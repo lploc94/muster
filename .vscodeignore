@@ -1,0 +1,19 @@
+# Source & dev (compiled output is in dist/)
+src/**
+scripts/**
+mcp/**
+study/**
+
+# Docs (not needed in VSIX; keep in git repo)
+docs/**
+
+# Tooling
+node_modules/**
+.git/**
+.github/**
+*.vsix
+tsconfig.json
+
+# Tests & spikes
+**/*.map
+**/.DS_Store
