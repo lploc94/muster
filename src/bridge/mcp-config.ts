@@ -26,7 +26,7 @@ function bridgeAcpEntry(port: number, token: string): McpServerConfig {
 }
 
 function isAcpBackend(backend: Backend): boolean {
-  return backend.name === 'grok' || backend.name === 'kiro';
+  return backend.name === 'grok' || backend.name === 'kiro' || backend.name === 'codex';
 }
 
 export function buildTurnMcp(

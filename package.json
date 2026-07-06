@@ -85,6 +85,8 @@
     "mvp:claude": "tsx scripts/test-runner.ts",
     "mvp:grok": "tsx scripts/test-grok.ts",
     "mvp:kiro": "tsx scripts/test-kiro.ts",
+    "mvp:codex": "tsx scripts/test-codex.ts",
+    "vendor:codex-acp": "node scripts/vendor-codex-acp.mjs",
     "mvp:task": "tsx scripts/test-task.ts",
     "mvp:bridge": "tsx scripts/test-bridge.ts",
     "test:agy-ask": "node scripts/test-agy-ask-mcp.mjs",

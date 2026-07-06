@@ -12,6 +12,8 @@ export type SessionUpdate = Record<string, unknown>;
 
 export interface PromptResult {
   stopReason?: string;
+  /** Some ACP agents (e.g. codex-acp) return usage on the prompt result. */
+  usage?: Record<string, unknown>;
   _meta?: Record<string, unknown>;
 }
 
@@ -44,6 +46,11 @@ export interface AcpAgentConfig {
   command: string;
   /** Arguments for the ACP stdio agent, e.g. ['agent', 'stdio'] or ['acp']. */
   args: string[];
+  /**
+   * Extra environment variables merged into the spawned agent's env
+   * (below process.env, overridable by RunOptions.extraEnv).
+   */
+  env?: Record<string, string>;
   /** Client capabilities advertised on `initialize` (defaults to fs/terminal off). */
   clientCapabilities?: Record<string, unknown>;
   /**
@@ -179,7 +186,7 @@ export class AcpClient {
   }
 
   private mergedEnv(): NodeJS.ProcessEnv {
-    return { ...process.env, ...this.extraEnv };
+    return { ...process.env, ...this.config.env, ...this.extraEnv };
   }
 
   private emitConnectionLine(line: string, source: 'stderr' | 'non-json'): void {

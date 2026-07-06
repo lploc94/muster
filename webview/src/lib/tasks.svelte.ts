@@ -2,7 +2,7 @@ import type { SnapshotMessage, TaskSummary } from './protocol';
 import { isTerminalStatus } from './protocol';
 
 /** Backends selectable from the webview toolbar. */
-export type WebviewBackendId = 'claude' | 'grok' | 'kiro';
+export type WebviewBackendId = 'claude' | 'grok' | 'kiro' | 'codex';
 
 class TasksState {
   /** All known tasks keyed by id (roots + subtree entries from snapshots/patches). */
@@ -146,6 +146,13 @@ export function registerBackendSelect(el: (HTMLElement & { value: string }) | un
 /** Read the dropdown at send time so the chosen backend drives new-task creation. */
 export function resolveBackendForSend(): WebviewBackendId {
   const fromSelect = backendSelectEl?.value;
-  if (fromSelect === 'claude' || fromSelect === 'grok' || fromSelect === 'kiro') return fromSelect;
+  if (
+    fromSelect === 'claude' ||
+    fromSelect === 'grok' ||
+    fromSelect === 'kiro' ||
+    fromSelect === 'codex'
+  ) {
+    return fromSelect;
+  }
   return tasks.selectedBackend;
 }
