@@ -12,12 +12,29 @@ Thanks for your interest! This project is in early MVP — docs are ahead of cod
 
 ```bash
 npm install
-npm run watch
+npm run compile   # builds BOTH targets: extension host (tsc) + webview (Vite)
 ```
 
-Press **F5** in VS Code to launch the Extension Development Host.
+Press **F5** in VS Code to launch the Extension Development Host. The default
+`watch-all` build task runs `tsc -watch` and the Vite webview watcher in parallel.
 
 Requires `claude` on `PATH` for Claude backend testing.
+
+## Webview UI (Svelte + Vite)
+
+The chat sidebar is a **separate build target** under `webview/` (Svelte 5 +
+Vite + Tailwind v4 + vscode-elements). Full spec: [docs/WEBVIEW.md](docs/WEBVIEW.md).
+
+- **Two build graphs:** extension host (`tsc` → `dist/src`, CommonJS) and webview
+  (`vite` → `dist/webview`, ESM). They do not import each other; the shared
+  `NormalizedEvent` contract is duplicated in `webview/src/lib/types.ts`.
+- **Build the webview:** `npm run build:webview` (or `npm run compile` for both).
+- **Live rebuild:** `npm run watch:webview` next to `npm run watch`, or just F5.
+- **Iterate on UI outside VS Code (optional):** the
+  [vscode-elements Webview Playground](https://github.com/vscode-elements/webview-playground)
+  emulates the `--vscode-*` theme variables.
+- The provider loads `dist/webview/assets/index.{js,css}` via `asWebviewUri`
+  under a strict CSP — **do not** add inline scripts to the provider HTML.
 
 ## What to work on
 

@@ -1,0 +1,26 @@
+@import "tailwindcss";
+@source "./";
+
+:root {
+  color-scheme: light dark;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--vscode-font-family);
+  font-size: var(--vscode-font-size, 13px);
+  color: var(--vscode-foreground);
+  background: var(--vscode-editor-background, transparent);
+}
+
+#app {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}

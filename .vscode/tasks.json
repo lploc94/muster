@@ -6,13 +6,31 @@
       "script": "watch",
       "problemMatcher": "$tsc-watch",
       "isBackground": true,
-      "presentation": {
-        "reveal": "never"
-      },
-      "group": {
-        "kind": "build",
-        "isDefault": true
+      "presentation": { "reveal": "never", "group": "watch" },
+      "group": "build"
+    },
+    {
+      "type": "npm",
+      "script": "watch:webview",
+      "isBackground": true,
+      "presentation": { "reveal": "never", "group": "watch" },
+      "group": "build",
+      "problemMatcher": {
+        "owner": "vite",
+        "pattern": { "regexp": "^$", "file": 1, "line": 2, "column": 3, "message": 4 },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "building (for|client)",
+          "endsPattern": "built in"
+        }
       }
+    },
+    {
+      "label": "watch-all",
+      "dependsOn": ["watch", "watch:webview"],
+      "dependsOrder": "parallel",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": []
     },
     {
       "type": "npm",
