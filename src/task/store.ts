@@ -328,30 +328,96 @@ export class TaskStore {
   private tryAcquireLock(): LockRecord | undefined {
     const token = randomBytes(16).toString('hex');
     const record: LockRecord = { pid: process.pid, token };
+    const tmpPath = `${this.lockPath}.${process.pid}.${token}.tmp`;
+
+    // Write the full record to a private temp file first, then publish it with an
+    // atomic, exclusive link. This guarantees the lock path is either absent or a
+    // fully-written record — never an empty/partial file, even if this process is
+    // killed mid-acquire. (The old openSync('wx')+writeFileSync could leave an empty
+    // lock on a crash, which then deadlocked every future acquire.)
     try {
-      const fd = fs.openSync(this.lockPath, 'wx');
-      fs.writeFileSync(fd, JSON.stringify(record), 'utf8');
-      fs.closeSync(fd);
+      fs.writeFileSync(tmpPath, JSON.stringify(record), 'utf8');
+    } catch {
+      return undefined;
+    }
+
+    try {
+      fs.linkSync(tmpPath, this.lockPath);
       return record;
     } catch (error) {
       const err = error as NodeJS.ErrnoException;
-      if (err.code !== 'EEXIST') {
-        return undefined;
+      if (err.code === 'EEXIST') {
+        // A lock is present. Reclaim it if the owner is dead or the file is
+        // corrupt/empty, then let acquireLock() retry on the next tick.
+        this.reclaimStaleLock();
       }
-      const existing = readLockRecord(this.lockPath);
-      if (!existing || !isProcessDead(existing.pid)) {
-        return undefined;
-      }
+      return undefined;
+    } finally {
       try {
-        fs.unlinkSync(this.lockPath);
+        fs.unlinkSync(tmpPath);
       } catch {
-        return undefined;
+        // best-effort: an orphaned temp is harmless and uniquely named
       }
-      return this.tryAcquireLock();
     }
   }
 
+  /**
+   * Reclaim a lock only when it is safe. Never disturbs a well-formed lock owned by
+   * a live process. Otherwise it claims the suspicious lock atomically via rename —
+   * only one contender can win that rename, and each operates on the exact file
+   * instance it removed — which closes the read-then-unlink TOCTOU where a stale
+   * read could otherwise delete a freshly acquired live lock.
+   */
+  private reclaimStaleLock(): boolean {
+    const observed = readLockRecord(this.lockPath);
+    if (observed && !isProcessDead(observed.pid)) {
+      return false;
+    }
+    // Looks stale (dead owner) or corrupt/empty. Claim it atomically by renaming it
+    // aside instead of unlinking the path in place.
+    const quarantine = `${this.lockPath}.${process.pid}.${randomBytes(4).toString('hex')}.stale`;
+    try {
+      fs.renameSync(this.lockPath, quarantine);
+    } catch (error) {
+      // ENOENT: another contender already reclaimed it — the path is free now, so a
+      // retry can acquire. Any other error: leave the lock untouched.
+      return (error as NodeJS.ErrnoException).code === 'ENOENT';
+    }
+    // We now exclusively hold whatever WAS at lockPath. Re-inspect that instance.
+    const claimed = readLockRecord(quarantine);
+    if (claimed && !isProcessDead(claimed.pid)) {
+      // Rare race: a fresh, live lock was published between the observation and the
+      // rename. Best-effort restore so its owner is not silently displaced.
+      try {
+        fs.linkSync(quarantine, this.lockPath);
+      } catch {
+        // lockPath already re-taken by another acquirer; nothing safe to do.
+      }
+      try {
+        fs.unlinkSync(quarantine);
+      } catch {
+        // best-effort
+      }
+      return false;
+    }
+    // Confirmed stale/corrupt — discard it. lockPath is now free for a retry.
+    try {
+      fs.unlinkSync(quarantine);
+    } catch {
+      // best-effort
+    }
+    return true;
+  }
+
   private acquireLock(): LockRecord | undefined {
+    // Defense in depth: ensure the lock's directory exists before acquiring. The
+    // store path may be a not-yet-created globalStorage directory; a missing parent
+    // otherwise surfaces as ENOENT and, historically, a misleading lock error.
+    try {
+      fs.mkdirSync(path.dirname(this.lockPath), { recursive: true });
+    } catch {
+      // ignore — a subsequent IO failure will surface the real error
+    }
     const deadline = Date.now() + this.lockMaxWaitMs;
     while (Date.now() < deadline) {
       const lock = this.tryAcquireLock();

@@ -113,17 +113,26 @@ describe('TaskStore', () => {
     expect(finalStore.getTask('task-b')).toBeDefined();
   }, 20_000);
 
-  it('does not reclaim a malformed lock file', () => {
+  it('reclaims a malformed lock file left by a crashed writer', () => {
     const { filePath } = makeTempStore();
     fs.writeFileSync(`${filePath}.lock`, 'not-json', 'utf8');
-    const store = TaskStore.load({ filePath, lockMaxWaitMs: 50, lockRetryMs: 10 });
-    const commit = store.commit(() => ({ ok: true }));
-    expect(commit).toEqual({
-      ok: false,
-      reason: 'io_error',
-      detail: 'could not acquire store lock',
+    const store = TaskStore.load({ filePath, lockMaxWaitMs: 500, lockRetryMs: 10 });
+    const commit = store.commit((draft) => {
+      draft.tasks['task-1'] = sampleTask('task-1');
+      return { ok: true };
     });
-    fs.unlinkSync(`${filePath}.lock`);
+    expect(commit.ok).toBe(true);
+  });
+
+  it('reclaims an empty lock file left by a crash mid-acquire', () => {
+    const { filePath } = makeTempStore();
+    fs.writeFileSync(`${filePath}.lock`, '', 'utf8');
+    const store = TaskStore.load({ filePath, lockMaxWaitMs: 500, lockRetryMs: 10 });
+    const commit = store.commit((draft) => {
+      draft.tasks['task-1'] = sampleTask('task-1');
+      return { ok: true };
+    });
+    expect(commit.ok).toBe(true);
   });
 
   it('reclaims a lock from a dead pid', () => {
