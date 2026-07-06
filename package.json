@@ -71,7 +71,9 @@
     "vscode:prepublish": "npm run compile",
     "mvp:claude": "tsx scripts/test-runner.ts",
     "mvp:grok": "tsx scripts/test-grok.ts",
-    "test:agy-ask": "node scripts/test-agy-ask-mcp.mjs"
+    "test:agy-ask": "node scripts/test-agy-ask-mcp.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
@@ -84,7 +86,8 @@
     "tailwindcss": "^4.3.2",
     "tsx": "^4.7.0",
     "typescript": "^6.0.3",
-    "vite": "^8.1.3"
+    "vite": "^8.1.3",
+    "vitest": "4.1.10"
   },
   "dependencies": {
     "@vscode-elements/elements": "^2.5.1"

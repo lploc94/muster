@@ -1,0 +1,117 @@
+import type { TaskDependency, TaskLifecycleState } from './types';
+
+const TERMINAL_LIFECYCLES: ReadonlySet<TaskLifecycleState> = new Set([
+  'succeeded',
+  'failed',
+  'cancelled',
+  'skipped',
+]);
+
+function isTerminalLifecycle(state: TaskLifecycleState | undefined): boolean {
+  return state !== undefined && TERMINAL_LIFECYCLES.has(state);
+}
+
+export function isDependencySatisfied(
+  dep: TaskDependency,
+  depLifecycle: TaskLifecycleState | undefined,
+): boolean {
+  if (!isTerminalLifecycle(depLifecycle)) {
+    return false;
+  }
+  if (dep.requiredOutcome === 'settled') {
+    return true;
+  }
+  return depLifecycle === 'succeeded';
+}
+
+export function evaluateDependency(
+  dep: TaskDependency,
+  depLifecycle: TaskLifecycleState | undefined,
+): 'satisfied' | 'pending' | 'block' | 'fail' | 'skip' {
+  if (isDependencySatisfied(dep, depLifecycle)) {
+    return 'satisfied';
+  }
+  if (!isTerminalLifecycle(depLifecycle)) {
+    return 'pending';
+  }
+  return dep.onUnsatisfied;
+}
+
+export interface DepGraph {
+  rootOf(taskId: string): string | undefined;
+  dependsOn(taskId: string): readonly string[];
+}
+
+function hasCycle(
+  candidateTaskId: string,
+  newDeps: readonly TaskDependency[],
+  graph: DepGraph,
+): boolean {
+  for (const dep of newDeps) {
+    if (dep.taskId === candidateTaskId) {
+      return true;
+    }
+    const visited = new Set<string>();
+    const stack = [dep.taskId];
+    while (stack.length > 0) {
+      const current = stack.pop()!;
+      if (current === candidateTaskId) {
+        return true;
+      }
+      if (visited.has(current)) {
+        continue;
+      }
+      visited.add(current);
+      for (const next of graph.dependsOn(current)) {
+        stack.push(next);
+      }
+    }
+  }
+  return false;
+}
+
+function depsEqual(
+  left: readonly TaskDependency[],
+  right: readonly TaskDependency[],
+): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+  return left.every(
+    (dep, index) =>
+      dep.taskId === right[index].taskId &&
+      dep.requiredOutcome === right[index].requiredOutcome &&
+      dep.onUnsatisfied === right[index].onUnsatisfied,
+  );
+}
+
+export function validateDependencies(
+  candidate: { taskId: string; rootId: string },
+  deps: readonly TaskDependency[],
+  graph: DepGraph,
+  firstTurnQueued: boolean,
+  existingDeps?: readonly TaskDependency[],
+): { ok: true } | { ok: false; reason: string } {
+  if (firstTurnQueued) {
+    if (existingDeps === undefined || !depsEqual(deps, existingDeps)) {
+      return { ok: false, reason: 'dependencies are immutable after the first turn is queued' };
+    }
+    return { ok: true };
+  }
+
+  for (const dep of deps) {
+    const depRoot = graph.rootOf(dep.taskId);
+    if (depRoot === undefined) {
+      return { ok: false, reason: `dependency task ${dep.taskId} does not exist` };
+    }
+    if (depRoot !== candidate.rootId) {
+      return { ok: false, reason: `dependency ${dep.taskId} is not in the same root graph` };
+    }
+  }
+
+  if (hasCycle(candidate.taskId, deps, graph)) {
+    return { ok: false, reason: 'dependency cycle detected' };
+  }
+
+  return { ok: true };
+}
