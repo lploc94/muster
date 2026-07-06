@@ -13,131 +13,70 @@ This doc covers **how** those servers are passed per CLI backend.
 
 ## General Approach (MVP)
 
-We do **not** try to have one universal way.
+Muster uses **ACP only** — no headless `-p`/`exec` adapters. MCP injection is **uniform**:
 
-For each backend we do what that CLI supports best:
-
-- Claude: Best support → use `--mcp-config <file> --strict-mcp-config`
-- Codex: Use `-c` overrides or a temporary config profile
-- Grok: Currently relies on `.mcp.json` discovery or global config (ephemeral support is limited)
-- Antigravity: Uses `mcp_config.json`
-
-For fast MVP we will:
-
-1. Prepare a small MCP config file that points to your context engine.
-2. Pass it using the mechanism supported by the CLI we are calling.
-3. Keep the config file simple and version-controlled or generated on the fly.
+- Pass `mcpServers` on ACP `session/new` and `session/load`.
+- Use **http** or **sse** transport entries (stdio MCP is rejected by some agents over ACP).
+- The Muster Bridge (`muster_bridge`) is naturally http on `127.0.0.1`.
+- `context_engine` may need an http/sse proxy if it is stdio-only today.
 
 ## Recommended merged config (example)
 
-Generated per turn (or cached in extension storage):
+Built per turn by the extension host and passed as `RunOptions.mcpServers`:
 
 ```json
-{
-  "mcpServers": {
-    "context_engine": {
-      "command": "node",
-      "args": ["/absolute/path/to/context-engine/dist/index.js"],
-      "env": {}
-    },
-    "muster_bridge": {
-      "url": "http://127.0.0.1:<extension-port>/mcp"
-    }
+[
+  {
+    "type": "http",
+    "name": "context_engine",
+    "url": "http://127.0.0.1:<context-port>/mcp",
+    "headers": []
+  },
+  {
+    "type": "http",
+    "name": "muster_bridge",
+    "url": "http://127.0.0.1:<bridge-port>/mcp",
+    "headers": [{ "name": "Authorization", "value": "Bearer <token>" }]
   }
-}
+]
 ```
 
-If HTTP URL is not supported for a backend, use stdio proxy — see `MUSTER-BRIDGE.md` §4.2.
+If a backend's ACP agent accepts stdio MCP entries, prefer http anyway for consistency with the Bridge.
 
-**Tip**: Use an absolute path during development. Later you can make it configurable via VS Code settings.
+## Per Backend (ACP)
 
-## Per Backend (MVP)
+All backends follow the same injection point — only the **ACP agent spawn command** differs (see `CLI-COMMANDS.md`):
 
-### Claude Code (recommended to implement first)
+| Backend | ACP agent | `mcpServers` on `session/new`/`session/load` |
+|---------|-----------|-----------------------------------------------|
+| Grok | `grok agent stdio` | ✅ verified (http/sse) |
+| Claude | `claude-code-acp` | 🔜 verify on migrate |
+| Codex | `codex app-server --stdio` | 🔜 verify |
+| Antigravity | TBD | 🔜 blocked |
 
-```bash
-claude -p "..." \
-  --mcp-config /path/to/context-engine.mcp.json \
-  --strict-mcp-config
-```
-
-- `--strict-mcp-config` is important so only the servers we pass are active.
-- Works well with headless.
-
-### Grok
-
-Grok currently prefers discovering MCP servers from:
-
-- `.mcp.json` in the current working directory, or
-- Global/user config
-
-For MVP we have two practical options:
-
-**Option A (simplest)**: Temporarily write a `.mcp.json` in the `cwd` we pass to the spawn, then delete or ignore it after.
-
-**Option B**: Ask user to configure the context engine once globally for Grok (less ideal for coordinator).
-
-Start with Option A for development.
-
-Example temp `.mcp.json` we can write:
-
-```json
-{
-  "mcpServers": {
-    "context_engine": { ... }
-  }
-}
-```
-
-### Codex
-
-Codex supports configuration via:
-
-- `config.toml`, or
-- Repeatable `-c key=value` on the command line.
-
-For MCP in exec mode, the recommended way is to pre-register or use overrides.
-
-For MVP we can:
-
-- Use `-c 'mcp_servers.context_engine.command=node' -c 'mcp_servers.context_engine.args=["/path/..."]' ...`
-
-Or generate a small temporary config file and point Codex at it if it supports a config path override.
-
-**Action for MVP**: Test which method works cleanly with `codex exec --json`.
-
-### Antigravity
-
-Uses `mcp_config.json` (similar to Gemini CLI).
-
-For MVP we can write a workspace-level `mcp_config.json` or rely on global one.
-
-Mark as lower priority for **context_engine**. **`muster_bridge` / `ask_user` on agy is deferred** until streaming tool events improve (MCP blocking works — see `MUSTER-BRIDGE.md` §7).
+Do **not** write temp `.mcp.json`, `--mcp-config`, or `mcp_config.json` files for Muster turns — ACP `mcpServers` replaces all of those.
 
 ## Implementation Strategy for MVP
 
-1. Extension merges `context_engine` + `muster_bridge` into one config per turn.
-2. In the backend adapter:
-   - Claude → pass `--mcp-config` + `--strict-mcp-config`
-   - Grok → write temp `.mcp.json` in cwd if needed
-   - Codex → use `-c` overrides or temp config
-3. Make the path to the context engine configurable later (VS Code setting).
-4. For now, hardcode a dev path or read from an environment variable / setting.
+1. Extension merges `context_engine` + `muster_bridge` into `mcpServers[]` per turn.
+2. Every ACP backend adapter passes `options.mcpServers` on `session/new` / `session/load`.
+3. Make context engine URL/port configurable later (VS Code setting).
+4. Issue per-turn bearer token for `muster_bridge` (see `MUSTER-BRIDGE.md` §10).
 
 ## Security / Trust Note (MVP)
 
-When using `--strict-mcp-config` or equivalent, we reduce the risk of pulling in other MCP servers the user has configured.
+Per-session injection means only the servers we pass are active for that turn — no reliance on the user's global MCP config.
 
 For the context engine itself, make sure it only exposes safe read-only or well-scoped tools during MVP.
 
 ## Next Step for Code
 
-When implementing a backend, the MCP part should be:
+When implementing or migrating a backend:
 
 ```ts
-if (options.mcpConfigPath) {
-  // add the right flags or write temp file
-}
+const mcpServers = options.mcpServers ?? [];
+await client.newSession(cwd, mcpServers);
+// or loadSession(resumeId, cwd, mcpServers)
 ```
 
-Keep the logic inside each backend file (per-CLI) rather than forcing a common abstraction too early.
+Keep spawn-command differences in each backend file; keep MCP merge logic in the extension host.

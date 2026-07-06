@@ -491,7 +491,7 @@ The webview never holds the whole thread. Render a **recent window**; older item
 - [ ] `ReasoningBlock` (collapsible)
 - [ ] `toolUpdated` input preview
 - [ ] `messageId` grouping polish
-- [ ] Backend picker (Claude only → Grok)
+- [x] Backend picker (Claude + Grok)
 - [ ] Markdown subset for assistant bubbles — **once per turn**, not per delta (§7.3)
 - [ ] Optional: `requestAnimationFrame` delta batching
 

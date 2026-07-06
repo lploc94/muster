@@ -19,8 +19,8 @@ authoritative for the task-based flow.
 
 ## 1. Goals and boundaries
 
-Muster coordinates durable units of work while invoking short-lived headless AI
-CLI processes. The design must support:
+Muster coordinates durable units of work while invoking per-turn **ACP sessions**
+(one `session/new` or `session/load` per adapter `run()`). The design must support:
 
 - a root coordinator for each user request;
 - delegated worker and sub-coordinator tasks;

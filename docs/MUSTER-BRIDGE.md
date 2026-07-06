@@ -1,6 +1,6 @@
 # Muster Bridge — MCP Server (`muster_bridge`)
 
-This document is the **authoritative design** for the extension-owned MCP server `muster_bridge`: human-in-the-loop tools and IDE bridge capabilities that headless CLIs cannot provide alone.
+This document is the **authoritative design** for the extension-owned MCP server `muster_bridge`: human-in-the-loop tools and IDE bridge capabilities that non-interactive ACP coordinator mode cannot provide alone.
 
 **Related docs:**
 - `docs/DESIGN.md` — high-level architecture (§2.5, §5, §8)
@@ -12,7 +12,7 @@ This document is the **authoritative design** for the extension-owned MCP server
 
 ## 1. Problem
 
-In headless mode (`-p`, `exec`, …) there is no TTY. Builtin tools like Claude `AskUserQuestion` are unavailable or cannot block for a real user answer.
+In coordinator-driven ACP mode there is no TTY. Builtin ask-the-user tools are unavailable or cannot block for a real user answer without the Bridge.
 
 We still want the agent to **call a tool**, **wait for the human**, then **continue in the same turn** (same CLI process) — not force a new turn + resume for every clarification.
 
@@ -25,7 +25,7 @@ We still want the agent to **call a tool**, **wait for the human**, then **conti
 | Answer transport | **In-memory Promise** in extension (`AskBridge`). No answer JSON files in production. |
 | MCP server placement | **HTTP MCP URL** served by extension (preferred). stdio MCP + localhost callback as fallback. |
 | Turn model | Still **one CLI process per user message**. Turn may **pause** until `ask_user` resolves; process stays alive. |
-| Backend order | **Claude `stream-json` first** → Grok/Codex → **agy deferred** until better streaming/tool events. |
+| Backend order | **Grok ACP** (done) → **Claude ACP** → Codex ACP → agy when ACP entry exists. |
 
 ## 3. Architecture
 
@@ -151,7 +151,7 @@ Duplicating CLI tools on `muster_bridge` confuses the model and doubles maintena
 | Tool | Blocking? | Purpose |
 |------|-----------|---------|
 | **`notify_user`** | ❌ No | Toast / status line: info, warning, milestone. Agent updates UI without pausing. |
-| **`get_ide_context`** | ❌ No | Snapshot for headless agent: active editor path, selection range, workspace folder, optional diagnostics summary (errors count). CLIs in `-p` often lack “what user is looking at”. |
+| **`get_ide_context`** | ❌ No | Snapshot for coordinator-driven agent: active editor path, selection range, workspace folder, optional diagnostics summary (errors count). Agents without IDE bridge often lack “what user is looking at”. |
 
 `notify_user` input example:
 ```json
@@ -269,15 +269,15 @@ Render: question card with options + optional free-text; block sending new promp
 ```
 User sends message
   → extension creates runId, starts adapter.run()
-  → CLI spawns (fresh process)
+  → backend opens one ACP session (session/new or session/load)
   → agent works…
   → ask_user → AskBridge.register → webview card
   → [USER ANSWERS] → AskBridge.submit
   → MCP returns → agent continues
-  → turnCompleted → process exits
+  → turnCompleted → ACP session ends (shared agent process stays alive)
 ```
 
-**Clarification vs DESIGN.md §2.1:** We still spawn **one process per user-initiated message**. That process may remain alive longer while waiting for `ask_user`. This is not a session pool and not ACP-style long-lived brokers.
+**Clarification vs DESIGN.md §2.1:** Each user message is **one ACP session**. The session may stay alive longer while waiting for `ask_user`. Shared agent processes are not session pools. We do not proxy fs/terminal over ACP.
 
 **Cancellation:** `AbortSignal` on `RunOptions` must reject pending asks in `AskBridge` and kill the CLI process tree.
 
@@ -285,8 +285,8 @@ User sends message
 
 | Backend | MCP `ask_user` mid-turn | Detect ask for UI | Priority |
 |---------|-------------------------|-------------------|----------|
-| Claude `stream-json` | ✅ Expected | `toolStarted` + AskBridge | **P0** |
-| Grok `streaming-json` | ⚠️ Verify tool events | stream + AskBridge | P1 |
+| Claude ACP `session/update` | ✅ Expected | `toolStarted` + AskBridge | **P0** |
+| Grok ACP `session/update` | ✅ `tool_call` events | stream + AskBridge | P1 |
 | Codex `--json` | ⚠️ Verify `item.*` | stream + AskBridge | P1 |
 | agy plain `-p` | ✅ Proven (spike 1.0.16) | AskBridge only (no structured tool events) | **Deferred** |
 | agy `--output-format json` | ✅ MCP works; stdout is one blob | AskBridge only | **Deferred** |
@@ -324,7 +324,7 @@ Use `--strict-mcp-config` on Claude where supported.
 - [ ] Per-session bearer token + `Host`/`Origin` validation on the HTTP server (§10)
 - [ ] `mcp-config.ts` merge `context_engine` + `muster_bridge` (inject token into the `muster_bridge` entry)
 - [ ] Webview question card + `submitAsk` / `cancelAsk`
-- [ ] Claude adapter: parse `mcp__muster_bridge__ask_user` in stream-json
+- [ ] Claude ACP adapter: map `tool_call` for `mcp__muster_bridge__ask_user` in `session/update`
 - [ ] Wire `AbortSignal` → `AskBridge.cancelAll`
 - [ ] Replace file-IPC spike in `mcp/muster-ask-server.mjs` with HTTP callback
 - [ ] agy backend: pending until streaming tool events land

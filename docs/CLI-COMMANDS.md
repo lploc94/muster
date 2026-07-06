@@ -1,97 +1,69 @@
 # CLI Invocation Reference
 
-This document contains the exact commands, flags, and behaviors for headless usage + resume + MCP.
+Muster integrates with coding CLIs **only through ACP** ([Agent Client Protocol](https://agentclientprotocol.com)) — JSON-RPC 2.0 over stdio. **Headless** modes (`-p`, `exec`, NDJSON stdout) are **not used** by Muster adapters.
 
 Use this as the source of truth when implementing each backend.
 
 > **Verified against** (2026-07-06, from `--help` + empirical runs on this machine):
 > Claude Code 2.1.201 · Grok 0.2.87 · codex-cli 0.142.1 · agy 1.0.16
 >
-> CLI flags change over time. When bumping a CLI version, re-check the flags used by its adapter and update this doc (the adapter should also log the CLI version at turn start — see ADAPTER-SPEC.md).
+> Re-check ACP entry commands and `session/update` shapes when bumping CLI versions.
 
 ## General Principles (MVP)
-- Always spawn a **fresh process per turn**.
-- Use streaming / JSON output.
-- Pass explicit session ID for resume (never rely only on "continue last").
-- Inject MCP config so the agent can see the context engine tool.
-- Capture the session ID after the turn if the CLI returns one.
 
-## Permissions in headless mode (important)
+Each user message = one adapter `run()` = one **ACP session** (`session/new` or `session/load`).
 
-There is no interactive prompt in headless mode. If the coordinator doesn't set an explicit permission policy, tool calls either get **silently denied** or the turn stalls. Every adapter must pass a permission strategy:
+| Backend | ACP agent command | Adapter status |
+|---------|-------------------|----------------|
+| Grok | `grok --no-auto-update agent stdio` | ✅ implemented |
+| Claude | `claude-code-acp` (or `@agentclientprotocol/claude-agent-acp`) | 🔜 migrate |
+| Codex | `codex app-server --stdio` | 🔜 planned |
+| Antigravity | TBD — verify ACP entry on implement | 🔜 experimental |
 
-| CLI | Mechanism |
-|-----|-----------|
-| Claude | `--permission-mode <mode>`, `--allowedTools "Bash,Edit,..."`, or `--dangerously-skip-permissions` |
-| Grok | `--permission-mode <default\|acceptEdits\|auto\|dontAsk\|bypassPermissions\|plan>`, `--allow`/`--deny` rules, or `--always-approve` |
-| Codex | `-s/--sandbox <read-only\|workspace-write\|danger-full-access>`, or `--dangerously-bypass-approvals-and-sandbox` |
-| Antigravity | `--dangerously-skip-permissions`, `--sandbox`, or pre-approved rules in `~/.gemini/antigravity-cli/settings.json` (`permissions.allow`) |
+Shared rules (all backends):
 
-**MVP decision needed**: expose this as a per-backend setting (e.g. default to an "accept edits / workspace-write" level, with an opt-in "bypass everything" toggle). Do not hardcode the bypass flags.
+- One **shared** ACP agent process per backend type for the extension lifetime.
+- One **ACP session per turn** — not a session pool across unrelated conversations.
+- Stream via `session/update` notifications → `NormalizedEvent`.
+- Resume via `session/load { sessionId }` (never rely only on `--continue` / `--last`).
+- Inject MCP via `mcpServers` on `session/new` / `session/load` (http/sse).
+- Cancel via `session/cancel` notification.
+- Emit `sessionStarted` from `session/new` (or at start of `session/load`).
+
+## Shared ACP lifecycle
+
+```text
+spawn <backend-acp-agent>     # stdio JSON-RPC peer (long-lived)
+  → initialize { protocolVersion, clientCapabilities }
+  → authenticate { methodId, _meta: { headless: true } }   # when required
+  → session/new { cwd, mcpServers } | session/load { sessionId, cwd, mcpServers }
+  → session/prompt { sessionId, prompt: [{ type: "text", text }] }
+  ← session/update notifications (streaming)
+  ← session/prompt response { stopReason }                  # terminal signal
+  → session/cancel                                            # on user abort
+```
+
+**Client capabilities (Muster default):** declare `fs` and `terminal` **off** unless we intentionally proxy IDE operations. Auto-allow `session/request_permission` in coordinator mode (no interactive TTY).
+
+**MCP over ACP:** pass `mcpServers` as http/sse entries on `session/new`/`session/load`. stdio MCP is rejected by some agents — use http URLs (Muster Bridge pattern) or an sse/http proxy for `context_engine`.
 
 ---
 
-## Claude Code
+## Claude Code (ACP)
 
-### Basic headless
+**Muster adapter:** ACP via `claude-code-acp` (stdio). Package may be published as `@agentclientprotocol/claude-agent-acp` — verify name on install.
+
 ```bash
-claude -p "your prompt here"
+claude-code-acp   # JSON-RPC 2.0 over stdin/stdout
 ```
 
-### Streaming (recommended)
-```bash
-claude -p "your prompt here" \
-  --output-format stream-json \
-  --include-partial-messages \
-  --verbose
-```
+Lifecycle matches §Shared ACP lifecycle. Map `session/update` kinds to `NormalizedEvent` (verify shapes against the adapter version).
 
-⚠️ **`--verbose` is required**: with `-p/--print`, `--output-format=stream-json` errors out without it (verified on 2.1.201: `Error: When using --print, --output-format=stream-json requires --verbose`).
+**MCP:** `mcpServers` on `session/new`/`session/load` — same http/sse schema as Grok. Do **not** use `--mcp-config` in Muster adapters.
 
-### Resume
-```bash
-claude -p "continue this" --resume <session-id>
-# or
-claude -p "continue this" -c          # continue most recent (use with care)
-```
+**Permissions:** handle `session/request_permission` in the ACP client (auto-allow for coordinator mode, or map to a future permission UI).
 
-`--fork-session` can be added when resuming to branch into a new session ID instead of appending to the original.
-
-### New session with pre-generated ID
-```bash
-claude -p "..." --session-id <uuid>   # coordinator generates the UUID, so identity is known upfront
-```
-
-### MCP injection (context engine)
-```bash
-claude -p "..." \
-  --mcp-config /path/to/context-engine.json \
-  --strict-mcp-config
-```
-
-`--mcp-config` accepts **file paths or inline JSON strings** (space-separated, repeatable) — the inline form avoids temp files entirely.
-
-Example `context-engine.json`:
-```json
-{
-  "mcpServers": {
-    "context_engine": {
-      "command": "node",
-      "args": ["/absolute/path/to/your/context-engine/dist/index.js"],
-      "env": {}
-    }
-  }
-}
-```
-
-### Session ID extraction
-In `stream-json` mode the first event is a system/init event carrying `session_id` — emit `sessionStarted` from it. (Re-verify the exact shape per version; keep raw lines for debugging.)
-
-### Notes for MVP
-- `--include-partial-messages` gives token-by-token streaming deltas.
-- `--strict-mcp-config` ensures only the servers we pass are used.
-- `--max-turns` and `--max-budget-usd` exist as safety rails if we ever want them.
-- Avoid `--no-session-persistence` — it makes the session non-resumable.
+**Status:** `src/backends/claude.ts` still contains a legacy headless `-p` implementation — replace with ACP on the shared `acp-client.ts` path.
 
 ---
 
@@ -136,86 +108,37 @@ File-based discovery (`~/.grok/config.toml`, `.mcp.json`) still loads inside ses
 
 ### Server→client requests (Muster posture)
 
-- `session/request_permission` → auto-allow (non-interactive; parity with headless `--always-approve`)
+- `session/request_permission` → auto-allow (coordinator has no interactive TTY)
 - `fs/*`, `terminal/*` → unsupported (capabilities declared off; Grok uses built-in tools)
 - `_x.ai/*` extension notifications (no `id`) → ignored
 
-### Headless alternative (`grok -p`) — not used by Muster
+---
 
-Still available for scripts:
+## Codex (ACP)
+
+**Muster adapter:** ACP via `codex app-server --stdio` (experimental in codex-cli 0.142.1).
 
 ```bash
-grok -p "prompt" --output-format streaming-json
+codex app-server --stdio   # default transport: stdio://
 ```
 
-Headless emits only `thought` / `text` / `end` NDJSON — no structured tool events. Muster migrated to ACP for per-session MCP injection and richer streaming.
+Lifecycle matches §Shared ACP lifecycle. Verify `initialize`/`session/*` method names and `session/update` shapes against `codex app-server generate-json-schema` when implementing.
+
+**MCP:** `mcpServers` on `session/new`/`session/load`. Do **not** use `codex exec -c mcp_servers.*` in Muster adapters.
+
+**Config overrides:** pass `-c key=value` flags to `app-server` spawn if needed (sandbox, model, etc.).
+
+**Status:** not implemented — verify ACP compliance before replacing any legacy `codex exec --json` spike code.
 
 ---
 
-## Codex
+## Antigravity (agy) — ACP TBD
 
-### Non-interactive
-```bash
-codex exec "your prompt here"
-```
+**Muster adapter:** ACP entry command **not verified** on agy 1.0.16. Implement only after confirming an ACP stdio mode (e.g. upstream `--acp` or dedicated agent subcommand). Until then, agy is **experimental / blocked** for Muster.
 
-### Streaming
-```bash
-codex exec "your prompt here" --json     # JSONL events on stdout
-```
+When available, lifecycle and MCP injection follow §Shared ACP lifecycle (`mcpServers` on `session/new`/`session/load`).
 
-### Resume
-```bash
-codex exec resume <session-id> "your next prompt"
-# or
-codex exec resume --last "your next prompt"     # most recent recorded session
-```
-
-⚠️ Note the syntax: `resume` is a **subcommand** of `exec`, the session ID and follow-up prompt are positional arguments, and `--last` belongs to `resume` (there is no `codex exec "..." --last`).
-
-### Useful flags
-- `-C, --cd <dir>` — working root for the agent (instead of relying on process cwd).
-- `--skip-git-repo-check` — needed when running outside a git repo.
-- `-o, --output-last-message <file>` — writes the final message to a file (handy fallback).
-- ⚠️ Avoid `--ephemeral` — it skips session persistence, which **breaks resume**.
-
-### MCP
-Use repeatable `-c` config overrides (TOML values) or pre-register:
-```bash
-codex exec "..." \
-  -c 'mcp_servers.context_engine.command="node"' \
-  -c 'mcp_servers.context_engine.args=["/absolute/path/to/context-engine/dist/index.js"]'
-```
-
-Or one-time via `codex mcp add`.
-
-### JSONL event shapes (from the proven runner)
-
-Verified in production by `~/projects/codex_skill/skill-packs/codex-review/scripts/codex-runner.js` (reference implementation — study it before writing the Codex adapter):
-
-| Event | Meaning / payload |
-|-------|-------------------|
-| `{"type":"thread.started","thread_id":"..."}` | **Session/thread ID** → emit `sessionStarted` from this |
-| `{"type":"turn.started"}` | Turn began |
-| `{"type":"item.completed","item":{"type":"reasoning","text":"..."}}` | Reasoning (arrives as completed items, not deltas) |
-| `{"type":"item.started"/"item.completed","item":{"type":"command_execution","command":"..."}}` | Tool (shell) start/end |
-| `{"type":"item.completed","item":{"type":"file_change","changes":[{"path","kind"}]}}` | File edits |
-| `{"type":"item.completed","item":{"type":"agent_message","text":"..."}}` | **Final assistant message** |
-| `{"type":"turn.completed"}` / `{"type":"turn.failed","error":{"message"}}` | Terminal success / failure |
-
-Other proven practices from that runner:
-- **Pass the prompt via stdin**, not argv (avoids quoting/length issues): `codex exec ... ` with prompt piped in; on resume use the `-` positional (`codex exec ... resume <thread_id> -`).
-- Reasoning effort via `--config model_reasoning_effort=<low|medium|high>`.
-- Exact arg order used: `codex exec --skip-git-repo-check --json --sandbox <mode> --config model_reasoning_effort=<effort> -C <working-dir>` (new session), `codex exec --skip-git-repo-check --json --config model_reasoning_effort=<effort> resume <thread_id> -` (resume).
-
----
-
-## Antigravity (agy)
-
-### Basic headless
-```bash
-agy -p "your prompt here"       # -p is short for --print / --prompt
-```
+### agy notes for ACP implementers (from legacy spikes)
 
 ⚠️ **`--print-timeout` defaults to 5m** — long agentic turns will be killed unless we raise it (e.g. `--print-timeout 30m` or `2h`).
 
@@ -292,7 +215,7 @@ Community reference: `~/projects/.../agy-as-claude.sh` (ralphex) wraps plain agy
 | `text` | Same as plain |
 | `streaming-json`, `ndjson`, `stream-json`, `jsonl`, `events` | **Not implemented** — all fall back to plain text |
 
-Do **not** assume Claude/Grok-style NDJSON streaming on agy yet. Re-check when upgrading agy.
+Do **not** assume Claude-style NDJSON streaming on agy yet. Re-check when upgrading agy.
 
 ### Resume
 ```bash
@@ -349,7 +272,7 @@ Since 1.0.5, servers can also be configured with a `"url"` field instead of `com
 - **Option A (preferred)**: before spawn, write/merge a temp `mcp_config.json` into `~/.gemini/config/mcp_config.json` (or a project-specific override), then restore afterward if needed.
 - **Option B**: pre-register servers globally once; coordinator only ensures permissions allow `mcp(context_engine/*)`.
 
-There is no equivalent of Grok ACP's programmatic `mcpServers` in `session/new` for headless `-p` mode.
+Legacy `-p` mode has no programmatic `mcpServers` — another reason Muster does not use it.
 
 ### Session ID extraction
 
@@ -368,63 +291,78 @@ agy -p "..." --log-file /tmp/agy-turn.log           # debug log (also shown in T
 
 `agy plugin install/list/...` manages skills/agents from marketplaces — out of scope for MVP adapter unless we need bundled skills.
 
-### Adapter implications (vs Claude/Grok/Codex)
+### Blockers for ACP (agy 1.0.16)
 
 | Capability | agy 1.0.16 | Notes |
 |------------|------------|-------|
-| Headless per-turn spawn | ✅ `-p` | Matches our model |
-| Structured stdout | ✅ `--output-format json` | Hidden flag; single blob, not NDJSON |
-| Token streaming to UI | ❌ in JSON mode; ⚠️ line chunks in plain mode | Weaker than Claude `stream-json` |
-| Tool/reasoning events | ❌ structured | Only narrative in `response` text |
-| Explicit resume ID | ✅ `--conversation` | Field name is `conversation_id`, not `session_id` |
-| Pre-assign session ID | ❌ | CLI assigns UUID |
-| Per-turn MCP inject | ⚠️ file-based only | No CLI flag |
-| Cancellation | ⚠️ kill process | No documented `AbortSignal` flag; SIGTERM the child |
+| ACP stdio entry | ❌ not found in `--help` | Must verify before adapter work |
+| Legacy `-p` JSON blob | ✅ `--output-format json` | Spike only — not a Muster adapter path |
+| Structured tool events | ❌ in legacy JSON | ACP path must be verified |
 
-**Status in MVP**: implement **after** Claude + Grok + Codex. Use `--output-format json` as the primary parser target; keep plain-text line reading as an optional streaming shim. Mark as **experimental** until agy ships real NDJSON/streaming tool events.
+**Status:** blocked until agy exposes ACP. Legacy `-p` details are in §Legacy headless modes below (spikes only).
 
 ---
 
-## Quick Comparison Table (MVP)
+## Quick Comparison Table (MVP — ACP only)
 
-| CLI | Headless | Streaming | Resume | New session w/ own ID | MCP injection | Permission policy | Streaming quality |
-|-----|----------|-----------|--------|----------------------|---------------|-------------------|-------------------|
-| Claude | `-p` | `--output-format stream-json --include-partial-messages --verbose` | `--resume <id>` | `--session-id <uuid>` | `--mcp-config <file\|json> --strict-mcp-config` | `--permission-mode` / `--allowedTools` | Excellent |
-| Grok | `agent stdio` (ACP) | `session/update` notifications | `session/load <id>` | server-assigned via `session/new` | `mcpServers` on `session/new` (http/sse) | auto-allow `session/request_permission` | Excellent |
-| Codex | `exec` | `--json` | `exec resume <id> "prompt"` | — | `-c mcp_servers.*` overrides | `--sandbox <mode>` | Good |
-| Antigravity | `-p` | `--output-format json` (single blob; no NDJSON yet) | `--conversation <id>` | — (CLI assigns `conversation_id`) | `~/.gemini/config/mcp_config.json` (file-based) | `--dangerously-skip-permissions` / `--sandbox` / `settings.json` rules | Weak / experimental |
+| CLI | ACP agent command | Streaming | Resume | Session ID | MCP injection | Permissions |
+|-----|-------------------|-----------|--------|------------|---------------|-------------|
+| Grok | `grok agent stdio` | `session/update` | `session/load` | `session/new` (server) | `mcpServers` http/sse | auto-allow `session/request_permission` |
+| Claude | `claude-code-acp` | `session/update` | `session/load` | `session/new` (verify) | `mcpServers` http/sse | auto-allow `session/request_permission` |
+| Codex | `codex app-server --stdio` | `session/update` (verify) | `session/load` (verify) | `session/new` (verify) | `mcpServers` (verify) | verify sandbox via `-c` on spawn |
+| Antigravity | TBD | TBD | TBD | TBD | TBD | TBD |
 
 ---
 
 ## Recommendations for MVP
 
-1. Implement **Claude** first — best combination of streaming + explicit MCP support.
-2. Implement **Grok** second — ACP (`grok agent stdio`); per-session `mcpServers` injection.
-3. Add **Codex**.
-4. Add **Antigravity** last (treat as bonus/experimental).
+1. **Grok** — done (`grok agent stdio` + `acp-client.ts` reference).
+2. **Claude** — migrate `claude.ts` to ACP (`claude-code-acp`); delete headless `-p` path.
+3. **Codex** — implement on `codex app-server --stdio`; verify schema first.
+4. **Antigravity** — blocked until ACP entry exists.
 
-For each backend, create a small test script first that:
-- Runs a prompt
-- Continues with a known session ID
-- Passes MCP config
-- Exercises the permission policy (a turn that edits a file must succeed headlessly)
-- Prints normalized events to console
-
-This gives fast feedback before wiring into VS Code.
+For each new backend, create `scripts/test-<backend>.ts` that exercises ACP: prompt, resume, `mcpServers`, cancel, normalized events to console.
 
 ## Reference implementations (study before coding)
 
-Two battle-tested runners in sibling projects already solve process management (detached spawn, kill-tree, watchdog/stall detection, atomic state files) and output parsing:
-
-- **Codex**: `~/projects/codex_skill/skill-packs/codex-review/scripts/codex-runner.js` — headless `codex exec --json` per turn, prompt via stdin, `thread.started`/`turn.completed` lifecycle. Closest to our adapter model.
-- **Grok**: `~/projects/grok-implement/skill-packs/grok-implement/scripts/grok-runner.js` — ACP `grok agent stdio` broker. Different lifecycle than ours, but the authoritative source for Grok event shapes, MCP injection via `session/new`, cancel, and permission handling.
-- **Antigravity (plain-text shim)**: `agy-as-claude.sh` in ralphex — wraps agy plain output into Claude-style deltas. Useful if we need incremental text before agy ships real streaming.
+- **Grok (authoritative for Muster):** `~/projects/grok-implement/skill-packs/grok-implement/scripts/grok-runner.js` — ACP broker; event shapes, MCP, cancel.
+- **Grok Build VS Code plugin:** `study/grok-build-vscode-src/` — ACP dispatch patterns.
+- **Claude ACP adapter:** `@agentclientprotocol/claude-agent-acp` (formerly `@zed-industries/claude-code-acp`).
+- **Codex:** `codex app-server generate-json-schema` — protocol shapes (not `codex exec --json`).
 
 ## Open items to verify empirically
 
-- [x] ~~Exact event shape carrying the session/thread ID in `codex exec --json`~~ → `{"type":"thread.started","thread_id":...}` (confirmed by codex-runner.js).
-- [x] Grok ACP `session/update` shapes (reasoning, tools, cancel) — verified 0.2.87; Muster adapter uses ACP.
-- [x] ~~Antigravity headless JSON output + session ID~~ → `--output-format json` (hidden flag); `conversation_id` in single stdout JSON blob; `status`/`error`/`usage` confirmed on 1.0.16. **No** `--json` alias. `streaming-json`/`ndjson`/etc. not implemented yet.
-- [x] ~~Location of Antigravity MCP config~~ → primary path `~/.gemini/config/mcp_config.json`; permissions in `~/.gemini/antigravity-cli/settings.json`; project overrides in `~/.gemini/config/projects/<id>.json`.
-- [ ] Whether agy will add NDJSON/streaming tool events in a future release (re-check `--help` + `--output-format` values on upgrade).
-- [x] Grok per-session MCP via ACP `mcpServers` — http schema `{ type, name, url, headers }` verified; stdio rejected.
+- [x] Grok ACP `session/update` + cancel + `mcpServers` — verified 0.2.87.
+- [ ] Claude ACP `session/update` shapes via `claude-code-acp` on this machine.
+- [ ] Codex `app-server --stdio` ACP method parity (`session/new`, `session/load`, `session/update`).
+- [ ] Antigravity ACP entry command + `session/update` tool events.
+- [x] Grok `mcpServers` http schema verified; stdio rejected over ACP.
+
+---
+
+## Legacy headless modes (not used by Muster)
+
+The sections below are **reference only** for spikes and CLI exploration. Muster adapters must **not** implement these paths.
+
+### Claude `-p` + `stream-json` (legacy)
+
+```bash
+claude -p "prompt" --output-format stream-json --include-partial-messages --verbose
+claude -p "continue" --resume <id>
+claude -p "..." --mcp-config <file> --strict-mcp-config
+```
+
+### Grok `-p` + `streaming-json` (legacy)
+
+```bash
+grok -p "prompt" --output-format streaming-json
+```
+
+### Codex `exec --json` (legacy)
+
+```bash
+codex exec "prompt" --json
+codex exec resume <thread_id> "prompt"
+```
+
+### agy `-p` (legacy spike — see §Antigravity above for JSON blob shapes)

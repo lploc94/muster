@@ -1,5 +1,10 @@
 # Grok Backend Adapter — Implementation Plan
 
+> **⚠️ SUPERSEDED (2026-07-06):** This plan described the **headless** `grok -p`
+> adapter. Muster migrated Grok to **ACP** (`grok agent stdio`). The authoritative,
+> implemented design is in [`GROK-ACP-MIGRATION-PLAN.md`](GROK-ACP-MIGRATION-PLAN.md).
+> This file is kept for historical context only — do not implement from it.
+
 Target: add a **Grok "Build" CLI** backend to Muster that implements the `Backend`
 contract (`src/types.ts`, `docs/ADAPTER-SPEC.md`), mirroring `ClaudeBackend`, plus the
 minimal wiring needed to actually select it from the chat UI.

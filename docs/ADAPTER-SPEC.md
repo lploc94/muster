@@ -3,7 +3,7 @@
 This is the core contract between the coordinator and each CLI backend.
 
 **Guiding principles for this spec:**
-- One fresh process per turn (no long-lived agent processes managed by the plugin).
+- **ACP-only:** every backend adapter drives one ACP session per `run()` on a shared `<cli> agent stdio` connection (see `CLI-COMMANDS.md`). No headless `-p`/`exec` stdout parsing.
 - Explicit session IDs for resume (the coordinator, not the adapter, owns conversation identity).
 - MCP injection happens at turn start (so the agent can use tools like the context engine during that turn).
 - Streaming events normalized for UI (thinking + tool visibility).
@@ -37,7 +37,7 @@ export type NormalizedEvent =
 - Keep the set small and stable.
 - `reasoningDelta`, detailed tool events, and `meta` are optional capabilities.
 - `sessionStarted` is emitted **at most once per run**, as early as possible (usually from the first system/init event), and always before content events. `sessionId` may be omitted only when the CLI has not revealed it yet by end of turn (then the fallback below applies).
-- New-session ID strategy: if the CLI supports passing an explicit ID at creation time (e.g. Claude `--session-id <uuid>`), the coordinator may pre-generate a UUID and pass it in; otherwise the adapter captures the ID from CLI output. Verify per-CLI support in CLI-COMMANDS.md before relying on this.
+- New-session ID strategy: emit `sessionStarted` from the `session/new` response (server-assigned `sessionId`). Do not pre-generate IDs unless a backend's ACP implementation documents client-chosen IDs.
 - **Termination:** each `run()` must end with exactly one terminal event — either `{ type: 'turnCompleted' }` on success, or `{ type: 'error' }` on failure/cancellation. No events may follow the terminal event.
 - Operational failures (non-zero exit, parse errors that abort the turn, etc.) are represented by `{ type: 'error' }`, not thrown exceptions from the adapter. Unexpected programming errors may still reject the iterator.
 - `messageId` is required on `assistantDelta` and `reasoningDelta`; adapters synthesize stable per-run IDs when the provider does not supply them.
@@ -75,8 +75,9 @@ export interface Backend {
 
   /**
    * Run one turn. Returns an async iterable of normalized events.
-   * Must spawn a fresh process for this turn only.
-   * Must respect options.signal for cancellation (kill the child process).
+   * Open or resume one ACP session on the backend's shared agent connection,
+   * then drive session/prompt and map session/update → NormalizedEvent.
+   * Must respect options.signal for cancellation (ACP session/cancel).
    */
   run(options: RunOptions): AsyncIterable<NormalizedEvent>;
 
@@ -92,46 +93,41 @@ export interface Backend {
 
 ## Responsibilities of each Backend implementation
 
-- Build the exact CLI command + args (see CLI-COMMANDS.md for current known flags).
-- Inject MCP config using the mechanism that CLI supports (different per backend).
-- Use the correct streaming / JSON output flag.
-- Pass resume using the CLI's native flag (e.g. `--resume`, `--conversation`, `exec resume`).
-- Parse stdout (line-by-line or NDJSON) into NormalizedEvent as early as possible.
-- Yield `sessionStarted` as soon as the ID is known from the CLI.
-- Handle process lifecycle: errors, non-zero exit, user cancellation via signal.
-- Keep stderr for diagnostics / raw logging (do not swallow it silently).
-- Be defensive with output schemas (CLIs evolve).
+- Configure the backend's ACP agent spawn command (see CLI-COMMANDS.md).
+- Reuse or wrap the shared `AcpClient` (`src/backends/acp-client.ts`).
+- Inject MCP via `mcpServers` on `session/new` / `session/load` (`RunOptions.mcpServers`).
+- Resume via `session/load { sessionId }` when `resumeId` is set.
+- Map `session/update` notifications → `NormalizedEvent` as early as possible.
+- Yield `sessionStarted` immediately after `session/new` (or at start of `session/load`).
+- Handle ACP errors, agent process crash, and `session/cancel` on abort.
+- Be defensive with `sessionUpdate` shapes (CLIs evolve).
 
 ## Lifecycle clarification (important)
 
-- **Process** = one OS process for one turn.
 - **Turn** = one invocation of `run()` (what the adapter owns).
-- **Conversation / session** = long-lived history identified by the explicit ID the CLI gives us (what the coordinator stores and passes in `resumeId`).
+- **ACP agent process** = one long-lived stdio JSON-RPC peer per backend type (extension lifetime).
+- **ACP session** = one conversation slice on that agent (one per turn; `session/new` or `session/load`).
+- **Conversation / session** = long-lived history identified by the `sessionId` from `session/new` (what the coordinator stores and passes in `resumeId`).
 
 The adapter should not try to manage conversation history itself.
 
 ## Error & Cancellation
 
-- If `signal` is aborted: kill the child (and tree if possible), then yield `{ type: 'error', isCancellation: true, ... }` as the terminal event.
+- If `signal` is aborted: send ACP `session/cancel` for the active session, then yield `{ type: 'error', isCancellation: true, ... }` as the terminal event.
 - Distinguish user cancellation from other failures so the UI can react differently.
-- The runner (outside the adapter) must always clean up the child process.
+- The shared agent process stays alive; only the session ends. Dispose agent processes on extension deactivate.
 
 ## MCP handling
 
-MCP config injection is intentionally **per-backend** because each CLI has different mechanisms:
+MCP injection is **uniform over ACP**: pass `mcpServers` (http/sse entries) on `session/new` / `session/load` via `RunOptions.mcpServers`. stdio MCP is rejected by some agents over ACP — expose stdio servers (e.g. `context_engine`) via http/sse proxy or the Muster Bridge pattern.
 
-- Claude: `--mcp-config <file> --strict-mcp-config` (preferred)
-- Grok: often `.mcp.json` in cwd or global config (ephemeral support may be limited)
-- Codex: `-c` overrides or managed profile
-- Antigravity: `mcp_config.json`
-
-Do **not** force a single abstraction object for MCP servers in `RunOptions` at this stage. `mcpConfigPath` + backend-specific logic inside each adapter is acceptable and clearer for MVP.
+`mcpConfigPath` is legacy for the not-yet-migrated Claude headless adapter; new ACP adapters use `mcpServers` only.
 
 ## MVP Scope & Implementation order
 
 Start with:
-1. Claude (excellent streaming + explicit MCP support)
-2. Grok
+1. Grok (ACP reference implementation — done)
+2. Claude (ACP migration)
 
 Then:
 3. Codex

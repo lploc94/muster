@@ -16,5 +16,6 @@ Read in this order when onboarding:
 | [MCP-INJECTION.md](MCP-INJECTION.md) | `context_engine` + `coordinator` MCP per turn |
 | [MUSTER-BRIDGE.md](MUSTER-BRIDGE.md) | MCP `ask_user`, AskBridge, tool catalog |
 | [WEBVIEW.md](WEBVIEW.md) | Chat UI — Svelte, Vite, Tailwind, vscode-elements, postMessage protocol |
+| [GROK-ACP-MIGRATION-PLAN.md](GROK-ACP-MIGRATION-PLAN.md) | Grok backend — first ACP migration (completed; template for other CLIs) |
 
 All docs are living — update when CLI versions or spikes change behavior.

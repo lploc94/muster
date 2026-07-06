@@ -7,20 +7,21 @@ Open-source VS Code extension that **coordinates** multiple AI coding CLIs from 
 - [Codex CLI](https://github.com/openai/codex) (planned)
 - [Antigravity / agy](https://antigravity.google/product/antigravity-cli) (planned)
 
-**Status:** Early MVP — Claude backend + basic webview chat. See [docs/MVP-SCAFFOLD-PLAN.md](docs/MVP-SCAFFOLD-PLAN.md).
+**Status:** Early MVP — **ACP-only** architecture; Grok adapter done, Claude migration pending. See [docs/MVP-SCAFFOLD-PLAN.md](docs/MVP-SCAFFOLD-PLAN.md).
 
 ## Features (current & planned)
 
 | Feature | Status |
 |---------|--------|
-| Headless per-turn CLI spawn (Claude) | ✅ |
-| Claude `stream-json` adapter | ✅ (basic) |
-| Session resume (explicit ID) | ✅ |
-| Webview chat | ✅ (minimal) |
-| MCP context engine injection | 🔜 |
-| MCP `ask_user` (Muster Bridge) | 🔜 — [design](docs/MUSTER-BRIDGE.md) |
+| ACP client (`acp-client.ts`) | ✅ |
 | Grok ACP adapter (`grok agent stdio`) | ✅ (basic) |
-| Codex / agy backends | 🔜 |
+| Claude ACP adapter (`claude-code-acp`) | 🔜 (legacy headless code exists) |
+| Codex ACP adapter (`app-server --stdio`) | 🔜 |
+| Antigravity ACP adapter | 🔜 (entry TBD) |
+| Session resume (`session/load`) | ✅ |
+| Webview chat + backend picker | ✅ (minimal) |
+| MCP via `mcpServers` (context + Bridge) | 🔜 |
+| MCP `ask_user` (Muster Bridge) | 🔜 — [design](docs/MUSTER-BRIDGE.md) |
 
 ## Prerequisites
 

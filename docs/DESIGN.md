@@ -23,42 +23,45 @@ Build a VS Code extension that acts as a **coordinator** for multiple AI coding 
 - Rich permission system / approval cards
 - Native diff preview before apply
 - Plan mode / client-side gates
-- Long-lived bidirectional sessions (like full ACP)
-- Keeping agent processes alive across turns
+- Full ACP client capabilities for Grok (`fs`/`terminal` proxy — we declare them off)
+- Session pools or multi-turn brokers beyond what each CLI natively supports
 
 ## 2. Core Architectural Decisions
 
-### 2.1 Headless + Per-Turn Spawn
-- Every user message (or continue) results in **one fresh CLI process**.
-- No session pool, no long-running child processes.
-- The CLI itself is responsible for loading conversation history when we pass the correct resume flags + explicit session ID.
+### 2.1 ACP-only integration (all backends)
+- Muster talks to **every** backend through the [Agent Client Protocol](https://agentclientprotocol.com) (ACP) — JSON-RPC 2.0 over stdio. **No headless** `-p` / `exec` / NDJSON stdout adapters.
+- Every user message (or continue) = **one adapter `run()`** = **one ACP session** (`session/new` or `session/load`) on a shared agent connection for that backend.
+- One **shared** `<cli> agent stdio` (or equivalent ACP entry) process per backend type for the extension lifetime; we do **not** reuse ACP sessions across unrelated turns — each turn gets its own session ID.
+- Streaming arrives as ACP `session/update` notifications; MCP is injected per session via `mcpServers` on `session/new` / `session/load`.
+- Cancel via ACP `session/cancel` (not SIGKILL of the shared agent, except on extension shutdown).
 
 **Rationale**:
-- Matches the minimal requirements perfectly.
-- Much simpler than the Grok Build VS Code plugin (which needed persistent processes + ACP because of plan mode, live permissions, fs/terminal proxy, etc.).
-- Easier debugging, process cleanup, and resource usage.
+- One protocol for all backends → one `acp-client`, one event mapper, one MCP injection path.
+- Per-session `mcpServers` (http/sse) is the clean way to inject `context_engine` + `muster_bridge` without temp config files or races.
+- Structured tool/reasoning events and cancel are first-class in ACP.
+- We declare `fs`/`terminal` client capabilities **off** (agents use built-in tools) — not the full Grok Build VS Code plugin model.
 
 ### 2.2 Explicit Session IDs for Resume
 - Never rely solely on `--continue` / `--last` when the plugin can have multiple concurrent conversations in the same workspace.
 - Capture and persist the **explicit session ID** returned or used by each CLI.
-- When continuing, pass the ID using the CLI's resume flag (`--resume`, `--conversation`, etc.).
+- When continuing, pass the ID via ACP `session/load { sessionId }`.
 
-### 2.3 MCP Injection at Spawn Time
+### 2.3 MCP Injection at Turn Start
 - The "context engine" is provided to the agent as an **MCP server**.
-- We inject the MCP configuration at every spawn so the agent sees the tool during that turn.
-- MCP handling is **per-backend** (no single abstraction pretends all CLIs have identical flags).
+- We inject the MCP configuration at every turn so the agent sees the tool during that turn.
+- MCP handling is **uniform**: `mcpServers` on ACP `session/new` / `session/load` (http/sse entries; see `MCP-INJECTION.md`).
 
 ### 2.4 Streaming Output + Normalization
-- All backends are invoked with streaming/JSON output flags.
-- Output is parsed into a small set of **normalized events**.
+- All backends stream via ACP `session/update` notifications.
+- Updates are mapped into a small set of **normalized events**.
 - The UI only deals with the normalized model (makes it easy to add new backends later).
 
 ### 2.5 Human-in-the-Loop via Muster Bridge (MCP `ask_user`)
 - Agents ask structured questions through MCP tool `ask_user` on server `muster_bridge` — **MCP only**, no text/JSON fallback.
 - The **extension host** owns `AskBridge` (in-memory pending asks). The **webview** submits answers via `postMessage`; it does not call MCP directly.
 - Preferred transport: **HTTP MCP URL** served locally by the extension. stdio MCP + localhost callback is a fallback.
-- A turn remains **one CLI process per user message**, but the process may **pause** until the user answers (not a session pool).
-- **Claude `stream-json` first**; **agy deferred** until better streaming/tool events (spike proved MCP blocking works on agy 1.0.16).
+- A turn remains **one ACP session per user message**, but the session may **pause** until the user answers (not a session pool).
+- **Grok ACP first** (implemented); Claude/Codex/agy ACP adapters follow the same client (`acp-client.ts`).
 
 → Full design: **`docs/MUSTER-BRIDGE.md`**
 
@@ -84,34 +87,18 @@ type NormalizedEvent =
 - Make reasoning and some tool details optional capabilities per backend.
 - Always preserve raw/unknown events for debugging.
 
-## 4. Per-CLI Details (Headless + Resume + MCP + Streaming)
+## 4. Per-CLI ACP Entry Points
 
-### 4.1 Claude Code
-- Command: `claude -p "prompt" ...`
-- Resume: `--resume <id>` or `-c` (prefer explicit ID)
-- Streaming: `--output-format stream-json --include-partial-messages`
-- MCP: `--mcp-config <file> --strict-mcp-config`
-- Recommended flags for coordinator: `--bare` (optional, for speed) or avoid it if MCP discovery is wanted.
+Shared lifecycle for every backend: `initialize` → `authenticate` → `session/new|load` → `session/prompt` → `session/update`* → terminal `stopReason`. Details: `CLI-COMMANDS.md`.
 
-### 4.2 Grok
-- Command: `grok -p "prompt" ...`
-- Resume: `--resume <id>` or `--continue`
-- Streaming: `--output-format streaming-json`
-- MCP: Primarily discovered via `.mcp.json` / config (ephemeral injection may be limited → validate)
+| Backend | ACP agent command | Adapter status |
+|---------|-------------------|----------------|
+| Grok | `grok --no-auto-update agent stdio` | ✅ implemented |
+| Claude | `claude-code-acp` (ACP adapter; verify package name on bump) | 🔜 migrate from legacy headless code |
+| Codex | `codex app-server --stdio` (experimental) | 🔜 planned |
+| Antigravity | TBD — verify ACP entry when implementing | 🔜 experimental |
 
-### 4.3 Codex
-- Command: `codex exec "prompt" ...`
-- Resume: `codex exec resume <id>` or `--last`
-- Streaming: `--json`
-- MCP: Via config overrides (`-c mcp_servers...`) or managed profile
-
-### 4.4 Antigravity (agy)
-- Command: `agy -p "prompt" ...`
-- Resume: `--conversation <id>` or `--continue`
-- Streaming: Currently weakest (may fall back to text parsing)
-- MCP: Uses `mcp_config.json` (global/workspace)
-
-**Status**: Mark Antigravity as **experimental** until stable JSON streaming + MCP behavior is confirmed.
+All backends: `mcpServers` on `session/new`/`session/load`; `session/request_permission` → auto-allow in non-interactive coordinator mode; cancel → `session/cancel`.
 
 ## 5. High-Level Components
 
@@ -129,7 +116,8 @@ Extension
 ├── Muster Bridge
 │   ├── AskBridge (pending asks, in-memory)
 │   └── MusterMcpHttpServer (local HTTP MCP — `ask_user`)
-├── Runner (spawn + line-by-line parse + emit events)
+├── acp-client.ts (shared ACP JSON-RPC client per backend agent process)
+├── Runner (ACP session lifecycle + session/update → NormalizedEvent)
 └── UI (Webview)
     └── Chat view + question cards (submitAsk → AskBridge)
 ```
@@ -158,14 +146,14 @@ Each turn merges **two** MCP servers (details in `MCP-INJECTION.md`):
 1. **`context_engine`** — user-provided semantic search / codebase tools (stdio).
 2. **`muster_bridge`** — extension-owned `ask_user` for human-in-the-loop (`MUSTER-BRIDGE.md`).
 
-At spawn time we generate/pass a merged MCP config (or use per-CLI discovery). Goal: agents can search context **and** ask the user without leaving the turn.
+At turn start we generate/pass a merged MCP config (or use per-CLI discovery). Goal: agents can search context **and** ask the user without leaving the turn.
 
 ## 8. Implementation Roadmap (Suggested)
 
 1. **Design & Types** (this doc + `types.ts`)
 2. **TaskStore + TaskEngine** (versioned task, turn, message, and session-binding state)
 3. **Command builders** for all 4 CLIs (with MCP injection)
-4. **Runner + basic parser** for Claude + Grok first (best streaming support)
+4. **ACP client + event mapper** — Grok first (done), then Claude/Codex/agy on the same path
 5. **Minimal webview** that consumes normalized events
 6. **Muster Bridge** — `AskBridge` + HTTP MCP `ask_user` (Claude first)
 7. **Codex backend**
@@ -174,16 +162,15 @@ At spawn time we generate/pass a merged MCP config (or use per-CLI discovery). G
 
 ## 9. Risks & Open Questions
 
-- Grok `streaming-json` fidelity for reasoning + MCP tool events (needs contract test).
-- Antigravity structured output / streaming quality (agy `ask_user` spike OK; adapter/UI deferred — see `MUSTER-BRIDGE.md` §7).
-- Ephemeral MCP config support in Grok and Antigravity.
-- How reliably CLIs return / expose new session IDs after a turn.
-- Schema changes in CLI streaming formats over time.
+- Shared ACP agent blast radius (one crashed agent process affects all in-flight sessions on that backend).
+- Antigravity ACP entry point unverified (agy `ask_user` spike OK on legacy path — see `MUSTER-BRIDGE.md` §7).
+- stdio MCP servers (`context_engine`) need http/sse proxy for ACP injection — Muster Bridge is already http.
+- ACP `session/update` schema drift across CLI versions.
 
 ## 10. References
 
 - Grok Build VS Code plugin study (`study/grok-build-vscode-src/`)
-- Official CLI docs (headless, resume, MCP, streaming flags)
+- [Agent Client Protocol](https://agentclientprotocol.com) spec + per-CLI ACP entry commands (`CLI-COMMANDS.md`)
 - Model Context Protocol (MCP) specification
 - `docs/MUSTER-BRIDGE.md` — MCP `ask_user` + AskBridge design
 

@@ -7,9 +7,10 @@
 > recovery, and continuation semantics.
 
 ## Core Principle
-We do **not** keep agent processes alive.
-Each turn is a fresh process.
-The **CLI itself** manages conversation history on disk using session IDs.
+We do **not** keep ACP sessions alive across unrelated turns.
+Each turn is one adapter `run()` = one **ACP session** (`session/new` or `session/load`) on the backend's shared agent stdio connection.
+
+The **agent** manages conversation history on disk using `sessionId` values returned by `session/new`.
 
 The plugin only needs to:
 - Remember the **explicit session ID** from previous turns.
@@ -22,12 +23,9 @@ Who creates the ID, and how the coordinator learns it (flags verified in CLI-COM
 
 | Backend | New session | How we learn the ID | Resume |
 |---------|-------------|---------------------|--------|
-| Claude | **Muster pre-generates UUID** → `--session-id <uuid>` | Known upfront; also confirmed by the `init` system event in `stream-json` | `--resume <id>` |
-| Grok | **Muster pre-generates UUID** → `--session-id <uuid>` (must be a fresh UUID) | Known upfront | `--resume <id>` |
-| Codex | CLI generates a thread ID | `{"type":"thread.started","thread_id":...}` in `--json` output | `codex exec resume <id> "prompt"` |
-| Antigravity | Unclear — **verify** whether `--conversation <id>` accepts a client-chosen ID on first turn | TBD (plain-text output, no structured event) | `--conversation <id>` |
+| All (ACP) | `session/new { cwd, mcpServers }` | `sessionStarted` from `session/new` response (emit immediately) | `session/load { sessionId, cwd, mcpServers }` |
 
-**Rule of thumb: prefer pre-generated IDs wherever the CLI supports them** (Claude, Grok). The coordinator owns conversation identity from turn one and never depends on fragile output parsing. Extraction is then only needed for Codex (easy — one JSONL event) and Antigravity (hard — treat as experimental).
+**Rule of thumb:** session IDs are **server-assigned** via `session/new`. The coordinator stores the ID after a successful turn and passes it as `resumeId` on continue. Do not parse stdout for IDs (legacy headless paths).
 
 ## Explicit Session ID vs "Continue Last"
 
@@ -79,8 +77,8 @@ versioned task/turn store defined in `TASK-MANAGEMENT.md`.
 2. Look up stored `sessionId` for B.
 3. Build `RunOptions`:
    - Stored ID exists → set `resumeId`.
-   - No stored ID → new session. For Claude/Grok, pre-generate a UUID and pass it via the backend's new-session flag; that UUID is the candidate ID.
-4. Spawn the fresh CLI process; stream normalized events.
+   - No stored ID → ACP `session/new` and capture the server-assigned `sessionId`.
+4. Drive `session/prompt`; stream `session/update` → normalized events.
 5. During the turn: if `sessionStarted` carries a `sessionId`, that value is authoritative (may confirm the pre-generated one, or supply Codex's thread ID).
 6. On terminal event:
    - **`turnCompleted`** → commit the ID to the store. Fallback chain if no ID was observed: `sessionStarted.sessionId` → `extractSessionId(rawOutput, lastUsedId)` → the ID we passed in (see ADAPTER-SPEC.md).
@@ -97,12 +95,12 @@ limits. Never run two processes against the same session ID.
 
 - User clicks "New Session" or switches backend → clear the stored `sessionId` for that backend.
 - Next send starts without a resume flag → fresh conversation (with a fresh pre-generated UUID where supported).
-- **Forking** (post-MVP): Claude and Grok support `--fork-session` when resuming — branch a new session ID from existing history instead of appending. Useful for a "duplicate conversation" UI action later.
+- **Forking** (post-MVP): verify per-backend ACP fork support. Useful for a "duplicate conversation" UI action later.
 
 ## Cancellation
 
 If the user cancels mid-turn:
-- Abort via `RunOptions.signal`; the adapter kills the child (and process tree) and yields `{ type: 'error', isCancellation: true }` (see ADAPTER-SPEC.md).
+- Abort via `RunOptions.signal`; adapter sends ACP `session/cancel` and yields `{ type: 'error', isCancellation: true }` (see ADAPTER-SPEC.md).
 - Do **not** update the stored session ID.
 - The CLI may have persisted partial state — acceptable for MVP.
 

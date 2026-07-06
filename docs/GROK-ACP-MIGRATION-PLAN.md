@@ -1,5 +1,9 @@
 # Grok Backend — Headless → ACP Migration Plan
 
+> **Status: COMPLETED (2026-07-06).** First backend on Muster's **ACP-only** path.
+> Implemented in `src/backends/grok.ts` + `src/backends/acp-client.ts`.
+> Claude/Codex/agy follow the same client — see `DESIGN.md` §2.1 + `CLI-COMMANDS.md`.
+
 Convert the Grok backend adapter from **headless** (`grok -p` + `--output-format
 streaming-json`, spawn-per-turn) to **ACP** (`grok agent stdio`, persistent JSON-RPC
 agent). The `Backend`/`NormalizedEvent` contract and the webview stay unchanged; only
@@ -7,7 +11,7 @@ the Grok adapter's internals change. This unlocks clean, concurrency-safe per-se
 MCP injection (for the future Muster Bridge) and richer streaming (reasoning + tool
 events).
 
-**Implementer:** Grok. **Reviewer path:** `codex-plan-review` → implement → `codex-impl-review`.
+**Implementer:** Grok. **Reviewer path:** `codex-plan-review` → implement → `codex-impl-review` (done — APPROVE).
 
 ---
 

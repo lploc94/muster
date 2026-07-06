@@ -16,7 +16,7 @@ We do **not** need full VS Code UI or all 4 backends on day 1.
 
 Target: A Node/TypeScript script you can run from terminal that:
 - Takes a backend name + prompt
-- Spawns the real CLI in headless mode
+- Invokes the real CLI over **ACP** (`<cli> agent stdio` or equivalent)
 - Streams normalized events to console
 - Supports basic resume with explicit session ID
 - Optionally passes MCP config
@@ -27,16 +27,12 @@ Target: A Node/TypeScript script you can run from terminal that:
    - Copy NormalizedEvent from ADAPTER-SPEC.md
    - Define `RunOptions` and `Backend` interface
 
-2. `src/backends/claude.ts` (start here)
-   - Implement `run(options)`
-   - Build command using flags from CLI-COMMANDS.md
-   - Spawn with `child_process.spawn`
-   - Read stdout line by line
-   - Map to NormalizedEvent (start simple: assistantDelta + error)
-   - Handle process exit
+2. `src/backends/acp-client.ts` + `src/backends/grok.ts` (reference — done)
+   - Shared ACP JSON-RPC client
+   - `grok agent stdio`; one session per turn
 
-3. `src/backends/grok.ts` (second backend)
-   - Same shape as claude
+3. `src/backends/claude.ts` (migrate next)
+   - Replace legacy headless `-p` with `claude-code-acp` on `acp-client.ts`
 
 4. `src/runner.ts`
    - Small function: `runTurn(backend, options)`
@@ -60,7 +56,7 @@ Target: A Node/TypeScript script you can run from terminal that:
 ## Phase 2 — Add MCP + Polish one more backend
 
 - Make MCP injection work for real (copy a context-engine.json)
-- Add Codex or improve Grok streaming parser
+- Add Codex backend
 - Better error handling + cancellation
 
 ## Phase 3 — VS Code Integration (still thin)
@@ -83,7 +79,7 @@ Target: A Node/TypeScript script you can run from terminal that:
 - Do not support all 4 backends from the beginning
 - Do not implement rich permission / diff UI
 - Do not over-abstract MCP too early
-- Do not keep processes alive across turns
+- Do not reuse ACP sessions across unrelated turns (shared agent process is OK — see `DESIGN.md` §2.1)
 
 ## Recommended Order (Fastest Path to Working)
 
