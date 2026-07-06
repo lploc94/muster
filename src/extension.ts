@@ -522,6 +522,12 @@ export async function activate(context: vscode.ExtensionContext) {
     ? path.join(wsFolder.uri.fsPath, '.muster-tasks.json')
     : path.join(context.globalStorageUri.fsPath, '.muster-tasks.json');
 
+  // Ensure the store's parent directory exists before any store/lock IO. Without
+  // a workspace folder the path falls back to globalStorage, which VS Code does not
+  // create eagerly — otherwise lock creation fails with ENOENT and surfaces as the
+  // misleading "could not acquire store lock".
+  fs.mkdirSync(path.dirname(storePath), { recursive: true });
+
   runSessionMigration(context, workspaceRoot);
 
   const provider = new MusterChatProvider(context.extensionUri);
