@@ -1,32 +1,198 @@
 import { vscode } from './vscode';
 import type { NormalizedEvent, Question } from './types';
 
-// Extension host -> webview (docs/WEBVIEW.md §4.1). Phase 1 handles all but
-// askPending / historyChunk (later phases).
-export type ExtMessage =
-  | { type: 'turnStart'; runId: string; prompt: string; backend: string; resume: boolean }
-  | { type: 'event'; runId: string; event: NormalizedEvent }
-  | { type: 'turnDone'; runId: string }
-  | { type: 'turnError'; runId: string; message: string }
-  | { type: 'askPending'; id: string; questions: Question[] }
-  | { type: 'sessionReset' };
+export type TurnTrigger = 'user' | 'engine' | 'retry';
 
-// Webview -> extension host (docs/WEBVIEW.md §4.2). Phase 1 subset.
+export type TaskViewStatus =
+  | 'waiting_dependencies'
+  | 'queued'
+  | 'running'
+  | 'waiting_user'
+  | 'waiting_children'
+  | 'blocked'
+  | 'needs_recovery'
+  | 'idle'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled'
+  | 'skipped';
+
+export interface TaskSummary {
+  id: string;
+  parentId: string | null;
+  goal: string;
+  role: string;
+  lifecycle: string;
+  viewStatus: TaskViewStatus;
+  updatedAt: string;
+  continuationOf?: string;
+}
+
+export interface TranscriptItem {
+  id: string;
+  kind: 'user' | 'assistant' | 'tool' | 'error';
+  content: unknown;
+}
+
+export interface PendingAsk {
+  turnId: string;
+  askId: string;
+  questions: Question[];
+}
+
+export interface SnapshotMessage {
+  type: 'snapshot';
+  rootTasks: TaskSummary[];
+  focusedTaskId?: string;
+  subtree?: TaskSummary[];
+  transcript?: TranscriptItem[];
+  activeTurnId?: string;
+  storeRevision: number;
+  pendingAsk?: PendingAsk;
+}
+
+// Extension host -> webview (protocol v2, TASK-MODEL-PHASE-D-PLAN §4.1)
+export type ExtMessage =
+  | SnapshotMessage
+  | { type: 'taskUpdated'; taskId: string; storeRevision: number; patch: Partial<TaskSummary> }
+  | { type: 'turnStart'; taskId: string; turnId: string; trigger: TurnTrigger }
+  | { type: 'event'; taskId: string; turnId: string; event: NormalizedEvent }
+  | { type: 'turnDone'; taskId: string; turnId: string }
+  | { type: 'turnError'; taskId: string; turnId: string; message: string }
+  | { type: 'transcriptAppend'; taskId: string; item: TranscriptItem }
+  | { type: 'askPending'; taskId: string; turnId: string; askId: string; questions: Question[] }
+  | { type: 'askCleared'; taskId: string; turnId: string; askId: string }
+  | { type: 'commandError'; taskId?: string; message: string };
+
+export type AskAnswer = { selected: string[]; freeText: string | null };
+
+// Webview -> extension host (protocol v2)
 export type OutMessage =
-  | { type: 'send'; text: string; backend?: string; continueLast?: boolean }
-  | { type: 'newSession'; backend?: string }
-  | { type: 'cancelTurn' };
+  | { type: 'send'; taskId?: string; text: string; backend?: string; continuationOf?: string }
+  | { type: 'focusTask'; taskId: string }
+  | { type: 'hydrateSubtree'; taskId: string }
+  | { type: 'newTask' }
+  | { type: 'cancelTurn'; taskId: string; turnId: string }
+  | { type: 'submitAsk'; taskId: string; turnId: string; askId: string; answers: Record<string, AskAnswer> }
+  | { type: 'cancelAsk'; taskId: string; turnId: string; askId: string }
+  | { type: 'retryTurn'; taskId: string; turnId: string; instruction: string }
+  | { type: 'continueTask'; taskId: string; instruction: string }
+  | { type: 'resumeQueuedTurn'; taskId: string; turnId: string };
 
 /** Post a typed message to the extension host. */
 export function post(message: OutMessage): void {
   vscode.postMessage(message);
 }
 
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null;
+}
+
+function isString(v: unknown): v is string {
+  return typeof v === 'string';
+}
+
+function isNumber(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v);
+}
+
+function isTaskSummary(v: unknown): v is TaskSummary {
+  if (!isRecord(v)) return false;
+  return (
+    isString(v.id) &&
+    (v.parentId === null || isString(v.parentId)) &&
+    isString(v.goal) &&
+    isString(v.role) &&
+    isString(v.lifecycle) &&
+    isString(v.viewStatus) &&
+    isString(v.updatedAt)
+  );
+}
+
+function isTranscriptItem(v: unknown): v is TranscriptItem {
+  if (!isRecord(v)) return false;
+  const kind = v.kind;
+  return isString(v.id) && (kind === 'user' || kind === 'assistant' || kind === 'tool' || kind === 'error');
+}
+
+function isQuestion(v: unknown): v is Question {
+  if (!isRecord(v)) return false;
+  return isString(v.prompt);
+}
+
+const TURN_SCOPED_TYPES = new Set([
+  'turnStart',
+  'event',
+  'turnDone',
+  'turnError',
+  'askPending',
+  'askCleared',
+]);
+
 /** Minimal runtime guard for messages arriving from the extension host. */
 export function isExtMessage(data: unknown): data is ExtMessage {
-  return (
-    typeof data === 'object' &&
-    data !== null &&
-    typeof (data as { type?: unknown }).type === 'string'
-  );
+  if (!isRecord(data) || !isString(data.type)) return false;
+
+  const t = data.type;
+
+  if (TURN_SCOPED_TYPES.has(t)) {
+    if (!isString(data.taskId) || !isString(data.turnId)) return false;
+  }
+
+  switch (t) {
+    case 'snapshot':
+      return (
+        Array.isArray(data.rootTasks) &&
+        data.rootTasks.every(isTaskSummary) &&
+        isNumber(data.storeRevision) &&
+        (data.focusedTaskId === undefined || isString(data.focusedTaskId)) &&
+        (data.subtree === undefined || (Array.isArray(data.subtree) && data.subtree.every(isTaskSummary))) &&
+        (data.transcript === undefined || (Array.isArray(data.transcript) && data.transcript.every(isTranscriptItem))) &&
+        (data.activeTurnId === undefined || isString(data.activeTurnId)) &&
+        (data.pendingAsk === undefined ||
+          (isRecord(data.pendingAsk) &&
+            isString(data.pendingAsk.turnId) &&
+            isString(data.pendingAsk.askId) &&
+            Array.isArray(data.pendingAsk.questions) &&
+            data.pendingAsk.questions.every(isQuestion)))
+      );
+
+    case 'taskUpdated':
+      return isString(data.taskId) && isNumber(data.storeRevision) && isRecord(data.patch);
+
+    case 'turnStart':
+      return isString(data.trigger);
+
+    case 'event':
+      return isRecord(data.event) && isString((data.event as { type?: unknown }).type);
+
+    case 'turnDone':
+      return true;
+
+    case 'turnError':
+      return isString(data.message);
+
+    case 'transcriptAppend':
+      return isString(data.taskId) && isTranscriptItem(data.item);
+
+    case 'askPending':
+      return isString(data.askId) && Array.isArray(data.questions) && data.questions.every(isQuestion);
+
+    case 'askCleared':
+      return isString(data.askId);
+
+    case 'commandError':
+      return isString(data.message) && (data.taskId === undefined || isString(data.taskId));
+
+    default:
+      return false;
+  }
+}
+
+export function isTerminalStatus(status: TaskViewStatus): boolean {
+  return status === 'succeeded' || status === 'failed' || status === 'cancelled' || status === 'skipped';
+}
+
+export function statusLabel(status: TaskViewStatus): string {
+  return status.replace(/_/g, ' ');
 }

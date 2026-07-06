@@ -1,7 +1,9 @@
 <script lang="ts">
-  import { thread } from '../lib/turn-state.svelte';
+  import { threadStore } from '../lib/thread.svelte';
   import MessageBubble from './MessageBubble.svelte';
   import ToolCard from './ToolCard.svelte';
+
+  const thread = $derived(threadStore.current);
 
   let scrollEl: HTMLDivElement | undefined;
   let pinned = true;
@@ -11,14 +13,12 @@
     return el.scrollHeight - el.scrollTop - el.clientHeight < BOTTOM_THRESHOLD_PX;
   }
 
-  // Measure BEFORE the DOM grows so we know whether the user was pinned.
   $effect.pre(() => {
     void thread.items.length;
     void thread.streaming?.text;
     if (scrollEl) pinned = isNearBottom(scrollEl);
   });
 
-  // After the DOM updates, only auto-scroll if the user was already at the bottom.
   $effect(() => {
     void thread.items.length;
     void thread.streaming?.text;
@@ -52,6 +52,6 @@
   {/if}
 
   {#if thread.items.length === 0 && !thread.streaming}
-    <div class="text-center mt-4" style="opacity: 0.6;">Start a conversation with Claude.</div>
+    <div class="text-center mt-4" style="opacity: 0.6;">No messages yet.</div>
   {/if}
 </div>

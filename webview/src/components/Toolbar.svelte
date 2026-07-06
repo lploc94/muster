@@ -1,27 +1,28 @@
 <script lang="ts">
-  import { thread, registerBackendSelect } from '../lib/turn-state.svelte';
+  import { tasks, registerBackendSelect } from '../lib/tasks.svelte';
+  import { threadStore } from '../lib/thread.svelte';
   import { post } from '../lib/protocol';
 
-  function newSession() {
-    post({ type: 'newSession', backend: thread.backend });
-  }
+  const thread = $derived(threadStore.current);
 
-  // vscode-single-select dispatches input+change; bind:value keeps thread.backend in sync.
   let backendSelect: (HTMLElement & { value: string }) | undefined;
 
   function syncBackendFromSelect(e: Event) {
     const el = (e.currentTarget ?? backendSelect) as (HTMLElement & { value: string }) | undefined;
     const next = el?.value;
     if (next === 'claude' || next === 'grok') {
-      thread.setBackend(next);
+      tasks.setBackend(next);
     }
+  }
+
+  function newTask() {
+    tasks.openNewTaskDraft();
+    post({ type: 'newTask' });
   }
 
   $effect(() => {
     registerBackendSelect(backendSelect);
   });
-
-  const shortId = $derived(thread.sessionId ? thread.sessionId.slice(0, 8) : null);
 </script>
 
 <div
@@ -32,8 +33,8 @@
 
   <vscode-single-select
     bind:this={backendSelect}
-    value={thread.backend}
-    title="Backend"
+    value={tasks.selectedBackend}
+    title="Backend (new tasks)"
     disabled={thread.running}
     onchange={syncBackendFromSelect}
     oninput={syncBackendFromSelect}
@@ -42,15 +43,11 @@
     <vscode-option value="grok">Grok</vscode-option>
   </vscode-single-select>
 
-  {#if shortId}
-    <vscode-badge title={thread.sessionId}>{shortId}</vscode-badge>
-  {/if}
-
   <span class="flex-1"></span>
 
   {#if thread.running}
     <vscode-badge>running…</vscode-badge>
   {/if}
 
-  <vscode-button secondary onclick={newSession}>New Session</vscode-button>
+  <vscode-button secondary onclick={newTask}>New task</vscode-button>
 </div>

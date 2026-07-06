@@ -5,6 +5,7 @@ import { AskBridge } from '../bridge/ask-bridge';
 import { CredentialRegistry } from '../bridge/credentials';
 import { runTurn as defaultRunTurn } from '../runner';
 import type { Backend, NormalizedEvent, RunOptions } from '../types';
+import type { TurnTrigger } from './types';
 import { canBindTaskToBackend } from './backend-eligibility';
 import { deriveViewStatus } from './derived-status';
 import type { DepGraph } from './deps';
@@ -62,6 +63,12 @@ export interface DispositionLimits {
   maxError: number;
 }
 
+export type EngineEvent =
+  | { type: 'turnStart'; taskId: string; turnId: string; trigger: TurnTrigger }
+  | { type: 'event'; taskId: string; turnId: string; event: NormalizedEvent }
+  | { type: 'turnDone'; taskId: string; turnId: string }
+  | { type: 'turnError'; taskId: string; turnId: string; message: string };
+
 export interface TaskEngineConfig {
   store: TaskStore;
   makeBackend: (name: string) => Backend;
@@ -72,6 +79,9 @@ export interface TaskEngineConfig {
   credentialRegistry?: CredentialRegistry;
   bridgePort?: number;
   resourceLimits?: ResourceLimits;
+  emit?: (e: EngineEvent) => void;
+  /** When false, reload reconciliation preserves queued turns without scheduling them. Default true. */
+
 }
 
 export type EngineResult<T> =
@@ -277,7 +287,10 @@ export class TaskEngine {
   private readonly credentialRegistry?: CredentialRegistry;
   private readonly bridgePort: number;
   private readonly resourceLimits: ResourceLimits;
+  private readonly emit?: (e: EngineEvent) => void;
   private readonly liveRuns = new Map<string, AbortController>();
+  /** Queued turns preserved on reload — start only via resumeQueuedTurn. */
+  private readonly deferredQueuedTurns = new Set<string>();
   private readonly acceptedOpIds = new Map<string, string>();
   private readonly turnPromises = new Map<string, Promise<void>>();
   private readonly pendingAskPromises = new Map<string, { promise: Promise<Answers>; fingerprint: string }>();
@@ -294,6 +307,15 @@ export class TaskEngine {
     this.credentialRegistry = config.credentialRegistry;
     this.bridgePort = config.bridgePort ?? 0;
     this.resourceLimits = config.resourceLimits ?? DEFAULT_RESOURCE_LIMITS;
+    this.emit = config.emit;
+  }
+
+  private safeEmit(event: EngineEvent): void {
+    try {
+      this.emit?.(event);
+    } catch {
+      // emission is best-effort and state-free
+    }
   }
 
   private graphDeps(): GraphEngineDeps {
@@ -388,6 +410,137 @@ export class TaskEngine {
     const engine = new TaskEngine(config, config.store.getStorePath());
     engine.reconcileReload();
     return engine;
+  }
+
+  startNewTask(params: {
+    goal: string;
+    backend: string;
+    continuationOf?: string;
+    role?: TaskRole;
+  }): EngineResult<{ taskId: string; messageId: string; turnId: string }> {
+    const backend = this.makeBackend(params.backend);
+    if (!canBindTaskToBackend(backend.capabilities)) {
+      return { ok: false, reason: 'backend does not support MCP' };
+    }
+
+    const taskId = randomUUID();
+    const messageId = randomUUID();
+    const turnId = randomUUID();
+    const now = nowIso(this.clock);
+    const input: CreateTaskInput = {
+      id: taskId,
+      role: params.role ?? 'coordinator',
+      goal: params.goal,
+      continuationOf: params.continuationOf,
+      parentId: null,
+      dependencies: [],
+      backend: params.backend,
+      capabilities: ['create_child', 'start_child', 'wait_child', 'read_subtree'],
+      executionPolicy: DEFAULT_POLICY,
+    };
+
+    const commit = this.store.commit((draft) => {
+      if (draft.tasks[taskId]) {
+        return { ok: false, reason: 'task id already exists' };
+      }
+      const graph = depGraphFromFile(draft);
+      const created = createTask(input, { rootId: taskId, graph, now });
+      if (!created.ok) {
+        return created;
+      }
+      draft.tasks[taskId] = created.next;
+
+      draft.messages[messageId] = {
+        id: messageId,
+        taskId,
+        role: 'user',
+        content: params.goal,
+        state: 'pending',
+        createdAt: now,
+      };
+
+      const queued = transitionStartTask(created.next, [], {
+        turnId,
+        now,
+        inputs: [{ kind: 'message', messageId }],
+      });
+      if (!queued.ok) {
+        return queued;
+      }
+      draft.turns[turnId] = queued.next;
+      return { ok: true };
+    });
+
+    if (!commit.ok) {
+      return { ok: false, reason: commit.detail ?? commit.reason };
+    }
+
+    void this.scheduleTurn(turnId);
+    return { ok: true, value: { taskId, messageId, turnId } };
+  }
+
+  continueTaskWithMessage(
+    taskId: string,
+    instruction: string,
+  ): EngineResult<{ messageId: string; turnId: string }> {
+    const messageId = randomUUID();
+    const turnId = randomUUID();
+    const now = nowIso(this.clock);
+
+    const commit = this.store.commit((draft) => {
+      const task = draft.tasks[taskId];
+      if (!task) {
+        return { ok: false, reason: 'task not found' };
+      }
+      if (isTerminalLifecycle(task.lifecycle)) {
+        return { ok: false, reason: 'task is terminal' };
+      }
+
+      draft.messages[messageId] = {
+        id: messageId,
+        taskId,
+        role: 'user',
+        content: instruction,
+        state: 'pending',
+        createdAt: now,
+      };
+
+      const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
+      if (!turnCap.ok) {
+        return turnCap;
+      }
+
+      const queued = transitionContinueTask(task, turnsForTask(draft, taskId), {
+        turnId,
+        now,
+        inputs: [{ kind: 'message', messageId }],
+      });
+      if (!queued.ok) {
+        return queued;
+      }
+      draft.turns[turnId] = queued.next;
+      return { ok: true };
+    });
+
+    if (!commit.ok) {
+      return { ok: false, reason: commit.detail ?? commit.reason };
+    }
+
+    void this.scheduleTurn(turnId);
+    return { ok: true, value: { messageId, turnId } };
+  }
+
+  resumeQueuedTurn(turnId: string): EngineResult<void> {
+    const turn = this.store.getFile().turns[turnId];
+    if (!turn) {
+      return { ok: false, reason: 'turn not found' };
+    }
+    if (turn.status !== 'queued') {
+      return { ok: false, reason: 'turn is not queued' };
+    }
+    this.deferredQueuedTurns.delete(turnId);
+    void this.scheduleTurn(turnId);
+    return { ok: true, value: undefined };
   }
 
   async whenIdle(): Promise<void> {
@@ -700,9 +853,19 @@ export class TaskEngine {
       this.credentialRegistry?.revoke(turn.id);
     }
 
-    this.reconcileChildWaits();
+    this.reconcileChildWaits({ schedule: false });
+    this.deferReloadQueuedTurns();
     this.reconcileTaskTimeouts();
     processCancelRequests(this.graphDeps());
+  }
+
+  /** Every persisted queued turn survives reload unscheduled until an explicit resume. */
+  private deferReloadQueuedTurns(): void {
+    for (const turn of Object.values(this.store.getFile().turns)) {
+      if (turn.status === 'queued') {
+        this.deferredQueuedTurns.add(turn.id);
+      }
+    }
   }
 
   private reconcileTaskTimeouts(): void {
@@ -750,7 +913,8 @@ export class TaskEngine {
     }
   }
 
-  private reconcileChildWaits(): void {
+  private reconcileChildWaits(options?: { schedule?: boolean }): void {
+    const schedule = options?.schedule ?? true;
     const file = this.store.getFile();
     const now = nowIso(this.clock);
     for (const task of Object.values(file.tasks)) {
@@ -789,11 +953,17 @@ export class TaskEngine {
         }
         return { ok: true };
       });
-      if (commit.ok) {
-        const continuation = this.store.getFile().turns[continuationTurnId];
-        if (continuation?.status === 'queued') {
-          void this.scheduleTurn(continuationTurnId);
-        }
+      if (!commit.ok) {
+        continue;
+      }
+      const continuation = this.store.getFile().turns[continuationTurnId];
+      if (continuation?.status !== 'queued') {
+        continue;
+      }
+      if (schedule) {
+        void this.scheduleTurn(continuationTurnId);
+      } else {
+        this.deferredQueuedTurns.add(continuationTurnId);
       }
     }
   }
@@ -861,6 +1031,9 @@ export class TaskEngine {
       this.turnPromises.delete(turnId);
       const queued = Object.values(this.store.getFile().turns).filter((t) => t.status === 'queued');
       for (const turn of queued) {
+        if (this.deferredQueuedTurns.has(turn.id)) {
+          continue;
+        }
         if (tryPromoteTurn(this.store, turn.id, this.resourceLimits)) {
           void this.scheduleTurn(turn.id);
         }
@@ -927,6 +1100,16 @@ export class TaskEngine {
       return;
     }
 
+    const startedTurn = this.store.getFile().turns[turnId];
+    if (startedTurn) {
+      this.safeEmit({
+        type: 'turnStart',
+        taskId: startedTurn.taskId,
+        turnId,
+        trigger: startedTurn.trigger,
+      });
+    }
+
     const abort = new AbortController();
     this.liveRuns.set(turnId, abort);
     const turnTimeoutMs = task.executionPolicy.turnTimeoutMs;
@@ -963,6 +1146,14 @@ export class TaskEngine {
           rawOutput,
           backend,
         );
+        if (terminalSettled) {
+          this.safeEmit({
+            type: 'turnError',
+            taskId: turn.taskId,
+            turnId,
+            message: `backend factory failed: ${message}`,
+          });
+        }
         return;
       }
       const current = this.store.getFile();
@@ -982,6 +1173,17 @@ export class TaskEngine {
         processCancelRequests(this.graphDeps());
         if (terminalSettled) {
           break;
+        }
+
+        if (
+          event.type === 'assistantDelta' ||
+          event.type === 'reasoningDelta' ||
+          event.type === 'toolStarted' ||
+          event.type === 'toolUpdated' ||
+          event.type === 'toolCompleted' ||
+          event.type === 'usage'
+        ) {
+          this.safeEmit({ type: 'event', taskId: turn.taskId, turnId, event });
         }
 
         switch (event.type) {
@@ -1027,13 +1229,17 @@ export class TaskEngine {
               return { ok: true };
             });
             if (!commit.ok) {
+              const failMessage = commit.detail ?? 'assistant persistence failed';
               terminalSettled = await this.settleFailed(
                 turnId,
-                commit.detail ?? 'assistant persistence failed',
+                failMessage,
                 observedSessionId,
                 rawOutput,
                 backend,
               );
+              if (terminalSettled) {
+                this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message: failMessage });
+              }
               break;
             }
             break;
@@ -1043,7 +1249,9 @@ export class TaskEngine {
             break;
           case 'turnCompleted':
             terminalSettled = await this.settleSuccess(turnId, observedSessionId, rawOutput, backend);
-            if (!terminalSettled) {
+            if (terminalSettled) {
+              this.safeEmit({ type: 'turnDone', taskId: turn.taskId, turnId });
+            } else {
               terminalSettled = await this.settleFailed(
                 turnId,
                 'failed to settle successful turn',
@@ -1051,13 +1259,27 @@ export class TaskEngine {
                 rawOutput,
                 backend,
               );
+              if (terminalSettled) {
+                this.safeEmit({
+                  type: 'turnError',
+                  taskId: turn.taskId,
+                  turnId,
+                  message: 'failed to settle successful turn',
+                });
+              }
             }
             break;
           case 'error':
             if (event.isCancellation) {
               terminalSettled = await this.settleInterrupted(turnId, observedSessionId, rawOutput, backend);
+              if (terminalSettled) {
+                this.safeEmit({ type: 'turnDone', taskId: turn.taskId, turnId });
+              }
             } else {
               terminalSettled = await this.settleFailed(turnId, event.message, observedSessionId, rawOutput, backend);
+              if (terminalSettled) {
+                this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message: event.message });
+              }
             }
             if (!terminalSettled) {
               terminalSettled = await this.settleFailed(
@@ -1067,6 +1289,14 @@ export class TaskEngine {
                 rawOutput,
                 backend,
               );
+              if (terminalSettled) {
+                this.safeEmit({
+                  type: 'turnError',
+                  taskId: turn.taskId,
+                  turnId,
+                  message: 'failed to settle error turn',
+                });
+              }
             }
             break;
           default:
@@ -1082,11 +1312,22 @@ export class TaskEngine {
           rawOutput,
           backend,
         );
+        if (terminalSettled) {
+          this.safeEmit({
+            type: 'turnError',
+            taskId: turn.taskId,
+            turnId,
+            message: 'turn ended without terminal event',
+          });
+        }
       }
     } catch (error) {
       if (!terminalSettled) {
         const message = error instanceof Error ? error.message : String(error);
         terminalSettled = await this.settleFailed(turnId, message, observedSessionId, rawOutput, backend);
+        if (terminalSettled) {
+          this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message });
+        }
       }
     } finally {
       clearInterval(cancelPoll);

@@ -11,6 +11,7 @@ export interface StoreOptions {
   schemaVersion?: number;
   lockMaxWaitMs?: number;
   lockRetryMs?: number;
+  onCommit?: (file: TaskStoreFile, affectedTaskIds: string[]) => void;
 }
 
 export type ApplyResult = { ok: true } | { ok: false; reason: string };
@@ -194,12 +195,58 @@ function rebuildIndexes(file: TaskStoreFile): {
   return { rootOf, childIdsOf: childIds, viewStatusOf };
 }
 
+export function computeAffectedTaskIds(before: TaskStoreFile, after: TaskStoreFile): string[] {
+  const affected = new Set<string>();
+
+  const allTaskIds = new Set([...Object.keys(before.tasks), ...Object.keys(after.tasks)]);
+  for (const id of allTaskIds) {
+    const prev = before.tasks[id];
+    const next = after.tasks[id];
+    if (JSON.stringify(prev) !== JSON.stringify(next)) {
+      if (next) {
+        affected.add(id);
+      } else if (prev) {
+        affected.add(prev.id);
+      }
+    }
+  }
+
+  const allTurnIds = new Set([...Object.keys(before.turns), ...Object.keys(after.turns)]);
+  for (const id of allTurnIds) {
+    const prev = before.turns[id];
+    const next = after.turns[id];
+    if (JSON.stringify(prev) !== JSON.stringify(next)) {
+      if (next) {
+        affected.add(next.taskId);
+      } else if (prev) {
+        affected.add(prev.taskId);
+      }
+    }
+  }
+
+  const allMessageIds = new Set([...Object.keys(before.messages), ...Object.keys(after.messages)]);
+  for (const id of allMessageIds) {
+    const prev = before.messages[id];
+    const next = after.messages[id];
+    if (JSON.stringify(prev) !== JSON.stringify(next)) {
+      if (next) {
+        affected.add(next.taskId);
+      } else if (prev) {
+        affected.add(prev.taskId);
+      }
+    }
+  }
+
+  return [...affected];
+}
+
 export class TaskStore {
   private readonly filePath: string;
   private readonly schemaVersion: number;
   private readonly lockPath: string;
   private readonly lockMaxWaitMs: number;
   private readonly lockRetryMs: number;
+  private readonly onCommit?: (file: TaskStoreFile, affectedTaskIds: string[]) => void;
   private file: TaskStoreFile;
   private rootOfIndex = new Map<string, string>();
   private childIdsIndex = new Map<string, string[]>();
@@ -212,6 +259,7 @@ export class TaskStore {
     this.lockPath = `${filePath}.lock`;
     this.lockMaxWaitMs = opts.lockMaxWaitMs ?? 5_000;
     this.lockRetryMs = opts.lockRetryMs ?? 25;
+    this.onCommit = opts.onCommit;
     this.file = file;
     this.refreshIndexes();
   }
@@ -244,6 +292,11 @@ export class TaskStore {
 
   getFile(): Readonly<TaskStoreFile> {
     return this.file;
+  }
+
+  reload(): void {
+    this.file = readFreshFile(this.filePath, this.schemaVersion);
+    this.refreshIndexes();
   }
 
   getTask(id: string): MusterTask | undefined {
@@ -327,8 +380,11 @@ export class TaskStore {
       return { ok: false, reason: 'io_error', detail: 'could not acquire store lock' };
     }
     this.ownedLock = lock;
+    let result: CommitResult = { ok: false, reason: 'io_error', detail: 'commit did not complete' };
+    let onCommitPayload: { file: TaskStoreFile; affectedTaskIds: string[] } | undefined;
     try {
       let draft: TaskStoreFile;
+      let loadFailed = false;
       try {
         draft = readFreshFile(this.filePath, this.schemaVersion);
       } catch (error) {
@@ -337,43 +393,64 @@ export class TaskStore {
           draft = emptyEnvelope(this.schemaVersion);
         } else {
           preserveCorruptFile(this.filePath);
-          return {
+          result = {
             ok: false,
             reason: 'io_error',
             detail: `corrupt store preserved: ${err.message}`,
           };
+          loadFailed = true;
+          draft = emptyEnvelope(this.schemaVersion);
         }
       }
 
-      const result = apply(draft);
-      if (!result.ok) {
-        return { ok: false, reason: 'rejected', detail: result.reason };
-      }
+      if (!loadFailed) {
+        const before = cloneFile(draft);
+        const applyResult = apply(draft);
+        if (!applyResult.ok) {
+          result = { ok: false, reason: 'rejected', detail: applyResult.reason };
+        } else {
+          draft.revision += 1;
+          draft.schemaVersion = this.schemaVersion;
 
-      draft.revision += 1;
-      draft.schemaVersion = this.schemaVersion;
+          const tempPath = `${this.filePath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+          let writeFailed = false;
+          try {
+            fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+            fs.writeFileSync(tempPath, JSON.stringify(draft, null, 2), 'utf8');
+            fs.renameSync(tempPath, this.filePath);
+          } catch (error) {
+            try {
+              fs.unlinkSync(tempPath);
+            } catch {
+              // ignore
+            }
+            const err = error as NodeJS.ErrnoException;
+            result = { ok: false, reason: 'io_error', detail: err.message };
+            writeFailed = true;
+          }
 
-      const tempPath = `${this.filePath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
-      try {
-        fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
-        fs.writeFileSync(tempPath, JSON.stringify(draft, null, 2), 'utf8');
-        fs.renameSync(tempPath, this.filePath);
-      } catch (error) {
-        try {
-          fs.unlinkSync(tempPath);
-        } catch {
-          // ignore
+          if (!writeFailed) {
+            this.file = draft;
+            this.refreshIndexes();
+            if (this.onCommit) {
+              onCommitPayload = { file: draft, affectedTaskIds: computeAffectedTaskIds(before, draft) };
+            }
+            result = { ok: true, revision: draft.revision, file: this.file };
+          }
         }
-        const err = error as NodeJS.ErrnoException;
-        return { ok: false, reason: 'io_error', detail: err.message };
       }
-
-      this.file = draft;
-      this.refreshIndexes();
-      return { ok: true, revision: draft.revision, file: this.file };
     } finally {
       this.releaseLock(lock);
       this.ownedLock = undefined;
     }
+    // onCommit runs after the store lock is released so nested commits (e.g. retention) can acquire it.
+    if (onCommitPayload && this.onCommit) {
+      try {
+        this.onCommit(onCommitPayload.file, onCommitPayload.affectedTaskIds);
+      } catch {
+        // onCommit is best-effort and must not affect persisted state
+      }
+    }
+    return result;
   }
 }

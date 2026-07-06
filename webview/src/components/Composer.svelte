@@ -1,22 +1,64 @@
 <script lang="ts">
-  import { thread, resolveBackendForSend } from '../lib/turn-state.svelte';
+  import { threadStore } from '../lib/thread.svelte';
+  import { tasks, resolveBackendForSend } from '../lib/tasks.svelte';
   import { post } from '../lib/protocol';
+  import type { PendingAsk } from '../lib/protocol';
 
-  // vscode-textarea is a custom element exposing a `.value` property.
+  interface Props {
+    mode: 'draft' | 'task';
+    taskId?: string;
+    turnId?: string | null;
+    readOnly?: boolean;
+    pendingAsk?: PendingAsk | null;
+  }
+
+  let {
+    mode,
+    taskId,
+    turnId = null,
+    readOnly = false,
+    pendingAsk = null,
+  }: Props = $props();
+
+  const thread = $derived(threadStore.current);
+
   let textareaEl: (HTMLElement & { value: string }) | undefined;
 
+  const blocked = $derived(!!pendingAsk || readOnly);
+  const canSend = $derived(!thread.running && !blocked);
+  const canCancel = $derived(thread.running && !!taskId && !!turnId);
+
   function send() {
-    if (thread.running || !textareaEl) return;
+    if (!canSend || !textareaEl) return;
     const value = (textareaEl.value ?? '').trim();
     if (!value) return;
-    const backend = resolveBackendForSend();
-    thread.setBackend(backend);
-    post({ type: 'send', text: value, backend });
+
+    if (mode === 'draft') {
+      const backend = resolveBackendForSend();
+      tasks.setBackend(backend);
+      const payload: {
+        type: 'send';
+        text: string;
+        backend: string;
+        continuationOf?: string;
+      } = { type: 'send', text: value, backend };
+      if (tasks.continuationOf) payload.continuationOf = tasks.continuationOf;
+      threadStore.current.appendTranscript({
+        id: `local-${Date.now()}`,
+        kind: 'user',
+        content: value,
+      });
+      post(payload);
+    } else if (taskId) {
+      post({ type: 'send', taskId, text: value });
+    }
+
     textareaEl.value = '';
   }
 
   function cancel() {
-    post({ type: 'cancelTurn' });
+    if (!canCancel || !taskId || !turnId) return;
+    post({ type: 'cancelTurn', taskId, turnId });
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -25,22 +67,32 @@
       send();
     }
   }
+
+  const placeholder = $derived(
+    mode === 'draft'
+      ? `New task message (${tasks.selectedBackend})…`
+      : readOnly
+        ? 'Thread is read-only.'
+        : pendingAsk
+          ? 'Answer the pending question above…'
+          : `Message…`,
+  );
 </script>
 
 <div class="border-t p-2 flex flex-col gap-2" style="border-color: var(--vscode-panel-border);">
   <vscode-textarea
     bind:this={textareaEl}
     rows={3}
-    placeholder={`Message ${thread.backend}…  (Enter to send, Shift+Enter for newline)`}
-    disabled={thread.running}
+    placeholder={placeholder}
+    disabled={!canSend}
     onkeydown={onKeydown}
     style="width: 100%;"
   ></vscode-textarea>
 
   <div class="flex gap-2 justify-end">
-    {#if thread.running}
+    {#if canCancel}
       <vscode-button secondary onclick={cancel}>Cancel</vscode-button>
-    {:else}
+    {:else if canSend}
       <vscode-button onclick={send}>Send</vscode-button>
     {/if}
   </div>

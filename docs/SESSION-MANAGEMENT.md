@@ -1,9 +1,9 @@
 # Session Management (MVP)
 
-> **Scope:** Backend identity and resume behavior in this document applies to both
-> flows. Sections describing one flat session per backend document the current
-> legacy chat-only implementation. In the task-based flow, each task owns its
-> session and `TASK-MANAGEMENT.md` is authoritative for storage, concurrency, turn
+> **Scope:** Backend identity and resume behavior in this document applies to the
+> **task-based flow** (the sole shipping path). The legacy flat chat flow and
+> `.muster-sessions.json` were retired in Phase E — existing files are archived on
+> activation. `TASK-MANAGEMENT.md` is authoritative for storage, concurrency, turn
 > recovery, and continuation semantics.
 
 ## Core Principle
@@ -38,29 +38,17 @@ Reasons:
 
 **Rule for MVP:** always pass an explicit session ID when resuming, using the CLI's resume flag.
 
-## Storage (current legacy chat flow)
+## Storage (retired legacy chat flow)
 
-### Current implementation: JSON file in workspace
-- File: `.muster-sessions.json` in the workspace root — implemented in `src/session-store.ts` (`getSessionId` / `saveSessionId`).
-- Flat structure, one active session per backend per workspace:
-```json
-{
-  "claude": "session-uuid-123",
-  "grok": "grok-session-456"
-}
-```
-- **Add it to `.gitignore`** — session IDs are machine-local state, not project content.
-- Write atomically (tmp file + rename) to prevent partial files — see the
-  `atomicWrite` pattern in the reference runners (`CLI-COMMANDS.md` → reference
-  implementations). Atomic replacement does not prevent lost updates between VS
-  Code windows; supporting that requires a single writer, lock, or compare-and-swap
-  revision.
+### `.muster-sessions.json` — archived, not used
 
-### Legacy alternative: VS Code `workspaceState`
-Easier persistence across restarts, harder to inspect manually. Migrate once the JSON file has proven the flow; keep the flat schema so migration is trivial.
+The flat per-backend session file is **retired**. On extension activation, if
+`.muster-sessions.json` exists in the workspace root it is **archived** by atomic
+rename to `.muster-sessions.json.migrated` (or `.muster-sessions.json.corrupt` if
+unparseable). A one-time notice is shown; there is **no** session-import path.
 
-Do not expand this flat file into a task store. The task flow replaces it with the
-versioned task/turn store defined in `TASK-MANAGEMENT.md`.
+The authoritative store is `.muster-tasks.json` (versioned `TaskStoreFile`). Per-task
+`committedSessionId` replaces the flat `{ backend: sessionId }` map.
 
 ## Storage (target task flow)
 
@@ -71,31 +59,28 @@ versioned task/turn store defined in `TASK-MANAGEMENT.md`.
 - A failed/interrupted turn retains diagnostic candidate IDs but does not replace
   the committed task binding.
 
-## Turn lifecycle & ID update rules (legacy flow)
+## Turn lifecycle & ID update rules (task flow)
 
-1. User sends a message for backend B.
-2. Look up stored `sessionId` for B.
+1. User sends a message on a task (or starts a new root task).
+2. `TaskEngine` reads `MusterTask.committedSessionId` for resume.
 3. Build `RunOptions`:
-   - Stored ID exists → set `resumeId`.
-   - No stored ID → ACP `session/new` and capture the server-assigned `sessionId`.
+   - Committed ID exists → set `resumeId`.
+   - No committed ID → ACP `session/new` and capture the server-assigned `sessionId`.
 4. Drive `session/prompt`; stream `session/update` → normalized events.
-5. During the turn: if `sessionStarted` carries a `sessionId`, that value is authoritative (may confirm the pre-generated one, or supply Codex's thread ID).
+5. During the turn: candidate IDs live on `TaskTurn`; `sessionStarted` is authoritative.
 6. On terminal event:
-   - **`turnCompleted`** → commit the ID to the store. Fallback chain if no ID was observed: `sessionStarted.sessionId` → `extractSessionId(rawOutput, lastUsedId)` → the ID we passed in (see ADAPTER-SPEC.md).
-   - **`error` (including cancellation)** → do **not** commit a new ID; keep the previous stored value. (With pre-generated IDs the CLI may still have created partial history under the new ID — acceptable for MVP; the next send simply starts fresh or resumes the old ID.)
-
-**Legacy concurrency rule:** at most one in-flight turn per backend per workspace,
-because the flat flow has only one current session for that backend.
+   - **`turnCompleted`** → commit the ID to `MusterTask.committedSessionId` (see `TASK-MANAGEMENT.md` §10).
+   - **`error` / interrupt** → do **not** replace the committed binding.
 
 **Task-flow correctness rule:** at most one active turn per task/session. Different
 task sessions may run concurrently subject to verified backend and global scheduler
 limits. Never run two processes against the same session ID.
 
-## New Session (legacy flow)
+## New task (replaces New Session)
 
-- User clicks "New Session" or switches backend → clear the stored `sessionId` for that backend.
-- Next send starts without a resume flag → fresh conversation (with a fresh pre-generated UUID where supported).
-- **Forking** (post-MVP): verify per-backend ACP fork support. Useful for a "duplicate conversation" UI action later.
+- User clicks **New task** → unpersisted composer; first `send` calls `startNewTask`.
+- **Continue as new task** on a terminal task creates a new root coordinator with
+  `continuationOf` set — UI grouping only, never reopens the old task.
 
 ## Cancellation
 
@@ -104,14 +89,8 @@ If the user cancels mid-turn:
 - Do **not** update the stored session ID.
 - The CLI may have persisted partial state — acceptable for MVP.
 
-## Migration
+## Migration (Phase E — complete)
 
-- Keep `.muster-sessions.json` only while the chat-only path remains available.
-- Do not add multiple-session metadata to that flat schema.
-- Once task flow is the default, migrate or archive the current IDs and remove the
-  legacy store.
-- Implement conversation continuation as a new task with a fresh or explicitly
-  forked session; never share one session ID between tasks.
-
-For the current legacy UI: **one active session ID per backend per workspace,
-committed only after a successful turn.**
+- Legacy `.muster-sessions.json` is **archive-only** on activation (`src/task/migration-sessions.ts`).
+- Marker: `muster.sessionMigration.v1` in `workspaceState` (idempotent).
+- No adopt/import of legacy session IDs — start new tasks instead.

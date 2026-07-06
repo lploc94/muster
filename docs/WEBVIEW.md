@@ -437,10 +437,13 @@ The webview never holds the whole thread. Render a **recent window**; older item
 - Enter sends; Shift+Enter newline (standard chat pattern).
 - **Re-enable on `turnDone` OR `turnError`.** A normal adapter `error` NormalizedEvent (non-zero exit, cancellation) arrives via an `event` message and is then followed by `turnDone`; only an uncaught host/adapter failure sends `turnError`. Treat either terminal message as end-of-turn so the composer never gets stuck.
 
-### Session
+### Session / tasks
 
-- `newSession` clears in-memory `lastSessionId` in extension host and sends `sessionReset`.
-- “Continue last” passes `continueLast: true` on `send` — extension loads `.muster-sessions.json` (see SESSION-MANAGEMENT).
+- **New task** opens an unpersisted composer; first `send` has no `taskId` → `startNewTask`.
+- **Continue as new task** on a terminal thread sends `send { text, continuationOf }` (no `taskId`).
+- Legacy flat chat, `newSession`, and “Continue last” (`.muster-sessions.json`) were removed in Phase E.
+- **`needs_recovery`**: explicit **Retry** (required instruction) and **Continue** (required message) controls.
+- **Reload-preserved queued turn**: **Resume** → `resumeQueuedTurn`.
 
 ### Webview persistence (host-owned transcript + lazy scrollback)
 

@@ -7,7 +7,7 @@ Open-source VS Code extension that **coordinates** multiple AI coding CLIs from 
 - [Codex CLI](https://github.com/openai/codex) (planned)
 - [Antigravity / agy](https://antigravity.google/product/antigravity-cli) (planned)
 
-**Status:** Early MVP — **ACP-only** architecture; Grok adapter done, Claude migration pending. See [docs/MVP-SCAFFOLD-PLAN.md](docs/MVP-SCAFFOLD-PLAN.md).
+**Status:** Early MVP — **ACP-only**, **task-model** architecture (`TaskEngine` is the sole host path). Grok adapter done, Claude migration pending. Legacy flat chat and `.muster-sessions.json` were removed in Phase E (archived on first activation). See [docs/TASK-MANAGEMENT.md](docs/TASK-MANAGEMENT.md).
 
 ## Features (current & planned)
 
@@ -19,9 +19,12 @@ Open-source VS Code extension that **coordinates** multiple AI coding CLIs from 
 | Codex ACP adapter (`app-server --stdio`) | 🔜 |
 | Antigravity ACP adapter | 🔜 (entry TBD) |
 | Session resume (`session/load`) | ✅ |
-| Webview chat + backend picker | ✅ (minimal) |
-| MCP via `mcpServers` (context + Bridge) | 🔜 |
-| MCP `ask_user` (Muster Bridge) | 🔜 — [design](docs/MUSTER-BRIDGE.md) |
+| Task model (`TaskStore` + `TaskEngine`) | ✅ |
+| Webview task UI (list + workspace, protocol v2) | ✅ |
+| Muster Bridge + coordinator tools | ✅ |
+| MCP via `mcpServers` (context + Bridge) | ✅ |
+| MCP `ask_user` (Muster Bridge) | ✅ — [design](docs/MUSTER-BRIDGE.md) |
+| Reload recovery UI (Retry / Continue / Resume) | ✅ |
 
 ## Prerequisites
 

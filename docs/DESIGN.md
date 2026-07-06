@@ -111,7 +111,7 @@ Extension
 │   ├── codex.ts
 │   └── antigravity.ts
 ├── TaskStore + TaskEngine (task graph, turns, orchestration — see `docs/TASK-MANAGEMENT.md`)
-├── SessionStore (legacy flat chat-session path during migration)
+├── Session migration (archive-only `.muster-sessions.json` → `.migrated` on activation)
 ├── CommandBuilder / MCPConfig helpers
 ├── Muster Bridge
 │   ├── AskBridge (pending asks, in-memory)
@@ -124,9 +124,9 @@ Extension
 
 ## 6. Session Management
 
-The current chat-only implementation owns a small store of
-`{ workspace, backend, sessionId }`. This is a migration path, not the target task
-model.
+The extension is **engine-only**: there is no flat per-backend session file or
+second persistence path. On activation, a present `.muster-sessions.json` is
+archived (never silently dropped); new work always starts as tasks.
 
 In the task-based flow:
 
