@@ -71,6 +71,7 @@
     "vscode:prepublish": "npm run compile",
     "mvp:claude": "tsx scripts/test-runner.ts",
     "mvp:grok": "tsx scripts/test-grok.ts",
+    "mvp:task": "tsx scripts/test-task.ts",
     "test:agy-ask": "node scripts/test-agy-ask-mcp.mjs",
     "test": "vitest run",
     "test:watch": "vitest"
