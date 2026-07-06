@@ -13,8 +13,8 @@ export type ExtMessage =
 
 // Webview -> extension host (docs/WEBVIEW.md §4.2). Phase 1 subset.
 export type OutMessage =
-  | { type: 'send'; text: string; continueLast?: boolean }
-  | { type: 'newSession' }
+  | { type: 'send'; text: string; backend?: string; continueLast?: boolean }
+  | { type: 'newSession'; backend?: string }
   | { type: 'cancelTurn' };
 
 /** Post a typed message to the extension host. */

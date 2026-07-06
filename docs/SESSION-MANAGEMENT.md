@@ -1,5 +1,11 @@
 # Session Management (MVP)
 
+> **Scope:** Backend identity and resume behavior in this document applies to both
+> flows. Sections describing one flat session per backend document the current
+> legacy chat-only implementation. In the task-based flow, each task owns its
+> session and `TASK-MANAGEMENT.md` is authoritative for storage, concurrency, turn
+> recovery, and continuation semantics.
+
 ## Core Principle
 We do **not** keep agent processes alive.
 Each turn is a fresh process.
@@ -34,9 +40,9 @@ Reasons:
 
 **Rule for MVP:** always pass an explicit session ID when resuming, using the CLI's resume flag.
 
-## Storage (MVP)
+## Storage (current legacy chat flow)
 
-### Option 1 (current implementation): JSON file in workspace
+### Current implementation: JSON file in workspace
 - File: `.muster-sessions.json` in the workspace root — implemented in `src/session-store.ts` (`getSessionId` / `saveSessionId`).
 - Flat structure, one active session per backend per workspace:
 ```json
@@ -46,14 +52,28 @@ Reasons:
 }
 ```
 - **Add it to `.gitignore`** — session IDs are machine-local state, not project content.
-- Write atomically (tmp file + rename) to survive concurrent turns/windows — see the `atomicWrite` pattern in the reference runners (CLI-COMMANDS.md → Reference implementations).
+- Write atomically (tmp file + rename) to prevent partial files — see the
+  `atomicWrite` pattern in the reference runners (`CLI-COMMANDS.md` → reference
+  implementations). Atomic replacement does not prevent lost updates between VS
+  Code windows; supporting that requires a single writer, lock, or compare-and-swap
+  revision.
 
-### Option 2 (later): VS Code `workspaceState`
+### Legacy alternative: VS Code `workspaceState`
 Easier persistence across restarts, harder to inspect manually. Migrate once the JSON file has proven the flow; keep the flat schema so migration is trivial.
 
-Richer metadata (names, timestamps, multiple sessions per backend) is a post-MVP schema change — don't add it to the file until the UI needs it.
+Do not expand this flat file into a task store. The task flow replaces it with the
+versioned task/turn store defined in `TASK-MANAGEMENT.md`.
 
-## Turn lifecycle & ID update rules
+## Storage (target task flow)
+
+- `MusterTask.committedSessionId` is the only committed session binding.
+- Candidate/observed IDs for a running invocation live on its `TaskTurn`.
+- Session IDs are never shared across tasks.
+- The task store commits the ID only after adapter `turnCompleted`.
+- A failed/interrupted turn retains diagnostic candidate IDs but does not replace
+  the committed task binding.
+
+## Turn lifecycle & ID update rules (legacy flow)
 
 1. User sends a message for backend B.
 2. Look up stored `sessionId` for B.
@@ -66,9 +86,14 @@ Richer metadata (names, timestamps, multiple sessions per backend) is a post-MVP
    - **`turnCompleted`** → commit the ID to the store. Fallback chain if no ID was observed: `sessionStarted.sessionId` → `extractSessionId(rawOutput, lastUsedId)` → the ID we passed in (see ADAPTER-SPEC.md).
    - **`error` (including cancellation)** → do **not** commit a new ID; keep the previous stored value. (With pre-generated IDs the CLI may still have created partial history under the new ID — acceptable for MVP; the next send simply starts fresh or resumes the old ID.)
 
-**Concurrency rule:** at most **one in-flight turn per backend per workspace**. Queue or reject sends while a turn is running — two processes resuming the same session concurrently corrupts or forks history unpredictably (the reference runners gate on this too: "poll before resume").
+**Legacy concurrency rule:** at most one in-flight turn per backend per workspace,
+because the flat flow has only one current session for that backend.
 
-## New Session
+**Task-flow correctness rule:** at most one active turn per task/session. Different
+task sessions may run concurrently subject to verified backend and global scheduler
+limits. Never run two processes against the same session ID.
+
+## New Session (legacy flow)
 
 - User clicks "New Session" or switches backend → clear the stored `sessionId` for that backend.
 - Next send starts without a resume flag → fresh conversation (with a fresh pre-generated UUID where supported).
@@ -81,11 +106,14 @@ If the user cancels mid-turn:
 - Do **not** update the stored session ID.
 - The CLI may have persisted partial state — acceptable for MVP.
 
-## Future Improvements (post MVP)
+## Migration
 
-- Multiple named sessions per backend (schema: `{ backend: [{ id, name, updatedAt }] }`).
-- Session list UI with names/timestamps; fork via `--fork-session`.
-- Persist session metadata (last prompt, model used, etc.).
-- Move storage to `workspaceState` once the flow is stable.
+- Keep `.muster-sessions.json` only while the chat-only path remains available.
+- Do not add multiple-session metadata to that flat schema.
+- Once task flow is the default, migrate or archive the current IDs and remove the
+  legacy store.
+- Implement conversation continuation as a new task with a fresh or explicitly
+  forked session; never share one session ID between tasks.
 
-For now: **one active session ID per backend per workspace, committed only after a successful turn.**
+For the current legacy UI: **one active session ID per backend per workspace,
+committed only after a successful turn.**

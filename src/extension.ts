@@ -1,12 +1,26 @@
 import * as vscode from 'vscode';
 import { randomUUID } from 'crypto';
 import { ClaudeBackend } from './backends/claude';
+import { makeBackend } from './backends/index';
 import { RunOptions } from './types';
 import * as fs from 'fs';
 import * as path from 'path';
 
-let lastSessionId: string | undefined;
-let suppressFileResume = false;
+interface BackendSessionState {
+  lastSessionId?: string;
+  suppressFileResume?: boolean;
+}
+
+const backendSessions = new Map<string, BackendSessionState>();
+
+function getBackendState(backend: string): BackendSessionState {
+  let state = backendSessions.get(backend);
+  if (!state) {
+    state = {};
+    backendSessions.set(backend, state);
+  }
+  return state;
+}
 
 class MusterChatProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'muster.chat';
@@ -33,19 +47,25 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     webviewView.webview.onDidReceiveMessage(async (data) => {
       switch (data?.type) {
         case 'send':
-          await this._handleSend(data.text, data.continueLast || false, webviewView.webview);
+          await this._handleSend(
+            data.text,
+            data.backend || 'claude',
+            data.continueLast || false,
+            webviewView.webview,
+          );
           break;
         case 'cancelTurn':
           this._currentRun?.controller.abort();
           break;
         case 'newSession': {
-          // Invalidate the current run BEFORE aborting so a late event from the
-          // aborted turn cannot restore the just-reset session (ISSUE-1).
           const run = this._currentRun;
           this._currentRun = undefined;
           run?.controller.abort();
-          lastSessionId = undefined;
-          suppressFileResume = true;
+          const backend = data.backend || 'claude';
+          const state = getBackendState(backend);
+          state.lastSessionId = undefined;
+          state.suppressFileResume = true;
+          this._clearSessionId(backend);
           webviewView.webview.postMessage({ type: 'sessionReset' });
           break;
         }
@@ -53,23 +73,38 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  private async _handleSend(text: string, _continueLast: boolean, webview: vscode.Webview) {
+  private async _handleSend(
+    text: string,
+    backendName: string,
+    _continueLast: boolean,
+    webview: vscode.Webview,
+  ) {
+    if (this._currentRun) {
+      return;
+    }
+
     const runId = randomUUID();
     const controller = new AbortController();
     this._currentRun = { runId, controller };
 
-    const backend = new ClaudeBackend();
+    const backend = makeBackend(backendName);
+    const state = getBackendState(backend.name);
     const options: RunOptions = { prompt: text, signal: controller.signal };
 
-    // Resume the active in-memory session; otherwise fall back to the persisted
-    // one unless a New Session was just requested (docs/WEBVIEW.md §8).
-    if (lastSessionId) {
-      options.resumeId = lastSessionId;
-    } else if (!suppressFileResume) {
-      const wsSession = this._loadSessionId();
+    const wsFolder = vscode.workspace.workspaceFolders?.[0];
+    if (wsFolder) {
+      options.cwd = wsFolder.uri.fsPath;
+    }
+
+    if (state.lastSessionId) {
+      options.resumeId = state.lastSessionId;
+    } else if (!state.suppressFileResume) {
+      const wsSession = this._loadSessionId(backend.name);
       if (wsSession) options.resumeId = wsSession;
     }
-    suppressFileResume = false;
+    state.suppressFileResume = false;
+
+    let stagedSessionId: string | undefined;
 
     webview.postMessage({
       type: 'turnStart',
@@ -81,19 +116,22 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
 
     try {
       for await (const event of backend.run(options)) {
+        if (this._currentRun?.runId !== runId) break;
+
         webview.postMessage({ type: 'event', runId, event });
-        // Only persist the session ID while THIS run is still active — a
-        // superseded/reset run must not restore a stale session (ISSUE-1).
-        if (
-          event.type === 'sessionStarted' &&
-          event.sessionId &&
-          this._currentRun?.runId === runId
-        ) {
-          lastSessionId = event.sessionId;
-          this._saveSessionId(event.sessionId);
+
+        if (event.type === 'sessionStarted' && event.sessionId) {
+          stagedSessionId = event.sessionId;
+        } else if (event.type === 'turnCompleted') {
+          if (stagedSessionId && this._currentRun?.runId === runId) {
+            state.lastSessionId = stagedSessionId;
+            this._saveSessionId(backend.name, stagedSessionId);
+          }
         }
       }
-      webview.postMessage({ type: 'turnDone', runId });
+      if (this._currentRun?.runId === runId) {
+        webview.postMessage({ type: 'turnDone', runId });
+      }
     } catch (err: any) {
       webview.postMessage({ type: 'turnError', runId, message: err?.message ?? String(err) });
     } finally {
@@ -101,34 +139,48 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private _loadSessionId(): string | undefined {
+  private _loadSessionId(backend: string): string | undefined {
     const wsFolder = vscode.workspace.workspaceFolders?.[0];
     if (!wsFolder) return undefined;
     const file = path.join(wsFolder.uri.fsPath, '.muster-sessions.json');
     if (!fs.existsSync(file)) return undefined;
     try {
       const data = JSON.parse(fs.readFileSync(file, 'utf8'));
-      return data['claude'];
+      return data[backend];
     } catch {
       return undefined;
     }
   }
 
-  private _saveSessionId(id: string | undefined) {
+  private _saveSessionId(backend: string, id: string | undefined) {
     if (!id) return;
     const wsFolder = vscode.workspace.workspaceFolders?.[0];
     if (!wsFolder) return;
     const file = path.join(wsFolder.uri.fsPath, '.muster-sessions.json');
     let data: any = {};
     if (fs.existsSync(file)) {
-      try { data = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
+      try {
+        data = JSON.parse(fs.readFileSync(file, 'utf8'));
+      } catch {}
     }
-    data['claude'] = id;
+    data[backend] = id;
     try {
       fs.writeFileSync(file, JSON.stringify(data, null, 2));
     } catch {
-      // Best-effort persistence — a read-only/failed FS must not abort the turn (ISSUE-2).
+      // Best-effort persistence — a read-only/failed FS must not abort the turn.
     }
+  }
+
+  private _clearSessionId(backend: string) {
+    const wsFolder = vscode.workspace.workspaceFolders?.[0];
+    if (!wsFolder) return;
+    const file = path.join(wsFolder.uri.fsPath, '.muster-sessions.json');
+    if (!fs.existsSync(file)) return;
+    try {
+      const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+      delete data[backend];
+      fs.writeFileSync(file, JSON.stringify(data, null, 2));
+    } catch {}
   }
 
   private _getHtmlForWebview(webview: vscode.Webview): string {
@@ -158,13 +210,13 @@ export function activate(context: vscode.ExtensionContext) {
   const provider = new MusterChatProvider(context.extensionUri);
 
   context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider(MusterChatProvider.viewType, provider)
+    vscode.window.registerWebviewViewProvider(MusterChatProvider.viewType, provider),
   );
 
   context.subscriptions.push(
     vscode.commands.registerCommand('muster.openChat', () => {
       vscode.commands.executeCommand('workbench.view.extension.muster');
-    })
+    }),
   );
 
   context.subscriptions.push(
@@ -176,7 +228,7 @@ export function activate(context: vscode.ExtensionContext) {
         'tleClaudeQuick',
         'Claude Quick',
         vscode.ViewColumn.Beside,
-        { enableScripts: true }
+        { enableScripts: true },
       );
 
       panel.webview.html = `<html><body>
@@ -203,9 +255,9 @@ export function activate(context: vscode.ExtensionContext) {
       const backend = new ClaudeBackend();
       const opts: RunOptions = { prompt };
 
-      // load last session ID if possible
       const ws = vscode.workspace.workspaceFolders?.[0];
       if (ws) {
+        opts.cwd = ws.uri.fsPath;
         const f = path.join(ws.uri.fsPath, '.muster-sessions.json');
         if (fs.existsSync(f)) {
           try {
@@ -215,19 +267,24 @@ export function activate(context: vscode.ExtensionContext) {
         }
       }
 
+      let stagedSessionId: string | undefined;
       for await (const ev of backend.run(opts)) {
         panel.webview.postMessage({ type: 'event', event: ev });
         if (ev.type === 'sessionStarted' && ev.sessionId) {
-          if (ws) {
-            const f = path.join(ws.uri.fsPath, '.muster-sessions.json');
-            let data: any = {};
-            if (fs.existsSync(f)) { try { data = JSON.parse(fs.readFileSync(f, 'utf8')); } catch {} }
-            data.claude = ev.sessionId;
-            fs.writeFileSync(f, JSON.stringify(data, null, 2));
+          stagedSessionId = ev.sessionId;
+        } else if (ev.type === 'turnCompleted' && stagedSessionId && ws) {
+          const f = path.join(ws.uri.fsPath, '.muster-sessions.json');
+          let data: any = {};
+          if (fs.existsSync(f)) {
+            try {
+              data = JSON.parse(fs.readFileSync(f, 'utf8'));
+            } catch {}
           }
+          data.claude = stagedSessionId;
+          fs.writeFileSync(f, JSON.stringify(data, null, 2));
         }
       }
-    })
+    }),
   );
 }
 

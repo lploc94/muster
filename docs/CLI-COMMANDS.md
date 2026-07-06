@@ -5,7 +5,7 @@ This document contains the exact commands, flags, and behaviors for headless usa
 Use this as the source of truth when implementing each backend.
 
 > **Verified against** (2026-07-06, from `--help` + empirical runs on this machine):
-> Claude Code 2.1.201 · Grok 0.2.82 · codex-cli 0.142.1 · agy 1.0.16
+> Claude Code 2.1.201 · Grok 0.2.87 · codex-cli 0.142.1 · agy 1.0.16
 >
 > CLI flags change over time. When bumping a CLI version, re-check the flags used by its adapter and update this doc (the adapter should also log the CLI version at turn start — see ADAPTER-SPEC.md).
 
@@ -134,8 +134,24 @@ For MVP:
 
 `grok mcp doctor` is useful when debugging discovery/connectivity.
 
+### `streaming-json` event shapes (verified 0.2.87)
+
+NDJSON — one JSON object per line. Only three event types observed in headless mode:
+
+```jsonl
+{"type":"thought","data":"The"}                 // reasoning, token-by-token
+{"type":"text","data":"hello"}                  // assistant answer, token-by-token
+{"type":"end","stopReason":"EndTurn","sessionId":"<uuid>","requestId":"<uuid>"}
+```
+
+- `thought` = reasoning deltas; `text` = assistant deltas (concatenate `data` chunks).
+- `end` is the **only** terminal marker; `sessionId` appears **only** in `end` (after content).
+- **No structured tool events** in headless `streaming-json` — tool activity is internal to Grok.
+- `--session-id <uuid>` is honored for new sessions (v4 UUID verified).
+- `stopReason` observed: `EndTurn` (success). Map `Error`/`Refusal` to adapter errors if seen.
+- Permission mode `default` completes noninteractively for edit + shell turns (least-permissive verified).
+
 ### Notes
-- `streaming-json` gives incremental events — empirically verify the exact shape of reasoning and tool events before finalizing the parser.
 - `--max-turns <N>` exists as a safety rail.
 
 ### Alternative: ACP mode (`grok agent stdio`) — proven, but long-lived

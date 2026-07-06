@@ -3,7 +3,12 @@
   import { post } from '../lib/protocol';
 
   function newSession() {
-    post({ type: 'newSession' });
+    post({ type: 'newSession', backend: thread.backend });
+  }
+
+  function onBackendChange(e: Event) {
+    const el = e.currentTarget as HTMLElement & { value: string };
+    thread.backend = el.value;
   }
 
   const shortId = $derived(thread.sessionId ? thread.sessionId.slice(0, 8) : null);
@@ -15,8 +20,14 @@
 >
   <span class="font-semibold">Muster</span>
 
-  <vscode-single-select disabled value="claude" title="Backend">
+  <vscode-single-select
+    value={thread.backend}
+    title="Backend"
+    disabled={thread.running}
+    onchange={onBackendChange}
+  >
     <vscode-option value="claude">Claude</vscode-option>
+    <vscode-option value="grok">Grok</vscode-option>
   </vscode-single-select>
 
   {#if shortId}

@@ -2,6 +2,12 @@
 
 Authoritative spec for the Muster chat sidebar webview: tech stack, folder layout, `postMessage` protocol, rendering rules, and MVP phases.
 
+> **Scope:** The concrete `runId` / `newSession` protocol below describes the
+> current single-chat UI. The task-based target adds `taskId`, renames `runId` to
+> the persisted `turnId`, and replaces New Session with New Task as specified in
+> `TASK-MANAGEMENT.md` §14. Rendering and streaming rules in this document remain
+> applicable.
+
 **Related docs (do not duplicate here):**
 - [`ADAPTER-SPEC.md`](ADAPTER-SPEC.md) — `NormalizedEvent` types and adapter invariants
 - [`MUSTER-BRIDGE.md`](MUSTER-BRIDGE.md) — `ask_user` + AskBridge (§3.2–3.3), extension↔webview messages (§6)

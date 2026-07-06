@@ -122,6 +122,11 @@ On `submit`:
 
 ## 4. MCP tool catalog
 
+> **Task-flow extension:** `TASK-MANAGEMENT.md` defines additional orchestration
+> and self-disposition tools. They are exposed only through turn-scoped capability
+> credentials and are not general-purpose bridge utilities. This section remains
+> authoritative for non-task IDE/human-in-the-loop tools.
+
 **Principle:** `muster_bridge` is **thin**. Only tools that need the **VS Code extension host** or **blocking human input**. Everything else stays on the CLI (Read/Edit/Bash) or on **`context_engine`** (semantic search).
 
 ### 4.1 Do NOT put on `muster_bridge`
@@ -195,7 +200,9 @@ Aligns with DESIGN.md “permission cards” — currently **out of scope**, but
 - **`run_terminal` / `read_file`** — CLI already has these; coordinator should not proxy.
 - **`search_codebase`** — belongs on `context_engine`.
 - **`switch_backend` / `new_session`** — user-driven coordinator actions, not agent tools.
-- **Large tool surface** — every tool is prompt noise; prefer ≤ 4 tools on `muster_bridge` for MVP+Phase 2.
+- **Large utility surface** — every tool is prompt noise; prefer ≤ 4 non-task
+  utilities for MVP+Phase 2. Task-management tools are filtered by caller role and
+  capability rather than exposed to every turn.
 
 ---
 

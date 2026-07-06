@@ -70,6 +70,7 @@
     "watch:webview": "vite build --config webview/vite.config.ts --watch",
     "vscode:prepublish": "npm run compile",
     "mvp:claude": "tsx scripts/test-runner.ts",
+    "mvp:grok": "tsx scripts/test-grok.ts",
     "test:agy-ask": "node scripts/test-agy-ask-mcp.mjs"
   },
   "devDependencies": {

@@ -123,7 +123,8 @@ Extension
 │   ├── grok.ts
 │   ├── codex.ts
 │   └── antigravity.ts
-├── SessionStore (persist explicit IDs per workspace + backend)
+├── TaskStore + TaskEngine (task graph, turns, orchestration — see `docs/TASK-MANAGEMENT.md`)
+├── SessionStore (legacy flat chat-session path during migration)
 ├── CommandBuilder / MCPConfig helpers
 ├── Muster Bridge
 │   ├── AskBridge (pending asks, in-memory)
@@ -135,12 +136,20 @@ Extension
 
 ## 6. Session Management
 
-- Plugin owns a small store of `{ workspace, backend, sessionId }`.
-- On "New Session": clear current ID or start fresh.
-- On send:
-  - If continuing → include resume flag + ID.
-  - After successful turn → update stored ID if CLI returned a new one.
-- Provide UI to list/switch recent sessions per backend (future).
+The current chat-only implementation owns a small store of
+`{ workspace, backend, sessionId }`. This is a migration path, not the target task
+model.
+
+In the task-based flow:
+
+- each task owns one backend session and never shares its session ID;
+- each CLI invocation is a persisted turn;
+- session identity is committed to the task only after a successful turn;
+- task lifecycle and turn/process status are separate concepts;
+- "New task" replaces "New Session" as the primary user action.
+
+See `TASK-MANAGEMENT.md` for the authoritative domain model and
+`SESSION-MANAGEMENT.md` for backend-specific identity/resume behavior.
 
 ## 7. MCP Integration (two servers per turn)
 
@@ -154,7 +163,7 @@ At spawn time we generate/pass a merged MCP config (or use per-CLI discovery). G
 ## 8. Implementation Roadmap (Suggested)
 
 1. **Design & Types** (this doc + `types.ts`)
-2. **SessionStore** (simple JSON or VS Code `globalState` / `workspaceState`)
+2. **TaskStore + TaskEngine** (versioned task, turn, message, and session-binding state)
 3. **Command builders** for all 4 CLIs (with MCP injection)
 4. **Runner + basic parser** for Claude + Grok first (best streaming support)
 5. **Minimal webview** that consumes normalized events

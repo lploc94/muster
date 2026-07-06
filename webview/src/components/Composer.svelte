@@ -9,7 +9,7 @@
     if (thread.running || !textareaEl) return;
     const value = (textareaEl.value ?? '').trim();
     if (!value) return;
-    post({ type: 'send', text: value });
+    post({ type: 'send', text: value, backend: thread.backend });
     textareaEl.value = '';
   }
 

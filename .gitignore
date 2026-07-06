@@ -45,5 +45,6 @@ coverage/
 
 # Local session store (dev)
 .muster-sessions.json
+.muster-tasks.json
 .codex-review/
 study/

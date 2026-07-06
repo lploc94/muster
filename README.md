@@ -3,7 +3,7 @@
 Open-source VS Code extension that **coordinates** multiple AI coding CLIs from one chat UI:
 
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
-- [Grok CLI](https://github.com/xai-org/grok-cli) (planned)
+- [Grok CLI](https://github.com/xai-org/grok-cli)
 - [Codex CLI](https://github.com/openai/codex) (planned)
 - [Antigravity / agy](https://antigravity.google/product/antigravity-cli) (planned)
 
@@ -19,13 +19,15 @@ Open-source VS Code extension that **coordinates** multiple AI coding CLIs from 
 | Webview chat | ✅ (minimal) |
 | MCP context engine injection | 🔜 |
 | MCP `ask_user` (Muster Bridge) | 🔜 — [design](docs/MUSTER-BRIDGE.md) |
-| Grok / Codex / agy backends | 🔜 |
+| Grok `streaming-json` adapter | ✅ (basic) |
+| Codex / agy backends | 🔜 |
 
 ## Prerequisites
 
 - **Node.js** 20+
 - **VS Code** 1.94+
 - **Claude Code** CLI (`claude`) on `PATH` for the Claude backend
+- **Grok CLI** (`grok`) on `PATH` for the Grok backend
 - Other CLIs as backends are added
 
 ## Development
@@ -44,6 +46,9 @@ In VS Code: **Run and Debug → Run Extension** (or **F5**). This opens an Exten
 ```bash
 npm run mvp:claude -- "your prompt here"
 RESUME_ID=<session-id> npm run mvp:claude -- "continue"
+
+npm run mvp:grok -- "your prompt here"
+RESUME_ID=<session-id> npm run mvp:grok -- "continue"
 ```
 
 ### MCP ask spike (agy)
