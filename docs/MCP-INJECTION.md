@@ -49,9 +49,11 @@ All backends follow the same injection point — only the **ACP agent spawn comm
 
 | Backend | ACP agent | `mcpServers` on `session/new`/`session/load` |
 |---------|-----------|-----------------------------------------------|
-| Grok | `grok agent stdio` | ✅ verified (http/sse) |
-| Claude | `claude-code-acp` | 🔜 verify on migrate |
-| Codex | `codex app-server --stdio` | 🔜 verify |
+| Grok | `grok --no-auto-update agent stdio` | ✅ verified (http/sse) |
+| Kiro | `kiro-cli acp` | ✅ (http) |
+| OpenCode | `opencode acp` | ✅ (http) |
+| Claude | bundled `claude-agent-acp` | ✅ (http) |
+| Codex | bundled `codex-acp` | ✅ (http) |
 | Antigravity | TBD | 🔜 blocked |
 
 Do **not** write temp `.mcp.json`, `--mcp-config`, or `mcp_config.json` files for Muster turns — ACP `mcpServers` replaces all of those.

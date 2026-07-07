@@ -25,7 +25,7 @@ We still want the agent to **call a tool**, **wait for the human**, then **conti
 | Answer transport | **In-memory Promise** in extension (`AskBridge`). No answer JSON files in production. |
 | MCP server placement | **HTTP MCP URL** served by extension (preferred). stdio MCP + localhost callback as fallback. |
 | Turn model | Still **one CLI process per user message**. Turn may **pause** until `ask_user` resolves; process stays alive. |
-| Backend order | **Grok ACP** (done) → **Claude ACP** → Codex ACP → agy when ACP entry exists. |
+| Backend order | **All five ACP backends done** (Grok, Kiro, OpenCode, Claude, Codex); agy when its ACP entry exists. |
 
 ## 3. Architecture
 

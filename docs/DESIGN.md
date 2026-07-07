@@ -4,10 +4,12 @@
 
 Build a VS Code extension that acts as a **coordinator** for multiple AI coding CLIs:
 
-- Grok (xAI Grok Build CLI)
+- Grok (xAI Grok CLI)
 - Claude Code (Anthropic)
+- Kiro (Kiro CLI)
 - Codex (OpenAI)
-- Antigravity (Google, formerly Gemini CLI)
+- OpenCode
+- Antigravity (Google, formerly Gemini CLI) — planned
 
 ### Core Use Cases (Minimal but Useful)
 - Send a prompt to any backend.
@@ -61,7 +63,7 @@ Build a VS Code extension that acts as a **coordinator** for multiple AI coding 
 - The **extension host** owns `AskBridge` (in-memory pending asks). The **webview** submits answers via `postMessage`; it does not call MCP directly.
 - Preferred transport: **HTTP MCP URL** served locally by the extension. stdio MCP + localhost callback is a fallback.
 - A turn remains **one ACP session per user message**, but the session may **pause** until the user answers (not a session pool).
-- **Grok ACP first** (implemented); Claude/Codex/agy ACP adapters follow the same client (`acp-client.ts`).
+- **All five ACP backends implemented** (Grok, Kiro, OpenCode, Claude, Codex) on the shared `acp-client.ts`; agy follows the same client when its ACP entry exists.
 
 → Full design: **`docs/MUSTER-BRIDGE.md`**
 
@@ -94,9 +96,13 @@ Shared lifecycle for every backend: `initialize` → `authenticate` → `session
 | Backend | ACP agent command | Adapter status |
 |---------|-------------------|----------------|
 | Grok | `grok --no-auto-update agent stdio` | ✅ implemented |
-| Claude | `claude-code-acp` (ACP adapter; verify package name on bump) | 🔜 migrate from legacy headless code |
-| Codex | `codex app-server --stdio` (experimental) | 🔜 planned |
+| Kiro | `kiro-cli acp` | ✅ implemented |
+| OpenCode | `opencode acp` | ✅ implemented |
+| Claude | bundled `@agentclientprotocol/claude-agent-acp` (`CLAUDE_CODE_EXECUTABLE` → user's `claude`) | ✅ implemented |
+| Codex | bundled `@agentclientprotocol/codex-acp` (`CODEX_PATH` → user's `codex`) | ✅ implemented |
 | Antigravity | TBD — verify ACP entry when implementing | 🔜 experimental |
+
+Grok, Kiro, and OpenCode speak ACP natively; Claude and Codex use standard ACP adapters vendored into `resources/*/index.mjs` and shipped in the `.vsix` (pointed at the user's CLI), so no extra install is needed.
 
 All backends: `mcpServers` on `session/new`/`session/load`; `session/request_permission` → auto-allow in non-interactive coordinator mode; cancel → `session/cancel`.
 
@@ -106,10 +112,13 @@ All backends: `mcpServers` on `session/new`/`session/load`; `session/request_per
 Extension
 ├── Backend Layer
 │   ├── types.ts (NormalizedEvent + Backend interface)
-│   ├── claude.ts
+│   ├── index.ts (BACKEND_IDS + makeBackend factory)
+│   ├── claude.ts   (bundled claude-agent-acp)
 │   ├── grok.ts
-│   ├── codex.ts
-│   └── antigravity.ts
+│   ├── kiro.ts
+│   ├── codex.ts    (bundled codex-acp)
+│   ├── opencode.ts
+│   └── antigravity.ts  (planned)
 ├── TaskStore + TaskEngine (task graph, turns, orchestration — see `docs/TASK-MANAGEMENT.md`)
 ├── Session migration (archive-only `.muster-sessions.json` → `.migrated` on activation)
 ├── CommandBuilder / MCPConfig helpers
