@@ -48,6 +48,7 @@ function transcriptToThreadItem(item: TranscriptItem): ThreadItem | null {
 export class TaskThread {
   items = $state<ThreadItem[]>([]);
   streaming = $state<{ messageId: string; text: string } | null>(null);
+  reasoning = $state<string>('');
   running = $state(false);
   activeTurnId = $state<string | null>(null);
   readOnly = $state(false);
@@ -79,6 +80,7 @@ export class TaskThread {
       ...next.slice(insertPos),
     ];
     this.streaming = null;
+    this.reasoning = '';
     this.activeTurnId = activeTurnId ?? null;
     this.running = viewStatus === 'running' || viewStatus === 'waiting_user';
     this.readOnly = viewStatus ? isTerminalStatus(viewStatus) : false;
@@ -87,6 +89,7 @@ export class TaskThread {
   reset(): void {
     this.items = [];
     this.streaming = null;
+    this.reasoning = '';
     this.running = false;
     this.activeTurnId = null;
     this.readOnly = false;
@@ -108,6 +111,7 @@ export class TaskThread {
 
   endTurn(): void {
     this.commitStreaming();
+    this.reasoning = '';
     this.running = false;
     this.activeTurnId = null;
   }
@@ -144,6 +148,10 @@ export class TaskThread {
           this.streaming = { messageId: ev.messageId, text: '' };
         }
         this.streaming.text += ev.content;
+        break;
+
+      case 'reasoningDelta':
+        this.reasoning += ev.content;
         break;
 
       case 'toolStarted':

@@ -1,12 +1,42 @@
 <script lang="ts">
   import { tasks } from '../lib/tasks.svelte';
+  import hljs from 'highlight.js/lib/core';
+
+  // Register common languages to keep bundle size reasonable
+  import bash from 'highlight.js/lib/languages/bash';
+  import javascript from 'highlight.js/lib/languages/javascript';
+  import typescript from 'highlight.js/lib/languages/typescript';
+  import python from 'highlight.js/lib/languages/python';
+  import json from 'highlight.js/lib/languages/json';
+  import yaml from 'highlight.js/lib/languages/yaml';
+  import xml from 'highlight.js/lib/languages/xml';
+  import css from 'highlight.js/lib/languages/css';
+  import markdown from 'highlight.js/lib/languages/markdown';
+
+  hljs.registerLanguage('bash', bash);
+  hljs.registerLanguage('sh', bash);
+  hljs.registerLanguage('javascript', javascript);
+  hljs.registerLanguage('js', javascript);
+  hljs.registerLanguage('typescript', typescript);
+  hljs.registerLanguage('ts', typescript);
+  hljs.registerLanguage('python', python);
+  hljs.registerLanguage('py', python);
+  hljs.registerLanguage('json', json);
+  hljs.registerLanguage('yaml', yaml);
+  hljs.registerLanguage('yml', yaml);
+  hljs.registerLanguage('xml', xml);
+  hljs.registerLanguage('html', xml);
+  hljs.registerLanguage('css', css);
+  hljs.registerLanguage('markdown', markdown);
+  hljs.registerLanguage('md', markdown);
 
   interface Props {
     role: 'user' | 'assistant';
     text: string;
     streaming?: boolean;
+    showFooter?: boolean;
   }
-  let { role, text, streaming = false }: Props = $props();
+  let { role, text, streaming = false, showFooter = true }: Props = $props();
 
   const currentBackend = $derived(
     role === 'assistant' ? (tasks.focusedTask?.backend ?? 'unknown') : null
@@ -36,15 +66,48 @@
 
   function renderMarkdown(raw: string): string {
     if (!raw) return '';
+    // Normalize newlines (some sources send \r\n)
+    raw = raw.replace(/\r\n?/g, '\n');
     let html = raw
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;');
 
-    // Fenced code blocks
+    const codeBlocks: string[] = [];
+
+    // Fenced code blocks first (with syntax highlighting) - use placeholder to avoid later processing
     html = html.replace(/```(\w+)?\n?([\s\S]*?)```/g, (_m, lang, code) => {
-      const language = lang || '';
-      return `<pre class="code-block"><code class="lang-${language}">${code.trim()}</code></pre>`;
+      const language = (lang || '').trim();
+      let highlighted = code.trim();
+
+      try {
+        if (language && hljs.getLanguage(language)) {
+          highlighted = hljs.highlight(highlighted, { language }).value;
+        } else {
+          highlighted = hljs.highlightAuto(highlighted).value;
+        }
+      } catch (e) {
+        highlighted = code.trim();
+      }
+
+      // Preserve original newlines by keeping literal "\n" characters inside
+      // <pre><code>. The .markdown-body pre / pre code rules use `white-space: pre`,
+      // so line breaks render faithfully. Do NOT convert to <br>: github-markdown-css
+      // has `.markdown-body code br { display: none }` which would collapse everything
+      // onto a single line.
+      const langClass = language ? ` language-${language}` : '';
+      const codeId = 'code-' + Date.now() + Math.random().toString(36).slice(2);
+      const blockHtml = `
+        <div class="code-block-wrapper" data-code-id="${codeId}">
+          <button class="code-copy-btn" data-code-id="${codeId}" title="Copy code">
+            <span class="codicon codicon-copy"></span>
+          </button>
+          <pre class="code-block"><code class="hljs${langClass}" data-code-id="${codeId}">${highlighted}</code></pre>
+        </div>
+      `;
+      const i = codeBlocks.length;
+      codeBlocks.push(blockHtml);
+      return `\x00CODE${i}\x00`;
     });
 
     // Inline code
@@ -61,23 +124,49 @@
     // Links
     html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
 
-    // Headers
+    // Headers (before lists/paragraphs)
     html = html.replace(/^### (.*$)/gm, '<h3>$1</h3>');
     html = html.replace(/^## (.*$)/gm, '<h2>$1</h2>');
     html = html.replace(/^# (.*$)/gm, '<h1>$1</h1>');
 
-    // Unordered lists
-    html = html.replace(/^\- (.*$)/gm, '<li>$1</li>');
-    html = html.replace(/(<li>[\s\S]*?<\/li>)/g, '<ul>$1</ul>');
+    // Unordered lists - better grouping
+    // Match blocks of lines starting with - or *
+    html = html.replace(/^([\-\*] .*(?:\n[\-\*] .*)*)/gm, (block) => {
+      const items = block
+        .trim()
+        .split('\n')
+        .map(line => {
+          const content = line.replace(/^[\-\*] /, '');
+          return `<li>${content}</li>`;
+        })
+        .join('');
+      return `<ul>${items}</ul>`;
+    });
 
-    // Paragraphs and line breaks
-    html = html.replace(/\n\n+/g, '</p><p>');
-    html = html.replace(/\n/g, '<br>');
-    html = '<p>' + html + '</p>';
+    // Paragraphs: split on blank lines
+    const parts = html.split(/\n\s*\n/);
+    html = parts.map(part => {
+      const trimmed = part.trim();
+      // Skip if already a block element or a code-block placeholder (must not be wrapped in <p>)
+      if (
+        trimmed.startsWith('<ul>') ||
+        trimmed.startsWith('<h') ||
+        trimmed.startsWith('<pre>') ||
+        /^\x00CODE\d+\x00$/.test(trimmed)
+      ) {
+        return part;
+      }
+      // Convert single newlines to <br> inside paragraph
+      const withBreaks = trimmed.replace(/\n/g, '<br>');
+      return `<p>${withBreaks}</p>`;
+    }).join('');
 
-    // Clean empty paragraphs
+    // Clean up empty paragraphs
     html = html.replace(/<p><\/p>/g, '');
     html = html.replace(/<p><br><\/p>/g, '');
+
+    // Restore code blocks
+    html = html.replace(/\x00CODE(\d+)\x00/g, (_m, i) => codeBlocks[parseInt(i, 10)] || '');
 
     return html;
   }
@@ -86,6 +175,7 @@
   const rendered = $derived(role === 'assistant' ? renderMarkdown(text) : text);
 
   let copied = $state(false);
+  let contentEl: HTMLDivElement | undefined = $state();
 
   function copyMessage() {
     if (!text) return;
@@ -93,7 +183,6 @@
       copied = true;
       setTimeout(() => { copied = false; }, 1200);
     }).catch(() => {
-      // fallback
       const ta = document.createElement('textarea');
       ta.value = text;
       document.body.appendChild(ta);
@@ -104,6 +193,34 @@
       setTimeout(() => { copied = false; }, 1200);
     });
   }
+
+  function copyCode(code: string) {
+    navigator.clipboard.writeText(code).then(() => {
+      // could add toast later
+    });
+  }
+
+  $effect(() => {
+    if (!contentEl) return;
+    const btns = contentEl.querySelectorAll('.code-copy-btn');
+    btns.forEach((btn) => {
+      const handler = () => {
+        const id = (btn as HTMLElement).dataset.codeId;
+        if (!id) return;
+        const codeEl = contentEl!.querySelector(`code[data-code-id="${id}"]`);
+        if (codeEl) {
+          copyCode(codeEl.textContent || '');
+          // visual feedback
+          const orig = btn.innerHTML;
+          btn.innerHTML = '<span class="codicon codicon-check"></span>';
+          setTimeout(() => { btn.innerHTML = orig; }, 1200);
+        }
+      };
+      btn.addEventListener('click', handler);
+      // cleanup
+      return () => btn.removeEventListener('click', handler);
+    });
+  });
 </script>
 
 {#if role === 'user'}
@@ -117,22 +234,8 @@
   </div>
 {:else}
   <div class="w-full">
-    <!-- Avatar + name on top -->
-    <div class="flex items-center gap-1.5 mb-1">
-      <div
-        class="flex-shrink-0 w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-mono font-bold border"
-        style="border-color: var(--vscode-panel-border); color: var(--vscode-foreground); background: var(--vscode-editor-background);"
-        title={currentBackend || 'assistant'}
-      >
-        {backendIcon}
-      </div>
-      <span class="text-[11px] opacity-70 font-medium">
-        {getBackendLabel(currentBackend)}
-      </span>
-    </div>
-
-    <!-- Message content (full width for CLI, no bubble limit) -->
-    <div class="prose prose-sm text-sm leading-relaxed px-1 py-1">
+    <!-- GitHub-style Markdown via github-markdown-css -->
+    <div class="markdown-body" bind:this={contentEl}>
       {#if streaming}
         <div class="streaming-content whitespace-pre-wrap break-words">
           {text}<span class="streaming-cursor" style="opacity: 0.6;">▋</span>
@@ -145,7 +248,7 @@
     </div>
 
     <!-- Footer for CLI bubbles - always visible, left aligned -->
-    {#if !streaming}
+    {#if !streaming && showFooter}
       <div class="flex justify-start mt-1 pl-1">
         <button
           type="button"

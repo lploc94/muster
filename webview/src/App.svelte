@@ -60,6 +60,13 @@
     post({ type: 'clearHistory' });
   }
 
+  function backToList() {
+    tasks.focusedTaskId = null;
+    tasks.draftMode = false;
+    threadStore.clearFocus();
+    historyOpen = false;
+  }
+
   onMount(() => {
     function onMessage(e: MessageEvent) {
       const msg = e.data;
@@ -195,8 +202,20 @@
       class="shrink-0 border-b"
       style="border-color: var(--vscode-panel-border); background: var(--vscode-sideBar-background, transparent);"
     >
-      <!-- Row 1: History + New task (top, right-aligned) -->
-      <div class="flex items-center justify-end gap-2 px-3 py-1 text-xs relative">
+      <!-- Row 1: Back | History + New task -->
+      <div class="flex items-center gap-2 px-3 py-1 text-xs relative">
+        <button
+          type="button"
+          class="icon-btn"
+          style="width: 22px; height: 22px;"
+          onclick={backToList}
+          title="Back to tasks list"
+        >
+          <span class="codicon codicon-arrow-left"></span>
+        </button>
+
+        <div class="flex-1"></div>
+
         <button
           type="button"
           class="icon-btn"
