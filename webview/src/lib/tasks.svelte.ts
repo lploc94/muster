@@ -110,6 +110,7 @@ class TasksState {
         lifecycle: 'open',
         viewStatus: 'idle',
         updatedAt: new Date(0).toISOString(),
+        backend: '',
       }),
       ...patch,
       id: taskId,

@@ -1,15 +1,39 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import Toolbar from './components/Toolbar.svelte';
-  import TaskList from './components/TaskList.svelte';
+  import TaskHistoryList from './components/TaskList.svelte';
   import TaskWorkspace from './components/TaskWorkspace.svelte';
   import { tasks } from './lib/tasks.svelte';
   import { threadStore } from './lib/thread.svelte';
-  import { isExtMessage } from './lib/protocol';
+  import { isExtMessage, post, statusLabel } from './lib/protocol';
   import type { PendingAsk } from './lib/protocol';
 
   let pendingAsk = $state<PendingAsk | null>(null);
   let activeTurnId = $state<string | null>(null);
+
+  // When no focused task and not in draft, we show the previous tasks list as entry
+  const inChat = $derived(tasks.draftMode || !!tasks.focusedTaskId);
+  let historyOpen = $state(false);
+
+  const currentThread = $derived(threadStore.current);
+
+  function selectTask(taskId: string) {
+    tasks.focusTask(taskId);
+    post({ type: 'focusTask', taskId });
+    post({ type: 'hydrateSubtree', taskId });
+    historyOpen = false;
+  }
+
+  function shortGoal(goal: string): string {
+    const trimmed = goal.trim();
+    if (trimmed.length <= 48) return trimmed || '(no goal)';
+    return `${trimmed.slice(0, 45)}…`;
+  }
+
+  function clearHistory() {
+    historyOpen = false;
+    post({ type: 'clearHistory' });
+  }
 
   onMount(() => {
     function onMessage(e: MessageEvent) {
@@ -106,7 +130,7 @@
   });
 </script>
 
-<Toolbar />
+<Toolbar {inChat} {historyOpen} toggleHistory={() => (historyOpen = !historyOpen)} />
 
 {#if tasks.commandError}
   <div
@@ -122,7 +146,91 @@
   </div>
 {/if}
 
-<div class="flex flex-1 min-h-0">
-  <TaskList />
-  <TaskWorkspace {pendingAsk} {activeTurnId} />
-</div>
+{#if !inChat}
+  <!-- Entry: show previous coordinator tasks -->
+  <div class="flex-1 min-h-0 flex flex-col p-3">
+    <div class="flex items-center justify-between mb-2 px-1">
+      <span class="font-semibold">Previous tasks</span>
+      <button
+        type="button"
+        class="icon-btn"
+        style="width: 22px; height: 22px;"
+        onclick={() => { tasks.openNewTaskDraft(); post({ type: 'newTask' }); historyOpen = false; }}
+        title="New task"
+      >
+        <span class="codicon codicon-add"></span>
+      </button>
+    </div>
+    <TaskHistoryList variant="full" onSelect={(id) => { selectTask(id); historyOpen = false; }} onClear={clearHistory} />
+  </div>
+{:else}
+  <div class="flex-1 min-h-0 flex flex-col relative">
+    <!-- Chat header: two rows -->
+    <div
+      class="shrink-0 border-b"
+      style="border-color: var(--vscode-panel-border); background: var(--vscode-sideBar-background, transparent);"
+    >
+      <!-- Row 1: History + New task (top, right-aligned) -->
+      <div class="flex items-center justify-end gap-2 px-3 py-1 text-xs relative">
+        <button
+          type="button"
+          class="icon-btn"
+          style="width: 22px; height: 22px;"
+          onclick={() => (historyOpen = !historyOpen)}
+          title="History (previous coordinator tasks)"
+        >
+          <span class="codicon codicon-history"></span>
+        </button>
+
+        <button
+          type="button"
+          class="icon-btn"
+          style="width: 22px; height: 22px;"
+          onclick={() => { tasks.openNewTaskDraft(); post({ type: 'newTask' }); historyOpen = false; }}
+          title="New task"
+        >
+          <span class="codicon codicon-add"></span>
+        </button>
+      </div>
+
+      <!-- Row 2: task name + status (below, left-aligned) -->
+      {#if tasks.focusedTask}
+        <div class="flex items-center gap-2 px-3 pb-1.5 text-sm" style="border-top: 1px solid var(--vscode-panel-border);">
+          <span class="font-semibold truncate" title={tasks.focusedTask.goal}>
+            {shortGoal(tasks.focusedTask.goal)}
+          </span>
+          <vscode-badge>{statusLabel(tasks.focusedTask.viewStatus)}</vscode-badge>
+          {#if currentThread.running}
+            <vscode-badge>running…</vscode-badge>
+          {/if}
+        </div>
+      {:else if tasks.draftMode}
+        <div class="flex items-center gap-2 px-3 pb-1.5 text-sm" style="border-top: 1px solid var(--vscode-panel-border);">
+          <span class="font-semibold">
+            {tasks.continuationOf ? 'Continue as new task' : 'New task'}
+          </span>
+          <span class="text-xs" style="opacity: 0.7;">First message creates the coordinator task.</span>
+        </div>
+      {/if}
+    </div>
+
+    <TaskWorkspace {pendingAsk} {activeTurnId} />
+
+    <!-- History dropdown -->
+    {#if historyOpen}
+      <!-- click outside catcher -->
+      <div class="absolute left-0 right-0 bottom-0 top-[28px] z-40" onclick={() => (historyOpen = false)}></div>
+      <div
+        class="absolute right-3 top-[28px] z-50 w-80 max-w-[min(20rem,calc(100%-1rem))] max-h-[min(55vh,320px)] overflow-auto rounded border shadow"
+        style="background: var(--vscode-editor-background); border-color: var(--vscode-panel-border);"
+        onclick={(e) => e.stopPropagation()}
+      >
+        <div class="flex items-center justify-between px-2 py-1 border-b text-xs" style="border-color: var(--vscode-panel-border);">
+          <span class="font-medium">Previous tasks</span>
+          <button type="button" class="underline text-xs" onclick={() => { clearHistory(); }}>Clear</button>
+        </div>
+        <TaskHistoryList variant="dropdown" onSelect={(id) => { selectTask(id); }} onClear={() => { clearHistory(); }} />
+      </div>
+    {/if}
+  </div>
+{/if}

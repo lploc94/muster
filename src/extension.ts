@@ -239,6 +239,69 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     this.seedObservation(taskStore.getFile());
   }
 
+  private handleClearHistory(): void {
+    if (!taskStore) {
+      this.postCommandError('task store not ready');
+      return;
+    }
+    const file = taskStore.getFile();
+    const focus = this.focusedTaskId;
+
+    // Collect terminal root tasks to remove (except the currently focused one)
+    // Only coordinators (parentId null). Preserve running / non-terminal.
+    const toRemoveRoots: string[] = [];
+    for (const task of Object.values(file.tasks)) {
+      if (task.parentId !== null) continue;
+      if (task.id === focus) continue;
+      const isTerminal = task.lifecycle === 'succeeded' || task.lifecycle === 'failed' || task.lifecycle === 'cancelled' || task.lifecycle === 'skipped';
+      if (isTerminal) {
+        toRemoveRoots.push(task.id);
+      }
+    }
+
+    if (toRemoveRoots.length === 0) {
+      // nothing to clear, refresh anyway
+      this.postSnapshot(focus);
+      return;
+    }
+
+    // Collect full subtrees for removal
+    const toRemove = new Set<string>();
+    const queue = [...toRemoveRoots];
+    while (queue.length > 0) {
+      const id = queue.shift()!;
+      if (toRemove.has(id)) continue;
+      toRemove.add(id);
+      for (const t of Object.values(file.tasks)) {
+        if (t.parentId === id) queue.push(t.id);
+      }
+    }
+
+    taskStore.commit((draft) => {
+      for (const id of toRemove) {
+        delete draft.tasks[id];
+        // remove related turns and messages (operations/cancelRequests are turn-keyed or ledger; safe to leave)
+        for (const turnId of Object.keys(draft.turns)) {
+          if (draft.turns[turnId].taskId === id) delete draft.turns[turnId];
+        }
+        for (const msgId of Object.keys(draft.messages)) {
+          if (draft.messages[msgId].taskId === id) delete draft.messages[msgId];
+        }
+      }
+      // ensure optionals exist
+      draft.operations = draft.operations ?? {};
+      draft.cancelRequests = draft.cancelRequests ?? {};
+      return { ok: true };
+    });
+
+    // If focused was removed (shouldn't), clear it
+    if (focus && toRemove.has(focus)) {
+      this.focusedTaskId = undefined;
+    }
+
+    this.postSnapshot(this.focusedTaskId);
+  }
+
   private transcriptItemFromMessage(messageId: string): TranscriptItem | undefined {
     if (!taskStore) {
       return undefined;
@@ -292,8 +355,17 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           return;
         }
       }
+
+      // For new tasks: goal (display name) is trimmed first ~30 chars of the message.
+      // The full text is stored as the actual first user message content.
+      const fullMessage = text;
+      const shortGoal = fullMessage.length <= 30
+        ? fullMessage
+        : fullMessage.slice(0, 30).trim() + '…';
+
       const result = taskEngine.startNewTask({
-        goal: text,
+        goal: shortGoal,
+        message: fullMessage,
         backend: data.backend ?? 'claude',
         continuationOf: data.continuationOf,
       });
@@ -482,13 +554,14 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             });
           }
           break;
+        case 'clearHistory':
+          this.handleClearHistory();
+          break;
       }
     });
 
-    if (!this.focusedTaskId && taskStore) {
-      const roots = Object.values(taskStore.getFile().tasks).filter((task) => task.parentId === null);
-      this.focusedTaskId = roots[0]?.id;
-    }
+    // Do not auto-focus on open — entry UI shows previous tasks list (per redesign)
+    // User selects from list or New task to enter chat.
     this.postSnapshot(this.focusedTaskId);
   }
 

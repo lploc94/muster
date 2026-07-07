@@ -18,6 +18,7 @@ export interface TaskSummary {
   lifecycle: TaskLifecycleState;
   viewStatus: TaskViewStatus;
   updatedAt: string;
+  backend: string;
   continuationOf?: string;
 }
 
@@ -99,6 +100,7 @@ export function projectTaskSummary(file: TaskStoreFile, taskId: string): TaskSum
     lifecycle: task.lifecycle,
     viewStatus: deriveViewStatus(task, turnsForTask(file, taskId), depLifecyclesForTask(file, task)),
     updatedAt: projectActivityTime(file, taskId),
+    backend: task.backend,
     continuationOf: task.continuationOf,
   };
 }

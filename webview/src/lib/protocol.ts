@@ -25,6 +25,7 @@ export interface TaskSummary {
   lifecycle: string;
   viewStatus: TaskViewStatus;
   updatedAt: string;
+  backend: string;
   continuationOf?: string;
 }
 
@@ -77,7 +78,8 @@ export type OutMessage =
   | { type: 'cancelAsk'; taskId: string; turnId: string; askId: string }
   | { type: 'retryTurn'; taskId: string; turnId: string; instruction: string }
   | { type: 'continueTask'; taskId: string; instruction: string }
-  | { type: 'resumeQueuedTurn'; taskId: string; turnId: string };
+  | { type: 'resumeQueuedTurn'; taskId: string; turnId: string }
+  | { type: 'clearHistory' };
 
 /** Post a typed message to the extension host. */
 export function post(message: OutMessage): void {
@@ -105,7 +107,8 @@ function isTaskSummary(v: unknown): v is TaskSummary {
     isString(v.role) &&
     isString(v.lifecycle) &&
     isString(v.viewStatus) &&
-    isString(v.updatedAt)
+    isString(v.updatedAt) &&
+    isString(v.backend)
   );
 }
 

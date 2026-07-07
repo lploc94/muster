@@ -417,6 +417,8 @@ export class TaskEngine {
     backend: string;
     continuationOf?: string;
     role?: TaskRole;
+    /** Full content of the first user message. If not provided, falls back to goal. */
+    message?: string;
   }): EngineResult<{ taskId: string; messageId: string; turnId: string }> {
     const backend = this.makeBackend(params.backend);
     if (!canBindTaskToBackend(backend.capabilities)) {
@@ -450,11 +452,12 @@ export class TaskEngine {
       }
       draft.tasks[taskId] = created.next;
 
+      const messageContent = params.message ?? params.goal;
       draft.messages[messageId] = {
         id: messageId,
         taskId,
         role: 'user',
-        content: params.goal,
+        content: messageContent,
         state: 'pending',
         createdAt: now,
       };

@@ -1,6 +1,10 @@
 @import "tailwindcss";
 @source "./";
 
+/* Load codicons font and base styles properly */
+@import "@vscode/codicons/dist/codicon.css";
+
+
 :root {
   color-scheme: light dark;
 }
@@ -23,4 +27,32 @@ body {
   display: flex;
   flex-direction: column;
   min-height: 0;
+}
+
+/* Additional tweaks for codicons inside web components if needed */
+.codicon {
+  font-size: 16px;
+  vertical-align: middle;
+}
+
+/* Consistent icon button style for toolbar actions */
+.icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.25rem;
+  border-radius: 0.25rem;
+  background: none;
+  border: none;
+  cursor: pointer;
+  transition: background-color 0.1s ease;
+}
+
+.icon-btn:hover {
+  background-color: var(--vscode-toolbar-hoverBackground);
+}
+
+.icon-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
