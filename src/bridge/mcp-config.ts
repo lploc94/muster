@@ -30,7 +30,8 @@ function isAcpBackend(backend: Backend): boolean {
     backend.name === 'grok' ||
     backend.name === 'kiro' ||
     backend.name === 'codex' ||
-    backend.name === 'claude'
+    backend.name === 'claude' ||
+    backend.name === 'opencode'
   );
 }
 

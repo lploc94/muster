@@ -10,7 +10,7 @@
   function syncBackendFromSelect(e: Event) {
     const el = (e.currentTarget ?? backendSelect) as (HTMLElement & { value: string }) | undefined;
     const next = el?.value;
-    if (next === 'claude' || next === 'grok' || next === 'kiro' || next === 'codex') {
+    if (next === 'claude' || next === 'grok' || next === 'kiro' || next === 'codex' || next === 'opencode') {
       tasks.setBackend(next);
     }
   }
@@ -43,6 +43,7 @@
     <vscode-option value="grok">Grok</vscode-option>
     <vscode-option value="kiro">Kiro</vscode-option>
     <vscode-option value="codex">Codex</vscode-option>
+    <vscode-option value="opencode">OpenCode</vscode-option>
   </vscode-single-select>
 
   <span class="flex-1"></span>
