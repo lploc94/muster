@@ -13,6 +13,10 @@
 name: CI
 
 on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -23,8 +27,10 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
           cache: npm
 
       - run: npm ci
-      - run: npm run compile
+      - run: npm test
+      - run: npm run test:source-boundary
+      - run: npm run test:evidence
