@@ -25,6 +25,20 @@ function transcriptToThreadItem(item: TranscriptItem): ThreadItem | null {
       const isCancellation = typeof content === 'object' ? content?.isCancellation : false;
       return { kind: 'error', id: item.id, message, isCancellation };
     }
+    case 'tool': {
+      // support persisted tool items if ever sent in transcript
+      const t = item.content as any;
+      return {
+        kind: 'tool',
+        id: item.id,
+        name: t?.name ?? 'tool',
+        toolKind: t?.toolKind,
+        status: t?.status ?? 'success',
+        input: t?.input,
+        output: t?.output,
+        error: t?.error,
+      };
+    }
     default:
       return null;
   }
@@ -44,7 +58,26 @@ export class TaskThread {
       const mapped = transcriptToThreadItem(item);
       if (mapped) next.push(mapped);
     }
-    this.items = next;
+    // Preserve tool call history (they are added via events during turns and not in base transcript)
+    const toolItems = this.items.filter((it): it is Extract<ThreadItem, { kind: 'tool' }> => it.kind === 'tool');
+    // avoid dups by id
+    const existingIds = new Set(next.map((i) => i.id));
+    const additionalTools = toolItems.filter((t) => !existingIds.has(t.id));
+
+    // Insert tools before the last assistant message so that:
+    // user -> tools -> final assistant  (tools belong to the same turn as the message)
+    let insertPos = next.length;
+    for (let i = next.length - 1; i >= 0; i--) {
+      if (next[i].kind === 'assistant') {
+        insertPos = i;
+        break;
+      }
+    }
+    this.items = [
+      ...next.slice(0, insertPos),
+      ...additionalTools,
+      ...next.slice(insertPos),
+    ];
     this.streaming = null;
     this.activeTurnId = activeTurnId ?? null;
     this.running = viewStatus === 'running' || viewStatus === 'waiting_user';
@@ -121,6 +154,7 @@ export class TaskThread {
           name: ev.name,
           toolKind: ev.kind,
           status: 'running',
+          input: ev.input,
         });
         break;
 
@@ -128,7 +162,11 @@ export class TaskThread {
         const tool = this.findTool(ev.toolCallId);
         if (tool) {
           tool.status = ev.outcome;
-          if (ev.outcome === 'error') tool.error = ev.error;
+          if (ev.outcome === 'error') {
+            tool.error = ev.error;
+          } else {
+            tool.output = ev.output;
+          }
         }
         break;
       }
@@ -143,7 +181,13 @@ export class TaskThread {
 
       case 'sessionStarted':
       case 'reasoningDelta':
-      case 'toolUpdated':
+      case 'toolUpdated': {
+        const t = this.findTool(ev.toolCallId);
+        if (t && ev.input !== undefined) {
+          t.input = ev.input;
+        }
+        break;
+      }
       case 'usage':
       case 'raw':
         break;

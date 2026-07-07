@@ -17,6 +17,8 @@ export interface ToolItem {
   name: string;
   toolKind?: 'mcp' | 'builtin' | 'other';
   status: 'running' | 'success' | 'error';
+  input?: unknown;
+  output?: unknown;
   error?: string;
 }
 export interface ErrorItem {

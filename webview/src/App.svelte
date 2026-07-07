@@ -6,7 +6,7 @@
   import { tasks } from './lib/tasks.svelte';
   import { threadStore } from './lib/thread.svelte';
   import { isExtMessage, post, statusLabel } from './lib/protocol';
-  import type { PendingAsk } from './lib/protocol';
+  import type { PendingAsk, TaskViewStatus } from './lib/protocol';
 
   let pendingAsk = $state<PendingAsk | null>(null);
   let activeTurnId = $state<string | null>(null);
@@ -28,6 +28,31 @@
     const trimmed = goal.trim();
     if (trimmed.length <= 48) return trimmed || '(no goal)';
     return `${trimmed.slice(0, 45)}…`;
+  }
+
+  function statusIcon(status: TaskViewStatus): string {
+    switch (status) {
+      case 'running':
+      case 'waiting_user':
+        return 'codicon-loading';
+      case 'succeeded':
+        return 'codicon-check';
+      case 'failed':
+        return 'codicon-error';
+      case 'cancelled':
+      case 'skipped':
+        return 'codicon-circle-slash';
+      case 'queued':
+      case 'waiting_dependencies':
+        return 'codicon-clock';
+      case 'blocked':
+      case 'needs_recovery':
+        return 'codicon-warning';
+      case 'waiting_children':
+        return 'codicon-ellipsis';
+      default:
+        return 'codicon-circle-outline';
+    }
   }
 
   function clearHistory() {
@@ -199,10 +224,11 @@
           <span class="font-semibold truncate" title={tasks.focusedTask.goal}>
             {shortGoal(tasks.focusedTask.goal)}
           </span>
-          <vscode-badge>{statusLabel(tasks.focusedTask.viewStatus)}</vscode-badge>
-          {#if currentThread.running}
-            <vscode-badge>running…</vscode-badge>
-          {/if}
+          <span 
+            class="codicon {statusIcon(tasks.focusedTask.viewStatus)}" 
+            style="font-size: 14px; vertical-align: middle; margin-left: 4px;"
+            title={statusLabel(tasks.focusedTask.viewStatus)}
+          ></span>
         </div>
       {:else if tasks.draftMode}
         <div class="flex items-center gap-2 px-3 pb-1.5 text-sm" style="border-top: 1px solid var(--vscode-panel-border);">
