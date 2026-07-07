@@ -1,308 +1,286 @@
-# Muster audit va lo trinh cai tien tuong lai
+# Muster audit và lộ trình cải tiến tương lai
 
-## Executive summary / Tom tat dieu hanh
+## Tóm tắt điều hành
 
-Tai M001, cong viec chi tao bao cao va cong cu kiem chung cau truc; khong co thay doi hanh vi production nao cua extension. Tai lieu nay bien backlog ky thuat cua Muster thanh lo trinh milestone co the thuc thi, phan biet ro dau la bang chung doc truc tiep trong repository va dau la rui ro suy luan hoac khuyen nghi theo thuc hanh tot.
+M001 là milestone audit và lập lộ trình, không phải milestone sửa hành vi production của extension. Kết quả chính là báo cáo tiếng Việt này và verifier `scripts/verify-muster-audit-report.test.mjs` để giữ cấu trúc báo cáo ổn định.
 
-Muster hien la VS Code extension MVP dieu phoi CLI AI, voi Claude backend co streaming co ban, webview chat toi thieu, session resume dang o muc ban dau, MCP bridge dang la thiet ke/spike va nhieu backend khac con duoc lap ke hoach. Lo trinh de xuat uu tien giam rui ro theo thu tu: khoa hoi quy bang automated tests, cung co Claude/session/runtime, harden MCP bridge va bao mat, bat CI/package readiness, dong bo tai lieu/report, sau do moi mo rong maintainability cho nhieu backend.
+Muster hiện là VS Code extension MVP để điều phối nhiều AI CLI. Claude backend đã có streaming cơ bản; webview chat, session resume và runner đã có nền tảng ban đầu; MCP bridge và các backend Grok/Codex/Antigravity còn đang ở mức thiết kế hoặc spike. Hướng ưu tiên an toàn nhất là tạo regression tests trước, rồi harden Claude/session/runtime, harden MCP bridge và bảo mật, bật CI/package readiness, đồng bộ tài liệu, sau đó mới mở rộng multi-backend.
 
-## Legend / Chu giai muc do tin cay
+## Chú giải mức độ tin cậy
 
-- [Evidence] Su kien doc truc tiep tu file trong repository, vi du `package.json`, `src/backends/claude.ts`, `docs/MUSTER-BRIDGE.md`.
-- [Inferred] Rui ro hop ly duoc suy ra tu code/config hien co nhung chua duoc runtime kiem chung.
-- [Research] Khuyen nghi dua tren thuc hanh pho bien cho VS Code extension, child process runner, CI va packaging.
-- [Unknown] Hanh vi can chay thu voi VS Code/CLI/nguoi dung that de ket luan.
+- [Bằng chứng] Sự kiện đọc trực tiếp từ repository, ví dụ `package.json`, `.github/workflows/ci.yml`, `src/backends/claude.ts` hoặc tài liệu trong `docs/`.
+- [Suy luận] Rủi ro hợp lý được suy ra từ code/config hiện có nhưng chưa được kiểm chứng runtime.
+- [Nghiên cứu] Khuyến nghị dựa trên thực hành phổ biến cho VS Code extension, child process runner, CI, packaging và local security boundary.
+- [Chưa rõ] Hành vi cần chạy thử với VS Code, CLI hoặc người dùng thật trước khi kết luận.
 
-## Pham vi va nguon bang chung
+## Phạm vi và nguồn bằng chứng
 
-- [Evidence] `README.md` mo ta trang thai "Early MVP", hien co Claude backend + webview chat co ban; Grok, Codex, Antigravity, MCP context engine injection va Muster Bridge con la ke hoach.
-- [Evidence] `package.json` khai bao extension VS Code, entrypoint `./dist/src/extension.js`, script `compile`, `watch`, `mvp:claude`, `test:agy-ask`; chua co script `test` tong hop hay script packaging/release.
-- [Evidence] `.github/workflows/ci.yml` chi chay tren `workflow_dispatch` va chi thuc hien `npm ci` + `npm run compile`.
-- [Evidence] `tsconfig.json` bat `strict: true`, dung CommonJS, `rootDir: "."`, include ca `src/**/*` va `scripts/**/*`.
-- [Evidence] `src/extension.ts` dung webview co inline HTML/CSS/JS, nhan `send`/`newSession`, goi `ClaudeBackend`, luu session vao `.muster-sessions.json` bang sync filesystem.
-- [Evidence] Webview dung `postMessage` cho `send`/`newSession`; extension host can schema validation, CSP/nonce hardening, va malformed-message tests truoc khi coi trust boundary nay la on dinh.
-- [Evidence] `src/backends/claude.ts` spawn `claude -p`, them `--resume`, `--output-format stream-json`, `--include-partial-messages`, `--verbose`, tuy chon `--mcp-config`/`--strict-mcp-config`, parse JSON line va bubble stderr/exit code thanh normalized events.
-- [Evidence] `src/types.ts` dinh nghia normalized event model gom session, assistant/reasoning/tool/usage/error/raw events; `src/runner.ts` chi uy quyen `yield* backend.run(options)`.
-- [Evidence] `src/session-store.ts` co helper doc/ghi `.muster-sessions.json`, nhung `src/extension.ts` dang lap lai logic rieng thay vi import helper.
-- [Evidence] `mcp/muster-ask-server.mjs` la stdio MCP spike dung file IPC qua `MUSTER_RUNTIME_DIR`, `pending/`, `answers/`, polling 200 ms va timeout mac dinh 120 giay.
-- [Evidence] `scripts/test-agy-ask-mcp.mjs` tam thoi thay `~/.gemini/config/mcp_config.json`, spawn `agy` voi `--dangerously-skip-permissions`, tu dong tra loi pending asks, va restore config theo best effort; day la live/config-mutating spike, khong phai unit test an toan.
-- [Evidence] Cac duong smoke CLI (`claude`, `agy`) ke thua `process.env`, cwd va MCP config cua tien trinh goi, nen env/cwd/config la trust boundary can opt-in, sandbox policy va telemetry ro rang truoc khi mo rong.
-- [Evidence] `docs/SESSION-MANAGEMENT.md`, `docs/MUSTER-BRIDGE.md`, `docs/MCP-INJECTION.md`, `docs/DESIGN.md`, `docs/MVP-SCAFFOLD-PLAN.md` mo ta kien truc muc tieu: per-turn spawn, explicit session ID, MCP injection, AskBridge HTTP/fallback, va roadmap MVP.
+- [Bằng chứng] `README.md` ghi Muster là "Early MVP": Claude backend và webview chat cơ bản đã có; Grok, Codex, Antigravity, MCP context engine injection và Muster Bridge vẫn là planned.
+- [Bằng chứng] `package.json` khai báo extension VS Code, entrypoint `./dist/src/extension.js`, scripts `compile`, `watch`, `mvp:claude`, `test:agy-ask`; chưa có `npm test` tổng hợp hoặc script package/release.
+- [Bằng chứng] `.github/workflows/ci.yml` hiện chỉ chạy bằng `workflow_dispatch` và chỉ thực hiện `npm ci` + `npm run compile`.
+- [Bằng chứng] `tsconfig.json` bật `strict: true`, dùng CommonJS, `rootDir: "."`, include cả `src/**/*` và `scripts/**/*`.
+- [Bằng chứng] `src/extension.ts` dựng webview bằng inline HTML/CSS/JS, nhận `send`/`newSession`, gọi `ClaudeBackend`, và tự đọc/ghi `.muster-sessions.json`.
+- [Bằng chứng] `src/backends/claude.ts` spawn `claude -p`, dùng stream-json, resume session, parse JSON lines, gom stderr và yield normalized events.
+- [Bằng chứng] `src/session-store.ts` có helper session store, nhưng `src/extension.ts` đang lặp lại logic persistence riêng.
+- [Bằng chứng] `mcp/muster-ask-server.mjs` là stdio MCP spike dùng file IPC dưới `MUSTER_RUNTIME_DIR`, có `pending/`, `answers/`, polling 200 ms và timeout mặc định 120 giây.
+- [Bằng chứng] `scripts/test-agy-ask-mcp.mjs` tạm sửa `~/.gemini/config/mcp_config.json`, spawn `agy` với `--dangerously-skip-permissions`, rồi restore config theo best effort; đây là spike có rủi ro đụng cấu hình user.
+- [Bằng chứng] Các tài liệu `docs/SESSION-MANAGEMENT.md`, `docs/MUSTER-BRIDGE.md`, `docs/MCP-INJECTION.md`, `docs/DESIGN.md` mô tả kiến trúc mục tiêu chi tiết hơn implementation hiện tại.
 
-## Hien trang Muster theo mien cai tien
+## Hiện trạng Muster theo miền cải tiến
 
-### Kiem thu va hoi quy
+### Kiểm thử và hồi quy
 
-- [Evidence] Repository co script compile va spike runner, nhung `package.json` chua co script `test` tong hop; CI hien chi compile.
-- [Evidence] T01 cua M001 them `scripts/verify-muster-audit-report.test.mjs`, day la verifier cho artifact bao cao nay, khong phai test runtime cua extension.
-- [Inferred] Thieu automated tests cho adapter parse stream-json, error event, cancellation, session store, webview message handling va MCP timeout lam rui ro regression cao khi bat dau hardening.
-- [Research] Nen uu tien node:test unit/integration tests voi fixtures JSONL va fake child process truoc khi sua runtime, de moi thay doi co canh bao ngay trong CI.
+- [Bằng chứng] Repository có compile script và vài spike runner, nhưng chưa có `npm test` tổng hợp.
+- [Bằng chứng] Verifier hiện tại chỉ kiểm tra báo cáo audit, không kiểm thử runtime của extension.
+- [Suy luận] Thiếu tests cho adapter parse stream-json, error event, cancellation, session store, webview message handling và MCP timeout làm rủi ro regression cao khi sửa runtime.
+- [Nghiên cứu] Nên ưu tiên `node:test` với JSONL fixtures và fake child process trước khi refactor runtime.
 
-### CI va chat luong build
+### CI và chất lượng build
 
-- [Evidence] `.github/workflows/ci.yml` bi gioi han boi `workflow_dispatch`; push/PR khong tu dong chay.
-- [Evidence] CI chi chay `npm ci` va `npm run compile`, chua chay verifier tai lieu, unit tests, packaging smoke hay artifact checks.
-- [Inferred] Khi PR khong bat buoc chay compile/test, loi type hoặc contract co the vao main muon hon moi bi phat hien.
-- [Research] Bat `push`/`pull_request`, them `npm test`, `npm run package:check` hoac `vsce package --no-dependencies` smoke neu duoc la buoc can thiet truoc release.
+- [Bằng chứng] CI chỉ chạy thủ công bằng `workflow_dispatch`; push/PR không tự động chạy.
+- [Bằng chứng] CI hiện chỉ compile, chưa chạy tests, verifier tài liệu, package smoke hoặc artifact checks.
+- [Suy luận] Lỗi type, contract hoặc tài liệu có thể vào main rồi mới bị phát hiện muộn.
+- [Nghiên cứu] Nên bật `push`/`pull_request`, thêm `npm test`, và thêm package smoke bằng `vsce` khi phù hợp.
 
-### Type safety va contract su kien
+### Type safety và contract sự kiện
 
-- [Evidence] `tsconfig.json` bat `strict: true`, day la nen tang tot.
-- [Evidence] `src/extension.ts` su dung `any` o duong fallback `event as any` va catch `err: any`; session JSON trong extension va `src/session-store.ts` parse khong validate shape.
-- [Inferred] Type strict hien chua du bao ve ranh gioi du lieu den tu webview, filesystem session store, JSONL stdout cua Claude, va MCP answer file.
-- [Research] Nen them schema guards nho, discriminated helpers va fixtures de tranh silent failure khi CLI hoac webview payload doi shape.
+- [Bằng chứng] `strict: true` là nền tảng tốt.
+- [Bằng chứng] `src/extension.ts` vẫn có fallback kiểu `any`; session JSON parse chưa validate schema rõ ràng.
+- [Suy luận] Type strict chưa bảo vệ đủ các ranh giới dữ liệu từ webview, filesystem, stdout JSONL của Claude và MCP answer files.
+- [Nghiên cứu] Nên thêm schema guards, discriminated helpers và fixtures để tránh silent failure khi payload đổi shape.
 
-### Kien truc, operability va runtime reliability
+### Kiến trúc, vận hành và runtime reliability
 
-- [Evidence] `docs/DESIGN.md` chon kien truc per-turn spawn, khong giu process lau dai, normalized streaming events va explicit session IDs; day la nen tang operability/observability cua runner MVP.
-- [Evidence] `src/backends/claude.ts` co cancellation bang AbortSignal -> `SIGTERM`, gom stderr, va yield `error` khi exit code khac 0.
-- [Evidence] `src/extension.ts` post `done` sau ca success va catch error; no chua co gate mot turn dang chay, queue, hoac cancellation UI.
-- [Inferred] Hai prompt dong thoi tren cung backend/workspace co the ghi de session store hoac tao lich su CLI khong mong muon, phu hop voi canh bao concurrency trong `docs/SESSION-MANAGEMENT.md`.
-- [Unknown] Chua co bang chung runtime trong VS Code Extension Development Host ve scroll, cancellation, long stderr, malformed JSONL, hoac khi `claude` khong ton tai tren PATH.
+- [Bằng chứng] Thiết kế hiện chọn per-turn spawn, normalized streaming events và explicit session IDs.
+- [Bằng chứng] Claude backend có AbortSignal -> `SIGTERM`, gom stderr và yield `error` khi exit code khác 0.
+- [Bằng chứng] Webview/extension chưa có gate rõ cho một turn đang chạy, queue hoặc cancellation UI.
+- [Suy luận] Hai prompt đồng thời trên cùng workspace có thể ghi đè session store hoặc tạo lịch sử CLI ngoài ý muốn.
+- [Chưa rõ] Chưa có runtime proof trong VS Code Extension Development Host cho long stream, malformed JSONL, missing `claude` PATH, cancel hoặc stderr lớn.
 
-### Session management va persistence
+### Session management và persistence
 
-- [Evidence] `docs/SESSION-MANAGEMENT.md` yeu cau commit session ID sau terminal event thanh cong, khong commit khi error/cancel, va khuyen nghi atomic write.
-- [Evidence] `src/session-store.ts` doc/ghi sync `.muster-sessions.json`, bo qua JSON parse loi bang cach tra `undefined` hoac data rong; `src/extension.ts` co logic tuong tu rieng.
-- [Inferred] Viec duplicate logic lam tang nguy co lech hanh vi giua runner va extension; ghi file khong atomic co the hong file khi co nhieu cua so/turn.
-- [Research] Nen tap trung hoa session store, them atomic write, validation, lock/queue mot in-flight turn moi backend/workspace, va test corrupted JSON.
+- [Bằng chứng] `docs/SESSION-MANAGEMENT.md` yêu cầu chỉ commit session ID sau terminal success, không commit khi error/cancel, và khuyến nghị atomic write.
+- [Bằng chứng] `src/session-store.ts` và `src/extension.ts` đang có logic persistence trùng nhau.
+- [Suy luận] Duplicate logic làm tăng nguy cơ lệch hành vi; ghi không atomic có thể làm hỏng `.muster-sessions.json` khi có nhiều turn/cửa sổ.
+- [Nghiên cứu] Nên tập trung hóa session store, thêm atomic write, validation, lock/queue và test corrupted JSON.
 
-### MCP bridge, bao mat va trust boundary
+### MCP bridge, bảo mật và trust boundary
 
-- [Evidence] `docs/MUSTER-BRIDGE.md` quyet dinh production bridge nen la HTTP MCP trong extension voi AskBridge Promise; file IPC chi la spike.
-- [Evidence] `mcp/muster-ask-server.mjs` yeu cau `MUSTER_RUNTIME_DIR`, tao `pending`/`answers`, ghi pending JSON, poll answers JSON va tra `isError` khi timeout/loi parse.
-- [Evidence] `scripts/test-agy-ask-mcp.mjs` sua config MCP cap user cua Antigravity va dung `--dangerously-skip-permissions`; neu bi ngat hoac restore loi co the de lai cau hinh nguoi dung sai trang thai.
-- [Evidence] Cac subprocess CLI ke thua `process.env`; report khong nen coi smoke scripts la an toan neu chua co opt-in, masking/redaction, va huong dan permission policy.
-- [Evidence] `docs/MCP-INJECTION.md` nhac security/trust note cho per-turn MCP config, context_engine va muster_bridge.
-- [Inferred] File IPC spike can hardening neu con duoc dung: validate id, gioi han path traversal, cleanup pending/answers, quyen runtime dir, timeout config va answer schema.
-- [Inferred] Webview message boundary can hardening bang schema validation cho `postMessage`, CSP/nonce cho HTML inline, va negative tests cho payload la/khong hop le.
-- [Research] Truoc production nen dung extension-owned local server voi token, bind `127.0.0.1`, cap vong doi theo turn, Host/Origin validation, va khong mo rong bridge thanh file/shell proxy.
+- [Bằng chứng] `docs/MUSTER-BRIDGE.md` định hướng production bridge nên là HTTP MCP trong extension; file IPC chỉ là spike.
+- [Bằng chứng] MCP spike hiện dựa vào runtime dir, pending/answers files, polling và timeout.
+- [Bằng chứng] Agy spike có thể sửa cấu hình MCP cấp user và dùng bypass permissions; không nên xem là test an toàn mặc định.
+- [Suy luận] File IPC cần validate id/path traversal, quyền thư mục, cleanup stale files, answer schema và timeout nếu còn dùng.
+- [Nghiên cứu] Production bridge nên bind `127.0.0.1`, dùng token, validate Host/Origin, gắn lifecycle theo turn và không expose file/shell proxy.
 
-### Tai lieu, report alignment va developer experience
+### Tài liệu, report alignment và developer experience
 
-- [Evidence] README noi `MCP context engine injection` va `MCP ask_user` la planned; docs thiet ke chi tiet hon source code hien co.
-- [Evidence] `docs/README.md` la index tai lieu; `docs/MVP-SCAFFOLD-PLAN.md` ghi cac phase va thanh cong cua console MVP/webview.
-- [Inferred] Co khoang cach giua docs muc tieu va implementation hien tai; nguoi dong gop co the nham lan cai da ship voi cai moi la design.
-- [Research] Nen duy tri ma tran "doc claim -> repo evidence -> status" va verifier cho tai lieu quan trong de tranh drift.
+- [Bằng chứng] README và docs có nhiều claim planned/target architecture đi trước source code hiện tại.
+- [Suy luận] Contributor có thể nhầm giữa thứ đã ship và thứ mới là thiết kế.
+- [Nghiên cứu] Nên duy trì ma trận claim -> evidence -> status để tránh drift.
 
-### Packaging va release readiness
+### Packaging và release readiness
 
-- [Evidence] `package.json` co metadata publisher/license/repository, engine VS Code va dependency `@vscode/vsce`, nhung chua co script package/publish.
-- [Evidence] Extension activation la `onStartupFinished`, webview view va commands da khai bao.
-- [Inferred] Truoc release can smoke test `vsce package`, kiem tra bundled dist, activation footprint, `.vscodeignore`, icon, changelog va extension host test.
-- [Unknown] Chua co bang chung package VSIX duoc tao/cai/chay trong Extension Development Host hoac VS Code that.
+- [Bằng chứng] `package.json` có metadata VS Code extension và dependency `@vscode/vsce`, nhưng chưa có script package/publish.
+- [Suy luận] Trước release cần smoke test VSIX, bundled `dist`, `.vscodeignore`, icon, changelog và extension host.
+- [Chưa rõ] Chưa có bằng chứng VSIX hiện tại được tạo/cài/chạy trong VS Code thật.
 
-### Maintainability va mo rong multi-backend
+### Maintainability và mở rộng multi-backend
 
-- [Evidence] README va design nham toi nhieu CLI: Claude hien co, Grok/Codex/Antigravity planned.
-- [Evidence] `src/types.ts` da co `Backend` interface va event union co du cho tool/usage/error.
-- [Inferred] Neu them backend truoc khi adapter contract co tests, moi CLI se co cach parse/session/MCP rieng va lam no chi phi maintainability.
-- [Research] Nen dong bang adapter contract, conformance fixtures va shared runner behavior truoc khi them backend thu hai/thu ba.
+- [Bằng chứng] `src/types.ts` đã có `Backend` interface và event union cho assistant/tool/usage/error/raw.
+- [Suy luận] Nếu thêm backend trước khi có adapter contract tests, mỗi CLI sẽ nhân đôi logic parse/session/MCP riêng.
+- [Nghiên cứu] Nên đóng băng adapter contract và conformance fixtures trước khi thêm backend thứ hai/thứ ba.
 
-## Nguyen tac sap xep milestone tuong lai
+## Nguyên tắc sắp xếp milestone tương lai
 
-1. Giam rui ro khong thay bang mat thuong truoc: tests va CI phai di truoc runtime refactor.
-2. Tach bang chung repo khoi gia dinh runtime: moi claim can co file, command, hoac manual UAT ro rang.
-3. Khong mo rong backend khi ranh gioi session/MCP/security chua on dinh.
-4. Moi milestone phai co tieu chi chap nhan va ky vong xac minh de GSD hoac developer co the thi hanh sau nay.
-5. Khong xem M001 la da sua runtime; M001 chi tao audit/report va verifier cau truc cho report.
+1. Tests và CI đi trước runtime refactor.
+2. Mỗi claim phải tách rõ bằng chứng repo, suy luận, nghiên cứu hoặc phần chưa rõ.
+3. Không mở rộng backend khi session/MCP/security chưa ổn định.
+4. Mỗi milestone phải có dependency, risk, acceptance criteria và verification expectations.
+5. M001 chỉ tạo audit/report và verifier, chưa sửa runtime production.
 
-## Milestone 1: Nen tang automated regression tests
+## Mốc 1: Nền tảng automated regression tests
 
-**Muc dich**  
-Khoa cac contract hien co truoc khi sua runtime: Claude stream-json adapter, normalized events, session store, runner delegation, MCP ask spike timeout, va verifier tai lieu.
+**Mục đích**  
+Khóa các contract hiện có trước khi sửa runtime: Claude stream-json adapter, normalized events, session store, runner delegation, MCP ask spike timeout và verifier tài liệu.
 
-**Phu thuoc / Dependency**  
-Khong phu thuoc milestone tuong lai nao. Dung code hien co trong `src/*`, `mcp/*`, `scripts/*` va fixtures inline/git-tracked.
+**Phụ thuộc / Dependency**  
+Không phụ thuộc milestone tương lai nào. Dùng code hiện có trong `src/*`, `mcp/*`, `scripts/*` và fixtures tracked trong repo.
 
-**Rui ro / Risk**  
-Neu test fake qua muc, chung chi xac nhan mock thay vi contract thuc. Neu test can `claude` that, CI se mong manh. Can uu tien fixtures JSONL va fake child process co kiem soat.
+**Rủi ro / Risk**  
+Nếu test fake quá mức, test chỉ xác nhận mock thay vì contract thật. Nếu test cần CLI thật, CI sẽ mong manh.
 
-**Tieu chi chap nhan / Acceptance criteria**
+**Tiêu chí chấp nhận / Acceptance criteria**
 
-- Co `npm test` chay node:test cho adapter/session/MCP/report verifier.
-- Test Claude adapter bao gom JSONL hop le, line malformed -> `raw`, stderr capture, non-zero exit -> `error`, cancellation -> cancellation event.
-- Test session store bao gom missing file, corrupted JSON, save/load backend rieng.
-- Test MCP ask spike bao gom missing env, timeout, malformed answer JSON, unknown tool.
-- CI hoac local command co the chay compile + tests trong mot lenh tai lap.
+- Có `npm test` chạy `node:test` cho adapter/session/MCP/report verifier.
+- Test Claude adapter bao gồm JSONL hợp lệ, malformed line -> `raw`, stderr capture, non-zero exit -> `error`, cancellation.
+- Test session store bao gồm missing file, corrupted JSON, save/load theo backend riêng.
+- Test MCP ask spike bao gồm missing env, timeout, malformed answer JSON và unknown tool.
+- CI hoặc local command có thể chạy compile + tests trong một lệnh tái lập.
 
-**Ky vong xac minh / Verification expectations**
+**Kỳ vọng xác minh / Verification expectations**
 
 - `npm run compile`
 - `npm test`
 - `node --test scripts/verify-muster-audit-report.test.mjs`
-- Fixture files nam trong repo, khong phu thuoc `.gsd/`, `.planning/`, hoac state local.
 
-## Milestone 2: Claude, session va runtime hardening
+## Mốc 2: Claude, session và runtime hardening
 
-**Muc dich**  
-Lam duong chay Claude va session resume dang tin cay hon truoc khi them bridge production hoac backend khac.
+**Mục đích**  
+Làm đường chạy Claude và session resume đáng tin cậy hơn trước khi thêm bridge production hoặc backend khác.
 
-**Phu thuoc / Dependency**  
-Phu thuoc Milestone 1 de co regression net cho adapter, session store va error paths.
+**Phụ thuộc / Dependency**  
+Phụ thuộc Mốc 1 để có regression net cho adapter, session store và error paths.
 
-**Rui ro / Risk**  
-Thay doi session timing co the lam mat kha nang resume hoac commit session sai khi turn loi. Thay doi spawn/cancel co the tao child process mo coi neu khong test ky.
+**Rủi ro / Risk**  
+Thay đổi session timing có thể commit session sai khi turn lỗi. Thay đổi spawn/cancel có thể tạo child process mồ côi nếu không test kỹ.
 
-**Tieu chi chap nhan / Acceptance criteria**
+**Tiêu chí chấp nhận / Acceptance criteria**
 
-- `src/extension.ts` dung chung `src/session-store.ts` hoac service tuong duong thay vi duplicate logic.
-- Session ID chi duoc commit sau terminal success theo `docs/SESSION-MANAGEMENT.md`; cancel/error khong ghi session moi.
-- Co queue/reject mot in-flight turn moi backend/workspace, voi UI message ro rang.
-- Claude backend co timeout/cancellation handling ro hon, error event giu du context an toan, va parser duoc test bang fixtures.
-- Webview co trang thai running/done/error nhat quan; khong gui `done` gay hieu nham khi flow bi loi neu UX yeu cau phan biet.
+- `src/extension.ts` dùng chung `src/session-store.ts` hoặc service tương đương thay vì duplicate logic.
+- Session ID chỉ được commit sau terminal success; cancel/error không ghi session mới.
+- Có queue/reject một in-flight turn mỗi backend/workspace, với UI message rõ ràng.
+- Claude backend có timeout/cancellation handling rõ hơn và parser được test bằng fixtures.
+- Webview có trạng thái running/done/error nhất quán.
 
-**Ky vong xac minh / Verification expectations**
+**Kỳ vọng xác minh / Verification expectations**
 
 - `npm test`
 - `npm run compile`
-- Manual UAT trong VS Code Extension Development Host: prompt moi, continue last, new session, missing `claude` PATH, cancel/abort neu UI da co.
-- Kiem tra `.muster-sessions.json` khong bi ghi khi turn loi/cancel va duoc ghi khi turn thanh cong.
+- Manual UAT trong VS Code Extension Development Host: prompt mới, continue last, new session, missing `claude` PATH, cancel/abort nếu UI đã có.
+- Kiểm tra `.muster-sessions.json` không bị ghi khi turn lỗi/cancel và được ghi khi turn thành công.
 
-## Milestone 3: MCP bridge va security hardening
+## Mốc 3: MCP bridge và security hardening
 
-**Muc dich**  
-Bien thiet ke `muster_bridge.ask_user` thanh implementation an toan, mong, co timeout, va phu hop trust boundary extension-host/webview/CLI.
+**Mục đích**  
+Biến thiết kế `muster_bridge.ask_user` thành implementation an toàn, có timeout, có cancel và phù hợp trust boundary extension-host/webview/CLI.
 
-**Phu thuoc / Dependency**  
-Phu thuoc Milestone 1 cho negative tests va Milestone 2 cho turn lifecycle on dinh. Co the song song mot phan voi Milestone 2 neu chi lam spike hardening, nhung production bridge nen doi runtime lifecycle ro.
+**Phụ thuộc / Dependency**  
+Phụ thuộc Mốc 1 cho negative tests và Mốc 2 cho turn lifecycle ổn định.
 
-**Rui ro / Risk**  
-Bridge co the thanh be mat tan cong neu mo file/shell proxy, khong bind localhost/token, hoac chap nhan payload khong validate. Blocking ask_user co the treo CLI neu timeout/cancel khong duoc bubble dung.
+**Rủi ro / Risk**  
+Bridge có thể thành bề mặt tấn công nếu mở file/shell proxy, không bind localhost/token hoặc chấp nhận payload không validate. Blocking `ask_user` có thể treo CLI nếu timeout/cancel không được bubble đúng.
 
-**Tieu chi chap nhan / Acceptance criteria**
+**Tiêu chí chấp nhận / Acceptance criteria**
 
-- Production path uu tien AskBridge trong extension va local MCP endpoint/callback theo `docs/MUSTER-BRIDGE.md`; file IPC spike duoc danh dau dev-only hoac thay the.
-- MCP config injection tao per-turn config an toan, dung `--strict-mcp-config` voi Claude khi ho tro.
-- `ask_user` validate input/output schema, timeout, cancel, duplicate id va malformed payload.
-- File/spike path neu con ton tai phai validate `MUSTER_RUNTIME_DIR`, id/path traversal, pending/answers cleanup, answer size/schema va stale-file behavior.
-- Agy/Grok config mutation neu con can dung phai opt-in, atomic backup/restore, khong hardcode bypass permissions, va ghi ro failure telemetry.
-- Webview chi postMessage toi extension; extension host validate payload schema, CSP/nonce khong de inline trust boundary mo, va khong noi truc tiep MCP.
-- Local MCP endpoint dung token, bind localhost, Host/Origin validation, cancellation lifecycle va khong expose file/shell proxy.
-- Tai lieu security/trust note trong `docs/MCP-INJECTION.md` va `docs/MUSTER-BRIDGE.md` khop voi code.
+- Production path ưu tiên AskBridge trong extension và local MCP endpoint/callback theo `docs/MUSTER-BRIDGE.md`; file IPC spike được đánh dấu dev-only hoặc thay thế.
+- MCP config injection tạo per-turn config an toàn, dùng `--strict-mcp-config` với Claude khi hỗ trợ.
+- `ask_user` validate input/output schema, timeout, cancel, duplicate id và malformed payload.
+- File/spike path nếu còn tồn tại phải validate `MUSTER_RUNTIME_DIR`, id/path traversal, cleanup, answer size/schema và stale-file behavior.
+- Local MCP endpoint dùng token, bind localhost, Host/Origin validation và không expose file/shell proxy.
 
-**Ky vong xac minh / Verification expectations**
+**Kỳ vọng xác minh / Verification expectations**
 
-- `npm test` voi negative cases cho timeout, malformed answer, duplicate id, cancellation va unknown tool.
+- `npm test` với negative cases cho timeout, malformed answer, duplicate id, cancellation và unknown tool.
 - `npm run compile`
-- Manual UAT: agent goi `ask_user`, webview hien question card, submit answer tiep tuc cung turn, timeout/cancel tra error thay vi treo.
-- Neu van giu file IPC spike, kiem tra path traversal/id validation va cleanup runtime dir.
+- Manual UAT: agent gọi `ask_user`, webview hiện question card, submit answer tiếp tục cùng turn, timeout/cancel trả error thay vì treo.
 
-## Milestone 4: CI, package va release readiness
+## Mốc 4: CI, package và release readiness
 
-**Muc dich**  
-Bien MVP tu code co the compile thanh artifact co the kiem chung tren PR va dong goi VSIX mot cach lap lai.
+**Mục đích**  
+Biến MVP từ code có thể compile thành artifact có thể kiểm chứng trên PR và đóng gói VSIX một cách lặp lại.
 
-**Phu thuoc / Dependency**  
-Phu thuoc Milestone 1 de co `npm test`; nen sau Milestone 2/3 neu release muon gom runtime/bridge hardening dau tien.
+**Phụ thuộc / Dependency**  
+Phụ thuộc Mốc 1 để có `npm test`; nên sau Mốc 2/3 nếu release muốn gom runtime/bridge hardening đầu tiên.
 
-**Rui ro / Risk**  
-Bat CI day du co the lam lo cac loi ton dong ve test flake, dependency cache, dist/outDir hoac VS Code extension packaging. Neu packaging khong kiem tra runtime, VSIX co the tao duoc nhung extension khong chay.
+**Rủi ro / Risk**  
+Bật CI đầy đủ có thể làm lộ lỗi tồn đọng về test flake, dependency cache, dist/outDir hoặc packaging. VSIX có thể tạo được nhưng extension vẫn chưa chạy nếu không smoke runtime.
 
-**Tieu chi chap nhan / Acceptance criteria**
+**Tiêu chí chấp nhận / Acceptance criteria**
 
-- CI chay tren `push` va `pull_request` cho main/default branch, khong chi `workflow_dispatch`.
-- CI chay `npm ci`, `npm run compile`, `npm test`, verifier tai lieu va package smoke.
-- `package.json` co script ro rang cho `test`, `package:check` va neu can `prepublish`/`vscode:prepublish`.
-- Release checklist bao gom VS Code engine, bundled dist, `.vscodeignore`, CHANGELOG, license, icon/metadata va smoke install.
-- CI output phan biet loi compile/test/package de developer sua nhanh.
+- CI chạy trên `push` và `pull_request`, không chỉ `workflow_dispatch`.
+- CI chạy `npm ci`, `npm run compile`, `npm test`, verifier tài liệu và package smoke.
+- `package.json` có script `test`, `package:check` và nếu cần `vscode:prepublish`.
+- Release checklist bao gồm VS Code engine, bundled `dist`, `.vscodeignore`, CHANGELOG, license, icon/metadata và smoke install.
 
-**Ky vong xac minh / Verification expectations**
+**Kỳ vọng xác minh / Verification expectations**
 
-- Local: `npm ci` neu can tai moi dependency, `npm run compile`, `npm test`, `npm run package:check`.
-- GitHub Actions: PR mau pass voi cung command.
-- Manual smoke: cai VSIX vao Extension Development Host hoac VS Code profile sach va mo Muster view.
+- Local: `npm ci`, `npm run compile`, `npm test`, `npm run package:check`.
+- GitHub Actions: PR mẫu pass với cùng command.
+- Manual smoke: cài VSIX vào Extension Development Host hoặc VS Code profile sạch và mở Muster view.
 
-## Milestone 5: Tai lieu, report alignment va developer experience
+## Mốc 5: Tài liệu, report alignment và developer experience
 
-**Muc dich**  
-Giu README, design docs, scaffold plan, bridge/session docs va report audit khop voi implementation sau cac milestone hardening.
+**Mục đích**  
+Giữ README, design docs, bridge/session docs và report audit khớp với implementation sau các milestone hardening.
 
-**Phu thuoc / Dependency**  
-Phu thuoc Milestone 2/3/4 de tai lieu phan anh code moi. Co the cap nhat nho song song, nhung alignment day du nen chay sau khi runtime/CI on dinh.
+**Phụ thuộc / Dependency**  
+Phụ thuộc Mốc 2/3/4 để tài liệu phản ánh code mới.
 
-**Rui ro / Risk**  
-Tai lieu co the tiep tuc noi qua muc "planned" vs "implemented" neu khong co verifier. Qua nhieu tai lieu trung lap se tao drift.
+**Rủi ro / Risk**  
+Tài liệu có thể tiếp tục nói quá mức planned vs implemented nếu không có verifier. Quá nhiều tài liệu trùng lặp sẽ tạo drift.
 
-**Tieu chi chap nhan / Acceptance criteria**
+**Tiêu chí chấp nhận / Acceptance criteria**
 
-- README feature matrix tach ro implemented, partial, planned va experimental.
-- `docs/SESSION-MANAGEMENT.md`, `docs/MUSTER-BRIDGE.md`, `docs/MCP-INJECTION.md`, `docs/DESIGN.md` co status khop code.
-- `docs/README.md` index dung ten va pham vi tai lieu.
-- Bao cao `docs/MUSTER-AUDIT-ROADMAP.vi.md` duoc cap nhat neu sequence thay doi, van giu confidence labels.
-- Co verifier hoac checklist cho heading bat buoc, status labels va command verification.
+- README feature matrix tách rõ implemented, partial, planned và experimental.
+- `docs/SESSION-MANAGEMENT.md`, `docs/MUSTER-BRIDGE.md`, `docs/MCP-INJECTION.md`, `docs/DESIGN.md` có status khớp code.
+- `docs/README.md` index đúng tên và phạm vi tài liệu.
+- Báo cáo audit được cập nhật nếu sequence thay đổi, vẫn giữ confidence labels.
 
-**Ky vong xac minh / Verification expectations**
+**Kỳ vọng xác minh / Verification expectations**
 
 - `node --test scripts/verify-muster-audit-report.test.mjs`
-- `npm test` neu verifier tai lieu nam trong suite chung.
-- Review doc claim matrix: moi claim quan trong co citation den code/config/doc hoac duoc gan [Unknown].
-- Manual doc walkthrough cho contributor moi: tu README -> development -> run extension -> test/package.
+- `npm test` nếu verifier tài liệu nằm trong suite chung.
+- Review doc claim matrix: mỗi claim quan trọng có citation đến code/config/doc hoặc được gắn [Chưa rõ].
 
-## Milestone 6: Multi-backend maintainability va adapter conformance
+## Mốc 6: Multi-backend maintainability và adapter conformance
 
-**Muc dich**  
-Chuan hoa cach them Grok, Codex, Antigravity va cac backend sau nay ma khong nhan doi logic session/MCP/error parsing.
+**Mục đích**  
+Chuẩn hóa cách thêm Grok, Codex, Antigravity và các backend sau này mà không nhân đôi logic session/MCP/error parsing.
 
-**Phu thuoc / Dependency**  
-Phu thuoc Milestone 1 cho contract tests, Milestone 2 cho runner/session lifecycle, Milestone 3 cho MCP injection/bridge, va Milestone 5 cho docs alignment.
+**Phụ thuộc / Dependency**  
+Phụ thuộc Mốc 1 cho contract tests, Mốc 2 cho runner/session lifecycle, Mốc 3 cho MCP injection/bridge, và Mốc 5 cho docs alignment.
 
-**Rui ro / Risk**  
-Moi CLI co flags/session/streaming khac nhau; neu interface qua chung chung se che mat edge cases, neu qua rieng le se kho maintain. Antigravity streaming/session dang [Unknown] theo docs nen can spike co kiem chung.
+**Rủi ro / Risk**  
+Mỗi CLI có flags/session/streaming khác nhau; interface quá chung sẽ che edge cases, interface quá riêng sẽ kh
+ó maintain.
 
-**Tieu chi chap nhan / Acceptance criteria**
+**Tiêu chí chấp nhận / Acceptance criteria**
 
-- Co adapter conformance suite dung chung cho backend: session start/resume, assistant deltas, tool events neu co, usage/error/raw, cancellation.
-- Backend capability matrix duoc doc va test: reasoning, detailed tool events, MCP, session ownership, streaming format.
-- Grok/Codex/Antigravity chi duoc bat UI neu dat smoke tests toi thieu va status docs khop.
-- Shared helpers cho spawn, env, MCP config, stderr handling va cancellation giam duplicate code.
-- Experimental backend co flag/status ro, khong lam suy yeu Claude path da on dinh.
+- Có adapter conformance suite dùng chung cho backend: session start/resume, assistant deltas, tool events nếu có, usage/error/raw, cancellation.
+- Backend capability matrix được doc và test: reasoning, detailed tool events, MCP, session ownership, streaming format.
+- Grok/Codex/Antigravity chỉ được bật UI nếu đạt smoke tests tối thiểu và status docs khớp.
+- Shared helpers cho spawn, env, MCP config, stderr handling và cancellation giảm duplicate code.
 
-**Ky vong xac minh / Verification expectations**
+**Kỳ vọng xác minh / Verification expectations**
 
-- `npm test` voi conformance fixtures cho tung backend duoc ho tro.
+- `npm test` với conformance fixtures cho từng backend được hỗ trợ.
 - `npm run compile`
-- Manual smoke cho moi backend da bat: prompt moi, resume, MCP config injection neu backend ho tro, error khi CLI missing.
-- Documentation matrix cap nhat truoc khi danh dau backend la implemented.
+- Manual smoke cho mỗi backend đã bật: prompt mới, resume, MCP config injection nếu backend hỗ trợ, error khi CLI missing.
 
-## Ma tran uu tien mien cai tien
+## Ma trận ưu tiên miền cải tiến
 
-| Mien | Muc uu tien | Ly do | Milestone chinh |
+| Miền | Mức ưu tiên | Lý do | Mốc chính |
 |---|---:|---|---|
-| Kiem thu tu dong | Rat cao | La day an toan cho moi refactor runtime | Milestone 1 |
-| Claude/session/runtime reliability | Rat cao | La user loop hien co cua MVP | Milestone 2 |
-| Bao mat/MCP bridge | Cao | Tao trust boundary va human-in-the-loop production | Milestone 3 |
-| CI/package readiness | Cao | Bien chat luong thanh bat buoc tren PR/release | Milestone 4 |
-| Tai lieu/report alignment | Trung binh-cao | Giam drift giua design va code | Milestone 5 |
-| Developer experience | Trung binh-cao | Giup contributor chay/test/package nhanh | Milestone 4-5 |
-| Architecture maintainability | Trung binh | Can truoc khi them nhieu backend | Milestone 6 |
-| Multi-backend expansion | Sau | Chi nen lam sau khi contract va security on dinh | Milestone 6 |
+| Kiểm thử tự động | Rất cao | Dây an toàn cho mọi refactor runtime | Mốc 1 |
+| Claude/session/runtime reliability | Rất cao | User loop hiện có của MVP | Mốc 2 |
+| Bảo mật/MCP bridge | Cao | Trust boundary và human-in-the-loop production | Mốc 3 |
+| CI/package readiness | Cao | Chất lượng bắt buộc trên PR/release | Mốc 4 |
+| Tài liệu/report alignment | Trung bình-cao | Giảm drift giữa design và code | Mốc 5 |
+| Multi-backend expansion | Sau | Chỉ nên làm sau khi contract và security ổn định | Mốc 6 |
 
-## Cac dieu chua ro can kiem chung bang UAT/runtime
+## Các điều chưa rõ cần kiểm chứng bằng UAT/runtime
 
-- [Unknown] Claude CLI version thuc te co ho tro day du flags dang dung trong `src/backends/claude.ts` tren moi moi truong khong.
-- [Unknown] Webview UX khi stream dai, error stderr lon, malformed event, hoac user bam lien tiep nhieu prompt.
-- [Unknown] Session resume trong VS Code that co khop voi `docs/SESSION-MANAGEMENT.md` khi CLI tao/tra session ID khac ky vong.
-- [Unknown] `muster_bridge` production nen dung HTTP MCP truc tiep hay fallback stdio callback cho tung CLI sau khi thu nghiem compatibility.
-- [Unknown] Packaging VSIX hien tai co gom dung dist va chay duoc sau install hay chua.
-
+- [Chưa rõ] Claude CLI version thực tế có hỗ trợ đầy đủ flags đang dùng trong `src/backends/claude.ts` trên mọi môi trường không.
+- [Chưa rõ] Webview UX khi stream dài, stderr lớn, malformed event hoặc user bấm liên tiếp nhiều prompt.
+- [Chưa rõ] Session resume trong VS Code thật có khớp với `docs/SESSION-MANAGEMENT.md` không.
+- [Chưa rõ] `muster_bridge` production nên dùng HTTP MCP trực tiếp hay fallback stdio callback cho từng CLI.
+- [Chưa rõ] Packaging VSIX hiện tại có gom đúng `dist` và chạy được sau install hay chưa.
 
 ## Failure Modes
 
-- External dependency: repo source files and documentation inputs (`README.md`, `package.json`, `tsconfig.json`, `.github/workflows/ci.yml`, `src/*`, `mcp/*`, `docs/*`). Failure path: missing or stale file would weaken the report evidence. Handling: this task inspected the planned inputs before writing and labeled unverified runtime behavior as [Unknown] instead of claiming production facts.
-- External dependency: filesystem write to `docs/MUSTER-AUDIT-ROADMAP.vi.md`. Failure path: missing parent directory or write failure would leave the artifact absent. Handling: final verification uses `test -s docs/MUSTER-AUDIT-ROADMAP.vi.md` and the node:test verifier reads the same path.
-- External dependency: Node verifier `scripts/verify-muster-audit-report.test.mjs`. Failure path: missing headings, missing confidence labels, or incomplete milestone sections fail the structural test. Handling: the report includes the required legend, domains, future milestone sections, dependencies, risks, acceptance criteria, and verification expectations.
+- Nếu source/docs đầu vào thiếu hoặc stale, report evidence sẽ yếu; cách xử lý là gắn [Chưa rõ] thay vì khẳng định production fact.
+- Nếu `docs/MUSTER-AUDIT-ROADMAP.vi.md` vắng mặt hoặc thiếu cấu trúc, verifier sẽ fail.
+- Nếu future milestone thiếu dependency, risk, acceptance criteria hoặc verification expectations, verifier sẽ fail.
 
 ## Load Profile
 
-- Bao cao nay khong chay load test; cac breakpoint duoc ghi nhan nhu rui ro can kiem chung sau: subprocess count khi nhieu prompt dong thoi, stderr buffering, polling file IPC 200 ms moi pending ask, va stale pending/answer files neu spike MCP chay lau.
+Báo cáo này không chạy load test. Các breakpoint cần kiểm chứng sau gồm số lượng subprocess khi nhiều prompt đồng thời, stderr buffering, polling file IPC 200 ms mỗi pending ask, và stale pending/answer files nếu spike MCP chạy lâu.
 
 ## Negative Tests
 
-- `scripts/verify-muster-audit-report.test.mjs` has a negative missing-report assertion: if `docs/MUSTER-AUDIT-ROADMAP.vi.md` is absent, the verifier fails with an explicit message.
-- The same verifier fails when the report lacks a Vietnamese title/summary, lacks the confidence-label legend, omits any required improvement domain, or leaves future milestones without dependency, risk, acceptance, and verification language.
-- The T02 red-test run (`node --test scripts/verify-muster-audit-report.test.mjs`) failed before the artifact existed, proving the missing-artifact negative path was active before implementation.
+- `scripts/verify-muster-audit-report.test.mjs` fail nếu missing report.
+- Verifier fail nếu thiếu title/summary tiếng Việt, thiếu chú giải confidence labels, thiếu miền cải tiến bắt buộc, hoặc milestone thiếu dependency/risk/acceptance/verification.
 
-## Ket luan
+## Kết luận
 
-Huong di an toan nhat cho Muster la khong them ngay nhieu backend hay UI lon, ma truoc het tao regression net va harden duong Claude/session dang co. Sau do bridge/security va CI/package readiness bien MVP thanh nen tang co the release. Tai lieu va multi-backend maintainability nen di sau cac bang chung runtime, de moi milestone tuong lai khong chi la y tuong ma co acceptance criteria va verification expectations ro rang.
+Hướng đi an toàn nhất cho Muster là không thêm ngay nhiều backend hoặc UI lớn. Trước hết nên tạo regression net và harden đường Claude/session hiện có. Sau đó bridge/security và CI/package readiness mới biến MVP thành nền tảng có thể release. Tài liệu và multi-backend maintainability nên đi sau bằng chứng runtime, để mỗi milestone tương lai không chỉ là ý tưởng mà có tiêu chí chấp nhận và kỳ vọng xác minh rõ ràng.
