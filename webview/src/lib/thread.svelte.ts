@@ -3,22 +3,23 @@ import type { TaskViewStatus, TranscriptItem } from './protocol';
 import { isTerminalStatus } from './protocol';
 import type { ThreadItem } from './turn-state.svelte';
 
+function asText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  return (content as { text?: string })?.text ?? '';
+}
+
 function transcriptToThreadItem(item: TranscriptItem): ThreadItem | null {
   switch (item.kind) {
-    case 'user': {
-      const text =
-        typeof item.content === 'string'
-          ? item.content
-          : ((item.content as { text?: string })?.text ?? '');
-      return { kind: 'user', id: item.id, text };
-    }
-    case 'assistant': {
-      const text =
-        typeof item.content === 'string'
-          ? item.content
-          : ((item.content as { text?: string })?.text ?? '');
-      return { kind: 'assistant', id: item.id, text };
-    }
+    case 'user':
+      return { kind: 'user', id: item.id, text: asText(item.content), turnId: item.turnId };
+    case 'assistant':
+      return {
+        kind: 'assistant',
+        id: item.id,
+        text: asText(item.content),
+        turnId: item.turnId,
+        order: item.order,
+      };
     case 'error': {
       const content = item.content as { message?: string; isCancellation?: boolean } | string;
       const message = typeof content === 'string' ? content : (content?.message ?? 'Error');
@@ -26,8 +27,15 @@ function transcriptToThreadItem(item: TranscriptItem): ThreadItem | null {
       return { kind: 'error', id: item.id, message, isCancellation };
     }
     case 'tool': {
-      // support persisted tool items if ever sent in transcript
-      const t = item.content as any;
+      const t = item.content as {
+        toolCallId?: string;
+        name?: string;
+        toolKind?: 'mcp' | 'builtin' | 'other';
+        status?: 'running' | 'success' | 'error';
+        input?: unknown;
+        output?: unknown;
+        error?: string;
+      };
       return {
         kind: 'tool',
         id: item.id,
@@ -37,50 +45,61 @@ function transcriptToThreadItem(item: TranscriptItem): ThreadItem | null {
         input: t?.input,
         output: t?.output,
         error: t?.error,
+        turnId: item.turnId,
+        order: item.order,
       };
     }
+    // reasoning items are collected separately (turn-scoped header), not as list items
     default:
       return null;
   }
 }
 
-/** Per-task streaming thread (docs/WEBVIEW.md §7.3). */
+/** Per-task streaming thread (docs/WEBVIEW-IMPROVEMENT-PLAN §5.2 / §5.4). */
 export class TaskThread {
   items = $state<ThreadItem[]>([]);
   streaming = $state<{ messageId: string; text: string } | null>(null);
-  reasoning = $state<string>('');
+  /** Reasoning is turn-scoped: turnId -> accumulated reasoning text (rendered in header). */
+  reasoningByTurn = $state<Record<string, string>>({});
   running = $state(false);
   activeTurnId = $state<string | null>(null);
   readOnly = $state(false);
+  /**
+   * Monotonic activity counter bumped on every applied event. Lets the view track
+   * in-place content growth (reasoning appends, tool status/input/output changes)
+   * that does not alter `items.length` or `streaming.text` — used for autoscroll.
+   */
+  revision = $state(0);
 
   hydrate(transcript: TranscriptItem[], activeTurnId?: string, viewStatus?: TaskViewStatus): void {
+    // Keep the live streaming buffer only if it belongs to the still-active turn and
+    // corresponds to a persisted `partial` assistant segment of the same id — the
+    // buffer supersedes that transcript item (avoids a double bubble).
+    const keepStreaming =
+      !!this.streaming &&
+      !!activeTurnId &&
+      this.activeTurnId === activeTurnId &&
+      transcript.some(
+        (t) => t.kind === 'assistant' && t.state === 'partial' && t.id === this.streaming!.messageId,
+      );
+
     const next: ThreadItem[] = [];
+    const reasoning: Record<string, string> = {};
     for (const item of transcript) {
+      if (item.kind === 'reasoning') {
+        if (item.turnId) reasoning[item.turnId] = asText(item.content);
+        continue;
+      }
+      if (keepStreaming && item.kind === 'assistant' && item.id === this.streaming!.messageId) {
+        continue; // superseded by the live streaming buffer
+      }
       const mapped = transcriptToThreadItem(item);
       if (mapped) next.push(mapped);
     }
-    // Preserve tool call history (they are added via events during turns and not in base transcript)
-    const toolItems = this.items.filter((it): it is Extract<ThreadItem, { kind: 'tool' }> => it.kind === 'tool');
-    // avoid dups by id
-    const existingIds = new Set(next.map((i) => i.id));
-    const additionalTools = toolItems.filter((t) => !existingIds.has(t.id));
 
-    // Insert tools before the last assistant message so that:
-    // user -> tools -> final assistant  (tools belong to the same turn as the message)
-    let insertPos = next.length;
-    for (let i = next.length - 1; i >= 0; i--) {
-      if (next[i].kind === 'assistant') {
-        insertPos = i;
-        break;
-      }
-    }
-    this.items = [
-      ...next.slice(0, insertPos),
-      ...additionalTools,
-      ...next.slice(insertPos),
-    ];
-    this.streaming = null;
-    this.reasoning = '';
+    this.items = next;
+    this.reasoningByTurn = reasoning;
+    if (!keepStreaming) this.streaming = null;
     this.activeTurnId = activeTurnId ?? null;
     this.running = viewStatus === 'running' || viewStatus === 'waiting_user';
     this.readOnly = viewStatus ? isTerminalStatus(viewStatus) : false;
@@ -89,7 +108,7 @@ export class TaskThread {
   reset(): void {
     this.items = [];
     this.streaming = null;
-    this.reasoning = '';
+    this.reasoningByTurn = {};
     this.running = false;
     this.activeTurnId = null;
     this.readOnly = false;
@@ -100,6 +119,10 @@ export class TaskThread {
   }
 
   appendTranscript(item: TranscriptItem): void {
+    if (item.kind === 'reasoning') {
+      if (item.turnId) this.reasoningByTurn[item.turnId] = asText(item.content);
+      return;
+    }
     const mapped = transcriptToThreadItem(item);
     if (mapped) this.items.push(mapped);
   }
@@ -111,7 +134,6 @@ export class TaskThread {
 
   endTurn(): void {
     this.commitStreaming();
-    this.reasoning = '';
     this.running = false;
     this.activeTurnId = null;
   }
@@ -123,11 +145,36 @@ export class TaskThread {
 
   private commitStreaming(): void {
     if (this.streaming && this.streaming.text.length > 0) {
-      this.items.push({
-        kind: 'assistant',
-        id: `asst-${this.streaming.messageId}`,
-        text: this.streaming.text,
-      });
+      const id = this.streaming.messageId;
+      // The segment id is the deterministic `${turnId}:${order}`. Recover turnId/order so
+      // a committed *live* bubble carries the same turn linkage as a *restored* transcript
+      // item — the per-turn reasoning header requires `turnId`, and without it live vs.
+      // restored rendering would diverge.
+      let turnId = this.activeTurnId ?? undefined;
+      let order: number | undefined;
+      if (turnId && id.startsWith(`${turnId}:`)) {
+        const n = Number(id.slice(turnId.length + 1));
+        if (Number.isFinite(n)) order = n;
+      } else {
+        // Fallback: split at the last colon (turnId may itself contain colons).
+        const lastColon = id.lastIndexOf(':');
+        if (lastColon > 0) {
+          const n = Number(id.slice(lastColon + 1));
+          if (Number.isFinite(n)) {
+            turnId = id.slice(0, lastColon);
+            order = n;
+          }
+        }
+      }
+      // messageId is the deterministic segment id; dedupe by id.
+      const existing = this.items.find((it) => it.id === id);
+      if (existing && existing.kind === 'assistant') {
+        existing.text = this.streaming.text;
+        existing.turnId ??= turnId;
+        existing.order ??= order;
+      } else {
+        this.items.push({ kind: 'assistant', id, text: this.streaming.text, turnId, order });
+      }
     }
     this.streaming = null;
   }
@@ -139,42 +186,97 @@ export class TaskThread {
     return undefined;
   }
 
-  /** Reduce one NormalizedEvent into the thread (docs/WEBVIEW.md §5). */
+  /** Reduce one NormalizedEvent into the thread. */
   applyEvent(ev: NormalizedEvent): void {
     switch (ev.type) {
       case 'assistantDelta':
         if (!this.streaming || this.streaming.messageId !== ev.messageId) {
           this.commitStreaming();
-          this.streaming = { messageId: ev.messageId, text: '' };
+          // If a persisted partial segment with this id is already an item (e.g. after
+          // a hide/show re-hydrate mid-stream), absorb it into the buffer to avoid a
+          // duplicate bubble; the buffer then continues appending live deltas.
+          const idx = this.items.findIndex((it) => it.kind === 'assistant' && it.id === ev.messageId);
+          let seed = '';
+          if (idx >= 0) {
+            const it = this.items[idx];
+            if (it.kind === 'assistant') seed = it.text;
+            this.items.splice(idx, 1);
+          }
+          this.streaming = { messageId: ev.messageId, text: seed };
         }
         this.streaming.text += ev.content;
         break;
 
       case 'reasoningDelta':
-        this.reasoning += ev.content;
+        if (this.activeTurnId) {
+          this.reasoningByTurn[this.activeTurnId] =
+            (this.reasoningByTurn[this.activeTurnId] ?? '') + ev.content;
+        }
         break;
 
-      case 'toolStarted':
+      case 'toolStarted': {
+        // A tool closes the current assistant segment (matches the engine).
         this.commitStreaming();
-        this.items.push({
-          kind: 'tool',
-          id: ev.toolCallId,
-          name: ev.name,
-          toolKind: ev.kind,
-          status: 'running',
-          input: ev.input,
-        });
+        if (!this.activeTurnId) break;
+        const id = `${this.activeTurnId}:${ev.toolCallId}`;
+        const existing = this.findTool(id);
+        if (existing) {
+          existing.name = ev.name;
+          existing.toolKind = ev.kind;
+          existing.status = 'running';
+          if (ev.input !== undefined) existing.input = ev.input;
+        } else {
+          this.items.push({
+            kind: 'tool',
+            id,
+            turnId: this.activeTurnId,
+            name: ev.name,
+            toolKind: ev.kind,
+            status: 'running',
+            input: ev.input,
+          });
+        }
         break;
+      }
+
+      case 'toolUpdated': {
+        if (!this.activeTurnId) break;
+        const id = `${this.activeTurnId}:${ev.toolCallId}`;
+        const tool = this.findTool(id);
+        if (tool) {
+          if (ev.input !== undefined) tool.input = ev.input;
+        } else {
+          this.items.push({
+            kind: 'tool',
+            id,
+            turnId: this.activeTurnId,
+            name: 'tool',
+            status: 'running',
+            input: ev.input,
+          });
+        }
+        break;
+      }
 
       case 'toolCompleted': {
-        const tool = this.findTool(ev.toolCallId);
+        if (!this.activeTurnId) break;
+        const id = `${this.activeTurnId}:${ev.toolCallId}`;
+        const tool = this.findTool(id);
+        const status = ev.outcome === 'error' ? 'error' : 'success';
         if (tool) {
-          tool.status = ev.outcome;
-          if (ev.outcome === 'error') {
-            tool.error = ev.error;
-          } else {
-            tool.output = ev.output;
-          }
+          tool.status = status;
+          if (ev.outcome === 'error') tool.error = ev.error;
+          else tool.output = ev.output;
+        } else {
+          this.items.push({
+            kind: 'tool',
+            id,
+            turnId: this.activeTurnId,
+            name: 'tool',
+            status,
+            output: ev.outcome === 'error' ? undefined : ev.output,
+            error: ev.outcome === 'error' ? ev.error : undefined,
+          });
         }
         break;
       }
@@ -188,20 +290,17 @@ export class TaskThread {
         break;
 
       case 'sessionStarted':
-      case 'reasoningDelta':
-      case 'toolUpdated': {
-        const t = this.findTool(ev.toolCallId);
-        if (t && ev.input !== undefined) {
-          t.input = ev.input;
-        }
-        break;
-      }
       case 'usage':
       case 'raw':
         break;
     }
+    // Track in-place mutations (reasoning/tool) that don't change items/streaming length.
+    this.revision++;
   }
 }
+
+/** Cap on retained inactive threads (P2-5). */
+const MAX_CACHED_THREADS = 30;
 
 class ThreadStore {
   private byTask = new Map<string, TaskThread>();
@@ -213,8 +312,20 @@ class ThreadStore {
     if (!thread) {
       thread = new TaskThread();
       this.byTask.set(taskId, thread);
+      this.evictIfNeeded();
     }
     return thread;
+  }
+
+  /** Evict inactive terminal/non-focused threads; never evict running/waiting. */
+  private evictIfNeeded(): void {
+    if (this.byTask.size <= MAX_CACHED_THREADS) return;
+    for (const [taskId, thread] of this.byTask) {
+      if (this.byTask.size <= MAX_CACHED_THREADS) break;
+      if (taskId === this.currentTaskId) continue;
+      if (thread.running || thread.activeTurnId) continue;
+      this.byTask.delete(taskId);
+    }
   }
 
   focusTask(
@@ -239,32 +350,30 @@ class ThreadStore {
   }
 
   onTurnStart(taskId: string, turnId: string): void {
-    if (taskId !== this.currentTaskId) return;
-    this.current.startTurn(turnId);
+    this.getOrCreate(taskId).startTurn(turnId);
   }
 
   onEvent(taskId: string, turnId: string, event: NormalizedEvent): void {
-    if (taskId !== this.currentTaskId) return;
-    if (turnId !== this.current.activeTurnId) return;
-    this.current.applyEvent(event);
+    const thread = this.getOrCreate(taskId);
+    if (turnId !== thread.activeTurnId) return;
+    thread.applyEvent(event);
   }
 
   onTurnDone(taskId: string, turnId: string): void {
-    if (taskId !== this.currentTaskId) return;
-    if (turnId !== this.current.activeTurnId) return;
-    this.current.endTurn();
+    const thread = this.getOrCreate(taskId);
+    if (turnId !== thread.activeTurnId) return;
+    thread.endTurn();
   }
 
   onTurnError(taskId: string, turnId: string, message: string): void {
-    if (taskId !== this.currentTaskId) return;
-    if (turnId !== this.current.activeTurnId) return;
-    this.current.pushError(message);
-    this.current.endTurn();
+    const thread = this.getOrCreate(taskId);
+    if (turnId !== thread.activeTurnId) return;
+    thread.pushError(message);
+    thread.endTurn();
   }
 
   onTranscriptAppend(taskId: string, item: TranscriptItem): void {
-    if (taskId !== this.currentTaskId) return;
-    this.current.appendTranscript(item);
+    this.getOrCreate(taskId).appendTranscript(item);
   }
 
   updateReadOnly(viewStatus: TaskViewStatus): void {

@@ -108,6 +108,15 @@ function pruneTerminalTaskTurns(file: TaskStoreFile, taskId: string, maxTurnsPer
     delete file.turns[turnId];
     delete file.operations?.[turnId];
     delete file.cancelRequests?.[turnId];
+    delete file.reasoning?.[turnId];
+  }
+
+  if (file.toolCalls) {
+    for (const key of Object.keys(file.toolCalls)) {
+      if (dropSet.has(file.toolCalls[key].turnId)) {
+        delete file.toolCalls[key];
+      }
+    }
   }
 }
 
@@ -123,6 +132,33 @@ function truncateOpenTaskOutput(file: TaskStoreFile, taskId: string, maxStoredOu
         ...message,
         content: truncateAssistantOutput(message.content, maxStoredOutputChars),
       };
+    }
+  }
+  // Cap persisted tool output and reasoning so display records cannot blow up the store.
+  if (file.toolCalls) {
+    for (const key of Object.keys(file.toolCalls)) {
+      const tc = file.toolCalls[key];
+      if (
+        tc.taskId === taskId &&
+        typeof tc.output === 'string' &&
+        tc.output.length > maxStoredOutputChars
+      ) {
+        file.toolCalls[key] = {
+          ...tc,
+          output: truncateAssistantOutput(tc.output, maxStoredOutputChars),
+        };
+      }
+    }
+  }
+  if (file.reasoning) {
+    for (const key of Object.keys(file.reasoning)) {
+      const r = file.reasoning[key];
+      if (r.taskId === taskId && r.content.length > maxStoredOutputChars) {
+        file.reasoning[key] = {
+          ...r,
+          content: truncateAssistantOutput(r.content, maxStoredOutputChars),
+        };
+      }
     }
   }
 }

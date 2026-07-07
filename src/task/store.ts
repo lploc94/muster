@@ -4,7 +4,7 @@ import { randomBytes } from 'crypto';
 import { deriveViewStatus } from './derived-status';
 import type { MusterTask, TaskLifecycleState, TaskMessage, TaskStoreFile, TaskTurn, TaskViewStatus } from './types';
 
-export const CURRENT_SCHEMA_VERSION = 2;
+export const CURRENT_SCHEMA_VERSION = 3;
 
 export interface StoreOptions {
   filePath: string;
@@ -36,6 +36,10 @@ function emptyEnvelope(schemaVersion: number): TaskStoreFile {
   if (schemaVersion >= 2) {
     base.operations = {};
     base.cancelRequests = {};
+  }
+  if (schemaVersion >= 3) {
+    base.toolCalls = {};
+    base.reasoning = {};
   }
   return base;
 }
@@ -90,6 +94,12 @@ export function migrate(file: TaskStoreFile, targetVersion: number): TaskStoreFi
       current.schemaVersion = 2;
       current.operations = current.operations ?? {};
       current.cancelRequests = current.cancelRequests ?? {};
+      continue;
+    }
+    if (current.schemaVersion === 2) {
+      current.schemaVersion = 3;
+      current.toolCalls = current.toolCalls ?? {};
+      current.reasoning = current.reasoning ?? {};
       continue;
     }
     throw new Error(`No migration path from schema ${current.schemaVersion}`);
@@ -228,6 +238,38 @@ export function computeAffectedTaskIds(before: TaskStoreFile, after: TaskStoreFi
   for (const id of allMessageIds) {
     const prev = before.messages[id];
     const next = after.messages[id];
+    if (JSON.stringify(prev) !== JSON.stringify(next)) {
+      if (next) {
+        affected.add(next.taskId);
+      } else if (prev) {
+        affected.add(prev.taskId);
+      }
+    }
+  }
+
+  const allToolCallIds = new Set([
+    ...Object.keys(before.toolCalls ?? {}),
+    ...Object.keys(after.toolCalls ?? {}),
+  ]);
+  for (const id of allToolCallIds) {
+    const prev = before.toolCalls?.[id];
+    const next = after.toolCalls?.[id];
+    if (JSON.stringify(prev) !== JSON.stringify(next)) {
+      if (next) {
+        affected.add(next.taskId);
+      } else if (prev) {
+        affected.add(prev.taskId);
+      }
+    }
+  }
+
+  const allReasoningIds = new Set([
+    ...Object.keys(before.reasoning ?? {}),
+    ...Object.keys(after.reasoning ?? {}),
+  ]);
+  for (const id of allReasoningIds) {
+    const prev = before.reasoning?.[id];
+    const next = after.reasoning?.[id];
     if (JSON.stringify(prev) !== JSON.stringify(next)) {
       if (next) {
         affected.add(next.taskId);

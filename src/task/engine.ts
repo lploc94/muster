@@ -1130,7 +1130,12 @@ export class TaskEngine {
     let rawOutput = '';
     let observedSessionId: string | undefined;
     let terminalSettled = false;
-    const assistantStoreIds = new Map<string, string>();
+    // Per-turn render ordering + assistant segmentation (see WEBVIEW-IMPROVEMENT-PLAN §5.1.1).
+    // `order` is a per-turn monotonic counter shared by assistant segments and tool
+    // calls; `(turn.sequence, order)` reconstructs the exact live interleaving.
+    let orderCounter = 0;
+    const nextOrder = (): number => orderCounter++;
+    let currentAssistantSegment: { storeId: string; sourceMessageId: string } | undefined;
     let backend: Backend = {
       name: task.backend,
       run: async function* () {},
@@ -1178,8 +1183,11 @@ export class TaskEngine {
           break;
         }
 
+        // Auxiliary streaming events are forwarded raw. `assistantDelta` is
+        // forwarded AFTER persistence with a rewritten, deterministic messageId
+        // (`${turnId}:${order}`) so the live stream and hydrated snapshot reconcile
+        // by identical id (see WEBVIEW-IMPROVEMENT-PLAN §5.1.1).
         if (
-          event.type === 'assistantDelta' ||
           event.type === 'reasoningDelta' ||
           event.type === 'toolStarted' ||
           event.type === 'toolUpdated' ||
@@ -1204,27 +1212,38 @@ export class TaskEngine {
             }
             break;
           case 'assistantDelta': {
+            // Open a new segment when none is current or the backend messageId
+            // changed (mirrors the live reducer). Segment store id = `${turnId}:${order}`.
+            const openNew =
+              !currentAssistantSegment || currentAssistantSegment.sourceMessageId !== event.messageId;
+            let segmentId: string;
+            let segmentOrder = -1;
+            if (openNew) {
+              segmentOrder = nextOrder();
+              segmentId = `${turnId}:${segmentOrder}`;
+              currentAssistantSegment = { storeId: segmentId, sourceMessageId: event.messageId };
+            } else {
+              segmentId = currentAssistantSegment!.storeId;
+            }
             const commit = this.store.commit((draft) => {
               const draftTurn = draft.turns[turnId];
               if (!draftTurn) {
                 return { ok: false, reason: 'turn not found' };
               }
-              let storeMessageId = assistantStoreIds.get(event.messageId);
-              if (!storeMessageId) {
-                storeMessageId = randomUUID();
-                assistantStoreIds.set(event.messageId, storeMessageId);
-                draft.messages[storeMessageId] = {
-                  id: storeMessageId,
+              const existing = draft.messages[segmentId];
+              if (!existing) {
+                draft.messages[segmentId] = {
+                  id: segmentId,
                   taskId: draftTurn.taskId,
                   role: 'assistant',
                   content: event.content,
                   state: 'partial',
                   createdAt: nowIso(this.clock),
                   turnId,
+                  order: segmentOrder,
                 };
               } else {
-                const existing = draft.messages[storeMessageId];
-                draft.messages[storeMessageId] = {
+                draft.messages[segmentId] = {
                   ...existing,
                   content: existing.content + event.content,
                 };
@@ -1233,6 +1252,191 @@ export class TaskEngine {
             });
             if (!commit.ok) {
               const failMessage = commit.detail ?? 'assistant persistence failed';
+              terminalSettled = await this.settleFailed(
+                turnId,
+                failMessage,
+                observedSessionId,
+                rawOutput,
+                backend,
+              );
+              if (terminalSettled) {
+                this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message: failMessage });
+              }
+              break;
+            }
+            // Forward a rewritten delta carrying the deterministic segment id.
+            this.safeEmit({
+              type: 'event',
+              taskId: turn.taskId,
+              turnId,
+              event: { type: 'assistantDelta', content: event.content, messageId: segmentId },
+            });
+            break;
+          }
+          case 'reasoningDelta': {
+            const commit = this.store.commit((draft) => {
+              const draftTurn = draft.turns[turnId];
+              if (!draftTurn) {
+                return { ok: false, reason: 'turn not found' };
+              }
+              draft.reasoning = draft.reasoning ?? {};
+              const now = nowIso(this.clock);
+              const existing = draft.reasoning[turnId];
+              draft.reasoning[turnId] = existing
+                ? { ...existing, content: existing.content + event.content, updatedAt: now }
+                : {
+                    id: turnId,
+                    taskId: draftTurn.taskId,
+                    turnId,
+                    content: event.content,
+                    createdAt: now,
+                    updatedAt: now,
+                  };
+              return { ok: true };
+            });
+            if (!commit.ok) {
+              const failMessage = commit.detail ?? 'reasoning persistence failed';
+              terminalSettled = await this.settleFailed(
+                turnId,
+                failMessage,
+                observedSessionId,
+                rawOutput,
+                backend,
+              );
+              if (terminalSettled) {
+                this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message: failMessage });
+              }
+              break;
+            }
+            break;
+          }
+          case 'toolStarted': {
+            // A tool closes the current assistant segment (matches live commitStreaming).
+            currentAssistantSegment = undefined;
+            const compositeId = `${turnId}:${event.toolCallId}`;
+            const commit = this.store.commit((draft) => {
+              const draftTurn = draft.turns[turnId];
+              if (!draftTurn) {
+                return { ok: false, reason: 'turn not found' };
+              }
+              draft.toolCalls = draft.toolCalls ?? {};
+              if (!draft.toolCalls[compositeId]) {
+                const now = nowIso(this.clock);
+                draft.toolCalls[compositeId] = {
+                  id: compositeId,
+                  taskId: draftTurn.taskId,
+                  turnId,
+                  toolCallId: event.toolCallId,
+                  order: nextOrder(),
+                  name: event.name,
+                  kind: event.kind,
+                  status: 'running',
+                  input: event.input,
+                  createdAt: now,
+                  updatedAt: now,
+                };
+              }
+              return { ok: true };
+            });
+            if (!commit.ok) {
+              const failMessage = commit.detail ?? 'tool persistence failed';
+              terminalSettled = await this.settleFailed(
+                turnId,
+                failMessage,
+                observedSessionId,
+                rawOutput,
+                backend,
+              );
+              if (terminalSettled) {
+                this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message: failMessage });
+              }
+              break;
+            }
+            break;
+          }
+          case 'toolUpdated': {
+            const compositeId = `${turnId}:${event.toolCallId}`;
+            const commit = this.store.commit((draft) => {
+              const draftTurn = draft.turns[turnId];
+              if (!draftTurn) {
+                return { ok: false, reason: 'turn not found' };
+              }
+              draft.toolCalls = draft.toolCalls ?? {};
+              const now = nowIso(this.clock);
+              const existing = draft.toolCalls[compositeId];
+              draft.toolCalls[compositeId] = existing
+                ? {
+                    ...existing,
+                    // Adapter `toolUpdated.input` is a full snapshot — replace, not merge.
+                    input: event.input !== undefined ? event.input : existing.input,
+                    updatedAt: now,
+                  }
+                : {
+                    id: compositeId,
+                    taskId: draftTurn.taskId,
+                    turnId,
+                    toolCallId: event.toolCallId,
+                    order: nextOrder(),
+                    name: 'tool',
+                    status: 'running',
+                    input: event.input,
+                    createdAt: now,
+                    updatedAt: now,
+                  };
+              return { ok: true };
+            });
+            if (!commit.ok) {
+              const failMessage = commit.detail ?? 'tool persistence failed';
+              terminalSettled = await this.settleFailed(
+                turnId,
+                failMessage,
+                observedSessionId,
+                rawOutput,
+                backend,
+              );
+              if (terminalSettled) {
+                this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message: failMessage });
+              }
+              break;
+            }
+            break;
+          }
+          case 'toolCompleted': {
+            const compositeId = `${turnId}:${event.toolCallId}`;
+            const outcome = event.outcome;
+            const commit = this.store.commit((draft) => {
+              const draftTurn = draft.turns[turnId];
+              if (!draftTurn) {
+                return { ok: false, reason: 'turn not found' };
+              }
+              draft.toolCalls = draft.toolCalls ?? {};
+              const now = nowIso(this.clock);
+              const existing = draft.toolCalls[compositeId];
+              const base =
+                existing ??
+                {
+                  id: compositeId,
+                  taskId: draftTurn.taskId,
+                  turnId,
+                  toolCallId: event.toolCallId,
+                  order: nextOrder(),
+                  name: 'tool',
+                  status: 'running' as const,
+                  createdAt: now,
+                  updatedAt: now,
+                };
+              draft.toolCalls[compositeId] = {
+                ...base,
+                status: outcome === 'error' ? 'error' : 'success',
+                updatedAt: now,
+                ...(outcome === 'error'
+                  ? { error: event.error, output: undefined }
+                  : { output: event.output, error: undefined }),
+              };
+              return { ok: true };
+            });
+            if (!commit.ok) {
+              const failMessage = commit.detail ?? 'tool persistence failed';
               terminalSettled = await this.settleFailed(
                 turnId,
                 failMessage,

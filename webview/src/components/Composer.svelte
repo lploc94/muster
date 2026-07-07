@@ -26,7 +26,17 @@
   let backendSelect = $state<(HTMLElement & { value: string }) | undefined>(undefined);
 
   const blocked = $derived(!!pendingAsk || readOnly);
-  const canSend = $derived(!thread.running && !blocked);
+  // Block normal sends while the task has an active/queued turn (derived from viewStatus),
+  // not just when this thread is locally streaming.
+  const viewBusy = $derived(
+    ((s) =>
+      s === 'queued' ||
+      s === 'waiting_dependencies' ||
+      s === 'waiting_children' ||
+      s === 'running' ||
+      s === 'waiting_user')(tasks.focusedTask?.viewStatus),
+  );
+  const canSend = $derived(!thread.running && !blocked && !viewBusy);
   const canCancel = $derived(thread.running && !!taskId && !!turnId);
 
   // Register select so resolveBackendForSend can read it for draft sends
@@ -68,6 +78,9 @@
   }
 
   function onKeydown(e: KeyboardEvent) {
+    // Ignore Enter while an IME composition is active (CJK/Vietnamese input);
+    // keyCode 229 is the legacy signal for the same.
+    if (e.isComposing || e.keyCode === 229) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       send();

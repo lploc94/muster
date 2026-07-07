@@ -15,8 +15,6 @@
   const inChat = $derived(tasks.draftMode || !!tasks.focusedTaskId);
   let historyOpen = $state(false);
 
-  const currentThread = $derived(threadStore.current);
-
   function selectTask(taskId: string) {
     tasks.focusTask(taskId);
     post({ type: 'focusTask', taskId });
@@ -264,11 +262,16 @@
     <!-- History dropdown -->
     {#if historyOpen}
       <!-- click outside catcher -->
-      <div class="absolute left-0 right-0 bottom-0 top-[28px] z-40" onclick={() => (historyOpen = false)}></div>
+      <button
+        type="button"
+        aria-label="Close history"
+        class="absolute left-0 right-0 bottom-0 top-[28px] z-40 cursor-default"
+        style="background: transparent; border: none;"
+        onclick={() => (historyOpen = false)}
+      ></button>
       <div
         class="absolute right-3 top-[28px] z-50 w-80 max-w-[min(20rem,calc(100%-1rem))] max-h-[min(55vh,320px)] overflow-auto rounded border shadow"
         style="background: var(--vscode-editor-background); border-color: var(--vscode-panel-border);"
-        onclick={(e) => e.stopPropagation()}
       >
         <div class="flex items-center justify-between px-2 py-1 border-b text-xs" style="border-color: var(--vscode-panel-border);">
           <span class="font-medium">Previous tasks</span>

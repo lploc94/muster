@@ -207,6 +207,63 @@ describe('TaskStore', () => {
     expect(reloaded.getFile().revision).toBe(4);
   });
 
+  it('migrates a v2 fixture to v3 defaulting toolCalls/reasoning to empty', () => {
+    const { filePath } = makeTempStore();
+    const legacy = {
+      schemaVersion: 2,
+      revision: 7,
+      tasks: { 'task-1': sampleTask('task-1') },
+      turns: {},
+      messages: {},
+      operations: {},
+      cancelRequests: {},
+    };
+    fs.writeFileSync(filePath, JSON.stringify(legacy), 'utf8');
+
+    const store = TaskStore.load({ filePath });
+    const file = store.getFile();
+    expect(file.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
+    expect(file.toolCalls).toEqual({});
+    expect(file.reasoning).toEqual({});
+  });
+
+  it('persists toolCalls/reasoning across commit and reload (retention writeback plumbing)', () => {
+    const { filePath } = makeTempStore();
+    const store = TaskStore.load({ filePath });
+    store.commit((draft) => {
+      draft.tasks['task-1'] = sampleTask('task-1');
+      draft.toolCalls = {
+        'turn-1:tc1': {
+          id: 'turn-1:tc1',
+          taskId: 'task-1',
+          turnId: 'turn-1',
+          toolCallId: 'tc1',
+          order: 0,
+          name: 'read',
+          status: 'success',
+          output: 'ok',
+          createdAt: '2026-07-06T00:00:00.000Z',
+          updatedAt: '2026-07-06T00:00:00.000Z',
+        },
+      };
+      draft.reasoning = {
+        'turn-1': {
+          id: 'turn-1',
+          taskId: 'task-1',
+          turnId: 'turn-1',
+          content: 'thinking',
+          createdAt: '2026-07-06T00:00:00.000Z',
+          updatedAt: '2026-07-06T00:00:00.000Z',
+        },
+      };
+      return { ok: true };
+    });
+
+    const reloaded = TaskStore.load({ filePath });
+    expect(reloaded.getFile().toolCalls?.['turn-1:tc1']?.output).toBe('ok');
+    expect(reloaded.getFile().reasoning?.['turn-1']?.content).toBe('thinking');
+  });
+
   it('rebuilds derived indexes after each commit', () => {
     const { filePath } = makeTempStore();
     const store = TaskStore.load({ filePath });

@@ -82,6 +82,43 @@ export interface TaskMessage {
   state: TaskMessageState;
   createdAt: string;
   turnId?: string;
+  /**
+   * Per-turn monotonic render order for assistant segments (schema ≥ 3). Assistant
+   * messages are segmented at tool boundaries so `(turn.sequence, order)` reproduces
+   * the exact live interleaving of assistant text and tool cards.
+   */
+  order?: number;
+}
+
+/** Persisted tool call for transcript reconstruction (schema ≥ 3). */
+export interface PersistedToolCall {
+  /** Composite id `${turnId}:${toolCallId}` — unique across turns. */
+  id: string;
+  taskId: string;
+  turnId: string;
+  /** Raw backend tool-call id, used to match update/complete events within the turn. */
+  toolCallId: string;
+  /** Per-turn monotonic render order (shared counter with assistant segments). */
+  order: number;
+  name: string;
+  kind?: 'mcp' | 'builtin' | 'other';
+  status: 'running' | 'success' | 'error';
+  input?: unknown;
+  output?: unknown;
+  error?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Persisted reasoning, turn-scoped (schema ≥ 3). One record per turn. */
+export interface PersistedReasoning {
+  /** Equal to turnId. */
+  id: string;
+  taskId: string;
+  turnId: string;
+  content: string;
+  createdAt: string;
+  updatedAt: string;
 }
 export interface OpResult {
   ok: boolean;
@@ -110,6 +147,10 @@ export interface TaskStoreFile {
   /** Phase C coordination state (schema ≥ 2). */
   operations?: Record<string, OperationLedgerEntry>;
   cancelRequests?: Record<string, CancelRequest>;
+  /** Persisted tool calls, keyed by `${turnId}:${toolCallId}` (schema ≥ 3). */
+  toolCalls?: Record<string, PersistedToolCall>;
+  /** Persisted reasoning, keyed by turnId (schema ≥ 3). */
+  reasoning?: Record<string, PersistedReasoning>;
 }
 
 // Derived view status (§4.3) — computed, never persisted
