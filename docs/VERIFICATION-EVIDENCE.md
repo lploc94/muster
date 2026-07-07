@@ -37,7 +37,7 @@ Contract proof is supplied by the repository scripts and source contracts:
 - `package.json` keeps the existing `npm test` Vitest entry point and defines `npm run test:source-boundary` for `node scripts/source-boundary-smoke.mjs`, so the repository can run product tests and source-boundary checks without replacing the current suite.
 - `scripts/source-boundary-smoke.mjs` checks the expected source files and rejects unsupported runtime-scope claim phrases in tracked text files.
 - `src/types.ts` declares `NormalizedEvent`, `RunOptions`, `BackendCapabilities`, and `Backend`, giving the local verifier a stable source-level contract to inspect.
-- `src/backends/claude.ts` implements `makeBackend` against `Backend`, `NormalizedEvent`, and `RunOptions` and exposes MCP capability metadata at the source-contract level.
+- `src/backends/claude.ts` implements the `Backend` contract against `NormalizedEvent` and `RunOptions` and exposes MCP capability metadata at the source-contract level, while `src/backends/index.ts` provides the `makeBackend` factory that selects it.
 
 This proof class is represented by evidence IDs `4eadab69-0625-468d-b8ea-a14ebf4c1f50` and `64f78de1-e31f-425b-ac37-69f3a9ceafb8`.
 

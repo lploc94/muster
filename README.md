@@ -28,7 +28,7 @@ Open-source VS Code extension that **coordinates** multiple AI coding CLIs from 
 
 ## Prerequisites
 
-- **Node.js** 20+
+- **Node.js** 20+ (CI and the M002 quality gate target Node 24 LTS)
 - **VS Code** 1.94+
 - **Claude Code** CLI (`claude`) on `PATH` for the Claude backend
 - **Grok CLI** (`grok`) on `PATH` for the Grok backend

@@ -1,14 +1,8 @@
-# CI is scaffolded but disabled by default.
+# CI runs automatically on push and pull requests targeting `main`,
+# and can also be triggered manually from GitHub Actions → CI → Run workflow.
 #
-# To enable automatic runs on push/PR, replace `on:` with:
-#
-#   on:
-#     push:
-#       branches: [main]
-#     pull_request:
-#       branches: [main]
-#
-# Until then, trigger manually from GitHub Actions → CI → Run workflow.
+# It runs the shared local verifier (`npm test`) plus the M002 quality-gate
+# checks (source-boundary smoke, evidence ledger, and fixtures) on Node 24 LTS.
 
 name: CI
 
@@ -34,3 +28,4 @@ jobs:
       - run: npm test
       - run: npm run test:source-boundary
       - run: npm run test:evidence
+      - run: npm run test:source-boundary:fixtures
