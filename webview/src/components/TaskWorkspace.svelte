@@ -72,15 +72,6 @@
 
 <div class="flex-1 min-w-0 min-h-0 flex flex-col">
   {#if tasks.draftMode}
-    <div
-      class="px-3 py-2 border-b text-sm"
-      style="border-color: var(--vscode-panel-border);"
-    >
-      <span class="font-semibold">
-        {tasks.continuationOf ? 'Continue as new task' : 'New task'}
-      </span>
-      <span class="ml-2 text-xs" style="opacity: 0.7;">First message creates the task.</span>
-    </div>
     <ChatThread />
     <Composer mode="draft" {pendingAsk} />
   {:else if focused}
@@ -106,6 +97,9 @@
         <div class="flex items-center gap-2 min-w-0">
           <span class="font-semibold truncate">{shortGoal(focused.goal)}</span>
           <vscode-badge class={statusClass(focused.viewStatus)}>{presentation.label}</vscode-badge>
+          {#if focused.backend}
+            <span class="task-pill task-pill--muted">{focused.backend}</span>
+          {/if}
           {#if focused.continuationOf}
             <span class="task-pill task-pill--muted">continuation</span>
           {/if}

@@ -5,11 +5,14 @@ export interface UserItem {
   kind: 'user';
   id: string;
   text: string;
+  turnId?: string;
 }
 export interface AssistantItem {
   kind: 'assistant';
   id: string;
   text: string;
+  turnId?: string;
+  order?: number;
 }
 export interface ToolItem {
   kind: 'tool';
@@ -17,7 +20,11 @@ export interface ToolItem {
   name: string;
   toolKind?: 'mcp' | 'builtin' | 'other';
   status: 'running' | 'success' | 'error';
+  input?: unknown;
+  output?: unknown;
   error?: string;
+  turnId?: string;
+  order?: number;
 }
 export interface ErrorItem {
   kind: 'error';

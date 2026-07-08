@@ -20,7 +20,8 @@ describe('buildTurnMcp', () => {
   });
 
   it('emits headless mcpConfigPath with headers object', () => {
-    const backend: Backend = { name: 'claude', capabilities: MCP_CAPS, run: async function* () {} };
+    // Any backend NOT in the ACP set uses the headless --mcp-config file path.
+    const backend: Backend = { name: 'legacy-headless', capabilities: MCP_CAPS, run: async function* () {} };
     const result = buildTurnMcp(backend, { port: 4321 }, 'tok-abc');
     expect(result.mcpConfigPath).toBeDefined();
     const parsed = JSON.parse(fs.readFileSync(result.mcpConfigPath!, 'utf8'));

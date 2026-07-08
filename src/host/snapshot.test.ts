@@ -160,8 +160,22 @@ describe('host task snapshot projection', () => {
       ['root-active', 'running'],
     ]);
     expect(snapshot.transcript).toEqual([
-      { id: 'user', kind: 'user', content: 'user request' },
-      { id: 'assistant', kind: 'assistant', content: 'assistant answer' },
+      {
+        id: 'user',
+        kind: 'user',
+        content: 'user request',
+        turnId: undefined,
+        order: undefined,
+        state: 'complete',
+      },
+      {
+        id: 'assistant',
+        kind: 'assistant',
+        content: 'assistant answer',
+        turnId: undefined,
+        order: undefined,
+        state: 'complete',
+      },
     ]);
     expect(snapshot.activeTurnId).toBe('root-active-queued');
     expect(snapshot.pendingAsk).toEqual({

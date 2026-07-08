@@ -127,4 +127,76 @@ describe('applyRetention', () => {
     const twice = applyRetention(once, DEFAULT_RETENTION_CONFIG);
     expect(twice).toEqual(once);
   });
+
+  it('truncates oversized tool output and reasoning content on open tasks', () => {
+    const file = emptyFile();
+    file.schemaVersion = 3;
+    file.toolCalls = {};
+    file.reasoning = {};
+    file.tasks['task-1'] = sampleTask('task-1', 'open');
+    file.turns['t1'] = turn('t1', 'task-1', 1);
+    const huge = 'z'.repeat(300_000);
+    file.toolCalls['t1:tc1'] = {
+      id: 't1:tc1',
+      taskId: 'task-1',
+      turnId: 't1',
+      toolCallId: 'tc1',
+      order: 0,
+      name: 'read',
+      status: 'success',
+      output: huge,
+      createdAt: '2026-07-06T00:00:01.000Z',
+      updatedAt: '2026-07-06T00:00:01.000Z',
+    };
+    file.reasoning['t1'] = {
+      id: 't1',
+      taskId: 'task-1',
+      turnId: 't1',
+      content: huge,
+      createdAt: '2026-07-06T00:00:01.000Z',
+      updatedAt: '2026-07-06T00:00:01.000Z',
+    };
+
+    const pruned = applyRetention(file, { maxTurnsPerTask: 200, maxStoredOutputChars: 200_000 });
+    expect((pruned.toolCalls!['t1:tc1'].output as string).length).toBeLessThan(huge.length);
+    expect((pruned.toolCalls!['t1:tc1'].output as string).endsWith(TRUNCATION_MARKER)).toBe(true);
+    expect(pruned.reasoning!['t1'].content.endsWith(TRUNCATION_MARKER)).toBe(true);
+  });
+
+  it('drops tool calls and reasoning for pruned turns on terminal tasks', () => {
+    const file = emptyFile();
+    file.schemaVersion = 3;
+    file.toolCalls = {};
+    file.reasoning = {};
+    file.tasks['task-1'] = sampleTask('task-1', 'succeeded');
+    for (let i = 1; i <= 5; i += 1) {
+      file.turns[`t${i}`] = turn(`t${i}`, 'task-1', i);
+      file.toolCalls[`t${i}:tc`] = {
+        id: `t${i}:tc`,
+        taskId: 'task-1',
+        turnId: `t${i}`,
+        toolCallId: 'tc',
+        order: 0,
+        name: 'read',
+        status: 'success',
+        createdAt: `2026-07-06T00:00:0${i}.000Z`,
+        updatedAt: `2026-07-06T00:00:0${i}.000Z`,
+      };
+      file.reasoning[`t${i}`] = {
+        id: `t${i}`,
+        taskId: 'task-1',
+        turnId: `t${i}`,
+        content: `r${i}`,
+        createdAt: `2026-07-06T00:00:0${i}.000Z`,
+        updatedAt: `2026-07-06T00:00:0${i}.000Z`,
+      };
+    }
+
+    const pruned = applyRetention(file, { maxTurnsPerTask: 3, maxStoredOutputChars: 200_000 });
+    expect(pruned.toolCalls!['t1:tc']).toBeUndefined();
+    expect(pruned.toolCalls!['t2:tc']).toBeUndefined();
+    expect(pruned.toolCalls!['t5:tc']).toBeDefined();
+    expect(pruned.reasoning!['t1']).toBeUndefined();
+    expect(pruned.reasoning!['t5']).toBeDefined();
+  });
 });

@@ -130,7 +130,14 @@ describe('task lifecycle runtime regression harness', () => {
     });
     expect(snapshot.activeTurnId).toBe(started.value.turnId);
     expect(snapshot.transcript).toEqual([
-      { id: started.value.messageId, kind: 'user', content: 'Run a lifecycle task' },
+      {
+        id: started.value.messageId,
+        kind: 'user',
+        content: 'Run a lifecycle task',
+        turnId: started.value.turnId,
+        order: undefined,
+        state: 'assigned',
+      },
     ]);
 
     gate.release();

@@ -22,6 +22,7 @@ interface TaskSummary {
   lifecycle: string;
   viewStatus: TaskViewStatus;
   updatedAt: string;
+  backend: string;
 }
 
 interface SnapshotMessage {
@@ -107,6 +108,7 @@ function task(overrides: Partial<TaskSummary> = {}): TaskSummary {
     lifecycle: 'open',
     viewStatus: 'idle',
     updatedAt: '2026-01-01T00:00:00.000Z',
+    backend: 'claude',
     ...overrides,
   };
 }
@@ -124,7 +126,8 @@ test.describe('Muster webview host state smoke', () => {
       storeRevision: 1,
     });
 
-    await expect(page.getByRole('button', { name: /Wire browser regression harness idle/i })).toBeVisible();
+    await expect(page.locator('.task-workspace-banner').getByText('Ready for work')).toBeVisible();
+    await expect(page.locator('.task-workspace-banner').getByText('No turn is currently running for this task.')).toBeVisible();
     await expect(page.getByText('Wire browser regression harness').first()).toBeVisible();
     await expect(page.getByText('Harness ready.')).toBeVisible();
   });
@@ -138,16 +141,13 @@ test.describe('Muster webview host state smoke', () => {
       storeRevision: 2,
     });
 
-    await expect(page.getByText('No tasks yet.')).toBeVisible();
-    await expect(page.getByText('Select a task or create a new one.')).toBeVisible();
-
-    await page.getByRole('button', { name: 'New task' }).first().click();
+    await expect(page.getByText('No previous tasks.')).toBeVisible();
+    await page.locator('button[title="New task"]').first().click();
     await expectPostedMessage(page, { type: 'newTask' });
-    await expect(page.getByText('New task (draft)')).toBeVisible();
-    await expect(page.getByText('First message creates the task.')).toBeVisible();
-
-    await page.getByPlaceholder('New task message (claude)...').fill('Start a browser-visible task.');
-    await page.getByRole('button', { name: 'Send' }).click();
+    await expect(page.getByText('New task').first()).toBeVisible();
+    await expect(page.getByText('First message creates the coordinator task.')).toBeVisible();
+    await page.getByPlaceholder('Start a new coordinator task with claude…').fill('Start a browser-visible task.');
+    await page.locator('button[title="Send"]').click();
     await expectPostedMessage(page, {
       type: 'send',
       text: 'Start a browser-visible task.',
@@ -177,21 +177,27 @@ test.describe('Muster webview host state smoke', () => {
       storeRevision: 3,
     });
 
-    await expect(page.getByRole('button', { name: /Run the model evaluation.*Running.*Agent is working/i })).toBeVisible();
-    await expect(page.getByRole('button', { name: /Run the model evaluation.*Running.*Agent is working/i })).toHaveClass(/task-list-item--selected/);
-    await expect(page.getByRole('button', { name: /Recover failed analysis.*Needs recovery.*Recovery required/i })).toBeVisible();
-    await expect(page.getByRole('button', { name: /Cancelled rollout.*Cancelled.*Stopped before finishing/i })).toBeVisible();
+    await expect(page.locator('.task-workspace-banner').getByText('Task is running')).toBeVisible();
+    await expect(page.locator('.task-workspace-banner').getByText('The assigned agent is actively processing this task')).toBeVisible();
+    await page.locator('button[title="History (previous coordinator tasks)"]').click();
+    await expect(page.getByRole('button', { name: /Run the model evaluation.*Running.*Agent is working.*Backend claude/i })).toBeVisible();
+    await expect(page.getByRole('button', { name: /Recover failed analysis.*Needs recovery.*Recovery required.*Backend claude/i })).toBeVisible();
+    await expect(page.getByRole('button', { name: /Cancelled rollout.*Cancelled.*Stopped before finishing.*Backend claude/i })).toBeVisible();
+    await page.getByRole('button', { name: 'Close history' }).click();
     await expect(page.getByText('Task is running')).toBeVisible();
     await expect(page.getByText('Composer is disabled while the active turn is running')).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Cancel running task' })).toBeVisible();
-    await page.getByRole('button', { name: 'Cancel running task' }).click();
+    await expect(page.locator('button[title="Stop"]')).toBeVisible();
+    await page.locator('button[title="Stop"]').click();
     await expectPostedMessage(page, {
       type: 'cancelTurn',
       taskId: 'task-running',
       turnId: 'turn-running',
     });
 
-    await page.getByRole('button', { name: /Recover failed analysis.*Needs recovery.*Recovery required/i }).click();
+    if ((await page.getByRole('button', { name: /Recover failed analysis.*Needs recovery.*Recovery required.*Backend claude/i }).count()) === 0) {
+      await page.locator('button[title="History (previous coordinator tasks)"]').click();
+    }
+    await page.getByRole('button', { name: /Recover failed analysis.*Needs recovery.*Recovery required.*Backend claude/i }).click();
     await expectPostedMessage(page, { type: 'focusTask', taskId: 'task-recovery' });
     await expectPostedMessage(page, { type: 'hydrateSubtree', taskId: 'task-recovery' });
 
@@ -276,8 +282,8 @@ test.describe('Muster webview host state smoke', () => {
     await page.getByRole('button', { name: 'Continue as new task' }).click();
     await expectPostedMessage(page, { type: 'newTask' });
     await expect(page.getByText('Continue as new task')).toBeVisible();
-    await page.getByPlaceholder('New task message (claude)...').fill('Open a follow-up after cancellation.');
-    await page.getByRole('button', { name: 'Send' }).click();
+    await page.getByPlaceholder('Start a new coordinator task with claude…').fill('Open a follow-up after cancellation.');
+    await page.locator('button[title="Send"]').click();
     await expectPostedMessage(page, {
       type: 'send',
       text: 'Open a follow-up after cancellation.',
@@ -395,8 +401,8 @@ test.describe('Muster webview host state smoke', () => {
     await expect(page.getByText('Which model should continue?')).toBeVisible();
     await expect(page.locator('.composer-guidance').getByText('Answer the pending task question above to continue.')).toBeVisible();
     await expect(page.getByRole('button', { name: 'Send' })).toHaveCount(0);
-    await expect(page.getByRole('button', { name: 'Cancel running task' })).toHaveCount(0);
-    await page.getByLabel('Claude').check();
+    await expect(page.getByRole('button', { name: 'Stop' })).toHaveCount(0);
+    await page.locator('vscode-radio').filter({ hasText: 'Claude' }).click();
     await page.getByRole('button', { name: 'Submit' }).click();
     await expectPostedMessage(page, {
       type: 'submitAsk',
@@ -427,7 +433,7 @@ test.describe('Muster webview host state smoke', () => {
 
     await expect(page.getByText('Agent question')).toHaveCount(0);
     await expect(page.locator('.composer-guidance').getByText('Answer the pending prompt to unblock the task.')).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Cancel running task' })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Stop' })).toHaveCount(0);
   });
 });
 

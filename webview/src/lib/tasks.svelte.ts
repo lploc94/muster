@@ -7,7 +7,7 @@ export interface CommandErrorState {
 }
 
 /** Backends selectable from the webview toolbar. */
-export type WebviewBackendId = 'claude' | 'grok' | 'kiro' | 'codex';
+export type WebviewBackendId = 'claude' | 'grok' | 'kiro' | 'codex' | 'opencode';
 
 class TasksState {
   /** All known tasks keyed by id (roots + subtree entries from snapshots/patches). */
@@ -115,6 +115,7 @@ class TasksState {
         lifecycle: 'open',
         viewStatus: 'idle',
         updatedAt: new Date(0).toISOString(),
+        backend: '',
       }),
       ...patch,
       id: taskId,
@@ -155,7 +156,8 @@ export function resolveBackendForSend(): WebviewBackendId {
     fromSelect === 'claude' ||
     fromSelect === 'grok' ||
     fromSelect === 'kiro' ||
-    fromSelect === 'codex'
+    fromSelect === 'codex' ||
+    fromSelect === 'opencode'
   ) {
     return fromSelect;
   }

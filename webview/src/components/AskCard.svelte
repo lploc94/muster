@@ -29,16 +29,10 @@
     return entry;
   }
 
-  function toggleOption(index: number, option: string, multi: boolean): void {
+  // Single-select: options render as a radio group (at most one selection).
+  function selectOption(index: number, option: string): void {
     const entry = ensureAnswer(index);
-    if (multi) {
-      const set = new Set(entry.selected);
-      if (set.has(option)) set.delete(option);
-      else set.add(option);
-      entry.selected = [...set];
-    } else {
-      entry.selected = [option];
-    }
+    entry.selected = [option];
     answers = { ...answers };
   }
 
@@ -72,31 +66,29 @@
       <div class="whitespace-pre-wrap">{q.prompt}</div>
 
       {#if q.options && q.options.length > 0}
-        <div class="flex flex-col gap-0.5">
+        <vscode-radio-group
+          onchange={(e: Event) => {
+            const val = (e.target as HTMLElement & { value?: string })?.value;
+            if (typeof val === 'string') selectOption(i, val);
+          }}
+        >
           {#each q.options as option (option)}
-            <label class="flex items-center gap-1 cursor-pointer">
-              <input
-                type={q.options && q.options.length > 1 && !q.allowFreeText ? 'checkbox' : 'radio'}
-                name={`ask-${askId}-${i}`}
-                checked={readAnswer(i).selected.includes(option)}
-                onchange={() =>
-                  toggleOption(i, option, !!(q.options && q.options.length > 1 && !q.allowFreeText))}
-              />
-              <span>{option}</span>
-            </label>
+            <vscode-radio
+              value={option}
+              name={`ask-${askId}-${i}`}
+              checked={readAnswer(i).selected.includes(option)}
+            >{option}</vscode-radio>
           {/each}
-        </div>
+        </vscode-radio-group>
       {/if}
 
-      {#if q.allowFreeText !== false || !q.options?.length}
-        <input
-          type="text"
-          class="w-full px-1 py-0.5 rounded"
-          style="background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border);"
+      {#if q.allowFreeText === true || !q.options?.length}
+        <vscode-textfield
           placeholder="Your answer…"
           value={readAnswer(i).freeText ?? ''}
-          oninput={(e) => setFreeText(i, (e.currentTarget as HTMLInputElement).value)}
-        />
+          oninput={(e: Event) =>
+            setFreeText(i, (e.currentTarget as HTMLInputElement & { value: string }).value)}
+        ></vscode-textfield>
       {/if}
     </div>
   {/each}

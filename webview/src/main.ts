@@ -3,8 +3,11 @@ import './app.css';
 // vscode-elements — import only the components we use (tree-shakeable).
 import '@vscode-elements/elements/dist/vscode-button/index.js';
 import '@vscode-elements/elements/dist/vscode-textarea/index.js';
+import '@vscode-elements/elements/dist/vscode-textfield/index.js';
 import '@vscode-elements/elements/dist/vscode-single-select/index.js';
 import '@vscode-elements/elements/dist/vscode-option/index.js';
+import '@vscode-elements/elements/dist/vscode-radio-group/index.js';
+import '@vscode-elements/elements/dist/vscode-radio/index.js';
 import '@vscode-elements/elements/dist/vscode-badge/index.js';
 
 import { mount } from 'svelte';

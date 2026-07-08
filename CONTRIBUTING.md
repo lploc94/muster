@@ -18,7 +18,9 @@ npm run compile   # builds BOTH targets: extension host (tsc) + webview (Vite)
 Press **F5** in VS Code to launch the Extension Development Host. The default
 `watch-all` build task runs `tsc -watch` and the Vite webview watcher in parallel.
 
-Requires `claude` and/or `grok` on `PATH` for backend testing.
+Requires the CLI for whichever backend you test on `PATH` (logged in): `claude`,
+`grok`, `kiro-cli`, `codex`, and/or `opencode`. The Claude and Codex ACP adapters
+are bundled into the extension, so no extra adapter install is needed.
 
 ## Webview UI (Svelte + Vite)
 
@@ -38,12 +40,11 @@ Vite + Tailwind v4 + vscode-elements). Full spec: [docs/WEBVIEW.md](docs/WEBVIEW
 
 ## What to work on
 
-See [docs/MVP-SCAFFOLD-PLAN.md](docs/MVP-SCAFFOLD-PLAN.md) for phased goals. Good first tasks:
+All five ACP backends (Claude, Grok, Kiro, Codex, OpenCode) are implemented. Good tasks now:
 
-- Migrate Claude backend to ACP (`claude-code-acp` on `acp-client.ts`)
-- Muster Bridge (`AskBridge` + HTTP MCP)
-- Claude / Codex / Antigravity ACP adapter migrations
+- Antigravity (`agy`) ACP backend once it exposes an ACP stdio entry
 - Webview UX (tool cards, reasoning, question UI)
+- Hardening the Muster Bridge (`AskBridge` + HTTP MCP) and coordinator tools
 
 ## Pull requests
 

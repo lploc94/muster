@@ -1,6 +1,13 @@
 @import "tailwindcss";
 @source "./";
 
+/* GitHub Markdown CSS for standard rendering (like GitHub) */
+@import "github-markdown-css/github-markdown.css";
+
+/* Load codicons font and base styles properly */
+@import "@vscode/codicons/dist/codicon.css";
+
+
 :root {
   color-scheme: light dark;
 }
@@ -196,3 +203,224 @@ body {
 .task-command-error__dismiss {
   text-decoration: underline;
 }
+
+/* Additional tweaks for codicons inside web components if needed */
+.codicon {
+  font-size: 16px;
+  vertical-align: middle;
+}
+
+/* Consistent icon button style for toolbar actions */
+.icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.25rem;
+  border-radius: 0.25rem;
+  background: none;
+  border: none;
+  cursor: pointer;
+  transition: background-color 0.1s ease;
+}
+
+.icon-btn:hover {
+  background-color: var(--vscode-toolbar-hoverBackground);
+}
+
+.icon-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* GitHub Markdown CSS overrides for VSCode webview theme */
+.markdown-body {
+  color: var(--vscode-foreground);
+  background: transparent;
+  font-size: var(--vscode-font-size, 13px) !important;
+  line-height: 1.5;
+}
+
+/* Scale headings relative to VSCode font size */
+.markdown-body h1 { font-size: 1.5em !important; }
+.markdown-body h2 { font-size: 1.3em !important; }
+.markdown-body h3 { font-size: 1.15em !important; }
+.markdown-body h4 { font-size: 1.05em !important; }
+.markdown-body h5 { font-size: 1em !important; }
+.markdown-body h6 { font-size: 1em !important; }
+
+.markdown-body ul,
+.markdown-body ol {
+  padding-left: 2em !important;
+  margin-top: 0 !important;
+  margin-bottom: 0 !important;
+}
+
+.markdown-body ul {
+  list-style-type: disc !important;
+}
+
+.markdown-body ol {
+  list-style-type: decimal !important;
+}
+
+.markdown-body ul ul {
+  list-style-type: circle !important;
+}
+
+.markdown-body ol ol {
+  list-style-type: lower-roman !important;
+}
+
+.markdown-body code {
+  background: var(--vscode-textCodeBlock-background, var(--vscode-editor-background));
+  padding: 0.1em 0.3em;
+  border-radius: 3px;
+  font-family: var(--vscode-editor-font-family);
+  font-size: 0.9em;
+}
+
+.markdown-body pre {
+  background: var(--vscode-textCodeBlock-background, var(--vscode-editor-background));
+  padding: 10px;
+  border-radius: 6px;
+  overflow-x: auto;
+  margin: 0.5em 0;
+  border: 1px solid var(--vscode-panel-border);
+  white-space: pre !important;
+}
+
+.markdown-body pre code {
+  background: none;
+  padding: 0;
+  font-size: 12px;
+  white-space: pre;
+}
+
+/* Code block with copy button in top-right corner (button injected after sanitize) */
+.markdown-content pre.code-block {
+  position: relative;
+  padding-top: 28px;
+}
+
+.markdown-content pre.code-block .code-copy-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 4px;
+  background: var(--vscode-editor-background);
+  color: var(--vscode-foreground);
+  opacity: 0;
+  cursor: pointer;
+  transition: opacity 0.12s ease, background 0.12s ease;
+}
+
+.markdown-content pre.code-block:hover .code-copy-btn,
+.markdown-content pre.code-block .code-copy-btn:focus-visible {
+  opacity: 0.75;
+}
+
+.markdown-content pre.code-block .code-copy-btn:hover {
+  opacity: 1;
+  background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
+}
+
+.markdown-content pre.code-block .code-copy-btn .codicon {
+  font-size: 14px;
+}
+
+/* Syntax highlighting via highlight.js - VSCode editor colors */
+.hljs {
+  color: var(--vscode-editor-foreground);
+}
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-title,
+.hljs-section,
+.hljs-doctag,
+.hljs-name,
+.hljs-strong {
+  color: var(--vscode-symbolIcon-keywordForeground, #c586c0);
+}
+.hljs-string,
+.hljs-title.class_,
+.hljs-title.function_,
+.hljs-number,
+.hljs-regexp,
+.hljs-literal {
+  color: var(--vscode-symbolIcon-stringForeground, #ce9178);
+}
+.hljs-comment,
+.hljs-quote {
+  color: var(--vscode-descriptionForeground);
+  font-style: italic;
+}
+.hljs-attr,
+.hljs-attribute,
+.hljs-variable,
+.hljs-template-variable,
+.hljs-type,
+.hljs-selector-id,
+.hljs-selector-class,
+.hljs-selector-attr,
+.hljs-selector-pseudo {
+  color: var(--vscode-symbolIcon-variableForeground, #9cdcfe);
+}
+.hljs-subst,
+.hljs-symbol,
+.hljs-bullet,
+.hljs-link {
+  color: var(--vscode-symbolIcon-propertyForeground, #dcdcaa);
+}
+
+.markdown-body a {
+  color: var(--vscode-textLink-foreground);
+  text-decoration: underline;
+}
+
+.markdown-body a:hover {
+  color: var(--vscode-textLink-activeForeground);
+}
+
+/* Streaming content - important for no flicker */
+.streaming-content {
+  white-space: pre-wrap;
+  word-break: break-word;
+  /* Prevent layout shift during streaming */
+  min-height: 1.4em;
+}
+
+.streaming-cursor {
+  display: inline-block;
+  animation: blink 1s step-end infinite;
+}
+
+@keyframes blink {
+  50% { opacity: 0; }
+}
+
+/* When we switch from streaming to final markdown, try to reduce flash */
+.markdown-content {
+  transition: none;
+}
+
+/* 
+  === GITHUB MARKDOWN CSS (alternative) ===
+  Nếu muốn style giống GitHub:
+  1. npm install github-markdown-css
+  2. @import "github-markdown-css/github-markdown.css";
+  3. Dùng class="markdown-body" thay vì "prose"
+
+  Lưu ý:
+  - Code block styling rất tốt (giống GitHub).
+  - Mermaid: KHÔNG tự render. Phải tự xử lý bằng mermaid.js (giống study).
+  - Math: Cũng phải tự xử lý.
+  - Ưu điểm: Nhìn "chuẩn GitHub" nhất.
+*/

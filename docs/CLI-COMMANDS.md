@@ -4,8 +4,8 @@ Muster integrates with coding CLIs **only through ACP** ([Agent Client Protocol]
 
 Use this as the source of truth when implementing each backend.
 
-> **Verified against** (2026-07-06, from `--help` + empirical runs on this machine):
-> Claude Code 2.1.201 · Grok 0.2.87 · codex-cli 0.142.1 · agy 1.0.16
+> **Verified against** (from `--help` + empirical ACP runs on this machine):
+> Claude Code 2.1.201 · Grok 0.2.87 · Kiro CLI (`kiro-cli acp`) · codex-cli 0.142.5 (via `codex-acp`) · OpenCode 1.15.12 · agy 1.0.16
 >
 > Re-check ACP entry commands and `session/update` shapes when bumping CLI versions.
 
@@ -16,8 +16,10 @@ Each user message = one adapter `run()` = one **ACP session** (`session/new` or 
 | Backend | ACP agent command | Adapter status |
 |---------|-------------------|----------------|
 | Grok | `grok --no-auto-update agent stdio` | ✅ implemented |
-| Claude | `claude-code-acp` (or `@agentclientprotocol/claude-agent-acp`) | 🔜 migrate |
-| Codex | `codex app-server --stdio` | 🔜 planned |
+| Kiro | `kiro-cli acp` | ✅ implemented |
+| OpenCode | `opencode acp` | ✅ implemented |
+| Claude | bundled `@agentclientprotocol/claude-agent-acp` (`CLAUDE_CODE_EXECUTABLE` → user's `claude`) | ✅ implemented |
+| Codex | bundled `@agentclientprotocol/codex-acp` (`CODEX_PATH` → user's `codex`, wraps `codex app-server`) | ✅ implemented |
 | Antigravity | TBD — verify ACP entry on implement | 🔜 experimental |
 
 Shared rules (all backends):
@@ -51,19 +53,22 @@ spawn <backend-acp-agent>     # stdio JSON-RPC peer (long-lived)
 
 ## Claude Code (ACP)
 
-**Muster adapter:** ACP via `claude-code-acp` (stdio). Package may be published as `@agentclientprotocol/claude-agent-acp` — verify name on install.
+**Muster adapter:** ACP via the **bundled** `@agentclientprotocol/claude-agent-acp` (stdio). The adapter is vendored as a single self-contained esbuild bundle at `resources/claude-acp/index.mjs` and spawned under Node (`process.execPath`, `ELECTRON_RUN_AS_NODE=1` in the extension host). `CLAUDE_CODE_EXECUTABLE` points it at the user's installed `claude`, so no extra install is needed and the heavy platform binary is never used.
 
 ```bash
-claude-code-acp   # JSON-RPC 2.0 over stdin/stdout
+# how Muster launches it (conceptually):
+CLAUDE_CODE_EXECUTABLE=claude node resources/claude-acp/index.mjs   # JSON-RPC 2.0 over stdio
 ```
 
-Lifecycle matches §Shared ACP lifecycle. Map `session/update` kinds to `NormalizedEvent` (verify shapes against the adapter version).
+Lifecycle matches §Shared ACP lifecycle. Verified live (claude-agent-acp 0.56.0 + claude 2.1.201): `initialize` → `agentCapabilities.loadSession: true`, `mcpCapabilities.http: true`, `authMethods: []`. Observed `session/update` kinds: `agent_thought_chunk` → `reasoningDelta`, `agent_message_chunk` → `assistantDelta`, `tool_call`/`tool_call_update` → tool events, `usage_update` → `usage`; unknown/non-normalized → `raw`.
 
-**MCP:** `mcpServers` on `session/new`/`session/load` — same http/sse schema as Grok. Do **not** use `--mcp-config` in Muster adapters.
+**MCP:** `mcpServers` on `session/new`/`session/load` — same http/sse schema as Grok. Do **not** use `--mcp-config`.
 
-**Permissions:** handle `session/request_permission` in the ACP client (auto-allow for coordinator mode, or map to a future permission UI).
+**Permissions:** `session/request_permission` auto-allowed by the shared ACP client (coordinator mode); `fs/*` and `terminal/*` declared off (the `claude` process does its own file access).
 
-**Status:** `src/backends/claude.ts` still contains a legacy headless `-p` implementation — replace with ACP on the shared `acp-client.ts` path.
+**Auth:** no ACP `authenticate` step — Claude uses its cached login or `ANTHROPIC_API_KEY` consumed by the CLI/SDK directly.
+
+**Regenerate the bundle:** `npm run vendor:claude-acp` (pinned to a known version; also emits `LICENSE` + `THIRD-PARTY-LICENSES.txt`).
 
 ---
 
@@ -114,21 +119,46 @@ File-based discovery (`~/.grok/config.toml`, `.mcp.json`) still loads inside ses
 
 ---
 
-## Codex (ACP)
+## Kiro (ACP)
 
-**Muster adapter:** ACP via `codex app-server --stdio` (experimental in codex-cli 0.142.1).
+**Muster adapter:** ACP (`kiro-cli acp`) — the user's installed Kiro CLI speaks ACP natively; no adapter/bundle needed.
 
 ```bash
-codex app-server --stdio   # default transport: stdio://
+kiro-cli acp   # JSON-RPC 2.0 over stdio
 ```
 
-Lifecycle matches §Shared ACP lifecycle. Verify `initialize`/`session/*` method names and `session/update` shapes against `codex app-server generate-json-schema` when implementing.
+Lifecycle matches §Shared ACP lifecycle. **Auth:** Kiro authenticates transparently via cached login (`kiro-cli login`) or `KIRO_API_KEY`; it typically advertises no `authMethods`, so no `authenticate` step runs. `session/update` kinds map like Grok (`agent_thought_chunk`→reasoning, `agent_message_chunk`→assistant, `tool_call`/`tool_call_update`→tool events; `user_message_chunk`/`available_commands_update` ignored; unknown→`raw`). MCP via `mcpServers` (http). Tool call IDs are namespaced `kiro:`.
 
-**MCP:** `mcpServers` on `session/new`/`session/load`. Do **not** use `codex exec -c mcp_servers.*` in Muster adapters.
+---
 
-**Config overrides:** pass `-c key=value` flags to `app-server` spawn if needed (sandbox, model, etc.).
+## OpenCode (ACP)
 
-**Status:** not implemented — verify ACP compliance before replacing any legacy `codex exec --json` spike code.
+**Muster adapter:** ACP (`opencode acp`) — OpenCode is ACP-native; no adapter/bundle needed.
+
+```bash
+opencode acp   # JSON-RPC 2.0 over stdio
+```
+
+Lifecycle matches §Shared ACP lifecycle. Verified live (opencode 1.15.12): `initialize` → `agentCapabilities.loadSession: true`, `mcpCapabilities.http: true`, `authMethods: ["opencode-login"]`. **Auth:** even though `opencode-login` is advertised, it uses cached credentials (`opencode auth login` → auth.json) or `OPENCODE_API_KEY` transparently, so Muster does **not** call `authenticate` (that method is interactive). Observed `session/update` kinds: `agent_thought_chunk`→reasoning, `agent_message_chunk`→assistant, `usage_update`→usage, `available_commands_update` ignored; unknown→`raw`. Usage is also on the `session/prompt` result. Tool call IDs are namespaced `opencode:`.
+
+---
+
+## Codex (ACP)
+
+**Muster adapter:** ACP via the **bundled** `@agentclientprotocol/codex-acp` (stdio). Codex's native `codex app-server` speaks a proprietary thread/turn JSON-RPC protocol (not ACP), so Muster uses the `codex-acp` adapter, which wraps `codex app-server` and exposes standard ACP. It is vendored as a single self-contained bundle at `resources/codex-acp/index.mjs` and spawned under Node; `CODEX_PATH` points it at the user's installed `codex`.
+
+```bash
+# how Muster launches it (conceptually):
+CODEX_PATH=codex node resources/codex-acp/index.mjs   # JSON-RPC 2.0 over stdio
+```
+
+Lifecycle matches §Shared ACP lifecycle. Verified live (codex-acp 1.1.0 + codex-cli 0.142.5): `initialize` → `agentCapabilities.loadSession: true`, `mcpCapabilities.http: true`, `authMethods: [api-key, chat-gpt]`; works with cached ChatGPT login (no explicit `authenticate`). Usage is returned on the `session/prompt` result. `session/update` kinds map like Grok/Kiro; unknown → `raw`.
+
+**MCP:** `mcpServers` on `session/new`/`session/load` (http). Do **not** use `codex exec -c mcp_servers.*`.
+
+**Auth:** API key if `CODEX_API_KEY`/`OPENAI_API_KEY` is set and an api-key method is advertised, otherwise cached ChatGPT login (no `authenticate` step).
+
+**Regenerate the bundle:** `npm run vendor:codex-acp`.
 
 ---
 
@@ -303,40 +333,41 @@ agy -p "..." --log-file /tmp/agy-turn.log           # debug log (also shown in T
 
 ---
 
-## Quick Comparison Table (MVP — ACP only)
+## Quick Comparison Table (ACP only)
 
-| CLI | ACP agent command | Streaming | Resume | Session ID | MCP injection | Permissions |
-|-----|-------------------|-----------|--------|------------|---------------|-------------|
-| Grok | `grok agent stdio` | `session/update` | `session/load` | `session/new` (server) | `mcpServers` http/sse | auto-allow `session/request_permission` |
-| Claude | `claude-code-acp` | `session/update` | `session/load` | `session/new` (verify) | `mcpServers` http/sse | auto-allow `session/request_permission` |
-| Codex | `codex app-server --stdio` | `session/update` (verify) | `session/load` (verify) | `session/new` (verify) | `mcpServers` (verify) | verify sandbox via `-c` on spawn |
-| Antigravity | TBD | TBD | TBD | TBD | TBD | TBD |
+| CLI | ACP agent command | Bundled? | Resume | MCP injection | Permissions |
+|-----|-------------------|----------|--------|---------------|-------------|
+| Grok | `grok --no-auto-update agent stdio` | no (native) | `session/load` | `mcpServers` http/sse | auto-allow |
+| Kiro | `kiro-cli acp` | no (native) | `session/load` | `mcpServers` http | auto-allow |
+| OpenCode | `opencode acp` | no (native) | `session/load` | `mcpServers` http | auto-allow |
+| Claude | bundled `claude-agent-acp` (`CLAUDE_CODE_EXECUTABLE`) | yes (`resources/claude-acp/`) | `session/load` | `mcpServers` http | auto-allow |
+| Codex | bundled `codex-acp` (`CODEX_PATH`) | yes (`resources/codex-acp/`) | `session/load` | `mcpServers` http | auto-allow |
+| Antigravity | TBD | TBD | TBD | TBD | TBD |
 
 ---
 
-## Recommendations for MVP
+## Status & next steps
 
-1. **Grok** — done (`grok agent stdio` + `acp-client.ts` reference).
-2. **Claude** — migrate `claude.ts` to ACP (`claude-code-acp`); delete headless `-p` path.
-3. **Codex** — implement on `codex app-server --stdio`; verify schema first.
-4. **Antigravity** — blocked until ACP entry exists.
+1. **Grok / Kiro / OpenCode** — done, native ACP (`… agent stdio` / `acp`).
+2. **Claude / Codex** — done via **bundled** ACP adapters (`claude-agent-acp` / `codex-acp`) pointed at the user's CLI; regenerate with `npm run vendor:claude-acp` / `npm run vendor:codex-acp`.
+3. **Antigravity** — blocked until agy exposes an ACP stdio entry.
 
-For each new backend, create `scripts/test-<backend>.ts` that exercises ACP: prompt, resume, `mcpServers`, cancel, normalized events to console.
+Each backend has a `scripts/test-<backend>.ts` console runner (`npm run mvp:<backend>`) that exercises ACP: prompt, resume, `mcpServers`, cancel, normalized events.
 
 ## Reference implementations (study before coding)
 
-- **Grok (authoritative for Muster):** `~/projects/grok-implement/skill-packs/grok-implement/scripts/grok-runner.js` — ACP broker; event shapes, MCP, cancel.
-- **Grok Build VS Code plugin:** `study/grok-build-vscode-src/` — ACP dispatch patterns.
+- **Grok:** `study/grok-build-vscode-src/` — ACP dispatch patterns.
 - **Claude ACP adapter:** `@agentclientprotocol/claude-agent-acp` (formerly `@zed-industries/claude-code-acp`).
-- **Codex:** `codex app-server generate-json-schema` — protocol shapes (not `codex exec --json`).
+- **Codex ACP adapter:** `@agentclientprotocol/codex-acp` (wraps `codex app-server`).
 
 ## Open items to verify empirically
 
 - [x] Grok ACP `session/update` + cancel + `mcpServers` — verified 0.2.87.
-- [ ] Claude ACP `session/update` shapes via `claude-code-acp` on this machine.
-- [ ] Codex `app-server --stdio` ACP method parity (`session/new`, `session/load`, `session/update`).
+- [x] Kiro ACP (`kiro-cli acp`) — verified.
+- [x] OpenCode ACP (`opencode acp`) — verified 1.15.12.
+- [x] Claude ACP via `claude-agent-acp` — verified 0.56.0.
+- [x] Codex ACP via `codex-acp` — verified 1.1.0.
 - [ ] Antigravity ACP entry command + `session/update` tool events.
-- [x] Grok `mcpServers` http schema verified; stdio rejected over ACP.
 
 ---
 

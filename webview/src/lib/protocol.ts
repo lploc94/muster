@@ -25,13 +25,17 @@ export interface TaskSummary {
   lifecycle: string;
   viewStatus: TaskViewStatus;
   updatedAt: string;
+  backend: string;
   continuationOf?: string;
 }
 
 export interface TranscriptItem {
   id: string;
-  kind: 'user' | 'assistant' | 'tool' | 'error';
+  kind: 'user' | 'assistant' | 'tool' | 'reasoning' | 'error';
   content: unknown;
+  turnId?: string;
+  order?: number;
+  state?: string;
 }
 
 export interface PendingAsk {
@@ -77,7 +81,9 @@ export type OutMessage =
   | { type: 'cancelAsk'; taskId: string; turnId: string; askId: string }
   | { type: 'retryTurn'; taskId: string; turnId: string; instruction: string }
   | { type: 'continueTask'; taskId: string; instruction: string }
-  | { type: 'resumeQueuedTurn'; taskId: string; turnId: string };
+  | { type: 'resumeQueuedTurn'; taskId: string; turnId: string }
+  | { type: 'openLink'; url: string }
+  | { type: 'clearHistory' };
 
 /** Post a typed message to the extension host. */
 export function post(message: OutMessage): void {
@@ -105,14 +111,60 @@ function isTaskSummary(v: unknown): v is TaskSummary {
     isString(v.role) &&
     isString(v.lifecycle) &&
     isString(v.viewStatus) &&
-    isString(v.updatedAt)
+    isString(v.updatedAt) &&
+    isString(v.backend)
   );
 }
 
 function isTranscriptItem(v: unknown): v is TranscriptItem {
-  if (!isRecord(v)) return false;
-  const kind = v.kind;
-  return isString(v.id) && (kind === 'user' || kind === 'assistant' || kind === 'tool' || kind === 'error');
+  if (!isRecord(v) || !isString(v.id)) return false;
+  switch (v.kind) {
+    case 'user':
+    case 'assistant':
+      return isString(v.content);
+    case 'reasoning':
+      // Turn-scoped, string content, no order.
+      return isString(v.turnId) && isString(v.content);
+    case 'tool': {
+      // Requires turnId + numeric order + structured tool content.
+      if (!isString(v.turnId) || !isNumber(v.order) || !isRecord(v.content)) return false;
+      const c = v.content;
+      return isString(c.toolCallId) && isString(c.name) && isString(c.status);
+    }
+    case 'error':
+      // Locally-synthesized only; the host never sends error transcript items.
+      return true;
+    default:
+      return false;
+  }
+}
+
+/** Discriminated runtime guard for a NormalizedEvent arriving from the host. */
+export function isNormalizedEvent(v: unknown): v is NormalizedEvent {
+  if (!isRecord(v) || !isString(v.type)) return false;
+  switch (v.type) {
+    case 'sessionStarted':
+      return v.sessionId === undefined || isString(v.sessionId);
+    case 'assistantDelta':
+    case 'reasoningDelta':
+      return isString(v.content) && isString(v.messageId);
+    case 'toolStarted':
+      return isString(v.toolCallId) && isString(v.name);
+    case 'toolUpdated':
+      return isString(v.toolCallId);
+    case 'toolCompleted':
+      return isString(v.toolCallId) && (v.outcome === 'success' || v.outcome === 'error');
+    case 'usage':
+      return isRecord(v.usage);
+    case 'turnCompleted':
+      return true;
+    case 'error':
+      return isString(v.message);
+    case 'raw':
+      return isString(v.line);
+    default:
+      return false;
+  }
 }
 
 function isQuestion(v: unknown): v is Question {
@@ -164,7 +216,7 @@ export function isExtMessage(data: unknown): data is ExtMessage {
       return isString(data.trigger);
 
     case 'event':
-      return isRecord(data.event) && isString((data.event as { type?: unknown }).type);
+      return isNormalizedEvent(data.event);
 
     case 'turnDone':
       return true;

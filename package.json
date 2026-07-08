@@ -82,11 +82,13 @@
     "build:webview": "vite build --config webview/vite.config.ts",
     "watch:webview": "vite build --config webview/vite.config.ts --watch",
     "vscode:prepublish": "npm run compile",
-    "mvp:claude": "tsx scripts/test-runner.ts",
+    "mvp:claude": "tsx scripts/test-claude.ts",
     "mvp:grok": "tsx scripts/test-grok.ts",
     "mvp:kiro": "tsx scripts/test-kiro.ts",
     "mvp:codex": "tsx scripts/test-codex.ts",
+    "mvp:opencode": "tsx scripts/test-opencode.ts",
     "vendor:codex-acp": "node scripts/vendor-codex-acp.mjs",
+    "vendor:claude-acp": "node scripts/vendor-claude-acp.mjs",
     "mvp:task": "tsx scripts/test-task.ts",
     "mvp:bridge": "tsx scripts/test-bridge.ts",
     "test:agy-ask": "node scripts/test-agy-ask-mcp.mjs",
@@ -113,6 +115,11 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "@vscode-elements/elements": "^2.5.1"
+    "@tailwindcss/typography": "^0.5.20",
+    "@vscode-elements/elements": "^2.5.1",
+    "dompurify": "^3.4.11",
+    "github-markdown-css": "^5.9.0",
+    "highlight.js": "^11.11.1",
+    "marked": "^15.0.12"
   }
 }

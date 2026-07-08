@@ -1,6 +1,4 @@
 import { randomUUID } from 'crypto';
-import * as fs from 'fs';
-import * as path from 'path';
 import { Backend, BackendCapabilities, McpServerConfig, NormalizedEvent, RunOptions } from '../types';
 import {
   AcpAgentConfig,
@@ -16,76 +14,36 @@ export { disposeSharedAcpClient };
 const FAILURE_STOP_REASONS = new Set(['refusal', 'error', 'max_tokens', 'max_turn_requests']);
 
 /**
- * Resolve the bundled claude-agent-acp ESM entry
- * (`resources/claude-acp/index.mjs`). It is a single self-contained esbuild
- * bundle vendored into the extension, so no node_modules are required at
- * runtime. Falls back to the installed package during development.
- */
-function resolveClaudeAcpEntry(): string {
-  const candidates = [
-    // Compiled layout: dist/src/backends/claude.js -> <root>/resources/...
-    path.join(__dirname, '..', '..', '..', 'resources', 'claude-acp', 'index.mjs'),
-    // tsx / source layout: src/backends/claude.ts -> <root>/resources/...
-    path.join(__dirname, '..', '..', 'resources', 'claude-acp', 'index.mjs'),
-  ];
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  // Dev fallback: resolve from node_modules (not shipped in the .vsix).
-  try {
-    return require.resolve('@agentclientprotocol/claude-agent-acp');
-  } catch {
-    // Return the primary expected path; spawn will surface a clear ENOENT.
-    return candidates[0];
-  }
-}
-
-/**
- * Shared ACP agent configuration for Claude, via the bundled
- * `claude-agent-acp` adapter (https://github.com/agentclientprotocol/claude-agent-acp).
- * The adapter drives Claude Code through the official Claude Agent SDK and
- * translates its events to ACP.
+ * Shared ACP agent configuration for the OpenCode CLI (`opencode acp`).
  *
- * We run the vendored ESM bundle under the current Node runtime. In the VS Code
- * extension host `process.execPath` is Electron; `ELECTRON_RUN_AS_NODE=1` makes
- * it behave as Node. Under plain Node (tests/CLI) the flag is ignored.
- *
- * `CLAUDE_CODE_EXECUTABLE` points the adapter at the user's installed `claude`,
- * so we never need the heavy bundled `@anthropic-ai/claude-agent-sdk` platform
- * binary.
+ * OpenCode is ACP-native — no adapter or bundle is required; we spawn the
+ * user's installed `opencode` directly. It authenticates transparently using
+ * cached credentials (`opencode auth login`, stored in auth.json) or
+ * `OPENCODE_API_KEY` (already inherited via the process env). Although it
+ * advertises an `opencode-login` auth method on `initialize`, that method
+ * triggers an interactive login flow and is NOT needed when credentials are
+ * cached (verified against opencode 1.15.12), so we skip the `authenticate`
+ * step entirely.
  */
-export function claudeAgentConfig(): AcpAgentConfig {
-  return {
-    key: 'claude',
-    label: 'Claude',
-    command: process.execPath,
-    args: [resolveClaudeAcpEntry()],
-    env: {
-      ELECTRON_RUN_AS_NODE: '1',
-      CLAUDE_CODE_EXECUTABLE: process.env.CLAUDE_CODE_EXECUTABLE || 'claude',
-    },
-    resolveAuth: (init, env) => {
-      const ids = (init.authMethods ?? []).map((m) => m.id);
-      const apiKey = env.ANTHROPIC_API_KEY || env.CLAUDE_API_KEY;
-      const apiKeyMethod = ids.find((id) => /api[-_]?key/i.test(id));
-      if (apiKey && apiKeyMethod) {
-        return { methodId: apiKeyMethod, meta: { headless: true } };
-      }
-      // Otherwise rely on Claude's own auth (cached login or ANTHROPIC_API_KEY
-      // consumed directly by the CLI/SDK). claude-agent-acp advertises no ACP
-      // auth methods, so no `authenticate` step is required.
-      return null;
-    },
-  };
-}
+export const OPENCODE_AGENT_CONFIG: AcpAgentConfig = {
+  key: 'opencode',
+  label: 'OpenCode',
+  command: 'opencode',
+  args: ['acp'],
+  resolveAuth: () => {
+    // Rely on OpenCode's own cached login / OPENCODE_API_KEY. The advertised
+    // `opencode-login` method is interactive and unnecessary here.
+    return null;
+  },
+};
 
 function resolveMcpServers(options: RunOptions): McpServerConfig[] {
   return options.mcpServers ?? [];
 }
 
 /**
- * Map a Claude (claude-agent-acp) ACP `session/update` to a NormalizedEvent.
- * The adapter implements standard ACP, so update kinds arrive in snake_case
+ * Map an OpenCode (`opencode acp`) ACP `session/update` to a NormalizedEvent.
+ * OpenCode implements standard ACP, so update kinds arrive in snake_case
  * (`agent_message_chunk`, `tool_call`, ...). Unknown/non-normalized shapes fall
  * back to `raw` to preserve debuggability if the wire format evolves.
  */
@@ -124,7 +82,8 @@ function mapSessionUpdate(update: SessionUpdate, messageId: string): NormalizedE
       // ignore list). All other non-normalized updates fall through to `raw`.
       return undefined;
     case 'tool_call': {
-      const toolCallId = typeof update.toolCallId === 'string' ? `claude:${update.toolCallId}` : undefined;
+      const toolCallId =
+        typeof update.toolCallId === 'string' ? `opencode:${update.toolCallId}` : undefined;
       const name = typeof update.title === 'string' ? update.title : 'tool';
       if (!toolCallId) return { type: 'raw', line: JSON.stringify(update) };
       const meta = update._meta as Record<string, unknown> | undefined;
@@ -138,7 +97,8 @@ function mapSessionUpdate(update: SessionUpdate, messageId: string): NormalizedE
       };
     }
     case 'tool_call_update': {
-      const toolCallId = typeof update.toolCallId === 'string' ? `claude:${update.toolCallId}` : undefined;
+      const toolCallId =
+        typeof update.toolCallId === 'string' ? `opencode:${update.toolCallId}` : undefined;
       if (!toolCallId) return { type: 'raw', line: JSON.stringify(update) };
       const meta = update._meta as Record<string, unknown> | undefined;
       const statusRaw =
@@ -187,8 +147,8 @@ function extractToolOutput(content: unknown): string | undefined {
 }
 
 /**
- * Build a usage event from the prompt result if the adapter reports token usage
- * on the `session/prompt` result.
+ * Build a usage event from the prompt result. OpenCode reports token usage on
+ * the `session/prompt` result (`usage`).
  */
 function usageFromResult(result: PromptResult): NormalizedEvent | undefined {
   const usage: Record<string, unknown> = {};
@@ -218,13 +178,13 @@ function terminalFromPrompt(result: PromptResult, cancelled: boolean): Normalize
     return { type: 'error', message: 'Turn cancelled', isCancellation: true };
   }
   if (typeof stopReason !== 'string' || stopReason.length === 0) {
-    return { type: 'error', message: 'Claude prompt ended without a stopReason' };
+    return { type: 'error', message: 'OpenCode prompt ended without a stopReason' };
   }
   if (FAILURE_STOP_REASONS.has(stopReason)) {
-    return { type: 'error', message: `Claude stopped: ${stopReason}` };
+    return { type: 'error', message: `OpenCode stopped: ${stopReason}` };
   }
   if (stopReason !== 'end_turn') {
-    return { type: 'error', message: `Claude stopped: ${stopReason}`, meta: { stopReason } };
+    return { type: 'error', message: `OpenCode stopped: ${stopReason}`, meta: { stopReason } };
   }
   return { type: 'turnCompleted', meta: { stopReason } };
 }
@@ -233,8 +193,8 @@ function cancellationTerminal(): NormalizedEvent {
   return { type: 'error', message: 'Turn cancelled', isCancellation: true };
 }
 
-export class ClaudeBackend implements Backend {
-  readonly name = 'claude';
+export class OpenCodeBackend implements Backend {
+  readonly name = 'opencode';
   readonly capabilities: BackendCapabilities = {
     supportsReasoning: true,
     supportsDetailedToolEvents: true,
@@ -245,7 +205,7 @@ export class ClaudeBackend implements Backend {
     const messageId = randomUUID();
     const cwd = options.cwd || process.cwd();
     const mcpServers = resolveMcpServers(options);
-    const client = getSharedAcpClient(claudeAgentConfig());
+    const client = getSharedAcpClient(OPENCODE_AGENT_CONFIG);
 
     let activeSessionId: string | undefined;
     let unregister: (() => void) | undefined;
@@ -287,7 +247,7 @@ export class ClaudeBackend implements Backend {
 
       if (options.resumeId) {
         if (!client.loadSessionSupported) {
-          yield { type: 'error', message: 'Claude agent does not support session resume' };
+          yield { type: 'error', message: 'OpenCode agent does not support session resume' };
           return;
         }
         const loaded = await client.loadSession(options.resumeId, cwd, mcpServers);
@@ -341,10 +301,10 @@ export class ClaudeBackend implements Backend {
       const message = err instanceof Error ? err.message : String(err);
       if (isAborted()) {
         yield cancellationTerminal();
-      } else if (message.includes('Claude agent exited') || message.includes('not running')) {
+      } else if (message.includes('OpenCode agent exited') || message.includes('not running')) {
         yield { type: 'error', message };
       } else {
-        yield { type: 'error', message: `Claude ACP error: ${message}` };
+        yield { type: 'error', message: `OpenCode ACP error: ${message}` };
       }
     } finally {
       options.signal?.removeEventListener('abort', onAbort);

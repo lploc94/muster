@@ -4,6 +4,7 @@ import type { TaskStore } from '../task/store';
 import type {
   MusterTask,
   TaskLifecycleState,
+  TaskMessageState,
   TaskRole,
   TaskStoreFile,
   TaskTurn,
@@ -18,14 +19,31 @@ export interface TaskSummary {
   lifecycle: TaskLifecycleState;
   viewStatus: TaskViewStatus;
   updatedAt: string;
+  backend: string;
   continuationOf?: string;
 }
 
-export interface TranscriptItem {
-  id: string;
-  kind: 'user' | 'assistant';
-  content: string;
+export interface ToolTranscriptContent {
+  toolCallId: string;
+  name: string;
+  toolKind?: 'mcp' | 'builtin' | 'other';
+  status: 'running' | 'success' | 'error';
+  input?: unknown;
+  output?: unknown;
+  error?: string;
 }
+
+export type TranscriptItem =
+  | {
+      id: string;
+      kind: 'user' | 'assistant';
+      content: string;
+      turnId?: string;
+      order?: number;
+      state?: TaskMessageState;
+    }
+  | { id: string; kind: 'tool'; turnId: string; order: number; content: ToolTranscriptContent }
+  | { id: string; kind: 'reasoning'; turnId: string; content: string };
 
 export interface TaskSnapshot {
   rootTasks: TaskSummary[];
@@ -83,6 +101,16 @@ export function projectActivityTime(file: TaskStoreFile, taskId: string): string
       latest = maxIso(latest, message.createdAt);
     }
   }
+  for (const tc of Object.values(file.toolCalls ?? {})) {
+    if (tc.taskId === taskId) {
+      latest = maxIso(latest, tc.createdAt, tc.updatedAt);
+    }
+  }
+  for (const r of Object.values(file.reasoning ?? {})) {
+    if (r.taskId === taskId) {
+      latest = maxIso(latest, r.createdAt, r.updatedAt);
+    }
+  }
   return latest;
 }
 
@@ -99,19 +127,113 @@ export function projectTaskSummary(file: TaskStoreFile, taskId: string): TaskSum
     lifecycle: task.lifecycle,
     viewStatus: deriveViewStatus(task, turnsForTask(file, taskId), depLifecyclesForTask(file, task)),
     updatedAt: projectActivityTime(file, taskId),
+    backend: task.backend,
     continuationOf: task.continuationOf,
   };
 }
 
 export function buildTranscript(file: TaskStoreFile, taskId: string): TranscriptItem[] {
-  return Object.values(file.messages)
-    .filter((message) => message.taskId === taskId && (message.role === 'user' || message.role === 'assistant'))
-    .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
-    .map((message) => ({
+  const turns = turnsForTask(file, taskId);
+  const seqOf = new Map<string, number>();
+  for (const turn of turns) {
+    seqOf.set(turn.id, turn.sequence);
+  }
+  // User messages link to a turn via turn.inputs (they carry no turnId themselves).
+  const msgTurn = new Map<string, string>();
+  for (const turn of turns) {
+    for (const input of turn.inputs) {
+      if (input.kind === 'message') {
+        msgTurn.set(input.messageId, turn.id);
+      }
+    }
+  }
+
+  interface Entry {
+    item: TranscriptItem;
+    seq: number;
+    order: number;
+    createdAt: string;
+    id: string;
+  }
+  const entries: Entry[] = [];
+
+  for (const message of Object.values(file.messages)) {
+    if (message.taskId !== taskId) {
+      continue;
+    }
+    if (message.role !== 'user' && message.role !== 'assistant') {
+      continue;
+    }
+    const turnId = message.role === 'assistant' ? message.turnId : (message.turnId ?? msgTurn.get(message.id));
+    const seq = turnId !== undefined && seqOf.has(turnId) ? seqOf.get(turnId)! : -1;
+    // user prompt (-2) sorts before reasoning (-1) and assistant/tool segments (>=0).
+    const order = message.role === 'assistant' ? (message.order ?? 0) : -2;
+    entries.push({
+      item: {
+        id: message.id,
+        kind: message.role,
+        content: message.content,
+        turnId,
+        order: message.order,
+        state: message.state,
+      },
+      seq,
+      order,
+      createdAt: message.createdAt,
       id: message.id,
-      kind: message.role as 'user' | 'assistant',
-      content: message.content,
-    }));
+    });
+  }
+
+  for (const tc of Object.values(file.toolCalls ?? {})) {
+    if (tc.taskId !== taskId) {
+      continue;
+    }
+    const seq = seqOf.has(tc.turnId) ? seqOf.get(tc.turnId)! : -1;
+    entries.push({
+      item: {
+        id: tc.id,
+        kind: 'tool',
+        turnId: tc.turnId,
+        order: tc.order,
+        content: {
+          toolCallId: tc.toolCallId,
+          name: tc.name,
+          toolKind: tc.kind,
+          status: tc.status,
+          input: tc.input,
+          output: tc.output,
+          error: tc.error,
+        },
+      },
+      seq,
+      order: tc.order,
+      createdAt: tc.createdAt,
+      id: tc.id,
+    });
+  }
+
+  for (const r of Object.values(file.reasoning ?? {})) {
+    if (r.taskId !== taskId) {
+      continue;
+    }
+    const seq = seqOf.has(r.turnId) ? seqOf.get(r.turnId)! : -1;
+    entries.push({
+      item: { id: r.id, kind: 'reasoning', turnId: r.turnId, content: r.content },
+      seq,
+      order: -1,
+      createdAt: r.createdAt,
+      id: r.id,
+    });
+  }
+
+  entries.sort(
+    (a, b) =>
+      a.seq - b.seq ||
+      a.order - b.order ||
+      a.createdAt.localeCompare(b.createdAt) ||
+      a.id.localeCompare(b.id),
+  );
+  return entries.map((entry) => entry.item);
 }
 
 export function activeTurnIdForTask(file: TaskStoreFile, taskId: string): string | undefined {

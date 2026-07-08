@@ -15,7 +15,7 @@ import {
 import { SESSION_MIGRATION_MARKER, migrateLegacySessions } from './task/migration-sessions';
 import { applyRetention, retentionChanged, type RetentionConfig } from './task/retention';
 import { TaskEngine, type EngineEvent } from './task/engine';
-import { TaskStore } from './task/store';
+import { TaskStore, computeAffectedTaskIds } from './task/store';
 import { isTerminalLifecycle } from './task/transitions';
 import type { TaskStoreFile } from './task/types';
 import * as fs from 'fs';
@@ -31,6 +31,37 @@ let workspaceRoot: string | undefined;
 let lastObservedRevision = 0;
 let lastObservedFile: TaskStoreFile | undefined;
 const activePendingAsks = new Map<string, PendingAskOverlay>();
+
+/** Backends the webview may request. Mirrors the composer's select options. */
+const WEBVIEW_BACKENDS = new Set(['claude', 'grok', 'kiro', 'codex', 'opencode']);
+const MAX_MESSAGE_CHARS = 100_000;
+const MAX_FREE_TEXT_CHARS = 10_000;
+const MAX_LINK_CHARS = 4096;
+
+/** Validate the inbound ask-answer payload shape from the webview. */
+function isValidAskAnswers(
+  value: unknown,
+): value is Record<string, { selected: string[]; freeText: string | null }> {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  for (const entry of Object.values(value as Record<string, unknown>)) {
+    if (typeof entry !== 'object' || entry === null) {
+      return false;
+    }
+    const e = entry as { selected?: unknown; freeText?: unknown };
+    if (!Array.isArray(e.selected) || !e.selected.every((s) => typeof s === 'string')) {
+      return false;
+    }
+    if (!(e.freeText === null || typeof e.freeText === 'string')) {
+      return false;
+    }
+    if (typeof e.freeText === 'string' && e.freeText.length > MAX_FREE_TEXT_CHARS) {
+      return false;
+    }
+  }
+  return true;
+}
 
 function getRetentionConfig(): RetentionConfig {
   const config = vscode.workspace.getConfiguration('muster.retention');
@@ -66,13 +97,50 @@ function applyRetentionToStore(store: TaskStore): void {
     draft.messages = pruned.messages;
     draft.operations = pruned.operations;
     draft.cancelRequests = pruned.cancelRequests;
+    draft.toolCalls = pruned.toolCalls ?? {};
+    draft.reasoning = pruned.reasoning ?? {};
     return { ok: true };
   });
 }
 
+/**
+ * True when any record belonging to `taskId` differs between `previous` and `file`,
+ * including additions AND deletions (a record present in one snapshot but absent in
+ * the other). Used to decide whether a focused snapshot must be re-posted.
+ */
+function taskRecordsChanged(
+  previous: TaskStoreFile,
+  file: TaskStoreFile,
+  taskId: string,
+): boolean {
+  const differs = <T extends { taskId: string }>(
+    prevMap: Record<string, T> | undefined,
+    nextMap: Record<string, T> | undefined,
+  ): boolean => {
+    const prev = prevMap ?? {};
+    const next = nextMap ?? {};
+    for (const key of new Set([...Object.keys(prev), ...Object.keys(next)])) {
+      const p = prev[key];
+      const n = next[key];
+      if (p?.taskId !== taskId && n?.taskId !== taskId) {
+        continue;
+      }
+      if (JSON.stringify(p) !== JSON.stringify(n)) {
+        return true;
+      }
+    }
+    return false;
+  };
+  return (
+    differs(previous.messages, file.messages) ||
+    differs(previous.toolCalls, file.toolCalls) ||
+    differs(previous.reasoning, file.reasoning) ||
+    differs(previous.turns, file.turns)
+  );
+}
+
 class MusterChatProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'muster.chat';
-
   private _view?: vscode.WebviewView;
   focusedTaskId?: string;
 
@@ -172,22 +240,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     lastObservedFile = JSON.parse(JSON.stringify(file)) as TaskStoreFile;
 
     if (this._view?.visible && this.focusedTaskId && affectedTaskIds.includes(this.focusedTaskId)) {
-      const transcriptChanged = Object.values(file.messages).some((message) => {
-        if (message.taskId !== this.focusedTaskId) {
-          return false;
-        }
-        const prev = previous.messages[message.id];
-        return JSON.stringify(prev) !== JSON.stringify(message);
-      });
-      const activeTurnChanged = Object.keys(file.turns).some((turnId) => {
-        const prev = previous.turns[turnId];
-        const next = file.turns[turnId];
-        if (!next || next.taskId !== this.focusedTaskId) {
-          return false;
-        }
-        return JSON.stringify(prev) !== JSON.stringify(next);
-      });
-      if (transcriptChanged || activeTurnChanged) {
+      if (taskRecordsChanged(previous, file, this.focusedTaskId)) {
         this.postSnapshot();
       }
     }
@@ -207,23 +260,10 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       this.seedObservation(file);
       return;
     }
-    const affected = new Set<string>();
-    for (const taskId of Object.keys(file.tasks)) {
-      if (JSON.stringify(previous.tasks[taskId]) !== JSON.stringify(file.tasks[taskId])) {
-        affected.add(taskId);
-      }
-    }
-    for (const turn of Object.values(file.turns)) {
-      if (JSON.stringify(previous.turns[turn.id]) !== JSON.stringify(turn)) {
-        affected.add(turn.taskId);
-      }
-    }
-    for (const message of Object.values(file.messages)) {
-      if (JSON.stringify(previous.messages[message.id]) !== JSON.stringify(message)) {
-        affected.add(message.taskId);
-      }
-    }
-    this.reprojectChanged(file, [...affected], previous);
+    // Union-key diff (deletion-aware): a task is affected when any of its
+    // tasks/turns/messages/toolCalls/reasoning records was added, changed, OR removed.
+    const affected = computeAffectedTaskIds(previous, file);
+    this.reprojectChanged(file, affected, previous);
   }
 
   postSnapshot(focusedTaskId?: string): void {
@@ -237,6 +277,99 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       this.focusedTaskId = focus;
     }
     this.seedObservation(taskStore.getFile());
+  }
+
+  private handleOpenLink(url: unknown): void {
+    if (typeof url !== 'string' || url.length === 0 || url.length > MAX_LINK_CHARS) {
+      this.postCommandError('invalid link');
+      return;
+    }
+    let parsed: vscode.Uri;
+    try {
+      parsed = vscode.Uri.parse(url, true);
+    } catch {
+      this.postCommandError('invalid link');
+      return;
+    }
+    const scheme = parsed.scheme.toLowerCase();
+    if (scheme !== 'http' && scheme !== 'https' && scheme !== 'mailto') {
+      this.postCommandError('link scheme not allowed');
+      return;
+    }
+    void vscode.env.openExternal(parsed);
+  }
+
+  private handleClearHistory(): void {
+    if (!taskStore) {
+      this.postCommandError('task store not ready');
+      return;
+    }
+    const file = taskStore.getFile();
+    const focus = this.focusedTaskId;
+
+    // Collect terminal root tasks to remove (except the currently focused one)
+    // Only coordinators (parentId null). Preserve running / non-terminal.
+    const toRemoveRoots: string[] = [];
+    for (const task of Object.values(file.tasks)) {
+      if (task.parentId !== null) continue;
+      if (task.id === focus) continue;
+      const isTerminal = task.lifecycle === 'succeeded' || task.lifecycle === 'failed' || task.lifecycle === 'cancelled' || task.lifecycle === 'skipped';
+      if (isTerminal) {
+        toRemoveRoots.push(task.id);
+      }
+    }
+
+    if (toRemoveRoots.length === 0) {
+      // nothing to clear, refresh anyway
+      this.postSnapshot(focus);
+      return;
+    }
+
+    // Collect full subtrees for removal
+    const toRemove = new Set<string>();
+    const queue = [...toRemoveRoots];
+    while (queue.length > 0) {
+      const id = queue.shift()!;
+      if (toRemove.has(id)) continue;
+      toRemove.add(id);
+      for (const t of Object.values(file.tasks)) {
+        if (t.parentId === id) queue.push(t.id);
+      }
+    }
+
+    taskStore.commit((draft) => {
+      for (const id of toRemove) {
+        delete draft.tasks[id];
+        // remove related turns and messages (operations/cancelRequests are turn-keyed or ledger; safe to leave)
+        for (const turnId of Object.keys(draft.turns)) {
+          if (draft.turns[turnId].taskId === id) delete draft.turns[turnId];
+        }
+        for (const msgId of Object.keys(draft.messages)) {
+          if (draft.messages[msgId].taskId === id) delete draft.messages[msgId];
+        }
+        if (draft.toolCalls) {
+          for (const key of Object.keys(draft.toolCalls)) {
+            if (draft.toolCalls[key].taskId === id) delete draft.toolCalls[key];
+          }
+        }
+        if (draft.reasoning) {
+          for (const key of Object.keys(draft.reasoning)) {
+            if (draft.reasoning[key].taskId === id) delete draft.reasoning[key];
+          }
+        }
+      }
+      // ensure optionals exist
+      draft.operations = draft.operations ?? {};
+      draft.cancelRequests = draft.cancelRequests ?? {};
+      return { ok: true };
+    });
+
+    // If focused was removed (shouldn't), clear it
+    if (focus && toRemove.has(focus)) {
+      this.focusedTaskId = undefined;
+    }
+
+    this.postSnapshot(this.focusedTaskId);
   }
 
   private transcriptItemFromMessage(messageId: string): TranscriptItem | undefined {
@@ -278,9 +411,17 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       this.postCommandError('task engine not ready');
       return;
     }
+    if (data.backend !== undefined && !WEBVIEW_BACKENDS.has(data.backend)) {
+      this.postCommandError('unknown backend', data.taskId);
+      return;
+    }
     const text = data.text?.trim();
     if (!text) {
       this.postCommandError('message cannot be empty', data.taskId);
+      return;
+    }
+    if (text.length > MAX_MESSAGE_CHARS) {
+      this.postCommandError('message too long', data.taskId);
       return;
     }
 
@@ -292,8 +433,17 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           return;
         }
       }
+
+      // For new tasks: goal (display name) is trimmed first ~30 chars of the message.
+      // The full text is stored as the actual first user message content.
+      const fullMessage = text;
+      const shortGoal = fullMessage.length <= 30
+        ? fullMessage
+        : fullMessage.slice(0, 30).trim() + '…';
+
       const result = taskEngine.startNewTask({
-        goal: text,
+        goal: shortGoal,
+        message: fullMessage,
         backend: data.backend ?? 'claude',
         continuationOf: data.continuationOf,
       });
@@ -396,6 +546,10 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
               this.postCommandError('retryTurn requires a non-empty instruction', data.taskId);
               break;
             }
+            if (instruction.length > MAX_MESSAGE_CHARS) {
+              this.postCommandError('instruction too long', data.taskId);
+              break;
+            }
             const turn = taskStore.getFile().turns[data.turnId];
             if (!turn || turn.taskId !== data.taskId) {
               this.postCommandError('turn does not belong to task', data.taskId);
@@ -420,6 +574,10 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             const instruction = typeof data.instruction === 'string' ? data.instruction.trim() : '';
             if (!instruction) {
               this.postCommandError('continueTask requires a non-empty instruction', data.taskId);
+              break;
+            }
+            if (instruction.length > MAX_MESSAGE_CHARS) {
+              this.postCommandError('instruction too long', data.taskId);
               break;
             }
             const result = taskEngine.continueTaskWithMessage(data.taskId, instruction);
@@ -461,12 +619,19 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             typeof data.taskId === 'string' &&
             typeof data.turnId === 'string' &&
             typeof data.askId === 'string' &&
-            data.answers
+            isValidAskAnswers(data.answers)
           ) {
+            const turn = taskStore?.getFile().turns[data.turnId];
+            if (!turn || turn.taskId !== data.taskId) {
+              this.postCommandError('turn does not belong to task', data.taskId);
+              break;
+            }
             taskEngine?.submitAskAnswer(
               { taskId: data.taskId, turnId: data.turnId, askId: data.askId },
               data.answers,
             );
+          } else {
+            this.postCommandError('invalid ask answer payload');
           }
           break;
         case 'cancelAsk':
@@ -482,13 +647,17 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             });
           }
           break;
+        case 'openLink':
+          this.handleOpenLink(data.url);
+          break;
+        case 'clearHistory':
+          this.handleClearHistory();
+          break;
       }
     });
 
-    if (!this.focusedTaskId && taskStore) {
-      const roots = Object.values(taskStore.getFile().tasks).filter((task) => task.parentId === null);
-      this.focusedTaskId = roots[0]?.id;
-    }
+    // Do not auto-focus on open — entry UI shows previous tasks list (per redesign)
+    // User selects from list or New task to enter chat.
     this.postSnapshot(this.focusedTaskId);
   }
 

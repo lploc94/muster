@@ -1,57 +1,149 @@
 <script lang="ts">
   import { threadStore } from '../lib/thread.svelte';
+  import { tasks } from '../lib/tasks.svelte';
+  import { backendIcon, backendLabel } from '../lib/backends';
   import MessageBubble from './MessageBubble.svelte';
   import ToolCard from './ToolCard.svelte';
 
   const thread = $derived(threadStore.current);
+  const currentBackend = $derived(tasks.focusedTask?.backend ?? 'unknown');
 
-  let scrollEl: HTMLDivElement | undefined;
-  let pinned = true;
+  const lastAssistantId = $derived(
+    thread.items.filter((it) => it.kind === 'assistant').pop()?.id ?? null,
+  );
+
+  let scrollEl: HTMLDivElement | undefined = $state();
+  let pinned = $state(true);
   const BOTTOM_THRESHOLD_PX = 80;
 
   function isNearBottom(el: HTMLElement): boolean {
     return el.scrollHeight - el.scrollTop - el.clientHeight < BOTTOM_THRESHOLD_PX;
   }
 
+  function onScroll() {
+    if (scrollEl) pinned = isNearBottom(scrollEl);
+  }
+
+  function scrollToBottom() {
+    if (scrollEl) {
+      scrollEl.scrollTop = scrollEl.scrollHeight;
+      pinned = true;
+    }
+  }
+
   $effect.pre(() => {
     void thread.items.length;
     void thread.streaming?.text;
+    void thread.revision;
     if (scrollEl) pinned = isNearBottom(scrollEl);
   });
 
   $effect(() => {
     void thread.items.length;
     void thread.streaming?.text;
+    void thread.revision;
     if (scrollEl && pinned) scrollEl.scrollTop = scrollEl.scrollHeight;
   });
+
+  // Header (backend chip + reasoning) starts a response block.
+  function isBlockStart(index: number): boolean {
+    const item = thread.items[index];
+    if (item.kind !== 'assistant' && item.kind !== 'tool') return false;
+    const prev = index > 0 ? thread.items[index - 1] : null;
+    return index === 0 || prev?.kind === 'user';
+  }
+
+  function reasoningFor(turnId: string | undefined): string {
+    if (!turnId) return '';
+    return thread.reasoningByTurn[turnId] ?? '';
+  }
 </script>
 
-<div
-  bind:this={scrollEl}
-  class="flex-1 min-h-0 overflow-y-auto overscroll-contain p-2 flex flex-col gap-2"
->
-  {#each thread.items as item (item.id)}
-    {#if item.kind === 'user'}
-      <MessageBubble role="user" text={item.text} />
-    {:else if item.kind === 'assistant'}
-      <MessageBubble role="assistant" text={item.text} />
-    {:else if item.kind === 'tool'}
-      <ToolCard tool={item} />
-    {:else if item.kind === 'error'}
-      <div
-        class="rounded px-2 py-1 text-xs whitespace-pre-wrap"
-        style={item.isCancellation
-          ? 'color: var(--vscode-descriptionForeground);'
-          : 'color: var(--vscode-errorForeground); border: 1px solid var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground));'}
-      >{item.isCancellation ? 'Cancelled' : item.message}</div>
+<div class="relative flex-1 min-h-0 flex flex-col">
+  <div
+    bind:this={scrollEl}
+    onscroll={onScroll}
+    class="flex-1 min-h-0 overflow-y-auto overscroll-contain p-2 flex flex-col gap-2"
+  >
+    {#each thread.items as item, i (item.id)}
+      {#if isBlockStart(i)}
+        {@const turnId = item.kind === 'assistant' || item.kind === 'tool' ? item.turnId : undefined}
+        <div class="flex items-center gap-1.5 mb-1">
+          <div
+            class="flex-shrink-0 w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-mono font-bold border"
+            style="border-color: var(--vscode-panel-border); color: var(--vscode-foreground); background: var(--vscode-editor-background);"
+            title={currentBackend || 'assistant'}
+          >
+            {backendIcon(currentBackend)}
+          </div>
+          <span class="text-[11px] opacity-70 font-medium">{backendLabel(currentBackend)}</span>
+        </div>
+
+        {#if reasoningFor(turnId)}
+          <details class="mb-1 text-xs opacity-70">
+            <summary class="cursor-pointer flex items-center gap-1">
+              <span class="codicon codicon-lightbulb"></span> Thinking
+            </summary>
+            <div class="mt-1 pl-5 whitespace-pre-wrap">{reasoningFor(turnId)}</div>
+          </details>
+        {/if}
+      {/if}
+
+      {#if item.kind === 'user'}
+        <MessageBubble role="user" text={item.text} />
+      {:else if item.kind === 'assistant'}
+        <MessageBubble role="assistant" text={item.text} showFooter={item.id === lastAssistantId} />
+      {:else if item.kind === 'tool'}
+        <ToolCard tool={item} />
+      {:else if item.kind === 'error'}
+        <div
+          class="rounded px-2 py-1 text-xs whitespace-pre-wrap"
+          style={item.isCancellation
+            ? 'color: var(--vscode-descriptionForeground);'
+            : 'color: var(--vscode-errorForeground); border: 1px solid var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground));'}
+        >{item.isCancellation ? 'Cancelled' : item.message}</div>
+      {/if}
+    {/each}
+
+    {#if thread.streaming}
+      {@const lastItem = thread.items.length > 0 ? thread.items[thread.items.length - 1] : null}
+      {#if lastItem?.kind === 'user' || thread.items.length === 0}
+        <div class="flex items-center gap-1.5 mb-1">
+          <div
+            class="flex-shrink-0 w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-mono font-bold border"
+            style="border-color: var(--vscode-panel-border); color: var(--vscode-foreground); background: var(--vscode-editor-background);"
+            title={currentBackend || 'assistant'}
+          >
+            {backendIcon(currentBackend)}
+          </div>
+          <span class="text-[11px] opacity-70 font-medium">{backendLabel(currentBackend)}</span>
+        </div>
+        {#if thread.activeTurnId && reasoningFor(thread.activeTurnId)}
+          <details class="mb-1 text-xs opacity-70" open>
+            <summary class="cursor-pointer flex items-center gap-1">
+              <span class="codicon codicon-lightbulb"></span> Thinking
+            </summary>
+            <div class="mt-1 pl-5 whitespace-pre-wrap">{reasoningFor(thread.activeTurnId)}</div>
+          </details>
+        {/if}
+      {/if}
+      <MessageBubble role="assistant" text={thread.streaming.text} streaming />
     {/if}
-  {/each}
 
-  {#if thread.streaming}
-    <MessageBubble role="assistant" text={thread.streaming.text} streaming />
-  {/if}
+    {#if thread.items.length === 0 && !thread.streaming}
+      <div class="text-center mt-4" style="opacity: 0.6;">No messages yet.</div>
+    {/if}
+  </div>
 
-  {#if thread.items.length === 0 && !thread.streaming}
-    <div class="text-center mt-4" style="opacity: 0.6;">No messages yet.</div>
+  {#if !pinned}
+    <button
+      type="button"
+      class="absolute bottom-2 right-3 icon-btn shadow"
+      style="width: 30px; height: 30px; border-radius: 999px; background: var(--vscode-editor-background); border: 1px solid var(--vscode-panel-border);"
+      title="Scroll to latest"
+      onclick={scrollToBottom}
+    >
+      <span class="codicon codicon-arrow-down"></span>
+    </button>
   {/if}
 </div>

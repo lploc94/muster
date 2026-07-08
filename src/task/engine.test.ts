@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { Backend, BackendCapabilities, NormalizedEvent, RunOptions } from '../types';
 import { TaskEngine, projectPrompt } from './engine';
 import { TaskStore } from './store';
+import { buildTranscript } from '../host/snapshot';
 import type { TaskMessage, TaskTurn } from './types';
 
 const tempDirs: string[] = [];
@@ -498,5 +499,82 @@ describe('TaskEngine', () => {
     expect(conflict.ok).toBe(false);
     resume?.();
     await engine.whenIdle();
+  });
+});
+
+describe('TaskEngine transcript persistence (tool + reasoning + segmentation)', () => {
+  it('persists segmented assistant text, tool calls (composite id, replaced input), and reasoning; buildTranscript reconstructs order', async () => {
+    const { store } = makeTempStore();
+    const events: NormalizedEvent[] = [
+      { type: 'assistantDelta', content: 'before ', messageId: 'a1' },
+      { type: 'toolStarted', toolCallId: 'tc1', name: 'read_file', input: { path: 'x' } },
+      { type: 'toolUpdated', toolCallId: 'tc1', input: { path: 'y' } },
+      { type: 'toolCompleted', toolCallId: 'tc1', outcome: 'success', output: 'ok' },
+      { type: 'assistantDelta', content: 'after', messageId: 'a2' },
+      { type: 'reasoningDelta', content: 'thinking', messageId: 'r1' },
+      { type: 'turnCompleted' },
+    ];
+    const engine = makeEngine(store, events);
+    engine.createTask({ id: 'task-1', goal: 'g', backend: 'fake' });
+    const sent = engine.send('task-1', 'go');
+    expect(sent.ok).toBe(true);
+    if (!sent.ok || !sent.value.turnId) return;
+    await engine.whenIdle();
+
+    const file = store.getFile();
+    const turnId = sent.value.turnId;
+
+    // Two assistant segments, distinct order, split around the tool.
+    const asst = Object.values(file.messages)
+      .filter((m) => m.role === 'assistant' && m.turnId === turnId)
+      .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+    expect(asst.map((m) => m.content)).toEqual(['before ', 'after']);
+    expect(asst[0].order).toBe(0);
+    expect(asst[1].order).toBe(2);
+    expect(asst[0].id).toBe(`${turnId}:0`);
+
+    // Tool call: composite id, input REPLACED (not merged), completed.
+    const toolKey = `${turnId}:tc1`;
+    const tc = file.toolCalls?.[toolKey];
+    expect(tc).toBeDefined();
+    expect(tc?.name).toBe('read_file');
+    expect(tc?.status).toBe('success');
+    expect(tc?.output).toBe('ok');
+    expect(tc?.input).toEqual({ path: 'y' });
+    expect(tc?.order).toBe(1);
+
+    // Reasoning: turn-scoped, appended.
+    expect(file.reasoning?.[turnId]?.content).toBe('thinking');
+
+    // buildTranscript reconstructs exact order: user, reasoning, assistant, tool, assistant.
+    const transcript = buildTranscript(file, 'task-1');
+    expect(transcript.map((t) => t.kind)).toEqual([
+      'user',
+      'reasoning',
+      'assistant',
+      'tool',
+      'assistant',
+    ]);
+    const assistantTexts = transcript
+      .filter((t) => t.kind === 'assistant')
+      .map((t) => t.content as string);
+    expect(assistantTexts).toEqual(['before ', 'after']);
+  });
+
+  it('creates a tool record on toolCompleted even when the start was missed (upsert)', async () => {
+    const { store } = makeTempStore();
+    const events: NormalizedEvent[] = [
+      { type: 'toolCompleted', toolCallId: 'orphan', outcome: 'error', error: 'boom' },
+      { type: 'turnCompleted' },
+    ];
+    const engine = makeEngine(store, events);
+    engine.createTask({ id: 'task-1', goal: 'g', backend: 'fake' });
+    const sent = engine.send('task-1', 'go');
+    if (!sent.ok || !sent.value.turnId) return;
+    await engine.whenIdle();
+    const file = store.getFile();
+    const tc = file.toolCalls?.[`${sent.value.turnId}:orphan`];
+    expect(tc?.status).toBe('error');
+    expect(tc?.error).toBe('boom');
   });
 });

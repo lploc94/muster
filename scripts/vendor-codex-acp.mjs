@@ -43,6 +43,16 @@ try {
   const dest = path.join(destDir, 'index.mjs');
   copyFileSync(src, dest);
   console.log(`Vendored ${spec} -> ${path.relative(repoRoot, dest)}`);
+
+  // Apache-2.0 requires retaining the license (and NOTICE, if any) when
+  // redistributing the bundle inside the .vsix.
+  for (const name of ['LICENSE', 'NOTICE']) {
+    const from = path.join(work, 'package', name);
+    if (existsSync(from)) {
+      copyFileSync(from, path.join(destDir, name));
+      console.log(`  + ${name}`);
+    }
+  }
 } finally {
   rmSync(work, { recursive: true, force: true });
 }

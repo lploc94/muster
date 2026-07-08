@@ -67,7 +67,7 @@ export interface BackendCapabilities {
 }
 
 export interface Backend {
-  /** Unique name, e.g. 'claude', 'grok', 'codex', 'antigravity' */
+  /** Unique name, e.g. 'claude', 'grok', 'kiro', 'codex', 'opencode' */
   readonly name: string;
 
   /** What this backend can reliably produce (helps the coordinator decide what to render) */
@@ -121,17 +121,19 @@ The adapter should not try to manage conversation history itself.
 
 MCP injection is **uniform over ACP**: pass `mcpServers` (http/sse entries) on `session/new` / `session/load` via `RunOptions.mcpServers`. stdio MCP is rejected by some agents over ACP — expose stdio servers (e.g. `context_engine`) via http/sse proxy or the Muster Bridge pattern.
 
-`mcpConfigPath` is legacy for the not-yet-migrated Claude headless adapter; new ACP adapters use `mcpServers` only.
+`mcpConfigPath` is a legacy field retained for any future non-ACP (headless) backend; all current ACP adapters (Claude, Grok, Kiro, Codex, OpenCode) use `mcpServers` only.
 
-## MVP Scope & Implementation order
+## Implementation status
 
-Start with:
-1. Grok (ACP reference implementation — done)
-2. Claude (ACP migration)
+All five ACP backends are implemented on the shared `acp-client.ts`:
 
-Then:
-3. Codex
-4. Antigravity (mark as experimental until we have solid streaming + MCP behavior)
+1. Grok — native ACP (`grok --no-auto-update agent stdio`)
+2. Kiro — native ACP (`kiro-cli acp`)
+3. OpenCode — native ACP (`opencode acp`)
+4. Claude — bundled `@agentclientprotocol/claude-agent-acp`
+5. Codex — bundled `@agentclientprotocol/codex-acp`
+
+Next: Antigravity (`agy`), experimental until it exposes an ACP stdio entry with solid streaming + MCP behavior.
 
 ## Versioning & evolution
 
