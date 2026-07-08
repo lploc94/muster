@@ -13,5 +13,5 @@
     "types": ["node", "vscode"]
   },
   "include": ["src/**/*", "scripts/**/*"],
-  "exclude": ["**/*.test.ts", "vitest.config.ts"]
+  "exclude": ["**/*.test.ts", "**/*.testkit.ts", "vitest.config.ts"]
 }
