@@ -179,6 +179,31 @@ body {
   background: color-mix(in srgb, var(--vscode-editor-background) 92%, var(--vscode-foreground) 8%);
 }
 
+
+.composer-shell {
+  position: relative;
+}
+
+.composer-shell--dragging {
+  outline: 1px dashed var(--vscode-focusBorder, var(--vscode-charts-blue));
+  outline-offset: -4px;
+  background: color-mix(in srgb, var(--vscode-editor-background) 82%, var(--vscode-focusBorder, #3794ff) 18%);
+}
+
+.composer-shell--dragging::after {
+  content: 'Drop file to mention it';
+  position: absolute;
+  inset: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  color: var(--vscode-foreground);
+  background: color-mix(in srgb, var(--vscode-editor-background) 72%, transparent);
+  pointer-events: none;
+  font-size: 12px;
+}
+
 .composer-guidance {
   color: var(--vscode-descriptionForeground);
   font-size: 12px;
