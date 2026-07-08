@@ -338,34 +338,57 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     const file = taskStore.getFile();
     const focus = this.focusedTaskId;
 
-    // Collect terminal root tasks to remove (except the currently focused one)
-    // Only coordinators (parentId null). Preserve running / non-terminal.
-    const toRemoveRoots: string[] = [];
-    for (const task of Object.values(file.tasks)) {
-      if (task.parentId !== null) continue;
-      if (task.id === focus) continue;
-      const isTerminal = task.lifecycle === 'succeeded' || task.lifecycle === 'failed' || task.lifecycle === 'cancelled' || task.lifecycle === 'skipped';
-      if (isTerminal) {
-        toRemoveRoots.push(task.id);
+    // A task is removable only if it is idle or terminal — and not the currently
+    // focused task. Anything with active work is preserved.
+    const isRemovable = (id: string): boolean => {
+      if (id === focus) return false;
+      const viewStatus = taskEngine ? taskEngine.viewStatus(id) : file.tasks[id]?.lifecycle;
+      return (
+        viewStatus === 'idle' ||
+        viewStatus === 'succeeded' ||
+        viewStatus === 'failed' ||
+        viewStatus === 'cancelled' ||
+        viewStatus === 'skipped'
+      );
+    };
+
+    // Index children so whole subtrees can be inspected.
+    const childrenOf = new Map<string, string[]>();
+    for (const t of Object.values(file.tasks)) {
+      if (t.parentId) {
+        const list = childrenOf.get(t.parentId);
+        if (list) list.push(t.id);
+        else childrenOf.set(t.parentId, [t.id]);
       }
     }
 
-    if (toRemoveRoots.length === 0) {
+    // Remove a root subtree only if EVERY task in it is removable. A root can be
+    // idle/terminal while a delegated child is still queued/running, and deleting
+    // the subtree would otherwise nuke that in-flight work.
+    const toRemove = new Set<string>();
+    for (const task of Object.values(file.tasks)) {
+      if (task.parentId !== null) continue;
+      const subtree: string[] = [];
+      const stack: string[] = [task.id];
+      let allRemovable = true;
+      while (stack.length > 0) {
+        const id = stack.pop()!;
+        subtree.push(id);
+        if (!isRemovable(id)) {
+          allRemovable = false;
+          break;
+        }
+        for (const child of childrenOf.get(id) ?? []) stack.push(child);
+      }
+      if (allRemovable) {
+        for (const id of subtree) toRemove.add(id);
+      }
+    }
+
+    if (toRemove.size === 0) {
       // nothing to clear, refresh anyway
       this.postSnapshot(focus);
       return;
-    }
-
-    // Collect full subtrees for removal
-    const toRemove = new Set<string>();
-    const queue = [...toRemoveRoots];
-    while (queue.length > 0) {
-      const id = queue.shift()!;
-      if (toRemove.has(id)) continue;
-      toRemove.add(id);
-      for (const t of Object.values(file.tasks)) {
-        if (t.parentId === id) queue.push(t.id);
-      }
     }
 
     taskStore.commit((draft) => {
@@ -723,6 +746,11 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           break;
         case 'clearHistory':
           this.handleClearHistory();
+          break;
+        case 'blurTask':
+          // Webview returned to the task list; drop the host-side focus so a
+          // later snapshot (e.g. after Clear history) doesn't re-open a stale chat.
+          this.focusedTaskId = undefined;
           break;
         default:
           // Unknown inbound type: log instead of silently ignoring. This surfaces

@@ -6,6 +6,7 @@
   import { threadStore } from '../lib/thread.svelte';
   import { post, statusLabel } from '../lib/protocol';
   import type { PendingAsk } from '../lib/protocol';
+  import { tip } from '../lib/tooltip';
 
   interface Props {
     pendingAsk: PendingAsk | null;
@@ -72,7 +73,7 @@
       >
         <span style="opacity: 0.7;">Subtree:</span>
         {#each tasks.subtree as node (node.id)}
-          <vscode-badge title={node.goal}>
+          <vscode-badge use:tip={node.goal}>
             {node.id === focused.id ? '▸ ' : ''}{shortGoal(node.goal).slice(0, 24)}
           </vscode-badge>
         {/each}

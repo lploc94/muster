@@ -143,7 +143,8 @@ export type OutMessage =
   | { type: 'continueTask'; taskId: string; instruction: string }
   | { type: 'resumeQueuedTurn'; taskId: string; turnId: string }
   | { type: 'openLink'; url: string }
-  | { type: 'clearHistory' };
+  | { type: 'clearHistory' }
+  | { type: 'blurTask' };
 
 /** Post a typed message to the extension host. */
 export function post(message: OutMessage): void {
@@ -326,5 +327,6 @@ export function isTerminalStatus(status: TaskViewStatus): boolean {
 }
 
 export function statusLabel(status: TaskViewStatus): string {
-  return status.replace(/_/g, ' ');
+  const s = status.replace(/_/g, ' ');
+  return s.charAt(0).toUpperCase() + s.slice(1);
 }

@@ -1,6 +1,8 @@
 <script lang="ts">
   import { tasks } from '../lib/tasks.svelte';
   import { post, statusLabel } from '../lib/protocol';
+  import { backendShortLabel } from '../lib/backends';
+  import { tip } from '../lib/tooltip';
 
   interface Props {
     variant?: 'full' | 'dropdown' | 'sidebar';
@@ -56,12 +58,12 @@
       <span class="flex items-center gap-1 flex-wrap" style="opacity: 0.85;">
         <vscode-badge>{statusLabel(task.viewStatus)}</vscode-badge>
         {#if task.backend}
-          <span class="text-[10px] opacity-70">{task.backend}</span>
+          <span class="text-[11px] leading-[14px] opacity-70">{backendShortLabel(task.backend)}</span>
         {/if}
         {#if task.continuationOf}
           <span style="font-size: 10px;">↳ cont.</span>
         {/if}
-        <span class="ml-auto text-[10px] opacity-60" title={task.updatedAt}>
+        <span class="ml-auto text-[10px] opacity-60" use:tip={task.updatedAt}>
           {new Date(task.updatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
         </span>
       </span>
@@ -74,7 +76,16 @@
 
   {#if variant === 'full' && tasks.rootTasks.length > 0}
     <div class="mt-3 pt-2 border-t flex justify-end" style="border-color: var(--vscode-panel-border);">
-      <button type="button" class="text-xs underline opacity-70" onclick={() => onClear && onClear()}>Clear history</button>
+      <button
+        type="button"
+        class="icon-btn"
+        style="width: 22px; height: 22px;"
+        onclick={() => onClear && onClear()}
+        aria-label="Clear history"
+        use:tip={'Clear history'}
+      >
+        <span class="codicon codicon-trash"></span>
+      </button>
     </div>
   {/if}
 </div>

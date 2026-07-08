@@ -60,6 +60,26 @@ body {
   cursor: default;
 }
 
+/* Instant hover tooltip (see lib/tooltip.ts `tip` action). Replaces the native
+   `title` attribute, whose show delay the browser does not let us configure. */
+.tt-pop {
+  position: fixed;
+  z-index: 1000;
+  max-width: min(240px, calc(100vw - 8px));
+  box-sizing: border-box;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 11px;
+  line-height: 1.4;
+  background: var(--vscode-editorHoverWidget-background, #252526);
+  color: var(--vscode-editorHoverWidget-foreground, var(--vscode-foreground));
+  border: 1px solid var(--vscode-editorHoverWidget-border, var(--vscode-panel-border));
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 /* GitHub Markdown CSS overrides for VSCode webview theme */
 .markdown-body {
   color: var(--vscode-foreground);

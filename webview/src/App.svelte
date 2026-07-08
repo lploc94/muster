@@ -8,6 +8,7 @@
   import { threadStore } from './lib/thread.svelte';
   import { isExtMessage, isProtocolCompatible, post, statusLabel } from './lib/protocol';
   import type { PendingAsk, PendingPermission, TaskViewStatus } from './lib/protocol';
+  import { tip } from './lib/tooltip';
 
   let pendingAsk = $state<PendingAsk | null>(null);
   let pendingPermission = $state<PendingPermission | null>(null);
@@ -69,6 +70,9 @@
     tasks.draftMode = false;
     threadStore.clearFocus();
     historyOpen = false;
+    // Tell the host we left the chat so it drops its focus; otherwise a later
+    // snapshot (e.g. after Clear history) would re-open the stale chat.
+    post({ type: 'blurTask' });
   }
 
   onMount(() => {
@@ -245,7 +249,8 @@
         class="icon-btn"
         style="width: 22px; height: 22px;"
         onclick={() => { tasks.openNewTaskDraft(); post({ type: 'newTask' }); historyOpen = false; }}
-        title="New task"
+        aria-label="New task"
+        use:tip={'New task'}
       >
         <span class="codicon codicon-add"></span>
       </button>
@@ -266,7 +271,8 @@
           class="icon-btn"
           style="width: 22px; height: 22px;"
           onclick={backToList}
-          title="Back to tasks list"
+          aria-label="Back to tasks list"
+          use:tip={'Back to tasks list'}
         >
           <span class="codicon codicon-arrow-left"></span>
         </button>
@@ -278,7 +284,8 @@
           class="icon-btn"
           style="width: 22px; height: 22px;"
           onclick={() => (historyOpen = !historyOpen)}
-          title="History (previous coordinator tasks)"
+          aria-label="History (previous coordinator tasks)"
+          use:tip={'History (previous coordinator tasks)'}
         >
           <span class="codicon codicon-history"></span>
         </button>
@@ -288,7 +295,8 @@
           class="icon-btn"
           style="width: 22px; height: 22px;"
           onclick={() => { tasks.openNewTaskDraft(); post({ type: 'newTask' }); historyOpen = false; }}
-          title="New task"
+          aria-label="New task"
+          use:tip={'New task'}
         >
           <span class="codicon codicon-add"></span>
         </button>
@@ -296,18 +304,18 @@
 
       <!-- Row 2: task name + status (below, left-aligned) -->
       {#if tasks.focusedTask}
-        <div class="flex items-center gap-2 px-3 pb-1.5 text-sm" style="border-top: 1px solid var(--vscode-panel-border);">
-          <span class="font-semibold truncate" title={tasks.focusedTask.goal}>
+        <div class="flex items-center gap-2 px-3 py-1.5 text-sm" style="border-top: 1px solid var(--vscode-panel-border);">
+          <span class="font-semibold truncate" use:tip={tasks.focusedTask.goal}>
             {shortGoal(tasks.focusedTask.goal)}
           </span>
           <span 
             class="codicon {statusIcon(tasks.focusedTask.viewStatus)}" 
             style="font-size: 14px; vertical-align: middle; margin-left: 4px;"
-            title={statusLabel(tasks.focusedTask.viewStatus)}
+            use:tip={statusLabel(tasks.focusedTask.viewStatus)}
           ></span>
         </div>
       {:else if tasks.draftMode}
-        <div class="flex items-center gap-2 px-3 pb-1.5 text-sm" style="border-top: 1px solid var(--vscode-panel-border);">
+        <div class="flex items-center gap-2 px-3 py-1.5 text-sm" style="border-top: 1px solid var(--vscode-panel-border);">
           <span class="font-semibold">
             {tasks.continuationOf ? 'Continue as new task' : 'New task'}
           </span>
