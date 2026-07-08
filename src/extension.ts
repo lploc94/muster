@@ -1,10 +1,14 @@
 import * as vscode from 'vscode';
 import { AskBridge } from './bridge/ask-bridge';
 import type { Question } from './bridge/ask-bridge';
+import { PermissionBridge } from './bridge/permission-bridge';
+import type { PermissionRequest } from './bridge/permission-bridge';
 import { CredentialRegistry } from './bridge/credentials';
 import { MusterBridgeServer } from './bridge/server';
 import { makeBackend } from './backends/index';
-import { disposeSharedAcpClient } from './backends/acp-client';
+import { disposeSharedAcpClient, setPermissionController } from './backends/acp-client';
+import type { PermissionController } from './backends/acp-client';
+import type { PermissionAuditEntry, PermissionMode } from './backends/permission-policy';
 import {
   buildSnapshot,
   projectTaskSummary,
@@ -22,6 +26,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 let askBridge: AskBridge | undefined;
+let permissionBridge: PermissionBridge | undefined;
+let permissionAuditChannel: vscode.OutputChannel | undefined;
 let credentialRegistry: CredentialRegistry | undefined;
 let bridgeServer: MusterBridgeServer | undefined;
 let taskEngine: TaskEngine | undefined;
@@ -31,6 +37,17 @@ let workspaceRoot: string | undefined;
 let lastObservedRevision = 0;
 let lastObservedFile: TaskStoreFile | undefined;
 const activePendingAsks = new Map<string, PendingAskOverlay>();
+
+/** How long a permission prompt waits for a webview decision before safe-denying. */
+const PERMISSION_PROMPT_TIMEOUT_MS = 120_000;
+/** Reject oversized inbound webview identifiers/option ids (defense-in-depth). */
+const MAX_ID_CHARS = 256;
+
+/** Read the live permission mode from settings (never frozen at connect time). */
+function getPermissionMode(): PermissionMode {
+  const mode = vscode.workspace.getConfiguration('muster.permissions').get<string>('mode', 'ask');
+  return mode === 'allow' || mode === 'readonly' ? mode : 'ask';
+}
 
 /** Backends the webview may request. Mirrors the composer's select options. */
 const WEBVIEW_BACKENDS = new Set(['claude', 'grok', 'kiro', 'codex', 'opencode']);
@@ -647,6 +664,43 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             });
           }
           break;
+        case 'submitPermission': {
+          if (
+            typeof data.permissionId !== 'string' ||
+            typeof data.optionId !== 'string' ||
+            typeof data.remember !== 'boolean' ||
+            data.permissionId.length === 0 ||
+            data.permissionId.length > MAX_ID_CHARS ||
+            data.optionId.length === 0 ||
+            data.optionId.length > MAX_ID_CHARS
+          ) {
+            this.postCommandError('invalid permission submission');
+            break;
+          }
+          // The id must be a currently-pending prompt, and the optionId must be
+          // one the agent actually offered for it — never trust an arbitrary id.
+          const pending = permissionBridge?.peek(data.permissionId);
+          if (!pending) {
+            this.postCommandError('no such pending permission');
+            break;
+          }
+          if (!pending.options.some((o) => o.optionId === data.optionId)) {
+            this.postCommandError('permission option not offered');
+            break;
+          }
+          permissionBridge?.submit(data.permissionId, {
+            optionId: data.optionId,
+            remember: data.remember,
+          });
+          break;
+        }
+        case 'cancelPermission': {
+          if (typeof data.permissionId !== 'string' || data.permissionId.length > MAX_ID_CHARS) {
+            break;
+          }
+          permissionBridge?.cancel(data.permissionId);
+          break;
+        }
         case 'openLink':
           this.handleOpenLink(data.url);
           break;
@@ -731,6 +785,62 @@ export async function activate(context: vscode.ExtensionContext) {
         });
       },
     });
+
+    // Permission approval gate: prompts route to a webview card; the audit log
+    // records every allow/deny decision.
+    permissionAuditChannel = vscode.window.createOutputChannel('Muster Permissions');
+    context.subscriptions.push(permissionAuditChannel);
+    permissionBridge = new PermissionBridge({
+      onRegister: (permissionId, request: PermissionRequest) => {
+        provider['_view']?.webview.postMessage({
+          type: 'permissionPending',
+          sessionId: request.sessionId,
+          permissionId,
+          title: request.title,
+          kind: request.kind,
+          classification: request.classification,
+          options: request.options.map((o) => ({
+            optionId: o.optionId,
+            name: o.name ?? o.optionId,
+            kind: o.kind,
+          })),
+        });
+      },
+      onResolve: (permissionId) => {
+        provider['_view']?.webview.postMessage({ type: 'permissionCleared', permissionId });
+      },
+    });
+    const bridge = permissionBridge;
+    const auditChannel = permissionAuditChannel;
+    const permissionController: PermissionController = {
+      // Read live each call — AcpClient is a shared singleton constructed once,
+      // so the mode must NOT be frozen at first connect.
+      mode: () => getPermissionMode(),
+      isAllowlisted: (sessionId, key) => bridge.isAllowlisted(sessionId, key),
+      remember: (sessionId, key) => bridge.remember(sessionId, key),
+      audit: (entry: PermissionAuditEntry) => {
+        bridge.recordAudit(entry);
+        auditChannel.appendLine(
+          `${entry.at} ${entry.decision.toUpperCase()} [${entry.source}] ` +
+            `session=${entry.sessionId} class=${entry.classification} ` +
+            `kind=${entry.kind} title=${JSON.stringify(entry.title)}`,
+        );
+      },
+      prompt: (req) =>
+        bridge.register(
+          bridge.generatePermissionId(),
+          {
+            sessionId: req.sessionId,
+            title: req.title,
+            kind: req.kind,
+            classification: req.classification,
+            options: req.options,
+          },
+          PERMISSION_PROMPT_TIMEOUT_MS,
+        ),
+    };
+    setPermissionController(permissionController);
+
     credentialRegistry = new CredentialRegistry();
     bridgeServer = new MusterBridgeServer({
       credentials: credentialRegistry,
@@ -759,6 +869,17 @@ export async function activate(context: vscode.ExtensionContext) {
     applyRetentionToStore(taskStore);
     lastObservedFile = JSON.parse(JSON.stringify(taskStore.getFile())) as TaskStoreFile;
     lastObservedRevision = taskStore.getFile().revision;
+
+    if (taskStore.isCorrupt()) {
+      // The store could not be read (corrupt or written by a newer version). It is
+      // preserved and never overwritten; run in recovery mode instead of bricking.
+      const info = taskStore.getRecoveryInfo();
+      void vscode.window.showWarningMessage(
+        `Muster: the task store could not be read. Your data is preserved at ${
+          info?.backupPath ?? 'a .corrupt backup'
+        }. Muster is in recovery mode and will not overwrite it — remove or repair the file to resume.`,
+      );
+    }
 
     taskEngine = TaskEngine.load({
       store: taskStore,
@@ -791,15 +912,20 @@ export async function activate(context: vscode.ExtensionContext) {
       dispose: () => {
         void bridgeServer?.close();
         askBridge?.cancelAll('deactivate');
+        setPermissionController(null);
+        permissionBridge?.cancelAll();
         credentialRegistry?.revokeAll();
       },
     });
   } catch (error) {
     void bridgeServer?.close();
     askBridge?.cancelAll('init failed');
+    setPermissionController(null);
+    permissionBridge?.cancelAll();
     credentialRegistry?.revokeAll();
     bridgeServer = undefined;
     askBridge = undefined;
+    permissionBridge = undefined;
     credentialRegistry = undefined;
     taskEngine = undefined;
     taskStore = undefined;
@@ -810,6 +936,8 @@ export async function activate(context: vscode.ExtensionContext) {
 
 export function deactivate() {
   askBridge?.cancelAll('deactivate');
+  setPermissionController(null);
+  permissionBridge?.cancelAll();
   credentialRegistry?.revokeAll();
   void bridgeServer?.close();
   disposeSharedAcpClient();

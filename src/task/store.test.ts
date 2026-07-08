@@ -163,14 +163,135 @@ describe('TaskStore', () => {
     fs.unlinkSync(lockPath);
   });
 
-  it('preserves corrupt files instead of overwriting them', () => {
+  it('load() recovers from a pre-existing corrupt store instead of bricking', () => {
     const { dir, filePath } = makeTempStore();
     fs.writeFileSync(filePath, '{not json', 'utf8');
 
-    expect(() => TaskStore.load({ filePath })).toThrow(/Corrupt task store preserved/);
+    // Must NOT throw — a corrupt store at startup would otherwise disable the engine
+    // with no observable recovery state.
+    const store = TaskStore.load({ filePath });
+    expect(store.isCorrupt()).toBe(true);
+    expect(store.getRecoveryInfo()?.backupPath).toContain('.corrupt-');
+    // In-memory falls back to an empty envelope; the corrupt bytes are quarantined once.
+    expect(Object.keys(store.getFile().tasks).length).toBe(0);
     const corruptFiles = fs.readdirSync(dir).filter((name) => name.includes('.corrupt-'));
     expect(corruptFiles.length).toBe(1);
+    // The user's corrupt data is preserved untouched — never auto-reset.
     expect(fs.readFileSync(filePath, 'utf8')).toBe('{not json');
+    // A commit must still refuse to overwrite the corrupt on-disk file.
+    const attempt = store.commit((draft) => {
+      draft.tasks['t'] = sampleTask('t');
+      return { ok: true };
+    });
+    expect(attempt.ok).toBe(false);
+    expect(fs.readFileSync(filePath, 'utf8')).toBe('{not json');
+  });
+
+  it('reload() surfaces external corruption without throwing and recovers when repaired', () => {
+    const { filePath } = makeTempStore();
+    const store = TaskStore.load({ filePath });
+    expect(
+      store.commit((draft) => {
+        draft.tasks['t'] = sampleTask('t');
+        return { ok: true };
+      }).ok,
+    ).toBe(true);
+    expect(store.isCorrupt()).toBe(false);
+
+    // An external process corrupts the file; the watcher-driven reload must not throw.
+    fs.writeFileSync(filePath, '{ broken', 'utf8');
+    expect(() => store.reload()).not.toThrow();
+    expect(store.isCorrupt()).toBe(true);
+    expect(store.getRecoveryInfo()?.backupPath).toContain('.corrupt-');
+    // Last-known-good in-memory state is retained during recovery.
+    expect(store.getTask('t')?.id).toBe('t');
+
+    // The file becomes readable again → reload clears the corruption signal.
+    fs.writeFileSync(
+      filePath,
+      JSON.stringify({ schemaVersion: CURRENT_SCHEMA_VERSION, revision: 5, tasks: {}, turns: {}, messages: {} }),
+      'utf8',
+    );
+    store.reload();
+    expect(store.isCorrupt()).toBe(false);
+    expect(store.getRecoveryInfo()).toBeUndefined();
+    expect(store.getFile().revision).toBe(5);
+  });
+
+  it('quarantines a commit-time corruption once and exposes a recoverable signal', () => {
+    const { dir, filePath } = makeTempStore();
+    const store = TaskStore.load({ filePath });
+    // Establish a healthy store on disk.
+    expect(
+      store.commit((draft) => {
+        draft.tasks['t'] = sampleTask('t');
+        return { ok: true };
+      }).ok,
+    ).toBe(true);
+    expect(store.isCorrupt()).toBe(false);
+
+    // Corrupt the file out from under the store.
+    fs.writeFileSync(filePath, '{ broken json', 'utf8');
+
+    const first = store.commit(() => ({ ok: true }));
+    expect(first.ok).toBe(false);
+    if (!first.ok) {
+      expect(first.reason).toBe('store_corrupt');
+      if (first.reason === 'store_corrupt') {
+        expect(first.backupPath).toContain('.corrupt-');
+      }
+    }
+    expect(store.isCorrupt()).toBe(true);
+    expect(store.getRecoveryInfo()?.backupPath).toContain('.corrupt-');
+
+    // Repeated commits against the SAME corruption must not accumulate backups.
+    expect(store.commit(() => ({ ok: true })).ok).toBe(false);
+    expect(store.commit(() => ({ ok: true })).ok).toBe(false);
+    const corruptFiles = fs.readdirSync(dir).filter((name) => name.includes('.corrupt-'));
+    expect(corruptFiles.length).toBe(1);
+
+    // The user's corrupt data is preserved untouched — never auto-reset.
+    expect(fs.readFileSync(filePath, 'utf8')).toBe('{ broken json');
+  });
+
+  it('creates a distinct backup for a second, different corruption', () => {
+    const { dir, filePath } = makeTempStore();
+    const store = TaskStore.load({ filePath });
+    store.commit((draft) => {
+      draft.tasks['t'] = sampleTask('t');
+      return { ok: true };
+    });
+
+    fs.writeFileSync(filePath, 'corruption-one', 'utf8');
+    store.commit(() => ({ ok: true }));
+    fs.writeFileSync(filePath, 'a-different-corruption', 'utf8');
+    store.commit(() => ({ ok: true }));
+
+    const corruptFiles = fs.readdirSync(dir).filter((name) => name.includes('.corrupt-'));
+    expect(corruptFiles.length).toBe(2);
+  });
+
+  it('clears the corruption signal once the store is readable again', () => {
+    const { filePath } = makeTempStore();
+    const store = TaskStore.load({ filePath });
+    store.commit((draft) => {
+      draft.tasks['t'] = sampleTask('t');
+      return { ok: true };
+    });
+
+    fs.writeFileSync(filePath, 'not json', 'utf8');
+    expect(store.commit(() => ({ ok: true })).ok).toBe(false);
+    expect(store.isCorrupt()).toBe(true);
+
+    // User chooses to start fresh: remove the corrupt file.
+    fs.unlinkSync(filePath);
+    const recovered = store.commit((draft) => {
+      draft.tasks['t2'] = sampleTask('t2');
+      return { ok: true };
+    });
+    expect(recovered.ok).toBe(true);
+    expect(store.isCorrupt()).toBe(false);
+    expect(store.getRecoveryInfo()).toBeUndefined();
   });
 
   it('rejects unknown-newer schema versions', () => {

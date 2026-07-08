@@ -54,6 +54,17 @@
           "default": 200000,
           "minimum": 1024,
           "description": "Maximum stored assistant output characters per settled turn on open tasks."
+        },
+        "muster.permissions.mode": {
+          "type": "string",
+          "enum": ["ask", "allow", "readonly"],
+          "default": "ask",
+          "enumDescriptions": [
+            "Safe: auto-allow read-only tool calls, prompt for writes/commands/unknown actions.",
+            "Auto-approve every tool-permission request (least safe; still audit-logged).",
+            "Allow read-only tool calls, deny all writes/commands without prompting."
+          ],
+          "description": "How Muster handles agent tool-permission requests. 'ask' (safe): auto-allow read-only, prompt for writes/commands. 'allow': auto-approve everything (less safe). 'readonly': deny all writes/commands."
         }
       }
     },
@@ -94,6 +105,7 @@
     "test:agy-ask": "node scripts/test-agy-ask-mcp.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
+    "check:svelte": "svelte-check --workspace webview --tsconfig ./tsconfig.json",
     "test:source-boundary": "node scripts/source-boundary-smoke.mjs",
     "test:evidence": "node --test scripts/verify-verification-evidence.test.mjs",
     "test:source-boundary:fixtures": "node --test scripts/source-boundary-smoke.test.mjs"
@@ -104,7 +116,9 @@
     "@types/node": "^26.1.0",
     "@types/vscode": "^1.94.0",
     "@vscode/vsce": "^3.9.2",
+    "jsdom": "^29.1.1",
     "svelte": "^5.56.4",
+    "svelte-check": "^4.7.2",
     "tailwindcss": "^4.3.2",
     "tsx": "^4.7.0",
     "typescript": "^6.0.3",

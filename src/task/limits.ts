@@ -1,4 +1,4 @@
-import type { TaskStoreFile } from './types';
+import type { TaskExecutionPolicy, TaskStoreFile } from './types';
 
 export interface ResourceLimits {
   maxDepth: number;
@@ -23,6 +23,77 @@ export const DEFAULT_RESOURCE_LIMITS: ResourceLimits = {
   maxResultBytes: 16_384,
   maxErrorBytes: 4_096,
 };
+
+/**
+ * Hard bounds applied to agent-supplied {@link TaskExecutionPolicy} values before
+ * they are persisted. An AI coordinator can request an arbitrary execution policy
+ * via the MCP bridge; without clamping it could set a multi-day turn/task timeout
+ * or an enormous turn budget (resource-exhaustion / DoS). Every field is clamped
+ * to `[min, max]` so the raw agent value is never trusted.
+ */
+export interface ExecutionPolicyBounds {
+  minTurnTimeoutMs: number;
+  maxTurnTimeoutMs: number;
+  minTaskTimeoutMs: number;
+  maxTaskTimeoutMs: number;
+  maxTurns: number;
+  maxAutomaticRetries: number;
+}
+
+export const DEFAULT_EXECUTION_POLICY_BOUNDS: ExecutionPolicyBounds = {
+  minTurnTimeoutMs: 1_000, // 1 second
+  maxTurnTimeoutMs: 1_800_000, // 30 minutes
+  minTaskTimeoutMs: 1_000, // 1 second
+  maxTaskTimeoutMs: 14_400_000, // 4 hours
+  maxTurns: 500,
+  maxAutomaticRetries: 20,
+};
+
+/**
+ * Independent hard cap on a bridge bearer token's lifetime. This is deliberately
+ * decoupled from {@link ExecutionPolicyBounds.maxTurnTimeoutMs}: even a large (but
+ * clamped) turn timeout must never mint a local credential that outlives this
+ * bound. See {@link bridgeTokenTtlMs}.
+ */
+export const MAX_BRIDGE_TOKEN_TTL_MS = 900_000; // 15 minutes
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
+/**
+ * Merge an agent-supplied (already type-validated) partial execution policy onto a
+ * trusted base and clamp every field to {@link ExecutionPolicyBounds}. The result
+ * is safe to persist: over-limit timeouts / turn budgets are reduced to the
+ * configured maxima and below-minimum timeouts are raised to the minima.
+ */
+export function clampExecutionPolicy(
+  base: TaskExecutionPolicy,
+  requested: Partial<TaskExecutionPolicy> | undefined,
+  bounds: ExecutionPolicyBounds = DEFAULT_EXECUTION_POLICY_BOUNDS,
+): TaskExecutionPolicy {
+  const merged = { ...base, ...requested };
+  return {
+    maxTurns: clamp(merged.maxTurns, 1, bounds.maxTurns),
+    maxAutomaticRetries: clamp(merged.maxAutomaticRetries, 0, bounds.maxAutomaticRetries),
+    turnTimeoutMs: clamp(merged.turnTimeoutMs, bounds.minTurnTimeoutMs, bounds.maxTurnTimeoutMs),
+    taskTimeoutMs: clamp(merged.taskTimeoutMs, bounds.minTaskTimeoutMs, bounds.maxTaskTimeoutMs),
+  };
+}
+
+/**
+ * TTL for a bridge bearer token, capped by an independent hard bound. Even a large
+ * (already clamped) turn timeout must never produce a token that lives longer than
+ * `maxTtlMs`, keeping local credentials short-lived. Negative/NaN inputs collapse
+ * to 0 (an immediately-expired token) rather than a long-lived one.
+ */
+export function bridgeTokenTtlMs(
+  turnTimeoutMs: number,
+  maxTtlMs: number = MAX_BRIDGE_TOKEN_TTL_MS,
+): number {
+  const requested = Number.isFinite(turnTimeoutMs) ? Math.max(0, turnTimeoutMs) : 0;
+  return Math.min(requested, maxTtlMs);
+}
 
 export type LimitKind =
   | 'depth'
