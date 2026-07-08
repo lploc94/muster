@@ -155,6 +155,33 @@ test.describe('Muster webview host state smoke', () => {
     });
   });
 
+  test('adds a file mention from the composer add-file button', async ({ page }) => {
+    await openWebview(page);
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [],
+      storeRevision: 2,
+    });
+
+    await page.locator('button[title="New task"]').first().click();
+    await expectPostedMessage(page, { type: 'newTask' });
+
+    await page.locator('button[title="Add file"]').click();
+    await expectPostedMessage(page, { type: 'pickFile' });
+
+    await postRawHostMessage(page, { type: 'filePicked', path: 'src/extension.ts' });
+    await expect(page.getByPlaceholder('Start a new coordinator task with claude…')).toHaveValue('@src/extension.ts ');
+
+    await page.getByPlaceholder('Start a new coordinator task with claude…').fill('Review @src/extension.ts');
+    await page.locator('button[title="Send"]').click();
+    await expectPostedMessage(page, {
+      type: 'send',
+      text: 'Review @src/extension.ts',
+      backend: 'claude',
+    });
+  });
+
   test('surfaces task-centric status feedback for active and failed tasks', async ({ page }) => {
     await openWebview(page);
 

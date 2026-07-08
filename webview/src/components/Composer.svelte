@@ -29,6 +29,7 @@
 
   let textareaEl = $state<(HTMLElement & { value: string }) | undefined>(undefined);
   let backendSelect = $state<(HTMLElement & { value: string }) | undefined>(undefined);
+  let isDraggingFile = $state(false);
 
   const statusBlocksSend = $derived(
     taskStatus === 'running' ||
@@ -50,6 +51,17 @@
   // Register select so resolveBackendForSend can read it for draft sends.
   $effect(() => {
     registerBackendSelect(backendSelect);
+  });
+
+  $effect(() => {
+    function onMessage(e: MessageEvent) {
+      const msg = e.data;
+      if (msg?.type !== 'filePicked' || typeof msg.path !== 'string') return;
+      insertFileMention(msg.path);
+    }
+
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
   });
 
   function send() {
@@ -83,6 +95,70 @@
   function cancel() {
     if (!canCancel || !taskId || !turnId) return;
     post({ type: 'cancelTurn', taskId, turnId });
+  }
+
+  function mentionForPath(path: string): string {
+    const normalized = path.trim().replace(/\\/g, '/');
+    if (!normalized) return '';
+    return /\s/.test(normalized) ? `@"${normalized}"` : `@${normalized}`;
+  }
+
+  function insertFileMention(path: string) {
+    if (!textareaEl || !canSend) return;
+    const mention = mentionForPath(path);
+    if (!mention) return;
+
+    const current = textareaEl.value ?? '';
+    const needsLeadingSpace = current.length > 0 && !/\s$/.test(current);
+    const next = `${current}${needsLeadingSpace ? ' ' : ''}${mention} `;
+    textareaEl.value = next;
+    textareaEl.focus?.();
+  }
+
+  function pickFile() {
+    if (!canSend) return;
+    post({ type: 'pickFile' });
+  }
+
+  function dragCandidates(dataTransfer: DataTransfer): string[] {
+    const candidates: string[] = [];
+    for (const file of Array.from(dataTransfer.files ?? [])) {
+      const path = (file as File & { path?: string }).path;
+      if (typeof path === 'string' && path) candidates.push(path);
+      if (file.name) candidates.push(file.name);
+    }
+    for (const type of dataTransfer.types ?? []) {
+      const value = dataTransfer.getData(type);
+      if (value) candidates.push(value);
+    }
+    return candidates;
+  }
+
+  function onDragOver(e: DragEvent) {
+    if (!canSend) return;
+    e.preventDefault();
+    isDraggingFile = true;
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+  }
+
+  function onDragLeave(e: DragEvent) {
+    if (!e.currentTarget || !e.relatedTarget) {
+      isDraggingFile = false;
+      return;
+    }
+    const current = e.currentTarget as Node;
+    const related = e.relatedTarget as Node;
+    if (!current.contains(related)) isDraggingFile = false;
+  }
+
+  function onDrop(e: DragEvent) {
+    if (!canSend || !e.dataTransfer) return;
+    e.preventDefault();
+    isDraggingFile = false;
+    const candidates = dragCandidates(e.dataTransfer);
+    if (candidates.length > 0) {
+      post({ type: 'resolveFileDrop', candidates });
+    }
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -126,7 +202,14 @@
   }
 </script>
 
-<div class="composer-shell border-t p-2 flex flex-col gap-2" style="border-color: var(--vscode-panel-border);">
+<div
+  class="composer-shell border-t p-2 flex flex-col gap-2"
+  class:composer-shell--dragging={isDraggingFile}
+  style="border-color: var(--vscode-panel-border);"
+  ondragover={onDragOver}
+  ondragleave={onDragLeave}
+  ondrop={onDrop}
+>
   {#if disabledReason}
     <div class="composer-guidance" role="note">{disabledReason}</div>
   {/if}
@@ -169,7 +252,14 @@
         </div>
       {/if}
 
-      <button type="button" class="icon-btn opacity-60" style="width: 20px; height: 20px;" title="Add context (coming soon)" disabled>
+      <button
+        type="button"
+        class="icon-btn"
+        style="width: 20px; height: 20px;"
+        title="Add file"
+        onclick={pickFile}
+        disabled={!canSend}
+      >
         <span class="codicon codicon-add"></span>
       </button>
 

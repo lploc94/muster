@@ -158,6 +158,100 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'commandError', taskId, message });
   }
 
+
+  private workspaceMentionForUri(uri: vscode.Uri): string | undefined {
+    const fsPath = uri.fsPath;
+    if (!fsPath) return undefined;
+
+    if (workspaceRoot) {
+      const relative = path.relative(workspaceRoot, fsPath);
+      if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) {
+        return relative.replace(/\\/g, '/');
+      }
+    }
+
+    const folder = vscode.workspace.getWorkspaceFolder(uri);
+    if (folder) {
+      const relative = path.relative(folder.uri.fsPath, fsPath);
+      if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) {
+        return relative.replace(/\\/g, '/');
+      }
+    }
+
+    return undefined;
+  }
+
+  private uriFromDroppedCandidate(candidate: string): vscode.Uri | undefined {
+    const trimmed = candidate.trim();
+    if (!trimmed || trimmed.startsWith('#')) return undefined;
+
+    try {
+      if (/^[a-z][a-z0-9+.-]*:/i.test(trimmed)) {
+        const uri = vscode.Uri.parse(trimmed);
+        if (uri.scheme === 'file' || uri.scheme === 'vscode-remote') {
+          return uri;
+        }
+      }
+    } catch {
+      // Fall back to path handling below.
+    }
+
+    if (path.isAbsolute(trimmed)) {
+      return vscode.Uri.file(trimmed);
+    }
+
+    if (workspaceRoot) {
+      const candidatePath = path.resolve(workspaceRoot, trimmed);
+      if (fs.existsSync(candidatePath)) {
+        return vscode.Uri.file(candidatePath);
+      }
+    }
+
+    return undefined;
+  }
+
+  private async handlePickFile(): Promise<void> {
+    const defaultUri = workspaceRoot ? vscode.Uri.file(workspaceRoot) : undefined;
+    const picked = await vscode.window.showOpenDialog({
+      canSelectFiles: true,
+      canSelectFolders: false,
+      canSelectMany: false,
+      defaultUri,
+      openLabel: 'Add file to chat',
+    });
+    const uri = picked?.[0];
+    if (!uri) return;
+
+    const mentionPath = this.workspaceMentionForUri(uri);
+    if (!mentionPath) {
+      this.postCommandError('Only workspace files can be added to chat.');
+      return;
+    }
+    this.post({ type: 'filePicked', path: mentionPath });
+  }
+
+  private handleResolveFileDrop(candidates: unknown): void {
+    if (!Array.isArray(candidates)) {
+      this.postCommandError('file drop did not include a valid file reference');
+      return;
+    }
+
+    for (const value of candidates) {
+      if (typeof value !== 'string') continue;
+      for (const candidate of value.split(/\r?\n/)) {
+        const uri = this.uriFromDroppedCandidate(candidate);
+        if (!uri) continue;
+        const mentionPath = this.workspaceMentionForUri(uri);
+        if (mentionPath) {
+          this.post({ type: 'filePicked', path: mentionPath });
+          return;
+        }
+      }
+    }
+
+    this.postCommandError('Drop a file from the current workspace to mention it in chat.');
+  }
+
   forwardTurnEvent(event: EngineEvent): void {
     switch (event.type) {
       case 'turnStart':
@@ -646,6 +740,12 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
               askId: data.askId,
             });
           }
+          break;
+        case 'pickFile':
+          await this.handlePickFile();
+          break;
+        case 'resolveFileDrop':
+          this.handleResolveFileDrop(data.candidates);
           break;
         case 'openLink':
           this.handleOpenLink(data.url);
