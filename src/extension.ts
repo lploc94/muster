@@ -39,6 +39,16 @@ let lastObservedRevision = 0;
 let lastObservedFile: TaskStoreFile | undefined;
 const activePendingAsks = new Map<string, PendingAskOverlay>();
 
+/**
+ * Host copy of the webview wire protocol version. The source of truth is
+ * PROTOCOL_VERSION in webview/src/lib/protocol.ts; the host cannot import that
+ * module because its graph has browser-only side effects (acquireVsCodeApi runs
+ * at import time), so the value is duplicated here. Keep the two in sync: the
+ * version is stamped on the bootstrap `snapshot` message, and a mismatch is
+ * surfaced in the webview as a visible "reload the window" banner.
+ */
+const PROTOCOL_VERSION = 2;
+
 /** How long a permission prompt waits for a webview decision before safe-denying. */
 const PERMISSION_PROMPT_TIMEOUT_MS = 120_000;
 /** Reject oversized inbound webview identifiers/option ids (defense-in-depth). */
@@ -290,7 +300,10 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     }
     const focus = focusedTaskId ?? this.focusedTaskId;
     const snapshot: TaskSnapshot = buildSnapshot(taskStore, focus, activePendingAsks);
-    this.post({ type: 'snapshot', ...snapshot });
+    // Stamp the wire version on the bootstrap message so the webview can detect
+    // host<->webview drift once (and show a reload banner) instead of silently
+    // dropping mismatched messages.
+    this.post({ type: 'snapshot', protocolVersion: PROTOCOL_VERSION, ...snapshot });
     if (focus) {
       this.focusedTaskId = focus;
     }
@@ -710,6 +723,12 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           break;
         case 'clearHistory':
           this.handleClearHistory();
+          break;
+        default:
+          // Unknown inbound type: log instead of silently ignoring. This surfaces
+          // host<->webview protocol drift (e.g. a newer webview sending a message
+          // type this host build predates) rather than dropping it without a trace.
+          console.warn(`Muster: ignoring unknown webview message type ${String(data?.type)}`);
           break;
       }
     });

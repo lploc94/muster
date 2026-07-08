@@ -6,12 +6,16 @@
   import PermissionCard from './components/PermissionCard.svelte';
   import { tasks } from './lib/tasks.svelte';
   import { threadStore } from './lib/thread.svelte';
-  import { isExtMessage, post, statusLabel } from './lib/protocol';
+  import { isExtMessage, isProtocolCompatible, post, statusLabel } from './lib/protocol';
   import type { PendingAsk, PendingPermission, TaskViewStatus } from './lib/protocol';
 
   let pendingAsk = $state<PendingAsk | null>(null);
   let pendingPermission = $state<PendingPermission | null>(null);
   let activeTurnId = $state<string | null>(null);
+  // Set when a bootstrap `snapshot` arrives stamped with a protocolVersion that
+  // differs from ours (host<->webview drift). Surfaces a visible banner instead
+  // of silently dropping the drifted message.
+  let protocolMismatch = $state(false);
 
   // When no focused task and not in draft, we show the previous tasks list as entry
   const inChat = $derived(tasks.draftMode || !!tasks.focusedTaskId);
@@ -70,6 +74,20 @@
   onMount(() => {
     function onMessage(e: MessageEvent) {
       const msg = e.data;
+
+      // Protocol-drift detection: the bootstrap `snapshot` carries the host's
+      // protocolVersion. Check it BEFORE the strict isExtMessage guard, because a
+      // drifted snapshot (shapes changed on the other side) may not pass that
+      // guard and would otherwise be silently dropped. A mismatch — or an absent
+      // version from an old host — raises a visible banner instead of proceeding.
+      if (msg && typeof msg === 'object' && (msg as { type?: unknown }).type === 'snapshot') {
+        if (!isProtocolCompatible((msg as { protocolVersion?: unknown }).protocolVersion)) {
+          protocolMismatch = true;
+          return;
+        }
+        protocolMismatch = false;
+      }
+
       if (!isExtMessage(msg)) return;
 
       switch (msg.type) {
@@ -183,6 +201,15 @@
 </script>
 
 <Toolbar {inChat} {historyOpen} toggleHistory={() => (historyOpen = !historyOpen)} />
+
+{#if protocolMismatch}
+  <div
+    class="px-3 py-1 text-xs"
+    style="color: var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground, transparent); border-bottom: 1px solid var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground));"
+  >
+    Muster: UI/host version mismatch — reload the window (Developer: Reload Window) to update the panel.
+  </div>
+{/if}
 
 {#if tasks.commandError}
   <div

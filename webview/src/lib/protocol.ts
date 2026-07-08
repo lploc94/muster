@@ -1,6 +1,29 @@
 import { vscode } from './vscode';
 import type { NormalizedEvent, Question } from './types';
 
+/**
+ * Wire protocol version for the host<->webview message channel ("protocol v2").
+ * Single source of truth: the webview imports this constant; the host keeps a
+ * duplicated copy in src/extension.ts because it cannot import this module (the
+ * module graph has browser-only side effects via acquireVsCodeApi). The version
+ * is stamped on the bootstrap `snapshot` message so either side can detect drift
+ * once, instead of silently dropping mismatched messages. Bump this on any
+ * breaking change to the ExtMessage/OutMessage shapes below (and mirror it in
+ * src/extension.ts).
+ */
+export const PROTOCOL_VERSION = 2;
+
+/**
+ * Decide whether a peer's advertised protocol version is compatible with ours.
+ * Same integer => compatible. A different version OR an absent/non-numeric one
+ * (an old peer that predates version stamping) => incompatible, so the caller
+ * can surface a visible "reload the window" diagnostic instead of silently
+ * proceeding against a drifted peer. Pure and side-effect free (unit-tested).
+ */
+export function isProtocolCompatible(theirVersion: unknown): boolean {
+  return theirVersion === PROTOCOL_VERSION;
+}
+
 export type TurnTrigger = 'user' | 'engine' | 'retry';
 
 export type TaskViewStatus =
@@ -65,6 +88,12 @@ export interface PendingPermission {
 
 export interface SnapshotMessage {
   type: 'snapshot';
+  /**
+   * Wire protocol version stamped by the host on this bootstrap message; see
+   * PROTOCOL_VERSION. Optional so an older host that predates version stamping
+   * still type-checks — its absence is treated as an (incompatible) mismatch.
+   */
+  protocolVersion?: number;
   rootTasks: TaskSummary[];
   focusedTaskId?: string;
   subtree?: TaskSummary[];
@@ -230,6 +259,7 @@ export function isExtMessage(data: unknown): data is ExtMessage {
   switch (t) {
     case 'snapshot':
       return (
+        (data.protocolVersion === undefined || isNumber(data.protocolVersion)) &&
         Array.isArray(data.rootTasks) &&
         data.rootTasks.every(isTaskSummary) &&
         isNumber(data.storeRevision) &&
