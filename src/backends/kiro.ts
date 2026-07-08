@@ -53,8 +53,8 @@ const KIRO_SPEC: AcpAdapterSpec = {
   idPrefix: 'kiro:',
   makeConfig: () => KIRO_AGENT_CONFIG,
   failureStopReasons: FAILURE_STOP_REASONS,
-  emptyChunk: 'raw',
-  mapUsageUpdate: false,
+  emptyChunk: 'drop',
+  mapUsageUpdate: true,
   usage: {
     source: 'meta',
     keys: ['totalTokens', 'inputTokens', 'outputTokens', 'cachedReadTokens', 'reasoningTokens', 'modelId'],

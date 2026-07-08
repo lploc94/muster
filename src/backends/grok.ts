@@ -4,7 +4,7 @@ import { ACP_CAPABILITIES, AcpAdapterSpec, runAcpTurn } from './acp-run';
 
 export { disposeSharedAcpClient };
 
-const FAILURE_STOP_REASONS = new Set(['refusal', 'error', 'max_tokens']);
+const FAILURE_STOP_REASONS = new Set(['refusal', 'error', 'max_tokens', 'max_turn_requests']);
 
 /** Shared ACP agent configuration for the Grok CLI (`grok agent stdio`). */
 export const GROK_AGENT_CONFIG: AcpAgentConfig = {
@@ -37,10 +37,10 @@ export const GROK_AGENT_CONFIG: AcpAgentConfig = {
 };
 
 /**
- * Grok's adapter spec. Grok surfaces empty agent chunks as raw, has no
- * `usage_update` case, reads post-turn usage from `result._meta` (no
- * `thoughtTokens`), classifies tool kind from `_meta['x.ai/tool']`, and its
- * FAILURE set omits `max_turn_requests` (a known drift vs the other adapters).
+ * Grok's adapter spec. Grok reads post-turn usage from `result._meta` (no
+ * `thoughtTokens`) and classifies tool kind from `_meta['x.ai/tool']` — genuine
+ * per-CLI differences that are kept. Its empty-chunk handling, `usage_update`
+ * mapping, and FAILURE set were normalized to the shared reference behavior.
  */
 const GROK_SPEC: AcpAdapterSpec = {
   name: 'grok',
@@ -48,8 +48,8 @@ const GROK_SPEC: AcpAdapterSpec = {
   idPrefix: 'grok:',
   makeConfig: () => GROK_AGENT_CONFIG,
   failureStopReasons: FAILURE_STOP_REASONS,
-  emptyChunk: 'raw',
-  mapUsageUpdate: false,
+  emptyChunk: 'drop',
+  mapUsageUpdate: true,
   usage: {
     source: 'meta',
     keys: ['totalTokens', 'inputTokens', 'outputTokens', 'cachedReadTokens', 'reasoningTokens', 'modelId'],

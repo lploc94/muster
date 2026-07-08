@@ -241,12 +241,18 @@ describe('KiroBackend.run — tool events', () => {
   });
 });
 
-describe('KiroBackend.run — usage (drift: no usage_update case, post-turn usage from _meta)', () => {
-  it('drift #3: has NO usage_update case — falls through to raw and emits no usage event', async () => {
-    const update = { sessionUpdate: 'usage_update', used: 10, size: 100 };
-    const events = await runTurn(new KiroBackend(), options(), fake, { updates: [update] });
-    expect(events).toContainEqual({ type: 'raw', line: JSON.stringify(update) });
-    expect(events.some((e) => e.type === 'usage')).toBe(false);
+describe('KiroBackend.run — usage (post-turn usage from _meta)', () => {
+  it('maps usage_update to a usage event (used/size) before the terminal', async () => {
+    // Normalized (4b): Kiro previously had no usage_update case (fell through to
+    // raw); it now maps usage_update like the reference adapter.
+    const events = await runTurn(new KiroBackend(), options(), fake, {
+      updates: [{ sessionUpdate: 'usage_update', used: 10, size: 100 }],
+    });
+    const usageIdx = events.findIndex((e) => e.type === 'usage');
+    const termIdx = events.findIndex((e) => e.type === 'turnCompleted');
+    expect(usageIdx).toBeGreaterThanOrEqual(0);
+    expect(events[usageIdx]).toEqual({ type: 'usage', usage: { used: 10, size: 100 } });
+    expect(usageIdx).toBeLessThan(termIdx);
   });
 
   it('drift #4: emits a usage event from result._meta, picking only the whitelisted keys (thoughtTokens dropped)', async () => {
@@ -348,19 +354,23 @@ describe('KiroBackend.run — terminal classification', () => {
   });
 });
 
-describe('KiroBackend.run — empty/unknown chunk handling (drift: kiro emits raw for empties)', () => {
-  it('drift #2: emits raw (not dropped) for an empty-string assistant chunk', async () => {
-    const update = { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '' } };
-    const events = await runTurn(new KiroBackend(), options(), fake, { updates: [update] });
+describe('KiroBackend.run — empty/unknown chunk handling', () => {
+  it('drops an empty-string assistant chunk (no assistantDelta, no raw)', async () => {
+    // Normalized (4b): Kiro previously surfaced empty chunks as raw noise; it now
+    // drops them like the reference adapter.
+    const events = await runTurn(new KiroBackend(), options(), fake, {
+      updates: [{ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '' } }],
+    });
     expect(events.some((e) => e.type === 'assistantDelta')).toBe(false);
-    expect(events).toContainEqual({ type: 'raw', line: JSON.stringify(update) });
+    expect(events.some((e) => e.type === 'raw')).toBe(false);
   });
 
-  it('drift #2: emits raw (not dropped) for an empty-string thought chunk', async () => {
-    const update = { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: '' } };
-    const events = await runTurn(new KiroBackend(), options(), fake, { updates: [update] });
+  it('drops an empty-string thought chunk', async () => {
+    const events = await runTurn(new KiroBackend(), options(), fake, {
+      updates: [{ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: '' } }],
+    });
     expect(events.some((e) => e.type === 'reasoningDelta')).toBe(false);
-    expect(events).toContainEqual({ type: 'raw', line: JSON.stringify(update) });
+    expect(events.some((e) => e.type === 'raw')).toBe(false);
   });
 
   it('emits raw for a recognized chunk with a non-string text shape', async () => {

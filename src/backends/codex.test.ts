@@ -288,19 +288,23 @@ describe('CodexBackend.run — terminal classification', () => {
   });
 });
 
-describe('CodexBackend.run — empty/unknown chunk handling (drift: codex emits raw for empties)', () => {
-  it('emits raw for an empty-string assistant chunk (no assistantDelta)', async () => {
-    const update = { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '' } };
-    const events = await runTurn(new CodexBackend(), options(), fake, { updates: [update] });
+describe('CodexBackend.run — empty/unknown chunk handling', () => {
+  it('drops an empty-string assistant chunk (no assistantDelta, no raw)', async () => {
+    // Normalized (4b): Codex previously surfaced empty chunks as raw noise; it now
+    // drops them like the reference adapter.
+    const events = await runTurn(new CodexBackend(), options(), fake, {
+      updates: [{ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '' } }],
+    });
     expect(events.some((e) => e.type === 'assistantDelta')).toBe(false);
-    expect(events).toContainEqual({ type: 'raw', line: JSON.stringify(update) });
+    expect(events.some((e) => e.type === 'raw')).toBe(false);
   });
 
-  it('emits raw for an empty-string thought chunk (no reasoningDelta)', async () => {
-    const update = { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: '' } };
-    const events = await runTurn(new CodexBackend(), options(), fake, { updates: [update] });
+  it('drops an empty-string thought chunk', async () => {
+    const events = await runTurn(new CodexBackend(), options(), fake, {
+      updates: [{ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: '' } }],
+    });
     expect(events.some((e) => e.type === 'reasoningDelta')).toBe(false);
-    expect(events).toContainEqual({ type: 'raw', line: JSON.stringify(update) });
+    expect(events.some((e) => e.type === 'raw')).toBe(false);
   });
 
   it('emits raw for a recognized chunk with a non-string text shape', async () => {

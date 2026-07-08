@@ -76,7 +76,7 @@ const CODEX_SPEC: AcpAdapterSpec = {
   idPrefix: 'codex:',
   makeConfig: codexAgentConfig,
   failureStopReasons: FAILURE_STOP_REASONS,
-  emptyChunk: 'raw',
+  emptyChunk: 'drop',
   mapUsageUpdate: true,
   usage: {
     source: 'result',
