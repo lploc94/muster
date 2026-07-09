@@ -5,6 +5,8 @@
   import { getTaskStatusPresentation, isTaskStatusTerminal } from '../lib/task-status';
   import type { PendingAsk, TaskViewStatus } from '../lib/protocol';
   import type { WebviewBackendId } from '../lib/tasks.svelte';
+  import { BACKENDS, backendShortLabel } from '../lib/backends';
+  import { tip } from '../lib/tooltip';
 
   interface Props {
     mode: 'draft' | 'task';
@@ -229,26 +231,24 @@
         <vscode-single-select
           bind:this={backendSelect}
           value={currentBackend}
-          title="Select CLI / model for new task"
+          use:tip={'Select CLI / model for new task'}
           disabled={thread.running}
           position="above"
           onchange={onBackendChange}
           oninput={onBackendChange}
           style="width: fit-content; min-width: fit-content;"
         >
-          <vscode-option value="claude">Claude</vscode-option>
-          <vscode-option value="grok">Grok</vscode-option>
-          <vscode-option value="kiro">Kiro</vscode-option>
-          <vscode-option value="codex">Codex</vscode-option>
-          <vscode-option value="opencode">OpenCode</vscode-option>
+          {#each BACKENDS as be (be.id)}
+            <vscode-option value={be.id}>{be.label}</vscode-option>
+          {/each}
         </vscode-single-select>
       {:else}
         <div
           class="px-2 py-0.5 text-xs rounded border truncate"
           style="border-color: var(--vscode-panel-border); opacity: 0.85;"
-          title="Backend for this task"
+          use:tip={'Backend for this task'}
         >
-          {currentBackend}
+          {backendShortLabel(currentBackend)}
         </div>
       {/if}
 
@@ -256,25 +256,48 @@
         type="button"
         class="icon-btn"
         style="width: 20px; height: 20px;"
-        title="Add file"
+        aria-label="Add file"
+        use:tip={'Add file'}
         onclick={pickFile}
         disabled={!canSend}
       >
         <span class="codicon codicon-add"></span>
       </button>
 
-      <button type="button" class="icon-btn opacity-60" style="width: 20px; height: 20px;" title="Config" disabled>
+      <!-- Config button (placeholder) -->
+      <button
+        type="button"
+        class="icon-btn opacity-60"
+        style="width: 20px; height: 20px;"
+        aria-label="Config"
+        use:tip={'Config'}
+        disabled
+      >
         <span class="codicon codicon-gear"></span>
       </button>
     </div>
 
     <div class="flex items-center gap-2">
       {#if canCancel}
-        <button type="button" class="icon-btn" style="width: 28px; height: 28px;" onclick={cancel} title="Stop">
+        <button
+          type="button"
+          class="icon-btn"
+          style="width: 28px; height: 28px;"
+          onclick={cancel}
+          aria-label="Stop"
+          use:tip={'Stop'}
+        >
           <span class="codicon codicon-debug-stop"></span>
         </button>
       {:else if canSend}
-        <button type="button" class="icon-btn" style="width: 28px; height: 28px;" onclick={send} title="Send">
+        <button
+          type="button"
+          class="icon-btn"
+          style="width: 28px; height: 28px;"
+          onclick={send}
+          aria-label="Send"
+          use:tip={'Send'}
+        >
           <span class="codicon codicon-send"></span>
         </button>
       {:else if taskStatus === 'queued' && turnId}
@@ -282,7 +305,14 @@
       {:else if taskStatus === 'needs_recovery' && !turnId}
         <span class="task-muted text-xs">Recovery actions need a retryable turn.</span>
       {:else if thread.running}
-        <button type="button" class="icon-btn" style="width: 28px; height: 28px;" disabled title="Running…">
+        <button
+          type="button"
+          class="icon-btn"
+          style="width: 28px; height: 28px;"
+          disabled
+          aria-label="Running…"
+          use:tip={'Running…'}
+        >
           <span class="codicon codicon-loading"></span>
         </button>
       {/if}

@@ -4,6 +4,7 @@
   import { backendIcon, backendLabel } from '../lib/backends';
   import MessageBubble from './MessageBubble.svelte';
   import ToolCard from './ToolCard.svelte';
+  import { tip } from '../lib/tooltip';
 
   const thread = $derived(threadStore.current);
   const currentBackend = $derived(tasks.focusedTask?.backend ?? 'unknown');
@@ -70,11 +71,11 @@
         {@const turnId = item.kind === 'assistant' || item.kind === 'tool' ? item.turnId : undefined}
         <div class="flex items-center gap-1.5 mb-1">
           <div
-            class="flex-shrink-0 w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-mono font-bold border"
+            class="flex-shrink-0 w-5 h-5 rounded-full flex items-center justify-center border"
             style="border-color: var(--vscode-panel-border); color: var(--vscode-foreground); background: var(--vscode-editor-background);"
-            title={currentBackend || 'assistant'}
+            use:tip={currentBackend || 'assistant'}
           >
-            {backendIcon(currentBackend)}
+            <span class="codicon {backendIcon(currentBackend)} text-[13px]"></span>
           </div>
           <span class="text-[11px] opacity-70 font-medium">{backendLabel(currentBackend)}</span>
         </div>
@@ -110,11 +111,11 @@
       {#if lastItem?.kind === 'user' || thread.items.length === 0}
         <div class="flex items-center gap-1.5 mb-1">
           <div
-            class="flex-shrink-0 w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-mono font-bold border"
+            class="flex-shrink-0 w-5 h-5 rounded-full flex items-center justify-center border"
             style="border-color: var(--vscode-panel-border); color: var(--vscode-foreground); background: var(--vscode-editor-background);"
-            title={currentBackend || 'assistant'}
+            use:tip={currentBackend || 'assistant'}
           >
-            {backendIcon(currentBackend)}
+            <span class="codicon {backendIcon(currentBackend)} text-[13px]"></span>
           </div>
           <span class="text-[11px] opacity-70 font-medium">{backendLabel(currentBackend)}</span>
         </div>
@@ -140,7 +141,8 @@
       type="button"
       class="absolute bottom-2 right-3 icon-btn shadow"
       style="width: 30px; height: 30px; border-radius: 999px; background: var(--vscode-editor-background); border: 1px solid var(--vscode-panel-border);"
-      title="Scroll to latest"
+      aria-label="Scroll to latest"
+      use:tip={'Scroll to latest'}
       onclick={scrollToBottom}
     >
       <span class="codicon codicon-arrow-down"></span>

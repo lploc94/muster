@@ -146,7 +146,10 @@ export type OutMessage =
   | { type: 'pickFile' }
   | { type: 'resolveFileDrop'; candidates: string[] }
   | { type: 'openLink'; url: string }
-  | { type: 'clearHistory' };
+  | { type: 'clearHistory' }
+  | { type: 'deleteTask'; taskId: string }
+  | { type: 'renameTask'; taskId: string; goal: string }
+  | { type: 'blurTask' };
 
 /** Post a typed message to the extension host. */
 export function post(message: OutMessage): void {
@@ -332,5 +335,6 @@ export function isTerminalStatus(status: TaskViewStatus): boolean {
 }
 
 export function statusLabel(status: TaskViewStatus): string {
-  return status.replace(/_/g, ' ');
+  const s = status.replace(/_/g, ' ');
+  return s.charAt(0).toUpperCase() + s.slice(1);
 }

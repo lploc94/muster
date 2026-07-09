@@ -1,6 +1,5 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import Toolbar from './components/Toolbar.svelte';
   import TaskHistoryList from './components/TaskList.svelte';
   import TaskWorkspace from './components/TaskWorkspace.svelte';
   import PermissionCard from './components/PermissionCard.svelte';
@@ -8,6 +7,7 @@
   import { threadStore } from './lib/thread.svelte';
   import { isExtMessage, isProtocolCompatible, post, statusLabel } from './lib/protocol';
   import type { PendingAsk, PendingPermission, TaskViewStatus } from './lib/protocol';
+  import { tip } from './lib/tooltip';
 
   let pendingAsk = $state<PendingAsk | null>(null);
   let pendingPermission = $state<PendingPermission | null>(null);
@@ -69,11 +69,22 @@
     post({ type: 'clearHistory' });
   }
 
+  function deleteTask(taskId: string) {
+    post({ type: 'deleteTask', taskId });
+  }
+
+  function renameTask(taskId: string, goal: string) {
+    post({ type: 'renameTask', taskId, goal });
+  }
+
   function backToList() {
     tasks.focusedTaskId = null;
     tasks.draftMode = false;
     threadStore.clearFocus();
     historyOpen = false;
+    // Tell the host we left the chat so it drops its focus; otherwise a later
+    // snapshot (e.g. after Clear history) would re-open the stale chat.
+    post({ type: 'blurTask' });
   }
 
   onMount(() => {
@@ -211,8 +222,6 @@
   });
 </script>
 
-<Toolbar {inChat} {historyOpen} toggleHistory={() => (historyOpen = !historyOpen)} />
-
 {#if protocolMismatch}
   <div
     class="px-3 py-1 text-xs"
@@ -247,21 +256,23 @@
 {/if}
 
 {#if !inChat}
-  <!-- Entry: show previous coordinator tasks -->
-  <div class="flex-1 min-h-0 flex flex-col p-3">
-    <div class="flex items-center justify-between mb-2 px-1">
-      <span class="font-semibold">Previous tasks</span>
-      <button
-        type="button"
-        class="icon-btn"
-        style="width: 22px; height: 22px;"
-        onclick={() => { tasks.openNewTaskDraft(); post({ type: 'newTask' }); historyOpen = false; }}
-        title="New task"
-      >
-        <span class="codicon codicon-add"></span>
-      </button>
-    </div>
-    <TaskHistoryList variant="full" onSelect={(id) => { selectTask(id); historyOpen = false; }} onClear={clearHistory} />
+  <!-- Entry: New task action, then the searchable previous-tasks list -->
+  <div class="flex-1 min-h-0 flex flex-col">
+    <button
+      type="button"
+      class="shrink-0 flex items-center gap-2 px-3 py-2 text-sm font-medium w-full text-left hover:bg-[var(--vscode-list-hoverBackground)]"
+      onclick={() => { tasks.openNewTaskDraft(); post({ type: 'newTask' }); historyOpen = false; }}
+    >
+      <span class="codicon codicon-add" style="font-size: 16px;"></span>
+      <span>New task</span>
+    </button>
+    <div class="shrink-0" style="border-top: 1px solid var(--vscode-panel-border);"></div>
+    <TaskHistoryList
+      variant="full"
+      onSelect={(id) => { selectTask(id); historyOpen = false; }}
+      onDelete={deleteTask}
+      onRename={renameTask}
+    />
   </div>
 {:else}
   <div class="flex-1 min-h-0 flex flex-col relative">
@@ -277,7 +288,8 @@
           class="icon-btn"
           style="width: 22px; height: 22px;"
           onclick={backToList}
-          title="Back to tasks list"
+          aria-label="Back to tasks list"
+          use:tip={'Back to tasks list'}
         >
           <span class="codicon codicon-arrow-left"></span>
         </button>
@@ -289,7 +301,8 @@
           class="icon-btn"
           style="width: 22px; height: 22px;"
           onclick={() => (historyOpen = !historyOpen)}
-          title="History (previous coordinator tasks)"
+          aria-label="History (previous coordinator tasks)"
+          use:tip={'History (previous coordinator tasks)'}
         >
           <span class="codicon codicon-history"></span>
         </button>
@@ -299,7 +312,8 @@
           class="icon-btn"
           style="width: 22px; height: 22px;"
           onclick={() => { tasks.openNewTaskDraft(); post({ type: 'newTask' }); historyOpen = false; }}
-          title="New task"
+          aria-label="New task"
+          use:tip={'New task'}
         >
           <span class="codicon codicon-add"></span>
         </button>
@@ -307,22 +321,22 @@
 
       <!-- Row 2: task name + status (below, left-aligned) -->
       {#if tasks.focusedTask}
-        <div class="flex items-center gap-2 px-3 pb-1.5 text-sm" style="border-top: 1px solid var(--vscode-panel-border);">
-          <span class="font-semibold truncate" title={tasks.focusedTask.goal}>
+        <div class="flex items-center gap-2 px-3 py-1.5 text-sm" style="border-top: 1px solid var(--vscode-panel-border);">
+          <span class="font-semibold truncate" use:tip={tasks.focusedTask.goal}>
             {shortGoal(tasks.focusedTask.goal)}
           </span>
           <span 
             class="codicon {statusIcon(tasks.focusedTask.viewStatus)}" 
             style="font-size: 14px; vertical-align: middle; margin-left: 4px;"
-            title={statusLabel(tasks.focusedTask.viewStatus)}
+            use:tip={statusLabel(tasks.focusedTask.viewStatus)}
           ></span>
         </div>
       {:else if tasks.draftMode}
-        <div class="flex items-center gap-2 px-3 pb-1.5 text-sm" style="border-top: 1px solid var(--vscode-panel-border);">
-          <span class="font-semibold">
+        <div class="flex flex-col px-3 py-1.5" style="border-top: 1px solid var(--vscode-panel-border);">
+          <span class="text-sm font-semibold leading-tight">
             {tasks.continuationOf ? 'Continue as new task' : 'New task'}
           </span>
-          <span class="text-xs" style="opacity: 0.7;">First message creates the coordinator task.</span>
+          <span class="text-xs leading-tight" style="opacity: 0.6; margin-top: 2px;">First message creates the coordinator task.</span>
         </div>
       {/if}
     </div>
@@ -347,7 +361,7 @@
           <span class="font-medium">Previous tasks</span>
           <button type="button" class="underline text-xs" onclick={() => { clearHistory(); }}>Clear</button>
         </div>
-        <TaskHistoryList variant="dropdown" onSelect={(id) => { selectTask(id); }} onClear={() => { clearHistory(); }} />
+        <TaskHistoryList variant="dropdown" onSelect={(id) => { selectTask(id); }} />
       </div>
     {/if}
   </div>

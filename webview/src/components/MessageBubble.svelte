@@ -1,6 +1,7 @@
 <script lang="ts">
   import { post } from '../lib/protocol';
   import { renderMarkdown } from '../lib/markdown';
+  import { tip } from '../lib/tooltip';
 
   interface Props {
     role: 'user' | 'assistant';
@@ -51,7 +52,7 @@
       const btn = document.createElement('button');
       btn.className = 'code-copy-btn';
       btn.type = 'button';
-      btn.title = 'Copy code';
+      btn.setAttribute('aria-label', 'Copy code');
       btn.innerHTML = '<span class="codicon codicon-copy"></span>';
       pre.appendChild(btn);
     });
@@ -124,7 +125,8 @@
         <button
           type="button"
           class="icon-btn text-xs opacity-60 hover:opacity-100"
-          title={copied ? 'Copied!' : 'Copy message'}
+          aria-label={copied ? 'Copied!' : 'Copy message'}
+          use:tip={copied ? 'Copied!' : 'Copy message'}
           onclick={copyMessage}
         >
           <span class="codicon {copied ? 'codicon-check' : 'codicon-copy'}"></span>

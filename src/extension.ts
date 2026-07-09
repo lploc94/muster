@@ -18,8 +18,8 @@ import {
 } from './host/snapshot';
 import { SESSION_MIGRATION_MARKER, migrateLegacySessions } from './task/migration-sessions';
 import { applyRetention, retentionChanged, type RetentionConfig } from './task/retention';
-import { TaskEngine, type EngineEvent } from './task/engine';
-import { TaskStore, computeAffectedTaskIds } from './task/store';
+import { TaskEngine, type EngineEvent, viewStatusFromDraft } from './task/engine';
+import { TaskStore, computeAffectedTaskIds, type CommitResult } from './task/store';
 import { isTerminalLifecycle } from './task/transitions';
 import { resolveWorkspaceCwd } from './task/workspace-cwd';
 import type { TaskStoreFile } from './task/types';
@@ -424,76 +424,175 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     void vscode.env.openExternal(parsed);
   }
 
+  /**
+   * A task is removable only if it is idle or terminal (not actively working)
+   * and it is not the currently focused task. Removability is derived from the
+   * fresh `draft` (via viewStatusFromDraft) so the check is consistent with the
+   * exact bytes a commit is about to write — see the guard-inside-commit note on
+   * handleDeleteTask/handleClearHistory.
+   */
+  private isDraftTaskRemovable(draft: TaskStoreFile, id: string, focus: string | undefined): boolean {
+    if (id === focus) return false;
+    const viewStatus = viewStatusFromDraft(draft, id);
+    return (
+      viewStatus === 'idle' ||
+      viewStatus === 'succeeded' ||
+      viewStatus === 'failed' ||
+      viewStatus === 'cancelled' ||
+      viewStatus === 'skipped'
+    );
+  }
+
+  /** Index children by parent id so whole subtrees can be inspected. */
+  private buildChildrenIndex(tasks: TaskStoreFile['tasks']): Map<string, string[]> {
+    const childrenOf = new Map<string, string[]>();
+    for (const t of Object.values(tasks)) {
+      if (t.parentId) {
+        const list = childrenOf.get(t.parentId);
+        if (list) list.push(t.id);
+        else childrenOf.set(t.parentId, [t.id]);
+      }
+    }
+    return childrenOf;
+  }
+
+  /**
+   * Return every task id in the subtree rooted at `rootId` IF every task in it
+   * is removable; otherwise null. A root can be idle/terminal while a delegated
+   * child is still queued/running, and deleting the subtree would otherwise nuke
+   * that in-flight work — so the whole subtree must be clear before removal.
+   */
+  private removableSubtree(
+    draft: TaskStoreFile,
+    rootId: string,
+    childrenOf: Map<string, string[]>,
+    focus: string | undefined,
+  ): string[] | null {
+    const subtree: string[] = [];
+    const stack: string[] = [rootId];
+    while (stack.length > 0) {
+      const id = stack.pop()!;
+      subtree.push(id);
+      if (!this.isDraftTaskRemovable(draft, id, focus)) return null;
+      for (const child of childrenOf.get(id) ?? []) stack.push(child);
+    }
+    return subtree;
+  }
+
+  /**
+   * Mutate `draft` in place: delete the given task ids and their
+   * turns/messages/toolCalls/reasoning. Called from inside a `commit` callback
+   * (operations/cancelRequests are turn-keyed or ledger; safe to leave).
+   */
+  private applyTaskDeletion(draft: TaskStoreFile, ids: Iterable<string>): void {
+    const idSet = ids instanceof Set ? (ids as Set<string>) : new Set(ids);
+    for (const id of idSet) {
+      delete draft.tasks[id];
+      for (const turnId of Object.keys(draft.turns)) {
+        if (draft.turns[turnId].taskId === id) delete draft.turns[turnId];
+      }
+      for (const msgId of Object.keys(draft.messages)) {
+        if (draft.messages[msgId].taskId === id) delete draft.messages[msgId];
+      }
+      if (draft.toolCalls) {
+        for (const key of Object.keys(draft.toolCalls)) {
+          if (draft.toolCalls[key].taskId === id) delete draft.toolCalls[key];
+        }
+      }
+      if (draft.reasoning) {
+        for (const key of Object.keys(draft.reasoning)) {
+          if (draft.reasoning[key].taskId === id) delete draft.reasoning[key];
+        }
+      }
+    }
+    // ensure optionals exist
+    draft.operations = draft.operations ?? {};
+    draft.cancelRequests = draft.cancelRequests ?? {};
+  }
+
+  /** Surface a failed commit as a command error. Returns true when it failed. */
+  private reportCommitFailure(result: CommitResult): boolean {
+    if (result.ok) return false;
+    this.postCommandError(result.detail ?? `store ${result.reason}`);
+    return true;
+  }
+
   private handleClearHistory(): void {
     if (!taskStore) {
       this.postCommandError('task store not ready');
       return;
     }
-    const file = taskStore.getFile();
     const focus = this.focusedTaskId;
-
-    // Collect terminal root tasks to remove (except the currently focused one)
-    // Only coordinators (parentId null). Preserve running / non-terminal.
-    const toRemoveRoots: string[] = [];
-    for (const task of Object.values(file.tasks)) {
-      if (task.parentId !== null) continue;
-      if (task.id === focus) continue;
-      const isTerminal = task.lifecycle === 'succeeded' || task.lifecycle === 'failed' || task.lifecycle === 'cancelled' || task.lifecycle === 'skipped';
-      if (isTerminal) {
-        toRemoveRoots.push(task.id);
+    let focusRemoved = false;
+    // Compute removable subtrees INSIDE the commit against the fresh `draft` that
+    // commit re-reads under the store lock. Deciding on the pre-commit snapshot
+    // would be TOCTOU-unsafe: another window could add a delegated descendant or
+    // flip a task to running between the check and the write, orphaning the child
+    // or deleting active work.
+    const result = taskStore.commit((draft) => {
+      const childrenOf = this.buildChildrenIndex(draft.tasks);
+      const toRemove = new Set<string>();
+      for (const task of Object.values(draft.tasks)) {
+        if (task.parentId !== null) continue;
+        const subtree = this.removableSubtree(draft, task.id, childrenOf, focus);
+        if (subtree) for (const id of subtree) toRemove.add(id);
       }
-    }
-
-    if (toRemoveRoots.length === 0) {
-      // nothing to clear, refresh anyway
-      this.postSnapshot(focus);
-      return;
-    }
-
-    // Collect full subtrees for removal
-    const toRemove = new Set<string>();
-    const queue = [...toRemoveRoots];
-    while (queue.length > 0) {
-      const id = queue.shift()!;
-      if (toRemove.has(id)) continue;
-      toRemove.add(id);
-      for (const t of Object.values(file.tasks)) {
-        if (t.parentId === id) queue.push(t.id);
-      }
-    }
-
-    taskStore.commit((draft) => {
-      for (const id of toRemove) {
-        delete draft.tasks[id];
-        // remove related turns and messages (operations/cancelRequests are turn-keyed or ledger; safe to leave)
-        for (const turnId of Object.keys(draft.turns)) {
-          if (draft.turns[turnId].taskId === id) delete draft.turns[turnId];
-        }
-        for (const msgId of Object.keys(draft.messages)) {
-          if (draft.messages[msgId].taskId === id) delete draft.messages[msgId];
-        }
-        if (draft.toolCalls) {
-          for (const key of Object.keys(draft.toolCalls)) {
-            if (draft.toolCalls[key].taskId === id) delete draft.toolCalls[key];
-          }
-        }
-        if (draft.reasoning) {
-          for (const key of Object.keys(draft.reasoning)) {
-            if (draft.reasoning[key].taskId === id) delete draft.reasoning[key];
-          }
-        }
-      }
-      // ensure optionals exist
-      draft.operations = draft.operations ?? {};
-      draft.cancelRequests = draft.cancelRequests ?? {};
+      if (toRemove.size === 0) return { ok: true }; // nothing removable — no-op
+      this.applyTaskDeletion(draft, toRemove);
+      if (focus && toRemove.has(focus)) focusRemoved = true;
       return { ok: true };
     });
+    if (this.reportCommitFailure(result)) return;
+    if (focusRemoved) this.focusedTaskId = undefined;
+    this.postSnapshot(this.focusedTaskId);
+  }
 
-    // If focused was removed (shouldn't), clear it
-    if (focus && toRemove.has(focus)) {
-      this.focusedTaskId = undefined;
+  /** Delete a single top-level task (and its whole subtree) from history. */
+  private handleDeleteTask(taskId: string): void {
+    if (!taskStore) {
+      this.postCommandError('task store not ready');
+      return;
     }
+    const focus = this.focusedTaskId;
+    let focusRemoved = false;
+    // Validate + delete atomically against the fresh `draft` (see handleClearHistory).
+    const result = taskStore.commit((draft) => {
+      const task = draft.tasks[taskId];
+      if (!task) return { ok: true }; // already gone — no-op
+      if (task.parentId !== null) return { ok: false, reason: 'Only top-level tasks can be deleted.' };
+      const childrenOf = this.buildChildrenIndex(draft.tasks);
+      const subtree = this.removableSubtree(draft, taskId, childrenOf, focus);
+      if (!subtree) {
+        return { ok: false, reason: 'Cannot delete a task while it or a subtask is still running.' };
+      }
+      this.applyTaskDeletion(draft, subtree);
+      if (focus && subtree.includes(focus)) focusRemoved = true;
+      return { ok: true };
+    });
+    if (this.reportCommitFailure(result)) return;
+    if (focusRemoved) this.focusedTaskId = undefined;
+    this.postSnapshot(this.focusedTaskId);
+  }
 
+  /** Rename a task by replacing its goal (the display label). */
+  private handleRenameTask(taskId: string, goal: string): void {
+    if (!taskStore) {
+      this.postCommandError('task store not ready');
+      return;
+    }
+    const trimmed = goal.trim();
+    if (!trimmed) {
+      this.postCommandError('Task name cannot be empty.');
+      return;
+    }
+    const capped = trimmed.length > MAX_MESSAGE_CHARS ? trimmed.slice(0, MAX_MESSAGE_CHARS) : trimmed;
+    const result = taskStore.commit((draft) => {
+      const t = draft.tasks[taskId];
+      if (!t) return { ok: true }; // gone — no-op
+      t.goal = capped;
+      return { ok: true };
+    });
+    if (this.reportCommitFailure(result)) return;
     this.postSnapshot(this.focusedTaskId);
   }
 
@@ -823,6 +922,21 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           break;
         case 'clearHistory':
           this.handleClearHistory();
+          break;
+        case 'deleteTask':
+          if (typeof data.taskId === 'string') {
+            this.handleDeleteTask(data.taskId);
+          }
+          break;
+        case 'renameTask':
+          if (typeof data.taskId === 'string' && typeof data.goal === 'string') {
+            this.handleRenameTask(data.taskId, data.goal);
+          }
+          break;
+        case 'blurTask':
+          // Webview returned to the task list; drop the host-side focus so a
+          // later snapshot (e.g. after Clear history) doesn't re-open a stale chat.
+          this.focusedTaskId = undefined;
           break;
         default:
           // Unknown inbound type: log instead of silently ignoring. This surfaces
