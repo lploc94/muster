@@ -48,6 +48,8 @@ export interface MusterTask {
   dependencies: TaskDependency[];
   wait?: PersistedWait;
   backend: string;
+  /** Optional model id selected for this task (ACP session config option value). */
+  model?: string;
   /**
    * Backend conversation session for this task. Set after a successful turn
    * (session/new or session/load). Next turns pass it as resumeId — process may

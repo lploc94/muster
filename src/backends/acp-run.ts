@@ -1,6 +1,12 @@
 import { randomUUID } from 'crypto';
 import { BackendCapabilities, NormalizedEvent, RunOptions } from '../types';
-import { AcpAgentConfig, PromptResult, SessionUpdate, getSharedAcpClient } from './acp-client';
+import {
+  AcpAgentConfig,
+  type AcpModelConfig,
+  PromptResult,
+  SessionUpdate,
+  getSharedAcpClient,
+} from './acp-client';
 
 /**
  * Shared ACP turn runner.
@@ -48,6 +54,8 @@ export interface AcpAdapterSpec {
   readonly toolKind: (update: SessionUpdate) => 'mcp' | 'builtin';
   /** Error messages containing any of these substrings pass through the catch unwrapped (no `<Label> ACP error:` prefix). */
   readonly errorPassthrough: readonly string[];
+  /** Config option id used for model selection (default `'model'`); passed as `configId` to `session/set_config_option`. */
+  readonly modelConfigId?: string;
 }
 
 /** Every ACP adapter advertises the same capabilities. */
@@ -205,6 +213,7 @@ export async function* runAcpTurn(
   const client = getSharedAcpClient(spec.makeConfig());
 
   let activeSessionId: string | undefined;
+  let modelConfig: AcpModelConfig | undefined;
   let unregister: (() => void) | undefined;
   let unregisterConnection: (() => void) | undefined;
   let cancelled = false;
@@ -258,6 +267,7 @@ export async function* runAcpTurn(
     } else {
       const created = await client.newSession(cwd, mcpServers);
       activeSessionId = created.sessionId;
+      modelConfig = created.modelConfig;
       if (isAborted()) {
         yield cancellationTerminal();
         return;
@@ -269,6 +279,17 @@ export async function* runAcpTurn(
     if (isAborted()) {
       yield cancellationTerminal();
       return;
+    }
+
+    // Apply the selected model before prompting. Best-effort: an unsupported
+    // option or an unknown value just falls back to the agent's default.
+    if (options.model) {
+      const configId = modelConfig?.id ?? spec.modelConfigId ?? 'model';
+      try {
+        await client.setConfigOption(activeSessionId, configId, options.model);
+      } catch {
+        // Non-fatal — continue the turn with the agent's default model.
+      }
     }
 
     const promptPromise = client.prompt(activeSessionId, options.prompt, options.signal);

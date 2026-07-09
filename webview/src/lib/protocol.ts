@@ -154,6 +154,16 @@ export interface SettingsUpdateResultMessage {
   result: SettingsUpdateResult;
 }
 
+/** A backend's selectable models, reported by the host for the model picker. */
+export interface BackendModelOption {
+  value: string;
+  name: string;
+}
+export interface BackendModels {
+  current?: string;
+  options: BackendModelOption[];
+}
+
 // Extension host -> webview (protocol v2, TASK-MODEL-PHASE-D-PLAN §4.1)
 export type ExtMessage =
   | SnapshotMessage
@@ -179,13 +189,14 @@ export type ExtMessage =
   | { type: 'permissionCleared'; permissionId: string }
   | { type: 'commandError'; taskId?: string; message: string }
   | { type: 'filePicked'; path: string }
-  | { type: 'backendsAvailable'; backends: string[] };
+  | { type: 'backendsAvailable'; backends: string[] }
+  | { type: 'modelsAvailable'; models: Record<string, BackendModels> };
 
 export type AskAnswer = { selected: string[]; freeText: string | null };
 
 // Webview -> extension host (protocol v2)
 export type OutMessage =
-  | { type: 'send'; taskId?: string; text: string; backend?: string; continuationOf?: string }
+  | { type: 'send'; taskId?: string; text: string; backend?: string; model?: string; continuationOf?: string }
   | { type: 'focusTask'; taskId: string }
   | { type: 'hydrateSubtree'; taskId: string }
   | { type: 'newTask' }
@@ -208,6 +219,7 @@ export type OutMessage =
   | { type: 'requestSettings' }
   | { type: 'updateSetting'; settingId: RetentionSettingId; value: number }
   | { type: 'listBackends' }
+  | { type: 'listModels' }
   /** User sets task lifecycle (not CLI-driven). */
   | {
       type: 'setTaskLifecycle';
@@ -465,6 +477,9 @@ export function isExtMessage(data: unknown): data is ExtMessage {
 
     case 'backendsAvailable':
       return Array.isArray(data.backends) && data.backends.every(isString);
+
+    case 'modelsAvailable':
+      return typeof data.models === 'object' && data.models !== null;
 
     default:
       return false;

@@ -52,6 +52,35 @@ describe('ClaudeBackend — identity', () => {
   });
 });
 
+describe('ClaudeBackend.run — model selection', () => {
+  it('sets the model config option after the session and before the prompt', async () => {
+    await runTurn(new ClaudeBackend(), options({ model: 'opus[1m]' }), fake, {});
+    expect(fake.calls.setConfigOption).toHaveLength(1);
+    expect(fake.calls.setConfigOption[0]).toEqual(['sess-1', 'model', 'opus[1m]']);
+    const ns = fake.callOrder.indexOf('newSession');
+    const sc = fake.callOrder.indexOf('setConfigOption');
+    const pr = fake.callOrder.indexOf('prompt');
+    expect(ns).toBeGreaterThanOrEqual(0);
+    expect(sc).toBeGreaterThan(ns);
+    expect(pr).toBeGreaterThan(sc);
+  });
+
+  it('uses the model config option id advertised by the session when present', async () => {
+    fake = makeFakeAcpClient({
+      modelConfig: { id: 'model', currentValue: 'default', options: [{ value: 'sonnet', name: 'Sonnet' }] },
+    });
+    H.current = fake;
+    await runTurn(new ClaudeBackend(), options({ model: 'sonnet' }), fake, {});
+    expect(fake.calls.setConfigOption[0]).toEqual(['sess-1', 'model', 'sonnet']);
+  });
+
+  it('does not set a model config option when no model is selected', async () => {
+    await runTurn(new ClaudeBackend(), options(), fake, {});
+    expect(fake.calls.setConfigOption).toHaveLength(0);
+    expect(fake.callOrder).not.toContain('setConfigOption');
+  });
+});
+
 describe('ClaudeBackend.run — session + streaming', () => {
   it('emits sessionStarted, streams assistant deltas with a stable messageId, then turnCompleted', async () => {
     const events = await runTurn(new ClaudeBackend(), options(), fake, {
