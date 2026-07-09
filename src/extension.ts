@@ -375,18 +375,48 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
 
   /**
    * Enumerate each installed backend's models (via a throwaway ACP session) and
-   * send them to the webview for the grouped model picker. Cached (computed
-   * once); on failure the webview keeps the plain backend picker.
+   * send them to the webview for the grouped model picker.
+   *
+   * Posts progressive updates as each backend settles (so the picker fills in
+   * without waiting for the slowest CLI). An empty final result is not cached
+   * forever — the next request retries. Failures stay fail-open (plain backend
+   * labels) with a console warning.
    */
   private async postAvailableModels(): Promise<void> {
+    if (this.availableModelsPromise) {
+      // Already enumerating / done — re-post whatever we have when it finishes.
+      try {
+        const models = await this.availableModelsPromise;
+        if (Object.keys(models).length > 0) {
+          this.post({ type: 'modelsAvailable', models });
+        }
+      } catch {
+        this.availableModelsPromise = undefined;
+      }
+      return;
+    }
+
+    this.availableModelsPromise = (async () => {
+      const backends = await (this.availableBackendsPromise ??= detectAvailableBackends());
+      console.info(`Muster: enumerating models for backends: ${backends.join(', ') || '(none)'}`);
+      const models = await enumerateModels(backends, resolveTaskCwd(), (partial) => {
+        this.post({ type: 'modelsAvailable', models: partial });
+      });
+      console.info(
+        `Muster: model catalog ready for ${Object.keys(models).join(', ') || '(no model options)'}`,
+      );
+      return models;
+    })();
+
     try {
-      this.availableModelsPromise ??= (async () => {
-        const backends = await (this.availableBackendsPromise ??= detectAvailableBackends());
-        return enumerateModels(backends, resolveTaskCwd());
-      })();
       const models = await this.availableModelsPromise;
       this.post({ type: 'modelsAvailable', models });
-    } catch {
+      // Empty catalog: drop cache so a later listModels can retry (transient ACP failures).
+      if (Object.keys(models).length === 0) {
+        this.availableModelsPromise = undefined;
+      }
+    } catch (err) {
+      console.warn('Muster: model enumeration failed:', err instanceof Error ? err.message : err);
       this.availableModelsPromise = undefined;
     }
   }
@@ -1116,6 +1146,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     // Tell the webview which backends are actually installed so its picker only
     // offers callable ones (the webview also requests this on mount).
     void this.postAvailableBackends();
+    // Prefetch model catalog so New task can show [Backend] Model options promptly.
+    void this.postAvailableModels();
   }
 
   private _getHtmlForWebview(webview: vscode.Webview): string {

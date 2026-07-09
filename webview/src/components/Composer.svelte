@@ -308,6 +308,9 @@
 
   // Grouped model picker: one `[Backend] Model` option per enumerated model.
   // Until the host reports models, fall back to plain per-backend options.
+  const modelsLoaded = $derived(!!tasks.modelsByBackend && Object.keys(tasks.modelsByBackend).length > 0);
+  const modelsLoading = $derived(mode === 'draft' && !modelsLoaded);
+
   const pickerOptions = $derived.by(() => {
     const models = tasks.modelsByBackend;
     if (models && Object.keys(models).length > 0) {
@@ -319,15 +322,20 @@
             opts.push({ value: `${be.id}::${o.value}`, label: `[${backendShortLabel(be.id)}] ${o.name}` });
           }
         } else {
-          opts.push({ value: be.id, label: be.label });
+          // Backend installed but no model list yet (still enumerating) or none advertised.
+          opts.push({
+            value: be.id,
+            label: modelsLoading ? `${be.label} (loading models…)` : be.label,
+          });
         }
       }
       if (opts.length > 0) return opts;
     }
-    return pickerBackends.map((b) => ({ value: b.id, label: b.label }));
+    return pickerBackends.map((b) => ({
+      value: b.id,
+      label: modelsLoading ? `${b.label} (loading models…)` : b.label,
+    }));
   });
-
-  const modelsLoaded = $derived(!!tasks.modelsByBackend && Object.keys(tasks.modelsByBackend).length > 0);
 
   function modelInCatalog(backend: string, model: string): boolean {
     return !!tasks.modelsByBackend?.[backend]?.options.some((o) => o.value === model);
@@ -349,12 +357,25 @@
     return currentBackend;
   });
 
-  // Ask the host to enumerate models once, when the draft composer first mounts.
-  let modelsRequested = false;
+  // Remount key so vscode-single-select rebuilds options when the catalog arrives
+  // (web components often ignore Svelte re-rendering child <vscode-option>s).
+  // Only remount when the option *set* changes — not when the selected value changes.
+  const pickerRemountKey = $derived(
+    modelsLoaded
+      ? `models:${pickerOptions.map((o) => o.value).join('|')}`
+      : `backends:${pickerBackends.map((b) => b.id).join(',')}:loading`,
+  );
+
+  // Ensure host starts enumeration when the draft composer is shown (also
+  // prefetched on App mount / panel resolve).
+  let draftModelsRequested = false;
   $effect(() => {
-    if (mode === 'draft' && !modelsRequested) {
-      modelsRequested = true;
+    if (mode === 'draft' && !draftModelsRequested) {
+      draftModelsRequested = true;
       post({ type: 'listModels' });
+    }
+    if (mode !== 'draft') {
+      draftModelsRequested = false;
     }
   });
 
@@ -429,20 +450,24 @@
   <div class="flex items-center justify-between gap-2 pt-1" onkeydown={onKeydown}>
     <div class="flex items-center gap-1.5 min-w-0">
       {#if mode === 'draft'}
-        <vscode-single-select
-          bind:this={backendSelect}
-          value={currentPickerValue}
-          use:tip={'Select model for new task'}
-          disabled={thread.running}
-          position="above"
-          onchange={onBackendChange}
-          oninput={onBackendChange}
-          style="width: fit-content; min-width: fit-content;"
-        >
-          {#each pickerOptions as opt (opt.value)}
-            <vscode-option value={opt.value}>{opt.label}</vscode-option>
-          {/each}
-        </vscode-single-select>
+        {#key pickerRemountKey}
+          <vscode-single-select
+            bind:this={backendSelect}
+            value={currentPickerValue}
+            use:tip={modelsLoaded
+              ? 'Select backend + model for the new task'
+              : 'Loading models from installed CLIs… (shows backends first)'}
+            disabled={thread.running}
+            position="above"
+            onchange={onBackendChange}
+            oninput={onBackendChange}
+            style="width: fit-content; min-width: fit-content; max-width: 100%;"
+          >
+            {#each pickerOptions as opt (opt.value)}
+              <vscode-option value={opt.value}>{opt.label}</vscode-option>
+            {/each}
+          </vscode-single-select>
+        {/key}
       {:else}
         <div
           class="px-2 py-0.5 text-xs rounded border truncate"

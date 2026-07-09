@@ -284,9 +284,13 @@ export async function* runAcpTurn(
     // Apply the selected model before prompting. Best-effort: an unsupported
     // option or an unknown value just falls back to the agent's default.
     if (options.model) {
-      const configId = modelConfig?.id ?? spec.modelConfigId ?? 'model';
       try {
-        await client.setConfigOption(activeSessionId, configId, options.model);
+        if (modelConfig?.applyVia === 'session_set_model') {
+          await client.setSessionModel(activeSessionId, options.model);
+        } else {
+          const configId = modelConfig?.id ?? spec.modelConfigId ?? 'model';
+          await client.setConfigOption(activeSessionId, configId, options.model);
+        }
       } catch {
         // Non-fatal — continue the turn with the agent's default model.
       }

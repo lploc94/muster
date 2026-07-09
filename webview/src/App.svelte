@@ -301,6 +301,8 @@
     window.addEventListener('message', onMessage);
     // Ask the host which backends are installed so the picker only offers them.
     post({ type: 'listBackends' });
+    // Prefetch model lists for the New-task picker (host also prefetches on resolve).
+    post({ type: 'listModels' });
     return () => window.removeEventListener('message', onMessage);
   });
 </script>

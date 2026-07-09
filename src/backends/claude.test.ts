@@ -79,6 +79,26 @@ describe('ClaudeBackend.run — model selection', () => {
     expect(fake.calls.setConfigOption).toHaveLength(0);
     expect(fake.callOrder).not.toContain('setConfigOption');
   });
+
+  it('uses session/set_model when the agent advertises session.models shape', async () => {
+    fake = makeFakeAcpClient({
+      modelConfig: {
+        id: 'model',
+        applyVia: 'session_set_model',
+        currentValue: 'grok-4.5',
+        options: [{ value: 'grok-4.5', name: 'Grok 4.5' }],
+      },
+    });
+    H.current = fake;
+    await runTurn(new ClaudeBackend(), options({ model: 'grok-4.5' }), fake, {});
+    expect(fake.calls.setConfigOption).toHaveLength(0);
+    expect(fake.calls.setSessionModel).toEqual([['sess-1', 'grok-4.5']]);
+    const ns = fake.callOrder.indexOf('newSession');
+    const sm = fake.callOrder.indexOf('setSessionModel');
+    const pr = fake.callOrder.indexOf('prompt');
+    expect(sm).toBeGreaterThan(ns);
+    expect(pr).toBeGreaterThan(sm);
+  });
 });
 
 describe('ClaudeBackend.run — session + streaming', () => {

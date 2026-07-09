@@ -318,16 +318,27 @@ export interface AcpConfigOptionChoice {
   description?: string;
 }
 
-/** The model config option advertised by an agent in the `session/new` response. */
+/**
+ * How the client applies a model selection for this agent:
+ * - `config_option` — Claude/Codex/OpenCode style: `session/set_config_option`
+ * - `session_set_model` — Grok/Kiro style: `session/set_model` with `{ modelId }`
+ */
+export type AcpModelApplyVia = 'config_option' | 'session_set_model';
+
+/** The model config advertised by an agent in the `session/new` response. */
 export interface AcpModelConfig {
-  /** The option id to pass as `configId` to `session/set_config_option` (usually "model"). */
+  /**
+   * Config option id for `session/set_config_option` (usually `"model"`).
+   * Unused when `applyVia === 'session_set_model'`.
+   */
   id: string;
+  applyVia?: AcpModelApplyVia;
   currentValue?: string;
   options: AcpConfigOptionChoice[];
 }
 
-/** Pull the `category: 'model'` config option out of a `session/new` response. */
-export function extractModelConfig(configOptions: unknown): AcpModelConfig | undefined {
+/** Pull the `category: 'model'` config option out of a `session/new` configOptions array. */
+export function extractModelConfigFromOptions(configOptions: unknown): AcpModelConfig | undefined {
   if (!Array.isArray(configOptions)) return undefined;
   for (const opt of configOptions) {
     if (!opt || typeof opt !== 'object') continue;
@@ -348,12 +359,64 @@ export function extractModelConfig(configOptions: unknown): AcpModelConfig | und
     if (choices.length > 0) {
       return {
         id: o.id,
+        applyVia: 'config_option',
         currentValue: typeof o.currentValue === 'string' ? o.currentValue : undefined,
         options: choices,
       };
     }
   }
   return undefined;
+}
+
+/**
+ * Grok / Kiro (and other agents) advertise models as:
+ * `{ currentModelId, availableModels: [{ modelId, name, description? }] }`
+ * on `session/new` (or initialize `_meta.modelState`) — not as configOptions.
+ */
+export function extractModelConfigFromSessionModels(models: unknown): AcpModelConfig | undefined {
+  if (!models || typeof models !== 'object') return undefined;
+  const m = models as Record<string, unknown>;
+  const available = m.availableModels;
+  if (!Array.isArray(available)) return undefined;
+
+  const choices: AcpConfigOptionChoice[] = [];
+  for (const item of available) {
+    if (!item || typeof item !== 'object') continue;
+    const o = item as Record<string, unknown>;
+    const value =
+      typeof o.modelId === 'string'
+        ? o.modelId
+        : typeof o.id === 'string'
+          ? o.id
+          : typeof o.value === 'string'
+            ? o.value
+            : undefined;
+    if (!value) continue;
+    const name = typeof o.name === 'string' && o.name ? o.name : value;
+    choices.push({
+      value,
+      name,
+      description: typeof o.description === 'string' ? o.description : undefined,
+    });
+  }
+  if (choices.length === 0) return undefined;
+
+  return {
+    id: 'model',
+    applyVia: 'session_set_model',
+    currentValue: typeof m.currentModelId === 'string' ? m.currentModelId : undefined,
+    options: choices,
+  };
+}
+
+/**
+ * Prefer configOptions (Claude/Codex/OpenCode); fall back to session.models (Grok/Kiro).
+ * @deprecated Prefer the two extractors above; kept as the combined entry point.
+ */
+export function extractModelConfig(configOptions: unknown, sessionModels?: unknown): AcpModelConfig | undefined {
+  return (
+    extractModelConfigFromOptions(configOptions) ?? extractModelConfigFromSessionModels(sessionModels)
+  );
 }
 
 export class AcpClient {
@@ -410,14 +473,27 @@ export class AcpClient {
     const res = (await this.request('session/new', { cwd, mcpServers })) as {
       sessionId: string;
       configOptions?: unknown;
+      models?: unknown;
     };
-    return { sessionId: res.sessionId, modelConfig: extractModelConfig(res.configOptions) };
+    return {
+      sessionId: res.sessionId,
+      modelConfig: extractModelConfig(res.configOptions, res.models),
+    };
   }
 
   /** Set a session config option (e.g. the model) via ACP `session/set_config_option`. */
   async setConfigOption(sessionId: string, configId: string, value: string): Promise<void> {
     await this.ensureConnected();
     await this.request('session/set_config_option', { sessionId, configId, value });
+  }
+
+  /**
+   * Select a model for agents that advertise `session.models` (Grok/Kiro) via
+   * the legacy/stable `session/set_model` method (`{ sessionId, modelId }`).
+   */
+  async setSessionModel(sessionId: string, modelId: string): Promise<void> {
+    await this.ensureConnected();
+    await this.request('session/set_model', { sessionId, modelId });
   }
 
   /** Best-effort `session/close` — used to release a transient enumeration session. */

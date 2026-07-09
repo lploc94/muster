@@ -52,27 +52,46 @@ export async function enumerateBackendModels(backendId: string, cwd: string): Pr
             options: session.modelConfig.options.map((o) => ({ value: o.value, name: o.name })),
           }
         : null;
-    // Only cache a successful enumeration; a transient error/timeout is retryable.
+    // Cache both positive results and "no model option" so we don't re-spawn.
+    // Transient errors (catch) are not cached so a later call can retry.
     cache.set(backendId, models);
     return models;
-  } catch {
+  } catch (err) {
+    console.warn(
+      `Muster: model enumeration failed for backend "${backendId}":`,
+      err instanceof Error ? err.message : err,
+    );
     return null;
   } finally {
     client.dispose();
   }
 }
 
-/** Enumerate models for several backends in parallel. Backends with no models are omitted. */
+export type EnumerateModelsProgress = (partial: Record<string, BackendModels>) => void;
+
+/**
+ * Enumerate models for several backends in parallel. Backends with no models are omitted.
+ * When `onProgress` is set, it is called after each backend settles so the UI can update early.
+ */
 export async function enumerateModels(
   backendIds: string[],
   cwd: string,
+  onProgress?: EnumerateModelsProgress,
 ): Promise<Record<string, BackendModels>> {
   const out: Record<string, BackendModels> = {};
   await Promise.all(
     backendIds.map(async (id) => {
       const models = await enumerateBackendModels(id, cwd);
-      if (models) out[id] = models;
+      if (models) {
+        out[id] = models;
+        onProgress?.({ ...out });
+      }
     }),
   );
   return out;
+}
+
+/** Test helper: clear the per-process enumeration cache. */
+export function clearModelCatalogCacheForTests(): void {
+  cache.clear();
 }
