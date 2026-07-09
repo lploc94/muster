@@ -19,6 +19,7 @@ import { canPromoteTurn } from './scheduler';
 import type { TaskStore } from './store';
 import {
   createTask,
+  cancelPendingTurn,
   interruptTurn,
   registerAsk,
   stageDisposition,
@@ -451,7 +452,10 @@ export async function executeToolCommand(
 
       const ids = [command.childId, ...descendantIds(deps.store.getFile(), command.childId)].reverse();
       for (const taskId of ids) {
-        const lt = turnsForTask(deps.store.getFile(), taskId).find(
+        const pendingTurns = turnsForTask(deps.store.getFile(), taskId).filter(
+          (t) => t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user',
+        );
+        const lt = pendingTurns.find(
           (t) => t.status === 'running' || t.status === 'waiting_user',
         );
         if (
@@ -466,13 +470,22 @@ export async function executeToolCommand(
         deps.store.commit((draft) => {
           const task = draft.tasks[taskId];
           if (!task || isTerminalLifecycle(task.lifecycle)) return { ok: true };
-          const currentLive = turnsForTask(draft, taskId).find(
+          const currentPending = turnsForTask(draft, taskId).filter(
+            (t) => t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user',
+          );
+          const currentLive = currentPending.find(
             (t) => t.status === 'running' || t.status === 'waiting_user',
           );
           const cancelled = transitionCancelTask(task, { liveTurn: currentLive, now });
           if (!cancelled.ok) return cancelled;
           draft.tasks[taskId] = cancelled.next.task;
           if (cancelled.next.turn) draft.turns[cancelled.next.turn.id] = cancelled.next.turn;
+          for (const pending of currentPending) {
+            if (pending.id === currentLive?.id) continue;
+            const settled = cancelPendingTurn(pending, { now });
+            if (!settled.ok) return settled;
+            draft.turns[pending.id] = settled.next;
+          }
           return { ok: true };
         });
         if (lt) cleanupTurnResources(deps, lt.id);
@@ -673,10 +686,18 @@ export function processCancelRequests(deps: GraphEngineDeps): void {
       } else {
         const task = draft.tasks[turn.taskId];
         if (task) {
+          const pendingTurns = turnsForTask(draft, task.id).filter(
+            (t) => t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user',
+          );
           const cancelled = transitionCancelTask(task, { liveTurn: turn, now });
           if (cancelled.ok) {
             draft.tasks[task.id] = cancelled.next.task;
             if (cancelled.next.turn) draft.turns[cancelled.next.turn.id] = cancelled.next.turn;
+            for (const pending of pendingTurns) {
+              if (pending.id === turn.id) continue;
+              const settled = cancelPendingTurn(pending, { now });
+              if (settled.ok) draft.turns[pending.id] = settled.next;
+            }
           }
         }
       }

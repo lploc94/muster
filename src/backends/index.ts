@@ -19,7 +19,8 @@ export function makeBackend(name: string): Backend {
     case 'opencode':
       return new OpenCodeBackend();
     case 'claude':
-    default:
       return new ClaudeBackend();
+    default:
+      throw new Error(`unsupported backend: ${name}`);
   }
 }

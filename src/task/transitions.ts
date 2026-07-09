@@ -468,6 +468,8 @@ export function cancelPendingTurn(
       next: {
         ...turn,
         status: 'cancelled',
+        candidateSessionId: turn.observedSessionId ?? turn.candidateSessionId,
+        isCancellation: LIVE_TURN_STATUSES.has(turn.status) ? true : turn.isCancellation,
         finishedAt: options.now,
         disposition: undefined,
       },
@@ -537,6 +539,8 @@ export function cancelTask(
     cancelledTurn = {
       ...options.liveTurn,
       status: 'cancelled',
+      candidateSessionId: options.liveTurn.observedSessionId ?? options.liveTurn.candidateSessionId,
+      isCancellation: true,
       finishedAt: options.now,
       disposition: undefined,
     };

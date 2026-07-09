@@ -253,6 +253,30 @@ function turnsForTask(file: TaskStoreFile, taskId: string): TaskTurn[] {
     .sort((a, b) => a.sequence - b.sequence);
 }
 
+function childIdsOf(file: TaskStoreFile, parentId: string): string[] {
+  return Object.values(file.tasks)
+    .filter((task) => task.parentId === parentId)
+    .map((task) => task.id)
+    .sort();
+}
+
+function descendantIds(file: TaskStoreFile, rootId: string): string[] {
+  const result: string[] = [];
+  const stack = [...childIdsOf(file, rootId)].reverse();
+  while (stack.length > 0) {
+    const id = stack.pop()!;
+    result.push(id);
+    stack.push(...childIdsOf(file, id).reverse());
+  }
+  return result;
+}
+
+function pendingTurnsForTask(file: TaskStoreFile, taskId: string): TaskTurn[] {
+  return turnsForTask(file, taskId).filter(
+    (turn) => turn.status === 'queued' || turn.status === 'running' || turn.status === 'waiting_user',
+  );
+}
+
 function pendingUserMessages(file: TaskStoreFile, taskId: string): TaskMessage[] {
   return Object.values(file.messages)
     .filter((message) => message.taskId === taskId && message.role === 'user' && message.state === 'pending')
@@ -794,28 +818,64 @@ export class TaskEngine {
 
   cancelTask(taskId: string): EngineResult<void> {
     const now = nowIso(this.clock);
-    const liveTurn = turnsForTask(this.store.getFile(), taskId).find(
-      (turn) => turn.status === 'running' || turn.status === 'waiting_user',
+    const file = this.store.getFile();
+    if (!file.tasks[taskId]) {
+      return { ok: false, reason: 'task not found' };
+    }
+
+    const taskIds = [taskId, ...descendantIds(file, taskId)].reverse();
+    const liveTurnIds = taskIds.flatMap((id) =>
+      pendingTurnsForTask(file, id)
+        .filter((turn) => turn.status === 'running' || turn.status === 'waiting_user')
+        .map((turn) => turn.id),
     );
-    if (liveTurn) {
-      this.liveRuns.get(liveTurn.id)?.abort();
+    const remoteLiveTurnIds = new Set(
+      liveTurnIds.filter((turnId) => leaseOwnerAlive(this.storePath, turnId) && !ownsLocalLease(this.storePath, turnId)),
+    );
+    for (const turnId of liveTurnIds) {
+      if (!remoteLiveTurnIds.has(turnId)) {
+        this.liveRuns.get(turnId)?.abort();
+      }
     }
 
     const commit = this.store.commit((draft) => {
-      const task = draft.tasks[taskId];
-      if (!task) {
-        return { ok: false, reason: 'task not found' };
-      }
-      const currentLive = turnsForTask(draft, taskId).find(
-        (turn) => turn.status === 'running' || turn.status === 'waiting_user',
-      );
-      const result = transitionCancelTask(task, { liveTurn: currentLive, now });
-      if (!result.ok) {
-        return result;
-      }
-      draft.tasks[taskId] = result.next.task;
-      if (result.next.turn) {
-        draft.turns[result.next.turn.id] = result.next.turn;
+      for (const id of taskIds) {
+        const task = draft.tasks[id];
+        if (!task || isTerminalLifecycle(task.lifecycle)) {
+          continue;
+        }
+        const pendingTurns = pendingTurnsForTask(draft, id);
+        const currentLive = pendingTurns.find(
+          (turn) => turn.status === 'running' || turn.status === 'waiting_user',
+        );
+        if (currentLive && remoteLiveTurnIds.has(currentLive.id)) {
+          draft.cancelRequests = draft.cancelRequests ?? {};
+          draft.cancelRequests[currentLive.id] = {
+            kind: 'cancel',
+            by: 'engine',
+            opId: `cancel-task-${taskId}`,
+            at: now,
+          };
+          continue;
+        }
+        const result = transitionCancelTask(task, { liveTurn: currentLive, now });
+        if (!result.ok) {
+          return result;
+        }
+        draft.tasks[id] = result.next.task;
+        if (result.next.turn) {
+          draft.turns[result.next.turn.id] = result.next.turn;
+        }
+        for (const pending of pendingTurns) {
+          if (pending.id === currentLive?.id) {
+            continue;
+          }
+          const cancelled = cancelPendingTurn(pending, { now });
+          if (!cancelled.ok) {
+            return cancelled;
+          }
+          draft.turns[pending.id] = cancelled.next;
+        }
       }
       return { ok: true };
     });
@@ -823,8 +883,13 @@ export class TaskEngine {
     if (!commit.ok) {
       return { ok: false, reason: commit.detail ?? commit.reason };
     }
-    if (liveTurn) {
-      this.acceptedOpIds.delete(liveTurn.id);
+    for (const turnId of liveTurnIds) {
+      if (remoteLiveTurnIds.has(turnId)) {
+        continue;
+      }
+      this.acceptedOpIds.delete(turnId);
+      this.askBridge.cancelForTurn(turnId, 'task cancelled');
+      this.credentialRegistry?.revoke(turnId);
     }
     return { ok: true, value: undefined };
   }
@@ -1000,6 +1065,43 @@ export class TaskEngine {
       return { ok: true };
     });
     this.reconcileChildWaits();
+    this.drainPendingSendsAfterSettlement(turnId);
+  }
+
+  private drainPendingSendsAfterSettlement(settledTurnId: string): void {
+    let continuationTurnId: string | undefined;
+    const now = nowIso(this.clock);
+    const commit = this.store.commit((draft) => {
+      const settledTurn = draft.turns[settledTurnId];
+      if (!settledTurn || settledTurn.status !== 'succeeded') {
+        return { ok: true };
+      }
+      const task = draft.tasks[settledTurn.taskId];
+      if (!task || isTerminalLifecycle(task.lifecycle)) {
+        return { ok: true };
+      }
+      const pending = pendingUserMessages(draft, task.id);
+      if (pending.length === 0) {
+        return { ok: true };
+      }
+      const turnCap = canCreateTurn(draft, task.id, this.resourceLimits);
+      if (!turnCap.ok) {
+        return { ok: true };
+      }
+      const inputs: TurnInput[] = pending.map((message) => ({ kind: 'message', messageId: message.id }));
+      const turnId = randomUUID();
+      const queued = transitionContinueTask(task, turnsForTask(draft, task.id), { turnId, now, inputs });
+      if (!queued.ok) {
+        return { ok: true };
+      }
+      draft.turns[turnId] = queued.next;
+      continuationTurnId = turnId;
+      return { ok: true };
+    });
+
+    if (commit.ok && continuationTurnId && !this.deferredQueuedTurns.has(continuationTurnId)) {
+      void this.scheduleTurn(continuationTurnId);
+    }
   }
 
   private exceedsTurnLimit(taskId: string, candidateTurnId?: string): boolean {

@@ -10,6 +10,11 @@
 
   let pendingAsk = $state<PendingAsk | null>(null);
   let activeTurnId = $state<string | null>(null);
+  const visibleCommandError = $derived(
+    tasks.commandError && (!tasks.commandError.taskId || tasks.commandError.taskId === tasks.focusedTaskId)
+      ? tasks.commandError
+      : null,
+  );
 
   // When no focused task and not in draft, we show the previous tasks list as entry
   const inChat = $derived(tasks.draftMode || !!tasks.focusedTaskId);
@@ -127,7 +132,10 @@
           threadStore.onTranscriptAppend(msg.taskId, msg.item);
           break;
 
-        case 'askPending':
+        case 'askPending': {
+          if (tasks.tasks.has(msg.taskId) && msg.taskId !== tasks.focusedTaskId) {
+            tasks.focusTask(msg.taskId);
+          }
           if (msg.taskId === tasks.focusedTaskId) {
             pendingAsk = {
               turnId: msg.turnId,
@@ -137,6 +145,7 @@
             activeTurnId = msg.turnId;
           }
           break;
+        }
 
         case 'askCleared':
           if (
@@ -150,7 +159,9 @@
           break;
 
         case 'commandError':
-          tasks.setCommandError(msg.message);
+          if (!msg.taskId || msg.taskId === tasks.focusedTaskId) {
+            tasks.setCommandError(msg.message, msg.taskId ?? null);
+          }
           break;
       }
     }
@@ -162,15 +173,15 @@
 
 <Toolbar {inChat} {historyOpen} toggleHistory={() => (historyOpen = !historyOpen)} />
 
-{#if tasks.commandError}
-  <div
-    class="px-3 py-1 text-xs"
-    style="color: var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground, transparent); border-bottom: 1px solid var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground));"
-  >
-    {tasks.commandError}
+{#if visibleCommandError}
+  <div class="task-command-error" role="alert">
+    <div class="min-w-0">
+      <div class="font-semibold">Task command failed</div>
+      <div class="task-command-error__detail">{visibleCommandError.message}</div>
+    </div>
     <button
       type="button"
-      class="ml-2 underline"
+      class="task-command-error__dismiss"
       onclick={() => tasks.setCommandError(null)}
     >Dismiss</button>
   </div>

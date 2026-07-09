@@ -114,4 +114,112 @@ describe('engine graph orchestration', () => {
     const childId = deriveEntityId(started.value!.turnId, 'op-create', 'task');
     expect(store.getFile().tasks[childId]?.parentId).toBe('coord');
   });
+
+  it('cancel_task via coordinator terminally cancels a child subtree and queued turns', async () => {
+    const { store, engine, credentials } = makeHarness();
+    engine.createTask({
+      id: 'coord-cancel',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child', 'start_child', 'wait_child', 'cancel_child', 'read_subtree'],
+    });
+    const started = engine.startTask('coord-cancel');
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    const token = credentials.issue({
+      rootId: 'coord-cancel',
+      callerTaskId: 'coord-cancel',
+      turnId: started.value.turnId,
+      allowedActions: new Set(['cancel_task']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    store.commit((draft) => {
+      const parent = draft.tasks['coord-cancel'];
+      draft.tasks['child-cancel'] = {
+        ...parent,
+        id: 'child-cancel',
+        role: 'worker',
+        goal: 'child',
+        parentId: 'coord-cancel',
+        revision: 0,
+      };
+      draft.tasks['grandchild-cancel'] = {
+        ...parent,
+        id: 'grandchild-cancel',
+        role: 'worker',
+        goal: 'grandchild',
+        parentId: 'child-cancel',
+        revision: 0,
+      };
+      draft.turns['child-cancel-turn'] = {
+        id: 'child-cancel-turn',
+        taskId: 'child-cancel',
+        sequence: 1,
+        trigger: 'user',
+        status: 'queued',
+        inputs: [],
+        createdAt: '2026-07-06T12:00:00.000Z',
+      };
+      draft.turns['grandchild-cancel-turn'] = {
+        id: 'grandchild-cancel-turn',
+        taskId: 'grandchild-cancel',
+        sequence: 1,
+        trigger: 'user',
+        status: 'queued',
+        inputs: [],
+        createdAt: '2026-07-06T12:00:00.000Z',
+      };
+      return { ok: true };
+    });
+
+    const result = await engine.handleToolCall(ctx, 'cancel_task', {
+      kind: 'cancel_task',
+      opId: 'op-cancel-subtree',
+      childId: 'child-cancel',
+    });
+
+    expect(result).toEqual({ ok: true, result: { cancelled: 'child-cancel' } });
+    const file = store.getFile();
+    expect(file.tasks['child-cancel']?.lifecycle).toBe('cancelled');
+    expect(file.tasks['grandchild-cancel']?.lifecycle).toBe('cancelled');
+    expect(file.turns['child-cancel-turn']?.status).toBe('cancelled');
+    expect(file.turns['grandchild-cancel-turn']?.status).toBe('cancelled');
+  });
+
+
+  it('rejects cancel_task for a non-owned child without mutating that task', async () => {
+    const { store, engine, credentials } = makeHarness();
+    engine.createTask({
+      id: 'coord-owner',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['cancel_child'],
+    });
+    engine.createTask({ id: 'unowned-child', goal: 'other', backend: 'grok', role: 'worker' });
+    const started = engine.startTask('coord-owner');
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    const token = credentials.issue({
+      rootId: 'coord-owner',
+      callerTaskId: 'coord-owner',
+      turnId: started.value.turnId,
+      allowedActions: new Set(['cancel_task']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+
+    const result = await engine.handleToolCall(ctx, 'cancel_task', {
+      kind: 'cancel_task',
+      opId: 'op-reject-unowned',
+      childId: 'unowned-child',
+    });
+
+    expect(result).toEqual({ ok: false, error: 'not an owned direct child' });
+    expect(store.getFile().tasks['unowned-child']?.lifecycle).toBe('open');
+    expect(store.getFile().operations?.[`${started.value.turnId}:op-reject-unowned`]).toBeUndefined();
+  });
+
 });

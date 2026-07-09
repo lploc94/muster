@@ -1,6 +1,11 @@
 import type { SnapshotMessage, TaskSummary } from './protocol';
 import { isTerminalStatus } from './protocol';
 
+export interface CommandErrorState {
+  taskId: string | null;
+  message: string;
+}
+
 /** Backends selectable from the webview toolbar. */
 export type WebviewBackendId = 'claude' | 'grok' | 'kiro' | 'codex' | 'opencode';
 
@@ -22,7 +27,7 @@ class TasksState {
 
   selectedBackend = $state<WebviewBackendId>('claude');
 
-  commandError = $state<string | null>(null);
+  commandError = $state<CommandErrorState | null>(null);
 
   get rootTasks(): TaskSummary[] {
     const roots: TaskSummary[] = [];
@@ -126,8 +131,8 @@ class TasksState {
     }
   }
 
-  setCommandError(message: string | null): void {
-    this.commandError = message;
+  setCommandError(message: string | null, taskId: string | null = null): void {
+    this.commandError = message ? { taskId, message } : null;
   }
 
   private seedWatermark(taskId: string, revision: number): void {

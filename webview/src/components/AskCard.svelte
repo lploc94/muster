@@ -14,12 +14,19 @@
 
   let answers = $state<Record<string, AskAnswer>>({});
 
+  function defaultAnswer(): AskAnswer {
+    return { selected: [], freeText: null };
+  }
+
+  function readAnswer(index: number): AskAnswer {
+    return answers[String(index)] ?? defaultAnswer();
+  }
+
   function ensureAnswer(index: number): AskAnswer {
     const key = String(index);
-    if (!answers[key]) {
-      answers[key] = { selected: [], freeText: null };
-    }
-    return answers[key];
+    const entry = answers[key] ?? defaultAnswer();
+    answers = { ...answers, [key]: entry };
+    return entry;
   }
 
   // Single-select: options render as a radio group (at most one selection).
@@ -38,7 +45,7 @@
   function submit(): void {
     const payload: Record<string, AskAnswer> = {};
     for (let i = 0; i < questions.length; i++) {
-      payload[String(i)] = ensureAnswer(i);
+      payload[String(i)] = readAnswer(i);
     }
     post({ type: 'submitAsk', taskId, turnId, askId, answers: payload });
   }
@@ -69,7 +76,7 @@
             <vscode-radio
               value={option}
               name={`ask-${askId}-${i}`}
-              checked={ensureAnswer(i).selected.includes(option)}
+              checked={readAnswer(i).selected.includes(option)}
             >{option}</vscode-radio>
           {/each}
         </vscode-radio-group>
@@ -78,7 +85,7 @@
       {#if q.allowFreeText === true || !q.options?.length}
         <vscode-textfield
           placeholder="Your answer…"
-          value={ensureAnswer(i).freeText ?? ''}
+          value={readAnswer(i).freeText ?? ''}
           oninput={(e: Event) =>
             setFreeText(i, (e.currentTarget as HTMLInputElement & { value: string }).value)}
         ></vscode-textfield>
