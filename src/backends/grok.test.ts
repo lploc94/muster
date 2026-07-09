@@ -222,11 +222,17 @@ describe('GrokBackend.run — tool events', () => {
 });
 
 describe('GrokBackend.run — usage', () => {
-  it('does NOT special-case usage_update; it falls through to raw (drift: no usage_update branch)', async () => {
-    const update = { sessionUpdate: 'usage_update', used: 10, size: 100 };
-    const events = await runTurn(new GrokBackend(), options(), fake, { updates: [update] });
-    expect(events.some((e) => e.type === 'usage')).toBe(false);
-    expect(events).toContainEqual({ type: 'raw', line: JSON.stringify(update) });
+  it('maps usage_update to a usage event (used/size) before the terminal', async () => {
+    // Normalized (4b): Grok previously had no usage_update case (fell through to
+    // raw); it now maps usage_update like the reference adapter.
+    const events = await runTurn(new GrokBackend(), options(), fake, {
+      updates: [{ sessionUpdate: 'usage_update', used: 10, size: 100 }],
+    });
+    const usageIdx = events.findIndex((e) => e.type === 'usage');
+    const termIdx = events.findIndex((e) => e.type === 'turnCompleted');
+    expect(usageIdx).toBeGreaterThanOrEqual(0);
+    expect(events[usageIdx]).toEqual({ type: 'usage', usage: { used: 10, size: 100 } });
+    expect(usageIdx).toBeLessThan(termIdx);
   });
 
   it('emits a usage event from result._meta, dropping thoughtTokens, before the terminal (drift)', async () => {
@@ -280,15 +286,14 @@ describe('GrokBackend.run — terminal classification', () => {
     expect(events.at(-1)).toEqual({ type: 'error', message: 'Grok stopped: max_tokens' });
   });
 
-  it('max_turn_requests is NOT a failure reason for Grok -> "stopped" error WITH meta (headline drift)', async () => {
+  it('treats max_turn_requests as a failure stopReason -> "stopped" error WITHOUT meta', async () => {
+    // Normalized (4b): max_turn_requests is now in Grok's FAILURE set (as in the
+    // other adapters), so it hits the failure branch (no meta) instead of the
+    // generic non-end_turn branch (which carried meta.stopReason).
     const events = await runTurn(new GrokBackend(), options(), fake, {
       result: { stopReason: 'max_turn_requests' },
     });
-    expect(events.at(-1)).toEqual({
-      type: 'error',
-      message: 'Grok stopped: max_turn_requests',
-      meta: { stopReason: 'max_turn_requests' },
-    });
+    expect(events.at(-1)).toEqual({ type: 'error', message: 'Grok stopped: max_turn_requests' });
   });
 
   it('a non-failure non-end_turn stopReason -> "stopped" error WITH meta', async () => {
@@ -301,19 +306,23 @@ describe('GrokBackend.run — terminal classification', () => {
   });
 });
 
-describe('GrokBackend.run — empty/unknown chunk handling (drift: grok emits raw for empties)', () => {
-  it('emits raw for an empty-string assistant chunk (does NOT drop it)', async () => {
-    const update = { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '' } };
-    const events = await runTurn(new GrokBackend(), options(), fake, { updates: [update] });
+describe('GrokBackend.run — empty/unknown chunk handling', () => {
+  it('drops an empty-string assistant chunk (no assistantDelta, no raw)', async () => {
+    // Normalized (4b): Grok previously surfaced empty chunks as raw noise; it now
+    // drops them like the reference adapter.
+    const events = await runTurn(new GrokBackend(), options(), fake, {
+      updates: [{ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '' } }],
+    });
     expect(events.some((e) => e.type === 'assistantDelta')).toBe(false);
-    expect(events).toContainEqual({ type: 'raw', line: JSON.stringify(update) });
+    expect(events.some((e) => e.type === 'raw')).toBe(false);
   });
 
-  it('emits raw for an empty-string thought chunk (does NOT drop it)', async () => {
-    const update = { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: '' } };
-    const events = await runTurn(new GrokBackend(), options(), fake, { updates: [update] });
+  it('drops an empty-string thought chunk', async () => {
+    const events = await runTurn(new GrokBackend(), options(), fake, {
+      updates: [{ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: '' } }],
+    });
     expect(events.some((e) => e.type === 'reasoningDelta')).toBe(false);
-    expect(events).toContainEqual({ type: 'raw', line: JSON.stringify(update) });
+    expect(events.some((e) => e.type === 'raw')).toBe(false);
   });
 
   it('emits raw for a recognized chunk with a non-string text shape', async () => {
