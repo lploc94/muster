@@ -165,7 +165,8 @@ export type ExtMessage =
     }
   | { type: 'permissionCleared'; permissionId: string }
   | { type: 'commandError'; taskId?: string; message: string }
-  | { type: 'filePicked'; path: string };
+  | { type: 'filePicked'; path: string }
+  | { type: 'backendsAvailable'; backends: string[] };
 
 export type AskAnswer = { selected: string[]; freeText: string | null };
 
@@ -191,7 +192,8 @@ export type OutMessage =
   | { type: 'renameTask'; taskId: string; goal: string }
   | { type: 'blurTask' }
   | { type: 'requestSettings' }
-  | { type: 'updateSetting'; settingId: RetentionSettingId; value: number };
+  | { type: 'updateSetting'; settingId: RetentionSettingId; value: number }
+  | { type: 'listBackends' };
 
 /** Post a typed message to the extension host. */
 export function post(message: OutMessage): void {
@@ -438,6 +440,9 @@ export function isExtMessage(data: unknown): data is ExtMessage {
 
     case 'filePicked':
       return isString(data.path);
+
+    case 'backendsAvailable':
+      return Array.isArray(data.backends) && data.backends.every(isString);
 
     default:
       return false;

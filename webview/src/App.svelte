@@ -304,10 +304,16 @@
             tasks.setCommandError(msg.message, msg.taskId ?? null);
           }
           break;
+
+        case 'backendsAvailable':
+          tasks.setAvailableBackends(msg.backends);
+          break;
       }
     }
 
     window.addEventListener('message', onMessage);
+    // Ask the host which backends are installed so the picker only offers them.
+    post({ type: 'listBackends' });
     return () => window.removeEventListener('message', onMessage);
   });
 </script>

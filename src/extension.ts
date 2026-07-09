@@ -21,6 +21,7 @@ import {
   handleRetentionSettingUpdateAction,
   type RetentionSettingSnapshot,
 } from './host/retention-settings';
+import { detectAvailableBackends, installAugmentedPath } from './host/backend-availability';
 import { SESSION_MIGRATION_MARKER, migrateLegacySessions } from './task/migration-sessions';
 import { applyRetention, retentionChanged, type RetentionConfig } from './task/retention';
 import { TaskEngine, type EngineEvent, viewStatusFromDraft } from './task/engine';
@@ -182,6 +183,8 @@ function taskRecordsChanged(
 class MusterChatProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'muster.chat';
   private _view?: vscode.WebviewView;
+  /** In-flight/cached detection of which backend CLIs are callable (computed once). */
+  private availableBackendsPromise?: Promise<string[]>;
   focusedTaskId?: string;
 
   constructor(private readonly _extensionUri: vscode.Uri) {}
@@ -315,6 +318,25 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     }
 
     this.postCommandError('Drop a file from the current workspace to mention it in chat.');
+  }
+
+  /**
+   * Detect (once, cached) which backend CLIs are installed on this machine and
+   * tell the webview so its picker only offers callable backends. If detection
+   * fails we stay silent — the webview then fails open and shows all backends.
+   */
+  private async postAvailableBackends(): Promise<void> {
+    try {
+      // Cache the in-flight promise so a concurrent panel-open + `listBackends`
+      // don't run detection twice.
+      this.availableBackendsPromise ??= detectAvailableBackends();
+      const backends = await this.availableBackendsPromise;
+      this.post({ type: 'backendsAvailable', backends });
+    } catch {
+      // Detection failed — drop the cached rejection so a later request retries;
+      // the webview meanwhile fails open and shows all backends.
+      this.availableBackendsPromise = undefined;
+    }
   }
 
   forwardTurnEvent(event: EngineEvent): void {
@@ -981,6 +1003,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         case 'updateSetting':
           await this.handleUpdateSetting(data);
           break;
+        case 'listBackends':
+          void this.postAvailableBackends();
+          break;
         default:
           // Unknown inbound type: log instead of silently ignoring. This surfaces
           // host<->webview protocol drift (e.g. a newer webview sending a message
@@ -992,6 +1017,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     // Do not auto-focus on open — entry UI shows previous tasks list (per redesign)
     // User selects from list or New task to enter chat.
     this.postSnapshot(this.focusedTaskId);
+    // Tell the webview which backends are actually installed so its picker only
+    // offers callable ones (the webview also requests this on mount).
+    void this.postAvailableBackends();
   }
 
   private _getHtmlForWebview(webview: vscode.Webview): string {
@@ -1030,6 +1058,10 @@ function resolveTaskCwd(): string {
 }
 
 export async function activate(context: vscode.ExtensionContext) {
+  // Patch PATH from the login shell BEFORE anything spawns a backend CLI, so a
+  // GUI-launched editor (minimal PATH) can both detect and actually run the CLIs.
+  await installAugmentedPath();
+
   const wsFolder = vscode.workspace.workspaceFolders?.[0];
   workspaceRoot = wsFolder?.uri.fsPath;
   storePath = wsFolder

@@ -27,6 +27,9 @@ class TasksState {
 
   selectedBackend = $state<WebviewBackendId>('claude');
 
+  /** Backend ids the host reports as installed/callable; null = not yet known. */
+  availableBackends = $state<string[] | null>(null);
+
   commandError = $state<CommandErrorState | null>(null);
 
   get rootTasks(): TaskSummary[] {
@@ -50,6 +53,15 @@ class TasksState {
 
   setBackend(next: WebviewBackendId): void {
     this.selectedBackend = next;
+  }
+
+  setAvailableBackends(ids: string[]): void {
+    this.availableBackends = ids;
+    // If the currently selected backend isn't installed, fall back to the first
+    // available one so the picker never shows a dead default.
+    if (ids.length > 0 && !ids.includes(this.selectedBackend)) {
+      this.selectedBackend = ids[0] as WebviewBackendId;
+    }
   }
 
   openNewTaskDraft(): void {

@@ -187,6 +187,15 @@
     return '';
   });
 
+  // Only offer backends whose CLI the host reports as installed. Until that is
+  // known (null) — or if nothing was detected — fail open and show all.
+  const pickerBackends = $derived.by(() => {
+    const avail = tasks.availableBackends;
+    if (!avail || avail.length === 0) return BACKENDS;
+    const filtered = BACKENDS.filter((b) => avail.includes(b.id));
+    return filtered.length > 0 ? filtered : BACKENDS;
+  });
+
   const placeholder = $derived(
     mode === 'draft'
       ? `Start a new coordinator task with ${currentBackend}…`
@@ -238,7 +247,7 @@
           oninput={onBackendChange}
           style="width: fit-content; min-width: fit-content;"
         >
-          {#each BACKENDS as be (be.id)}
+          {#each pickerBackends as be (be.id)}
             <vscode-option value={be.id}>{be.label}</vscode-option>
           {/each}
         </vscode-single-select>
