@@ -2,7 +2,9 @@
   import { threadStore } from '../lib/thread.svelte';
   import { tasks, resolveBackendForSend, registerBackendSelect } from '../lib/tasks.svelte';
   import { post } from '../lib/protocol';
+  import { ADD_CONTEXT_ACTIONS, getAddContextActionHostMessage } from '../lib/context-actions';
   import { getTaskStatusPresentation, isTaskStatusTerminal } from '../lib/task-status';
+  import type { AddContextAction } from '../lib/context-actions';
   import type { PendingAsk, TaskViewStatus } from '../lib/protocol';
   import type { WebviewBackendId } from '../lib/tasks.svelte';
   import { BACKENDS, backendShortLabel } from '../lib/backends';
@@ -31,7 +33,9 @@
 
   let textareaEl = $state<(HTMLElement & { value: string }) | undefined>(undefined);
   let backendSelect = $state<(HTMLElement & { value: string }) | undefined>(undefined);
+  let addContextMenuRegion = $state<HTMLElement | undefined>(undefined);
   let isDraggingFile = $state(false);
+  let isAddContextMenuOpen = $state(false);
 
   const statusBlocksSend = $derived(
     taskStatus === 'running' ||
@@ -64,6 +68,25 @@
 
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
+  });
+
+  $effect(() => {
+    if (!canSend && isAddContextMenuOpen) {
+      closeAddContextMenu();
+    }
+  });
+
+  $effect(() => {
+    if (!isAddContextMenuOpen) return;
+
+    function onPointerDown(e: PointerEvent) {
+      const target = e.target;
+      if (target instanceof Node && addContextMenuRegion?.contains(target)) return;
+      closeAddContextMenu();
+    }
+
+    window.addEventListener('pointerdown', onPointerDown, true);
+    return () => window.removeEventListener('pointerdown', onPointerDown, true);
   });
 
   function send() {
@@ -117,9 +140,21 @@
     textareaEl.focus?.();
   }
 
-  function pickFile() {
+  function closeAddContextMenu() {
+    isAddContextMenuOpen = false;
+  }
+
+  function toggleAddContextMenu() {
     if (!canSend) return;
-    post({ type: 'pickFile' });
+    isAddContextMenuOpen = !isAddContextMenuOpen;
+  }
+
+  function activateAddContextAction(action: AddContextAction) {
+    if (!canSend) return;
+    const hostMessage = getAddContextActionHostMessage(action.id);
+    if (!hostMessage) return;
+    closeAddContextMenu();
+    post(hostMessage);
   }
 
   function dragCandidates(dataTransfer: DataTransfer): string[] {
@@ -164,6 +199,12 @@
   }
 
   function onKeydown(e: KeyboardEvent) {
+    if (e.key === 'Escape' && isAddContextMenuOpen) {
+      e.preventDefault();
+      closeAddContextMenu();
+      return;
+    }
+
     // Ignore Enter while an IME composition is active (CJK/Vietnamese input);
     // keyCode 229 is the legacy signal for the same.
     if (e.isComposing || e.keyCode === 229) return;
@@ -234,7 +275,7 @@
     style="width: 100%;"
   ></vscode-textarea>
 
-  <div class="flex items-center justify-between gap-2 pt-1">
+  <div class="flex items-center justify-between gap-2 pt-1" onkeydown={onKeydown}>
     <div class="flex items-center gap-1.5 min-w-0">
       {#if mode === 'draft'}
         <vscode-single-select
@@ -261,17 +302,43 @@
         </div>
       {/if}
 
-      <button
-        type="button"
-        class="icon-btn"
-        style="width: 20px; height: 20px;"
-        aria-label="Add file"
-        use:tip={'Add file'}
-        onclick={pickFile}
-        disabled={!canSend}
-      >
-        <span class="codicon codicon-add"></span>
-      </button>
+      <div bind:this={addContextMenuRegion} class="add-context">
+        <button
+          type="button"
+          class="icon-btn add-context__button"
+          aria-label="Add Context"
+          aria-haspopup="menu"
+          aria-expanded={isAddContextMenuOpen ? 'true' : 'false'}
+          use:tip={'Add Context'}
+          onclick={toggleAddContextMenu}
+          disabled={!canSend}
+        >
+          <span class="codicon codicon-add"></span>
+        </button>
+
+        {#if isAddContextMenuOpen}
+          <div class="add-context__menu" role="menu" aria-label="Add Context">
+            {#each ADD_CONTEXT_ACTIONS as action (action.id)}
+              <button
+                type="button"
+                class="add-context__menu-item"
+                class:add-context__menu-item--disabled={action.state !== 'enabled'}
+                role="menuitem"
+                aria-label={action.label}
+                aria-disabled={action.state !== 'enabled' ? 'true' : 'false'}
+                title={action.state === 'enabled' ? action.description : action.disabledReason}
+                disabled={action.state !== 'enabled'}
+                onclick={() => activateAddContextAction(action)}
+              >
+                <span class="add-context__menu-item-label">{action.label}</span>
+                {#if action.state === 'comingSoon'}
+                  <span class="add-context__menu-item-badge">Coming soon</span>
+                {/if}
+              </button>
+            {/each}
+          </div>
+        {/if}
+      </div>
 
       <!-- Config button (placeholder) -->
       <button

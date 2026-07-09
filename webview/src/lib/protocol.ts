@@ -185,6 +185,7 @@ export type OutMessage =
   | { type: 'continueTask'; taskId: string; instruction: string }
   | { type: 'resumeQueuedTurn'; taskId: string; turnId: string }
   | { type: 'pickFile' }
+  | { type: 'browseWorkspaceFiles' }
   | { type: 'resolveFileDrop'; candidates: string[] }
   | { type: 'openLink'; url: string }
   | { type: 'clearHistory' }
