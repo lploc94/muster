@@ -87,11 +87,24 @@ function readLockRecord(lockPath: string): LockRecord | undefined {
   return undefined;
 }
 
-function sleep(ms: number): void {
-  const deadline = Date.now() + ms;
-  while (Date.now() < deadline) {
-    // busy-wait for short test-friendly sleeps without timers
+/**
+ * Synchronous, NON-SPINNING sleep. Parks the thread for `ms` without burning CPU by
+ * blocking on `Atomics.wait` against a throwaway zero-initialised SharedArrayBuffer that
+ * nothing ever notifies — so the wait always runs to its `ms` timeout. This is permitted
+ * on Node's main (extension-host) thread. It replaces the old `while (Date.now() < deadline)`
+ * busy-wait, which pinned a whole CPU core whenever multiple VS Code windows contended for
+ * the shared globalStorage store lock.
+ *
+ * NOTE: the store API (and `commit()`) stays fully SYNCHRONOUS on purpose — a sync→async
+ * lock refactor ripples across the entire engine and is out of scope here. A truly
+ * non-blocking async lock is a deliberate future follow-up; this change only removes the
+ * CPU burn, not the synchronous blocking.
+ */
+export function sleep(ms: number): void {
+  if (ms <= 0) {
+    return;
   }
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 export function migrate(file: TaskStoreFile, targetVersion: number): TaskStoreFile {
@@ -534,6 +547,28 @@ export class TaskStore {
     return true;
   }
 
+  /**
+   * Run `fn` while holding the exclusive cross-process store lock, then release it.
+   * Returns `fn()`'s result, or `undefined` if the lock could not be acquired within the
+   * wait budget. Use this to SERIALIZE cross-process operations that touch sibling files
+   * (e.g. per-turn lease acquisition) so they cannot interleave across VS Code windows —
+   * closing read-then-mutate TOCTOU races that plain fs primitives cannot.
+   *
+   * `fn` MUST be short and MUST NOT call `commit()` or `runExclusive()` again: the lock is
+   * NOT re-entrant and doing so would deadlock.
+   */
+  runExclusive<T>(fn: () => T): T | undefined {
+    const lock = this.acquireLock();
+    if (!lock) {
+      return undefined;
+    }
+    try {
+      return fn();
+    } finally {
+      this.releaseLock(lock);
+    }
+  }
+
   private acquireLock(): LockRecord | undefined {
     // Defense in depth: ensure the lock's directory exists before acquiring. The
     // store path may be a not-yet-created globalStorage directory; a missing parent
@@ -616,8 +651,35 @@ export class TaskStore {
           let writeFailed = false;
           try {
             fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
-            fs.writeFileSync(tempPath, JSON.stringify(draft, null, 2), 'utf8');
+            // Write the temp file through an fd and fsync it before the rename so the bytes
+            // are on stable storage first. rename() gives readers atomic visibility but NOT
+            // crash/power-loss durability; the fsync closes that gap.
+            const fd = fs.openSync(tempPath, 'w');
+            try {
+              // writeFileSync(fd, ...) writes the ENTIRE buffer (looping internally) or
+              // throws — unlike writeSync(fd, string), whose short-write return value we
+              // would otherwise have to check. A partial write here (e.g. disk full) must
+              // never be fsync'd + renamed as a "successful" commit: that would replace the
+              // store with truncated JSON. writeFileSync closes that gap.
+              fs.writeFileSync(fd, JSON.stringify(draft, null, 2), 'utf8');
+              fs.fsyncSync(fd);
+            } finally {
+              fs.closeSync(fd);
+            }
             fs.renameSync(tempPath, this.filePath);
+            // Best-effort: fsync the parent directory so the rename entry itself survives
+            // power loss on POSIX. Windows and some filesystems don't support directory
+            // fsync, so any failure here is swallowed and must not fail the commit.
+            try {
+              const dirFd = fs.openSync(path.dirname(this.filePath), 'r');
+              try {
+                fs.fsyncSync(dirFd);
+              } finally {
+                fs.closeSync(dirFd);
+              }
+            } catch {
+              // directory fsync unsupported on this platform/FS — ignore
+            }
           } catch (error) {
             try {
               fs.unlinkSync(tempPath);

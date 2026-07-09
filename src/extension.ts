@@ -21,6 +21,7 @@ import { applyRetention, retentionChanged, type RetentionConfig } from './task/r
 import { TaskEngine, type EngineEvent } from './task/engine';
 import { TaskStore, computeAffectedTaskIds } from './task/store';
 import { isTerminalLifecycle } from './task/transitions';
+import { resolveWorkspaceCwd } from './task/workspace-cwd';
 import type { TaskStoreFile } from './task/types';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -557,6 +558,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         message: fullMessage,
         backend: data.backend ?? 'claude',
         continuationOf: data.continuationOf,
+        // Capture the workspace cwd at task-creation time so every turn (and any
+        // delegated child) runs in the right directory instead of process.cwd().
+        cwd: resolveTaskCwd(),
       });
       if (!result.ok) {
         this.postCommandError(result.reason);
@@ -836,6 +840,18 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
 </body>
 </html>`;
   }
+}
+
+/**
+ * Resolve the workspace directory a new task's agent should run in. Multi-root
+ * aware via {@link resolveWorkspaceCwd}: the folder holding the active editor
+ * file wins, else the first workspace folder. Falls back to process.cwd() when
+ * no folder is open (matching every ACP adapter's own fallback).
+ */
+function resolveTaskCwd(): string {
+  const folders = vscode.workspace.workspaceFolders?.map((f) => f.uri.fsPath) ?? [];
+  const activeFile = vscode.window.activeTextEditor?.document.uri.fsPath;
+  return resolveWorkspaceCwd(folders, activeFile) ?? process.cwd();
 }
 
 export async function activate(context: vscode.ExtensionContext) {

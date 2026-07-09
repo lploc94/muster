@@ -404,7 +404,9 @@ describe('TaskEngine', () => {
     });
     fs.writeFileSync(
       `${filePath}.lease.turn-1`,
-      JSON.stringify({ pid: process.pid, token: 'live' }),
+      // A fresh lease held by this (live) process — createdAt is now, so it is not
+      // reclaimable by the max-age PID-reuse defense.
+      JSON.stringify({ pid: process.pid, token: 'live', createdAt: new Date().toISOString() }),
       'utf8',
     );
 
@@ -576,5 +578,60 @@ describe('TaskEngine transcript persistence (tool + reasoning + segmentation)', 
     const tc = file.toolCalls?.[`${sent.value.turnId}:orphan`];
     expect(tc?.status).toBe('error');
     expect(tc?.error).toBe('boom');
+  });
+});
+
+describe('TaskEngine workspace cwd', () => {
+  it('persists a task cwd and passes it to the turn RunOptions', async () => {
+    const { filePath, store } = makeTempStore();
+    let captured: RunOptions | undefined;
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => scriptedBackend([{ type: 'turnCompleted' }]),
+      // Capture the RunOptions the engine dispatches so we can assert cwd flows
+      // through the turn base object all the way to the runner/adapter boundary.
+      runTurn: (backend, options) => {
+        captured = options;
+        return backend.run(options);
+      },
+    });
+
+    const started = engine.startNewTask({
+      goal: 'do a thing',
+      backend: 'fake',
+      cwd: '/workspace/root',
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    await engine.whenIdle();
+
+    // Persisted on the task...
+    expect(store.getTask(started.value.taskId)?.cwd).toBe('/workspace/root');
+    // ...survives a reload round-trip through the store file...
+    const reloaded = TaskStore.load({ filePath });
+    expect(reloaded.getTask(started.value.taskId)?.cwd).toBe('/workspace/root');
+    // ...and is handed to the turn dispatch as RunOptions.cwd.
+    expect(captured?.cwd).toBe('/workspace/root');
+  });
+
+  it('leaves cwd undefined when no workspace cwd is provided', async () => {
+    const { store } = makeTempStore();
+    let captured: RunOptions | undefined;
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => scriptedBackend([{ type: 'turnCompleted' }]),
+      runTurn: (backend, options) => {
+        captured = options;
+        return backend.run(options);
+      },
+    });
+
+    const started = engine.startNewTask({ goal: 'no cwd', backend: 'fake' });
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    await engine.whenIdle();
+
+    expect(store.getTask(started.value.taskId)?.cwd).toBeUndefined();
+    expect(captured?.cwd).toBeUndefined();
   });
 });

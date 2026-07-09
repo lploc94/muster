@@ -315,6 +315,9 @@ export async function executeToolCommand(
           parentId: ctx.callerTaskId,
           dependencies: command.spec.dependencies ?? [],
           backend: command.spec.backend,
+          // Children inherit the parent's workspace directory so delegated
+          // sub-tasks run in the same place and never fall back to process.cwd().
+          cwd: caller.cwd,
           capabilities: DEFAULT_CHILD_CAPS,
           // Never trust the raw agent-supplied policy: clamp every field to bounds.
           executionPolicy: clampExecutionPolicy(

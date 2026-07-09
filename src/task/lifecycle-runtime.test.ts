@@ -617,7 +617,7 @@ describe('task lifecycle runtime regression harness', () => {
       });
       fs.writeFileSync(
         `${filePath}.lease.remote-turn`,
-        JSON.stringify({ pid: remoteOwner.pid, token: 'remote-owner' }),
+        JSON.stringify({ pid: remoteOwner.pid, token: 'remote-owner', createdAt: new Date().toISOString() }),
         'utf8',
       );
       const reloadedStore = TaskStore.load({ filePath });

@@ -31,6 +31,12 @@ export interface MusterTask {
   wait?: PersistedWait;
   backend: string;
   committedSessionId?: string;
+  /**
+   * Workspace directory the agent runs in for this task's turns (schema-compatible:
+   * optional, absent value tolerated so no schema bump is required). Populated at
+   * task creation from the resolved workspace root; children inherit the parent's.
+   */
+  cwd?: string;
   capabilities: TaskCapability[];
   executionPolicy: TaskExecutionPolicy;
   result?: string;

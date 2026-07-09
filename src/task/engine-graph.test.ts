@@ -222,6 +222,35 @@ describe('engine graph orchestration', () => {
     expect(store.getFile().operations?.[`${started.value.turnId}:op-reject-unowned`]).toBeUndefined();
   });
 
+  it('child tasks inherit the parent task cwd on create_task', async () => {
+    const { store, engine, credentials } = makeHarness();
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child', 'start_child', 'wait_child', 'read_subtree'],
+      cwd: '/parent/workspace',
+    });
+    const started = engine.startTask('coord');
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId: started.value!.turnId,
+      allowedActions: new Set(['create_task']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    const result = await engine.handleToolCall(ctx, 'create_task', {
+      kind: 'create_task',
+      opId: 'op-child-cwd',
+      spec: { goal: 'child', backend: 'grok', role: 'worker' },
+    });
+    expect(result.ok).toBe(true);
+    const childId = deriveEntityId(started.value!.turnId, 'op-child-cwd', 'task');
+    expect(store.getFile().tasks[childId]?.cwd).toBe('/parent/workspace');
+  });
+
   it('clamps an agent-supplied over-limit executionPolicy on create_task', async () => {
     const { store, engine, credentials } = makeHarness();
     engine.createTask({

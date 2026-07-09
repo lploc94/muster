@@ -271,7 +271,7 @@ export class KiroBackend implements Backend {
         return;
       }
 
-      const promptPromise = client.prompt(activeSessionId, options.prompt);
+      const promptPromise = client.prompt(activeSessionId, options.prompt, options.signal);
 
       while (true) {
         while (pendingUpdates.length > 0) {
