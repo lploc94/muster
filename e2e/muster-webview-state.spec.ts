@@ -163,7 +163,7 @@ test.describe('Muster webview host state smoke', () => {
     });
   });
 
-  test('adds a file mention from the composer add-file button', async ({ page }) => {
+  test('Add Context menu keeps the existing file picker and mention flow', async ({ page }) => {
     await openWebview(page);
 
     await postSnapshot(page, {
@@ -175,19 +175,145 @@ test.describe('Muster webview host state smoke', () => {
     await page.getByRole('button', { name: 'New task' }).first().click();
     await expectPostedMessage(page, { type: 'newTask' });
 
-    await page.getByRole('button', { name: 'Add file' }).click();
+    const composer = page.getByPlaceholder('Start a new coordinator task with claude…');
+    await composer.fill('Review this');
+
+    const addContextButton = page.getByRole('button', { name: 'Add Context' });
+    await expect(addContextButton).toHaveAttribute('aria-expanded', 'false');
+    await addContextButton.click();
+
+    const menu = page.getByRole('menu', { name: 'Add Context' });
+    await expect(menu).toBeVisible();
+    await expect(addContextButton).toHaveAttribute('aria-expanded', 'true');
+    await expect(menu.getByRole('menuitem', { name: 'Add file' })).toBeVisible();
+    await expect(menu.getByRole('menuitem', { name: 'Browse workspace files' })).toBeVisible();
+    expect(await postedMessages(page)).not.toContainEqual({ type: 'pickFile' });
+
+    await menu.getByRole('menuitem', { name: 'Add file' }).click();
     await expectPostedMessage(page, { type: 'pickFile' });
+    await expect(menu).toHaveCount(0);
 
     await postRawHostMessage(page, { type: 'filePicked', path: 'src/extension.ts' });
-    await expect(page.getByPlaceholder('Start a new coordinator task with claude…')).toHaveValue('@src/extension.ts ');
+    await expect(composer).toHaveValue('Review this @src/extension.ts ');
 
-    await page.getByPlaceholder('Start a new coordinator task with claude…').fill('Review @src/extension.ts');
+    await composer.fill('Review @src/extension.ts');
     await page.getByRole('button', { name: 'Send' }).click();
     await expectPostedMessage(page, {
       type: 'send',
       text: 'Review @src/extension.ts',
       backend: 'claude',
     });
+  });
+
+  test('Add Context menu browses workspace files through the shared filePicked mention flow', async ({ page }) => {
+    await openWebview(page);
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [],
+      storeRevision: 2,
+    });
+
+    await page.getByRole('button', { name: 'New task' }).first().click();
+    await expectPostedMessage(page, { type: 'newTask' });
+
+    const composer = page.getByPlaceholder('Start a new coordinator task with claude…');
+    await composer.fill('Inspect');
+
+    const addContextButton = page.getByRole('button', { name: 'Add Context' });
+    await addContextButton.click();
+    const menu = page.getByRole('menu', { name: 'Add Context' });
+    await menu.getByRole('menuitem', { name: 'Browse workspace files' }).click();
+
+    await expectPostedMessage(page, { type: 'browseWorkspaceFiles' });
+    await expect(menu).toHaveCount(0);
+    await expect(addContextButton).toHaveAttribute('aria-expanded', 'false');
+    await expect(composer).toHaveValue('Inspect');
+
+    await postRawHostMessage(page, { type: 'filePicked', path: 'src/host/workspace-files.ts' });
+    await expect(composer).toHaveValue('Inspect @src/host/workspace-files.ts ');
+  });
+
+  test('Add Context menu renders future model actions as disabled coming-soon entries', async ({ page }) => {
+    await openWebview(page);
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [],
+      storeRevision: 2,
+    });
+
+    await page.getByRole('button', { name: 'New task' }).first().click();
+    await expectPostedMessage(page, { type: 'newTask' });
+
+    const addContextButton = page.getByRole('button', { name: 'Add Context' });
+    await addContextButton.click();
+    const menu = page.getByRole('menu', { name: 'Add Context' });
+    await expect(menu).toBeVisible();
+
+    for (const label of ['Skill', 'Wiki page', 'Agent', 'Browser tab', 'Web search']) {
+      const item = menu.getByRole('menuitem', { name: label });
+      await expect(item).toBeVisible();
+      await expect(item).toBeDisabled();
+      await expect(item).toHaveAttribute('aria-disabled', 'true');
+      await expect(item.locator('.add-context__menu-item-badge')).toHaveText('Coming soon');
+    }
+
+    await menu.getByRole('menuitem', { name: 'Skill' }).click({ force: true });
+    expect(await postedMessages(page)).not.toContainEqual({ type: 'pickFile' });
+    expect(await postedMessages(page)).not.toContainEqual({ type: 'browseWorkspaceFiles' });
+    await expect(menu).toBeVisible();
+    await expect(addContextButton).toHaveAttribute('aria-expanded', 'true');
+  });
+
+  test('Add Context menu hardens dismissal states without losing draft text', async ({ page }) => {
+    await openWebview(page);
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [],
+      storeRevision: 2,
+    });
+
+    await page.getByRole('button', { name: 'New task' }).first().click();
+    await expectPostedMessage(page, { type: 'newTask' });
+
+    const composer = page.getByRole('textbox').first();
+    const addContextButton = page.getByRole('button', { name: 'Add Context' });
+    const menu = page.getByRole('menu', { name: 'Add Context' });
+
+    await composer.fill('Keep this draft');
+    await addContextButton.click();
+    await expect(menu).toBeVisible();
+    await composer.click();
+    await expect(menu).toHaveCount(0);
+    await expect(addContextButton).toHaveAttribute('aria-expanded', 'false');
+    await expect(composer).toHaveValue('Keep this draft');
+
+    await addContextButton.click();
+    await expect(menu).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(menu).toHaveCount(0);
+    await expect(composer).toHaveValue('Keep this draft');
+
+    await addContextButton.click();
+    await expect(menu).toBeVisible();
+    await addContextButton.click();
+    await expect(menu).toHaveCount(0);
+
+    await addContextButton.click();
+    await expect(menu).toBeVisible();
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-running', goal: 'Run active work', viewStatus: 'running' })],
+      focusedTaskId: 'task-running',
+      subtree: [task({ id: 'task-running', goal: 'Run active work', viewStatus: 'running' })],
+      activeTurnId: 'turn-running',
+      storeRevision: 3,
+    });
+    await expect(menu).toHaveCount(0);
+    await expect(addContextButton).toBeDisabled();
+    await expect(addContextButton).toHaveAttribute('aria-expanded', 'false');
   });
 
   test('surfaces task-centric status feedback for active and failed tasks', async ({ page }) => {

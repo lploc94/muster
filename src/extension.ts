@@ -22,6 +22,7 @@ import {
   type RetentionSettingSnapshot,
 } from './host/retention-settings';
 import { detectAvailableBackends, installAugmentedPath } from './host/backend-availability';
+import { pickWorkspaceFileMentionPath } from './host/workspace-files';
 import { SESSION_MIGRATION_MARKER, migrateLegacySessions } from './task/migration-sessions';
 import { applyRetention, retentionChanged, type RetentionConfig } from './task/retention';
 import { TaskEngine, type EngineEvent, viewStatusFromDraft } from './task/engine';
@@ -296,6 +297,36 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       return;
     }
     this.post({ type: 'filePicked', path: mentionPath });
+  }
+
+  private async handleBrowseWorkspaceFiles(): Promise<void> {
+    try {
+      const result = await pickWorkspaceFileMentionPath({
+        workspaceFolders: vscode.workspace.workspaceFolders,
+        findFiles: (include, exclude, maxResults) => vscode.workspace.findFiles(include, exclude, maxResults),
+        showQuickPick: (items, options) => vscode.window.showQuickPick(items, options),
+      });
+
+      switch (result.type) {
+        case 'picked':
+          this.post({ type: 'filePicked', path: result.path });
+          return;
+        case 'cancelled':
+          return;
+        case 'noWorkspace':
+          this.postCommandError('Open a workspace to browse files.');
+          return;
+        case 'noFiles':
+          this.postCommandError('No workspace files found to add to chat.');
+          return;
+        default: {
+          const _exhaustive: never = result;
+          return _exhaustive;
+        }
+      }
+    } catch {
+      this.postCommandError('Unable to browse workspace files.');
+    }
   }
 
   private handleResolveFileDrop(candidates: unknown): void {
@@ -972,6 +1003,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         }
         case 'pickFile':
           await this.handlePickFile();
+          break;
+        case 'browseWorkspaceFiles':
+          await this.handleBrowseWorkspaceFiles();
           break;
         case 'resolveFileDrop':
           this.handleResolveFileDrop(data.candidates);
