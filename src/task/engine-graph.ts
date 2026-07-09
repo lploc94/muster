@@ -7,12 +7,15 @@ import { canBindTaskToBackend } from './backend-eligibility';
 import { capabilitiesFor } from './capabilities';
 import type { ToolCommand } from './coordinator-tools';
 import {
+  bridgeTokenTtlMs,
   canCreateTurn,
   checkLimit,
+  clampExecutionPolicy,
   countChildren,
   countRootChildren,
   DEFAULT_RESOURCE_LIMITS,
   taskDepth,
+  type ExecutionPolicyBounds,
   type ResourceLimits,
 } from './limits';
 import { canPromoteTurn } from './scheduler';
@@ -124,6 +127,10 @@ export interface GraphEngineDeps {
   askBridge: AskBridge;
   bridgePort: number;
   resourceLimits?: ResourceLimits;
+  /** Bounds used to clamp agent-supplied execution policies. Defaults to DEFAULT_EXECUTION_POLICY_BOUNDS. */
+  executionPolicyBounds?: ExecutionPolicyBounds;
+  /** Independent hard cap on a bridge token's TTL. Defaults to MAX_BRIDGE_TOKEN_TTL_MS. */
+  maxBridgeTokenTtlMs?: number;
   clock?: () => string;
   liveRuns: Map<string, AbortController>;
   pendingAskPromises: Map<string, { promise: Promise<Answers>; fingerprint: string }>;
@@ -189,7 +196,9 @@ export function issueTurnCredential(
     callerTaskId: task.id,
     turnId,
     allowedActions: actions,
-    ttlMs: task.executionPolicy.turnTimeoutMs,
+    // Independent hard cap: even a large (clamped) turn timeout must not mint a
+    // token that outlives MAX_BRIDGE_TOKEN_TTL_MS.
+    ttlMs: bridgeTokenTtlMs(task.executionPolicy.turnTimeoutMs, deps.maxBridgeTokenTtlMs),
   });
 }
 
@@ -307,7 +316,12 @@ export async function executeToolCommand(
           dependencies: command.spec.dependencies ?? [],
           backend: command.spec.backend,
           capabilities: DEFAULT_CHILD_CAPS,
-          executionPolicy: { ...DEFAULT_POLICY, ...command.spec.executionPolicy },
+          // Never trust the raw agent-supplied policy: clamp every field to bounds.
+          executionPolicy: clampExecutionPolicy(
+            DEFAULT_POLICY,
+            command.spec.executionPolicy,
+            deps.executionPolicyBounds,
+          ),
         };
         const graph = depGraphFromFile(draft);
         const created = createTask(input, { rootId, graph, now });

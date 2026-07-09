@@ -3,12 +3,14 @@
   import Toolbar from './components/Toolbar.svelte';
   import TaskHistoryList from './components/TaskList.svelte';
   import TaskWorkspace from './components/TaskWorkspace.svelte';
+  import PermissionCard from './components/PermissionCard.svelte';
   import { tasks } from './lib/tasks.svelte';
   import { threadStore } from './lib/thread.svelte';
   import { isExtMessage, post, statusLabel } from './lib/protocol';
-  import type { PendingAsk, TaskViewStatus } from './lib/protocol';
+  import type { PendingAsk, PendingPermission, TaskViewStatus } from './lib/protocol';
 
   let pendingAsk = $state<PendingAsk | null>(null);
+  let pendingPermission = $state<PendingPermission | null>(null);
   let activeTurnId = $state<string | null>(null);
   const visibleCommandError = $derived(
     tasks.commandError && (!tasks.commandError.taskId || tasks.commandError.taskId === tasks.focusedTaskId)
@@ -158,6 +160,26 @@
           }
           break;
 
+        case 'permissionPending':
+          // Security gate: show regardless of the focused task — a permission
+          // request is session-scoped, and hiding it could silently stall or
+          // (worse) misrepresent what the agent is asking to do.
+          pendingPermission = {
+            sessionId: msg.sessionId,
+            permissionId: msg.permissionId,
+            title: msg.title,
+            kind: msg.kind,
+            classification: msg.classification,
+            options: msg.options,
+          };
+          break;
+
+        case 'permissionCleared':
+          if (pendingPermission && pendingPermission.permissionId === msg.permissionId) {
+            pendingPermission = null;
+          }
+          break;
+
         case 'commandError':
           if (!msg.taskId || msg.taskId === tasks.focusedTaskId) {
             tasks.setCommandError(msg.message, msg.taskId ?? null);
@@ -185,6 +207,16 @@
       onclick={() => tasks.setCommandError(null)}
     >Dismiss</button>
   </div>
+{/if}
+
+{#if pendingPermission}
+  <PermissionCard
+    permissionId={pendingPermission.permissionId}
+    title={pendingPermission.title}
+    kind={pendingPermission.kind}
+    classification={pendingPermission.classification}
+    options={pendingPermission.options}
+  />
 {/if}
 
 {#if !inChat}

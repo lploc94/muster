@@ -44,6 +44,25 @@ export interface PendingAsk {
   questions: Question[];
 }
 
+/** Coarse risk class for a tool-permission request (mirrors the host). */
+export type PermissionClass = 'read' | 'write' | 'unknown';
+
+/** An option offered by the agent on a permission request. */
+export interface PermissionOptionView {
+  optionId: string;
+  name: string;
+  kind: string;
+}
+
+export interface PendingPermission {
+  sessionId: string;
+  permissionId: string;
+  title: string;
+  kind: string;
+  classification: PermissionClass;
+  options: PermissionOptionView[];
+}
+
 export interface SnapshotMessage {
   type: 'snapshot';
   rootTasks: TaskSummary[];
@@ -66,6 +85,16 @@ export type ExtMessage =
   | { type: 'transcriptAppend'; taskId: string; item: TranscriptItem }
   | { type: 'askPending'; taskId: string; turnId: string; askId: string; questions: Question[] }
   | { type: 'askCleared'; taskId: string; turnId: string; askId: string }
+  | {
+      type: 'permissionPending';
+      sessionId: string;
+      permissionId: string;
+      title: string;
+      kind: string;
+      classification: PermissionClass;
+      options: PermissionOptionView[];
+    }
+  | { type: 'permissionCleared'; permissionId: string }
   | { type: 'commandError'; taskId?: string; message: string }
   | { type: 'filePicked'; path: string };
 
@@ -80,6 +109,8 @@ export type OutMessage =
   | { type: 'cancelTurn'; taskId: string; turnId: string }
   | { type: 'submitAsk'; taskId: string; turnId: string; askId: string; answers: Record<string, AskAnswer> }
   | { type: 'cancelAsk'; taskId: string; turnId: string; askId: string }
+  | { type: 'submitPermission'; permissionId: string; optionId: string; remember: boolean }
+  | { type: 'cancelPermission'; permissionId: string }
   | { type: 'retryTurn'; taskId: string; turnId: string; instruction: string }
   | { type: 'continueTask'; taskId: string; instruction: string }
   | { type: 'resumeQueuedTurn'; taskId: string; turnId: string }
@@ -175,6 +206,11 @@ function isQuestion(v: unknown): v is Question {
   return isString(v.prompt);
 }
 
+function isPermissionOption(v: unknown): v is PermissionOptionView {
+  if (!isRecord(v)) return false;
+  return isString(v.optionId) && isString(v.name) && isString(v.kind);
+}
+
 const TURN_SCOPED_TYPES = new Set([
   'turnStart',
   'event',
@@ -235,6 +271,20 @@ export function isExtMessage(data: unknown): data is ExtMessage {
 
     case 'askCleared':
       return isString(data.askId);
+
+    case 'permissionPending':
+      return (
+        isString(data.sessionId) &&
+        isString(data.permissionId) &&
+        isString(data.title) &&
+        isString(data.kind) &&
+        isString(data.classification) &&
+        Array.isArray(data.options) &&
+        data.options.every(isPermissionOption)
+      );
+
+    case 'permissionCleared':
+      return isString(data.permissionId);
 
     case 'commandError':
       return isString(data.message) && (data.taskId === undefined || isString(data.taskId));

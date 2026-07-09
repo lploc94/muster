@@ -1,6 +1,53 @@
 import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
 import { createInterface, Interface } from 'readline';
 import { McpServerConfig } from '../types';
+import {
+  classifyPermission,
+  pickOption,
+  resolvePolicy,
+  type PermissionAuditEntry,
+  type PermissionAuditSource,
+  type PermissionClass,
+  type PermissionMode,
+  type PermissionOption,
+  type PermissionToolCall,
+} from './permission-policy';
+
+/**
+ * A permission request handed to {@link PermissionController.prompt} when the
+ * gate needs an explicit user decision.
+ */
+export interface PermissionPromptRequest {
+  sessionId: string;
+  title: string;
+  kind: string;
+  classification: PermissionClass;
+  options: PermissionOption[];
+}
+
+/**
+ * Host-side controller consulted by the ACP permission gate. Injected via
+ * {@link setPermissionController}. When absent, the client keeps its legacy
+ * blind auto-allow behavior (backward compatible).
+ */
+export interface PermissionController {
+  /** Current mode, read live so config changes take effect immediately. */
+  mode(): PermissionMode;
+  isAllowlisted(sessionId: string, key: string): boolean;
+  remember(sessionId: string, key: string): void;
+  audit(entry: PermissionAuditEntry): void;
+  /** Prompt the user for a decision (write/unknown actions in ask mode). */
+  prompt(
+    req: PermissionPromptRequest,
+  ): Promise<{ allow: boolean; remember: boolean; timedOut?: boolean }>;
+}
+
+let permissionController: PermissionController | null = null;
+
+/** Inject (or clear) the global permission controller for the ACP gate. */
+export function setPermissionController(controller: PermissionController | null): void {
+  permissionController = controller;
+}
 
 type Pending = {
   resolve: (value: unknown) => void;
@@ -380,14 +427,7 @@ export class AcpClient {
 
     try {
       if (method === 'session/request_permission') {
-        const options = (params.options ?? []) as { optionId: string; kind: string }[];
-        const allow =
-          options.find((o) => /allow/i.test(o.kind)) ??
-          options.find((o) => o.optionId === 'allow_once') ??
-          options[0];
-        this.respondOk(id, {
-          outcome: { outcome: 'selected', optionId: allow?.optionId ?? 'allow_once' },
-        });
+        await this.handlePermissionRequest(id, params);
         return;
       }
 
@@ -408,6 +448,99 @@ export class AcpClient {
       this.respondOk(id, {});
     } catch (err) {
       this.respondError(id, -32603, (err as Error).message || 'Internal error');
+    }
+  }
+
+  /**
+   * Gate an ACP `session/request_permission` through the injected controller.
+   * With no controller wired, keeps the legacy blind auto-allow (backward
+   * compatible). Otherwise classifies the request, resolves the policy, and
+   * either auto-decides or prompts the user — every outcome is audited.
+   */
+  private async handlePermissionRequest(
+    id: number | string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const options = (params.options ?? []) as PermissionOption[];
+    const controller = permissionController;
+
+    // Legacy path: no gate installed → auto-allow as before.
+    if (!controller) {
+      const allow =
+        options.find((o) => /allow/i.test(o.kind)) ??
+        options.find((o) => o.optionId === 'allow_once') ??
+        options[0];
+      this.respondOk(id, {
+        outcome: { outcome: 'selected', optionId: allow?.optionId ?? 'allow_once' },
+      });
+      return;
+    }
+
+    const sessionId = typeof params.sessionId === 'string' ? params.sessionId : '';
+    const toolCall = params.toolCall as PermissionToolCall | undefined;
+    const kind = toolCall?.kind ?? 'other';
+    const title = toolCall?.title ?? toolCall?.kind ?? 'tool call';
+    const cls = classifyPermission(toolCall, options);
+    // Stable per-session allow-list key: kind + title identifies "this action".
+    const key = `${kind}:${title}`;
+
+    const emitAudit = (decision: 'allow' | 'deny', source: PermissionAuditSource): void => {
+      controller.audit({
+        at: new Date().toISOString(),
+        sessionId,
+        title,
+        kind,
+        classification: cls,
+        decision,
+        source,
+      });
+    };
+
+    const respondAllow = (source: PermissionAuditSource): void => {
+      const optionId = pickOption(options, true);
+      if (optionId) {
+        this.respondOk(id, { outcome: { outcome: 'selected', optionId } });
+      } else {
+        // No allow option offered — ack so the agent proceeds (legacy fallback).
+        this.respondOk(id, {});
+      }
+      emitAudit('allow', source);
+    };
+
+    const respondDeny = (source: PermissionAuditSource): void => {
+      const optionId = pickOption(options, false);
+      if (optionId) {
+        this.respondOk(id, { outcome: { outcome: 'selected', optionId } });
+      } else {
+        this.respondOk(id, { outcome: { outcome: 'cancelled' } });
+      }
+      emitAudit('deny', source);
+    };
+
+    const mode = controller.mode();
+    const allowlisted = controller.isAllowlisted(sessionId, key);
+    const { decision } = resolvePolicy(mode, cls, allowlisted);
+
+    if (decision === 'allow') {
+      const source: PermissionAuditSource =
+        cls === 'read' ? 'read' : mode === 'allow' ? 'mode-allow' : 'allowlist';
+      respondAllow(source);
+      return;
+    }
+
+    if (decision === 'deny') {
+      // Only reachable in readonly mode for write/unknown actions.
+      respondDeny('mode-readonly');
+      return;
+    }
+
+    // decision === 'prompt': ask the user (write/unknown in ask mode).
+    const result = await controller.prompt({ sessionId, title, kind, classification: cls, options });
+    if (result.allow) {
+      if (result.remember) controller.remember(sessionId, key);
+      respondAllow('user');
+    } else {
+      respondDeny(result.timedOut ? 'timeout-deny' : 'user');
     }
   }
 }
