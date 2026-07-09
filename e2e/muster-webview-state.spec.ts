@@ -164,7 +164,8 @@ test.describe('Muster webview host state smoke', () => {
     await expect(page.locator('.task-workspace-banner').getByText('Task is open')).toHaveCount(0);
     await page.locator('.task-workspace-banner').getByRole('button', { name: /Expand task details/i }).click();
     await expect(page.locator('.task-workspace-banner').getByText('Task is open')).toBeVisible();
-    await expect(page.locator('[data-cli-status="not_started"]').getByText(/CLI not started/i)).toBeVisible();
+    // Transcript present ⇒ prior process (hadProcess); CLI strip shows stopped, not not_started.
+    await expect(page.locator('[data-cli-status="stopped"]').getByText(/CLI stopped/i)).toBeVisible();
     await expect(page.getByText('Harness ready.')).toBeVisible();
   });
 
