@@ -205,7 +205,7 @@ export function issueTurnCredential(
 export function buildRunOptionsForTurn(
   deps: GraphEngineDeps,
   turnId: string,
-  base: { prompt: string; resumeId?: string; signal?: AbortSignal; cwd?: string },
+  base: { prompt: string; resumeId?: string; signal?: AbortSignal; cwd?: string; model?: string },
 ): { options: import('../types').RunOptions; mcpConfigPath?: string } {
   const file = deps.store.getFile();
   const turn = file.turns[turnId];

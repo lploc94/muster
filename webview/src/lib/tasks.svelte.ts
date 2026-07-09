@@ -1,5 +1,6 @@
-import type { SnapshotMessage, TaskSummary } from './protocol';
+import type { BackendModels, SnapshotMessage, TaskSummary } from './protocol';
 import { isTerminalStatus } from './protocol';
+import { vscode } from './vscode';
 
 export interface CommandErrorState {
   taskId: string | null;
@@ -27,10 +28,30 @@ class TasksState {
 
   selectedBackend = $state<WebviewBackendId>('claude');
 
+  /** Selected model value for the current backend; null = the backend default. */
+  selectedModel = $state<string | null>(null);
+
   /** Backend ids the host reports as installed/callable; null = not yet known. */
   availableBackends = $state<string[] | null>(null);
 
+  /** Per-backend model lists reported by the host; null = not yet enumerated. */
+  modelsByBackend = $state<Record<string, BackendModels> | null>(null);
+
   commandError = $state<CommandErrorState | null>(null);
+
+  constructor() {
+    // Restore the last-used backend/model from webview state (persists across reloads).
+    try {
+      const saved = vscode.getState() as { selectedBackend?: unknown; selectedModel?: unknown } | undefined;
+      const be = saved?.selectedBackend;
+      if (be === 'claude' || be === 'grok' || be === 'kiro' || be === 'codex' || be === 'opencode') {
+        this.selectedBackend = be;
+      }
+      if (typeof saved?.selectedModel === 'string') this.selectedModel = saved.selectedModel;
+    } catch {
+      // best-effort — fall back to defaults
+    }
+  }
 
   get rootTasks(): TaskSummary[] {
     const roots: TaskSummary[] = [];
@@ -52,7 +73,17 @@ class TasksState {
   }
 
   setBackend(next: WebviewBackendId): void {
+    // Switching backend drops the model selection (models are backend-specific).
+    if (next !== this.selectedBackend) this.selectedModel = null;
     this.selectedBackend = next;
+    this.persistSelection();
+  }
+
+  /** Select a specific (backend, model) pair from the grouped model picker. */
+  setModelSelection(backend: WebviewBackendId, model: string): void {
+    this.selectedBackend = backend;
+    this.selectedModel = model;
+    this.persistSelection();
   }
 
   setAvailableBackends(ids: string[]): void {
@@ -61,6 +92,29 @@ class TasksState {
     // available one so the picker never shows a dead default.
     if (ids.length > 0 && !ids.includes(this.selectedBackend)) {
       this.selectedBackend = ids[0] as WebviewBackendId;
+      this.selectedModel = null;
+      this.persistSelection();
+    }
+  }
+
+  setAvailableModels(models: Record<string, BackendModels>): void {
+    this.modelsByBackend = models;
+    // Drop a persisted/selected model the current backend no longer advertises.
+    if (this.selectedModel) {
+      const opts = models[this.selectedBackend]?.options;
+      if (!opts || !opts.some((o) => o.value === this.selectedModel)) {
+        this.selectedModel = null;
+        this.persistSelection();
+      }
+    }
+  }
+
+  private persistSelection(): void {
+    try {
+      const prev = (vscode.getState() as Record<string, unknown> | undefined) ?? {};
+      vscode.setState({ ...prev, selectedBackend: this.selectedBackend, selectedModel: this.selectedModel });
+    } catch {
+      // best-effort
     }
   }
 

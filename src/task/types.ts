@@ -30,6 +30,8 @@ export interface MusterTask {
   dependencies: TaskDependency[];
   wait?: PersistedWait;
   backend: string;
+  /** Optional model id selected for this task (ACP session config option value). */
+  model?: string;
   committedSessionId?: string;
   /**
    * Workspace directory the agent runs in for this task's turns (schema-compatible:

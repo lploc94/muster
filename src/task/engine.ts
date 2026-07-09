@@ -548,6 +548,8 @@ export class TaskEngine {
   startNewTask(params: {
     goal: string;
     backend: string;
+    /** Model id selected for this task (ACP session config option value). */
+    model?: string;
     continuationOf?: string;
     role?: TaskRole;
     /** Full content of the first user message. If not provided, falls back to goal. */
@@ -572,6 +574,7 @@ export class TaskEngine {
       parentId: null,
       dependencies: [],
       backend: params.backend,
+      model: params.model,
       cwd: params.cwd,
       capabilities: ['create_child', 'start_child', 'wait_child', 'read_subtree'],
       executionPolicy: DEFAULT_POLICY,
@@ -1399,8 +1402,17 @@ export class TaskEngine {
             // pass it as session/new|load { cwd } instead of falling back to
             // process.cwd() (wrong dir in a packaged extension).
             cwd: task.cwd,
+            model: task.model,
           })
-        : { options: { prompt, resumeId: task.committedSessionId, signal: abort.signal, cwd: task.cwd } };
+        : {
+            options: {
+              prompt,
+              resumeId: task.committedSessionId,
+              signal: abort.signal,
+              cwd: task.cwd,
+              model: task.model,
+            },
+          };
       mcpConfigPath = built.mcpConfigPath;
 
       for await (const event of this.runTurnFn(backend, built.options)) {

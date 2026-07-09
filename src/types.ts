@@ -24,6 +24,8 @@ export interface RunOptions {
   cwd?: string;
   extraEnv?: Record<string, string>;
   signal?: AbortSignal;
+  /** Model to select for this turn's session (ACP `session/set_config_option`). */
+  model?: string;
 }
 
 export interface BackendCapabilities {

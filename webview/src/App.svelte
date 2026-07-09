@@ -308,6 +308,10 @@
         case 'backendsAvailable':
           tasks.setAvailableBackends(msg.backends);
           break;
+
+        case 'modelsAvailable':
+          tasks.setAvailableModels(msg.models);
+          break;
       }
     }
 

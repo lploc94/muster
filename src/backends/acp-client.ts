@@ -311,6 +311,51 @@ export function disposeSharedAcpClient(): void {
   sharedClients.clear();
 }
 
+/** One selectable value of an ACP `select` config option. */
+export interface AcpConfigOptionChoice {
+  value: string;
+  name: string;
+  description?: string;
+}
+
+/** The model config option advertised by an agent in the `session/new` response. */
+export interface AcpModelConfig {
+  /** The option id to pass as `configId` to `session/set_config_option` (usually "model"). */
+  id: string;
+  currentValue?: string;
+  options: AcpConfigOptionChoice[];
+}
+
+/** Pull the `category: 'model'` config option out of a `session/new` response. */
+export function extractModelConfig(configOptions: unknown): AcpModelConfig | undefined {
+  if (!Array.isArray(configOptions)) return undefined;
+  for (const opt of configOptions) {
+    if (!opt || typeof opt !== 'object') continue;
+    const o = opt as Record<string, unknown>;
+    if (o.category !== 'model' || typeof o.id !== 'string' || !Array.isArray(o.options)) continue;
+    const choices: AcpConfigOptionChoice[] = [];
+    for (const choice of o.options as unknown[]) {
+      if (!choice || typeof choice !== 'object') continue;
+      const c = choice as Record<string, unknown>;
+      if (typeof c.value === 'string' && typeof c.name === 'string') {
+        choices.push({
+          value: c.value,
+          name: c.name,
+          description: typeof c.description === 'string' ? c.description : undefined,
+        });
+      }
+    }
+    if (choices.length > 0) {
+      return {
+        id: o.id,
+        currentValue: typeof o.currentValue === 'string' ? o.currentValue : undefined,
+        options: choices,
+      };
+    }
+  }
+  return undefined;
+}
+
 export class AcpClient {
   private proc?: ChildProcessWithoutNullStreams;
   private rl?: Interface;
@@ -357,10 +402,31 @@ export class AcpClient {
     return this.connectPromise;
   }
 
-  async newSession(cwd: string, mcpServers: McpServerConfig[]): Promise<{ sessionId: string }> {
+  async newSession(
+    cwd: string,
+    mcpServers: McpServerConfig[],
+  ): Promise<{ sessionId: string; modelConfig?: AcpModelConfig }> {
     await this.ensureConnected();
-    const res = (await this.request('session/new', { cwd, mcpServers })) as { sessionId: string };
-    return { sessionId: res.sessionId };
+    const res = (await this.request('session/new', { cwd, mcpServers })) as {
+      sessionId: string;
+      configOptions?: unknown;
+    };
+    return { sessionId: res.sessionId, modelConfig: extractModelConfig(res.configOptions) };
+  }
+
+  /** Set a session config option (e.g. the model) via ACP `session/set_config_option`. */
+  async setConfigOption(sessionId: string, configId: string, value: string): Promise<void> {
+    await this.ensureConnected();
+    await this.request('session/set_config_option', { sessionId, configId, value });
+  }
+
+  /** Best-effort `session/close` — used to release a transient enumeration session. */
+  async closeSession(sessionId: string): Promise<void> {
+    try {
+      await this.request('session/close', { sessionId });
+    } catch {
+      // Not all agents support session/close; leaving the session is harmless.
+    }
   }
 
   async loadSession(

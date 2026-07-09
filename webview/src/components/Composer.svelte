@@ -101,8 +101,15 @@
         type: 'send';
         text: string;
         backend: string;
+        model?: string;
         continuationOf?: string;
       } = { type: 'send', text: value, backend };
+      // Only deliver a model that belongs to the chosen backend's catalog. Before
+      // enumeration finishes (catalog null) trust the persisted selection.
+      const model = tasks.selectedModel;
+      if (model && (!tasks.modelsByBackend || modelInCatalog(backend, model))) {
+        payload.model = model;
+      }
       if (tasks.continuationOf) payload.continuationOf = tasks.continuationOf;
       threadStore.current.appendTranscript({
         id: `local-${Date.now()}`,
@@ -237,6 +244,58 @@
     return filtered.length > 0 ? filtered : BACKENDS;
   });
 
+  // Grouped model picker: one `[Backend] Model` option per enumerated model.
+  // Until the host reports models, fall back to plain per-backend options.
+  const pickerOptions = $derived.by(() => {
+    const models = tasks.modelsByBackend;
+    if (models && Object.keys(models).length > 0) {
+      const opts: { value: string; label: string }[] = [];
+      for (const be of pickerBackends) {
+        const m = models[be.id];
+        if (m && m.options.length > 0) {
+          for (const o of m.options) {
+            opts.push({ value: `${be.id}::${o.value}`, label: `[${backendShortLabel(be.id)}] ${o.name}` });
+          }
+        } else {
+          opts.push({ value: be.id, label: be.label });
+        }
+      }
+      if (opts.length > 0) return opts;
+    }
+    return pickerBackends.map((b) => ({ value: b.id, label: b.label }));
+  });
+
+  const modelsLoaded = $derived(!!tasks.modelsByBackend && Object.keys(tasks.modelsByBackend).length > 0);
+
+  function modelInCatalog(backend: string, model: string): boolean {
+    return !!tasks.modelsByBackend?.[backend]?.options.some((o) => o.value === model);
+  }
+
+  // Encoded value the select should show — always an option that exists in
+  // `pickerOptions`. Until models load (or for a backend with none) that is the
+  // plain backend id; otherwise the chosen model, else the backend's default.
+  const currentPickerValue = $derived.by(() => {
+    if (!modelsLoaded) return currentBackend;
+    const m = tasks.modelsByBackend?.[currentBackend];
+    if (m && m.options.length > 0) {
+      const chosen =
+        tasks.selectedModel && modelInCatalog(currentBackend, tasks.selectedModel)
+          ? tasks.selectedModel
+          : (m.current ?? m.options[0].value);
+      return `${currentBackend}::${chosen}`;
+    }
+    return currentBackend;
+  });
+
+  // Ask the host to enumerate models once, when the draft composer first mounts.
+  let modelsRequested = false;
+  $effect(() => {
+    if (mode === 'draft' && !modelsRequested) {
+      modelsRequested = true;
+      post({ type: 'listModels' });
+    }
+  });
+
   const placeholder = $derived(
     mode === 'draft'
       ? `Start a new coordinator task with ${currentBackend}…`
@@ -245,11 +304,20 @@
         : `Message this task…`,
   );
 
+  const BACKEND_IDS = ['claude', 'grok', 'kiro', 'codex', 'opencode'];
+
   function onBackendChange(e: Event) {
     const el = (e.currentTarget ?? backendSelect) as (HTMLElement & { value: string }) | undefined;
-    const next = el?.value;
-    if (next === 'claude' || next === 'grok' || next === 'kiro' || next === 'codex' || next === 'opencode') {
-      tasks.setBackend(next as WebviewBackendId);
+    const raw = el?.value ?? '';
+    const sep = raw.indexOf('::');
+    if (sep >= 0) {
+      const backend = raw.slice(0, sep);
+      const model = raw.slice(sep + 2);
+      if (BACKEND_IDS.includes(backend)) {
+        tasks.setModelSelection(backend as WebviewBackendId, model);
+      }
+    } else if (BACKEND_IDS.includes(raw)) {
+      tasks.setBackend(raw as WebviewBackendId);
     }
   }
 </script>
@@ -280,16 +348,16 @@
       {#if mode === 'draft'}
         <vscode-single-select
           bind:this={backendSelect}
-          value={currentBackend}
-          use:tip={'Select CLI / model for new task'}
+          value={currentPickerValue}
+          use:tip={'Select model for new task'}
           disabled={thread.running}
           position="above"
           onchange={onBackendChange}
           oninput={onBackendChange}
           style="width: fit-content; min-width: fit-content;"
         >
-          {#each pickerBackends as be (be.id)}
-            <vscode-option value={be.id}>{be.label}</vscode-option>
+          {#each pickerOptions as opt (opt.value)}
+            <vscode-option value={opt.value}>{opt.label}</vscode-option>
           {/each}
         </vscode-single-select>
       {:else}

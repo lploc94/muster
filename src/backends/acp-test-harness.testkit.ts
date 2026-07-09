@@ -26,6 +26,7 @@ export interface FakeAcpHarness {
     ensureConnected: unknown[][];
     newSession: unknown[][];
     loadSession: unknown[][];
+    setConfigOption: unknown[][];
     prompt: unknown[][];
     cancel: unknown[][];
     registerConnectionSink: unknown[][];
@@ -44,7 +45,12 @@ export interface FakeAcpHarness {
 }
 
 export function makeFakeAcpClient(
-  opts: { sessionId?: string; loadSessionSupported?: boolean } = {},
+  opts: {
+    sessionId?: string;
+    loadSessionSupported?: boolean;
+    /** Model config returned from `newSession` (as an ACP agent would advertise). */
+    modelConfig?: { id: string; currentValue?: string; options: { value: string; name: string }[] };
+  } = {},
 ): FakeAcpHarness {
   const sessionId = opts.sessionId ?? 'sess-1';
   let sessionSink: ((u: unknown) => void) | undefined;
@@ -62,6 +68,7 @@ export function makeFakeAcpClient(
     ensureConnected: [],
     newSession: [],
     loadSession: [],
+    setConfigOption: [],
     prompt: [],
     cancel: [],
     registerConnectionSink: [],
@@ -84,12 +91,16 @@ export function makeFakeAcpClient(
     newSession: async (...args: unknown[]) => {
       callOrder.push('newSession');
       calls.newSession.push(args);
-      return { sessionId };
+      return { sessionId, modelConfig: opts.modelConfig };
     },
     loadSession: async (...args: unknown[]) => {
       callOrder.push('loadSession');
       calls.loadSession.push(args);
       return { sessionId };
+    },
+    setConfigOption: async (...args: unknown[]) => {
+      callOrder.push('setConfigOption');
+      calls.setConfigOption.push(args);
     },
     registerSessionSink: (sid: string, fn: (u: unknown) => void) => {
       callOrder.push('registerSessionSink');

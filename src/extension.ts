@@ -23,6 +23,7 @@ import {
 } from './host/retention-settings';
 import { detectAvailableBackends, installAugmentedPath } from './host/backend-availability';
 import { pickWorkspaceFileMentionPath } from './host/workspace-files';
+import { enumerateModels, type BackendModels } from './backends/model-catalog';
 import { SESSION_MIGRATION_MARKER, migrateLegacySessions } from './task/migration-sessions';
 import { applyRetention, retentionChanged, type RetentionConfig } from './task/retention';
 import { TaskEngine, type EngineEvent, viewStatusFromDraft } from './task/engine';
@@ -186,6 +187,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   private _view?: vscode.WebviewView;
   /** In-flight/cached detection of which backend CLIs are callable (computed once). */
   private availableBackendsPromise?: Promise<string[]>;
+  /** In-flight/cached per-backend model enumeration (computed once). */
+  private availableModelsPromise?: Promise<Record<string, BackendModels>>;
   focusedTaskId?: string;
 
   constructor(private readonly _extensionUri: vscode.Uri) {}
@@ -367,6 +370,24 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       // Detection failed — drop the cached rejection so a later request retries;
       // the webview meanwhile fails open and shows all backends.
       this.availableBackendsPromise = undefined;
+    }
+  }
+
+  /**
+   * Enumerate each installed backend's models (via a throwaway ACP session) and
+   * send them to the webview for the grouped model picker. Cached (computed
+   * once); on failure the webview keeps the plain backend picker.
+   */
+  private async postAvailableModels(): Promise<void> {
+    try {
+      this.availableModelsPromise ??= (async () => {
+        const backends = await (this.availableBackendsPromise ??= detectAvailableBackends());
+        return enumerateModels(backends, resolveTaskCwd());
+      })();
+      const models = await this.availableModelsPromise;
+      this.post({ type: 'modelsAvailable', models });
+    } catch {
+      this.availableModelsPromise = undefined;
     }
   }
 
@@ -719,6 +740,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     taskId?: string;
     text: string;
     backend?: string;
+    model?: string;
     continuationOf?: string;
   }): Promise<void> {
     if (!taskEngine || !taskStore) {
@@ -759,6 +781,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         goal: shortGoal,
         message: fullMessage,
         backend: data.backend ?? 'claude',
+        model: typeof data.model === 'string' && data.model ? data.model : undefined,
         continuationOf: data.continuationOf,
         // Capture the workspace cwd at task-creation time so every turn (and any
         // delegated child) runs in the right directory instead of process.cwd().
@@ -1039,6 +1062,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           break;
         case 'listBackends':
           void this.postAvailableBackends();
+          break;
+        case 'listModels':
+          void this.postAvailableModels();
           break;
         default:
           // Unknown inbound type: log instead of silently ignoring. This surfaces
