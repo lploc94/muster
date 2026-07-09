@@ -372,7 +372,7 @@ function deterministicRetryTurnId(failedTurnId: string, retryIndex: number): str
   return `${failedTurnId}-auto-retry-${retryIndex}`;
 }
 
-function viewStatusFromDraft(draft: TaskStoreFile, taskId: string) {
+export function viewStatusFromDraft(draft: TaskStoreFile, taskId: string) {
   const task = draft.tasks[taskId];
   if (!task) {
     return undefined;

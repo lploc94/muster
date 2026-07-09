@@ -82,7 +82,7 @@
         {
           "type": "webview",
           "id": "muster.chat",
-          "name": "Chat"
+          "name": "Muster"
         }
       ]
     }

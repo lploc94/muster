@@ -1,6 +1,5 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import Toolbar from './components/Toolbar.svelte';
   import TaskHistoryList from './components/TaskList.svelte';
   import TaskWorkspace from './components/TaskWorkspace.svelte';
   import PermissionCard from './components/PermissionCard.svelte';
@@ -63,6 +62,14 @@
   function clearHistory() {
     historyOpen = false;
     post({ type: 'clearHistory' });
+  }
+
+  function deleteTask(taskId: string) {
+    post({ type: 'deleteTask', taskId });
+  }
+
+  function renameTask(taskId: string, goal: string) {
+    post({ type: 'renameTask', taskId, goal });
   }
 
   function backToList() {
@@ -204,8 +211,6 @@
   });
 </script>
 
-<Toolbar {inChat} {historyOpen} toggleHistory={() => (historyOpen = !historyOpen)} />
-
 {#if protocolMismatch}
   <div
     class="px-3 py-1 text-xs"
@@ -240,22 +245,23 @@
 {/if}
 
 {#if !inChat}
-  <!-- Entry: show previous coordinator tasks -->
-  <div class="flex-1 min-h-0 flex flex-col p-3">
-    <div class="flex items-center justify-between mb-2 px-1">
-      <span class="font-semibold">Previous tasks</span>
-      <button
-        type="button"
-        class="icon-btn"
-        style="width: 22px; height: 22px;"
-        onclick={() => { tasks.openNewTaskDraft(); post({ type: 'newTask' }); historyOpen = false; }}
-        aria-label="New task"
-        use:tip={'New task'}
-      >
-        <span class="codicon codicon-add"></span>
-      </button>
-    </div>
-    <TaskHistoryList variant="full" onSelect={(id) => { selectTask(id); historyOpen = false; }} onClear={clearHistory} />
+  <!-- Entry: New task action, then the searchable previous-tasks list -->
+  <div class="flex-1 min-h-0 flex flex-col">
+    <button
+      type="button"
+      class="shrink-0 flex items-center gap-2 px-3 py-2 text-sm font-medium w-full text-left hover:bg-[var(--vscode-list-hoverBackground)]"
+      onclick={() => { tasks.openNewTaskDraft(); post({ type: 'newTask' }); historyOpen = false; }}
+    >
+      <span class="codicon codicon-add" style="font-size: 16px;"></span>
+      <span>New task</span>
+    </button>
+    <div class="shrink-0" style="border-top: 1px solid var(--vscode-panel-border);"></div>
+    <TaskHistoryList
+      variant="full"
+      onSelect={(id) => { selectTask(id); historyOpen = false; }}
+      onDelete={deleteTask}
+      onRename={renameTask}
+    />
   </div>
 {:else}
   <div class="flex-1 min-h-0 flex flex-col relative">
@@ -344,7 +350,7 @@
           <span class="font-medium">Previous tasks</span>
           <button type="button" class="underline text-xs" onclick={() => { clearHistory(); }}>Clear</button>
         </div>
-        <TaskHistoryList variant="dropdown" onSelect={(id) => { selectTask(id); }} onClear={() => { clearHistory(); }} />
+        <TaskHistoryList variant="dropdown" onSelect={(id) => { selectTask(id); }} />
       </div>
     {/if}
   </div>

@@ -144,6 +144,8 @@ export type OutMessage =
   | { type: 'resumeQueuedTurn'; taskId: string; turnId: string }
   | { type: 'openLink'; url: string }
   | { type: 'clearHistory' }
+  | { type: 'deleteTask'; taskId: string }
+  | { type: 'renameTask'; taskId: string; goal: string }
   | { type: 'blurTask' };
 
 /** Post a typed message to the extension host. */
