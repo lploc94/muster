@@ -149,11 +149,15 @@ In the task-based flow:
 - task lifecycle is sealed by the **user** and/or an authorized **coordinator**
   when the user enables outcome delegation (default supervised confirm; later
   **yolo** handoff) — never by CLI exit alone; soft `failed` reopens on a new
-  user message; cancel cascades; **skip** = created but won’t perform;
+  user message; cancel/skip cascade; **skip** = created but won’t perform;
+- webview surfaces: **task status card as workspace header** + status menu
+  (`setTaskLifecycle`); CLI strip on composer; hard terminals use continuation
+  (no same-id reopen); `awaiting_outcome` does not block send;
 - "New task" replaces "New Session" as the primary user action.
 
 See `TASK-MANAGEMENT.md` for the authoritative domain model (especially §3–§5,
-§4.3) and `SESSION-MANAGEMENT.md` for backend-specific identity/resume behavior.
+§4.3, §9, §14) and `SESSION-MANAGEMENT.md` for backend-specific identity/resume
+behavior.
 
 ## 7. MCP Integration (two servers per turn)
 

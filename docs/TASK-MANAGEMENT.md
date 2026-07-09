@@ -509,6 +509,8 @@ Derivation sketch (from turns + live stream flags):
 4. Latest process settled, or orchestration with no live process (`needs_recovery`, `waiting_children`, `awaiting_outcome`, hard/soft terminal with prior process) → **`stopped`**; set `lastExit` from latest terminal turn when known.
 5. Open task, never spawned → **`not_started`**.
 
+**Reload / derive hints (webview):** until the host projects `cliViewStatus`, treat a prior process as known when `thread.hadProcess` is true **or** the task has a `committedSessionId` (bound conversation implies a prior successful process). Empty open task with neither → `not_started`.
+
 Under Muster’s common **one process per turn** model, `on + idle` between user
 messages is uncommon (process usually exits → `stopped`). `idle` is still
 required for **ask_user** (process alive, not generating). If a backend later
@@ -561,9 +563,9 @@ type TaskViewStatus = TaskLifecycleState | TaskRuntimeActivity;
 | UI surface | Shows |
 |------------|--------|
 | Task list badge | **Lifecycle only** (optional tiny live-process dot, not a second status word) |
-| Workspace header | **Lifecycle** + backend; optional one-line orchestration hint |
+| Workspace header | **Task status card** = header (name + lifecycle badge + status menu). No separate title row that repeats the same badge. **Expand details** (collapsed by default) shows lifecycle copy, optional orchestration one-liner, bound session id, continuation hint — not when collapsed. |
 | Composer strip | **CLI view** (`not_started` / `running` / `idle` / `stopped`); optional lastExit when stopped |
-| Action panels | Recovery, resume queue, outcome accept/reject |
+| Action panels | Recovery, resume queue; outcome accept/reject when product ships dedicated card (today: lifecycle status menu) |
 
 Composer / send rules use lifecycle **and** live CLI/orchestration (see §9).
 
@@ -697,8 +699,9 @@ coordinator seals; CLI never does.
 | UI / API | Domain effect | Lifecycle |
 |----------|---------------|-----------|
 | **Pause / Stop turn** → `interruptTurn` | Abort live process; turn → `interrupted` | stays `open` |
-| **Cancel task** → `cancelTask` | Task + **all descendants** → `cancelled`; live turns cancelled; proposals cleared | hard terminal |
-| **Skip task** → `skipTask` | Authorized actor marks **won’t perform**; see §5.6 | hard terminal |
+| **Cancel task** → `cancelTask` (or `setTaskLifecycle` → `cancelled`) | Task + **all descendants** → `cancelled`; live turns cancelled; proposals cleared | hard terminal |
+| **Skip task** → `skipTask` (or `setTaskLifecycle` → `skipped`) | Authorized actor marks **won’t perform**; cascades unfinished descendants; see §5.6 | hard terminal |
+| **User status menu** → `setTaskLifecycle` | Direct lifecycle seal from UI: `succeeded` / `failed` / `open` (soft reopen only) / routes cancel & skip as above | per target state |
 
 - `retryTurn` / recovery create a **new** turn; they never revive a dead process
   and never set lifecycle by themselves.
@@ -735,8 +738,9 @@ deliberate “won’t do,” not an error and not an abort of in-flight work.
 | Wait / deps | Settles wait barriers. Does **not** satisfy `requiredOutcome: 'succeeded'`. Dependents with `onUnsatisfied: 'skip'` may themselves become `skipped`. |
 | CLI | Never maps process exit or missing disposition to `skipped`. |
 
-Host command (illustrative): `skipTask { taskId, reason?: string }`. Optional
-`reason` is stored for transcript/history only.
+Host path (implemented): webview posts `setTaskLifecycle { taskId, lifecycle: 'skipped' }`;
+host routes to engine `skipTask` (cascade + interrupt live turns). Optional `reason`
+may be added later for transcript/history only.
 
 ### 5.7 Settled outcomes for waits and dependencies
 
@@ -861,9 +865,10 @@ the same tool-call/operation ID is idempotent; a conflicting disposition is
 rejected. The engine derives mutation idempotency from `(turnId, toolCallId)` or an
 equivalent stable operation ID.
 
-User decisions and mode control are **host/webview commands** (not MCP), e.g.
-`acceptOutcome`, `rejectOutcome { reason?: string }`, `cancelTask`, `skipTask`,
-`setOutcomeAuthorityMode { mode }` (name illustrative).
+User decisions and mode control are **host/webview commands** (not MCP). Implemented
+today: `setTaskLifecycle` (user status menu; cancel/skip cascade via engine). Planned
+dedicated cards: `acceptOutcome`, `rejectOutcome { reason?: string }`,
+`setOutcomeAuthorityMode { mode }`.
 
 ### 8.2 Explicit child waiting
 
@@ -935,9 +940,9 @@ both constrain behavior:
 | `open` | `running` / `waiting_user` | Persist; do not inject into the live process except via `submitAsk` |
 | `open` | `waiting_children` / `blocked` | Persist for the next continuation turn |
 | `open` | `needs_recovery` | Persist; offer explicit Retry / Continue recovery |
-| `open` | `awaiting_outcome` | Prefer Accept/Reject on the outcome card; a new message may be treated as implicit reject-with-reason (clear proposal, stay open, queue turn) — product default: **require explicit reject or accept** so sends while a proposal is pending are either blocked or queued as pending until the card is dismissed |
+| `open` | `awaiting_outcome` | Prefer Accept/Reject when an outcome card exists. **Composer stays writable:** a new `send` clears `outcomeProposal`, keeps lifecycle `open`, and queues a turn (continue session). Do **not** block send solely because a proposal is pending. |
 | `failed` (soft) | — | **Reopen** to `open`, then queue a turn with the message |
-| `succeeded` / `cancelled` / `skipped` | — | Read-only; offer **Continue as new task** (or new task if user later wants a previously skipped goal) |
+| `succeeded` / `cancelled` / `skipped` | — | Read-only; no reopen on the same task id. Offer **Continue as new task** (or new task if the user later wants a previously skipped goal) |
 
 Chat messages are durable records, not raw queued strings. They provide both the
 task transcript and delivery identity:
@@ -1107,7 +1112,7 @@ turns but never seal lifecycle. User and authorized coordinators do.
 | Screen | Content |
 |--------|---------|
 | Task list | Root tasks; **lifecycle** badge only; optional CLI live dot; updated time; **New task** |
-| Task workspace | Lifecycle header; thread; composer **CLI strip**; orchestration panels; outcome card |
+| Task workspace | **Task status card as header** (name + lifecycle + status menu; expand for detail); thread; composer **CLI strip**; orchestration / recovery panels; outcome card when shipped |
 
 Clicking **New task** opens an unpersisted composer. The first submitted message
 creates the root coordinator task (`lifecycle: open`) with that message as its
@@ -1137,35 +1142,54 @@ outcomeProposal?   OutcomeProposal
 ```
 
 Until the host projects `cliViewStatus`, the webview **derives** it from
-`runtimeActivity`, live turn flags, and whether a process ever started (§4.3.2).
+`runtimeActivity`, live turn flags, transcript/`hadProcess`, and
+`committedSessionId` (§4.3.2).
 
 The webview ignores late events whose `turnId` is no longer active for that task.
 `submitAsk` must include `taskId`, `turnId`, and `askId`.
 
-Host commands for user seals and mode (names illustrative):
+Host commands for user seals and mode:
 
 ```text
+# Implemented
+setTaskLifecycle           { taskId, lifecycle, result?, error? }
+  // lifecycle: open | succeeded | failed | cancelled | skipped
+  // open      → only from soft failed (hard terminals rejected)
+  // cancelled → engine cancelTask (cascade descendants)
+  // skipped   → engine skipTask (cascade unfinished descendants)
+  // terminal seals interrupt local live turns; remote-owned → interrupt request
+
+# Planned (outcome card / settings)
 acceptOutcome              { taskId }
 rejectOutcome              { taskId, reason?: string }  // empty reason on complete → failed
-cancelTask                 { taskId }                   // cascade cancelled
-skipTask                   { taskId, reason?: string }  // won’t perform; see §5.6
 setOutcomeAuthorityMode    { mode }                     // user_confirm | coordinator_delegate | yolo
 ```
 
-### 14.3 Outcome card and terminal UX
+Engine also exposes `cancelTask` / `skipTask` directly for host/coordinator paths;
+the webview status menu uses `setTaskLifecycle` only.
 
-- While `lifecycle === 'open'` and `outcomeProposal` is set, show Accept / Reject
-  (reason optional). Do **not** show the task as Succeeded merely because
-  `turnDone` arrived.
+### 14.3 Outcome UX and terminal chrome
+
+- **Header:** task status card (name + lifecycle badge + status menu). Expand
+  details for lifecycle/orchestration/session copy; collapsed by default so the
+  badge is not duplicated in a second header row.
+- While `lifecycle === 'open'` and `outcomeProposal` is set (`awaiting_outcome`):
+  prefer Accept / Reject when a dedicated card ships. **Until then**, the status
+  menu can seal lifecycle; **composer remains writable** and send clears the
+  proposal and continues (§9). Do **not** show the task as Succeeded merely
+  because `turnDone` arrived.
 - Surface **outcome authority mode** (supervised / delegate / yolo) so users know
   whether the coordinator may mark success without confirmation.
 - When a coordinator seals under delegate/yolo, show a non-blocking notice
   (who sealed, when) rather than an Accept card — unless `alwaysConfirmRoot`.
-- **Failed** (soft): composer remains available; send reopens to `open`.
-- **Succeeded** / **Cancelled** / **Skipped**: thread read-only; **Continue as
-  new task** (or new task) if the user wants related work later.
+- **Failed** (soft): composer remains available; send reopens to `open`. Status
+  menu may also **Reopen** → `setTaskLifecycle` `open`.
+- **Succeeded** / **Cancelled** / **Skipped**: thread read-only; **no**
+  reopen-on-same-id (status menu does not offer open). **Continue as new task**
+  (or new task) if the user wants related work later.
 - **Cancel task** = abort in-progress work (cascade). **Skip task** = won’t
-  perform this created task. Both are distinct from **stop/interrupt turn**.
+  perform this created task (cascade unfinished descendants). Both are distinct
+  from **stop/interrupt turn**.
 
 ### 14.4 Anti-patterns (webview)
 
@@ -1173,6 +1197,10 @@ setOutcomeAuthorityMode    { mode }                     // user_confirm | coordi
   from turn events without a separate lifecycle field.
 - Setting list status to “failed” when a CLI turn errors.
 - Treating `turnDone` as task completion.
+- Duplicating task name + lifecycle in both App chrome and the workspace status
+  card (status card **is** the header).
+- Blocking composer solely because `runtimeActivity === 'awaiting_outcome'`.
+- Offering “Reopen” for hard-terminal tasks on the same task id.
 - Auto-sealing root success in **`user_confirm`** mode on agent `complete_task`.
 - Blocking all coordinator seals in **`coordinator_delegate` / `yolo`** as if
   every outcome still required a human click (defeats handoff).
