@@ -25,6 +25,7 @@ import { canCreateTurn, DEFAULT_RESOURCE_LIMITS, type ResourceLimits } from './l
 import { selectCommittedSessionId } from './session-select';
 import { TaskStore } from './store';
 import {
+  applyDependencyTerminal,
   applyFailedTurn,
   applySuccessfulTurn,
   createTask,
@@ -37,10 +38,13 @@ import {
   startProcess,
   startTask as transitionStartTask,
   continueTask as transitionContinueTask,
-  applyDependencyTerminal,
   cancelPendingTurn,
   cancelTask as transitionCancelTask,
+  hasActiveOrQueuedTurn,
+  isHardTerminalLifecycle,
   isTerminalLifecycle,
+  reopenSoftFailedTask,
+  setTaskLifecycle as transitionSetTaskLifecycle,
   type CreateTaskInput,
   type Effect,
 } from './transitions';
@@ -748,14 +752,36 @@ export class TaskEngine {
     let queuedTurnId: string | undefined;
 
     const commit = this.store.commit((draft) => {
-      const draftTask = draft.tasks[taskId];
+      let draftTask = draft.tasks[taskId];
       if (!draftTask) {
         return { ok: false, reason: 'task not found' };
       }
-      if (isTerminalLifecycle(draftTask.lifecycle)) {
+      // Hard terminal: read-only. Soft failed: reopen to open on the same task id.
+      if (isHardTerminalLifecycle(draftTask.lifecycle)) {
         return { ok: false, reason: 'task is terminal' };
       }
+      if (draftTask.lifecycle === 'failed') {
+        const reopened = reopenSoftFailedTask(draftTask, { now });
+        if (!reopened.ok) {
+          return reopened;
+        }
+        draft.tasks[taskId] = reopened.next;
+        draftTask = reopened.next;
+      }
 
+      // New user message supersedes a pending outcome proposal (implicit continue).
+      if (draftTask.outcomeProposal) {
+        draftTask = {
+          ...draftTask,
+          outcomeProposal: undefined,
+          revision: draftTask.revision + 1,
+          updatedAt: now,
+        };
+        draft.tasks[taskId] = draftTask;
+      }
+
+      // Queue a turn when open and no live/queued turn — including after a
+      // successful prior turn (resume session via committedSessionId) or recovery.
       const viewStatus = viewStatusFromDraft(draft, taskId) ?? 'idle';
       draft.messages[messageId] = {
         id: messageId,
@@ -766,7 +792,14 @@ export class TaskEngine {
         createdAt: now,
       };
 
-      if (viewStatus === 'idle') {
+      // Allow continue when idle, awaiting_outcome (proposal cleared above), or
+      // needs_recovery is handled by explicit retry — but plain send on idle after
+      // stopped CLI must always queue a continuation turn.
+      if (
+        viewStatus === 'idle' ||
+        viewStatus === 'awaiting_outcome' ||
+        (viewStatus === 'needs_recovery' && !hasActiveOrQueuedTurn(turnsForTask(draft, taskId)))
+      ) {
         const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
         if (!turnCap.ok) {
           return turnCap;
@@ -934,6 +967,198 @@ export class TaskEngine {
     return { ok: true, value: { turnId: newTurnId } };
   }
 
+  /**
+   * User (or host UI) sets task lifecycle. Never driven by CLI process status.
+   * Cancels/interrupts live turns when sealing terminal outcomes.
+   * For `skipped`, cascades to unfinished descendants (see skipTask).
+   */
+  setTaskLifecycle(
+    taskId: string,
+    lifecycle: TaskLifecycleState,
+    options?: { result?: string; error?: string },
+  ): EngineResult<void> {
+    if (lifecycle === 'skipped') {
+      return this.skipTask(taskId);
+    }
+
+    const now = nowIso(this.clock);
+    const file = this.store.getFile();
+    if (!file.tasks[taskId]) {
+      return { ok: false, reason: 'task not found' };
+    }
+
+    const turns = this.store.getTurnsForTask(taskId);
+    const live = turns.find((t) => t.status === 'running' || t.status === 'waiting_user');
+    const remoteOwned =
+      !!live &&
+      leaseOwnerAlive(this.storePath, live.id) &&
+      !ownsLocalLease(this.storePath, live.id);
+
+    if (live && lifecycle !== 'open' && !remoteOwned) {
+      this.liveRuns.get(live.id)?.abort();
+    }
+
+    const commit = this.store.commit((draft) => {
+      const task = draft.tasks[taskId];
+      if (!task) {
+        return { ok: false, reason: 'task not found' };
+      }
+
+      // Remote-owned live turn: request interrupt (not cancel). We already seal
+      // lifecycle here; remote processCancelRequests cancel branch would call
+      // transitionCancelTask and fail once the task is terminal.
+      if (live && lifecycle !== 'open' && remoteOwned) {
+        draft.cancelRequests = draft.cancelRequests ?? {};
+        draft.cancelRequests[live.id] = {
+          kind: 'interrupt',
+          by: 'engine',
+          opId: `lifecycle-${lifecycle}-${taskId}`,
+          at: now,
+        };
+      }
+
+      const result = transitionSetTaskLifecycle(task, lifecycle, {
+        now,
+        result: options?.result,
+        error: options?.error,
+        sealedBy: 'user',
+      });
+      if (!result.ok) {
+        return result;
+      }
+      draft.tasks[taskId] = result.next;
+
+      // When sealing terminal, settle live/queued turns without leaving zombies.
+      // Skip remote-owned live turns (handled via cancelRequests).
+      if (lifecycle !== 'open') {
+        const pending = Object.values(draft.turns).filter(
+          (t) =>
+            t.taskId === taskId &&
+            (t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user'),
+        );
+        for (const p of pending) {
+          if (live && remoteOwned && p.id === live.id) {
+            continue;
+          }
+          if (p.status === 'queued') {
+            const cancelled = cancelPendingTurn(p, { now });
+            if (cancelled.ok) draft.turns[p.id] = cancelled.next;
+          } else {
+            const interrupted = interruptTurn(p, { now });
+            if (interrupted.ok) {
+              draft.turns[p.id] = {
+                ...interrupted.next,
+                isCancellation: lifecycle === 'cancelled',
+              };
+            }
+          }
+        }
+      }
+      return { ok: true };
+    });
+
+    if (!commit.ok) {
+      return { ok: false, reason: commit.detail ?? commit.reason };
+    }
+
+    if (live && !remoteOwned) {
+      this.askBridge.cancelForTurn(live.id, 'task lifecycle changed');
+      this.credentialRegistry?.revoke(live.id);
+    }
+    return { ok: true, value: undefined };
+  }
+
+  /**
+   * Skip task + unfinished descendants (user or authorized coordinator).
+   * Hard terminal: won’t perform. Live turns are interrupted first.
+   */
+  skipTask(taskId: string): EngineResult<void> {
+    const now = nowIso(this.clock);
+    const file = this.store.getFile();
+    if (!file.tasks[taskId]) {
+      return { ok: false, reason: 'task not found' };
+    }
+
+    const taskIds = [taskId, ...descendantIds(file, taskId)].reverse();
+    const liveTurnIds = taskIds.flatMap((id) =>
+      pendingTurnsForTask(file, id)
+        .filter((turn) => turn.status === 'running' || turn.status === 'waiting_user')
+        .map((turn) => turn.id),
+    );
+    const remoteLiveTurnIds = new Set(
+      liveTurnIds.filter(
+        (turnId) => leaseOwnerAlive(this.storePath, turnId) && !ownsLocalLease(this.storePath, turnId),
+      ),
+    );
+    for (const turnId of liveTurnIds) {
+      if (!remoteLiveTurnIds.has(turnId)) {
+        this.liveRuns.get(turnId)?.abort();
+      }
+    }
+
+    const commit = this.store.commit((draft) => {
+      for (const id of taskIds) {
+        const task = draft.tasks[id];
+        if (!task || isTerminalLifecycle(task.lifecycle)) {
+          continue;
+        }
+        const pendingTurns = pendingTurnsForTask(draft, id);
+        const currentLive = pendingTurns.find(
+          (turn) => turn.status === 'running' || turn.status === 'waiting_user',
+        );
+        if (currentLive && remoteLiveTurnIds.has(currentLive.id)) {
+          draft.cancelRequests = draft.cancelRequests ?? {};
+          // interrupt: task is sealed to skipped here; remote only settles the turn.
+          draft.cancelRequests[currentLive.id] = {
+            kind: 'interrupt',
+            by: 'engine',
+            opId: `skip-task-${taskId}`,
+            at: now,
+          };
+        }
+        const result = transitionSetTaskLifecycle(task, 'skipped', {
+          now,
+          sealedBy: 'user',
+        });
+        if (!result.ok) {
+          return result;
+        }
+        draft.tasks[id] = result.next;
+        for (const pending of pendingTurns) {
+          if (currentLive && remoteLiveTurnIds.has(currentLive.id) && pending.id === currentLive.id) {
+            continue;
+          }
+          if (pending.status === 'queued') {
+            const cancelled = cancelPendingTurn(pending, { now });
+            if (!cancelled.ok) return cancelled;
+            draft.turns[pending.id] = cancelled.next;
+          } else {
+            const interrupted = interruptTurn(pending, { now });
+            if (!interrupted.ok) return interrupted;
+            draft.turns[pending.id] = interrupted.next;
+          }
+        }
+      }
+      return { ok: true };
+    });
+
+    if (!commit.ok) {
+      return { ok: false, reason: commit.detail ?? commit.reason };
+    }
+    for (const turnId of liveTurnIds) {
+      if (remoteLiveTurnIds.has(turnId)) {
+        continue;
+      }
+      this.acceptedOpIds.delete(turnId);
+      this.askBridge.cancelForTurn(turnId, 'task skipped');
+      this.credentialRegistry?.revoke(turnId);
+    }
+    return { ok: true, value: undefined };
+  }
+
+  /**
+   * Cancel task + descendants (user or authorized coordinator). Not driven by CLI exit.
+   */
   cancelTask(taskId: string): EngineResult<void> {
     const now = nowIso(this.clock);
     const file = this.store.getFile();
@@ -948,7 +1173,9 @@ export class TaskEngine {
         .map((turn) => turn.id),
     );
     const remoteLiveTurnIds = new Set(
-      liveTurnIds.filter((turnId) => leaseOwnerAlive(this.storePath, turnId) && !ownsLocalLease(this.storePath, turnId)),
+      liveTurnIds.filter(
+        (turnId) => leaseOwnerAlive(this.storePath, turnId) && !ownsLocalLease(this.storePath, turnId),
+      ),
     );
     for (const turnId of liveTurnIds) {
       if (!remoteLiveTurnIds.has(turnId)) {
@@ -1058,42 +1285,41 @@ export class TaskEngine {
     const deps = this.graphDeps();
     const now = nowIso(this.clock);
     const nowMs = Date.parse(now);
+    if (!Number.isFinite(nowMs)) return;
     for (const task of Object.values(this.store.getFile().tasks)) {
       if (isTerminalLifecycle(task.lifecycle)) continue;
       const turns = this.store.getTurnsForTask(task.id);
       const firstStarted = turns.find((t) => t.startedAt)?.startedAt;
       if (!firstStarted) continue;
-      if (nowMs - Date.parse(firstStarted) <= task.executionPolicy.taskTimeoutMs) continue;
+      const startedMs = Date.parse(firstStarted);
+      // Invalid timestamps must not force-cancel every open task (NaN comparisons are false).
+      if (!Number.isFinite(startedMs)) continue;
+      if (nowMs - startedMs <= task.executionPolicy.taskTimeoutMs) continue;
+      // Timeout interrupts live turns only — does NOT seal task lifecycle (user/coordinator only).
       const live = turns.find((t) => t.status === 'running' || t.status === 'waiting_user');
       const remoteLeased =
-        live &&
-        deps.leaseOwnerAlive(live.id) &&
-        !deps.ownsLease(live.id);
+        live && deps.leaseOwnerAlive(live.id) && !deps.ownsLease(live.id);
       if (remoteLeased) {
-        deps.writeCancelRequest(live.id, 'cancel', 'engine', `task-timeout-${task.id}`);
+        deps.writeCancelRequest(live.id, 'interrupt', 'engine', `task-timeout-${task.id}`);
         continue;
       }
       if (live) this.liveRuns.get(live.id)?.abort();
       this.store.commit((draft) => {
-        const draftTask = draft.tasks[task.id];
-        if (!draftTask || isTerminalLifecycle(draftTask.lifecycle)) return { ok: true };
         const pendingTurns = Object.values(draft.turns).filter(
           (t) =>
             t.taskId === task.id &&
             (t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user'),
         );
-        const draftLive = pendingTurns.find(
-          (t) => t.status === 'running' || t.status === 'waiting_user',
-        );
-        const cancelled = transitionCancelTask(draftTask, { liveTurn: draftLive, now });
-        if (!cancelled.ok) return cancelled;
-        draft.tasks[task.id] = cancelled.next.task;
-        if (cancelled.next.turn) draft.turns[cancelled.next.turn.id] = cancelled.next.turn;
         for (const pending of pendingTurns) {
-          if (pending.status !== 'queued' || pending.id === draftLive?.id) continue;
-          const settled = cancelPendingTurn(pending, { now });
-          if (settled.ok) draft.turns[pending.id] = settled.next;
+          if (pending.status === 'queued') {
+            const settled = cancelPendingTurn(pending, { now });
+            if (settled.ok) draft.turns[pending.id] = settled.next;
+          } else {
+            const interrupted = interruptTurn(pending, { now });
+            if (interrupted.ok) draft.turns[pending.id] = interrupted.next;
+          }
         }
+        // Task lifecycle stays open for user recovery / decision.
         return { ok: true };
       });
     }
@@ -1154,6 +1380,11 @@ export class TaskEngine {
     }
   }
 
+  /**
+   * Host policy for dependency `onUnsatisfied: fail|skip` — not CLI-driven.
+   * Seals dependents when a required dependency finished unsuccessfully.
+   * `onUnsatisfied: block` remains open + blocked via scheduler only.
+   */
   private applyDependencyTerminals(): void {
     const now = nowIso(this.clock);
     this.store.commit((draft) => {
@@ -1162,7 +1393,9 @@ export class TaskEngine {
         const outcome = dependencyTerminalOutcome(draft, task.id);
         if (!outcome) continue;
         const live = Object.values(draft.turns).find(
-          (t) => t.taskId === task.id && (t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user'),
+          (t) =>
+            t.taskId === task.id &&
+            (t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user'),
         );
         const terminal = applyDependencyTerminal(task, live, outcome, {
           now,

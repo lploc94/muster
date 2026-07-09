@@ -202,7 +202,9 @@ describe('TaskEngine', () => {
     const task = store.getTask('task-1');
     const turn = store.getFile().turns[sent.value.turnId];
     expect(task?.committedSessionId).toBe('sess-123');
-    expect(task?.lifecycle).toBe('succeeded');
+    // Root complete is human-gated: lifecycle stays open with a proposal.
+    expect(task?.lifecycle).toBe('open');
+    expect(task?.outcomeProposal).toMatchObject({ kind: 'complete', result: 'done' });
     expect(turn?.status).toBe('succeeded');
     expect(store.getMessagesForTask('task-1').find((m) => m.role === 'user')?.state).toBe('complete');
   });
@@ -363,8 +365,14 @@ describe('TaskEngine', () => {
     release?.();
     await engine.whenIdle();
 
-    const terminalSend = engine.send('task-1', 'too late');
-    expect(terminalSend).toEqual({ ok: false, reason: 'task is terminal' });
+    // Root stays open after agent complete — user may continue on the same task/session.
+    expect(store.getTask('task-1')?.lifecycle).toBe('open');
+    expect(store.getTask('task-1')?.outcomeProposal?.kind).toBe('complete');
+    const followUp = engine.send('task-1', 'continue please');
+    expect(followUp.ok).toBe(true);
+    // Follow-up clears the proposal and keeps the same open task (session resume on next turn).
+    expect(store.getTask('task-1')?.outcomeProposal).toBeUndefined();
+    expect(store.getTask('task-1')?.lifecycle).toBe('open');
   });
 
   it('leaves reload running turns untouched when a live lease exists', async () => {

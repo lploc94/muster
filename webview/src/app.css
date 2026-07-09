@@ -49,6 +49,71 @@ body {
   font-weight: 600;
 }
 
+.task-status-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 11px;
+  line-height: 1.4;
+  cursor: pointer;
+  background: color-mix(in srgb, currentColor 8%, transparent);
+  color: inherit;
+}
+
+.task-status-btn:hover {
+  background: color-mix(in srgb, currentColor 14%, transparent);
+}
+
+.task-status-menu {
+  position: relative;
+  display: inline-flex;
+}
+
+.task-status-menu__panel {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 50;
+  min-width: 200px;
+  max-width: 280px;
+  padding: 4px;
+  border-radius: 8px;
+  border: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  box-shadow: 0 4px 16px color-mix(in srgb, #000 35%, transparent);
+}
+
+.task-status-menu__item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  width: 100%;
+  text-align: left;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: transparent;
+  color: var(--vscode-foreground);
+  cursor: pointer;
+}
+
+.task-status-menu__item:hover {
+  background: var(--vscode-list-hoverBackground);
+}
+
+.task-status-menu__item-label {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.task-status-menu__item-desc {
+  font-size: 11px;
+  opacity: 0.7;
+}
+
 .task-status--neutral,
 .task-status--info {
   color: var(--vscode-charts-blue, #3794ff);
@@ -109,6 +174,75 @@ body {
 .task-pill--muted,
 .task-live-chip {
   color: var(--vscode-descriptionForeground);
+}
+
+/* Coarse CLI process status — lives near the composer, not the task badge. */
+.cli-status-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 1.4;
+  border: 1px solid color-mix(in srgb, currentColor 22%, transparent);
+  background: color-mix(in srgb, var(--vscode-editor-background) 92%, var(--vscode-foreground) 8%);
+}
+
+.cli-status-bar--muted {
+  color: var(--vscode-descriptionForeground);
+}
+
+.cli-status-bar--attention {
+  color: var(--vscode-charts-yellow, #cca700);
+}
+
+.cli-status-bar--info,
+.cli-status-bar--neutral {
+  color: var(--vscode-charts-blue, #3794ff);
+}
+
+.cli-status-bar--success {
+  color: var(--vscode-testing-iconPassed, #73c991);
+}
+
+.cli-status-bar__label {
+  font-weight: 600;
+}
+
+.cli-status-bar__sep {
+  opacity: 0.45;
+}
+
+.cli-status-bar__hint {
+  opacity: 0.65;
+  font-weight: 400;
+}
+
+.cli-live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--vscode-charts-yellow, #cca700);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--vscode-charts-yellow, #cca700) 28%, transparent);
+  flex-shrink: 0;
+}
+
+.task-workspace-orchestration {
+  margin-top: 4px;
+  font-size: 11px;
+  opacity: 0.72;
+}
+
+.task-workspace-details {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid color-mix(in srgb, var(--vscode-panel-border) 80%, transparent);
+}
+
+.task-workspace-banner {
+  /* Compact header by default; details expand in-place */
+  padding: 8px 12px;
 }
 
 .task-workspace-banner {

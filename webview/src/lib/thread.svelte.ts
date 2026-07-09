@@ -1,6 +1,6 @@
 import type { NormalizedEvent } from './types';
-import type { TaskViewStatus, TranscriptItem } from './protocol';
-import { isTerminalStatus } from './protocol';
+import type { TaskRuntimeActivity, TaskViewStatus, TranscriptItem } from './protocol';
+import { isHardTerminalLifecycle } from './protocol';
 import type { ThreadItem } from './turn-state.svelte';
 
 function asText(content: unknown): string {
@@ -64,6 +64,8 @@ export class TaskThread {
   running = $state(false);
   activeTurnId = $state<string | null>(null);
   readOnly = $state(false);
+  /** True after any turn process was started for this task (CLI was created at least once). */
+  hadProcess = $state(false);
   /**
    * Monotonic activity counter bumped on every applied event. Lets the view track
    * in-place content growth (reasoning appends, tool status/input/output changes)
@@ -71,7 +73,12 @@ export class TaskThread {
    */
   revision = $state(0);
 
-  hydrate(transcript: TranscriptItem[], activeTurnId?: string, viewStatus?: TaskViewStatus): void {
+  hydrate(
+    transcript: TranscriptItem[],
+    activeTurnId?: string,
+    viewStatus?: TaskViewStatus,
+    opts?: { lifecycle?: string; runtimeActivity?: TaskRuntimeActivity | null },
+  ): void {
     // Keep the live streaming buffer only if it belongs to the still-active turn and
     // corresponds to a persisted `partial` assistant segment of the same id — the
     // buffer supersedes that transcript item (avoids a double bubble).
@@ -101,8 +108,16 @@ export class TaskThread {
     this.reasoningByTurn = reasoning;
     if (!keepStreaming) this.streaming = null;
     this.activeTurnId = activeTurnId ?? null;
-    this.running = viewStatus === 'running' || viewStatus === 'waiting_user';
-    this.readOnly = viewStatus ? isTerminalStatus(viewStatus) : false;
+    const runtime = opts?.runtimeActivity ?? (viewStatus === 'running' || viewStatus === 'waiting_user' ? viewStatus : null);
+    this.running = runtime === 'running' || runtime === 'waiting_user';
+    // Restore "had a process" after reload: live/recovery runtime, or any transcript
+    // (implies a prior turn). Composer also treats committedSessionId as hadProcess.
+    if (this.running || runtime === 'needs_recovery' || next.length > 0) {
+      this.hadProcess = true;
+    }
+    // Soft failed stays writable; only hard terminals are read-only.
+    const lifecycle = opts?.lifecycle ?? viewStatus;
+    this.readOnly = lifecycle ? isHardTerminalLifecycle(lifecycle) : false;
   }
 
   reset(): void {
@@ -112,6 +127,7 @@ export class TaskThread {
     this.running = false;
     this.activeTurnId = null;
     this.readOnly = false;
+    this.hadProcess = false;
   }
 
   setReadOnly(readOnly: boolean): void {
@@ -130,12 +146,14 @@ export class TaskThread {
   startTurn(turnId: string): void {
     this.running = true;
     this.activeTurnId = turnId;
+    this.hadProcess = true;
   }
 
   endTurn(): void {
     this.commitStreaming();
     this.running = false;
     this.activeTurnId = null;
+    this.hadProcess = true;
   }
 
   pushError(message: string, isCancellation = false): void {
@@ -333,14 +351,18 @@ class ThreadStore {
     transcript?: TranscriptItem[],
     activeTurnId?: string,
     viewStatus?: TaskViewStatus,
+    opts?: { lifecycle?: string; runtimeActivity?: TaskRuntimeActivity | null },
   ): void {
     const thread = this.getOrCreate(taskId);
     this.current = thread;
     this.currentTaskId = taskId;
     if (transcript) {
-      thread.hydrate(transcript, activeTurnId, viewStatus);
-    } else if (viewStatus) {
-      thread.setReadOnly(isTerminalStatus(viewStatus));
+      thread.hydrate(transcript, activeTurnId, viewStatus, opts);
+    } else if (opts?.lifecycle || viewStatus) {
+      const lifecycle = opts?.lifecycle ?? viewStatus;
+      thread.setReadOnly(lifecycle ? isHardTerminalLifecycle(lifecycle) : false);
+      const runtime = opts?.runtimeActivity;
+      thread.running = runtime === 'running' || runtime === 'waiting_user';
     }
   }
 
@@ -376,8 +398,13 @@ class ThreadStore {
     this.getOrCreate(taskId).appendTranscript(item);
   }
 
-  updateReadOnly(viewStatus: TaskViewStatus): void {
-    this.current.setReadOnly(isTerminalStatus(viewStatus));
+  updateReadOnly(lifecycleOrViewStatus: string): void {
+    this.current.setReadOnly(isHardTerminalLifecycle(lifecycleOrViewStatus));
+  }
+
+  updateRuntimeFlags(runtimeActivity: TaskRuntimeActivity | null | undefined): void {
+    this.current.running =
+      runtimeActivity === 'running' || runtimeActivity === 'waiting_user';
   }
 }
 

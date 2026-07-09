@@ -3,9 +3,21 @@
   import { tasks, resolveBackendForSend, registerBackendSelect } from '../lib/tasks.svelte';
   import { post } from '../lib/protocol';
   import { ADD_CONTEXT_ACTIONS, getAddContextActionHostMessage } from '../lib/context-actions';
-  import { getTaskStatusPresentation, isTaskStatusTerminal } from '../lib/task-status';
+  import {
+    getTaskPresentation,
+    getTaskStatusPresentation,
+    isHardTerminal,
+    runtimeBlocksComposer,
+  } from '../lib/task-status';
+  import {
+    CLI_LAST_EXIT_LABELS,
+    cliStatusFromTask,
+    getCliStatusPresentation,
+    type CliLastExit,
+  } from '../lib/cli-status';
   import type { AddContextAction } from '../lib/context-actions';
-  import type { PendingAsk, TaskViewStatus } from '../lib/protocol';
+  import type { PendingAsk, TaskSummary, TaskViewStatus } from '../lib/protocol';
+  import { effectiveRuntimeActivity } from '../lib/protocol';
   import type { WebviewBackendId } from '../lib/tasks.svelte';
   import { BACKENDS, backendShortLabel } from '../lib/backends';
   import { tip } from '../lib/tooltip';
@@ -16,7 +28,12 @@
     turnId?: string | null;
     readOnly?: boolean;
     pendingAsk?: PendingAsk | null;
+    /** Preferred: full task summary for dual-axis status. */
+    task?: TaskSummary | null;
+    /** @deprecated Prefer `task`. Kept for callers that only have viewStatus. */
     taskStatus?: TaskViewStatus;
+    /** Optional last process exit (host may project later). */
+    cliLastExit?: CliLastExit | null;
   }
 
   let {
@@ -25,11 +42,34 @@
     turnId = null,
     readOnly = false,
     pendingAsk = null,
+    task = null,
     taskStatus = 'idle',
+    cliLastExit = null,
   }: Props = $props();
 
   const thread = $derived(threadStore.current);
-  const presentation = $derived(getTaskStatusPresentation(taskStatus));
+  const presentation = $derived(task ? getTaskPresentation(task) : getTaskStatusPresentation(taskStatus));
+  const runtime = $derived(task ? effectiveRuntimeActivity(task) : null);
+  const lifecycle = $derived(task?.lifecycle ?? (taskStatus as string));
+  const cliStatus = $derived(
+    task
+      ? cliStatusFromTask(task, {
+          // Generating only when streaming without a pending ask.
+          threadRunning: thread.running && !pendingAsk,
+          askPending: !!pendingAsk,
+          // Persist across reload: a committed session implies a prior process.
+          hadProcess: thread.hadProcess || !!task.committedSessionId,
+        })
+      : thread.running && !pendingAsk
+        ? ('running' as const)
+        : pendingAsk
+          ? ('idle' as const)
+          : ('not_started' as const),
+  );
+  const cliPresentation = $derived(getCliStatusPresentation(cliStatus));
+  const cliExitHint = $derived(
+    cliStatus === 'stopped' && cliLastExit ? CLI_LAST_EXIT_LABELS[cliLastExit] : null,
+  );
 
   let textareaEl = $state<(HTMLElement & { value: string }) | undefined>(undefined);
   let backendSelect = $state<(HTMLElement & { value: string }) | undefined>(undefined);
@@ -38,17 +78,30 @@
   let isAddContextMenuOpen = $state(false);
 
   const statusBlocksSend = $derived(
-    taskStatus === 'running' ||
-      taskStatus === 'queued' ||
-      taskStatus === 'waiting_dependencies' ||
-      taskStatus === 'waiting_children' ||
-      taskStatus === 'waiting_user' ||
-      taskStatus === 'needs_recovery' ||
-      isTaskStatusTerminal(taskStatus),
+    task
+      ? isHardTerminal(lifecycle) || runtimeBlocksComposer(runtime)
+      : taskStatus === 'running' ||
+          taskStatus === 'queued' ||
+          taskStatus === 'waiting_dependencies' ||
+          taskStatus === 'waiting_children' ||
+          taskStatus === 'waiting_user' ||
+          taskStatus === 'needs_recovery' ||
+          isHardTerminal(taskStatus),
   );
   const blocked = $derived(mode === 'task' && (!!pendingAsk || readOnly || statusBlocksSend));
   const canSend = $derived(mode === 'draft' ? !thread.running : !thread.running && !blocked);
-  const canCancel = $derived(mode === 'task' && taskStatus === 'running' && !!taskId && !!turnId);
+  // Stop applies while a process is up (generating or idle/waiting_user).
+  const canCancel = $derived(
+    mode === 'task' &&
+      (cliStatus === 'running' ||
+        cliStatus === 'idle' ||
+        runtime === 'running' ||
+        runtime === 'waiting_user' ||
+        taskStatus === 'running' ||
+        taskStatus === 'waiting_user') &&
+      !!taskId &&
+      !!turnId,
+  );
 
   const currentBackend = $derived(
     mode === 'draft' ? tasks.selectedBackend : (tasks.focusedTask?.backend ?? tasks.selectedBackend),
@@ -224,13 +277,22 @@
   const disabledReason = $derived.by(() => {
     if (mode === 'draft') return '';
     if (pendingAsk) return 'Answer the pending task question above to continue.';
+    if (task) {
+      if (isHardTerminal(lifecycle)) return presentation.composerGuidance;
+      if (runtimeBlocksComposer(runtime)) return presentation.composerGuidance;
+      if (lifecycle === 'failed') return presentation.composerGuidance;
+      if (readOnly) return 'This task is read-only right now.';
+      return '';
+    }
     if (taskStatus === 'running') return presentation.composerGuidance;
     if (taskStatus === 'queued') return presentation.composerGuidance;
     if (taskStatus === 'waiting_dependencies') return presentation.composerGuidance;
     if (taskStatus === 'waiting_children') return presentation.composerGuidance;
     if (taskStatus === 'waiting_user') return presentation.composerGuidance;
     if (taskStatus === 'needs_recovery') return presentation.composerGuidance;
-    if (isTaskStatusTerminal(taskStatus)) return presentation.composerGuidance;
+    if (taskStatus === 'awaiting_outcome') return presentation.composerGuidance;
+    if (isHardTerminal(taskStatus)) return presentation.composerGuidance;
+    if (taskStatus === 'failed') return presentation.composerGuidance;
     if (readOnly) return 'This task is read-only right now.';
     return '';
   });
@@ -330,6 +392,27 @@
   ondragleave={onDragLeave}
   ondrop={onDrop}
 >
+  {#if mode === 'task'}
+    <div
+      class={`cli-status-bar cli-status-bar--${cliPresentation.tone}`}
+      data-cli-status={cliStatus}
+      role="status"
+      aria-live="polite"
+      use:tip={cliPresentation.detail}
+    >
+      <span
+        class="codicon codicon-{cliPresentation.icon}"
+        class:codicon-modifier-spin={cliStatus === 'running'}
+        aria-hidden="true"
+      ></span>
+      <span class="cli-status-bar__label">{cliPresentation.label}</span>
+      <span class="cli-status-bar__sep" aria-hidden="true">·</span>
+      <span class="cli-status-bar__hint">
+        {cliExitHint ?? cliPresentation.hint}
+      </span>
+    </div>
+  {/if}
+
   {#if disabledReason}
     <div class="composer-guidance" role="note">{disabledReason}</div>
   {/if}
@@ -444,9 +527,9 @@
         >
           <span class="codicon codicon-send"></span>
         </button>
-      {:else if taskStatus === 'queued' && turnId}
+      {:else if (runtime === 'queued' || taskStatus === 'queued') && turnId}
         <span class="task-muted text-xs">Queued turn is waiting to resume.</span>
-      {:else if taskStatus === 'needs_recovery' && !turnId}
+      {:else if (runtime === 'needs_recovery' || taskStatus === 'needs_recovery') && !turnId}
         <span class="task-muted text-xs">Recovery actions need a retryable turn.</span>
       {:else if thread.running}
         <button

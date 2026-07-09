@@ -1,5 +1,11 @@
 import { evaluateDependency } from './deps';
-import type { MusterTask, TaskLifecycleState, TaskTurn, TaskViewStatus } from './types';
+import type {
+  MusterTask,
+  TaskLifecycleState,
+  TaskRuntimeActivity,
+  TaskTurn,
+  TaskViewStatus,
+} from './types';
 
 const TERMINAL_LIFECYCLES: ReadonlySet<TaskLifecycleState> = new Set([
   'succeeded',
@@ -8,8 +14,24 @@ const TERMINAL_LIFECYCLES: ReadonlySet<TaskLifecycleState> = new Set([
   'skipped',
 ]);
 
-function isTerminalLifecycle(state: TaskLifecycleState): boolean {
+const HARD_TERMINAL_LIFECYCLES: ReadonlySet<TaskLifecycleState> = new Set([
+  'succeeded',
+  'cancelled',
+  'skipped',
+]);
+
+export function isTerminalLifecycle(state: TaskLifecycleState): boolean {
   return TERMINAL_LIFECYCLES.has(state);
+}
+
+/** Hard terminal: read-only; follow-up is a new/continuation task. */
+export function isHardTerminalLifecycle(state: TaskLifecycleState): boolean {
+  return HARD_TERMINAL_LIFECYCLES.has(state);
+}
+
+/** Soft terminal: user may reopen with a new message on the same task. */
+export function isSoftTerminalLifecycle(state: TaskLifecycleState): boolean {
+  return state === 'failed';
 }
 
 function isLiveTurnStatus(status: TaskTurn['status']): boolean {
@@ -52,17 +74,26 @@ function needsRecovery(turns: readonly TaskTurn[]): boolean {
   return !turns.some((turn) => turn.status === 'queued' || isLiveTurnStatus(turn.status));
 }
 
-export function deriveViewStatus(
+function hasOutcomeProposal(task: MusterTask): boolean {
+  return task.outcomeProposal != null;
+}
+
+/**
+ * Runtime activity for an **open** task (CLI/deps/waits). Returns `null` when
+ * lifecycle is not open — UI should show lifecycle alone for terminal outcomes.
+ */
+export function deriveRuntimeActivity(
   task: MusterTask,
   turns: readonly TaskTurn[],
   depLifecycles: ReadonlyMap<string, TaskLifecycleState>,
-): TaskViewStatus {
-  // 1. Terminal lifecycle
-  if (isTerminalLifecycle(task.lifecycle)) {
-    return task.lifecycle as Extract<
-      TaskViewStatus,
-      'succeeded' | 'failed' | 'cancelled' | 'skipped'
-    >;
+): TaskRuntimeActivity | null {
+  if (task.lifecycle !== 'open') {
+    return null;
+  }
+
+  // 1. Outcome proposal awaiting authorized sealer
+  if (hasOutcomeProposal(task)) {
+    return 'awaiting_outcome';
   }
 
   // 2. Live turn
@@ -98,4 +129,19 @@ export function deriveViewStatus(
 
   // 8. Idle
   return 'idle';
+}
+
+/**
+ * Compact single-axis status (backward compatible).
+ * Prefer `task.lifecycle` + `deriveRuntimeActivity` for UI.
+ */
+export function deriveViewStatus(
+  task: MusterTask,
+  turns: readonly TaskTurn[],
+  depLifecycles: ReadonlyMap<string, TaskLifecycleState>,
+): TaskViewStatus {
+  if (isTerminalLifecycle(task.lifecycle)) {
+    return task.lifecycle;
+  }
+  return deriveRuntimeActivity(task, turns, depLifecycles) ?? 'idle';
 }

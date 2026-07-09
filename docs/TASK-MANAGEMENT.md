@@ -15,6 +15,16 @@ domain concepts and invariants that implementation types must preserve.
 document describes the legacy single-chat flow differently, this document is
 authoritative for the task-based flow.
 
+**Outcome model (normative):** task **lifecycle** (open / succeeded / failed /
+cancelled / skipped) is a **work outcome**, not the CLI process status. A new
+task is always `open`. Lifecycle is sealed only by an **authorized actor** — the
+**user** and/or a **coordinator task** when the user has enabled outcome
+delegation (including a future **yolo** / full handoff mode). CLI turn success,
+process exit, and adapter errors never by themselves set lifecycle to
+`succeeded` / `failed` / `skipped`. Webview and host projections keep **three
+separate axes**: task lifecycle, CLI process status, and orchestration activity
+(see §4.3, §4.1.1, and §5).
+
 ---
 
 ## 1. Goals and boundaries
@@ -26,7 +36,9 @@ Muster coordinates durable units of work while invoking per-turn **ACP sessions*
 - delegated worker and sub-coordinator tasks;
 - explicit dependencies and child wait sets;
 - multiple turns backed by one CLI conversation per task;
-- deterministic cancellation, failure, and reload recovery;
+- **authorized outcome sealing** — user always; coordinator when user delegates
+  (default supervised gate; future **yolo** handoff for self-orchestration);
+- deterministic cancellation (with cascade), soft-fail reopen, and reload recovery;
 - host-enforced orchestration policy and resource limits.
 
 This document does not standardize backend-specific CLI flags, normalized stream
@@ -38,11 +50,18 @@ events, or visual rendering details. Those belong to the related documents.
 
 | Term | Definition | Lifetime |
 |------|------------|----------|
-| **Task** | A unit of work with a goal, dependencies, policy, and final outcome | Until a terminal outcome |
+| **Task** | A unit of work with a goal, dependencies, policy, and user-facing **lifecycle** outcome | Until hard terminal; soft `failed` may reopen |
+| **Lifecycle** | Persisted work outcome (`open` / `succeeded` / `failed` / `cancelled` / `skipped`) | Independent of CLI process |
+| **CLI process status** | Whether a CLI process exists and is busy/idle/stopped (see §4.3.2) | Ephemeral / derived; not task outcome |
+| **CLI last exit** | How the last process ended (`ok` / `error` / `cancelled` / …) — not a process phase | Attached when process is stopped |
+| **Orchestration activity** | Graph/scheduling waits while open (deps, children, recovery, outcome proposal) | Ephemeral / derived |
+| **Runtime activity** | Host-derived open-task activity (legacy compact name for orchestration + turn live signals) | Ephemeral / derived |
+| **Outcome proposal** | Request to mark complete/fail; awaits an authorized sealer when not auto-sealed | Cleared on accept/reject/cancel/seal |
+| **Outcome authority mode** | Who may seal lifecycle: user only vs user + delegated coordinator (yolo later) | Per root / workspace setting |
 | **Backend** | A reusable adapter for one CLI family such as Claude, Codex, or Grok | Extension lifetime |
 | **Session** | Backend-owned conversation history used by one task | Task lifetime |
 | **Turn** | One requested interaction with a task's session | One CLI invocation |
-| **Process** | The operating-system child process used to execute a turn | While that turn runs |
+| **Process** | The operating-system (or agent) process used to execute a turn | While that process is up |
 | **Coordinator** | A task role allowed to create, start, stop, and wait for child tasks | Task lifetime |
 | **Worker** | A task role that performs delegated work without extending the task graph | Task lifetime |
 | **Engine** | Host-side scheduler and state machine that validates and applies orchestration actions | Extension lifetime |
@@ -78,30 +97,56 @@ class.
 Implementations must preserve all of the following:
 
 1. **Turn success is not task success.** Adapter `turnCompleted` means only that
-   one CLI invocation succeeded.
-2. **Task completion is explicit.** A task reaches a terminal outcome only through
-   an accepted turn disposition, dependency policy, cancellation, or exhausted
-   execution policy.
-3. **Terminal task outcomes are immutable.** More work creates a continuation task;
-   it does not reopen a completed dependency node.
-4. **One task owns one session.** Session IDs are never shared by tasks.
-5. **Identity is stable.** Parent, role, and backend binding do not change after
+   one CLI invocation succeeded. CLI process status never becomes task lifecycle.
+2. **Lifecycle is sealed by authorized actors, never by the CLI.** A task leaves
+   `open` for `succeeded` / `failed` / `skipped` / `cancelled` only via the
+   **user** or an authorized **coordinator**, according to the active
+   **outcome authority mode** (§4.1.1). Turn completion and process exit never
+   seal lifecycle by themselves.
+3. **Default is supervised; delegation is explicit.** In the default mode,
+   coordinators **propose** outcomes and the user accepts/rejects. When the user
+   enables **coordinator delegate** (and later **yolo**), a coordinator may
+   **seal** outcomes in its scope without a per-decision human click. The user
+   always retains override (cancel, skip, reject, reopen soft-fail, change mode).
+4. **Lifecycle and runtime are separate axes.** Persisted `TaskLifecycleState` is
+   the work outcome. Turn status, dependency readiness, child waits, and recovery
+   needs are **runtime / activity** facts. They must not be collapsed into one
+   enum that the UI treats as “the task status.”
+5. **Create always yields `open`.** No other lifecycle is written at creation.
+6. **Hard vs soft terminal:**
+   - `succeeded`, `cancelled`, and `skipped` are **hard terminal**: read-only;
+     further user work uses a **continuation task** or a new task, never silently
+     reopening the same outcome node for dependents that already observed it.
+   - `failed` is **soft terminal**: no automatic coordinator turns; a new user
+     message **reopens** the same task to `open` and may queue a turn. This is
+     not a continuation task.
+   - **Semantics:** `skipped` = created but user chose **not to perform**;
+     `cancelled` = stop work that was (or could be) in progress; `failed` =
+     user marked the attempt unsuccessful. See §5.6.
+7. **Cancel cascades.** User cancel on a task marks that task and every
+   descendant `cancelled`, interrupts live turns, and clears pending proposals.
+   Workspace **revert of agent edits** is a planned future side effect, not
+   required for the lifecycle transition itself. Skip on a parent may cascade
+   skip (or cancel live work) on unfinished descendants — see §5.6.
+8. **One task owns one session.** Session IDs are never shared by tasks.
+9. **Identity is stable.** Parent, role, and backend binding do not change after
    task creation; dependencies do not change after the first turn is queued.
-6. **One active turn per task/session.** Different tasks may run concurrently when
-   backend limits allow it.
-7. **Readiness is derived.** Dependency, scheduler, child-wait, and runtime state
-   must not be copied into one mutable task-status enum.
-8. **Child waiting is explicit and turn-scoped.** The engine never infers a wait
-   set from every child that happened to be started during a turn.
-9. **The host is authoritative.** MCP calls express requested actions; the engine
-   validates ownership, capability, state, and resource policy before applying them.
-10. **Orchestration is idempotent.** Create, start, disposition, child completion,
-   and continuation scheduling are keyed by stable operation or turn IDs.
-11. **No automatic replay after uncertainty.** A process lost during reload becomes
-    interrupted; Muster does not silently resend its input.
-12. **Persist before side effects.** A queued/running turn and its input identity
+10. **One active turn per task/session.** Different tasks may run concurrently when
+    backend limits allow it.
+11. **Readiness is derived.** Dependency, scheduler, child-wait, and runtime state
+    must not be copied into the persisted lifecycle field.
+12. **Child waiting is explicit and turn-scoped.** The engine never infers a wait
+    set from every child that happened to be started during a turn.
+13. **The host is authoritative.** MCP calls express requested actions; the engine
+    validates ownership, capability, state, and resource policy before applying them.
+14. **Orchestration is idempotent.** Create, start, proposal staging, child
+    completion, and continuation scheduling are keyed by stable operation or turn IDs.
+15. **No automatic replay after uncertainty.** A process lost during reload becomes
+    interrupted; Muster does not silently resend its input. Interrupted turns do
+    not change lifecycle to `failed` or `cancelled` by themselves.
+16. **Persist before side effects.** A queued/running turn and its input identity
     are stored before spawning a process.
-13. **Delegation is bounded.** Depth, child count, turn count, and concurrency have
+17. **Delegation is bounded.** Depth, child count, turn count, and concurrency have
     host-configured limits even when sub-coordinators are enabled.
 
 ---
@@ -116,12 +161,34 @@ between store modules, but must preserve their semantics.
 ```ts
 type TaskRole = 'coordinator' | 'worker';
 
+/**
+ * User-facing work outcome. Independent of whether a CLI process is running.
+ * New tasks are always `open`.
+ */
 type TaskLifecycleState =
-  | 'open'
-  | 'succeeded'
-  | 'failed'
-  | 'cancelled'
-  | 'skipped';
+  | 'open'       // default; work may continue
+  | 'succeeded'  // hard terminal — user accepted a completion proposal
+  | 'failed'     // soft terminal — user rejected without reason (or explicit fail path)
+  | 'cancelled'  // hard terminal — user aborted work in progress (cascades)
+  | 'skipped';   // hard terminal — task exists but user chose not to perform it
+
+/**
+ * Agent (or host) proposal awaiting user decision. Does not change lifecycle
+ * until the user accepts or rejects. Staged while the task remains `open`.
+ */
+type OutcomeProposal =
+  | {
+      kind: 'complete';
+      result: string;
+      proposedByTurnId: string;
+      proposedAt: string;
+    }
+  | {
+      kind: 'fail';
+      error: string;
+      proposedByTurnId: string;
+      proposedAt: string;
+    };
 
 interface TaskDependency {
   taskId: string;
@@ -180,7 +247,8 @@ interface MusterTask {
   capabilities: TaskCapability[];
   executionPolicy: TaskExecutionPolicy;
 
-  // Outcome
+  // Outcome proposal (open tasks only) + sealed outcome fields
+  outcomeProposal?: OutcomeProposal;
   result?: string;
   error?: string;
 
@@ -193,7 +261,7 @@ interface MusterTask {
 ```
 
 `parentId` is the source of truth for tree ownership. `childIds` is a derived
-index, not duplicated task data. Child status and result are read from child
+index, not duplicated task data. Child lifecycle and result are read from child
 records; a persisted `childRuns` snapshot is not authoritative.
 
 `capabilities` are issued and validated by the host. A caller cannot grant itself
@@ -205,6 +273,87 @@ Default graph capabilities are:
 |------|--------------------|
 | Root/sub-coordinator | Host-approved subset of all `TaskCapability` values |
 | Worker | None; self-disposition and `ask_user` do not extend the graph |
+
+#### 4.1.1 Outcome authority (who may seal lifecycle)
+
+Lifecycle is a **governance** decision, not a process signal. Two classes of
+actor may seal it:
+
+| Actor | Always? | What they can do |
+|-------|---------|------------------|
+| **User** | Yes | Accept/reject proposals; cancel; skip; soft-fail reopen; change mode; always overrides the coordinator |
+| **Coordinator task** | Only when mode allows | Seal `succeeded` / `failed` / `skipped` (and cancel children per policy) for tasks in its **authority scope** |
+
+**Workers** never gain outcome-seal authority for the graph; they may only
+propose self-completion or act through tools that the host routes to the parent
+coordinator / engine.
+
+##### Outcome authority mode
+
+Host/workspace (or per-root) setting. Default is supervised so accidental YOLO
+is impossible:
+
+```ts
+/**
+ * Who may seal task lifecycle without a further human click.
+ * User can always seal and always override.
+ */
+type OutcomeAuthorityMode =
+  | 'user_confirm'           // default — supervised
+  | 'coordinator_delegate'   // user delegated seal rights to coordinators
+  | 'yolo';                  // future — full handoff / autonomous orchestration
+```
+
+| Mode | Root lifecycle seal | Child lifecycle seal | Intent |
+|------|---------------------|----------------------|--------|
+| **`user_confirm`** (default) | User only (Accept/Reject/Cancel/Skip). Coordinator **proposes** → `outcomeProposal`. | Parent coordinator may seal children for graph progress (orchestration), or also require proposals — product default: **coordinator may seal direct children** so waits can settle without N human clicks. | Safe default; human owns the user request. |
+| **`coordinator_delegate`** | Root coordinator may seal its own root outcome (and descendants) via disposition / tools on turn commit. User still sees activity and may cancel/override. | Same as parent coordinator scope. | User says “you drive; mark done when you believe the goal is met.” |
+| **`yolo`** (future) | Same seal path as `coordinator_delegate`, with **broader** defaults: higher concurrency/depth, fewer prompts, optional auto-continue. Still **not** CLI-exit → lifecycle. | Full subtree under the root coordinator. | User hands the job to the coordinator for self-orchestration (“fire and forget” within policy limits). |
+
+```ts
+// Illustrative placement — exact field may live on root task, workspace
+// settings, or both (task overrides workspace default).
+interface OutcomeAuthorityPolicy {
+  mode: OutcomeAuthorityMode;
+  /** When true, user still gets a non-blocking toast/card after coordinator seals. */
+  notifyOnCoordinatorSeal?: boolean;
+  /** Optional: even in delegate/yolo, require user confirm for root only. */
+  alwaysConfirmRoot?: boolean;
+}
+```
+
+##### Authority scope (coordinator)
+
+When mode is `coordinator_delegate` or `yolo`, a coordinator may seal:
+
+1. **Itself** (including the root coordinator sealing the root task), and
+2. **Descendants** it is allowed to manage (`create_child` / cancel / skip tools),
+
+subject to host capability checks and the same cascade rules as user cancel/skip.
+
+A **sub-coordinator** seals only within its subtree, not sibling branches or the
+root, unless the root mode and capabilities explicitly allow it.
+
+##### What never seals lifecycle
+
+- Adapter `turnCompleted` / process exit / non-zero exit alone  
+- Exhausted automatic retries (leave `open` + `needs_recovery`, or coordinator
+  *may* seal `failed` only if mode + tool path authorize it)  
+- Reload / interrupted turns  
+- Worker self-talk without host-validated tools  
+
+##### Auditability
+
+Every seal records **who** sealed it (for UI and debugging):
+
+```ts
+type OutcomeSealedBy =
+  | { kind: 'user'; }
+  | { kind: 'coordinator'; taskId: string; turnId?: string; mode: OutcomeAuthorityMode };
+
+// On MusterTask when lifecycle leaves open:
+// sealedBy?: OutcomeSealedBy;
+```
 
 ### 4.2 Turns
 
@@ -225,6 +374,13 @@ type TurnInput =
   | { kind: 'child_results'; taskIds: string[] }
   | { kind: 'recovery'; interruptedTurnId: string; instruction: string };
 
+/**
+ * Staged by MCP on a live turn. On turnCompleted, host applies authority mode
+ * (§4.1.1):
+ * - If sealer is not authorized yet → `complete`/`fail` become outcomeProposal
+ * - If coordinator is authorized (delegate/yolo, or child orchestration) → seal
+ * - `wait_tasks` / `idle` → orchestration only (no lifecycle change)
+ */
 type TurnDisposition =
   | { kind: 'complete'; result: string }
   | { kind: 'fail'; error: string }
@@ -259,59 +415,193 @@ A turn ID is also the stream/run correlation ID used by the webview. Retrying an
 interrupted or failed invocation creates a new turn ID; an old turn record is never
 changed back to `queued` or `running`.
 
-### 4.3 Derived view status
+### 4.3 Status axes (normative)
 
-The store persists task lifecycle, turns, dependencies, and explicit waits. The
-UI status is computed:
+Muster exposes **three independent axes**. Mixing them into one badge is a
+product bug.
+
+| Axis | Question | Where in UI (normative) |
+|------|----------|-------------------------|
+| **Task lifecycle** | Is the work open / done / failed / cancelled / skipped? | Task list badge + workspace header |
+| **CLI process status** | Is a CLI process not started, running, idle (alive), or stopped? | Near composer / send–stop (process chrome) |
+| **Orchestration activity** | Waiting on deps, children, recovery, outcome proposal? | Secondary line / action panels — not the task badge, not the CLI phase |
+
+The store persists **lifecycle**, turns, dependencies, waits, and optional
+`outcomeProposal`. CLI process status and orchestration activity are **derived**.
+
+#### 4.3.1 Task lifecycle (persisted work outcome)
 
 ```ts
-type TaskViewStatus =
-  | 'waiting_dependencies'
+type TaskLifecycleState =
+  | 'open' | 'succeeded' | 'failed' | 'cancelled' | 'skipped';
+```
+
+Primary task badge only. Never set from CLI exit alone. See §5.
+
+#### 4.3.2 CLI process status
+
+CLI status answers: **does a process exist, and is it generating?** It is
+orthogonal to task lifecycle.
+
+##### Internal layers (implementation)
+
+```ts
+/** Whether a process is up for this task’s current agent session. */
+type CliProcessPhase =
+  | 'not_started'  // never spawned for this task (or only queued, not yet spawned)
+  | 'starting'     // optional: between schedule and first live event (may fold into not_started)
+  | 'on'           // process is alive
+  | 'stopped';     // process was up and has exited
+
+/** What the live process is doing — only meaningful when phase === 'on'. */
+type CliProcessActivity =
+  | 'busy'          // streaming, tools, reasoning — “đang trả lời”
+  | 'idle'          // alive but not generating (rare if each turn is one process)
+  | 'waiting_user';  // alive, blocked on ask_user (still on)
+
+/**
+ * How the last process ended — NOT a peer of process phase.
+ * Present when phase === 'stopped' (and optionally on history).
+ */
+type CliLastExit =
+  | 'ok'          // clean turnCompleted / normal stop
+  | 'error'       // adapter error, non-zero failure, missing terminal
+  | 'cancelled'   // user/host interrupt or cancel of the live process
+  | 'unknown';
+```
+
+**Error is not a CLI phase.** A failed run is:
+
+- process **phase** → `stopped`, and  
+- **lastExit** → `error` (or turn `failed` / recovery UI),  
+
+not `CliProcessStatus = 'error'`. Tool errors mid-turn leave phase `on` and
+activity `busy`; they are transcript events, not process phase.
+
+##### Product-facing CLI view (MVP chip)
+
+Collapse phase + activity into four user-visible values (composer chrome):
+
+```ts
+/**
+ * Product CLI chip. Derived; never persisted as task.lifecycle.
+ * Map: not_started | running (on+busy) | idle (on+idle|waiting_user) | stopped
+ */
+type CliViewStatus =
+  | 'not_started'  // chưa bật — no process yet
+  | 'running'      // đang bật + đang trả lời (on + busy)
+  | 'idle'         // đang bật nhưng không generate (on + idle | waiting_user)
+  | 'stopped';     // đã tắt — process exited (see lastExit for why)
+```
+
+| `CliViewStatus` | Phase | Activity | Typical labels |
+|-----------------|-------|----------|----------------|
+| `not_started` | `not_started` (or `starting`) | — | CLI not started |
+| `running` | `on` | `busy` | CLI running |
+| `idle` | `on` | `idle` or `waiting_user` | CLI idle / waiting for you |
+| `stopped` | `stopped` | — | CLI stopped (+ optional last exit subtitle) |
+
+Derivation sketch (from turns + live stream flags):
+
+1. Live turn `status === 'running'` and generating (or webview `thread.running` without ask) → **`running`**.
+2. Live turn `status === 'waiting_user'` (or process on but paused for ask) → **`idle`** (detail: waiting for you). Process is still **on**.
+3. Turn `queued` only (not yet spawned) → **`not_started`** (optional: show Starting if `starting` is modeled).
+4. Latest process settled, or orchestration with no live process (`needs_recovery`, `waiting_children`, `awaiting_outcome`, hard/soft terminal with prior process) → **`stopped`**; set `lastExit` from latest terminal turn when known.
+5. Open task, never spawned → **`not_started`**.
+
+**Reload / derive hints (webview):** until the host projects `cliViewStatus`, treat a prior process as known when `thread.hadProcess` is true **or** the task has a `committedSessionId` (bound conversation implies a prior successful process). Empty open task with neither → `not_started`.
+
+Under Muster’s common **one process per turn** model, `on + idle` between user
+messages is uncommon (process usually exits → `stopped`). `idle` is still
+required for **ask_user** (process alive, not generating). If a backend later
+holds a long-lived process between prompts, `idle` covers that too.
+
+##### CLI vs task error
+
+| Situation | CLI view | Task lifecycle |
+|-----------|----------|----------------|
+| Process crash / turn adapter error | `stopped` + `lastExit: error` | stays `open` (often orchestration `needs_recovery`) |
+| User rejects completion without reason | `stopped` (or `not_started`) | soft `failed` |
+| User accepts complete | `stopped` + `lastExit: ok` | `succeeded` |
+| Tool error mid-stream | stays `running` | unchanged |
+
+#### 4.3.3 Orchestration activity (open tasks)
+
+Scheduling and graph waits — **not** CLI phase and **not** lifecycle:
+
+```ts
+type TaskRuntimeActivity =
+  | 'idle'
   | 'queued'
-  | 'running'
-  | 'waiting_user'
+  | 'running'              // live turn generating (feeds CLI view = running)
+  | 'waiting_user'         // live ask_user (feeds CLI view = idle)
+  | 'waiting_dependencies'
   | 'waiting_children'
   | 'blocked'
   | 'needs_recovery'
-  | 'idle'
-  | 'succeeded'
-  | 'failed'
-  | 'cancelled'
-  | 'skipped';
+  | 'awaiting_outcome';
 ```
 
-Evaluation order is deterministic:
+Evaluation order (only when `lifecycle === 'open'`):
 
-1. A terminal `TaskLifecycleState` maps directly to the terminal view status.
-2. A live turn maps to `running` or `waiting_user`.
-3. Unsatisfied dependencies map to `waiting_dependencies`, even when a queued turn
-   records start intent.
-4. A schedulable queued turn maps to `queued`.
-5. `wait.kind === 'children'` maps to `waiting_children`.
-6. `wait.kind === 'external'` maps to `blocked`.
-7. A latest failed/interrupted turn with no replacement maps to `needs_recovery`.
-8. Otherwise the open task is `idle`.
+1. Non-null `outcomeProposal` → `awaiting_outcome` (CLI usually already `stopped`).
+2. Live turn → `running` or `waiting_user`.
+3. Unsatisfied dependencies → `waiting_dependencies`.
+4. Schedulable queued turn → `queued`.
+5. `wait.kind === 'children'` → `waiting_children`.
+6. `wait.kind === 'external'` → `blocked`.
+7. Latest failed/interrupted turn, no replacement → `needs_recovery`.
+8. Otherwise → `idle`.
 
-`ready`, `pending_deps`, `awaiting_children`, `paused`, and `stopped` are therefore
-not persisted task lifecycle states.
+```ts
+/** Compact single-axis (legacy indexes only). Prefer explicit axes. */
+type TaskViewStatus = TaskLifecycleState | TaskRuntimeActivity;
+```
+
+#### 4.3.4 Presentation rules (webview)
+
+| UI surface | Shows |
+|------------|--------|
+| Task list badge | **Lifecycle only** (optional tiny live-process dot, not a second status word) |
+| Workspace header | **Task status card** = header (name + lifecycle badge + status menu). No separate title row that repeats the same badge. **Expand details** (collapsed by default) shows lifecycle copy, optional orchestration one-liner, bound session id, continuation hint — not when collapsed. |
+| Composer strip | **CLI view** (`not_started` / `running` / `idle` / `stopped`); optional lastExit when stopped |
+| Action panels | Recovery, resume queue; outcome accept/reject when product ships dedicated card (today: lifecycle status menu) |
+
+Composer / send rules use lifecycle **and** live CLI/orchestration (see §9).
+
+Do not map adapter exit codes onto lifecycle. Do not use a single chip that
+says both “Failed” (task) and “Running” (CLI) interchangeably from `turnDone`.
 
 ---
 
-## 5. Task lifecycle
+## 5. Task lifecycle (user-facing outcome)
 
 ```text
-create
-  └── open
-      ├── queue turn ──► execute turns ──► open
-      ├── accepted complete disposition ──► succeeded
-      ├── accepted fail disposition ──────► failed
-      ├── dependency/execution policy ────► failed | skipped
-      └── cancel task ────────────────────► cancelled
+create ──────────────────────────────────────────────► open
+
+open + agent proposes complete/fail ─────────────────► open (outcomeProposal set)
+open + user Accept (complete proposal) ──────────────► succeeded   [hard]
+open + user Reject complete WITH reason ─────────────► open        (reason → next turn input; clear proposal)
+open + user Reject complete WITHOUT reason ──────────► failed      [soft]
+open + user Accept fail proposal (if any) ───────────► failed      [soft]
+open + user Reject fail proposal WITH reason ────────► open
+open + user Cancel ──────────────────────────────────► cancelled   [hard, cascade]
+open + user Skip ────────────────────────────────────► skipped     [hard; won’t perform]
+failed + user sends message ─────────────────────────► open        (reopen; queue turn)
+succeeded / cancelled / skipped + more work ─────────► new task (or continuationOf)
 ```
 
-Terminal outcomes are `succeeded`, `failed`, `cancelled`, and `skipped`. They are
-settled for child wait sets. Only `succeeded` satisfies a dependency whose
-`requiredOutcome` is `succeeded`.
+```text
+                    ┌──────────────────────────────────────────────┐
+                    │                    open                       │
+                    │  (CLI may run / idle / wait children)         │
+                    └───┬──────────┬──────────┬──────────┬─────────┘
+       Accept complete  │   Cancel │     Skip │          │ Reject complete
+                        ▼          ▼          ▼          │ no reason
+                  succeeded   cancelled   skipped        ▼
+                   [hard]      [hard]      [hard]      failed ──user msg──► open
+                        work done   abort      won’t do   [soft]
+```
 
 ### 5.1 Creating a task
 
@@ -320,44 +610,148 @@ settled for child wait sets. Only `succeeded` satisfies a dependency whose
 1. Validates parent ownership and caller capability.
 2. Validates dependency scope and rejects dependency cycles.
 3. Applies host policy; the caller cannot choose arbitrary capabilities or limits.
-4. Persists an `open` task without starting a turn.
-5. Returns the task ID and derived view status.
+4. Persists a task with **`lifecycle: 'open'`** and no `outcomeProposal`, without
+   starting a turn (unless a convenience API also queues the first turn).
+5. Returns the task ID, lifecycle, and derived runtime activity.
 
 Task creation and task starting are separate operations. A convenience
 `delegate_task` MCP tool may atomically create a child and queue its first turn.
+Children are also created `open`.
 
-### 5.2 Starting and continuing
+### 5.2 Starting and continuing (runtime only)
 
 `startTask(taskId, inputs)` and `continueTask(taskId, inputs)` both create a new
-queued `TaskTurn`. `startTask` is valid before the first turn; `continueTask` is
-valid after at least one settled turn.
+queued `TaskTurn`. They do **not** change lifecycle. `startTask` is valid before
+the first turn; `continueTask` is valid after at least one settled turn while the
+task is `open` (including after soft-fail **reopen**).
 
 If dependencies are unresolved, the queued turn records start intent but is not
 spawned. When dependencies resolve, the engine either schedules it or applies the
-dependency's `onUnsatisfied` policy.
+dependency's `onUnsatisfied` policy (see §5.6 for `skip`).
 
 There may be at most one queued or active turn per task.
 
-### 5.3 Interrupting and cancelling
+### 5.3 Outcome sealing (user and coordinator)
 
-- `interruptTurn(turnId)` aborts a live process and marks that turn
-  `interrupted`. The task remains `open`.
-- `retryTurn(turnId, recoveryInstruction)` creates a new turn. It does not revive
-  or continue the same process.
-- `cancelTask(taskId, cascadePolicy)` is terminal and marks the task `cancelled`.
-- UI **Pause** maps to `interruptTurn`; UI **Cancel** maps to `cancelTask`.
+Lifecycle is sealed by **authorized actors** (§4.1.1), never by CLI exit alone.
 
-Do not expose both `pause` and `stop` unless they have genuinely different domain
-semantics.
+Shared tool path: during a live turn the agent calls `complete_task` /
+`fail_task` / skip tools. The engine **stages** a disposition, then on
+`turnCompleted` either **proposes** or **seals** according to mode and role.
 
-### 5.4 Continuations after terminal outcomes
+#### 5.3.1 Supervised path (`user_confirm` — default)
 
-A terminal task is read-only. A user follow-up creates a new task with
-`continuationOf` referencing the prior task. It receives a fresh session, or a
-backend-native fork when explicitly supported. It never shares the old session ID.
+Proposal / approval: the coordinator asserts “I think we’re done”; the **user**
+seals (especially the root).
 
-The UI may group continuation tasks into one user-facing history, but dependency
-nodes remain immutable.
+1. Stage disposition on the live turn.
+2. On `turnCompleted`:
+   - turn status → `succeeded` (CLI OK only);
+   - for root (and any task requiring confirm): copy into `outcomeProposal`;
+     lifecycle stays `open`;
+   - for children under default orchestration policy: parent coordinator may
+     already be allowed to seal the child (graph progress).
+3. Webview shows an **outcome card** when a proposal awaits the user.
+4. User actions:
+
+| User action | Lifecycle | Side effects |
+|-------------|-----------|--------------|
+| **Accept** complete proposal | `succeeded` | Persist `result`; clear proposal; `finishedAt`; `sealedBy: user` |
+| **Reject** complete **with reason** | stays `open` | Clear proposal; inject reason; may auto-queue continuation turn |
+| **Reject** complete **without reason** | `failed` | Soft terminal; no automatic further turns; `sealedBy: user` |
+| **Accept** fail proposal | `failed` | Soft terminal; `sealedBy: user` |
+| **Reject** fail proposal **with reason** | stays `open` | Clear proposal; coordinator may continue |
+| **Reject** fail proposal **without reason** | stays `open` (default) | Clear proposal; user declined the agent’s self-fail |
+
+#### 5.3.2 Delegated path (`coordinator_delegate` and future `yolo`)
+
+User has **turned on** outcome delegation so the coordinator can mark success
+(and other outcomes) without a per-decision click — including sealing the **root**
+when the goal is met. This is the foundation for later **yolo**: hand the job to
+the root coordinator for self-orchestration within host limits.
+
+1. Stage disposition as today (`complete` / `fail` / skip / cancel-child tools).
+2. On `turnCompleted`, if the caller is a coordinator **and** mode + capabilities
+   authorize the target task:
+   - seal lifecycle immediately (`succeeded` / `failed` / …);
+   - set `sealedBy: { kind: 'coordinator', taskId, turnId, mode }`;
+   - **do not** require `outcomeProposal` / Accept card (optional notify toast).
+3. If authorization fails (worker, wrong subtree, mode is `user_confirm` for that
+   target), fall back to proposal or reject the tool.
+
+| Mode | Typical root behavior on `complete_task` |
+|------|------------------------------------------|
+| `user_confirm` | Proposal → user Accept/Reject |
+| `coordinator_delegate` | Coordinator seals `succeeded` on the root when it completes its own turn with `complete` |
+| `yolo` | Same seal mechanics as delegate; policy defaults favor autonomy (limits, auto-continue, fewer UI blocks) |
+
+**User override is never removed:** cancel, skip, soft-fail reopen, force-fail,
+and switching mode back to `user_confirm` always work. A coordinator seal does
+not lock the user out of the workspace.
+
+**Yolo (future product):** not a separate state machine — it is
+`OutcomeAuthorityMode = 'yolo'` plus looser execution policy (depth, concurrency,
+timeouts, optional auto-retry). Lifecycle rules stay: only user or authorized
+coordinator seals; CLI never does.
+
+### 5.4 Interrupting (runtime) vs cancelling (lifecycle)
+
+| UI / API | Domain effect | Lifecycle |
+|----------|---------------|-----------|
+| **Pause / Stop turn** → `interruptTurn` | Abort live process; turn → `interrupted` | stays `open` |
+| **Cancel task** → `cancelTask` (or `setTaskLifecycle` → `cancelled`) | Task + **all descendants** → `cancelled`; live turns cancelled; proposals cleared | hard terminal |
+| **Skip task** → `skipTask` (or `setTaskLifecycle` → `skipped`) | Authorized actor marks **won’t perform**; cascades unfinished descendants; see §5.6 | hard terminal |
+| **User status menu** → `setTaskLifecycle` | Direct lifecycle seal from UI: `succeeded` / `failed` / `open` (soft reopen only) / routes cancel & skip as above | per target state |
+
+- `retryTurn` / recovery create a **new** turn; they never revive a dead process
+  and never set lifecycle by themselves.
+- Do not expose both `pause` and `stop` unless they have genuinely different
+  domain semantics.
+- **Revert workspace changes** on cancel is **out of scope for the lifecycle
+  transition**; track as a future enhancement (e.g. snapshot/worktree rollback).
+  Cancel must still succeed as a pure state transition without revert.
+
+### 5.5 Soft fail reopen vs hard terminal continuation
+
+| State | User wants more work | Mechanism |
+|-------|----------------------|-----------|
+| `failed` (soft) | Send a message on the **same** task | Reopen → `open`, clear `finishedAt` / optional error retention for history, queue turn |
+| `succeeded` / `cancelled` / `skipped` (hard) | Follow-up or “do it after all” | **New task** or **Continue as new task** (`continuationOf`); new session; old node stays immutable for dependents |
+
+The UI may group continuation tasks visually. Soft-fail reopen must **not** create
+a second task ID unless the user explicitly starts a new task.
+
+### 5.6 `skipped` — created, user chooses not to perform
+
+`skipped` means: the task **record exists** (created by user, coordinator, or
+graph), but an **authorized actor decided it will not be executed**. It is a
+deliberate “won’t do,” not an error and not an abort of in-flight work.
+
+| Aspect | Rule |
+|--------|------|
+| Who sets it | **User** always; **coordinator** when outcome mode allows (`coordinator_delegate` / `yolo`) for tasks in scope. Dependency policy `onUnsatisfied: 'skip'` may also mark a blocked dependent skipped (host policy, not CLI). Workers do not seal skip on the root without going through coordinator tools + mode checks. |
+| When | Typically while `open`, often **before** meaningful work (no turns, or only idle). If a live turn exists, skip should interrupt/cancel that turn first, then seal `skipped` (or product may require cancel instead when work already started — prefer: skip allowed anytime on `open`, with interrupt of live process). |
+| vs `cancelled` | **Cancel** = stop / abandon work that was accepted as in progress. **Skip** = choose not to do this unit of work (backlog triage, “not now / not this”). |
+| vs `failed` | **Failed** = attempt judged unsuccessful. **Skipped** = never (or no longer) attempting. |
+| Descendants | Default: unfinished descendants are also **skipped** (or cancelled if they had live turns — implementation may map live children → cancel process then skip). Cascade must leave no open orphan work under a skipped parent. |
+| Hard terminal | Read-only; no reopen-on-message. To do the work later → new task / continuation. |
+| Wait / deps | Settles wait barriers. Does **not** satisfy `requiredOutcome: 'succeeded'`. Dependents with `onUnsatisfied: 'skip'` may themselves become `skipped`. |
+| CLI | Never maps process exit or missing disposition to `skipped`. |
+
+Host path (implemented): webview posts `setTaskLifecycle { taskId, lifecycle: 'skipped' }`;
+host routes to engine `skipTask` (cascade + interrupt live turns). Optional `reason`
+may be added later for transcript/history only.
+
+### 5.7 Settled outcomes for waits and dependencies
+
+For child wait barriers and dependencies:
+
+- `succeeded`, `failed`, `cancelled`, and `skipped` all **settle** a wait set
+  (barrier complete).
+- Only `succeeded` satisfies `requiredOutcome: 'succeeded'`.
+- Soft-fail reopen of a dependency after a parent has already continued is an
+  advanced case: parents that already consumed a settled barrier do not re-fire;
+  new work uses new turns / new wait sets.
 
 ---
 
@@ -379,34 +773,43 @@ Exactly one adapter terminal event closes a running turn, as defined by
 
 On adapter `turnCompleted`, the engine atomically:
 
-1. Marks the turn `succeeded`.
+1. Marks the turn `succeeded` (**turn** status only).
 2. Commits the session ID according to §10.
-3. Applies the staged disposition:
-   - `complete` → task `succeeded`, bounded `result` persisted;
-   - `fail` → task `failed`, bounded `error` persisted;
-   - `wait_tasks` → task stays open and receives a child wait set;
-   - `idle` or no disposition → task stays open without an automatic next turn.
+3. Applies the staged disposition **without conflating it with CLI success**,
+   using outcome authority (§4.1.1, §5.3):
+   - **`complete` / `fail` + sealer authorized** (user already confirmed offline
+     N/A; **coordinator** under `coordinator_delegate` / `yolo`, or child under
+     orchestration policy) → **seal** lifecycle, set `sealedBy`, clear proposal.
+   - **`complete` / `fail` + sealer not authorized** → stage/refresh
+     `outcomeProposal`; lifecycle stays `open` until user (or later authorized
+     coordinator) seals.
+   - `wait_tasks` → task stays `open` and receives a child wait set.
+   - `idle` or no disposition → task stays `open` without an automatic next turn
+     and without a new outcome proposal.
 4. Marks user-message inputs assigned to that turn as `complete`.
-5. Emits task and turn updates.
+5. Emits task and turn updates (lifecycle + proposal + runtime activity + mode).
 
 A staged disposition is discarded if the adapter turn fails or is interrupted.
-This prevents an MCP call made early in a failed invocation from prematurely
-changing the task outcome.
+This prevents an MCP call made early in a failed invocation from becoming a
+completion proposal or an unauthorized seal.
 
-Delegated prompts must instruct workers and coordinators to explicitly call
-`complete_task`, `fail_task`, or `wait_for_tasks`. Missing disposition safely falls
-back to `idle`; execution policy may later time out or fail an abandoned task.
+Agents should call `complete_task` / `fail_task` or `wait_for_tasks` when
+appropriate. Missing disposition safely falls back to `idle`. Turn/task
+**timeouts** are runtime events: leave `open` + `needs_recovery`, unless an
+authorized coordinator explicitly seals `failed` under delegate/yolo policy.
 
 ### 6.2 Applying a failed turn
 
-A failed turn does not automatically mean the domain work is impossible. The
-task's execution policy decides whether to:
+A failed **turn** does not mean the **task** lifecycle is `failed`. The task
+stays `open`. Execution policy may:
 
-- enqueue a bounded retry;
-- leave the task open for user/coordinator recovery; or
-- mark the task `failed` after automatic retries are exhausted.
+- enqueue a bounded automatic retry; or
+- leave the task open for user/coordinator recovery (`needs_recovery`).
 
-Policy decisions and retry turn IDs are persisted so reload cannot duplicate them.
+Do **not** auto-transition lifecycle to `failed` solely because retries are
+exhausted. Sealing `failed` requires an authorized actor (§5.3) — user action or
+coordinator under delegate/yolo — not the CLI. Policy decisions and retry turn
+IDs are persisted so reload cannot duplicate them.
 
 ---
 
@@ -445,21 +848,27 @@ tools.
 | `delegate_task` | Coordinator | Atomically create a direct child and queue its first turn |
 | `start_task` | Coordinator | Queue the first turn of an existing direct child |
 | `interrupt_task` | Coordinator | Interrupt an active direct child turn |
-| `cancel_task` | Coordinator | Terminally cancel a direct child according to policy |
+| `cancel_task` | Coordinator | Request cancel of a direct child (host may cascade per policy) |
 | `wait_for_tasks` | Coordinator | Stage the caller turn's explicit child wait set |
-| `get_task_status` | Coordinator | Read an authorized subtree summary |
-| `complete_task` | Any task | Stage successful task completion on the caller turn |
-| `fail_task` | Any task | Stage failed task completion on the caller turn |
+| `get_task_status` | Coordinator | Read an authorized subtree summary (lifecycle **and** runtime activity) |
+| `complete_task` | Any task | Stage successful completion; **seal or propose** per outcome mode + role (§4.1.1) |
+| `fail_task` | Any task | Stage failure; seal or propose per mode + role |
 | `report_progress` | Any task | Update optional progress metadata |
 | `ask_user` | Any task | Block the caller's live turn for structured user input |
 
-Tool names describe requested host actions. The MCP response confirms acceptance;
-it does not bypass engine validation.
+Tool names describe requested host actions. The MCP response confirms the host
+**accepted the staging** (and, when mode allows, that a seal will apply on
+`turnCompleted`). Under `user_confirm`, staging is not a root lifecycle seal.
 
 Each turn has at most one staged disposition. Repeating the same disposition with
 the same tool-call/operation ID is idempotent; a conflicting disposition is
 rejected. The engine derives mutation idempotency from `(turnId, toolCallId)` or an
 equivalent stable operation ID.
+
+User decisions and mode control are **host/webview commands** (not MCP). Implemented
+today: `setTaskLifecycle` (user status menu; cancel/skip cascade via engine). Planned
+dedicated cards: `acceptOutcome`, `rejectOutcome { reason?: string }`,
+`setOutcomeAuthorityMode { mode }`.
 
 ### 8.2 Explicit child waiting
 
@@ -521,16 +930,19 @@ Default host policy must set finite limits for at least:
 
 ## 9. User messages and focused-task chat
 
-`send(taskId, message)` targets the focused task, but only while that task is open.
+`send(taskId, message)` targets the focused task. Lifecycle and runtime activity
+both constrain behavior:
 
-| Derived task state | Behavior |
-|--------------------|----------|
-| `idle` | Create a user-triggered queued turn |
-| `waiting_dependencies` / `queued` | Persist the message as pending input |
-| `running` / `waiting_user` | Persist it; do not inject it into the live process except through `submitAsk` |
-| `waiting_children` / `blocked` | Persist it for the next continuation turn |
-| `needs_recovery` | Persist it and offer explicit Retry or Continue recovery |
-| terminal | Read-only; offer **Continue as new task** |
+| Lifecycle | Runtime activity (if open) | Behavior |
+|-----------|----------------------------|----------|
+| `open` | `idle` | Queue a user-triggered turn |
+| `open` | `waiting_dependencies` / `queued` | Persist message as pending input |
+| `open` | `running` / `waiting_user` | Persist; do not inject into the live process except via `submitAsk` |
+| `open` | `waiting_children` / `blocked` | Persist for the next continuation turn |
+| `open` | `needs_recovery` | Persist; offer explicit Retry / Continue recovery |
+| `open` | `awaiting_outcome` | Prefer Accept/Reject when an outcome card exists. **Composer stays writable:** a new `send` clears `outcomeProposal`, keeps lifecycle `open`, and queues a turn (continue session). Do **not** block send solely because a proposal is pending. |
+| `failed` (soft) | — | **Reopen** to `open`, then queue a turn with the message |
+| `succeeded` / `cancelled` / `skipped` | — | Read-only; no reopen on the same task id. Offer **Continue as new task** (or new task if the user later wants a previously skipped goal) |
 
 Chat messages are durable records, not raw queued strings. They provide both the
 task transcript and delivery identity:
@@ -673,18 +1085,23 @@ wait set is sufficient to recover orchestration state.
 `TaskEngine` is the single authority for task and turn transitions. It:
 
 - validates graph ownership, cycles, capabilities, and limits;
-- creates and persists tasks, turns, messages, wait sets, and dispositions;
+- creates and persists tasks, turns, messages, wait sets, dispositions, and
+  outcome proposals;
+- applies **user** accept/reject/cancel/skip/reopen decisions to lifecycle;
+- applies **coordinator** seals when outcome authority mode allows (§4.1.1);
+- enforces outcome mode and capability scope on every seal;
 - schedules turns through backend adapters;
-- maps adapter events to the correct task and turn;
+- maps adapter events to the correct task and turn (**turn** status only for CLI);
 - commits session identity only after successful turns;
 - routes AskBridge requests by task and turn ID;
 - resolves dependencies and child barriers;
-- applies retries and execution policy;
-- emits task/turn patches to the webview;
-- performs reload reconciliation and idempotent continuation scheduling.
+- applies retries and execution policy without CLI-driven lifecycle seals;
+- emits task/turn patches with lifecycle + runtime activity + authority mode;
+- performs reload reconciliation and idempotent continuation scheduling;
+- cascades cancel/skip to descendants.
 
 `TaskStore` persists state but does not decide transitions. Backend adapters execute
-turns but do not decide task outcomes.
+turns but never seal lifecycle. User and authorized coordinators do.
 
 ---
 
@@ -694,12 +1111,12 @@ turns but do not decide task outcomes.
 
 | Screen | Content |
 |--------|---------|
-| Task list | Root tasks and continuation grouping, derived status, updated time, **New task** |
-| Task workspace | Task subtree plus the focused task's session thread |
+| Task list | Root tasks; **lifecycle** badge only; optional CLI live dot; updated time; **New task** |
+| Task workspace | **Task status card as header** (name + lifecycle + status menu; expand for detail); thread; composer **CLI strip**; orchestration / recovery panels; outcome card when shipped |
 
 Clicking **New task** opens an unpersisted composer. The first submitted message
-creates the root coordinator task with that message as its goal and queues its first
-turn. This avoids creating empty root tasks.
+creates the root coordinator task (`lifecycle: open`) with that message as its
+goal and queues its first turn. This avoids creating empty root tasks.
 
 ### 14.2 Protocol identity
 
@@ -708,20 +1125,86 @@ All turn-scoped messages carry both `taskId` and `turnId`:
 ```text
 turnStart      { taskId, turnId }
 event          { taskId, turnId, event }
-turnDone       { taskId, turnId }
+turnDone       { taskId, turnId }          // turn settled — not task lifecycle
 turnError      { taskId, turnId, error }
 askPending     { taskId, turnId, askId, questions }
-taskUpdated    { taskId, revision, patch }
+taskUpdated    { taskId, revision, patch } // patch includes lifecycle, proposal, runtime
 ```
+
+Preferred summary fields (additive):
+
+```text
+lifecycle          TaskLifecycleState
+runtimeActivity    TaskRuntimeActivity      // orchestration + live turn signals
+cliViewStatus?     CliViewStatus            // not_started | running | idle | stopped
+cliLastExit?       CliLastExit              // when stopped
+outcomeProposal?   OutcomeProposal
+```
+
+Until the host projects `cliViewStatus`, the webview **derives** it from
+`runtimeActivity`, live turn flags, transcript/`hadProcess`, and
+`committedSessionId` (§4.3.2).
 
 The webview ignores late events whose `turnId` is no longer active for that task.
 `submitAsk` must include `taskId`, `turnId`, and `askId`.
 
-### 14.3 Terminal tasks
+Host commands for user seals and mode:
 
-Terminal threads are read-only. **Continue as new task** creates a continuation
-task and focuses it. The UI may visually group the continuation with the prior
-thread without changing the old task outcome.
+```text
+# Implemented
+setTaskLifecycle           { taskId, lifecycle, result?, error? }
+  // lifecycle: open | succeeded | failed | cancelled | skipped
+  // open      → only from soft failed (hard terminals rejected)
+  // cancelled → engine cancelTask (cascade descendants)
+  // skipped   → engine skipTask (cascade unfinished descendants)
+  // terminal seals interrupt local live turns; remote-owned → interrupt request
+
+# Planned (outcome card / settings)
+acceptOutcome              { taskId }
+rejectOutcome              { taskId, reason?: string }  // empty reason on complete → failed
+setOutcomeAuthorityMode    { mode }                     // user_confirm | coordinator_delegate | yolo
+```
+
+Engine also exposes `cancelTask` / `skipTask` directly for host/coordinator paths;
+the webview status menu uses `setTaskLifecycle` only.
+
+### 14.3 Outcome UX and terminal chrome
+
+- **Header:** task status card (name + lifecycle badge + status menu). Expand
+  details for lifecycle/orchestration/session copy; collapsed by default so the
+  badge is not duplicated in a second header row.
+- While `lifecycle === 'open'` and `outcomeProposal` is set (`awaiting_outcome`):
+  prefer Accept / Reject when a dedicated card ships. **Until then**, the status
+  menu can seal lifecycle; **composer remains writable** and send clears the
+  proposal and continues (§9). Do **not** show the task as Succeeded merely
+  because `turnDone` arrived.
+- Surface **outcome authority mode** (supervised / delegate / yolo) so users know
+  whether the coordinator may mark success without confirmation.
+- When a coordinator seals under delegate/yolo, show a non-blocking notice
+  (who sealed, when) rather than an Accept card — unless `alwaysConfirmRoot`.
+- **Failed** (soft): composer remains available; send reopens to `open`. Status
+  menu may also **Reopen** → `setTaskLifecycle` `open`.
+- **Succeeded** / **Cancelled** / **Skipped**: thread read-only; **no**
+  reopen-on-same-id (status menu does not offer open). **Continue as new task**
+  (or new task) if the user wants related work later.
+- **Cancel task** = abort in-progress work (cascade). **Skip task** = won’t
+  perform this created task (cascade unfinished descendants). Both are distinct
+  from **stop/interrupt turn**.
+
+### 14.4 Anti-patterns (webview)
+
+- Using a single status chip that shows `running` / `succeeded` interchangeably
+  from turn events without a separate lifecycle field.
+- Setting list status to “failed” when a CLI turn errors.
+- Treating `turnDone` as task completion.
+- Duplicating task name + lifecycle in both App chrome and the workspace status
+  card (status card **is** the header).
+- Blocking composer solely because `runtimeActivity === 'awaiting_outcome'`.
+- Offering “Reopen” for hard-terminal tasks on the same task id.
+- Auto-sealing root success in **`user_confirm`** mode on agent `complete_task`.
+- Blocking all coordinator seals in **`coordinator_delegate` / `yolo`** as if
+  every outcome still required a human click (defeats handoff).
+- Using **Skip** and **Cancel** as synonyms in the UI copy.
 
 ---
 
@@ -771,17 +1254,34 @@ thread without changing the old task outcome.
 |-------|----------|
 | Domain terminology | Use Task, Backend, Session, Turn, Process, and Engine; retire Executor |
 | Main agent | Root coordinator is a normal task with host-issued coordinator policy |
-| State model | Persist task lifecycle and turn status separately; derive UI status |
-| Completion | Adapter `turnCompleted` completes only a turn; task disposition is explicit |
+| Two axes | Persist **lifecycle** (work outcome) separately from **turn/runtime activity** (CLI and waits) |
+| New task | Always `lifecycle: open` |
+| Who seals lifecycle | **User always**; **coordinator** when outcome authority mode allows — never the CLI |
+| Status axes | Lifecycle ≠ CLI process ≠ orchestration; three axes (§4.3) |
+| CLI view (MVP) | `not_started` \| `running` \| `idle` \| `stopped`; error is `lastExit`, not a phase |
+| CLI idle | Process on but not generating (incl. ask_user); common under long-lived process or mid-ask |
+| CLI placement | Task badge = lifecycle; CLI strip near composer (§4.3.4, WEBVIEW) |
+| Default mode | `user_confirm` — coordinator proposes, user Accept → `succeeded` |
+| Delegate mode | `coordinator_delegate` — user enables coordinator to mark success/fail/skip in scope (incl. root) |
+| Yolo (future) | `yolo` — same seal path as delegate + freer execution policy for self-orchestration handoff |
+| Reject complete with reason | Stay `open`; inject reason; coordinator continues |
+| Reject complete without reason | Soft `failed`; no auto turns until user messages |
+| Soft fail reopen | New user message on `failed` reopens same task to `open` |
+| Hard terminal follow-up | `succeeded` / `cancelled` / `skipped` → new or continuation task, not silent reopen |
+| Cancel | Authorized cancel seals `cancelled` and **cascades** descendants; workspace revert is future work |
+| Skip | Created task marked **won’t perform** → `skipped` (hard); user or authorized coordinator |
+| CLI / turn failure | Never seals lifecycle by itself; leave `open` + recovery (unless authorized sealer acts) |
+| Disposition commit | Propose vs seal decided by mode + role on `turnCompleted` (§5.3, §6.1) |
+| Audit | Persist `sealedBy` (user vs coordinator + mode) |
 | Child waiting | Explicit turn-scoped wait set; no implicit per-turn spawn batch |
-| Child failure | Settles the barrier but does not automatically fail the parent |
+| Child failure | Settles the barrier but does not automatically fail the parent root |
 | Dependencies | Declare required outcome and failure policy |
-| Terminal follow-up | Create immutable continuation task; never reopen a dependency node |
 | Concurrency | Serialize per task/session, then apply backend and global limits |
-| Interruption | Aborted/reloaded process becomes an immutable interrupted turn |
+| Interruption | Aborted/reloaded process → interrupted **turn**; lifecycle stays `open` |
 | Reload | Reconcile persisted state; never silently replay a process |
 | Persistence | Versioned task/turn/message store with one authoritative copy of each fact |
 | Delegation safety | Scoped authorization plus finite depth, count, turn, timeout, and concurrency limits |
+| Webview status | Show lifecycle badge + runtime activity; do not conflate with CLI status |
 
 ---
 

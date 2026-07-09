@@ -1,5 +1,5 @@
 import type { BackendModels, SnapshotMessage, TaskSummary } from './protocol';
-import { isTerminalStatus } from './protocol';
+import { isHardTerminalLifecycle } from './protocol';
 import { vscode } from './vscode';
 
 export interface CommandErrorState {
@@ -67,9 +67,14 @@ class TasksState {
     return this.tasks.get(this.focusedTaskId);
   }
 
+  /** Hard terminal only — soft failed stays editable / reopenable. */
   get focusedIsTerminal(): boolean {
     const task = this.focusedTask;
-    return task ? isTerminalStatus(task.viewStatus) : false;
+    return task ? isHardTerminalLifecycle(task.lifecycle) : false;
+  }
+
+  get focusedIsSoftFailed(): boolean {
+    return this.focusedTask?.lifecycle === 'failed';
   }
 
   setBackend(next: WebviewBackendId): void {
@@ -179,6 +184,7 @@ class TasksState {
         goal: '',
         role: 'coordinator',
         lifecycle: 'open',
+        runtimeActivity: 'idle',
         viewStatus: 'idle',
         updatedAt: new Date(0).toISOString(),
         backend: '',

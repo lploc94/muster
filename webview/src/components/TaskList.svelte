@@ -1,8 +1,8 @@
 <script lang="ts">
   import { tasks } from '../lib/tasks.svelte';
-  import { post } from '../lib/protocol';
-  import { getTaskStatusPresentation, isTaskStatusTerminal } from '../lib/task-status';
-  import type { TaskSummary, TaskViewStatus } from '../lib/protocol';
+  import { effectiveRuntimeActivity, post } from '../lib/protocol';
+  import { getLifecyclePresentation, isSoftTerminal } from '../lib/task-status';
+  import type { TaskSummary } from '../lib/protocol';
   import { backendShortLabel } from '../lib/backends';
   import { tip } from '../lib/tooltip';
 
@@ -47,30 +47,31 @@
     return `${trimmed.slice(0, 45)}…`;
   }
 
-  function statusClass(status: TaskViewStatus): string {
-    return `task-status task-status--${getTaskStatusPresentation(status).tone}`;
+  function lifecycleClass(lifecycle: string): string {
+    return `task-status task-status--${getLifecyclePresentation(lifecycle).tone}`;
   }
 
   function taskStateFlags(task: TaskSummary): string[] {
     const flags: string[] = [];
-    if (task.viewStatus === 'running') flags.push('Active turn');
-    if (task.viewStatus === 'queued') flags.push('Queued turn');
-    if (task.viewStatus === 'waiting_user') flags.push('Waiting for answer');
-    if (task.viewStatus === 'needs_recovery') flags.push('Recovery needed');
-    if (task.viewStatus === 'failed') flags.push('Failed terminal task');
-    if (task.viewStatus === 'cancelled') flags.push('Cancelled terminal task');
-    if (isTaskStatusTerminal(task.viewStatus) && task.viewStatus !== 'failed' && task.viewStatus !== 'cancelled') {
-      flags.push('Terminal task');
-    }
+    const runtime = effectiveRuntimeActivity(task);
+    // Task status only (lifecycle) — CLI process is shown near the composer.
+    flags.push(`Task ${getLifecyclePresentation(task.lifecycle).label}`);
+    if (runtime === 'running' || runtime === 'waiting_user') flags.push('CLI running');
+    if (isSoftTerminal(task.lifecycle)) flags.push('Soft failed — send to reopen');
     if (task.backend) flags.push(`Backend ${task.backend}`);
     if (task.continuationOf) flags.push('Continuation');
     return flags;
   }
 
   function taskAriaLabel(task: TaskSummary): string {
-    const presentation = getTaskStatusPresentation(task.viewStatus);
     const flags = taskStateFlags(task);
-    return [shortGoal(task.goal), presentation.label, presentation.listCopy, ...flags].join(' ');
+    return [shortGoal(task.goal), ...flags].join(' ');
+  }
+
+  /** True when a CLI process is up (running or idle/waiting_user). */
+  function isCliLive(task: TaskSummary): boolean {
+    const runtime = effectiveRuntimeActivity(task);
+    return runtime === 'running' || runtime === 'waiting_user';
   }
 
   function startRename(task: TaskSummary) {
@@ -155,8 +156,8 @@
       {/if}
 
       {#each filtered as task (task.id)}
-        {@const presentation = getTaskStatusPresentation(task.viewStatus)}
         {@const flags = taskStateFlags(task)}
+        {@const cliLive = isCliLive(task)}
         {@const isSel = tasks.focusedTaskId === task.id && !tasks.draftMode}
         {@const isEditing = editingId === task.id}
         {@const isConfirming = confirmDeleteId === task.id}
@@ -206,7 +207,19 @@
             >
               <span class="truncate font-medium">{shortGoal(task.goal)}</span>
               <span class="flex items-center gap-1 flex-wrap" style="opacity: 0.85;">
-                <vscode-badge class={statusClass(task.viewStatus)}>{presentation.label}</vscode-badge>
+                <vscode-badge
+                  class={lifecycleClass(task.lifecycle)}
+                  use:tip={`Task status: ${getLifecyclePresentation(task.lifecycle).listCopy}`}
+                >
+                  {getLifecyclePresentation(task.lifecycle).label}
+                </vscode-badge>
+                {#if cliLive}
+                  <span
+                    class="cli-live-dot"
+                    use:tip={'CLI running (process status — not task outcome)'}
+                    aria-label="CLI running"
+                  ></span>
+                {/if}
                 {#if task.backend}
                   <span class="text-[11px] leading-[14px] opacity-70">{backendShortLabel(task.backend)}</span>
                 {/if}
@@ -298,8 +311,8 @@
     {/if}
 
     {#each tasks.rootTasks as task (task.id)}
-      {@const presentation = getTaskStatusPresentation(task.viewStatus)}
       {@const flags = taskStateFlags(task)}
+      {@const cliLive = isCliLive(task)}
       <button
         type="button"
         class="w-full text-left rounded px-2 py-1.5 text-xs flex flex-col gap-0.5 hover:bg-[var(--vscode-list-hoverBackground)]"
@@ -311,7 +324,19 @@
       >
         <span class="truncate font-medium">{shortGoal(task.goal)}</span>
         <span class="flex items-center gap-1 flex-wrap" style="opacity: 0.85;">
-          <vscode-badge class={statusClass(task.viewStatus)}>{presentation.label}</vscode-badge>
+          <vscode-badge
+            class={lifecycleClass(task.lifecycle)}
+            use:tip={`Task status: ${getLifecyclePresentation(task.lifecycle).listCopy}`}
+          >
+            {getLifecyclePresentation(task.lifecycle).label}
+          </vscode-badge>
+          {#if cliLive}
+            <span
+              class="cli-live-dot"
+              use:tip={'CLI running (process status — not task outcome)'}
+              aria-label="CLI running"
+            ></span>
+          {/if}
           {#if task.backend}
             <span class="text-[11px] leading-[14px] opacity-70">{backendShortLabel(task.backend)}</span>
           {/if}

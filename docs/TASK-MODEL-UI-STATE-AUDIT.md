@@ -4,6 +4,15 @@
 **Purpose:** give downstream runtime-state work a source-backed baseline for the task domain model, host snapshot/protocol projection, and webview task UI state.  
 **Confidence labels:** `[High confidence]` means the claim is directly implemented in referenced source; `[Medium confidence]` means the source supports the claim but behavior still depends on host/runtime wiring; `[Low confidence]` means the claim is a proof boundary or unverified runtime assumption.
 
+> **Design drift notice (normative intent vs this audit):**  
+> `docs/TASK-MANAGEMENT.md` now defines **authorized outcome sealing** (user
+> always; coordinator when mode is `coordinator_delegate` / future `yolo`),
+> soft-fail reopen, cancel/skip cascade, and a strict split between **lifecycle**
+> and **runtime activity**. CLI/`turnDone` must not become the task status.
+> Default mode remains supervised proposal/accept. This audit still describes
+> **what the code projected at audit time**. Treat `TASK-MANAGEMENT.md` as the
+> target contract; use this file as a source baseline for migration.
+
 ## Source Map
 
 | Area | Current source | Audit role |
@@ -131,4 +140,4 @@
 2. Preserve the `taskId` + `turnId` identity boundary across host and webview messages; do not reintroduce run-only identity for task UI state.
 3. Prefer making projections more explicit and testable before changing UI behavior. The riskiest boundary is currently the mixed incremental `taskUpdated` plus full focused snapshot stream.
 4. Add focused tests before runtime UX changes: snapshot root ordering/subtree/transcript/active-turn behavior, stale patch rejection, late event ignoring, and reload recovery/resume paths.
-5. Keep task lifecycle immutable after terminal outcomes; user follow-up should create continuation tasks instead of reopening records.
+5. Align with `TASK-MANAGEMENT.md` outcome model when changing UI: separate lifecycle badge from runtime activity (and CLI strip); lifecycle sealed by user (`setTaskLifecycle` / status menu) and/or authorized coordinator (mode-dependent); soft `failed` reopens on send; hard terminals use continuation/new task (no same-id reopen); cancel/skip cascade; status card is the workspace header (expand for details); do not block composer solely for `awaiting_outcome`. Do not treat mixed `TaskViewStatus` as the long-term product model.

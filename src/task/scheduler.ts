@@ -64,7 +64,9 @@ export function dependenciesBlockTask(file: TaskStoreFile, taskId: string): bool
   for (const dep of task.dependencies) {
     const lifecycle = file.tasks[dep.taskId]?.lifecycle;
     const outcome = evaluateDependency(dep, lifecycle);
-    if (outcome === 'block' || outcome === 'pending') {
+    // Only 'satisfied' allows promotion. pending/block wait; fail/skip are sealed by
+    // host applyDependencyTerminals — still block until sealed/settled.
+    if (outcome !== 'satisfied') {
       return true;
     }
   }

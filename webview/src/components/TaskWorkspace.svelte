@@ -4,9 +4,13 @@
   import AskCard from './AskCard.svelte';
   import { tasks } from '../lib/tasks.svelte';
   import { threadStore } from '../lib/thread.svelte';
-  import { post } from '../lib/protocol';
-  import { getTaskStatusPresentation, isTaskStatusTerminal } from '../lib/task-status';
-  import type { PendingAsk, TaskViewStatus } from '../lib/protocol';
+  import { effectiveRuntimeActivity, post } from '../lib/protocol';
+  import {
+    getLifecyclePresentation,
+    getTaskPresentation,
+    isHardTerminal,
+  } from '../lib/task-status';
+  import type { PendingAsk, TaskLifecycleState } from '../lib/protocol';
   import { tip } from '../lib/tooltip';
 
   interface Props {
@@ -18,20 +22,85 @@
 
   let retryInstruction = $state('');
   let continueMessage = $state('');
+  let statusMenuOpen = $state(false);
+  let statusMenuRegion = $state<HTMLElement | undefined>(undefined);
+  /** Collapsed by default — detail lines (headline, session, orchestration) only when expanded. */
+  let detailsExpanded = $state(false);
 
   const focused = $derived(tasks.focusedTask);
   const thread = $derived(threadStore.current);
-  const presentation = $derived(getTaskStatusPresentation(focused?.viewStatus));
+  const presentation = $derived(focused ? getTaskPresentation(focused) : null);
+  const runtime = $derived(focused ? effectiveRuntimeActivity(focused) : null);
+
+  type LifecycleAction = {
+    lifecycle: TaskLifecycleState;
+    label: string;
+    description: string;
+  };
+
+  const lifecycleActions = $derived.by((): LifecycleAction[] => {
+    const current = focused?.lifecycle ?? 'open';
+    const actions: LifecycleAction[] = [];
+    if (current === 'open') {
+      actions.push(
+        { lifecycle: 'succeeded', label: 'Mark done', description: 'Seal task as succeeded' },
+        { lifecycle: 'failed', label: 'Mark failed', description: 'Soft-fail; can reopen later' },
+        { lifecycle: 'cancelled', label: 'Cancel task', description: 'Cancel this task and children' },
+        { lifecycle: 'skipped', label: 'Skip', description: 'Won’t perform this task' },
+      );
+    } else if (current === 'failed') {
+      actions.push(
+        { lifecycle: 'open', label: 'Reopen', description: 'Continue on the same task' },
+        { lifecycle: 'succeeded', label: 'Mark done', description: 'Seal as succeeded' },
+        { lifecycle: 'cancelled', label: 'Cancel task', description: 'Cancel this task and children' },
+        { lifecycle: 'skipped', label: 'Skip', description: 'Won’t perform' },
+      );
+    }
+    // Hard terminal (succeeded/cancelled/skipped): no lifecycle menu actions —
+    // further work uses Continue as new task, not reopen-on-same-id.
+    return actions;
+  });
+
+  function setLifecycle(lifecycle: TaskLifecycleState) {
+    if (!focused) return;
+    statusMenuOpen = false;
+    post({ type: 'setTaskLifecycle', taskId: focused.id, lifecycle });
+  }
+
+  $effect(() => {
+    if (!statusMenuOpen) return;
+    function onPointerDown(e: PointerEvent) {
+      const target = e.target;
+      if (target instanceof Node && statusMenuRegion?.contains(target)) return;
+      statusMenuOpen = false;
+    }
+    window.addEventListener('pointerdown', onPointerDown, true);
+    return () => window.removeEventListener('pointerdown', onPointerDown, true);
+  });
+
+  // Collapse details when switching tasks so each open starts compact.
+  $effect(() => {
+    void focused?.id;
+    detailsExpanded = false;
+    statusMenuOpen = false;
+  });
+
   const showResume = $derived(
     !!focused &&
+      focused.lifecycle === 'open' &&
       !!activeTurnId &&
-      (focused.viewStatus === 'queued' || focused.viewStatus === 'waiting_dependencies'),
+      (runtime === 'queued' || runtime === 'waiting_dependencies'),
   );
-  const showRecovery = $derived(focused?.viewStatus === 'needs_recovery');
-  const showContinueAsNew = $derived(!!focused && isTaskStatusTerminal(focused.viewStatus));
+  const showRecovery = $derived(focused?.lifecycle === 'open' && runtime === 'needs_recovery');
+  const showContinueAsNew = $derived(!!focused && isHardTerminal(focused.lifecycle));
+  const showSoftFailHint = $derived(focused?.lifecycle === 'failed');
   const hasRetryableTurn = $derived(!!activeTurnId);
   const composerReadOnly = $derived(
-    !!focused && (thread.readOnly || showRecovery || focused.viewStatus === 'running' || focused.viewStatus === 'queued'),
+    !!focused &&
+      (thread.readOnly ||
+        showRecovery ||
+        runtime === 'running' ||
+        runtime === 'queued'),
   );
 
   function resumeQueued(): void {
@@ -66,16 +135,29 @@
     return trimmed || '(no goal)';
   }
 
-  function statusClass(status: TaskViewStatus): string {
-    return `task-status task-status--${getTaskStatusPresentation(status).tone}`;
+  function lifecycleClass(lifecycle: string): string {
+    return `task-status task-status--${getLifecyclePresentation(lifecycle).tone}`;
   }
+
+  /** Banner uses lifecycle tone only — CLI process is shown near the composer. */
+  const bannerTone = $derived(presentation?.lifecycle.tone ?? 'neutral');
 </script>
 
 <div class="flex-1 min-w-0 min-h-0 flex flex-col">
   {#if tasks.draftMode}
+    <div class="task-workspace-banner task-workspace-banner--neutral" data-task-status="draft">
+      <div class="min-w-0 flex-1">
+        <div class="font-semibold text-sm">
+          {tasks.continuationOf ? 'Continue as new task' : 'New task'}
+        </div>
+        <div class="task-workspace-detail" style="margin-top: 2px;">
+          First message creates the coordinator task.
+        </div>
+      </div>
+    </div>
     <ChatThread />
     <Composer mode="draft" {pendingAsk} />
-  {:else if focused}
+  {:else if focused && presentation}
     {#if tasks.subtree.length > 1}
       <div
         class="px-2 py-1 border-b flex flex-wrap gap-1 items-center text-xs"
@@ -83,38 +165,112 @@
       >
         <span style="opacity: 0.7;">Subtree:</span>
         {#each tasks.subtree as node (node.id)}
-          <vscode-badge use:tip={node.goal} class={statusClass(node.viewStatus)}>
+          {@const nodePresentation = getTaskPresentation(node)}
+          <vscode-badge use:tip={`${nodePresentation.listCopy}: ${node.goal}`} class={lifecycleClass(node.lifecycle)}>
             {node.id === focused.id ? '▸ ' : ''}{shortGoal(node.goal).slice(0, 24)}
+            · {nodePresentation.lifecycle.label}
           </vscode-badge>
         {/each}
       </div>
     {/if}
 
+    <!-- Single header card: title + status (replaces App header row 2) -->
     <div
-      class={`task-workspace-banner task-workspace-banner--${presentation.tone}`}
-      data-task-status={focused.viewStatus}
+      class={`task-workspace-banner task-workspace-banner--${bannerTone}`}
+      data-task-lifecycle={focused.lifecycle}
+      data-task-status={focused.lifecycle}
+      data-details-expanded={detailsExpanded ? 'true' : 'false'}
     >
       <div class="min-w-0 flex-1">
         <div class="flex items-center gap-2 min-w-0">
-          <span class="font-semibold truncate">{shortGoal(focused.goal)}</span>
-          <vscode-badge class={statusClass(focused.viewStatus)}>{presentation.label}</vscode-badge>
+          <span class="font-semibold truncate text-sm min-w-0 flex-1" use:tip={focused.goal}>
+            {shortGoal(focused.goal)}
+          </span>
+          <div bind:this={statusMenuRegion} class="task-status-menu shrink-0">
+            <button
+              type="button"
+              class={`task-status-btn task-status task-status--${presentation.lifecycle.tone}`}
+              aria-haspopup="menu"
+              aria-expanded={statusMenuOpen ? 'true' : 'false'}
+              aria-label={`Task status: ${presentation.lifecycle.label}. Click to change.`}
+              use:tip={'Change task status (user only — not CLI)'}
+              onclick={() => (statusMenuOpen = !statusMenuOpen)}
+            >
+              {presentation.lifecycle.label}
+              <span class="codicon codicon-chevron-down" style="font-size: 11px; opacity: 0.8;"></span>
+            </button>
+            {#if statusMenuOpen}
+              <div class="task-status-menu__panel" role="menu" aria-label="Set task status">
+                {#each lifecycleActions as action (action.lifecycle)}
+                  <button
+                    type="button"
+                    class="task-status-menu__item"
+                    role="menuitem"
+                    title={action.description}
+                    onclick={() => setLifecycle(action.lifecycle)}
+                  >
+                    <span class="task-status-menu__item-label">{action.label}</span>
+                    <span class="task-status-menu__item-desc">{action.description}</span>
+                  </button>
+                {/each}
+              </div>
+            {/if}
+          </div>
           {#if focused.backend}
-            <span class="task-pill task-pill--muted">{focused.backend}</span>
+            <span class="task-pill task-pill--muted shrink-0">{focused.backend}</span>
           {/if}
-          {#if focused.continuationOf}
-            <span class="task-pill task-pill--muted">continuation</span>
-          {/if}
+          <button
+            type="button"
+            class="icon-btn shrink-0"
+            style="width: 22px; height: 22px;"
+            aria-label={detailsExpanded ? 'Collapse task details' : 'Expand task details'}
+            aria-expanded={detailsExpanded ? 'true' : 'false'}
+            use:tip={detailsExpanded ? 'Collapse details' : 'Expand details'}
+            onclick={() => (detailsExpanded = !detailsExpanded)}
+          >
+            <span
+              class="codicon"
+              class:codicon-chevron-up={detailsExpanded}
+              class:codicon-chevron-down={!detailsExpanded}
+              style="font-size: 14px;"
+            ></span>
+          </button>
         </div>
-        <div class="task-workspace-headline">{presentation.workspaceHeadline}</div>
-        <div class="task-workspace-detail">{presentation.workspaceDetail}</div>
+
+        {#if detailsExpanded}
+          <div class="task-workspace-details">
+            <div class="task-workspace-headline">{presentation.lifecycle.workspaceHeadline}</div>
+            <div class="task-workspace-detail">{presentation.lifecycle.workspaceDetail}</div>
+            {#if runtime && runtime !== 'idle' && focused.lifecycle === 'open' && presentation.runtime}
+              <div class="task-workspace-orchestration" use:tip={presentation.runtime.workspaceDetail}>
+                Orchestration: {presentation.runtime.label}
+              </div>
+            {/if}
+            {#if focused.hasOutcomeProposal && focused.lifecycle === 'open'}
+              <div
+                class="task-workspace-orchestration"
+                use:tip={'Agent proposed completion; send a message to continue on the same task/session.'}
+              >
+                Agent proposed done — task stays open; chat to continue (session resume).
+              </div>
+            {/if}
+            {#if focused.committedSessionId}
+              <div
+                class="task-workspace-orchestration"
+                style="opacity: 0.55;"
+                use:tip={'CLI conversation session bound to this task'}
+              >
+                Session {focused.committedSessionId.slice(0, 12)}…
+              </div>
+            {/if}
+            {#if focused.continuationOf}
+              <div class="task-workspace-orchestration" style="opacity: 0.55;">
+                Continuation of prior task
+              </div>
+            {/if}
+          </div>
+        {/if}
       </div>
-      {#if focused.viewStatus === 'running' && activeTurnId}
-        <div class="task-live-chip">Active turn</div>
-      {:else if focused.viewStatus === 'queued' && activeTurnId}
-        <div class="task-live-chip">Queued turn</div>
-      {:else if focused.viewStatus === 'waiting_user'}
-        <div class="task-live-chip">Waiting for answer</div>
-      {/if}
     </div>
 
     <ChatThread />
@@ -128,7 +284,7 @@
       />
     {/if}
 
-    {#if focused.viewStatus === 'waiting_user' && !pendingAsk}
+    {#if runtime === 'waiting_user' && !pendingAsk}
       <div class="task-action-panel task-action-panel--attention">
         <span>{presentation.composerGuidance}</span>
         {#if !activeTurnId}
@@ -139,8 +295,11 @@
 
     {#if showRecovery}
       <div class="task-action-panel task-action-panel--danger">
-        <div class="font-semibold">Recovery needed</div>
+        <div class="font-semibold">Turn recovery needed</div>
         <p>{presentation.composerGuidance}</p>
+        <p class="task-muted">
+          Task lifecycle remains <strong>Open</strong> — a failed CLI turn is not a sealed task failure.
+        </p>
         {#if !hasRetryableTurn}
           <p class="task-muted">No retryable turn is available for this task.</p>
         {/if}
@@ -180,9 +339,15 @@
         <span>A queued task turn is ready to start.</span>
         <vscode-button onclick={resumeQueued}>Resume queued task</vscode-button>
       </div>
-    {:else if focused.viewStatus === 'queued'}
+    {:else if runtime === 'queued'}
       <div class="task-action-panel task-action-panel--info">
         <span>This task is queued, but no resumable turn id is available yet.</span>
+      </div>
+    {/if}
+
+    {#if showSoftFailHint}
+      <div class="task-action-panel task-action-panel--danger">
+        <span>{presentation.composerGuidance}</span>
       </div>
     {/if}
 
@@ -198,7 +363,7 @@
       taskId={focused.id}
       turnId={activeTurnId}
       readOnly={composerReadOnly}
-      taskStatus={focused.viewStatus}
+      task={focused}
       {pendingAsk}
     />
   {:else}

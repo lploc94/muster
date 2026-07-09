@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { deriveViewStatus } from './derived-status';
+import {
+  deriveRuntimeActivity,
+  deriveViewStatus,
+  isHardTerminalLifecycle,
+  isSoftTerminalLifecycle,
+} from './derived-status';
 import type { MusterTask, TaskLifecycleState, TaskTurn } from './types';
 
 const NOW = '2026-07-06T00:00:00.000Z';
@@ -37,6 +42,30 @@ function turn(overrides: Partial<TaskTurn> & Pick<TaskTurn, 'id' | 'status'>): T
     ...overrides,
   };
 }
+
+describe('lifecycle terminal helpers', () => {
+  it('classifies hard vs soft terminal', () => {
+    expect(isHardTerminalLifecycle('succeeded')).toBe(true);
+    expect(isHardTerminalLifecycle('cancelled')).toBe(true);
+    expect(isHardTerminalLifecycle('skipped')).toBe(true);
+    expect(isHardTerminalLifecycle('failed')).toBe(false);
+    expect(isSoftTerminalLifecycle('failed')).toBe(true);
+    expect(isSoftTerminalLifecycle('open')).toBe(false);
+  });
+});
+
+describe('deriveRuntimeActivity', () => {
+  it('returns null for terminal lifecycle even with live turns', () => {
+    const task = baseTask({ lifecycle: 'succeeded' });
+    const turns = [turn({ id: 't1', status: 'running', sequence: 1 })];
+    expect(deriveRuntimeActivity(task, turns, new Map())).toBeNull();
+  });
+
+  it('maps open + running turn to running', () => {
+    const turns = [turn({ id: 't1', status: 'running', sequence: 1 })];
+    expect(deriveRuntimeActivity(baseTask(), turns, new Map())).toBe('running');
+  });
+});
 
 describe('deriveViewStatus', () => {
   it('maps terminal lifecycle directly', () => {

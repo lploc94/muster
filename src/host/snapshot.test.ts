@@ -149,15 +149,16 @@ describe('host task snapshot projection', () => {
       id: 'root-active',
       role: 'coordinator',
       lifecycle: 'open',
+      runtimeActivity: 'running',
       viewStatus: 'running',
       updatedAt: '2026-07-06T00:14:00.000Z',
     });
     expect(snapshot.focusedTaskId).toBe('root-active');
-    expect(snapshot.subtree?.map((summary) => [summary.id, summary.viewStatus])).toEqual([
-      ['child-a', 'waiting_dependencies'],
-      ['child-b', 'idle'],
-      ['grandchild', 'idle'],
-      ['root-active', 'running'],
+    expect(snapshot.subtree?.map((summary) => [summary.id, summary.lifecycle, summary.runtimeActivity, summary.viewStatus])).toEqual([
+      ['child-a', 'open', 'waiting_dependencies', 'waiting_dependencies'],
+      ['child-b', 'open', 'idle', 'idle'],
+      ['grandchild', 'open', 'idle', 'idle'],
+      ['root-active', 'open', 'running', 'running'],
     ]);
     expect(snapshot.transcript).toEqual([
       {

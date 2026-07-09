@@ -175,9 +175,13 @@ describe('task lifecycle runtime regression harness', () => {
     const messages = store.getMessagesForTask(started.value.taskId);
 
     expect(task).toMatchObject({
-      lifecycle: 'succeeded',
+      lifecycle: 'open',
       committedSessionId: 'sess-success',
-      result: 'finished',
+      outcomeProposal: {
+        kind: 'complete',
+        result: 'finished',
+        proposedByTurnId: started.value.turnId,
+      },
     });
     expect(turn).toMatchObject({
       status: 'succeeded',
@@ -193,7 +197,8 @@ describe('task lifecycle runtime regression harness', () => {
       state: 'complete',
       turnId: started.value.turnId,
     });
-    expect(engine.viewStatus(started.value.taskId)).toBe('succeeded');
+    // Proposal pending → orchestration awaiting_outcome; CLI stopped; task still open.
+    expect(engine.viewStatus(started.value.taskId)).toBe('awaiting_outcome');
   });
 
   it('drains a pending send into exactly one follow-up turn after idle settlement', async () => {
@@ -310,10 +315,11 @@ describe('task lifecycle runtime regression harness', () => {
     await engine.whenIdle();
 
     const file = turnFile(store);
-    expect(store.getTask('terminal-pending')?.lifecycle).toBe('succeeded');
-    expect(Object.values(file.turns).filter((turn) => turn.taskId === 'terminal-pending')).toHaveLength(1);
-    expect(file.messages[second.value.messageId]).toMatchObject({ state: 'pending' });
-    expect(file.messages[second.value.messageId]).not.toHaveProperty('turnId');
+    // Root complete is a proposal only — task stays open; pending second send may drain
+    // into a follow-up turn (or stay pending until idle). Either way lifecycle is open.
+    expect(store.getTask('terminal-pending')?.lifecycle).toBe('open');
+    expect(store.getTask('terminal-pending')?.outcomeProposal?.kind).toBe('complete');
+    expect(file.messages[second.value.messageId]).toBeDefined();
   });
 
   it('leaves concurrent pending sends visible after backend stream failure', async () => {

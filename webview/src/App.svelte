@@ -6,14 +6,18 @@
   import PermissionCard from './components/PermissionCard.svelte';
   import { tasks } from './lib/tasks.svelte';
   import { threadStore } from './lib/thread.svelte';
-  import { isExtMessage, isProtocolCompatible, post, statusLabel } from './lib/protocol';
+  import {
+    effectiveRuntimeActivity,
+    isExtMessage,
+    isProtocolCompatible,
+    post,
+  } from './lib/protocol';
   import type {
     PendingAsk,
     PendingPermission,
     RetentionSettingId,
     RetentionSettingSnapshot,
     SettingsUpdateResult,
-    TaskViewStatus,
   } from './lib/protocol';
   import { tip } from './lib/tooltip';
 
@@ -51,37 +55,6 @@
     post({ type: 'focusTask', taskId });
     post({ type: 'hydrateSubtree', taskId });
     historyOpen = false;
-  }
-
-  function shortGoal(goal: string): string {
-    const trimmed = goal.trim();
-    if (trimmed.length <= 48) return trimmed || '(no goal)';
-    return `${trimmed.slice(0, 45)}…`;
-  }
-
-  function statusIcon(status: TaskViewStatus): string {
-    switch (status) {
-      case 'running':
-      case 'waiting_user':
-        return 'codicon-loading';
-      case 'succeeded':
-        return 'codicon-check';
-      case 'failed':
-        return 'codicon-error';
-      case 'cancelled':
-      case 'skipped':
-        return 'codicon-circle-slash';
-      case 'queued':
-      case 'waiting_dependencies':
-        return 'codicon-clock';
-      case 'blocked':
-      case 'needs_recovery':
-        return 'codicon-warning';
-      case 'waiting_children':
-        return 'codicon-ellipsis';
-      default:
-        return 'codicon-circle-outline';
-    }
   }
 
   function clearHistory() {
@@ -199,6 +172,10 @@
               msg.transcript,
               msg.activeTurnId,
               focused?.viewStatus,
+              {
+                lifecycle: focused?.lifecycle,
+                runtimeActivity: focused ? effectiveRuntimeActivity(focused) : null,
+              },
             );
           } else if (tasks.draftMode) {
             threadStore.clearFocus();
@@ -208,8 +185,14 @@
 
         case 'taskUpdated': {
           tasks.applyTaskUpdated(msg.taskId, msg.storeRevision, msg.patch);
-          if (msg.taskId === tasks.focusedTaskId && msg.patch.viewStatus) {
-            threadStore.updateReadOnly(msg.patch.viewStatus);
+          if (msg.taskId === tasks.focusedTaskId) {
+            const focused = tasks.tasks.get(msg.taskId);
+            if (focused) {
+              threadStore.updateReadOnly(focused.lifecycle);
+              threadStore.updateRuntimeFlags(effectiveRuntimeActivity(focused));
+            } else if (msg.patch.lifecycle) {
+              threadStore.updateReadOnly(msg.patch.lifecycle);
+            }
           }
           break;
         }
@@ -402,81 +385,57 @@
   </div>
 {:else}
   <div class="flex-1 min-h-0 flex flex-col relative">
-    <!-- Chat header: two rows -->
+    <!-- Toolbar only: Back | History + New task + Settings (task title lives in status card) -->
     <div
-      class="shrink-0 border-b"
+      class="shrink-0 border-b flex items-center gap-2 px-3 py-1 text-xs"
       style="border-color: var(--vscode-panel-border); background: var(--vscode-sideBar-background, transparent);"
     >
-      <!-- Row 1: Back | History + New task + Settings -->
-      <div class="flex items-center gap-2 px-3 py-1 text-xs relative">
-        <button
-          type="button"
-          class="icon-btn"
-          style="width: 22px; height: 22px;"
-          onclick={backToList}
-          aria-label="Back to tasks list"
-          use:tip={'Back to tasks list'}
-        >
-          <span class="codicon codicon-arrow-left"></span>
-        </button>
+      <button
+        type="button"
+        class="icon-btn"
+        style="width: 22px; height: 22px;"
+        onclick={backToList}
+        aria-label="Back to tasks list"
+        use:tip={'Back to tasks list'}
+      >
+        <span class="codicon codicon-arrow-left"></span>
+      </button>
 
-        <div class="flex-1"></div>
+      <div class="flex-1"></div>
 
-        <button
-          type="button"
-          class="icon-btn"
-          style="width: 22px; height: 22px;"
-          onclick={() => (historyOpen = !historyOpen)}
-          aria-label="History (previous coordinator tasks)"
-          use:tip={'History (previous coordinator tasks)'}
-        >
-          <span class="codicon codicon-history"></span>
-        </button>
+      <button
+        type="button"
+        class="icon-btn"
+        style="width: 22px; height: 22px;"
+        onclick={() => (historyOpen = !historyOpen)}
+        aria-label="History (previous coordinator tasks)"
+        use:tip={'History (previous coordinator tasks)'}
+      >
+        <span class="codicon codicon-history"></span>
+      </button>
 
-        <button
-          type="button"
-          class="icon-btn"
-          style="width: 22px; height: 22px;"
-          onclick={() => { tasks.openNewTaskDraft(); post({ type: 'newTask' }); historyOpen = false; }}
-          aria-label="New task"
-          use:tip={'New task'}
-        >
-          <span class="codicon codicon-add"></span>
-        </button>
+      <button
+        type="button"
+        class="icon-btn"
+        style="width: 22px; height: 22px;"
+        onclick={() => { tasks.openNewTaskDraft(); post({ type: 'newTask' }); historyOpen = false; }}
+        aria-label="New task"
+        use:tip={'New task'}
+      >
+        <span class="codicon codicon-add"></span>
+      </button>
 
-        <button
-          type="button"
-          class="icon-btn"
-          style="width: 22px; height: 22px;"
-          onclick={openSettings}
-          aria-label="Settings"
-          aria-pressed={settingsOpen}
-          use:tip={'Settings'}
-        >
-          <span class="codicon codicon-settings-gear"></span>
-        </button>
-      </div>
-
-      <!-- Row 2: task name + status (below, left-aligned) -->
-      {#if tasks.focusedTask}
-        <div class="flex items-center gap-2 px-3 py-1.5 text-sm" style="border-top: 1px solid var(--vscode-panel-border);">
-          <span class="font-semibold truncate" use:tip={tasks.focusedTask.goal}>
-            {shortGoal(tasks.focusedTask.goal)}
-          </span>
-          <span 
-            class="codicon {statusIcon(tasks.focusedTask.viewStatus)}" 
-            style="font-size: 14px; vertical-align: middle; margin-left: 4px;"
-            use:tip={statusLabel(tasks.focusedTask.viewStatus)}
-          ></span>
-        </div>
-      {:else if tasks.draftMode}
-        <div class="flex flex-col px-3 py-1.5" style="border-top: 1px solid var(--vscode-panel-border);">
-          <span class="text-sm font-semibold leading-tight">
-            {tasks.continuationOf ? 'Continue as new task' : 'New task'}
-          </span>
-          <span class="text-xs leading-tight" style="opacity: 0.6; margin-top: 2px;">First message creates the coordinator task.</span>
-        </div>
-      {/if}
+      <button
+        type="button"
+        class="icon-btn"
+        style="width: 22px; height: 22px;"
+        onclick={openSettings}
+        aria-label="Settings"
+        aria-pressed={settingsOpen}
+        use:tip={'Settings'}
+      >
+        <span class="codicon codicon-settings-gear"></span>
+      </button>
     </div>
 
     <TaskWorkspace {pendingAsk} {activeTurnId} />

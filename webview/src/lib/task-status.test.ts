@@ -1,15 +1,32 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { TaskViewStatus } from './protocol';
+
+vi.mock('./vscode', () => ({
+  vscode: {
+    postMessage: vi.fn(),
+    getState: vi.fn(),
+    setState: vi.fn(),
+  },
+}));
+
+import type { TaskRuntimeActivity } from './protocol';
 import {
-  TASK_STATUS_PRESENTATIONS,
+  LIFECYCLE_PRESENTATIONS,
+  RUNTIME_PRESENTATIONS,
+  TASK_LIFECYCLE_STATES,
+  TASK_RUNTIME_ACTIVITIES,
   TASK_VIEW_STATUSES,
+  getLifecyclePresentation,
+  getTaskPresentation,
   getTaskStatusPresentation,
+  isHardTerminal,
+  isSoftTerminal,
   isTaskStatusTerminal,
+  runtimeBlocksComposer,
   taskStatusLabel,
   type TaskStatusTone,
 } from './task-status';
 
-const EXPECTED_STATUSES = [
+const EXPECTED_RUNTIME = [
   'waiting_dependencies',
   'queued',
   'running',
@@ -18,11 +35,18 @@ const EXPECTED_STATUSES = [
   'blocked',
   'needs_recovery',
   'idle',
-  'succeeded',
-  'failed',
-  'cancelled',
-  'skipped',
-] as const satisfies readonly TaskViewStatus[];
+  'awaiting_outcome',
+] as const satisfies readonly TaskRuntimeActivity[];
+
+const EXPECTED_TONES = new Set<TaskStatusTone>([
+  'neutral',
+  'info',
+  'attention',
+  'success',
+  'warning',
+  'danger',
+  'muted',
+]);
 
 const NON_EMPTY_FIELDS = [
   'label',
@@ -32,28 +56,69 @@ const NON_EMPTY_FIELDS = [
   'composerGuidance',
 ] as const;
 
-const EXPECTED_TERMINAL_STATUSES = new Set<TaskViewStatus>(['succeeded', 'failed', 'cancelled', 'skipped']);
-const EXPECTED_TONES = new Set<TaskStatusTone>(['neutral', 'info', 'attention', 'success', 'warning', 'danger', 'muted']);
+describe('task status dual-axis presentation', () => {
+  it('covers every lifecycle and runtime activity with complete copy', () => {
+    expect(TASK_LIFECYCLE_STATES).toEqual(['open', 'succeeded', 'failed', 'cancelled', 'skipped']);
+    expect(TASK_RUNTIME_ACTIVITIES).toEqual(EXPECTED_RUNTIME);
 
-describe('task status presentation model', () => {
-  it('covers every task view status with complete user-facing copy', () => {
-    expect(TASK_VIEW_STATUSES).toEqual(EXPECTED_STATUSES);
-    expect(Object.keys(TASK_STATUS_PRESENTATIONS).sort()).toEqual([...EXPECTED_STATUSES].sort());
-
-    for (const status of EXPECTED_STATUSES) {
-      const presentation = TASK_STATUS_PRESENTATIONS[status];
-
-      expect(presentation.status).toBe(status);
+    for (const lifecycle of TASK_LIFECYCLE_STATES) {
+      const presentation = LIFECYCLE_PRESENTATIONS[lifecycle];
+      expect(presentation.key).toBe(lifecycle);
       expect(EXPECTED_TONES.has(presentation.tone)).toBe(true);
       for (const field of NON_EMPTY_FIELDS) {
-        expect(presentation[field].trim(), `${status}.${field}`).not.toBe('');
+        expect(presentation[field].trim(), `${lifecycle}.${field}`).not.toBe('');
       }
+    }
+
+    for (const activity of EXPECTED_RUNTIME) {
+      const presentation = RUNTIME_PRESENTATIONS[activity];
+      expect(presentation.key).toBe(activity);
+      expect(EXPECTED_TONES.has(presentation.tone)).toBe(true);
+      for (const field of NON_EMPTY_FIELDS) {
+        expect(presentation[field].trim(), `${activity}.${field}`).not.toBe('');
+      }
+    }
+  });
+
+  it('shows lifecycle Open with runtime activity when task is open', () => {
+    const presentation = getTaskPresentation({
+      lifecycle: 'open',
+      runtimeActivity: 'running',
+      viewStatus: 'running',
+    });
+
+    expect(presentation.lifecycle.label).toBe('Open');
+    expect(presentation.runtime?.label).toBe('Running');
+    expect(presentation.label).toBe('Running');
+    expect(presentation.listCopy).toContain('Open');
+    expect(presentation.workspaceDetail).toContain('CLI process');
+  });
+
+  it('uses failed lifecycle (soft) without treating it as hard terminal', () => {
+    const presentation = getTaskPresentation({
+      lifecycle: 'failed',
+      runtimeActivity: null,
+      viewStatus: 'failed',
+    });
+
+    expect(presentation.label).toBe('Failed');
+    expect(presentation.composerGuidance).toMatch(/reopen/i);
+    expect(isSoftTerminal('failed')).toBe(true);
+    expect(isHardTerminal('failed')).toBe(false);
+    expect(isTaskStatusTerminal('failed')).toBe(false);
+  });
+
+  it('marks succeeded/cancelled/skipped as hard terminal', () => {
+    for (const lifecycle of ['succeeded', 'cancelled', 'skipped'] as const) {
+      expect(isHardTerminal(lifecycle)).toBe(true);
+      expect(isTaskStatusTerminal(lifecycle)).toBe(true);
+      expect(getLifecyclePresentation(lifecycle).composerGuidance).toMatch(/closed|new task/i);
     }
   });
 
   it('exposes labels through the presentation lookup', () => {
     expect(taskStatusLabel('waiting_dependencies')).toBe('Waiting on dependencies');
-    expect(getTaskStatusPresentation('needs_recovery').workspaceHeadline).toContain('Recovery');
+    expect(getTaskStatusPresentation('needs_recovery').workspaceHeadline).toMatch(/recovery/i);
   });
 
   it('falls back safely for malformed host values', () => {
@@ -74,24 +139,29 @@ describe('task status presentation model', () => {
       expect(presentation.label).toBe('Unknown status');
       expect(presentation.tone).toBe('muted');
       expect(presentation.workspaceDetail).toContain('missing');
-      expect(presentation.composerGuidance).toContain('inspect host logs');
     }
   });
 
-  it('matches protocol terminal status semantics', async () => {
+  it('blocks composer only for busy runtime activities', () => {
+    expect(runtimeBlocksComposer('running')).toBe(true);
+    expect(runtimeBlocksComposer('idle')).toBe(false);
+    expect(runtimeBlocksComposer(null)).toBe(false);
+    expect(runtimeBlocksComposer('awaiting_outcome')).toBe(false);
+  });
+
+  it('matches protocol hard-terminal helpers', async () => {
     vi.stubGlobal('acquireVsCodeApi', () => ({
       postMessage: vi.fn(),
       getState: vi.fn(),
       setState: vi.fn(),
     }));
 
-    const { isTerminalStatus } = await import('./protocol');
+    const { isHardTerminalLifecycle, isSoftTerminalLifecycle } = await import('./protocol');
 
-    for (const status of EXPECTED_STATUSES) {
-      const expected = EXPECTED_TERMINAL_STATUSES.has(status);
-
-      expect(isTaskStatusTerminal(status), status).toBe(expected);
-      expect(isTaskStatusTerminal(status), status).toBe(isTerminalStatus(status));
+    for (const status of TASK_VIEW_STATUSES) {
+      expect(isTaskStatusTerminal(status), status).toBe(isHardTerminalLifecycle(status));
     }
+    expect(isSoftTerminalLifecycle('failed')).toBe(true);
+    expect(isSoftTerminalLifecycle('succeeded')).toBe(false);
   });
 });

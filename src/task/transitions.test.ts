@@ -6,14 +6,18 @@ import {
   continueTask,
   createTask,
   interruptTurn,
+  isHardTerminalLifecycle,
   isSettledTurn,
+  isSoftTerminalLifecycle,
   isTerminalLifecycle,
   isTerminalTurn,
   hasActiveOrQueuedTurn,
   registerAsk,
+  reopenSoftFailedTask,
   resolveChildWait,
   retryCountOf,
   retryTurn,
+  setTaskLifecycle,
   startProcess,
   startTask,
   stageDisposition,
@@ -266,16 +270,21 @@ describe('applySuccessfulTurn', () => {
     ).toEqual({ ok: false, reason: 'applySuccessfulTurn requires a running turn' });
   });
 
-  it('applies complete disposition', () => {
+  it('root complete disposition stages proposal without sealing lifecycle', () => {
     const staged = {
       ...running,
       disposition: { kind: 'complete' as const, result: 'done' },
     };
-    const result = applySuccessfulTurn(baseTask(), staged, { now: NOW });
+    const result = applySuccessfulTurn(baseTask({ parentId: null }), staged, { now: NOW });
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.next.task.lifecycle).toBe('succeeded');
-      expect(result.next.task.result).toBe('done');
+      expect(result.next.task.lifecycle).toBe('open');
+      expect(result.next.task.outcomeProposal).toEqual({
+        kind: 'complete',
+        result: 'done',
+        proposedByTurnId: 't1',
+        proposedAt: NOW,
+      });
       expect(result.next.turn.status).toBe('succeeded');
       expect(result.next.turn.finishedAt).toBe(NOW);
       expect(result.effects).toEqual([
@@ -285,16 +294,34 @@ describe('applySuccessfulTurn', () => {
     }
   });
 
-  it('applies fail disposition', () => {
+  it('non-root complete disposition seals child for orchestration', () => {
+    const staged = {
+      ...running,
+      taskId: 'child-1',
+      disposition: { kind: 'complete' as const, result: 'done' },
+    };
+    const result = applySuccessfulTurn(
+      baseTask({ id: 'child-1', parentId: 'root-1' }),
+      staged,
+      { now: NOW },
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.next.task.lifecycle).toBe('succeeded');
+      expect(result.next.task.result).toBe('done');
+    }
+  });
+
+  it('root fail disposition stages proposal without sealing lifecycle', () => {
     const staged = {
       ...running,
       disposition: { kind: 'fail' as const, error: 'boom' },
     };
-    const result = applySuccessfulTurn(baseTask(), staged, { now: NOW });
+    const result = applySuccessfulTurn(baseTask({ parentId: null }), staged, { now: NOW });
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.next.task.lifecycle).toBe('failed');
-      expect(result.next.task.error).toBe('boom');
+      expect(result.next.task.lifecycle).toBe('open');
+      expect(result.next.task.outcomeProposal).toMatchObject({ kind: 'fail', error: 'boom' });
     }
   });
 
@@ -392,7 +419,7 @@ describe('applyFailedTurn', () => {
     }
   });
 
-  it('fail marks task failed when retries exhausted', () => {
+  it('never seals lifecycle failed when retries exhausted (user/coordinator only)', () => {
     const result = applyFailedTurn(baseTask(), running, {
       error: 'adapter error',
       retryCount: 2,
@@ -402,9 +429,41 @@ describe('applyFailedTurn', () => {
     });
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.next.task.lifecycle).toBe('failed');
-      expect(result.next.task.error).toBe('adapter error');
+      expect(result.next.task.lifecycle).toBe('open');
+      expect(result.effects).toEqual([]);
     }
+  });
+
+  it('setTaskLifecycle seals succeeded for user', () => {
+    const result = setTaskLifecycle(baseTask(), 'succeeded', { now: NOW, result: 'shipped' });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.next.lifecycle).toBe('succeeded');
+      expect(result.next.result).toBe('shipped');
+    }
+  });
+
+  it('setTaskLifecycle reopens only soft-failed tasks', () => {
+    const fromFailed = setTaskLifecycle(
+      baseTask({ lifecycle: 'failed', finishedAt: NOW, error: 'x' }),
+      'open',
+      { now: NOW },
+    );
+    expect(fromFailed.ok).toBe(true);
+    if (fromFailed.ok) {
+      expect(fromFailed.next.lifecycle).toBe('open');
+      expect(fromFailed.next.finishedAt).toBeUndefined();
+    }
+
+    expect(
+      setTaskLifecycle(baseTask({ lifecycle: 'succeeded', finishedAt: NOW }), 'open', { now: NOW }),
+    ).toEqual({ ok: false, reason: 'only soft-failed tasks may reopen to open' });
+    expect(
+      setTaskLifecycle(baseTask({ lifecycle: 'cancelled', finishedAt: NOW }), 'open', { now: NOW }),
+    ).toEqual({ ok: false, reason: 'only soft-failed tasks may reopen to open' });
+    expect(
+      setTaskLifecycle(baseTask({ lifecycle: 'skipped', finishedAt: NOW }), 'open', { now: NOW }),
+    ).toEqual({ ok: false, reason: 'only soft-failed tasks may reopen to open' });
   });
 });
 
@@ -479,6 +538,32 @@ describe('retryTurn', () => {
     ).toEqual({
       ok: false,
       reason: 'retryTurn requires a failed or interrupted turn',
+    });
+  });
+});
+
+describe('soft fail reopen', () => {
+  it('reopens failed tasks to open', () => {
+    const task = baseTask({ lifecycle: 'failed', finishedAt: NOW, error: 'nope' });
+    expect(isSoftTerminalLifecycle(task.lifecycle)).toBe(true);
+    expect(isHardTerminalLifecycle(task.lifecycle)).toBe(false);
+    const result = reopenSoftFailedTask(task, { now: '2026-07-06T01:00:00.000Z' });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.next.lifecycle).toBe('open');
+      expect(result.next.finishedAt).toBeUndefined();
+      expect(result.next.error).toBe('nope');
+    }
+  });
+
+  it('rejects reopen of hard terminal or open tasks', () => {
+    expect(reopenSoftFailedTask(baseTask({ lifecycle: 'succeeded' }), { now: NOW })).toEqual({
+      ok: false,
+      reason: 'task is not soft-failed',
+    });
+    expect(reopenSoftFailedTask(baseTask({ lifecycle: 'open' }), { now: NOW })).toEqual({
+      ok: false,
+      reason: 'task is not soft-failed',
     });
   });
 });

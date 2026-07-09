@@ -32,6 +32,12 @@ const TERMINAL_LIFECYCLES: ReadonlySet<TaskLifecycleState> = new Set([
   'skipped',
 ]);
 
+const HARD_TERMINAL_LIFECYCLES: ReadonlySet<TaskLifecycleState> = new Set([
+  'succeeded',
+  'cancelled',
+  'skipped',
+]);
+
 const TERMINAL_TURN_STATUSES: ReadonlySet<TurnStatus> = new Set([
   'succeeded',
   'failed',
@@ -50,6 +56,36 @@ const LIVE_TURN_STATUSES: ReadonlySet<TurnStatus> = new Set(['running', 'waiting
 
 export function isTerminalLifecycle(state: TaskLifecycleState): boolean {
   return TERMINAL_LIFECYCLES.has(state);
+}
+
+/** Hard terminal: read-only; further work is a new/continuation task. */
+export function isHardTerminalLifecycle(state: TaskLifecycleState): boolean {
+  return HARD_TERMINAL_LIFECYCLES.has(state);
+}
+
+/** Soft terminal (`failed`): same task may reopen on a new user message. */
+export function isSoftTerminalLifecycle(state: TaskLifecycleState): boolean {
+  return state === 'failed';
+}
+
+/**
+ * Reopen a soft-failed task to `open` so the user can continue on the same id.
+ */
+export function reopenSoftFailedTask(
+  task: MusterTask,
+  options: { now: string },
+): TransitionResult<MusterTask> {
+  if (task.lifecycle !== 'failed') {
+    return { ok: false, reason: 'task is not soft-failed' };
+  }
+  return {
+    ok: true,
+    next: bumpTask(task, options.now, {
+      lifecycle: 'open',
+      finishedAt: undefined,
+    }),
+    effects: [{ kind: 'emitUpdate' }],
+  };
 }
 
 export function isTerminalTurn(status: TurnStatus): boolean {
@@ -301,6 +337,25 @@ export function applySuccessfulTurn(
 
   switch (disposition.kind) {
     case 'complete':
+      // Root tasks: human-gated — propose only; lifecycle stays open (TASK-MANAGEMENT §5.3).
+      // Non-root: seal for orchestration / wait barriers.
+      if (task.parentId === null) {
+        return {
+          ok: true,
+          next: {
+            task: bumpTask(task, options.now, {
+              outcomeProposal: {
+                kind: 'complete',
+                result: disposition.result,
+                proposedByTurnId: turn.id,
+                proposedAt: options.now,
+              },
+            }),
+            turn: succeededTurn,
+          },
+          effects,
+        };
+      }
       return {
         ok: true,
         next: {
@@ -308,12 +363,30 @@ export function applySuccessfulTurn(
             lifecycle: 'succeeded',
             result: disposition.result,
             finishedAt: options.now,
+            outcomeProposal: undefined,
           }),
           turn: succeededTurn,
         },
         effects,
       };
     case 'fail':
+      if (task.parentId === null) {
+        return {
+          ok: true,
+          next: {
+            task: bumpTask(task, options.now, {
+              outcomeProposal: {
+                kind: 'fail',
+                error: disposition.error,
+                proposedByTurnId: turn.id,
+                proposedAt: options.now,
+              },
+            }),
+            turn: succeededTurn,
+          },
+          effects,
+        };
+      }
       return {
         ok: true,
         next: {
@@ -321,6 +394,7 @@ export function applySuccessfulTurn(
             lifecycle: 'failed',
             error: disposition.error,
             finishedAt: options.now,
+            outcomeProposal: undefined,
           }),
           turn: succeededTurn,
         },
@@ -336,6 +410,7 @@ export function applySuccessfulTurn(
               taskIds: [...disposition.taskIds],
               registeredByTurnId: turn.id,
             },
+            outcomeProposal: undefined,
           }),
           turn: succeededTurn,
         },
@@ -386,26 +461,104 @@ export function applyFailedTurn(
     };
   }
 
-  if (options.onExhausted === 'recover') {
+  // Lifecycle is never sealed by CLI/turn failure — only user or authorized coordinator.
+  // Exhausted retries leave the task open for recovery / user decision.
+  void options.onExhausted;
+  return {
+    ok: true,
+    next: { task: bumpTask(task, options.now, {}), turn: failedTurn },
+    effects: [],
+  };
+}
+
+/**
+ * User (or authorized coordinator host path) sets task lifecycle explicitly.
+ * Not driven by CLI process status.
+ */
+export function setTaskLifecycle(
+  task: MusterTask,
+  lifecycle: TaskLifecycleState,
+  options: {
+    now: string;
+    result?: string;
+    error?: string;
+    /** Who applied the change (audit; optional). */
+    sealedBy?: 'user' | 'coordinator';
+  },
+): TransitionResult<MusterTask> {
+  if (task.lifecycle === lifecycle) {
     return {
       ok: true,
-      next: { task: bumpTask(task, options.now, {}), turn: failedTurn },
-      effects: [],
+      next: bumpTask(task, options.now, {
+        outcomeProposal: undefined,
+        ...(lifecycle === 'succeeded' && options.result !== undefined
+          ? { result: options.result }
+          : {}),
+        ...(lifecycle === 'failed' && options.error !== undefined ? { error: options.error } : {}),
+      }),
+      effects: [{ kind: 'emitUpdate' }],
     };
   }
 
-  return {
-    ok: true,
-    next: {
-      task: bumpTask(task, options.now, {
-        lifecycle: 'failed',
-        error: options.error,
-        finishedAt: options.now,
+  if (lifecycle === 'open') {
+    // Soft-fail reopen only. Hard terminals require a new/continuation task.
+    if (task.lifecycle !== 'failed') {
+      return { ok: false, reason: 'only soft-failed tasks may reopen to open' };
+    }
+    return {
+      ok: true,
+      next: bumpTask(task, options.now, {
+        lifecycle: 'open',
+        finishedAt: undefined,
+        outcomeProposal: undefined,
       }),
-      turn: failedTurn,
-    },
-    effects: [],
-  };
+      effects: [{ kind: 'emitUpdate' }],
+    };
+  }
+
+  if (lifecycle === 'succeeded') {
+    const fromProposal =
+      task.outcomeProposal?.kind === 'complete' ? task.outcomeProposal.result : undefined;
+    return {
+      ok: true,
+      next: bumpTask(task, options.now, {
+        lifecycle: 'succeeded',
+        result: options.result ?? fromProposal ?? task.result,
+        finishedAt: options.now,
+        outcomeProposal: undefined,
+      }),
+      effects: [{ kind: 'emitUpdate' }],
+    };
+  }
+
+  if (lifecycle === 'failed') {
+    const fromProposal =
+      task.outcomeProposal?.kind === 'fail' ? task.outcomeProposal.error : undefined;
+    return {
+      ok: true,
+      next: bumpTask(task, options.now, {
+        lifecycle: 'failed',
+        error: options.error ?? fromProposal ?? task.error,
+        finishedAt: options.now,
+        outcomeProposal: undefined,
+      }),
+      effects: [{ kind: 'emitUpdate' }],
+    };
+  }
+
+  if (lifecycle === 'cancelled' || lifecycle === 'skipped') {
+    return {
+      ok: true,
+      next: bumpTask(task, options.now, {
+        lifecycle,
+        finishedAt: options.now,
+        outcomeProposal: undefined,
+      }),
+      effects: [{ kind: 'emitUpdate' }],
+    };
+  }
+
+  return { ok: false, reason: 'unsupported lifecycle' };
 }
 
 export function interruptTurn(

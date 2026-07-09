@@ -26,7 +26,11 @@ export function isProtocolCompatible(theirVersion: unknown): boolean {
 
 export type TurnTrigger = 'user' | 'engine' | 'retry';
 
-export type TaskViewStatus =
+/** Persisted work outcome — primary task badge. */
+export type TaskLifecycleState = 'open' | 'succeeded' | 'failed' | 'cancelled' | 'skipped';
+
+/** Derived CLI/deps/wait activity while open — secondary chrome. */
+export type TaskRuntimeActivity =
   | 'waiting_dependencies'
   | 'queued'
   | 'running'
@@ -35,18 +39,27 @@ export type TaskViewStatus =
   | 'blocked'
   | 'needs_recovery'
   | 'idle'
-  | 'succeeded'
-  | 'failed'
-  | 'cancelled'
-  | 'skipped';
+  | 'awaiting_outcome';
+
+/**
+ * Compact single-axis status (host still sends for compatibility).
+ * Prefer lifecycle + runtimeActivity for UI.
+ */
+export type TaskViewStatus = TaskLifecycleState | TaskRuntimeActivity;
 
 export interface TaskSummary {
   id: string;
   parentId: string | null;
   goal: string;
   role: string;
-  lifecycle: string;
+  lifecycle: TaskLifecycleState | string;
+  /** Present when host supports dual-axis status; null when lifecycle is terminal. */
+  runtimeActivity?: TaskRuntimeActivity | null;
   viewStatus: TaskViewStatus;
+  /** Backend session bound to this task for resume across process restarts. */
+  committedSessionId?: string;
+  /** Agent proposed complete/fail while lifecycle remains open. */
+  hasOutcomeProposal?: boolean;
   updatedAt: string;
   backend: string;
   continuationOf?: string;
@@ -206,7 +219,15 @@ export type OutMessage =
   | { type: 'requestSettings' }
   | { type: 'updateSetting'; settingId: RetentionSettingId; value: number }
   | { type: 'listBackends' }
-  | { type: 'listModels' };
+  | { type: 'listModels' }
+  /** User sets task lifecycle (not CLI-driven). */
+  | {
+      type: 'setTaskLifecycle';
+      taskId: string;
+      lifecycle: 'open' | 'succeeded' | 'failed' | 'cancelled' | 'skipped';
+      result?: string;
+      error?: string;
+    };
 
 /** Post a typed message to the extension host. */
 export function post(message: OutMessage): void {
@@ -465,11 +486,54 @@ export function isExtMessage(data: unknown): data is ExtMessage {
   }
 }
 
-export function isTerminalStatus(status: TaskViewStatus): boolean {
+/** Any sealed lifecycle (including soft failed). Prefer hard/soft helpers for UX. */
+export function isTerminalStatus(status: TaskViewStatus | string): boolean {
   return status === 'succeeded' || status === 'failed' || status === 'cancelled' || status === 'skipped';
 }
 
-export function statusLabel(status: TaskViewStatus): string {
+/** Hard terminal: thread read-only; follow-up is a new task. */
+export function isHardTerminalLifecycle(lifecycle: string): boolean {
+  return lifecycle === 'succeeded' || lifecycle === 'cancelled' || lifecycle === 'skipped';
+}
+
+/** Soft terminal: same task may reopen on send. */
+export function isSoftTerminalLifecycle(lifecycle: string): boolean {
+  return lifecycle === 'failed';
+}
+
+export function isOpenLifecycle(lifecycle: string): boolean {
+  return lifecycle === 'open';
+}
+
+export function statusLabel(status: TaskViewStatus | string): string {
   const s = status.replace(/_/g, ' ');
   return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+/** Effective runtime activity from summary (host field or fall back from viewStatus). */
+export function effectiveRuntimeActivity(
+  task: Pick<TaskSummary, 'lifecycle' | 'runtimeActivity' | 'viewStatus'>,
+): TaskRuntimeActivity | null {
+  if (task.lifecycle !== 'open') {
+    return null;
+  }
+  if (task.runtimeActivity !== undefined) {
+    return task.runtimeActivity;
+  }
+  // Older hosts: viewStatus holds runtime when open.
+  const vs = task.viewStatus;
+  if (
+    vs === 'waiting_dependencies' ||
+    vs === 'queued' ||
+    vs === 'running' ||
+    vs === 'waiting_user' ||
+    vs === 'waiting_children' ||
+    vs === 'blocked' ||
+    vs === 'needs_recovery' ||
+    vs === 'idle' ||
+    vs === 'awaiting_outcome'
+  ) {
+    return vs;
+  }
+  return 'idle';
 }

@@ -440,10 +440,42 @@ The webview never holds the whole thread. Render a **recent window**; older item
 
 ### Session / tasks
 
-- **New task** opens an unpersisted composer; first `send` has no `taskId` → `startNewTask`.
-- **Continue as new task** on a terminal thread sends `send { text, continuationOf }` (no `taskId`).
+- **New task** opens an unpersisted composer; first `send` has no `taskId` → `startNewTask` (`lifecycle: open`).
+- **Three status axes** (see `TASK-MANAGEMENT.md` §4.3):
+  - **Task lifecycle** on list + **workspace status card header**: `open` /
+    `succeeded` / `failed` / `cancelled` / `skipped`.
+  - **CLI view** on the **composer strip**: `not_started` / `running` / `idle` /
+    `stopped`. Optional subtitle for `lastExit` (`ok` / `error` / `cancelled`)
+    when stopped. **Error is not a CLI phase.**
+  - **Orchestration** (deps, children, recovery, outcome proposal): action panels
+    or expand-details one-liners — not the task badge, not a second App header row.
+  Do **not** set task lifecycle from `turnDone` / CLI errors alone.
+- **Workspace header = task status card** (not a duplicate title/status bar):
+  name + lifecycle badge + **status menu** (`setTaskLifecycle`). **Expand task
+  details** (collapsed by default) for lifecycle copy, orchestration hint, bound
+  session id; keep collapsed chrome free of “Task is open / Session ses_…” noise.
+- **CLI mapping:** live generating → `running`; `waiting_user` / process alive
+  not generating → `idle`; never spawned / only queued → `not_started`; process
+  exited → `stopped`. After reload, derive prior process from `hadProcess` and/or
+  `committedSessionId` when host has not projected `cliViewStatus`.
+- **Who seals outcomes:** **user** always (status menu → `setTaskLifecycle`);
+  **coordinator** when the user enables outcome delegation (`coordinator_delegate`
+  / future `yolo`). See `TASK-MANAGEMENT.md` §4.1.1.
+- **Outcome proposal** (`awaiting_outcome`): prefer Accept / Reject when a
+  dedicated card ships (`acceptOutcome` / `rejectOutcome`). **Today:** composer
+  stays writable; `send` clears the proposal and continues on the same task/
+  session. Status menu can still seal `succeeded` / `failed` / cancel / skip.
+- **Delegate / yolo:** coordinator may mark success without Accept card; show a
+  short “sealed by coordinator” notice; user can still cancel/override.
+- **Soft failed:** composer stays available; next `send` **reopens** the same task
+  to `open` (not a new task id). Status menu **Reopen** → `setTaskLifecycle` `open`.
+- **Continue as new task** for **hard** terminal (`succeeded` / `cancelled` /
+  `skipped`): `send { text, continuationOf }` (no `taskId`). No reopen-on-same-id.
+- **Cancel / skip** via status menu (`setTaskLifecycle` → `cancelled` / `skipped`):
+  host cascades descendants (`cancelTask` / `skipTask`). Distinct from interrupt
+  turn. See `TASK-MANAGEMENT.md` §5.4–§5.6.
 - Legacy flat chat, `newSession`, and “Continue last” (`.muster-sessions.json`) were removed in Phase E.
-- **`needs_recovery`**: explicit **Retry** (required instruction) and **Continue** (required message) controls.
+- **`needs_recovery`**: explicit **Retry** (required instruction) and **Continue** (required message) controls; lifecycle stays `open`.
 - **Reload-preserved queued turn**: **Resume** → `resumeQueuedTurn`.
 
 ### Webview persistence (host-owned transcript + lazy scrollback)

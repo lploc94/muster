@@ -1,11 +1,12 @@
 import type { Question } from '../bridge/ask-bridge';
-import { deriveViewStatus } from '../task/derived-status';
+import { deriveRuntimeActivity, deriveViewStatus } from '../task/derived-status';
 import type { TaskStore } from '../task/store';
 import type {
   MusterTask,
   TaskLifecycleState,
   TaskMessageState,
   TaskRole,
+  TaskRuntimeActivity,
   TaskStoreFile,
   TaskTurn,
   TaskViewStatus,
@@ -16,8 +17,22 @@ export interface TaskSummary {
   parentId: string | null;
   goal: string;
   role: TaskRole;
+  /** User-facing work outcome (open / succeeded / failed / cancelled / skipped). */
   lifecycle: TaskLifecycleState;
+  /**
+   * CLI/deps/wait activity while lifecycle is open; null when terminal.
+   * Primary UI: lifecycle badge; secondary: this field.
+   */
+  runtimeActivity: TaskRuntimeActivity | null;
+  /**
+   * Compact single-axis status for older consumers: terminal lifecycle or
+   * runtime activity. Prefer lifecycle + runtimeActivity.
+   */
   viewStatus: TaskViewStatus;
+  /** Backend session id for resume (same task, next turn). */
+  committedSessionId?: string;
+  /** Agent proposed complete/fail; root stays open until user continues or accepts. */
+  hasOutcomeProposal?: boolean;
   updatedAt: string;
   backend: string;
   continuationOf?: string;
@@ -119,13 +134,18 @@ export function projectTaskSummary(file: TaskStoreFile, taskId: string): TaskSum
   if (!task) {
     return undefined;
   }
+  const turns = turnsForTask(file, taskId);
+  const deps = depLifecyclesForTask(file, task);
   return {
     id: task.id,
     parentId: task.parentId,
     goal: task.goal,
     role: task.role,
     lifecycle: task.lifecycle,
-    viewStatus: deriveViewStatus(task, turnsForTask(file, taskId), depLifecyclesForTask(file, task)),
+    runtimeActivity: deriveRuntimeActivity(task, turns, deps),
+    viewStatus: deriveViewStatus(task, turns, deps),
+    committedSessionId: task.committedSessionId,
+    hasOutcomeProposal: task.outcomeProposal != null,
     updatedAt: projectActivityTime(file, taskId),
     backend: task.backend,
     continuationOf: task.continuationOf,

@@ -954,6 +954,42 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             }
           }
           break;
+        case 'setTaskLifecycle': {
+          if (!taskEngine) {
+            this.postCommandError('task engine not ready');
+            break;
+          }
+          if (typeof data.taskId !== 'string') {
+            this.postCommandError('setTaskLifecycle requires taskId');
+            break;
+          }
+          const lifecycle = data.lifecycle;
+          if (
+            lifecycle !== 'open' &&
+            lifecycle !== 'succeeded' &&
+            lifecycle !== 'failed' &&
+            lifecycle !== 'cancelled' &&
+            lifecycle !== 'skipped'
+          ) {
+            this.postCommandError('setTaskLifecycle requires a valid lifecycle', data.taskId);
+            break;
+          }
+          // Cancel/skip cascade to descendants; other seals are single-task (user menu).
+          // setTaskLifecycle routes 'skipped' → skipTask and 'cancelled' is handled here.
+          const result =
+            lifecycle === 'cancelled'
+              ? taskEngine.cancelTask(data.taskId)
+              : taskEngine.setTaskLifecycle(data.taskId, lifecycle, {
+                  result: typeof data.result === 'string' ? data.result : undefined,
+                  error: typeof data.error === 'string' ? data.error : undefined,
+                });
+          if (!result.ok) {
+            this.postCommandError(result.reason, data.taskId);
+          } else {
+            this.postSnapshot(this.focusedTaskId ?? data.taskId);
+          }
+          break;
+        }
         case 'submitAsk':
           if (
             typeof data.taskId === 'string' &&
