@@ -18,6 +18,14 @@ import {
   type RetentionSettingSnapshot,
 } from './host/retention-settings';
 import { pickWorkspaceFileMentionPath } from './host/workspace-files';
+import { PresentationManager } from './host/presentation-manager';
+import {
+  createPresentationPanelFactory,
+  createPresentationPanelSerializer,
+  type PresentationHost,
+} from './host/presentation-panel-adapter';
+import { PresentationToolRouter } from './host/presentation-tool-router';
+import { createPresentationChatLink } from './host/presentation-chat-link';
 import { SESSION_MIGRATION_MARKER, migrateLegacySessions } from './task/migration-sessions';
 import { applyRetention, retentionChanged, type RetentionConfig } from './task/retention';
 import { TaskEngine, type EngineEvent } from './task/engine';
@@ -34,6 +42,7 @@ let taskEngine: TaskEngine | undefined;
 let taskStore: TaskStore | undefined;
 let storePath: string | undefined;
 let workspaceRoot: string | undefined;
+let presentationManager: PresentationManager | undefined;
 let lastObservedRevision = 0;
 let lastObservedFile: TaskStoreFile | undefined;
 const activePendingAsks = new Map<string, PendingAskOverlay>();
@@ -43,6 +52,20 @@ const WEBVIEW_BACKENDS = new Set(['claude', 'grok', 'kiro', 'codex', 'opencode']
 const MAX_MESSAGE_CHARS = 100_000;
 const MAX_FREE_TEXT_CHARS = 10_000;
 const MAX_LINK_CHARS = 4096;
+
+const presentationHost: PresentationHost = {
+  joinPath: (...parts) => vscode.Uri.joinPath(parts[0] as vscode.Uri, ...(parts.slice(1) as string[])),
+  createPanel: (viewType, title, showOptions, options) =>
+    vscode.window.createWebviewPanel(
+      viewType,
+      title,
+      showOptions as { viewColumn: vscode.ViewColumn; preserveFocus?: boolean },
+      options as vscode.WebviewPanelOptions & vscode.WebviewOptions,
+    ),
+  openExternal: (uri) => vscode.env.openExternal(uri as vscode.Uri),
+  parseUri: (value) => vscode.Uri.parse(value, true),
+  besideColumn: vscode.ViewColumn.Beside,
+};
 
 /** Validate the inbound ask-answer payload shape from the webview. */
 function isValidAskAnswers(
@@ -426,6 +449,11 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     // tasks/turns/messages/toolCalls/reasoning records was added, changed, OR removed.
     const affected = computeAffectedTaskIds(previous, file);
     this.reprojectChanged(file, affected, previous);
+  }
+
+  focusTask(taskId: string): void {
+    this.focusedTaskId = taskId;
+    this.postSnapshot(taskId);
   }
 
   postSnapshot(focusedTaskId?: string): void {
@@ -877,6 +905,30 @@ export async function activate(context: vscode.ExtensionContext) {
   runSessionMigration(context, workspaceRoot);
 
   const provider = new MusterChatProvider(context.extensionUri);
+  const revealLinkedChat = async (ownerTaskId: string): Promise<boolean> => {
+    if (!taskStore) return false;
+    const reveal = createPresentationChatLink(
+      taskStore,
+      { executeCommand: (command) => vscode.commands.executeCommand(command) },
+      provider,
+    );
+    return (await reveal(ownerTaskId)).ok;
+  };
+  presentationManager = new PresentationManager(
+    createPresentationPanelFactory(presentationHost, context.extensionUri, revealLinkedChat),
+  );
+  context.subscriptions.push(
+    vscode.window.registerWebviewPanelSerializer(
+      'muster.presentation',
+      createPresentationPanelSerializer(presentationHost, context.extensionUri, presentationManager, revealLinkedChat),
+    ),
+  );
+  context.subscriptions.push({
+    dispose: () => {
+      presentationManager?.dispose();
+      presentationManager = undefined;
+    },
+  });
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(MusterChatProvider.viewType, provider, {
@@ -885,9 +937,9 @@ export async function activate(context: vscode.ExtensionContext) {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('muster.openChat', () => {
-      vscode.commands.executeCommand('workbench.view.extension.muster');
-    }),
+    vscode.commands.registerCommand('muster.openChat', () =>
+      vscode.commands.executeCommand('workbench.view.extension.muster'),
+    ),
   );
 
   try {
@@ -909,16 +961,21 @@ export async function activate(context: vscode.ExtensionContext) {
       },
     });
     credentialRegistry = new CredentialRegistry();
+    const engineToolHandler = {
+      handleToolCall: async (
+        ctx: import('./bridge/credentials').CredentialContext,
+        tool: string,
+        command: import('./task/coordinator-tools').ToolCommand,
+      ) => {
+        if (!taskEngine) {
+          return { ok: false as const, error: 'task engine not ready' };
+        }
+        return taskEngine.handleToolCall(ctx, tool, command);
+      },
+    };
     bridgeServer = new MusterBridgeServer({
       credentials: credentialRegistry,
-      toolHandler: {
-        handleToolCall: async (ctx, _tool, args) => {
-          if (!taskEngine) {
-            return { ok: false, error: 'task engine not ready' };
-          }
-          return taskEngine.handleToolCall(ctx, _tool, args as import('./task/coordinator-tools').ToolCommand);
-        },
-      },
+      toolHandler: new PresentationToolRouter(engineToolHandler, presentationManager),
     });
     const { port } = await bridgeServer.listen();
 
@@ -986,6 +1043,8 @@ export async function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {
+  presentationManager?.dispose();
+  presentationManager = undefined;
   askBridge?.cancelAll('deactivate');
   credentialRegistry?.revokeAll();
   void bridgeServer?.close();

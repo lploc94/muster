@@ -11,6 +11,20 @@ export interface CreateChildSpec {
   executionPolicy?: Partial<TaskExecutionPolicy>;
 }
 
+export const PRESENTATION_ID_MAX_LENGTH = 128;
+export const PRESENTATION_TITLE_MAX_LENGTH = 200;
+export const PRESENTATION_MARKDOWN_MAX_LENGTH = 100_000;
+
+const PRESENTATION_KEYS = new Set([
+  'presentationId',
+  'ownerTaskId',
+  'opId',
+  'revision',
+  'title',
+  'markdown',
+]);
+const STABLE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+
 export type ToolCommand =
   | { kind: 'create_task'; opId: string; spec: CreateChildSpec }
   | { kind: 'delegate_task'; opId: string; spec: CreateChildSpec }
@@ -22,7 +36,16 @@ export type ToolCommand =
   | { kind: 'complete_task'; opId: string; result: string }
   | { kind: 'fail_task'; opId: string; error: string }
   | { kind: 'report_progress'; opId: string; note: string }
-  | { kind: 'ask_user'; opId: string; questions: Question[] };
+  | { kind: 'ask_user'; opId: string; questions: Question[] }
+  | {
+      kind: 'upsert_presentation';
+      presentationId: string;
+      ownerTaskId: string;
+      opId: string;
+      revision: number;
+      title: string;
+      markdown: string;
+    };
 
 const MUTATING_TOOLS: ReadonlySet<string> = new Set([
   'create_task',
@@ -35,6 +58,7 @@ const MUTATING_TOOLS: ReadonlySet<string> = new Set([
   'fail_task',
   'report_progress',
   'ask_user',
+  'upsert_presentation',
 ]);
 
 function toolActionForName(name: string): ToolAction | undefined {
@@ -50,6 +74,7 @@ function toolActionForName(name: string): ToolAction | undefined {
     'fail_task',
     'report_progress',
     'ask_user',
+    'upsert_presentation',
   ];
   return actions.find((a) => a === name);
 }
@@ -88,6 +113,24 @@ function nonNegativeInt(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) && value >= 0
     ? value
     : undefined;
+}
+
+function isStablePresentationId(value: string | undefined): value is string {
+  return value !== undefined && value.length <= PRESENTATION_ID_MAX_LENGTH && STABLE_ID_PATTERN.test(value);
+}
+
+function isPositiveSafeInt(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+}
+
+function isPresentationPayloadTooLarge(args: Record<string, unknown>): boolean {
+  return (
+    (typeof args.presentationId === 'string' && args.presentationId.length > PRESENTATION_ID_MAX_LENGTH) ||
+    (typeof args.ownerTaskId === 'string' && args.ownerTaskId.length > PRESENTATION_ID_MAX_LENGTH) ||
+    (typeof args.opId === 'string' && args.opId.length > PRESENTATION_ID_MAX_LENGTH) ||
+    (typeof args.title === 'string' && args.title.length > PRESENTATION_TITLE_MAX_LENGTH) ||
+    (typeof args.markdown === 'string' && args.markdown.length > PRESENTATION_MARKDOWN_MAX_LENGTH)
+  );
 }
 
 function parseExecutionPolicy(value: Record<string, unknown>): Partial<TaskExecutionPolicy> | undefined {
@@ -179,16 +222,25 @@ export function dispatch(
     return { ok: false, toolError: `unknown tool: ${tool}` };
   }
   if (!ctx.allowedActions.has(action)) {
-    return { ok: false, toolError: `action not permitted: ${tool}` };
+    return {
+      ok: false,
+      toolError: tool === 'upsert_presentation' ? 'unauthorized' : `action not permitted: ${tool}`,
+    };
   }
   if (!isRecord(args)) {
-    return { ok: false, toolError: 'arguments must be an object' };
+    return {
+      ok: false,
+      toolError: tool === 'upsert_presentation' ? 'invalid_arguments' : 'arguments must be an object',
+    };
   }
 
   if (MUTATING_TOOLS.has(tool)) {
     const opId = requireString(args, 'opId');
     if (!opId) {
-      return { ok: false, toolError: 'opId is required' };
+      return {
+        ok: false,
+        toolError: tool === 'upsert_presentation' ? 'invalid_arguments' : 'opId is required',
+      };
     }
 
     switch (tool) {
@@ -263,6 +315,41 @@ export function dispatch(
         return {
           ok: true,
           command: { kind: 'ask_user', opId, questions },
+        };
+      }
+      case 'upsert_presentation': {
+        if (isPresentationPayloadTooLarge(args)) {
+          return { ok: false, toolError: 'payload_too_large' };
+        }
+        const presentationId = requireString(args, 'presentationId');
+        const ownerTaskId = requireString(args, 'ownerTaskId');
+        const title = requireString(args, 'title');
+        const markdown = requireString(args, 'markdown');
+        if (
+          Object.keys(args).some((key) => !PRESENTATION_KEYS.has(key)) ||
+          !isStablePresentationId(presentationId) ||
+          !isStablePresentationId(ownerTaskId) ||
+          !isStablePresentationId(opId) ||
+          !isPositiveSafeInt(args.revision) ||
+          !title ||
+          !markdown
+        ) {
+          return { ok: false, toolError: 'invalid_arguments' };
+        }
+        if (ownerTaskId !== ctx.callerTaskId) {
+          return { ok: false, toolError: 'owner_mismatch' };
+        }
+        return {
+          ok: true,
+          command: {
+            kind: 'upsert_presentation',
+            presentationId,
+            ownerTaskId,
+            opId,
+            revision: args.revision,
+            title,
+            markdown,
+          },
         };
       }
       default:

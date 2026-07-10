@@ -580,6 +580,11 @@ export async function executeToolCommand(
       return { ok: true, result: { root: targetId, tasks: nodes.slice(0, 32) } };
     }
 
+    case 'upsert_presentation':
+      // Presentation execution is composed by the host router (T04). The pure task
+      // graph must remain VS Code-independent and fail closed if called directly.
+      return { ok: false, error: 'panel_open_failed' };
+
     case 'ask_user': {
       const askKey = opLedgerKey(ctx.turnId, command.opId);
       const existing = deps.pendingAskPromises.get(askKey);

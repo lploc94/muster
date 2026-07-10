@@ -10,7 +10,12 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import type { CredentialRegistry } from './credentials';
 import type { ToolAction } from '../task/capabilities';
-import { dispatch } from '../task/coordinator-tools';
+import {
+  dispatch,
+  PRESENTATION_ID_MAX_LENGTH,
+  PRESENTATION_MARKDOWN_MAX_LENGTH,
+  PRESENTATION_TITLE_MAX_LENGTH,
+} from '../task/coordinator-tools';
 
 export interface ToolCallHandler {
   handleToolCall(
@@ -37,9 +42,16 @@ const ALL_TOOLS: ToolAction[] = [
   'fail_task',
   'report_progress',
   'ask_user',
+  'upsert_presentation',
 ];
 
 const OP_ID = { type: 'string', minLength: 1 };
+const PRESENTATION_ID = {
+  type: 'string',
+  minLength: 1,
+  maxLength: PRESENTATION_ID_MAX_LENGTH,
+  pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]*$',
+};
 
 const DEPENDENCY_SCHEMA = {
   type: 'object',
@@ -175,6 +187,19 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
     properties: {
       opId: OP_ID,
       questions: { type: 'array', items: QUESTION_SCHEMA, minItems: 1 },
+    },
+    additionalProperties: false,
+  },
+  upsert_presentation: {
+    type: 'object',
+    required: ['presentationId', 'ownerTaskId', 'opId', 'revision', 'title', 'markdown'],
+    properties: {
+      presentationId: PRESENTATION_ID,
+      ownerTaskId: PRESENTATION_ID,
+      opId: PRESENTATION_ID,
+      revision: { type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+      title: { type: 'string', minLength: 1, maxLength: PRESENTATION_TITLE_MAX_LENGTH },
+      markdown: { type: 'string', minLength: 1, maxLength: PRESENTATION_MARKDOWN_MAX_LENGTH },
     },
     additionalProperties: false,
   },

@@ -537,7 +537,38 @@ The webview never holds the whole thread. Render a **recent window**; older item
 
 ---
 
-## 12. References
+## 12. Read-only presentation review and revision
+
+A coordinator-triggered dedicated tab presents a bounded review artifact beside the Muster chat. It is **read-only**: it is not an editor, file manager, or alternate conversation surface. Markdown paragraphs, tables, fenced code, and safe links render in the tab; links use the host's safe external-opening policy.
+
+### Identity, updates, and isolation
+
+Each tab has a stable presentation ID and immutable owning task. A monotonic revision updates that same tab only when the revision is newer; stale or replayed revisions are ignored. Multiple tabs may remain open, and each presentation ID is isolated so an update cannot mutate another tab.
+
+### Mermaid and visible fallback
+
+Mermaid rendering is deliberately bounded by diagram count, source length, strict rendering, and sanitized SVG output. Unsupported, oversized, malformed, unsafe, or failed diagrams remain visible as source-backed fallback blocks rather than disappearing. For troubleshooting, inspect the diagram element's `data-mermaid-state` (`rendered` or `fallback`) and `data-mermaid-reason` (for example `malformed`, `unsafe-output`, or `renderer-failure`). These attributes describe renderer state without exposing task or transcript content.
+
+### Revise through the linked chat
+
+Use **Open linked chat** to reveal the presentation owner's existing task. The button reports a typed `success` or `failure` status. Submit feedback in that existing task; when the coordinator produces a newer correlated revision, the stable presentation ID refreshes the same panel. The tab does not create a second conversation channel, and its content cannot be edited directly.
+
+### Restore, dispose, and diagnose
+
+Supported window reload restores a validated persisted presentation while preserving its identity, owner, and latest revision. Closing the tab disposes its panel registration; a later update may create a fresh panel but cannot mutate the disposed instance. Close all scenario-created tabs when finished.
+
+If review or revision fails:
+
+1. Check the linked-chat typed status. A failure means reveal was rejected or the owning task could not be shown; continue from the task list rather than assuming feedback was sent.
+2. Check `data-mermaid-state` and `data-mermaid-reason` for a diagram-specific fallback. The source remains available for review.
+3. Confirm the update uses the same presentation and owner identities with a strictly newer revision.
+4. After reload, distinguish a rejected invalid snapshot from a valid restored tab. After disposal, verify the closed panel does not change.
+
+Contributor proof and live-host evidence rules are in [CONTRIBUTING.md](../CONTRIBUTING.md).
+
+---
+
+## 13. References
 
 - [VS Code Webview API](https://code.visualstudio.com/api/extension-guides/webview)
 - [VS Code Elements docs](https://vscode-elements.github.io)
