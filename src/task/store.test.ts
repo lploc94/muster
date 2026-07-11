@@ -74,9 +74,15 @@ describe('TaskStore', () => {
           revision: result.ok ? result.revision : 0,
         }));
       `;
+      // Use the tsx CLI (not `node --import tsx -e`) so named ESM exports from
+      // CommonJS-oriented sources resolve correctly under Node 20.
       const child = spawn(
         process.execPath,
-        ['--import', 'tsx', '--input-type=module', '-e', script],
+        [
+          require.resolve('tsx/cli'),
+          '--eval',
+          script,
+        ],
         {
           cwd: path.resolve(__dirname, '../..'),
           stdio: ['ignore', 'pipe', 'pipe'],
@@ -377,6 +383,33 @@ describe('TaskStore', () => {
     expect(file.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
     expect(file.toolCalls).toEqual({});
     expect(file.reasoning).toEqual({});
+    expect(file.workflowRuns).toEqual({});
+    expect(file.workflowArtifacts).toEqual({});
+    expect(file.usageRecords).toEqual({});
+  });
+
+  it('migrates a v3 fixture to v4 defaulting workflow maps to empty', () => {
+    const { filePath } = makeTempStore();
+    const legacy = {
+      schemaVersion: 3,
+      revision: 4,
+      tasks: { 'task-1': sampleTask('task-1') },
+      turns: {},
+      messages: {},
+      operations: {},
+      cancelRequests: {},
+      toolCalls: {},
+      reasoning: {},
+    };
+    fs.writeFileSync(filePath, JSON.stringify(legacy), 'utf8');
+
+    const store = TaskStore.load({ filePath });
+    const file = store.getFile();
+    expect(file.schemaVersion).toBe(4);
+    expect(file.workflowRuns).toEqual({});
+    expect(file.workflowArtifacts).toEqual({});
+    expect(file.usageRecords).toEqual({});
+    expect(file.tasks['task-1']).toBeDefined();
   });
 
   it('persists toolCalls/reasoning across commit and reload (retention writeback plumbing)', () => {

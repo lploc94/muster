@@ -288,6 +288,22 @@
           }
           break;
 
+        case 'commandResult':
+          if (!msg.taskId || msg.taskId === tasks.focusedTaskId) {
+            if (!msg.ok) {
+              tasks.setCommandError(msg.message ?? msg.error?.message ?? 'Command failed', msg.taskId ?? null);
+            } else if (msg.message) {
+              // Surface non-error command feedback in the same banner slot (cleared by user).
+              tasks.setCommandError(null);
+              threadStore.current.appendTranscript({
+                id: `cmd-${Date.now()}`,
+                kind: 'assistant',
+                content: msg.message,
+              });
+            }
+          }
+          break;
+
         case 'backendsAvailable':
           tasks.setAvailableBackends(msg.backends);
           break;

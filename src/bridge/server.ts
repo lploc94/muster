@@ -37,6 +37,8 @@ const ALL_TOOLS: ToolAction[] = [
   'fail_task',
   'report_progress',
   'ask_user',
+  'submit_decision_brief',
+  'submit_plan_artifact',
 ];
 
 const OP_ID = { type: 'string', minLength: 1 };
@@ -175,6 +177,24 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
     properties: {
       opId: OP_ID,
       questions: { type: 'array', items: QUESTION_SCHEMA, minItems: 1 },
+    },
+    additionalProperties: false,
+  },
+  submit_decision_brief: {
+    type: 'object',
+    required: ['opId', 'artifact'],
+    properties: {
+      opId: OP_ID,
+      artifact: { type: 'object' },
+    },
+    additionalProperties: false,
+  },
+  submit_plan_artifact: {
+    type: 'object',
+    required: ['opId', 'artifact'],
+    properties: {
+      opId: OP_ID,
+      artifact: { type: 'object' },
     },
     additionalProperties: false,
   },

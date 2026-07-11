@@ -167,9 +167,18 @@ function truncateOpenTaskOutput(file: TaskStoreFile, taskId: string, maxStoredOu
  * Pure, idempotent retention transform over a loaded TaskStoreFile.
  * Open tasks: truncate oversized settled assistant output only.
  * Terminal tasks: may drop oldest turns beyond maxTurnsPerTask.
+ *
+ * Workflow artifacts, workflow runs, and usage records (schema ≥ 4) are never
+ * pruned here — decision/plan/verification evidence must survive transcript
+ * truncation.
  */
 export function applyRetention(file: TaskStoreFile, config: RetentionConfig = DEFAULT_RETENTION_CONFIG): TaskStoreFile {
   const next = cloneFile(file);
+
+  // Snapshot workflow maps so accidental future prunes cannot drop them.
+  const workflowRuns = next.workflowRuns;
+  const workflowArtifacts = next.workflowArtifacts;
+  const usageRecords = next.usageRecords;
 
   for (const task of Object.values(next.tasks)) {
     if (isTerminalLifecycle(task.lifecycle)) {
@@ -178,6 +187,10 @@ export function applyRetention(file: TaskStoreFile, config: RetentionConfig = DE
       truncateOpenTaskOutput(next, task.id, config.maxStoredOutputChars);
     }
   }
+
+  if (workflowRuns) next.workflowRuns = workflowRuns;
+  if (workflowArtifacts) next.workflowArtifacts = workflowArtifacts;
+  if (usageRecords) next.usageRecords = usageRecords;
 
   return next;
 }

@@ -12,9 +12,13 @@ Read in this order when onboarding:
 |-----|--------|
 | [SESSION-MANAGEMENT.md](SESSION-MANAGEMENT.md) | Explicit session IDs, resume flow |
 | [TASK-MANAGEMENT.md](TASK-MANAGEMENT.md) | Task/turn domain model, coordinator protocol, TaskEngine lifecycle |
+| [AGENTIC-WORKFLOW-KNOWLEDGE.md](AGENTIC-WORKFLOW-KNOWLEDGE.md) | Native workflow phases, commands, artifacts, host enforcement |
+| [NATIVE-COMMANDS.md](NATIVE-COMMANDS.md) | Slash/CLI command catalog and limits |
 | [MCP-INJECTION.md](MCP-INJECTION.md) | `context_engine` + `coordinator` MCP per turn |
 | [MUSTER-BRIDGE.md](MUSTER-BRIDGE.md) | MCP `ask_user`, AskBridge, tool catalog |
 | [WEBVIEW.md](WEBVIEW.md) | Chat UI — Svelte, Vite, Tailwind, vscode-elements, postMessage protocol |
 | [SETTINGS.md](SETTINGS.md) | Host-backed Settings pattern for feature configuration |
 
 All docs are living — update when CLI versions or spikes change behavior.
+
+**Store schema:** task store is at schema **v4** (workflow runs, artifacts, usage).

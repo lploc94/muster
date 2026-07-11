@@ -6,6 +6,8 @@ domain concepts and invariants that implementation types must preserve.
 **Related documents:**
 
 - [`DESIGN.md`](DESIGN.md) — extension architecture and per-turn process model
+- [`AGENTIC-WORKFLOW-KNOWLEDGE.md`](AGENTIC-WORKFLOW-KNOWLEDGE.md) — native workflow
+  phases, plan approval, and structured artifacts (orthogonal to lifecycle)
 - [`SESSION-MANAGEMENT.md`](SESSION-MANAGEMENT.md) — backend-specific session identity and resume rules
 - [`ADAPTER-SPEC.md`](ADAPTER-SPEC.md) — `NormalizedEvent`, `RunOptions`, and adapter turn lifecycle
 - [`MUSTER-BRIDGE.md`](MUSTER-BRIDGE.md) — MCP transport and `ask_user`
@@ -65,9 +67,18 @@ events, or visual rendering details. Those belong to the related documents.
 | **Coordinator** | A task role allowed to create, start, stop, and wait for child tasks | Task lifetime |
 | **Worker** | A task role that performs delegated work without extending the task graph | Task lifetime |
 | **Engine** | Host-side scheduler and state machine that validates and applies orchestration actions | Extension lifetime |
+| **Workflow run** | Root-owned orchestration stage (`thinking` → plan approval → execution phases) | Until completed/abandoned; persisted separately from lifecycle |
+| **Plan artifact** | Host-validated DAG proposal; starts work only after user approval | Plan revision history on the workflow run |
+| **Workflow phase** | Orchestration stage — **not** a lifecycle value | Independent of `open`/`succeeded`/… |
 
-Do not use **executor** as a domain term. It ambiguously refers to a backend,
-session, agent, or process. In code and documentation, use the precise term.
+Do not use **executor** as a domain term for backends/processes. Prefer the
+precise term. Workflow docs may use **executor role** for post-approval
+implementation tasks (see `AGENTIC-WORKFLOW-KNOWLEDGE.md`).
+
+**Lifecycle vs workflow phase:** sealing a task `succeeded` does not replace
+workflow verification evidence; finishing a workflow does not by itself seal
+lifecycle. Proposal → approval → execution evidence → sealed outcome are four
+layers (see knowledge doc §5.2).
 
 ### 2.1 Layering
 

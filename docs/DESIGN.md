@@ -22,11 +22,18 @@ Build a VS Code extension that acts as a **coordinator** for multiple AI coding 
 - Let the agent **ask the user** mid-turn via MCP `muster_bridge.ask_user` (see `docs/MUSTER-BRIDGE.md`).
 
 ### Explicitly Out of Scope (for now)
-- Rich permission system / approval cards
 - Native diff preview before apply
-- Plan mode / client-side gates
 - Full ACP client capabilities for Grok (`fs`/`terminal` proxy — we declare them off)
 - Session pools or multi-turn brokers beyond what each CLI natively supports
+- Importing third-party workflow runners (CK skills, provider slash catalogs) as runtime deps
+
+### In scope (native workflow commands)
+- Host-enforced plan → approval → execution lifecycle (not prompt-only gates)
+- Native slash/command core shared by VS Code and future CLI
+- Structured artifacts (`DecisionBrief`, `PlanArtifact`, reports) — see
+  [`AGENTIC-WORKFLOW-KNOWLEDGE.md`](AGENTIC-WORKFLOW-KNOWLEDGE.md) and
+  `src/workflow/contracts.ts`
+- Tool permissions remain host settings (`muster.permissions.mode`), not slash commands
 
 ## 2. Core Architectural Decisions
 
@@ -120,15 +127,20 @@ Extension
 │   ├── opencode.ts
 │   └── antigravity.ts  (planned)
 ├── TaskStore + TaskEngine (task graph, turns, orchestration — see `docs/TASK-MANAGEMENT.md`)
+├── Workflow layer (phases, artifacts, approval — see `docs/AGENTIC-WORKFLOW-KNOWLEDGE.md`)
+│   ├── contracts.ts (typed artifacts + validators)
+│   ├── store / transitions (schema v4 workflowRuns + artifacts)
+│   └── command core (`src/commands/*` — VS Code-free handlers)
 ├── Session migration (archive-only `.muster-sessions.json` → `.migrated` on activation)
 ├── CommandBuilder / MCPConfig helpers
 ├── Muster Bridge
 │   ├── AskBridge (pending asks, in-memory)
-│   └── MusterMcpHttpServer (local HTTP MCP — `ask_user`)
+│   ├── phase-gated tool listing / dispatch
+│   └── MusterMcpHttpServer (local HTTP MCP — `ask_user` + artifact submit)
 ├── acp-client.ts (shared ACP JSON-RPC client per backend agent process)
 ├── Runner (ACP session lifecycle + session/update → NormalizedEvent)
 └── UI (Webview)
-    └── Chat view + question cards (submitAsk → AskBridge)
+    └── Chat view + plan/approval cards + question cards (submitAsk → AskBridge)
 ```
 
 ## 6. Session Management
@@ -156,8 +168,9 @@ In the task-based flow:
 - "New task" replaces "New Session" as the primary user action.
 
 See `TASK-MANAGEMENT.md` for the authoritative domain model (especially §3–§5,
-§4.3, §9, §14) and `SESSION-MANAGEMENT.md` for backend-specific identity/resume
-behavior.
+§4.3, §9, §14), `AGENTIC-WORKFLOW-KNOWLEDGE.md` for workflow phases/commands/
+artifacts (independent of lifecycle), and `SESSION-MANAGEMENT.md` for
+backend-specific identity/resume behavior.
 
 ## 7. MCP Integration (two servers per turn)
 
@@ -170,15 +183,14 @@ At turn start we generate/pass a merged MCP config (or use per-CLI discovery). G
 
 ## 8. Implementation Roadmap (Suggested)
 
-1. **Design & Types** (this doc + `types.ts`)
-2. **TaskStore + TaskEngine** (versioned task, turn, message, and session-binding state)
-3. **Command builders** for all 4 CLIs (with MCP injection)
-4. **ACP client + event mapper** — Grok first (done), then Claude/Codex/agy on the same path
-5. **Minimal webview** that consumes normalized events
-6. **Muster Bridge** — `AskBridge` + HTTP MCP `ask_user` (Claude first)
-7. **Codex backend**
-8. **Antigravity (agy) backend** — deferred for ask UI until streaming tool events improve
-9. Polish: error handling, cancellation, version detection, raw event logging
+1. **Design & Types** (this doc + `types.ts`) — done
+2. **TaskStore + TaskEngine** (versioned task, turn, message, and session-binding state) — done
+3. **ACP backends** — Claude, Grok, Kiro, Codex, OpenCode on shared `acp-client` — done
+4. **Muster Bridge** — `AskBridge` + HTTP MCP `ask_user` — done
+5. **Native workflow commands** — contracts, schema v4, command core, approval gate,
+   VS Code UX, utilities, CLI portability — in progress (`plans/260711-1635-native-workflow-commands`)
+6. **Antigravity (agy) backend** — deferred until ACP entry is verified
+7. Polish: error handling, cancellation, version detection, raw event logging
 
 ## 9. Risks & Open Questions
 

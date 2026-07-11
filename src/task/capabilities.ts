@@ -11,7 +11,10 @@ export type CoordinatorAction =
 
 export type AnyTaskAction = 'complete_task' | 'fail_task' | 'report_progress' | 'ask_user';
 
-export type ToolAction = CoordinatorAction | AnyTaskAction;
+/** Typed planner artifact submission (host validates; never infers from markdown). */
+export type WorkflowArtifactAction = 'submit_decision_brief' | 'submit_plan_artifact';
+
+export type ToolAction = CoordinatorAction | AnyTaskAction | WorkflowArtifactAction;
 
 const CAPABILITY_TO_ACTIONS: Record<TaskCapability, CoordinatorAction[]> = {
   create_child: ['create_task', 'delegate_task'],

@@ -8,6 +8,7 @@ import type { Backend, BackendCapabilities, NormalizedEvent, RunOptions } from '
 import { TaskEngine } from './engine';
 import { TaskStore } from './store';
 import type { TaskStoreFile } from './types';
+import { createWorkflowRun } from '../workflow/transitions';
 
 const tempDirs: string[] = [];
 
@@ -92,6 +93,70 @@ afterEach(() => {
 });
 
 describe('task lifecycle runtime regression harness', () => {
+  it('queues an agent turn for /test and rejects a second workflow command while it is active', async () => {
+    const { store } = makeTempStore();
+    const gate = makeGate();
+    const prompts: string[] = [];
+    let runCount = 0;
+    const backend = scriptedBackend(async function* (options) {
+      runCount += 1;
+      prompts.push(options.prompt);
+      yield { type: 'sessionStarted', sessionId: 'workflow-test' };
+      if (runCount === 1) {
+        yield { type: 'turnCompleted' };
+        return;
+      }
+      await gate.wait;
+      yield { type: 'turnCompleted' };
+    });
+    const engine = makeEngine(store, () => backend);
+
+    const root = engine.startNewTask({
+      goal: 'Verify the workflow', backend: 'fake', workflowMode: 'direct',
+    });
+    expect(root.ok).toBe(true);
+    if (!root.ok) return;
+    await engine.whenIdle();
+    expect(store.commit((draft) => {
+      const created = createWorkflowRun(draft, {
+        id: 'workflow-run',
+        rootTaskId: root.value.taskId,
+        phase: 'implementing',
+        now: '2026-07-06T12:00:00.000Z',
+      });
+      return created.ok ? { ok: true } : { ok: false, reason: created.error.message };
+    }).ok).toBe(true);
+
+    const started = engine.runWorkflowCommand({
+      commandId: 'test', rawName: 'test', argv: [], rawArgs: 'workflow scope', rootTaskId: root.value.taskId,
+    });
+    expect(started.ok, started.ok ? undefined : JSON.stringify(started.error)).toBe(true);
+    if (!started.ok) return;
+    expect(started.commandId).toBe('test');
+    const turnId = (started.data as { turnId?: string } | undefined)?.turnId;
+    expect(turnId).toBeTruthy();
+    expect(turnFile(store).turns[turnId!]).toMatchObject({ taskId: root.value.taskId, status: expect.stringMatching(/queued|running/) });
+    expect(turnFile(store).workflowRuns?.['workflow-run']?.phase).toBe('testing');
+    expect(Object.values(turnFile(store).workflowArtifacts ?? {}).some((artifact) => artifact.kind === 'test_report')).toBe(true);
+
+    await waitFor(() => turnFile(store).turns[turnId!]?.status === 'running', 'workflow test turn to run');
+    expect(prompts[1]).toContain('collecting independent test evidence');
+
+    const rejected = engine.runWorkflowCommand({
+      commandId: 'review', rawName: 'review', argv: [], rawArgs: 'diff', rootTaskId: root.value.taskId,
+    });
+    expect(rejected).toMatchObject({
+      ok: false,
+      commandId: 'review',
+      error: { code: 'TRANSITION_DENIED' },
+    });
+    expect(turnFile(store).workflowRuns?.['workflow-run']?.phase).toBe('testing');
+    expect(Object.values(turnFile(store).workflowArtifacts ?? {}).filter((artifact) => artifact.kind === 'review_report')).toHaveLength(0);
+
+    gate.release();
+    await engine.whenIdle();
+  });
+
   it('creates a task with startNewTask and projects the gated turn as running', async () => {
     const { store } = makeTempStore();
     const gate = makeGate();
@@ -102,7 +167,11 @@ describe('task lifecycle runtime regression harness', () => {
     });
     const engine = makeEngine(store, () => backend);
 
-    const started = engine.startNewTask({ goal: 'Run a lifecycle task', backend: 'fake' });
+    const started = engine.startNewTask({
+      goal: 'Run a lifecycle task',
+      backend: 'fake',
+      workflowMode: 'direct',
+    });
 
     expect(started.ok).toBe(true);
     if (!started.ok) return;
@@ -155,7 +224,11 @@ describe('task lifecycle runtime regression harness', () => {
     });
     const engine = makeEngine(store, () => backend);
 
-    const started = engine.startNewTask({ goal: 'Finish the task', backend: 'fake' });
+    const started = engine.startNewTask({
+      goal: 'Finish the task',
+      backend: 'fake',
+      workflowMode: 'direct',
+    });
     expect(started.ok).toBe(true);
     if (!started.ok) return;
     await waitFor(

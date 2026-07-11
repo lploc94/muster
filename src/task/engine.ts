@@ -6,6 +6,19 @@ import { CredentialRegistry } from '../bridge/credentials';
 import { runTurn as defaultRunTurn } from '../runner';
 import type { Backend, NormalizedEvent, RunOptions } from '../types';
 import type { TurnTrigger } from './types';
+import { approveAndMaterialize, readyChildIds } from '../workflow/approval';
+import {
+  buildAutoPlanMessage,
+  ensurePlannerWorkflowRun,
+} from '../workflow/planner';
+import {
+  beginReplan,
+  getWorkflowRunForRoot,
+  transitionWorkflowPhase,
+} from '../workflow/store';
+import { dispatchWorkflowRoute } from '../workflow/routes';
+import type { CommandRequest, CommandResult } from '../commands/types';
+import type { WorkflowPhase } from '../workflow/contracts';
 import { canBindTaskToBackend } from './backend-eligibility';
 import { deriveViewStatus } from './derived-status';
 import type { DepGraph } from './deps';
@@ -560,9 +573,16 @@ export class TaskEngine {
     message?: string;
     /** Workspace directory the agent runs in for this task's turns. */
     cwd?: string;
-  }): EngineResult<{ taskId: string; messageId: string; turnId: string }> {
+    /**
+     * `auto_plan` (default): enter think/plan with host-enforced approval gate.
+     * `draft`: create root without a turn (empty chat).
+     * `direct`: legacy immediate execution (bypass auto-plan; tests / escape hatch).
+     */
+    workflowMode?: 'auto_plan' | 'draft' | 'direct';
+  }): EngineResult<{ taskId: string; messageId?: string; turnId?: string; workflowRunId?: string }> {
+    const mode = params.workflowMode ?? 'auto_plan';
     const backend = this.makeBackend(params.backend);
-    if (!canBindTaskToBackend(backend.capabilities)) {
+    if (mode !== 'draft' && !canBindTaskToBackend(backend.capabilities)) {
       return { ok: false, reason: 'backend does not support MCP' };
     }
 
@@ -584,6 +604,8 @@ export class TaskEngine {
       executionPolicy: DEFAULT_POLICY,
     };
 
+    let workflowRunId: string | undefined;
+
     const commit = this.store.commit((draft) => {
       if (draft.tasks[taskId]) {
         return { ok: false, reason: 'task id already exists' };
@@ -595,6 +617,50 @@ export class TaskEngine {
       }
       draft.tasks[taskId] = created.next;
 
+      if (mode === 'draft') {
+        const run = ensurePlannerWorkflowRun(draft, {
+          rootTaskId: taskId,
+          now,
+          phase: 'draft',
+        });
+        workflowRunId = run.workflowRunId;
+        return { ok: true };
+      }
+
+      if (mode === 'auto_plan') {
+        const run = ensurePlannerWorkflowRun(draft, {
+          rootTaskId: taskId,
+          now,
+          phase: 'thinking',
+        });
+        workflowRunId = run.workflowRunId;
+        const messageContent = buildAutoPlanMessage({
+          goal: params.message ?? params.goal,
+          rootTaskId: taskId,
+          workflowRunId: run.workflowRunId,
+          phase: 'thinking',
+        });
+        draft.messages[messageId] = {
+          id: messageId,
+          taskId,
+          role: 'user',
+          content: messageContent,
+          state: 'pending',
+          createdAt: now,
+        };
+        const queued = transitionStartTask(created.next, [], {
+          turnId,
+          now,
+          inputs: [{ kind: 'message', messageId }],
+        });
+        if (!queued.ok) {
+          return queued;
+        }
+        draft.turns[turnId] = queued.next;
+        return { ok: true };
+      }
+
+      // direct (legacy)
       const messageContent = params.message ?? params.goal;
       draft.messages[messageId] = {
         id: messageId,
@@ -621,8 +687,262 @@ export class TaskEngine {
       return { ok: false, reason: commit.detail ?? commit.reason };
     }
 
-    void this.scheduleTurn(turnId);
-    return { ok: true, value: { taskId, messageId, turnId } };
+    if (mode !== 'draft') {
+      void this.scheduleTurn(turnId);
+      return { ok: true, value: { taskId, messageId, turnId, workflowRunId } };
+    }
+    return { ok: true, value: { taskId, workflowRunId } };
+  }
+
+  /**
+   * Approve the pending plan on a root task and materialize children once.
+   * Starts ready children (deps satisfied). Idempotent for the same opId.
+   */
+  approvePlan(params: {
+    rootTaskId: string;
+    planArtifactId?: string;
+    opId: string;
+  }): EngineResult<{
+    workflowRunId: string;
+    createdTaskIds: string[];
+    startedTurnIds: string[];
+    alreadyMaterialized: boolean;
+  }> {
+    const now = nowIso(this.clock);
+    const startedTurnIds: string[] = [];
+    let resultValue:
+      | {
+          workflowRunId: string;
+          createdTaskIds: string[];
+          alreadyMaterialized: boolean;
+        }
+      | undefined;
+
+    const commit = this.store.commit((draft) => {
+      const run = getWorkflowRunForRoot(draft, params.rootTaskId);
+      if (!run) {
+        return { ok: false, reason: 'workflow run not found' };
+      }
+      const planArtifactId =
+        params.planArtifactId ?? run.approval?.planArtifactId ?? run.currentPlanArtifactId;
+      if (!planArtifactId) {
+        return { ok: false, reason: 'no plan artifact to approve' };
+      }
+
+      const materialized = approveAndMaterialize(draft, {
+        workflowRunId: run.id,
+        planArtifactId,
+        materializeOpId: params.opId,
+        now,
+        defaultPolicy: DEFAULT_POLICY,
+      });
+      if (!materialized.ok) {
+        return { ok: false, reason: materialized.error.message };
+      }
+
+      resultValue = {
+        workflowRunId: materialized.workflowRunId,
+        createdTaskIds: materialized.createdTaskIds,
+        alreadyMaterialized: materialized.alreadyMaterialized,
+      };
+
+      if (!materialized.alreadyMaterialized) {
+        transitionWorkflowPhase(draft, {
+          workflowRunId: run.id,
+          to: 'implementing',
+          now,
+        });
+      }
+
+      // Queue turns for ready children only when first materializing
+      if (!materialized.alreadyMaterialized) {
+        const ready = readyChildIds(draft, materialized.createdTaskIds);
+        for (const childId of ready) {
+          const child = draft.tasks[childId];
+          if (!child) continue;
+          const childTurns = turnsForTask(draft, childId);
+          if (childTurns.some((t) => t.status === 'queued' || t.status === 'running')) {
+            continue;
+          }
+          const turnId = randomUUID();
+          const messageId = randomUUID();
+          draft.messages[messageId] = {
+            id: messageId,
+            taskId: childId,
+            role: 'user',
+            content: child.goal,
+            state: 'pending',
+            createdAt: now,
+          };
+          const queued = transitionStartTask(child, childTurns, {
+            turnId,
+            now,
+            inputs: [{ kind: 'message', messageId }],
+          });
+          if (queued.ok) {
+            draft.turns[turnId] = queued.next;
+            startedTurnIds.push(turnId);
+          }
+        }
+      }
+
+      return { ok: true };
+    });
+
+    if (!commit.ok || !resultValue) {
+      return { ok: false, reason: commit.ok ? 'approve failed' : commit.detail ?? commit.reason };
+    }
+
+    for (const turnId of startedTurnIds) {
+      void this.scheduleTurn(turnId);
+    }
+
+    return {
+      ok: true,
+      value: {
+        ...resultValue,
+        startedTurnIds,
+      },
+    };
+  }
+
+  replan(params: { rootTaskId: string }): EngineResult<{ workflowRunId: string }> {
+    const now = nowIso(this.clock);
+    let workflowRunId: string | undefined;
+    const commit = this.store.commit((draft) => {
+      const run = getWorkflowRunForRoot(draft, params.rootTaskId);
+      if (!run) {
+        return { ok: false, reason: 'workflow run not found' };
+      }
+      const result = beginReplan(draft, { workflowRunId: run.id, now });
+      if (!result.ok) {
+        return { ok: false, reason: result.error.message };
+      }
+      workflowRunId = run.id;
+      return { ok: true };
+    });
+    if (!commit.ok || !workflowRunId) {
+      return { ok: false, reason: commit.ok ? 'replan failed' : commit.detail ?? commit.reason };
+    }
+    return { ok: true, value: { workflowRunId } };
+  }
+
+  /**
+   * Host-side workflow command routes (implement/test/review/debug/verify/finish/…).
+   * Mutates store inside a single commit when successful.
+   */
+  runWorkflowCommand(request: CommandRequest, options?: { cwd?: string }): CommandResult {
+    const rootTaskId = request.rootTaskId ?? request.focusedTaskId;
+    if (!rootTaskId) {
+      return {
+        ok: false,
+        commandId: request.commandId,
+        error: {
+          code: 'NOT_FOUND',
+          message: 'root task required',
+        },
+        presenter: 'error',
+      };
+    }
+    const now = request.now ?? nowIso(this.clock);
+    let commandResult: CommandResult | undefined;
+    let workflowTurnId: string | undefined;
+    const executesAgent = new Set(['test', 'review', 'debug', 'verify']);
+    const commit = this.store.commit((draft) => {
+      const root = draft.tasks[rootTaskId];
+      if (!root) {
+        commandResult = {
+          ok: false,
+          commandId: request.commandId,
+          error: { code: 'NOT_FOUND', message: 'root task not found' },
+          presenter: 'error',
+        };
+        return { ok: false, reason: commandResult.error.message };
+      }
+      if (executesAgent.has(request.commandId) && hasActiveOrQueuedTurn(turnsForTask(draft, rootTaskId))) {
+        commandResult = {
+          ok: false,
+          commandId: request.commandId,
+          error: {
+            code: 'TRANSITION_DENIED',
+            message: `/${request.commandId} requires the root task to be idle`,
+          },
+          presenter: 'error',
+        };
+        return { ok: false, reason: commandResult.error.message };
+      }
+      commandResult = dispatchWorkflowRoute(
+        draft,
+        request,
+        rootTaskId,
+        now,
+        options?.cwd,
+      );
+      // Only commit mutations on success
+      if (!commandResult.ok) {
+        return { ok: false, reason: commandResult.error.message };
+      }
+
+      if (executesAgent.has(request.commandId)) {
+        const instruction =
+          typeof commandResult.message === 'string' && commandResult.message.length > 0
+            ? commandResult.message
+            : `Run the native /${request.commandId} workflow and submit structured evidence.`;
+        const messageId = randomUUID();
+        const turnId = randomUUID();
+        draft.messages[messageId] = {
+          id: messageId,
+          taskId: rootTaskId,
+          role: 'user',
+          content: instruction,
+          state: 'pending',
+          createdAt: now,
+        };
+        const queued = transitionContinueTask(root, turnsForTask(draft, rootTaskId), {
+          turnId,
+          now,
+          inputs: [{ kind: 'message', messageId }],
+        });
+        if (!queued.ok) {
+          return queued;
+        }
+        draft.turns[turnId] = queued.next;
+        workflowTurnId = turnId;
+        commandResult = {
+          ...commandResult,
+          data: {
+            ...(commandResult.data && typeof commandResult.data === 'object'
+              ? commandResult.data as Record<string, unknown>
+              : {}),
+            turnId,
+          },
+        };
+      }
+      return { ok: true };
+    });
+    if (!commandResult) {
+      return {
+        ok: false,
+        error: { code: 'NOT_FOUND', message: 'workflow command failed' },
+        presenter: 'error',
+      };
+    }
+    if (!commit.ok && commandResult.ok) {
+      return {
+        ok: false,
+        commandId: request.commandId,
+        error: { code: 'ARTIFACT_INVALID', message: commit.detail ?? commit.reason },
+        presenter: 'error',
+      };
+    }
+    if (commandResult.ok && workflowTurnId) {
+      void this.scheduleTurn(workflowTurnId);
+    }
+    return commandResult;
+  }
+
+  getWorkflowPhase(rootTaskId: string): WorkflowPhase | undefined {
+    return getWorkflowRunForRoot(this.store.getFile(), rootTaskId)?.phase;
   }
 
   continueTaskWithMessage(

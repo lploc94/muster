@@ -79,7 +79,7 @@ async function openWebview(page: Page) {
 // PROTOCOL_VERSION in webview/src/lib/protocol.ts. Test fixtures below always
 // send it so the version-mismatch banner doesn't mask the harness's own
 // snapshot messages.
-const PROTOCOL_VERSION = 2;
+const PROTOCOL_VERSION = 3;
 
 async function postSnapshot(page: Page, snapshot: SnapshotMessage) {
   await page.evaluate((message) => {

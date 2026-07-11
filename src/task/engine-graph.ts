@@ -4,7 +4,19 @@ import type { CredentialRegistry } from '../bridge/credentials';
 import { buildTurnMcp, deleteMcpConfigFile } from '../bridge/mcp-config';
 import type { Backend } from '../types';
 import { canBindTaskToBackend } from './backend-eligibility';
-import { capabilitiesFor } from './capabilities';
+import { BACKEND_IDS } from '../backends';
+import {
+  validateDecisionBrief,
+  validatePlanArtifact,
+  WORKFLOW_CONTRACT_VERSION,
+} from '../workflow/contracts';
+import { actionsForTaskInStore } from '../workflow/capabilities';
+import {
+  attachArtifact,
+  createWorkflowRun,
+  getWorkflowRunForRoot,
+  stagePlanForApproval,
+} from '../workflow/store';
 import type { ToolCommand } from './coordinator-tools';
 import {
   bridgeTokenTtlMs,
@@ -190,7 +202,8 @@ export function issueTurnCredential(
   const task = turn ? file.tasks[turn.taskId] : undefined;
   if (!turn || !task) return undefined;
   const rootId = findRootId(file, task.id);
-  const actions = capabilitiesFor(task);
+  // Phase-aware: planners cannot mint start/complete/fail before approval.
+  const actions = actionsForTaskInStore(file, task);
   return deps.credentials.issue({
     rootId,
     callerTaskId: task.id,
@@ -595,6 +608,148 @@ export async function executeToolCommand(
         };
       }).filter((n): n is NonNullable<typeof n> => n !== undefined);
       return { ok: true, result: { root: targetId, tasks: nodes.slice(0, 32) } };
+    }
+
+    case 'submit_decision_brief': {
+      const validated = validateDecisionBrief(command.artifact);
+      if (!validated.ok) {
+        return {
+          ok: false,
+          error: JSON.stringify({
+            code: validated.error.code,
+            message: validated.error.message,
+            details: validated.error.details,
+          }),
+        };
+      }
+      const commit = deps.store.commit((draft) => {
+        ensureCoordinationMaps(draft);
+        let run = getWorkflowRunForRoot(draft, ctx.rootId);
+        if (!run) {
+          const created = createWorkflowRun(draft, {
+            id: randomUUID(),
+            rootTaskId: ctx.rootId,
+            phase: 'thinking',
+            now,
+          });
+          if (!created.ok) {
+            return { ok: false, reason: created.error.message };
+          }
+          run = created.value;
+        }
+        // Align envelope ids with host authority
+        const brief = {
+          ...validated.value,
+          rootTaskId: ctx.rootId,
+          workflowRunId: run.id,
+          producedByTaskId: ctx.callerTaskId,
+          producedByTurnId: ctx.turnId,
+          contractVersion: WORKFLOW_CONTRACT_VERSION,
+        };
+        const attached = attachArtifact(draft, {
+          id: brief.id,
+          contractVersion: brief.contractVersion,
+          kind: 'decision_brief',
+          rootTaskId: brief.rootTaskId,
+          workflowRunId: brief.workflowRunId,
+          producedByTaskId: brief.producedByTaskId,
+          producedByTurnId: brief.producedByTurnId,
+          producedAt: brief.producedAt,
+          consumer: brief.consumer,
+          body: brief.body,
+        });
+        if (!attached.ok) {
+          return { ok: false, reason: attached.error.message };
+        }
+        writeLedger(draft, ctx.turnId, command.opId, fingerprint, {
+          ok: true,
+          data: { artifactId: brief.id, kind: 'decision_brief' },
+        });
+        return { ok: true };
+      });
+      if (!commit.ok) {
+        return { ok: false, error: commit.detail ?? commit.reason };
+      }
+      return { ok: true, result: { artifactId: validated.value.id, kind: 'decision_brief' } };
+    }
+
+    case 'submit_plan_artifact': {
+      const validated = validatePlanArtifact(command.artifact, {
+        knownBackends: BACKEND_IDS,
+      });
+      if (!validated.ok) {
+        return {
+          ok: false,
+          error: JSON.stringify({
+            code: validated.error.code,
+            message: validated.error.message,
+            details: validated.error.details,
+          }),
+        };
+      }
+      const commit = deps.store.commit((draft) => {
+        ensureCoordinationMaps(draft);
+        let run = getWorkflowRunForRoot(draft, ctx.rootId);
+        if (!run) {
+          const created = createWorkflowRun(draft, {
+            id: randomUUID(),
+            rootTaskId: ctx.rootId,
+            phase: 'planning',
+            now,
+          });
+          if (!created.ok) {
+            return { ok: false, reason: created.error.message };
+          }
+          run = created.value;
+        }
+        const plan = {
+          ...validated.value,
+          rootTaskId: ctx.rootId,
+          workflowRunId: run.id,
+          producedByTaskId: ctx.callerTaskId,
+          producedByTurnId: ctx.turnId,
+          contractVersion: WORKFLOW_CONTRACT_VERSION,
+        };
+        // Ensure planner can reach awaiting_plan_approval from current phase
+        if (run.phase === 'draft') {
+          run.phase = 'planning';
+          run.updatedAt = now;
+        }
+        if (run.phase === 'thinking') {
+          run.phase = 'planning';
+          run.updatedAt = now;
+        }
+        const staged = stagePlanForApproval(draft, {
+          workflowRunId: run.id,
+          plan,
+          now,
+        });
+        if (!staged.ok) {
+          return { ok: false, reason: staged.error.message };
+        }
+        writeLedger(draft, ctx.turnId, command.opId, fingerprint, {
+          ok: true,
+          data: {
+            artifactId: plan.id,
+            kind: 'plan',
+            phase: 'awaiting_plan_approval',
+            revision: plan.body.revision,
+          },
+        });
+        return { ok: true };
+      });
+      if (!commit.ok) {
+        return { ok: false, error: commit.detail ?? commit.reason };
+      }
+      return {
+        ok: true,
+        result: {
+          artifactId: validated.value.id,
+          kind: 'plan',
+          phase: 'awaiting_plan_approval',
+          revision: validated.value.body.revision,
+        },
+      };
     }
 
     case 'ask_user': {

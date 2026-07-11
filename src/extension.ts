@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import './vscode-node-compat';
 import { AskBridge } from './bridge/ask-bridge';
 import type { Question } from './bridge/ask-bridge';
 import { PermissionBridge } from './bridge/permission-bridge';
@@ -31,8 +32,16 @@ import { TaskStore, computeAffectedTaskIds, type CommitResult } from './task/sto
 import { isTerminalLifecycle } from './task/transitions';
 import { resolveWorkspaceCwd } from './task/workspace-cwd';
 import type { TaskStoreFile } from './task/types';
+import { CommandService } from './commands/service';
+import { createEngineDomainPort } from './commands/domain-adapter';
+import { isSlashCommand } from './commands/parser';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
+
+function osHomedir(): string {
+  return os.homedir();
+}
 
 let askBridge: AskBridge | undefined;
 let permissionBridge: PermissionBridge | undefined;
@@ -41,6 +50,7 @@ let credentialRegistry: CredentialRegistry | undefined;
 let bridgeServer: MusterBridgeServer | undefined;
 let taskEngine: TaskEngine | undefined;
 let taskStore: TaskStore | undefined;
+let commandService: CommandService | undefined;
 let storePath: string | undefined;
 let workspaceRoot: string | undefined;
 let lastObservedRevision = 0;
@@ -55,7 +65,7 @@ const activePendingAsks = new Map<string, PendingAskOverlay>();
  * version is stamped on the bootstrap `snapshot` message, and a mismatch is
  * surfaced in the webview as a visible "reload the window" banner.
  */
-const PROTOCOL_VERSION = 2;
+const PROTOCOL_VERSION = 3;
 
 /** How long a permission prompt waits for a webview decision before safe-denying. */
 const PERMISSION_PROMPT_TIMEOUT_MS = 120_000;
@@ -766,6 +776,84 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     return undefined;
   }
 
+  private ensureCommandService(): CommandService | undefined {
+    if (!taskEngine || !taskStore) return undefined;
+    if (!commandService) {
+      commandService = new CommandService({
+        domain: createEngineDomainPort({
+          engine: taskEngine,
+          store: taskStore,
+          getFocusedTaskId: () => this.focusedTaskId,
+          setFocusedTaskId: (id) => {
+            this.focusedTaskId = id;
+          },
+          defaultBackend: 'claude',
+          cwd: resolveTaskCwd(),
+        }),
+        interaction: {
+          confirm: async (message) => {
+            const pick = await vscode.window.showWarningMessage(message, { modal: true }, 'Yes', 'No');
+            return pick === 'Yes';
+          },
+          choose: async (message, options) => {
+            return vscode.window.showQuickPick(options, { title: message });
+          },
+          ask: async (message) => {
+            return vscode.window.showInputBox({ prompt: message });
+          },
+          save: async (defaultName, content) => {
+            const uri = await vscode.window.showSaveDialog({
+              defaultUri: vscode.Uri.file(path.join(resolveTaskCwd() ?? osHomedir(), defaultName)),
+            });
+            if (!uri) return undefined;
+            await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
+            return uri.fsPath;
+          },
+        },
+      });
+    }
+    return commandService;
+  }
+
+  private async handleCommandText(text: string, taskId?: string): Promise<void> {
+    const svc = this.ensureCommandService();
+    if (!svc || !taskEngine || !taskStore) {
+      this.postCommandError('task engine not ready', taskId);
+      return;
+    }
+    const result = await svc.handleInput(text, {
+      focusedTaskId: taskId ?? this.focusedTaskId,
+      rootTaskId: taskId ?? this.focusedTaskId,
+    });
+    if (!result || !('ok' in result)) {
+      return;
+    }
+    if (result.ok && result.presenter === 'export' && result.data && typeof result.data === 'object') {
+      const data = result.data as { format?: string; content?: string };
+      if (typeof data.content === 'string') {
+        const ext = data.format === 'json' ? 'json' : 'md';
+        const uri = await vscode.window.showSaveDialog({
+          defaultUri: vscode.Uri.file(path.join(resolveTaskCwd() ?? osHomedir(), `muster-export.${ext}`)),
+        });
+        if (uri) {
+          await vscode.workspace.fs.writeFile(uri, Buffer.from(data.content, 'utf8'));
+          void vscode.window.showInformationMessage(`Exported to ${uri.fsPath}`);
+        }
+      }
+    }
+    this.post({
+      type: 'commandResult',
+      taskId: taskId ?? this.focusedTaskId,
+      ok: result.ok,
+      commandId: result.ok ? result.commandId : result.commandId,
+      message: result.ok ? result.message : result.error.message,
+      presenter: result.ok ? result.presenter : 'error',
+      data: result.ok ? result.data : undefined,
+      error: result.ok ? undefined : { code: result.error.code, message: result.error.message },
+    });
+    this.postSnapshot(this.focusedTaskId);
+  }
+
   private async handleSend(data: {
     taskId?: string;
     text: string;
@@ -788,6 +876,12 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     }
     if (text.length > MAX_MESSAGE_CHARS) {
       this.postCommandError('message too long', data.taskId);
+      return;
+    }
+
+    // Slash commands share the VS Code-free command core.
+    if (isSlashCommand(text)) {
+      await this.handleCommandText(text, data.taskId);
       return;
     }
 
@@ -863,6 +957,11 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       switch (data?.type) {
         case 'send':
           await this.handleSend(data);
+          break;
+        case 'runCommand':
+          if (typeof data.text === 'string') {
+            await this.handleCommandText(data.text, typeof data.taskId === 'string' ? data.taskId : undefined);
+          }
           break;
         case 'newTask':
           this.focusedTaskId = undefined;
@@ -1215,6 +1314,44 @@ export async function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand('muster.openChat', () => {
       vscode.commands.executeCommand('workbench.view.extension.muster');
+    }),
+    vscode.commands.registerCommand('muster.newChat', async () => {
+      await vscode.commands.executeCommand('workbench.view.extension.muster');
+      // Draft via command core
+      if (taskEngine && taskStore) {
+        const result = taskEngine.startNewTask({
+          goal: '(draft)',
+          backend: 'claude',
+          cwd: resolveTaskCwd(),
+          workflowMode: 'draft',
+        });
+        if (result.ok) {
+          provider['focusedTaskId'] = result.value.taskId;
+          provider['postSnapshot'](result.value.taskId);
+        }
+      }
+    }),
+    vscode.commands.registerCommand('muster.approveActivePlan', async () => {
+      await vscode.commands.executeCommand('workbench.view.extension.muster');
+      const focused = provider['focusedTaskId'] as string | undefined;
+      if (!focused || !taskEngine) {
+        void vscode.window.showWarningMessage('No focused task with a plan to approve');
+        return;
+      }
+      const result = taskEngine.approvePlan({
+        rootTaskId: focused,
+        opId: `palette-approve:${focused}:${Date.now()}`,
+      });
+      if (!result.ok) {
+        void vscode.window.showErrorMessage(result.reason);
+      } else {
+        void vscode.window.showInformationMessage(
+          result.value.alreadyMaterialized
+            ? 'Plan already approved'
+            : `Approved plan; started ${result.value.startedTurnIds.length} task(s)`,
+        );
+        provider['postSnapshot'](focused);
+      }
     }),
   );
 

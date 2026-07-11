@@ -11,6 +11,8 @@ import type {
   TaskTurn,
   TaskViewStatus,
 } from '../task/types';
+import { projectWorkflowSummaryForRoot } from '../workflow/store';
+import type { WorkflowSummary } from '../workflow/types';
 
 export interface TaskSummary {
   id: string;
@@ -36,6 +38,8 @@ export interface TaskSummary {
   updatedAt: string;
   backend: string;
   continuationOf?: string;
+  /** Safe workflow projection for root tasks (schema ≥ 4). */
+  workflow?: WorkflowSummary;
 }
 
 export interface ToolTranscriptContent {
@@ -136,7 +140,7 @@ export function projectTaskSummary(file: TaskStoreFile, taskId: string): TaskSum
   }
   const turns = turnsForTask(file, taskId);
   const deps = depLifecyclesForTask(file, task);
-  return {
+  const summary: TaskSummary = {
     id: task.id,
     parentId: task.parentId,
     goal: task.goal,
@@ -150,6 +154,13 @@ export function projectTaskSummary(file: TaskStoreFile, taskId: string): TaskSum
     backend: task.backend,
     continuationOf: task.continuationOf,
   };
+  if (task.parentId === null) {
+    const workflow = projectWorkflowSummaryForRoot(file, taskId);
+    if (workflow) {
+      summary.workflow = workflow;
+    }
+  }
+  return summary;
 }
 
 export function buildTranscript(file: TaskStoreFile, taskId: string): TranscriptItem[] {

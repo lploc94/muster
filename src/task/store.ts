@@ -4,7 +4,7 @@ import { createHash, randomBytes } from 'crypto';
 import { deriveViewStatus } from './derived-status';
 import type { MusterTask, TaskLifecycleState, TaskMessage, TaskStoreFile, TaskTurn, TaskViewStatus } from './types';
 
-export const CURRENT_SCHEMA_VERSION = 3;
+export const CURRENT_SCHEMA_VERSION = 4;
 
 export interface StoreOptions {
   filePath: string;
@@ -56,6 +56,11 @@ function emptyEnvelope(schemaVersion: number): TaskStoreFile {
   if (schemaVersion >= 3) {
     base.toolCalls = {};
     base.reasoning = {};
+  }
+  if (schemaVersion >= 4) {
+    base.workflowRuns = {};
+    base.workflowArtifacts = {};
+    base.usageRecords = {};
   }
   return base;
 }
@@ -129,6 +134,13 @@ export function migrate(file: TaskStoreFile, targetVersion: number): TaskStoreFi
       current.schemaVersion = 3;
       current.toolCalls = current.toolCalls ?? {};
       current.reasoning = current.reasoning ?? {};
+      continue;
+    }
+    if (current.schemaVersion === 3) {
+      current.schemaVersion = 4;
+      current.workflowRuns = current.workflowRuns ?? {};
+      current.workflowArtifacts = current.workflowArtifacts ?? {};
+      current.usageRecords = current.usageRecords ?? {};
       continue;
     }
     throw new Error(`No migration path from schema ${current.schemaVersion}`);
@@ -349,6 +361,38 @@ export function computeAffectedTaskIds(before: TaskStoreFile, after: TaskStoreFi
         affected.add(next.taskId);
       } else if (prev) {
         affected.add(prev.taskId);
+      }
+    }
+  }
+
+  const allWorkflowRunIds = new Set([
+    ...Object.keys(before.workflowRuns ?? {}),
+    ...Object.keys(after.workflowRuns ?? {}),
+  ]);
+  for (const id of allWorkflowRunIds) {
+    const prev = before.workflowRuns?.[id];
+    const next = after.workflowRuns?.[id];
+    if (JSON.stringify(prev) !== JSON.stringify(next)) {
+      if (next) {
+        affected.add(next.rootTaskId);
+      } else if (prev) {
+        affected.add(prev.rootTaskId);
+      }
+    }
+  }
+
+  const allArtifactIds = new Set([
+    ...Object.keys(before.workflowArtifacts ?? {}),
+    ...Object.keys(after.workflowArtifacts ?? {}),
+  ]);
+  for (const id of allArtifactIds) {
+    const prev = before.workflowArtifacts?.[id];
+    const next = after.workflowArtifacts?.[id];
+    if (JSON.stringify(prev) !== JSON.stringify(next)) {
+      if (next) {
+        affected.add(next.rootTaskId);
+      } else if (prev) {
+        affected.add(prev.rootTaskId);
       }
     }
   }

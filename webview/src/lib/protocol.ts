@@ -11,7 +11,7 @@ import type { NormalizedEvent, Question } from './types';
  * breaking change to the ExtMessage/OutMessage shapes below (and mirror it in
  * src/extension.ts).
  */
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 /**
  * Decide whether a peer's advertised protocol version is compatible with ours.
@@ -47,6 +47,20 @@ export type TaskRuntimeActivity =
  */
 export type TaskViewStatus = TaskLifecycleState | TaskRuntimeActivity;
 
+/** Safe workflow projection (schema ≥ 4 / protocol ≥ 3). */
+export interface WorkflowSummaryView {
+  workflowRunId: string;
+  rootTaskId: string;
+  phase: string;
+  planRevision: number;
+  approvalStatus?: string;
+  currentPlanTitle?: string;
+  currentPlanSummary?: string;
+  archived?: boolean;
+  updatedAt: string;
+  confidence?: string;
+}
+
 export interface TaskSummary {
   id: string;
   parentId: string | null;
@@ -63,6 +77,8 @@ export interface TaskSummary {
   updatedAt: string;
   backend: string;
   continuationOf?: string;
+  /** Root-task workflow phase/plan summary when present. */
+  workflow?: WorkflowSummaryView;
 }
 
 export interface TranscriptItem {
@@ -188,6 +204,16 @@ export type ExtMessage =
     }
   | { type: 'permissionCleared'; permissionId: string }
   | { type: 'commandError'; taskId?: string; message: string }
+  | {
+      type: 'commandResult';
+      taskId?: string;
+      ok: boolean;
+      commandId?: string;
+      message?: string;
+      presenter?: string;
+      data?: unknown;
+      error?: { code: string; message: string };
+    }
   | { type: 'filePicked'; path: string }
   | { type: 'backendsAvailable'; backends: string[] }
   | { type: 'modelsAvailable'; models: Record<string, BackendModels> };
@@ -197,6 +223,8 @@ export type AskAnswer = { selected: string[]; freeText: string | null };
 // Webview -> extension host (protocol v2)
 export type OutMessage =
   | { type: 'send'; taskId?: string; text: string; backend?: string; model?: string; continuationOf?: string }
+  /** Explicit command invoke (slash already parsed client-side; host re-parses). */
+  | { type: 'runCommand'; text: string; taskId?: string }
   | { type: 'focusTask'; taskId: string }
   | { type: 'hydrateSubtree'; taskId: string }
   | { type: 'newTask' }
@@ -471,6 +499,15 @@ export function isExtMessage(data: unknown): data is ExtMessage {
 
     case 'commandError':
       return isString(data.message) && (data.taskId === undefined || isString(data.taskId));
+
+    case 'commandResult':
+      return (
+        typeof data.ok === 'boolean' &&
+        (data.taskId === undefined || isString(data.taskId)) &&
+        (data.commandId === undefined || isString(data.commandId)) &&
+        (data.message === undefined || isString(data.message)) &&
+        (data.presenter === undefined || isString(data.presenter))
+      );
 
     case 'filePicked':
       return isString(data.path);

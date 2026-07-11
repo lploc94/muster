@@ -38,6 +38,14 @@
       {
         "command": "muster.openChat",
         "title": "Muster: Open Chat"
+      },
+      {
+        "command": "muster.newChat",
+        "title": "Muster: New Chat"
+      },
+      {
+        "command": "muster.approveActivePlan",
+        "title": "Muster: Approve Active Plan"
       }
     ],
     "configuration": {
@@ -111,7 +119,8 @@
     "check:svelte": "svelte-check --workspace webview --tsconfig ./tsconfig.json",
     "test:source-boundary": "node scripts/source-boundary-smoke.mjs",
     "test:evidence": "node --test scripts/verify-verification-evidence.test.mjs",
-    "test:source-boundary:fixtures": "node --test scripts/source-boundary-smoke.test.mjs"
+    "test:source-boundary:fixtures": "node --test scripts/source-boundary-smoke.test.mjs",
+    "cli": "tsx src/cli/main.ts"
   },
   "devDependencies": {
     "@playwright/test": "^1.61.1",
@@ -136,6 +145,7 @@
     "dompurify": "^3.4.11",
     "github-markdown-css": "^5.9.0",
     "highlight.js": "^11.11.1",
-    "marked": "^15.0.12"
+    "marked": "^15.0.12",
+    "zod": "3.25.76"
   }
 }

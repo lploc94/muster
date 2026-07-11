@@ -22,7 +22,9 @@ export type ToolCommand =
   | { kind: 'complete_task'; opId: string; result: string }
   | { kind: 'fail_task'; opId: string; error: string }
   | { kind: 'report_progress'; opId: string; note: string }
-  | { kind: 'ask_user'; opId: string; questions: Question[] };
+  | { kind: 'ask_user'; opId: string; questions: Question[] }
+  | { kind: 'submit_decision_brief'; opId: string; artifact: unknown }
+  | { kind: 'submit_plan_artifact'; opId: string; artifact: unknown };
 
 const MUTATING_TOOLS: ReadonlySet<string> = new Set([
   'create_task',
@@ -35,6 +37,8 @@ const MUTATING_TOOLS: ReadonlySet<string> = new Set([
   'fail_task',
   'report_progress',
   'ask_user',
+  'submit_decision_brief',
+  'submit_plan_artifact',
 ]);
 
 function toolActionForName(name: string): ToolAction | undefined {
@@ -50,6 +54,8 @@ function toolActionForName(name: string): ToolAction | undefined {
     'fail_task',
     'report_progress',
     'ask_user',
+    'submit_decision_brief',
+    'submit_plan_artifact',
   ];
   return actions.find((a) => a === name);
 }
@@ -263,6 +269,24 @@ export function dispatch(
         return {
           ok: true,
           command: { kind: 'ask_user', opId, questions },
+        };
+      }
+      case 'submit_decision_brief': {
+        if (!('artifact' in args)) {
+          return { ok: false, toolError: 'artifact is required' };
+        }
+        return {
+          ok: true,
+          command: { kind: 'submit_decision_brief', opId, artifact: args.artifact },
+        };
+      }
+      case 'submit_plan_artifact': {
+        if (!('artifact' in args)) {
+          return { ok: false, toolError: 'artifact is required' };
+        }
+        return {
+          ok: true,
+          command: { kind: 'submit_plan_artifact', opId, artifact: args.artifact },
         };
       }
       default:

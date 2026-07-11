@@ -2,6 +2,8 @@
   import ChatThread from './ChatThread.svelte';
   import Composer from './Composer.svelte';
   import AskCard from './AskCard.svelte';
+  import PlanCard from './PlanCard.svelte';
+  import WorkflowStatus from './WorkflowStatus.svelte';
   import { tasks } from '../lib/tasks.svelte';
   import { threadStore } from '../lib/thread.svelte';
   import { effectiveRuntimeActivity, post } from '../lib/protocol';
@@ -272,6 +274,13 @@
         {/if}
       </div>
     </div>
+
+    {#if focused?.workflow}
+      <div class="px-3 pt-2">
+        <WorkflowStatus workflow={focused.workflow} />
+        <PlanCard workflow={focused.workflow} taskId={focused.id} />
+      </div>
+    {/if}
 
     <ChatThread />
 

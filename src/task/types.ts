@@ -1,3 +1,9 @@
+import type {
+  UsageRecord as WorkflowUsageRecord,
+  WorkflowArtifactRecord,
+  WorkflowRun,
+} from '../workflow/types';
+
 // Tasks (§4.1)
 export type TaskRole = 'coordinator' | 'worker';
 export type TaskLifecycleState = 'open' | 'succeeded' | 'failed' | 'cancelled' | 'skipped';
@@ -184,6 +190,12 @@ export interface TaskStoreFile {
   toolCalls?: Record<string, PersistedToolCall>;
   /** Persisted reasoning, keyed by turnId (schema ≥ 3). */
   reasoning?: Record<string, PersistedReasoning>;
+  /** Root-owned workflow runs (schema ≥ 4). */
+  workflowRuns?: Record<string, WorkflowRun>;
+  /** Structured workflow artifacts (schema ≥ 4). */
+  workflowArtifacts?: Record<string, WorkflowArtifactRecord>;
+  /** Normalized usage records (schema ≥ 4). */
+  usageRecords?: Record<string, WorkflowUsageRecord>;
 }
 
 /**
