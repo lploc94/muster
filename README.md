@@ -29,6 +29,7 @@ Open-source VS Code extension that **coordinates** multiple AI coding CLIs from 
 | MCP via `mcpServers` (context + Bridge) | ✅ |
 | MCP `ask_user` (Muster Bridge) | ✅ — [design](docs/MUSTER-BRIDGE.md) |
 | Reload recovery UI (Retry / Continue / Resume) | ✅ |
+| Read-only presentation tabs | ✅ — [review and revision guide](docs/WEBVIEW.md) |
 
 ## Prerequisites
 
@@ -91,6 +92,7 @@ Dev-only file IPC proof — production design uses [Muster Bridge](docs/MUSTER-B
 | [docs/SESSION-MANAGEMENT.md](docs/SESSION-MANAGEMENT.md) | Session IDs & resume |
 | [docs/TASK-MANAGEMENT.md](docs/TASK-MANAGEMENT.md) | Task/turn model & TaskEngine |
 | [docs/SETTINGS.md](docs/SETTINGS.md) | Host-backed Settings pattern |
+| [docs/WEBVIEW.md](docs/WEBVIEW.md) | Chat UI and read-only presentation review, revision, and diagnostics |
 
 Full index: [docs/README.md](docs/README.md).
 

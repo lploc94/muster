@@ -107,6 +107,14 @@ async function expectPostedMessage(page: Page, expected: unknown) {
   await expect.poll(async () => postedMessages(page)).toContainEqual(expected);
 }
 
+async function dispatchFileDrag(page: Page, type: 'dragover' | 'drop', mime: string, value: string) {
+  await page.locator('.composer-shell').evaluate((element, args) => {
+    const transfer = new DataTransfer();
+    transfer.setData(args.mime, args.value);
+    element.dispatchEvent(new DragEvent(args.type, { bubbles: true, cancelable: true, dataTransfer: transfer }));
+  }, { type, mime, value });
+}
+
 async function expectButtonDisabledAttribute(page: Page, name: string) {
   await expect
     .poll(() => page.getByRole('button', { name }).evaluate((button) => button.hasAttribute('disabled')))
@@ -232,6 +240,64 @@ test.describe('Muster webview host state smoke', () => {
       text: 'Review @src/extension.ts',
       backend: 'claude',
     });
+  });
+
+  test('inserts picked files at the caret and preserves surrounding draft text', async ({ page }) => {
+    await openWebview(page);
+    await postSnapshot(page, { type: 'snapshot', rootTasks: [], storeRevision: 2 });
+    await page.getByRole('button', { name: 'New task' }).first().click();
+
+    const composer = page.getByPlaceholder('Start a new coordinator task with claude…');
+    await composer.fill('Review before after');
+    await composer.evaluate((el: HTMLTextAreaElement) => el.setSelectionRange(7, 7));
+    await postRawHostMessage(page, { type: 'filePicked', path: 'docs/my file.md' });
+
+    await expect(composer).toHaveValue('Review @"docs/my file.md" before after');
+    await expect(composer).toBeFocused();
+    await expect.poll(() => composer.evaluate((el: HTMLTextAreaElement) => el.selectionStart)).toBe(26);
+  });
+
+  test('drops a file through the host contract and projects sanitized failures without changing the draft', async ({ page }) => {
+    await openWebview(page);
+    await postSnapshot(page, { type: 'snapshot', rootTasks: [], storeRevision: 2 });
+    await page.getByRole('button', { name: 'New task' }).first().click();
+
+    const composer = page.getByPlaceholder('Start a new coordinator task with claude…');
+    const shell = page.locator('.composer-shell');
+    await composer.fill('Use this');
+    await composer.evaluate((el: HTMLTextAreaElement) => el.setSelectionRange(3, 3));
+
+    await dispatchFileDrag(page, 'dragover', 'text/uri-list', 'file:///workspace/docs/my%20file.md');
+    await expect(shell).toHaveClass(/composer-shell--dragging/);
+    await expect(page.getByRole('status').getByText('Drop file to mention it')).toBeVisible();
+    await dispatchFileDrag(page, 'drop', 'text/uri-list', 'file:///workspace/docs/my%20file.md');
+    await expectPostedMessage(page, { type: 'resolveFileDrop', candidates: ['file:///workspace/docs/my%20file.md'] });
+    await expect(shell).not.toHaveClass(/composer-shell--dragging/);
+
+    await postRawHostMessage(page, { type: 'filePicked', path: 'docs/my file.md' });
+    await expect(composer).toHaveValue('Use @"docs/my file.md" this');
+
+    await composer.fill('Keep draft');
+    await dispatchFileDrag(page, 'dragover', 'text/plain', 'outside.txt');
+    await dispatchFileDrag(page, 'drop', 'text/plain', 'outside.txt');
+    await postCommandError(page, { type: 'commandError', message: 'Drop a file from the current workspace.' });
+    await expect(page.getByText('Drop a file from the current workspace.')).toBeVisible();
+    await expect(composer).toHaveValue('Keep draft');
+    await expect(shell).not.toHaveClass(/composer-shell--dragging/);
+  });
+
+  test('ignores file drops while the composer is disabled', async ({ page }) => {
+    await openWebview(page);
+    await postSnapshot(page, {
+      type: 'snapshot', rootTasks: [task({ viewStatus: 'running' })], focusedTaskId: 'task-root',
+      subtree: [task({ viewStatus: 'running' })], activeTurnId: 'turn-running', storeRevision: 3,
+    });
+    const shell = page.locator('.composer-shell');
+    const before = await postedMessages(page);
+    await dispatchFileDrag(page, 'dragover', 'text/plain', 'src/a.ts');
+    await dispatchFileDrag(page, 'drop', 'text/plain', 'src/a.ts');
+    await expect(shell).not.toHaveClass(/composer-shell--dragging/);
+    expect(await postedMessages(page)).toEqual(before);
   });
 
   test('Add Context menu browses workspace files through the shared filePicked mention flow', async ({ page }) => {

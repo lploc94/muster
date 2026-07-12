@@ -15,9 +15,16 @@ describe('capabilitiesFor', () => {
     expect(caps.has('interrupt_task')).toBe(false);
   });
 
+  it('grants presentation upserts to coordinators by role', () => {
+    const caps = capabilitiesFor({ role: 'coordinator', capabilities: [] });
+
+    expect(caps.has('upsert_presentation')).toBe(true);
+  });
+
   it('grants only any-task actions to workers', () => {
     const caps = capabilitiesFor({ role: 'worker', capabilities: ['create_child'] });
     expect(caps.has('create_task')).toBe(false);
+    expect(caps.has('upsert_presentation')).toBe(false);
     expect(caps.has('complete_task')).toBe(true);
     expect(caps.has('ask_user')).toBe(true);
   });

@@ -325,7 +325,7 @@ body {
 }
 
 .composer-shell--dragging::after {
-  content: 'Drop file to mention it';
+  content: '';
   position: absolute;
   inset: 4px;
   display: flex;
@@ -336,6 +336,14 @@ body {
   background: color-mix(in srgb, var(--vscode-editor-background) 72%, transparent);
   pointer-events: none;
   font-size: 12px;
+}
+
+.composer-drop-status {
+  position: relative;
+  z-index: 1;
+  color: var(--vscode-foreground);
+  font-weight: 600;
+  text-align: center;
 }
 
 .composer-guidance {
@@ -890,6 +898,114 @@ body {
 /* When we switch from streaming to final markdown, try to reduce flash */
 .markdown-content {
   transition: none;
+}
+
+/* Dedicated editor-column presentation surface. */
+.presentation-body {
+  overflow: auto;
+}
+
+.presentation-shell {
+  width: min(100%, 960px);
+  min-height: 100%;
+  margin: 0 auto;
+  box-sizing: border-box;
+  padding: 0 32px 48px;
+}
+
+.presentation-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 24px 0 16px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-editor-background);
+}
+
+.presentation-header h1 {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 1.65rem;
+  line-height: 1.25;
+}
+
+.presentation-header span {
+  flex: none;
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.presentation-content {
+  box-sizing: border-box;
+  max-width: none;
+  padding: 28px 0;
+  overflow-wrap: anywhere;
+}
+
+.presentation-content table,
+.presentation-content pre {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.mermaid-diagram {
+  max-width: 100%;
+  margin: 1rem 0;
+  overflow-x: auto;
+}
+
+.mermaid-diagram svg {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  height: auto;
+  margin-inline: auto;
+}
+
+.mermaid-diagram[data-mermaid-state="fallback"] {
+  padding: 12px;
+  border: 1px solid var(--vscode-inputValidation-warningBorder, var(--vscode-panel-border));
+  border-radius: 6px;
+  background: var(--vscode-inputValidation-warningBackground, transparent);
+}
+
+.mermaid-fallback__reason {
+  margin: 0 0 8px;
+  color: var(--vscode-descriptionForeground);
+  font-weight: 600;
+}
+
+.mermaid-diagram .mermaid-fallback__source {
+  margin: 0;
+  white-space: pre;
+}
+
+.presentation-empty {
+  display: grid;
+  min-height: 100%;
+  place-items: center;
+  box-sizing: border-box;
+  padding: 32px;
+  color: var(--vscode-descriptionForeground);
+  text-align: center;
+}
+
+@media (max-width: 640px) {
+  .presentation-shell {
+    padding-inline: 16px;
+  }
+
+  .presentation-header {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 6px;
+  }
 }
 
 /* 

@@ -16,30 +16,11 @@ import {
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { askIdPattern, sanitizeAskId } from './ask-id.mjs';
+
+export { sanitizeAskId } from './ask-id.mjs';
 
 const POLL_MS = 200;
-
-// The ask `id` is agent-controlled and is interpolated directly into on-disk
-// paths for BOTH the pending write (`pending/<id>.json`) and the answer read
-// (`answers/<id>.json`, whose contents are returned to the agent). Without
-// validation an id like `../../../home/user/.ssh/foo` yields arbitrary-file
-// write and arbitrary-file read (info disclosure). Restrict to a strict
-// allowlist and additionally reject the `.`/`..` traversal names, which the
-// character class alone would otherwise permit.
-const ASK_ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
-
-/**
- * Validate an agent-supplied ask id, returning it unchanged when safe.
- * @param {unknown} id
- * @returns {string}
- * @throws {Error} when the id could escape the pending/answers directories.
- */
-export function sanitizeAskId(id) {
-  if (typeof id !== 'string' || !ASK_ID_PATTERN.test(id) || id === '.' || id === '..') {
-    throw new Error(`Invalid ask id: ${JSON.stringify(id)}`);
-  }
-  return id;
-}
 
 function waitForAnswer(answersDir, id, timeoutMs) {
   const answerPath = path.join(answersDir, `${id}.json`);
@@ -97,7 +78,7 @@ async function main() {
             id: {
               type: 'string',
               description: 'Optional ask id (letters, digits, dot, dash, underscore; max 128 chars)',
-              pattern: ASK_ID_PATTERN.source,
+              pattern: askIdPattern.source,
               maxLength: 128,
             },
             questions: {

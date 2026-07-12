@@ -196,8 +196,25 @@ describe('settings protocol guard', () => {
   });
 });
 
+describe('file drop outbound protocol', () => {
+  it('posts the bounded candidate payload without file contents or metadata', () => {
+    const message: OutMessage = {
+      type: 'resolveFileDrop',
+      candidates: ['file:///workspace/a%20b.ts'],
+    };
+
+    post(message);
+
+    expect(vscode.postMessage).toHaveBeenCalledWith({
+      type: 'resolveFileDrop',
+      candidates: ['file:///workspace/a%20b.ts'],
+    });
+  });
+});
+
 describe('settings outbound protocol', () => {
   it('posts explicit request and update messages to the extension host', () => {
+    vi.mocked(vscode.postMessage).mockClear();
     const messages: OutMessage[] = [
       { type: 'requestSettings' },
       { type: 'updateSetting', settingId: 'maxTurnsPerTask', value: 25 },

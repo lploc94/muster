@@ -14,7 +14,11 @@ Read in this order when onboarding:
 | [TASK-MANAGEMENT.md](TASK-MANAGEMENT.md) | Task/turn domain model, coordinator protocol, TaskEngine lifecycle |
 | [MCP-INJECTION.md](MCP-INJECTION.md) | `context_engine` + `coordinator` MCP per turn |
 | [MUSTER-BRIDGE.md](MUSTER-BRIDGE.md) | MCP `ask_user`, AskBridge, tool catalog |
-| [WEBVIEW.md](WEBVIEW.md) | Chat UI — Svelte, Vite, Tailwind, vscode-elements, postMessage protocol |
+| [WEBVIEW.md](WEBVIEW.md) | Chat UI, workspace file-drop mention contract, read-only presentation review, lifecycle, and diagnostics |
 | [SETTINGS.md](SETTINGS.md) | Host-backed Settings pattern for feature configuration |
+
+Operational evidence:
+
+- [File-drop live-host evidence](uat/m007-s02/file-drop-live-host-evidence.md) — scenario-local Extension Development Host verdicts and proof boundary.
 
 All docs are living — update when CLI versions or spikes change behavior.

@@ -46,9 +46,13 @@ describe('buildTurnMcp', () => {
     expect(path.basename(dir).startsWith('muster-mcp-')).toBe(true);
     expect(path.basename(filePath)).toMatch(/^[0-9a-f]{32}\.json$/);
 
-    // The private directory is owner-only (0o700) and the token file is 0o600.
-    expect(fs.statSync(dir).mode & 0o777).toBe(0o700);
-    expect(fs.statSync(filePath).mode & 0o777).toBe(0o600);
+    // POSIX exposes owner-only mode bits. Windows does not preserve chmod-style
+    // permissions in stat(), so its security contract is covered by the
+    // unpredictable path and exclusive-creation assertions below.
+    if (process.platform !== 'win32') {
+      expect(fs.statSync(dir).mode & 0o777).toBe(0o700);
+      expect(fs.statSync(filePath).mode & 0o777).toBe(0o600);
+    }
 
     // Exclusive creation: re-opening the exact path with O_EXCL must fail
     // (EEXIST), proving a pre-existing path/symlink can't be silently

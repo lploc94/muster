@@ -21,6 +21,7 @@
   import type { WebviewBackendId } from '../lib/tasks.svelte';
   import { BACKENDS, backendShortLabel } from '../lib/backends';
   import { tip } from '../lib/tooltip';
+  import { extractFileDropCandidates } from '../lib/file-drop';
 
   interface Props {
     mode: 'draft' | 'task';
@@ -71,7 +72,13 @@
     cliStatus === 'stopped' && cliLastExit ? CLI_LAST_EXIT_LABELS[cliLastExit] : null,
   );
 
-  let textareaEl = $state<(HTMLElement & { value: string }) | undefined>(undefined);
+  type ComposerTextarea = HTMLElement & { value: string };
+
+  function nativeTextarea(): HTMLTextAreaElement | null {
+    return textareaEl?.shadowRoot?.querySelector('textarea') ?? null;
+  }
+
+  let textareaEl = $state<ComposerTextarea | undefined>(undefined);
   let backendSelect = $state<(HTMLElement & { value: string }) | undefined>(undefined);
   let addContextMenuRegion = $state<HTMLElement | undefined>(undefined);
   let isDraggingFile = $state(false);
@@ -194,10 +201,20 @@
     if (!mention) return;
 
     const current = textareaEl.value ?? '';
-    const needsLeadingSpace = current.length > 0 && !/\s$/.test(current);
-    const next = `${current}${needsLeadingSpace ? ' ' : ''}${mention} `;
-    textareaEl.value = next;
-    textareaEl.focus?.();
+    const native = nativeTextarea();
+    const start = native?.selectionStart ?? current.length;
+    const end = native?.selectionEnd ?? start;
+    const before = current.slice(0, start);
+    const after = current.slice(end);
+    const leading = before.length > 0 && !/\s$/.test(before) ? ' ' : '';
+    const trailing = after.length === 0 || !/^\s/.test(after) ? ' ' : '';
+    const insertion = `${leading}${mention}${trailing}`;
+    textareaEl.value = `${before}${insertion}${after}`;
+    const caret = start + insertion.length;
+    queueMicrotask(() => {
+      textareaEl?.focus?.();
+      nativeTextarea()?.setSelectionRange(caret, caret);
+    });
   }
 
   function closeAddContextMenu() {
@@ -215,20 +232,6 @@
     if (!hostMessage) return;
     closeAddContextMenu();
     post(hostMessage);
-  }
-
-  function dragCandidates(dataTransfer: DataTransfer): string[] {
-    const candidates: string[] = [];
-    for (const file of Array.from(dataTransfer.files ?? [])) {
-      const path = (file as File & { path?: string }).path;
-      if (typeof path === 'string' && path) candidates.push(path);
-      if (file.name) candidates.push(file.name);
-    }
-    for (const type of dataTransfer.types ?? []) {
-      const value = dataTransfer.getData(type);
-      if (value) candidates.push(value);
-    }
-    return candidates;
   }
 
   function onDragOver(e: DragEvent) {
@@ -249,12 +252,12 @@
   }
 
   function onDrop(e: DragEvent) {
+    isDraggingFile = false;
     if (!canSend || !e.dataTransfer) return;
     e.preventDefault();
-    isDraggingFile = false;
-    const candidates = dragCandidates(e.dataTransfer);
-    if (candidates.length > 0) {
-      post({ type: 'resolveFileDrop', candidates });
+    const extraction = extractFileDropCandidates(e.dataTransfer, canSend);
+    if (extraction.ok) {
+      post({ type: 'resolveFileDrop', candidates: extraction.candidates });
     }
   }
 
@@ -432,6 +435,10 @@
         {cliExitHint ?? cliPresentation.hint}
       </span>
     </div>
+  {/if}
+
+  {#if isDraggingFile}
+    <div class="composer-drop-status" role="status" aria-live="polite">Drop file to mention it</div>
   {/if}
 
   {#if disabledReason}
