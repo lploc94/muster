@@ -8,7 +8,6 @@
   import {
     getLifecyclePresentation,
     getTaskPresentation,
-    isHardTerminal,
   } from '../lib/task-status';
   import type { PendingAsk, TaskLifecycleState } from '../lib/protocol';
   import { tip } from '../lib/tooltip';
@@ -55,9 +54,18 @@
         { lifecycle: 'cancelled', label: 'Cancel task', description: 'Cancel this task and children' },
         { lifecycle: 'skipped', label: 'Skip', description: 'Won’t perform' },
       );
+    } else if (
+      current === 'succeeded' ||
+      current === 'cancelled' ||
+      current === 'skipped'
+    ) {
+      // Hard terminal: reopen same task id, or user creates a new task separately.
+      actions.push({
+        lifecycle: 'open',
+        label: 'Reopen',
+        description: 'Open this task again and continue on the same id',
+      });
     }
-    // Hard terminal (succeeded/cancelled/skipped): no lifecycle menu actions —
-    // further work uses Continue as new task, not reopen-on-same-id.
     return actions;
   });
 
@@ -92,8 +100,14 @@
       (runtime === 'queued' || runtime === 'waiting_dependencies'),
   );
   const showRecovery = $derived(focused?.lifecycle === 'open' && runtime === 'needs_recovery');
-  const showContinueAsNew = $derived(!!focused && isHardTerminal(focused.lifecycle));
-  const showSoftFailHint = $derived(focused?.lifecycle === 'failed');
+  /** Sealed task: composer stays enabled; hint that send (or Reopen) restores open. */
+  const showTerminalReopenHint = $derived(
+    !!focused &&
+      (focused.lifecycle === 'failed' ||
+        focused.lifecycle === 'succeeded' ||
+        focused.lifecycle === 'cancelled' ||
+        focused.lifecycle === 'skipped'),
+  );
   const hasRetryableTurn = $derived(!!activeTurnId);
   const composerReadOnly = $derived(
     !!focused &&
@@ -124,12 +138,6 @@
     continueMessage = '';
   }
 
-  function continueAsNewTask(): void {
-    if (!focused) return;
-    tasks.openContinuationDraft(focused.id);
-    post({ type: 'newTask' });
-  }
-
   function shortGoal(goal: string): string {
     const trimmed = goal.trim();
     return trimmed || '(no goal)';
@@ -148,7 +156,7 @@
     <div class="task-workspace-banner task-workspace-banner--neutral" data-task-status="draft">
       <div class="min-w-0 flex-1">
         <div class="font-semibold text-sm">
-          {tasks.continuationOf ? 'Continue as new task' : 'New task'}
+          New task
         </div>
         <div class="task-workspace-detail" style="margin-top: 2px;">
           First message creates the coordinator task.
@@ -345,16 +353,15 @@
       </div>
     {/if}
 
-    {#if showSoftFailHint}
-      <div class="task-action-panel task-action-panel--danger">
+    {#if showTerminalReopenHint}
+      <div
+        class={`task-action-panel ${
+          focused.lifecycle === 'failed' ? 'task-action-panel--danger' : 'task-action-panel--warning'
+        }`}
+        role="status"
+      >
         <span>{presentation.composerGuidance}</span>
-      </div>
-    {/if}
-
-    {#if showContinueAsNew}
-      <div class="task-action-panel task-action-panel--muted">
-        <span>{presentation.composerGuidance}</span>
-        <vscode-button secondary onclick={continueAsNewTask}>Continue as new task</vscode-button>
+        <vscode-button secondary onclick={() => setLifecycle('open')}>Reopen</vscode-button>
       </div>
     {/if}
 

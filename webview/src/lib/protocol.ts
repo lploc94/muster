@@ -188,7 +188,8 @@ export type ExtMessage =
     }
   | { type: 'permissionCleared'; permissionId: string }
   | { type: 'commandError'; taskId?: string; message: string }
-  | { type: 'filePicked'; path: string }
+  /** `path` = resolve target for LLM; optional `displayName` = short chip label. */
+  | { type: 'filePicked'; path: string; displayName?: string }
   | { type: 'backendsAvailable'; backends: string[] }
   | { type: 'modelsAvailable'; models: Record<string, BackendModels> };
 
@@ -196,7 +197,17 @@ export type AskAnswer = { selected: string[]; freeText: string | null };
 
 // Webview -> extension host (protocol v2)
 export type OutMessage =
-  | { type: 'send'; taskId?: string; text: string; backend?: string; model?: string; continuationOf?: string }
+  | {
+      type: 'send';
+      taskId?: string;
+      /** User-visible text (display-name mentions). */
+      text: string;
+      /** Agent-facing text when mentions expand to full paths. */
+      llmText?: string;
+      backend?: string;
+      model?: string;
+      continuationOf?: string;
+    }
   | { type: 'focusTask'; taskId: string }
   | { type: 'hydrateSubtree'; taskId: string }
   | { type: 'newTask' }
@@ -211,6 +222,11 @@ export type OutMessage =
   | { type: 'pickFile' }
   | { type: 'browseWorkspaceFiles' }
   | { type: 'resolveFileDrop'; candidates: string[] }
+  /**
+   * When the webview has file bytes but no filesystem path (Finder → sandboxed
+   * webview), host writes a temp copy and replies with `filePicked` absolute path.
+   */
+  | { type: 'importDroppedFile'; name: string; data: ArrayBuffer }
   | { type: 'openLink'; url: string }
   | { type: 'clearHistory' }
   | { type: 'deleteTask'; taskId: string }
@@ -473,7 +489,7 @@ export function isExtMessage(data: unknown): data is ExtMessage {
       return isString(data.message) && (data.taskId === undefined || isString(data.taskId));
 
     case 'filePicked':
-      return isString(data.path);
+      return isString(data.path) && (data.displayName === undefined || isString(data.displayName));
 
     case 'backendsAvailable':
       return Array.isArray(data.backends) && data.backends.every(isString);
@@ -491,12 +507,12 @@ export function isTerminalStatus(status: TaskViewStatus | string): boolean {
   return status === 'succeeded' || status === 'failed' || status === 'cancelled' || status === 'skipped';
 }
 
-/** Hard terminal: thread read-only; follow-up is a new task. */
+/** Hard terminal: sealed success/cancel/skip (user may reopen same id). */
 export function isHardTerminalLifecycle(lifecycle: string): boolean {
   return lifecycle === 'succeeded' || lifecycle === 'cancelled' || lifecycle === 'skipped';
 }
 
-/** Soft terminal: same task may reopen on send. */
+/** Soft terminal: sealed fail (user may reopen same id, same as hard). */
 export function isSoftTerminalLifecycle(lifecycle: string): boolean {
   return lifecycle === 'failed';
 }

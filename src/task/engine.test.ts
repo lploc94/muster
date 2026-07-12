@@ -334,7 +334,7 @@ describe('TaskEngine', () => {
     expect(store.getTask('task-1')?.committedSessionId).toBeUndefined();
   });
 
-  it('keeps send pending while running and rejects terminal send', async () => {
+  it('keeps send pending while running and continues after agent complete proposal', async () => {
     const { store } = makeTempStore();
     let release: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {
@@ -373,6 +373,31 @@ describe('TaskEngine', () => {
     // Follow-up clears the proposal and keeps the same open task (session resume on next turn).
     expect(store.getTask('task-1')?.outcomeProposal).toBeUndefined();
     expect(store.getTask('task-1')?.lifecycle).toBe('open');
+  });
+
+  it('reopens hard-terminal tasks on send (same task id)', async () => {
+    const { store } = makeTempStore();
+    const backend: Backend = {
+      name: 'fake',
+      capabilities: MCP_CAPS,
+      async *run() {
+        yield { type: 'sessionStarted', sessionId: 'sess-reopen' };
+        yield { type: 'turnCompleted' };
+      },
+    };
+    const engine = TaskEngine.load({ store, makeBackend: () => backend });
+    engine.createTask({ id: 'task-1', goal: 'done work', backend: 'fake' });
+    expect(engine.setTaskLifecycle('task-1', 'succeeded', { result: 'shipped' }).ok).toBe(true);
+    expect(store.getTask('task-1')?.lifecycle).toBe('succeeded');
+
+    const sent = engine.send('task-1', 'actually more work');
+    expect(sent.ok).toBe(true);
+    expect(store.getTask('task-1')?.lifecycle).toBe('open');
+    expect(store.getTask('task-1')?.finishedAt).toBeUndefined();
+    if (sent.ok) {
+      expect(store.getFile().messages[sent.value.messageId]?.taskId).toBe('task-1');
+    }
+    await engine.whenIdle();
   });
 
   it('leaves reload running turns untouched when a live lease exists', async () => {

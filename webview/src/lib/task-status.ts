@@ -78,7 +78,8 @@ export const LIFECYCLE_PRESENTATIONS = {
     listCopy: 'Marked complete',
     workspaceHeadline: 'Task succeeded',
     workspaceDetail: 'An authorized actor sealed this task as successfully completed.',
-    composerGuidance: 'This task is closed; use Continue as new task for follow-up work.',
+    composerGuidance:
+      'This task is succeeded. Sending a new message will reopen it (same task). Or create a new task instead.',
   },
   failed: {
     key: 'failed',
@@ -88,7 +89,8 @@ export const LIFECYCLE_PRESENTATIONS = {
     workspaceHeadline: 'Task failed',
     workspaceDetail:
       'This attempt was sealed as unsuccessful. Send a message to reopen the same task, or start a new one.',
-    composerGuidance: 'Send a message to reopen this task and continue, or create a new task.',
+    composerGuidance:
+      'This task is failed. Sending a new message will reopen it (same task). Or create a new task instead.',
   },
   cancelled: {
     key: 'cancelled',
@@ -97,7 +99,8 @@ export const LIFECYCLE_PRESENTATIONS = {
     listCopy: 'Cancelled',
     workspaceHeadline: 'Task cancelled',
     workspaceDetail: 'The task was cancelled before it finished (including cascaded cancels).',
-    composerGuidance: 'This task is closed; use Continue as new task for related work.',
+    composerGuidance:
+      'This task is cancelled. Sending a new message will reopen it (same task). Or create a new task instead.',
   },
   skipped: {
     key: 'skipped',
@@ -106,7 +109,8 @@ export const LIFECYCLE_PRESENTATIONS = {
     listCopy: 'Won’t perform',
     workspaceHeadline: 'Task skipped',
     workspaceDetail: 'This task was created but deliberately marked as will not be performed.',
-    composerGuidance: 'This task is closed; create a new task if you want to do this work later.',
+    composerGuidance:
+      'This task is skipped. Sending a new message will reopen it (same task). Or create a new task instead.',
   },
 } as const satisfies Record<TaskLifecycleState, StatusAxisPresentation>;
 

@@ -58,19 +58,39 @@ export function isTerminalLifecycle(state: TaskLifecycleState): boolean {
   return TERMINAL_LIFECYCLES.has(state);
 }
 
-/** Hard terminal: read-only; further work is a new/continuation task. */
+/** Hard terminal: sealed success/cancel/skip (distinct from soft-failed). */
 export function isHardTerminalLifecycle(state: TaskLifecycleState): boolean {
   return HARD_TERMINAL_LIFECYCLES.has(state);
 }
 
-/** Soft terminal (`failed`): same task may reopen on a new user message. */
+/** Soft terminal (`failed`): sealed unsuccessful attempt. */
 export function isSoftTerminalLifecycle(state: TaskLifecycleState): boolean {
   return state === 'failed';
 }
 
 /**
- * Reopen a soft-failed task to `open` so the user can continue on the same id.
+ * Reopen any terminal task to `open` so the user can continue on the same id.
+ * Follow-up is reopen-or-new-task — not a separate continuation task id.
  */
+export function reopenTask(
+  task: MusterTask,
+  options: { now: string },
+): TransitionResult<MusterTask> {
+  if (!isTerminalLifecycle(task.lifecycle)) {
+    return { ok: false, reason: 'task is not terminal' };
+  }
+  return {
+    ok: true,
+    next: bumpTask(task, options.now, {
+      lifecycle: 'open',
+      finishedAt: undefined,
+      outcomeProposal: undefined,
+    }),
+    effects: [{ kind: 'emitUpdate' }],
+  };
+}
+
+/** @deprecated Prefer reopenTask — soft and hard terminals both reopen on the same id. */
 export function reopenSoftFailedTask(
   task: MusterTask,
   options: { now: string },
@@ -78,14 +98,7 @@ export function reopenSoftFailedTask(
   if (task.lifecycle !== 'failed') {
     return { ok: false, reason: 'task is not soft-failed' };
   }
-  return {
-    ok: true,
-    next: bumpTask(task, options.now, {
-      lifecycle: 'open',
-      finishedAt: undefined,
-    }),
-    effects: [{ kind: 'emitUpdate' }],
-  };
+  return reopenTask(task, options);
 }
 
 export function isTerminalTurn(status: TurnStatus): boolean {
@@ -501,19 +514,11 @@ export function setTaskLifecycle(
   }
 
   if (lifecycle === 'open') {
-    // Soft-fail reopen only. Hard terminals require a new/continuation task.
-    if (task.lifecycle !== 'failed') {
-      return { ok: false, reason: 'only soft-failed tasks may reopen to open' };
+    // Any terminal lifecycle may reopen on the same task id (user choice).
+    if (!isTerminalLifecycle(task.lifecycle)) {
+      return { ok: false, reason: 'only terminal tasks may reopen to open' };
     }
-    return {
-      ok: true,
-      next: bumpTask(task, options.now, {
-        lifecycle: 'open',
-        finishedAt: undefined,
-        outcomeProposal: undefined,
-      }),
-      effects: [{ kind: 'emitUpdate' }],
-    };
+    return reopenTask(task, { now: options.now });
   }
 
   if (lifecycle === 'succeeded') {

@@ -29,12 +29,35 @@ describe('dropped file mention resolver', () => {
     await expect(resolveDroppedFileMention(candidates, services())).resolves.toEqual({ ok: true, path: expected });
   });
 
+  it('accepts absolute paths outside the workspace', async () => {
+    await expect(
+      resolveDroppedFileMention(['/Users/me/Desktop/notes.md'], services()),
+    ).resolves.toEqual({ ok: true, path: '/Users/me/Desktop/notes.md' });
+  });
+
+  it('collapses alternate encodings of the same file into one mention', async () => {
+    await expect(
+      resolveDroppedFileMention(
+        ['file:///workspace/src/a.ts', '/workspace/src/a.ts', 'src/a.ts'],
+        services(),
+      ),
+    ).resolves.toEqual({ ok: true, path: 'src/a.ts' });
+  });
+
+  it('still mentions a path when stat fails (sandbox / missing file)', async () => {
+    await expect(
+      resolveDroppedFileMention(
+        ['/workspace/missing.ts'],
+        services(vi.fn().mockRejectedValue(new Error('ENOENT'))),
+      ),
+    ).resolves.toEqual({ ok: true, path: 'missing.ts' });
+  });
+
   it.each([
     [null, 'invalidPayload'],
     [Array(17).fill('a'), 'tooManyCandidates'],
-    [['a', 'b'], 'multipleFiles'],
+    [['src/a.ts', 'src/b.ts'], 'multipleFiles'],
     [['https://example.test/a'], 'unsupportedScheme'],
-    [['/outside/private.txt'], 'outsideWorkspace'],
     [['bad\0path'], 'malformedCandidate'],
     [[`#${'x'.repeat(5000)}\n/workspace/a.ts`], 'malformedCandidate'],
   ])('rejects unsafe input without reflecting it: %j', async (input, code) => {
@@ -43,8 +66,9 @@ describe('dropped file mention resolver', () => {
     expect(JSON.stringify(result)).not.toContain('/outside/private.txt');
   });
 
-  it('rejects folders and sanitizes filesystem failures', async () => {
-    await expect(resolveDroppedFileMention(['/workspace/src'], services(vi.fn().mockResolvedValue({ type: 2 })))).resolves.toMatchObject({ ok: false, code: 'notFile' });
-    await expect(resolveDroppedFileMention(['/workspace/missing'], services(vi.fn().mockRejectedValue(new Error('/secret'))))).resolves.toEqual({ ok: false, code: 'unavailable', message: 'Unable to read the dropped file.' });
+  it('rejects folders when stat reports a directory', async () => {
+    await expect(
+      resolveDroppedFileMention(['/workspace/src'], services(vi.fn().mockResolvedValue({ type: 2 }))),
+    ).resolves.toMatchObject({ ok: false, code: 'notFile' });
   });
 });

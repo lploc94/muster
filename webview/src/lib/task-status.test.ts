@@ -108,11 +108,14 @@ describe('task status dual-axis presentation', () => {
     expect(isTaskStatusTerminal('failed')).toBe(false);
   });
 
-  it('marks succeeded/cancelled/skipped as hard terminal', () => {
+  it('marks succeeded/cancelled/skipped as hard terminal with reopen guidance', () => {
     for (const lifecycle of ['succeeded', 'cancelled', 'skipped'] as const) {
       expect(isHardTerminal(lifecycle)).toBe(true);
       expect(isTaskStatusTerminal(lifecycle)).toBe(true);
-      expect(getLifecyclePresentation(lifecycle).composerGuidance).toMatch(/closed|new task/i);
+      const guidance = getLifecyclePresentation(lifecycle).composerGuidance;
+      expect(guidance).toMatch(new RegExp(`This task is ${lifecycle}`, 'i'));
+      expect(guidance).toMatch(/reopen/i);
+      expect(guidance).toMatch(/new message|Sending/i);
     }
   });
 

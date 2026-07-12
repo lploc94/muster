@@ -79,8 +79,8 @@ limits. Never run two processes against the same session ID.
 ## New task (replaces New Session)
 
 - User clicks **New task** → unpersisted composer; first `send` calls `startNewTask`.
-- **Continue as new task** on a terminal task creates a new root coordinator with
-  `continuationOf` set — UI grouping only, never reopens the old task.
+- **Reopen** on a terminal task sets lifecycle back to `open` on the **same** task
+  id (via status menu or `send`). A separate conversation uses **New task**.
 
 ## Cancellation
 

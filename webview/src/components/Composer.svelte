@@ -21,7 +21,17 @@
   import type { WebviewBackendId } from '../lib/tasks.svelte';
   import { BACKENDS, backendShortLabel } from '../lib/backends';
   import { tip } from '../lib/tooltip';
-  import { extractFileDropCandidates } from '../lib/file-drop';
+  import {
+    extractFileDropCandidatesFromDataTransfer,
+    isOsFileManagerDrag,
+    isVsCodeExplorerDrag,
+  } from '../lib/file-drop';
+  import { renderUserTextWithMentions } from '../lib/file-mention-render';
+  import {
+    allocateDisplayToken,
+    expandMentionsForLlm,
+    type MentionBindingMap,
+  } from '../lib/file-mention-bindings';
 
   interface Props {
     mode: 'draft' | 'task';
@@ -72,28 +82,35 @@
     cliStatus === 'stopped' && cliLastExit ? CLI_LAST_EXIT_LABELS[cliLastExit] : null,
   );
 
-  type ComposerTextarea = HTMLElement & { value: string };
-
-  function nativeTextarea(): HTMLTextAreaElement | null {
-    return textareaEl?.shadowRoot?.querySelector('textarea') ?? null;
-  }
-
-  let textareaEl = $state<ComposerTextarea | undefined>(undefined);
+  let textareaEl = $state<HTMLTextAreaElement | undefined>(undefined);
+  let highlightEl = $state<HTMLDivElement | undefined>(undefined);
+  let draftText = $state('');
+  /** Display token (@name) → resolve path for LLM expand-on-send. */
+  let mentionBindings: MentionBindingMap = new Map();
   let backendSelect = $state<(HTMLElement & { value: string }) | undefined>(undefined);
   let addContextMenuRegion = $state<HTMLElement | undefined>(undefined);
   let isDraggingFile = $state(false);
+  let isExplorerDrag = $state(false);
+  let dropFeedback = $state<string | null>(null);
   let isAddContextMenuOpen = $state(false);
 
+  /** Highlight layer mirrors draft; trailing newline needs an extra break for height parity. */
+  const draftHighlightHtml = $derived.by(() => {
+    const base = renderUserTextWithMentions(draftText);
+    if (!base) return '';
+    return draftText.endsWith('\n') ? `${base}<br>` : base;
+  });
+
+  // Terminal lifecycles stay writable: host send reopens the same task to open.
   const statusBlocksSend = $derived(
     task
-      ? isHardTerminal(lifecycle) || runtimeBlocksComposer(runtime)
+      ? runtimeBlocksComposer(runtime)
       : taskStatus === 'running' ||
           taskStatus === 'queued' ||
           taskStatus === 'waiting_dependencies' ||
           taskStatus === 'waiting_children' ||
           taskStatus === 'waiting_user' ||
-          taskStatus === 'needs_recovery' ||
-          isHardTerminal(taskStatus),
+          taskStatus === 'needs_recovery',
   );
   const blocked = $derived(mode === 'task' && (!!pendingAsk || readOnly || statusBlocksSend));
   const canSend = $derived(mode === 'draft' ? !thread.running : !thread.running && !blocked);
@@ -123,7 +140,12 @@
     function onMessage(e: MessageEvent) {
       const msg = e.data;
       if (msg?.type !== 'filePicked' || typeof msg.path !== 'string') return;
-      insertFileMention(msg.path);
+      dropFeedback = null;
+      const displayName =
+        typeof msg.displayName === 'string' && msg.displayName.trim()
+          ? msg.displayName.trim()
+          : undefined;
+      insertFileMention(msg.path, displayName);
     }
 
     window.addEventListener('message', onMessage);
@@ -150,9 +172,12 @@
   });
 
   function send() {
-    if (!canSend || !textareaEl) return;
-    const value = (textareaEl.value ?? '').trim();
-    if (!value) return;
+    if (!canSend) return;
+    const displayText = draftText.trim();
+    if (!displayText) return;
+
+    // UI keeps short @names; host stores display `text` and agent-facing `llmText`.
+    const llmText = expandMentionsForLlm(displayText, mentionBindings);
 
     if (mode === 'draft') {
       const backend = resolveBackendForSend();
@@ -160,10 +185,12 @@
       const payload: {
         type: 'send';
         text: string;
+        llmText?: string;
         backend: string;
         model?: string;
         continuationOf?: string;
-      } = { type: 'send', text: value, backend };
+      } = { type: 'send', text: displayText, backend };
+      if (llmText !== displayText) payload.llmText = llmText;
       // Only deliver a model that belongs to the chosen backend's catalog. Before
       // enumeration finishes (catalog null) trust the persisted selection.
       const model = tasks.selectedModel;
@@ -174,14 +201,21 @@
       threadStore.current.appendTranscript({
         id: `local-${Date.now()}`,
         kind: 'user',
-        content: value,
+        content: displayText,
       });
       post(payload);
     } else if (taskId) {
-      post({ type: 'send', taskId, text: value });
+      const payload: { type: 'send'; taskId: string; text: string; llmText?: string } = {
+        type: 'send',
+        taskId,
+        text: displayText,
+      };
+      if (llmText !== displayText) payload.llmText = llmText;
+      post(payload);
     }
 
-    textareaEl.value = '';
+    draftText = '';
+    mentionBindings = new Map();
   }
 
   function cancel() {
@@ -189,32 +223,38 @@
     post({ type: 'cancelTurn', taskId, turnId });
   }
 
-  function mentionForPath(path: string): string {
-    const normalized = path.trim().replace(/\\/g, '/');
-    if (!normalized) return '';
-    return /\s/.test(normalized) ? `@"${normalized}"` : `@${normalized}`;
-  }
+  function insertFileMention(resolvePath: string, displayName?: string) {
+    if (!canSend) return;
+    const { token } = allocateDisplayToken(mentionBindings, resolvePath, displayName);
+    if (!token) return;
 
-  function insertFileMention(path: string) {
-    if (!textareaEl || !canSend) return;
-    const mention = mentionForPath(path);
-    if (!mention) return;
-
-    const current = textareaEl.value ?? '';
-    const native = nativeTextarea();
-    const start = native?.selectionStart ?? current.length;
-    const end = native?.selectionEnd ?? start;
+    const current = draftText;
+    const start = textareaEl?.selectionStart ?? current.length;
+    const end = textareaEl?.selectionEnd ?? start;
     const before = current.slice(0, start);
     const after = current.slice(end);
     const leading = before.length > 0 && !/\s$/.test(before) ? ' ' : '';
     const trailing = after.length === 0 || !/^\s/.test(after) ? ' ' : '';
-    const insertion = `${leading}${mention}${trailing}`;
-    textareaEl.value = `${before}${insertion}${after}`;
+    const insertion = `${leading}${token}${trailing}`;
+    draftText = `${before}${insertion}${after}`;
     const caret = start + insertion.length;
     queueMicrotask(() => {
-      textareaEl?.focus?.();
-      nativeTextarea()?.setSelectionRange(caret, caret);
+      textareaEl?.focus();
+      textareaEl?.setSelectionRange(caret, caret);
+      syncHighlightScroll();
     });
+  }
+
+  function syncHighlightScroll() {
+    if (!textareaEl || !highlightEl) return;
+    highlightEl.scrollTop = textareaEl.scrollTop;
+    highlightEl.scrollLeft = textareaEl.scrollLeft;
+  }
+
+  function onDraftInput(e: Event) {
+    const el = e.currentTarget as HTMLTextAreaElement;
+    draftText = el.value;
+    syncHighlightScroll();
   }
 
   function closeAddContextMenu() {
@@ -236,28 +276,77 @@
 
   function onDragOver(e: DragEvent) {
     if (!canSend) return;
+    // Must preventDefault so VS Code / Chromium allow the drop into the webview.
     e.preventDefault();
     isDraggingFile = true;
+    const types = e.dataTransfer?.types;
+    isExplorerDrag =
+      !!types && (isVsCodeExplorerDrag(types) || isOsFileManagerDrag(types));
     if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+    dropFeedback = null;
   }
 
   function onDragLeave(e: DragEvent) {
     if (!e.currentTarget || !e.relatedTarget) {
       isDraggingFile = false;
+      isExplorerDrag = false;
       return;
     }
     const current = e.currentTarget as Node;
     const related = e.relatedTarget as Node;
-    if (!current.contains(related)) isDraggingFile = false;
+    if (!current.contains(related)) {
+      isDraggingFile = false;
+      isExplorerDrag = false;
+    }
   }
 
-  function onDrop(e: DragEvent) {
+  function isBareFileName(candidate: string): boolean {
+    const c = candidate.trim();
+    if (!c) return false;
+    if (c.includes('/') || c.includes('\\')) return false;
+    if (/^[a-z][a-z0-9+.-]*:/i.test(c)) return false;
+    return true;
+  }
+
+  async function onDrop(e: DragEvent) {
     isDraggingFile = false;
+    isExplorerDrag = false;
     if (!canSend || !e.dataTransfer) return;
     e.preventDefault();
-    const extraction = extractFileDropCandidates(e.dataTransfer, canSend);
+    e.stopPropagation();
+
+    const dt = e.dataTransfer;
+    const files = Array.from(dt.files ?? []);
+
+    // Sync + async path extraction (Explorer URIs / Electron File.path).
+    const extraction = await extractFileDropCandidatesFromDataTransfer(dt, canSend);
+
+    // Finder often only gives File.name (no absolute path). Import bytes on the
+    // host so the mention is a real absolute path the LLM can open.
+    const onlyBareNames =
+      extraction.ok &&
+      extraction.candidates.length > 0 &&
+      extraction.candidates.every(isBareFileName);
+    if (files.length === 1 && (onlyBareNames || !extraction.ok)) {
+      try {
+        const file = files[0];
+        const buffer = await file.arrayBuffer();
+        dropFeedback = null;
+        post({ type: 'importDroppedFile', name: file.name, data: buffer });
+        return;
+      } catch {
+        dropFeedback = 'Unable to read the dropped file.';
+        return;
+      }
+    }
+
     if (extraction.ok) {
+      dropFeedback = null;
       post({ type: 'resolveFileDrop', candidates: extraction.candidates });
+      return;
+    }
+    if (extraction.code !== 'disabled') {
+      dropFeedback = extraction.message;
     }
   }
 
@@ -277,13 +366,19 @@
     }
   }
 
-  const disabledReason = $derived.by(() => {
+  /** True when lifecycle is sealed; composer stays enabled and send reopens. */
+  const isTerminalReopenable = $derived(
+    task
+      ? isHardTerminal(lifecycle) || lifecycle === 'failed'
+      : isHardTerminal(taskStatus) || taskStatus === 'failed',
+  );
+
+  /** Blocks send (busy/gated). Terminal reopenable is NOT a block. */
+  const blockReason = $derived.by(() => {
     if (mode === 'draft') return '';
     if (pendingAsk) return 'Answer the pending task question above to continue.';
     if (task) {
-      if (isHardTerminal(lifecycle)) return presentation.composerGuidance;
       if (runtimeBlocksComposer(runtime)) return presentation.composerGuidance;
-      if (lifecycle === 'failed') return presentation.composerGuidance;
       if (readOnly) return 'This task is read-only right now.';
       return '';
     }
@@ -293,10 +388,20 @@
     if (taskStatus === 'waiting_children') return presentation.composerGuidance;
     if (taskStatus === 'waiting_user') return presentation.composerGuidance;
     if (taskStatus === 'needs_recovery') return presentation.composerGuidance;
-    if (taskStatus === 'awaiting_outcome') return presentation.composerGuidance;
-    if (isHardTerminal(taskStatus)) return presentation.composerGuidance;
-    if (taskStatus === 'failed') return presentation.composerGuidance;
     if (readOnly) return 'This task is read-only right now.';
+    return '';
+  });
+
+  /**
+   * Composer note only for blocked/busy states.
+   * Terminal reopen warning lives once in TaskWorkspace (panel + Reopen button).
+   */
+  const composerNote = $derived.by(() => {
+    if (mode === 'draft') return '';
+    if (blockReason) return blockReason;
+    if (taskStatus === 'awaiting_outcome' && !isTerminalReopenable) {
+      return presentation.composerGuidance;
+    }
     return '';
   });
 
@@ -385,9 +490,11 @@
   const placeholder = $derived(
     mode === 'draft'
       ? `Start a new coordinator task with ${currentBackend}…`
-      : disabledReason
-        ? disabledReason
-        : `Message this task…`,
+      : isTerminalReopenable
+        ? 'Send a message to reopen this task…'
+        : blockReason
+          ? blockReason
+          : 'Message this task…',
   );
 
   const BACKEND_IDS = ['claude', 'grok', 'kiro', 'codex', 'opencode'];
@@ -438,21 +545,41 @@
   {/if}
 
   {#if isDraggingFile}
-    <div class="composer-drop-status" role="status" aria-live="polite">Drop file to mention it</div>
+    <div class="composer-drop-status" role="status" aria-live="polite">
+      {isExplorerDrag
+        ? 'Hold Shift and drop to mention the file (Explorer / Finder)'
+        : 'Drop file to mention it'}
+    </div>
   {/if}
 
-  {#if disabledReason}
-    <div class="composer-guidance" role="note">{disabledReason}</div>
+  {#if dropFeedback}
+    <div class="composer-guidance composer-guidance--error" role="alert">{dropFeedback}</div>
   {/if}
 
-  <vscode-textarea
-    bind:this={textareaEl}
-    rows={3}
-    placeholder={placeholder}
-    disabled={!canSend}
-    onkeydown={onKeydown}
-    style="width: 100%;"
-  ></vscode-textarea>
+  {#if composerNote}
+    <div class="composer-guidance" role="note">{composerNote}</div>
+  {/if}
+
+  <!-- Layered input: highlight backdrop + transparent textarea (Cursor-style live chips). -->
+  <div class="composer-input" class:composer-input--disabled={!canSend}>
+    <div
+      bind:this={highlightEl}
+      class="composer-input__highlight"
+      aria-hidden="true"
+    >{@html draftHighlightHtml}</div>
+    <textarea
+      bind:this={textareaEl}
+      class="composer-input__textarea"
+      rows={3}
+      placeholder={placeholder}
+      disabled={!canSend}
+      value={draftText}
+      oninput={onDraftInput}
+      onscroll={syncHighlightScroll}
+      onkeydown={onKeydown}
+      spellcheck="true"
+    ></textarea>
+  </div>
 
   <div class="flex items-center justify-between gap-2 pt-1" onkeydown={onKeydown}>
     <div class="flex items-center gap-1.5 min-w-0">

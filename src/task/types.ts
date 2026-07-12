@@ -111,7 +111,13 @@ export interface TaskMessage {
   id: string;
   taskId: string;
   role: 'user' | 'assistant' | 'system';
+  /** User-visible text (short display-name mentions). */
   content: string;
+  /**
+   * Optional agent-facing text when it differs from `content` (e.g. full paths
+   * after mention expand-on-send). CLI turns use this when present.
+   */
+  agentContent?: string;
   state: TaskMessageState;
   createdAt: string;
   turnId?: string;
