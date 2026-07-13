@@ -62,7 +62,7 @@ export const WORKFLOW_PHASE_TRANSITIONS: Readonly<
   implementing: ['testing', 'reviewing', 'debugging', 'verifying', 'planning', 'finishing', 'abandoned'],
   testing: ['reviewing', 'debugging', 'implementing', 'verifying', 'planning', 'abandoned'],
   reviewing: ['debugging', 'implementing', 'verifying', 'testing', 'planning', 'finishing', 'abandoned'],
-  debugging: ['implementing', 'planning', 'testing', 'reviewing', 'abandoned'],
+  debugging: ['implementing', 'planning', 'testing', 'reviewing', 'verifying', 'abandoned'],
   verifying: ['finishing', 'debugging', 'implementing', 'planning', 'abandoned'],
   finishing: ['completed', 'debugging', 'planning', 'abandoned'],
   completed: [],
@@ -126,8 +126,22 @@ export interface CommandSpecMeta {
 }
 
 export const NATIVE_COMMAND_SPECS: readonly CommandSpecMeta[] = [
-  { id: 'think', aliases: [], effectClass: 'mutate_plan', requiresTask: true, summary: 'Produce a decision brief for the focused root.' },
-  { id: 'plan', aliases: [], effectClass: 'mutate_plan', requiresTask: true, summary: 'Produce or revise a structured plan artifact.' },
+  {
+    id: 'think',
+    aliases: [],
+    effectClass: 'mutate_plan',
+    requiresTask: true,
+    requiredPhases: ['draft', 'thinking', 'planning', 'awaiting_plan_approval'],
+    summary: 'Produce a decision brief for the focused root.',
+  },
+  {
+    id: 'plan',
+    aliases: [],
+    effectClass: 'mutate_plan',
+    requiresTask: true,
+    requiredPhases: ['draft', 'thinking', 'planning', 'awaiting_plan_approval'],
+    summary: 'Produce or revise a structured plan artifact.',
+  },
   {
     id: 'approve',
     aliases: [],

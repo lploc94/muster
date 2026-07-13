@@ -96,6 +96,24 @@ describe('projectPrompt', () => {
 });
 
 describe('TaskEngine', () => {
+  it('starts ordinary chat directly without injecting a planner prompt', async () => {
+    const { store } = makeTempStore();
+    const engine = makeEngine(store, [{ type: 'turnCompleted' }]);
+
+    const started = engine.startNewTask({
+      goal: 'What model are you?',
+      message: 'What model are you?',
+      backend: 'fake',
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    await engine.whenIdle();
+
+    const file = store.getFile();
+    expect(file.messages[started.value.messageId!]?.content).toBe('What model are you?');
+    expect(file.workflowRuns).toEqual({});
+  });
+
   it('rejects duplicate task ids and validates dependencies', () => {
     const { store } = makeTempStore();
     const engine = makeEngine(store, [{ type: 'turnCompleted' }]);
@@ -162,6 +180,53 @@ describe('TaskEngine', () => {
     });
     const result = engine.createTask({ goal: 'x', backend: 'fake' });
     expect(result).toEqual({ ok: false, reason: 'backend does not support MCP' });
+  });
+
+  it('routes native backend/model commands without reporting them as unknown', () => {
+    const { store } = makeTempStore();
+    const engine = makeEngine(store, []);
+    const created = engine.startNewTask({
+      goal: 'configure draft',
+      backend: 'claude',
+      workflowMode: 'draft',
+    });
+    expect(created.ok).toBe(true);
+    if (!created.ok) return;
+
+    const backend = engine.runWorkflowCommand({
+      commandId: 'backend',
+      rawName: 'backend',
+      argv: ['codex'],
+      rawArgs: 'codex',
+      rootTaskId: created.value.taskId,
+    });
+    expect(backend).toMatchObject({ ok: true, commandId: 'backend' });
+    expect(store.getTask(created.value.taskId)?.backend).toBe('codex');
+
+    const model = engine.runWorkflowCommand({
+      commandId: 'model',
+      rawName: 'model',
+      argv: ['gpt-5'],
+      rawArgs: 'gpt-5',
+      rootTaskId: created.value.taskId,
+    });
+    expect(model).toMatchObject({ ok: true, commandId: 'model' });
+    expect(store.getTask(created.value.taskId)?.model).toBe('gpt-5');
+
+    for (const commandId of ['fork', 'retry'] as const) {
+      const result = engine.runWorkflowCommand({
+        commandId,
+        rawName: commandId,
+        argv: [],
+        rawArgs: '',
+        rootTaskId: created.value.taskId,
+      });
+      expect(result).toMatchObject({
+        ok: false,
+        commandId,
+        error: { code: 'COMMAND_ARGS' },
+      });
+    }
   });
 
   it('completes a successful turn and commits session id from sessionStarted', async () => {

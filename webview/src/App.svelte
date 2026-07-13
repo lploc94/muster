@@ -98,6 +98,43 @@
     return SETTING_LABELS[settingId];
   }
 
+  function commandResultContent(commandId: string | undefined, message: string | undefined, data: unknown): string {
+    if (commandId === 'help' && data && typeof data === 'object' && Array.isArray((data as { commands?: unknown[] }).commands)) {
+      const commands = (data as { commands: Array<{ id?: unknown; summary?: unknown }> }).commands;
+      return ['### Muster commands', '', ...commands
+        .filter((command) => typeof command.id === 'string')
+        .map((command) => `- \`/${command.id}\`${typeof command.summary === 'string' ? ` — ${command.summary}` : ''}`),
+      ].join('\n');
+    }
+    if (commandId === 'tasks' && data && typeof data === 'object' && Array.isArray((data as { tasks?: unknown[] }).tasks)) {
+      const tasksList = (data as { tasks: Array<{ id?: unknown; goal?: unknown; lifecycle?: unknown }> }).tasks;
+      return ['### Tasks', '', ...(tasksList.length
+        ? tasksList.map((task) => `- \`${String(task.id ?? 'unknown')}\` — ${String(task.goal ?? '')} (${String(task.lifecycle ?? 'unknown')})`)
+        : ['No tasks yet.'])].join('\n');
+    }
+    if (commandId === 'mcp' && data && typeof data === 'object' && Array.isArray((data as { servers?: unknown[] }).servers)) {
+      const servers = (data as { servers: unknown[] }).servers;
+      return ['### MCP integrations', '', ...servers.map((server) => `- \`${String(server)}\``)].join('\n');
+    }
+    if ((commandId === 'status' || commandId === 'context') && data !== undefined) {
+      return `### ${commandId === 'status' ? 'Task status' : 'Context'}\n\n\`\`\`json\n${JSON.stringify(data, null, 2)}\n\`\`\``;
+    }
+    if ((commandId === 'think' || commandId === 'plan' || commandId === 'replan') && data !== undefined) {
+      return `### ${commandId === 'think' ? 'Decision brief' : 'Plan'}\n\n${message ?? 'Workflow artifact updated.'}\n\n\`\`\`json\n${JSON.stringify(data, null, 2)}\n\`\`\``;
+    }
+    if (commandId === 'approve' && data !== undefined) {
+      return `### Plan approved\n\n${message ?? 'Approval completed.'}\n\n\`\`\`json\n${JSON.stringify(data, null, 2)}\n\`\`\``;
+    }
+    if (commandId === 'export' && data && typeof data === 'object') {
+      const format = String((data as { format?: unknown }).format ?? 'md');
+      const content = typeof (data as { content?: unknown }).content === 'string'
+        ? (data as { content: string }).content
+        : JSON.stringify(data, null, 2);
+      return `### Export ready (${format})\n\n\`\`\`${format === 'json' ? 'json' : 'markdown'}\n${content}\n\`\`\``;
+    }
+    return message ?? 'Command completed.';
+  }
+
   function updateSnapshotValue(settingId: RetentionSettingId, value: number) {
     if (!settingsSnapshot) return;
     settingsSnapshot = {
@@ -292,13 +329,13 @@
           if (!msg.taskId || msg.taskId === tasks.focusedTaskId) {
             if (!msg.ok) {
               tasks.setCommandError(msg.message ?? msg.error?.message ?? 'Command failed', msg.taskId ?? null);
-            } else if (msg.message) {
+            } else if (msg.message || msg.data !== undefined) {
               // Surface non-error command feedback in the same banner slot (cleared by user).
               tasks.setCommandError(null);
               threadStore.current.appendTranscript({
                 id: `cmd-${Date.now()}`,
                 kind: 'assistant',
-                content: msg.message,
+                content: commandResultContent(msg.commandId, msg.message, msg.data),
               });
             }
           }

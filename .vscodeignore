@@ -8,12 +8,19 @@ study/**
 docs/**
 
 # Tooling
-node_modules/**
 .git/**
 .github/**
 *.vsix
+.muster-tasks.json
 tsconfig.json
+playwright.config.ts
+vitest.config.ts
+package-lock.json
 
 # Tests & spikes
+e2e/**
+plans/**
+test-results/**
+**/*.test.*
 **/*.map
 **/.DS_Store

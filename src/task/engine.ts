@@ -574,13 +574,15 @@ export class TaskEngine {
     /** Workspace directory the agent runs in for this task's turns. */
     cwd?: string;
     /**
-     * `auto_plan` (default): enter think/plan with host-enforced approval gate.
+     * `auto_plan`: enter think/plan with host-enforced approval gate. Reserved
+     * for an explicit workflow request such as `/new <goal>`.
      * `draft`: create root without a turn (empty chat).
-     * `direct`: legacy immediate execution (bypass auto-plan; tests / escape hatch).
+     * `direct` (default): answer the user's message immediately. A normal chat
+     * must never be forced through the planner merely because it starts a task.
      */
     workflowMode?: 'auto_plan' | 'draft' | 'direct';
   }): EngineResult<{ taskId: string; messageId?: string; turnId?: string; workflowRunId?: string }> {
-    const mode = params.workflowMode ?? 'auto_plan';
+    const mode = params.workflowMode ?? 'direct';
     const backend = this.makeBackend(params.backend);
     if (mode !== 'draft' && !canBindTaskToBackend(backend.capabilities)) {
       return { ok: false, reason: 'backend does not support MCP' };

@@ -192,6 +192,140 @@ test.describe('Muster webview host state smoke', () => {
     });
   });
 
+  test('suggests native slash commands and sends the backend encoded by the model picker', async ({ page }) => {
+    await openWebview(page);
+    await postSnapshot(page, { type: 'snapshot', rootTasks: [], storeRevision: 2 });
+    await page.getByRole('button', { name: 'New task' }).first().click();
+
+    const composer = page.getByPlaceholder('Start a new coordinator task with claude…');
+    await composer.fill('/');
+    const commandMenu = page.getByRole('listbox', { name: 'Muster commands' });
+    await expect(commandMenu.getByRole('option', { name: /\/think.*requires an open task/i })).toBeDisabled();
+    await commandMenu.getByRole('option', { name: /\/help.*List native commands/i }).click();
+    await expectPostedMessage(page, { type: 'runCommand', text: '/help' });
+
+    await composer.fill('Use Grok for this task');
+    await postRawHostMessage(page, {
+      type: 'modelsAvailable',
+      models: {
+        claude: { current: 'claude-default', options: [{ value: 'claude-default', name: 'Claude default' }] },
+        grok: { current: 'grok-4', options: [{ value: 'grok-4', name: 'Grok 4' }] },
+      },
+    });
+    await page.locator('vscode-single-select').evaluate((element) => {
+      (element as HTMLElement & { value: string }).value = 'grok::grok-4';
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+      element.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await page.getByRole('button', { name: 'Send' }).click();
+    await expectPostedMessage(page, {
+      type: 'send',
+      text: 'Use Grok for this task',
+      backend: 'grok',
+      model: 'grok-4',
+    });
+  });
+
+  test('opens file-context choices when the composer contains @', async ({ page }) => {
+    await openWebview(page);
+    await postSnapshot(page, { type: 'snapshot', rootTasks: [], storeRevision: 2 });
+    await page.getByRole('button', { name: 'New task' }).first().click();
+
+    const composer = page.getByPlaceholder('Start a new coordinator task with claude…');
+    await composer.fill('@');
+    const contextMenu = page.getByRole('listbox', { name: 'Muster context' });
+    await expect(contextMenu.getByRole('option', { name: /@.*Add file/i })).toBeVisible();
+    await contextMenu.getByRole('option', { name: /@.*Add file/i }).click();
+    await expectPostedMessage(page, { type: 'pickFile' });
+    await expect(composer).toHaveValue('');
+  });
+
+  test('runs safe slash commands from the suggestion and renders their result', async ({ page }) => {
+    await openWebview(page);
+    await postSnapshot(page, { type: 'snapshot', rootTasks: [], storeRevision: 2 });
+    await page.getByRole('button', { name: 'New task' }).first().click();
+
+    const composer = page.getByPlaceholder('Start a new coordinator task with claude…');
+    await composer.fill('/help');
+    await page.getByRole('option', { name: /\/help.*List native commands/i }).click();
+    await expectPostedMessage(page, { type: 'runCommand', text: '/help' });
+
+    await postRawHostMessage(page, {
+      type: 'commandResult',
+      ok: true,
+      commandId: 'help',
+      presenter: 'help',
+      message: 'Native Muster commands',
+      data: { commands: [{ id: 'think', summary: 'Create a decision brief' }] },
+    });
+    await expect(page.getByText('Muster commands')).toBeVisible();
+    await expect(page.getByText('/think')).toBeVisible();
+  });
+
+  test('renders workflow command result presenters visibly', async ({ page }) => {
+    await openWebview(page);
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-root', goal: 'Build palette page', viewStatus: 'idle' })],
+      focusedTaskId: 'task-root',
+      subtree: [task({ id: 'task-root', goal: 'Build palette page', viewStatus: 'idle' })],
+      transcript: [],
+      storeRevision: 7,
+    });
+
+    const composer = page.getByRole('textbox').first();
+    await composer.fill('/status');
+    await page.getByRole('option', { name: /\/status.*Show status/i }).click();
+    await expectPostedMessage(page, { type: 'runCommand', text: '/status', taskId: 'task-root' });
+
+    await postRawHostMessage(page, {
+      type: 'commandResult',
+      taskId: 'task-root',
+      ok: true,
+      commandId: 'status',
+      presenter: 'status',
+      data: { id: 'task-root', workflow: { phase: 'awaiting_plan_approval' } },
+    });
+    await expect(page.getByText('Task status')).toBeVisible();
+    await expect(page.getByText('awaiting_plan_approval')).toBeVisible();
+
+    await postRawHostMessage(page, {
+      type: 'commandResult',
+      taskId: 'task-root',
+      ok: true,
+      commandId: 'plan',
+      presenter: 'plan_card',
+      message: 'Plan ready for approval',
+      data: { artifactId: 'plan-1', phase: 'awaiting_plan_approval' },
+    });
+    await expect(page.getByText('Plan ready for approval')).toBeVisible();
+    await expect(page.getByText('plan-1')).toBeVisible();
+
+    await postRawHostMessage(page, {
+      type: 'commandResult',
+      taskId: 'task-root',
+      ok: true,
+      commandId: 'approve',
+      presenter: 'approval',
+      message: 'Approved; started 1 child turn(s)',
+      data: { createdTaskIds: ['child-1'], startedTurnIds: ['turn-1'] },
+    });
+    await expect(page.getByText('Plan approved')).toBeVisible();
+    await expect(page.getByText('child-1')).toBeVisible();
+
+    await postRawHostMessage(page, {
+      type: 'commandResult',
+      taskId: 'task-root',
+      ok: true,
+      commandId: 'export',
+      presenter: 'export',
+      message: 'Export ready (json)',
+      data: { format: 'json', content: '{\"workflow\":{\"phase\":\"finishing\"}}' },
+    });
+    await expect(page.getByText('Export ready (json)')).toBeVisible();
+    await expect(page.getByText('finishing')).toBeVisible();
+  });
+
   test('Add Context menu keeps the existing file picker and mention flow', async ({ page }) => {
     await openWebview(page);
 

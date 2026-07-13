@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { CliAdapter, runCommandText } from './adapter';
 import { helpEntries } from '../commands/registry';
 import type { CommandDomainPort } from '../commands/types';
+import { COMMAND_BEHAVIOR } from '../commands/behavior-matrix';
 
 function mockDomain(): CommandDomainPort {
   return {
@@ -82,5 +83,38 @@ describe('CLI adapter', () => {
   it('parity: runCommandText matches domain approve', async () => {
     const result = await runCommandText(mockDomain(), '/approve', { yes: true });
     expect(result).toMatchObject({ ok: true, commandId: 'approve' });
+  });
+
+  it('returns JSON for every safe global command', async () => {
+    const safeGlobal = COMMAND_BEHAVIOR.filter(
+      (command) => command.instantSafe && !command.requiresTask && command.availability === 'implemented',
+    );
+    expect(safeGlobal.map((command) => command.id).sort()).toEqual(['help', 'mcp', 'tasks']);
+
+    for (const command of safeGlobal) {
+      const out: string[] = [];
+      const adapter = new CliAdapter({
+        domain: mockDomain(),
+        stdout: (line) => out.push(line),
+      });
+      const code = await adapter.run([command.id, '--json']);
+      expect(code, command.id).toBe(0);
+      expect(JSON.parse(out[0])).toMatchObject({
+        ok: true,
+        commandId: command.id,
+      });
+    }
+  });
+
+  it('keeps task-scoped CLI commands rejected without focus', async () => {
+    const domain = mockDomain();
+    domain.getFocusedTaskId = () => undefined;
+    for (const command of COMMAND_BEHAVIOR.filter((entry) => entry.requiresTask)) {
+      const result = await runCommandText(domain, `/${command.id}`, { yes: true });
+      expect(result && 'ok' in result, command.id).toBe(true);
+      if (result && 'ok' in result) {
+        expect(result.ok, command.id).toBe(false);
+      }
+    }
   });
 });

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { threadStore } from '../lib/thread.svelte';
-  import { tasks, resolveBackendForSend, registerBackendSelect } from '../lib/tasks.svelte';
+  import { tasks, resolveBackendSelectionForSend, registerBackendSelect } from '../lib/tasks.svelte';
   import { post } from '../lib/protocol';
   import { ADD_CONTEXT_ACTIONS, getAddContextActionHostMessage } from '../lib/context-actions';
   import {
@@ -20,6 +20,7 @@
   import { effectiveRuntimeActivity } from '../lib/protocol';
   import type { WebviewBackendId } from '../lib/tasks.svelte';
   import { BACKENDS, backendShortLabel } from '../lib/backends';
+  import { filterCommandSuggestions, looksLikeSlashCommand, type CommandSuggestion } from '../lib/commands';
   import { tip } from '../lib/tooltip';
 
   interface Props {
@@ -76,6 +77,7 @@
   let addContextMenuRegion = $state<HTMLElement | undefined>(undefined);
   let isDraggingFile = $state(false);
   let isAddContextMenuOpen = $state(false);
+  let composerText = $state('');
 
   const statusBlocksSend = $derived(
     task
@@ -148,7 +150,8 @@
     if (!value) return;
 
     if (mode === 'draft') {
-      const backend = resolveBackendForSend();
+      const selection = resolveBackendSelectionForSend();
+      const backend = selection.backend;
       tasks.setBackend(backend);
       const payload: {
         type: 'send';
@@ -159,7 +162,7 @@
       } = { type: 'send', text: value, backend };
       // Only deliver a model that belongs to the chosen backend's catalog. Before
       // enumeration finishes (catalog null) trust the persisted selection.
-      const model = tasks.selectedModel;
+      const model = selection.model ?? tasks.selectedModel;
       if (model && (!tasks.modelsByBackend || modelInCatalog(backend, model))) {
         payload.model = model;
       }
@@ -175,6 +178,68 @@
     }
 
     textareaEl.value = '';
+    composerText = '';
+  }
+
+  function availabilityForSuggestion(command: CommandSuggestion): CommandSuggestion {
+    if (command.availability === 'disabled') return command;
+    if (command.requiresTask && !taskId) {
+      return {
+        ...command,
+        availability: 'disabled',
+        disabledReason: `${command.label} requires an open task. Use /new <goal> to start a workflow.`,
+      };
+    }
+    if (command.requiresTask && mode === 'task' && blocked) {
+      return {
+        ...command,
+        availability: 'disabled',
+        disabledReason: disabledReason || 'The focused task is not ready for this command.',
+      };
+    }
+    return command;
+  }
+
+  const slashSuggestions = $derived.by(() =>
+    looksLikeSlashCommand(composerText)
+      ? filterCommandSuggestions(composerText.trim()).map(availabilityForSuggestion)
+      : [],
+  );
+  const mentionSuggestions = $derived.by(() => composerText.trim() === '@'
+    ? ADD_CONTEXT_ACTIONS.filter((action) => action.state === 'enabled')
+    : []);
+  const instantCommandIds = new Set(['help', 'tasks', 'mcp']);
+
+  function onComposerInput(e: Event) {
+    composerText = (e.currentTarget as HTMLTextAreaElement | undefined)?.value ?? textareaEl?.value ?? '';
+  }
+
+  function chooseSlashCommand(id: string) {
+    const suggestion = slashSuggestions.find((command) => command.id === id);
+    if (suggestion?.availability === 'disabled') return;
+    // Read-only, argument-free commands should behave like commands, not like
+    // text snippets that require the user to discover a second Enter/Send step.
+    // Task-scoped reads are also safe to run immediately when a task is open.
+    if (instantCommandIds.has(id) || ((id === 'status' || id === 'context') && taskId)) {
+      post({ type: 'runCommand', text: `/${id}`, ...(taskId ? { taskId } : {}) });
+      composerText = '';
+      if (textareaEl) textareaEl.value = '';
+      return;
+    }
+    const next = `/${id} `;
+    if (textareaEl) {
+      textareaEl.value = next;
+      textareaEl.focus();
+    }
+    composerText = next;
+  }
+
+  function chooseMentionAction(action: AddContextAction) {
+    if (!textareaEl || !canSend) return;
+    // `@` opens the contextual picker; it is not itself a file mention.
+    textareaEl.value = textareaEl.value.replace(/@\s*$/, '');
+    composerText = textareaEl.value;
+    activateAddContextAction(action);
   }
 
   function cancel() {
@@ -197,6 +262,7 @@
     const needsLeadingSpace = current.length > 0 && !/\s$/.test(current);
     const next = `${current}${needsLeadingSpace ? ' ' : ''}${mention} `;
     textareaEl.value = next;
+    composerText = next;
     textareaEl.focus?.();
   }
 
@@ -443,9 +509,48 @@
     rows={3}
     placeholder={placeholder}
     disabled={!canSend}
+    oninput={onComposerInput}
     onkeydown={onKeydown}
     style="width: 100%;"
   ></vscode-textarea>
+
+  {#if slashSuggestions.length > 0}
+    <div class="slash-command-menu" role="listbox" aria-label="Muster commands">
+      {#each slashSuggestions as command (command.id)}
+        <button
+          type="button"
+          role="option"
+          aria-selected="false"
+          class="slash-command-menu__item"
+          class:slash-command-menu__item--disabled={command.availability === 'disabled'}
+          aria-disabled={command.availability === 'disabled' ? 'true' : 'false'}
+          title={command.disabledReason}
+          disabled={command.availability === 'disabled'}
+          onclick={() => chooseSlashCommand(command.id)}
+        >
+          <code>{command.label}</code>
+          <span>{command.disabledReason ?? command.summary}</span>
+        </button>
+      {/each}
+    </div>
+  {/if}
+
+  {#if mentionSuggestions.length > 0}
+    <div class="slash-command-menu" role="listbox" aria-label="Muster context">
+      {#each mentionSuggestions as action (action.id)}
+        <button
+          type="button"
+          role="option"
+          aria-selected="false"
+          class="slash-command-menu__item"
+          onclick={() => chooseMentionAction(action)}
+        >
+          <code>@</code>
+          <span>{action.label} — {action.description}</span>
+        </button>
+      {/each}
+    </div>
+  {/if}
 
   <div class="flex items-center justify-between gap-2 pt-1" onkeydown={onKeydown}>
     <div class="flex items-center gap-1.5 min-w-0">

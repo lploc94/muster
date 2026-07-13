@@ -1,7 +1,7 @@
 {
   "name": "muster",
   "displayName": "Muster",
-  "version": "0.1.0",
+  "version": "0.1.4",
   "publisher": "tlelabs",
   "license": "MIT",
   "description": "Muster — an open-source coordinator for multiple AI CLIs (Claude, Grok, Codex, Antigravity) with streaming and session resume",
@@ -65,7 +65,11 @@
         },
         "muster.permissions.mode": {
           "type": "string",
-          "enum": ["ask", "allow", "readonly"],
+          "enum": [
+            "ask",
+            "allow",
+            "readonly"
+          ],
           "default": "ask",
           "enumDescriptions": [
             "Safe: auto-allow read-only tool calls, prompt for writes/commands/unknown actions.",

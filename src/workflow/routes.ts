@@ -4,6 +4,7 @@
  */
 
 import { randomUUID } from 'crypto';
+import { BACKEND_IDS } from '../backends';
 import type { TaskStoreFile } from '../task/types';
 import type { CommandRequest, CommandResult } from '../commands/types';
 import {
@@ -15,8 +16,10 @@ import {
   archiveWorkflowRun,
   attachArtifact,
   getWorkflowRunForRoot,
+  stagePlanForApproval,
   transitionWorkflowPhase,
 } from './store';
+import type { PlanArtifact } from './contracts';
 import { buildContextReport } from './context';
 import { compactWorkflowTranscript } from './compact';
 import { exportWorkflowJson, exportWorkflowMarkdown } from './export';
@@ -31,6 +34,30 @@ import {
   defaultVerificationSelection,
   discoverPackageScripts,
 } from './verification-discovery';
+
+const KNOWN_BACKENDS = new Set<string>(BACKEND_IDS);
+const PRE_EXECUTION_PHASES: WorkflowPhase[] = ['draft', 'thinking', 'planning', 'awaiting_plan_approval'];
+const ACTIVE_TURN_STATUSES = new Set(['queued', 'running', 'waiting_user']);
+
+function hasActiveTurn(file: TaskStoreFile, taskId: string): boolean {
+  return Object.values(file.turns).some(
+    (turn) => turn.taskId === taskId && ACTIVE_TURN_STATUSES.has(turn.status),
+  );
+}
+
+function commandError(
+  commandId: CommandRequest['commandId'],
+  code: Parameters<typeof workflowError>[0],
+  message: string,
+  details?: Record<string, unknown>,
+): CommandResult {
+  return {
+    ok: false,
+    commandId,
+    error: workflowError(code, message, details),
+    presenter: 'error',
+  };
+}
 
 function phaseOk(
   file: TaskStoreFile,
@@ -65,6 +92,175 @@ function phaseOk(
   return { ok: true, workflowRunId: run.id, phase: run.phase };
 }
 
+function transitionIfNeeded(
+  draft: TaskStoreFile,
+  workflowRunId: string,
+  phase: WorkflowPhase,
+  to: WorkflowPhase,
+  now: string,
+): CommandResult | undefined {
+  if (phase === to) return undefined;
+  const transitioned = transitionWorkflowPhase(draft, {
+    workflowRunId,
+    to,
+    now,
+  });
+  if (!transitioned.ok) {
+    return {
+      ok: false,
+      error: transitioned.error,
+      presenter: 'error',
+    };
+  }
+  return undefined;
+}
+
+export function routeThink(
+  draft: TaskStoreFile,
+  request: CommandRequest,
+  rootTaskId: string,
+  now: string,
+): CommandResult {
+  const gate = phaseOk(draft, rootTaskId, ['draft', 'thinking', 'planning', 'awaiting_plan_approval']);
+  if (!gate.ok) return { ...gate.result, commandId: 'think' };
+  const phaseError = transitionIfNeeded(draft, gate.workflowRunId, gate.phase, 'thinking', now);
+  if (phaseError) return { ...phaseError, commandId: 'think' };
+  const root = draft.tasks[rootTaskId];
+  const goal = request.rawArgs || root?.goal || 'focused task';
+  const artifactId = randomUUID();
+  attachArtifact(draft, {
+    id: artifactId,
+    contractVersion: WORKFLOW_CONTRACT_VERSION,
+    kind: 'decision_brief',
+    rootTaskId,
+    workflowRunId: gate.workflowRunId,
+    producedByTaskId: rootTaskId,
+    producedAt: now,
+    consumer: 'planner',
+    body: {
+      goal,
+      problemSummary: `Decision brief for ${goal}`,
+      constraints: ['Do not modify files during thinking.'],
+      openQuestions: [],
+      assumptions: ['The focused task describes the intended work.'],
+      risks: ['Implementation details still need plan approval.'],
+      recommendedApproach: 'Create a plan artifact before execution.',
+      alternatives: [
+        {
+          option: 'Answer directly',
+          tradeoff: 'Appropriate only for non-task chat, not workflow execution.',
+        },
+      ],
+      confidence: 'medium',
+      unknowns: [],
+      evidence: [
+        {
+          id: `command:${artifactId}`,
+          kind: 'command',
+          summary: '/think command created this decision brief',
+          producedAt: now,
+        },
+      ],
+    },
+  });
+  return {
+    ok: true,
+    commandId: 'think',
+    effectClass: 'mutate_plan',
+    presenter: 'plan_card',
+    message: 'Decision brief created',
+    data: { artifactId, phase: 'thinking' },
+  };
+}
+
+export function routePlan(
+  draft: TaskStoreFile,
+  request: CommandRequest,
+  rootTaskId: string,
+  now: string,
+): CommandResult {
+  const gate = phaseOk(draft, rootTaskId, ['draft', 'thinking', 'planning', 'awaiting_plan_approval']);
+  if (!gate.ok) return { ...gate.result, commandId: 'plan' };
+  const phaseError = transitionIfNeeded(draft, gate.workflowRunId, gate.phase, 'planning', now);
+  if (phaseError) return { ...phaseError, commandId: 'plan' };
+  const root = draft.tasks[rootTaskId];
+  const run = getWorkflowRunForRoot(draft, rootTaskId);
+  if (!run) {
+    return commandError('plan', 'NOT_FOUND', 'workflow run not found');
+  }
+  const revision = run.planRevision + 1;
+  const artifactId = randomUUID();
+  const goal = request.rawArgs || root?.goal || 'focused task';
+  const currentDecisionBriefId = run.currentDecisionBriefId;
+  const plan: PlanArtifact = {
+    id: artifactId,
+    contractVersion: WORKFLOW_CONTRACT_VERSION,
+    kind: 'plan',
+    rootTaskId,
+    workflowRunId: gate.workflowRunId,
+    planRevision: revision,
+    producedByTaskId: rootTaskId,
+    producedAt: now,
+    consumer: 'planner',
+    body: {
+      title: `Plan for ${goal}`,
+      summary: 'Native Muster plan generated from the focused workflow command.',
+      goal,
+      revision,
+      ...(revision > 1 ? { revisesRevision: revision - 1 } : {}),
+      ...(currentDecisionBriefId ? { decisionBriefId: currentDecisionBriefId } : {}),
+      tasks: [
+        {
+          proposalId: 'implement',
+          goal: `Implement: ${goal}`,
+          role: 'worker',
+          backend: root?.backend ?? 'claude',
+          ...(root?.model ? { model: root.model } : {}),
+          dependsOn: [],
+          acceptanceCriteria: ['Implementation matches the approved plan goal.'],
+          verification: ['Run /test, /review, and /verify before /finish.'],
+        },
+      ],
+      acceptanceCriteria: ['A user can approve the plan before execution starts.'],
+      verificationStrategy: ['Use native slash command verification stages.'],
+      rollbackNotes: ['Archive or replan the workflow; do not delete task data.'],
+      openQuestions: [],
+      constraints: ['No implementation runs before /approve.'],
+      confidence: 'medium',
+      unknowns: [],
+      evidence: [
+        {
+          id: `command:${artifactId}`,
+          kind: 'command',
+          summary: '/plan command created this plan artifact',
+          producedAt: now,
+        },
+      ],
+    },
+  };
+  const staged = stagePlanForApproval(draft, {
+    workflowRunId: gate.workflowRunId,
+    plan,
+    now,
+  });
+  if (!staged.ok) {
+    return {
+      ok: false,
+      commandId: 'plan',
+      error: staged.error,
+      presenter: 'error',
+    };
+  }
+  return {
+    ok: true,
+    commandId: 'plan',
+    effectClass: 'mutate_plan',
+    presenter: 'plan_card',
+    message: 'Plan ready for approval',
+    data: { artifactId, phase: 'awaiting_plan_approval', revision },
+  };
+}
+
 export function routeImplement(
   draft: TaskStoreFile,
   request: CommandRequest,
@@ -73,11 +269,8 @@ export function routeImplement(
 ): CommandResult {
   const gate = phaseOk(draft, rootTaskId, ['approved', 'implementing', 'debugging']);
   if (!gate.ok) return gate.result;
-  transitionWorkflowPhase(draft, {
-    workflowRunId: gate.workflowRunId,
-    to: 'implementing',
-    now,
-  });
+  const phaseError = transitionIfNeeded(draft, gate.workflowRunId, gate.phase, 'implementing', now);
+  if (phaseError) return { ...phaseError, commandId: 'implement' };
   const root = draft.tasks[rootTaskId];
   const handoff = implementHandoffPreamble({
     goal: root?.goal ?? (request.rawArgs || 'implement approved plan'),
@@ -109,11 +302,8 @@ export function routeTest(
     'verifying',
   ]);
   if (!gate.ok) return gate.result;
-  transitionWorkflowPhase(draft, {
-    workflowRunId: gate.workflowRunId,
-    to: 'testing',
-    now,
-  });
+  const phaseError = transitionIfNeeded(draft, gate.workflowRunId, gate.phase, 'testing', now);
+  if (phaseError) return { ...phaseError, commandId: 'test' };
   const checks = cwd ? discoverPackageScripts(cwd) : [];
   const selected = defaultVerificationSelection(checks);
   const artifactId = randomUUID();
@@ -162,11 +352,8 @@ export function routeReview(
     'verifying',
   ]);
   if (!gate.ok) return gate.result;
-  transitionWorkflowPhase(draft, {
-    workflowRunId: gate.workflowRunId,
-    to: 'reviewing',
-    now,
-  });
+  const phaseError = transitionIfNeeded(draft, gate.workflowRunId, gate.phase, 'reviewing', now);
+  if (phaseError) return { ...phaseError, commandId: 'review' };
   const artifactId = randomUUID();
   attachArtifact(draft, {
     id: artifactId,
@@ -213,11 +400,8 @@ export function routeDebug(
     'finishing',
   ]);
   if (!gate.ok) return gate.result;
-  transitionWorkflowPhase(draft, {
-    workflowRunId: gate.workflowRunId,
-    to: 'debugging',
-    now,
-  });
+  const phaseError = transitionIfNeeded(draft, gate.workflowRunId, gate.phase, 'debugging', now);
+  if (phaseError) return { ...phaseError, commandId: 'debug' };
   const symptom = request.rawArgs || 'unspecified failure';
   const artifactId = randomUUID();
   attachArtifact(draft, {
@@ -264,11 +448,8 @@ export function routeVerify(
     'verifying',
   ]);
   if (!gate.ok) return gate.result;
-  transitionWorkflowPhase(draft, {
-    workflowRunId: gate.workflowRunId,
-    to: 'verifying',
-    now,
-  });
+  const phaseError = transitionIfNeeded(draft, gate.workflowRunId, gate.phase, 'verifying', now);
+  if (phaseError) return { ...phaseError, commandId: 'verify' };
   const checks = cwd ? defaultVerificationSelection(discoverPackageScripts(cwd)) : [];
   const artifactId = randomUUID();
   // Staged report is not overallPassed — evidence required for success claims
@@ -320,11 +501,8 @@ export function routeFinish(
     'implementing',
   ]);
   if (!gate.ok) return gate.result;
-  transitionWorkflowPhase(draft, {
-    workflowRunId: gate.workflowRunId,
-    to: 'finishing',
-    now,
-  });
+  const phaseError = transitionIfNeeded(draft, gate.workflowRunId, gate.phase, 'finishing', now);
+  if (phaseError) return { ...phaseError, commandId: 'finish' };
 
   // Collect evidence refs from existing artifacts
   const artifacts = Object.values(draft.workflowArtifacts ?? {}).filter(
@@ -390,6 +568,83 @@ export function routeFinish(
   };
 }
 
+export function routeBackend(
+  draft: TaskStoreFile,
+  request: CommandRequest,
+  rootTaskId: string,
+  now: string,
+): CommandResult {
+  const backend = request.argv[0];
+  if (!backend) {
+    return commandError('backend', 'COMMAND_ARGS', '/backend requires a backend id');
+  }
+  if (!KNOWN_BACKENDS.has(backend)) {
+    return commandError('backend', 'COMMAND_ARGS', `Unknown backend '${backend}'`, {
+      knownBackends: [...KNOWN_BACKENDS],
+    });
+  }
+  const gate = phaseOk(draft, rootTaskId, PRE_EXECUTION_PHASES);
+  if (!gate.ok) return { ...gate.result, commandId: 'backend' };
+  if (hasActiveTurn(draft, rootTaskId)) {
+    return commandError('backend', 'TRANSITION_DENIED', '/backend requires the root task to be idle');
+  }
+  const root = draft.tasks[rootTaskId];
+  if (!root) {
+    return commandError('backend', 'NOT_FOUND', 'root task not found');
+  }
+  draft.tasks[rootTaskId] = {
+    ...root,
+    backend,
+    revision: root.revision + 1,
+    updatedAt: now,
+  };
+  return {
+    ok: true,
+    commandId: 'backend',
+    effectClass: 'mutate_store',
+    presenter: 'message',
+    message: `Backend set to ${backend}`,
+    data: { taskId: rootTaskId, backend },
+  };
+}
+
+export function routeModel(
+  draft: TaskStoreFile,
+  request: CommandRequest,
+  rootTaskId: string,
+  now: string,
+): CommandResult {
+  const model = request.argv[0];
+  if (!model) {
+    return commandError('model', 'COMMAND_ARGS', '/model requires a model id');
+  }
+  const gate = phaseOk(draft, rootTaskId, PRE_EXECUTION_PHASES);
+  if (!gate.ok) return { ...gate.result, commandId: 'model' };
+  if (hasActiveTurn(draft, rootTaskId)) {
+    return commandError('model', 'TRANSITION_DENIED', '/model requires the root task to be idle');
+  }
+  const root = draft.tasks[rootTaskId];
+  if (!root) {
+    return commandError('model', 'NOT_FOUND', 'root task not found');
+  }
+  const next = model === 'auto' || model === 'default'
+    ? { ...root, model: undefined }
+    : { ...root, model };
+  draft.tasks[rootTaskId] = {
+    ...next,
+    revision: root.revision + 1,
+    updatedAt: now,
+  };
+  return {
+    ok: true,
+    commandId: 'model',
+    effectClass: 'mutate_store',
+    presenter: 'message',
+    message: next.model ? `Model set to ${next.model}` : 'Model reset to backend default',
+    data: { taskId: rootTaskId, model: next.model },
+  };
+}
+
 export function dispatchWorkflowRoute(
   draft: TaskStoreFile,
   request: CommandRequest,
@@ -410,16 +665,18 @@ export function dispatchWorkflowRoute(
       return routeVerify(draft, request, rootTaskId, now, cwd);
     case 'finish':
       return routeFinish(draft, request, rootTaskId, now);
+    case 'backend':
+      return routeBackend(draft, request, rootTaskId, now);
+    case 'model':
+      return routeModel(draft, request, rootTaskId, now);
+    case 'fork':
+      return commandError('fork', 'COMMAND_ARGS', '/fork is not implemented yet');
+    case 'retry':
+      return commandError('retry', 'COMMAND_ARGS', '/retry is not implemented yet');
     case 'think':
+      return routeThink(draft, request, rootTaskId, now);
     case 'plan':
-      return {
-        ok: true,
-        commandId: request.commandId,
-        effectClass: 'mutate_plan',
-        presenter: 'message',
-        message: `Continue ${request.commandId} via planner turn (submit_* bridge tools)`,
-        data: { phase: getWorkflowRunForRoot(draft, rootTaskId)?.phase },
-      };
+      return routePlan(draft, request, rootTaskId, now);
     case 'context': {
       const report = buildContextReport(draft, rootTaskId);
       return {

@@ -223,7 +223,27 @@ export function registerBackendSelect(el: (HTMLElement & { value: string }) | un
 
 /** Read the dropdown at send time so the chosen backend drives new-task creation. */
 export function resolveBackendForSend(): WebviewBackendId {
-  const fromSelect = backendSelectEl?.value;
+  return resolveBackendSelectionForSend().backend;
+}
+
+/**
+ * Read the backend/model picker at send time. The grouped picker encodes a
+ * model option as `backend::model`; do not fall back to the previous backend
+ * when a web component has not delivered its change event yet.
+ */
+export function resolveBackendSelectionForSend(): { backend: WebviewBackendId; model?: string } {
+  const fromSelect = backendSelectEl?.value ?? '';
+  const separator = fromSelect.indexOf('::');
+  if (separator > 0) {
+    const backend = fromSelect.slice(0, separator);
+    const model = fromSelect.slice(separator + 2);
+    if (
+      model &&
+      (backend === 'claude' || backend === 'grok' || backend === 'kiro' || backend === 'codex' || backend === 'opencode')
+    ) {
+      return { backend, model };
+    }
+  }
   if (
     fromSelect === 'claude' ||
     fromSelect === 'grok' ||
@@ -231,7 +251,10 @@ export function resolveBackendForSend(): WebviewBackendId {
     fromSelect === 'codex' ||
     fromSelect === 'opencode'
   ) {
-    return fromSelect;
+    return { backend: fromSelect };
   }
-  return tasks.selectedBackend;
+  return {
+    backend: tasks.selectedBackend,
+    ...(tasks.selectedModel ? { model: tasks.selectedModel } : {}),
+  };
 }
