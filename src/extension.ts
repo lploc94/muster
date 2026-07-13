@@ -1285,11 +1285,15 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           }
           {
             const instruction = typeof data.instruction === 'string' ? data.instruction.trim() : '';
-            if (!instruction) {
+            const reuseOriginalInputs = data.reuseOriginalInputs === true;
+            // Explicit original-input replay may omit instruction (reuses prior inputs).
+            const effectiveInstruction =
+              instruction || (reuseOriginalInputs ? 'Run again' : '');
+            if (!effectiveInstruction) {
               this.postCommandError('retryTurn requires a non-empty instruction', data.taskId);
               break;
             }
-            if (instruction.length > MAX_MESSAGE_CHARS) {
+            if (effectiveInstruction.length > MAX_MESSAGE_CHARS) {
               this.postCommandError('instruction too long', data.taskId);
               break;
             }
@@ -1298,7 +1302,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
               this.postCommandError('turn does not belong to task', data.taskId);
               break;
             }
-            const result = taskEngine.retryTurn(data.turnId, instruction);
+            const result = taskEngine.retryTurn(data.turnId, effectiveInstruction, {
+              reuseOriginalInputs,
+            });
             if (!result.ok) {
               this.postCommandError(result.reason, data.taskId);
             }

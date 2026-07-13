@@ -1563,7 +1563,11 @@ export class TaskEngine {
     return { ok: true, value: undefined };
   }
 
-  retryTurn(turnId: string, instruction: string): EngineResult<{ turnId: string }> {
+  retryTurn(
+    turnId: string,
+    instruction: string,
+    options?: { reuseOriginalInputs?: boolean },
+  ): EngineResult<{ turnId: string }> {
     const taskId = this.store.getFile().turns[turnId]?.taskId;
     if (!taskId) {
       return { ok: false, reason: 'turn not found' };
@@ -1581,6 +1585,7 @@ export class TaskEngine {
         turnId: newTurnId,
         instruction,
         now,
+        reuseOriginalInputs: options?.reuseOriginalInputs === true,
       });
       if (!result.ok) {
         return result;
@@ -1913,10 +1918,27 @@ export class TaskEngine {
 
   /** Every persisted queued turn survives reload unscheduled until an explicit resume. */
   private deferReloadQueuedTurns(): void {
-    for (const turn of Object.values(this.store.getFile().turns)) {
+    const file = this.store.getFile();
+    for (const turn of Object.values(file.turns)) {
       if (turn.status === 'queued') {
         this.deferredQueuedTurns.add(turn.id);
       }
+    }
+    // Phase C: auto-reschedule durable safe retries that were mid-backoff across reload.
+    for (const turn of Object.values(file.turns)) {
+      if (turn.status !== 'queued' || !turn.retryOf) continue;
+      const pred = file.turns[turn.retryOf];
+      if (!pred || pred.failureClass !== 'safe_to_retry') continue;
+      this.deferredQueuedTurns.delete(turn.id);
+      const retryIndex = Math.max(1, retryCountOf(
+        Object.values(file.turns).filter((t) => t.taskId === turn.taskId),
+        turn.id,
+      ));
+      const baseMs = Math.min(30_000, 250 * 2 ** Math.min(retryIndex - 1, 6));
+      const jitter = Math.floor(Math.random() * Math.min(500, baseMs));
+      setTimeout(() => {
+        void this.scheduleTurn(turn.id);
+      }, baseMs + jitter);
     }
   }
 
@@ -3019,10 +3041,16 @@ export class TaskEngine {
         );
         if (retryTurnEntry) {
           // Bounded exponential backoff + jitter for safe auto-retries (Phase C).
-          const retryIndex = Math.max(1, retryCountOf(
-            Object.values(this.store.getFile().turns).filter((t) => t.taskId === retryTurnEntry.taskId),
-            turnId,
-          ));
+          // Depth is measured from the new retry turn's chain, not the failed predecessor alone.
+          const retryIndex = Math.max(
+            1,
+            retryCountOf(
+              Object.values(this.store.getFile().turns).filter(
+                (t) => t.taskId === retryTurnEntry.taskId,
+              ),
+              retryTurnEntry.id,
+            ),
+          );
           const baseMs = Math.min(30_000, 250 * 2 ** Math.min(retryIndex - 1, 6));
           const jitter = Math.floor(Math.random() * Math.min(500, baseMs));
           const delayMs = baseMs + jitter;

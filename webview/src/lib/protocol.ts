@@ -320,7 +320,14 @@ export type OutMessage =
     }
   | { type: 'submitPermission'; permissionId: string; optionId: string; remember: boolean }
   | { type: 'cancelPermission'; permissionId: string }
-  | { type: 'retryTurn'; taskId: string; turnId: string; instruction: string }
+  | {
+      type: 'retryTurn';
+      taskId: string;
+      turnId: string;
+      instruction: string;
+      /** Phase C explicit replay: reuse prior turn inputs (byte-stable prompt). */
+      reuseOriginalInputs?: boolean;
+    }
   | { type: 'continueTask'; taskId: string; instruction: string }
   /**
    * Deliver an instruction to the currently running, locally owned turn for

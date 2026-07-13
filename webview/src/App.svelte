@@ -428,8 +428,15 @@
 
         case 'sendRejected': {
           const rejected = outboxList(vscode).find((e) => e.clientRequestId === msg.clientRequestId);
+          // Restore draft only when scoped to the focused task (or draft/new-task)
+          // and composer is empty — never overwrite a newer draft the user typed.
           if (rejected?.keepDraft && rejected.text) {
-            tasks.prefillComposer(rejected.text);
+            const sameScope =
+              (!rejected.taskId && tasks.draftMode) ||
+              (!!rejected.taskId && rejected.taskId === tasks.focusedTaskId);
+            if (sameScope) {
+              tasks.prefillComposer(rejected.text);
+            }
           }
           outboxRemove(vscode, msg.clientRequestId);
           if (isTaskScopedBannerVisible(msg.taskId, tasks.focusedTaskId)) {

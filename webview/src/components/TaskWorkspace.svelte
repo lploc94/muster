@@ -152,12 +152,13 @@
 
   function submitRunAgain(): void {
     if (!focused || !recoveryTurnId) return;
-    // Explicit replay authorization for uncertain work (not silent).
+    // Explicit replay authorization: reuse original turn inputs (not silent).
     post({
       type: 'retryTurn',
       taskId: focused.id,
       turnId: recoveryTurnId,
-      instruction: 'Run again: re-execute the previous user instruction carefully.',
+      instruction: 'Run again',
+      reuseOriginalInputs: true,
     });
   }
 

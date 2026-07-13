@@ -641,7 +641,7 @@ export function retryTurn(
   }
 
   const inputs = options.reuseOriginalInputs
-    ? oldTurn.inputs.filter((input) => input.kind === 'message')
+    ? [...oldTurn.inputs]
     : [
         {
           kind: 'recovery' as const,
@@ -650,7 +650,7 @@ export function retryTurn(
         },
       ];
   if (options.reuseOriginalInputs && inputs.length === 0) {
-    return { ok: false, reason: 'cannot reuse original inputs: no message inputs' };
+    return { ok: false, reason: 'cannot reuse original inputs: empty input list' };
   }
 
   return queueTurn(task, turns, {
