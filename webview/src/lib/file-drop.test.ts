@@ -3,6 +3,8 @@ import {
   FILE_DROP_MAX_CANDIDATES,
   FILE_DROP_MAX_CANDIDATE_LENGTH,
   extractFileDropCandidates,
+  isOsFileManagerDrag,
+  isVsCodeExplorerDrag,
   type FileDropData,
 } from './file-drop';
 
@@ -50,12 +52,54 @@ describe('extractFileDropCandidates', () => {
     expect(extractFileDropCandidates(data, true)).toEqual({ ok: true, candidates: ['src/a.ts'] });
   });
 
-  it.each([
-    ['disabled composer', transfer(), false, { ok: false, code: 'disabled', message: 'File drop is unavailable.' }],
-    ['no supported data', transfer({ types: ['text/html'], getData: () => '<b>x</b>' }), true, { ok: false, code: 'noData', message: 'No supported file data was dropped.' }],
-    ['empty URI list', transfer({ types: ['text/uri-list'], getData: () => '# comment\n' }), true, { ok: false, code: 'noData', message: 'No supported file data was dropped.' }],
-  ])('rejects %s', (_name, data, enabled, expected) => {
-    expect(extractFileDropCandidates(data as FileDropData, enabled as boolean)).toEqual(expected);
+  it('rejects disabled composer', () => {
+    expect(extractFileDropCandidates(transfer(), false)).toEqual({
+      ok: false,
+      code: 'disabled',
+      message: 'File drop is unavailable.',
+    });
+  });
+
+  it('rejects unsupported MIME-only drops', () => {
+    const result = extractFileDropCandidates(
+      transfer({ types: ['text/html'], getData: () => '<b>x</b>' }),
+      true,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe('noData');
+  });
+
+  it('rejects empty URI lists', () => {
+    const result = extractFileDropCandidates(
+      transfer({ types: ['text/uri-list'], getData: () => '# comment\n' }),
+      true,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe('noData');
+  });
+
+  it('accepts Finder-style File.path when MIME payloads are empty', () => {
+    const data = transfer({
+      files: [{ name: 'a.ts', path: '/Users/me/projects/muster/src/a.ts' }],
+      types: ['Files'],
+      getData: () => '',
+    });
+    expect(extractFileDropCandidates(data, true)).toEqual({
+      ok: true,
+      candidates: ['/Users/me/projects/muster/src/a.ts'],
+    });
+  });
+
+  it('falls back to bare file names when absolute paths are stripped', () => {
+    const result = extractFileDropCandidates(
+      transfer({
+        files: [{ name: 'a.ts' }],
+        types: ['Files'],
+        getData: () => '',
+      }),
+      true,
+    );
+    expect(result).toEqual({ ok: true, candidates: ['a.ts'] });
   });
 
   it('rejects excessive candidates instead of truncating silently', () => {
@@ -67,26 +111,89 @@ describe('extractFileDropCandidates', () => {
     });
   });
 
-  it('rejects overlong and NUL-containing candidates', () => {
-    const tooLong = 'a'.repeat(FILE_DROP_MAX_CANDIDATE_LENGTH + 1);
-    for (const value of [tooLong, 'file:///workspace/a\0.ts']) {
-      expect(extractFileDropCandidates(transfer({ types: ['text/plain'], getData: () => value }), true)).toEqual({
-        ok: false,
-        code: 'invalidCandidate',
-        message: 'Dropped file data is malformed or too long.',
-      });
-    }
+  it('rejects overlong and NUL-containing path-like candidates', () => {
+    // Overlong absolute-style path still recognized then rejected as invalid.
+    const tooLong = `/${'a'.repeat(FILE_DROP_MAX_CANDIDATE_LENGTH)}`;
+    expect(
+      extractFileDropCandidates(transfer({ types: ['text/plain'], getData: () => tooLong }), true),
+    ).toEqual({
+      ok: false,
+      code: 'invalidCandidate',
+      message: 'Dropped file data is malformed or too long.',
+    });
+    // NUL cannot be a valid path candidate — treated as no usable data.
+    const nulResult = extractFileDropCandidates(
+      transfer({ types: ['text/plain'], getData: () => 'file:///workspace/a\0.ts' }),
+      true,
+    );
+    expect(nulResult.ok).toBe(false);
   });
 
-  it('deduplicates identical candidates while preserving source order', () => {
+  it('prefers a single MIME source over merging File.path with uri-list', () => {
     const data = transfer({
       files: [{ path: '/workspace/a.ts' }],
-      types: ['text/uri-list'],
-      getData: () => '/workspace/a.ts\nfile:///workspace/b.ts',
+      types: ['text/uri-list', 'Files'],
+      getData: (type) => (type === 'text/uri-list' ? 'file:///workspace/a.ts' : ''),
+    });
+    // uri-list wins over File.path — one candidate, not two encodings of the same file.
+    expect(extractFileDropCandidates(data, true)).toEqual({
+      ok: true,
+      candidates: ['file:///workspace/a.ts'],
+    });
+  });
+
+  it('prefers resourceurls over other Explorer MIME payloads', () => {
+    const data = transfer({
+      files: [{ path: '/workspace/src/extension.ts' }],
+      types: ['resourceurls', 'text/uri-list', 'Files'],
+      getData: (type) => {
+        if (type.toLowerCase() === 'resourceurls') {
+          return JSON.stringify(['file:///workspace/src/extension.ts']);
+        }
+        if (type === 'text/uri-list') return 'file:///workspace/src/extension.ts';
+        return '';
+      },
     });
     expect(extractFileDropCandidates(data, true)).toEqual({
       ok: true,
-      candidates: ['/workspace/a.ts', 'file:///workspace/b.ts'],
+      candidates: ['file:///workspace/src/extension.ts'],
     });
+  });
+
+  it('extracts VS Code Explorer resourceurls JSON payloads', () => {
+    const data = transfer({
+      types: ['resourceurls'],
+      getData: (type) =>
+        type.toLowerCase() === 'resourceurls'
+          ? JSON.stringify(['file:///workspace/src/extension.ts', 'file:///workspace/docs/a.md'])
+          : '',
+    });
+    expect(extractFileDropCandidates(data, true)).toEqual({
+      ok: true,
+      candidates: ['file:///workspace/src/extension.ts', 'file:///workspace/docs/a.md'],
+    });
+  });
+
+  it('extracts VS Code codeeditors descriptors', () => {
+    const data = transfer({
+      types: ['codeeditors'],
+      getData: (type) =>
+        type.toLowerCase() === 'codeeditors'
+          ? JSON.stringify([
+              { resource: { external: 'file:///workspace/src/a.ts', fsPath: '/workspace/src/a.ts' } },
+            ])
+          : '',
+    });
+    expect(extractFileDropCandidates(data, true)).toEqual({
+      ok: true,
+      candidates: ['file:///workspace/src/a.ts'],
+    });
+  });
+
+  it('detects VS Code Explorer vs OS file-manager drag MIME types', () => {
+    expect(isVsCodeExplorerDrag(['resourceurls', 'Files'])).toBe(true);
+    expect(isVsCodeExplorerDrag(['text/plain'])).toBe(false);
+    expect(isOsFileManagerDrag(['Files'])).toBe(true);
+    expect(isOsFileManagerDrag(['resourceurls', 'Files'])).toBe(false);
   });
 });

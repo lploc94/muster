@@ -125,6 +125,18 @@ async function dispatchFileDrag(page: Page, type: 'dragover' | 'drop', mime: str
   }, { type, mime, value });
 }
 
+async function dispatchFileDragMulti(
+  page: Page,
+  type: 'dragover' | 'drop',
+  entries: Array<{ mime: string; value: string }>,
+) {
+  await page.locator('.composer-shell').evaluate((element, args) => {
+    const transfer = new DataTransfer();
+    for (const entry of args.entries) transfer.setData(entry.mime, entry.value);
+    element.dispatchEvent(new DragEvent(args.type, { bubbles: true, cancelable: true, dataTransfer: transfer }));
+  }, { type, entries });
+}
+
 async function expectButtonDisabledAttribute(page: Page, name: string) {
   await expect
     .poll(() => page.getByRole('button', { name }).evaluate((button) => button.hasAttribute('disabled')))
@@ -240,8 +252,8 @@ test.describe('Muster webview host state smoke', () => {
     await expectPostedMessage(page, { type: 'pickFile' });
     await expect(menu).toHaveCount(0);
 
-    await postRawHostMessage(page, { type: 'filePicked', path: 'src/extension.ts' });
-    await expect(composer).toHaveValue('Review this @src/extension.ts ');
+    await postRawHostMessage(page, { type: 'filePicked', path: 'src/extension.ts', displayName: 'extension.ts' });
+    await expect(composer).toHaveValue('Review this @extension.ts ');
 
     await composer.fill('Review @src/extension.ts');
     await page.getByRole('button', { name: 'Send' }).click();
@@ -260,11 +272,13 @@ test.describe('Muster webview host state smoke', () => {
     const composer = page.getByPlaceholder('Start a new coordinator task with claude…');
     await composer.fill('Review before after');
     await composer.evaluate((el: HTMLTextAreaElement) => el.setSelectionRange(7, 7));
-    await postRawHostMessage(page, { type: 'filePicked', path: 'docs/my file.md' });
+    // UI inserts display basename only; full path is bound for expand-on-send.
+    await postRawHostMessage(page, { type: 'filePicked', path: 'docs/my file.md', displayName: 'my file.md' });
 
-    await expect(composer).toHaveValue('Review @"docs/my file.md" before after');
+    await expect(composer).toHaveValue('Review @"my file.md" before after');
     await expect(composer).toBeFocused();
-    await expect.poll(() => composer.evaluate((el: HTMLTextAreaElement) => el.selectionStart)).toBe(26);
+    // "Review " = 7, + @"my file.md" = 13, + trailing space = 21 → caret at 7+13+1 = 21
+    await expect.poll(() => composer.evaluate((el: HTMLTextAreaElement) => el.selectionStart)).toBe(21);
   });
 
   test('drops a file through the host contract and projects sanitized failures without changing the draft', async ({ page }) => {
@@ -284,8 +298,25 @@ test.describe('Muster webview host state smoke', () => {
     await expectPostedMessage(page, { type: 'resolveFileDrop', candidates: ['file:///workspace/docs/my%20file.md'] });
     await expect(shell).not.toHaveClass(/composer-shell--dragging/);
 
-    await postRawHostMessage(page, { type: 'filePicked', path: 'docs/my file.md' });
-    await expect(composer).toHaveValue('Use @"docs/my file.md" this');
+    await postRawHostMessage(page, { type: 'filePicked', path: 'docs/my file.md', displayName: 'my file.md' });
+    await expect(composer).toHaveValue('Use @"my file.md" this');
+
+    // VS Code Explorer uses resourceurls JSON, not text/uri-list.
+    await composer.fill('Explorer ');
+    await composer.evaluate((el: HTMLTextAreaElement) => el.setSelectionRange(9, 9));
+    await dispatchFileDragMulti(page, 'dragover', [
+      { mime: 'resourceurls', value: JSON.stringify(['file:///workspace/src/extension.ts']) },
+    ]);
+    await expect(page.getByRole('status').getByText(/Hold Shift and drop/i)).toBeVisible();
+    await dispatchFileDragMulti(page, 'drop', [
+      { mime: 'resourceurls', value: JSON.stringify(['file:///workspace/src/extension.ts']) },
+    ]);
+    await expectPostedMessage(page, {
+      type: 'resolveFileDrop',
+      candidates: ['file:///workspace/src/extension.ts'],
+    });
+    await postRawHostMessage(page, { type: 'filePicked', path: 'src/extension.ts', displayName: 'extension.ts' });
+    await expect(composer).toHaveValue('Explorer @extension.ts ');
 
     await composer.fill('Keep draft');
     await dispatchFileDrag(page, 'dragover', 'text/plain', 'outside.txt');
@@ -341,8 +372,12 @@ test.describe('Muster webview host state smoke', () => {
     await expect(addContextButton).toHaveAttribute('aria-expanded', 'false');
     await expect(composer).toHaveValue('Inspect');
 
-    await postRawHostMessage(page, { type: 'filePicked', path: 'src/host/workspace-files.ts' });
-    await expect(composer).toHaveValue('Inspect @src/host/workspace-files.ts ');
+    await postRawHostMessage(page, {
+      type: 'filePicked',
+      path: 'src/host/workspace-files.ts',
+      displayName: 'workspace-files.ts',
+    });
+    await expect(composer).toHaveValue('Inspect @workspace-files.ts ');
   });
 
   test('Add Context menu renders future model actions as disabled coming-soon entries', async ({ page }) => {
@@ -565,19 +600,17 @@ test.describe('Muster webview host state smoke', () => {
     });
 
     await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Cancelled/i })).toBeVisible();
-    await expect(page.locator('.task-action-panel--muted').getByText(/This task is closed; use Continue as new task/i)).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Continue as new task' })).toBeVisible();
-    await expect(page.locator('.composer-guidance').getByText(/This task is closed; use Continue as new task/i)).toBeVisible();
-    await page.getByRole('button', { name: 'Continue as new task' }).click();
-    await expectPostedMessage(page, { type: 'newTask' });
-    await expect(page.getByText('Continue as new task')).toBeVisible();
-    await page.getByPlaceholder('Start a new coordinator task with claude…').fill('Open a follow-up after cancellation.');
-    await page.getByRole('button', { name: 'Send' }).click();
+    await expect(page.locator('.task-action-panel--warning').getByText(/This task is cancelled/i)).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Reopen' })).toBeVisible();
+    // Single warning (panel + Reopen only) — no duplicate under the composer.
+    await expect(page.locator('.composer-guidance')).toHaveCount(0);
+    // Composer stays enabled — warning only (native layered textarea).
+    await expect(page.locator('.composer-input__textarea')).toBeEnabled();
+    await page.getByRole('button', { name: 'Reopen' }).click();
     await expectPostedMessage(page, {
-      type: 'send',
-      text: 'Open a follow-up after cancellation.',
-      backend: 'claude',
-      continuationOf: 'task-cancelled',
+      type: 'setTaskLifecycle',
+      taskId: 'task-cancelled',
+      lifecycle: 'open',
     });
 
     await postSnapshot(page, {
@@ -615,9 +648,10 @@ test.describe('Muster webview host state smoke', () => {
     });
 
     await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Failed/i })).toBeVisible();
-    // Soft failed: reopen via send on the same task — not hard-terminal "Continue as new".
+    // Soft failed: reopen via send or Reopen on the same task id.
     await page.locator('.task-workspace-banner').getByRole('button', { name: /Expand task details/i }).click();
-    await expect(page.getByText(/Send a message to reopen/i).first()).toBeVisible();
+    await expect(page.getByText(/This task is failed/i).first()).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Reopen' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Continue as new task' })).toHaveCount(0);
 
     await postSnapshot(page, {
@@ -630,7 +664,8 @@ test.describe('Muster webview host state smoke', () => {
     });
 
     await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Succeeded/i })).toBeVisible();
-    await expect(page.locator('.task-action-panel--muted').getByText(/This task is closed; use Continue as new task/i)).toBeVisible();
+    await expect(page.locator('.task-action-panel--warning').getByText(/This task is succeeded/i)).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Reopen' })).toBeVisible();
 
     await postCommandError(page, {
       type: 'commandError',

@@ -69,7 +69,7 @@ describe('canMutateQueuedTurn / isQueuedTurnMutable', () => {
     expect(canMutateQueuedTurn(baseTurn())).toBe(true);
     expect(canMutateQueuedTurn({ ...baseTurn(), status: 'queued' })).toBe(true);
     // Defensive: any non-queued status locks controls (dispatched / stale).
-    expect(canMutateQueuedTurn({ turnId: 'x', status: 'running' as 'queued' })).toBe(false);
+    expect(canMutateQueuedTurn({ status: 'running' })).toBe(false);
   });
 
   it('locks controls when turnId is no longer present in the live queuedTurns projection', () => {

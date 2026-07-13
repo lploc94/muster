@@ -1,6 +1,5 @@
 import type { NormalizedEvent } from './types';
 import type { TaskRuntimeActivity, TaskViewStatus, TranscriptItem } from './protocol';
-import { isHardTerminalLifecycle } from './protocol';
 import type { ThreadItem } from './turn-state.svelte';
 
 function asText(content: unknown): string {
@@ -115,9 +114,8 @@ export class TaskThread {
     if (this.running || runtime === 'needs_recovery' || next.length > 0) {
       this.hadProcess = true;
     }
-    // Soft failed stays writable; only hard terminals are read-only.
-    const lifecycle = opts?.lifecycle ?? viewStatus;
-    this.readOnly = lifecycle ? isHardTerminalLifecycle(lifecycle) : false;
+    // Terminal tasks stay writable: send reopens the same task to open.
+    this.readOnly = false;
   }
 
   reset(): void {
@@ -359,8 +357,8 @@ class ThreadStore {
     if (transcript) {
       thread.hydrate(transcript, activeTurnId, viewStatus, opts);
     } else if (opts?.lifecycle || viewStatus) {
-      const lifecycle = opts?.lifecycle ?? viewStatus;
-      thread.setReadOnly(lifecycle ? isHardTerminalLifecycle(lifecycle) : false);
+      // Terminal tasks stay writable (send reopens); never lock the composer here.
+      thread.setReadOnly(false);
       const runtime = opts?.runtimeActivity;
       thread.running = runtime === 'running' || runtime === 'waiting_user';
     }
@@ -398,8 +396,9 @@ class ThreadStore {
     this.getOrCreate(taskId).appendTranscript(item);
   }
 
-  updateReadOnly(lifecycleOrViewStatus: string): void {
-    this.current.setReadOnly(isHardTerminalLifecycle(lifecycleOrViewStatus));
+  updateReadOnly(_lifecycleOrViewStatus: string): void {
+    // Terminal tasks stay writable; send reopens the same task to open.
+    this.current.setReadOnly(false);
   }
 
   updateRuntimeFlags(runtimeActivity: TaskRuntimeActivity | null | undefined): void {

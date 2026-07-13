@@ -20,7 +20,8 @@ pnpm-debug.log*
 .DS_Store
 Thumbs.db
 
-# Editor / IDE (local only)
+# Editor / IDE — keep shared VS Code launch/tasks for contributors (F5 Run Extension).
+# Everything else under .vscode stays local-only.
 .vscode/*
 !.vscode/launch.json
 !.vscode/tasks.json
@@ -70,7 +71,7 @@ com[1-9]
 com[1-9].*
 lpt[1-9]
 lpt[1-9].*
-.vscode/
+# Do NOT ignore .vscode/ here — shared launch/tasks/extensions are whitelisted above.
 *.code-workspace
 .next/
 build/

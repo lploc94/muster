@@ -24,12 +24,12 @@ export function isTerminalLifecycle(state: TaskLifecycleState): boolean {
   return TERMINAL_LIFECYCLES.has(state);
 }
 
-/** Hard terminal: read-only; follow-up is a new/continuation task. */
+/** Hard terminal: sealed success/cancel/skip (user may reopen same id). */
 export function isHardTerminalLifecycle(state: TaskLifecycleState): boolean {
   return HARD_TERMINAL_LIFECYCLES.has(state);
 }
 
-/** Soft terminal: user may reopen with a new message on the same task. */
+/** Soft terminal: sealed fail (user may reopen same id). */
 export function isSoftTerminalLifecycle(state: TaskLifecycleState): boolean {
   return state === 'failed';
 }

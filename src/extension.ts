@@ -26,6 +26,7 @@ import { pickWorkspaceFileMentionPath } from './host/workspace-files';
 import { resolveDroppedFileMention } from './host/file-mentions';
 import { routeSendLiveInput } from './host/live-input';
 import { routeDeleteQueuedTurn, routeEditQueuedTurn } from './host/queued-turn-mutations';
+import { importDroppedFileBytes } from './host/import-dropped-file';
 import { PresentationManager } from './host/presentation-manager';
 import {
   createPresentationPanelFactory,
@@ -325,7 +326,13 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       this.postCommandError('Only workspace files can be added to chat.');
       return;
     }
-    this.post({ type: 'filePicked', path: mentionPath });
+    this.postFilePicked(mentionPath);
+  }
+
+  /** Notify webview of a file mention: full `path` for LLM, short display name for chips. */
+  private postFilePicked(resolvePath: string, displayName?: string): void {
+    const base = displayName?.trim() || resolvePath.replace(/\\/g, '/').split('/').pop() || resolvePath;
+    this.post({ type: 'filePicked', path: resolvePath, displayName: base });
   }
 
   private async handleBrowseWorkspaceFiles(): Promise<void> {
@@ -338,7 +345,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
 
       switch (result.type) {
         case 'picked':
-          this.post({ type: 'filePicked', path: result.path });
+          this.postFilePicked(result.path);
           return;
         case 'cancelled':
           return;
@@ -367,7 +374,37 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       stat: (uri) => vscode.workspace.fs.stat(uri as vscode.Uri),
     });
     if (result.ok) {
-      this.post({ type: 'filePicked', path: result.path });
+      this.postFilePicked(result.path);
+    } else {
+      this.postCommandError(result.message);
+    }
+  }
+
+  /**
+   * Persist a Finder/OS drop that the webview could read as bytes but not as a
+   * path (sandbox). Returns an absolute temp path so the LLM can open the file.
+   */
+  private handleImportDroppedFile(name: unknown, data: unknown): void {
+    if (typeof name !== 'string' || !name.trim()) {
+      this.postCommandError('Dropped file is missing a name.');
+      return;
+    }
+    let bytes: Uint8Array | undefined;
+    if (data instanceof ArrayBuffer) {
+      bytes = new Uint8Array(data);
+    } else if (ArrayBuffer.isView(data)) {
+      bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    } else if (Array.isArray(data) && data.every((n) => typeof n === 'number')) {
+      bytes = Uint8Array.from(data);
+    }
+    if (!bytes) {
+      this.postCommandError('Dropped file data is missing.');
+      return;
+    }
+    const result = importDroppedFileBytes(name, bytes);
+    if (result.ok) {
+      // UI shows original name; LLM gets absolute temp path via expand-on-send.
+      this.postFilePicked(result.path, name.trim());
     } else {
       this.postCommandError(result.message);
     }
@@ -793,6 +830,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   private async handleSend(data: {
     taskId?: string;
     text: string;
+    /** Expanded mention paths for the agent; defaults to `text`. */
+    llmText?: string;
     backend?: string;
     model?: string;
     continuationOf?: string;
@@ -805,12 +844,19 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       this.postCommandError('unknown backend', data.taskId);
       return;
     }
+    // `text` = user-visible (display-name chips). `llmText` = agent payload when expanded.
     const text = data.text?.trim();
     if (!text) {
       this.postCommandError('message cannot be empty', data.taskId);
       return;
     }
     if (text.length > MAX_MESSAGE_CHARS) {
+      this.postCommandError('message too long', data.taskId);
+      return;
+    }
+    const llmText =
+      typeof data.llmText === 'string' && data.llmText.trim() ? data.llmText.trim() : text;
+    if (llmText.length > MAX_MESSAGE_CHARS) {
       this.postCommandError('message too long', data.taskId);
       return;
     }
@@ -824,16 +870,13 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         }
       }
 
-      // For new tasks: goal (display name) is trimmed first ~30 chars of the message.
-      // The full text is stored as the actual first user message content.
-      const fullMessage = text;
-      const shortGoal = fullMessage.length <= 30
-        ? fullMessage
-        : fullMessage.slice(0, 30).trim() + '…';
+      // Goal from display text so task titles stay short (not absolute temp paths).
+      const shortGoal = text.length <= 30 ? text : text.slice(0, 30).trim() + '…';
 
       const result = taskEngine.startNewTask({
         goal: shortGoal,
-        message: fullMessage,
+        message: text,
+        agentMessage: llmText !== text ? llmText : undefined,
         backend: data.backend ?? 'claude',
         model: typeof data.model === 'string' && data.model ? data.model : undefined,
         continuationOf: data.continuationOf,
@@ -850,7 +893,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    const result = taskEngine.send(data.taskId, text);
+    const result = taskEngine.send(data.taskId, text, {
+      agentContent: llmText !== text ? llmText : undefined,
+    });
     if (!result.ok) {
       this.postCommandError(result.reason, data.taskId);
       return;
@@ -1188,6 +1233,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           break;
         case 'resolveFileDrop':
           await this.handleResolveFileDrop(data.candidates);
+          break;
+        case 'importDroppedFile':
+          this.handleImportDroppedFile(data.name, data.data);
           break;
         case 'openLink':
           this.handleOpenLink(data.url);

@@ -41,11 +41,10 @@ import {
   cancelPendingTurn,
   cancelTask as transitionCancelTask,
   hasActiveOrQueuedTurn,
-  isHardTerminalLifecycle,
   isTerminalLifecycle,
   prepareDeleteQueuedTurn,
   prepareEditQueuedTurn,
-  reopenSoftFailedTask,
+  reopenTask,
   setTaskLifecycle as transitionSetTaskLifecycle,
   type CreateTaskInput,
   type Effect,
@@ -311,7 +310,7 @@ export function projectPrompt(
     .filter((message): message is TaskMessage => message !== undefined)
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
   for (const message of messageInputs) {
-    parts.push(message.content);
+    parts.push(message.agentContent ?? message.content);
   }
 
   for (const input of turn.inputs) {
@@ -571,8 +570,10 @@ export class TaskEngine {
     model?: string;
     continuationOf?: string;
     role?: TaskRole;
-    /** Full content of the first user message. If not provided, falls back to goal. */
+    /** User-visible first message (display-name mentions). Falls back to goal. */
     message?: string;
+    /** Agent-facing first message when it differs from `message` (expanded paths). */
+    agentMessage?: string;
     /** Workspace directory the agent runs in for this task's turns. */
     cwd?: string;
   }): EngineResult<{ taskId: string; messageId: string; turnId: string }> {
@@ -611,11 +612,16 @@ export class TaskEngine {
       draft.tasks[taskId] = created.next;
 
       const messageContent = params.message ?? params.goal;
+      const agentContent =
+        params.agentMessage && params.agentMessage !== messageContent
+          ? params.agentMessage
+          : undefined;
       draft.messages[messageId] = {
         id: messageId,
         taskId,
         role: 'user',
         content: messageContent,
+        ...(agentContent ? { agentContent } : {}),
         state: 'pending',
         createdAt: now,
       };
@@ -761,22 +767,25 @@ export class TaskEngine {
     return { ok: true, value: { taskId } };
   }
 
-  send(taskId: string, content: string): EngineResult<{ messageId: string; turnId?: string }> {
+  send(
+    taskId: string,
+    content: string,
+    options?: { agentContent?: string },
+  ): EngineResult<{ messageId: string; turnId?: string }> {
     const messageId = randomUUID();
     const now = nowIso(this.clock);
     let queuedTurnId: string | undefined;
+    const agentContent =
+      options?.agentContent && options.agentContent !== content ? options.agentContent : undefined;
 
     const commit = this.store.commit((draft) => {
       let draftTask = draft.tasks[taskId];
       if (!draftTask) {
         return { ok: false, reason: 'task not found' };
       }
-      // Hard terminal: read-only. Soft failed: reopen to open on the same task id.
-      if (isHardTerminalLifecycle(draftTask.lifecycle)) {
-        return { ok: false, reason: 'task is terminal' };
-      }
-      if (draftTask.lifecycle === 'failed') {
-        const reopened = reopenSoftFailedTask(draftTask, { now });
+      // Any terminal lifecycle: reopen to open on the same task id, then queue.
+      if (isTerminalLifecycle(draftTask.lifecycle)) {
+        const reopened = reopenTask(draftTask, { now });
         if (!reopened.ok) {
           return reopened;
         }
@@ -805,6 +814,7 @@ export class TaskEngine {
         taskId,
         role: 'user',
         content,
+        ...(agentContent ? { agentContent } : {}),
         state: 'pending',
         createdAt: now,
       };

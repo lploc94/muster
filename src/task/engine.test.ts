@@ -497,6 +497,31 @@ describe('TaskEngine', () => {
     expect(prompts).toEqual(['first', 'second', 'third']);
   });
 
+  it('reopens hard-terminal tasks on send (same task id)', async () => {
+    const { store } = makeTempStore();
+    const backend: Backend = {
+      name: 'fake',
+      capabilities: MCP_CAPS,
+      async *run() {
+        yield { type: 'sessionStarted', sessionId: 'sess-reopen' };
+        yield { type: 'turnCompleted' };
+      },
+    };
+    const engine = TaskEngine.load({ store, makeBackend: () => backend });
+    engine.createTask({ id: 'task-1', goal: 'done work', backend: 'fake' });
+    expect(engine.setTaskLifecycle('task-1', 'succeeded', { result: 'shipped' }).ok).toBe(true);
+    expect(store.getTask('task-1')?.lifecycle).toBe('succeeded');
+
+    const sent = engine.send('task-1', 'actually more work');
+    expect(sent.ok).toBe(true);
+    expect(store.getTask('task-1')?.lifecycle).toBe('open');
+    expect(store.getTask('task-1')?.finishedAt).toBeUndefined();
+    if (sent.ok) {
+      expect(store.getFile().messages[sent.value.messageId]?.taskId).toBe('task-1');
+    }
+    await engine.whenIdle();
+  });
+
   it('leaves reload running turns untouched when a live lease exists', async () => {
     const { filePath } = makeTempStore();
     const store = TaskStore.load({ filePath });

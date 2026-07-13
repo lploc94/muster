@@ -1,6 +1,7 @@
 <script lang="ts">
   import { post } from '../lib/protocol';
   import { renderMarkdown } from '../lib/markdown';
+  import { renderUserTextWithMentions } from '../lib/file-mention-render';
   import { tip } from '../lib/tooltip';
 
   interface Props {
@@ -12,6 +13,7 @@
   let { role, text, streaming = false, showFooter = true }: Props = $props();
 
   const rendered = $derived(role === 'assistant' && !streaming ? renderMarkdown(text) : '');
+  const userHtml = $derived(role === 'user' ? renderUserTextWithMentions(text) : '');
 
   let copied = $state(false);
   let contentEl: HTMLDivElement | undefined = $state();
@@ -100,10 +102,10 @@
 {#if role === 'user'}
   <div class="flex flex-col items-end">
     <div
-      class="max-w-[85%] whitespace-pre-wrap break-words rounded-lg px-3 py-2 text-sm"
+      class="user-message-bubble max-w-[85%] break-words rounded-lg px-3 py-2 text-sm"
       style="background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);"
     >
-      {text}{#if streaming}<span style="opacity: 0.6;">▋</span>{/if}
+      {@html userHtml}{#if streaming}<span style="opacity: 0.6;">▋</span>{/if}
     </div>
   </div>
 {:else}

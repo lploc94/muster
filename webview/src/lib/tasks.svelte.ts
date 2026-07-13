@@ -30,7 +30,7 @@ class TasksState {
   /** Unpersisted composer — first send has no taskId. */
   draftMode = $state(false);
 
-  /** Set when opening "Continue as new task" from a terminal thread. */
+  /** Optional link when creating a draft after another task (legacy protocol field). */
   continuationOf = $state<string | null>(null);
 
   selectedBackend = $state<WebviewBackendId>('claude');
@@ -84,7 +84,7 @@ class TasksState {
     return this.tasks.get(this.focusedTaskId);
   }
 
-  /** Hard terminal only — soft failed stays editable / reopenable. */
+  /** Hard terminal (succeeded/cancelled/skipped). Soft failed is separate. */
   get focusedIsTerminal(): boolean {
     const task = this.focusedTask;
     return task ? isHardTerminalLifecycle(task.lifecycle) : false;

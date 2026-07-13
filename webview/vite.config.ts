@@ -8,23 +8,59 @@ import { resolve } from 'node:path';
 const root = fileURLToPath(new URL('.', import.meta.url));
 const outDir = fileURLToPath(new URL('../dist/webview', import.meta.url));
 
-function stablePresentationCssAlias(): Plugin {
+/**
+ * Host loads stable paths:
+ *   - dist/webview/assets/index.css        (main chat webview — extension.ts)
+ *   - dist/webview/assets/presentation.css (presentation panel)
+ *
+ * Multi-entry + shared CSS can name the extracted sheet after a chunk (e.g.
+ * markdown.css). Emit the host-expected aliases from that single stylesheet.
+ */
+function stableWebviewCssAliases(): Plugin {
+  const aliases = ['assets/index.css', 'assets/presentation.css'] as const;
+
   return {
-    name: 'stable-presentation-css-alias',
+    name: 'stable-webview-css-aliases',
     generateBundle(_options, bundle) {
-      if (bundle['assets/presentation.css']) return;
       const cssAssets = Object.values(bundle).filter(
         (output): output is Extract<typeof output, { type: 'asset' }> =>
-          output.type === 'asset' && output.fileName.endsWith('.css'),
+          output.type === 'asset' &&
+          output.fileName.endsWith('.css') &&
+          !aliases.includes(output.fileName as (typeof aliases)[number]),
       );
-      if (cssAssets.length !== 1) {
-        this.error(`Expected exactly one shared webview stylesheet, found ${cssAssets.length}`);
+
+      if (cssAssets.length === 0) {
+        // Already emitted under a stable name (e.g. only index.css in bundle).
+        const hasIndex = Boolean(bundle['assets/index.css']);
+        const hasPresentation = Boolean(bundle['assets/presentation.css']);
+        if (hasIndex && hasPresentation) return;
+        if (hasIndex && !hasPresentation) {
+          const source = (bundle['assets/index.css'] as { source: string | Uint8Array }).source;
+          this.emitFile({ type: 'asset', fileName: 'assets/presentation.css', source });
+          return;
+        }
+        if (hasPresentation && !hasIndex) {
+          const source = (bundle['assets/presentation.css'] as { source: string | Uint8Array }).source;
+          this.emitFile({ type: 'asset', fileName: 'assets/index.css', source });
+          return;
+        }
+        this.error('Expected a webview stylesheet to alias as index.css / presentation.css');
       }
-      this.emitFile({
-        type: 'asset',
-        fileName: 'assets/presentation.css',
-        source: cssAssets[0].source,
-      });
+
+      if (cssAssets.length !== 1) {
+        this.error(
+          `Expected exactly one shared webview stylesheet to alias, found ${cssAssets.length}: ${cssAssets
+            .map((a) => a.fileName)
+            .join(', ')}`,
+        );
+      }
+
+      const source = cssAssets[0].source;
+      for (const fileName of aliases) {
+        if (!bundle[fileName]) {
+          this.emitFile({ type: 'asset', fileName, source });
+        }
+      }
     },
   };
 }
@@ -32,7 +68,7 @@ function stablePresentationCssAlias(): Plugin {
 export default defineConfig({
   root,
   base: './',
-  plugins: [svelte(), tailwindcss(), stablePresentationCssAlias()],
+  plugins: [svelte(), tailwindcss(), stableWebviewCssAliases()],
   build: {
     outDir,
     emptyOutDir: true,

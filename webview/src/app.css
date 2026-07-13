@@ -354,6 +354,14 @@ body {
   gap: 6px;
 }
 
+.task-action-panel--warning {
+  border-color: var(--vscode-inputValidation-warningBorder, var(--vscode-editorWarning-foreground, #cca700));
+  background: var(
+    --vscode-inputValidation-warningBackground,
+    color-mix(in srgb, var(--vscode-editor-background) 90%, #cca700 10%)
+  );
+}
+
 .composer-shell {
   position: relative;
 }
@@ -389,6 +397,148 @@ body {
 .composer-guidance {
   color: var(--vscode-descriptionForeground);
   font-size: 12px;
+}
+
+.composer-guidance--error {
+  color: var(--vscode-errorForeground);
+}
+
+/* File mention chips (@path) — transcript bubbles can use padded chips. */
+.user-message-bubble {
+  white-space: pre-wrap;
+  line-height: 1.45;
+}
+
+.user-message-bubble .file-mention {
+  display: inline;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+  padding: 0.1em 0.4em;
+  margin: 0 0.06em;
+  border-radius: 6px;
+  font-weight: 500;
+  color: var(--vscode-textLink-foreground, #3794ff);
+  background: color-mix(
+    in srgb,
+    var(--vscode-textLink-foreground, #3794ff) 18%,
+    var(--vscode-editor-background, #1e1e1e) 82%
+  );
+  border: 1px solid
+    color-mix(in srgb, var(--vscode-textLink-foreground, #3794ff) 35%, transparent);
+  word-break: break-all;
+}
+
+/*
+ * Composer chips: keep metrics identical to the textarea.
+ * - Horizontal pad ≤ ~half a space (2–3px) so the pill sits in the flanking
+ *   space without touching the previous word; equal negative margin cancels
+ *   advance width so the caret does not drift.
+ * - No vertical pad / no outer box-shadow (those made the chip too tall and
+ *   bled into neighboring glyphs).
+ */
+.composer-input .file-mention {
+  --mention-pad-x: 2px;
+  display: inline;
+  padding: 0 var(--mention-pad-x);
+  margin: 0 calc(-1 * var(--mention-pad-x));
+  border: none;
+  border-radius: 4px;
+  font-weight: inherit;
+  letter-spacing: inherit;
+  line-height: inherit;
+  vertical-align: baseline;
+  color: var(--vscode-textLink-foreground, #3794ff);
+  background: color-mix(
+    in srgb,
+    var(--vscode-textLink-foreground, #3794ff) 16%,
+    var(--vscode-input-background, var(--vscode-editor-background, #1e1e1e)) 84%
+  );
+  /* Inset ring only — no outer glow that grows height or hits neighbors. */
+  box-shadow: inset 0 0 0 1px
+    color-mix(in srgb, var(--vscode-textLink-foreground, #3794ff) 40%, transparent);
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
+/* Composer: highlight layer under transparent textarea for live mention chips. */
+.composer-input {
+  position: relative;
+  width: 100%;
+  min-height: calc(3 * 1.4em + 16px);
+  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+  border-radius: 4px;
+  background: var(--vscode-input-background, var(--vscode-editor-background));
+  overflow: hidden;
+}
+
+.composer-input--disabled {
+  opacity: 0.65;
+}
+
+.composer-input__highlight,
+.composer-input__textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: calc(3 * 1.4em + 16px);
+  margin: 0;
+  padding: 8px 10px;
+  border: none;
+  /* Identical metrics — any drift shifts caret vs highlight. */
+  font-family: var(--vscode-font-family);
+  font-size: var(--vscode-font-size, 13px);
+  font-weight: 400;
+  font-style: normal;
+  font-variant: normal;
+  font-stretch: normal;
+  line-height: 1.4;
+  letter-spacing: normal;
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+  word-break: normal;
+  tab-size: 2;
+  /* Same scrollbar gutter on both layers so content width matches. */
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+.composer-input__highlight {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  color: var(--vscode-input-foreground, var(--vscode-foreground));
+  background: transparent;
+}
+
+.composer-input__textarea {
+  position: relative;
+  z-index: 1;
+  display: block;
+  resize: vertical;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  caret-color: var(--vscode-editorCursor-foreground, var(--vscode-foreground));
+  background: transparent;
+  outline: none;
+}
+
+.composer-input__textarea::placeholder {
+  color: var(--vscode-input-placeholderForeground, var(--vscode-descriptionForeground));
+  -webkit-text-fill-color: var(--vscode-input-placeholderForeground, var(--vscode-descriptionForeground));
+  opacity: 1;
+}
+
+.composer-input__textarea:focus {
+  outline: 1px solid var(--vscode-focusBorder, #3794ff);
+  outline-offset: -1px;
+}
+
+.composer-input__textarea::selection {
+  /* Keep selection visible while glyphs stay transparent. */
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  background: color-mix(in srgb, var(--vscode-editor-selectionBackground, #264f78) 70%, transparent);
 }
 
 .add-context {

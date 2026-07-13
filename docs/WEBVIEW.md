@@ -468,10 +468,10 @@ The webview never holds the whole thread. Render a **recent window**; older item
   session. Status menu can still seal `succeeded` / `failed` / cancel / skip.
 - **Delegate / yolo:** coordinator may mark success without Accept card; show a
   short “sealed by coordinator” notice; user can still cancel/override.
-- **Soft failed:** composer stays available; next `send` **reopens** the same task
-  to `open` (not a new task id). Status menu **Reopen** → `setTaskLifecycle` `open`.
-- **Continue as new task** for **hard** terminal (`succeeded` / `cancelled` /
-  `skipped`): `send { text, continuationOf }` (no `taskId`). No reopen-on-same-id.
+- **Any sealed lifecycle** (`failed` / `succeeded` / `cancelled` / `skipped`):
+  composer stays available; next `send` **reopens** the same task to `open`
+  (not a new task id). Status menu / panel **Reopen** → `setTaskLifecycle` `open`.
+  For a separate conversation, user creates a **new task** (no continuation draft).
 - **Cancel / skip** via status menu (`setTaskLifecycle` → `cancelled` / `skipped`):
   host cascades descendants (`cancelTask` / `skipTask`). Distinct from interrupt
   turn. See `TASK-MANAGEMENT.md` §5.4–§5.6.
@@ -570,23 +570,28 @@ The webview never holds the whole thread. Render a **recent window**; older item
 
 ---
 
-## 12. Workspace file-drop mentions
+## 12. File-drop mentions
 
-Dragging onto an enabled composer is a request to insert a **textual mention**; it is not an attachment and does not upload or persist file contents. The webview extracts bounded drag candidates and sends `resolveFileDrop` with `{ candidates: string[] }` to the extension host. The host alone parses URIs, checks the workspace boundary, verifies the target, and replies with `filePicked` carrying `{ path: string }` only after resolution succeeds.
+Dragging onto an enabled composer inserts a **textual file mention** (chip). It is not an editor attachment in the VS Code sense, but **OS/Finder drops without a visible path** may be **copied into a private temp directory** so the agent can still open the bytes.
 
-The supported contract is deliberately narrow:
+### Protocol
 
-- exactly one regular file from the current workspace; local `file:` and matching `vscode-remote:` workspace resources are accepted;
-- the returned path is workspace-relative, uses forward slashes, and contains no absolute workspace identity;
-- the composer inserts `@path` (or `@"path with spaces"`) at the current selection/caret, preserving surrounding draft text and placing the caret after the mention;
-- disabled composers ignore drag input and send no resolution request; and
-- multiple files, malformed or oversized data, unsupported schemes, missing workspaces, outside-workspace paths, directories, and stat failures are rejected with a bounded, sanitized user-facing error. Rejection does not change the draft and never reflects raw paths or filesystem errors.
+1. Webview extracts drag candidates (`resolveFileDrop { candidates }`) or, when only a `File` blob is available, sends `importDroppedFile { name, data }` (raw bytes, max 25 MiB).
+2. Host resolves paths (workspace-relative when inside a folder, otherwise absolute) or materializes an owner-only temp copy under `os.tmpdir()/muster-file-drops/drop-*/`.
+3. Host replies `filePicked { path, displayName? }`. Composer inserts a **short display chip** (`@name` / `@"name with spaces"`) and binds it to the resolve path.
+4. On **send**, webview keeps display text for the transcript and may send `llmText` with chips expanded to full paths for the agent (`TaskMessage.agentContent`).
 
-This is a security boundary, not merely formatting: the webview cannot declare a candidate safe, and `filePicked` must contain only the host-validated relative mention. The protocol does not grant the backend direct file bytes or create an attachment.
+### Contract notes
+
+- Prefer **one file** per drop; alternate encodings of the same file are collapsed.
+- VS Code often requires **Shift** when dropping into a webview from Explorer/Finder.
+- Disabled composers ignore drag input.
+- Temp imports use exclusive create (`wx`), mode `0o600`, per-drop directories, and best-effort 24h prune on the next import.
+- Directories are rejected when `stat` reports a folder; missing targets may still be mentioned if a path string was provided.
 
 ### Proof boundary
 
-Unit tests cover extraction, host resolution, protocol guards, and negative cases. Focused Playwright covers the browser-visible composer flow with synthetic host messages. Local unit and Playwright checks are supportive only: only direct observation in an actual VS Code Extension Development Host can establish a live `PASS` or `FAIL`. Record live attempts and scenario-local environmental blockers using the contributor procedure and tracked evidence ledger.
+Unit tests cover extraction, host resolution, import, and mention expand-on-send. Focused Playwright covers the browser-visible composer flow with synthetic host messages. Local unit and Playwright checks are **supportive only**; live Extension Development Host observation is required for PASS/FAIL of native Explorer/Finder drags.
 
 ---
 

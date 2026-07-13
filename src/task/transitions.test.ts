@@ -16,6 +16,7 @@ import {
   prepareEditQueuedTurn,
   registerAsk,
   reopenSoftFailedTask,
+  reopenTask,
   resolveChildWait,
   retryCountOf,
   retryTurn,
@@ -499,27 +500,21 @@ describe('applyFailedTurn', () => {
     }
   });
 
-  it('setTaskLifecycle reopens only soft-failed tasks', () => {
-    const fromFailed = setTaskLifecycle(
-      baseTask({ lifecycle: 'failed', finishedAt: NOW, error: 'x' }),
-      'open',
-      { now: NOW },
-    );
-    expect(fromFailed.ok).toBe(true);
-    if (fromFailed.ok) {
-      expect(fromFailed.next.lifecycle).toBe('open');
-      expect(fromFailed.next.finishedAt).toBeUndefined();
+  it('setTaskLifecycle reopens any terminal task to open', () => {
+    for (const lifecycle of ['failed', 'succeeded', 'cancelled', 'skipped'] as const) {
+      const result = setTaskLifecycle(
+        baseTask({ lifecycle, finishedAt: NOW, error: lifecycle === 'failed' ? 'x' : undefined }),
+        'open',
+        { now: NOW },
+      );
+      expect(result.ok, lifecycle).toBe(true);
+      if (result.ok) {
+        expect(result.next.lifecycle).toBe('open');
+        expect(result.next.finishedAt).toBeUndefined();
+      }
     }
 
-    expect(
-      setTaskLifecycle(baseTask({ lifecycle: 'succeeded', finishedAt: NOW }), 'open', { now: NOW }),
-    ).toEqual({ ok: false, reason: 'only soft-failed tasks may reopen to open' });
-    expect(
-      setTaskLifecycle(baseTask({ lifecycle: 'cancelled', finishedAt: NOW }), 'open', { now: NOW }),
-    ).toEqual({ ok: false, reason: 'only soft-failed tasks may reopen to open' });
-    expect(
-      setTaskLifecycle(baseTask({ lifecycle: 'skipped', finishedAt: NOW }), 'open', { now: NOW }),
-    ).toEqual({ ok: false, reason: 'only soft-failed tasks may reopen to open' });
+    expect(setTaskLifecycle(baseTask({ lifecycle: 'open' }), 'open', { now: NOW }).ok).toBe(true);
   });
 });
 
@@ -598,12 +593,12 @@ describe('retryTurn', () => {
   });
 });
 
-describe('soft fail reopen', () => {
+describe('terminal reopen', () => {
   it('reopens failed tasks to open', () => {
     const task = baseTask({ lifecycle: 'failed', finishedAt: NOW, error: 'nope' });
     expect(isSoftTerminalLifecycle(task.lifecycle)).toBe(true);
     expect(isHardTerminalLifecycle(task.lifecycle)).toBe(false);
-    const result = reopenSoftFailedTask(task, { now: '2026-07-06T01:00:00.000Z' });
+    const result = reopenTask(task, { now: '2026-07-06T01:00:00.000Z' });
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.next.lifecycle).toBe('open');
@@ -612,7 +607,25 @@ describe('soft fail reopen', () => {
     }
   });
 
-  it('rejects reopen of hard terminal or open tasks', () => {
+  it('reopens hard-terminal tasks to open', () => {
+    for (const lifecycle of ['succeeded', 'cancelled', 'skipped'] as const) {
+      const result = reopenTask(baseTask({ lifecycle, finishedAt: NOW }), { now: NOW });
+      expect(result.ok, lifecycle).toBe(true);
+      if (result.ok) {
+        expect(result.next.lifecycle).toBe('open');
+        expect(result.next.finishedAt).toBeUndefined();
+      }
+    }
+  });
+
+  it('rejects reopen of open tasks', () => {
+    expect(reopenTask(baseTask({ lifecycle: 'open' }), { now: NOW })).toEqual({
+      ok: false,
+      reason: 'task is not terminal',
+    });
+  });
+
+  it('legacy soft helper still rejects non-failed tasks', () => {
     expect(reopenSoftFailedTask(baseTask({ lifecycle: 'succeeded' }), { now: NOW })).toEqual({
       ok: false,
       reason: 'task is not soft-failed',
