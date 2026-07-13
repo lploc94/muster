@@ -71,7 +71,10 @@ describe('boundedPromptCancel', () => {
 
     await vi.advanceTimersByTimeAsync(100);
 
-    await expect(wrapped).resolves.toEqual({ stopReason: 'cancelled' });
+    await expect(wrapped).resolves.toEqual({
+      stopReason: 'cancelled',
+      cancelConfidence: 'forced',
+    });
     expect(onForceSettle).toHaveBeenCalledTimes(1);
   });
 
@@ -95,6 +98,7 @@ describe('boundedPromptCancel', () => {
     await Promise.resolve(); // let pending.then run and clear the grace timer
     await vi.advanceTimersByTimeAsync(500); // well past the grace
 
+    // Cooperative settle has no cancelConfidence: 'forced' (confirmed path).
     await expect(wrapped).resolves.toEqual({ stopReason: 'cancelled' });
     expect(onForceSettle).not.toHaveBeenCalled();
   });

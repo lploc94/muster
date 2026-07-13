@@ -110,6 +110,8 @@ export interface QueuedTurnProjection {
   createdAt: string;
   /** Host-projected user text so the queue panel works without chat bubbles. */
   previewText?: string;
+  /** Prefer concurrent inject when a live turn is available. */
+  delivery?: 'turn' | 'live_inject';
 }
 
 export interface SnapshotMessage {
@@ -453,7 +455,8 @@ function isQueuedTurnProjection(v: unknown): v is QueuedTurnProjection {
     Array.isArray(v.messageIds) &&
     v.messageIds.every(isString) &&
     isString(v.createdAt) &&
-    (v.previewText === undefined || isString(v.previewText))
+    (v.previewText === undefined || isString(v.previewText)) &&
+    (v.delivery === undefined || v.delivery === 'turn' || v.delivery === 'live_inject')
   );
 }
 

@@ -1198,55 +1198,35 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           }
           break;
         case 'sendLiveInput': {
-          // Prefer concurrent inject; if the backend/session cannot accept it,
-          // silently deliver via ordinary send (FIFO while a turn is live).
-          // Never surface a red error for “unsupported live input” — bad UX.
+          // Interrupt & send (cut & continue): reserve follow-up first, then
+          // interrupt the live turn if a local handle exists. Never concurrent
+          // backend.sendLiveInput / liveInputResult banner.
           const engine = taskEngine;
-          const injectInstruction =
-            typeof data.instruction === 'string' ? data.instruction.trim() : '';
-          const outcome = await routeSendLiveInput(data, {
-            engineReady: Boolean(engine),
-            sendLiveInput: (taskId, instruction) => {
-              if (!engine) {
-                return Promise.resolve({
-                  code: 'rejected' as const,
-                  reason: 'task engine not ready',
-                });
-              }
-              return engine.sendLiveInput(taskId, instruction);
-            },
-          });
-          if (outcome.kind === 'ack') {
-            this.post({
-              type: 'liveInputResult',
-              taskId: outcome.taskId,
-              code: 'delivered',
-              sessionId: outcome.sessionId,
-            });
-            // Direct inject is visible in chat immediately (not a queued turn).
-            if (outcome.taskId === this.focusedTaskId && injectInstruction) {
-              this.post({
-                type: 'transcriptAppend',
-                taskId: outcome.taskId,
-                item: {
-                  id: `live-inject-${Date.now()}`,
-                  kind: 'user',
-                  content: injectInstruction,
-                },
-              });
-            }
-          } else if (outcome.kind === 'fallback-send') {
-            // Same as Enter: queue while live, start a turn when idle.
-            // Instruction may already be expanded mention text.
-            const text = outcome.instruction.trim();
-            if (text) {
-              await this.handleSend({
-                taskId: outcome.taskId,
-                text,
-              });
-            }
+          if (!engine) {
+            this.postCommandError('task engine not ready');
+            break;
           }
-          // silent: ignore empty/malformed inject without a banner
+          const instruction =
+            typeof data.instruction === 'string' ? data.instruction.trim() : '';
+          const taskId = typeof data.taskId === 'string' ? data.taskId.trim() : '';
+          if (!taskId) {
+            this.postCommandError('sendLiveInput requires taskId');
+            break;
+          }
+          if (!instruction) {
+            this.postCommandError('message cannot be empty', taskId);
+            break;
+          }
+          if (instruction.length > MAX_MESSAGE_CHARS) {
+            this.postCommandError('instruction too long', taskId);
+            break;
+          }
+          const result = engine.interruptAndSend(taskId, instruction);
+          if (!result.ok) {
+            this.postCommandError(result.reason, taskId);
+            break;
+          }
+          this.postSnapshot(taskId);
           break;
         }
         case 'editQueuedTurn': {

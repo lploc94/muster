@@ -105,10 +105,17 @@ export interface TaskTurn {
   finishedAt?: string;
   /**
    * When true, the engine must not auto-promote this queued turn after a prior
-   * failed/interrupted settlement (MEM030). Cleared by explicit resume.
-   * Retry/Continue/auto-retry turns created after settlement omit this flag.
+   * failed/interrupted settlement (MEM030). Cleared by explicit resume or by
+   * confirmed interrupt-and-send settlement when follow-ups should continue.
    */
   holdAutoPromote?: boolean;
+  /**
+   * How an interrupted turn's cancel was observed (interrupt-and-send gate):
+   * - `confirmed`: primary prompt ended after cancel without force-timeout
+   * - `forced`: grace force-settle / unconfirmed — do not bind session or promote
+   * - `armed`: reserved for in-flight bookkeeping (not a settled value)
+   */
+  interruptConfidence?: 'armed' | 'confirmed' | 'forced';
 }
 
 // Messages (§9) + store envelope (§12.1)

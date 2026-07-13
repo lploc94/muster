@@ -942,7 +942,7 @@ both constrain behavior:
 |-----------|----------------------------|----------|
 | `open` | `idle` | Queue a user-triggered turn (`send`) |
 | `open` | `waiting_dependencies` / `queued` | `send` creates another distinct FIFO queued turn (or binds per engine policy); inspect / edit / delete via `queuedTurns` |
-| `open` | `running` | `send` queues a FIFO follow-up; **Ctrl+Enter** prefers `sendLiveInput` when supported, otherwise silent `send` (FIFO) without `commandError`. `submitAsk` remains the path for structured ask answers |
+| `open` | `running` | `send` queues a FIFO follow-up (no interrupt); **Ctrl+Enter** `sendLiveInput` → reserve follow-up then interrupt live turn (cut & continue). `submitAsk` remains the path for structured ask answers |
 | `open` | `waiting_user` | Answer the pending ask via `submitAsk`; free-form composer may still queue follow-ups when product policy allows |
 | `open` | `waiting_children` / `blocked` | Persist / queue for the next continuation turn |
 | `open` | `needs_recovery` | Persist; offer explicit Retry / Continue recovery (free-form send blocked while recovery is required) |
@@ -950,27 +950,28 @@ both constrain behavior:
 | `failed` (soft) | — | **Reopen** to `open`, then queue a turn with the message |
 | `succeeded` / `cancelled` / `skipped` | — | **Reopen** to `open` on the same task id, then queue a turn (same as soft-fail). Operators may still create a new task instead |
 
-### 9.1 Multi-queued FIFO follow-ups and live inject
+### 9.1 Multi-queued FIFO follow-ups and interrupt & send
 
-**Normative send rule (R012):** every focused-task `send` creates a **distinct queued turn** bound to that user message, or **refuses visibly** when a turn cannot be allocated (turn cap, hard recovery block). Concurrent sends while a turn is live or already queued still create additional queued turns; the scheduler promotes **one active (running) turn per task**, only the **earliest** queued sequence (FIFO), and drains **multiple queued follow-ups** in order after **successful** settlement. After failure/interrupted settlement, queued follow-ups remain queued (not auto-promoted) until recovery/resume policy allows.
+**Normative send rule (R012):** every focused-task `send` creates a **distinct queued turn** bound to that user message, or **refuses visibly** when a turn cannot be allocated (turn cap, hard recovery block). Concurrent sends while a turn is live or already queued still create additional queued turns; the scheduler promotes **one active (running) turn per task**, only the **earliest** queued sequence (FIFO), and drains **multiple queued follow-ups** in order after **successful** settlement. After **failed** or **forced/unconfirmed interrupted** settlement, queued follow-ups remain queued (not auto-promoted) until recovery/resume policy allows. After a **confirmed** interrupt settlement with queued follow-ups (interrupt & send / Enter-then-Stop), FIFO auto-promotes.
 
 | Operator action | Engine / host API | Notes |
 |-----------------|-------------------|-------|
 | Enter / Send | `send` | FIFO follow-up turn; composer stays editable while running/queued |
-| Ctrl+Enter while running | `sendLiveInput` then maybe `send` | **Always try** concurrent inject (no advertise gate); if inject cannot deliver, **silent `send`** (FIFO) without `commandError` |
-| Ctrl+Enter while idle | `send` | Immediate normal turn (same as Enter); not inject |
+| Ctrl+Enter while running | `sendLiveInput` → `interruptAndSend` | Reserve FIFO follow-up, then interrupt live turn; no concurrent inject; no delivered banner |
+| Ctrl+Enter while idle | `send` | Immediate normal turn (same as Enter) |
 | Edit pending queue item | `editQueuedTurn` | Only while `turnId` remains in the live `queuedTurns` projection; clears stale `agentContent` |
 | Delete pending queue item | `deleteQueuedTurn` | Undispatched only; never cancels a running turn |
 
 **Projection:** snapshots include optional `queuedTurns` (`turnId`, `sequence`, `status: 'queued'`, `messageIds`, `createdAt`, optional `previewText`) so the webview can render an inspectable FIFO panel and lock edit/delete at the dispatch boundary. User messages bound to still-`queued` turns are **omitted from the chat transcript** until the turn promotes to running; they are visible only in the queue panel (and via `previewText`).
 
-**Live inject outcomes:**
+**Interrupt & send outcomes:**
 
-- Success → `liveInputResult` `{ taskId, code: 'delivered', sessionId }` (webview status notice).
-- Inject unavailable (unsupported backend, not local owner, no active turn, …) → **silent delivery via `send`** (FIFO while live). Do **not** surface `commandError` for capability refusals — the operator message must always be accepted.
+- Success → reserve follow-up + interrupt; after **confirmed** settle, FIFO-promote (no `liveInputResult` banner).
+- Reserve failure (terminal task, turn cap, …) → **commandError**; live turn keeps running (no interrupt).
+- Confirmed interrupt with queued follow-ups → clear `holdAutoPromote` and FIFO-promote; pure Stop with empty queue promotes nothing.
 - Stale `editQueuedTurn` / `deleteQueuedTurn` (missing, foreign, or already dispatched turn) → `commandError` with a clear stale-mutation message; controls should already be locked when the projection drops the turn.
 
-`sendLiveInput` is distinct from `continueTask` / `send` when delivered: inject does not allocate a new turn. When inject cannot run, the host falls back to `send` without error chrome. Webview keyboard policy maps Ctrl/Meta+Enter to `sendLiveInput` when a live turn is running (host may still deliver via `send`); otherwise Ctrl/Meta+Enter uses `send`.
+`sendLiveInput` means **interrupt & send**: host calls `TaskEngine.interruptAndSend` (reserve follow-up, then interrupt). It does **not** call concurrent `backend.sendLiveInput`. After a **confirmed** interrupt settlement, same-task queued follow-ups promote FIFO and observed session may bind to `committedSessionId` when unset. Forced/unconfirmed cancel keeps holds and does not auto-promote. Webview keyboard policy maps Ctrl/Meta+Enter to `sendLiveInput` when a live turn is running; otherwise Ctrl/Meta+Enter uses `send`.
 
 Chat messages are durable records, not raw queued strings. They provide both the
 task transcript and delivery identity:

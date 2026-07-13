@@ -5,7 +5,6 @@ import {
   buildPresentationWebviewHtml,
   parseAllowedPresentationLink,
 } from './webview-security';
-import { routeSendLiveInput } from './live-input';
 import { routeDeleteQueuedTurn, routeEditQueuedTurn } from './queued-turn-mutations';
 
 describe('presentation webview security', () => {
@@ -84,71 +83,21 @@ describe('presentation webview security', () => {
   });
 });
 
-describe('host live-input routing contract', () => {
-  it('wires sendLiveInput through routeSendLiveInput without continueTask fallthrough', () => {
+describe('host interrupt-and-send routing contract', () => {
+  it('wires sendLiveInput as interruptAndSend (reserve-then-interrupt), not concurrent inject', () => {
     const extensionSource = readFileSync(resolve(process.cwd(), 'src/extension.ts'), 'utf8');
     expect(extensionSource).toContain("case 'sendLiveInput'");
-    expect(extensionSource).toContain('routeSendLiveInput');
-    expect(extensionSource).toContain('engine.sendLiveInput');
-    expect(extensionSource).toContain("type: 'liveInputResult'");
-    // The live-input case must not call continueTaskWithMessage.
     const liveCase = extensionSource.match(
-      /case 'sendLiveInput':[\s\S]*?case 'resumeQueuedTurn':/,
+      /case 'sendLiveInput':[\s\S]*?case 'editQueuedTurn':/,
     )?.[0];
     expect(liveCase).toBeDefined();
-    expect(liveCase).not.toContain('continueTaskWithMessage');
-  });
-
-  it('returns fallback-send for unsupported live input so the host can silent-send', async () => {
-    const sendLiveInput = vi.fn(async () => ({
-      code: 'unsupported' as const,
-      reason: 'backend kiro does not support live input',
-    }));
-    const continueTaskWithMessage = vi.fn();
-
-    const outcome = await routeSendLiveInput(
-      { type: 'sendLiveInput', taskId: 'task-1', instruction: 'nudge' },
-      { engineReady: true, sendLiveInput },
-    );
-
-    expect(sendLiveInput).toHaveBeenCalledTimes(1);
-    // Route itself does not call continueTask; host maps fallback-send → handleSend.
-    expect(continueTaskWithMessage).not.toHaveBeenCalled();
-    expect(outcome).toEqual({
-      kind: 'fallback-send',
-      taskId: 'task-1',
-      instruction: 'nudge',
-    });
-  });
-
-  it('delegates supported live input once and returns a delivered ack', async () => {
-    const sendLiveInput = vi.fn(async () => ({
-      code: 'delivered' as const,
-      sessionId: 'sess-9',
-    }));
-
-    const outcome = await routeSendLiveInput(
-      { type: 'sendLiveInput', taskId: 'task-2', instruction: 'inject' },
-      { engineReady: true, sendLiveInput },
-    );
-
-    expect(sendLiveInput).toHaveBeenCalledTimes(1);
-    expect(sendLiveInput).toHaveBeenCalledWith('task-2', 'inject');
-    expect(outcome).toEqual({
-      kind: 'ack',
-      taskId: 'task-2',
-      sessionId: 'sess-9',
-    });
-  });
-
-  it('stays silent on malformed payloads before engine delegation', async () => {
-    const sendLiveInput = vi.fn();
-    const outcome = await routeSendLiveInput(
-      { type: 'sendLiveInput', taskId: 'task-3', instruction: '' },
-      { engineReady: true, sendLiveInput },
-    );
-    expect(sendLiveInput).not.toHaveBeenCalled();
-    expect(outcome).toEqual({ kind: 'silent', taskId: 'task-3' });
+    expect(liveCase).toContain('interruptAndSend');
+    expect(liveCase).toContain('postSnapshot');
+    // Must not use concurrent inject path for composer direct messages.
+    expect(liveCase).not.toContain('routeSendLiveInput');
+    expect(liveCase).not.toContain('engine.sendLiveInput');
+    expect(liveCase).not.toContain("type: 'liveInputResult'");
+    expect(liveCase).not.toContain("delivery: 'live_inject'");
   });
 });
 

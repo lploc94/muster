@@ -114,7 +114,7 @@ describe('continueTaskWithMessage', () => {
     expect(TaskStore.load({ filePath }).getFile().turns[result.value.turnId].status).toBe('succeeded');
   });
 
-  it('does not leave a pending user message when continuation cannot be queued', () => {
+  it('does not leave a pending user message when continuation cannot be queued', async () => {
     const { filePath } = makeTempStore();
     const store = TaskStore.load({ filePath });
     store.commit((draft) => {

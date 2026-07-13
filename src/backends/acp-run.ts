@@ -189,12 +189,24 @@ function usageFromResult(result: PromptResult, spec: AcpAdapterSpec): Normalized
 }
 
 function terminalFromPrompt(result: PromptResult, cancelled: boolean, spec: AcpAdapterSpec): NormalizedEvent {
+  const interruptConfidence: 'confirmed' | 'forced' =
+    result.cancelConfidence === 'forced' ? 'forced' : 'confirmed';
   if (cancelled) {
-    return { type: 'error', message: 'Turn cancelled', isCancellation: true };
+    return {
+      type: 'error',
+      message: 'Turn cancelled',
+      isCancellation: true,
+      meta: { interruptConfidence },
+    };
   }
   const stopReason = result.stopReason;
   if (stopReason === 'cancelled') {
-    return { type: 'error', message: 'Turn cancelled', isCancellation: true };
+    return {
+      type: 'error',
+      message: 'Turn cancelled',
+      isCancellation: true,
+      meta: { interruptConfidence },
+    };
   }
   if (typeof stopReason !== 'string' || stopReason.length === 0) {
     return { type: 'error', message: `${spec.label} prompt ended without a stopReason` };

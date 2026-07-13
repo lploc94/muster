@@ -5,12 +5,12 @@ import test from 'node:test';
 const root = new URL('../', import.meta.url);
 
 /**
- * Mechanical contract for M008 queue + live-inject operator docs.
+ * Mechanical contract for queue + interrupt-and-send operator docs.
  * Markers must appear in the named tracked files; forbidden claims must not.
  */
 const required = {
   'docs/WEBVIEW.md': [
-    '## 14. Queued follow-ups and live inject',
+    '## 14. Queued follow-ups and interrupt & send',
     'Enter',
     'Ctrl+Enter',
     '`send`',
@@ -19,9 +19,8 @@ const required = {
     '`queuedTurns`',
     '`editQueuedTurn`',
     '`deleteQueuedTurn`',
-    '`liveInputResult`',
+    'interrupt',
     '`commandError`',
-    'silent delivery via `send`',
     'composer stays editable',
     'Shift+Enter',
     'IME',
@@ -29,26 +28,25 @@ const required = {
     'Extension Development Host',
   ],
   'docs/TASK-MANAGEMENT.md': [
-    '## 9.1 Multi-queued FIFO follow-ups and live inject',
+    '## 9.1 Multi-queued FIFO follow-ups and interrupt & send',
     'FIFO',
     '`send`',
     '`sendLiveInput`',
+    'interruptAndSend',
     'distinct queued turn',
     'one active (running) turn per task',
     'multiple queued follow-ups',
     '`queuedTurns`',
     '`editQueuedTurn`',
     '`deleteQueuedTurn`',
-    '`liveInputResult`',
     '`commandError`',
-    'silent `send`',
     'stale',
   ],
   'docs/README.md': [
-    'queued follow-ups and live inject',
+    'queued follow-ups and interrupt & send',
   ],
   'CONTRIBUTING.md': [
-    '## Queue and live-inject verification',
+    '## Queue and interrupt-and-send verification',
     'npm run test:queue-live-inject-docs',
     'e2e/muster-webview-state.spec.ts',
     'Enter',
@@ -76,10 +74,12 @@ const forbiddenClaims = [
     label: 'submitAsk-only live inject',
   },
   {
-    // Product allows silent host delivery via send when inject is unavailable,
-    // but docs must not claim the *webview* always maps Ctrl+Enter to queue-only.
     pattern: /Ctrl\+Enter (?:always )?(?:queues|creates a queued turn) only/i,
     label: 'Ctrl+Enter always queues only',
+  },
+  {
+    pattern: /Always try.*concurrent inject/i,
+    label: 'concurrent inject as product path',
   },
 ];
 
@@ -94,28 +94,23 @@ function validate(files) {
 
   const combined = Object.values(files).join('\n');
   for (const { pattern, label } of forbiddenClaims) {
-    assert.ok(!pattern.test(combined), `forbidden queue/live-inject claim: ${label}`);
+    assert.ok(!pattern.test(combined), `forbidden queue claim: ${label}`);
   }
 
   const webview = files['docs/WEBVIEW.md'];
-  const sectionStart = webview.indexOf('## 14. Queued follow-ups and live inject');
-  assert.ok(sectionStart >= 0, 'WEBVIEW.md missing queue/live-inject section');
-  // Section runs until next ## heading or end
+  const sectionStart = webview.indexOf('## 14. Queued follow-ups and interrupt & send');
+  assert.ok(sectionStart >= 0, 'WEBVIEW.md missing queue/interrupt-and-send section');
   const after = webview.slice(sectionStart + 1);
   const nextHeading = after.search(/\n## /);
   const section = nextHeading >= 0 ? after.slice(0, nextHeading) : after;
-  assert.match(section, /Enter queues/i, 'WEBVIEW.md must document Enter → FIFO queue');
-  assert.match(section, /Ctrl\+Enter/i, 'WEBVIEW.md must document Ctrl+Enter live inject');
-  assert.match(
-    section,
-    /silent delivery via `send`/i,
-    'WEBVIEW.md must document silent send when inject unavailable',
-  );
-  assert.match(section, /commandError/i, 'WEBVIEW.md must mention commandError (for other refusals)');
-  assert.match(section, /liveInputResult/i, 'WEBVIEW.md must document delivered liveInputResult');
+  assert.match(section, /Enter queues|FIFO follow-up/i, 'WEBVIEW.md must document Enter → FIFO queue');
+  assert.match(section, /Ctrl\+Enter/i, 'WEBVIEW.md must document Ctrl+Enter');
+  assert.match(section, /interrupt/i, 'WEBVIEW.md must document interrupt & send');
+  assert.match(section, /commandError/i, 'WEBVIEW.md must mention commandError');
+  assert.match(section, /no `liveInputResult` banner|not.*liveInputResult/i, 'WEBVIEW.md must reject liveInputResult as product success path');
 
   const taskMgmt = files['docs/TASK-MANAGEMENT.md'];
-  const tmStart = taskMgmt.indexOf('## 9.1 Multi-queued FIFO follow-ups and live inject');
+  const tmStart = taskMgmt.indexOf('## 9.1 Multi-queued FIFO follow-ups and interrupt & send');
   assert.ok(tmStart >= 0, 'TASK-MANAGEMENT.md missing multi-queue section');
   const tmAfter = taskMgmt.slice(tmStart + 1);
   const tmNext = tmAfter.search(/\n## /);
@@ -135,7 +130,7 @@ async function trackedFiles() {
   );
 }
 
-test('tracked documentation defines the queue and live-inject operating contract', async () => {
+test('tracked documentation defines the queue and interrupt-and-send operating contract', async () => {
   assert.equal(validate(await trackedFiles()), true);
 });
 
@@ -144,7 +139,6 @@ test('rejects omitted protocol, keyboard, and feedback markers', async () => {
   for (const marker of [
     '`sendLiveInput`',
     '`queuedTurns`',
-    'silent delivery via `send`',
     'npm run test:queue-live-inject-docs',
   ]) {
     const owner = Object.keys(required).find((name) => files[name].includes(marker));

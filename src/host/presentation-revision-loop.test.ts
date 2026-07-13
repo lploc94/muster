@@ -137,7 +137,10 @@ describe('linked coordinator revision loop', () => {
     await expect(manager.upsert(context, { ...document, ownerTaskId: 'other', opId: 'wrong-owner', revision: 2 })).resolves.toEqual({ ok: false, code: 'owner_mismatch' });
 
     store.commit((draft) => { draft.tasks.root.lifecycle = 'succeeded'; return { ok: true }; });
-    expect(engine.continueTaskWithMessage('root', 'must not persist')).toEqual({ ok: false, reason: 'task is terminal' });
+    expect(engine.continueTaskWithMessage('root', 'must not persist')).toEqual({
+      ok: false,
+      reason: 'task is terminal',
+    });
     expect(JSON.stringify(store.getFile())).not.toContain('must not persist');
     expect(JSON.parse(baseline).tasks.root.id).toBe(store.getFile().tasks.root.id);
     expect(factory.panels).toHaveLength(2);

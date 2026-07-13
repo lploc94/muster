@@ -83,9 +83,9 @@ The focused browser test uses synthetic host messages and is **supportive only**
 
 Record each scenario in `docs/uat/m007-s02/file-drop-live-host-evidence.md` with one `PASS`, `FAIL`, or `ENVIRONMENT BLOCKED` verdict, a UTC timestamp, expected and observed results, bounded evidence, blocker detail, and cleanup. Use `ENVIRONMENT BLOCKED` only after naming the attempted step and concrete unavailable control. Never promote unit or Playwright results to live proof, and never record absolute paths, workspace identity, file contents, credentials, raw transcripts, or task-store data.
 
-## Queue and live-inject verification
+## Queue and interrupt-and-send verification
 
-Multi-queued FIFO follow-ups and Ctrl+Enter live inject are documented in
+Multi-queued FIFO follow-ups and Ctrl+Enter interrupt & send are documented in
 [docs/TASK-MANAGEMENT.md](docs/TASK-MANAGEMENT.md) §9.1 and
 [docs/WEBVIEW.md](docs/WEBVIEW.md) §14. Before claiming those surfaces, run:
 
@@ -95,14 +95,13 @@ npm run test:webview -- e2e/muster-webview-state.spec.ts
 ```
 
 The doc verifier checks keyboard contract markers (`Enter` → `send` FIFO,
-`Ctrl+Enter` → prefer `sendLiveInput` with silent `send` when inject is
-unavailable), `queuedTurns` edit/delete, and `liveInputResult` delivered notice.
+`Ctrl+Enter` → `sendLiveInput` (interrupt & send), `queuedTurns` edit/delete.
 Playwright covers the browser-visible composer against the Vite webview with
 synthetic host messages and is **supportive only** for live Extension Development
 Host keyboard proof.
 
 Optional live check: press **F5**, open a running task, confirm Enter stacks
-queue rows, Ctrl+Enter either delivers a live-input notice or quietly queues
+queue rows, Ctrl+Enter reserves a follow-up and interrupts the live turn
 via `send` (never a red “unsupported” banner), and queue Edit/Delete update the panel.
 
 ## What to work on

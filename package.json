@@ -57,7 +57,11 @@
         },
         "muster.permissions.mode": {
           "type": "string",
-          "enum": ["ask", "allow", "readonly"],
+          "enum": [
+            "ask",
+            "allow",
+            "readonly"
+          ],
           "default": "ask",
           "enumDescriptions": [
             "Safe: auto-allow read-only tool calls, prompt for writes/commands/unknown actions.",
@@ -113,11 +117,14 @@
     "test:file-drop-live-evidence": "node --test scripts/verify-file-drop-live-host-evidence.test.mjs",
     "test:file-drop-docs": "node --test scripts/verify-file-drop-docs.test.mjs",
     "test:queue-live-inject-docs": "node --test scripts/verify-queue-live-inject-docs.test.mjs",
+    "test:live-inject-smoke": "node --test scripts/verify-live-inject-smoke.test.mjs",
     "test:watch": "vitest",
     "check:svelte": "svelte-check --workspace webview --tsconfig ./tsconfig.json",
     "test:source-boundary": "node scripts/source-boundary-smoke.mjs",
     "test:evidence": "node --test scripts/verify-verification-evidence.test.mjs",
-    "test:source-boundary:fixtures": "node --test scripts/source-boundary-smoke.test.mjs"
+    "test:source-boundary:fixtures": "node --test scripts/source-boundary-smoke.test.mjs",
+    "mvp:grok-live-inject": "tsx scripts/test-grok-live-inject.ts",
+    "mvp:grok-interrupt-and-send": "tsx scripts/test-grok-interrupt-and-send.ts"
   },
   "devDependencies": {
     "@playwright/test": "^1.61.1",

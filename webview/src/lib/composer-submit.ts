@@ -8,8 +8,8 @@ export type ComposerSubmitIntent =
   /** Host `send` — creates/continues a turn (FIFO follow-up while live). */
   | { kind: 'send' }
   /**
-   * Host `sendLiveInput` — prefer concurrent inject into the live turn.
-   * Host may silently deliver via `send` when inject is unavailable.
+   * Host `sendLiveInput` — interrupt & send (cut & continue): reserve a FIFO
+   * follow-up, then interrupt the live turn. Not concurrent ACP inject.
    */
   | { kind: 'sendLiveInput' };
 
@@ -39,7 +39,7 @@ export interface ComposerKeyPolicyOptions {
  *
  * - IME composition / keyCode 229: none
  * - Shift+Enter: none (browser inserts newline)
- * - Ctrl/Meta+Enter in task mode + live turn: sendLiveInput (host may silent-send)
+ * - Ctrl/Meta+Enter in task mode + live turn: sendLiveInput (interrupt & send)
  * - Ctrl/Meta+Enter in task mode when idle / not live: send (immediate turn)
  * - Plain Enter (and Ctrl+Enter in draft): send
  */

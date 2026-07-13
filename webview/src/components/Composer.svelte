@@ -257,7 +257,7 @@
     }
 
     if (intent.kind === 'sendLiveInput') {
-      // Prefer inject; host silently delivers via send/FIFO if inject is unavailable.
+      // Interrupt & send: host reserves follow-up then interrupts live turn.
       const message = buildTaskComposerMessage(intent, {
         taskId,
         text: displayText,
@@ -422,7 +422,7 @@
     }
   }
 
-  /** Live inject only while a turn is generating — idle Ctrl+Enter uses ordinary send. */
+  /** Interrupt & send only while a turn is generating — idle Ctrl+Enter uses ordinary send. */
   const liveInjectEligible = $derived(
     mode === 'task' && (runtime === 'running' || taskStatus === 'running' || cliStatus === 'running'),
   );
@@ -666,7 +666,7 @@
         : blockReason
           ? blockReason
           : liveComposerGuidance
-            ? 'Enter queues a follow-up · Ctrl+Enter injects live input…'
+            ? 'Enter queues a follow-up · Ctrl+Enter interrupts and sends…'
             : 'Message this task…',
   );
 
@@ -872,7 +872,7 @@
             aria-label="Send"
             use:tip={
               mode === 'task' && (runtime === 'running' || taskStatus === 'running')
-                ? 'Enter queues a follow-up; Ctrl+Enter injects live input'
+                ? 'Enter queues a follow-up; Ctrl+Enter interrupts and sends'
                 : isTerminalReopenable
                   ? 'Send a message to reopen this task'
                   : 'Send'
@@ -887,8 +887,8 @@
             class="icon-btn"
             style="width: 28px; height: 28px;"
             onclick={sendLiveInput}
-            aria-label="Inject live input"
-            use:tip={'Ctrl+Enter: inject live input (never queues)'}
+            aria-label="Interrupt and send"
+            use:tip={'Ctrl+Enter: interrupt & send (cut & continue)'}
             data-testid="composer-live-inject"
           >
             <span class="codicon codicon-debug-line-by-line"></span>

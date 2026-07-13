@@ -135,6 +135,12 @@ export interface PromptResult {
   /** Some ACP agents (e.g. codex-acp) return usage on the prompt result. */
   usage?: Record<string, unknown>;
   _meta?: Record<string, unknown>;
+  /**
+   * Set by {@link boundedPromptCancel}: `forced` when the grace timer dropped the
+   * pending request; omit/`confirmed` when the agent settled the prompt itself.
+   * Engine uses this for interrupt-and-send session bind / promote gates.
+   */
+  cancelConfidence?: 'confirmed' | 'forced';
 }
 
 type SessionSink = (update: SessionUpdate) => void;
@@ -376,7 +382,7 @@ export function boundedPromptCancel(
         settled = true;
         signal.removeEventListener('abort', onAbort);
         hooks.onForceSettle();
-        resolve({ stopReason: 'cancelled' });
+        resolve({ stopReason: 'cancelled', cancelConfidence: 'forced' });
       }, graceMs);
       if (typeof graceTimer.unref === 'function') graceTimer.unref();
     };

@@ -259,7 +259,7 @@ describe('CodexBackend.run — terminal classification', () => {
 
   it('stopReason "cancelled" -> cancellation error', async () => {
     const events = await runTurn(new CodexBackend(), options(), fake, { result: { stopReason: 'cancelled' } });
-    expect(events.at(-1)).toEqual({ type: 'error', message: 'Turn cancelled', isCancellation: true });
+    expect(events.at(-1)).toEqual({ type: 'error', message: 'Turn cancelled', isCancellation: true, meta: { interruptConfidence: 'confirmed' } });
   });
 
   it('missing stopReason -> "prompt ended without a stopReason" error', async () => {
@@ -366,7 +366,7 @@ describe('CodexBackend.run — cancellation & errors', () => {
     fake.resolve({ stopReason: 'end_turn' });
     await pump;
     expect(fake.calls.cancel[0][0]).toBe('sess-1');
-    expect(events.at(-1)).toEqual({ type: 'error', message: 'Turn cancelled', isCancellation: true });
+    expect(events.at(-1)).toEqual({ type: 'error', message: 'Turn cancelled', isCancellation: true, meta: { interruptConfidence: 'confirmed' } });
   });
 
   it('reports an unsupported resume when the client cannot load sessions', async () => {

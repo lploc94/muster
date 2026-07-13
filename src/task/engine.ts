@@ -452,6 +452,15 @@ export class TaskEngine {
       taskId: string;
       backend: Backend;
       sessionId?: string;
+      /**
+       * Monotonic render-order allocator for this live turn (assistant/tool segments).
+       */
+      nextOrder?: () => number;
+      /**
+       * Set when this process requested interrupt (abort). Required for
+       * confirmed interrupt-and-send settlement (bind + promote).
+       */
+      interruptArmed?: boolean;
     }
   >();
   /** Queued turns preserved on reload — start only via resumeQueuedTurn. */
@@ -786,7 +795,85 @@ export class TaskEngine {
     return { ok: true, value: { taskId, messageId, turnId } };
   }
 
+  /**
+   * Enqueue a user message as a FIFO follow-up turn (plain Enter / idle send).
+   * Does not interrupt a live turn. Schedules immediately when eligible.
+   */
   continueTaskWithMessage(
+    taskId: string,
+    instruction: string,
+  ): EngineResult<{
+    messageId: string;
+    turnId: string;
+    outcome: 'queued' | 'scheduled';
+  }> {
+    const reserved = this.reserveQueuedFollowUp(taskId, instruction);
+    if (!reserved.ok) {
+      return reserved;
+    }
+    void this.scheduleTurn(reserved.value.turnId);
+    return {
+      ok: true,
+      value: { ...reserved.value, outcome: 'scheduled' },
+    };
+  }
+
+  /**
+   * Direct message while live: **reserve first, interrupt second**.
+   * Never concurrent `backend.sendLiveInput`. On reserve failure the live turn
+   * keeps running. Interrupt only when a local liveRuns handle exists.
+   */
+  interruptAndSend(
+    taskId: string,
+    instruction: string,
+  ): EngineResult<{
+    messageId: string;
+    turnId: string;
+    outcome: 'queued' | 'scheduled';
+    interruptedTurnId?: string;
+  }> {
+    const file = this.store.getFile();
+    const live = turnsForTask(file, taskId).find(
+      (t) => t.status === 'running' || t.status === 'waiting_user',
+    );
+
+    if (!live) {
+      const cont = this.continueTaskWithMessage(taskId, instruction);
+      if (!cont.ok) return cont;
+      return { ok: true, value: cont.value };
+    }
+
+    // ISSUE-3: reserve continuation before any abort.
+    const reserved = this.reserveQueuedFollowUp(taskId, instruction);
+    if (!reserved.ok) {
+      return reserved;
+    }
+
+    const hasLocalHandle = this.liveRuns.has(live.id);
+    if (hasLocalHandle) {
+      this.interruptTurn(live.id);
+      return {
+        ok: true,
+        value: {
+          ...reserved.value,
+          outcome: 'queued',
+          interruptedTurnId: live.id,
+        },
+      };
+    }
+
+    // No local handle: message stays queued; do not fake interrupt success.
+    return {
+      ok: true,
+      value: {
+        ...reserved.value,
+        outcome: 'queued',
+      },
+    };
+  }
+
+  /** Durable queue row only — does not schedule or interrupt. */
+  private reserveQueuedFollowUp(
     taskId: string,
     instruction: string,
   ): EngineResult<{ messageId: string; turnId: string }> {
@@ -832,8 +919,6 @@ export class TaskEngine {
     if (!commit.ok) {
       return { ok: false, reason: commit.detail ?? commit.reason };
     }
-
-    void this.scheduleTurn(turnId);
     return { ok: true, value: { messageId, turnId } };
   }
 
@@ -1311,7 +1396,11 @@ export class TaskEngine {
   }
 
   interruptTurn(turnId: string): EngineResult<void> {
-    this.liveRuns.get(turnId)?.controller.abort();
+    const handle = this.liveRuns.get(turnId);
+    if (handle) {
+      handle.interruptArmed = true;
+      handle.controller.abort();
+    }
     return { ok: true, value: undefined };
   }
 
@@ -1888,17 +1977,21 @@ export class TaskEngine {
     }
     const promise = this.executeTurn(turnId);
     this.turnPromises.set(turnId, promise);
-    void promise.finally(() => {
+    void promise.finally(async () => {
       this.turnPromises.delete(turnId);
       const file = this.store.getFile();
       const settled = file.turns[turnId];
-      // Same-task FIFO follow-ups auto-promote only after successful settlement
-      // (MEM030 / failure+cap paths keep queued follow-ups unstarted).
-      const allowSameTaskFollowUps = settled?.status === 'succeeded';
+      // Success always drains same-task FIFO. Confirmed interrupt with queued
+      // follow-ups also drains (interrupt-and-send / Enter-then-Stop). Forced
+      // interrupt and failed settlements keep MEM030 freeze.
+      const confirmedInterrupt =
+        settled?.status === 'interrupted' && settled.interruptConfidence === 'confirmed';
+      const allowSameTaskFollowUps =
+        settled?.status === 'succeeded' || confirmedInterrupt;
       const settledTaskId = settled?.taskId;
-      // Promote in FIFO order (sequence → createdAt → id) so the earliest
-      // queued follow-up is always the first candidate after settlement.
-      const queued = Object.values(file.turns)
+
+      const afterFlush = this.store.getFile();
+      const queued = Object.values(afterFlush.turns)
         .filter((t) => t.status === 'queued')
         .sort(
           (a, b) =>
@@ -1912,7 +2005,8 @@ export class TaskEngine {
         }
         if (settledTaskId && turn.taskId === settledTaskId) {
           if (!allowSameTaskFollowUps) continue;
-        } else if (isQueuedTurnAutoPromoteFrozen(file, turn.taskId, turn.id)) {
+          // Confirmed interrupt path already cleared holds in settleInterrupted.
+        } else if (isQueuedTurnAutoPromoteFrozen(afterFlush, turn.taskId, turn.id)) {
           // Unrelated settlement must not thaw pre-failure follow-ups; post-
           // settlement recovery/retry turns are not frozen (see helper).
           continue;
@@ -2032,10 +2126,15 @@ export class TaskEngine {
     let observedSessionId: string | undefined;
     let terminalSettled = false;
     // Per-turn render ordering + assistant segmentation (see WEBVIEW-IMPROVEMENT-PLAN §5.1.1).
-    // `order` is a per-turn monotonic counter shared by assistant segments and tool
-    // calls; `(turn.sequence, order)` reconstructs the exact live interleaving.
+    // `order` is a per-turn monotonic counter shared by assistant segments, tools,
+    // and mid-turn live_inject user messages; `(turn.sequence, order)` reconstructs
+    // the exact live interleaving.
     let orderCounter = 0;
     const nextOrder = (): number => orderCounter++;
+    {
+      const liveHandle = this.liveRuns.get(turnId);
+      if (liveHandle) liveHandle.nextOrder = nextOrder;
+    }
     let currentAssistantSegment: { storeId: string; sourceMessageId: string } | undefined;
     let mcpConfigPath: string | undefined;
 
@@ -2392,7 +2491,20 @@ export class TaskEngine {
             break;
           case 'error':
             if (event.isCancellation) {
-              terminalSettled = await this.settleInterrupted(turnId, observedSessionId, rawOutput, backend);
+              // Confirmed only if we armed a local interrupt and adapter did not
+              // force-timeout. Missing meta / spontaneous cancel → forced.
+              const handle = this.liveRuns.get(turnId);
+              const armed = handle?.interruptArmed === true;
+              const adapterForced = event.meta?.interruptConfidence === 'forced';
+              const confidence: 'confirmed' | 'forced' =
+                armed && !adapterForced ? 'confirmed' : 'forced';
+              terminalSettled = await this.settleInterrupted(
+                turnId,
+                observedSessionId,
+                rawOutput,
+                backend,
+                confidence,
+              );
               if (terminalSettled) {
                 this.safeEmit({ type: 'turnDone', taskId: turn.taskId, turnId });
               }
@@ -2528,6 +2640,7 @@ export class TaskEngine {
     observedSessionId: string | undefined,
     rawOutput: string,
     backend: Backend,
+    interruptConfidence: 'confirmed' | 'forced' = 'confirmed',
   ): Promise<boolean> {
     if (this.settling.has(turnId)) {
       return false;
@@ -2544,20 +2657,51 @@ export class TaskEngine {
         if (!result.ok) {
           return result;
         }
+        const observed = observedSessionId ?? turn.observedSessionId;
         const candidate = selectCommittedSessionId(
           backend,
-          { observedSessionId: observedSessionId ?? turn.observedSessionId },
+          { observedSessionId: observed },
           rawOutput,
           undefined,
         );
         draft.turns[turnId] = {
           ...result.next,
-          observedSessionId: observedSessionId ?? turn.observedSessionId,
+          observedSessionId: observed,
           candidateSessionId: candidate,
           isCancellation: true,
+          interruptConfidence,
         };
-        // Freeze follow-ups that were already queued before this interrupt.
-        holdQueuedFollowUpsOnFailure(draft, turn.taskId);
+
+        const task = draft.tasks[turn.taskId];
+        const queuedFollowUps = turnsForTask(draft, turn.taskId).filter(
+          (t) => t.status === 'queued',
+        );
+
+        if (interruptConfidence === 'confirmed') {
+          // ISSUE-1: bind observed session for first-turn interrupt when unset.
+          if (task && !task.committedSessionId) {
+            const bindId = observed ?? candidate;
+            if (bindId) {
+              draft.tasks[turn.taskId] = {
+                ...task,
+                committedSessionId: bindId,
+              };
+            }
+          }
+          if (queuedFollowUps.length > 0) {
+            // ISSUE-4: clear holds so FIFO can promote after confirmed cut.
+            for (const q of queuedFollowUps) {
+              if (!q.holdAutoPromote) continue;
+              const { holdAutoPromote: _h, ...rest } = q;
+              void _h;
+              draft.turns[q.id] = rest;
+            }
+          }
+          // Pure Stop (no queued follow-ups): nothing to promote; no freeze needed.
+        } else {
+          // Forced / unconfirmed: freeze follow-ups; do not commit session.
+          holdQueuedFollowUpsOnFailure(draft, turn.taskId);
+        }
         return { ok: true };
       });
       return commit.ok;

@@ -142,7 +142,7 @@ export const RUNTIME_PRESENTATIONS = {
     workspaceHeadline: 'Turn is running',
     workspaceDetail: 'A CLI process is active for this task (runtime only — not task outcome).',
     composerGuidance:
-      'Enter queues a follow-up turn; Ctrl+Enter injects live input when the agent supports it.',
+      'Enter queues a follow-up turn; Ctrl+Enter interrupts and sends.',
   },
   waiting_user: {
     key: 'waiting_user',

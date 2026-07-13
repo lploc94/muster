@@ -282,7 +282,7 @@ describe('TaskEngine', () => {
     expect(retries).toHaveLength(1);
   });
 
-  it('interrupts on cancellation without committing session id', async () => {
+  it('interrupts on cancellation; confirmed pure-stop binds session, promotes nothing', async () => {
     const { store } = makeTempStore();
     let release: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {
@@ -295,7 +295,12 @@ describe('TaskEngine', () => {
         yield { type: 'sessionStarted', sessionId: 'sess-live' };
         await gate;
         if (options.signal?.aborted) {
-          yield { type: 'error', message: 'aborted', isCancellation: true };
+          yield {
+            type: 'error',
+            message: 'aborted',
+            isCancellation: true,
+            meta: { interruptConfidence: 'confirmed' },
+          };
         }
       },
     };
@@ -312,8 +317,12 @@ describe('TaskEngine', () => {
     const task = store.getTask('task-1');
     const turn = store.getFile().turns[sent.value.turnId];
     expect(task?.lifecycle).toBe('open');
-    expect(task?.committedSessionId).toBeUndefined();
+    // Confirmed interrupt binds observed session for later resume (ISSUE-1).
+    expect(task?.committedSessionId).toBe('sess-live');
     expect(turn?.status).toBe('interrupted');
+    expect(turn?.interruptConfidence).toBe('confirmed');
+    // No queued follow-ups → nothing else to promote.
+    expect(Object.values(store.getFile().turns).filter((t) => t.status === 'queued')).toHaveLength(0);
   });
 
   it('settles iterator rejection as a single failed turn', async () => {
@@ -1364,5 +1373,226 @@ describe('TaskEngine.editQueuedTurn / deleteQueuedTurn', () => {
     engine.stageDisposition(first.value.turnId, { kind: 'idle' }, 'op-race');
     release?.();
     await engine.whenIdle();
+  });
+});
+
+describe('TaskEngine.interruptAndSend', () => {
+  async function startGatedTurn(opts?: {
+    eventsAfterSession?: NormalizedEvent[];
+  }): Promise<{
+    store: TaskStore;
+    filePath: string;
+    engine: TaskEngine;
+    taskId: string;
+    turnId: string;
+    resume: () => void;
+    runOptions: RunOptions[];
+  }> {
+    const { store, filePath } = makeTempStore();
+    let resume!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    const runOptions: RunOptions[] = [];
+    const backend: Backend = {
+      name: 'fake',
+      capabilities: MCP_CAPS,
+      async *run(options: RunOptions) {
+        runOptions.push(options);
+        yield { type: 'sessionStarted', sessionId: 'sess-ias-1' };
+        await gate;
+        for (const e of opts?.eventsAfterSession ?? [{ type: 'turnCompleted' as const }]) {
+          yield e;
+        }
+      },
+    };
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => backend,
+      clock: () => '2026-07-13T12:00:00.000Z',
+    });
+    engine.createTask({ id: 'task-ias', goal: 'ias', backend: 'fake' });
+    const started = engine.startTask('task-ias', []);
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error('start failed');
+    for (let i = 0; i < 80; i++) {
+      const turn = store.getFile().turns[started.value.turnId];
+      if (turn?.status === 'running' && turn.observedSessionId === 'sess-ias-1') break;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    return {
+      store,
+      filePath,
+      engine,
+      taskId: 'task-ias',
+      turnId: started.value.turnId,
+      resume,
+      runOptions,
+    };
+  }
+
+  it('reserves a follow-up then interrupts; confirmed settle binds session and promotes', async () => {
+    const { store, engine, taskId, turnId, resume, runOptions } = await startGatedTurn({
+      eventsAfterSession: [
+        {
+          type: 'error',
+          message: 'Turn cancelled',
+          isCancellation: true,
+          meta: { interruptConfidence: 'confirmed' },
+        },
+      ],
+    });
+
+    // First turn still running — committedSessionId not set yet (success-only historically).
+    expect(store.getFile().tasks[taskId]?.committedSessionId).toBeUndefined();
+
+    const result = engine.interruptAndSend(taskId, 'MUSTER_INJECT_ACK continue');
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error('interruptAndSend failed');
+    expect(result.value.interruptedTurnId).toBe(turnId);
+    expect(result.value.outcome).toBe('queued');
+
+    const followUpId = result.value.turnId;
+    expect(store.getFile().turns[followUpId]?.status).toBe('queued');
+    // Live turn should be aborting; release gate so cancel terminal is processed.
+    resume();
+    await engine.whenIdle();
+
+    const file = store.getFile();
+    expect(file.turns[turnId]?.status).toBe('interrupted');
+    expect(file.turns[turnId]?.interruptConfidence).toBe('confirmed');
+    // Session bound on confirmed interrupt.
+    expect(file.tasks[taskId]?.committedSessionId).toBe('sess-ias-1');
+    // Follow-up should have run (or be running/finished) with resumeId.
+    const followUp = file.turns[followUpId];
+    expect(followUp?.status).not.toBe('queued');
+    expect(followUp?.holdAutoPromote).not.toBe(true);
+    // Second run uses committed session.
+    const second = runOptions[1];
+    expect(second?.resumeId).toBe('sess-ias-1');
+    expect(second?.prompt).toContain('MUSTER_INJECT_ACK');
+  });
+
+  it('does not interrupt when reserve would fail (terminal task)', async () => {
+    const { store, engine, taskId, turnId, resume } = await startGatedTurn();
+    store.commit((draft) => {
+      draft.tasks[taskId] = { ...draft.tasks[taskId]!, lifecycle: 'succeeded' };
+      return { ok: true };
+    });
+    const beforeRunning = store.getFile().turns[turnId]?.status;
+    const result = engine.interruptAndSend(taskId, 'should fail reserve');
+    expect(result.ok).toBe(false);
+    expect(store.getFile().turns[turnId]?.status).toBe(beforeRunning);
+    resume();
+    await engine.whenIdle();
+  });
+
+  it('forced interrupt keeps hold and does not bind committedSessionId', async () => {
+    const { store, engine, taskId, turnId, resume, runOptions } = await startGatedTurn({
+      eventsAfterSession: [
+        {
+          type: 'error',
+          message: 'Turn cancelled',
+          isCancellation: true,
+          meta: { interruptConfidence: 'forced' },
+        },
+      ],
+    });
+
+    const result = engine.interruptAndSend(taskId, 'after forced');
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error('fail');
+    const followUpId = result.value.turnId;
+    resume();
+    await engine.whenIdle();
+
+    const file = store.getFile();
+    expect(file.turns[turnId]?.interruptConfidence).toBe('forced');
+    expect(file.tasks[taskId]?.committedSessionId).toBeUndefined();
+    expect(file.turns[followUpId]?.status).toBe('queued');
+    expect(file.turns[followUpId]?.holdAutoPromote).toBe(true);
+    // Only primary run should have started.
+    expect(runOptions.length).toBe(1);
+  });
+
+  it('Enter queue without interrupt leaves live turn running', async () => {
+    const { store, engine, taskId, turnId, resume } = await startGatedTurn();
+    const cont = engine.continueTaskWithMessage(taskId, 'fifo only');
+    expect(cont.ok).toBe(true);
+    expect(store.getFile().turns[turnId]?.status).toBe('running');
+    if (cont.ok) {
+      expect(store.getFile().turns[cont.value.turnId]?.status).toBe('queued');
+    }
+    resume();
+    await engine.whenIdle();
+  });
+
+  it('no local live handle: reserves queue but does not arm interrupt', async () => {
+    const { store, engine, taskId, turnId, resume } = await startGatedTurn();
+    // Simulate missing local handle (e.g. other window owns process view).
+    (engine as unknown as { liveRuns: Map<string, unknown> }).liveRuns.delete(turnId);
+    const result = engine.interruptAndSend(taskId, 'orphan queue');
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error('fail');
+    expect(result.value.interruptedTurnId).toBeUndefined();
+    expect(store.getFile().turns[result.value.turnId]?.status).toBe('queued');
+    // Primary still "running" in store (we only dropped in-memory handle).
+    expect(store.getFile().turns[turnId]?.status).toBe('running');
+    resume();
+    await engine.whenIdle();
+  });
+
+  it('Enter-then-Stop (confirmed interrupt) promotes the queued follow-up', async () => {
+    const { store, engine, taskId, turnId, resume, runOptions } = await startGatedTurn({
+      eventsAfterSession: [
+        {
+          type: 'error',
+          message: 'Turn cancelled',
+          isCancellation: true,
+          meta: { interruptConfidence: 'confirmed' },
+        },
+      ],
+    });
+    const cont = engine.continueTaskWithMessage(taskId, 'queued then stop');
+    expect(cont.ok).toBe(true);
+    if (!cont.ok) throw new Error('fail');
+    engine.interruptTurn(turnId);
+    resume();
+    await engine.whenIdle();
+    expect(store.getFile().turns[turnId]?.interruptConfidence).toBe('confirmed');
+    expect(store.getFile().tasks[taskId]?.committedSessionId).toBe('sess-ias-1');
+    const follow = store.getFile().turns[cont.value.turnId];
+    expect(follow?.status).not.toBe('queued');
+    expect(runOptions[1]?.prompt).toContain('queued then stop');
+  });
+
+  it('rapid double interruptAndSend reserves two FIFO turns and one interrupt', async () => {
+    const { store, engine, taskId, turnId, resume, runOptions } = await startGatedTurn({
+      eventsAfterSession: [
+        {
+          type: 'error',
+          message: 'Turn cancelled',
+          isCancellation: true,
+          meta: { interruptConfidence: 'confirmed' },
+        },
+      ],
+    });
+    const a = engine.interruptAndSend(taskId, 'first direct');
+    const b = engine.interruptAndSend(taskId, 'second direct');
+    expect(a.ok && b.ok).toBe(true);
+    if (!a.ok || !b.ok) throw new Error('fail');
+    expect(a.value.interruptedTurnId).toBe(turnId);
+    // Second may also report interruptedTurnId; both messages queued.
+    expect(store.getFile().turns[a.value.turnId]?.status).toBe('queued');
+    expect(store.getFile().turns[b.value.turnId]?.status).toBe('queued');
+    resume();
+    await engine.whenIdle();
+    // First follow-up must leave queue; second may still be draining after first.
+    const firstStatus = store.getFile().turns[a.value.turnId]?.status;
+    expect(firstStatus).not.toBe('queued');
+    // At least one extra run beyond primary for FIFO drain of directs.
+    expect(runOptions.length).toBeGreaterThanOrEqual(2);
+    // Second reservation still exists (queued or finished).
+    expect(store.getFile().turns[b.value.turnId]).toBeDefined();
   });
 });

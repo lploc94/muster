@@ -74,8 +74,8 @@ export interface QueuedTurnProjection {
   messageIds: string[];
   createdAt: string;
   /**
-   * User-visible content of bound pending message(s). Host projects this so the
-   * queue panel does not depend on chat transcript (queued follow-ups stay out of chat).
+   * Host-projected user text so the S04 queue panel does not depend on chat transcript
+   * (queued follow-ups stay out of chat).
    */
   previewText?: string;
 }
@@ -222,8 +222,14 @@ export function buildTranscript(file: TaskStoreFile, taskId: string): Transcript
       }
     }
     const seq = turnId !== undefined && seqOf.has(turnId) ? seqOf.get(turnId)! : -1;
-    // user prompt (-2) sorts before reasoning (-1) and assistant/tool segments (>=0).
-    const order = message.role === 'assistant' ? (message.order ?? 0) : -2;
+    // Opening user prompts use order -2 (before reasoning -1 / assistant >=0).
+    // Explicit message.order (if present) is respected for ordered segments.
+    const order =
+      message.role === 'assistant'
+        ? (message.order ?? 0)
+        : message.order !== undefined
+          ? message.order
+          : -2;
     entries.push({
       item: {
         id: message.id,
