@@ -9,6 +9,7 @@ import { makeBackend } from './backends/index';
 import {
   disposeSharedAcpClient,
   isAskLikeForm,
+  setAcpDebugLogger,
   setElicitationController,
   setPermissionController,
   setQuestionController,
@@ -66,6 +67,7 @@ let askBridge: AskBridge | undefined;
 let elicitationBridge: ElicitationBridge | undefined;
 let permissionBridge: PermissionBridge | undefined;
 let permissionAuditChannel: vscode.OutputChannel | undefined;
+let elicitationDebugChannel: vscode.OutputChannel | undefined;
 let credentialRegistry: CredentialRegistry | undefined;
 let bridgeServer: MusterBridgeServer | undefined;
 let taskEngine: TaskEngine | undefined;
@@ -76,6 +78,19 @@ let presentationManager: PresentationManager | undefined;
 let lastObservedRevision = 0;
 let lastObservedFile: TaskStoreFile | undefined;
 const activePendingAsks = new Map<string, PendingAskOverlay>();
+
+function debugElicitation(event: string, details: Record<string, unknown> = {}): void {
+  try {
+    const timestamp = new Date().toISOString();
+    const line = `${timestamp} ${event} ${JSON.stringify(details)}`;
+    elicitationDebugChannel?.appendLine(line);
+    // Mirror to the Extension Host Debug Console for launch/F5 workflows.
+    // Keep a stable prefix so users can filter the otherwise noisy console.
+    console.info(`[muster][elicitation-debug] ${line}`);
+  } catch {
+    // Debug logging must not affect the live protocol path.
+  }
+}
 
 /**
  * Host copy of the webview wire protocol version. The source of truth is
@@ -1088,6 +1103,20 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     });
 
     webviewView.webview.onDidReceiveMessage(async (data) => {
+      if (data?.type === 'submitAsk' || data?.type === 'cancelAsk' || data?.type === 'submitElicitation') {
+        debugElicitation('host.webview_message', {
+          type: data.type,
+          taskId: data.taskId,
+          turnId: data.turnId,
+          askId: data.askId,
+          promptId: data.promptId,
+          action: data.action,
+          answerIndexes:
+            data.answers && typeof data.answers === 'object' ? Object.keys(data.answers) : undefined,
+          contentKeys:
+            data.content && typeof data.content === 'object' ? Object.keys(data.content) : undefined,
+        });
+      }
       switch (data?.type) {
         case 'send':
           await this.handleSend(data);
@@ -1344,28 +1373,96 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           ) {
             const turn = taskStore?.getFile().turns[data.turnId];
             if (!turn || turn.taskId !== data.taskId) {
-              this.postCommandError('turn does not belong to task', data.taskId);
+              const message = 'turn does not belong to task';
+              this.postCommandError(message, data.taskId);
+              this.post({
+                type: 'askSubmissionResult',
+                taskId: data.taskId,
+                turnId: data.turnId,
+                askId: data.askId,
+                ok: false,
+                message,
+              });
               break;
             }
             const result = taskEngine?.submitAskAnswer(
               { taskId: data.taskId, turnId: data.turnId, askId: data.askId },
               data.answers,
             );
-            if (result && !result.ok) {
-              this.postCommandError(result.reason, data.taskId);
+            if (!result || !result.ok) {
+              const message = result?.reason ?? 'task engine unavailable';
+              debugElicitation('host.ask_submit_rejected', {
+                taskId: data.taskId,
+                turnId: data.turnId,
+                askId: data.askId,
+                message,
+              });
+              this.postCommandError(message, data.taskId);
+              this.post({
+                type: 'askSubmissionResult',
+                taskId: data.taskId,
+                turnId: data.turnId,
+                askId: data.askId,
+                ok: false,
+                message,
+              });
+            } else {
+              debugElicitation('host.ask_submit_accepted', {
+                taskId: data.taskId,
+                turnId: data.turnId,
+                askId: data.askId,
+              });
+              this.post({
+                type: 'askSubmissionResult',
+                taskId: data.taskId,
+                turnId: data.turnId,
+                askId: data.askId,
+                ok: true,
+              });
             }
           } else {
-            this.postCommandError('invalid ask answer payload');
+            const message = 'invalid ask answer payload';
+            this.postCommandError(message);
+            if (
+              typeof data.taskId === 'string' &&
+              typeof data.turnId === 'string' &&
+              typeof data.askId === 'string'
+            ) {
+              this.post({
+                type: 'askSubmissionResult',
+                taskId: data.taskId,
+                turnId: data.turnId,
+                askId: data.askId,
+                ok: false,
+                message,
+              });
+            }
           }
           break;
         case 'submitElicitation': {
           if (typeof data.promptId !== 'string' || typeof data.action !== 'string') {
-            this.postCommandError('invalid elicitation submission');
+            const message = 'invalid elicitation submission';
+            this.postCommandError(message);
+            if (typeof data.promptId === 'string') {
+              this.post({
+                type: 'elicitationSubmissionResult',
+                promptId: data.promptId,
+                ok: false,
+                message,
+              });
+            }
             break;
           }
           const action = data.action as 'accept' | 'decline' | 'cancel';
           if (action !== 'accept' && action !== 'decline' && action !== 'cancel') {
-            this.postCommandError('invalid elicitation action');
+            const message = 'invalid elicitation action';
+            this.postCommandError(message);
+            this.post({
+              type: 'elicitationSubmissionResult',
+              promptId: data.promptId,
+              ok: false,
+              message,
+            });
             break;
           }
           let content =
@@ -1379,15 +1476,43 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
               const { validateFormValues } = await import('./backends/elicitation');
               const check = validateFormValues(form, content ?? {});
               if (!check.ok) {
+                debugElicitation('host.elicitation_validation_rejected', {
+                  promptId: data.promptId,
+                  message: check.message,
+                });
                 this.postCommandError(check.message);
+                this.post({
+                  type: 'elicitationSubmissionResult',
+                  promptId: data.promptId,
+                  ok: false,
+                  message: check.message,
+                });
                 break;
               }
             }
           }
           if (!elicitationBridge?.submit(data.promptId, { action, content })) {
-            this.postCommandError('no matching pending elicitation');
+            const message = 'no matching pending elicitation';
+            debugElicitation('host.elicitation_submit_rejected', {
+              promptId: data.promptId,
+              action,
+              message,
+            });
+            this.postCommandError(message);
+            this.post({
+              type: 'elicitationSubmissionResult',
+              promptId: data.promptId,
+              ok: false,
+              message,
+            });
             break;
           }
+          debugElicitation('host.elicitation_submit_accepted', {
+            promptId: data.promptId,
+            action,
+            contentKeys: content ? Object.keys(content) : [],
+          });
+          this.post({ type: 'elicitationSubmissionResult', promptId: data.promptId, ok: true });
           // URL consent accept → open external after user confirmed.
           if (action === 'accept') {
             const waiting = elicitationBridge.listOob().find((e) => e.promptId === data.promptId);
@@ -1412,8 +1537,25 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
               turnId: data.turnId,
               askId: data.askId,
             });
-            if (result && !result.ok) {
-              this.postCommandError(result.reason, data.taskId);
+            if (!result || !result.ok) {
+              const message = result?.reason ?? 'task engine unavailable';
+              this.postCommandError(message, data.taskId);
+              this.post({
+                type: 'askSubmissionResult',
+                taskId: data.taskId,
+                turnId: data.turnId,
+                askId: data.askId,
+                ok: false,
+                message,
+              });
+            } else {
+              this.post({
+                type: 'askSubmissionResult',
+                taskId: data.taskId,
+                turnId: data.turnId,
+                askId: data.askId,
+                ok: true,
+              });
             }
           }
           break;
@@ -1617,8 +1759,20 @@ export async function activate(context: vscode.ExtensionContext) {
   );
 
   try {
+    elicitationDebugChannel = vscode.window.createOutputChannel('Muster Elicitation Debug');
+    context.subscriptions.push(elicitationDebugChannel);
+    setAcpDebugLogger((event, details) => debugElicitation(`acp.${event}`, details));
+    debugElicitation('debug.enabled', { protocolVersion: PROTOCOL_VERSION });
+
     askBridge = new AskBridge({
       onRegister: (ref, questions) => {
+        debugElicitation('host.ask_registered', {
+          taskId: ref.taskId,
+          turnId: ref.turnId,
+          askId: ref.askId,
+          questionCount: questions.length,
+          webviewReady: !!provider['_view'],
+        });
         activePendingAsks.set(ref.taskId, {
           taskId: ref.taskId,
           turnId: ref.turnId,
@@ -1693,18 +1847,33 @@ export async function activate(context: vscode.ExtensionContext) {
     // Grok vendor ask_user_question → AskBridge + askPending (separate from RFD).
     const questionController: QuestionController = {
       prompt: async (req) => {
+        debugElicitation('host.grok_prompt_start', {
+          sessionId: req.sessionId,
+          questionCount: req.questions.length,
+        });
         const engine = taskEngine;
         if (!engine) {
+          debugElicitation('host.grok_prompt_cancelled', { reason: 'task engine unavailable' });
           return { outcome: 'cancelled' };
         }
         const registered = engine.registerAgentAsk(req.sessionId, req.questions, 120_000);
         if (!registered.ok) {
+          debugElicitation('host.grok_prompt_cancelled', { reason: registered.reason });
           return { outcome: 'cancelled' };
         }
+        debugElicitation('host.grok_prompt_waiting', registered.ref);
         try {
           const answers = await registered.promise;
+          debugElicitation('host.grok_prompt_resolved', {
+            ...registered.ref,
+            answeredIndexes: Object.keys(answers),
+          });
           return { outcome: 'accepted', answers };
-        } catch {
+        } catch (error) {
+          debugElicitation('host.grok_prompt_cancelled', {
+            ...registered.ref,
+            reason: error instanceof Error ? error.message : String(error),
+          });
           return { outcome: 'cancelled' };
         }
       },
@@ -1714,6 +1883,13 @@ export async function activate(context: vscode.ExtensionContext) {
     // RFD elicitation (form + url) — single owner ElicitationBridge.
     elicitationBridge = new ElicitationBridge({
       onRegister: (kind, prompt) => {
+        debugElicitation('host.elicitation_registered', {
+          kind,
+          promptId: prompt.promptId,
+          sessionId: prompt.sessionId,
+          webviewReady: !!provider['_view'],
+          fieldKeys: 'fields' in prompt ? prompt.fields.map((field) => field.key) : undefined,
+        });
         if (kind === 'form') {
           const form = prompt as import('./bridge/elicitation-bridge').PendingFormPrompt;
           provider['_view']?.webview.postMessage({
@@ -1747,6 +1923,7 @@ export async function activate(context: vscode.ExtensionContext) {
         });
       },
       onClear: (promptId) => {
+        debugElicitation('host.elicitation_cleared', { promptId });
         provider['_view']?.webview.postMessage({ type: 'elicitationCleared', promptId });
       },
     });
@@ -1757,12 +1934,23 @@ export async function activate(context: vscode.ExtensionContext) {
         const key = clientKey || 'muster-acp';
         const askLike = isAskLikeForm(form);
         const { promptId, promise } = eBridge.registerForm(key, form, askLike, 120_000);
+        debugElicitation('host.elicitation_waiting', {
+          promptId,
+          clientKey: key,
+          sessionId: form.sessionId,
+          askLike,
+        });
         let waitTurnId: string | undefined;
         if (form.sessionId && taskEngine) {
           waitTurnId = taskEngine.beginElicitationWait(form.sessionId, promptId)?.turnId;
         }
         try {
           const result = await promise;
+          debugElicitation('host.elicitation_resolved', {
+            promptId,
+            action: result.action,
+            contentKeys: result.content ? Object.keys(result.content) : [],
+          });
           // Soft resume only if engine still owns this wait (hard clear drops tokens first).
           if (waitTurnId && taskEngine) {
             taskEngine.endElicitationWait(waitTurnId, promptId);
@@ -1870,6 +2058,7 @@ export async function activate(context: vscode.ExtensionContext) {
         setPermissionController(null);
         setQuestionController(null);
         setElicitationController(null);
+        setAcpDebugLogger(null);
         permissionBridge?.cancelAll();
         credentialRegistry?.revokeAll();
       },
@@ -1881,6 +2070,7 @@ export async function activate(context: vscode.ExtensionContext) {
     setPermissionController(null);
     setQuestionController(null);
     setElicitationController(null);
+    setAcpDebugLogger(null);
     permissionBridge?.cancelAll();
     credentialRegistry?.revokeAll();
     bridgeServer = undefined;
@@ -1903,6 +2093,7 @@ export function deactivate() {
   setPermissionController(null);
   setQuestionController(null);
   setElicitationController(null);
+  setAcpDebugLogger(null);
   permissionBridge?.cancelAll();
   credentialRegistry?.revokeAll();
   void bridgeServer?.close();

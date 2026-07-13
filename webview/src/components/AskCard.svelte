@@ -8,9 +8,11 @@
     turnId: string;
     askId: string;
     questions: Question[];
+    submissionError?: string;
+    submissionVersion?: number;
   }
 
-  let { taskId, turnId, askId, questions }: Props = $props();
+  let { taskId, turnId, askId, questions, submissionError, submissionVersion = 0 }: Props = $props();
 
   let answers = $state<Record<string, AskAnswer>>({});
 
@@ -50,21 +52,58 @@
   }
 
   let submitting = $state(false);
+  let localPostError = $state<string | null>(null);
+  let seenSubmissionVersion = $state(0);
+
+  $effect(() => {
+    if (submissionVersion > seenSubmissionVersion) {
+      seenSubmissionVersion = submissionVersion;
+      submitting = false;
+    }
+  });
 
   function submit(): void {
     if (submitting) return;
     submitting = true;
+    localPostError = null;
     const payload: Record<string, AskAnswer> = {};
     for (let i = 0; i < questions.length; i++) {
-      payload[String(i)] = readAnswer(i);
+      // `$state` recursively proxies nested answer objects/arrays. VS Code's
+      // webview bridge structured-clones messages and rejects Proxy values with
+      // DataCloneError, after the button has already entered submitting state.
+      const answer = readAnswer(i);
+      payload[String(i)] = {
+        selected: [...answer.selected],
+        freeText: answer.freeText,
+      };
     }
-    post({ type: 'submitAsk', taskId, turnId, askId, answers: payload });
+    console.info('[muster][elicitation-ui] submitAsk', {
+      taskId,
+      turnId,
+      askId,
+      answeredIndexes: Object.keys(payload),
+    });
+    try {
+      post({ type: 'submitAsk', taskId, turnId, askId, answers: payload });
+    } catch (error) {
+      submitting = false;
+      localPostError = `Could not send the answer: ${error instanceof Error ? error.message : String(error)}`;
+      console.error('[muster][elicitation-ui] submitAsk failed', error);
+    }
   }
 
   function cancel(): void {
     if (submitting) return;
     submitting = true;
-    post({ type: 'cancelAsk', taskId, turnId, askId });
+    localPostError = null;
+    console.info('[muster][elicitation-ui] cancelAsk', { taskId, turnId, askId });
+    try {
+      post({ type: 'cancelAsk', taskId, turnId, askId });
+    } catch (error) {
+      submitting = false;
+      localPostError = `Could not cancel the question: ${error instanceof Error ? error.message : String(error)}`;
+      console.error('[muster][elicitation-ui] cancelAsk failed', error);
+    }
   }
 </script>
 
@@ -73,6 +112,9 @@
   style="border: 1px solid var(--vscode-inputValidation-infoBorder, var(--vscode-focusBorder)); background: var(--vscode-editor-background);"
 >
   <div class="font-semibold">Agent question</div>
+  {#if localPostError || submissionError}
+    <div role="alert" style="color: var(--vscode-errorForeground);">{localPostError || submissionError}</div>
+  {/if}
 
   {#each questions as q, i (i)}
     <div class="flex flex-col gap-1">

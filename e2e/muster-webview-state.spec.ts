@@ -70,8 +70,11 @@ async function openWebview(page: Page) {
     const state = { value: undefined as unknown };
     window.acquireVsCodeApi = () => ({
       postMessage(message: unknown) {
-        window.__musterPostedMessages = [...(window.__musterPostedMessages ?? []), message];
-        window.dispatchEvent(new CustomEvent('muster:test:postMessage', { detail: message }));
+        // Match VS Code's webview boundary: messages must survive structured
+        // clone. This catches accidental Svelte `$state` Proxy payloads.
+        const cloned = structuredClone(message);
+        window.__musterPostedMessages = [...(window.__musterPostedMessages ?? []), cloned];
+        window.dispatchEvent(new CustomEvent('muster:test:postMessage', { detail: cloned }));
       },
       getState() {
         return state.value;
@@ -740,7 +743,7 @@ test.describe('Muster webview host state smoke', () => {
     // Process is still up (CLI idle) — Stop remains available to abort the turn.
     await expect(page.getByRole('button', { name: 'Stop' })).toBeVisible();
     await page.locator('vscode-radio').filter({ hasText: 'Claude' }).click();
-    await page.getByRole('button', { name: 'Submit' }).click();
+    await page.getByRole('button', { name: 'Accept' }).click();
     await expectPostedMessage(page, {
       type: 'submitAsk',
       taskId: 'task-waiting',
@@ -750,13 +753,21 @@ test.describe('Muster webview host state smoke', () => {
         '0': { selected: ['Claude'], freeText: null },
       },
     });
-    await page.getByRole('button', { name: 'Dismiss' }).click();
-    await expectPostedMessage(page, {
-      type: 'cancelAsk',
+    await postRawHostMessage(page, {
+      type: 'askSubmissionResult',
       taskId: 'task-waiting',
       turnId: 'turn-waiting',
       askId: 'ask-1',
+      ok: false,
+      message: 'turn is not waiting for user',
     });
+    await expect(page.getByRole('alert').getByText('turn is not waiting for user')).toBeVisible();
+    await page.getByRole('button', { name: 'Accept' }).click();
+    await expect.poll(async () =>
+      (await postedMessages(page)).filter((message) =>
+        (message as { type?: string }).type === 'submitAsk',
+      ),
+    ).toHaveLength(2);
 
     await postSnapshot(page, {
       type: 'snapshot',
@@ -772,6 +783,82 @@ test.describe('Muster webview host state smoke', () => {
     // ask_user without pending card: process still on → CLI idle (not running).
     await expect(page.locator('[data-cli-status="idle"]').getByText(/CLI idle/i)).toBeVisible();
     await expect(page.getByRole('button', { name: 'Stop' })).toBeVisible();
+  });
+
+  test('RFD form shows validation errors and unlocks after host rejection', async ({ page }) => {
+    await openWebview(page);
+    await postRawHostMessage(page, {
+      type: 'elicitationFormPending',
+      promptId: 'elicitation-1',
+      message: 'Choose a deployment target',
+      fields: [{ key: 'targets', type: 'multiEnum', title: 'Targets', options: ['Staging', 'Production'], required: true }],
+      required: ['targets'],
+      askLike: true,
+    });
+
+    await page.getByRole('button', { name: 'Accept' }).click();
+    await expect(page.getByRole('alert').getByText('Targets is required.')).toBeVisible();
+    expect(
+      (await postedMessages(page)).filter((message) =>
+        (message as { type?: string }).type === 'submitElicitation',
+      ),
+    ).toHaveLength(0);
+
+    await page.getByRole('checkbox', { name: 'Staging' }).click();
+    await page.getByRole('checkbox', { name: 'Production' }).click();
+    await page.getByRole('button', { name: 'Accept' }).click();
+    await expectPostedMessage(page, {
+      type: 'submitElicitation',
+      promptId: 'elicitation-1',
+      action: 'accept',
+      content: { targets: ['Staging', 'Production'] },
+    });
+
+    await postRawHostMessage(page, {
+      type: 'elicitationSubmissionResult',
+      promptId: 'elicitation-1',
+      ok: false,
+      message: 'no matching pending elicitation',
+    });
+    await expect(page.getByRole('alert').getByText('no matching pending elicitation')).toBeVisible();
+    await page.getByRole('button', { name: 'Accept' }).click();
+    await expect.poll(async () =>
+      (await postedMessages(page)).filter((message) =>
+        (message as { type?: string }).type === 'submitElicitation',
+      ),
+    ).toHaveLength(2);
+  });
+
+  test('RFD URL consent unlocks after host rejection', async ({ page }) => {
+    await openWebview(page);
+    await postRawHostMessage(page, {
+      type: 'elicitationUrlPending',
+      promptId: 'elicitation-url-1',
+      elicitationId: 'oauth-1',
+      url: 'https://example.com/authorize',
+      message: 'Authorize the CLI',
+    });
+
+    await page.getByRole('button', { name: 'Open & continue' }).click();
+    await expectPostedMessage(page, {
+      type: 'submitElicitation',
+      promptId: 'elicitation-url-1',
+      action: 'accept',
+    });
+
+    await postRawHostMessage(page, {
+      type: 'elicitationSubmissionResult',
+      promptId: 'elicitation-url-1',
+      ok: false,
+      message: 'no matching pending elicitation',
+    });
+    await expect(page.getByRole('alert').getByText('no matching pending elicitation')).toBeVisible();
+    await page.getByRole('button', { name: 'Open & continue' }).click();
+    await expect.poll(async () =>
+      (await postedMessages(page)).filter((message) =>
+        (message as { type?: string }).type === 'submitElicitation',
+      ),
+    ).toHaveLength(2);
   });
 
   test('Settings panel edits host-backed retention values without losing task or chat state', async ({ page }) => {

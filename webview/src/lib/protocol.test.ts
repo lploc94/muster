@@ -396,6 +396,27 @@ describe('queued turn mutation protocol', () => {
       }),
     ).toBe(true);
   });
+
+  it('accepts prompt submission acknowledgements and rejects malformed ones', () => {
+    expect(isExtMessage({
+      type: 'askSubmissionResult',
+      taskId: 'task-1',
+      turnId: 'turn-1',
+      askId: 'ask-1',
+      ok: false,
+      message: 'retry',
+    })).toBe(true);
+    expect(isExtMessage({
+      type: 'elicitationSubmissionResult',
+      promptId: 'prompt-1',
+      ok: true,
+    })).toBe(true);
+    expect(isExtMessage({
+      type: 'elicitationSubmissionResult',
+      promptId: 'prompt-1',
+      ok: 'yes',
+    })).toBe(false);
+  });
 });
 
 describe('settings outbound protocol', () => {

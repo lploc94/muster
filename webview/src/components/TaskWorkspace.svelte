@@ -16,9 +16,11 @@
   interface Props {
     pendingAsk: PendingAsk | null;
     activeTurnId: string | null;
+    submissionError?: string;
+    submissionVersion?: number;
   }
 
-  let { pendingAsk = null, activeTurnId = null }: Props = $props();
+  let { pendingAsk = null, activeTurnId = null, submissionError, submissionVersion = 0 }: Props = $props();
 
   let retryInstruction = $state('');
   let continueMessage = $state('');
@@ -379,6 +381,8 @@
         turnId={pendingAsk.turnId}
         askId={pendingAsk.askId}
         questions={pendingAsk.questions}
+        {submissionError}
+        {submissionVersion}
       />
     {/if}
 

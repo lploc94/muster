@@ -195,6 +195,14 @@ export type ExtMessage =
   | { type: 'askPending'; taskId: string; turnId: string; askId: string; questions: Question[] }
   | { type: 'askCleared'; taskId: string; turnId: string; askId: string }
   | {
+      type: 'askSubmissionResult';
+      taskId: string;
+      turnId: string;
+      askId: string;
+      ok: boolean;
+      message?: string;
+    }
+  | {
       type: 'elicitationFormPending';
       promptId: string;
       sessionId?: string;
@@ -214,6 +222,7 @@ export type ExtMessage =
     }
   | { type: 'elicitationUrlWaiting'; promptId: string; elicitationId: string; message?: string }
   | { type: 'elicitationCleared'; promptId: string }
+  | { type: 'elicitationSubmissionResult'; promptId: string; ok: boolean; message?: string }
   | {
       type: 'permissionPending';
       sessionId: string;
@@ -505,6 +514,7 @@ const TURN_SCOPED_TYPES = new Set([
   'turnError',
   'askPending',
   'askCleared',
+  'askSubmissionResult',
 ]);
 
 /** Minimal runtime guard for messages arriving from the extension host. */
@@ -568,6 +578,13 @@ export function isExtMessage(data: unknown): data is ExtMessage {
     case 'askCleared':
       return isString(data.askId);
 
+    case 'askSubmissionResult':
+      return (
+        isString(data.askId) &&
+        typeof data.ok === 'boolean' &&
+        (data.message === undefined || isString(data.message))
+      );
+
     case 'elicitationFormPending':
       return (
         isString(data.promptId) &&
@@ -589,6 +606,13 @@ export function isExtMessage(data: unknown): data is ExtMessage {
 
     case 'elicitationCleared':
       return isString(data.promptId);
+
+    case 'elicitationSubmissionResult':
+      return (
+        isString(data.promptId) &&
+        typeof data.ok === 'boolean' &&
+        (data.message === undefined || isString(data.message))
+      );
 
     case 'permissionPending':
       return (

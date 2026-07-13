@@ -38,6 +38,8 @@
         fields: Array<Record<string, unknown>>;
         required: string[];
         askLike?: boolean;
+        submissionError?: string;
+        submissionVersion?: number;
       }
     | {
         kind: 'url';
@@ -46,9 +48,13 @@
         url: string;
         message: string;
         waiting?: boolean;
+        submissionError?: string;
+        submissionVersion?: number;
       };
 
   let pendingAsk = $state<PendingAsk | null>(null);
+  let askSubmissionError = $state<string | undefined>(undefined);
+  let askSubmissionVersion = $state(0);
   let pendingPermission = $state<PendingPermission | null>(null);
   let pendingElicitations = $state<PendingElicitation[]>([]);
   let activeTurnId = $state<string | null>(null);
@@ -193,6 +199,7 @@
         case 'snapshot': {
           tasks.applySnapshot(msg);
           pendingAsk = msg.pendingAsk ?? null;
+          askSubmissionError = undefined;
           activeTurnId = msg.activeTurnId ?? null;
 
           if (msg.focusedTaskId) {
@@ -276,6 +283,7 @@
               askId: msg.askId,
               questions: msg.questions,
             };
+            askSubmissionError = undefined;
             activeTurnId = msg.turnId;
           }
           break;
@@ -289,6 +297,19 @@
             msg.taskId === tasks.focusedTaskId
           ) {
             pendingAsk = null;
+            askSubmissionError = undefined;
+          }
+          break;
+
+        case 'askSubmissionResult':
+          if (
+            !msg.ok &&
+            pendingAsk?.askId === msg.askId &&
+            pendingAsk.turnId === msg.turnId &&
+            msg.taskId === tasks.focusedTaskId
+          ) {
+            askSubmissionError = msg.message ?? 'The answer could not be delivered. Please try again.';
+            askSubmissionVersion += 1;
           }
           break;
 
@@ -312,7 +333,8 @@
           }
           break;
 
-        case 'elicitationFormPending':
+        case 'elicitationFormPending': {
+          const existingForm = pendingElicitations.find((p) => p.promptId === msg.promptId);
           pendingElicitations = [
             ...pendingElicitations.filter((p) => p.promptId !== msg.promptId),
             {
@@ -322,11 +344,16 @@
               fields: msg.fields,
               required: msg.required,
               askLike: msg.askLike,
+              // Preserve unlock state across snapshot/replay of the same prompt.
+              submissionError: existingForm?.submissionError,
+              submissionVersion: existingForm?.submissionVersion,
             },
           ];
           break;
+        }
 
-        case 'elicitationUrlPending':
+        case 'elicitationUrlPending': {
+          const existingUrl = pendingElicitations.find((p) => p.promptId === msg.promptId);
           pendingElicitations = [
             ...pendingElicitations.filter((p) => p.promptId !== msg.promptId),
             {
@@ -335,9 +362,14 @@
               elicitationId: msg.elicitationId,
               url: msg.url,
               message: msg.message,
+              // Preserve unlock state across snapshot/replay of the same prompt.
+              submissionError: existingUrl?.submissionError,
+              submissionVersion: existingUrl?.submissionVersion,
+              waiting: existingUrl?.kind === 'url' ? existingUrl.waiting : undefined,
             },
           ];
           break;
+        }
 
         case 'elicitationUrlWaiting':
           pendingElicitations = pendingElicitations.map((p) =>
@@ -349,6 +381,21 @@
 
         case 'elicitationCleared':
           pendingElicitations = pendingElicitations.filter((p) => p.promptId !== msg.promptId);
+          break;
+
+        case 'elicitationSubmissionResult':
+          pendingElicitations = pendingElicitations.map((p) => {
+            if (p.promptId !== msg.promptId) return p;
+            if (!msg.ok) {
+              return {
+                ...p,
+                submissionError: msg.message ?? 'The response could not be delivered. Please try again.',
+                submissionVersion: (p.submissionVersion ?? 0) + 1,
+              };
+            }
+            // URL accept keeps the card mounted in waiting state — clear stale rejection text.
+            return { ...p, submissionError: undefined };
+          });
           break;
 
         case 'commandError':
@@ -463,6 +510,8 @@
       }>}
       required={pe.required}
       askLike={pe.askLike}
+      submissionError={pe.submissionError}
+      submissionVersion={pe.submissionVersion}
     />
   {:else}
     <ElicitationUrlCard
@@ -471,6 +520,8 @@
       url={pe.url}
       message={pe.message}
       waiting={pe.waiting}
+      submissionError={pe.submissionError}
+      submissionVersion={pe.submissionVersion}
     />
   {/if}
 {/each}
@@ -562,7 +613,12 @@
       </button>
     </div>
 
-    <TaskWorkspace {pendingAsk} {activeTurnId} />
+    <TaskWorkspace
+      {pendingAsk}
+      {activeTurnId}
+      submissionError={askSubmissionError}
+      submissionVersion={askSubmissionVersion}
+    />
 
     <!-- History dropdown -->
     {#if historyOpen}

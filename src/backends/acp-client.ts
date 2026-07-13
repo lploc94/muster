@@ -103,6 +103,22 @@ export interface ElicitationController {
 let permissionController: PermissionController | null = null;
 let questionController: QuestionController | null = null;
 let elicitationController: ElicitationController | null = null;
+let acpDebugLogger: ((event: string, details: Record<string, unknown>) => void) | null = null;
+
+/** Inject a host-owned diagnostic sink without coupling the ACP transport to VS Code. */
+export function setAcpDebugLogger(
+  logger: ((event: string, details: Record<string, unknown>) => void) | null,
+): void {
+  acpDebugLogger = logger;
+}
+
+function debugAcp(event: string, details: Record<string, unknown>): void {
+  try {
+    acpDebugLogger?.(event, details);
+  } catch {
+    // Diagnostics must never affect protocol handling.
+  }
+}
 
 /** Inject (or clear) the global permission controller for the ACP gate. */
 export function setPermissionController(controller: PermissionController | null): void {
@@ -982,7 +998,24 @@ export class AcpClient {
   }
 
   private respondOk(id: number | string, result: unknown = {}): void {
-    this.writeLine({ jsonrpc: '2.0', id, result });
+    const wrote = this.writeLine({ jsonrpc: '2.0', id, result });
+    const summary = result && typeof result === 'object' ? (result as Record<string, unknown>) : {};
+    debugAcp('response.ok', {
+      backend: this.config.key,
+      id,
+      action: summary.action,
+      outcome: summary.outcome,
+      contentKeys:
+        summary.content && typeof summary.content === 'object'
+          ? Object.keys(summary.content as Record<string, unknown>)
+          : undefined,
+      answerKeys:
+        summary.answers && typeof summary.answers === 'object'
+          ? Object.keys(summary.answers as Record<string, unknown>)
+          : undefined,
+      wrote,
+      stdinWritable: this.proc?.stdin.writable ?? false,
+    });
   }
 
   private respondError(id: number | string, code: number, message: string): void {
@@ -1063,6 +1096,20 @@ export class AcpClient {
     const method = msg.method as string;
     const id = msg.id as number | string;
     const params = (msg.params ?? {}) as Record<string, unknown>;
+    if (
+      method === 'elicitation/create' ||
+      method === 'x.ai/ask_user_question' ||
+      method === '_x.ai/ask_user_question'
+    ) {
+      debugAcp('request.received', {
+        backend: this.config.key,
+        method,
+        id,
+        sessionId: params.sessionId,
+        questionCount: Array.isArray(params.questions) ? params.questions.length : undefined,
+        mode: params.mode,
+      });
+    }
 
     try {
       if (method === 'session/request_permission') {
@@ -1153,6 +1200,7 @@ export class AcpClient {
   ): Promise<void> {
     const parsed = parseElicitationCreate(params);
     if (parsed.kind === 'error') {
+      debugAcp('elicitation.parse_error', { backend: this.config.key, id, message: parsed.message });
       this.respondError(id, parsed.code, parsed.message);
       return;
     }
@@ -1162,12 +1210,25 @@ export class AcpClient {
       return;
     }
     const clientKey = this.config.key;
+    debugAcp('elicitation.prompt_start', {
+      backend: this.config.key,
+      id,
+      kind: parsed.kind,
+      sessionId: parsed.sessionId,
+      fieldKeys: parsed.kind === 'form' ? parsed.fields.map((field) => field.key) : undefined,
+    });
     if (parsed.kind === 'url') {
       const result = await controller.promptUrl(parsed, clientKey);
       this.respondOk(id, { action: result.action });
       return;
     }
     const result = await controller.promptForm(parsed, clientKey);
+    debugAcp('elicitation.prompt_resolved', {
+      backend: this.config.key,
+      id,
+      action: result.action,
+      contentKeys: result.content ? Object.keys(result.content) : [],
+    });
     if (result.action === 'accept') {
       this.respondOk(id, { action: 'accept', content: result.content ?? {} });
       return;
@@ -1183,6 +1244,12 @@ export class AcpClient {
     const sessionId = typeof params.sessionId === 'string' ? params.sessionId : '';
     const questions = normalizeAgentQuestions(params.questions);
     const controller = questionController;
+    debugAcp('grok_ask.normalized', {
+      backend: this.config.key,
+      id,
+      sessionId,
+      questionCount: questions.length,
+    });
 
     if (!controller || questions.length === 0) {
       this.respondOk(id, { outcome: 'cancelled' });
@@ -1190,6 +1257,13 @@ export class AcpClient {
     }
 
     const result = await controller.prompt({ sessionId, questions });
+    debugAcp('grok_ask.prompt_resolved', {
+      backend: this.config.key,
+      id,
+      sessionId,
+      outcome: result.outcome,
+      answeredIndexes: result.answers ? Object.keys(result.answers) : [],
+    });
     if (result.outcome === 'accepted' && answersNonEmpty(result.answers, questions.length)) {
       this.respondOk(id, {
         outcome: 'accepted',

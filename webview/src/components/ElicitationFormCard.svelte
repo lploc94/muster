@@ -17,12 +17,23 @@
     fields: Field[];
     required: string[];
     askLike?: boolean;
+    submissionError?: string;
+    submissionVersion?: number;
   }
 
-  let { promptId, message, fields, required, askLike = false }: Props = $props();
+  let { promptId, message, fields, required, askLike = false, submissionError, submissionVersion = 0 }: Props = $props();
 
   let values = $state<Record<string, unknown>>({});
   let submitting = $state(false);
+  let localError = $state<string | null>(null);
+  let seenSubmissionVersion = $state(0);
+
+  $effect(() => {
+    if (submissionVersion > seenSubmissionVersion) {
+      seenSubmissionVersion = submissionVersion;
+      submitting = false;
+    }
+  });
 
   function initDefaults(): void {
     const next: Record<string, unknown> = {};
@@ -47,40 +58,70 @@
     setValue(key, cur);
   }
 
+  function plainValues(): Record<string, unknown> {
+    const result: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(values)) {
+      result[key] = Array.isArray(value) ? [...value] : value;
+    }
+    return result;
+  }
+
   function submit(action: 'accept' | 'decline' | 'cancel'): void {
     if (submitting) return;
+    localError = null;
     if (action === 'accept') {
       // Client-side checks so host validation failure does not lock the form.
       for (const f of fields) {
         const need = f.required || required.includes(f.key);
         const v = values[f.key];
         if (need && (v === undefined || v === null || v === '' || (Array.isArray(v) && v.length === 0))) {
+          localError = `${f.title || f.key} is required.`;
+          console.info('[muster][elicitation-ui] validationBlocked', { promptId, field: f.key, reason: 'required' });
           return;
         }
         if (typeof v === 'string') {
           const minL = (f as { minLength?: number }).minLength;
           const maxL = (f as { maxLength?: number }).maxLength;
-          if (minL !== undefined && v.length < minL) return;
-          if (maxL !== undefined && v.length > maxL) return;
+          if (minL !== undefined && v.length < minL) { localError = `${f.title || f.key} must be at least ${minL} characters.`; return; }
+          if (maxL !== undefined && v.length > maxL) { localError = `${f.title || f.key} must be at most ${maxL} characters.`; return; }
         }
         if (typeof v === 'number') {
           const min = (f as { minimum?: number }).minimum;
           const max = (f as { maximum?: number }).maximum;
-          if (min !== undefined && v < min) return;
-          if (max !== undefined && v > max) return;
+          if (min !== undefined && v < min) { localError = `${f.title || f.key} must be at least ${min}.`; return; }
+          if (max !== undefined && v > max) { localError = `${f.title || f.key} must be at most ${max}.`; return; }
         }
         if (Array.isArray(v)) {
           const minI = (f as { minItems?: number }).minItems;
           const maxI = (f as { maxItems?: number }).maxItems;
-          if (minI !== undefined && v.length < minI) return;
-          if (maxI !== undefined && v.length > maxI) return;
+          if (minI !== undefined && v.length < minI) { localError = `${f.title || f.key} requires at least ${minI} selections.`; return; }
+          if (maxI !== undefined && v.length > maxI) { localError = `${f.title || f.key} allows at most ${maxI} selections.`; return; }
         }
       }
-      // Do not lock permanently on host rejection — only disable during post.
-      post({ type: 'submitElicitation', promptId, action, content: { ...values } });
+      submitting = true;
+      const content = plainValues();
+      console.info('[muster][elicitation-ui] submitElicitation', {
+        promptId,
+        action,
+        contentKeys: Object.keys(content),
+      });
+      try {
+        post({ type: 'submitElicitation', promptId, action, content });
+      } catch (error) {
+        submitting = false;
+        localError = `Could not send the response: ${error instanceof Error ? error.message : String(error)}`;
+        console.error('[muster][elicitation-ui] submitElicitation failed', error);
+      }
     } else {
       submitting = true;
-      post({ type: 'submitElicitation', promptId, action });
+      console.info('[muster][elicitation-ui] submitElicitation', { promptId, action, contentKeys: [] });
+      try {
+        post({ type: 'submitElicitation', promptId, action });
+      } catch (error) {
+        submitting = false;
+        localError = `Could not send the response: ${error instanceof Error ? error.message : String(error)}`;
+        console.error('[muster][elicitation-ui] submitElicitation failed', error);
+      }
     }
   }
 </script>
@@ -90,6 +131,9 @@
   style="border: 1px solid var(--vscode-inputValidation-infoBorder, var(--vscode-focusBorder)); background: var(--vscode-editor-background);"
 >
   <div class="font-semibold">{askLike ? 'Agent question' : 'Agent request'}</div>
+  {#if localError || submissionError}
+    <div role="alert" style="color: var(--vscode-errorForeground);">{localError || submissionError}</div>
+  {/if}
   {#if message}
     <div class="whitespace-pre-wrap opacity-90">{message}</div>
   {/if}

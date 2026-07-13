@@ -7,15 +7,34 @@
     url: string;
     message: string;
     waiting?: boolean;
+    submissionError?: string;
+    submissionVersion?: number;
   }
 
-  let { promptId, url, message, waiting = false }: Props = $props();
+  let { promptId, url, message, waiting = false, submissionError, submissionVersion = 0 }: Props = $props();
   let submitting = $state(false);
+  let localError = $state<string | null>(null);
+  let seenSubmissionVersion = $state(0);
+
+  $effect(() => {
+    if (submissionVersion > seenSubmissionVersion) {
+      seenSubmissionVersion = submissionVersion;
+      submitting = false;
+    }
+  });
 
   function submit(action: 'accept' | 'decline' | 'cancel'): void {
     if (submitting || waiting) return;
     submitting = true;
-    post({ type: 'submitElicitation', promptId, action });
+    localError = null;
+    console.info('[muster][elicitation-ui] submitElicitation', { promptId, action, contentKeys: [] });
+    try {
+      post({ type: 'submitElicitation', promptId, action });
+    } catch (error) {
+      submitting = false;
+      localError = `Could not send the response: ${error instanceof Error ? error.message : String(error)}`;
+      console.error('[muster][elicitation-ui] submitElicitation failed', error);
+    }
   }
 
   function domainOf(u: string): string {
@@ -32,6 +51,9 @@
   style="border: 1px solid var(--vscode-inputValidation-warningBorder, var(--vscode-editorWarning-foreground)); background: var(--vscode-editor-background);"
 >
   <div class="font-semibold">{waiting ? 'Waiting for external auth…' : 'External authorization'}</div>
+  {#if localError || submissionError}
+    <div role="alert" style="color: var(--vscode-errorForeground);">{localError || submissionError}</div>
+  {/if}
   {#if message}
     <div class="whitespace-pre-wrap">{message}</div>
   {/if}

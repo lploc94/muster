@@ -612,17 +612,15 @@
   // does not fire change when setting .value / defaulting option[0] on remount —
   // only real user click/Enter dispatches change (via new Event, isTrusted=false).
   let catalogGeneration = $state(0);
-  let sawModels = false;
+  let lastModelsLoaded: boolean | undefined;
   $effect(() => {
     const loaded = modelsLoaded;
-    if (loaded && !sawModels) {
-      sawModels = true;
-      catalogGeneration += 1;
-    }
-    if (!loaded) {
-      sawModels = false;
-      catalogGeneration += 1;
-    }
+    // Only bump on an actual empty↔loaded transition. Incrementing on every
+    // `!loaded` effect pass reads/writes catalogGeneration forever and can halt
+    // all subsequent webview reactivity with effect_update_depth_exceeded.
+    if (loaded === lastModelsLoaded) return;
+    lastModelsLoaded = loaded;
+    catalogGeneration += 1;
   });
   const pickerRemountKey = $derived(
     modelsLoaded ? `models:${catalogGeneration}` : `loading:${catalogGeneration}`,

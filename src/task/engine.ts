@@ -669,23 +669,24 @@ export class TaskEngine {
     if (!this.askBridge.hasPending(ref)) {
       return { ok: false, reason: 'no matching pending ask' };
     }
-    // Soft dismiss: resume the turn and reject the pending ask so MCP/agent
-    // paths can continue (cancelled), instead of hard-aborting the whole turn.
-    this.askBridge.cancel(ref, 'user dismissed ask');
+    // Soft dismiss: commit the waiting_user → resumed transition first, then
+    // reject the pending ask so MCP/agent paths can continue (cancelled).
+    // Cancel only after commit so a failed commit leaves the ask retryable.
     const commit = this.store.commit((draft) => {
       const turn = draft.turns[ref.turnId];
       if (!turn) return { ok: false, reason: 'turn not found' };
-      if (turn.status === 'waiting_user') {
-        const resumed = submitAnswer(turn);
-        if (resumed.ok) {
-          draft.turns[ref.turnId] = resumed.next;
-        }
+      if (turn.status !== 'waiting_user') {
+        return { ok: false, reason: 'turn is not waiting for user' };
       }
+      const resumed = submitAnswer(turn);
+      if (!resumed.ok) return resumed;
+      draft.turns[ref.turnId] = resumed.next;
       return { ok: true };
     });
     if (!commit.ok) {
       return { ok: false, reason: commit.detail ?? commit.reason };
     }
+    this.askBridge.cancel(ref, 'user dismissed ask');
     return { ok: true, value: undefined };
   }
 
