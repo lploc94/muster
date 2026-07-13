@@ -73,8 +73,9 @@ class TasksState {
   /**
    * One-shot prefill for the composer (queue Edit → message box).
    * Composer consumes and clears when `nonce` changes.
+   * Optional clientRequestId: only clear matching rejected outbox on successful apply.
    */
-  composerPrefill = $state<{ text: string; nonce: number } | null>(null);
+  composerPrefill = $state<{ text: string; nonce: number; clientRequestId?: string } | null>(null);
 
   constructor() {
     // Restore the last-used backend/model from webview state (persists across reloads).
@@ -318,9 +319,13 @@ class TasksState {
     if (message) this.commandError = null;
   }
 
-  /** Put text into the task/draft composer (used by queue Edit). */
-  prefillComposer(text: string): void {
-    this.composerPrefill = { text, nonce: Date.now() };
+  /** Put text into the task/draft composer (used by queue Edit / rejected send restore). */
+  prefillComposer(text: string, clientRequestId?: string): void {
+    this.composerPrefill = {
+      text,
+      nonce: Date.now(),
+      ...(clientRequestId ? { clientRequestId } : {}),
+    };
   }
 
   clearComposerPrefill(): void {

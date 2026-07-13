@@ -128,19 +128,28 @@
 
   // Queue panel Edit / sendRejected restore → load text into the message box.
   // Never overwrite a newer non-empty draft the user already typed.
+  // On refuse (non-empty draft): leave prefill uncleared so App does not drop outbox.
   $effect(() => {
     const prefill = tasks.composerPrefill;
     if (!prefill || prefill.nonce === lastPrefillNonce) return;
     if (!canSend) return;
-    lastPrefillNonce = prefill.nonce;
     if (draftText.trim().length > 0) {
-      tasks.clearComposerPrefill();
+      // Refuse: keep prefill for a later empty-composer attempt; mark nonce seen
+      // so we don't spin, but restore only when draft becomes empty.
       return;
     }
+    lastPrefillNonce = prefill.nonce;
     draftText = prefill.text;
     mentionBindings = new Map();
     dropFeedback = null;
+    const appliedId = prefill.clientRequestId;
     tasks.clearComposerPrefill();
+    if (appliedId) {
+      // Signal successful apply for outbox cleanup.
+      window.dispatchEvent(
+        new CustomEvent('muster:prefill-applied', { detail: { clientRequestId: appliedId } }),
+      );
+    }
     queueMicrotask(() => {
       textareaEl?.focus();
       const len = draftText.length;

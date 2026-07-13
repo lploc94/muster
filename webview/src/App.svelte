@@ -433,13 +433,9 @@
               (!rejected.taskId && tasks.draftMode) ||
               (!!rejected.taskId && rejected.taskId === tasks.focusedTaskId);
             if (sameScope) {
-              tasks.prefillComposer(rejected.text);
-              queueMicrotask(() => {
-                if (!tasks.composerPrefill) {
-                  outboxRemove(vscode, msg.clientRequestId);
-                }
-              });
+              tasks.prefillComposer(rejected.text, rejected.clientRequestId);
             }
+            // Outbox stays until muster:prefill-applied confirms restore.
           } else {
             outboxRemove(vscode, msg.clientRequestId);
           }
@@ -470,13 +466,24 @@
       }
     }
 
+    function onPrefillApplied(e: Event) {
+      const id = (e as CustomEvent<{ clientRequestId?: string }>).detail?.clientRequestId;
+      if (typeof id === 'string' && id) {
+        outboxRemove(vscode, id);
+      }
+    }
+
     window.addEventListener('message', onMessage);
+    window.addEventListener('muster:prefill-applied', onPrefillApplied);
     // Ask the host which backends are installed so the picker only offers them.
     post({ type: 'listBackends' });
     // Prefetch model lists for the New-task picker (host also prefetches on resolve).
     post({ type: 'listModels' });
     // Phase C outbox replay happens after a compatible snapshot (see below).
-    return () => window.removeEventListener('message', onMessage);
+    return () => {
+      window.removeEventListener('message', onMessage);
+      window.removeEventListener('muster:prefill-applied', onPrefillApplied);
+    };
   });
 
   let outboxReplayed = false;
@@ -495,12 +502,8 @@
       );
     });
     if (!entry) return;
-    tasks.prefillComposer(entry.text);
-    queueMicrotask(() => {
-      if (!tasks.composerPrefill) {
-        outboxRemove(vscode, entry.clientRequestId);
-      }
-    });
+    if (tasks.composerPrefill?.clientRequestId === entry.clientRequestId) return;
+    tasks.prefillComposer(entry.text, entry.clientRequestId);
   });
 </script>
 
