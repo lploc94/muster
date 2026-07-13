@@ -1,12 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
   bridgeTokenTtlMs,
+  canCreateTurn,
   clampExecutionPolicy,
   DEFAULT_EXECUTION_POLICY_BOUNDS,
+  DEFAULT_RESOURCE_LIMITS,
   MAX_BRIDGE_TOKEN_TTL_MS,
   type ExecutionPolicyBounds,
 } from './limits';
-import type { TaskExecutionPolicy } from './types';
+import type { TaskExecutionPolicy, TaskStoreFile } from './types';
 
 const BASE: TaskExecutionPolicy = {
   maxTurns: 50,
@@ -110,3 +112,62 @@ describe('bridgeTokenTtlMs', () => {
     );
   });
 });
+
+describe('canCreateTurn queued reservations', () => {
+  it('counts queued turns toward the per-task cap', () => {
+    const file: TaskStoreFile = {
+      schemaVersion: 2,
+      revision: 1,
+      tasks: {
+        t: {
+          id: 't',
+          role: 'coordinator',
+          lifecycle: 'open',
+          goal: 'cap',
+          parentId: null,
+          dependencies: [],
+          backend: 'fake',
+          capabilities: [],
+          executionPolicy: {
+            maxTurns: 2,
+            maxAutomaticRetries: 0,
+            turnTimeoutMs: 60_000,
+            taskTimeoutMs: 120_000,
+          },
+          revision: 0,
+          createdAt: 't',
+          updatedAt: 't',
+        },
+      },
+      turns: {
+        a: {
+          id: 'a',
+          taskId: 't',
+          sequence: 1,
+          trigger: 'user',
+          status: 'running',
+          inputs: [],
+          createdAt: 't',
+          startedAt: 't',
+        },
+        b: {
+          id: 'b',
+          taskId: 't',
+          sequence: 2,
+          trigger: 'user',
+          status: 'queued',
+          inputs: [],
+          createdAt: 't2',
+        },
+      },
+      messages: {},
+      operations: {},
+      cancelRequests: {},
+    };
+    expect(canCreateTurn(file, 't', { ...DEFAULT_RESOURCE_LIMITS, maxTurnsPerTask: 50 })).toEqual({
+      ok: false,
+      reason: 'max turns per task exceeded',
+    });
+  });
+});
+

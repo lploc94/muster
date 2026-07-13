@@ -397,6 +397,30 @@ function pendingUserMessages(file: TaskStoreFile, taskId: string): TaskMessage[]
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
 }
 
+/**
+ * MEM030: after the latest non-queued turn for a task failed/interrupted and
+ * there is still a queued follow-up, do not auto-promote that queue until an
+ * explicit resume/recovery path. Prevents an unrelated task's success from
+ * thawing a frozen failure queue.
+ */
+function isTaskAutoFollowUpFrozen(file: TaskStoreFile, taskId: string): boolean {
+  const turns = turnsForTask(file, taskId);
+  if (!turns.some((turn) => turn.status === 'queued')) return false;
+  if (turns.some((turn) => turn.status === 'running' || turn.status === 'waiting_user')) {
+    return false;
+  }
+  const latestSettled = [...turns]
+    .filter((turn) => turn.status !== 'queued')
+    .sort(
+      (a, b) =>
+        b.sequence - a.sequence ||
+        b.createdAt.localeCompare(a.createdAt) ||
+        b.id.localeCompare(a.id),
+    )[0];
+  if (!latestSettled) return false;
+  return latestSettled.status === 'failed' || latestSettled.status === 'interrupted';
+}
+
 function deterministicRetryTurnId(failedTurnId: string, retryIndex: number): string {
   return `${failedTurnId}-auto-retry-${retryIndex}`;
 }
@@ -815,7 +839,9 @@ export class TaskEngine {
       // (scheduler promotes one-at-a-time). Refuse visibly when a turn cannot be
       // created — never leave free-floating pending messages without turn identity.
       const viewStatus = viewStatusFromDraft(draft, taskId) ?? 'idle';
-      if (viewStatus === 'needs_recovery' && hasActiveOrQueuedTurn(turnsForTask(draft, taskId))) {
+      // needs_recovery is only derived when no live/queued turn exists; free-form
+      // send must not invent a turn — use explicit recovery/retry paths instead.
+      if (viewStatus === 'needs_recovery') {
         return {
           ok: false,
           reason: 'task needs recovery; resolve recovery before queueing a new turn',
@@ -1747,11 +1773,11 @@ export class TaskEngine {
         if (this.deferredQueuedTurns.has(turn.id)) {
           continue;
         }
-        if (
-          settledTaskId &&
-          turn.taskId === settledTaskId &&
-          !allowSameTaskFollowUps
-        ) {
+        if (settledTaskId && turn.taskId === settledTaskId) {
+          if (!allowSameTaskFollowUps) continue;
+        } else if (isTaskAutoFollowUpFrozen(file, turn.taskId)) {
+          // Unrelated settlement must not thaw another task frozen after
+          // failure/interrupt; explicit resumeQueuedTurn / recovery only.
           continue;
         }
         if (tryPromoteTurn(this.store, turn.id, this.resourceLimits)) {

@@ -684,7 +684,7 @@ export class AcpClient {
   ): Promise<unknown | 'cancelled'> {
     // Concurrent session/prompt is the proven in-flight wire shape when the
     // agent advertised liveInput capability during initialize.
-    const { promise } = this.sendRequest(LIVE_INPUT_METHOD, {
+    const { id, promise } = this.sendRequest(LIVE_INPUT_METHOD, {
       sessionId,
       prompt: [{ type: 'text', text: instruction }],
     });
@@ -697,6 +697,9 @@ export class AcpClient {
         if (settled) return;
         settled = true;
         signal.removeEventListener('abort', onAbort);
+        // Drop the JSON-RPC pending entry so abort does not leave a 30-minute
+        // timeout / unresolved map entry after the outer promise resolves.
+        this.dropPending(id);
         resolve('cancelled');
       };
       if (signal.aborted) {

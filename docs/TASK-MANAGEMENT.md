@@ -114,9 +114,11 @@ Implementations must preserve all of the following:
    enum that the UI treats as “the task status.”
 5. **Create always yields `open`.** No other lifecycle is written at creation.
 6. **Hard vs soft terminal:**
-   - `succeeded`, `cancelled`, and `skipped` are **hard terminal**: read-only;
-     further user work uses a **continuation task** or a new task, never silently
-     reopening the same outcome node for dependents that already observed it.
+   - `succeeded`, `cancelled`, and `skipped` are **hard terminal** for
+     dependents/outcome observation (the sealed node stays historically terminal
+     until reopened). A new user **message on the same task id reopens** to
+     `open` and may queue a turn; operators may still create a new/continuation
+     task instead.
    - `failed` is **soft terminal**: no automatic coordinator turns; a new user
      message **reopens** the same task to `open` and may queue a turn. This is
      not a continuation task.
@@ -588,7 +590,8 @@ open + user Reject fail proposal WITH reason ────────► open
 open + user Cancel ──────────────────────────────────► cancelled   [hard, cascade]
 open + user Skip ────────────────────────────────────► skipped     [hard; won’t perform]
 failed + user sends message ─────────────────────────► open        (reopen; queue turn)
-succeeded / cancelled / skipped + more work ─────────► new task (or continuationOf)
+succeeded / cancelled / skipped + user sends message ► open        (reopen same id; queue turn)
+succeeded / cancelled / skipped + explicit new work ─► new task (or continuationOf) optional
 ```
 
 ```text
@@ -1179,10 +1182,11 @@ Host commands for user seals and mode:
 # Implemented
 setTaskLifecycle           { taskId, lifecycle, result?, error? }
   // lifecycle: open | succeeded | failed | cancelled | skipped
-  // open      → only from soft failed (hard terminals rejected)
+  // open      → reopen from soft failed or hard terminal (same task id)
   // cancelled → engine cancelTask (cascade descendants)
   // skipped   → engine skipTask (cascade unfinished descendants)
   // terminal seals interrupt local live turns; remote-owned → interrupt request
+  // send on any terminal lifecycle also reopens then queues a turn
 
 # Planned (outcome card / settings)
 acceptOutcome              { taskId }
