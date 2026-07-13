@@ -449,8 +449,9 @@ test.describe('Muster webview host state smoke', () => {
 
     await addContextButton.click();
     await expect(menu).toBeVisible();
-    // Hard-terminal tasks still lock free-form composer affordances (Add Context).
-    // Running no longer disables the composer — that path is covered by queue/inject tests.
+    // Hard-terminal tasks stay writable for same-id reopen (send reopens).
+    // Menu closes on snapshot focus change; Add Context remains enabled.
+    // Running composer unlock is covered by queue/inject tests.
     await postSnapshot(page, {
       type: 'snapshot',
       rootTasks: [
@@ -473,8 +474,9 @@ test.describe('Muster webview host state smoke', () => {
       storeRevision: 3,
     });
     await expect(menu).toHaveCount(0);
-    await expect(addContextButton).toBeDisabled();
+    await expect(addContextButton).toBeEnabled();
     await expect(addContextButton).toHaveAttribute('aria-expanded', 'false');
+    await expect(page.getByRole('textbox').first()).toBeEnabled();
   });
 
   test('surfaces task-centric status feedback for active and failed tasks', async ({ page }) => {
@@ -962,6 +964,33 @@ test.describe('Muster webview host state smoke', () => {
       taskId: 'task-live',
       instruction: 'Inject via button',
     });
+  });
+
+  test('Ctrl+Enter on an idle task posts send (not sendLiveInput)', async ({ page }) => {
+    await openWebview(page);
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-idle', goal: 'Idle work', viewStatus: 'idle' })],
+      focusedTaskId: 'task-idle',
+      subtree: [task({ id: 'task-idle', goal: 'Idle work', viewStatus: 'idle' })],
+      storeRevision: 120,
+    });
+
+    const composer = page.getByRole('textbox').first();
+    await expect(composer).toBeEnabled();
+    await expect(page.getByRole('button', { name: 'Inject live input' })).toHaveCount(0);
+
+    await composer.fill('Send while idle via chord');
+    await composer.press('Control+Enter');
+    await expectPostedMessage(page, {
+      type: 'send',
+      taskId: 'task-idle',
+      text: 'Send while idle via chord',
+    });
+    expect(
+      (await postedMessages(page)).filter((m) => (m as { type?: string }).type === 'sendLiveInput'),
+    ).toHaveLength(0);
   });
 
   test('Shift+Enter does not submit while a live turn is running', async ({ page }) => {

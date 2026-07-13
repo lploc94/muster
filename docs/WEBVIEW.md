@@ -434,8 +434,8 @@ The webview never holds the whole thread. Render a **recent window**; older item
 ### Composer
 
 - **Composer stays editable** while a focused open task is `running` or has FIFO queued follow-ups so Enter can create another turn and Ctrl+Enter can attempt live inject. Do **not** hard-disable solely because a turn is in-flight.
-- **Disabled / blocked** while any `askPending` is unresolved (or show `AskCard` modal — user must submit or cancel), during recovery gates, dependency-blocked free-form send, or hard-terminal lifecycle.
-- **Enter** posts host `send` (FIFO follow-up while live); **Ctrl+Enter** / **Meta+Enter** posts `sendLiveInput` only (no queue fallback). Shift+Enter inserts a newline; IME composition suppresses submit.
+- **Disabled / blocked** while any `askPending` is unresolved (or show `AskCard` modal — user must submit or cancel), during recovery gates, or dependency-blocked free-form send. Terminal lifecycles stay writable: next `send` **reopens** the same task id to `open`.
+- **Enter** posts host `send` (FIFO follow-up while live). **Ctrl+Enter** / **Meta+Enter**: when a turn is **running**, posts `sendLiveInput` only (**no queue fallback** on refuse); when **idle**, posts ordinary `send` immediately. Shift+Enter inserts a newline; IME composition suppresses submit.
 - **Stop / cancel** still targets the live turn; queue mutations use the `queuedTurns` panel (`editQueuedTurn` / `deleteQueuedTurn`). See §14 for the full queue and live-inject contract.
 - **Terminal messages:** a normal adapter `error` NormalizedEvent (non-zero exit, cancellation) arrives via an `event` message and is then followed by `turnDone`; only an uncaught host/adapter failure sends `turnError`. Treat either terminal message as end-of-turn for stop-button and streaming chrome so the UI never gets stuck mid-run.
 
@@ -632,14 +632,15 @@ Task-workspace composer keyboard and queue UX (product contract for multi-turn f
 
 | Input | Host message | Behavior |
 |-------|--------------|----------|
-| **Enter** (task focused, open) | `send` `{ taskId, text }` | Creates a **distinct** FIFO follow-up turn bound to that user message. Works while a turn is already running or other turns are queued. |
-| **Ctrl+Enter** / **Meta+Enter** | `sendLiveInput` `{ taskId, instruction }` | Concurrent inject into the **currently running**, locally owned turn when the backend proves live-input support. **No queue fallback** — refusal never creates a queued turn. |
+| **Enter** (task focused) | `send` `{ taskId, text }` | Creates a **distinct** FIFO follow-up turn bound to that user message. Works while a turn is already running or other turns are queued. On terminal lifecycle, reopens the same task then queues. |
+| **Ctrl+Enter** / **Meta+Enter** (running) | `sendLiveInput` `{ taskId, instruction }` | Concurrent inject into the **currently running**, locally owned turn when the backend proves live-input support. **No queue fallback** — refusal never creates a queued turn. Instruction uses agent-facing expanded mention text when present. |
+| **Ctrl+Enter** / **Meta+Enter** (idle) | `send` `{ taskId, text }` | Same as Enter — starts/continues a normal turn immediately (not inject). |
 | **Shift+Enter** | — | Inserts a newline; does not submit. |
 | IME composition / keyCode 229 | — | Suppresses submit. |
 
 ### Composer unlock vs blocks
 
-The **composer stays editable** during `running` and `queued` so operators can stack follow-ups and attempt live inject. Free-form send is still blocked for recovery (`needs_recovery`), unresolved ask-user, dependency gates that product policy marks non-writable, and hard-terminal lifecycles (`succeeded` / `cancelled` / `skipped`). Soft-failed tasks reopen on the next `send` (existing reopen contract).
+The **composer stays editable** during `running` and `queued` so operators can stack follow-ups and attempt live inject. Free-form send is still blocked for recovery (`needs_recovery`), unresolved ask-user, and dependency gates that product policy marks non-writable. Terminal lifecycles (`succeeded` / `failed` / `cancelled` / `skipped`) stay writable: next `send` reopens the same task id to `open` and may queue a turn.
 
 Guidance copy on the composer strip describes queue/inject affordances (e.g. “Enter queues a follow-up · Ctrl+Enter injects live input”) rather than a hard disable-while-running message.
 
@@ -647,11 +648,13 @@ Guidance copy on the composer strip describes queue/inject affordances (e.g. “
 
 Host snapshots project `queuedTurns` (ordered by sequence) for the focused task. The workspace **queued turns** panel is the inspection surface: each undispatched turn may be edited or deleted.
 
-- **Edit** → `editQueuedTurn` `{ taskId, turnId, content }` — updates the bound pending user message of that turn only.
+- **Edit** → `editQueuedTurn` `{ taskId, turnId, content }` — updates the bound pending user message of that turn only; clears any stale `agentContent` so the edited text drives the next prompt.
 - **Delete** → `deleteQueuedTurn` `{ taskId, turnId }` — removes the undispatched turn and its bound pending message(s); does **not** cancel a running turn.
 - Controls **lock** when `turnId` leaves the live `queuedTurns` projection (dispatch / start boundary). Stale mutations refuse with a visible `commandError` banner; they never silently no-op as success.
 
-Scheduler promotes at most **one active (running) turn** per task; multiple queued follow-ups drain in FIFO order after settlement.
+Scheduler promotes at most **one active (running) turn** per task and only the **earliest** queued sequence (FIFO). Multiple queued follow-ups drain in order after **successful** settlement; after failure/recovery, queued follow-ups stay queued until recovery resumes them (they are not auto-promoted).
+
+Over-cap `send` refuses visibly (`commandError` / engine reason) and does **not** leave free-floating pending messages without turn identity.
 
 ### Live inject feedback
 
@@ -660,7 +663,7 @@ Scheduler promotes at most **one active (running) turn** per task; multiple queu
 | Delivered | `liveInputResult` `{ taskId, code: 'delivered', sessionId }` | Dismissible status notice (`commandNotice`); must not be silently dropped. |
 | Refused (unsupported backend, not local owner, no active turn, validation, engine not ready, …) | `commandError` `{ taskId?, message }` | Visible alert banner with a bounded, sanitized message. |
 
-Refusals use `commandError` only — never a queued turn and never a synthetic `send`. Delivered acks and errors mutually clear so the latest inject outcome remains visible for the focused task.
+Refusals use `commandError` only — never a queued turn and never a synthetic `send` from a refused inject while live. Delivered acks and errors mutually clear so the latest inject outcome remains visible for the focused task.
 
 Draft / new-task mode has **no** live-inject path: Ctrl+Enter behaves like Enter (`send` / first-turn create).
 

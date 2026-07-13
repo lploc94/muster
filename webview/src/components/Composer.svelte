@@ -219,9 +219,13 @@
     }
 
     if (intent.kind === 'sendLiveInput') {
-      const message = buildTaskComposerMessage(intent, { taskId, text: displayText });
+      // Expanded mention paths go in instruction; inject never falls through to queue.
+      const message = buildTaskComposerMessage(intent, {
+        taskId,
+        text: displayText,
+        llmText,
+      });
       if (!message) return;
-      // Live inject never falls through to queue creation; host refuses via commandError.
       post(message);
       draftText = '';
       mentionBindings = new Map();
@@ -229,12 +233,12 @@
     }
 
     if (!taskId) return;
-    const payload: { type: 'send'; taskId: string; text: string; llmText?: string } = {
-      type: 'send',
+    const payload = buildTaskComposerMessage(intent, {
       taskId,
       text: displayText,
-    };
-    if (llmText !== displayText) payload.llmText = llmText;
+      llmText,
+    });
+    if (!payload || payload.type !== 'send') return;
     post(payload);
     draftText = '';
     mentionBindings = new Map();
@@ -380,6 +384,11 @@
     }
   }
 
+  /** Live inject only while a turn is generating — idle Ctrl+Enter uses ordinary send. */
+  const liveInjectEligible = $derived(
+    mode === 'task' && (runtime === 'running' || taskStatus === 'running' || cliStatus === 'running'),
+  );
+
   function onKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape' && isAddContextMenuOpen) {
       e.preventDefault();
@@ -396,9 +405,10 @@
       isComposing: e.isComposing,
       keyCode: e.keyCode,
     };
-    const intent = resolveComposerKeyIntent(policyInput, { mode });
+    const keyOpts = { mode, liveInjectEligible };
+    const intent = resolveComposerKeyIntent(policyInput, keyOpts);
     if (intent.kind === 'none') return;
-    if (shouldPreventDefaultForComposerKey(policyInput, { mode })) {
+    if (shouldPreventDefaultForComposerKey(policyInput, keyOpts)) {
       e.preventDefault();
     }
     submitComposer(intent);

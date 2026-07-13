@@ -718,10 +718,10 @@ coordinator seals; CLI never does.
 | State | User wants more work | Mechanism |
 |-------|----------------------|-----------|
 | `failed` (soft) | Send a message on the **same** task | Reopen → `open`, clear `finishedAt` / optional error retention for history, queue turn |
-| `succeeded` / `cancelled` / `skipped` (hard) | Follow-up or “do it after all” | **New task** or **Continue as new task** (`continuationOf`); new session; old node stays immutable for dependents |
+| `succeeded` / `cancelled` / `skipped` (hard) | Follow-up or “do it after all” | Same as soft-fail: next `send` **reopens** the same task id to `open` and may queue a turn. Operators may still create a **new task** / continuation instead |
 
-The UI may group continuation tasks visually. Soft-fail reopen must **not** create
-a second task ID unless the user explicitly starts a new task.
+The UI may group related work visually. Reopen keeps the same task id; a second
+task ID is created only when the user explicitly starts a new task.
 
 ### 5.6 `skipped` — created, user chooses not to perform
 
@@ -736,7 +736,7 @@ deliberate “won’t do,” not an error and not an abort of in-flight work.
 | vs `cancelled` | **Cancel** = stop / abandon work that was accepted as in progress. **Skip** = choose not to do this unit of work (backlog triage, “not now / not this”). |
 | vs `failed` | **Failed** = attempt judged unsuccessful. **Skipped** = never (or no longer) attempting. |
 | Descendants | Default: unfinished descendants are also **skipped** (or cancelled if they had live turns — implementation may map live children → cancel process then skip). Cascade must leave no open orphan work under a skipped parent. |
-| Hard terminal | Read-only; no reopen-on-message. To do the work later → new task / continuation. |
+| Hard terminal | Composer stays writable; next `send` reopens same id to `open`. New task remains available if preferred. |
 | Wait / deps | Settles wait barriers. Does **not** satisfy `requiredOutcome: 'succeeded'`. Dependents with `onUnsatisfied: 'skip'` may themselves become `skipped`. |
 | CLI | Never maps process exit or missing disposition to `skipped`. |
 
@@ -945,17 +945,18 @@ both constrain behavior:
 | `open` | `needs_recovery` | Persist; offer explicit Retry / Continue recovery (free-form send blocked while recovery is required) |
 | `open` | `awaiting_outcome` | Prefer Accept/Reject when an outcome card exists. **Composer stays writable:** a new `send` clears `outcomeProposal`, keeps lifecycle `open`, and queues a turn (continue session). Do **not** block send solely because a proposal is pending. |
 | `failed` (soft) | — | **Reopen** to `open`, then queue a turn with the message |
-| `succeeded` / `cancelled` / `skipped` | — | Read-only; no reopen on the same task id. Offer **Continue as new task** (or new task if the user later wants a previously skipped goal) |
+| `succeeded` / `cancelled` / `skipped` | — | **Reopen** to `open` on the same task id, then queue a turn (same as soft-fail). Operators may still create a new task instead |
 
 ### 9.1 Multi-queued FIFO follow-ups and live inject
 
-**Normative send rule (R012):** every focused-task `send` creates a **distinct queued turn** bound to that user message. Concurrent sends while a turn is live or already queued still create additional queued turns; the scheduler promotes **one active (running) turn per task** and drains **multiple queued follow-ups** in FIFO order after successful settlement.
+**Normative send rule (R012):** every focused-task `send` creates a **distinct queued turn** bound to that user message, or **refuses visibly** when a turn cannot be allocated (turn cap, hard recovery block). Concurrent sends while a turn is live or already queued still create additional queued turns; the scheduler promotes **one active (running) turn per task**, only the **earliest** queued sequence (FIFO), and drains **multiple queued follow-ups** in order after **successful** settlement. After failure/interrupted settlement, queued follow-ups remain queued (not auto-promoted) until recovery/resume policy allows.
 
 | Operator action | Engine / host API | Notes |
 |-----------------|-------------------|-------|
 | Enter / Send | `send` | FIFO follow-up turn; composer stays editable while running/queued |
-| Ctrl+Enter (live inject) | `sendLiveInput` | Concurrent instruction into the locally owned active session when capability evidence exists. **No queue fallback** on refusal |
-| Edit pending queue item | `editQueuedTurn` | Only while `turnId` remains in the live `queuedTurns` projection |
+| Ctrl+Enter while running | `sendLiveInput` | Concurrent instruction into the locally owned active session when capability evidence exists. **No queue fallback** on refusal |
+| Ctrl+Enter while idle | `send` | Immediate normal turn (same as Enter); not inject |
+| Edit pending queue item | `editQueuedTurn` | Only while `turnId` remains in the live `queuedTurns` projection; clears stale `agentContent` |
 | Delete pending queue item | `deleteQueuedTurn` | Undispatched only; never cancels a running turn |
 
 **Projection:** snapshots include optional `queuedTurns` (`turnId`, `sequence`, `status: 'queued'`, `messageIds`, `createdAt`) so the webview can render an inspectable FIFO panel and lock edit/delete at the dispatch boundary.
@@ -966,7 +967,7 @@ both constrain behavior:
 - Refusal (unsupported backend, not local owner, no active turn, validation failure, engine not ready, …) → sanitized `commandError`. Never invent a queued turn from a refused inject.
 - Stale `editQueuedTurn` / `deleteQueuedTurn` (missing, foreign, or already dispatched turn) → `commandError` with a clear stale-mutation message; controls should already be locked when the projection drops the turn.
 
-`sendLiveInput` is distinct from `continueTask` / `send`: inject does not allocate a new turn. Webview keyboard policy maps Ctrl/Meta+Enter to `sendLiveInput` only in task mode.
+`sendLiveInput` is distinct from `continueTask` / `send`: inject does not allocate a new turn. Webview keyboard policy maps Ctrl/Meta+Enter to `sendLiveInput` only when a live turn is running; otherwise Ctrl/Meta+Enter uses `send`.
 
 Chat messages are durable records, not raw queued strings. They provide both the
 task transcript and delivery identity:
@@ -1208,9 +1209,9 @@ the webview status menu uses `setTaskLifecycle` only.
   (who sealed, when) rather than an Accept card — unless `alwaysConfirmRoot`.
 - **Failed** (soft): composer remains available; send reopens to `open`. Status
   menu may also **Reopen** → `setTaskLifecycle` `open`.
-- **Succeeded** / **Cancelled** / **Skipped**: thread read-only; **no**
-  reopen-on-same-id (status menu does not offer open). **Continue as new task**
-  (or new task) if the user wants related work later.
+- **Succeeded** / **Cancelled** / **Skipped**: composer remains available; next
+  `send` reopens the same task id to `open` and may queue a turn. Operators may
+  still start a new task instead.
 - **Cancel task** = abort in-progress work (cascade). **Skip task** = won’t
   perform this created task (cascade unfinished descendants). Both are distinct
   from **stop/interrupt turn**.
@@ -1224,7 +1225,7 @@ the webview status menu uses `setTaskLifecycle` only.
 - Duplicating task name + lifecycle in both App chrome and the workspace status
   card (status card **is** the header).
 - Blocking composer solely because `runtimeActivity === 'awaiting_outcome'`.
-- Offering “Reopen” for hard-terminal tasks on the same task id.
+- Blocking composer solely because lifecycle is hard-terminal (reopen-on-send is allowed).
 - Auto-sealing root success in **`user_confirm`** mode on agent `complete_task`.
 - Blocking all coordinator seals in **`coordinator_delegate` / `yolo`** as if
   every outcome still required a human click (defeats handoff).
@@ -1291,7 +1292,7 @@ the webview status menu uses `setTaskLifecycle` only.
 | Reject complete with reason | Stay `open`; inject reason; coordinator continues |
 | Reject complete without reason | Soft `failed`; no auto turns until user messages |
 | Soft fail reopen | New user message on `failed` reopens same task to `open` |
-| Hard terminal follow-up | `succeeded` / `cancelled` / `skipped` → new or continuation task, not silent reopen |
+| Hard terminal follow-up | `succeeded` / `cancelled` / `skipped` → reopen same id on next `send` (or new task if user prefers) |
 | Cancel | Authorized cancel seals `cancelled` and **cascades** descendants; workspace revert is future work |
 | Skip | Created task marked **won’t perform** → `skipped` (hard); user or authorized coordinator |
 | CLI / turn failure | Never seals lifecycle by itself; leave `open` + recovery (unless authorized sealer acts) |

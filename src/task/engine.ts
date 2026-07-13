@@ -698,12 +698,18 @@ export class TaskEngine {
   }
 
   resumeQueuedTurn(turnId: string): EngineResult<void> {
-    const turn = this.store.getFile().turns[turnId];
+    const file = this.store.getFile();
+    const turn = file.turns[turnId];
     if (!turn) {
       return { ok: false, reason: 'turn not found' };
     }
     if (turn.status !== 'queued') {
       return { ok: false, reason: 'turn is not queued' };
+    }
+    // Fail closed on FIFO violations rather than silently no-op promote.
+    const promote = canPromoteTurn(file, turnId, this.resourceLimits);
+    if (!promote.ok) {
+      return { ok: false, reason: promote.reason };
     }
     this.deferredQueuedTurns.delete(turnId);
     void this.scheduleTurn(turnId);
@@ -806,9 +812,21 @@ export class TaskEngine {
 
       // R012: every Enter/send becomes one distinct FIFO turn bound to this message.
       // Concurrent sends while a turn is live/queued still create queued turns
-      // (scheduler promotes one-at-a-time). Free-floating pending-only messages are
-      // reserved for turn-cap refusal and other failure paths, not normal send.
+      // (scheduler promotes one-at-a-time). Refuse visibly when a turn cannot be
+      // created — never leave free-floating pending messages without turn identity.
       const viewStatus = viewStatusFromDraft(draft, taskId) ?? 'idle';
+      if (viewStatus === 'needs_recovery' && hasActiveOrQueuedTurn(turnsForTask(draft, taskId))) {
+        return {
+          ok: false,
+          reason: 'task needs recovery; resolve recovery before queueing a new turn',
+        };
+      }
+
+      const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
+      if (!turnCap.ok) {
+        return turnCap;
+      }
+
       draft.messages[messageId] = {
         id: messageId,
         taskId,
@@ -819,18 +837,6 @@ export class TaskEngine {
         createdAt: now,
       };
 
-      // Refuse only when hard-blocked (needs_recovery already has live/queued work).
-      // idle / awaiting_outcome / running / queued / waiting_* all accept a new
-      // one-message turn so follow-ups keep durable turn identity for edit/delete.
-      if (viewStatus === 'needs_recovery' && hasActiveOrQueuedTurn(turnsForTask(draft, taskId))) {
-        return { ok: true };
-      }
-
-      const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
-      if (!turnCap.ok) {
-        // Leave the message pending without a turn when the turn budget is exhausted.
-        return { ok: true };
-      }
       const turns = turnsForTask(draft, taskId);
       const turnId = randomUUID();
       const queue =
@@ -846,13 +852,9 @@ export class TaskEngine {
               inputs: [{ kind: 'message', messageId }],
             });
       if (!queue.ok) {
-        // First-turn path without a settled turn should not leave a free-floating
-        // message when start/continue guards fire unexpectedly — surface the error.
-        // When turns exist but continue fails, keep the pending message (cap/recovery).
-        if (turns.length === 0) {
-          return queue;
-        }
-        return { ok: true };
+        // Roll back the message so we never persist orphan pending content.
+        delete draft.messages[messageId];
+        return queue;
       }
       draft.turns[turnId] = queue.next;
       queuedTurnId = turnId;
@@ -908,8 +910,13 @@ export class TaskEngine {
       if (!message) {
         return { ok: false, reason: 'message not found' };
       }
+      // Clear stale agentContent: edited display text must drive projectPrompt.
+      // Callers that expand mentions on edit can pass agentContent via a future
+      // option; plain edit replaces content and drops the prior expansion.
+      const { agentContent: _staleAgentContent, ...rest } = message;
+      void _staleAgentContent;
       draft.messages[prepared.next.messageId] = {
-        ...message,
+        ...rest,
         content: prepared.next.content,
       };
       editedMessageId = prepared.next.messageId;
@@ -1726,7 +1733,16 @@ export class TaskEngine {
       // (MEM030 / failure+cap paths keep queued follow-ups unstarted).
       const allowSameTaskFollowUps = settled?.status === 'succeeded';
       const settledTaskId = settled?.taskId;
-      const queued = Object.values(file.turns).filter((t) => t.status === 'queued');
+      // Promote in FIFO order (sequence → createdAt → id) so the earliest
+      // queued follow-up is always the first candidate after settlement.
+      const queued = Object.values(file.turns)
+        .filter((t) => t.status === 'queued')
+        .sort(
+          (a, b) =>
+            a.sequence - b.sequence ||
+            a.createdAt.localeCompare(b.createdAt) ||
+            a.id.localeCompare(b.id),
+        );
       for (const turn of queued) {
         if (this.deferredQueuedTurns.has(turn.id)) {
           continue;

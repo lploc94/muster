@@ -64,4 +64,22 @@ describe('scheduler', () => {
     };
     expect(canPromoteTurn(file, 't1', DEFAULT_RESOURCE_LIMITS).ok).toBe(false);
   });
+
+  it('blocks promoting a later FIFO queued turn before an earlier one', () => {
+    const file = baseFile();
+    file.turns.t2 = {
+      id: 't2',
+      taskId: 'root',
+      sequence: 2,
+      trigger: 'user',
+      status: 'queued',
+      inputs: [],
+      createdAt: 't2',
+    };
+    expect(canPromoteTurn(file, 't1', DEFAULT_RESOURCE_LIMITS)).toEqual({ ok: true });
+    expect(canPromoteTurn(file, 't2', DEFAULT_RESOURCE_LIMITS)).toEqual({
+      ok: false,
+      reason: 'earlier queued turn must run first',
+    });
+  });
 });

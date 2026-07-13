@@ -54,13 +54,31 @@ describe('resolveComposerKeyIntent', () => {
     expect(shouldPreventDefaultForComposerKey(key({ key: 'Enter' }), { mode: 'task' })).toBe(true);
   });
 
-  it('maps Ctrl+Enter and Meta+Enter to sendLiveInput only in task mode (no queue fallback)', () => {
-    expect(resolveComposerKeyIntent(key({ key: 'Enter', ctrlKey: true }), { mode: 'task' })).toEqual({
-      kind: 'sendLiveInput',
-    });
-    expect(resolveComposerKeyIntent(key({ key: 'Enter', metaKey: true }), { mode: 'task' })).toEqual({
-      kind: 'sendLiveInput',
-    });
+  it('maps Ctrl+Enter and Meta+Enter to sendLiveInput only when a live turn is running', () => {
+    expect(
+      resolveComposerKeyIntent(key({ key: 'Enter', ctrlKey: true }), {
+        mode: 'task',
+        liveInjectEligible: true,
+      }),
+    ).toEqual({ kind: 'sendLiveInput' });
+    expect(
+      resolveComposerKeyIntent(key({ key: 'Enter', metaKey: true }), {
+        mode: 'task',
+        liveInjectEligible: true,
+      }),
+    ).toEqual({ kind: 'sendLiveInput' });
+  });
+
+  it('maps Ctrl+Enter to ordinary send when task is idle (no live inject path)', () => {
+    expect(
+      resolveComposerKeyIntent(key({ key: 'Enter', ctrlKey: true }), {
+        mode: 'task',
+        liveInjectEligible: false,
+      }),
+    ).toEqual({ kind: 'send' });
+    expect(
+      resolveComposerKeyIntent(key({ key: 'Enter', metaKey: true }), { mode: 'task' }),
+    ).toEqual({ kind: 'send' });
   });
 
   it('maps Ctrl+Enter to plain send in draft mode (no live inject path)', () => {
@@ -88,6 +106,21 @@ describe('buildTaskComposerMessage', () => {
         { taskId: 'task-1', text: 'steer now' },
       ),
     ).toEqual({ type: 'sendLiveInput', taskId: 'task-1', instruction: 'steer now' });
+  });
+
+  it('uses expanded llmText as sendLiveInput instruction and send llmText', () => {
+    expect(
+      buildTaskComposerMessage(
+        { kind: 'sendLiveInput' },
+        { taskId: 'task-1', text: '@foo', llmText: '/tmp/foo.ts' },
+      ),
+    ).toEqual({ type: 'sendLiveInput', taskId: 'task-1', instruction: '/tmp/foo.ts' });
+    expect(
+      buildTaskComposerMessage(
+        { kind: 'send' },
+        { taskId: 'task-1', text: '@foo', llmText: '/tmp/foo.ts' },
+      ),
+    ).toEqual({ type: 'send', taskId: 'task-1', text: '@foo', llmText: '/tmp/foo.ts' });
   });
 
   it('refuses empty / whitespace-only payloads for both intents', () => {

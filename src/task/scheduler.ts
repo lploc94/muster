@@ -114,6 +114,21 @@ export function canPromoteTurn(
     return { ok: false, reason: 'task already has an active turn' };
   }
 
+  // FIFO: only the earliest still-queued turn for this task may promote.
+  // Blocks resumeQueuedTurn / cross-process schedule of a later sequence first.
+  const earlierQueued = turnsForTask(file, turn.taskId).find(
+    (t) =>
+      t.id !== turnId &&
+      t.status === 'queued' &&
+      (t.sequence < turn.sequence ||
+        (t.sequence === turn.sequence &&
+          (t.createdAt < turn.createdAt ||
+            (t.createdAt === turn.createdAt && t.id < turn.id)))),
+  );
+  if (earlierQueued) {
+    return { ok: false, reason: 'earlier queued turn must run first' };
+  }
+
   if (dependenciesBlockTask(file, turn.taskId)) {
     return { ok: false, reason: 'dependencies not satisfied' };
   }
@@ -149,7 +164,12 @@ export function canPromoteTurn(
 export function pickRunnableTurns(file: TaskStoreFile, limits: ResourceLimits): string[] {
   const queued = Object.values(file.turns)
     .filter((t) => t.status === 'queued')
-    .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+    .sort(
+      (a, b) =>
+        a.sequence - b.sequence ||
+        a.createdAt.localeCompare(b.createdAt) ||
+        a.id.localeCompare(b.id),
+    );
 
   const promoted: string[] = [];
   let draft = file;

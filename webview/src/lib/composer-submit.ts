@@ -26,6 +26,12 @@ export interface ComposerKeyPolicyInput {
 
 export interface ComposerKeyPolicyOptions {
   mode: ComposerMode;
+  /**
+   * Task mode only: true when a live turn is running and Ctrl/Meta+Enter should
+   * inject. When false/undefined, Ctrl/Meta+Enter uses ordinary `send` (idle path).
+   * Does not change refused-inject behavior: inject never falls through to queue.
+   */
+  liveInjectEligible?: boolean;
 }
 
 /**
@@ -33,7 +39,8 @@ export interface ComposerKeyPolicyOptions {
  *
  * - IME composition / keyCode 229: none
  * - Shift+Enter: none (browser inserts newline)
- * - Ctrl/Meta+Enter in task mode: sendLiveInput only (no queue fallback)
+ * - Ctrl/Meta+Enter in task mode + live turn: sendLiveInput only (no queue fallback)
+ * - Ctrl/Meta+Enter in task mode when idle / not live: send (immediate turn)
  * - Plain Enter (and Ctrl+Enter in draft): send
  */
 export function resolveComposerKeyIntent(
@@ -45,7 +52,7 @@ export function resolveComposerKeyIntent(
   if (event.shiftKey) return { kind: 'none' };
 
   const mod = event.ctrlKey || event.metaKey;
-  if (mod && opts.mode === 'task') {
+  if (mod && opts.mode === 'task' && opts.liveInjectEligible) {
     return { kind: 'sendLiveInput' };
   }
   return { kind: 'send' };
@@ -62,6 +69,12 @@ export function shouldPreventDefaultForComposerKey(
 export interface TaskComposerMessageParams {
   taskId?: string;
   text: string;
+  /**
+   * Agent-facing expanded text (e.g. file-mention full paths). When set and
+   * different from `text`, `send` includes `llmText` and `sendLiveInput` uses it
+   * as the inject instruction.
+   */
+  llmText?: string;
 }
 
 /**
@@ -76,9 +89,15 @@ export function buildTaskComposerMessage(
   if (!taskId) return null;
   const text = params.text.trim();
   if (!text) return null;
+  const llmText =
+    typeof params.llmText === 'string' && params.llmText.trim() ? params.llmText.trim() : text;
 
   if (intent.kind === 'sendLiveInput') {
-    return { type: 'sendLiveInput', taskId, instruction: text };
+    // Inject always delivers the agent-facing payload (expanded mentions).
+    return { type: 'sendLiveInput', taskId, instruction: llmText };
+  }
+  if (llmText !== text) {
+    return { type: 'send', taskId, text, llmText };
   }
   return { type: 'send', taskId, text };
 }

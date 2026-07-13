@@ -720,7 +720,7 @@ describe('task lifecycle runtime regression harness', () => {
     expect(engine.viewStatus('failure-pending')).toBe('queued');
   });
 
-  it('leaves over-cap concurrent sends as free-floating pending messages without a turn', async () => {
+  it('refuses over-cap concurrent sends without leaving free-floating pending messages', async () => {
     const { store } = makeTempStore();
     const gate = makeGate();
     const backend = scriptedBackend(async function* () {
@@ -745,10 +745,10 @@ describe('task lifecycle runtime regression harness', () => {
       'limited turn to run',
     );
     const second = engine.send('limit-pending', 'over the cap');
-    expect(second.ok).toBe(true);
-    if (!second.ok) return;
-    // Turn budget exhausted: message is accepted but no FIFO turn is created.
-    expect(second.value.turnId).toBeUndefined();
+    // Turn budget exhausted: refuse visibly — no orphan pending message.
+    expect(second.ok).toBe(false);
+    if (second.ok) return;
+    expect(second.reason).toMatch(/turn|limit|max/i);
 
     expect(engine.stageDisposition(first.value.turnId, { kind: 'idle' }, 'op-idle-limit')).toEqual({
       ok: true,
@@ -759,8 +759,7 @@ describe('task lifecycle runtime regression harness', () => {
 
     const file = turnFile(store);
     expect(Object.values(file.turns).filter((turn) => turn.taskId === 'limit-pending')).toHaveLength(1);
-    expect(file.messages[second.value.messageId]).toMatchObject({ state: 'pending' });
-    expect(file.messages[second.value.messageId]).not.toHaveProperty('turnId');
+    expect(Object.values(file.messages).filter((m) => m.taskId === 'limit-pending' && m.content === 'over the cap')).toHaveLength(0);
     expect(engine.viewStatus('limit-pending')).toBe('idle');
   });
 

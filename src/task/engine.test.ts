@@ -1092,6 +1092,7 @@ describe('TaskEngine.editQueuedTurn / deleteQueuedTurn', () => {
       value: { turnId: second.value.turnId, messageId: second.value.messageId },
     });
     expect(store.getFile().messages[second.value.messageId]?.content).toBe('revised-b');
+    expect(store.getFile().messages[second.value.messageId]).not.toHaveProperty('agentContent');
     expect(store.getFile().messages[third.value.messageId]?.content).toBe('follow-c');
     expect(store.getFile().turns[first.value.turnId]?.status).toBe('running');
     expect(store.getFile().turns[second.value.turnId]).toMatchObject({
@@ -1125,6 +1126,42 @@ describe('TaskEngine.editQueuedTurn / deleteQueuedTurn', () => {
     release?.();
     await engine.whenIdle();
   });
+
+  it('clears stale agentContent when editing a queued turn', async () => {
+    const { store } = makeTempStore();
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const backend: Backend = {
+      name: 'fake',
+      capabilities: MCP_CAPS,
+      async *run() {
+        yield { type: 'sessionStarted', sessionId: 'sess-ac' };
+        await gate;
+        yield { type: 'turnCompleted' };
+      },
+    };
+    const engine = TaskEngine.load({ store, makeBackend: () => backend });
+    engine.createTask({ id: 'task-ac', goal: 'agent content edit', backend: 'fake' });
+    const first = engine.send('task-ac', 'live');
+    expect(first.ok && first.value.turnId).toBeTruthy();
+    if (!first.ok || !first.value.turnId) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const second = engine.send('task-ac', '@chip', { agentContent: '/abs/old/path.ts' });
+    expect(second.ok && second.value.turnId).toBeTruthy();
+    if (!second.ok || !second.value.turnId) return;
+    expect(store.getFile().messages[second.value.messageId]?.agentContent).toBe('/abs/old/path.ts');
+    const edit = engine.editQueuedTurn('task-ac', second.value.turnId, 'plain revised');
+    expect(edit.ok).toBe(true);
+    expect(store.getFile().messages[second.value.messageId]).toEqual(
+      expect.objectContaining({ content: 'plain revised' }),
+    );
+    expect(store.getFile().messages[second.value.messageId]).not.toHaveProperty('agentContent');
+    release?.();
+    await engine.whenIdle();
+  });
+
 
   it('refuses edit/delete after dispatch assigns messages and promotes to running', async () => {
     const { store } = makeTempStore();
