@@ -95,14 +95,15 @@ npm run test:webview -- e2e/muster-webview-state.spec.ts
 ```
 
 The doc verifier checks keyboard contract markers (`Enter` → `send` FIFO,
-`Ctrl+Enter` → `sendLiveInput` with no queue fallback), `queuedTurns` edit/delete,
-and visible `liveInputResult` / `commandError` feedback. Playwright covers the
-browser-visible composer against the Vite webview with synthetic host messages
-and is **supportive only** for live Extension Development Host keyboard proof.
+`Ctrl+Enter` → prefer `sendLiveInput` with silent `send` when inject is
+unavailable), `queuedTurns` edit/delete, and `liveInputResult` delivered notice.
+Playwright covers the browser-visible composer against the Vite webview with
+synthetic host messages and is **supportive only** for live Extension Development
+Host keyboard proof.
 
 Optional live check: press **F5**, open a running task, confirm Enter stacks
-queue rows, Ctrl+Enter either delivers a notice or shows a refusal banner, and
-stale queue mutations surface `commandError` without silent success.
+queue rows, Ctrl+Enter either delivers a live-input notice or quietly queues
+via `send` (never a red “unsupported” banner), and queue Edit/Delete update the panel.
 
 ## What to work on
 

@@ -99,7 +99,7 @@ describe('host live-input routing contract', () => {
     expect(liveCase).not.toContain('continueTaskWithMessage');
   });
 
-  it('visibly refuses unsupported live input without engine queue mutation paths', async () => {
+  it('returns fallback-send for unsupported live input so the host can silent-send', async () => {
     const sendLiveInput = vi.fn(async () => ({
       code: 'unsupported' as const,
       reason: 'backend kiro does not support live input',
@@ -112,11 +112,12 @@ describe('host live-input routing contract', () => {
     );
 
     expect(sendLiveInput).toHaveBeenCalledTimes(1);
+    // Route itself does not call continueTask; host maps fallback-send → handleSend.
     expect(continueTaskWithMessage).not.toHaveBeenCalled();
     expect(outcome).toEqual({
-      kind: 'error',
+      kind: 'fallback-send',
       taskId: 'task-1',
-      message: expect.stringContaining('unsupported'),
+      instruction: 'nudge',
     });
   });
 
@@ -140,14 +141,14 @@ describe('host live-input routing contract', () => {
     });
   });
 
-  it('rejects malformed payloads before engine delegation', async () => {
+  it('stays silent on malformed payloads before engine delegation', async () => {
     const sendLiveInput = vi.fn();
     const outcome = await routeSendLiveInput(
       { type: 'sendLiveInput', taskId: 'task-3', instruction: '' },
       { engineReady: true, sendLiveInput },
     );
     expect(sendLiveInput).not.toHaveBeenCalled();
-    expect(outcome.kind).toBe('error');
+    expect(outcome).toEqual({ kind: 'silent', taskId: 'task-3' });
   });
 });
 

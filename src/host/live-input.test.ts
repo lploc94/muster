@@ -124,30 +124,24 @@ describe('sanitizeLiveInputText', () => {
 });
 
 describe('routeSendLiveInput', () => {
-  it('refuses when the engine is not ready without calling sendLiveInput', async () => {
+  it('falls back to send when the engine is not ready without calling sendLiveInput', async () => {
     const sendLiveInput = vi.fn();
     const outcome = await routeSendLiveInput(
       { type: 'sendLiveInput', taskId: 't', instruction: 'x' },
       { engineReady: false, sendLiveInput },
     );
-    expect(outcome).toEqual({ kind: 'error', message: 'task engine not ready' });
+    expect(outcome).toEqual({ kind: 'fallback-send', taskId: 't', instruction: 'x' });
     expect(sendLiveInput).not.toHaveBeenCalled();
   });
 
-  it('rejects malformed payloads without engine delegation', async () => {
+  it('stays silent on malformed payloads without engine delegation or error banners', async () => {
     const sendLiveInput = vi.fn();
-    const continueTask = vi.fn();
     const outcome = await routeSendLiveInput(
       { type: 'sendLiveInput', taskId: 't', instruction: '' },
       { engineReady: true, sendLiveInput },
     );
-    expect(outcome.kind).toBe('error');
-    if (outcome.kind === 'error') {
-      expect(outcome.taskId).toBe('t');
-      expect(outcome.message).toContain('non-empty instruction');
-    }
+    expect(outcome).toEqual({ kind: 'silent', taskId: 't' });
     expect(sendLiveInput).not.toHaveBeenCalled();
-    expect(continueTask).not.toHaveBeenCalled();
   });
 
   it('delegates once on valid payload and returns ack for delivered', async () => {
@@ -165,43 +159,38 @@ describe('routeSendLiveInput', () => {
   });
 
   it.each([
-    [{ code: 'unsupported' as const, reason: 'backend kiro lacks live input' }, 'unsupported'],
-    [{ code: 'no-active-turn' as const, reason: 'no running turn' }, 'No active turn'],
-    [{ code: 'not-local-owner' as const, reason: 'foreign lease' }, 'not the local owner'],
-    [{ code: 'rejected' as const, reason: 'agent error' }, 'rejected'],
-    [{ code: 'cancelled' as const, reason: 'aborted' }, 'cancelled'],
-  ])('surfaces %s refusal as a visible command error', async (result, fragment) => {
+    [{ code: 'unsupported' as const, reason: 'backend kiro lacks live input' }],
+    [{ code: 'no-active-turn' as const, reason: 'no running turn' }],
+    [{ code: 'not-local-owner' as const, reason: 'foreign lease' }],
+    [{ code: 'rejected' as const, reason: 'agent error' }],
+    [{ code: 'cancelled' as const, reason: 'aborted' }],
+  ])('falls back to silent send delivery when inject cannot deliver (%s)', async (result) => {
     const sendLiveInput = vi.fn(async () => result);
     const outcome = await routeSendLiveInput(
       { type: 'sendLiveInput', taskId: 'task-1', instruction: 'nudge' },
       { engineReady: true, sendLiveInput },
     );
     expect(sendLiveInput).toHaveBeenCalledTimes(1);
-    expect(outcome.kind).toBe('error');
-    if (outcome.kind === 'error') {
-      expect(outcome.taskId).toBe('task-1');
-      expect(outcome.message).toContain(fragment);
-    }
+    expect(outcome).toEqual({
+      kind: 'fallback-send',
+      taskId: 'task-1',
+      instruction: 'nudge',
+    });
   });
 
-  it('never falls through to continueTask — only sendLiveInput is invoked', async () => {
+  it('attempts sendLiveInput once before returning fallback-send', async () => {
     const calls: string[] = [];
     const sendLiveInput = vi.fn(async () => {
       calls.push('sendLiveInput');
       return { code: 'unsupported' as const, reason: 'nope' };
     });
-    const continueTaskWithMessage = vi.fn(async () => {
-      calls.push('continueTaskWithMessage');
-      return { ok: true };
-    });
 
-    await routeSendLiveInput(
+    const outcome = await routeSendLiveInput(
       { type: 'sendLiveInput', taskId: 'task-1', instruction: 'nudge' },
       { engineReady: true, sendLiveInput },
     );
 
-    // Explicitly prove continueTask is not part of this route surface.
-    expect(continueTaskWithMessage).not.toHaveBeenCalled();
     expect(calls).toEqual(['sendLiveInput']);
+    expect(outcome.kind).toBe('fallback-send');
   });
 });

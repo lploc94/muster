@@ -1094,8 +1094,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           }
           break;
         case 'sendLiveInput': {
-          // Honest live-turn injection: validate + engine.sendLiveInput only.
-          // Never falls through to continueTask / queue creation.
+          // Prefer concurrent inject; if the backend/session cannot accept it,
+          // silently deliver via ordinary send (FIFO while a turn is live).
+          // Never surface a red error for “unsupported live input” — bad UX.
           const engine = taskEngine;
           const injectInstruction =
             typeof data.instruction === 'string' ? data.instruction.trim() : '';
@@ -1130,9 +1131,18 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
                 },
               });
             }
-          } else {
-            this.postCommandError(outcome.message, outcome.taskId);
+          } else if (outcome.kind === 'fallback-send') {
+            // Same as Enter: queue while live, start a turn when idle.
+            // Instruction may already be expanded mention text.
+            const text = outcome.instruction.trim();
+            if (text) {
+              await this.handleSend({
+                taskId: outcome.taskId,
+                text,
+              });
+            }
           }
+          // silent: ignore empty/malformed inject without a banner
           break;
         }
         case 'editQueuedTurn': {

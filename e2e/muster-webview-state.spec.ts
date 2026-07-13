@@ -1019,7 +1019,9 @@ test.describe('Muster webview host state smoke', () => {
     await expect.poll(async () => composer.inputValue()).toMatch(/Line one/);
   });
 
-  test('surfaces liveInputResult delivery notice and commandError inject refusal', async ({ page }) => {
+  test('surfaces liveInputResult delivery notice without treating inject unavailability as failure chrome', async ({
+    page,
+  }) => {
     await openWebview(page);
 
     await postSnapshot(page, {
@@ -1056,17 +1058,15 @@ test.describe('Muster webview host state smoke', () => {
       notice.getByText('Live input delivered to the active session.', { exact: true }),
     ).toBeVisible();
 
-    // Refusal uses commandError chrome and clears the prior notice.
+    // Capability refusals are no longer red task-command-failed banners (host falls back to send).
+    // Unrelated command errors still show when the host posts them for other reasons.
     await postCommandError(page, {
       type: 'commandError',
       taskId: 'task-live',
-      message: 'Live input is not supported for this backend session.',
+      message: 'message cannot be empty',
     });
     await expect(page.getByRole('alert').getByText('Task command failed')).toBeVisible();
-    await expect(
-      page.getByRole('alert').getByText('Live input is not supported for this backend session.'),
-    ).toBeVisible();
-    await expect(page.locator('.task-command-notice')).toHaveCount(0);
+    await expect(page.getByRole('alert').getByText('message cannot be empty')).toBeVisible();
 
     // Foreign-task errors stay hidden while focused elsewhere.
     await postCommandError(page, {

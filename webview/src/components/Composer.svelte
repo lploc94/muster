@@ -238,7 +238,7 @@
     }
 
     if (intent.kind === 'sendLiveInput') {
-      // Expanded mention paths go in instruction; inject never falls through to queue.
+      // Prefer inject; host silently delivers via send/FIFO if inject is unavailable.
       const message = buildTaskComposerMessage(intent, {
         taskId,
         text: displayText,

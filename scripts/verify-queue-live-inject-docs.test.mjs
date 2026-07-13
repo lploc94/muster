@@ -21,7 +21,7 @@ const required = {
     '`deleteQueuedTurn`',
     '`liveInputResult`',
     '`commandError`',
-    'no queue fallback',
+    'silent delivery via `send`',
     'composer stays editable',
     'Shift+Enter',
     'IME',
@@ -41,7 +41,7 @@ const required = {
     '`deleteQueuedTurn`',
     '`liveInputResult`',
     '`commandError`',
-    'no queue fallback',
+    'silent `send`',
     'stale',
   ],
   'docs/README.md': [
@@ -76,12 +76,10 @@ const forbiddenClaims = [
     label: 'submitAsk-only live inject',
   },
   {
-    pattern: /Ctrl\+Enter (?:queues|creates a queued turn|falls? through to queue)/i,
-    label: 'Ctrl+Enter queue fallback',
-  },
-  {
-    pattern: /sendLiveInput (?:queues|falls? through to (?:queue|continueTask))/i,
-    label: 'sendLiveInput queue fallback',
+    // Product allows silent host delivery via send when inject is unavailable,
+    // but docs must not claim the *webview* always maps Ctrl+Enter to queue-only.
+    pattern: /Ctrl\+Enter (?:always )?(?:queues|creates a queued turn) only/i,
+    label: 'Ctrl+Enter always queues only',
   },
 ];
 
@@ -108,8 +106,12 @@ function validate(files) {
   const section = nextHeading >= 0 ? after.slice(0, nextHeading) : after;
   assert.match(section, /Enter queues/i, 'WEBVIEW.md must document Enter → FIFO queue');
   assert.match(section, /Ctrl\+Enter/i, 'WEBVIEW.md must document Ctrl+Enter live inject');
-  assert.match(section, /no queue fallback/i, 'WEBVIEW.md must state live inject has no queue fallback');
-  assert.match(section, /commandError/i, 'WEBVIEW.md must document refusal via commandError');
+  assert.match(
+    section,
+    /silent delivery via `send`/i,
+    'WEBVIEW.md must document silent send when inject unavailable',
+  );
+  assert.match(section, /commandError/i, 'WEBVIEW.md must mention commandError (for other refusals)');
   assert.match(section, /liveInputResult/i, 'WEBVIEW.md must document delivered liveInputResult');
 
   const taskMgmt = files['docs/TASK-MANAGEMENT.md'];
@@ -142,7 +144,7 @@ test('rejects omitted protocol, keyboard, and feedback markers', async () => {
   for (const marker of [
     '`sendLiveInput`',
     '`queuedTurns`',
-    'no queue fallback',
+    'silent delivery via `send`',
     'npm run test:queue-live-inject-docs',
   ]) {
     const owner = Object.keys(required).find((name) => files[name].includes(marker));
@@ -176,8 +178,8 @@ test('rejects superseded single-queue and hard-disable claims', async () => {
     () =>
       validate({
         ...files,
-        'docs/WEBVIEW.md': `${files['docs/WEBVIEW.md']}\nCtrl+Enter queues a follow-up turn.\n`,
+        'docs/WEBVIEW.md': `${files['docs/WEBVIEW.md']}\nCtrl+Enter always queues only.\n`,
       }),
-    /Ctrl\+Enter queue fallback/,
+    /Ctrl\+Enter always queues only/,
   );
 });

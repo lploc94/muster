@@ -942,7 +942,7 @@ both constrain behavior:
 |-----------|----------------------------|----------|
 | `open` | `idle` | Queue a user-triggered turn (`send`) |
 | `open` | `waiting_dependencies` / `queued` | `send` creates another distinct FIFO queued turn (or binds per engine policy); inspect / edit / delete via `queuedTurns` |
-| `open` | `running` | `send` queues a FIFO follow-up; **Ctrl+Enter** may call `sendLiveInput` for concurrent inject when supported (no queue fallback). `submitAsk` remains the path for structured ask answers |
+| `open` | `running` | `send` queues a FIFO follow-up; **Ctrl+Enter** prefers `sendLiveInput` when supported, otherwise silent `send` (FIFO) without `commandError`. `submitAsk` remains the path for structured ask answers |
 | `open` | `waiting_user` | Answer the pending ask via `submitAsk`; free-form composer may still queue follow-ups when product policy allows |
 | `open` | `waiting_children` / `blocked` | Persist / queue for the next continuation turn |
 | `open` | `needs_recovery` | Persist; offer explicit Retry / Continue recovery (free-form send blocked while recovery is required) |
@@ -957,7 +957,7 @@ both constrain behavior:
 | Operator action | Engine / host API | Notes |
 |-----------------|-------------------|-------|
 | Enter / Send | `send` | FIFO follow-up turn; composer stays editable while running/queued |
-| Ctrl+Enter while running | `sendLiveInput` | Concurrent instruction into the locally owned active session when capability evidence exists. **No queue fallback** on refusal |
+| Ctrl+Enter while running | `sendLiveInput` then maybe `send` | Prefer concurrent inject when capability evidence exists; if inject cannot deliver, **silent `send`** (FIFO) without `commandError` |
 | Ctrl+Enter while idle | `send` | Immediate normal turn (same as Enter); not inject |
 | Edit pending queue item | `editQueuedTurn` | Only while `turnId` remains in the live `queuedTurns` projection; clears stale `agentContent` |
 | Delete pending queue item | `deleteQueuedTurn` | Undispatched only; never cancels a running turn |
@@ -967,10 +967,10 @@ both constrain behavior:
 **Live inject outcomes:**
 
 - Success → `liveInputResult` `{ taskId, code: 'delivered', sessionId }` (webview status notice).
-- Refusal (unsupported backend, not local owner, no active turn, validation failure, engine not ready, …) → sanitized `commandError`. Never invent a queued turn from a refused inject.
+- Inject unavailable (unsupported backend, not local owner, no active turn, …) → **silent delivery via `send`** (FIFO while live). Do **not** surface `commandError` for capability refusals — the operator message must always be accepted.
 - Stale `editQueuedTurn` / `deleteQueuedTurn` (missing, foreign, or already dispatched turn) → `commandError` with a clear stale-mutation message; controls should already be locked when the projection drops the turn.
 
-`sendLiveInput` is distinct from `continueTask` / `send`: inject does not allocate a new turn. Webview keyboard policy maps Ctrl/Meta+Enter to `sendLiveInput` only when a live turn is running; otherwise Ctrl/Meta+Enter uses `send`.
+`sendLiveInput` is distinct from `continueTask` / `send` when delivered: inject does not allocate a new turn. When inject cannot run, the host falls back to `send` without error chrome. Webview keyboard policy maps Ctrl/Meta+Enter to `sendLiveInput` when a live turn is running (host may still deliver via `send`); otherwise Ctrl/Meta+Enter uses `send`.
 
 Chat messages are durable records, not raw queued strings. They provide both the
 task transcript and delivery identity:

@@ -9,20 +9,27 @@ export const MAX_LIVE_INPUT_ID_CHARS = 256;
  */
 export const MAX_LIVE_INPUT_INSTRUCTION_CHARS = 8_192;
 
-/** Cap for sanitized refusal text posted to the webview (no raw stack dumps). */
+/** Cap for sanitized refusal text (kept for tests / optional diagnostics). */
 export const MAX_LIVE_INPUT_ERROR_CHARS = 400;
 
 export type ParsedLiveInput =
   | { ok: true; taskId: string; instruction: string }
   | { ok: false; message: string; taskId?: string };
 
+/**
+ * Host outcome for sendLiveInput.
+ * - ack: concurrent inject delivered
+ * - fallback-send: inject unavailable — deliver via ordinary send (FIFO while live)
+ * - silent: invalid/empty payload or engine not ready — no error banner (UX: never block the user)
+ */
 export type LiveInputHostOutcome =
   | { kind: 'ack'; taskId: string; sessionId: string }
-  | { kind: 'error'; taskId?: string; message: string };
+  | { kind: 'fallback-send'; taskId: string; instruction: string }
+  | { kind: 'silent'; taskId?: string };
 
 /**
  * Strip control characters and bound length so refusal text is safe to surface
- * in the webview command-error chrome without leaking raw internals.
+ * when diagnostics are needed (not used for the default user path).
  */
 export function sanitizeLiveInputText(text: string, max = MAX_LIVE_INPUT_ERROR_CHARS): string {
   const cleaned = text.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -74,7 +81,8 @@ export function parseSendLiveInputMessage(data: unknown): ParsedLiveInput {
 
 /**
  * Map a typed engine/backend LiveInputResult to a capability- or ownership-specific
- * refusal string. Delivered outcomes are not refusals.
+ * diagnostic string. Delivered outcomes are not refusals.
+ * Prefer {@link routeSendLiveInput} fallback-send over surfacing this to the user.
  */
 export function liveInputRefusalMessage(result: LiveInputResult): string {
   switch (result.code) {
@@ -97,38 +105,61 @@ export function liveInputRefusalMessage(result: LiveInputResult): string {
   }
 }
 
+/** True when inject could not run but the user message should still be delivered via send. */
+export function shouldFallbackLiveInputToSend(result: LiveInputResult): boolean {
+  return result.code !== 'delivered';
+}
+
 export interface LiveInputRouteDeps {
   engineReady: boolean;
   /**
    * Engine entrypoint. Tests assert this is called at most once and only after
-   * payload validation succeeds — never continueTask / queue creation.
+   * payload validation succeeds.
    */
   sendLiveInput: (taskId: string, instruction: string) => Promise<LiveInputResult>;
 }
 
 /**
- * Host routing for live-input: validate, delegate once to the engine, and return
- * either a success ack or a sanitized command-error payload. Never falls through
- * to continueTask or any queue mutation path.
+ * Host routing for live-input: try concurrent inject first.
+ * When inject cannot deliver (unsupported backend, no active turn, ownership, …),
+ * return `fallback-send` so the host can deliver via ordinary `send` / FIFO queue
+ * **without** a commandError banner — user input is never rejected for UX reasons.
  */
 export async function routeSendLiveInput(
   data: unknown,
   deps: LiveInputRouteDeps,
 ): Promise<LiveInputHostOutcome> {
   if (!deps.engineReady) {
-    return { kind: 'error', message: 'task engine not ready' };
+    // Prefer fallback when we can parse a usable payload; otherwise stay silent.
+    const parsedOffline = parseSendLiveInputMessage(data);
+    if (parsedOffline.ok) {
+      return {
+        kind: 'fallback-send',
+        taskId: parsedOffline.taskId,
+        instruction: parsedOffline.instruction,
+      };
+    }
+    return { kind: 'silent', taskId: parsedOffline.taskId };
   }
   const parsed = parseSendLiveInputMessage(data);
   if (!parsed.ok) {
-    return { kind: 'error', taskId: parsed.taskId, message: parsed.message };
+    return { kind: 'silent', taskId: parsed.taskId };
   }
   const result = await deps.sendLiveInput(parsed.taskId, parsed.instruction);
   if (result.code === 'delivered') {
     return { kind: 'ack', taskId: parsed.taskId, sessionId: result.sessionId };
   }
+  // Capability / ownership / no-turn / agent refuse → still accept the message.
+  if (shouldFallbackLiveInputToSend(result)) {
+    return {
+      kind: 'fallback-send',
+      taskId: parsed.taskId,
+      instruction: parsed.instruction,
+    };
+  }
   return {
-    kind: 'error',
+    kind: 'fallback-send',
     taskId: parsed.taskId,
-    message: liveInputRefusalMessage(result),
+    instruction: parsed.instruction,
   };
 }
