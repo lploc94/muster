@@ -219,6 +219,22 @@
           } else if (tasks.draftMode) {
             threadStore.clearFocus();
           }
+          // Phase C: replay outbox only after a compatible host snapshot.
+          if (!outboxReplayed && !protocolMismatch) {
+            outboxReplayed = true;
+            for (const entry of outboxList(vscode)) {
+              post({
+                type: 'send',
+                taskId: entry.taskId,
+                text: entry.text,
+                llmText: entry.llmText,
+                backend: entry.backend,
+                model: entry.model,
+                continuationOf: entry.continuationOf,
+                clientRequestId: entry.clientRequestId,
+              });
+            }
+          }
           break;
         }
 
@@ -410,12 +426,17 @@
           outboxRemove(vscode, msg.clientRequestId);
           break;
 
-        case 'sendRejected':
+        case 'sendRejected': {
+          const rejected = outboxList(vscode).find((e) => e.clientRequestId === msg.clientRequestId);
+          if (rejected?.keepDraft && rejected.text) {
+            tasks.prefillComposer(rejected.text);
+          }
           outboxRemove(vscode, msg.clientRequestId);
           if (isTaskScopedBannerVisible(msg.taskId, tasks.focusedTaskId)) {
             tasks.setCommandError(msg.reason, msg.taskId ?? null);
           }
           break;
+        }
 
         case 'liveInputResult':
           // Delivered acks must not be silently dropped; refusals use commandError.
@@ -443,21 +464,11 @@
     post({ type: 'listBackends' });
     // Prefetch model lists for the New-task picker (host also prefetches on resolve).
     post({ type: 'listModels' });
-    // Phase C: resend unacked outbox entries with the same clientRequestId.
-    for (const entry of outboxList(vscode)) {
-      post({
-        type: 'send',
-        taskId: entry.taskId,
-        text: entry.text,
-        llmText: entry.llmText,
-        backend: entry.backend,
-        model: entry.model,
-        continuationOf: entry.continuationOf,
-        clientRequestId: entry.clientRequestId,
-      });
-    }
+    // Phase C outbox replay happens after a compatible snapshot (see below).
     return () => window.removeEventListener('message', onMessage);
   });
+
+  let outboxReplayed = false;
 </script>
 
 {#if protocolMismatch}

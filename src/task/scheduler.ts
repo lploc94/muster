@@ -114,12 +114,13 @@ export function canPromoteTurn(
     return { ok: false, reason: 'task already has an active turn' };
   }
 
-  // FIFO: only the earliest still-queued turn for this task may promote.
-  // Blocks resumeQueuedTurn / cross-process schedule of a later sequence first.
+  // FIFO: only the earliest still-queued, promotable turn for this task may run.
+  // Held follow-ups (holdAutoPromote) do not block a later safe auto-retry.
   const earlierQueued = turnsForTask(file, turn.taskId).find(
     (t) =>
       t.id !== turnId &&
       t.status === 'queued' &&
+      t.holdAutoPromote !== true &&
       (t.sequence < turn.sequence ||
         (t.sequence === turn.sequence &&
           (t.createdAt < turn.createdAt ||

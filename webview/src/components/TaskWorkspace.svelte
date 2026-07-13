@@ -114,6 +114,18 @@
       (focused.currentTurnActivity?.state === 'failed_turn' ||
         (focused.currentTurnActivity === undefined && runtime === 'needs_recovery')),
   );
+  const showUncertainCard = $derived(
+    !!focused &&
+      focused.lifecycle === 'open' &&
+      focused.currentTurnActivity?.state === 'uncertain',
+  );
+  const recoveryTurnId = $derived(
+    focused?.currentTurnActivity &&
+      (focused.currentTurnActivity.state === 'failed_turn' ||
+        focused.currentTurnActivity.state === 'uncertain')
+      ? focused.currentTurnActivity.turnId
+      : activeTurnId,
+  );
   /** Sealed task: composer stays enabled; hint that send (or Reopen) restores open. */
   const showTerminalReopenHint = $derived(
     !!focused &&
@@ -132,15 +144,25 @@
   }
 
   function submitRetry(): void {
-    if (!focused || !activeTurnId) return;
-    const instruction = retryInstruction.trim();
-    if (!instruction) return;
-    post({ type: 'retryTurn', taskId: focused.id, turnId: activeTurnId, instruction });
+    if (!focused || !recoveryTurnId) return;
+    const instruction = retryInstruction.trim() || 'Retry the previous instruction.';
+    post({ type: 'retryTurn', taskId: focused.id, turnId: recoveryTurnId, instruction });
     retryInstruction = '';
   }
 
+  function submitRunAgain(): void {
+    if (!focused || !recoveryTurnId) return;
+    // Explicit replay authorization for uncertain work (not silent).
+    post({
+      type: 'retryTurn',
+      taskId: focused.id,
+      turnId: recoveryTurnId,
+      instruction: 'Run again: re-execute the previous user instruction carefully.',
+    });
+  }
+
   function submitContinue(): void {
-    if (!focused || !activeTurnId) return;
+    if (!focused) return;
     const instruction = continueMessage.trim();
     if (!instruction) return;
     post({ type: 'continueTask', taskId: focused.id, instruction });
@@ -387,13 +409,39 @@
       </div>
     {/if}
 
-    {#if showFailedTurnCard}
+    {#if showUncertainCard}
+      <div class="task-action-panel task-action-panel--warning" data-turn-activity="uncertain">
+        <div class="font-semibold">Status unclear — continue or run again?</div>
+        <p class="task-muted">
+          The previous turn may have partially run. Choose explicitly — nothing is replayed automatically.
+        </p>
+        <div class="flex flex-col gap-1">
+          <vscode-button disabled={!recoveryTurnId} onclick={submitRunAgain}>
+            Run again
+          </vscode-button>
+        </div>
+        <div class="flex flex-col gap-1">
+          <span>Check and continue</span>
+          <vscode-textarea
+            rows={2}
+            placeholder="Inspect workspace then continue with a new message..."
+            value={continueMessage}
+            oninput={(e: Event) => {
+              continueMessage = (e.currentTarget as HTMLTextAreaElement).value;
+            }}
+          ></vscode-textarea>
+          <vscode-button disabled={!continueMessage.trim()} onclick={submitContinue}>
+            Check and continue
+          </vscode-button>
+        </div>
+      </div>
+    {:else if showFailedTurnCard}
       <div class="task-action-panel task-action-panel--danger" data-turn-activity="failed_turn">
         <div class="font-semibold">Could not finish</div>
         <p class="task-muted">
           The last turn could not finish. Type a new message below to continue, or use Retry / Continue.
         </p>
-        {#if !hasRetryableTurn}
+        {#if !recoveryTurnId}
           <p class="task-muted">No retryable turn is available for this task.</p>
         {/if}
 
@@ -407,7 +455,7 @@
               retryInstruction = (e.currentTarget as HTMLTextAreaElement).value;
             }}
           ></vscode-textarea>
-          <vscode-button disabled={!retryInstruction.trim() || !activeTurnId} onclick={submitRetry}>
+          <vscode-button disabled={!recoveryTurnId} onclick={submitRetry}>
             Try again
           </vscode-button>
         </div>
@@ -422,7 +470,7 @@
               continueMessage = (e.currentTarget as HTMLTextAreaElement).value;
             }}
           ></vscode-textarea>
-          <vscode-button disabled={!continueMessage.trim() || !activeTurnId} onclick={submitContinue}>
+          <vscode-button disabled={!continueMessage.trim()} onclick={submitContinue}>
             Continue
           </vscode-button>
         </div>

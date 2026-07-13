@@ -247,6 +247,7 @@
         model: model ?? undefined,
         continuationOf: tasks.continuationOf ?? undefined,
         createdAt: Date.now(),
+        keepDraft: true,
       });
       // DEBUG: temporary — remove after diagnosing grok→claude draft send.
       console.info('[muster][draft-send]', {
@@ -263,6 +264,7 @@
         content: displayText,
       });
       post(payload);
+      // Keep draft until sendAccepted; clear only on success (App restores on reject).
       draftText = '';
       mentionBindings = new Map();
       return;
@@ -296,9 +298,11 @@
         text: displayText,
         llmText: llmText !== displayText ? llmText : undefined,
         createdAt: Date.now(),
+        keepDraft: true,
       });
     }
     post(payload);
+    // Optimistic clear; sendRejected restores from outbox text.
     draftText = '';
     mentionBindings = new Map();
   }

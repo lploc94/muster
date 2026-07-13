@@ -12,6 +12,8 @@ export interface OutboxEntry {
   model?: string;
   continuationOf?: string;
   createdAt: number;
+  /** Restore composer draft on sendRejected. */
+  keepDraft?: boolean;
 }
 
 const OUTBOX_KEY = 'muster.sendOutbox.v1';

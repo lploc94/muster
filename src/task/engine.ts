@@ -2353,13 +2353,14 @@ export class TaskEngine {
           };
       mcpConfigPath = built.mcpConfigPath;
       // Phase C: mark prompt_outstanding immediately before side-effecting prompt.
+      // Abort the ACP boundary if the durable marker cannot be written.
       built.options = {
         ...built.options,
         onBeforePrompt: async () => {
-          this.store.commit((draft) => {
+          const commit = this.store.commit((draft) => {
             const t = draft.turns[turnId];
             if (!t || (t.status !== 'running' && t.status !== 'waiting_user')) {
-              return { ok: true };
+              return { ok: false, reason: 'turn is not live for prompt dispatch marker' };
             }
             if (t.dispatchPhase === 'prompt_outstanding' || t.dispatchPhase === 'terminal_received') {
               return { ok: true };
@@ -2367,6 +2368,11 @@ export class TaskEngine {
             draft.turns[turnId] = { ...t, dispatchPhase: 'prompt_outstanding' };
             return { ok: true };
           });
+          if (!commit.ok) {
+            throw new Error(
+              `failed to persist prompt_outstanding dispatch marker: ${commit.detail ?? commit.reason}`,
+            );
+          }
         },
       };
 
@@ -3012,7 +3018,17 @@ export class TaskEngine {
           (turn) => turn.retryOf === turnId && turn.status === 'queued',
         );
         if (retryTurnEntry) {
-          void this.scheduleTurn(retryTurnEntry.id);
+          // Bounded exponential backoff + jitter for safe auto-retries (Phase C).
+          const retryIndex = Math.max(1, retryCountOf(
+            Object.values(this.store.getFile().turns).filter((t) => t.taskId === retryTurnEntry.taskId),
+            turnId,
+          ));
+          const baseMs = Math.min(30_000, 250 * 2 ** Math.min(retryIndex - 1, 6));
+          const jitter = Math.floor(Math.random() * Math.min(500, baseMs));
+          const delayMs = baseMs + jitter;
+          setTimeout(() => {
+            void this.scheduleTurn(retryTurnEntry.id);
+          }, delayMs);
         }
         return true;
       }

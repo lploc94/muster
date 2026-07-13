@@ -628,7 +628,15 @@ export function retryTurn(
   if (oldTurn.status !== 'failed' && oldTurn.status !== 'interrupted') {
     return { ok: false, reason: 'retryTurn requires a failed or interrupted turn' };
   }
-  if (hasActiveOrQueuedTurn(turns)) {
+  // Safe auto-retry may coexist with held follow-ups; other retries still require a clear queue.
+  const blocking = turns.filter(
+    (turn) =>
+      turn.status === 'running' ||
+      turn.status === 'waiting_user' ||
+      (turn.status === 'queued' &&
+        !(options.reuseOriginalInputs && turn.holdAutoPromote === true)),
+  );
+  if (blocking.length > 0) {
     return { ok: false, reason: 'task already has an active or queued turn' };
   }
 
