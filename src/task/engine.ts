@@ -30,6 +30,7 @@ import {
   applySuccessfulTurn,
   createTask,
   interruptTurn,
+  registerAsk,
   retryCountOf,
   retryTurn,
   resolveChildWait,
@@ -507,6 +508,76 @@ export class TaskEngine {
     };
   }
 
+  /**
+   * Resolve a live turn for an ACP session id (observed on the live handle or
+   * persisted on the turn). Used to route agent-extension ask_user_question
+   * prompts back into the correct task/turn AskBridge registration.
+   */
+  findLiveTurnBySessionId(
+    sessionId: string,
+  ): { taskId: string; turnId: string } | undefined {
+    if (!sessionId) {
+      return undefined;
+    }
+    for (const [turnId, handle] of this.liveRuns) {
+      if (handle.sessionId === sessionId) {
+        return { taskId: handle.taskId, turnId };
+      }
+    }
+    const file = this.store.getFile();
+    for (const turn of Object.values(file.turns)) {
+      if (
+        (turn.status === 'running' || turn.status === 'waiting_user') &&
+        turn.observedSessionId === sessionId
+      ) {
+        return { taskId: turn.taskId, turnId: turn.id };
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Register an agent-extension ask (e.g. Grok x.ai/ask_user_question) against
+   * the live turn for `sessionId`, pause the turn as waiting_user, and return
+   * the AskBridge promise the host can await for webview answers.
+   */
+  registerAgentAsk(
+    sessionId: string,
+    questions: import('../bridge/ask-bridge').Question[],
+    deadlineMs: number,
+  ):
+    | { ok: true; ref: AskRef; promise: Promise<Answers> }
+    | { ok: false; reason: string } {
+    const live = this.findLiveTurnBySessionId(sessionId);
+    if (!live) {
+      return { ok: false, reason: 'no live turn for session' };
+    }
+    if (questions.length === 0) {
+      return { ok: false, reason: 'questions required' };
+    }
+    const askId = this.askBridge.generateAskId();
+    const ref: AskRef = { taskId: live.taskId, turnId: live.turnId, askId };
+    const commit = this.store.commit((draft) => {
+      const turn = draft.turns[ref.turnId];
+      if (!turn) return { ok: false, reason: 'turn not found' };
+      if (turn.status === 'waiting_user') {
+        return { ok: true };
+      }
+      if (turn.status !== 'running') {
+        return { ok: false, reason: 'turn is not live' };
+      }
+      const asked = registerAsk(turn);
+      if (!asked.ok) return asked;
+      draft.turns[ref.turnId] = asked.next;
+      return { ok: true };
+    });
+    if (!commit.ok) {
+      return { ok: false, reason: commit.detail ?? commit.reason };
+    }
+    const promise = this.askBridge.register(ref, questions, deadlineMs);
+    return { ok: true, ref, promise };
+  }
+
   submitAskAnswer(ref: AskRef, answers: Answers): EngineResult<void> {
     if (!this.askBridge.hasPending(ref)) {
       return { ok: false, reason: 'no matching pending ask' };
@@ -534,23 +605,23 @@ export class TaskEngine {
     if (!this.askBridge.hasPending(ref)) {
       return { ok: false, reason: 'no matching pending ask' };
     }
-    this.liveRuns.get(ref.turnId)?.controller.abort();
-    const now = nowIso(this.clock);
+    // Soft dismiss: resume the turn and reject the pending ask so MCP/agent
+    // paths can continue (cancelled), instead of hard-aborting the whole turn.
+    this.askBridge.cancel(ref, 'user dismissed ask');
     const commit = this.store.commit((draft) => {
       const turn = draft.turns[ref.turnId];
       if (!turn) return { ok: false, reason: 'turn not found' };
-      if (turn.status === 'running' || turn.status === 'waiting_user') {
-        const interrupted = interruptTurn(turn, { now });
-        if (!interrupted.ok) return interrupted;
-        draft.turns[ref.turnId] = interrupted.next;
-        holdQueuedFollowUpsOnFailure(draft, turn.taskId);
+      if (turn.status === 'waiting_user') {
+        const resumed = submitAnswer(turn);
+        if (resumed.ok) {
+          draft.turns[ref.turnId] = resumed.next;
+        }
       }
       return { ok: true };
     });
     if (!commit.ok) {
       return { ok: false, reason: commit.detail ?? commit.reason };
     }
-    this.askBridge.cancel(ref, 'turn cancelled');
     return { ok: true, value: undefined };
   }
 

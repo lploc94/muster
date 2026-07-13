@@ -633,7 +633,7 @@ Task-workspace composer keyboard and queue UX (product contract for multi-turn f
 | Input | Host message | Behavior |
 |-------|--------------|----------|
 | **Enter** (task focused) | `send` `{ taskId, text }` | Creates a **distinct** FIFO follow-up turn bound to that user message. Works while a turn is already running or other turns are queued. On terminal lifecycle, reopens the same task then queues. |
-| **Ctrl+Enter** / **Meta+Enter** (running) | `sendLiveInput` then maybe `send` | Prefer concurrent inject when the backend supports it. If inject cannot deliver, **silent delivery via `send`** (FIFO follow-up) — **never a red error banner**. Instruction uses agent-facing expanded mention text when present. |
+| **Ctrl+Enter** / **Meta+Enter** (running) | `sendLiveInput` then maybe `send` | **Always try** concurrent inject (policy B — do not wait for ACP capability advertise). If the agent rejects/fails the wire call, **silent delivery via `send`** (FIFO follow-up) — **never a red error banner**. Instruction uses agent-facing expanded mention text when present. |
 | **Ctrl+Enter** / **Meta+Enter** (idle) | `send` `{ taskId, text }` | Same as Enter — starts/continues a normal turn immediately (not inject). |
 | **Shift+Enter** | — | Inserts a newline; does not submit. |
 | IME composition / keyCode 229 | — | Suppresses submit. |

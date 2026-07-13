@@ -42,11 +42,99 @@ export interface PermissionController {
   ): Promise<{ allow: boolean; remember: boolean; timedOut?: boolean }>;
 }
 
+/**
+ * Normalized question shape for agent-extension ask_user_question prompts
+ * (e.g. Grok `x.ai/ask_user_question`). Host maps these onto the webview AskCard.
+ */
+export interface AgentQuestion {
+  prompt: string;
+  options?: string[];
+  allowFreeText?: boolean;
+  multiSelect?: boolean;
+}
+
+export interface QuestionPromptRequest {
+  sessionId: string;
+  questions: AgentQuestion[];
+}
+
+/**
+ * Result returned to the ACP agent for ask_user_question.
+ * Grok expects an internally-tagged enum on `outcome` (accepted | cancelled).
+ */
+export interface QuestionPromptResult {
+  outcome: 'accepted' | 'cancelled';
+  /** question text → chosen label (multi-select labels joined with ", ") */
+  answers?: Record<string, string>;
+  annotations?: Record<string, { notes?: string; preview?: string }>;
+}
+
+/**
+ * Host-side controller for agent-extension user questions. Injected via
+ * {@link setQuestionController}. When absent, ask_user_question is cancelled.
+ */
+export interface QuestionController {
+  prompt(req: QuestionPromptRequest): Promise<QuestionPromptResult>;
+}
+
 let permissionController: PermissionController | null = null;
+let questionController: QuestionController | null = null;
 
 /** Inject (or clear) the global permission controller for the ACP gate. */
 export function setPermissionController(controller: PermissionController | null): void {
   permissionController = controller;
+}
+
+/** Inject (or clear) the global question controller for agent ask_user_question. */
+export function setQuestionController(controller: QuestionController | null): void {
+  questionController = controller;
+}
+
+/** Normalize Grok/ACP ask_user_question items into the webview Question shape. */
+export function normalizeAgentQuestions(raw: unknown): AgentQuestion[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const out: AgentQuestion[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') {
+      continue;
+    }
+    const rec = entry as Record<string, unknown>;
+    const prompt =
+      typeof rec.question === 'string'
+        ? rec.question
+        : typeof rec.prompt === 'string'
+          ? rec.prompt
+          : '';
+    if (!prompt) {
+      continue;
+    }
+    let options: string[] | undefined;
+    if (Array.isArray(rec.options)) {
+      options = rec.options
+        .map((opt) => {
+          if (typeof opt === 'string') return opt;
+          if (opt && typeof opt === 'object') {
+            const label = (opt as { label?: unknown }).label;
+            if (typeof label === 'string') return label;
+          }
+          return null;
+        })
+        .filter((label): label is string => typeof label === 'string' && label.length > 0);
+      if (options.length === 0) {
+        options = undefined;
+      }
+    }
+    const multiSelect = rec.multiSelect === true;
+    out.push({
+      prompt,
+      options,
+      allowFreeText: !options?.length,
+      multiSelect,
+    });
+  }
+  return out;
 }
 
 type Pending = {
@@ -97,8 +185,8 @@ export interface AcpInitializeResult {
 }
 
 /**
- * Derive honest live-input capability evidence from an ACP `initialize` result.
- * Support is true only when the agent explicitly advertises it.
+ * Derive live-input capability evidence from an ACP `initialize` result.
+ * Used for diagnostics only — policy B always attempts inject regardless.
  */
 export function deriveLiveInputSupport(init: AcpInitializeResult | null | undefined): boolean {
   const caps = init?.agentCapabilities;
@@ -474,8 +562,10 @@ export class AcpClient {
   private authenticated = false;
   loadSessionSupported = false;
   /**
-   * True only after `initialize` advertises live-input capability evidence.
-   * Callers must not claim support when this is false.
+   * True when `initialize` advertised live-input capability evidence.
+   * Advisory only — Muster always *attempts* mid-turn inject (policy B);
+   * failures fall back to ordinary send at the host. This flag remains for
+   * diagnostics / future UI "inject vs queue" hints.
    */
   liveInputSupported = false;
   /**
@@ -591,11 +681,15 @@ export class AcpClient {
 
   /**
    * Deliver an instruction to a live session while its primary prompt is pending.
-   * Honest refusals:
-   * - `unsupported` when initialize never advertised live-input capability
+   *
+   * Policy B (always-try): do **not** refuse solely because initialize omitted
+   * liveInput capability. Always attempt concurrent `session/prompt` when a
+   * primary prompt is in flight. Host maps non-delivered results to silent send.
+   *
+   * Refusals that still apply before wire send:
    * - `no-active-turn` when no prompt is in flight for the session
    * - `cancelled` when the caller signal is already aborted
-   * - `rejected` on agent/transport errors or malformed responses
+   * - `rejected` on connect/agent/transport errors or malformed responses
    *
    * Does not create queue state; only talks to the exact session over ACP.
    */
@@ -621,12 +715,8 @@ export class AcpClient {
       };
     }
 
-    if (!this.liveInputSupported) {
-      return {
-        code: 'unsupported',
-        reason: `${this.config.label} agent does not advertise live-input capability`,
-      };
-    }
+    // Capability advertisement is advisory only (policy B). Always attempt
+    // inject when a primary prompt is in flight.
 
     if (!this.hasActivePrompt(sessionId)) {
       return {
@@ -682,8 +772,8 @@ export class AcpClient {
     instruction: string,
     signal?: AbortSignal,
   ): Promise<unknown | 'cancelled'> {
-    // Concurrent session/prompt is the proven in-flight wire shape when the
-    // agent advertised liveInput capability during initialize.
+    // Concurrent session/prompt while a primary prompt is pending (policy B:
+    // always attempt; host falls back to send if the agent rejects).
     const { id, promise } = this.sendRequest(LIVE_INPUT_METHOD, {
       sessionId,
       prompt: [{ type: 'text', text: instruction }],
@@ -957,6 +1047,11 @@ export class AcpClient {
         return;
       }
 
+      if (method === 'x.ai/ask_user_question' || method === '_x.ai/ask_user_question') {
+        await this.handleAskUserQuestion(id, params);
+        return;
+      }
+
       if (method.startsWith('fs/') || method.startsWith('terminal/')) {
         this.respondError(id, -32601, 'Client capability not supported');
         return;
@@ -975,6 +1070,36 @@ export class AcpClient {
     } catch (err) {
       this.respondError(id, -32603, (err as Error).message || 'Internal error');
     }
+  }
+
+  /**
+   * Grok (and compatible agents) send `x.ai/ask_user_question` as a server→client
+   * request. Response is an internally-tagged enum on `outcome` (accepted|cancelled).
+   * Without a host controller, cancel so the agent does not hang on a bare `{}`.
+   */
+  private async handleAskUserQuestion(
+    id: number | string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const sessionId = typeof params.sessionId === 'string' ? params.sessionId : '';
+    const questions = normalizeAgentQuestions(params.questions);
+    const controller = questionController;
+
+    if (!controller || questions.length === 0) {
+      this.respondOk(id, { outcome: 'cancelled' });
+      return;
+    }
+
+    const result = await controller.prompt({ sessionId, questions });
+    if (result.outcome === 'accepted') {
+      this.respondOk(id, {
+        outcome: 'accepted',
+        answers: result.answers ?? {},
+        annotations: result.annotations ?? {},
+      });
+      return;
+    }
+    this.respondOk(id, { outcome: 'cancelled' });
   }
 
   /**

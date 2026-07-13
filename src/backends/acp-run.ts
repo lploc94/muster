@@ -69,7 +69,8 @@ export const ACP_CAPABILITIES: BackendCapabilities = {
   supportsReasoning: true,
   supportsDetailedToolEvents: true,
   supportsMCP: true,
-  // Static advertisement only — runtime still requires agent initialize evidence.
+  // All ACP adapters expose sendLiveInput; policy B always attempts the wire
+  // call when a prompt is in flight (capability advertise is advisory only).
   supportsLiveInput: true,
 };
 

@@ -6,8 +6,12 @@ import type { PermissionRequest } from './bridge/permission-bridge';
 import { CredentialRegistry } from './bridge/credentials';
 import { MusterBridgeServer } from './bridge/server';
 import { makeBackend } from './backends/index';
-import { disposeSharedAcpClient, setPermissionController } from './backends/acp-client';
-import type { PermissionController } from './backends/acp-client';
+import {
+  disposeSharedAcpClient,
+  setPermissionController,
+  setQuestionController,
+} from './backends/acp-client';
+import type { PermissionController, QuestionController } from './backends/acp-client';
 import type { PermissionAuditEntry, PermissionMode } from './backends/permission-policy';
 import {
   buildSnapshot,
@@ -1255,10 +1259,13 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
               this.postCommandError('turn does not belong to task', data.taskId);
               break;
             }
-            taskEngine?.submitAskAnswer(
+            const result = taskEngine?.submitAskAnswer(
               { taskId: data.taskId, turnId: data.turnId, askId: data.askId },
               data.answers,
             );
+            if (result && !result.ok) {
+              this.postCommandError(result.reason, data.taskId);
+            }
           } else {
             this.postCommandError('invalid ask answer payload');
           }
@@ -1269,11 +1276,14 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             typeof data.turnId === 'string' &&
             typeof data.askId === 'string'
           ) {
-            taskEngine?.cancelAskTurn({
+            const result = taskEngine?.cancelAskTurn({
               taskId: data.taskId,
               turnId: data.turnId,
               askId: data.askId,
             });
+            if (result && !result.ok) {
+              this.postCommandError(result.reason, data.taskId);
+            }
           }
           break;
         case 'submitPermission': {
@@ -1542,6 +1552,40 @@ export async function activate(context: vscode.ExtensionContext) {
     };
     setPermissionController(permissionController);
 
+    // Grok (and similar) ask_user_question over ACP → webview AskCard.
+    const questionController: QuestionController = {
+      prompt: async (req) => {
+        const engine = taskEngine;
+        if (!engine) {
+          return { outcome: 'cancelled' };
+        }
+        const registered = engine.registerAgentAsk(req.sessionId, req.questions, 120_000);
+        if (!registered.ok) {
+          return { outcome: 'cancelled' };
+        }
+        try {
+          const answers = await registered.promise;
+          const keyed: Record<string, string> = {};
+          req.questions.forEach((q, i) => {
+            const entry = answers[String(i)];
+            const selected = entry?.selected ?? [];
+            const free = entry?.freeText?.trim();
+            const value =
+              selected.length > 0 ? selected.join(', ') : free && free.length > 0 ? free : '';
+            keyed[q.prompt] = value;
+          });
+          const allEmpty = Object.values(keyed).every((v) => v.length === 0);
+          if (allEmpty) {
+            return { outcome: 'cancelled' };
+          }
+          return { outcome: 'accepted', answers: keyed, annotations: {} };
+        } catch {
+          return { outcome: 'cancelled' };
+        }
+      },
+    };
+    setQuestionController(questionController);
+
     credentialRegistry = new CredentialRegistry();
     const engineToolHandler = {
       handleToolCall: async (
@@ -1619,6 +1663,7 @@ export async function activate(context: vscode.ExtensionContext) {
         void bridgeServer?.close();
         askBridge?.cancelAll('deactivate');
         setPermissionController(null);
+        setQuestionController(null);
         permissionBridge?.cancelAll();
         credentialRegistry?.revokeAll();
       },
@@ -1627,6 +1672,7 @@ export async function activate(context: vscode.ExtensionContext) {
     void bridgeServer?.close();
     askBridge?.cancelAll('init failed');
     setPermissionController(null);
+    setQuestionController(null);
     permissionBridge?.cancelAll();
     credentialRegistry?.revokeAll();
     bridgeServer = undefined;
@@ -1645,6 +1691,7 @@ export function deactivate() {
   presentationManager = undefined;
   askBridge?.cancelAll('deactivate');
   setPermissionController(null);
+  setQuestionController(null);
   permissionBridge?.cancelAll();
   credentialRegistry?.revokeAll();
   void bridgeServer?.close();

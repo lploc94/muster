@@ -42,7 +42,11 @@
     answers = { ...answers };
   }
 
+  let submitting = $state(false);
+
   function submit(): void {
+    if (submitting) return;
+    submitting = true;
     const payload: Record<string, AskAnswer> = {};
     for (let i = 0; i < questions.length; i++) {
       payload[String(i)] = readAnswer(i);
@@ -51,6 +55,8 @@
   }
 
   function cancel(): void {
+    if (submitting) return;
+    submitting = true;
     post({ type: 'cancelAsk', taskId, turnId, askId });
   }
 </script>
@@ -68,8 +74,14 @@
       {#if q.options && q.options.length > 0}
         <vscode-radio-group
           onchange={(e: Event) => {
-            const val = (e.target as HTMLElement & { value?: string })?.value;
-            if (typeof val === 'string') selectOption(i, val);
+            const target = e.target as HTMLElement & { value?: string; checked?: boolean };
+            const val =
+              typeof target?.value === 'string' && target.value.length > 0
+                ? target.value
+                : (e.currentTarget as HTMLElement)
+                    ?.querySelector?.('vscode-radio[checked]')
+                    ?.getAttribute?.('value') ?? undefined;
+            if (typeof val === 'string' && val.length > 0) selectOption(i, val);
           }}
         >
           {#each q.options as option (option)}
@@ -94,7 +106,7 @@
   {/each}
 
   <div class="flex gap-2 justify-end">
-    <vscode-button secondary onclick={cancel}>Dismiss</vscode-button>
-    <vscode-button onclick={submit}>Submit</vscode-button>
+    <vscode-button secondary disabled={submitting} onclick={cancel}>Dismiss</vscode-button>
+    <vscode-button disabled={submitting} onclick={submit}>Submit</vscode-button>
   </div>
 </div>

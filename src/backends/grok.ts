@@ -33,9 +33,8 @@ export const GROK_AGENT_CONFIG: AcpAgentConfig = {
     return { methodId, meta: { headless: true } };
   },
   extensionRequestHandler: (method) => {
-    if (method === 'x.ai/ask_user_question' || method === '_x.ai/ask_user_question') {
-      return { result: { outcome: 'cancelled' } };
-    }
+    // ask_user_question is handled asynchronously by AcpClient + QuestionController
+    // (see handleAskUserQuestion). Only stub exit_plan_mode here.
     if (method === 'x.ai/exit_plan_mode' || method === '_x.ai/exit_plan_mode') {
       return { result: { outcome: 'approved' } };
     }

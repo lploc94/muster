@@ -5,6 +5,7 @@ import {
   deriveLiveInputSupport,
   killProcessTree,
   LIVE_INPUT_METHOD,
+  normalizeAgentQuestions,
   terminateProcessTree,
   type KillableProcess,
   type PromptResult,
@@ -196,10 +197,10 @@ describe('LIVE_INPUT_METHOD', () => {
 });
 
 describe('AcpClient.sendLiveInput contract', () => {
-  it('refuses with unsupported when capability evidence is absent (no wire send)', async () => {
+  it('policy B: attempts wire send even when capability evidence is absent', async () => {
     const { AcpClient } = await import('./acp-client');
     const client = new AcpClient({
-      key: 'live-input-test-unsupported',
+      key: 'live-input-test-always-try',
       label: 'TestAgent',
       command: 'false',
       args: [],
@@ -207,7 +208,10 @@ describe('AcpClient.sendLiveInput contract', () => {
     // Simulate a connected client that never advertised live input.
     (client as unknown as { liveInputSupported: boolean }).liveInputSupported = false;
     (client as unknown as { ensureConnected: () => Promise<void> }).ensureConnected = async () => {};
-    const sendRequest = vi.fn();
+    const sendRequest = vi.fn(() => ({
+      id: 1,
+      promise: Promise.resolve({}),
+    }));
     (client as unknown as { sendRequest: typeof sendRequest }).sendRequest = sendRequest;
     (client as unknown as { hasActivePrompt: (s: string) => boolean }).hasActivePrompt = () => true;
 
@@ -216,11 +220,8 @@ describe('AcpClient.sendLiveInput contract', () => {
       instruction: 'steer left',
     });
 
-    expect(result).toEqual({
-      code: 'unsupported',
-      reason: 'TestAgent agent does not advertise live-input capability',
-    });
-    expect(sendRequest).not.toHaveBeenCalled();
+    expect(result).toEqual({ code: 'delivered', sessionId: 'sess-1' });
+    expect(sendRequest).toHaveBeenCalledTimes(1);
     client.dispose();
   });
 
@@ -408,5 +409,43 @@ describe('terminateProcessTree', () => {
     terminateProcessTree(proc, 50, kill);
 
     expect(kill).not.toHaveBeenCalled();
+  });
+});
+
+describe('normalizeAgentQuestions', () => {
+  it('maps Grok question/options{label} into prompt/options strings', () => {
+    expect(
+      normalizeAgentQuestions([
+        {
+          question: 'Pick one?',
+          options: [{ label: 'A', description: 'alpha' }, { label: 'B' }],
+          multiSelect: false,
+        },
+      ]),
+    ).toEqual([
+      {
+        prompt: 'Pick one?',
+        options: ['A', 'B'],
+        allowFreeText: false,
+        multiSelect: false,
+      },
+    ]);
+  });
+
+  it('accepts prompt + string options (muster_bridge shape)', () => {
+    expect(
+      normalizeAgentQuestions([{ prompt: 'Freeform?', options: ['yes', 'no'], multiSelect: true }]),
+    ).toEqual([
+      {
+        prompt: 'Freeform?',
+        options: ['yes', 'no'],
+        allowFreeText: false,
+        multiSelect: true,
+      },
+    ]);
+  });
+
+  it('drops empty / non-object entries', () => {
+    expect(normalizeAgentQuestions([null, {}, { question: '' }, 'x'])).toEqual([]);
   });
 });

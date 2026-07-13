@@ -443,13 +443,13 @@ describe('GROK_AGENT_CONFIG.resolveAuth (drift: throws when unresolved)', () => 
 });
 
 describe('GROK_AGENT_CONFIG.extensionRequestHandler (grok-only)', () => {
-  it('cancels ask_user_question for both namespaced forms', () => {
-    expect(GROK_AGENT_CONFIG.extensionRequestHandler!('x.ai/ask_user_question', {} as never)).toEqual({
-      result: { outcome: 'cancelled' },
-    });
-    expect(GROK_AGENT_CONFIG.extensionRequestHandler!('_x.ai/ask_user_question', {} as never)).toEqual({
-      result: { outcome: 'cancelled' },
-    });
+  it('leaves ask_user_question to AcpClient QuestionController (no sync stub)', () => {
+    expect(
+      GROK_AGENT_CONFIG.extensionRequestHandler!('x.ai/ask_user_question', {} as never),
+    ).toBeUndefined();
+    expect(
+      GROK_AGENT_CONFIG.extensionRequestHandler!('_x.ai/ask_user_question', {} as never),
+    ).toBeUndefined();
   });
 
   it('approves exit_plan_mode for both namespaced forms', () => {

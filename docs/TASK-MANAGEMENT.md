@@ -957,7 +957,7 @@ both constrain behavior:
 | Operator action | Engine / host API | Notes |
 |-----------------|-------------------|-------|
 | Enter / Send | `send` | FIFO follow-up turn; composer stays editable while running/queued |
-| Ctrl+Enter while running | `sendLiveInput` then maybe `send` | Prefer concurrent inject when capability evidence exists; if inject cannot deliver, **silent `send`** (FIFO) without `commandError` |
+| Ctrl+Enter while running | `sendLiveInput` then maybe `send` | **Always try** concurrent inject (no advertise gate); if inject cannot deliver, **silent `send`** (FIFO) without `commandError` |
 | Ctrl+Enter while idle | `send` | Immediate normal turn (same as Enter); not inject |
 | Edit pending queue item | `editQueuedTurn` | Only while `turnId` remains in the live `queuedTurns` projection; clears stale `agentContent` |
 | Delete pending queue item | `deleteQueuedTurn` | Undispatched only; never cancels a running turn |
