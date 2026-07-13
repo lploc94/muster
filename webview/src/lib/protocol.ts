@@ -62,6 +62,8 @@ export interface TaskSummary {
   hasOutcomeProposal?: boolean;
   updatedAt: string;
   backend: string;
+  /** Optional model id selected for this task (ACP session config option value). */
+  model?: string;
   continuationOf?: string;
 }
 
@@ -191,6 +193,26 @@ export type ExtMessage =
   | { type: 'askPending'; taskId: string; turnId: string; askId: string; questions: Question[] }
   | { type: 'askCleared'; taskId: string; turnId: string; askId: string }
   | {
+      type: 'elicitationFormPending';
+      promptId: string;
+      sessionId?: string;
+      toolCallId?: string;
+      message: string;
+      fields: Array<Record<string, unknown>>;
+      required: string[];
+      askLike?: boolean;
+    }
+  | {
+      type: 'elicitationUrlPending';
+      promptId: string;
+      elicitationId: string;
+      sessionId?: string;
+      url: string;
+      message: string;
+    }
+  | { type: 'elicitationUrlWaiting'; promptId: string; elicitationId: string; message?: string }
+  | { type: 'elicitationCleared'; promptId: string }
+  | {
       type: 'permissionPending';
       sessionId: string;
       permissionId: string;
@@ -210,7 +232,13 @@ export type ExtMessage =
   /** `path` = resolve target for LLM; optional `displayName` = short chip label. */
   | { type: 'filePicked'; path: string; displayName?: string }
   | { type: 'backendsAvailable'; backends: string[] }
-  | { type: 'modelsAvailable'; models: Record<string, BackendModels> };
+  | { type: 'modelsAvailable'; models: Record<string, BackendModels> }
+  /**
+   * Host-persisted last-used composer backend/model (globalState). Sent on
+   * webview mount so the picker survives restarts — webview `setState` alone
+   * is not durable enough when the view is recreated.
+   */
+  | { type: 'composerSelection'; backend: string; model: string | null };
 
 export type AskAnswer = { selected: string[]; freeText: string | null };
 
@@ -233,6 +261,12 @@ export type OutMessage =
   | { type: 'cancelTurn'; taskId: string; turnId: string }
   | { type: 'submitAsk'; taskId: string; turnId: string; askId: string; answers: Record<string, AskAnswer> }
   | { type: 'cancelAsk'; taskId: string; turnId: string; askId: string }
+  | {
+      type: 'submitElicitation';
+      promptId: string;
+      action: 'accept' | 'decline' | 'cancel';
+      content?: Record<string, unknown>;
+    }
   | { type: 'submitPermission'; permissionId: string; optionId: string; remember: boolean }
   | { type: 'cancelPermission'; permissionId: string }
   | { type: 'retryTurn'; taskId: string; turnId: string; instruction: string }
@@ -275,6 +309,11 @@ export type OutMessage =
   | { type: 'updateSetting'; settingId: RetentionSettingId; value: number }
   | { type: 'listBackends' }
   | { type: 'listModels' }
+  /**
+   * Persist the composer's last-used backend/model on the host (globalState)
+   * so the preference survives full restarts and webview recreation.
+   */
+  | { type: 'setComposerSelection'; backend: string; model?: string | null }
   /** User sets task lifecycle (not CLI-driven). */
   | {
       type: 'setTaskLifecycle';
@@ -377,7 +416,8 @@ function isTaskSummary(v: unknown): v is TaskSummary {
     isString(v.lifecycle) &&
     isString(v.viewStatus) &&
     isString(v.updatedAt) &&
-    isString(v.backend)
+    isString(v.backend) &&
+    (v.model === undefined || isString(v.model))
   );
 }
 
@@ -525,6 +565,28 @@ export function isExtMessage(data: unknown): data is ExtMessage {
     case 'askCleared':
       return isString(data.askId);
 
+    case 'elicitationFormPending':
+      return (
+        isString(data.promptId) &&
+        isString(data.message) &&
+        Array.isArray(data.fields) &&
+        Array.isArray(data.required)
+      );
+
+    case 'elicitationUrlPending':
+      return (
+        isString(data.promptId) &&
+        isString(data.elicitationId) &&
+        isString(data.url) &&
+        isString(data.message)
+      );
+
+    case 'elicitationUrlWaiting':
+      return isString(data.promptId) && isString(data.elicitationId);
+
+    case 'elicitationCleared':
+      return isString(data.promptId);
+
     case 'permissionPending':
       return (
         isString(data.sessionId) &&
@@ -558,6 +620,13 @@ export function isExtMessage(data: unknown): data is ExtMessage {
 
     case 'modelsAvailable':
       return typeof data.models === 'object' && data.models !== null;
+
+    case 'composerSelection':
+      return (
+        hasOnlyKeys(data, ['type', 'backend', 'model']) &&
+        isString(data.backend) &&
+        (data.model === null || isString(data.model))
+      );
 
     default:
       return false;

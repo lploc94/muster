@@ -424,3 +424,31 @@ describe('settings outbound protocol', () => {
     });
   });
 });
+
+describe('composer selection protocol', () => {
+  it('accepts host composerSelection messages', () => {
+    expect(
+      isExtMessage({ type: 'composerSelection', backend: 'grok', model: 'grok-4' }),
+    ).toBe(true);
+    expect(isExtMessage({ type: 'composerSelection', backend: 'claude', model: null })).toBe(true);
+  });
+
+  it('rejects malformed composerSelection messages', () => {
+    expect(isExtMessage({ type: 'composerSelection', backend: 'grok' })).toBe(false);
+    expect(isExtMessage({ type: 'composerSelection', backend: 1, model: null })).toBe(false);
+    expect(
+      isExtMessage({ type: 'composerSelection', backend: 'grok', model: null, extra: true }),
+    ).toBe(false);
+  });
+
+  it('posts setComposerSelection to the host', () => {
+    vi.mocked(vscode.postMessage).mockClear();
+    const message: OutMessage = { type: 'setComposerSelection', backend: 'grok', model: 'm1' };
+    post(message);
+    expect(vscode.postMessage).toHaveBeenCalledWith({
+      type: 'setComposerSelection',
+      backend: 'grok',
+      model: 'm1',
+    });
+  });
+});

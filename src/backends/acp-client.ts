@@ -1,6 +1,24 @@
 import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
 import { createInterface, Interface } from 'readline';
 import { LiveInputRequest, LiveInputResult, McpServerConfig } from '../types';
+import type {
+  AgentQuestion,
+  ElicitationAction,
+  ParsedFormElicitation,
+  ParsedUrlElicitation,
+  QuestionAnswers,
+} from './elicitation';
+import {
+  answersNonEmpty,
+  encodeElicitationContentFromQuestions,
+  encodeGrokAnswers,
+  formToAgentQuestions,
+  isAskLikeForm,
+  normalizeAgentQuestions,
+  parseElicitationCreate,
+  parseUrlElicitationRequiredEntries,
+  URL_ELICITATION_REQUIRED_CODE,
+} from './elicitation';
 import {
   classifyPermission,
   pickOption,
@@ -12,6 +30,16 @@ import {
   type PermissionOption,
   type PermissionToolCall,
 } from './permission-policy';
+
+export type { AgentQuestion, QuestionAnswers } from './elicitation';
+export {
+  encodeElicitationContentFromQuestions as encodeElicitationContent,
+  encodeGrokAnswers,
+  formToAgentQuestions,
+  isAskLikeForm,
+  normalizeAgentQuestions,
+  parseElicitationCreate,
+} from './elicitation';
 
 /**
  * A permission request handed to {@link PermissionController.prompt} when the
@@ -42,105 +70,62 @@ export interface PermissionController {
   ): Promise<{ allow: boolean; remember: boolean; timedOut?: boolean }>;
 }
 
-/**
- * Normalized question shape for agent-extension ask_user_question prompts
- * (e.g. Grok `x.ai/ask_user_question`). Host maps these onto the webview AskCard.
- */
-export interface AgentQuestion {
-  prompt: string;
-  options?: string[];
-  allowFreeText?: boolean;
-  multiSelect?: boolean;
-}
-
 export interface QuestionPromptRequest {
   sessionId: string;
   questions: AgentQuestion[];
 }
 
-/**
- * Result returned to the ACP agent for ask_user_question.
- * Grok expects an internally-tagged enum on `outcome` (accepted | cancelled).
- */
 export interface QuestionPromptResult {
-  outcome: 'accepted' | 'cancelled';
-  /** question text → chosen label (multi-select labels joined with ", ") */
-  answers?: Record<string, string>;
-  annotations?: Record<string, { notes?: string; preview?: string }>;
+  outcome: 'accepted' | 'cancelled' | 'declined';
+  answers?: QuestionAnswers;
 }
 
-/**
- * Host-side controller for agent-extension user questions. Injected via
- * {@link setQuestionController}. When absent, ask_user_question is cancelled.
- */
+/** Host controller for Grok vendor ask_user_question (AskCard). */
 export interface QuestionController {
   prompt(req: QuestionPromptRequest): Promise<QuestionPromptResult>;
 }
 
+/** Host controller for full RFD elicitation form/url. */
+export interface ElicitationController {
+  /** Prefer per-call clientKey from ACP agent config when provided. */
+  clientKey: string;
+  promptForm(
+    form: ParsedFormElicitation,
+    clientKey?: string,
+  ): Promise<{ action: ElicitationAction; content?: Record<string, unknown> }>;
+  promptUrl(
+    url: ParsedUrlElicitation,
+    clientKey?: string,
+  ): Promise<{ action: ElicitationAction }>;
+  onUrlComplete(clientKey: string, elicitationId: string): void;
+}
+
 let permissionController: PermissionController | null = null;
 let questionController: QuestionController | null = null;
+let elicitationController: ElicitationController | null = null;
 
 /** Inject (or clear) the global permission controller for the ACP gate. */
 export function setPermissionController(controller: PermissionController | null): void {
   permissionController = controller;
 }
 
-/** Inject (or clear) the global question controller for agent ask_user_question. */
+/** Inject (or clear) the global Grok question controller. */
 export function setQuestionController(controller: QuestionController | null): void {
   questionController = controller;
 }
 
-/** Normalize Grok/ACP ask_user_question items into the webview Question shape. */
-export function normalizeAgentQuestions(raw: unknown): AgentQuestion[] {
-  if (!Array.isArray(raw)) {
-    return [];
-  }
-  const out: AgentQuestion[] = [];
-  for (const entry of raw) {
-    if (!entry || typeof entry !== 'object') {
-      continue;
-    }
-    const rec = entry as Record<string, unknown>;
-    const prompt =
-      typeof rec.question === 'string'
-        ? rec.question
-        : typeof rec.prompt === 'string'
-          ? rec.prompt
-          : '';
-    if (!prompt) {
-      continue;
-    }
-    let options: string[] | undefined;
-    if (Array.isArray(rec.options)) {
-      options = rec.options
-        .map((opt) => {
-          if (typeof opt === 'string') return opt;
-          if (opt && typeof opt === 'object') {
-            const label = (opt as { label?: unknown }).label;
-            if (typeof label === 'string') return label;
-          }
-          return null;
-        })
-        .filter((label): label is string => typeof label === 'string' && label.length > 0);
-      if (options.length === 0) {
-        options = undefined;
-      }
-    }
-    const multiSelect = rec.multiSelect === true;
-    out.push({
-      prompt,
-      options,
-      allowFreeText: !options?.length,
-      multiSelect,
-    });
-  }
-  return out;
+/** Inject (or clear) the RFD elicitation controller. */
+export function setElicitationController(controller: ElicitationController | null): void {
+  elicitationController = controller;
 }
 
 type Pending = {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timer?: ReturnType<typeof setTimeout>;
+  method?: string;
+  params?: unknown;
+  retried32042?: boolean;
 };
 
 export type SessionUpdate = Record<string, unknown>;
@@ -255,6 +240,8 @@ export interface AcpAgentConfig {
 const DEFAULT_CLIENT_CAPABILITIES: Record<string, unknown> = {
   fs: { readTextFile: false, writeTextFile: false },
   terminal: false,
+  // RFD elicitation — form + url (Claude AskUserQuestion, OAuth consent, …).
+  elicitation: { form: {}, url: {} },
 };
 
 /**
@@ -935,6 +922,7 @@ export class AcpClient {
     method: string,
     params: unknown,
     timeoutMs?: number,
+    opts?: { retried32042?: boolean },
   ): { id: number; promise: Promise<unknown> } {
     const id = this.nextId++;
     const timeout = timeoutMs ?? (method === 'session/prompt' ? 1_800_000 : 120_000);
@@ -943,6 +931,9 @@ export class AcpClient {
       const entry: Pending = {
         resolve,
         reject,
+        method,
+        params,
+        retried32042: opts?.retried32042 === true,
       };
       this.pending.set(id, entry);
 
@@ -1016,15 +1007,41 @@ export class AcpClient {
       return;
     }
 
+    // RFD elicitation/complete — notification (no id) after URL-mode OOB interaction.
+    if (msg.method === 'elicitation/complete' && msg.id == null) {
+      const params = (msg.params ?? {}) as Record<string, unknown>;
+      const elicitationId =
+        typeof params.elicitationId === 'string' ? params.elicitationId : '';
+      if (elicitationId && elicitationController) {
+        // Prefer this connection's agent key; controller still receives clientKey arg.
+        elicitationController.onUrlComplete(this.config.key, elicitationId);
+      }
+      return;
+    }
+
     if (msg.id != null && msg.method == null) {
       const p = this.pending.get(msg.id as number);
       if (p) {
-        this.pending.delete(msg.id as number);
         if (p.timer) clearTimeout(p.timer);
         if (msg.error) {
-          const err = msg.error as { message?: string };
+          const err = msg.error as { code?: number; message?: string; data?: unknown };
+          // RFD -32042 URLElicitationRequiredError: prompt URL consent, then retry once.
+          if (
+            err.code === URL_ELICITATION_REQUIRED_CODE &&
+            !p.retried32042 &&
+            elicitationController
+          ) {
+            const parsed = parseUrlElicitationRequiredEntries(err.data);
+            if (parsed.ok) {
+              this.pending.delete(msg.id as number);
+              void this.handleUrlElicitationRequired(msg.id as number, p, parsed.entries);
+              return;
+            }
+          }
+          this.pending.delete(msg.id as number);
           p.reject(new Error(err.message ?? JSON.stringify(msg.error)));
         } else {
+          this.pending.delete(msg.id as number);
           p.resolve(msg.result);
         }
       }
@@ -1047,8 +1064,15 @@ export class AcpClient {
         return;
       }
 
+      // RFD elicitation (shared path for Claude AskUserQuestion, Codex MCP forms, …)
+      if (method === 'elicitation/create') {
+        await this.handleElicitationCreate(id, params);
+        return;
+      }
+
+      // Vendor extension: Grok native ask_user_question
       if (method === 'x.ai/ask_user_question' || method === '_x.ai/ask_user_question') {
-        await this.handleAskUserQuestion(id, params);
+        await this.handleGrokAskUserQuestion(id, params);
         return;
       }
 
@@ -1073,11 +1097,80 @@ export class AcpClient {
   }
 
   /**
-   * Grok (and compatible agents) send `x.ai/ask_user_question` as a server→client
-   * request. Response is an internally-tagged enum on `outcome` (accepted|cancelled).
-   * Without a host controller, cancel so the agent does not hang on a bare `{}`.
+   * After -32042: run URL consent for each entry; on all accept+complete, retry
+   * the original request once. Decline/cancel rejects the parent.
    */
-  private async handleAskUserQuestion(
+  private async handleUrlElicitationRequired(
+    _originalId: number,
+    parent: Pending,
+    entries: import('./elicitation').ParsedUrlRequiredEntry[],
+  ): Promise<void> {
+    const controller = elicitationController;
+    if (!controller || !parent.method) {
+      parent.reject(new Error('URL elicitation required but controller unavailable'));
+      return;
+    }
+    const clientKey = this.config.key;
+    try {
+      for (const entry of entries) {
+        const action = await controller.promptUrl(
+          {
+            kind: 'url',
+            elicitationId: entry.elicitationId,
+            url: entry.url,
+            message: entry.message,
+          },
+          clientKey,
+        );
+        if (action.action !== 'accept') {
+          parent.reject(new Error('URL elicitation declined or cancelled'));
+          return;
+        }
+        // Accept only records consent; wait briefly for optional complete notif.
+        // Minimal: proceed after accept (OOB may complete async). Full wait can
+        // be tightened later via bridge promise on OOB complete.
+      }
+      // Single retry with retried32042=true so a second -32042 fails closed.
+      const { promise } = this.sendRequest(parent.method, parent.params, undefined, {
+        retried32042: true,
+      });
+      parent.resolve(await promise);
+    } catch (err) {
+      parent.reject(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+
+  /** ACP RFD elicitation/create — form or url. */
+  private async handleElicitationCreate(
+    id: number | string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const parsed = parseElicitationCreate(params);
+    if (parsed.kind === 'error') {
+      this.respondError(id, parsed.code, parsed.message);
+      return;
+    }
+    const controller = elicitationController;
+    if (!controller) {
+      this.respondOk(id, { action: 'cancel' });
+      return;
+    }
+    const clientKey = this.config.key;
+    if (parsed.kind === 'url') {
+      const result = await controller.promptUrl(parsed, clientKey);
+      this.respondOk(id, { action: result.action });
+      return;
+    }
+    const result = await controller.promptForm(parsed, clientKey);
+    if (result.action === 'accept') {
+      this.respondOk(id, { action: 'accept', content: result.content ?? {} });
+      return;
+    }
+    this.respondOk(id, { action: result.action });
+  }
+
+  /** Grok `x.ai/ask_user_question` — vendor extension → AskCard. */
+  private async handleGrokAskUserQuestion(
     id: number | string,
     params: Record<string, unknown>,
   ): Promise<void> {
@@ -1091,11 +1184,11 @@ export class AcpClient {
     }
 
     const result = await controller.prompt({ sessionId, questions });
-    if (result.outcome === 'accepted') {
+    if (result.outcome === 'accepted' && answersNonEmpty(result.answers, questions.length)) {
       this.respondOk(id, {
         outcome: 'accepted',
-        answers: result.answers ?? {},
-        annotations: result.annotations ?? {},
+        answers: encodeGrokAnswers(questions, result.answers),
+        annotations: {},
       });
       return;
     }

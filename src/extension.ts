@@ -8,10 +8,17 @@ import { MusterBridgeServer } from './bridge/server';
 import { makeBackend } from './backends/index';
 import {
   disposeSharedAcpClient,
+  isAskLikeForm,
+  setElicitationController,
   setPermissionController,
   setQuestionController,
 } from './backends/acp-client';
-import type { PermissionController, QuestionController } from './backends/acp-client';
+import type {
+  ElicitationController,
+  PermissionController,
+  QuestionController,
+} from './backends/acp-client';
+import { ElicitationBridge } from './bridge/elicitation-bridge';
 import type { PermissionAuditEntry, PermissionMode } from './backends/permission-policy';
 import {
   buildSnapshot,
@@ -26,6 +33,11 @@ import {
   type RetentionSettingSnapshot,
 } from './host/retention-settings';
 import { detectAvailableBackends, installAugmentedPath } from './host/backend-availability';
+import {
+  parseComposerSelection,
+  readComposerSelection,
+  writeComposerSelection,
+} from './host/composer-selection';
 import { pickWorkspaceFileMentionPath } from './host/workspace-files';
 import { resolveDroppedFileMention } from './host/file-mentions';
 import { routeSendLiveInput } from './host/live-input';
@@ -51,6 +63,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 let askBridge: AskBridge | undefined;
+let elicitationBridge: ElicitationBridge | undefined;
 let permissionBridge: PermissionBridge | undefined;
 let permissionAuditChannel: vscode.OutputChannel | undefined;
 let credentialRegistry: CredentialRegistry | undefined;
@@ -222,7 +235,10 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   private availableModelsPromise?: Promise<Record<string, BackendModels>>;
   focusedTaskId?: string;
 
-  constructor(private readonly _extensionUri: vscode.Uri) {}
+  constructor(
+    private readonly _extensionUri: vscode.Uri,
+    private readonly _globalState: vscode.Memento,
+  ) {}
 
   private post(message: unknown): void {
     try {
@@ -433,6 +449,26 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  /** Push host-persisted last-used backend/model so the picker survives restarts. */
+  private postComposerSelection(): void {
+    const selection = readComposerSelection(this._globalState);
+    if (!selection) return;
+    this.post({
+      type: 'composerSelection',
+      backend: selection.backend,
+      model: selection.model,
+    });
+  }
+
+  private handleSetComposerSelection(data: { backend?: unknown; model?: unknown }): void {
+    const selection = parseComposerSelection({
+      backend: data.backend,
+      model: data.model === undefined ? null : data.model,
+    });
+    if (!selection) return;
+    void writeComposerSelection(this._globalState, selection);
+  }
+
   /**
    * Enumerate each installed backend's models (via a throwaway ACP session) and
    * send them to the webview for the grouped model picker.
@@ -622,10 +658,55 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     // host<->webview drift once (and show a reload banner) instead of silently
     // dropping mismatched messages.
     this.post({ type: 'snapshot', protocolVersion: PROTOCOL_VERSION, ...snapshot });
+    this.replayPendingElicitations();
     if (focus) {
       this.focusedTaskId = focus;
     }
     this.seedObservation(taskStore.getFile());
+  }
+
+  /** Replay durable elicitation prompts after snapshot / webview resolve. */
+  replayPendingElicitations(): void {
+    if (!elicitationBridge || !this._view) return;
+    for (const prompt of elicitationBridge.listPending()) {
+      if ('fields' in prompt) {
+        this.post({
+          type: 'elicitationFormPending',
+          promptId: prompt.promptId,
+          sessionId: prompt.sessionId,
+          toolCallId: prompt.toolCallId,
+          message: prompt.message,
+          fields: prompt.fields,
+          required: prompt.required,
+          askLike: prompt.askLike,
+        });
+      } else {
+        this.post({
+          type: 'elicitationUrlPending',
+          promptId: prompt.promptId,
+          elicitationId: prompt.elicitationId,
+          sessionId: prompt.sessionId,
+          url: prompt.url,
+          message: prompt.message,
+        });
+      }
+    }
+    for (const oob of elicitationBridge.listOob()) {
+      // Reconstruct full URL card then mark waiting (webview map may be empty).
+      this.post({
+        type: 'elicitationUrlPending',
+        promptId: oob.promptId,
+        elicitationId: oob.elicitationId,
+        url: oob.url,
+        message: oob.message,
+      });
+      this.post({
+        type: 'elicitationUrlWaiting',
+        promptId: oob.promptId,
+        elicitationId: oob.elicitationId,
+        message: oob.message,
+      });
+    }
   }
 
   private handleOpenLink(url: unknown): void {
@@ -894,13 +975,24 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
 
       // Goal from display text so task titles stay short (not absolute temp paths).
       const shortGoal = text.length <= 30 ? text : text.slice(0, 30).trim() + '…';
+      const resolvedBackend = data.backend ?? 'claude';
+      const resolvedModel =
+        typeof data.model === 'string' && data.model ? data.model : undefined;
+      // DEBUG: temporary — remove after diagnosing grok→claude draft send.
+      console.info('[muster][host-send]', {
+        inboundBackend: data.backend,
+        inboundModel: data.model,
+        resolvedBackend,
+        resolvedModel: resolvedModel ?? null,
+        usedDefaultBackend: data.backend === undefined,
+      });
 
       const result = taskEngine.startNewTask({
         goal: shortGoal,
         message: text,
         agentMessage: llmText !== text ? llmText : undefined,
-        backend: data.backend ?? 'claude',
-        model: typeof data.model === 'string' && data.model ? data.model : undefined,
+        backend: resolvedBackend,
+        model: resolvedModel,
         continuationOf: data.continuationOf,
         // Capture the workspace cwd at task-creation time so every turn (and any
         // delegated child) runs in the right directory instead of process.cwd().
@@ -910,6 +1002,11 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         this.postCommandError(result.reason);
         return;
       }
+      console.info('[muster][host-send] task created', {
+        taskId: result.value.taskId,
+        backend: resolvedBackend,
+        model: resolvedModel ?? null,
+      });
       this.focusedTaskId = result.value.taskId;
       this.postSnapshot(result.value.taskId);
       return;
@@ -1026,9 +1123,12 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
               this.postCommandError('turn does not belong to task', data.taskId);
               break;
             }
+            const sessionId = turn.observedSessionId;
             const result = taskEngine.interruptTurn(data.turnId);
             if (!result.ok) {
               this.postCommandError(result.reason, data.taskId);
+            } else if (sessionId) {
+              elicitationBridge?.cancelForSession(sessionId);
             }
           }
           break;
@@ -1243,6 +1343,14 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           if (!result.ok) {
             this.postCommandError(result.reason, data.taskId);
           } else {
+            // Clear any RFD form/url prompts tied to this task's live session.
+            const live = Object.values(taskStore?.getFile().turns ?? {}).find(
+              (t) =>
+                t.taskId === data.taskId &&
+                (t.status === 'running' || t.status === 'waiting_user' || t.status === 'cancelled'),
+            );
+            const sessionId = live?.observedSessionId;
+            if (sessionId) elicitationBridge?.cancelForSession(sessionId);
             this.postSnapshot(this.focusedTaskId ?? data.taskId);
           }
           break;
@@ -1270,6 +1378,49 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             this.postCommandError('invalid ask answer payload');
           }
           break;
+        case 'submitElicitation': {
+          if (typeof data.promptId !== 'string' || typeof data.action !== 'string') {
+            this.postCommandError('invalid elicitation submission');
+            break;
+          }
+          const action = data.action as 'accept' | 'decline' | 'cancel';
+          if (action !== 'accept' && action !== 'decline' && action !== 'cancel') {
+            this.postCommandError('invalid elicitation action');
+            break;
+          }
+          let content =
+            data.content && typeof data.content === 'object' && !Array.isArray(data.content)
+              ? (data.content as Record<string, unknown>)
+              : undefined;
+          // Host-side form validation before accept (keep card open on failure).
+          if (action === 'accept' && elicitationBridge) {
+            const form = elicitationBridge.peekForm(data.promptId);
+            if (form) {
+              const { validateFormValues } = await import('./backends/elicitation');
+              const check = validateFormValues(form, content ?? {});
+              if (!check.ok) {
+                this.postCommandError(check.message);
+                break;
+              }
+            }
+          }
+          if (!elicitationBridge?.submit(data.promptId, { action, content })) {
+            this.postCommandError('no matching pending elicitation');
+            break;
+          }
+          // URL consent accept → open external after user confirmed.
+          if (action === 'accept') {
+            const waiting = elicitationBridge.listOob().find((e) => e.promptId === data.promptId);
+            if (waiting?.url) {
+              try {
+                await vscode.env.openExternal(vscode.Uri.parse(waiting.url));
+              } catch {
+                // best-effort open
+              }
+            }
+          }
+          break;
+        }
         case 'cancelAsk':
           if (
             typeof data.taskId === 'string' &&
@@ -1368,6 +1519,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         case 'listModels':
           void this.postAvailableModels();
           break;
+        case 'setComposerSelection':
+          this.handleSetComposerSelection(data);
+          break;
         default:
           // Unknown inbound type: log instead of silently ignoring. This surfaces
           // host<->webview protocol drift (e.g. a newer webview sending a message
@@ -1384,6 +1538,10 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     void this.postAvailableBackends();
     // Prefetch model catalog so New task can show [Backend] Model options promptly.
     void this.postAvailableModels();
+    // Restore last-used backend/model from globalState (survives full restarts).
+    // Posted after availability so the webview can re-apply preference once the
+    // picker list is known; applyHostComposerSelection does not require it.
+    this.postComposerSelection();
   }
 
   private _getHtmlForWebview(webview: vscode.Webview): string {
@@ -1440,7 +1598,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
   runSessionMigration(context, workspaceRoot);
 
-  const provider = new MusterChatProvider(context.extensionUri);
+  const provider = new MusterChatProvider(context.extensionUri, context.globalState);
   const revealLinkedChat = async (ownerTaskId: string): Promise<boolean> => {
     if (!taskStore) return false;
     const reveal = createPresentationChatLink(
@@ -1552,7 +1710,7 @@ export async function activate(context: vscode.ExtensionContext) {
     };
     setPermissionController(permissionController);
 
-    // Grok (and similar) ask_user_question over ACP → webview AskCard.
+    // Grok vendor ask_user_question → AskBridge + askPending (separate from RFD).
     const questionController: QuestionController = {
       prompt: async (req) => {
         const engine = taskEngine;
@@ -1565,26 +1723,92 @@ export async function activate(context: vscode.ExtensionContext) {
         }
         try {
           const answers = await registered.promise;
-          const keyed: Record<string, string> = {};
-          req.questions.forEach((q, i) => {
-            const entry = answers[String(i)];
-            const selected = entry?.selected ?? [];
-            const free = entry?.freeText?.trim();
-            const value =
-              selected.length > 0 ? selected.join(', ') : free && free.length > 0 ? free : '';
-            keyed[q.prompt] = value;
-          });
-          const allEmpty = Object.values(keyed).every((v) => v.length === 0);
-          if (allEmpty) {
-            return { outcome: 'cancelled' };
-          }
-          return { outcome: 'accepted', answers: keyed, annotations: {} };
+          return { outcome: 'accepted', answers };
         } catch {
           return { outcome: 'cancelled' };
         }
       },
     };
     setQuestionController(questionController);
+
+    // RFD elicitation (form + url) — single owner ElicitationBridge.
+    elicitationBridge = new ElicitationBridge({
+      onRegister: (kind, prompt) => {
+        if (kind === 'form') {
+          const form = prompt as import('./bridge/elicitation-bridge').PendingFormPrompt;
+          provider['_view']?.webview.postMessage({
+            type: 'elicitationFormPending',
+            promptId: form.promptId,
+            sessionId: form.sessionId,
+            toolCallId: form.toolCallId,
+            message: form.message,
+            fields: form.fields,
+            required: form.required,
+            askLike: form.askLike,
+          });
+          return;
+        }
+        const url = prompt as import('./bridge/elicitation-bridge').PendingUrlConsent;
+        provider['_view']?.webview.postMessage({
+          type: 'elicitationUrlPending',
+          promptId: url.promptId,
+          elicitationId: url.elicitationId,
+          sessionId: url.sessionId,
+          url: url.url,
+          message: url.message,
+        });
+      },
+      onWaiting: (entry) => {
+        provider['_view']?.webview.postMessage({
+          type: 'elicitationUrlWaiting',
+          promptId: entry.promptId,
+          elicitationId: entry.elicitationId,
+          message: entry.message,
+        });
+      },
+      onClear: (promptId) => {
+        provider['_view']?.webview.postMessage({ type: 'elicitationCleared', promptId });
+      },
+    });
+    const eBridge = elicitationBridge;
+    const elicitationController: ElicitationController = {
+      clientKey: 'muster-acp',
+      promptForm: async (form, clientKey) => {
+        const key = clientKey || 'muster-acp';
+        const askLike = isAskLikeForm(form);
+        const { promptId, promise } = eBridge.registerForm(key, form, askLike, 120_000);
+        let waitTurnId: string | undefined;
+        if (form.sessionId && taskEngine) {
+          waitTurnId = taskEngine.beginElicitationWait(form.sessionId, promptId)?.turnId;
+        }
+        try {
+          const result = await promise;
+          // Soft resume only if engine still owns this wait (hard clear drops tokens first).
+          if (waitTurnId && taskEngine) {
+            taskEngine.endElicitationWait(waitTurnId, promptId);
+          }
+          return result;
+        } catch {
+          if (waitTurnId && taskEngine) {
+            taskEngine.endElicitationWait(waitTurnId, promptId);
+          }
+          return { action: 'cancel' as const };
+        }
+      },
+      promptUrl: async (urlReq, clientKey) => {
+        const key = clientKey || 'muster-acp';
+        const { promise } = eBridge.registerUrl(key, urlReq, 120_000);
+        try {
+          return await promise;
+        } catch {
+          return { action: 'cancel' as const };
+        }
+      },
+      onUrlComplete: (clientKey, elicitationId) => {
+        eBridge.complete(clientKey, elicitationId);
+      },
+    };
+    setElicitationController(elicitationController);
 
     credentialRegistry = new CredentialRegistry();
     const engineToolHandler = {
@@ -1662,8 +1886,10 @@ export async function activate(context: vscode.ExtensionContext) {
       dispose: () => {
         void bridgeServer?.close();
         askBridge?.cancelAll('deactivate');
+        elicitationBridge?.cancelAll();
         setPermissionController(null);
         setQuestionController(null);
+        setElicitationController(null);
         permissionBridge?.cancelAll();
         credentialRegistry?.revokeAll();
       },
@@ -1671,12 +1897,15 @@ export async function activate(context: vscode.ExtensionContext) {
   } catch (error) {
     void bridgeServer?.close();
     askBridge?.cancelAll('init failed');
+    elicitationBridge?.cancelAll();
     setPermissionController(null);
     setQuestionController(null);
+    setElicitationController(null);
     permissionBridge?.cancelAll();
     credentialRegistry?.revokeAll();
     bridgeServer = undefined;
     askBridge = undefined;
+    elicitationBridge = undefined;
     permissionBridge = undefined;
     credentialRegistry = undefined;
     taskEngine = undefined;
@@ -1690,8 +1919,10 @@ export function deactivate() {
   presentationManager?.dispose();
   presentationManager = undefined;
   askBridge?.cancelAll('deactivate');
+  elicitationBridge?.cancelAll();
   setPermissionController(null);
   setQuestionController(null);
+  setElicitationController(null);
   permissionBridge?.cancelAll();
   credentialRegistry?.revokeAll();
   void bridgeServer?.close();

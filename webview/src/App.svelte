@@ -4,6 +4,8 @@
   import TaskHistoryList from './components/TaskList.svelte';
   import TaskWorkspace from './components/TaskWorkspace.svelte';
   import PermissionCard from './components/PermissionCard.svelte';
+  import ElicitationFormCard from './components/ElicitationFormCard.svelte';
+  import ElicitationUrlCard from './components/ElicitationUrlCard.svelte';
   import { tasks } from './lib/tasks.svelte';
   import { threadStore } from './lib/thread.svelte';
   import {
@@ -28,8 +30,27 @@
     maxStoredOutputChars: 'Maximum stored output characters',
   };
 
+  type PendingElicitation =
+    | {
+        kind: 'form';
+        promptId: string;
+        message: string;
+        fields: Array<Record<string, unknown>>;
+        required: string[];
+        askLike?: boolean;
+      }
+    | {
+        kind: 'url';
+        promptId: string;
+        elicitationId: string;
+        url: string;
+        message: string;
+        waiting?: boolean;
+      };
+
   let pendingAsk = $state<PendingAsk | null>(null);
   let pendingPermission = $state<PendingPermission | null>(null);
+  let pendingElicitations = $state<PendingElicitation[]>([]);
   let activeTurnId = $state<string | null>(null);
   const visibleCommandError = $derived(
     tasks.commandError &&
@@ -291,6 +312,45 @@
           }
           break;
 
+        case 'elicitationFormPending':
+          pendingElicitations = [
+            ...pendingElicitations.filter((p) => p.promptId !== msg.promptId),
+            {
+              kind: 'form',
+              promptId: msg.promptId,
+              message: msg.message,
+              fields: msg.fields,
+              required: msg.required,
+              askLike: msg.askLike,
+            },
+          ];
+          break;
+
+        case 'elicitationUrlPending':
+          pendingElicitations = [
+            ...pendingElicitations.filter((p) => p.promptId !== msg.promptId),
+            {
+              kind: 'url',
+              promptId: msg.promptId,
+              elicitationId: msg.elicitationId,
+              url: msg.url,
+              message: msg.message,
+            },
+          ];
+          break;
+
+        case 'elicitationUrlWaiting':
+          pendingElicitations = pendingElicitations.map((p) =>
+            p.promptId === msg.promptId && p.kind === 'url'
+              ? { ...p, waiting: true, message: msg.message ?? p.message }
+              : p,
+          );
+          break;
+
+        case 'elicitationCleared':
+          pendingElicitations = pendingElicitations.filter((p) => p.promptId !== msg.promptId);
+          break;
+
         case 'commandError':
           if (isTaskScopedBannerVisible(msg.taskId, tasks.focusedTaskId)) {
             tasks.setCommandError(msg.message, msg.taskId ?? null);
@@ -310,6 +370,10 @@
 
         case 'modelsAvailable':
           tasks.setAvailableModels(msg.models);
+          break;
+
+        case 'composerSelection':
+          tasks.applyHostComposerSelection(msg.backend, msg.model);
           break;
       }
     }
@@ -382,6 +446,34 @@
     options={pendingPermission.options}
   />
 {/if}
+
+{#each pendingElicitations as pe (pe.promptId)}
+  {#if pe.kind === 'form'}
+    <ElicitationFormCard
+      promptId={pe.promptId}
+      message={pe.message}
+      fields={pe.fields as Array<{
+        key: string;
+        type: string;
+        title?: string;
+        description?: string;
+        options?: string[];
+        required?: boolean;
+        default?: unknown;
+      }>}
+      required={pe.required}
+      askLike={pe.askLike}
+    />
+  {:else}
+    <ElicitationUrlCard
+      promptId={pe.promptId}
+      elicitationId={pe.elicitationId}
+      url={pe.url}
+      message={pe.message}
+      waiting={pe.waiting}
+    />
+  {/if}
+{/each}
 
 {#if !inChat}
   <!-- Entry: New task action, then the searchable previous-tasks list -->

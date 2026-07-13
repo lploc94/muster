@@ -605,67 +605,14 @@ export async function executeToolCommand(
       // graph must remain VS Code-independent and fail closed if called directly.
       return { ok: false, error: 'panel_open_failed' };
 
-    case 'ask_user': {
-      const askKey = opLedgerKey(ctx.turnId, command.opId);
-      const existing = deps.pendingAskPromises.get(askKey);
-      if (existing) {
-        if (existing.fingerprint !== fingerprint) {
-          return { ok: false, error: 'opId conflict: different ask arguments' };
-        }
-        const answers = await existing.promise;
-        return { ok: true, result: { answers } };
-      }
-
-      const askId = deps.askBridge.generateAskId();
-      const ref: AskRef = { taskId: ctx.callerTaskId, turnId: ctx.turnId, askId };
-
-      const registerCommit = deps.store.commit((draft) => {
-        const turn = draft.turns[ctx.turnId];
-        if (!turn) return { ok: false, reason: 'turn not found' };
-        const asked = registerAsk(turn);
-        if (!asked.ok) return asked;
-        draft.turns[ctx.turnId] = asked.next;
-        return { ok: true };
-      });
-      if (!registerCommit.ok) {
-        return { ok: false, error: registerCommit.detail ?? registerCommit.reason };
-      }
-
-      const callerTask = deps.store.getFile().tasks[ctx.callerTaskId];
-      const deadlineMs = Math.min(
-        120_000,
-        callerTask?.executionPolicy.turnTimeoutMs ?? 120_000,
-      );
-
-      const answersPromise = deps.askBridge.register(ref, command.questions, deadlineMs);
-      deps.pendingAskPromises.set(askKey, { promise: answersPromise, fingerprint });
-
-      try {
-        const answers = await answersPromise;
-        deps.store.commit((draft) => {
-          const turn = draft.turns[ctx.turnId];
-          if (turn) {
-            const resumed = submitAnswer(turn);
-            if (resumed.ok) draft.turns[ctx.turnId] = resumed.next;
-          }
-          return { ok: true };
-        });
-        return { ok: true, result: { id: askId, answers } };
-      } catch (error) {
-        deps.store.commit((draft) => {
-          const turn = draft.turns[ctx.turnId];
-          if (turn?.status === 'waiting_user') {
-            const resumed = submitAnswer(turn);
-            if (resumed.ok) draft.turns[ctx.turnId] = resumed.next;
-          }
-          return { ok: true };
-        });
-        const message = error instanceof Error ? error.message : String(error);
-        return { ok: false, error: message };
-      } finally {
-        deps.pendingAskPromises.delete(askKey);
-      }
-    }
+    case 'ask_user':
+      // Temporarily ignored: structured user questions go through ACP RFD
+      // elicitation (and vendor extensions like Grok x.ai/ask_user_question).
+      return {
+        ok: false,
+        error:
+          'ask_user MCP tool is disabled; use ACP elicitation/create (or native agent ask)',
+      };
 
     default: {
       const _exhaustive: never = command;

@@ -35,6 +35,8 @@ export interface TaskSummary {
   hasOutcomeProposal?: boolean;
   updatedAt: string;
   backend: string;
+  /** Optional model id selected for this task (ACP session config option value). */
+  model?: string;
   continuationOf?: string;
 }
 
@@ -173,6 +175,7 @@ export function projectTaskSummary(file: TaskStoreFile, taskId: string): TaskSum
     hasOutcomeProposal: task.outcomeProposal != null,
     updatedAt: projectActivityTime(file, taskId),
     backend: task.backend,
+    model: task.model,
     continuationOf: task.continuationOf,
   };
 }

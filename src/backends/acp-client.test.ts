@@ -3,9 +3,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   boundedPromptCancel,
   deriveLiveInputSupport,
+  encodeElicitationContent,
+  encodeGrokAnswers,
   killProcessTree,
   LIVE_INPUT_METHOD,
   normalizeAgentQuestions,
+  parseElicitationCreate,
   terminateProcessTree,
   type KillableProcess,
   type PromptResult,
@@ -447,5 +450,36 @@ describe('normalizeAgentQuestions', () => {
 
   it('drops empty / non-object entries', () => {
     expect(normalizeAgentQuestions([null, {}, { question: '' }, 'x'])).toEqual([]);
+  });
+});
+
+describe('RFD elicitation parse (via acp-client re-export)', () => {
+  it('parses form create params', () => {
+    const parsed = parseElicitationCreate({
+      sessionId: 'sess-1',
+      mode: 'form',
+      message: 'Pick approach',
+      requestedSchema: {
+        type: 'object',
+        properties: {
+          question_0: {
+            type: 'string',
+            description: 'How to proceed?',
+            oneOf: [{ const: 'A' }, { const: 'B' }],
+          },
+        },
+        required: ['question_0'],
+      },
+    });
+    expect(parsed.kind).toBe('form');
+  });
+
+  it('encodes Grok answers keyed by question text', () => {
+    expect(
+      encodeGrokAnswers(
+        [{ prompt: 'Pick one?', options: ['A', 'B'] }],
+        { '0': { selected: ['A'], freeText: null } },
+      ),
+    ).toEqual({ 'Pick one?': 'A' });
   });
 });

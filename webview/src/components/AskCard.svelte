@@ -29,10 +29,17 @@
     return entry;
   }
 
-  // Single-select: options render as a radio group (at most one selection).
-  function selectOption(index: number, option: string): void {
+  function selectOption(index: number, option: string, multi = false): void {
     const entry = ensureAnswer(index);
-    entry.selected = [option];
+    if (multi) {
+      const cur = [...entry.selected];
+      const i = cur.indexOf(option);
+      if (i >= 0) cur.splice(i, 1);
+      else cur.push(option);
+      entry.selected = cur;
+    } else {
+      entry.selected = [option];
+    }
     answers = { ...answers };
   }
 
@@ -72,26 +79,37 @@
       <div class="whitespace-pre-wrap">{q.prompt}</div>
 
       {#if q.options && q.options.length > 0}
-        <vscode-radio-group
-          onchange={(e: Event) => {
-            const target = e.target as HTMLElement & { value?: string; checked?: boolean };
-            const val =
-              typeof target?.value === 'string' && target.value.length > 0
-                ? target.value
-                : (e.currentTarget as HTMLElement)
-                    ?.querySelector?.('vscode-radio[checked]')
-                    ?.getAttribute?.('value') ?? undefined;
-            if (typeof val === 'string' && val.length > 0) selectOption(i, val);
-          }}
-        >
+        {#if q.multiSelect}
           {#each q.options as option (option)}
-            <vscode-radio
-              value={option}
-              name={`ask-${askId}-${i}`}
-              checked={readAnswer(i).selected.includes(option)}
-            >{option}</vscode-radio>
+            <label class="flex items-center gap-1">
+              <input
+                type="checkbox"
+                checked={readAnswer(i).selected.includes(option)}
+                onchange={() => selectOption(i, option, true)}
+              />
+              {option}
+            </label>
           {/each}
-        </vscode-radio-group>
+        {:else}
+          <vscode-radio-group
+            onchange={(e: Event) => {
+              const target = e.target as HTMLElement & { value?: string };
+              const val =
+                typeof target?.value === 'string' && target.value.length > 0
+                  ? target.value
+                  : undefined;
+              if (typeof val === 'string' && val.length > 0) selectOption(i, val, false);
+            }}
+          >
+            {#each q.options as option (option)}
+              <vscode-radio
+                value={option}
+                name={`ask-${askId}-${i}`}
+                checked={readAnswer(i).selected.includes(option)}
+              >{option}</vscode-radio>
+            {/each}
+          </vscode-radio-group>
+        {/if}
       {/if}
 
       {#if q.allowFreeText === true || !q.options?.length}
@@ -105,8 +123,9 @@
     </div>
   {/each}
 
-  <div class="flex gap-2 justify-end">
+  <div class="flex gap-2 justify-end flex-wrap">
     <vscode-button secondary disabled={submitting} onclick={cancel}>Dismiss</vscode-button>
-    <vscode-button disabled={submitting} onclick={submit}>Submit</vscode-button>
+    <vscode-button secondary disabled={submitting} onclick={cancel}>Decline</vscode-button>
+    <vscode-button disabled={submitting} onclick={submit}>Accept</vscode-button>
   </div>
 </div>

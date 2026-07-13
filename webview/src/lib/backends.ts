@@ -43,3 +43,18 @@ export function backendLabel(backend: string | null | undefined): string {
   if (b.includes('open')) return 'Open Code';
   return backend;
 }
+
+/**
+ * Picker-style label: `[Grok] grok-4.5` when model is set, else short backend name.
+ * Used for locked-task chips and assistant headers.
+ */
+export function backendModelLabel(
+  backend: string | null | undefined,
+  model?: string | null,
+): string {
+  const short = backendShortLabel(backend);
+  if (typeof model === 'string' && model.trim()) {
+    return `[${short}] ${model.trim()}`;
+  }
+  return short;
+}

@@ -3,7 +3,7 @@
   import { effectiveRuntimeActivity, post } from '../lib/protocol';
   import { getLifecyclePresentation, isSoftTerminal } from '../lib/task-status';
   import type { TaskSummary } from '../lib/protocol';
-  import { backendShortLabel } from '../lib/backends';
+  import { backendModelLabel } from '../lib/backends';
   import { tip } from '../lib/tooltip';
 
   interface Props {
@@ -221,7 +221,9 @@
                   ></span>
                 {/if}
                 {#if task.backend}
-                  <span class="text-[11px] leading-[14px] opacity-70">{backendShortLabel(task.backend)}</span>
+                  <span class="text-[11px] leading-[14px] opacity-70"
+                    >{backendModelLabel(task.backend, task.model)}</span
+                  >
                 {/if}
                 {#if task.continuationOf}
                   <span style="font-size: 10px;">↳ cont.</span>
@@ -338,7 +340,9 @@
             ></span>
           {/if}
           {#if task.backend}
-            <span class="text-[11px] leading-[14px] opacity-70">{backendShortLabel(task.backend)}</span>
+            <span class="text-[11px] leading-[14px] opacity-70"
+              >{backendModelLabel(task.backend, task.model)}</span
+            >
           {/if}
           {#if task.continuationOf}
             <span style="font-size: 10px;">↳ cont.</span>

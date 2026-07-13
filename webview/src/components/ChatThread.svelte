@@ -1,13 +1,15 @@
 <script lang="ts">
   import { threadStore } from '../lib/thread.svelte';
   import { tasks } from '../lib/tasks.svelte';
-  import { backendIcon, backendLabel } from '../lib/backends';
+  import { backendIcon, backendModelLabel } from '../lib/backends';
   import MessageBubble from './MessageBubble.svelte';
   import ToolCard from './ToolCard.svelte';
   import { tip } from '../lib/tooltip';
 
   const thread = $derived(threadStore.current);
   const currentBackend = $derived(tasks.focusedTask?.backend ?? 'unknown');
+  const currentModel = $derived(tasks.focusedTask?.model);
+  const currentBackendLabel = $derived(backendModelLabel(currentBackend, currentModel));
 
   const lastAssistantId = $derived(
     thread.items.filter((it) => it.kind === 'assistant').pop()?.id ?? null,
@@ -73,11 +75,11 @@
           <div
             class="flex-shrink-0 w-5 h-5 rounded-full flex items-center justify-center border"
             style="border-color: var(--vscode-panel-border); color: var(--vscode-foreground); background: var(--vscode-editor-background);"
-            use:tip={currentBackend || 'assistant'}
+            use:tip={currentBackendLabel}
           >
             <span class="codicon {backendIcon(currentBackend)} text-[13px]"></span>
           </div>
-          <span class="text-[11px] opacity-70 font-medium">{backendLabel(currentBackend)}</span>
+          <span class="text-[11px] opacity-70 font-medium">{currentBackendLabel}</span>
         </div>
 
         {#if reasoningFor(turnId)}
@@ -113,11 +115,11 @@
           <div
             class="flex-shrink-0 w-5 h-5 rounded-full flex items-center justify-center border"
             style="border-color: var(--vscode-panel-border); color: var(--vscode-foreground); background: var(--vscode-editor-background);"
-            use:tip={currentBackend || 'assistant'}
+            use:tip={currentBackendLabel}
           >
             <span class="codicon {backendIcon(currentBackend)} text-[13px]"></span>
           </div>
-          <span class="text-[11px] opacity-70 font-medium">{backendLabel(currentBackend)}</span>
+          <span class="text-[11px] opacity-70 font-medium">{currentBackendLabel}</span>
         </div>
         {#if thread.activeTurnId && reasoningFor(thread.activeTurnId)}
           <details class="mb-1 text-xs opacity-70" open>

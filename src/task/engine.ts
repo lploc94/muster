@@ -508,6 +508,61 @@ export class TaskEngine {
     };
   }
 
+  /** Per-turn elicitation wait tokens (RFD form); resume only when empty. */
+  private readonly elicitationWaitTokens = new Map<string, Set<string>>();
+
+  /**
+   * Mark live turn waiting_user for an RFD elicitation prompt (no AskBridge).
+   * Returns turnId when a live turn was found.
+   */
+  beginElicitationWait(
+    sessionId: string,
+    promptId: string,
+  ): { turnId: string } | undefined {
+    const live = this.findLiveTurnBySessionId(sessionId);
+    if (!live) return undefined;
+    const commit = this.store.commit((draft) => {
+      const turn = draft.turns[live.turnId];
+      if (!turn) return { ok: false, reason: 'turn not found' };
+      if (turn.status === 'waiting_user') return { ok: true };
+      if (turn.status !== 'running') return { ok: false, reason: 'turn is not live' };
+      const asked = registerAsk(turn);
+      if (!asked.ok) return asked;
+      draft.turns[live.turnId] = asked.next;
+      return { ok: true };
+    });
+    if (!commit.ok) return undefined;
+    let set = this.elicitationWaitTokens.get(live.turnId);
+    if (!set) {
+      set = new Set();
+      this.elicitationWaitTokens.set(live.turnId, set);
+    }
+    set.add(promptId);
+    return { turnId: live.turnId };
+  }
+
+  /** Soft release: resume only if this token existed and set is now empty. */
+  endElicitationWait(turnId: string, promptId: string): void {
+    const set = this.elicitationWaitTokens.get(turnId);
+    // Hard-cleared turns have no set — do not revive.
+    if (!set || !set.has(promptId)) return;
+    set.delete(promptId);
+    if (set.size > 0) return;
+    this.elicitationWaitTokens.delete(turnId);
+    this.store.commit((draft) => {
+      const turn = draft.turns[turnId];
+      if (!turn || turn.status !== 'waiting_user') return { ok: true };
+      const resumed = submitAnswer(turn);
+      if (resumed.ok) draft.turns[turnId] = resumed.next;
+      return { ok: true };
+    });
+  }
+
+  /** Hard clear tokens without resuming (turn cancel / backend exit / deactivate). */
+  dropElicitationWaits(turnId: string): void {
+    this.elicitationWaitTokens.delete(turnId);
+  }
+
   /**
    * Resolve a live turn for an ACP session id (observed on the live handle or
    * persisted on the turn). Used to route agent-extension ask_user_question
@@ -1388,6 +1443,8 @@ export class TaskEngine {
 
     if (live && !remoteOwned) {
       this.askBridge.cancelForTurn(live.id, 'task lifecycle changed');
+      this.dropElicitationWaits(live.id);
+      // Note: host elicitationBridge.cancelForSession is invoked from extension cancel paths when available.
       this.credentialRegistry?.revoke(live.id);
     }
     return { ok: true, value: undefined };
@@ -1476,6 +1533,7 @@ export class TaskEngine {
       }
       this.acceptedOpIds.delete(turnId);
       this.askBridge.cancelForTurn(turnId, 'task skipped');
+      this.dropElicitationWaits(turnId);
       this.credentialRegistry?.revoke(turnId);
     }
     return { ok: true, value: undefined };
@@ -1559,6 +1617,7 @@ export class TaskEngine {
       }
       this.acceptedOpIds.delete(turnId);
       this.askBridge.cancelForTurn(turnId, 'task cancelled');
+      this.dropElicitationWaits(turnId);
       this.credentialRegistry?.revoke(turnId);
     }
     return { ok: true, value: undefined };
@@ -1589,6 +1648,7 @@ export class TaskEngine {
       });
       this.acceptedOpIds.delete(turn.id);
       this.askBridge.cancelForTurn(turn.id, 'reload interrupt');
+      this.dropElicitationWaits(turn.id);
       this.credentialRegistry?.revoke(turn.id);
     }
 
@@ -2393,6 +2453,8 @@ export class TaskEngine {
     } finally {
       clearInterval(cancelPoll);
       if (turnTimer) clearTimeout(turnTimer);
+      // Hard clear elicitation wait tokens — do not soft-resume a settling turn.
+      this.dropElicitationWaits(turnId);
       this.liveRuns.delete(turnId);
       this.acceptedOpIds.delete(turnId);
       if (this.credentialRegistry) {

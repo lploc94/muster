@@ -1,6 +1,7 @@
 import type { BackendModels, QueuedTurnProjection, SnapshotMessage, TaskSummary } from './protocol';
 import { isHardTerminalLifecycle } from './protocol';
 import { sortQueuedTurns } from './queued-turns';
+import { parseBackendId, parseModelFromSelectValue } from './backend-resolve';
 import { vscode } from './vscode';
 
 export interface CommandErrorState {
@@ -33,9 +34,22 @@ class TasksState {
   /** Optional link when creating a draft after another task (legacy protocol field). */
   continuationOf = $state<string | null>(null);
 
+  /**
+   * User's preferred backend for new tasks (what we persist). May temporarily
+   * differ from the picker display when that CLI is not currently detected.
+   */
+  preferredBackend = $state<WebviewBackendId>('claude');
+
+  /** Preferred model for preferredBackend; null = backend default. */
+  preferredModel = $state<string | null>(null);
+
+  /**
+   * Backend shown in the picker. Falls back to the first available CLI when
+   * preferredBackend is missing from detection — without overwriting preference.
+   */
   selectedBackend = $state<WebviewBackendId>('claude');
 
-  /** Selected model value for the current backend; null = the backend default. */
+  /** Model shown for selectedBackend; null = backend default. */
   selectedModel = $state<string | null>(null);
 
   /** Backend ids the host reports as installed/callable; null = not yet known. */
@@ -64,13 +78,18 @@ class TasksState {
 
   constructor() {
     // Restore the last-used backend/model from webview state (persists across reloads).
+    // Host globalState may overwrite this shortly via applyHostComposerSelection.
     try {
       const saved = vscode.getState() as { selectedBackend?: unknown; selectedModel?: unknown } | undefined;
       const be = saved?.selectedBackend;
       if (be === 'claude' || be === 'grok' || be === 'kiro' || be === 'codex' || be === 'opencode') {
+        this.preferredBackend = be;
         this.selectedBackend = be;
       }
-      if (typeof saved?.selectedModel === 'string') this.selectedModel = saved.selectedModel;
+      if (typeof saved?.selectedModel === 'string') {
+        this.preferredModel = saved.selectedModel;
+        this.selectedModel = saved.selectedModel;
+      }
     } catch {
       // best-effort — fall back to defaults
     }
@@ -102,45 +121,96 @@ class TasksState {
 
   setBackend(next: WebviewBackendId): void {
     // Switching backend drops the model selection (models are backend-specific).
-    if (next !== this.selectedBackend) this.selectedModel = null;
-    this.selectedBackend = next;
+    if (next !== this.preferredBackend) this.preferredModel = null;
+    this.preferredBackend = next;
+    this.syncDisplaySelection();
     this.persistSelection();
   }
 
   /** Select a specific (backend, model) pair from the grouped model picker. */
   setModelSelection(backend: WebviewBackendId, model: string): void {
-    this.selectedBackend = backend;
-    this.selectedModel = model;
+    this.preferredBackend = backend;
+    this.preferredModel = model;
+    this.syncDisplaySelection();
     this.persistSelection();
   }
 
   setAvailableBackends(ids: string[]): void {
     this.availableBackends = ids;
-    // If the currently selected backend isn't installed, fall back to the first
-    // available one so the picker never shows a dead default.
-    if (ids.length > 0 && !ids.includes(this.selectedBackend)) {
-      this.selectedBackend = ids[0] as WebviewBackendId;
-      this.selectedModel = null;
-      this.persistSelection();
-    }
+    // Recompute display only — never overwrite preferredBackend/model.
+    this.syncDisplaySelection();
   }
 
   setAvailableModels(models: Record<string, BackendModels>): void {
     this.modelsByBackend = models;
-    // Drop a persisted/selected model the current backend no longer advertises.
-    if (this.selectedModel) {
-      const opts = models[this.selectedBackend]?.options;
-      if (!opts || !opts.some((o) => o.value === this.selectedModel)) {
-        this.selectedModel = null;
-        this.persistSelection();
+    this.syncDisplaySelection();
+  }
+
+  /**
+   * Apply host-persisted last-used backend/model (survives restarts).
+   * Host preference wins over ephemeral webview state.
+   */
+  applyHostComposerSelection(backend: string, model: string | null): void {
+    if (
+      backend !== 'claude' &&
+      backend !== 'grok' &&
+      backend !== 'kiro' &&
+      backend !== 'codex' &&
+      backend !== 'opencode'
+    ) {
+      return;
+    }
+    this.preferredBackend = backend;
+    this.preferredModel = typeof model === 'string' && model.length > 0 ? model : null;
+    this.syncDisplaySelection();
+    this.persistLocalSelection();
+  }
+
+  /**
+   * Map preferredBackend/model onto selectedBackend/model for the picker.
+   * Falls back to the first detected backend when preferred is unavailable,
+   * without mutating or persisting the preference.
+   */
+  private syncDisplaySelection(): void {
+    const ids = this.availableBackends;
+    if (ids && ids.length > 0 && !ids.includes(this.preferredBackend)) {
+      this.selectedBackend = ids[0] as WebviewBackendId;
+      this.selectedModel = null;
+      return;
+    }
+    this.selectedBackend = this.preferredBackend;
+    let model = this.preferredModel;
+    if (model && this.modelsByBackend) {
+      const opts = this.modelsByBackend[this.preferredBackend]?.options;
+      if (!opts || !opts.some((o) => o.value === model)) {
+        model = null;
       }
     }
+    this.selectedModel = model;
   }
 
   private persistSelection(): void {
+    this.persistLocalSelection();
+    // Durable copy on the host — webview setState alone is lost on full restart.
+    try {
+      vscode.postMessage({
+        type: 'setComposerSelection',
+        backend: this.preferredBackend,
+        model: this.preferredModel,
+      });
+    } catch {
+      // best-effort
+    }
+  }
+
+  private persistLocalSelection(): void {
     try {
       const prev = (vscode.getState() as Record<string, unknown> | undefined) ?? {};
-      vscode.setState({ ...prev, selectedBackend: this.selectedBackend, selectedModel: this.selectedModel });
+      vscode.setState({
+        ...prev,
+        selectedBackend: this.preferredBackend,
+        selectedModel: this.preferredModel,
+      });
     } catch {
       // best-effort
     }
@@ -152,6 +222,8 @@ class TasksState {
     this.focusedTaskId = null;
     this.subtree = [];
     this.queuedTurns = [];
+    // Keep last-used preferredBackend/model; only refresh display mapping.
+    this.syncDisplaySelection();
   }
 
   openContinuationDraft(terminalTaskId: string): void {
@@ -273,17 +345,39 @@ export function registerBackendSelect(el: (HTMLElement & { value: string }) | un
   backendSelectEl = el;
 }
 
-/** Read the dropdown at send time so the chosen backend drives new-task creation. */
+/**
+ * Backend for a draft send. The live select is authoritative when it has a
+ * parseable value (`backend` or `backend::model`) — that is what the user sees.
+ * preferredBackend is only a fallback when the select is missing/unmounted.
+ */
 export function resolveBackendForSend(): WebviewBackendId {
-  const fromSelect = backendSelectEl?.value;
-  if (
-    fromSelect === 'claude' ||
-    fromSelect === 'grok' ||
-    fromSelect === 'kiro' ||
-    fromSelect === 'codex' ||
-    fromSelect === 'opencode'
-  ) {
-    return fromSelect;
+  return parseBackendId(backendSelectEl?.value) ?? tasks.preferredBackend;
+}
+
+/**
+ * Model for a draft send. Prefer the encoded select value, then preferredModel
+ * when it belongs to the resolved backend.
+ */
+export function resolveModelForSend(): string | null {
+  const raw = backendSelectEl?.value;
+  const fromDom = parseModelFromSelectValue(raw);
+  if (fromDom) return fromDom;
+  const backend = resolveBackendForSend();
+  if (backend === tasks.preferredBackend) return tasks.preferredModel;
+  return null;
+}
+
+/**
+ * Sync preferred* from the live select (or current preferred) so persistence
+ * and subsequent drafts match what was just sent.
+ */
+export function syncPreferenceFromSend(): { backend: WebviewBackendId; model: string | null } {
+  const backend = resolveBackendForSend();
+  const model = resolveModelForSend();
+  if (model) {
+    tasks.setModelSelection(backend, model);
+  } else {
+    tasks.setBackend(backend);
   }
-  return tasks.selectedBackend;
+  return { backend, model };
 }

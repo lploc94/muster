@@ -1,6 +1,11 @@
 <script lang="ts">
   import { threadStore } from '../lib/thread.svelte';
-  import { tasks, resolveBackendForSend, registerBackendSelect } from '../lib/tasks.svelte';
+  import {
+    tasks,
+    registerBackendSelect,
+    type WebviewBackendId,
+  } from '../lib/tasks.svelte';
+  import { parseBackendId, parseModelFromSelectValue } from '../lib/backend-resolve';
   import { post } from '../lib/protocol';
   import { ADD_CONTEXT_ACTIONS, getAddContextActionHostMessage } from '../lib/context-actions';
   import {
@@ -18,8 +23,7 @@
   import type { AddContextAction } from '../lib/context-actions';
   import type { PendingAsk, TaskSummary, TaskViewStatus } from '../lib/protocol';
   import { effectiveRuntimeActivity } from '../lib/protocol';
-  import type { WebviewBackendId } from '../lib/tasks.svelte';
-  import { BACKENDS, backendShortLabel } from '../lib/backends';
+  import { BACKENDS, backendShortLabel, backendModelLabel } from '../lib/backends';
   import { tip } from '../lib/tooltip';
   import {
     extractFileDropCandidatesFromDataTransfer,
@@ -208,8 +212,19 @@
 
     if (mode === 'draft') {
       // Draft has no live-inject path — treat any submit as create-task send.
-      const backend = resolveBackendForSend();
-      tasks.setBackend(backend);
+      // Read the LIVE select element first (what the user sees). Do not trust
+      // preferredBackend alone — onchange can lag or be missed by the WC.
+      const raw = backendSelect?.value ?? '';
+      const fromDom = parseBackendId(raw);
+      const backend: WebviewBackendId = fromDom ?? tasks.preferredBackend;
+      const model =
+        parseModelFromSelectValue(raw) ??
+        (backend === tasks.preferredBackend ? tasks.preferredModel : null);
+      if (model) {
+        tasks.setModelSelection(backend, model);
+      } else {
+        tasks.setBackend(backend);
+      }
       const payload: {
         type: 'send';
         text: string;
@@ -219,13 +234,17 @@
         continuationOf?: string;
       } = { type: 'send', text: displayText, backend };
       if (llmText !== displayText) payload.llmText = llmText;
-      // Only deliver a model that belongs to the chosen backend's catalog. Before
-      // enumeration finishes (catalog null) trust the persisted selection.
-      const model = tasks.selectedModel;
-      if (model && (!tasks.modelsByBackend || modelInCatalog(backend, model))) {
-        payload.model = model;
-      }
+      if (model) payload.model = model;
       if (tasks.continuationOf) payload.continuationOf = tasks.continuationOf;
+      // DEBUG: temporary — remove after diagnosing grok→claude draft send.
+      console.info('[muster][draft-send]', {
+        selectValue: raw,
+        fromDom,
+        preferredBackend: tasks.preferredBackend,
+        preferredModel: tasks.preferredModel,
+        payloadBackend: payload.backend,
+        payloadModel: payload.model ?? null,
+      });
       threadStore.current.appendTranscript({
         id: `local-${Date.now()}`,
         kind: 'user',
@@ -496,60 +515,135 @@
   const modelsLoaded = $derived(!!tasks.modelsByBackend && Object.keys(tasks.modelsByBackend).length > 0);
   const modelsLoading = $derived(mode === 'draft' && !modelsLoaded);
 
+  /** Prefer the user's restored choice over the availability display fallback. */
+  const draftBackend = $derived(
+    mode === 'draft' ? tasks.preferredBackend : currentBackend,
+  );
+  const draftModel = $derived(
+    mode === 'draft'
+      ? (tasks.preferredModel ?? tasks.selectedModel)
+      : tasks.selectedModel,
+  );
+
   const pickerOptions = $derived.by(() => {
     const models = tasks.modelsByBackend;
+    const opts: { value: string; label: string }[] = [];
     if (models && Object.keys(models).length > 0) {
-      const opts: { value: string; label: string }[] = [];
       for (const be of pickerBackends) {
         const m = models[be.id];
         if (m && m.options.length > 0) {
           for (const o of m.options) {
-            opts.push({ value: `${be.id}::${o.value}`, label: `[${backendShortLabel(be.id)}] ${o.name}` });
+            opts.push({
+              value: `${be.id}::${o.value}`,
+              label: `[${backendShortLabel(be.id)}] ${o.name}`,
+            });
           }
         } else {
           // Backend installed but no model list yet (still enumerating) or none advertised.
+          // Keep restored preference visible as backend::model when we have one.
+          if (be.id === draftBackend && draftModel) {
+            opts.push({
+              value: `${be.id}::${draftModel}`,
+              label: `[${backendShortLabel(be.id)}] ${draftModel}`,
+            });
+          } else {
+            opts.push({
+              value: be.id,
+              label: modelsLoading ? `${be.label} (loading models…)` : be.label,
+            });
+          }
+        }
+      }
+    } else {
+      for (const be of pickerBackends) {
+        if (be.id === draftBackend && draftModel) {
+          opts.push({
+            value: `${be.id}::${draftModel}`,
+            label: `[${backendShortLabel(be.id)}] ${draftModel}`,
+          });
+        } else {
           opts.push({
             value: be.id,
             label: modelsLoading ? `${be.label} (loading models…)` : be.label,
           });
         }
       }
-      if (opts.length > 0) return opts;
     }
-    return pickerBackends.map((b) => ({
-      value: b.id,
-      label: modelsLoading ? `${b.label} (loading models…)` : b.label,
-    }));
+    // Ensure the active selection always exists as an option (web component needs it).
+    const active = encodePickerValue(draftBackend, draftModel, models);
+    if (active.includes('::') && !opts.some((o) => o.value === active)) {
+      const [be, ...rest] = active.split('::');
+      const model = rest.join('::');
+      opts.unshift({
+        value: active,
+        label: `[${backendShortLabel(be)}] ${model}`,
+      });
+    }
+    return opts;
   });
 
   function modelInCatalog(backend: string, model: string): boolean {
     return !!tasks.modelsByBackend?.[backend]?.options.some((o) => o.value === model);
   }
 
-  // Encoded value the select should show — always an option that exists in
-  // `pickerOptions`. Until models load (or for a backend with none) that is the
-  // plain backend id; otherwise the chosen model, else the backend's default.
-  const currentPickerValue = $derived.by(() => {
-    if (!modelsLoaded) return currentBackend;
-    const m = tasks.modelsByBackend?.[currentBackend];
+  function encodePickerValue(
+    backend: string,
+    model: string | null,
+    models: typeof tasks.modelsByBackend,
+  ): string {
+    const m = models?.[backend];
     if (m && m.options.length > 0) {
       const chosen =
-        tasks.selectedModel && modelInCatalog(currentBackend, tasks.selectedModel)
-          ? tasks.selectedModel
-          : (m.current ?? m.options[0].value);
-      return `${currentBackend}::${chosen}`;
+        (model && m.options.some((o) => o.value === model) ? model : null) ??
+        m.current ??
+        m.options[0].value;
+      return `${backend}::${chosen}`;
     }
-    return currentBackend;
-  });
+    if (model) return `${backend}::${model}`;
+    return backend;
+  }
 
-  // Remount key so vscode-single-select rebuilds options when the catalog arrives
-  // (web components often ignore Svelte re-rendering child <vscode-option>s).
-  // Only remount when the option *set* changes — not when the selected value changes.
-  const pickerRemountKey = $derived(
-    modelsLoaded
-      ? `models:${pickerOptions.map((o) => o.value).join('|')}`
-      : `backends:${pickerBackends.map((b) => b.id).join(',')}:loading`,
+  // Always prefer backend::model when a model is known (restored or catalog default).
+  const currentPickerValue = $derived(
+    encodePickerValue(draftBackend, draftModel, tasks.modelsByBackend),
   );
+
+  // Remount only on catalog phase transitions (empty → has models). vscode-elements
+  // does not fire change when setting .value / defaulting option[0] on remount —
+  // only real user click/Enter dispatches change (via new Event, isTrusted=false).
+  let catalogGeneration = $state(0);
+  let sawModels = false;
+  $effect(() => {
+    const loaded = modelsLoaded;
+    if (loaded && !sawModels) {
+      sawModels = true;
+      catalogGeneration += 1;
+    }
+    if (!loaded) {
+      sawModels = false;
+      catalogGeneration += 1;
+    }
+  });
+  const pickerRemountKey = $derived(
+    modelsLoaded ? `models:${catalogGeneration}` : `loading:${catalogGeneration}`,
+  );
+
+  // Only force preferred encoding after remount — never continuously overwrite
+  // the live select (that fights the user's pick and can clobber Grok → Claude).
+  let lastForcedRemountKey = '';
+  $effect(() => {
+    const el = backendSelect;
+    const key = pickerRemountKey;
+    const next = currentPickerValue;
+    if (!el || mode !== 'draft') return;
+    if (key === lastForcedRemountKey && el.value) return;
+    lastForcedRemountKey = key;
+    try {
+      el.value = next;
+    } catch {
+      // best-effort
+    }
+  });
 
   // Ensure host starts enumeration when the draft composer is shown (also
   // prefetched on App mount / panel resolve).
@@ -566,7 +660,7 @@
 
   const placeholder = $derived(
     mode === 'draft'
-      ? `Start a new coordinator task with ${currentBackend}…`
+      ? `Start a new coordinator task with ${draftBackend}…`
       : isTerminalReopenable
         ? 'Send a message to reopen this task…'
         : blockReason
@@ -579,6 +673,8 @@
   const BACKEND_IDS = ['claude', 'grok', 'kiro', 'codex', 'opencode'];
 
   function onBackendChange(e: Event) {
+    // vscode-single-select dispatches `new Event('change')` so isTrusted is always
+    // false even for real user clicks — never filter on isTrusted.
     const el = (e.currentTarget ?? backendSelect) as (HTMLElement & { value: string }) | undefined;
     const raw = el?.value ?? '';
     const sep = raw.indexOf('::');
@@ -586,10 +682,14 @@
       const backend = raw.slice(0, sep);
       const model = raw.slice(sep + 2);
       if (BACKEND_IDS.includes(backend)) {
+        console.info('[muster][picker-change]', { raw, backend, model, isTrusted: e.isTrusted });
         tasks.setModelSelection(backend as WebviewBackendId, model);
       }
     } else if (BACKEND_IDS.includes(raw)) {
+      console.info('[muster][picker-change]', { raw, backend: raw, model: null, isTrusted: e.isTrusted });
       tasks.setBackend(raw as WebviewBackendId);
+    } else {
+      console.warn('[muster][picker-change] unparsed', { raw, isTrusted: e.isTrusted });
     }
   }
 </script>
@@ -672,7 +772,6 @@
         {#key pickerRemountKey}
           <vscode-single-select
             bind:this={backendSelect}
-            value={currentPickerValue}
             use:tip={modelsLoaded
               ? 'Select backend + model for the new task'
               : 'Loading models from installed CLIs… (shows backends first)'}
@@ -683,7 +782,9 @@
             style="width: fit-content; min-width: fit-content; max-width: 100%;"
           >
             {#each pickerOptions as opt (opt.value)}
-              <vscode-option value={opt.value}>{opt.label}</vscode-option>
+              <vscode-option value={opt.value} selected={opt.value === currentPickerValue}
+                >{opt.label}</vscode-option
+              >
             {/each}
           </vscode-single-select>
         {/key}
@@ -691,9 +792,9 @@
         <div
           class="px-2 py-0.5 text-xs rounded border truncate"
           style="border-color: var(--vscode-panel-border); opacity: 0.85;"
-          use:tip={'Backend for this task'}
+          use:tip={'Backend + model for this task'}
         >
-          {backendShortLabel(currentBackend)}
+          {backendModelLabel(currentBackend, tasks.focusedTask?.model)}
         </div>
       {/if}
 
