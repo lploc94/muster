@@ -100,7 +100,7 @@ function debugElicitation(event: string, details: Record<string, unknown> = {}):
  * version is stamped on the bootstrap `snapshot` message, and a mismatch is
  * surfaced in the webview as a visible "reload the window" banner.
  */
-const PROTOCOL_VERSION = 3;
+const PROTOCOL_VERSION = 4;
 
 /** How long a permission prompt waits for a webview decision before safe-denying. */
 const PERMISSION_PROMPT_TIMEOUT_MS = 120_000;
@@ -953,29 +953,84 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     backend?: string;
     model?: string;
     continuationOf?: string;
+    clientRequestId?: string;
   }): Promise<void> {
+    const clientRequestId =
+      typeof data.clientRequestId === 'string' && data.clientRequestId.trim()
+        ? data.clientRequestId.trim()
+        : undefined;
     if (!taskEngine || !taskStore) {
-      this.postCommandError('task engine not ready');
+      if (clientRequestId) {
+        this.post({
+          type: 'sendRejected',
+          clientRequestId,
+          taskId: data.taskId,
+          reason: 'task engine not ready',
+          code: 'store',
+        });
+      } else {
+        this.postCommandError('task engine not ready');
+      }
       return;
     }
     if (data.backend !== undefined && !WEBVIEW_BACKENDS.has(data.backend)) {
-      this.postCommandError('unknown backend', data.taskId);
+      if (clientRequestId) {
+        this.post({
+          type: 'sendRejected',
+          clientRequestId,
+          taskId: data.taskId,
+          reason: 'unknown backend',
+          code: 'validation',
+        });
+      } else {
+        this.postCommandError('unknown backend', data.taskId);
+      }
       return;
     }
     // `text` = user-visible (display-name chips). `llmText` = agent payload when expanded.
     const text = data.text?.trim();
     if (!text) {
-      this.postCommandError('message cannot be empty', data.taskId);
+      if (clientRequestId) {
+        this.post({
+          type: 'sendRejected',
+          clientRequestId,
+          taskId: data.taskId,
+          reason: 'message cannot be empty',
+          code: 'validation',
+        });
+      } else {
+        this.postCommandError('message cannot be empty', data.taskId);
+      }
       return;
     }
     if (text.length > MAX_MESSAGE_CHARS) {
-      this.postCommandError('message too long', data.taskId);
+      if (clientRequestId) {
+        this.post({
+          type: 'sendRejected',
+          clientRequestId,
+          taskId: data.taskId,
+          reason: 'message too long',
+          code: 'validation',
+        });
+      } else {
+        this.postCommandError('message too long', data.taskId);
+      }
       return;
     }
     const llmText =
       typeof data.llmText === 'string' && data.llmText.trim() ? data.llmText.trim() : text;
     if (llmText.length > MAX_MESSAGE_CHARS) {
-      this.postCommandError('message too long', data.taskId);
+      if (clientRequestId) {
+        this.post({
+          type: 'sendRejected',
+          clientRequestId,
+          taskId: data.taskId,
+          reason: 'message too long',
+          code: 'validation',
+        });
+      } else {
+        this.postCommandError('message too long', data.taskId);
+      }
       return;
     }
 
@@ -983,7 +1038,16 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       if (data.continuationOf) {
         const continuationError = this.validateContinuationOf(data.continuationOf);
         if (continuationError) {
-          this.postCommandError(continuationError);
+          if (clientRequestId) {
+            this.post({
+              type: 'sendRejected',
+              clientRequestId,
+              reason: continuationError,
+              code: 'validation',
+            });
+          } else {
+            this.postCommandError(continuationError);
+          }
           return;
         }
       }
@@ -1012,9 +1076,24 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         // Capture the workspace cwd at task-creation time so every turn (and any
         // delegated child) runs in the right directory instead of process.cwd().
         cwd: resolveTaskCwd(),
+        clientRequestId,
       });
       if (!result.ok) {
-        this.postCommandError(result.reason);
+        if (clientRequestId) {
+          const code = /conflict/i.test(result.reason)
+            ? 'conflict'
+            : /capacity|maxTurns|turn cap/i.test(result.reason)
+              ? 'capacity'
+              : 'unknown';
+          this.post({
+            type: 'sendRejected',
+            clientRequestId,
+            reason: result.reason,
+            code,
+          });
+        } else {
+          this.postCommandError(result.reason);
+        }
         return;
       }
       console.info('[muster][host-send] task created', {
@@ -1023,16 +1102,50 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         model: resolvedModel ?? null,
       });
       this.focusedTaskId = result.value.taskId;
+      if (clientRequestId) {
+        this.post({
+          type: 'sendAccepted',
+          clientRequestId,
+          taskId: result.value.taskId,
+          messageId: result.value.messageId,
+          turnId: result.value.turnId,
+        });
+      }
       this.postSnapshot(result.value.taskId);
       return;
     }
 
     const result = taskEngine.send(data.taskId, text, {
       agentContent: llmText !== text ? llmText : undefined,
+      clientRequestId,
     });
     if (!result.ok) {
-      this.postCommandError(result.reason, data.taskId);
+      if (clientRequestId) {
+        const code = /conflict/i.test(result.reason)
+          ? 'conflict'
+          : /capacity|maxTurns|turn cap/i.test(result.reason)
+            ? 'capacity'
+            : 'unknown';
+        this.post({
+          type: 'sendRejected',
+          clientRequestId,
+          taskId: data.taskId,
+          reason: result.reason,
+          code,
+        });
+      } else {
+        this.postCommandError(result.reason, data.taskId);
+      }
       return;
+    }
+    if (clientRequestId && result.value.messageId) {
+      this.post({
+        type: 'sendAccepted',
+        clientRequestId,
+        taskId: data.taskId,
+        messageId: result.value.messageId,
+        turnId: result.value.turnId,
+      });
     }
     // Only project into chat when the turn is not a FIFO follow-up still sitting
     // in the queue. Queued messages appear in the queue panel only; they enter

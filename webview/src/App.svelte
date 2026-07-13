@@ -24,6 +24,8 @@
     SettingsUpdateResult,
   } from './lib/protocol';
   import { tip } from './lib/tooltip';
+  import { outboxList, outboxRemove } from './lib/send-outbox';
+  import { vscode } from './lib/vscode';
 
   const SETTING_LABELS: Record<RetentionSettingId, string> = {
     maxTurnsPerTask: 'Maximum turns per task',
@@ -404,6 +406,17 @@
           }
           break;
 
+        case 'sendAccepted':
+          outboxRemove(vscode, msg.clientRequestId);
+          break;
+
+        case 'sendRejected':
+          outboxRemove(vscode, msg.clientRequestId);
+          if (isTaskScopedBannerVisible(msg.taskId, tasks.focusedTaskId)) {
+            tasks.setCommandError(msg.reason, msg.taskId ?? null);
+          }
+          break;
+
         case 'liveInputResult':
           // Delivered acks must not be silently dropped; refusals use commandError.
           if (isTaskScopedBannerVisible(msg.taskId, tasks.focusedTaskId)) {
@@ -430,6 +443,19 @@
     post({ type: 'listBackends' });
     // Prefetch model lists for the New-task picker (host also prefetches on resolve).
     post({ type: 'listModels' });
+    // Phase C: resend unacked outbox entries with the same clientRequestId.
+    for (const entry of outboxList(vscode)) {
+      post({
+        type: 'send',
+        taskId: entry.taskId,
+        text: entry.text,
+        llmText: entry.llmText,
+        backend: entry.backend,
+        model: entry.model,
+        continuationOf: entry.continuationOf,
+        clientRequestId: entry.clientRequestId,
+      });
+    }
     return () => window.removeEventListener('message', onMessage);
   });
 </script>

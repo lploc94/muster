@@ -299,6 +299,29 @@ function ownsLocalLease(storePath: string, turnId: string): boolean {
   return existing?.pid === process.pid;
 }
 
+/** Stable fingerprint for Phase C send idempotency (existing-task path). */
+export function sendFingerprint(input: {
+  kind: 'existing' | 'new';
+  taskId?: string;
+  content: string;
+  agentContent?: string;
+  backend?: string;
+  model?: string;
+  continuationOf?: string;
+  goal?: string;
+}): string {
+  return JSON.stringify({
+    kind: input.kind,
+    taskId: input.taskId ?? null,
+    content: input.content,
+    agentContent: input.agentContent ?? null,
+    backend: input.backend ?? null,
+    model: input.model ?? null,
+    continuationOf: input.continuationOf ?? null,
+    goal: input.goal ?? null,
+  });
+}
+
 export function projectPrompt(
   turn: TaskTurn,
   messages: ReadonlyMap<string, TaskMessage>,
@@ -726,10 +749,48 @@ export class TaskEngine {
     agentMessage?: string;
     /** Workspace directory the agent runs in for this task's turns. */
     cwd?: string;
-  }): EngineResult<{ taskId: string; messageId: string; turnId: string }> {
+    /** Phase C idempotent send key. */
+    clientRequestId?: string;
+  }): EngineResult<{ taskId: string; messageId: string; turnId: string; clientRequestId?: string }> {
     const backend = this.makeBackend(params.backend);
     if (!canBindTaskToBackend(backend.capabilities)) {
       return { ok: false, reason: 'backend does not support MCP' };
+    }
+
+    const clientRequestId =
+      typeof params.clientRequestId === 'string' && params.clientRequestId.trim()
+        ? params.clientRequestId.trim()
+        : undefined;
+    const messageContent = params.message ?? params.goal;
+    const agentContent =
+      params.agentMessage && params.agentMessage !== messageContent
+        ? params.agentMessage
+        : undefined;
+    const fingerprint = sendFingerprint({
+      kind: 'new',
+      content: messageContent,
+      agentContent,
+      backend: params.backend,
+      model: params.model,
+      continuationOf: params.continuationOf,
+      goal: params.goal,
+    });
+    if (clientRequestId) {
+      const existing = this.store.getFile().sendReceipts?.[clientRequestId];
+      if (existing) {
+        if (existing.fingerprint !== fingerprint) {
+          return { ok: false, reason: 'clientRequestId conflict: different payload' };
+        }
+        return {
+          ok: true,
+          value: {
+            taskId: existing.taskId,
+            messageId: existing.messageId,
+            turnId: existing.turnId,
+            clientRequestId,
+          },
+        };
+      }
     }
 
     const taskId = randomUUID();
@@ -751,6 +812,15 @@ export class TaskEngine {
     };
 
     const commit = this.store.commit((draft) => {
+      if (clientRequestId) {
+        const race = draft.sendReceipts?.[clientRequestId];
+        if (race) {
+          if (race.fingerprint !== fingerprint) {
+            return { ok: false, reason: 'clientRequestId conflict: different payload' };
+          }
+          return { ok: true };
+        }
+      }
       if (draft.tasks[taskId]) {
         return { ok: false, reason: 'task id already exists' };
       }
@@ -761,11 +831,6 @@ export class TaskEngine {
       }
       draft.tasks[taskId] = created.next;
 
-      const messageContent = params.message ?? params.goal;
-      const agentContent =
-        params.agentMessage && params.agentMessage !== messageContent
-          ? params.agentMessage
-          : undefined;
       draft.messages[messageId] = {
         id: messageId,
         taskId,
@@ -785,6 +850,17 @@ export class TaskEngine {
         return queued;
       }
       draft.turns[turnId] = queued.next;
+      if (clientRequestId) {
+        draft.sendReceipts = draft.sendReceipts ?? {};
+        draft.sendReceipts[clientRequestId] = {
+          clientRequestId,
+          fingerprint,
+          taskId,
+          messageId,
+          turnId,
+          createdAt: now,
+        };
+      }
       return { ok: true };
     });
 
@@ -792,8 +868,27 @@ export class TaskEngine {
       return { ok: false, reason: commit.detail ?? commit.reason };
     }
 
+    if (clientRequestId) {
+      const receipt = this.store.getFile().sendReceipts?.[clientRequestId];
+      if (receipt) {
+        void this.scheduleTurn(receipt.turnId);
+        return {
+          ok: true,
+          value: {
+            taskId: receipt.taskId,
+            messageId: receipt.messageId,
+            turnId: receipt.turnId,
+            clientRequestId,
+          },
+        };
+      }
+    }
+
     void this.scheduleTurn(turnId);
-    return { ok: true, value: { taskId, messageId, turnId } };
+    return {
+      ok: true,
+      value: { taskId, messageId, turnId, ...(clientRequestId ? { clientRequestId } : {}) },
+    };
   }
 
   /**
@@ -1017,15 +1112,54 @@ export class TaskEngine {
   send(
     taskId: string,
     content: string,
-    options?: { agentContent?: string },
-  ): EngineResult<{ messageId: string; turnId?: string }> {
+    options?: { agentContent?: string; clientRequestId?: string },
+  ): EngineResult<{ messageId: string; turnId?: string; clientRequestId?: string }> {
+    const clientRequestId =
+      typeof options?.clientRequestId === 'string' && options.clientRequestId.trim()
+        ? options.clientRequestId.trim()
+        : undefined;
+    const agentContent =
+      options?.agentContent && options.agentContent !== content ? options.agentContent : undefined;
+    const fingerprint = sendFingerprint({
+      kind: 'existing',
+      taskId,
+      content,
+      agentContent,
+    });
+
+    if (clientRequestId) {
+      const existing = this.store.getFile().sendReceipts?.[clientRequestId];
+      if (existing) {
+        if (existing.fingerprint !== fingerprint) {
+          return { ok: false, reason: 'clientRequestId conflict: different payload' };
+        }
+        return {
+          ok: true,
+          value: {
+            messageId: existing.messageId,
+            turnId: existing.turnId,
+            clientRequestId,
+          },
+        };
+      }
+    }
+
     const messageId = randomUUID();
     const now = nowIso(this.clock);
     let queuedTurnId: string | undefined;
-    const agentContent =
-      options?.agentContent && options.agentContent !== content ? options.agentContent : undefined;
 
     const commit = this.store.commit((draft) => {
+      if (clientRequestId) {
+        const race = draft.sendReceipts?.[clientRequestId];
+        if (race) {
+          if (race.fingerprint !== fingerprint) {
+            return { ok: false, reason: 'clientRequestId conflict: different payload' };
+          }
+          queuedTurnId = race.turnId;
+          return { ok: true };
+        }
+      }
+
       let draftTask = draft.tasks[taskId];
       if (!draftTask) {
         return { ok: false, reason: 'task not found' };
@@ -1094,6 +1228,17 @@ export class TaskEngine {
       }
       draft.turns[turnId] = queue.next;
       queuedTurnId = turnId;
+      if (clientRequestId) {
+        draft.sendReceipts = draft.sendReceipts ?? {};
+        draft.sendReceipts[clientRequestId] = {
+          clientRequestId,
+          fingerprint,
+          taskId,
+          messageId,
+          turnId,
+          createdAt: now,
+        };
+      }
       return { ok: true };
     });
 
@@ -1101,11 +1246,31 @@ export class TaskEngine {
       return { ok: false, reason: commit.detail ?? commit.reason };
     }
 
+    if (clientRequestId) {
+      const receipt = this.store.getFile().sendReceipts?.[clientRequestId];
+      if (receipt) {
+        if (receipt.turnId && !this.deferredQueuedTurns.has(receipt.turnId)) {
+          void this.scheduleTurn(receipt.turnId);
+        }
+        return {
+          ok: true,
+          value: {
+            messageId: receipt.messageId,
+            turnId: receipt.turnId,
+            clientRequestId,
+          },
+        };
+      }
+    }
+
     if (queuedTurnId) {
       void this.scheduleTurn(queuedTurnId);
     }
 
-    return { ok: true, value: { messageId, turnId: queuedTurnId } };
+    return {
+      ok: true,
+      value: { messageId, turnId: queuedTurnId, ...(clientRequestId ? { clientRequestId } : {}) },
+    };
   }
 
   /**
@@ -1725,7 +1890,12 @@ export class TaskEngine {
         if (!result.ok) {
           return result;
         }
-        draft.turns[turn.id] = result.next;
+        // Phase C: orphan live after reload → uncertain (no silent auto-replay).
+        draft.turns[turn.id] = {
+          ...result.next,
+          failureClass: 'uncertain',
+          dispatchPhase: draftTurn.dispatchPhase ?? 'prompt_outstanding',
+        };
         holdQueuedFollowUpsOnFailure(draft, draftTurn.taskId);
         return { ok: true };
       });
@@ -2072,7 +2242,8 @@ export class TaskEngine {
       if (!started.ok) {
         return started;
       }
-      draft.turns[turnId] = started.next;
+      // Phase C: durable pre_dispatch until onBeforePrompt flips to prompt_outstanding.
+      draft.turns[turnId] = { ...started.next, dispatchPhase: 'pre_dispatch' };
       return { ok: true };
     });
 
@@ -2181,6 +2352,23 @@ export class TaskEngine {
             },
           };
       mcpConfigPath = built.mcpConfigPath;
+      // Phase C: mark prompt_outstanding immediately before side-effecting prompt.
+      built.options = {
+        ...built.options,
+        onBeforePrompt: async () => {
+          this.store.commit((draft) => {
+            const t = draft.turns[turnId];
+            if (!t || (t.status !== 'running' && t.status !== 'waiting_user')) {
+              return { ok: true };
+            }
+            if (t.dispatchPhase === 'prompt_outstanding' || t.dispatchPhase === 'terminal_received') {
+              return { ok: true };
+            }
+            draft.turns[turnId] = { ...t, dispatchPhase: 'prompt_outstanding' };
+            return { ok: true };
+          });
+        },
+      };
 
       for await (const event of this.runTurnFn(backend, built.options)) {
         processCancelRequests(this.graphDeps());
@@ -2504,13 +2692,22 @@ export class TaskEngine {
               }
             } else {
               const terminalReceived = event.meta?.failureClass === 'terminal_received';
+              const livePhase = this.store.getFile().turns[turnId]?.dispatchPhase;
+              const failureClass =
+                terminalReceived
+                  ? 'terminal_received'
+                  : livePhase === 'prompt_outstanding'
+                    ? 'uncertain'
+                    : livePhase === 'pre_dispatch' || livePhase === undefined
+                      ? 'safe_to_retry'
+                      : 'unclassified';
               terminalSettled = await this.settleFailed(
                 turnId,
                 event.message,
                 observedSessionId,
                 rawOutput,
                 backend,
-                { terminalReceived },
+                { terminalReceived, failureClass },
               );
               if (terminalSettled) {
                 this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message: event.message });
@@ -2718,7 +2915,10 @@ export class TaskEngine {
     observedSessionId: string | undefined,
     rawOutput: string,
     backend: Backend,
-    opts?: { terminalReceived?: boolean },
+    opts?: {
+      terminalReceived?: boolean;
+      failureClass?: import('./types').TurnFailureClass;
+    },
   ): Promise<boolean> {
     if (this.settling.has(turnId)) {
       return false;
@@ -2734,12 +2934,16 @@ export class TaskEngine {
         }
 
         const turns = turnsForTask(draft, task.id);
+        const failureClass =
+          opts?.failureClass ??
+          (opts?.terminalReceived ? 'terminal_received' : 'unclassified');
         const result = applyFailedTurn(task, turn, {
           error: errorMessage,
           retryCount: retryCountOf(turns, turn.id),
           policy: task.executionPolicy,
           onExhausted: 'recover',
           now,
+          failureClass,
         });
         if (!result.ok) {
           return result;
@@ -2787,8 +2991,9 @@ export class TaskEngine {
                 draft.turns[turnId],
                 {
                   turnId: retryId,
-                  instruction: `Automatic retry after failure: ${errorMessage.slice(0, 200)}`,
+                  instruction: '',
                   now,
+                  reuseOriginalInputs: true,
                 },
               );
               if (retryResult.ok) {

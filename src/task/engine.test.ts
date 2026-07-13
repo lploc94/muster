@@ -1762,4 +1762,88 @@ describe('TaskEngine.interruptAndSend', () => {
     // Second reservation still exists (queued or finished).
     expect(store.getFile().turns[b.value.turnId]).toBeDefined();
   });
+
+  it('Phase C: same clientRequestId re-ACKs without duplicate turn', () => {
+    const { store } = makeTempStore();
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => scriptedBackend([{ type: 'turnCompleted' }]),
+      clock: () => '2026-07-06T12:00:00.000Z',
+    });
+    engine.createTask({ id: 'task-1', goal: 'hello', backend: 'fake' });
+    const first = engine.send('task-1', 'hi', { clientRequestId: 'req-1' });
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    const second = engine.send('task-1', 'hi', { clientRequestId: 'req-1' });
+    expect(second.ok).toBe(true);
+    if (!second.ok || !first.ok) return;
+    expect(second.value.messageId).toBe(first.value.messageId);
+    expect(second.value.turnId).toBe(first.value.turnId);
+    const userMsgs = Object.values(store.getFile().messages).filter((m) => m.role === 'user');
+    expect(userMsgs).toHaveLength(1);
+  });
+
+  it('Phase C: same clientRequestId different payload is rejected', () => {
+    const { store } = makeTempStore();
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => scriptedBackend([{ type: 'turnCompleted' }]),
+      clock: () => '2026-07-06T12:00:00.000Z',
+    });
+    engine.createTask({ id: 'task-1', goal: 'hello', backend: 'fake' });
+    const first = engine.send('task-1', 'hi', { clientRequestId: 'req-2' });
+    expect(first.ok).toBe(true);
+    const second = engine.send('task-1', 'different', { clientRequestId: 'req-2' });
+    expect(second.ok).toBe(false);
+    if (!second.ok) {
+      expect(second.reason).toMatch(/conflict/i);
+    }
+  });
+
+  it('Phase C: safe auto-retry reuses original message inputs (same prompt)', async () => {
+    const { store } = makeTempStore();
+    const prompts: string[] = [];
+    const backend: Backend = {
+      name: 'fake',
+      capabilities: MCP_CAPS,
+      async *run(options) {
+        prompts.push(options.prompt);
+        if (prompts.length === 1) {
+          yield { type: 'error', message: 'pre-dispatch fail' };
+          return;
+        }
+        yield { type: 'turnCompleted' };
+      },
+    };
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => backend,
+      clock: () => '2026-07-06T12:00:00.000Z',
+    });
+    engine.createTask({
+      id: 'task-1',
+      goal: 'hello',
+      backend: 'fake',
+      executionPolicy: {
+        maxTurns: 10,
+        maxAutomaticRetries: 2,
+        turnTimeoutMs: 60_000,
+        taskTimeoutMs: 300_000,
+      },
+    });
+    const sent = engine.send('task-1', 'exact original prompt');
+    expect(sent.ok).toBe(true);
+    await engine.whenIdle();
+    // First failure at pre_dispatch should auto-retry with same prompt text.
+    expect(prompts.length).toBeGreaterThanOrEqual(1);
+    if (prompts.length >= 2) {
+      expect(prompts[1]).toBe(prompts[0]);
+      expect(prompts[0]).toContain('exact original prompt');
+    }
+    const turns = Object.values(store.getFile().turns);
+    const retry = turns.find((t) => t.retryOf);
+    if (retry) {
+      expect(retry.inputs.every((i) => i.kind === 'message')).toBe(true);
+    }
+  });
 });

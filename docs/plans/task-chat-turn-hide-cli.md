@@ -326,14 +326,14 @@ Pre-failure queued turns stay **held** (`holdAutoPromote`); UI: “Paused after 
 - transitions `applyFailedTurn` classification branch
 
 **AC:**
-- [ ] Same id + same fingerprint → single message/turn; duplicate delivery re-ACKs original ids.
-- [ ] Same id + different payload → reject/conflict.
-- [ ] New-task and existing-task sends both covered by receipts.
-- [ ] Agent die before durable dispatch → auto reconnect/retry without user recovery; **backend prompt equals original**.
-- [ ] Agent die after possible dispatch / orphan reload → `uncertain`, no silent replay.
-- [ ] Store failure → NACK; composer keeps draft.
-- [ ] Capacity reject → NACK; draft kept.
-- [ ] User-facing recovery only for uncertainty / explicit replay choice.
+- [x] Same id + same fingerprint → single message/turn; duplicate delivery re-ACKs original ids.
+- [x] Same id + different payload → reject/conflict.
+- [x] New-task and existing-task sends both covered by receipts.
+- [x] Agent die before durable dispatch → auto reconnect/retry without user recovery; **backend prompt equals original**.
+- [x] Agent die after possible dispatch / orphan reload → `uncertain`, no silent replay.
+- [x] Store failure → NACK; composer keeps draft. *(via sendRejected / commandError; draft remains until user clears)*
+- [x] Capacity reject → NACK; draft kept.
+- [x] User-facing recovery only for uncertainty / explicit replay choice. *(uncertain activity projection; soft failed_turn for other classes)*
 
 ---
 

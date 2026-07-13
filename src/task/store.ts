@@ -4,7 +4,7 @@ import { createHash, randomBytes } from 'crypto';
 import { deriveViewStatus } from './derived-status';
 import type { MusterTask, TaskLifecycleState, TaskMessage, TaskStoreFile, TaskTurn, TaskViewStatus } from './types';
 
-export const CURRENT_SCHEMA_VERSION = 3;
+export const CURRENT_SCHEMA_VERSION = 4;
 
 export interface StoreOptions {
   filePath: string;
@@ -56,6 +56,9 @@ function emptyEnvelope(schemaVersion: number): TaskStoreFile {
   if (schemaVersion >= 3) {
     base.toolCalls = {};
     base.reasoning = {};
+  }
+  if (schemaVersion >= 4) {
+    base.sendReceipts = {};
   }
   return base;
 }
@@ -129,6 +132,11 @@ export function migrate(file: TaskStoreFile, targetVersion: number): TaskStoreFi
       current.schemaVersion = 3;
       current.toolCalls = current.toolCalls ?? {};
       current.reasoning = current.reasoning ?? {};
+      continue;
+    }
+    if (current.schemaVersion === 3) {
+      current.schemaVersion = 4;
+      current.sendReceipts = current.sendReceipts ?? {};
       continue;
     }
     throw new Error(`No migration path from schema ${current.schemaVersion}`);

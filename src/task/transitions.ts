@@ -9,6 +9,7 @@ import type {
   TaskRole,
   TaskTurn,
   TurnDisposition,
+  TurnFailureClass,
   TurnInput,
   TurnStatus,
   TurnTrigger,
@@ -448,6 +449,11 @@ export function applyFailedTurn(
     policy: TaskExecutionPolicy;
     onExhausted: 'recover' | 'fail';
     now: string;
+    /**
+     * Phase C: only `safe_to_retry` (durable pre-dispatch) uses maxAutomaticRetries
+     * and enqueues a silent retry. Other classes never auto-retry.
+     */
+    failureClass?: TurnFailureClass;
   },
 ): TransitionResult<{ task: MusterTask; turn: TaskTurn }> {
   if (isTerminalLifecycle(task.lifecycle)) {
@@ -461,15 +467,22 @@ export function applyFailedTurn(
     return { ok: false, reason: 'applyFailedTurn requires a running turn' };
   }
 
+  const failureClass = options.failureClass ?? 'unclassified';
   const failedTurn: TaskTurn = {
     ...turn,
     status: 'failed',
     error: options.error,
     finishedAt: options.now,
     disposition: undefined,
+    failureClass,
+    dispatchPhase: 'terminal_received',
   };
 
-  if (options.retryCount < options.policy.maxAutomaticRetries) {
+  // Silent auto-retry only for durable pre-dispatch safety (Phase C).
+  if (
+    failureClass === 'safe_to_retry' &&
+    options.retryCount < options.policy.maxAutomaticRetries
+  ) {
     return {
       ok: true,
       next: { task: bumpTask(task, options.now, {}), turn: failedTurn },
@@ -478,7 +491,7 @@ export function applyFailedTurn(
   }
 
   // Lifecycle is never sealed by CLI/turn failure — only user or authorized coordinator.
-  // Exhausted retries leave the task open for recovery / user decision.
+  // Exhausted retries / non-safe failures leave the task open for recovery / user decision.
   void options.onExhausted;
   return {
     ok: true,
@@ -592,7 +605,16 @@ export function retryTurn(
   task: MusterTask,
   turns: readonly TaskTurn[],
   oldTurn: TaskTurn,
-  options: { turnId: string; instruction: string; now: string },
+  options: {
+    turnId: string;
+    instruction: string;
+    now: string;
+    /**
+     * Phase C safe auto-retry: reuse original message input ids so the backend
+     * prompt equals the original turn (no diagnostic-only recovery text).
+     */
+    reuseOriginalInputs?: boolean;
+  },
 ): TransitionResult<TaskTurn> {
   if (isTerminalLifecycle(task.lifecycle)) {
     return { ok: false, reason: 'task is terminal' };
@@ -610,18 +632,25 @@ export function retryTurn(
     return { ok: false, reason: 'task already has an active or queued turn' };
   }
 
+  const inputs = options.reuseOriginalInputs
+    ? oldTurn.inputs.filter((input) => input.kind === 'message')
+    : [
+        {
+          kind: 'recovery' as const,
+          interruptedTurnId: oldTurn.id,
+          instruction: options.instruction,
+        },
+      ];
+  if (options.reuseOriginalInputs && inputs.length === 0) {
+    return { ok: false, reason: 'cannot reuse original inputs: no message inputs' };
+  }
+
   return queueTurn(task, turns, {
     turnId: options.turnId,
     now: options.now,
     trigger: 'retry',
     retryOf: oldTurn.id,
-    inputs: [
-      {
-        kind: 'recovery',
-        interruptedTurnId: oldTurn.id,
-        instruction: options.instruction,
-      },
-    ],
+    inputs,
   });
 }
 

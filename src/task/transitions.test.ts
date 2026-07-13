@@ -439,7 +439,7 @@ describe('applyFailedTurn', () => {
     ).toEqual({ ok: false, reason: 'turn does not belong to task' });
   });
 
-  it('discards staged disposition and enqueues retry when under limit', () => {
+  it('discards staged disposition and enqueues retry when under limit (safe_to_retry only)', () => {
     const staged = {
       ...running,
       disposition: { kind: 'complete' as const, result: 'ignored' },
@@ -450,6 +450,7 @@ describe('applyFailedTurn', () => {
       policy: defaultPolicy,
       onExhausted: 'fail',
       now: NOW,
+      failureClass: 'safe_to_retry',
     });
     expect(result.ok).toBe(true);
     if (result.ok) {
@@ -458,6 +459,21 @@ describe('applyFailedTurn', () => {
       expect(result.next.turn.finishedAt).toBe(NOW);
       expect(result.next.task.lifecycle).toBe('open');
       expect(result.effects).toEqual([{ kind: 'enqueueRetry', ofTurnId: 't1' }]);
+    }
+  });
+
+  it('does not auto-retry unclassified failures', () => {
+    const result = applyFailedTurn(baseTask(), running, {
+      error: 'adapter error',
+      retryCount: 0,
+      policy: defaultPolicy,
+      onExhausted: 'recover',
+      now: NOW,
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.effects).toEqual([]);
+      expect(result.next.turn.failureClass).toBe('unclassified');
     }
   });
 

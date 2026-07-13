@@ -271,6 +271,9 @@ export function projectCurrentTurnActivity(file: TaskStoreFile, taskId: string):
   if (isPureUserStop(latest)) {
     return null;
   }
+  if (latest.failureClass === 'uncertain') {
+    return { state: 'uncertain', turnId: latest.id, requiresConfirmation: true };
+  }
   if (latest.status === 'failed') {
     return { state: 'failed_turn', turnId: latest.id, retryable: true };
   }

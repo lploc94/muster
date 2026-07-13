@@ -26,6 +26,12 @@ export interface RunOptions {
   signal?: AbortSignal;
   /** Model to select for this turn's session (ACP `session/set_config_option`). */
   model?: string;
+  /**
+   * Phase C: durable dispatch boundary. Invoked immediately before the
+   * side-effecting `session/prompt` (or equivalent). Host must persist
+   * `prompt_outstanding` here so pre-dispatch failures remain safe_to_retry.
+   */
+  onBeforePrompt?: () => void | Promise<void>;
 }
 
 export interface BackendCapabilities {

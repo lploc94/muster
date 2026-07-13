@@ -41,6 +41,8 @@
     shouldPreventDefaultForComposerKey,
     type ComposerSubmitIntent,
   } from '../lib/composer-submit';
+  import { outboxAdd } from '../lib/send-outbox';
+  import { vscode } from '../lib/vscode';
 
   interface Props {
     mode: 'draft' | 'task';
@@ -221,6 +223,10 @@
       } else {
         tasks.setBackend(backend);
       }
+      const clientRequestId =
+        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `send-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       const payload: {
         type: 'send';
         text: string;
@@ -228,10 +234,20 @@
         backend: string;
         model?: string;
         continuationOf?: string;
-      } = { type: 'send', text: displayText, backend };
+        clientRequestId: string;
+      } = { type: 'send', text: displayText, backend, clientRequestId };
       if (llmText !== displayText) payload.llmText = llmText;
       if (model) payload.model = model;
       if (tasks.continuationOf) payload.continuationOf = tasks.continuationOf;
+      outboxAdd(vscode, {
+        clientRequestId,
+        text: displayText,
+        llmText: llmText !== displayText ? llmText : undefined,
+        backend,
+        model: model ?? undefined,
+        continuationOf: tasks.continuationOf ?? undefined,
+        createdAt: Date.now(),
+      });
       // DEBUG: temporary — remove after diagnosing grok→claude draft send.
       console.info('[muster][draft-send]', {
         selectValue: raw,
@@ -273,6 +289,15 @@
       llmText,
     });
     if (!payload || payload.type !== 'send') return;
+    if (payload.clientRequestId) {
+      outboxAdd(vscode, {
+        clientRequestId: payload.clientRequestId,
+        taskId,
+        text: displayText,
+        llmText: llmText !== displayText ? llmText : undefined,
+        createdAt: Date.now(),
+      });
+    }
     post(payload);
     draftText = '';
     mentionBindings = new Map();

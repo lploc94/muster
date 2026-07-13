@@ -96,7 +96,9 @@ describe('buildTaskComposerMessage', () => {
         { kind: 'send' },
         { taskId: 'task-1', text: '  follow up later  ' },
       ),
-    ).toEqual({ type: 'send', taskId: 'task-1', text: 'follow up later' });
+    ).toEqual(
+      expect.objectContaining({ type: 'send', taskId: 'task-1', text: 'follow up later' }),
+    );
   });
 
   it('builds sendLiveInput only for live inject — never a send/queue message', () => {
@@ -120,7 +122,14 @@ describe('buildTaskComposerMessage', () => {
         { kind: 'send' },
         { taskId: 'task-1', text: '@foo', llmText: '/tmp/foo.ts' },
       ),
-    ).toEqual({ type: 'send', taskId: 'task-1', text: '@foo', llmText: '/tmp/foo.ts' });
+    ).toEqual(
+      expect.objectContaining({
+        type: 'send',
+        taskId: 'task-1',
+        text: '@foo',
+        llmText: '/tmp/foo.ts',
+      }),
+    );
   });
 
   it('refuses empty / whitespace-only payloads for both intents', () => {

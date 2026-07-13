@@ -11,7 +11,7 @@ import type { NormalizedEvent, Question } from './types';
  * breaking change to the ExtMessage/OutMessage shapes below (and mirror it in
  * src/extension.ts).
  */
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 /**
  * Decide whether a peer's advertised protocol version is compatible with ours.
@@ -256,6 +256,22 @@ export type ExtMessage =
     }
   | { type: 'permissionCleared'; permissionId: string }
   | { type: 'commandError'; taskId?: string; message: string }
+  /** Phase C: durable send accepted after store commit (or re-ACK of receipt). */
+  | {
+      type: 'sendAccepted';
+      clientRequestId: string;
+      taskId: string;
+      messageId: string;
+      turnId?: string;
+    }
+  /** Phase C: send rejected (capacity, conflict, store failure). */
+  | {
+      type: 'sendRejected';
+      clientRequestId: string;
+      taskId?: string;
+      reason: string;
+      code?: 'conflict' | 'capacity' | 'store' | 'validation' | 'unknown';
+    }
   /**
    * Host acknowledgement that a live-input instruction was delivered to the
    * locally owned active backend session. Refusals use `commandError` with a
@@ -287,6 +303,8 @@ export type OutMessage =
       backend?: string;
       model?: string;
       continuationOf?: string;
+      /** Phase C idempotent send key (stable across resend). */
+      clientRequestId?: string;
     }
   | { type: 'focusTask'; taskId: string }
   | { type: 'hydrateSubtree'; taskId: string }
@@ -681,6 +699,27 @@ export function isExtMessage(data: unknown): data is ExtMessage {
 
     case 'commandError':
       return isString(data.message) && (data.taskId === undefined || isString(data.taskId));
+
+    case 'sendAccepted':
+      return (
+        isString(data.clientRequestId) &&
+        isString(data.taskId) &&
+        isString(data.messageId) &&
+        (data.turnId === undefined || isString(data.turnId))
+      );
+
+    case 'sendRejected':
+      return (
+        isString(data.clientRequestId) &&
+        isString(data.reason) &&
+        (data.taskId === undefined || isString(data.taskId)) &&
+        (data.code === undefined ||
+          data.code === 'conflict' ||
+          data.code === 'capacity' ||
+          data.code === 'store' ||
+          data.code === 'validation' ||
+          data.code === 'unknown')
+      );
 
     case 'liveInputResult':
       return (

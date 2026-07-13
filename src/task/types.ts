@@ -87,6 +87,25 @@ export type TurnDisposition =
   | { kind: 'fail'; error: string }
   | { kind: 'wait_tasks'; taskIds: string[] }
   | { kind: 'idle' };
+/**
+ * Durable ACP boundary phase for a live/settled turn (Phase C).
+ * Written before side-effecting `session/prompt`; used for reload classification.
+ */
+export type TurnDispatchPhase = 'pre_dispatch' | 'prompt_outstanding' | 'terminal_received';
+
+/**
+ * How a failed/interrupted turn is classified for retry / UI (Phase C).
+ * - safe_to_retry: failed before durable prompt dispatch
+ * - terminal_received: adapter saw an explicit terminal prompt outcome
+ * - uncertain: prompt may have started; never silent auto-replay
+ * - unclassified: transport/adapter failure without terminal evidence
+ */
+export type TurnFailureClass =
+  | 'safe_to_retry'
+  | 'terminal_received'
+  | 'uncertain'
+  | 'unclassified';
+
 export interface TaskTurn {
   id: string;
   taskId: string;
@@ -116,6 +135,15 @@ export interface TaskTurn {
    * - `armed`: reserved for in-flight bookkeeping (not a settled value)
    */
   interruptConfidence?: 'armed' | 'confirmed' | 'forced';
+  /**
+   * Durable dispatch marker (Phase C). Set `pre_dispatch` when the turn becomes
+   * running; flip to `prompt_outstanding` immediately before `session/prompt`;
+   * set `terminal_received` on terminal settlement. Missing/ambiguous on reload
+   * → treat orphan live as uncertain.
+   */
+  dispatchPhase?: TurnDispatchPhase;
+  /** Settlement classification for activity projection + auto-retry eligibility. */
+  failureClass?: TurnFailureClass;
 }
 
 // Messages (§9) + store envelope (§12.1)
@@ -190,6 +218,19 @@ export interface OperationLedgerEntry {
   result: OpResult;
 }
 
+/**
+ * Durable send ack receipt (Phase C idempotency). Keyed by clientRequestId.
+ * Same id + same fingerprint → re-ACK original ids; same id + different fingerprint → conflict.
+ */
+export interface SendReceipt {
+  clientRequestId: string;
+  fingerprint: string;
+  taskId: string;
+  messageId: string;
+  turnId: string;
+  createdAt: string;
+}
+
 export interface TaskStoreFile {
   schemaVersion: number;
   revision: number;
@@ -203,6 +244,11 @@ export interface TaskStoreFile {
   toolCalls?: Record<string, PersistedToolCall>;
   /** Persisted reasoning, keyed by turnId (schema ≥ 3). */
   reasoning?: Record<string, PersistedReasoning>;
+  /**
+   * Webview send outbox receipts (Phase C). Keyed by `clientRequestId`.
+   * Retained for the resend window so duplicate delivery re-ACKs without a second commit.
+   */
+  sendReceipts?: Record<string, SendReceipt>;
 }
 
 /**

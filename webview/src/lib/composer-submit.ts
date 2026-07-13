@@ -96,8 +96,12 @@ export function buildTaskComposerMessage(
     // Inject always delivers the agent-facing payload (expanded mentions).
     return { type: 'sendLiveInput', taskId, instruction: llmText };
   }
+  const clientRequestId =
+    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `send-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   if (llmText !== text) {
-    return { type: 'send', taskId, text, llmText };
+    return { type: 'send', taskId, text, llmText, clientRequestId };
   }
-  return { type: 'send', taskId, text };
+  return { type: 'send', taskId, text, clientRequestId };
 }

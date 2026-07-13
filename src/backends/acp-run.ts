@@ -331,6 +331,14 @@ export async function* runAcpTurn(
       }
     }
 
+    if (options.onBeforePrompt) {
+      await options.onBeforePrompt();
+    }
+    if (isAborted()) {
+      yield cancellationTerminal();
+      return;
+    }
+
     const promptPromise = client.prompt(activeSessionId, options.prompt, options.signal);
 
     while (true) {
