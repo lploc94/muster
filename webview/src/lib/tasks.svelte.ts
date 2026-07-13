@@ -76,6 +76,7 @@ class TasksState {
    * Optional clientRequestId: only clear matching rejected outbox on successful apply.
    */
   composerPrefill = $state<{ text: string; nonce: number; clientRequestId?: string } | null>(null);
+  private prefillNonceSeq = 0;
 
   constructor() {
     // Restore the last-used backend/model from webview state (persists across reloads).
@@ -321,9 +322,10 @@ class TasksState {
 
   /** Put text into the task/draft composer (used by queue Edit / rejected send restore). */
   prefillComposer(text: string, clientRequestId?: string): void {
+    this.prefillNonceSeq += 1;
     this.composerPrefill = {
       text,
-      nonce: Date.now(),
+      nonce: this.prefillNonceSeq,
       ...(clientRequestId ? { clientRequestId } : {}),
     };
   }
