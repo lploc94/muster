@@ -46,13 +46,17 @@ function messageText(item: QueuedPreviewMessage): string {
 }
 
 /**
- * Resolve display/edit preview for a queued turn from its bound messageIds.
- * Accepts host transcript items or webview ThreadItems; empty when messages are missing.
+ * Resolve display/edit preview for a queued turn.
+ * Prefer host-projected `previewText` (queued messages are not in chat transcript).
+ * Fall back to bound messageIds in thread/transcript when present.
  */
 export function resolveQueuedTurnPreview(
-  turn: Pick<QueuedTurnProjection, 'messageIds'>,
+  turn: Pick<QueuedTurnProjection, 'messageIds' | 'previewText'>,
   messages: readonly QueuedPreviewMessage[] | readonly TranscriptItem[] | undefined,
 ): string {
+  if (typeof turn.previewText === 'string' && turn.previewText.trim()) {
+    return turn.previewText.trim();
+  }
   if (!messages || turn.messageIds.length === 0) return '';
   const byId = new Map(messages.map((item) => [item.id, item as QueuedPreviewMessage]));
   const parts: string[] = [];

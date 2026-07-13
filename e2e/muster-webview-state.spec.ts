@@ -37,6 +37,7 @@ interface QueuedTurnProjection {
   status: 'queued';
   messageIds: string[];
   createdAt: string;
+  previewText?: string;
 }
 
 interface SnapshotMessage {
@@ -1085,10 +1086,8 @@ test.describe('Muster webview host state smoke', () => {
       rootTasks: [task({ id: 'task-queue', goal: 'Queued follow-ups', viewStatus: 'running' })],
       focusedTaskId: 'task-queue',
       subtree: [task({ id: 'task-queue', goal: 'Queued follow-ups', viewStatus: 'running' })],
-      transcript: [
-        { id: 'msg-assistant', kind: 'assistant', content: 'Still working…' },
-        { id: queuedMessageId, kind: 'user', content: 'First queued follow-up' },
-      ],
+      // Queued follow-ups must not appear in chat transcript — only in queue panel.
+      transcript: [{ id: 'msg-assistant', kind: 'assistant', content: 'Still working…' }],
       activeTurnId: 'turn-active',
       queuedTurns: [
         {
@@ -1097,6 +1096,7 @@ test.describe('Muster webview host state smoke', () => {
           status: 'queued',
           messageIds: [queuedMessageId],
           createdAt: '2026-01-01T00:00:01.000Z',
+          previewText: 'First queued follow-up',
         },
       ],
       storeRevision: 120,
@@ -1106,6 +1106,8 @@ test.describe('Muster webview host state smoke', () => {
     await expect(panel).toBeVisible();
     await expect(panel.getByText('Queued follow-ups (1)')).toBeVisible();
     await expect(panel.getByText('First queued follow-up')).toBeVisible();
+    // Not in the chat thread as a user bubble.
+    await expect(page.getByText('First queued follow-up')).toHaveCount(1);
 
     const item = panel.locator('.queued-turn-item[data-turn-id="turn-q1"]');
     await expect(item).toHaveAttribute('data-queued-locked', 'false');
@@ -1133,10 +1135,7 @@ test.describe('Muster webview host state smoke', () => {
       rootTasks: [task({ id: 'task-queue', goal: 'Queued follow-ups', viewStatus: 'running' })],
       focusedTaskId: 'task-queue',
       subtree: [task({ id: 'task-queue', goal: 'Queued follow-ups', viewStatus: 'running' })],
-      transcript: [
-        { id: 'msg-assistant', kind: 'assistant', content: 'Still working…' },
-        { id: queuedMessageId, kind: 'user', content: 'Edited queued follow-up' },
-      ],
+      transcript: [{ id: 'msg-assistant', kind: 'assistant', content: 'Still working…' }],
       activeTurnId: 'turn-active',
       queuedTurns: [
         {
@@ -1145,6 +1144,7 @@ test.describe('Muster webview host state smoke', () => {
           status: 'queued',
           messageIds: [queuedMessageId],
           createdAt: '2026-01-01T00:00:01.000Z',
+          previewText: 'Edited queued follow-up',
         },
       ],
       storeRevision: 121,
@@ -1158,29 +1158,24 @@ test.describe('Muster webview host state smoke', () => {
       turnId: 'turn-q1',
     });
 
-    // Drain projection: turn left the queue (stale local mutation path).
+    // Drain projection: turn left the queue (started as next chat turn).
     await postSnapshot(page, {
       type: 'snapshot',
       rootTasks: [task({ id: 'task-queue', goal: 'Queued follow-ups', viewStatus: 'running' })],
       focusedTaskId: 'task-queue',
       subtree: [task({ id: 'task-queue', goal: 'Queued follow-ups', viewStatus: 'running' })],
-      transcript: [{ id: 'msg-assistant', kind: 'assistant', content: 'Still working…' }],
-      activeTurnId: 'turn-active',
+      transcript: [
+        { id: 'msg-assistant', kind: 'assistant', content: 'Still working…' },
+        { id: queuedMessageId, kind: 'user', content: 'Edited queued follow-up' },
+      ],
+      activeTurnId: 'turn-q1',
       queuedTurns: [],
       storeRevision: 122,
     });
     await expect(page.getByTestId('queued-turns-panel')).toHaveCount(0);
-
-    // Host-side stale refusal after a concurrent drain remains visible.
-    await postCommandError(page, {
-      type: 'commandError',
-      taskId: 'task-queue',
-      message: 'Queued turn mutation refused: turn is not queued',
-    });
-    await expect(page.getByRole('alert').getByText('Task command failed')).toBeVisible();
-    await expect(
-      page.getByRole('alert').getByText('Queued turn mutation refused: turn is not queued'),
-    ).toBeVisible();
+    // Dispatched follow-up is now in chat, not in the queue panel.
+    await expect(page.getByText('Edited queued follow-up')).toBeVisible();
+    await expect(page.getByRole('alert')).toHaveCount(0);
   });
 });
 

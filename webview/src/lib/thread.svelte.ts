@@ -137,6 +137,10 @@ export class TaskThread {
       if (item.turnId) this.reasoningByTurn[item.turnId] = asText(item.content);
       return;
     }
+    // Idempotent: turnStart + snapshot hydrate may both project the same user message.
+    if (this.items.some((existing) => existing.id === item.id)) {
+      return;
+    }
     const mapped = transcriptToThreadItem(item);
     if (mapped) this.items.push(mapped);
   }

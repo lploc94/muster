@@ -71,6 +71,11 @@ export interface QueuedTurnProjection {
   status: 'queued';
   messageIds: string[];
   createdAt: string;
+  /**
+   * User-visible content of bound pending message(s). Host projects this so the
+   * queue panel does not depend on chat transcript (queued follow-ups stay out of chat).
+   */
+  previewText?: string;
 }
 
 export interface TaskSnapshot {
@@ -205,6 +210,14 @@ export function buildTranscript(file: TaskStoreFile, taskId: string): Transcript
       continue;
     }
     const turnId = message.role === 'assistant' ? message.turnId : (message.turnId ?? msgTurn.get(message.id));
+    // FIFO follow-ups stay in the queue panel only until their turn starts.
+    // Do not project user messages bound to still-queued turns into chat.
+    if (message.role === 'user' && turnId) {
+      const boundTurn = file.turns[turnId];
+      if (boundTurn?.status === 'queued') {
+        continue;
+      }
+    }
     const seq = turnId !== undefined && seqOf.has(turnId) ? seqOf.get(turnId)! : -1;
     // user prompt (-2) sorts before reasoning (-1) and assistant/tool segments (>=0).
     const order = message.role === 'assistant' ? (message.order ?? 0) : -2;
@@ -286,6 +299,17 @@ function messageIdsForTurn(turn: TaskTurn): string[] {
  * FIFO queued follow-up turns for a task. Excludes live/settled turns so S03/S04
  * can key edit/delete and composer feedback off dedicated turn identity.
  */
+function previewTextForQueuedTurn(file: TaskStoreFile, turn: TaskTurn): string {
+  const parts: string[] = [];
+  for (const messageId of messageIdsForTurn(turn)) {
+    const message = file.messages[messageId];
+    if (!message || message.role !== 'user') continue;
+    const text = message.content.trim();
+    if (text) parts.push(text);
+  }
+  return parts.join('\n');
+}
+
 export function projectQueuedTurns(file: TaskStoreFile, taskId: string): QueuedTurnProjection[] {
   return turnsForTask(file, taskId)
     .filter((turn) => turn.status === 'queued')
@@ -295,13 +319,17 @@ export function projectQueuedTurns(file: TaskStoreFile, taskId: string): QueuedT
         a.createdAt.localeCompare(b.createdAt) ||
         a.id.localeCompare(b.id),
     )
-    .map((turn) => ({
-      turnId: turn.id,
-      sequence: turn.sequence,
-      status: 'queued' as const,
-      messageIds: messageIdsForTurn(turn),
-      createdAt: turn.createdAt,
-    }));
+    .map((turn) => {
+      const previewText = previewTextForQueuedTurn(file, turn);
+      return {
+        turnId: turn.id,
+        sequence: turn.sequence,
+        status: 'queued' as const,
+        messageIds: messageIdsForTurn(turn),
+        createdAt: turn.createdAt,
+        ...(previewText ? { previewText } : {}),
+      };
+    });
 }
 
 /**

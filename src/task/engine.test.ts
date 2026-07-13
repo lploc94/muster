@@ -378,8 +378,13 @@ describe('TaskEngine', () => {
           status: 'queued',
           messageIds: [second.value.messageId],
           createdAt: store.getFile().turns[second.value.turnId!]!.createdAt,
+          previewText: 'second',
         },
       ]);
+      // Queued follow-up must not appear in chat transcript while still queued.
+      expect(
+        snapshot.transcript?.filter((item) => item.kind === 'user').map((item) => item.id),
+      ).toEqual([first.value.messageId]);
     }
     engine.stageDisposition(first.value.turnId, { kind: 'complete', result: 'ok' }, 'op-1');
     release?.();

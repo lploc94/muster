@@ -352,6 +352,7 @@ describe('task lifecycle runtime regression harness', () => {
         status: 'queued',
         messageIds: [second.value.messageId],
         createdAt: queued.turns[second.value.turnId]!.createdAt,
+        previewText: store.getFile().messages[second.value.messageId]?.content,
       },
       {
         turnId: third.value.turnId,
@@ -359,13 +360,13 @@ describe('task lifecycle runtime regression harness', () => {
         status: 'queued',
         messageIds: [third.value.messageId],
         createdAt: queued.turns[third.value.turnId]!.createdAt,
+        previewText: store.getFile().messages[third.value.messageId]?.content,
       },
     ]);
+    // Only the live turn's user prompt is in chat; follow-ups stay in the queue panel.
     const userTranscript = snapshotWhileLive.transcript?.filter((item) => item.kind === 'user') ?? [];
     expect(userTranscript.map((item) => [item.id, item.turnId, item.state])).toEqual([
       [first.value.messageId, first.value.turnId, 'assigned'],
-      [second.value.messageId, second.value.turnId, 'pending'],
-      [third.value.messageId, third.value.turnId, 'pending'],
     ]);
 
     expect(engine.stageDisposition(first.value.turnId, { kind: 'idle' }, 'op-a')).toEqual({
@@ -715,6 +716,7 @@ describe('task lifecycle runtime regression harness', () => {
         status: 'queued',
         messageIds: [second.value.messageId],
         createdAt: file.turns[second.value.turnId]!.createdAt,
+        previewText: file.messages[second.value.messageId]?.content,
       },
     ]);
     expect(engine.viewStatus('failure-pending')).toBe('queued');

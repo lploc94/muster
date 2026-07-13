@@ -486,6 +486,24 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           turnId: event.turnId,
           trigger: event.trigger,
         });
+        // Turn left the FIFO queue — project its user message(s) into chat now.
+        // Snapshot rebuild also includes them; append is idempotent by message id.
+        if (event.taskId === this.focusedTaskId && taskStore) {
+          const turn = taskStore.getFile().turns[event.turnId];
+          if (turn) {
+            for (const input of turn.inputs) {
+              if (input.kind !== 'message') continue;
+              const item = this.transcriptItemFromMessage(input.messageId);
+              if (item) {
+                this.post({
+                  type: 'transcriptAppend',
+                  taskId: event.taskId,
+                  item: { ...item, turnId: event.turnId },
+                });
+              }
+            }
+          }
+        }
         break;
       case 'event':
         this.post({
@@ -900,12 +918,52 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       this.postCommandError(result.reason, data.taskId);
       return;
     }
-    if (data.taskId === this.focusedTaskId) {
+    // Only project into chat when the turn is not a FIFO follow-up still sitting
+    // in the queue. Queued messages appear in the queue panel only; they enter
+    // chat when the turn promotes to running (snapshot rebuild).
+    if (data.taskId === this.focusedTaskId && this.shouldAppendSendToTranscript(result.value.turnId)) {
       const item = this.transcriptItemFromMessage(result.value.messageId);
       if (item) {
         this.post({ type: 'transcriptAppend', taskId: data.taskId, item });
       }
     }
+  }
+
+  /**
+   * True when a newly created turn should appear in chat immediately.
+   * Queued FIFO follow-ups stay out of chat (queue panel + snapshot.previewText only)
+   * until the turn promotes to running (turnStart / snapshot rebuild).
+   */
+  private shouldAppendSendToTranscript(turnId: string | undefined): boolean {
+    if (!turnId || !taskStore) {
+      return false;
+    }
+    const turn = taskStore.getFile().turns[turnId];
+    return Boolean(turn && turn.status !== 'queued');
+  }
+
+  /**
+   * Stale edit/delete when a follow-up already started is an expected race (drain),
+   * not a hard command failure. Refresh projection quietly; surface real errors.
+   */
+  private handleQueuedMutationOutcome(
+    message: string,
+    taskId: string | undefined,
+    turnId: unknown,
+  ): void {
+    const stale =
+      /not queued|not found|already dispatched|is not pending/i.test(message) ||
+      (typeof turnId === 'string' &&
+        !!taskStore &&
+        (() => {
+          const turn = taskStore.getFile().turns[turnId];
+          return !!turn && turn.status !== 'queued';
+        })());
+    if (stale) {
+      this.postSnapshot(taskId ?? this.focusedTaskId);
+      return;
+    }
+    this.postCommandError(message, taskId);
   }
 
   public resolveWebviewView(
@@ -1024,7 +1082,10 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
               this.postCommandError(result.reason, data.taskId);
               break;
             }
-            if (data.taskId === this.focusedTaskId) {
+            if (
+              data.taskId === this.focusedTaskId &&
+              this.shouldAppendSendToTranscript(result.value.turnId)
+            ) {
               const item = this.transcriptItemFromMessage(result.value.messageId);
               if (item) {
                 this.post({ type: 'transcriptAppend', taskId: data.taskId, item });
@@ -1036,6 +1097,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           // Honest live-turn injection: validate + engine.sendLiveInput only.
           // Never falls through to continueTask / queue creation.
           const engine = taskEngine;
+          const injectInstruction =
+            typeof data.instruction === 'string' ? data.instruction.trim() : '';
           const outcome = await routeSendLiveInput(data, {
             engineReady: Boolean(engine),
             sendLiveInput: (taskId, instruction) => {
@@ -1055,6 +1118,18 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
               code: 'delivered',
               sessionId: outcome.sessionId,
             });
+            // Direct inject is visible in chat immediately (not a queued turn).
+            if (outcome.taskId === this.focusedTaskId && injectInstruction) {
+              this.post({
+                type: 'transcriptAppend',
+                taskId: outcome.taskId,
+                item: {
+                  id: `live-inject-${Date.now()}`,
+                  kind: 'user',
+                  content: injectInstruction,
+                },
+              });
+            }
           } else {
             this.postCommandError(outcome.message, outcome.taskId);
           }
@@ -1074,7 +1149,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             },
           });
           if (outcome.kind === 'error') {
-            this.postCommandError(outcome.message, outcome.taskId);
+            this.handleQueuedMutationOutcome(outcome.message, outcome.taskId, data?.turnId);
           }
           // Success: store onCommit projects updated snapshot/taskUpdated.
           break;
@@ -1093,7 +1168,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             },
           });
           if (outcome.kind === 'error') {
-            this.postCommandError(outcome.message, outcome.taskId);
+            this.handleQueuedMutationOutcome(outcome.message, outcome.taskId, data?.turnId);
           }
           // Success: store onCommit projects updated snapshot/taskUpdated.
           break;

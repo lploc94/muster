@@ -272,6 +272,7 @@ describe('host task snapshot projection', () => {
         status: 'queued',
         messageIds: ['msg-b'],
         createdAt: '2026-07-06T00:02:00.000Z',
+        previewText: 'b',
       },
       {
         turnId: 'turn-q2',
@@ -279,6 +280,7 @@ describe('host task snapshot projection', () => {
         status: 'queued',
         messageIds: ['msg-c'],
         createdAt: '2026-07-06T00:03:00.000Z',
+        previewText: 'c',
       },
     ]);
 
@@ -291,6 +293,7 @@ describe('host task snapshot projection', () => {
         status: 'queued',
         messageIds: ['msg-b'],
         createdAt: '2026-07-06T00:02:00.000Z',
+        previewText: 'b',
       },
       {
         turnId: 'turn-q2',
@@ -298,9 +301,10 @@ describe('host task snapshot projection', () => {
         status: 'queued',
         messageIds: ['msg-c'],
         createdAt: '2026-07-06T00:03:00.000Z',
+        previewText: 'c',
       },
     ]);
-    // Transcript still binds each user message to its dedicated turn identity.
+    // Queued follow-ups stay out of chat; only the live-turn user prompt appears.
     expect(snapshot.transcript?.filter((item) => item.kind === 'user')).toEqual([
       {
         id: 'msg-a',
@@ -309,22 +313,6 @@ describe('host task snapshot projection', () => {
         turnId: 'turn-live',
         order: undefined,
         state: 'assigned',
-      },
-      {
-        id: 'msg-b',
-        kind: 'user',
-        content: 'b',
-        turnId: 'turn-q1',
-        order: undefined,
-        state: 'pending',
-      },
-      {
-        id: 'msg-c',
-        kind: 'user',
-        content: 'c',
-        turnId: 'turn-q2',
-        order: undefined,
-        state: 'pending',
       },
     ]);
   });
@@ -373,6 +361,7 @@ describe('host task snapshot projection', () => {
         status: 'queued',
         messageIds: ['msg-q'],
         createdAt: '2026-07-06T00:02:00.000Z',
+        previewText: 'queued follow-up',
       },
     ]);
     expect(buildSnapshot(storeFrom(file), 'ask').activeTurnId).toBe('live');
@@ -421,4 +410,72 @@ describe('host task snapshot projection', () => {
     expect(activeTurnIdForTask(file, 'settled')).toBeUndefined();
     expect(activeTurnIdForTask(file, 'missing')).toBeUndefined();
   });
+
+  it('excludes queued-turn user messages from transcript but projects queue previewText', () => {
+    const file: TaskStoreFile = {
+      schemaVersion: 2,
+      revision: 1,
+      tasks: {
+        t: task('t', { role: 'coordinator', goal: 'Queue vs chat' }),
+      },
+      turns: {
+        live: turn({
+          id: 'live',
+          taskId: 't',
+          sequence: 1,
+          status: 'running',
+          inputs: [{ kind: 'message', messageId: 'msg-live' }],
+          createdAt: '2026-07-06T00:01:00.000Z',
+          startedAt: '2026-07-06T00:01:01.000Z',
+        }),
+        queued: turn({
+          id: 'queued',
+          taskId: 't',
+          sequence: 2,
+          status: 'queued',
+          inputs: [{ kind: 'message', messageId: 'msg-queued' }],
+          createdAt: '2026-07-06T00:02:00.000Z',
+        }),
+      },
+      messages: {
+        'msg-live': {
+          id: 'msg-live',
+          taskId: 't',
+          role: 'user',
+          content: 'live prompt',
+          state: 'assigned',
+          createdAt: '2026-07-06T00:01:00.000Z',
+          turnId: 'live',
+        },
+        'msg-queued': {
+          id: 'msg-queued',
+          taskId: 't',
+          role: 'user',
+          content: 'follow-up in queue only',
+          state: 'pending',
+          createdAt: '2026-07-06T00:02:00.000Z',
+        },
+      },
+      operations: {},
+      cancelRequests: {},
+    };
+    const store = storeFrom(file);
+    const snapshot = buildSnapshot(store, 't');
+    const userContents = (snapshot.transcript ?? [])
+      .filter((item) => item.kind === 'user')
+      .map((item) => item.content);
+    expect(userContents).toEqual(['live prompt']);
+    expect(userContents).not.toContain('follow-up in queue only');
+    expect(snapshot.queuedTurns).toEqual([
+      {
+        turnId: 'queued',
+        sequence: 2,
+        status: 'queued',
+        messageIds: ['msg-queued'],
+        createdAt: '2026-07-06T00:02:00.000Z',
+        previewText: 'follow-up in queue only',
+      },
+    ]);
+  });
+
 });

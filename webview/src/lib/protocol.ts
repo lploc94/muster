@@ -106,6 +106,8 @@ export interface QueuedTurnProjection {
   status: 'queued';
   messageIds: string[];
   createdAt: string;
+  /** Host-projected user text so the queue panel works without chat bubbles. */
+  previewText?: string;
 }
 
 export interface SnapshotMessage {
@@ -410,7 +412,8 @@ function isQueuedTurnProjection(v: unknown): v is QueuedTurnProjection {
     v.status === 'queued' &&
     Array.isArray(v.messageIds) &&
     v.messageIds.every(isString) &&
-    isString(v.createdAt)
+    isString(v.createdAt) &&
+    (v.previewText === undefined || isString(v.previewText))
   );
 }
 

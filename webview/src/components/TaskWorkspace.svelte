@@ -182,16 +182,18 @@
 
   function submitEditQueuedTurn(turnId: string): void {
     if (!focused) return;
+    // Turn already left the queue (dispatched into chat) — expected race, no error banner.
     const locked = !tasks.queuedTurns.some((turn) => turn.turnId === turnId);
-    const message = buildEditQueuedTurnMessage(focused.id, turnId, editingQueuedContent, {
-      locked,
-    });
-    if (!message) {
-      if (locked) {
-        tasks.setCommandError('Queued turn mutation refused: turn is not queued', focused.id);
-      }
+    if (locked) {
+      editingQueuedTurnId = null;
+      editingQueuedContent = '';
+      tasks.setCommandError(null);
       return;
     }
+    const message = buildEditQueuedTurnMessage(focused.id, turnId, editingQueuedContent, {
+      locked: false,
+    });
+    if (!message) return;
     tasks.setCommandError(null);
     post(message);
     editingQueuedTurnId = null;
@@ -200,14 +202,18 @@
 
   function submitDeleteQueuedTurn(turnId: string): void {
     if (!focused) return;
+    // Turn already left the queue (dispatched / deleted elsewhere) — quiet no-op.
     const locked = !tasks.queuedTurns.some((turn) => turn.turnId === turnId);
-    const message = buildDeleteQueuedTurnMessage(focused.id, turnId, { locked });
-    if (!message) {
-      if (locked) {
-        tasks.setCommandError('Queued turn mutation refused: turn is not queued', focused.id);
+    if (locked) {
+      if (editingQueuedTurnId === turnId) {
+        editingQueuedTurnId = null;
+        editingQueuedContent = '';
       }
+      tasks.setCommandError(null);
       return;
     }
+    const message = buildDeleteQueuedTurnMessage(focused.id, turnId, { locked: false });
+    if (!message) return;
     if (editingQueuedTurnId === turnId) {
       editingQueuedTurnId = null;
       editingQueuedContent = '';

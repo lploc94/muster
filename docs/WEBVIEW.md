@@ -646,7 +646,7 @@ Guidance copy on the composer strip describes queue/inject affordances (e.g. “
 
 ### FIFO queue panel (`queuedTurns`)
 
-Host snapshots project `queuedTurns` (ordered by sequence) for the focused task. The workspace **queued turns** panel is the inspection surface: each undispatched turn may be edited or deleted.
+Host snapshots project `queuedTurns` (ordered by sequence) for the focused task. The workspace **queued turns** panel is the inspection surface: each undispatched turn may be edited or deleted. **Queued follow-ups do not appear in the chat transcript** until their turn starts; the panel uses host `previewText` (not chat bubbles). **Ctrl+Enter live inject** does appear in chat immediately on delivery.
 
 - **Edit** → `editQueuedTurn` `{ taskId, turnId, content }` — updates the bound pending user message of that turn only; clears any stale `agentContent` so the edited text drives the next prompt.
 - **Delete** → `deleteQueuedTurn` `{ taskId, turnId }` — removes the undispatched turn and its bound pending message(s); does **not** cancel a running turn.

@@ -962,7 +962,7 @@ both constrain behavior:
 | Edit pending queue item | `editQueuedTurn` | Only while `turnId` remains in the live `queuedTurns` projection; clears stale `agentContent` |
 | Delete pending queue item | `deleteQueuedTurn` | Undispatched only; never cancels a running turn |
 
-**Projection:** snapshots include optional `queuedTurns` (`turnId`, `sequence`, `status: 'queued'`, `messageIds`, `createdAt`) so the webview can render an inspectable FIFO panel and lock edit/delete at the dispatch boundary.
+**Projection:** snapshots include optional `queuedTurns` (`turnId`, `sequence`, `status: 'queued'`, `messageIds`, `createdAt`, optional `previewText`) so the webview can render an inspectable FIFO panel and lock edit/delete at the dispatch boundary. User messages bound to still-`queued` turns are **omitted from the chat transcript** until the turn promotes to running; they are visible only in the queue panel (and via `previewText`).
 
 **Live inject outcomes:**
 
