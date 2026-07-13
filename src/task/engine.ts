@@ -397,42 +397,25 @@ function pendingUserMessages(file: TaskStoreFile, taskId: string): TaskMessage[]
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
 }
 
-/**
- * MEM030: after the latest non-queued turn for a task failed/interrupted,
- * do not auto-promote **pre-failure** FIFO follow-ups until explicit resume.
- * Turns created at/after that settlement (Retry/Continue/auto-retry) are not
- * frozen so they can start once capacity frees. Also prevents an unrelated
- * task's success from thawing a frozen pre-failure queue.
- */
+/** MEM030: durable hold set on queued turns present at failed/interrupted settle. */
+function holdQueuedFollowUpsOnFailure(draft: TaskStoreFile, taskId: string): void {
+  for (const turn of turnsForTask(draft, taskId)) {
+    if (turn.status !== 'queued') continue;
+    if (turn.holdAutoPromote) continue;
+    draft.turns[turn.id] = { ...turn, holdAutoPromote: true };
+  }
+}
+
 function isQueuedTurnAutoPromoteFrozen(
   file: TaskStoreFile,
   taskId: string,
   candidateTurnId: string,
 ): boolean {
-  const turns = turnsForTask(file, taskId);
-  const candidate = turns.find((turn) => turn.id === candidateTurnId);
-  if (!candidate || candidate.status !== 'queued') return false;
-  if (turns.some((turn) => turn.status === 'running' || turn.status === 'waiting_user')) {
+  const candidate = file.turns[candidateTurnId];
+  if (!candidate || candidate.taskId !== taskId || candidate.status !== 'queued') {
     return false;
   }
-  const latestSettled = [...turns]
-    .filter((turn) => turn.status !== 'queued')
-    .sort(
-      (a, b) =>
-        b.sequence - a.sequence ||
-        b.createdAt.localeCompare(a.createdAt) ||
-        b.id.localeCompare(a.id),
-    )[0];
-  if (!latestSettled) return false;
-  if (latestSettled.status !== 'failed' && latestSettled.status !== 'interrupted') {
-    return false;
-  }
-  // Post-settlement recovery/retry turns may auto-promote when capacity frees.
-  const boundary = latestSettled.finishedAt ?? latestSettled.createdAt;
-  if (candidate.createdAt >= boundary) {
-    return false;
-  }
-  return true;
+  return candidate.holdAutoPromote === true;
 }
 
 function deterministicRetryTurnId(failedTurnId: string, retryIndex: number): string {
@@ -744,8 +727,23 @@ export class TaskEngine {
     if (turn.status !== 'queued') {
       return { ok: false, reason: 'turn is not queued' };
     }
-    // Fail closed on FIFO violations rather than silently no-op promote.
-    const promote = canPromoteTurn(file, turnId, this.resourceLimits);
+    // Explicit resume clears MEM030 hold so this turn may auto-promote.
+    if (turn.holdAutoPromote) {
+      const clear = this.store.commit((draft) => {
+        const current = draft.turns[turnId];
+        if (!current || current.status !== 'queued') {
+          return { ok: false, reason: 'turn is not queued' };
+        }
+        const { holdAutoPromote: _hold, ...rest } = current;
+        void _hold;
+        draft.turns[turnId] = rest;
+        return { ok: true };
+      });
+      if (!clear.ok) {
+        return { ok: false, reason: clear.detail ?? clear.reason };
+      }
+    }
+    const promote = canPromoteTurn(this.store.getFile(), turnId, this.resourceLimits);
     if (!promote.ok) {
       return { ok: false, reason: promote.reason };
     }
@@ -2431,6 +2429,8 @@ export class TaskEngine {
           candidateSessionId: candidate,
           isCancellation: true,
         };
+        // Freeze follow-ups that were already queued before this interrupt.
+        holdQueuedFollowUpsOnFailure(draft, turn.taskId);
         return { ok: true };
       });
       return commit.ok;
@@ -2483,6 +2483,9 @@ export class TaskEngine {
           candidateSessionId: candidate,
         };
         draft.tasks[task.id] = result.next.task;
+        // Freeze pre-existing FIFO follow-ups before auto-retry is created so
+        // the new retry turn is not holdAutoPromote-marked.
+        holdQueuedFollowUpsOnFailure(draft, task.id);
 
         for (const effect of result.effects) {
           if (effect.kind === 'enqueueRetry') {

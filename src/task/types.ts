@@ -103,6 +103,12 @@ export interface TaskTurn {
   createdAt: string;
   startedAt?: string;
   finishedAt?: string;
+  /**
+   * When true, the engine must not auto-promote this queued turn after a prior
+   * failed/interrupted settlement (MEM030). Cleared by explicit resume.
+   * Retry/Continue/auto-retry turns created after settlement omit this flag.
+   */
+  holdAutoPromote?: boolean;
 }
 
 // Messages (§9) + store envelope (§12.1)
