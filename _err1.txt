@@ -1,0 +1,23 @@
+mutation feedback (933ms)
+
+
+  1) [chromium] \u203a e2e\muster-webview-state.spec.ts:957:7 \u203a Muster webview host state smoke \u203a surfaces liveInputResult delivery notice and commandError inject refusal 
+
+    Error: expect(locator).toBeVisible() failed
+
+    Locator: getByRole('status').getByText('Live input')
+    Expected: visible
+    Error: strict mode violation: getByRole('status').getByText('Live input') resolved to 2 elements:
+        1) <div class="font-semibold">Live input</div> aka getByText('Live input', { exact: true })
+        2) <div class="ta\xabredacted\xbb">Live input delivered to the active session.</div> aka getByText('Live input delivered to the')
+
+    Call log:
+      - Expect "toBeVisible" with timeout 5000ms
+      - waiting for getByRole('status').getByText('Live input')
+
+
+      974 |     });
+      975 |
+    > 976 |     await expect(page.getByRole('status').getByText('Live input')).toBeVisible();
+          |                                                                    ^
+     

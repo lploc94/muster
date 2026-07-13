@@ -54,6 +54,7 @@ describe('OpenCodeBackend — identity', () => {
       supportsReasoning: true,
       supportsDetailedToolEvents: true,
       supportsMCP: true,
+      supportsLiveInput: true,
     });
   });
 });

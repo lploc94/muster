@@ -1,8 +1,15 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { Backend, BackendCapabilities, NormalizedEvent, RunOptions } from '../types';
+import {
+  Backend,
+  BackendCapabilities,
+  LiveInputRequest,
+  LiveInputResult,
+  NormalizedEvent,
+  RunOptions,
+} from '../types';
 import { AcpAgentConfig, disposeSharedAcpClient } from './acp-client';
-import { ACP_CAPABILITIES, AcpAdapterSpec, runAcpTurn } from './acp-run';
+import { ACP_CAPABILITIES, AcpAdapterSpec, runAcpTurn, sendAcpLiveInput } from './acp-run';
 
 export { disposeSharedAcpClient };
 
@@ -92,5 +99,9 @@ export class CodexBackend implements Backend {
 
   run(options: RunOptions): AsyncIterable<NormalizedEvent> {
     return runAcpTurn(CODEX_SPEC, options);
+  }
+
+  sendLiveInput(request: LiveInputRequest): Promise<LiveInputResult> {
+    return sendAcpLiveInput(CODEX_SPEC, request);
   }
 }

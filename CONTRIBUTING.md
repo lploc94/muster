@@ -83,6 +83,27 @@ The focused browser test uses synthetic host messages and is **supportive only**
 
 Record each scenario in `docs/uat/m007-s02/file-drop-live-host-evidence.md` with one `PASS`, `FAIL`, or `ENVIRONMENT BLOCKED` verdict, a UTC timestamp, expected and observed results, bounded evidence, blocker detail, and cleanup. Use `ENVIRONMENT BLOCKED` only after naming the attempted step and concrete unavailable control. Never promote unit or Playwright results to live proof, and never record absolute paths, workspace identity, file contents, credentials, raw transcripts, or task-store data.
 
+## Queue and live-inject verification
+
+Multi-queued FIFO follow-ups and Ctrl+Enter live inject are documented in
+[docs/TASK-MANAGEMENT.md](docs/TASK-MANAGEMENT.md) §9.1 and
+[docs/WEBVIEW.md](docs/WEBVIEW.md) §14. Before claiming those surfaces, run:
+
+```bash
+npm run test:queue-live-inject-docs
+npm run test:webview -- e2e/muster-webview-state.spec.ts
+```
+
+The doc verifier checks keyboard contract markers (`Enter` → `send` FIFO,
+`Ctrl+Enter` → `sendLiveInput` with no queue fallback), `queuedTurns` edit/delete,
+and visible `liveInputResult` / `commandError` feedback. Playwright covers the
+browser-visible composer against the Vite webview with synthetic host messages
+and is **supportive only** for live Extension Development Host keyboard proof.
+
+Optional live check: press **F5**, open a running task, confirm Enter stacks
+queue rows, Ctrl+Enter either delivers a notice or shows a refusal banner, and
+stale queue mutations surface `commandError` without silent success.
+
 ## What to work on
 
 All five ACP backends (Claude, Grok, Kiro, Codex, OpenCode) are implemented. Good tasks now:

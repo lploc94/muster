@@ -127,7 +127,8 @@ export const RUNTIME_PRESENTATIONS = {
     listCopy: 'Turn queued',
     workspaceHeadline: 'Queued for execution',
     workspaceDetail: 'A turn is ready and waiting for the scheduler.',
-    composerGuidance: 'A turn is queued; hold new instructions unless adjusting before start.',
+    composerGuidance:
+      'Enter queues another follow-up; edit or delete pending turns in the queue panel before they start.',
   },
   running: {
     key: 'running',
@@ -136,7 +137,8 @@ export const RUNTIME_PRESENTATIONS = {
     listCopy: 'CLI turn active',
     workspaceHeadline: 'Turn is running',
     workspaceDetail: 'A CLI process is active for this task (runtime only — not task outcome).',
-    composerGuidance: 'Composer is disabled while a turn is running; wait or cancel the turn.',
+    composerGuidance:
+      'Enter queues a follow-up turn; Ctrl+Enter injects live input when the agent supports it.',
   },
   waiting_user: {
     key: 'waiting_user',
@@ -390,14 +392,19 @@ export function taskStatusLabel(status: TaskViewStatus | string | null | undefin
   return getTaskStatusPresentation(status).label;
 }
 
-/** Runtime activities that block free-form composer send (turn busy or gated). */
+/**
+ * Runtime activities that block free-form composer send.
+ *
+ * Live turns (`running`) and FIFO `queued` states stay open so Enter can create
+ * follow-ups and Ctrl+Enter can attempt live inject. Recovery, ask-user, and
+ * dependency gates still block free-form send.
+ */
 export function runtimeBlocksComposer(activity: TaskRuntimeActivity | null | undefined): boolean {
   if (!activity) return false;
   // awaiting_outcome: agent proposed complete but task stays open — user may still
   // send a message (clears proposal and continues session). Do not block.
+  // running / queued: unlocked for FIFO follow-ups + honest live-input path.
   return (
-    activity === 'running' ||
-    activity === 'queued' ||
     activity === 'waiting_dependencies' ||
     activity === 'waiting_children' ||
     activity === 'waiting_user' ||

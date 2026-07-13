@@ -22,6 +22,12 @@
   import { BACKENDS, backendShortLabel } from '../lib/backends';
   import { tip } from '../lib/tooltip';
   import { extractFileDropCandidates } from '../lib/file-drop';
+  import {
+    buildTaskComposerMessage,
+    resolveComposerKeyIntent,
+    shouldPreventDefaultForComposerKey,
+    type ComposerSubmitIntent,
+  } from '../lib/composer-submit';
 
   interface Props {
     mode: 'draft' | 'task';
@@ -87,16 +93,17 @@
   const statusBlocksSend = $derived(
     task
       ? isHardTerminal(lifecycle) || runtimeBlocksComposer(runtime)
-      : taskStatus === 'running' ||
-          taskStatus === 'queued' ||
-          taskStatus === 'waiting_dependencies' ||
+      : // Legacy viewStatus path: keep running/queued unlocked (FIFO + live inject).
+        taskStatus === 'waiting_dependencies' ||
           taskStatus === 'waiting_children' ||
           taskStatus === 'waiting_user' ||
           taskStatus === 'needs_recovery' ||
           isHardTerminal(taskStatus),
   );
   const blocked = $derived(mode === 'task' && (!!pendingAsk || readOnly || statusBlocksSend));
-  const canSend = $derived(mode === 'draft' ? !thread.running : !thread.running && !blocked);
+  // Draft still waits for the first turn to settle. Task mode stays open while
+  // a live/queued turn is active so Enter queues and Ctrl+Enter can inject.
+  const canSend = $derived(mode === 'draft' ? !thread.running : !blocked);
   // Stop applies while a process is up (generating or idle/waiting_user).
   const canCancel = $derived(
     mode === 'task' &&
@@ -149,12 +156,14 @@
     return () => window.removeEventListener('pointerdown', onPointerDown, true);
   });
 
-  function send() {
+  function submitComposer(intent: Exclude<ComposerSubmitIntent, { kind: 'none' }>) {
     if (!canSend || !textareaEl) return;
-    const value = (textareaEl.value ?? '').trim();
+    const raw = textareaEl.value ?? '';
+    const value = raw.trim();
     if (!value) return;
 
     if (mode === 'draft') {
+      // Draft has no live-inject path — treat any submit as create-task send.
       const backend = resolveBackendForSend();
       tasks.setBackend(backend);
       const payload: {
@@ -177,11 +186,23 @@
         content: value,
       });
       post(payload);
-    } else if (taskId) {
-      post({ type: 'send', taskId, text: value });
+      textareaEl.value = '';
+      return;
     }
 
+    const message = buildTaskComposerMessage(intent, { taskId, text: raw });
+    if (!message) return;
+    // Live inject never falls through to queue creation; host refuses via commandError.
+    post(message);
     textareaEl.value = '';
+  }
+
+  function send() {
+    submitComposer({ kind: 'send' });
+  }
+
+  function sendLiveInput() {
+    submitComposer({ kind: 'sendLiveInput' });
   }
 
   function cancel() {
@@ -268,15 +289,24 @@
       return;
     }
 
-    // Ignore Enter while an IME composition is active (CJK/Vietnamese input);
-    // keyCode 229 is the legacy signal for the same.
-    if (e.isComposing || e.keyCode === 229) return;
-    if (e.key === 'Enter' && !e.shiftKey) {
+    const policyInput = {
+      key: e.key,
+      shiftKey: e.shiftKey,
+      ctrlKey: e.ctrlKey,
+      metaKey: e.metaKey,
+      altKey: e.altKey,
+      isComposing: e.isComposing,
+      keyCode: e.keyCode,
+    };
+    const intent = resolveComposerKeyIntent(policyInput, { mode });
+    if (intent.kind === 'none') return;
+    if (shouldPreventDefaultForComposerKey(policyInput, { mode })) {
       e.preventDefault();
-      send();
     }
+    submitComposer(intent);
   }
 
+  /** Blocking reasons that disable the textarea (recovery/ask/terminal/read-only). */
   const disabledReason = $derived.by(() => {
     if (mode === 'draft') return '';
     if (pendingAsk) return 'Answer the pending task question above to continue.';
@@ -287,18 +317,28 @@
       if (readOnly) return 'This task is read-only right now.';
       return '';
     }
-    if (taskStatus === 'running') return presentation.composerGuidance;
-    if (taskStatus === 'queued') return presentation.composerGuidance;
     if (taskStatus === 'waiting_dependencies') return presentation.composerGuidance;
     if (taskStatus === 'waiting_children') return presentation.composerGuidance;
     if (taskStatus === 'waiting_user') return presentation.composerGuidance;
     if (taskStatus === 'needs_recovery') return presentation.composerGuidance;
-    if (taskStatus === 'awaiting_outcome') return presentation.composerGuidance;
     if (isHardTerminal(taskStatus)) return presentation.composerGuidance;
     if (taskStatus === 'failed') return presentation.composerGuidance;
     if (readOnly) return 'This task is read-only right now.';
     return '';
   });
+
+  /** Non-blocking affordance copy while live/queued (composer remains editable). */
+  const liveComposerGuidance = $derived.by(() => {
+    if (mode !== 'task' || disabledReason) return '';
+    if (task) {
+      if (runtime === 'running' || runtime === 'queued') return presentation.composerGuidance;
+      return '';
+    }
+    if (taskStatus === 'running' || taskStatus === 'queued') return presentation.composerGuidance;
+    return '';
+  });
+
+  const guidanceNote = $derived(disabledReason || liveComposerGuidance);
 
   // Only offer backends whose CLI the host reports as installed. Until that is
   // known (null) — or if nothing was detected — fail open and show all.
@@ -387,7 +427,9 @@
       ? `Start a new coordinator task with ${currentBackend}…`
       : disabledReason
         ? disabledReason
-        : `Message this task…`,
+        : liveComposerGuidance
+          ? 'Enter queues a follow-up · Ctrl+Enter injects live input…'
+          : `Message this task…`,
   );
 
   const BACKEND_IDS = ['claude', 'grok', 'kiro', 'codex', 'opencode'];
@@ -441,8 +483,10 @@
     <div class="composer-drop-status" role="status" aria-live="polite">Drop file to mention it</div>
   {/if}
 
-  {#if disabledReason}
-    <div class="composer-guidance" role="note">{disabledReason}</div>
+  {#if guidanceNote}
+    <div class="composer-guidance" role="note" data-composer-guidance={disabledReason ? 'blocked' : 'live'}>
+      {guidanceNote}
+    </div>
   {/if}
 
   <vscode-textarea
@@ -548,22 +592,40 @@
         >
           <span class="codicon codicon-debug-stop"></span>
         </button>
-      {:else if canSend}
-        <button
-          type="button"
-          class="icon-btn"
-          style="width: 28px; height: 28px;"
-          onclick={send}
-          aria-label="Send"
-          use:tip={'Send'}
-        >
-          <span class="codicon codicon-send"></span>
-        </button>
-      {:else if (runtime === 'queued' || taskStatus === 'queued') && turnId}
-        <span class="task-muted text-xs">Queued turn is waiting to resume.</span>
+      {/if}
+      {#if canSend}
+        {#if !canCancel}
+          <button
+            type="button"
+            class="icon-btn"
+            style="width: 28px; height: 28px;"
+            onclick={send}
+            aria-label="Send"
+            use:tip={
+              mode === 'task' && (runtime === 'running' || taskStatus === 'running')
+                ? 'Enter queues a follow-up; Ctrl+Enter injects live input'
+                : 'Send'
+            }
+          >
+            <span class="codicon codicon-send"></span>
+          </button>
+        {/if}
+        {#if mode === 'task' && (runtime === 'running' || taskStatus === 'running')}
+          <button
+            type="button"
+            class="icon-btn"
+            style="width: 28px; height: 28px;"
+            onclick={sendLiveInput}
+            aria-label="Inject live input"
+            use:tip={'Ctrl+Enter: inject live input (never queues)'}
+            data-testid="composer-live-inject"
+          >
+            <span class="codicon codicon-debug-line-by-line"></span>
+          </button>
+        {/if}
       {:else if (runtime === 'needs_recovery' || taskStatus === 'needs_recovery') && !turnId}
         <span class="task-muted text-xs">Recovery actions need a retryable turn.</span>
-      {:else if thread.running}
+      {:else if mode === 'draft' && thread.running}
         <button
           type="button"
           class="icon-btn"

@@ -24,6 +24,8 @@ import {
 import { detectAvailableBackends, installAugmentedPath } from './host/backend-availability';
 import { pickWorkspaceFileMentionPath } from './host/workspace-files';
 import { resolveDroppedFileMention } from './host/file-mentions';
+import { routeSendLiveInput } from './host/live-input';
+import { routeDeleteQueuedTurn, routeEditQueuedTurn } from './host/queued-turn-mutations';
 import { PresentationManager } from './host/presentation-manager';
 import {
   createPresentationPanelFactory,
@@ -985,6 +987,72 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             }
           }
           break;
+        case 'sendLiveInput': {
+          // Honest live-turn injection: validate + engine.sendLiveInput only.
+          // Never falls through to continueTask / queue creation.
+          const engine = taskEngine;
+          const outcome = await routeSendLiveInput(data, {
+            engineReady: Boolean(engine),
+            sendLiveInput: (taskId, instruction) => {
+              if (!engine) {
+                return Promise.resolve({
+                  code: 'rejected' as const,
+                  reason: 'task engine not ready',
+                });
+              }
+              return engine.sendLiveInput(taskId, instruction);
+            },
+          });
+          if (outcome.kind === 'ack') {
+            this.post({
+              type: 'liveInputResult',
+              taskId: outcome.taskId,
+              code: 'delivered',
+              sessionId: outcome.sessionId,
+            });
+          } else {
+            this.postCommandError(outcome.message, outcome.taskId);
+          }
+          break;
+        }
+        case 'editQueuedTurn': {
+          // R013: edit undispatched queued follow-up by turn identity.
+          // Validate + engine.editQueuedTurn only; never continueTask fallthrough.
+          const engine = taskEngine;
+          const outcome = routeEditQueuedTurn(data, {
+            engineReady: Boolean(engine),
+            editQueuedTurn: (taskId, turnId, content) => {
+              if (!engine) {
+                return { ok: false, reason: 'task engine not ready' };
+              }
+              return engine.editQueuedTurn(taskId, turnId, content);
+            },
+          });
+          if (outcome.kind === 'error') {
+            this.postCommandError(outcome.message, outcome.taskId);
+          }
+          // Success: store onCommit projects updated snapshot/taskUpdated.
+          break;
+        }
+        case 'deleteQueuedTurn': {
+          // R013: remove undispatched queued follow-up by turn identity.
+          // Validate + engine.deleteQueuedTurn only; never cancelProcess.
+          const engine = taskEngine;
+          const outcome = routeDeleteQueuedTurn(data, {
+            engineReady: Boolean(engine),
+            deleteQueuedTurn: (taskId, turnId) => {
+              if (!engine) {
+                return { ok: false, reason: 'task engine not ready' };
+              }
+              return engine.deleteQueuedTurn(taskId, turnId);
+            },
+          });
+          if (outcome.kind === 'error') {
+            this.postCommandError(outcome.message, outcome.taskId);
+          }
+          // Success: store onCommit projects updated snapshot/taskUpdated.
+          break;
+        }
         case 'resumeQueuedTurn':
           if (!taskEngine || !taskStore) {
             this.postCommandError('task engine not ready');

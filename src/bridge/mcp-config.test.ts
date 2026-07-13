@@ -4,7 +4,12 @@ import { describe, expect, it } from 'vitest';
 import { buildTurnMcp, deleteMcpConfigFile } from './mcp-config';
 import type { Backend } from '../types';
 
-const MCP_CAPS = { supportsMCP: true, supportsReasoning: false, supportsDetailedToolEvents: false };
+const MCP_CAPS = {
+  supportsMCP: true,
+  supportsReasoning: false,
+  supportsDetailedToolEvents: false,
+  supportsLiveInput: false,
+};
 
 describe('buildTurnMcp', () => {
   it('emits ACP mcpServers array with header objects', () => {

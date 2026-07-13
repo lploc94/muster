@@ -29,6 +29,7 @@ export interface FakeAcpHarness {
     setConfigOption: unknown[][];
     setSessionModel: unknown[][];
     prompt: unknown[][];
+    sendLiveInput: unknown[][];
     cancel: unknown[][];
     registerConnectionSink: unknown[][];
     registerSessionSink: unknown[][];
@@ -49,6 +50,8 @@ export function makeFakeAcpClient(
   opts: {
     sessionId?: string;
     loadSessionSupported?: boolean;
+    /** Whether the fake agent advertises live-input capability evidence. */
+    liveInputSupported?: boolean;
     /** Model config returned from `newSession` (as an ACP agent would advertise). */
     modelConfig?: {
       id: string;
@@ -56,6 +59,11 @@ export function makeFakeAcpClient(
       currentValue?: string;
       options: { value: string; name: string }[];
     };
+    /**
+     * Optional custom live-input implementation. When omitted, the fake returns
+     * unsupported unless `liveInputSupported` is true and a prompt is active.
+     */
+    sendLiveInputImpl?: (request: unknown) => Promise<unknown>;
   } = {},
 ): FakeAcpHarness {
   const sessionId = opts.sessionId ?? 'sess-1';
@@ -77,14 +85,18 @@ export function makeFakeAcpClient(
     setConfigOption: [],
     setSessionModel: [],
     prompt: [],
+    sendLiveInput: [],
     cancel: [],
     registerConnectionSink: [],
     registerSessionSink: [],
   };
+  let activePromptCount = 0;
   const callOrder: string[] = [];
 
   const client = {
     loadSessionSupported: opts.loadSessionSupported ?? true,
+    liveInputSupported: opts.liveInputSupported ?? false,
+    hasActivePrompt: (sessionId: string) => activePromptCount > 0 && sessionId === sessionId,
     registerConnectionSink: (fn: (line: string, source: 'stderr' | 'non-json') => void) => {
       callOrder.push('registerConnectionSink');
       calls.registerConnectionSink.push([]);
@@ -123,7 +135,29 @@ export function makeFakeAcpClient(
     prompt: (...args: unknown[]) => {
       callOrder.push('prompt');
       calls.prompt.push(args);
-      return promptP;
+      activePromptCount += 1;
+      return promptP.finally(() => {
+        activePromptCount = Math.max(0, activePromptCount - 1);
+      });
+    },
+    sendLiveInput: async (...args: unknown[]) => {
+      callOrder.push('sendLiveInput');
+      calls.sendLiveInput.push(args);
+      if (opts.sendLiveInputImpl) return opts.sendLiveInputImpl(args[0]);
+      const request = (args[0] ?? {}) as { sessionId?: string; instruction?: string };
+      if (!opts.liveInputSupported) {
+        return {
+          code: 'unsupported',
+          reason: 'fake agent does not advertise live-input capability',
+        };
+      }
+      if (activePromptCount <= 0) {
+        return {
+          code: 'no-active-turn',
+          reason: `no in-flight prompt for session ${request.sessionId ?? ''}`,
+        };
+      }
+      return { code: 'delivered', sessionId: request.sessionId ?? sessionId };
     },
     cancel: (...args: unknown[]) => {
       callOrder.push('cancel');

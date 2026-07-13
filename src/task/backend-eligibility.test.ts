@@ -6,8 +6,9 @@ describe('canBindTaskToBackend', () => {
     expect(
       canBindTaskToBackend({
         supportsReasoning: false,
-        supportsDetailedToolEvents: false,
-        supportsMCP: true,
+      supportsDetailedToolEvents: false,
+      supportsMCP: true,
+      supportsLiveInput: false
       }),
     ).toBe(true);
   });
@@ -16,8 +17,9 @@ describe('canBindTaskToBackend', () => {
     expect(
       canBindTaskToBackend({
         supportsReasoning: true,
-        supportsDetailedToolEvents: true,
-        supportsMCP: false,
+      supportsDetailedToolEvents: true,
+      supportsMCP: false,
+      supportsLiveInput: false
       }),
     ).toBe(false);
   });

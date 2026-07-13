@@ -142,11 +142,30 @@ describe('task status dual-axis presentation', () => {
     }
   });
 
-  it('blocks composer only for busy runtime activities', () => {
-    expect(runtimeBlocksComposer('running')).toBe(true);
+  it('keeps composer open while running or queued for FIFO follow-ups and live inject', () => {
+    expect(runtimeBlocksComposer('running')).toBe(false);
+    expect(runtimeBlocksComposer('queued')).toBe(false);
     expect(runtimeBlocksComposer('idle')).toBe(false);
     expect(runtimeBlocksComposer(null)).toBe(false);
     expect(runtimeBlocksComposer('awaiting_outcome')).toBe(false);
+  });
+
+  it('still blocks composer for recovery, ask-user, and dependency gates', () => {
+    expect(runtimeBlocksComposer('waiting_user')).toBe(true);
+    expect(runtimeBlocksComposer('needs_recovery')).toBe(true);
+    expect(runtimeBlocksComposer('waiting_dependencies')).toBe(true);
+    expect(runtimeBlocksComposer('waiting_children')).toBe(true);
+  });
+
+  it('describes queue and live-inject affordances while a turn is running', () => {
+    const presentation = getTaskPresentation({
+      lifecycle: 'open',
+      runtimeActivity: 'running',
+      viewStatus: 'running',
+    });
+    expect(presentation.composerGuidance).toMatch(/Enter queues/i);
+    expect(presentation.composerGuidance).toMatch(/Ctrl\+Enter/i);
+    expect(presentation.composerGuidance).not.toMatch(/disabled while a turn is running/i);
   });
 
   it('matches protocol hard-terminal helpers', async () => {

@@ -12,6 +12,8 @@ import {
   isTerminalLifecycle,
   isTerminalTurn,
   hasActiveOrQueuedTurn,
+  prepareDeleteQueuedTurn,
+  prepareEditQueuedTurn,
   registerAsk,
   reopenSoftFailedTask,
   resolveChildWait,
@@ -25,7 +27,7 @@ import {
   type CreateTaskContext,
 } from './transitions';
 import type { DepGraph } from './deps';
-import type { MusterTask, TaskTurn } from './types';
+import type { MusterTask, TaskMessage, TaskTurn } from './types';
 
 const NOW = '2026-07-06T00:00:00.000Z';
 
@@ -165,8 +167,9 @@ describe('startTask / continueTask', () => {
     });
   });
 
-  it('continueTask requires a settled turn and rejects active turns', () => {
+  it('continueTask requires a prior turn and allows FIFO queue while live/queued', () => {
     const task = baseTask();
+    const liveOnly = turn({ id: 't1', status: 'running', sequence: 1 });
     const settled = turn({ id: 't1', status: 'succeeded', sequence: 1 });
     const active = turn({ id: 't2', status: 'running', sequence: 2 });
 
@@ -174,30 +177,83 @@ describe('startTask / continueTask', () => {
       continueTask(task, [], { turnId: 't2', now: NOW, inputs: [] }),
     ).toEqual({
       ok: false,
-      reason: 'continueTask requires at least one settled turn',
+      reason: 'continueTask requires at least one prior turn',
     });
+
+    // R012: first follow-up may queue while the initial turn is still live (no settled yet).
+    const behindFirstLive = continueTask(task, [liveOnly], {
+      turnId: 't2',
+      now: NOW,
+      inputs: [{ kind: 'message', messageId: 'm-early' }],
+    });
+    expect(behindFirstLive.ok).toBe(true);
+    if (behindFirstLive.ok) {
+      expect(behindFirstLive.next).toMatchObject({
+        id: 't2',
+        status: 'queued',
+        sequence: 2,
+        inputs: [{ kind: 'message', messageId: 'm-early' }],
+      });
+    }
 
     expect(
       continueTask(task, [settled], { turnId: 't2', now: NOW, inputs: [] }).ok,
     ).toBe(true);
 
-    expect(
-      continueTask(task, [settled, active], { turnId: 't3', now: NOW, inputs: [] }),
-    ).toEqual({
-      ok: false,
-      reason: 'task already has an active or queued turn',
+    // R012: follow-up turns may stack behind a live turn (scheduler enforces one-at-a-time).
+    const behindLive = continueTask(task, [settled, active], {
+      turnId: 't3',
+      now: NOW,
+      inputs: [{ kind: 'message', messageId: 'm-follow' }],
     });
+    expect(behindLive.ok).toBe(true);
+    if (behindLive.ok) {
+      expect(behindLive.next).toMatchObject({
+        id: 't3',
+        status: 'queued',
+        sequence: 3,
+        inputs: [{ kind: 'message', messageId: 'm-follow' }],
+      });
+    }
   });
 
-  it('rejects a second queued turn', () => {
+  it('allows multiple one-message FIFO queued turns behind a live turn', () => {
     const task = baseTask();
-    const queued = turn({ id: 't1', status: 'queued', sequence: 1 });
-    expect(hasActiveOrQueuedTurn([queued])).toBe(true);
+    const settled = turn({ id: 't0', status: 'succeeded', sequence: 1 });
+    const live = turn({ id: 't1', status: 'running', sequence: 2 });
+    const firstQueued = continueTask(task, [settled, live], {
+      turnId: 't2',
+      now: NOW,
+      inputs: [{ kind: 'message', messageId: 'm2' }],
+    });
+    expect(firstQueued.ok).toBe(true);
+    if (!firstQueued.ok) return;
+
+    const secondQueued = continueTask(task, [settled, live, firstQueued.next], {
+      turnId: 't3',
+      now: NOW,
+      inputs: [{ kind: 'message', messageId: 'm3' }],
+    });
+    expect(secondQueued.ok).toBe(true);
+    if (!secondQueued.ok) return;
+    expect(secondQueued.next).toMatchObject({
+      id: 't3',
+      status: 'queued',
+      sequence: 4,
+      inputs: [{ kind: 'message', messageId: 'm3' }],
+    });
+    expect(hasActiveOrQueuedTurn([settled, live, firstQueued.next, secondQueued.next])).toBe(true);
+  });
+
+  it('retryTurn still rejects when another active or queued turn exists', () => {
+    const task = baseTask();
+    const failed = turn({ id: 't1', status: 'failed', sequence: 1 });
+    const queued = turn({ id: 't2', status: 'queued', sequence: 2 });
     expect(
-      continueTask(task, [turn({ id: 't0', status: 'succeeded', sequence: 1 }), queued], {
-        turnId: 't2',
+      retryTurn(task, [failed, queued], failed, {
+        turnId: 't3',
+        instruction: 'retry',
         now: NOW,
-        inputs: [],
       }),
     ).toEqual({
       ok: false,
@@ -627,5 +683,134 @@ describe('stageDisposition rejections', () => {
         {},
       ),
     ).toEqual({ ok: false, reason: 'stageDisposition requires a live turn' });
+  });
+});
+
+describe('prepareEditQueuedTurn / prepareDeleteQueuedTurn', () => {
+  function userMessage(overrides: Partial<TaskMessage> & Pick<TaskMessage, 'id'>): TaskMessage {
+    return {
+      taskId: 'task-1',
+      role: 'user',
+      content: 'hello',
+      state: 'pending',
+      createdAt: NOW,
+      ...overrides,
+    };
+  }
+
+  it('edits only the bound pending user message content of a queued turn', () => {
+    const queued = turn({
+      id: 't2',
+      status: 'queued',
+      sequence: 2,
+      inputs: [{ kind: 'message', messageId: 'm2' }],
+    });
+    const messages = {
+      m2: userMessage({ id: 'm2', content: 'old' }),
+      m1: userMessage({ id: 'm1', content: 'live', state: 'assigned', turnId: 't1' }),
+    };
+    const result = prepareEditQueuedTurn('task-1', queued, messages, '  revised  ');
+    expect(result).toEqual({
+      ok: true,
+      next: { messageId: 'm2', content: 'revised' },
+      effects: [],
+    });
+  });
+
+  it('refuses edit when turn is missing, foreign, or not queued', () => {
+    const messages = { m1: userMessage({ id: 'm1' }) };
+    expect(prepareEditQueuedTurn('task-1', undefined, messages, 'x')).toEqual({
+      ok: false,
+      reason: 'turn not found',
+    });
+    expect(
+      prepareEditQueuedTurn(
+        'task-1',
+        turn({ id: 't1', taskId: 'other', status: 'queued', sequence: 1, inputs: [{ kind: 'message', messageId: 'm1' }] }),
+        messages,
+        'x',
+      ),
+    ).toEqual({ ok: false, reason: 'turn does not belong to task' });
+    expect(
+      prepareEditQueuedTurn(
+        'task-1',
+        turn({ id: 't1', status: 'running', sequence: 1, inputs: [{ kind: 'message', messageId: 'm1' }] }),
+        messages,
+        'x',
+      ),
+    ).toEqual({ ok: false, reason: 'turn is not queued' });
+    expect(
+      prepareEditQueuedTurn(
+        'task-1',
+        turn({ id: 't1', status: 'succeeded', sequence: 1, inputs: [{ kind: 'message', messageId: 'm1' }] }),
+        messages,
+        'x',
+      ),
+    ).toEqual({ ok: false, reason: 'turn is not queued' });
+  });
+
+  it('refuses edit for empty content or non-pending bound messages', () => {
+    const queued = turn({
+      id: 't1',
+      status: 'queued',
+      sequence: 1,
+      inputs: [{ kind: 'message', messageId: 'm1' }],
+    });
+    expect(prepareEditQueuedTurn('task-1', queued, { m1: userMessage({ id: 'm1' }) }, '   ')).toEqual({
+      ok: false,
+      reason: 'invalid content',
+    });
+    expect(prepareEditQueuedTurn('task-1', queued, {}, 'ok')).toEqual({
+      ok: false,
+      reason: 'message not found',
+    });
+    expect(
+      prepareEditQueuedTurn(
+        'task-1',
+        queued,
+        { m1: userMessage({ id: 'm1', state: 'assigned', turnId: 't1' }) },
+        'ok',
+      ),
+    ).toEqual({ ok: false, reason: 'message is not pending' });
+  });
+
+  it('deletes a queued turn and its pending user messages only', () => {
+    const queued = turn({
+      id: 't2',
+      status: 'queued',
+      sequence: 2,
+      inputs: [{ kind: 'message', messageId: 'm2' }],
+    });
+    const messages = {
+      m2: userMessage({ id: 'm2', content: 'follow-up' }),
+      m1: userMessage({ id: 'm1', content: 'live', state: 'assigned', turnId: 't1' }),
+    };
+    expect(prepareDeleteQueuedTurn('task-1', queued, messages)).toEqual({
+      ok: true,
+      next: { turnId: 't2', messageIds: ['m2'] },
+      effects: [],
+    });
+  });
+
+  it('refuses delete when turn is not queued or messages are not pending', () => {
+    const messages = { m1: userMessage({ id: 'm1' }) };
+    expect(prepareDeleteQueuedTurn('task-1', undefined, messages)).toEqual({
+      ok: false,
+      reason: 'turn not found',
+    });
+    expect(
+      prepareDeleteQueuedTurn(
+        'task-1',
+        turn({ id: 't1', status: 'running', sequence: 1, inputs: [{ kind: 'message', messageId: 'm1' }] }),
+        messages,
+      ),
+    ).toEqual({ ok: false, reason: 'turn is not queued' });
+    expect(
+      prepareDeleteQueuedTurn(
+        'task-1',
+        turn({ id: 't1', status: 'queued', sequence: 1, inputs: [{ kind: 'message', messageId: 'm1' }] }),
+        { m1: userMessage({ id: 'm1', state: 'assigned' }) },
+      ),
+    ).toEqual({ ok: false, reason: 'message is not pending' });
   });
 });

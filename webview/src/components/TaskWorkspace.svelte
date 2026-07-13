@@ -11,6 +11,11 @@
     isHardTerminal,
   } from '../lib/task-status';
   import type { PendingAsk, TaskLifecycleState } from '../lib/protocol';
+  import {
+    buildDeleteQueuedTurnMessage,
+    buildEditQueuedTurnMessage,
+    queuedTurnControlState,
+  } from '../lib/queued-turns';
   import { tip } from '../lib/tooltip';
 
   interface Props {
@@ -26,11 +31,20 @@
   let statusMenuRegion = $state<HTMLElement | undefined>(undefined);
   /** Collapsed by default — detail lines (headline, session, orchestration) only when expanded. */
   let detailsExpanded = $state(false);
+  /** turnId currently being edited in the queue panel (inline content). */
+  let editingQueuedTurnId = $state<string | null>(null);
+  let editingQueuedContent = $state('');
 
   const focused = $derived(tasks.focusedTask);
   const thread = $derived(threadStore.current);
   const presentation = $derived(focused ? getTaskPresentation(focused) : null);
   const runtime = $derived(focused ? effectiveRuntimeActivity(focused) : null);
+  /** Preview source: thread user bubbles keyed by message id (host transcript projection). */
+  const queuedTurnControls = $derived(
+    tasks.queuedTurns.map((turn) =>
+      queuedTurnControlState(turn, thread.items, tasks.queuedTurns),
+    ),
+  );
 
   type LifecycleAction = {
     lifecycle: TaskLifecycleState;
@@ -83,6 +97,17 @@
     void focused?.id;
     detailsExpanded = false;
     statusMenuOpen = false;
+    editingQueuedTurnId = null;
+    editingQueuedContent = '';
+  });
+
+  // Drop inline editor when the turn leaves the queue (dispatch/delete).
+  $effect(() => {
+    if (!editingQueuedTurnId) return;
+    if (!tasks.queuedTurns.some((turn) => turn.turnId === editingQueuedTurnId)) {
+      editingQueuedTurnId = null;
+      editingQueuedContent = '';
+    }
   });
 
   const showResume = $derived(
@@ -95,12 +120,11 @@
   const showContinueAsNew = $derived(!!focused && isHardTerminal(focused.lifecycle));
   const showSoftFailHint = $derived(focused?.lifecycle === 'failed');
   const hasRetryableTurn = $derived(!!activeTurnId);
+  // Keep the composer editable during live/queued turns so Enter can create FIFO
+  // follow-ups and Ctrl+Enter can attempt honest live inject. Recovery and hard
+  // terminal / host read-only still lock free-form send.
   const composerReadOnly = $derived(
-    !!focused &&
-      (thread.readOnly ||
-        showRecovery ||
-        runtime === 'running' ||
-        runtime === 'queued'),
+    !!focused && (thread.readOnly || showRecovery),
   );
 
   function resumeQueued(): void {
@@ -128,6 +152,54 @@
     if (!focused) return;
     tasks.openContinuationDraft(focused.id);
     post({ type: 'newTask' });
+  }
+
+  function beginEditQueuedTurn(turnId: string, previewText: string): void {
+    if (!tasks.queuedTurns.some((turn) => turn.turnId === turnId)) return;
+    editingQueuedTurnId = turnId;
+    editingQueuedContent = previewText;
+    tasks.setCommandError(null);
+  }
+
+  function cancelEditQueuedTurn(): void {
+    editingQueuedTurnId = null;
+    editingQueuedContent = '';
+  }
+
+  function submitEditQueuedTurn(turnId: string): void {
+    if (!focused) return;
+    const locked = !tasks.queuedTurns.some((turn) => turn.turnId === turnId);
+    const message = buildEditQueuedTurnMessage(focused.id, turnId, editingQueuedContent, {
+      locked,
+    });
+    if (!message) {
+      if (locked) {
+        tasks.setCommandError('Queued turn mutation refused: turn is not queued', focused.id);
+      }
+      return;
+    }
+    tasks.setCommandError(null);
+    post(message);
+    editingQueuedTurnId = null;
+    editingQueuedContent = '';
+  }
+
+  function submitDeleteQueuedTurn(turnId: string): void {
+    if (!focused) return;
+    const locked = !tasks.queuedTurns.some((turn) => turn.turnId === turnId);
+    const message = buildDeleteQueuedTurnMessage(focused.id, turnId, { locked });
+    if (!message) {
+      if (locked) {
+        tasks.setCommandError('Queued turn mutation refused: turn is not queued', focused.id);
+      }
+      return;
+    }
+    if (editingQueuedTurnId === turnId) {
+      editingQueuedTurnId = null;
+      editingQueuedContent = '';
+    }
+    tasks.setCommandError(null);
+    post(message);
   }
 
   function shortGoal(goal: string): string {
@@ -274,6 +346,73 @@
     </div>
 
     <ChatThread />
+
+    {#if queuedTurnControls.length > 0}
+      <div
+        class="task-action-panel task-action-panel--info queued-turns-panel"
+        data-testid="queued-turns-panel"
+        aria-label="Queued follow-up turns"
+      >
+        <div class="font-semibold">Queued follow-ups ({queuedTurnControls.length})</div>
+        <p class="task-muted" style="margin: 0;">
+          Edit or delete before dispatch. Controls lock once a turn starts.
+        </p>
+        <ul class="queued-turns-list">
+          {#each queuedTurnControls as control (control.turnId)}
+            <li
+              class="queued-turn-item"
+              data-turn-id={control.turnId}
+              data-queued-locked={control.locked ? 'true' : 'false'}
+            >
+              <div class="queued-turn-item__meta">
+                <span class="task-pill task-pill--muted">#{control.sequence}</span>
+                <span class="task-muted">queued</span>
+              </div>
+
+              {#if editingQueuedTurnId === control.turnId && !control.locked}
+                <vscode-textarea
+                  rows={3}
+                  value={editingQueuedContent}
+                  aria-label={`Edit queued turn ${control.sequence}`}
+                  oninput={(e: Event) => {
+                    editingQueuedContent = (e.currentTarget as HTMLTextAreaElement).value;
+                  }}
+                ></vscode-textarea>
+                <div class="queued-turn-item__actions">
+                  <vscode-button
+                    disabled={!editingQueuedContent.trim()}
+                    onclick={() => submitEditQueuedTurn(control.turnId)}
+                  >
+                    Save edit
+                  </vscode-button>
+                  <vscode-button secondary onclick={cancelEditQueuedTurn}>Cancel</vscode-button>
+                </div>
+              {:else}
+                <div class="queued-turn-item__preview">
+                  {control.previewText || '(empty queued message)'}
+                </div>
+                <div class="queued-turn-item__actions">
+                  <vscode-button
+                    secondary
+                    disabled={control.locked || !control.canEdit}
+                    onclick={() => beginEditQueuedTurn(control.turnId, control.previewText)}
+                  >
+                    Edit
+                  </vscode-button>
+                  <vscode-button
+                    secondary
+                    disabled={control.locked || !control.canDelete}
+                    onclick={() => submitDeleteQueuedTurn(control.turnId)}
+                  >
+                    Delete
+                  </vscode-button>
+                </div>
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      </div>
+    {/if}
 
     {#if pendingAsk && tasks.focusedTaskId}
       <AskCard

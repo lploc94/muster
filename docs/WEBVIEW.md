@@ -433,10 +433,11 @@ The webview never holds the whole thread. Render a **recent window**; older item
 
 ### Composer
 
-- **Disabled** while a turn is in-flight (`turnStart` received, no `turnDone` / `turnError` yet).
-- **Disabled** while any `askPending` is unresolved (or show `AskCard` modal — user must submit or cancel).
-- Enter sends; Shift+Enter newline (standard chat pattern).
-- **Re-enable on `turnDone` OR `turnError`.** A normal adapter `error` NormalizedEvent (non-zero exit, cancellation) arrives via an `event` message and is then followed by `turnDone`; only an uncaught host/adapter failure sends `turnError`. Treat either terminal message as end-of-turn so the composer never gets stuck.
+- **Composer stays editable** while a focused open task is `running` or has FIFO queued follow-ups so Enter can create another turn and Ctrl+Enter can attempt live inject. Do **not** hard-disable solely because a turn is in-flight.
+- **Disabled / blocked** while any `askPending` is unresolved (or show `AskCard` modal — user must submit or cancel), during recovery gates, dependency-blocked free-form send, or hard-terminal lifecycle.
+- **Enter** posts host `send` (FIFO follow-up while live); **Ctrl+Enter** / **Meta+Enter** posts `sendLiveInput` only (no queue fallback). Shift+Enter inserts a newline; IME composition suppresses submit.
+- **Stop / cancel** still targets the live turn; queue mutations use the `queuedTurns` panel (`editQueuedTurn` / `deleteQueuedTurn`). See §14 for the full queue and live-inject contract.
+- **Terminal messages:** a normal adapter `error` NormalizedEvent (non-zero exit, cancellation) arrives via an `event` message and is then followed by `turnDone`; only an uncaught host/adapter failure sends `turnError`. Treat either terminal message as end-of-turn for stop-button and streaming chrome so the UI never gets stuck mid-run.
 
 ### Session / tasks
 
@@ -490,7 +491,7 @@ The webview never holds the whole thread. Render a **recent window**; older item
 
 ### Cancellation
 
-- `cancelTurn` → extension aborts `AbortSignal`, `AskBridge.cancelAll()`, kills CLI child. Targets the current `runId` (only one turn is ever in-flight — the composer is disabled otherwise).
+- `cancelTurn` → extension aborts `AbortSignal`, `AskBridge.cancelAll()`, kills CLI child. Targets the current live turn/`runId` (at most one **running** turn per task; additional follow-ups may already be FIFO-queued — cancel does not delete them).
 - Pending `AskCard` → `cancelAsk` or turn cancel clears card.
 
 ### Security
@@ -620,7 +621,51 @@ Contributor proof and live-host evidence rules are in [CONTRIBUTING.md](../CONTR
 
 ---
 
-## 14. References
+## 14. Queued follow-ups and live inject
+
+Task-workspace composer keyboard and queue UX (product contract for multi-turn follow-ups):
+
+| Input | Host message | Behavior |
+|-------|--------------|----------|
+| **Enter** (task focused, open) | `send` `{ taskId, text }` | Creates a **distinct** FIFO follow-up turn bound to that user message. Works while a turn is already running or other turns are queued. |
+| **Ctrl+Enter** / **Meta+Enter** | `sendLiveInput` `{ taskId, instruction }` | Concurrent inject into the **currently running**, locally owned turn when the backend proves live-input support. **No queue fallback** — refusal never creates a queued turn. |
+| **Shift+Enter** | — | Inserts a newline; does not submit. |
+| IME composition / keyCode 229 | — | Suppresses submit. |
+
+### Composer unlock vs blocks
+
+The **composer stays editable** during `running` and `queued` so operators can stack follow-ups and attempt live inject. Free-form send is still blocked for recovery (`needs_recovery`), unresolved ask-user, dependency gates that product policy marks non-writable, and hard-terminal lifecycles (`succeeded` / `cancelled` / `skipped`). Soft-failed tasks reopen on the next `send` (existing reopen contract).
+
+Guidance copy on the composer strip describes queue/inject affordances (e.g. “Enter queues a follow-up · Ctrl+Enter injects live input”) rather than a hard disable-while-running message.
+
+### FIFO queue panel (`queuedTurns`)
+
+Host snapshots project `queuedTurns` (ordered by sequence) for the focused task. The workspace **queued turns** panel is the inspection surface: each undispatched turn may be edited or deleted.
+
+- **Edit** → `editQueuedTurn` `{ taskId, turnId, content }` — updates the bound pending user message of that turn only.
+- **Delete** → `deleteQueuedTurn` `{ taskId, turnId }` — removes the undispatched turn and its bound pending message(s); does **not** cancel a running turn.
+- Controls **lock** when `turnId` leaves the live `queuedTurns` projection (dispatch / start boundary). Stale mutations refuse with a visible `commandError` banner; they never silently no-op as success.
+
+Scheduler promotes at most **one active (running) turn** per task; multiple queued follow-ups drain in FIFO order after settlement.
+
+### Live inject feedback
+
+| Outcome | Host message | UI |
+|---------|--------------|----|
+| Delivered | `liveInputResult` `{ taskId, code: 'delivered', sessionId }` | Dismissible status notice (`commandNotice`); must not be silently dropped. |
+| Refused (unsupported backend, not local owner, no active turn, validation, engine not ready, …) | `commandError` `{ taskId?, message }` | Visible alert banner with a bounded, sanitized message. |
+
+Refusals use `commandError` only — never a queued turn and never a synthetic `send`. Delivered acks and errors mutually clear so the latest inject outcome remains visible for the focused task.
+
+Draft / new-task mode has **no** live-inject path: Ctrl+Enter behaves like Enter (`send` / first-turn create).
+
+### Proof boundary
+
+Unit tests cover keyboard intent, protocol shapes, queue control locking, and banner helpers. Focused Playwright (`e2e/muster-webview-state.spec.ts` against the Vite webview) proves Enter vs Ctrl+Enter message shapes, queue edit/delete, and visible inject/stale feedback with synthetic host messages. Local unit and Playwright checks are supportive only: only direct observation in an actual VS Code Extension Development Host can establish a live keyboard proof. See [CONTRIBUTING.md](../CONTRIBUTING.md) for the queue and live-inject verification commands.
+
+---
+
+## 15. References
 
 - [VS Code Webview API](https://code.visualstudio.com/api/extension-guides/webview)
 - [VS Code Elements docs](https://vscode-elements.github.io)

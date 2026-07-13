@@ -53,6 +53,7 @@ describe('CodexBackend — identity', () => {
       supportsReasoning: true,
       supportsDetailedToolEvents: true,
       supportsMCP: true,
+      supportsLiveInput: true,
     });
   });
 });

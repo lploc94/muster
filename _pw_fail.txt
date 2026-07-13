@@ -1,0 +1,85 @@
+
+Running 2 tests using 1 worker
+
+[1/2] [chromium] › e2e\muster-webview-state.spec.ts:957:7 › Muster webview host state smoke › surfaces liveInputResult delivery notice and commandError inject refusal
+
+[WebServer] The request id "D:\_Dev\muster\node_modules\@vscode\codicons\dist\codicon.ttf" is outside of Vite serving allow list.
+
+[WebServer] 
+[WebServer] - D:/_Dev/muster/.gsd-worktrees/M008
+[WebServer] - D:/_Dev/muster/node_modules/vite/dist/client
+[WebServer] 
+[WebServer] Refer to docs https://vite.dev/config/server-options.html#server-fs-allow for configurations and more details.
+[WebServer] 
+  1) [chromium] › e2e\muster-webview-state.spec.ts:957:7 › Muster webview host state smoke › surfaces liveInputResult delivery notice and commandError inject refusal 
+
+    Error: expect(locator).toBeVisible() failed
+
+    Locator: getByRole('status').getByText('Live input')
+    Expected: visible
+    Error: strict mode violation: getByRole('status').getByText('Live input') resolved to 2 elements:
+        1) <div class="font-semibold">Live input</div> aka getByText('Live input', { exact: true })
+        2) <div class="task-command-notice__detail">Live input delivered to the active session.</div> aka getByText('Live input delivered to the')
+
+    Call log:
+      - Expect "toBeVisible" with timeout 5000ms
+      - waiting for getByRole('status').getByText('Live input')
+
+
+      974 |     });
+      975 |
+    > 976 |     await expect(page.getByRole('status').getByText('Live input')).toBeVisible();
+          |                                                                    ^
+      977 |     await expect(
+      978 |       page.getByRole('status').getByText('Live input delivered to the active session.'),
+      979 |     ).toBeVisible();
+        at D:\_Dev\muster\.gsd-worktrees\M008\e2e\muster-webview-state.spec.ts:976:68
+
+    Error Context: test-results\muster-webview-state-Muste-0a092-commandError-inject-refusal-chromium\error-context.md
+
+    attachment #2: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results\muster-webview-state-Muste-0a092-commandError-inject-refusal-chromium\trace.zip
+    Usage:
+
+        npx playwright show-trace test-results\muster-webview-state-Muste-0a092-commandError-inject-refusal-chromium\trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+[2/2] [chromium] › e2e\muster-webview-state.spec.ts:1013:7 › Muster webview host state smoke › queuedTurns panel supports edit/delete and shows stale mutation feedback
+
+[WebServer] The request id "D:\_Dev\muster\node_modules\@vscode\codicons\dist\codicon.ttf" is outside of Vite serving allow list.
+  2) [chromium] › e2e\muster-webview-state.spec.ts:1013:7 › Muster webview host state smoke › queuedTurns panel supports edit/delete and shows stale mutation feedback 
+
+    Error: locator.fill: Error: Element is not an <input>, <textarea>, <select> or [contenteditable] and does not have a role allowing [aria-readonly]
+    Call log:
+      - waiting for getByLabel('Edit queued turn 1')
+        - locator resolved to <vscode-textarea aria-label="Edit queued turn 1"></vscode-textarea>
+        - fill("Edited queued follow-up")
+      - attempting fill action
+        - waiting for element to be visible, enabled and editable
+
+
+      1047 |     await item.getByRole('button', { name: 'Edit' }).click();
+      1048 |     const editor = page.getByLabel('Edit queued turn 1');
+    > 1049 |     await editor.fill('Edited queued follow-up');
+           |                  ^
+      1050 |     await page.getByRole('button', { name: 'Save edit' }).click();
+      1051 |     await expectPostedMessage(page, {
+      1052 |       type: 'editQueuedTurn',
+        at D:\_Dev\muster\.gsd-worktrees\M008\e2e\muster-webview-state.spec.ts:1049:18
+
+    Error Context: test-results\muster-webview-state-Muste-2d92e-ows-stale-mutation-feedback-chromium\error-context.md
+
+    attachment #2: trace (application/zip) ─────────────────────────────────────────────────────────
+    test-results\muster-webview-state-Muste-2d92e-ows-stale-mutation-feedback-chromium\trace.zip
+    Usage:
+
+        npx playwright show-trace test-results\muster-webview-state-Muste-2d92e-ows-stale-mutation-feedback-chromium\trace.zip
+
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+
+  2 failed
+    [chromium] › e2e\muster-webview-state.spec.ts:957:7 › Muster webview host state smoke › surfaces liveInputResult delivery notice and commandError inject refusal 
+    [chromium] › e2e\muster-webview-state.spec.ts:1013:7 › Muster webview host state smoke › queuedTurns panel supports edit/delete and shows stale mutation feedback 

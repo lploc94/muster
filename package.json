@@ -112,6 +112,7 @@
     "test:presentation-docs": "node --test scripts/verify-presentation-docs.test.mjs",
     "test:file-drop-live-evidence": "node --test scripts/verify-file-drop-live-host-evidence.test.mjs",
     "test:file-drop-docs": "node --test scripts/verify-file-drop-docs.test.mjs",
+    "test:queue-live-inject-docs": "node --test scripts/verify-queue-live-inject-docs.test.mjs",
     "test:watch": "vitest",
     "check:svelte": "svelte-check --workspace webview --tsconfig ./tsconfig.json",
     "test:source-boundary": "node scripts/source-boundary-smoke.mjs",

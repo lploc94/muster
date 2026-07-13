@@ -32,11 +32,41 @@ export interface BackendCapabilities {
   supportsReasoning: boolean;
   supportsDetailedToolEvents: boolean;
   supportsMCP: boolean;
+  /**
+   * True when this backend may deliver in-flight input to a live turn
+   * (subject to runtime agent capability evidence). False means the backend
+   * has no live-input path and callers must refuse without queue mutation.
+   */
+  supportsLiveInput: boolean;
 }
+
+/** Request to inject an instruction into a backend's currently-active turn. */
+export interface LiveInputRequest {
+  sessionId: string;
+  instruction: string;
+  signal?: AbortSignal;
+}
+
+/**
+ * Stable live-input outcomes. Backend/engine/host layers share these codes so
+ * refusals stay capability- and ownership-specific (never silent queueing).
+ */
+export type LiveInputResult =
+  | { code: 'delivered'; sessionId: string }
+  | { code: 'unsupported'; reason: string }
+  | { code: 'no-active-turn'; reason: string }
+  | { code: 'not-local-owner'; reason: string }
+  | { code: 'rejected'; reason: string }
+  | { code: 'cancelled'; reason: string };
 
 export interface Backend {
   readonly name: string;
   readonly capabilities?: BackendCapabilities;
   run(options: RunOptions): AsyncIterable<NormalizedEvent>;
   extractSessionId?(rawOutput: string, lastUsedId?: string): string | undefined;
+  /**
+   * Optional in-flight input path. When absent or when capability evidence is
+   * missing, callers treat live input as unsupported.
+   */
+  sendLiveInput?(request: LiveInputRequest): Promise<LiveInputResult>;
 }

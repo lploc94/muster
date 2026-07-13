@@ -60,12 +60,32 @@ export type TranscriptItem =
   | { id: string; kind: 'tool'; turnId: string; order: number; content: ToolTranscriptContent }
   | { id: string; kind: 'reasoning'; turnId: string; content: string };
 
+/**
+ * Authoritative queued follow-up turn projection for S03 edit/delete and S04
+ * composer feedback. Ordered by FIFO sequence (then createdAt, then id).
+ * Each entry binds a distinct turn identity to its message inputs.
+ */
+export interface QueuedTurnProjection {
+  turnId: string;
+  sequence: number;
+  status: 'queued';
+  messageIds: string[];
+  createdAt: string;
+}
+
 export interface TaskSnapshot {
   rootTasks: TaskSummary[];
   focusedTaskId?: string;
   subtree?: TaskSummary[];
   transcript?: TranscriptItem[];
+  /**
+   * Currently live (running/waiting_user) turn, or the sole queued turn when
+   * nothing is live, or the latest retryable turn under needs_recovery.
+   * Never prefers a later queued follow-up over a live turn (R012 multi-queue).
+   */
   activeTurnId?: string;
+  /** FIFO queued follow-ups for the focused task (excludes the live turn). */
+  queuedTurns?: QueuedTurnProjection[];
   storeRevision: number;
   pendingAsk?: { turnId: string; askId: string; questions: Question[] };
 }
@@ -256,13 +276,57 @@ export function buildTranscript(file: TaskStoreFile, taskId: string): Transcript
   return entries.map((entry) => entry.item);
 }
 
+function messageIdsForTurn(turn: TaskTurn): string[] {
+  return turn.inputs
+    .filter((input): input is { kind: 'message'; messageId: string } => input.kind === 'message')
+    .map((input) => input.messageId);
+}
+
+/**
+ * FIFO queued follow-up turns for a task. Excludes live/settled turns so S03/S04
+ * can key edit/delete and composer feedback off dedicated turn identity.
+ */
+export function projectQueuedTurns(file: TaskStoreFile, taskId: string): QueuedTurnProjection[] {
+  return turnsForTask(file, taskId)
+    .filter((turn) => turn.status === 'queued')
+    .sort(
+      (a, b) =>
+        a.sequence - b.sequence ||
+        a.createdAt.localeCompare(b.createdAt) ||
+        a.id.localeCompare(b.id),
+    )
+    .map((turn) => ({
+      turnId: turn.id,
+      sequence: turn.sequence,
+      status: 'queued' as const,
+      messageIds: messageIdsForTurn(turn),
+      createdAt: turn.createdAt,
+    }));
+}
+
+/**
+ * Active turn for host/webview controls:
+ * 1. Live running/waiting_user turn (never a later queued follow-up)
+ * 2. Else earliest queued turn by sequence (resume target when nothing is live)
+ * 3. Else latest failed/interrupted under needs_recovery
+ */
 export function activeTurnIdForTask(file: TaskStoreFile, taskId: string): string | undefined {
   const turns = turnsForTask(file, taskId);
-  const live = turns.filter(
-    (turn) => turn.status === 'running' || turn.status === 'waiting_user' || turn.status === 'queued',
-  );
+  const live = turns.filter((turn) => turn.status === 'running' || turn.status === 'waiting_user');
   if (live.length > 0) {
+    // Prefer highest sequence if multiple live (should be rare; scheduler enforces one).
     return live.reduce((latest, turn) => (turn.sequence > latest.sequence ? turn : latest)).id;
+  }
+  const queued = turns
+    .filter((turn) => turn.status === 'queued')
+    .sort(
+      (a, b) =>
+        a.sequence - b.sequence ||
+        a.createdAt.localeCompare(b.createdAt) ||
+        a.id.localeCompare(b.id),
+    );
+  if (queued.length > 0) {
+    return queued[0]!.id;
   }
   const task = file.tasks[taskId];
   if (!task) {
@@ -308,6 +372,7 @@ export function buildSnapshot(
     .sort((a, b) => a.id.localeCompare(b.id));
   snapshot.transcript = buildTranscript(file, focusedTaskId);
   snapshot.activeTurnId = activeTurnIdForTask(file, focusedTaskId);
+  snapshot.queuedTurns = projectQueuedTurns(file, focusedTaskId);
 
   const pending = activePendingAsks?.get(focusedTaskId);
   if (pending) {

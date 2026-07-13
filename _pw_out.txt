@@ -1,0 +1,89 @@
+
+Running 16 tests using 1 worker
+
+  ok  1 [chromium] \u203a e2e\muster-webview-state.spec.ts:167:7 \u203a Muster webview host state smoke \u203a renders task shell from a mocked VS Code snapshot (702ms)
+  ok  2 [chromium] \u203a e2e\muster-webview-state.spec.ts:190:7 \u203a Muster webview host state smoke \u203a keeps the shell usable when a snapshot contains no tasks (387ms)
+  ok  3 [chromium] \u203a e2e\muster-webview-state.spec.ts:213:7 \u203a Muster webview host state smoke \u203a Add Context menu keeps the existing file picker and mention flow (549ms)
+  ok  4 [chromium] \u203a e2e\muster-webview-state.spec.ts:255:7 \u203a Muster webview host state smoke \u203a inserts picked files at the caret and preserves surrounding draft text (437ms)
+  ok  5 [chromium] \u203a e2e\muster-webview-state.spec.ts:270:7 \u203a Muster webview host state smoke \u203a drops a file through the host contract and projects sanitized failures without changing the draft (567ms)
+  ok  6 [chromium] \u203a e2e\muster-webview-state.spec.ts:299:7 \u203a Muster webview host state smoke \u203a ignores file drops while the composer is disabled (485ms)
+  ok  7 [chromium] \u203a e2e\muster-webview-state.spec.ts:319:7 \u203a Muster webview host state smoke \u203a Add Context menu browses workspace files through the shared filePicked mention flow (655ms)
+  ok  8 [chromium] \u203a e2e\muster-webview-state.spec.ts:348:7 \u203a Muster webview host state smoke \u203a Add Context menu renders future model actions as disabled coming-soon entries (654ms)
+  ok  9 [chromium] \u203a e2e\muster-webview-state.spec.ts:380:7 \u203a Muster webview host state smoke \u203a Add Context menu hardens dismissal states without losing draft text (653ms)
+  ok 10 [chromium] \u203a e2e\muster-webview-state.spec.ts:445:7 \u203a Muster webview host state smoke \u203a surfaces task-centric status feedback for active and failed tasks (1.3s)
+  ok 11 [chromium] \u203a e2e\muster-webview-state.spec.ts:677:7 \u203a Muster webview host state smoke \u203a blocks the composer while a pending task ask is visible (512ms)
+  ok 12 [chromium] \u203a e2e\muster-webview-state.spec.ts:739:7 \u203a Muster webview host state smoke \u203a Settings panel edits host-backed retention values without losing task or chat state (897ms)
+  ok 13 [chromium] \u203a e2e\muster-webview-state.spec.ts:862:7 \u203a Muster webview host state smoke \u203a Enter queues a FIFO follow-up while running; Ctrl+Enter posts sendLiveInput only (437ms)
+  ok 14 [chromium] \u203a e2e\muster-webview-state.spec.ts:932:7 \u203a Muster webview host state smoke \u203a Shift+Enter does not submit while a live turn is running (324ms)
+  x  15 [chromium] \u203a e2e\muster-webview-state.spec.ts:957:7 \u203a Muster webview host state smoke \u203a surfaces liveInputResult delivery notice and commandError inject refusal (375ms)
+  x  16 [chromium] \u203a e2e\muster-webview-state.spec.ts:1013:7 \u203a Muster webview host state smoke \u203a queuedTurns panel supports edit/delete and shows stale mutation feedback (933ms)
+
+
+  1) [chromium] \u203a e2e\muster-webview-state.spec.ts:957:7 \u203a Muster webview host state smoke \u203a surfaces liveInputResult delivery notice and commandError inject refusal 
+
+    Error: expect(locator).toBeVisible() failed
+
+    Locator: getByRole('status').getByText('Live input')
+    Expected: visible
+    Error: strict mode violation: getByRole('status').getByText('Live input') resolved to 2 elements:
+        1) <div class="font-semibold">Live input</div> aka getByText('Live input', { exact: true })
+        2) <div class="ta\xabredacted\xbb">Live input delivered to the active session.</div> aka getByText('Live input delivered to the')
+
+    Call log:
+      - Expect "toBeVisible" with timeout 5000ms
+      - waiting for getByRole('status').getByText('Live input')
+
+
+      974 |     });
+      975 |
+    > 976 |     await expect(page.getByRole('status').getByText('Live input')).toBeVisible();
+          |                                                                    ^
+      977 |     await expect(
+      978 |       page.getByRole('status').getByText('Live input delivered to the active session.'),
+      979 |     ).toBeVisible();
+        at D:\_Dev\muster\.gsd-worktrees\M008\e2e\muster-webview-state.spec.ts:976:68
+
+    Error Context: test-results\muster-webview-state-Muste-0a092-commandError-inject-refusal-chromium\error-context.md
+
+    attachment #2: trace (application/zip) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    test-results\muster-webview-state-Muste-0a092-commandError-inject-refusal-chromium\trace.zip
+    Usage:
+
+        npx playwright show-trace test-results\muster-webview-state-Muste-0a092-commandError-inject-refusal-chromium\trace.zip
+
+    \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+  2) [chromium] \u203a e2e\muster-webview-state.spec.ts:1013:7 \u203a Muster webview host state smoke \u203a queuedTurns panel supports edit/delete and shows stale mutation feedback 
+
+    Error: locator.fill: Error: Element is not an <input>, <textarea>, <select> or [contenteditable] and does not have a role allowing [aria-readonly]
+    Call log:
+      - waiting for getByLabel('Edit queued turn 1')
+        - locator resolved to <vscode-textarea aria-label="Edit queued turn 1"></vscode-textarea>
+        - fill("Edited queued follow-up")
+      - attempting fill action
+        - waiting for element to be visible, enabled and editable
+
+
+      1047 |     await item.getByRole('button', { name: 'Edit' }).click();
+      1048 |     const editor = page.getByLabel('Edit queued turn 1');
+    > 1049 |     await editor.fill('Edited queued follow-up');
+           |                  ^
+      1050 |     await page.getByRole('button', { name: 'Save edit' }).click();
+      1051 |     await expectPostedMessage(page, {
+      1052 |       type: 'editQueuedTurn',
+        at D:\_Dev\muster\.gsd-worktrees\M008\e2e\muster-webview-state.spec.ts:1049:18
+
+    Error Context: test-results\muster-webview-state-Muste-2d92e-ows-stale-mutation-feedback-chromium\error-context.md
+
+    attachment #2: trace (application/zip) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    test-results\muster-webview-state-Muste-2d92e-ows-stale-mutation-feedback-chromium\trace.zip
+    Usage:
+
+        npx playwright show-trace test-results\muster-webview-state-Muste-2d92e-ows-stale-mutation-feedback-chromium\trace.zip
+
+    \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+  2 failed
+    [chromium] \u203a e2e\muster-webview-state.spec.ts:957:7 \u203a Muster webview host state smoke \u203a surfaces liveInputResult delivery notice and commandError inject refusal 
+    [chromium] \u203a e2e\muster-webview-state.spec.ts:1013:7 \u203a Muster webview host state smoke \u203a queuedTurns panel supports edit/delete and shows stale mutation feedback 
+  14 passed (18.3s)

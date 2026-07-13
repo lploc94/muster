@@ -99,6 +99,15 @@ export interface PendingPermission {
   options: PermissionOptionView[];
 }
 
+/** FIFO queued follow-up turns projected by the host for edit/delete and composer feedback. */
+export interface QueuedTurnProjection {
+  turnId: string;
+  sequence: number;
+  status: 'queued';
+  messageIds: string[];
+  createdAt: string;
+}
+
 export interface SnapshotMessage {
   type: 'snapshot';
   /**
@@ -112,6 +121,8 @@ export interface SnapshotMessage {
   subtree?: TaskSummary[];
   transcript?: TranscriptItem[];
   activeTurnId?: string;
+  /** Authoritative multi-queue projection (R012); optional for older hosts. */
+  queuedTurns?: QueuedTurnProjection[];
   storeRevision: number;
   pendingAsk?: PendingAsk;
 }
@@ -188,6 +199,12 @@ export type ExtMessage =
     }
   | { type: 'permissionCleared'; permissionId: string }
   | { type: 'commandError'; taskId?: string; message: string }
+  /**
+   * Host acknowledgement that a live-input instruction was delivered to the
+   * locally owned active backend session. Refusals use `commandError` with a
+   * capability- or ownership-specific message instead — never a queued turn.
+   */
+  | { type: 'liveInputResult'; taskId: string; code: 'delivered'; sessionId: string }
   | { type: 'filePicked'; path: string }
   | { type: 'backendsAvailable'; backends: string[] }
   | { type: 'modelsAvailable'; models: Record<string, BackendModels> };
@@ -207,6 +224,26 @@ export type OutMessage =
   | { type: 'cancelPermission'; permissionId: string }
   | { type: 'retryTurn'; taskId: string; turnId: string; instruction: string }
   | { type: 'continueTask'; taskId: string; instruction: string }
+  /**
+   * Deliver an instruction to the currently running, locally owned turn for
+   * `taskId` when the backend proves live-input support. Distinct from
+   * `continueTask` (which queues a follow-up turn). Host refuses with
+   * `commandError` when unsupported / not local owner / no active turn.
+   */
+  | { type: 'sendLiveInput'; taskId: string; instruction: string }
+  /**
+   * Edit the bound pending user message of an undispatched queued turn for
+   * `taskId` identified by `turnId`. Host refuses with `commandError` when the
+   * turn is missing, foreign, already dispatched, or content is invalid.
+   * Distinct from `continueTask` (which creates a new queued turn).
+   */
+  | { type: 'editQueuedTurn'; taskId: string; turnId: string; content: string }
+  /**
+   * Remove an undispatched queued turn and its bound pending user message(s).
+   * Host refuses with `commandError` when the turn is missing, foreign, or
+   * already dispatched. Does not cancel an active/running turn.
+   */
+  | { type: 'deleteQueuedTurn'; taskId: string; turnId: string }
   | { type: 'resumeQueuedTurn'; taskId: string; turnId: string }
   | { type: 'pickFile' }
   | { type: 'browseWorkspaceFiles' }
@@ -349,6 +386,18 @@ function isTranscriptItem(v: unknown): v is TranscriptItem {
   }
 }
 
+function isQueuedTurnProjection(v: unknown): v is QueuedTurnProjection {
+  if (!isRecord(v)) return false;
+  return (
+    isString(v.turnId) &&
+    isNumber(v.sequence) &&
+    v.status === 'queued' &&
+    Array.isArray(v.messageIds) &&
+    v.messageIds.every(isString) &&
+    isString(v.createdAt)
+  );
+}
+
 /** Discriminated runtime guard for a NormalizedEvent arriving from the host. */
 export function isNormalizedEvent(v: unknown): v is NormalizedEvent {
   if (!isRecord(v) || !isString(v.type)) return false;
@@ -417,6 +466,8 @@ export function isExtMessage(data: unknown): data is ExtMessage {
         (data.subtree === undefined || (Array.isArray(data.subtree) && data.subtree.every(isTaskSummary))) &&
         (data.transcript === undefined || (Array.isArray(data.transcript) && data.transcript.every(isTranscriptItem))) &&
         (data.activeTurnId === undefined || isString(data.activeTurnId)) &&
+        (data.queuedTurns === undefined ||
+          (Array.isArray(data.queuedTurns) && data.queuedTurns.every(isQueuedTurnProjection))) &&
         (data.pendingAsk === undefined ||
           (isRecord(data.pendingAsk) &&
             isString(data.pendingAsk.turnId) &&
@@ -472,6 +523,14 @@ export function isExtMessage(data: unknown): data is ExtMessage {
     case 'commandError':
       return isString(data.message) && (data.taskId === undefined || isString(data.taskId));
 
+    case 'liveInputResult':
+      return (
+        hasOnlyKeys(data, ['type', 'taskId', 'code', 'sessionId']) &&
+        isString(data.taskId) &&
+        data.code === 'delivered' &&
+        isString(data.sessionId)
+      );
+
     case 'filePicked':
       return isString(data.path);
 
@@ -484,6 +543,30 @@ export function isExtMessage(data: unknown): data is ExtMessage {
     default:
       return false;
   }
+}
+
+/**
+ * User-visible acknowledgement for a successful host `liveInputResult`.
+ * Session id is required so callers never invent a silent/empty success banner.
+ */
+export function formatLiveInputDeliveredMessage(sessionId: string): string {
+  if (typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+    throw new Error('sessionId is required for live-input delivered acknowledgements');
+  }
+  return 'Live input delivered to the active session.';
+}
+
+/**
+ * Task-scoped banner visibility shared by commandError refusals and live-input
+ * success notices. Global (absent/null taskId) banners always show; otherwise
+ * only the currently focused task sees the feedback.
+ */
+export function isTaskScopedBannerVisible(
+  taskId: string | null | undefined,
+  focusedTaskId: string | null,
+): boolean {
+  if (taskId == null || taskId === '') return true;
+  return focusedTaskId != null && taskId === focusedTaskId;
 }
 
 /** Any sealed lifecycle (including soft failed). Prefer hard/soft helpers for UX. */

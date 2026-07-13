@@ -4,7 +4,7 @@ import type { Answers, AskRef } from '../bridge/ask-bridge';
 import { AskBridge } from '../bridge/ask-bridge';
 import { CredentialRegistry } from '../bridge/credentials';
 import { runTurn as defaultRunTurn } from '../runner';
-import type { Backend, NormalizedEvent, RunOptions } from '../types';
+import type { Backend, LiveInputResult, NormalizedEvent, RunOptions } from '../types';
 import type { TurnTrigger } from './types';
 import { canBindTaskToBackend } from './backend-eligibility';
 import { deriveViewStatus } from './derived-status';
@@ -43,6 +43,8 @@ import {
   hasActiveOrQueuedTurn,
   isHardTerminalLifecycle,
   isTerminalLifecycle,
+  prepareDeleteQueuedTurn,
+  prepareEditQueuedTurn,
   reopenSoftFailedTask,
   setTaskLifecycle as transitionSetTaskLifecycle,
   type CreateTaskInput,
@@ -425,7 +427,20 @@ export class TaskEngine {
   private readonly bridgePort: number;
   private readonly resourceLimits: ResourceLimits;
   private readonly emit?: (e: EngineEvent) => void;
-  private readonly liveRuns = new Map<string, AbortController>();
+  /**
+   * In-process handles for currently executing turns. Keyed by turnId so live
+   * input can route only to a run this engine owns, with the exact backend
+   * instance and abort signal for that turn.
+   */
+  private readonly liveRuns = new Map<
+    string,
+    {
+      controller: AbortController;
+      taskId: string;
+      backend: Backend;
+      sessionId?: string;
+    }
+  >();
   /** Queued turns preserved on reload — start only via resumeQueuedTurn. */
   private readonly deferredQueuedTurns = new Set<string>();
   private readonly acceptedOpIds = new Map<string, string>();
@@ -507,7 +522,7 @@ export class TaskEngine {
     if (!this.askBridge.hasPending(ref)) {
       return { ok: false, reason: 'no matching pending ask' };
     }
-    this.liveRuns.get(ref.turnId)?.abort();
+    this.liveRuns.get(ref.turnId)?.controller.abort();
     const now = nowIso(this.clock);
     const commit = this.store.commit((draft) => {
       const turn = draft.turns[ref.turnId];
@@ -780,8 +795,10 @@ export class TaskEngine {
         draft.tasks[taskId] = draftTask;
       }
 
-      // Queue a turn when open and no live/queued turn — including after a
-      // successful prior turn (resume session via committedSessionId) or recovery.
+      // R012: every Enter/send becomes one distinct FIFO turn bound to this message.
+      // Concurrent sends while a turn is live/queued still create queued turns
+      // (scheduler promotes one-at-a-time). Free-floating pending-only messages are
+      // reserved for turn-cap refusal and other failure paths, not normal send.
       const viewStatus = viewStatusFromDraft(draft, taskId) ?? 'idle';
       draft.messages[messageId] = {
         id: messageId,
@@ -792,38 +809,43 @@ export class TaskEngine {
         createdAt: now,
       };
 
-      // Allow continue when idle, awaiting_outcome (proposal cleared above), or
-      // needs_recovery is handled by explicit retry — but plain send on idle after
-      // stopped CLI must always queue a continuation turn.
-      if (
-        viewStatus === 'idle' ||
-        viewStatus === 'awaiting_outcome' ||
-        (viewStatus === 'needs_recovery' && !hasActiveOrQueuedTurn(turnsForTask(draft, taskId)))
-      ) {
-        const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
-        if (!turnCap.ok) {
-          return turnCap;
-        }
-        const turns = turnsForTask(draft, taskId);
-        const turnId = randomUUID();
-        const queue =
-          turns.length === 0
-            ? transitionStartTask(draftTask, turns, {
-                turnId,
-                now,
-                inputs: [{ kind: 'message', messageId }],
-              })
-            : transitionContinueTask(draftTask, turns, {
-                turnId,
-                now,
-                inputs: [{ kind: 'message', messageId }],
-              });
-        if (!queue.ok) {
+      // Refuse only when hard-blocked (needs_recovery already has live/queued work).
+      // idle / awaiting_outcome / running / queued / waiting_* all accept a new
+      // one-message turn so follow-ups keep durable turn identity for edit/delete.
+      if (viewStatus === 'needs_recovery' && hasActiveOrQueuedTurn(turnsForTask(draft, taskId))) {
+        return { ok: true };
+      }
+
+      const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
+      if (!turnCap.ok) {
+        // Leave the message pending without a turn when the turn budget is exhausted.
+        return { ok: true };
+      }
+      const turns = turnsForTask(draft, taskId);
+      const turnId = randomUUID();
+      const queue =
+        turns.length === 0
+          ? transitionStartTask(draftTask, turns, {
+              turnId,
+              now,
+              inputs: [{ kind: 'message', messageId }],
+            })
+          : transitionContinueTask(draftTask, turns, {
+              turnId,
+              now,
+              inputs: [{ kind: 'message', messageId }],
+            });
+      if (!queue.ok) {
+        // First-turn path without a settled turn should not leave a free-floating
+        // message when start/continue guards fire unexpectedly — surface the error.
+        // When turns exist but continue fails, keep the pending message (cap/recovery).
+        if (turns.length === 0) {
           return queue;
         }
-        draft.turns[turnId] = queue.next;
-        queuedTurnId = turnId;
+        return { ok: true };
       }
+      draft.turns[turnId] = queue.next;
+      queuedTurnId = turnId;
       return { ok: true };
     });
 
@@ -836,6 +858,95 @@ export class TaskEngine {
     }
 
     return { ok: true, value: { messageId, turnId: queuedTurnId } };
+  }
+
+  /**
+   * Hard upper bound for queued follow-up message content (edit path).
+   * Host boundary may apply a tighter limit; this protects the engine store.
+   */
+  static readonly MAX_QUEUED_MESSAGE_CHARS = 100_000;
+
+  /**
+   * R013: edit the bound pending user message of an undispatched queued turn.
+   * Fail-closed once executeTurn's startCommit assigns messages / promotes to running.
+   */
+  editQueuedTurn(
+    taskId: string,
+    turnId: string,
+    content: string,
+  ): EngineResult<{ turnId: string; messageId: string }> {
+    if (typeof content !== 'string') {
+      return { ok: false, reason: 'invalid content' };
+    }
+    if (content.length > TaskEngine.MAX_QUEUED_MESSAGE_CHARS) {
+      return {
+        ok: false,
+        reason: `content exceeds ${TaskEngine.MAX_QUEUED_MESSAGE_CHARS} characters`,
+      };
+    }
+
+    let editedMessageId: string | undefined;
+    const commit = this.store.commit((draft) => {
+      if (!draft.tasks[taskId]) {
+        return { ok: false, reason: 'task not found' };
+      }
+      const prepared = prepareEditQueuedTurn(taskId, draft.turns[turnId], draft.messages, content);
+      if (!prepared.ok) {
+        return prepared;
+      }
+      const message = draft.messages[prepared.next.messageId];
+      if (!message) {
+        return { ok: false, reason: 'message not found' };
+      }
+      draft.messages[prepared.next.messageId] = {
+        ...message,
+        content: prepared.next.content,
+      };
+      editedMessageId = prepared.next.messageId;
+      return { ok: true };
+    });
+
+    if (!commit.ok) {
+      return { ok: false, reason: commit.detail ?? commit.reason };
+    }
+    if (!editedMessageId) {
+      return { ok: false, reason: 'message not found' };
+    }
+    return { ok: true, value: { turnId, messageId: editedMessageId } };
+  }
+
+  /**
+   * R013: remove an undispatched queued turn and its bound pending user message(s).
+   * Does not cancelProcess, does not touch live/settled turns or task lifecycle.
+   */
+  deleteQueuedTurn(
+    taskId: string,
+    turnId: string,
+  ): EngineResult<{ turnId: string; deletedMessageIds: string[] }> {
+    let deletedMessageIds: string[] | undefined;
+    const commit = this.store.commit((draft) => {
+      if (!draft.tasks[taskId]) {
+        return { ok: false, reason: 'task not found' };
+      }
+      const prepared = prepareDeleteQueuedTurn(taskId, draft.turns[turnId], draft.messages);
+      if (!prepared.ok) {
+        return prepared;
+      }
+      for (const messageId of prepared.next.messageIds) {
+        delete draft.messages[messageId];
+      }
+      delete draft.turns[turnId];
+      deletedMessageIds = prepared.next.messageIds;
+      return { ok: true };
+    });
+
+    if (!commit.ok) {
+      return { ok: false, reason: commit.detail ?? commit.reason };
+    }
+    return {
+      ok: true,
+      value: { turnId, deletedMessageIds: deletedMessageIds ?? [] },
+    };
   }
 
   startTask(
@@ -930,8 +1041,103 @@ export class TaskEngine {
     return { ok: true, value: undefined };
   }
 
+  /**
+   * Hard upper bound for live-input instruction size. Host boundary may apply
+   * a tighter limit; this protects the engine/backend path.
+   */
+  static readonly MAX_LIVE_INPUT_CHARS = 8_192;
+
+  /**
+   * Deliver an instruction to the task's currently running, locally owned turn.
+   * Never persists a TaskMessage or TaskTurn — refusals and deliveries alike
+   * leave queue/message/revision state unchanged.
+   */
+  async sendLiveInput(taskId: string, instruction: string): Promise<LiveInputResult> {
+    const trimmedTaskId = typeof taskId === 'string' ? taskId.trim() : '';
+    if (!trimmedTaskId) {
+      return { code: 'rejected', reason: 'task id is required for live input' };
+    }
+    if (typeof instruction !== 'string' || !instruction.trim()) {
+      return { code: 'rejected', reason: 'instruction is required for live input' };
+    }
+    if (instruction.length > TaskEngine.MAX_LIVE_INPUT_CHARS) {
+      return {
+        code: 'rejected',
+        reason: `instruction exceeds ${TaskEngine.MAX_LIVE_INPUT_CHARS} characters`,
+      };
+    }
+
+    const file = this.store.getFile();
+    const task = file.tasks[trimmedTaskId];
+    if (!task) {
+      return { code: 'rejected', reason: 'task not found' };
+    }
+
+    const liveTurn = turnsForTask(file, trimmedTaskId).find((t) => t.status === 'running');
+    if (!liveTurn) {
+      return { code: 'no-active-turn', reason: 'no running turn for task' };
+    }
+
+    // Local ownership: this process must hold the turn lease.
+    if (!ownsLocalLease(this.storePath, liveTurn.id)) {
+      return {
+        code: 'not-local-owner',
+        reason: 'running turn is not owned by this process',
+      };
+    }
+
+    const handle = this.liveRuns.get(liveTurn.id);
+    if (!handle || handle.taskId !== trimmedTaskId) {
+      // Lease says local but no in-process handle (stale/settling race).
+      return { code: 'no-active-turn', reason: 'no in-process live run for task' };
+    }
+    if (handle.controller.signal.aborted) {
+      return { code: 'cancelled', reason: 'live run is cancelling' };
+    }
+
+    const sessionId =
+      handle.sessionId ??
+      liveTurn.observedSessionId ??
+      task.committedSessionId;
+    if (!sessionId) {
+      return {
+        code: 'no-active-turn',
+        reason: 'active turn has no session identity yet',
+      };
+    }
+
+    const backend = handle.backend;
+    const caps = backend.capabilities;
+    if (!caps?.supportsLiveInput || typeof backend.sendLiveInput !== 'function') {
+      return {
+        code: 'unsupported',
+        reason: `backend ${backend.name} does not support live input`,
+      };
+    }
+
+    // Re-check cancellation immediately before dispatch.
+    if (handle.controller.signal.aborted) {
+      return { code: 'cancelled', reason: 'live run is cancelling' };
+    }
+
+    try {
+      const result = await backend.sendLiveInput({
+        sessionId,
+        instruction,
+        signal: handle.controller.signal,
+      });
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (handle.controller.signal.aborted || /abort|cancel/i.test(message)) {
+        return { code: 'cancelled', reason: message };
+      }
+      return { code: 'rejected', reason: message };
+    }
+  }
+
   interruptTurn(turnId: string): EngineResult<void> {
-    this.liveRuns.get(turnId)?.abort();
+    this.liveRuns.get(turnId)?.controller.abort();
     return { ok: true, value: undefined };
   }
 
@@ -995,7 +1201,7 @@ export class TaskEngine {
       !ownsLocalLease(this.storePath, live.id);
 
     if (live && lifecycle !== 'open' && !remoteOwned) {
-      this.liveRuns.get(live.id)?.abort();
+      this.liveRuns.get(live.id)?.controller.abort();
     }
 
     const commit = this.store.commit((draft) => {
@@ -1092,7 +1298,7 @@ export class TaskEngine {
     );
     for (const turnId of liveTurnIds) {
       if (!remoteLiveTurnIds.has(turnId)) {
-        this.liveRuns.get(turnId)?.abort();
+        this.liveRuns.get(turnId)?.controller.abort();
       }
     }
 
@@ -1179,7 +1385,7 @@ export class TaskEngine {
     );
     for (const turnId of liveTurnIds) {
       if (!remoteLiveTurnIds.has(turnId)) {
-        this.liveRuns.get(turnId)?.abort();
+        this.liveRuns.get(turnId)?.controller.abort();
       }
     }
 
@@ -1303,7 +1509,7 @@ export class TaskEngine {
         deps.writeCancelRequest(live.id, 'interrupt', 'engine', `task-timeout-${task.id}`);
         continue;
       }
-      if (live) this.liveRuns.get(live.id)?.abort();
+      if (live) this.liveRuns.get(live.id)?.controller.abort();
       this.store.commit((draft) => {
         const pendingTurns = Object.values(draft.turns).filter(
           (t) =>
@@ -1420,7 +1626,7 @@ export class TaskEngine {
   }
 
   private drainPendingSendsAfterSettlement(settledTurnId: string): void {
-    let continuationTurnId: string | undefined;
+    const continuationTurnIds: string[] = [];
     const now = nowIso(this.clock);
     const commit = this.store.commit((draft) => {
       const settledTurn = draft.turns[settledTurnId];
@@ -1431,27 +1637,46 @@ export class TaskEngine {
       if (!task || isTerminalLifecycle(task.lifecycle)) {
         return { ok: true };
       }
+      // R012: when follow-ups were eagerly queued on send, do not create a
+      // second continuation from free-floating pending messages — the scheduler
+      // promotes existing queued turns one-at-a-time.
+      if (turnsForTask(draft, task.id).some((turn) => turn.status === 'queued')) {
+        return { ok: true };
+      }
       const pending = pendingUserMessages(draft, task.id);
       if (pending.length === 0) {
         return { ok: true };
       }
-      const turnCap = canCreateTurn(draft, task.id, this.resourceLimits);
-      if (!turnCap.ok) {
-        return { ok: true };
+      // R012/T02: one free-floating pending message → one continuation turn.
+      // Never batch multiple pending messages into a single turn's inputs
+      // (projectPrompt would join them into one multi-message backend prompt).
+      for (const message of pending) {
+        const turnCap = canCreateTurn(draft, task.id, this.resourceLimits);
+        if (!turnCap.ok) {
+          break;
+        }
+        const turnId = randomUUID();
+        const inputs: TurnInput[] = [{ kind: 'message', messageId: message.id }];
+        const queued = transitionContinueTask(task, turnsForTask(draft, task.id), {
+          turnId,
+          now,
+          inputs,
+        });
+        if (!queued.ok) {
+          break;
+        }
+        draft.turns[turnId] = queued.next;
+        continuationTurnIds.push(turnId);
       }
-      const inputs: TurnInput[] = pending.map((message) => ({ kind: 'message', messageId: message.id }));
-      const turnId = randomUUID();
-      const queued = transitionContinueTask(task, turnsForTask(draft, task.id), { turnId, now, inputs });
-      if (!queued.ok) {
-        return { ok: true };
-      }
-      draft.turns[turnId] = queued.next;
-      continuationTurnId = turnId;
       return { ok: true };
     });
 
-    if (commit.ok && continuationTurnId && !this.deferredQueuedTurns.has(continuationTurnId)) {
-      void this.scheduleTurn(continuationTurnId);
+    if (commit.ok) {
+      for (const continuationTurnId of continuationTurnIds) {
+        if (!this.deferredQueuedTurns.has(continuationTurnId)) {
+          void this.scheduleTurn(continuationTurnId);
+        }
+      }
     }
   }
 
@@ -1485,9 +1710,22 @@ export class TaskEngine {
     this.turnPromises.set(turnId, promise);
     void promise.finally(() => {
       this.turnPromises.delete(turnId);
-      const queued = Object.values(this.store.getFile().turns).filter((t) => t.status === 'queued');
+      const file = this.store.getFile();
+      const settled = file.turns[turnId];
+      // Same-task FIFO follow-ups auto-promote only after successful settlement
+      // (MEM030 / failure+cap paths keep queued follow-ups unstarted).
+      const allowSameTaskFollowUps = settled?.status === 'succeeded';
+      const settledTaskId = settled?.taskId;
+      const queued = Object.values(file.turns).filter((t) => t.status === 'queued');
       for (const turn of queued) {
         if (this.deferredQueuedTurns.has(turn.id)) {
+          continue;
+        }
+        if (
+          settledTaskId &&
+          turn.taskId === settledTaskId &&
+          !allowSameTaskFollowUps
+        ) {
           continue;
         }
         if (tryPromoteTurn(this.store, turn.id, this.resourceLimits)) {
@@ -1536,15 +1774,20 @@ export class TaskEngine {
         return { ok: false, reason: 'task is terminal' };
       }
 
-      const pending = pendingUserMessages(draft, turn.taskId);
+      // R012: assign only messages already bound to this turn. Do not sweep other
+      // pending user messages onto this turn (that batching is removed for FIFO).
       const inputs: TurnInput[] = [...draftTurn.inputs];
-      for (const message of pending) {
-        if (!inputs.some((input) => input.kind === 'message' && input.messageId === message.id)) {
-          inputs.push({ kind: 'message', messageId: message.id });
+      for (const input of inputs) {
+        if (input.kind !== 'message') continue;
+        const message = draft.messages[input.messageId];
+        if (!message || message.taskId !== turn.taskId) continue;
+        if (message.state === 'pending' || message.state === 'assigned') {
+          draft.messages[input.messageId] = {
+            ...message,
+            state: 'assigned',
+            turnId,
+          };
         }
-        message.state = 'assigned';
-        message.turnId = turnId;
-        draft.messages[message.id] = message;
       }
 
       const withInputs = { ...draftTurn, inputs };
@@ -1572,7 +1815,18 @@ export class TaskEngine {
     }
 
     const abort = new AbortController();
-    this.liveRuns.set(turnId, abort);
+    // Placeholder backend until factory succeeds; live input refuses unsupported
+    // until the real instance is installed below.
+    let backend: Backend = {
+      name: task.backend,
+      run: async function* () {},
+    };
+    this.liveRuns.set(turnId, {
+      controller: abort,
+      taskId: turn.taskId,
+      backend,
+      sessionId: undefined,
+    });
     const turnTimeoutMs = task.executionPolicy.turnTimeoutMs;
     const cancelPoll = setInterval(() => {
       this.reconcileTaskTimeouts();
@@ -1594,15 +1848,13 @@ export class TaskEngine {
     let orderCounter = 0;
     const nextOrder = (): number => orderCounter++;
     let currentAssistantSegment: { storeId: string; sourceMessageId: string } | undefined;
-    let backend: Backend = {
-      name: task.backend,
-      run: async function* () {},
-    };
     let mcpConfigPath: string | undefined;
 
     try {
       try {
         backend = this.makeBackend(task.backend);
+        const liveHandle = this.liveRuns.get(turnId);
+        if (liveHandle) liveHandle.backend = backend;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         terminalSettled = await this.settleFailed(
@@ -1672,6 +1924,8 @@ export class TaskEngine {
           case 'sessionStarted':
             if (event.sessionId) {
               observedSessionId = event.sessionId;
+              const liveHandle = this.liveRuns.get(turnId);
+              if (liveHandle) liveHandle.sessionId = event.sessionId;
               this.store.commit((draft) => {
                 const draftTurn = draft.turns[turnId];
                 if (!draftTurn) {

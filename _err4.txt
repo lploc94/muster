@@ -1,0 +1,19 @@
+\u2500\u2500\u2500\u2500
+
+  2) [chromium] \u203a e2e\muster-webview-state.spec.ts:1013:7 \u203a Muster webview host state smoke \u203a queuedTurns panel supports edit/delete and shows stale mutation feedback 
+
+    Error: locator.fill: Error: Element is not an <input>, <textarea>, <select> or [contenteditable] and does not have a role allowing [aria-readonly]
+    Call log:
+      - waiting for getByLabel('Edit queued turn 1')
+        - locator resolved to <vscode-textarea aria-label="Edit queued turn 1"></vscode-textarea>
+        - fill("Edited queued follow-up")
+      - attempting fill action
+        - waiting for element to be visible, enabled and editable
+
+
+      1047 |     await item.getByRole('button', { name: 'Edit' }).click();
+      1048 |     const editor = page.getByLabel('Edit queued turn 1');
+    > 1049 |     await editor.fill('Edited queued follow-up');
+           |                  ^
+      1050 |     await page.getByRole('button', { name: 'Save edit' }).click();
+      1051 |     await expectPostedMessage(page

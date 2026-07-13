@@ -31,6 +31,14 @@ interface TaskSummary {
   backend: string;
 }
 
+interface QueuedTurnProjection {
+  turnId: string;
+  sequence: number;
+  status: 'queued';
+  messageIds: string[];
+  createdAt: string;
+}
+
 interface SnapshotMessage {
   type: 'snapshot';
   /** Stamped automatically by postSnapshot() below; omit when constructing test fixtures. */
@@ -38,8 +46,10 @@ interface SnapshotMessage {
   rootTasks: TaskSummary[];
   focusedTaskId?: string;
   subtree?: TaskSummary[];
-  transcript?: Array<{ id: string; kind: 'user' | 'assistant' | 'tool' | 'error'; content: unknown }>;
+  transcript?: Array<{ id: string; kind: 'user' | 'assistant' | 'tool' | 'error' | 'reasoning'; content: unknown }>;
   activeTurnId?: string;
+  /** Authoritative multi-queue projection for FIFO follow-ups (edit/delete + panel). */
+  queuedTurns?: QueuedTurnProjection[];
   pendingAsk?: {
     turnId: string;
     askId: string;
@@ -288,9 +298,15 @@ test.describe('Muster webview host state smoke', () => {
 
   test('ignores file drops while the composer is disabled', async ({ page }) => {
     await openWebview(page);
+    // Running no longer disables free-form send (FIFO + live inject). Use a true
+    // blocking activity so drop handling stays gated by canSend.
     await postSnapshot(page, {
-      type: 'snapshot', rootTasks: [task({ viewStatus: 'running' })], focusedTaskId: 'task-root',
-      subtree: [task({ viewStatus: 'running' })], activeTurnId: 'turn-running', storeRevision: 3,
+      type: 'snapshot',
+      rootTasks: [task({ viewStatus: 'waiting_user' })],
+      focusedTaskId: 'task-root',
+      subtree: [task({ viewStatus: 'waiting_user' })],
+      activeTurnId: 'turn-waiting',
+      storeRevision: 3,
     });
     const shell = page.locator('.composer-shell');
     const before = await postedMessages(page);
@@ -398,12 +414,27 @@ test.describe('Muster webview host state smoke', () => {
 
     await addContextButton.click();
     await expect(menu).toBeVisible();
+    // Hard-terminal tasks still lock free-form composer affordances (Add Context).
+    // Running no longer disables the composer — that path is covered by queue/inject tests.
     await postSnapshot(page, {
       type: 'snapshot',
-      rootTasks: [task({ id: 'task-running', goal: 'Run active work', viewStatus: 'running' })],
-      focusedTaskId: 'task-running',
-      subtree: [task({ id: 'task-running', goal: 'Run active work', viewStatus: 'running' })],
-      activeTurnId: 'turn-running',
+      rootTasks: [
+        task({
+          id: 'task-succeeded',
+          goal: 'Run active work',
+          viewStatus: 'succeeded',
+          lifecycle: 'succeeded',
+        }),
+      ],
+      focusedTaskId: 'task-succeeded',
+      subtree: [
+        task({
+          id: 'task-succeeded',
+          goal: 'Run active work',
+          viewStatus: 'succeeded',
+          lifecycle: 'succeeded',
+        }),
+      ],
       storeRevision: 3,
     });
     await expect(menu).toHaveCount(0);
@@ -563,7 +594,10 @@ test.describe('Muster webview host state smoke', () => {
     await page.locator('.task-workspace-banner').getByRole('button', { name: /Expand task details/i }).click();
     await expect(page.locator('.task-workspace-orchestration').getByText(/Queued/i)).toBeVisible();
     await expect(page.getByRole('button', { name: 'Resume queued task' })).toBeVisible();
-    await expect(page.getByText('Queued turn is waiting to resume.')).toBeVisible();
+    // Live/queued composers stay editable with queue-oriented guidance (not a hard disable).
+    await expect(
+      page.locator('.composer-guidance').getByText(/Enter queues another follow-up/i),
+    ).toBeVisible();
     await page.getByRole('button', { name: 'Resume queued task' }).click();
     await expectPostedMessage(page, {
       type: 'resumeQueuedTurn',
@@ -823,6 +857,266 @@ test.describe('Muster webview host state smoke', () => {
     await expect(page.getByRole('heading', { name: 'Settings' })).toHaveCount(0);
     await expect(page.getByText('Chat context remains visible.')).toBeVisible();
     await expect(page.getByRole('alert').getByText('Host command remains visible.')).toBeVisible();
+  });
+
+  test('Enter queues a FIFO follow-up while running; Ctrl+Enter posts sendLiveInput only', async ({ page }) => {
+    await openWebview(page);
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-live', goal: 'Live turn work', viewStatus: 'running' })],
+      focusedTaskId: 'task-live',
+      subtree: [task({ id: 'task-live', goal: 'Live turn work', viewStatus: 'running' })],
+      transcript: [{ id: 'msg-live', kind: 'assistant', content: 'Working…' }],
+      activeTurnId: 'turn-live',
+      storeRevision: 100,
+    });
+
+    await expect(page.locator('[data-cli-status="running"]')).toBeVisible();
+    await expect(
+      page.locator('.composer-guidance').getByText(/Enter queues a follow-up turn/i),
+    ).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Inject live input' })).toBeVisible();
+
+    const composer = page.getByPlaceholder(/Enter queues a follow-up/i);
+    await expect(composer).toBeEnabled();
+
+    await composer.fill('Queue this follow-up');
+    await composer.press('Enter');
+    await expectPostedMessage(page, {
+      type: 'send',
+      taskId: 'task-live',
+      text: 'Queue this follow-up',
+    });
+    await expect(composer).toHaveValue('');
+
+    const afterQueue = await postedMessages(page);
+    expect(afterQueue.filter((m) => (m as { type?: string }).type === 'sendLiveInput')).toHaveLength(0);
+
+    await composer.fill('Inject now');
+    await composer.press('Control+Enter');
+    await expectPostedMessage(page, {
+      type: 'sendLiveInput',
+      taskId: 'task-live',
+      instruction: 'Inject now',
+    });
+    await expect(composer).toHaveValue('');
+
+    // Ctrl+Enter must never fall through to queue creation.
+    const livePosts = (await postedMessages(page)).filter(
+      (m) => (m as { type?: string }).type === 'sendLiveInput',
+    );
+    expect(livePosts).toContainEqual({
+      type: 'sendLiveInput',
+      taskId: 'task-live',
+      instruction: 'Inject now',
+    });
+    expect(
+      (await postedMessages(page)).filter(
+        (m) =>
+          (m as { type?: string; text?: string }).type === 'send' &&
+          (m as { text?: string }).text === 'Inject now',
+      ),
+    ).toHaveLength(0);
+
+    // Explicit inject control uses the same live-input path.
+    await composer.fill('Inject via button');
+    await page.getByRole('button', { name: 'Inject live input' }).click();
+    await expectPostedMessage(page, {
+      type: 'sendLiveInput',
+      taskId: 'task-live',
+      instruction: 'Inject via button',
+    });
+  });
+
+  test('Shift+Enter does not submit while a live turn is running', async ({ page }) => {
+    await openWebview(page);
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-live', goal: 'Live turn work', viewStatus: 'running' })],
+      focusedTaskId: 'task-live',
+      subtree: [task({ id: 'task-live', goal: 'Live turn work', viewStatus: 'running' })],
+      activeTurnId: 'turn-live',
+      storeRevision: 101,
+    });
+
+    const composer = page.getByPlaceholder(/Enter queues a follow-up/i);
+    await composer.fill('Line one');
+    await composer.press('Shift+Enter');
+
+    // No host post for Shift+Enter; draft retains content (newline may be inserted by the control).
+    expect(
+      (await postedMessages(page)).filter((m) =>
+        ['send', 'sendLiveInput'].includes((m as { type?: string }).type ?? ''),
+      ),
+    ).toHaveLength(0);
+    await expect.poll(async () => composer.inputValue()).toMatch(/Line one/);
+  });
+
+  test('surfaces liveInputResult delivery notice and commandError inject refusal', async ({ page }) => {
+    await openWebview(page);
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-live', goal: 'Live turn work', viewStatus: 'running' })],
+      focusedTaskId: 'task-live',
+      subtree: [task({ id: 'task-live', goal: 'Live turn work', viewStatus: 'running' })],
+      activeTurnId: 'turn-live',
+      storeRevision: 110,
+    });
+
+    await postRawHostMessage(page, {
+      type: 'liveInputResult',
+      taskId: 'task-live',
+      code: 'delivered',
+      sessionId: 'sess-abc',
+    });
+
+    const notice = page.locator('.task-command-notice');
+    await expect(notice).toBeVisible();
+    await expect(notice.getByText('Live input', { exact: true })).toBeVisible();
+    await expect(
+      notice.getByText('Live input delivered to the active session.', { exact: true }),
+    ).toBeVisible();
+    await expect(page.getByRole('alert')).toHaveCount(0);
+
+    // Malformed liveInputResult (missing sessionId) must not invent a banner.
+    await postRawHostMessage(page, {
+      type: 'liveInputResult',
+      taskId: 'task-live',
+      code: 'delivered',
+    });
+    await expect(
+      notice.getByText('Live input delivered to the active session.', { exact: true }),
+    ).toBeVisible();
+
+    // Refusal uses commandError chrome and clears the prior notice.
+    await postCommandError(page, {
+      type: 'commandError',
+      taskId: 'task-live',
+      message: 'Live input is not supported for this backend session.',
+    });
+    await expect(page.getByRole('alert').getByText('Task command failed')).toBeVisible();
+    await expect(
+      page.getByRole('alert').getByText('Live input is not supported for this backend session.'),
+    ).toBeVisible();
+    await expect(page.locator('.task-command-notice')).toHaveCount(0);
+
+    // Foreign-task errors stay hidden while focused elsewhere.
+    await postCommandError(page, {
+      type: 'commandError',
+      taskId: 'other-task',
+      message: 'Foreign inject refusal.',
+    });
+    await expect(page.getByRole('alert').getByText('Foreign inject refusal.')).toHaveCount(0);
+  });
+
+  test('queuedTurns panel supports edit/delete and shows stale mutation feedback', async ({ page }) => {
+    await openWebview(page);
+
+    const queuedMessageId = 'msg-queued-1';
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-queue', goal: 'Queued follow-ups', viewStatus: 'running' })],
+      focusedTaskId: 'task-queue',
+      subtree: [task({ id: 'task-queue', goal: 'Queued follow-ups', viewStatus: 'running' })],
+      transcript: [
+        { id: 'msg-assistant', kind: 'assistant', content: 'Still working…' },
+        { id: queuedMessageId, kind: 'user', content: 'First queued follow-up' },
+      ],
+      activeTurnId: 'turn-active',
+      queuedTurns: [
+        {
+          turnId: 'turn-q1',
+          sequence: 1,
+          status: 'queued',
+          messageIds: [queuedMessageId],
+          createdAt: '2026-01-01T00:00:01.000Z',
+        },
+      ],
+      storeRevision: 120,
+    });
+
+    const panel = page.getByTestId('queued-turns-panel');
+    await expect(panel).toBeVisible();
+    await expect(panel.getByText('Queued follow-ups (1)')).toBeVisible();
+    await expect(panel.getByText('First queued follow-up')).toBeVisible();
+
+    const item = panel.locator('.queued-turn-item[data-turn-id="turn-q1"]');
+    await expect(item).toHaveAttribute('data-queued-locked', 'false');
+
+    await item.getByRole('button', { name: 'Edit' }).click();
+    const editor = page.getByLabel('Edit queued turn 1');
+    await expect(editor).toBeVisible();
+    // vscode-textarea is a custom element; set the host value and fire input so Svelte bind:value updates.
+    await editor.evaluate((el, value) => {
+      const host = el as HTMLElement & { value?: string };
+      host.value = value;
+      host.dispatchEvent(new Event('input', { bubbles: true }));
+    }, 'Edited queued follow-up');
+    await page.getByRole('button', { name: 'Save edit' }).click();
+    await expectPostedMessage(page, {
+      type: 'editQueuedTurn',
+      taskId: 'task-queue',
+      turnId: 'turn-q1',
+      content: 'Edited queued follow-up',
+    });
+
+    // Host reflects the edit in the next snapshot projection.
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-queue', goal: 'Queued follow-ups', viewStatus: 'running' })],
+      focusedTaskId: 'task-queue',
+      subtree: [task({ id: 'task-queue', goal: 'Queued follow-ups', viewStatus: 'running' })],
+      transcript: [
+        { id: 'msg-assistant', kind: 'assistant', content: 'Still working…' },
+        { id: queuedMessageId, kind: 'user', content: 'Edited queued follow-up' },
+      ],
+      activeTurnId: 'turn-active',
+      queuedTurns: [
+        {
+          turnId: 'turn-q1',
+          sequence: 1,
+          status: 'queued',
+          messageIds: [queuedMessageId],
+          createdAt: '2026-01-01T00:00:01.000Z',
+        },
+      ],
+      storeRevision: 121,
+    });
+    await expect(panel.getByText('Edited queued follow-up')).toBeVisible();
+
+    await item.getByRole('button', { name: 'Delete' }).click();
+    await expectPostedMessage(page, {
+      type: 'deleteQueuedTurn',
+      taskId: 'task-queue',
+      turnId: 'turn-q1',
+    });
+
+    // Drain projection: turn left the queue (stale local mutation path).
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-queue', goal: 'Queued follow-ups', viewStatus: 'running' })],
+      focusedTaskId: 'task-queue',
+      subtree: [task({ id: 'task-queue', goal: 'Queued follow-ups', viewStatus: 'running' })],
+      transcript: [{ id: 'msg-assistant', kind: 'assistant', content: 'Still working…' }],
+      activeTurnId: 'turn-active',
+      queuedTurns: [],
+      storeRevision: 122,
+    });
+    await expect(page.getByTestId('queued-turns-panel')).toHaveCount(0);
+
+    // Host-side stale refusal after a concurrent drain remains visible.
+    await postCommandError(page, {
+      type: 'commandError',
+      taskId: 'task-queue',
+      message: 'Queued turn mutation refused: turn is not queued',
+    });
+    await expect(page.getByRole('alert').getByText('Task command failed')).toBeVisible();
+    await expect(
+      page.getByRole('alert').getByText('Queued turn mutation refused: turn is not queued'),
+    ).toBeVisible();
   });
 });
 

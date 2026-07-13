@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   applyPresentationUpdate,
   parsePersistedPresentation,
@@ -6,6 +6,24 @@ import {
   parsePresentationRevealResult,
   parsePresentationUpdate,
 } from './presentation-protocol';
+
+// protocol.ts acquires the webview API at import time; stub for node tests.
+vi.mock('./vscode', () => ({
+  vscode: {
+    postMessage: vi.fn(),
+    getState: vi.fn(),
+    setState: vi.fn(),
+  },
+}));
+
+import {
+  formatLiveInputDeliveredMessage,
+  isExtMessage,
+  isTaskScopedBannerVisible,
+  type OutMessage,
+  post,
+} from './protocol';
+import { vscode } from './vscode';
 
 describe('presentation browser protocol', () => {
   it('accepts only exact identity-free linked-chat requests and typed results', () => {
@@ -100,5 +118,43 @@ describe('presentation browser protocol', () => {
     const message = value === null ? null : { type: 'presentationUpdate', document };
 
     expect(parsePresentationUpdate(message)).toBeUndefined();
+  });
+});
+
+describe('live-input host protocol (S01 integration surface)', () => {
+  it('exposes sendLiveInput as a typed OutMessage distinct from continueTask', () => {
+    vi.mocked(vscode.postMessage).mockClear();
+    const live: OutMessage = {
+      type: 'sendLiveInput',
+      taskId: 'task-1',
+      instruction: 'live nudge',
+    };
+    post(live);
+    expect(vscode.postMessage).toHaveBeenCalledWith(live);
+    expect(live.type).not.toBe('continueTask');
+  });
+
+  it('accepts delivered liveInputResult and commandError refusal shapes', () => {
+    expect(
+      isExtMessage({
+        type: 'liveInputResult',
+        taskId: 'task-1',
+        code: 'delivered',
+        sessionId: 'sess-1',
+      }),
+    ).toBe(true);
+    expect(
+      isExtMessage({
+        type: 'commandError',
+        taskId: 'task-1',
+        message: 'Live input unsupported: no capability',
+      }),
+    ).toBe(true);
+  });
+
+  it('formats delivered live-input acknowledgements for the App notice banner', () => {
+    expect(formatLiveInputDeliveredMessage('sess-1').toLowerCase()).toContain('delivered');
+    expect(isTaskScopedBannerVisible('task-1', 'task-1')).toBe(true);
+    expect(isTaskScopedBannerVisible('task-1', 'other')).toBe(false);
   });
 });

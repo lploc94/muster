@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { activeTurnIdForTask, buildSnapshot, type PendingAskOverlay } from './snapshot';
+import {
+  activeTurnIdForTask,
+  buildSnapshot,
+  projectQueuedTurns,
+  type PendingAskOverlay,
+} from './snapshot';
 import type { TaskStore } from '../task/store';
 import type { MusterTask, TaskMessage, TaskStoreFile, TaskTurn } from '../task/types';
 
@@ -178,12 +183,215 @@ describe('host task snapshot projection', () => {
         state: 'complete',
       },
     ]);
-    expect(snapshot.activeTurnId).toBe('root-active-queued');
+    // Live turn wins over higher-sequence queued follow-ups (R012 multi-queue).
+    expect(snapshot.activeTurnId).toBe('root-active-running');
+    expect(snapshot.queuedTurns).toEqual([
+      {
+        turnId: 'root-active-queued',
+        sequence: 3,
+        status: 'queued',
+        messageIds: [],
+        createdAt: '2026-07-06T00:12:00.000Z',
+      },
+    ]);
     expect(snapshot.pendingAsk).toEqual({
       turnId: 'root-active-running',
       askId: 'ask-1',
       questions: [{ name: 'direction', question: 'Continue?', type: 'text' }],
     });
+  });
+
+  it('projects multi-queued follow-ups in FIFO order with one message identity each', () => {
+    const file: TaskStoreFile = {
+      schemaVersion: 2,
+      revision: 3,
+      tasks: {
+        multi: task('multi', { role: 'coordinator', goal: 'Multi queue' }),
+      },
+      turns: {
+        'turn-live': turn({
+          id: 'turn-live',
+          taskId: 'multi',
+          status: 'running',
+          sequence: 1,
+          startedAt: '2026-07-06T00:01:00.000Z',
+          inputs: [{ kind: 'message', messageId: 'msg-a' }],
+        }),
+        'turn-q1': turn({
+          id: 'turn-q1',
+          taskId: 'multi',
+          status: 'queued',
+          sequence: 2,
+          createdAt: '2026-07-06T00:02:00.000Z',
+          inputs: [{ kind: 'message', messageId: 'msg-b' }],
+        }),
+        'turn-q2': turn({
+          id: 'turn-q2',
+          taskId: 'multi',
+          status: 'queued',
+          sequence: 3,
+          createdAt: '2026-07-06T00:03:00.000Z',
+          inputs: [{ kind: 'message', messageId: 'msg-c' }],
+        }),
+      },
+      messages: {
+        'msg-a': message({
+          id: 'msg-a',
+          taskId: 'multi',
+          role: 'user',
+          content: 'a',
+          state: 'assigned',
+          turnId: 'turn-live',
+        }),
+        'msg-b': message({
+          id: 'msg-b',
+          taskId: 'multi',
+          role: 'user',
+          content: 'b',
+          state: 'pending',
+          createdAt: '2026-07-06T00:02:00.000Z',
+        }),
+        'msg-c': message({
+          id: 'msg-c',
+          taskId: 'multi',
+          role: 'user',
+          content: 'c',
+          state: 'pending',
+          createdAt: '2026-07-06T00:03:00.000Z',
+        }),
+      },
+      operations: {},
+      cancelRequests: {},
+    };
+
+    expect(activeTurnIdForTask(file, 'multi')).toBe('turn-live');
+    expect(projectQueuedTurns(file, 'multi')).toEqual([
+      {
+        turnId: 'turn-q1',
+        sequence: 2,
+        status: 'queued',
+        messageIds: ['msg-b'],
+        createdAt: '2026-07-06T00:02:00.000Z',
+      },
+      {
+        turnId: 'turn-q2',
+        sequence: 3,
+        status: 'queued',
+        messageIds: ['msg-c'],
+        createdAt: '2026-07-06T00:03:00.000Z',
+      },
+    ]);
+
+    const snapshot = buildSnapshot(storeFrom(file), 'multi');
+    expect(snapshot.activeTurnId).toBe('turn-live');
+    expect(snapshot.queuedTurns).toEqual([
+      {
+        turnId: 'turn-q1',
+        sequence: 2,
+        status: 'queued',
+        messageIds: ['msg-b'],
+        createdAt: '2026-07-06T00:02:00.000Z',
+      },
+      {
+        turnId: 'turn-q2',
+        sequence: 3,
+        status: 'queued',
+        messageIds: ['msg-c'],
+        createdAt: '2026-07-06T00:03:00.000Z',
+      },
+    ]);
+    // Transcript still binds each user message to its dedicated turn identity.
+    expect(snapshot.transcript?.filter((item) => item.kind === 'user')).toEqual([
+      {
+        id: 'msg-a',
+        kind: 'user',
+        content: 'a',
+        turnId: 'turn-live',
+        order: undefined,
+        state: 'assigned',
+      },
+      {
+        id: 'msg-b',
+        kind: 'user',
+        content: 'b',
+        turnId: 'turn-q1',
+        order: undefined,
+        state: 'pending',
+      },
+      {
+        id: 'msg-c',
+        kind: 'user',
+        content: 'c',
+        turnId: 'turn-q2',
+        order: undefined,
+        state: 'pending',
+      },
+    ]);
+  });
+
+  it('omits queuedTurns and prefers waiting_user over later queued when live is ask', () => {
+    const file: TaskStoreFile = {
+      schemaVersion: 2,
+      revision: 1,
+      tasks: {
+        ask: task('ask'),
+      },
+      turns: {
+        live: turn({
+          id: 'live',
+          taskId: 'ask',
+          status: 'waiting_user',
+          sequence: 1,
+        }),
+        queued: turn({
+          id: 'queued',
+          taskId: 'ask',
+          status: 'queued',
+          sequence: 2,
+          createdAt: '2026-07-06T00:02:00.000Z',
+          inputs: [{ kind: 'message', messageId: 'msg-q' }],
+        }),
+      },
+      messages: {
+        'msg-q': message({
+          id: 'msg-q',
+          taskId: 'ask',
+          role: 'user',
+          content: 'queued follow-up',
+          state: 'pending',
+        }),
+      },
+      operations: {},
+      cancelRequests: {},
+    };
+
+    expect(activeTurnIdForTask(file, 'ask')).toBe('live');
+    expect(projectQueuedTurns(file, 'ask')).toEqual([
+      {
+        turnId: 'queued',
+        sequence: 2,
+        status: 'queued',
+        messageIds: ['msg-q'],
+        createdAt: '2026-07-06T00:02:00.000Z',
+      },
+    ]);
+    expect(buildSnapshot(storeFrom(file), 'ask').activeTurnId).toBe('live');
+  });
+
+  it('returns empty queuedTurns when only a live turn exists', () => {
+    const file: TaskStoreFile = {
+      schemaVersion: 2,
+      revision: 1,
+      tasks: { only: task('only') },
+      turns: {
+        live: turn({ id: 'live', taskId: 'only', status: 'running', sequence: 1 }),
+      },
+      messages: {},
+      operations: {},
+      cancelRequests: {},
+    };
+    expect(projectQueuedTurns(file, 'only')).toEqual([]);
+    expect(buildSnapshot(storeFrom(file), 'only').queuedTurns).toEqual([]);
   });
 
   it('selects the latest retryable turn only for recovery state', () => {

@@ -1,0 +1,58 @@
+
+Running 16 tests using 1 worker
+
+[1/16] [chromium] › e2e\muster-webview-state.spec.ts:167:7 › Muster webview host state smoke › renders task shell from a mocked VS Code snapshot
+
+[WebServer] The request id "D:\_Dev\muster\node_modules\@vscode\codicons\dist\codicon.ttf" is outside of Vite serving allow list.
+[WebServer] 
+[WebServer] - D:/_Dev/muster/.gsd-worktrees/M008
+[WebServer] - D:/_Dev/muster/node_modules/vite/dist/client
+[WebServer] 
+[WebServer] Refer to docs https://vite.dev/config/server-options.html#server-fs-allow for configurations and more details.
+[WebServer] 
+[2/16] [chromium] › e2e\muster-webview-state.spec.ts:190:7 › Muster webview host state smoke › keeps the shell usable when a snapshot contains no tasks
+
+[WebServer] The request id "D:\_Dev\muster\node_modules\@vscode\codicons\dist\codicon.ttf" is outside of Vite serving allow list.
+[3/16] [chromium] › e2e\muster-webview-state.spec.ts:213:7 › Muster webview host state smoke › Add Context menu keeps the existing file picker and mention flow
+
+[WebServer] The request id "D:\_Dev\muster\node_modules\@vscode\codicons\dist\codicon.ttf" is outside of Vite serving allow list.
+[4/16] [chromium] › e2e\muster-webview-state.spec.ts:255:7 › Muster webview host state smoke › inserts picked files at the caret and preserves surrounding draft text
+
+[WebServer] The request id "D:\_Dev\muster\node_modules\@vscode\codicons\dist\codicon.ttf" is outside of Vite serving allow list.
+[5/16] [chromium] › e2e\muster-webview-state.spec.ts:270:7 › Muster webview host state smoke › drops a file through the host contract and projects sanitized failures without changing the draft
+
+[WebServer] The request id "D:\_Dev\muster\node_modules\@vscode\codicons\dist\codicon.ttf" is outside of Vite serving allow list.
+[6/16] [chromium] › e2e\muster-webview-state.spec.ts:299:7 › Muster webview host state smoke › ignores file drops while the composer is disabled
+
+[WebServer] The request id "D:\_Dev\muster\node_modules\@vscode\codicons\dist\codicon.ttf" is outside of Vite serving allow list.
+[7/16] [chromium] › e2e\muster-webview-state.spec.ts:319:7 › Muster webview host state smoke › Add Context menu browses workspace files through the shared filePicked mention flow
+
+[WebServer] The request id "D:\_Dev\muster\node_modules\@vscode\codicons\dist\codicon.ttf" is outside of Vite serving allow list.
+[8/16] [chromium] › e2e\muster-webview-state.spec.ts:348:7 › Muster webview host state smoke › Add Context menu renders future model actions as disabled coming-soon entries
+
+[WebServer] The request id "D:\_Dev\muster\node_modules\@vscode\codicons\dist\codicon.ttf" is outside of Vite serving allow list.
+[9/16] [chromium] › e2e\muster-webview-state.spec.ts:380:7 › Muster webview host state smoke › Add Context menu hardens dismissal states without losing draft text
+
+[WebServer] The request id "D:\_Dev\muster\node_modules\@vscode\codicons\dist\codicon.ttf" is outside of Vite serving allow list.
+[10/16] [chromium] › e2e\muster-webview-state.spec.ts:445:7 › Muster webview host state smoke › surfaces task-centric status feedback for active and failed tasks
+
+[WebServer] The request id "D:\_Dev\muster\node_modules\@vscode\codicons\dist\codicon.ttf" is outside of Vite serving allow list.
+[11/16] [chromium] › e2e\muster-webview-state.spec.ts:677:7 › Muster webview host state smoke › blocks the composer while a pending task ask is visible
+
+[WebServer] The request id "D:\_Dev\muster\node_modules\@vscode\codicons\dist\codicon.ttf" is outside of Vite serving allow list.
+[12/16] [chromium] › e2e\muster-webview-state.spec.ts:739:7 › Muster webview host state smoke › Settings panel edits host-backed retention values without losing task or chat state
+
+[WebServer] The request id "D:\_Dev\muster\node_modules\@vscode\codicons\dist\codicon.ttf" is outside of Vite serving allow list.
+[13/16] [chromium] › e2e\muster-webview-state.spec.ts:862:7 › Muster webview host state smoke › Enter queues a FIFO follow-up while running; Ctrl+Enter posts sendLiveInput only
+
+[WebServer] The request id "D:\_Dev\muster\node_modules\@vscode\codicons\dist\codicon.ttf" is outside of Vite serving allow list.
+[14/16] [chromium] › e2e\muster-webview-state.spec.ts:932:7 › Muster webview host state smoke › Shift+Enter does not submit while a live turn is running
+
+[WebServer] The request id "D:\_Dev\muster\node_modules\@vscode\codicons\dist\codicon.ttf" is outside of Vite serving allow list.
+[15/16] [chromium] › e2e\muster-webview-state.spec.ts:957:7 › Muster webview host state smoke › surfaces liveInputResult delivery notice and commandError inject refusal
+
+[WebServer] The request id "D:\_Dev\muster\node_modules\@vscode\codicons\dist\codicon.ttf" is outside of Vite serving allow list.
+[16/16] [chromium] › e2e\muster-webview-state.spec.ts:1015:7 › Muster webview host state smoke › queuedTurns panel supports edit/delete and shows stale mutation feedback
+
+[WebServer] The request id "D:\_Dev\muster\node_modules\@vscode\codicons\dist\codicon.ttf" is outside of Vite serving allow list.
+  16 passed (13.7s)

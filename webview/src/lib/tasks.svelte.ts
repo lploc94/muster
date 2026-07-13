@@ -1,8 +1,15 @@
-import type { BackendModels, SnapshotMessage, TaskSummary } from './protocol';
+import type { BackendModels, QueuedTurnProjection, SnapshotMessage, TaskSummary } from './protocol';
 import { isHardTerminalLifecycle } from './protocol';
+import { sortQueuedTurns } from './queued-turns';
 import { vscode } from './vscode';
 
 export interface CommandErrorState {
+  taskId: string | null;
+  message: string;
+}
+
+/** Non-error status notice (e.g. live-input delivered acknowledgement). */
+export interface CommandNoticeState {
   taskId: string | null;
   message: string;
 }
@@ -38,6 +45,16 @@ class TasksState {
   modelsByBackend = $state<Record<string, BackendModels> | null>(null);
 
   commandError = $state<CommandErrorState | null>(null);
+
+  /** Transient success/status notice (live-input delivered, etc.). */
+  commandNotice = $state<CommandNoticeState | null>(null);
+
+  /**
+   * FIFO queued follow-ups for the focused task (host snapshot.queuedTurns).
+   * Cleared on draft/blur; replaced on every focused snapshot so dispatch
+   * removing an entry immediately drops edit/delete controls.
+   */
+  queuedTurns = $state<QueuedTurnProjection[]>([]);
 
   constructor() {
     // Restore the last-used backend/model from webview state (persists across reloads).
@@ -128,6 +145,7 @@ class TasksState {
     this.continuationOf = null;
     this.focusedTaskId = null;
     this.subtree = [];
+    this.queuedTurns = [];
   }
 
   openContinuationDraft(terminalTaskId: string): void {
@@ -135,6 +153,7 @@ class TasksState {
     this.continuationOf = terminalTaskId;
     this.focusedTaskId = null;
     this.subtree = [];
+    this.queuedTurns = [];
   }
 
   clearDraft(): void {
@@ -146,6 +165,8 @@ class TasksState {
     this.draftMode = false;
     this.continuationOf = null;
     this.focusedTaskId = taskId;
+    // Drop prior focus queue until the host snapshot for this task arrives.
+    this.queuedTurns = [];
   }
 
   applySnapshot(snapshot: SnapshotMessage): void {
@@ -169,6 +190,9 @@ class TasksState {
       this.focusedTaskId = snapshot.focusedTaskId;
       this.draftMode = false;
       this.continuationOf = null;
+      this.queuedTurns = sortQueuedTurns(snapshot.queuedTurns ?? []);
+    } else if (!this.draftMode) {
+      this.queuedTurns = [];
     }
   }
 
@@ -205,6 +229,14 @@ class TasksState {
 
   setCommandError(message: string | null, taskId: string | null = null): void {
     this.commandError = message ? { taskId, message } : null;
+    // A refusal/error supersedes any prior success notice for the same chrome.
+    if (message) this.commandNotice = null;
+  }
+
+  setCommandNotice(message: string | null, taskId: string | null = null): void {
+    this.commandNotice = message ? { taskId, message } : null;
+    // A delivered acknowledgement clears a prior refusal so success is visible.
+    if (message) this.commandError = null;
   }
 
   private seedWatermark(taskId: string, revision: number): void {

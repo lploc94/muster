@@ -48,6 +48,7 @@ describe('ClaudeBackend — identity', () => {
       supportsReasoning: true,
       supportsDetailedToolEvents: true,
       supportsMCP: true,
+      supportsLiveInput: true,
     });
   });
 });

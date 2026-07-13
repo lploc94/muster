@@ -8,8 +8,10 @@
   import { threadStore } from './lib/thread.svelte';
   import {
     effectiveRuntimeActivity,
+    formatLiveInputDeliveredMessage,
     isExtMessage,
     isProtocolCompatible,
+    isTaskScopedBannerVisible,
     post,
   } from './lib/protocol';
   import type {
@@ -30,8 +32,15 @@
   let pendingPermission = $state<PendingPermission | null>(null);
   let activeTurnId = $state<string | null>(null);
   const visibleCommandError = $derived(
-    tasks.commandError && (!tasks.commandError.taskId || tasks.commandError.taskId === tasks.focusedTaskId)
+    tasks.commandError &&
+      isTaskScopedBannerVisible(tasks.commandError.taskId, tasks.focusedTaskId)
       ? tasks.commandError
+      : null,
+  );
+  const visibleCommandNotice = $derived(
+    tasks.commandNotice &&
+      isTaskScopedBannerVisible(tasks.commandNotice.taskId, tasks.focusedTaskId)
+      ? tasks.commandNotice
       : null,
   );
   // Set when a bootstrap `snapshot` arrives stamped with a protocolVersion that
@@ -283,8 +292,15 @@
           break;
 
         case 'commandError':
-          if (!msg.taskId || msg.taskId === tasks.focusedTaskId) {
+          if (isTaskScopedBannerVisible(msg.taskId, tasks.focusedTaskId)) {
             tasks.setCommandError(msg.message, msg.taskId ?? null);
+          }
+          break;
+
+        case 'liveInputResult':
+          // Delivered acks must not be silently dropped; refusals use commandError.
+          if (isTaskScopedBannerVisible(msg.taskId, tasks.focusedTaskId)) {
+            tasks.setCommandNotice(formatLiveInputDeliveredMessage(msg.sessionId), msg.taskId);
           }
           break;
 
@@ -339,6 +355,20 @@
       type="button"
       class="task-command-error__dismiss"
       onclick={() => tasks.setCommandError(null)}
+    >Dismiss</button>
+  </div>
+{/if}
+
+{#if visibleCommandNotice}
+  <div class="task-command-notice" role="status">
+    <div class="min-w-0">
+      <div class="font-semibold">Live input</div>
+      <div class="task-command-notice__detail">{visibleCommandNotice.message}</div>
+    </div>
+    <button
+      type="button"
+      class="task-command-notice__dismiss"
+      onclick={() => tasks.setCommandNotice(null)}
     >Dismiss</button>
   </div>
 {/if}

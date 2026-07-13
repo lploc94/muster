@@ -629,7 +629,9 @@ If dependencies are unresolved, the queued turn records start intent but is not
 spawned. When dependencies resolve, the engine either schedules it or applies the
 dependency's `onUnsatisfied` policy (see §5.6 for `skip`).
 
-There may be at most one queued or active turn per task.
+There may be at most **one active (running) turn** per task. Operators may stack
+**multiple queued follow-ups** (FIFO); the scheduler promotes one-at-a-time after
+settlement. See §9.1.
 
 ### 5.3 Outcome sealing (user and coordinator)
 
@@ -935,14 +937,36 @@ both constrain behavior:
 
 | Lifecycle | Runtime activity (if open) | Behavior |
 |-----------|----------------------------|----------|
-| `open` | `idle` | Queue a user-triggered turn |
-| `open` | `waiting_dependencies` / `queued` | Persist message as pending input |
-| `open` | `running` / `waiting_user` | Persist; do not inject into the live process except via `submitAsk` |
-| `open` | `waiting_children` / `blocked` | Persist for the next continuation turn |
-| `open` | `needs_recovery` | Persist; offer explicit Retry / Continue recovery |
+| `open` | `idle` | Queue a user-triggered turn (`send`) |
+| `open` | `waiting_dependencies` / `queued` | `send` creates another distinct FIFO queued turn (or binds per engine policy); inspect / edit / delete via `queuedTurns` |
+| `open` | `running` | `send` queues a FIFO follow-up; **Ctrl+Enter** may call `sendLiveInput` for concurrent inject when supported (no queue fallback). `submitAsk` remains the path for structured ask answers |
+| `open` | `waiting_user` | Answer the pending ask via `submitAsk`; free-form composer may still queue follow-ups when product policy allows |
+| `open` | `waiting_children` / `blocked` | Persist / queue for the next continuation turn |
+| `open` | `needs_recovery` | Persist; offer explicit Retry / Continue recovery (free-form send blocked while recovery is required) |
 | `open` | `awaiting_outcome` | Prefer Accept/Reject when an outcome card exists. **Composer stays writable:** a new `send` clears `outcomeProposal`, keeps lifecycle `open`, and queues a turn (continue session). Do **not** block send solely because a proposal is pending. |
 | `failed` (soft) | — | **Reopen** to `open`, then queue a turn with the message |
 | `succeeded` / `cancelled` / `skipped` | — | Read-only; no reopen on the same task id. Offer **Continue as new task** (or new task if the user later wants a previously skipped goal) |
+
+### 9.1 Multi-queued FIFO follow-ups and live inject
+
+**Normative send rule (R012):** every focused-task `send` creates a **distinct queued turn** bound to that user message. Concurrent sends while a turn is live or already queued still create additional queued turns; the scheduler promotes **one active (running) turn per task** and drains **multiple queued follow-ups** in FIFO order after successful settlement.
+
+| Operator action | Engine / host API | Notes |
+|-----------------|-------------------|-------|
+| Enter / Send | `send` | FIFO follow-up turn; composer stays editable while running/queued |
+| Ctrl+Enter (live inject) | `sendLiveInput` | Concurrent instruction into the locally owned active session when capability evidence exists. **No queue fallback** on refusal |
+| Edit pending queue item | `editQueuedTurn` | Only while `turnId` remains in the live `queuedTurns` projection |
+| Delete pending queue item | `deleteQueuedTurn` | Undispatched only; never cancels a running turn |
+
+**Projection:** snapshots include optional `queuedTurns` (`turnId`, `sequence`, `status: 'queued'`, `messageIds`, `createdAt`) so the webview can render an inspectable FIFO panel and lock edit/delete at the dispatch boundary.
+
+**Live inject outcomes:**
+
+- Success → `liveInputResult` `{ taskId, code: 'delivered', sessionId }` (webview status notice).
+- Refusal (unsupported backend, not local owner, no active turn, validation failure, engine not ready, …) → sanitized `commandError`. Never invent a queued turn from a refused inject.
+- Stale `editQueuedTurn` / `deleteQueuedTurn` (missing, foreign, or already dispatched turn) → `commandError` with a clear stale-mutation message; controls should already be locked when the projection drops the turn.
+
+`sendLiveInput` is distinct from `continueTask` / `send`: inject does not allocate a new turn. Webview keyboard policy maps Ctrl/Meta+Enter to `sendLiveInput` only in task mode.
 
 Chat messages are durable records, not raw queued strings. They provide both the
 task transcript and delivery identity:
@@ -1017,7 +1041,7 @@ Correctness requires serialization per task/session, not globally per backend.
 
 The scheduler enforces:
 
-- at most one queued or active turn per task;
+- at most one **active (running)** turn per task (multiple queued follow-ups allowed; FIFO drain — §9.1);
 - at most one active turn for a session ID;
 - backend-specific concurrency limits;
 - global/root concurrency and resource limits.
