@@ -2,26 +2,63 @@
   "version": "2.0.0",
   "tasks": [
     {
+      "label": "compile",
+      "type": "npm",
+      "script": "compile",
+      "problemMatcher": ["$tsc"],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "silent",
+        "panel": "shared",
+        "clear": true,
+        "showReuseMessage": false
+      },
+      "detail": "tsc + build:webview — full fresh dist for Extension Host"
+    },
+    {
+      "label": "watch",
       "type": "npm",
       "script": "watch",
       "problemMatcher": "$tsc-watch",
       "isBackground": true,
-      "presentation": { "reveal": "never", "group": "watch" },
-      "group": "build"
+      "presentation": {
+        "reveal": "never",
+        "group": "watch",
+        "panel": "dedicated"
+      },
+      "group": "build",
+      "detail": "tsc -watch only (extension host JS)"
     },
     {
+      "label": "watch:webview",
       "type": "npm",
       "script": "watch:webview",
       "isBackground": true,
-      "presentation": { "reveal": "never", "group": "watch" },
+      "presentation": {
+        "reveal": "never",
+        "group": "watch",
+        "panel": "dedicated"
+      },
       "group": "build",
+      "detail": "vite build --watch (dist/webview)",
       "problemMatcher": {
         "owner": "vite",
-        "pattern": { "regexp": "^$", "file": 1, "line": 2, "column": 3, "message": 4 },
+        "source": "vite",
+        "applyTo": "allDocuments",
+        "fileLocation": "absolute",
+        "pattern": {
+          "regexp": "^(.*)$",
+          "file": 1,
+          "location": 1,
+          "message": 1
+        },
         "background": {
           "activeOnStart": true,
-          "beginsPattern": "building (for|client)",
-          "endsPattern": "built in"
+          "beginsPattern": ".*building\\s+(for|client).*",
+          "endsPattern": ".*built in\\s+.*"
         }
       }
     },
@@ -29,14 +66,9 @@
       "label": "watch-all",
       "dependsOn": ["watch", "watch:webview"],
       "dependsOrder": "parallel",
-      "group": { "kind": "build", "isDefault": true },
-      "problemMatcher": []
-    },
-    {
-      "type": "npm",
-      "script": "compile",
-      "problemMatcher": "$tsc",
-      "group": "build"
+      "group": "build",
+      "problemMatcher": [],
+      "detail": "Background tsc + vite watch (start manually; Run Extension uses compile)"
     }
   ]
 }

@@ -787,7 +787,6 @@ describe('runtime handoff protocol', () => {
       taskId: 'task-1',
       targetBackend: 'codex',
       targetModel: 'gpt-5',
-      skipSummary: true,
     };
     post(message);
 
@@ -796,7 +795,6 @@ describe('runtime handoff protocol', () => {
       taskId: 'task-1',
       targetBackend: 'codex',
       targetModel: 'gpt-5',
-      skipSummary: true,
     });
     expect(message.type).not.toBe('exportTask');
     expect(message.type).not.toBe('setComposerSelection');

@@ -15,7 +15,6 @@ export type ParsedRequestRuntimeHandoff =
       taskId: string;
       targetBackend: string;
       targetModel?: string;
-      skipSummary: boolean;
     }
   | {
       ok: false;
@@ -54,7 +53,6 @@ export interface RuntimeHandoffRouteDeps {
     taskId: string;
     targetBackend: string;
     targetModel?: string;
-    skipSummary?: boolean;
   }) => Promise<RuntimeHandoffEngineResult<RuntimeHandoffRequestValue>>;
   completeRuntimeHandoff: (params: {
     taskId: string;
@@ -155,12 +153,10 @@ function refused(
   };
 }
 
-function isSafeLabel(value: string, max: number): boolean {
+/** Non-empty string, length cap, no null/control bytes. Catalog ids may include `/`. */
+function isNonEmptyLabel(value: string, max: number): boolean {
   if (!value || value.length > max) return false;
-  if (value.includes('\0')) return false;
-  // Reject control characters and path-like fragments.
-  if (/[\u0000-\u001f\u007f]/.test(value)) return false;
-  if (/[\\/]/.test(value) || /^[A-Za-z]:/.test(value)) return false;
+  if (value.includes('\0') || /[\u0000-\u001f\u007f]/.test(value)) return false;
   return true;
 }
 
@@ -221,7 +217,8 @@ export function parseRequestRuntimeHandoffMessage(
     };
   }
   const targetBackend = record.targetBackend.trim();
-  if (!isSafeLabel(targetBackend, MAX_RUNTIME_HANDOFF_LABEL_CHARS)) {
+  // Backend is a webview picker id (claude/grok/…); engine makeBackend is the real gate.
+  if (!isNonEmptyLabel(targetBackend, MAX_RUNTIME_HANDOFF_LABEL_CHARS)) {
     return {
       ok: false,
       code: 'invalid_request',
@@ -241,9 +238,11 @@ export function parseRequestRuntimeHandoffMessage(
       };
     }
     const trimmedModel = record.targetModel.trim();
+    // Model ids come from the CLI catalog (may include provider/ prefixes).
+    // Only reject empty, oversized, or control-byte garbage — no inventing charset rules.
     if (trimmedModel.length === 0) {
       targetModel = undefined;
-    } else if (!isSafeLabel(trimmedModel, MAX_RUNTIME_HANDOFF_LABEL_CHARS)) {
+    } else if (!isNonEmptyLabel(trimmedModel, MAX_RUNTIME_HANDOFF_LABEL_CHARS)) {
       return {
         ok: false,
         code: 'invalid_request',
@@ -255,27 +254,13 @@ export function parseRequestRuntimeHandoffMessage(
     }
   }
 
-  // Default skipSummary true so the host does not force a hidden summary turn
-  // unless the webview explicitly requests one.
-  let skipSummary = true;
-  if (record.skipSummary !== undefined) {
-    if (typeof record.skipSummary !== 'boolean') {
-      return {
-        ok: false,
-        code: 'invalid_request',
-        message: 'requestRuntimeHandoff skipSummary is invalid',
-        taskId,
-      };
-    }
-    skipSummary = record.skipSummary;
-  }
-
+  // skipSummary is not a product control: engine always best-effort summarizes.
+  // Unknown/extra fields (including legacy skipSummary) are ignored.
   return {
     ok: true,
     taskId,
     targetBackend,
     ...(targetModel !== undefined ? { targetModel } : {}),
-    skipSummary,
   };
 }
 
@@ -307,11 +292,13 @@ export async function routeRuntimeHandoff(
 ): Promise<RuntimeHandoffHostOutcome> {
   const parsed = parseRequestRuntimeHandoffMessage(data);
   if (!parsed.ok) {
+    console.info('[muster][handoff-route] parse failed', parsed);
     return refused(
       parsed.message || 'Runtime handoff request is invalid.',
       parsed.taskId,
     );
   }
+  console.info('[muster][handoff-route] parsed', parsed);
 
   if (
     !deps ||
@@ -320,6 +307,7 @@ export async function routeRuntimeHandoff(
     typeof deps.requestRuntimeHandoff !== 'function' ||
     typeof deps.completeRuntimeHandoff !== 'function'
   ) {
+    console.info('[muster][handoff-route] deps unavailable');
     return refused('Runtime handoff is unavailable.', parsed.taskId);
   }
 
@@ -327,19 +315,31 @@ export async function routeRuntimeHandoff(
   try {
     current = deps.getTask(parsed.taskId);
   } catch {
+    console.info('[muster][handoff-route] getTask threw');
     return refused('Unable to read task for runtime handoff.', parsed.taskId);
   }
 
   if (!current) {
+    console.info('[muster][handoff-route] task not found', parsed.taskId);
     return refused('Task not found for runtime handoff.', parsed.taskId);
   }
 
   if (sameBinding(current, parsed.targetBackend, parsed.targetModel)) {
+    console.info('[muster][handoff-route] same binding refused', {
+      current,
+      targetBackend: parsed.targetBackend,
+      targetModel: parsed.targetModel,
+    });
     return refused(
       'Target backend/model is already bound; switch is unchanged.',
       parsed.taskId,
     );
   }
+  console.info('[muster][handoff-route] will request', {
+    current,
+    targetBackend: parsed.targetBackend,
+    targetModel: parsed.targetModel,
+  });
 
   let requested: RuntimeHandoffEngineResult<RuntimeHandoffRequestValue>;
   try {
@@ -349,7 +349,6 @@ export async function routeRuntimeHandoff(
       ...(parsed.targetModel !== undefined
         ? { targetModel: parsed.targetModel }
         : {}),
-      skipSummary: parsed.skipSummary,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

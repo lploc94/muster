@@ -1524,7 +1524,6 @@ test.describe('Muster webview host state smoke', () => {
       taskId,
       targetBackend: 'grok',
       targetModel: 'grok-4',
-      skipSummary: true,
     });
 
     // Host projects in-flight handoffProgress (sanitized labels only).
@@ -1569,12 +1568,12 @@ test.describe('Muster webview host state smoke', () => {
     await expect(page.getByText(digestCanary)).toHaveCount(0);
     await expect(page.getByText(summaryBodyCanary)).toHaveCount(0);
     await expect(page.getByText(bootstrapCanary)).toHaveCount(0);
-    // While in flight, picker is disabled (not interactive for a second switch).
+    // Picker stays interactive during in-flight handoff (product rule).
     // vscode-single-select exposes `disabled` as an attribute; Playwright's
     // a11y-based toBeDisabled() does not always treat custom elements as disabled.
     await expect
       .poll(() => modelSwitch.evaluate((el) => el.hasAttribute('disabled')))
-      .toBe(true);
+      .toBe(false);
 
     // Completion: binding updates to target; progress is terminal completed chrome.
     const completed = handoffProgressFixture({
@@ -1667,7 +1666,7 @@ test.describe('Muster webview host state smoke', () => {
     await expect(page.getByText(conversationOnly)).toBeVisible();
     await expect(page.getByText(sessionCanary)).toHaveCount(0);
 
-    // Busy (running) tasks fall back to read-only pill — no interactive switch.
+    // Busy (running) tasks still show an interactive picker — never blocked.
     const runningTask = task({
       id: taskId,
       goal: idleTask.goal,
@@ -1688,8 +1687,8 @@ test.describe('Muster webview host state smoke', () => {
       ],
       storeRevision: 305,
     });
-    await expect(page.getByTestId('task-model-readonly')).toBeVisible();
-    await expect(page.getByTestId('task-model-switch')).toHaveCount(0);
+    await expect(page.getByTestId('task-model-switch')).toBeVisible();
+    await expect(page.getByTestId('task-model-readonly')).toHaveCount(0);
   });
 });
 

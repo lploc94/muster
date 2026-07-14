@@ -6,7 +6,7 @@
     type WebviewBackendId,
   } from '../lib/tasks.svelte';
   import { parseBackendId, parseModelFromSelectValue } from '../lib/backend-resolve';
-  import { post } from '../lib/protocol';
+  import { post, postDebug } from '../lib/protocol';
   import { ADD_CONTEXT_ACTIONS, getAddContextActionHostMessage } from '../lib/context-actions';
   import {
     getTaskPresentation,
@@ -23,10 +23,7 @@
   import type { PendingAsk, TaskSummary, TaskViewStatus } from '../lib/protocol';
   import { effectiveRuntimeActivity } from '../lib/protocol';
   import { BACKENDS, backendShortLabel, backendModelLabel } from '../lib/backends';
-  import {
-    canRequestRuntimeHandoff,
-    isHandoffProgressInFlight,
-  } from '../lib/handoff-progress';
+  import { isHandoffProgressInFlight } from '../lib/handoff-progress';
   import { tip } from '../lib/tooltip';
   import {
     extractFileDropCandidatesFromDataTransfer,
@@ -178,10 +175,7 @@
     mode === 'draft' ? tasks.selectedBackend : (tasks.focusedTask?.backend ?? tasks.selectedBackend),
   );
 
-  /** Existing-task model switch is allowed only when idle/open and no in-flight handoff. */
-  const handoffSwitchAllowed = $derived(
-    mode === 'task' && canRequestRuntimeHandoff(tasks.focusedTask),
-  );
+  /** Task-mode picker is always interactive; chrome only reflects in-flight handoff. */
   const handoffInFlight = $derived(
     mode === 'task' && isHandoffProgressInFlight(tasks.focusedTask?.handoffProgress),
   );
@@ -189,6 +183,42 @@
   // Register select so resolveBackendForSend can read it for draft sends.
   $effect(() => {
     registerBackendSelect(backendSelect);
+  });
+
+  // Native listeners (capture) — vscode-elements change can miss Svelte onchange.
+  $effect(() => {
+    const el = backendSelect as (HTMLElement & { value: string }) | undefined;
+    if (!el) return;
+    postDebug('picker.mounted', {
+      mode,
+      testId: el.getAttribute('data-testid'),
+      value: el.value,
+      disabled: el.hasAttribute('disabled'),
+      focusedTaskId: tasks.focusedTask?.id ?? null,
+      focusedBackend: tasks.focusedTask?.backend ?? null,
+      focusedModel: tasks.focusedTask?.model ?? null,
+    });
+    const onAny = (e: Event) => {
+      postDebug(`picker.dom_${e.type}`, {
+        mode,
+        value: (e.currentTarget as HTMLElement & { value?: string })?.value ?? el.value,
+        isTrusted: e.isTrusted,
+        focusedTaskId: tasks.focusedTask?.id ?? null,
+        focusedBackend: tasks.focusedTask?.backend ?? null,
+        focusedModel: tasks.focusedTask?.model ?? null,
+      });
+      // Only handle change here (input is noisy/duplicate). Svelte onchange also
+      // fires; dedupe in onBackendChange.
+      if (e.type === 'change') {
+        onBackendChange(e);
+      }
+    };
+    el.addEventListener('change', onAny, true);
+    el.addEventListener('click', onAny, true);
+    return () => {
+      el.removeEventListener('change', onAny, true);
+      el.removeEventListener('click', onAny, true);
+    };
   });
 
   $effect(() => {
@@ -296,12 +326,20 @@
       return;
     }
 
+    // Prefer live picker selection so a model switch that didn't fire handoff
+    // still reaches the host (send path will hand off when binding differs).
+    const rawPicker = backendSelect?.value ?? '';
+    const pickerBackend = parseBackendId(rawPicker);
+    const pickerModel = parseModelFromSelectValue(rawPicker);
+
     if (intent.kind === 'sendLiveInput') {
       // Interrupt & send: host reserves follow-up then interrupts live turn.
       const message = buildTaskComposerMessage(intent, {
         taskId,
         text: displayText,
         llmText,
+        ...(pickerBackend ? { backend: pickerBackend } : {}),
+        ...(pickerModel ? { model: pickerModel } : {}),
       });
       if (!message) return;
       post(message);
@@ -315,6 +353,8 @@
       taskId,
       text: displayText,
       llmText,
+      ...(pickerBackend ? { backend: pickerBackend } : {}),
+      ...(pickerModel ? { model: pickerModel } : {}),
     });
     if (!payload || payload.type !== 'send') return;
     if (payload.clientRequestId) {
@@ -576,14 +616,24 @@
       : (tasks.focusedTask?.model ?? tasks.selectedModel),
   );
 
-  /** Task-mode picker value always reflects the bound task backend/model. */
-  const taskPickerValue = $derived(
-    encodePickerValue(
-      tasks.focusedTask?.backend ?? currentBackend,
-      tasks.focusedTask?.model ?? null,
+  /**
+   * Task-mode picker value: optimistic pending handoff target when set for this
+   * task, else the host-bound task backend/model.
+   */
+  const taskPickerValue = $derived.by(() => {
+    const focused = tasks.focusedTask;
+    const pending =
+      focused &&
+      tasks.pendingHandoffTarget &&
+      tasks.pendingHandoffTarget.taskId === focused.id
+        ? tasks.pendingHandoffTarget
+        : null;
+    return encodePickerValue(
+      pending?.backend ?? focused?.backend ?? currentBackend,
+      pending?.model ?? focused?.model ?? null,
       tasks.modelsByBackend,
-    ),
-  );
+    );
+  });
 
   const pickerOptions = $derived.by(() => {
     const models = tasks.modelsByBackend;
@@ -642,6 +692,17 @@
     return opts;
   });
 
+  /** Width from longest option label so long opencode model ids are not clipped. */
+  const pickerWidthStyle = $derived.by(() => {
+    let maxChars = 12;
+    for (const opt of pickerOptions) {
+      if (opt.label.length > maxChars) maxChars = opt.label.length;
+    }
+    // ~7.2px per char + chevron/padding; clamp so narrow webviews still scroll.
+    const px = Math.min(Math.max(Math.ceil(maxChars * 7.2 + 36), 140), 420);
+    return `width: ${px}px; min-width: ${px}px; max-width: min(100%, 420px);`;
+  });
+
   function modelInCatalog(backend: string, model: string): boolean {
     return !!tasks.modelsByBackend?.[backend]?.options.some((o) => o.value === model);
   }
@@ -686,15 +747,29 @@
     modelsLoaded ? `models:${catalogGeneration}` : `loading:${catalogGeneration}`,
   );
 
-  // Only force preferred encoding after remount — never continuously overwrite
-  // the live select (that fights the user's pick and can clobber Grok → Claude).
-  // Task mode always mirrors the bound task backend/model (handoff updates).
+  // Sync select value only when remount key or bound task binding changes.
+  // Never continuously overwrite on every effect tick — that fights the open
+  // dropdown / user pick and makes the task picker feel unclickable.
   let lastForcedRemountKey = '';
+  let lastTaskBindingKey = '';
   $effect(() => {
-    const el = backendSelect;
+    const el = backendSelect as
+      | (HTMLElement & { value: string; open?: boolean })
+      | undefined;
     const key = pickerRemountKey;
     if (!el) return;
+    // Never force value while the dropdown is open (closes/fights the click).
+    if (el.open === true || el.getAttribute('aria-expanded') === 'true') {
+      return;
+    }
     if (mode === 'task') {
+      const bindingKey = `${tasks.focusedTask?.id ?? ''}:${taskPickerValue}`;
+      // Remount or host-confirmed binding change only (not optimistic user pick).
+      if (key === lastForcedRemountKey && bindingKey === lastTaskBindingKey && el.value) {
+        return;
+      }
+      lastForcedRemountKey = key;
+      lastTaskBindingKey = bindingKey;
       try {
         el.value = taskPickerValue;
       } catch {
@@ -712,11 +787,10 @@
     }
   });
 
-  // Ensure host starts enumeration when draft or switchable-task composer is shown.
+  // Ensure host starts enumeration whenever draft or task composer is shown.
   let modelsRequested = false;
   $effect(() => {
-    const needModels =
-      mode === 'draft' || (mode === 'task' && (handoffSwitchAllowed || handoffInFlight));
+    const needModels = mode === 'draft' || mode === 'task';
     if (needModels && !modelsRequested) {
       modelsRequested = true;
       post({ type: 'listModels' });
@@ -759,57 +833,110 @@
     }
   }
 
+  /** Deduplicate change+input double-fire from vscode-single-select. */
+  let lastHandoffRequestKey = '';
+  let lastHandoffRequestAt = 0;
+
   function onBackendChange(e: Event) {
     // vscode-single-select dispatches `new Event('change')` so isTrusted is always
     // false even for real user clicks — never filter on isTrusted.
+    // Prefer change over input to avoid double handoff (input often follows change).
+    if (e.type === 'input') {
+      return;
+    }
     const el = (e.currentTarget ?? backendSelect) as (HTMLElement & { value: string }) | undefined;
     const raw = el?.value ?? '';
+    postDebug('picker.change_handler', {
+      type: e.type,
+      raw,
+      isTrusted: e.isTrusted,
+      mode,
+      focusedTaskId: tasks.focusedTask?.id ?? null,
+      focusedBackend: tasks.focusedTask?.backend ?? null,
+      focusedModel: tasks.focusedTask?.model ?? null,
+      pendingHandoff: tasks.pendingHandoffTarget,
+    });
     const sep = raw.indexOf('::');
     if (sep >= 0) {
       const backend = raw.slice(0, sep);
       const model = raw.slice(sep + 2);
       if (BACKEND_IDS.includes(backend)) {
-        console.info('[muster][picker-change]', {
-          raw,
-          backend,
-          model,
-          isTrusted: e.isTrusted,
-          mode,
-        });
         if (mode === 'draft') {
+          postDebug('picker.draft_setModelSelection', { backend, model });
           tasks.setModelSelection(backend as WebviewBackendId, model);
           return;
         }
-        // Existing task: post host-orchestrated runtime handoff (never chat).
+        // Existing task: changing model always requests handoff (never chat).
         const focused = tasks.focusedTask;
-        if (!focused || !handoffSwitchAllowed) {
+        if (!focused) {
+          postDebug('picker.no_focused_task', { raw });
           revertTaskPicker(el);
           return;
         }
-        if (sameBinding(backend, model, focused)) return;
+        if (sameBinding(backend, model, focused)) {
+          postDebug('picker.same_binding', {
+            backend,
+            model,
+            taskBackend: focused.backend,
+            taskModel: focused.model ?? null,
+          });
+          revertTaskPicker(el);
+          return;
+        }
+        const key = `${focused.id}|${backend}|${model}`;
+        const now = Date.now();
+        if (key === lastHandoffRequestKey && now - lastHandoffRequestAt < 1500) {
+          postDebug('picker.handoff_deduped', { key });
+          return;
+        }
+        lastHandoffRequestKey = key;
+        lastHandoffRequestAt = now;
+        postDebug('picker.request_handoff', {
+          taskId: focused.id,
+          from: { backend: focused.backend, model: focused.model ?? null },
+          to: { backend, model },
+        });
         tasks.requestRuntimeHandoff(focused.id, backend, model);
+      } else {
+        postDebug('picker.backend_not_in_ids', { backend, raw });
       }
     } else if (BACKEND_IDS.includes(raw)) {
-      console.info('[muster][picker-change]', {
-        raw,
-        backend: raw,
-        model: null,
-        isTrusted: e.isTrusted,
-        mode,
-      });
       if (mode === 'draft') {
+        postDebug('picker.draft_setBackend', { backend: raw });
         tasks.setBackend(raw as WebviewBackendId);
         return;
       }
       const focused = tasks.focusedTask;
-      if (!focused || !handoffSwitchAllowed) {
+      if (!focused) {
+        postDebug('picker.no_focused_task', { raw });
         revertTaskPicker(el);
         return;
       }
-      if (sameBinding(raw, null, focused)) return;
+      if (sameBinding(raw, null, focused)) {
+        postDebug('picker.same_binding_backend_only', {
+          backend: raw,
+          taskBackend: focused.backend,
+          taskModel: focused.model ?? null,
+        });
+        revertTaskPicker(el);
+        return;
+      }
+      const key = `${focused.id}|${raw}|`;
+      const now = Date.now();
+      if (key === lastHandoffRequestKey && now - lastHandoffRequestAt < 1500) {
+        postDebug('picker.handoff_deduped', { key });
+        return;
+      }
+      lastHandoffRequestKey = key;
+      lastHandoffRequestAt = now;
+      postDebug('picker.request_handoff_backend_only', {
+        taskId: focused.id,
+        from: { backend: focused.backend, model: focused.model ?? null },
+        to: { backend: raw, model: null },
+      });
       tasks.requestRuntimeHandoff(focused.id, raw, null);
     } else {
-      console.warn('[muster][picker-change] unparsed', { raw, isTrusted: e.isTrusted });
+      postDebug('picker.unparsed', { raw, isTrusted: e.isTrusted });
     }
   }
 </script>
@@ -886,7 +1013,7 @@
 
   <div class="flex items-center justify-between gap-2 pt-1" onkeydown={onKeydown}>
     <div class="flex items-center gap-1.5 min-w-0">
-      {#if mode === 'draft' || handoffSwitchAllowed || handoffInFlight}
+      {#if mode === 'draft' || mode === 'task'}
         {#key `${mode}:${pickerRemountKey}`}
           <vscode-single-select
             bind:this={backendSelect}
@@ -897,16 +1024,15 @@
                   ? 'Select backend + model for the new task'
                   : 'Loading models from installed CLIs… (shows backends first)'
                 : handoffInFlight
-                  ? 'Model switch in progress…'
+                  ? 'Model switch in progress… (picker stays available)'
                   : modelsLoaded
-                    ? 'Switch backend + model for this task'
+                    ? 'Switch backend + model for this task (handoff)'
                     : 'Loading models from installed CLIs…'
             }
-            disabled={mode === 'draft' ? thread.running : !handoffSwitchAllowed}
+            disabled={mode === 'draft' ? thread.running : false}
             position="above"
             onchange={onBackendChange}
-            oninput={onBackendChange}
-            style="width: fit-content; min-width: fit-content; max-width: 100%;"
+            style={pickerWidthStyle}
           >
             {#each pickerOptions as opt (opt.value)}
               <vscode-option
@@ -917,15 +1043,6 @@
             {/each}
           </vscode-single-select>
         {/key}
-      {:else}
-        <div
-          class="px-2 py-0.5 text-xs rounded border truncate"
-          style="border-color: var(--vscode-panel-border); opacity: 0.85;"
-          data-testid="task-model-readonly"
-          use:tip={'Backend + model for this task (switch available when idle)'}
-        >
-          {backendModelLabel(currentBackend, tasks.focusedTask?.model)}
-        </div>
       {/if}
 
       <div bind:this={addContextMenuRegion} class="add-context">

@@ -8,16 +8,20 @@ import type { Backend, LiveInputResult, NormalizedEvent, RunOptions } from '../t
 import type { TaskHandoffPhase, TurnTrigger } from './types';
 import { canBindTaskToBackend } from './backend-eligibility';
 import {
-  advanceHandoffToPreparingReceiver,
-  advanceHandoffWithSourceSummary,
   buildHandoffBootstrapPrompt,
   buildHandoffPackage,
   collectInternalSummaryTurnText,
   digestSourceSummaryText,
+  exportConversationContextMetadata,
   HANDOFF_SOURCE_SUMMARY_PROMPT,
   isActiveHandoffPhase,
   type SourceSummaryOutcome,
 } from './engine-handoff';
+
+/** Best-effort source summary budget — never hang the model switch forever. */
+const HANDOFF_SOURCE_SUMMARY_TIMEOUT_MS = 20_000;
+/** Receiver bootstrap budget for completeRuntimeHandoff. */
+const HANDOFF_RECEIVER_INIT_TIMEOUT_MS = 45_000;
 import { TaskHandoff, type TaskHandoffDiagnostics } from './task-handoff';
 import { deriveViewStatus } from './derived-status';
 import type { DepGraph } from './deps';
@@ -751,6 +755,9 @@ export class TaskEngine {
   static load(config: TaskEngineConfig): TaskEngine {
     const engine = new TaskEngine(config, config.store.getStorePath());
     engine.reconcileReload();
+    // Resume incomplete receiver transfers after reload without re-summarizing.
+    // Fire-and-forget: load stays sync; failures leave source binding + handoff.fail.
+    void engine.resumePendingRuntimeHandoffs();
     return engine;
   }
 
@@ -925,10 +932,18 @@ export class TaskEngine {
     if (!reserved.ok) {
       return reserved;
     }
-    void this.scheduleTurn(reserved.value.turnId);
+    const liveTask = this.store.getTask(taskId);
+    const handoffBusy =
+      !!liveTask?.handoff && isActiveHandoffPhase(liveTask.handoff.phase);
+    if (!handoffBusy) {
+      void this.scheduleTurn(reserved.value.turnId);
+    }
     return {
       ok: true,
-      value: { ...reserved.value, outcome: 'scheduled' },
+      value: {
+        ...reserved.value,
+        outcome: handoffBusy ? 'queued' : 'scheduled',
+      },
     };
   }
 
@@ -1026,6 +1041,7 @@ export class TaskEngine {
       if (!queued.ok) {
         return queued;
       }
+      // Handoff barrier is canPromoteTurn (active handoff phase), not holdAutoPromote.
       draft.turns[turnId] = queued.next;
       return { ok: true };
     });
@@ -1128,14 +1144,17 @@ export class TaskEngine {
   }
 
   /**
-   * Start a cross-runtime handoff on an idle task (M010/S02).
+   * Start a cross-runtime handoff (M010/S02).
    *
    * Creates TaskHandoff, exports conversation-context metadata from existing
-   * messages, optionally runs a *hidden* source-summary internal turn against
-   * the current backend (no TaskMessage/TaskTurn rows, no EngineEvent emission),
-   * then advances to preparing_receiver. Never rebinds task.backend / model /
-   * committedSessionId (S03 owns receiver setup). Fail-closed for missing task,
-   * live turns, active handoff, or non-MCP target.
+   * messages, always best-effort runs a *hidden* source-summary internal turn
+   * against the current backend (no TaskMessage/TaskTurn rows, no EngineEvent
+   * emission), then advances to preparing_receiver. Never rebinds task.backend /
+   * model / committedSessionId (S03 owns receiver setup).
+   *
+   * Live turns are interrupted immediately (do not wait for them to finish);
+   * queued turns for the task are cancelled so handoff can start. Fail-closed
+   * for missing task, active handoff, or non-MCP target.
    *
    * Summary failure/empty response never blocks preparing_receiver when
    * conversation context is ready (D017/D018/D019).
@@ -1144,11 +1163,6 @@ export class TaskEngine {
     taskId: string;
     targetBackend: string;
     targetModel?: string;
-    /**
-     * When true (default), skip the optional source-summary internal turn.
-     * When false, run a hidden summary turn against the source backend.
-     */
-    skipSummary?: boolean;
   }): Promise<
     EngineResult<{
       operationId: string;
@@ -1165,11 +1179,6 @@ export class TaskEngine {
       return { ok: false, reason: 'active handoff in progress' };
     }
 
-    const liveOrQueued = pendingTurnsForTask(this.store.getFile(), params.taskId);
-    if (liveOrQueued.length > 0) {
-      return { ok: false, reason: 'task has a live or active turn' };
-    }
-
     let targetBackend;
     try {
       targetBackend = this.makeBackend(params.targetBackend);
@@ -1181,9 +1190,16 @@ export class TaskEngine {
       return { ok: false, reason: 'backend does not support MCP' };
     }
 
+    // Preempt live work: interrupt running/waiting turns and drop queued FIFO
+    // so handoff starts immediately (never wait for the current turn to finish).
+    const preemption = this.preemptTaskTurnsForHandoff(params.taskId);
+    if (!preemption.ok) {
+      return preemption;
+    }
+
     const now = nowIso(this.clock);
     const operationId = randomUUID();
-    const handoff = TaskHandoff.create({
+    let handoff = TaskHandoff.create({
       operationId,
       source: {
         backend: task.backend,
@@ -1197,37 +1213,33 @@ export class TaskEngine {
       now,
     });
 
+    // Reserve active handoff BEFORE the async source-summary turn so concurrent
+    // switch/send cannot race the same task/session (compare-and-set on commit).
     const messages = this.store.getMessagesForTask(params.taskId);
-    const wantSummary = params.skipSummary === false;
-
-    let summary: SourceSummaryOutcome;
-    if (!wantSummary) {
-      summary = { kind: 'skipped', reason: 'summary not requested' };
-    } else {
-      summary = await this.runHiddenSourceSummaryTurn(task, now);
+    const op = { now, operationId };
+    const started = handoff.startExport(op);
+    if (!started.ok) {
+      return { ok: false, reason: started.reason };
     }
-
-    const advanced = wantSummary
-      ? advanceHandoffWithSourceSummary({
-          handoff,
-          messages,
-          now,
-          operationId,
-          summary,
-        })
-      : advanceHandoffToPreparingReceiver({
-          handoff,
-          messages,
-          now,
-          operationId,
-          skipSummaryReason: 'summary not requested',
-        });
-    if (!advanced.ok) {
-      return { ok: false, reason: advanced.reason };
+    handoff = started.next;
+    const exported = exportConversationContextMetadata(messages, now);
+    const conversationReady = handoff.markConversationReady({
+      ...op,
+      messageCount: exported.messageCount,
+      contentDigest: exported.contentDigest,
+      exportedAt: exported.exportedAt,
+    });
+    if (!conversationReady.ok) {
+      return { ok: false, reason: conversationReady.reason };
     }
+    handoff = conversationReady.next;
+    const summarizing = handoff.beginSummarizing(op);
+    if (!summarizing.ok) {
+      return { ok: false, reason: summarizing.reason };
+    }
+    handoff = summarizing.next;
 
-    const nextState = advanced.next.toState();
-    const commit = this.store.commit((draft) => {
+    const reserveCommit = this.store.commit((draft) => {
       const current = draft.tasks[params.taskId];
       if (!current) {
         return { ok: false, reason: 'task not found' };
@@ -1235,21 +1247,113 @@ export class TaskEngine {
       if (current.handoff && isActiveHandoffPhase(current.handoff.phase)) {
         return { ok: false, reason: 'active handoff in progress' };
       }
-      if (pendingTurnsForTask(draft, params.taskId).length > 0) {
-        return { ok: false, reason: 'task has a live or active turn' };
+      // Re-preempt inside the same CAS so a turn that started between preemption
+      // and reserve cannot slip through.
+      const clear = this.applyHandoffTurnPreemption(draft, params.taskId, now, {
+        cancelQueued: false,
+      });
+      if (!clear.ok) {
+        return clear;
+      }
+      draft.tasks[params.taskId] = {
+        ...current,
+        handoff: handoff.toState(),
+        revision: current.revision + 1,
+        updatedAt: now,
+      };
+      return { ok: true };
+    });
+    if (!reserveCommit.ok) {
+      return { ok: false, reason: reserveCommit.detail ?? reserveCommit.reason };
+    }
+
+    // Always best-effort source summary. Conversation history is already exported.
+    // Summary failure / timeout → unavailable; transfer still continues conversation-only.
+    const summary = await this.runHiddenSourceSummaryTurn(task, now, {
+      timeoutMs: HANDOFF_SOURCE_SUMMARY_TIMEOUT_MS,
+    });
+    const summaryNow = nowIso(this.clock);
+
+    // Re-load + CAS: only this operationId at summarizing_source may finish.
+    const reservedTask = this.store.getTask(params.taskId);
+    if (!reservedTask?.handoff || reservedTask.handoff.operationId !== operationId) {
+      return { ok: false, reason: 'stale handoff operation' };
+    }
+    const restored = TaskHandoff.restore(reservedTask.handoff);
+    if (!restored.ok) {
+      return { ok: false, reason: restored.reason };
+    }
+    handoff = restored.next;
+    if (handoff.phase !== 'summarizing_source') {
+      return { ok: false, reason: `handoff is not summarizing_source (phase=${handoff.phase})` };
+    }
+
+    if (summary.kind === 'ready') {
+      const marked = handoff.markSummaryReady({
+        now: summaryNow,
+        operationId,
+        contentDigest: summary.contentDigest,
+        summarizedAt: summary.summarizedAt,
+      });
+      if (!marked.ok) {
+        return { ok: false, reason: marked.reason };
+      }
+      handoff = marked.next;
+    } else {
+      const reason =
+        summary.kind === 'unavailable'
+          ? summary.reason
+          : summary.kind === 'skipped'
+            ? summary.reason
+            : 'source summary unavailable';
+      const marked = handoff.markSummaryUnavailable({
+        now: summaryNow,
+        operationId,
+        reason,
+      });
+      if (!marked.ok) {
+        return { ok: false, reason: marked.reason };
+      }
+      handoff = marked.next;
+    }
+
+    const prepared = handoff.beginPreparingReceiver({ now: summaryNow, operationId });
+    if (!prepared.ok) {
+      return { ok: false, reason: prepared.reason };
+    }
+    handoff = prepared.next;
+    const nextState = handoff.toState();
+
+    const finishCommit = this.store.commit((draft) => {
+      const current = draft.tasks[params.taskId];
+      if (!current?.handoff) {
+        return { ok: false, reason: 'task not found' };
+      }
+      if (current.handoff.operationId !== operationId) {
+        return { ok: false, reason: 'stale operation' };
+      }
+      if (current.handoff.phase !== 'summarizing_source') {
+        return { ok: false, reason: 'handoff is not summarizing_source' };
+      }
+      // Only interrupt live turns that reappeared; keep user messages queued during handoff.
+      const clear = this.applyHandoffTurnPreemption(draft, params.taskId, summaryNow, {
+        cancelQueued: false,
+      });
+      if (!clear.ok) {
+        return clear;
       }
       // Persist handoff only — never rebind backend/model/session here.
       draft.tasks[params.taskId] = {
         ...current,
         handoff: nextState,
         revision: current.revision + 1,
-        updatedAt: now,
+        updatedAt: summaryNow,
       };
       return { ok: true };
     });
 
-    if (!commit.ok) {
-      return { ok: false, reason: commit.detail ?? commit.reason };
+    if (!finishCommit.ok) {
+      return { ok: false, reason: finishCommit.detail ?? finishCommit.reason };
     }
 
     // Cache raw summary text ephemerally for S03 receiver package (D020).
@@ -1263,7 +1367,7 @@ export class TaskEngine {
       value: {
         operationId,
         phase: nextState.phase,
-        diagnostics: advanced.next.toDiagnostics(),
+        diagnostics: handoff.toDiagnostics(),
       },
     };
   }
@@ -1306,8 +1410,11 @@ export class TaskEngine {
     if (handoff.phase !== 'preparing_receiver') {
       return { ok: false, reason: `handoff is not preparing_receiver (phase=${handoff.phase})` };
     }
-    if (pendingTurnsForTask(this.store.getFile(), params.taskId).length > 0) {
-      return { ok: false, reason: 'task has a live or active turn' };
+
+    // Preempt any live/queued work before receiver transfer (do not wait).
+    const preemption = this.preemptTaskTurnsForHandoff(params.taskId);
+    if (!preemption.ok) {
+      return preemption;
     }
 
     const now = nowIso(this.clock);
@@ -1331,8 +1438,11 @@ export class TaskEngine {
       if (current.handoff.phase !== 'preparing_receiver') {
         return { ok: false, reason: 'handoff is not preparing_receiver' };
       }
-      if (pendingTurnsForTask(draft, params.taskId).length > 0) {
-        return { ok: false, reason: 'task has a live or active turn' };
+      const clear = this.applyHandoffTurnPreemption(draft, params.taskId, now, {
+        cancelQueued: false,
+      });
+      if (!clear.ok) {
+        return clear;
       }
       draft.tasks[params.taskId] = {
         ...current,
@@ -1383,24 +1493,62 @@ export class TaskEngine {
 
     let boundSessionId: string | undefined;
     let initError: string | undefined;
+    const initAbort = new AbortController();
+    let initTimer: ReturnType<typeof setTimeout> | undefined;
     try {
       const runOptions: RunOptions = {
         prompt: bootstrapPrompt,
         // Intentionally omit resumeId — new session only (D021).
         ...(state.target.model ? { model: state.target.model } : {}),
         ...(task.cwd ? { cwd: task.cwd } : {}),
+        signal: initAbort.signal,
       };
-      for await (const event of this.runTurnFn(targetBackend, runOptions)) {
-        if (event.type === 'sessionStarted' && event.sessionId) {
-          if (!boundSessionId) {
-            boundSessionId = event.sessionId;
+      const initResult = await Promise.race([
+        (async () => {
+          let sessionId: string | undefined;
+          let errorMessage: string | undefined;
+          let completed = false;
+          for await (const event of this.runTurnFn(targetBackend, runOptions)) {
+            if (event.type === 'sessionStarted' && event.sessionId) {
+              if (!sessionId) sessionId = event.sessionId;
+            } else if (event.type === 'error') {
+              errorMessage = event.isCancellation
+                ? event.message?.trim() || 'receiver init cancelled'
+                : event.message;
+            } else if (event.type === 'turnCompleted') {
+              completed = true;
+            }
           }
-        } else if (event.type === 'error' && !event.isCancellation) {
-          initError = event.message;
-        }
+          if (errorMessage !== undefined) {
+            return { sessionId, errorMessage };
+          }
+          if (!completed) {
+            return {
+              sessionId,
+              errorMessage: 'receiver init ended without completion',
+            };
+          }
+          return { sessionId, errorMessage: undefined as string | undefined };
+        })(),
+        new Promise<{ sessionId?: string; errorMessage: string }>((resolve) => {
+          initTimer = setTimeout(() => {
+            initAbort.abort();
+            resolve({
+              errorMessage: `receiver init timed out after ${HANDOFF_RECEIVER_INIT_TIMEOUT_MS}ms`,
+            });
+          }, HANDOFF_RECEIVER_INIT_TIMEOUT_MS);
+        }),
+      ]);
+      // Prefer explicit timeout/error; only bind session when init completed cleanly.
+      initError = initResult.errorMessage;
+      if (!initError) {
+        boundSessionId = initResult.sessionId;
       }
     } catch (error) {
       initError = error instanceof Error ? error.message : String(error);
+    } finally {
+      if (initTimer) clearTimeout(initTimer);
+      if (!initAbort.signal.aborted) initAbort.abort();
     }
 
     if (initError) {
@@ -1451,6 +1599,8 @@ export class TaskEngine {
       };
       if (state.target.model !== undefined) {
         nextTask.model = state.target.model;
+      } else {
+        delete nextTask.model;
       }
       if (boundSessionId) {
         nextTask.committedSessionId = boundSessionId;
@@ -1466,6 +1616,8 @@ export class TaskEngine {
     }
 
     this.handoffSourceSummaryByOperationId.delete(operationId);
+    // Promote messages that were queued during the handoff window.
+    this.releaseQueuedTurnsAfterHandoff(params.taskId);
 
     return {
       ok: true,
@@ -1523,6 +1675,8 @@ export class TaskEngine {
         };
         return { ok: true };
       });
+      // Failed handoffs keep the source binding; thaw held messages so send is not stuck.
+      this.releaseQueuedTurnsAfterHandoff(params.taskId);
     }
     return { ok: false, reason: params.message };
   }
@@ -1532,23 +1686,37 @@ export class TaskEngine {
    * the source session/model, captures assistant text in-memory for digesting only,
    * and never creates TaskMessage/TaskTurn rows or emits EngineEvents.
    *
-   * Failures yield `unavailable` — conversation-ready handoffs still advance.
+   * Failures / timeout yield `unavailable` — conversation-ready handoffs still advance.
    */
   private async runHiddenSourceSummaryTurn(
     task: MusterTask,
     now: string,
+    options: { timeoutMs?: number } = {},
   ): Promise<SourceSummaryOutcome> {
+    const timeoutMs = options.timeoutMs ?? HANDOFF_SOURCE_SUMMARY_TIMEOUT_MS;
+    const abort = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const sourceBackend = this.makeBackend(task.backend);
-      const options: RunOptions = {
+      const runOptions: RunOptions = {
         prompt: HANDOFF_SOURCE_SUMMARY_PROMPT,
         ...(task.committedSessionId ? { resumeId: task.committedSessionId } : {}),
         ...(task.model ? { model: task.model } : {}),
         ...(task.cwd ? { cwd: task.cwd } : {}),
+        signal: abort.signal,
       };
-      const collected = await collectInternalSummaryTurnText(
-        this.runTurnFn(sourceBackend, options),
-      );
+      const collected = await Promise.race([
+        collectInternalSummaryTurnText(this.runTurnFn(sourceBackend, runOptions)),
+        new Promise<{ text: string; errorMessage: string }>((resolve) => {
+          timer = setTimeout(() => {
+            abort.abort();
+            resolve({
+              text: '',
+              errorMessage: `source summary timed out after ${timeoutMs}ms`,
+            });
+          }, timeoutMs);
+        }),
+      ]);
       if (collected.errorMessage) {
         return {
           kind: 'unavailable',
@@ -1571,6 +1739,9 @@ export class TaskEngine {
         kind: 'unavailable',
         reason: message.slice(0, 120),
       };
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (!abort.signal.aborted) abort.abort();
     }
   }
 
@@ -1597,6 +1768,16 @@ export class TaskEngine {
       if (existing) {
         if (existing.fingerprint !== fingerprint) {
           return { ok: false, reason: 'clientRequestId conflict: different payload' };
+        }
+        const liveTask = this.store.getTask(taskId);
+        const handoffBusy =
+          !!liveTask?.handoff && isActiveHandoffPhase(liveTask.handoff.phase);
+        if (
+          !handoffBusy &&
+          existing.turnId &&
+          !this.deferredQueuedTurns.has(existing.turnId)
+        ) {
+          void this.scheduleTurn(existing.turnId);
         }
         return {
           ok: true,
@@ -1656,6 +1837,7 @@ export class TaskEngine {
       // created — never leave free-floating pending messages without turn identity.
       // Phase B: free-form send after failed/interrupted is a normal continuation
       // turn (not retryOf); needs_recovery no longer blocks admission.
+      // Active handoff does NOT block send — messages queue; canPromoteTurn gates promote.
 
       const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
       if (!turnCap.ok) {
@@ -1691,6 +1873,7 @@ export class TaskEngine {
         delete draft.messages[messageId];
         return queue;
       }
+      // Admit during handoff; canPromoteTurn refuses until handoff is terminal.
       draft.turns[turnId] = queue.next;
       queuedTurnId = turnId;
       if (clientRequestId) {
@@ -1711,10 +1894,20 @@ export class TaskEngine {
       return { ok: false, reason: commit.detail ?? commit.reason };
     }
 
+    // Do not schedule while a runtime handoff is still active — release after rebind.
+    // canPromoteTurn also refuses during active handoff (without touching MEM030 holds).
+    const liveTask = this.store.getTask(taskId);
+    const handoffBusy =
+      !!liveTask?.handoff && isActiveHandoffPhase(liveTask.handoff.phase);
+
     if (clientRequestId) {
       const receipt = this.store.getFile().sendReceipts?.[clientRequestId];
       if (receipt) {
-        if (receipt.turnId && !this.deferredQueuedTurns.has(receipt.turnId)) {
+        if (
+          receipt.turnId &&
+          !this.deferredQueuedTurns.has(receipt.turnId) &&
+          !handoffBusy
+        ) {
           void this.scheduleTurn(receipt.turnId);
         }
         return {
@@ -1728,7 +1921,7 @@ export class TaskEngine {
       }
     }
 
-    if (queuedTurnId) {
+    if (queuedTurnId && !handoffBusy && !this.deferredQueuedTurns.has(queuedTurnId)) {
       void this.scheduleTurn(queuedTurnId);
     }
 
@@ -2375,10 +2568,269 @@ export class TaskEngine {
       this.credentialRegistry?.revoke(turn.id);
     }
 
+    this.reconcileOrphanedHandoffs();
     this.reconcileChildWaits({ schedule: false });
     this.deferReloadQueuedTurns();
     this.reconcileTaskTimeouts();
     processCancelRequests(this.graphDeps());
+  }
+
+  /**
+   * Interrupt live turns so handoff can start immediately. Queued turns stay
+   * queued; canPromoteTurn refuses while the handoff is active (does not use
+   * holdAutoPromote — that flag is MEM030 failure-safety only).
+   * Local leases abort via liveRuns; remote-owned leases get cancelRequests
+   * inside the store-side preemption (covers CAS re-preempt paths too).
+   * Does not wait for the backend stream to finish.
+   */
+  private preemptTaskTurnsForHandoff(taskId: string): EngineResult<void> {
+    const file = this.store.getFile();
+    const pending = pendingTurnsForTask(file, taskId);
+    if (pending.length === 0) {
+      return { ok: true, value: undefined };
+    }
+
+    const liveIds = pending
+      .filter((turn) => turn.status === 'running' || turn.status === 'waiting_user')
+      .map((turn) => turn.id);
+    for (const turnId of liveIds) {
+      const handle = this.liveRuns.get(turnId);
+      if (handle) {
+        handle.interruptArmed = true;
+        handle.controller.abort();
+      }
+    }
+
+    const now = nowIso(this.clock);
+    const commit = this.store.commit((draft) =>
+      this.applyHandoffTurnPreemption(draft, taskId, now, { cancelQueued: false }),
+    );
+    if (!commit.ok) {
+      return { ok: false, reason: commit.detail ?? commit.reason };
+    }
+
+    // Also abort any liveRuns that appeared after the pre-commit snapshot.
+    for (const turn of pendingTurnsForTask(this.store.getFile(), taskId)) {
+      if (turn.status !== 'running' && turn.status !== 'waiting_user' && turn.status !== 'interrupted') {
+        continue;
+      }
+      const handle = this.liveRuns.get(turn.id);
+      if (handle) {
+        handle.interruptArmed = true;
+        handle.controller.abort();
+      }
+    }
+
+    for (const turnId of liveIds) {
+      this.acceptedOpIds.delete(turnId);
+      this.askBridge.cancelForTurn(turnId, 'runtime handoff');
+      this.dropElicitationWaits(turnId);
+      this.credentialRegistry?.revoke(turnId);
+    }
+    return { ok: true, value: undefined };
+  }
+
+  /**
+   * Store-side preemption used inside CAS commits: interrupt live turns.
+   * Remote-owned live leases get interrupt cancelRequests on the same draft
+   * (covers races where a turn becomes live between snapshot and commit).
+   * When cancelQueued is true, also cancel queued turns; otherwise leave them
+   * queued (handoff phase blocks promotion via canPromoteTurn).
+   */
+  private applyHandoffTurnPreemption(
+    draft: TaskStoreFile,
+    taskId: string,
+    now: string,
+    options: { cancelQueued?: boolean } = {},
+  ): { ok: true } | { ok: false; reason: string } {
+    const cancelQueued = options.cancelQueued === true;
+    const pending = pendingTurnsForTask(draft, taskId);
+    for (const turn of pending) {
+      if (turn.status === 'queued') {
+        if (cancelQueued) {
+          const cancelled = cancelPendingTurn(turn, { now });
+          if (!cancelled.ok) {
+            return cancelled;
+          }
+          draft.turns[turn.id] = {
+            ...cancelled.next,
+            isCancellation: true,
+            interruptConfidence: 'confirmed',
+          };
+        }
+        // else: leave queued; do not touch holdAutoPromote (MEM030).
+      } else {
+        // Notify remote owners before marking interrupted in the shared store.
+        if (
+          !this.liveRuns.has(turn.id) &&
+          leaseOwnerAlive(this.storePath, turn.id) &&
+          !ownsLocalLease(this.storePath, turn.id)
+        ) {
+          draft.cancelRequests = draft.cancelRequests ?? {};
+          draft.cancelRequests[turn.id] = {
+            kind: 'interrupt',
+            by: 'engine',
+            opId: `handoff-preempt-${taskId}-${turn.id}`,
+            at: now,
+          };
+        }
+        const interrupted = interruptTurn(turn, { now });
+        if (!interrupted.ok) {
+          return interrupted;
+        }
+        draft.turns[turn.id] = {
+          ...interrupted.next,
+          isCancellation: true,
+          interruptConfidence: 'confirmed',
+        };
+      }
+    }
+    return { ok: true };
+  }
+
+  /** Queued turn ids for a task, oldest-first (sequence then createdAt then id). */
+  private queuedTurnIdsInFifoOrder(taskId: string): string[] {
+    const file = this.store.getFile();
+    return turnsForTask(file, taskId)
+      .filter((t) => t.status === 'queued')
+      .map((t) => t.id)
+      .sort((a, b) => {
+        const ta = file.turns[a];
+        const tb = file.turns[b];
+        if (!ta || !tb) return 0;
+        return (
+          ta.sequence - tb.sequence ||
+          ta.createdAt.localeCompare(tb.createdAt) ||
+          ta.id.localeCompare(tb.id)
+        );
+      });
+  }
+
+  /**
+   * After handoff becomes terminal (completed/failed), schedule queued turns that
+   * are eligible. Does not clear holdAutoPromote — failure-safety holds stay until
+   * explicit resume.
+   */
+  private releaseQueuedTurnsAfterHandoff(taskId: string): void {
+    for (const turnId of this.queuedTurnIdsInFifoOrder(taskId)) {
+      this.deferredQueuedTurns.delete(turnId);
+      void this.scheduleTurn(turnId);
+    }
+  }
+
+  /**
+   * After process reload, in-process source-summary work is gone. Advance any
+   * orphaned summarizing_source reservation to preparing_receiver with summary
+   * unavailable so host/engine can still complete conversation-only transfer
+   * without re-querying the source CLI. Never rebinds runtime here.
+   *
+   * Orphaned `transferring` is fail-closed: receiver side effects are uncertain,
+   * so mark failed (source binding retained) so a fresh handoff and queue thaw
+   * can proceed.
+   */
+  private reconcileOrphanedHandoffs(): void {
+    const now = nowIso(this.clock);
+    for (const task of Object.values(this.store.getFile().tasks)) {
+      if (!task.handoff) continue;
+
+      if (task.handoff.phase === 'transferring') {
+        const restored = TaskHandoff.restore(task.handoff);
+        if (!restored.ok) continue;
+        const operationId = restored.next.operationId;
+        const failed = restored.next.fail({
+          now,
+          operationId,
+          code: 'handoff_interrupted_by_reload',
+          message: 'receiver transfer interrupted by reload',
+        });
+        if (!failed.ok) continue;
+        this.store.commit((draft) => {
+          const current = draft.tasks[task.id];
+          if (!current?.handoff || current.handoff.operationId !== operationId) {
+            return { ok: true };
+          }
+          if (current.handoff.phase !== 'transferring') {
+            return { ok: true };
+          }
+          draft.tasks[task.id] = {
+            ...current,
+            handoff: failed.next.toState(),
+            revision: current.revision + 1,
+            updatedAt: now,
+          };
+          return { ok: true };
+        });
+        this.handoffSourceSummaryByOperationId.delete(operationId);
+        this.releaseQueuedTurnsAfterHandoff(task.id);
+        continue;
+      }
+
+      if (task.handoff.phase !== 'summarizing_source') {
+        continue;
+      }
+      const restored = TaskHandoff.restore(task.handoff);
+      if (!restored.ok) {
+        continue;
+      }
+      const operationId = restored.next.operationId;
+      let handoff = restored.next;
+      const marked = handoff.markSummaryUnavailable({
+        now,
+        operationId,
+        reason: 'source summary interrupted by reload',
+      });
+      if (!marked.ok) {
+        continue;
+      }
+      handoff = marked.next;
+      const prepared = handoff.beginPreparingReceiver({ now, operationId });
+      if (!prepared.ok) {
+        continue;
+      }
+      handoff = prepared.next;
+      this.store.commit((draft) => {
+        const current = draft.tasks[task.id];
+        if (!current?.handoff || current.handoff.operationId !== operationId) {
+          return { ok: true };
+        }
+        if (current.handoff.phase !== 'summarizing_source') {
+          return { ok: true };
+        }
+        draft.tasks[task.id] = {
+          ...current,
+          handoff: handoff.toState(),
+          revision: current.revision + 1,
+          updatedAt: now,
+        };
+        return { ok: true };
+      });
+      // Ephemeral summary cache does not survive reload (D020).
+      this.handoffSourceSummaryByOperationId.delete(operationId);
+    }
+  }
+
+  /**
+   * Product recovery: after reload, finish any handoff already at
+   * preparing_receiver (including ones just recovered from summarizing_source).
+   * Conversation-only when summary text is gone. Does not re-run source summary.
+   */
+  private async resumePendingRuntimeHandoffs(): Promise<void> {
+    const pending: Array<{ taskId: string; operationId: string }> = [];
+    for (const task of Object.values(this.store.getFile().tasks)) {
+      if (task.handoff?.phase === 'preparing_receiver') {
+        pending.push({ taskId: task.id, operationId: task.handoff.operationId });
+      }
+    }
+    for (const item of pending) {
+      try {
+        await this.completeRuntimeHandoff({
+          taskId: item.taskId,
+          operationId: item.operationId,
+        });
+      } catch {
+        // Fail-closed inside completeRuntimeHandoff records handoff.fail when possible.
+      }
+    }
   }
 
   /** Every persisted queued turn survives reload unscheduled until an explicit resume. */
@@ -2415,35 +2867,33 @@ export class TaskEngine {
     for (const task of Object.values(this.store.getFile().tasks)) {
       if (isTerminalLifecycle(task.lifecycle)) continue;
       const turns = this.store.getTurnsForTask(task.id);
-      const firstStarted = turns.find((t) => t.startedAt)?.startedAt;
-      if (!firstStarted) continue;
-      const startedMs = Date.parse(firstStarted);
-      // Invalid timestamps must not force-cancel every open task (NaN comparisons are false).
+      // Timeout applies only to a currently live turn that has been running too long.
+      // Never use the task's first-ever startedAt (that permanently bricks long-lived
+      // tasks after taskTimeoutMs and cancelled every new send).
+      // Never cancel queued user follow-ups here — that made send appear to "do nothing".
+      const live = turns.find((t) => t.status === 'running' || t.status === 'waiting_user');
+      if (!live?.startedAt) continue;
+      const startedMs = Date.parse(live.startedAt);
       if (!Number.isFinite(startedMs)) continue;
       if (nowMs - startedMs <= task.executionPolicy.taskTimeoutMs) continue;
-      // Timeout interrupts live turns only — does NOT seal task lifecycle (user/coordinator only).
-      const live = turns.find((t) => t.status === 'running' || t.status === 'waiting_user');
       const remoteLeased =
-        live && deps.leaseOwnerAlive(live.id) && !deps.ownsLease(live.id);
+        deps.leaseOwnerAlive(live.id) && !deps.ownsLease(live.id);
       if (remoteLeased) {
         deps.writeCancelRequest(live.id, 'interrupt', 'engine', `task-timeout-${task.id}`);
         continue;
       }
-      if (live) this.liveRuns.get(live.id)?.controller.abort();
+      this.liveRuns.get(live.id)?.controller.abort();
       this.store.commit((draft) => {
-        const pendingTurns = Object.values(draft.turns).filter(
-          (t) =>
-            t.taskId === task.id &&
-            (t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user'),
-        );
-        for (const pending of pendingTurns) {
-          if (pending.status === 'queued') {
-            const settled = cancelPendingTurn(pending, { now });
-            if (settled.ok) draft.turns[pending.id] = settled.next;
-          } else {
-            const interrupted = interruptTurn(pending, { now });
-            if (interrupted.ok) draft.turns[pending.id] = interrupted.next;
-          }
+        const pending = draft.turns[live.id];
+        if (
+          !pending ||
+          (pending.status !== 'running' && pending.status !== 'waiting_user')
+        ) {
+          return { ok: true };
+        }
+        const interrupted = interruptTurn(pending, { now });
+        if (interrupted.ok) {
+          draft.turns[live.id] = interrupted.next;
         }
         // Task lifecycle stays open for user recovery / decision.
         return { ok: true };

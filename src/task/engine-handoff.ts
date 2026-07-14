@@ -410,20 +410,35 @@ export function digestSourceSummaryText(text: string): string {
  * Collect assistant text (and optional error) from a backend turn stream.
  * Used only for the hidden internal handoff summary turn — callers must not
  * persist the returned text as TaskMessage/TaskTurn content.
+ *
+ * Success requires a `turnCompleted` terminal with no error. Cancellation and
+ * stream end without completion are treated as failures so partial deltas are
+ * never promoted to a ready summary.
  */
 export async function collectInternalSummaryTurnText(
   events: AsyncIterable<NormalizedEvent>,
 ): Promise<{ text: string; errorMessage?: string }> {
   let text = '';
   let errorMessage: string | undefined;
+  let completed = false;
   for await (const event of events) {
     if (event.type === 'assistantDelta') {
       text += event.content;
-    } else if (event.type === 'error' && !event.isCancellation) {
-      errorMessage = event.message;
+    } else if (event.type === 'error') {
+      errorMessage = event.isCancellation
+        ? event.message?.trim() || 'source summary cancelled'
+        : event.message;
+    } else if (event.type === 'turnCompleted') {
+      completed = true;
     }
   }
-  return errorMessage !== undefined ? { text, errorMessage } : { text };
+  if (errorMessage !== undefined) {
+    return { text, errorMessage };
+  }
+  if (!completed) {
+    return { text, errorMessage: 'source summary ended without completion' };
+  }
+  return { text };
 }
 
 export type SourceSummaryOutcome =

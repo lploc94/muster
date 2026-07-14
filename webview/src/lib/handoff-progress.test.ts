@@ -120,7 +120,7 @@ describe('handoff progress labels', () => {
 });
 
 describe('canRequestRuntimeHandoff', () => {
-  it('allows idle open tasks without an in-flight handoff', () => {
+  it('allows any open task — including busy runtime and in-flight handoff chrome', () => {
     expect(canRequestRuntimeHandoff(baseTask)).toBe(true);
     expect(
       canRequestRuntimeHandoff({
@@ -134,44 +134,43 @@ describe('canRequestRuntimeHandoff', () => {
         handoffProgress: { ...baseProgress, phase: 'failed' },
       }),
     ).toBe(true);
-  });
-
-  it('refuses missing tasks, non-open lifecycle, busy runtime, and in-flight handoff', () => {
-    expect(canRequestRuntimeHandoff(undefined)).toBe(false);
-    expect(canRequestRuntimeHandoff(null)).toBe(false);
-    expect(canRequestRuntimeHandoff({ ...baseTask, lifecycle: 'succeeded' })).toBe(false);
-    expect(canRequestRuntimeHandoff({ ...baseTask, lifecycle: 'failed' })).toBe(false);
     expect(
       canRequestRuntimeHandoff({
         ...baseTask,
         runtimeActivity: 'running',
         viewStatus: 'running',
       }),
-    ).toBe(false);
+    ).toBe(true);
     expect(
       canRequestRuntimeHandoff({
         ...baseTask,
         runtimeActivity: 'waiting_user',
         viewStatus: 'waiting_user',
       }),
-    ).toBe(false);
+    ).toBe(true);
     expect(
       canRequestRuntimeHandoff({
         ...baseTask,
         handoffProgress: baseProgress,
       }),
-    ).toBe(false);
+    ).toBe(true);
     expect(
       canRequestRuntimeHandoff({
         ...baseTask,
         handoffProgress: { ...baseProgress, phase: 'transferring' },
       }),
-    ).toBe(false);
+    ).toBe(true);
+  });
+
+  it('refuses missing tasks and non-open lifecycle only', () => {
+    expect(canRequestRuntimeHandoff(undefined)).toBe(false);
+    expect(canRequestRuntimeHandoff(null)).toBe(false);
+    expect(canRequestRuntimeHandoff({ ...baseTask, lifecycle: 'succeeded' })).toBe(false);
+    expect(canRequestRuntimeHandoff({ ...baseTask, lifecycle: 'failed' })).toBe(false);
   });
 
   it('never treats same-binding checks as a chrome concern (host refuses)', () => {
     // Webview may post a same-binding pick; host route refuses with commandError.
-    // canRequest only gates idle/open/in-flight — not source===target equality.
     expect(
       canRequestRuntimeHandoff({
         ...baseTask,

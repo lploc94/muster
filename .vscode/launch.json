@@ -7,7 +7,25 @@
       "request": "launch",
       "args": ["--extensionDevelopmentPath=${workspaceFolder}"],
       "outFiles": ["${workspaceFolder}/dist/**/*.js"],
-      "preLaunchTask": "${defaultBuildTask}"
+      "preLaunchTask": "compile",
+      "presentation": {
+        "hidden": false,
+        "group": "muster",
+        "order": 1
+      }
+    },
+    {
+      "name": "Run Extension (watch)",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": ["--extensionDevelopmentPath=${workspaceFolder}"],
+      "outFiles": ["${workspaceFolder}/dist/**/*.js"],
+      "preLaunchTask": "watch-all",
+      "presentation": {
+        "hidden": false,
+        "group": "muster",
+        "order": 2
+      }
     }
   ]
 }

@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { buildSnapshot, buildTranscript } from '../host/snapshot';
 import { renderTaskMarkdownExport } from '../host/task-markdown-export';
 import type { Backend, BackendCapabilities, NormalizedEvent, RunOptions } from '../types';
@@ -223,6 +223,33 @@ describe('engine-handoff helpers', () => {
     const collected = await collectInternalSummaryTurnText(stream());
     expect(collected.text).toBe('part-a part-b');
     expect(collected.errorMessage).toBeUndefined();
+  });
+
+  it('treats cancellation, errors, and missing turnCompleted as summary failures', async () => {
+    async function* cancelled(): AsyncIterable<NormalizedEvent> {
+      yield { type: 'assistantDelta', content: 'partial', messageId: 'x' };
+      yield { type: 'error', message: 'user stop', isCancellation: true };
+    }
+    async function* incomplete(): AsyncIterable<NormalizedEvent> {
+      yield { type: 'assistantDelta', content: 'partial only', messageId: 'x' };
+    }
+    async function* failed(): AsyncIterable<NormalizedEvent> {
+      yield { type: 'assistantDelta', content: 'partial', messageId: 'x' };
+      yield { type: 'error', message: 'backend died' };
+    }
+
+    await expect(collectInternalSummaryTurnText(cancelled())).resolves.toEqual({
+      text: 'partial',
+      errorMessage: 'user stop',
+    });
+    await expect(collectInternalSummaryTurnText(incomplete())).resolves.toEqual({
+      text: 'partial only',
+      errorMessage: 'source summary ended without completion',
+    });
+    await expect(collectInternalSummaryTurnText(failed())).resolves.toEqual({
+      text: 'partial',
+      errorMessage: 'backend died',
+    });
   });
 
   it('advances through summarizing_source with ready summary to preparing_receiver', () => {
@@ -547,12 +574,16 @@ describe('HandoffPackage (S03 T01)', () => {
   });
 });
 
-describe('TaskEngine.requestRuntimeHandoff (skip-summary path)', () => {
+describe('TaskEngine.requestRuntimeHandoff (always best-effort summary)', () => {
   it('starts handoff, exports conversation metadata, and reaches preparing_receiver without rebinding', async () => {
     const { store, taskId } = seedIdleTaskWithMessages();
     const engine = TaskEngine.load({
       store,
       makeBackend: () => scriptedBackend(),
+      // Empty summary stream → unavailable; conversation still ready.
+      runTurn: async function* () {
+        yield { type: 'turnCompleted' };
+      },
       clock: () => '2026-07-14T10:10:00.000Z',
     });
 
@@ -561,7 +592,6 @@ describe('TaskEngine.requestRuntimeHandoff (skip-summary path)', () => {
       taskId,
       targetBackend: 'codex',
       targetModel: 'gpt-5',
-      skipSummary: true,
     });
 
     expect(result.ok).toBe(true);
@@ -573,7 +603,8 @@ describe('TaskEngine.requestRuntimeHandoff (skip-summary path)', () => {
     expect(task.handoff).toBeDefined();
     expect(task.handoff!.phase).toBe('preparing_receiver');
     expect(task.handoff!.conversationContext.status).toBe('ready');
-    expect(task.handoff!.sourceSummary?.status).toBe('skipped');
+    // Product always attempts summary; empty/fail becomes unavailable, not a skip flag.
+    expect(task.handoff!.sourceSummary?.status).toBe('unavailable');
     expect(task.handoff!.source.backend).toBe(before.backend);
     expect(task.handoff!.source.model).toBe(before.model);
     expect(task.handoff!.source.sessionId).toBe(before.committedSessionId);
@@ -605,7 +636,6 @@ describe('TaskEngine.requestRuntimeHandoff (skip-summary path)', () => {
     const result = await engine.requestRuntimeHandoff({
       taskId: 'missing',
       targetBackend: 'codex',
-      skipSummary: true,
     });
     expect(result.ok).toBe(false);
     if (result.ok) {
@@ -615,13 +645,17 @@ describe('TaskEngine.requestRuntimeHandoff (skip-summary path)', () => {
     expect(store.getFile().revision).toBe(beforeRevision);
   });
 
-  it('fails closed when a live turn is present', async () => {
+  it('interrupts a live turn and still starts handoff (does not wait)', async () => {
     const { store, taskId } = seedIdleTaskWithMessages();
     // Load the engine first — load-time orphan recovery can settle pre-existing
     // running turns. Seed the live turn after load so the gate sees it.
     const engine = TaskEngine.load({
       store,
       makeBackend: () => scriptedBackend(),
+      runTurn: async function* () {
+        yield { type: 'error', message: 'summary unavailable during preempt proof' };
+      },
+      clock: () => '2026-07-14T10:05:00.000Z',
     });
     store.commit((draft) => {
       draft.turns['live-1'] = {
@@ -640,18 +674,17 @@ describe('TaskEngine.requestRuntimeHandoff (skip-summary path)', () => {
     const result = await engine.requestRuntimeHandoff({
       taskId,
       targetBackend: 'codex',
-      skipSummary: true,
     });
-    expect(result.ok).toBe(false);
-    if (result.ok) {
-      throw new Error('expected failure');
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      throw new Error(result.reason);
     }
-    expect(result.reason).toMatch(/live|running|active turn/i);
     const after = store.getTask(taskId)!;
+    expect(after.handoff?.phase).toBe('preparing_receiver');
     expect(after.backend).toBe(before.backend);
     expect(after.model).toBe(before.model);
     expect(after.committedSessionId).toBe(before.committedSessionId);
-    expect(after.handoff).toBeUndefined();
+    expect(store.getFile().turns['live-1']?.status).toBe('interrupted');
   });
 
   it('fails closed when an active handoff already exists', async () => {
@@ -678,7 +711,6 @@ describe('TaskEngine.requestRuntimeHandoff (skip-summary path)', () => {
     const result = await engine.requestRuntimeHandoff({
       taskId,
       targetBackend: 'codex',
-      skipSummary: true,
     });
     expect(result.ok).toBe(false);
     if (result.ok) {
@@ -709,7 +741,6 @@ describe('TaskEngine.requestRuntimeHandoff (skip-summary path)', () => {
     const result = await engine.requestRuntimeHandoff({
       taskId,
       targetBackend: 'legacy',
-      skipSummary: true,
     });
     expect(result.ok).toBe(false);
     if (result.ok) {
@@ -756,7 +787,6 @@ describe('TaskEngine.requestRuntimeHandoff (hidden source-summary path)', () => 
       taskId,
       targetBackend: 'codex',
       targetModel: 'gpt-5',
-      skipSummary: false,
     });
 
     expect(result.ok).toBe(true);
@@ -823,7 +853,6 @@ describe('TaskEngine.requestRuntimeHandoff (hidden source-summary path)', () => 
     const result = await engine.requestRuntimeHandoff({
       taskId,
       targetBackend: 'codex',
-      skipSummary: false,
     });
 
     expect(result.ok).toBe(true);
@@ -858,7 +887,6 @@ describe('TaskEngine.requestRuntimeHandoff (hidden source-summary path)', () => 
     const result = await engine.requestRuntimeHandoff({
       taskId,
       targetBackend: 'codex',
-      skipSummary: false,
     });
 
     expect(result.ok).toBe(true);
@@ -890,7 +918,6 @@ describe('TaskEngine.requestRuntimeHandoff isolation + fail-closed gates (S02 de
       taskId,
       targetBackend: 'codex',
       targetModel: 'gpt-5',
-      skipSummary: true,
     });
     expect(result.ok).toBe(true);
     if (!result.ok) throw new Error(result.reason);
@@ -910,6 +937,78 @@ describe('TaskEngine.requestRuntimeHandoff isolation + fail-closed gates (S02 de
     expect(after.committedSessionId).toBe('sess-source-hold');
     expect(after.handoff?.target.backend).toBe('codex');
     expect(after.handoff?.target.model).toBe('gpt-5');
+  });
+
+  it('reload during summarizing_source auto-completes conversation-only transfer', async () => {
+    const SOURCE_SESSION = 'sess-source-mid-summary';
+    const TARGET_SESSION = 'sess-target-after-orphan-summary';
+    const { store, taskId, filePath } = seedIdleTaskWithMessages({
+      backend: 'claude-cli',
+      model: 'sonnet',
+      sessionId: SOURCE_SESSION,
+    });
+
+    // Seed an orphaned summarizing_source reservation as if the process died
+    // after reserveCommit and before summary completion.
+    store.commit((draft) => {
+      const task = draft.tasks[taskId];
+      if (!task) return { ok: false, reason: 'missing' };
+      draft.tasks[taskId] = {
+        ...task,
+        handoff: {
+          version: 1,
+          operationId: 'op-orphan-summary',
+          phase: 'summarizing_source',
+          source: {
+            backend: 'claude-cli',
+            model: 'sonnet',
+            sessionId: SOURCE_SESSION,
+          },
+          target: { backend: 'codex', model: 'gpt-5' },
+          conversationContext: {
+            status: 'ready',
+            messageCount: 2,
+            contentDigest: 'deadbeefdeadbeefdeadbeefdeadbeef',
+            exportedAt: '2026-07-14T10:40:00.000Z',
+          },
+          sourceSummary: { status: 'pending' },
+          createdAt: '2026-07-14T10:40:00.000Z',
+          updatedAt: '2026-07-14T10:40:00.000Z',
+          startedAt: '2026-07-14T10:40:00.000Z',
+        },
+        revision: task.revision + 1,
+        updatedAt: '2026-07-14T10:40:00.000Z',
+      };
+      return { ok: true };
+    });
+
+    const reloadedStore = TaskStore.load({ filePath });
+    const captured: RunOptions[] = [];
+    TaskEngine.load({
+      store: reloadedStore,
+      makeBackend: (name) => scriptedBackend([], MCP_CAPS, name),
+      runTurn: async function* (_backend: Backend, options: RunOptions) {
+        captured.push(options);
+        // Must not re-query source summary after reload; only receiver bootstrap.
+        yield { type: 'sessionStarted', sessionId: TARGET_SESSION };
+        yield { type: 'turnCompleted' };
+      },
+      clock: () => '2026-07-14T10:41:00.000Z',
+    });
+
+    // Product recovery is automatic on load — no manual completeRuntimeHandoff.
+    await vi.waitFor(() => {
+      const task = reloadedStore.getTask(taskId)!;
+      expect(task.handoff?.phase).toBe('completed');
+      expect(task.backend).toBe('codex');
+      expect(task.committedSessionId).toBe(TARGET_SESSION);
+    });
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].resumeId).toBeUndefined();
+    expect(captured[0].prompt).toContain('muster-handoff-package/v1');
+    expect(captured[0].prompt).toMatch(/conversation only|no source summary|without a source summary/i);
+    expect(captured[0].prompt).not.toBe(HANDOFF_SOURCE_SUMMARY_PROMPT);
   });
 
   it('hides handoff metadata from snapshot and markdown export projections', async () => {
@@ -939,7 +1038,6 @@ describe('TaskEngine.requestRuntimeHandoff isolation + fail-closed gates (S02 de
       taskId,
       targetBackend: 'codex',
       targetModel: 'gpt-5',
-      skipSummary: false,
     });
     expect(result.ok).toBe(true);
     if (!result.ok) throw new Error(result.reason);
@@ -994,11 +1092,15 @@ describe('TaskEngine.requestRuntimeHandoff isolation + fail-closed gates (S02 de
     }
   });
 
-  it('fails closed when a queued turn is present without mutating binding', async () => {
+  it('holds queued turns during handoff without rebinding', async () => {
     const { store, taskId } = seedIdleTaskWithMessages();
     const engine = TaskEngine.load({
       store,
       makeBackend: () => scriptedBackend(),
+      runTurn: async function* () {
+        yield { type: 'error', message: 'summary unavailable during queue preempt' };
+      },
+      clock: () => '2026-07-14T10:07:00.000Z',
     });
     store.commit((draft) => {
       draft.turns['queued-1'] = {
@@ -1016,23 +1118,29 @@ describe('TaskEngine.requestRuntimeHandoff isolation + fail-closed gates (S02 de
     const result = await engine.requestRuntimeHandoff({
       taskId,
       targetBackend: 'codex',
-      skipSummary: true,
     });
-    expect(result.ok).toBe(false);
-    if (result.ok) throw new Error('expected failure');
-    expect(result.reason).toMatch(/live|active turn|queued/i);
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.reason);
     const after = store.getTask(taskId)!;
+    expect(after.handoff?.phase).toBe('preparing_receiver');
     expect(after.backend).toBe(before.backend);
     expect(after.model).toBe(before.model);
     expect(after.committedSessionId).toBe(before.committedSessionId);
-    expect(after.handoff).toBeUndefined();
+    const held = store.getFile().turns['queued-1'];
+    expect(held?.status).toBe('queued');
+    // Handoff must not set holdAutoPromote (MEM030 failure-safety only).
+    expect(held?.holdAutoPromote).toBeUndefined();
   });
 
-  it('fails closed when a waiting_user turn is present without mutating binding', async () => {
+  it('interrupts waiting_user turns and still starts handoff without rebinding', async () => {
     const { store, taskId } = seedIdleTaskWithMessages();
     const engine = TaskEngine.load({
       store,
       makeBackend: () => scriptedBackend(),
+      runTurn: async function* () {
+        yield { type: 'error', message: 'summary unavailable during wait preempt' };
+      },
+      clock: () => '2026-07-14T10:06:00.000Z',
     });
     store.commit((draft) => {
       draft.turns['wait-1'] = {
@@ -1051,16 +1159,66 @@ describe('TaskEngine.requestRuntimeHandoff isolation + fail-closed gates (S02 de
     const result = await engine.requestRuntimeHandoff({
       taskId,
       targetBackend: 'codex',
-      skipSummary: true,
     });
-    expect(result.ok).toBe(false);
-    if (result.ok) throw new Error('expected failure');
-    expect(result.reason).toMatch(/live|active turn/i);
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.reason);
     const after = store.getTask(taskId)!;
+    expect(after.handoff?.phase).toBe('preparing_receiver');
     expect(after.backend).toBe(before.backend);
     expect(after.model).toBe(before.model);
     expect(after.committedSessionId).toBe(before.committedSessionId);
-    expect(after.handoff).toBeUndefined();
+    expect(store.getFile().turns['wait-1']?.status).toBe('interrupted');
+  });
+
+  it('writes interrupt cancelRequests for remote-owned live turns during handoff preempt', async () => {
+    const { store, taskId, filePath } = seedIdleTaskWithMessages();
+    // Fake a lease owned by a different live process (pid 1 is typically always alive).
+    const remoteTurnId = 'remote-live-1';
+    fs.writeFileSync(
+      `${filePath}.lease.${remoteTurnId}`,
+      JSON.stringify({
+        pid: 1,
+        token: 'remote-owner',
+        createdAt: new Date().toISOString(),
+      }),
+      'utf8',
+    );
+    store.commit((draft) => {
+      draft.turns[remoteTurnId] = {
+        id: remoteTurnId,
+        taskId,
+        sequence: 1,
+        trigger: 'user',
+        status: 'running',
+        inputs: [],
+        createdAt: '2026-07-14T10:00:00.000Z',
+        startedAt: '2026-07-14T10:00:01.000Z',
+      };
+      return { ok: true };
+    });
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => scriptedBackend(),
+      runTurn: async function* () {
+        yield { type: 'error', message: 'summary unavailable during remote preempt' };
+      },
+      clock: () => '2026-07-14T10:08:00.000Z',
+    });
+    const result = await engine.requestRuntimeHandoff({
+      taskId,
+      targetBackend: 'codex',
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.reason);
+    expect(store.getFile().turns[remoteTurnId]?.status).toBe('interrupted');
+    const cancel = store.getFile().cancelRequests?.[remoteTurnId];
+    expect(cancel?.kind).toBe('interrupt');
+    expect(cancel?.by).toBe('engine');
+    try {
+      fs.unlinkSync(`${filePath}.lease.${remoteTurnId}`);
+    } catch {
+      // best-effort
+    }
   });
 
   it('fails closed when target backend factory throws without mutating binding', async () => {
@@ -1078,7 +1236,6 @@ describe('TaskEngine.requestRuntimeHandoff isolation + fail-closed gates (S02 de
     const result = await engine.requestRuntimeHandoff({
       taskId,
       targetBackend: 'missing-cli',
-      skipSummary: true,
     });
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error('expected failure');
@@ -1119,7 +1276,6 @@ describe('TaskEngine.requestRuntimeHandoff isolation + fail-closed gates (S02 de
       taskId,
       targetBackend: 'codex',
       targetModel: 'gpt-5.1',
-      skipSummary: false,
     });
     expect(result.ok).toBe(true);
     if (!result.ok) throw new Error(result.reason);
@@ -1181,7 +1337,6 @@ describe('TaskEngine.completeRuntimeHandoff (S03 T02)', () => {
       taskId,
       targetBackend: 'codex',
       targetModel: 'gpt-5',
-      skipSummary: false,
     });
     expect(requested.ok).toBe(true);
     if (!requested.ok) throw new Error(requested.reason);
@@ -1237,6 +1392,44 @@ describe('TaskEngine.completeRuntimeHandoff (S03 T02)', () => {
     }
   });
 
+  it('fails receiver init when stream ends without turnCompleted', async () => {
+    const SOURCE_SESSION = 'sess-source-incomplete';
+    const { store, taskId } = seedIdleTaskWithMessages({
+      backend: 'claude-cli',
+      model: 'sonnet',
+      sessionId: SOURCE_SESSION,
+    });
+    let clock = '2026-07-14T11:10:00.000Z';
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: (name) => scriptedBackend([], MCP_CAPS, name),
+      runTurn: async function* (backend: Backend, options: RunOptions) {
+        if (options.prompt === HANDOFF_SOURCE_SUMMARY_PROMPT) {
+          yield { type: 'turnCompleted' };
+          return;
+        }
+        // Session opens but never completes — must not rebind.
+        yield { type: 'sessionStarted', sessionId: 'sess-orphan-target' };
+      },
+      clock: () => clock,
+    });
+    const requested = await engine.requestRuntimeHandoff({
+      taskId,
+      targetBackend: 'codex',
+    });
+    expect(requested.ok).toBe(true);
+    clock = '2026-07-14T11:10:01.000Z';
+    const transferred = await engine.completeRuntimeHandoff({ taskId });
+    expect(transferred.ok).toBe(false);
+    if (transferred.ok) throw new Error('expected incomplete receiver to fail');
+    expect(transferred.reason).toMatch(/without completion|cancelled|failed/i);
+    const after = store.getTask(taskId)!;
+    expect(after.backend).toBe('claude-cli');
+    expect(after.model).toBe('sonnet');
+    expect(after.committedSessionId).toBe(SOURCE_SESSION);
+    expect(after.handoff?.phase).toBe('failed');
+  });
+
   it('keeps source binding when receiver init fails and records handoff.failure', async () => {
     const SOURCE_SESSION = 'sess-source-fail';
     const { store, taskId } = seedIdleTaskWithMessages({
@@ -1260,7 +1453,6 @@ describe('TaskEngine.completeRuntimeHandoff (S03 T02)', () => {
       taskId,
       targetBackend: 'codex',
       targetModel: 'gpt-5',
-      skipSummary: true,
     });
     expect(requested.ok).toBe(true);
     if (!requested.ok) throw new Error(requested.reason);
@@ -1281,7 +1473,7 @@ describe('TaskEngine.completeRuntimeHandoff (S03 T02)', () => {
     expect(after.handoff?.failure?.message).toMatch(/refused bootstrap/i);
   });
 
-  it('conversation-only transfer works when summary text was skipped', async () => {
+  it('conversation-only transfer works when source summary is unavailable', async () => {
     const TARGET_SESSION = 'sess-target-conv-only';
     const { store, taskId } = seedIdleTaskWithMessages();
     const captured: RunOptions[] = [];
@@ -1291,6 +1483,11 @@ describe('TaskEngine.completeRuntimeHandoff (S03 T02)', () => {
       makeBackend: (name) => scriptedBackend([], MCP_CAPS, name),
       runTurn: async function* (_backend: Backend, options: RunOptions) {
         captured.push(options);
+        if (options.prompt === HANDOFF_SOURCE_SUMMARY_PROMPT) {
+          // Source CLI fails to produce summary → conversation-only transfer.
+          yield { type: 'error', message: 'source summary refused' };
+          return;
+        }
         yield { type: 'sessionStarted', sessionId: TARGET_SESSION };
         yield { type: 'turnCompleted' };
       },
@@ -1300,20 +1497,22 @@ describe('TaskEngine.completeRuntimeHandoff (S03 T02)', () => {
     const requested = await engine.requestRuntimeHandoff({
       taskId,
       targetBackend: 'codex',
-      skipSummary: true,
     });
     expect(requested.ok).toBe(true);
     if (!requested.ok) throw new Error(requested.reason);
+    expect(store.getTask(taskId)!.handoff!.sourceSummary?.status).toBe('unavailable');
 
     clock = '2026-07-14T11:21:00.000Z';
     const transferred = await engine.completeRuntimeHandoff({ taskId });
     expect(transferred.ok).toBe(true);
     if (!transferred.ok) throw new Error(transferred.reason);
     expect(transferred.value.boundSessionId).toBe(TARGET_SESSION);
-    expect(captured).toHaveLength(1);
-    expect(captured[0].resumeId).toBeUndefined();
-    expect(captured[0].prompt).toContain('muster-handoff-package/v1');
-    expect(captured[0].prompt).toMatch(/conversation only|no source summary|without a source summary/i);
+    // Always attempt summary (1) then receiver bootstrap (2).
+    expect(captured).toHaveLength(2);
+    expect(captured[0].prompt).toBe(HANDOFF_SOURCE_SUMMARY_PROMPT);
+    expect(captured[1].resumeId).toBeUndefined();
+    expect(captured[1].prompt).toContain('muster-handoff-package/v1');
+    expect(captured[1].prompt).toMatch(/conversation only|no source summary|without a source summary/i);
     expect(store.getTask(taskId)!.backend).toBe('codex');
     expect(store.getTask(taskId)!.committedSessionId).toBe(TARGET_SESSION);
   });
@@ -1354,7 +1553,6 @@ describe('TaskEngine.completeRuntimeHandoff (S03 T03 proof)', () => {
       taskId,
       targetBackend: 'codex',
       targetModel: 'gpt-5',
-      skipSummary: false,
     });
     expect(requested.ok).toBe(true);
     if (!requested.ok) throw new Error(requested.reason);
@@ -1373,7 +1571,7 @@ describe('TaskEngine.completeRuntimeHandoff (S03 T03 proof)', () => {
     expect(reloadedTask.committedSessionId).toBe(SOURCE_SESSION);
 
     const transferCaptured: Array<{ backend: string; options: RunOptions }> = [];
-    const secondEngine = TaskEngine.load({
+    TaskEngine.load({
       store: reloaded,
       makeBackend: (name) => scriptedBackend([], MCP_CAPS, name),
       runTurn: async function* (backend: Backend, options: RunOptions) {
@@ -1385,15 +1583,15 @@ describe('TaskEngine.completeRuntimeHandoff (S03 T03 proof)', () => {
       clock: () => '2026-07-14T12:05:00.000Z',
     });
 
-    const transferred = await secondEngine.completeRuntimeHandoff({
-      taskId,
-      operationId: requested.value.operationId,
+    // Product recovery auto-completes preparing_receiver on load.
+    await vi.waitFor(() => {
+      const after = reloaded.getTask(taskId)!;
+      expect(after.handoff?.phase).toBe('completed');
+      expect(after.backend).toBe('codex');
+      expect(after.model).toBe('gpt-5');
+      expect(after.committedSessionId).toBe(TARGET_SESSION);
     });
-    expect(transferred.ok).toBe(true);
-    if (!transferred.ok) throw new Error(transferred.reason);
 
-    expect(transferred.value.boundSessionId).toBe(TARGET_SESSION);
-    expect(transferred.value.boundBackend).toBe('codex');
     // Exactly one receiver init — no hidden source-summary re-query after reload.
     expect(transferCaptured).toHaveLength(1);
     expect(transferCaptured[0].backend).toBe('codex');
@@ -1409,9 +1607,6 @@ describe('TaskEngine.completeRuntimeHandoff (S03 T03 proof)', () => {
     expect(transferCaptured[0].options.prompt).not.toBe(HANDOFF_SOURCE_SUMMARY_PROMPT);
 
     const after = reloaded.getTask(taskId)!;
-    expect(after.backend).toBe('codex');
-    expect(after.model).toBe('gpt-5');
-    expect(after.committedSessionId).toBe(TARGET_SESSION);
     expect(after.committedSessionId).not.toBe(SOURCE_SESSION);
     expect(after.handoff?.phase).toBe('completed');
   });
@@ -1450,6 +1645,10 @@ describe('TaskEngine.completeRuntimeHandoff (S03 T03 proof)', () => {
         makeBackend: (name) => scriptedBackend([], MCP_CAPS, name),
         runTurn: async function* (_backend: Backend, options: RunOptions) {
           captured.push(options);
+          if (options.prompt === HANDOFF_SOURCE_SUMMARY_PROMPT) {
+            yield { type: 'error', message: 'summary unavailable for isolation proof' };
+            return;
+          }
           yield { type: 'sessionStarted', sessionId: targetSession };
           yield { type: 'turnCompleted' };
         },
@@ -1459,7 +1658,6 @@ describe('TaskEngine.completeRuntimeHandoff (S03 T03 proof)', () => {
         taskId,
         targetBackend: 'codex',
         targetModel: 'gpt-5',
-        skipSummary: true,
       });
       expect(requested.ok).toBe(true);
       if (!requested.ok) throw new Error(requested.reason);
@@ -1470,9 +1668,10 @@ describe('TaskEngine.completeRuntimeHandoff (S03 T03 proof)', () => {
       expect(transferred.value.boundSessionId).toBe(targetSession);
       expect(transferred.value.boundSessionId).not.toBe(sourceSession);
       expect(store.getTask(taskId)!.committedSessionId).toBe(targetSession);
-      expect(captured).toHaveLength(1);
-      expect(captured[0].resumeId).toBeUndefined();
-      return captured[0];
+      // Summary attempt + receiver bootstrap; only bootstrap is returned for session checks.
+      expect(captured).toHaveLength(2);
+      expect(captured[1].resumeId).toBeUndefined();
+      return captured[1];
     }
 
     const optsA = await transferTask(storeA, taskA, SOURCE_A, TARGET_A);
@@ -1534,7 +1733,6 @@ describe('TaskEngine.completeRuntimeHandoff (S03 T03 proof)', () => {
       taskId,
       targetBackend: 'codex',
       targetModel: 'gpt-5',
-      skipSummary: false,
     });
     expect(requested.ok).toBe(true);
     if (!requested.ok) throw new Error(requested.reason);

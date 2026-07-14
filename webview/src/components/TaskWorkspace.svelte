@@ -230,6 +230,38 @@
   const handoffProgress = $derived(focused?.handoffProgress);
   const handoffInFlight = $derived(isHandoffProgressInFlight(handoffProgress));
   const handoffTerminal = $derived(isHandoffTerminal(handoffProgress?.phase));
+  /** Auto-dismiss terminal "Switch complete" after a short toast window. */
+  let handoffTerminalDismissed = $state(false);
+  let handoffTerminalDismissTimer: ReturnType<typeof setTimeout> | undefined;
+  $effect(() => {
+    const phase = handoffProgress?.phase;
+    const op = handoffProgress?.operationId;
+    if (handoffTerminalDismissTimer) {
+      clearTimeout(handoffTerminalDismissTimer);
+      handoffTerminalDismissTimer = undefined;
+    }
+    if (phase === 'completed' || phase === 'cancelled') {
+      handoffTerminalDismissed = false;
+      handoffTerminalDismissTimer = setTimeout(() => {
+        handoffTerminalDismissed = true;
+      }, 2800);
+    } else if (phase === 'failed') {
+      // Keep failure visible longer so the user can read the reason.
+      handoffTerminalDismissed = false;
+      handoffTerminalDismissTimer = setTimeout(() => {
+        handoffTerminalDismissed = true;
+      }, 8000);
+    } else {
+      handoffTerminalDismissed = false;
+    }
+    return () => {
+      if (handoffTerminalDismissTimer) clearTimeout(handoffTerminalDismissTimer);
+    };
+  });
+  const showHandoffChrome = $derived(
+    !!handoffProgress &&
+      (handoffInFlight || (handoffTerminal && !handoffTerminalDismissed)),
+  );
   const handoffChromeLabel = $derived(
     handoffProgress ? formatHandoffProgressLabel(handoffProgress) : '',
   );
@@ -374,7 +406,7 @@
       </div>
     </div>
 
-    {#if handoffProgress && (handoffInFlight || handoffTerminal)}
+    {#if showHandoffChrome && handoffProgress}
       <div
         class={`turn-activity-bar turn-activity-bar--${handoffChromeTone} handoff-progress-bar`}
         data-testid="handoff-progress"

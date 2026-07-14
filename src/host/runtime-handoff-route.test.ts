@@ -61,15 +61,50 @@ describe('parseRequestRuntimeHandoffMessage', () => {
       taskId: 'task-1',
       targetBackend: 'codex',
       targetModel: 'gpt-5',
-      skipSummary: true,
     });
     expect(parsed).toEqual({
       ok: true,
       taskId: 'task-1',
       targetBackend: 'codex',
       targetModel: 'gpt-5',
-      skipSummary: true,
     });
+  });
+
+  it('accepts provider/model ids with slash (opencode catalog)', () => {
+    const parsed = parseRequestRuntimeHandoffMessage({
+      type: 'requestRuntimeHandoff',
+      taskId: 'task-1',
+      targetBackend: 'opencode',
+      targetModel: 'opencode-go/deepseek-v4-flash',
+    });
+    expect(parsed).toEqual({
+      ok: true,
+      taskId: 'task-1',
+      targetBackend: 'opencode',
+      targetModel: 'opencode-go/deepseek-v4-flash',
+    });
+  });
+
+  it('rejects control-byte model labels; empty model is omitted', () => {
+    const empty = parseRequestRuntimeHandoffMessage({
+      type: 'requestRuntimeHandoff',
+      taskId: 'task-1',
+      targetBackend: 'opencode',
+      targetModel: '',
+    });
+    expect(empty).toEqual({
+      ok: true,
+      taskId: 'task-1',
+      targetBackend: 'opencode',
+    });
+    expect(
+      parseRequestRuntimeHandoffMessage({
+        type: 'requestRuntimeHandoff',
+        taskId: 'task-1',
+        targetBackend: 'opencode',
+        targetModel: 'bad\0model',
+      }).ok,
+    ).toBe(false);
   });
 
   it('rejects missing/empty/oversized/null-byte ids and backends', () => {
@@ -137,7 +172,6 @@ describe('routeRuntimeHandoff', () => {
       taskId: 'task-1',
       targetBackend: 'codex',
       targetModel: 'gpt-5',
-      skipSummary: true,
     });
     expect(afterRequest).toHaveBeenCalledWith('task-1');
     expect(complete).toHaveBeenCalledTimes(1);
@@ -295,34 +329,22 @@ describe('routeRuntimeHandoff', () => {
     }
   });
 
-  it('defaults skipSummary to true so the host does not force a hidden summary turn', async () => {
+  it('always requests handoff without a skipSummary product flag', async () => {
     const { deps, request } = makeDeps();
     await routeRuntimeHandoff(
       {
         type: 'requestRuntimeHandoff',
         taskId: 'task-1',
         targetBackend: 'codex',
+        // Legacy field must be ignored if a stale client still sends it.
+        skipSummary: true,
       },
       deps,
     );
-    expect(request).toHaveBeenCalledWith(
-      expect.objectContaining({ skipSummary: true }),
-    );
-  });
-
-  it('forwards explicit skipSummary: false when requested', async () => {
-    const { deps, request } = makeDeps();
-    await routeRuntimeHandoff(
-      {
-        type: 'requestRuntimeHandoff',
-        taskId: 'task-1',
-        targetBackend: 'codex',
-        skipSummary: false,
-      },
-      deps,
-    );
-    expect(request).toHaveBeenCalledWith(
-      expect.objectContaining({ skipSummary: false }),
-    );
+    expect(request).toHaveBeenCalledWith({
+      taskId: 'task-1',
+      targetBackend: 'codex',
+    });
+    expect(request.mock.calls[0][0]).not.toHaveProperty('skipSummary');
   });
 });

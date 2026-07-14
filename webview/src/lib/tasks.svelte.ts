@@ -60,6 +60,16 @@ class TasksState {
 
   commandError = $state<CommandErrorState | null>(null);
 
+  /**
+   * Optimistic picker target while a handoff is in flight so the select does
+   * not snap back to the old task binding before snapshot confirms rebind.
+   */
+  pendingHandoffTarget = $state<{
+    taskId: string;
+    backend: string;
+    model?: string;
+  } | null>(null);
+
   /** Transient success/status notice (live-input delivered, etc.). */
   commandNotice = $state<CommandNoticeState | null>(null);
 
@@ -271,6 +281,7 @@ class TasksState {
       this.draftMode = false;
       this.continuationOf = null;
       this.queuedTurns = sortQueuedTurns(snapshot.queuedTurns ?? []);
+      this.reconcilePendingHandoffTarget(snapshot.focusedTaskId);
     } else if (!this.draftMode) {
       this.queuedTurns = [];
     }
@@ -306,12 +317,35 @@ class TasksState {
     } else if (this.focusedTaskId && this.subtree.some((t) => t.id === taskId)) {
       this.subtree = this.subtree.map((t) => (t.id === taskId ? merged : t));
     }
+    this.reconcilePendingHandoffTarget(taskId);
   }
 
   setCommandError(message: string | null, taskId: string | null = null): void {
     this.commandError = message ? { taskId, message } : null;
     // A refusal/error supersedes any prior success notice for the same chrome.
-    if (message) this.commandNotice = null;
+    if (message) {
+      this.commandNotice = null;
+      // Handoff refusal: drop optimistic picker target so UI snaps back to task binding.
+      this.clearPendingHandoffTarget(taskId ?? undefined);
+    }
+  }
+
+  private reconcilePendingHandoffTarget(taskId: string): void {
+    const pending = this.pendingHandoffTarget;
+    if (!pending || pending.taskId !== taskId) return;
+    const task = this.tasks.get(taskId);
+    if (!task) return;
+    const taskModel =
+      typeof task.model === 'string' && task.model.trim() ? task.model.trim() : '';
+    const pendingModel = pending.model ?? '';
+    if (task.backend === pending.backend && taskModel === pendingModel) {
+      this.pendingHandoffTarget = null;
+      return;
+    }
+    // Terminal failed handoff: stop optimistic target.
+    if (task.handoffProgress?.phase === 'failed' || task.handoffProgress?.phase === 'cancelled') {
+      this.pendingHandoffTarget = null;
+    }
   }
 
   setCommandNotice(message: string | null, taskId: string | null = null): void {
@@ -351,22 +385,34 @@ class TasksState {
     targetModel?: string | null,
   ): void {
     this.setCommandError(null);
+    const model =
+      typeof targetModel === 'string' && targetModel.trim()
+        ? targetModel.trim()
+        : undefined;
+    this.pendingHandoffTarget = model
+      ? { taskId, backend: targetBackend, model }
+      : { taskId, backend: targetBackend };
     const message: {
       type: 'requestRuntimeHandoff';
       taskId: string;
       targetBackend: string;
       targetModel?: string;
-      skipSummary?: boolean;
     } = {
       type: 'requestRuntimeHandoff',
       taskId,
       targetBackend,
-      skipSummary: true,
     };
-    if (typeof targetModel === 'string' && targetModel.trim()) {
-      message.targetModel = targetModel.trim();
+    if (model) {
+      message.targetModel = model;
     }
+    post({ type: 'debugLog', event: 'handoff.post_request', details: message });
     post(message);
+  }
+
+  clearPendingHandoffTarget(taskId?: string): void {
+    if (!this.pendingHandoffTarget) return;
+    if (taskId && this.pendingHandoffTarget.taskId !== taskId) return;
+    this.pendingHandoffTarget = null;
   }
 
   private seedWatermark(taskId: string, revision: number): void {

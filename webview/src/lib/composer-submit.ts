@@ -75,6 +75,12 @@ export interface TaskComposerMessageParams {
    * as the inject instruction.
    */
   llmText?: string;
+  /**
+   * Optional picker-selected backend/model for existing-task send. Host may
+   * hand off when these differ from the task binding before queuing the turn.
+   */
+  backend?: string;
+  model?: string | null;
 }
 
 /**
@@ -100,8 +106,22 @@ export function buildTaskComposerMessage(
     typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
       ? crypto.randomUUID()
       : `send-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  if (llmText !== text) {
-    return { type: 'send', taskId, text, llmText, clientRequestId };
-  }
-  return { type: 'send', taskId, text, clientRequestId };
+  const backend =
+    typeof params.backend === 'string' && params.backend.trim()
+      ? params.backend.trim()
+      : undefined;
+  const model =
+    typeof params.model === 'string' && params.model.trim()
+      ? params.model.trim()
+      : undefined;
+  const base: Extract<OutMessage, { type: 'send' }> = {
+    type: 'send',
+    taskId,
+    text,
+    clientRequestId,
+  };
+  if (llmText !== text) base.llmText = llmText;
+  if (backend) base.backend = backend;
+  if (model) base.model = model;
+  return base;
 }

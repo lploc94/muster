@@ -437,14 +437,14 @@ export type OutMessage =
       taskId: string;
       targetBackend: string;
       targetModel?: string;
-      /** When true (default on host), skip the optional hidden source-summary turn. */
-      skipSummary?: boolean;
     }
   | { type: 'blurTask' }
   | { type: 'requestSettings' }
   | { type: 'updateSetting'; settingId: RetentionSettingId; value: number }
   | { type: 'listBackends' }
   | { type: 'listModels' }
+  /** Webview → host debug line for Output channel "Muster Debug". */
+  | { type: 'debugLog'; event: string; details?: Record<string, unknown> }
   /**
    * Persist the composer's last-used backend/model on the host (globalState)
    * so the preference survives full restarts and webview recreation.
@@ -462,6 +462,20 @@ export type OutMessage =
 /** Post a typed message to the extension host. */
 export function post(message: OutMessage): void {
   vscode.postMessage(message);
+}
+
+/** Always visible in host Output → Muster Debug (not only DevTools). */
+export function postDebug(event: string, details: Record<string, unknown> = {}): void {
+  try {
+    vscode.postMessage({ type: 'debugLog', event, details });
+  } catch {
+    // best-effort
+  }
+  try {
+    console.info(`[muster]${event}`, details);
+  } catch {
+    // best-effort
+  }
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {

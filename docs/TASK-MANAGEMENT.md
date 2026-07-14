@@ -1365,7 +1365,7 @@ interface TaskHandoffState {
 | Field | Role |
 |-------|------|
 | `conversationContext` | **Required** export metadata (counts/digests only). Receiver setup depends on it. |
-| `sourceSummary` | **Optional.** Handoff may complete with summary `unavailable` / `skipped` when conversation context is ready. |
+| `sourceSummary` | **Best-effort.** Always attempted on product switch. `ready` when source CLI produces a summary; `unavailable` on CLI/summary failure (conversation-only transfer). |
 
 ### Store validation policy
 
@@ -1389,7 +1389,6 @@ engine.requestRuntimeHandoff({
   taskId: string;
   targetBackend: string;
   targetModel?: string;
-  skipSummary?: boolean; // default true
 }): Promise<EngineResult<{
   operationId: string;
   phase: TaskHandoffPhase;
@@ -1401,12 +1400,13 @@ engine.requestRuntimeHandoff({
 
 1. Validate fail-closed gates (below).
 2. Create `TaskHandoff` with `source` = current task binding (`backend` / `model` / `committedSessionId`) and `target` = requested backend/model.
-3. Export **required** conversation-context metadata (messageCount + contentDigest only) from existing `TaskMessage` rows.
-4. Optional source summary (`skipSummary: false`):
+3. Export **required** conversation-context metadata (messageCount + contentDigest only) from existing `TaskMessage` rows. Conversation history is **always** required for transfer.
+4. Source summary is **always attempted** (no product on/off flag):
    - Run a **hidden internal turn** via `makeBackend(source)` + private `runTurnFn` with a fixed handoff prompt and the source session/model.
    - Capture assistant text in memory, digest it into `sourceSummary.contentDigest`, discard raw text.
    - Never create `TaskMessage` / `TaskTurn` rows and never emit ordinary `EngineEvent`s.
-   - Summary error / empty / throw → `sourceSummary: unavailable` and **still** advance when conversation context is ready.
+   - Summary success → package carries **summary + conversation**.
+   - Summary error / empty / throw → `sourceSummary: unavailable` and transfer continues **conversation-only** (still completes the model switch).
 5. Persist `MusterTask.handoff` at phase `preparing_receiver`.
 6. **Do not** mutate `task.backend`, `task.model`, or `task.committedSessionId` — old runtime binding holds until receiver setup.
 
@@ -1415,7 +1415,7 @@ engine.requestRuntimeHandoff({
 | Condition | Behavior |
 |-----------|----------|
 | Missing task | Reject; store unchanged |
-| Live / queued / `waiting_user` turn | Reject |
+| Live / queued / `waiting_user` turn | **Preempt** — interrupt live turns immediately and **hold** queued turns (`holdAutoPromote`) so they promote after rebind; do **not** wait for the current turn to finish; then continue handoff |
 | Active (non-terminal) handoff already present | Reject |
 | Target backend factory throws | Reject (`target backend unavailable`) |
 | Target lacks MCP | Reject (`backend does not support MCP`) |
@@ -1467,7 +1467,7 @@ engine.completeRuntimeHandoff({
 
 **Happy path**
 
-1. Require idle task + handoff phase `preparing_receiver` (optional `operationId` must match).
+1. Require handoff phase `preparing_receiver` (optional `operationId` must match). Preempt any live/queued turns first (interrupt, do not wait).
 2. Advance `preparing_receiver` → `transferring` and persist.
 3. Rebuild `HandoffPackage` from current visible `TaskMessage` rows + optional in-process summary text for this `operationId` (D020).
 4. `makeBackend(target)` + `runTurn` with bootstrap prompt and **no** `resumeId` / source session id (D021).
@@ -1491,7 +1491,7 @@ engine.completeRuntimeHandoff({
 
 ### Host route (`routeRuntimeHandoff`)
 
-The webview posts a typed `requestRuntimeHandoff` OutMessage (`taskId`, `targetBackend`, optional `targetModel`, optional `skipSummary`). The extension wires this through a pure host route (export-route pattern) that:
+The webview posts a typed `requestRuntimeHandoff` OutMessage (`taskId`, `targetBackend`, optional `targetModel`). There is **no** product `skipSummary` flag — the engine always best-effort summarizes. The extension wires this through a pure host route (export-route pattern) that:
 
 1. Validates the inbound payload (safe labels only — no session ids, paths, or control characters).
 2. Refuses missing tasks and same-binding switches without calling engine APIs.
@@ -1500,7 +1500,7 @@ The webview posts a typed `requestRuntimeHandoff` OutMessage (`taskId`, `targetB
 5. Surfaces refusals/failures as task-scoped `commandError` with sanitized text (no stacks, absolute paths, or secrets).
 6. Never returns `boundSessionId`, digests, or summary/bootstrap bodies on the wire.
 
-Default `skipSummary` is `true` so the host does not force a hidden source-summary turn unless the webview explicitly requests one. Progress and final binding labels are observed only through `TaskSummary.handoffProgress` / `backend` / `model` on snapshot/taskUpdated — never as chat turns.
+Progress and final binding labels are observed only through `TaskSummary.handoffProgress` / `backend` / `model` on snapshot/taskUpdated — never as chat turns.
 
 ### Webview projection (`TaskSummary.handoffProgress`)
 
@@ -1526,6 +1526,6 @@ Never projected on `TaskSummary`, transcript, or Markdown export conversation bo
 
 ### Webview model-switch control
 
-On an **idle open** existing task (no in-flight handoff), the composer replaces the read-only backend/model pill with an interactive picker (`data-testid="task-model-switch"`). Selecting a different backend/model posts `requestRuntimeHandoff` with labels only (`skipSummary: true` by default). Same-binding picks are no-ops locally; host still refuses same-binding/live-turn/missing-task via `commandError`.
+On an **open** existing task the composer always shows an interactive CLI+model picker (`data-testid="task-model-switch"`) — never blocked by runtime activity or in-flight handoff chrome. Start uses the same picker to choose binding; later changes post `requestRuntimeHandoff` with labels only. The engine **interrupts** any live turn and **holds** queued turns (does not wait for the turn to finish), then best-effort source-summarizes (conversation always included; summary attached when the source CLI succeeds). Same-binding picks are no-ops locally; host/engine still refuse same-binding/active-handoff/missing-task via `commandError` (picker stays enabled).
 
-Task chrome renders sanitized `TaskSummary.handoffProgress` in a task-scoped progress bar (`data-testid="handoff-progress"`) above the chat thread — phase label + source → target bindings, and bounded `failure.message` on failed. The bar never injects digests, session ids, summary/bootstrap bodies, or chat turns. During in-flight phases the picker is disabled; after `completed`/`failed`/`cancelled` the bound `backend`/`model` labels (source retained on failure) remain the source of truth for the next switch.
+Task chrome renders sanitized `TaskSummary.handoffProgress` in a task-scoped progress bar (`data-testid="handoff-progress"`) above the chat thread — phase label + source → target bindings, and bounded `failure.message` on failed. The bar never injects digests, session ids, summary/bootstrap bodies, or chat turns. The picker remains enabled during in-flight phases; after `completed`/`failed`/`cancelled` the bound `backend`/`model` labels (source retained on failure) remain the source of truth for the next switch.

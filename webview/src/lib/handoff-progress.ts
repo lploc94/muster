@@ -7,7 +7,6 @@
  */
 import { backendModelLabel } from './backends';
 import {
-  effectiveRuntimeActivity,
   type HandoffProgress,
   type HandoffProgressBinding,
   type TaskHandoffPhase,
@@ -83,16 +82,13 @@ export function formatHandoffProgressLabel(progress: HandoffProgress): string {
 
 /**
  * Whether the webview may post requestRuntimeHandoff for this task.
- * Host still refuses same-binding / live-turn / missing-task with commandError.
+ * Product rule: the CLI+model picker is never blocked by runtime activity or
+ * handoff chrome — start uses the picker to choose; later changes request handoff.
+ * Host still refuses same-binding / live-turn / active-handoff / missing-task
+ * with commandError (engine gates), not by greying out the picker.
  */
 export function canRequestRuntimeHandoff(task: TaskSummary | null | undefined): boolean {
   if (!task) return false;
-  if (task.lifecycle !== 'open') return false;
-  if (isHandoffProgressInFlight(task.handoffProgress)) return false;
-  const runtime = effectiveRuntimeActivity(task);
-  // Allow when runtime is idle, awaiting_outcome, or unset (legacy projections).
-  if (runtime == null || runtime === 'idle' || runtime === 'awaiting_outcome') {
-    return true;
-  }
-  return false;
+  // Soft/hard terminals are not model-switch targets; reopen/send first.
+  return task.lifecycle === 'open';
 }

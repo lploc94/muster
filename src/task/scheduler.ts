@@ -1,4 +1,5 @@
 import { evaluateDependency } from './deps';
+import { isActiveHandoffPhase } from './engine-handoff';
 import type { ResourceLimits } from './limits';
 import type { TaskStoreFile, TaskTurn } from './types';
 
@@ -140,6 +141,12 @@ export function canPromoteTurn(
   }
   if (task.wait?.kind === 'external') {
     return { ok: false, reason: 'waiting on external blocker' };
+  }
+
+  // Active runtime handoff owns the binding — queue but do not promote until rebind/fail.
+  // Do not reuse holdAutoPromote (that flag is MEM030 failure-safety only).
+  if (task.handoff && isActiveHandoffPhase(task.handoff.phase)) {
+    return { ok: false, reason: 'runtime handoff in progress' };
   }
 
   // Pre-failure FIFO holds require explicit resume (not auto-promote).

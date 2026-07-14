@@ -1931,7 +1931,6 @@ describe('TaskEngine.requestRuntimeHandoff (S02 engine demo)', () => {
       taskId: 'task-handoff-demo',
       targetBackend: 'codex',
       targetModel: 'gpt-5',
-      skipSummary: false,
     });
     expect(result.ok).toBe(true);
     if (!result.ok) throw new Error(result.reason);
@@ -1964,11 +1963,14 @@ describe('TaskEngine.requestRuntimeHandoff (S02 engine demo)', () => {
     expect(snapshotJson).not.toContain(result.value.operationId);
   });
 
-  it('fails closed on non-idle task without mutating runtime binding', async () => {
+  it('interrupts a non-idle task and still starts handoff without rebinding yet', async () => {
     const { store } = makeTempStore();
     const engine = TaskEngine.load({
       store,
       makeBackend: () => scriptedBackend([{ type: 'turnCompleted' }]),
+      runTurn: async function* () {
+        yield { type: 'error', message: 'summary unavailable' };
+      },
       clock: () => '2026-07-14T11:01:00.000Z',
     });
     const created = engine.createTask({
@@ -2002,16 +2004,15 @@ describe('TaskEngine.requestRuntimeHandoff (S02 engine demo)', () => {
     const result = await engine.requestRuntimeHandoff({
       taskId: 'task-busy',
       targetBackend: 'codex',
-      skipSummary: true,
     });
-    expect(result.ok).toBe(false);
-    if (result.ok) throw new Error('expected failure');
-    expect(result.reason).toMatch(/live|active turn/i);
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.reason);
     const after = store.getTask('task-busy')!;
     expect(after.backend).toBe(before.backend);
     expect(after.model).toBe(before.model);
     expect(after.committedSessionId).toBe(before.committedSessionId);
-    expect(after.handoff).toBeUndefined();
+    expect(after.handoff?.phase).toBe('preparing_receiver');
+    expect(store.getFile().turns['busy-1']?.status).toBe('interrupted');
   });
 });
 
@@ -2104,7 +2105,6 @@ describe('TaskEngine.completeRuntimeHandoff (S03 engine demo)', () => {
       taskId: 'task-handoff-complete-demo',
       targetBackend: 'codex',
       targetModel: 'gpt-5',
-      skipSummary: false,
     });
     expect(requested.ok).toBe(true);
     if (!requested.ok) throw new Error(requested.reason);

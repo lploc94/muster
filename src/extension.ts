@@ -70,6 +70,8 @@ let elicitationBridge: ElicitationBridge | undefined;
 let permissionBridge: PermissionBridge | undefined;
 let permissionAuditChannel: vscode.OutputChannel | undefined;
 let elicitationDebugChannel: vscode.OutputChannel | undefined;
+/** Visible Output channel for picker/handoff diagnostics (View → Output → Muster Debug). */
+let musterDebugChannel: vscode.OutputChannel | undefined;
 let credentialRegistry: CredentialRegistry | undefined;
 let bridgeServer: MusterBridgeServer | undefined;
 let taskEngine: TaskEngine | undefined;
@@ -80,6 +82,25 @@ let presentationManager: PresentationManager | undefined;
 let lastObservedRevision = 0;
 let lastObservedFile: TaskStoreFile | undefined;
 const activePendingAsks = new Map<string, PendingAskOverlay>();
+
+function ensureMusterDebugChannel(): vscode.OutputChannel {
+  if (!musterDebugChannel) {
+    musterDebugChannel = vscode.window.createOutputChannel('Muster Debug');
+  }
+  return musterDebugChannel;
+}
+
+function debugMuster(event: string, details: Record<string, unknown> = {}): void {
+  try {
+    const channel = ensureMusterDebugChannel();
+    const timestamp = new Date().toISOString();
+    const line = `${timestamp} ${event} ${JSON.stringify(details)}`;
+    channel.appendLine(line);
+    console.info(line);
+  } catch {
+    // best-effort
+  }
+}
 
 function debugElicitation(event: string, details: Record<string, unknown> = {}): void {
   try {
@@ -926,7 +947,11 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
    * posts session ids, digests, or hidden handoff turn content to chat.
    */
   private async handleRequestRuntimeHandoff(data: unknown): Promise<void> {
+    debugMuster('handoff.host_received', {
+      data: typeof data === 'object' && data ? data : { raw: String(data) },
+    });
     if (!taskEngine || !taskStore) {
+      debugMuster('handoff.engine_not_ready', {});
       this.postCommandError('task engine not ready');
       return;
     }
@@ -941,12 +966,42 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           ? { backend: task.backend, model: task.model }
           : { backend: task.backend };
       },
-      requestRuntimeHandoff: (params) => engine.requestRuntimeHandoff(params),
-      completeRuntimeHandoff: (params) => engine.completeRuntimeHandoff(params),
+      requestRuntimeHandoff: async (params) => {
+        debugMuster('handoff.engine_request', params as unknown as Record<string, unknown>);
+        const result = await engine.requestRuntimeHandoff(params);
+        debugMuster(
+          'handoff.engine_request_result',
+          result.ok
+            ? { ok: true, phase: result.value.phase, operationId: result.value.operationId }
+            : { ok: false, reason: result.reason },
+        );
+        return result;
+      },
+      completeRuntimeHandoff: async (params) => {
+        debugMuster('handoff.engine_complete', params as unknown as Record<string, unknown>);
+        const result = await engine.completeRuntimeHandoff(params);
+        debugMuster(
+          'handoff.engine_complete_result',
+          result.ok
+            ? {
+                ok: true,
+                phase: result.value.phase,
+                boundBackend: result.value.boundBackend,
+              }
+            : { ok: false, reason: result.reason },
+        );
+        return result;
+      },
       afterRequestCommitted: (taskId) => {
         // Project intermediate preparing_receiver progress before transfer.
+        debugMuster('handoff.after_request_snapshot', { taskId });
         this.postSnapshot(taskId);
       },
+    });
+    debugMuster('handoff.route_outcome', {
+      kind: outcome.kind,
+      taskId: 'taskId' in outcome ? outcome.taskId : undefined,
+      messages: outcome.messages.map((m) => m.message),
     });
     for (const message of outcome.messages) {
       this.post(message);
@@ -1192,6 +1247,96 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    // Existing task: if the composer picker asked for a different backend/model,
+    // hand off first (interrupt + switch), then send on the rebound binding.
+    // Covers cases where picker change didn't fire requestRuntimeHandoff.
+    // When a matching handoff is already in flight (picker change), skip a
+    // duplicate request and let engine.send queue with holdAutoPromote.
+    const existing = taskStore.getTask(data.taskId);
+    if (existing && data.backend && WEBVIEW_BACKENDS.has(data.backend)) {
+      const targetModel =
+        typeof data.model === 'string' && data.model.trim() ? data.model.trim() : undefined;
+      const currentModel =
+        typeof existing.model === 'string' && existing.model.trim()
+          ? existing.model.trim()
+          : undefined;
+      const bindingDiffers =
+        existing.backend !== data.backend || currentModel !== targetModel;
+      if (bindingDiffers) {
+        const handoff = existing.handoff;
+        const handoffActive =
+          !!handoff &&
+          handoff.phase !== 'completed' &&
+          handoff.phase !== 'failed' &&
+          handoff.phase !== 'cancelled';
+        const handoffTargetModel =
+          typeof handoff?.target.model === 'string' && handoff.target.model.trim()
+            ? handoff.target.model.trim()
+            : undefined;
+        const matchingHandoff =
+          handoffActive &&
+          handoff!.target.backend === data.backend &&
+          handoffTargetModel === targetModel;
+
+        if (!matchingHandoff) {
+          console.info('[muster][host-send] handoff-before-send', {
+            taskId: data.taskId,
+            from: { backend: existing.backend, model: currentModel ?? null },
+            to: { backend: data.backend, model: targetModel ?? null },
+          });
+          await this.handleRequestRuntimeHandoff({
+            type: 'requestRuntimeHandoff',
+            taskId: data.taskId,
+            targetBackend: data.backend,
+            ...(targetModel ? { targetModel } : {}),
+          });
+          const after = taskStore.getTask(data.taskId);
+          const afterModel =
+            typeof after?.model === 'string' && after.model.trim()
+              ? after.model.trim()
+              : undefined;
+          if (
+            !after ||
+            after.backend !== data.backend ||
+            afterModel !== targetModel
+          ) {
+            // Still in-flight toward the same target → queue via send below.
+            const afterHandoff = after?.handoff;
+            const afterActive =
+              !!afterHandoff &&
+              afterHandoff.phase !== 'completed' &&
+              afterHandoff.phase !== 'failed' &&
+              afterHandoff.phase !== 'cancelled';
+            const afterTargetModel =
+              typeof afterHandoff?.target.model === 'string' &&
+              afterHandoff.target.model.trim()
+                ? afterHandoff.target.model.trim()
+                : undefined;
+            const stillMatching =
+              afterActive &&
+              afterHandoff!.target.backend === data.backend &&
+              afterTargetModel === targetModel;
+            if (!stillMatching) {
+              const reason =
+                'Model switch did not complete; message was not sent on the previous backend.';
+              if (clientRequestId) {
+                this.post({
+                  type: 'sendRejected',
+                  clientRequestId,
+                  taskId: data.taskId,
+                  reason,
+                  code: 'unknown',
+                });
+              } else {
+                this.postCommandError(reason, data.taskId);
+              }
+              return;
+            }
+          }
+        }
+      }
+    }
+
     const result = taskEngine.send(data.taskId, text, {
       agentContent: llmText !== text ? llmText : undefined,
       clientRequestId,
@@ -1233,6 +1378,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         this.post({ type: 'transcriptAppend', taskId: data.taskId, item });
       }
     }
+    // Always refresh so queue panel / turn activity / binding labels update.
+    this.postSnapshot(data.taskId ?? this.focusedTaskId);
   }
 
   /**
@@ -1293,6 +1440,29 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     });
 
     webviewView.webview.onDidReceiveMessage(async (data) => {
+      if (data?.type === 'debugLog') {
+        debugMuster(
+          typeof data.event === 'string' ? data.event : 'webview.debug',
+          data.details && typeof data.details === 'object'
+            ? (data.details as Record<string, unknown>)
+            : { details: data.details },
+        );
+        return;
+      }
+      if (
+        data?.type === 'requestRuntimeHandoff' ||
+        data?.type === 'send' ||
+        data?.type === 'listModels'
+      ) {
+        debugMuster('host.webview_message', {
+          type: data?.type,
+          taskId: data?.taskId,
+          targetBackend: data?.targetBackend,
+          targetModel: data?.targetModel,
+          backend: data?.backend,
+          model: data?.model,
+        });
+      }
       if (data?.type === 'submitAsk' || data?.type === 'cancelAsk' || data?.type === 'submitElicitation') {
         debugElicitation('host.webview_message', {
           type: data.type,
@@ -2300,4 +2470,6 @@ export function deactivate() {
   credentialRegistry?.revokeAll();
   void bridgeServer?.close();
   disposeSharedAcpClient();
+  musterDebugChannel?.dispose();
+  musterDebugChannel = undefined;
 }
