@@ -119,6 +119,9 @@ describe('createTask', () => {
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.next.lifecycle).toBe('open');
+      expect(result.next.releaseState).toBe('draft');
+      expect(result.next.brief?.objective).toBe('do work');
+      expect(result.next.brief?.kind).toBe('generic');
       expect(result.effects).toEqual([]);
     }
   });

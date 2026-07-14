@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { createHash, randomBytes } from 'crypto';
+import { synthesizeBriefFromGoal } from './brief';
 import { deriveViewStatus } from './derived-status';
 import type {
   MusterTask,
@@ -18,7 +19,7 @@ import type {
   TaskViewStatus,
 } from './types';
 
-export const CURRENT_SCHEMA_VERSION = 4;
+export const CURRENT_SCHEMA_VERSION = 5;
 
 export interface StoreOptions {
   filePath: string;
@@ -424,6 +425,22 @@ export function migrate(file: TaskStoreFile, targetVersion: number): TaskStoreFi
     if (current.schemaVersion === 3) {
       current.schemaVersion = 4;
       current.sendReceipts = current.sendReceipts ?? {};
+      continue;
+    }
+    if (current.schemaVersion === 4) {
+      current.schemaVersion = 5;
+      // Orchestration Phase F: releaseState + brief backfill (never auto-run drafts).
+      const taskIdsWithTurns = new Set(
+        Object.values(current.turns).map((turn) => turn.taskId),
+      );
+      for (const task of Object.values(current.tasks)) {
+        if (task.releaseState === undefined) {
+          task.releaseState = taskIdsWithTurns.has(task.id) ? 'released' : 'draft';
+        }
+        if (!task.brief) {
+          task.brief = synthesizeBriefFromGoal(task.goal, task.description);
+        }
+      }
       continue;
     }
     throw new Error(`No migration path from schema ${current.schemaVersion}`);

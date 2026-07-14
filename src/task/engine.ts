@@ -7,6 +7,7 @@ import { runTurn as defaultRunTurn } from '../runner';
 import type { Backend, LiveInputResult, NormalizedEvent, RunOptions } from '../types';
 import type { TaskHandoffPhase, TurnTrigger } from './types';
 import { canBindTaskToBackend } from './backend-eligibility';
+import { compileTaskPrompt } from './brief';
 import {
   formatPinnedInputsForPrompt,
   pinResolvedInputs,
@@ -846,6 +847,8 @@ export class TaskEngine {
       cwd: params.cwd,
       capabilities: ['create_child', 'start_child', 'wait_child', 'read_subtree'],
       executionPolicy: DEFAULT_POLICY,
+      // Host composer create-and-run: atomic released (plan W3 matrix).
+      releaseState: 'released',
     };
 
     const commit = this.store.commit((draft) => {
@@ -866,7 +869,10 @@ export class TaskEngine {
       if (!created.ok) {
         return created;
       }
-      draft.tasks[taskId] = created.next;
+      draft.tasks[taskId] = {
+        ...created.next,
+        releasedAt: now,
+      };
 
       draft.messages[messageId] = {
         id: messageId,
@@ -3170,7 +3176,7 @@ export class TaskEngine {
         return { ok: false, reason: 'task is terminal' };
       }
 
-      // W1: resolve + durable pin before process dispatch when bindings exist.
+      // W1/W2: resolve bindings + compile brief into durable pin before process dispatch.
       // Persist attention on missing inputs with ok:true (commit rejects on ok:false).
       let turnForStart = draftTurn;
       const bindings = draftTask.inputBindings;
@@ -3195,7 +3201,12 @@ export class TaskEngine {
             // Leave turn queued; caller detects status !== running.
             return { ok: true };
           }
-          const compiled = formatPinnedInputsForPrompt(resolved.pins);
+          const compiled = draftTask.brief
+            ? compileTaskPrompt(draftTask.brief, resolved.pins, {
+                taskId: draftTask.id,
+                goal: draftTask.goal,
+              })
+            : formatPinnedInputsForPrompt(resolved.pins);
           const pinned = pinResolvedInputs(draftTurn, resolved.pins, compiled || undefined);
           if (!pinned.ok) {
             return { ok: false, reason: pinned.reason };
@@ -3211,6 +3222,23 @@ export class TaskEngine {
             };
           }
         }
+      } else if (
+        draftTask.brief &&
+        draftTurn.resolvedInputs === undefined &&
+        draftTurn.trigger === 'engine' &&
+        draftTurn.sequence === 1
+      ) {
+        // W2: engine first-turn intents freeze brief-compiled prompt (no dataflow pins).
+        // User-triggered turns keep message content as the prompt body.
+        const compiled = compileTaskPrompt(draftTask.brief, [], {
+          taskId: draftTask.id,
+          goal: draftTask.goal,
+        });
+        const pinned = pinResolvedInputs(draftTurn, [], compiled);
+        if (!pinned.ok) {
+          return { ok: false, reason: pinned.reason };
+        }
+        turnForStart = pinned.next;
       }
 
       // R012: assign only messages already bound to this turn. Do not sweep other

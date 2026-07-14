@@ -1,12 +1,16 @@
+import { synthesizeBriefFromGoal } from './brief';
 import { buildTaskResultFromSummary } from './dataflow';
 import { validateDependencies, type DepGraph } from './deps';
 import type {
   MusterTask,
+  TaskBriefV1,
   TaskCapability,
   TaskDependency,
   TaskExecutionPolicy,
+  TaskInputBinding,
   TaskLifecycleState,
   TaskMessage,
+  TaskReleaseState,
   TaskRole,
   TaskTurn,
   TurnDisposition,
@@ -151,6 +155,12 @@ export interface CreateTaskInput {
   cwd?: string;
   capabilities: TaskCapability[];
   executionPolicy: TaskExecutionPolicy;
+  /** Structured brief; default synthesized from goal/description. */
+  brief?: TaskBriefV1;
+  /** Draft vs released; default draft (W3 auto-run). */
+  releaseState?: TaskReleaseState;
+  inputBindings?: TaskInputBinding[];
+  claimsGit?: boolean;
 }
 
 export interface CreateTaskContext {
@@ -257,6 +267,10 @@ export function createTask(
     cwd: input.cwd,
     capabilities: [...input.capabilities],
     executionPolicy: { ...input.executionPolicy },
+    brief: input.brief ?? synthesizeBriefFromGoal(input.goal, input.description),
+    releaseState: input.releaseState ?? 'draft',
+    ...(input.inputBindings ? { inputBindings: [...input.inputBindings] } : {}),
+    ...(input.claimsGit !== undefined ? { claimsGit: input.claimsGit } : {}),
     revision: 0,
     createdAt: ctx.now,
     updatedAt: ctx.now,

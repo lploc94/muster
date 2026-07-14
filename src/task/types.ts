@@ -90,6 +90,38 @@ export type TaskSealedBy =
   | { kind: 'user' }
   | { kind: 'coordinator'; taskId: string; turnId?: string; mode: string };
 
+/** Host-owned brief kind for prompt preambles (orchestration W2). */
+export type TaskBriefKind =
+  | 'coordinate'
+  | 'plan'
+  | 'implement'
+  | 'test'
+  | 'verify'
+  | 'research'
+  | 'generic';
+
+/**
+ * Structured task brief (schema ≥ 5). Source of truth for objective/paths;
+ * `inputBindings` live on the task root (one source of truth).
+ */
+export interface TaskBriefV1 {
+  version: 1;
+  kind: TaskBriefKind;
+  title: string;
+  /** Mirrors MusterTask.goal when synthesized. */
+  objective: string;
+  context?: string;
+  nonGoals?: string[];
+  constraints?: string[];
+  acceptanceCriteria: string[];
+  definitionOfDone?: string[];
+  readPaths?: string[];
+  writePaths?: string[];
+  verification?: { commands?: string[]; manualChecks?: string[] };
+  /** v1: only "summary" is meaningful for expected outputs. */
+  expectedOutputs?: string[];
+}
+
 export interface MusterTask {
   id: string;
   role: TaskRole;
@@ -142,6 +174,8 @@ export interface MusterTask {
   releaseState?: TaskReleaseState;
   releasedAt?: string;
   releaseAttemptId?: string;
+  /** Structured brief for prompt compilation (schema ≥ 5). */
+  brief?: TaskBriefV1;
   /** Host resource claim: may run git write operations (default false). */
   claimsGit?: boolean;
   error?: string;

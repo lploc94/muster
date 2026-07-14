@@ -379,6 +379,46 @@ describe('TaskStore', () => {
     expect(file.reasoning).toEqual({});
   });
 
+  it('migrates v4 → v5: releaseState + brief from goal; goal preserved', () => {
+    const withTurn = sampleTask('with-turn');
+    withTurn.goal = 'legacy goal A';
+    withTurn.description = 'desc A';
+    const noTurn = sampleTask('no-turn');
+    noTurn.goal = 'legacy goal B';
+    const v4: TaskStoreFile = {
+      schemaVersion: 4,
+      revision: 2,
+      tasks: { 'with-turn': withTurn, 'no-turn': noTurn },
+      turns: {
+        t1: {
+          id: 't1',
+          taskId: 'with-turn',
+          sequence: 1,
+          trigger: 'user',
+          status: 'succeeded',
+          inputs: [],
+          createdAt: '2026-07-06T00:00:00.000Z',
+        },
+      },
+      messages: {},
+      operations: {},
+      cancelRequests: {},
+      toolCalls: {},
+      reasoning: {},
+      sendReceipts: {},
+    };
+    const migrated = migrate(v4, CURRENT_SCHEMA_VERSION);
+    expect(migrated.schemaVersion).toBe(5);
+    expect(migrated.tasks['with-turn']?.goal).toBe('legacy goal A');
+    expect(migrated.tasks['with-turn']?.releaseState).toBe('released');
+    expect(migrated.tasks['with-turn']?.brief?.objective).toBe('legacy goal A');
+    expect(migrated.tasks['with-turn']?.brief?.context).toBe('desc A');
+    expect(migrated.tasks['no-turn']?.releaseState).toBe('draft');
+    expect(migrated.tasks['no-turn']?.brief?.objective).toBe('legacy goal B');
+    // Never invent turns for draft tasks.
+    expect(Object.values(migrated.turns).filter((t) => t.taskId === 'no-turn')).toHaveLength(0);
+  });
+
   it('persists toolCalls/reasoning across commit and reload (retention writeback plumbing)', () => {
     const { filePath } = makeTempStore();
     const store = TaskStore.load({ filePath });
