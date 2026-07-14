@@ -4,12 +4,16 @@
   import TaskHistoryList from './components/TaskList.svelte';
   import TaskWorkspace from './components/TaskWorkspace.svelte';
   import PermissionCard from './components/PermissionCard.svelte';
+  import ElicitationFormCard from './components/ElicitationFormCard.svelte';
+  import ElicitationUrlCard from './components/ElicitationUrlCard.svelte';
   import { tasks } from './lib/tasks.svelte';
   import { threadStore } from './lib/thread.svelte';
   import {
     effectiveRuntimeActivity,
+    formatLiveInputDeliveredMessage,
     isExtMessage,
     isProtocolCompatible,
+    isTaskScopedBannerVisible,
     post,
   } from './lib/protocol';
   import type {
@@ -20,18 +24,52 @@
     SettingsUpdateResult,
   } from './lib/protocol';
   import { tip } from './lib/tooltip';
+  import { outboxList, outboxMarkRejected, outboxPending, outboxRejected, outboxRemove } from './lib/send-outbox';
+  import { vscode } from './lib/vscode';
 
   const SETTING_LABELS: Record<RetentionSettingId, string> = {
     maxTurnsPerTask: 'Maximum turns per task',
     maxStoredOutputChars: 'Maximum stored output characters',
   };
 
+  type PendingElicitation =
+    | {
+        kind: 'form';
+        promptId: string;
+        message: string;
+        fields: Array<Record<string, unknown>>;
+        required: string[];
+        askLike?: boolean;
+        submissionError?: string;
+        submissionVersion?: number;
+      }
+    | {
+        kind: 'url';
+        promptId: string;
+        elicitationId: string;
+        url: string;
+        message: string;
+        waiting?: boolean;
+        submissionError?: string;
+        submissionVersion?: number;
+      };
+
   let pendingAsk = $state<PendingAsk | null>(null);
+  let askSubmissionError = $state<string | undefined>(undefined);
+  let askSubmissionVersion = $state(0);
   let pendingPermission = $state<PendingPermission | null>(null);
+  let pendingElicitations = $state<PendingElicitation[]>([]);
   let activeTurnId = $state<string | null>(null);
   const visibleCommandError = $derived(
-    tasks.commandError && (!tasks.commandError.taskId || tasks.commandError.taskId === tasks.focusedTaskId)
+    tasks.commandError &&
+      isTaskScopedBannerVisible(tasks.commandError.taskId, tasks.focusedTaskId)
       ? tasks.commandError
+      : null,
+  );
+  const visibleCommandNotice = $derived(
+    tasks.commandNotice &&
+      isTaskScopedBannerVisible(tasks.commandNotice.taskId, tasks.focusedTaskId)
+      ? tasks.commandNotice
       : null,
   );
   // Set when a bootstrap `snapshot` arrives stamped with a protocolVersion that
@@ -200,6 +238,7 @@
         case 'snapshot': {
           tasks.applySnapshot(msg);
           pendingAsk = msg.pendingAsk ?? null;
+          askSubmissionError = undefined;
           activeTurnId = msg.activeTurnId ?? null;
 
           if (msg.focusedTaskId) {
@@ -216,6 +255,22 @@
             );
           } else if (tasks.draftMode) {
             threadStore.clearFocus();
+          }
+          // Phase C: replay pending (not rejected) outbox only after compatible snapshot.
+          if (!outboxReplayed && !protocolMismatch) {
+            outboxReplayed = true;
+            for (const entry of outboxPending(vscode)) {
+              post({
+                type: 'send',
+                taskId: entry.taskId,
+                text: entry.text,
+                llmText: entry.llmText,
+                backend: entry.backend,
+                model: entry.model,
+                continuationOf: entry.continuationOf,
+                clientRequestId: entry.clientRequestId,
+              });
+            }
           }
           break;
         }
@@ -283,6 +338,7 @@
               askId: msg.askId,
               questions: msg.questions,
             };
+            askSubmissionError = undefined;
             activeTurnId = msg.turnId;
           }
           break;
@@ -296,6 +352,19 @@
             msg.taskId === tasks.focusedTaskId
           ) {
             pendingAsk = null;
+            askSubmissionError = undefined;
+          }
+          break;
+
+        case 'askSubmissionResult':
+          if (
+            !msg.ok &&
+            pendingAsk?.askId === msg.askId &&
+            pendingAsk.turnId === msg.turnId &&
+            msg.taskId === tasks.focusedTaskId
+          ) {
+            askSubmissionError = msg.message ?? 'The answer could not be delivered. Please try again.';
+            askSubmissionVersion += 1;
           }
           break;
 
@@ -319,8 +388,73 @@
           }
           break;
 
+        case 'elicitationFormPending': {
+          const existingForm = pendingElicitations.find((p) => p.promptId === msg.promptId);
+          pendingElicitations = [
+            ...pendingElicitations.filter((p) => p.promptId !== msg.promptId),
+            {
+              kind: 'form',
+              promptId: msg.promptId,
+              message: msg.message,
+              fields: msg.fields,
+              required: msg.required,
+              askLike: msg.askLike,
+              // Preserve unlock state across snapshot/replay of the same prompt.
+              submissionError: existingForm?.submissionError,
+              submissionVersion: existingForm?.submissionVersion,
+            },
+          ];
+          break;
+        }
+
+        case 'elicitationUrlPending': {
+          const existingUrl = pendingElicitations.find((p) => p.promptId === msg.promptId);
+          pendingElicitations = [
+            ...pendingElicitations.filter((p) => p.promptId !== msg.promptId),
+            {
+              kind: 'url',
+              promptId: msg.promptId,
+              elicitationId: msg.elicitationId,
+              url: msg.url,
+              message: msg.message,
+              // Preserve unlock state across snapshot/replay of the same prompt.
+              submissionError: existingUrl?.submissionError,
+              submissionVersion: existingUrl?.submissionVersion,
+              waiting: existingUrl?.kind === 'url' ? existingUrl.waiting : undefined,
+            },
+          ];
+          break;
+        }
+
+        case 'elicitationUrlWaiting':
+          pendingElicitations = pendingElicitations.map((p) =>
+            p.promptId === msg.promptId && p.kind === 'url'
+              ? { ...p, waiting: true, message: msg.message ?? p.message }
+              : p,
+          );
+          break;
+
+        case 'elicitationCleared':
+          pendingElicitations = pendingElicitations.filter((p) => p.promptId !== msg.promptId);
+          break;
+
+        case 'elicitationSubmissionResult':
+          pendingElicitations = pendingElicitations.map((p) => {
+            if (p.promptId !== msg.promptId) return p;
+            if (!msg.ok) {
+              return {
+                ...p,
+                submissionError: msg.message ?? 'The response could not be delivered. Please try again.',
+                submissionVersion: (p.submissionVersion ?? 0) + 1,
+              };
+            }
+            // URL accept keeps the card mounted in waiting state — clear stale rejection text.
+            return { ...p, submissionError: undefined };
+          });
+          break;
+
         case 'commandError':
-          if (!msg.taskId || msg.taskId === tasks.focusedTaskId) {
+          if (isTaskScopedBannerVisible(msg.taskId, tasks.focusedTaskId)) {
             tasks.setCommandError(msg.message, msg.taskId ?? null);
           }
           break;
@@ -341,6 +475,36 @@
           }
           break;
 
+        case 'sendAccepted':
+          outboxRemove(vscode, msg.clientRequestId);
+          break;
+
+        case 'sendRejected': {
+          const rejected = outboxMarkRejected(vscode, msg.clientRequestId);
+          if (rejected?.text) {
+            const sameScope =
+              (!rejected.taskId && tasks.draftMode) ||
+              (!!rejected.taskId && rejected.taskId === tasks.focusedTaskId);
+            if (sameScope) {
+              tasks.prefillComposer(rejected.text, rejected.clientRequestId);
+            }
+            // Outbox stays until muster:prefill-applied confirms restore.
+          } else {
+            outboxRemove(vscode, msg.clientRequestId);
+          }
+          if (isTaskScopedBannerVisible(msg.taskId, tasks.focusedTaskId)) {
+            tasks.setCommandError(msg.reason, msg.taskId ?? null);
+          }
+          break;
+        }
+
+        case 'liveInputResult':
+          // Delivered acks must not be silently dropped; refusals use commandError.
+          if (isTaskScopedBannerVisible(msg.taskId, tasks.focusedTaskId)) {
+            tasks.setCommandNotice(formatLiveInputDeliveredMessage(msg.sessionId), msg.taskId);
+          }
+          break;
+
         case 'backendsAvailable':
           tasks.setAvailableBackends(msg.backends);
           break;
@@ -348,15 +512,51 @@
         case 'modelsAvailable':
           tasks.setAvailableModels(msg.models);
           break;
+
+        case 'composerSelection':
+          tasks.applyHostComposerSelection(msg.backend, msg.model);
+          break;
+      }
+    }
+
+    function onPrefillApplied(e: Event) {
+      const id = (e as CustomEvent<{ clientRequestId?: string }>).detail?.clientRequestId;
+      if (typeof id === 'string' && id) {
+        outboxRemove(vscode, id);
       }
     }
 
     window.addEventListener('message', onMessage);
+    window.addEventListener('muster:prefill-applied', onPrefillApplied);
     // Ask the host which backends are installed so the picker only offers them.
     post({ type: 'listBackends' });
     // Prefetch model lists for the New-task picker (host also prefetches on resolve).
     post({ type: 'listModels' });
-    return () => window.removeEventListener('message', onMessage);
+    // Phase C outbox replay happens after a compatible snapshot (see below).
+    return () => {
+      window.removeEventListener('message', onMessage);
+      window.removeEventListener('muster:prefill-applied', onPrefillApplied);
+    };
+  });
+
+  let outboxReplayed = false;
+
+  // After focus changes, restore only rejected drafts (never pending ACK entries).
+  $effect(() => {
+    void tasks.focusedTaskId;
+    void tasks.draftMode;
+    const rejected = outboxRejected(vscode);
+    if (rejected.length === 0) return;
+    // One at a time to avoid stomping composerPrefill.
+    const entry = rejected.find((e) => {
+      if (!e.text) return false;
+      return (
+        (!e.taskId && tasks.draftMode) || (!!e.taskId && e.taskId === tasks.focusedTaskId)
+      );
+    });
+    if (!entry) return;
+    if (tasks.composerPrefill?.clientRequestId === entry.clientRequestId) return;
+    tasks.prefillComposer(entry.text, entry.clientRequestId);
   });
 </script>
 
@@ -396,6 +596,20 @@
   </div>
 {/if}
 
+{#if visibleCommandNotice}
+  <div class="task-command-notice" role="status">
+    <div class="min-w-0">
+      <div class="font-semibold">Live input</div>
+      <div class="task-command-notice__detail">{visibleCommandNotice.message}</div>
+    </div>
+    <button
+      type="button"
+      class="task-command-notice__dismiss"
+      onclick={() => tasks.setCommandNotice(null)}
+    >Dismiss</button>
+  </div>
+{/if}
+
 {#if pendingPermission}
   <PermissionCard
     permissionId={pendingPermission.permissionId}
@@ -405,6 +619,38 @@
     options={pendingPermission.options}
   />
 {/if}
+
+{#each pendingElicitations as pe (pe.promptId)}
+  {#if pe.kind === 'form'}
+    <ElicitationFormCard
+      promptId={pe.promptId}
+      message={pe.message}
+      fields={pe.fields as Array<{
+        key: string;
+        type: string;
+        title?: string;
+        description?: string;
+        options?: string[];
+        required?: boolean;
+        default?: unknown;
+      }>}
+      required={pe.required}
+      askLike={pe.askLike}
+      submissionError={pe.submissionError}
+      submissionVersion={pe.submissionVersion}
+    />
+  {:else}
+    <ElicitationUrlCard
+      promptId={pe.promptId}
+      elicitationId={pe.elicitationId}
+      url={pe.url}
+      message={pe.message}
+      waiting={pe.waiting}
+      submissionError={pe.submissionError}
+      submissionVersion={pe.submissionVersion}
+    />
+  {/if}
+{/each}
 
 {#if !inChat}
   <!-- Entry: New task action, then the searchable previous-tasks list -->
@@ -493,7 +739,12 @@
       </button>
     </div>
 
-    <TaskWorkspace {pendingAsk} {activeTurnId} />
+    <TaskWorkspace
+      {pendingAsk}
+      {activeTurnId}
+      submissionError={askSubmissionError}
+      submissionVersion={askSubmissionVersion}
+    />
 
     <!-- History dropdown -->
     {#if historyOpen}

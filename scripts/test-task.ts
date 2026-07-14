@@ -9,6 +9,7 @@ const MCP_CAPS: BackendCapabilities = {
   supportsMCP: true,
   supportsReasoning: false,
   supportsDetailedToolEvents: false,
+  supportsLiveInput: false,
 };
 
 async function runScenario(label: string, scenario: 'success' | 'cancel'): Promise<void> {

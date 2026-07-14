@@ -1,6 +1,5 @@
 import type { NormalizedEvent } from './types';
 import type { TaskRuntimeActivity, TaskViewStatus, TranscriptItem } from './protocol';
-import { isHardTerminalLifecycle } from './protocol';
 import type { ThreadItem } from './turn-state.svelte';
 
 function asText(content: unknown): string {
@@ -11,7 +10,13 @@ function asText(content: unknown): string {
 function transcriptToThreadItem(item: TranscriptItem): ThreadItem | null {
   switch (item.kind) {
     case 'user':
-      return { kind: 'user', id: item.id, text: asText(item.content), turnId: item.turnId };
+      return {
+        kind: 'user',
+        id: item.id,
+        text: asText(item.content),
+        turnId: item.turnId,
+        order: item.order,
+      };
     case 'assistant':
       return {
         kind: 'assistant',
@@ -115,9 +120,8 @@ export class TaskThread {
     if (this.running || runtime === 'needs_recovery' || next.length > 0) {
       this.hadProcess = true;
     }
-    // Soft failed stays writable; only hard terminals are read-only.
-    const lifecycle = opts?.lifecycle ?? viewStatus;
-    this.readOnly = lifecycle ? isHardTerminalLifecycle(lifecycle) : false;
+    // Terminal tasks stay writable: send reopens the same task to open.
+    this.readOnly = false;
   }
 
   reset(): void {
@@ -137,6 +141,28 @@ export class TaskThread {
   appendTranscript(item: TranscriptItem): void {
     if (item.kind === 'reasoning') {
       if (item.turnId) this.reasoningByTurn[item.turnId] = asText(item.content);
+      return;
+    }
+    // Idempotent: turnStart + snapshot hydrate may both project the same user message.
+    if (this.items.some((existing) => existing.id === item.id)) {
+      return;
+    }
+    // Mid-turn inject (has order >= 0): split live stream so the user bubble
+    // sits between prior and subsequent assistant text — same as live raw path.
+    if (
+      item.kind === 'user' &&
+      typeof item.order === 'number' &&
+      item.order >= 0 &&
+      this.running &&
+      item.turnId &&
+      item.turnId === this.activeTurnId
+    ) {
+      this.insertLiveInject({
+        id: item.id,
+        content: asText(item.content),
+        turnId: item.turnId,
+        order: item.order,
+      });
       return;
     }
     const mapped = transcriptToThreadItem(item);
@@ -204,6 +230,29 @@ export class TaskThread {
     return undefined;
   }
 
+  /**
+   * Mid-turn live inject: commit the current assistant stream as a bubble, then
+   * append the user message so later assistant deltas form a new bubble after it.
+   */
+  insertLiveInject(item: {
+    id: string;
+    content: string;
+    turnId?: string;
+    order?: number;
+  }): void {
+    this.commitStreaming();
+    if (this.items.some((existing) => existing.id === item.id)) {
+      return;
+    }
+    this.items.push({
+      kind: 'user',
+      id: item.id,
+      text: item.content,
+      turnId: item.turnId,
+      order: item.order,
+    });
+  }
+
   /** Reduce one NormalizedEvent into the thread. */
   applyEvent(ev: NormalizedEvent): void {
     switch (ev.type) {
@@ -224,6 +273,34 @@ export class TaskThread {
         }
         this.streaming.text += ev.content;
         break;
+
+      case 'raw': {
+        // Host mid-turn live_inject marker (JSON line from TaskEngine).
+        try {
+          const parsed = JSON.parse(ev.line) as {
+            muster?: string;
+            messageId?: string;
+            content?: string;
+            order?: number;
+          };
+          if (
+            parsed &&
+            parsed.muster === 'live_inject' &&
+            typeof parsed.messageId === 'string' &&
+            typeof parsed.content === 'string'
+          ) {
+            this.insertLiveInject({
+              id: parsed.messageId,
+              content: parsed.content,
+              turnId: this.activeTurnId ?? undefined,
+              order: typeof parsed.order === 'number' ? parsed.order : undefined,
+            });
+          }
+        } catch {
+          // ignore non-JSON raw lines
+        }
+        break;
+      }
 
       case 'reasoningDelta':
         if (this.activeTurnId) {
@@ -359,8 +436,8 @@ class ThreadStore {
     if (transcript) {
       thread.hydrate(transcript, activeTurnId, viewStatus, opts);
     } else if (opts?.lifecycle || viewStatus) {
-      const lifecycle = opts?.lifecycle ?? viewStatus;
-      thread.setReadOnly(lifecycle ? isHardTerminalLifecycle(lifecycle) : false);
+      // Terminal tasks stay writable (send reopens); never lock the composer here.
+      thread.setReadOnly(false);
       const runtime = opts?.runtimeActivity;
       thread.running = runtime === 'running' || runtime === 'waiting_user';
     }
@@ -398,8 +475,9 @@ class ThreadStore {
     this.getOrCreate(taskId).appendTranscript(item);
   }
 
-  updateReadOnly(lifecycleOrViewStatus: string): void {
-    this.current.setReadOnly(isHardTerminalLifecycle(lifecycleOrViewStatus));
+  updateReadOnly(_lifecycleOrViewStatus: string): void {
+    // Terminal tasks stay writable; send reopens the same task to open.
+    this.current.setReadOnly(false);
   }
 
   updateRuntimeFlags(runtimeActivity: TaskRuntimeActivity | null | undefined): void {

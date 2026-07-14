@@ -54,6 +54,7 @@ describe('OpenCodeBackend — identity', () => {
       supportsReasoning: true,
       supportsDetailedToolEvents: true,
       supportsMCP: true,
+      supportsLiveInput: true,
     });
   });
 });
@@ -259,24 +260,24 @@ describe('OpenCodeBackend.run — terminal classification', () => {
 
   it('stopReason "cancelled" -> cancellation error', async () => {
     const events = await runTurn(new OpenCodeBackend(), options(), fake, { result: { stopReason: 'cancelled' } });
-    expect(events.at(-1)).toEqual({ type: 'error', message: 'Turn cancelled', isCancellation: true });
+    expect(events.at(-1)).toEqual({ type: 'error', message: 'Turn cancelled', isCancellation: true, meta: { interruptConfidence: 'confirmed' } });
   });
 
   it('missing stopReason -> "prompt ended without a stopReason" error', async () => {
     const events = await runTurn(new OpenCodeBackend(), options(), fake, { result: {} });
-    expect(events.at(-1)).toEqual({ type: 'error', message: 'OpenCode prompt ended without a stopReason' });
+    expect(events.at(-1)).toEqual({ type: 'error', message: 'OpenCode prompt ended without a stopReason', meta: { failureClass: 'terminal_received' } });
   });
 
   it('a failure stopReason -> "stopped" error WITHOUT meta', async () => {
     const events = await runTurn(new OpenCodeBackend(), options(), fake, { result: { stopReason: 'max_tokens' } });
-    expect(events.at(-1)).toEqual({ type: 'error', message: 'OpenCode stopped: max_tokens' });
+    expect(events.at(-1)).toEqual({ type: 'error', message: 'OpenCode stopped: max_tokens', meta: { failureClass: 'terminal_received' } });
   });
 
   it('max_turn_requests is a failure stopReason for OpenCode -> error WITHOUT meta', async () => {
     const events = await runTurn(new OpenCodeBackend(), options(), fake, {
       result: { stopReason: 'max_turn_requests' },
     });
-    expect(events.at(-1)).toEqual({ type: 'error', message: 'OpenCode stopped: max_turn_requests' });
+    expect(events.at(-1)).toEqual({ type: 'error', message: 'OpenCode stopped: max_turn_requests', meta: { failureClass: 'terminal_received' } });
   });
 
   it('a non-failure non-end_turn stopReason -> "stopped" error WITH meta', async () => {
@@ -284,7 +285,7 @@ describe('OpenCodeBackend.run — terminal classification', () => {
     expect(events.at(-1)).toEqual({
       type: 'error',
       message: 'OpenCode stopped: surprise',
-      meta: { stopReason: 'surprise' },
+      meta: { failureClass: 'terminal_received', stopReason: 'surprise' },
     });
   });
 });
@@ -364,7 +365,7 @@ describe('OpenCodeBackend.run — cancellation & errors', () => {
     fake.resolve({ stopReason: 'end_turn' });
     await pump;
     expect(fake.calls.cancel[0][0]).toBe('sess-1');
-    expect(events.at(-1)).toEqual({ type: 'error', message: 'Turn cancelled', isCancellation: true });
+    expect(events.at(-1)).toEqual({ type: 'error', message: 'Turn cancelled', isCancellation: true, meta: { interruptConfidence: 'confirmed' } });
   });
 
   it('reports an unsupported resume when the client cannot load sessions', async () => {

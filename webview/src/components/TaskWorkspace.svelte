@@ -10,17 +10,19 @@
   import {
     getLifecyclePresentation,
     getTaskPresentation,
-    isHardTerminal,
   } from '../lib/task-status';
   import type { PendingAsk, TaskLifecycleState } from '../lib/protocol';
+  import { buildDeleteQueuedTurnMessage, queuedTurnControlState } from '../lib/queued-turns';
   import { tip } from '../lib/tooltip';
 
   interface Props {
     pendingAsk: PendingAsk | null;
     activeTurnId: string | null;
+    submissionError?: string;
+    submissionVersion?: number;
   }
 
-  let { pendingAsk = null, activeTurnId = null }: Props = $props();
+  let { pendingAsk = null, activeTurnId = null, submissionError, submissionVersion = 0 }: Props = $props();
 
   let retryInstruction = $state('');
   let continueMessage = $state('');
@@ -33,6 +35,12 @@
   const thread = $derived(threadStore.current);
   const presentation = $derived(focused ? getTaskPresentation(focused) : null);
   const runtime = $derived(focused ? effectiveRuntimeActivity(focused) : null);
+  /** Preview source: thread user bubbles keyed by message id (host transcript projection). */
+  const queuedTurnControls = $derived(
+    tasks.queuedTurns.map((turn) =>
+      queuedTurnControlState(turn, thread.items, tasks.queuedTurns),
+    ),
+  );
 
   type LifecycleAction = {
     lifecycle: TaskLifecycleState;
@@ -57,9 +65,18 @@
         { lifecycle: 'cancelled', label: 'Cancel task', description: 'Cancel this task and children' },
         { lifecycle: 'skipped', label: 'Skip', description: 'Won’t perform' },
       );
+    } else if (
+      current === 'succeeded' ||
+      current === 'cancelled' ||
+      current === 'skipped'
+    ) {
+      // Hard terminal: reopen same task id, or user creates a new task separately.
+      actions.push({
+        lifecycle: 'open',
+        label: 'Reopen',
+        description: 'Open this task again and continue on the same id',
+      });
     }
-    // Hard terminal (succeeded/cancelled/skipped): no lifecycle menu actions —
-    // further work uses Continue as new task, not reopen-on-same-id.
     return actions;
   });
 
@@ -93,17 +110,35 @@
       !!activeTurnId &&
       (runtime === 'queued' || runtime === 'waiting_dependencies'),
   );
-  const showRecovery = $derived(focused?.lifecycle === 'open' && runtime === 'needs_recovery');
-  const showContinueAsNew = $derived(!!focused && isHardTerminal(focused.lifecycle));
-  const showSoftFailHint = $derived(focused?.lifecycle === 'failed');
-  const hasRetryableTurn = $derived(!!activeTurnId);
-  const composerReadOnly = $derived(
+  const showFailedTurnCard = $derived(
     !!focused &&
-      (thread.readOnly ||
-        showRecovery ||
-        runtime === 'running' ||
-        runtime === 'queued'),
+      focused.lifecycle === 'open' &&
+      (focused.currentTurnActivity?.state === 'failed_turn' ||
+        (focused.currentTurnActivity === undefined && runtime === 'needs_recovery')),
   );
+  const showUncertainCard = $derived(
+    !!focused &&
+      focused.lifecycle === 'open' &&
+      focused.currentTurnActivity?.state === 'uncertain',
+  );
+  const recoveryTurnId = $derived(
+    focused?.currentTurnActivity &&
+      (focused.currentTurnActivity.state === 'failed_turn' ||
+        focused.currentTurnActivity.state === 'uncertain')
+      ? focused.currentTurnActivity.turnId
+      : activeTurnId,
+  );
+  /** Sealed task: composer stays enabled; hint that send (or Reopen) restores open. */
+  const showTerminalReopenHint = $derived(
+    !!focused &&
+      (focused.lifecycle === 'failed' ||
+        focused.lifecycle === 'succeeded' ||
+        focused.lifecycle === 'cancelled' ||
+        focused.lifecycle === 'skipped'),
+  );
+  const hasRetryableTurn = $derived(!!activeTurnId);
+  // Phase B: free-form send stays open after failed turns; only host readOnly locks.
+  const composerReadOnly = $derived(!!focused && thread.readOnly);
 
   function resumeQueued(): void {
     if (!focused || !activeTurnId) return;
@@ -111,15 +146,26 @@
   }
 
   function submitRetry(): void {
-    if (!focused || !activeTurnId) return;
-    const instruction = retryInstruction.trim();
-    if (!instruction) return;
-    post({ type: 'retryTurn', taskId: focused.id, turnId: activeTurnId, instruction });
+    if (!focused || !recoveryTurnId) return;
+    const instruction = retryInstruction.trim() || 'Retry the previous instruction.';
+    post({ type: 'retryTurn', taskId: focused.id, turnId: recoveryTurnId, instruction });
     retryInstruction = '';
   }
 
+  function submitRunAgain(): void {
+    if (!focused || !recoveryTurnId) return;
+    // Explicit replay authorization: reuse original turn inputs (not silent).
+    post({
+      type: 'retryTurn',
+      taskId: focused.id,
+      turnId: recoveryTurnId,
+      instruction: 'Run again',
+      reuseOriginalInputs: true,
+    });
+  }
+
   function submitContinue(): void {
-    if (!focused || !activeTurnId) return;
+    if (!focused) return;
     const instruction = continueMessage.trim();
     if (!instruction) return;
     post({ type: 'continueTask', taskId: focused.id, instruction });
@@ -132,6 +178,32 @@
     post({ type: 'newTask' });
   }
 
+  /**
+   * Edit = pull text into the composer message box and remove the queue row.
+   * User revises in the composer and Enter re-queues (or Ctrl+Enter injects).
+   */
+  function editQueuedTurnToComposer(turnId: string, previewText: string): void {
+    if (!focused) return;
+    if (!tasks.queuedTurns.some((turn) => turn.turnId === turnId)) return;
+    const message = buildDeleteQueuedTurnMessage(focused.id, turnId, { locked: false });
+    if (!message) return;
+    tasks.setCommandError(null);
+    // Optimistic: drop row immediately, load text into composer.
+    tasks.removeQueuedTurnLocally(turnId);
+    tasks.prefillComposer(previewText);
+    post(message);
+  }
+
+  function submitDeleteQueuedTurn(turnId: string): void {
+    if (!focused) return;
+    if (!tasks.queuedTurns.some((turn) => turn.turnId === turnId)) return;
+    const message = buildDeleteQueuedTurnMessage(focused.id, turnId, { locked: false });
+    if (!message) return;
+    tasks.setCommandError(null);
+    tasks.removeQueuedTurnLocally(turnId);
+    post(message);
+  }
+
   function shortGoal(goal: string): string {
     const trimmed = goal.trim();
     return trimmed || '(no goal)';
@@ -141,7 +213,7 @@
     return `task-status task-status--${getLifecyclePresentation(lifecycle).tone}`;
   }
 
-  /** Banner uses lifecycle tone only — CLI process is shown near the composer. */
+  /** Banner uses lifecycle tone only — turn activity is shown near the composer. */
   const bannerTone = $derived(presentation?.lifecycle.tone ?? 'neutral');
 </script>
 
@@ -150,7 +222,7 @@
     <div class="task-workspace-banner task-workspace-banner--neutral" data-task-status="draft">
       <div class="min-w-0 flex-1">
         <div class="font-semibold text-sm">
-          {tasks.continuationOf ? 'Continue as new task' : 'New task'}
+          New task
         </div>
         <div class="task-workspace-detail" style="margin-top: 2px;">
           First message creates the coordinator task.
@@ -195,7 +267,7 @@
               aria-haspopup="menu"
               aria-expanded={statusMenuOpen ? 'true' : 'false'}
               aria-label={`Task status: ${presentation.lifecycle.label}. Click to change.`}
-              use:tip={'Change task status (user only — not CLI)'}
+              use:tip={'Change task status'}
               onclick={() => (statusMenuOpen = !statusMenuOpen)}
             >
               {presentation.lifecycle.label}
@@ -251,18 +323,9 @@
             {#if focused.hasOutcomeProposal && focused.lifecycle === 'open'}
               <div
                 class="task-workspace-orchestration"
-                use:tip={'Agent proposed completion; send a message to continue on the same task/session.'}
+                use:tip={'Agent proposed completion; send a message to continue on the same task.'}
               >
-                Agent proposed done — task stays open; chat to continue (session resume).
-              </div>
-            {/if}
-            {#if focused.committedSessionId}
-              <div
-                class="task-workspace-orchestration"
-                style="opacity: 0.55;"
-                use:tip={'CLI conversation session bound to this task'}
-              >
-                Session {focused.committedSessionId.slice(0, 12)}…
+                Agent proposed done — task stays open; chat to continue.
               </div>
             {/if}
             {#if focused.continuationOf}
@@ -284,12 +347,66 @@
 
     <ChatThread />
 
+    {#if queuedTurnControls.length > 0}
+      <div
+        class="task-action-panel task-action-panel--info queued-turns-panel"
+        data-testid="queued-turns-panel"
+        aria-label="Queued follow-up turns"
+      >
+        <div class="font-semibold">Queued follow-ups ({queuedTurnControls.length})</div>
+        <p class="task-muted" style="margin: 0;">
+          Edit moves text into the message box so you can revise and send again. Delete removes
+          it from the queue. Rows disappear once a turn starts.
+        </p>
+        <ul class="queued-turns-list">
+          {#each queuedTurnControls as control (control.turnId)}
+            <li
+              class="queued-turn-item"
+              data-turn-id={control.turnId}
+              data-queued-locked={control.locked ? 'true' : 'false'}
+            >
+              <div class="queued-turn-item__meta">
+                <span class="task-pill task-pill--muted">#{control.sequence}</span>
+                <span class="task-muted">queued</span>
+              </div>
+
+              <div class="queued-turn-item__preview">
+                {control.previewText || '(empty queued message)'}
+              </div>
+              <div class="queued-turn-item__actions">
+                <button
+                  type="button"
+                  class="queued-turn-action"
+                  disabled={control.locked || !control.canEdit}
+                  aria-label={`Edit queued turn ${control.sequence}`}
+                  onclick={() => editQueuedTurnToComposer(control.turnId, control.previewText)}
+                >
+                  Edit
+                </button>
+                <button
+                  type="button"
+                  class="queued-turn-action queued-turn-action--danger"
+                  disabled={control.locked || !control.canDelete}
+                  aria-label={`Delete queued turn ${control.sequence}`}
+                  onclick={() => submitDeleteQueuedTurn(control.turnId)}
+                >
+                  Delete
+                </button>
+              </div>
+            </li>
+          {/each}
+        </ul>
+      </div>
+    {/if}
+
     {#if pendingAsk && tasks.focusedTaskId}
       <AskCard
         taskId={tasks.focusedTaskId}
         turnId={pendingAsk.turnId}
         askId={pendingAsk.askId}
         questions={pendingAsk.questions}
+        {submissionError}
+        {submissionVersion}
       />
     {/if}
 
@@ -302,19 +419,44 @@
       </div>
     {/if}
 
-    {#if showRecovery}
-      <div class="task-action-panel task-action-panel--danger">
-        <div class="font-semibold">Turn recovery needed</div>
-        <p>{presentation.composerGuidance}</p>
+    {#if showUncertainCard}
+      <div class="task-action-panel task-action-panel--warning" data-turn-activity="uncertain">
+        <div class="font-semibold">Status unclear — continue or run again?</div>
         <p class="task-muted">
-          Task lifecycle remains <strong>Open</strong> — a failed CLI turn is not a sealed task failure.
+          The previous turn may have partially run. Choose explicitly — nothing is replayed automatically.
         </p>
-        {#if !hasRetryableTurn}
+        <div class="flex flex-col gap-1">
+          <vscode-button disabled={!recoveryTurnId} onclick={submitRunAgain}>
+            Run again
+          </vscode-button>
+        </div>
+        <div class="flex flex-col gap-1">
+          <span>Check and continue</span>
+          <vscode-textarea
+            rows={2}
+            placeholder="Inspect workspace then continue with a new message..."
+            value={continueMessage}
+            oninput={(e: Event) => {
+              continueMessage = (e.currentTarget as HTMLTextAreaElement).value;
+            }}
+          ></vscode-textarea>
+          <vscode-button disabled={!continueMessage.trim()} onclick={submitContinue}>
+            Check and continue
+          </vscode-button>
+        </div>
+      </div>
+    {:else if showFailedTurnCard}
+      <div class="task-action-panel task-action-panel--danger" data-turn-activity="failed_turn">
+        <div class="font-semibold">Could not finish</div>
+        <p class="task-muted">
+          The last turn could not finish. Type a new message below to continue, or use Retry / Continue.
+        </p>
+        {#if !recoveryTurnId}
           <p class="task-muted">No retryable turn is available for this task.</p>
         {/if}
 
         <div class="flex flex-col gap-1">
-          <span>Retry (required instruction)</span>
+          <span>Try again (optional instruction)</span>
           <vscode-textarea
             rows={2}
             placeholder="What should the agent do differently?"
@@ -323,13 +465,13 @@
               retryInstruction = (e.currentTarget as HTMLTextAreaElement).value;
             }}
           ></vscode-textarea>
-          <vscode-button disabled={!retryInstruction.trim() || !activeTurnId} onclick={submitRetry}>
-            Retry failed turn
+          <vscode-button disabled={!recoveryTurnId} onclick={submitRetry}>
+            Try again
           </vscode-button>
         </div>
 
         <div class="flex flex-col gap-1">
-          <span>Continue (required message)</span>
+          <span>Check and continue</span>
           <vscode-textarea
             rows={2}
             placeholder="Message to queue as the next turn..."
@@ -338,8 +480,8 @@
               continueMessage = (e.currentTarget as HTMLTextAreaElement).value;
             }}
           ></vscode-textarea>
-          <vscode-button disabled={!continueMessage.trim() || !activeTurnId} onclick={submitContinue}>
-            Continue task
+          <vscode-button disabled={!continueMessage.trim()} onclick={submitContinue}>
+            Continue
           </vscode-button>
         </div>
       </div>
@@ -354,16 +496,15 @@
       </div>
     {/if}
 
-    {#if showSoftFailHint}
-      <div class="task-action-panel task-action-panel--danger">
+    {#if showTerminalReopenHint}
+      <div
+        class={`task-action-panel ${
+          focused.lifecycle === 'failed' ? 'task-action-panel--danger' : 'task-action-panel--warning'
+        }`}
+        role="status"
+      >
         <span>{presentation.composerGuidance}</span>
-      </div>
-    {/if}
-
-    {#if showContinueAsNew}
-      <div class="task-action-panel task-action-panel--muted">
-        <span>{presentation.composerGuidance}</span>
-        <vscode-button secondary onclick={continueAsNewTask}>Continue as new task</vscode-button>
+        <vscode-button secondary onclick={() => setLifecycle('open')}>Reopen</vscode-button>
       </div>
     {/if}
 

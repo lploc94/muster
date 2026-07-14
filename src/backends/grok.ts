@@ -1,6 +1,13 @@
-import { Backend, BackendCapabilities, NormalizedEvent, RunOptions } from '../types';
+import {
+  Backend,
+  BackendCapabilities,
+  LiveInputRequest,
+  LiveInputResult,
+  NormalizedEvent,
+  RunOptions,
+} from '../types';
 import { AcpAgentConfig, disposeSharedAcpClient } from './acp-client';
-import { ACP_CAPABILITIES, AcpAdapterSpec, runAcpTurn } from './acp-run';
+import { ACP_CAPABILITIES, AcpAdapterSpec, runAcpTurn, sendAcpLiveInput } from './acp-run';
 
 export { disposeSharedAcpClient };
 
@@ -26,9 +33,8 @@ export const GROK_AGENT_CONFIG: AcpAgentConfig = {
     return { methodId, meta: { headless: true } };
   },
   extensionRequestHandler: (method) => {
-    if (method === 'x.ai/ask_user_question' || method === '_x.ai/ask_user_question') {
-      return { result: { outcome: 'cancelled' } };
-    }
+    // ask_user_question is handled asynchronously by AcpClient + QuestionController
+    // (see handleAskUserQuestion). Only stub exit_plan_mode here.
     if (method === 'x.ai/exit_plan_mode' || method === '_x.ai/exit_plan_mode') {
       return { result: { outcome: 'approved' } };
     }
@@ -68,5 +74,9 @@ export class GrokBackend implements Backend {
 
   run(options: RunOptions): AsyncIterable<NormalizedEvent> {
     return runAcpTurn(GROK_SPEC, options);
+  }
+
+  sendLiveInput(request: LiveInputRequest): Promise<LiveInputResult> {
+    return sendAcpLiveInput(GROK_SPEC, request);
   }
 }

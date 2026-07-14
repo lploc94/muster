@@ -132,9 +132,10 @@ export function canCreateTurn(
     return { ok: false, reason: 'task not found' };
   }
   const cap = effectiveTurnCap(task, limits);
-  const slotsUsed = Object.values(file.turns).filter(
-    (turn) => turn.taskId === taskId && turn.status !== 'queued',
-  ).length;
+  // Count every turn row for the task, including still-queued reservations, so
+  // operators cannot oversubscribe the effective cap with FIFO follow-ups that
+  // can never all execute.
+  const slotsUsed = Object.values(file.turns).filter((turn) => turn.taskId === taskId).length;
   if (slotsUsed >= cap) {
     return { ok: false, reason: 'max turns per task exceeded' };
   }

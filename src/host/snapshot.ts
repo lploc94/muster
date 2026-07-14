@@ -1,5 +1,6 @@
 import type { Question } from '../bridge/ask-bridge';
 import { deriveRuntimeActivity, deriveViewStatus } from '../task/derived-status';
+import { dependenciesBlockTask } from '../task/scheduler';
 import type { TaskStore } from '../task/store';
 import type {
   MusterTask,
@@ -14,6 +15,28 @@ import type {
 import { projectWorkflowSummaryForRoot } from '../workflow/store';
 import type { WorkflowSummary } from '../workflow/types';
 
+/** Host-owned turn chrome (product surface). Not process/CLI vocabulary. */
+export type TurnActivityWaitReason =
+  | 'dependencies'
+  | 'children'
+  | 'external'
+  | 'held_after_failure'
+  | 'live_turn_ahead'
+  | string;
+
+export type TurnActivity =
+  | {
+      state: 'queued';
+      turnId: string;
+      position?: number;
+      waitReason?: TurnActivityWaitReason;
+    }
+  | { state: 'executing'; turnId: string; phase?: 'starting' | 'streaming' | 'tool' | 'retrying' }
+  | { state: 'waiting_you'; turnId: string; requestId?: string }
+  | { state: 'failed_turn'; turnId: string; retryable: boolean }
+  | { state: 'uncertain'; turnId: string; requiresConfirmation: true }
+  | null;
+
 export interface TaskSummary {
   id: string;
   parentId: string | null;
@@ -22,21 +45,23 @@ export interface TaskSummary {
   /** User-facing work outcome (open / succeeded / failed / cancelled / skipped). */
   lifecycle: TaskLifecycleState;
   /**
-   * CLI/deps/wait activity while lifecycle is open; null when terminal.
-   * Primary UI: lifecycle badge; secondary: this field.
+   * Host-derived deps/wait activity while lifecycle is open; null when terminal.
+   * Prefer currentTurnActivity for turn chrome.
    */
   runtimeActivity: TaskRuntimeActivity | null;
   /**
    * Compact single-axis status for older consumers: terminal lifecycle or
-   * runtime activity. Prefer lifecycle + runtimeActivity.
+   * runtime activity. Prefer lifecycle + currentTurnActivity.
    */
   viewStatus: TaskViewStatus;
-  /** Backend session id for resume (same task, next turn). */
-  committedSessionId?: string;
+  /** Host-authoritative turn activity for composer/list chrome (required protocol v3+). */
+  currentTurnActivity: TurnActivity;
   /** Agent proposed complete/fail; root stays open until user continues or accepts. */
   hasOutcomeProposal?: boolean;
   updatedAt: string;
   backend: string;
+  /** Optional model id selected for this task (ACP session config option value). */
+  model?: string;
   continuationOf?: string;
   /** Safe workflow projection for root tasks (schema ≥ 4). */
   workflow?: WorkflowSummary;
@@ -64,12 +89,37 @@ export type TranscriptItem =
   | { id: string; kind: 'tool'; turnId: string; order: number; content: ToolTranscriptContent }
   | { id: string; kind: 'reasoning'; turnId: string; content: string };
 
+/**
+ * Authoritative queued follow-up turn projection for S03 edit/delete and S04
+ * composer feedback. Ordered by FIFO sequence (then createdAt, then id).
+ * Each entry binds a distinct turn identity to its message inputs.
+ */
+export interface QueuedTurnProjection {
+  turnId: string;
+  sequence: number;
+  status: 'queued';
+  messageIds: string[];
+  createdAt: string;
+  /**
+   * Host-projected user text so the S04 queue panel does not depend on chat transcript
+   * (queued follow-ups stay out of chat).
+   */
+  previewText?: string;
+}
+
 export interface TaskSnapshot {
   rootTasks: TaskSummary[];
   focusedTaskId?: string;
   subtree?: TaskSummary[];
   transcript?: TranscriptItem[];
+  /**
+   * Currently live (running/waiting_user) turn, or the sole queued turn when
+   * nothing is live, or the latest retryable turn under needs_recovery.
+   * Never prefers a later queued follow-up over a live turn (R012 multi-queue).
+   */
   activeTurnId?: string;
+  /** FIFO queued follow-ups for the focused task (excludes the live turn). */
+  queuedTurns?: QueuedTurnProjection[];
   storeRevision: number;
   pendingAsk?: { turnId: string; askId: string; questions: Question[] };
 }
@@ -133,6 +183,108 @@ export function projectActivityTime(file: TaskStoreFile, taskId: string): string
   return latest;
 }
 
+function queuedTurnsFifo(turns: readonly TaskTurn[]): TaskTurn[] {
+  return turns
+    .filter((turn) => turn.status === 'queued')
+    .sort(
+      (a, b) =>
+        a.sequence - b.sequence ||
+        a.createdAt.localeCompare(b.createdAt) ||
+        a.id.localeCompare(b.id),
+    );
+}
+
+function waitReasonForQueuedTurn(file: TaskStoreFile, task: MusterTask, turn: TaskTurn): TurnActivityWaitReason | undefined {
+  if (dependenciesBlockTask(file, task.id)) {
+    return 'dependencies';
+  }
+  if (task.wait?.kind === 'children') {
+    return 'children';
+  }
+  if (task.wait?.kind === 'external') {
+    return 'external';
+  }
+  if (turn.holdAutoPromote) {
+    return 'held_after_failure';
+  }
+  return undefined;
+}
+
+function isPureUserStop(turn: TaskTurn): boolean {
+  if (turn.status !== 'interrupted') return false;
+  if (turn.interruptConfidence === 'forced') return false;
+  // Confirmed cancel / user Stop: transcript shows cancel; no sticky failed chrome.
+  if (turn.interruptConfidence === 'confirmed') return true;
+  return turn.isCancellation === true && !turn.error;
+}
+
+/**
+ * Host projection precedence for currentTurnActivity (first match wins):
+ * 1. Live turn (running / waiting_user)
+ * 2. Earliest queued turn (+ waitReason when blocked)
+ * 3. Latest failed needing attention; pure user Stop → null
+ * 4. else null
+ */
+export function projectCurrentTurnActivity(file: TaskStoreFile, taskId: string): TurnActivity {
+  const task = file.tasks[taskId];
+  if (!task || task.lifecycle !== 'open') {
+    return null;
+  }
+  const turns = turnsForTask(file, taskId);
+  const live = turns.filter((turn) => turn.status === 'running' || turn.status === 'waiting_user');
+  if (live.length > 0) {
+    const liveTurn = live.reduce((latest, turn) => (turn.sequence > latest.sequence ? turn : latest));
+    if (liveTurn.status === 'waiting_user') {
+      return { state: 'waiting_you', turnId: liveTurn.id };
+    }
+    const phase = liveTurn.retryOf ? 'retrying' : undefined;
+    return phase
+      ? { state: 'executing', turnId: liveTurn.id, phase }
+      : { state: 'executing', turnId: liveTurn.id };
+  }
+
+  const queued = queuedTurnsFifo(turns);
+  if (queued.length > 0) {
+    const earliest = queued[0]!;
+    const waitReason = waitReasonForQueuedTurn(file, task, earliest);
+    return {
+      state: 'queued',
+      turnId: earliest.id,
+      position: 1,
+      ...(waitReason ? { waitReason } : {}),
+    };
+  }
+
+  // Inspect latest settled turn overall so a later success clears prior failure chrome.
+  const settled = turns
+    .filter(
+      (turn) =>
+        turn.status === 'succeeded' ||
+        turn.status === 'failed' ||
+        turn.status === 'interrupted' ||
+        turn.status === 'cancelled',
+    )
+    .sort((a, b) => b.sequence - a.sequence || b.createdAt.localeCompare(a.createdAt));
+  const latest = settled[0];
+  if (!latest) {
+    return null;
+  }
+  if (latest.status === 'succeeded' || latest.status === 'cancelled') {
+    return null;
+  }
+  if (isPureUserStop(latest)) {
+    return null;
+  }
+  if (latest.failureClass === 'uncertain') {
+    return { state: 'uncertain', turnId: latest.id, requiresConfirmation: true };
+  }
+  if (latest.status === 'failed') {
+    return { state: 'failed_turn', turnId: latest.id, retryable: true };
+  }
+  // Ambiguous / forced interrupt without confirmed user Stop: soft failed_turn.
+  return { state: 'failed_turn', turnId: latest.id, retryable: true };
+}
+
 export function projectTaskSummary(file: TaskStoreFile, taskId: string): TaskSummary | undefined {
   const task = file.tasks[taskId];
   if (!task) {
@@ -148,10 +300,11 @@ export function projectTaskSummary(file: TaskStoreFile, taskId: string): TaskSum
     lifecycle: task.lifecycle,
     runtimeActivity: deriveRuntimeActivity(task, turns, deps),
     viewStatus: deriveViewStatus(task, turns, deps),
-    committedSessionId: task.committedSessionId,
+    currentTurnActivity: projectCurrentTurnActivity(file, taskId),
     hasOutcomeProposal: task.outcomeProposal != null,
     updatedAt: projectActivityTime(file, taskId),
     backend: task.backend,
+    model: task.model,
     continuationOf: task.continuationOf,
   };
   if (task.parentId === null) {
@@ -196,9 +349,23 @@ export function buildTranscript(file: TaskStoreFile, taskId: string): Transcript
       continue;
     }
     const turnId = message.role === 'assistant' ? message.turnId : (message.turnId ?? msgTurn.get(message.id));
+    // FIFO follow-ups stay in the queue panel only until their turn starts.
+    // Do not project user messages bound to still-queued turns into chat.
+    if (message.role === 'user' && turnId) {
+      const boundTurn = file.turns[turnId];
+      if (boundTurn?.status === 'queued') {
+        continue;
+      }
+    }
     const seq = turnId !== undefined && seqOf.has(turnId) ? seqOf.get(turnId)! : -1;
-    // user prompt (-2) sorts before reasoning (-1) and assistant/tool segments (>=0).
-    const order = message.role === 'assistant' ? (message.order ?? 0) : -2;
+    // Opening user prompts use order -2 (before reasoning -1 / assistant >=0).
+    // Explicit message.order (if present) is respected for ordered segments.
+    const order =
+      message.role === 'assistant'
+        ? (message.order ?? 0)
+        : message.order !== undefined
+          ? message.order
+          : -2;
     entries.push({
       item: {
         id: message.id,
@@ -267,13 +434,72 @@ export function buildTranscript(file: TaskStoreFile, taskId: string): Transcript
   return entries.map((entry) => entry.item);
 }
 
+function messageIdsForTurn(turn: TaskTurn): string[] {
+  return turn.inputs
+    .filter((input): input is { kind: 'message'; messageId: string } => input.kind === 'message')
+    .map((input) => input.messageId);
+}
+
+/**
+ * FIFO queued follow-up turns for a task. Excludes live/settled turns so S03/S04
+ * can key edit/delete and composer feedback off dedicated turn identity.
+ */
+function previewTextForQueuedTurn(file: TaskStoreFile, turn: TaskTurn): string {
+  const parts: string[] = [];
+  for (const messageId of messageIdsForTurn(turn)) {
+    const message = file.messages[messageId];
+    if (!message || message.role !== 'user') continue;
+    const text = message.content.trim();
+    if (text) parts.push(text);
+  }
+  return parts.join('\n');
+}
+
+export function projectQueuedTurns(file: TaskStoreFile, taskId: string): QueuedTurnProjection[] {
+  return turnsForTask(file, taskId)
+    .filter((turn) => turn.status === 'queued')
+    .sort(
+      (a, b) =>
+        a.sequence - b.sequence ||
+        a.createdAt.localeCompare(b.createdAt) ||
+        a.id.localeCompare(b.id),
+    )
+    .map((turn) => {
+      const previewText = previewTextForQueuedTurn(file, turn);
+      return {
+        turnId: turn.id,
+        sequence: turn.sequence,
+        status: 'queued' as const,
+        messageIds: messageIdsForTurn(turn),
+        createdAt: turn.createdAt,
+        ...(previewText ? { previewText } : {}),
+      };
+    });
+}
+
+/**
+ * Active turn for host/webview controls:
+ * 1. Live running/waiting_user turn (never a later queued follow-up)
+ * 2. Else earliest queued turn by sequence (resume target when nothing is live)
+ * 3. Else latest failed/interrupted under needs_recovery
+ */
 export function activeTurnIdForTask(file: TaskStoreFile, taskId: string): string | undefined {
   const turns = turnsForTask(file, taskId);
-  const live = turns.filter(
-    (turn) => turn.status === 'running' || turn.status === 'waiting_user' || turn.status === 'queued',
-  );
+  const live = turns.filter((turn) => turn.status === 'running' || turn.status === 'waiting_user');
   if (live.length > 0) {
+    // Prefer highest sequence if multiple live (should be rare; scheduler enforces one).
     return live.reduce((latest, turn) => (turn.sequence > latest.sequence ? turn : latest)).id;
+  }
+  const queued = turns
+    .filter((turn) => turn.status === 'queued')
+    .sort(
+      (a, b) =>
+        a.sequence - b.sequence ||
+        a.createdAt.localeCompare(b.createdAt) ||
+        a.id.localeCompare(b.id),
+    );
+  if (queued.length > 0) {
+    return queued[0]!.id;
   }
   const task = file.tasks[taskId];
   if (!task) {
@@ -319,6 +545,7 @@ export function buildSnapshot(
     .sort((a, b) => a.id.localeCompare(b.id));
   snapshot.transcript = buildTranscript(file, focusedTaskId);
   snapshot.activeTurnId = activeTurnIdForTask(file, focusedTaskId);
+  snapshot.queuedTurns = projectQueuedTurns(file, focusedTaskId);
 
   const pending = activePendingAsks?.get(focusedTaskId);
   if (pending) {

@@ -11,7 +11,7 @@ import type { NormalizedEvent, Question } from './types';
  * breaking change to the ExtMessage/OutMessage shapes below (and mirror it in
  * src/extension.ts).
  */
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 /**
  * Decide whether a peer's advertised protocol version is compatible with ours.
@@ -60,6 +60,27 @@ export interface WorkflowSummaryView {
   updatedAt: string;
   confidence?: string;
 }
+/** Host-owned turn chrome (mirrors src/host/snapshot.ts). */
+export type TurnActivityWaitReason =
+  | 'dependencies'
+  | 'children'
+  | 'external'
+  | 'held_after_failure'
+  | 'live_turn_ahead'
+  | string;
+
+export type TurnActivity =
+  | {
+      state: 'queued';
+      turnId: string;
+      position?: number;
+      waitReason?: TurnActivityWaitReason;
+    }
+  | { state: 'executing'; turnId: string; phase?: 'starting' | 'streaming' | 'tool' | 'retrying' }
+  | { state: 'waiting_you'; turnId: string; requestId?: string }
+  | { state: 'failed_turn'; turnId: string; retryable: boolean }
+  | { state: 'uncertain'; turnId: string; requiresConfirmation: true }
+  | null;
 
 export interface TaskSummary {
   id: string;
@@ -70,12 +91,14 @@ export interface TaskSummary {
   /** Present when host supports dual-axis status; null when lifecycle is terminal. */
   runtimeActivity?: TaskRuntimeActivity | null;
   viewStatus: TaskViewStatus;
-  /** Backend session bound to this task for resume across process restarts. */
-  committedSessionId?: string;
+  /** Host-authoritative turn activity for composer/list chrome (required protocol v3+). */
+  currentTurnActivity: TurnActivity;
   /** Agent proposed complete/fail while lifecycle remains open. */
   hasOutcomeProposal?: boolean;
   updatedAt: string;
   backend: string;
+  /** Optional model id selected for this task (ACP session config option value). */
+  model?: string;
   continuationOf?: string;
   /** Root-task workflow phase/plan summary when present. */
   workflow?: WorkflowSummaryView;
@@ -115,6 +138,19 @@ export interface PendingPermission {
   options: PermissionOptionView[];
 }
 
+/** FIFO queued follow-up turns projected by the host for edit/delete and composer feedback. */
+export interface QueuedTurnProjection {
+  turnId: string;
+  sequence: number;
+  status: 'queued';
+  messageIds: string[];
+  createdAt: string;
+  /** Host-projected user text so the queue panel works without chat bubbles. */
+  previewText?: string;
+  /** Prefer concurrent inject when a live turn is available. */
+  delivery?: 'turn' | 'live_inject';
+}
+
 export interface SnapshotMessage {
   type: 'snapshot';
   /**
@@ -128,6 +164,8 @@ export interface SnapshotMessage {
   subtree?: TaskSummary[];
   transcript?: TranscriptItem[];
   activeTurnId?: string;
+  /** Authoritative multi-queue projection (R012); optional for older hosts. */
+  queuedTurns?: QueuedTurnProjection[];
   storeRevision: number;
   pendingAsk?: PendingAsk;
 }
@@ -194,6 +232,35 @@ export type ExtMessage =
   | { type: 'askPending'; taskId: string; turnId: string; askId: string; questions: Question[] }
   | { type: 'askCleared'; taskId: string; turnId: string; askId: string }
   | {
+      type: 'askSubmissionResult';
+      taskId: string;
+      turnId: string;
+      askId: string;
+      ok: boolean;
+      message?: string;
+    }
+  | {
+      type: 'elicitationFormPending';
+      promptId: string;
+      sessionId?: string;
+      toolCallId?: string;
+      message: string;
+      fields: Array<Record<string, unknown>>;
+      required: string[];
+      askLike?: boolean;
+    }
+  | {
+      type: 'elicitationUrlPending';
+      promptId: string;
+      elicitationId: string;
+      sessionId?: string;
+      url: string;
+      message: string;
+    }
+  | { type: 'elicitationUrlWaiting'; promptId: string; elicitationId: string; message?: string }
+  | { type: 'elicitationCleared'; promptId: string }
+  | { type: 'elicitationSubmissionResult'; promptId: string; ok: boolean; message?: string }
+  | {
       type: 'permissionPending';
       sessionId: string;
       permissionId: string;
@@ -214,15 +281,56 @@ export type ExtMessage =
       data?: unknown;
       error?: { code: string; message: string };
     }
-  | { type: 'filePicked'; path: string }
+  /** Phase C: durable send accepted after store commit (or re-ACK of receipt). */
+  | {
+      type: 'sendAccepted';
+      clientRequestId: string;
+      taskId: string;
+      messageId: string;
+      turnId?: string;
+    }
+  /** Phase C: send rejected (capacity, conflict, store failure). */
+  | {
+      type: 'sendRejected';
+      clientRequestId: string;
+      taskId?: string;
+      reason: string;
+      code?: 'conflict' | 'capacity' | 'store' | 'validation' | 'unknown';
+    }
+  /**
+   * Host acknowledgement that a live-input instruction was delivered to the
+   * locally owned active backend session. Refusals use `commandError` with a
+   * capability- or ownership-specific message instead — never a queued turn.
+   */
+  | { type: 'liveInputResult'; taskId: string; code: 'delivered'; sessionId: string }
+  /** `path` = resolve target for LLM; optional `displayName` = short chip label. */
+  | { type: 'filePicked'; path: string; displayName?: string }
   | { type: 'backendsAvailable'; backends: string[] }
-  | { type: 'modelsAvailable'; models: Record<string, BackendModels> };
+  | { type: 'modelsAvailable'; models: Record<string, BackendModels> }
+  /**
+   * Host-persisted last-used composer backend/model (globalState). Sent on
+   * webview mount so the picker survives restarts — webview `setState` alone
+   * is not durable enough when the view is recreated.
+   */
+  | { type: 'composerSelection'; backend: string; model: string | null };
 
 export type AskAnswer = { selected: string[]; freeText: string | null };
 
 // Webview -> extension host (protocol v2)
 export type OutMessage =
-  | { type: 'send'; taskId?: string; text: string; backend?: string; model?: string; continuationOf?: string }
+  | {
+      type: 'send';
+      taskId?: string;
+      /** User-visible text (display-name mentions). */
+      text: string;
+      /** Agent-facing text when mentions expand to full paths. */
+      llmText?: string;
+      backend?: string;
+      model?: string;
+      continuationOf?: string;
+      /** Phase C idempotent send key (stable across resend). */
+      clientRequestId?: string;
+    }
   /** Explicit command invoke (slash already parsed client-side; host re-parses). */
   | { type: 'runCommand'; text: string; taskId?: string }
   | { type: 'focusTask'; taskId: string }
@@ -231,14 +339,52 @@ export type OutMessage =
   | { type: 'cancelTurn'; taskId: string; turnId: string }
   | { type: 'submitAsk'; taskId: string; turnId: string; askId: string; answers: Record<string, AskAnswer> }
   | { type: 'cancelAsk'; taskId: string; turnId: string; askId: string }
+  | {
+      type: 'submitElicitation';
+      promptId: string;
+      action: 'accept' | 'decline' | 'cancel';
+      content?: Record<string, unknown>;
+    }
   | { type: 'submitPermission'; permissionId: string; optionId: string; remember: boolean }
   | { type: 'cancelPermission'; permissionId: string }
-  | { type: 'retryTurn'; taskId: string; turnId: string; instruction: string }
+  | {
+      type: 'retryTurn';
+      taskId: string;
+      turnId: string;
+      instruction: string;
+      /** Phase C explicit replay: reuse prior turn inputs (byte-stable prompt). */
+      reuseOriginalInputs?: boolean;
+    }
   | { type: 'continueTask'; taskId: string; instruction: string }
+  /**
+   * Deliver an instruction to the currently running, locally owned turn for
+   * `taskId` when the backend proves live-input support. Distinct from
+   * `continueTask` (which queues a follow-up turn). Host refuses with
+   * `commandError` when unsupported / not local owner / no active turn.
+   */
+  | { type: 'sendLiveInput'; taskId: string; instruction: string }
+  /**
+   * Edit the bound pending user message of an undispatched queued turn for
+   * `taskId` identified by `turnId`. Host refuses with `commandError` when the
+   * turn is missing, foreign, already dispatched, or content is invalid.
+   * Distinct from `continueTask` (which creates a new queued turn).
+   */
+  | { type: 'editQueuedTurn'; taskId: string; turnId: string; content: string }
+  /**
+   * Remove an undispatched queued turn and its bound pending user message(s).
+   * Host refuses with `commandError` when the turn is missing, foreign, or
+   * already dispatched. Does not cancel an active/running turn.
+   */
+  | { type: 'deleteQueuedTurn'; taskId: string; turnId: string }
   | { type: 'resumeQueuedTurn'; taskId: string; turnId: string }
   | { type: 'pickFile' }
   | { type: 'browseWorkspaceFiles' }
   | { type: 'resolveFileDrop'; candidates: string[] }
+  /**
+   * When the webview has file bytes but no filesystem path (Finder → sandboxed
+   * webview), host writes a temp copy and replies with `filePicked` absolute path.
+   */
+  | { type: 'importDroppedFile'; name: string; data: ArrayBuffer }
   | { type: 'openLink'; url: string }
   | { type: 'clearHistory' }
   | { type: 'deleteTask'; taskId: string }
@@ -248,6 +394,11 @@ export type OutMessage =
   | { type: 'updateSetting'; settingId: RetentionSettingId; value: number }
   | { type: 'listBackends' }
   | { type: 'listModels' }
+  /**
+   * Persist the composer's last-used backend/model on the host (globalState)
+   * so the preference survives full restarts and webview recreation.
+   */
+  | { type: 'setComposerSelection'; backend: string; model?: string | null }
   /** User sets task lifecycle (not CLI-driven). */
   | {
       type: 'setTaskLifecycle';
@@ -340,6 +491,34 @@ function isSettingsUpdateResult(v: unknown): v is SettingsUpdateResult {
   return isRetentionSettingId(v.settingId);
 }
 
+function isTurnActivity(v: unknown): v is TurnActivity {
+  if (v === null) return true;
+  if (!isRecord(v) || !isString(v.state) || !isString(v.turnId)) return false;
+  switch (v.state) {
+    case 'queued':
+      return (
+        (v.position === undefined || isNumber(v.position)) &&
+        (v.waitReason === undefined || isString(v.waitReason))
+      );
+    case 'executing':
+      return (
+        v.phase === undefined ||
+        v.phase === 'starting' ||
+        v.phase === 'streaming' ||
+        v.phase === 'tool' ||
+        v.phase === 'retrying'
+      );
+    case 'waiting_you':
+      return v.requestId === undefined || isString(v.requestId);
+    case 'failed_turn':
+      return typeof v.retryable === 'boolean';
+    case 'uncertain':
+      return v.requiresConfirmation === true;
+    default:
+      return false;
+  }
+}
+
 function isTaskSummary(v: unknown): v is TaskSummary {
   if (!isRecord(v)) return false;
   return (
@@ -349,8 +528,10 @@ function isTaskSummary(v: unknown): v is TaskSummary {
     isString(v.role) &&
     isString(v.lifecycle) &&
     isString(v.viewStatus) &&
+    isTurnActivity(v.currentTurnActivity) &&
     isString(v.updatedAt) &&
-    isString(v.backend)
+    isString(v.backend) &&
+    (v.model === undefined || isString(v.model))
   );
 }
 
@@ -375,6 +556,20 @@ function isTranscriptItem(v: unknown): v is TranscriptItem {
     default:
       return false;
   }
+}
+
+function isQueuedTurnProjection(v: unknown): v is QueuedTurnProjection {
+  if (!isRecord(v)) return false;
+  return (
+    isString(v.turnId) &&
+    isNumber(v.sequence) &&
+    v.status === 'queued' &&
+    Array.isArray(v.messageIds) &&
+    v.messageIds.every(isString) &&
+    isString(v.createdAt) &&
+    (v.previewText === undefined || isString(v.previewText)) &&
+    (v.delivery === undefined || v.delivery === 'turn' || v.delivery === 'live_inject')
+  );
 }
 
 /** Discriminated runtime guard for a NormalizedEvent arriving from the host. */
@@ -422,6 +617,7 @@ const TURN_SCOPED_TYPES = new Set([
   'turnError',
   'askPending',
   'askCleared',
+  'askSubmissionResult',
 ]);
 
 /** Minimal runtime guard for messages arriving from the extension host. */
@@ -445,6 +641,8 @@ export function isExtMessage(data: unknown): data is ExtMessage {
         (data.subtree === undefined || (Array.isArray(data.subtree) && data.subtree.every(isTaskSummary))) &&
         (data.transcript === undefined || (Array.isArray(data.transcript) && data.transcript.every(isTranscriptItem))) &&
         (data.activeTurnId === undefined || isString(data.activeTurnId)) &&
+        (data.queuedTurns === undefined ||
+          (Array.isArray(data.queuedTurns) && data.queuedTurns.every(isQueuedTurnProjection))) &&
         (data.pendingAsk === undefined ||
           (isRecord(data.pendingAsk) &&
             isString(data.pendingAsk.turnId) &&
@@ -483,6 +681,42 @@ export function isExtMessage(data: unknown): data is ExtMessage {
     case 'askCleared':
       return isString(data.askId);
 
+    case 'askSubmissionResult':
+      return (
+        isString(data.askId) &&
+        typeof data.ok === 'boolean' &&
+        (data.message === undefined || isString(data.message))
+      );
+
+    case 'elicitationFormPending':
+      return (
+        isString(data.promptId) &&
+        isString(data.message) &&
+        Array.isArray(data.fields) &&
+        Array.isArray(data.required)
+      );
+
+    case 'elicitationUrlPending':
+      return (
+        isString(data.promptId) &&
+        isString(data.elicitationId) &&
+        isString(data.url) &&
+        isString(data.message)
+      );
+
+    case 'elicitationUrlWaiting':
+      return isString(data.promptId) && isString(data.elicitationId);
+
+    case 'elicitationCleared':
+      return isString(data.promptId);
+
+    case 'elicitationSubmissionResult':
+      return (
+        isString(data.promptId) &&
+        typeof data.ok === 'boolean' &&
+        (data.message === undefined || isString(data.message))
+      );
+
     case 'permissionPending':
       return (
         isString(data.sessionId) &&
@@ -509,8 +743,37 @@ export function isExtMessage(data: unknown): data is ExtMessage {
         (data.presenter === undefined || isString(data.presenter))
       );
 
+    case 'sendAccepted':
+      return (
+        isString(data.clientRequestId) &&
+        isString(data.taskId) &&
+        isString(data.messageId) &&
+        (data.turnId === undefined || isString(data.turnId))
+      );
+
+    case 'sendRejected':
+      return (
+        isString(data.clientRequestId) &&
+        isString(data.reason) &&
+        (data.taskId === undefined || isString(data.taskId)) &&
+        (data.code === undefined ||
+          data.code === 'conflict' ||
+          data.code === 'capacity' ||
+          data.code === 'store' ||
+          data.code === 'validation' ||
+          data.code === 'unknown')
+      );
+
+    case 'liveInputResult':
+      return (
+        hasOnlyKeys(data, ['type', 'taskId', 'code', 'sessionId']) &&
+        isString(data.taskId) &&
+        data.code === 'delivered' &&
+        isString(data.sessionId)
+      );
+
     case 'filePicked':
-      return isString(data.path);
+      return isString(data.path) && (data.displayName === undefined || isString(data.displayName));
 
     case 'backendsAvailable':
       return Array.isArray(data.backends) && data.backends.every(isString);
@@ -518,9 +781,40 @@ export function isExtMessage(data: unknown): data is ExtMessage {
     case 'modelsAvailable':
       return typeof data.models === 'object' && data.models !== null;
 
+    case 'composerSelection':
+      return (
+        hasOnlyKeys(data, ['type', 'backend', 'model']) &&
+        isString(data.backend) &&
+        (data.model === null || isString(data.model))
+      );
+
     default:
       return false;
   }
+}
+
+/**
+ * User-visible acknowledgement for a successful host `liveInputResult`.
+ * Session id is required so callers never invent a silent/empty success banner.
+ */
+export function formatLiveInputDeliveredMessage(sessionId: string): string {
+  if (typeof sessionId !== 'string' || sessionId.trim().length === 0) {
+    throw new Error('sessionId is required for live-input delivered acknowledgements');
+  }
+  return 'Live input delivered to the active session.';
+}
+
+/**
+ * Task-scoped banner visibility shared by commandError refusals and live-input
+ * success notices. Global (absent/null taskId) banners always show; otherwise
+ * only the currently focused task sees the feedback.
+ */
+export function isTaskScopedBannerVisible(
+  taskId: string | null | undefined,
+  focusedTaskId: string | null,
+): boolean {
+  if (taskId == null || taskId === '') return true;
+  return focusedTaskId != null && taskId === focusedTaskId;
 }
 
 /** Any sealed lifecycle (including soft failed). Prefer hard/soft helpers for UX. */
@@ -528,12 +822,12 @@ export function isTerminalStatus(status: TaskViewStatus | string): boolean {
   return status === 'succeeded' || status === 'failed' || status === 'cancelled' || status === 'skipped';
 }
 
-/** Hard terminal: thread read-only; follow-up is a new task. */
+/** Hard terminal: sealed success/cancel/skip (user may reopen same id). */
 export function isHardTerminalLifecycle(lifecycle: string): boolean {
   return lifecycle === 'succeeded' || lifecycle === 'cancelled' || lifecycle === 'skipped';
 }
 
-/** Soft terminal: same task may reopen on send. */
+/** Soft terminal: sealed fail (user may reopen same id, same as hard). */
 export function isSoftTerminalLifecycle(lifecycle: string): boolean {
   return lifecycle === 'failed';
 }

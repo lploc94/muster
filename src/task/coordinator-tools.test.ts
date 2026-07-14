@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { dispatch } from './coordinator-tools';
+import {
+  dispatch,
+  PRESENTATION_ID_MAX_LENGTH,
+  PRESENTATION_MARKDOWN_MAX_LENGTH,
+  PRESENTATION_TITLE_MAX_LENGTH,
+} from './coordinator-tools';
 import type { CredentialContext } from '../bridge/credentials';
 
 function ctx(actions: string[]): CredentialContext {
@@ -14,6 +19,124 @@ function ctx(actions: string[]): CredentialContext {
 }
 
 describe('coordinator-tools dispatch', () => {
+  it('maps a valid presentation upsert owned by the caller to ToolCommand', () => {
+    const result = dispatch(
+      'upsert_presentation',
+      {
+        presentationId: 'release-notes',
+        ownerTaskId: 'task-1',
+        opId: 'op-present-1',
+        revision: 1,
+        title: 'Release notes',
+        markdown: '# Ready',
+      },
+      ctx(['upsert_presentation']),
+    );
+
+    expect(result).toEqual({
+      ok: true,
+      command: {
+        kind: 'upsert_presentation',
+        presentationId: 'release-notes',
+        ownerTaskId: 'task-1',
+        opId: 'op-present-1',
+        revision: 1,
+        title: 'Release notes',
+        markdown: '# Ready',
+      },
+    });
+  });
+
+  it('returns the stable unauthorized code when presentation capability is absent', () => {
+    const result = dispatch(
+      'upsert_presentation',
+      {
+        presentationId: 'release-notes',
+        ownerTaskId: 'task-1',
+        opId: 'op-present-1',
+        revision: 1,
+        title: 'Release notes',
+        markdown: '# Ready',
+      },
+      ctx([]),
+    );
+
+    expect(result).toEqual({ ok: false, toolError: 'unauthorized' });
+  });
+
+  it('returns invalid_arguments for a non-object presentation payload', () => {
+    const result = dispatch('upsert_presentation', null, ctx(['upsert_presentation']));
+
+    expect(result).toEqual({ ok: false, toolError: 'invalid_arguments' });
+  });
+
+  it('rejects a presentation owner that does not match the credential caller', () => {
+    const result = dispatch(
+      'upsert_presentation',
+      {
+        presentationId: 'release-notes',
+        ownerTaskId: 'task-forged',
+        opId: 'op-present-1',
+        revision: 1,
+        title: 'Release notes',
+        markdown: '# Ready',
+      },
+      ctx(['upsert_presentation']),
+    );
+
+    expect(result).toEqual({ ok: false, toolError: 'owner_mismatch' });
+  });
+
+  it.each([
+    ['unknown field', { extra: true }],
+    ['invalid presentation ID', { presentationId: 'contains spaces' }],
+    ['invalid owner task ID', { ownerTaskId: '../task-1' }],
+    ['invalid operation ID', { opId: '' }],
+    ['non-positive revision', { revision: 0 }],
+    ['wrong title type', { title: 42 }],
+    ['empty Markdown', { markdown: '' }],
+  ])('rejects presentation arguments with %s', (_label, override) => {
+    const result = dispatch(
+      'upsert_presentation',
+      {
+        presentationId: 'release-notes',
+        ownerTaskId: 'task-1',
+        opId: 'op-present-1',
+        revision: 1,
+        title: 'Release notes',
+        markdown: '# Ready',
+        ...override,
+      },
+      ctx(['upsert_presentation']),
+    );
+
+    expect(result).toEqual({ ok: false, toolError: 'invalid_arguments' });
+  });
+
+  it.each([
+    ['presentation ID', { presentationId: `p${'x'.repeat(PRESENTATION_ID_MAX_LENGTH)}` }],
+    ['owner task ID', { ownerTaskId: `t${'x'.repeat(PRESENTATION_ID_MAX_LENGTH)}` }],
+    ['operation ID', { opId: `o${'x'.repeat(PRESENTATION_ID_MAX_LENGTH)}` }],
+    ['title', { title: 'x'.repeat(PRESENTATION_TITLE_MAX_LENGTH + 1) }],
+    ['Markdown', { markdown: 'x'.repeat(PRESENTATION_MARKDOWN_MAX_LENGTH + 1) }],
+  ])('rejects an oversized presentation %s without reflecting content', (_label, override) => {
+    const result = dispatch(
+      'upsert_presentation',
+      {
+        presentationId: 'release-notes',
+        ownerTaskId: 'task-1',
+        opId: 'op-present-1',
+        revision: 1,
+        title: 'Release notes',
+        markdown: '# Ready',
+        ...override,
+      },
+      ctx(['upsert_presentation']),
+    );
+
+    expect(result).toEqual({ ok: false, toolError: 'payload_too_large' });
+  });
+
   it('maps create_task to ToolCommand', () => {
     const result = dispatch(
       'create_task',

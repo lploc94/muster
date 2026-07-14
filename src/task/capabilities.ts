@@ -7,7 +7,8 @@ export type CoordinatorAction =
   | 'interrupt_task'
   | 'cancel_task'
   | 'wait_for_tasks'
-  | 'get_task_status';
+  | 'get_task_status'
+  | 'upsert_presentation';
 
 export type AnyTaskAction = 'complete_task' | 'fail_task' | 'report_progress' | 'ask_user';
 
@@ -37,6 +38,7 @@ export function capabilitiesFor(
 ): Set<ToolAction> {
   const granted = new Set<ToolAction>(ANY_TASK_ACTIONS);
   if (task.role === 'coordinator') {
+    granted.add('upsert_presentation');
     for (const cap of task.capabilities) {
       for (const action of CAPABILITY_TO_ACTIONS[cap] ?? []) {
         granted.add(action);

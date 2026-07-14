@@ -18,14 +18,14 @@ document describes the legacy single-chat flow differently, this document is
 authoritative for the task-based flow.
 
 **Outcome model (normative):** task **lifecycle** (open / succeeded / failed /
-cancelled / skipped) is a **work outcome**, not the CLI process status. A new
+cancelled / skipped) is a **work outcome**, not agent process status. A new
 task is always `open`. Lifecycle is sealed only by an **authorized actor** — the
 **user** and/or a **coordinator task** when the user has enabled outcome
-delegation (including a future **yolo** / full handoff mode). CLI turn success,
+delegation (including a future **yolo** / full handoff mode). Turn success,
 process exit, and adapter errors never by themselves set lifecycle to
-`succeeded` / `failed` / `skipped`. Webview and host projections keep **three
-separate axes**: task lifecycle, CLI process status, and orchestration activity
-(see §4.3, §4.1.1, and §5).
+`succeeded` / `failed` / `skipped`. Product projections keep **lifecycle + turn
+activity** (plus secondary orchestration panels); process/session stay
+engine-internal (see §4.3, §4.1.1, and §5; plan `task-chat-turn-hide-cli`).
 
 ---
 
@@ -53,9 +53,9 @@ events, or visual rendering details. Those belong to the related documents.
 | Term | Definition | Lifetime |
 |------|------------|----------|
 | **Task** | A unit of work with a goal, dependencies, policy, and user-facing **lifecycle** outcome | Until hard terminal; soft `failed` may reopen |
-| **Lifecycle** | Persisted work outcome (`open` / `succeeded` / `failed` / `cancelled` / `skipped`) | Independent of CLI process |
-| **CLI process status** | Whether a CLI process exists and is busy/idle/stopped (see §4.3.2) | Ephemeral / derived; not task outcome |
-| **CLI last exit** | How the last process ended (`ok` / `error` / `cancelled` / …) — not a process phase | Attached when process is stopped |
+| **Lifecycle** | Persisted work outcome (`open` / `succeeded` / `failed` / `cancelled` / `skipped`) | Independent of agent process |
+| **Turn activity** | Product chrome for current turn (`executing` / `waiting_you` / `queued` / `failed_turn` / ready) | Ephemeral / derived; not task outcome |
+| **Process status** | Engine-internal: whether an agent process exists and is busy/idle/stopped | Ephemeral; **not** product chrome after Phase A |
 | **Orchestration activity** | Graph/scheduling waits while open (deps, children, recovery, outcome proposal) | Ephemeral / derived |
 | **Runtime activity** | Host-derived open-task activity (legacy compact name for orchestration + turn live signals) | Ephemeral / derived |
 | **Outcome proposal** | Request to mark complete/fail; awaits an authorized sealer when not auto-sealed | Cleared on accept/reject/cancel/seal |
@@ -125,9 +125,11 @@ Implementations must preserve all of the following:
    enum that the UI treats as “the task status.”
 5. **Create always yields `open`.** No other lifecycle is written at creation.
 6. **Hard vs soft terminal:**
-   - `succeeded`, `cancelled`, and `skipped` are **hard terminal**: read-only;
-     further user work uses a **continuation task** or a new task, never silently
-     reopening the same outcome node for dependents that already observed it.
+   - `succeeded`, `cancelled`, and `skipped` are **hard terminal** for
+     dependents/outcome observation (the sealed node stays historically terminal
+     until reopened). A new user **message on the same task id reopens** to
+     `open` and may queue a turn; operators may still create a new/continuation
+     task instead.
    - `failed` is **soft terminal**: no automatic coordinator turns; a new user
      message **reopens** the same task to `open` and may queue a turn. This is
      not a continuation task.
@@ -428,17 +430,20 @@ changed back to `queued` or `running`.
 
 ### 4.3 Status axes (normative)
 
-Muster exposes **three independent axes**. Mixing them into one badge is a
-product bug.
+Product UI exposes **task lifecycle + turn activity** (plus secondary
+orchestration panels). **Process and session identity are engine-internal** —
+not product chrome after Phase A of `docs/plans/task-chat-turn-hide-cli.md`.
 
 | Axis | Question | Where in UI (normative) |
 |------|----------|-------------------------|
 | **Task lifecycle** | Is the work open / done / failed / cancelled / skipped? | Task list badge + workspace header |
-| **CLI process status** | Is a CLI process not started, running, idle (alive), or stopped? | Near composer / send–stop (process chrome) |
-| **Orchestration activity** | Waiting on deps, children, recovery, outcome proposal? | Secondary line / action panels — not the task badge, not the CLI phase |
+| **Turn activity** | Is a turn working / waiting for you / queued / could not finish / ready? | Composer strip (`data-turn-activity`); optional turn-active list dot |
+| **Orchestration activity** | Waiting on deps, children, recovery, outcome proposal? | Secondary line / action panels — not the task badge |
+| **Process / session** (internal) | Agent process and `committedSessionId` | Engine-owned; **not** product chrome; not on webview wire (Phase B+) |
 
 The store persists **lifecycle**, turns, dependencies, waits, and optional
-`outcomeProposal`. CLI process status and orchestration activity are **derived**.
+`outcomeProposal`. Turn activity is **host-projected** as `currentTurnActivity`
+(Phase B); orchestration may still appear via `runtimeActivity`.
 
 #### 4.3.1 Task lifecycle (persisted work outcome)
 
@@ -447,115 +452,58 @@ type TaskLifecycleState =
   | 'open' | 'succeeded' | 'failed' | 'cancelled' | 'skipped';
 ```
 
-Primary task badge only. Never set from CLI exit alone. See §5.
+Primary task badge only. Never set from agent/process exit alone. See §5.
 
-#### 4.3.2 CLI process status
+#### 4.3.2 Turn activity (product) and process (engine-internal)
 
-CLI status answers: **does a process exist, and is it generating?** It is
-orthogonal to task lifecycle.
-
-##### Internal layers (implementation)
+**Product strip** answers: **what is the current turn doing?** Labels:
+Working / Waiting for you / Queued / Could not finish / (no strip when ready).
 
 ```ts
-/** Whether a process is up for this task’s current agent session. */
-type CliProcessPhase =
-  | 'not_started'  // never spawned for this task (or only queued, not yet spawned)
-  | 'starting'     // optional: between schedule and first live event (may fold into not_started)
-  | 'on'           // process is alive
-  | 'stopped';     // process was up and has exited
-
-/** What the live process is doing — only meaningful when phase === 'on'. */
-type CliProcessActivity =
-  | 'busy'          // streaming, tools, reasoning — “đang trả lời”
-  | 'idle'          // alive but not generating (rare if each turn is one process)
-  | 'waiting_user';  // alive, blocked on ask_user (still on)
-
-/**
- * How the last process ended — NOT a peer of process phase.
- * Present when phase === 'stopped' (and optionally on history).
- */
-type CliLastExit =
-  | 'ok'          // clean turnCompleted / normal stop
-  | 'error'       // adapter error, non-zero failure, missing terminal
-  | 'cancelled'   // user/host interrupt or cancel of the live process
-  | 'unknown';
+// Product-facing (Phase A client-derived; Phase B host-owned currentTurnActivity)
+type TurnActivityState =
+  | 'executing'    // live turn generating
+  | 'waiting_you'  // ask_user / waiting_user
+  | 'queued'       // turn queued, not yet live
+  | 'failed_turn'  // needs_recovery / last turn failed
+  | 'null';         // ready / between turns — no strip
 ```
 
-**Error is not a CLI phase.** A failed run is:
+**Engine-internal** process phase (not webview chrome) remains useful for
+adapters: spawn, shared agent, exit codes, `committedSessionId`. Do **not**
+project process phase labels (“CLI running/stopped/idle”) or session ids into
+product UI.
 
-- process **phase** → `stopped`, and  
-- **lastExit** → `error` (or turn `failed` / recovery UI),  
+##### Turn vs task error
 
-not `CliProcessStatus = 'error'`. Tool errors mid-turn leave phase `on` and
-activity `busy`; they are transcript events, not process phase.
-
-##### Product-facing CLI view (MVP chip)
-
-Collapse phase + activity into four user-visible values (composer chrome):
-
-```ts
-/**
- * Product CLI chip. Derived; never persisted as task.lifecycle.
- * Map: not_started | running (on+busy) | idle (on+idle|waiting_user) | stopped
- */
-type CliViewStatus =
-  | 'not_started'  // chưa bật — no process yet
-  | 'running'      // đang bật + đang trả lời (on + busy)
-  | 'idle'         // đang bật nhưng không generate (on + idle | waiting_user)
-  | 'stopped';     // đã tắt — process exited (see lastExit for why)
-```
-
-| `CliViewStatus` | Phase | Activity | Typical labels |
-|-----------------|-------|----------|----------------|
-| `not_started` | `not_started` (or `starting`) | — | CLI not started |
-| `running` | `on` | `busy` | CLI running |
-| `idle` | `on` | `idle` or `waiting_user` | CLI idle / waiting for you |
-| `stopped` | `stopped` | — | CLI stopped (+ optional last exit subtitle) |
-
-Derivation sketch (from turns + live stream flags):
-
-1. Live turn `status === 'running'` and generating (or webview `thread.running` without ask) → **`running`**.
-2. Live turn `status === 'waiting_user'` (or process on but paused for ask) → **`idle`** (detail: waiting for you). Process is still **on**.
-3. Turn `queued` only (not yet spawned) → **`not_started`** (optional: show Starting if `starting` is modeled).
-4. Latest process settled, or orchestration with no live process (`needs_recovery`, `waiting_children`, `awaiting_outcome`, hard/soft terminal with prior process) → **`stopped`**; set `lastExit` from latest terminal turn when known.
-5. Open task, never spawned → **`not_started`**.
-
-**Reload / derive hints (webview):** until the host projects `cliViewStatus`, treat a prior process as known when `thread.hadProcess` is true **or** the task has a `committedSessionId` (bound conversation implies a prior successful process). Empty open task with neither → `not_started`.
-
-Under Muster’s common **one process per turn** model, `on + idle` between user
-messages is uncommon (process usually exits → `stopped`). `idle` is still
-required for **ask_user** (process alive, not generating). If a backend later
-holds a long-lived process between prompts, `idle` covers that too.
-
-##### CLI vs task error
-
-| Situation | CLI view | Task lifecycle |
-|-----------|----------|----------------|
-| Process crash / turn adapter error | `stopped` + `lastExit: error` | stays `open` (often orchestration `needs_recovery`) |
-| User rejects completion without reason | `stopped` (or `not_started`) | soft `failed` |
-| User accepts complete | `stopped` + `lastExit: ok` | `succeeded` |
-| Tool error mid-stream | stays `running` | unchanged |
+| Situation | Turn activity (product) | Task lifecycle |
+|-----------|-------------------------|----------------|
+| Turn adapter error / crash | `failed_turn` (or recovery panel pre-Phase B) | stays `open` |
+| User rejects completion without reason | none / ready | soft `failed` |
+| User accepts complete | none / ready | `succeeded` |
+| Tool error mid-stream | stays `executing` | unchanged |
+| User Stop this turn | none / ready (transcript cancel) | stays `open` |
 
 #### 4.3.3 Orchestration activity (open tasks)
 
-Scheduling and graph waits — **not** CLI phase and **not** lifecycle:
+Scheduling and graph waits — **not** turn activity labels and **not** lifecycle:
 
 ```ts
 type TaskRuntimeActivity =
   | 'idle'
   | 'queued'
-  | 'running'              // live turn generating (feeds CLI view = running)
-  | 'waiting_user'         // live ask_user (feeds CLI view = idle)
+  | 'running'              // live turn generating → product turn activity = executing
+  | 'waiting_user'         // live ask_user → product turn activity = waiting_you
   | 'waiting_dependencies'
   | 'waiting_children'
   | 'blocked'
-  | 'needs_recovery'
+  | 'needs_recovery'       // → product turn activity = failed_turn (Phase A)
   | 'awaiting_outcome';
 ```
 
 Evaluation order (only when `lifecycle === 'open'`):
 
-1. Non-null `outcomeProposal` → `awaiting_outcome` (CLI usually already `stopped`).
+1. Non-null `outcomeProposal` → `awaiting_outcome` (no live turn strip).
 2. Live turn → `running` or `waiting_user`.
 3. Unsatisfied dependencies → `waiting_dependencies`.
 4. Schedulable queued turn → `queued`.
@@ -573,15 +521,15 @@ type TaskViewStatus = TaskLifecycleState | TaskRuntimeActivity;
 
 | UI surface | Shows |
 |------------|--------|
-| Task list badge | **Lifecycle only** (optional tiny live-process dot, not a second status word) |
-| Workspace header | **Task status card** = header (name + lifecycle badge + status menu). No separate title row that repeats the same badge. **Expand details** (collapsed by default) shows lifecycle copy, optional orchestration one-liner, bound session id, continuation hint — not when collapsed. |
-| Composer strip | **CLI view** (`not_started` / `running` / `idle` / `stopped`); optional lastExit when stopped |
-| Action panels | Recovery, resume queue; outcome accept/reject when product ships dedicated card (today: lifecycle status menu) |
+| Task list badge | **Lifecycle only** (optional tiny **turn-active** dot, not a second status word; not “CLI running”) |
+| Workspace header | **Task status card** = header (name + lifecycle badge + status menu). No separate title row that repeats the same badge. **Expand details** (collapsed by default) shows lifecycle copy, optional orchestration one-liner, continuation hint — **not** session id in product chrome. |
+| Composer strip | **Turn activity** (`executing` / `waiting_you` / `queued` / `failed_turn`); **no strip** when ready. Do not show CLI process phases. Host-owned `currentTurnActivity` lands in Phase B (`docs/plans/task-chat-turn-hide-cli.md`). |
+| Action panels | Recovery, resume queue; outcome accept/reject when product ships dedicated card (today: lifecycle status menu). Recovery copy talks about **turns**, not CLI process. |
 
-Composer / send rules use lifecycle **and** live CLI/orchestration (see §9).
+Composer / send rules use lifecycle **and** turn/orchestration (see §9).
 
 Do not map adapter exit codes onto lifecycle. Do not use a single chip that
-says both “Failed” (task) and “Running” (CLI) interchangeably from `turnDone`.
+says both “Failed” (task) and “Working” (turn) interchangeably from `turnDone`.
 
 ---
 
@@ -599,7 +547,8 @@ open + user Reject fail proposal WITH reason ────────► open
 open + user Cancel ──────────────────────────────────► cancelled   [hard, cascade]
 open + user Skip ────────────────────────────────────► skipped     [hard; won’t perform]
 failed + user sends message ─────────────────────────► open        (reopen; queue turn)
-succeeded / cancelled / skipped + more work ─────────► new task (or continuationOf)
+succeeded / cancelled / skipped + user sends message ► open        (reopen same id; queue turn)
+succeeded / cancelled / skipped + explicit new work ─► new task (or continuationOf) optional
 ```
 
 ```text
@@ -640,7 +589,9 @@ If dependencies are unresolved, the queued turn records start intent but is not
 spawned. When dependencies resolve, the engine either schedules it or applies the
 dependency's `onUnsatisfied` policy (see §5.6 for `skip`).
 
-There may be at most one queued or active turn per task.
+There may be at most **one active (running) turn** per task. Operators may stack
+**multiple queued follow-ups** (FIFO); the scheduler promotes one-at-a-time after
+settlement. See §9.1.
 
 ### 5.3 Outcome sealing (user and coordinator)
 
@@ -727,10 +678,10 @@ coordinator seals; CLI never does.
 | State | User wants more work | Mechanism |
 |-------|----------------------|-----------|
 | `failed` (soft) | Send a message on the **same** task | Reopen → `open`, clear `finishedAt` / optional error retention for history, queue turn |
-| `succeeded` / `cancelled` / `skipped` (hard) | Follow-up or “do it after all” | **New task** or **Continue as new task** (`continuationOf`); new session; old node stays immutable for dependents |
+| `succeeded` / `cancelled` / `skipped` (hard) | Follow-up or “do it after all” | Same as soft-fail: next `send` **reopens** the same task id to `open` and may queue a turn. Operators may still create a **new task** / continuation instead |
 
-The UI may group continuation tasks visually. Soft-fail reopen must **not** create
-a second task ID unless the user explicitly starts a new task.
+The UI may group related work visually. Reopen keeps the same task id; a second
+task ID is created only when the user explicitly starts a new task.
 
 ### 5.6 `skipped` — created, user chooses not to perform
 
@@ -745,7 +696,7 @@ deliberate “won’t do,” not an error and not an abort of in-flight work.
 | vs `cancelled` | **Cancel** = stop / abandon work that was accepted as in progress. **Skip** = choose not to do this unit of work (backlog triage, “not now / not this”). |
 | vs `failed` | **Failed** = attempt judged unsuccessful. **Skipped** = never (or no longer) attempting. |
 | Descendants | Default: unfinished descendants are also **skipped** (or cancelled if they had live turns — implementation may map live children → cancel process then skip). Cascade must leave no open orphan work under a skipped parent. |
-| Hard terminal | Read-only; no reopen-on-message. To do the work later → new task / continuation. |
+| Hard terminal | Composer stays writable; next `send` reopens same id to `open`. New task remains available if preferred. |
 | Wait / deps | Settles wait barriers. Does **not** satisfy `requiredOutcome: 'succeeded'`. Dependents with `onUnsatisfied: 'skip'` may themselves become `skipped`. |
 | CLI | Never maps process exit or missing disposition to `skipped`. |
 
@@ -946,14 +897,38 @@ both constrain behavior:
 
 | Lifecycle | Runtime activity (if open) | Behavior |
 |-----------|----------------------------|----------|
-| `open` | `idle` | Queue a user-triggered turn |
-| `open` | `waiting_dependencies` / `queued` | Persist message as pending input |
-| `open` | `running` / `waiting_user` | Persist; do not inject into the live process except via `submitAsk` |
-| `open` | `waiting_children` / `blocked` | Persist for the next continuation turn |
-| `open` | `needs_recovery` | Persist; offer explicit Retry / Continue recovery |
+| `open` | `idle` | Queue a user-triggered turn (`send`) |
+| `open` | `waiting_dependencies` / `queued` | `send` creates another distinct FIFO queued turn (or binds per engine policy); inspect / edit / delete via `queuedTurns` |
+| `open` | `running` | `send` queues a FIFO follow-up (no interrupt); **Ctrl+Enter** `sendLiveInput` → reserve follow-up then interrupt live turn (cut & continue). `submitAsk` remains the path for structured ask answers |
+| `open` | `waiting_user` | Answer the pending ask via `submitAsk`; free-form composer may still queue follow-ups when product policy allows |
+| `open` | `waiting_children` / `blocked` | Persist / queue for the next continuation turn |
+| `open` | `needs_recovery` | Persist; free-form send accepted as continuation; soft “Could not finish” card + optional Retry / Continue |
 | `open` | `awaiting_outcome` | Prefer Accept/Reject when an outcome card exists. **Composer stays writable:** a new `send` clears `outcomeProposal`, keeps lifecycle `open`, and queues a turn (continue session). Do **not** block send solely because a proposal is pending. |
 | `failed` (soft) | — | **Reopen** to `open`, then queue a turn with the message |
-| `succeeded` / `cancelled` / `skipped` | — | Read-only; no reopen on the same task id. Offer **Continue as new task** (or new task if the user later wants a previously skipped goal) |
+| `succeeded` / `cancelled` / `skipped` | — | **Reopen** to `open` on the same task id, then queue a turn (same as soft-fail). Operators may still create a new task instead |
+
+### 9.1 Multi-queued FIFO follow-ups and interrupt & send
+
+**Normative send rule (R012):** every focused-task `send` creates a **distinct queued turn** bound to that user message, or **refuses visibly** when a turn cannot be allocated (turn cap, hard recovery block). Concurrent sends while a turn is live or already queued still create additional queued turns; the scheduler promotes **one active (running) turn per task**, only the **earliest** queued sequence (FIFO), and drains **multiple queued follow-ups** in order after **successful** settlement. After **failed** or **forced/unconfirmed interrupted** settlement, queued follow-ups remain queued (not auto-promoted) until recovery/resume policy allows. After a **confirmed** interrupt settlement with queued follow-ups (interrupt & send / Enter-then-Stop), FIFO auto-promotes.
+
+| Operator action | Engine / host API | Notes |
+|-----------------|-------------------|-------|
+| Enter / Send | `send` | FIFO follow-up turn; composer stays editable while running/queued |
+| Ctrl+Enter while running | `sendLiveInput` → `interruptAndSend` | Reserve FIFO follow-up, then interrupt live turn; no concurrent inject; no delivered banner |
+| Ctrl+Enter while idle | `send` | Immediate normal turn (same as Enter) |
+| Edit pending queue item | `editQueuedTurn` | Only while `turnId` remains in the live `queuedTurns` projection; clears stale `agentContent` |
+| Delete pending queue item | `deleteQueuedTurn` | Undispatched only; never cancels a running turn |
+
+**Projection:** snapshots include optional `queuedTurns` (`turnId`, `sequence`, `status: 'queued'`, `messageIds`, `createdAt`, optional `previewText`) so the webview can render an inspectable FIFO panel and lock edit/delete at the dispatch boundary. User messages bound to still-`queued` turns are **omitted from the chat transcript** until the turn promotes to running; they are visible only in the queue panel (and via `previewText`).
+
+**Interrupt & send outcomes:**
+
+- Success → reserve follow-up + interrupt; after **confirmed** settle, FIFO-promote (no `liveInputResult` banner).
+- Reserve failure (terminal task, turn cap, …) → **commandError**; live turn keeps running (no interrupt).
+- Confirmed interrupt with queued follow-ups → clear `holdAutoPromote` and FIFO-promote; pure Stop with empty queue promotes nothing.
+- Stale `editQueuedTurn` / `deleteQueuedTurn` (missing, foreign, or already dispatched turn) → `commandError` with a clear stale-mutation message; controls should already be locked when the projection drops the turn.
+
+`sendLiveInput` means **interrupt & send**: host calls `TaskEngine.interruptAndSend` (reserve follow-up, then interrupt). It does **not** call concurrent `backend.sendLiveInput`. After a **confirmed** interrupt settlement, same-task queued follow-ups promote FIFO and observed session may bind to `committedSessionId` when unset. Forced/unconfirmed cancel keeps holds and does not auto-promote. Webview keyboard policy maps Ctrl/Meta+Enter to `sendLiveInput` when a live turn is running; otherwise Ctrl/Meta+Enter uses `send`.
 
 Chat messages are durable records, not raw queued strings. They provide both the
 task transcript and delivery identity:
@@ -1028,7 +1003,7 @@ Correctness requires serialization per task/session, not globally per backend.
 
 The scheduler enforces:
 
-- at most one queued or active turn per task;
+- at most one **active (running)** turn per task (multiple queued follow-ups allowed; FIFO drain — §9.1);
 - at most one active turn for a session ID;
 - backend-specific concurrency limits;
 - global/root concurrency and resource limits.
@@ -1122,8 +1097,8 @@ turns but never seal lifecycle. User and authorized coordinators do.
 
 | Screen | Content |
 |--------|---------|
-| Task list | Root tasks; **lifecycle** badge only; optional CLI live dot; updated time; **New task** |
-| Task workspace | **Task status card as header** (name + lifecycle + status menu; expand for detail); thread; composer **CLI strip**; orchestration / recovery panels; outcome card when shipped |
+| Task list | Root tasks; **lifecycle** badge only; optional **turn-active** dot; updated time; **New task** |
+| Task workspace | **Task status card as header** (name + lifecycle + status menu; expand for detail); thread; composer **turn-activity strip**; orchestration / recovery panels; outcome card when shipped |
 
 Clicking **New task** opens an unpersisted composer. The first submitted message
 creates the root coordinator task (`lifecycle: open`) with that message as its
@@ -1147,14 +1122,13 @@ Preferred summary fields (additive):
 ```text
 lifecycle          TaskLifecycleState
 runtimeActivity    TaskRuntimeActivity      // orchestration + live turn signals
-cliViewStatus?     CliViewStatus            // not_started | running | idle | stopped
-cliLastExit?       CliLastExit              // when stopped
+currentTurnActivity  // host-owned product chrome (TurnActivity | null)
+// Do not project cliViewStatus / process phases / committedSessionId as product chrome
 outcomeProposal?   OutcomeProposal
 ```
 
-Until the host projects `cliViewStatus`, the webview **derives** it from
-`runtimeActivity`, live turn flags, transcript/`hadProcess`, and
-`committedSessionId` (§4.3.2).
+Host projects **turn activity** as `currentTurnActivity`. Webview prefers that
+field and falls back to client derive only if absent.
 
 The webview ignores late events whose `turnId` is no longer active for that task.
 `submitAsk` must include `taskId`, `turnId`, and `askId`.
@@ -1165,10 +1139,11 @@ Host commands for user seals and mode:
 # Implemented
 setTaskLifecycle           { taskId, lifecycle, result?, error? }
   // lifecycle: open | succeeded | failed | cancelled | skipped
-  // open      → only from soft failed (hard terminals rejected)
+  // open      → reopen from soft failed or hard terminal (same task id)
   // cancelled → engine cancelTask (cascade descendants)
   // skipped   → engine skipTask (cascade unfinished descendants)
   // terminal seals interrupt local live turns; remote-owned → interrupt request
+  // send on any terminal lifecycle also reopens then queues a turn
 
 # Planned (outcome card / settings)
 acceptOutcome              { taskId }
@@ -1195,9 +1170,9 @@ the webview status menu uses `setTaskLifecycle` only.
   (who sealed, when) rather than an Accept card — unless `alwaysConfirmRoot`.
 - **Failed** (soft): composer remains available; send reopens to `open`. Status
   menu may also **Reopen** → `setTaskLifecycle` `open`.
-- **Succeeded** / **Cancelled** / **Skipped**: thread read-only; **no**
-  reopen-on-same-id (status menu does not offer open). **Continue as new task**
-  (or new task) if the user wants related work later.
+- **Succeeded** / **Cancelled** / **Skipped**: composer remains available; next
+  `send` reopens the same task id to `open` and may queue a turn. Operators may
+  still start a new task instead.
 - **Cancel task** = abort in-progress work (cascade). **Skip task** = won’t
   perform this created task (cascade unfinished descendants). Both are distinct
   from **stop/interrupt turn**.
@@ -1211,7 +1186,7 @@ the webview status menu uses `setTaskLifecycle` only.
 - Duplicating task name + lifecycle in both App chrome and the workspace status
   card (status card **is** the header).
 - Blocking composer solely because `runtimeActivity === 'awaiting_outcome'`.
-- Offering “Reopen” for hard-terminal tasks on the same task id.
+- Blocking composer solely because lifecycle is hard-terminal (reopen-on-send is allowed).
 - Auto-sealing root success in **`user_confirm`** mode on agent `complete_task`.
 - Blocking all coordinator seals in **`coordinator_delegate` / `yolo`** as if
   every outcome still required a human click (defeats handoff).
@@ -1268,17 +1243,17 @@ the webview status menu uses `setTaskLifecycle` only.
 | Two axes | Persist **lifecycle** (work outcome) separately from **turn/runtime activity** (CLI and waits) |
 | New task | Always `lifecycle: open` |
 | Who seals lifecycle | **User always**; **coordinator** when outcome authority mode allows — never the CLI |
-| Status axes | Lifecycle ≠ CLI process ≠ orchestration; three axes (§4.3) |
-| CLI view (MVP) | `not_started` \| `running` \| `idle` \| `stopped`; error is `lastExit`, not a phase |
-| CLI idle | Process on but not generating (incl. ask_user); common under long-lived process or mid-ask |
-| CLI placement | Task badge = lifecycle; CLI strip near composer (§4.3.4, WEBVIEW) |
+| Status axes | Lifecycle ≠ turn activity ≠ orchestration (§4.3); process/session stay engine-internal |
+| Turn activity (product) | `executing` \| `waiting_you` \| `queued` \| `failed_turn` \| none (ready); Phase A client-derived, Phase B host-owned |
+| Process status | Engine-internal only — not product chrome after Phase A |
+| Placement | Task badge = lifecycle; turn strip near composer (§4.3.4, WEBVIEW) |
 | Default mode | `user_confirm` — coordinator proposes, user Accept → `succeeded` |
 | Delegate mode | `coordinator_delegate` — user enables coordinator to mark success/fail/skip in scope (incl. root) |
 | Yolo (future) | `yolo` — same seal path as delegate + freer execution policy for self-orchestration handoff |
 | Reject complete with reason | Stay `open`; inject reason; coordinator continues |
 | Reject complete without reason | Soft `failed`; no auto turns until user messages |
 | Soft fail reopen | New user message on `failed` reopens same task to `open` |
-| Hard terminal follow-up | `succeeded` / `cancelled` / `skipped` → new or continuation task, not silent reopen |
+| Hard terminal follow-up | `succeeded` / `cancelled` / `skipped` → reopen same id on next `send` (or new task if user prefers) |
 | Cancel | Authorized cancel seals `cancelled` and **cascades** descendants; workspace revert is future work |
 | Skip | Created task marked **won’t perform** → `skipped` (hard); user or authorized coordinator |
 | CLI / turn failure | Never seals lifecycle by itself; leave `open` + recovery (unless authorized sealer acts) |

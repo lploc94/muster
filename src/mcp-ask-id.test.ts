@@ -1,9 +1,6 @@
 import { describe, expect, it } from 'vitest';
-// Import the pure sanitizer from the dev-only MCP ask server spike. The module
-// guards its bootstrap behind an entrypoint check, so importing it here does not
-// start the stdio transport or touch the filesystem.
-// @ts-expect-error - plain .mjs dev spike without a type declaration
-import { sanitizeAskId } from '../mcp/muster-ask-server.mjs';
+// @ts-expect-error - plain .mjs dev spike helper without a type declaration
+import { sanitizeAskId } from '../mcp/ask-id.mjs';
 
 describe('sanitizeAskId (mcp ask server path-traversal guard)', () => {
   it('accepts safe ids', () => {

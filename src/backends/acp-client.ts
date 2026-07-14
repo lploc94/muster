@@ -1,6 +1,24 @@
 import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
 import { createInterface, Interface } from 'readline';
-import { McpServerConfig } from '../types';
+import { LiveInputRequest, LiveInputResult, McpServerConfig } from '../types';
+import type {
+  AgentQuestion,
+  ElicitationAction,
+  ParsedFormElicitation,
+  ParsedUrlElicitation,
+  QuestionAnswers,
+} from './elicitation';
+import {
+  answersNonEmpty,
+  encodeElicitationContentFromQuestions,
+  encodeGrokAnswers,
+  formToAgentQuestions,
+  isAskLikeForm,
+  normalizeAgentQuestions,
+  parseElicitationCreate,
+  parseUrlElicitationRequiredEntries,
+  URL_ELICITATION_REQUIRED_CODE,
+} from './elicitation';
 import {
   classifyPermission,
   pickOption,
@@ -12,6 +30,16 @@ import {
   type PermissionOption,
   type PermissionToolCall,
 } from './permission-policy';
+
+export type { AgentQuestion, QuestionAnswers } from './elicitation';
+export {
+  encodeElicitationContentFromQuestions as encodeElicitationContent,
+  encodeGrokAnswers,
+  formToAgentQuestions,
+  isAskLikeForm,
+  normalizeAgentQuestions,
+  parseElicitationCreate,
+} from './elicitation';
 
 /**
  * A permission request handed to {@link PermissionController.prompt} when the
@@ -42,17 +70,78 @@ export interface PermissionController {
   ): Promise<{ allow: boolean; remember: boolean; timedOut?: boolean }>;
 }
 
+export interface QuestionPromptRequest {
+  sessionId: string;
+  questions: AgentQuestion[];
+}
+
+export interface QuestionPromptResult {
+  outcome: 'accepted' | 'cancelled' | 'declined';
+  answers?: QuestionAnswers;
+}
+
+/** Host controller for Grok vendor ask_user_question (AskCard). */
+export interface QuestionController {
+  prompt(req: QuestionPromptRequest): Promise<QuestionPromptResult>;
+}
+
+/** Host controller for full RFD elicitation form/url. */
+export interface ElicitationController {
+  /** Prefer per-call clientKey from ACP agent config when provided. */
+  clientKey: string;
+  promptForm(
+    form: ParsedFormElicitation,
+    clientKey?: string,
+  ): Promise<{ action: ElicitationAction; content?: Record<string, unknown> }>;
+  promptUrl(
+    url: ParsedUrlElicitation,
+    clientKey?: string,
+  ): Promise<{ action: ElicitationAction }>;
+  onUrlComplete(clientKey: string, elicitationId: string): void;
+}
+
 let permissionController: PermissionController | null = null;
+let questionController: QuestionController | null = null;
+let elicitationController: ElicitationController | null = null;
+let acpDebugLogger: ((event: string, details: Record<string, unknown>) => void) | null = null;
+
+/** Inject a host-owned diagnostic sink without coupling the ACP transport to VS Code. */
+export function setAcpDebugLogger(
+  logger: ((event: string, details: Record<string, unknown>) => void) | null,
+): void {
+  acpDebugLogger = logger;
+}
+
+function debugAcp(event: string, details: Record<string, unknown>): void {
+  try {
+    acpDebugLogger?.(event, details);
+  } catch {
+    // Diagnostics must never affect protocol handling.
+  }
+}
 
 /** Inject (or clear) the global permission controller for the ACP gate. */
 export function setPermissionController(controller: PermissionController | null): void {
   permissionController = controller;
 }
 
+/** Inject (or clear) the global Grok question controller. */
+export function setQuestionController(controller: QuestionController | null): void {
+  questionController = controller;
+}
+
+/** Inject (or clear) the RFD elicitation controller. */
+export function setElicitationController(controller: ElicitationController | null): void {
+  elicitationController = controller;
+}
+
 type Pending = {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timer?: ReturnType<typeof setTimeout>;
+  method?: string;
+  params?: unknown;
+  retried32042?: boolean;
 };
 
 export type SessionUpdate = Record<string, unknown>;
@@ -62,16 +151,65 @@ export interface PromptResult {
   /** Some ACP agents (e.g. codex-acp) return usage on the prompt result. */
   usage?: Record<string, unknown>;
   _meta?: Record<string, unknown>;
+  /**
+   * Set by {@link boundedPromptCancel}: `forced` when the grace timer dropped the
+   * pending request; omit/`confirmed` when the agent settled the prompt itself.
+   * Engine uses this for interrupt-and-send session bind / promote gates.
+   */
+  cancelConfidence?: 'confirmed' | 'forced';
 }
 
 type SessionSink = (update: SessionUpdate) => void;
 type ConnectionSink = (line: string, source: 'stderr' | 'non-json') => void;
 
-/** Shape of the ACP `initialize` response fields the client relies on. */
+/**
+ * Shape of the ACP `initialize` response fields the client relies on.
+ * Live-input support is proven only from agent-advertised capability evidence
+ * (never assumed from backend id alone).
+ */
 export interface AcpInitializeResult {
   authMethods?: { id: string }[];
-  agentCapabilities?: { loadSession?: boolean };
+  agentCapabilities?: {
+    loadSession?: boolean;
+    promptCapabilities?: {
+      image?: boolean;
+      audio?: boolean;
+      embeddedContext?: boolean;
+      /** Agent accepts concurrent in-flight prompts for mid-turn steering. */
+      liveInput?: boolean;
+    };
+    sessionCapabilities?: {
+      liveInput?: boolean;
+      [key: string]: unknown;
+    };
+    /** Some agents advertise live input only under `_meta`. */
+    _meta?: {
+      liveInput?: boolean;
+      [key: string]: unknown;
+    };
+    [key: string]: unknown;
+  };
 }
+
+/**
+ * Derive live-input capability evidence from an ACP `initialize` result.
+ * Used for diagnostics only — policy B always attempts inject regardless.
+ */
+export function deriveLiveInputSupport(init: AcpInitializeResult | null | undefined): boolean {
+  const caps = init?.agentCapabilities;
+  if (!caps) return false;
+  if (caps.promptCapabilities?.liveInput === true) return true;
+  if (caps.sessionCapabilities?.liveInput === true) return true;
+  if (caps._meta?.liveInput === true) return true;
+  return false;
+}
+
+/**
+ * ACP wire method used for mid-turn live input when capability evidence is present.
+ * Concurrent `session/prompt` to the same session while a prior prompt is pending
+ * is the backend-supported path (not a queue-priority side channel).
+ */
+export const LIVE_INPUT_METHOD = 'session/prompt' as const;
 
 /** Auth choice returned by a backend's {@link AcpAgentConfig.resolveAuth}. */
 export interface AcpAuthChoice {
@@ -124,6 +262,8 @@ export interface AcpAgentConfig {
 const DEFAULT_CLIENT_CAPABILITIES: Record<string, unknown> = {
   fs: { readTextFile: false, writeTextFile: false },
   terminal: false,
+  // RFD elicitation — form + url (Claude AskUserQuestion, OAuth consent, …).
+  elicitation: { form: {}, url: {} },
 };
 
 /**
@@ -258,7 +398,7 @@ export function boundedPromptCancel(
         settled = true;
         signal.removeEventListener('abort', onAbort);
         hooks.onForceSettle();
-        resolve({ stopReason: 'cancelled' });
+        resolve({ stopReason: 'cancelled', cancelConfidence: 'forced' });
       }, graceMs);
       if (typeof graceTimer.unref === 'function') graceTimer.unref();
     };
@@ -430,6 +570,18 @@ export class AcpClient {
   private extraEnv?: Record<string, string>;
   private authenticated = false;
   loadSessionSupported = false;
+  /**
+   * True when `initialize` advertised live-input capability evidence.
+   * Advisory only — Muster always *attempts* mid-turn inject (policy B);
+   * failures fall back to ordinary send at the host. This flag remains for
+   * diagnostics / future UI "inject vs queue" hints.
+   */
+  liveInputSupported = false;
+  /**
+   * Count of in-flight `session/prompt` requests per session. Live input is
+   * only meaningful while at least one prompt is pending for that session.
+   */
+  private activePromptCounts = new Map<string, number>();
 
   constructor(private readonly config: AcpAgentConfig) {}
 
@@ -522,19 +674,153 @@ export class AcpClient {
     await this.ensureConnected();
     // Keep the request id so bounded cancellation can drop the pending entry
     // (and clear its 30-minute timeout) when force-settling a hung turn.
-    const { id, promise } = this.sendRequest('session/prompt', {
+    this.trackPromptStart(sessionId);
+    const { id, promise } = this.sendRequest(LIVE_INPUT_METHOD, {
       sessionId,
       prompt: [{ type: 'text', text }],
     });
-    return boundedPromptCancel(promise as Promise<PromptResult>, signal, {
+    const tracked = (promise as Promise<PromptResult>).finally(() => {
+      this.trackPromptEnd(sessionId);
+    });
+    return boundedPromptCancel(tracked, signal, {
       onCancel: () => this.cancel(sessionId),
       onForceSettle: () => this.dropPending(id),
     });
   }
 
+  /**
+   * Deliver an instruction to a live session while its primary prompt is pending.
+   *
+   * Policy B (always-try): do **not** refuse solely because initialize omitted
+   * liveInput capability. Always attempt concurrent `session/prompt` when a
+   * primary prompt is in flight. Host maps non-delivered results to silent send.
+   *
+   * Refusals that still apply before wire send:
+   * - `no-active-turn` when no prompt is in flight for the session
+   * - `cancelled` when the caller signal is already aborted
+   * - `rejected` on connect/agent/transport errors or malformed responses
+   *
+   * Does not create queue state; only talks to the exact session over ACP.
+   */
+  async sendLiveInput(request: LiveInputRequest): Promise<LiveInputResult> {
+    const sessionId = request.sessionId?.trim() ?? '';
+    const instruction = request.instruction ?? '';
+    if (!sessionId) {
+      return { code: 'rejected', reason: 'sessionId is required for live input' };
+    }
+    if (!instruction.trim()) {
+      return { code: 'rejected', reason: 'instruction is required for live input' };
+    }
+    if (request.signal?.aborted) {
+      return { code: 'cancelled', reason: 'live input cancelled before dispatch' };
+    }
+
+    try {
+      await this.ensureConnected();
+    } catch (err) {
+      return {
+        code: 'rejected',
+        reason: (err as Error).message || `${this.config.label} agent is not connected`,
+      };
+    }
+
+    // Capability advertisement is advisory only (policy B). Always attempt
+    // inject when a primary prompt is in flight.
+
+    if (!this.hasActivePrompt(sessionId)) {
+      return {
+        code: 'no-active-turn',
+        reason: `no in-flight prompt for session ${sessionId}`,
+      };
+    }
+
+    // Race cancellation against the live-input request so abort during dispatch
+    // surfaces as cancelled rather than hanging on the agent response.
+    try {
+      const result = await this.awaitLiveInputDispatch(sessionId, instruction, request.signal);
+      if (result === 'cancelled') {
+        return { code: 'cancelled', reason: 'live input cancelled during dispatch' };
+      }
+      // A successful JSON-RPC result (even empty) means the agent accepted the
+      // in-flight input. Malformed/null results are rejected below.
+      if (result == null || typeof result !== 'object') {
+        return { code: 'rejected', reason: 'malformed live-input response from agent' };
+      }
+      return { code: 'delivered', sessionId };
+    } catch (err) {
+      const message = (err as Error).message || 'live input failed';
+      if (request.signal?.aborted || /abort|cancel/i.test(message)) {
+        return { code: 'cancelled', reason: message };
+      }
+      return { code: 'rejected', reason: message };
+    }
+  }
+
+  /** True when at least one `session/prompt` is pending for the session. */
+  hasActivePrompt(sessionId: string): boolean {
+    return (this.activePromptCounts.get(sessionId) ?? 0) > 0;
+  }
+
   cancel(sessionId: string): void {
     // ACP defines session/cancel as a notification (no id).
     this.notify('session/cancel', { sessionId });
+  }
+
+  private trackPromptStart(sessionId: string): void {
+    this.activePromptCounts.set(sessionId, (this.activePromptCounts.get(sessionId) ?? 0) + 1);
+  }
+
+  private trackPromptEnd(sessionId: string): void {
+    const next = (this.activePromptCounts.get(sessionId) ?? 0) - 1;
+    if (next <= 0) this.activePromptCounts.delete(sessionId);
+    else this.activePromptCounts.set(sessionId, next);
+  }
+
+  private awaitLiveInputDispatch(
+    sessionId: string,
+    instruction: string,
+    signal?: AbortSignal,
+  ): Promise<unknown | 'cancelled'> {
+    // Concurrent session/prompt while a primary prompt is pending (policy B:
+    // always attempt; host falls back to send if the agent rejects).
+    const { id, promise } = this.sendRequest(LIVE_INPUT_METHOD, {
+      sessionId,
+      prompt: [{ type: 'text', text: instruction }],
+    });
+
+    if (!signal) return promise;
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const onAbort = (): void => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', onAbort);
+        // Drop the JSON-RPC pending entry so abort does not leave a 30-minute
+        // timeout / unresolved map entry after the outer promise resolves.
+        this.dropPending(id);
+        resolve('cancelled');
+      };
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener('abort', onAbort);
+      promise.then(
+        (result) => {
+          if (settled) return;
+          settled = true;
+          signal.removeEventListener('abort', onAbort);
+          resolve(result);
+        },
+        (err) => {
+          if (settled) return;
+          settled = true;
+          signal.removeEventListener('abort', onAbort);
+          reject(err);
+        },
+      );
+    });
   }
 
   dispose(): void {
@@ -619,6 +905,7 @@ export class AcpClient {
       })) as AcpInitializeResult;
 
       this.loadSessionSupported = !!init.agentCapabilities?.loadSession;
+      this.liveInputSupported = deriveLiveInputSupport(init);
 
       if (this.config.resolveAuth) {
         const choice = this.config.resolveAuth(init, env);
@@ -657,6 +944,7 @@ export class AcpClient {
     method: string,
     params: unknown,
     timeoutMs?: number,
+    opts?: { retried32042?: boolean },
   ): { id: number; promise: Promise<unknown> } {
     const id = this.nextId++;
     const timeout = timeoutMs ?? (method === 'session/prompt' ? 1_800_000 : 120_000);
@@ -665,6 +953,9 @@ export class AcpClient {
       const entry: Pending = {
         resolve,
         reject,
+        method,
+        params,
+        retried32042: opts?.retried32042 === true,
       };
       this.pending.set(id, entry);
 
@@ -707,7 +998,24 @@ export class AcpClient {
   }
 
   private respondOk(id: number | string, result: unknown = {}): void {
-    this.writeLine({ jsonrpc: '2.0', id, result });
+    const wrote = this.writeLine({ jsonrpc: '2.0', id, result });
+    const summary = result && typeof result === 'object' ? (result as Record<string, unknown>) : {};
+    debugAcp('response.ok', {
+      backend: this.config.key,
+      id,
+      action: summary.action,
+      outcome: summary.outcome,
+      contentKeys:
+        summary.content && typeof summary.content === 'object'
+          ? Object.keys(summary.content as Record<string, unknown>)
+          : undefined,
+      answerKeys:
+        summary.answers && typeof summary.answers === 'object'
+          ? Object.keys(summary.answers as Record<string, unknown>)
+          : undefined,
+      wrote,
+      stdinWritable: this.proc?.stdin.writable ?? false,
+    });
   }
 
   private respondError(id: number | string, code: number, message: string): void {
@@ -738,15 +1046,41 @@ export class AcpClient {
       return;
     }
 
+    // RFD elicitation/complete — notification (no id) after URL-mode OOB interaction.
+    if (msg.method === 'elicitation/complete' && msg.id == null) {
+      const params = (msg.params ?? {}) as Record<string, unknown>;
+      const elicitationId =
+        typeof params.elicitationId === 'string' ? params.elicitationId : '';
+      if (elicitationId && elicitationController) {
+        // Prefer this connection's agent key; controller still receives clientKey arg.
+        elicitationController.onUrlComplete(this.config.key, elicitationId);
+      }
+      return;
+    }
+
     if (msg.id != null && msg.method == null) {
       const p = this.pending.get(msg.id as number);
       if (p) {
-        this.pending.delete(msg.id as number);
         if (p.timer) clearTimeout(p.timer);
         if (msg.error) {
-          const err = msg.error as { message?: string };
+          const err = msg.error as { code?: number; message?: string; data?: unknown };
+          // RFD -32042 URLElicitationRequiredError: prompt URL consent, then retry once.
+          if (
+            err.code === URL_ELICITATION_REQUIRED_CODE &&
+            !p.retried32042 &&
+            elicitationController
+          ) {
+            const parsed = parseUrlElicitationRequiredEntries(err.data);
+            if (parsed.ok) {
+              this.pending.delete(msg.id as number);
+              void this.handleUrlElicitationRequired(msg.id as number, p, parsed.entries);
+              return;
+            }
+          }
+          this.pending.delete(msg.id as number);
           p.reject(new Error(err.message ?? JSON.stringify(msg.error)));
         } else {
+          this.pending.delete(msg.id as number);
           p.resolve(msg.result);
         }
       }
@@ -762,10 +1096,36 @@ export class AcpClient {
     const method = msg.method as string;
     const id = msg.id as number | string;
     const params = (msg.params ?? {}) as Record<string, unknown>;
+    if (
+      method === 'elicitation/create' ||
+      method === 'x.ai/ask_user_question' ||
+      method === '_x.ai/ask_user_question'
+    ) {
+      debugAcp('request.received', {
+        backend: this.config.key,
+        method,
+        id,
+        sessionId: params.sessionId,
+        questionCount: Array.isArray(params.questions) ? params.questions.length : undefined,
+        mode: params.mode,
+      });
+    }
 
     try {
       if (method === 'session/request_permission') {
         await this.handlePermissionRequest(id, params);
+        return;
+      }
+
+      // RFD elicitation (shared path for Claude AskUserQuestion, Codex MCP forms, …)
+      if (method === 'elicitation/create') {
+        await this.handleElicitationCreate(id, params);
+        return;
+      }
+
+      // Vendor extension: Grok native ask_user_question
+      if (method === 'x.ai/ask_user_question' || method === '_x.ai/ask_user_question') {
+        await this.handleGrokAskUserQuestion(id, params);
         return;
       }
 
@@ -787,6 +1147,132 @@ export class AcpClient {
     } catch (err) {
       this.respondError(id, -32603, (err as Error).message || 'Internal error');
     }
+  }
+
+  /**
+   * After -32042: run URL consent for each entry; on all accept+complete, retry
+   * the original request once. Decline/cancel rejects the parent.
+   */
+  private async handleUrlElicitationRequired(
+    _originalId: number,
+    parent: Pending,
+    entries: import('./elicitation').ParsedUrlRequiredEntry[],
+  ): Promise<void> {
+    const controller = elicitationController;
+    if (!controller || !parent.method) {
+      parent.reject(new Error('URL elicitation required but controller unavailable'));
+      return;
+    }
+    const clientKey = this.config.key;
+    try {
+      for (const entry of entries) {
+        const action = await controller.promptUrl(
+          {
+            kind: 'url',
+            elicitationId: entry.elicitationId,
+            url: entry.url,
+            message: entry.message,
+          },
+          clientKey,
+        );
+        if (action.action !== 'accept') {
+          parent.reject(new Error('URL elicitation declined or cancelled'));
+          return;
+        }
+        // Accept only records consent; wait briefly for optional complete notif.
+        // Minimal: proceed after accept (OOB may complete async). Full wait can
+        // be tightened later via bridge promise on OOB complete.
+      }
+      // Single retry with retried32042=true so a second -32042 fails closed.
+      const { promise } = this.sendRequest(parent.method, parent.params, undefined, {
+        retried32042: true,
+      });
+      parent.resolve(await promise);
+    } catch (err) {
+      parent.reject(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+
+  /** ACP RFD elicitation/create — form or url. */
+  private async handleElicitationCreate(
+    id: number | string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const parsed = parseElicitationCreate(params);
+    if (parsed.kind === 'error') {
+      debugAcp('elicitation.parse_error', { backend: this.config.key, id, message: parsed.message });
+      this.respondError(id, parsed.code, parsed.message);
+      return;
+    }
+    const controller = elicitationController;
+    if (!controller) {
+      this.respondOk(id, { action: 'cancel' });
+      return;
+    }
+    const clientKey = this.config.key;
+    debugAcp('elicitation.prompt_start', {
+      backend: this.config.key,
+      id,
+      kind: parsed.kind,
+      sessionId: parsed.sessionId,
+      fieldKeys: parsed.kind === 'form' ? parsed.fields.map((field) => field.key) : undefined,
+    });
+    if (parsed.kind === 'url') {
+      const result = await controller.promptUrl(parsed, clientKey);
+      this.respondOk(id, { action: result.action });
+      return;
+    }
+    const result = await controller.promptForm(parsed, clientKey);
+    debugAcp('elicitation.prompt_resolved', {
+      backend: this.config.key,
+      id,
+      action: result.action,
+      contentKeys: result.content ? Object.keys(result.content) : [],
+    });
+    if (result.action === 'accept') {
+      this.respondOk(id, { action: 'accept', content: result.content ?? {} });
+      return;
+    }
+    this.respondOk(id, { action: result.action });
+  }
+
+  /** Grok `x.ai/ask_user_question` — vendor extension → AskCard. */
+  private async handleGrokAskUserQuestion(
+    id: number | string,
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const sessionId = typeof params.sessionId === 'string' ? params.sessionId : '';
+    const questions = normalizeAgentQuestions(params.questions);
+    const controller = questionController;
+    debugAcp('grok_ask.normalized', {
+      backend: this.config.key,
+      id,
+      sessionId,
+      questionCount: questions.length,
+    });
+
+    if (!controller || questions.length === 0) {
+      this.respondOk(id, { outcome: 'cancelled' });
+      return;
+    }
+
+    const result = await controller.prompt({ sessionId, questions });
+    debugAcp('grok_ask.prompt_resolved', {
+      backend: this.config.key,
+      id,
+      sessionId,
+      outcome: result.outcome,
+      answeredIndexes: result.answers ? Object.keys(result.answers) : [],
+    });
+    if (result.outcome === 'accepted' && answersNonEmpty(result.answers, questions.length)) {
+      this.respondOk(id, {
+        outcome: 'accepted',
+        answers: encodeGrokAnswers(questions, result.answers),
+        annotations: {},
+      });
+      return;
+    }
+    this.respondOk(id, { outcome: 'cancelled' });
   }
 
   /**

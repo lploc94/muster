@@ -12,8 +12,11 @@ import {
   isTerminalLifecycle,
   isTerminalTurn,
   hasActiveOrQueuedTurn,
+  prepareDeleteQueuedTurn,
+  prepareEditQueuedTurn,
   registerAsk,
   reopenSoftFailedTask,
+  reopenTask,
   resolveChildWait,
   retryCountOf,
   retryTurn,
@@ -25,7 +28,7 @@ import {
   type CreateTaskContext,
 } from './transitions';
 import type { DepGraph } from './deps';
-import type { MusterTask, TaskTurn } from './types';
+import type { MusterTask, TaskMessage, TaskTurn } from './types';
 
 const NOW = '2026-07-06T00:00:00.000Z';
 
@@ -165,8 +168,9 @@ describe('startTask / continueTask', () => {
     });
   });
 
-  it('continueTask requires a settled turn and rejects active turns', () => {
+  it('continueTask requires a prior turn and allows FIFO queue while live/queued', () => {
     const task = baseTask();
+    const liveOnly = turn({ id: 't1', status: 'running', sequence: 1 });
     const settled = turn({ id: 't1', status: 'succeeded', sequence: 1 });
     const active = turn({ id: 't2', status: 'running', sequence: 2 });
 
@@ -174,30 +178,83 @@ describe('startTask / continueTask', () => {
       continueTask(task, [], { turnId: 't2', now: NOW, inputs: [] }),
     ).toEqual({
       ok: false,
-      reason: 'continueTask requires at least one settled turn',
+      reason: 'continueTask requires at least one prior turn',
     });
+
+    // R012: first follow-up may queue while the initial turn is still live (no settled yet).
+    const behindFirstLive = continueTask(task, [liveOnly], {
+      turnId: 't2',
+      now: NOW,
+      inputs: [{ kind: 'message', messageId: 'm-early' }],
+    });
+    expect(behindFirstLive.ok).toBe(true);
+    if (behindFirstLive.ok) {
+      expect(behindFirstLive.next).toMatchObject({
+        id: 't2',
+        status: 'queued',
+        sequence: 2,
+        inputs: [{ kind: 'message', messageId: 'm-early' }],
+      });
+    }
 
     expect(
       continueTask(task, [settled], { turnId: 't2', now: NOW, inputs: [] }).ok,
     ).toBe(true);
 
-    expect(
-      continueTask(task, [settled, active], { turnId: 't3', now: NOW, inputs: [] }),
-    ).toEqual({
-      ok: false,
-      reason: 'task already has an active or queued turn',
+    // R012: follow-up turns may stack behind a live turn (scheduler enforces one-at-a-time).
+    const behindLive = continueTask(task, [settled, active], {
+      turnId: 't3',
+      now: NOW,
+      inputs: [{ kind: 'message', messageId: 'm-follow' }],
     });
+    expect(behindLive.ok).toBe(true);
+    if (behindLive.ok) {
+      expect(behindLive.next).toMatchObject({
+        id: 't3',
+        status: 'queued',
+        sequence: 3,
+        inputs: [{ kind: 'message', messageId: 'm-follow' }],
+      });
+    }
   });
 
-  it('rejects a second queued turn', () => {
+  it('allows multiple one-message FIFO queued turns behind a live turn', () => {
     const task = baseTask();
-    const queued = turn({ id: 't1', status: 'queued', sequence: 1 });
-    expect(hasActiveOrQueuedTurn([queued])).toBe(true);
+    const settled = turn({ id: 't0', status: 'succeeded', sequence: 1 });
+    const live = turn({ id: 't1', status: 'running', sequence: 2 });
+    const firstQueued = continueTask(task, [settled, live], {
+      turnId: 't2',
+      now: NOW,
+      inputs: [{ kind: 'message', messageId: 'm2' }],
+    });
+    expect(firstQueued.ok).toBe(true);
+    if (!firstQueued.ok) return;
+
+    const secondQueued = continueTask(task, [settled, live, firstQueued.next], {
+      turnId: 't3',
+      now: NOW,
+      inputs: [{ kind: 'message', messageId: 'm3' }],
+    });
+    expect(secondQueued.ok).toBe(true);
+    if (!secondQueued.ok) return;
+    expect(secondQueued.next).toMatchObject({
+      id: 't3',
+      status: 'queued',
+      sequence: 4,
+      inputs: [{ kind: 'message', messageId: 'm3' }],
+    });
+    expect(hasActiveOrQueuedTurn([settled, live, firstQueued.next, secondQueued.next])).toBe(true);
+  });
+
+  it('retryTurn still rejects when another active or queued turn exists', () => {
+    const task = baseTask();
+    const failed = turn({ id: 't1', status: 'failed', sequence: 1 });
+    const queued = turn({ id: 't2', status: 'queued', sequence: 2 });
     expect(
-      continueTask(task, [turn({ id: 't0', status: 'succeeded', sequence: 1 }), queued], {
-        turnId: 't2',
+      retryTurn(task, [failed, queued], failed, {
+        turnId: 't3',
+        instruction: 'retry',
         now: NOW,
-        inputs: [],
       }),
     ).toEqual({
       ok: false,
@@ -382,7 +439,7 @@ describe('applyFailedTurn', () => {
     ).toEqual({ ok: false, reason: 'turn does not belong to task' });
   });
 
-  it('discards staged disposition and enqueues retry when under limit', () => {
+  it('discards staged disposition and enqueues retry when under limit (safe_to_retry only)', () => {
     const staged = {
       ...running,
       disposition: { kind: 'complete' as const, result: 'ignored' },
@@ -393,6 +450,7 @@ describe('applyFailedTurn', () => {
       policy: defaultPolicy,
       onExhausted: 'fail',
       now: NOW,
+      failureClass: 'safe_to_retry',
     });
     expect(result.ok).toBe(true);
     if (result.ok) {
@@ -401,6 +459,21 @@ describe('applyFailedTurn', () => {
       expect(result.next.turn.finishedAt).toBe(NOW);
       expect(result.next.task.lifecycle).toBe('open');
       expect(result.effects).toEqual([{ kind: 'enqueueRetry', ofTurnId: 't1' }]);
+    }
+  });
+
+  it('does not auto-retry unclassified failures', () => {
+    const result = applyFailedTurn(baseTask(), running, {
+      error: 'adapter error',
+      retryCount: 0,
+      policy: defaultPolicy,
+      onExhausted: 'recover',
+      now: NOW,
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.effects).toEqual([]);
+      expect(result.next.turn.failureClass).toBe('unclassified');
     }
   });
 
@@ -443,27 +516,21 @@ describe('applyFailedTurn', () => {
     }
   });
 
-  it('setTaskLifecycle reopens only soft-failed tasks', () => {
-    const fromFailed = setTaskLifecycle(
-      baseTask({ lifecycle: 'failed', finishedAt: NOW, error: 'x' }),
-      'open',
-      { now: NOW },
-    );
-    expect(fromFailed.ok).toBe(true);
-    if (fromFailed.ok) {
-      expect(fromFailed.next.lifecycle).toBe('open');
-      expect(fromFailed.next.finishedAt).toBeUndefined();
+  it('setTaskLifecycle reopens any terminal task to open', () => {
+    for (const lifecycle of ['failed', 'succeeded', 'cancelled', 'skipped'] as const) {
+      const result = setTaskLifecycle(
+        baseTask({ lifecycle, finishedAt: NOW, error: lifecycle === 'failed' ? 'x' : undefined }),
+        'open',
+        { now: NOW },
+      );
+      expect(result.ok, lifecycle).toBe(true);
+      if (result.ok) {
+        expect(result.next.lifecycle).toBe('open');
+        expect(result.next.finishedAt).toBeUndefined();
+      }
     }
 
-    expect(
-      setTaskLifecycle(baseTask({ lifecycle: 'succeeded', finishedAt: NOW }), 'open', { now: NOW }),
-    ).toEqual({ ok: false, reason: 'only soft-failed tasks may reopen to open' });
-    expect(
-      setTaskLifecycle(baseTask({ lifecycle: 'cancelled', finishedAt: NOW }), 'open', { now: NOW }),
-    ).toEqual({ ok: false, reason: 'only soft-failed tasks may reopen to open' });
-    expect(
-      setTaskLifecycle(baseTask({ lifecycle: 'skipped', finishedAt: NOW }), 'open', { now: NOW }),
-    ).toEqual({ ok: false, reason: 'only soft-failed tasks may reopen to open' });
+    expect(setTaskLifecycle(baseTask({ lifecycle: 'open' }), 'open', { now: NOW }).ok).toBe(true);
   });
 });
 
@@ -542,12 +609,12 @@ describe('retryTurn', () => {
   });
 });
 
-describe('soft fail reopen', () => {
+describe('terminal reopen', () => {
   it('reopens failed tasks to open', () => {
     const task = baseTask({ lifecycle: 'failed', finishedAt: NOW, error: 'nope' });
     expect(isSoftTerminalLifecycle(task.lifecycle)).toBe(true);
     expect(isHardTerminalLifecycle(task.lifecycle)).toBe(false);
-    const result = reopenSoftFailedTask(task, { now: '2026-07-06T01:00:00.000Z' });
+    const result = reopenTask(task, { now: '2026-07-06T01:00:00.000Z' });
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.next.lifecycle).toBe('open');
@@ -556,7 +623,25 @@ describe('soft fail reopen', () => {
     }
   });
 
-  it('rejects reopen of hard terminal or open tasks', () => {
+  it('reopens hard-terminal tasks to open', () => {
+    for (const lifecycle of ['succeeded', 'cancelled', 'skipped'] as const) {
+      const result = reopenTask(baseTask({ lifecycle, finishedAt: NOW }), { now: NOW });
+      expect(result.ok, lifecycle).toBe(true);
+      if (result.ok) {
+        expect(result.next.lifecycle).toBe('open');
+        expect(result.next.finishedAt).toBeUndefined();
+      }
+    }
+  });
+
+  it('rejects reopen of open tasks', () => {
+    expect(reopenTask(baseTask({ lifecycle: 'open' }), { now: NOW })).toEqual({
+      ok: false,
+      reason: 'task is not terminal',
+    });
+  });
+
+  it('legacy soft helper still rejects non-failed tasks', () => {
     expect(reopenSoftFailedTask(baseTask({ lifecycle: 'succeeded' }), { now: NOW })).toEqual({
       ok: false,
       reason: 'task is not soft-failed',
@@ -627,5 +712,134 @@ describe('stageDisposition rejections', () => {
         {},
       ),
     ).toEqual({ ok: false, reason: 'stageDisposition requires a live turn' });
+  });
+});
+
+describe('prepareEditQueuedTurn / prepareDeleteQueuedTurn', () => {
+  function userMessage(overrides: Partial<TaskMessage> & Pick<TaskMessage, 'id'>): TaskMessage {
+    return {
+      taskId: 'task-1',
+      role: 'user',
+      content: 'hello',
+      state: 'pending',
+      createdAt: NOW,
+      ...overrides,
+    };
+  }
+
+  it('edits only the bound pending user message content of a queued turn', () => {
+    const queued = turn({
+      id: 't2',
+      status: 'queued',
+      sequence: 2,
+      inputs: [{ kind: 'message', messageId: 'm2' }],
+    });
+    const messages = {
+      m2: userMessage({ id: 'm2', content: 'old' }),
+      m1: userMessage({ id: 'm1', content: 'live', state: 'assigned', turnId: 't1' }),
+    };
+    const result = prepareEditQueuedTurn('task-1', queued, messages, '  revised  ');
+    expect(result).toEqual({
+      ok: true,
+      next: { messageId: 'm2', content: 'revised' },
+      effects: [],
+    });
+  });
+
+  it('refuses edit when turn is missing, foreign, or not queued', () => {
+    const messages = { m1: userMessage({ id: 'm1' }) };
+    expect(prepareEditQueuedTurn('task-1', undefined, messages, 'x')).toEqual({
+      ok: false,
+      reason: 'turn not found',
+    });
+    expect(
+      prepareEditQueuedTurn(
+        'task-1',
+        turn({ id: 't1', taskId: 'other', status: 'queued', sequence: 1, inputs: [{ kind: 'message', messageId: 'm1' }] }),
+        messages,
+        'x',
+      ),
+    ).toEqual({ ok: false, reason: 'turn does not belong to task' });
+    expect(
+      prepareEditQueuedTurn(
+        'task-1',
+        turn({ id: 't1', status: 'running', sequence: 1, inputs: [{ kind: 'message', messageId: 'm1' }] }),
+        messages,
+        'x',
+      ),
+    ).toEqual({ ok: false, reason: 'turn is not queued' });
+    expect(
+      prepareEditQueuedTurn(
+        'task-1',
+        turn({ id: 't1', status: 'succeeded', sequence: 1, inputs: [{ kind: 'message', messageId: 'm1' }] }),
+        messages,
+        'x',
+      ),
+    ).toEqual({ ok: false, reason: 'turn is not queued' });
+  });
+
+  it('refuses edit for empty content or non-pending bound messages', () => {
+    const queued = turn({
+      id: 't1',
+      status: 'queued',
+      sequence: 1,
+      inputs: [{ kind: 'message', messageId: 'm1' }],
+    });
+    expect(prepareEditQueuedTurn('task-1', queued, { m1: userMessage({ id: 'm1' }) }, '   ')).toEqual({
+      ok: false,
+      reason: 'invalid content',
+    });
+    expect(prepareEditQueuedTurn('task-1', queued, {}, 'ok')).toEqual({
+      ok: false,
+      reason: 'message not found',
+    });
+    expect(
+      prepareEditQueuedTurn(
+        'task-1',
+        queued,
+        { m1: userMessage({ id: 'm1', state: 'assigned', turnId: 't1' }) },
+        'ok',
+      ),
+    ).toEqual({ ok: false, reason: 'message is not pending' });
+  });
+
+  it('deletes a queued turn and its pending user messages only', () => {
+    const queued = turn({
+      id: 't2',
+      status: 'queued',
+      sequence: 2,
+      inputs: [{ kind: 'message', messageId: 'm2' }],
+    });
+    const messages = {
+      m2: userMessage({ id: 'm2', content: 'follow-up' }),
+      m1: userMessage({ id: 'm1', content: 'live', state: 'assigned', turnId: 't1' }),
+    };
+    expect(prepareDeleteQueuedTurn('task-1', queued, messages)).toEqual({
+      ok: true,
+      next: { turnId: 't2', messageIds: ['m2'] },
+      effects: [],
+    });
+  });
+
+  it('refuses delete when turn is not queued or messages are not pending', () => {
+    const messages = { m1: userMessage({ id: 'm1' }) };
+    expect(prepareDeleteQueuedTurn('task-1', undefined, messages)).toEqual({
+      ok: false,
+      reason: 'turn not found',
+    });
+    expect(
+      prepareDeleteQueuedTurn(
+        'task-1',
+        turn({ id: 't1', status: 'running', sequence: 1, inputs: [{ kind: 'message', messageId: 'm1' }] }),
+        messages,
+      ),
+    ).toEqual({ ok: false, reason: 'turn is not queued' });
+    expect(
+      prepareDeleteQueuedTurn(
+        'task-1',
+        turn({ id: 't1', status: 'queued', sequence: 1, inputs: [{ kind: 'message', messageId: 'm1' }] }),
+        { m1: userMessage({ id: 'm1', state: 'assigned' }) },
+      ),
+    ).toEqual({ ok: false, reason: 'message is not pending' });
   });
 });

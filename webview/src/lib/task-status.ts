@@ -78,7 +78,8 @@ export const LIFECYCLE_PRESENTATIONS = {
     listCopy: 'Marked complete',
     workspaceHeadline: 'Task succeeded',
     workspaceDetail: 'An authorized actor sealed this task as successfully completed.',
-    composerGuidance: 'This task is closed; use Continue as new task for follow-up work.',
+    composerGuidance:
+      'This task is succeeded. Sending a new message will reopen it (same task). Or create a new task instead.',
   },
   failed: {
     key: 'failed',
@@ -88,7 +89,8 @@ export const LIFECYCLE_PRESENTATIONS = {
     workspaceHeadline: 'Task failed',
     workspaceDetail:
       'This attempt was sealed as unsuccessful. Send a message to reopen the same task, or start a new one.',
-    composerGuidance: 'Send a message to reopen this task and continue, or create a new task.',
+    composerGuidance:
+      'This task is failed. Sending a new message will reopen it (same task). Or create a new task instead.',
   },
   cancelled: {
     key: 'cancelled',
@@ -97,7 +99,8 @@ export const LIFECYCLE_PRESENTATIONS = {
     listCopy: 'Cancelled',
     workspaceHeadline: 'Task cancelled',
     workspaceDetail: 'The task was cancelled before it finished (including cascaded cancels).',
-    composerGuidance: 'This task is closed; use Continue as new task for related work.',
+    composerGuidance:
+      'This task is cancelled. Sending a new message will reopen it (same task). Or create a new task instead.',
   },
   skipped: {
     key: 'skipped',
@@ -106,7 +109,8 @@ export const LIFECYCLE_PRESENTATIONS = {
     listCopy: 'Won’t perform',
     workspaceHeadline: 'Task skipped',
     workspaceDetail: 'This task was created but deliberately marked as will not be performed.',
-    composerGuidance: 'This task is closed; create a new task if you want to do this work later.',
+    composerGuidance:
+      'This task is skipped. Sending a new message will reopen it (same task). Or create a new task instead.',
   },
 } as const satisfies Record<TaskLifecycleState, StatusAxisPresentation>;
 
@@ -127,16 +131,18 @@ export const RUNTIME_PRESENTATIONS = {
     listCopy: 'Turn queued',
     workspaceHeadline: 'Queued for execution',
     workspaceDetail: 'A turn is ready and waiting for the scheduler.',
-    composerGuidance: 'A turn is queued; hold new instructions unless adjusting before start.',
+    composerGuidance:
+      'Enter queues another follow-up; edit or delete pending turns in the queue panel before they start.',
   },
   running: {
     key: 'running',
-    label: 'Running',
+    label: 'Working',
     tone: 'attention',
-    listCopy: 'CLI turn active',
+    listCopy: 'Turn active',
     workspaceHeadline: 'Turn is running',
-    workspaceDetail: 'A CLI process is active for this task (runtime only — not task outcome).',
-    composerGuidance: 'Composer is disabled while a turn is running; wait or cancel the turn.',
+    workspaceDetail: 'A turn is executing for this task (not a sealed task outcome).',
+    composerGuidance:
+      'Enter queues a follow-up turn; Ctrl+Enter interrupts and sends.',
   },
   waiting_user: {
     key: 'waiting_user',
@@ -167,13 +173,13 @@ export const RUNTIME_PRESENTATIONS = {
   },
   needs_recovery: {
     key: 'needs_recovery',
-    label: 'Needs recovery',
+    label: 'Could not finish',
     tone: 'danger',
-    listCopy: 'Turn recovery needed',
-    workspaceHeadline: 'Turn recovery needed',
+    listCopy: 'Turn needs attention',
+    workspaceHeadline: 'Turn could not finish',
     workspaceDetail:
-      'The last CLI turn failed or was interrupted. The task remains open until you recover or continue.',
-    composerGuidance: 'Retry or continue with recovery instructions — this is not a sealed task failure.',
+      'The last turn failed or was interrupted. The task remains open until you retry or continue.',
+    composerGuidance: 'Retry or continue with instructions — this is not a sealed task failure.',
   },
   idle: {
     key: 'idle',
@@ -390,17 +396,14 @@ export function taskStatusLabel(status: TaskViewStatus | string | null | undefin
   return getTaskStatusPresentation(status).label;
 }
 
-/** Runtime activities that block free-form composer send (turn busy or gated). */
+/**
+ * Runtime activities that block free-form composer send (UI default only).
+ *
+ * Phase B: free-form send is accepted for needs_recovery and wait orchestration
+ * (deps/children/external). Only structured `waiting_user` / pending ask blocks
+ * Enter by default (AskCard is primary).
+ */
 export function runtimeBlocksComposer(activity: TaskRuntimeActivity | null | undefined): boolean {
   if (!activity) return false;
-  // awaiting_outcome: agent proposed complete but task stays open — user may still
-  // send a message (clears proposal and continues session). Do not block.
-  return (
-    activity === 'running' ||
-    activity === 'queued' ||
-    activity === 'waiting_dependencies' ||
-    activity === 'waiting_children' ||
-    activity === 'waiting_user' ||
-    activity === 'needs_recovery'
-  );
+  return activity === 'waiting_user';
 }

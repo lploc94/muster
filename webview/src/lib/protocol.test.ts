@@ -15,8 +15,10 @@ vi.mock('./vscode', () => ({
 
 import {
   PROTOCOL_VERSION,
+  formatLiveInputDeliveredMessage,
   isExtMessage,
   isProtocolCompatible,
+  isTaskScopedBannerVisible,
   post,
   type OutMessage,
   type RetentionSettingSnapshot,
@@ -70,6 +72,69 @@ describe('isExtMessage snapshot version tolerance', () => {
 
   it('rejects a snapshot whose protocolVersion is not a number', () => {
     expect(isExtMessage({ ...baseSnapshot, protocolVersion: 'nope' })).toBe(false);
+  });
+
+  it('accepts optional queuedTurns FIFO projection entries', () => {
+    expect(
+      isExtMessage({
+        ...baseSnapshot,
+        activeTurnId: 'turn-live',
+        queuedTurns: [
+          {
+            turnId: 'turn-q1',
+            sequence: 2,
+            status: 'queued',
+            messageIds: ['msg-b'],
+            createdAt: '2026-07-06T00:02:00.000Z',
+          },
+        ],
+      }),
+    ).toBe(true);
+  });
+
+  it('rejects malformed queuedTurns projection entries', () => {
+    const malformed = [
+      { ...baseSnapshot, queuedTurns: 'not-array' },
+      {
+        ...baseSnapshot,
+        queuedTurns: [
+          {
+            turnId: 'turn-q1',
+            sequence: 2,
+            status: 'running',
+            messageIds: ['msg-b'],
+            createdAt: '2026-07-06T00:02:00.000Z',
+          },
+        ],
+      },
+      {
+        ...baseSnapshot,
+        queuedTurns: [
+          {
+            turnId: 'turn-q1',
+            sequence: '2',
+            status: 'queued',
+            messageIds: ['msg-b'],
+            createdAt: '2026-07-06T00:02:00.000Z',
+          },
+        ],
+      },
+      {
+        ...baseSnapshot,
+        queuedTurns: [
+          {
+            turnId: 'turn-q1',
+            sequence: 2,
+            status: 'queued',
+            messageIds: [1],
+            createdAt: '2026-07-06T00:02:00.000Z',
+          },
+        ],
+      },
+    ];
+    for (const message of malformed) {
+      expect(isExtMessage(message), JSON.stringify(message)).toBe(false);
+    }
   });
 });
 
@@ -196,8 +261,167 @@ describe('settings protocol guard', () => {
   });
 });
 
+describe('file drop outbound protocol', () => {
+  it('posts the bounded candidate payload without file contents or metadata', () => {
+    const message: OutMessage = {
+      type: 'resolveFileDrop',
+      candidates: ['file:///workspace/a%20b.ts'],
+    };
+
+    post(message);
+
+    expect(vscode.postMessage).toHaveBeenCalledWith({
+      type: 'resolveFileDrop',
+      candidates: ['file:///workspace/a%20b.ts'],
+    });
+  });
+});
+
+describe('live-input protocol', () => {
+  it('posts sendLiveInput as a distinct OutMessage from continueTask', () => {
+    vi.mocked(vscode.postMessage).mockClear();
+
+    const live: OutMessage = {
+      type: 'sendLiveInput',
+      taskId: 'task-1',
+      instruction: 'nudge the active turn',
+    };
+    const queued: OutMessage = {
+      type: 'continueTask',
+      taskId: 'task-1',
+      instruction: 'queue a follow-up turn',
+    };
+
+    post(live);
+    post(queued);
+
+    expect(vscode.postMessage).toHaveBeenNthCalledWith(1, live);
+    expect(vscode.postMessage).toHaveBeenNthCalledWith(2, queued);
+    expect(live.type).not.toBe(queued.type);
+  });
+
+  it('accepts a delivered liveInputResult acknowledgement from the host', () => {
+    expect(
+      isExtMessage({
+        type: 'liveInputResult',
+        taskId: 'task-1',
+        code: 'delivered',
+        sessionId: 'sess-1',
+      }),
+    ).toBe(true);
+  });
+
+  it('rejects malformed liveInputResult shapes', () => {
+    const malformed = [
+      { type: 'liveInputResult', taskId: 'task-1', code: 'delivered' },
+      { type: 'liveInputResult', taskId: 'task-1', code: 'unsupported', sessionId: 's' },
+      { type: 'liveInputResult', taskId: 'task-1', code: 'delivered', sessionId: 's', extra: true },
+      { type: 'liveInputResult', code: 'delivered', sessionId: 's' },
+    ];
+    for (const message of malformed) {
+      expect(isExtMessage(message), JSON.stringify(message)).toBe(false);
+    }
+  });
+
+  it('keeps commandError as the visible refusal channel for live-input failures', () => {
+    expect(
+      isExtMessage({
+        type: 'commandError',
+        taskId: 'task-1',
+        message: 'Live input unsupported: backend kiro does not support live input',
+      }),
+    ).toBe(true);
+  });
+
+  it('formats a delivered live-input acknowledgement that is never empty', () => {
+    const message = formatLiveInputDeliveredMessage('sess-1');
+    expect(message.length).toBeGreaterThan(0);
+    expect(message.toLowerCase()).toContain('live input');
+    expect(message.toLowerCase()).toContain('delivered');
+  });
+
+  it('rejects blank session ids when formatting delivered acknowledgements', () => {
+    expect(() => formatLiveInputDeliveredMessage('')).toThrow(/session/i);
+    expect(() => formatLiveInputDeliveredMessage('   ')).toThrow(/session/i);
+  });
+
+  it('scopes inject feedback banners to the focused task (or global when taskId is absent)', () => {
+    expect(isTaskScopedBannerVisible(null, 'task-1')).toBe(true);
+    expect(isTaskScopedBannerVisible(undefined, 'task-1')).toBe(true);
+    expect(isTaskScopedBannerVisible('task-1', 'task-1')).toBe(true);
+    expect(isTaskScopedBannerVisible('task-1', 'task-other')).toBe(false);
+    expect(isTaskScopedBannerVisible('task-1', null)).toBe(false);
+  });
+});
+
+describe('queued turn mutation protocol', () => {
+  it('posts editQueuedTurn and deleteQueuedTurn as distinct OutMessages', () => {
+    vi.mocked(vscode.postMessage).mockClear();
+
+    const edit: OutMessage = {
+      type: 'editQueuedTurn',
+      taskId: 'task-1',
+      turnId: 'turn-q',
+      content: 'revised follow-up',
+    };
+    const del: OutMessage = {
+      type: 'deleteQueuedTurn',
+      taskId: 'task-1',
+      turnId: 'turn-q',
+    };
+    const continueMsg: OutMessage = {
+      type: 'continueTask',
+      taskId: 'task-1',
+      instruction: 'queue a follow-up turn',
+    };
+
+    post(edit);
+    post(del);
+    post(continueMsg);
+
+    expect(vscode.postMessage).toHaveBeenNthCalledWith(1, edit);
+    expect(vscode.postMessage).toHaveBeenNthCalledWith(2, del);
+    expect(vscode.postMessage).toHaveBeenNthCalledWith(3, continueMsg);
+    expect(edit.type).not.toBe(continueMsg.type);
+    expect(del.type).not.toBe(continueMsg.type);
+    expect(edit.type).not.toBe(del.type);
+  });
+
+  it('keeps commandError as the visible refusal channel for stale queued mutations', () => {
+    expect(
+      isExtMessage({
+        type: 'commandError',
+        taskId: 'task-1',
+        message: 'Queued turn mutation refused: turn is not queued',
+      }),
+    ).toBe(true);
+  });
+
+  it('accepts prompt submission acknowledgements and rejects malformed ones', () => {
+    expect(isExtMessage({
+      type: 'askSubmissionResult',
+      taskId: 'task-1',
+      turnId: 'turn-1',
+      askId: 'ask-1',
+      ok: false,
+      message: 'retry',
+    })).toBe(true);
+    expect(isExtMessage({
+      type: 'elicitationSubmissionResult',
+      promptId: 'prompt-1',
+      ok: true,
+    })).toBe(true);
+    expect(isExtMessage({
+      type: 'elicitationSubmissionResult',
+      promptId: 'prompt-1',
+      ok: 'yes',
+    })).toBe(false);
+  });
+});
+
 describe('settings outbound protocol', () => {
   it('posts explicit request and update messages to the extension host', () => {
+    vi.mocked(vscode.postMessage).mockClear();
     const messages: OutMessage[] = [
       { type: 'requestSettings' },
       { type: 'updateSetting', settingId: 'maxTurnsPerTask', value: 25 },
@@ -218,6 +442,34 @@ describe('settings outbound protocol', () => {
       type: 'updateSetting',
       settingId: 'maxStoredOutputChars',
       value: 4096,
+    });
+  });
+});
+
+describe('composer selection protocol', () => {
+  it('accepts host composerSelection messages', () => {
+    expect(
+      isExtMessage({ type: 'composerSelection', backend: 'grok', model: 'grok-4' }),
+    ).toBe(true);
+    expect(isExtMessage({ type: 'composerSelection', backend: 'claude', model: null })).toBe(true);
+  });
+
+  it('rejects malformed composerSelection messages', () => {
+    expect(isExtMessage({ type: 'composerSelection', backend: 'grok' })).toBe(false);
+    expect(isExtMessage({ type: 'composerSelection', backend: 1, model: null })).toBe(false);
+    expect(
+      isExtMessage({ type: 'composerSelection', backend: 'grok', model: null, extra: true }),
+    ).toBe(false);
+  });
+
+  it('posts setComposerSelection to the host', () => {
+    vi.mocked(vscode.postMessage).mockClear();
+    const message: OutMessage = { type: 'setComposerSelection', backend: 'grok', model: 'm1' };
+    post(message);
+    expect(vscode.postMessage).toHaveBeenCalledWith({
+      type: 'setComposerSelection',
+      backend: 'grok',
+      model: 'm1',
     });
   });
 });

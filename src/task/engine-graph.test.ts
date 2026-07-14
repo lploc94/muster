@@ -14,6 +14,7 @@ const MCP_CAPS: BackendCapabilities = {
   supportsMCP: true,
   supportsReasoning: false,
   supportsDetailedToolEvents: false,
+  supportsLiveInput: false
 };
 
 function makeHarness() {

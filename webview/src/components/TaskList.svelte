@@ -1,9 +1,8 @@
 <script lang="ts">
   import { tasks } from '../lib/tasks.svelte';
-  import { effectiveRuntimeActivity, post } from '../lib/protocol';
+  import { post, type TaskSummary } from '../lib/protocol';
   import { getLifecyclePresentation, isSoftTerminal } from '../lib/task-status';
-  import type { TaskSummary } from '../lib/protocol';
-  import { backendShortLabel } from '../lib/backends';
+  import { backendModelLabel } from '../lib/backends';
   import { tip } from '../lib/tooltip';
 
   interface Props {
@@ -53,10 +52,10 @@
 
   function taskStateFlags(task: TaskSummary): string[] {
     const flags: string[] = [];
-    const runtime = effectiveRuntimeActivity(task);
-    // Task status only (lifecycle) — CLI process is shown near the composer.
+    const activity = task.currentTurnActivity?.state;
     flags.push(`Task ${getLifecyclePresentation(task.lifecycle).label}`);
-    if (runtime === 'running' || runtime === 'waiting_user') flags.push('CLI running');
+    if (activity === 'executing') flags.push('Turn working');
+    if (activity === 'waiting_you') flags.push('Waiting for you');
     if (isSoftTerminal(task.lifecycle)) flags.push('Soft failed — send to reopen');
     if (task.backend) flags.push(`Backend ${task.backend}`);
     if (task.continuationOf) flags.push('Continuation');
@@ -68,10 +67,10 @@
     return [shortGoal(task.goal), ...flags].join(' ');
   }
 
-  /** True when a CLI process is up (running or idle/waiting_user). */
-  function isCliLive(task: TaskSummary): boolean {
-    const runtime = effectiveRuntimeActivity(task);
-    return runtime === 'running' || runtime === 'waiting_user';
+  /** True when host turn activity is live (executing or waiting for the user). */
+  function isTurnLive(task: TaskSummary): boolean {
+    const activity = task.currentTurnActivity?.state;
+    return activity === 'executing' || activity === 'waiting_you';
   }
 
   function startRename(task: TaskSummary) {
@@ -157,7 +156,7 @@
 
       {#each filtered as task (task.id)}
         {@const flags = taskStateFlags(task)}
-        {@const cliLive = isCliLive(task)}
+        {@const turnLive = isTurnLive(task)}
         {@const isSel = tasks.focusedTaskId === task.id && !tasks.draftMode}
         {@const isEditing = editingId === task.id}
         {@const isConfirming = confirmDeleteId === task.id}
@@ -213,15 +212,17 @@
                 >
                   {getLifecyclePresentation(task.lifecycle).label}
                 </vscode-badge>
-                {#if cliLive}
+                {#if turnLive}
                   <span
-                    class="cli-live-dot"
-                    use:tip={'CLI running (process status — not task outcome)'}
-                    aria-label="CLI running"
+                    class="turn-live-dot"
+                    use:tip={'Turn is active (not task outcome)'}
+                    aria-label="Turn active"
                   ></span>
                 {/if}
                 {#if task.backend}
-                  <span class="text-[11px] leading-[14px] opacity-70">{backendShortLabel(task.backend)}</span>
+                  <span class="text-[11px] leading-[14px] opacity-70"
+                    >{backendModelLabel(task.backend, task.model)}</span
+                  >
                 {/if}
                 {#if task.continuationOf}
                   <span style="font-size: 10px;">↳ cont.</span>
@@ -312,7 +313,7 @@
 
     {#each tasks.rootTasks as task (task.id)}
       {@const flags = taskStateFlags(task)}
-      {@const cliLive = isCliLive(task)}
+      {@const turnLive = isTurnLive(task)}
       <button
         type="button"
         class="w-full text-left rounded px-2 py-1.5 text-xs flex flex-col gap-0.5 hover:bg-[var(--vscode-list-hoverBackground)]"
@@ -330,15 +331,17 @@
           >
             {getLifecyclePresentation(task.lifecycle).label}
           </vscode-badge>
-          {#if cliLive}
+          {#if turnLive}
             <span
-              class="cli-live-dot"
-              use:tip={'CLI running (process status — not task outcome)'}
-              aria-label="CLI running"
+              class="turn-live-dot"
+              use:tip={'Turn is active (not task outcome)'}
+              aria-label="Turn active"
             ></span>
           {/if}
           {#if task.backend}
-            <span class="text-[11px] leading-[14px] opacity-70">{backendShortLabel(task.backend)}</span>
+            <span class="text-[11px] leading-[14px] opacity-70"
+              >{backendModelLabel(task.backend, task.model)}</span
+            >
           {/if}
           {#if task.continuationOf}
             <span style="font-size: 10px;">↳ cont.</span>

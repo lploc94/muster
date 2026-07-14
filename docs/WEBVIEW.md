@@ -248,7 +248,7 @@ Source of truth for event shapes: [`ADAPTER-SPEC.md`](ADAPTER-SPEC.md). UI rules
 
 | Event | Render | Component | Notes |
 |-------|--------|-----------|-------|
-| `sessionStarted` | Status chip / toolbar hint | `Toolbar` | Show session ID truncated; optional |
+| `sessionStarted` | Internal / optional debug only | — | **Do not** show session id in product chrome (Phase A+) |
 | `assistantDelta` | Append to open bubble | `MessageBubble` | Group by `messageId`; same ID → same bubble |
 | `reasoningDelta` | Append in collapsible | `ReasoningBlock` | Group by `messageId` (like `assistantDelta`); default collapsed; muted style |
 | `toolStarted` | New card, running state | `ToolCard` | Show `name`, `kind`; MCP badge if `kind === 'mcp'` |
@@ -433,31 +433,34 @@ The webview never holds the whole thread. Render a **recent window**; older item
 
 ### Composer
 
-- **Disabled** while a turn is in-flight (`turnStart` received, no `turnDone` / `turnError` yet).
-- **Disabled** while any `askPending` is unresolved (or show `AskCard` modal — user must submit or cancel).
-- Enter sends; Shift+Enter newline (standard chat pattern).
-- **Re-enable on `turnDone` OR `turnError`.** A normal adapter `error` NormalizedEvent (non-zero exit, cancellation) arrives via an `event` message and is then followed by `turnDone`; only an uncaught host/adapter failure sends `turnError`. Treat either terminal message as end-of-turn so the composer never gets stuck.
+- **Composer stays editable** while a focused open task is `running` or has FIFO queued follow-ups so Enter can queue another turn and Ctrl+Enter can interrupt & send. Do **not** hard-disable solely because a turn is in-flight.
+- **Disabled / blocked** while any `askPending` is unresolved (or show `AskCard` modal — user must submit or cancel), during recovery gates, or dependency-blocked free-form send. Terminal lifecycles stay writable: next `send` **reopens** the same task id to `open`.
+- **Enter** posts host `send` (FIFO follow-up while live, no interrupt). **Ctrl+Enter** / **Meta+Enter**: posts `sendLiveInput` when a turn is running — host **reserves a follow-up then interrupts** the live turn (cut & continue). Not concurrent ACP inject. When idle, posts ordinary `send`. Shift+Enter inserts a newline; IME composition suppresses submit.
+- **Stop / cancel** still targets the live turn; queue mutations use the `queuedTurns` panel (`editQueuedTurn` / `deleteQueuedTurn`). See §14 for the full queue and interrupt-and-send contract.
+- **Terminal messages:** a normal adapter `error` NormalizedEvent (non-zero exit, cancellation) arrives via an `event` message and is then followed by `turnDone`; only an uncaught host/adapter failure sends `turnError`. Treat either terminal message as end-of-turn for stop-button and streaming chrome so the UI never gets stuck mid-run.
 
 ### Session / tasks
 
 - **New task** opens an unpersisted composer; first `send` has no `taskId` → `startNewTask` (`lifecycle: open`).
-- **Three status axes** (see `TASK-MANAGEMENT.md` §4.3):
+- **Status axes** (see `TASK-MANAGEMENT.md` §4.3; Phase A of
+  `docs/plans/task-chat-turn-hide-cli.md`):
   - **Task lifecycle** on list + **workspace status card header**: `open` /
     `succeeded` / `failed` / `cancelled` / `skipped`.
-  - **CLI view** on the **composer strip**: `not_started` / `running` / `idle` /
-    `stopped`. Optional subtitle for `lastExit` (`ok` / `error` / `cancelled`)
-    when stopped. **Error is not a CLI phase.**
+  - **Turn activity** on the **composer strip** (`data-turn-activity`):
+    `executing` (“Working”), `waiting_you`, `queued`, `failed_turn`
+    (“Could not finish”). **No strip** when ready / between turns. Product UI
+    must **not** show CLI process vocabulary (`CLI running/stopped/idle`).
   - **Orchestration** (deps, children, recovery, outcome proposal): action panels
     or expand-details one-liners — not the task badge, not a second App header row.
-  Do **not** set task lifecycle from `turnDone` / CLI errors alone.
+  Do **not** set task lifecycle from `turnDone` / adapter errors alone.
 - **Workspace header = task status card** (not a duplicate title/status bar):
   name + lifecycle badge + **status menu** (`setTaskLifecycle`). **Expand task
-  details** (collapsed by default) for lifecycle copy, orchestration hint, bound
-  session id; keep collapsed chrome free of “Task is open / Session ses_…” noise.
-- **CLI mapping:** live generating → `running`; `waiting_user` / process alive
-  not generating → `idle`; never spawned / only queued → `not_started`; process
-  exited → `stopped`. After reload, derive prior process from `hadProcess` and/or
-  `committedSessionId` when host has not projected `cliViewStatus`.
+  details** (collapsed by default) for lifecycle copy and orchestration hint;
+  do **not** show bound session id in product chrome (Phase A).
+- **Turn activity mapping (Phase A client derive; Phase B host-owned):** live
+  generating → `executing`; `waiting_user` / pending ask → `waiting_you`;
+  queued only → `queued`; `needs_recovery` → `failed_turn`; otherwise no strip.
+  Stop control is labeled **Stop this turn**.
 - **Who seals outcomes:** **user** always (status menu → `setTaskLifecycle`);
   **coordinator** when the user enables outcome delegation (`coordinator_delegate`
   / future `yolo`). See `TASK-MANAGEMENT.md` §4.1.1.
@@ -467,15 +470,15 @@ The webview never holds the whole thread. Render a **recent window**; older item
   session. Status menu can still seal `succeeded` / `failed` / cancel / skip.
 - **Delegate / yolo:** coordinator may mark success without Accept card; show a
   short “sealed by coordinator” notice; user can still cancel/override.
-- **Soft failed:** composer stays available; next `send` **reopens** the same task
-  to `open` (not a new task id). Status menu **Reopen** → `setTaskLifecycle` `open`.
-- **Continue as new task** for **hard** terminal (`succeeded` / `cancelled` /
-  `skipped`): `send { text, continuationOf }` (no `taskId`). No reopen-on-same-id.
+- **Any sealed lifecycle** (`failed` / `succeeded` / `cancelled` / `skipped`):
+  composer stays available; next `send` **reopens** the same task to `open`
+  (not a new task id). Status menu / panel **Reopen** → `setTaskLifecycle` `open`.
+  For a separate conversation, user creates a **new task** (no continuation draft).
 - **Cancel / skip** via status menu (`setTaskLifecycle` → `cancelled` / `skipped`):
   host cascades descendants (`cancelTask` / `skipTask`). Distinct from interrupt
   turn. See `TASK-MANAGEMENT.md` §5.4–§5.6.
 - Legacy flat chat, `newSession`, and “Continue last” (`.muster-sessions.json`) were removed in Phase E.
-- **`needs_recovery`**: explicit **Retry** (required instruction) and **Continue** (required message) controls; lifecycle stays `open`.
+- **`needs_recovery` / `failed_turn`**: inline “Could not finish” card with optional **Try again** / **Continue**; free-form composer remains open; lifecycle stays `open`.
 - **Reload-preserved queued turn**: **Resume** → `resumeQueuedTurn`.
 
 ### Webview persistence (host-owned transcript + lazy scrollback)
@@ -490,7 +493,7 @@ The webview never holds the whole thread. Render a **recent window**; older item
 
 ### Cancellation
 
-- `cancelTurn` → extension aborts `AbortSignal`, `AskBridge.cancelAll()`, kills CLI child. Targets the current `runId` (only one turn is ever in-flight — the composer is disabled otherwise).
+- `cancelTurn` → extension aborts `AbortSignal`, `AskBridge.cancelAll()`, kills CLI child. Targets the current live turn/`runId` (at most one **running** turn per task; additional follow-ups may already be FIFO-queued — cancel does not delete them).
 - Pending `AskCard` → `cancelAsk` or turn cancel clears card.
 
 ### Security
@@ -569,7 +572,112 @@ The webview never holds the whole thread. Render a **recent window**; older item
 
 ---
 
-## 12. References
+## 12. File-drop mentions
+
+Dragging onto an enabled composer inserts a **textual file mention** (chip). It is not an editor attachment in the VS Code sense, but **OS/Finder drops without a visible path** may be **copied into a private temp directory** so the agent can still open the bytes.
+
+### Protocol
+
+1. Webview extracts drag candidates (`resolveFileDrop { candidates }`) or, when only a `File` blob is available, sends `importDroppedFile { name, data }` (raw bytes, max 25 MiB).
+2. Host resolves paths (workspace-relative when inside a folder, otherwise absolute) or materializes an owner-only temp copy under `os.tmpdir()/muster-file-drops/drop-*/`.
+3. Host replies `filePicked { path, displayName? }`. Composer inserts a **short display chip** (`@name` / `@"name with spaces"`) and binds it to the resolve path.
+4. On **send**, webview keeps display text for the transcript and may send `llmText` with chips expanded to full paths for the agent (`TaskMessage.agentContent`).
+
+### Contract notes
+
+- Prefer **one file** per drop; alternate encodings of the same file are collapsed.
+- VS Code often requires **Shift** when dropping into a webview from Explorer/Finder.
+- Disabled composers ignore drag input.
+- Temp imports use exclusive create (`wx`), mode `0o600`, per-drop directories, and best-effort 24h prune on the next import.
+- Directories are rejected when `stat` reports a folder; missing targets may still be mentioned if a path string was provided.
+
+### Proof boundary
+
+Unit tests cover extraction, host resolution, import, and mention expand-on-send. Focused Playwright covers the browser-visible composer flow with synthetic host messages. Local unit and Playwright checks are **supportive only**; live Extension Development Host observation is required for PASS/FAIL of native Explorer/Finder drags.
+
+---
+
+## 13. Read-only presentation review and revision
+
+A coordinator-triggered dedicated tab presents a bounded review artifact beside the Muster chat. It is **read-only**: it is not an editor, file manager, or alternate conversation surface. Markdown paragraphs, tables, fenced code, and safe links render in the tab; links use the host's safe external-opening policy.
+
+### Identity, updates, and isolation
+
+Each tab has a stable presentation ID and immutable owning task. A monotonic revision updates that same tab only when the revision is newer; stale or replayed revisions are ignored. Multiple tabs may remain open, and each presentation ID is isolated so an update cannot mutate another tab.
+
+### Mermaid and visible fallback
+
+Mermaid rendering is deliberately bounded by diagram count, source length, strict rendering, and sanitized SVG output. Unsupported, oversized, malformed, unsafe, or failed diagrams remain visible as source-backed fallback blocks rather than disappearing. For troubleshooting, inspect the diagram element's `data-mermaid-state` (`rendered` or `fallback`) and `data-mermaid-reason` (for example `malformed`, `unsafe-output`, or `renderer-failure`). These attributes describe renderer state without exposing task or transcript content.
+
+### Revise through the linked chat
+
+Use **Open linked chat** to reveal the presentation owner's existing task. The button reports a typed `success` or `failure` status. Submit feedback in that existing task; when the coordinator produces a newer correlated revision, the stable presentation ID refreshes the same panel. The tab does not create a second conversation channel, and its content cannot be edited directly.
+
+### Restore, dispose, and diagnose
+
+Supported window reload restores a validated persisted presentation while preserving its identity, owner, and latest revision. Closing the tab disposes its panel registration; a later update may create a fresh panel but cannot mutate the disposed instance. Close all scenario-created tabs when finished.
+
+If review or revision fails:
+
+1. Check the linked-chat typed status. A failure means reveal was rejected or the owning task could not be shown; continue from the task list rather than assuming feedback was sent.
+2. Check `data-mermaid-state` and `data-mermaid-reason` for a diagram-specific fallback. The source remains available for review.
+3. Confirm the update uses the same presentation and owner identities with a strictly newer revision.
+4. After reload, distinguish a rejected invalid snapshot from a valid restored tab. After disposal, verify the closed panel does not change.
+
+Contributor proof and live-host evidence rules are in [CONTRIBUTING.md](../CONTRIBUTING.md).
+
+---
+
+## 14. Queued follow-ups and interrupt & send
+
+Task-workspace composer keyboard and queue UX (product contract for multi-turn follow-ups):
+
+| Input | Host message | Behavior |
+|-------|--------------|----------|
+| **Enter** (task focused) | `send` `{ taskId, text }` | Creates a **distinct** FIFO follow-up turn bound to that user message. Works while a turn is already running or other turns are queued. On terminal lifecycle, reopens the same task then queues. |
+| **Ctrl+Enter** / **Meta+Enter** (running) | `sendLiveInput` → `interruptAndSend` | **Reserve** FIFO follow-up first, then **interrupt** the live turn when a local handle exists. No concurrent `backend.sendLiveInput`, no `liveInputResult` banner. Instruction uses agent-facing expanded mention text when present. |
+| **Ctrl+Enter** / **Meta+Enter** (idle) | `send` `{ taskId, text }` | Same as Enter — starts/continues a normal turn immediately. |
+| **Shift+Enter** | — | Inserts a newline; does not submit. |
+| IME composition / keyCode 229 | — | Suppresses submit. |
+
+### Composer unlock vs blocks
+
+The **composer stays editable** during `running`, `queued`, `needs_recovery`, and dependency/children/external waits so operators can stack follow-ups (scheduler gates promotion). Free-form send is UI-blocked only for structured `waiting_you` / pending ask (AskCard primary). Terminal lifecycles (`succeeded` / `failed` / `cancelled` / `skipped`) stay writable: next `send` reopens the same task id to `open` and may queue a turn.
+
+Guidance copy on the composer strip describes queue vs interrupt-and-send (e.g. “Enter queues a follow-up · Ctrl+Enter interrupts and sends”) rather than a hard disable-while-running message.
+
+### FIFO queue panel (`queuedTurns`)
+
+Host snapshots project `queuedTurns` (ordered by sequence) for the focused task. The workspace **queued turns** panel is the inspection surface: each undispatched turn may be edited or deleted. **Queued follow-ups (including interrupt-and-send reservations) do not appear in the chat transcript** until their turn starts; the panel uses host `previewText` (not chat bubbles).
+
+- **Edit** → `editQueuedTurn` `{ taskId, turnId, content }` — updates the bound pending user message of that turn only; clears any stale `agentContent` so the edited text drives the next prompt.
+- **Delete** → `deleteQueuedTurn` `{ taskId, turnId }` — removes the undispatched turn and its bound pending message(s); does **not** cancel a running turn.
+- Controls **lock** when `turnId` leaves the live `queuedTurns` projection (dispatch / start boundary). Stale mutations refuse with a visible `commandError` banner; they never silently no-op as success.
+
+Scheduler promotes at most **one active (running) turn** per task and only the **earliest** queued sequence (FIFO). Multiple queued follow-ups drain after **successful** settlement **or** a **confirmed** interrupt settlement (cut & continue). Forced interrupt and failed settlements keep MEM030 hold until recovery/resume.
+
+Over-cap `send` refuses visibly (`commandError` / engine reason) and does **not** leave free-floating pending messages without turn identity.
+
+### Interrupt & send feedback
+
+| Outcome | Host / engine | UI |
+|---------|---------------|----|
+| Reserve + interrupt | `interruptAndSend` | Follow-up appears in `queuedTurns`; no `liveInputResult` banner |
+| Reserve failed | `commandError` | Live turn keeps running |
+| Confirmed interrupt settle | FIFO promote + optional session bind | Next turn runs with user message |
+| Forced / unconfirmed cancel | Hold queue | Follow-up stays queued until recovery/resume |
+
+Capability / concurrent inject is **not** the product path for Ctrl+Enter.
+
+Draft / new-task mode has **no** interrupt-and-send path: Ctrl+Enter behaves like Enter (`send` / first-turn create).
+
+### Proof boundary
+
+Unit tests cover keyboard intent, protocol shapes, queue control locking, and interrupt-and-send host wiring. Focused Playwright (`e2e/muster-webview-state.spec.ts` against the Vite webview) proves Enter vs Ctrl+Enter message shapes and queue edit/delete with synthetic host messages. Local unit and Playwright checks are supportive only: only direct observation in an actual VS Code Extension Development Host can establish a live keyboard proof. See [CONTRIBUTING.md](../CONTRIBUTING.md) for verification commands.
+
+---
+
+## 15. References
 
 - [VS Code Webview API](https://code.visualstudio.com/api/extension-guides/webview)
 - [VS Code Elements docs](https://vscode-elements.github.io)

@@ -4,7 +4,7 @@ import type { Answers, AskRef } from '../bridge/ask-bridge';
 import { AskBridge } from '../bridge/ask-bridge';
 import { CredentialRegistry } from '../bridge/credentials';
 import { runTurn as defaultRunTurn } from '../runner';
-import type { Backend, NormalizedEvent, RunOptions } from '../types';
+import type { Backend, LiveInputResult, NormalizedEvent, RunOptions } from '../types';
 import type { TurnTrigger } from './types';
 import { approveAndMaterialize, readyChildIds } from '../workflow/approval';
 import {
@@ -43,6 +43,7 @@ import {
   applySuccessfulTurn,
   createTask,
   interruptTurn,
+  registerAsk,
   retryCountOf,
   retryTurn,
   resolveChildWait,
@@ -54,9 +55,11 @@ import {
   cancelPendingTurn,
   cancelTask as transitionCancelTask,
   hasActiveOrQueuedTurn,
-  isHardTerminalLifecycle,
   isTerminalLifecycle,
-  reopenSoftFailedTask,
+  prepareDeleteQueuedTurn,
+  prepareEditQueuedTurn,
+  holdQueuedFollowUpsOnFailure,
+  reopenTask,
   setTaskLifecycle as transitionSetTaskLifecycle,
   type CreateTaskInput,
   type Effect,
@@ -309,6 +312,29 @@ function ownsLocalLease(storePath: string, turnId: string): boolean {
   return existing?.pid === process.pid;
 }
 
+/** Stable fingerprint for Phase C send idempotency (existing-task path). */
+export function sendFingerprint(input: {
+  kind: 'existing' | 'new';
+  taskId?: string;
+  content: string;
+  agentContent?: string;
+  backend?: string;
+  model?: string;
+  continuationOf?: string;
+  goal?: string;
+}): string {
+  return JSON.stringify({
+    kind: input.kind,
+    taskId: input.taskId ?? null,
+    content: input.content,
+    agentContent: input.agentContent ?? null,
+    backend: input.backend ?? null,
+    model: input.model ?? null,
+    continuationOf: input.continuationOf ?? null,
+    goal: input.goal ?? null,
+  });
+}
+
 export function projectPrompt(
   turn: TaskTurn,
   messages: ReadonlyMap<string, TaskMessage>,
@@ -322,7 +348,7 @@ export function projectPrompt(
     .filter((message): message is TaskMessage => message !== undefined)
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
   for (const message of messageInputs) {
-    parts.push(message.content);
+    parts.push(message.agentContent ?? message.content);
   }
 
   for (const input of turn.inputs) {
@@ -409,6 +435,18 @@ function pendingUserMessages(file: TaskStoreFile, taskId: string): TaskMessage[]
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
 }
 
+function isQueuedTurnAutoPromoteFrozen(
+  file: TaskStoreFile,
+  taskId: string,
+  candidateTurnId: string,
+): boolean {
+  const candidate = file.turns[candidateTurnId];
+  if (!candidate || candidate.taskId !== taskId || candidate.status !== 'queued') {
+    return false;
+  }
+  return candidate.holdAutoPromote === true;
+}
+
 function deterministicRetryTurnId(failedTurnId: string, retryIndex: number): string {
   return `${failedTurnId}-auto-retry-${retryIndex}`;
 }
@@ -438,7 +476,29 @@ export class TaskEngine {
   private readonly bridgePort: number;
   private readonly resourceLimits: ResourceLimits;
   private readonly emit?: (e: EngineEvent) => void;
-  private readonly liveRuns = new Map<string, AbortController>();
+  /**
+   * In-process handles for currently executing turns. Keyed by turnId so live
+   * input can route only to a run this engine owns, with the exact backend
+   * instance and abort signal for that turn.
+   */
+  private readonly liveRuns = new Map<
+    string,
+    {
+      controller: AbortController;
+      taskId: string;
+      backend: Backend;
+      sessionId?: string;
+      /**
+       * Monotonic render-order allocator for this live turn (assistant/tool segments).
+       */
+      nextOrder?: () => number;
+      /**
+       * Set when this process requested interrupt (abort). Required for
+       * confirmed interrupt-and-send settlement (bind + promote).
+       */
+      interruptArmed?: boolean;
+    }
+  >();
   /** Queued turns preserved on reload — start only via resumeQueuedTurn. */
   private readonly deferredQueuedTurns = new Set<string>();
   private readonly acceptedOpIds = new Map<string, string>();
@@ -493,6 +553,131 @@ export class TaskEngine {
     };
   }
 
+  /** Per-turn elicitation wait tokens (RFD form); resume only when empty. */
+  private readonly elicitationWaitTokens = new Map<string, Set<string>>();
+
+  /**
+   * Mark live turn waiting_user for an RFD elicitation prompt (no AskBridge).
+   * Returns turnId when a live turn was found.
+   */
+  beginElicitationWait(
+    sessionId: string,
+    promptId: string,
+  ): { turnId: string } | undefined {
+    const live = this.findLiveTurnBySessionId(sessionId);
+    if (!live) return undefined;
+    const commit = this.store.commit((draft) => {
+      const turn = draft.turns[live.turnId];
+      if (!turn) return { ok: false, reason: 'turn not found' };
+      if (turn.status === 'waiting_user') return { ok: true };
+      if (turn.status !== 'running') return { ok: false, reason: 'turn is not live' };
+      const asked = registerAsk(turn);
+      if (!asked.ok) return asked;
+      draft.turns[live.turnId] = asked.next;
+      return { ok: true };
+    });
+    if (!commit.ok) return undefined;
+    let set = this.elicitationWaitTokens.get(live.turnId);
+    if (!set) {
+      set = new Set();
+      this.elicitationWaitTokens.set(live.turnId, set);
+    }
+    set.add(promptId);
+    return { turnId: live.turnId };
+  }
+
+  /** Soft release: resume only if this token existed and set is now empty. */
+  endElicitationWait(turnId: string, promptId: string): void {
+    const set = this.elicitationWaitTokens.get(turnId);
+    // Hard-cleared turns have no set — do not revive.
+    if (!set || !set.has(promptId)) return;
+    set.delete(promptId);
+    if (set.size > 0) return;
+    this.elicitationWaitTokens.delete(turnId);
+    this.store.commit((draft) => {
+      const turn = draft.turns[turnId];
+      if (!turn || turn.status !== 'waiting_user') return { ok: true };
+      const resumed = submitAnswer(turn);
+      if (resumed.ok) draft.turns[turnId] = resumed.next;
+      return { ok: true };
+    });
+  }
+
+  /** Hard clear tokens without resuming (turn cancel / backend exit / deactivate). */
+  dropElicitationWaits(turnId: string): void {
+    this.elicitationWaitTokens.delete(turnId);
+  }
+
+  /**
+   * Resolve a live turn for an ACP session id (observed on the live handle or
+   * persisted on the turn). Used to route agent-extension ask_user_question
+   * prompts back into the correct task/turn AskBridge registration.
+   */
+  findLiveTurnBySessionId(
+    sessionId: string,
+  ): { taskId: string; turnId: string } | undefined {
+    if (!sessionId) {
+      return undefined;
+    }
+    for (const [turnId, handle] of this.liveRuns) {
+      if (handle.sessionId === sessionId) {
+        return { taskId: handle.taskId, turnId };
+      }
+    }
+    const file = this.store.getFile();
+    for (const turn of Object.values(file.turns)) {
+      if (
+        (turn.status === 'running' || turn.status === 'waiting_user') &&
+        turn.observedSessionId === sessionId
+      ) {
+        return { taskId: turn.taskId, turnId: turn.id };
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Register an agent-extension ask (e.g. Grok x.ai/ask_user_question) against
+   * the live turn for `sessionId`, pause the turn as waiting_user, and return
+   * the AskBridge promise the host can await for webview answers.
+   */
+  registerAgentAsk(
+    sessionId: string,
+    questions: import('../bridge/ask-bridge').Question[],
+    deadlineMs: number,
+  ):
+    | { ok: true; ref: AskRef; promise: Promise<Answers> }
+    | { ok: false; reason: string } {
+    const live = this.findLiveTurnBySessionId(sessionId);
+    if (!live) {
+      return { ok: false, reason: 'no live turn for session' };
+    }
+    if (questions.length === 0) {
+      return { ok: false, reason: 'questions required' };
+    }
+    const askId = this.askBridge.generateAskId();
+    const ref: AskRef = { taskId: live.taskId, turnId: live.turnId, askId };
+    const commit = this.store.commit((draft) => {
+      const turn = draft.turns[ref.turnId];
+      if (!turn) return { ok: false, reason: 'turn not found' };
+      if (turn.status === 'waiting_user') {
+        return { ok: true };
+      }
+      if (turn.status !== 'running') {
+        return { ok: false, reason: 'turn is not live' };
+      }
+      const asked = registerAsk(turn);
+      if (!asked.ok) return asked;
+      draft.turns[ref.turnId] = asked.next;
+      return { ok: true };
+    });
+    if (!commit.ok) {
+      return { ok: false, reason: commit.detail ?? commit.reason };
+    }
+    const promise = this.askBridge.register(ref, questions, deadlineMs);
+    return { ok: true, ref, promise };
+  }
+
   submitAskAnswer(ref: AskRef, answers: Answers): EngineResult<void> {
     if (!this.askBridge.hasPending(ref)) {
       return { ok: false, reason: 'no matching pending ask' };
@@ -520,22 +705,24 @@ export class TaskEngine {
     if (!this.askBridge.hasPending(ref)) {
       return { ok: false, reason: 'no matching pending ask' };
     }
-    this.liveRuns.get(ref.turnId)?.abort();
-    const now = nowIso(this.clock);
+    // Soft dismiss: commit the waiting_user → resumed transition first, then
+    // reject the pending ask so MCP/agent paths can continue (cancelled).
+    // Cancel only after commit so a failed commit leaves the ask retryable.
     const commit = this.store.commit((draft) => {
       const turn = draft.turns[ref.turnId];
       if (!turn) return { ok: false, reason: 'turn not found' };
-      if (turn.status === 'running' || turn.status === 'waiting_user') {
-        const interrupted = interruptTurn(turn, { now });
-        if (!interrupted.ok) return interrupted;
-        draft.turns[ref.turnId] = interrupted.next;
+      if (turn.status !== 'waiting_user') {
+        return { ok: false, reason: 'turn is not waiting for user' };
       }
+      const resumed = submitAnswer(turn);
+      if (!resumed.ok) return resumed;
+      draft.turns[ref.turnId] = resumed.next;
       return { ok: true };
     });
     if (!commit.ok) {
       return { ok: false, reason: commit.detail ?? commit.reason };
     }
-    this.askBridge.cancel(ref, 'turn cancelled');
+    this.askBridge.cancel(ref, 'user dismissed ask');
     return { ok: true, value: undefined };
   }
 
@@ -569,8 +756,10 @@ export class TaskEngine {
     model?: string;
     continuationOf?: string;
     role?: TaskRole;
-    /** Full content of the first user message. If not provided, falls back to goal. */
+    /** User-visible first message (display-name mentions). Falls back to goal. */
     message?: string;
+    /** Agent-facing first message when it differs from `message` (expanded paths). */
+    agentMessage?: string;
     /** Workspace directory the agent runs in for this task's turns. */
     cwd?: string;
     /**
@@ -581,11 +770,55 @@ export class TaskEngine {
      * must never be forced through the planner merely because it starts a task.
      */
     workflowMode?: 'auto_plan' | 'draft' | 'direct';
-  }): EngineResult<{ taskId: string; messageId?: string; turnId?: string; workflowRunId?: string }> {
+    /** Phase C idempotent send key. */
+    clientRequestId?: string;
+  }): EngineResult<{
+    taskId: string;
+    messageId?: string;
+    turnId?: string;
+    workflowRunId?: string;
+    clientRequestId?: string;
+  }> {
     const mode = params.workflowMode ?? 'direct';
     const backend = this.makeBackend(params.backend);
     if (mode !== 'draft' && !canBindTaskToBackend(backend.capabilities)) {
       return { ok: false, reason: 'backend does not support MCP' };
+    }
+
+    const clientRequestId =
+      typeof params.clientRequestId === 'string' && params.clientRequestId.trim()
+        ? params.clientRequestId.trim()
+        : undefined;
+    const messageContent = params.message ?? params.goal;
+    const agentContent =
+      params.agentMessage && params.agentMessage !== messageContent
+        ? params.agentMessage
+        : undefined;
+    const fingerprint = sendFingerprint({
+      kind: 'new',
+      content: messageContent,
+      agentContent,
+      backend: params.backend,
+      model: params.model,
+      continuationOf: params.continuationOf,
+      goal: params.goal,
+    });
+    if (clientRequestId) {
+      const existing = this.store.getFile().sendReceipts?.[clientRequestId];
+      if (existing) {
+        if (existing.fingerprint !== fingerprint) {
+          return { ok: false, reason: 'clientRequestId conflict: different payload' };
+        }
+        return {
+          ok: true,
+          value: {
+            taskId: existing.taskId,
+            messageId: existing.messageId,
+            turnId: existing.turnId,
+            clientRequestId,
+          },
+        };
+      }
     }
 
     const taskId = randomUUID();
@@ -609,6 +842,15 @@ export class TaskEngine {
     let workflowRunId: string | undefined;
 
     const commit = this.store.commit((draft) => {
+      if (clientRequestId) {
+        const race = draft.sendReceipts?.[clientRequestId];
+        if (race) {
+          if (race.fingerprint !== fingerprint) {
+            return { ok: false, reason: 'clientRequestId conflict: different payload' };
+          }
+          return { ok: true };
+        }
+      }
       if (draft.tasks[taskId]) {
         return { ok: false, reason: 'task id already exists' };
       }
@@ -636,7 +878,7 @@ export class TaskEngine {
           phase: 'thinking',
         });
         workflowRunId = run.workflowRunId;
-        const messageContent = buildAutoPlanMessage({
+        const planMessageContent = buildAutoPlanMessage({
           goal: params.message ?? params.goal,
           rootTaskId: taskId,
           workflowRunId: run.workflowRunId,
@@ -646,7 +888,7 @@ export class TaskEngine {
           id: messageId,
           taskId,
           role: 'user',
-          content: messageContent,
+          content: planMessageContent,
           state: 'pending',
           createdAt: now,
         };
@@ -659,16 +901,27 @@ export class TaskEngine {
           return queued;
         }
         draft.turns[turnId] = queued.next;
+        if (clientRequestId) {
+          draft.sendReceipts = draft.sendReceipts ?? {};
+          draft.sendReceipts[clientRequestId] = {
+            clientRequestId,
+            fingerprint,
+            taskId,
+            messageId,
+            turnId,
+            createdAt: now,
+          };
+        }
         return { ok: true };
       }
 
-      // direct (legacy)
-      const messageContent = params.message ?? params.goal;
+      // direct
       draft.messages[messageId] = {
         id: messageId,
         taskId,
         role: 'user',
         content: messageContent,
+        ...(agentContent ? { agentContent } : {}),
         state: 'pending',
         createdAt: now,
       };
@@ -682,6 +935,17 @@ export class TaskEngine {
         return queued;
       }
       draft.turns[turnId] = queued.next;
+      if (clientRequestId) {
+        draft.sendReceipts = draft.sendReceipts ?? {};
+        draft.sendReceipts[clientRequestId] = {
+          clientRequestId,
+          fingerprint,
+          taskId,
+          messageId,
+          turnId,
+          createdAt: now,
+        };
+      }
       return { ok: true };
     });
 
@@ -689,11 +953,44 @@ export class TaskEngine {
       return { ok: false, reason: commit.detail ?? commit.reason };
     }
 
+    if (clientRequestId) {
+      const receipt = this.store.getFile().sendReceipts?.[clientRequestId];
+      if (receipt) {
+        void this.scheduleTurn(receipt.turnId);
+        return {
+          ok: true,
+          value: {
+            taskId: receipt.taskId,
+            messageId: receipt.messageId,
+            turnId: receipt.turnId,
+            workflowRunId,
+            clientRequestId,
+          },
+        };
+      }
+    }
+
     if (mode !== 'draft') {
       void this.scheduleTurn(turnId);
-      return { ok: true, value: { taskId, messageId, turnId, workflowRunId } };
+      return {
+        ok: true,
+        value: {
+          taskId,
+          messageId,
+          turnId,
+          workflowRunId,
+          ...(clientRequestId ? { clientRequestId } : {}),
+        },
+      };
     }
-    return { ok: true, value: { taskId, workflowRunId } };
+    return {
+      ok: true,
+      value: {
+        taskId,
+        workflowRunId,
+        ...(clientRequestId ? { clientRequestId } : {}),
+      },
+    };
   }
 
   /**
@@ -947,7 +1244,85 @@ export class TaskEngine {
     return getWorkflowRunForRoot(this.store.getFile(), rootTaskId)?.phase;
   }
 
+  /**
+   * Enqueue a user message as a FIFO follow-up turn (plain Enter / idle send).
+   * Does not interrupt a live turn. Schedules immediately when eligible.
+   */
   continueTaskWithMessage(
+    taskId: string,
+    instruction: string,
+  ): EngineResult<{
+    messageId: string;
+    turnId: string;
+    outcome: 'queued' | 'scheduled';
+  }> {
+    const reserved = this.reserveQueuedFollowUp(taskId, instruction);
+    if (!reserved.ok) {
+      return reserved;
+    }
+    void this.scheduleTurn(reserved.value.turnId);
+    return {
+      ok: true,
+      value: { ...reserved.value, outcome: 'scheduled' },
+    };
+  }
+
+  /**
+   * Direct message while live: **reserve first, interrupt second**.
+   * Never concurrent `backend.sendLiveInput`. On reserve failure the live turn
+   * keeps running. Interrupt only when a local liveRuns handle exists.
+   */
+  interruptAndSend(
+    taskId: string,
+    instruction: string,
+  ): EngineResult<{
+    messageId: string;
+    turnId: string;
+    outcome: 'queued' | 'scheduled';
+    interruptedTurnId?: string;
+  }> {
+    const file = this.store.getFile();
+    const live = turnsForTask(file, taskId).find(
+      (t) => t.status === 'running' || t.status === 'waiting_user',
+    );
+
+    if (!live) {
+      const cont = this.continueTaskWithMessage(taskId, instruction);
+      if (!cont.ok) return cont;
+      return { ok: true, value: cont.value };
+    }
+
+    // ISSUE-3: reserve continuation before any abort.
+    const reserved = this.reserveQueuedFollowUp(taskId, instruction);
+    if (!reserved.ok) {
+      return reserved;
+    }
+
+    const hasLocalHandle = this.liveRuns.has(live.id);
+    if (hasLocalHandle) {
+      this.interruptTurn(live.id);
+      return {
+        ok: true,
+        value: {
+          ...reserved.value,
+          outcome: 'queued',
+          interruptedTurnId: live.id,
+        },
+      };
+    }
+
+    // No local handle: message stays queued; do not fake interrupt success.
+    return {
+      ok: true,
+      value: {
+        ...reserved.value,
+        outcome: 'queued',
+      },
+    };
+  }
+
+  /** Durable queue row only — does not schedule or interrupt. */
+  private reserveQueuedFollowUp(
     taskId: string,
     instruction: string,
   ): EngineResult<{ messageId: string; turnId: string }> {
@@ -993,18 +1368,37 @@ export class TaskEngine {
     if (!commit.ok) {
       return { ok: false, reason: commit.detail ?? commit.reason };
     }
-
-    void this.scheduleTurn(turnId);
     return { ok: true, value: { messageId, turnId } };
   }
 
   resumeQueuedTurn(turnId: string): EngineResult<void> {
-    const turn = this.store.getFile().turns[turnId];
+    const file = this.store.getFile();
+    const turn = file.turns[turnId];
     if (!turn) {
       return { ok: false, reason: 'turn not found' };
     }
     if (turn.status !== 'queued') {
       return { ok: false, reason: 'turn is not queued' };
+    }
+    // Explicit resume clears MEM030 hold so this turn may auto-promote.
+    if (turn.holdAutoPromote) {
+      const clear = this.store.commit((draft) => {
+        const current = draft.turns[turnId];
+        if (!current || current.status !== 'queued') {
+          return { ok: false, reason: 'turn is not queued' };
+        }
+        const { holdAutoPromote: _hold, ...rest } = current;
+        void _hold;
+        draft.turns[turnId] = rest;
+        return { ok: true };
+      });
+      if (!clear.ok) {
+        return { ok: false, reason: clear.detail ?? clear.reason };
+      }
+    }
+    const promote = canPromoteTurn(this.store.getFile(), turnId, this.resourceLimits);
+    if (!promote.ok) {
+      return { ok: false, reason: promote.reason };
     }
     this.deferredQueuedTurns.delete(turnId);
     void this.scheduleTurn(turnId);
@@ -1068,22 +1462,64 @@ export class TaskEngine {
     return { ok: true, value: { taskId } };
   }
 
-  send(taskId: string, content: string): EngineResult<{ messageId: string; turnId?: string }> {
+  send(
+    taskId: string,
+    content: string,
+    options?: { agentContent?: string; clientRequestId?: string },
+  ): EngineResult<{ messageId: string; turnId?: string; clientRequestId?: string }> {
+    const clientRequestId =
+      typeof options?.clientRequestId === 'string' && options.clientRequestId.trim()
+        ? options.clientRequestId.trim()
+        : undefined;
+    const agentContent =
+      options?.agentContent && options.agentContent !== content ? options.agentContent : undefined;
+    const fingerprint = sendFingerprint({
+      kind: 'existing',
+      taskId,
+      content,
+      agentContent,
+    });
+
+    if (clientRequestId) {
+      const existing = this.store.getFile().sendReceipts?.[clientRequestId];
+      if (existing) {
+        if (existing.fingerprint !== fingerprint) {
+          return { ok: false, reason: 'clientRequestId conflict: different payload' };
+        }
+        return {
+          ok: true,
+          value: {
+            messageId: existing.messageId,
+            turnId: existing.turnId,
+            clientRequestId,
+          },
+        };
+      }
+    }
+
     const messageId = randomUUID();
     const now = nowIso(this.clock);
     let queuedTurnId: string | undefined;
 
     const commit = this.store.commit((draft) => {
+      if (clientRequestId) {
+        const race = draft.sendReceipts?.[clientRequestId];
+        if (race) {
+          if (race.fingerprint !== fingerprint) {
+            return { ok: false, reason: 'clientRequestId conflict: different payload' };
+          }
+          queuedTurnId = race.turnId;
+          return { ok: true };
+        }
+      }
+
       let draftTask = draft.tasks[taskId];
       if (!draftTask) {
         return { ok: false, reason: 'task not found' };
       }
-      // Hard terminal: read-only. Soft failed: reopen to open on the same task id.
-      if (isHardTerminalLifecycle(draftTask.lifecycle)) {
-        return { ok: false, reason: 'task is terminal' };
-      }
-      if (draftTask.lifecycle === 'failed') {
-        const reopened = reopenSoftFailedTask(draftTask, { now });
+      // Any terminal lifecycle: reopen to open on the same task id, then queue.
+      if (isTerminalLifecycle(draftTask.lifecycle)) {
+        const reopened = reopenTask(draftTask, { now });
         if (!reopened.ok) {
           return reopened;
         }
@@ -1102,49 +1538,59 @@ export class TaskEngine {
         draft.tasks[taskId] = draftTask;
       }
 
-      // Queue a turn when open and no live/queued turn — including after a
-      // successful prior turn (resume session via committedSessionId) or recovery.
-      const viewStatus = viewStatusFromDraft(draft, taskId) ?? 'idle';
+      // R012: every Enter/send becomes one distinct FIFO turn bound to this message.
+      // Concurrent sends while a turn is live/queued still create queued turns
+      // (scheduler promotes one-at-a-time). Refuse visibly when a turn cannot be
+      // created — never leave free-floating pending messages without turn identity.
+      // Phase B: free-form send after failed/interrupted is a normal continuation
+      // turn (not retryOf); needs_recovery no longer blocks admission.
+
+      const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
+      if (!turnCap.ok) {
+        return turnCap;
+      }
+
       draft.messages[messageId] = {
         id: messageId,
         taskId,
         role: 'user',
         content,
+        ...(agentContent ? { agentContent } : {}),
         state: 'pending',
         createdAt: now,
       };
 
-      // Allow continue when idle, awaiting_outcome (proposal cleared above), or
-      // needs_recovery is handled by explicit retry — but plain send on idle after
-      // stopped CLI must always queue a continuation turn.
-      if (
-        viewStatus === 'idle' ||
-        viewStatus === 'awaiting_outcome' ||
-        (viewStatus === 'needs_recovery' && !hasActiveOrQueuedTurn(turnsForTask(draft, taskId)))
-      ) {
-        const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
-        if (!turnCap.ok) {
-          return turnCap;
-        }
-        const turns = turnsForTask(draft, taskId);
-        const turnId = randomUUID();
-        const queue =
-          turns.length === 0
-            ? transitionStartTask(draftTask, turns, {
-                turnId,
-                now,
-                inputs: [{ kind: 'message', messageId }],
-              })
-            : transitionContinueTask(draftTask, turns, {
-                turnId,
-                now,
-                inputs: [{ kind: 'message', messageId }],
-              });
-        if (!queue.ok) {
-          return queue;
-        }
-        draft.turns[turnId] = queue.next;
-        queuedTurnId = turnId;
+      const turns = turnsForTask(draft, taskId);
+      const turnId = randomUUID();
+      const queue =
+        turns.length === 0
+          ? transitionStartTask(draftTask, turns, {
+              turnId,
+              now,
+              inputs: [{ kind: 'message', messageId }],
+            })
+          : transitionContinueTask(draftTask, turns, {
+              turnId,
+              now,
+              inputs: [{ kind: 'message', messageId }],
+            });
+      if (!queue.ok) {
+        // Roll back the message so we never persist orphan pending content.
+        delete draft.messages[messageId];
+        return queue;
+      }
+      draft.turns[turnId] = queue.next;
+      queuedTurnId = turnId;
+      if (clientRequestId) {
+        draft.sendReceipts = draft.sendReceipts ?? {};
+        draft.sendReceipts[clientRequestId] = {
+          clientRequestId,
+          fingerprint,
+          taskId,
+          messageId,
+          turnId,
+          createdAt: now,
+        };
       }
       return { ok: true };
     });
@@ -1153,11 +1599,125 @@ export class TaskEngine {
       return { ok: false, reason: commit.detail ?? commit.reason };
     }
 
+    if (clientRequestId) {
+      const receipt = this.store.getFile().sendReceipts?.[clientRequestId];
+      if (receipt) {
+        if (receipt.turnId && !this.deferredQueuedTurns.has(receipt.turnId)) {
+          void this.scheduleTurn(receipt.turnId);
+        }
+        return {
+          ok: true,
+          value: {
+            messageId: receipt.messageId,
+            turnId: receipt.turnId,
+            clientRequestId,
+          },
+        };
+      }
+    }
+
     if (queuedTurnId) {
       void this.scheduleTurn(queuedTurnId);
     }
 
-    return { ok: true, value: { messageId, turnId: queuedTurnId } };
+    return {
+      ok: true,
+      value: { messageId, turnId: queuedTurnId, ...(clientRequestId ? { clientRequestId } : {}) },
+    };
+  }
+
+  /**
+   * Hard upper bound for queued follow-up message content (edit path).
+   * Host boundary may apply a tighter limit; this protects the engine store.
+   */
+  static readonly MAX_QUEUED_MESSAGE_CHARS = 100_000;
+
+  /**
+   * R013: edit the bound pending user message of an undispatched queued turn.
+   * Fail-closed once executeTurn's startCommit assigns messages / promotes to running.
+   */
+  editQueuedTurn(
+    taskId: string,
+    turnId: string,
+    content: string,
+  ): EngineResult<{ turnId: string; messageId: string }> {
+    if (typeof content !== 'string') {
+      return { ok: false, reason: 'invalid content' };
+    }
+    if (content.length > TaskEngine.MAX_QUEUED_MESSAGE_CHARS) {
+      return {
+        ok: false,
+        reason: `content exceeds ${TaskEngine.MAX_QUEUED_MESSAGE_CHARS} characters`,
+      };
+    }
+
+    let editedMessageId: string | undefined;
+    const commit = this.store.commit((draft) => {
+      if (!draft.tasks[taskId]) {
+        return { ok: false, reason: 'task not found' };
+      }
+      const prepared = prepareEditQueuedTurn(taskId, draft.turns[turnId], draft.messages, content);
+      if (!prepared.ok) {
+        return prepared;
+      }
+      const message = draft.messages[prepared.next.messageId];
+      if (!message) {
+        return { ok: false, reason: 'message not found' };
+      }
+      // Clear stale agentContent: edited display text must drive projectPrompt.
+      // Callers that expand mentions on edit can pass agentContent via a future
+      // option; plain edit replaces content and drops the prior expansion.
+      const { agentContent: _staleAgentContent, ...rest } = message;
+      void _staleAgentContent;
+      draft.messages[prepared.next.messageId] = {
+        ...rest,
+        content: prepared.next.content,
+      };
+      editedMessageId = prepared.next.messageId;
+      return { ok: true };
+    });
+
+    if (!commit.ok) {
+      return { ok: false, reason: commit.detail ?? commit.reason };
+    }
+    if (!editedMessageId) {
+      return { ok: false, reason: 'message not found' };
+    }
+    return { ok: true, value: { turnId, messageId: editedMessageId } };
+  }
+
+  /**
+   * R013: remove an undispatched queued turn and its bound pending user message(s).
+   * Does not cancelProcess, does not touch live/settled turns or task lifecycle.
+   */
+  deleteQueuedTurn(
+    taskId: string,
+    turnId: string,
+  ): EngineResult<{ turnId: string; deletedMessageIds: string[] }> {
+    let deletedMessageIds: string[] | undefined;
+    const commit = this.store.commit((draft) => {
+      if (!draft.tasks[taskId]) {
+        return { ok: false, reason: 'task not found' };
+      }
+      const prepared = prepareDeleteQueuedTurn(taskId, draft.turns[turnId], draft.messages);
+      if (!prepared.ok) {
+        return prepared;
+      }
+      for (const messageId of prepared.next.messageIds) {
+        delete draft.messages[messageId];
+      }
+      delete draft.turns[turnId];
+      deletedMessageIds = prepared.next.messageIds;
+      return { ok: true };
+    });
+
+    if (!commit.ok) {
+      return { ok: false, reason: commit.detail ?? commit.reason };
+    }
+    return {
+      ok: true,
+      value: { turnId, deletedMessageIds: deletedMessageIds ?? [] },
+    };
   }
 
   startTask(
@@ -1252,12 +1812,115 @@ export class TaskEngine {
     return { ok: true, value: undefined };
   }
 
+  /**
+   * Hard upper bound for live-input instruction size. Host boundary may apply
+   * a tighter limit; this protects the engine/backend path.
+   */
+  static readonly MAX_LIVE_INPUT_CHARS = 8_192;
+
+  /**
+   * Deliver an instruction to the task's currently running, locally owned turn.
+   * Never persists a TaskMessage or TaskTurn — refusals and deliveries alike
+   * leave queue/message/revision state unchanged.
+   */
+  async sendLiveInput(taskId: string, instruction: string): Promise<LiveInputResult> {
+    const trimmedTaskId = typeof taskId === 'string' ? taskId.trim() : '';
+    if (!trimmedTaskId) {
+      return { code: 'rejected', reason: 'task id is required for live input' };
+    }
+    if (typeof instruction !== 'string' || !instruction.trim()) {
+      return { code: 'rejected', reason: 'instruction is required for live input' };
+    }
+    if (instruction.length > TaskEngine.MAX_LIVE_INPUT_CHARS) {
+      return {
+        code: 'rejected',
+        reason: `instruction exceeds ${TaskEngine.MAX_LIVE_INPUT_CHARS} characters`,
+      };
+    }
+
+    const file = this.store.getFile();
+    const task = file.tasks[trimmedTaskId];
+    if (!task) {
+      return { code: 'rejected', reason: 'task not found' };
+    }
+
+    const liveTurn = turnsForTask(file, trimmedTaskId).find((t) => t.status === 'running');
+    if (!liveTurn) {
+      return { code: 'no-active-turn', reason: 'no running turn for task' };
+    }
+
+    // Local ownership: this process must hold the turn lease.
+    if (!ownsLocalLease(this.storePath, liveTurn.id)) {
+      return {
+        code: 'not-local-owner',
+        reason: 'running turn is not owned by this process',
+      };
+    }
+
+    const handle = this.liveRuns.get(liveTurn.id);
+    if (!handle || handle.taskId !== trimmedTaskId) {
+      // Lease says local but no in-process handle (stale/settling race).
+      return { code: 'no-active-turn', reason: 'no in-process live run for task' };
+    }
+    if (handle.controller.signal.aborted) {
+      return { code: 'cancelled', reason: 'live run is cancelling' };
+    }
+
+    const sessionId =
+      handle.sessionId ??
+      liveTurn.observedSessionId ??
+      task.committedSessionId;
+    if (!sessionId) {
+      return {
+        code: 'no-active-turn',
+        reason: 'active turn has no session identity yet',
+      };
+    }
+
+    const backend = handle.backend;
+    const caps = backend.capabilities;
+    if (!caps?.supportsLiveInput || typeof backend.sendLiveInput !== 'function') {
+      return {
+        code: 'unsupported',
+        reason: `backend ${backend.name} does not support live input`,
+      };
+    }
+
+    // Re-check cancellation immediately before dispatch.
+    if (handle.controller.signal.aborted) {
+      return { code: 'cancelled', reason: 'live run is cancelling' };
+    }
+
+    try {
+      const result = await backend.sendLiveInput({
+        sessionId,
+        instruction,
+        signal: handle.controller.signal,
+      });
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (handle.controller.signal.aborted || /abort|cancel/i.test(message)) {
+        return { code: 'cancelled', reason: message };
+      }
+      return { code: 'rejected', reason: message };
+    }
+  }
+
   interruptTurn(turnId: string): EngineResult<void> {
-    this.liveRuns.get(turnId)?.abort();
+    const handle = this.liveRuns.get(turnId);
+    if (handle) {
+      handle.interruptArmed = true;
+      handle.controller.abort();
+    }
     return { ok: true, value: undefined };
   }
 
-  retryTurn(turnId: string, instruction: string): EngineResult<{ turnId: string }> {
+  retryTurn(
+    turnId: string,
+    instruction: string,
+    options?: { reuseOriginalInputs?: boolean },
+  ): EngineResult<{ turnId: string }> {
     const taskId = this.store.getFile().turns[turnId]?.taskId;
     if (!taskId) {
       return { ok: false, reason: 'turn not found' };
@@ -1275,6 +1938,7 @@ export class TaskEngine {
         turnId: newTurnId,
         instruction,
         now,
+        reuseOriginalInputs: options?.reuseOriginalInputs === true,
       });
       if (!result.ok) {
         return result;
@@ -1317,7 +1981,7 @@ export class TaskEngine {
       !ownsLocalLease(this.storePath, live.id);
 
     if (live && lifecycle !== 'open' && !remoteOwned) {
-      this.liveRuns.get(live.id)?.abort();
+      this.liveRuns.get(live.id)?.controller.abort();
     }
 
     const commit = this.store.commit((draft) => {
@@ -1385,6 +2049,8 @@ export class TaskEngine {
 
     if (live && !remoteOwned) {
       this.askBridge.cancelForTurn(live.id, 'task lifecycle changed');
+      this.dropElicitationWaits(live.id);
+      // Note: host elicitationBridge.cancelForSession is invoked from extension cancel paths when available.
       this.credentialRegistry?.revoke(live.id);
     }
     return { ok: true, value: undefined };
@@ -1414,7 +2080,7 @@ export class TaskEngine {
     );
     for (const turnId of liveTurnIds) {
       if (!remoteLiveTurnIds.has(turnId)) {
-        this.liveRuns.get(turnId)?.abort();
+        this.liveRuns.get(turnId)?.controller.abort();
       }
     }
 
@@ -1473,6 +2139,7 @@ export class TaskEngine {
       }
       this.acceptedOpIds.delete(turnId);
       this.askBridge.cancelForTurn(turnId, 'task skipped');
+      this.dropElicitationWaits(turnId);
       this.credentialRegistry?.revoke(turnId);
     }
     return { ok: true, value: undefined };
@@ -1501,7 +2168,7 @@ export class TaskEngine {
     );
     for (const turnId of liveTurnIds) {
       if (!remoteLiveTurnIds.has(turnId)) {
-        this.liveRuns.get(turnId)?.abort();
+        this.liveRuns.get(turnId)?.controller.abort();
       }
     }
 
@@ -1556,6 +2223,7 @@ export class TaskEngine {
       }
       this.acceptedOpIds.delete(turnId);
       this.askBridge.cancelForTurn(turnId, 'task cancelled');
+      this.dropElicitationWaits(turnId);
       this.credentialRegistry?.revoke(turnId);
     }
     return { ok: true, value: undefined };
@@ -1580,11 +2248,18 @@ export class TaskEngine {
         if (!result.ok) {
           return result;
         }
-        draft.turns[turn.id] = result.next;
+        // Phase C: orphan live after reload → uncertain (no silent auto-replay).
+        draft.turns[turn.id] = {
+          ...result.next,
+          failureClass: 'uncertain',
+          dispatchPhase: draftTurn.dispatchPhase ?? 'prompt_outstanding',
+        };
+        holdQueuedFollowUpsOnFailure(draft, draftTurn.taskId);
         return { ok: true };
       });
       this.acceptedOpIds.delete(turn.id);
       this.askBridge.cancelForTurn(turn.id, 'reload interrupt');
+      this.dropElicitationWaits(turn.id);
       this.credentialRegistry?.revoke(turn.id);
     }
 
@@ -1596,10 +2271,27 @@ export class TaskEngine {
 
   /** Every persisted queued turn survives reload unscheduled until an explicit resume. */
   private deferReloadQueuedTurns(): void {
-    for (const turn of Object.values(this.store.getFile().turns)) {
+    const file = this.store.getFile();
+    for (const turn of Object.values(file.turns)) {
       if (turn.status === 'queued') {
         this.deferredQueuedTurns.add(turn.id);
       }
+    }
+    // Phase C: auto-reschedule durable safe retries that were mid-backoff across reload.
+    for (const turn of Object.values(file.turns)) {
+      if (turn.status !== 'queued' || !turn.retryOf) continue;
+      const pred = file.turns[turn.retryOf];
+      if (!pred || pred.failureClass !== 'safe_to_retry') continue;
+      this.deferredQueuedTurns.delete(turn.id);
+      const retryIndex = Math.max(1, retryCountOf(
+        Object.values(file.turns).filter((t) => t.taskId === turn.taskId),
+        turn.id,
+      ));
+      const baseMs = Math.min(30_000, 250 * 2 ** Math.min(retryIndex - 1, 6));
+      const jitter = Math.floor(Math.random() * Math.min(500, baseMs));
+      setTimeout(() => {
+        void this.scheduleTurn(turn.id);
+      }, baseMs + jitter);
     }
   }
 
@@ -1625,7 +2317,7 @@ export class TaskEngine {
         deps.writeCancelRequest(live.id, 'interrupt', 'engine', `task-timeout-${task.id}`);
         continue;
       }
-      if (live) this.liveRuns.get(live.id)?.abort();
+      if (live) this.liveRuns.get(live.id)?.controller.abort();
       this.store.commit((draft) => {
         const pendingTurns = Object.values(draft.turns).filter(
           (t) =>
@@ -1742,7 +2434,7 @@ export class TaskEngine {
   }
 
   private drainPendingSendsAfterSettlement(settledTurnId: string): void {
-    let continuationTurnId: string | undefined;
+    const continuationTurnIds: string[] = [];
     const now = nowIso(this.clock);
     const commit = this.store.commit((draft) => {
       const settledTurn = draft.turns[settledTurnId];
@@ -1753,27 +2445,46 @@ export class TaskEngine {
       if (!task || isTerminalLifecycle(task.lifecycle)) {
         return { ok: true };
       }
+      // R012: when follow-ups were eagerly queued on send, do not create a
+      // second continuation from free-floating pending messages — the scheduler
+      // promotes existing queued turns one-at-a-time.
+      if (turnsForTask(draft, task.id).some((turn) => turn.status === 'queued')) {
+        return { ok: true };
+      }
       const pending = pendingUserMessages(draft, task.id);
       if (pending.length === 0) {
         return { ok: true };
       }
-      const turnCap = canCreateTurn(draft, task.id, this.resourceLimits);
-      if (!turnCap.ok) {
-        return { ok: true };
+      // R012/T02: one free-floating pending message → one continuation turn.
+      // Never batch multiple pending messages into a single turn's inputs
+      // (projectPrompt would join them into one multi-message backend prompt).
+      for (const message of pending) {
+        const turnCap = canCreateTurn(draft, task.id, this.resourceLimits);
+        if (!turnCap.ok) {
+          break;
+        }
+        const turnId = randomUUID();
+        const inputs: TurnInput[] = [{ kind: 'message', messageId: message.id }];
+        const queued = transitionContinueTask(task, turnsForTask(draft, task.id), {
+          turnId,
+          now,
+          inputs,
+        });
+        if (!queued.ok) {
+          break;
+        }
+        draft.turns[turnId] = queued.next;
+        continuationTurnIds.push(turnId);
       }
-      const inputs: TurnInput[] = pending.map((message) => ({ kind: 'message', messageId: message.id }));
-      const turnId = randomUUID();
-      const queued = transitionContinueTask(task, turnsForTask(draft, task.id), { turnId, now, inputs });
-      if (!queued.ok) {
-        return { ok: true };
-      }
-      draft.turns[turnId] = queued.next;
-      continuationTurnId = turnId;
       return { ok: true };
     });
 
-    if (commit.ok && continuationTurnId && !this.deferredQueuedTurns.has(continuationTurnId)) {
-      void this.scheduleTurn(continuationTurnId);
+    if (commit.ok) {
+      for (const continuationTurnId of continuationTurnIds) {
+        if (!this.deferredQueuedTurns.has(continuationTurnId)) {
+          void this.scheduleTurn(continuationTurnId);
+        }
+      }
     }
   }
 
@@ -1805,11 +2516,38 @@ export class TaskEngine {
     }
     const promise = this.executeTurn(turnId);
     this.turnPromises.set(turnId, promise);
-    void promise.finally(() => {
+    void promise.finally(async () => {
       this.turnPromises.delete(turnId);
-      const queued = Object.values(this.store.getFile().turns).filter((t) => t.status === 'queued');
+      const file = this.store.getFile();
+      const settled = file.turns[turnId];
+      // Success always drains same-task FIFO. Confirmed interrupt with queued
+      // follow-ups also drains (interrupt-and-send / Enter-then-Stop). Forced
+      // interrupt and failed settlements keep MEM030 freeze.
+      const confirmedInterrupt =
+        settled?.status === 'interrupted' && settled.interruptConfidence === 'confirmed';
+      const allowSameTaskFollowUps =
+        settled?.status === 'succeeded' || confirmedInterrupt;
+      const settledTaskId = settled?.taskId;
+
+      const afterFlush = this.store.getFile();
+      const queued = Object.values(afterFlush.turns)
+        .filter((t) => t.status === 'queued')
+        .sort(
+          (a, b) =>
+            a.sequence - b.sequence ||
+            a.createdAt.localeCompare(b.createdAt) ||
+            a.id.localeCompare(b.id),
+        );
       for (const turn of queued) {
         if (this.deferredQueuedTurns.has(turn.id)) {
+          continue;
+        }
+        if (settledTaskId && turn.taskId === settledTaskId) {
+          if (!allowSameTaskFollowUps) continue;
+          // Confirmed interrupt path already cleared holds in settleInterrupted.
+        } else if (isQueuedTurnAutoPromoteFrozen(afterFlush, turn.taskId, turn.id)) {
+          // Unrelated settlement must not thaw pre-failure follow-ups; post-
+          // settlement recovery/retry turns are not frozen (see helper).
           continue;
         }
         if (tryPromoteTurn(this.store, turn.id, this.resourceLimits)) {
@@ -1858,15 +2596,20 @@ export class TaskEngine {
         return { ok: false, reason: 'task is terminal' };
       }
 
-      const pending = pendingUserMessages(draft, turn.taskId);
+      // R012: assign only messages already bound to this turn. Do not sweep other
+      // pending user messages onto this turn (that batching is removed for FIFO).
       const inputs: TurnInput[] = [...draftTurn.inputs];
-      for (const message of pending) {
-        if (!inputs.some((input) => input.kind === 'message' && input.messageId === message.id)) {
-          inputs.push({ kind: 'message', messageId: message.id });
+      for (const input of inputs) {
+        if (input.kind !== 'message') continue;
+        const message = draft.messages[input.messageId];
+        if (!message || message.taskId !== turn.taskId) continue;
+        if (message.state === 'pending' || message.state === 'assigned') {
+          draft.messages[input.messageId] = {
+            ...message,
+            state: 'assigned',
+            turnId,
+          };
         }
-        message.state = 'assigned';
-        message.turnId = turnId;
-        draft.messages[message.id] = message;
       }
 
       const withInputs = { ...draftTurn, inputs };
@@ -1874,7 +2617,8 @@ export class TaskEngine {
       if (!started.ok) {
         return started;
       }
-      draft.turns[turnId] = started.next;
+      // Phase C: durable pre_dispatch until onBeforePrompt flips to prompt_outstanding.
+      draft.turns[turnId] = { ...started.next, dispatchPhase: 'pre_dispatch' };
       return { ok: true };
     });
 
@@ -1894,7 +2638,18 @@ export class TaskEngine {
     }
 
     const abort = new AbortController();
-    this.liveRuns.set(turnId, abort);
+    // Placeholder backend until factory succeeds; live input refuses unsupported
+    // until the real instance is installed below.
+    let backend: Backend = {
+      name: task.backend,
+      run: async function* () {},
+    };
+    this.liveRuns.set(turnId, {
+      controller: abort,
+      taskId: turn.taskId,
+      backend,
+      sessionId: undefined,
+    });
     const turnTimeoutMs = task.executionPolicy.turnTimeoutMs;
     const cancelPoll = setInterval(() => {
       this.reconcileTaskTimeouts();
@@ -1911,20 +2666,23 @@ export class TaskEngine {
     let observedSessionId: string | undefined;
     let terminalSettled = false;
     // Per-turn render ordering + assistant segmentation (see WEBVIEW-IMPROVEMENT-PLAN §5.1.1).
-    // `order` is a per-turn monotonic counter shared by assistant segments and tool
-    // calls; `(turn.sequence, order)` reconstructs the exact live interleaving.
+    // `order` is a per-turn monotonic counter shared by assistant segments, tools,
+    // and mid-turn live_inject user messages; `(turn.sequence, order)` reconstructs
+    // the exact live interleaving.
     let orderCounter = 0;
     const nextOrder = (): number => orderCounter++;
+    {
+      const liveHandle = this.liveRuns.get(turnId);
+      if (liveHandle) liveHandle.nextOrder = nextOrder;
+    }
     let currentAssistantSegment: { storeId: string; sourceMessageId: string } | undefined;
-    let backend: Backend = {
-      name: task.backend,
-      run: async function* () {},
-    };
     let mcpConfigPath: string | undefined;
 
     try {
       try {
         backend = this.makeBackend(task.backend);
+        const liveHandle = this.liveRuns.get(turnId);
+        if (liveHandle) liveHandle.backend = backend;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         terminalSettled = await this.settleFailed(
@@ -1969,6 +2727,29 @@ export class TaskEngine {
             },
           };
       mcpConfigPath = built.mcpConfigPath;
+      // Phase C: mark prompt_outstanding immediately before side-effecting prompt.
+      // Abort the ACP boundary if the durable marker cannot be written.
+      built.options = {
+        ...built.options,
+        onBeforePrompt: async () => {
+          const commit = this.store.commit((draft) => {
+            const t = draft.turns[turnId];
+            if (!t || (t.status !== 'running' && t.status !== 'waiting_user')) {
+              return { ok: false, reason: 'turn is not live for prompt dispatch marker' };
+            }
+            if (t.dispatchPhase === 'prompt_outstanding' || t.dispatchPhase === 'terminal_received') {
+              return { ok: true };
+            }
+            draft.turns[turnId] = { ...t, dispatchPhase: 'prompt_outstanding' };
+            return { ok: true };
+          });
+          if (!commit.ok) {
+            throw new Error(
+              `failed to persist prompt_outstanding dispatch marker: ${commit.detail ?? commit.reason}`,
+            );
+          }
+        },
+      };
 
       for await (const event of this.runTurnFn(backend, built.options)) {
         processCancelRequests(this.graphDeps());
@@ -1994,6 +2775,8 @@ export class TaskEngine {
           case 'sessionStarted':
             if (event.sessionId) {
               observedSessionId = event.sessionId;
+              const liveHandle = this.liveRuns.get(turnId);
+              if (liveHandle) liveHandle.sessionId = event.sessionId;
               this.store.commit((draft) => {
                 const draftTurn = draft.turns[turnId];
                 if (!draftTurn) {
@@ -2271,12 +3054,42 @@ export class TaskEngine {
             break;
           case 'error':
             if (event.isCancellation) {
-              terminalSettled = await this.settleInterrupted(turnId, observedSessionId, rawOutput, backend);
+              // Confirmed only if we armed a local interrupt and adapter did not
+              // force-timeout. Missing meta / spontaneous cancel → forced.
+              const handle = this.liveRuns.get(turnId);
+              const armed = handle?.interruptArmed === true;
+              const adapterForced = event.meta?.interruptConfidence === 'forced';
+              const confidence: 'confirmed' | 'forced' =
+                armed && !adapterForced ? 'confirmed' : 'forced';
+              terminalSettled = await this.settleInterrupted(
+                turnId,
+                observedSessionId,
+                rawOutput,
+                backend,
+                confidence,
+              );
               if (terminalSettled) {
                 this.safeEmit({ type: 'turnDone', taskId: turn.taskId, turnId });
               }
             } else {
-              terminalSettled = await this.settleFailed(turnId, event.message, observedSessionId, rawOutput, backend);
+              const terminalReceived = event.meta?.failureClass === 'terminal_received';
+              const livePhase = this.store.getFile().turns[turnId]?.dispatchPhase;
+              const failureClass =
+                terminalReceived
+                  ? 'terminal_received'
+                  : livePhase === 'prompt_outstanding'
+                    ? 'uncertain'
+                    : livePhase === 'pre_dispatch' || livePhase === undefined
+                      ? 'safe_to_retry'
+                      : 'unclassified';
+              terminalSettled = await this.settleFailed(
+                turnId,
+                event.message,
+                observedSessionId,
+                rawOutput,
+                backend,
+                { terminalReceived, failureClass },
+              );
               if (terminalSettled) {
                 this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message: event.message });
               }
@@ -2332,6 +3145,8 @@ export class TaskEngine {
     } finally {
       clearInterval(cancelPoll);
       if (turnTimer) clearTimeout(turnTimer);
+      // Hard clear elicitation wait tokens — do not soft-resume a settling turn.
+      this.dropElicitationWaits(turnId);
       this.liveRuns.delete(turnId);
       this.acceptedOpIds.delete(turnId);
       if (this.credentialRegistry) {
@@ -2405,6 +3220,7 @@ export class TaskEngine {
     observedSessionId: string | undefined,
     rawOutput: string,
     backend: Backend,
+    interruptConfidence: 'confirmed' | 'forced' = 'confirmed',
   ): Promise<boolean> {
     if (this.settling.has(turnId)) {
       return false;
@@ -2421,18 +3237,51 @@ export class TaskEngine {
         if (!result.ok) {
           return result;
         }
+        const observed = observedSessionId ?? turn.observedSessionId;
         const candidate = selectCommittedSessionId(
           backend,
-          { observedSessionId: observedSessionId ?? turn.observedSessionId },
+          { observedSessionId: observed },
           rawOutput,
           undefined,
         );
         draft.turns[turnId] = {
           ...result.next,
-          observedSessionId: observedSessionId ?? turn.observedSessionId,
+          observedSessionId: observed,
           candidateSessionId: candidate,
           isCancellation: true,
+          interruptConfidence,
         };
+
+        const task = draft.tasks[turn.taskId];
+        const queuedFollowUps = turnsForTask(draft, turn.taskId).filter(
+          (t) => t.status === 'queued',
+        );
+
+        if (interruptConfidence === 'confirmed') {
+          // ISSUE-1: bind observed session for first-turn interrupt when unset.
+          if (task && !task.committedSessionId) {
+            const bindId = observed ?? candidate;
+            if (bindId) {
+              draft.tasks[turn.taskId] = {
+                ...task,
+                committedSessionId: bindId,
+              };
+            }
+          }
+          if (queuedFollowUps.length > 0) {
+            // ISSUE-4: clear holds so FIFO can promote after confirmed cut.
+            for (const q of queuedFollowUps) {
+              if (!q.holdAutoPromote) continue;
+              const { holdAutoPromote: _h, ...rest } = q;
+              void _h;
+              draft.turns[q.id] = rest;
+            }
+          }
+          // Pure Stop (no queued follow-ups): nothing to promote; no freeze needed.
+        } else {
+          // Forced / unconfirmed: freeze follow-ups; do not commit session.
+          holdQueuedFollowUpsOnFailure(draft, turn.taskId);
+        }
         return { ok: true };
       });
       return commit.ok;
@@ -2447,6 +3296,10 @@ export class TaskEngine {
     observedSessionId: string | undefined,
     rawOutput: string,
     backend: Backend,
+    opts?: {
+      terminalReceived?: boolean;
+      failureClass?: import('./types').TurnFailureClass;
+    },
   ): Promise<boolean> {
     if (this.settling.has(turnId)) {
       return false;
@@ -2462,29 +3315,47 @@ export class TaskEngine {
         }
 
         const turns = turnsForTask(draft, task.id);
+        const failureClass =
+          opts?.failureClass ??
+          (opts?.terminalReceived ? 'terminal_received' : 'unclassified');
         const result = applyFailedTurn(task, turn, {
           error: errorMessage,
           retryCount: retryCountOf(turns, turn.id),
           policy: task.executionPolicy,
           onExhausted: 'recover',
           now,
+          failureClass,
         });
         if (!result.ok) {
           return result;
         }
 
+        const observed = observedSessionId ?? turn.observedSessionId;
         const candidate = selectCommittedSessionId(
           backend,
-          { observedSessionId: observedSessionId ?? turn.observedSessionId },
+          { observedSessionId: observed },
           rawOutput,
           undefined,
         );
         draft.turns[turnId] = {
           ...result.next.turn,
-          observedSessionId: observedSessionId ?? turn.observedSessionId,
+          observedSessionId: observed,
           candidateSessionId: candidate,
         };
-        draft.tasks[task.id] = result.next.task;
+        // Phase B: bind only terminal_received + nonblank observed session id
+        // (never speculative candidate from raw output).
+        let nextTask = result.next.task;
+        if (opts?.terminalReceived && !nextTask.committedSessionId) {
+          const bindId =
+            typeof observed === 'string' && observed.trim().length > 0 ? observed.trim() : undefined;
+          if (bindId) {
+            nextTask = { ...nextTask, committedSessionId: bindId };
+          }
+        }
+        draft.tasks[task.id] = nextTask;
+        // Freeze pre-existing FIFO follow-ups before auto-retry is created so
+        // the new retry turn is not holdAutoPromote-marked.
+        holdQueuedFollowUpsOnFailure(draft, task.id);
 
         for (const effect of result.effects) {
           if (effect.kind === 'enqueueRetry') {
@@ -2501,8 +3372,9 @@ export class TaskEngine {
                 draft.turns[turnId],
                 {
                   turnId: retryId,
-                  instruction: `Automatic retry after failure: ${errorMessage.slice(0, 200)}`,
+                  instruction: '',
                   now,
+                  reuseOriginalInputs: true,
                 },
               );
               if (retryResult.ok) {
@@ -2521,7 +3393,23 @@ export class TaskEngine {
           (turn) => turn.retryOf === turnId && turn.status === 'queued',
         );
         if (retryTurnEntry) {
-          void this.scheduleTurn(retryTurnEntry.id);
+          // Bounded exponential backoff + jitter for safe auto-retries (Phase C).
+          // Depth is measured from the new retry turn's chain, not the failed predecessor alone.
+          const retryIndex = Math.max(
+            1,
+            retryCountOf(
+              Object.values(this.store.getFile().turns).filter(
+                (t) => t.taskId === retryTurnEntry.taskId,
+              ),
+              retryTurnEntry.id,
+            ),
+          );
+          const baseMs = Math.min(30_000, 250 * 2 ** Math.min(retryIndex - 1, 6));
+          const jitter = Math.floor(Math.random() * Math.min(500, baseMs));
+          const delayMs = baseMs + jitter;
+          setTimeout(() => {
+            void this.scheduleTurn(retryTurnEntry.id);
+          }, delayMs);
         }
         return true;
       }

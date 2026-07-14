@@ -61,6 +61,7 @@ function emptyEnvelope(schemaVersion: number): TaskStoreFile {
     base.workflowRuns = {};
     base.workflowArtifacts = {};
     base.usageRecords = {};
+    base.sendReceipts = {};
   }
   return base;
 }
@@ -141,6 +142,7 @@ export function migrate(file: TaskStoreFile, targetVersion: number): TaskStoreFi
       current.workflowRuns = current.workflowRuns ?? {};
       current.workflowArtifacts = current.workflowArtifacts ?? {};
       current.usageRecords = current.usageRecords ?? {};
+      current.sendReceipts = current.sendReceipts ?? {};
       continue;
     }
     throw new Error(`No migration path from schema ${current.schemaVersion}`);

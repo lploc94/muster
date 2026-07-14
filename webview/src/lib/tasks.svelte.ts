@@ -1,8 +1,16 @@
-import type { BackendModels, SnapshotMessage, TaskSummary } from './protocol';
+import type { BackendModels, QueuedTurnProjection, SnapshotMessage, TaskSummary } from './protocol';
 import { isHardTerminalLifecycle } from './protocol';
+import { sortQueuedTurns } from './queued-turns';
+import { parseBackendId, parseModelFromSelectValue } from './backend-resolve';
 import { vscode } from './vscode';
 
 export interface CommandErrorState {
+  taskId: string | null;
+  message: string;
+}
+
+/** Non-error status notice (e.g. live-input delivered acknowledgement). */
+export interface CommandNoticeState {
   taskId: string | null;
   message: string;
 }
@@ -23,12 +31,25 @@ class TasksState {
   /** Unpersisted composer — first send has no taskId. */
   draftMode = $state(false);
 
-  /** Set when opening "Continue as new task" from a terminal thread. */
+  /** Optional link when creating a draft after another task (legacy protocol field). */
   continuationOf = $state<string | null>(null);
 
+  /**
+   * User's preferred backend for new tasks (what we persist). May temporarily
+   * differ from the picker display when that CLI is not currently detected.
+   */
+  preferredBackend = $state<WebviewBackendId>('claude');
+
+  /** Preferred model for preferredBackend; null = backend default. */
+  preferredModel = $state<string | null>(null);
+
+  /**
+   * Backend shown in the picker. Falls back to the first available CLI when
+   * preferredBackend is missing from detection — without overwriting preference.
+   */
   selectedBackend = $state<WebviewBackendId>('claude');
 
-  /** Selected model value for the current backend; null = the backend default. */
+  /** Model shown for selectedBackend; null = backend default. */
   selectedModel = $state<string | null>(null);
 
   /** Backend ids the host reports as installed/callable; null = not yet known. */
@@ -39,15 +60,38 @@ class TasksState {
 
   commandError = $state<CommandErrorState | null>(null);
 
+  /** Transient success/status notice (live-input delivered, etc.). */
+  commandNotice = $state<CommandNoticeState | null>(null);
+
+  /**
+   * FIFO queued follow-ups for the focused task (host snapshot.queuedTurns).
+   * Cleared on draft/blur; replaced on every focused snapshot so dispatch
+   * removing an entry immediately drops edit/delete controls.
+   */
+  queuedTurns = $state<QueuedTurnProjection[]>([]);
+
+  /**
+   * One-shot prefill for the composer (queue Edit → message box).
+   * Composer consumes and clears when `nonce` changes.
+   * Optional clientRequestId: only clear matching rejected outbox on successful apply.
+   */
+  composerPrefill = $state<{ text: string; nonce: number; clientRequestId?: string } | null>(null);
+  private prefillNonceSeq = 0;
+
   constructor() {
     // Restore the last-used backend/model from webview state (persists across reloads).
+    // Host globalState may overwrite this shortly via applyHostComposerSelection.
     try {
       const saved = vscode.getState() as { selectedBackend?: unknown; selectedModel?: unknown } | undefined;
       const be = saved?.selectedBackend;
       if (be === 'claude' || be === 'grok' || be === 'kiro' || be === 'codex' || be === 'opencode') {
+        this.preferredBackend = be;
         this.selectedBackend = be;
       }
-      if (typeof saved?.selectedModel === 'string') this.selectedModel = saved.selectedModel;
+      if (typeof saved?.selectedModel === 'string') {
+        this.preferredModel = saved.selectedModel;
+        this.selectedModel = saved.selectedModel;
+      }
     } catch {
       // best-effort — fall back to defaults
     }
@@ -67,7 +111,7 @@ class TasksState {
     return this.tasks.get(this.focusedTaskId);
   }
 
-  /** Hard terminal only — soft failed stays editable / reopenable. */
+  /** Hard terminal (succeeded/cancelled/skipped). Soft failed is separate. */
   get focusedIsTerminal(): boolean {
     const task = this.focusedTask;
     return task ? isHardTerminalLifecycle(task.lifecycle) : false;
@@ -79,45 +123,96 @@ class TasksState {
 
   setBackend(next: WebviewBackendId): void {
     // Switching backend drops the model selection (models are backend-specific).
-    if (next !== this.selectedBackend) this.selectedModel = null;
-    this.selectedBackend = next;
+    if (next !== this.preferredBackend) this.preferredModel = null;
+    this.preferredBackend = next;
+    this.syncDisplaySelection();
     this.persistSelection();
   }
 
   /** Select a specific (backend, model) pair from the grouped model picker. */
   setModelSelection(backend: WebviewBackendId, model: string): void {
-    this.selectedBackend = backend;
-    this.selectedModel = model;
+    this.preferredBackend = backend;
+    this.preferredModel = model;
+    this.syncDisplaySelection();
     this.persistSelection();
   }
 
   setAvailableBackends(ids: string[]): void {
     this.availableBackends = ids;
-    // If the currently selected backend isn't installed, fall back to the first
-    // available one so the picker never shows a dead default.
-    if (ids.length > 0 && !ids.includes(this.selectedBackend)) {
-      this.selectedBackend = ids[0] as WebviewBackendId;
-      this.selectedModel = null;
-      this.persistSelection();
-    }
+    // Recompute display only — never overwrite preferredBackend/model.
+    this.syncDisplaySelection();
   }
 
   setAvailableModels(models: Record<string, BackendModels>): void {
     this.modelsByBackend = models;
-    // Drop a persisted/selected model the current backend no longer advertises.
-    if (this.selectedModel) {
-      const opts = models[this.selectedBackend]?.options;
-      if (!opts || !opts.some((o) => o.value === this.selectedModel)) {
-        this.selectedModel = null;
-        this.persistSelection();
+    this.syncDisplaySelection();
+  }
+
+  /**
+   * Apply host-persisted last-used backend/model (survives restarts).
+   * Host preference wins over ephemeral webview state.
+   */
+  applyHostComposerSelection(backend: string, model: string | null): void {
+    if (
+      backend !== 'claude' &&
+      backend !== 'grok' &&
+      backend !== 'kiro' &&
+      backend !== 'codex' &&
+      backend !== 'opencode'
+    ) {
+      return;
+    }
+    this.preferredBackend = backend;
+    this.preferredModel = typeof model === 'string' && model.length > 0 ? model : null;
+    this.syncDisplaySelection();
+    this.persistLocalSelection();
+  }
+
+  /**
+   * Map preferredBackend/model onto selectedBackend/model for the picker.
+   * Falls back to the first detected backend when preferred is unavailable,
+   * without mutating or persisting the preference.
+   */
+  private syncDisplaySelection(): void {
+    const ids = this.availableBackends;
+    if (ids && ids.length > 0 && !ids.includes(this.preferredBackend)) {
+      this.selectedBackend = ids[0] as WebviewBackendId;
+      this.selectedModel = null;
+      return;
+    }
+    this.selectedBackend = this.preferredBackend;
+    let model = this.preferredModel;
+    if (model && this.modelsByBackend) {
+      const opts = this.modelsByBackend[this.preferredBackend]?.options;
+      if (!opts || !opts.some((o) => o.value === model)) {
+        model = null;
       }
     }
+    this.selectedModel = model;
   }
 
   private persistSelection(): void {
+    this.persistLocalSelection();
+    // Durable copy on the host — webview setState alone is lost on full restart.
+    try {
+      vscode.postMessage({
+        type: 'setComposerSelection',
+        backend: this.preferredBackend,
+        model: this.preferredModel,
+      });
+    } catch {
+      // best-effort
+    }
+  }
+
+  private persistLocalSelection(): void {
     try {
       const prev = (vscode.getState() as Record<string, unknown> | undefined) ?? {};
-      vscode.setState({ ...prev, selectedBackend: this.selectedBackend, selectedModel: this.selectedModel });
+      vscode.setState({
+        ...prev,
+        selectedBackend: this.preferredBackend,
+        selectedModel: this.preferredModel,
+      });
     } catch {
       // best-effort
     }
@@ -128,6 +223,9 @@ class TasksState {
     this.continuationOf = null;
     this.focusedTaskId = null;
     this.subtree = [];
+    this.queuedTurns = [];
+    // Keep last-used preferredBackend/model; only refresh display mapping.
+    this.syncDisplaySelection();
   }
 
   openContinuationDraft(terminalTaskId: string): void {
@@ -135,6 +233,7 @@ class TasksState {
     this.continuationOf = terminalTaskId;
     this.focusedTaskId = null;
     this.subtree = [];
+    this.queuedTurns = [];
   }
 
   clearDraft(): void {
@@ -146,6 +245,8 @@ class TasksState {
     this.draftMode = false;
     this.continuationOf = null;
     this.focusedTaskId = taskId;
+    // Drop prior focus queue until the host snapshot for this task arrives.
+    this.queuedTurns = [];
   }
 
   applySnapshot(snapshot: SnapshotMessage): void {
@@ -169,6 +270,9 @@ class TasksState {
       this.focusedTaskId = snapshot.focusedTaskId;
       this.draftMode = false;
       this.continuationOf = null;
+      this.queuedTurns = sortQueuedTurns(snapshot.queuedTurns ?? []);
+    } else if (!this.draftMode) {
+      this.queuedTurns = [];
     }
   }
 
@@ -186,6 +290,7 @@ class TasksState {
         lifecycle: 'open',
         runtimeActivity: 'idle',
         viewStatus: 'idle',
+        currentTurnActivity: null,
         updatedAt: new Date(0).toISOString(),
         backend: '',
       }),
@@ -205,6 +310,33 @@ class TasksState {
 
   setCommandError(message: string | null, taskId: string | null = null): void {
     this.commandError = message ? { taskId, message } : null;
+    // A refusal/error supersedes any prior success notice for the same chrome.
+    if (message) this.commandNotice = null;
+  }
+
+  setCommandNotice(message: string | null, taskId: string | null = null): void {
+    this.commandNotice = message ? { taskId, message } : null;
+    // A delivered acknowledgement clears a prior refusal so success is visible.
+    if (message) this.commandError = null;
+  }
+
+  /** Put text into the task/draft composer (used by queue Edit / rejected send restore). */
+  prefillComposer(text: string, clientRequestId?: string): void {
+    this.prefillNonceSeq += 1;
+    this.composerPrefill = {
+      text,
+      nonce: this.prefillNonceSeq,
+      ...(clientRequestId ? { clientRequestId } : {}),
+    };
+  }
+
+  clearComposerPrefill(): void {
+    this.composerPrefill = null;
+  }
+
+  /** Optimistic remove so Delete/Edit feedback is immediate before host snapshot. */
+  removeQueuedTurnLocally(turnId: string): void {
+    this.queuedTurns = this.queuedTurns.filter((turn) => turn.turnId !== turnId);
   }
 
   private seedWatermark(taskId: string, revision: number): void {
@@ -221,40 +353,39 @@ export function registerBackendSelect(el: (HTMLElement & { value: string }) | un
   backendSelectEl = el;
 }
 
-/** Read the dropdown at send time so the chosen backend drives new-task creation. */
+/**
+ * Backend for a draft send. The live select is authoritative when it has a
+ * parseable value (`backend` or `backend::model`) — that is what the user sees.
+ * preferredBackend is only a fallback when the select is missing/unmounted.
+ */
 export function resolveBackendForSend(): WebviewBackendId {
-  return resolveBackendSelectionForSend().backend;
+  return parseBackendId(backendSelectEl?.value) ?? tasks.preferredBackend;
 }
 
 /**
- * Read the backend/model picker at send time. The grouped picker encodes a
- * model option as `backend::model`; do not fall back to the previous backend
- * when a web component has not delivered its change event yet.
+ * Model for a draft send. Prefer the encoded select value, then preferredModel
+ * when it belongs to the resolved backend.
  */
-export function resolveBackendSelectionForSend(): { backend: WebviewBackendId; model?: string } {
-  const fromSelect = backendSelectEl?.value ?? '';
-  const separator = fromSelect.indexOf('::');
-  if (separator > 0) {
-    const backend = fromSelect.slice(0, separator);
-    const model = fromSelect.slice(separator + 2);
-    if (
-      model &&
-      (backend === 'claude' || backend === 'grok' || backend === 'kiro' || backend === 'codex' || backend === 'opencode')
-    ) {
-      return { backend, model };
-    }
+export function resolveModelForSend(): string | null {
+  const raw = backendSelectEl?.value;
+  const fromDom = parseModelFromSelectValue(raw);
+  if (fromDom) return fromDom;
+  const backend = resolveBackendForSend();
+  if (backend === tasks.preferredBackend) return tasks.preferredModel;
+  return null;
+}
+
+/**
+ * Sync preferred* from the live select (or current preferred) so persistence
+ * and subsequent drafts match what was just sent.
+ */
+export function syncPreferenceFromSend(): { backend: WebviewBackendId; model: string | null } {
+  const backend = resolveBackendForSend();
+  const model = resolveModelForSend();
+  if (model) {
+    tasks.setModelSelection(backend, model);
+  } else {
+    tasks.setBackend(backend);
   }
-  if (
-    fromSelect === 'claude' ||
-    fromSelect === 'grok' ||
-    fromSelect === 'kiro' ||
-    fromSelect === 'codex' ||
-    fromSelect === 'opencode'
-  ) {
-    return { backend: fromSelect };
-  }
-  return {
-    backend: tasks.selectedBackend,
-    ...(tasks.selectedModel ? { model: tasks.selectedModel } : {}),
-  };
+  return { backend, model };
 }

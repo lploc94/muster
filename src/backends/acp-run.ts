@@ -1,5 +1,11 @@
 import { randomUUID } from 'crypto';
-import { BackendCapabilities, NormalizedEvent, RunOptions } from '../types';
+import {
+  BackendCapabilities,
+  LiveInputRequest,
+  LiveInputResult,
+  NormalizedEvent,
+  RunOptions,
+} from '../types';
 import {
   AcpAgentConfig,
   type AcpModelConfig,
@@ -63,6 +69,9 @@ export const ACP_CAPABILITIES: BackendCapabilities = {
   supportsReasoning: true,
   supportsDetailedToolEvents: true,
   supportsMCP: true,
+  // All ACP adapters expose sendLiveInput; policy B always attempts the wire
+  // call when a prompt is in flight (capability advertise is advisory only).
+  supportsLiveInput: true,
 };
 
 function cancellationTerminal(): NormalizedEvent {
@@ -180,21 +189,47 @@ function usageFromResult(result: PromptResult, spec: AcpAdapterSpec): Normalized
 }
 
 function terminalFromPrompt(result: PromptResult, cancelled: boolean, spec: AcpAdapterSpec): NormalizedEvent {
+  const interruptConfidence: 'confirmed' | 'forced' =
+    result.cancelConfidence === 'forced' ? 'forced' : 'confirmed';
   if (cancelled) {
-    return { type: 'error', message: 'Turn cancelled', isCancellation: true };
+    return {
+      type: 'error',
+      message: 'Turn cancelled',
+      isCancellation: true,
+      meta: { interruptConfidence },
+    };
   }
   const stopReason = result.stopReason;
   if (stopReason === 'cancelled') {
-    return { type: 'error', message: 'Turn cancelled', isCancellation: true };
+    return {
+      type: 'error',
+      message: 'Turn cancelled',
+      isCancellation: true,
+      meta: { interruptConfidence },
+    };
   }
+  // Prompt returned a terminal result — Phase B session-bind evidence.
+  const terminalMeta = { failureClass: 'terminal_received' as const };
   if (typeof stopReason !== 'string' || stopReason.length === 0) {
-    return { type: 'error', message: `${spec.label} prompt ended without a stopReason` };
+    return {
+      type: 'error',
+      message: `${spec.label} prompt ended without a stopReason`,
+      meta: terminalMeta,
+    };
   }
   if (spec.failureStopReasons.has(stopReason)) {
-    return { type: 'error', message: `${spec.label} stopped: ${stopReason}` };
+    return {
+      type: 'error',
+      message: `${spec.label} stopped: ${stopReason}`,
+      meta: terminalMeta,
+    };
   }
   if (stopReason !== 'end_turn') {
-    return { type: 'error', message: `${spec.label} stopped: ${stopReason}`, meta: { stopReason } };
+    return {
+      type: 'error',
+      message: `${spec.label} stopped: ${stopReason}`,
+      meta: { ...terminalMeta, stopReason },
+    };
   }
   return { type: 'turnCompleted', meta: { stopReason } };
 }
@@ -296,6 +331,14 @@ export async function* runAcpTurn(
       }
     }
 
+    if (options.onBeforePrompt) {
+      await options.onBeforePrompt();
+    }
+    if (isAborted()) {
+      yield cancellationTerminal();
+      return;
+    }
+
     const promptPromise = client.prompt(activeSessionId, options.prompt, options.signal);
 
     while (true) {
@@ -333,4 +376,16 @@ export async function* runAcpTurn(
     unregister?.();
     unregisterConnection?.();
   }
+}
+
+/**
+ * Route a live-input request through the shared ACP client for this adapter.
+ * Capability evidence is enforced inside {@link AcpClient.sendLiveInput}.
+ */
+export async function sendAcpLiveInput(
+  spec: AcpAdapterSpec,
+  request: LiveInputRequest,
+): Promise<LiveInputResult> {
+  const client = getSharedAcpClient(spec.makeConfig());
+  return client.sendLiveInput(request);
 }

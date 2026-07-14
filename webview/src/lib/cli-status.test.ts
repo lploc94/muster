@@ -116,8 +116,11 @@ describe('cliStatusFromTask', () => {
 describe('getCliStatusPresentation', () => {
   it('has labels for all four process views', () => {
     expect(getCliStatusPresentation('not_started').label).toMatch(/not started/i);
-    expect(getCliStatusPresentation('running').label).toMatch(/running/i);
-    expect(getCliStatusPresentation('idle').label).toMatch(/idle/i);
-    expect(getCliStatusPresentation('stopped').label).toMatch(/stopped/i);
+    expect(getCliStatusPresentation('running').label).toMatch(/working/i);
+    expect(getCliStatusPresentation('idle').label).toMatch(/waiting/i);
+    expect(getCliStatusPresentation('stopped').label).toMatch(/idle/i);
+    for (const status of ['not_started', 'running', 'idle', 'stopped'] as const) {
+      expect(getCliStatusPresentation(status).label.toLowerCase()).not.toMatch(/\bcli\b/);
+    }
   });
 });

@@ -33,4 +33,5 @@ export interface Question {
   prompt: string;
   options?: string[];
   allowFreeText?: boolean;
+  multiSelect?: boolean;
 }

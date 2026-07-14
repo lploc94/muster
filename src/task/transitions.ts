@@ -5,9 +5,11 @@ import type {
   TaskDependency,
   TaskExecutionPolicy,
   TaskLifecycleState,
+  TaskMessage,
   TaskRole,
   TaskTurn,
   TurnDisposition,
+  TurnFailureClass,
   TurnInput,
   TurnStatus,
   TurnTrigger,
@@ -58,19 +60,39 @@ export function isTerminalLifecycle(state: TaskLifecycleState): boolean {
   return TERMINAL_LIFECYCLES.has(state);
 }
 
-/** Hard terminal: read-only; further work is a new/continuation task. */
+/** Hard terminal: sealed success/cancel/skip (distinct from soft-failed). */
 export function isHardTerminalLifecycle(state: TaskLifecycleState): boolean {
   return HARD_TERMINAL_LIFECYCLES.has(state);
 }
 
-/** Soft terminal (`failed`): same task may reopen on a new user message. */
+/** Soft terminal (`failed`): sealed unsuccessful attempt. */
 export function isSoftTerminalLifecycle(state: TaskLifecycleState): boolean {
   return state === 'failed';
 }
 
 /**
- * Reopen a soft-failed task to `open` so the user can continue on the same id.
+ * Reopen any terminal task to `open` so the user can continue on the same id.
+ * Follow-up is reopen-or-new-task — not a separate continuation task id.
  */
+export function reopenTask(
+  task: MusterTask,
+  options: { now: string },
+): TransitionResult<MusterTask> {
+  if (!isTerminalLifecycle(task.lifecycle)) {
+    return { ok: false, reason: 'task is not terminal' };
+  }
+  return {
+    ok: true,
+    next: bumpTask(task, options.now, {
+      lifecycle: 'open',
+      finishedAt: undefined,
+      outcomeProposal: undefined,
+    }),
+    effects: [{ kind: 'emitUpdate' }],
+  };
+}
+
+/** @deprecated Prefer reopenTask — soft and hard terminals both reopen on the same id. */
 export function reopenSoftFailedTask(
   task: MusterTask,
   options: { now: string },
@@ -78,14 +100,7 @@ export function reopenSoftFailedTask(
   if (task.lifecycle !== 'failed') {
     return { ok: false, reason: 'task is not soft-failed' };
   }
-  return {
-    ok: true,
-    next: bumpTask(task, options.now, {
-      lifecycle: 'open',
-      finishedAt: undefined,
-    }),
-    effects: [{ kind: 'emitUpdate' }],
-  };
+  return reopenTask(task, options);
 }
 
 export function isTerminalTurn(status: TurnStatus): boolean {
@@ -194,9 +209,9 @@ function queueTurn(
   if (isTerminalLifecycle(task.lifecycle)) {
     return { ok: false, reason: 'task is terminal' };
   }
-  if (hasActiveOrQueuedTurn(turns)) {
-    return { ok: false, reason: 'task already has an active or queued turn' };
-  }
+  // R012: allow multiple FIFO queued turns (and queue behind a live turn).
+  // One-at-a-time execution is enforced by canPromoteTurn / scheduler, not here.
+  // Retry still uses exclusive queue via retryTurn's hasActiveOrQueuedTurn guard.
 
   const turn: TaskTurn = {
     id: options.turnId,
@@ -265,8 +280,10 @@ export function continueTask(
   turns: readonly TaskTurn[],
   options: QueueTurnOptions,
 ): TransitionResult<TaskTurn> {
-  if (!turns.some((turn) => isSettledTurn(turn.status))) {
-    return { ok: false, reason: 'continueTask requires at least one settled turn' };
+  // R012: allow FIFO follow-up turns while a prior turn is still live/queued.
+  // startTask covers the empty-history case; continue requires at least one prior turn.
+  if (turns.length === 0) {
+    return { ok: false, reason: 'continueTask requires at least one prior turn' };
   }
   return queueTurn(task, turns, options);
 }
@@ -432,6 +449,11 @@ export function applyFailedTurn(
     policy: TaskExecutionPolicy;
     onExhausted: 'recover' | 'fail';
     now: string;
+    /**
+     * Phase C: only `safe_to_retry` (durable pre-dispatch) uses maxAutomaticRetries
+     * and enqueues a silent retry. Other classes never auto-retry.
+     */
+    failureClass?: TurnFailureClass;
   },
 ): TransitionResult<{ task: MusterTask; turn: TaskTurn }> {
   if (isTerminalLifecycle(task.lifecycle)) {
@@ -445,15 +467,22 @@ export function applyFailedTurn(
     return { ok: false, reason: 'applyFailedTurn requires a running turn' };
   }
 
+  const failureClass = options.failureClass ?? 'unclassified';
   const failedTurn: TaskTurn = {
     ...turn,
     status: 'failed',
     error: options.error,
     finishedAt: options.now,
     disposition: undefined,
+    failureClass,
+    dispatchPhase: 'terminal_received',
   };
 
-  if (options.retryCount < options.policy.maxAutomaticRetries) {
+  // Silent auto-retry only for durable pre-dispatch safety (Phase C).
+  if (
+    failureClass === 'safe_to_retry' &&
+    options.retryCount < options.policy.maxAutomaticRetries
+  ) {
     return {
       ok: true,
       next: { task: bumpTask(task, options.now, {}), turn: failedTurn },
@@ -462,7 +491,7 @@ export function applyFailedTurn(
   }
 
   // Lifecycle is never sealed by CLI/turn failure — only user or authorized coordinator.
-  // Exhausted retries leave the task open for recovery / user decision.
+  // Exhausted retries / non-safe failures leave the task open for recovery / user decision.
   void options.onExhausted;
   return {
     ok: true,
@@ -501,19 +530,11 @@ export function setTaskLifecycle(
   }
 
   if (lifecycle === 'open') {
-    // Soft-fail reopen only. Hard terminals require a new/continuation task.
-    if (task.lifecycle !== 'failed') {
-      return { ok: false, reason: 'only soft-failed tasks may reopen to open' };
+    // Any terminal lifecycle may reopen on the same task id (user choice).
+    if (!isTerminalLifecycle(task.lifecycle)) {
+      return { ok: false, reason: 'only terminal tasks may reopen to open' };
     }
-    return {
-      ok: true,
-      next: bumpTask(task, options.now, {
-        lifecycle: 'open',
-        finishedAt: undefined,
-        outcomeProposal: undefined,
-      }),
-      effects: [{ kind: 'emitUpdate' }],
-    };
+    return reopenTask(task, { now: options.now });
   }
 
   if (lifecycle === 'succeeded') {
@@ -584,7 +605,16 @@ export function retryTurn(
   task: MusterTask,
   turns: readonly TaskTurn[],
   oldTurn: TaskTurn,
-  options: { turnId: string; instruction: string; now: string },
+  options: {
+    turnId: string;
+    instruction: string;
+    now: string;
+    /**
+     * Phase C safe auto-retry: reuse original message input ids so the backend
+     * prompt equals the original turn (no diagnostic-only recovery text).
+     */
+    reuseOriginalInputs?: boolean;
+  },
 ): TransitionResult<TaskTurn> {
   if (isTerminalLifecycle(task.lifecycle)) {
     return { ok: false, reason: 'task is terminal' };
@@ -598,8 +628,29 @@ export function retryTurn(
   if (oldTurn.status !== 'failed' && oldTurn.status !== 'interrupted') {
     return { ok: false, reason: 'retryTurn requires a failed or interrupted turn' };
   }
-  if (hasActiveOrQueuedTurn(turns)) {
+  // Safe auto-retry may coexist with held follow-ups; other retries still require a clear queue.
+  const blocking = turns.filter(
+    (turn) =>
+      turn.status === 'running' ||
+      turn.status === 'waiting_user' ||
+      (turn.status === 'queued' &&
+        !(options.reuseOriginalInputs && turn.holdAutoPromote === true)),
+  );
+  if (blocking.length > 0) {
     return { ok: false, reason: 'task already has an active or queued turn' };
+  }
+
+  const inputs = options.reuseOriginalInputs
+    ? [...oldTurn.inputs]
+    : [
+        {
+          kind: 'recovery' as const,
+          interruptedTurnId: oldTurn.id,
+          instruction: options.instruction,
+        },
+      ];
+  if (options.reuseOriginalInputs && inputs.length === 0) {
+    return { ok: false, reason: 'cannot reuse original inputs: empty input list' };
   }
 
   return queueTurn(task, turns, {
@@ -607,13 +658,7 @@ export function retryTurn(
     now: options.now,
     trigger: 'retry',
     retryOf: oldTurn.id,
-    inputs: [
-      {
-        kind: 'recovery',
-        interruptedTurnId: oldTurn.id,
-        instruction: options.instruction,
-      },
-    ],
+    inputs,
   });
 }
 
@@ -636,6 +681,103 @@ export function cancelPendingTurn(
     };
   }
   return { ok: false, reason: 'turn is not pending' };
+}
+
+/**
+ * R013: pure predicate for editing an undispatched queued follow-up.
+ * Mutates only the bound pending user message content once applied by the engine.
+ * Fail-closed at the queued→running assign boundary (status !== 'queued' or message not pending).
+ */
+export function prepareEditQueuedTurn(
+  taskId: string,
+  turn: TaskTurn | undefined,
+  messages: Readonly<Record<string, TaskMessage>>,
+  content: string,
+): TransitionResult<{ messageId: string; content: string }> {
+  if (!turn) {
+    return { ok: false, reason: 'turn not found' };
+  }
+  if (turn.taskId !== taskId) {
+    return { ok: false, reason: 'turn does not belong to task' };
+  }
+  if (turn.status !== 'queued') {
+    return { ok: false, reason: 'turn is not queued' };
+  }
+
+  const trimmed = content.trim();
+  if (trimmed.length === 0) {
+    return { ok: false, reason: 'invalid content' };
+  }
+
+  const messageIds = messageIdsFromInputs(turn.inputs);
+  if (messageIds.length === 0) {
+    return { ok: false, reason: 'message not found' };
+  }
+  // One-message-per-turn FIFO: edit the first (only) bound user message.
+  // Multi-message inputs are not expected for R012 queue entries, but we still
+  // validate every bound message is a pending user message on this task.
+  for (const messageId of messageIds) {
+    const message = messages[messageId];
+    if (!message) {
+      return { ok: false, reason: 'message not found' };
+    }
+    if (message.taskId !== taskId) {
+      return { ok: false, reason: 'message not found' };
+    }
+    if (message.role !== 'user') {
+      return { ok: false, reason: 'message is not pending' };
+    }
+    if (message.state !== 'pending') {
+      return { ok: false, reason: 'message is not pending' };
+    }
+  }
+
+  return {
+    ok: true,
+    next: { messageId: messageIds[0]!, content: trimmed },
+    effects: [],
+  };
+}
+
+/**
+ * R013: pure predicate for deleting an undispatched queued follow-up turn.
+ * Removes the turn row and its bound pending user messages only — no cancelProcess,
+ * no lifecycle change, no mutation of live/settled turns.
+ */
+export function prepareDeleteQueuedTurn(
+  taskId: string,
+  turn: TaskTurn | undefined,
+  messages: Readonly<Record<string, TaskMessage>>,
+): TransitionResult<{ turnId: string; messageIds: string[] }> {
+  if (!turn) {
+    return { ok: false, reason: 'turn not found' };
+  }
+  if (turn.taskId !== taskId) {
+    return { ok: false, reason: 'turn does not belong to task' };
+  }
+  if (turn.status !== 'queued') {
+    return { ok: false, reason: 'turn is not queued' };
+  }
+
+  const messageIds = messageIdsFromInputs(turn.inputs);
+  for (const messageId of messageIds) {
+    const message = messages[messageId];
+    if (!message) {
+      return { ok: false, reason: 'message not found' };
+    }
+    if (message.taskId !== taskId) {
+      return { ok: false, reason: 'message not found' };
+    }
+    if (message.role !== 'user' || message.state !== 'pending') {
+      return { ok: false, reason: 'message is not pending' };
+    }
+  }
+
+  return {
+    ok: true,
+    next: { turnId: turn.id, messageIds },
+    effects: [],
+  };
 }
 
 export function applyDependencyTerminal(
@@ -884,3 +1026,20 @@ export function stageDisposition(
 
   return { ok: false, reason: 'disposition already staged with a different opId' };
 }
+
+/**
+ * MEM030: mark already-queued follow-ups so they are not auto-promoted after a
+ * failed/interrupted live settlement. Call inside the same commit that settles
+ * the live turn, before creating post-settlement retry/recovery turns.
+ */
+export function holdQueuedFollowUpsOnFailure(
+  draft: { turns: Record<string, TaskTurn> },
+  taskId: string,
+): void {
+  for (const turn of Object.values(draft.turns)) {
+    if (turn.taskId !== taskId || turn.status !== 'queued') continue;
+    if (turn.holdAutoPromote) continue;
+    draft.turns[turn.id] = { ...turn, holdAutoPromote: true };
+  }
+}
+

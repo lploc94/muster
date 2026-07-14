@@ -1,6 +1,11 @@
 <script lang="ts">
   import { threadStore } from '../lib/thread.svelte';
-  import { tasks, resolveBackendSelectionForSend, registerBackendSelect } from '../lib/tasks.svelte';
+  import {
+    tasks,
+    registerBackendSelect,
+    type WebviewBackendId,
+  } from '../lib/tasks.svelte';
+  import { parseBackendId, parseModelFromSelectValue } from '../lib/backend-resolve';
   import { post } from '../lib/protocol';
   import { ADD_CONTEXT_ACTIONS, getAddContextActionHostMessage } from '../lib/context-actions';
   import {
@@ -10,18 +15,35 @@
     runtimeBlocksComposer,
   } from '../lib/task-status';
   import {
-    CLI_LAST_EXIT_LABELS,
-    cliStatusFromTask,
-    getCliStatusPresentation,
-    type CliLastExit,
-  } from '../lib/cli-status';
+    getTurnActivityPresentation,
+    turnActivityFromTask,
+    type TurnActivityState,
+  } from '../lib/turn-activity';
   import type { AddContextAction } from '../lib/context-actions';
   import type { PendingAsk, TaskSummary, TaskViewStatus } from '../lib/protocol';
   import { effectiveRuntimeActivity } from '../lib/protocol';
-  import type { WebviewBackendId } from '../lib/tasks.svelte';
-  import { BACKENDS, backendShortLabel } from '../lib/backends';
+  import { BACKENDS, backendShortLabel, backendModelLabel } from '../lib/backends';
   import { filterCommandSuggestions, looksLikeSlashCommand, type CommandSuggestion } from '../lib/commands';
   import { tip } from '../lib/tooltip';
+  import {
+    extractFileDropCandidatesFromDataTransfer,
+    isOsFileManagerDrag,
+    isVsCodeExplorerDrag,
+  } from '../lib/file-drop';
+  import { renderUserTextWithMentions } from '../lib/file-mention-render';
+  import {
+    allocateDisplayToken,
+    expandMentionsForLlm,
+    type MentionBindingMap,
+  } from '../lib/file-mention-bindings';
+  import {
+    buildTaskComposerMessage,
+    resolveComposerKeyIntent,
+    shouldPreventDefaultForComposerKey,
+    type ComposerSubmitIntent,
+  } from '../lib/composer-submit';
+  import { outboxAdd } from '../lib/send-outbox';
+  import { vscode } from '../lib/vscode';
 
   interface Props {
     mode: 'draft' | 'task';
@@ -33,8 +55,6 @@
     task?: TaskSummary | null;
     /** @deprecated Prefer `task`. Kept for callers that only have viewStatus. */
     taskStatus?: TaskViewStatus;
-    /** Optional last process exit (host may project later). */
-    cliLastExit?: CliLastExit | null;
   }
 
   let {
@@ -45,58 +65,104 @@
     pendingAsk = null,
     task = null,
     taskStatus = 'idle',
-    cliLastExit = null,
   }: Props = $props();
 
   const thread = $derived(threadStore.current);
   const presentation = $derived(task ? getTaskPresentation(task) : getTaskStatusPresentation(taskStatus));
   const runtime = $derived(task ? effectiveRuntimeActivity(task) : null);
   const lifecycle = $derived(task?.lifecycle ?? (taskStatus as string));
-  const cliStatus = $derived(
-    task
-      ? cliStatusFromTask(task, {
-          // Generating only when streaming without a pending ask.
-          threadRunning: thread.running && !pendingAsk,
-          askPending: !!pendingAsk,
-          // Persist across reload: a committed session implies a prior process.
-          hadProcess: thread.hadProcess || !!task.committedSessionId,
-        })
-      : thread.running && !pendingAsk
-        ? ('running' as const)
-        : pendingAsk
-          ? ('idle' as const)
-          : ('not_started' as const),
-  );
-  const cliPresentation = $derived(getCliStatusPresentation(cliStatus));
-  const cliExitHint = $derived(
-    cliStatus === 'stopped' && cliLastExit ? CLI_LAST_EXIT_LABELS[cliLastExit] : null,
+  const turnActivity = $derived.by((): TurnActivityState => {
+    if (task) {
+      return turnActivityFromTask(task, {
+        threadRunning: thread.running && !pendingAsk,
+        askPending: !!pendingAsk,
+      });
+    }
+    if (pendingAsk || taskStatus === 'waiting_user') return 'waiting_you';
+    if (thread.running || taskStatus === 'running') return 'executing';
+    if (taskStatus === 'queued') return 'queued';
+    if (taskStatus === 'needs_recovery') return 'failed_turn';
+    return 'null';
+  });
+  const turnPresentation = $derived(
+    getTurnActivityPresentation(turnActivity, {
+      hostActivity: task?.currentTurnActivity,
+      waitReason:
+        task?.currentTurnActivity && task.currentTurnActivity.state === 'queued'
+          ? task.currentTurnActivity.waitReason
+          : undefined,
+    }),
   );
 
-  let textareaEl = $state<(HTMLElement & { value: string }) | undefined>(undefined);
+  let textareaEl = $state<HTMLTextAreaElement | undefined>(undefined);
+  let highlightEl = $state<HTMLDivElement | undefined>(undefined);
+  let draftText = $state('');
+  /** Display token (@name) → resolve path for LLM expand-on-send. */
+  let mentionBindings: MentionBindingMap = new Map();
   let backendSelect = $state<(HTMLElement & { value: string }) | undefined>(undefined);
   let addContextMenuRegion = $state<HTMLElement | undefined>(undefined);
   let isDraggingFile = $state(false);
+  let isExplorerDrag = $state(false);
+  let dropFeedback = $state<string | null>(null);
   let isAddContextMenuOpen = $state(false);
-  let composerText = $state('');
+  let lastPrefillNonce = $state<number | null>(null);
 
+  /** Highlight layer mirrors draft; trailing newline needs an extra break for height parity. */
+  const draftHighlightHtml = $derived.by(() => {
+    const base = renderUserTextWithMentions(draftText);
+    if (!base) return '';
+    return draftText.endsWith('\n') ? `${base}<br>` : base;
+  });
+
+  // Terminal lifecycles stay writable: host send reopens the same task to open.
+  // Live/queued stay writable so Enter queues FIFO follow-ups and Ctrl+Enter can inject.
+  // Phase B: only structured waiting_you / pendingAsk blocks free-form by default.
   const statusBlocksSend = $derived(
     task
-      ? isHardTerminal(lifecycle) || runtimeBlocksComposer(runtime)
-      : taskStatus === 'running' ||
-          taskStatus === 'queued' ||
-          taskStatus === 'waiting_dependencies' ||
-          taskStatus === 'waiting_children' ||
-          taskStatus === 'waiting_user' ||
-          taskStatus === 'needs_recovery' ||
-          isHardTerminal(taskStatus),
+      ? runtimeBlocksComposer(runtime) || turnActivity === 'waiting_you'
+      : taskStatus === 'waiting_user',
   );
   const blocked = $derived(mode === 'task' && (!!pendingAsk || readOnly || statusBlocksSend));
-  const canSend = $derived(mode === 'draft' ? !thread.running : !thread.running && !blocked);
-  // Stop applies while a process is up (generating or idle/waiting_user).
+  // Draft still waits for the first turn to settle. Task mode stays open while
+  // a live/queued turn is active so Enter queues and Ctrl+Enter can inject.
+  const canSend = $derived(mode === 'draft' ? !thread.running : !blocked);
+
+  // Queue panel Edit / sendRejected restore → load text into the message box.
+  // Never overwrite a newer non-empty draft the user already typed.
+  // On refuse (non-empty draft): leave prefill uncleared so App does not drop outbox.
+  $effect(() => {
+    const prefill = tasks.composerPrefill;
+    if (!prefill || prefill.nonce === lastPrefillNonce) return;
+    if (!canSend) return;
+    if (draftText.trim().length > 0) {
+      // Refuse: keep prefill for a later empty-composer attempt; mark nonce seen
+      // so we don't spin, but restore only when draft becomes empty.
+      return;
+    }
+    lastPrefillNonce = prefill.nonce;
+    draftText = prefill.text;
+    mentionBindings = new Map();
+    dropFeedback = null;
+    const appliedId = prefill.clientRequestId;
+    tasks.clearComposerPrefill();
+    if (appliedId) {
+      // Signal successful apply for outbox cleanup.
+      window.dispatchEvent(
+        new CustomEvent('muster:prefill-applied', { detail: { clientRequestId: appliedId } }),
+      );
+    }
+    queueMicrotask(() => {
+      textareaEl?.focus();
+      const len = draftText.length;
+      textareaEl?.setSelectionRange(len, len);
+      syncHighlightScroll();
+    });
+  });
+  // Stop this turn while a live turn is executing or waiting for the user.
   const canCancel = $derived(
     mode === 'task' &&
-      (cliStatus === 'running' ||
-        cliStatus === 'idle' ||
+      (turnActivity === 'executing' ||
+        turnActivity === 'waiting_you' ||
         runtime === 'running' ||
         runtime === 'waiting_user' ||
         taskStatus === 'running' ||
@@ -118,7 +184,12 @@
     function onMessage(e: MessageEvent) {
       const msg = e.data;
       if (msg?.type !== 'filePicked' || typeof msg.path !== 'string') return;
-      insertFileMention(msg.path);
+      dropFeedback = null;
+      const displayName =
+        typeof msg.displayName === 'string' && msg.displayName.trim()
+          ? msg.displayName.trim()
+          : undefined;
+      insertFileMention(msg.path, displayName);
     }
 
     window.addEventListener('message', onMessage);
@@ -144,43 +215,6 @@
     return () => window.removeEventListener('pointerdown', onPointerDown, true);
   });
 
-  function send() {
-    if (!canSend || !textareaEl) return;
-    const value = (textareaEl.value ?? '').trim();
-    if (!value) return;
-
-    if (mode === 'draft') {
-      const selection = resolveBackendSelectionForSend();
-      const backend = selection.backend;
-      tasks.setBackend(backend);
-      const payload: {
-        type: 'send';
-        text: string;
-        backend: string;
-        model?: string;
-        continuationOf?: string;
-      } = { type: 'send', text: value, backend };
-      // Only deliver a model that belongs to the chosen backend's catalog. Before
-      // enumeration finishes (catalog null) trust the persisted selection.
-      const model = selection.model ?? tasks.selectedModel;
-      if (model && (!tasks.modelsByBackend || modelInCatalog(backend, model))) {
-        payload.model = model;
-      }
-      if (tasks.continuationOf) payload.continuationOf = tasks.continuationOf;
-      threadStore.current.appendTranscript({
-        id: `local-${Date.now()}`,
-        kind: 'user',
-        content: value,
-      });
-      post(payload);
-    } else if (taskId) {
-      post({ type: 'send', taskId, text: value });
-    }
-
-    textareaEl.value = '';
-    composerText = '';
-  }
-
   function availabilityForSuggestion(command: CommandSuggestion): CommandSuggestion {
     if (command.availability === 'disabled') return command;
     if (command.requiresTask && !taskId) {
@@ -194,52 +228,161 @@
       return {
         ...command,
         availability: 'disabled',
-        disabledReason: disabledReason || 'The focused task is not ready for this command.',
+        disabledReason: blockReason || 'The focused task is not ready for this command.',
       };
     }
     return command;
   }
 
   const slashSuggestions = $derived.by(() =>
-    looksLikeSlashCommand(composerText)
-      ? filterCommandSuggestions(composerText.trim()).map(availabilityForSuggestion)
+    looksLikeSlashCommand(draftText)
+      ? filterCommandSuggestions(draftText.trim()).map(availabilityForSuggestion)
       : [],
   );
-  const mentionSuggestions = $derived.by(() => composerText.trim() === '@'
-    ? ADD_CONTEXT_ACTIONS.filter((action) => action.state === 'enabled')
-    : []);
+  const mentionSuggestions = $derived.by(() =>
+    draftText.trim() === '@' ? ADD_CONTEXT_ACTIONS.filter((action) => action.state === 'enabled') : [],
+  );
   const instantCommandIds = new Set(['help', 'tasks', 'mcp']);
-
-  function onComposerInput(e: Event) {
-    composerText = (e.currentTarget as HTMLTextAreaElement | undefined)?.value ?? textareaEl?.value ?? '';
-  }
 
   function chooseSlashCommand(id: string) {
     const suggestion = slashSuggestions.find((command) => command.id === id);
     if (suggestion?.availability === 'disabled') return;
     // Read-only, argument-free commands should behave like commands, not like
     // text snippets that require the user to discover a second Enter/Send step.
-    // Task-scoped reads are also safe to run immediately when a task is open.
     if (instantCommandIds.has(id) || ((id === 'status' || id === 'context') && taskId)) {
       post({ type: 'runCommand', text: `/${id}`, ...(taskId ? { taskId } : {}) });
-      composerText = '';
-      if (textareaEl) textareaEl.value = '';
+      draftText = '';
       return;
     }
     const next = `/${id} `;
-    if (textareaEl) {
-      textareaEl.value = next;
-      textareaEl.focus();
-    }
-    composerText = next;
+    draftText = next;
+    queueMicrotask(() => {
+      textareaEl?.focus();
+      const caret = next.length;
+      textareaEl?.setSelectionRange(caret, caret);
+    });
   }
 
   function chooseMentionAction(action: AddContextAction) {
-    if (!textareaEl || !canSend) return;
+    if (!canSend) return;
     // `@` opens the contextual picker; it is not itself a file mention.
-    textareaEl.value = textareaEl.value.replace(/@\s*$/, '');
-    composerText = textareaEl.value;
+    draftText = draftText.replace(/@\s*$/, '');
     activateAddContextAction(action);
+  }
+
+  function submitComposer(intent: Exclude<ComposerSubmitIntent, { kind: 'none' }>) {
+    if (!canSend) return;
+    const displayText = draftText.trim();
+    if (!displayText) return;
+
+    // UI keeps short @names; host stores display `text` and agent-facing `llmText`.
+    const llmText = expandMentionsForLlm(displayText, mentionBindings);
+
+    if (mode === 'draft') {
+      // Draft has no live-inject path — treat any submit as create-task send.
+      // Read the LIVE select element first (what the user sees). Do not trust
+      // preferredBackend alone — onchange can lag or be missed by the WC.
+      const raw = backendSelect?.value ?? '';
+      const fromDom = parseBackendId(raw);
+      const backend: WebviewBackendId = fromDom ?? tasks.preferredBackend;
+      const model =
+        parseModelFromSelectValue(raw) ??
+        (backend === tasks.preferredBackend ? tasks.preferredModel : null);
+      if (model) {
+        tasks.setModelSelection(backend, model);
+      } else {
+        tasks.setBackend(backend);
+      }
+      const clientRequestId =
+        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `send-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      const payload: {
+        type: 'send';
+        text: string;
+        llmText?: string;
+        backend: string;
+        model?: string;
+        continuationOf?: string;
+        clientRequestId: string;
+      } = { type: 'send', text: displayText, backend, clientRequestId };
+      if (llmText !== displayText) payload.llmText = llmText;
+      if (model) payload.model = model;
+      if (tasks.continuationOf) payload.continuationOf = tasks.continuationOf;
+      outboxAdd(vscode, {
+        clientRequestId,
+        text: displayText,
+        llmText: llmText !== displayText ? llmText : undefined,
+        backend,
+        model: model ?? undefined,
+        continuationOf: tasks.continuationOf ?? undefined,
+        createdAt: Date.now(),
+        status: 'pending',
+      });
+      // DEBUG: temporary — remove after diagnosing grok→claude draft send.
+      console.info('[muster][draft-send]', {
+        selectValue: raw,
+        fromDom,
+        preferredBackend: tasks.preferredBackend,
+        preferredModel: tasks.preferredModel,
+        payloadBackend: payload.backend,
+        payloadModel: payload.model ?? null,
+      });
+      threadStore.current.appendTranscript({
+        id: `local-${Date.now()}`,
+        kind: 'user',
+        content: displayText,
+      });
+      post(payload);
+      // Keep draft until sendAccepted; clear only on success (App restores on reject).
+      draftText = '';
+      mentionBindings = new Map();
+      return;
+    }
+
+    if (intent.kind === 'sendLiveInput') {
+      // Interrupt & send: host reserves follow-up then interrupts live turn.
+      const message = buildTaskComposerMessage(intent, {
+        taskId,
+        text: displayText,
+        llmText,
+      });
+      if (!message) return;
+      post(message);
+      draftText = '';
+      mentionBindings = new Map();
+      return;
+    }
+
+    if (!taskId) return;
+    const payload = buildTaskComposerMessage(intent, {
+      taskId,
+      text: displayText,
+      llmText,
+    });
+    if (!payload || payload.type !== 'send') return;
+    if (payload.clientRequestId) {
+      outboxAdd(vscode, {
+        clientRequestId: payload.clientRequestId,
+        taskId,
+        text: displayText,
+        llmText: llmText !== displayText ? llmText : undefined,
+        createdAt: Date.now(),
+        status: 'pending',
+      });
+    }
+    post(payload);
+    // Optimistic clear; sendRejected restores from outbox text.
+    draftText = '';
+    mentionBindings = new Map();
+  }
+
+  function send() {
+    submitComposer({ kind: 'send' });
+  }
+
+  function sendLiveInput() {
+    submitComposer({ kind: 'sendLiveInput' });
   }
 
   function cancel() {
@@ -247,23 +390,38 @@
     post({ type: 'cancelTurn', taskId, turnId });
   }
 
-  function mentionForPath(path: string): string {
-    const normalized = path.trim().replace(/\\/g, '/');
-    if (!normalized) return '';
-    return /\s/.test(normalized) ? `@"${normalized}"` : `@${normalized}`;
+  function insertFileMention(resolvePath: string, displayName?: string) {
+    if (!canSend) return;
+    const { token } = allocateDisplayToken(mentionBindings, resolvePath, displayName);
+    if (!token) return;
+
+    const current = draftText;
+    const start = textareaEl?.selectionStart ?? current.length;
+    const end = textareaEl?.selectionEnd ?? start;
+    const before = current.slice(0, start);
+    const after = current.slice(end);
+    const leading = before.length > 0 && !/\s$/.test(before) ? ' ' : '';
+    const trailing = after.length === 0 || !/^\s/.test(after) ? ' ' : '';
+    const insertion = `${leading}${token}${trailing}`;
+    draftText = `${before}${insertion}${after}`;
+    const caret = start + insertion.length;
+    queueMicrotask(() => {
+      textareaEl?.focus();
+      textareaEl?.setSelectionRange(caret, caret);
+      syncHighlightScroll();
+    });
   }
 
-  function insertFileMention(path: string) {
-    if (!textareaEl || !canSend) return;
-    const mention = mentionForPath(path);
-    if (!mention) return;
+  function syncHighlightScroll() {
+    if (!textareaEl || !highlightEl) return;
+    highlightEl.scrollTop = textareaEl.scrollTop;
+    highlightEl.scrollLeft = textareaEl.scrollLeft;
+  }
 
-    const current = textareaEl.value ?? '';
-    const needsLeadingSpace = current.length > 0 && !/\s$/.test(current);
-    const next = `${current}${needsLeadingSpace ? ' ' : ''}${mention} `;
-    textareaEl.value = next;
-    composerText = next;
-    textareaEl.focus?.();
+  function onDraftInput(e: Event) {
+    const el = e.currentTarget as HTMLTextAreaElement;
+    draftText = el.value;
+    syncHighlightScroll();
   }
 
   function closeAddContextMenu() {
@@ -283,46 +441,87 @@
     post(hostMessage);
   }
 
-  function dragCandidates(dataTransfer: DataTransfer): string[] {
-    const candidates: string[] = [];
-    for (const file of Array.from(dataTransfer.files ?? [])) {
-      const path = (file as File & { path?: string }).path;
-      if (typeof path === 'string' && path) candidates.push(path);
-      if (file.name) candidates.push(file.name);
-    }
-    for (const type of dataTransfer.types ?? []) {
-      const value = dataTransfer.getData(type);
-      if (value) candidates.push(value);
-    }
-    return candidates;
-  }
-
   function onDragOver(e: DragEvent) {
     if (!canSend) return;
+    // Must preventDefault so VS Code / Chromium allow the drop into the webview.
     e.preventDefault();
     isDraggingFile = true;
+    const types = e.dataTransfer?.types;
+    isExplorerDrag =
+      !!types && (isVsCodeExplorerDrag(types) || isOsFileManagerDrag(types));
     if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+    dropFeedback = null;
   }
 
   function onDragLeave(e: DragEvent) {
     if (!e.currentTarget || !e.relatedTarget) {
       isDraggingFile = false;
+      isExplorerDrag = false;
       return;
     }
     const current = e.currentTarget as Node;
     const related = e.relatedTarget as Node;
-    if (!current.contains(related)) isDraggingFile = false;
-  }
-
-  function onDrop(e: DragEvent) {
-    if (!canSend || !e.dataTransfer) return;
-    e.preventDefault();
-    isDraggingFile = false;
-    const candidates = dragCandidates(e.dataTransfer);
-    if (candidates.length > 0) {
-      post({ type: 'resolveFileDrop', candidates });
+    if (!current.contains(related)) {
+      isDraggingFile = false;
+      isExplorerDrag = false;
     }
   }
+
+  function isBareFileName(candidate: string): boolean {
+    const c = candidate.trim();
+    if (!c) return false;
+    if (c.includes('/') || c.includes('\\')) return false;
+    if (/^[a-z][a-z0-9+.-]*:/i.test(c)) return false;
+    return true;
+  }
+
+  async function onDrop(e: DragEvent) {
+    isDraggingFile = false;
+    isExplorerDrag = false;
+    if (!canSend || !e.dataTransfer) return;
+    e.preventDefault();
+    e.stopPropagation();
+
+    const dt = e.dataTransfer;
+    const files = Array.from(dt.files ?? []);
+
+    // Sync + async path extraction (Explorer URIs / Electron File.path).
+    const extraction = await extractFileDropCandidatesFromDataTransfer(dt, canSend);
+
+    // Finder often only gives File.name (no absolute path). Import bytes on the
+    // host so the mention is a real absolute path the LLM can open.
+    const onlyBareNames =
+      extraction.ok &&
+      extraction.candidates.length > 0 &&
+      extraction.candidates.every(isBareFileName);
+    if (files.length === 1 && (onlyBareNames || !extraction.ok)) {
+      try {
+        const file = files[0];
+        const buffer = await file.arrayBuffer();
+        dropFeedback = null;
+        post({ type: 'importDroppedFile', name: file.name, data: buffer });
+        return;
+      } catch {
+        dropFeedback = 'Unable to read the dropped file.';
+        return;
+      }
+    }
+
+    if (extraction.ok) {
+      dropFeedback = null;
+      post({ type: 'resolveFileDrop', candidates: extraction.candidates });
+      return;
+    }
+    if (extraction.code !== 'disabled') {
+      dropFeedback = extraction.message;
+    }
+  }
+
+  /** Interrupt & send only while a turn is executing — waiting_you Ctrl+Enter uses ordinary send. */
+  const liveInjectEligible = $derived(
+    mode === 'task' &&
+      (runtime === 'running' || taskStatus === 'running' || turnActivity === 'executing'),
+  );
 
   function onKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape' && isAddContextMenuOpen) {
@@ -331,35 +530,69 @@
       return;
     }
 
-    // Ignore Enter while an IME composition is active (CJK/Vietnamese input);
-    // keyCode 229 is the legacy signal for the same.
-    if (e.isComposing || e.keyCode === 229) return;
-    if (e.key === 'Enter' && !e.shiftKey) {
+    const policyInput = {
+      key: e.key,
+      shiftKey: e.shiftKey,
+      ctrlKey: e.ctrlKey,
+      metaKey: e.metaKey,
+      altKey: e.altKey,
+      isComposing: e.isComposing,
+      keyCode: e.keyCode,
+    };
+    const keyOpts = { mode, liveInjectEligible };
+    const intent = resolveComposerKeyIntent(policyInput, keyOpts);
+    if (intent.kind === 'none') return;
+    if (shouldPreventDefaultForComposerKey(policyInput, keyOpts)) {
       e.preventDefault();
-      send();
     }
+    submitComposer(intent);
   }
 
-  const disabledReason = $derived.by(() => {
+  /** True when lifecycle is sealed; composer stays enabled and send reopens. */
+  const isTerminalReopenable = $derived(
+    task
+      ? isHardTerminal(lifecycle) || lifecycle === 'failed'
+      : isHardTerminal(taskStatus) || taskStatus === 'failed',
+  );
+
+  /** Blocks send (busy/gated). Terminal reopenable is NOT a block. Live/queued are not blocks. */
+  const blockReason = $derived.by(() => {
     if (mode === 'draft') return '';
-    if (pendingAsk) return 'Answer the pending task question above to continue.';
+    if (pendingAsk || turnActivity === 'waiting_you') {
+      return 'Answer above to continue.';
+    }
     if (task) {
-      if (isHardTerminal(lifecycle)) return presentation.composerGuidance;
       if (runtimeBlocksComposer(runtime)) return presentation.composerGuidance;
-      if (lifecycle === 'failed') return presentation.composerGuidance;
       if (readOnly) return 'This task is read-only right now.';
       return '';
     }
-    if (taskStatus === 'running') return presentation.composerGuidance;
-    if (taskStatus === 'queued') return presentation.composerGuidance;
-    if (taskStatus === 'waiting_dependencies') return presentation.composerGuidance;
-    if (taskStatus === 'waiting_children') return presentation.composerGuidance;
-    if (taskStatus === 'waiting_user') return presentation.composerGuidance;
-    if (taskStatus === 'needs_recovery') return presentation.composerGuidance;
-    if (taskStatus === 'awaiting_outcome') return presentation.composerGuidance;
-    if (isHardTerminal(taskStatus)) return presentation.composerGuidance;
-    if (taskStatus === 'failed') return presentation.composerGuidance;
+    if (taskStatus === 'waiting_user') return 'Answer above to continue.';
     if (readOnly) return 'This task is read-only right now.';
+    return '';
+  });
+
+  /** Non-blocking affordance copy while live/queued (composer remains editable). */
+  const liveComposerGuidance = $derived.by(() => {
+    if (mode !== 'task' || blockReason) return '';
+    if (task) {
+      if (runtime === 'running' || runtime === 'queued') return presentation.composerGuidance;
+      return '';
+    }
+    if (taskStatus === 'running' || taskStatus === 'queued') return presentation.composerGuidance;
+    return '';
+  });
+
+  /**
+   * Composer note for blocked/busy states and live queue affordance.
+   * Terminal reopen warning lives once in TaskWorkspace (panel + Reopen button).
+   */
+  const composerNote = $derived.by(() => {
+    if (mode === 'draft') return '';
+    if (blockReason) return blockReason;
+    if (liveComposerGuidance) return liveComposerGuidance;
+    if (taskStatus === 'awaiting_outcome' && !isTerminalReopenable) {
+      return presentation.composerGuidance;
+    }
     return '';
   });
 
@@ -377,60 +610,133 @@
   const modelsLoaded = $derived(!!tasks.modelsByBackend && Object.keys(tasks.modelsByBackend).length > 0);
   const modelsLoading = $derived(mode === 'draft' && !modelsLoaded);
 
+  /** Prefer the user's restored choice over the availability display fallback. */
+  const draftBackend = $derived(
+    mode === 'draft' ? tasks.preferredBackend : currentBackend,
+  );
+  const draftModel = $derived(
+    mode === 'draft'
+      ? (tasks.preferredModel ?? tasks.selectedModel)
+      : tasks.selectedModel,
+  );
+
   const pickerOptions = $derived.by(() => {
     const models = tasks.modelsByBackend;
+    const opts: { value: string; label: string }[] = [];
     if (models && Object.keys(models).length > 0) {
-      const opts: { value: string; label: string }[] = [];
       for (const be of pickerBackends) {
         const m = models[be.id];
         if (m && m.options.length > 0) {
           for (const o of m.options) {
-            opts.push({ value: `${be.id}::${o.value}`, label: `[${backendShortLabel(be.id)}] ${o.name}` });
+            opts.push({
+              value: `${be.id}::${o.value}`,
+              label: `[${backendShortLabel(be.id)}] ${o.name}`,
+            });
           }
         } else {
           // Backend installed but no model list yet (still enumerating) or none advertised.
+          // Keep restored preference visible as backend::model when we have one.
+          if (be.id === draftBackend && draftModel) {
+            opts.push({
+              value: `${be.id}::${draftModel}`,
+              label: `[${backendShortLabel(be.id)}] ${draftModel}`,
+            });
+          } else {
+            opts.push({
+              value: be.id,
+              label: modelsLoading ? `${be.label} (loading models…)` : be.label,
+            });
+          }
+        }
+      }
+    } else {
+      for (const be of pickerBackends) {
+        if (be.id === draftBackend && draftModel) {
+          opts.push({
+            value: `${be.id}::${draftModel}`,
+            label: `[${backendShortLabel(be.id)}] ${draftModel}`,
+          });
+        } else {
           opts.push({
             value: be.id,
             label: modelsLoading ? `${be.label} (loading models…)` : be.label,
           });
         }
       }
-      if (opts.length > 0) return opts;
     }
-    return pickerBackends.map((b) => ({
-      value: b.id,
-      label: modelsLoading ? `${b.label} (loading models…)` : b.label,
-    }));
+    // Ensure the active selection always exists as an option (web component needs it).
+    const active = encodePickerValue(draftBackend, draftModel, models);
+    if (active.includes('::') && !opts.some((o) => o.value === active)) {
+      const [be, ...rest] = active.split('::');
+      const model = rest.join('::');
+      opts.unshift({
+        value: active,
+        label: `[${backendShortLabel(be)}] ${model}`,
+      });
+    }
+    return opts;
   });
 
   function modelInCatalog(backend: string, model: string): boolean {
     return !!tasks.modelsByBackend?.[backend]?.options.some((o) => o.value === model);
   }
 
-  // Encoded value the select should show — always an option that exists in
-  // `pickerOptions`. Until models load (or for a backend with none) that is the
-  // plain backend id; otherwise the chosen model, else the backend's default.
-  const currentPickerValue = $derived.by(() => {
-    if (!modelsLoaded) return currentBackend;
-    const m = tasks.modelsByBackend?.[currentBackend];
+  function encodePickerValue(
+    backend: string,
+    model: string | null,
+    models: typeof tasks.modelsByBackend,
+  ): string {
+    const m = models?.[backend];
     if (m && m.options.length > 0) {
       const chosen =
-        tasks.selectedModel && modelInCatalog(currentBackend, tasks.selectedModel)
-          ? tasks.selectedModel
-          : (m.current ?? m.options[0].value);
-      return `${currentBackend}::${chosen}`;
+        (model && m.options.some((o) => o.value === model) ? model : null) ??
+        m.current ??
+        m.options[0].value;
+      return `${backend}::${chosen}`;
     }
-    return currentBackend;
-  });
+    if (model) return `${backend}::${model}`;
+    return backend;
+  }
 
-  // Remount key so vscode-single-select rebuilds options when the catalog arrives
-  // (web components often ignore Svelte re-rendering child <vscode-option>s).
-  // Only remount when the option *set* changes — not when the selected value changes.
-  const pickerRemountKey = $derived(
-    modelsLoaded
-      ? `models:${pickerOptions.map((o) => o.value).join('|')}`
-      : `backends:${pickerBackends.map((b) => b.id).join(',')}:loading`,
+  // Always prefer backend::model when a model is known (restored or catalog default).
+  const currentPickerValue = $derived(
+    encodePickerValue(draftBackend, draftModel, tasks.modelsByBackend),
   );
+
+  // Remount only on catalog phase transitions (empty → has models). vscode-elements
+  // does not fire change when setting .value / defaulting option[0] on remount —
+  // only real user click/Enter dispatches change (via new Event, isTrusted=false).
+  let catalogGeneration = $state(0);
+  let lastModelsLoaded: boolean | undefined;
+  $effect(() => {
+    const loaded = modelsLoaded;
+    // Only bump on an actual empty↔loaded transition. Incrementing on every
+    // `!loaded` effect pass reads/writes catalogGeneration forever and can halt
+    // all subsequent webview reactivity with effect_update_depth_exceeded.
+    if (loaded === lastModelsLoaded) return;
+    lastModelsLoaded = loaded;
+    catalogGeneration += 1;
+  });
+  const pickerRemountKey = $derived(
+    modelsLoaded ? `models:${catalogGeneration}` : `loading:${catalogGeneration}`,
+  );
+
+  // Only force preferred encoding after remount — never continuously overwrite
+  // the live select (that fights the user's pick and can clobber Grok → Claude).
+  let lastForcedRemountKey = '';
+  $effect(() => {
+    const el = backendSelect;
+    const key = pickerRemountKey;
+    const next = currentPickerValue;
+    if (!el || mode !== 'draft') return;
+    if (key === lastForcedRemountKey && el.value) return;
+    lastForcedRemountKey = key;
+    try {
+      el.value = next;
+    } catch {
+      // best-effort
+    }
+  });
 
   // Ensure host starts enumeration when the draft composer is shown (also
   // prefetched on App mount / panel resolve).
@@ -447,15 +753,21 @@
 
   const placeholder = $derived(
     mode === 'draft'
-      ? `Start a new coordinator task with ${currentBackend}…`
-      : disabledReason
-        ? disabledReason
-        : `Message this task…`,
+      ? `Start a new coordinator task with ${draftBackend}…`
+      : isTerminalReopenable
+        ? 'Send a message to reopen this task…'
+        : blockReason
+          ? blockReason
+          : liveComposerGuidance
+            ? 'Enter queues a follow-up · Ctrl+Enter interrupts and sends…'
+            : 'Message this task…',
   );
 
   const BACKEND_IDS = ['claude', 'grok', 'kiro', 'codex', 'opencode'];
 
   function onBackendChange(e: Event) {
+    // vscode-single-select dispatches `new Event('change')` so isTrusted is always
+    // false even for real user clicks — never filter on isTrusted.
     const el = (e.currentTarget ?? backendSelect) as (HTMLElement & { value: string }) | undefined;
     const raw = el?.value ?? '';
     const sep = raw.indexOf('::');
@@ -463,10 +775,14 @@
       const backend = raw.slice(0, sep);
       const model = raw.slice(sep + 2);
       if (BACKEND_IDS.includes(backend)) {
+        console.info('[muster][picker-change]', { raw, backend, model, isTrusted: e.isTrusted });
         tasks.setModelSelection(backend as WebviewBackendId, model);
       }
     } else if (BACKEND_IDS.includes(raw)) {
+      console.info('[muster][picker-change]', { raw, backend: raw, model: null, isTrusted: e.isTrusted });
       tasks.setBackend(raw as WebviewBackendId);
+    } else {
+      console.warn('[muster][picker-change] unparsed', { raw, isTrusted: e.isTrusted });
     }
   }
 </script>
@@ -479,40 +795,67 @@
   ondragleave={onDragLeave}
   ondrop={onDrop}
 >
-  {#if mode === 'task'}
+  {#if mode === 'task' && turnPresentation.showStrip}
     <div
-      class={`cli-status-bar cli-status-bar--${cliPresentation.tone}`}
-      data-cli-status={cliStatus}
+      class={`turn-activity-bar turn-activity-bar--${turnPresentation.tone}`}
+      data-turn-activity={turnActivity}
       role="status"
       aria-live="polite"
-      use:tip={cliPresentation.detail}
+      use:tip={turnPresentation.detail}
     >
       <span
-        class="codicon codicon-{cliPresentation.icon}"
-        class:codicon-modifier-spin={cliStatus === 'running'}
+        class="codicon codicon-{turnPresentation.icon}"
+        class:codicon-modifier-spin={turnActivity === 'executing'}
         aria-hidden="true"
       ></span>
-      <span class="cli-status-bar__label">{cliPresentation.label}</span>
-      <span class="cli-status-bar__sep" aria-hidden="true">·</span>
-      <span class="cli-status-bar__hint">
-        {cliExitHint ?? cliPresentation.hint}
-      </span>
+      <span class="turn-activity-bar__label">{turnPresentation.label}</span>
+      <span class="turn-activity-bar__sep" aria-hidden="true">·</span>
+      <span class="turn-activity-bar__hint">{turnPresentation.hint}</span>
     </div>
   {/if}
 
-  {#if disabledReason}
-    <div class="composer-guidance" role="note">{disabledReason}</div>
+  {#if isDraggingFile}
+    <div class="composer-drop-status" role="status" aria-live="polite">
+      {isExplorerDrag
+        ? 'Hold Shift and drop to mention the file (Explorer / Finder)'
+        : 'Drop file to mention it'}
+    </div>
   {/if}
 
-  <vscode-textarea
-    bind:this={textareaEl}
-    rows={3}
-    placeholder={placeholder}
-    disabled={!canSend}
-    oninput={onComposerInput}
-    onkeydown={onKeydown}
-    style="width: 100%;"
-  ></vscode-textarea>
+  {#if dropFeedback}
+    <div class="composer-guidance composer-guidance--error" role="alert">{dropFeedback}</div>
+  {/if}
+
+  {#if composerNote}
+    <div
+      class="composer-guidance"
+      role="note"
+      data-composer-guidance={blockReason ? 'blocked' : liveComposerGuidance ? 'live' : 'info'}
+    >
+      {composerNote}
+    </div>
+  {/if}
+
+  <!-- Layered input: highlight backdrop + transparent textarea (Cursor-style live chips). -->
+  <div class="composer-input" class:composer-input--disabled={!canSend}>
+    <div
+      bind:this={highlightEl}
+      class="composer-input__highlight"
+      aria-hidden="true"
+    >{@html draftHighlightHtml}</div>
+    <textarea
+      bind:this={textareaEl}
+      class="composer-input__textarea"
+      rows={3}
+      placeholder={placeholder}
+      disabled={!canSend}
+      value={draftText}
+      oninput={onDraftInput}
+      onscroll={syncHighlightScroll}
+      onkeydown={onKeydown}
+      spellcheck="true"
+    ></textarea>
+  </div>
 
   {#if slashSuggestions.length > 0}
     <div class="slash-command-menu" role="listbox" aria-label="Muster commands">
@@ -558,7 +901,6 @@
         {#key pickerRemountKey}
           <vscode-single-select
             bind:this={backendSelect}
-            value={currentPickerValue}
             use:tip={modelsLoaded
               ? 'Select backend + model for the new task'
               : 'Loading models from installed CLIs… (shows backends first)'}
@@ -569,7 +911,9 @@
             style="width: fit-content; min-width: fit-content; max-width: 100%;"
           >
             {#each pickerOptions as opt (opt.value)}
-              <vscode-option value={opt.value}>{opt.label}</vscode-option>
+              <vscode-option value={opt.value} selected={opt.value === currentPickerValue}
+                >{opt.label}</vscode-option
+              >
             {/each}
           </vscode-single-select>
         {/key}
@@ -577,9 +921,9 @@
         <div
           class="px-2 py-0.5 text-xs rounded border truncate"
           style="border-color: var(--vscode-panel-border); opacity: 0.85;"
-          use:tip={'Backend for this task'}
+          use:tip={'Backend + model for this task'}
         >
-          {backendShortLabel(currentBackend)}
+          {backendModelLabel(currentBackend, tasks.focusedTask?.model)}
         </div>
       {/if}
 
@@ -641,27 +985,47 @@
           class="icon-btn"
           style="width: 28px; height: 28px;"
           onclick={cancel}
-          aria-label="Stop"
-          use:tip={'Stop'}
+          aria-label="Stop this turn"
+          use:tip={'Stop this turn'}
         >
           <span class="codicon codicon-debug-stop"></span>
         </button>
-      {:else if canSend}
-        <button
-          type="button"
-          class="icon-btn"
-          style="width: 28px; height: 28px;"
-          onclick={send}
-          aria-label="Send"
-          use:tip={'Send'}
-        >
-          <span class="codicon codicon-send"></span>
-        </button>
-      {:else if (runtime === 'queued' || taskStatus === 'queued') && turnId}
-        <span class="task-muted text-xs">Queued turn is waiting to resume.</span>
+      {/if}
+      {#if canSend}
+        {#if !canCancel}
+          <button
+            type="button"
+            class="icon-btn"
+            style="width: 28px; height: 28px;"
+            onclick={send}
+            aria-label="Send"
+            use:tip={
+              mode === 'task' && (runtime === 'running' || taskStatus === 'running')
+                ? 'Enter queues a follow-up; Ctrl+Enter interrupts and sends'
+                : isTerminalReopenable
+                  ? 'Send a message to reopen this task'
+                  : 'Send'
+            }
+          >
+            <span class="codicon codicon-send"></span>
+          </button>
+        {/if}
+        {#if mode === 'task' && (runtime === 'running' || taskStatus === 'running')}
+          <button
+            type="button"
+            class="icon-btn"
+            style="width: 28px; height: 28px;"
+            onclick={sendLiveInput}
+            aria-label="Interrupt and send"
+            use:tip={'Ctrl+Enter: interrupt & send (cut & continue)'}
+            data-testid="composer-live-inject"
+          >
+            <span class="codicon codicon-debug-line-by-line"></span>
+          </button>
+        {/if}
       {:else if (runtime === 'needs_recovery' || taskStatus === 'needs_recovery') && !turnId}
         <span class="task-muted text-xs">Recovery actions need a retryable turn.</span>
-      {:else if thread.running}
+      {:else if mode === 'draft' && thread.running}
         <button
           type="button"
           class="icon-btn"

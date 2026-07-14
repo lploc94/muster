@@ -114,8 +114,37 @@ export function canPromoteTurn(
     return { ok: false, reason: 'task already has an active turn' };
   }
 
+  // FIFO: only the earliest still-queued, promotable turn for this task may run.
+  // Held follow-ups (holdAutoPromote) do not block a later safe auto-retry.
+  const earlierQueued = turnsForTask(file, turn.taskId).find(
+    (t) =>
+      t.id !== turnId &&
+      t.status === 'queued' &&
+      t.holdAutoPromote !== true &&
+      (t.sequence < turn.sequence ||
+        (t.sequence === turn.sequence &&
+          (t.createdAt < turn.createdAt ||
+            (t.createdAt === turn.createdAt && t.id < turn.id)))),
+  );
+  if (earlierQueued) {
+    return { ok: false, reason: 'earlier queued turn must run first' };
+  }
+
   if (dependenciesBlockTask(file, turn.taskId)) {
     return { ok: false, reason: 'dependencies not satisfied' };
+  }
+
+  // Open composer may accept sends while task.wait is active; do not promote early.
+  if (task.wait?.kind === 'children') {
+    return { ok: false, reason: 'waiting on child tasks' };
+  }
+  if (task.wait?.kind === 'external') {
+    return { ok: false, reason: 'waiting on external blocker' };
+  }
+
+  // Pre-failure FIFO holds require explicit resume (not auto-promote).
+  if (turn.holdAutoPromote) {
+    return { ok: false, reason: 'held after previous turn failure' };
   }
 
   if (countRunningTurns(file) >= limits.maxConcurrentTurns) {
@@ -149,7 +178,12 @@ export function canPromoteTurn(
 export function pickRunnableTurns(file: TaskStoreFile, limits: ResourceLimits): string[] {
   const queued = Object.values(file.turns)
     .filter((t) => t.status === 'queued')
-    .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+    .sort(
+      (a, b) =>
+        a.sequence - b.sequence ||
+        a.createdAt.localeCompare(b.createdAt) ||
+        a.id.localeCompare(b.id),
+    );
 
   const promoted: string[] = [];
   let draft = file;

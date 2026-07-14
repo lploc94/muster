@@ -88,10 +88,10 @@ describe('task status dual-axis presentation', () => {
     });
 
     expect(presentation.lifecycle.label).toBe('Open');
-    expect(presentation.runtime?.label).toBe('Running');
-    expect(presentation.label).toBe('Running');
+    expect(presentation.runtime?.label).toBe('Working');
+    expect(presentation.label).toBe('Working');
     expect(presentation.listCopy).toContain('Open');
-    expect(presentation.workspaceDetail).toContain('CLI process');
+    expect(presentation.workspaceDetail).toMatch(/turn is executing/i);
   });
 
   it('uses failed lifecycle (soft) without treating it as hard terminal', () => {
@@ -108,17 +108,20 @@ describe('task status dual-axis presentation', () => {
     expect(isTaskStatusTerminal('failed')).toBe(false);
   });
 
-  it('marks succeeded/cancelled/skipped as hard terminal', () => {
+  it('marks succeeded/cancelled/skipped as hard terminal with reopen guidance', () => {
     for (const lifecycle of ['succeeded', 'cancelled', 'skipped'] as const) {
       expect(isHardTerminal(lifecycle)).toBe(true);
       expect(isTaskStatusTerminal(lifecycle)).toBe(true);
-      expect(getLifecyclePresentation(lifecycle).composerGuidance).toMatch(/closed|new task/i);
+      const guidance = getLifecyclePresentation(lifecycle).composerGuidance;
+      expect(guidance).toMatch(new RegExp(`This task is ${lifecycle}`, 'i'));
+      expect(guidance).toMatch(/reopen/i);
+      expect(guidance).toMatch(/new message|Sending/i);
     }
   });
 
   it('exposes labels through the presentation lookup', () => {
     expect(taskStatusLabel('waiting_dependencies')).toBe('Waiting on dependencies');
-    expect(getTaskStatusPresentation('needs_recovery').workspaceHeadline).toMatch(/recovery/i);
+    expect(getTaskStatusPresentation('needs_recovery').workspaceHeadline).toMatch(/could not finish/i);
   });
 
   it('falls back safely for malformed host values', () => {
@@ -142,11 +145,31 @@ describe('task status dual-axis presentation', () => {
     }
   });
 
-  it('blocks composer only for busy runtime activities', () => {
-    expect(runtimeBlocksComposer('running')).toBe(true);
+  it('keeps composer open while running or queued for FIFO follow-ups and live inject', () => {
+    expect(runtimeBlocksComposer('running')).toBe(false);
+    expect(runtimeBlocksComposer('queued')).toBe(false);
     expect(runtimeBlocksComposer('idle')).toBe(false);
     expect(runtimeBlocksComposer(null)).toBe(false);
     expect(runtimeBlocksComposer('awaiting_outcome')).toBe(false);
+  });
+
+  it('blocks free-form composer only for waiting_user (Phase B)', () => {
+    expect(runtimeBlocksComposer('waiting_user')).toBe(true);
+    expect(runtimeBlocksComposer('needs_recovery')).toBe(false);
+    expect(runtimeBlocksComposer('waiting_dependencies')).toBe(false);
+    expect(runtimeBlocksComposer('waiting_children')).toBe(false);
+    expect(runtimeBlocksComposer('blocked')).toBe(false);
+  });
+
+  it('describes queue and live-inject affordances while a turn is running', () => {
+    const presentation = getTaskPresentation({
+      lifecycle: 'open',
+      runtimeActivity: 'running',
+      viewStatus: 'running',
+    });
+    expect(presentation.composerGuidance).toMatch(/Enter queues/i);
+    expect(presentation.composerGuidance).toMatch(/Ctrl\+Enter/i);
+    expect(presentation.composerGuidance).not.toMatch(/disabled while a turn is running/i);
   });
 
   it('matches protocol hard-terminal helpers', async () => {
