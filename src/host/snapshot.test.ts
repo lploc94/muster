@@ -563,6 +563,65 @@ describe('host task snapshot projection', () => {
     expect(projectCurrentTurnActivity(pureStopFile, 't')).toBeNull();
   });
 
+  it('projects wait continuation and recovery previews when no user message', () => {
+    const file: TaskStoreFile = {
+      schemaVersion: 2,
+      revision: 1,
+      tasks: { t: task('t', { role: 'coordinator', goal: 'Wait UX' }) },
+      turns: {
+        wait: turn({
+          id: 'wait',
+          taskId: 't',
+          sequence: 2,
+          status: 'queued',
+          trigger: 'engine',
+          inputs: [{ kind: 'child_results', taskIds: ['c1'] }],
+          createdAt: '2026-07-06T00:02:00.000Z',
+        }),
+        recovery: turn({
+          id: 'recovery',
+          taskId: 't',
+          sequence: 3,
+          status: 'queued',
+          trigger: 'engine',
+          inputs: [
+            {
+              kind: 'recovery',
+              interruptedTurnId: 'live',
+              instruction: 'retry carefully',
+            },
+          ],
+          createdAt: '2026-07-06T00:03:00.000Z',
+        }),
+        user: turn({
+          id: 'user',
+          taskId: 't',
+          sequence: 4,
+          status: 'queued',
+          inputs: [{ kind: 'message', messageId: 'msg-user' }],
+          createdAt: '2026-07-06T00:04:00.000Z',
+        }),
+      },
+      messages: {
+        'msg-user': message({
+          id: 'msg-user',
+          taskId: 't',
+          role: 'user',
+          content: '  real user follow-up  ',
+          state: 'pending',
+        }),
+      },
+      operations: {},
+      cancelRequests: {},
+    };
+    const queued = projectQueuedTurns(file, 't');
+    expect(queued.map((q) => q.previewText)).toEqual([
+      'Continuation after wait',
+      'Recovery turn',
+      'real user follow-up',
+    ]);
+  });
+
   it('excludes queued-turn user messages from transcript but projects queue previewText', () => {
     const file: TaskStoreFile = {
       schemaVersion: 2,

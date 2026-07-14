@@ -512,11 +512,16 @@ function messageIdsForTurn(turn: TaskTurn): string[] {
     .map((input) => input.messageId);
 }
 
+/** Stable host labels for engine-queued turns without user message text (W5). */
+export const QUEUED_PREVIEW_WAIT_CONTINUATION = 'Continuation after wait';
+export const QUEUED_PREVIEW_RECOVERY = 'Recovery turn';
+
 /**
- * FIFO queued follow-up turns for a task. Excludes live/settled turns so S03/S04
- * can key edit/delete and composer feedback off dedicated turn identity.
+ * Preview for a queued turn. Prefer user message text; if inputs are only
+ * child_results / recovery (or empty), return a stable host label so the UI
+ * never shows "(empty queued message)".
  */
-function previewTextForQueuedTurn(file: TaskStoreFile, turn: TaskTurn): string {
+export function previewTextForQueuedTurn(file: TaskStoreFile, turn: TaskTurn): string {
   const parts: string[] = [];
   for (const messageId of messageIdsForTurn(turn)) {
     const message = file.messages[messageId];
@@ -524,7 +529,19 @@ function previewTextForQueuedTurn(file: TaskStoreFile, turn: TaskTurn): string {
     const text = message.content.trim();
     if (text) parts.push(text);
   }
-  return parts.join('\n');
+  if (parts.length > 0) return parts.join('\n');
+
+  const hasRecovery = turn.inputs.some((i) => i.kind === 'recovery');
+  if (hasRecovery) return QUEUED_PREVIEW_RECOVERY;
+
+  const hasChildResults = turn.inputs.some((i) => i.kind === 'child_results');
+  if (hasChildResults) return QUEUED_PREVIEW_WAIT_CONTINUATION;
+
+  // Engine-queued with no user text (edge): still non-empty for UX.
+  if (turn.trigger === 'engine' || turn.trigger === 'retry') {
+    return QUEUED_PREVIEW_WAIT_CONTINUATION;
+  }
+  return '';
 }
 
 export function projectQueuedTurns(file: TaskStoreFile, taskId: string): QueuedTurnProjection[] {
