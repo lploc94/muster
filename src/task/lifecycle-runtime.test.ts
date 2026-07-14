@@ -71,6 +71,19 @@ function makeEngine(store: TaskStore, makeBackend: (name: string) => Backend): T
   });
 }
 
+/** Sequence-1 freezes host context into the prompt; turn 2+ is user text only. */
+function expectPromptSequence(prompts: string[], messages: string[]): void {
+  expect(prompts).toHaveLength(messages.length);
+  for (let i = 0; i < messages.length; i++) {
+    if (i === 0) {
+      expect(prompts[i]).toContain('# Muster host context');
+      expect(prompts[i]).toContain(messages[i]);
+    } else {
+      expect(prompts[i]).toBe(messages[i]);
+    }
+  }
+}
+
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
   const deadline = Date.now() + 1_000;
   while (Date.now() < deadline) {
@@ -266,7 +279,7 @@ describe('task lifecycle runtime regression harness', () => {
       state: 'assigned',
       turnId: followUp.id,
     });
-    expect(prompts).toEqual(['first prompt', 'follow-up prompt']);
+    expectPromptSequence(prompts, ['first prompt', 'follow-up prompt']);
 
     secondGate.release();
     await engine.whenIdle();
@@ -375,7 +388,7 @@ describe('task lifecycle runtime regression harness', () => {
     });
     firstGate.release();
     await waitFor(() => runCount === 2, 'second FIFO turn to start');
-    expect(prompts).toEqual(['prompt-a', 'prompt-b']);
+    expectPromptSequence(prompts, ['prompt-a', 'prompt-b']);
 
     const snapshotDuringSecond = buildSnapshot(store, 'fifo-multi');
     expect(snapshotDuringSecond.activeTurnId).toBe(second.value.turnId);
@@ -387,7 +400,7 @@ describe('task lifecycle runtime regression harness', () => {
     });
     secondGate.release();
     await waitFor(() => runCount === 3, 'third FIFO turn to start');
-    expect(prompts).toEqual(['prompt-a', 'prompt-b', 'prompt-c']);
+    expectPromptSequence(prompts, ['prompt-a', 'prompt-b', 'prompt-c']);
 
     expect(engine.stageDisposition(third.value.turnId, { kind: 'idle' }, 'op-c')).toEqual({
       ok: true,
@@ -478,7 +491,7 @@ describe('task lifecycle runtime regression harness', () => {
     });
     firstGate.release();
     await waitFor(() => runCount === 2, 'surviving queued turn to start');
-    expect(prompts).toEqual(['prompt-a', 'prompt-c']);
+    expectPromptSequence(prompts, ['prompt-a', 'prompt-c']);
 
     // Stale mutation against the now-running survivor fails closed.
     const rev = turnFile(store).revision;
@@ -498,7 +511,7 @@ describe('task lifecycle runtime regression harness', () => {
     });
     secondGate.release();
     await engine.whenIdle();
-    expect(prompts).toEqual(['prompt-a', 'prompt-c']);
+    expectPromptSequence(prompts, ['prompt-a', 'prompt-c']);
   });
 
   it('drains free-floating pending sends as one-message FIFO turns, never batched', async () => {
@@ -588,7 +601,7 @@ describe('task lifecycle runtime regression harness', () => {
     });
     secondGate.release();
     await waitFor(() => runCount === 3, 'second free-floating drain turn to start');
-    expect(prompts).toEqual(['prompt-a', 'prompt-b', 'prompt-c']);
+    expectPromptSequence(prompts, ['prompt-a', 'prompt-b', 'prompt-c']);
 
     const thirdTurn = Object.values(turnFile(store).turns).find(
       (turn) =>
@@ -617,7 +630,7 @@ describe('task lifecycle runtime regression harness', () => {
     for (const turn of allTurns) {
       expect(turn.inputs.filter((input) => input.kind === 'message')).toHaveLength(1);
     }
-    expect(prompts).toEqual(['prompt-a', 'prompt-b', 'prompt-c']);
+    expectPromptSequence(prompts, ['prompt-a', 'prompt-b', 'prompt-c']);
   });
 
   it('leaves pending sends untouched when the active turn terminally completes the task', async () => {
