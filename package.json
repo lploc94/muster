@@ -69,6 +69,34 @@
             "Allow read-only tool calls, deny all writes/commands without prompting."
           ],
           "description": "How Muster handles agent tool-permission requests. 'ask' (safe): auto-allow read-only, prompt for writes/commands. 'allow': auto-approve everything (less safe). 'readonly': deny all writes/commands."
+        },
+        "muster.taskTypes": {
+          "type": "object",
+          "default": {},
+          "scope": "resource",
+          "description": "Named task type presets (id → { backend, model?, role?, briefKind?, description? }). Coordinators create children by taskType; backend/model are optional user overrides only. Empty registry fails closed.",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["backend"],
+            "properties": {
+              "backend": { "type": "string", "description": "ACP backend id (e.g. codex, grok, opencode)." },
+              "model": { "type": "string", "description": "Optional ACP model id for this type." },
+              "role": {
+                "type": "string",
+                "enum": ["coordinator", "worker"],
+                "description": "Default child role (default worker)."
+              },
+              "briefKind": {
+                "type": "string",
+                "enum": ["coordinate", "plan", "implement", "test", "verify", "research", "generic"],
+                "description": "Default brief.kind preamble for children of this type."
+              },
+              "description": {
+                "type": "string",
+                "description": "Short selection help for coordinators (max 200 chars)."
+              }
+            }
+          }
         }
       }
     },

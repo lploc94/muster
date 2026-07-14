@@ -133,6 +133,11 @@ export interface TaskEngineConfig {
   getHostEnvironment?: () => HostEnvironmentSnapshot | undefined;
   /** Fallback cwd when task.cwd and snapshot.cwd are absent. */
   workspaceFolder?: string;
+  /**
+   * Task-types W2: live cwd-aware registry from host settings.
+   * Passed through to GraphEngineDeps for create/list.
+   */
+  getTaskTypeRegistry?: (cwd?: string) => import('./task-types').TaskTypeRegistryResult;
 }
 
 export type EngineResult<T> =
@@ -518,6 +523,9 @@ export class TaskEngine {
   private readonly prepareHostEnvironment?: () => Promise<void>;
   private readonly getHostEnvironment?: () => HostEnvironmentSnapshot | undefined;
   private readonly workspaceFolder?: string;
+  private readonly getTaskTypeRegistry?: (
+    cwd?: string,
+  ) => import('./task-types').TaskTypeRegistryResult;
   /**
    * In-process handles for currently executing turns. Keyed by turnId so live
    * input can route only to a run this engine owns, with the exact backend
@@ -570,6 +578,7 @@ export class TaskEngine {
     this.prepareHostEnvironment = config.prepareHostEnvironment;
     this.getHostEnvironment = config.getHostEnvironment;
     this.workspaceFolder = config.workspaceFolder;
+    this.getTaskTypeRegistry = config.getTaskTypeRegistry;
   }
 
   /** 2s-capped host prepare before sequence-1 assemble (single freeze site). */
@@ -655,6 +664,9 @@ export class TaskEngine {
         ? () => this.getHostEnvironment!()
         : undefined,
       workspaceFolder: this.workspaceFolder,
+      getTaskTypeRegistry: this.getTaskTypeRegistry
+        ? (cwd) => this.getTaskTypeRegistry!(cwd)
+        : undefined,
       leaseOwnerAlive: (turnId) => leaseOwnerAlive(this.storePath, turnId),
       ownsLease: (turnId) => ownsLocalLease(this.storePath, turnId),
       writeCancelRequest: (turnId, kind, by, opId, sealedBy) => {

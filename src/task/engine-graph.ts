@@ -163,6 +163,11 @@ export interface GraphEngineDeps {
   /** W3: sync host env cache for get_host_context (same as first-turn inject). */
   getHostEnvironment?: () => HostEnvironmentSnapshot | undefined;
   workspaceFolder?: string;
+  /**
+   * Task-types W2: live cwd-aware registry (VS Code muster.taskTypes).
+   * Missing hook → treated as empty at create/list sites.
+   */
+  getTaskTypeRegistry?: (cwd?: string) => import('./task-types').TaskTypeRegistryResult;
   leaseOwnerAlive: (turnId: string) => boolean;
   ownsLease: (turnId: string) => boolean;
   writeCancelRequest: (

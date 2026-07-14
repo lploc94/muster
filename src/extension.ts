@@ -33,6 +33,11 @@ import {
   handleRetentionSettingUpdateAction,
   type RetentionSettingSnapshot,
 } from './host/retention-settings';
+import {
+  TASK_TYPES_CONFIG_KEY,
+  TASK_TYPES_CONFIG_SECTION,
+  loadTaskTypeRegistry,
+} from './host/task-types-config';
 import { detectAvailableBackends, installAugmentedPath } from './host/backend-availability';
 import {
   parseComposerSelection,
@@ -130,6 +135,21 @@ function getHostEnvironment(): HostEnvironmentSnapshot | undefined {
     ...hostEnvCache,
     trusted: vscode.workspace.isTrusted,
   };
+}
+
+/** Live resource-scoped muster.taskTypes for caller cwd (or workspace default). */
+function getTaskTypeRegistry(cwd?: string) {
+  return loadTaskTypeRegistry((folderCwd) => {
+    const resource =
+      typeof folderCwd === 'string' && folderCwd.length > 0
+        ? vscode.Uri.file(folderCwd)
+        : undefined;
+    const cfg = vscode.workspace.getConfiguration(
+      TASK_TYPES_CONFIG_SECTION,
+      resource,
+    );
+    return cfg.get(TASK_TYPES_CONFIG_KEY);
+  }, cwd);
 }
 let presentationManager: PresentationManager | undefined;
 let lastObservedRevision = 0;
@@ -2460,6 +2480,7 @@ export async function activate(context: vscode.ExtensionContext) {
       prepareHostEnvironment,
       getHostEnvironment,
       workspaceFolder: resolveTaskCwd(),
+      getTaskTypeRegistry,
       emit: (event) => {
         try {
           provider.forwardTurnEvent(event);
