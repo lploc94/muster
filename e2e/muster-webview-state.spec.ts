@@ -959,11 +959,14 @@ test.describe('Muster webview host state smoke', () => {
     await expect(page.getByPlaceholder('Search tasks…')).toBeVisible();
     await page.getByRole('button', { name: 'Settings' }).click();
     await expectPostedMessage(page, { type: 'requestSettings' });
+    await expectPostedMessage(page, { type: 'requestTaskTypesSettings' });
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
     await expect(page.getByText('Backed by VS Code configuration')).toBeVisible();
     await expect(page.getByText('Retention keeps recent task history usable without storing unlimited completed-turn output.')).toBeVisible();
     await expect(page.getByRole('status').getByText('Loading retention settings from VS Code…')).toBeVisible();
-    await expect(page.getByPlaceholder('Search tasks…')).toBeVisible();
+    // Full-view Settings replaces the task list (not an overlay).
+    await expect(page.getByPlaceholder('Search tasks…')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Back to tasks' })).toBeVisible();
 
     await postRawHostMessage(page, {
       type: 'settingsSnapshot',
@@ -989,7 +992,11 @@ test.describe('Muster webview host state smoke', () => {
       },
     });
 
-    await expect(page.getByRole('status').getByText('Settings ready. Edit one field at a time; each Save writes only that VS Code setting.')).toBeVisible();
+    await expect(
+      page
+        .getByRole('status')
+        .getByText('Edit one retention field at a time; each Save writes only that VS Code setting.'),
+    ).toBeVisible();
     await expect(page.getByLabel('Maximum turns per task')).toHaveValue('200');
     await expect(page.getByLabel('Maximum stored output characters')).toHaveValue('200000');
     await expect(page.getByText('Minimum 1. Default 200.')).toBeVisible();
@@ -1038,7 +1045,7 @@ test.describe('Muster webview host state smoke', () => {
       )
       .toBe(true);
 
-    await page.getByRole('button', { name: 'Close settings' }).click();
+    await page.getByRole('button', { name: 'Back to tasks' }).click();
     await expect(page.getByRole('heading', { name: 'Settings' })).toHaveCount(0);
     await expect(page.getByPlaceholder('Search tasks…')).toBeVisible();
 
@@ -1064,7 +1071,9 @@ test.describe('Muster webview host state smoke', () => {
     await page.getByRole('button', { name: 'Settings' }).click();
     await expectPostedMessage(page, { type: 'requestSettings' });
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
-    await page.getByRole('button', { name: 'Close settings' }).click();
+    // Full-view Settings hides chat until Back.
+    await expect(page.getByText('Chat context remains visible.')).toHaveCount(0);
+    await page.getByRole('button', { name: 'Back to tasks' }).click();
     await expect(page.getByRole('heading', { name: 'Settings' })).toHaveCount(0);
     await expect(page.getByText('Chat context remains visible.')).toBeVisible();
     await expect(page.getByRole('alert').getByText('Host command remains visible.')).toBeVisible();
