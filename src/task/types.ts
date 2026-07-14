@@ -6,8 +6,22 @@ export interface TaskDependency {
   requiredOutcome: 'succeeded' | 'settled';
   onUnsatisfied: 'block' | 'fail' | 'skip';
 }
+export type WaitWakeOn = 'terminal' | 'needs_attention';
+
 export type PersistedWait =
-  | { kind: 'children'; taskIds: string[]; registeredByTurnId: string }
+  | {
+      kind: 'children';
+      taskIds: string[];
+      registeredByTurnId: string;
+      /**
+       * W6: events that re-enter the parent. New waits default to both;
+       * missing on load → terminal-only (legacy).
+       */
+      wakeOn?: WaitWakeOn[];
+      phase?: 'active' | 'suspended_attention';
+      attentionContinuationTurnId?: string;
+      terminalObserved?: Record<string, 'succeeded' | 'failed' | 'cancelled' | 'skipped'>;
+    }
   | { kind: 'external'; key: string; message?: string };
 export type TaskCapability =
   | 'create_child' | 'start_child' | 'wait_child'

@@ -2,6 +2,7 @@ import { evaluateDependency } from './deps';
 import { isActiveHandoffPhase } from './engine-handoff';
 import type { ResourceLimits } from './limits';
 import { evaluateTaskReadiness, readinessToPromoteReason } from './readiness';
+import { hasResourceConflict } from './resources';
 import type { TaskStoreFile, TaskTurn } from './types';
 
 const LIVE_STATUSES: ReadonlySet<TaskTurn['status']> = new Set(['running', 'waiting_user']);
@@ -179,6 +180,12 @@ export function canPromoteTurn(
   const sessionId = task.committedSessionId;
   if (sessionId && isSessionBusy(file, sessionId)) {
     return { ok: false, reason: 'session already has a running turn' };
+  }
+
+  // W7: shared-cwd path/git serialization (same commit gate as promote).
+  const resource = hasResourceConflict(file, turn.taskId);
+  if (resource.conflict) {
+    return { ok: false, reason: resource.reason };
   }
 
   return { ok: true };

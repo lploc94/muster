@@ -504,6 +504,10 @@ export function applySuccessfulTurn(
               kind: 'children',
               taskIds: [...disposition.taskIds],
               registeredByTurnId: turn.id,
+              // W6: new waits default to terminal + attention wake.
+              wakeOn: ['terminal', 'needs_attention'],
+              phase: 'active',
+              terminalObserved: {},
             },
             outcomeProposal: undefined,
           }),
@@ -1000,11 +1004,29 @@ function hasContinuationForWait(
   );
 }
 
+/**
+ * Effective wakeOn for a children wait.
+ * Missing field (legacy) → terminal only; new waits store both explicitly.
+ */
+export function effectiveWaitWakeOn(
+  wait: Extract<MusterTask['wait'], { kind: 'children' }>,
+): Array<'terminal' | 'needs_attention'> {
+  if (!wait.wakeOn || wait.wakeOn.length === 0) {
+    return ['terminal'];
+  }
+  return wait.wakeOn;
+}
+
 export function resolveChildWait(
   task: MusterTask,
   childLifecycles: ReadonlyMap<string, TaskLifecycleState>,
   turns: readonly TaskTurn[],
-  options: { continuationTurnId: string; now: string },
+  options: {
+    continuationTurnId: string;
+    now: string;
+    /** Child attention map for needs_attention wake (W6). */
+    childAttention?: ReadonlyMap<string, { code: string } | undefined>;
+  },
 ): TransitionResult<{ task: MusterTask; turn?: TaskTurn }> {
   if (isTerminalLifecycle(task.lifecycle)) {
     return { ok: false, reason: 'task is terminal' };
@@ -1026,7 +1048,75 @@ export function resolveChildWait(
     return { ok: false, reason: 'task has no children wait' };
   }
 
+  const wakeOn = effectiveWaitWakeOn(wait);
+  const terminalObserved = { ...(wait.terminalObserved ?? {}) };
+  for (const childId of wait.taskIds) {
+    const lifecycle = childLifecycles.get(childId);
+    if (
+      lifecycle === 'succeeded' ||
+      lifecycle === 'failed' ||
+      lifecycle === 'cancelled' ||
+      lifecycle === 'skipped'
+    ) {
+      terminalObserved[childId] = lifecycle;
+    }
+  }
+
+  // Attention wake: one continuation while suspended; do not clear terminalObserved.
+  if (
+    wakeOn.includes('needs_attention') &&
+    wait.phase !== 'suspended_attention' &&
+    options.childAttention
+  ) {
+    const attentionChild = wait.taskIds.find((id) => options.childAttention?.get(id));
+    if (attentionChild && !wait.attentionContinuationTurnId) {
+      const attentionTurnId = `${wait.registeredByTurnId}-attention`;
+      if (!turns.some((t) => t.id === attentionTurnId)) {
+        const attentionTurn: TaskTurn = {
+          id: attentionTurnId,
+          taskId: task.id,
+          sequence: nextSequence(turns),
+          trigger: 'engine',
+          status: 'queued',
+          inputs: [{ kind: 'child_results', taskIds: [...wait.taskIds] }],
+          createdAt: options.now,
+        };
+        return {
+          ok: true,
+          next: {
+            task: bumpTask(task, options.now, {
+              wait: {
+                ...wait,
+                phase: 'suspended_attention',
+                attentionContinuationTurnId: attentionTurnId,
+                terminalObserved,
+              },
+            }),
+            turn: attentionTurn,
+          },
+          effects: [{ kind: 'scheduleContinuation', waitTurnId: wait.registeredByTurnId }],
+        };
+      }
+    }
+  }
+
   if (!allChildrenTerminal(wait.taskIds, childLifecycles)) {
+    // Persist observed terminals while still waiting.
+    if (JSON.stringify(terminalObserved) !== JSON.stringify(wait.terminalObserved ?? {})) {
+      return {
+        ok: true,
+        next: {
+          task: bumpTask(task, options.now, {
+            wait: { ...wait, terminalObserved },
+          }),
+        },
+        effects: [],
+      };
+    }
+    return { ok: true, next: { task }, effects: [] };
+  }
+
+  if (!wakeOn.includes('terminal')) {
     return { ok: true, next: { task }, effects: [] };
   }
 

@@ -514,6 +514,9 @@ describe('applySuccessfulTurn', () => {
         kind: 'children',
         taskIds: ['child-1'],
         registeredByTurnId: 't1',
+        wakeOn: ['terminal', 'needs_attention'],
+        phase: 'active',
+        terminalObserved: {},
       });
     }
   });

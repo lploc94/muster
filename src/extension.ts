@@ -2401,6 +2401,7 @@ export async function activate(context: vscode.ExtensionContext) {
       askBridge,
       credentialRegistry,
       bridgePort: port,
+      isWorkspaceTrusted: () => vscode.workspace.isTrusted,
       emit: (event) => {
         try {
           provider.forwardTurnEvent(event);
@@ -2409,6 +2410,16 @@ export async function activate(context: vscode.ExtensionContext) {
         }
       },
     });
+
+    context.subscriptions.push(
+      vscode.workspace.onDidGrantWorkspaceTrust(() => {
+        try {
+          taskEngine?.onWorkspaceTrustGranted();
+        } catch {
+          // best-effort
+        }
+      }),
+    );
 
     if (storePath) {
       const storeDir = path.dirname(storePath);

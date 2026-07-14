@@ -142,6 +142,8 @@ export interface GraphEngineDeps {
   onScheduleTurn: (turnId: string) => void;
   /** W5: rescan queued released turns after lifecycle/resource changes. */
   onRescanSchedulableTurns?: (affectedTaskIds?: readonly string[]) => void;
+  /** W9: workspace trust predicate for create-and-run paths. */
+  isWorkspaceTrusted?: () => boolean;
   leaseOwnerAlive: (turnId: string) => boolean;
   ownsLease: (turnId: string) => boolean;
   writeCancelRequest: (
@@ -280,6 +282,20 @@ export async function executeToolCommand(
   switch (command.kind) {
     case 'create_task':
     case 'delegate_task': {
+      if (
+        command.kind === 'delegate_task' &&
+        deps.isWorkspaceTrusted &&
+        !deps.isWorkspaceTrusted()
+      ) {
+        return {
+          ok: false,
+          error: JSON.stringify({
+            code: 'workspace_untrusted',
+            message: 'workspace is not trusted; cannot run or release tasks',
+            retryable: true,
+          }),
+        };
+      }
       const childId = deriveEntityId(ctx.turnId, command.opId, 'task');
       const turnId = deriveEntityId(ctx.turnId, command.opId, 'turn');
       const backend = deps.makeBackend(command.spec.backend);
@@ -400,6 +416,16 @@ export async function executeToolCommand(
     }
 
     case 'release_tasks': {
+      if (deps.isWorkspaceTrusted && !deps.isWorkspaceTrusted()) {
+        return {
+          ok: false,
+          error: JSON.stringify({
+            code: 'workspace_untrusted',
+            message: 'workspace is not trusted; cannot run or release tasks',
+            retryable: true,
+          }),
+        };
+      }
       const scheduledTurnIds: string[] = [];
       const commit = deps.store.commit((draft) => {
         ensureCoordinationMaps(draft);

@@ -50,12 +50,13 @@ export const DEFAULT_EXECUTION_POLICY_BOUNDS: ExecutionPolicyBounds = {
 };
 
 /**
- * Independent hard cap on a bridge bearer token's lifetime. This is deliberately
- * decoupled from {@link ExecutionPolicyBounds.maxTurnTimeoutMs}: even a large (but
- * clamped) turn timeout must never mint a local credential that outlives this
- * bound. See {@link bridgeTokenTtlMs}.
+ * Soft default ceiling for bridge bearer tokens when turnTimeout is small.
+ * W8: token lifetime must cover the turn budget — bridgeTokenTtlMs uses
+ * max(turnTimeoutMs, this floor) then applies a hard safety cap.
  */
 export const MAX_BRIDGE_TOKEN_TTL_MS = 900_000; // 15 minutes
+/** Absolute hard cap (2h) so a misconfigured turnTimeout cannot mint multi-day tokens. */
+export const HARD_BRIDGE_TOKEN_TTL_MS = 7_200_000;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
@@ -82,17 +83,22 @@ export function clampExecutionPolicy(
 }
 
 /**
- * TTL for a bridge bearer token, capped by an independent hard bound. Even a large
- * (already clamped) turn timeout must never produce a token that lives longer than
- * `maxTtlMs`, keeping local credentials short-lived. Negative/NaN inputs collapse
- * to 0 (an immediately-expired token) rather than a long-lived one.
+ * TTL for a bridge bearer token (W8): must cover turnTimeoutMs so complete_task
+ * remains authorized for the full turn. Soft default MAX_BRIDGE_TOKEN_TTL_MS when
+ * turnTimeout is smaller; hard cap HARD_BRIDGE_TOKEN_TTL_MS (or maxTtlMs override).
+ * Negative/NaN inputs collapse to 0.
  */
 export function bridgeTokenTtlMs(
   turnTimeoutMs: number,
-  maxTtlMs: number = MAX_BRIDGE_TOKEN_TTL_MS,
+  maxTtlMs: number = HARD_BRIDGE_TOKEN_TTL_MS,
 ): number {
-  const requested = Number.isFinite(turnTimeoutMs) ? Math.max(0, turnTimeoutMs) : 0;
-  return Math.min(requested, maxTtlMs);
+  if (!Number.isFinite(turnTimeoutMs) || turnTimeoutMs <= 0) {
+    return 0;
+  }
+  const requested = turnTimeoutMs;
+  // Cover at least the turn budget; soft floor for short turns (W8).
+  const softFloor = Math.min(MAX_BRIDGE_TOKEN_TTL_MS, maxTtlMs);
+  return Math.min(Math.max(requested, softFloor), maxTtlMs);
 }
 
 export type LimitKind =

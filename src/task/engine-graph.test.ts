@@ -6,7 +6,11 @@ import { AskBridge } from '../bridge/ask-bridge';
 import { CredentialRegistry } from '../bridge/credentials';
 import { deriveEntityId, issueTurnCredential, type GraphEngineDeps } from './engine-graph';
 import { TaskEngine } from './engine';
-import { DEFAULT_EXECUTION_POLICY_BOUNDS, MAX_BRIDGE_TOKEN_TTL_MS } from './limits';
+import {
+  DEFAULT_EXECUTION_POLICY_BOUNDS,
+  HARD_BRIDGE_TOKEN_TTL_MS,
+  MAX_BRIDGE_TOKEN_TTL_MS,
+} from './limits';
 import { TaskStore } from './store';
 import type { Backend, BackendCapabilities, NormalizedEvent, RunOptions } from '../types';
 
@@ -463,8 +467,8 @@ describe('engine graph orchestration', () => {
     expect(token).toBeDefined();
     const verified = credentials.verify(token!)!;
     const remainingMs = verified.expiry - before;
-    // TTL is pinned to the independent cap, not the absurd turn timeout.
+    // W8: token covers turn budget up to hard cap (not soft 15m floor only).
     expect(remainingMs).toBeGreaterThan(MAX_BRIDGE_TOKEN_TTL_MS - 1_000);
-    expect(remainingMs).toBeLessThanOrEqual(MAX_BRIDGE_TOKEN_TTL_MS + 1_000);
+    expect(remainingMs).toBeLessThanOrEqual(HARD_BRIDGE_TOKEN_TTL_MS + 1_000);
   });
 });

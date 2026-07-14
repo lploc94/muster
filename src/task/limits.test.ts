@@ -84,15 +84,18 @@ describe('clampExecutionPolicy', () => {
 });
 
 describe('bridgeTokenTtlMs', () => {
-  it('passes a normal turn timeout through when it is below the cap', () => {
-    expect(bridgeTokenTtlMs(300_000)).toBe(300_000);
+  it('covers turn timeout and floors short turns to soft default', () => {
+    expect(bridgeTokenTtlMs(300_000)).toBe(MAX_BRIDGE_TOKEN_TTL_MS);
+    expect(bridgeTokenTtlMs(60_000)).toBe(MAX_BRIDGE_TOKEN_TTL_MS);
   });
 
-  it('caps a turn timeout at the independent hard bound', () => {
-    expect(bridgeTokenTtlMs(DEFAULT_EXECUTION_POLICY_BOUNDS.maxTurnTimeoutMs)).toBe(
-      MAX_BRIDGE_TOKEN_TTL_MS,
-    );
-    expect(bridgeTokenTtlMs(Number.MAX_SAFE_INTEGER)).toBe(MAX_BRIDGE_TOKEN_TTL_MS);
+  it('covers turn timeouts larger than soft default (W8)', () => {
+    const long = 1_200_000;
+    expect(bridgeTokenTtlMs(long)).toBe(long);
+  });
+
+  it('caps at hard bound', () => {
+    expect(bridgeTokenTtlMs(Number.MAX_SAFE_INTEGER)).toBe(7_200_000);
   });
 
   it('honours a custom cap', () => {
@@ -102,14 +105,6 @@ describe('bridgeTokenTtlMs', () => {
   it('collapses invalid inputs to an immediately-expired token', () => {
     expect(bridgeTokenTtlMs(-5)).toBe(0);
     expect(bridgeTokenTtlMs(Number.NaN)).toBe(0);
-  });
-
-  it('is a genuinely independent cap below the maximum clamped turn timeout', () => {
-    // The whole point of the cap: even a maximum-clamped turn timeout mints a
-    // shorter-lived token than the turn itself is allowed to run.
-    expect(MAX_BRIDGE_TOKEN_TTL_MS).toBeLessThan(
-      DEFAULT_EXECUTION_POLICY_BOUNDS.maxTurnTimeoutMs,
-    );
   });
 });
 

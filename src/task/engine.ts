@@ -110,8 +110,11 @@ export interface TaskEngineConfig {
   bridgePort?: number;
   resourceLimits?: ResourceLimits;
   emit?: (e: EngineEvent) => void;
-  /** When false, reload reconciliation preserves queued turns without scheduling them. Default true. */
-
+  /**
+   * W9: workspace trust gate for create-and-run / promote. Default true (tests).
+   * Host should pass `() => vscode.workspace.isTrusted`.
+   */
+  isWorkspaceTrusted?: () => boolean;
 }
 
 export type EngineResult<T> =
@@ -493,6 +496,7 @@ export class TaskEngine {
   private readonly bridgePort: number;
   private readonly resourceLimits: ResourceLimits;
   private readonly emit?: (e: EngineEvent) => void;
+  private readonly isWorkspaceTrusted: () => boolean;
   /**
    * In-process handles for currently executing turns. Keyed by turnId so live
    * input can route only to a run this engine owns, with the exact backend
@@ -541,6 +545,26 @@ export class TaskEngine {
     this.bridgePort = config.bridgePort ?? 0;
     this.resourceLimits = config.resourceLimits ?? DEFAULT_RESOURCE_LIMITS;
     this.emit = config.emit;
+    this.isWorkspaceTrusted = config.isWorkspaceTrusted ?? (() => true);
+  }
+
+  /** W9: host calls when workspace trust is granted — rescan safe queued work. */
+  onWorkspaceTrustGranted(): void {
+    this.rescanSchedulableTurns();
+  }
+
+  private requireWorkspaceTrusted(): EngineResult<void> {
+    if (this.isWorkspaceTrusted()) {
+      return { ok: true, value: undefined };
+    }
+    return {
+      ok: false,
+      reason: JSON.stringify({
+        code: 'workspace_untrusted',
+        message: 'workspace is not trusted; cannot run or release tasks',
+        retryable: true,
+      }),
+    };
   }
 
   private safeEmit(event: EngineEvent): void {
@@ -565,6 +589,7 @@ export class TaskEngine {
       pendingAskPromises: this.pendingAskPromises,
       onScheduleTurn: (turnId) => void this.scheduleTurn(turnId),
       onRescanSchedulableTurns: (ids) => this.rescanSchedulableTurns(ids),
+      isWorkspaceTrusted: () => this.isWorkspaceTrusted(),
       leaseOwnerAlive: (turnId) => leaseOwnerAlive(this.storePath, turnId),
       ownsLease: (turnId) => ownsLocalLease(this.storePath, turnId),
       writeCancelRequest: (turnId, kind, by, opId, sealedBy) => {
@@ -798,6 +823,8 @@ export class TaskEngine {
     /** Phase C idempotent send key. */
     clientRequestId?: string;
   }): EngineResult<{ taskId: string; messageId: string; turnId: string; clientRequestId?: string }> {
+    const trust = this.requireWorkspaceTrusted();
+    if (!trust.ok) return trust;
     const backend = this.makeBackend(params.backend);
     if (!canBindTaskToBackend(backend.capabilities)) {
       return { ok: false, reason: 'backend does not support MCP' };
@@ -2069,6 +2096,8 @@ export class TaskEngine {
     taskId: string,
     inputs: TurnInput[] = [],
   ): EngineResult<{ turnId: string }> {
+    const trust = this.requireWorkspaceTrusted();
+    if (!trust.ok) return trust;
     const turnId = randomUUID();
     const now = nowIso(this.clock);
     const commit = this.store.commit((draft) => {
@@ -2900,29 +2929,63 @@ export class TaskEngine {
     }
   }
 
-  /** Every persisted queued turn survives reload unscheduled until an explicit resume. */
+  /**
+   * W9 reload: hold uncertain / non-safe queued turns; auto-resume
+   * safe_never_dispatched released engine turns when workspace trusted.
+   */
   private deferReloadQueuedTurns(): void {
     const file = this.store.getFile();
+    const trusted = this.isWorkspaceTrusted();
     for (const turn of Object.values(file.turns)) {
-      if (turn.status === 'queued') {
+      if (turn.status !== 'queued') continue;
+      const task = file.tasks[turn.taskId];
+      const releaseState =
+        task?.releaseState ?? (Object.values(file.turns).some((t) => t.taskId === turn.taskId) ? 'released' : 'draft');
+      // safe_never_dispatched: never running, no prompt dispatch phase (or only pre-queue).
+      const safeNeverDispatched =
+        !turn.dispatchPhase ||
+        turn.dispatchPhase === 'pre_dispatch';
+      const safeRetry =
+        turn.retryOf &&
+        file.turns[turn.retryOf]?.failureClass === 'safe_to_retry';
+      if (
+        trusted &&
+        releaseState === 'released' &&
+        (safeNeverDispatched || safeRetry) &&
+        turn.holdAutoPromote !== true
+      ) {
+        // Eligible for auto-resume — do not defer (or clear if safe retry).
+        if (safeRetry) {
+          this.deferredQueuedTurns.delete(turn.id);
+          const retryIndex = Math.max(
+            1,
+            retryCountOf(
+              Object.values(file.turns).filter((t) => t.taskId === turn.taskId),
+              turn.id,
+            ),
+          );
+          const baseMs = Math.min(30_000, 250 * 2 ** Math.min(retryIndex - 1, 6));
+          const jitter = Math.floor(Math.random() * Math.min(500, baseMs));
+          setTimeout(() => {
+            void this.scheduleTurn(turn.id);
+          }, baseMs + jitter);
+        } else if (
+          turn.trigger === 'engine' &&
+          safeNeverDispatched &&
+          !turn.id.endsWith('-continuation') &&
+          !turn.id.endsWith('-attention')
+        ) {
+          // Auto-resume safe released first-turn intents (not wait continuations).
+          setTimeout(() => {
+            void this.scheduleTurn(turn.id);
+          }, 0);
+        } else {
+          // Continuations and user turns stay deferred until explicit resume / settle.
+          this.deferredQueuedTurns.add(turn.id);
+        }
+      } else {
         this.deferredQueuedTurns.add(turn.id);
       }
-    }
-    // Phase C: auto-reschedule durable safe retries that were mid-backoff across reload.
-    for (const turn of Object.values(file.turns)) {
-      if (turn.status !== 'queued' || !turn.retryOf) continue;
-      const pred = file.turns[turn.retryOf];
-      if (!pred || pred.failureClass !== 'safe_to_retry') continue;
-      this.deferredQueuedTurns.delete(turn.id);
-      const retryIndex = Math.max(1, retryCountOf(
-        Object.values(file.turns).filter((t) => t.taskId === turn.taskId),
-        turn.id,
-      ));
-      const baseMs = Math.min(30_000, 250 * 2 ** Math.min(retryIndex - 1, 6));
-      const jitter = Math.floor(Math.random() * Math.min(500, baseMs));
-      setTimeout(() => {
-        void this.scheduleTurn(turn.id);
-      }, baseMs + jitter);
     }
   }
 
@@ -2983,10 +3046,15 @@ export class TaskEngine {
           return { ok: true };
         }
         const childLifecycles = new Map<string, TaskLifecycleState>();
+        const childAttention = new Map<string, { code: string } | undefined>();
         for (const childId of draftTask.wait.taskIds) {
-          const lifecycle = draft.tasks[childId]?.lifecycle;
+          const child = draft.tasks[childId];
+          const lifecycle = child?.lifecycle;
           if (lifecycle) {
             childLifecycles.set(childId, lifecycle);
+          }
+          if (child?.attention) {
+            childAttention.set(childId, { code: child.attention.code });
           }
         }
         const turnCap = canCreateTurn(draft, task.id, this.resourceLimits);
@@ -2997,7 +3065,7 @@ export class TaskEngine {
           draftTask,
           childLifecycles,
           turnsForTask(draft, task.id),
-          { continuationTurnId, now },
+          { continuationTurnId, now, childAttention },
         );
         if (!result.ok) {
           return result;
@@ -3012,13 +3080,21 @@ export class TaskEngine {
         continue;
       }
       const continuation = this.store.getFile().turns[continuationTurnId];
-      if (continuation?.status !== 'queued') {
-        continue;
-      }
-      if (schedule) {
-        void this.scheduleTurn(continuationTurnId);
-      } else {
-        this.deferredQueuedTurns.add(continuationTurnId);
+      // Schedule terminal continuation and/or attention continuation (W6).
+      const updated = this.store.getFile().tasks[task.id];
+      const attentionTurnId =
+        updated?.wait?.kind === 'children'
+          ? updated.wait.attentionContinuationTurnId
+          : undefined;
+      for (const id of [continuationTurnId, attentionTurnId]) {
+        if (!id) continue;
+        const cont = this.store.getFile().turns[id];
+        if (cont?.status !== 'queued') continue;
+        if (schedule) {
+          void this.scheduleTurn(id);
+        } else {
+          this.deferredQueuedTurns.add(id);
+        }
       }
     }
   }
@@ -3161,6 +3237,9 @@ export class TaskEngine {
     this.reconcileTaskTimeouts();
     this.applyDependencyTerminals();
     processCancelRequests(this.graphDeps());
+    if (!this.isWorkspaceTrusted()) {
+      return Promise.resolve();
+    }
     const turn = this.store.getFile().turns[turnId];
     if (turn && this.exceedsTurnLimit(turn.taskId, turnId)) {
       return Promise.resolve();
