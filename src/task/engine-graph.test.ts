@@ -289,6 +289,86 @@ describe('engine graph orchestration', () => {
     expect(store.getTask(delId)?.backend).toBe('claude');
   });
 
+  it('delegate_task with opencode-go/deepseek-v4-flash pins model through to RunOptions', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-graph-model-'));
+    const store = TaskStore.load({ filePath: path.join(dir, '.muster-tasks.json') });
+    const credentials = new CredentialRegistry();
+    const askBridge = new AskBridge();
+    const capturedModels: Array<string | undefined> = [];
+    const backend: Backend = {
+      name: 'opencode',
+      capabilities: MCP_CAPS,
+      async *run(options: RunOptions) {
+        capturedModels.push(options.model);
+        yield { type: 'sessionStarted', sessionId: `sess-${capturedModels.length}` };
+        yield { type: 'turnCompleted' };
+      },
+    };
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => backend,
+      askBridge,
+      credentialRegistry: credentials,
+      bridgePort: 19999,
+      clock: () => '2026-07-06T12:00:00.000Z',
+    });
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'opencode',
+      role: 'coordinator',
+      capabilities: ['create_child', 'wait_child', 'read_subtree'],
+    });
+    // Seed a synthetic open turn for tool credentials without running a real coord turn.
+    store.commit((draft) => {
+      draft.turns['coord-turn'] = {
+        id: 'coord-turn',
+        taskId: 'coord',
+        sequence: 1,
+        trigger: 'user',
+        status: 'running',
+        inputs: [],
+        createdAt: '2026-07-06T12:00:00.000Z',
+        startedAt: '2026-07-06T12:00:00.000Z',
+      };
+      draft.tasks.coord = {
+        ...draft.tasks.coord!,
+        releaseState: 'released',
+        revision: draft.tasks.coord!.revision + 1,
+        updatedAt: '2026-07-06T12:00:00.000Z',
+      };
+      return { ok: true };
+    });
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId: 'coord-turn',
+      allowedActions: new Set(['delegate_task', 'complete_task']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    const MODEL = 'opencode-go/deepseek-v4-flash';
+    const result = await engine.handleToolCall(ctx, 'delegate_task', {
+      kind: 'delegate_task',
+      opId: 'op-oc-model',
+      spec: {
+        goal: 'quick research',
+        backend: 'opencode',
+        model: MODEL,
+        role: 'worker',
+      },
+    });
+    expect(result.ok).toBe(true);
+    const childId = deriveEntityId('coord-turn', 'op-oc-model', 'task');
+    expect(store.getTask(childId)?.model).toBe(MODEL);
+    expect(store.getTask(childId)?.backend).toBe('opencode');
+
+    await engine.whenIdle();
+    // Child is the only turn that should have run.
+    expect(capturedModels).toContain(MODEL);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('cancel_task via coordinator terminally cancels a child subtree and queued turns', async () => {
     const { store, engine, credentials } = makeHarness();
     engine.createTask({

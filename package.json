@@ -102,6 +102,7 @@
     "mvp:kiro": "tsx scripts/test-kiro.ts",
     "mvp:codex": "tsx scripts/test-codex.ts",
     "mvp:opencode": "tsx scripts/test-opencode.ts",
+    "smoke:child-model-opencode": "npm run compile && node scripts/smoke-child-model-opencode.mjs",
     "vendor:codex-acp": "node scripts/vendor-codex-acp.mjs",
     "vendor:claude-acp": "node scripts/vendor-claude-acp.mjs",
     "mvp:task": "tsx scripts/test-task.ts",

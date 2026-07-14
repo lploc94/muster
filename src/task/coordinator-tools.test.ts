@@ -162,6 +162,36 @@ describe('coordinator-tools dispatch', () => {
     }
   });
 
+  it('accepts opencode provider/model ids with slash', () => {
+    const result = dispatch(
+      'delegate_task',
+      {
+        opId: 'op-1',
+        goal: 'fast plan',
+        backend: 'opencode',
+        model: 'opencode-go/deepseek-v4-flash',
+      },
+      ctx(['delegate_task']),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && result.command.kind === 'delegate_task') {
+      expect(result.command.spec.backend).toBe('opencode');
+      expect(result.command.spec.model).toBe('opencode-go/deepseek-v4-flash');
+    }
+  });
+
+  it('omits model when empty string', () => {
+    const result = dispatch(
+      'create_task',
+      { opId: 'op-1', goal: 'x', backend: 'opencode', model: '' },
+      ctx(['create_task']),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && result.command.kind === 'create_task') {
+      expect(result.command.spec.model).toBeUndefined();
+    }
+  });
+
   it('maps release_tasks to ToolCommand', () => {
     const result = dispatch(
       'release_tasks',
