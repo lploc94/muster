@@ -424,6 +424,22 @@ function isInteger(v: unknown): v is number {
   return isNumber(v) && Number.isInteger(v);
 }
 
+/** Basename-only export file names — never path segments or drive prefixes. */
+function isExportResultFileName(v: unknown): v is string {
+  if (typeof v !== 'string') return false;
+  const name = v.trim();
+  if (name.length === 0) return false;
+  if (/[\\/]/.test(name) || /^[A-Za-z]:/.test(name)) return false;
+  return true;
+}
+
+/** Host export timestamps are ISO-8601 (`Date.toISOString()`). */
+function isExportResultTimestamp(v: unknown): v is string {
+  if (typeof v !== 'string' || v.trim() === '') return false;
+  const ms = Date.parse(v);
+  return !Number.isNaN(ms);
+}
+
 function isRetentionSettingId(v: unknown): v is RetentionSettingId {
   return v === 'maxTurnsPerTask' || v === 'maxStoredOutputChars';
 }
@@ -773,9 +789,9 @@ export function isExtMessage(data: unknown): data is ExtMessage {
       return (
         hasOnlyKeys(data, ['type', 'taskId', 'fileName', 'sourceRevision', 'exportedAt']) &&
         isString(data.taskId) &&
-        isString(data.fileName) &&
-        isNumber(data.sourceRevision) &&
-        isString(data.exportedAt)
+        isExportResultFileName(data.fileName) &&
+        isInteger(data.sourceRevision) &&
+        isExportResultTimestamp(data.exportedAt)
       );
 
     default:

@@ -1375,7 +1375,7 @@ test.describe('Muster webview host state smoke', () => {
     // No exportResult arrives on cancel; success notice must not appear from silence alone.
     await expect(page.locator('.task-command-notice')).toHaveCount(0);
 
-    // Path-like fileName must not invent a success banner (formatter rejects; message ignored).
+    // Path-like fileName is rejected by protocol guard before formatting (no banner).
     await postRawHostMessage(page, {
       type: 'exportResult',
       taskId: 'task-export',

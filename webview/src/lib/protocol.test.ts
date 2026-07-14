@@ -539,6 +539,72 @@ describe('task export protocol', () => {
         sourceRevision: 11,
         exportedAt: '2026-07-14T12:00:00.000Z',
       },
+      // Path-like / blank basenames — drop before formatExportResultMessage.
+      {
+        type: 'exportResult',
+        taskId: 'task-a',
+        fileName: 'C:\\Users\\secret\\export.md',
+        sourceRevision: 11,
+        exportedAt: '2026-07-14T12:00:00.000Z',
+      },
+      {
+        type: 'exportResult',
+        taskId: 'task-a',
+        fileName: '/tmp/export.md',
+        sourceRevision: 11,
+        exportedAt: '2026-07-14T12:00:00.000Z',
+      },
+      {
+        type: 'exportResult',
+        taskId: 'task-a',
+        fileName: 'nested/export.md',
+        sourceRevision: 11,
+        exportedAt: '2026-07-14T12:00:00.000Z',
+      },
+      {
+        type: 'exportResult',
+        taskId: 'task-a',
+        fileName: '   ',
+        sourceRevision: 11,
+        exportedAt: '2026-07-14T12:00:00.000Z',
+      },
+      // Non-integer / non-finite revisions.
+      {
+        type: 'exportResult',
+        taskId: 'task-a',
+        fileName: 'export.md',
+        sourceRevision: 11.5,
+        exportedAt: '2026-07-14T12:00:00.000Z',
+      },
+      {
+        type: 'exportResult',
+        taskId: 'task-a',
+        fileName: 'export.md',
+        sourceRevision: Number.NaN,
+        exportedAt: '2026-07-14T12:00:00.000Z',
+      },
+      {
+        type: 'exportResult',
+        taskId: 'task-a',
+        fileName: 'export.md',
+        sourceRevision: Number.POSITIVE_INFINITY,
+        exportedAt: '2026-07-14T12:00:00.000Z',
+      },
+      // Malformed timestamps.
+      {
+        type: 'exportResult',
+        taskId: 'task-a',
+        fileName: 'export.md',
+        sourceRevision: 11,
+        exportedAt: '',
+      },
+      {
+        type: 'exportResult',
+        taskId: 'task-a',
+        fileName: 'export.md',
+        sourceRevision: 11,
+        exportedAt: 'not-an-iso-timestamp',
+      },
     ];
     for (const message of malformed) {
       expect(isExtMessage(message), JSON.stringify(message)).toBe(false);
