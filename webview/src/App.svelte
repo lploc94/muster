@@ -10,6 +10,7 @@
   import { threadStore } from './lib/thread.svelte';
   import {
     effectiveRuntimeActivity,
+    formatExportResultMessage,
     formatLiveInputDeliveredMessage,
     isExtMessage,
     isProtocolCompatible,
@@ -452,6 +453,17 @@
           }
           break;
 
+        case 'exportResult':
+          // Success notice is task-scoped; basename-only fileName + sourceRevision.
+          // Failures use commandError; cancel posts nothing from the host.
+          if (isTaskScopedBannerVisible(msg.taskId, tasks.focusedTaskId)) {
+            tasks.setCommandNotice(
+              formatExportResultMessage(msg.fileName, msg.sourceRevision),
+              msg.taskId,
+            );
+          }
+          break;
+
         case 'backendsAvailable':
           tasks.setAvailableBackends(msg.backends);
           break;
@@ -546,7 +558,7 @@
 {#if visibleCommandNotice}
   <div class="task-command-notice" role="status">
     <div class="min-w-0">
-      <div class="font-semibold">Live input</div>
+      <div class="font-semibold">Status</div>
       <div class="task-command-notice__detail">{visibleCommandNotice.message}</div>
     </div>
     <button

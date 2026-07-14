@@ -117,6 +117,8 @@
     "test:file-drop-live-evidence": "node --test scripts/verify-file-drop-live-host-evidence.test.mjs",
     "test:file-drop-docs": "node --test scripts/verify-file-drop-docs.test.mjs",
     "test:queue-live-inject-docs": "node --test scripts/verify-queue-live-inject-docs.test.mjs",
+    "test:task-export-docs": "node --test scripts/verify-task-export-docs.test.mjs",
+    "test:task-export-live-evidence": "node --test scripts/verify-task-export-live-host-evidence.test.mjs",
     "test:live-inject-smoke": "node --test scripts/verify-live-inject-smoke.test.mjs",
     "test:watch": "vitest",
     "check:svelte": "svelte-check --workspace webview --tsconfig ./tsconfig.json",

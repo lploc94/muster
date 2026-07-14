@@ -43,6 +43,7 @@ import { pickWorkspaceFileMentionPath } from './host/workspace-files';
 import { resolveDroppedFileMention } from './host/file-mentions';
 import { routeSendLiveInput } from './host/live-input';
 import { routeDeleteQueuedTurn, routeEditQueuedTurn } from './host/queued-turn-mutations';
+import { routeExportTask } from './host/task-export-route';
 import { importDroppedFileBytes } from './host/import-dropped-file';
 import { PresentationManager } from './host/presentation-manager';
 import {
@@ -916,6 +917,43 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     this.postSnapshot(this.focusedTaskId);
   }
 
+  /**
+   * Export one task as Markdown via native Save As. Read-only store access;
+   * never mutates task-store state. Cancel is intentionally silent.
+   */
+  private async handleExportTask(data: unknown): Promise<void> {
+    if (!taskStore) {
+      this.postCommandError('task store not ready');
+      return;
+    }
+    const store = taskStore;
+    const outcome = await routeExportTask(data, {
+      getStoreFile: () => store.getFile(),
+      showSaveDialog: async ({ defaultFileName }) => {
+        const defaultUri = workspaceRoot
+          ? vscode.Uri.file(path.join(workspaceRoot, defaultFileName))
+          : vscode.Uri.file(defaultFileName);
+        const uri = await vscode.window.showSaveDialog({
+          defaultUri,
+          filters: { Markdown: ['md'] },
+          saveLabel: 'Export',
+        });
+        // vscode.Uri satisfies TaskExportUri (fsPath/path); absolute paths never leave the route.
+        return uri;
+      },
+      writeFile: async (uri, content) => {
+        await vscode.workspace.fs.writeFile(uri as vscode.Uri, content);
+      },
+      exportedAt: new Date().toISOString(),
+    });
+    if (outcome.kind === 'cancel') {
+      return;
+    }
+    for (const message of outcome.messages) {
+      this.post(message);
+    }
+  }
+
   private transcriptItemFromMessage(messageId: string): TranscriptItem | undefined {
     if (!taskStore) {
       return undefined;
@@ -1742,6 +1780,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           if (typeof data.taskId === 'string' && typeof data.goal === 'string') {
             this.handleRenameTask(data.taskId, data.goal);
           }
+          break;
+        case 'exportTask':
+          await this.handleExportTask(data);
           break;
         case 'blurTask':
           // Webview returned to the task list; drop the host-side focus so a

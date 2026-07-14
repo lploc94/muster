@@ -15,6 +15,7 @@ vi.mock('./vscode', () => ({
 
 import {
   PROTOCOL_VERSION,
+  formatExportResultMessage,
   formatLiveInputDeliveredMessage,
   isExtMessage,
   isProtocolCompatible,
@@ -471,5 +472,112 @@ describe('composer selection protocol', () => {
       backend: 'grok',
       model: 'm1',
     });
+  });
+});
+
+describe('task export protocol', () => {
+  it('posts exportTask as a distinct OutMessage with taskId only', () => {
+    vi.mocked(vscode.postMessage).mockClear();
+
+    const message: OutMessage = { type: 'exportTask', taskId: 'task-a' };
+    post(message);
+
+    expect(vscode.postMessage).toHaveBeenCalledWith({ type: 'exportTask', taskId: 'task-a' });
+    expect(message.type).not.toBe('deleteTask');
+    expect(message.type).not.toBe('clearHistory');
+  });
+
+  it('accepts a well-formed exportResult from the host (basename only)', () => {
+    expect(
+      isExtMessage({
+        type: 'exportResult',
+        taskId: 'task-a',
+        fileName: 'ship-readable-export.md',
+        sourceRevision: 11,
+        exportedAt: '2026-07-14T12:00:00.000Z',
+      }),
+    ).toBe(true);
+  });
+
+  it('rejects malformed exportResult payloads', () => {
+    const malformed = [
+      { type: 'exportResult' },
+      {
+        type: 'exportResult',
+        taskId: 'task-a',
+        fileName: 'ship-readable-export.md',
+        sourceRevision: 11,
+      },
+      {
+        type: 'exportResult',
+        taskId: 'task-a',
+        fileName: 'ship-readable-export.md',
+        sourceRevision: '11',
+        exportedAt: '2026-07-14T12:00:00.000Z',
+      },
+      {
+        type: 'exportResult',
+        taskId: 'task-a',
+        fileName: 42,
+        sourceRevision: 11,
+        exportedAt: '2026-07-14T12:00:00.000Z',
+      },
+      {
+        type: 'exportResult',
+        taskId: 'task-a',
+        fileName: 'ship-readable-export.md',
+        sourceRevision: 11,
+        exportedAt: '2026-07-14T12:00:00.000Z',
+        extra: true,
+      },
+      {
+        type: 'exportResult',
+        taskId: 'task-a',
+        // Absolute path must not be accepted as a distinct path field.
+        path: 'C:\\Users\\secret\\exports\\ship-readable-export.md',
+        fileName: 'ship-readable-export.md',
+        sourceRevision: 11,
+        exportedAt: '2026-07-14T12:00:00.000Z',
+      },
+    ];
+    for (const message of malformed) {
+      expect(isExtMessage(message), JSON.stringify(message)).toBe(false);
+    }
+  });
+
+  it('keeps commandError as the visible refusal channel for export failures', () => {
+    expect(
+      isExtMessage({
+        type: 'commandError',
+        taskId: 'task-a',
+        message: 'Unable to write the exported Markdown file.',
+      }),
+    ).toBe(true);
+  });
+
+  it('formats a task-scoped export success notice with basename and source revision', () => {
+    const message = formatExportResultMessage('ship-readable-export.md', 11);
+    expect(message.length).toBeGreaterThan(0);
+    expect(message).toContain('ship-readable-export.md');
+    expect(message).toContain('11');
+    expect(message.toLowerCase()).toMatch(/export|saved/);
+    // Never surface path separators or absolute destinations in the notice.
+    expect(message).not.toMatch(/[\\/]/);
+    expect(message).not.toMatch(/[A-Za-z]:/);
+  });
+
+  it('rejects blank file names and absolute-path-like values when formatting export notices', () => {
+    expect(() => formatExportResultMessage('', 1)).toThrow(/fileName/i);
+    expect(() => formatExportResultMessage('   ', 1)).toThrow(/fileName/i);
+    expect(() => formatExportResultMessage('C:\\Users\\secret\\export.md', 1)).toThrow(/fileName/i);
+    expect(() => formatExportResultMessage('/tmp/export.md', 1)).toThrow(/fileName/i);
+    expect(() => formatExportResultMessage('nested/export.md', 1)).toThrow(/fileName/i);
+  });
+
+  it('rejects non-finite source revisions when formatting export notices', () => {
+    expect(() => formatExportResultMessage('export.md', Number.NaN)).toThrow(/sourceRevision/i);
+    expect(() => formatExportResultMessage('export.md', Number.POSITIVE_INFINITY)).toThrow(
+      /sourceRevision/i,
+    );
   });
 });
