@@ -1,9 +1,12 @@
 import type { Question } from '../bridge/ask-bridge';
 import { deriveRuntimeActivity, deriveViewStatus } from '../task/derived-status';
 import { dependenciesBlockTask } from '../task/scheduler';
+import { sanitizeHandoffFailureMessage } from '../task/store';
 import type { TaskStore } from '../task/store';
 import type {
   MusterTask,
+  TaskHandoffPhase,
+  TaskHandoffState,
   TaskLifecycleState,
   TaskMessageState,
   TaskRole,
@@ -35,6 +38,33 @@ export type TurnActivity =
   | { state: 'uncertain'; turnId: string; requiresConfirmation: true }
   | null;
 
+/**
+ * Sanitized, task-scoped handoff chrome for the webview.
+ * Never includes digests, summary/bootstrap bodies, session ids, or credentials.
+ */
+export interface HandoffProgressBinding {
+  backend: string;
+  model?: string;
+}
+
+export interface HandoffProgressFailure {
+  code: string;
+  message: string;
+  at: string;
+}
+
+export interface HandoffProgress {
+  operationId: string;
+  phase: TaskHandoffPhase;
+  source: HandoffProgressBinding;
+  target: HandoffProgressBinding;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  failure?: HandoffProgressFailure;
+}
+
 export interface TaskSummary {
   id: string;
   parentId: string | null;
@@ -61,6 +91,12 @@ export interface TaskSummary {
   /** Optional model id selected for this task (ACP session config option value). */
   model?: string;
   continuationOf?: string;
+  /**
+   * Optional sanitized handoff progress for model-switch chrome (D018 / §19).
+   * Omitted when the task has no handoff. Never carries digests, session ids,
+   * or summary/bootstrap bodies — those stay off TaskSummary and chat.
+   */
+  handoffProgress?: HandoffProgress;
 }
 
 export interface ToolTranscriptContent {
@@ -281,6 +317,51 @@ export function projectCurrentTurnActivity(file: TaskStoreFile, taskId: string):
   return { state: 'failed_turn', turnId: latest.id, retryable: true };
 }
 
+function projectHandoffBinding(binding: {
+  backend: string;
+  model?: string;
+}): HandoffProgressBinding {
+  return binding.model
+    ? { backend: binding.backend, model: binding.model }
+    : { backend: binding.backend };
+}
+
+/**
+ * Project durable TaskHandoff state into omission-safe chrome progress.
+ * Labels + phase + timestamps + bounded failure only — never digests, bodies,
+ * or session identifiers (MEM156 / D018).
+ */
+export function projectHandoffProgress(
+  handoff: TaskHandoffState | undefined,
+): HandoffProgress | undefined {
+  if (!handoff) {
+    return undefined;
+  }
+  const progress: HandoffProgress = {
+    operationId: handoff.operationId,
+    phase: handoff.phase,
+    source: projectHandoffBinding(handoff.source),
+    target: projectHandoffBinding(handoff.target),
+    createdAt: handoff.createdAt,
+    updatedAt: handoff.updatedAt,
+  };
+  if (handoff.startedAt) {
+    progress.startedAt = handoff.startedAt;
+  }
+  if (handoff.finishedAt) {
+    progress.finishedAt = handoff.finishedAt;
+  }
+  if (handoff.failure) {
+    progress.failure = {
+      code: handoff.failure.code,
+      // Re-sanitize at the projection boundary so raw/legacy failure text cannot leak.
+      message: sanitizeHandoffFailureMessage(handoff.failure.message),
+      at: handoff.failure.at,
+    };
+  }
+  return progress;
+}
+
 export function projectTaskSummary(file: TaskStoreFile, taskId: string): TaskSummary | undefined {
   const task = file.tasks[taskId];
   if (!task) {
@@ -288,6 +369,7 @@ export function projectTaskSummary(file: TaskStoreFile, taskId: string): TaskSum
   }
   const turns = turnsForTask(file, taskId);
   const deps = depLifecyclesForTask(file, task);
+  const handoffProgress = projectHandoffProgress(task.handoff);
   return {
     id: task.id,
     parentId: task.parentId,
@@ -302,6 +384,7 @@ export function projectTaskSummary(file: TaskStoreFile, taskId: string): TaskSum
     backend: task.backend,
     model: task.model,
     continuationOf: task.continuationOf,
+    ...(handoffProgress ? { handoffProgress } : {}),
   };
 }
 

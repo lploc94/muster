@@ -718,6 +718,72 @@ describe('renderTaskMarkdownExport', () => {
     expect(withNegative).toEqual(withDefault);
     expect(DEFAULT_TASK_MARKDOWN_EXPORT_MAX_CHARS).toBe(1_000_000);
   });
+
+  it('keeps existing export snapshots unchanged when a task carries handoff state', () => {
+    const withoutHandoff = baseFile();
+    const withHandoff = baseFile({
+      tasks: {
+        'task-a': task('task-a', {
+          goal: 'Ship readable export',
+          lifecycle: 'succeeded',
+          backend: 'claude',
+          model: 'sonnet',
+          finishedAt: '2026-07-06T01:00:00.000Z',
+          handoff: {
+            version: 1,
+            operationId: 'hop-export-canary',
+            phase: 'completed',
+            source: { backend: 'claude', model: 'sonnet', sessionId: 'src-handoff-sess' },
+            target: { backend: 'codex', model: 'gpt-5' },
+            conversationContext: {
+              status: 'ready',
+              messageCount: 2,
+              contentDigest: 'export-handoff-digest-SECRET',
+              exportedAt: '2026-07-06T00:50:00.000Z',
+            },
+            sourceSummary: {
+              status: 'unavailable',
+              reason: 'SOURCE_SUMMARY_MUST_NOT_EXPORT',
+            },
+            createdAt: '2026-07-06T00:40:00.000Z',
+            updatedAt: '2026-07-06T00:55:00.000Z',
+            finishedAt: '2026-07-06T00:55:00.000Z',
+            completion: {
+              completedAt: '2026-07-06T00:55:00.000Z',
+              boundBackend: 'codex',
+              boundSessionId: 'tgt-handoff-sess-SECRET',
+            },
+          },
+        }),
+      },
+    });
+
+    const baseline = renderTaskMarkdownExport(withoutHandoff, 'task-a', {
+      exportedAt: EXPORTED_AT,
+    });
+    const withField = renderTaskMarkdownExport(withHandoff, 'task-a', {
+      exportedAt: EXPORTED_AT,
+    });
+    expect(baseline.ok).toBe(true);
+    expect(withField.ok).toBe(true);
+    if (!baseline.ok || !withField.ok) return;
+
+    // Handoff is orthogonal to Markdown export: conversation body is identical.
+    expect(withField.markdown).toBe(baseline.markdown);
+    expect(withField.suggestedFilename).toBe(baseline.suggestedFilename);
+    expect(withField.sourceRevision).toBe(baseline.sourceRevision);
+
+    for (const needle of [
+      'hop-export-canary',
+      'export-handoff-digest-SECRET',
+      'SOURCE_SUMMARY_MUST_NOT_EXPORT',
+      'tgt-handoff-sess-SECRET',
+      'src-handoff-sess',
+      'handoff',
+    ]) {
+      expect(withField.markdown, `export must not leak ${needle}`).not.toContain(needle);
+    }
+  });
 });
 
 describe('suggestTaskMarkdownFilename', () => {

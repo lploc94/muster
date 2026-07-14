@@ -58,6 +58,29 @@ describe('isProtocolCompatible', () => {
   });
 });
 
+const baseTaskSummary = {
+  id: 'task-1',
+  parentId: null,
+  goal: 'Goal',
+  role: 'worker',
+  lifecycle: 'open',
+  viewStatus: 'idle',
+  currentTurnActivity: null,
+  updatedAt: '2026-07-06T00:00:00.000Z',
+  backend: 'claude-cli',
+  model: 'sonnet',
+};
+
+const sanitizedHandoffProgress = {
+  operationId: 'hop-op-1',
+  phase: 'preparing_receiver',
+  source: { backend: 'claude-cli', model: 'sonnet' },
+  target: { backend: 'codex', model: 'gpt-5' },
+  createdAt: '2026-07-06T00:00:00.000Z',
+  updatedAt: '2026-07-06T00:10:00.000Z',
+  startedAt: '2026-07-06T00:00:01.000Z',
+};
+
 describe('isExtMessage snapshot version tolerance', () => {
   const baseSnapshot = { type: 'snapshot', rootTasks: [], storeRevision: 0 };
 
@@ -134,6 +157,113 @@ describe('isExtMessage snapshot version tolerance', () => {
       },
     ];
     for (const message of malformed) {
+      expect(isExtMessage(message), JSON.stringify(message)).toBe(false);
+    }
+  });
+
+  it('accepts optional sanitized handoffProgress on TaskSummary', () => {
+    expect(
+      isExtMessage({
+        ...baseSnapshot,
+        rootTasks: [{ ...baseTaskSummary, handoffProgress: sanitizedHandoffProgress }],
+      }),
+    ).toBe(true);
+
+    expect(
+      isExtMessage({
+        ...baseSnapshot,
+        rootTasks: [
+          {
+            ...baseTaskSummary,
+            handoffProgress: {
+              ...sanitizedHandoffProgress,
+              phase: 'failed',
+              finishedAt: '2026-07-06T00:02:00.000Z',
+              failure: {
+                code: 'receiver_init_failed',
+                message: 'Receiver init failed',
+                at: '2026-07-06T00:02:00.000Z',
+              },
+            },
+          },
+        ],
+      }),
+    ).toBe(true);
+  });
+
+  it('rejects handoffProgress that carries session ids, digests, or extra secret fields', () => {
+    const secretful = [
+      {
+        ...baseSnapshot,
+        rootTasks: [
+          {
+            ...baseTaskSummary,
+            handoffProgress: {
+              ...sanitizedHandoffProgress,
+              source: {
+                backend: 'claude-cli',
+                model: 'sonnet',
+                sessionId: 'src-sess-SECRET',
+              },
+            },
+          },
+        ],
+      },
+      {
+        ...baseSnapshot,
+        rootTasks: [
+          {
+            ...baseTaskSummary,
+            handoffProgress: {
+              ...sanitizedHandoffProgress,
+              contentDigest: 'handoff-digest-SECRET',
+            },
+          },
+        ],
+      },
+      {
+        ...baseSnapshot,
+        rootTasks: [
+          {
+            ...baseTaskSummary,
+            handoffProgress: {
+              ...sanitizedHandoffProgress,
+              sourceSummary: { status: 'ready', contentDigest: 'x' },
+            },
+          },
+        ],
+      },
+      {
+        ...baseSnapshot,
+        rootTasks: [
+          {
+            ...baseTaskSummary,
+            handoffProgress: {
+              ...sanitizedHandoffProgress,
+              phase: 'not-a-phase',
+            },
+          },
+        ],
+      },
+      {
+        ...baseSnapshot,
+        rootTasks: [
+          {
+            ...baseTaskSummary,
+            handoffProgress: {
+              ...sanitizedHandoffProgress,
+              failure: {
+                code: 'receiver_init_failed',
+                message: 'x',
+                at: '2026-07-06T00:02:00.000Z',
+                boundSessionId: 'handoff-bound-session-SECRET',
+              },
+            },
+          },
+        ],
+      },
+    ];
+    for (const message of secretful) {
       expect(isExtMessage(message), JSON.stringify(message)).toBe(false);
     }
   });
@@ -645,5 +775,43 @@ describe('task export protocol', () => {
     expect(() => formatExportResultMessage('export.md', Number.POSITIVE_INFINITY)).toThrow(
       /sourceRevision/i,
     );
+  });
+});
+
+describe('runtime handoff protocol', () => {
+  it('posts requestRuntimeHandoff as a distinct OutMessage with target labels only', () => {
+    vi.mocked(vscode.postMessage).mockClear();
+
+    const message: OutMessage = {
+      type: 'requestRuntimeHandoff',
+      taskId: 'task-1',
+      targetBackend: 'codex',
+      targetModel: 'gpt-5',
+      skipSummary: true,
+    };
+    post(message);
+
+    expect(vscode.postMessage).toHaveBeenCalledWith({
+      type: 'requestRuntimeHandoff',
+      taskId: 'task-1',
+      targetBackend: 'codex',
+      targetModel: 'gpt-5',
+      skipSummary: true,
+    });
+    expect(message.type).not.toBe('exportTask');
+    expect(message.type).not.toBe('setComposerSelection');
+    expect(message.type).not.toBe('continueTask');
+    // Labels only — never session ids on the outbound switch request.
+    expect(JSON.stringify(message)).not.toContain('sessionId');
+  });
+
+  it('keeps commandError as the visible refusal channel for handoff failures', () => {
+    expect(
+      isExtMessage({
+        type: 'commandError',
+        taskId: 'task-1',
+        message: 'Target backend/model is already bound; switch is unchanged.',
+      }),
+    ).toBe(true);
   });
 });

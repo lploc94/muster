@@ -10,6 +10,11 @@
     getTaskPresentation,
   } from '../lib/task-status';
   import type { PendingAsk, TaskLifecycleState } from '../lib/protocol';
+  import {
+    formatHandoffProgressLabel,
+    isHandoffProgressInFlight,
+    isHandoffTerminal,
+  } from '../lib/handoff-progress';
   import { buildDeleteQueuedTurnMessage, queuedTurnControlState } from '../lib/queued-turns';
   import { tip } from '../lib/tooltip';
 
@@ -220,6 +225,21 @@
 
   /** Banner uses lifecycle tone only — turn activity is shown near the composer. */
   const bannerTone = $derived(presentation?.lifecycle.tone ?? 'neutral');
+
+  /** Task-scoped handoff chrome — never chat / transcript. */
+  const handoffProgress = $derived(focused?.handoffProgress);
+  const handoffInFlight = $derived(isHandoffProgressInFlight(handoffProgress));
+  const handoffTerminal = $derived(isHandoffTerminal(handoffProgress?.phase));
+  const handoffChromeLabel = $derived(
+    handoffProgress ? formatHandoffProgressLabel(handoffProgress) : '',
+  );
+  const handoffChromeTone = $derived.by(() => {
+    if (!handoffProgress) return 'muted';
+    if (handoffProgress.phase === 'failed') return 'danger';
+    if (handoffProgress.phase === 'completed') return 'success';
+    if (handoffProgress.phase === 'cancelled') return 'muted';
+    return 'attention';
+  });
 </script>
 
 <div class="flex-1 min-w-0 min-h-0 flex flex-col">
@@ -353,6 +373,20 @@
         {/if}
       </div>
     </div>
+
+    {#if handoffProgress && (handoffInFlight || handoffTerminal)}
+      <div
+        class={`turn-activity-bar turn-activity-bar--${handoffChromeTone} handoff-progress-bar`}
+        data-testid="handoff-progress"
+        data-handoff-phase={handoffProgress.phase}
+        role="status"
+        aria-live="polite"
+        use:tip={'Model switch progress (task chrome only — never shown in chat)'}
+      >
+        <span class="turn-live-dot" aria-hidden="true"></span>
+        <span class="turn-activity-bar__label">{handoffChromeLabel}</span>
+      </div>
+    {/if}
 
     <ChatThread />
 

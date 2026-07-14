@@ -5,8 +5,20 @@ import { AskBridge } from '../bridge/ask-bridge';
 import { CredentialRegistry } from '../bridge/credentials';
 import { runTurn as defaultRunTurn } from '../runner';
 import type { Backend, LiveInputResult, NormalizedEvent, RunOptions } from '../types';
-import type { TurnTrigger } from './types';
+import type { TaskHandoffPhase, TurnTrigger } from './types';
 import { canBindTaskToBackend } from './backend-eligibility';
+import {
+  advanceHandoffToPreparingReceiver,
+  advanceHandoffWithSourceSummary,
+  buildHandoffBootstrapPrompt,
+  buildHandoffPackage,
+  collectInternalSummaryTurnText,
+  digestSourceSummaryText,
+  HANDOFF_SOURCE_SUMMARY_PROMPT,
+  isActiveHandoffPhase,
+  type SourceSummaryOutcome,
+} from './engine-handoff';
+import { TaskHandoff, type TaskHandoffDiagnostics } from './task-handoff';
 import { deriveViewStatus } from './derived-status';
 import type { DepGraph } from './deps';
 import {
@@ -491,6 +503,12 @@ export class TaskEngine {
   private readonly acceptedOpIds = new Map<string, string>();
   private readonly turnPromises = new Map<string, Promise<void>>();
   private readonly pendingAskPromises = new Map<string, { promise: Promise<Answers>; fingerprint: string }>();
+  /**
+   * Ephemeral source-summary text keyed by handoff operationId (D020).
+   * In-process only — never persisted; cleared after transfer/failure.
+   * After reload the map is empty and transfer continues conversation-only.
+   */
+  private readonly handoffSourceSummaryByOperationId = new Map<string, string>();
   private settling = new Set<string>();
 
   private constructor(config: TaskEngineConfig, storePath: string) {
@@ -1107,6 +1125,453 @@ export class TaskEngine {
       return { ok: false, reason: commit.detail ?? commit.reason };
     }
     return { ok: true, value: { taskId } };
+  }
+
+  /**
+   * Start a cross-runtime handoff on an idle task (M010/S02).
+   *
+   * Creates TaskHandoff, exports conversation-context metadata from existing
+   * messages, optionally runs a *hidden* source-summary internal turn against
+   * the current backend (no TaskMessage/TaskTurn rows, no EngineEvent emission),
+   * then advances to preparing_receiver. Never rebinds task.backend / model /
+   * committedSessionId (S03 owns receiver setup). Fail-closed for missing task,
+   * live turns, active handoff, or non-MCP target.
+   *
+   * Summary failure/empty response never blocks preparing_receiver when
+   * conversation context is ready (D017/D018/D019).
+   */
+  async requestRuntimeHandoff(params: {
+    taskId: string;
+    targetBackend: string;
+    targetModel?: string;
+    /**
+     * When true (default), skip the optional source-summary internal turn.
+     * When false, run a hidden summary turn against the source backend.
+     */
+    skipSummary?: boolean;
+  }): Promise<
+    EngineResult<{
+      operationId: string;
+      phase: TaskHandoffPhase;
+      diagnostics: TaskHandoffDiagnostics;
+    }>
+  > {
+    const task = this.store.getTask(params.taskId);
+    if (!task) {
+      return { ok: false, reason: 'task not found' };
+    }
+
+    if (task.handoff && isActiveHandoffPhase(task.handoff.phase)) {
+      return { ok: false, reason: 'active handoff in progress' };
+    }
+
+    const liveOrQueued = pendingTurnsForTask(this.store.getFile(), params.taskId);
+    if (liveOrQueued.length > 0) {
+      return { ok: false, reason: 'task has a live or active turn' };
+    }
+
+    let targetBackend;
+    try {
+      targetBackend = this.makeBackend(params.targetBackend);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { ok: false, reason: `target backend unavailable: ${message}` };
+    }
+    if (!canBindTaskToBackend(targetBackend.capabilities)) {
+      return { ok: false, reason: 'backend does not support MCP' };
+    }
+
+    const now = nowIso(this.clock);
+    const operationId = randomUUID();
+    const handoff = TaskHandoff.create({
+      operationId,
+      source: {
+        backend: task.backend,
+        ...(task.model ? { model: task.model } : {}),
+        ...(task.committedSessionId ? { sessionId: task.committedSessionId } : {}),
+      },
+      target: {
+        backend: params.targetBackend,
+        ...(params.targetModel ? { model: params.targetModel } : {}),
+      },
+      now,
+    });
+
+    const messages = this.store.getMessagesForTask(params.taskId);
+    const wantSummary = params.skipSummary === false;
+
+    let summary: SourceSummaryOutcome;
+    if (!wantSummary) {
+      summary = { kind: 'skipped', reason: 'summary not requested' };
+    } else {
+      summary = await this.runHiddenSourceSummaryTurn(task, now);
+    }
+
+    const advanced = wantSummary
+      ? advanceHandoffWithSourceSummary({
+          handoff,
+          messages,
+          now,
+          operationId,
+          summary,
+        })
+      : advanceHandoffToPreparingReceiver({
+          handoff,
+          messages,
+          now,
+          operationId,
+          skipSummaryReason: 'summary not requested',
+        });
+    if (!advanced.ok) {
+      return { ok: false, reason: advanced.reason };
+    }
+
+    const nextState = advanced.next.toState();
+    const commit = this.store.commit((draft) => {
+      const current = draft.tasks[params.taskId];
+      if (!current) {
+        return { ok: false, reason: 'task not found' };
+      }
+      if (current.handoff && isActiveHandoffPhase(current.handoff.phase)) {
+        return { ok: false, reason: 'active handoff in progress' };
+      }
+      if (pendingTurnsForTask(draft, params.taskId).length > 0) {
+        return { ok: false, reason: 'task has a live or active turn' };
+      }
+      // Persist handoff only — never rebind backend/model/session here.
+      draft.tasks[params.taskId] = {
+        ...current,
+        handoff: nextState,
+        revision: current.revision + 1,
+        updatedAt: now,
+      };
+      return { ok: true };
+    });
+
+    if (!commit.ok) {
+      return { ok: false, reason: commit.detail ?? commit.reason };
+    }
+
+    // Cache raw summary text ephemerally for S03 receiver package (D020).
+    // Only digests live on MusterTask; text is never reloaded after process restart.
+    if (summary.kind === 'ready' && typeof summary.text === 'string' && summary.text.trim().length > 0) {
+      this.handoffSourceSummaryByOperationId.set(operationId, summary.text);
+    }
+
+    return {
+      ok: true,
+      value: {
+        operationId,
+        phase: nextState.phase,
+        diagnostics: advanced.next.toDiagnostics(),
+      },
+    };
+  }
+
+  /**
+   * S03 receiver transfer: build HandoffPackage from visible TaskMessage rows +
+   * optional ephemeral summary, init a *new* target session (no resumeId), capture
+   * sessionStarted id, and atomically rebind backend/model/committedSessionId with
+   * handoff.complete. Source binding is unchanged on init failure (D021).
+   */
+  async completeRuntimeHandoff(params: {
+    taskId: string;
+    operationId?: string;
+  }): Promise<
+    EngineResult<{
+      operationId: string;
+      phase: TaskHandoffPhase;
+      diagnostics: TaskHandoffDiagnostics;
+      boundBackend: string;
+      boundSessionId?: string;
+    }>
+  > {
+    const task = this.store.getTask(params.taskId);
+    if (!task) {
+      return { ok: false, reason: 'task not found' };
+    }
+    if (!task.handoff) {
+      return { ok: false, reason: 'no handoff in progress' };
+    }
+
+    const restored = TaskHandoff.restore(task.handoff);
+    if (!restored.ok) {
+      return { ok: false, reason: restored.reason };
+    }
+    let handoff = restored.next;
+
+    if (params.operationId && params.operationId !== handoff.operationId) {
+      return { ok: false, reason: 'stale operation' };
+    }
+    if (handoff.phase !== 'preparing_receiver') {
+      return { ok: false, reason: `handoff is not preparing_receiver (phase=${handoff.phase})` };
+    }
+    if (pendingTurnsForTask(this.store.getFile(), params.taskId).length > 0) {
+      return { ok: false, reason: 'task has a live or active turn' };
+    }
+
+    const now = nowIso(this.clock);
+    const operationId = handoff.operationId;
+    const state = handoff.toState();
+
+    const transferring = handoff.beginTransfer({ now, operationId });
+    if (!transferring.ok) {
+      return { ok: false, reason: transferring.reason };
+    }
+    handoff = transferring.next;
+
+    const persistTransferring = this.store.commit((draft) => {
+      const current = draft.tasks[params.taskId];
+      if (!current || !current.handoff) {
+        return { ok: false, reason: 'task not found' };
+      }
+      if (current.handoff.operationId !== operationId) {
+        return { ok: false, reason: 'stale operation' };
+      }
+      if (current.handoff.phase !== 'preparing_receiver') {
+        return { ok: false, reason: 'handoff is not preparing_receiver' };
+      }
+      if (pendingTurnsForTask(draft, params.taskId).length > 0) {
+        return { ok: false, reason: 'task has a live or active turn' };
+      }
+      draft.tasks[params.taskId] = {
+        ...current,
+        handoff: handoff.toState(),
+        revision: current.revision + 1,
+        updatedAt: now,
+      };
+      return { ok: true };
+    });
+    if (!persistTransferring.ok) {
+      return { ok: false, reason: persistTransferring.detail ?? persistTransferring.reason };
+    }
+
+    const messages = this.store.getMessagesForTask(params.taskId);
+    const sourceSummaryText = this.handoffSourceSummaryByOperationId.get(operationId);
+    const pkg = buildHandoffPackage({
+      taskId: params.taskId,
+      taskGoal: task.goal,
+      handoff,
+      messages,
+      builtAt: now,
+      ...(sourceSummaryText ? { sourceSummaryText } : {}),
+    });
+    const bootstrapPrompt = buildHandoffBootstrapPrompt(pkg);
+
+    let targetBackend;
+    try {
+      targetBackend = this.makeBackend(state.target.backend);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return this.failRuntimeHandoffTransfer({
+        taskId: params.taskId,
+        operationId,
+        code: 'target_backend_unavailable',
+        message: `target backend unavailable: ${message}`,
+        now,
+      });
+    }
+    if (!canBindTaskToBackend(targetBackend.capabilities)) {
+      return this.failRuntimeHandoffTransfer({
+        taskId: params.taskId,
+        operationId,
+        code: 'target_backend_not_mcp',
+        message: 'backend does not support MCP',
+        now,
+      });
+    }
+
+    let boundSessionId: string | undefined;
+    let initError: string | undefined;
+    try {
+      const runOptions: RunOptions = {
+        prompt: bootstrapPrompt,
+        // Intentionally omit resumeId — new session only (D021).
+        ...(state.target.model ? { model: state.target.model } : {}),
+        ...(task.cwd ? { cwd: task.cwd } : {}),
+      };
+      for await (const event of this.runTurnFn(targetBackend, runOptions)) {
+        if (event.type === 'sessionStarted' && event.sessionId) {
+          if (!boundSessionId) {
+            boundSessionId = event.sessionId;
+          }
+        } else if (event.type === 'error' && !event.isCancellation) {
+          initError = event.message;
+        }
+      }
+    } catch (error) {
+      initError = error instanceof Error ? error.message : String(error);
+    }
+
+    if (initError) {
+      return this.failRuntimeHandoffTransfer({
+        taskId: params.taskId,
+        operationId,
+        code: 'receiver_init_failed',
+        message: initError,
+        now: nowIso(this.clock),
+      });
+    }
+
+    const completeNow = nowIso(this.clock);
+    const completed = handoff.complete({
+      now: completeNow,
+      operationId,
+      boundBackend: state.target.backend,
+      ...(boundSessionId ? { boundSessionId } : {}),
+    });
+    if (!completed.ok) {
+      return this.failRuntimeHandoffTransfer({
+        taskId: params.taskId,
+        operationId,
+        code: 'handoff_complete_rejected',
+        message: completed.reason,
+        now: completeNow,
+      });
+    }
+    handoff = completed.next;
+
+    const bindCommit = this.store.commit((draft) => {
+      const current = draft.tasks[params.taskId];
+      if (!current || !current.handoff) {
+        return { ok: false, reason: 'task not found' };
+      }
+      if (current.handoff.operationId !== operationId) {
+        return { ok: false, reason: 'stale operation' };
+      }
+      if (current.handoff.phase !== 'transferring') {
+        return { ok: false, reason: 'handoff is not transferring' };
+      }
+      const nextTask: MusterTask = {
+        ...current,
+        backend: state.target.backend,
+        handoff: handoff.toState(),
+        revision: current.revision + 1,
+        updatedAt: completeNow,
+      };
+      if (state.target.model !== undefined) {
+        nextTask.model = state.target.model;
+      }
+      if (boundSessionId) {
+        nextTask.committedSessionId = boundSessionId;
+      } else {
+        delete nextTask.committedSessionId;
+      }
+      draft.tasks[params.taskId] = nextTask;
+      return { ok: true };
+    });
+
+    if (!bindCommit.ok) {
+      return { ok: false, reason: bindCommit.detail ?? bindCommit.reason };
+    }
+
+    this.handoffSourceSummaryByOperationId.delete(operationId);
+
+    return {
+      ok: true,
+      value: {
+        operationId,
+        phase: handoff.phase,
+        diagnostics: handoff.toDiagnostics(),
+        boundBackend: state.target.backend,
+        ...(boundSessionId ? { boundSessionId } : {}),
+      },
+    };
+  }
+
+  /**
+   * Record handoff.fail after a transfer-time error. Does not rebind runtime.
+   * Clears ephemeral summary cache for the operation.
+   */
+  private failRuntimeHandoffTransfer(params: {
+    taskId: string;
+    operationId: string;
+    code: string;
+    message: string;
+    now: string;
+  }): EngineResult<{
+    operationId: string;
+    phase: TaskHandoffPhase;
+    diagnostics: TaskHandoffDiagnostics;
+    boundBackend: string;
+    boundSessionId?: string;
+  }> {
+    this.handoffSourceSummaryByOperationId.delete(params.operationId);
+    const task = this.store.getTask(params.taskId);
+    if (!task?.handoff) {
+      return { ok: false, reason: params.message };
+    }
+    const restored = TaskHandoff.restore(task.handoff);
+    if (!restored.ok) {
+      return { ok: false, reason: params.message };
+    }
+    const failed = restored.next.fail({
+      now: params.now,
+      operationId: params.operationId,
+      code: params.code,
+      message: params.message,
+    });
+    if (failed.ok) {
+      this.store.commit((draft) => {
+        const current = draft.tasks[params.taskId];
+        if (!current) return { ok: false, reason: 'task not found' };
+        draft.tasks[params.taskId] = {
+          ...current,
+          handoff: failed.next.toState(),
+          revision: current.revision + 1,
+          updatedAt: params.now,
+        };
+        return { ok: true };
+      });
+    }
+    return { ok: false, reason: params.message };
+  }
+
+  /**
+   * Hidden internal source-summary turn. Calls makeBackend(source)+runTurnFn with
+   * the source session/model, captures assistant text in-memory for digesting only,
+   * and never creates TaskMessage/TaskTurn rows or emits EngineEvents.
+   *
+   * Failures yield `unavailable` — conversation-ready handoffs still advance.
+   */
+  private async runHiddenSourceSummaryTurn(
+    task: MusterTask,
+    now: string,
+  ): Promise<SourceSummaryOutcome> {
+    try {
+      const sourceBackend = this.makeBackend(task.backend);
+      const options: RunOptions = {
+        prompt: HANDOFF_SOURCE_SUMMARY_PROMPT,
+        ...(task.committedSessionId ? { resumeId: task.committedSessionId } : {}),
+        ...(task.model ? { model: task.model } : {}),
+        ...(task.cwd ? { cwd: task.cwd } : {}),
+      };
+      const collected = await collectInternalSummaryTurnText(
+        this.runTurnFn(sourceBackend, options),
+      );
+      if (collected.errorMessage) {
+        return {
+          kind: 'unavailable',
+          reason: collected.errorMessage.slice(0, 120),
+        };
+      }
+      const text = collected.text.trim();
+      if (!text) {
+        return { kind: 'unavailable', reason: 'empty source summary' };
+      }
+      return {
+        kind: 'ready',
+        contentDigest: digestSourceSummaryText(text),
+        summarizedAt: now,
+        text,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        kind: 'unavailable',
+        reason: message.slice(0, 120),
+      };
+    }
   }
 
   send(

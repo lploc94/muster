@@ -72,6 +72,121 @@ export interface MusterTask {
   createdAt: string;
   updatedAt: string;
   finishedAt?: string;
+  /**
+   * Optional cross-runtime handoff state (schema-compatible: absent on legacy tasks).
+   * Owned by the TaskHandoff aggregate; never projected as ordinary TaskMessage chat.
+   * Malformed records are stripped on load (fail closed) without quarantining the store.
+   */
+  handoff?: TaskHandoffState;
+}
+
+// ---------------------------------------------------------------------------
+// Cross-runtime task handoff (M010) — durable contract only.
+// Phase transitions and orchestration live in the TaskHandoff aggregate (T02).
+// ---------------------------------------------------------------------------
+
+/** Explicit handoff progress phases. Terminal: completed | failed | cancelled. */
+export type TaskHandoffPhase =
+  | 'requested'
+  | 'exporting_context'
+  | 'summarizing_source'
+  | 'preparing_receiver'
+  | 'transferring'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+/** Source or target runtime binding for a handoff operation. */
+export interface TaskHandoffRuntimeBinding {
+  /** Backend id (e.g. claude-cli, codex). Never a credential or absolute path. */
+  backend: string;
+  /** Optional model id for this side of the handoff. */
+  model?: string;
+  /** Optional backend session id already bound (source) or established (target). */
+  sessionId?: string;
+}
+
+/**
+ * Required conversation-context export metadata.
+ * Stores digests/counts only — never full conversation bodies or credentials.
+ */
+export type TaskHandoffConversationContext =
+  | {
+      status: 'pending';
+    }
+  | {
+      status: 'ready';
+      messageCount: number;
+      /** Stable content digest of the exported conversation package. */
+      contentDigest: string;
+      exportedAt: string;
+    }
+  | {
+      status: 'unavailable';
+      reason: string;
+    };
+
+/**
+ * Optional source-summary state. Distinct from required conversation context:
+ * handoff may complete with summary unavailable when conversation context is ready.
+ */
+export type TaskHandoffSourceSummary =
+  | {
+      status: 'pending';
+    }
+  | {
+      status: 'ready';
+      /** Digest of the source summary payload — not the summary text itself. */
+      contentDigest: string;
+      summarizedAt: string;
+    }
+  | {
+      status: 'unavailable';
+      reason: string;
+    }
+  | {
+      status: 'skipped';
+      reason: string;
+    };
+
+/** Terminal success metadata once the receiver is bound and ready for next turns. */
+export interface TaskHandoffCompletion {
+  completedAt: string;
+  boundBackend: string;
+  boundSessionId?: string;
+}
+
+/**
+ * Bounded failure diagnostics for a failed/cancelled handoff.
+ * `message` is sanitized (no absolute paths, credentials, or raw conversation bodies).
+ */
+export interface TaskHandoffFailure {
+  code: string;
+  message: string;
+  at: string;
+}
+
+/**
+ * Persisted handoff state on a MusterTask (versioned, bounded, reloadable).
+ * Does not include chat messages, handoff prompts, raw CLI output, or secrets.
+ */
+export interface TaskHandoffState {
+  /** Contract version for this handoff record (independent of store schemaVersion). */
+  version: 1;
+  /** Stable operation id for stale-op rejection and idempotent terminal handling. */
+  operationId: string;
+  phase: TaskHandoffPhase;
+  source: TaskHandoffRuntimeBinding;
+  target: TaskHandoffRuntimeBinding;
+  conversationContext: TaskHandoffConversationContext;
+  /** Optional; omit or set unavailable/skipped when source summary is not used. */
+  sourceSummary?: TaskHandoffSourceSummary;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  completion?: TaskHandoffCompletion;
+  failure?: TaskHandoffFailure;
 }
 
 // Turns (§4.2)

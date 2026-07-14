@@ -4,6 +4,7 @@ import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { Backend, BackendCapabilities, NormalizedEvent, RunOptions } from '../types';
 import { TaskEngine, projectPrompt } from './engine';
+import { HANDOFF_SOURCE_SUMMARY_PROMPT } from './engine-handoff';
 import { TaskStore } from './store';
 import { buildSnapshot, buildTranscript } from '../host/snapshot';
 import type { TaskMessage, TaskTurn } from './types';
@@ -1845,5 +1846,312 @@ describe('TaskEngine.interruptAndSend', () => {
     if (retry) {
       expect(retry.inputs.every((i) => i.kind === 'message')).toBe(true);
     }
+  });
+});
+
+describe('TaskEngine.requestRuntimeHandoff (S02 engine demo)', () => {
+  it('requests a model switch, runs hidden handoff turn, isolates transcript, holds old runtime', async () => {
+    const { store } = makeTempStore();
+    const SUMMARY_TEXT = 'ENGINE_TEST_HANDOFF_SUMMARY_CANARY';
+    const captured: RunOptions[] = [];
+    const engineEvents: unknown[] = [];
+
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: (name) => ({
+        ...scriptedBackend([{ type: 'turnCompleted' }], MCP_CAPS),
+        name,
+      }),
+      runTurn: async function* (_backend: Backend, options: RunOptions) {
+        captured.push(options);
+        yield {
+          type: 'assistantDelta',
+          content: SUMMARY_TEXT,
+          messageId: 'engine-demo-hidden',
+        };
+        yield { type: 'turnCompleted' };
+      },
+      clock: () => '2026-07-14T11:00:00.000Z',
+      emit: (e) => {
+        engineEvents.push(e);
+      },
+    });
+
+    const created = engine.createTask({
+      id: 'task-handoff-demo',
+      goal: 'switch runtime demo',
+      backend: 'claude-cli',
+      executionPolicy: {
+        maxTurns: 8,
+        maxAutomaticRetries: 2,
+        turnTimeoutMs: 300_000,
+        taskTimeoutMs: 3_600_000,
+      },
+    });
+    expect(created.ok).toBe(true);
+
+    // Seed model + committed source session + completed conversation without a live turn.
+    // createTask does not accept model; bind it on the task record like production selection does.
+    store.commit((draft) => {
+      const task = draft.tasks['task-handoff-demo'];
+      if (!task) {
+        return { ok: false, reason: 'missing task' };
+      }
+      draft.tasks['task-handoff-demo'] = {
+        ...task,
+        model: 'sonnet',
+        committedSessionId: 'sess-engine-demo',
+        revision: task.revision + 1,
+        updatedAt: '2026-07-14T11:00:00.000Z',
+      };
+      draft.messages['u-demo'] = {
+        id: 'u-demo',
+        taskId: 'task-handoff-demo',
+        role: 'user',
+        content: 'visible user chat',
+        state: 'complete',
+        createdAt: '2026-07-14T10:59:00.000Z',
+      };
+      draft.messages['a-demo'] = {
+        id: 'a-demo',
+        taskId: 'task-handoff-demo',
+        role: 'assistant',
+        content: 'visible assistant chat',
+        state: 'complete',
+        createdAt: '2026-07-14T10:59:30.000Z',
+      };
+      return { ok: true };
+    });
+
+    const before = store.getTask('task-handoff-demo')!;
+    const messageCountBefore = Object.keys(store.getFile().messages).length;
+    const turnCountBefore = Object.keys(store.getFile().turns).length;
+
+    const result = await engine.requestRuntimeHandoff({
+      taskId: 'task-handoff-demo',
+      targetBackend: 'codex',
+      targetModel: 'gpt-5',
+      skipSummary: false,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error(result.reason);
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].prompt).toBe(HANDOFF_SOURCE_SUMMARY_PROMPT);
+    expect(captured[0].resumeId).toBe('sess-engine-demo');
+    expect(captured[0].model).toBe('sonnet');
+
+    const task = store.getTask('task-handoff-demo')!;
+    expect(task.handoff?.phase).toBe('preparing_receiver');
+    expect(task.handoff?.target).toEqual({ backend: 'codex', model: 'gpt-5' });
+    expect(task.backend).toBe(before.backend);
+    expect(task.model).toBe(before.model);
+    expect(task.committedSessionId).toBe(before.committedSessionId);
+
+    expect(Object.keys(store.getFile().messages).length).toBe(messageCountBefore);
+    expect(Object.keys(store.getFile().turns).length).toBe(turnCountBefore);
+    expect(engineEvents).toHaveLength(0);
+
+    const transcript = JSON.stringify(buildTranscript(store.getFile(), 'task-handoff-demo'));
+    expect(transcript).toContain('visible user chat');
+    expect(transcript).toContain('visible assistant chat');
+    expect(transcript).not.toContain(SUMMARY_TEXT);
+    expect(transcript).not.toContain(HANDOFF_SOURCE_SUMMARY_PROMPT);
+
+    const snapshot = buildSnapshot(store, 'task-handoff-demo');
+    const snapshotJson = JSON.stringify(snapshot.transcript);
+    expect(snapshotJson).not.toContain(SUMMARY_TEXT);
+    expect(snapshotJson).not.toContain(result.value.operationId);
+  });
+
+  it('fails closed on non-idle task without mutating runtime binding', async () => {
+    const { store } = makeTempStore();
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => scriptedBackend([{ type: 'turnCompleted' }]),
+      clock: () => '2026-07-14T11:01:00.000Z',
+    });
+    const created = engine.createTask({
+      id: 'task-busy',
+      goal: 'busy',
+      backend: 'claude-cli',
+      executionPolicy: {
+        maxTurns: 8,
+        maxAutomaticRetries: 2,
+        turnTimeoutMs: 300_000,
+        taskTimeoutMs: 3_600_000,
+      },
+    });
+    expect(created.ok).toBe(true);
+
+    store.commit((draft) => {
+      draft.turns['busy-1'] = {
+        id: 'busy-1',
+        taskId: 'task-busy',
+        sequence: 1,
+        trigger: 'user',
+        status: 'running',
+        inputs: [],
+        createdAt: '2026-07-14T11:00:00.000Z',
+        startedAt: '2026-07-14T11:00:01.000Z',
+      };
+      return { ok: true };
+    });
+
+    const before = store.getTask('task-busy')!;
+    const result = await engine.requestRuntimeHandoff({
+      taskId: 'task-busy',
+      targetBackend: 'codex',
+      skipSummary: true,
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error('expected failure');
+    expect(result.reason).toMatch(/live|active turn/i);
+    const after = store.getTask('task-busy')!;
+    expect(after.backend).toBe(before.backend);
+    expect(after.model).toBe(before.model);
+    expect(after.committedSessionId).toBe(before.committedSessionId);
+    expect(after.handoff).toBeUndefined();
+  });
+});
+
+describe('TaskEngine.completeRuntimeHandoff (S03 engine demo)', () => {
+  it('starts a new target session with provenance, no source session reuse, projection isolation', async () => {
+    const SOURCE_SESSION = 'sess-engine-source';
+    const TARGET_SESSION = 'sess-engine-target-new';
+    const SUMMARY_TEXT = 'ENGINE_COMPLETE_HANDOFF_SUMMARY_CANARY';
+    const { store } = makeTempStore();
+    const captured: RunOptions[] = [];
+    const engineEvents: unknown[] = [];
+    let clock = '2026-07-14T13:00:00.000Z';
+
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: (name) => ({
+        ...scriptedBackend([{ type: 'turnCompleted' }], MCP_CAPS),
+        name,
+      }),
+      runTurn: async function* (_backend: Backend, options: RunOptions) {
+        captured.push(options);
+        if (options.prompt === HANDOFF_SOURCE_SUMMARY_PROMPT) {
+          yield {
+            type: 'assistantDelta',
+            content: SUMMARY_TEXT,
+            messageId: 'engine-complete-hidden',
+          };
+          yield { type: 'turnCompleted' };
+          return;
+        }
+        // Receiver bootstrap: new session only.
+        expect(options.resumeId).toBeUndefined();
+        yield { type: 'sessionStarted', sessionId: TARGET_SESSION };
+        yield { type: 'turnCompleted' };
+      },
+      clock: () => clock,
+      emit: (e) => {
+        engineEvents.push(e);
+      },
+    });
+
+    const created = engine.createTask({
+      id: 'task-handoff-complete-demo',
+      goal: 'complete transfer demo',
+      backend: 'claude-cli',
+      executionPolicy: {
+        maxTurns: 8,
+        maxAutomaticRetries: 2,
+        turnTimeoutMs: 300_000,
+        taskTimeoutMs: 3_600_000,
+      },
+    });
+    expect(created.ok).toBe(true);
+
+    store.commit((draft) => {
+      const task = draft.tasks['task-handoff-complete-demo'];
+      if (!task) {
+        return { ok: false, reason: 'missing task' };
+      }
+      draft.tasks['task-handoff-complete-demo'] = {
+        ...task,
+        model: 'sonnet',
+        committedSessionId: SOURCE_SESSION,
+        revision: task.revision + 1,
+        updatedAt: clock,
+      };
+      draft.messages['u-complete'] = {
+        id: 'u-complete',
+        taskId: 'task-handoff-complete-demo',
+        role: 'user',
+        content: 'complete-demo user chat',
+        state: 'complete',
+        createdAt: '2026-07-14T12:59:00.000Z',
+      };
+      draft.messages['a-complete'] = {
+        id: 'a-complete',
+        taskId: 'task-handoff-complete-demo',
+        role: 'assistant',
+        content: 'complete-demo assistant chat',
+        state: 'complete',
+        createdAt: '2026-07-14T12:59:30.000Z',
+      };
+      return { ok: true };
+    });
+
+    const messageCountBefore = Object.keys(store.getFile().messages).length;
+    const turnCountBefore = Object.keys(store.getFile().turns).length;
+
+    const requested = await engine.requestRuntimeHandoff({
+      taskId: 'task-handoff-complete-demo',
+      targetBackend: 'codex',
+      targetModel: 'gpt-5',
+      skipSummary: false,
+    });
+    expect(requested.ok).toBe(true);
+    if (!requested.ok) throw new Error(requested.reason);
+    expect(store.getTask('task-handoff-complete-demo')!.committedSessionId).toBe(SOURCE_SESSION);
+
+    clock = '2026-07-14T13:01:00.000Z';
+    const transferred = await engine.completeRuntimeHandoff({
+      taskId: 'task-handoff-complete-demo',
+      operationId: requested.value.operationId,
+    });
+    expect(transferred.ok).toBe(true);
+    if (!transferred.ok) throw new Error(transferred.reason);
+
+    // Two turns: hidden summary (source resume) + receiver bootstrap (no resume).
+    expect(captured).toHaveLength(2);
+    expect(captured[0]!.prompt).toBe(HANDOFF_SOURCE_SUMMARY_PROMPT);
+    expect(captured[0]!.resumeId).toBe(SOURCE_SESSION);
+    expect(captured[1]!.resumeId).toBeUndefined();
+    expect(captured[1]!.prompt).toContain('muster-handoff-package/v1');
+    expect(captured[1]!.prompt).toContain('complete-demo user chat');
+    expect(captured[1]!.prompt).toContain(SUMMARY_TEXT);
+    expect(captured[1]!.prompt).toMatch(/continue/i);
+    expect(captured[1]!.prompt).not.toContain(SOURCE_SESSION);
+
+    const after = store.getTask('task-handoff-complete-demo')!;
+    expect(after.backend).toBe('codex');
+    expect(after.model).toBe('gpt-5');
+    expect(after.committedSessionId).toBe(TARGET_SESSION);
+    expect(after.committedSessionId).not.toBe(SOURCE_SESSION);
+    expect(after.handoff?.phase).toBe('completed');
+    expect(transferred.value.boundSessionId).toBe(TARGET_SESSION);
+    expect(transferred.value.boundBackend).toBe('codex');
+
+    // Bootstrap/summary isolation: no new chat/turn rows, no bodies in projections.
+    expect(Object.keys(store.getFile().messages).length).toBe(messageCountBefore);
+    expect(Object.keys(store.getFile().turns).length).toBe(turnCountBefore);
+    expect(engineEvents).toHaveLength(0);
+
+    const transcript = JSON.stringify(buildTranscript(store.getFile(), 'task-handoff-complete-demo'));
+    expect(transcript).toContain('complete-demo user chat');
+    expect(transcript).not.toContain(SUMMARY_TEXT);
+    expect(transcript).not.toContain('muster-handoff-package/v1');
+    expect(transcript).not.toContain(HANDOFF_SOURCE_SUMMARY_PROMPT);
+
+    const snapshot = buildSnapshot(store, 'task-handoff-complete-demo');
+    const snapshotJson = JSON.stringify(snapshot.transcript);
+    expect(snapshotJson).not.toContain(SUMMARY_TEXT);
+    expect(snapshotJson).not.toContain(requested.value.operationId);
   });
 });

@@ -44,6 +44,7 @@ import { resolveDroppedFileMention } from './host/file-mentions';
 import { routeSendLiveInput } from './host/live-input';
 import { routeDeleteQueuedTurn, routeEditQueuedTurn } from './host/queued-turn-mutations';
 import { routeExportTask } from './host/task-export-route';
+import { routeRuntimeHandoff } from './host/runtime-handoff-route';
 import { importDroppedFileBytes } from './host/import-dropped-file';
 import { PresentationManager } from './host/presentation-manager';
 import {
@@ -918,6 +919,44 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   }
 
   /**
+   * Host-orchestrated runtime model/backend switch for an existing idle task.
+   * Pure route validates the inbound request, chains requestRuntimeHandoff →
+   * completeRuntimeHandoff, posts sanitized commandError on refusal/failure,
+   * and refreshes snapshot so handoffProgress + binding labels update. Never
+   * posts session ids, digests, or hidden handoff turn content to chat.
+   */
+  private async handleRequestRuntimeHandoff(data: unknown): Promise<void> {
+    if (!taskEngine || !taskStore) {
+      this.postCommandError('task engine not ready');
+      return;
+    }
+    const engine = taskEngine;
+    const store = taskStore;
+    const outcome = await routeRuntimeHandoff(data, {
+      getTask: (taskId) => {
+        const task = store.getTask(taskId);
+        if (!task) return undefined;
+        // Labels only for same-binding refusal — never session ids.
+        return task.model
+          ? { backend: task.backend, model: task.model }
+          : { backend: task.backend };
+      },
+      requestRuntimeHandoff: (params) => engine.requestRuntimeHandoff(params),
+      completeRuntimeHandoff: (params) => engine.completeRuntimeHandoff(params),
+      afterRequestCommitted: (taskId) => {
+        // Project intermediate preparing_receiver progress before transfer.
+        this.postSnapshot(taskId);
+      },
+    });
+    for (const message of outcome.messages) {
+      this.post(message);
+    }
+    if (outcome.refreshSnapshot) {
+      this.postSnapshot(outcome.taskId ?? this.focusedTaskId);
+    }
+  }
+
+  /**
    * Export one task as Markdown via native Save As. Read-only store access;
    * never mutates task-store state. Cancel is intentionally silent.
    */
@@ -1783,6 +1822,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           break;
         case 'exportTask':
           await this.handleExportTask(data);
+          break;
+        case 'requestRuntimeHandoff':
+          await this.handleRequestRuntimeHandoff(data);
           break;
         case 'blurTask':
           // Webview returned to the task list; drop the host-side focus so a

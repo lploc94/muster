@@ -27,6 +27,33 @@ type TurnActivity =
   | { state: 'uncertain'; turnId: string; requiresConfirmation: true }
   | null;
 
+type TaskHandoffPhase =
+  | 'requested'
+  | 'exporting_context'
+  | 'summarizing_source'
+  | 'preparing_receiver'
+  | 'transferring'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+interface HandoffProgressBinding {
+  backend: string;
+  model?: string;
+}
+
+interface HandoffProgress {
+  operationId: string;
+  phase: TaskHandoffPhase;
+  source: HandoffProgressBinding;
+  target: HandoffProgressBinding;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  failure?: { code: string; message: string; at: string };
+}
+
 interface TaskSummary {
   id: string;
   parentId: string | null;
@@ -38,6 +65,10 @@ interface TaskSummary {
   currentTurnActivity: TurnActivity;
   updatedAt: string;
   backend: string;
+  /** Optional model id selected for this task. */
+  model?: string;
+  /** Sanitized task-scoped handoff chrome (never digests/session ids/bodies). */
+  handoffProgress?: HandoffProgress;
 }
 
 interface QueuedTurnProjection {
@@ -163,6 +194,45 @@ async function expectButtonDisabledAttribute(page: Page, name: string) {
   await expect
     .poll(() => page.getByRole('button', { name }).evaluate((button) => button.hasAttribute('disabled')))
     .toBe(true);
+}
+
+/** Seed host model catalog so the task model switch has backend::model options. */
+async function postModelsAvailable(
+  page: Page,
+  models: Record<
+    string,
+    { current?: string; options: Array<{ value: string; name: string }> }
+  >,
+) {
+  await postRawHostMessage(page, { type: 'modelsAvailable', models });
+}
+
+/**
+ * Drive vscode-single-select like a user pick: set value + dispatch change.
+ * vscode-elements fires `new Event('change')` (isTrusted=false) for real clicks too.
+ */
+async function selectTaskModelSwitch(page: Page, value: string) {
+  const picker = page.getByTestId('task-model-switch');
+  await expect(picker).toBeVisible();
+  await picker.evaluate((element, nextValue) => {
+    const select = element as HTMLElement & { value: string };
+    select.value = nextValue;
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    select.dispatchEvent(new Event('input', { bubbles: true }));
+  }, value);
+}
+
+function handoffProgressFixture(
+  overrides: Partial<HandoffProgress> & Pick<HandoffProgress, 'phase'>,
+): HandoffProgress {
+  return {
+    operationId: 'hop-e2e-1',
+    source: { backend: 'claude', model: 'sonnet' },
+    target: { backend: 'grok', model: 'grok-4' },
+    createdAt: '2026-07-14T00:00:00.000Z',
+    updatedAt: '2026-07-14T00:00:01.000Z',
+    ...overrides,
+  };
 }
 
 function turnActivityFromView(viewStatus: TaskViewStatus, lifecycle: string): TurnActivity {
@@ -1391,6 +1461,235 @@ test.describe('Muster webview host state smoke', () => {
       fileName: 'ignored.md',
     });
     await expect(page.locator('.task-command-notice')).toHaveCount(0);
+  });
+
+  test('existing-task model switch posts requestRuntimeHandoff, shows handoffProgress chrome, and keeps chat free of hidden handoff content', async ({
+    page,
+  }) => {
+    await openWebview(page);
+
+    const taskId = 'task-handoff';
+    const conversationOnly = 'Conversation-only visible reply.';
+    // Canaries that must never appear in chat when projected only via handoff chrome.
+    const sessionCanary = 'sess-hidden-handoff-xyz';
+    const digestCanary = 'digest-deadbeef-handoff';
+    const summaryBodyCanary = 'HIDDEN_SOURCE_SUMMARY_BODY';
+    const bootstrapCanary = 'HIDDEN_BOOTSTRAP_PROMPT';
+
+    const idleTask = task({
+      id: taskId,
+      goal: 'Switch model on existing idle task',
+      viewStatus: 'idle',
+      lifecycle: 'open',
+      backend: 'claude',
+      model: 'sonnet',
+    });
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [idleTask],
+      focusedTaskId: taskId,
+      subtree: [idleTask],
+      transcript: [
+        { id: 'msg-user-1', kind: 'user', content: 'Please summarize the plan.' },
+        { id: 'msg-asst-1', kind: 'assistant', content: conversationOnly },
+      ],
+      storeRevision: 301,
+    });
+
+    // Host model catalog — required for backend::model picker options.
+    await postModelsAvailable(page, {
+      claude: {
+        current: 'sonnet',
+        options: [
+          { value: 'sonnet', name: 'sonnet' },
+          { value: 'opus', name: 'opus' },
+        ],
+      },
+      grok: {
+        current: 'grok-4',
+        options: [{ value: 'grok-4', name: 'grok-4' }],
+      },
+    });
+
+    const modelSwitch = page.getByTestId('task-model-switch');
+    await expect(modelSwitch).toBeVisible();
+    await expect(page.getByTestId('task-model-readonly')).toHaveCount(0);
+
+    // User changes model on the existing idle task.
+    await selectTaskModelSwitch(page, 'grok::grok-4');
+
+    await expectPostedMessage(page, {
+      type: 'requestRuntimeHandoff',
+      taskId,
+      targetBackend: 'grok',
+      targetModel: 'grok-4',
+      skipSummary: true,
+    });
+
+    // Host projects in-flight handoffProgress (sanitized labels only).
+    const inFlight = handoffProgressFixture({
+      phase: 'preparing_receiver',
+      startedAt: '2026-07-14T00:00:02.000Z',
+    });
+    const inFlightTask = task({
+      ...idleTask,
+      handoffProgress: inFlight,
+      updatedAt: '2026-07-14T00:00:02.000Z',
+    });
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [inFlightTask],
+      focusedTaskId: taskId,
+      subtree: [inFlightTask],
+      transcript: [
+        { id: 'msg-user-1', kind: 'user', content: 'Please summarize the plan.' },
+        { id: 'msg-asst-1', kind: 'assistant', content: conversationOnly },
+      ],
+      storeRevision: 302,
+    });
+
+    const progress = page.getByTestId('handoff-progress');
+    await expect(progress).toBeVisible();
+    await expect(progress).toHaveAttribute('data-handoff-phase', 'preparing_receiver');
+    await expect(progress).toContainText('Preparing receiver');
+    await expect(progress).toContainText('[Claude] sonnet');
+    await expect(progress).toContainText('[Grok] grok-4');
+    // Chrome must not surface secret-bearing fields even if a bad host leaked them elsewhere.
+    await expect(progress).not.toContainText(sessionCanary);
+    await expect(progress).not.toContainText(digestCanary);
+    await expect(progress).not.toContainText(summaryBodyCanary);
+    await expect(progress).not.toContainText(bootstrapCanary);
+    await expect(progress).not.toContainText(inFlight.operationId);
+
+    // Chat stays conversation-only — no hidden handoff turn / canaries.
+    await expect(page.getByText(conversationOnly)).toBeVisible();
+    await expect(page.getByText('Please summarize the plan.')).toBeVisible();
+    await expect(page.getByText(sessionCanary)).toHaveCount(0);
+    await expect(page.getByText(digestCanary)).toHaveCount(0);
+    await expect(page.getByText(summaryBodyCanary)).toHaveCount(0);
+    await expect(page.getByText(bootstrapCanary)).toHaveCount(0);
+    // While in flight, picker is disabled (not interactive for a second switch).
+    // vscode-single-select exposes `disabled` as an attribute; Playwright's
+    // a11y-based toBeDisabled() does not always treat custom elements as disabled.
+    await expect
+      .poll(() => modelSwitch.evaluate((el) => el.hasAttribute('disabled')))
+      .toBe(true);
+
+    // Completion: binding updates to target; progress is terminal completed chrome.
+    const completed = handoffProgressFixture({
+      phase: 'completed',
+      startedAt: '2026-07-14T00:00:02.000Z',
+      finishedAt: '2026-07-14T00:00:05.000Z',
+      updatedAt: '2026-07-14T00:00:05.000Z',
+    });
+    const completedTask = task({
+      id: taskId,
+      goal: idleTask.goal,
+      viewStatus: 'idle',
+      lifecycle: 'open',
+      backend: 'grok',
+      model: 'grok-4',
+      handoffProgress: completed,
+      updatedAt: '2026-07-14T00:00:05.000Z',
+    });
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [completedTask],
+      focusedTaskId: taskId,
+      subtree: [completedTask],
+      transcript: [
+        { id: 'msg-user-1', kind: 'user', content: 'Please summarize the plan.' },
+        { id: 'msg-asst-1', kind: 'assistant', content: conversationOnly },
+      ],
+      storeRevision: 303,
+    });
+
+    await expect(progress).toHaveAttribute('data-handoff-phase', 'completed');
+    await expect(progress).toContainText('Switch complete');
+    // Task header pill + model switch reflect the new binding.
+    await expect(page.locator('.task-pill').filter({ hasText: 'grok' })).toBeVisible();
+    // Terminal completed handoff re-enables the interactive switch (attribute cleared).
+    await expect
+      .poll(() => modelSwitch.evaluate((el) => el.hasAttribute('disabled')))
+      .toBe(false);
+    // Chat still free of handoff canaries after completion.
+    await expect(page.getByText(conversationOnly)).toBeVisible();
+    await expect(page.getByText(sessionCanary)).toHaveCount(0);
+    await expect(page.getByText(digestCanary)).toHaveCount(0);
+    await expect(page.getByText(summaryBodyCanary)).toHaveCount(0);
+    await expect(page.getByText(bootstrapCanary)).toHaveCount(0);
+
+    // Failed handoff keeps prior (source) binding labels and shows bounded failure chrome only.
+    const failed = handoffProgressFixture({
+      phase: 'failed',
+      source: { backend: 'grok', model: 'grok-4' },
+      target: { backend: 'claude', model: 'opus' },
+      finishedAt: '2026-07-14T00:00:08.000Z',
+      updatedAt: '2026-07-14T00:00:08.000Z',
+      failure: {
+        code: 'receiver_unavailable',
+        message: 'Target backend is not available.',
+        at: '2026-07-14T00:00:08.000Z',
+      },
+    });
+    const failedTask = task({
+      id: taskId,
+      goal: idleTask.goal,
+      viewStatus: 'idle',
+      lifecycle: 'open',
+      // Binding remains source after failure.
+      backend: 'grok',
+      model: 'grok-4',
+      handoffProgress: failed,
+      updatedAt: '2026-07-14T00:00:08.000Z',
+    });
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [failedTask],
+      focusedTaskId: taskId,
+      subtree: [failedTask],
+      transcript: [
+        { id: 'msg-user-1', kind: 'user', content: 'Please summarize the plan.' },
+        { id: 'msg-asst-1', kind: 'assistant', content: conversationOnly },
+      ],
+      storeRevision: 304,
+    });
+
+    await expect(progress).toHaveAttribute('data-handoff-phase', 'failed');
+    await expect(progress).toContainText('Switch failed');
+    await expect(progress).toContainText('Target backend is not available.');
+    await expect(progress).not.toContainText(sessionCanary);
+    await expect(progress).not.toContainText(digestCanary);
+    // Prior binding remains on the task header.
+    await expect(page.locator('.task-pill').filter({ hasText: 'grok' })).toBeVisible();
+    await expect(page.locator('.task-pill').filter({ hasText: 'claude' })).toHaveCount(0);
+    await expect(page.getByText(conversationOnly)).toBeVisible();
+    await expect(page.getByText(sessionCanary)).toHaveCount(0);
+
+    // Busy (running) tasks fall back to read-only pill — no interactive switch.
+    const runningTask = task({
+      id: taskId,
+      goal: idleTask.goal,
+      viewStatus: 'running',
+      lifecycle: 'open',
+      backend: 'grok',
+      model: 'grok-4',
+      updatedAt: '2026-07-14T00:00:09.000Z',
+    });
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [runningTask],
+      focusedTaskId: taskId,
+      subtree: [runningTask],
+      transcript: [
+        { id: 'msg-user-1', kind: 'user', content: 'Please summarize the plan.' },
+        { id: 'msg-asst-1', kind: 'assistant', content: conversationOnly },
+      ],
+      storeRevision: 305,
+    });
+    await expect(page.getByTestId('task-model-readonly')).toBeVisible();
+    await expect(page.getByTestId('task-model-switch')).toHaveCount(0);
   });
 });
 

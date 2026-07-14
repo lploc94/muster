@@ -1,5 +1,5 @@
 import type { BackendModels, QueuedTurnProjection, SnapshotMessage, TaskSummary } from './protocol';
-import { isHardTerminalLifecycle } from './protocol';
+import { isHardTerminalLifecycle, post } from './protocol';
 import { sortQueuedTurns } from './queued-turns';
 import { parseBackendId, parseModelFromSelectValue } from './backend-resolve';
 import { vscode } from './vscode';
@@ -337,6 +337,36 @@ class TasksState {
   /** Optimistic remove so Delete/Edit feedback is immediate before host snapshot. */
   removeQueuedTurnLocally(turnId: string): void {
     this.queuedTurns = this.queuedTurns.filter((turn) => turn.turnId !== turnId);
+  }
+
+  /**
+   * Request a host-orchestrated runtime handoff (model/backend switch) on an
+   * existing task. Progress arrives via TaskSummary.handoffProgress on
+   * snapshot/taskUpdated — never as chat. Refusals use setCommandError via
+   * commandError inbound messages.
+   */
+  requestRuntimeHandoff(
+    taskId: string,
+    targetBackend: string,
+    targetModel?: string | null,
+  ): void {
+    this.setCommandError(null);
+    const message: {
+      type: 'requestRuntimeHandoff';
+      taskId: string;
+      targetBackend: string;
+      targetModel?: string;
+      skipSummary?: boolean;
+    } = {
+      type: 'requestRuntimeHandoff',
+      taskId,
+      targetBackend,
+      skipSummary: true,
+    };
+    if (typeof targetModel === 'string' && targetModel.trim()) {
+      message.targetModel = targetModel.trim();
+    }
+    post(message);
   }
 
   private seedWatermark(taskId: string, revision: number): void {

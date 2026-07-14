@@ -630,4 +630,278 @@ describe('host task snapshot projection', () => {
     ]);
   });
 
+  it('does not project TaskHandoff state into the webview transcript', () => {
+    const handoffCanaries = {
+      operationId: 'hop-secret-op',
+      contentDigest: 'handoff-digest-SECRET',
+      summaryReason: 'SOURCE_SUMMARY_BODY_MUST_NOT_APPEAR',
+      boundSessionId: 'handoff-bound-session-SECRET',
+      sourceSessionId: 'src-sess-SECRET',
+    };
+    const file: TaskStoreFile = {
+      schemaVersion: 2,
+      revision: 4,
+      tasks: {
+        handoff: task('handoff', {
+          role: 'coordinator',
+          goal: 'Cross-runtime handoff task',
+          handoff: {
+            version: 1,
+            operationId: handoffCanaries.operationId,
+            phase: 'completed',
+            source: {
+              backend: 'claude-cli',
+              model: 'sonnet',
+              sessionId: handoffCanaries.sourceSessionId,
+            },
+            target: { backend: 'codex', model: 'gpt-5' },
+            conversationContext: {
+              status: 'ready',
+              messageCount: 2,
+              contentDigest: handoffCanaries.contentDigest,
+              exportedAt: '2026-07-06T00:10:00.000Z',
+            },
+            sourceSummary: {
+              status: 'skipped',
+              reason: handoffCanaries.summaryReason,
+            },
+            createdAt: '2026-07-06T00:00:00.000Z',
+            updatedAt: '2026-07-06T00:11:00.000Z',
+            startedAt: '2026-07-06T00:00:01.000Z',
+            finishedAt: '2026-07-06T00:11:00.000Z',
+            completion: {
+              completedAt: '2026-07-06T00:11:00.000Z',
+              boundBackend: 'codex',
+              boundSessionId: handoffCanaries.boundSessionId,
+            },
+          },
+        }),
+      },
+      turns: {
+        t1: turn({
+          id: 't1',
+          taskId: 'handoff',
+          status: 'succeeded',
+          sequence: 1,
+          inputs: [{ kind: 'message', messageId: 'u1' }],
+          finishedAt: '2026-07-06T00:05:00.000Z',
+        }),
+      },
+      messages: {
+        u1: message({
+          id: 'u1',
+          taskId: 'handoff',
+          role: 'user',
+          content: 'visible chat only',
+          createdAt: '2026-07-06T00:04:00.000Z',
+          turnId: 't1',
+        }),
+        a1: message({
+          id: 'a1',
+          taskId: 'handoff',
+          role: 'assistant',
+          content: 'visible assistant reply',
+          createdAt: '2026-07-06T00:04:30.000Z',
+          turnId: 't1',
+          order: 0,
+        }),
+      },
+      operations: {},
+      cancelRequests: {},
+    };
+
+    const snapshot = buildSnapshot(storeFrom(file), 'handoff');
+    expect(snapshot.transcript).toEqual([
+      {
+        id: 'u1',
+        kind: 'user',
+        content: 'visible chat only',
+        turnId: 't1',
+        order: undefined,
+        state: 'complete',
+      },
+      {
+        id: 'a1',
+        kind: 'assistant',
+        content: 'visible assistant reply',
+        turnId: 't1',
+        order: 0,
+        state: 'complete',
+      },
+    ]);
+
+    const transcriptJson = JSON.stringify(snapshot.transcript);
+    for (const needle of Object.values(handoffCanaries)) {
+      expect(transcriptJson, `transcript must not contain ${needle}`).not.toContain(needle);
+    }
+    // Task summaries also must not surface handoff digests/session ids as chat.
+    const summaryJson = JSON.stringify({
+      roots: snapshot.rootTasks,
+      subtree: snapshot.subtree,
+    });
+    expect(summaryJson).not.toContain(handoffCanaries.contentDigest);
+    expect(summaryJson).not.toContain(handoffCanaries.summaryReason);
+    expect(summaryJson).not.toContain(handoffCanaries.boundSessionId);
+    expect(summaryJson).not.toContain(handoffCanaries.sourceSessionId);
+  });
+
+  it('projects sanitized handoffProgress on TaskSummary without secrets', () => {
+    const canaries = {
+      contentDigest: 'handoff-digest-SECRET',
+      summaryReason: 'SOURCE_SUMMARY_BODY_MUST_NOT_APPEAR',
+      bootstrapBody: 'BOOTSTRAP_PROMPT_BODY_MUST_NOT_APPEAR',
+      boundSessionId: 'handoff-bound-session-SECRET',
+      sourceSessionId: 'src-sess-SECRET',
+      targetSessionId: 'tgt-sess-SECRET',
+    };
+    const file: TaskStoreFile = {
+      schemaVersion: 2,
+      revision: 5,
+      tasks: {
+        hop: task('hop', {
+          backend: 'claude-cli',
+          model: 'sonnet',
+          handoff: {
+            version: 1,
+            operationId: 'hop-op-1',
+            phase: 'preparing_receiver',
+            source: {
+              backend: 'claude-cli',
+              model: 'sonnet',
+              sessionId: canaries.sourceSessionId,
+            },
+            target: {
+              backend: 'codex',
+              model: 'gpt-5',
+              sessionId: canaries.targetSessionId,
+            },
+            conversationContext: {
+              status: 'ready',
+              messageCount: 3,
+              contentDigest: canaries.contentDigest,
+              exportedAt: '2026-07-06T00:10:00.000Z',
+            },
+            sourceSummary: {
+              status: 'ready',
+              contentDigest: canaries.contentDigest,
+              summarizedAt: '2026-07-06T00:10:30.000Z',
+            },
+            createdAt: '2026-07-06T00:00:00.000Z',
+            updatedAt: '2026-07-06T00:10:45.000Z',
+            startedAt: '2026-07-06T00:00:01.000Z',
+          },
+        }),
+        idle: task('idle', {
+          goal: 'No handoff',
+          updatedAt: '2026-07-06T00:00:00.000Z',
+        }),
+      },
+      turns: {},
+      messages: {},
+      operations: {},
+      cancelRequests: {},
+    };
+
+    const summary = projectTaskSummary(file, 'hop');
+    expect(summary?.handoffProgress).toEqual({
+      operationId: 'hop-op-1',
+      phase: 'preparing_receiver',
+      source: { backend: 'claude-cli', model: 'sonnet' },
+      target: { backend: 'codex', model: 'gpt-5' },
+      createdAt: '2026-07-06T00:00:00.000Z',
+      updatedAt: '2026-07-06T00:10:45.000Z',
+      startedAt: '2026-07-06T00:00:01.000Z',
+    });
+    expect(summary).not.toHaveProperty('handoff');
+    expect(projectTaskSummary(file, 'idle')).not.toHaveProperty('handoffProgress');
+
+    const snapshot = buildSnapshot(storeFrom(file), 'hop');
+    const hopRoot = snapshot.rootTasks.find((t) => t.id === 'hop');
+    const hopSubtree = snapshot.subtree?.find((t) => t.id === 'hop');
+    expect(hopRoot?.handoffProgress?.phase).toBe('preparing_receiver');
+    expect(hopSubtree?.handoffProgress?.operationId).toBe('hop-op-1');
+
+    const projectedJson = JSON.stringify({
+      summary,
+      roots: snapshot.rootTasks,
+      subtree: snapshot.subtree,
+      transcript: snapshot.transcript,
+    });
+    for (const needle of Object.values(canaries)) {
+      expect(projectedJson, `projection must not contain ${needle}`).not.toContain(needle);
+    }
+    // Explicit absence of internal handoff fields / bodies.
+    expect(projectedJson).not.toContain('contentDigest');
+    expect(projectedJson).not.toContain('sourceSummary');
+    expect(projectedJson).not.toContain('conversationContext');
+    expect(projectedJson).not.toContain('sessionId');
+    expect(projectedJson).not.toContain('boundSessionId');
+  });
+
+  it('projects bounded handoff failure metadata only on failed handoffProgress', () => {
+    const rawFailure =
+      'Receiver init failed at C:\\Users\\secret\\repo\\handoff with sk-live-SECRETTOKEN12345 dump';
+    const file: TaskStoreFile = {
+      schemaVersion: 2,
+      revision: 6,
+      tasks: {
+        fail: task('fail', {
+          handoff: {
+            version: 1,
+            operationId: 'hop-fail-1',
+            phase: 'failed',
+            source: { backend: 'claude-cli', model: 'sonnet', sessionId: 'src-sess-SECRET' },
+            target: { backend: 'codex', model: 'gpt-5' },
+            conversationContext: {
+              status: 'ready',
+              messageCount: 1,
+              contentDigest: 'handoff-digest-SECRET',
+              exportedAt: '2026-07-06T00:01:00.000Z',
+            },
+            sourceSummary: {
+              status: 'skipped',
+              reason: 'SOURCE_SUMMARY_BODY_MUST_NOT_APPEAR',
+            },
+            createdAt: '2026-07-06T00:00:00.000Z',
+            updatedAt: '2026-07-06T00:02:00.000Z',
+            startedAt: '2026-07-06T00:00:01.000Z',
+            finishedAt: '2026-07-06T00:02:00.000Z',
+            failure: {
+              code: 'receiver_init_failed',
+              message: rawFailure,
+              at: '2026-07-06T00:02:00.000Z',
+            },
+          },
+        }),
+      },
+      turns: {},
+      messages: {},
+      operations: {},
+      cancelRequests: {},
+    };
+
+    const progress = projectTaskSummary(file, 'fail')?.handoffProgress;
+    expect(progress).toMatchObject({
+      operationId: 'hop-fail-1',
+      phase: 'failed',
+      source: { backend: 'claude-cli', model: 'sonnet' },
+      target: { backend: 'codex', model: 'gpt-5' },
+      finishedAt: '2026-07-06T00:02:00.000Z',
+      failure: {
+        code: 'receiver_init_failed',
+        at: '2026-07-06T00:02:00.000Z',
+      },
+    });
+    expect(progress?.failure?.message).toBeTruthy();
+    expect(progress?.failure?.message.length).toBeLessThanOrEqual(240);
+    expect(progress?.failure?.message).not.toMatch(/C:\\Users/);
+    expect(progress?.failure?.message).not.toContain('sk-live-SECRETTOKEN12345');
+    const progressJson = JSON.stringify(progress);
+    expect(progressJson).not.toContain('src-sess-SECRET');
+    expect(progressJson).not.toContain('handoff-digest-SECRET');
+    expect(progressJson).not.toContain('SOURCE_SUMMARY_BODY_MUST_NOT_APPEAR');
+    expect(progressJson).not.toContain('contentDigest');
+    expect(progressJson).not.toContain('sessionId');
+  });
+
 });

@@ -259,6 +259,12 @@ interface MusterTask {
   createdAt: string;
   updatedAt: string;
   finishedAt?: string;
+  /**
+   * Optional cross-runtime handoff state (schema-compatible: absent on legacy
+   * tasks). Owned by the TaskHandoff aggregate; never projected as ordinary
+   * TaskMessage chat. Malformed records are stripped on load (fail closed).
+   */
+  handoff?: TaskHandoffState;
 }
 ```
 
@@ -1292,3 +1298,234 @@ Operators may export one task's **committed visible conversation** as a versione
 - Failures map to stable generic messages (`invalid_request`, `task_not_found`, `render_bound`, `write_failed`, `dialog_failed`) via task-scoped **sanitized** `commandError` text — no absolute paths, raw stacks, credentials, or other-task content.
 
 Webview trigger, notice chrome, and proof-class separation are specified in [WEBVIEW.md](WEBVIEW.md) §16 and [CONTRIBUTING.md](../CONTRIBUTING.md).
+
+---
+
+## 19. Cross-runtime task handoff (durable contract)
+
+Schema-compatible optional field on `MusterTask`. No store `schemaVersion` bump: legacy tasks without `handoff` remain valid; present-but-malformed handoff is **stripped on load/commit** (fail closed) without quarantining the whole store.
+
+### Ownership and no-chat invariants
+
+- **Owner:** the TaskHandoff aggregate (domain object) owns legal phase transitions, serialization, and terminal/idempotent behavior. `TaskStore` only persists and sanitizes the record. Orchestration (engine/backends) drives transitions; it must not invent alternate phase machines or write handoff prompts into `messages`.
+- **Not chat:** handoff prompts, source-summary text, and exported conversation bodies are **never** written as ordinary `TaskMessage` rows and must not appear in the webview transcript or Markdown export as user/assistant turns.
+- **Projection boundary:** `buildTranscript` / `buildSnapshot` and `renderTaskMarkdownExport` read only `TaskMessage` (plus tool/reasoning for host chrome). They never read `MusterTask.handoff`. A task with in-progress or completed handoff projects the same transcript as an identical task without the field.
+- **Reload safety:** well-formed handoff reloads as task metadata only; message collections stay unchanged. Legacy tasks without `handoff` remain valid and message-stable when sibling tasks gain handoff records.
+- **Diagnostics only:** progress surfaces may show sanitized phase, source/target backend ids, `operationId`, and timestamps — never conversation text, credentials, raw CLI output, or absolute paths.
+
+### Persisted shape (`TaskHandoffState`)
+
+```ts
+type TaskHandoffPhase =
+  | 'requested'
+  | 'exporting_context'
+  | 'summarizing_source'
+  | 'preparing_receiver'
+  | 'transferring'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+interface TaskHandoffRuntimeBinding {
+  backend: string;
+  model?: string;
+  sessionId?: string;
+}
+
+type TaskHandoffConversationContext =
+  | { status: 'pending' }
+  | { status: 'ready'; messageCount: number; contentDigest: string; exportedAt: string }
+  | { status: 'unavailable'; reason: string };
+
+type TaskHandoffSourceSummary =
+  | { status: 'pending' }
+  | { status: 'ready'; contentDigest: string; summarizedAt: string }
+  | { status: 'unavailable'; reason: string }
+  | { status: 'skipped'; reason: string };
+
+interface TaskHandoffState {
+  version: 1;
+  operationId: string;
+  phase: TaskHandoffPhase;
+  source: TaskHandoffRuntimeBinding;
+  target: TaskHandoffRuntimeBinding;
+  conversationContext: TaskHandoffConversationContext; // required metadata
+  sourceSummary?: TaskHandoffSourceSummary;            // optional; may be unavailable
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  completion?: { completedAt: string; boundBackend: string; boundSessionId?: string };
+  failure?: { code: string; message: string; at: string }; // message sanitized + bounded
+}
+```
+
+### Required vs optional context
+
+| Field | Role |
+|-------|------|
+| `conversationContext` | **Required** export metadata (counts/digests only). Receiver setup depends on it. |
+| `sourceSummary` | **Optional.** Handoff may complete with summary `unavailable` / `skipped` when conversation context is ready. |
+
+### Store validation policy
+
+| On-disk shape | Behavior |
+|---------------|----------|
+| No `handoff` field | Valid legacy task; unchanged. |
+| Well-formed `handoff` | Loaded, re-sanitized, and reloadable. |
+| Malformed `handoff` | Field stripped; task kept; store **not** quarantined. |
+| Unparseable store file | Existing store-corrupt quarantine policy (unchanged). |
+
+Failure `message` is scrubbed of absolute paths and credential-like tokens and capped (≤240 chars) via `sanitizeHandoffFailureMessage` on load and commit.
+
+### Engine orchestration (`TaskEngine.requestRuntimeHandoff`)
+
+S02 entrypoint for starting a cross-runtime handoff on an **idle** task. It drives the TaskHandoff aggregate through export (+ optional hidden source summary) into `preparing_receiver`, then **stops**. Receiver session init and runtime rebinding are owned by S03.
+
+**Command shape**
+
+```ts
+engine.requestRuntimeHandoff({
+  taskId: string;
+  targetBackend: string;
+  targetModel?: string;
+  skipSummary?: boolean; // default true
+}): Promise<EngineResult<{
+  operationId: string;
+  phase: TaskHandoffPhase;
+  diagnostics: TaskHandoffDiagnostics; // sanitized; no digests/session ids
+}>>
+```
+
+**Happy path**
+
+1. Validate fail-closed gates (below).
+2. Create `TaskHandoff` with `source` = current task binding (`backend` / `model` / `committedSessionId`) and `target` = requested backend/model.
+3. Export **required** conversation-context metadata (messageCount + contentDigest only) from existing `TaskMessage` rows.
+4. Optional source summary (`skipSummary: false`):
+   - Run a **hidden internal turn** via `makeBackend(source)` + private `runTurnFn` with a fixed handoff prompt and the source session/model.
+   - Capture assistant text in memory, digest it into `sourceSummary.contentDigest`, discard raw text.
+   - Never create `TaskMessage` / `TaskTurn` rows and never emit ordinary `EngineEvent`s.
+   - Summary error / empty / throw → `sourceSummary: unavailable` and **still** advance when conversation context is ready.
+5. Persist `MusterTask.handoff` at phase `preparing_receiver`.
+6. **Do not** mutate `task.backend`, `task.model`, or `task.committedSessionId` — old runtime binding holds until receiver setup.
+
+**Fail-closed gates** (no binding mutation, no handoff write on rejection)
+
+| Condition | Behavior |
+|-----------|----------|
+| Missing task | Reject; store unchanged |
+| Live / queued / `waiting_user` turn | Reject |
+| Active (non-terminal) handoff already present | Reject |
+| Target backend factory throws | Reject (`target backend unavailable`) |
+| Target lacks MCP | Reject (`backend does not support MCP`) |
+
+**Isolation invariants**
+
+- Handoff prompts, summary text, digests, and operation ids never appear in `buildTranscript` / `buildSnapshot` chat or Markdown export conversation bodies.
+- Diagnostics expose phase, source/target backend ids, `operationId`, timestamps, and status flags only.
+- Reload of a `preparing_receiver` task restores handoff metadata and keeps the **source** runtime binding until S03 rebinds.
+
+### Receiver handoff package (`muster-handoff-package/v1`)
+
+S03 builds an **in-process, versioned `HandoffPackage`** at transfer time. It is **not** persisted on `MusterTask` and is never written as chat.
+
+| Field | Role |
+|-------|------|
+| `version` | Package contract version (`1`). Independent of store `schemaVersion` and of `TaskHandoffState.version`. |
+| `operationId` / `taskId` / `taskGoal` / `builtAt` | Provenance of this transfer attempt. |
+| `provenance` | Source/target **backend** (+ optional models) only. **Never** includes source or target session ids. |
+| `conversation` | Bounded rebuild of visible `TaskMessage` rows (`user`/`assistant`, non-`pending`), preferring `agentContent` over display `content`. Newest messages retained under message-count and total-char budgets. |
+| `messageCount` / `conversationDigest` | Count + digest of the rebuilt rows (not full bodies). |
+| `sourceSummary?` | Optional ephemeral enrichment text supplied only from engine memory; omit when summary was skipped/unavailable. Bounded independently of conversation. |
+| `continuationInstructions` | Fixed instructions to continue the same task without addressing the user or resuming a prior session. |
+
+**Rebuild rule (D020):** conversation is always reconstructed from current visible `TaskMessage` rows at transfer time. Optional source-summary **text** is never read from the store (only digests/status live on `TaskHandoffState`); when the engine still holds summary text for the operation, it may attach it as enrichment. After reload, transfer continues **conversation-only** without re-querying the source CLI.
+
+**Bootstrap prompt:** `buildHandoffBootstrapPrompt(pkg)` renders a `<!-- muster-handoff-package/v1 -->` prompt for `makeBackend(target)+runTurn` **without** `resumeId` / source session id. Prompt and summary bodies must never enter logs, `EngineEvent`s, `TaskMessage`/`TaskTurn` rows, or projections.
+
+**Bounds (defaults):** `MAX_HANDOFF_CONVERSATION_MESSAGES` (200), `MAX_HANDOFF_CONVERSATION_CHARS` (100_000), `MAX_HANDOFF_SOURCE_SUMMARY_CHARS` (16_384).
+
+### Engine transfer (`TaskEngine.completeRuntimeHandoff`)
+
+S03 entrypoint that finishes a handoff already at `preparing_receiver`. Builds the ephemeral package, initializes a **new** target session, and rebinds runtime only after the receiver is ready.
+
+**Command shape**
+
+```ts
+engine.completeRuntimeHandoff({
+  taskId: string;
+  operationId?: string; // optional stale-op guard
+}): Promise<EngineResult<{
+  operationId: string;
+  phase: TaskHandoffPhase;
+  diagnostics: TaskHandoffDiagnostics; // sanitized; no prompt/summary bodies
+  boundBackend: string;
+  boundSessionId?: string; // newly captured sessionStarted id only
+}>>
+```
+
+**Happy path**
+
+1. Require idle task + handoff phase `preparing_receiver` (optional `operationId` must match).
+2. Advance `preparing_receiver` → `transferring` and persist.
+3. Rebuild `HandoffPackage` from current visible `TaskMessage` rows + optional in-process summary text for this `operationId` (D020).
+4. `makeBackend(target)` + `runTurn` with bootstrap prompt and **no** `resumeId` / source session id (D021).
+5. Capture the first `sessionStarted` id as the new bound session.
+6. Atomically commit `backend` / `model` / `committedSessionId` + `handoff.complete` in one store write; clear ephemeral summary cache.
+
+**Fail-closed transfer errors** (source binding unchanged)
+
+| Condition | Behavior |
+|-----------|----------|
+| Target backend factory throws | `handoff.fail` (`target_backend_unavailable`) |
+| Target lacks MCP | `handoff.fail` (`target_backend_not_mcp`) |
+| Receiver init stream error / throw | `handoff.fail` (`receiver_init_failed`) |
+| Aggregate complete rejected | `handoff.fail` (`handoff_complete_rejected`) |
+
+**Session and reload invariants**
+
+- Never reuse the source (or any prior) session id on the target: omit `resumeId`, bind only a newly observed `sessionStarted` id, and give each task its own target session.
+- After process reload at `preparing_receiver`, the ephemeral summary cache is empty; transfer continues **conversation-only** without re-querying the source CLI.
+- Bootstrap prompt and summary bodies never create `TaskMessage`/`TaskTurn` rows and never appear in `buildTranscript` / `buildSnapshot` chat or Markdown export conversation bodies.
+
+### Host route (`routeRuntimeHandoff`)
+
+The webview posts a typed `requestRuntimeHandoff` OutMessage (`taskId`, `targetBackend`, optional `targetModel`, optional `skipSummary`). The extension wires this through a pure host route (export-route pattern) that:
+
+1. Validates the inbound payload (safe labels only — no session ids, paths, or control characters).
+2. Refuses missing tasks and same-binding switches without calling engine APIs.
+3. Calls `requestRuntimeHandoff` (binding hold → `preparing_receiver`), optionally projects intermediate `handoffProgress` via snapshot refresh.
+4. Calls `completeRuntimeHandoff` for atomic rebind (or `handoff.fail` with source binding retained).
+5. Surfaces refusals/failures as task-scoped `commandError` with sanitized text (no stacks, absolute paths, or secrets).
+6. Never returns `boundSessionId`, digests, or summary/bootstrap bodies on the wire.
+
+Default `skipSummary` is `true` so the host does not force a hidden source-summary turn unless the webview explicitly requests one. Progress and final binding labels are observed only through `TaskSummary.handoffProgress` / `backend` / `model` on snapshot/taskUpdated — never as chat turns.
+
+### Webview projection (`TaskSummary.handoffProgress`)
+
+Task chrome may render handoff progress, but only through an omission-safe projection on `TaskSummary` (and therefore on `snapshot` / `taskUpdated` patches). The host projects:
+
+| Field | Included |
+|-------|----------|
+| `operationId` | yes |
+| `phase` | yes (full `TaskHandoffPhase` enum) |
+| `source` / `target` | backend + optional model labels only |
+| `createdAt` / `updatedAt` / `startedAt` / `finishedAt` | yes when present |
+| `failure.code` / `failure.message` / `failure.at` | yes when failed/cancelled; message re-sanitized at projection |
+
+Never projected on `TaskSummary`, transcript, or Markdown export conversation bodies:
+
+- `sessionId` / `boundSessionId`
+- `conversationContext` (including digests and message counts)
+- `sourceSummary` (including digests, reasons, and any summary body)
+- bootstrap / handoff package prompt bodies
+- raw CLI output, credentials, or absolute paths
+
+`handoffProgress` is omitted entirely when a task has no handoff. Refusals for model-switch requests use task-scoped `commandError` (same channel as other host command refusals); they do not invent chat turns.
+
+### Webview model-switch control
+
+On an **idle open** existing task (no in-flight handoff), the composer replaces the read-only backend/model pill with an interactive picker (`data-testid="task-model-switch"`). Selecting a different backend/model posts `requestRuntimeHandoff` with labels only (`skipSummary: true` by default). Same-binding picks are no-ops locally; host still refuses same-binding/live-turn/missing-task via `commandError`.
+
+Task chrome renders sanitized `TaskSummary.handoffProgress` in a task-scoped progress bar (`data-testid="handoff-progress"`) above the chat thread — phase label + source → target bindings, and bounded `failure.message` on failed. The bar never injects digests, session ids, summary/bootstrap bodies, or chat turns. During in-flight phases the picker is disabled; after `completed`/`failed`/`cancelled` the bound `backend`/`model` labels (source retained on failure) remain the source of truth for the next switch.

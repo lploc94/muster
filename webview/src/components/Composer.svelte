@@ -23,6 +23,10 @@
   import type { PendingAsk, TaskSummary, TaskViewStatus } from '../lib/protocol';
   import { effectiveRuntimeActivity } from '../lib/protocol';
   import { BACKENDS, backendShortLabel, backendModelLabel } from '../lib/backends';
+  import {
+    canRequestRuntimeHandoff,
+    isHandoffProgressInFlight,
+  } from '../lib/handoff-progress';
   import { tip } from '../lib/tooltip';
   import {
     extractFileDropCandidatesFromDataTransfer,
@@ -172,6 +176,14 @@
 
   const currentBackend = $derived(
     mode === 'draft' ? tasks.selectedBackend : (tasks.focusedTask?.backend ?? tasks.selectedBackend),
+  );
+
+  /** Existing-task model switch is allowed only when idle/open and no in-flight handoff. */
+  const handoffSwitchAllowed = $derived(
+    mode === 'task' && canRequestRuntimeHandoff(tasks.focusedTask),
+  );
+  const handoffInFlight = $derived(
+    mode === 'task' && isHandoffProgressInFlight(tasks.focusedTask?.handoffProgress),
   );
 
   // Register select so resolveBackendForSend can read it for draft sends.
@@ -561,7 +573,16 @@
   const draftModel = $derived(
     mode === 'draft'
       ? (tasks.preferredModel ?? tasks.selectedModel)
-      : tasks.selectedModel,
+      : (tasks.focusedTask?.model ?? tasks.selectedModel),
+  );
+
+  /** Task-mode picker value always reflects the bound task backend/model. */
+  const taskPickerValue = $derived(
+    encodePickerValue(
+      tasks.focusedTask?.backend ?? currentBackend,
+      tasks.focusedTask?.model ?? null,
+      tasks.modelsByBackend,
+    ),
   );
 
   const pickerOptions = $derived.by(() => {
@@ -667,12 +688,21 @@
 
   // Only force preferred encoding after remount — never continuously overwrite
   // the live select (that fights the user's pick and can clobber Grok → Claude).
+  // Task mode always mirrors the bound task backend/model (handoff updates).
   let lastForcedRemountKey = '';
   $effect(() => {
     const el = backendSelect;
     const key = pickerRemountKey;
+    if (!el) return;
+    if (mode === 'task') {
+      try {
+        el.value = taskPickerValue;
+      } catch {
+        // best-effort
+      }
+      return;
+    }
     const next = currentPickerValue;
-    if (!el || mode !== 'draft') return;
     if (key === lastForcedRemountKey && el.value) return;
     lastForcedRemountKey = key;
     try {
@@ -682,16 +712,17 @@
     }
   });
 
-  // Ensure host starts enumeration when the draft composer is shown (also
-  // prefetched on App mount / panel resolve).
-  let draftModelsRequested = false;
+  // Ensure host starts enumeration when draft or switchable-task composer is shown.
+  let modelsRequested = false;
   $effect(() => {
-    if (mode === 'draft' && !draftModelsRequested) {
-      draftModelsRequested = true;
+    const needModels =
+      mode === 'draft' || (mode === 'task' && (handoffSwitchAllowed || handoffInFlight));
+    if (needModels && !modelsRequested) {
+      modelsRequested = true;
       post({ type: 'listModels' });
     }
-    if (mode !== 'draft') {
-      draftModelsRequested = false;
+    if (!needModels) {
+      modelsRequested = false;
     }
   });
 
@@ -709,6 +740,25 @@
 
   const BACKEND_IDS = ['claude', 'grok', 'kiro', 'codex', 'opencode'];
 
+  function sameBinding(
+    backend: string,
+    model: string | null | undefined,
+    task: TaskSummary | undefined,
+  ): boolean {
+    if (!task) return false;
+    const taskModel = typeof task.model === 'string' && task.model.trim() ? task.model.trim() : '';
+    const nextModel = typeof model === 'string' && model.trim() ? model.trim() : '';
+    return task.backend === backend && taskModel === nextModel;
+  }
+
+  function revertTaskPicker(el: (HTMLElement & { value: string }) | undefined): void {
+    try {
+      if (el) el.value = taskPickerValue;
+    } catch {
+      // best-effort
+    }
+  }
+
   function onBackendChange(e: Event) {
     // vscode-single-select dispatches `new Event('change')` so isTrusted is always
     // false even for real user clicks — never filter on isTrusted.
@@ -719,12 +769,45 @@
       const backend = raw.slice(0, sep);
       const model = raw.slice(sep + 2);
       if (BACKEND_IDS.includes(backend)) {
-        console.info('[muster][picker-change]', { raw, backend, model, isTrusted: e.isTrusted });
-        tasks.setModelSelection(backend as WebviewBackendId, model);
+        console.info('[muster][picker-change]', {
+          raw,
+          backend,
+          model,
+          isTrusted: e.isTrusted,
+          mode,
+        });
+        if (mode === 'draft') {
+          tasks.setModelSelection(backend as WebviewBackendId, model);
+          return;
+        }
+        // Existing task: post host-orchestrated runtime handoff (never chat).
+        const focused = tasks.focusedTask;
+        if (!focused || !handoffSwitchAllowed) {
+          revertTaskPicker(el);
+          return;
+        }
+        if (sameBinding(backend, model, focused)) return;
+        tasks.requestRuntimeHandoff(focused.id, backend, model);
       }
     } else if (BACKEND_IDS.includes(raw)) {
-      console.info('[muster][picker-change]', { raw, backend: raw, model: null, isTrusted: e.isTrusted });
-      tasks.setBackend(raw as WebviewBackendId);
+      console.info('[muster][picker-change]', {
+        raw,
+        backend: raw,
+        model: null,
+        isTrusted: e.isTrusted,
+        mode,
+      });
+      if (mode === 'draft') {
+        tasks.setBackend(raw as WebviewBackendId);
+        return;
+      }
+      const focused = tasks.focusedTask;
+      if (!focused || !handoffSwitchAllowed) {
+        revertTaskPicker(el);
+        return;
+      }
+      if (sameBinding(raw, null, focused)) return;
+      tasks.requestRuntimeHandoff(focused.id, raw, null);
     } else {
       console.warn('[muster][picker-change] unparsed', { raw, isTrusted: e.isTrusted });
     }
@@ -803,21 +886,32 @@
 
   <div class="flex items-center justify-between gap-2 pt-1" onkeydown={onKeydown}>
     <div class="flex items-center gap-1.5 min-w-0">
-      {#if mode === 'draft'}
-        {#key pickerRemountKey}
+      {#if mode === 'draft' || handoffSwitchAllowed || handoffInFlight}
+        {#key `${mode}:${pickerRemountKey}`}
           <vscode-single-select
             bind:this={backendSelect}
-            use:tip={modelsLoaded
-              ? 'Select backend + model for the new task'
-              : 'Loading models from installed CLIs… (shows backends first)'}
-            disabled={thread.running}
+            data-testid={mode === 'task' ? 'task-model-switch' : 'draft-model-picker'}
+            use:tip={
+              mode === 'draft'
+                ? modelsLoaded
+                  ? 'Select backend + model for the new task'
+                  : 'Loading models from installed CLIs… (shows backends first)'
+                : handoffInFlight
+                  ? 'Model switch in progress…'
+                  : modelsLoaded
+                    ? 'Switch backend + model for this task'
+                    : 'Loading models from installed CLIs…'
+            }
+            disabled={mode === 'draft' ? thread.running : !handoffSwitchAllowed}
             position="above"
             onchange={onBackendChange}
             oninput={onBackendChange}
             style="width: fit-content; min-width: fit-content; max-width: 100%;"
           >
             {#each pickerOptions as opt (opt.value)}
-              <vscode-option value={opt.value} selected={opt.value === currentPickerValue}
+              <vscode-option
+                value={opt.value}
+                selected={opt.value === (mode === 'draft' ? currentPickerValue : taskPickerValue)}
                 >{opt.label}</vscode-option
               >
             {/each}
@@ -827,7 +921,8 @@
         <div
           class="px-2 py-0.5 text-xs rounded border truncate"
           style="border-color: var(--vscode-panel-border); opacity: 0.85;"
-          use:tip={'Backend + model for this task'}
+          data-testid="task-model-readonly"
+          use:tip={'Backend + model for this task (switch available when idle)'}
         >
           {backendModelLabel(currentBackend, tasks.focusedTask?.model)}
         </div>

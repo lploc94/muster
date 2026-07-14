@@ -467,4 +467,176 @@ describe('TaskStore', () => {
     });
     expect(store.viewStatusOf('root')).toBe('succeeded');
   });
+
+  it('legacy tasks without handoff remain valid across load and commit', () => {
+    const { filePath } = makeTempStore();
+    const legacy: TaskStoreFile = {
+      schemaVersion: CURRENT_SCHEMA_VERSION,
+      revision: 2,
+      tasks: { 'task-1': sampleTask('task-1') },
+      turns: {},
+      messages: {},
+      operations: {},
+      cancelRequests: {},
+      toolCalls: {},
+      reasoning: {},
+      sendReceipts: {},
+    };
+    fs.writeFileSync(filePath, JSON.stringify(legacy), 'utf8');
+
+    const store = TaskStore.load({ filePath });
+    const task = store.getTask('task-1');
+    expect(task).toBeDefined();
+    expect(task?.handoff).toBeUndefined();
+
+    const commit = store.commit((draft) => {
+      draft.tasks['task-2'] = sampleTask('task-2');
+      return { ok: true };
+    });
+    expect(commit.ok).toBe(true);
+    expect(store.getTask('task-1')?.handoff).toBeUndefined();
+    expect(store.getTask('task-2')?.handoff).toBeUndefined();
+  });
+
+  it('persists and reloads a well-formed handoff state on a task', () => {
+    const { filePath } = makeTempStore();
+    const store = TaskStore.load({ filePath });
+    const handoff = {
+      version: 1 as const,
+      operationId: 'hop-1',
+      phase: 'preparing_receiver' as const,
+      source: { backend: 'claude-cli', model: 'sonnet', sessionId: 'src-sess' },
+      target: { backend: 'codex', model: 'gpt-5' },
+      conversationContext: {
+        status: 'ready' as const,
+        messageCount: 4,
+        contentDigest: 'digest-abc',
+        exportedAt: '2026-07-06T00:10:00.000Z',
+      },
+      sourceSummary: {
+        status: 'unavailable' as const,
+        reason: 'source_summary_unsupported',
+      },
+      createdAt: '2026-07-06T00:00:00.000Z',
+      updatedAt: '2026-07-06T00:10:00.000Z',
+      startedAt: '2026-07-06T00:00:01.000Z',
+    };
+
+    const commit = store.commit((draft) => {
+      draft.tasks['task-1'] = { ...sampleTask('task-1'), handoff };
+      return { ok: true };
+    });
+    expect(commit.ok).toBe(true);
+
+    const reloaded = TaskStore.load({ filePath });
+    expect(reloaded.getTask('task-1')?.handoff).toEqual(handoff);
+  });
+
+  it('strips malformed handoff on load (fail closed) without quarantining the store', () => {
+    const { filePath } = makeTempStore();
+    const raw = {
+      schemaVersion: CURRENT_SCHEMA_VERSION,
+      revision: 1,
+      tasks: {
+        'task-1': {
+          ...sampleTask('task-1'),
+          handoff: {
+            // missing required fields / wrong types
+            version: 1,
+            operationId: 42,
+            phase: 'not-a-phase',
+            source: 'claude',
+            target: null,
+            conversationContext: { status: 'ready' },
+            createdAt: '2026-07-06T00:00:00.000Z',
+            updatedAt: '2026-07-06T00:00:00.000Z',
+          },
+        },
+        'task-2': {
+          ...sampleTask('task-2'),
+          handoff: {
+            version: 1,
+            operationId: 'hop-ok',
+            phase: 'completed',
+            source: { backend: 'claude-cli' },
+            target: { backend: 'codex', sessionId: 'tgt' },
+            conversationContext: {
+              status: 'ready',
+              messageCount: 2,
+              contentDigest: 'ok',
+              exportedAt: '2026-07-06T00:05:00.000Z',
+            },
+            createdAt: '2026-07-06T00:00:00.000Z',
+            updatedAt: '2026-07-06T00:05:00.000Z',
+            finishedAt: '2026-07-06T00:05:00.000Z',
+            completion: {
+              completedAt: '2026-07-06T00:05:00.000Z',
+              boundBackend: 'codex',
+              boundSessionId: 'tgt',
+            },
+          },
+        },
+      },
+      turns: {},
+      messages: {},
+      operations: {},
+      cancelRequests: {},
+      toolCalls: {},
+      reasoning: {},
+      sendReceipts: {},
+    };
+    fs.writeFileSync(filePath, JSON.stringify(raw), 'utf8');
+
+    const store = TaskStore.load({ filePath });
+    expect(store.isCorrupt()).toBe(false);
+    // Malformed handoff is dropped; the task itself remains loadable.
+    expect(store.getTask('task-1')?.handoff).toBeUndefined();
+    expect(store.getTask('task-1')?.id).toBe('task-1');
+    // Well-formed sibling handoff is preserved.
+    expect(store.getTask('task-2')?.handoff?.operationId).toBe('hop-ok');
+    expect(store.getTask('task-2')?.handoff?.phase).toBe('completed');
+  });
+
+  it('sanitizes handoff diagnostics to exclude conversation bodies and absolute paths', () => {
+    const { filePath } = makeTempStore();
+    const store = TaskStore.load({ filePath });
+    const commit = store.commit((draft) => {
+      draft.tasks['task-1'] = {
+        ...sampleTask('task-1'),
+        handoff: {
+          version: 1,
+          operationId: 'hop-fail',
+          phase: 'failed',
+          source: { backend: 'claude-cli' },
+          target: { backend: 'codex' },
+          conversationContext: {
+            status: 'unavailable',
+            reason: 'export_empty',
+          },
+          createdAt: '2026-07-06T00:00:00.000Z',
+          updatedAt: '2026-07-06T00:01:00.000Z',
+          finishedAt: '2026-07-06T00:01:00.000Z',
+          failure: {
+            code: 'export_failed',
+            // Intentionally hostile payload — must be bounded/sanitized on load.
+            message:
+              'failed at C:\\Users\\secret\\proj with body: ' +
+              'A'.repeat(2_000) +
+              ' sk-secret-key',
+            at: '2026-07-06T00:01:00.000Z',
+          },
+        },
+      };
+      return { ok: true };
+    });
+    expect(commit.ok).toBe(true);
+
+    const reloaded = TaskStore.load({ filePath });
+    const failure = reloaded.getTask('task-1')?.handoff?.failure;
+    expect(failure?.code).toBe('export_failed');
+    expect(failure?.message.length).toBeLessThanOrEqual(240);
+    expect(failure?.message).not.toMatch(/C:\\Users/i);
+    expect(failure?.message).not.toMatch(/sk-secret/);
+    expect(failure?.message).not.toMatch(/A{50}/);
+  });
 });

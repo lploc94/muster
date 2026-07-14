@@ -69,6 +69,46 @@ export type TurnActivity =
   | { state: 'uncertain'; turnId: string; requiresConfirmation: true }
   | null;
 
+/** Explicit handoff progress phases (mirrors host TaskHandoffPhase). */
+export type TaskHandoffPhase =
+  | 'requested'
+  | 'exporting_context'
+  | 'summarizing_source'
+  | 'preparing_receiver'
+  | 'transferring'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+/** Sanitized source/target labels only — never session ids. */
+export interface HandoffProgressBinding {
+  backend: string;
+  model?: string;
+}
+
+/** Bounded failure chrome for a failed/cancelled handoff. */
+export interface HandoffProgressFailure {
+  code: string;
+  message: string;
+  at: string;
+}
+
+/**
+ * Task-scoped handoff chrome projected by the host (D018 / §19).
+ * Never includes digests, summary/bootstrap bodies, session ids, or credentials.
+ */
+export interface HandoffProgress {
+  operationId: string;
+  phase: TaskHandoffPhase;
+  source: HandoffProgressBinding;
+  target: HandoffProgressBinding;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  failure?: HandoffProgressFailure;
+}
+
 export interface TaskSummary {
   id: string;
   parentId: string | null;
@@ -87,6 +127,12 @@ export interface TaskSummary {
   /** Optional model id selected for this task (ACP session config option value). */
   model?: string;
   continuationOf?: string;
+  /**
+   * Optional sanitized handoff progress for model-switch chrome.
+   * Omitted when the task has no handoff. Never carries digests, session ids,
+   * or summary/bootstrap bodies — those stay off TaskSummary and chat.
+   */
+  handoffProgress?: HandoffProgress;
 }
 
 export interface TranscriptItem {
@@ -379,6 +425,21 @@ export type OutMessage =
    * task-scoped `commandError`; cancel posts nothing.
    */
   | { type: 'exportTask'; taskId: string }
+  /**
+   * Request a runtime model/backend handoff on an existing idle task.
+   * Host validates, chains requestRuntimeHandoff → completeRuntimeHandoff,
+   * and projects progress via snapshot/taskUpdated. Refusals use task-scoped
+   * `commandError`. Success is observed via updated TaskSummary.backend/model
+   * + handoffProgress (no chat turns, no session ids).
+   */
+  | {
+      type: 'requestRuntimeHandoff';
+      taskId: string;
+      targetBackend: string;
+      targetModel?: string;
+      /** When true (default on host), skip the optional hidden source-summary turn. */
+      skipSummary?: boolean;
+    }
   | { type: 'blurTask' }
   | { type: 'requestSettings' }
   | { type: 'updateSetting'; settingId: RetentionSettingId; value: number }
@@ -525,6 +586,64 @@ function isTurnActivity(v: unknown): v is TurnActivity {
   }
 }
 
+const TASK_HANDOFF_PHASES = new Set<TaskHandoffPhase>([
+  'requested',
+  'exporting_context',
+  'summarizing_source',
+  'preparing_receiver',
+  'transferring',
+  'completed',
+  'failed',
+  'cancelled',
+]);
+
+function isTaskHandoffPhase(v: unknown): v is TaskHandoffPhase {
+  return isString(v) && TASK_HANDOFF_PHASES.has(v as TaskHandoffPhase);
+}
+
+function isHandoffProgressBinding(v: unknown): v is HandoffProgressBinding {
+  if (!isRecord(v) || !isString(v.backend)) return false;
+  // Labels only — reject session ids or other secret-bearing keys at the wire guard.
+  if (!hasOnlyKeys(v, ['backend', 'model'])) return false;
+  return v.model === undefined || isString(v.model);
+}
+
+function isHandoffProgressFailure(v: unknown): v is HandoffProgressFailure {
+  if (!isRecord(v)) return false;
+  if (!hasOnlyKeys(v, ['code', 'message', 'at'])) return false;
+  return isString(v.code) && isString(v.message) && isString(v.at);
+}
+
+function isHandoffProgress(v: unknown): v is HandoffProgress {
+  if (!isRecord(v)) return false;
+  if (
+    !hasOnlyKeys(v, [
+      'operationId',
+      'phase',
+      'source',
+      'target',
+      'createdAt',
+      'updatedAt',
+      'startedAt',
+      'finishedAt',
+      'failure',
+    ])
+  ) {
+    return false;
+  }
+  return (
+    isString(v.operationId) &&
+    isTaskHandoffPhase(v.phase) &&
+    isHandoffProgressBinding(v.source) &&
+    isHandoffProgressBinding(v.target) &&
+    isString(v.createdAt) &&
+    isString(v.updatedAt) &&
+    (v.startedAt === undefined || isString(v.startedAt)) &&
+    (v.finishedAt === undefined || isString(v.finishedAt)) &&
+    (v.failure === undefined || isHandoffProgressFailure(v.failure))
+  );
+}
+
 function isTaskSummary(v: unknown): v is TaskSummary {
   if (!isRecord(v)) return false;
   return (
@@ -537,7 +656,13 @@ function isTaskSummary(v: unknown): v is TaskSummary {
     isTurnActivity(v.currentTurnActivity) &&
     isString(v.updatedAt) &&
     isString(v.backend) &&
-    (v.model === undefined || isString(v.model))
+    (v.model === undefined || isString(v.model)) &&
+    (v.continuationOf === undefined || isString(v.continuationOf)) &&
+    (v.hasOutcomeProposal === undefined || typeof v.hasOutcomeProposal === 'boolean') &&
+    (v.runtimeActivity === undefined ||
+      v.runtimeActivity === null ||
+      isString(v.runtimeActivity)) &&
+    (v.handoffProgress === undefined || isHandoffProgress(v.handoffProgress))
   );
 }
 

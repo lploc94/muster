@@ -223,6 +223,11 @@ body {
   font-weight: 400;
 }
 
+/* Task-scoped model-switch progress (never chat). */
+.handoff-progress-bar {
+  margin: 6px 8px 0;
+}
+
 .turn-live-dot {
   width: 7px;
   height: 7px;
