@@ -7,12 +7,17 @@ import { runTurn as defaultRunTurn } from '../runner';
 import type { Backend, LiveInputResult, NormalizedEvent, RunOptions } from '../types';
 import type { TaskHandoffPhase, TurnTrigger } from './types';
 import { canBindTaskToBackend } from './backend-eligibility';
-import { compileTaskPrompt } from './brief';
+import { assembleFirstTurnPrompt, synthesizeBriefFromGoal } from './brief';
+import { capabilitiesFor } from './capabilities';
 import {
   formatPinnedInputsForPrompt,
   pinResolvedInputs,
   resolveInputBindings,
 } from './dataflow';
+import {
+  minimalHostSnapshot,
+  type HostEnvironmentSnapshot,
+} from './host-context';
 import {
   buildHandoffBootstrapPrompt,
   buildHandoffPackage,
@@ -115,6 +120,19 @@ export interface TaskEngineConfig {
    * Host should pass `() => vscode.workspace.isTrusted`.
    */
   isWorkspaceTrusted?: () => boolean;
+  /**
+   * Host-context W1: async prepare that fills backend/model cache (idempotent;
+   * concurrent callers share one in-flight). Engine races this with a 2s timeout
+   * at the single first-turn freeze site only.
+   */
+  prepareHostEnvironment?: () => Promise<void>;
+  /**
+   * Sync read of last resolved host env cache only (no I/O).
+   * Missing → engine synthesizes minimalHostSnapshot.
+   */
+  getHostEnvironment?: () => HostEnvironmentSnapshot | undefined;
+  /** Fallback cwd when task.cwd and snapshot.cwd are absent. */
+  workspaceFolder?: string;
 }
 
 export type EngineResult<T> =
@@ -497,6 +515,9 @@ export class TaskEngine {
   private readonly resourceLimits: ResourceLimits;
   private readonly emit?: (e: EngineEvent) => void;
   private readonly isWorkspaceTrusted: () => boolean;
+  private readonly prepareHostEnvironment?: () => Promise<void>;
+  private readonly getHostEnvironment?: () => HostEnvironmentSnapshot | undefined;
+  private readonly workspaceFolder?: string;
   /**
    * In-process handles for currently executing turns. Keyed by turnId so live
    * input can route only to a run this engine owns, with the exact backend
@@ -546,6 +567,46 @@ export class TaskEngine {
     this.resourceLimits = config.resourceLimits ?? DEFAULT_RESOURCE_LIMITS;
     this.emit = config.emit;
     this.isWorkspaceTrusted = config.isWorkspaceTrusted ?? (() => true);
+    this.prepareHostEnvironment = config.prepareHostEnvironment;
+    this.getHostEnvironment = config.getHostEnvironment;
+    this.workspaceFolder = config.workspaceFolder;
+  }
+
+  /** 2s-capped host prepare before sequence-1 assemble (single freeze site). */
+  private async prepareHostForFirstTurn(): Promise<void> {
+    if (!this.prepareHostEnvironment) return;
+    try {
+      await Promise.race([
+        this.prepareHostEnvironment().catch(() => {
+          // Rejection → fall through to minimal snapshot at assemble.
+        }),
+        new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
+      ]);
+    } catch {
+      // Never strand the turn: assemble with minimalHostSnapshot.
+    }
+  }
+
+  /**
+   * Sync host snapshot for assemble. Never returns undefined.
+   * task.cwd wins; trusted always from isWorkspaceTrusted().
+   */
+  private resolveHostSnapshot(task: MusterTask): HostEnvironmentSnapshot {
+    const trusted = this.isWorkspaceTrusted();
+    const cached = this.getHostEnvironment?.();
+    const cwd =
+      (task.cwd && task.cwd.length > 0 ? task.cwd : undefined) ??
+      cached?.cwd ??
+      this.workspaceFolder ??
+      process.cwd();
+    if (!cached) {
+      return minimalHostSnapshot(cwd, trusted);
+    }
+    return {
+      ...cached,
+      cwd,
+      trusted,
+    };
   }
 
   /** W9: host calls when workspace trust is granted — rescan safe queued work. */
@@ -3387,6 +3448,14 @@ export class TaskEngine {
     }
 
     const now = nowIso(this.clock);
+
+    // Host-context W1: prepare only at the single freeze site (seq-1, unpinned).
+    const needsFirstTurnAssemble =
+      turn.sequence === 1 && turn.resolvedInputs === undefined;
+    if (needsFirstTurnAssemble) {
+      await this.prepareHostForFirstTurn();
+    }
+
     const startCommit = this.store.commit((draft) => {
       const draftTurn = draft.turns[turnId];
       const draftTask = draft.tasks[turn.taskId];
@@ -3401,15 +3470,15 @@ export class TaskEngine {
         return { ok: false, reason: 'task is terminal' };
       }
 
-      // W1/W2: resolve bindings + compile brief into durable pin before process dispatch.
-      // Persist attention on missing inputs with ok:true (commit rejects on ok:false).
+      // Single freeze site: sequence === 1 only. Queue paths never assemble.
+      // Presence of resolvedInputs (even []) is the durable pin marker — never re-assemble.
       let turnForStart = draftTurn;
-      const bindings = draftTask.inputBindings;
-      if (bindings && bindings.length > 0) {
-        // Presence of resolvedInputs (even []) is the durable pin marker — never re-resolve.
-        if (draftTurn.resolvedInputs !== undefined) {
-          turnForStart = draftTurn;
-        } else {
+      let taskForStart = draftTask;
+
+      if (draftTurn.sequence === 1 && draftTurn.resolvedInputs === undefined) {
+        let pins: import('./types').ResolvedInputPin[] = [];
+        const bindings = draftTask.inputBindings;
+        if (bindings && bindings.length > 0) {
           const resolved = resolveInputBindings(bindings, draft.tasks);
           if (!resolved.ok) {
             draft.tasks[draftTask.id] = {
@@ -3426,44 +3495,91 @@ export class TaskEngine {
             // Leave turn queued; caller detects status !== running.
             return { ok: true };
           }
-          const compiled = draftTask.brief
-            ? compileTaskPrompt(draftTask.brief, resolved.pins, {
-                taskId: draftTask.id,
-                goal: draftTask.goal,
-              })
-            : formatPinnedInputsForPrompt(resolved.pins);
-          const pinned = pinResolvedInputs(draftTurn, resolved.pins, compiled || undefined);
-          if (!pinned.ok) {
-            return { ok: false, reason: pinned.reason };
-          }
-          turnForStart = pinned.next;
-          // Clear prior missing_input attention once pins succeed.
-          if (draftTask.attention?.code === 'missing_input') {
-            draft.tasks[draftTask.id] = {
-              ...draftTask,
-              revision: draftTask.revision + 1,
-              updatedAt: now,
-              attention: undefined,
-            };
-          }
+          pins = resolved.pins;
         }
-      } else if (
-        draftTask.brief &&
-        draftTurn.resolvedInputs === undefined &&
-        draftTurn.trigger === 'engine' &&
-        draftTurn.sequence === 1
-      ) {
-        // W2: engine first-turn intents freeze brief-compiled prompt (no dataflow pins).
-        // User-triggered turns keep message content as the prompt body.
-        const compiled = compileTaskPrompt(draftTask.brief, [], {
-          taskId: draftTask.id,
-          goal: draftTask.goal,
+
+        const brief =
+          draftTask.brief ??
+          synthesizeBriefFromGoal(draftTask.goal, draftTask.description);
+        const snapshot = this.resolveHostSnapshot(draftTask);
+        const tools = [...capabilitiesFor(draftTask)].sort();
+        const assembled = assembleFirstTurnPrompt({
+          snapshot,
+          self: {
+            taskId: draftTask.id,
+            role: draftTask.role,
+            backend: draftTask.backend,
+            ...(draftTask.model !== undefined ? { model: draftTask.model } : {}),
+            ...(draftTask.parentId ? { parentTaskId: draftTask.parentId } : {}),
+            ...(draftTask.goal ? { goal: draftTask.goal } : {}),
+          },
+          tools,
+          taskCwd: draftTask.cwd,
+          brief,
+          resolvedInputs: pins,
+          meta: { taskId: draftTask.id, goal: draftTask.goal },
         });
-        const pinned = pinResolvedInputs(draftTurn, [], compiled);
+
+        if (!assembled.ok) {
+          // Budget fail: assign bound messages, fail turn in-commit (no adapter run).
+          for (const input of draftTurn.inputs) {
+            if (input.kind !== 'message') continue;
+            const message = draft.messages[input.messageId];
+            if (!message || message.taskId !== turn.taskId) continue;
+            if (message.state === 'pending' || message.state === 'assigned') {
+              draft.messages[input.messageId] = {
+                ...message,
+                state: 'complete',
+                turnId,
+              };
+            }
+          }
+          const started = startProcess(draftTurn, { now });
+          if (!started.ok) {
+            return started;
+          }
+          const failed = applyFailedTurn(draftTask, started.next, {
+            error: assembled.message,
+            retryCount: 0,
+            policy: draftTask.executionPolicy,
+            onExhausted: 'recover',
+            now,
+            failureClass: 'unclassified',
+          });
+          if (!failed.ok) {
+            return { ok: false, reason: failed.reason };
+          }
+          draft.tasks[draftTask.id] = {
+            ...failed.next.task,
+            attention: {
+              code: 'prompt_budget_exceeded',
+              message: assembled.message,
+              at: now,
+              sourceTurnId: turnId,
+            },
+          };
+          draft.turns[turnId] = failed.next.turn;
+          return { ok: true };
+        }
+
+        const pinned = pinResolvedInputs(draftTurn, pins, assembled.prompt);
         if (!pinned.ok) {
           return { ok: false, reason: pinned.reason };
         }
         turnForStart = pinned.next;
+        // Clear prior missing_input / budget attention once freeze succeeds.
+        if (
+          draftTask.attention?.code === 'missing_input' ||
+          draftTask.attention?.code === 'prompt_budget_exceeded'
+        ) {
+          taskForStart = {
+            ...draftTask,
+            revision: draftTask.revision + 1,
+            updatedAt: now,
+            attention: undefined,
+          };
+          draft.tasks[draftTask.id] = taskForStart;
+        }
       }
 
       // R012: assign only messages already bound to this turn. Do not sweep other
@@ -3496,10 +3612,14 @@ export class TaskEngine {
       releaseLease(this.storePath, turnId, lease);
       return;
     }
-    // W1: pin gate may persist attention and leave the turn queued.
+    // Pin gate / budget fail: leave queued or failed without adapter dispatch.
     {
       const afterPin = this.store.getFile().turns[turnId];
       if (!afterPin || afterPin.status !== 'running') {
+        if (afterPin?.status === 'failed') {
+          // Budget fail: wake parent waits (needs_attention) + prune ledger.
+          this.afterTurnSettled(turnId);
+        }
         releaseLease(this.storePath, turnId, lease);
         return;
       }

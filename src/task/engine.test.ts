@@ -368,7 +368,8 @@ describe('TaskEngine', () => {
     if (!started.ok) return;
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(capturedPrompt).not.toContain('SECRET_PLAN');
-    expect(store.getFile().turns[started.value.turnId].resolvedInputs).toBeUndefined();
+    // Seq-1 freeze pins empty resolvedInputs when there are no bindings.
+    expect(store.getFile().turns[started.value.turnId].resolvedInputs).toEqual([]);
     engine.stageDisposition(started.value.turnId, { kind: 'idle' }, 'op-u');
     resume?.();
     await engine.whenIdle();
@@ -584,6 +585,14 @@ describe('TaskEngine', () => {
     if (!sent.ok || !sent.value.turnId) {
       return;
     }
+    // Wait until promote/dispatch started (first-turn assemble is async).
+    for (let i = 0; i < 100; i++) {
+      const st = store.getFile().turns[sent.value.turnId]?.status;
+      if (st === 'running') break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    // Let sessionStarted land before interrupt.
+    await new Promise((resolve) => setTimeout(resolve, 20));
     engine.interruptTurn(sent.value.turnId);
     release?.();
     await engine.whenIdle();
@@ -761,7 +770,12 @@ describe('TaskEngine', () => {
     for (let i = 0; i < 100 && prompts.length < 3; i++) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
-    expect(prompts).toEqual(['first', 'second', 'third']);
+    // First turn includes host+brief compile prefix; follow-ups are message-only.
+    expect(prompts[0]).toContain('first');
+    expect(prompts[0]).toContain('# Muster host context');
+    expect(prompts[1]).toBe('second');
+    expect(prompts[2]).toBe('third');
+    expect(prompts).toHaveLength(3);
 
     const third = Object.values(store.getFile().turns).find(
       (turn) =>
@@ -782,7 +796,6 @@ describe('TaskEngine', () => {
     for (const turn of turns) {
       expect(turn.inputs.filter((input) => input.kind === 'message')).toHaveLength(1);
     }
-    expect(prompts).toEqual(['first', 'second', 'third']);
   });
 
   it('reopens hard-terminal tasks on send (same task id)', async () => {

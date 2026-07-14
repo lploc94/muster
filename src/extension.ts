@@ -58,6 +58,7 @@ import { enumerateModels, type BackendModels } from './backends/model-catalog';
 import { SESSION_MIGRATION_MARKER, migrateLegacySessions } from './task/migration-sessions';
 import { applyRetention, retentionChanged, type RetentionConfig } from './task/retention';
 import { TaskEngine, type EngineEvent, viewStatusFromDraft } from './task/engine';
+import type { HostEnvironmentSnapshot } from './task/host-context';
 import { TaskStore, computeAffectedTaskIds, type CommitResult } from './task/store';
 import { isTerminalLifecycle } from './task/transitions';
 import { resolveWorkspaceCwd } from './task/workspace-cwd';
@@ -78,6 +79,58 @@ let taskEngine: TaskEngine | undefined;
 let taskStore: TaskStore | undefined;
 let storePath: string | undefined;
 let workspaceRoot: string | undefined;
+
+/** Shared host-env cache for first-turn inject + get_host_context (W1). */
+let hostEnvCache: HostEnvironmentSnapshot | undefined;
+let hostEnvPrepare: Promise<void> | undefined;
+
+function writeHostEnvCache(partial: {
+  availableBackends?: string[];
+  models?: Record<string, BackendModels>;
+}): void {
+  const cwd = resolveTaskCwd();
+  const trusted = vscode.workspace.isTrusted;
+  hostEnvCache = {
+    cwd,
+    trusted,
+    availableBackends: partial.availableBackends ?? hostEnvCache?.availableBackends ?? [],
+    models: partial.models
+      ? Object.fromEntries(
+          Object.entries(partial.models).map(([k, v]) => [
+            k,
+            {
+              ...(v.current !== undefined ? { current: v.current } : {}),
+              options: v.options.map((o) => ({ value: o.value, name: o.name })),
+            },
+          ]),
+        )
+      : (hostEnvCache?.models ?? {}),
+  };
+}
+
+async function prepareHostEnvironment(): Promise<void> {
+  if (!hostEnvPrepare) {
+    hostEnvPrepare = (async () => {
+      try {
+        const backends = await detectAvailableBackends();
+        writeHostEnvCache({ availableBackends: backends });
+        const models = await enumerateModels(backends, resolveTaskCwd());
+        writeHostEnvCache({ availableBackends: backends, models });
+      } catch {
+        // leave cache partial/empty; engine synthesizes minimal
+      }
+    })();
+  }
+  await hostEnvPrepare;
+}
+
+function getHostEnvironment(): HostEnvironmentSnapshot | undefined {
+  if (!hostEnvCache) return undefined;
+  return {
+    ...hostEnvCache,
+    trusted: vscode.workspace.isTrusted,
+  };
+}
 let presentationManager: PresentationManager | undefined;
 let lastObservedRevision = 0;
 let lastObservedFile: TaskStoreFile | undefined;
@@ -479,6 +532,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       // don't run detection twice.
       this.availableBackendsPromise ??= detectAvailableBackends();
       const backends = await this.availableBackendsPromise;
+      writeHostEnvCache({ availableBackends: backends });
       this.post({ type: 'backendsAvailable', backends });
     } catch {
       // Detection failed — drop the cached rejection so a later request retries;
@@ -544,6 +598,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
 
     try {
       const models = await this.availableModelsPromise;
+      writeHostEnvCache({ models });
       this.post({ type: 'modelsAvailable', models });
       // Empty catalog: drop cache so a later listModels can retry (transient ACP failures).
       if (Object.keys(models).length === 0) {
@@ -2402,6 +2457,9 @@ export async function activate(context: vscode.ExtensionContext) {
       credentialRegistry,
       bridgePort: port,
       isWorkspaceTrusted: () => vscode.workspace.isTrusted,
+      prepareHostEnvironment,
+      getHostEnvironment,
+      workspaceFolder: resolveTaskCwd(),
       emit: (event) => {
         try {
           provider.forwardTurnEvent(event);
