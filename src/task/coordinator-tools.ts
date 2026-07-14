@@ -6,6 +6,11 @@ import type { TaskDependency, TaskExecutionPolicy, TaskRole } from './types';
 export interface CreateChildSpec {
   goal: string;
   backend: string;
+  /**
+   * Optional ACP model id for this child (session config / set_model value).
+   * When omitted, the backend agent uses its own default model.
+   */
+  model?: string;
   role?: TaskRole;
   dependencies?: TaskDependency[];
   executionPolicy?: Partial<TaskExecutionPolicy>;
@@ -196,6 +201,10 @@ function parseCreateSpec(args: Record<string, unknown>): CreateChildSpec | undef
     return undefined;
   }
   const spec: CreateChildSpec = { goal, backend };
+  const model = requireString(args, 'model');
+  if (model) {
+    spec.model = model;
+  }
   if (typeof args.role === 'string' && (args.role === 'coordinator' || args.role === 'worker')) {
     spec.role = args.role;
   }

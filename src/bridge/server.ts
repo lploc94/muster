@@ -80,6 +80,8 @@ const CREATE_SPEC_PROPERTIES = {
   opId: OP_ID,
   goal: { type: 'string', minLength: 1 },
   backend: { type: 'string', minLength: 1 },
+  /** ACP model id (config option value or session/set_model id). Optional. */
+  model: { type: 'string', minLength: 1 },
   role: { enum: ['coordinator', 'worker'] },
   dependencies: { type: 'array', items: DEPENDENCY_SCHEMA },
   executionPolicy: EXECUTION_POLICY_SCHEMA,

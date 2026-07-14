@@ -249,6 +249,46 @@ describe('engine graph orchestration', () => {
     expect(turns[0]?.trigger).toBe('engine');
   });
 
+  it('create_task / delegate_task persist optional model on child', async () => {
+    const { store, engine, credentials } = makeHarness();
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child', 'wait_child', 'read_subtree'],
+    });
+    const started = engine.startTask('coord');
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId: started.value.turnId,
+      allowedActions: new Set(['create_task', 'delegate_task', 'complete_task']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+
+    await engine.handleToolCall(ctx, 'create_task', {
+      kind: 'create_task',
+      opId: 'op-model-create',
+      spec: { goal: 'plan', backend: 'codex', model: 'gpt-5', role: 'worker' },
+    });
+    const createId = deriveEntityId(started.value.turnId, 'op-model-create', 'task');
+    expect(store.getTask(createId)?.model).toBe('gpt-5');
+    expect(store.getTask(createId)?.backend).toBe('codex');
+
+    await engine.handleToolCall(ctx, 'delegate_task', {
+      kind: 'delegate_task',
+      opId: 'op-model-del',
+      spec: { goal: 'impl', backend: 'claude', model: 'sonnet', role: 'worker' },
+    });
+    const delId = deriveEntityId(started.value.turnId, 'op-model-del', 'task');
+    expect(store.getTask(delId)?.model).toBe('sonnet');
+    expect(store.getTask(delId)?.backend).toBe('claude');
+  });
+
   it('cancel_task via coordinator terminally cancels a child subtree and queued turns', async () => {
     const { store, engine, credentials } = makeHarness();
     engine.createTask({

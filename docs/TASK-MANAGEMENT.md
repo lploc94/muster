@@ -801,8 +801,8 @@ tools.
 
 | Tool | Caller | Purpose |
 |------|--------|---------|
-| `create_task` | Coordinator | Create a **draft** direct child (no first turn; not scheduler-eligible) |
-| `delegate_task` | Coordinator | Atomically create a **released** child + queue first-turn intent |
+| `create_task` | Coordinator | Create a **draft** direct child (no first turn; not scheduler-eligible). Args: `goal`, `backend`, optional `model` (ACP model id), `role`, `dependencies`, `executionPolicy` |
+| `delegate_task` | Coordinator | Atomically create a **released** child + queue first-turn intent (same args as `create_task`, including optional `model`) |
 | `release_tasks` | Coordinator | Atomic draft→released for `taskIds[]` (+ optional dep closure); queues first-turn intents |
 | `start_task` | **Host / recovery only** | Not in coordinator MCP `allowedActions`; rejects draft |
 | `interrupt_task` | Coordinator | Interrupt an active direct child turn |

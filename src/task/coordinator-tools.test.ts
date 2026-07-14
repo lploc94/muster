@@ -149,6 +149,19 @@ describe('coordinator-tools dispatch', () => {
     }
   });
 
+  it('maps create_task model into CreateChildSpec', () => {
+    const result = dispatch(
+      'create_task',
+      { opId: 'op-1', goal: 'plan work', backend: 'codex', model: 'gpt-5' },
+      ctx(['create_task']),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && result.command.kind === 'create_task') {
+      expect(result.command.spec.model).toBe('gpt-5');
+      expect(result.command.spec.backend).toBe('codex');
+    }
+  });
+
   it('maps release_tasks to ToolCommand', () => {
     const result = dispatch(
       'release_tasks',

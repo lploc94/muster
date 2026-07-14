@@ -344,6 +344,8 @@ export async function executeToolCommand(
           parentId: ctx.callerTaskId,
           dependencies: command.spec.dependencies ?? [],
           backend: command.spec.backend,
+          // Optional ACP model id; omit → agent default for that backend.
+          model: command.spec.model,
           // Children inherit the parent's workspace directory so delegated
           // sub-tasks run in the same place and never fall back to process.cwd().
           cwd: caller.cwd,
