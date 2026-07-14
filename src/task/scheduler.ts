@@ -1,6 +1,7 @@
 import { evaluateDependency } from './deps';
 import { isActiveHandoffPhase } from './engine-handoff';
 import type { ResourceLimits } from './limits';
+import { evaluateTaskReadiness, readinessToPromoteReason } from './readiness';
 import type { TaskStoreFile, TaskTurn } from './types';
 
 const LIVE_STATUSES: ReadonlySet<TaskTurn['status']> = new Set(['running', 'waiting_user']);
@@ -131,27 +132,28 @@ export function canPromoteTurn(
     return { ok: false, reason: 'earlier queued turn must run first' };
   }
 
+  // W5: same readiness evaluator as get_task_status / UI (draft, deps, inputs, wait, handoff, holds).
+  const readiness = evaluateTaskReadiness(file, turn.taskId);
+  if (!readiness.schedulable) {
+    const reason = readinessToPromoteReason(readiness);
+    if (reason) return { ok: false, reason };
+  }
+  // Turn-specific holds still apply when readiness is otherwise clear.
+  if (turn.holdAutoPromote) {
+    return { ok: false, reason: 'held after previous turn failure' };
+  }
+  // Keep handoff/deps double-check for defense in depth if readiness drifts.
   if (dependenciesBlockTask(file, turn.taskId)) {
     return { ok: false, reason: 'dependencies not satisfied' };
   }
-
-  // Open composer may accept sends while task.wait is active; do not promote early.
   if (task.wait?.kind === 'children') {
     return { ok: false, reason: 'waiting on child tasks' };
   }
   if (task.wait?.kind === 'external') {
     return { ok: false, reason: 'waiting on external blocker' };
   }
-
-  // Active runtime handoff owns the binding — queue but do not promote until rebind/fail.
-  // Do not reuse holdAutoPromote (that flag is MEM030 failure-safety only).
   if (task.handoff && isActiveHandoffPhase(task.handoff.phase)) {
     return { ok: false, reason: 'runtime handoff in progress' };
-  }
-
-  // Pre-failure FIFO holds require explicit resume (not auto-promote).
-  if (turn.holdAutoPromote) {
-    return { ok: false, reason: 'held after previous turn failure' };
   }
 
   if (countRunningTurns(file) >= limits.maxConcurrentTurns) {

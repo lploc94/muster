@@ -19,6 +19,7 @@ import {
   type ExecutionPolicyBounds,
   type ResourceLimits,
 } from './limits';
+import { evaluateTaskReadiness } from './readiness';
 import { canPromoteTurn } from './scheduler';
 import type { TaskStore } from './store';
 import {
@@ -139,6 +140,8 @@ export interface GraphEngineDeps {
   liveRuns: Map<string, { controller: AbortController }>;
   pendingAskPromises: Map<string, { promise: Promise<Answers>; fingerprint: string }>;
   onScheduleTurn: (turnId: string) => void;
+  /** W5: rescan queued released turns after lifecycle/resource changes. */
+  onRescanSchedulableTurns?: (affectedTaskIds?: readonly string[]) => void;
   leaseOwnerAlive: (turnId: string) => boolean;
   ownsLease: (turnId: string) => boolean;
   writeCancelRequest: (
@@ -722,6 +725,8 @@ export async function executeToolCommand(
         });
         return { ok: true };
       });
+      // Full rescan: dependents outside the cancelled subtree may now be ready.
+      deps.onRescanSchedulableTurns?.();
       return { ok: true, result: { cancelled: command.childId } };
     }
 
@@ -798,11 +803,20 @@ export async function executeToolCommand(
       const nodes = [targetId, ...descendantIds(file, targetId)].map((id) => {
         const t = file.tasks[id];
         if (!t) return undefined;
+        const readiness = evaluateTaskReadiness(file, id);
         return {
           id: t.id,
           lifecycle: t.lifecycle,
+          releaseState: t.releaseState ?? 'draft',
           goal: t.goal.slice(0, 128),
           parentId: t.parentId,
+          attention: t.attention,
+          resultSummary: t.taskResult?.summary ?? t.result,
+          readiness: {
+            code: readiness.code,
+            schedulable: readiness.schedulable,
+            reasons: readiness.reasons,
+          },
         };
       }).filter((n): n is NonNullable<typeof n> => n !== undefined);
       return { ok: true, result: { root: targetId, tasks: nodes.slice(0, 32) } };

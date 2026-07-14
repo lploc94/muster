@@ -42,6 +42,7 @@ import {
   type GraphEngineDeps,
 } from './engine-graph';
 import type { ToolCommand } from './coordinator-tools';
+import { evaluateTaskReadiness } from './readiness';
 import { canPromoteTurn, dependencyTerminalOutcome } from './scheduler';
 import { canCreateTurn, DEFAULT_RESOURCE_LIMITS, type ResourceLimits } from './limits';
 import { selectCommittedSessionId } from './session-select';
@@ -563,6 +564,7 @@ export class TaskEngine {
       liveRuns: this.liveRuns,
       pendingAskPromises: this.pendingAskPromises,
       onScheduleTurn: (turnId) => void this.scheduleTurn(turnId),
+      onRescanSchedulableTurns: (ids) => this.rescanSchedulableTurns(ids),
       leaseOwnerAlive: (turnId) => leaseOwnerAlive(this.storePath, turnId),
       ownsLease: (turnId) => ownsLocalLease(this.storePath, turnId),
       writeCancelRequest: (turnId, kind, by, opId, sealedBy) => {
@@ -1856,6 +1858,19 @@ export class TaskEngine {
         draft.tasks[taskId] = draftTask;
       }
 
+      // Host user send is create-and-run for drafts (same policy as startTask).
+      if ((draftTask.releaseState ?? 'draft') === 'draft') {
+        draftTask = {
+          ...draftTask,
+          releaseState: 'released',
+          releasedAt: now,
+          releaseAttemptId: `host:send:${randomUUID()}`,
+          revision: draftTask.revision + 1,
+          updatedAt: now,
+        };
+        draft.tasks[taskId] = draftTask;
+      }
+
       // R012: every Enter/send becomes one distinct FIFO turn bound to this message.
       // Concurrent sends while a turn is live/queued still create queued turns
       // (scheduler promotes one-at-a-time). Refuse visibly when a turn cannot be
@@ -2402,6 +2417,8 @@ export class TaskEngine {
       // Note: host elicitationBridge.cancelForSession is invoked from extension cancel paths when available.
       this.credentialRegistry?.revoke(live.id);
     }
+    // Seal may unblock dependents — rescan queued released turns.
+    this.rescanSchedulableTurns();
     return { ok: true, value: undefined };
   }
 
@@ -2491,6 +2508,7 @@ export class TaskEngine {
       this.dropElicitationWaits(turnId);
       this.credentialRegistry?.revoke(turnId);
     }
+    this.rescanSchedulableTurns();
     return { ok: true, value: undefined };
   }
 
@@ -2579,6 +2597,7 @@ export class TaskEngine {
       this.dropElicitationWaits(turnId);
       this.credentialRegistry?.revoke(turnId);
     }
+    this.rescanSchedulableTurns();
     return { ok: true, value: undefined };
   }
 
@@ -3114,6 +3133,30 @@ export class TaskEngine {
     return slotsUsed > cap;
   }
 
+  /**
+   * W5: re-evaluate queued released turns after readiness-changing commits
+   * (release, lifecycle seal, dependency terminal, settle, trust grant).
+   */
+  private rescanSchedulableTurns(affectedTaskIds?: readonly string[]): void {
+    const file = this.store.getFile();
+    const queued = Object.values(file.turns)
+      .filter((t) => t.status === 'queued')
+      .filter((t) => {
+        if (!affectedTaskIds || affectedTaskIds.length === 0) return true;
+        return affectedTaskIds.includes(t.taskId);
+      })
+      .sort(
+        (a, b) =>
+          a.sequence - b.sequence ||
+          a.createdAt.localeCompare(b.createdAt) ||
+          a.id.localeCompare(b.id),
+      );
+    for (const turn of queued) {
+      if (this.deferredQueuedTurns.has(turn.id)) continue;
+      void this.scheduleTurn(turn.id);
+    }
+  }
+
   private scheduleTurn(turnId: string): Promise<void> {
     this.reconcileTaskTimeouts();
     this.applyDependencyTerminals();
@@ -3123,6 +3166,34 @@ export class TaskEngine {
       return Promise.resolve();
     }
     if (!tryPromoteTurn(this.store, turnId, this.resourceLimits)) {
+      // Persist missing_input attention when readiness blocks pin (W1/W5).
+      const file = this.store.getFile();
+      const t = file.turns[turnId];
+      if (t) {
+        const readiness = evaluateTaskReadiness(file, t.taskId);
+        if (
+          readiness.reasons.some((r) => r.code === 'missing_input_binding') &&
+          file.tasks[t.taskId]?.attention?.code !== 'missing_input'
+        ) {
+          const now = nowIso(this.clock);
+          this.store.commit((draft) => {
+            const task = draft.tasks[t.taskId];
+            if (!task) return { ok: true };
+            draft.tasks[t.taskId] = {
+              ...task,
+              revision: task.revision + 1,
+              updatedAt: now,
+              attention: {
+                code: 'missing_input',
+                message: 'missing required input binding',
+                at: now,
+                sourceTurnId: turnId,
+              },
+            };
+            return { ok: true };
+          });
+        }
+      }
       return Promise.resolve();
     }
     const existing = this.turnPromises.get(turnId);
