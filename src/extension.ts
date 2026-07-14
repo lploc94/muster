@@ -2171,8 +2171,23 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
 
   private _getHtmlForWebview(webview: vscode.Webview): string {
     const dist = vscode.Uri.joinPath(this._extensionUri, 'dist', 'webview', 'assets');
-    const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(dist, 'index.js'));
-    const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(dist, 'index.css'));
+    // Cache-bust CSS/JS by the built asset's mtime. The resource filenames carry no
+    // content hash, so the webview URL is byte-identical across reloads — VS Code's
+    // webview resource cache then keeps serving the PREVIOUS build's stylesheet even
+    // after a rebuild + reload, until the whole dev host is torn down. A per-content
+    // version query changes the URL only when the asset actually changes, forcing a
+    // fresh fetch then and letting the cache stay warm otherwise.
+    const version = (file: vscode.Uri): string => {
+      try {
+        return String(Math.trunc(fs.statSync(file.fsPath).mtimeMs));
+      } catch {
+        return '0';
+      }
+    };
+    const scriptFile = vscode.Uri.joinPath(dist, 'index.js');
+    const styleFile = vscode.Uri.joinPath(dist, 'index.css');
+    const scriptUri = `${webview.asWebviewUri(scriptFile)}?v=${version(scriptFile)}`;
+    const styleUri = `${webview.asWebviewUri(styleFile)}?v=${version(styleFile)}`;
     const cspSource = webview.cspSource;
 
     return `<!DOCTYPE html>

@@ -13,52 +13,54 @@ const outDir = fileURLToPath(new URL('../dist/webview', import.meta.url));
  *   - dist/webview/assets/index.css        (main chat webview — extension.ts)
  *   - dist/webview/assets/presentation.css (presentation panel)
  *
- * Multi-entry + shared CSS can name the extracted sheet after a chunk (e.g.
- * markdown.css). Emit the host-expected aliases from that single stylesheet.
+ * Multi-entry builds may split CSS several ways: one shared chunk sheet (named
+ * after a chunk, e.g. markdown.css) carrying Tailwind/codicons, plus optional
+ * entry-specific sheets already named index.css / presentation.css (an index-only
+ * component's scoped styles land there). The host loads ONLY the two aliases, so
+ * each alias must carry the COMPLETE stylesheet. Concatenate every emitted CSS
+ * (shared base first, then per-entry styles) and write it to both aliases.
  */
 function stableWebviewCssAliases(): Plugin {
   const aliases = ['assets/index.css', 'assets/presentation.css'] as const;
+  const toText = (source: string | Uint8Array): string =>
+    typeof source === 'string' ? source : Buffer.from(source).toString('utf8');
 
   return {
     name: 'stable-webview-css-aliases',
     generateBundle(_options, bundle) {
       const cssAssets = Object.values(bundle).filter(
         (output): output is Extract<typeof output, { type: 'asset' }> =>
-          output.type === 'asset' &&
-          output.fileName.endsWith('.css') &&
-          !aliases.includes(output.fileName as (typeof aliases)[number]),
+          output.type === 'asset' && output.fileName.endsWith('.css'),
       );
 
       if (cssAssets.length === 0) {
-        // Already emitted under a stable name (e.g. only index.css in bundle).
-        const hasIndex = Boolean(bundle['assets/index.css']);
-        const hasPresentation = Boolean(bundle['assets/presentation.css']);
-        if (hasIndex && hasPresentation) return;
-        if (hasIndex && !hasPresentation) {
-          const source = (bundle['assets/index.css'] as { source: string | Uint8Array }).source;
-          this.emitFile({ type: 'asset', fileName: 'assets/presentation.css', source });
-          return;
-        }
-        if (hasPresentation && !hasIndex) {
-          const source = (bundle['assets/presentation.css'] as { source: string | Uint8Array }).source;
-          this.emitFile({ type: 'asset', fileName: 'assets/index.css', source });
-          return;
-        }
-        this.error('Expected a webview stylesheet to alias as index.css / presentation.css');
+        this.error('Expected at least one webview stylesheet to alias as index.css / presentation.css');
+        return;
       }
 
-      if (cssAssets.length !== 1) {
-        this.error(
-          `Expected exactly one shared webview stylesheet to alias, found ${cssAssets.length}: ${cssAssets
-            .map((a) => a.fileName)
-            .join(', ')}`,
-        );
-      }
+      // Shared chunk sheets (Tailwind/codicons/app.css) come first so their base
+      // layer precedes any entry-specific component styles.
+      const shared = cssAssets.filter(
+        (asset) => !aliases.includes(asset.fileName as (typeof aliases)[number]),
+      );
+      const base = shared.map((asset) => toText(asset.source)).join('\n');
+      const ownText = (fileName: string): string => {
+        const asset = bundle[fileName];
+        return asset && asset.type === 'asset' ? toText(asset.source) : '';
+      };
 
-      const source = cssAssets[0].source;
+      // Both aliases get the full union of styles; unused per-entry selectors are
+      // harmless, and this stays correct no matter how the bundler splits CSS.
+      const complete = [base, ownText('assets/index.css'), ownText('assets/presentation.css')]
+        .filter((chunk) => chunk.trim().length > 0)
+        .join('\n');
+
       for (const fileName of aliases) {
-        if (!bundle[fileName]) {
-          this.emitFile({ type: 'asset', fileName, source });
+        const existing = bundle[fileName];
+        if (existing && existing.type === 'asset') {
+          existing.source = complete;
+        } else {
+          this.emitFile({ type: 'asset', fileName, source: complete });
         }
       }
     },

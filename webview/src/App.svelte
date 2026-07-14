@@ -669,12 +669,14 @@
 {/each}
 
 {#if !inChat}
-  <!-- Entry: New task action, then the searchable previous-tasks list -->
-  <div class="flex-1 min-h-0 flex flex-col">
-    <div class="shrink-0 flex items-center">
+  <!-- Entry: New task action, then the searchable previous-tasks list.
+       Sidebar background across the whole entry so the New-task header shares one
+       light surface with the list below (matching the MUSTER view-title bar). -->
+  <div class="flex-1 min-h-0 flex flex-col" style="background: var(--vscode-sideBar-background);">
+    <div class="shrink-0 flex items-center hover:bg-[var(--vscode-list-hoverBackground)]">
       <button
         type="button"
-        class="flex-1 flex items-center gap-2 px-3 py-2 text-sm font-medium text-left hover:bg-[var(--vscode-list-hoverBackground)]"
+        class="flex-1 flex items-center gap-2 px-3 py-2 text-sm font-medium text-left"
         onclick={() => { tasks.openNewTaskDraft(); post({ type: 'newTask' }); historyOpen = false; }}
       >
         <span class="codicon codicon-add" style="font-size: 16px;"></span>
