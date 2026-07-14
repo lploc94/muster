@@ -786,7 +786,33 @@ export class TaskEngine {
     _tool: string,
     command: ToolCommand,
   ): Promise<{ ok: true; result: unknown } | { ok: false; error: string }> {
-    return executeToolCommand(
+    const kind = command.kind;
+    if (
+      kind === 'create_task' ||
+      kind === 'delegate_task' ||
+      kind === 'release_tasks' ||
+      kind === 'complete_task' ||
+      kind === 'fail_task'
+    ) {
+      console.info('[muster][task-orch] tool.call', {
+        kind,
+        callerTaskId: ctx.callerTaskId,
+        turnId: ctx.turnId,
+        opId: 'opId' in command ? command.opId : undefined,
+        ...(kind === 'create_task' || kind === 'delegate_task'
+          ? {
+              goal: command.spec.goal.slice(0, 120),
+              backend: command.spec.backend,
+              model: command.spec.model ?? null,
+              role: command.spec.role ?? null,
+            }
+          : {}),
+        ...(kind === 'release_tasks'
+          ? { taskIds: command.taskIds, includeDependencies: command.includeDependencies ?? false }
+          : {}),
+      });
+    }
+    const result = await executeToolCommand(
       this.graphDeps(),
       {
         callerTaskId: ctx.callerTaskId,
@@ -796,6 +822,20 @@ export class TaskEngine {
       },
       command,
     );
+    if (
+      kind === 'create_task' ||
+      kind === 'delegate_task' ||
+      kind === 'release_tasks' ||
+      kind === 'complete_task' ||
+      kind === 'fail_task'
+    ) {
+      if (result.ok) {
+        console.info('[muster][task-orch] tool.ok', { kind, result: result.result });
+      } else {
+        console.info('[muster][task-orch] tool.err', { kind, error: result.error });
+      }
+    }
+    return result;
   }
 
   static load(config: TaskEngineConfig): TaskEngine {
@@ -3544,6 +3584,17 @@ export class TaskEngine {
       const currentTurn = current.turns[turnId];
       const messages = messageMapFromFile(current);
       const prompt = projectPrompt(currentTurn, messages, current, this.resourceLimits.maxResultBytes);
+      console.info('[muster][task-orch] turn.run', {
+        taskId: task.id,
+        turnId,
+        parentId: task.parentId,
+        backend: task.backend,
+        model: task.model ?? null,
+        releaseState: task.releaseState ?? null,
+        cwd: task.cwd ?? null,
+        trigger: currentTurn?.trigger ?? null,
+        promptChars: prompt.length,
+      });
       const built = this.bridgePort > 0 && this.credentialRegistry
         ? buildRunOptionsForTurn(this.graphDeps(), turnId, {
             prompt,
@@ -4069,6 +4120,28 @@ export class TaskEngine {
 
         return { ok: true };
       });
+      if (commit.ok) {
+        const file = this.store.getFile();
+        const turn = file.turns[turnId];
+        const task = turn ? file.tasks[turn.taskId] : undefined;
+        console.info('[muster][task-orch] turn.settle.ok', {
+          taskId: turn?.taskId,
+          turnId,
+          parentId: task?.parentId ?? null,
+          lifecycle: task?.lifecycle,
+          disposition: turn?.disposition?.kind ?? null,
+          sealedBy: task?.sealedBy ?? null,
+          resultChars:
+            typeof task?.result === 'string'
+              ? task.result.length
+              : task?.taskResult?.summary?.length ?? 0,
+        });
+      } else {
+        console.info('[muster][task-orch] turn.settle.commit_failed', {
+          turnId,
+          reason: commit.detail ?? commit.reason,
+        });
+      }
       return commit.ok;
     } finally {
       this.settling.delete(turnId);
@@ -4249,6 +4322,17 @@ export class TaskEngine {
       });
 
       if (commit.ok) {
+        const file = this.store.getFile();
+        const turn = file.turns[turnId];
+        const task = turn ? file.tasks[turn.taskId] : undefined;
+        console.info('[muster][task-orch] turn.settle.failed', {
+          taskId: turn?.taskId,
+          turnId,
+          parentId: task?.parentId ?? null,
+          lifecycle: task?.lifecycle,
+          error: errorMessage.slice(0, 300),
+          failureClass: opts?.failureClass ?? null,
+        });
         const retryTurnEntry = Object.values(this.store.getFile().turns).find(
           (turn) => turn.retryOf === turnId && turn.status === 'queued',
         );
