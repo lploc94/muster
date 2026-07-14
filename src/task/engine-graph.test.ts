@@ -249,6 +249,139 @@ describe('engine graph orchestration', () => {
     expect(turns[0]?.trigger).toBe('engine');
   });
 
+  it('W2: create_task with brief AC and paths persists on child', async () => {
+    const { store, engine, credentials } = makeHarness();
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child', 'wait_child', 'read_subtree'],
+    });
+    const started = engine.startTask('coord');
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId: started.value.turnId,
+      allowedActions: new Set(['create_task', 'complete_task']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    const result = await engine.handleToolCall(ctx, 'create_task', {
+      kind: 'create_task',
+      opId: 'op-brief',
+      spec: {
+        goal: 'implement feature',
+        backend: 'grok',
+        description: 'from coordinator',
+        brief: {
+          kind: 'implement',
+          acceptanceCriteria: ['tests pass'],
+        },
+        writePaths: ['src/f.ts'],
+        claimsGit: true,
+      },
+    });
+    expect(result.ok).toBe(true);
+    const childId = deriveEntityId(started.value.turnId, 'op-brief', 'task');
+    const child = store.getTask(childId);
+    expect(child?.brief?.kind).toBe('implement');
+    expect(child?.brief?.acceptanceCriteria).toEqual(['tests pass']);
+    expect(child?.brief?.writePaths).toEqual(['src/f.ts']);
+    expect(child?.brief?.context).toBe('from coordinator');
+    expect(child?.claimsGit).toBe(true);
+    expect(child?.releaseState).toBe('draft');
+  });
+
+  it('W2: create_task rejects non-summary inputBindings', async () => {
+    const { engine, credentials } = makeHarness();
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child'],
+    });
+    const started = engine.startTask('coord');
+    if (!started.ok) return;
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId: started.value.turnId,
+      allowedActions: new Set(['create_task']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    const result = await engine.handleToolCall(ctx, 'create_task', {
+      kind: 'create_task',
+      opId: 'op-bad-bind',
+      spec: {
+        goal: 'x',
+        backend: 'grok',
+        inputBindings: [{ fromTaskId: 'p', output: 'artifact' as 'summary', as: 'a' }],
+      },
+    });
+    expect(result.ok).toBe(false);
+  });
+
+  it('W2: delegate_task with brief + model persists and queues first turn', async () => {
+    const { store, engine, credentials, resume } = makeHarness();
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child', 'wait_child', 'read_subtree'],
+    });
+    const started = engine.startTask('coord');
+    if (!started.ok) return;
+    await new Promise((r) => setTimeout(r, 30));
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId: started.value.turnId,
+      allowedActions: new Set(['delegate_task', 'complete_task']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    const result = await engine.handleToolCall(ctx, 'delegate_task', {
+      kind: 'delegate_task',
+      opId: 'op-del-brief',
+      spec: {
+        goal: 'plan the work',
+        backend: 'grok',
+        model: 'm1',
+        brief: {
+          kind: 'plan',
+          objective: 'Produce a concrete plan',
+          acceptanceCriteria: ['has steps'],
+        },
+      },
+    });
+    expect(result.ok).toBe(true);
+    const childId = deriveEntityId(started.value.turnId, 'op-del-brief', 'task');
+    const child = store.getTask(childId);
+    expect(child?.model).toBe('m1');
+    expect(child?.brief?.kind).toBe('plan');
+    expect(child?.brief?.objective).toBe('Produce a concrete plan');
+    expect(child?.goal).toBe('Produce a concrete plan');
+    expect(child?.releaseState).toBe('released');
+    const turn = Object.values(store.getFile().turns).find((t) => t.taskId === childId);
+    expect(turn).toBeDefined();
+    await new Promise((r) => setTimeout(r, 40));
+    const after = store.getFile().turns[turn!.id];
+    expect(after?.compiledPrompt).toContain('Produce a concrete plan');
+    expect(after?.compiledPrompt).toContain('Acceptance criteria');
+    engine.stageDisposition(started.value.turnId, { kind: 'idle' }, 'op-idle');
+    if (after?.status === 'running') {
+      engine.stageDisposition(after.id, { kind: 'idle' }, 'op-child-idle');
+    }
+    resume();
+    await engine.whenIdle();
+  });
+
   it('create_task / delegate_task persist optional model on child', async () => {
     const { store, engine, credentials } = makeHarness();
     engine.createTask({

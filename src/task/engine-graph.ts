@@ -4,6 +4,7 @@ import type { CredentialRegistry } from '../bridge/credentials';
 import { buildTurnMcp, deleteMcpConfigFile } from '../bridge/mcp-config';
 import type { Backend } from '../types';
 import { canBindTaskToBackend } from './backend-eligibility';
+import { mergeBriefFromCreate } from './brief';
 import { capabilitiesFor } from './capabilities';
 import type { ToolCommand } from './coordinator-tools';
 import { validateBindingsForRelease } from './dataflow';
@@ -337,10 +338,22 @@ export async function executeToolCommand(
         });
         if (!rootCheck.ok) return rootCheck;
 
+        const bindingCheck = validateBindingsForRelease(command.spec.inputBindings);
+        if (!bindingCheck.ok) {
+          return { ok: false, reason: bindingCheck.reason };
+        }
+        const brief = mergeBriefFromCreate({
+          goal: command.spec.goal,
+          description: command.spec.description,
+          brief: command.spec.brief,
+          writePaths: command.spec.writePaths,
+          readPaths: command.spec.readPaths,
+        });
         const input: CreateTaskInput = {
           id: childId,
           role: command.spec.role ?? 'worker',
-          goal: command.spec.goal,
+          goal: brief.objective || command.spec.goal,
+          description: command.spec.description,
           parentId: ctx.callerTaskId,
           dependencies: command.spec.dependencies ?? [],
           backend: command.spec.backend,
@@ -358,6 +371,9 @@ export async function executeToolCommand(
           ),
           // create_task stays draft; delegate_task is atomic released create-and-run.
           releaseState: command.kind === 'delegate_task' ? 'released' : 'draft',
+          brief,
+          ...(command.spec.inputBindings ? { inputBindings: command.spec.inputBindings } : {}),
+          ...(command.spec.claimsGit !== undefined ? { claimsGit: command.spec.claimsGit } : {}),
         };
         const graph = depGraphFromFile(draft);
         const created = createTask(input, { rootId, graph, now });
@@ -378,7 +394,7 @@ export async function executeToolCommand(
             id: messageId,
             taskId: childId,
             role: 'user',
-            content: command.spec.goal,
+            content: brief.objective || command.spec.goal,
             state: 'assigned',
             createdAt: now,
             turnId,

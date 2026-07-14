@@ -58,6 +58,119 @@ export function synthesizeBriefFromGoal(
   };
 }
 
+export const TASK_BRIEF_KINDS: readonly TaskBriefKind[] = [
+  'coordinate',
+  'plan',
+  'implement',
+  'test',
+  'verify',
+  'research',
+  'generic',
+];
+
+export function isTaskBriefKind(value: string): value is TaskBriefKind {
+  return (TASK_BRIEF_KINDS as readonly string[]).includes(value);
+}
+
+/** MCP/create partial brief overlay (no version). */
+export type TaskBriefOverlay = {
+  kind?: TaskBriefKind;
+  title?: string;
+  objective?: string;
+  context?: string;
+  nonGoals?: string[];
+  constraints?: string[];
+  acceptanceCriteria?: string[];
+  definitionOfDone?: string[];
+  readPaths?: string[];
+  writePaths?: string[];
+  verification?: { commands?: string[]; manualChecks?: string[] };
+};
+
+function clampStringList(items: readonly string[] | undefined, itemMax = 500): string[] | undefined {
+  if (!items) return undefined;
+  return items
+    .slice(0, BRIEF_LIST_MAX_ITEMS)
+    .map((s) => clampSection(s, itemMax))
+    .filter((s) => s.length > 0);
+}
+
+/**
+ * Merge synthesize-from-goal with optional MCP brief overlay + path convenience fields.
+ * Pure; clamps oversize. Prefer brief.* paths over top-level convenience when both set.
+ */
+export function mergeBriefFromCreate(args: {
+  goal: string;
+  description?: string;
+  brief?: TaskBriefOverlay;
+  writePaths?: string[];
+  readPaths?: string[];
+}): TaskBriefV1 {
+  const kind = args.brief?.kind ?? 'generic';
+  const base = synthesizeBriefFromGoal(args.goal, args.description, kind);
+  const o = args.brief;
+
+  const readPaths =
+    clampStringList(o?.readPaths, 1000) ??
+    clampStringList(args.readPaths, 1000) ??
+    base.readPaths;
+  const writePaths =
+    clampStringList(o?.writePaths, 1000) ??
+    clampStringList(args.writePaths, 1000) ??
+    base.writePaths;
+
+  const verification =
+    o?.verification !== undefined
+      ? {
+          ...(clampStringList(o.verification.commands)
+            ? { commands: clampStringList(o.verification.commands) }
+            : {}),
+          ...(clampStringList(o.verification.manualChecks)
+            ? { manualChecks: clampStringList(o.verification.manualChecks) }
+            : {}),
+        }
+      : base.verification;
+
+  const merged: TaskBriefV1 = {
+    version: 1,
+    kind: o?.kind ?? base.kind,
+    title: o?.title !== undefined ? clampSection(o.title, 200) : base.title,
+    objective:
+      o?.objective !== undefined ? clampSection(o.objective) : base.objective,
+    acceptanceCriteria:
+      clampStringList(o?.acceptanceCriteria) ?? base.acceptanceCriteria,
+    expectedOutputs: base.expectedOutputs ?? ['summary'],
+  };
+
+  const context =
+    o?.context !== undefined
+      ? o.context.length > 0
+        ? clampSection(o.context)
+        : undefined
+      : base.context;
+  if (context) merged.context = context;
+
+  const nonGoals = clampStringList(o?.nonGoals);
+  if (nonGoals) merged.nonGoals = nonGoals;
+  else if (base.nonGoals) merged.nonGoals = base.nonGoals;
+
+  const constraints = clampStringList(o?.constraints);
+  if (constraints) merged.constraints = constraints;
+  else if (base.constraints) merged.constraints = base.constraints;
+
+  const definitionOfDone = clampStringList(o?.definitionOfDone);
+  if (definitionOfDone) merged.definitionOfDone = definitionOfDone;
+  else if (base.definitionOfDone) merged.definitionOfDone = base.definitionOfDone;
+
+  if (readPaths && readPaths.length > 0) merged.readPaths = readPaths;
+  if (writePaths && writePaths.length > 0) merged.writePaths = writePaths;
+  if (verification && (verification.commands?.length || verification.manualChecks?.length)) {
+    merged.verification = verification;
+  }
+
+  return merged;
+}
+
 export interface CompileTaskPromptMeta {
   taskId?: string;
   goal?: string;

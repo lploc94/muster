@@ -261,4 +261,99 @@ describe('coordinator-tools dispatch', () => {
       }
     }
   });
+
+  it('maps rich create fields (description, brief, bindings, paths, claimsGit)', () => {
+    const result = dispatch(
+      'create_task',
+      {
+        opId: 'op-1',
+        goal: 'implement feature',
+        backend: 'grok',
+        description: 'more context',
+        brief: {
+          kind: 'implement',
+          acceptanceCriteria: ['tests pass'],
+        },
+        inputBindings: [{ fromTaskId: 'plan', output: 'summary', as: 'plan' }],
+        claimsGit: true,
+        writePaths: ['src/x.ts'],
+        readPaths: ['docs/y.md'],
+      },
+      ctx(['create_task']),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && result.command.kind === 'create_task') {
+      expect(result.command.spec.description).toBe('more context');
+      expect(result.command.spec.brief).toEqual({
+        kind: 'implement',
+        acceptanceCriteria: ['tests pass'],
+      });
+      expect(result.command.spec.inputBindings).toEqual([
+        { fromTaskId: 'plan', output: 'summary', as: 'plan' },
+      ]);
+      expect(result.command.spec.claimsGit).toBe(true);
+      expect(result.command.spec.writePaths).toEqual(['src/x.ts']);
+      expect(result.command.spec.readPaths).toEqual(['docs/y.md']);
+    }
+  });
+
+  it('rejects invalid brief.kind', () => {
+    const result = dispatch(
+      'create_task',
+      {
+        opId: 'op-1',
+        goal: 'x',
+        backend: 'grok',
+        brief: { kind: 'nope' },
+      },
+      ctx(['create_task']),
+    );
+    expect(result).toEqual({ ok: false, toolError: 'invalid create_task arguments' });
+  });
+
+  it('rejects unknown brief keys fail-closed', () => {
+    const result = dispatch(
+      'create_task',
+      {
+        opId: 'op-1',
+        goal: 'x',
+        backend: 'grok',
+        brief: { objective: 'o', secret: true },
+      },
+      ctx(['create_task']),
+    );
+    expect(result).toEqual({ ok: false, toolError: 'invalid create_task arguments' });
+  });
+
+  it('rejects non-summary binding output', () => {
+    const result = dispatch(
+      'create_task',
+      {
+        opId: 'op-1',
+        goal: 'x',
+        backend: 'grok',
+        inputBindings: [{ fromTaskId: 'p', output: 'artifact', as: 'a' }],
+      },
+      ctx(['create_task']),
+    );
+    expect(result).toEqual({ ok: false, toolError: 'invalid create_task arguments' });
+  });
+
+  it('maps rich fields on delegate_task', () => {
+    const result = dispatch(
+      'delegate_task',
+      {
+        opId: 'op-d',
+        goal: 'child',
+        backend: 'opencode',
+        brief: { kind: 'plan', objective: 'write plan' },
+      },
+      ctx(['delegate_task']),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && result.command.kind === 'delegate_task') {
+      expect(result.command.spec.brief?.kind).toBe('plan');
+      expect(result.command.spec.brief?.objective).toBe('write plan');
+    }
+  });
 });

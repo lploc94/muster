@@ -1,7 +1,15 @@
 import type { Question } from '../bridge/ask-bridge';
 import type { CredentialContext } from '../bridge/credentials';
+import type { TaskBriefOverlay } from './brief';
+import { BRIEF_SECTION_MAX, clampSection, isTaskBriefKind } from './brief';
 import type { ToolAction } from './capabilities';
-import type { TaskDependency, TaskExecutionPolicy, TaskRole } from './types';
+import { isAllowedBindingOutput } from './dataflow';
+import type {
+  TaskDependency,
+  TaskExecutionPolicy,
+  TaskInputBinding,
+  TaskRole,
+} from './types';
 
 export interface CreateChildSpec {
   goal: string;
@@ -14,6 +22,15 @@ export interface CreateChildSpec {
   role?: TaskRole;
   dependencies?: TaskDependency[];
   executionPolicy?: Partial<TaskExecutionPolicy>;
+  /** Optional longer description → brief.context when synthesizing. */
+  description?: string;
+  /** Partial brief overlay (merged with synthesize-from-goal at create). */
+  brief?: TaskBriefOverlay;
+  inputBindings?: TaskInputBinding[];
+  claimsGit?: boolean;
+  /** Convenience: merge into brief.writePaths when brief omits them. */
+  writePaths?: string[];
+  readPaths?: string[];
 }
 
 export const PRESENTATION_ID_MAX_LENGTH = 128;
@@ -194,6 +211,100 @@ function parseQuestions(value: unknown): Question[] | undefined {
   return out;
 }
 
+const BRIEF_OVERLAY_KEYS = new Set([
+  'kind',
+  'title',
+  'objective',
+  'context',
+  'nonGoals',
+  'constraints',
+  'acceptanceCriteria',
+  'definitionOfDone',
+  'readPaths',
+  'writePaths',
+  'verification',
+]);
+
+function parseStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== 'string') return undefined;
+    out.push(entry);
+  }
+  return out;
+}
+
+function parseBriefOverlay(value: unknown): TaskBriefOverlay | undefined {
+  if (!isRecord(value)) return undefined;
+  if (Object.keys(value).some((k) => !BRIEF_OVERLAY_KEYS.has(k))) return undefined;
+  const overlay: TaskBriefOverlay = {};
+  if (value.kind !== undefined) {
+    if (typeof value.kind !== 'string' || !isTaskBriefKind(value.kind)) return undefined;
+    overlay.kind = value.kind;
+  }
+  for (const key of ['title', 'objective', 'context'] as const) {
+    if (value[key] !== undefined) {
+      if (typeof value[key] !== 'string') return undefined;
+      overlay[key] = value[key] as string;
+    }
+  }
+  for (const key of [
+    'nonGoals',
+    'constraints',
+    'acceptanceCriteria',
+    'definitionOfDone',
+    'readPaths',
+    'writePaths',
+  ] as const) {
+    if (value[key] !== undefined) {
+      const list = parseStringArray(value[key]);
+      if (!list) return undefined;
+      overlay[key] = list;
+    }
+  }
+  if (value.verification !== undefined) {
+    if (!isRecord(value.verification)) return undefined;
+    const vKeys = new Set(['commands', 'manualChecks']);
+    if (Object.keys(value.verification).some((k) => !vKeys.has(k))) return undefined;
+    const verification: { commands?: string[]; manualChecks?: string[] } = {};
+    if (value.verification.commands !== undefined) {
+      const list = parseStringArray(value.verification.commands);
+      if (!list) return undefined;
+      verification.commands = list;
+    }
+    if (value.verification.manualChecks !== undefined) {
+      const list = parseStringArray(value.verification.manualChecks);
+      if (!list) return undefined;
+      verification.manualChecks = list;
+    }
+    overlay.verification = verification;
+  }
+  return overlay;
+}
+
+function parseInputBindings(value: unknown): TaskInputBinding[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out: TaskInputBinding[] = [];
+  for (const entry of value) {
+    if (!isRecord(entry)) return undefined;
+    const fromTaskId = typeof entry.fromTaskId === 'string' ? entry.fromTaskId : '';
+    const as = typeof entry.as === 'string' ? entry.as : '';
+    const output = typeof entry.output === 'string' ? entry.output : '';
+    if (!fromTaskId || !as || !output) return undefined;
+    if (!isAllowedBindingOutput(output)) return undefined;
+    const binding: TaskInputBinding = { fromTaskId, output, as };
+    if (entry.required !== undefined) {
+      if (typeof entry.required !== 'boolean') return undefined;
+      binding.required = entry.required;
+    }
+    const allowed = new Set(['fromTaskId', 'output', 'as', 'required']);
+    if (Object.keys(entry).some((k) => !allowed.has(k))) return undefined;
+    out.push(binding);
+  }
+  return out;
+}
+
 function parseCreateSpec(args: Record<string, unknown>): CreateChildSpec | undefined {
   const goal = requireString(args, 'goal');
   const backend = requireString(args, 'backend');
@@ -225,6 +336,36 @@ function parseCreateSpec(args: Record<string, unknown>): CreateChildSpec | undef
     const policy = parseExecutionPolicy(args.executionPolicy);
     if (policy === undefined) return undefined;
     spec.executionPolicy = policy;
+  }
+  if (args.description !== undefined) {
+    if (typeof args.description !== 'string') return undefined;
+    if (args.description.length > 0) {
+      spec.description = clampSection(args.description, BRIEF_SECTION_MAX);
+    }
+  }
+  if (args.brief !== undefined) {
+    const brief = parseBriefOverlay(args.brief);
+    if (!brief) return undefined;
+    spec.brief = brief;
+  }
+  if (args.inputBindings !== undefined) {
+    const bindings = parseInputBindings(args.inputBindings);
+    if (!bindings) return undefined;
+    spec.inputBindings = bindings;
+  }
+  if (args.claimsGit !== undefined) {
+    if (typeof args.claimsGit !== 'boolean') return undefined;
+    spec.claimsGit = args.claimsGit;
+  }
+  if (args.writePaths !== undefined) {
+    const list = parseStringArray(args.writePaths);
+    if (!list) return undefined;
+    spec.writePaths = list;
+  }
+  if (args.readPaths !== undefined) {
+    const list = parseStringArray(args.readPaths);
+    if (!list) return undefined;
+    spec.readPaths = list;
   }
   return spec;
 }

@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
+  BRIEF_LIST_MAX_ITEMS,
   BRIEF_SECTION_MAX,
   COMPILED_PROMPT_MAX,
   assembleFirstTurnPrompt,
   clampSection,
   compileTaskPrompt,
+  mergeBriefFromCreate,
   synthesizeBriefFromGoal,
 } from './brief';
 import {
@@ -82,6 +84,60 @@ describe('compileTaskPrompt', () => {
 describe('clampSection', () => {
   it('no-ops under max', () => {
     expect(clampSection('abc')).toBe('abc');
+  });
+});
+
+describe('mergeBriefFromCreate', () => {
+  it('goal-only matches synthesizeBriefFromGoal', () => {
+    const merged = mergeBriefFromCreate({ goal: 'Ship feature X', description: 'ctx' });
+    expect(merged).toEqual(synthesizeBriefFromGoal('Ship feature X', 'ctx'));
+  });
+
+  it('overlays acceptanceCriteria and kind', () => {
+    const merged = mergeBriefFromCreate({
+      goal: 'Implement plan',
+      brief: {
+        kind: 'implement',
+        acceptanceCriteria: ['tests pass', 'lint clean'],
+        context: 'from plan',
+      },
+    });
+    expect(merged.kind).toBe('implement');
+    expect(merged.acceptanceCriteria).toEqual(['tests pass', 'lint clean']);
+    expect(merged.context).toBe('from plan');
+    expect(merged.objective).toBe('Implement plan');
+  });
+
+  it('top-level writePaths land when brief omits them', () => {
+    const merged = mergeBriefFromCreate({
+      goal: 'edit files',
+      writePaths: ['src/a.ts'],
+      readPaths: ['docs/x.md'],
+    });
+    expect(merged.writePaths).toEqual(['src/a.ts']);
+    expect(merged.readPaths).toEqual(['docs/x.md']);
+  });
+
+  it('brief paths win over top-level convenience', () => {
+    const merged = mergeBriefFromCreate({
+      goal: 'edit',
+      writePaths: ['top.ts'],
+      brief: { writePaths: ['brief.ts'] },
+    });
+    expect(merged.writePaths).toEqual(['brief.ts']);
+  });
+
+  it('clamps oversize objective and truncates long lists', () => {
+    const many = Array.from({ length: BRIEF_LIST_MAX_ITEMS + 5 }, (_, i) => `c${i}`);
+    const merged = mergeBriefFromCreate({
+      goal: 'g',
+      brief: {
+        objective: 'O'.repeat(BRIEF_SECTION_MAX + 50),
+        acceptanceCriteria: many,
+      },
+    });
+    expect(merged.objective.length).toBe(BRIEF_SECTION_MAX);
+    expect(merged.acceptanceCriteria).toHaveLength(BRIEF_LIST_MAX_ITEMS);
   });
 });
 

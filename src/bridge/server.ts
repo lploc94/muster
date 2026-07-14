@@ -76,6 +76,45 @@ const EXECUTION_POLICY_SCHEMA = {
   additionalProperties: false,
 };
 
+const BRIEF_SCHEMA = {
+  type: 'object',
+  properties: {
+    kind: {
+      enum: ['coordinate', 'plan', 'implement', 'test', 'verify', 'research', 'generic'],
+    },
+    title: { type: 'string' },
+    objective: { type: 'string' },
+    context: { type: 'string' },
+    nonGoals: { type: 'array', items: { type: 'string' } },
+    constraints: { type: 'array', items: { type: 'string' } },
+    acceptanceCriteria: { type: 'array', items: { type: 'string' } },
+    definitionOfDone: { type: 'array', items: { type: 'string' } },
+    readPaths: { type: 'array', items: { type: 'string' } },
+    writePaths: { type: 'array', items: { type: 'string' } },
+    verification: {
+      type: 'object',
+      properties: {
+        commands: { type: 'array', items: { type: 'string' } },
+        manualChecks: { type: 'array', items: { type: 'string' } },
+      },
+      additionalProperties: false,
+    },
+  },
+  additionalProperties: false,
+};
+
+const INPUT_BINDING_SCHEMA = {
+  type: 'object',
+  required: ['fromTaskId', 'output', 'as'],
+  properties: {
+    fromTaskId: OP_ID,
+    output: { enum: ['summary'] },
+    as: { type: 'string', minLength: 1 },
+    required: { type: 'boolean' },
+  },
+  additionalProperties: false,
+};
+
 const CREATE_SPEC_PROPERTIES = {
   opId: OP_ID,
   goal: { type: 'string', minLength: 1 },
@@ -85,6 +124,12 @@ const CREATE_SPEC_PROPERTIES = {
   role: { enum: ['coordinator', 'worker'] },
   dependencies: { type: 'array', items: DEPENDENCY_SCHEMA },
   executionPolicy: EXECUTION_POLICY_SCHEMA,
+  description: { type: 'string' },
+  brief: BRIEF_SCHEMA,
+  inputBindings: { type: 'array', items: INPUT_BINDING_SCHEMA },
+  claimsGit: { type: 'boolean' },
+  writePaths: { type: 'array', items: { type: 'string' } },
+  readPaths: { type: 'array', items: { type: 'string' } },
 };
 
 const QUESTION_SCHEMA = {
