@@ -95,6 +95,45 @@ describe('projectPrompt', () => {
     ]);
     expect(projectPrompt(turn, messages)).toBe('first\n\nsecond\n\nTry again carefully');
   });
+
+  it('prefixes durable compiledPrompt / resolvedInputs before messages (W1 pin)', () => {
+    const turn: TaskTurn = {
+      id: 't1',
+      taskId: 'impl',
+      sequence: 1,
+      trigger: 'engine',
+      status: 'queued',
+      inputs: [{ kind: 'message', messageId: 'm1' }],
+      createdAt: '2026-07-06T00:00:00.000Z',
+      compiledPrompt: '## Bound predecessor outputs\nplan text',
+      resolvedInputs: [
+        {
+          as: 'implementationPlan',
+          fromTaskId: 'plan',
+          output: 'summary',
+          producerResultRevision: 1,
+          text: 'plan text',
+        },
+      ],
+    };
+    const messages = new Map<string, TaskMessage>([
+      [
+        'm1',
+        {
+          id: 'm1',
+          taskId: 'impl',
+          role: 'user',
+          content: 'implement it',
+          state: 'assigned',
+          createdAt: '2026-07-06T00:00:00.000Z',
+        },
+      ],
+    ]);
+    const prompt = projectPrompt(turn, messages);
+    expect(prompt.startsWith('## Bound predecessor outputs')).toBe(true);
+    expect(prompt).toContain('plan text');
+    expect(prompt).toContain('implement it');
+  });
 });
 
 describe('TaskEngine', () => {
@@ -165,6 +204,240 @@ describe('TaskEngine', () => {
     });
     const result = engine.createTask({ goal: 'x', backend: 'fake' });
     expect(result).toEqual({ ok: false, reason: 'backend does not support MCP' });
+  });
+
+  it('W1: pins plan summary into implement first prompt; reopen does not rewrite pin', async () => {
+    const { store } = makeTempStore();
+    let capturedPrompt = '';
+    let resume: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    const backend: Backend = {
+      name: 'fake',
+      capabilities: MCP_CAPS,
+      async *run(options: RunOptions) {
+        capturedPrompt = options.prompt ?? '';
+        yield { type: 'sessionStarted', sessionId: 'sess-impl' };
+        await gate;
+        yield { type: 'turnCompleted' };
+      },
+    };
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => backend,
+      clock: () => '2026-07-06T12:00:00.000Z',
+    });
+
+    // Same-root plan→impl graph (host createTask always roots itself).
+    const policy = {
+      maxTurns: 10,
+      maxAutomaticRetries: 0,
+      turnTimeoutMs: 60_000,
+      taskTimeoutMs: 120_000,
+    };
+    store.commit((draft) => {
+      draft.tasks.plan = {
+        id: 'plan',
+        role: 'worker',
+        lifecycle: 'succeeded',
+        goal: 'plan work',
+        parentId: null,
+        dependencies: [],
+        backend: 'fake',
+        capabilities: [],
+        executionPolicy: policy,
+        result: 'do X then Y',
+        taskResult: { version: 1, revision: 2, summary: 'do X then Y' },
+        finishedAt: '2026-07-06T12:00:00.000Z',
+        revision: 1,
+        createdAt: '2026-07-06T12:00:00.000Z',
+        updatedAt: '2026-07-06T12:00:00.000Z',
+      };
+      draft.tasks.impl = {
+        id: 'impl',
+        role: 'worker',
+        lifecycle: 'open',
+        goal: 'implement work',
+        parentId: 'plan',
+        dependencies: [{ taskId: 'plan', requiredOutcome: 'succeeded', onUnsatisfied: 'block' }],
+        backend: 'fake',
+        capabilities: [],
+        executionPolicy: policy,
+        inputBindings: [{ fromTaskId: 'plan', output: 'summary', as: 'implementationPlan' }],
+        revision: 0,
+        createdAt: '2026-07-06T12:00:00.000Z',
+        updatedAt: '2026-07-06T12:00:00.000Z',
+      };
+      return { ok: true };
+    });
+
+    const started = engine.startTask('impl', []);
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    const turn = store.getFile().turns[started.value.turnId];
+    expect(turn.resolvedInputs?.[0]?.text).toBe('do X then Y');
+    expect(turn.resolvedInputs?.[0]?.producerResultRevision).toBe(2);
+    expect(capturedPrompt).toContain('do X then Y');
+    expect(capturedPrompt).toContain('untrusted');
+
+    // Producer "reopen" rewrite must not change pin.
+    store.commit((draft) => {
+      draft.tasks.plan = {
+        ...draft.tasks.plan!,
+        taskResult: { version: 1, revision: 9, summary: 'rewritten' },
+        result: 'rewritten',
+        revision: draft.tasks.plan!.revision + 1,
+        updatedAt: '2026-07-06T12:00:01.000Z',
+      };
+      return { ok: true };
+    });
+    expect(store.getFile().turns[started.value.turnId].resolvedInputs?.[0]?.text).toBe('do X then Y');
+
+    engine.stageDisposition(started.value.turnId, { kind: 'idle' }, 'op-idle');
+    resume?.();
+    await engine.whenIdle();
+  });
+
+  it('W1: unbound dependency does not inject predecessor content', async () => {
+    const { store } = makeTempStore();
+    let capturedPrompt = '';
+    let resume: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    const backend: Backend = {
+      name: 'fake',
+      capabilities: MCP_CAPS,
+      async *run(options: RunOptions) {
+        capturedPrompt = options.prompt ?? '';
+        yield { type: 'sessionStarted', sessionId: 'sess-u' };
+        await gate;
+        yield { type: 'turnCompleted' };
+      },
+    };
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => backend,
+      clock: () => '2026-07-06T12:00:00.000Z',
+    });
+    const policy = {
+      maxTurns: 10,
+      maxAutomaticRetries: 0,
+      turnTimeoutMs: 60_000,
+      taskTimeoutMs: 120_000,
+    };
+    store.commit((draft) => {
+      draft.tasks.plan = {
+        id: 'plan',
+        role: 'worker',
+        lifecycle: 'succeeded',
+        goal: 'plan',
+        parentId: null,
+        dependencies: [],
+        backend: 'fake',
+        capabilities: [],
+        executionPolicy: policy,
+        result: 'SECRET_PLAN',
+        taskResult: { version: 1, revision: 1, summary: 'SECRET_PLAN' },
+        finishedAt: '2026-07-06T12:00:00.000Z',
+        revision: 1,
+        createdAt: '2026-07-06T12:00:00.000Z',
+        updatedAt: '2026-07-06T12:00:00.000Z',
+      };
+      draft.tasks.impl = {
+        id: 'impl',
+        role: 'worker',
+        lifecycle: 'open',
+        goal: 'implement',
+        parentId: 'plan',
+        dependencies: [{ taskId: 'plan', requiredOutcome: 'succeeded', onUnsatisfied: 'block' }],
+        backend: 'fake',
+        capabilities: [],
+        executionPolicy: policy,
+        revision: 0,
+        createdAt: '2026-07-06T12:00:00.000Z',
+        updatedAt: '2026-07-06T12:00:00.000Z',
+      };
+      return { ok: true };
+    });
+    const started = engine.startTask('impl', []);
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(capturedPrompt).not.toContain('SECRET_PLAN');
+    expect(store.getFile().turns[started.value.turnId].resolvedInputs).toBeUndefined();
+    engine.stageDisposition(started.value.turnId, { kind: 'idle' }, 'op-u');
+    resume?.();
+    await engine.whenIdle();
+  });
+
+  it('W1: missing required binding sets attention and does not dispatch', async () => {
+    const { store } = makeTempStore();
+    let ran = false;
+    const backend: Backend = {
+      name: 'fake',
+      capabilities: MCP_CAPS,
+      async *run() {
+        ran = true;
+        yield { type: 'turnCompleted' };
+      },
+    };
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => backend,
+      clock: () => '2026-07-06T12:00:00.000Z',
+    });
+    const policy = {
+      maxTurns: 10,
+      maxAutomaticRetries: 0,
+      turnTimeoutMs: 60_000,
+      taskTimeoutMs: 120_000,
+    };
+    store.commit((draft) => {
+      draft.tasks.plan = {
+        id: 'plan',
+        role: 'worker',
+        lifecycle: 'succeeded',
+        goal: 'plan',
+        parentId: null,
+        dependencies: [],
+        backend: 'fake',
+        capabilities: [],
+        executionPolicy: policy,
+        finishedAt: '2026-07-06T12:00:00.000Z',
+        revision: 1,
+        createdAt: '2026-07-06T12:00:00.000Z',
+        updatedAt: '2026-07-06T12:00:00.000Z',
+      };
+      draft.tasks.impl = {
+        id: 'impl',
+        role: 'worker',
+        lifecycle: 'open',
+        goal: 'implement',
+        parentId: 'plan',
+        dependencies: [{ taskId: 'plan', requiredOutcome: 'succeeded', onUnsatisfied: 'block' }],
+        backend: 'fake',
+        capabilities: [],
+        executionPolicy: policy,
+        inputBindings: [{ fromTaskId: 'plan', output: 'summary', as: 'implementationPlan' }],
+        revision: 0,
+        createdAt: '2026-07-06T12:00:00.000Z',
+        updatedAt: '2026-07-06T12:00:00.000Z',
+      };
+      return { ok: true };
+    });
+    const started = engine.startTask('impl', []);
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(ran).toBe(false);
+    const impl = store.getTask('impl');
+    expect(impl?.attention?.code).toBe('missing_input');
+    expect(store.getFile().turns[started.value.turnId].status).toBe('queued');
+    expect(store.getFile().turns[started.value.turnId].resolvedInputs).toBeUndefined();
   });
 
   it('completes a successful turn and commits session id from sessionStarted', async () => {

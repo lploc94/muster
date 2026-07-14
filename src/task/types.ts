@@ -36,6 +36,60 @@ export type OutcomeProposal =
       proposedAt: string;
     };
 
+// ---------------------------------------------------------------------------
+// Orchestration Phase F — result/release/dataflow (declared before MusterTask)
+// ---------------------------------------------------------------------------
+
+/** Draft tasks are not scheduler-eligible until atomic release. */
+export type TaskReleaseState = 'draft' | 'released';
+
+/** v1 binding output keys — only `summary` is produced by complete_task. */
+export type TaskResultOutputKey = 'summary';
+
+export interface TaskInputBinding {
+  fromTaskId: string;
+  output: TaskResultOutputKey;
+  /** Local name for the prompt compiler. */
+  as: string;
+  /** Default true. */
+  required?: boolean;
+}
+
+/** Structured task outcome for dataflow. */
+export interface TaskResultV1 {
+  version: 1;
+  /** Monotonic per task; captured by dependents at pin time. */
+  revision: number;
+  summary: string;
+}
+
+/** Frozen binding resolution persisted on a turn before dispatch. */
+export interface ResolvedInputPin {
+  as: string;
+  fromTaskId: string;
+  output: TaskResultOutputKey;
+  producerResultRevision: number;
+  text: string;
+}
+
+export type TaskAttentionCode =
+  | 'missing_disposition'
+  | 'missing_input'
+  | 'dependency_blocked'
+  | 'recovery_exhausted'
+  | string;
+
+export interface TaskAttention {
+  code: TaskAttentionCode;
+  message: string;
+  at: string;
+  sourceTurnId?: string;
+}
+
+export type TaskSealedBy =
+  | { kind: 'user' }
+  | { kind: 'coordinator'; taskId: string; turnId?: string; mode: string };
+
 export interface MusterTask {
   id: string;
   role: TaskRole;
@@ -66,12 +120,39 @@ export interface MusterTask {
   executionPolicy: TaskExecutionPolicy;
   /** Staged complete/fail for root (human-gated) or display; not a lifecycle seal. */
   outcomeProposal?: OutcomeProposal;
+  /**
+   * Legacy/display summary string. When `taskResult` is set, mirrors `taskResult.summary`.
+   * Prefer `taskResult` for dataflow pins (orchestration Phase F / W1).
+   */
   result?: string;
+  /**
+   * Structured sealed/proposed outcome for dependency dataflow (schema ≥ 5).
+   * `revision` is captured by dependents at pin time.
+   */
+  taskResult?: TaskResultV1;
+  /**
+   * Explicit dataflow edges: which predecessor outputs feed this task's first prompt.
+   * Ordering still requires `dependencies` separately. v1: output key `summary` only.
+   */
+  inputBindings?: TaskInputBinding[];
+  /**
+   * Draft vs released for auto-run (schema ≥ 5). Missing on load is migrated:
+   * any turn present → released; else draft.
+   */
+  releaseState?: TaskReleaseState;
+  releasedAt?: string;
+  releaseAttemptId?: string;
+  /** Host resource claim: may run git write operations (default false). */
+  claimsGit?: boolean;
   error?: string;
   revision: number;
   createdAt: string;
   updatedAt: string;
   finishedAt?: string;
+  /** Non-terminal orchestration attention (schema ≥ 5). Never a lifecycle seal. */
+  attention?: TaskAttention;
+  /** Who sealed lifecycle (user or coordinator). Required on every terminal seal going forward. */
+  sealedBy?: TaskSealedBy;
   /**
    * Optional cross-runtime handoff state (schema-compatible: absent on legacy tasks).
    * Owned by the TaskHandoff aggregate; never projected as ordinary TaskMessage chat.
@@ -259,6 +340,13 @@ export interface TaskTurn {
   dispatchPhase?: TurnDispatchPhase;
   /** Settlement classification for activity projection + auto-retry eligibility. */
   failureClass?: TurnFailureClass;
+  /**
+   * Durable dataflow pin (W1): resolved predecessor outputs captured before dispatch.
+   * Immutable once set; producer reopen must not rewrite these texts.
+   */
+  resolvedInputs?: ResolvedInputPin[];
+  /** Optional frozen first-prompt text compiled from brief + resolvedInputs. */
+  compiledPrompt?: string;
 }
 
 // Messages (§9) + store envelope (§12.1)

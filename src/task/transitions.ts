@@ -1,3 +1,4 @@
+import { buildTaskResultFromSummary } from './dataflow';
 import { validateDependencies, type DepGraph } from './deps';
 import type {
   MusterTask,
@@ -353,7 +354,9 @@ export function applySuccessfulTurn(
   }
 
   switch (disposition.kind) {
-    case 'complete':
+    case 'complete': {
+      // Persist structured TaskResultV1 on propose and seal (W1 dataflow).
+      const taskResult = buildTaskResultFromSummary(disposition.result, task.taskResult);
       // Root tasks: human-gated — propose only; lifecycle stays open (TASK-MANAGEMENT §5.3).
       // Non-root: seal for orchestration / wait barriers.
       if (task.parentId === null) {
@@ -361,9 +364,11 @@ export function applySuccessfulTurn(
           ok: true,
           next: {
             task: bumpTask(task, options.now, {
+              taskResult,
+              result: taskResult.summary,
               outcomeProposal: {
                 kind: 'complete',
-                result: disposition.result,
+                result: taskResult.summary,
                 proposedByTurnId: turn.id,
                 proposedAt: options.now,
               },
@@ -378,7 +383,8 @@ export function applySuccessfulTurn(
         next: {
           task: bumpTask(task, options.now, {
             lifecycle: 'succeeded',
-            result: disposition.result,
+            taskResult,
+            result: taskResult.summary,
             finishedAt: options.now,
             outcomeProposal: undefined,
           }),
@@ -386,6 +392,7 @@ export function applySuccessfulTurn(
         },
         effects,
       };
+    }
     case 'fail':
       if (task.parentId === null) {
         return {
@@ -516,15 +523,18 @@ export function setTaskLifecycle(
   },
 ): TransitionResult<MusterTask> {
   if (task.lifecycle === lifecycle) {
+    const sameSucceededPatch: Partial<MusterTask> = { outcomeProposal: undefined };
+    if (lifecycle === 'succeeded' && options.result !== undefined) {
+      const taskResult = buildTaskResultFromSummary(options.result, task.taskResult);
+      sameSucceededPatch.taskResult = taskResult;
+      sameSucceededPatch.result = taskResult.summary;
+    }
+    if (lifecycle === 'failed' && options.error !== undefined) {
+      sameSucceededPatch.error = options.error;
+    }
     return {
       ok: true,
-      next: bumpTask(task, options.now, {
-        outcomeProposal: undefined,
-        ...(lifecycle === 'succeeded' && options.result !== undefined
-          ? { result: options.result }
-          : {}),
-        ...(lifecycle === 'failed' && options.error !== undefined ? { error: options.error } : {}),
-      }),
+      next: bumpTask(task, options.now, sameSucceededPatch),
       effects: [{ kind: 'emitUpdate' }],
     };
   }
@@ -540,14 +550,22 @@ export function setTaskLifecycle(
   if (lifecycle === 'succeeded') {
     const fromProposal =
       task.outcomeProposal?.kind === 'complete' ? task.outcomeProposal.result : undefined;
+    const summary = options.result ?? fromProposal ?? task.result;
+    const patch: Partial<MusterTask> = {
+      lifecycle: 'succeeded',
+      finishedAt: options.now,
+      outcomeProposal: undefined,
+    };
+    // Only write TaskResultV1 when a real summary exists — empty string would
+    // incorrectly satisfy required inputBindings (W1 / codex-impl-review).
+    if (summary !== undefined) {
+      const taskResult = buildTaskResultFromSummary(summary, task.taskResult);
+      patch.taskResult = taskResult;
+      patch.result = taskResult.summary;
+    }
     return {
       ok: true,
-      next: bumpTask(task, options.now, {
-        lifecycle: 'succeeded',
-        result: options.result ?? fromProposal ?? task.result,
-        finishedAt: options.now,
-        outcomeProposal: undefined,
-      }),
+      next: bumpTask(task, options.now, patch),
       effects: [{ kind: 'emitUpdate' }],
     };
   }

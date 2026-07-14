@@ -8,6 +8,11 @@ import type { Backend, LiveInputResult, NormalizedEvent, RunOptions } from '../t
 import type { TaskHandoffPhase, TurnTrigger } from './types';
 import { canBindTaskToBackend } from './backend-eligibility';
 import {
+  formatPinnedInputsForPrompt,
+  pinResolvedInputs,
+  resolveInputBindings,
+} from './dataflow';
+import {
   buildHandoffBootstrapPrompt,
   buildHandoffPackage,
   collectInternalSummaryTurnText,
@@ -345,6 +350,13 @@ export function projectPrompt(
   maxChildResultBytes = 16_384,
 ): string {
   const parts: string[] = [];
+  // W1: durable pin / frozen compiled prompt precedes turn inputs.
+  if (turn.compiledPrompt) {
+    parts.push(turn.compiledPrompt);
+  } else if (turn.resolvedInputs && turn.resolvedInputs.length > 0) {
+    const framed = formatPinnedInputsForPrompt(turn.resolvedInputs);
+    if (framed) parts.push(framed);
+  }
   const messageInputs = turn.inputs
     .filter((input): input is { kind: 'message'; messageId: string } => input.kind === 'message')
     .map((input) => messages.get(input.messageId))
@@ -3158,9 +3170,52 @@ export class TaskEngine {
         return { ok: false, reason: 'task is terminal' };
       }
 
+      // W1: resolve + durable pin before process dispatch when bindings exist.
+      // Persist attention on missing inputs with ok:true (commit rejects on ok:false).
+      let turnForStart = draftTurn;
+      const bindings = draftTask.inputBindings;
+      if (bindings && bindings.length > 0) {
+        // Presence of resolvedInputs (even []) is the durable pin marker — never re-resolve.
+        if (draftTurn.resolvedInputs !== undefined) {
+          turnForStart = draftTurn;
+        } else {
+          const resolved = resolveInputBindings(bindings, draft.tasks);
+          if (!resolved.ok) {
+            draft.tasks[draftTask.id] = {
+              ...draftTask,
+              revision: draftTask.revision + 1,
+              updatedAt: now,
+              attention: {
+                code: 'missing_input',
+                message: resolved.reason,
+                at: now,
+                sourceTurnId: turnId,
+              },
+            };
+            // Leave turn queued; caller detects status !== running.
+            return { ok: true };
+          }
+          const compiled = formatPinnedInputsForPrompt(resolved.pins);
+          const pinned = pinResolvedInputs(draftTurn, resolved.pins, compiled || undefined);
+          if (!pinned.ok) {
+            return { ok: false, reason: pinned.reason };
+          }
+          turnForStart = pinned.next;
+          // Clear prior missing_input attention once pins succeed.
+          if (draftTask.attention?.code === 'missing_input') {
+            draft.tasks[draftTask.id] = {
+              ...draftTask,
+              revision: draftTask.revision + 1,
+              updatedAt: now,
+              attention: undefined,
+            };
+          }
+        }
+      }
+
       // R012: assign only messages already bound to this turn. Do not sweep other
       // pending user messages onto this turn (that batching is removed for FIFO).
-      const inputs: TurnInput[] = [...draftTurn.inputs];
+      const inputs: TurnInput[] = [...turnForStart.inputs];
       for (const input of inputs) {
         if (input.kind !== 'message') continue;
         const message = draft.messages[input.messageId];
@@ -3174,7 +3229,7 @@ export class TaskEngine {
         }
       }
 
-      const withInputs = { ...draftTurn, inputs };
+      const withInputs = { ...turnForStart, inputs };
       const started = startProcess(withInputs, { now });
       if (!started.ok) {
         return started;
@@ -3187,6 +3242,14 @@ export class TaskEngine {
     if (!startCommit.ok) {
       releaseLease(this.storePath, turnId, lease);
       return;
+    }
+    // W1: pin gate may persist attention and leave the turn queued.
+    {
+      const afterPin = this.store.getFile().turns[turnId];
+      if (!afterPin || afterPin.status !== 'running') {
+        releaseLease(this.storePath, turnId, lease);
+        return;
+      }
     }
 
     const startedTurn = this.store.getFile().turns[turnId];
