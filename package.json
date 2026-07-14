@@ -72,9 +72,36 @@
         },
         "muster.taskTypes": {
           "type": "object",
-          "default": {},
+          "default": {
+            "coordinate": {
+              "description": "Coordinate multi-step work; create and wait on children",
+              "backend": "opencode",
+              "role": "coordinator",
+              "briefKind": "coordinate"
+            },
+            "plan": {
+              "description": "Produce an actionable implementation plan",
+              "backend": "codex",
+              "briefKind": "plan"
+            },
+            "implement": {
+              "description": "Apply the plan with minimal correct changes",
+              "backend": "grok",
+              "briefKind": "implement"
+            },
+            "verify": {
+              "description": "Verify acceptance criteria and definition of done",
+              "backend": "codex",
+              "briefKind": "verify"
+            },
+            "research": {
+              "description": "Gather facts; avoid unnecessary workspace writes",
+              "backend": "opencode",
+              "briefKind": "research"
+            }
+          },
           "scope": "resource",
-          "description": "Named task type presets (id → { backend, model?, role?, briefKind?, description? }). Coordinators create children by taskType; backend/model are optional user overrides only. Empty registry fails closed.",
+          "description": "Named task type presets (id → { backend, model?, role?, briefKind?, description? }). Muster ships defaults (no model pins); edit in Settings or VS Code settings.json. Explicit empty map fails closed for create/delegate.",
           "additionalProperties": {
             "type": "object",
             "required": ["backend"],

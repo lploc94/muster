@@ -23,6 +23,9 @@
     RetentionSettingId,
     RetentionSettingSnapshot,
     SettingsUpdateResult,
+    TaskTypeSettingsRow,
+    TaskTypesSettingsSnapshot,
+    TaskTypesSettingsUpdateResult,
   } from './lib/protocol';
   import { tip } from './lib/tooltip';
   import { outboxList, outboxMarkRejected, outboxPending, outboxRejected, outboxRemove } from './lib/send-outbox';
@@ -88,6 +91,11 @@
   let settingsSavedMessage = $state<string | null>(null);
   let settingsGlobalError = $state<string | null>(null);
   let settingsFieldErrors = $state<Partial<Record<RetentionSettingId, string>>>({});
+  let taskTypesSnapshot = $state<TaskTypesSettingsSnapshot | null>(null);
+  let taskTypesLoading = $state(false);
+  let taskTypesSaving = $state(false);
+  let taskTypesSavedMessage = $state<string | null>(null);
+  let taskTypesError = $state<string | null>(null);
 
   function selectTask(taskId: string) {
     tasks.focusTask(taskId);
@@ -116,7 +124,13 @@
     settingsGlobalError = null;
     settingsSavedMessage = null;
     settingsFieldErrors = {};
+    taskTypesLoading = !taskTypesSnapshot;
+    taskTypesError = null;
+    taskTypesSavedMessage = null;
     post({ type: 'requestSettings' });
+    post({ type: 'requestTaskTypesSettings' });
+    post({ type: 'listBackends' });
+    post({ type: 'listModels' });
   }
 
   function closeSettings() {
@@ -177,6 +191,31 @@
     settingsGlobalError = null;
     settingsFieldErrors = { ...settingsFieldErrors, [settingId]: undefined };
     post({ type: 'updateSetting', settingId, value });
+  }
+
+  function applyTaskTypesUpdateResult(result: TaskTypesSettingsUpdateResult) {
+    taskTypesSaving = false;
+    taskTypesLoading = false;
+    if (result.ok) {
+      taskTypesError = null;
+      taskTypesSavedMessage = 'Saved task types to workspace settings.';
+      return;
+    }
+    taskTypesSavedMessage = null;
+    const diag = result.diagnostics?.[0]?.message;
+    taskTypesError = diag ?? result.message;
+  }
+
+  function saveTaskTypes(types: TaskTypeSettingsRow[]) {
+    taskTypesSaving = true;
+    taskTypesSavedMessage = null;
+    taskTypesError = null;
+    post({ type: 'updateTaskTypes', types });
+  }
+
+  function resetTaskTypesToDefaults() {
+    if (!taskTypesSnapshot) return;
+    saveTaskTypes(taskTypesSnapshot.defaults.map((t) => ({ ...t })));
   }
 
   onMount(() => {
@@ -261,6 +300,16 @@
 
         case 'settingsUpdateResult':
           applySettingsUpdateResult(msg.result);
+          break;
+
+        case 'taskTypesSettingsSnapshot':
+          taskTypesSnapshot = msg.snapshot;
+          taskTypesLoading = false;
+          if (!taskTypesSaving) taskTypesError = null;
+          break;
+
+        case 'taskTypesSettingsUpdateResult':
+          applyTaskTypesUpdateResult(msg.result);
           break;
 
         case 'turnStart':
@@ -538,9 +587,17 @@
     globalError={settingsGlobalError}
     fieldErrors={settingsFieldErrors}
     onSave={saveSetting}
+    taskTypesSnapshot={taskTypesSnapshot}
+    taskTypesLoading={taskTypesLoading}
+    taskTypesSaving={taskTypesSaving}
+    taskTypesSavedMessage={taskTypesSavedMessage}
+    taskTypesError={taskTypesError}
+    availableBackends={tasks.availableBackends ?? []}
+    modelsByBackend={tasks.modelsByBackend ?? {}}
+    onSaveTaskTypes={saveTaskTypes}
+    onResetTaskTypes={resetTaskTypesToDefaults}
   />
-{/if}
-
+{:else}
 {#if visibleCommandError}
   <div class="task-command-error" role="alert">
     <div class="min-w-0">
@@ -727,4 +784,5 @@
       </div>
     {/if}
   </div>
+{/if}
 {/if}

@@ -36,7 +36,10 @@ import {
 import {
   TASK_TYPES_CONFIG_KEY,
   TASK_TYPES_CONFIG_SECTION,
+  buildTaskTypesSettingsSnapshot,
+  handleTaskTypesSettingsUpdateAction,
   loadTaskTypeRegistry,
+  pickExplicitTaskTypesValue,
 } from './host/task-types-config';
 import { detectAvailableBackends, installAugmentedPath } from './host/backend-availability';
 import {
@@ -137,19 +140,22 @@ function getHostEnvironment(): HostEnvironmentSnapshot | undefined {
   };
 }
 
+/**
+ * Unmerged raw muster.taskTypes for a folder (or workspace).
+ * Uses inspect() so workspace `{}` overrides package defaults (get() merges objects).
+ */
+function readExplicitTaskTypesRaw(cwd?: string): unknown {
+  const resource =
+    typeof cwd === 'string' && cwd.length > 0 ? vscode.Uri.file(cwd) : undefined;
+  const cfg = vscode.workspace.getConfiguration(TASK_TYPES_CONFIG_SECTION, resource);
+  const inspected = cfg.inspect(TASK_TYPES_CONFIG_KEY);
+  if (!inspected) return undefined;
+  return pickExplicitTaskTypesValue(inspected);
+}
+
 /** Live resource-scoped muster.taskTypes for caller cwd (or workspace default). */
 function getTaskTypeRegistry(cwd?: string) {
-  return loadTaskTypeRegistry((folderCwd) => {
-    const resource =
-      typeof folderCwd === 'string' && folderCwd.length > 0
-        ? vscode.Uri.file(folderCwd)
-        : undefined;
-    const cfg = vscode.workspace.getConfiguration(
-      TASK_TYPES_CONFIG_SECTION,
-      resource,
-    );
-    return cfg.get(TASK_TYPES_CONFIG_KEY);
-  }, cwd);
+  return loadTaskTypeRegistry((folderCwd) => readExplicitTaskTypesRaw(folderCwd), cwd);
 }
 let presentationManager: PresentationManager | undefined;
 let lastObservedRevision = 0;
@@ -383,6 +389,49 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       vscode.workspace.getConfiguration('muster.retention'),
       data,
       vscode.ConfigurationTarget.Workspace,
+    );
+    for (const message of messages) {
+      this.post(message);
+    }
+  }
+
+  private readTaskTypesRaw(): unknown {
+    return readExplicitTaskTypesRaw();
+  }
+
+  private postTaskTypesSettingsSnapshot(): void {
+    try {
+      this.post({
+        type: 'taskTypesSettingsSnapshot',
+        snapshot: buildTaskTypesSettingsSnapshot(() => this.readTaskTypesRaw()),
+      });
+    } catch {
+      this.post({
+        type: 'taskTypesSettingsUpdateResult',
+        result: {
+          ok: false,
+          code: 'updateFailed',
+          message: 'Unable to load task type settings.',
+        },
+      });
+    }
+  }
+
+  private async handleUpdateTaskTypes(data: unknown): Promise<void> {
+    const payload =
+      typeof data === 'object' && data !== null && 'types' in data
+        ? { types: (data as { types: unknown }).types }
+        : data;
+    const messages = await handleTaskTypesSettingsUpdateAction(
+      {
+        update: (key, value, target) =>
+          vscode.workspace
+            .getConfiguration(TASK_TYPES_CONFIG_SECTION)
+            .update(key, value, target as vscode.ConfigurationTarget),
+      },
+      payload,
+      vscode.ConfigurationTarget.Workspace,
+      () => this.readTaskTypesRaw(),
     );
     for (const message of messages) {
       this.post(message);
@@ -2078,9 +2127,16 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           break;
         case 'requestSettings':
           this.postSettingsSnapshot();
+          this.postTaskTypesSettingsSnapshot();
           break;
         case 'updateSetting':
           await this.handleUpdateSetting(data);
+          break;
+        case 'requestTaskTypesSettings':
+          this.postTaskTypesSettingsSnapshot();
+          break;
+        case 'updateTaskTypes':
+          await this.handleUpdateTaskTypes(data);
           break;
         case 'listBackends':
           void this.postAvailableBackends();

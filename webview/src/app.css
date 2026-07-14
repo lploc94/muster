@@ -12,11 +12,16 @@
   color-scheme: light dark;
 }
 
+/*
+ * VS Code webviews often grow with content when only height:100% is used, so the
+ * document scales instead of scrolling. Pin the shell to the webview viewport.
+ */
 html,
-body,
-#app {
+body {
+  width: 100%;
   height: 100%;
   margin: 0;
+  overflow: hidden;
 }
 
 body {
@@ -24,12 +29,18 @@ body {
   font-size: var(--vscode-font-size, 13px);
   color: var(--vscode-foreground);
   background: var(--vscode-editor-background, transparent);
+  /* Fixed to the webview client box — content cannot expand the page height. */
+  position: fixed;
+  inset: 0;
 }
 
 #app {
+  position: absolute;
+  inset: 0;
   display: flex;
   flex-direction: column;
   min-height: 0;
+  overflow: hidden;
 }
 
 .sr-only {
@@ -691,22 +702,42 @@ body {
 
 .settings-panel {
   display: flex;
+  flex: 1 1 0;
   flex-direction: column;
   gap: 0;
+  width: 100%;
   max-width: 100%;
   min-width: 0;
+  min-height: 0;
+  /* Fill the fixed #app viewport; never grow past it. */
+  height: 100%;
+  max-height: 100%;
+  overflow: hidden;
   box-sizing: border-box;
-  border-bottom: 1px solid var(--vscode-panel-border);
-  background: color-mix(in srgb, var(--vscode-editor-background) 94%, var(--vscode-sideBar-foreground, var(--vscode-foreground)) 6%);
+  background: var(--vscode-editor-background, var(--vscode-sideBar-background));
 }
 
 .settings-panel__header {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 12px;
+  padding: 10px 12px;
+  flex: none;
   border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+.settings-panel__header-start {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.settings-panel__back {
+  width: 24px;
+  height: 24px;
+  flex: none;
 }
 
 .settings-panel__title {
@@ -729,17 +760,22 @@ body {
   font-size: 12px;
 }
 
-.settings-panel__close {
-  width: 24px;
-  height: 24px;
-  flex: none;
+.settings-panel__body {
+  display: block;
+  gap: 0;
+  padding: 12px;
+  min-height: 0;
+  flex: 1 1 0;
+  /* Only this region scrolls; header stays put. */
+  overflow-x: hidden;
+  overflow-y: scroll;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
 }
 
-.settings-panel__body {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  padding: 12px;
+/* Block children stack with gap without flex-grow fighting overflow. */
+.settings-panel__body > * + * {
+  margin-top: 8px;
 }
 
 .settings-panel__intro,
@@ -830,6 +866,50 @@ body {
   align-items: stretch;
 }
 
+/* Toolbar of actions next to a label (Add / Reset / Save) — do not use fixed 180px column. */
+.settings-panel__control--row {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+.settings-panel__control--row .settings-panel__save {
+  flex: 0 0 auto;
+  width: auto;
+  white-space: nowrap;
+}
+
+/* Task-type editor rows: full-width form, not side-by-side with 180px control. */
+.settings-panel__row--type {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.settings-panel__type-grid {
+  display: grid;
+  grid-template-columns: minmax(4.5rem, auto) minmax(0, 1fr);
+  gap: 6px 10px;
+  align-items: center;
+  width: 100%;
+  min-width: 0;
+}
+
+.settings-panel__type-grid .settings-panel__label {
+  font-size: 12px;
+}
+
+.settings-panel__type-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
 .settings-panel__input {
   width: 100%;
   min-height: 26px;
@@ -839,6 +919,13 @@ body {
   border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
   border-radius: 3px;
   padding: 3px 6px;
+  font: inherit;
+}
+
+/* Native <select> must re-apply theme; Tailwind preflight leaves them bare otherwise. */
+select.settings-panel__input {
+  appearance: auto;
+  cursor: pointer;
 }
 
 .settings-panel__input[aria-invalid="true"] {
@@ -847,7 +934,7 @@ body {
 
 .settings-panel__input:focus-visible,
 .settings-panel__save:focus-visible,
-.settings-panel__close:focus-visible {
+.settings-panel__back:focus-visible {
   outline: 1px solid var(--vscode-focusBorder, #3794ff);
   outline-offset: 2px;
 }
@@ -914,8 +1001,18 @@ body {
     width: 100%;
   }
 
+  .settings-panel__control--row {
+    width: 100%;
+    justify-content: stretch;
+  }
+
+  .settings-panel__control--row .settings-panel__save,
   .settings-panel__save {
     width: 100%;
+  }
+
+  .settings-panel__type-grid {
+    grid-template-columns: 1fr;
   }
 }
 

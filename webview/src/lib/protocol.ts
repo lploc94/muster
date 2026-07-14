@@ -239,6 +239,50 @@ export interface SettingsUpdateResultMessage {
   result: SettingsUpdateResult;
 }
 
+/** Editable task-type row (mirrors host TaskTypeSettingsRow). */
+export interface TaskTypeSettingsRow {
+  id: string;
+  backend: string;
+  model?: string;
+  role: 'coordinator' | 'worker';
+  briefKind: string;
+  description?: string;
+}
+
+export interface TaskTypesSettingsSnapshot {
+  status: 'ok' | 'empty' | 'invalid';
+  types: TaskTypeSettingsRow[];
+  diagnostics: Array<{ code: string; message: string }>;
+  defaults: TaskTypeSettingsRow[];
+  constraints: {
+    maxTypes: number;
+    idPattern: string;
+    descriptionMax: number;
+    stringMax: number;
+    roles: Array<'coordinator' | 'worker'>;
+    briefKinds: string[];
+  };
+}
+
+export type TaskTypesSettingsUpdateResult =
+  | { ok: true }
+  | {
+      ok: false;
+      code: 'invalid_task_type_config' | 'updateFailed';
+      message: string;
+      diagnostics?: Array<{ code: string; message: string }>;
+    };
+
+export interface TaskTypesSettingsSnapshotMessage {
+  type: 'taskTypesSettingsSnapshot';
+  snapshot: TaskTypesSettingsSnapshot;
+}
+
+export interface TaskTypesSettingsUpdateResultMessage {
+  type: 'taskTypesSettingsUpdateResult';
+  result: TaskTypesSettingsUpdateResult;
+}
+
 /** A backend's selectable models, reported by the host for the model picker. */
 export interface BackendModelOption {
   value: string;
@@ -254,6 +298,8 @@ export type ExtMessage =
   | SnapshotMessage
   | SettingsSnapshotMessage
   | SettingsUpdateResultMessage
+  | TaskTypesSettingsSnapshotMessage
+  | TaskTypesSettingsUpdateResultMessage
   | { type: 'taskUpdated'; taskId: string; storeRevision: number; patch: Partial<TaskSummary> }
   | { type: 'turnStart'; taskId: string; turnId: string; trigger: TurnTrigger }
   | { type: 'event'; taskId: string; turnId: string; event: NormalizedEvent }
@@ -441,6 +487,8 @@ export type OutMessage =
   | { type: 'blurTask' }
   | { type: 'requestSettings' }
   | { type: 'updateSetting'; settingId: RetentionSettingId; value: number }
+  | { type: 'requestTaskTypesSettings' }
+  | { type: 'updateTaskTypes'; types: TaskTypeSettingsRow[] }
   | { type: 'listBackends' }
   | { type: 'listModels' }
   /** Webview → host debug line for Output channel "Muster Debug". */
@@ -557,6 +605,58 @@ function isRetentionSettingErrorCode(v: unknown): v is RetentionSettingErrorCode
     v === 'belowMinimum' ||
     v === 'updateFailed'
   );
+}
+
+function isTaskTypeSettingsRow(v: unknown): v is TaskTypeSettingsRow {
+  if (!isRecord(v) || !isString(v.id) || !isString(v.backend)) return false;
+  if (v.role !== 'coordinator' && v.role !== 'worker') return false;
+  if (!isString(v.briefKind)) return false;
+  if (v.model !== undefined && !isString(v.model)) return false;
+  if (v.description !== undefined && !isString(v.description)) return false;
+  return true;
+}
+
+function isTaskTypesSettingsSnapshot(v: unknown): v is TaskTypesSettingsSnapshot {
+  if (!isRecord(v)) return false;
+  if (v.status !== 'ok' && v.status !== 'empty' && v.status !== 'invalid') return false;
+  if (!Array.isArray(v.types) || !v.types.every(isTaskTypeSettingsRow)) return false;
+  if (!Array.isArray(v.defaults) || !v.defaults.every(isTaskTypeSettingsRow)) return false;
+  if (!Array.isArray(v.diagnostics)) return false;
+  for (const d of v.diagnostics) {
+    if (!isRecord(d) || !isString(d.code) || !isString(d.message)) return false;
+  }
+  if (!isRecord(v.constraints)) return false;
+  const c = v.constraints;
+  if (!isInteger(c.maxTypes) || c.maxTypes < 1) return false;
+  if (!isInteger(c.descriptionMax) || c.descriptionMax < 1) return false;
+  if (!isInteger(c.stringMax) || c.stringMax < 1) return false;
+  if (!isString(c.idPattern) || c.idPattern.length === 0) return false;
+  try {
+    // Reject invalid regex syntax so the editor never throws on Save.
+    // eslint-disable-next-line no-new
+    new RegExp(c.idPattern);
+  } catch {
+    return false;
+  }
+  if (!Array.isArray(c.roles) || c.roles.length === 0) return false;
+  if (!c.roles.every((role) => role === 'coordinator' || role === 'worker')) return false;
+  if (!Array.isArray(c.briefKinds) || c.briefKinds.length === 0) return false;
+  if (!c.briefKinds.every((kind) => typeof kind === 'string' && kind.length > 0)) return false;
+  return true;
+}
+
+function isTaskTypesSettingsUpdateResult(v: unknown): v is TaskTypesSettingsUpdateResult {
+  if (!isRecord(v) || typeof v.ok !== 'boolean') return false;
+  if (v.ok === true) return hasOnlyKeys(v, ['ok']);
+  if (v.code !== 'invalid_task_type_config' && v.code !== 'updateFailed') return false;
+  if (!isString(v.message)) return false;
+  if (v.diagnostics !== undefined) {
+    if (!Array.isArray(v.diagnostics)) return false;
+    for (const d of v.diagnostics) {
+      if (!isRecord(d) || !isString(d.code) || !isString(d.message)) return false;
+    }
+  }
+  return true;
 }
 
 function isSettingsUpdateResult(v: unknown): v is SettingsUpdateResult {
@@ -801,6 +901,12 @@ export function isExtMessage(data: unknown): data is ExtMessage {
 
     case 'settingsUpdateResult':
       return hasOnlyKeys(data, ['type', 'result']) && isSettingsUpdateResult(data.result);
+
+    case 'taskTypesSettingsSnapshot':
+      return hasOnlyKeys(data, ['type', 'snapshot']) && isTaskTypesSettingsSnapshot(data.snapshot);
+
+    case 'taskTypesSettingsUpdateResult':
+      return hasOnlyKeys(data, ['type', 'result']) && isTaskTypesSettingsUpdateResult(data.result);
 
     case 'taskUpdated':
       return isString(data.taskId) && isNumber(data.storeRevision) && isRecord(data.patch);

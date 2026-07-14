@@ -428,7 +428,7 @@ npm run smoke:child-model-opencode   # update fixtures for taskType if schema re
 8. `list_task_types` under create_child, no opId.
 9. Keep `get_host_context`; extend with types.
 10. No legacy taskType inference.
-11. **Empty registry → `task_types_not_configured` only** — **no** built-in product default types in v1 (user/workspace must configure).
+11. **Product ship defaults** via `package.json` `muster.taskTypes.default` (no model pins). Explicit empty `{}` still → `task_types_not_configured`. Invalid user map → `invalid_task_type_config` (no silent default merge). Settings UI edits persist to workspace `settings.json`.
 12. Config hook returns **`TaskTypeRegistryResult`** (`ok` | `empty` | `invalid` + diagnostics); invalid ≠ empty.
 13. Backend construction is **fail-closed structured** (`backend_unsupported` / try-catch around factory).
 14. First-turn task-type **rules and type ids** are protected under host budget; raw catalogs demoted when types present.
