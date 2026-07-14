@@ -287,7 +287,18 @@ export type ExtMessage =
    * webview mount so the picker survives restarts — webview `setState` alone
    * is not durable enough when the view is recreated.
    */
-  | { type: 'composerSelection'; backend: string; model: string | null };
+  | { type: 'composerSelection'; backend: string; model: string | null }
+  /**
+   * Task Markdown export succeeded. `fileName` is basename only — never an
+   * absolute path. Failures use `commandError`; cancel is intentionally silent.
+   */
+  | {
+      type: 'exportResult';
+      taskId: string;
+      fileName: string;
+      sourceRevision: number;
+      exportedAt: string;
+    };
 
 export type AskAnswer = { selected: string[]; freeText: string | null };
 
@@ -362,6 +373,12 @@ export type OutMessage =
   | { type: 'clearHistory' }
   | { type: 'deleteTask'; taskId: string }
   | { type: 'renameTask'; taskId: string; goal: string }
+  /**
+   * Export one task as Markdown via the host native Save As dialog.
+   * Success replies with `exportResult` (basename only); failures use
+   * task-scoped `commandError`; cancel posts nothing.
+   */
+  | { type: 'exportTask'; taskId: string }
   | { type: 'blurTask' }
   | { type: 'requestSettings' }
   | { type: 'updateSetting'; settingId: RetentionSettingId; value: number }
@@ -752,6 +769,15 @@ export function isExtMessage(data: unknown): data is ExtMessage {
         (data.model === null || isString(data.model))
       );
 
+    case 'exportResult':
+      return (
+        hasOnlyKeys(data, ['type', 'taskId', 'fileName', 'sourceRevision', 'exportedAt']) &&
+        isString(data.taskId) &&
+        isString(data.fileName) &&
+        isNumber(data.sourceRevision) &&
+        isString(data.exportedAt)
+      );
+
     default:
       return false;
   }
@@ -766,6 +792,27 @@ export function formatLiveInputDeliveredMessage(sessionId: string): string {
     throw new Error('sessionId is required for live-input delivered acknowledgements');
   }
   return 'Live input delivered to the active session.';
+}
+
+/**
+ * User-visible acknowledgement for a successful host `exportResult`.
+ * `fileName` must be a basename only (no path separators or drive prefixes) so
+ * the notice never surfaces absolute destinations. `sourceRevision` is the
+ * store revision the Markdown was projected from.
+ */
+export function formatExportResultMessage(fileName: string, sourceRevision: number): string {
+  if (typeof fileName !== 'string' || fileName.trim().length === 0) {
+    throw new Error('fileName is required for export success notices');
+  }
+  const name = fileName.trim();
+  // Defense-in-depth: never format path-like values into the task-scoped notice.
+  if (/[\\/]/.test(name) || /^[A-Za-z]:/.test(name)) {
+    throw new Error('fileName must be a basename only for export success notices');
+  }
+  if (typeof sourceRevision !== 'number' || !Number.isFinite(sourceRevision)) {
+    throw new Error('sourceRevision must be a finite number for export success notices');
+  }
+  return `Export saved as ${name} (source revision ${sourceRevision}).`;
 }
 
 /**

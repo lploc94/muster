@@ -1267,3 +1267,28 @@ the webview status menu uses `setTaskLifecycle` only.
 - `docs/ADAPTER-SPEC.md` — exactly-one terminal event contract
 - `docs/MUSTER-BRIDGE.md` — MCP transport, AskBridge, and bridge security
 - `docs/WEBVIEW.md` — rendering and message protocol
+
+---
+
+## 18. Task Markdown export
+
+Operators may export one task's **committed visible conversation** as a versioned Markdown document. Export is a **point-in-time** projection for reading/sharing; it is **not a backup** or restore format and does not round-trip into the task store.
+
+### Document contract (`muster-task-export/v1`)
+
+- Marker: `<!-- muster-task-export/v1 -->` at the top of every document.
+- Title and disclaimer that this is a point-in-time export, not a backup/restore format.
+- **Task** metadata: task id, goal, lifecycle status, backend, optional model, source revision (store revision used for the projection), and export timestamp (`exportedAt`, ISO-8601).
+- **Conversation** section built from the canonical transcript, allowlisting only **user/assistant** display content. Tool, reasoning, system, and queued-draft items are **omitted** even when present in the store projection.
+- Retention truncation markers in allowlisted content are preserved verbatim.
+- Atomic render bound: exceeding the Markdown character budget fails closed with `render_bound` and returns **no** partial document.
+
+### Filename and host I/O
+
+- Suggested Save As basename is an ASCII slug of the task goal with a `.md` suffix; unsafe/empty/Unicode-only goals fall back to deterministic `task-export.md`.
+- Host opens native **Save As**, writes UTF-8 on approval, and never mutates the task store for export.
+- Webview posts `exportTask` `{ taskId }` for the focused task; host replies with `exportResult` carrying **basename-only** `fileName` plus `taskId`, `sourceRevision`, and `exportedAt`. Absolute destinations never leave the host route.
+- User cancel is a **silent cancel** outcome (no `exportResult`, no `commandError`).
+- Failures map to stable generic messages (`invalid_request`, `task_not_found`, `render_bound`, `write_failed`, `dialog_failed`) via task-scoped **sanitized** `commandError` text — no absolute paths, raw stacks, credentials, or other-task content.
+
+Webview trigger, notice chrome, and proof-class separation are specified in [WEBVIEW.md](WEBVIEW.md) §16 and [CONTRIBUTING.md](../CONTRIBUTING.md).

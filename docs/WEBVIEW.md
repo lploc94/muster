@@ -677,7 +677,34 @@ Unit tests cover keyboard intent, protocol shapes, queue control locking, and in
 
 ---
 
-## 15. References
+## 15. Task / chat Markdown export
+
+From a **focused task** workspace, **Export task/chat** posts a host-owned export request for that task only. The host projects a point-in-time Markdown document (`muster-task-export/v1`), opens the native VS Code Save As dialog, and writes UTF-8 on approval. Domain contract details (allowlist, metadata, filename rules) live in [TASK-MANAGEMENT.md](TASK-MANAGEMENT.md) §18.
+
+### Protocol
+
+| Direction | Message | Shape / notes |
+|-----------|---------|----------------|
+| Webview → host | `exportTask` | `{ type: 'exportTask', taskId }` — focused task id only |
+| Host → webview | `exportResult` | `{ type: 'exportResult', taskId, fileName, sourceRevision, exportedAt }` — `fileName` is **basename-only** (never an absolute path) |
+| Host → webview | `commandError` | Task-scoped sanitized failure text (`invalid_request`, `task_not_found`, `render_bound`, `write_failed`, `dialog_failed`) |
+| Host → webview | _(none)_ | User cancel of Save As is **silent** — cancel produces no webview message |
+
+### UX rules
+
+- The control is available on the focused task workspace; it must not export a foreign task id.
+- Success uses the task-scoped notice chrome with basename + `sourceRevision` context (for example `Export saved as ship-readable-export.md (source revision 11).`).
+- Failures reuse existing `commandError` chrome with host-sanitized generic text — no absolute destinations, raw stacks, credentials, or other-task content.
+- Cancel clears no extra chrome beyond the click that starts export (prior error banners may clear when re-triggering export).
+- Foreign-task `exportResult` / `commandError` feedback stays hidden when another task is focused.
+
+### Proof boundary
+
+Unit tests cover the pure Markdown projector, host export route (including silent cancel and sanitized failures), and webview protocol guards. Focused Playwright (`e2e/muster-webview-state.spec.ts` against the Vite webview with mocked VS Code APIs) proves **Export task/chat** posts focused `exportTask` and shows task-scoped success/failure chrome with synthetic host messages. Local unit and Playwright checks are supportive only; they do not prove native Save As, overwrite, Unicode filename, or write-failure outcomes. Live Extension Development Host observation and the verifier-backed ledger in [CONTRIBUTING.md](../CONTRIBUTING.md) establish PASS / FAIL / ENVIRONMENT BLOCKED for those scenarios.
+
+---
+
+## 16. References
 
 - [VS Code Webview API](https://code.visualstudio.com/api/extension-guides/webview)
 - [VS Code Elements docs](https://vscode-elements.github.io)

@@ -1147,7 +1147,8 @@ test.describe('Muster webview host state smoke', () => {
 
     const notice = page.locator('.task-command-notice');
     await expect(notice).toBeVisible();
-    await expect(notice.getByText('Live input', { exact: true })).toBeVisible();
+    // Shared task-scoped notice chrome uses a generic Status title; detail carries the ack.
+    await expect(notice.getByText('Status', { exact: true })).toBeVisible();
     await expect(
       notice.getByText('Live input delivered to the active session.', { exact: true }),
     ).toBeVisible();
@@ -1270,6 +1271,126 @@ test.describe('Muster webview host state smoke', () => {
     });
     await expect(page.getByTestId('queued-turns-panel')).toHaveCount(0);
     await expect(page.getByRole('alert')).toHaveCount(0);
+  });
+
+  test('Export task/chat posts exportTask and shows task-scoped success/failure chrome', async ({
+    page,
+  }) => {
+    await openWebview(page);
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-export', goal: 'Export this task', viewStatus: 'idle' })],
+      focusedTaskId: 'task-export',
+      subtree: [task({ id: 'task-export', goal: 'Export this task', viewStatus: 'idle' })],
+      transcript: [{ id: 'msg-export-1', kind: 'assistant', content: 'Ready to export.' }],
+      storeRevision: 201,
+    });
+
+    const exportBtn = page.getByTestId('export-task-chat');
+    await expect(exportBtn).toBeVisible();
+    await expect(exportBtn).toHaveAttribute('aria-label', 'Export task/chat');
+
+    // Stale failure chrome is cleared when Export is re-triggered.
+    await postCommandError(page, {
+      type: 'commandError',
+      taskId: 'task-export',
+      message: 'Previous export failed.',
+    });
+    await expect(page.getByRole('alert').getByText('Previous export failed.')).toBeVisible();
+
+    await exportBtn.click();
+    await expectPostedMessage(page, { type: 'exportTask', taskId: 'task-export' });
+    // Click path only posts exportTask with focused taskId — no extra payload fields required by host.
+    const exportPosts = (await postedMessages(page)).filter(
+      (m) => (m as { type?: string }).type === 'exportTask',
+    );
+    expect(exportPosts).toEqual([{ type: 'exportTask', taskId: 'task-export' }]);
+    await expect(page.getByRole('alert')).toHaveCount(0);
+
+    // Success notice is task-scoped and uses basename + sourceRevision only (no absolute paths).
+    await postRawHostMessage(page, {
+      type: 'exportResult',
+      taskId: 'task-export',
+      fileName: 'export-this-task.md',
+      sourceRevision: 201,
+      exportedAt: '2026-07-14T00:00:00.000Z',
+    });
+    const notice = page.locator('.task-command-notice');
+    await expect(notice).toBeVisible();
+    await expect(notice.getByText('Status', { exact: true })).toBeVisible();
+    await expect(
+      notice.getByText('Export saved as export-this-task.md (source revision 201).', {
+        exact: true,
+      }),
+    ).toBeVisible();
+    await expect(page.getByRole('alert')).toHaveCount(0);
+    // Notice text must never surface absolute destinations.
+    await expect(notice).not.toContainText(/[\\/]/);
+    await expect(notice).not.toContainText(/^[A-Za-z]:/);
+
+    // Foreign-task exportResult stays hidden while focused elsewhere.
+    await postRawHostMessage(page, {
+      type: 'exportResult',
+      taskId: 'other-task',
+      fileName: 'other.md',
+      sourceRevision: 9,
+      exportedAt: '2026-07-14T00:00:01.000Z',
+    });
+    await expect(
+      notice.getByText('Export saved as export-this-task.md (source revision 201).', {
+        exact: true,
+      }),
+    ).toBeVisible();
+    await expect(notice.getByText('Export saved as other.md (source revision 9).')).toHaveCount(0);
+
+    // Task-scoped commandError is the failure chrome; success notice is superseded.
+    await postCommandError(page, {
+      type: 'commandError',
+      taskId: 'task-export',
+      message: 'Export could not be completed.',
+    });
+    await expect(page.getByRole('alert').getByText('Task command failed')).toBeVisible();
+    await expect(page.getByRole('alert').getByText('Export could not be completed.')).toBeVisible();
+    await expect(page.locator('.task-command-notice')).toHaveCount(0);
+
+    // Foreign-task failure stays hidden.
+    await postCommandError(page, {
+      type: 'commandError',
+      taskId: 'other-task',
+      message: 'Foreign export failed.',
+    });
+    await expect(page.getByRole('alert').getByText('Foreign export failed.')).toHaveCount(0);
+
+    // Cancel is silent: host posts nothing after exportTask. Click clears prior error chrome
+    // so a cancelled Save As does not leave a stale failure banner.
+    const beforeCancel = await postedMessages(page);
+    await exportBtn.click();
+    await expect.poll(async () => (await postedMessages(page)).length).toBe(beforeCancel.length + 1);
+    const cancelExportPosts = (await postedMessages(page)).filter(
+      (m) => (m as { type?: string }).type === 'exportTask',
+    );
+    expect(cancelExportPosts.at(-1)).toEqual({ type: 'exportTask', taskId: 'task-export' });
+    await expect(page.getByRole('alert')).toHaveCount(0);
+    // No exportResult arrives on cancel; success notice must not appear from silence alone.
+    await expect(page.locator('.task-command-notice')).toHaveCount(0);
+
+    // Path-like fileName must not invent a success banner (formatter rejects; message ignored).
+    await postRawHostMessage(page, {
+      type: 'exportResult',
+      taskId: 'task-export',
+      fileName: 'C:\\Users\\secret\\export.md',
+      sourceRevision: 201,
+      exportedAt: '2026-07-14T00:00:02.000Z',
+    });
+    await expect(page.locator('.task-command-notice')).toHaveCount(0);
+    // Malformed exportResult (missing required fields) is ignored by protocol guard.
+    await postRawHostMessage(page, {
+      type: 'exportResult',
+      taskId: 'task-export',
+      fileName: 'ignored.md',
+    });
+    await expect(page.locator('.task-command-notice')).toHaveCount(0);
   });
 });
 

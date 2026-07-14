@@ -90,9 +90,9 @@ Dev-only file IPC proof — production design uses [Muster Bridge](docs/MUSTER-B
 | [docs/MUSTER-BRIDGE.md](docs/MUSTER-BRIDGE.md) | MCP `ask_user` + AskBridge |
 | [docs/MCP-INJECTION.md](docs/MCP-INJECTION.md) | MCP config per backend |
 | [docs/SESSION-MANAGEMENT.md](docs/SESSION-MANAGEMENT.md) | Session IDs & resume |
-| [docs/TASK-MANAGEMENT.md](docs/TASK-MANAGEMENT.md) | Task/turn model & TaskEngine |
+| [docs/TASK-MANAGEMENT.md](docs/TASK-MANAGEMENT.md) | Task/turn model, TaskEngine, and Markdown export contract |
 | [docs/SETTINGS.md](docs/SETTINGS.md) | Host-backed Settings pattern |
-| [docs/WEBVIEW.md](docs/WEBVIEW.md) | Chat UI and read-only presentation review, revision, and diagnostics |
+| [docs/WEBVIEW.md](docs/WEBVIEW.md) | Chat UI, read-only presentation review/revision, and task Markdown export UX |
 
 Full index: [docs/README.md](docs/README.md).
 

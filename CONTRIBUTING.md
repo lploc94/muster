@@ -83,6 +83,35 @@ The focused browser test uses synthetic host messages and is **supportive only**
 
 Record each scenario in `docs/uat/m007-s02/file-drop-live-host-evidence.md` with one `PASS`, `FAIL`, or `ENVIRONMENT BLOCKED` verdict, a UTC timestamp, expected and observed results, bounded evidence, blocker detail, and cleanup. Use `ENVIRONMENT BLOCKED` only after naming the attempted step and concrete unavailable control. Never promote unit or Playwright results to live proof, and never record absolute paths, workspace identity, file contents, credentials, raw transcripts, or task-store data.
 
+## Task export verification and live-host evidence
+
+Task / chat Markdown export has three distinct proof classes. Run them in this order:
+
+```bash
+# Local projector, host route, and webview protocol gates
+npm test
+npm run compile
+npm run test:webview -- e2e/muster-webview-state.spec.ts
+npm run test:task-export-docs
+# Live ledger verifier (T04): accepts PASS / FAIL / ENVIRONMENT BLOCKED honestly
+npm run test:task-export-live-evidence
+```
+
+Focused Playwright (`e2e/muster-webview-state.spec.ts` against the Vite webview with mocked VS Code APIs) proves only that **Export task/chat** posts focused `exportTask` and that task-scoped success/failure chrome renders from synthetic host messages. Those results are **supportive only**. They do not prove native Save As, cancel, overwrite, Unicode filename, or write-failure outcomes, and they must never be promoted to live proof.
+
+Next, press **F5** to launch the actual VS Code **Extension Development Host**. From a focused task with short synthetic conversation content, attempt export save, cancel, overwrite, a Unicode filename, and a write-failure path as recorded in the ledger.
+
+Record each scenario in `docs/uat/m009-s03/task-export-live-host-evidence.md`:
+
+- give every scenario exactly one `PASS`, `FAIL`, or `ENVIRONMENT BLOCKED` verdict and a UTC timestamp;
+- use `PASS` only for bounded observation in the actual Extension Development Host;
+- use `FAIL` for reproducible product behavior observed in that host;
+- use `ENVIRONMENT BLOCKED` when host control, dialog automation, filesystem permissions, or reload automation prevents the scenario, naming both the attempted step and concrete blocker;
+- record final cleanup explicitly; and
+- never include credentials, secrets, prompts, transcript content, raw task-store data, workspace identity, or absolute paths.
+
+Validate the ledger with `npm run test:task-export-live-evidence` once the T04 verifier and ledger land; its errors identify the scenario or evidence rule that failed.
+
 ## Queue and interrupt-and-send verification
 
 Multi-queued FIFO follow-ups and Ctrl+Enter interrupt & send are documented in
