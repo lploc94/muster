@@ -151,6 +151,11 @@ export interface MusterTask {
   /** Optional model id selected for this task (ACP session config option value). */
   model?: string;
   /**
+   * Provenance: muster.taskTypes id used at create/delegate (schema-compatible optional).
+   * Absent on legacy tasks; never re-resolved on release.
+   */
+  taskType?: string;
+  /**
    * Backend conversation session for this task. Set after a successful turn
    * (session/new or session/load). Next turns pass it as resumeId — process may
    * stop between turns, but the session binding stays on the open task.

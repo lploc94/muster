@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'crypto';
 import type { AskBridge, Answers, AskRef } from '../bridge/ask-bridge';
 import type { CredentialRegistry } from '../bridge/credentials';
 import { buildTurnMcp, deleteMcpConfigFile } from '../bridge/mcp-config';
+import { isKnownBackendId } from '../backends/index';
 import type { Backend } from '../types';
 import { canBindTaskToBackend } from './backend-eligibility';
 import { mergeBriefFromCreate } from './brief';
@@ -13,6 +14,14 @@ import {
   minimalHostSnapshot,
   type HostEnvironmentSnapshot,
 } from './host-context';
+import {
+  parseTaskTypeRegistry,
+  resolveCreateChildSpec,
+  summarizeTaskTypes,
+  TASK_TYPE_DIAGNOSTIC_MAX,
+  TASK_TYPE_DIAGNOSTIC_MESSAGE_MAX,
+  type TaskTypeRegistryResult,
+} from './task-types';
 import {
   bridgeTokenTtlMs,
   canCreateTurn,
@@ -167,7 +176,7 @@ export interface GraphEngineDeps {
    * Task-types W2: live cwd-aware registry (VS Code muster.taskTypes).
    * Missing hook → treated as empty at create/list sites.
    */
-  getTaskTypeRegistry?: (cwd?: string) => import('./task-types').TaskTypeRegistryResult;
+  getTaskTypeRegistry?: (cwd?: string) => TaskTypeRegistryResult;
   leaseOwnerAlive: (turnId: string) => boolean;
   ownsLease: (turnId: string) => boolean;
   writeCancelRequest: (
@@ -296,7 +305,8 @@ export async function executeToolCommand(
   if (
     command.kind !== 'get_task_status' &&
     command.kind !== 'report_progress' &&
-    command.kind !== 'get_host_context'
+    command.kind !== 'get_host_context' &&
+    command.kind !== 'list_task_types'
   ) {
     const existing = deps.store.getFile().operations?.[opLedgerKey(ctx.turnId, command.opId)];
     if (existing) {
@@ -324,12 +334,74 @@ export async function executeToolCommand(
           }),
         };
       }
+
+      // Resolve task type before any store mutation (fail-closed).
+      const callerForCwd = deps.store.getFile().tasks[ctx.callerTaskId];
+      const registryCwd =
+        (callerForCwd?.cwd && callerForCwd.cwd.length > 0 ? callerForCwd.cwd : undefined) ??
+        deps.workspaceFolder;
+      const registryResult: TaskTypeRegistryResult = deps.getTaskTypeRegistry
+        ? deps.getTaskTypeRegistry(registryCwd)
+        : parseTaskTypeRegistry(undefined);
+      const resolved = resolveCreateChildSpec(
+        {
+          taskType: command.spec.taskType,
+          backend: command.spec.backend,
+          model: command.spec.model,
+          role: command.spec.role,
+          briefKind: command.spec.brief?.kind,
+        },
+        registryResult,
+      );
+      if (!resolved.ok) {
+        return {
+          ok: false,
+          error: JSON.stringify({
+            code: resolved.code,
+            message: resolved.message,
+          }),
+        };
+      }
+
+      if (!isKnownBackendId(resolved.resolved.backend)) {
+        return {
+          ok: false,
+          error: JSON.stringify({
+            code: 'backend_unsupported',
+            message: `unsupported backend: ${resolved.resolved.backend}`,
+          }),
+        };
+      }
+
+      let backend: Backend;
+      try {
+        backend = deps.makeBackend(resolved.resolved.backend);
+      } catch {
+        return {
+          ok: false,
+          error: JSON.stringify({
+            code: 'backend_unsupported',
+            message: `unsupported backend: ${resolved.resolved.backend}`,
+          }),
+        };
+      }
+      if (!canBindTaskToBackend(backend.capabilities)) {
+        return {
+          ok: false,
+          error: JSON.stringify({
+            code: 'backend_not_mcp',
+            message: 'backend does not support MCP',
+          }),
+        };
+      }
+
       const childId = deriveEntityId(ctx.turnId, command.opId, 'task');
       const turnId = deriveEntityId(ctx.turnId, command.opId, 'turn');
-      const backend = deps.makeBackend(command.spec.backend);
-      if (!canBindTaskToBackend(backend.capabilities)) {
-        return { ok: false, error: 'backend does not support MCP' };
-      }
+      const resolvedRole = resolved.resolved.role;
+      const resolvedBackend = resolved.resolved.backend;
+      const resolvedModel = resolved.resolved.model;
+      const resolvedTaskType = resolved.resolved.taskType;
+      const resolvedBriefKind = resolved.resolved.briefKind;
 
       const commit = deps.store.commit((draft) => {
         ensureCoordinationMaps(draft);
@@ -375,22 +447,24 @@ export async function executeToolCommand(
           brief: command.spec.brief,
           writePaths: command.spec.writePaths,
           readPaths: command.spec.readPaths,
+          defaultKind: resolvedBriefKind,
         });
         const input: CreateTaskInput = {
           id: childId,
-          role: command.spec.role ?? 'worker',
+          role: resolvedRole,
           goal: brief.objective || command.spec.goal,
           description: command.spec.description,
           parentId: ctx.callerTaskId,
           dependencies: command.spec.dependencies ?? [],
-          backend: command.spec.backend,
+          backend: resolvedBackend,
           // Optional ACP model id; omit → agent default for that backend.
-          model: command.spec.model,
+          model: resolvedModel,
+          taskType: resolvedTaskType,
           // Children inherit the parent's workspace directory so delegated
           // sub-tasks run in the same place and never fall back to process.cwd().
           cwd: caller.cwd,
           capabilities:
-            (command.spec.role ?? 'worker') === 'coordinator'
+            resolvedRole === 'coordinator'
               ? DEFAULT_COORDINATOR_CHILD_CAPS
               : DEFAULT_WORKER_CAPS,
           // Never trust the raw agent-supplied policy: clamp every field to bounds.
@@ -444,7 +518,17 @@ export async function executeToolCommand(
 
         const result: OpResult = {
           ok: true,
-          data: { taskId: childId, turnId: queuedTurnId },
+          data: {
+            taskId: childId,
+            turnId: queuedTurnId,
+            taskType: resolvedTaskType,
+            resolved: {
+              backend: resolvedBackend,
+              ...(resolvedModel !== undefined ? { model: resolvedModel } : {}),
+              role: resolvedRole,
+              briefKind: brief.kind,
+            },
+          },
         };
         writeLedger(draft, ctx.turnId, command.opId, fingerprint, result);
         return { ok: true };
@@ -1142,6 +1226,16 @@ export async function executeToolCommand(
         ? { ...cached, cwd, trusted }
         : minimalHostSnapshot(cwd, trusted);
       const tools = [...capabilitiesFor(task)].sort();
+      const registryResult: TaskTypeRegistryResult = deps.getTaskTypeRegistry
+        ? deps.getTaskTypeRegistry(cwd)
+        : parseTaskTypeRegistry(undefined);
+      // Snapshot present (even empty backends) ⇒ scanned; missing cache ⇒ unknown.
+      const scanned = cached !== undefined;
+      const available = new Set(snapshot.availableBackends ?? []);
+      const { taskTypes, diagnostics } = summarizeTaskTypes(registryResult, (backend) => {
+        if (!scanned) return 'unknown';
+        return available.has(backend) ? 'available' : 'unavailable';
+      });
       const host = buildHostContext({
         snapshot,
         self: {
@@ -1154,8 +1248,54 @@ export async function executeToolCommand(
         },
         tools,
         taskCwd: task.cwd,
+        // Coordinators always get taskTypes array (empty = configure guidance).
+        // suppressBackendCatalog omitted → keep diagnostic backends/models.
+        ...(task.role === 'coordinator' ? { taskTypes } : {}),
       });
-      return { ok: true, result: host };
+      return {
+        ok: true,
+        result: {
+          ...host,
+          taskTypes,
+          ...(diagnostics.length > 0 ? { taskTypeDiagnostics: diagnostics } : {}),
+        },
+      };
+    }
+
+    case 'list_task_types': {
+      // Read-only: no opId, no ledger. Live registry for coordinator create_child.
+      const file = deps.store.getFile();
+      const task = file.tasks[ctx.callerTaskId];
+      if (!task) return { ok: false, error: 'task not found' };
+      const cwd =
+        (task.cwd && task.cwd.length > 0 ? task.cwd : undefined) ??
+        deps.getHostEnvironment?.()?.cwd ??
+        deps.workspaceFolder ??
+        process.cwd();
+      const registryResult: TaskTypeRegistryResult = deps.getTaskTypeRegistry
+        ? deps.getTaskTypeRegistry(cwd)
+        : parseTaskTypeRegistry(undefined);
+      const hostEnv = deps.getHostEnvironment?.();
+      const scanned = hostEnv !== undefined;
+      const available = new Set(hostEnv?.availableBackends ?? []);
+      const summarized = summarizeTaskTypes(registryResult, (backend) => {
+        if (!scanned) return 'unknown';
+        return available.has(backend) ? 'available' : 'unavailable';
+      });
+      const diagnostics = [...summarized.diagnostics];
+      for (const row of summarized.taskTypes) {
+        if (row.availability !== 'unavailable') continue;
+        if (diagnostics.length >= TASK_TYPE_DIAGNOSTIC_MAX) break;
+        let message = `backend "${row.backend}" for type "${row.id}" not detected on PATH`;
+        if (message.length > TASK_TYPE_DIAGNOSTIC_MESSAGE_MAX) {
+          message = `${message.slice(0, TASK_TYPE_DIAGNOSTIC_MESSAGE_MAX - 1)}…`;
+        }
+        diagnostics.push({ code: 'backend_unavailable', message });
+      }
+      return {
+        ok: true,
+        result: { taskTypes: summarized.taskTypes, diagnostics },
+      };
     }
 
     case 'upsert_presentation':

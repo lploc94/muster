@@ -13,10 +13,16 @@ import type {
 
 export interface CreateChildSpec {
   goal: string;
-  backend: string;
+  /** Required routing key into muster.taskTypes (resolved at create/delegate). */
+  taskType: string;
+  /**
+   * Optional user override for backend (only when user named it).
+   * Resolved against the task type preset before persist.
+   */
+  backend?: string;
   /**
    * Optional ACP model id for this child (session config / set_model value).
-   * When omitted, the backend agent uses its own default model.
+   * When omitted, uses type preset model (if backend unchanged) or agent default.
    */
   model?: string;
   role?: TaskRole;
@@ -71,6 +77,7 @@ export type ToolCommand =
   | { kind: 'wait_for_tasks'; opId: string; taskIds: string[] }
   | { kind: 'get_task_status'; taskId?: string }
   | { kind: 'get_host_context' }
+  | { kind: 'list_task_types' }
   | { kind: 'complete_task'; opId: string; result: string }
   | { kind: 'fail_task'; opId: string; error: string }
   | { kind: 'report_progress'; opId: string; note: string }
@@ -113,6 +120,7 @@ function toolActionForName(name: string): ToolAction | undefined {
     'wait_for_tasks',
     'get_task_status',
     'get_host_context',
+    'list_task_types',
     'complete_task',
     'fail_task',
     'report_progress',
@@ -320,16 +328,26 @@ function parseInputBindings(value: unknown): TaskInputBinding[] | undefined {
 
 function parseCreateSpec(args: Record<string, unknown>): CreateChildSpec | undefined {
   const goal = requireString(args, 'goal');
-  const backend = requireString(args, 'backend');
-  if (!goal || !backend) {
+  const taskType = requireString(args, 'taskType');
+  if (!goal || !taskType) {
     return undefined;
   }
-  const spec: CreateChildSpec = { goal, backend };
-  const model = requireString(args, 'model');
-  if (model) {
-    spec.model = model;
+  const spec: CreateChildSpec = { goal, taskType };
+  // Present-but-invalid optional routing fields fail closed (not silently omitted).
+  if ('backend' in args) {
+    if (typeof args.backend !== 'string' || args.backend.length === 0 || args.backend.length > 200) {
+      return undefined;
+    }
+    spec.backend = args.backend;
   }
-  if (typeof args.role === 'string' && (args.role === 'coordinator' || args.role === 'worker')) {
+  if ('model' in args) {
+    if (typeof args.model !== 'string' || args.model.length === 0 || args.model.length > 200) {
+      return undefined;
+    }
+    spec.model = args.model;
+  }
+  if ('role' in args) {
+    if (args.role !== 'coordinator' && args.role !== 'worker') return undefined;
     spec.role = args.role;
   }
   if (args.dependencies !== undefined) {
@@ -605,6 +623,14 @@ export function dispatch(
       return { ok: false, toolError: 'get_host_context takes no arguments' };
     }
     return { ok: true, command: { kind: 'get_host_context' } };
+  }
+
+  if (tool === 'list_task_types') {
+    // Read-only: no opId; empty args only (live registry in engine).
+    if (Object.keys(args).length > 0) {
+      return { ok: false, toolError: 'list_task_types takes no arguments' };
+    }
+    return { ok: true, command: { kind: 'list_task_types' } };
   }
 
   return { ok: false, toolError: `unsupported tool: ${tool}` };

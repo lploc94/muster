@@ -105,8 +105,10 @@ export function mergeBriefFromCreate(args: {
   brief?: TaskBriefOverlay;
   writePaths?: string[];
   readPaths?: string[];
+  /** Preset briefKind when overlay omits kind (task-types resolve). */
+  defaultKind?: TaskBriefKind;
 }): TaskBriefV1 {
-  const kind = args.brief?.kind ?? 'generic';
+  const kind = args.brief?.kind ?? args.defaultKind ?? 'generic';
   const base = synthesizeBriefFromGoal(args.goal, args.description, kind);
   const o = args.brief;
 
@@ -276,6 +278,8 @@ export interface AssembleFirstTurnInput {
   brief: TaskBriefV1;
   resolvedInputs?: readonly ResolvedInputPin[];
   meta?: CompileTaskPromptMeta;
+  /** Coordinator task-type summaries for first-turn host inject. */
+  taskTypes?: BuildHostContextInput['taskTypes'];
 }
 
 /**
@@ -289,6 +293,9 @@ export function assembleFirstTurnPrompt(input: AssembleFirstTurnInput): Assemble
     self: input.self,
     tools: input.tools,
     taskCwd: input.taskCwd,
+    taskTypes: input.taskTypes,
+    // First-turn: demote raw catalogs when types present (get_host_context keeps them).
+    suppressBackendCatalog: true,
   });
   let hostMd = formatHostContextMarkdown(hostCtx);
 

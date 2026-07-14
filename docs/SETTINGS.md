@@ -12,7 +12,7 @@ This guide documents the destination pattern for feature settings. It is not a m
 
 ## Non-negotiable invariants
 
-- At least one real settings group is backed by VS Code contributed configuration. Today the retention group exposes `muster.retention.maxTurnsPerTask` and `muster.retention.maxStoredOutputChars` through the extension manifest so VS Code owns default values, minimums, and the user-facing Settings entry.
+- At least one real settings group is backed by VS Code contributed configuration. Today the retention group exposes `muster.retention.maxTurnsPerTask` and `muster.retention.maxStoredOutputChars` through the extension manifest so VS Code owns default values, minimums, and the user-facing Settings entry. Task-type presets use resource-scoped `muster.taskTypes` (object map); empty fails closed for coordinator create/delegate (see `docs/TASK-MANAGEMENT.md` §8).
 - The extension host owns reads and writes. It reads configuration into a snapshot, validates update requests, writes through VS Code configuration APIs, and sends the result back to the webview.
 - The webview is a typed view. It requests a snapshot, renders values from host messages, posts update requests, and waits for host results before treating a value as saved.
 - Webview messages are typed and runtime-guarded. Every new host-to-webview or webview-to-host settings message needs a static TypeScript shape and a runtime guard so malformed messages are ignored instead of partially applied.

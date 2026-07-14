@@ -168,6 +168,8 @@ export interface CreateTaskInput {
   backend: string;
   /** Optional model id selected for this task (see MusterTask.model). */
   model?: string;
+  /** Provenance task type id (see MusterTask.taskType). */
+  taskType?: string;
   /** Workspace directory the agent should run in for this task (see MusterTask.cwd). */
   cwd?: string;
   capabilities: TaskCapability[];
@@ -281,6 +283,7 @@ export function createTask(
     dependencies: [...input.dependencies],
     backend: input.backend,
     model: input.model,
+    ...(input.taskType !== undefined ? { taskType: input.taskType } : {}),
     cwd: input.cwd,
     capabilities: [...input.capabilities],
     executionPolicy: { ...input.executionPolicy },

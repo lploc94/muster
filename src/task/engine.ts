@@ -9,6 +9,7 @@ import type { TaskHandoffPhase, TurnTrigger } from './types';
 import { canBindTaskToBackend } from './backend-eligibility';
 import { assembleFirstTurnPrompt, synthesizeBriefFromGoal } from './brief';
 import { capabilitiesFor } from './capabilities';
+import { summarizeTaskTypes } from './task-types';
 import {
   formatPinnedInputsForPrompt,
   pinResolvedInputs,
@@ -3531,6 +3532,24 @@ export class TaskEngine {
           synthesizeBriefFromGoal(draftTask.goal, draftTask.description);
         const snapshot = this.resolveHostSnapshot(draftTask);
         const tools = [...capabilitiesFor(draftTask)].sort();
+        const registryCwd =
+          (draftTask.cwd && draftTask.cwd.length > 0 ? draftTask.cwd : undefined) ??
+          snapshot.cwd ??
+          this.workspaceFolder;
+        const registryResult = this.getTaskTypeRegistry
+          ? this.getTaskTypeRegistry(registryCwd)
+          : undefined;
+        // Coordinators always get taskTypes array (empty when unconfigured) for guidance.
+        const taskTypesForHost =
+          draftTask.role === 'coordinator'
+            ? summarizeTaskTypes(
+                registryResult ?? {
+                  status: 'empty' as const,
+                  registry: new Map(),
+                  diagnostics: [],
+                },
+              ).taskTypes
+            : undefined;
         const assembled = assembleFirstTurnPrompt({
           snapshot,
           self: {
@@ -3546,6 +3565,7 @@ export class TaskEngine {
           brief,
           resolvedInputs: pins,
           meta: { taskId: draftTask.id, goal: draftTask.goal },
+          ...(taskTypesForHost !== undefined ? { taskTypes: taskTypesForHost } : {}),
         });
 
         if (!assembled.ok) {

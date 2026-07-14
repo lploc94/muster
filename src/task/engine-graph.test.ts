@@ -12,7 +12,16 @@ import {
   MAX_BRIDGE_TOKEN_TTL_MS,
 } from './limits';
 import { TaskStore } from './store';
+import { parseTaskTypeRegistry } from './task-types';
 import type { Backend, BackendCapabilities, NormalizedEvent, RunOptions } from '../types';
+
+/** Default test registry so create/delegate with taskType resolves. */
+export const TEST_TASK_TYPES = parseTaskTypeRegistry({
+  worker: { backend: 'grok', role: 'worker', briefKind: 'generic' },
+  plan: { backend: 'codex', model: 'gpt-5', role: 'worker', briefKind: 'plan' },
+  implement: { backend: 'claude', model: 'sonnet', role: 'worker', briefKind: 'implement' },
+  coordinate: { backend: 'grok', role: 'coordinator', briefKind: 'coordinate' },
+});
 
 const MCP_CAPS: BackendCapabilities = {
   supportsMCP: true,
@@ -44,10 +53,11 @@ function makeHarness() {
 
   const engine = TaskEngine.load({
     store,
-    makeBackend: () => backend,
+    makeBackend: (name) => ({ ...backend, name }),
     askBridge,
     credentialRegistry: credentials,
     bridgePort: 19999,
+    getTaskTypeRegistry: () => TEST_TASK_TYPES,
   });
 
   return { store, engine, credentials, resume: () => resume?.() };
@@ -79,7 +89,7 @@ describe('engine graph orchestration', () => {
     const result = await engine.handleToolCall(ctx, 'create_task', {
       kind: 'create_task',
       opId: 'op-1',
-      spec: { goal: 'child', backend: 'grok' },
+      spec: { goal: 'child', taskType: 'worker', backend: 'grok' },
     });
     expect(result.ok).toBe(false);
     expect(Object.keys(store.getFile().tasks)).toEqual(['root']);
@@ -114,7 +124,7 @@ describe('engine graph orchestration', () => {
     const result = await engine.handleToolCall(ctx, 'create_task', {
       kind: 'create_task',
       opId: 'op-create',
-      spec: { goal: 'child task', backend: 'grok', role: 'worker' },
+      spec: { goal: 'child task', taskType: 'worker', backend: 'grok', role: 'worker' },
     });
     expect(result.ok).toBe(true);
     const childId = deriveEntityId(started.value!.turnId, 'op-create', 'task');
@@ -157,12 +167,12 @@ describe('engine graph orchestration', () => {
     await engine.handleToolCall(ctx, 'create_task', {
       kind: 'create_task',
       opId: 'op-a',
-      spec: { goal: 'child A', backend: 'grok', role: 'worker' },
+      spec: { goal: 'child A', taskType: 'worker', backend: 'grok', role: 'worker' },
     });
     await engine.handleToolCall(ctx, 'create_task', {
       kind: 'create_task',
       opId: 'op-b',
-      spec: { goal: 'child B', backend: 'grok', role: 'worker' },
+      spec: { goal: 'child B', taskType: 'worker', backend: 'grok', role: 'worker' },
     });
     const childA = deriveEntityId(turnId, 'op-a', 'task');
     const childB = deriveEntityId(turnId, 'op-b', 'task');
@@ -239,7 +249,7 @@ describe('engine graph orchestration', () => {
     const result = await engine.handleToolCall(ctx, 'delegate_task', {
       kind: 'delegate_task',
       opId: 'op-del',
-      spec: { goal: 'do it', backend: 'grok', role: 'worker' },
+      spec: { goal: 'do it', taskType: 'worker', backend: 'grok', role: 'worker' },
     });
     expect(result.ok).toBe(true);
     const childId = deriveEntityId(started.value.turnId, 'op-del', 'task');
@@ -272,7 +282,7 @@ describe('engine graph orchestration', () => {
     await engine.handleToolCall(ctx, 'create_task', {
       kind: 'create_task',
       opId: 'op-c',
-      spec: { goal: 'child work', backend: 'grok', role: 'worker' },
+      spec: { goal: 'child work', taskType: 'worker', backend: 'grok', role: 'worker' },
     });
     const childId = deriveEntityId(started.value.turnId, 'op-c', 'task');
     // release via host startTask after marking released
@@ -350,7 +360,7 @@ describe('engine graph orchestration', () => {
     await engine.handleToolCall(ctx, 'create_task', {
       kind: 'create_task',
       opId: 'op-c',
-      spec: { goal: 'c', backend: 'grok' },
+      spec: { goal: 'c', taskType: 'worker', backend: 'grok' },
     });
     const childId = deriveEntityId(started.value.turnId, 'op-c', 'task');
     const result = await engine.handleToolCall(ctx, 'set_task_lifecycle', {
@@ -392,6 +402,7 @@ describe('engine graph orchestration', () => {
       credentialRegistry: credentials,
       bridgePort: 19999,
       getHostEnvironment: () => hostSnap,
+      getTaskTypeRegistry: () => TEST_TASK_TYPES,
       isWorkspaceTrusted: () => true,
     });
     engineWithHost.createTask({
@@ -423,12 +434,15 @@ describe('engine graph orchestration', () => {
       version: number;
       self: { taskId: string; role: string };
       availableBackends?: string[];
+      taskTypes?: Array<{ id: string }>;
       scope?: unknown;
     };
     expect(host.version).toBe(1);
     expect(host.self.taskId).toBe('coord');
     expect(host.self.role).toBe('coordinator');
+    // get_host_context keeps diagnostic backends; also surfaces taskTypes.
     expect(host.availableBackends).toEqual(['opencode']);
+    expect(host.taskTypes?.some((t) => t.id === 'plan')).toBe(true);
     expect(host.scope).toBeUndefined();
     const opsAfter = Object.keys(store.getFile().operations ?? {}).length;
     expect(opsAfter).toBe(opsBefore);
@@ -501,6 +515,7 @@ describe('engine graph orchestration', () => {
       opId: 'op-brief',
       spec: {
         goal: 'implement feature',
+        taskType: 'worker',
         backend: 'grok',
         description: 'from coordinator',
         brief: {
@@ -546,6 +561,7 @@ describe('engine graph orchestration', () => {
       opId: 'op-bad-bind',
       spec: {
         goal: 'x',
+        taskType: 'worker',
         backend: 'grok',
         inputBindings: [{ fromTaskId: 'p', output: 'artifact' as 'summary', as: 'a' }],
       },
@@ -578,6 +594,7 @@ describe('engine graph orchestration', () => {
       opId: 'op-del-brief',
       spec: {
         goal: 'plan the work',
+        taskType: 'worker',
         backend: 'grok',
         model: 'm1',
         brief: {
@@ -633,7 +650,7 @@ describe('engine graph orchestration', () => {
     await engine.handleToolCall(ctx, 'create_task', {
       kind: 'create_task',
       opId: 'op-model-create',
-      spec: { goal: 'plan', backend: 'codex', model: 'gpt-5', role: 'worker' },
+      spec: { goal: 'plan', taskType: 'plan', backend: 'codex', model: 'gpt-5', role: 'worker' },
     });
     const createId = deriveEntityId(started.value.turnId, 'op-model-create', 'task');
     expect(store.getTask(createId)?.model).toBe('gpt-5');
@@ -642,7 +659,7 @@ describe('engine graph orchestration', () => {
     await engine.handleToolCall(ctx, 'delegate_task', {
       kind: 'delegate_task',
       opId: 'op-model-del',
-      spec: { goal: 'impl', backend: 'claude', model: 'sonnet', role: 'worker' },
+      spec: { goal: 'impl', taskType: 'implement', backend: 'claude', model: 'sonnet', role: 'worker' },
     });
     const delId = deriveEntityId(started.value.turnId, 'op-model-del', 'task');
     expect(store.getTask(delId)?.model).toBe('sonnet');
@@ -671,6 +688,7 @@ describe('engine graph orchestration', () => {
       credentialRegistry: credentials,
       bridgePort: 19999,
       clock: () => '2026-07-06T12:00:00.000Z',
+      getTaskTypeRegistry: () => TEST_TASK_TYPES,
     });
     engine.createTask({
       id: 'coord',
@@ -713,6 +731,7 @@ describe('engine graph orchestration', () => {
       opId: 'op-oc-model',
       spec: {
         goal: 'quick research',
+        taskType: 'worker',
         backend: 'opencode',
         model: MODEL,
         role: 'worker',
@@ -857,7 +876,7 @@ describe('engine graph orchestration', () => {
     const result = await engine.handleToolCall(ctx, 'create_task', {
       kind: 'create_task',
       opId: 'op-child-cwd',
-      spec: { goal: 'child', backend: 'grok', role: 'worker' },
+      spec: { goal: 'child', taskType: 'worker', backend: 'grok', role: 'worker' },
     });
     expect(result.ok).toBe(true);
     const childId = deriveEntityId(started.value!.turnId, 'op-child-cwd', 'task');
@@ -887,6 +906,7 @@ describe('engine graph orchestration', () => {
       opId: 'op-clamp',
       spec: {
         goal: 'child',
+        taskType: 'worker',
         backend: 'grok',
         role: 'worker',
         executionPolicy: {
@@ -951,4 +971,190 @@ describe('engine graph orchestration', () => {
     expect(remainingMs).toBeGreaterThan(MAX_BRIDGE_TOKEN_TTL_MS - 1_000);
     expect(remainingMs).toBeLessThanOrEqual(HARD_BRIDGE_TOKEN_TTL_MS + 1_000);
   });
+
+  it('task types: create_task resolves preset backend/model and persists taskType', async () => {
+    const { store, engine, credentials } = makeHarness();
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child', 'wait_child', 'read_subtree'],
+    });
+    const started = engine.startTask('coord');
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId: started.value.turnId,
+      allowedActions: new Set(['create_task', 'list_task_types', 'complete_task']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    const listed = await engine.handleToolCall(ctx, 'list_task_types', { kind: 'list_task_types' });
+    expect(listed.ok).toBe(true);
+    if (listed.ok) {
+      const data = listed.result as { taskTypes: Array<{ id: string }> };
+      expect(data.taskTypes.some((t) => t.id === 'plan')).toBe(true);
+    }
+    const opsBefore = Object.keys(store.getFile().operations ?? {}).length;
+    const result = await engine.handleToolCall(ctx, 'create_task', {
+      kind: 'create_task',
+      opId: 'op-plan',
+      spec: { goal: 'write plan', taskType: 'plan' },
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      const data = result.result as {
+        taskId: string;
+        taskType: string;
+        resolved: { backend: string; model?: string };
+      };
+      expect(data.taskType).toBe('plan');
+      expect(data.resolved.backend).toBe('codex');
+      expect(data.resolved.model).toBe('gpt-5');
+    }
+    const childId = deriveEntityId(started.value.turnId, 'op-plan', 'task');
+    const child = store.getTask(childId);
+    expect(child?.backend).toBe('codex');
+    expect(child?.model).toBe('gpt-5');
+    expect(child?.taskType).toBe('plan');
+    expect(child?.brief?.kind).toBe('plan');
+    // list_task_types does not grow op ledger
+    expect(Object.keys(store.getFile().operations ?? {}).length).toBe(opsBefore + 1);
+  });
+
+  it('task types: unknown type has zero child rows', async () => {
+    const { store, engine, credentials } = makeHarness();
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child'],
+    });
+    const started = engine.startTask('coord');
+    if (!started.ok) return;
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId: started.value.turnId,
+      allowedActions: new Set(['create_task']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    const before = Object.keys(store.getFile().tasks).length;
+    const result = await engine.handleToolCall(ctx, 'create_task', {
+      kind: 'create_task',
+      opId: 'op-unknown',
+      spec: { goal: 'x', taskType: 'nope', backend: 'codex' },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toMatch(/unknown_task_type/);
+    }
+    expect(Object.keys(store.getFile().tasks).length).toBe(before);
+  });
+
+  it('task types: typo backend → backend_unsupported, zero children', async () => {
+    const { store, engine, credentials } = makeHarness();
+    // Override registry with typo backend
+    const badReg = parseTaskTypeRegistry({ bad: { backend: 'codx' } });
+    const engine2 = TaskEngine.load({
+      store,
+      makeBackend: (name) => {
+        if (name === 'codx') throw new Error('unsupported backend: codx');
+        return {
+          name,
+          capabilities: MCP_CAPS,
+          async *run() {
+            yield { type: 'turnCompleted' };
+          },
+        };
+      },
+      askBridge: new AskBridge(),
+      credentialRegistry: credentials,
+      bridgePort: 19999,
+      getTaskTypeRegistry: () => badReg,
+    });
+    engine2.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child'],
+    });
+    const started = engine2.startTask('coord');
+    if (!started.ok) return;
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId: started.value.turnId,
+      allowedActions: new Set(['create_task']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    const before = Object.keys(store.getFile().tasks).length;
+    const result = await engine2.handleToolCall(ctx, 'create_task', {
+      kind: 'create_task',
+      opId: 'op-typo',
+      spec: { goal: 'x', taskType: 'bad' },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/backend_unsupported/);
+    expect(Object.keys(store.getFile().tasks).length).toBe(before);
+  });
+
+  it('task types: malformed registry → invalid_task_type_config, zero children', async () => {
+    const { store, credentials } = makeHarness();
+    const inv = parseTaskTypeRegistry({ plan: { backend: 1 } });
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => ({
+        name: 'grok',
+        capabilities: MCP_CAPS,
+        async *run() {
+          yield { type: 'turnCompleted' };
+        },
+      }),
+      askBridge: new AskBridge(),
+      credentialRegistry: credentials,
+      bridgePort: 19999,
+      getTaskTypeRegistry: () => inv,
+    });
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child'],
+    });
+    const started = engine.startTask('coord');
+    if (!started.ok) return;
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId: started.value.turnId,
+      allowedActions: new Set(['create_task', 'list_task_types']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    const list = await engine.handleToolCall(ctx, 'list_task_types', { kind: 'list_task_types' });
+    expect(list.ok).toBe(true);
+    if (list.ok) {
+      const data = list.result as { diagnostics: unknown[] };
+      expect(data.diagnostics.length).toBeGreaterThan(0);
+    }
+    const before = Object.keys(store.getFile().tasks).length;
+    const result = await engine.handleToolCall(ctx, 'create_task', {
+      kind: 'create_task',
+      opId: 'op-inv',
+      spec: { goal: 'x', taskType: 'plan' },
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/invalid_task_type_config/);
+    expect(Object.keys(store.getFile().tasks).length).toBe(before);
+  });
+
 });

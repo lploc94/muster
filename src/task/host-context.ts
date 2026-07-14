@@ -1,9 +1,12 @@
 /**
  * Host environment context for first-turn prompt injection (pure).
  * Role-tiered: coordinators get backends/models/tools; workers get scope.
+ * When task types are configured, coordinators get type catalog + type rules
+ * (raw backends/models demoted).
  */
 
 import type { TaskRole } from './types';
+import type { TaskTypeSummary } from './task-types';
 
 export const HOST_BLOCK_MAX = 6_000;
 export const HOST_MODELS_PER_BACKEND = 12;
@@ -25,6 +28,14 @@ export interface HostContextSelf {
   goal?: string;
 }
 
+/** Compact type row for first-turn / get_host_context (ids protected under budget). */
+export interface HostTaskTypeRow {
+  id: string;
+  defaultRole: TaskRole;
+  defaultBriefKind: string;
+  description?: string;
+}
+
 export interface HostContextV1 {
   version: 1;
   workspace: { cwd: string; trusted: boolean };
@@ -33,6 +44,8 @@ export interface HostContextV1 {
   availableBackends?: string[];
   models?: Record<string, { current?: string; options: { value: string; name: string }[] }>;
   tools?: string[];
+  /** Coordinator: configured task types (omit when empty). */
+  taskTypes?: HostTaskTypeRow[];
   scope?: {
     singleTask: true;
     completeVia: 'complete_task' | 'fail_task';
@@ -47,6 +60,18 @@ export interface BuildHostContextInput {
   tools?: string[];
   /** Override cwd (task.cwd wins over snapshot.cwd). */
   taskCwd?: string;
+  /**
+   * Optional live task-type summaries (coordinator).
+   * - Defined (incl. empty): inject `## Task types` section; empty shows configure guidance.
+   * - Non-empty: swap 4 playbook bullets for type rules; suppress raw backends/models in first-turn.
+   * - Undefined: legacy backends/models catalog (no types section).
+   */
+  taskTypes?: readonly TaskTypeSummary[];
+  /**
+   * When true (first-turn markdown), suppress availableBackends/models if types present.
+   * get_host_context sets false so diagnostic catalogs remain.
+   */
+  suppressBackendCatalog?: boolean;
 }
 
 /** Base rules for all roles (exact strings are unit-tested). */
@@ -57,7 +82,10 @@ export const HOST_RULES_BASE: readonly string[] = [
   'Prefer Muster MCP tools for task graph actions over inventing side channels.',
 ];
 
-/** Coordinator playbook rules (appended after base). */
+/**
+ * Coordinator playbook rules when **no** task types configured.
+ * When types are configured, the last 4 bullets are replaced by HOST_RULES_TASK_TYPES.
+ */
 export const HOST_RULES_COORDINATOR: readonly string[] = [
   'Create children as **draft** (`create_task`); run graph with **`release_tasks`** (all-or-nothing).',
   'There is **no** coordinator MCP `start_task` — release or `delegate_task` queues first turns.',
@@ -67,6 +95,20 @@ export const HOST_RULES_COORDINATOR: readonly string[] = [
   'Prefer rich `brief` on create/delegate so children need not re-derive the job.',
   'Do not seal the **root** via MCP in v1 (user/host only).',
 ];
+
+/**
+ * Task-type routing rules (exact strings unit-tested).
+ * When types configured: replace the last 4 HOST_RULES_COORDINATOR bullets so all 4 survive HOST_RULES_MAX.
+ */
+export const HOST_RULES_TASK_TYPES: readonly string[] = [
+  'Prefer `taskType` from the list when creating children.',
+  'Omit backend/model to use the type preset.',
+  'Pass backend/model **only** when the current user explicitly named that override.',
+  'Never invent types or silently fall back to parent backend.',
+];
+
+/** Core coordinator bullets kept when task types are present (first 3 of playbook). */
+const HOST_RULES_COORDINATOR_CORE: readonly string[] = HOST_RULES_COORDINATOR.slice(0, 3);
 
 /** Worker scope rules (appended after base). */
 export const HOST_RULES_WORKER: readonly string[] = [
@@ -82,10 +124,21 @@ export const WORKER_SCOPE_DO_NOT: readonly string[] = [
   'seal the root task',
 ];
 
-function rulesForRole(role: TaskRole): string[] {
+function rulesForRole(role: TaskRole, hasTaskTypes: boolean): string[] {
   const base = [...HOST_RULES_BASE];
-  const extra = role === 'coordinator' ? HOST_RULES_COORDINATOR : HOST_RULES_WORKER;
-  return [...base, ...extra].slice(0, HOST_RULES_MAX);
+  if (role !== 'coordinator') {
+    return [...base, ...HOST_RULES_WORKER].slice(0, HOST_RULES_MAX);
+  }
+  if (hasTaskTypes) {
+    // base(4) + core(3) + type rules(4) + root seal(1) = 12 — all type rules protected.
+    return [
+      ...base,
+      ...HOST_RULES_COORDINATOR_CORE,
+      ...HOST_RULES_TASK_TYPES,
+      HOST_RULES_COORDINATOR[6]!,
+    ].slice(0, HOST_RULES_MAX);
+  }
+  return [...base, ...HOST_RULES_COORDINATOR].slice(0, HOST_RULES_MAX);
 }
 
 function capModels(
@@ -109,7 +162,23 @@ export function buildHostContext(input: BuildHostContextInput): HostContextV1 {
   const { snapshot, self, tools } = input;
   const cwd =
     input.taskCwd !== undefined && input.taskCwd.length > 0 ? input.taskCwd : snapshot.cwd;
-  const rules = rulesForRole(self.role);
+  const typesProvided = self.role === 'coordinator' && input.taskTypes !== undefined;
+  const typeRows: HostTaskTypeRow[] | undefined = typesProvided
+    ? input.taskTypes!.map((t) => {
+        const row: HostTaskTypeRow = {
+          id: t.id,
+          defaultRole: t.defaultRole,
+          defaultBriefKind: t.defaultBriefKind,
+        };
+        if (t.description !== undefined) row.description = t.description;
+        return row;
+      })
+    : undefined;
+  const hasConfiguredTypes = typeRows !== undefined && typeRows.length > 0;
+  const rules = rulesForRole(self.role, hasConfiguredTypes);
+  // First-turn sets suppressBackendCatalog: true. get_host_context omits or false → keep catalogs.
+  const suppressCatalog =
+    hasConfiguredTypes && input.suppressBackendCatalog === true;
 
   const base: HostContextV1 = {
     version: 1,
@@ -119,6 +188,19 @@ export function buildHostContext(input: BuildHostContextInput): HostContextV1 {
   };
 
   if (self.role === 'coordinator') {
+    if (typesProvided) {
+      return {
+        ...base,
+        taskTypes: typeRows,
+        ...(suppressCatalog
+          ? {}
+          : {
+              availableBackends: [...snapshot.availableBackends],
+              models: capModels(snapshot.models),
+            }),
+        ...(tools !== undefined ? { tools: [...tools] } : {}),
+      };
+    }
     return {
       ...base,
       availableBackends: [...snapshot.availableBackends],
@@ -150,11 +232,25 @@ function clampField(text: string, max: number): string {
  */
 export function formatHostContextMarkdown(ctx: HostContextV1): string {
   // Progressive reductions at section/entry boundaries only.
+  // Budget priority: workspace/self/rules protected; type ids protected; type descriptions drop first.
   const variants: HostContextV1[] = [
     ctx,
     // Drop optional goal mirror
     { ...ctx, self: { ...ctx.self, goal: undefined } },
   ];
+
+  // Drop task type descriptions first (ids + role + briefKind retained).
+  if (ctx.taskTypes && ctx.taskTypes.some((t) => t.description)) {
+    variants.push({
+      ...ctx,
+      self: { ...ctx.self, goal: undefined },
+      taskTypes: ctx.taskTypes.map(({ id, defaultRole, defaultBriefKind }) => ({
+        id,
+        defaultRole,
+        defaultBriefKind,
+      })),
+    });
+  }
 
   if (ctx.models) {
     const strippedNames: HostContextV1 = {
@@ -218,7 +314,7 @@ export function formatHostContextMarkdown(ctx: HostContextV1): string {
     if (text.length <= HOST_BLOCK_MAX) return text;
   }
 
-  // Last resort: clamp long identity fields (cwd/ids) but keep all protected sections.
+  // Last resort: clamp long identity fields (cwd/ids) but keep all protected sections + type ids + rules.
   const safe: HostContextV1 = {
     version: 1,
     workspace: {
@@ -235,6 +331,15 @@ export function formatHostContextMarkdown(ctx: HostContextV1): string {
         : {}),
     },
     rules: ctx.rules,
+    ...(ctx.taskTypes
+      ? {
+          taskTypes: ctx.taskTypes.map(({ id, defaultRole, defaultBriefKind }) => ({
+            id,
+            defaultRole,
+            defaultBriefKind,
+          })),
+        }
+      : {}),
     ...(ctx.scope ? { scope: ctx.scope } : {}),
   };
   return renderHostMarkdown(safe);
@@ -261,6 +366,21 @@ function renderHostMarkdown(ctx: HostContextV1): string {
   lines.push('', '## Rules');
   for (const rule of ctx.rules) {
     lines.push(`- ${rule}`);
+  }
+  if (ctx.taskTypes !== undefined) {
+    lines.push('', '## Task types');
+    if (ctx.taskTypes.length === 0) {
+      lines.push(
+        '- (none configured — set `muster.taskTypes` in workspace settings; do not invent backends)',
+      );
+    } else {
+      for (const t of ctx.taskTypes) {
+        const desc = t.description ? ` — ${t.description}` : '';
+        lines.push(
+          `- \`${t.id}\` role=\`${t.defaultRole}\` briefKind=\`${t.defaultBriefKind}\`${desc}`,
+        );
+      }
+    }
   }
   if (ctx.availableBackends !== undefined) {
     lines.push('', '## Available backends');

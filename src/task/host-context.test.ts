@@ -4,12 +4,14 @@ import {
   HOST_MODELS_PER_BACKEND,
   HOST_RULES_BASE,
   HOST_RULES_COORDINATOR,
+  HOST_RULES_TASK_TYPES,
   HOST_RULES_WORKER,
   buildHostContext,
   formatHostContextMarkdown,
   minimalHostSnapshot,
   type HostEnvironmentSnapshot,
 } from './host-context';
+import type { TaskTypeSummary } from './task-types';
 
 const baseSnapshot = (): HostEnvironmentSnapshot => ({
   cwd: '/workspace',
@@ -94,6 +96,126 @@ describe('buildHostContext', () => {
       self: { taskId: 'r', role: 'coordinator', backend: 'opencode' },
     });
     expect(ctx.models?.opencode?.options).toHaveLength(HOST_MODELS_PER_BACKEND);
+  });
+
+  it('when task types present: injects types, all 4 type rules, demotes backends/models', () => {
+    const types: TaskTypeSummary[] = [
+      {
+        id: 'plan',
+        backend: 'codex',
+        defaultRole: 'worker',
+        defaultBriefKind: 'plan',
+        description: 'plan work',
+        availability: 'unknown',
+      },
+      {
+        id: 'implement',
+        backend: 'grok',
+        defaultRole: 'worker',
+        defaultBriefKind: 'implement',
+        availability: 'unknown',
+      },
+    ];
+    const ctx = buildHostContext({
+      snapshot: baseSnapshot(),
+      self: { taskId: 'root', role: 'coordinator', backend: 'opencode' },
+      tools: ['create_task', 'list_task_types'],
+      taskTypes: types,
+      suppressBackendCatalog: true,
+    });
+    expect(ctx.taskTypes?.map((t) => t.id)).toEqual(['plan', 'implement']);
+    expect(ctx.availableBackends).toBeUndefined();
+    expect(ctx.models).toBeUndefined();
+    for (const rule of HOST_RULES_TASK_TYPES) {
+      expect(ctx.rules).toContain(rule);
+    }
+    expect(ctx.rules).toHaveLength(12);
+    const md = formatHostContextMarkdown(ctx);
+    expect(md).toContain('## Task types');
+    expect(md).toContain('`plan`');
+    expect(md).toContain('`implement`');
+    for (const rule of HOST_RULES_TASK_TYPES) {
+      expect(md).toContain(rule);
+    }
+  });
+
+  it('empty taskTypes array still renders configure guidance', () => {
+    const ctx = buildHostContext({
+      snapshot: baseSnapshot(),
+      self: { taskId: 'root', role: 'coordinator', backend: 'opencode' },
+      taskTypes: [],
+      suppressBackendCatalog: true,
+    });
+    expect(ctx.taskTypes).toEqual([]);
+    const md = formatHostContextMarkdown(ctx);
+    expect(md).toContain('## Task types');
+    expect(md).toContain('muster.taskTypes');
+  });
+
+  it('get_host_context path keeps backends when types present (no suppress)', () => {
+    const types: TaskTypeSummary[] = [
+      {
+        id: 'plan',
+        backend: 'codex',
+        defaultRole: 'worker',
+        defaultBriefKind: 'plan',
+        availability: 'available',
+      },
+    ];
+    const ctx = buildHostContext({
+      snapshot: baseSnapshot(),
+      self: { taskId: 'root', role: 'coordinator', backend: 'opencode' },
+      taskTypes: types,
+      // suppressBackendCatalog omitted/false → diagnostic catalogs remain
+    });
+    expect(ctx.taskTypes?.map((t) => t.id)).toEqual(['plan']);
+    expect(ctx.availableBackends).toEqual(['opencode', 'codex']);
+    expect(ctx.models).toBeDefined();
+  });
+
+  it('max 32 types retains all ids under HOST_BLOCK_MAX (descriptions may drop)', () => {
+    const types: TaskTypeSummary[] = Array.from({ length: 32 }, (_, i) => ({
+      id: `t${i}`,
+      backend: 'codex',
+      defaultRole: 'worker' as const,
+      defaultBriefKind: 'generic',
+      description: 'x'.repeat(200),
+      availability: 'unknown' as const,
+    }));
+    const ctx = buildHostContext({
+      snapshot: baseSnapshot(),
+      self: { taskId: 'root', role: 'coordinator', backend: 'opencode', goal: 'g'.repeat(500) },
+      taskTypes: types,
+      suppressBackendCatalog: true,
+    });
+    const md = formatHostContextMarkdown(ctx);
+    expect(md.length).toBeLessThanOrEqual(HOST_BLOCK_MAX);
+    for (let i = 0; i < 32; i++) {
+      expect(md).toContain(`\`t${i}\``);
+    }
+    for (const rule of HOST_RULES_TASK_TYPES) {
+      expect(md).toContain(rule);
+    }
+  });
+
+  it('worker first prompt has no task-type create catalog', () => {
+    const types: TaskTypeSummary[] = [
+      {
+        id: 'plan',
+        backend: 'codex',
+        defaultRole: 'worker',
+        defaultBriefKind: 'plan',
+        availability: 'unknown',
+      },
+    ];
+    const ctx = buildHostContext({
+      snapshot: baseSnapshot(),
+      self: { taskId: 'c', role: 'worker', backend: 'opencode' },
+      taskTypes: types,
+    });
+    expect(ctx.taskTypes).toBeUndefined();
+    const md = formatHostContextMarkdown(ctx);
+    expect(md).not.toContain('## Task types');
   });
 });
 

@@ -140,7 +140,7 @@ describe('coordinator-tools dispatch', () => {
   it('maps create_task to ToolCommand', () => {
     const result = dispatch(
       'create_task',
-      { opId: 'op-1', goal: 'child goal', backend: 'grok' },
+      { opId: 'op-1', goal: 'child goal', taskType: 'worker', backend: 'grok' },
       ctx(['create_task', 'ask_user']),
     );
     expect(result.ok).toBe(true);
@@ -152,7 +152,7 @@ describe('coordinator-tools dispatch', () => {
   it('maps create_task model into CreateChildSpec', () => {
     const result = dispatch(
       'create_task',
-      { opId: 'op-1', goal: 'plan work', backend: 'codex', model: 'gpt-5' },
+      { opId: 'op-1', goal: 'plan work', taskType: 'worker', backend: 'codex', model: 'gpt-5' },
       ctx(['create_task']),
     );
     expect(result.ok).toBe(true);
@@ -167,7 +167,7 @@ describe('coordinator-tools dispatch', () => {
       'delegate_task',
       {
         opId: 'op-1',
-        goal: 'fast plan',
+        goal: 'fast plan', taskType: 'worker',
         backend: 'opencode',
         model: 'opencode-go/deepseek-v4-flash',
       },
@@ -180,16 +180,22 @@ describe('coordinator-tools dispatch', () => {
     }
   });
 
-  it('omits model when empty string', () => {
+  it('rejects empty-string model override (present but invalid)', () => {
     const result = dispatch(
       'create_task',
-      { opId: 'op-1', goal: 'x', backend: 'opencode', model: '' },
+      { opId: 'op-1', goal: 'x', taskType: 'worker', backend: 'opencode', model: '' },
       ctx(['create_task']),
     );
-    expect(result.ok).toBe(true);
-    if (result.ok && result.command.kind === 'create_task') {
-      expect(result.command.spec.model).toBeUndefined();
-    }
+    expect(result).toEqual({ ok: false, toolError: 'invalid create_task arguments' });
+  });
+
+  it('rejects non-string backend override', () => {
+    const result = dispatch(
+      'create_task',
+      { opId: 'op-1', goal: 'x', taskType: 'worker', backend: 123 },
+      ctx(['create_task']),
+    );
+    expect(result).toEqual({ ok: false, toolError: 'invalid create_task arguments' });
   });
 
   it('maps release_tasks to ToolCommand', () => {
@@ -222,7 +228,7 @@ describe('coordinator-tools dispatch', () => {
   it('rejects action outside allowedActions', () => {
     const result = dispatch(
       'create_task',
-      { opId: 'op-1', goal: 'g', backend: 'grok' },
+      { opId: 'op-1', goal: 'g', taskType: 'worker', backend: 'grok' },
       ctx(['ask_user']),
     );
     expect(result).toEqual({ ok: false, toolError: 'action not permitted: create_task' });
@@ -234,6 +240,7 @@ describe('coordinator-tools dispatch', () => {
       {
         opId: 'op-1',
         goal: 'child',
+        taskType: 'worker',
         backend: 'grok',
         executionPolicy: { maxTurns: -1, turnTimeoutMs: 60_000 },
       },
@@ -248,6 +255,7 @@ describe('coordinator-tools dispatch', () => {
       {
         opId: 'op-1',
         goal: 'child',
+        taskType: 'worker',
         backend: 'grok',
         executionPolicy: { maxAutomaticRetries: 0 },
       },
@@ -268,6 +276,7 @@ describe('coordinator-tools dispatch', () => {
       {
         opId: 'op-1',
         goal: 'implement feature',
+        taskType: 'worker',
         backend: 'grok',
         description: 'more context',
         brief: {
@@ -303,6 +312,7 @@ describe('coordinator-tools dispatch', () => {
       {
         opId: 'op-1',
         goal: 'x',
+        taskType: 'worker',
         backend: 'grok',
         brief: { kind: 'nope' },
       },
@@ -317,6 +327,7 @@ describe('coordinator-tools dispatch', () => {
       {
         opId: 'op-1',
         goal: 'x',
+        taskType: 'worker',
         backend: 'grok',
         brief: { objective: 'o', secret: true },
       },
@@ -331,6 +342,7 @@ describe('coordinator-tools dispatch', () => {
       {
         opId: 'op-1',
         goal: 'x',
+        taskType: 'worker',
         backend: 'grok',
         inputBindings: [{ fromTaskId: 'p', output: 'artifact', as: 'a' }],
       },
@@ -353,12 +365,36 @@ describe('coordinator-tools dispatch', () => {
     expect(result.ok).toBe(false);
   });
 
+  it('maps list_task_types with empty args and no opId', () => {
+    const result = dispatch('list_task_types', {}, ctx(['list_task_types']));
+    expect(result).toEqual({ ok: true, command: { kind: 'list_task_types' } });
+  });
+
+  it('rejects list_task_types with extra args', () => {
+    const result = dispatch(
+      'list_task_types',
+      { foo: 1 },
+      ctx(['list_task_types']),
+    );
+    expect(result.ok).toBe(false);
+  });
+
+  it('rejects public create without taskType', () => {
+    const result = dispatch(
+      'create_task',
+      { opId: 'op-1', goal: 'child', backend: 'grok' },
+      ctx(['create_task']),
+    );
+    expect(result).toEqual({ ok: false, toolError: 'invalid create_task arguments' });
+  });
+
   it('maps rich fields on delegate_task', () => {
     const result = dispatch(
       'delegate_task',
       {
         opId: 'op-d',
         goal: 'child',
+        taskType: 'worker',
         backend: 'opencode',
         brief: { kind: 'plan', objective: 'write plan' },
       },

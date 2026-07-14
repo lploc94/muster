@@ -74,6 +74,16 @@ const engine = TaskEngine.load({
   askBridge,
   credentialRegistry: credentials,
   bridgePort: 0,
+  getTaskTypeRegistry: () => {
+    // Minimal in-process registry (same shape as parseTaskTypeRegistry ok result).
+    const registry = new Map([
+      [
+        'worker',
+        { backend: 'opencode', role: 'worker', briefKind: 'generic' },
+      ],
+    ]);
+    return { status: 'ok', registry, diagnostics: [] };
+  },
 });
 
 engine.createTask({
@@ -124,12 +134,13 @@ function deriveEntityId(callerTurnId, opId, suffix) {
   return `${suffix}-${hash}`;
 }
 
-console.log(`Smoke: delegate_task backend=opencode model=${MODEL}`);
+console.log(`Smoke: delegate_task taskType=worker model=${MODEL}`);
 const result = await engine.handleToolCall(ctx, 'delegate_task', {
   kind: 'delegate_task',
   opId: 'smoke-oc-model',
   spec: {
     goal: 'Reply with exactly: PONG',
+    taskType: 'worker',
     backend: 'opencode',
     model: MODEL,
     role: 'worker',

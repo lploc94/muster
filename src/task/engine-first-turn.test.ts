@@ -7,6 +7,12 @@ import * as brief from './brief';
 import { TaskEngine } from './engine';
 import type { HostEnvironmentSnapshot } from './host-context';
 import { TaskStore } from './store';
+import { parseTaskTypeRegistry } from './task-types';
+
+const EMPTY_TASK_TYPES = parseTaskTypeRegistry({});
+const WORKER_TASK_TYPES = parseTaskTypeRegistry({
+  worker: { backend: 'grok', role: 'worker' },
+});
 
 const tempDirs: string[] = [];
 
@@ -70,6 +76,7 @@ describe('W1 single freeze site + host prepare', () => {
       prepareHostEnvironment: prepare,
       getHostEnvironment: () => hostSnap(),
       isWorkspaceTrusted: () => true,
+      getTaskTypeRegistry: () => EMPTY_TASK_TYPES,
     });
 
     const started = engine.startNewTask({
@@ -123,6 +130,7 @@ describe('W1 single freeze site + host prepare', () => {
       clock: () => '2026-07-06T12:00:00.000Z',
       getHostEnvironment: () => hostSnap(),
       isWorkspaceTrusted: () => true,
+      getTaskTypeRegistry: () => EMPTY_TASK_TYPES,
     });
 
     store.commit((draft) => {
@@ -197,6 +205,7 @@ describe('W1 single freeze site + host prepare', () => {
       makeBackend: () => backend,
       clock: () => '2026-07-06T12:00:00.000Z',
       getHostEnvironment: () => hostSnap(),
+      getTaskTypeRegistry: () => EMPTY_TASK_TYPES,
     });
 
     const created = engine.createTask({ id: 't-multi', goal: 'multi', backend: 'fake' });
@@ -255,6 +264,7 @@ describe('W1 single freeze site + host prepare', () => {
       prepareHostEnvironment: prepare,
       getHostEnvironment: () => undefined,
       isWorkspaceTrusted: () => true,
+      getTaskTypeRegistry: () => EMPTY_TASK_TYPES,
       workspaceFolder: '/fallback-cwd',
     });
 
@@ -301,6 +311,7 @@ describe('W1 single freeze site + host prepare', () => {
       makeBackend: () => backend,
       clock: () => '2026-07-06T12:00:00.000Z',
       getHostEnvironment: () => hostSnap(),
+      getTaskTypeRegistry: () => EMPTY_TASK_TYPES,
     });
 
     store.commit((draft) => {
@@ -377,6 +388,7 @@ describe('W1 single freeze site + host prepare', () => {
       askBridge: new AskBridge(),
       credentialRegistry: credentials,
       bridgePort: 19997,
+      getTaskTypeRegistry: () => WORKER_TASK_TYPES,
     });
 
     engine.createTask({
@@ -403,7 +415,7 @@ describe('W1 single freeze site + host prepare', () => {
     const created = await engine.handleToolCall(ctx, 'create_task', {
       kind: 'create_task',
       opId: 'op-c',
-      spec: { goal: 'draft child', backend: 'fake', role: 'worker' },
+      spec: { goal: 'draft child', taskType: 'worker', role: 'worker' },
     });
     expect(created.ok).toBe(true);
     const childId = deriveEntityId(started.value.turnId, 'op-c', 'task');
@@ -470,6 +482,7 @@ describe('W1 single freeze site + host prepare', () => {
       askBridge: new AskBridge(),
       credentialRegistry: credentials,
       bridgePort: 19998,
+      getTaskTypeRegistry: () => WORKER_TASK_TYPES,
     });
 
     engine.createTask({
@@ -497,7 +510,7 @@ describe('W1 single freeze site + host prepare', () => {
     const result = await engine.handleToolCall(ctx, 'delegate_task', {
       kind: 'delegate_task',
       opId: 'op-del',
-      spec: { goal: 'child work', backend: 'fake', role: 'worker' },
+      spec: { goal: 'child work', taskType: 'worker', role: 'worker' },
     });
     expect(result.ok).toBe(true);
 
@@ -542,6 +555,7 @@ describe('W1 single freeze site + host prepare', () => {
       makeBackend: () => backend,
       clock: () => '2026-07-06T12:00:00.000Z',
       getHostEnvironment: () => hostSnap(),
+      getTaskTypeRegistry: () => EMPTY_TASK_TYPES,
     });
 
     store.commit((draft) => {

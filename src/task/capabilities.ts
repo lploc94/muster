@@ -4,6 +4,7 @@ export type CoordinatorAction =
   | 'create_task'
   | 'delegate_task'
   | 'release_tasks'
+  | 'list_task_types'
   | 'start_task'
   | 'interrupt_task'
   | 'cancel_task'
@@ -22,8 +23,8 @@ export type AnyTaskAction =
 export type ToolAction = CoordinatorAction | AnyTaskAction;
 
 const CAPABILITY_TO_ACTIONS: Record<TaskCapability, CoordinatorAction[]> = {
-  // create_child owns draft create + atomic release + create-and-run delegate.
-  create_child: ['create_task', 'delegate_task', 'release_tasks'],
+  // create_child owns draft create + atomic release + create-and-run delegate + type list.
+  create_child: ['create_task', 'delegate_task', 'release_tasks', 'list_task_types'],
   // start_task is host/recovery only — not granted via coordinator MCP credentials.
   start_child: [],
   wait_child: ['wait_for_tasks'],

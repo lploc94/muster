@@ -818,32 +818,37 @@ tools.
 
 | Tool | Caller | Purpose |
 |------|--------|---------|
-| `create_task` | Coordinator | Create a **draft** direct child (no first turn). Args: `goal`, `backend`, optional `model`, `role`, `dependencies`, `executionPolicy`, **`description`**, **`brief`** (partial `TaskBriefV1`), **`inputBindings`**, **`claimsGit`**, **`writePaths`/`readPaths`** |
-| `delegate_task` | Coordinator | Atomically create a **released** child + queue first-turn intent (same rich args as `create_task`) |
-| `release_tasks` | Coordinator | Atomic draft→released for `taskIds[]` (+ optional dep closure); queues first-turn intents |
+| `create_task` | Coordinator | Create a **draft** direct child (no first turn). **Required:** `goal`, **`taskType`**. Optional: `backend`/`model` **only as user overrides**, `role`, `dependencies`, `executionPolicy`, **`description`**, **`brief`**, **`inputBindings`**, **`claimsGit`**, **`writePaths`/`readPaths`**. Resolves `taskType` from workspace `muster.taskTypes` before persist |
+| `delegate_task` | Coordinator | Atomically create a **released** child + queue first-turn intent (same args as `create_task`) |
+| `list_task_types` | Coordinator (`create_child`) | Live registry summary (id, backend, model?, role, briefKind) + diagnostics. **No `opId`**, no ledger |
+| `release_tasks` | Coordinator | Atomic draft→released for `taskIds[]` (+ optional dep closure); queues first-turn intents. Uses **persisted** backend/model — never re-resolves registry |
 | `start_task` | **Host / recovery only** | Not in coordinator MCP `allowedActions`; rejects draft |
 | `interrupt_task` | Coordinator | Interrupt an active direct child turn (`interrupt_child` cap) |
 | `cancel_task` | Coordinator | Cancel direct child + cascade unfinished descendants (`cancel_child` cap); `sealedBy.coordinator` |
 | `set_task_lifecycle` | Coordinator | **Parent-seal** a direct child's lifecycle (`succeeded`/`failed`/`cancelled`/`skipped`) when the child omitted disposition (`cancel_child` cap). See §5.3 |
 | `wait_for_tasks` | Coordinator | Stage the caller turn's explicit child wait set (`wakeOn` default: terminal + attention) |
 | `get_task_status` | Coordinator | Subtree summary: lifecycle, `releaseState`, **readiness**, attention, result.summary |
-| `get_host_context` | **Any task** | Read-only role-filtered host env / self / rules JSON (same builder as first-turn host block). **No `opId`**, no op ledger |
+| `get_host_context` | **Any task** | Read-only role-filtered host env / self / rules / **taskTypes** JSON (same builder as first-turn host block). **No `opId`**, no op ledger |
 | `complete_task` | Any task | Stage successful completion; **seal or propose** per outcome mode + role (§4.1.1) |
 | `fail_task` | Any task | Stage failure; seal or propose per mode + role |
 | `report_progress` | Any task | Update optional progress metadata |
 | `ask_user` | Any task | Block the caller's live turn for structured user input |
 
-**Happy path (multi-node graph):** `create_task*` (draft) → `release_tasks` → `wait_for_tasks`.  
+**Task types (v1):** Config SoT is resource-scoped VS Code setting `muster.taskTypes` (id → `{ backend, model?, role?, briefKind?, description? }`). Empty registry → create/delegate fail with `task_types_not_configured` (zero mutations). Malformed → `invalid_task_type_config`. Unknown type → `unknown_task_type` even if `backend` override is present. Typo backend id → `backend_unsupported`. No built-in product default types.
+
+**Happy path (multi-node graph):** `list_task_types` → `create_task*` (draft by type) → `release_tasks` → `wait_for_tasks`.  
 Coordinator does **not** start CLI processes via `start_task`.
 
 **Capability grants:** root coordinators and coordinator-role children include
 `cancel_child` (+ `interrupt_child`) so `cancel_task` / `set_task_lifecycle` are
-listed. Store load backfills missing `cancel_child` on existing coordinators.
-Workers never receive graph mutators.
+listed. `list_task_types` is under `create_child`. Store load backfills missing
+`cancel_child` on existing coordinators. Workers never receive graph mutators.
 
 **First-turn host context:** every task's **sequence-1** turn freezes a compiled
-prompt: `# Muster host context` (role-tiered) → brief → untrusted pins. Turn 2+
-does not re-prefix host; agents may call `get_host_context` to refresh.
+prompt: `# Muster host context` (role-tiered; coordinators with types get
+`## Task types` + protected type rules; raw backends/models demoted when types
+present) → brief → untrusted pins. Turn 2+ does not re-prefix host; agents may
+call `get_host_context` / `list_task_types` to refresh.
 
 **Dataflow:** `inputBindings` + `TaskResultV1` (`summary` only v1); durable pin on turn before dispatch.  
 **Ordering** still uses `dependencies` separately.

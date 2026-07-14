@@ -8,6 +8,10 @@ import { OpenCodeBackend } from './opencode';
 export const BACKEND_IDS = ['claude', 'grok', 'kiro', 'codex', 'opencode'] as const;
 export type BackendId = (typeof BACKEND_IDS)[number];
 
+export function isKnownBackendId(name: string): name is BackendId {
+  return (BACKEND_IDS as readonly string[]).includes(name);
+}
+
 export function makeBackend(name: string): Backend {
   switch (name) {
     case 'grok':

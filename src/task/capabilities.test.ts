@@ -10,6 +10,7 @@ describe('capabilitiesFor', () => {
     expect(caps.has('create_task')).toBe(true);
     expect(caps.has('delegate_task')).toBe(true);
     expect(caps.has('release_tasks')).toBe(true);
+    expect(caps.has('list_task_types')).toBe(true);
     expect(caps.has('wait_for_tasks')).toBe(true);
     expect(caps.has('get_task_status')).toBe(true);
     expect(caps.has('ask_user')).toBe(true);
@@ -35,6 +36,7 @@ describe('capabilitiesFor', () => {
   it('grants only any-task actions to workers', () => {
     const caps = capabilitiesFor({ role: 'worker', capabilities: ['create_child'] });
     expect(caps.has('create_task')).toBe(false);
+    expect(caps.has('list_task_types')).toBe(false);
     expect(caps.has('upsert_presentation')).toBe(false);
     expect(caps.has('complete_task')).toBe(true);
     expect(caps.has('ask_user')).toBe(true);

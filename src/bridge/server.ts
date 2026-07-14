@@ -34,6 +34,7 @@ const ALL_TOOLS: ToolAction[] = [
   'create_task',
   'delegate_task',
   'release_tasks',
+  'list_task_types',
   'start_task',
   'interrupt_task',
   'cancel_task',
@@ -120,9 +121,12 @@ const INPUT_BINDING_SCHEMA = {
 const CREATE_SPEC_PROPERTIES = {
   opId: OP_ID,
   goal: { type: 'string', minLength: 1 },
-  backend: { type: 'string', minLength: 1 },
-  /** ACP model id (config option value or session/set_model id). Optional. */
-  model: { type: 'string', minLength: 1 },
+  /** Required: id from muster.taskTypes (not enum'd — registry changes independently). */
+  taskType: { type: 'string', minLength: 1 },
+  /** Optional user override only when the user named a backend. */
+  backend: { type: 'string', minLength: 1, maxLength: 200 },
+  /** ACP model id (config option value or session/set_model id). Optional override. */
+  model: { type: 'string', minLength: 1, maxLength: 200 },
   role: { enum: ['coordinator', 'worker'] },
   dependencies: { type: 'array', items: DEPENDENCY_SCHEMA },
   executionPolicy: EXECUTION_POLICY_SCHEMA,
@@ -148,14 +152,19 @@ const QUESTION_SCHEMA = {
 const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
   create_task: {
     type: 'object',
-    required: ['opId', 'goal', 'backend'],
+    required: ['opId', 'goal', 'taskType'],
     properties: CREATE_SPEC_PROPERTIES,
     additionalProperties: false,
   },
   delegate_task: {
     type: 'object',
-    required: ['opId', 'goal', 'backend'],
+    required: ['opId', 'goal', 'taskType'],
     properties: CREATE_SPEC_PROPERTIES,
+    additionalProperties: false,
+  },
+  list_task_types: {
+    type: 'object',
+    properties: {},
     additionalProperties: false,
   },
   release_tasks: {
@@ -331,10 +340,14 @@ function createMcpServer(
         name,
         description:
           name === 'get_host_context'
-            ? 'Refresh trusted host env, self ids, and role rules (same data as first-turn host block).'
-            : name === 'set_task_lifecycle'
-              ? "Parent-seal a direct child's lifecycle (succeeded/failed/…). Use when child did not complete_task."
-              : `Muster coordinator tool: ${name}`,
+            ? 'Refresh trusted host env, self ids, task-type registry summary, and role rules (same data as first-turn host block).'
+            : name === 'list_task_types'
+              ? 'List configured muster.taskTypes presets (id, backend, model, role, briefKind). Create children by taskType; omit backend/model unless the user named an override.'
+              : name === 'create_task' || name === 'delegate_task'
+                ? `Create a child by required taskType from muster.taskTypes (backend/model optional user overrides only). Tool: ${name}.`
+                : name === 'set_task_lifecycle'
+                  ? "Parent-seal a direct child's lifecycle (succeeded/failed/…). Use when child did not complete_task."
+                  : `Muster coordinator tool: ${name}`,
         inputSchema: TOOL_INPUT_SCHEMAS[name],
       })),
     };

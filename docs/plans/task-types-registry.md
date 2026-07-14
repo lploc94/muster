@@ -1,7 +1,7 @@
 # Plan: User-defined task types (type → backend/model presets)
 
 ## Status
-**APPROVED** — codex-think-about CONSENSUS + codex-plan-review 2026-07-14 (2 rounds; ISSUE-1…4 fixed). Ready to implement W1→W6.
+**IMPLEMENTED** — W1–W6 on main (pure registry → host config → MCP → engine-graph → first-turn → docs/smoke).
 
 Depends on: Phase F orchestration + host-context/parent-seal (W0–W6) on `main`.
 
