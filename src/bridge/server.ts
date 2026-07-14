@@ -33,6 +33,7 @@ export interface MusterBridgeServerOptions {
 const ALL_TOOLS: ToolAction[] = [
   'create_task',
   'delegate_task',
+  'release_tasks',
   'start_task',
   'interrupt_task',
   'cancel_task',
@@ -106,6 +107,16 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
     type: 'object',
     required: ['opId', 'goal', 'backend'],
     properties: CREATE_SPEC_PROPERTIES,
+    additionalProperties: false,
+  },
+  release_tasks: {
+    type: 'object',
+    required: ['opId', 'taskIds'],
+    properties: {
+      opId: OP_ID,
+      taskIds: { type: 'array', items: OP_ID, minItems: 1 },
+      includeDependencies: { type: 'boolean' },
+    },
     additionalProperties: false,
   },
   start_task: {

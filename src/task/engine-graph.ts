@@ -6,6 +6,7 @@ import type { Backend } from '../types';
 import { canBindTaskToBackend } from './backend-eligibility';
 import { capabilitiesFor } from './capabilities';
 import type { ToolCommand } from './coordinator-tools';
+import { validateBindingsForRelease } from './dataflow';
 import {
   bridgeTokenTtlMs,
   canCreateTurn,
@@ -113,7 +114,8 @@ function descendantIds(file: TaskStoreFile, rootId: string): string[] {
   return result.sort();
 }
 
-const DEFAULT_CHILD_CAPS: TaskCapability[] = ['create_child', 'start_child', 'wait_child', 'read_subtree'];
+// start_child intentionally omitted — start_task is host/recovery only (W3).
+const DEFAULT_CHILD_CAPS: TaskCapability[] = ['create_child', 'wait_child', 'read_subtree'];
 const DEFAULT_POLICY: TaskExecutionPolicy = {
   maxTurns: 50,
   maxAutomaticRetries: 2,
@@ -327,11 +329,20 @@ export async function executeToolCommand(
             command.spec.executionPolicy,
             deps.executionPolicyBounds,
           ),
+          // create_task stays draft; delegate_task is atomic released create-and-run.
+          releaseState: command.kind === 'delegate_task' ? 'released' : 'draft',
         };
         const graph = depGraphFromFile(draft);
         const created = createTask(input, { rootId, graph, now });
         if (!created.ok) return created;
-        draft.tasks[childId] = created.next;
+        draft.tasks[childId] =
+          command.kind === 'delegate_task'
+            ? {
+                ...created.next,
+                releasedAt: now,
+                releaseAttemptId: command.opId,
+              }
+            : created.next;
 
         let queuedTurnId: string | undefined;
         if (command.kind === 'delegate_task') {
@@ -347,10 +358,11 @@ export async function executeToolCommand(
           };
           const turnCheck = canCreateTurn(draft, childId, limits);
           if (!turnCheck.ok) return turnCheck;
-          const started = transitionStartTask(created.next, [], {
+          const started = transitionStartTask(draft.tasks[childId]!, [], {
             turnId,
             now,
             inputs: [{ kind: 'message', messageId }],
+            trigger: 'engine',
           });
           if (!started.ok) return started;
           draft.turns[turnId] = started.next;
@@ -378,12 +390,192 @@ export async function executeToolCommand(
       return { ok: true, result: ledger?.result.data };
     }
 
+    case 'release_tasks': {
+      const scheduledTurnIds: string[] = [];
+      const commit = deps.store.commit((draft) => {
+        ensureCoordinationMaps(draft);
+        const caller = draft.tasks[ctx.callerTaskId];
+        if (!caller || caller.lifecycle !== 'open') {
+          return { ok: false, reason: 'caller task not open' };
+        }
+
+        // Resolve release set (explicit ids + optional dependency closure).
+        const resolved = new Set<string>();
+        const stack = [...command.taskIds];
+        while (stack.length > 0) {
+          const id = stack.pop()!;
+          if (resolved.has(id)) continue;
+          resolved.add(id);
+          if (command.includeDependencies) {
+            const task = draft.tasks[id];
+            if (task) {
+              for (const dep of task.dependencies) {
+                stack.push(dep.taskId);
+              }
+            }
+          }
+        }
+
+        type TaskError = { taskId: string; code: string; message: string };
+        const taskErrors: TaskError[] = [];
+        const members = [...resolved];
+
+        for (const taskId of members) {
+          const task = draft.tasks[taskId];
+          if (!task) {
+            taskErrors.push({ taskId, code: 'not_found', message: 'task not found' });
+            continue;
+          }
+          if (task.parentId !== ctx.callerTaskId) {
+            taskErrors.push({
+              taskId,
+              code: 'not_owned',
+              message: 'not an owned direct child of the caller',
+            });
+            continue;
+          }
+          if (task.lifecycle !== 'open') {
+            taskErrors.push({
+              taskId,
+              code: 'not_open',
+              message: `task lifecycle is ${task.lifecycle}`,
+            });
+            continue;
+          }
+          const releaseState = task.releaseState ?? 'draft';
+          if (releaseState === 'released') {
+            // Idempotent only when same releaseAttemptId.
+            if (task.releaseAttemptId !== command.opId) {
+              taskErrors.push({
+                taskId,
+                code: 'already_released',
+                message: 'task already released under a different attempt',
+              });
+            }
+            continue;
+          }
+          if (!task.brief) {
+            taskErrors.push({
+              taskId,
+              code: 'missing_brief',
+              message: 'task has no brief',
+            });
+            continue;
+          }
+          const bindingCheck = validateBindingsForRelease(task.inputBindings);
+          if (!bindingCheck.ok) {
+            taskErrors.push({
+              taskId,
+              code: 'invalid_bindings',
+              message: bindingCheck.reason,
+            });
+            continue;
+          }
+          const backend = deps.makeBackend(task.backend);
+          if (!canBindTaskToBackend(backend.capabilities)) {
+            taskErrors.push({
+              taskId,
+              code: 'backend_ineligible',
+              message: 'backend does not support MCP',
+            });
+            continue;
+          }
+        }
+
+        if (taskErrors.length > 0) {
+          return {
+            ok: false,
+            reason: JSON.stringify({
+              code: 'release_validation_failed',
+              message: 'release_tasks validation failed; no tasks released',
+              taskErrors,
+              retryable: false,
+            }),
+          };
+        }
+
+        const turnIds: string[] = [];
+        for (const taskId of members) {
+          const task = draft.tasks[taskId]!;
+          if ((task.releaseState ?? 'draft') === 'released' && task.releaseAttemptId === command.opId) {
+            // Already released under this attempt — leave existing first-turn.
+            const existing = turnsForTask(draft, taskId).find((t) => t.sequence === 1);
+            if (existing) turnIds.push(existing.id);
+            continue;
+          }
+
+          draft.tasks[taskId] = {
+            ...task,
+            releaseState: 'released',
+            releasedAt: now,
+            releaseAttemptId: command.opId,
+            revision: task.revision + 1,
+            updatedAt: now,
+          };
+
+          const existingTurns = turnsForTask(draft, taskId);
+          if (existingTurns.length === 0) {
+            const turnId = deriveEntityId(ctx.turnId, `${command.opId}:${taskId}`, 'turn');
+            const turnCheck = canCreateTurn(draft, taskId, limits);
+            if (!turnCheck.ok) {
+              return { ok: false, reason: turnCheck.reason };
+            }
+            const messageId = randomUUID();
+            draft.messages[messageId] = {
+              id: messageId,
+              taskId,
+              role: 'user',
+              content: task.goal,
+              state: 'assigned',
+              createdAt: now,
+              turnId,
+            };
+            const started = transitionStartTask(draft.tasks[taskId]!, [], {
+              turnId,
+              now,
+              inputs: [{ kind: 'message', messageId }],
+              trigger: 'engine',
+            });
+            if (!started.ok) return started;
+            draft.turns[turnId] = started.next;
+            turnIds.push(turnId);
+          } else {
+            const first = existingTurns.find((t) => t.sequence === 1) ?? existingTurns[0]!;
+            turnIds.push(first.id);
+          }
+        }
+
+        writeLedger(draft, ctx.turnId, command.opId, fingerprint, {
+          ok: true,
+          data: { taskIds: members, turnIds },
+        });
+        scheduledTurnIds.push(...turnIds);
+        return { ok: true };
+      });
+
+      if (!commit.ok) {
+        // Prefer structured JSON error when present.
+        const detail = commit.detail ?? commit.reason;
+        return { ok: false, error: detail };
+      }
+      for (const turnId of scheduledTurnIds) {
+        deps.onScheduleTurn(turnId);
+      }
+      const ledger = deps.store.getFile().operations?.[opLedgerKey(ctx.turnId, command.opId)];
+      return { ok: true, result: ledger?.result.data };
+    }
+
     case 'start_task': {
+      // Host recovery may still call engine.startTask; coordinator MCP must not
+      // bypass release (capability map also omits start_task for create_child).
       const commit = deps.store.commit((draft) => {
         ensureCoordinationMaps(draft);
         const child = draft.tasks[command.childId];
         if (!child || child.parentId !== ctx.callerTaskId) {
           return { ok: false, reason: 'not an owned direct child' };
+        }
+        if ((child.releaseState ?? 'draft') === 'draft') {
+          return { ok: false, reason: 'task not released; use release_tasks' };
         }
         const turnId = deriveEntityId(ctx.turnId, command.opId, 'turn');
         if (draft.turns[turnId]) {
@@ -407,6 +599,7 @@ export async function executeToolCommand(
           turnId,
           now,
           inputs: [{ kind: 'message', messageId }],
+          trigger: 'engine',
         });
         if (!started.ok) return started;
         draft.turns[turnId] = started.next;

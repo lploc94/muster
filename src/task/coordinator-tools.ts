@@ -28,6 +28,12 @@ const STABLE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 export type ToolCommand =
   | { kind: 'create_task'; opId: string; spec: CreateChildSpec }
   | { kind: 'delegate_task'; opId: string; spec: CreateChildSpec }
+  | {
+      kind: 'release_tasks';
+      opId: string;
+      taskIds: string[];
+      includeDependencies?: boolean;
+    }
   | { kind: 'start_task'; opId: string; childId: string }
   | { kind: 'interrupt_task'; opId: string; childId: string }
   | { kind: 'cancel_task'; opId: string; childId: string }
@@ -50,6 +56,7 @@ export type ToolCommand =
 const MUTATING_TOOLS: ReadonlySet<string> = new Set([
   'create_task',
   'delegate_task',
+  'release_tasks',
   'start_task',
   'interrupt_task',
   'cancel_task',
@@ -65,6 +72,7 @@ function toolActionForName(name: string): ToolAction | undefined {
   const actions: ToolAction[] = [
     'create_task',
     'delegate_task',
+    'release_tasks',
     'start_task',
     'interrupt_task',
     'cancel_task',
@@ -257,6 +265,26 @@ export function dispatch(
           return { ok: false, toolError: 'invalid delegate_task arguments' };
         }
         return { ok: true, command: { kind: 'delegate_task', opId, spec } };
+      }
+      case 'release_tasks': {
+        const raw = args.taskIds;
+        if (!Array.isArray(raw) || raw.length === 0 || !raw.every((id) => typeof id === 'string' && id.length > 0)) {
+          return { ok: false, toolError: 'taskIds must be a non-empty string array' };
+        }
+        const includeDependencies =
+          args.includeDependencies === undefined ? false : args.includeDependencies === true;
+        if (args.includeDependencies !== undefined && typeof args.includeDependencies !== 'boolean') {
+          return { ok: false, toolError: 'includeDependencies must be a boolean' };
+        }
+        return {
+          ok: true,
+          command: {
+            kind: 'release_tasks',
+            opId,
+            taskIds: raw as string[],
+            includeDependencies,
+          },
+        };
       }
       case 'start_task': {
         const childId = requireString(args, 'childId') ?? requireString(args, 'taskId');

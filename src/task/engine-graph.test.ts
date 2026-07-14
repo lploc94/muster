@@ -88,7 +88,7 @@ describe('engine graph orchestration', () => {
       goal: 'coord',
       backend: 'grok',
       role: 'coordinator',
-      capabilities: ['create_child', 'start_child', 'wait_child', 'read_subtree'],
+      capabilities: ['create_child', 'wait_child', 'read_subtree'],
     });
     const started = engine.startTask('coord');
     const token = credentials.issue({
@@ -98,7 +98,7 @@ describe('engine graph orchestration', () => {
       allowedActions: new Set([
         'create_task',
         'delegate_task',
-        'start_task',
+        'release_tasks',
         'wait_for_tasks',
         'get_task_status',
         'complete_task',
@@ -115,6 +115,134 @@ describe('engine graph orchestration', () => {
     expect(result.ok).toBe(true);
     const childId = deriveEntityId(started.value!.turnId, 'op-create', 'task');
     expect(store.getFile().tasks[childId]?.parentId).toBe('coord');
+    expect(store.getFile().tasks[childId]?.releaseState).toBe('draft');
+    expect(
+      Object.values(store.getFile().turns).filter((t) => t.taskId === childId),
+    ).toHaveLength(0);
+  });
+
+  it('W3: create → release queues first-turn; partial fail is atomic; start_task on draft rejected', async () => {
+    const { store, engine, credentials } = makeHarness();
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child', 'wait_child', 'read_subtree'],
+    });
+    const started = engine.startTask('coord');
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    const turnId = started.value.turnId;
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId,
+      allowedActions: new Set([
+        'create_task',
+        'delegate_task',
+        'release_tasks',
+        'start_task',
+        'wait_for_tasks',
+        'complete_task',
+      ]),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+
+    await engine.handleToolCall(ctx, 'create_task', {
+      kind: 'create_task',
+      opId: 'op-a',
+      spec: { goal: 'child A', backend: 'grok', role: 'worker' },
+    });
+    await engine.handleToolCall(ctx, 'create_task', {
+      kind: 'create_task',
+      opId: 'op-b',
+      spec: { goal: 'child B', backend: 'grok', role: 'worker' },
+    });
+    const childA = deriveEntityId(turnId, 'op-a', 'task');
+    const childB = deriveEntityId(turnId, 'op-b', 'task');
+    expect(store.getTask(childA)?.releaseState).toBe('draft');
+    expect(store.getTask(childB)?.releaseState).toBe('draft');
+
+    // start_task on draft must fail even if credential still lists it.
+    const startDraft = await engine.handleToolCall(ctx, 'start_task', {
+      kind: 'start_task',
+      opId: 'op-start-draft',
+      childId: childA,
+    });
+    expect(startDraft.ok).toBe(false);
+    if (!startDraft.ok) {
+      expect(startDraft.error).toMatch(/not released/);
+    }
+
+    // Atomic fail: include a missing id → neither child releases.
+    const badRelease = await engine.handleToolCall(ctx, 'release_tasks', {
+      kind: 'release_tasks',
+      opId: 'op-rel-bad',
+      taskIds: [childA, 'missing-child'],
+    });
+    expect(badRelease.ok).toBe(false);
+    expect(store.getTask(childA)?.releaseState).toBe('draft');
+    expect(store.getTask(childB)?.releaseState).toBe('draft');
+
+    const goodRelease = await engine.handleToolCall(ctx, 'release_tasks', {
+      kind: 'release_tasks',
+      opId: 'op-rel-ok',
+      taskIds: [childA, childB],
+    });
+    expect(goodRelease.ok).toBe(true);
+    expect(store.getTask(childA)?.releaseState).toBe('released');
+    expect(store.getTask(childB)?.releaseState).toBe('released');
+    expect(store.getTask(childA)?.releaseAttemptId).toBe('op-rel-ok');
+    const turnsA = Object.values(store.getFile().turns).filter((t) => t.taskId === childA);
+    const turnsB = Object.values(store.getFile().turns).filter((t) => t.taskId === childB);
+    expect(turnsA).toHaveLength(1);
+    expect(turnsB).toHaveLength(1);
+    expect(turnsA[0]?.trigger).toBe('engine');
+    expect(turnsA[0]?.status).toBe('queued');
+
+    // Idempotent same opId.
+    const again = await engine.handleToolCall(ctx, 'release_tasks', {
+      kind: 'release_tasks',
+      opId: 'op-rel-ok',
+      taskIds: [childA, childB],
+    });
+    expect(again.ok).toBe(true);
+    expect(Object.values(store.getFile().turns).filter((t) => t.taskId === childA)).toHaveLength(1);
+  });
+
+  it('W3: delegate_task creates released child with first-turn', async () => {
+    const { store, engine, credentials } = makeHarness();
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child', 'wait_child', 'read_subtree'],
+    });
+    const started = engine.startTask('coord');
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId: started.value.turnId,
+      allowedActions: new Set(['delegate_task', 'complete_task']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    const result = await engine.handleToolCall(ctx, 'delegate_task', {
+      kind: 'delegate_task',
+      opId: 'op-del',
+      spec: { goal: 'do it', backend: 'grok', role: 'worker' },
+    });
+    expect(result.ok).toBe(true);
+    const childId = deriveEntityId(started.value.turnId, 'op-del', 'task');
+    expect(store.getTask(childId)?.releaseState).toBe('released');
+    const turns = Object.values(store.getFile().turns).filter((t) => t.taskId === childId);
+    expect(turns).toHaveLength(1);
+    expect(turns[0]?.trigger).toBe('engine');
   });
 
   it('cancel_task via coordinator terminally cancels a child subtree and queued turns', async () => {

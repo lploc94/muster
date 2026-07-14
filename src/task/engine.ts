@@ -845,7 +845,7 @@ export class TaskEngine {
       backend: params.backend,
       model: params.model,
       cwd: params.cwd,
-      capabilities: ['create_child', 'start_child', 'wait_child', 'read_subtree'],
+      capabilities: ['create_child', 'wait_child', 'read_subtree'],
       executionPolicy: DEFAULT_POLICY,
       // Host composer create-and-run: atomic released (plan W3 matrix).
       releaseState: 'released',
@@ -1138,7 +1138,8 @@ export class TaskEngine {
       dependencies: params.dependencies ?? [],
       backend: params.backend,
       cwd: params.cwd,
-      capabilities: params.capabilities ?? ['create_child', 'start_child', 'wait_child', 'read_subtree'],
+      capabilities:
+        params.capabilities ?? ['create_child', 'wait_child', 'read_subtree'],
       executionPolicy: params.executionPolicy ?? DEFAULT_POLICY,
     };
 
@@ -2057,11 +2058,30 @@ export class TaskEngine {
       if (isTerminalLifecycle(task.lifecycle)) {
         return { ok: false, reason: 'task is terminal' };
       }
+      // Host recovery / create-and-run: atomically release drafts in the same commit
+      // (coordinator MCP cannot start drafts — use release_tasks instead).
+      let taskForStart = task;
+      if ((task.releaseState ?? 'draft') === 'draft') {
+        taskForStart = {
+          ...task,
+          releaseState: 'released',
+          releasedAt: now,
+          releaseAttemptId: `host:startTask:${turnId}`,
+          revision: task.revision + 1,
+          updatedAt: now,
+        };
+        draft.tasks[taskId] = taskForStart;
+      }
       const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
       if (!turnCap.ok) {
         return turnCap;
       }
-      const result = transitionStartTask(task, turnsForTask(draft, taskId), { turnId, now, inputs });
+      const result = transitionStartTask(taskForStart, turnsForTask(draft, taskId), {
+        turnId,
+        now,
+        inputs,
+        trigger: 'engine',
+      });
       if (!result.ok) {
         return result;
       }

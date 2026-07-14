@@ -149,6 +149,28 @@ describe('coordinator-tools dispatch', () => {
     }
   });
 
+  it('maps release_tasks to ToolCommand', () => {
+    const result = dispatch(
+      'release_tasks',
+      { opId: 'op-rel', taskIds: ['a', 'b'], includeDependencies: true },
+      ctx(['release_tasks']),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && result.command.kind === 'release_tasks') {
+      expect(result.command.taskIds).toEqual(['a', 'b']);
+      expect(result.command.includeDependencies).toBe(true);
+    }
+  });
+
+  it('rejects release_tasks with empty taskIds', () => {
+    const result = dispatch(
+      'release_tasks',
+      { opId: 'op-rel', taskIds: [] },
+      ctx(['release_tasks']),
+    );
+    expect(result.ok).toBe(false);
+  });
+
   it('rejects missing opId', () => {
     const result = dispatch('start_task', { childId: 'c1' }, ctx(['start_task']));
     expect(result).toEqual({ ok: false, toolError: 'opId is required' });

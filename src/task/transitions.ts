@@ -173,12 +173,12 @@ export interface QueueTurnOptions {
   inputs: TurnInput[];
   turnId: string;
   now: string;
-}
-
-interface InternalQueueTurnOptions extends QueueTurnOptions {
+  /** Default 'user'. Engine first-turn intents use 'engine'. */
   trigger?: TurnTrigger;
   retryOf?: string;
 }
+
+interface InternalQueueTurnOptions extends QueueTurnOptions {}
 
 function bumpTask(task: MusterTask, now: string, patch: Partial<MusterTask>): MusterTask {
   return {

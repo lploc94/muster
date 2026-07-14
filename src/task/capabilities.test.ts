@@ -9,10 +9,21 @@ describe('capabilitiesFor', () => {
     });
     expect(caps.has('create_task')).toBe(true);
     expect(caps.has('delegate_task')).toBe(true);
+    expect(caps.has('release_tasks')).toBe(true);
     expect(caps.has('wait_for_tasks')).toBe(true);
     expect(caps.has('get_task_status')).toBe(true);
     expect(caps.has('ask_user')).toBe(true);
     expect(caps.has('interrupt_task')).toBe(false);
+    // start_task is host/recovery only — not granted via start_child or create_child.
+    expect(caps.has('start_task')).toBe(false);
+  });
+
+  it('does not grant start_task even when start_child capability is present', () => {
+    const caps = capabilitiesFor({
+      role: 'coordinator',
+      capabilities: ['start_child'],
+    });
+    expect(caps.has('start_task')).toBe(false);
   });
 
   it('grants presentation upserts to coordinators by role', () => {
