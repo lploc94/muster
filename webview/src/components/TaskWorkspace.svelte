@@ -428,46 +428,48 @@
       data-tree-expanded={treeExpanded ? 'true' : 'false'}
     >
       <div class="task-chrome__bar">
-        <span
-          class="codicon task-chrome__role {taskRoleIcon(focused.role)}"
-          aria-hidden="true"
-        ></span>
-        <span class="task-chrome__goal font-semibold truncate text-sm min-w-0 flex-1" use:tip={focused.goal}>
-          {shortGoal(focused.goal)}
-        </span>
-        <div bind:this={statusMenuRegion} class="task-status-menu shrink-0">
-          <button
-            type="button"
-            class={`task-status-btn task-status task-status--${presentation.lifecycle.tone}`}
-            aria-haspopup="menu"
-            aria-expanded={statusMenuOpen ? 'true' : 'false'}
-            aria-label={`Task status: ${presentation.lifecycle.label}. Click to change.`}
-            use:tip={statusButtonTip}
-            onclick={() => (statusMenuOpen = !statusMenuOpen)}
-          >
-            {presentation.lifecycle.label}
-            <span class="codicon codicon-chevron-down" style="font-size: 11px; opacity: 0.8;"></span>
-          </button>
-          {#if statusMenuOpen}
-            <div class="task-status-menu__panel" role="menu" aria-label="Set task status">
-              {#each lifecycleActions as action (action.lifecycle)}
-                <button
-                  type="button"
-                  class="task-status-menu__item"
-                  role="menuitem"
-                  title={action.description}
-                  onclick={() => setLifecycle(action.lifecycle)}
-                >
-                  <span class="task-status-menu__item-label">{action.label}</span>
-                  <span class="task-status-menu__item-desc">{action.description}</span>
-                </button>
-              {/each}
-            </div>
+        <div class="task-chrome__main">
+          <span
+            class="codicon task-chrome__role {taskRoleIcon(focused.role)}"
+            aria-hidden="true"
+          ></span>
+          <span class="task-chrome__goal font-semibold truncate text-sm" use:tip={focused.goal}>
+            {shortGoal(focused.goal)}
+          </span>
+          <div bind:this={statusMenuRegion} class="task-status-menu shrink-0">
+            <button
+              type="button"
+              class={`task-status-btn task-status task-status--${presentation.lifecycle.tone}`}
+              aria-haspopup="menu"
+              aria-expanded={statusMenuOpen ? 'true' : 'false'}
+              aria-label={`Task status: ${presentation.lifecycle.label}. Click to change.`}
+              use:tip={statusButtonTip}
+              onclick={() => (statusMenuOpen = !statusMenuOpen)}
+            >
+              {presentation.lifecycle.label}
+              <span class="codicon codicon-chevron-down" style="font-size: 11px; opacity: 0.8;"></span>
+            </button>
+            {#if statusMenuOpen}
+              <div class="task-status-menu__panel" role="menu" aria-label="Set task status">
+                {#each lifecycleActions as action (action.lifecycle)}
+                  <button
+                    type="button"
+                    class="task-status-menu__item"
+                    role="menuitem"
+                    title={action.description}
+                    onclick={() => setLifecycle(action.lifecycle)}
+                  >
+                    <span class="task-status-menu__item-label">{action.label}</span>
+                    <span class="task-status-menu__item-desc">{action.description}</span>
+                  </button>
+                {/each}
+              </div>
+            {/if}
+          </div>
+          {#if focused.backend}
+            <span class="task-pill task-pill--muted shrink-0">{focused.backend}</span>
           {/if}
         </div>
-        {#if focused.backend}
-          <span class="task-pill task-pill--muted shrink-0">{focused.backend}</span>
-        {/if}
         {#if showTaskNav}
           <button
             type="button"
