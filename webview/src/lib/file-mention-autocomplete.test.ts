@@ -330,6 +330,7 @@ describe('createFileMentionAutocompleteSession', () => {
       items: [],
       activeQuery: null,
       pendingRequestId: null,
+      outcome: 'closed',
     });
     session.dispose();
   });
@@ -398,6 +399,77 @@ describe('createFileMentionAutocompleteSession', () => {
       items: sampleItems,
     });
     expect(session.getState().items.map((i) => i.kind)).toEqual(['file', 'directory']);
+    session.dispose();
+  });
+
+  it('tracks loading/ready/empty/error outcomes without clearing draft scope', () => {
+    const session = createFileMentionAutocompleteSession({
+      post: () => {},
+      createRequestId: () => 'req-1',
+    });
+
+    expect(session.getState().outcome).toBe('closed');
+
+    session.onCaretChange({ text: '@nope', caret: 5, canSend: true });
+    // Debouncing: query is active but not yet requested.
+    expect(session.getState().activeQuery?.relativeQuery).toBe('nope');
+    expect(session.getState().outcome).toBe('closed');
+
+    vi.advanceTimersByTime(FILE_MENTION_SUGGESTION_DEBOUNCE_MS);
+    expect(session.getState().outcome).toBe('loading');
+    expect(session.getState().pendingRequestId).toBe('req-1');
+    expect(session.getState().open).toBe(false);
+
+    session.onResponse({
+      type: 'fileMentionSuggestions',
+      requestId: 'req-1',
+      parentDepth: 0,
+      relativeQuery: 'nope',
+      items: [],
+    });
+    expect(session.getState().outcome).toBe('empty');
+    expect(session.getState().open).toBe(true);
+    expect(session.getState().items).toEqual([]);
+    // Active query preserved so draft/caret replacement range stays valid.
+    expect(session.getState().activeQuery).toEqual({
+      start: 0,
+      end: 5,
+      parentDepth: 0,
+      relativeQuery: 'nope',
+    });
+
+    session.onCaretChange({ text: '@fail', caret: 5, canSend: true });
+    vi.advanceTimersByTime(FILE_MENTION_SUGGESTION_DEBOUNCE_MS);
+    expect(session.getState().outcome).toBe('loading');
+
+    session.onResponse({
+      type: 'fileMentionSuggestions',
+      ok: false,
+      requestId: 'req-1',
+      code: 'listingFailed',
+    });
+    expect(session.getState().outcome).toBe('error');
+    expect(session.getState().open).toBe(true);
+    expect(session.getState().items).toEqual([]);
+    // Never stores host error codes or free-form text.
+    expect(JSON.stringify(session.getState())).not.toMatch(/listingFailed|\/Users|C:\\/);
+
+    session.onCaretChange({ text: '@ok', caret: 3, canSend: true });
+    vi.advanceTimersByTime(FILE_MENTION_SUGGESTION_DEBOUNCE_MS);
+    session.onResponse({
+      type: 'fileMentionSuggestions',
+      requestId: 'req-1',
+      parentDepth: 0,
+      relativeQuery: 'ok',
+      items: sampleItems,
+    });
+    expect(session.getState().outcome).toBe('ready');
+    expect(session.getState().open).toBe(true);
+    expect(session.getState().items).toEqual(sampleItems);
+
+    session.reset();
+    expect(session.getState().outcome).toBe('closed');
+    expect(session.getState().open).toBe(false);
     session.dispose();
   });
 });

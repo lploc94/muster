@@ -10,6 +10,7 @@ import {
   acceptFileMentionSuggestionResponse,
   type FileMentionSuggestionAcceptScope,
 } from './file-mention-suggestions';
+import type { FileMentionListboxOutcome } from './file-mention-listbox';
 import type {
   FileMentionParentDepth,
   FileMentionSuggestionItem,
@@ -25,6 +26,8 @@ export interface FileMentionAutocompleteState {
   items: FileMentionSuggestionItem[];
   activeQuery: ActiveFileMentionQuery | null;
   pendingRequestId: string | null;
+  /** Accessible status outcome for empty/error/loading surfaces (S03). */
+  outcome: FileMentionListboxOutcome;
 }
 
 export interface FileMentionAutocompleteCaretInput {
@@ -133,6 +136,7 @@ function emptyState(): FileMentionAutocompleteState {
     items: [],
     activeQuery: null,
     pendingRequestId: null,
+    outcome: 'closed',
   };
 }
 
@@ -188,6 +192,7 @@ export function createFileMentionAutocompleteSession(
       items: [],
       activeQuery: query,
       pendingRequestId: requestId,
+      outcome: 'loading',
     });
 
     const message: OutMessage = {
@@ -219,11 +224,13 @@ export function createFileMentionAutocompleteSession(
       }
 
       // Keep active query fresh even while debouncing so selection range is current.
+      // Outcome stays closed until fireRequest marks loading — avoids flash of status.
       setState({
         open: false,
         items: [],
         activeQuery: query,
         pendingRequestId: state.pendingRequestId,
+        outcome: state.pendingRequestId ? 'loading' : 'closed',
       });
 
       clearTimer();
@@ -256,21 +263,26 @@ export function createFileMentionAutocompleteSession(
         return;
       }
       if (!accepted.ok) {
+        // Error outcome opens a status-only popup; draft/caret range stays via activeQuery.
         setState({
-          open: false,
+          open: true,
           items: [],
           activeQuery: state.activeQuery,
           pendingRequestId: null,
+          outcome: 'error',
         });
         pendingScope = null;
         return;
       }
       // S02: show files and directories so mouse navigation can drill down.
+      // Empty success keeps the popup open with a sanitized status (S03).
+      const empty = accepted.items.length === 0;
       setState({
-        open: accepted.items.length > 0,
+        open: true,
         items: accepted.items,
         activeQuery: state.activeQuery,
         pendingRequestId: null,
+        outcome: empty ? 'empty' : 'ready',
       });
       pendingScope = null;
     },
