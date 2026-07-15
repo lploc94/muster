@@ -698,7 +698,7 @@
   </div>
 {:else}
   <div class="flex-1 min-h-0 flex flex-col relative">
-    <!-- Toolbar only: Back | History + New task + Settings (task title lives in status card) -->
+    <!-- Toolbar only: Back | History + New task + Settings (task context lives in tree chrome) -->
     <div
       class="shrink-0 border-b flex items-center gap-2 px-3 py-1 text-xs"
       style="border-color: var(--vscode-panel-border); background: var(--vscode-sideBar-background, transparent);"

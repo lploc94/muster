@@ -306,8 +306,8 @@ test.describe('Muster webview host state smoke', () => {
     });
 
     // Compact chrome: title + status button (no legacy expand-details disclosure).
-    await expect(page.locator('.task-workspace-banner').getByText('Wire browser regression harness')).toBeVisible();
-    await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
+    await expect(page.locator('.task-chrome').getByText('Wire browser regression harness')).toBeVisible();
+    await expect(page.locator('.task-chrome').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
     // Between turns / idle open: no turn-activity strip (ready).
     await expect(page.locator('[data-turn-activity]')).toHaveCount(0);
     await expect(page.getByText('Harness ready.')).toBeVisible();
@@ -1406,7 +1406,7 @@ test('sendRejected restores file mention display text without exposing agent pat
     .click();
   await expect(composer).toHaveValue('Review @config.ts ');
 
-  await page.getByRole('button', { name: 'Send' }).click();
+  await page.getByRole('button', { name: 'Send', exact: true }).click();
   const send = (await postedMessages(page)).find(
     (message) =>
       (message as { type?: string; taskId?: string }).type === 'send' &&
@@ -1436,7 +1436,7 @@ test('sendRejected restores file mention display text without exposing agent pat
   // Retrying the restored draft must retain the private display-token binding.
   // Otherwise the second send silently loses llmText and the agent sees only @config.ts.
   const retryStart = (await postedMessages(page)).length;
-  await page.getByRole('button', { name: 'Send' }).click();
+  await page.getByRole('button', { name: 'Send', exact: true }).click();
   const retrySend = (await postedMessages(page))
     .slice(retryStart)
     .find(
@@ -3830,15 +3830,15 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       storeRevision: 3,
     });
 
-    await expect(page.locator('.task-workspace-banner').getByText('Run the model evaluation')).toBeVisible();
-    await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
+    await expect(page.locator('.task-chrome').getByText('Run the model evaluation')).toBeVisible();
+    await expect(page.locator('.task-chrome').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
     await expect(page.locator('[data-turn-activity="executing"]').getByText(/Working/i)).toBeVisible();
     await page.getByRole('button', { name: 'History (previous coordinator tasks)' }).click();
     await expect(page.getByRole('button', { name: /Run the model evaluation.*Task Open.*Turn working.*Backend claude/i })).toBeVisible();
     await expect(page.getByRole('button', { name: /Recover failed analysis.*Task Open.*Backend claude/i })).toBeVisible();
     await expect(page.getByRole('button', { name: /Cancelled rollout.*Task Cancelled.*Backend claude/i })).toBeVisible();
     await page.getByRole('button', { name: 'Close history' }).click();
-    await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
+    await expect(page.locator('.task-chrome').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
     await expect(page.locator('[data-turn-activity="executing"]')).toBeVisible();
     await expect(page.getByRole('button', { name: 'Stop this turn' })).toBeVisible();
     await page.getByRole('button', { name: 'Stop this turn' }).click();
@@ -3863,7 +3863,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       storeRevision: 4,
     });
 
-    await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
+    await expect(page.locator('.task-chrome').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
     await expect(page.locator('.turn-activity-bar[data-turn-activity="failed_turn"]')).toBeVisible();
     await expect(page.locator('.task-action-panel--danger').getByText(/^Could not finish$/)).toBeVisible();
     // Host currentTurnActivity carries turnId even without activeTurnId projection.
@@ -3909,7 +3909,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       storeRevision: 42,
     });
 
-    await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Cancelled/i })).toBeVisible();
+    await expect(page.locator('.task-chrome').getByRole('button', { name: /Task status: Cancelled/i })).toBeVisible();
     await expect(page.locator('.task-action-panel--warning').getByText(/This task is cancelled/i)).toBeVisible();
     await expect(page.getByRole('button', { name: 'Reopen' })).toBeVisible();
     // Single warning (panel + Reopen only) — no duplicate under the composer.
@@ -3933,7 +3933,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       storeRevision: 46,
     });
 
-    await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
+    await expect(page.locator('.task-chrome').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
     await expect(page.getByText(/A queued task turn is ready to start/i)).toBeVisible();
     await expect(page.getByRole('button', { name: 'Resume queued task' })).toBeVisible();
     // Live/queued composers stay editable with queue-oriented guidance (not a hard disable).
@@ -3956,7 +3956,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       storeRevision: 47,
     });
 
-    await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Failed/i })).toBeVisible();
+    await expect(page.locator('.task-chrome').getByRole('button', { name: /Task status: Failed/i })).toBeVisible();
     // Soft failed: reopen via send or Reopen on the same task id.
     await expect(page.getByText(/This task is failed/i).first()).toBeVisible();
     await expect(page.getByRole('button', { name: 'Reopen' })).toBeVisible();
@@ -3971,7 +3971,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       storeRevision: 48,
     });
 
-    await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Succeeded/i })).toBeVisible();
+    await expect(page.locator('.task-chrome').getByRole('button', { name: /Task status: Succeeded/i })).toBeVisible();
     await expect(page.locator('.task-action-panel--warning').getByText(/This task is succeeded/i)).toBeVisible();
     await expect(page.getByRole('button', { name: 'Reopen' })).toBeVisible();
 
@@ -4035,7 +4035,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       storeRevision: 1,
     });
 
-    await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
+    await expect(page.locator('.task-chrome').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
     // Structured ask: turn waiting for user.
     await expect(page.locator('[data-turn-activity="waiting_you"]').getByText(/Waiting for you/i)).toBeVisible();
     await expect(page.getByText('Agent question')).toBeVisible();
@@ -4772,8 +4772,11 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
 
     await expect(progress).toHaveAttribute('data-handoff-phase', 'completed');
     await expect(progress).toContainText('Switch complete');
-    // Task header pill + model switch reflect the new binding.
-    await expect(page.locator('.task-pill').filter({ hasText: 'grok' })).toBeVisible();
+    // Binding lives in the composer switch; task-tree chrome does not repeat backend metadata.
+    await expect
+      .poll(() => modelSwitch.evaluate((el) => (el as HTMLElement & { value: string }).value))
+      .toBe('grok::grok-4');
+    await expect(page.getByTestId('task-chrome').getByText('grok', { exact: true })).toHaveCount(0);
     // Terminal completed handoff re-enables the interactive switch (attribute cleared).
     await expect
       .poll(() => modelSwitch.evaluate((el) => el.hasAttribute('disabled')))
@@ -4826,9 +4829,12 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expect(progress).toContainText('Target backend is not available.');
     await expect(progress).not.toContainText(sessionCanary);
     await expect(progress).not.toContainText(digestCanary);
-    // Prior binding remains on the task header.
-    await expect(page.locator('.task-pill').filter({ hasText: 'grok' })).toBeVisible();
-    await expect(page.locator('.task-pill').filter({ hasText: 'claude' })).toHaveCount(0);
+    // Prior binding remains in the composer switch without duplicating it in task chrome.
+    await expect
+      .poll(() => modelSwitch.evaluate((el) => (el as HTMLElement & { value: string }).value))
+      .toBe('grok::grok-4');
+    await expect(page.getByTestId('task-chrome').getByText('grok', { exact: true })).toHaveCount(0);
+    await expect(page.getByTestId('task-chrome').getByText('claude', { exact: true })).toHaveCount(0);
     await expect(page.getByText(conversationOnly)).toBeVisible();
     await expect(page.getByText(sessionCanary)).toHaveCount(0);
 
@@ -4900,8 +4906,8 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
   });
 });
 
-test.describe('Owning-root task tree navigation', () => {
-  test('unified chrome expands tree, keeps expand on same-root hop, preserves draft', async ({
+test.describe('Task-tree chrome navigation', () => {
+  test('collapsed tree is the selected-task header and expands without duplicate context', async ({
     page,
   }) => {
     await openWebview(page);
@@ -4943,22 +4949,46 @@ test.describe('Owning-root task tree navigation', () => {
     });
 
     await expect(page.getByTestId('task-chrome')).toBeVisible();
-    // Tasks control lives inside unified chrome (not a separate top strip).
+    // Collapsed chrome is exactly the focused task row, not a second title above the tree.
+    await expect(page.getByTestId('task-chrome')).toHaveAttribute('data-tree-expanded', 'false');
     await expect(page.getByTestId('task-chrome').getByTestId('task-tree-summary')).toBeVisible();
-    await expect(page.getByTestId('task-tree-summary')).toContainText('Tasks 3');
+    await expect(page.getByTestId('task-tree-row')).toHaveCount(1);
+    await expect(page.getByTestId('task-tree-row')).toContainText('Coordinate multi-child work');
+    await expect(page.getByTestId('task-tree-row').filter({ hasText: 'Auth worker' })).toHaveCount(0);
+
+    // The selected header itself opens the tree; clicking it again collapses.
+    await page.getByTestId('task-tree-row').click();
+    await expect(page.getByTestId('task-chrome')).toHaveAttribute('data-tree-expanded', 'true');
+    await page.getByTestId('task-tree-row').filter({ hasText: 'Coordinate multi-child work' }).click();
+    await expect(page.getByTestId('task-chrome')).toHaveAttribute('data-tree-expanded', 'false');
 
     const taskComposer = page.locator('textarea.composer-input__textarea, textarea').last();
     await taskComposer.fill('draft stays while tree open');
 
     await page.getByTestId('task-tree-summary').click();
-    await expect(page.getByTestId('task-chrome-tree')).toBeVisible();
+    await expect(page.getByTestId('task-chrome')).toHaveAttribute('data-tree-expanded', 'true');
+    await expect(page.getByTestId('task-tree-row')).toHaveCount(3);
     await expect(page.getByTestId('task-tree-row').filter({ hasText: 'Auth worker' })).toBeVisible();
-    // Expand body is tree, not seal prose primary.
-    await expect(page.getByTestId('task-chrome-tree').getByText(/authorized actor sealed/i)).toHaveCount(0);
+    // The selected goal and lifecycle each occur once inside chrome.
+    await expect(page.getByTestId('task-chrome').getByText('Coordinate multi-child work', { exact: true })).toHaveCount(1);
+    await expect(
+      page.getByTestId('task-chrome').locator('.task-tree-panel__status-btn[data-task-lifecycle="open"]'),
+    ).toHaveCount(3);
+    await expect(page.getByTestId('task-chrome').getByText('Open', { exact: true })).toHaveCount(0);
+
+    const docsNode = page.locator('.task-tree-panel__item').filter({ hasText: 'Docs worker' });
+    await docsNode.getByRole('button', { name: /Task status: Open/i }).click();
+    await page.getByRole('menu', { name: 'Set status for Docs worker' }).getByText('Mark done', { exact: true }).click();
+    await expectPostedMessage(page, {
+      type: 'setTaskLifecycle',
+      taskId: 'worker-b',
+      lifecycle: 'succeeded',
+    });
 
     await expect(taskComposer).toHaveValue('draft stays while tree open');
     await page.keyboard.press('Escape');
-    await expect(page.getByTestId('task-chrome-tree')).toHaveCount(0);
+    await expect(page.getByTestId('task-chrome')).toHaveAttribute('data-tree-expanded', 'false');
+    await expect(page.getByTestId('task-tree-row')).toHaveCount(1);
     await expect(taskComposer).toHaveValue('draft stays while tree open');
 
     await page.getByTestId('task-tree-summary').click();
@@ -4977,6 +5007,18 @@ test.describe('Owning-root task tree navigation', () => {
       })
       .toBe(true);
 
+    // Host snapshot has not arrived yet: pending navigation must still own tree chrome.
+    await expect(page.getByTestId('task-tree-row').filter({ hasText: 'Auth worker' })).toHaveAttribute('aria-current', 'page');
+    // In expanded mode the predictable top/root chevron collapses the whole chrome.
+    await expect(
+      page.locator('.task-tree-panel__item').filter({ hasText: 'Coordinate multi-child work' }).getByTestId('task-tree-summary'),
+    ).toBeVisible();
+    await page.getByTestId('task-tree-summary').click();
+    await expect(page.getByTestId('task-tree-row')).toHaveCount(1);
+    await expect(page.getByTestId('task-tree-row')).toContainText('Auth worker');
+    await expect(page.getByTestId('task-chrome').getByText('Coordinate multi-child work')).toHaveCount(0);
+    await page.getByTestId('task-tree-summary').click();
+
     await postSnapshot(page, {
       type: 'snapshot',
       rootTasks: [root],
@@ -4988,13 +5030,20 @@ test.describe('Owning-root task tree navigation', () => {
 
     await expect(page.getByText('only child transcript')).toBeVisible();
     await expect(page.getByText('Kick off children')).toHaveCount(0);
-    // Same owning-root hop: tree stays expanded; header shows child goal.
-    await expect(page.getByTestId('task-chrome-tree')).toBeVisible();
-    await expect(page.getByTestId('task-chrome')).toContainText('Auth worker');
+    // Same owning-root hop: tree stays expanded and marks the child as current.
+    await expect(page.getByTestId('task-chrome')).toHaveAttribute('data-tree-expanded', 'true');
+    await expect(page.getByTestId('task-tree-row').filter({ hasText: 'Auth worker' })).toHaveAttribute('aria-current', 'page');
     await expect(taskComposer).toHaveValue('draft stays while tree open');
 
-    // Breadcrumb (wide viewport) navigates up to coordinator.
-    await page.getByTestId('task-tree-breadcrumb-item').first().click();
+    // Regression: collapsing while a child is focused must use the child as header, never row 0/root.
+    await page.getByTestId('task-tree-summary').click();
+    await expect(page.getByTestId('task-tree-row')).toHaveCount(1);
+    await expect(page.getByTestId('task-tree-row')).toContainText('Auth worker');
+    await expect(page.getByTestId('task-chrome').getByText('Coordinate multi-child work')).toHaveCount(0);
+    await page.getByTestId('task-tree-summary').click();
+
+    // The tree itself navigates back to the coordinator; no breadcrumb duplicates it.
+    await page.getByTestId('task-tree-row').filter({ hasText: 'Coordinate multi-child work' }).click();
     await expect
       .poll(async () => {
         const messages = await postedMessages(page);
@@ -5017,9 +5066,9 @@ test.describe('Owning-root task tree navigation', () => {
       storeRevision: 902,
     });
     // After ancestor hop within same root, tree still expanded.
-    await expect(page.getByTestId('task-chrome-tree')).toBeVisible();
+    await expect(page.getByTestId('task-chrome')).toHaveAttribute('data-tree-expanded', 'true');
 
-    // Solitary root snapshot → collapse (no multi-node nav).
+    // A solitary task uses the same row/header pattern.
     const solitary = task({
       id: 'solo-root',
       role: 'coordinator',
@@ -5035,10 +5084,12 @@ test.describe('Owning-root task tree navigation', () => {
       storeRevision: 903,
     });
     await expect(page.getByTestId('task-chrome')).toContainText('Solitary coordinator');
-    await expect(page.getByTestId('task-chrome-tree')).toHaveCount(0);
-    await expect(page.getByTestId('task-tree-summary')).toHaveCount(0);
+    await expect(page.getByTestId('task-tree-row')).toHaveCount(1);
+    await expect(page.getByTestId('task-tree-summary')).toBeVisible();
+    await page.getByTestId('task-tree-summary').click();
+    await expect(page.getByTestId('task-chrome')).toHaveAttribute('data-tree-expanded', 'false');
 
-    // Re-enter multi-node, expand, then draft mode collapses.
+    // Re-enter multi-node, expand, then draft mode removes task chrome.
     await postSnapshot(page, {
       type: 'snapshot',
       rootTasks: [root],
@@ -5048,10 +5099,10 @@ test.describe('Owning-root task tree navigation', () => {
       storeRevision: 904,
     });
     await page.getByTestId('task-tree-summary').click();
-    await expect(page.getByTestId('task-chrome-tree')).toBeVisible();
+    await expect(page.getByTestId('task-chrome')).toHaveAttribute('data-tree-expanded', 'true');
     await page.getByRole('button', { name: 'New task' }).first().click();
     await expect(page.getByText('First message creates the coordinator task.')).toBeVisible();
-    await expect(page.getByTestId('task-chrome-tree')).toHaveCount(0);
+    await expect(page.getByTestId('task-chrome')).toHaveCount(0);
 
     // Different multi-node root → collapse.
     await postSnapshot(page, {
@@ -5063,7 +5114,7 @@ test.describe('Owning-root task tree navigation', () => {
       storeRevision: 905,
     });
     await page.getByTestId('task-tree-summary').click();
-    await expect(page.getByTestId('task-chrome-tree')).toBeVisible();
+    await expect(page.getByTestId('task-chrome')).toHaveAttribute('data-tree-expanded', 'true');
 
     const otherRoot = task({
       id: 'other-root',
@@ -5087,10 +5138,11 @@ test.describe('Owning-root task tree navigation', () => {
       storeRevision: 906,
     });
     await expect(page.getByTestId('task-chrome')).toContainText('Other coordinator');
-    await expect(page.getByTestId('task-chrome-tree')).toHaveCount(0);
+    await expect(page.getByTestId('task-chrome')).toHaveAttribute('data-tree-expanded', 'true');
+    await expect(page.getByTestId('task-tree-row').filter({ hasText: 'Other worker' })).toBeVisible();
   });
 
-  test('narrow viewport keeps Parent and primary actions without horizontal overflow', async ({
+  test('narrow viewport keeps selected child as compact header without horizontal overflow', async ({
     page,
   }) => {
     await page.setViewportSize({ width: 280, height: 700 });
@@ -5120,13 +5172,16 @@ test.describe('Owning-root task tree navigation', () => {
     });
 
     await expect(page.getByTestId('task-chrome')).toBeVisible();
-    await expect(page.getByTestId('task-tree-parent')).toBeVisible();
     await expect(page.getByTestId('export-task-chat')).toBeVisible();
     await expect(page.getByTestId('task-chrome')).toContainText('Auth worker');
     await expect(page.getByTestId('task-chrome').getByRole('button', { name: /Task status:/i })).toBeVisible();
     await expect(page.getByTestId('task-tree-summary')).toBeVisible();
-    // Breadcrumb hidden at narrow width (display:none).
-    await expect(page.getByTestId('task-tree-breadcrumb')).toBeHidden();
+    await expect(page.getByTestId('task-tree-row')).toHaveCount(1);
+    await expect(page.getByTestId('task-chrome').getByText('Coordinate multi-child work')).toHaveCount(0);
+
+    await page.getByTestId('task-tree-summary').click();
+    await expect(page.getByTestId('task-tree-row')).toHaveCount(2);
+    await expect(page.getByTestId('task-tree-row').filter({ hasText: 'Coordinate multi-child work' })).toBeVisible();
 
     const overflow = await page.evaluate(() => {
       const doc = document.documentElement;
@@ -5135,7 +5190,7 @@ test.describe('Owning-root task tree navigation', () => {
     expect(overflow).toBe(true);
   });
 
-  test('wide viewport can show breadcrumb path when nested', async ({ page }) => {
+  test('expanded nested tree replaces breadcrumb and keeps one selected-task copy', async ({ page }) => {
     await page.setViewportSize({ width: 480, height: 700 });
     await openWebview(page);
 
@@ -5162,8 +5217,12 @@ test.describe('Owning-root task tree navigation', () => {
       storeRevision: 920,
     });
 
-    await expect(page.getByTestId('task-tree-breadcrumb')).toBeVisible();
-    await expect(page.getByTestId('task-tree-breadcrumb')).toContainText('Coordinate');
+    await expect(page.getByTestId('task-tree-row')).toHaveCount(1);
+    await expect(page.getByTestId('task-tree-row')).toContainText('Auth worker');
+    await page.getByTestId('task-tree-summary').click();
+    await expect(page.getByTestId('task-tree-row')).toHaveCount(2);
+    await expect(page.getByTestId('task-chrome').getByText('Auth worker', { exact: true })).toHaveCount(1);
+    await expect(page.getByTestId('task-tree-row').filter({ hasText: 'Auth worker' })).toHaveAttribute('aria-current', 'page');
   });
 });
 

@@ -84,42 +84,6 @@ body {
   font-weight: 600;
 }
 
-.task-status-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  border-radius: 999px;
-  padding: 2px 8px;
-  font-size: 11px;
-  line-height: 1.4;
-  cursor: pointer;
-  background: color-mix(in srgb, currentColor 8%, transparent);
-  color: inherit;
-}
-
-.task-status-btn:hover {
-  background: color-mix(in srgb, currentColor 14%, transparent);
-}
-
-.task-status-menu {
-  position: relative;
-  display: inline-flex;
-}
-
-.task-status-menu__panel {
-  position: absolute;
-  top: calc(100% + 4px);
-  left: 0;
-  z-index: 50;
-  min-width: 200px;
-  max-width: 280px;
-  padding: 4px;
-  border-radius: 8px;
-  border: 1px solid var(--vscode-panel-border);
-  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
-  box-shadow: 0 4px 16px color-mix(in srgb, #000 35%, transparent);
-}
-
 .task-status-menu__item {
   display: flex;
   flex-direction: column;
@@ -330,203 +294,32 @@ body {
   border-left-color: var(--vscode-descriptionForeground);
 }
 
-/* Unified task chrome (header + expand tree). */
+/* The selected task row is the collapsed header; expanding reveals the tree. */
 .task-chrome {
-  display: flex;
-  flex-direction: column;
-  gap: 0;
-  min-width: 0;
-}
-
-.task-chrome.task-workspace-banner {
-  align-items: stretch;
-  justify-content: flex-start;
-  gap: 0;
-  /* Compact vs legacy banner (10px 12px) — target ~32–40px solitary / ~36–56px with meta. */
-  padding: 4px 8px;
-}
-
-.task-chrome__bar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  min-width: 0;
-  min-height: 28px;
-}
-
-/* Left cluster grows; Tasks stays on the far right edge. */
-.task-chrome__main {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex: 1 1 auto;
-  min-width: 0;
-}
-
-.task-chrome__role {
-  flex-shrink: 0;
-  font-size: 14px;
-  opacity: 0.85;
-}
-
-.task-chrome__goal {
-  flex: 1 1 auto;
-  min-width: 0;
-}
-
-.task-chrome__tasks {
-  flex: 0 0 auto;
-  margin-left: 0;
-  max-width: min(11rem, 42%);
-}
-
-.task-chrome__meta {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-height: 22px;
-  margin-top: 2px;
-  padding-top: 2px;
-  border-top: 1px solid color-mix(in srgb, var(--vscode-panel-border) 80%, transparent);
-}
-
-.task-chrome__tree {
-  margin-top: 6px;
-  max-height: min(40vh, 280px);
-  overflow: auto;
-  border-top: 1px solid color-mix(in srgb, var(--vscode-panel-border) 80%, transparent);
-  padding-top: 4px;
-}
-
-.task-chrome__muted {
-  padding: 2px 6px 0;
-  color: var(--vscode-descriptionForeground, var(--vscode-foreground));
-  font-size: 11px;
-  line-height: 1.3;
-  opacity: 0.9;
-}
-
-.task-chrome__muted-line {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.task-tree-nav__parent,
-.task-tree-nav__summary {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  min-width: 0;
-  max-width: 100%;
-  padding: 2px 6px;
-  border: 0;
-  border-radius: 3px;
-  color: var(--vscode-foreground);
-  background: transparent;
-  font: inherit;
-  font-size: 11px;
-  line-height: 1.3;
-  cursor: pointer;
-}
-
-.task-tree-nav__parent:hover,
-.task-tree-nav__summary:hover {
-  background: var(--vscode-list-hoverBackground, color-mix(in srgb, var(--vscode-foreground) 8%, transparent));
-}
-
-.task-tree-nav__parent--spacer {
-  flex: 0 0 auto;
   min-width: 0;
   padding: 0;
-  pointer-events: none;
+  border-bottom: 1px solid var(--vscode-panel-border);
+  background: color-mix(
+    in srgb,
+    var(--vscode-sideBar-background, var(--vscode-editor-background)) 94%,
+    var(--vscode-foreground) 6%
+  );
 }
 
-.task-tree-nav__parent-label,
-.task-tree-nav__summary-label {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.task-tree-nav__summary {
-  flex-shrink: 0;
-  color: var(--vscode-descriptionForeground, var(--vscode-foreground));
-}
-
-.task-chrome__tasks.task-tree-nav__summary {
-  color: var(--vscode-descriptionForeground, var(--vscode-foreground));
-}
-
-/* Breadcrumb only when wide enough; narrow keeps Parent control. */
-.task-tree-nav__breadcrumb {
-  display: none;
-  align-items: center;
-  gap: 2px;
-  min-width: 0;
-  flex: 1;
-  overflow: hidden;
-  font-size: 11px;
-}
-
-.task-tree-nav__parent--narrow-only {
-  display: inline-flex;
-}
-
-@media (min-width: 320px) {
-  .task-tree-nav__breadcrumb {
-    display: flex;
-  }
-
-  .task-tree-nav__parent--narrow-only {
-    display: none;
-  }
-}
-
-.task-tree-nav__crumb {
-  min-width: 0;
-  max-width: 7rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  padding: 1px 4px;
-  border: 0;
-  border-radius: 3px;
-  color: var(--vscode-textLink-foreground, var(--vscode-foreground));
-  background: transparent;
-  font: inherit;
-  font-size: 11px;
-  cursor: pointer;
-}
-
-.task-tree-nav__crumb:hover {
-  background: var(--vscode-list-hoverBackground, color-mix(in srgb, var(--vscode-foreground) 8%, transparent));
-}
-
-.task-tree-nav__crumb--current {
-  color: var(--vscode-foreground);
-  font-weight: 600;
-  cursor: default;
-}
-
-.task-tree-nav__crumb-sep {
-  flex-shrink: 0;
-  opacity: 0.55;
-  font-size: 10px;
-}
-
-.task-tree-nav__summary .codicon,
-.task-tree-nav__parent .codicon {
-  font-size: 13px;
-  opacity: 0.85;
-}
-
-/* Inline tree list only (overlay path retired). */
 .task-tree-panel__list {
+  max-height: min(34vh, 260px);
   overflow: auto;
-  padding: 2px 0;
+  overscroll-behavior: contain;
+  padding: 0;
+}
+
+.task-chrome[data-tree-expanded='false'] .task-tree-panel__list {
+  max-height: none;
+  overflow: visible;
+}
+
+.task-tree-panel__item + .task-tree-panel__item {
+  margin-top: 1px;
 }
 
 .task-tree-panel__row {
@@ -534,9 +327,9 @@ body {
   align-items: center;
   gap: 2px;
   width: 100%;
-  min-height: 28px;
+  min-height: 30px;
   padding: 1px 4px 1px 0;
-  border-radius: 3px;
+  border-radius: 0;
   color: inherit;
   font-size: 11px;
 }
@@ -546,9 +339,18 @@ body {
 }
 
 .task-tree-panel__row--focused {
-  background: var(--vscode-list-activeSelectionBackground, var(--vscode-list-hoverBackground));
+  background: color-mix(
+    in srgb,
+    var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder)) 78%,
+    transparent
+  );
   color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground));
-  box-shadow: inset 0 0 0 1px var(--vscode-focusBorder, #3794ff);
+  box-shadow: none;
+}
+
+.task-chrome[data-tree-expanded='false'] .task-tree-panel__row--focused {
+  background: transparent;
+  box-shadow: none;
 }
 
 .task-tree-panel__twistie {
@@ -571,6 +373,16 @@ body {
   opacity: 0.8;
 }
 
+.task-tree-panel__chrome-toggle {
+  width: 22px;
+  color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+}
+
+.task-tree-panel__chrome-toggle:hover {
+  color: var(--vscode-foreground);
+  background: color-mix(in srgb, var(--vscode-foreground) 10%, transparent);
+}
+
 .task-tree-panel__twistie--spacer {
   pointer-events: none;
 }
@@ -581,7 +393,7 @@ body {
   align-items: center;
   gap: 6px;
   min-width: 0;
-  padding: 3px 6px 3px 2px;
+  padding: 4px 6px 4px 2px;
   border: 0;
   border-radius: 3px;
   color: inherit;
@@ -606,14 +418,49 @@ body {
   white-space: nowrap;
 }
 
-.task-tree-panel__status {
+.task-tree-panel__row--focused .task-tree-panel__goal {
+  font-weight: 600;
+}
+
+.task-tree-panel__status-btn {
+  display: inline-flex;
   flex-shrink: 0;
-  max-width: 40%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  width: 36px;
+  height: 22px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: color-mix(in srgb, currentColor 8%, transparent);
+  font: inherit;
   font-size: 10px;
-  opacity: 0.9;
+  line-height: 1.35;
+  cursor: pointer;
+}
+
+.task-tree-panel__status-btn:hover,
+.task-tree-panel__status-btn[aria-expanded='true'] {
+  background: color-mix(in srgb, currentColor 16%, transparent);
+}
+
+.task-tree-panel__status-btn .codicon {
+  flex-shrink: 0;
+  font-size: 11px;
+}
+
+.task-tree-panel__status-menu {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  gap: 2px;
+  margin-top: 2px;
+  margin-right: 4px;
+  margin-bottom: 5px;
+  padding: 4px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  box-shadow: 0 4px 14px color-mix(in srgb, #000 28%, transparent);
 }
 
 .task-workspace-headline {
