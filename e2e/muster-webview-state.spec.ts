@@ -1,4 +1,11 @@
 import { expect, test, type Page } from '@playwright/test';
+import { promises as fs } from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import {
+  isFileMentionDirectorySymlink,
+  listFileMentionSuggestions,
+} from '../src/host/file-mention-suggestions';
 
 type TaskRuntimeActivity =
   | 'waiting_dependencies'
@@ -1198,6 +1205,255 @@ test('current-directory file mention flow covers draft and idle task dual-text s
     ) as { type: string; text: string; llmText?: string; taskId: string };
   expect(taskSend.text).toBe('Check @package.json');
   expect(taskSend.llmText).toBeUndefined();
+});
+
+/**
+ * Integration proof across production seams: the browser emits a bounded
+ * task-scoped request, the real host listing core derives its authoritative cwd
+ * and reads the filesystem, and the guarded result returns through the popup,
+ * mention binding, and dual text/llmText send path.
+ */
+test('production host listing composes with browser selection and dual-path send', async ({
+  page,
+}) => {
+  const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'muster-file-mention-'));
+  const taskCwd = path.join(fixtureRoot, 'task');
+  await fs.mkdir(taskCwd);
+  await fs.writeFile(path.join(fixtureRoot, 'config.ts'), 'export const safe = true;\n');
+
+  try {
+    await openWebview(page);
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [
+        task({
+          id: 'task-production-host-mention',
+          goal: 'Exercise production host listing',
+          viewStatus: 'idle',
+        }),
+      ],
+      focusedTaskId: 'task-production-host-mention',
+      subtree: [
+        task({
+          id: 'task-production-host-mention',
+          goal: 'Exercise production host listing',
+          viewStatus: 'idle',
+        }),
+      ],
+      transcript: [{ id: 'msg-production-host-mention', kind: 'assistant', content: 'Ready.' }],
+      storeRevision: 31,
+    });
+
+    const composer = page.getByPlaceholder('Message this task…');
+    await composer.click();
+    const requestStart = (await postedMessages(page)).length;
+    await composer.pressSequentially('Review @../co', { delay: 15 });
+
+    await expect
+      .poll(async () => {
+        const messages = await postedMessages(page);
+        return messages
+          .slice(requestStart)
+          .filter(
+            (message) =>
+              (message as { type?: string }).type === 'requestFileMentionSuggestions',
+          );
+      })
+      .not.toHaveLength(0);
+
+    const request = (await postedMessages(page))
+      .slice(requestStart)
+      .find(
+        (message) =>
+          (message as { type?: string }).type === 'requestFileMentionSuggestions',
+      ) as {
+      requestId: string;
+      taskId?: string;
+      parentDepth: number;
+      relativeQuery: string;
+    };
+    expect(request).toMatchObject({
+      taskId: 'task-production-host-mention',
+      parentDepth: 1,
+      relativeQuery: 'co',
+    });
+    expect(JSON.stringify(request)).not.toContain(taskCwd);
+
+    const resolvedScopes: Array<{ taskId?: string }> = [];
+    const result = await listFileMentionSuggestions(
+      {
+        requestId: request.requestId,
+        taskId: request.taskId,
+        parentDepth: request.parentDepth,
+        relativeQuery: request.relativeQuery,
+      },
+      {
+        resolveCwd: (scope) => {
+          resolvedScopes.push(scope);
+          return scope.taskId === 'task-production-host-mention' ? taskCwd : undefined;
+        },
+        readDirectory: (dirPath) => fs.readdir(dirPath, { withFileTypes: true }),
+        isDirectorySymlink: isFileMentionDirectorySymlink,
+      },
+    );
+
+    expect(resolvedScopes).toEqual([{ taskId: 'task-production-host-mention' }]);
+    expect(result.ok).toBe(true);
+    expect(JSON.stringify(result)).not.toContain(fixtureRoot);
+    if (!result.ok) throw new Error(`production host listing failed: ${result.code}`);
+    expect(result.items).toEqual([
+      {
+        id: 'file:../config.ts',
+        kind: 'file',
+        label: 'config.ts',
+        insertionPath: '../config.ts',
+      },
+    ]);
+
+    await postRawHostMessage(page, {
+      type: 'fileMentionSuggestions',
+      ok: true,
+      requestId: result.requestId,
+      parentDepth: result.parentDepth,
+      relativeQuery: result.relativeQuery,
+      items: result.items,
+    });
+
+    const listbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+    await expect(listbox).toBeVisible();
+    await listbox.getByRole('option', { name: 'config.ts' }).click();
+    await expect(composer).toHaveValue('Review @config.ts ');
+
+    await page.getByRole('button', { name: 'Send' }).click();
+    await expectPostedMessage(page, {
+      type: 'send',
+      taskId: 'task-production-host-mention',
+      text: 'Review @config.ts',
+      llmText: 'Review @../config.ts',
+    });
+    await expect(page.locator('body')).not.toContainText(fixtureRoot);
+  } finally {
+    await fs.rm(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Integration regression for the durable send NACK path. A rejected send must
+ * restore only the user-visible relative mention text from the outbox; the
+ * agent-facing llmText path must not leak into the composer or error chrome.
+ */
+test('sendRejected restores file mention display text without exposing agent paths', async ({
+  page,
+}) => {
+  await openWebview(page);
+  await postSnapshot(page, {
+    type: 'snapshot',
+    rootTasks: [
+      task({
+        id: 'task-mention-rejected',
+        goal: 'Reject a file mention send safely',
+        viewStatus: 'idle',
+      }),
+    ],
+    focusedTaskId: 'task-mention-rejected',
+    subtree: [
+      task({
+        id: 'task-mention-rejected',
+        goal: 'Reject a file mention send safely',
+        viewStatus: 'idle',
+      }),
+    ],
+    transcript: [{ id: 'msg-mention-rejected', kind: 'assistant', content: 'Ready.' }],
+    storeRevision: 30,
+  });
+
+  const composer = page.getByPlaceholder('Message this task…');
+  await composer.click();
+  const requestStart = (await postedMessages(page)).length;
+  await composer.pressSequentially('Review @co', { delay: 15 });
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(requestStart)
+        .filter((message) => (message as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+
+  const request = (await postedMessages(page))
+    .slice(requestStart)
+    .find(
+      (message) => (message as { type?: string }).type === 'requestFileMentionSuggestions',
+    ) as {
+    requestId: string;
+  };
+
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: request.requestId,
+    parentDepth: 0,
+    relativeQuery: 'co',
+    items: [
+      {
+        id: 'file:config.ts',
+        kind: 'file',
+        label: 'config.ts',
+        insertionPath: 'src/private/config.ts',
+      },
+    ],
+  });
+
+  await page
+    .getByRole('listbox', { name: 'File mention suggestions' })
+    .getByRole('option', { name: 'config.ts' })
+    .click();
+  await expect(composer).toHaveValue('Review @config.ts ');
+
+  await page.getByRole('button', { name: 'Send' }).click();
+  const send = (await postedMessages(page)).find(
+    (message) =>
+      (message as { type?: string; taskId?: string }).type === 'send' &&
+      (message as { taskId?: string }).taskId === 'task-mention-rejected',
+  ) as {
+    clientRequestId: string;
+    text: string;
+    llmText?: string;
+  };
+  expect(send.text).toBe('Review @config.ts');
+  expect(send.llmText).toBe('Review @src/private/config.ts');
+  expect(send.clientRequestId).toEqual(expect.any(String));
+  await expect(composer).toHaveValue('');
+
+  await postRawHostMessage(page, {
+    type: 'sendRejected',
+    clientRequestId: send.clientRequestId,
+    taskId: 'task-mention-rejected',
+    reason: 'Task queue capacity reached.',
+    code: 'capacity',
+  });
+
+  await expect(composer).toHaveValue('Review @config.ts');
+  await expect(page.getByRole('alert').getByText('Task queue capacity reached.')).toBeVisible();
+  await expect(page.locator('body')).not.toContainText('src/private/config.ts');
+
+  // Retrying the restored draft must retain the private display-token binding.
+  // Otherwise the second send silently loses llmText and the agent sees only @config.ts.
+  const retryStart = (await postedMessages(page)).length;
+  await page.getByRole('button', { name: 'Send' }).click();
+  const retrySend = (await postedMessages(page))
+    .slice(retryStart)
+    .find(
+      (message) =>
+        (message as { type?: string; taskId?: string }).type === 'send' &&
+        (message as { taskId?: string }).taskId === 'task-mention-rejected',
+    ) as {
+    clientRequestId: string;
+    text: string;
+    llmText?: string;
+  };
+  expect(retrySend.text).toBe('Review @config.ts');
+  expect(retrySend.llmText).toBe('Review @src/private/config.ts');
+  expect(retrySend.clientRequestId).not.toBe(send.clientRequestId);
 });
 
 /**

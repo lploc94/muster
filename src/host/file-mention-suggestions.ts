@@ -9,6 +9,7 @@
  * absolute paths.
  */
 
+import * as fs from 'fs';
 import * as path from 'path';
 
 export const FILE_MENTION_SUGGESTION_MAX_ITEMS = 50;
@@ -87,6 +88,17 @@ export interface FileMentionDirEntry {
   isFile(): boolean;
   isDirectory(): boolean;
   isSymbolicLink(): boolean;
+}
+
+/**
+ * Return whether a refinement segment is a filesystem link/junction.
+ * `lstat().isDirectory()` is intentionally not required: lstat describes the
+ * link itself, so directory symlinks report `isSymbolicLink() === true` and
+ * `isDirectory() === false` even when their target is a directory.
+ */
+export async function isFileMentionDirectorySymlink(dirPath: string): Promise<boolean> {
+  const stat = await fs.promises.lstat(dirPath);
+  return stat.isSymbolicLink();
 }
 
 export interface FileMentionSuggestionServices {

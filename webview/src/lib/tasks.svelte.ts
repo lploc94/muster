@@ -81,11 +81,17 @@ class TasksState {
   queuedTurns = $state<QueuedTurnProjection[]>([]);
 
   /**
-   * One-shot prefill for the composer (queue Edit → message box).
+   * One-shot prefill for the composer (queue Edit -> message box, rejected send -> retry).
    * Composer consumes and clears when `nonce` changes.
    * Optional clientRequestId: only clear matching rejected outbox on successful apply.
+   * Rejected sends also restore display-token bindings so retry preserves llmText.
    */
-  composerPrefill = $state<{ text: string; nonce: number; clientRequestId?: string } | null>(null);
+  composerPrefill = $state<{
+    text: string;
+    nonce: number;
+    clientRequestId?: string;
+    mentionBindings?: Array<[string, string]>;
+  } | null>(null);
   private prefillNonceSeq = 0;
 
   constructor() {
@@ -355,12 +361,17 @@ class TasksState {
   }
 
   /** Put text into the task/draft composer (used by queue Edit / rejected send restore). */
-  prefillComposer(text: string, clientRequestId?: string): void {
+  prefillComposer(
+    text: string,
+    clientRequestId?: string,
+    mentionBindings?: Array<[string, string]>,
+  ): void {
     this.prefillNonceSeq += 1;
     this.composerPrefill = {
       text,
       nonce: this.prefillNonceSeq,
       ...(clientRequestId ? { clientRequestId } : {}),
+      ...(mentionBindings && mentionBindings.length > 0 ? { mentionBindings } : {}),
     };
   }
 

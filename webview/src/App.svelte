@@ -483,7 +483,11 @@
               (!rejected.taskId && tasks.draftMode) ||
               (!!rejected.taskId && rejected.taskId === tasks.focusedTaskId);
             if (sameScope) {
-              tasks.prefillComposer(rejected.text, rejected.clientRequestId);
+              tasks.prefillComposer(
+                rejected.text,
+                rejected.clientRequestId,
+                rejected.mentionBindings,
+              );
             }
             // Outbox stays until muster:prefill-applied confirms restore.
           } else {
@@ -564,7 +568,7 @@
     });
     if (!entry) return;
     if (tasks.composerPrefill?.clientRequestId === entry.clientRequestId) return;
-    tasks.prefillComposer(entry.text, entry.clientRequestId);
+    tasks.prefillComposer(entry.text, entry.clientRequestId, entry.mentionBindings);
   });
 </script>
 

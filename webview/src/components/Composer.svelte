@@ -269,7 +269,7 @@
     }
     lastPrefillNonce = prefill.nonce;
     draftText = prefill.text;
-    mentionBindings = new Map();
+    mentionBindings = new Map(prefill.mentionBindings ?? []);
     dropFeedback = null;
     const appliedId = prefill.clientRequestId;
     tasks.clearComposerPrefill();
@@ -463,6 +463,8 @@
         clientRequestId,
         text: displayText,
         llmText: llmText !== displayText ? llmText : undefined,
+        mentionBindings:
+          mentionBindings.size > 0 ? Array.from(mentionBindings.entries()) : undefined,
         backend,
         model: model ?? undefined,
         continuationOf: tasks.continuationOf ?? undefined,
@@ -527,6 +529,8 @@
         taskId,
         text: displayText,
         llmText: llmText !== displayText ? llmText : undefined,
+        mentionBindings:
+          mentionBindings.size > 0 ? Array.from(mentionBindings.entries()) : undefined,
         createdAt: Date.now(),
         status: 'pending',
       });

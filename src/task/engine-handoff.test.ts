@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -1172,52 +1173,61 @@ describe('TaskEngine.requestRuntimeHandoff isolation + fail-closed gates (S02 de
 
   it('writes interrupt cancelRequests for remote-owned live turns during handoff preempt', async () => {
     const { store, taskId, filePath } = seedIdleTaskWithMessages();
-    // Fake a lease owned by a different live process (pid 1 is typically always alive).
+    const remoteOwner = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 10000)'], {
+      stdio: 'ignore',
+    });
     const remoteTurnId = 'remote-live-1';
-    fs.writeFileSync(
-      `${filePath}.lease.${remoteTurnId}`,
-      JSON.stringify({
-        pid: 1,
-        token: 'remote-owner',
-        createdAt: new Date().toISOString(),
-      }),
-      'utf8',
-    );
-    store.commit((draft) => {
-      draft.turns[remoteTurnId] = {
-        id: remoteTurnId,
-        taskId,
-        sequence: 1,
-        trigger: 'user',
-        status: 'running',
-        inputs: [],
-        createdAt: '2026-07-14T10:00:00.000Z',
-        startedAt: '2026-07-14T10:00:01.000Z',
-      };
-      return { ok: true };
-    });
-    const engine = TaskEngine.load({
-      store,
-      makeBackend: () => scriptedBackend(),
-      runTurn: async function* () {
-        yield { type: 'error', message: 'summary unavailable during remote preempt' };
-      },
-      clock: () => '2026-07-14T10:08:00.000Z',
-    });
-    const result = await engine.requestRuntimeHandoff({
-      taskId,
-      targetBackend: 'codex',
-    });
-    expect(result.ok).toBe(true);
-    if (!result.ok) throw new Error(result.reason);
-    expect(store.getFile().turns[remoteTurnId]?.status).toBe('interrupted');
-    const cancel = store.getFile().cancelRequests?.[remoteTurnId];
-    expect(cancel?.kind).toBe('interrupt');
-    expect(cancel?.by).toBe('engine');
     try {
-      fs.unlinkSync(`${filePath}.lease.${remoteTurnId}`);
-    } catch {
-      // best-effort
+      if (!remoteOwner.pid) {
+        throw new Error('remote owner process did not start');
+      }
+      fs.writeFileSync(
+        `${filePath}.lease.${remoteTurnId}`,
+        JSON.stringify({
+          pid: remoteOwner.pid,
+          token: 'remote-owner',
+          createdAt: new Date().toISOString(),
+        }),
+        'utf8',
+      );
+      store.commit((draft) => {
+        draft.turns[remoteTurnId] = {
+          id: remoteTurnId,
+          taskId,
+          sequence: 1,
+          trigger: 'user',
+          status: 'running',
+          inputs: [],
+          createdAt: '2026-07-14T10:00:00.000Z',
+          startedAt: '2026-07-14T10:00:01.000Z',
+        };
+        return { ok: true };
+      });
+      const engine = TaskEngine.load({
+        store,
+        makeBackend: () => scriptedBackend(),
+        runTurn: async function* () {
+          yield { type: 'error', message: 'summary unavailable during remote preempt' };
+        },
+        clock: () => '2026-07-14T10:08:00.000Z',
+      });
+      const result = await engine.requestRuntimeHandoff({
+        taskId,
+        targetBackend: 'codex',
+      });
+      expect(result.ok).toBe(true);
+      if (!result.ok) throw new Error(result.reason);
+      expect(store.getFile().turns[remoteTurnId]?.status).toBe('interrupted');
+      const cancel = store.getFile().cancelRequests?.[remoteTurnId];
+      expect(cancel?.kind).toBe('interrupt');
+      expect(cancel?.by).toBe('engine');
+    } finally {
+      remoteOwner.kill();
+      try {
+        fs.unlinkSync(`${filePath}.lease.${remoteTurnId}`);
+      } catch {
+        // best-effort
+      }
     }
   });
 

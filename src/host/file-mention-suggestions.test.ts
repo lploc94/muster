@@ -1,8 +1,11 @@
+import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { describe, expect, it, vi } from 'vitest';
 import {
   FILE_MENTION_SUGGESTION_MAX_ITEMS,
   FILE_MENTION_SUGGESTION_MAX_QUERY_CHARS,
+  isFileMentionDirectorySymlink,
   listFileMentionSuggestions,
   type FileMentionSuggestionServices,
   type FileMentionSuggestionsRequest,
@@ -60,6 +63,20 @@ function request(
 }
 
 describe('listFileMentionSuggestions', () => {
+  it('recognizes a directory symlink or junction from lstat metadata', async () => {
+    const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'muster-file-mention-'));
+    const target = path.join(root, 'target');
+    const link = path.join(root, 'link');
+    await fs.promises.mkdir(target);
+
+    try {
+      await fs.promises.symlink(target, link, process.platform === 'win32' ? 'junction' : 'dir');
+      await expect(isFileMentionDirectorySymlink(link)).resolves.toBe(true);
+    } finally {
+      await fs.promises.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('lists the current directory non-recursively with directories first and relative paths only', async () => {
     const result = await listFileMentionSuggestions(request(), services());
 
