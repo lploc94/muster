@@ -1,4 +1,4 @@
-import type { TaskDependency, TaskLifecycleState, VerdictStatus } from './types';
+import type { TaskBriefKind, TaskDependency, TaskLifecycleState, VerdictStatus } from './types';
 
 const TERMINAL_LIFECYCLES: ReadonlySet<TaskLifecycleState> = new Set([
   'succeeded',
@@ -49,6 +49,13 @@ export function evaluateDependency(
 export interface DepGraph {
   rootOf(taskId: string): string | undefined;
   dependsOn(taskId: string): readonly string[];
+  /**
+   * Brief kind of an existing task, backed by the SAME task map `rootOf`/`dependsOn`
+   * read (an O(1) lookup, not a second scan). Enables the verify-gate auto-default in
+   * createTask. Optional so legacy graph mocks (which never target a verify producer)
+   * stay valid; real engine graphs always provide it.
+   */
+  briefKindOf?(taskId: string): TaskBriefKind | undefined;
 }
 
 function hasCycle(

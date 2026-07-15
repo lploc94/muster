@@ -187,6 +187,14 @@ export interface CreateTaskContext {
   rootId: string;
   graph: DepGraph;
   now: string;
+  /**
+   * Internal opt-out for the verify-dependency auto-gate (verify-gate-loop default B).
+   * The Phase B remediation path creates a fix task that DEPENDS on the failed verify
+   * task (to run after it) but must NOT require its verdict to pass — otherwise the fix
+   * could never run and the loop would not terminate. That single internal path sets
+   * this true; all coordinator-initiated creates leave it false so the gate defaults on.
+   */
+  skipVerifyAutoGate?: boolean;
 }
 
 export interface QueueTurnOptions {
@@ -272,6 +280,19 @@ export function createTask(
     return depResult;
   }
 
+  // Verify-gate auto-default (verify-gate-loop B): a dependency whose TARGET producer is
+  // a verify-kind task defaults to requiring that verification's verdict to PASS. Reuses
+  // the same graph `validateDependencies` just confirmed the targets against (an O(1)
+  // briefKindOf lookup — no second scan). An explicit `requiredVerdict` is never
+  // overwritten, and a dependency whose target is not verify-kind is left untouched.
+  const dependencies = input.dependencies.map((dep) => {
+    if (dep.requiredVerdict !== undefined || ctx.skipVerifyAutoGate) return dep;
+    if (ctx.graph.briefKindOf?.(dep.taskId) === 'verify') {
+      return { ...dep, requiredVerdict: 'pass' as const };
+    }
+    return dep;
+  });
+
   const task: MusterTask = {
     id: input.id,
     role: input.role,
@@ -281,7 +302,7 @@ export function createTask(
     reason: input.reason,
     continuationOf: input.continuationOf,
     parentId: input.parentId,
-    dependencies: [...input.dependencies],
+    dependencies,
     backend: input.backend,
     model: input.model,
     ...(input.taskType !== undefined ? { taskType: input.taskType } : {}),

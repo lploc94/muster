@@ -485,6 +485,7 @@ function depGraphFromFile(file: TaskStoreFile): DepGraph {
       return current.id;
     },
     dependsOn: (taskId) => file.tasks[taskId]?.dependencies.map((dep) => dep.taskId) ?? [],
+    briefKindOf: (taskId) => file.tasks[taskId]?.brief?.kind,
   };
 }
 
@@ -3542,7 +3543,11 @@ export class TaskEngine {
           inputBindings: bindings,
           ...(upstream.claimsGit !== undefined ? { claimsGit: upstream.claimsGit } : {}),
         };
-        const created = createTask(input, { rootId, graph, now });
+        // skipVerifyAutoGate: the fix DEPENDS on the failed verify task (to run after it)
+        // but must NOT require its verdict to pass — that would deadlock the fix and break
+        // the loop-termination invariant. The gate re-point below is a direct mutation
+        // (not a createTask), so it is likewise never auto-gated.
+        const created = createTask(input, { rootId, graph, now, skipVerifyAutoGate: true });
         if (!created.ok) {
           // ISSUE 11 — an internal creation failure (e.g. cross-root verify) is NOT
           // fixable by re-dispatch, so SEAL the blocked task rather than leave it hanging

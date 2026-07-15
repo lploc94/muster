@@ -489,6 +489,68 @@ describe('coordinator-tools batch dispatch', () => {
     }
   });
 
+  it('threads an explicit requiredVerdict through a batch child dependency (verify-gate-loop C)', () => {
+    const result = dispatch(
+      'create_tasks',
+      {
+        opId: 'op-batch',
+        tasks: [
+          {
+            localId: 'ship',
+            goal: 'ship it',
+            taskType: 'implement',
+            dependencies: [
+              {
+                taskId: 'task-verify',
+                requiredOutcome: 'succeeded',
+                onUnsatisfied: 'block',
+                requiredVerdict: 'pass',
+              },
+            ],
+          },
+        ],
+      },
+      ctx(['create_tasks']),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && result.command.kind === 'create_tasks') {
+      expect(result.command.specs[0].dependencies).toEqual([
+        {
+          taskId: 'task-verify',
+          requiredOutcome: 'succeeded',
+          onUnsatisfied: 'block',
+          requiredVerdict: 'pass',
+        },
+      ]);
+    }
+  });
+
+  it('rejects a batch child dependency with an invalid requiredVerdict (fail-closed)', () => {
+    const result = dispatch(
+      'create_tasks',
+      {
+        opId: 'op-batch',
+        tasks: [
+          {
+            localId: 'ship',
+            goal: 'ship it',
+            taskType: 'implement',
+            dependencies: [
+              {
+                taskId: 'task-verify',
+                requiredOutcome: 'succeeded',
+                onUnsatisfied: 'block',
+                requiredVerdict: 'fail',
+              },
+            ],
+          },
+        ],
+      },
+      ctx(['create_tasks']),
+    );
+    expect(result).toEqual({ ok: false, toolError: 'invalid create_tasks arguments' });
+  });
+
   it('maps delegate_tasks with a pre-existing task binding', () => {
     const result = dispatch(
       'delegate_tasks',

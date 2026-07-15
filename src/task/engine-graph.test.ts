@@ -1470,6 +1470,94 @@ describe('engine graph batch create/delegate', () => {
     await engine.whenIdle();
   });
 
+  it('auto-gates batch dependencies onto verify-kind producers, leaving non-verify deps ungated (verify-gate-loop B+C)', async () => {
+    const { store, engine, credentials } = makeHarness();
+    const { turnId, ctx } = startCoord(engine, credentials, ['create_tasks']);
+
+    // Pre-existing tasks in the same root: one verify-kind, one implement-kind.
+    const seedTask = (id: string, kind: 'verify' | 'implement') =>
+      ({
+        id,
+        role: 'worker' as const,
+        lifecycle: 'open' as const,
+        goal: id,
+        parentId: 'coord',
+        dependencies: [],
+        backend: 'grok',
+        capabilities: [],
+        executionPolicy: {
+          maxTurns: 10,
+          maxAutomaticRetries: 0,
+          turnTimeoutMs: 60_000,
+          taskTimeoutMs: 120_000,
+        },
+        brief: {
+          version: 1 as const,
+          kind,
+          title: id,
+          objective: id,
+          acceptanceCriteria: [],
+          expectedOutputs: ['summary'],
+        },
+        revision: 0,
+        createdAt: '2026-07-06T00:00:00.000Z',
+        updatedAt: '2026-07-06T00:00:00.000Z',
+      });
+    store.commit((draft) => {
+      draft.tasks['pre-verify'] = seedTask('pre-verify', 'verify');
+      draft.tasks['pre-impl'] = seedTask('pre-impl', 'implement');
+      return { ok: true };
+    });
+
+    const created = await engine.handleToolCall(ctx, 'create_tasks', {
+      kind: 'create_tasks',
+      opId: 'op-gate',
+      specs: [
+        // A verify-kind SIBLING produced within the same batch.
+        { localId: 'vfy', goal: 'verify the work', taskType: 'worker', brief: { kind: 'verify' } },
+        {
+          localId: 'ship',
+          goal: 'ship the work',
+          taskType: 'implement',
+          // Intra-batch binding onto the verify sibling → derived succeeded/fail dep, auto-gated.
+          inputBindings: [{ fromLocalId: 'vfy', output: 'summary', as: 'verified' }],
+          dependencies: [
+            // Pre-existing verify producer, no requiredVerdict → auto-gated.
+            { taskId: 'pre-verify', requiredOutcome: 'succeeded', onUnsatisfied: 'block' },
+            // Pre-existing NON-verify producer → left untouched.
+            { taskId: 'pre-impl', requiredOutcome: 'succeeded', onUnsatisfied: 'block' },
+          ],
+        },
+      ],
+    });
+    expect(created.ok).toBe(true);
+
+    const vfyId = deriveEntityId(turnId, 'op-gate', 'task:vfy');
+    const shipId = deriveEntityId(turnId, 'op-gate', 'task:ship');
+    const shipDeps = store.getTask(shipId)?.dependencies ?? [];
+
+    // Sibling inputBinding dep onto the verify producer is auto-gated.
+    expect(shipDeps).toContainEqual({
+      taskId: vfyId,
+      requiredOutcome: 'succeeded',
+      onUnsatisfied: 'fail',
+      requiredVerdict: 'pass',
+    });
+    // Explicit dep onto a pre-existing verify producer is auto-gated.
+    expect(shipDeps).toContainEqual({
+      taskId: 'pre-verify',
+      requiredOutcome: 'succeeded',
+      onUnsatisfied: 'block',
+      requiredVerdict: 'pass',
+    });
+    // Dep onto a non-verify producer is NOT auto-gated.
+    expect(shipDeps).toContainEqual({
+      taskId: 'pre-impl',
+      requiredOutcome: 'succeeded',
+      onUnsatisfied: 'block',
+    });
+  });
+
   async function waitTurnRunning(
     store: TaskStore,
     turnId: string,

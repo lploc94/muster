@@ -8,6 +8,8 @@ import { deriveEntityId } from './engine-graph';
 import { DEFAULT_RESOURCE_LIMITS } from './limits';
 import { failureSignature } from './recovery-policy';
 import { TaskStore } from './store';
+import { createTask } from './transitions';
+import type { DepGraph } from './deps';
 import type { MusterTask, TaskBriefV1, TaskExecutionPolicy, TaskVerdict } from './types';
 
 // Phase B — bounded verify-remediation engine pass (applyVerdictRemediation).
@@ -382,6 +384,101 @@ describe('applyVerdictRemediation', () => {
     expect(ship.attention?.code).toBe('verdict_failed');
     expect(ship.attention?.message).toContain('could not create remediation task');
     expect(ship.sealedBy).toBeDefined();
+  });
+
+  it('end-to-end: auto-gate makes implement→verify(fail)→downstream block + remediate with NO explicit requiredVerdict', () => {
+    const store = makeStore();
+    const engine = makeEngine(store);
+
+    const verifyBrief: TaskBriefV1 = {
+      version: 1,
+      kind: 'verify',
+      title: 'verify widget',
+      objective: 'verify widget',
+      acceptanceCriteria: [],
+      expectedOutputs: ['summary'],
+    };
+
+    // Seed the producers: impl (done) and a verify-kind vfy (done, FAIL verdict) that
+    // was checking impl. No `requiredVerdict` is written anywhere by hand.
+    store.commit((draft) => {
+      draft.tasks.coord = task({ id: 'coord', role: 'coordinator', lifecycle: 'open', parentId: null });
+      draft.tasks.impl = task({
+        id: 'impl',
+        role: 'worker',
+        lifecycle: 'succeeded',
+        goal: 'implement widget',
+        brief: implBrief(),
+        claimsGit: true,
+        taskResult: { version: 1, revision: 1, summary: 'implemented widget' },
+      });
+      draft.tasks.vfy = task({
+        id: 'vfy',
+        role: 'worker',
+        lifecycle: 'succeeded',
+        goal: 'verify widget',
+        brief: verifyBrief,
+        inputBindings: [{ fromTaskId: 'impl', output: 'summary', as: 'artifact' }],
+        taskResult: { version: 1, revision: 1, summary: 'ran verification', verdict: failVerdict() },
+      });
+      return { ok: true };
+    });
+
+    // Create `ship` through the real createTask path with a file-backed graph. Its plain
+    // block dependency on the verify-kind vfy MUST auto-gate to requiredVerdict:'pass'.
+    store.commit((draft) => {
+      const graph: DepGraph = {
+        rootOf: () => 'coord',
+        dependsOn: (id) => draft.tasks[id]?.dependencies.map((d) => d.taskId) ?? [],
+        briefKindOf: (id) => draft.tasks[id]?.brief?.kind,
+      };
+      const created = createTask(
+        {
+          id: 'ship',
+          role: 'worker',
+          goal: 'ship widget',
+          parentId: 'coord',
+          dependencies: [{ taskId: 'vfy', requiredOutcome: 'succeeded', onUnsatisfied: 'block' }],
+          backend: 'fake',
+          capabilities: [],
+          executionPolicy: POLICY,
+        },
+        { rootId: 'coord', graph, now: NOW },
+      );
+      if (!created.ok) throw new Error(`createTask failed: ${created.reason}`);
+      draft.tasks.ship = created.next;
+      return { ok: true };
+    });
+
+    // Auto-gate engaged with no explicit requiredVerdict in the creating call.
+    expect(store.getTask('ship')?.dependencies).toEqual([
+      { taskId: 'vfy', requiredOutcome: 'succeeded', onUnsatisfied: 'block', requiredVerdict: 'pass' },
+    ]);
+
+    // The gate + Phase B remediation now engage automatically.
+    runRemediation(engine);
+
+    const file = store.getFile();
+    const fix = file.tasks[REMEDIATION_ID];
+    expect(fix).toBeDefined();
+    expect(fix.brief?.kind).toBe('implement');
+    expect(fix.brief?.writePaths).toEqual(['src/widget.ts']);
+    // The fix DEPENDS on the failed verify (to run after it) but is NOT re-gated —
+    // skipVerifyAutoGate keeps the loop terminating.
+    expect(fix.dependencies).toContainEqual({
+      taskId: 'vfy',
+      requiredOutcome: 'succeeded',
+      onUnsatisfied: 'block',
+    });
+    expect(file.turns[REMEDIATION_TURN_ID]?.status).toBe('queued');
+
+    // Ship's gate is re-pointed onto the fix (requiredVerdict dropped) and stays open.
+    const ship = file.tasks.ship;
+    expect(ship.dependencies).toEqual([
+      { taskId: REMEDIATION_ID, requiredOutcome: 'succeeded', onUnsatisfied: 'block' },
+    ]);
+    expect(ship.lifecycle).toBe('open');
+    expect(ship.remediation).toMatchObject({ uses: 1, fixTaskId: REMEDIATION_ID });
   });
 
   it('ISSUE 12 — seals the blocked task failed (verdict_failed) when the producer is terminal but NOT succeeded', () => {
