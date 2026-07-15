@@ -4862,7 +4862,9 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
 });
 
 test.describe('Owning-root task tree navigation', () => {
-  test('opens tree panel, freezes scroll, preserves draft, and selects child', async ({ page }) => {
+  test('unified chrome expands tree, keeps expand on same-root hop, preserves draft', async ({
+    page,
+  }) => {
     await openWebview(page);
 
     const root = task({
@@ -4889,10 +4891,6 @@ test.describe('Owning-root task tree navigation', () => {
       runtimeActivity: 'waiting_user',
     });
 
-    const longAssistant = Array.from({ length: 40 }, (_, i) => `Line ${i + 1} of transcript body.`).join(
-      '\n',
-    );
-
     await postSnapshot(page, {
       type: 'snapshot',
       rootTasks: [root],
@@ -4900,44 +4898,27 @@ test.describe('Owning-root task tree navigation', () => {
       subtree: [root, childA, childB],
       transcript: [
         { id: 'msg-u', kind: 'user', content: 'Kick off children' },
-        { id: 'msg-a', kind: 'assistant', content: longAssistant },
+        { id: 'msg-a', kind: 'assistant', content: 'Coordinator reply.' },
       ],
       storeRevision: 900,
     });
 
-    await expect(page.getByTestId('task-tree-nav')).toBeVisible();
+    await expect(page.getByTestId('task-chrome')).toBeVisible();
     await expect(page.getByTestId('task-tree-summary')).toContainText('Tasks 3');
 
-    const scrollRegion = page.locator('.task-workspace-main .overflow-y-auto').first();
-    await scrollRegion.evaluate((el) => {
-      el.scrollTop = 80;
-    });
-    const scrollBefore = await scrollRegion.evaluate((el) => el.scrollTop);
-    expect(scrollBefore).toBeGreaterThan(0);
-
-    const composer = page.getByPlaceholder(/Message coord-root|Message|Continue|Ask/i).first();
-    // Prefer task composer placeholder when available.
     const taskComposer = page.locator('textarea.composer-input__textarea, textarea').last();
     await taskComposer.fill('draft stays while tree open');
 
     await page.getByTestId('task-tree-summary').click();
-    await expect(page.getByTestId('task-tree-panel')).toBeVisible();
-
-    await scrollRegion.evaluate((el) => {
-      el.scrollTop = 400;
-    });
-    await expect
-      .poll(async () => scrollRegion.evaluate((el) => el.scrollTop))
-      .toBe(scrollBefore);
+    await expect(page.getByTestId('task-chrome-tree')).toBeVisible();
+    await expect(page.getByTestId('task-tree-row').filter({ hasText: 'Auth worker' })).toBeVisible();
+    // Expand body is tree, not seal prose primary.
+    await expect(page.getByTestId('task-chrome-tree').getByText(/authorized actor sealed/i)).toHaveCount(0);
 
     await expect(taskComposer).toHaveValue('draft stays while tree open');
-
     await page.keyboard.press('Escape');
-    await expect(page.getByTestId('task-tree-panel')).toHaveCount(0);
+    await expect(page.getByTestId('task-chrome-tree')).toHaveCount(0);
     await expect(taskComposer).toHaveValue('draft stays while tree open');
-    await expect
-      .poll(async () => scrollRegion.evaluate((el) => el.scrollTop))
-      .toBe(scrollBefore);
 
     await page.getByTestId('task-tree-summary').click();
     await page.getByTestId('task-tree-row').filter({ hasText: 'Auth worker' }).click();
@@ -4955,7 +4936,6 @@ test.describe('Owning-root task tree navigation', () => {
       })
       .toBe(true);
 
-    // Host would normally reply with child snapshot; simulate isolation.
     await postSnapshot(page, {
       type: 'snapshot',
       rootTasks: [root],
@@ -4967,12 +4947,77 @@ test.describe('Owning-root task tree navigation', () => {
 
     await expect(page.getByText('only child transcript')).toBeVisible();
     await expect(page.getByText('Kick off children')).toHaveCount(0);
-    // Child focus: wide view shows breadcrumb; parent control always present in DOM
-    // (may be CSS-hidden when breadcrumb is shown).
-    await expect(page.getByTestId('task-tree-nav')).toBeVisible();
-    const hasCrumb = await page.getByTestId('task-tree-breadcrumb').count();
-    const hasParent = await page.getByTestId('task-tree-parent').count();
-    expect(hasCrumb + hasParent).toBeGreaterThan(0);
+    // Same owning-root hop: tree stays expanded; header shows child goal.
+    await expect(page.getByTestId('task-chrome-tree')).toBeVisible();
+    await expect(page.getByTestId('task-chrome')).toContainText('Auth worker');
+    await expect(taskComposer).toHaveValue('draft stays while tree open');
+
+    // Different multi-node root → collapse.
+    const otherRoot = task({
+      id: 'other-root',
+      role: 'coordinator',
+      goal: 'Other coordinator',
+      viewStatus: 'idle',
+    });
+    const otherChild = task({
+      id: 'other-child',
+      parentId: 'other-root',
+      role: 'worker',
+      goal: 'Other worker',
+      viewStatus: 'idle',
+    });
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [root, otherRoot],
+      focusedTaskId: 'other-root',
+      subtree: [otherRoot, otherChild],
+      transcript: [{ id: 'msg-o', kind: 'user', content: 'other root chat' }],
+      storeRevision: 902,
+    });
+    await expect(page.getByTestId('task-chrome')).toContainText('Other coordinator');
+    await expect(page.getByTestId('task-chrome-tree')).toHaveCount(0);
+  });
+
+  test('narrow viewport keeps Parent and primary actions without horizontal overflow', async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 280, height: 700 });
+    await openWebview(page);
+
+    const root = task({
+      id: 'coord-root',
+      role: 'coordinator',
+      goal: 'Coordinate multi-child work',
+      viewStatus: 'running',
+    });
+    const childA = task({
+      id: 'worker-a',
+      parentId: 'coord-root',
+      role: 'worker',
+      goal: 'Auth worker',
+      viewStatus: 'idle',
+    });
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [root],
+      focusedTaskId: 'worker-a',
+      subtree: [root, childA],
+      transcript: [{ id: 'msg-c', kind: 'user', content: 'child' }],
+      storeRevision: 910,
+    });
+
+    await expect(page.getByTestId('task-chrome')).toBeVisible();
+    await expect(page.getByTestId('task-tree-parent')).toBeVisible();
+    await expect(page.getByTestId('export-task-chat')).toBeVisible();
+    // Breadcrumb hidden at narrow width (display:none).
+    await expect(page.getByTestId('task-tree-breadcrumb')).toBeHidden();
+
+    const overflow = await page.evaluate(() => {
+      const doc = document.documentElement;
+      return doc.scrollWidth <= doc.clientWidth + 1;
+    });
+    expect(overflow).toBe(true);
   });
 });
 

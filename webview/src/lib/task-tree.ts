@@ -217,3 +217,51 @@ export function expandPathInCollapsed(
   }
   return next;
 }
+
+type SubtreeNode = { id: string; parentId: string | null };
+
+/**
+ * Owning-root id of focusedId within a projected subtree (parent links).
+ * Walks parentId until null or parent missing from set.
+ */
+export function owningRootIdFromSubtree(
+  focusedId: string,
+  subtree: readonly SubtreeNode[],
+): string | null {
+  if (subtree.length === 0) return null;
+  const byId = new Map(subtree.map((n) => [n.id, n]));
+  if (!byId.has(focusedId)) return null;
+  const visited = new Set<string>();
+  let current = focusedId;
+  while (true) {
+    if (visited.has(current)) return current;
+    visited.add(current);
+    const node = byId.get(current);
+    if (!node) return current;
+    if (node.parentId === null || !byId.has(node.parentId)) return current;
+    current = node.parentId;
+  }
+}
+
+/** Whether chrome tree expand should survive a focus/snapshot transition. */
+export function shouldKeepTreeExpanded(input: {
+  wasExpanded: boolean;
+  previousOwningRootId: string | null;
+  nextOwningRootId: string | null;
+  nextShowTaskNav: boolean;
+}): boolean {
+  return (
+    input.wasExpanded &&
+    input.nextShowTaskNav &&
+    input.previousOwningRootId != null &&
+    input.previousOwningRootId === input.nextOwningRootId
+  );
+}
+
+export function showTaskNavFor(
+  focused: { parentId: string | null } | null | undefined,
+  subtreeLength: number,
+): boolean {
+  if (!focused) return false;
+  return focused.parentId != null || subtreeLength > 1;
+}

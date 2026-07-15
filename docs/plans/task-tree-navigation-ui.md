@@ -1,6 +1,6 @@
 # Task tree navigation UI (hybrid chrome + transient panel)
 
-**Status:** plan — APPROVED (codex-plan-review 20260715-003); implementing I1→I3  
+**Status:** I1–I3 shipped; chrome unified by `docs/plans/task-chrome-unified-header.md`  
 **Audience:** implementer (webview + host snapshot)  
 **Evidence date:** 2026-07-15  
 **Decision source:** codex-think-about hybrid **C**

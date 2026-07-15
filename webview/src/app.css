@@ -322,16 +322,56 @@ body {
   border-left-color: var(--vscode-descriptionForeground);
 }
 
-/* Owning-root task tree navigation (I1). */
-.task-tree-nav {
+/* Unified task chrome (header + expand tree). */
+.task-chrome {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  min-width: 0;
+}
+
+.task-chrome__bar {
   display: flex;
   align-items: center;
   gap: 6px;
-  min-height: 32px;
-  max-height: 36px;
-  padding: 2px 8px;
-  border-bottom: 1px solid var(--vscode-panel-border);
-  background: var(--vscode-editor-background, transparent);
+  min-width: 0;
+  min-height: 28px;
+}
+
+.task-chrome__role {
+  flex-shrink: 0;
+  font-size: 14px;
+  opacity: 0.85;
+}
+
+.task-chrome__goal {
+  min-width: 0;
+}
+
+.task-chrome__meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid color-mix(in srgb, var(--vscode-panel-border) 80%, transparent);
+}
+
+.task-chrome__tree {
+  margin-top: 6px;
+  max-height: min(40vh, 280px);
+  overflow: auto;
+  border-top: 1px solid color-mix(in srgb, var(--vscode-panel-border) 80%, transparent);
+  padding-top: 4px;
+}
+
+.task-chrome__muted {
+  padding: 4px 8px 2px;
+  color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+  font-size: 11px;
+  line-height: 1.35;
+  opacity: 0.9;
 }
 
 .task-tree-nav__parent,

@@ -12,7 +12,10 @@ import {
   formatTaskTreeSummary,
   isTaskTreeActive,
   isTaskTreeNeedYou,
+  owningRootIdFromSubtree,
   parentSummary,
+  shouldKeepTreeExpanded,
+  showTaskNavFor,
   taskRoleIcon,
 } from './task-tree';
 
@@ -122,5 +125,59 @@ describe('buildTaskTree', () => {
     const opened = expandPathInCollapsed(collapsed, path);
     const flat = flattenTaskTreeCollapsible(tree, opened);
     expect(flat.map((n) => n.task.id)).toContain('deep');
+  });
+});
+
+describe('owning-root expand retention', () => {
+  it('resolves owning root from parent links', () => {
+    const nodes = [
+      summary({ id: 'root', role: 'coordinator' }),
+      summary({ id: 'a', parentId: 'root' }),
+      summary({ id: 'nested', parentId: 'a' }),
+    ];
+    expect(owningRootIdFromSubtree('nested', nodes)).toBe('root');
+    expect(owningRootIdFromSubtree('root', nodes)).toBe('root');
+    expect(owningRootIdFromSubtree('missing', nodes)).toBeNull();
+  });
+
+  it('keeps expand only for same owning root', () => {
+    expect(
+      shouldKeepTreeExpanded({
+        wasExpanded: true,
+        previousOwningRootId: 'root-a',
+        nextOwningRootId: 'root-a',
+        nextShowTaskNav: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldKeepTreeExpanded({
+        wasExpanded: true,
+        previousOwningRootId: 'root-a',
+        nextOwningRootId: 'root-b',
+        nextShowTaskNav: true,
+      }),
+    ).toBe(false);
+    expect(
+      shouldKeepTreeExpanded({
+        wasExpanded: true,
+        previousOwningRootId: 'root-a',
+        nextOwningRootId: 'root-a',
+        nextShowTaskNav: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldKeepTreeExpanded({
+        wasExpanded: false,
+        previousOwningRootId: 'root-a',
+        nextOwningRootId: 'root-a',
+        nextShowTaskNav: true,
+      }),
+    ).toBe(false);
+  });
+
+  it('showTaskNav requires parent or multi-node', () => {
+    expect(showTaskNavFor({ parentId: null }, 1)).toBe(false);
+    expect(showTaskNavFor({ parentId: null }, 2)).toBe(true);
+    expect(showTaskNavFor({ parentId: 'r' }, 1)).toBe(true);
   });
 });
