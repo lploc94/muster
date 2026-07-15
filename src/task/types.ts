@@ -159,6 +159,8 @@ export type TaskAttentionCode =
   // verify-gate-loop Phase A: producer verdict failed / never emitted.
   | 'verdict_failed'
   | 'verdict_missing'
+  /** A declared brief skill is known-absent on the task's backend (non-fatal). */
+  | 'skill_unavailable'
   | string;
 
 /** Durable child→parent question (P0.5 ask_parent). */
@@ -227,6 +229,12 @@ export interface TaskBriefV1 {
     hostRun?: boolean;
     emitVerdict?: boolean;
   };
+  /**
+   * Declared backend skills/slash-commands (bare validated names, no args).
+   * Injected as leading `/name` lines on the first-turn prompt when advertised
+   * by the backend; fail-closed on known-absent names.
+   */
+  skills?: string[];
   /** v1: only "summary" is meaningful for expected outputs. */
   expectedOutputs?: string[];
 }

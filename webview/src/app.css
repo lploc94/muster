@@ -384,12 +384,37 @@ body {
   opacity: 0.85;
 }
 
+.task-workspace-body {
+  position: relative;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.task-workspace-main {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
 .task-tree-panel {
   display: flex;
   flex-direction: column;
   max-height: min(40vh, 280px);
   border-bottom: 1px solid var(--vscode-panel-border);
   background: var(--vscode-sideBar-background, var(--vscode-editor-background));
+}
+
+.task-tree-panel--overlay {
+  position: absolute;
+  z-index: 30;
+  inset: 0 0 auto 0;
+  max-height: min(55vh, 360px);
+  border: 1px solid var(--vscode-menu-border, var(--vscode-panel-border));
+  border-radius: 0 0 4px 4px;
+  box-shadow: 0 8px 24px color-mix(in srgb, black 28%, transparent);
 }
 
 .task-tree-panel__header {

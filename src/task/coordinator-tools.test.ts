@@ -357,6 +357,42 @@ describe('coordinator-tools dispatch', () => {
     }
   });
 
+  it('maps brief.skills into CreateChildSpec (raw string array, no normalization here)', () => {
+    const result = dispatch(
+      'create_task',
+      {
+        opId: 'op-1',
+        goal: 'implement feature',
+        taskType: 'worker',
+        backend: 'grok',
+        brief: { kind: 'implement', skills: ['plan', 'review'] },
+      },
+      ctx(['create_task']),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && result.command.kind === 'create_task') {
+      expect(result.command.spec.brief).toEqual({
+        kind: 'implement',
+        skills: ['plan', 'review'],
+      });
+    }
+  });
+
+  it('rejects brief.skills that is not a string array', () => {
+    const result = dispatch(
+      'create_task',
+      {
+        opId: 'op-1',
+        goal: 'x',
+        taskType: 'worker',
+        backend: 'grok',
+        brief: { skills: [1, 2] },
+      },
+      ctx(['create_task']),
+    );
+    expect(result).toEqual({ ok: false, toolError: 'invalid create_task arguments' });
+  });
+
   it('rejects invalid brief.kind', () => {
     const result = dispatch(
       'create_task',

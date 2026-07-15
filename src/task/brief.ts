@@ -93,6 +93,7 @@ export type TaskBriefOverlay = {
     hostRun?: boolean;
     emitVerdict?: boolean;
   };
+  skills?: string[];
 };
 
 /**
@@ -109,6 +110,64 @@ function clampStringList(items: readonly string[] | undefined, itemMax = 500): s
     .slice(0, BRIEF_LIST_MAX_ITEMS)
     .map((s) => clampSection(s, itemMax))
     .filter((s) => s.length > 0);
+}
+
+/**
+ * Valid bare skill/command name. Rejects spaces, newlines, slashes, and control
+ * chars so a declared skill can never smuggle extra prompt lines (injection).
+ */
+export const SKILL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+/** Maximum number of skills a single brief may declare. */
+export const MAX_BRIEF_SKILLS = 8;
+
+/**
+ * Dedupe (case-sensitive) + preserve first-seen order + cap at MAX_BRIEF_SKILLS;
+ * drop non-strings and blanks. The NAME regex is NOT applied here — validation is
+ * deferred to injection time so we can distinguish invalid vs unavailable names
+ * for attention reporting. Returns undefined for a non-array or empty result.
+ */
+export function normalizeSkillNames(input: unknown): string[] | undefined {
+  if (!Array.isArray(input)) return undefined;
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const s of input) {
+    if (typeof s !== 'string') continue;
+    const t = s.trim();
+    if (!t || seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+    if (out.length >= MAX_BRIEF_SKILLS) break;
+  }
+  return out.length ? out : undefined;
+}
+
+export interface SkillResolution {
+  commandLines: string[];
+  unavailable: string[];
+}
+
+/**
+ * Resolve declared skills against a backend's advertised command set.
+ * - advertised === undefined → UNKNOWN backend → inject optimistically (valid names only).
+ * - advertised is a Set → KNOWN → strict: only inject names present in the set.
+ * A name failing SKILL_NAME_RE is never injected and is reported as unavailable.
+ */
+export function resolveSkillInvocation(
+  skills: readonly string[] | undefined,
+  advertised: ReadonlySet<string> | undefined,
+): SkillResolution {
+  const commandLines: string[] = [];
+  const unavailable: string[] = [];
+  for (const name of skills ?? []) {
+    if (!SKILL_NAME_RE.test(name)) {
+      unavailable.push(name);
+      continue;
+    }
+    const ok = advertised === undefined ? true : advertised.has(name);
+    if (ok) commandLines.push(`/${name}`);
+    else unavailable.push(name);
+  }
+  return { commandLines, unavailable };
 }
 
 /**
@@ -193,6 +252,9 @@ export function mergeBriefFromCreate(args: {
   ) {
     merged.verification = verification;
   }
+
+  const skills = normalizeSkillNames(o?.skills);
+  if (skills) merged.skills = skills;
 
   return merged;
 }
@@ -302,7 +364,7 @@ export function compileTaskPrompt(
 // ---------------------------------------------------------------------------
 
 export type AssembleFirstTurnResult =
-  | { ok: true; prompt: string; hostContext: HostContextV1 }
+  | { ok: true; prompt: string; hostContext: HostContextV1; unavailableSkills: string[] }
   | { ok: false; code: 'prompt_budget_exceeded'; message: string };
 
 export interface AssembleFirstTurnInput {
@@ -315,6 +377,11 @@ export interface AssembleFirstTurnInput {
   meta?: CompileTaskPromptMeta;
   /** Coordinator task-type summaries for first-turn host inject. */
   taskTypes?: BuildHostContextInput['taskTypes'];
+  /**
+   * Backend-advertised command/skill names for fail-closed skill injection.
+   * undefined → UNKNOWN backend → inject declared skills optimistically.
+   */
+  advertisedCommands?: ReadonlySet<string>;
 }
 
 /**
@@ -338,12 +405,26 @@ export function assembleFirstTurnPrompt(input: AssembleFirstTurnInput): Assemble
   const pins = input.resolvedInputs ?? [];
   const pinSection = formatPinnedInputsForPrompt(pins);
 
+  // Fail-closed skill injection resolved UP FRONT so the leading `/name` prefix is
+  // reserved in EVERY budget decision below — protected minimum, slim-host, AND
+  // optional-section packing — not just a final check. Otherwise optional sections
+  // could be kept that leave no room for the prefix, failing a prompt that would
+  // have fit by dropping an optional section. Known-absent / invalid names are not
+  // injected and are surfaced for engine attention. First turn only. `budget` is
+  // the space left for everything except the prefix.
+  const { commandLines, unavailable } = resolveSkillInvocation(
+    input.brief.skills,
+    input.advertisedCommands,
+  );
+  const skillPrefix = commandLines.length ? `${commandLines.join('\n')}\n\n` : '';
+  const budget = COMPILED_PROMPT_MAX - skillPrefix.length;
+
   // Protected minimum: host + role + objective (+ complete pins last if any)
   const minParts = [hostMd, role, objective];
   if (pinSection) minParts.push(pinSection);
   let minPrompt = minParts.join('\n\n');
 
-  if (minPrompt.length > COMPILED_PROMPT_MAX) {
+  if (minPrompt.length > budget) {
     // Drop coordinator catalog (backends/models) from host if present
     if (hostCtx.availableBackends !== undefined || hostCtx.models !== undefined) {
       const slim: HostContextV1 = {
@@ -355,11 +436,11 @@ export function assembleFirstTurnPrompt(input: AssembleFirstTurnInput): Assemble
       const slimParts = [hostMd, role, objective, ...(pinSection ? [pinSection] : [])];
       minPrompt = slimParts.join('\n\n');
     }
-    if (minPrompt.length > COMPILED_PROMPT_MAX) {
+    if (minPrompt.length > budget) {
       return {
         ok: false,
         code: 'prompt_budget_exceeded',
-        message: `First-turn prompt core (host+role+objective+pins) exceeds ${COMPILED_PROMPT_MAX} chars (${minPrompt.length})`,
+        message: `First-turn prompt core (host+role+objective+pins${skillPrefix ? '+skills' : ''}) exceeds ${COMPILED_PROMPT_MAX} chars (${minPrompt.length + skillPrefix.length})`,
       };
     }
   }
@@ -371,7 +452,7 @@ export function assembleFirstTurnPrompt(input: AssembleFirstTurnInput): Assemble
     const candidate = pinSection
       ? `${hostMd}\n\n${next}\n\n${pinSection}`
       : `${hostMd}\n\n${next}`;
-    if (candidate.length > COMPILED_PROMPT_MAX) break;
+    if (candidate.length > budget) break;
     briefBody = next;
   }
 
@@ -379,15 +460,20 @@ export function assembleFirstTurnPrompt(input: AssembleFirstTurnInput): Assemble
     ? `${hostMd}\n\n${briefBody}\n\n${pinSection}`
     : `${hostMd}\n\n${briefBody}`;
 
-  if (assembled.length > COMPILED_PROMPT_MAX) {
+  const prompt = skillPrefix ? `${skillPrefix}${assembled}` : assembled;
+
+  // Safety net: `assembled` is packed within `budget` = MAX - prefix, so the full
+  // prompt should already fit; this guards only against accounting drift.
+  if (prompt.length > COMPILED_PROMPT_MAX) {
     return {
       ok: false,
       code: 'prompt_budget_exceeded',
-      message: `First-turn prompt exceeds ${COMPILED_PROMPT_MAX} chars after assembly (${assembled.length})`,
+      message: `First-turn prompt exceeds ${COMPILED_PROMPT_MAX} chars after assembly (${prompt.length})`,
     };
   }
 
-  // Verify pin tags intact when pins present
+  // Verify pin tags intact when pins present (pins live in `assembled`; the skill
+  // prefix does not affect pin framing).
   if (pinSection) {
     for (const pin of pins) {
       const open = `<untrusted-input name="${pin.as}"`;
@@ -402,5 +488,5 @@ export function assembleFirstTurnPrompt(input: AssembleFirstTurnInput): Assemble
     }
   }
 
-  return { ok: true, prompt: assembled, hostContext: hostCtx };
+  return { ok: true, prompt, hostContext: hostCtx, unavailableSkills: unavailable };
 }

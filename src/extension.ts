@@ -9,6 +9,7 @@ import { makeBackend } from './backends/index';
 import {
   disposeSharedAcpClient,
   isAskLikeForm,
+  peekSharedAcpClient,
   setAcpDebugLogger,
   setElicitationController,
   setPermissionController,
@@ -2713,6 +2714,10 @@ export async function activate(context: vscode.ExtensionContext) {
       getHostEnvironment,
       workspaceFolder: resolveTaskCwd(),
       getTaskTypeRegistry,
+      // ACP skill invocation: read-only peek at the shared client's advertised
+      // command set (keyed by backend id == AcpAgentConfig.key). Never spawns.
+      getAdvertisedCommands: (backend: string) =>
+        peekSharedAcpClient(backend)?.getAdvertisedCommands(),
       emit: (event) => {
         try {
           provider.forwardTurnEvent(event);

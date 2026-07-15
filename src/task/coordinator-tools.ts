@@ -325,6 +325,7 @@ const BRIEF_OVERLAY_KEYS = new Set([
   'readPaths',
   'writePaths',
   'verification',
+  'skills',
 ]);
 
 function parseStringArray(value: unknown): string[] | undefined {
@@ -381,6 +382,11 @@ function parseBriefOverlay(value: unknown): TaskBriefOverlay | undefined {
       verification.manualChecks = list;
     }
     overlay.verification = verification;
+  }
+  if (value.skills !== undefined) {
+    const list = parseStringArray(value.skills);
+    if (!list) return undefined;
+    overlay.skills = list;
   }
   return overlay;
 }

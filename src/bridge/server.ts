@@ -131,6 +131,7 @@ const BRIEF_SCHEMA = {
       },
       additionalProperties: false,
     },
+    skills: { type: 'array', items: { type: 'string' }, maxItems: 8 },
   },
   additionalProperties: false,
 };

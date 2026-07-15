@@ -3,12 +3,16 @@ import {
   BRIEF_LIST_MAX_ITEMS,
   BRIEF_SECTION_MAX,
   COMPILED_PROMPT_MAX,
+  MAX_BRIEF_SKILLS,
+  SKILL_NAME_RE,
   TASK_BRIEF_KINDS,
   assembleFirstTurnPrompt,
   clampSection,
   compileTaskPrompt,
   isTaskBriefKind,
   mergeBriefFromCreate,
+  normalizeSkillNames,
+  resolveSkillInvocation,
   synthesizeBriefFromGoal,
 } from './brief';
 import {
@@ -323,5 +327,168 @@ describe('assembleFirstTurnPrompt', () => {
     expect(result.prompt).toContain(pinText);
     expect(result.prompt).toContain('</untrusted-input>');
     expect(result.prompt.length).toBeLessThanOrEqual(COMPILED_PROMPT_MAX);
+  });
+});
+
+describe('normalizeSkillNames', () => {
+  it('dedupes (case-sensitive) and preserves first-seen order', () => {
+    expect(normalizeSkillNames(['plan', 'review', 'plan', 'Plan'])).toEqual([
+      'plan',
+      'review',
+      'Plan',
+    ]);
+  });
+
+  it('trims whitespace and drops blanks / non-strings', () => {
+    expect(normalizeSkillNames(['  plan  ', '', '   ', 3, null, 'review'])).toEqual([
+      'plan',
+      'review',
+    ]);
+  });
+
+  it(`caps at MAX_BRIEF_SKILLS (${MAX_BRIEF_SKILLS})`, () => {
+    const many = Array.from({ length: 20 }, (_, i) => `s${i}`);
+    const out = normalizeSkillNames(many);
+    expect(out).toHaveLength(MAX_BRIEF_SKILLS);
+    expect(out?.[0]).toBe('s0');
+  });
+
+  it('returns undefined for a non-array or an empty result', () => {
+    expect(normalizeSkillNames(undefined)).toBeUndefined();
+    expect(normalizeSkillNames('plan')).toBeUndefined();
+    expect(normalizeSkillNames([])).toBeUndefined();
+    expect(normalizeSkillNames(['', '  '])).toBeUndefined();
+  });
+});
+
+describe('resolveSkillInvocation', () => {
+  it('UNKNOWN backend (undefined advertised): injects all valid names optimistically', () => {
+    const r = resolveSkillInvocation(['plan', 'review'], undefined);
+    expect(r.commandLines).toEqual(['/plan', '/review']);
+    expect(r.unavailable).toEqual([]);
+  });
+
+  it('KNOWN backend: injects only advertised names, others → unavailable', () => {
+    const r = resolveSkillInvocation(['plan', 'ghost'], new Set(['plan', 'other']));
+    expect(r.commandLines).toEqual(['/plan']);
+    expect(r.unavailable).toEqual(['ghost']);
+  });
+
+  it('KNOWN-but-empty set is fail-closed: nothing injected', () => {
+    const r = resolveSkillInvocation(['plan'], new Set());
+    expect(r.commandLines).toEqual([]);
+    expect(r.unavailable).toEqual(['plan']);
+  });
+
+  it('rejects names failing SKILL_NAME_RE (never a command line, even on UNKNOWN)', () => {
+    const bad = ['ok', 'has space', 'new\nline', '/slash', 'trailing;rm', '-leadingdash'];
+    const r = resolveSkillInvocation(bad, undefined);
+    expect(r.commandLines).toEqual(['/ok']);
+    expect(r.unavailable).toEqual(['has space', 'new\nline', '/slash', 'trailing;rm', '-leadingdash']);
+    expect(SKILL_NAME_RE.test('ok')).toBe(true);
+    expect(SKILL_NAME_RE.test('a.b_c-1')).toBe(true);
+  });
+
+  it('handles undefined skills', () => {
+    expect(resolveSkillInvocation(undefined, new Set(['x']))).toEqual({
+      commandLines: [],
+      unavailable: [],
+    });
+  });
+});
+
+describe('mergeBriefFromCreate — skills', () => {
+  it('carries normalized skills from overlay (dedup + order + cap)', () => {
+    const merged = mergeBriefFromCreate({
+      goal: 'Do the thing',
+      brief: { skills: ['plan', 'plan', '  review  ', ''] },
+    });
+    expect(merged.skills).toEqual(['plan', 'review']);
+  });
+
+  it('omits skills when overlay has none or only blanks', () => {
+    expect(mergeBriefFromCreate({ goal: 'g' }).skills).toBeUndefined();
+    expect(mergeBriefFromCreate({ goal: 'g', brief: { skills: [] } }).skills).toBeUndefined();
+  });
+});
+
+describe('assembleFirstTurnPrompt — skill injection', () => {
+  const baseInput = () => ({
+    snapshot: hostSnap(),
+    self: { taskId: 'c1', role: 'worker' as const, backend: 'opencode' },
+    brief: synthesizeBriefFromGoal('Implement X', undefined, 'implement'),
+  });
+
+  it('prepends `/name` lines then a blank line before the body (UNKNOWN backend)', () => {
+    const brief = synthesizeBriefFromGoal('Implement X', undefined, 'implement');
+    brief.skills = ['plan', 'review'];
+    const result = assembleFirstTurnPrompt({ ...baseInput(), brief });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.prompt.startsWith('/plan\n/review\n\n')).toBe(true);
+    expect(result.prompt.indexOf('/plan')).toBeLessThan(result.prompt.indexOf('# Muster host context'));
+    expect(result.unavailableSkills).toEqual([]);
+  });
+
+  it('no skills → prompt unchanged and unavailableSkills empty', () => {
+    const result = assembleFirstTurnPrompt(baseInput());
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.prompt.startsWith('/')).toBe(false);
+    expect(result.prompt.startsWith('# Muster host context')).toBe(true);
+    expect(result.unavailableSkills).toEqual([]);
+  });
+
+  it('KNOWN backend: injects only advertised skills and surfaces the rest', () => {
+    const brief = synthesizeBriefFromGoal('Implement X', undefined, 'implement');
+    brief.skills = ['plan', 'ghost'];
+    const result = assembleFirstTurnPrompt({
+      ...baseInput(),
+      brief,
+      advertisedCommands: new Set(['plan']),
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.prompt.startsWith('/plan\n\n')).toBe(true);
+    expect(result.prompt).not.toContain('/ghost');
+    expect(result.unavailableSkills).toEqual(['ghost']);
+  });
+
+  it('counts the skill prefix against COMPILED_PROMPT_MAX (prefix cannot bypass budget)', () => {
+    const brief = synthesizeBriefFromGoal('small objective');
+    // Oversized but SKILL_NAME_RE-valid name: without counting the prefix it would
+    // silently blow past the budget. UNKNOWN backend → optimistic inject attempted.
+    brief.skills = ['a'.repeat(COMPILED_PROMPT_MAX)];
+    const result = assembleFirstTurnPrompt({ ...baseInput(), brief });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.code).toBe('prompt_budget_exceeded');
+  });
+
+  it('reserves the prefix during optional-section packing: drops an optional section to fit, still succeeds', () => {
+    const brief = synthesizeBriefFromGoal('objective');
+    // A large optional section that fits comfortably WITHOUT a skill prefix.
+    brief.context = `CTX ${'c'.repeat(BRIEF_SECTION_MAX)}`;
+
+    // Baseline (no skills): the context section is kept.
+    const noSkill = assembleFirstTurnPrompt({ ...baseInput(), brief });
+    expect(noSkill.ok).toBe(true);
+    if (!noSkill.ok) return;
+    expect(noSkill.prompt).toContain('# Context');
+
+    // A large (SKILL_NAME_RE-valid) skill: prefix + context would blow the budget,
+    // so the packing must DROP the context section — but still succeed (not fail).
+    const skillName = 'a'.repeat(41_000);
+    brief.skills = [skillName];
+    const withSkill = assembleFirstTurnPrompt({
+      ...baseInput(),
+      brief,
+      advertisedCommands: new Set([skillName]),
+    });
+    expect(withSkill.ok).toBe(true);
+    if (!withSkill.ok) return;
+    expect(withSkill.prompt.startsWith(`/${skillName}\n\n`)).toBe(true);
+    expect(withSkill.prompt).not.toContain('# Context');
+    expect(withSkill.prompt.length).toBeLessThanOrEqual(COMPILED_PROMPT_MAX);
   });
 });

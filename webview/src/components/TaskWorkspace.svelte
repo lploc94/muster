@@ -368,11 +368,13 @@
       </div>
     {/if}
 
+    <div class="task-workspace-body" class:task-workspace-body--tree-open={treePanelOpen}>
     {#if treePanelOpen && showTaskNav}
       <div
         id="task-tree-panel"
-        class="task-tree-panel"
+        class="task-tree-panel task-tree-panel--overlay"
         role="dialog"
+        aria-modal="true"
         aria-label="Current task tree"
         data-testid="task-tree-panel"
       >
@@ -427,13 +429,13 @@
       </div>
     {/if}
 
+    <div class="task-workspace-main" inert={treePanelOpen ? true : undefined}>
     <!-- Single header card: title + status (replaces App header row 2) -->
     <div
       class={`task-workspace-banner task-workspace-banner--${bannerTone}`}
       data-task-lifecycle={focused.lifecycle}
       data-task-status={focused.lifecycle}
       data-details-expanded={detailsExpanded ? 'true' : 'false'}
-      inert={treePanelOpen ? true : undefined}
     >
       <div class="min-w-0 flex-1">
         <div class="flex items-center gap-2 min-w-0">
@@ -543,7 +545,7 @@
       </div>
     {/if}
 
-    <ChatThread />
+    <ChatThread scrollLocked={treePanelOpen} />
 
     {#if queuedTurnControls.length > 0}
       <div
@@ -714,6 +716,8 @@
       task={focused}
       {pendingAsk}
     />
+    </div><!-- /.task-workspace-main -->
+    </div><!-- /.task-workspace-body -->
   {:else}
     <div class="flex-1 flex items-center justify-center text-sm" style="opacity: 0.6;">
       Select a task or create a new one.

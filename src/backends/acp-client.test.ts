@@ -1,13 +1,19 @@
 import { EventEmitter } from 'events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  AcpClient,
   boundedPromptCancel,
+  disposeSharedAcpClient,
   encodeElicitationContent,
   encodeGrokAnswers,
+  extractCommandNames,
+  getSharedAcpClient,
   killProcessTree,
   normalizeAgentQuestions,
   parseElicitationCreate,
+  peekSharedAcpClient,
   terminateProcessTree,
+  type AcpAgentConfig,
   type KillableProcess,
   type PromptResult,
 } from './acp-client';
@@ -277,5 +283,186 @@ describe('RFD elicitation parse (via acp-client re-export)', () => {
         { '0': { selected: ['A'], freeText: null } },
       ),
     ).toEqual({ 'Pick one?': 'A' });
+  });
+});
+
+describe('AcpClient advertised commands (tri-state)', () => {
+  const config: AcpAgentConfig = {
+    key: 'fake-backend',
+    label: 'Fake',
+    command: 'noop',
+    args: [],
+  };
+
+  it('is undefined before any advertisement (UNKNOWN)', () => {
+    const client = new AcpClient(config);
+    expect(client.getAdvertisedCommands()).toBeUndefined();
+  });
+
+  it('records the advertised set and reflects it (KNOWN)', () => {
+    const client = new AcpClient(config);
+    client.recordAdvertisedCommands(['plan', 'review']);
+    const set = client.getAdvertisedCommands();
+    expect(set).toBeInstanceOf(Set);
+    expect(set?.has('plan')).toBe(true);
+    expect(set?.has('review')).toBe(true);
+    expect(set?.has('nope')).toBe(false);
+  });
+
+  it('records an empty list as a KNOWN-but-empty set (fail-closed), not undefined', () => {
+    const client = new AcpClient(config);
+    client.recordAdvertisedCommands([]);
+    const set = client.getAdvertisedCommands();
+    expect(set).toBeInstanceOf(Set);
+    expect(set?.size).toBe(0);
+  });
+
+  it('replaces the set on re-advertisement (agent re-sends the full list)', () => {
+    const client = new AcpClient(config);
+    client.recordAdvertisedCommands(['a', 'b']);
+    client.recordAdvertisedCommands(['c']);
+    const set = client.getAdvertisedCommands();
+    expect([...(set ?? [])]).toEqual(['c']);
+  });
+});
+
+describe('peekSharedAcpClient', () => {
+  afterEach(() => {
+    disposeSharedAcpClient();
+  });
+
+  it('returns undefined for a key that was never created (never spawns)', () => {
+    expect(peekSharedAcpClient('never-made')).toBeUndefined();
+  });
+
+  it('returns the shared client keyed by config.key after it exists', () => {
+    const config: AcpAgentConfig = {
+      key: 'peek-backend',
+      label: 'Peek',
+      command: 'noop',
+      args: [],
+    };
+    const created = getSharedAcpClient(config);
+    expect(peekSharedAcpClient('peek-backend')).toBe(created);
+  });
+});
+
+describe('extractCommandNames', () => {
+  it('extracts names from an array of { name } objects (ACP spec shape)', () => {
+    expect(
+      extractCommandNames({
+        sessionUpdate: 'available_commands_update',
+        commands: [{ name: 'plan', description: 'x' }, { name: 'review' }],
+      }),
+    ).toEqual(['plan', 'review']);
+  });
+
+  it('extracts names from an array of bare strings', () => {
+    expect(extractCommandNames({ commands: ['a', 'b'] })).toEqual(['a', 'b']);
+  });
+
+  it('returns [] for an empty array (KNOWN-but-empty advertisement)', () => {
+    expect(extractCommandNames({ commands: [] })).toEqual([]);
+  });
+
+  it('returns [] when the commands field is missing', () => {
+    expect(extractCommandNames({ sessionUpdate: 'available_commands_update' })).toEqual([]);
+  });
+
+  it('returns [] when commands is not an array', () => {
+    expect(extractCommandNames({ commands: 'nope' })).toEqual([]);
+    expect(extractCommandNames({ commands: { name: 'x' } })).toEqual([]);
+  });
+
+  it('returns [] for non-object input without throwing (null / undefined / primitive)', () => {
+    expect(extractCommandNames(null)).toEqual([]);
+    expect(extractCommandNames(undefined)).toEqual([]);
+    expect(extractCommandNames('nope')).toEqual([]);
+    expect(extractCommandNames(42)).toEqual([]);
+  });
+
+  it('skips items with no usable name (null / non-string name / number)', () => {
+    expect(
+      extractCommandNames({
+        commands: [{ name: 'ok' }, null, { name: 42 }, {}, 7, { description: 'no name' }],
+      }),
+    ).toEqual(['ok']);
+  });
+});
+
+describe('AcpClient.onLine advertised-commands capture', () => {
+  const config: AcpAgentConfig = {
+    key: 'online-backend',
+    label: 'OnLine',
+    command: 'noop',
+    args: [],
+  };
+  const feed = (client: AcpClient, line: string): void => {
+    (client as unknown as { onLine(l: string): void }).onLine(line);
+  };
+
+  it('records available_commands_update even with NO session sink registered', () => {
+    // Reproduces the timing gap: the notification can arrive right after
+    // session/new, before runAcpTurn registers the session sink.
+    const client = new AcpClient(config);
+    expect(client.getAdvertisedCommands()).toBeUndefined();
+    feed(
+      client,
+      JSON.stringify({
+        method: 'session/update',
+        params: {
+          sessionId: 's-unregistered',
+          update: {
+            sessionUpdate: 'available_commands_update',
+            commands: [{ name: 'plan' }, { name: 'review' }],
+          },
+        },
+      }),
+    );
+    const set = client.getAdvertisedCommands();
+    expect(set).toBeInstanceOf(Set);
+    expect([...(set ?? [])].sort()).toEqual(['plan', 'review']);
+  });
+
+  it('records an empty advertisement as KNOWN-but-empty (not undefined)', () => {
+    const client = new AcpClient(config);
+    feed(
+      client,
+      JSON.stringify({
+        method: 'session/update',
+        params: { sessionId: 's', update: { sessionUpdate: 'available_commands_update', commands: [] } },
+      }),
+    );
+    expect(client.getAdvertisedCommands()?.size).toBe(0);
+  });
+
+  it('leaves the cache untouched for unrelated session updates', () => {
+    const client = new AcpClient(config);
+    feed(
+      client,
+      JSON.stringify({
+        method: 'session/update',
+        params: { sessionId: 's', update: { sessionUpdate: 'agent_message_chunk', content: {} } },
+      }),
+    );
+    expect(client.getAdvertisedCommands()).toBeUndefined();
+  });
+});
+
+describe('AcpClient advertised-commands lifecycle', () => {
+  const config: AcpAgentConfig = {
+    key: 'lifecycle-backend',
+    label: 'Lifecycle',
+    command: 'noop',
+    args: [],
+  };
+
+  it('drops the cache on process teardown (reconnect must re-advertise)', () => {
+    const client = new AcpClient(config);
+    client.recordAdvertisedCommands(['plan']);
+    expect(client.getAdvertisedCommands()?.has('plan')).toBe(true);
+    // teardownProcess is safe to call with no live process (rl/proc undefined).
+    (client as unknown as { teardownProcess(): void }).teardownProcess();
+    expect(client.getAdvertisedCommands()).toBeUndefined();
   });
 });

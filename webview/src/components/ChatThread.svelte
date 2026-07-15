@@ -5,6 +5,19 @@
   import MessageBubble from './MessageBubble.svelte';
   import ToolCard from './ToolCard.svelte';
   import { tip } from '../lib/tooltip';
+  import {
+    CHAT_SCROLL_BOTTOM_THRESHOLD_PX,
+    isNearBottom as isNearBottomMetrics,
+    pinnedAfterUnlock,
+    shouldAutoScrollToBottom,
+  } from '../lib/chat-scroll';
+
+  interface Props {
+    /** When true, freeze transcript scrollTop (e.g. task tree panel open). */
+    scrollLocked?: boolean;
+  }
+
+  let { scrollLocked = false }: Props = $props();
 
   const thread = $derived(threadStore.current);
   const currentBackend = $derived(tasks.focusedTask?.backend ?? 'unknown');
@@ -17,35 +30,69 @@
 
   let scrollEl: HTMLDivElement | undefined = $state();
   let pinned = $state(true);
-  const BOTTOM_THRESHOLD_PX = 80;
+  let frozenScrollTop: number | null = $state(null);
+  let wasScrollLocked = $state(false);
 
   function isNearBottom(el: HTMLElement): boolean {
-    return el.scrollHeight - el.scrollTop - el.clientHeight < BOTTOM_THRESHOLD_PX;
+    return isNearBottomMetrics(
+      el.scrollTop,
+      el.scrollHeight,
+      el.clientHeight,
+      CHAT_SCROLL_BOTTOM_THRESHOLD_PX,
+    );
   }
 
   function onScroll() {
-    if (scrollEl) pinned = isNearBottom(scrollEl);
+    if (!scrollEl || scrollLocked) return;
+    pinned = isNearBottom(scrollEl);
   }
 
   function scrollToBottom() {
-    if (scrollEl) {
+    if (scrollEl && !scrollLocked) {
       scrollEl.scrollTop = scrollEl.scrollHeight;
       pinned = true;
     }
   }
 
+  $effect(() => {
+    if (scrollLocked) {
+      if (!wasScrollLocked && scrollEl) {
+        frozenScrollTop = scrollEl.scrollTop;
+      }
+      wasScrollLocked = true;
+      if (scrollEl && frozenScrollTop !== null) {
+        scrollEl.scrollTop = frozenScrollTop;
+      }
+      return;
+    }
+    if (wasScrollLocked && scrollEl && frozenScrollTop !== null) {
+      scrollEl.scrollTop = frozenScrollTop;
+      pinned = pinnedAfterUnlock(
+        frozenScrollTop,
+        scrollEl.scrollHeight,
+        scrollEl.clientHeight,
+      );
+    }
+    wasScrollLocked = false;
+    frozenScrollTop = null;
+  });
+
   $effect.pre(() => {
     void thread.items.length;
     void thread.streaming?.text;
     void thread.revision;
-    if (scrollEl) pinned = isNearBottom(scrollEl);
+    if (scrollEl && !scrollLocked) pinned = isNearBottom(scrollEl);
   });
 
   $effect(() => {
     void thread.items.length;
     void thread.streaming?.text;
     void thread.revision;
-    if (scrollEl && pinned) scrollEl.scrollTop = scrollEl.scrollHeight;
+    if (scrollEl && shouldAutoScrollToBottom(pinned, scrollLocked)) {
+      scrollEl.scrollTop = scrollEl.scrollHeight;
+    } else if (scrollEl && scrollLocked && frozenScrollTop !== null) {
+      scrollEl.scrollTop = frozenScrollTop;
+    }
   });
 
   // Header (backend chip + reasoning) starts a response block.
