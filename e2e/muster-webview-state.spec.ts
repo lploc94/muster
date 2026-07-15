@@ -4897,6 +4897,8 @@ test.describe('Owning-root task tree navigation', () => {
     });
 
     await expect(page.getByTestId('task-chrome')).toBeVisible();
+    // Tasks control lives inside unified chrome (not a separate top strip).
+    await expect(page.getByTestId('task-chrome').getByTestId('task-tree-summary')).toBeVisible();
     await expect(page.getByTestId('task-tree-summary')).toContainText('Tasks 3');
 
     const taskComposer = page.locator('textarea.composer-input__textarea, textarea').last();
@@ -4945,7 +4947,78 @@ test.describe('Owning-root task tree navigation', () => {
     await expect(page.getByTestId('task-chrome')).toContainText('Auth worker');
     await expect(taskComposer).toHaveValue('draft stays while tree open');
 
+    // Breadcrumb (wide viewport) navigates up to coordinator.
+    await page.getByTestId('task-tree-breadcrumb-item').first().click();
+    await expect
+      .poll(async () => {
+        const messages = await postedMessages(page);
+        return messages.some(
+          (m) =>
+            typeof m === 'object' &&
+            m !== null &&
+            (m as { type?: string }).type === 'focusTask' &&
+            (m as { taskId?: string }).taskId === 'coord-root',
+        );
+      })
+      .toBe(true);
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [root],
+      focusedTaskId: 'coord-root',
+      subtree: [root, childA, childB],
+      transcript: [{ id: 'msg-back', kind: 'user', content: 'back on root' }],
+      storeRevision: 902,
+    });
+    // After ancestor hop within same root, tree still expanded.
+    await expect(page.getByTestId('task-chrome-tree')).toBeVisible();
+
+    // Solitary root snapshot → collapse (no multi-node nav).
+    const solitary = task({
+      id: 'solo-root',
+      role: 'coordinator',
+      goal: 'Solitary coordinator',
+      viewStatus: 'idle',
+    });
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [solitary],
+      focusedTaskId: 'solo-root',
+      subtree: [solitary],
+      transcript: [{ id: 'msg-solo', kind: 'user', content: 'solo chat' }],
+      storeRevision: 903,
+    });
+    await expect(page.getByTestId('task-chrome')).toContainText('Solitary coordinator');
+    await expect(page.getByTestId('task-chrome-tree')).toHaveCount(0);
+    await expect(page.getByTestId('task-tree-summary')).toHaveCount(0);
+
+    // Re-enter multi-node, expand, then draft mode collapses.
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [root],
+      focusedTaskId: 'coord-root',
+      subtree: [root, childA, childB],
+      transcript: [{ id: 'msg-r2', kind: 'user', content: 'again' }],
+      storeRevision: 904,
+    });
+    await page.getByTestId('task-tree-summary').click();
+    await expect(page.getByTestId('task-chrome-tree')).toBeVisible();
+    await page.getByRole('button', { name: 'New task' }).first().click();
+    await expect(page.getByText('First message creates the coordinator task.')).toBeVisible();
+    await expect(page.getByTestId('task-chrome-tree')).toHaveCount(0);
+
     // Different multi-node root → collapse.
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [root],
+      focusedTaskId: 'coord-root',
+      subtree: [root, childA, childB],
+      transcript: [{ id: 'msg-r3', kind: 'user', content: 'expand again' }],
+      storeRevision: 905,
+    });
+    await page.getByTestId('task-tree-summary').click();
+    await expect(page.getByTestId('task-chrome-tree')).toBeVisible();
+
     const otherRoot = task({
       id: 'other-root',
       role: 'coordinator',
@@ -4965,7 +5038,7 @@ test.describe('Owning-root task tree navigation', () => {
       focusedTaskId: 'other-root',
       subtree: [otherRoot, otherChild],
       transcript: [{ id: 'msg-o', kind: 'user', content: 'other root chat' }],
-      storeRevision: 902,
+      storeRevision: 906,
     });
     await expect(page.getByTestId('task-chrome')).toContainText('Other coordinator');
     await expect(page.getByTestId('task-chrome-tree')).toHaveCount(0);
@@ -5005,6 +5078,7 @@ test.describe('Owning-root task tree navigation', () => {
     await expect(page.getByTestId('export-task-chat')).toBeVisible();
     await expect(page.getByTestId('task-chrome')).toContainText('Auth worker');
     await expect(page.getByTestId('task-chrome').getByRole('button', { name: /Task status:/i })).toBeVisible();
+    await expect(page.getByTestId('task-tree-summary')).toBeVisible();
     // Breadcrumb hidden at narrow width (display:none).
     await expect(page.getByTestId('task-tree-breadcrumb')).toBeHidden();
 
@@ -5013,6 +5087,37 @@ test.describe('Owning-root task tree navigation', () => {
       return doc.scrollWidth <= doc.clientWidth + 1;
     });
     expect(overflow).toBe(true);
+  });
+
+  test('wide viewport can show breadcrumb path when nested', async ({ page }) => {
+    await page.setViewportSize({ width: 480, height: 700 });
+    await openWebview(page);
+
+    const root = task({
+      id: 'coord-root',
+      role: 'coordinator',
+      goal: 'Coordinate multi-child work',
+      viewStatus: 'running',
+    });
+    const childA = task({
+      id: 'worker-a',
+      parentId: 'coord-root',
+      role: 'worker',
+      goal: 'Auth worker',
+      viewStatus: 'idle',
+    });
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [root],
+      focusedTaskId: 'worker-a',
+      subtree: [root, childA],
+      transcript: [{ id: 'msg-c', kind: 'user', content: 'child' }],
+      storeRevision: 920,
+    });
+
+    await expect(page.getByTestId('task-tree-breadcrumb')).toBeVisible();
+    await expect(page.getByTestId('task-tree-breadcrumb')).toContainText('Coordinate');
   });
 });
 

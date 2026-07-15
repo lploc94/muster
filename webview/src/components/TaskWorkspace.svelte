@@ -95,6 +95,21 @@
     parts.push('Click to change status.');
     return parts.join(' ');
   });
+  /** At most two muted secondary lines under the expanded tree. */
+  const treeSecondaryLines = $derived.by((): string[] => {
+    if (!focused || !presentation) return [];
+    const lines: string[] = [];
+    if (runtime && runtime !== 'idle' && focused.lifecycle === 'open' && presentation.runtime) {
+      lines.push(`Orchestration: ${presentation.runtime.label}`);
+    }
+    if (focused.hasOutcomeProposal && focused.lifecycle === 'open') {
+      lines.push('Agent proposed done — task stays open; chat to continue.');
+    }
+    if (focused.continuationOf && lines.length < 2) {
+      lines.push('Continuation of prior task');
+    }
+    return lines.slice(0, 2);
+  });
   /** Preview source: thread user bubbles keyed by message id (host transcript projection). */
   const queuedTurnControls = $derived(
     tasks.queuedTurns.map((turn) =>
@@ -609,18 +624,12 @@
               </div>
             {/each}
           </div>
-          {#if runtime && runtime !== 'idle' && focused.lifecycle === 'open' && presentation.runtime}
-            <div class="task-chrome__muted" use:tip={presentation.runtime.workspaceDetail}>
-              Orchestration: {presentation.runtime.label}
+          {#if treeSecondaryLines.length > 0}
+            <div class="task-chrome__muted" data-testid="task-chrome-secondary">
+              {#each treeSecondaryLines as line, i (i)}
+                <div class="task-chrome__muted-line">{line}</div>
+              {/each}
             </div>
-          {/if}
-          {#if focused.hasOutcomeProposal && focused.lifecycle === 'open'}
-            <div class="task-chrome__muted">
-              Agent proposed done — task stays open; chat to continue.
-            </div>
-          {/if}
-          {#if focused.continuationOf}
-            <div class="task-chrome__muted" style="opacity: 0.55;">Continuation of prior task</div>
           {/if}
         </div>
       {/if}
