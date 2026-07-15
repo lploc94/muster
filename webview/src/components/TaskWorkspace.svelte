@@ -468,63 +468,10 @@
         {#if focused.backend}
           <span class="task-pill task-pill--muted shrink-0">{focused.backend}</span>
         {/if}
-      </div>
-
-      {#if showTaskNav}
-        <div class="task-chrome__meta" data-testid="task-tree-nav">
-          {#if focused.parentId}
-            {#if showBreadcrumb}
-              <nav
-                class="task-tree-nav__breadcrumb"
-                aria-label="Task path"
-                data-testid="task-tree-breadcrumb"
-              >
-                {#each crumbs as crumb, i (crumb.task.id)}
-                  {#if crumb.ellipsisBefore}
-                    <span class="task-tree-nav__crumb-sep" aria-hidden="true">…</span>
-                    <span class="task-tree-nav__crumb-sep" aria-hidden="true">›</span>
-                  {:else if i > 0}
-                    <span class="task-tree-nav__crumb-sep" aria-hidden="true">›</span>
-                  {/if}
-                  {#if crumb.task.id === focused.id}
-                    <span class="task-tree-nav__crumb task-tree-nav__crumb--current" aria-current="page">
-                      {shortGoal(crumb.task.goal)}
-                    </span>
-                  {:else}
-                    <button
-                      type="button"
-                      class="task-tree-nav__crumb"
-                      data-testid="task-tree-breadcrumb-item"
-                      data-task-id={crumb.task.id}
-                      use:tip={crumb.task.goal}
-                      onclick={() => navSelectTask(crumb.task.id)}
-                    >
-                      {shortGoal(crumb.task.goal)}
-                    </button>
-                  {/if}
-                {/each}
-              </nav>
-            {/if}
-            <button
-              type="button"
-              class="task-tree-nav__parent"
-              class:task-tree-nav__parent--narrow-only={showBreadcrumb}
-              data-testid="task-tree-parent"
-              aria-label={parentTask ? `Go to parent: ${parentTask.goal}` : 'Go to parent task'}
-              use:tip={parentTask?.goal ?? 'Parent task'}
-              onclick={goParent}
-            >
-              <span class="codicon codicon-arrow-up" aria-hidden="true"></span>
-              <span class="task-tree-nav__parent-label">
-                {parentTask ? shortGoal(parentTask.goal) : 'Parent'}
-              </span>
-            </button>
-          {:else}
-            <span class="task-tree-nav__parent task-tree-nav__parent--spacer" aria-hidden="true"></span>
-          {/if}
+        {#if showTaskNav}
           <button
             type="button"
-            class="task-tree-nav__summary"
+            class="task-tree-nav__summary task-chrome__tasks"
             data-testid="task-tree-summary"
             aria-expanded={treeExpanded ? 'true' : 'false'}
             aria-controls="task-chrome-tree"
@@ -534,13 +481,57 @@
           >
             <span class="codicon codicon-list-tree" aria-hidden="true"></span>
             <span class="task-tree-nav__summary-label">{treeSummaryLabel}</span>
-            <span
-              class="codicon"
-              class:codicon-chevron-up={treeExpanded}
-              class:codicon-chevron-down={!treeExpanded}
-              style="font-size: 11px; opacity: 0.75;"
-              aria-hidden="true"
-            ></span>
+          </button>
+        {/if}
+      </div>
+
+      {#if showTaskNav && focused.parentId}
+        <div class="task-chrome__meta" data-testid="task-tree-nav">
+          {#if showBreadcrumb}
+            <nav
+              class="task-tree-nav__breadcrumb"
+              aria-label="Task path"
+              data-testid="task-tree-breadcrumb"
+            >
+              {#each crumbs as crumb, i (crumb.task.id)}
+                {#if crumb.ellipsisBefore}
+                  <span class="task-tree-nav__crumb-sep" aria-hidden="true">…</span>
+                  <span class="task-tree-nav__crumb-sep" aria-hidden="true">›</span>
+                {:else if i > 0}
+                  <span class="task-tree-nav__crumb-sep" aria-hidden="true">›</span>
+                {/if}
+                {#if crumb.task.id === focused.id}
+                  <span class="task-tree-nav__crumb task-tree-nav__crumb--current" aria-current="page">
+                    {shortGoal(crumb.task.goal)}
+                  </span>
+                {:else}
+                  <button
+                    type="button"
+                    class="task-tree-nav__crumb"
+                    data-testid="task-tree-breadcrumb-item"
+                    data-task-id={crumb.task.id}
+                    use:tip={crumb.task.goal}
+                    onclick={() => navSelectTask(crumb.task.id)}
+                  >
+                    {shortGoal(crumb.task.goal)}
+                  </button>
+                {/if}
+              {/each}
+            </nav>
+          {/if}
+          <button
+            type="button"
+            class="task-tree-nav__parent"
+            class:task-tree-nav__parent--narrow-only={showBreadcrumb}
+            data-testid="task-tree-parent"
+            aria-label={parentTask ? `Go to parent: ${parentTask.goal}` : 'Go to parent task'}
+            use:tip={parentTask?.goal ?? 'Parent task'}
+            onclick={goParent}
+          >
+            <span class="codicon codicon-arrow-up" aria-hidden="true"></span>
+            <span class="task-tree-nav__parent-label">
+              {parentTask ? shortGoal(parentTask.goal) : 'Parent'}
+            </span>
           </button>
         </div>
       {/if}

@@ -348,13 +348,20 @@ body {
   min-width: 0;
 }
 
+/* Stick Tasks control to the right edge of the header bar. */
+.task-chrome__tasks {
+  margin-left: auto;
+  flex-shrink: 0;
+  max-width: 45%;
+}
+
 .task-chrome__meta {
   display: flex;
   align-items: center;
   gap: 6px;
-  min-height: 26px;
-  margin-top: 4px;
-  padding-top: 4px;
+  min-height: 22px;
+  margin-top: 2px;
+  padding-top: 2px;
   border-top: 1px solid color-mix(in srgb, var(--vscode-panel-border) 80%, transparent);
 }
 
@@ -413,8 +420,11 @@ body {
 }
 
 .task-tree-nav__summary {
-  margin-left: auto;
-  flex-shrink: 1;
+  flex-shrink: 0;
+  color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+}
+
+.task-chrome__tasks.task-tree-nav__summary {
   color: var(--vscode-descriptionForeground, var(--vscode-foreground));
 }
 
