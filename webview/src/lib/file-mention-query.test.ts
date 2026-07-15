@@ -71,11 +71,97 @@ describe('parseActiveFileMentionQuery', () => {
     expect(parseActiveFileMentionQuery('@foo\t', 5)).toBeNull();
   });
 
-  it('ignores unsupported traversal for S01 (parentDepth remains 0-only)', () => {
-    expect(parseActiveFileMentionQuery('@../', 4)).toBeNull();
-    expect(parseActiveFileMentionQuery('@../../x', 8)).toBeNull();
+  it('parses @../ as parentDepth 1 with empty relative query and exact range', () => {
+    const text = 'see @../';
+    const caret = text.length;
+    expect(parseActiveFileMentionQuery(text, caret)).toEqual({
+      start: 4,
+      end: caret,
+      parentDepth: 1,
+      relativeQuery: '',
+    });
+  });
+
+  it('parses @../../ as parentDepth 2 with empty relative query and exact range', () => {
+    const text = 'open @../../';
+    const caret = text.length;
+    expect(parseActiveFileMentionQuery(text, caret)).toEqual({
+      start: 5,
+      end: caret,
+      parentDepth: 2,
+      relativeQuery: '',
+    });
+  });
+
+  it('accepts incomplete trailing parent segments without a slash', () => {
+    expect(parseActiveFileMentionQuery('@..', 3)).toEqual({
+      start: 0,
+      end: 3,
+      parentDepth: 1,
+      relativeQuery: '',
+    });
+    expect(parseActiveFileMentionQuery('@../..', 6)).toEqual({
+      start: 0,
+      end: 6,
+      parentDepth: 2,
+      relativeQuery: '',
+    });
+  });
+
+  it('preserves relative directory and basename query under parent scopes', () => {
+    expect(parseActiveFileMentionQuery('@../src', 7)).toEqual({
+      start: 0,
+      end: 7,
+      parentDepth: 1,
+      relativeQuery: 'src',
+    });
+    const grand = '@../../lib/util';
+    expect(parseActiveFileMentionQuery(grand, grand.length)).toEqual({
+      start: 0,
+      end: grand.length,
+      parentDepth: 2,
+      relativeQuery: 'lib/util',
+    });
+    // caret mid-token ends the replacement range and relative query at the caret
+    const text = 'go @../src/app more';
+    const caret = 'go @../src'.length;
+    expect(parseActiveFileMentionQuery(text, caret)).toEqual({
+      start: 3,
+      end: caret,
+      parentDepth: 1,
+      relativeQuery: 'src',
+    });
+  });
+
+  it('normalizes backslash parent prefixes to parentDepth', () => {
+    expect(parseActiveFileMentionQuery('@..\\', 4)).toEqual({
+      start: 0,
+      end: 4,
+      parentDepth: 1,
+      relativeQuery: '',
+    });
+    expect(parseActiveFileMentionQuery('@..\\foo', 7)).toEqual({
+      start: 0,
+      end: 7,
+      parentDepth: 1,
+      relativeQuery: 'foo',
+    });
+  });
+
+  it('rejects parent depth greater than 2', () => {
+    expect(parseActiveFileMentionQuery('@../../../', 10)).toBeNull();
+    expect(parseActiveFileMentionQuery('@../../../x', 11)).toBeNull();
+    expect(parseActiveFileMentionQuery('@../../..', 9)).toBeNull();
+  });
+
+  it('rejects embedded or repeated traversal outside leading parent prefixes', () => {
     expect(parseActiveFileMentionQuery('@src/../x', 9)).toBeNull();
+    expect(parseActiveFileMentionQuery('@../src/../x', 12)).toBeNull();
+    expect(parseActiveFileMentionQuery('@../../a/../b', 13)).toBeNull();
     expect(parseActiveFileMentionQuery('@./x', 4)).toBeNull();
+    expect(parseActiveFileMentionQuery('@.././x', 7)).toBeNull();
+    expect(parseActiveFileMentionQuery('@foo/./bar', 10)).toBeNull();
+    expect(parseActiveFileMentionQuery('@a//b', 5)).toBeNull();
   });
 
   it('ignores absolute roots, drive, and UNC-style prefixes', () => {
