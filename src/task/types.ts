@@ -5,6 +5,13 @@ export interface TaskDependency {
   taskId: string;
   requiredOutcome: 'succeeded' | 'settled';
   onUnsatisfied: 'block' | 'fail' | 'skip';
+  /**
+   * Opt-in verify gate (verify-gate-loop Phase A). When `'pass'`, the dependency is
+   * satisfied only if the producer's terminal outcome is met AND its verdict is
+   * `pass`; a fail/inconclusive/absent verdict routes to `onUnsatisfied`. Absent =
+   * today's behavior (no verdict gate).
+   */
+  requiredVerdict?: 'pass';
 }
 export type WaitWakeOn = 'terminal' | 'needs_attention';
 
@@ -57,8 +64,11 @@ export type OutcomeProposal =
 /** Draft tasks are not scheduler-eligible until atomic release. */
 export type TaskReleaseState = 'draft' | 'released';
 
-/** v1 binding output keys — only `summary` is produced by complete_task. */
-export type TaskResultOutputKey = 'summary';
+/**
+ * Binding output keys. `summary` is always produced by complete_task; `verdict`
+ * is an optional structured verify outcome (present only when a verify task emits it).
+ */
+export type TaskResultOutputKey = 'summary' | 'verdict';
 
 export interface TaskInputBinding {
   fromTaskId: string;
@@ -69,12 +79,61 @@ export interface TaskInputBinding {
   required?: boolean;
 }
 
+// ---------------------------------------------------------------------------
+// Structured verify verdict (verify-gate-loop Phase A). Additive + optional:
+// with no verdict emitted and no dependency requiring one, behavior is unchanged.
+// ---------------------------------------------------------------------------
+
+/** Tri-state verify outcome. `inconclusive` is the fail-closed default. */
+export type VerdictStatus = 'pass' | 'fail' | 'inconclusive';
+
+/** One checked acceptance-criterion / definition-of-done line. */
+export interface VerdictCriterion {
+  label: string;
+  status: VerdictStatus;
+  detail?: string;
+}
+
+/** Source-bound evidence for a host-run verification command (Phase C). */
+export interface VerdictEvidence {
+  command: string;
+  exitCode: number | null;
+  /** `pass` iff exitCode === 0. */
+  status: VerdictStatus;
+  durationMs?: number;
+  /** Clamped tail of stdout/stderr. */
+  observation?: string;
+}
+
+/**
+ * Structured verify outcome carried on a TaskResultV1. Emitted by a worker via
+ * `complete_task` (Phase A, `source:'worker'`); Phase C adds host-run evidence.
+ */
+export interface TaskVerdict {
+  status: VerdictStatus;
+  rationale?: string;
+  criteria?: VerdictCriterion[];
+  /** Who produced the verdict. A: 'worker'; C: 'host'. */
+  source: 'worker' | 'host';
+  /** C: source-revision token the verdict is bound to. */
+  testedRevision?: string;
+  /** C: host-run command results. */
+  evidence?: VerdictEvidence[];
+  /** ISO timestamp when the verdict was recorded. */
+  at: string;
+}
+
 /** Structured task outcome for dataflow. */
 export interface TaskResultV1 {
   version: 1;
   /** Monotonic per task; captured by dependents at pin time. */
   revision: number;
   summary: string;
+  /**
+   * Optional structured verify verdict (schema stays `version:1`; absent on
+   * legacy/implement tasks). Read by verdict-aware dependencies + verdict bindings.
+   */
+  verdict?: TaskVerdict;
 }
 
 /** Frozen binding resolution persisted on a turn before dispatch. */
@@ -97,6 +156,9 @@ export type TaskAttentionCode =
   | 'missing_input'
   | 'dependency_blocked'
   | 'recovery_exhausted'
+  // verify-gate-loop Phase A: producer verdict failed / never emitted.
+  | 'verdict_failed'
+  | 'verdict_missing'
   | string;
 
 /** Durable child→parent question (P0.5 ask_parent). */
@@ -150,7 +212,21 @@ export interface TaskBriefV1 {
   definitionOfDone?: string[];
   readPaths?: string[];
   writePaths?: string[];
-  verification?: { commands?: string[]; manualChecks?: string[] };
+  /**
+   * `commands`/`manualChecks` describe how to verify. `hostRun` (verify-gate-loop
+   * Phase C) is OPT-IN: when `true` on a verify task, the ENGINE runs `commands`
+   * on the host at settle and OVERRIDES the worker's self-reported verdict with a
+   * source-bound host verdict. Absent/false = worker self-report (Phase A), unchanged.
+   * `emitVerdict` (opt-in) asks a worker to self-report a structured verdict via
+   * `complete_task`; it only changes the compiled preamble (adds a `# Verdict`
+   * instruction). Absent/false = legacy verify preamble, unchanged.
+   */
+  verification?: {
+    commands?: string[];
+    manualChecks?: string[];
+    hostRun?: boolean;
+    emitVerdict?: boolean;
+  };
   /** v1: only "summary" is meaningful for expected outputs. */
   expectedOutputs?: string[];
 }
@@ -237,6 +313,14 @@ export interface MusterTask {
       askedAt: string;
     }
   >;
+  /**
+   * Bounded verify-remediation bookkeeping (verify-gate-loop Phase B). Tracks how
+   * many auto-remediations this task's failed verify gate has spent (`uses`), the
+   * last remediated failure signature (anti-thrash), and the id of the current
+   * remediation fix task (`fixTaskId`) so a terminally-failed fix re-enters the same
+   * bounded budget instead of hanging the gate forever. Absent = never remediated.
+   */
+  remediation?: { uses: number; lastFailureSig?: string; fixTaskId?: string };
   /** Who sealed lifecycle (user or coordinator). Required on every terminal seal going forward. */
   sealedBy?: TaskSealedBy;
   /**
@@ -370,7 +454,7 @@ export type TurnInput =
   | { kind: 'child_results'; taskIds: string[] }
   | { kind: 'recovery'; interruptedTurnId: string; instruction: string };
 export type TurnDisposition =
-  | { kind: 'complete'; result: string }
+  | { kind: 'complete'; result: string; verdict?: TaskVerdict }
   | { kind: 'fail'; error: string }
   | { kind: 'wait_tasks'; taskIds: string[] }
   | { kind: 'idle' };

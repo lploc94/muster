@@ -55,6 +55,11 @@
           "minimum": 1024,
           "description": "Maximum stored assistant output characters per settled turn on open tasks."
         },
+        "muster.verification.hostRun": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow the host to execute a task's verification commands (workspace-trusted, allowlisted runners only)."
+        },
         "muster.permissions.mode": {
           "type": "string",
           "enum": [

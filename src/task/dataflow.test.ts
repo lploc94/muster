@@ -59,6 +59,17 @@ describe('buildTaskResultFromSummary', () => {
     expect(second.revision).toBe(2);
     expect(second.summary).toBe('b');
   });
+
+  it('omits verdict when none is provided (byte-identical to legacy shape)', () => {
+    expect(buildTaskResultFromSummary('s')).toEqual({ version: 1, revision: 1, summary: 's' });
+    expect('verdict' in buildTaskResultFromSummary('s')).toBe(false);
+  });
+
+  it('persists a provided verdict on the result', () => {
+    const verdict = { status: 'pass', source: 'worker', at: 't0' } as const;
+    const r = buildTaskResultFromSummary('s', undefined, verdict);
+    expect(r.verdict).toEqual(verdict);
+  });
 });
 
 describe('effectiveTaskResult', () => {
@@ -122,6 +133,64 @@ describe('resolveInputBindings', () => {
     if (!result.ok) {
       expect(result.missing?.[0]?.fromTaskId).toBe('plan');
     }
+  });
+
+  it('resolves a verdict binding to rendered verdict text', () => {
+    const producers = {
+      verify: task({
+        id: 'verify',
+        lifecycle: 'succeeded',
+        taskResult: {
+          version: 1,
+          revision: 4,
+          summary: 'checked',
+          verdict: { status: 'fail', source: 'worker', at: 't0', rationale: 'unit tests failed' },
+        },
+      }),
+    };
+    const result = resolveInputBindings(
+      [{ fromTaskId: 'verify', output: 'verdict', as: 'verify_failure' }],
+      producers,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.pins[0].output).toBe('verdict');
+    expect(result.pins[0].producerResultRevision).toBe(4);
+    expect(result.pins[0].text).toContain('status: fail');
+    expect(result.pins[0].text).toContain('rationale: unit tests failed');
+  });
+
+  it('treats a required verdict binding as missing when the producer has no verdict', () => {
+    const producers = {
+      verify: task({
+        id: 'verify',
+        lifecycle: 'succeeded',
+        taskResult: { version: 1, revision: 1, summary: 'no verdict here' },
+      }),
+    };
+    const result = resolveInputBindings(
+      [{ fromTaskId: 'verify', output: 'verdict', as: 'v' }],
+      producers,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.missing?.[0]).toMatchObject({ fromTaskId: 'verify', output: 'verdict' });
+    }
+  });
+
+  it('skips an optional verdict binding when the producer has no verdict', () => {
+    const producers = {
+      verify: task({
+        id: 'verify',
+        lifecycle: 'succeeded',
+        taskResult: { version: 1, revision: 1, summary: 's' },
+      }),
+    };
+    const result = resolveInputBindings(
+      [{ fromTaskId: 'verify', output: 'verdict', as: 'v', required: false }],
+      producers,
+    );
+    expect(result).toEqual({ ok: true, pins: [] });
   });
 
   it('rejects non-summary output keys in v1', () => {
