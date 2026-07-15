@@ -24,6 +24,8 @@ const KIND_PREAMBLES: Readonly<Record<TaskBriefKind, string>> = {
   coordinate:
     'You are coordinating a multi-task workflow. Create a clear plan graph, wait for children, and seal only via host policy.',
   plan: 'You are a planning agent. Produce a concrete, actionable plan summary suitable for implementers.',
+  breakdown:
+    'You are a work-breakdown agent. Decompose the plan into an ordered checklist of small, independent implementation tasks. For each item give: a one-line goal, its taskType, which earlier items it depends on, which earlier outputs it consumes, and acceptance criteria. Prefer parallelizable, minimal items. Emit the checklist in a strict, compact, machine-readable form.',
   implement: 'You are an implementation agent. Apply the plan carefully; prefer minimal correct changes.',
   test: 'You are a testing agent. Verify behavior with the given checks; report failures clearly.',
   verify: 'You are a verification agent. Confirm acceptance criteria and definition of done.',
@@ -61,6 +63,7 @@ export function synthesizeBriefFromGoal(
 export const TASK_BRIEF_KINDS: readonly TaskBriefKind[] = [
   'coordinate',
   'plan',
+  'breakdown',
   'implement',
   'test',
   'verify',

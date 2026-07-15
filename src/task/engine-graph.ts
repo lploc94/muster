@@ -7,7 +7,7 @@ import type { Backend } from '../types';
 import { canBindTaskToBackend } from './backend-eligibility';
 import { mergeBriefFromCreate } from './brief';
 import { capabilitiesFor } from './capabilities';
-import type { ToolCommand } from './coordinator-tools';
+import { BATCH_EXPAND_MAX, type BatchChildSpec, type ToolCommand } from './coordinator-tools';
 import { validateBindingsForRelease } from './dataflow';
 import {
   buildHostContext,
@@ -53,7 +53,16 @@ import {
   type CreateTaskInput,
 } from './transitions';
 import type { DepGraph } from './deps';
-import type { MusterTask, OpResult, TaskCapability, TaskExecutionPolicy, TaskStoreFile, TaskTurn } from './types';
+import type {
+  MusterTask,
+  OpResult,
+  TaskCapability,
+  TaskDependency,
+  TaskExecutionPolicy,
+  TaskInputBinding,
+  TaskStoreFile,
+  TaskTurn,
+} from './types';
 
 export function deriveEntityId(callerTurnId: string, opId: string, suffix: string): string {
   const hash = createHash('sha256').update(`${callerTurnId}:${opId}:${suffix}`).digest('hex').slice(0, 16);
@@ -287,6 +296,37 @@ export function cleanupTurnResources(
 
 function actionForCommand(command: ToolCommand): string {
   return command.kind;
+}
+
+/**
+ * Topologically order batch localIds so every prerequisite precedes its
+ * dependents. `prereqs` maps a localId to the set of sibling localIds it waits
+ * for (dependsOn ∪ intra-batch inputBinding producers). Returns `undefined` when
+ * the intra-batch DAG contains a cycle (whole batch is then rejected).
+ */
+function topoSortLocalIds(
+  localIds: readonly string[],
+  prereqs: ReadonlyMap<string, ReadonlySet<string>>,
+): string[] | undefined {
+  const order: string[] = [];
+  // 0 = unvisited, 1 = on stack (visiting), 2 = done
+  const state = new Map<string, 0 | 1 | 2>();
+  const visit = (id: string): boolean => {
+    const s = state.get(id) ?? 0;
+    if (s === 2) return true;
+    if (s === 1) return false; // back-edge → cycle
+    state.set(id, 1);
+    for (const p of prereqs.get(id) ?? []) {
+      if (!visit(p)) return false;
+    }
+    state.set(id, 2);
+    order.push(id);
+    return true;
+  };
+  for (const id of localIds) {
+    if (!visit(id)) return undefined;
+  }
+  return order;
 }
 
 export async function executeToolCommand(
@@ -545,6 +585,338 @@ export async function executeToolCommand(
 
       const ledger = deps.store.getFile().operations?.[opLedgerKey(ctx.turnId, command.opId)];
       return { ok: true, result: ledger?.result.data };
+    }
+
+    case 'create_tasks':
+    case 'delegate_tasks': {
+      const isDelegate = command.kind === 'delegate_tasks';
+
+      // Reject an over-cap batch before any resolution or write (dispatch also caps).
+      if (command.specs.length === 0 || command.specs.length > BATCH_EXPAND_MAX) {
+        return {
+          ok: false,
+          error: JSON.stringify({
+            code: 'batch_too_large',
+            message: `batch exceeds max of ${BATCH_EXPAND_MAX} tasks`,
+          }),
+        };
+      }
+
+      // Derive stable ids for every item up front so intra-batch references resolve.
+      const idByLocal = new Map<string, string>();
+      const turnIdByLocal = new Map<string, string>();
+      for (const spec of command.specs) {
+        idByLocal.set(spec.localId, deriveEntityId(ctx.turnId, command.opId, `task:${spec.localId}`));
+        turnIdByLocal.set(spec.localId, deriveEntityId(ctx.turnId, command.opId, `turn:${spec.localId}`));
+      }
+
+      interface ResolvedBatchItem {
+        spec: BatchChildSpec;
+        childId: string;
+        turnId: string;
+        role: import('./types').TaskRole;
+        backend: string;
+        model?: string;
+        taskType: string;
+        briefKind: import('./types').TaskBriefKind;
+      }
+
+      // Build intra-batch prerequisite edges (dependsOn ∪ intra-batch binding producers)
+      // and topo-sort so producers are inserted before consumers. Reject cycles.
+      const localIds = command.specs.map((s) => s.localId);
+      const prereqs = new Map<string, Set<string>>();
+      for (const spec of command.specs) {
+        const set = new Set<string>();
+        for (const dep of spec.dependsOn ?? []) set.add(dep);
+        for (const binding of spec.inputBindings ?? []) {
+          if (binding.fromLocalId !== undefined) set.add(binding.fromLocalId);
+        }
+        prereqs.set(spec.localId, set);
+      }
+      const order = topoSortLocalIds(localIds, prereqs);
+      if (!order) {
+        return {
+          ok: false,
+          error: JSON.stringify({
+            code: 'batch_cycle',
+            message: 'intra-batch dependency cycle detected',
+          }),
+        };
+      }
+
+      // Deterministic output ordering (spec order), independent of topo insertion order.
+      const orderedTaskIds = command.specs.map((s) => idByLocal.get(s.localId)!);
+      const orderedTurnIds = command.specs.map((s) => turnIdByLocal.get(s.localId)!);
+
+      const commit = deps.store.commit((draft) => {
+        ensureCoordinationMaps(draft);
+        // Idempotent replay: a cached ledger for this (turn, opId) short-circuits
+        // before any caller/config check or write. Compare the fingerprint so a reused
+        // opId with different arguments conflicts instead of silently succeeding with
+        // the wrong result (the batch's ids are argument-derived, so a coarse existence
+        // check could otherwise return another op's tasks and schedule phantom turns).
+        const priorLedger = readLedger(draft, ctx.turnId, command.opId);
+        if (priorLedger) {
+          if (priorLedger.fingerprint !== fingerprint) {
+            return { ok: false, reason: 'opId conflict: different arguments' };
+          }
+          return { ok: true };
+        }
+        const caller = draft.tasks[ctx.callerTaskId];
+        if (!caller || caller.lifecycle !== 'open') {
+          return { ok: false, reason: 'caller task not open' };
+        }
+
+        // Delegate runs/releases work — requires a trusted workspace. Checked here (not
+        // pre-commit) so the fresh ledger above is the authoritative replay/conflict
+        // decision before any time-varying validation can reject a legitimate replay.
+        if (isDelegate && deps.isWorkspaceTrusted && !deps.isWorkspaceTrusted()) {
+          return {
+            ok: false,
+            reason: JSON.stringify({
+              code: 'workspace_untrusted',
+              message: 'workspace is not trusted; cannot run or release tasks',
+              retryable: true,
+            }),
+          };
+        }
+
+        // Resolve task type + backend eligibility for every item against the fresh,
+        // under-lock draft (fail-closed). After the ledger short-circuit, so a replay
+        // never re-validates and a stale outer (in-memory) check cannot fail it. The
+        // structured error is carried in `reason`, surfaced verbatim via commit.detail.
+        const registryCwd =
+          (caller.cwd && caller.cwd.length > 0 ? caller.cwd : undefined) ?? deps.workspaceFolder;
+        const registryResult: TaskTypeRegistryResult = deps.getTaskTypeRegistry
+          ? deps.getTaskTypeRegistry(registryCwd)
+          : parseTaskTypeRegistry(undefined);
+        const resolvedByLocal = new Map<string, ResolvedBatchItem>();
+        for (const spec of command.specs) {
+          const resolved = resolveCreateChildSpec(
+            {
+              taskType: spec.taskType,
+              backend: spec.backend,
+              model: spec.model,
+              role: spec.role,
+              briefKind: spec.brief?.kind,
+            },
+            registryResult,
+          );
+          if (!resolved.ok) {
+            return {
+              ok: false,
+              reason: JSON.stringify({
+                code: resolved.code,
+                message: resolved.message,
+                localId: spec.localId,
+              }),
+            };
+          }
+          if (!isKnownBackendId(resolved.resolved.backend)) {
+            return {
+              ok: false,
+              reason: JSON.stringify({
+                code: 'backend_unsupported',
+                message: `unsupported backend: ${resolved.resolved.backend}`,
+                localId: spec.localId,
+              }),
+            };
+          }
+          let backend: Backend;
+          try {
+            backend = deps.makeBackend(resolved.resolved.backend);
+          } catch {
+            return {
+              ok: false,
+              reason: JSON.stringify({
+                code: 'backend_unsupported',
+                message: `unsupported backend: ${resolved.resolved.backend}`,
+                localId: spec.localId,
+              }),
+            };
+          }
+          if (!canBindTaskToBackend(backend.capabilities)) {
+            return {
+              ok: false,
+              reason: JSON.stringify({
+                code: 'backend_not_mcp',
+                message: 'backend does not support MCP',
+                localId: spec.localId,
+              }),
+            };
+          }
+          resolvedByLocal.set(spec.localId, {
+            spec,
+            childId: idByLocal.get(spec.localId)!,
+            turnId: turnIdByLocal.get(spec.localId)!,
+            role: resolved.resolved.role,
+            backend: resolved.resolved.backend,
+            model: resolved.resolved.model,
+            taskType: resolved.resolved.taskType,
+            briefKind: resolved.resolved.briefKind,
+          });
+        }
+
+        for (const item of resolvedByLocal.values()) {
+          if (draft.tasks[item.childId]) {
+            return { ok: false, reason: 'batch child id collision' };
+          }
+        }
+
+        const rootId = findRootId(draft, ctx.callerTaskId);
+        const parentDepth = taskDepth(draft, ctx.callerTaskId);
+        const n = command.specs.length;
+        if (parentDepth + 1 >= limits.maxDepth) {
+          return { ok: false, reason: 'max depth exceeded' };
+        }
+        if (countChildren(draft, ctx.callerTaskId) + n > limits.maxChildrenPerTask) {
+          return { ok: false, reason: 'max children per task exceeded' };
+        }
+        if (countRootChildren(draft, rootId) + n > limits.maxChildrenPerRoot) {
+          return { ok: false, reason: 'max children per root exceeded' };
+        }
+
+        // Insert in topo order so depGraphFromFile(draft) sees prerequisite siblings.
+        for (const localId of order) {
+          const item = resolvedByLocal.get(localId)!;
+          const spec = item.spec;
+
+          // Resolved dependencies: sibling dependsOn (succeeded/block) + pre-existing
+          // dependencies + auto-derived succeeded/block per intra-batch binding (dedup by id).
+          // Caller-supplied dependencies on pre-existing tasks go in first; the
+          // intra-batch guarantees below then override unconditionally, so a weaker
+          // explicit dep on a sibling id cannot subvert the required succeeded/block
+          // wait that dependsOn / an intra-batch inputBinding must enforce.
+          const depMap = new Map<string, TaskDependency>();
+          for (const dep of spec.dependencies ?? []) {
+            depMap.set(dep.taskId, dep);
+          }
+          for (const sib of spec.dependsOn ?? []) {
+            const depId = idByLocal.get(sib)!;
+            depMap.set(depId, { taskId: depId, requiredOutcome: 'succeeded', onUnsatisfied: 'block' });
+          }
+
+          const bindings: TaskInputBinding[] = [];
+          for (const binding of spec.inputBindings ?? []) {
+            const fromTaskId =
+              binding.fromLocalId !== undefined
+                ? idByLocal.get(binding.fromLocalId)!
+                : binding.fromTaskId!;
+            bindings.push({
+              fromTaskId,
+              output: binding.output,
+              as: binding.as,
+              ...(binding.required !== undefined ? { required: binding.required } : {}),
+            });
+            // An intra-batch binding producer must be waited for (succeeded/block),
+            // overriding any weaker explicit dep the caller set on that sibling.
+            if (binding.fromLocalId !== undefined) {
+              depMap.set(fromTaskId, {
+                taskId: fromTaskId,
+                requiredOutcome: 'succeeded',
+                onUnsatisfied: 'block',
+              });
+            }
+          }
+          const dependencies = [...depMap.values()];
+
+          const bindingCheck = validateBindingsForRelease(bindings.length > 0 ? bindings : undefined);
+          if (!bindingCheck.ok) {
+            return { ok: false, reason: bindingCheck.reason };
+          }
+          const brief = mergeBriefFromCreate({
+            goal: spec.goal,
+            description: spec.description,
+            brief: spec.brief,
+            writePaths: spec.writePaths,
+            readPaths: spec.readPaths,
+            defaultKind: item.briefKind,
+          });
+          const input: CreateTaskInput = {
+            id: item.childId,
+            role: item.role,
+            goal: brief.objective || spec.goal,
+            description: spec.description,
+            parentId: ctx.callerTaskId,
+            dependencies,
+            backend: item.backend,
+            model: item.model,
+            taskType: item.taskType,
+            cwd: caller.cwd,
+            capabilities:
+              item.role === 'coordinator'
+                ? DEFAULT_COORDINATOR_CHILD_CAPS
+                : DEFAULT_WORKER_CAPS,
+            executionPolicy: clampExecutionPolicy(
+              DEFAULT_POLICY,
+              spec.executionPolicy,
+              deps.executionPolicyBounds,
+            ),
+            releaseState: isDelegate ? 'released' : 'draft',
+            brief,
+            ...(bindings.length > 0 ? { inputBindings: bindings } : {}),
+            ...(spec.claimsGit !== undefined ? { claimsGit: spec.claimsGit } : {}),
+          };
+          // Live graph: sees already-inserted siblings in this same batch.
+          const graph = depGraphFromFile(draft);
+          const created = createTask(input, { rootId, graph, now });
+          if (!created.ok) return created;
+          draft.tasks[item.childId] = isDelegate
+            ? { ...created.next, releasedAt: now, releaseAttemptId: command.opId }
+            : created.next;
+
+          if (isDelegate) {
+            const messageId = randomUUID();
+            draft.messages[messageId] = {
+              id: messageId,
+              taskId: item.childId,
+              role: 'user',
+              content: brief.objective || spec.goal,
+              state: 'assigned',
+              createdAt: now,
+              turnId: item.turnId,
+            };
+            const turnCheck = canCreateTurn(draft, item.childId, limits);
+            if (!turnCheck.ok) return turnCheck;
+            const started = transitionStartTask(draft.tasks[item.childId]!, [], {
+              turnId: item.turnId,
+              now,
+              inputs: [{ kind: 'message', messageId }],
+              trigger: 'engine',
+            });
+            if (!started.ok) return started;
+            draft.turns[item.turnId] = started.next;
+          }
+        }
+
+        const result: OpResult = {
+          ok: true,
+          data: {
+            taskIds: orderedTaskIds,
+            turnIds: isDelegate ? orderedTurnIds : [],
+          },
+        };
+        writeLedger(draft, ctx.turnId, command.opId, fingerprint, result);
+        return { ok: true };
+      });
+
+      if (!commit.ok) {
+        return { ok: false, error: commit.detail ?? commit.reason };
+      }
+
+      const batchLedger = deps.store.getFile().operations?.[opLedgerKey(ctx.turnId, command.opId)];
+      const ledgerData = batchLedger?.result.data as
+        | { taskIds?: string[]; turnIds?: string[] }
+        | undefined;
+      if (isDelegate) {
+        // Schedule from the ledger's turnIds — authoritative on both a fresh create and
+        // an idempotent replay. Using this command's derived ids would try to schedule
+        // phantom turns when a same-opId request short-circuits on an existing ledger.
+        for (const turnId of ledgerData?.turnIds ?? []) {
+          deps.onScheduleTurn(turnId);
+        }
+      }
+      return { ok: true, result: ledgerData };
     }
 
     case 'release_tasks': {

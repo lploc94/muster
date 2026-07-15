@@ -47,7 +47,7 @@ import {
   tryPromoteTurn,
   type GraphEngineDeps,
 } from './engine-graph';
-import type { ToolCommand } from './coordinator-tools';
+import { BATCH_EXPAND_MAX, type ToolCommand } from './coordinator-tools';
 import { evaluateTaskReadiness } from './readiness';
 import { canPromoteTurn, dependencyTerminalOutcome } from './scheduler';
 import { canCreateTurn, DEFAULT_RESOURCE_LIMITS, type ResourceLimits } from './limits';
@@ -868,6 +868,8 @@ export class TaskEngine {
     if (
       kind === 'create_task' ||
       kind === 'delegate_task' ||
+      kind === 'create_tasks' ||
+      kind === 'delegate_tasks' ||
       kind === 'release_tasks' ||
       kind === 'complete_task' ||
       kind === 'fail_task'
@@ -883,6 +885,12 @@ export class TaskEngine {
               backend: command.spec.backend,
               model: command.spec.model ?? null,
               role: command.spec.role ?? null,
+            }
+          : {}),
+        ...(kind === 'create_tasks' || kind === 'delegate_tasks'
+          ? {
+              count: command.specs.length,
+              localIds: command.specs.map((s) => s.localId).slice(0, BATCH_EXPAND_MAX),
             }
           : {}),
         ...(kind === 'release_tasks'

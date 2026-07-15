@@ -108,6 +108,7 @@ export type TaskSealedBy =
 export type TaskBriefKind =
   | 'coordinate'
   | 'plan'
+  | 'breakdown'
   | 'implement'
   | 'test'
   | 'verify'

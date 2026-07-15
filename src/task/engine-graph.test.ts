@@ -13,6 +13,7 @@ import {
 } from './limits';
 import { TaskStore } from './store';
 import { parseTaskTypeRegistry } from './task-types';
+import { evaluateTaskReadiness } from './readiness';
 import type { Backend, BackendCapabilities, NormalizedEvent, RunOptions } from '../types';
 
 /** Default test registry so create/delegate with taskType resolves. */
@@ -1157,4 +1158,315 @@ describe('engine graph orchestration', () => {
     expect(Object.keys(store.getFile().tasks).length).toBe(before);
   });
 
+});
+
+describe('engine graph batch create/delegate', () => {
+  function startCoord(engine: TaskEngine, credentials: CredentialRegistry, actions: string[]) {
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child', 'wait_child', 'read_subtree', 'cancel_child'],
+    });
+    const started = engine.startTask('coord');
+    if (!started.ok) throw new Error('failed to start coord');
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId: started.value.turnId,
+      allowedActions: new Set(actions as import('./capabilities').ToolAction[]),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    return { turnId: started.value.turnId, ctx };
+  }
+
+  it('delegate_tasks atomically creates N children + N first turns; ledger idempotent on same opId', async () => {
+    const { store, engine, credentials } = makeHarness();
+    const { turnId, ctx } = startCoord(engine, credentials, ['delegate_tasks', 'complete_task']);
+
+    const result = await engine.handleToolCall(ctx, 'delegate_tasks', {
+      kind: 'delegate_tasks',
+      opId: 'op-batch',
+      specs: [
+        { localId: 'a', goal: 'first child', taskType: 'worker' },
+        { localId: 'b', goal: 'second child', taskType: 'worker' },
+      ],
+    });
+    expect(result.ok).toBe(true);
+    const aId = deriveEntityId(turnId, 'op-batch', 'task:a');
+    const bId = deriveEntityId(turnId, 'op-batch', 'task:b');
+    if (result.ok) {
+      const data = result.result as { taskIds: string[]; turnIds: string[] };
+      expect(data.taskIds).toEqual([aId, bId]);
+      expect(data.turnIds).toEqual([
+        deriveEntityId(turnId, 'op-batch', 'turn:a'),
+        deriveEntityId(turnId, 'op-batch', 'turn:b'),
+      ]);
+    }
+    expect(store.getTask(aId)?.parentId).toBe('coord');
+    expect(store.getTask(aId)?.releaseState).toBe('released');
+    expect(store.getTask(bId)?.releaseState).toBe('released');
+    expect(Object.values(store.getFile().turns).filter((t) => t.taskId === aId)).toHaveLength(1);
+    expect(Object.values(store.getFile().turns).filter((t) => t.taskId === bId)).toHaveLength(1);
+
+    const tasksAfterFirst = Object.keys(store.getFile().tasks).length;
+    const turnsAfterFirst = Object.keys(store.getFile().turns).length;
+    // Same opId → cached ledger, no new tasks/turns.
+    const again = await engine.handleToolCall(ctx, 'delegate_tasks', {
+      kind: 'delegate_tasks',
+      opId: 'op-batch',
+      specs: [
+        { localId: 'a', goal: 'first child', taskType: 'worker' },
+        { localId: 'b', goal: 'second child', taskType: 'worker' },
+      ],
+    });
+    expect(again.ok).toBe(true);
+    expect(Object.keys(store.getFile().tasks).length).toBe(tasksAfterFirst);
+    expect(Object.keys(store.getFile().turns).length).toBe(turnsAfterFirst);
+  });
+
+  it('create_tasks leaves every child as a draft with no turns', async () => {
+    const { store, engine, credentials } = makeHarness();
+    const { turnId, ctx } = startCoord(engine, credentials, ['create_tasks', 'complete_task']);
+    const result = await engine.handleToolCall(ctx, 'create_tasks', {
+      kind: 'create_tasks',
+      opId: 'op-batch',
+      specs: [
+        { localId: 'a', goal: 'first', taskType: 'worker' },
+        { localId: 'b', goal: 'second', taskType: 'worker' },
+      ],
+    });
+    expect(result.ok).toBe(true);
+    const aId = deriveEntityId(turnId, 'op-batch', 'task:a');
+    const bId = deriveEntityId(turnId, 'op-batch', 'task:b');
+    expect(store.getTask(aId)?.releaseState).toBe('draft');
+    expect(store.getTask(bId)?.releaseState).toBe('draft');
+    expect(Object.values(store.getFile().turns).filter((t) => t.taskId === aId)).toHaveLength(0);
+    expect(Object.values(store.getFile().turns).filter((t) => t.taskId === bId)).toHaveLength(0);
+    if (result.ok) {
+      const data = result.result as { turnIds: string[] };
+      expect(data.turnIds).toEqual([]);
+    }
+  });
+
+  it('rejects the whole batch and writes zero tasks when one item has a bad taskType', async () => {
+    const { store, engine, credentials } = makeHarness();
+    const { ctx } = startCoord(engine, credentials, ['create_tasks']);
+    const before = Object.keys(store.getFile().tasks).length;
+    const result = await engine.handleToolCall(ctx, 'create_tasks', {
+      kind: 'create_tasks',
+      opId: 'op-batch',
+      specs: [
+        { localId: 'good', goal: 'ok', taskType: 'worker' },
+        { localId: 'bad', goal: 'nope', taskType: 'does-not-exist' },
+      ],
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/unknown_task_type/);
+    expect(Object.keys(store.getFile().tasks).length).toBe(before);
+  });
+
+  it('rejects the whole batch and writes zero tasks when an intra-batch binding is invalid', async () => {
+    const { store, engine, credentials } = makeHarness();
+    const { ctx } = startCoord(engine, credentials, ['create_tasks']);
+    const before = Object.keys(store.getFile().tasks).length;
+    const result = await engine.handleToolCall(ctx, 'create_tasks', {
+      kind: 'create_tasks',
+      opId: 'op-batch',
+      specs: [
+        { localId: 'a', goal: 'producer', taskType: 'worker' },
+        {
+          localId: 'b',
+          goal: 'consumer',
+          taskType: 'worker',
+          // Non-summary output is fail-closed at bindings validation.
+          inputBindings: [{ fromLocalId: 'a', output: 'artifact' as 'summary', as: 'p' }],
+        },
+      ],
+    });
+    expect(result.ok).toBe(false);
+    expect(Object.keys(store.getFile().tasks).length).toBe(before);
+  });
+
+  it('rejects the whole batch when it exceeds maxChildrenPerTask (low limit override)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-graph-limit-'));
+    const store = TaskStore.load({ filePath: path.join(dir, '.muster-tasks.json') });
+    const credentials = new CredentialRegistry();
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: (name) => ({
+        name,
+        capabilities: MCP_CAPS,
+        async *run() {
+          yield { type: 'turnCompleted' };
+        },
+      }),
+      askBridge: new AskBridge(),
+      credentialRegistry: credentials,
+      bridgePort: 19999,
+      getTaskTypeRegistry: () => TEST_TASK_TYPES,
+      resourceLimits: {
+        maxDepth: 8,
+        maxChildrenPerTask: 2,
+        maxChildrenPerRoot: 64,
+        maxTurnsPerTask: 50,
+        maxConcurrentTurns: 4,
+        maxConcurrentPerRoot: 4,
+        maxConcurrentPerBackend: 2,
+        maxResultBytes: 16_384,
+        maxErrorBytes: 4_096,
+      },
+    });
+    const { ctx } = startCoord(engine, credentials, ['create_tasks']);
+    const before = Object.keys(store.getFile().tasks).length;
+    const result = await engine.handleToolCall(ctx, 'create_tasks', {
+      kind: 'create_tasks',
+      opId: 'op-batch',
+      specs: [
+        { localId: 'a', goal: 'x', taskType: 'worker' },
+        { localId: 'b', goal: 'y', taskType: 'worker' },
+        { localId: 'c', goal: 'z', taskType: 'worker' },
+      ],
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/max children per task/);
+    expect(Object.keys(store.getFile().tasks).length).toBe(before);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('rejects an intra-batch dependency cycle with zero writes', async () => {
+    const { store, engine, credentials } = makeHarness();
+    const { ctx } = startCoord(engine, credentials, ['create_tasks']);
+    const before = Object.keys(store.getFile().tasks).length;
+    const result = await engine.handleToolCall(ctx, 'create_tasks', {
+      kind: 'create_tasks',
+      opId: 'op-batch',
+      specs: [
+        { localId: 'a', goal: 'x', taskType: 'worker', dependsOn: ['b'] },
+        { localId: 'b', goal: 'y', taskType: 'worker', dependsOn: ['a'] },
+      ],
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/cycle/);
+    expect(Object.keys(store.getFile().tasks).length).toBe(before);
+  });
+
+  it('rejects worker delegate_tasks via tool handler with zero writes', async () => {
+    const { store, engine, credentials } = makeHarness();
+    engine.createTask({ id: 'root', goal: 'w', backend: 'grok', role: 'worker' });
+    const started = engine.startTask('root');
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    const token = credentials.issue({
+      rootId: 'root',
+      callerTaskId: 'root',
+      turnId: started.value.turnId,
+      // Worker credential never carries the batch action.
+      allowedActions: new Set(['complete_task', 'ask_user']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    const result = await engine.handleToolCall(ctx, 'delegate_tasks', {
+      kind: 'delegate_tasks',
+      opId: 'op-batch',
+      specs: [{ localId: 'a', goal: 'child', taskType: 'worker' }],
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error).toMatch(/not permitted/);
+    expect(Object.keys(store.getFile().tasks)).toEqual(['root']);
+  });
+
+  it('wires an intra-batch dependency + binding: consumer is held until producer succeeds, then pins its summary', async () => {
+    const { store, engine, credentials, resume } = makeHarness();
+    const { turnId, ctx } = startCoord(engine, credentials, [
+      'create_tasks',
+      'release_tasks',
+      'set_task_lifecycle',
+      'complete_task',
+    ]);
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Draft batch: B depends on + binds A.
+    const created = await engine.handleToolCall(ctx, 'create_tasks', {
+      kind: 'create_tasks',
+      opId: 'op-batch',
+      specs: [
+        { localId: 'a', goal: 'produce the plan', taskType: 'plan' },
+        {
+          localId: 'b',
+          goal: 'consume the plan',
+          taskType: 'implement',
+          dependsOn: ['a'],
+          inputBindings: [{ fromLocalId: 'a', output: 'summary', as: 'plan' }],
+        },
+      ],
+    });
+    expect(created.ok).toBe(true);
+    const aId = deriveEntityId(turnId, 'op-batch', 'task:a');
+    const bId = deriveEntityId(turnId, 'op-batch', 'task:b');
+
+    // Derived dependency + binding reference A's derived id.
+    expect(store.getTask(bId)?.dependencies).toEqual([
+      { taskId: aId, requiredOutcome: 'succeeded', onUnsatisfied: 'block' },
+    ]);
+    expect(store.getTask(bId)?.inputBindings).toEqual([
+      { fromTaskId: aId, output: 'summary', as: 'plan' },
+    ]);
+
+    // Release B while A is still open → B is held on the dependency.
+    const releasedB = await engine.handleToolCall(ctx, 'release_tasks', {
+      kind: 'release_tasks',
+      opId: 'op-rel-b',
+      taskIds: [bId],
+    });
+    expect(releasedB.ok).toBe(true);
+    const heldReadiness = evaluateTaskReadiness(store.getFile(), bId);
+    expect(heldReadiness.schedulable).toBe(false);
+    expect(heldReadiness.reasons.some((r) => r.code === 'waiting_dependencies')).toBe(true);
+
+    // Mark A released, then parent-seal A succeeded with a summary.
+    store.commit((draft) => {
+      draft.tasks[aId] = {
+        ...draft.tasks[aId]!,
+        releaseState: 'released',
+        revision: draft.tasks[aId]!.revision + 1,
+      };
+      return { ok: true };
+    });
+    const sealed = await engine.handleToolCall(ctx, 'set_task_lifecycle', {
+      kind: 'set_task_lifecycle',
+      opId: 'op-seal-a',
+      taskId: aId,
+      lifecycle: 'succeeded',
+      result: 'PLAN SUMMARY',
+    });
+    expect(sealed.ok).toBe(true);
+    expect(store.getTask(aId)?.taskResult?.summary).toBe('PLAN SUMMARY');
+
+    // A succeeded unblocks B; its first turn now freezes and pins A's summary.
+    let bTurn = Object.values(store.getFile().turns).find((t) => t.taskId === bId && t.sequence === 1);
+    for (let i = 0; i < 50 && bTurn?.resolvedInputs === undefined; i++) {
+      await new Promise((r) => setTimeout(r, 20));
+      bTurn = Object.values(store.getFile().turns).find((t) => t.taskId === bId && t.sequence === 1);
+    }
+    expect(bTurn?.resolvedInputs).toEqual([
+      {
+        as: 'plan',
+        fromTaskId: aId,
+        output: 'summary',
+        producerResultRevision: 1,
+        text: 'PLAN SUMMARY',
+      },
+    ]);
+
+    // Cleanup: drain coord + B turns.
+    engine.stageDisposition(turnId, { kind: 'idle' }, 'op-coord-idle');
+    if (bTurn && bTurn.status === 'running') {
+      engine.stageDisposition(bTurn.id, { kind: 'idle' }, 'op-b-idle');
+    }
+    resume();
+    await engine.whenIdle();
+  });
 });

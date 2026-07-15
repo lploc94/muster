@@ -33,6 +33,8 @@ export interface MusterBridgeServerOptions {
 const ALL_TOOLS: ToolAction[] = [
   'create_task',
   'delegate_task',
+  'create_tasks',
+  'delegate_tasks',
   'release_tasks',
   'list_task_types',
   'start_task',
@@ -83,7 +85,7 @@ const BRIEF_SCHEMA = {
   type: 'object',
   properties: {
     kind: {
-      enum: ['coordinate', 'plan', 'implement', 'test', 'verify', 'research', 'generic'],
+      enum: ['coordinate', 'plan', 'breakdown', 'implement', 'test', 'verify', 'research', 'generic'],
     },
     title: { type: 'string' },
     objective: { type: 'string' },
@@ -138,6 +140,47 @@ const CREATE_SPEC_PROPERTIES = {
   readPaths: { type: 'array', items: { type: 'string' } },
 };
 
+const BATCH_INPUT_BINDING_SCHEMA = {
+  type: 'object',
+  required: ['output', 'as'],
+  properties: {
+    /** Sibling localId producing the summary (XOR fromTaskId). */
+    fromLocalId: { type: 'string', minLength: 1 },
+    /** Pre-existing producer task id (XOR fromLocalId). */
+    fromTaskId: OP_ID,
+    output: { enum: ['summary'] },
+    as: { type: 'string', minLength: 1 },
+    required: { type: 'boolean' },
+  },
+  additionalProperties: false,
+};
+
+const BATCH_CHILD_SCHEMA = {
+  type: 'object',
+  required: ['localId', 'goal', 'taskType'],
+  properties: {
+    /** Unique-within-batch handle (same grammar as task type ids). */
+    localId: { type: 'string', minLength: 1, maxLength: 64, pattern: '^[a-z][a-z0-9_-]{0,63}$' },
+    goal: { type: 'string', minLength: 1 },
+    taskType: { type: 'string', minLength: 1 },
+    backend: { type: 'string', minLength: 1, maxLength: 200 },
+    model: { type: 'string', minLength: 1, maxLength: 200 },
+    role: { enum: ['coordinator', 'worker'] },
+    /** Sibling localIds this item waits for (→ succeeded/block dependency). */
+    dependsOn: { type: 'array', items: { type: 'string', minLength: 1 } },
+    /** Ordering edges onto pre-existing tasks in the same root. */
+    dependencies: { type: 'array', items: DEPENDENCY_SCHEMA },
+    executionPolicy: EXECUTION_POLICY_SCHEMA,
+    description: { type: 'string' },
+    brief: BRIEF_SCHEMA,
+    inputBindings: { type: 'array', items: BATCH_INPUT_BINDING_SCHEMA },
+    claimsGit: { type: 'boolean' },
+    writePaths: { type: 'array', items: { type: 'string' } },
+    readPaths: { type: 'array', items: { type: 'string' } },
+  },
+  additionalProperties: false,
+};
+
 const QUESTION_SCHEMA = {
   type: 'object',
   required: ['prompt'],
@@ -160,6 +203,24 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
     type: 'object',
     required: ['opId', 'goal', 'taskType'],
     properties: CREATE_SPEC_PROPERTIES,
+    additionalProperties: false,
+  },
+  create_tasks: {
+    type: 'object',
+    required: ['opId', 'tasks'],
+    properties: {
+      opId: OP_ID,
+      tasks: { type: 'array', minItems: 1, maxItems: 16, items: BATCH_CHILD_SCHEMA },
+    },
+    additionalProperties: false,
+  },
+  delegate_tasks: {
+    type: 'object',
+    required: ['opId', 'tasks'],
+    properties: {
+      opId: OP_ID,
+      tasks: { type: 'array', minItems: 1, maxItems: 16, items: BATCH_CHILD_SCHEMA },
+    },
     additionalProperties: false,
   },
   list_task_types: {
@@ -345,6 +406,8 @@ function createMcpServer(
               ? 'List configured muster.taskTypes presets (id, backend, model, role, briefKind). Create children by taskType; omit backend/model unless the user named an override.'
               : name === 'create_task' || name === 'delegate_task'
                 ? `Create a child by required taskType from muster.taskTypes (backend/model optional user overrides only). Tool: ${name}.`
+                : name === 'create_tasks' || name === 'delegate_tasks'
+                  ? `Batch-expand a structured checklist into up to 16 children in one atomic step: derives ids, topo-sorts intra-batch dependsOn/inputBindings (each item needs a unique localId), auto-wires a succeeded/block dependency per intra-batch binding. ${name === 'delegate_tasks' ? 'Releases and runs every child immediately.' : 'Leaves every child as a draft to release later.'} Tool: ${name}.`
                 : name === 'set_task_lifecycle'
                   ? "Parent-seal a direct child's lifecycle (succeeded/failed/…). Use when child did not complete_task."
                   : `Muster coordinator tool: ${name}`,

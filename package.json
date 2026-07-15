@@ -84,6 +84,11 @@
               "backend": "codex",
               "briefKind": "plan"
             },
+            "breakdown": {
+              "description": "Decompose a plan into a structured checklist of implement tasks",
+              "backend": "codex",
+              "briefKind": "breakdown"
+            },
             "implement": {
               "description": "Apply the plan with minimal correct changes",
               "backend": "grok",
@@ -115,7 +120,7 @@
               },
               "briefKind": {
                 "type": "string",
-                "enum": ["coordinate", "plan", "implement", "test", "verify", "research", "generic"],
+                "enum": ["coordinate", "plan", "breakdown", "implement", "test", "verify", "research", "generic"],
                 "description": "Default brief.kind preamble for children of this type."
               },
               "description": {

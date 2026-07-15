@@ -4,10 +4,12 @@ import type { TaskBriefOverlay } from './brief';
 import { BRIEF_SECTION_MAX, clampSection, isTaskBriefKind } from './brief';
 import type { ToolAction } from './capabilities';
 import { isAllowedBindingOutput } from './dataflow';
+import { TASK_TYPE_ID_RE } from './task-types';
 import type {
   TaskDependency,
   TaskExecutionPolicy,
   TaskInputBinding,
+  TaskResultOutputKey,
   TaskRole,
 } from './types';
 
@@ -39,6 +41,40 @@ export interface CreateChildSpec {
   readPaths?: string[];
 }
 
+/**
+ * Batch-binding shape: like {@link TaskInputBinding} but the producer may be a
+ * sibling in the same batch (`fromLocalId`) or a pre-existing real task
+ * (`fromTaskId`). Exactly one of the two is provided. The host maps `fromLocalId`
+ * to the sibling's derived task id at expand time.
+ */
+export interface BatchInputBinding {
+  fromLocalId?: string;
+  fromTaskId?: string;
+  output: TaskResultOutputKey;
+  as: string;
+  required?: boolean;
+}
+
+/**
+ * One item of a batch create/delegate. Reuses the singular {@link CreateChildSpec}
+ * fields plus a batch-local id, intra-batch ordering edges, and batch bindings.
+ */
+export interface BatchChildSpec extends Omit<CreateChildSpec, 'inputBindings'> {
+  /** Unique-within-batch handle (pattern reuses TASK_TYPE_ID_RE). */
+  localId: string;
+  /** Sibling localIds this item waits for (→ succeeded/block dependency). */
+  dependsOn?: string[];
+  /** Batch bindings (sibling localId or pre-existing task id). */
+  inputBindings?: BatchInputBinding[];
+}
+
+/**
+ * Max children expanded by one batch create/delegate. Must stay ≤
+ * DEFAULT_RESOURCE_LIMITS.maxChildrenPerTask (32) — the whole batch is rejected
+ * before any write when it would exceed this cap.
+ */
+export const BATCH_EXPAND_MAX = 16;
+
 export const PRESENTATION_ID_MAX_LENGTH = 128;
 export const PRESENTATION_TITLE_MAX_LENGTH = 200;
 export const PRESENTATION_MARKDOWN_MAX_LENGTH = 100_000;
@@ -56,6 +92,8 @@ const STABLE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 export type ToolCommand =
   | { kind: 'create_task'; opId: string; spec: CreateChildSpec }
   | { kind: 'delegate_task'; opId: string; spec: CreateChildSpec }
+  | { kind: 'create_tasks'; opId: string; specs: BatchChildSpec[] }
+  | { kind: 'delegate_tasks'; opId: string; specs: BatchChildSpec[] }
   | {
       kind: 'release_tasks';
       opId: string;
@@ -95,6 +133,8 @@ export type ToolCommand =
 const MUTATING_TOOLS: ReadonlySet<string> = new Set([
   'create_task',
   'delegate_task',
+  'create_tasks',
+  'delegate_tasks',
   'release_tasks',
   'start_task',
   'interrupt_task',
@@ -112,6 +152,8 @@ function toolActionForName(name: string): ToolAction | undefined {
   const actions: ToolAction[] = [
     'create_task',
     'delegate_task',
+    'create_tasks',
+    'delegate_tasks',
     'release_tasks',
     'start_task',
     'interrupt_task',
@@ -401,6 +443,97 @@ function parseCreateSpec(args: Record<string, unknown>): CreateChildSpec | undef
   return spec;
 }
 
+function parseBatchInputBindings(value: unknown): BatchInputBinding[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out: BatchInputBinding[] = [];
+  const allowed = new Set(['fromLocalId', 'fromTaskId', 'output', 'as', 'required']);
+  for (const entry of value) {
+    if (!isRecord(entry)) return undefined;
+    if (Object.keys(entry).some((k) => !allowed.has(k))) return undefined;
+    const output = typeof entry.output === 'string' ? entry.output : '';
+    const as = typeof entry.as === 'string' ? entry.as : '';
+    if (!as || !output || !isAllowedBindingOutput(output)) return undefined;
+    const hasLocal = typeof entry.fromLocalId === 'string' && entry.fromLocalId.length > 0;
+    const hasTask = typeof entry.fromTaskId === 'string' && entry.fromTaskId.length > 0;
+    // Exactly one producer reference (sibling localId XOR pre-existing task id).
+    if (hasLocal === hasTask) return undefined;
+    const binding: BatchInputBinding = { output, as };
+    if (hasLocal) binding.fromLocalId = entry.fromLocalId as string;
+    if (hasTask) binding.fromTaskId = entry.fromTaskId as string;
+    if (entry.required !== undefined) {
+      if (typeof entry.required !== 'boolean') return undefined;
+      binding.required = entry.required;
+    }
+    out.push(binding);
+  }
+  return out;
+}
+
+function parseBatchChildSpec(entry: unknown): BatchChildSpec | undefined {
+  if (!isRecord(entry)) return undefined;
+  const localId = typeof entry.localId === 'string' ? entry.localId : '';
+  if (!localId || !TASK_TYPE_ID_RE.test(localId)) return undefined;
+
+  let dependsOn: string[] | undefined;
+  if (entry.dependsOn !== undefined) {
+    if (!Array.isArray(entry.dependsOn)) return undefined;
+    const list: string[] = [];
+    for (const dep of entry.dependsOn) {
+      if (typeof dep !== 'string' || dep.length === 0) return undefined;
+      list.push(dep);
+    }
+    dependsOn = list;
+  }
+
+  let inputBindings: BatchInputBinding[] | undefined;
+  if (entry.inputBindings !== undefined) {
+    inputBindings = parseBatchInputBindings(entry.inputBindings);
+    if (!inputBindings) return undefined;
+  }
+
+  // Reuse the singular create parser for the shared fields. Strip batch-only keys
+  // (inputBindings has a different shape here) before delegating.
+  const baseArgs: Record<string, unknown> = { ...entry };
+  delete baseArgs.localId;
+  delete baseArgs.dependsOn;
+  delete baseArgs.inputBindings;
+  const base = parseCreateSpec(baseArgs);
+  if (!base) return undefined;
+  const { inputBindings: _dropped, ...baseRest } = base;
+  const spec: BatchChildSpec = { ...baseRest, localId };
+  if (dependsOn) spec.dependsOn = dependsOn;
+  if (inputBindings) spec.inputBindings = inputBindings;
+  return spec;
+}
+
+function parseBatchSpecs(value: unknown): BatchChildSpec[] | undefined {
+  if (!Array.isArray(value) || value.length === 0 || value.length > BATCH_EXPAND_MAX) {
+    return undefined;
+  }
+  const specs: BatchChildSpec[] = [];
+  const seen = new Set<string>();
+  for (const entry of value) {
+    const spec = parseBatchChildSpec(entry);
+    if (!spec) return undefined;
+    if (seen.has(spec.localId)) return undefined; // duplicate localId
+    seen.add(spec.localId);
+    specs.push(spec);
+  }
+  // Intra-batch references must point at known siblings (and never self).
+  for (const spec of specs) {
+    for (const dep of spec.dependsOn ?? []) {
+      if (dep === spec.localId || !seen.has(dep)) return undefined;
+    }
+    for (const binding of spec.inputBindings ?? []) {
+      if (binding.fromLocalId === undefined) continue;
+      if (binding.fromLocalId === spec.localId || !seen.has(binding.fromLocalId)) {
+        return undefined;
+      }
+    }
+  }
+  return specs;
+}
+
 export function dispatch(
   tool: string,
   args: unknown,
@@ -446,6 +579,15 @@ export function dispatch(
           return { ok: false, toolError: 'invalid delegate_task arguments' };
         }
         return { ok: true, command: { kind: 'delegate_task', opId, spec } };
+      }
+      case 'create_tasks':
+      case 'delegate_tasks': {
+        const specs = parseBatchSpecs(args.tasks);
+        if (!specs) {
+          return { ok: false, toolError: `invalid ${tool} arguments` };
+        }
+        const kind = tool === 'create_tasks' ? ('create_tasks' as const) : ('delegate_tasks' as const);
+        return { ok: true, command: { kind, opId, specs } };
       }
       case 'release_tasks': {
         const raw = args.taskIds;

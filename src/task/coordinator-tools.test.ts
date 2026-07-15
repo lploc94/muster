@@ -407,3 +407,192 @@ describe('coordinator-tools dispatch', () => {
     }
   });
 });
+
+describe('coordinator-tools batch dispatch', () => {
+  it('maps a valid create_tasks batch to a command with parsed specs', () => {
+    const result = dispatch(
+      'create_tasks',
+      {
+        opId: 'op-batch',
+        tasks: [
+          { localId: 'a', goal: 'first', taskType: 'plan' },
+          {
+            localId: 'b',
+            goal: 'second',
+            taskType: 'implement',
+            dependsOn: ['a'],
+            inputBindings: [{ fromLocalId: 'a', output: 'summary', as: 'plan' }],
+          },
+        ],
+      },
+      ctx(['create_tasks']),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && result.command.kind === 'create_tasks') {
+      expect(result.command.specs).toHaveLength(2);
+      expect(result.command.specs[1].localId).toBe('b');
+      expect(result.command.specs[1].dependsOn).toEqual(['a']);
+      expect(result.command.specs[1].inputBindings).toEqual([
+        { fromLocalId: 'a', output: 'summary', as: 'plan' },
+      ]);
+    }
+  });
+
+  it('maps delegate_tasks with a pre-existing task binding', () => {
+    const result = dispatch(
+      'delegate_tasks',
+      {
+        opId: 'op-batch',
+        tasks: [
+          {
+            localId: 'a',
+            goal: 'consume prior',
+            taskType: 'implement',
+            inputBindings: [{ fromTaskId: 'task-prior', output: 'summary', as: 'prior' }],
+          },
+        ],
+      },
+      ctx(['delegate_tasks']),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && result.command.kind === 'delegate_tasks') {
+      expect(result.command.specs[0].inputBindings).toEqual([
+        { fromTaskId: 'task-prior', output: 'summary', as: 'prior' },
+      ]);
+    }
+  });
+
+  it('rejects a batch with a duplicate localId', () => {
+    const result = dispatch(
+      'create_tasks',
+      {
+        opId: 'op-batch',
+        tasks: [
+          { localId: 'a', goal: 'x', taskType: 'plan' },
+          { localId: 'a', goal: 'y', taskType: 'plan' },
+        ],
+      },
+      ctx(['create_tasks']),
+    );
+    expect(result).toEqual({ ok: false, toolError: 'invalid create_tasks arguments' });
+  });
+
+  it('rejects dependsOn referencing an unknown localId', () => {
+    const result = dispatch(
+      'create_tasks',
+      {
+        opId: 'op-batch',
+        tasks: [{ localId: 'a', goal: 'x', taskType: 'plan', dependsOn: ['ghost'] }],
+      },
+      ctx(['create_tasks']),
+    );
+    expect(result).toEqual({ ok: false, toolError: 'invalid create_tasks arguments' });
+  });
+
+  it('rejects a binding referencing an unknown sibling localId', () => {
+    const result = dispatch(
+      'create_tasks',
+      {
+        opId: 'op-batch',
+        tasks: [
+          {
+            localId: 'a',
+            goal: 'x',
+            taskType: 'plan',
+            inputBindings: [{ fromLocalId: 'ghost', output: 'summary', as: 'p' }],
+          },
+        ],
+      },
+      ctx(['create_tasks']),
+    );
+    expect(result).toEqual({ ok: false, toolError: 'invalid create_tasks arguments' });
+  });
+
+  it('rejects a binding that supplies both fromLocalId and fromTaskId', () => {
+    const result = dispatch(
+      'create_tasks',
+      {
+        opId: 'op-batch',
+        tasks: [
+          { localId: 'a', goal: 'x', taskType: 'plan' },
+          {
+            localId: 'b',
+            goal: 'y',
+            taskType: 'plan',
+            inputBindings: [
+              { fromLocalId: 'a', fromTaskId: 'task-x', output: 'summary', as: 'p' },
+            ],
+          },
+        ],
+      },
+      ctx(['create_tasks']),
+    );
+    expect(result).toEqual({ ok: false, toolError: 'invalid create_tasks arguments' });
+  });
+
+  it('rejects a self dependsOn', () => {
+    const result = dispatch(
+      'create_tasks',
+      {
+        opId: 'op-batch',
+        tasks: [{ localId: 'a', goal: 'x', taskType: 'plan', dependsOn: ['a'] }],
+      },
+      ctx(['create_tasks']),
+    );
+    expect(result).toEqual({ ok: false, toolError: 'invalid create_tasks arguments' });
+  });
+
+  it('rejects an invalid localId pattern', () => {
+    const result = dispatch(
+      'create_tasks',
+      {
+        opId: 'op-batch',
+        tasks: [{ localId: 'Bad Id', goal: 'x', taskType: 'plan' }],
+      },
+      ctx(['create_tasks']),
+    );
+    expect(result).toEqual({ ok: false, toolError: 'invalid create_tasks arguments' });
+  });
+
+  it('rejects a per-item spec missing taskType', () => {
+    const result = dispatch(
+      'create_tasks',
+      { opId: 'op-batch', tasks: [{ localId: 'a', goal: 'x' }] },
+      ctx(['create_tasks']),
+    );
+    expect(result).toEqual({ ok: false, toolError: 'invalid create_tasks arguments' });
+  });
+
+  it('rejects a batch missing opId', () => {
+    const result = dispatch(
+      'create_tasks',
+      { tasks: [{ localId: 'a', goal: 'x', taskType: 'plan' }] },
+      ctx(['create_tasks']),
+    );
+    expect(result).toEqual({ ok: false, toolError: 'opId is required' });
+  });
+
+  it('rejects an empty tasks array', () => {
+    const result = dispatch('create_tasks', { opId: 'op-batch', tasks: [] }, ctx(['create_tasks']));
+    expect(result).toEqual({ ok: false, toolError: 'invalid create_tasks arguments' });
+  });
+
+  it('rejects a batch over the 16-task cap', () => {
+    const tasks = Array.from({ length: 17 }, (_, i) => ({
+      localId: `t${i}`,
+      goal: 'x',
+      taskType: 'plan',
+    }));
+    const result = dispatch('create_tasks', { opId: 'op-batch', tasks }, ctx(['create_tasks']));
+    expect(result).toEqual({ ok: false, toolError: 'invalid create_tasks arguments' });
+  });
+
+  it('rejects create_tasks outside allowedActions (capability gate)', () => {
+    const result = dispatch(
+      'create_tasks',
+      { opId: 'op-batch', tasks: [{ localId: 'a', goal: 'x', taskType: 'plan' }] },
+      ctx(['ask_user']),
+    );
+    expect(result).toEqual({ ok: false, toolError: 'action not permitted: create_tasks' });
+  });
+});

@@ -163,6 +163,86 @@ describe('MusterBridgeServer auth', () => {
     expect(handled).toHaveLength(1);
   });
 
+  it('exposes batch tools only to create_child coordinators and rejects malformed batches', async () => {
+    const credentials = new CredentialRegistry();
+    const handled: Array<{ tool: string; command: unknown }> = [];
+    server = new MusterBridgeServer({
+      credentials,
+      toolHandler: {
+        handleToolCall: async (_ctx, tool, command) => {
+          handled.push({ tool, command });
+          return { ok: true, result: { taskIds: ['task-a'], turnIds: [] } };
+        },
+      },
+    });
+    const { port } = await server.listen();
+    const coordinatorToken = credentials.issue({
+      rootId: 'root-1',
+      callerTaskId: 'task-1',
+      turnId: 'turn-coordinator',
+      allowedActions: new Set(['create_tasks', 'delegate_tasks']),
+      ttlMs: 60_000,
+    });
+    const coordinator = await openMcpSession(port, coordinatorToken);
+
+    const listed = await coordinator.request('tools/list');
+    const tools = (listed.result as {
+      tools: Array<{ name: string; inputSchema: Record<string, unknown> }>;
+    }).tools;
+    const names = tools.map((tool) => tool.name);
+    expect(names).toContain('create_tasks');
+    expect(names).toContain('delegate_tasks');
+    const batchSchema = tools.find((tool) => tool.name === 'create_tasks')!.inputSchema;
+    expect(batchSchema).toMatchObject({
+      required: ['opId', 'tasks'],
+      additionalProperties: false,
+    });
+    expect((batchSchema.properties as { tasks: { maxItems: number } }).tasks.maxItems).toBe(16);
+
+    // Valid single-item batch reaches the handler.
+    const ok = await coordinator.request('tools/call', {
+      name: 'create_tasks',
+      arguments: {
+        opId: 'op-1',
+        tasks: [{ localId: 'a', goal: 'child', taskType: 'worker' }],
+      },
+    });
+    expect(ok.result).not.toHaveProperty('isError', true);
+    expect(handled).toHaveLength(1);
+    expect(handled[0]).toMatchObject({ tool: 'create_tasks', command: { kind: 'create_tasks' } });
+
+    // Over-cap batch is rejected in dispatch before ever reaching the handler.
+    const overCap = await coordinator.request('tools/call', {
+      name: 'create_tasks',
+      arguments: {
+        opId: 'op-2',
+        tasks: Array.from({ length: 17 }, (_, i) => ({
+          localId: `t${i}`,
+          goal: 'x',
+          taskType: 'worker',
+        })),
+      },
+    });
+    expect(overCap.result).toMatchObject({ isError: true });
+    expect(handled).toHaveLength(1);
+
+    // Workers never see the batch tools.
+    const workerToken = credentials.issue({
+      rootId: 'root-1',
+      callerTaskId: 'worker-1',
+      turnId: 'turn-worker',
+      allowedActions: new Set(['complete_task']),
+      ttlMs: 60_000,
+    });
+    const worker = await openMcpSession(port, workerToken);
+    const workerListed = await worker.request('tools/list');
+    const workerNames = (workerListed.result as { tools: Array<{ name: string }> }).tools.map(
+      (tool) => tool.name,
+    );
+    expect(workerNames).not.toContain('create_tasks');
+    expect(workerNames).not.toContain('delegate_tasks');
+  });
+
   it('accepts valid token with loopback host and absent origin on initialize', async () => {
     const credentials = new CredentialRegistry();
     server = new MusterBridgeServer({

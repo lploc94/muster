@@ -3,9 +3,11 @@ import {
   BRIEF_LIST_MAX_ITEMS,
   BRIEF_SECTION_MAX,
   COMPILED_PROMPT_MAX,
+  TASK_BRIEF_KINDS,
   assembleFirstTurnPrompt,
   clampSection,
   compileTaskPrompt,
+  isTaskBriefKind,
   mergeBriefFromCreate,
   synthesizeBriefFromGoal,
 } from './brief';
@@ -46,6 +48,21 @@ describe('synthesizeBriefFromGoal', () => {
     const brief = synthesizeBriefFromGoal('Plan the work', undefined, 'plan');
     expect(brief.kind).toBe('plan');
     expect(brief.context).toBeUndefined();
+  });
+});
+
+describe('breakdown briefKind', () => {
+  it('is a recognized brief kind', () => {
+    expect(TASK_BRIEF_KINDS).toContain('breakdown');
+    expect(isTaskBriefKind('breakdown')).toBe(true);
+  });
+
+  it('emits the work-breakdown preamble in a compiled prompt', () => {
+    const brief = synthesizeBriefFromGoal('Decompose the plan', undefined, 'breakdown');
+    const prompt = compileTaskPrompt(brief, [], { taskId: 'bd', goal: 'Decompose the plan' });
+    expect(prompt).toContain('work-breakdown agent');
+    expect(prompt).toContain('ordered checklist');
+    expect(prompt).toContain('machine-readable');
   });
 });
 
