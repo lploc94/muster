@@ -839,6 +839,35 @@ describe('file mention suggestion protocol', () => {
     expect(JSON.stringify(message)).not.toContain('/workspace');
   });
 
+  it('allows parentDepth 1 and 2 on request and success responses', () => {
+    for (const parentDepth of [1, 2] as const) {
+      const request: OutMessage = {
+        type: 'requestFileMentionSuggestions',
+        requestId: `req-depth-${parentDepth}`,
+        parentDepth,
+        relativeQuery: parentDepth === 1 ? '' : 'lib/',
+      };
+      expect(JSON.stringify(request)).not.toContain('cwd');
+
+      expect(
+        isExtMessage({
+          type: 'fileMentionSuggestions',
+          requestId: `req-depth-${parentDepth}`,
+          parentDepth,
+          relativeQuery: parentDepth === 1 ? '' : 'lib/',
+          items: [
+            {
+              id: parentDepth === 1 ? 'dir:../sibling' : 'file:../../lib/util.ts',
+              kind: parentDepth === 1 ? 'directory' : 'file',
+              label: parentDepth === 1 ? 'sibling' : 'util.ts',
+              insertionPath: parentDepth === 1 ? '../sibling' : '../../lib/util.ts',
+            },
+          ],
+        }),
+      ).toBe(true);
+    }
+  });
+
   it('allows optional taskId omission for draft composer scope', () => {
     vi.mocked(vscode.postMessage).mockClear();
 
@@ -924,7 +953,14 @@ describe('file mention suggestion protocol', () => {
       {
         type: 'fileMentionSuggestions',
         requestId: 'req-1',
-        parentDepth: 1, // S01 only allows 0 at the wire guard
+        parentDepth: 3, // depth > 2 rejected at the wire guard
+        relativeQuery: '',
+        items: [],
+      },
+      {
+        type: 'fileMentionSuggestions',
+        requestId: 'req-1',
+        parentDepth: -1,
         relativeQuery: '',
         items: [],
       },
@@ -966,7 +1002,7 @@ describe('file mention suggestion protocol', () => {
             id: 'file:a',
             kind: 'file',
             label: 'a',
-            insertionPath: '../secret', // traversal rejected
+            insertionPath: '../../../secret', // depth > 2 rejected
           },
         ],
       },

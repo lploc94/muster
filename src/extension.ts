@@ -598,6 +598,17 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
           return entries;
         },
+        // Refuse to follow directory symlinks when refining under a scope so
+        // nested relativeQuery segments cannot escape the selected tree.
+        isDirectorySymlink: async (dirPath) => {
+          try {
+            const st = await fs.promises.lstat(dirPath);
+            return st.isSymbolicLink() && st.isDirectory();
+          } catch {
+            // Missing intermediate path is handled by readDirectory failure.
+            return false;
+          }
+        },
       });
 
       if (result.ok) {

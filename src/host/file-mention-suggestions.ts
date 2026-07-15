@@ -1,11 +1,15 @@
 /**
- * Host-owned current-directory file mention suggestions (M011 S01).
+ * Host-owned file mention suggestions (M011 S01–S02).
  *
  * The webview never supplies a cwd or absolute path. The host derives the
- * authoritative working directory from task/draft context, lists one directory
- * non-recursively, and returns only relative suggestion items. Failures use
- * bounded error codes — never raw filesystem messages or absolute paths.
+ * authoritative working directory from task/draft context, ascends at most two
+ * parent levels, optionally refines into a relative directory under that scope,
+ * lists one directory non-recursively, and returns only relative suggestion
+ * items. Failures use bounded error codes — never raw filesystem messages or
+ * absolute paths.
  */
+
+import * as path from 'path';
 
 export const FILE_MENTION_SUGGESTION_MAX_ITEMS = 50;
 export const FILE_MENTION_SUGGESTION_MAX_QUERY_CHARS = 256;
@@ -37,9 +41,10 @@ const BLOCKED_DIRECTORY_NAMES = new Set([
 ]);
 
 export type FileMentionSuggestionKind = 'file' | 'directory';
+export type FileMentionParentDepth = 0 | 1 | 2;
 
 export interface FileMentionSuggestionItem {
-  /** Stable identity for list rendering (kind + relative name). */
+  /** Stable identity for list rendering (kind + relative insertion path). */
   id: string;
   kind: FileMentionSuggestionKind;
   /** User-visible label (basename / entry name). */
@@ -52,9 +57,9 @@ export interface FileMentionSuggestionsRequest {
   requestId: string;
   /** When set, host resolves cwd from that task; when absent, draft/workspace cwd. */
   taskId?: string;
-  /** S01 always 0; host rejects other values. */
-  parentDepth: 0 | 1 | 2 | number;
-  /** Relative path query after '@' (no leading '@'). */
+  /** Bounded ascent from authoritative cwd: 0 current, 1 parent, 2 grandparent. */
+  parentDepth: FileMentionParentDepth | number;
+  /** Relative path query after parent prefix (no leading '@'). */
   relativeQuery: string;
 }
 
@@ -67,7 +72,7 @@ export type FileMentionSuggestionsResult =
   | {
       ok: true;
       requestId: string;
-      parentDepth: 0;
+      parentDepth: FileMentionParentDepth;
       relativeQuery: string;
       items: FileMentionSuggestionItem[];
     }
@@ -92,6 +97,12 @@ export interface FileMentionSuggestionServices {
   resolveCwd(scope: { taskId?: string }): string | undefined;
   /** List one directory non-recursively. */
   readDirectory(dirPath: string): Promise<readonly FileMentionDirEntry[]>;
+  /**
+   * Optional: detect directory symlinks when refining into nested paths so the
+   * host never follows a symlink that escapes the selected scope. Defaults to
+   * false when omitted (unit tests without symlink awareness).
+   */
+  isDirectorySymlink?(dirPath: string): Promise<boolean>;
 }
 
 function fail(
@@ -109,11 +120,16 @@ function hasControlChars(value: string): boolean {
   return false;
 }
 
+function isParentDepth(value: unknown): value is FileMentionParentDepth {
+  return value === 0 || value === 1 || value === 2;
+}
+
 /**
- * S01 safety: only plain relative path prefixes under the current directory.
- * Mirrors the webview parser so host and client reject the same shapes.
+ * Safe relative refinement under a parentDepth scope.
+ * Mirrors the webview parser remainder: no absolute/drive/UNC, no `.`/`..`
+ * segments, no control characters, length-capped.
  */
-export function isSafeCurrentDirectoryRelativeQuery(query: string): boolean {
+export function isSafeScopedRelativeQuery(query: string): boolean {
   if (typeof query !== 'string') return false;
   if (query.length > FILE_MENTION_SUGGESTION_MAX_QUERY_CHARS) return false;
   if (hasControlChars(query)) return false;
@@ -123,7 +139,9 @@ export function isSafeCurrentDirectoryRelativeQuery(query: string): boolean {
   if (query.startsWith('//') || query.startsWith('\\\\')) return false;
   if (/^[A-Za-z]:/.test(query)) return false;
 
-  const normalized = query.replace(/\\/g, '/');
+  // Trailing slash is valid directory refinement (`src/`); strip before segment checks.
+  const normalized = query.replace(/\\/g, '/').replace(/\/+$/, '');
+  if (normalized.length === 0) return false;
   const segments = normalized.split('/');
   for (const segment of segments) {
     if (segment === '' || segment === '.' || segment === '..') {
@@ -131,6 +149,11 @@ export function isSafeCurrentDirectoryRelativeQuery(query: string): boolean {
     }
   }
   return true;
+}
+
+/** @deprecated Prefer isSafeScopedRelativeQuery — kept for S01 call-site compatibility. */
+export function isSafeCurrentDirectoryRelativeQuery(query: string): boolean {
+  return isSafeScopedRelativeQuery(query);
 }
 
 function isSafeEntryName(name: string): boolean {
@@ -148,7 +171,6 @@ function isBlockedDirectoryName(name: string): boolean {
 }
 
 function isBlockedFileName(name: string): boolean {
-  // Hidden files (dotfiles) are out of autocomplete scope for S01.
   return name.startsWith('.');
 }
 
@@ -171,8 +193,51 @@ function normalizeTaskId(value: unknown): string | undefined {
   return trimmed;
 }
 
+function parentPrefix(depth: FileMentionParentDepth): string {
+  if (depth === 0) return '';
+  if (depth === 1) return '../';
+  return '../../';
+}
+
 /**
- * List bounded current-directory suggestions for an active @ query.
+ * Split a scoped relative query into the directory to list and the basename
+ * prefix filter. Trailing slash means list that directory with empty filter.
+ */
+function splitDirectoryAndFilter(relativeQuery: string): {
+  directorySegments: string[];
+  filterPrefix: string;
+} {
+  const normalized = relativeQuery.replace(/\\/g, '/');
+  if (normalized.length === 0) {
+    return { directorySegments: [], filterPrefix: '' };
+  }
+
+  const endsWithSlash = normalized.endsWith('/');
+  const parts = normalized.split('/').filter((segment) => segment.length > 0);
+  if (parts.length === 0) {
+    return { directorySegments: [], filterPrefix: '' };
+  }
+
+  if (endsWithSlash) {
+    return { directorySegments: parts, filterPrefix: '' };
+  }
+  if (parts.length === 1) {
+    return { directorySegments: [], filterPrefix: parts[0]!.toLowerCase() };
+  }
+  return {
+    directorySegments: parts.slice(0, -1),
+    filterPrefix: parts[parts.length - 1]!.toLowerCase(),
+  };
+}
+
+function joinRelative(prefix: string, segments: string[], name: string): string {
+  const body = [...segments, name].join('/');
+  if (!prefix) return body;
+  return `${prefix}${body}`;
+}
+
+/**
+ * List bounded suggestions for an active @ query at parentDepth 0–2.
  * Never returns absolute paths, raw filesystem errors, or cwd.
  */
 export async function listFileMentionSuggestions(
@@ -184,18 +249,18 @@ export async function listFileMentionSuggestions(
     return fail('', 'invalidRequest');
   }
 
-  if (rawRequest.parentDepth !== 0) {
+  if (!isParentDepth(rawRequest.parentDepth)) {
     return fail(requestId, 'invalidRequest');
   }
+  const parentDepth = rawRequest.parentDepth;
 
   const relativeQuery =
     typeof rawRequest.relativeQuery === 'string' ? rawRequest.relativeQuery : '';
-  if (!isSafeCurrentDirectoryRelativeQuery(relativeQuery)) {
+  if (!isSafeScopedRelativeQuery(relativeQuery)) {
     return fail(requestId, 'invalidRequest');
   }
 
   const taskId = normalizeTaskId(rawRequest.taskId);
-  // Invalid non-empty taskId shape (e.g. control chars) is a request error.
   if (rawRequest.taskId !== undefined && taskId === undefined) {
     return fail(requestId, 'invalidRequest');
   }
@@ -211,23 +276,39 @@ export async function listFileMentionSuggestions(
     return fail(requestId, 'unavailable');
   }
 
-  // S01 lists only the authoritative current directory (non-recursive).
-  // relativeQuery is a basename/prefix filter, not a nested path walk.
-  const queryNormalized = relativeQuery.replace(/\\/g, '/');
-  // If the query contains a slash, treat the final segment as the prefix filter
-  // for names in the current directory only — do not descend into subdirs.
-  // Nested directory drill-down is S02. For S01, multi-segment queries still
-  // filter entry names by the full relative string prefix so "src/u" matches
-  // nothing until the user selects `src` in a later slice.
-  const filterPrefix = queryNormalized.toLowerCase();
+  // Normalize the authoritative cwd and ascend parentDepth levels.
+  // Prefer path.normalize/join over path.resolve so Windows tests that supply
+  // root-relative fixtures are not rewritten with a drive letter.
+  let scopeRoot = path.normalize(cwd);
+  for (let i = 0; i < parentDepth; i += 1) {
+    scopeRoot = path.normalize(path.join(scopeRoot, '..'));
+  }
+
+  const { directorySegments, filterPrefix } = splitDirectoryAndFilter(relativeQuery);
+
+  // Walk directory segments under scopeRoot without following directory symlinks.
+  let listDir = scopeRoot;
+  for (const segment of directorySegments) {
+    listDir = path.join(listDir, segment);
+    if (typeof services.isDirectorySymlink === 'function') {
+      try {
+        if (await services.isDirectorySymlink(listDir)) {
+          return fail(requestId, 'listingFailed');
+        }
+      } catch {
+        return fail(requestId, 'listingFailed');
+      }
+    }
+  }
 
   let entries: readonly FileMentionDirEntry[];
   try {
-    entries = await services.readDirectory(cwd);
+    entries = await services.readDirectory(listDir);
   } catch {
     return fail(requestId, 'listingFailed');
   }
 
+  const prefix = parentPrefix(parentDepth);
   const directories: FileMentionSuggestionItem[] = [];
   const files: FileMentionSuggestionItem[] = [];
 
@@ -238,7 +319,7 @@ export async function listFileMentionSuggestions(
 
     const isDir = typeof entry.isDirectory === 'function' && entry.isDirectory();
     const isFile = typeof entry.isFile === 'function' && entry.isFile();
-    if (isDir === isFile) continue; // neither or both — skip
+    if (isDir === isFile) continue;
 
     if (isDir) {
       if (isBlockedDirectoryName(entry.name)) continue;
@@ -252,11 +333,12 @@ export async function listFileMentionSuggestions(
     }
 
     const kind: FileMentionSuggestionKind = isDir ? 'directory' : 'file';
+    const insertionPath = joinRelative(prefix, directorySegments, label);
     const item: FileMentionSuggestionItem = {
-      id: `${kind === 'directory' ? 'dir' : 'file'}:${label}`,
+      id: `${kind === 'directory' ? 'dir' : 'file'}:${insertionPath}`,
       kind,
       label,
-      insertionPath: label,
+      insertionPath,
     };
     if (kind === 'directory') directories.push(item);
     else files.push(item);
@@ -272,7 +354,7 @@ export async function listFileMentionSuggestions(
   return {
     ok: true,
     requestId,
-    parentDepth: 0,
+    parentDepth,
     relativeQuery,
     items,
   };

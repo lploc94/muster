@@ -401,6 +401,9 @@ export type ExtMessage =
 /** Kind of a single autocomplete suggestion item. */
 export type FileMentionSuggestionKind = 'file' | 'directory';
 
+/** Bounded ascent from authoritative task/draft cwd (0 current, 1 parent, 2 grandparent). */
+export type FileMentionParentDepth = 0 | 1 | 2;
+
 /** Relative-only suggestion returned by the host for @ autocomplete. */
 export interface FileMentionSuggestionItem {
   id: string;
@@ -425,7 +428,7 @@ export type FileMentionSuggestionsMessage =
       type: 'fileMentionSuggestions';
       ok?: true;
       requestId: string;
-      parentDepth: 0;
+      parentDepth: FileMentionParentDepth;
       relativeQuery: string;
       items: FileMentionSuggestionItem[];
     }
@@ -501,15 +504,14 @@ export type OutMessage =
   | { type: 'browseWorkspaceFiles' }
   | { type: 'resolveFileDrop'; candidates: string[] }
   /**
-   * Request current-directory @ autocomplete suggestions.
-   * Host derives cwd from taskId (existing task) or draft workspace context.
-   * Webview never supplies a filesystem path.
+   * Request @ autocomplete suggestions for depth 0–2 relative to the
+   * authoritative task/draft cwd. Webview never supplies a filesystem path.
    */
   | {
       type: 'requestFileMentionSuggestions';
       requestId: string;
       taskId?: string;
-      parentDepth: 0;
+      parentDepth: FileMentionParentDepth;
       relativeQuery: string;
     }
   /**
@@ -1109,7 +1111,7 @@ const FILE_MENTION_SUGGESTION_ERROR_CODES = new Set<FileMentionSuggestionsErrorC
   'listingFailed',
 ]);
 
-/** Relative mention paths for autocomplete — no absolute/drive/UNC/traversal. */
+/** Relative mention paths for autocomplete — absolute/drive/UNC rejected; up to two leading `../` allowed. */
 function isRelativeFileMentionPath(v: unknown): v is string {
   if (typeof v !== 'string') return false;
   const value = v.trim();
@@ -1122,7 +1124,21 @@ function isRelativeFileMentionPath(v: unknown): v is string {
     if (code < 0x20 || code === 0x7f) return false;
   }
   const normalized = value.replace(/\\/g, '/');
-  const segments = normalized.split('/');
+  let rest = normalized;
+  let parentDepth = 0;
+  while (parentDepth < 3) {
+    if (rest.startsWith('../')) {
+      parentDepth += 1;
+      rest = rest.slice(3);
+      continue;
+    }
+    break;
+  }
+  if (parentDepth > 2) return false;
+  // Bare ../ or ../../ is not a file/directory insertion path.
+  if (rest.length === 0) return false;
+  if (rest === '.' || rest === '..' || rest.startsWith('./') || rest.startsWith('../')) return false;
+  const segments = rest.split('/');
   for (const segment of segments) {
     if (segment === '' || segment === '.' || segment === '..') return false;
   }
@@ -1157,7 +1173,7 @@ function isFileMentionSuggestionsMessage(data: Record<string, unknown>): boolean
       ? (['type', 'ok', 'requestId', 'parentDepth', 'relativeQuery', 'items'] as const)
       : (['type', 'requestId', 'parentDepth', 'relativeQuery', 'items'] as const);
   if (!hasOnlyKeys(data, allowed)) return false;
-  if (data.parentDepth !== 0) return false;
+  if (data.parentDepth !== 0 && data.parentDepth !== 1 && data.parentDepth !== 2) return false;
   if (!isString(data.relativeQuery)) return false;
   // relativeQuery may be empty (bare @) but must not carry control chars.
   for (let i = 0; i < data.relativeQuery.length; i += 1) {

@@ -154,20 +154,131 @@ describe('listFileMentionSuggestions', () => {
     expect(JSON.stringify(result)).not.toContain(taskCwd);
   });
 
-  it('rejects parentDepth other than 0 for S01 without reading the filesystem', async () => {
+  it('rejects parentDepth outside 0..2 without reading the filesystem', async () => {
     const readDirectory = vi.fn();
+    for (const parentDepth of [-1, 3, 1.5, Number.NaN]) {
+      const result = await listFileMentionSuggestions(
+        request({ parentDepth }),
+        services({ readDirectory }),
+      );
+
+      expect(result).toEqual({
+        ok: false,
+        requestId: 'req-1',
+        code: 'invalidRequest',
+      });
+    }
+    expect(readDirectory).not.toHaveBeenCalled();
+    expect(JSON.stringify({ parentDepth: 3 })).not.toContain(CWD);
+  });
+
+  it('lists parent depth 1 relative to authoritative cwd with ../ insertion prefixes', async () => {
+    const parentDir = path.normalize(path.join(CWD, '..'));
+    const readDirectory = vi.fn().mockResolvedValue([
+      entry('sibling', 'directory'),
+      entry('root.md', 'file'),
+      entry('node_modules', 'directory'),
+    ]);
+
     const result = await listFileMentionSuggestions(
-      request({ parentDepth: 1 as 0 }),
+      request({ parentDepth: 1, relativeQuery: '' }),
       services({ readDirectory }),
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.parentDepth).toBe(1);
+    expect(readDirectory).toHaveBeenCalledWith(parentDir);
+    expect(result.items).toEqual([
+      {
+        id: 'dir:../sibling',
+        kind: 'directory',
+        label: 'sibling',
+        insertionPath: '../sibling',
+      },
+      {
+        id: 'file:../root.md',
+        kind: 'file',
+        label: 'root.md',
+        insertionPath: '../root.md',
+      },
+    ]);
+    expect(JSON.stringify(result)).not.toContain(CWD);
+    expect(JSON.stringify(result)).not.toContain(parentDir);
+  });
+
+  it('lists grandparent depth 2 and directory-refined children under that scope', async () => {
+    const grandparent = path.normalize(path.join(CWD, '..', '..'));
+    const libDir = path.normalize(path.join(grandparent, 'lib'));
+    const readDirectory = vi.fn().mockResolvedValue([
+      entry('util.ts', 'file'),
+      entry('nested', 'directory'),
+    ]);
+
+    const result = await listFileMentionSuggestions(
+      request({ parentDepth: 2, relativeQuery: 'lib/u' }),
+      services({ readDirectory }),
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.parentDepth).toBe(2);
+    expect(result.relativeQuery).toBe('lib/u');
+    expect(readDirectory).toHaveBeenCalledWith(libDir);
+    expect(result.items).toEqual([
+      {
+        id: 'file:../../lib/util.ts',
+        kind: 'file',
+        label: 'util.ts',
+        insertionPath: '../../lib/util.ts',
+      },
+    ]);
+    expect(JSON.stringify(result)).not.toContain(grandparent);
+  });
+
+  it('refines nested directories under depth 0 without whole-tree enumeration', async () => {
+    const srcDir = path.join(CWD, 'src');
+    const readDirectory = vi.fn().mockResolvedValue([
+      entry('utils', 'directory'),
+      entry('app.ts', 'file'),
+      entry('unused.ts', 'file'),
+    ]);
+
+    const result = await listFileMentionSuggestions(
+      request({ parentDepth: 0, relativeQuery: 'src/' }),
+      services({ readDirectory }),
+    );
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(readDirectory).toHaveBeenCalledTimes(1);
+    expect(readDirectory).toHaveBeenCalledWith(srcDir);
+    expect(result.items.map((item) => item.insertionPath)).toEqual([
+      'src/utils',
+      'src/app.ts',
+      'src/unused.ts',
+    ]);
+  });
+
+  it('returns listingFailed without paths when an intermediate directory is a symlink escape', async () => {
+    const readDirectory = vi.fn();
+    const isDirectorySymlink = vi.fn(async (dirPath: string) =>
+      dirPath === path.join(CWD, 'escape'),
+    );
+
+    const result = await listFileMentionSuggestions(
+      request({ parentDepth: 0, relativeQuery: 'escape/x' }),
+      services({ readDirectory, isDirectorySymlink }),
     );
 
     expect(result).toEqual({
       ok: false,
       requestId: 'req-1',
-      code: 'invalidRequest',
+      code: 'listingFailed',
     });
     expect(readDirectory).not.toHaveBeenCalled();
     expect(JSON.stringify(result)).not.toContain(CWD);
+    expect(JSON.stringify(result)).not.toContain('escape');
   });
 
   it.each([
