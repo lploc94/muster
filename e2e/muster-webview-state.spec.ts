@@ -2265,6 +2265,553 @@ test('accessible file mention keyboard flow', async ({ page }) => {
   expect(pageErrors, `page errors: ${pageErrors.join(' | ')}`).toEqual([]);
   expect(failedRequests, `failed requests: ${failedRequests.join(' | ')}`).toEqual([]);
 });
+
+/**
+ * S04 T01 integrated acceptance matrix for assembled file-mention autocomplete.
+ * Real typing + option activation across @ / @../ / @../../, directory refinement,
+ * mouse + keyboard selection, caret replacement, dual text/llmText, stale and
+ * cross-task rejection, empty + sanitized failures, and depth-3 non-request.
+ * Playwright browser proof only — not native Extension Development Host.
+ */
+test('integrated acceptance matrix for assembled file mention autocomplete', async ({
+  page,
+}) => {
+  const consoleErrors: string[] = [];
+  const pageErrors: string[] = [];
+  const failedRequests: string[] = [];
+  page.on('console', (msg) => {
+    if (msg.type() !== 'error') return;
+    const text = msg.text();
+    if (/status of 403|Failed to load resource/i.test(text)) return;
+    consoleErrors.push(text);
+  });
+  page.on('pageerror', (err) => {
+    pageErrors.push(err.message);
+  });
+  page.on('requestfailed', (req) => {
+    const failure = req.failure()?.errorText ?? '';
+    if (/403|ERR_ABORTED|net::ERR/i.test(failure) || /403/.test(req.url())) return;
+    failedRequests.push(`${req.method()} ${req.url()} ${failure}`);
+  });
+
+  await openWebview(page);
+
+  // ── @ current-directory: mouse select + dual text/llmText ───────────────
+  await postSnapshot(page, { type: 'snapshot', rootTasks: [], storeRevision: 80 });
+  await page.getByRole('button', { name: 'New task' }).first().click();
+  await expectPostedMessage(page, { type: 'newTask' });
+
+  const draftComposer = page.getByPlaceholder('Start a new coordinator task with claude…');
+  await draftComposer.click();
+  await draftComposer.pressSequentially('Matrix @re', { delay: 15 });
+
+  const depth0Before = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(depth0Before)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+
+  const depth0Request = (await postedMessages(page))
+    .slice(depth0Before)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    requestId: string;
+    parentDepth: number;
+    relativeQuery: string;
+  };
+  expect(depth0Request.parentDepth).toBe(0);
+  expect(depth0Request.relativeQuery).toBe('re');
+
+  // Stale prior-query response must not paint.
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: 'stale-matrix-prior',
+    parentDepth: 0,
+    relativeQuery: 'old',
+    items: [
+      {
+        id: 'file:stale-matrix.md',
+        kind: 'file',
+        label: 'stale-matrix.md',
+        insertionPath: 'stale-matrix.md',
+      },
+    ],
+  });
+  await expect(page.getByRole('listbox', { name: 'File mention suggestions' })).toHaveCount(0);
+
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: depth0Request.requestId,
+    parentDepth: 0,
+    relativeQuery: 're',
+    items: [
+      {
+        id: 'file:readme.md',
+        kind: 'file',
+        label: 'readme.md',
+        insertionPath: 'docs/readme.md',
+      },
+      {
+        id: 'dir:reports',
+        kind: 'directory',
+        label: 'reports',
+        insertionPath: 'reports',
+      },
+    ],
+  });
+
+  const depth0Listbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+  await expect(depth0Listbox).toBeVisible();
+  await expect(depth0Listbox.getByRole('option', { name: 'stale-matrix.md' })).toHaveCount(0);
+  await depth0Listbox.getByRole('option', { name: 'readme.md' }).click();
+  await expect(depth0Listbox).toHaveCount(0);
+  await expect(draftComposer).toHaveValue('Matrix @readme.md ');
+
+  await page.getByRole('button', { name: 'Send' }).click();
+  await expectPostedMessage(page, {
+    type: 'send',
+    text: 'Matrix @readme.md',
+    llmText: 'Matrix @docs/readme.md',
+    backend: 'claude',
+  });
+
+  // ── @../ parent: nested directory refinement + dual-text send ────────────
+  await postSnapshot(page, { type: 'snapshot', rootTasks: [], storeRevision: 81 });
+  await page.getByRole('button', { name: 'New task' }).first().click();
+  await expectPostedMessage(page, { type: 'newTask' });
+
+  const parentComposer = page.getByPlaceholder('Start a new coordinator task with claude…');
+  await parentComposer.click();
+  await parentComposer.pressSequentially('Parent @../', { delay: 15 });
+
+  const depth1Before = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(depth1Before)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+
+  const depth1Request = (await postedMessages(page))
+    .slice(depth1Before)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    requestId: string;
+    parentDepth: number;
+    relativeQuery: string;
+  };
+  expect(depth1Request.parentDepth).toBe(1);
+  expect(depth1Request.relativeQuery).toBe('');
+
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: depth1Request.requestId,
+    parentDepth: 1,
+    relativeQuery: '',
+    items: [
+      {
+        id: 'dir:../packages',
+        kind: 'directory',
+        label: 'packages',
+        insertionPath: '../packages',
+      },
+      {
+        id: 'file:../root.md',
+        kind: 'file',
+        label: 'root.md',
+        insertionPath: '../root.md',
+      },
+    ],
+  });
+
+  const parentListbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+  await expect(parentListbox).toBeVisible();
+  const beforeDrill = (await postedMessages(page)).length;
+  await parentListbox.getByRole('option', { name: 'packages/' }).click();
+  await expect(parentComposer).toHaveValue('Parent @../packages/');
+
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(beforeDrill)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+
+  const drillRequest = (await postedMessages(page))
+    .slice(beforeDrill)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    requestId: string;
+    parentDepth: number;
+    relativeQuery: string;
+  };
+  expect(drillRequest.parentDepth).toBe(1);
+  expect(drillRequest.relativeQuery).toBe('packages/');
+
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: drillRequest.requestId,
+    parentDepth: 1,
+    relativeQuery: 'packages/',
+    items: [
+      {
+        id: 'file:../packages/helper.ts',
+        kind: 'file',
+        label: 'helper.ts',
+        insertionPath: '../packages/helper.ts',
+      },
+    ],
+  });
+
+  const drillListbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+  await expect(drillListbox).toBeVisible();
+  await drillListbox.getByRole('option', { name: 'helper.ts' }).click();
+  await expect(drillListbox).toHaveCount(0);
+  await expect(parentComposer).toHaveValue('Parent @helper.ts ');
+
+  await page.getByRole('button', { name: 'Send' }).click();
+  await expectPostedMessage(page, {
+    type: 'send',
+    text: 'Parent @helper.ts',
+    llmText: 'Parent @../packages/helper.ts',
+    backend: 'claude',
+  });
+
+  // ── @../../ grandparent + depth-3 rejection ─────────────────────────────
+  await postSnapshot(page, { type: 'snapshot', rootTasks: [], storeRevision: 82 });
+  await page.getByRole('button', { name: 'New task' }).first().click();
+  await expectPostedMessage(page, { type: 'newTask' });
+
+  const grandComposer = page.getByPlaceholder('Start a new coordinator task with claude…');
+  await grandComposer.click();
+  await grandComposer.pressSequentially('Grand @../../', { delay: 15 });
+
+  const depth2Before = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(depth2Before)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+
+  const depth2Request = (await postedMessages(page))
+    .slice(depth2Before)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    requestId: string;
+    parentDepth: number;
+  };
+  expect(depth2Request.parentDepth).toBe(2);
+
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: depth2Request.requestId,
+    parentDepth: 2,
+    relativeQuery: '',
+    items: [
+      {
+        id: 'file:../../top.md',
+        kind: 'file',
+        label: 'top.md',
+        insertionPath: '../../top.md',
+      },
+    ],
+  });
+
+  const depth2Listbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+  await expect(depth2Listbox).toBeVisible();
+  await depth2Listbox.getByRole('option', { name: 'top.md' }).click();
+  await expect(grandComposer).toHaveValue('Grand @top.md ');
+
+  await grandComposer.fill('');
+  await grandComposer.click();
+  const beforeDepth3 = (await postedMessages(page)).length;
+  await grandComposer.pressSequentially('Too deep @../../../', { delay: 15 });
+  await page.waitForTimeout(250);
+  const afterDepth3 = (await postedMessages(page))
+    .slice(beforeDepth3)
+    .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+  expect(afterDepth3).toHaveLength(0);
+  await expect(page.getByRole('listbox', { name: 'File mention suggestions' })).toHaveCount(0);
+
+  // ── Keyboard accept + mid-sentence caret replacement ─────────────────────
+  await grandComposer.fill('');
+  await grandComposer.pressSequentially('See @fi before after', { delay: 12 });
+  await grandComposer.evaluate((el: HTMLTextAreaElement) => el.setSelectionRange(7, 7));
+  await grandComposer.dispatchEvent('select');
+
+  const caretBefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(caretBefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+
+  const caretRequest = (await postedMessages(page))
+    .slice(caretBefore)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    requestId: string;
+    relativeQuery: string;
+  };
+  expect(caretRequest.relativeQuery).toBe('fi');
+
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: caretRequest.requestId,
+    parentDepth: 0,
+    relativeQuery: 'fi',
+    items: [
+      {
+        id: 'file:file.ts',
+        kind: 'file',
+        label: 'file.ts',
+        insertionPath: 'src/file.ts',
+      },
+      {
+        id: 'file:filter.ts',
+        kind: 'file',
+        label: 'filter.ts',
+        insertionPath: 'filter.ts',
+      },
+    ],
+  });
+
+  const caretListbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+  await expect(caretListbox).toBeVisible();
+  await grandComposer.press('ArrowDown');
+  await expect(grandComposer).toHaveAttribute('aria-activedescendant', 'file-mention-option-1');
+  await grandComposer.press('Enter');
+  await expect(caretListbox).toHaveCount(0);
+  await expect(grandComposer).toHaveValue('See @filter.ts before after');
+
+  // ── Empty + sanitized failure outcomes ───────────────────────────────────
+  await grandComposer.fill('');
+  await grandComposer.pressSequentially('Empty @zz', { delay: 12 });
+  const emptyBefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(emptyBefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+  const emptyRequest = (await postedMessages(page))
+    .slice(emptyBefore)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    requestId: string;
+  };
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: emptyRequest.requestId,
+    parentDepth: 0,
+    relativeQuery: 'zz',
+    items: [],
+  });
+  const emptyListbox = page.getByTestId('file-mention-listbox');
+  await expect(emptyListbox).toBeVisible();
+  await expect(emptyListbox).toHaveAttribute('data-outcome', 'empty');
+  await expect(page.getByTestId('file-mention-status')).toHaveText('No matching files');
+  await grandComposer.press('Escape');
+  await expect(emptyListbox).toHaveCount(0);
+
+  await grandComposer.fill('');
+  await grandComposer.pressSequentially('Fail @er', { delay: 12 });
+  const errBefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(errBefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+  const errRequest = (await postedMessages(page))
+    .slice(errBefore)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    requestId: string;
+  };
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    ok: false,
+    requestId: errRequest.requestId,
+    code: 'listingFailed',
+  });
+  const errListbox = page.getByTestId('file-mention-listbox');
+  await expect(errListbox).toBeVisible();
+  await expect(errListbox).toHaveAttribute('data-outcome', 'error');
+  await expect(page.getByTestId('file-mention-status')).toHaveText('File suggestions unavailable');
+  await expect(page.locator('body')).not.toContainText('listingFailed');
+  await expect(page.locator('body')).not.toContainText('/Users');
+  await expect(page.locator('body')).not.toContainText('C:\\');
+  await grandComposer.press('Escape');
+
+  // ── Cross-task stale response rejection ──────────────────────────────────
+  await postSnapshot(page, {
+    type: 'snapshot',
+    rootTasks: [
+      task({
+        id: 'task-matrix-a',
+        goal: 'Matrix task A',
+        viewStatus: 'idle',
+      }),
+      task({
+        id: 'task-matrix-b',
+        goal: 'Matrix task B',
+        viewStatus: 'idle',
+      }),
+    ],
+    focusedTaskId: 'task-matrix-a',
+    subtree: [
+      task({
+        id: 'task-matrix-a',
+        goal: 'Matrix task A',
+        viewStatus: 'idle',
+      }),
+    ],
+    transcript: [{ id: 'msg-matrix-a', kind: 'assistant', content: 'Matrix A ready.' }],
+    storeRevision: 83,
+  });
+
+  await expect(page.getByText('Matrix A ready.')).toBeVisible();
+  const taskAComposer = page.getByPlaceholder('Message this task…');
+  await expect(taskAComposer).toBeEnabled();
+  await taskAComposer.click();
+  await taskAComposer.pressSequentially('A @../', { delay: 15 });
+
+  const taskABefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(taskABefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+
+  const taskARequest = (await postedMessages(page))
+    .slice(taskABefore)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    requestId: string;
+    taskId?: string;
+    parentDepth: number;
+  };
+  expect(taskARequest.parentDepth).toBe(1);
+  expect(taskARequest.taskId).toBe('task-matrix-a');
+
+  await postSnapshot(page, {
+    type: 'snapshot',
+    rootTasks: [
+      task({
+        id: 'task-matrix-a',
+        goal: 'Matrix task A',
+        viewStatus: 'idle',
+      }),
+      task({
+        id: 'task-matrix-b',
+        goal: 'Matrix task B',
+        viewStatus: 'idle',
+      }),
+    ],
+    focusedTaskId: 'task-matrix-b',
+    subtree: [
+      task({
+        id: 'task-matrix-b',
+        goal: 'Matrix task B',
+        viewStatus: 'idle',
+      }),
+    ],
+    transcript: [{ id: 'msg-matrix-b', kind: 'assistant', content: 'Matrix B ready.' }],
+    storeRevision: 84,
+  });
+
+  await expect(page.getByText('Matrix B ready.')).toBeVisible();
+  const taskBComposer = page.getByPlaceholder('Message this task…');
+  await expect(taskBComposer).toBeEnabled();
+  await taskBComposer.fill('');
+  await taskBComposer.click();
+  await taskBComposer.pressSequentially('B @../', { delay: 15 });
+
+  const taskBBefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(taskBBefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+
+  const taskBRequest = (await postedMessages(page))
+    .slice(taskBBefore)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    requestId: string;
+    taskId?: string;
+  };
+  expect(taskBRequest.taskId).toBe('task-matrix-b');
+  expect(taskBRequest.requestId).not.toBe(taskARequest.requestId);
+
+  // Late response for task A must not paint on task B.
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: taskARequest.requestId,
+    parentDepth: 1,
+    relativeQuery: '',
+    items: [
+      {
+        id: 'file:../other-task.md',
+        kind: 'file',
+        label: 'other-task.md',
+        insertionPath: '../other-task.md',
+      },
+    ],
+  });
+  await expect(page.getByRole('listbox', { name: 'File mention suggestions' })).toHaveCount(0);
+  await expect(taskBComposer).toHaveValue('B @../');
+
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: taskBRequest.requestId,
+    parentDepth: 1,
+    relativeQuery: '',
+    items: [
+      {
+        id: 'file:../current-task.md',
+        kind: 'file',
+        label: 'current-task.md',
+        insertionPath: '../current-task.md',
+      },
+    ],
+  });
+
+  const taskBListbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+  await expect(taskBListbox).toBeVisible();
+  await expect(taskBListbox.getByRole('option', { name: 'other-task.md' })).toHaveCount(0);
+  await taskBListbox.getByRole('option', { name: 'current-task.md' }).click();
+  await expect(taskBComposer).toHaveValue('B @current-task.md ');
+
+  await page.getByRole('button', { name: 'Send' }).click();
+  await expectPostedMessage(page, {
+    type: 'send',
+    taskId: 'task-matrix-b',
+    text: 'B @current-task.md',
+    llmText: 'B @../current-task.md',
+  });
+
+  expect(consoleErrors, `console errors: ${consoleErrors.join(' | ')}`).toEqual([]);
+  expect(pageErrors, `page errors: ${pageErrors.join(' | ')}`).toEqual([]);
+  expect(failedRequests, `failed requests: ${failedRequests.join(' | ')}`).toEqual([]);
+});
+
 test('Add Context menu keeps the existing file picker and mention flow', async ({ page }) => {
     await openWebview(page);
 
