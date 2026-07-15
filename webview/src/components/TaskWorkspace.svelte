@@ -16,6 +16,14 @@
     isHandoffTerminal,
   } from '../lib/handoff-progress';
   import { buildDeleteQueuedTurnMessage, queuedTurnControlState } from '../lib/queued-turns';
+  import { selectTask as navSelectTask } from '../lib/task-nav';
+  import {
+    buildTaskTree,
+    countTaskTree,
+    flattenTaskTree,
+    formatTaskTreeSummary,
+    parentSummary,
+  } from '../lib/task-tree';
   import { tip } from '../lib/tooltip';
 
   interface Props {
@@ -33,11 +41,19 @@
   let statusMenuRegion = $state<HTMLElement | undefined>(undefined);
   /** Collapsed by default — detail lines (headline, session, orchestration) only when expanded. */
   let detailsExpanded = $state(false);
+  let treePanelOpen = $state(false);
 
   const focused = $derived(tasks.focusedTask);
   const thread = $derived(threadStore.current);
   const presentation = $derived(focused ? getTaskPresentation(focused) : null);
   const runtime = $derived(focused ? effectiveRuntimeActivity(focused) : null);
+  const treeCounts = $derived(countTaskTree(tasks.subtree));
+  const treeRows = $derived(flattenTaskTree(buildTaskTree(tasks.subtree)));
+  const parentTask = $derived(focused ? parentSummary(focused, tasks.subtree) : undefined);
+  const showTaskNav = $derived(
+    !!focused && (focused.parentId != null || tasks.subtree.length > 1),
+  );
+  const treeSummaryLabel = $derived(formatTaskTreeSummary(treeCounts));
   /** Preview source: thread user bubbles keyed by message id (host transcript projection). */
   const queuedTurnControls = $derived(
     tasks.queuedTurns.map((turn) =>
@@ -112,7 +128,42 @@
     void focused?.id;
     detailsExpanded = false;
     statusMenuOpen = false;
+    treePanelOpen = false;
   });
+
+  $effect(() => {
+    if (!treePanelOpen) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        treePanelOpen = false;
+      }
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  });
+
+  function goParent() {
+    if (!focused?.parentId) return;
+    treePanelOpen = false;
+    navSelectTask(focused.parentId);
+  }
+
+  function activateTreeNode(taskId: string) {
+    treePanelOpen = false;
+    if (taskId === focused?.id) return;
+    navSelectTask(taskId);
+  }
+
+  function shortGoal(goal: string): string {
+    const trimmed = goal.trim();
+    if (trimmed.length <= 48) return trimmed || '(no goal)';
+    return `${trimmed.slice(0, 45)}…`;
+  }
+
+  function lifecycleClass(lifecycle: string): string {
+    return `task-status task-status--${getLifecyclePresentation(lifecycle).tone}`;
+  }
 
   const showResume = $derived(
     !!focused &&
@@ -213,15 +264,6 @@
     post(message);
   }
 
-  function shortGoal(goal: string): string {
-    const trimmed = goal.trim();
-    return trimmed || '(no goal)';
-  }
-
-  function lifecycleClass(lifecycle: string): string {
-    return `task-status task-status--${getLifecyclePresentation(lifecycle).tone}`;
-  }
-
   /** Banner uses lifecycle tone only — turn activity is shown near the composer. */
   const bannerTone = $derived(presentation?.lifecycle.tone ?? 'neutral');
 
@@ -288,19 +330,100 @@
     <ChatThread />
     <Composer mode="draft" {pendingAsk} />
   {:else if focused && presentation}
-    {#if tasks.subtree.length > 1}
+    {#if showTaskNav}
       <div
-        class="px-2 py-1 border-b flex flex-wrap gap-1 items-center text-xs"
+        class="task-tree-nav"
+        data-testid="task-tree-nav"
         style="border-color: var(--vscode-panel-border);"
       >
-        <span style="opacity: 0.7;">Subtree:</span>
-        {#each tasks.subtree as node (node.id)}
-          {@const nodePresentation = getTaskPresentation(node)}
-          <vscode-badge use:tip={`${nodePresentation.listCopy}: ${node.goal}`} class={lifecycleClass(node.lifecycle)}>
-            {node.id === focused.id ? '▸ ' : ''}{shortGoal(node.goal).slice(0, 24)}
-            · {nodePresentation.lifecycle.label}
-          </vscode-badge>
-        {/each}
+        {#if focused.parentId}
+          <button
+            type="button"
+            class="task-tree-nav__parent"
+            data-testid="task-tree-parent"
+            aria-label={parentTask ? `Go to parent: ${parentTask.goal}` : 'Go to parent task'}
+            use:tip={parentTask?.goal ?? 'Parent task'}
+            onclick={goParent}
+          >
+            <span class="codicon codicon-arrow-up" aria-hidden="true"></span>
+            <span class="task-tree-nav__parent-label">
+              {parentTask ? shortGoal(parentTask.goal) : 'Parent'}
+            </span>
+          </button>
+        {:else}
+          <span class="task-tree-nav__parent task-tree-nav__parent--spacer" aria-hidden="true"></span>
+        {/if}
+        <button
+          type="button"
+          class="task-tree-nav__summary"
+          data-testid="task-tree-summary"
+          aria-expanded={treePanelOpen ? 'true' : 'false'}
+          aria-controls="task-tree-panel"
+          aria-label={`${treeSummaryLabel}. Open current task tree.`}
+          onclick={() => (treePanelOpen = !treePanelOpen)}
+        >
+          <span class="codicon codicon-list-tree" aria-hidden="true"></span>
+          <span class="task-tree-nav__summary-label">{treeSummaryLabel}</span>
+        </button>
+      </div>
+    {/if}
+
+    {#if treePanelOpen && showTaskNav}
+      <div
+        id="task-tree-panel"
+        class="task-tree-panel"
+        role="dialog"
+        aria-label="Current task tree"
+        data-testid="task-tree-panel"
+      >
+        <div class="task-tree-panel__header">
+          <span class="task-tree-panel__title">Current task tree</span>
+          <button
+            type="button"
+            class="icon-btn"
+            aria-label="Close task tree"
+            data-testid="task-tree-close"
+            onclick={() => (treePanelOpen = false)}
+          >
+            <span class="codicon codicon-close" aria-hidden="true"></span>
+          </button>
+        </div>
+        <div class="task-tree-panel__list">
+          {#each treeRows as row (row.task.id)}
+            {@const nodePresentation = getTaskPresentation(row.task)}
+            {@const isFocused = row.task.id === focused.id}
+            <button
+              type="button"
+              class="task-tree-panel__row"
+              class:task-tree-panel__row--focused={isFocused}
+              aria-current={isFocused ? 'page' : undefined}
+              data-testid="task-tree-row"
+              data-task-id={row.task.id}
+              style={`padding-left: ${8 + Math.min(row.depth, 4) * 12}px`}
+              onclick={() => activateTreeNode(row.task.id)}
+            >
+              <span
+                class="codicon task-tree-panel__role"
+                class:codicon-type-hierarchy-sub={row.task.role === 'coordinator'}
+                class:codicon-file={row.task.role !== 'coordinator'}
+                aria-hidden="true"
+              ></span>
+              <span class="task-tree-panel__goal" use:tip={row.task.goal}>{shortGoal(row.task.goal)}</span>
+              <span
+                class={`task-tree-panel__status ${
+                  row.task.lifecycle === 'open' && nodePresentation.runtime
+                    ? `task-status task-status--${nodePresentation.runtime.tone}`
+                    : lifecycleClass(row.task.lifecycle)
+                }`}
+                use:tip={nodePresentation.listCopy}
+              >
+                {row.task.lifecycle === 'open' && nodePresentation.runtime
+                  ? nodePresentation.runtime.label
+                  : nodePresentation.lifecycle.label}
+              </span>
+            </button>
+          {/each}
+        </div>
       </div>
     {/if}
 
@@ -310,6 +433,7 @@
       data-task-lifecycle={focused.lifecycle}
       data-task-status={focused.lifecycle}
       data-details-expanded={detailsExpanded ? 'true' : 'false'}
+      inert={treePanelOpen ? true : undefined}
     >
       <div class="min-w-0 flex-1">
         <div class="flex items-center gap-2 min-w-0">

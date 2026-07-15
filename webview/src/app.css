@@ -322,6 +322,143 @@ body {
   border-left-color: var(--vscode-descriptionForeground);
 }
 
+/* Owning-root task tree navigation (I1). */
+.task-tree-nav {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  max-height: 36px;
+  padding: 2px 8px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-editor-background, transparent);
+}
+
+.task-tree-nav__parent,
+.task-tree-nav__summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 2px 6px;
+  border: 0;
+  border-radius: 3px;
+  color: var(--vscode-foreground);
+  background: transparent;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.3;
+  cursor: pointer;
+}
+
+.task-tree-nav__parent:hover,
+.task-tree-nav__summary:hover {
+  background: var(--vscode-list-hoverBackground, color-mix(in srgb, var(--vscode-foreground) 8%, transparent));
+}
+
+.task-tree-nav__parent--spacer {
+  flex: 0 0 auto;
+  min-width: 0;
+  padding: 0;
+  pointer-events: none;
+}
+
+.task-tree-nav__parent-label,
+.task-tree-nav__summary-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-tree-nav__summary {
+  margin-left: auto;
+  flex-shrink: 1;
+  color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+}
+
+.task-tree-nav__summary .codicon,
+.task-tree-nav__parent .codicon {
+  font-size: 13px;
+  opacity: 0.85;
+}
+
+.task-tree-panel {
+  display: flex;
+  flex-direction: column;
+  max-height: min(40vh, 280px);
+  border-bottom: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-sideBar-background, var(--vscode-editor-background));
+}
+
+.task-tree-panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px;
+  border-bottom: 1px solid color-mix(in srgb, var(--vscode-panel-border) 80%, transparent);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.task-tree-panel__list {
+  overflow: auto;
+  padding: 4px;
+}
+
+.task-tree-panel__row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 28px;
+  padding: 3px 8px;
+  border: 0;
+  border-radius: 3px;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.task-tree-panel__row:hover {
+  background: var(--vscode-list-hoverBackground, color-mix(in srgb, var(--vscode-foreground) 8%, transparent));
+}
+
+.task-tree-panel__row--focused {
+  background: var(--vscode-list-activeSelectionBackground, var(--vscode-list-hoverBackground));
+  color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground));
+  box-shadow: inset 0 0 0 1px var(--vscode-focusBorder, #3794ff);
+}
+
+.task-tree-panel__role {
+  flex-shrink: 0;
+  font-size: 13px;
+  opacity: 0.85;
+}
+
+.task-tree-panel__goal {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-tree-panel__status {
+  flex-shrink: 0;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  opacity: 0.9;
+}
+
 .task-workspace-headline {
   margin-top: 4px;
   font-weight: 700;

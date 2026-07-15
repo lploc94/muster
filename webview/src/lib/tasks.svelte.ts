@@ -22,6 +22,11 @@ class TasksState {
   /** All known tasks keyed by id (roots + subtree entries from snapshots/patches). */
   tasks = $state<Map<string, TaskSummary>>(new Map());
   focusedTaskId = $state<string | null>(null);
+  /**
+   * Set while waiting for host snapshot after selectTask.
+   * focusedTaskId stays on the previous task until snapshot arrives (atomic focus).
+   */
+  pendingFocusTaskId = $state<string | null>(null);
   subtree = $state<TaskSummary[]>([]);
   storeRevision = $state(0);
 
@@ -257,12 +262,22 @@ class TasksState {
     this.continuationOf = null;
   }
 
+  /**
+   * Optimistic focus (legacy). Prefer `beginFocusRequest` + host snapshot for atomic switch.
+   */
   focusTask(taskId: string): void {
     this.draftMode = false;
     this.continuationOf = null;
     this.focusedTaskId = taskId;
-    // Drop prior focus queue until the host snapshot for this task arrives.
+    this.pendingFocusTaskId = null;
     this.queuedTurns = [];
+  }
+
+  /** Mark in-flight focus; keep prior focusedTaskId until applySnapshot. */
+  beginFocusRequest(taskId: string): void {
+    this.draftMode = false;
+    this.continuationOf = null;
+    this.pendingFocusTaskId = taskId;
   }
 
   applySnapshot(snapshot: SnapshotMessage): void {
@@ -284,6 +299,13 @@ class TasksState {
 
     if (snapshot.focusedTaskId) {
       this.focusedTaskId = snapshot.focusedTaskId;
+      if (this.pendingFocusTaskId === snapshot.focusedTaskId) {
+        this.pendingFocusTaskId = null;
+      } else if (this.pendingFocusTaskId && this.pendingFocusTaskId !== snapshot.focusedTaskId) {
+        // Stale snapshot for a different focus request — keep pending.
+      } else {
+        this.pendingFocusTaskId = null;
+      }
       this.draftMode = false;
       this.continuationOf = null;
       this.queuedTurns = sortQueuedTurns(snapshot.queuedTurns ?? []);
@@ -314,13 +336,15 @@ class TasksState {
       ...patch,
       id: taskId,
     };
-    this.tasks.set(taskId, merged);
+    // Reassign Map so $state consumers (root list / focusedTask) refresh.
+    const nextTasks = new Map(this.tasks);
+    nextTasks.set(taskId, merged);
+    this.tasks = nextTasks;
     this.revisionWatermarks.set(taskId, storeRevision);
     this.storeRevision = Math.max(this.storeRevision, storeRevision);
 
-    if (merged.parentId === null) {
-      // root list is derived from tasks map
-    } else if (this.focusedTaskId && this.subtree.some((t) => t.id === taskId)) {
+    // Update existing subtree members only (including root) — never invent membership.
+    if (this.subtree.some((t) => t.id === taskId)) {
       this.subtree = this.subtree.map((t) => (t.id === taskId ? merged : t));
     }
     this.reconcilePendingHandoffTarget(taskId);

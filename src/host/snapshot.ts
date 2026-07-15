@@ -695,11 +695,13 @@ export function buildSnapshot(
     return snapshot;
   }
 
-  const subtreeIds = collectSubtreeIds(file, focusedTaskId);
+  // Project the full owning-root tree so parent/sibling navigation remains
+  // available while focused on a descendant (transcript stays focus-scoped).
+  const owningRootId = findOwningRoot(file, focusedTaskId) ?? focusedTaskId;
+  const subtreeIds = collectSubtreeIds(file, owningRootId);
   snapshot.subtree = subtreeIds
     .map((taskId) => projectTaskSummary(file, taskId))
-    .filter((summary): summary is TaskSummary => summary !== undefined)
-    .sort((a, b) => a.id.localeCompare(b.id));
+    .filter((summary): summary is TaskSummary => summary !== undefined);
   snapshot.transcript = buildTranscript(file, focusedTaskId);
   snapshot.activeTurnId = activeTurnIdForTask(file, focusedTaskId);
   snapshot.queuedTurns = projectQueuedTurns(file, focusedTaskId);
@@ -716,22 +718,94 @@ export function buildSnapshot(
   return snapshot;
 }
 
-function collectSubtreeIds(file: TaskStoreFile, rootTaskId: string): string[] {
-  const ids = [rootTaskId];
-  const queue = [rootTaskId];
-  while (queue.length > 0) {
-    const current = queue.shift();
-    if (!current) {
-      continue;
+/** Walk parentId to the root coordinator; cycle-safe. */
+export function findOwningRoot(file: TaskStoreFile, taskId: string): string | undefined {
+  if (!file.tasks[taskId]) {
+    return undefined;
+  }
+  const visited = new Set<string>();
+  let current = taskId;
+  while (true) {
+    if (visited.has(current)) {
+      return current;
     }
+    visited.add(current);
+    const task = file.tasks[current];
+    if (!task || task.parentId === null) {
+      return current;
+    }
+    if (!file.tasks[task.parentId]) {
+      return current;
+    }
+    current = task.parentId;
+  }
+}
+
+/** Ancestor chain from task toward root (excludes taskId; root last). */
+export function collectAncestorIds(file: TaskStoreFile, taskId: string): string[] {
+  const ancestors: string[] = [];
+  const visited = new Set<string>();
+  let current = file.tasks[taskId]?.parentId;
+  while (current && !visited.has(current)) {
+    visited.add(current);
+    ancestors.push(current);
+    current = file.tasks[current]?.parentId ?? null;
+  }
+  return ancestors;
+}
+
+/**
+ * DFS preorder under rootTaskId. Siblings ordered by createdAt asc, then id.
+ */
+export function collectSubtreeIds(file: TaskStoreFile, rootTaskId: string): string[] {
+  if (!file.tasks[rootTaskId]) {
+    return [];
+  }
+  const ids: string[] = [];
+  const visited = new Set<string>();
+  const visit = (id: string) => {
+    if (visited.has(id)) {
+      return;
+    }
+    visited.add(id);
+    ids.push(id);
     const children = Object.values(file.tasks)
-      .filter((task) => task.parentId === current)
-      .map((task) => task.id)
-      .sort();
-    for (const childId of children) {
-      ids.push(childId);
-      queue.push(childId);
+      .filter((task) => task.parentId === id)
+      .sort(
+        (a, b) =>
+          a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id),
+      );
+    for (const child of children) {
+      visit(child.id);
+    }
+  };
+  visit(rootTaskId);
+  return ids;
+}
+
+/** True when focused owning-root membership (set of ids) changed between files. */
+export function owningRootMembershipChanged(
+  before: TaskStoreFile,
+  after: TaskStoreFile,
+  focusedTaskId: string,
+): boolean {
+  const rootBefore = findOwningRoot(before, focusedTaskId);
+  const rootAfter = findOwningRoot(after, focusedTaskId);
+  if (!rootAfter) {
+    return true;
+  }
+  if (rootBefore !== rootAfter) {
+    return true;
+  }
+  const beforeIds = new Set(collectSubtreeIds(before, rootBefore ?? focusedTaskId));
+  const afterIds = collectSubtreeIds(after, rootAfter);
+  if (beforeIds.size !== afterIds.length) {
+    return true;
+  }
+  for (const id of afterIds) {
+    if (!beforeIds.has(id)) {
+      return true;
     }
   }
-  return ids;
+  return false;
 }

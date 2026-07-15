@@ -3,6 +3,7 @@
   import { post, type TaskSummary } from '../lib/protocol';
   import { getLifecyclePresentation, isSoftTerminal } from '../lib/task-status';
   import { backendModelLabel } from '../lib/backends';
+  import { selectTask as navSelectTask } from '../lib/task-nav';
   import { tip } from '../lib/tooltip';
 
   interface Props {
@@ -34,9 +35,7 @@
     if (onSelect) {
       onSelect(taskId);
     } else {
-      tasks.focusTask(taskId);
-      post({ type: 'focusTask', taskId });
-      post({ type: 'hydrateSubtree', taskId });
+      navSelectTask(taskId);
     }
   }
 

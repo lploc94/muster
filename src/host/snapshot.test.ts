@@ -2,6 +2,10 @@ import { describe, expect, it } from 'vitest';
 import {
   activeTurnIdForTask,
   buildSnapshot,
+  collectAncestorIds,
+  collectSubtreeIds,
+  findOwningRoot,
+  owningRootMembershipChanged,
   projectCurrentTurnActivity,
   projectQueuedTurns,
   projectTaskSummary,
@@ -161,11 +165,12 @@ describe('host task snapshot projection', () => {
       updatedAt: '2026-07-06T00:14:00.000Z',
     });
     expect(snapshot.focusedTaskId).toBe('root-active');
+    // DFS preorder under owning root (siblings by createdAt then id).
     expect(snapshot.subtree?.map((summary) => [summary.id, summary.lifecycle, summary.runtimeActivity, summary.viewStatus])).toEqual([
-      ['child-a', 'open', 'waiting_dependencies', 'waiting_dependencies'],
-      ['child-b', 'open', 'idle', 'idle'],
-      ['grandchild', 'open', 'idle', 'idle'],
       ['root-active', 'open', 'running', 'running'],
+      ['child-a', 'open', 'waiting_dependencies', 'waiting_dependencies'],
+      ['grandchild', 'open', 'idle', 'idle'],
+      ['child-b', 'open', 'idle', 'idle'],
     ]);
     expect(snapshot.transcript).toEqual([
       {
@@ -1005,6 +1010,94 @@ describe('host task snapshot projection', () => {
     });
     expect(summary?.childOrchestration?.label).toContain('running');
     expect(projectTaskSummary(file, 'c1')).not.toHaveProperty('childOrchestration');
+  });
+
+  it('projects full owning-root tree when focus is a nested child', () => {
+    const file: TaskStoreFile = {
+      schemaVersion: 2,
+      revision: 1,
+      tasks: {
+        root: task('root', { role: 'coordinator', goal: 'Root' }),
+        a: task('a', { parentId: 'root', goal: 'A', createdAt: '2026-07-06T00:01:00.000Z' }),
+        b: task('b', { parentId: 'root', goal: 'B', createdAt: '2026-07-06T00:02:00.000Z' }),
+        nested: task('nested', { parentId: 'a', goal: 'Nested', createdAt: '2026-07-06T00:03:00.000Z' }),
+      },
+      turns: {},
+      messages: {
+        nestedUser: message({
+          id: 'nestedUser',
+          taskId: 'nested',
+          role: 'user',
+          content: 'only nested',
+        }),
+        rootUser: message({
+          id: 'rootUser',
+          taskId: 'root',
+          role: 'user',
+          content: 'only root',
+        }),
+      },
+    };
+
+    expect(findOwningRoot(file, 'nested')).toBe('root');
+    expect(collectAncestorIds(file, 'nested')).toEqual(['a', 'root']);
+    expect(collectSubtreeIds(file, 'root')).toEqual(['root', 'a', 'nested', 'b']);
+
+    const snapshot = buildSnapshot(storeFrom(file), 'nested');
+    expect(snapshot.focusedTaskId).toBe('nested');
+    expect(snapshot.subtree?.map((s) => s.id)).toEqual(['root', 'a', 'nested', 'b']);
+    expect(snapshot.transcript?.map((item) => item.id)).toEqual(['nestedUser']);
+  });
+
+  it('detects owning-root membership changes for sibling create', () => {
+    const before: TaskStoreFile = {
+      schemaVersion: 2,
+      revision: 1,
+      tasks: {
+        root: task('root', { role: 'coordinator' }),
+        a: task('a', { parentId: 'root' }),
+      },
+      turns: {},
+      messages: {},
+    };
+    const after: TaskStoreFile = {
+      ...before,
+      revision: 2,
+      tasks: {
+        ...before.tasks,
+        b: task('b', { parentId: 'root', createdAt: '2026-07-06T00:02:00.000Z' }),
+      },
+    };
+    expect(owningRootMembershipChanged(before, after, 'a')).toBe(true);
+    expect(owningRootMembershipChanged(before, before, 'a')).toBe(false);
+  });
+
+  it('collectSubtreeIds does not recurse forever on parent cycles', () => {
+    const selfParent: TaskStoreFile = {
+      schemaVersion: 2,
+      revision: 1,
+      tasks: {
+        loop: task('loop', { parentId: 'loop' }),
+      },
+      turns: {},
+      messages: {},
+    };
+    expect(collectSubtreeIds(selfParent, 'loop')).toEqual(['loop']);
+
+    const mutual: TaskStoreFile = {
+      schemaVersion: 2,
+      revision: 1,
+      tasks: {
+        a: task('a', { parentId: 'b' }),
+        b: task('b', { parentId: 'a' }),
+      },
+      turns: {},
+      messages: {},
+    };
+    const ids = collectSubtreeIds(mutual, 'a');
+    expect(ids).toContain('a');
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids.length).toBeLessThanOrEqual(2);
   });
 
 });

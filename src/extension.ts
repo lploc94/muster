@@ -23,6 +23,8 @@ import { ElicitationBridge } from './bridge/elicitation-bridge';
 import type { PermissionAuditEntry, PermissionMode } from './backends/permission-policy';
 import {
   buildSnapshot,
+  collectAncestorIds,
+  owningRootMembershipChanged,
   projectTaskSummary,
   type PendingAskOverlay,
   type TaskSnapshot,
@@ -860,7 +862,19 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    // Reproject ancestors so childOrchestration / derived aggregates stay fresh.
+    const expanded = new Set<string>(affectedTaskIds);
     for (const taskId of affectedTaskIds) {
+      for (const ancestorId of collectAncestorIds(file, taskId)) {
+        expanded.add(ancestorId);
+      }
+      // Also walk previous file in case of reparent/delete.
+      for (const ancestorId of collectAncestorIds(previous, taskId)) {
+        expanded.add(ancestorId);
+      }
+    }
+
+    for (const taskId of expanded) {
       const patch = projectTaskSummary(file, taskId);
       if (!patch) {
         continue;
@@ -893,10 +907,21 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     lastObservedRevision = file.revision;
     lastObservedFile = JSON.parse(JSON.stringify(file)) as TaskStoreFile;
 
-    if (this._view?.visible && this.focusedTaskId && affectedTaskIds.includes(this.focusedTaskId)) {
-      if (taskRecordsChanged(previous, file, this.focusedTaskId)) {
-        this.postSnapshot();
-      }
+    if (!this._view?.visible || !this.focusedTaskId) {
+      return;
+    }
+
+    // Membership under owning root (new/removed sibling) requires full subtree snapshot.
+    if (owningRootMembershipChanged(previous, file, this.focusedTaskId)) {
+      this.postSnapshot();
+      return;
+    }
+
+    if (
+      expanded.has(this.focusedTaskId) &&
+      taskRecordsChanged(previous, file, this.focusedTaskId)
+    ) {
+      this.postSnapshot();
     }
   }
 

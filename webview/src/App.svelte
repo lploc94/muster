@@ -28,6 +28,7 @@
   } from './lib/protocol';
   import { tip } from './lib/tooltip';
   import { outboxList, outboxMarkRejected, outboxPending, outboxRejected, outboxRemove } from './lib/send-outbox';
+  import { selectTask as navSelectTask } from './lib/task-nav';
   import { vscode } from './lib/vscode';
 
   const SETTING_LABELS: Record<RetentionSettingId, string> = {
@@ -97,9 +98,7 @@
   let taskTypesError = $state<string | null>(null);
 
   function selectTask(taskId: string) {
-    tasks.focusTask(taskId);
-    post({ type: 'focusTask', taskId });
-    post({ type: 'hydrateSubtree', taskId });
+    navSelectTask(taskId);
     historyOpen = false;
   }
 
@@ -341,9 +340,8 @@
           break;
 
         case 'askPending': {
-          if (tasks.tasks.has(msg.taskId) && msg.taskId !== tasks.focusedTaskId) {
-            tasks.focusTask(msg.taskId);
-          }
+          // Never auto-focus another task (owning-root makes siblings known).
+          // Tree attention counts surface needs-you; user opens via tree nav.
           if (msg.taskId === tasks.focusedTaskId) {
             pendingAsk = {
               turnId: msg.turnId,
