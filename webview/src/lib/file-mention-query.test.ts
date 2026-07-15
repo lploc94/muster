@@ -108,6 +108,21 @@ describe('parseActiveFileMentionQuery', () => {
     });
   });
 
+  it('accepts trailing slash as directory refinement under parent scopes', () => {
+    expect(parseActiveFileMentionQuery('@../packages/', 13)).toEqual({
+      start: 0,
+      end: 13,
+      parentDepth: 1,
+      relativeQuery: 'packages/',
+    });
+    expect(parseActiveFileMentionQuery('@src/', 5)).toEqual({
+      start: 0,
+      end: 5,
+      parentDepth: 0,
+      relativeQuery: 'src/',
+    });
+  });
+
   it('preserves relative directory and basename query under parent scopes', () => {
     expect(parseActiveFileMentionQuery('@../src', 7)).toEqual({
       start: 0,

@@ -3,6 +3,7 @@ import {
   FILE_MENTION_SUGGESTION_DEBOUNCE_MS,
   acceptFileMentionSuggestions,
   createFileMentionAutocompleteSession,
+  refineActiveFileMentionDirectory,
   replaceActiveFileMentionQuery,
 } from './file-mention-autocomplete';
 import type { FileMentionSuggestionItem } from './protocol';
@@ -19,6 +20,21 @@ const sampleItems: FileMentionSuggestionItem[] = [
     kind: 'directory',
     label: 'src',
     insertionPath: 'src',
+  },
+];
+
+const parentItems: FileMentionSuggestionItem[] = [
+  {
+    id: 'file:../root.md',
+    kind: 'file',
+    label: 'root.md',
+    insertionPath: '../root.md',
+  },
+  {
+    id: 'dir:../packages',
+    kind: 'directory',
+    label: 'packages',
+    insertionPath: '../packages',
   },
 ];
 
@@ -41,6 +57,21 @@ describe('replaceActiveFileMentionQuery', () => {
     const text = 'See @fi next';
     const result = replaceActiveFileMentionQuery(text, { start: 4, end: 7 }, '@file.ts');
     expect(result.text).toBe('See @file.ts next');
+  });
+});
+
+describe('refineActiveFileMentionDirectory', () => {
+  it('replaces the active range with @insertionPath/ and keeps autocomplete open for children', () => {
+    const text = 'Open @../';
+    const result = refineActiveFileMentionDirectory(text, { start: 5, end: 9 }, '../packages');
+    expect(result.text).toBe('Open @../packages/');
+    expect(result.caret).toBe('Open @../packages/'.length);
+  });
+
+  it('normalizes separators and strips trailing slashes from insertionPath', () => {
+    const result = refineActiveFileMentionDirectory('@../', { start: 0, end: 4 }, '..\\src\\');
+    expect(result.text).toBe('@../src/');
+    expect(result.caret).toBe('@../src/'.length);
   });
 });
 
@@ -141,6 +172,52 @@ describe('createFileMentionAutocompleteSession', () => {
     session.dispose();
   });
 
+  it('posts parentDepth 1 for @../ and parentDepth 2 for @../../', () => {
+    const posts: unknown[] = [];
+    let seq = 0;
+    const session = createFileMentionAutocompleteSession({
+      post: (msg) => posts.push(msg),
+      createRequestId: () => `req-${++seq}`,
+    });
+
+    session.onCaretChange({ text: '@../', caret: 4, canSend: true });
+    vi.advanceTimersByTime(FILE_MENTION_SUGGESTION_DEBOUNCE_MS);
+    expect(posts).toEqual([
+      {
+        type: 'requestFileMentionSuggestions',
+        requestId: 'req-1',
+        parentDepth: 1,
+        relativeQuery: '',
+      },
+    ]);
+
+    session.onCaretChange({ text: 'See @../../lib', caret: 14, canSend: true, taskId: 'task-a' });
+    vi.advanceTimersByTime(FILE_MENTION_SUGGESTION_DEBOUNCE_MS);
+    expect(posts[1]).toEqual({
+      type: 'requestFileMentionSuggestions',
+      requestId: 'req-2',
+      taskId: 'task-a',
+      parentDepth: 2,
+      relativeQuery: 'lib',
+    });
+    session.dispose();
+  });
+
+  it('never requests the host for depth-3 traversal tokens', () => {
+    const posts: unknown[] = [];
+    const session = createFileMentionAutocompleteSession({
+      post: (msg) => posts.push(msg),
+      createRequestId: () => 'req-x',
+    });
+
+    session.onCaretChange({ text: '@../../../', caret: 10, canSend: true });
+    vi.advanceTimersByTime(FILE_MENTION_SUGGESTION_DEBOUNCE_MS);
+    expect(posts).toHaveLength(0);
+    expect(session.getState().open).toBe(false);
+    expect(session.getState().pendingRequestId).toBeNull();
+    session.dispose();
+  });
+
   it('includes optional taskId on task-scoped requests', () => {
     const posts: unknown[] = [];
     const session = createFileMentionAutocompleteSession({
@@ -191,8 +268,8 @@ describe('createFileMentionAutocompleteSession', () => {
       items: sampleItems,
     });
     expect(session.getState().open).toBe(true);
-    // S01 session filters to file items for mouse selection.
-    expect(session.getState().items).toEqual([sampleItems[0]]);
+    // S02 shows both file and directory rows for navigation.
+    expect(session.getState().items).toEqual(sampleItems);
 
     session.onCaretChange({
       text: 'user@example.com',
@@ -245,7 +322,7 @@ describe('createFileMentionAutocompleteSession', () => {
       items: sampleItems,
     });
     expect(session.getState().open).toBe(true);
-    expect(session.getState().items).toEqual([sampleItems[0]]);
+    expect(session.getState().items).toEqual(sampleItems);
 
     session.reset();
     expect(session.getState()).toEqual({
@@ -257,7 +334,56 @@ describe('createFileMentionAutocompleteSession', () => {
     session.dispose();
   });
 
-  it('filters popup to file items for mouse selection (S01)', () => {
+  it('ignores stale responses from a prior parentDepth or focused task', () => {
+    const posts: unknown[] = [];
+    let seq = 0;
+    const session = createFileMentionAutocompleteSession({
+      post: (msg) => posts.push(msg),
+      createRequestId: () => `req-${++seq}`,
+    });
+
+    session.onCaretChange({ text: '@../', caret: 4, canSend: true, taskId: 'task-a' });
+    vi.advanceTimersByTime(FILE_MENTION_SUGGESTION_DEBOUNCE_MS);
+
+    // Late depth-0 response with matching id shape must not paint.
+    session.onResponse({
+      type: 'fileMentionSuggestions',
+      requestId: 'req-1',
+      parentDepth: 0,
+      relativeQuery: '',
+      items: sampleItems,
+    });
+    expect(session.getState().open).toBe(false);
+
+    // Matching requestId + query but focus moved to another task.
+    session.onCaretChange({ text: '@../', caret: 4, canSend: true, taskId: 'task-b' });
+    // Focus change alone does not re-fire until debounce; keep pending scope for task-a
+    // by applying a late matching response after focus moved via a new request:
+    vi.advanceTimersByTime(FILE_MENTION_SUGGESTION_DEBOUNCE_MS);
+    expect(posts).toHaveLength(2);
+
+    session.onResponse({
+      type: 'fileMentionSuggestions',
+      requestId: 'req-1',
+      parentDepth: 1,
+      relativeQuery: '',
+      items: parentItems,
+    });
+    expect(session.getState().open).toBe(false);
+
+    session.onResponse({
+      type: 'fileMentionSuggestions',
+      requestId: 'req-2',
+      parentDepth: 1,
+      relativeQuery: '',
+      items: parentItems,
+    });
+    expect(session.getState().open).toBe(true);
+    expect(session.getState().items).toEqual(parentItems);
+    session.dispose();
+  });
+
+  it('shows file and directory items for mouse navigation (S02)', () => {
     const session = createFileMentionAutocompleteSession({
       post: () => {},
       createRequestId: () => 'req-1',
@@ -271,7 +397,7 @@ describe('createFileMentionAutocompleteSession', () => {
       relativeQuery: '',
       items: sampleItems,
     });
-    expect(session.getState().items.map((i) => i.kind)).toEqual(['file']);
+    expect(session.getState().items.map((i) => i.kind)).toEqual(['file', 'directory']);
     session.dispose();
   });
 });

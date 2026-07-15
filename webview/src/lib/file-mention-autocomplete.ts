@@ -1,11 +1,17 @@
 /**
  * Pure file-mention autocomplete session for Composer.
- * Debounces request posts, correlates responses by requestId, and never stores
+ * Debounces request posts, correlates responses by request scope
+ * (requestId + parentDepth + relativeQuery + taskId), and never stores
  * absolute paths. Independent of Svelte DOM code.
  */
 
 import { parseActiveFileMentionQuery, type ActiveFileMentionQuery } from './file-mention-query';
+import {
+  acceptFileMentionSuggestionResponse,
+  type FileMentionSuggestionAcceptScope,
+} from './file-mention-suggestions';
 import type {
+  FileMentionParentDepth,
   FileMentionSuggestionItem,
   FileMentionSuggestionsMessage,
   OutMessage,
@@ -45,10 +51,17 @@ export interface FileMentionAutocompleteSession {
   dispose(): void;
 }
 
+/**
+ * Accept a host suggestion response only when requestId matches the active scope.
+ * Returns null for stale/mismatched responses. Failures close without free-form text.
+ *
+ * @deprecated Prefer acceptFileMentionSuggestionResponse for parentDepth/query/task scope.
+ * Kept for unit tests that exercise the legacy requestId-only shape.
+ */
 export interface AcceptFileMentionScope {
   requestId: string;
   relativeQuery: string;
-  parentDepth: 0;
+  parentDepth: FileMentionParentDepth;
 }
 
 /**
@@ -87,6 +100,26 @@ export function replaceActiveFileMentionQuery(
   };
 }
 
+/**
+ * Refine the active @query into a directory scope for drill-down navigation.
+ * Replaces the active range with `@insertionPath/` (no trailing space) so the
+ * caret stays inside a valid autocomplete token and children are requested next.
+ */
+export function refineActiveFileMentionDirectory(
+  text: string,
+  range: { start: number; end: number },
+  insertionPath: string,
+): { text: string; caret: number } {
+  const normalized = insertionPath.replace(/\\/g, '/').replace(/\/+$/, '');
+  const token = `@${normalized}/`;
+  const before = text.slice(0, range.start);
+  const after = text.slice(range.end);
+  return {
+    text: `${before}${token}${after}`,
+    caret: before.length + token.length,
+  };
+}
+
 function defaultRequestId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     return crypto.randomUUID();
@@ -101,11 +134,6 @@ function emptyState(): FileMentionAutocompleteState {
     activeQuery: null,
     pendingRequestId: null,
   };
-}
-
-/** S01 mouse selection only targets files (directories deferred). */
-function selectableItems(items: FileMentionSuggestionItem[]): FileMentionSuggestionItem[] {
-  return items.filter((item) => item.kind === 'file');
 }
 
 /**
@@ -124,7 +152,7 @@ export function createFileMentionAutocompleteSession(
   let timer: ReturnType<typeof setTimeout> | null = null;
   let disposed = false;
   /** Scope of the in-flight / last posted request (for response correlation). */
-  let pendingScope: AcceptFileMentionScope | null = null;
+  let pendingScope: FileMentionSuggestionAcceptScope | null = null;
   /** Latest caret input while a debounce is pending. */
   let latestInput: FileMentionAutocompleteCaretInput | null = null;
 
@@ -148,10 +176,11 @@ export function createFileMentionAutocompleteSession(
 
   function fireRequest(input: FileMentionAutocompleteCaretInput, query: ActiveFileMentionQuery): void {
     const requestId = createRequestId();
-    const scope: AcceptFileMentionScope = {
+    const scope: FileMentionSuggestionAcceptScope = {
       requestId,
       relativeQuery: query.relativeQuery,
-      parentDepth: 0,
+      parentDepth: query.parentDepth,
+      taskId: input.taskId,
     };
     pendingScope = scope;
     setState({
@@ -164,7 +193,7 @@ export function createFileMentionAutocompleteSession(
     const message: OutMessage = {
       type: 'requestFileMentionSuggestions',
       requestId,
-      parentDepth: 0,
+      parentDepth: query.parentDepth,
       relativeQuery: query.relativeQuery,
     };
     if (input.taskId) {
@@ -217,7 +246,11 @@ export function createFileMentionAutocompleteSession(
 
     onResponse(message: FileMentionSuggestionsMessage): void {
       if (disposed) return;
-      const accepted = acceptFileMentionSuggestions(pendingScope, message);
+      // Compare request-time taskId against the latest focused task/draft so a
+      // late response cannot paint after the composer scope has moved.
+      const accepted = acceptFileMentionSuggestionResponse(pendingScope, message, {
+        focusedTaskId: latestInput?.taskId,
+      });
       if (!accepted) {
         // Stale response — ignore without closing a newer pending request.
         return;
@@ -232,10 +265,10 @@ export function createFileMentionAutocompleteSession(
         pendingScope = null;
         return;
       }
-      const items = selectableItems(accepted.items);
+      // S02: show files and directories so mouse navigation can drill down.
       setState({
-        open: items.length > 0,
-        items,
+        open: accepted.items.length > 0,
+        items: accepted.items,
         activeQuery: state.activeQuery,
         pendingRequestId: null,
       });

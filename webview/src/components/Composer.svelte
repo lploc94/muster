@@ -38,6 +38,7 @@
   } from '../lib/file-mention-bindings';
   import {
     createFileMentionAutocompleteSession,
+    refineActiveFileMentionDirectory,
     replaceActiveFileMentionQuery,
     type FileMentionAutocompleteState,
   } from '../lib/file-mention-autocomplete';
@@ -465,11 +466,30 @@
     });
   }
 
-  /** Mouse selection of a host suggestion: replace only the active @query range. */
+  /** Mouse selection of a host suggestion: files insert; directories refine and re-query. */
   function selectFileMentionSuggestion(item: FileMentionSuggestionItem) {
-    if (!canSend || item.kind !== 'file') return;
+    if (!canSend) return;
     const active = mentionAutocompleteSession.getState().activeQuery;
     if (!active) return;
+
+    if (item.kind === 'directory') {
+      const refined = refineActiveFileMentionDirectory(
+        draftText,
+        { start: active.start, end: active.end },
+        item.insertionPath,
+      );
+      draftText = refined.text;
+      queueMicrotask(() => {
+        textareaEl?.focus();
+        textareaEl?.setSelectionRange(refined.caret, refined.caret);
+        syncHighlightScroll();
+        // Re-parse @insertionPath/ and request children under that directory.
+        notifyMentionAutocompleteCaret();
+      });
+      return;
+    }
+
+    if (item.kind !== 'file') return;
     const { token } = allocateDisplayToken(mentionBindings, item.insertionPath, item.label);
     if (!token) return;
     const replaced = replaceActiveFileMentionQuery(draftText, { start: active.start, end: active.end }, token);
@@ -1116,13 +1136,17 @@
           <button
             type="button"
             class="file-mention-listbox__item"
+            class:file-mention-listbox__item--directory={item.kind === 'directory'}
             role="option"
-            aria-label={item.label}
+            aria-label={item.kind === 'directory' ? `${item.label}/` : item.label}
             data-testid="file-mention-option"
+            data-kind={item.kind}
             data-insertion-path={item.insertionPath}
             onclick={() => selectFileMentionSuggestion(item)}
           >
-            <span class="file-mention-listbox__item-label">{item.label}</span>
+            <span class="file-mention-listbox__item-label">
+              {item.kind === 'directory' ? `${item.label}/` : item.label}
+            </span>
           </button>
         {/each}
       </div>

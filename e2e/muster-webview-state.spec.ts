@@ -389,9 +389,9 @@ test('file mention autocomplete requests host suggestions and inserts a relative
 
   const listbox = page.getByRole('listbox', { name: 'File mention suggestions' });
   await expect(listbox).toBeVisible();
-  // S01 mouse selection is file-only; directory rows are filtered out.
+  // S02 shows files and directories so mouse navigation can drill down.
   await expect(listbox.getByRole('option', { name: 'readme.md' })).toBeVisible();
-  await expect(listbox.getByRole('option', { name: 'src' })).toHaveCount(0);
+  await expect(listbox.getByRole('option', { name: 'src/' })).toBeVisible();
 
   await listbox.getByRole('option', { name: 'readme.md' }).click();
   await expect(listbox).toHaveCount(0);
@@ -404,6 +404,195 @@ test('file mention autocomplete requests host suggestions and inserts a relative
     text: 'Review @readme.md',
     backend: 'claude',
   });
+});
+
+/**
+ * T03: parent/grandparent depth tokens, directory drill-down, depth-3 rejection,
+ * and stale-response non-paint — real typing + mouse activation.
+ */
+test('file mention autocomplete navigates parent depth and directory drill-down', async ({
+  page,
+}) => {
+  await openWebview(page);
+  await postSnapshot(page, { type: 'snapshot', rootTasks: [], storeRevision: 30 });
+  await page.getByRole('button', { name: 'New task' }).first().click();
+  await expectPostedMessage(page, { type: 'newTask' });
+
+  const composer = page.getByPlaceholder('Start a new coordinator task with claude…');
+  await composer.click();
+
+  // ── Depth 1: @../ ───────────────────────────────────────────────────────
+  await composer.pressSequentially('Parent @../', { delay: 20 });
+
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages.filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+
+  const depth1Request = (await postedMessages(page)).find(
+    (m) => (m as { type?: string }).type === 'requestFileMentionSuggestions',
+  ) as {
+    type: string;
+    requestId: string;
+    parentDepth: number;
+    relativeQuery: string;
+  };
+  expect(depth1Request.parentDepth).toBe(1);
+  expect(depth1Request.relativeQuery).toBe('');
+  expect(typeof depth1Request.requestId).toBe('string');
+
+  // Inject a deliberately stale prior-query response first — must not paint.
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: 'stale-prior-query',
+    parentDepth: 0,
+    relativeQuery: 'old',
+    items: [
+      {
+        id: 'file:stale.md',
+        kind: 'file',
+        label: 'stale.md',
+        insertionPath: 'stale.md',
+      },
+    ],
+  });
+  await expect(page.getByRole('listbox', { name: 'File mention suggestions' })).toHaveCount(0);
+
+  // Matching depth-1 response with directory + file.
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: depth1Request.requestId,
+    parentDepth: 1,
+    relativeQuery: '',
+    items: [
+      {
+        id: 'file:../root.md',
+        kind: 'file',
+        label: 'root.md',
+        insertionPath: '../root.md',
+      },
+      {
+        id: 'dir:../packages',
+        kind: 'directory',
+        label: 'packages',
+        insertionPath: '../packages',
+      },
+    ],
+  });
+
+  const listbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+  await expect(listbox).toBeVisible();
+  await expect(listbox.getByRole('option', { name: 'root.md' })).toBeVisible();
+  await expect(listbox.getByRole('option', { name: 'packages/' })).toBeVisible();
+  // Stale label must never appear.
+  await expect(listbox.getByRole('option', { name: 'stale.md' })).toHaveCount(0);
+
+  // Directory selection refines token and requests children under that scope.
+  const beforeDrill = (await postedMessages(page)).length;
+  await listbox.getByRole('option', { name: 'packages/' }).click();
+  await expect(composer).toHaveValue('Parent @../packages/');
+
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(beforeDrill)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+
+  const drillRequest = (await postedMessages(page))
+    .slice(beforeDrill)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    type: string;
+    requestId: string;
+    parentDepth: number;
+    relativeQuery: string;
+  };
+  expect(drillRequest.parentDepth).toBe(1);
+  expect(drillRequest.relativeQuery).toBe('packages/');
+
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: drillRequest.requestId,
+    parentDepth: 1,
+    relativeQuery: 'packages/',
+    items: [
+      {
+        id: 'file:../packages/pkg.json',
+        kind: 'file',
+        label: 'pkg.json',
+        insertionPath: '../packages/pkg.json',
+      },
+    ],
+  });
+
+  const childListbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+  await expect(childListbox).toBeVisible();
+  await childListbox.getByRole('option', { name: 'pkg.json' }).click();
+  await expect(childListbox).toHaveCount(0);
+  await expect(composer).toHaveValue('Parent @pkg.json ');
+
+  // ── Depth 2: clear and type @../../ ─────────────────────────────────────
+  await composer.fill('');
+  await composer.click();
+  await composer.pressSequentially('Grand @../../', { delay: 20 });
+
+  const beforeDepth2 = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(beforeDepth2)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+
+  const depth2Request = (await postedMessages(page))
+    .slice(beforeDepth2)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    type: string;
+    requestId: string;
+    parentDepth: number;
+    relativeQuery: string;
+  };
+  expect(depth2Request.parentDepth).toBe(2);
+  expect(depth2Request.relativeQuery).toBe('');
+
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: depth2Request.requestId,
+    parentDepth: 2,
+    relativeQuery: '',
+    items: [
+      {
+        id: 'file:../../top.md',
+        kind: 'file',
+        label: 'top.md',
+        insertionPath: '../../top.md',
+      },
+    ],
+  });
+
+  const depth2Listbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+  await expect(depth2Listbox).toBeVisible();
+  await depth2Listbox.getByRole('option', { name: 'top.md' }).click();
+  await expect(composer).toHaveValue('Grand @top.md ');
+
+  // ── Depth 3: @../../../ must never request the host ─────────────────────
+  await composer.fill('');
+  await composer.click();
+  const beforeDepth3 = (await postedMessages(page)).length;
+  await composer.pressSequentially('Too deep @../../../', { delay: 20 });
+  // Wait past debounce; no new request should appear.
+  await page.waitForTimeout(250);
+  const afterDepth3 = (await postedMessages(page)).slice(beforeDepth3).filter(
+    (m) => (m as { type?: string }).type === 'requestFileMentionSuggestions',
+  );
+  expect(afterDepth3).toHaveLength(0);
+  await expect(page.getByRole('listbox', { name: 'File mention suggestions' })).toHaveCount(0);
 });
 
 /**
@@ -477,8 +666,8 @@ test('current-directory file mention flow covers draft and idle task dual-text s
   const draftListbox = page.getByRole('listbox', { name: 'File mention suggestions' });
   await expect(draftListbox).toBeVisible();
   await expect(draftListbox.getByRole('option', { name: 'readme.md' })).toBeVisible();
-  // S01 mouse selection is file-only; directory rows are filtered out.
-  await expect(draftListbox.getByRole('option', { name: 'reports' })).toHaveCount(0);
+  // S02 shows directory rows for drill-down navigation.
+  await expect(draftListbox.getByRole('option', { name: 'reports/' })).toBeVisible();
 
   await draftListbox.getByRole('option', { name: 'readme.md' }).click();
   await expect(draftListbox).toHaveCount(0);
@@ -570,7 +759,7 @@ test('current-directory file mention flow covers draft and idle task dual-text s
   const taskListbox = page.getByRole('listbox', { name: 'File mention suggestions' });
   await expect(taskListbox).toBeVisible();
   await expect(taskListbox.getByRole('option', { name: 'package.json' })).toBeVisible();
-  await expect(taskListbox.getByRole('option', { name: 'packages' })).toHaveCount(0);
+  await expect(taskListbox.getByRole('option', { name: 'packages/' })).toBeVisible();
 
   await taskListbox.getByRole('option', { name: 'package.json' }).click();
   await expect(taskListbox).toHaveCount(0);

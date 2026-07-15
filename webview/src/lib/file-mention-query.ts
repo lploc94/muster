@@ -137,8 +137,20 @@ function parseBoundedParentScopedQuery(query: string): ScopedQuery | null {
     return { parentDepth: parentDepth as FileMentionParentDepth, relativeQuery: '' };
   }
 
-  // Reject empty segments (consecutive slashes) and `.` / `..` path segments.
-  const segments = rest.split('/');
+  // Trailing slash is valid directory refinement (`src/`, `../packages/`).
+  // Preserve it in relativeQuery so the host lists that directory; reject bare `/`
+  // and consecutive internal empty segments (`a//b`).
+  const endsWithSlash = rest.endsWith('/');
+  const withoutTrailing = rest.replace(/\/+$/, '');
+  if (withoutTrailing.length === 0) {
+    // Only slashes after the parent prefix (e.g. `@../` is already empty rest).
+    return null;
+  }
+  if (rest.includes('//')) {
+    return null;
+  }
+
+  const segments = withoutTrailing.split('/');
   for (const segment of segments) {
     if (segment === '' || segment === '.' || segment === '..') {
       return null;
@@ -147,6 +159,7 @@ function parseBoundedParentScopedQuery(query: string): ScopedQuery | null {
 
   return {
     parentDepth: parentDepth as FileMentionParentDepth,
-    relativeQuery: rest,
+    // Keep a single trailing slash when present for directory drill-down.
+    relativeQuery: endsWithSlash ? `${withoutTrailing}/` : withoutTrailing,
   };
 }
