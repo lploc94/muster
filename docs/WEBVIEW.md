@@ -215,12 +215,13 @@ interface TranscriptItem {
 
 | `type` | Payload | When |
 |--------|---------|------|
-| `send` | `{ text: string; continueLast?: boolean }` | User submits composer |
+| `send` | `{ text: string; llmText?: string; continueLast?: boolean }` | User submits composer; optional `llmText` carries expanded file-mention paths |
 | `newSession` | `{}` | Toolbar — clear session ID, reset UI |
 | `loadHistory` | `{ before?: string; limit: number }` | Lazy-load older transcript (scroll-up / on restore). `before` = id of oldest loaded item (cursor); omit for the latest window |
 | `cancelTurn` | `{}` | User aborts in-flight turn (`AbortSignal`) |
 | `submitAsk` | `{ id: string; answers: Record<string, { selected: string[]; freeText: string \| null }> }` | Ask card submitted |
 | `cancelAsk` | `{ id: string }` | User dismisses ask — may cancel turn |
+| `requestFileMentionSuggestions` | `{ requestId; taskId?; parentDepth: 0\|1\|2; relativeQuery }` | Active unquoted `@` query at caret (see §12.1) |
 
 Answer keys are **question index as string** (`"0"`, `"1"`, …) per MUSTER-BRIDGE §3.3.
 
@@ -594,6 +595,58 @@ Dragging onto an enabled composer inserts a **textual file mention** (chip). It 
 ### Proof boundary
 
 Unit tests cover extraction, host resolution, import, and mention expand-on-send. Focused Playwright covers the browser-visible composer flow with synthetic host messages. Local unit and Playwright checks are **supportive only**; live Extension Development Host observation is required for PASS/FAIL of native Explorer/Finder drags.
+
+---
+
+## 12.1 File-mention autocomplete (`@`, `@../`, `@../../`)
+
+While typing in an enabled composer, an unquoted `@query` at the caret opens a host-backed suggestion listbox. The webview never supplies a filesystem path or cwd; the host derives the authoritative working directory from the focused task or draft context.
+
+### Trigger grammar and scope
+
+| Trigger | `parentDepth` | Scope root |
+|---------|---------------|------------|
+| `@` + relative query | `0` | Current task/draft cwd |
+| `@../` + relative query | `1` | Parent of cwd |
+| `@../../` + relative query | `2` | Grandparent of cwd |
+
+- Relative query characters: ASCII letters, digits, `_ . / \\ -` after the leading parent prefix.
+- Directory refinement uses a trailing slash (for example `@src/` or `@../packages/ui/`) so the host lists that directory and filters by basename prefix when typing continues.
+- **Depth limit:** at most two parent ascents. `@../../../` and deeper do **not** open a request.
+- **Fail closed:** absolute roots (`/…`, `\\…`), drive/UNC prefixes, email-like `@` (word char immediately before `@`), quoted `@"…"` tokens, control characters, empty path segments, and embedded `.` / `..` segments are not active autocomplete queries.
+
+### Protocol
+
+1. Webview posts `requestFileMentionSuggestions { requestId, taskId?, parentDepth, relativeQuery }` after a short debounce (~120 ms).
+2. Host lists **one directory non-recursively** under the selected scope (optionally refined by relative directory segments), filters by basename prefix, and replies `fileMentionSuggestions`.
+3. Success returns relative `items[]` only (`id`, `kind: 'file' | 'directory'`, `label`, `insertionPath`). Failures use bounded codes only: `invalidRequest`, `unavailable`, `listingFailed` — never absolute paths, cwd, raw filesystem messages, or free-form error text.
+4. Accepting a **file** replaces the active `@…` span with a relative mention token and binds display to resolve path. Accepting a **directory** refines the query (appends `/`) and re-requests children.
+5. On **send**, transcript/UI keeps short display text; optional `llmText` expands bound chips to agent-facing paths (`TaskMessage.agentContent`). Unbound hand-typed mentions are left unchanged.
+
+### Keyboard and mouse
+
+| Input | Behavior when listbox open |
+|-------|----------------------------|
+| ArrowDown / ArrowUp | Move highlight (wraps) |
+| Enter / Tab | Accept the highlighted selectable option |
+| Escape | Dismiss popup |
+| Mouse click on option | Accept that option |
+| Shift+Enter, Ctrl/Meta+Enter | Do **not** accept; leave newline / interrupt-and-send policy free |
+| IME composition / keyCode 229 | No accept, dismiss, or send |
+
+When the popup is closed or empty, Enter / Ctrl+Enter remain owned by the normal composer submit policy.
+
+### Limits and exclusions
+
+- At most **50** suggestions per response; query, requestId, and taskId strings are length-capped (256 / 128 / 128).
+- Hidden/dotfile names and blocked directories (for example `node_modules`, `.git`, `dist`, `build`, `coverage`, `tmp`, `vendor`, `__pycache__`) are never suggested.
+- Directory **symlinks** are skipped; refinement refuses to follow a directory symlink that would escape the selected scope.
+- Stale responses are rejected by correlating `requestId` + `parentDepth` + `relativeQuery` + focused `taskId`. Cross-task responses must not paint.
+- Empty success keeps the popup open with a sanitized empty status; failures show a sanitized status without host filesystem details.
+
+### Proof boundary
+
+Unit and focused Playwright coverage (including the greppable integrated acceptance matrix) exercise typing, scopes, refinement, keyboard/mouse accept, display vs `llmText`, stale/cross-task rejection, and depth rejection against mocked host messages. Those results are **supportive only**. Live Extension Development Host observation for popup discovery, all three scopes, keyboard selection, task-cwd behavior, and cleanup is recorded in `docs/uat/m011-s04/file-mention-autocomplete-live-host-evidence.md` as `PASS`, `FAIL`, or `ENVIRONMENT BLOCKED` and must never be upgraded from Playwright.
 
 ---
 

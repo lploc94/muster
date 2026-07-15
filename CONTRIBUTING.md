@@ -67,6 +67,21 @@ Record the attempt in `docs/uat/m006-s05/presentation-live-host-evidence.md`:
 
 Local integration and Playwright results are **supportive only**. They do not prove live-host behavior or upgrade a live verdict. Validate the ledger with `npm run test:presentation-live-evidence`; its errors identify the scenario or evidence rule that failed.
 
+## File-mention autocomplete verification and live-host evidence
+
+Composer `@` / `@../` / `@../../` autocomplete is host-backed: the webview never supplies a filesystem path. Before collecting live evidence, run the local contract gates:
+
+```bash
+npm test -- src/host/file-mention-suggestions.test.ts webview/src/lib/file-mention-*.test.ts
+npm run compile
+npm run test:webview -- e2e/muster-webview-state.spec.ts --grep "file mention"
+npm run test:file-mention-autocomplete-live-evidence
+```
+
+Focused Playwright (including the greppable integrated acceptance matrix) uses synthetic host messages and is **supportive only**. Press **F5** and use the actual Extension Development Host for live proof. Attempt all eight ledger scenarios: popup discovery, current / parent / grandparent scopes, directory refinement, keyboard selection, task-cwd scoping, and cleanup/reload.
+
+Record each scenario in `docs/uat/m011-s04/file-mention-autocomplete-live-host-evidence.md` with one `PASS`, `FAIL`, or `ENVIRONMENT BLOCKED` verdict, a UTC timestamp, expected and observed results, bounded evidence, blocker detail, and cleanup. Use `ENVIRONMENT BLOCKED` only after naming the attempted step and concrete unavailable control. Never promote unit or Playwright results to live proof, and never record absolute paths, workspace identity, file contents, credentials, raw transcripts, or task-store data. Validate the ledger with `npm run test:file-mention-autocomplete-live-evidence`.
+
 ## File-drop verification and live-host evidence
 
 Workspace file drops create textual mentions, not attachments. Before collecting live evidence, run the local contract gates:

@@ -928,6 +928,28 @@ Default host policy must set finite limits for at least:
 ## 9. User messages and focused-task chat
 
 `send(taskId, message)` targets the focused task. Lifecycle and runtime activity
+both constrain behavior.
+
+### 9.0 File-mention autocomplete and host filesystem authority
+
+Composer `@` autocomplete is a focused-task UX surface with **host-owned path
+authority**:
+
+- The webview posts only `requestFileMentionSuggestions` with `requestId`,
+  optional focused `taskId`, bounded `parentDepth` (`0` current / `1` parent /
+  `2` grandparent), and a relative query string. It never supplies cwd or
+  absolute paths.
+- The host resolves cwd from task or draft context, ascends at most two parent
+  levels, optionally refines into a relative directory under that scope, lists
+  one directory non-recursively, and returns relative suggestion items only.
+- Accepted file mentions insert relative tokens into the draft; on send the
+  transcript keeps short display text while optional `llmText` expands bound
+  chips for the agent (`TaskMessage.agentContent`).
+- Task focus changes re-scope subsequent requests; stale or cross-task responses
+  must not paint. Full trigger grammar, keyboard controls, limits, exclusions,
+  and proof boundary live in `WEBVIEW.md` §12.1.
+
+`send(taskId, message)` targets the focused task. Lifecycle and runtime activity
 both constrain behavior:
 
 | Lifecycle | Runtime activity (if open) | Behavior |
