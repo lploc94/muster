@@ -29,7 +29,7 @@ import {
   type CreateTaskContext,
 } from './transitions';
 import type { DepGraph } from './deps';
-import type { MusterTask, TaskMessage, TaskTurn } from './types';
+import type { MusterTask, TaskBriefKind, TaskDependency, TaskMessage, TaskTurn } from './types';
 
 const NOW = '2026-07-06T00:00:00.000Z';
 
@@ -148,6 +148,89 @@ describe('createTask', () => {
       { ...createCtx, graph },
     );
     expect(result).toEqual({ ok: false, reason: 'dependency cycle detected' });
+  });
+
+  // verify-gate-loop B: depending on a verify-kind producer auto-defaults requiredVerdict.
+  const gateGraph = (kindById: Record<string, TaskBriefKind>): DepGraph => ({
+    rootOf: (id) => (id in kindById ? 'root' : undefined),
+    dependsOn: () => [],
+    briefKindOf: (id) => kindById[id],
+  });
+
+  function createWithDep(dep: TaskDependency, graph: DepGraph) {
+    return createTask(
+      {
+        id: 'task-1',
+        role: 'worker',
+        goal: 'do work',
+        parentId: 'root',
+        dependencies: [dep],
+        backend: 'grok',
+        capabilities: [],
+        executionPolicy: defaultPolicy,
+      },
+      { ...createCtx, graph },
+    );
+  }
+
+  it('auto-gates a dependency on a verify-kind producer (requiredVerdict defaults to pass)', () => {
+    const result = createWithDep(
+      { taskId: 'vfy', requiredOutcome: 'succeeded', onUnsatisfied: 'block' },
+      gateGraph({ vfy: 'verify' }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.next.dependencies).toEqual([
+        { taskId: 'vfy', requiredOutcome: 'succeeded', onUnsatisfied: 'block', requiredVerdict: 'pass' },
+      ]);
+    }
+  });
+
+  it('does NOT auto-gate a dependency on a non-verify producer', () => {
+    const result = createWithDep(
+      { taskId: 'impl', requiredOutcome: 'succeeded', onUnsatisfied: 'block' },
+      gateGraph({ impl: 'implement' }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.next.dependencies).toEqual([
+        { taskId: 'impl', requiredOutcome: 'succeeded', onUnsatisfied: 'block' },
+      ]);
+      expect(result.next.dependencies[0].requiredVerdict).toBeUndefined();
+    }
+  });
+
+  it('never overwrites an explicit requiredVerdict on a verify-kind dependency', () => {
+    const result = createWithDep(
+      { taskId: 'vfy', requiredOutcome: 'settled', onUnsatisfied: 'skip', requiredVerdict: 'pass' },
+      gateGraph({ vfy: 'verify' }),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.next.dependencies).toEqual([
+        { taskId: 'vfy', requiredOutcome: 'settled', onUnsatisfied: 'skip', requiredVerdict: 'pass' },
+      ]);
+    }
+  });
+
+  it('skipVerifyAutoGate opts out (remediation-safe: a fix may depend on the failed verify)', () => {
+    const result = createTask(
+      {
+        id: 'task-1',
+        role: 'worker',
+        goal: 'fix',
+        parentId: 'root',
+        dependencies: [{ taskId: 'vfy', requiredOutcome: 'succeeded', onUnsatisfied: 'block' }],
+        backend: 'grok',
+        capabilities: [],
+        executionPolicy: defaultPolicy,
+      },
+      { ...createCtx, graph: gateGraph({ vfy: 'verify' }), skipVerifyAutoGate: true },
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.next.dependencies[0].requiredVerdict).toBeUndefined();
+    }
   });
 });
 

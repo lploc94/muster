@@ -129,6 +129,7 @@ function depGraphFromFile(file: TaskStoreFile): DepGraph {
       return current.id;
     },
     dependsOn: (taskId) => file.tasks[taskId]?.dependencies.map((d) => d.taskId) ?? [],
+    briefKindOf: (taskId) => file.tasks[taskId]?.brief?.kind,
   };
 }
 

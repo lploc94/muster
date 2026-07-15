@@ -66,11 +66,22 @@ describe('breakdown briefKind', () => {
   });
 });
 
-describe('verify preamble + opt-in verdict (ISSUE 6)', () => {
-  it('uses the legacy verify preamble and NO verdict section by default', () => {
+describe('verify preamble + verdict-by-default (ISSUE 6 / verify-gate-loop A)', () => {
+  it('appends the # Verdict instruction for a plain verify-kind brief BY DEFAULT', () => {
+    // verify-gate-loop A: emitting a verdict is the job of a verify task, so a plain
+    // verify brief (no hostRun/emitVerdict flag) now includes the verdict section.
     const brief = synthesizeBriefFromGoal('Verify the widget', undefined, 'verify');
     const prompt = compileTaskPrompt(brief, [], { taskId: 'vfy', goal: 'Verify the widget' });
     expect(prompt).toContain('You are a verification agent. Confirm acceptance criteria and definition of done.');
+    expect(prompt).toContain('# Verdict');
+    expect(prompt).toContain('structured verdict');
+    expect(prompt).toContain("never a default 'pass'");
+  });
+
+  it('does NOT append the # Verdict instruction for a non-verify brief without the flag', () => {
+    // A non-verify kind (here `implement`) with no emitVerdict/hostRun opt-in stays clean.
+    const brief = synthesizeBriefFromGoal('Build the widget', undefined, 'implement');
+    const prompt = compileTaskPrompt(brief, [], { taskId: 'impl', goal: 'Build the widget' });
     expect(prompt).not.toContain('# Verdict');
     expect(prompt).not.toContain('structured verdict');
   });
