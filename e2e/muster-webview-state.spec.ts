@@ -596,6 +596,423 @@ test('file mention autocomplete navigates parent depth and directory drill-down'
 });
 
 /**
+ * T04: assembled S02 bounded parent navigation flow.
+ * Real typing for @../ / @../../, nested directory mouse drill-down,
+ * normalized relative insert + dual-text send, depth-3 non-request,
+ * and late responses from a prior query / other task that must not paint.
+ * Fixture-relative insertion paths only — never absolute host paths.
+ */
+test('bounded parent file mention flow covers depth, drill-down, stale task, and insert', async ({
+  page,
+}) => {
+  await openWebview(page);
+
+  // ── Draft @../ depth 1 + nested directory path ─────────────────────────
+  await postSnapshot(page, { type: 'snapshot', rootTasks: [], storeRevision: 40 });
+  await page.getByRole('button', { name: 'New task' }).first().click();
+  await expectPostedMessage(page, { type: 'newTask' });
+
+  const draftComposer = page.getByPlaceholder('Start a new coordinator task with claude…');
+  await draftComposer.click();
+  await draftComposer.pressSequentially('Scope @../', { delay: 20 });
+
+  const draftDepth1Before = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(draftDepth1Before)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+
+  const draftDepth1 = (await postedMessages(page))
+    .slice(draftDepth1Before)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    type: string;
+    requestId: string;
+    parentDepth: number;
+    relativeQuery: string;
+    taskId?: string;
+  };
+  expect(draftDepth1.parentDepth).toBe(1);
+  expect(draftDepth1.relativeQuery).toBe('');
+  expect(draftDepth1.taskId).toBeUndefined();
+  expect(typeof draftDepth1.requestId).toBe('string');
+  expect(draftDepth1.requestId.length).toBeGreaterThan(0);
+
+  // Late response from a prior (different) query — must not paint.
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: 'stale-prior-query-t04',
+    parentDepth: 0,
+    relativeQuery: 'old',
+    items: [
+      {
+        id: 'file:stale-prior.md',
+        kind: 'file',
+        label: 'stale-prior.md',
+        insertionPath: 'stale-prior.md',
+      },
+    ],
+  });
+  await expect(page.getByRole('listbox', { name: 'File mention suggestions' })).toHaveCount(0);
+
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: draftDepth1.requestId,
+    parentDepth: 1,
+    relativeQuery: '',
+    items: [
+      {
+        id: 'dir:../packages',
+        kind: 'directory',
+        label: 'packages',
+        insertionPath: '../packages',
+      },
+      {
+        id: 'file:../root.md',
+        kind: 'file',
+        label: 'root.md',
+        insertionPath: '../root.md',
+      },
+    ],
+  });
+
+  const draftListbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+  await expect(draftListbox).toBeVisible();
+  await expect(draftListbox.getByRole('option', { name: 'stale-prior.md' })).toHaveCount(0);
+  await expect(draftListbox.getByRole('option', { name: 'packages/' })).toBeVisible();
+
+  // Nested directory mouse path: packages/ → utils/ → helper.ts
+  const beforePackagesDrill = (await postedMessages(page)).length;
+  await draftListbox.getByRole('option', { name: 'packages/' }).click();
+  await expect(draftComposer).toHaveValue('Scope @../packages/');
+
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(beforePackagesDrill)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+
+  const packagesRequest = (await postedMessages(page))
+    .slice(beforePackagesDrill)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    type: string;
+    requestId: string;
+    parentDepth: number;
+    relativeQuery: string;
+  };
+  expect(packagesRequest.parentDepth).toBe(1);
+  expect(packagesRequest.relativeQuery).toBe('packages/');
+
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: packagesRequest.requestId,
+    parentDepth: 1,
+    relativeQuery: 'packages/',
+    items: [
+      {
+        id: 'dir:../packages/utils',
+        kind: 'directory',
+        label: 'utils',
+        insertionPath: '../packages/utils',
+      },
+    ],
+  });
+
+  const utilsListbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+  await expect(utilsListbox).toBeVisible();
+  const beforeUtilsDrill = (await postedMessages(page)).length;
+  await utilsListbox.getByRole('option', { name: 'utils/' }).click();
+  await expect(draftComposer).toHaveValue('Scope @../packages/utils/');
+
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(beforeUtilsDrill)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+
+  const utilsRequest = (await postedMessages(page))
+    .slice(beforeUtilsDrill)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    type: string;
+    requestId: string;
+    parentDepth: number;
+    relativeQuery: string;
+  };
+  expect(utilsRequest.parentDepth).toBe(1);
+  expect(utilsRequest.relativeQuery).toBe('packages/utils/');
+
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: utilsRequest.requestId,
+    parentDepth: 1,
+    relativeQuery: 'packages/utils/',
+    items: [
+      {
+        id: 'file:../packages/utils/helper.ts',
+        kind: 'file',
+        label: 'helper.ts',
+        insertionPath: '../packages/utils/helper.ts',
+      },
+    ],
+  });
+
+  const helperListbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+  await expect(helperListbox).toBeVisible();
+  await helperListbox.getByRole('option', { name: 'helper.ts' }).click();
+  await expect(helperListbox).toHaveCount(0);
+  // Display token is basename; agent path stays the normalized relative insertionPath.
+  await expect(draftComposer).toHaveValue('Scope @helper.ts ');
+
+  await page.getByRole('button', { name: 'Send' }).click();
+  await expectPostedMessage(page, {
+    type: 'send',
+    text: 'Scope @helper.ts',
+    llmText: 'Scope @../packages/utils/helper.ts',
+    backend: 'claude',
+  });
+
+  // ── Draft @../../ depth 2 ───────────────────────────────────────────────
+  await postSnapshot(page, { type: 'snapshot', rootTasks: [], storeRevision: 41 });
+  await page.getByRole('button', { name: 'New task' }).first().click();
+  await expectPostedMessage(page, { type: 'newTask' });
+
+  const depth2Composer = page.getByPlaceholder('Start a new coordinator task with claude…');
+  await depth2Composer.click();
+  await depth2Composer.pressSequentially('Grand @../../', { delay: 20 });
+
+  const depth2Before = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(depth2Before)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+
+  const depth2Request = (await postedMessages(page))
+    .slice(depth2Before)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    type: string;
+    requestId: string;
+    parentDepth: number;
+    relativeQuery: string;
+    taskId?: string;
+  };
+  expect(depth2Request.parentDepth).toBe(2);
+  expect(depth2Request.relativeQuery).toBe('');
+  expect(depth2Request.taskId).toBeUndefined();
+
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: depth2Request.requestId,
+    parentDepth: 2,
+    relativeQuery: '',
+    items: [
+      {
+        id: 'file:../../top.md',
+        kind: 'file',
+        label: 'top.md',
+        insertionPath: '../../top.md',
+      },
+    ],
+  });
+
+  const depth2Listbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+  await expect(depth2Listbox).toBeVisible();
+  await depth2Listbox.getByRole('option', { name: 'top.md' }).click();
+  await expect(depth2Composer).toHaveValue('Grand @top.md ');
+
+  // ── Depth 3 never requests the host ─────────────────────────────────────
+  await depth2Composer.fill('');
+  await depth2Composer.click();
+  const beforeDepth3 = (await postedMessages(page)).length;
+  await depth2Composer.pressSequentially('Too deep @../../../', { delay: 20 });
+  await page.waitForTimeout(250);
+  const afterDepth3 = (await postedMessages(page)).slice(beforeDepth3).filter(
+    (m) => (m as { type?: string }).type === 'requestFileMentionSuggestions',
+  );
+  expect(afterDepth3).toHaveLength(0);
+  await expect(page.getByRole('listbox', { name: 'File mention suggestions' })).toHaveCount(0);
+
+  // ── Idle task scope + late response from another task ───────────────────
+  await postSnapshot(page, {
+    type: 'snapshot',
+    rootTasks: [
+      task({
+        id: 'task-parent-a',
+        goal: 'Parent mention task A',
+        viewStatus: 'idle',
+      }),
+      task({
+        id: 'task-parent-b',
+        goal: 'Parent mention task B',
+        viewStatus: 'idle',
+      }),
+    ],
+    focusedTaskId: 'task-parent-a',
+    subtree: [
+      task({
+        id: 'task-parent-a',
+        goal: 'Parent mention task A',
+        viewStatus: 'idle',
+      }),
+    ],
+    transcript: [{ id: 'msg-parent-a', kind: 'assistant', content: 'Task A ready.' }],
+    storeRevision: 42,
+  });
+
+  await expect(page.getByText('Task A ready.')).toBeVisible();
+  const taskAComposer = page.getByPlaceholder('Message this task…');
+  await expect(taskAComposer).toBeEnabled();
+  await taskAComposer.click();
+  await taskAComposer.pressSequentially('A @../', { delay: 20 });
+
+  const taskABefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(taskABefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+
+  const taskARequest = (await postedMessages(page))
+    .slice(taskABefore)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    type: string;
+    requestId: string;
+    parentDepth: number;
+    relativeQuery: string;
+    taskId?: string;
+  };
+  expect(taskARequest.parentDepth).toBe(1);
+  expect(taskARequest.relativeQuery).toBe('');
+  expect(taskARequest.taskId).toBe('task-parent-a');
+
+  // Switch focused task before answering — late task-A response must not paint on B.
+  await postSnapshot(page, {
+    type: 'snapshot',
+    rootTasks: [
+      task({
+        id: 'task-parent-a',
+        goal: 'Parent mention task A',
+        viewStatus: 'idle',
+      }),
+      task({
+        id: 'task-parent-b',
+        goal: 'Parent mention task B',
+        viewStatus: 'idle',
+      }),
+    ],
+    focusedTaskId: 'task-parent-b',
+    subtree: [
+      task({
+        id: 'task-parent-b',
+        goal: 'Parent mention task B',
+        viewStatus: 'idle',
+      }),
+    ],
+    transcript: [{ id: 'msg-parent-b', kind: 'assistant', content: 'Task B ready.' }],
+    storeRevision: 43,
+  });
+
+  await expect(page.getByText('Task B ready.')).toBeVisible();
+  const taskBComposer = page.getByPlaceholder('Message this task…');
+  await expect(taskBComposer).toBeEnabled();
+  // Composer draft is component-local and may survive focus switches; clear so
+  // the B-scope token is the only active query while A’s late response is injected.
+  await taskBComposer.fill('');
+  await taskBComposer.click();
+  await taskBComposer.pressSequentially('B @../', { delay: 20 });
+
+  const taskBBefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(taskBBefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+
+  const taskBRequest = (await postedMessages(page))
+    .slice(taskBBefore)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    type: string;
+    requestId: string;
+    parentDepth: number;
+    relativeQuery: string;
+    taskId?: string;
+  };
+  expect(taskBRequest.parentDepth).toBe(1);
+  expect(taskBRequest.relativeQuery).toBe('');
+  expect(taskBRequest.taskId).toBe('task-parent-b');
+  expect(taskBRequest.requestId).not.toBe(taskARequest.requestId);
+
+  // Late response for the other task (A) — must neither render nor insert.
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: taskARequest.requestId,
+    parentDepth: 1,
+    relativeQuery: '',
+    items: [
+      {
+        id: 'file:../other-task.md',
+        kind: 'file',
+        label: 'other-task.md',
+        insertionPath: '../other-task.md',
+      },
+    ],
+  });
+  await expect(page.getByRole('listbox', { name: 'File mention suggestions' })).toHaveCount(0);
+  await expect(taskBComposer).toHaveValue('B @../');
+
+  // Matching task-B response paints; mouse file select inserts display token only.
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: taskBRequest.requestId,
+    parentDepth: 1,
+    relativeQuery: '',
+    items: [
+      {
+        id: 'file:../current-task.md',
+        kind: 'file',
+        label: 'current-task.md',
+        insertionPath: '../current-task.md',
+      },
+    ],
+  });
+
+  const taskBListbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+  await expect(taskBListbox).toBeVisible();
+  await expect(taskBListbox.getByRole('option', { name: 'other-task.md' })).toHaveCount(0);
+  await taskBListbox.getByRole('option', { name: 'current-task.md' }).click();
+  await expect(taskBListbox).toHaveCount(0);
+  await expect(taskBComposer).toHaveValue('B @current-task.md ');
+
+  // Prove the stale other-task item was never insertable: composer has only the
+  // matching selection, and send expands the bound relative path for the LLM.
+  await page.getByRole('button', { name: 'Send' }).click();
+  await expectPostedMessage(page, {
+    type: 'send',
+    taskId: 'task-parent-b',
+    text: 'B @current-task.md',
+    llmText: 'B @../current-task.md',
+  });
+});
+
+/**
  * T04 full S01 browser-flow proof: draft + idle task, real typing/click,
  * active-query replacement, and dual text/llmText send resolution.
  * Playwright only — not native Extension Development Host proof.
