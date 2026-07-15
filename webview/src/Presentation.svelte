@@ -36,7 +36,39 @@
   let tocOpen = $state(false);
   let activeHeadingId = $state<string | undefined>(undefined);
   let pendingFragment = $state<string | undefined>(undefined);
+  let revisionAnnounce = $state<string>('');
+  let revisionAnnounceTimer: ReturnType<typeof setTimeout> | undefined;
+  let relativeTick = $state(0);
   const rendered = $derived(document ? renderPresentationMarkdown(document.markdown) : undefined);
+
+  function captureScrollAnchor(): { headingId?: string; ratio: number } {
+    const shell = article?.closest('.presentation-shell') as HTMLElement | null;
+    if (!shell || !article) return { ratio: 0 };
+    const max = Math.max(1, shell.scrollHeight - shell.clientHeight);
+    const ratio = shell.scrollTop / max;
+    const headings = Array.from(article.querySelectorAll<HTMLElement>('h1[id], h2[id], h3[id]'));
+    const top = shell.getBoundingClientRect().top + 48;
+    let headingId: string | undefined;
+    for (const h of headings) {
+      if (h.getBoundingClientRect().top <= top + 8) headingId = h.id;
+    }
+    return { headingId, ratio };
+  }
+
+  async function restoreScrollAnchor(anchor: { headingId?: string; ratio: number }): Promise<void> {
+    await tick();
+    const shell = article?.closest('.presentation-shell') as HTMLElement | null;
+    if (!shell || !article) return;
+    if (anchor.headingId) {
+      const el = article.querySelector<HTMLElement>(`#${CSS.escape(anchor.headingId)}`);
+      if (el) {
+        el.scrollIntoView({ block: 'start' });
+        return;
+      }
+    }
+    const max = Math.max(0, shell.scrollHeight - shell.clientHeight);
+    shell.scrollTop = max * Math.min(1, Math.max(0, anchor.ratio));
+  }
 
   function persist(): void {
     if (!document) return;
@@ -227,20 +259,48 @@
       }
       const parsed = parsePresentationUpdate(event.data);
       if (!parsed) return;
+      const previous = document;
       const accepted = applyPresentationUpdate(document, event.data);
       if (accepted === document) return;
+      const anchor =
+        previous &&
+        accepted &&
+        previous.presentationId === accepted.presentationId &&
+        accepted.revision > previous.revision &&
+        !parsed.restore
+          ? captureScrollAnchor()
+          : undefined;
       document = accepted;
       if (parsed.rootId) rootId = parsed.rootId;
       persist();
+      if (
+        previous &&
+        accepted &&
+        previous.presentationId === accepted.presentationId &&
+        accepted.revision > previous.revision &&
+        !parsed.restore
+      ) {
+        revisionAnnounce = `Updated to revision ${accepted.revision}`;
+        if (revisionAnnounceTimer) clearTimeout(revisionAnnounceTimer);
+        revisionAnnounceTimer = setTimeout(() => {
+          revisionAnnounce = '';
+        }, 2500);
+      }
       void applyPendingFragment();
+      if (anchor) void restoreScrollAnchor(anchor);
     };
     window.addEventListener('message', handleMessage);
     window.addEventListener('click', handleContentClick);
+    const relativeInterval = setInterval(() => {
+      relativeTick += 1;
+    }, 30_000);
     return () => {
       window.removeEventListener('message', handleMessage);
       window.removeEventListener('click', handleContentClick);
       if (copyResetTimer) clearTimeout(copyResetTimer);
       if (revealResetTimer) clearTimeout(revealResetTimer);
+      if (revisionAnnounceTimer) clearTimeout(revisionAnnounceTimer);
+      clearInterval(relativeInterval);
     };
   });
 
@@ -279,7 +339,10 @@
   });
 
   const showSecondary = $derived(Boolean(document?.updatedAt || document?.sourcePath));
-  const relativeUpdated = $derived(formatRelativeUpdated(document?.updatedAt));
+  const relativeUpdated = $derived.by(() => {
+    void relativeTick;
+    return formatRelativeUpdated(document?.updatedAt);
+  });
   const toc = $derived(rendered?.toc ?? []);
 </script>
 
@@ -345,7 +408,13 @@
           {/if}
         </div>
       {/if}
-      <span class="presentation-status" role="status" aria-live="polite">
+      <span
+        class="presentation-status"
+        role="status"
+        aria-live="polite"
+        aria-label="Linked chat status"
+        data-status="linked-chat"
+      >
         {revealStatus === 'pending'
           ? 'Opening linked chat…'
           : revealStatus === 'success'
@@ -354,9 +423,24 @@
               ? 'Could not open linked chat.'
               : ''}
       </span>
+      <span
+        class="presentation-status presentation-status--revision"
+        role="status"
+        aria-live="polite"
+        aria-label="Revision status"
+        data-status="revision"
+      >
+        {revisionAnnounce}
+      </span>
     </header>
     {#if document.summary}
       <p class="presentation-summary">{document.summary}</p>
+    {/if}
+    {#if document.changeSummary}
+      <p class="presentation-change-summary" role="note">
+        <strong>What changed:</strong>
+        {document.changeSummary}
+      </p>
     {/if}
     {#if toc.length > 0}
       <div class="presentation-toc">

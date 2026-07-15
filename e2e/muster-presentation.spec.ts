@@ -58,14 +58,15 @@ test('reveals linked chat with identity-free messages and accessible typed statu
   const action = page.getByRole('button', { name: 'Open linked chat' });
   await action.click();
   await expect(action).toBeDisabled();
-  await expect(page.getByRole('status')).toHaveText('Opening linked chat…');
+  const chatStatus = page.getByRole('status', { name: 'Linked chat status' });
+  await expect(chatStatus).toHaveText('Opening linked chat…');
   await expect.poll(() => page.evaluate(() => window.__musterPostedMessages ?? [])).toEqual([
     { type: 'revealLinkedChat' },
   ]);
 
   await postRawMessage(page, { type: 'revealLinkedChatResult', status: 'success' });
   await expect(action).toBeEnabled();
-  await expect(page.getByRole('status')).toHaveText('Linked chat opened.');
+  await expect(chatStatus).toHaveText('Linked chat opened.');
   // Success status is transient (clears after ~2s); failure stays until retry.
 
   const presentationRoot = page.locator('[data-presentation-id]');
@@ -79,10 +80,14 @@ test('reveals linked chat with identity-free messages and accessible typed statu
 
   await action.click();
   await postRawMessage(page, { type: 'revealLinkedChatResult', status: 'failure', error: 'private transcript' });
-  await expect(page.getByRole('status')).toHaveText('Opening linked chat…');
+  await expect(chatStatus).toHaveText('Opening linked chat…');
   await postRawMessage(page, { type: 'revealLinkedChatResult', status: 'failure' });
-  await expect(page.getByRole('status')).toHaveText('Could not open linked chat.');
+  await expect(chatStatus).toHaveText('Could not open linked chat.');
   await expect(page.getByText('private transcript')).toHaveCount(0);
+
+  await postUpdate(page, presentation({ revision: 3, title: 'Rev 3', markdown: '# Rev 3 body' }));
+  await expect(page.getByRole('status', { name: 'Revision status' })).toHaveText('Updated to revision 3');
+  await expect(chatStatus).toHaveText('Could not open linked chat.');
 });
 
 test('restores a validated persisted presentation on browser startup', async ({ page }) => {
