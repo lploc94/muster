@@ -1616,6 +1616,154 @@ describe('engine graph batch create/delegate', () => {
     await engine.whenIdle();
   });
 
+  it('P1: continue_child reopens terminal child and queues instruction turn', async () => {
+    const { store, engine, credentials, resume } = makeHarness();
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child', 'wait_child', 'cancel_child'],
+    });
+    const started = engine.startTask('coord');
+    if (!started.ok) return;
+    const turnId = started.value.turnId;
+    await waitTurnRunning(store, turnId);
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId,
+      allowedActions: new Set([
+        'create_task',
+        'set_task_lifecycle',
+        'continue_child',
+        'wait_for_tasks',
+      ]),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    await engine.handleToolCall(ctx, 'create_task', {
+      kind: 'create_task',
+      opId: 'op-c',
+      spec: { goal: 'child', taskType: 'worker' },
+    });
+    const childId = deriveEntityId(turnId, 'op-c', 'task');
+    await engine.handleToolCall(ctx, 'set_task_lifecycle', {
+      kind: 'set_task_lifecycle',
+      opId: 'op-seal',
+      taskId: childId,
+      lifecycle: 'succeeded',
+      result: 'done',
+    });
+    expect(store.getTask(childId)?.lifecycle).toBe('succeeded');
+    const cont = await engine.handleToolCall(ctx, 'continue_child', {
+      kind: 'continue_child',
+      opId: 'op-cont',
+      childId,
+      instruction: 'revise the summary',
+      waitForCompletion: true,
+    });
+    expect(cont.ok).toBe(true);
+    expect(store.getTask(childId)?.lifecycle).toBe('open');
+    const contTurnId = deriveEntityId(turnId, 'op-cont', 'turn');
+    expect(store.getFile().turns[contTurnId]?.status).toBe('queued');
+    expect(store.getFile().turns[turnId]?.disposition).toEqual({
+      kind: 'wait_tasks',
+      taskIds: [childId],
+    });
+    engine.stageDisposition(turnId, { kind: 'idle' }, 'op-idle');
+    resume();
+    await engine.whenIdle();
+  });
+
+  it('P1: continue_child rejects live child', async () => {
+    const { store, engine, credentials, resume } = makeHarness();
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child'],
+    });
+    const started = engine.startTask('coord');
+    if (!started.ok) return;
+    const turnId = started.value.turnId;
+    await waitTurnRunning(store, turnId);
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId,
+      allowedActions: new Set(['delegate_task', 'continue_child']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    await engine.handleToolCall(ctx, 'delegate_task', {
+      kind: 'delegate_task',
+      opId: 'op-d',
+      spec: { goal: 'x', taskType: 'worker' },
+    });
+    const childId = deriveEntityId(turnId, 'op-d', 'task');
+    for (let i = 0; i < 50; i++) {
+      const t = Object.values(store.getFile().turns).find((x) => x.taskId === childId);
+      if (t?.status === 'running') break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    const cont = await engine.handleToolCall(ctx, 'continue_child', {
+      kind: 'continue_child',
+      opId: 'op-live',
+      childId,
+      instruction: 'more',
+    });
+    expect(cont.ok).toBe(false);
+    engine.stageDisposition(turnId, { kind: 'idle' }, 'op-idle');
+    resume();
+    await engine.whenIdle();
+  });
+
+  it('P1: cancel_tasks cancels multiple owned children', async () => {
+    const { store, engine, credentials, resume } = makeHarness();
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child', 'cancel_child'],
+    });
+    const started = engine.startTask('coord');
+    if (!started.ok) return;
+    const turnId = started.value.turnId;
+    await waitTurnRunning(store, turnId);
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId,
+      allowedActions: new Set(['create_tasks', 'cancel_tasks', 'cancel_task']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    await engine.handleToolCall(ctx, 'create_tasks', {
+      kind: 'create_tasks',
+      opId: 'op-batch',
+      specs: [
+        { localId: 'a', goal: 'a', taskType: 'worker' },
+        { localId: 'b', goal: 'b', taskType: 'worker' },
+      ],
+    });
+    const aId = deriveEntityId(turnId, 'op-batch', 'task:a');
+    const bId = deriveEntityId(turnId, 'op-batch', 'task:b');
+    const cancelled = await engine.handleToolCall(ctx, 'cancel_tasks', {
+      kind: 'cancel_tasks',
+      opId: 'op-can',
+      childIds: [aId, bId],
+    });
+    expect(cancelled.ok).toBe(true);
+    expect(store.getTask(aId)?.lifecycle).toBe('cancelled');
+    expect(store.getTask(bId)?.lifecycle).toBe('cancelled');
+    engine.stageDisposition(turnId, { kind: 'idle' }, 'op-idle');
+    resume();
+    await engine.whenIdle();
+  });
+
   it('P0.5: ask_parent routes question; answer_child_question queues child continuation', async () => {
     const { store, engine, credentials, resume } = makeHarness();
     engine.createTask({

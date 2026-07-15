@@ -44,6 +44,7 @@ import {
   holdQueuedFollowUpsOnFailure,
   interruptTurn,
   registerAsk,
+  reopenTask,
   stageDisposition,
   startTask as transitionStartTask,
   submitAnswer,
@@ -1259,6 +1260,141 @@ export async function executeToolCommand(
       const turnId = deriveEntityId(ctx.turnId, command.opId, 'turn');
       deps.onScheduleTurn(turnId);
       return { ok: true, result: { turnId } };
+    }
+
+    case 'continue_child': {
+      if (deps.isWorkspaceTrusted && !deps.isWorkspaceTrusted()) {
+        return {
+          ok: false,
+          error: JSON.stringify({
+            code: 'workspace_untrusted',
+            message: 'workspace is not trusted; cannot continue child',
+            retryable: true,
+          }),
+        };
+      }
+      const scheduleIds: string[] = [];
+      const commit = deps.store.commit((draft) => {
+        ensureCoordinationMaps(draft);
+        const prior = readLedger(draft, ctx.turnId, command.opId);
+        if (prior) {
+          if (prior.fingerprint !== fingerprint) {
+            return { ok: false, reason: 'opId conflict: different arguments' };
+          }
+          return { ok: true };
+        }
+        const child = draft.tasks[command.childId];
+        if (!child || child.parentId !== ctx.callerTaskId) {
+          return { ok: false, reason: 'not an owned direct child' };
+        }
+        const live = turnsForTask(draft, child.id).find(
+          (t) => t.status === 'running' || t.status === 'waiting_user',
+        );
+        if (live) {
+          return { ok: false, reason: 'child has a live turn; continue_child rejects live children' };
+        }
+        let working = child;
+        if (isTerminalLifecycle(child.lifecycle)) {
+          const reopened = reopenTask(child, { now });
+          if (!reopened.ok) return reopened;
+          working = reopened.next;
+          draft.tasks[child.id] = working;
+        } else if (child.lifecycle !== 'open') {
+          return { ok: false, reason: `child lifecycle is ${child.lifecycle}` };
+        }
+        const contTurnId = deriveEntityId(ctx.turnId, command.opId, 'turn');
+        const turnCap = canCreateTurn(draft, child.id, limits);
+        if (!turnCap.ok) return turnCap;
+        const messageId = randomUUID();
+        draft.messages[messageId] = {
+          id: messageId,
+          taskId: child.id,
+          role: 'user',
+          content: command.instruction,
+          state: 'assigned',
+          createdAt: now,
+          turnId: contTurnId,
+        };
+        const existingTurns = turnsForTask(draft, child.id);
+        const cont =
+          existingTurns.length === 0
+            ? transitionStartTask(working, existingTurns, {
+                turnId: contTurnId,
+                now,
+                inputs: [{ kind: 'message', messageId }],
+                trigger: 'engine',
+              })
+            : transitionContinueTask(working, existingTurns, {
+                turnId: contTurnId,
+                now,
+                inputs: [{ kind: 'message', messageId }],
+                trigger: 'engine',
+              });
+        if (!cont.ok) return cont;
+        draft.turns[contTurnId] = cont.next;
+        scheduleIds.push(contTurnId);
+        if (command.waitForCompletion === true) {
+          const waitStaged = stageCompoundWait(draft, ctx, command.opId, [child.id], limits);
+          if (!waitStaged.ok) return waitStaged;
+        }
+        writeLedger(draft, ctx.turnId, command.opId, fingerprint, {
+          ok: true,
+          data: {
+            childId: child.id,
+            turnId: contTurnId,
+            ...(command.waitForCompletion === true
+              ? { waitStaged: true, waitTaskIds: [child.id] }
+              : {}),
+          },
+        });
+        return { ok: true };
+      });
+      if (!commit.ok) {
+        return { ok: false, error: commit.detail ?? commit.reason };
+      }
+      for (const id of scheduleIds) {
+        deps.onScheduleTurn(id);
+      }
+      const ledger = deps.store.getFile().operations?.[opLedgerKey(ctx.turnId, command.opId)];
+      return { ok: true, result: ledger?.result.data };
+    }
+
+    case 'cancel_tasks': {
+      // All-or-nothing ownership validation, then cancel each via singular path semantics.
+      const file = deps.store.getFile();
+      for (const childId of command.childIds) {
+        const child = file.tasks[childId];
+        if (!child || child.parentId !== ctx.callerTaskId) {
+          return {
+            ok: false,
+            error: JSON.stringify({
+              code: 'not_owned',
+              message: `not an owned direct child: ${childId}`,
+            }),
+          };
+        }
+      }
+      const cancelled: string[] = [];
+      for (const childId of command.childIds) {
+        const sub = await executeToolCommand(deps, ctx, {
+          kind: 'cancel_task',
+          opId: `${command.opId}:${childId}`,
+          childId,
+        });
+        if (!sub.ok) {
+          return { ok: false, error: sub.error };
+        }
+        cancelled.push(childId);
+      }
+      deps.store.commit((draft) => {
+        writeLedger(draft, ctx.turnId, command.opId, fingerprint, {
+          ok: true,
+          data: { cancelled },
+        });
+        return { ok: true };
+      });
+      deps.onRescanSchedulableTurns?.();
+      return { ok: true, result: { cancelled } };
     }
 
     case 'interrupt_task':

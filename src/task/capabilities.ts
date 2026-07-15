@@ -10,6 +10,8 @@ export type CoordinatorAction =
   | 'start_task'
   | 'interrupt_task'
   | 'cancel_task'
+  | 'cancel_tasks'
+  | 'continue_child'
   | 'set_task_lifecycle'
   | 'wait_for_tasks'
   | 'get_task_status'
@@ -37,12 +39,19 @@ const CAPABILITY_TO_ACTIONS: Record<TaskCapability, CoordinatorAction[]> = {
     'delegate_tasks',
     'release_tasks',
     'list_task_types',
+    // Follow-up instruction on a direct child (reopen/queue new turn).
+    'continue_child',
   ],
   // start_task is host/recovery only — not granted via coordinator MCP credentials.
   start_child: [],
   wait_child: ['wait_for_tasks'],
   interrupt_child: ['interrupt_task'],
-  cancel_child: ['cancel_task', 'set_task_lifecycle', 'answer_child_question'],
+  cancel_child: [
+    'cancel_task',
+    'cancel_tasks',
+    'set_task_lifecycle',
+    'answer_child_question',
+  ],
   read_subtree: ['get_task_status'],
 };
 

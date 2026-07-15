@@ -117,6 +117,14 @@ export type ToolCommand =
   | { kind: 'start_task'; opId: string; childId: string }
   | { kind: 'interrupt_task'; opId: string; childId: string }
   | { kind: 'cancel_task'; opId: string; childId: string }
+  | { kind: 'cancel_tasks'; opId: string; childIds: string[]; reason?: string }
+  | {
+      kind: 'continue_child';
+      opId: string;
+      childId: string;
+      instruction: string;
+      waitForCompletion?: boolean;
+    }
   | {
       kind: 'set_task_lifecycle';
       opId: string;
@@ -160,6 +168,8 @@ const MUTATING_TOOLS: ReadonlySet<string> = new Set([
   'start_task',
   'interrupt_task',
   'cancel_task',
+  'cancel_tasks',
+  'continue_child',
   'set_task_lifecycle',
   'wait_for_tasks',
   'complete_task',
@@ -181,6 +191,8 @@ function toolActionForName(name: string): ToolAction | undefined {
     'start_task',
     'interrupt_task',
     'cancel_task',
+    'cancel_tasks',
+    'continue_child',
     'set_task_lifecycle',
     'wait_for_tasks',
     'get_task_status',
@@ -704,6 +716,49 @@ export function dispatch(
           return { ok: false, toolError: 'childId is required' };
         }
         return { ok: true, command: { kind: 'cancel_task', opId, childId } };
+      }
+      case 'cancel_tasks': {
+        const raw = args.childIds;
+        if (
+          !Array.isArray(raw) ||
+          raw.length === 0 ||
+          !raw.every((id) => typeof id === 'string' && id.length > 0)
+        ) {
+          return { ok: false, toolError: 'childIds must be a non-empty string array' };
+        }
+        const reason = typeof args.reason === 'string' ? args.reason : undefined;
+        return {
+          ok: true,
+          command: {
+            kind: 'cancel_tasks',
+            opId,
+            childIds: raw as string[],
+            ...(reason !== undefined ? { reason } : {}),
+          },
+        };
+      }
+      case 'continue_child': {
+        const childId = requireString(args, 'childId') ?? requireString(args, 'taskId');
+        const instruction = requireString(args, 'instruction');
+        if (!childId) {
+          return { ok: false, toolError: 'childId is required' };
+        }
+        if (!instruction) {
+          return { ok: false, toolError: 'instruction is required' };
+        }
+        if (args.waitForCompletion !== undefined && typeof args.waitForCompletion !== 'boolean') {
+          return { ok: false, toolError: 'waitForCompletion must be a boolean' };
+        }
+        return {
+          ok: true,
+          command: {
+            kind: 'continue_child',
+            opId,
+            childId,
+            instruction,
+            ...(args.waitForCompletion === true ? { waitForCompletion: true } : {}),
+          },
+        };
       }
       case 'set_task_lifecycle': {
         const taskId = requireString(args, 'taskId') ?? requireString(args, 'childId');
