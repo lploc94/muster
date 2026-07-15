@@ -11,7 +11,7 @@ import {
   type FileMentionSuggestionsRequest,
 } from './file-mention-suggestions';
 
-const CWD = path.join(path.sep, 'workspace', 'project');
+const CWD = path.join(path.sep, 'home', 'runner', 'workspace', 'project');
 
 function entry(
   name: string,
