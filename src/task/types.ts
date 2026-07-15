@@ -90,10 +90,26 @@ export type TaskAttentionCode =
   | 'missing_disposition'
   /** Non-wakeable: disposition repair in progress (excluded from parent wait needs_attention). */
   | 'disposition_repair_pending'
+  /** Child is waiting for parent answers (wakeable for parent; exempt from disposition repair). */
+  | 'awaiting_parent_answer'
+  /** Parent has a durable child question to answer. */
+  | 'child_question'
   | 'missing_input'
   | 'dependency_blocked'
   | 'recovery_exhausted'
   | string;
+
+/** Durable child→parent question (P0.5 ask_parent). */
+export interface PendingParentQuestion {
+  questionId: string;
+  questions: Array<{ prompt: string; options?: string[]; allowFreeText?: boolean }>;
+  askedAt: string;
+  sourceTurnId: string;
+  /** Present after parent answers; drives one fresh child continuation. */
+  answers?: string[];
+  answeredAt?: string;
+  continuationTurnId?: string;
+}
 
 export interface TaskAttention {
   code: TaskAttentionCode;
@@ -207,6 +223,20 @@ export interface MusterTask {
   finishedAt?: string;
   /** Non-terminal orchestration attention (schema ≥ 5). Never a lifecycle seal. */
   attention?: TaskAttention;
+  /** Child: durable ask_parent state (schema-compatible optional). */
+  pendingParentQuestion?: PendingParentQuestion;
+  /**
+   * Parent: inbound child questions keyed by questionId (schema-compatible optional).
+   * Cleared when answered or child cancelled.
+   */
+  pendingChildQuestions?: Record<
+    string,
+    {
+      fromChildId: string;
+      questions: PendingParentQuestion['questions'];
+      askedAt: string;
+    }
+  >;
   /** Who sealed lifecycle (user or coordinator). Required on every terminal seal going forward. */
   sealedBy?: TaskSealedBy;
   /**

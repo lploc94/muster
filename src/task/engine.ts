@@ -690,6 +690,16 @@ export class TaskEngine {
   private readonly elicitationWaitTokens = new Map<string, Set<string>>();
 
   /**
+   * Whether the live session may prompt the user directly (root only by default).
+   */
+  mayDirectAskUser(sessionId: string): boolean {
+    const live = this.findLiveTurnBySessionId(sessionId);
+    if (!live) return false;
+    const task = this.store.getFile().tasks[live.taskId];
+    return !task?.parentId;
+  }
+
+  /**
    * Mark live turn waiting_user for an RFD elicitation prompt (no AskBridge).
    * Returns turnId when a live turn was found.
    */
@@ -699,6 +709,7 @@ export class TaskEngine {
   ): { turnId: string } | undefined {
     const live = this.findLiveTurnBySessionId(sessionId);
     if (!live) return undefined;
+    if (!this.mayDirectAskUser(sessionId)) return undefined;
     const commit = this.store.commit((draft) => {
       const turn = draft.turns[live.turnId];
       if (!turn) return { ok: false, reason: 'turn not found' };
@@ -787,6 +798,14 @@ export class TaskEngine {
     }
     if (questions.length === 0) {
       return { ok: false, reason: 'questions required' };
+    }
+    // Non-root tasks must not reach the user by default (ask_parent path).
+    const liveTask = this.store.getFile().tasks[live.taskId];
+    if (liveTask?.parentId) {
+      return {
+        ok: false,
+        reason: 'direct user elicitation denied for non-root task; use ask_parent',
+      };
     }
     const askId = this.askBridge.generateAskId();
     const ref: AskRef = { taskId: live.taskId, turnId: live.turnId, askId };
@@ -4312,7 +4331,11 @@ export class TaskEngine {
               ? task.result.length
               : task?.taskResult?.summary?.length ?? 0,
         });
-        if (task?.attention?.code === 'disposition_repair_pending' && task.lifecycle === 'open') {
+        if (
+          task?.attention?.code === 'disposition_repair_pending' &&
+          task.lifecycle === 'open' &&
+          !task.pendingParentQuestion
+        ) {
           this.enqueueDispositionRepair(task.id, turnId);
         }
       } else {

@@ -1616,6 +1616,81 @@ describe('engine graph batch create/delegate', () => {
     await engine.whenIdle();
   });
 
+  it('P0.5: ask_parent routes question; answer_child_question queues child continuation', async () => {
+    const { store, engine, credentials, resume } = makeHarness();
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child', 'wait_child', 'cancel_child'],
+    });
+    const started = engine.startTask('coord');
+    if (!started.ok) return;
+    const turnId = started.value.turnId;
+    await waitTurnRunning(store, turnId);
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId,
+      allowedActions: new Set([
+        'delegate_task',
+        'wait_for_tasks',
+        'answer_child_question',
+      ]),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    await engine.handleToolCall(ctx, 'delegate_task', {
+      kind: 'delegate_task',
+      opId: 'op-ask-child',
+      waitForCompletion: true,
+      spec: { goal: 'work', taskType: 'worker' },
+    });
+    const childId = deriveEntityId(turnId, 'op-ask-child', 'task');
+    const childTurn = Object.values(store.getFile().turns).find(
+      (t) => t.taskId === childId && t.sequence === 1,
+    )!;
+    for (let i = 0; i < 50 && store.getFile().turns[childTurn.id]?.status !== 'running'; i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    const childToken = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: childId,
+      turnId: childTurn.id,
+      allowedActions: new Set(['ask_parent', 'complete_task']),
+      ttlMs: 60_000,
+    });
+    const childCtx = credentials.verify(childToken)!;
+    const asked = await engine.handleToolCall(childCtx, 'ask_parent', {
+      kind: 'ask_parent',
+      opId: 'op-q1',
+      questions: [{ prompt: 'Which approach?' }],
+    });
+    expect(asked.ok).toBe(true);
+    if (!asked.ok) return;
+    const qId = (asked.result as { questionId: string }).questionId;
+    expect(store.getTask(childId)?.pendingParentQuestion?.questionId).toBe(qId);
+    expect(store.getTask('coord')?.pendingChildQuestions?.[qId]?.fromChildId).toBe(childId);
+
+    const answered = await engine.handleToolCall(ctx, 'answer_child_question', {
+      kind: 'answer_child_question',
+      opId: 'op-ans',
+      questionId: qId,
+      answers: ['use option A'],
+    });
+    expect(answered.ok).toBe(true);
+    const contId = (answered.result as { continuationTurnId: string }).continuationTurnId;
+    expect(store.getFile().turns[contId]?.taskId).toBe(childId);
+    expect(store.getTask(childId)?.pendingParentQuestion?.answers).toEqual(['use option A']);
+    expect(store.getTask('coord')?.pendingChildQuestions?.[qId]).toBeUndefined();
+
+    engine.stageDisposition(turnId, { kind: 'idle' }, 'op-c-idle');
+    engine.stageDisposition(childTurn.id, { kind: 'idle' }, 'op-ch-idle');
+    resume();
+    await engine.whenIdle();
+  });
+
   it('P0.5: child turn without disposition queues one disposition-repair turn', async () => {
     const { store, engine, credentials, resume } = makeHarness();
     engine.createTask({

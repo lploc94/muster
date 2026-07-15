@@ -13,13 +13,15 @@ export type CoordinatorAction =
   | 'set_task_lifecycle'
   | 'wait_for_tasks'
   | 'get_task_status'
-  | 'upsert_presentation';
+  | 'upsert_presentation'
+  | 'answer_child_question';
 
 export type AnyTaskAction =
   | 'complete_task'
   | 'fail_task'
   | 'report_progress'
   | 'ask_user'
+  | 'ask_parent'
   | 'get_host_context';
 
 export type ToolAction = CoordinatorAction | AnyTaskAction;
@@ -40,7 +42,7 @@ const CAPABILITY_TO_ACTIONS: Record<TaskCapability, CoordinatorAction[]> = {
   start_child: [],
   wait_child: ['wait_for_tasks'],
   interrupt_child: ['interrupt_task'],
-  cancel_child: ['cancel_task', 'set_task_lifecycle'],
+  cancel_child: ['cancel_task', 'set_task_lifecycle', 'answer_child_question'],
   read_subtree: ['get_task_status'],
 };
 
@@ -48,14 +50,19 @@ const ANY_TASK_ACTIONS: AnyTaskAction[] = [
   'complete_task',
   'fail_task',
   'report_progress',
-  'ask_user',
   'get_host_context',
 ];
 
 export function capabilitiesFor(
-  task: Pick<MusterTask, 'role' | 'capabilities'>,
+  task: Pick<MusterTask, 'role' | 'capabilities' | 'parentId'>,
 ): Set<ToolAction> {
   const granted = new Set<ToolAction>(ANY_TASK_ACTIONS);
+  // Root may ask the user; non-root uses ask_parent by default.
+  if (task.parentId === null || task.parentId === undefined) {
+    granted.add('ask_user');
+  } else {
+    granted.add('ask_parent');
+  }
   if (task.role === 'coordinator') {
     granted.add('upsert_presentation');
     for (const cap of task.capabilities) {

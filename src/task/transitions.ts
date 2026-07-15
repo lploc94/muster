@@ -393,6 +393,28 @@ export function applySuccessfulTurn(
 
   const disposition = turn.disposition;
   if (!disposition || disposition.kind === 'idle') {
+    // Pending ask_parent: never treat as missing disposition / repair (ISSUE-9).
+    if (
+      task.pendingParentQuestion &&
+      task.pendingParentQuestion.answers === undefined &&
+      !task.pendingParentQuestion.continuationTurnId
+    ) {
+      return {
+        ok: true,
+        next: {
+          task: bumpTask(task, options.now, {
+            attention: {
+              code: 'awaiting_parent_answer',
+              message: 'waiting for parent answers',
+              at: options.now,
+              sourceTurnId: turn.id,
+            },
+          }),
+          turn: succeededTurn,
+        },
+        effects,
+      };
+    }
     // CLI success without disposition: no seal.
     // First omission on a normal turn → non-wakeable repair_pending (P0.5).
     // Repair turn still omitting → wakeable missing_disposition for parent.

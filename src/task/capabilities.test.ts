@@ -6,6 +6,7 @@ describe('capabilitiesFor', () => {
     const caps = capabilitiesFor({
       role: 'coordinator',
       capabilities: ['create_child', 'wait_child', 'read_subtree'],
+      parentId: null,
     });
     expect(caps.has('create_task')).toBe(true);
     expect(caps.has('delegate_task')).toBe(true);
@@ -16,6 +17,7 @@ describe('capabilitiesFor', () => {
     expect(caps.has('wait_for_tasks')).toBe(true);
     expect(caps.has('get_task_status')).toBe(true);
     expect(caps.has('ask_user')).toBe(true);
+    expect(caps.has('ask_parent')).toBe(false);
     expect(caps.has('interrupt_task')).toBe(false);
     // start_task is host/recovery only — not granted via start_child or create_child.
     expect(caps.has('start_task')).toBe(false);
@@ -25,43 +27,55 @@ describe('capabilitiesFor', () => {
     const caps = capabilitiesFor({
       role: 'coordinator',
       capabilities: ['start_child'],
+      parentId: null,
     });
     expect(caps.has('start_task')).toBe(false);
   });
 
   it('grants presentation upserts to coordinators by role', () => {
-    const caps = capabilitiesFor({ role: 'coordinator', capabilities: [] });
+    const caps = capabilitiesFor({ role: 'coordinator', capabilities: [], parentId: null });
 
     expect(caps.has('upsert_presentation')).toBe(true);
   });
 
   it('grants only any-task actions to workers', () => {
-    const caps = capabilitiesFor({ role: 'worker', capabilities: ['create_child'] });
+    const caps = capabilitiesFor({
+      role: 'worker',
+      capabilities: ['create_child'],
+      parentId: 'root',
+    });
     expect(caps.has('create_task')).toBe(false);
     expect(caps.has('create_tasks')).toBe(false);
     expect(caps.has('delegate_tasks')).toBe(false);
     expect(caps.has('list_task_types')).toBe(false);
     expect(caps.has('upsert_presentation')).toBe(false);
     expect(caps.has('complete_task')).toBe(true);
-    expect(caps.has('ask_user')).toBe(true);
+    expect(caps.has('ask_user')).toBe(false);
+    expect(caps.has('ask_parent')).toBe(true);
     expect(caps.has('get_host_context')).toBe(true);
   });
 
   it('grants get_host_context to coordinators and workers', () => {
     expect(
-      capabilitiesFor({ role: 'coordinator', capabilities: [] }).has('get_host_context'),
+      capabilitiesFor({ role: 'coordinator', capabilities: [], parentId: null }).has(
+        'get_host_context',
+      ),
     ).toBe(true);
-    expect(capabilitiesFor({ role: 'worker', capabilities: [] }).has('get_host_context')).toBe(
-      true,
-    );
+    expect(
+      capabilitiesFor({ role: 'worker', capabilities: [], parentId: 'root' }).has(
+        'get_host_context',
+      ),
+    ).toBe(true);
   });
 
   it('maps cancel_child to cancel_task and set_task_lifecycle', () => {
     const caps = capabilitiesFor({
       role: 'coordinator',
       capabilities: ['cancel_child'],
+      parentId: null,
     });
     expect(caps.has('cancel_task')).toBe(true);
     expect(caps.has('set_task_lifecycle')).toBe(true);
+    expect(caps.has('answer_child_question')).toBe(true);
   });
 });

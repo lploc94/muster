@@ -134,6 +134,13 @@ export type ToolCommand =
   | { kind: 'fail_task'; opId: string; error: string }
   | { kind: 'report_progress'; opId: string; note: string }
   | { kind: 'ask_user'; opId: string; questions: Question[] }
+  | { kind: 'ask_parent'; opId: string; questions: Question[] }
+  | {
+      kind: 'answer_child_question';
+      opId: string;
+      questionId: string;
+      answers: string[];
+    }
   | {
       kind: 'upsert_presentation';
       presentationId: string;
@@ -159,6 +166,8 @@ const MUTATING_TOOLS: ReadonlySet<string> = new Set([
   'fail_task',
   'report_progress',
   'ask_user',
+  'ask_parent',
+  'answer_child_question',
   'upsert_presentation',
 ]);
 
@@ -181,6 +190,8 @@ function toolActionForName(name: string): ToolAction | undefined {
     'fail_task',
     'report_progress',
     'ask_user',
+    'ask_parent',
+    'answer_child_question',
     'upsert_presentation',
   ];
   return actions.find((a) => a === name);
@@ -767,6 +778,36 @@ export function dispatch(
           return { ok: false, toolError: 'note is required' };
         }
         return { ok: true, command: { kind: 'report_progress', opId, note } };
+      }
+      case 'ask_parent': {
+        const questions = parseQuestions(args.questions);
+        if (!questions) {
+          return { ok: false, toolError: 'questions must be a non-empty array' };
+        }
+        return { ok: true, command: { kind: 'ask_parent', opId, questions } };
+      }
+      case 'answer_child_question': {
+        const questionId = requireString(args, 'questionId');
+        if (!questionId) {
+          return { ok: false, toolError: 'questionId is required' };
+        }
+        const rawAnswers = args.answers;
+        if (
+          !Array.isArray(rawAnswers) ||
+          rawAnswers.length === 0 ||
+          !rawAnswers.every((a) => typeof a === 'string')
+        ) {
+          return { ok: false, toolError: 'answers must be a non-empty string array' };
+        }
+        return {
+          ok: true,
+          command: {
+            kind: 'answer_child_question',
+            opId,
+            questionId,
+            answers: rawAnswers as string[],
+          },
+        };
       }
       case 'ask_user': {
         const questions = parseQuestions(args.questions);

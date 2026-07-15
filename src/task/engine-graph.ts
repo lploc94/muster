@@ -40,6 +40,7 @@ import type { TaskStore } from './store';
 import {
   createTask,
   cancelPendingTurn,
+  continueTask as transitionContinueTask,
   holdQueuedFollowUpsOnFailure,
   interruptTurn,
   registerAsk,
@@ -1784,11 +1785,217 @@ export async function executeToolCommand(
     case 'ask_user':
       // Temporarily ignored: structured user questions go through ACP RFD
       // elicitation (and vendor extensions like Grok x.ai/ask_user_question).
+      // Non-root must use ask_parent.
       return {
         ok: false,
         error:
-          'ask_user MCP tool is disabled; use ACP elicitation/create (or native agent ask)',
+          'ask_user MCP tool is disabled; use ACP elicitation/create (or ask_parent for children)',
       };
+
+    case 'ask_parent': {
+      const caller = deps.store.getFile().tasks[ctx.callerTaskId];
+      if (!caller?.parentId) {
+        return { ok: false, error: 'ask_parent is only valid on non-root tasks' };
+      }
+      if (!command.questions || command.questions.length === 0) {
+        return { ok: false, error: 'questions required' };
+      }
+      const questionId = deriveEntityId(ctx.turnId, command.opId, 'q');
+      const commit = deps.store.commit((draft) => {
+        ensureCoordinationMaps(draft);
+        const child = draft.tasks[ctx.callerTaskId];
+        const parentId = child?.parentId;
+        if (!child || !parentId) {
+          return { ok: false, reason: 'caller has no parent' };
+        }
+        const parent = draft.tasks[parentId];
+        if (!parent) {
+          return { ok: false, reason: 'parent not found' };
+        }
+        const prior = readLedger(draft, ctx.turnId, command.opId);
+        if (prior) {
+          if (prior.fingerprint !== fingerprint) {
+            return { ok: false, reason: 'opId conflict: different arguments' };
+          }
+          return { ok: true };
+        }
+        if (child.pendingParentQuestion && !child.pendingParentQuestion.answers) {
+          return { ok: false, reason: 'already awaiting parent answer' };
+        }
+        const questions = command.questions.map((q) => ({
+          prompt: q.prompt,
+          ...(q.options ? { options: q.options } : {}),
+          ...(q.allowFreeText !== undefined ? { allowFreeText: q.allowFreeText } : {}),
+        }));
+        draft.tasks[ctx.callerTaskId] = {
+          ...child,
+          pendingParentQuestion: {
+            questionId,
+            questions,
+            askedAt: now,
+            sourceTurnId: ctx.turnId,
+          },
+          attention: {
+            code: 'awaiting_parent_answer',
+            message: 'waiting for parent answers',
+            at: now,
+            sourceTurnId: ctx.turnId,
+          },
+          revision: child.revision + 1,
+          updatedAt: now,
+        };
+        const inbound = { ...(parent.pendingChildQuestions ?? {}) };
+        inbound[questionId] = {
+          fromChildId: ctx.callerTaskId,
+          questions,
+          askedAt: now,
+        };
+        // Terminal parent: still record; host/UI can surface (plan ISSUE-3).
+        draft.tasks[parentId] = {
+          ...parent,
+          pendingChildQuestions: inbound,
+          attention:
+            parent.lifecycle === 'open'
+              ? {
+                  code: 'child_question',
+                  message: `child ${ctx.callerTaskId} needs input`,
+                  at: now,
+                  sourceTurnId: ctx.turnId,
+                }
+              : parent.attention,
+          revision: parent.revision + 1,
+          updatedAt: now,
+        };
+        writeLedger(draft, ctx.turnId, command.opId, fingerprint, {
+          ok: true,
+          data: { questionId, parentTaskId: parentId },
+        });
+        return { ok: true };
+      });
+      if (!commit.ok) {
+        return { ok: false, error: commit.detail ?? commit.reason };
+      }
+      deps.onRescanSchedulableTurns?.();
+      const ledger = deps.store.getFile().operations?.[opLedgerKey(ctx.turnId, command.opId)];
+      return { ok: true, result: ledger?.result.data };
+    }
+
+    case 'answer_child_question': {
+      const scheduleIds: string[] = [];
+      const commit = deps.store.commit((draft) => {
+        ensureCoordinationMaps(draft);
+        const parent = draft.tasks[ctx.callerTaskId];
+        if (!parent || parent.lifecycle !== 'open') {
+          return { ok: false, reason: 'caller task not open' };
+        }
+        const prior = readLedger(draft, ctx.turnId, command.opId);
+        if (prior) {
+          if (prior.fingerprint !== fingerprint) {
+            return { ok: false, reason: 'opId conflict: different arguments' };
+          }
+          return { ok: true };
+        }
+        const inbound = parent.pendingChildQuestions?.[command.questionId];
+        if (!inbound) {
+          return { ok: false, reason: 'unknown questionId' };
+        }
+        const child = draft.tasks[inbound.fromChildId];
+        if (!child || child.parentId !== ctx.callerTaskId) {
+          return { ok: false, reason: 'child not owned' };
+        }
+        const pending = child.pendingParentQuestion;
+        if (!pending || pending.questionId !== command.questionId) {
+          return { ok: false, reason: 'child has no matching pending question' };
+        }
+        if (pending.continuationTurnId && draft.turns[pending.continuationTurnId]) {
+          // Idempotent: continuation already created.
+          writeLedger(draft, ctx.turnId, command.opId, fingerprint, {
+            ok: true,
+            data: { questionId: command.questionId, continuationTurnId: pending.continuationTurnId },
+          });
+          return { ok: true };
+        }
+        const continuationTurnId = deriveEntityId(ctx.turnId, command.opId, 'turn');
+        const turnCap = canCreateTurn(draft, child.id, limits);
+        if (!turnCap.ok) return turnCap;
+        const messageId = randomUUID();
+        const qText = pending.questions.map((q, i) => `Q${i + 1}: ${q.prompt}`).join('\n');
+        const aText = command.answers.map((a, i) => `A${i + 1}: ${a}`).join('\n');
+        draft.messages[messageId] = {
+          id: messageId,
+          taskId: child.id,
+          role: 'user',
+          content: `Parent answers for question ${command.questionId}:\n${qText}\n${aText}\nContinue the task and stage complete_task or fail_task.`,
+          state: 'assigned',
+          createdAt: now,
+          turnId: continuationTurnId,
+        };
+        const contResult = transitionContinueTask(child, turnsForTask(draft, child.id), {
+          turnId: continuationTurnId,
+          now,
+          inputs: [{ kind: 'message', messageId }],
+          trigger: 'engine',
+        });
+        if (!contResult.ok) return contResult;
+        draft.turns[continuationTurnId] = contResult.next;
+        scheduleIds.push(continuationTurnId);
+
+        draft.tasks[child.id] = {
+          ...child,
+          pendingParentQuestion: {
+            ...pending,
+            answers: command.answers,
+            answeredAt: now,
+            continuationTurnId,
+          },
+          attention: undefined,
+          revision: child.revision + 1,
+          updatedAt: now,
+        };
+        const nextInbound = { ...(parent.pendingChildQuestions ?? {}) };
+        delete nextInbound[command.questionId];
+        // Re-arm parent wait if attention-suspended with same membership.
+        let wait = parent.wait;
+        if (
+          wait?.kind === 'children' &&
+          wait.phase === 'suspended_attention' &&
+          wait.attentionContinuationTurnId
+        ) {
+          wait = {
+            ...wait,
+            phase: 'active',
+            attentionContinuationTurnId: undefined,
+          };
+        }
+        draft.tasks[ctx.callerTaskId] = {
+          ...parent,
+          pendingChildQuestions: Object.keys(nextInbound).length > 0 ? nextInbound : undefined,
+          attention:
+            Object.keys(nextInbound).length > 0
+              ? parent.attention
+              : parent.attention?.code === 'child_question'
+                ? undefined
+                : parent.attention,
+          wait,
+          revision: parent.revision + 1,
+          updatedAt: now,
+        };
+        writeLedger(draft, ctx.turnId, command.opId, fingerprint, {
+          ok: true,
+          data: { questionId: command.questionId, continuationTurnId },
+        });
+        return { ok: true };
+      });
+      if (!commit.ok) {
+        return { ok: false, error: commit.detail ?? commit.reason };
+      }
+      for (const id of scheduleIds) {
+        deps.onScheduleTurn(id);
+      }
+      deps.onRescanSchedulableTurns?.();
+      const ledger = deps.store.getFile().operations?.[opLedgerKey(ctx.turnId, command.opId)];
+      return { ok: true, result: ledger?.result.data };
+    }
 
     default: {
       const _exhaustive: never = command;

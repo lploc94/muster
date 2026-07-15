@@ -48,6 +48,8 @@ const ALL_TOOLS: ToolAction[] = [
   'fail_task',
   'report_progress',
   'ask_user',
+  'ask_parent',
+  'answer_child_question',
   'upsert_presentation',
 ];
 
@@ -355,6 +357,25 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
     properties: {
       opId: OP_ID,
       questions: { type: 'array', items: QUESTION_SCHEMA, minItems: 1 },
+    },
+    additionalProperties: false,
+  },
+  ask_parent: {
+    type: 'object',
+    required: ['opId', 'questions'],
+    properties: {
+      opId: OP_ID,
+      questions: { type: 'array', items: QUESTION_SCHEMA, minItems: 1 },
+    },
+    additionalProperties: false,
+  },
+  answer_child_question: {
+    type: 'object',
+    required: ['opId', 'questionId', 'answers'],
+    properties: {
+      opId: OP_ID,
+      questionId: OP_ID,
+      answers: { type: 'array', items: { type: 'string' }, minItems: 1 },
     },
     additionalProperties: false,
   },
