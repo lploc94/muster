@@ -22,10 +22,10 @@ export const BRIEF_LIST_MAX_ITEMS = 32;
 
 const KIND_PREAMBLES: Readonly<Record<TaskBriefKind, string>> = {
   coordinate:
-    'You are coordinating a multi-task workflow. Create a clear plan graph, wait for children, and seal only via host policy.',
+    'You are coordinating a multi-task workflow. Create a clear plan graph, wait for children, and seal only via host policy. When a step must be verified, delegate a verify task that depends on the work and have downstream tasks depend on that verify task; a non-pass verdict then blocks downstream and auto-remediation attempts a bounded fix.',
   plan: 'You are a planning agent. Produce a concrete, actionable plan summary suitable for implementers.',
   breakdown:
-    'You are a work-breakdown agent. Decompose the plan into an ordered checklist of small, independent implementation tasks. For each item give: a one-line goal, its taskType, which earlier items it depends on, which earlier outputs it consumes, and acceptance criteria. Prefer parallelizable, minimal items. Emit the checklist in a strict, compact, machine-readable form.',
+    'You are a work-breakdown agent. Decompose the plan into an ordered checklist of small, independent implementation tasks. For each item give: a one-line goal, its taskType, which earlier items it depends on, which earlier outputs it consumes, and acceptance criteria. Prefer parallelizable, minimal items. Emit the checklist in a strict, compact, machine-readable form. For any item that must be verified, emit a verify step depending on that work and mark its dependents as depending on the verify step so a failing verdict blocks them.',
   implement: 'You are an implementation agent. Apply the plan carefully; prefer minimal correct changes.',
   test: 'You are a testing agent. Verify behavior with the given checks; report failures clearly.',
   verify: 'You are a verification agent. Confirm acceptance criteria and definition of done.',
@@ -87,8 +87,21 @@ export type TaskBriefOverlay = {
   definitionOfDone?: string[];
   readPaths?: string[];
   writePaths?: string[];
-  verification?: { commands?: string[]; manualChecks?: string[] };
+  verification?: {
+    commands?: string[];
+    manualChecks?: string[];
+    hostRun?: boolean;
+    emitVerdict?: boolean;
+  };
 };
+
+/**
+ * Structured-verdict instruction. Appended to EVERY verify-kind brief by default
+ * (emitting a verdict is a verify task's job), and to a non-verify brief only when it
+ * opts in via `verification.hostRun` or `verification.emitVerdict`.
+ */
+const VERDICT_INSTRUCTION_SECTION =
+  "# Verdict\nWhen you finish, call complete_task with a structured verdict {status:'pass'|'fail'|'inconclusive', rationale, criteria[]}. Missing checks or missing evidence => 'inconclusive', never a default 'pass'.";
 
 function clampStringList(items: readonly string[] | undefined, itemMax = 500): string[] | undefined {
   if (!items) return undefined;
@@ -133,6 +146,8 @@ export function mergeBriefFromCreate(args: {
           ...(clampStringList(o.verification.manualChecks)
             ? { manualChecks: clampStringList(o.verification.manualChecks) }
             : {}),
+          ...(o.verification.hostRun === true ? { hostRun: true } : {}),
+          ...(o.verification.emitVerdict === true ? { emitVerdict: true } : {}),
         }
       : base.verification;
 
@@ -169,7 +184,13 @@ export function mergeBriefFromCreate(args: {
 
   if (readPaths && readPaths.length > 0) merged.readPaths = readPaths;
   if (writePaths && writePaths.length > 0) merged.writePaths = writePaths;
-  if (verification && (verification.commands?.length || verification.manualChecks?.length)) {
+  if (
+    verification &&
+    (verification.commands?.length ||
+      verification.manualChecks?.length ||
+      ('hostRun' in verification && verification.hostRun) ||
+      ('emitVerdict' in verification && verification.emitVerdict))
+  ) {
     merged.verification = verification;
   }
 
@@ -235,6 +256,17 @@ export function compileBriefBody(
     let body = lines.join('\n');
     if (body.length > BRIEF_SECTION_MAX) body = body.slice(0, BRIEF_SECTION_MAX);
     optional.push(`# Verification\n${body}`);
+  }
+  // Verdict-by-default (verify-gate-loop A): producing a pass/fail verdict IS the job of
+  // a verify task, so every verify-kind brief gets the `# Verdict` instruction. The
+  // `hostRun`/`emitVerdict` flags remain the opt-in for NON-verify kinds that also want
+  // to self-report a structured verdict.
+  if (
+    brief.kind === 'verify' ||
+    brief.verification?.hostRun === true ||
+    brief.verification?.emitVerdict === true
+  ) {
+    optional.push(VERDICT_INSTRUCTION_SECTION);
   }
 
   return { role, objective, optional };

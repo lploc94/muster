@@ -14,6 +14,7 @@ import type {
   TaskRole,
   TaskSealedBy,
   TaskTurn,
+  TaskVerdict,
   TurnDisposition,
   TurnFailureClass,
   TurnInput,
@@ -186,6 +187,14 @@ export interface CreateTaskContext {
   rootId: string;
   graph: DepGraph;
   now: string;
+  /**
+   * Internal opt-out for the verify-dependency auto-gate (verify-gate-loop default B).
+   * The Phase B remediation path creates a fix task that DEPENDS on the failed verify
+   * task (to run after it) but must NOT require its verdict to pass — otherwise the fix
+   * could never run and the loop would not terminate. That single internal path sets
+   * this true; all coordinator-initiated creates leave it false so the gate defaults on.
+   */
+  skipVerifyAutoGate?: boolean;
 }
 
 export interface QueueTurnOptions {
@@ -271,6 +280,19 @@ export function createTask(
     return depResult;
   }
 
+  // Verify-gate auto-default (verify-gate-loop B): a dependency whose TARGET producer is
+  // a verify-kind task defaults to requiring that verification's verdict to PASS. Reuses
+  // the same graph `validateDependencies` just confirmed the targets against (an O(1)
+  // briefKindOf lookup — no second scan). An explicit `requiredVerdict` is never
+  // overwritten, and a dependency whose target is not verify-kind is left untouched.
+  const dependencies = input.dependencies.map((dep) => {
+    if (dep.requiredVerdict !== undefined || ctx.skipVerifyAutoGate) return dep;
+    if (ctx.graph.briefKindOf?.(dep.taskId) === 'verify') {
+      return { ...dep, requiredVerdict: 'pass' as const };
+    }
+    return dep;
+  });
+
   const task: MusterTask = {
     id: input.id,
     role: input.role,
@@ -280,7 +302,7 @@ export function createTask(
     reason: input.reason,
     continuationOf: input.continuationOf,
     parentId: input.parentId,
-    dependencies: [...input.dependencies],
+    dependencies,
     backend: input.backend,
     model: input.model,
     ...(input.taskType !== undefined ? { taskType: input.taskType } : {}),
@@ -454,7 +476,12 @@ export function applySuccessfulTurn(
   switch (disposition.kind) {
     case 'complete': {
       // Persist structured TaskResultV1 on propose and seal (W1 dataflow).
-      const taskResult = buildTaskResultFromSummary(disposition.result, task.taskResult);
+      // Attach the optional verify verdict so verdict-aware dependents can gate on it.
+      const taskResult = buildTaskResultFromSummary(
+        disposition.result,
+        task.taskResult,
+        disposition.verdict,
+      );
       // Root tasks: human-gated — propose only; lifecycle stays open (TASK-MANAGEMENT §5.3).
       // Eligible direct children: host parent-orchestration seals with sealedBy.coordinator.
       if (!mayParentSealDirect(task, options.rootChildOrchestrationSeal)) {
@@ -659,6 +686,8 @@ export function setTaskLifecycle(
     reason?: string;
     /** Required on every terminal seal (W4). */
     sealedBy?: TaskSealedBy;
+    /** Optional structured verify verdict to persist on the succeeded result. */
+    verdict?: TaskVerdict;
   },
 ): TransitionResult<MusterTask> {
   const sealedBy = options.sealedBy ?? { kind: 'user' as const };
@@ -703,7 +732,7 @@ export function setTaskLifecycle(
     // Only write TaskResultV1 when a real summary exists — empty string would
     // incorrectly satisfy required inputBindings (W1 / codex-impl-review).
     if (summary !== undefined) {
-      const taskResult = buildTaskResultFromSummary(summary, task.taskResult);
+      const taskResult = buildTaskResultFromSummary(summary, task.taskResult, options.verdict);
       patch.taskResult = taskResult;
       patch.result = taskResult.summary;
     }
@@ -1251,7 +1280,12 @@ function boundDisposition(
 ): TurnDisposition {
   switch (disposition.kind) {
     case 'complete':
-      return { kind: 'complete', result: clampString(disposition.result, limits.maxResult) };
+      // Pass the structured verdict through unchanged (already normalized/clamped upstream).
+      return {
+        kind: 'complete',
+        result: clampString(disposition.result, limits.maxResult),
+        ...(disposition.verdict ? { verdict: disposition.verdict } : {}),
+      };
     case 'fail':
       return { kind: 'fail', error: clampString(disposition.error, limits.maxError) };
     default:

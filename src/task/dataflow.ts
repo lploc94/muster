@@ -10,12 +10,17 @@ import type {
   TaskResultOutputKey,
   TaskResultV1,
   TaskTurn,
+  TaskVerdict,
 } from './types';
+import { renderVerdictForPrompt } from './verdict';
 
 /** Max chars retained in a TaskResult summary / pin text. */
 export const TASK_RESULT_SUMMARY_MAX = 16_384;
 
-const ALLOWED_OUTPUT_KEYS: ReadonlySet<TaskResultOutputKey> = new Set(['summary']);
+const ALLOWED_OUTPUT_KEYS: ReadonlySet<TaskResultOutputKey> = new Set([
+  'summary',
+  'verdict',
+]);
 
 export function clampSummary(text: string, max = TASK_RESULT_SUMMARY_MAX): string {
   if (text.length <= max) return text;
@@ -25,17 +30,22 @@ export function clampSummary(text: string, max = TASK_RESULT_SUMMARY_MAX): strin
 /**
  * Build TaskResultV1 from a complete disposition string.
  * `previous` supplies the next revision when re-sealing/updating.
+ * `verdict` (optional) attaches a structured verify outcome; when omitted the
+ * result is byte-identical to the pre-verdict shape (no `verdict` key).
  */
 export function buildTaskResultFromSummary(
   summary: string,
   previous?: TaskResultV1,
+  verdict?: TaskVerdict,
 ): TaskResultV1 {
   const nextRevision = previous ? previous.revision + 1 : 1;
-  return {
+  const result: TaskResultV1 = {
     version: 1,
     revision: nextRevision,
     summary: clampSummary(summary),
   };
+  if (verdict) result.verdict = verdict;
+  return result;
 }
 
 /** Prefer structured taskResult; fall back to legacy result string as revision 1. */
@@ -89,12 +99,29 @@ export function resolveInputBindings(
       }
       continue;
     }
+    let text: string;
+    if (binding.output === 'verdict') {
+      // Producer settled without a verdict → fail-closed: required bindings miss.
+      if (!result.verdict) {
+        if (required) {
+          missing.push({
+            fromTaskId: binding.fromTaskId,
+            output: binding.output,
+            as: binding.as,
+          });
+        }
+        continue;
+      }
+      text = clampSummary(renderVerdictForPrompt(result.verdict));
+    } else {
+      text = clampSummary(result.summary);
+    }
     pins.push({
       as: binding.as,
       fromTaskId: binding.fromTaskId,
       output: binding.output,
       producerResultRevision: result.revision,
-      text: clampSummary(result.summary),
+      text,
     });
   }
 

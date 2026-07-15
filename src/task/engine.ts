@@ -7,7 +7,7 @@ import { runTurn as defaultRunTurn } from '../runner';
 import type { Backend, NormalizedEvent, RunOptions } from '../types';
 import type { TaskHandoffPhase, TurnTrigger } from './types';
 import { canBindTaskToBackend } from './backend-eligibility';
-import { assembleFirstTurnPrompt, synthesizeBriefFromGoal } from './brief';
+import { assembleFirstTurnPrompt, mergeBriefFromCreate, synthesizeBriefFromGoal } from './brief';
 import { capabilitiesFor } from './capabilities';
 import { summarizeTaskTypes } from './task-types';
 import {
@@ -41,6 +41,7 @@ import {
   buildRunOptionsForTurn,
   cleanupTurnResources,
   clearPendingParentQuestionOnCancel,
+  deriveEntityId,
   executeToolCommand,
   processCancelRequests,
   pruneLedgerForTurn,
@@ -48,6 +49,17 @@ import {
   tryPromoteTurn,
   type GraphEngineDeps,
 } from './engine-graph';
+import {
+  decideVerdictRetry,
+  failureSignature,
+  selectRecoveryDecision,
+} from './recovery-policy';
+import { runVerificationGate as defaultRunVerificationGate } from './verification-gate';
+import {
+  computeSourceRevision as defaultComputeSourceRevision,
+  NO_GIT_REVISION,
+  SOURCE_REVISION_UNAVAILABLE,
+} from './source-revision';
 import { BATCH_EXPAND_MAX, type ToolCommand } from './coordinator-tools';
 import { evaluateTaskReadiness } from './readiness';
 import { canPromoteTurn, dependencyTerminalOutcome } from './scheduler';
@@ -83,14 +95,17 @@ import {
 } from './transitions';
 import type {
   MusterTask,
+  TaskAttentionCode,
   TaskCapability,
   TaskDependency,
   TaskExecutionPolicy,
+  TaskInputBinding,
   TaskLifecycleState,
   TaskMessage,
   TaskRole,
   TaskStoreFile,
   TaskTurn,
+  TaskVerdict,
   TurnDisposition,
   TurnInput,
 } from './types';
@@ -140,6 +155,29 @@ export interface TaskEngineConfig {
    * Passed through to GraphEngineDeps for create/list.
    */
   getTaskTypeRegistry?: (cwd?: string) => import('./task-types').TaskTypeRegistryResult;
+  /**
+   * Host-authorization master switch for the Phase C host gate (default false). When
+   * NOT explicitly true, the engine NEVER executes a task's verification commands and
+   * falls back to the worker's self-reported verdict (Phase A behavior) — so host
+   * execution is user-authorized, never agent-triggerable.
+   *
+   * Accepts a live RESOLVER (`() => boolean`) as well as a static boolean: the engine
+   * evaluates it at settle time, so toggling the `muster.verification.hostRun` setting
+   * OFF revokes host execution immediately (no reload). Host wires a callback that reads
+   * the current setting value each time.
+   */
+  allowHostVerification?: boolean | (() => boolean);
+  /**
+   * Host-run verification gate (verify-gate-loop Phase C). Injectable so tests are
+   * deterministic and never shell out. Default: real host runner (`spawnSync`,
+   * `shell:false`). Invoked ONLY for verify tasks with `brief.verification.hostRun`.
+   */
+  runVerificationGate?: (commands: string[], cwd: string) => { verdict: TaskVerdict };
+  /**
+   * Source-revision probe for host-verdict drift invalidation (Phase C).
+   * Injectable for deterministic tests. Default: real git probe.
+   */
+  computeSourceRevision?: (cwd: string) => string;
 }
 
 export type EngineResult<T> =
@@ -164,6 +202,13 @@ export interface LeaseRecord {
  * legitimately run before it is force-cancelled anyway.
  */
 export const MAX_LEASE_AGE_MS = 1_800_000;
+
+/**
+ * Attention message set when auto-remediation pauses on an identical recurring verify
+ * failure. Stable literal so the pause branch can detect it and stay idempotent across
+ * repeated ticks (verify-gate-loop ISSUE 10).
+ */
+const PAUSE_ATTENTION_MESSAGE = 'identical verify failure recurred; auto-remediation paused';
 
 const DEFAULT_POLICY: TaskExecutionPolicy = {
   maxTurns: 50,
@@ -441,6 +486,7 @@ function depGraphFromFile(file: TaskStoreFile): DepGraph {
       return current.id;
     },
     dependsOn: (taskId) => file.tasks[taskId]?.dependencies.map((dep) => dep.taskId) ?? [],
+    briefKindOf: (taskId) => file.tasks[taskId]?.brief?.kind,
   };
 }
 
@@ -529,6 +575,18 @@ export class TaskEngine {
     cwd?: string,
   ) => import('./task-types').TaskTypeRegistryResult;
   /**
+   * Phase C host-authorization master switch (default false — never execute). Held as
+   * the raw config value (static boolean OR live resolver) and evaluated per settle via
+   * {@link resolveAllowHostVerification}.
+   */
+  private readonly allowHostVerification: boolean | (() => boolean);
+  /** Phase C host gate + drift probe (injectable; default real host shell/git). */
+  private readonly runVerificationGate: (
+    commands: string[],
+    cwd: string,
+  ) => { verdict: TaskVerdict };
+  private readonly computeSourceRevision: (cwd: string) => string;
+  /**
    * In-process handles for currently executing turns. Keyed by turnId so this
    * engine can abort only runs it owns and map session ids back to turns.
    */
@@ -579,6 +637,20 @@ export class TaskEngine {
     this.getHostEnvironment = config.getHostEnvironment;
     this.workspaceFolder = config.workspaceFolder;
     this.getTaskTypeRegistry = config.getTaskTypeRegistry;
+    // Preserve the raw value (boolean or resolver); resolveAllowHostVerification()
+    // evaluates it live at settle time so a mid-session setting toggle takes effect.
+    this.allowHostVerification = config.allowHostVerification ?? false;
+    this.computeSourceRevision =
+      config.computeSourceRevision ?? ((cwd) => defaultComputeSourceRevision(cwd));
+    // Thread the injected source-revision probe into the DEFAULT settle-time host gate
+    // too (not only revalidate), so the before/after drift capture uses the same
+    // revision function — deterministic in tests, consistent in production.
+    this.runVerificationGate =
+      config.runVerificationGate ??
+      ((commands, cwd) =>
+        defaultRunVerificationGate(commands, cwd, {
+          computeRevision: (c) => this.computeSourceRevision(c),
+        }));
   }
 
   /** 2s-capped host prepare before sequence-1 assemble (single freeze site). */
@@ -3248,6 +3320,528 @@ export class TaskEngine {
     // would recurse. Parents wake on the next settle/afterTurnSettled path.
   }
 
+  /**
+   * Bounded verify-remediation (verify-gate-loop Phase B/C) — opt-in, per-dependency.
+   *
+   * Runs in the same engine tick as {@link applyDependencyTerminals}, inside its own
+   * commit. Two triggers, both bounded by the SAME remediation budget so the loop
+   * ALWAYS terminates (never a permanent block):
+   *
+   *  1. A `requiredVerdict:'pass'` + `onUnsatisfied:'block'` gate whose producer settled
+   *     with a non-pass verdict. If the producer has a PRESENT fail/inconclusive verdict
+   *     → create ONE bounded fix task (re-point the gate to the fix, bind the failing
+   *     verdict as an untrusted `verify_failure` input). If the producer is terminal with
+   *     NO verdict (ISSUE 4) → seal the blocked task `failed` (`verdict_missing`) rather
+   *     than fabricate an un-runnable verdict-binding task.
+   *  2. A previously-created fix task that has ITSELF terminally failed (ISSUE 3). The
+   *     gate now waits on that failed fix forever; re-enter the budget — retry within
+   *     budget or seal the blocked task `failed`.
+   *
+   * Idempotent + bounded: fix ids derive deterministically from (blockedId, uses); once
+   * the gate is re-pointed the verdict trigger no longer matches, so a re-run creates no
+   * duplicate and never re-bumps `uses`. A graph with no `requiredVerdict` gate and no
+   * `remediation.fixTaskId` is a strict no-op (default behavior unchanged).
+   */
+  private applyVerdictRemediation(): void {
+    const now = nowIso(this.clock);
+    const turnsToSchedule: string[] = [];
+    this.store.commit((draft) => {
+      const graph = depGraphFromFile(draft);
+
+      // Seal a blocked task `failed` — an honest terminal, never a hang — attaching a
+      // verdict attention and cancelling any pending turn on it.
+      const sealBlockedFailed = (
+        blocked: MusterTask,
+        code: TaskAttentionCode,
+        message: string,
+        error: string,
+      ): void => {
+        const live = Object.values(draft.turns).find(
+          (t) =>
+            t.taskId === blocked.id &&
+            (t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user'),
+        );
+        const sealed = applyDependencyTerminal(blocked, live, 'failed', {
+          now,
+          error,
+          sealedBy: {
+            kind: 'coordinator',
+            taskId: blocked.parentId ?? blocked.id,
+            mode: 'dependency_policy',
+          },
+        });
+        if (sealed.ok) {
+          draft.tasks[blocked.id] = {
+            ...sealed.next.task,
+            attention: { code, message, at: now },
+          };
+          if (sealed.next.turn) draft.turns[sealed.next.turn.id] = sealed.next.turn;
+        }
+      };
+
+      // Set a non-terminal `verdict_failed` attention (block-with-reason, no seal).
+      const setBlockedAttention = (blocked: MusterTask, message: string): void => {
+        draft.tasks[blocked.id] = {
+          ...blocked,
+          revision: blocked.revision + 1,
+          updatedAt: now,
+          attention: { code: 'verdict_failed', message, at: now },
+        };
+      };
+
+      // Create ONE bounded fix task R that remediates `upstream`, binding `verify`'s
+      // failing verdict as an untrusted `verify_failure` input, re-point `blocked`'s gate
+      // (at `depIndex`) to require R to succeed, and bump the bounded budget (recording
+      // the failure signature + the new fix id for ISSUE 3 re-entry). Deterministic id
+      // keyed by (blockedId, uses) → idempotent; a pre-existing fix id is a strict skip.
+      const stageFix = (
+        blocked: MusterTask,
+        upstream: MusterTask,
+        verify: MusterTask,
+        depIndex: number,
+        uses: number,
+        sig: string,
+      ): void => {
+        const remediationId = deriveEntityId(blocked.id, 'verdict-remediation', String(uses));
+        if (draft.tasks[remediationId]) return; // a prior pass already staged this attempt
+        const remediationTurnId = deriveEntityId(
+          blocked.id,
+          'verdict-remediation-turn',
+          String(uses),
+        );
+        const remediationMessageId = deriveEntityId(
+          blocked.id,
+          'verdict-remediation-msg',
+          String(uses),
+        );
+
+        const rootId =
+          upstream.parentId === null ? remediationId : graph.rootOf(upstream.id) ?? remediationId;
+        const goal = `Remediate verification failure for: ${upstream.goal}`;
+        // Carry the upstream brief kind + writePaths so resource serialization
+        // (git-mutex) still applies to the fix.
+        const brief = mergeBriefFromCreate({
+          goal,
+          brief: { kind: upstream.brief?.kind ?? 'implement' },
+          writePaths: upstream.brief?.writePaths,
+        });
+        // The verdict binding also implies a succeeded/block dependency on the verify
+        // task (already terminal-succeeded → immediately satisfied), matching the
+        // create_tasks binding wiring.
+        const bindings: TaskInputBinding[] = [
+          { fromTaskId: verify.id, output: 'verdict', as: 'verify_failure' },
+        ];
+        const input: CreateTaskInput = {
+          id: remediationId,
+          role: 'worker',
+          goal,
+          parentId: upstream.parentId,
+          dependencies: [
+            { taskId: verify.id, requiredOutcome: 'succeeded', onUnsatisfied: 'block' },
+          ],
+          backend: upstream.backend,
+          model: upstream.model,
+          ...(upstream.taskType !== undefined ? { taskType: upstream.taskType } : {}),
+          cwd: upstream.cwd,
+          capabilities: ['create_child', 'wait_child', 'read_subtree'],
+          executionPolicy: { ...upstream.executionPolicy },
+          releaseState: 'released',
+          brief,
+          inputBindings: bindings,
+          ...(upstream.claimsGit !== undefined ? { claimsGit: upstream.claimsGit } : {}),
+        };
+        // skipVerifyAutoGate: the fix DEPENDS on the failed verify task (to run after it)
+        // but must NOT require its verdict to pass — that would deadlock the fix and break
+        // the loop-termination invariant. The gate re-point below is a direct mutation
+        // (not a createTask), so it is likewise never auto-gated.
+        const created = createTask(input, { rootId, graph, now, skipVerifyAutoGate: true });
+        if (!created.ok) {
+          // ISSUE 11 — an internal creation failure (e.g. cross-root verify) is NOT
+          // fixable by re-dispatch, so SEAL the blocked task rather than leave it hanging
+          // (or thrashing with a re-set attention). Nothing was staged yet.
+          sealBlockedFailed(
+            blocked,
+            'verdict_failed',
+            `could not create remediation task: ${created.reason}`,
+            `could not create remediation task: ${created.reason}`,
+          );
+          return;
+        }
+        draft.tasks[remediationId] = { ...created.next, releasedAt: now };
+        const turnCheck = canCreateTurn(draft, remediationId, this.resourceLimits);
+        if (!turnCheck.ok) {
+          // ISSUE 11 — roll back the partially-staged task in the SAME commit, then seal
+          // (guarantees termination; never a silent delete-and-return hang).
+          delete draft.tasks[remediationId];
+          sealBlockedFailed(
+            blocked,
+            'verdict_failed',
+            `could not create remediation task: ${turnCheck.reason}`,
+            `could not create remediation task: ${turnCheck.reason}`,
+          );
+          return;
+        }
+        draft.messages[remediationMessageId] = {
+          id: remediationMessageId,
+          taskId: remediationId,
+          role: 'user',
+          content: goal,
+          state: 'assigned',
+          createdAt: now,
+          turnId: remediationTurnId,
+        };
+        const started = transitionStartTask(draft.tasks[remediationId]!, [], {
+          turnId: remediationTurnId,
+          now,
+          inputs: [{ kind: 'message', messageId: remediationMessageId }],
+          trigger: 'engine',
+        });
+        if (!started.ok) {
+          // ISSUE 11 — roll back ALL partial staging (task + message) in the SAME commit,
+          // then seal so the blocked task terminates instead of hanging silently.
+          delete draft.tasks[remediationId];
+          delete draft.messages[remediationMessageId];
+          sealBlockedFailed(
+            blocked,
+            'verdict_failed',
+            `could not create remediation task: ${started.reason}`,
+            `could not create remediation task: ${started.reason}`,
+          );
+          return;
+        }
+        draft.turns[remediationTurnId] = started.next;
+
+        // Neutralize the blocked task's failed verdict gate: it now waits for the FIX
+        // task to succeed (drop requiredVerdict). Bump the bounded budget + record the
+        // failure signature and fix id so an identical recurrence pauses and a failed
+        // fix re-enters the SAME budget (ISSUE 3).
+        const nextDeps = blocked.dependencies.slice();
+        nextDeps[depIndex] = {
+          taskId: remediationId,
+          requiredOutcome: 'succeeded',
+          onUnsatisfied: 'block',
+        };
+        draft.tasks[blocked.id] = {
+          ...blocked,
+          dependencies: nextDeps,
+          remediation: { uses: uses + 1, lastFailureSig: sig, fixTaskId: remediationId },
+          revision: blocked.revision + 1,
+          updatedAt: now,
+        };
+        turnsToSchedule.push(remediationTurnId);
+      };
+
+      for (const blocked of Object.values(draft.tasks)) {
+        if (blocked.lifecycle !== 'open') continue;
+
+        // ── ISSUE 3 trigger: a previously-created fix task has ITSELF terminally failed.
+        // The gate (onUnsatisfied:'block' on the failed fix) would hang forever, so
+        // re-enter the SAME bounded budget: retry within budget or seal `failed`.
+        const fixTaskId = blocked.remediation?.fixTaskId;
+        if (fixTaskId) {
+          const fix = draft.tasks[fixTaskId];
+          const fixDepIndex = blocked.dependencies.findIndex(
+            (d) => d.taskId === fixTaskId && d.onUnsatisfied === 'block',
+          );
+          if (
+            fix &&
+            fixDepIndex >= 0 &&
+            isTerminalLifecycle(fix.lifecycle) &&
+            fix.lifecycle !== 'succeeded'
+          ) {
+            const uses = blocked.remediation?.uses ?? 0;
+            const sig = failureSignature(
+              fix.taskResult?.verdict?.rationale ??
+                fix.taskResult?.summary ??
+                fix.error ??
+                fix.id,
+            );
+            const identical =
+              decideVerdictRetry(blocked.remediation?.lastFailureSig, sig) === 'pause';
+            // Budget exhausted OR an identical fix-failure recurred → seal (terminate).
+            if (identical || selectRecoveryDecision('verdict-failed', uses) === 'abort') {
+              sealBlockedFailed(
+                blocked,
+                'verdict_failed',
+                identical
+                  ? 'remediation fix failed identically; auto-remediation stopped'
+                  : 'remediation budget exhausted',
+                identical
+                  ? 'remediation fix failed identically'
+                  : 'remediation budget exhausted',
+              );
+              continue;
+            }
+            // Within budget: retry against the SAME original verify context, recovered
+            // from the failed fix's verdict binding. If it cannot be recovered, seal
+            // rather than fabricate an un-runnable task (never hang).
+            const verifyId = (fix.inputBindings ?? []).find(
+              (b) => b.output === 'verdict',
+            )?.fromTaskId;
+            const verify = verifyId ? draft.tasks[verifyId] : undefined;
+            if (!verify) {
+              sealBlockedFailed(
+                blocked,
+                'verdict_failed',
+                'remediation fix failed; cannot reconstruct verify context — sealed',
+                'remediation fix failed; verify context missing',
+              );
+              continue;
+            }
+            stageFix(blocked, fix, verify, fixDepIndex, uses, sig);
+            continue;
+          }
+        }
+
+        // ── Phase A opt-in verdict-block gate on a settled, non-pass producer. Every
+        // other dependency shape is left untouched (Phase A already seals fail/skip;
+        // plain blocks wait via the scheduler).
+        const depIndex = blocked.dependencies.findIndex((dep) => {
+          if (dep.requiredVerdict !== 'pass' || dep.onUnsatisfied !== 'block') return false;
+          const producer = draft.tasks[dep.taskId];
+          if (!producer || !isTerminalLifecycle(producer.lifecycle)) return false;
+          return producer.taskResult?.verdict?.status !== 'pass';
+        });
+        if (depIndex < 0) continue;
+        const dep = blocked.dependencies[depIndex];
+        const verify = draft.tasks[dep.taskId]!;
+
+        // ── ISSUE 12: a remediation fix binds the producer's `verdict` output, which
+        // auto-wires a `requiredOutcome:'succeeded'` dependency on that producer. That is
+        // only satisfiable when the verify task itself SUCCEEDED. A producer that is
+        // terminal but NOT succeeded (failed/cancelled/skipped) would yield an
+        // un-promotable fix that could never run, so SEAL the blocked task `failed`
+        // (honest terminal) instead of fabricating a task that hangs.
+        if (verify.lifecycle !== 'succeeded') {
+          sealBlockedFailed(
+            blocked,
+            'verdict_failed',
+            'verify task did not succeed; gate cannot pass — coordinator action required',
+            'verify task did not succeed',
+          );
+          continue;
+        }
+
+        // ── ISSUE 4/12: producer succeeded but reported NO verdict. A verdict-binding fix
+        // would be un-runnable (no `verdict` output to consume), so seal `failed` with a
+        // `verdict_missing` attention — honest terminal, no silent hang.
+        if (!verify.taskResult?.verdict) {
+          sealBlockedFailed(
+            blocked,
+            'verdict_missing',
+            'verify produced no verdict; gate cannot pass — coordinator action required',
+            'verify produced no verdict',
+          );
+          continue;
+        }
+
+        const uses = blocked.remediation?.uses ?? 0;
+        const sig = failureSignature(
+          verify.taskResult?.verdict?.rationale ?? verify.taskResult?.summary ?? verify.id,
+        );
+
+        // Anti-thrash: an identical failure recurred → pause (attention, no new task).
+        if (decideVerdictRetry(blocked.remediation?.lastFailureSig, sig) === 'pause') {
+          // ISSUE 10 — idempotent: if the task already carries this exact pause attention,
+          // skip entirely (no new commit, no revision bump) across repeated ticks.
+          if (
+            blocked.attention?.code === 'verdict_failed' &&
+            blocked.attention.message === PAUSE_ATTENTION_MESSAGE
+          ) {
+            continue;
+          }
+          draft.tasks[blocked.id] = {
+            ...blocked,
+            revision: blocked.revision + 1,
+            updatedAt: now,
+            attention: { code: 'verdict_failed', message: PAUSE_ATTENTION_MESSAGE, at: now },
+          };
+          continue;
+        }
+
+        // Budget exhausted → seal the blocked task `failed` (honest terminal, not a hang).
+        if (selectRecoveryDecision('verdict-failed', uses) === 'abort') {
+          sealBlockedFailed(
+            blocked,
+            'verdict_failed',
+            'remediation budget exhausted',
+            'remediation budget exhausted',
+          );
+          continue;
+        }
+
+        // Identify the work to remediate from the verify task's OWN bindings: the first
+        // terminal input-binding producer is the task the verify was checking. Never
+        // fabricate work — with no upstream, block-with-reason for the coordinator.
+        const upstream = (verify.inputBindings ?? [])
+          .map((b) => draft.tasks[b.fromTaskId])
+          .find((t): t is MusterTask => !!t && isTerminalLifecycle(t.lifecycle));
+        if (!upstream) {
+          setBlockedAttention(
+            blocked,
+            'verify failed; no upstream task to remediate — coordinator action required',
+          );
+          continue;
+        }
+
+        stageFix(blocked, upstream, verify, depIndex, uses, sig);
+      }
+      return { ok: true };
+    });
+
+    // Schedule fix tasks' first turns outside the commit (mirrors create_tasks /
+    // drainPendingSendsAfterSettlement). scheduleTurn re-checks trust + readiness.
+    for (const turnId of turnsToSchedule) {
+      void this.scheduleTurn(turnId);
+    }
+  }
+
+  /**
+   * ISSUE 13 — resolve the host-authorization switch LIVE. When configured with a
+   * resolver callback (the host wires one reading `muster.verification.hostRun`), it is
+   * called every time so a mid-session toggle is honored. A throwing resolver fails
+   * CLOSED (never authorizes host execution).
+   */
+  private resolveAllowHostVerification(): boolean {
+    const value = this.allowHostVerification;
+    if (typeof value === 'function') {
+      try {
+        return value() === true;
+      } catch {
+        return false;
+      }
+    }
+    return value === true;
+  }
+
+  /**
+   * Phase C host gate (settle helper). Returns a source-bound HOST verdict when the
+   * settling turn belongs to a verify task with `brief.verification.hostRun === true`
+   * and carries a `complete` disposition; otherwise `undefined` (Phase A worker
+   * self-report is left unchanged). MUST be called OUTSIDE `store.commit` because the
+   * runner blocks (spawnSync) for the whole command duration.
+   */
+  private computeHostVerdictForSettle(turnId: string): TaskVerdict | undefined {
+    const file = this.store.getFile();
+    const turn = file.turns[turnId];
+    const task = turn ? file.tasks[turn.taskId] : undefined;
+    if (
+      !turn ||
+      !task ||
+      turn.status !== 'running' ||
+      turn.disposition?.kind !== 'complete' ||
+      task.brief?.kind !== 'verify' ||
+      task.brief.verification?.hostRun !== true
+    ) {
+      return undefined;
+    }
+    // ISSUE 1 — host-authorization master switch. Unless the USER explicitly enabled
+    // host verification, NEVER execute: fall back to the worker's self-reported verdict
+    // (Phase A behavior). Host execution is user-authorized, not agent-triggerable.
+    // ISSUE 13 — resolved LIVE here (before any spawn), so disabling the setting
+    // mid-session revokes host execution on the very next settle without a reload.
+    if (!this.resolveAllowHostVerification()) {
+      return undefined;
+    }
+    // ISSUE 2 — re-check workspace trust IMMEDIATELY before any host spawn (the same
+    // trust gate the delegate/scheduler paths use). Untrusted → run NOTHING and emit an
+    // `inconclusive` host verdict so the gate is NOT passed (fail-closed, no execution).
+    if (!this.isWorkspaceTrusted()) {
+      return {
+        status: 'inconclusive',
+        source: 'host',
+        rationale: 'workspace not trusted; host verification skipped',
+        at: nowIso(this.clock),
+      };
+    }
+    const cwd = this.resolveHostSnapshot(task).cwd;
+    const commands = task.brief.verification.commands ?? [];
+    return this.runVerificationGate(commands, cwd).verdict;
+  }
+
+  /**
+   * Drift invalidation (verify-gate-loop Phase C). A host verdict is bound to the
+   * source revision it was produced against; if the working tree has since moved
+   * (new commit or dirty edit) the stored `pass` is stale and is downgraded to
+   * `inconclusive`, which re-blocks any `requiredVerdict:'pass'` dependent.
+   *
+   * CRITICAL: git is invoked ONCE per cwd, OUTSIDE `store.commit` (it blocks for the
+   * whole subprocess). Cheap pre-scan first — if no producer carries a `source:'host'`
+   * passing verdict, this is a strict no-op and git is NEVER shelled, so a graph with
+   * no host verdicts keeps today's behavior and perf. Runs before
+   * {@link applyDependencyTerminals} in the tick so a re-blocked `onUnsatisfied:'fail'`
+   * dependent still seals in the same pass.
+   */
+  private revalidateVerdicts(): void {
+    // ISSUE 2 — never shell git on an untrusted workspace. Skip the drift probe when
+    // untrusted (no host spawn); stale verdicts are simply left intact until trust is
+    // granted, which re-runs the tick.
+    if (!this.isWorkspaceTrusted()) return;
+    const file = this.store.getFile();
+    // Cheap guard: only a passing host verdict can drift into a re-block. No such
+    // verdict → skip entirely (never shell git).
+    const candidates = Object.values(file.tasks).filter(
+      (t) =>
+        t.taskResult?.verdict?.source === 'host' &&
+        t.taskResult.verdict.status === 'pass',
+    );
+    if (candidates.length === 0) return;
+
+    // Compute the current revision ONCE per cwd, outside the commit (git blocks).
+    const revisionByCwd = new Map<string, string>();
+    const currentRevisionFor = (task: MusterTask): string => {
+      const cwd = this.resolveHostSnapshot(task).cwd;
+      let rev = revisionByCwd.get(cwd);
+      if (rev === undefined) {
+        rev = this.computeSourceRevision(cwd);
+        revisionByCwd.set(cwd, rev);
+      }
+      return rev;
+    };
+    const staleIds: string[] = [];
+    for (const task of candidates) {
+      const tested = task.taskResult?.verdict?.testedRevision;
+      const current = currentRevisionFor(task);
+      // Downgrade when the verdict can no longer be trusted as source-bound: either the
+      // current tree is UNAVAILABLE (cannot be fingerprinted → cannot confirm it still
+      // matches), or drift is positively observable (both tokens known and differing). A
+      // `no-git` sentinel on either side cannot prove drift → leave the verdict intact
+      // (never thrash on a git-less workspace).
+      if (
+        tested !== undefined &&
+        tested !== NO_GIT_REVISION &&
+        current !== NO_GIT_REVISION &&
+        (current === SOURCE_REVISION_UNAVAILABLE || tested !== current)
+      ) {
+        staleIds.push(task.id);
+      }
+    }
+    if (staleIds.length === 0) return;
+
+    const now = nowIso(this.clock);
+    this.store.commit((draft) => {
+      for (const id of staleIds) {
+        const task = draft.tasks[id];
+        const verdict = task?.taskResult?.verdict;
+        if (!task || !task.taskResult || !verdict) continue;
+        if (verdict.source !== 'host' || verdict.status !== 'pass') continue;
+        draft.tasks[id] = {
+          ...task,
+          revision: task.revision + 1,
+          updatedAt: now,
+          taskResult: {
+            ...task.taskResult,
+            // ISSUE 9 — bump the RESULT revision on downgrade so downstream pins /
+            // readiness observe the change (not just the task revision below).
+            revision: task.taskResult.revision + 1,
+            verdict: { ...verdict, status: 'inconclusive' },
+          },
+        };
+      }
+      return { ok: true };
+    });
+  }
+
   private afterTurnSettled(turnId: string): void {
     this.store.commit((draft) => {
       pruneLedgerForTurn(draft, turnId);
@@ -3352,7 +3946,11 @@ export class TaskEngine {
 
   private scheduleTurn(turnId: string): Promise<void> {
     this.reconcileTaskTimeouts();
+    // Phase C: downgrade stale host verdicts (git-guarded, no-op without host
+    // verdicts) BEFORE sealing so a re-blocked fail/skip dependent seals this tick.
+    this.revalidateVerdicts();
     this.applyDependencyTerminals();
+    this.applyVerdictRemediation();
     processCancelRequests(this.graphDeps());
     if (!this.isWorkspaceTrusted()) {
       return Promise.resolve();
@@ -4212,6 +4810,13 @@ export class TaskEngine {
     this.settling.add(turnId);
     const now = nowIso(this.clock);
     try {
+      // Phase C host gate — OPT-IN. When the settling turn is a verify task with
+      // `brief.verification.hostRun`, the ENGINE runs the declared commands on the
+      // host and OVERRIDES the worker's self-report. CRITICAL: `spawnSync`/git block
+      // for the whole command duration, so the gate runs HERE — before/outside the
+      // store.commit — and is threaded into the disposition inside the commit. The
+      // store lock is never held across the subprocess.
+      const hostVerdict = this.computeHostVerdictForSettle(turnId);
       const commit = this.store.commit((draft) => {
         const turn = draft.turns[turnId];
         const task = turn ? draft.tasks[turn.taskId] : undefined;
@@ -4220,7 +4825,16 @@ export class TaskEngine {
         }
 
         const observed = observedSessionId ?? turn.observedSessionId;
-        const withObserved = { ...turn, observedSessionId: observed };
+        // Override the worker's self-reported verdict with the host verdict when the
+        // gate ran; `buildTaskResultFromSummary` then persists the HOST verdict.
+        const withObserved =
+          hostVerdict && turn.disposition?.kind === 'complete'
+            ? {
+                ...turn,
+                observedSessionId: observed,
+                disposition: { ...turn.disposition, verdict: hostVerdict },
+              }
+            : { ...turn, observedSessionId: observed };
         // Root owns childOrchestrationSeal policy (W4).
         let rootId = task.id;
         let walk: string | null = task.parentId;

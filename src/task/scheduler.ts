@@ -65,8 +65,12 @@ export function dependenciesBlockTask(file: TaskStoreFile, taskId: string): bool
     return true;
   }
   for (const dep of task.dependencies) {
-    const lifecycle = file.tasks[dep.taskId]?.lifecycle;
-    const outcome = evaluateDependency(dep, lifecycle);
+    const producer = file.tasks[dep.taskId];
+    const outcome = evaluateDependency(
+      dep,
+      producer?.lifecycle,
+      producer?.taskResult?.verdict?.status,
+    );
     // Only 'satisfied' allows promotion. pending/block wait; fail/skip are sealed by
     // host applyDependencyTerminals — still block until sealed/settled.
     if (outcome !== 'satisfied') {
@@ -85,8 +89,12 @@ export function dependencyTerminalOutcome(
   let failed = false;
   let skipped = false;
   for (const dep of task.dependencies) {
-    const lifecycle = file.tasks[dep.taskId]?.lifecycle;
-    const outcome = evaluateDependency(dep, lifecycle);
+    const producer = file.tasks[dep.taskId];
+    const outcome = evaluateDependency(
+      dep,
+      producer?.lifecycle,
+      producer?.taskResult?.verdict?.status,
+    );
     if (outcome === 'fail') failed = true;
     if (outcome === 'skip') skipped = true;
   }

@@ -66,6 +66,51 @@ describe('breakdown briefKind', () => {
   });
 });
 
+describe('verify preamble + verdict-by-default (ISSUE 6 / verify-gate-loop A)', () => {
+  it('appends the # Verdict instruction for a plain verify-kind brief BY DEFAULT', () => {
+    // verify-gate-loop A: emitting a verdict is the job of a verify task, so a plain
+    // verify brief (no hostRun/emitVerdict flag) now includes the verdict section.
+    const brief = synthesizeBriefFromGoal('Verify the widget', undefined, 'verify');
+    const prompt = compileTaskPrompt(brief, [], { taskId: 'vfy', goal: 'Verify the widget' });
+    expect(prompt).toContain('You are a verification agent. Confirm acceptance criteria and definition of done.');
+    expect(prompt).toContain('# Verdict');
+    expect(prompt).toContain('structured verdict');
+    expect(prompt).toContain("never a default 'pass'");
+  });
+
+  it('does NOT append the # Verdict instruction for a non-verify brief without the flag', () => {
+    // A non-verify kind (here `implement`) with no emitVerdict/hostRun opt-in stays clean.
+    const brief = synthesizeBriefFromGoal('Build the widget', undefined, 'implement');
+    const prompt = compileTaskPrompt(brief, [], { taskId: 'impl', goal: 'Build the widget' });
+    expect(prompt).not.toContain('# Verdict');
+    expect(prompt).not.toContain('structured verdict');
+  });
+
+  it('appends the # Verdict instruction only when emitVerdict is opted in', () => {
+    const brief = mergeBriefFromCreate({
+      goal: 'Verify the widget',
+      brief: { kind: 'verify', verification: { emitVerdict: true } },
+    });
+    expect(brief.verification?.emitVerdict).toBe(true);
+    const prompt = compileTaskPrompt(brief, [], { taskId: 'vfy', goal: 'Verify the widget' });
+    // Legacy preamble stays; the verdict instruction is added as an extra section.
+    expect(prompt).toContain('You are a verification agent. Confirm acceptance criteria and definition of done.');
+    expect(prompt).toContain('# Verdict');
+    expect(prompt).toContain('structured verdict');
+    expect(prompt).toContain("never a default 'pass'");
+  });
+
+  it('appends the # Verdict instruction when hostRun is opted in', () => {
+    const brief = mergeBriefFromCreate({
+      goal: 'Verify the widget',
+      brief: { kind: 'verify', verification: { commands: ['npm test'], hostRun: true } },
+    });
+    expect(brief.verification?.hostRun).toBe(true);
+    const prompt = compileTaskPrompt(brief, [], { taskId: 'vfy', goal: 'Verify the widget' });
+    expect(prompt).toContain('# Verdict');
+  });
+});
+
 describe('compileTaskPrompt', () => {
   it('includes kind preamble, objective, and untrusted pin framing', () => {
     const brief = synthesizeBriefFromGoal('Implement plan', 'ctx', 'implement');

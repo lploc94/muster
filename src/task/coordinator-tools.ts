@@ -12,6 +12,7 @@ import type {
   TaskResultOutputKey,
   TaskRole,
 } from './types';
+import type { VerdictCriterionInput, VerdictInput } from './verdict';
 
 export interface CreateChildSpec {
   goal: string;
@@ -137,7 +138,7 @@ export type ToolCommand =
   | { kind: 'get_task_status'; taskId?: string }
   | { kind: 'get_host_context' }
   | { kind: 'list_task_types' }
-  | { kind: 'complete_task'; opId: string; result: string }
+  | { kind: 'complete_task'; opId: string; result: string; verdict?: VerdictInput }
   | { kind: 'fail_task'; opId: string; error: string }
   | { kind: 'report_progress'; opId: string; note: string }
   | { kind: 'ask_user'; opId: string; questions: Question[] }
@@ -225,7 +226,13 @@ function parseDependency(value: unknown): TaskDependency | undefined {
   ) {
     return undefined;
   }
-  return { taskId, requiredOutcome, onUnsatisfied };
+  const dep: TaskDependency = { taskId, requiredOutcome, onUnsatisfied };
+  // Opt-in verify gate. Present-but-invalid fails closed (rejects the create).
+  if (value.requiredVerdict !== undefined) {
+    if (value.requiredVerdict !== 'pass') return undefined;
+    dep.requiredVerdict = 'pass';
+  }
+  return dep;
 }
 
 function positiveInt(value: unknown): number | undefined {
@@ -396,6 +403,32 @@ function parseInputBindings(value: unknown): TaskInputBinding[] | undefined {
     const allowed = new Set(['fromTaskId', 'output', 'as', 'required']);
     if (Object.keys(entry).some((k) => !allowed.has(k))) return undefined;
     out.push(binding);
+  }
+  return out;
+}
+
+/**
+ * Structurally extract a worker-supplied verdict payload (verify-gate-loop Phase A).
+ * Timeless + never-rejecting: carries raw `status`/`rationale`/`criteria` strings for
+ * later fail-closed normalization (malformed status → inconclusive at normalize time).
+ * A non-record arg yields `undefined` (treated as no verdict).
+ */
+function parseVerdictInput(value: unknown): VerdictInput | undefined {
+  if (!isRecord(value)) return undefined;
+  const out: VerdictInput = {};
+  if (typeof value.status === 'string') out.status = value.status;
+  if (typeof value.rationale === 'string') out.rationale = value.rationale;
+  if (Array.isArray(value.criteria)) {
+    const criteria: VerdictCriterionInput[] = [];
+    for (const entry of value.criteria) {
+      if (!isRecord(entry)) continue;
+      const criterion: VerdictCriterionInput = {};
+      if (typeof entry.label === 'string') criterion.label = entry.label;
+      if (typeof entry.status === 'string') criterion.status = entry.status;
+      if (typeof entry.detail === 'string') criterion.detail = entry.detail;
+      criteria.push(criterion);
+    }
+    out.criteria = criteria;
   }
   return out;
 }
@@ -806,7 +839,18 @@ export function dispatch(
         if (!result) {
           return { ok: false, toolError: 'result is required' };
         }
-        return { ok: true, command: { kind: 'complete_task', opId, result } };
+        // Optional structured verdict. A bad verdict never rejects the call — it is
+        // normalized fail-closed (malformed status → inconclusive) at seal time.
+        const verdict = parseVerdictInput(args.verdict);
+        return {
+          ok: true,
+          command: {
+            kind: 'complete_task',
+            opId,
+            result,
+            ...(verdict !== undefined ? { verdict } : {}),
+          },
+        };
       }
       case 'fail_task': {
         const error = requireString(args, 'error');

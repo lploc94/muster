@@ -1,4 +1,4 @@
-import type { TaskDependency, TaskLifecycleState } from './types';
+import type { TaskBriefKind, TaskDependency, TaskLifecycleState, VerdictStatus } from './types';
 
 const TERMINAL_LIFECYCLES: ReadonlySet<TaskLifecycleState> = new Set([
   'succeeded',
@@ -14,21 +14,30 @@ function isTerminalLifecycle(state: TaskLifecycleState | undefined): boolean {
 export function isDependencySatisfied(
   dep: TaskDependency,
   depLifecycle: TaskLifecycleState | undefined,
+  depVerdict?: VerdictStatus,
 ): boolean {
   if (!isTerminalLifecycle(depLifecycle)) {
     return false;
   }
-  if (dep.requiredOutcome === 'settled') {
-    return true;
+  const outcomeSatisfied =
+    dep.requiredOutcome === 'settled' ? true : depLifecycle === 'succeeded';
+  if (!outcomeSatisfied) {
+    return false;
   }
-  return depLifecycle === 'succeeded';
+  // Opt-in verify gate (Phase A): only a passing producer verdict satisfies.
+  // Absent `requiredVerdict` → today's behavior (verdict ignored).
+  if (dep.requiredVerdict === 'pass') {
+    return depVerdict === 'pass';
+  }
+  return true;
 }
 
 export function evaluateDependency(
   dep: TaskDependency,
   depLifecycle: TaskLifecycleState | undefined,
+  depVerdict?: VerdictStatus,
 ): 'satisfied' | 'pending' | 'block' | 'fail' | 'skip' {
-  if (isDependencySatisfied(dep, depLifecycle)) {
+  if (isDependencySatisfied(dep, depLifecycle, depVerdict)) {
     return 'satisfied';
   }
   if (!isTerminalLifecycle(depLifecycle)) {
@@ -40,6 +49,13 @@ export function evaluateDependency(
 export interface DepGraph {
   rootOf(taskId: string): string | undefined;
   dependsOn(taskId: string): readonly string[];
+  /**
+   * Brief kind of an existing task, backed by the SAME task map `rootOf`/`dependsOn`
+   * read (an O(1) lookup, not a second scan). Enables the verify-gate auto-default in
+   * createTask. Optional so legacy graph mocks (which never target a verify producer)
+   * stay valid; real engine graphs always provide it.
+   */
+  briefKindOf?(taskId: string): TaskBriefKind | undefined;
 }
 
 function hasCycle(

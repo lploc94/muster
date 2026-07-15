@@ -2701,6 +2701,14 @@ export async function activate(context: vscode.ExtensionContext) {
       credentialRegistry,
       bridgePort: port,
       isWorkspaceTrusted: () => vscode.workspace.isTrusted,
+      // Host execution of a task's verification commands is OFF unless the USER
+      // explicitly enables it — commands become host-authorized, not agent-triggerable.
+      // Resolved LIVE per settle (callback), so toggling the setting OFF revokes host
+      // execution immediately without a reload (verify-gate-loop ISSUE 13).
+      allowHostVerification: () =>
+        vscode.workspace
+          .getConfiguration('muster')
+          .get<boolean>('verification.hostRun', false),
       prepareHostEnvironment,
       getHostEnvironment,
       workspaceFolder: resolveTaskCwd(),

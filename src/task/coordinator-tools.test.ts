@@ -6,6 +6,7 @@ import {
   PRESENTATION_TITLE_MAX_LENGTH,
 } from './coordinator-tools';
 import type { CredentialContext } from '../bridge/credentials';
+import { normalizeVerdict } from './verdict';
 
 function ctx(actions: string[]): CredentialContext {
   return {
@@ -488,6 +489,68 @@ describe('coordinator-tools batch dispatch', () => {
     }
   });
 
+  it('threads an explicit requiredVerdict through a batch child dependency (verify-gate-loop C)', () => {
+    const result = dispatch(
+      'create_tasks',
+      {
+        opId: 'op-batch',
+        tasks: [
+          {
+            localId: 'ship',
+            goal: 'ship it',
+            taskType: 'implement',
+            dependencies: [
+              {
+                taskId: 'task-verify',
+                requiredOutcome: 'succeeded',
+                onUnsatisfied: 'block',
+                requiredVerdict: 'pass',
+              },
+            ],
+          },
+        ],
+      },
+      ctx(['create_tasks']),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && result.command.kind === 'create_tasks') {
+      expect(result.command.specs[0].dependencies).toEqual([
+        {
+          taskId: 'task-verify',
+          requiredOutcome: 'succeeded',
+          onUnsatisfied: 'block',
+          requiredVerdict: 'pass',
+        },
+      ]);
+    }
+  });
+
+  it('rejects a batch child dependency with an invalid requiredVerdict (fail-closed)', () => {
+    const result = dispatch(
+      'create_tasks',
+      {
+        opId: 'op-batch',
+        tasks: [
+          {
+            localId: 'ship',
+            goal: 'ship it',
+            taskType: 'implement',
+            dependencies: [
+              {
+                taskId: 'task-verify',
+                requiredOutcome: 'succeeded',
+                onUnsatisfied: 'block',
+                requiredVerdict: 'fail',
+              },
+            ],
+          },
+        ],
+      },
+      ctx(['create_tasks']),
+    );
+    expect(result).toEqual({ ok: false, toolError: 'invalid create_tasks arguments' });
+  });
+
   it('maps delegate_tasks with a pre-existing task binding', () => {
     const result = dispatch(
       'delegate_tasks',
@@ -644,5 +707,99 @@ describe('coordinator-tools batch dispatch', () => {
       ctx(['complete_task']),
     );
     expect(result).toEqual({ ok: false, toolError: 'action not permitted: create_tasks' });
+  });
+});
+
+describe('complete_task verdict parsing', () => {
+  function completeCommand(args: Record<string, unknown>) {
+    const result = dispatch('complete_task', args, ctx(['complete_task']));
+    if (!result.ok) throw new Error(result.toolError);
+    if (result.command.kind !== 'complete_task') throw new Error('wrong command');
+    return result.command;
+  }
+
+  it('completes without a verdict (backward-compatible, no verdict key)', () => {
+    const command = completeCommand({ opId: 'op-c', result: 'done' });
+    expect(command).toEqual({ kind: 'complete_task', opId: 'op-c', result: 'done' });
+    expect('verdict' in command).toBe(false);
+  });
+
+  it('carries a structured verdict input through the command', () => {
+    const command = completeCommand({
+      opId: 'op-c',
+      result: 'done',
+      verdict: {
+        status: 'pass',
+        rationale: 'all checks passed',
+        criteria: [{ label: 'builds', status: 'pass' }],
+      },
+    });
+    expect(command.verdict).toEqual({
+      status: 'pass',
+      rationale: 'all checks passed',
+      criteria: [{ label: 'builds', status: 'pass' }],
+    });
+  });
+
+  it('never rejects the call for a malformed verdict; normalizes to inconclusive', () => {
+    const command = completeCommand({
+      opId: 'op-c',
+      result: 'done',
+      verdict: { status: 'garbage', rationale: 'unknown' },
+    });
+    // Parse keeps the raw token; normalization at seal time fail-closes it.
+    const normalized = normalizeVerdict(command.verdict, { at: 't0' });
+    expect(normalized?.status).toBe('inconclusive');
+    expect(normalized?.rationale).toBe('unknown');
+  });
+
+  it('ignores a non-object verdict arg (treated as no verdict)', () => {
+    const command = completeCommand({ opId: 'op-c', result: 'done', verdict: 'pass' });
+    expect(command.verdict).toBeUndefined();
+  });
+
+  it('still requires result when a verdict is present', () => {
+    const result = dispatch(
+      'complete_task',
+      { opId: 'op-c', verdict: { status: 'pass' } },
+      ctx(['complete_task']),
+    );
+    expect(result).toEqual({ ok: false, toolError: 'result is required' });
+  });
+});
+
+describe('parseDependency requiredVerdict', () => {
+  it('accepts requiredVerdict:pass on a create_task dependency', () => {
+    const result = dispatch(
+      'create_task',
+      {
+        opId: 'op-d',
+        goal: 'gate on verify',
+        taskType: 'implement',
+        dependencies: [
+          { taskId: 'verify-1', requiredOutcome: 'succeeded', onUnsatisfied: 'fail', requiredVerdict: 'pass' },
+        ],
+      },
+      ctx(['create_task']),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok || result.command.kind !== 'create_task') return;
+    expect(result.command.spec.dependencies?.[0].requiredVerdict).toBe('pass');
+  });
+
+  it('rejects an invalid requiredVerdict value (fail closed)', () => {
+    const result = dispatch(
+      'create_task',
+      {
+        opId: 'op-d',
+        goal: 'g',
+        taskType: 'implement',
+        dependencies: [
+          { taskId: 'v', requiredOutcome: 'succeeded', onUnsatisfied: 'fail', requiredVerdict: 'fail' },
+        ],
+      },
+      ctx(['create_task']),
+    );
+    expect(result).toEqual({ ok: false, toolError: 'invalid create_task arguments' });
   });
 });

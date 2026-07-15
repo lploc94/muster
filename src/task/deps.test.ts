@@ -77,6 +77,46 @@ describe('evaluateDependency', () => {
   }
 });
 
+describe('evaluateDependency with requiredVerdict', () => {
+  const policies = ['block', 'fail', 'skip'] as const;
+  const verdicts = ['pass', 'fail', 'inconclusive', undefined] as const;
+
+  for (const policy of policies) {
+    for (const verdict of verdicts) {
+      it(`succeeded producer, onUnsatisfied=${policy}, verdict=${String(verdict)}`, () => {
+        const d = dep({ requiredOutcome: 'succeeded', onUnsatisfied: policy, requiredVerdict: 'pass' });
+        const outcome = evaluateDependency(d, 'succeeded', verdict);
+        // Only a passing verdict satisfies; anything else routes to onUnsatisfied.
+        expect(outcome).toBe(verdict === 'pass' ? 'satisfied' : policy);
+      });
+    }
+  }
+
+  it('does not satisfy on a non-terminal producer even with a pass verdict pending', () => {
+    const d = dep({ requiredVerdict: 'pass' });
+    expect(evaluateDependency(d, 'open', 'pass')).toBe('pending');
+    expect(evaluateDependency(d, undefined, 'pass')).toBe('pending');
+  });
+
+  it('a failed producer stays terminal-unsatisfied regardless of verdict', () => {
+    const d = dep({ requiredOutcome: 'succeeded', onUnsatisfied: 'fail', requiredVerdict: 'pass' });
+    expect(evaluateDependency(d, 'failed', 'pass')).toBe('fail');
+  });
+
+  it('ignores verdict entirely when requiredVerdict is absent (unchanged behavior)', () => {
+    const d = dep({ requiredOutcome: 'succeeded', onUnsatisfied: 'block' });
+    expect(evaluateDependency(d, 'succeeded', 'fail')).toBe('satisfied');
+    expect(evaluateDependency(d, 'succeeded', undefined)).toBe('satisfied');
+    expect(isDependencySatisfied(d, 'succeeded', 'fail')).toBe(true);
+  });
+
+  it('settled requiredOutcome still honors the verdict gate', () => {
+    const d = dep({ requiredOutcome: 'settled', onUnsatisfied: 'skip', requiredVerdict: 'pass' });
+    expect(evaluateDependency(d, 'failed', 'pass')).toBe('satisfied');
+    expect(evaluateDependency(d, 'failed', 'fail')).toBe('skip');
+  });
+});
+
 function makeGraph(edges: Record<string, string[]>, roots: Record<string, string>): DepGraph {
   return {
     rootOf: (taskId) => roots[taskId],

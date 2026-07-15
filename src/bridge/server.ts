@@ -68,6 +68,31 @@ const DEPENDENCY_SCHEMA = {
     taskId: OP_ID,
     requiredOutcome: { enum: ['succeeded', 'settled'] },
     onUnsatisfied: { enum: ['block', 'fail', 'skip'] },
+    // Opt-in verify gate: satisfied only when the producer verdict is `pass`.
+    requiredVerdict: { enum: ['pass'] },
+  },
+  additionalProperties: false,
+};
+
+const VERDICT_SCHEMA = {
+  type: 'object',
+  required: ['status'],
+  properties: {
+    status: { enum: ['pass', 'fail', 'inconclusive'] },
+    rationale: { type: 'string' },
+    criteria: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['label', 'status'],
+        properties: {
+          label: { type: 'string' },
+          status: { enum: ['pass', 'fail', 'inconclusive'] },
+          detail: { type: 'string' },
+        },
+        additionalProperties: false,
+      },
+    },
   },
   additionalProperties: false,
 };
@@ -342,6 +367,8 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
     properties: {
       opId: OP_ID,
       result: { type: 'string', minLength: 1 },
+      // Optional structured verify verdict (verify tasks). Absent = no verdict.
+      verdict: VERDICT_SCHEMA,
     },
     additionalProperties: false,
   },

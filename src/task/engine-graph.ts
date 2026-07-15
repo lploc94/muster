@@ -9,6 +9,7 @@ import { mergeBriefFromCreate } from './brief';
 import { capabilitiesFor } from './capabilities';
 import { BATCH_EXPAND_MAX, type BatchChildSpec, type ToolCommand } from './coordinator-tools';
 import { validateBindingsForRelease } from './dataflow';
+import { normalizeVerdict } from './verdict';
 import {
   buildHostContext,
   minimalHostSnapshot,
@@ -128,6 +129,7 @@ function depGraphFromFile(file: TaskStoreFile): DepGraph {
       return current.id;
     },
     dependsOn: (taskId) => file.tasks[taskId]?.dependencies.map((d) => d.taskId) ?? [],
+    briefKindOf: (taskId) => file.tasks[taskId]?.brief?.kind,
   };
 }
 
@@ -1782,12 +1784,21 @@ export async function executeToolCommand(
     case 'complete_task': {
       const sizeCheck = checkLimit('result_size', limits, { file: deps.store.getFile(), parentId: null, rootId: ctx.rootId, resultBytes: Buffer.byteLength(command.result, 'utf8') });
       if (!sizeCheck.ok) return { ok: false, error: sizeCheck.reason };
+      // Normalize the (untrusted) worker verdict here where the engine clock lives, so
+      // `verdict.at` is deterministic per staging and the command fingerprint (parsed
+      // upstream, timeless) stays stable across idempotent retries. Absent → no verdict.
+      const verdict = normalizeVerdict(command.verdict, { at: now, source: 'worker' });
       const staged = deps.store.commit((draft) => {
         const turn = draft.turns[ctx.turnId];
         if (!turn) return { ok: false, reason: 'turn not found' };
-        const result = stageDisposition(turn, { kind: 'complete', result: command.result }, command.opId, {
-          limits: { maxResult: limits.maxResultBytes, maxError: limits.maxErrorBytes },
-        });
+        const result = stageDisposition(
+          turn,
+          { kind: 'complete', result: command.result, ...(verdict ? { verdict } : {}) },
+          command.opId,
+          {
+            limits: { maxResult: limits.maxResultBytes, maxError: limits.maxErrorBytes },
+          },
+        );
         if (!result.ok) return result;
         draft.turns[ctx.turnId] = result.next.turn;
         writeLedger(draft, ctx.turnId, command.opId, fingerprint, { ok: true, data: { staged: true } });
