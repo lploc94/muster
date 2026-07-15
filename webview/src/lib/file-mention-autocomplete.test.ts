@@ -384,6 +384,37 @@ describe('createFileMentionAutocompleteSession', () => {
     session.dispose();
   });
 
+  it('keeps open suggestions when caret re-syncs on the same active query', () => {
+    const posts: unknown[] = [];
+    const session = createFileMentionAutocompleteSession({
+      post: (msg) => posts.push(msg),
+      createRequestId: () => 'req-same',
+    });
+
+    session.onCaretChange({ text: '@re', caret: 3, canSend: true });
+    vi.advanceTimersByTime(FILE_MENTION_SUGGESTION_DEBOUNCE_MS);
+    session.onResponse({
+      type: 'fileMentionSuggestions',
+      requestId: 'req-same',
+      parentDepth: 0,
+      relativeQuery: 're',
+      items: sampleItems,
+    });
+    expect(session.getState().open).toBe(true);
+    expect(session.getState().items).toEqual(sampleItems);
+    expect(posts).toHaveLength(1);
+
+    // Keyup/caret re-sync at the same @re range must not close or re-request.
+    session.onCaretChange({ text: '@re', caret: 3, canSend: true });
+    expect(session.getState().open).toBe(true);
+    expect(session.getState().items).toEqual(sampleItems);
+    expect(session.getState().outcome).toBe('ready');
+    vi.advanceTimersByTime(FILE_MENTION_SUGGESTION_DEBOUNCE_MS);
+    expect(posts).toHaveLength(1);
+
+    session.dispose();
+  });
+
   it('shows file and directory items for mouse navigation (S02)', () => {
     const session = createFileMentionAutocompleteSession({
       post: () => {},

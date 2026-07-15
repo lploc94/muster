@@ -624,7 +624,21 @@
     notifyMentionAutocompleteCaret();
   }
 
-  function onDraftSelectOrKeyup() {
+  function onDraftSelectOrKeyup(e?: Event) {
+    // Arrow/Enter/Tab/Escape keyups must not re-run caret sync while the popup
+    // is open — that would re-enter the autocomplete session and can reset the
+    // keyboard highlight (activeIndex) or briefly clear items.
+    if (
+      mentionAutocomplete.open &&
+      e instanceof KeyboardEvent &&
+      (e.key === 'ArrowDown' ||
+        e.key === 'ArrowUp' ||
+        e.key === 'Enter' ||
+        e.key === 'Tab' ||
+        e.key === 'Escape')
+    ) {
+      return;
+    }
     notifyMentionAutocompleteCaret();
   }
 

@@ -1200,6 +1200,533 @@ test('current-directory file mention flow covers draft and idle task dual-text s
   expect(taskSend.llmText).toBeUndefined();
 });
 
+/**
+ * T03: keyboard / mouse / IME / caret proof for file-mention autocomplete.
+ * Real typing + host-mocked suggestions — not Extension Development Host.
+ */
+test('file mention autocomplete keyboard mouse IME and caret interactions', async ({
+  page,
+}) => {
+  const consoleErrors: string[] = [];
+  const pageErrors: string[] = [];
+  const failedRequests: string[] = [];
+  page.on('console', (msg) => {
+    if (msg.type() !== 'error') return;
+    // Vite/dev asset 403s are harness noise, not product regressions.
+    const text = msg.text();
+    if (/status of 403|Failed to load resource/i.test(text)) return;
+    consoleErrors.push(text);
+  });
+  page.on('pageerror', (err) => {
+    pageErrors.push(err.message);
+  });
+  page.on('requestfailed', (req) => {
+    const failure = req.failure()?.errorText ?? '';
+    // Ignore harness asset 403/net::ERR noise from Vite/dev server.
+    if (/403|ERR_ABORTED|net::ERR/i.test(failure) || /403/.test(req.url())) return;
+    failedRequests.push(`${req.method()} ${req.url()} ${failure}`);
+  });
+
+  await openWebview(page);
+  await postSnapshot(page, { type: 'snapshot', rootTasks: [], storeRevision: 40 });
+  await page.getByRole('button', { name: 'New task' }).first().click();
+  await expectPostedMessage(page, { type: 'newTask' });
+
+  const composer = page.getByPlaceholder('Start a new coordinator task with claude…');
+  await composer.click();
+
+  // ── Keyboard: Arrow navigation, Enter accepts (does not send), Escape dismisses ──
+  await composer.pressSequentially('Draft note @re', { delay: 20 });
+
+  const kbBefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(kbBefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+
+  const kbRequest = (await postedMessages(page))
+    .slice(kbBefore)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    type: string;
+    requestId: string;
+    parentDepth: number;
+    relativeQuery: string;
+  };
+  expect(kbRequest.parentDepth).toBe(0);
+  expect(kbRequest.relativeQuery).toBe('re');
+
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: kbRequest.requestId,
+    parentDepth: 0,
+    relativeQuery: 're',
+    items: [
+      {
+        id: 'file:readme.md',
+        kind: 'file',
+        label: 'readme.md',
+        insertionPath: 'docs/readme.md',
+      },
+      {
+        id: 'file:reports.md',
+        kind: 'file',
+        label: 'reports.md',
+        insertionPath: 'reports.md',
+      },
+      {
+        id: 'dir:research',
+        kind: 'directory',
+        label: 'research',
+        insertionPath: 'research',
+      },
+    ],
+  });
+
+  const listbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+  await expect(listbox).toBeVisible();
+  await expect(listbox).toHaveAttribute('data-testid', 'file-mention-listbox');
+  await expect(composer).toHaveAttribute('aria-expanded', 'true');
+  await expect(composer).toHaveAttribute('aria-activedescendant', 'file-mention-option-0');
+
+  // Active-option state via mouseenter (same mentionActiveIndex path as Arrow move).
+  // Pure Arrow policy is covered by unit tests; browser proof focuses on accept/dismiss.
+  await expect(composer).toBeFocused();
+  await listbox.getByRole('option', { name: 'reports.md' }).hover();
+  await expect(composer).toHaveAttribute('aria-activedescendant', 'file-mention-option-1');
+  await expect(listbox.getByRole('option', { name: 'reports.md' })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
+  // Return highlight to first option for Enter accept proof.
+  await listbox.getByRole('option', { name: 'readme.md' }).hover();
+  await expect(composer).toHaveAttribute('aria-activedescendant', 'file-mention-option-0');
+  await expect(composer).toBeFocused();
+
+  // Enter accepts the active option — must not post send while popup is open.
+  const beforeEnter = (await postedMessages(page)).length;
+  await composer.press('Enter');
+  await expect(listbox).toHaveCount(0);
+  // Only the active @re token is replaced; leading draft text is preserved.
+  await expect(composer).toHaveValue('Draft note @readme.md ');
+  await expect(composer).toBeFocused();
+  const afterEnter = await postedMessages(page);
+  expect(
+    afterEnter
+      .slice(beforeEnter)
+      .some((m) => (m as { type?: string }).type === 'send'),
+  ).toBe(false);
+
+  // Ordinary Enter after dismissal resumes send.
+  await composer.press('Enter');
+  await expectPostedMessage(page, {
+    type: 'send',
+    text: 'Draft note @readme.md',
+    llmText: 'Draft note @docs/readme.md',
+    backend: 'claude',
+  });
+
+  // ── Tab accept + mouse click + mid-sentence caret replacement ──
+  await composer.fill('');
+  await composer.pressSequentially('See @fi before after', { delay: 15 });
+  // Move caret into the middle of the @fi query (after "See @fi").
+  await composer.evaluate((el: HTMLTextAreaElement) => el.setSelectionRange(7, 7));
+  await composer.dispatchEvent('select');
+
+  const midBefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(midBefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+
+  const midRequest = (await postedMessages(page))
+    .slice(midBefore)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    type: string;
+    requestId: string;
+    relativeQuery: string;
+  };
+  expect(midRequest.relativeQuery).toBe('fi');
+
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: midRequest.requestId,
+    parentDepth: 0,
+    relativeQuery: 'fi',
+    items: [
+      {
+        id: 'file:file.ts',
+        kind: 'file',
+        label: 'file.ts',
+        insertionPath: 'src/file.ts',
+      },
+      {
+        id: 'file:filter.ts',
+        kind: 'file',
+        label: 'filter.ts',
+        insertionPath: 'filter.ts',
+      },
+    ],
+  });
+
+  const midListbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+  await expect(midListbox).toBeVisible();
+
+  // Mouse click preserves textarea focus (mousedown preventDefault) and replaces only @fi.
+  await midListbox.getByRole('option', { name: 'file.ts' }).click();
+  await expect(midListbox).toHaveCount(0);
+  await expect(composer).toHaveValue('See @file.ts before after');
+  await expect(composer).toBeFocused();
+
+  // Re-open for Tab accept + Escape dismiss proof.
+  await composer.fill('');
+  await composer.pressSequentially('Pick @ta', { delay: 15 });
+  const tabBefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(tabBefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+  const tabRequest = (await postedMessages(page))
+    .slice(tabBefore)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    requestId: string;
+  };
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: tabRequest.requestId,
+    parentDepth: 0,
+    relativeQuery: 'ta',
+    items: [
+      {
+        id: 'file:task.md',
+        kind: 'file',
+        label: 'task.md',
+        insertionPath: 'task.md',
+      },
+      {
+        id: 'file:table.md',
+        kind: 'file',
+        label: 'table.md',
+        insertionPath: 'table.md',
+      },
+    ],
+  });
+  const tabListbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+  await expect(tabListbox).toBeVisible();
+  await composer.press('ArrowDown');
+  await expect(composer).toHaveAttribute('aria-activedescendant', 'file-mention-option-1');
+  await composer.press('Tab');
+  await expect(tabListbox).toHaveCount(0);
+  await expect(composer).toHaveValue('Pick @table.md ');
+
+  // Escape dismisses without inserting; draft preserved.
+  await composer.fill('');
+  await composer.pressSequentially('Keep @esc', { delay: 15 });
+  const escBefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(escBefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+  const escRequest = (await postedMessages(page))
+    .slice(escBefore)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    requestId: string;
+  };
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: escRequest.requestId,
+    parentDepth: 0,
+    relativeQuery: 'esc',
+    items: [
+      {
+        id: 'file:escape.md',
+        kind: 'file',
+        label: 'escape.md',
+        insertionPath: 'escape.md',
+      },
+    ],
+  });
+  const escListbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+  await expect(escListbox).toBeVisible();
+  await composer.press('Escape');
+  await expect(escListbox).toHaveCount(0);
+  await expect(composer).toHaveValue('Keep @esc');
+  await expect(composer).toHaveAttribute('aria-expanded', 'false');
+
+  // ── Email-like text does not open the popup or request host suggestions ──
+  await composer.fill('');
+  const emailBefore = (await postedMessages(page)).length;
+  await composer.pressSequentially('user@example.com', { delay: 10 });
+  await page.waitForTimeout(200);
+  const emailMessages = (await postedMessages(page)).slice(emailBefore);
+  expect(
+    emailMessages.filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions'),
+  ).toHaveLength(0);
+  await expect(page.getByRole('listbox', { name: 'File mention suggestions' })).toHaveCount(0);
+
+  // ── IME composition must not open the popup or post host requests ──
+  await composer.fill('');
+  await composer.click();
+  const imeBefore = (await postedMessages(page)).length;
+  await composer.evaluate((el: HTMLTextAreaElement) => {
+    el.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true, data: '' }));
+    el.value = 'こんにちは@re';
+    el.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'こんにちは@re', isComposing: true }));
+    el.setSelectionRange(el.value.length, el.value.length);
+    el.dispatchEvent(
+      new CompositionEvent('compositionupdate', { bubbles: true, data: 'こんにちは@re' }),
+    );
+  });
+  await page.waitForTimeout(200);
+  const imeDuring = (await postedMessages(page)).slice(imeBefore);
+  expect(
+    imeDuring.filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions'),
+  ).toHaveLength(0);
+  await expect(page.getByRole('listbox', { name: 'File mention suggestions' })).toHaveCount(0);
+  // End composition and re-evaluate; still no request if query invalid / closed during IME.
+  await composer.evaluate((el: HTMLTextAreaElement) => {
+    el.dispatchEvent(
+      new CompositionEvent('compositionend', { bubbles: true, data: 'こんにちは@re' }),
+    );
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  // Force a clean non-composition @ query next.
+  await composer.fill('');
+  await composer.pressSequentially('@ime', { delay: 15 });
+  const imeAfterBefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(imeAfterBefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+
+  // ── Empty results: status popup, draft preserved, no free-form host text ──
+  await composer.fill('');
+  await composer.pressSequentially('Empty @zz', { delay: 15 });
+  const emptyBefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(emptyBefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+  const emptyRequest = (await postedMessages(page))
+    .slice(emptyBefore)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    requestId: string;
+    relativeQuery: string;
+  };
+  expect(emptyRequest.relativeQuery).toBe('zz');
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: emptyRequest.requestId,
+    parentDepth: 0,
+    relativeQuery: 'zz',
+    items: [],
+  });
+  const emptyListbox = page.getByTestId('file-mention-listbox');
+  await expect(emptyListbox).toBeVisible();
+  await expect(emptyListbox).toHaveAttribute('data-outcome', 'empty');
+  await expect(page.getByTestId('file-mention-status')).toHaveText('No matching files');
+  await expect(composer).toHaveValue('Empty @zz');
+  // Enter while empty status is open must not send.
+  const emptyEnterBefore = (await postedMessages(page)).length;
+  await composer.press('Enter');
+  expect(
+    (await postedMessages(page))
+      .slice(emptyEnterBefore)
+      .some((m) => (m as { type?: string }).type === 'send'),
+  ).toBe(false);
+  await composer.press('Escape');
+  await expect(emptyListbox).toHaveCount(0);
+  await expect(composer).toHaveValue('Empty @zz');
+
+  // ── Sanitized host error: no codes/paths in UI, draft preserved ──
+  await composer.fill('');
+  await composer.pressSequentially('Fail @er', { delay: 15 });
+  const errBefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(errBefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+  const errRequest = (await postedMessages(page))
+    .slice(errBefore)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    requestId: string;
+  };
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    ok: false,
+    requestId: errRequest.requestId,
+    code: 'listingFailed',
+  });
+  const errListbox = page.getByTestId('file-mention-listbox');
+  await expect(errListbox).toBeVisible();
+  await expect(errListbox).toHaveAttribute('data-outcome', 'error');
+  await expect(page.getByTestId('file-mention-status')).toHaveText('File suggestions unavailable');
+  await expect(composer).toHaveValue('Fail @er');
+  // Never surface host codes or absolute paths in the DOM.
+  await expect(page.locator('body')).not.toContainText('listingFailed');
+  await expect(page.locator('body')).not.toContainText('/Users');
+  await expect(page.locator('body')).not.toContainText('C:\\');
+  await composer.press('Escape');
+  await expect(errListbox).toHaveCount(0);
+  await expect(composer).toHaveValue('Fail @er');
+
+  // ── Task change closes suggestions ──
+  await composer.fill('');
+  await composer.pressSequentially('Scope @ch', { delay: 15 });
+  const taskChangeBefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(taskChangeBefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+  const taskChangeRequest = (await postedMessages(page))
+    .slice(taskChangeBefore)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    requestId: string;
+  };
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: taskChangeRequest.requestId,
+    parentDepth: 0,
+    relativeQuery: 'ch',
+    items: [
+      {
+        id: 'file:change.md',
+        kind: 'file',
+        label: 'change.md',
+        insertionPath: 'change.md',
+      },
+    ],
+  });
+  await expect(page.getByRole('listbox', { name: 'File mention suggestions' })).toBeVisible();
+
+  // Switch into an existing task — mode/taskId effect closes the popup.
+  await postSnapshot(page, {
+    type: 'snapshot',
+    rootTasks: [
+      task({
+        id: 'task-mention-switch',
+        goal: 'Task change closes mention popup',
+        viewStatus: 'idle',
+      }),
+    ],
+    focusedTaskId: 'task-mention-switch',
+    subtree: [
+      task({
+        id: 'task-mention-switch',
+        goal: 'Task change closes mention popup',
+        viewStatus: 'idle',
+      }),
+    ],
+    transcript: [{ id: 'msg-switch', kind: 'assistant', content: 'Ready after switch.' }],
+    storeRevision: 41,
+  });
+  await expect(page.getByText('Ready after switch.')).toBeVisible();
+  await expect(page.getByRole('listbox', { name: 'File mention suggestions' })).toHaveCount(0);
+
+  // ── Blocked composer (pending ask) closes suggestions ──
+  const taskComposer = page.getByPlaceholder('Message this task…');
+  await expect(taskComposer).toBeEnabled();
+  await taskComposer.click();
+  await taskComposer.pressSequentially('Block @bl', { delay: 15 });
+  const blockBefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(blockBefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+  const blockRequest = (await postedMessages(page))
+    .slice(blockBefore)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    requestId: string;
+    taskId?: string;
+  };
+  expect(blockRequest.taskId).toBe('task-mention-switch');
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: blockRequest.requestId,
+    parentDepth: 0,
+    relativeQuery: 'bl',
+    items: [
+      {
+        id: 'file:block.md',
+        kind: 'file',
+        label: 'block.md',
+        insertionPath: 'block.md',
+      },
+    ],
+  });
+  await expect(page.getByRole('listbox', { name: 'File mention suggestions' })).toBeVisible();
+
+  // Pending ask blocks free-form send and must close the popup.
+  await postSnapshot(page, {
+    type: 'snapshot',
+    rootTasks: [
+      task({
+        id: 'task-mention-switch',
+        goal: 'Task change closes mention popup',
+        viewStatus: 'waiting_user',
+      }),
+    ],
+    focusedTaskId: 'task-mention-switch',
+    subtree: [
+      task({
+        id: 'task-mention-switch',
+        goal: 'Task change closes mention popup',
+        viewStatus: 'waiting_user',
+      }),
+    ],
+    transcript: [{ id: 'msg-switch', kind: 'assistant', content: 'Ready after switch.' }],
+    activeTurnId: 'turn-block',
+    pendingAsk: {
+      turnId: 'turn-block',
+      askId: 'ask-block',
+      questions: [{ prompt: 'Continue?', options: ['Yes', 'No'], allowFreeText: false }],
+    },
+    storeRevision: 42,
+  });
+  await expect(page.getByText('Answer above to continue.')).toBeVisible();
+  await expect(page.getByRole('listbox', { name: 'File mention suggestions' })).toHaveCount(0);
+
+  // No console errors, page errors, or failed network requests from this flow.
+  expect(consoleErrors, `console errors: ${consoleErrors.join(' | ')}`).toEqual([]);
+  expect(pageErrors, `page errors: ${pageErrors.join(' | ')}`).toEqual([]);
+  expect(failedRequests, `failed requests: ${failedRequests.join(' | ')}`).toEqual([]);
+});
+
 test('Add Context menu keeps the existing file picker and mention flow', async ({ page }) => {
     await openWebview(page);
 

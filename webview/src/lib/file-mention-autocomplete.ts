@@ -210,6 +210,9 @@ export function createFileMentionAutocompleteSession(
   return {
     onCaretChange(input: FileMentionAutocompleteCaretInput): void {
       if (disposed) return;
+
+      // Capture prior focus scope before overwriting — task switches must re-request.
+      const previousTaskId = latestInput?.taskId;
       latestInput = input;
 
       if (!input.canSend) {
@@ -220,6 +223,25 @@ export function createFileMentionAutocompleteSession(
       const query = parseActiveFileMentionQuery(input.text, input.caret);
       if (!query) {
         closeAndClearPending();
+        return;
+      }
+
+      const prev = state.activeQuery;
+      const sameQuery =
+        prev != null &&
+        prev.start === query.start &&
+        prev.end === query.end &&
+        prev.parentDepth === query.parentDepth &&
+        prev.relativeQuery === query.relativeQuery &&
+        previousTaskId === input.taskId;
+
+      // Same active @query + task scope (e.g. Arrow/Enter keyup caret re-sync):
+      // keep the open listbox and do not re-debounce a host request.
+      if (sameQuery && (state.open || state.pendingRequestId != null)) {
+        setState({
+          ...state,
+          activeQuery: query,
+        });
         return;
       }
 
@@ -245,6 +267,21 @@ export function createFileMentionAutocompleteSession(
         const nextQuery = parseActiveFileMentionQuery(current.text, current.caret);
         if (!nextQuery) {
           closeAndClearPending();
+          return;
+        }
+        // Skip re-fire when we already have results for this exact query scope.
+        const latestState = state;
+        const alreadyReady =
+          latestState.open &&
+          latestState.activeQuery != null &&
+          latestState.activeQuery.start === nextQuery.start &&
+          latestState.activeQuery.end === nextQuery.end &&
+          latestState.activeQuery.parentDepth === nextQuery.parentDepth &&
+          latestState.activeQuery.relativeQuery === nextQuery.relativeQuery &&
+          (latestState.outcome === 'ready' ||
+            latestState.outcome === 'empty' ||
+            latestState.outcome === 'error');
+        if (alreadyReady) {
           return;
         }
         fireRequest(current, nextQuery);
