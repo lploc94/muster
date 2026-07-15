@@ -1,6 +1,6 @@
 # Presentation review panel enrichment
 
-**Status:** plan — APPROVED (codex-plan-review 20260715-005, 4 rounds; ISSUE-1…10 fixed)  
+**Status:** plan — SHIPPED P0–P2 (impl 90929dd / 2e849e0 / 5a390be; P3 backlog remains)  
 **Audience:** implementer (host + presentation webview; additive protocol)  
 **Evidence date:** 2026-07-15  
 **Depends on:** existing presentation surface (`docs/WEBVIEW.md` §13)  
