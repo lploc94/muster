@@ -260,7 +260,15 @@ body {
 
 /* Task-scoped model-switch progress (never chat). */
 .handoff-progress-bar {
-  margin: 6px 8px 0;
+  min-width: 0;
+  max-width: min(52vw, 520px);
+  white-space: nowrap;
+}
+
+.handoff-progress-bar .turn-activity-bar__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .turn-live-dot {
@@ -1811,17 +1819,22 @@ body {
   transition: none;
 }
 
-/* Dedicated editor-column presentation surface. */
+/* Dedicated editor-column presentation surface.
+ * Global html/body/#app pin the viewport with overflow:hidden so long plans
+ * must scroll inside the shell (not the document). */
 .presentation-body {
-  overflow: auto;
+  overflow: hidden;
 }
 
 .presentation-shell {
+  flex: 1 1 auto;
+  min-height: 0;
   width: min(100%, 960px);
-  min-height: 100%;
   margin: 0 auto;
   box-sizing: border-box;
   padding: 0 32px 48px;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .presentation-header {
@@ -1857,6 +1870,13 @@ body {
   max-width: none;
   padding: 28px 0;
   overflow-wrap: anywhere;
+}
+
+/* Chat markdown: workspace .md links open presentation tabs (host-handled). */
+.markdown-body a.workspace-md-link {
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 .presentation-content table,
@@ -1898,8 +1918,9 @@ body {
 }
 
 .presentation-empty {
+  flex: 1 1 auto;
+  min-height: 0;
   display: grid;
-  min-height: 100%;
   place-items: center;
   box-sizing: border-box;
   padding: 32px;

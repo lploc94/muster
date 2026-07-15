@@ -1,0 +1,173 @@
+/**
+ * Pure helpers: workspace markdown paths → presentation panel identity.
+ * Host resolves and reads the file; webview only forwards the raw href.
+ */
+
+import {
+  PRESENTATION_ID_MAX_LENGTH,
+  PRESENTATION_MARKDOWN_MAX_LENGTH,
+  PRESENTATION_TITLE_MAX_LENGTH,
+} from '../task/coordinator-tools';
+
+const MD_EXT = /\.(md|markdown|mdx)$/i;
+/** presentationId must match PresentationManager / upsert stable-id rules. */
+const STABLE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+
+export type MarkdownFileOpenTarget = {
+  /** Absolute filesystem path (posix or platform). */
+  absolutePath: string;
+  presentationId: string;
+  title: string;
+};
+
+/**
+ * True when `href` is a workspace-relative or file: path that points at markdown.
+ * Rejects http(s)/mailto/javascript and other schemes.
+ */
+export function isWorkspaceMarkdownHref(raw: string): boolean {
+  if (typeof raw !== 'string') return false;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 4096 || trimmed.includes('\0')) return false;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(trimmed) && !/^file:/i.test(trimmed)) return false;
+  const pathPart = stripQueryHash(fileUrlToPath(trimmed));
+  if (!pathPart || pathPart.includes('\0')) return false;
+  return MD_EXT.test(pathPart);
+}
+
+/** Basename without extension, clamped for presentation title. */
+export function titleFromMarkdownPath(absoluteOrRelative: string): string {
+  const base = stripQueryHash(fileUrlToPath(absoluteOrRelative)).replace(/\\/g, '/');
+  const name = base.split('/').pop() || 'plan';
+  const withoutExt = name.replace(MD_EXT, '') || name;
+  const title = withoutExt.trim() || 'Markdown';
+  return title.length <= PRESENTATION_TITLE_MAX_LENGTH
+    ? title
+    : title.slice(0, PRESENTATION_TITLE_MAX_LENGTH);
+}
+
+/**
+ * Stable presentation id from a workspace-relative path (posix separators).
+ * Example: docs/plans/foo.md → md:docs-plans-foo.md
+ */
+export function presentationIdFromRelativePath(relativePath: string): string {
+  const posix = stripQueryHash(relativePath).replace(/\\/g, '/').replace(/^\/+/, '');
+  const cleaned = posix
+    .replace(/[^A-Za-z0-9._:-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  let id = `md:${cleaned || 'file'}`;
+  if (id.length > PRESENTATION_ID_MAX_LENGTH) {
+    id = id.slice(0, PRESENTATION_ID_MAX_LENGTH);
+  }
+  if (!STABLE_ID_PATTERN.test(id)) {
+    id = 'md:file';
+  }
+  return id;
+}
+
+/**
+ * Resolve a raw webview href to an absolute path under one of `workspaceRoots`.
+ * Returns undefined when outside workspace, not markdown, or invalid.
+ */
+export function resolveWorkspaceMarkdownPath(
+  raw: string,
+  workspaceRoots: readonly string[],
+): MarkdownFileOpenTarget | undefined {
+  if (!isWorkspaceMarkdownHref(raw) || workspaceRoots.length === 0) return undefined;
+
+  const asPath = stripQueryHash(fileUrlToPath(raw.trim()));
+  if (!asPath) return undefined;
+
+  const isAbs =
+    asPath.startsWith('/') ||
+    /^[A-Za-z]:[\\/]/.test(asPath) ||
+    asPath.startsWith('\\\\');
+
+  for (const root of workspaceRoots) {
+    if (!root) continue;
+    const rootNorm = normalizeFsPath(root);
+    const candidate = isAbs
+      ? normalizeFsPath(asPath)
+      : normalizeFsPath(joinFs(rootNorm, asPath));
+    if (!isPathInsideRoot(candidate, rootNorm)) continue;
+    if (!MD_EXT.test(candidate)) continue;
+
+    const rel = relativeToRoot(candidate, rootNorm);
+    return {
+      absolutePath: candidate,
+      presentationId: presentationIdFromRelativePath(rel),
+      title: titleFromMarkdownPath(candidate),
+    };
+  }
+  return undefined;
+}
+
+export function clampPresentationMarkdown(text: string): string {
+  if (text.length <= PRESENTATION_MARKDOWN_MAX_LENGTH) return text;
+  return text.slice(0, PRESENTATION_MARKDOWN_MAX_LENGTH);
+}
+
+function stripQueryHash(value: string): string {
+  const q = value.indexOf('?');
+  const h = value.indexOf('#');
+  let end = value.length;
+  if (q >= 0) end = Math.min(end, q);
+  if (h >= 0) end = Math.min(end, h);
+  return value.slice(0, end);
+}
+
+/** Minimal file: URL → path (no full URL parser dependency). */
+function fileUrlToPath(raw: string): string {
+  if (!/^file:/i.test(raw)) return raw;
+  try {
+    const u = new URL(raw);
+    if (u.protocol !== 'file:') return raw;
+    let p = decodeURIComponent(u.pathname);
+    // Windows file:///C:/... → /C:/... → C:/...
+    if (/^\/[A-Za-z]:\//.test(p)) p = p.slice(1);
+    return p;
+  } catch {
+    return raw.replace(/^file:\/\//i, '');
+  }
+}
+
+function normalizeFsPath(p: string): string {
+  let s = p.replace(/\\/g, '/');
+  // Collapse . and .. carefully for containment checks only.
+  const parts: string[] = [];
+  const abs = s.startsWith('/');
+  const drive = /^[A-Za-z]:/.test(s) ? s.slice(0, 2) : '';
+  if (drive) s = s.slice(2);
+  if (s.startsWith('/')) s = s.slice(1);
+  for (const part of s.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') {
+      parts.pop();
+      continue;
+    }
+    parts.push(part);
+  }
+  const body = parts.join('/');
+  if (drive) return `${drive}/${body}`;
+  return abs ? `/${body}` : body;
+}
+
+function joinFs(root: string, rel: string): string {
+  const r = root.replace(/\/+$/, '');
+  const relNorm = rel.replace(/^\/+/, '');
+  return `${r}/${relNorm}`;
+}
+
+function isPathInsideRoot(absolute: string, root: string): boolean {
+  const a = normalizeFsPath(absolute).toLowerCase();
+  const r = normalizeFsPath(root).toLowerCase().replace(/\/+$/, '');
+  return a === r || a.startsWith(`${r}/`);
+}
+
+function relativeToRoot(absolute: string, root: string): string {
+  const a = normalizeFsPath(absolute);
+  const r = normalizeFsPath(root).replace(/\/+$/, '');
+  if (a === r) return a.split('/').pop() || 'file.md';
+  if (a.startsWith(`${r}/`)) return a.slice(r.length + 1);
+  return a.split('/').pop() || 'file.md';
+}

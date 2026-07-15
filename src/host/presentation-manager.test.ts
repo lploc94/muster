@@ -79,6 +79,67 @@ const request = {
   markdown: '# Launch\n\n<script>hostile()</script>',
 };
 
+describe('PresentationManager.openWorkspaceDocument', () => {
+  it('opens a new panel for a workspace markdown document', async () => {
+    const factory = new FakeFactory();
+    const manager = new PresentationManager(factory);
+    const result = await manager.openWorkspaceDocument('root-1', {
+      presentationId: 'md:docs-plan.md',
+      ownerTaskId: 'root-1',
+      title: 'plan',
+      markdown: '# From file',
+    });
+    expect(result).toEqual({ ok: true, code: 'opened' });
+    expect(factory.created).toHaveLength(1);
+    expect(factory.panels[0].updates[0]).toMatchObject({
+      presentationId: 'md:docs-plan.md',
+      revision: 1,
+      markdown: '# From file',
+    });
+  });
+
+  it('reveals without bumping when content is unchanged', async () => {
+    const factory = new FakeFactory();
+    const manager = new PresentationManager(factory);
+    await manager.openWorkspaceDocument('root-1', {
+      presentationId: 'md:docs-plan.md',
+      ownerTaskId: 'root-1',
+      title: 'plan',
+      markdown: '# Same',
+    });
+    const result = await manager.openWorkspaceDocument('root-1', {
+      presentationId: 'md:docs-plan.md',
+      ownerTaskId: 'root-1',
+      title: 'plan',
+      markdown: '# Same',
+    });
+    expect(result).toEqual({ ok: true, code: 'idempotent' });
+    expect(factory.panels).toHaveLength(1);
+    expect(factory.panels[0].revealCount).toBe(1);
+    expect(factory.panels[0].updates).toHaveLength(1);
+  });
+
+  it('bumps revision when file content changed', async () => {
+    const factory = new FakeFactory();
+    const manager = new PresentationManager(factory);
+    await manager.openWorkspaceDocument('root-1', {
+      presentationId: 'md:docs-plan.md',
+      ownerTaskId: 'root-1',
+      title: 'plan',
+      markdown: '# v1',
+    });
+    const result = await manager.openWorkspaceDocument('root-1', {
+      presentationId: 'md:docs-plan.md',
+      ownerTaskId: 'root-1',
+      title: 'plan',
+      markdown: '# v2',
+    });
+    expect(result).toEqual({ ok: true, code: 'opened' });
+    expect(factory.panels[0].updates.at(-1)?.revision).toBe(2);
+    expect(factory.panels[0].updates.at(-1)?.markdown).toBe('# v2');
+  });
+});
+
 describe('configurePresentationPanel', () => {
   it('disposes a created host panel when adapter configuration throws', () => {
     const hostPanel = { disposeCount: 0, dispose() { this.disposeCount += 1; } };

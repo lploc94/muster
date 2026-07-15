@@ -23,7 +23,14 @@
   import type { PendingAsk, TaskSummary, TaskViewStatus } from '../lib/protocol';
   import { effectiveRuntimeActivity } from '../lib/protocol';
   import { BACKENDS, backendShortLabel, backendModelLabel } from '../lib/backends';
-  import { isHandoffProgressInFlight } from '../lib/handoff-progress';
+  import {
+    dismissHandoffTerminalToast,
+    formatHandoffProgressLabel,
+    initialHandoffChromeVisibilityState,
+    isHandoffProgressInFlight,
+    reduceHandoffChromeVisibility,
+    shouldShowHandoffChrome,
+  } from '../lib/handoff-progress';
   import { tip } from '../lib/tooltip';
   import {
     extractFileDropCandidatesFromDataTransfer,
@@ -304,9 +311,52 @@
   );
 
   /** Task-mode picker is always interactive; chrome only reflects in-flight handoff. */
-  const handoffInFlight = $derived(
-    mode === 'task' && isHandoffProgressInFlight(tasks.focusedTask?.handoffProgress),
+  const handoffProgress = $derived(
+    mode === 'task' ? (task?.handoffProgress ?? tasks.focusedTask?.handoffProgress) : undefined,
   );
+  const handoffInFlight = $derived(
+    mode === 'task' && isHandoffProgressInFlight(handoffProgress),
+  );
+  let handoffChromeState = $state(initialHandoffChromeVisibilityState());
+  $effect(() => {
+    const next = reduceHandoffChromeVisibility(
+      handoffChromeState,
+      mode === 'task' ? (task?.id ?? taskId ?? null) : null,
+      handoffProgress,
+    );
+    if (next !== handoffChromeState) handoffChromeState = next;
+  });
+  const showHandoffChrome = $derived(
+    shouldShowHandoffChrome(
+      handoffChromeState,
+      mode === 'task' ? (task?.id ?? taskId ?? null) : null,
+      handoffProgress,
+    ),
+  );
+  const handoffChromeLabel = $derived(
+    handoffProgress ? formatHandoffProgressLabel(handoffProgress) : '',
+  );
+  const handoffChromeTone = $derived.by(() => {
+    if (!handoffProgress) return 'muted';
+    if (handoffProgress.phase === 'failed') return 'danger';
+    if (handoffProgress.phase === 'completed') return 'success';
+    if (handoffProgress.phase === 'cancelled') return 'muted';
+    return 'attention';
+  });
+
+  // Terminal results are brief one-shot feedback. Persisted completed/failed
+  // metadata cannot restart this timer because only an observed in-flight op
+  // receives terminalToastOperationId.
+  $effect(() => {
+    const operationId = handoffChromeState.terminalToastOperationId;
+    const phase = handoffProgress?.phase;
+    if (!operationId || !phase) return;
+    const delay = phase === 'failed' ? 8000 : 2800;
+    const timer = setTimeout(() => {
+      handoffChromeState = dismissHandoffTerminalToast(handoffChromeState, operationId);
+    }, delay);
+    return () => clearTimeout(timer);
+  });
 
   // Register select so resolveBackendForSend can read it for draft sends.
   $effect(() => {
@@ -949,8 +999,14 @@
         }
       }
     }
-    // Ensure the active selection always exists as an option (web component needs it).
-    const active = encodePickerValue(draftBackend, draftModel, models);
+    // Ensure the exact active selection always exists as an option. In task
+    // mode this must preserve the committed/pending binding even when a newly
+    // enumerated catalog temporarily omits that model; silently coercing to the
+    // catalog default would make the next chat look like another model switch.
+    const active =
+      mode === 'task'
+        ? taskPickerValue
+        : encodePickerValue(draftBackend, draftModel, models);
     if (active.includes('::') && !opts.some((o) => o.value === active)) {
       const [be, ...rest] = active.split('::');
       const model = rest.join('::');
@@ -986,10 +1042,9 @@
   ): string {
     const m = models?.[backend];
     if (m && m.options.length > 0) {
-      const chosen =
-        (model && m.options.some((o) => o.value === model) ? model : null) ??
-        m.current ??
-        m.options[0].value;
+      // An explicit model is authoritative for an existing task/restored user
+      // selection. Catalog enumeration is advisory and may be partial/stale.
+      const chosen = model ?? m.current ?? m.options[0].value;
       return `${backend}::${chosen}`;
     }
     if (model) return `${backend}::${model}`;
@@ -1376,6 +1431,21 @@
             {/each}
           </vscode-single-select>
         {/key}
+      {/if}
+
+      {#if mode === 'task' && showHandoffChrome && handoffProgress}
+        <div
+          class={`turn-activity-bar turn-activity-bar--${handoffChromeTone} handoff-progress-bar`}
+          data-testid="handoff-progress"
+          data-handoff-phase={handoffProgress.phase}
+          data-handoff-placement="model-picker"
+          role="status"
+          aria-live="polite"
+          use:tip={handoffChromeLabel}
+        >
+          <span class="turn-live-dot" aria-hidden="true"></span>
+          <span class="turn-activity-bar__label">{handoffChromeLabel}</span>
+        </div>
       {/if}
 
       <div bind:this={addContextMenuRegion} class="add-context">

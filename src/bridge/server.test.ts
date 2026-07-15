@@ -110,6 +110,10 @@ describe('MusterBridgeServer auth', () => {
     const listed = await coordinator.request('tools/list');
     const tools = (listed.result as { tools: Array<{ name: string; inputSchema: Record<string, unknown> }> }).tools;
     expect(tools.map((tool) => tool.name)).toEqual(['upsert_presentation']);
+    expect(tools[0]).toMatchObject({
+      name: 'upsert_presentation',
+      description: expect.stringContaining('REQUIRED when the user asks to plan'),
+    });
     expect(tools[0].inputSchema).toMatchObject({
       required: ['presentationId', 'ownerTaskId', 'opId', 'revision', 'title', 'markdown'],
       additionalProperties: false,

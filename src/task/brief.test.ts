@@ -85,7 +85,8 @@ describe('plan / coordinate presentation preambles', () => {
     const prompt = compileTaskPrompt(brief, [], { taskId: 'c1', goal: 'Coordinate work' });
     expect(prompt).toContain('upsert_presentation');
     expect(prompt).toContain('ownerTaskId=self.taskId');
-    expect(prompt).toContain('before releasing implement');
+    expect(prompt).toContain('MUST call MCP');
+    expect(prompt).toContain('do not only reply with chat text');
   });
 });
 

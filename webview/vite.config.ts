@@ -83,7 +83,12 @@ export default defineConfig({
       },
       output: {
         entryFileNames: 'assets/[name].js',
-        chunkFileNames: 'assets/[name].js',
+        // The host cache-busts the two stable entry files, but their static imports
+        // are fetched by the webview at the chunk URL itself. Stable chunk names
+        // (notably `markdown.js`) could therefore keep serving a previous build
+        // after Reload Window. Content hashes make every changed dependency URL
+        // immutable while preserving the host-facing index/presentation paths.
+        chunkFileNames: 'assets/[name]-[hash].js',
         assetFileNames: 'assets/[name][extname]',
       },
     },

@@ -4713,6 +4713,10 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     const progress = page.getByTestId('handoff-progress');
     await expect(progress).toBeVisible();
     await expect(progress).toHaveAttribute('data-handoff-phase', 'preparing_receiver');
+    await expect(progress).toHaveAttribute('data-handoff-placement', 'model-picker');
+    await expect
+      .poll(() => progress.evaluate((el) => el.previousElementSibling?.getAttribute('data-testid')))
+      .toBe('task-model-switch');
     await expect(progress).toContainText('Preparing receiver');
     await expect(progress).toContainText('[Claude] sonnet');
     await expect(progress).toContainText('[Grok] grok-4');
@@ -4851,6 +4855,48 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     });
     await expect(page.getByTestId('task-model-switch')).toBeVisible();
     await expect(page.getByTestId('task-model-readonly')).toHaveCount(0);
+
+    // Extension/webview reload with a persisted terminal record must not replay
+    // the old handoff status. It is metadata now, not a new notification.
+    await page.reload();
+    await expect(page.getByText('New task')).toBeVisible();
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [completedTask],
+      focusedTaskId: taskId,
+      subtree: [completedTask],
+      transcript: [
+        { id: 'msg-user-1', kind: 'user', content: 'Please summarize the plan.' },
+        { id: 'msg-asst-1', kind: 'assistant', content: conversationOnly },
+      ],
+      storeRevision: 306,
+    });
+    await expect(page.getByTestId('task-model-switch')).toBeVisible();
+    await expect(page.getByTestId('handoff-progress')).toHaveCount(0);
+
+    // A refreshed/partial catalog must not coerce the committed task model to
+    // its new default; otherwise the next chat would trigger a second handoff.
+    await postModelsAvailable(page, {
+      grok: {
+        current: 'grok-next',
+        options: [{ value: 'grok-next', name: 'grok-next' }],
+      },
+    });
+    await expect
+      .poll(() =>
+        page.getByTestId('task-model-switch').evaluate((el) => (el as HTMLElement & { value: string }).value),
+      )
+      .toBe('grok::grok-4');
+
+    await page.locator('.composer-input__textarea').fill('Continue after the model switch.');
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    await expect
+      .poll(async () =>
+        (await postedMessages(page)).filter(
+          (message) => (message as { type?: string }).type === 'requestRuntimeHandoff',
+        ).length,
+      )
+      .toBe(0);
   });
 });
 

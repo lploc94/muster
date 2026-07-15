@@ -10,11 +10,6 @@
     getTaskPresentation,
   } from '../lib/task-status';
   import type { PendingAsk, TaskLifecycleState } from '../lib/protocol';
-  import {
-    formatHandoffProgressLabel,
-    isHandoffProgressInFlight,
-    isHandoffTerminal,
-  } from '../lib/handoff-progress';
   import { buildDeleteQueuedTurnMessage, queuedTurnControlState } from '../lib/queued-turns';
   import { selectTask as navSelectTask } from '../lib/task-nav';
   import {
@@ -372,52 +367,6 @@
   /** Banner uses lifecycle tone only — turn activity is shown near the composer. */
   const bannerTone = $derived(presentation?.lifecycle.tone ?? 'neutral');
 
-  /** Task-scoped handoff chrome — never chat / transcript. */
-  const handoffProgress = $derived(focused?.handoffProgress);
-  const handoffInFlight = $derived(isHandoffProgressInFlight(handoffProgress));
-  const handoffTerminal = $derived(isHandoffTerminal(handoffProgress?.phase));
-  /** Auto-dismiss terminal "Switch complete" after a short toast window. */
-  let handoffTerminalDismissed = $state(false);
-  let handoffTerminalDismissTimer: ReturnType<typeof setTimeout> | undefined;
-  $effect(() => {
-    const phase = handoffProgress?.phase;
-    const op = handoffProgress?.operationId;
-    if (handoffTerminalDismissTimer) {
-      clearTimeout(handoffTerminalDismissTimer);
-      handoffTerminalDismissTimer = undefined;
-    }
-    if (phase === 'completed' || phase === 'cancelled') {
-      handoffTerminalDismissed = false;
-      handoffTerminalDismissTimer = setTimeout(() => {
-        handoffTerminalDismissed = true;
-      }, 2800);
-    } else if (phase === 'failed') {
-      // Keep failure visible longer so the user can read the reason.
-      handoffTerminalDismissed = false;
-      handoffTerminalDismissTimer = setTimeout(() => {
-        handoffTerminalDismissed = true;
-      }, 8000);
-    } else {
-      handoffTerminalDismissed = false;
-    }
-    return () => {
-      if (handoffTerminalDismissTimer) clearTimeout(handoffTerminalDismissTimer);
-    };
-  });
-  const showHandoffChrome = $derived(
-    !!handoffProgress &&
-      (handoffInFlight || (handoffTerminal && !handoffTerminalDismissed)),
-  );
-  const handoffChromeLabel = $derived(
-    handoffProgress ? formatHandoffProgressLabel(handoffProgress) : '',
-  );
-  const handoffChromeTone = $derived.by(() => {
-    if (!handoffProgress) return 'muted';
-    if (handoffProgress.phase === 'failed') return 'danger';
-    if (handoffProgress.phase === 'completed') return 'success';
-    if (handoffProgress.phase === 'cancelled') return 'muted';
-    return 'attention';
-  });
 </script>
 
 <div class="flex-1 min-w-0 min-h-0 flex flex-col">
@@ -634,20 +583,6 @@
         </div>
       {/if}
     </div>
-
-    {#if showHandoffChrome && handoffProgress}
-      <div
-        class={`turn-activity-bar turn-activity-bar--${handoffChromeTone} handoff-progress-bar`}
-        data-testid="handoff-progress"
-        data-handoff-phase={handoffProgress.phase}
-        role="status"
-        aria-live="polite"
-        use:tip={'Model switch progress (task chrome only — never shown in chat)'}
-      >
-        <span class="turn-live-dot" aria-hidden="true"></span>
-        <span class="turn-activity-bar__label">{handoffChromeLabel}</span>
-      </div>
-    {/if}
 
     <ChatThread />
 

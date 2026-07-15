@@ -64,13 +64,37 @@ export function isWorkspaceMarkdownLinkHref(raw: string): boolean {
 const BARE_MD_PATH =
   /(?<!\]\()(?<!["'`=])((?:file:\/\/\/[^\s]+\.(?:md|markdown|mdx)|(?:\.\/|\/|[A-Za-z]:[\\/])[A-Za-z0-9_./@%+\-]+\.(?:md|markdown|mdx)))(?=$|[\s),.:;!?'"\]])/gi;
 
+/** Absolute markdown path wrapped by a single inline-code backtick pair. */
+const INLINE_CODE_MD_PATH =
+  /(?<!`)`((?:file:\/\/\/[^\s`]+\.(?:md|markdown|mdx)|(?:\.\/|\/|[A-Za-z]:[\\/])[A-Za-z0-9_./@%+\-]+\.(?:md|markdown|mdx)))`(?!`)/gi;
+
 /**
  * Turn bare `…/plan.md` paths into markdown links so they become clickable
  * workspace-md presentation targets after sanitize.
  */
 export function linkifyBareMarkdownPaths(text: string): string {
   if (!text) return text;
-  return text.replace(BARE_MD_PATH, (match, path: string, offset: number, full: string) => {
+  // Assistants commonly format filesystem paths as inline code. When the whole
+  // code span is exactly an absolute markdown path, promote that span to a link;
+  // ordinary code spans and fenced code blocks remain code.
+  const withInlinePathLinks = text.replace(
+    INLINE_CODE_MD_PATH,
+    (match, path: string, offset: number, full: string) => {
+      const before = full.slice(0, offset);
+      const fenceCount = (before.match(/```/g) || []).length;
+      if (fenceCount % 2 === 1) return match;
+      const href = path.trim();
+      const label = href.replace(/\\/g, '/').split('/').pop() || href;
+      return `[${label}](${href})`;
+    },
+  );
+
+  return withInlinePathLinks.replace(BARE_MD_PATH, (
+    match,
+    path: string,
+    offset: number,
+    full: string,
+  ) => {
     // Skip fenced code blocks (odd number of ``` before match).
     const before = full.slice(0, offset);
     const fenceCount = (before.match(/```/g) || []).length;

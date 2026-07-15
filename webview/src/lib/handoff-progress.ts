@@ -54,6 +54,106 @@ export function isHandoffProgressInFlight(
   return isHandoffInFlight(progress?.phase);
 }
 
+/**
+ * Local UI lifecycle for the model-picker handoff status.
+ *
+ * The host deliberately persists terminal handoff metadata. A terminal record
+ * is therefore state, not a fresh notification: rendering it on mount or on
+ * every snapshot would replay an old "Switch complete" status after chat/reload.
+ * We only toast a terminal operation when this mounted composer observed the
+ * same operation in flight first.
+ */
+export interface HandoffChromeVisibilityState {
+  taskId: string | null;
+  observedInFlightOperationId: string | null;
+  terminalToastOperationId: string | null;
+  dismissedTerminalOperationId: string | null;
+}
+
+export function initialHandoffChromeVisibilityState(): HandoffChromeVisibilityState {
+  return {
+    taskId: null,
+    observedInFlightOperationId: null,
+    terminalToastOperationId: null,
+    dismissedTerminalOperationId: null,
+  };
+}
+
+function sameChromeVisibilityState(
+  left: HandoffChromeVisibilityState,
+  right: HandoffChromeVisibilityState,
+): boolean {
+  return (
+    left.taskId === right.taskId &&
+    left.observedInFlightOperationId === right.observedInFlightOperationId &&
+    left.terminalToastOperationId === right.terminalToastOperationId &&
+    left.dismissedTerminalOperationId === right.dismissedTerminalOperationId
+  );
+}
+
+/** Advance one-operation UI visibility without replaying persisted terminals. */
+export function reduceHandoffChromeVisibility(
+  state: HandoffChromeVisibilityState,
+  taskId: string | null | undefined,
+  progress: HandoffProgress | null | undefined,
+): HandoffChromeVisibilityState {
+  const nextTaskId = taskId ?? null;
+  const taskChanged = state.taskId !== nextTaskId;
+  const base: HandoffChromeVisibilityState = taskChanged
+    ? {
+        taskId: nextTaskId,
+        observedInFlightOperationId: null,
+        terminalToastOperationId: null,
+        dismissedTerminalOperationId: null,
+      }
+    : state;
+
+  let next = base;
+  if (progress && isHandoffInFlight(progress.phase)) {
+    next = {
+      ...base,
+      observedInFlightOperationId: progress.operationId,
+      terminalToastOperationId: null,
+    };
+  } else if (
+    progress &&
+    isHandoffTerminal(progress.phase) &&
+    base.observedInFlightOperationId === progress.operationId &&
+    base.dismissedTerminalOperationId !== progress.operationId
+  ) {
+    next = { ...base, terminalToastOperationId: progress.operationId };
+  } else if (base.terminalToastOperationId !== null) {
+    next = { ...base, terminalToastOperationId: null };
+  }
+
+  return sameChromeVisibilityState(state, next) ? state : next;
+}
+
+export function dismissHandoffTerminalToast(
+  state: HandoffChromeVisibilityState,
+  operationId: string,
+): HandoffChromeVisibilityState {
+  if (state.terminalToastOperationId !== operationId) return state;
+  return {
+    ...state,
+    terminalToastOperationId: null,
+    dismissedTerminalOperationId: operationId,
+  };
+}
+
+export function shouldShowHandoffChrome(
+  state: HandoffChromeVisibilityState,
+  taskId: string | null | undefined,
+  progress: HandoffProgress | null | undefined,
+): boolean {
+  if (!progress || state.taskId !== (taskId ?? null)) return false;
+  if (isHandoffInFlight(progress.phase)) return true;
+  return (
+    isHandoffTerminal(progress.phase) &&
+    state.terminalToastOperationId === progress.operationId
+  );
+}
+
 /** Human label for a handoff phase (chrome only). */
 export function handoffPhaseLabel(phase: TaskHandoffPhase): string {
   return PHASE_LABELS[phase] ?? phase;

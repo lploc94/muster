@@ -12,12 +12,16 @@ vi.mock('./vscode', () => ({
 import type { HandoffProgress, TaskSummary } from './protocol';
 import {
   canRequestRuntimeHandoff,
+  dismissHandoffTerminalToast,
   formatHandoffBinding,
   formatHandoffProgressLabel,
   handoffPhaseLabel,
+  initialHandoffChromeVisibilityState,
   isHandoffInFlight,
   isHandoffProgressInFlight,
   isHandoffTerminal,
+  reduceHandoffChromeVisibility,
+  shouldShowHandoffChrome,
 } from './handoff-progress';
 
 const baseProgress: HandoffProgress = {
@@ -116,6 +120,62 @@ describe('handoff progress labels', () => {
 
     const completed = formatHandoffProgressLabel({ ...baseProgress, phase: 'completed' });
     expect(completed).not.toContain('Target CLI');
+  });
+});
+
+describe('handoff chrome one-shot lifecycle', () => {
+  it('does not replay a persisted terminal handoff on initial load', () => {
+    const completed = { ...baseProgress, phase: 'completed' as const };
+    const state = reduceHandoffChromeVisibility(
+      initialHandoffChromeVisibilityState(),
+      baseTask.id,
+      completed,
+    );
+
+    expect(shouldShowHandoffChrome(state, baseTask.id, completed)).toBe(false);
+  });
+
+  it('shows in-flight progress and its terminal result once, then stays dismissed', () => {
+    let state = reduceHandoffChromeVisibility(
+      initialHandoffChromeVisibilityState(),
+      baseTask.id,
+      baseProgress,
+    );
+    expect(shouldShowHandoffChrome(state, baseTask.id, baseProgress)).toBe(true);
+
+    const completed = { ...baseProgress, phase: 'completed' as const };
+    state = reduceHandoffChromeVisibility(state, baseTask.id, completed);
+    expect(shouldShowHandoffChrome(state, baseTask.id, completed)).toBe(true);
+
+    state = dismissHandoffTerminalToast(state, completed.operationId);
+    state = reduceHandoffChromeVisibility(state, baseTask.id, completed);
+    expect(shouldShowHandoffChrome(state, baseTask.id, completed)).toBe(false);
+
+    // Ordinary task snapshots (for example after sending chat) cannot revive it.
+    state = reduceHandoffChromeVisibility(state, baseTask.id, { ...completed });
+    expect(shouldShowHandoffChrome(state, baseTask.id, completed)).toBe(false);
+  });
+
+  it('tracks a new operation independently and suppresses terminals on task switches', () => {
+    let state = reduceHandoffChromeVisibility(
+      initialHandoffChromeVisibilityState(),
+      baseTask.id,
+      baseProgress,
+    );
+    const completed = { ...baseProgress, phase: 'completed' as const };
+    state = reduceHandoffChromeVisibility(state, baseTask.id, completed);
+    state = dismissHandoffTerminalToast(state, completed.operationId);
+
+    const second = { ...baseProgress, operationId: 'hop-2', phase: 'transferring' as const };
+    state = reduceHandoffChromeVisibility(state, baseTask.id, second);
+    expect(shouldShowHandoffChrome(state, baseTask.id, second)).toBe(true);
+
+    const secondCompleted = { ...second, phase: 'completed' as const };
+    state = reduceHandoffChromeVisibility(state, baseTask.id, secondCompleted);
+    expect(shouldShowHandoffChrome(state, baseTask.id, secondCompleted)).toBe(true);
+
+    state = reduceHandoffChromeVisibility(state, 'task-2', secondCompleted);
+    expect(shouldShowHandoffChrome(state, 'task-2', secondCompleted)).toBe(false);
   });
 });
 

@@ -81,6 +81,13 @@
         }
         return;
       }
+      const mdLink = target.closest('a[data-workspace-md-href]');
+      if (mdLink && el.contains(mdLink)) {
+        e.preventDefault();
+        const url = mdLink.getAttribute('data-workspace-md-href');
+        if (url) post({ type: 'openLink', url });
+        return;
+      }
       const link = target.closest('a[data-external-href]');
       if (link && el.contains(link)) {
         e.preventDefault();

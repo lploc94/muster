@@ -171,6 +171,120 @@ export class PresentationManager {
 
   constructor(private readonly factory: PresentationPanelFactory) {}
 
+  /**
+   * User-initiated open (e.g. click a workspace `.md` link in chat).
+   * Bypasses credential/opId gates; reuses the panel for the same presentationId
+   * under `rootId`, bumps revision when content changes, otherwise reveals.
+   */
+  async openWorkspaceDocument(
+    rootId: string,
+    document: Omit<PresentationDocument, 'revision'> & { revision?: number },
+  ): Promise<PresentationResult> {
+    if (!isStableId(rootId) || !isStableId(document.presentationId) || !isStableId(document.ownerTaskId)) {
+      return { ok: false, code: 'invalid_arguments' };
+    }
+    if (
+      typeof document.title !== 'string' ||
+      document.title.length === 0 ||
+      document.title.length > PRESENTATION_TITLE_MAX_LENGTH ||
+      typeof document.markdown !== 'string' ||
+      document.markdown.length === 0 ||
+      document.markdown.length > PRESENTATION_MARKDOWN_MAX_LENGTH
+    ) {
+      return { ok: false, code: 'invalid_arguments' };
+    }
+
+    const key = this.presentationKey(rootId, document.presentationId);
+    const existing = this.panels.get(key);
+    if (existing) {
+      const sameContent =
+        existing.document.title === document.title &&
+        existing.document.markdown === document.markdown &&
+        existing.document.ownerTaskId === document.ownerTaskId;
+      if (sameContent) {
+        try {
+          existing.panel.reveal();
+        } catch {
+          // best-effort focus
+        }
+        return { ok: true, code: 'idempotent' };
+      }
+      const next: PresentationDocument = {
+        presentationId: document.presentationId,
+        ownerTaskId: document.ownerTaskId,
+        revision: existing.document.revision + 1,
+        title: document.title,
+        markdown: document.markdown,
+      };
+      let accepted = false;
+      try {
+        accepted = await existing.panel.update(next);
+      } catch {
+        // content-free failure
+      }
+      if (!accepted || this.panels.get(key) !== existing) {
+        return { ok: false, code: 'host_delivery_failed' };
+      }
+      existing.document = next;
+      try {
+        existing.panel.reveal();
+      } catch {
+        // best-effort
+      }
+      return { ok: true, code: 'opened' };
+    }
+
+    const created: PresentationDocument = {
+      presentationId: document.presentationId,
+      ownerTaskId: document.ownerTaskId,
+      revision: document.revision && document.revision > 0 ? document.revision : 1,
+      title: document.title,
+      markdown: document.markdown,
+    };
+    let panel: PresentationPanel;
+    try {
+      panel = this.factory.create(created);
+    } catch {
+      return { ok: false, code: 'panel_open_failed' };
+    }
+    let disposeListener: { dispose(): void };
+    try {
+      disposeListener = panel.onDidDispose(() => {
+        const current = this.panels.get(key);
+        if (current?.panel === panel) this.panels.delete(key);
+      });
+    } catch {
+      try {
+        panel.dispose();
+      } catch {
+        // ignore
+      }
+      return { ok: false, code: 'panel_open_failed' };
+    }
+    this.panels.set(key, { panel, disposeListener, document: created });
+    let accepted = false;
+    try {
+      accepted = await panel.update(created);
+    } catch {
+      // ignore
+    }
+    if (!accepted || this.panels.get(key)?.panel !== panel) {
+      try {
+        disposeListener.dispose();
+      } catch {
+        // ignore
+      }
+      if (this.panels.get(key)?.panel === panel) this.panels.delete(key);
+      try {
+        panel.dispose();
+      } catch {
+        // ignore
+      }
+      return { ok: false, code: 'panel_open_failed' };
+    }
+    return { ok: true, code: 'opened' };
+  }
+
   async upsert(
     context: PresentationContext,
     request: PresentationUpsertRequest,

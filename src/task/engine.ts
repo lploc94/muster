@@ -1097,9 +1097,10 @@ export class TaskEngine {
     const messageId = randomUUID();
     const turnId = randomUUID();
     const now = nowIso(this.clock);
+    const role = params.role ?? 'coordinator';
     const input: CreateTaskInput = {
       id: taskId,
-      role: params.role ?? 'coordinator',
+      role,
       goal: params.goal,
       continuationOf: params.continuationOf,
       parentId: null,
@@ -1117,6 +1118,12 @@ export class TaskEngine {
       executionPolicy: DEFAULT_POLICY,
       // Host composer create-and-run: atomic released (plan W3 matrix).
       releaseState: 'released',
+      // Root host tasks are coordinators by default — use coordinate preamble (presentation + graph playbook).
+      brief: synthesizeBriefFromGoal(
+        params.goal,
+        undefined,
+        role === 'coordinator' ? 'coordinate' : 'generic',
+      ),
     };
 
     const commit = this.store.commit((draft) => {
