@@ -4,6 +4,7 @@
  */
 
 import { createHash } from 'crypto';
+import * as path from 'path';
 import {
   PRESENTATION_ID_MAX_LENGTH,
   PRESENTATION_MARKDOWN_MAX_LENGTH,
@@ -146,6 +147,70 @@ export function resolveWorkspaceMarkdownPath(
 export function clampPresentationMarkdown(text: string): string {
   if (text.length <= PRESENTATION_MARKDOWN_MAX_LENGTH) return text;
   return text.slice(0, PRESENTATION_MARKDOWN_MAX_LENGTH);
+}
+
+/** Split href into path + fragment (without #). */
+export function splitMarkdownHref(raw: string): { path: string; fragment?: string } {
+  const trimmed = raw.trim();
+  const hash = trimmed.indexOf('#');
+  if (hash < 0) return { path: trimmed };
+  const pathPart = trimmed.slice(0, hash);
+  const fragment = trimmed.slice(hash + 1);
+  if (!fragment || !/^[A-Za-z0-9._:-]+$/.test(fragment)) return { path: pathPart };
+  return { path: pathPart, fragment };
+}
+
+/**
+ * Resolve absolute path under a bound folder + relative source path.
+ * Webview href protocol: leading `/` = workspace-root-relative (not OS-absolute).
+ * OS-absolute only for `file:` URLs or Windows drive paths.
+ */
+export function resolveUnderSource(
+  hrefPath: string,
+  sourcePath: string | undefined,
+  _sourceFolderUri: string,
+  folderFsPath: string,
+): { absolutePath: string; relativePath: string } | undefined {
+  const trimmed = hrefPath.trim();
+  if (!trimmed) return undefined;
+  const rootNorm = normalizeFsPath(folderFsPath);
+  const isFileUrl = /^file:/i.test(trimmed);
+  const asPath = stripQueryHash(fileUrlToPath(trimmed));
+  if (!asPath) return undefined;
+
+  const isOsAbs =
+    isFileUrl ||
+    /^[A-Za-z]:[\\/]/.test(asPath) ||
+    asPath.startsWith('\\\\');
+
+  let candidate: string;
+  if (isOsAbs) {
+    candidate = normalizeFsPath(asPath);
+  } else if (asPath.startsWith('/')) {
+    // Workspace-root-relative (e.g. /docs/plan.md)
+    candidate = normalizeFsPath(joinFs(rootNorm, asPath.replace(/^\/+/, '')));
+  } else if (sourcePath) {
+    const dir = sourcePath.includes('/')
+      ? sourcePath.slice(0, sourcePath.lastIndexOf('/'))
+      : '';
+    const base = dir ? joinFs(rootNorm, dir) : rootNorm;
+    candidate = normalizeFsPath(joinFs(base, asPath));
+  } else {
+    candidate = normalizeFsPath(joinFs(rootNorm, asPath));
+  }
+  if (!isPathInsideRoot(candidate, rootNorm)) return undefined;
+  if (!MD_EXT.test(candidate)) return undefined;
+  const relativePath = relativeToRoot(candidate, rootNorm).replace(/\\/g, '/');
+  return { absolutePath: candidate, relativePath };
+}
+
+/** True when realFile is inside realRoot after realpath (platform-aware). */
+export function isCanonicalInsideRoot(realFile: string, realRoot: string): boolean {
+  const rel = path.relative(realRoot, realFile);
+  if (!rel || rel === '') return true;
+  if (path.isAbsolute(rel)) return false;
+  if (rel === '..' || rel.startsWith(`..${path.sep}`)) return false;
+  return true;
 }
 
 function stripQueryHash(value: string): string {

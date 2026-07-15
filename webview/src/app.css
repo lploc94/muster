@@ -1964,11 +1964,98 @@ body {
   line-height: 1.4;
 }
 
+.presentation-source-btn {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.presentation-toc {
+  margin: 12px 0 0;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 4px;
+  padding: 6px 8px;
+}
+
+.presentation-toc__toggle {
+  margin: 0;
+  padding: 2px 4px;
+  border: 0;
+  background: transparent;
+  color: var(--vscode-foreground);
+  font: inherit;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.presentation-toc__list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 6px;
+}
+
+.presentation-toc__item {
+  color: var(--vscode-textLink-foreground);
+  font-size: 0.8rem;
+  text-decoration: none;
+  padding: 2px 4px;
+  border-radius: 2px;
+}
+
+.presentation-toc__item[data-level='2'] {
+  padding-left: 12px;
+}
+
+.presentation-toc__item[data-level='3'] {
+  padding-left: 22px;
+}
+
+.presentation-toc__item.active {
+  background: var(--vscode-list-activeSelectionBackground, transparent);
+  color: var(--vscode-list-activeSelectionForeground, var(--vscode-textLink-foreground));
+  outline: 1px solid var(--vscode-focusBorder, transparent);
+}
+
+.code-block-wrap {
+  position: relative;
+}
+
+.code-copy-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 1;
+  margin: 0;
+  padding: 2px 6px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 2px;
+  background: var(--vscode-editor-background);
+  color: var(--vscode-descriptionForeground);
+  font: inherit;
+  font-size: 0.7rem;
+  cursor: pointer;
+}
+
 .presentation-content {
   box-sizing: border-box;
   max-width: none;
   padding: 20px 0 28px;
   overflow-wrap: anywhere;
+}
+
+.presentation-content h1,
+.presentation-content h2,
+.presentation-content h3 {
+  scroll-margin-top: 64px;
 }
 
 /* Chat markdown: workspace .md links open presentation tabs (host-handled). */

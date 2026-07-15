@@ -1,10 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
   clampPresentationMarkdown,
+  isCanonicalInsideRoot,
   isWorkspaceMarkdownHref,
   presentationIdFromFolderAndRelativePath,
   presentationIdFromRelativePath,
+  resolveUnderSource,
   resolveWorkspaceMarkdownPath,
+  splitMarkdownHref,
   titleFromMarkdownPath,
 } from './markdown-file-presentation';
 import { PRESENTATION_MARKDOWN_MAX_LENGTH } from '../task/coordinator-tools';
@@ -84,5 +87,23 @@ describe('clampPresentationMarkdown', () => {
   it('clamps oversized bodies', () => {
     const big = 'x'.repeat(PRESENTATION_MARKDOWN_MAX_LENGTH + 10);
     expect(clampPresentationMarkdown(big).length).toBe(PRESENTATION_MARKDOWN_MAX_LENGTH);
+  });
+});
+
+
+describe('resolveUnderSource and containment', () => {
+  it('treats leading slash as workspace-root relative', () => {
+    const r = resolveUnderSource('/docs/plan.md', 'notes/a.md', 'file:///ws', '/ws');
+    expect(r?.relativePath).toBe('docs/plan.md');
+    expect(r?.absolutePath.replace(/\\/g, '/')).toBe('/ws/docs/plan.md');
+  });
+
+  it('splits fragment', () => {
+    expect(splitMarkdownHref('docs/a.md#sec-1')).toEqual({ path: 'docs/a.md', fragment: 'sec-1' });
+  });
+
+  it('canonical containment uses path.relative', () => {
+    expect(isCanonicalInsideRoot('/ws/a.md', '/ws')).toBe(true);
+    expect(isCanonicalInsideRoot('/other/a.md', '/ws')).toBe(false);
   });
 });

@@ -207,7 +207,7 @@ const SANITIZE_CONFIG = {
   ],
   ALLOWED_ATTR: [
     'href', 'target', 'rel', 'data-external-href', 'data-workspace-md-href',
-    'class', 'data-lang',
+    'class', 'data-lang', 'id',
     'type', 'checked', 'disabled', // task-list checkboxes
     'align', // table cell alignment
   ],

@@ -33,6 +33,9 @@
   let copyStatus = $state<'idle' | 'copied' | 'failed'>('idle');
   let copyResetTimer: ReturnType<typeof setTimeout> | undefined;
   let revealResetTimer: ReturnType<typeof setTimeout> | undefined;
+  let tocOpen = $state(false);
+  let activeHeadingId = $state<string | undefined>(undefined);
+  let pendingFragment = $state<string | undefined>(undefined);
   const rendered = $derived(document ? renderPresentationMarkdown(document.markdown) : undefined);
 
   function persist(): void {
@@ -118,18 +121,99 @@
     return `Updated ${new Date(t).toLocaleString()}`;
   }
 
+  function openPresentationSource(): void {
+    vscode.postMessage({ type: 'openPresentationSource' });
+  }
+
+  function scrollToHeading(id: string): void {
+    const el = article?.querySelector<HTMLElement>(`#${CSS.escape(id)}`);
+    if (!el) return;
+    el.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    activeHeadingId = id;
+  }
+
+  async function applyPendingFragment(): Promise<void> {
+    await tick();
+    if (!pendingFragment || !article) return;
+    const id = pendingFragment;
+    pendingFragment = undefined;
+    scrollToHeading(id);
+  }
+
   function handleContentClick(event: MouseEvent): void {
     const target = event.target;
     if (!(target instanceof Element)) return;
-    const anchor = target.closest<HTMLAnchorElement>('a[data-external-href]');
-    if (!anchor) return;
-    event.preventDefault();
-    const url = anchor.dataset.externalHref;
-    if (url) vscode.postMessage({ type: 'openExternal', url });
+
+    const copyBtn = target.closest<HTMLButtonElement>('[data-code-copy]');
+    if (copyBtn) {
+      event.preventDefault();
+      const pre = copyBtn.parentElement?.querySelector('pre code') ?? copyBtn.parentElement?.querySelector('code');
+      const text = pre?.textContent ?? '';
+      void navigator.clipboard.writeText(text).then(
+        () => {
+          copyBtn.textContent = 'Copied';
+          setTimeout(() => {
+            if (copyBtn.isConnected) copyBtn.textContent = 'Copy';
+          }, 1200);
+        },
+        () => {
+          copyBtn.textContent = 'Failed';
+        },
+      );
+      return;
+    }
+
+    const tocLink = target.closest<HTMLAnchorElement>('a[data-toc-href]');
+    if (tocLink) {
+      event.preventDefault();
+      const id = tocLink.dataset.tocHref;
+      if (id) scrollToHeading(id);
+      return;
+    }
+
+    const headingAnchor = target.closest<HTMLAnchorElement>('a[href^="#"]');
+    if (headingAnchor && article?.contains(headingAnchor)) {
+      const href = headingAnchor.getAttribute('href') ?? '';
+      if (href.startsWith('#') && href.length > 1) {
+        event.preventDefault();
+        scrollToHeading(decodeURIComponent(href.slice(1)));
+        return;
+      }
+    }
+
+    const workspace = target.closest<HTMLAnchorElement>('a[data-workspace-md-href]');
+    if (workspace) {
+      event.preventDefault();
+      const href = workspace.dataset.workspaceMdHref;
+      if (href) vscode.postMessage({ type: 'openWorkspaceMarkdown', href });
+      return;
+    }
+
+    const external = target.closest<HTMLAnchorElement>('a[data-external-href]');
+    if (external) {
+      event.preventDefault();
+      const url = external.dataset.externalHref;
+      if (url) vscode.postMessage({ type: 'openExternal', url });
+    }
   }
 
   onMount(() => {
     const handleMessage = (event: MessageEvent): void => {
+      const data = event.data;
+      if (
+        typeof data === 'object' &&
+        data !== null &&
+        !Array.isArray(data) &&
+        (data as { type?: unknown }).type === 'navigatePresentationFragment' &&
+        typeof (data as { fragment?: unknown }).fragment === 'string'
+      ) {
+        const frag = ((data as { fragment: string }).fragment).replace(/^#/, '');
+        if (/^[A-Za-z0-9._:-]+$/.test(frag)) {
+          pendingFragment = frag;
+          void applyPendingFragment();
+        }
+        return;
+      }
       const revealResult = parsePresentationRevealResult(event.data);
       if (revealResult && revealStatus === 'pending') {
         revealStatus = revealResult.status;
@@ -148,6 +232,7 @@
       document = accepted;
       if (parsed.rootId) rootId = parsed.rootId;
       persist();
+      void applyPendingFragment();
     };
     window.addEventListener('message', handleMessage);
     window.addEventListener('click', handleContentClick);
@@ -159,8 +244,43 @@
     };
   });
 
+  $effect(() => {
+    rendered?.toc;
+    void applyPendingFragment();
+  });
+
+  $effect(() => {
+    const entries = rendered?.toc ?? [];
+    const root = article;
+    if (!root || entries.length === 0) return;
+    const shell = root.closest('.presentation-shell') as HTMLElement | null;
+    const headings = entries
+      .map((e) => root.querySelector<HTMLElement>(`#${CSS.escape(e.id)}`))
+      .filter((el): el is HTMLElement => Boolean(el));
+    if (headings.length === 0) return;
+
+    const observer = new IntersectionObserver(
+      (records) => {
+        const visible = records
+          .filter((r) => r.isIntersecting)
+          .sort((a, b) => (a.boundingClientRect.top ?? 0) - (b.boundingClientRect.top ?? 0));
+        if (visible[0]?.target instanceof HTMLElement && visible[0].target.id) {
+          activeHeadingId = visible[0].target.id;
+        }
+      },
+      {
+        root: shell ?? null,
+        rootMargin: '-10% 0px -70% 0px',
+        threshold: [0, 0.1, 1],
+      },
+    );
+    for (const h of headings) observer.observe(h);
+    return () => observer.disconnect();
+  });
+
   const showSecondary = $derived(Boolean(document?.updatedAt || document?.sourcePath));
   const relativeUpdated = $derived(formatRelativeUpdated(document?.updatedAt));
+  const toc = $derived(rendered?.toc ?? []);
 </script>
 
 {#if document}
@@ -208,7 +328,17 @@
       {#if showSecondary}
         <div class="presentation-header__secondary">
           {#if document.sourcePath}
-            <span class="presentation-source" title={document.sourcePath}>{document.sourcePath}</span>
+            <button
+              type="button"
+              class="presentation-source presentation-source-btn"
+              title={document.sourcePath}
+              onclick={openPresentationSource}
+            >
+              {document.sourcePath}
+            </button>
+            <button type="button" class="presentation-icon-btn" onclick={openPresentationSource}>
+              Open source
+            </button>
           {/if}
           {#if relativeUpdated}
             <span class="presentation-updated" title={document.updatedAt ?? ''}>{relativeUpdated}</span>
@@ -227,6 +357,36 @@
     </header>
     {#if document.summary}
       <p class="presentation-summary">{document.summary}</p>
+    {/if}
+    {#if toc.length > 0}
+      <div class="presentation-toc">
+        <button
+          type="button"
+          class="presentation-toc__toggle"
+          aria-expanded={tocOpen}
+          aria-controls="presentation-toc-list"
+          onclick={() => {
+            tocOpen = !tocOpen;
+          }}
+        >
+          Contents
+        </button>
+        {#if tocOpen}
+          <nav id="presentation-toc-list" class="presentation-toc__list" aria-label="Contents">
+            {#each toc as entry (entry.id)}
+              <a
+                href={`#${entry.id}`}
+                data-toc-href={entry.id}
+                class="presentation-toc__item"
+                class:active={activeHeadingId === entry.id}
+                data-level={entry.level}
+              >
+                {entry.text}
+              </a>
+            {/each}
+          </nav>
+        {/if}
+      </div>
     {/if}
     <article bind:this={article} class="markdown-body presentation-content">
       {@html rendered?.html ?? ''}

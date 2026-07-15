@@ -80,6 +80,7 @@ export interface PresentationPanel {
   reveal(): void;
   dispose(): void;
   onDidDispose(listener: () => void): { dispose(): void };
+  navigateFragment?(fragment: string): PromiseLike<boolean> | boolean;
 }
 
 export interface PresentationPanelFactory {
@@ -508,6 +509,23 @@ export class PresentationManager {
       return { ok: false, code: 'host_delivery_failed' };
     }
     return { ok: true, code: 'restored' };
+  }
+
+  navigateFragment(
+    rootId: string,
+    presentationId: string,
+    fragment: string,
+  ): boolean {
+    if (!isStableId(rootId) || !isStableId(presentationId)) return false;
+    if (!/^[A-Za-z0-9._:-]+$/.test(fragment)) return false;
+    const entry = this.panels.get(this.presentationKey(rootId, presentationId));
+    if (!entry?.panel.navigateFragment) return false;
+    try {
+      void entry.panel.navigateFragment(fragment);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   dispose(): void {

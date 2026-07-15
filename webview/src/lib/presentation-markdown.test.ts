@@ -30,3 +30,19 @@ describe('presentation markdown', () => {
     expect(result.diagrams).toHaveLength(MAX_MERMAID_DIAGRAMS + 1);
   });
 });
+
+describe('presentation TOC and code copy', () => {
+  it('assigns collision-safe heading ids and toc entries', () => {
+    const result = renderPresentationMarkdown('# Alpha\n\n## Beta\n\n# Alpha\n\n```js\nconst x = 1\n```\n');
+    expect(result.toc.map((t) => t.id)).toEqual(['alpha', 'beta', 'alpha-2']);
+    expect(result.html).toContain('id="alpha"');
+    expect(result.html).toContain('id="alpha-2"');
+    expect(result.html).toContain('data-code-copy');
+  });
+
+  it('decodes entities in TOC text and slug', () => {
+    const result = renderPresentationMarkdown('# Research & Development\n');
+    expect(result.toc[0]?.text).toBe('Research & Development');
+    expect(result.toc[0]?.id).toBe('research-development');
+  });
+});

@@ -71,7 +71,12 @@ import { PresentationToolRouter } from './host/presentation-tool-router';
 import { createPresentationChatLink } from './host/presentation-chat-link';
 import {
   clampPresentationMarkdown,
+  isCanonicalInsideRoot,
+  presentationIdFromFolderAndRelativePath,
+  resolveUnderSource,
   resolveWorkspaceMarkdownPath,
+  splitMarkdownHref,
+  titleFromMarkdownPath,
 } from './host/markdown-file-presentation';
 import { enumerateModels, type BackendModels } from './backends/model-catalog';
 import { SESSION_MIGRATION_MARKER, migrateLegacySessions } from './task/migration-sessions';
@@ -2510,8 +2515,182 @@ export async function activate(context: vscode.ExtensionContext) {
     );
     return (await reveal(ownerTaskId)).ok;
   };
+
+  const openPresentationSource = async (document: {
+    sourcePath?: string;
+    sourceFolderUri?: string;
+  }): Promise<void> => {
+    if (!document.sourcePath || !document.sourceFolderUri) return;
+    const folder = vscode.workspace.workspaceFolders?.find(
+      (f) => f.uri.toString() === document.sourceFolderUri,
+    );
+    if (!folder) {
+      void vscode.window.showErrorMessage('Source folder is no longer in the workspace.');
+      return;
+    }
+    const abs = path.join(folder.uri.fsPath, document.sourcePath);
+    try {
+      const realFile = fs.realpathSync(abs);
+      const realRoot = fs.realpathSync(folder.uri.fsPath);
+      if (!isCanonicalInsideRoot(realFile, realRoot)) {
+        void vscode.window.showErrorMessage('Source path is outside the workspace folder.');
+        return;
+      }
+      const doc = await vscode.workspace.openTextDocument(realFile);
+      await vscode.window.showTextDocument(doc, { preview: true });
+    } catch {
+      void vscode.window.showErrorMessage('Could not open source file.');
+    }
+  };
+
+  const openWorkspaceMarkdownFromPresentation = async (
+    href: string,
+    origin: {
+      rootId: string;
+      document: {
+        ownerTaskId: string;
+        sourcePath?: string;
+        sourceFolderUri?: string;
+      };
+    },
+  ): Promise<void> => {
+    if (!presentationManager) return;
+    const { path: hrefPath, fragment } = splitMarkdownHref(href);
+    let targetAbs: string | undefined;
+    let targetId: string | undefined;
+    let title: string | undefined;
+    let sourcePath: string | undefined;
+    let sourceFolderUri: string | undefined;
+
+    if (origin.document.sourceFolderUri) {
+      const folder = vscode.workspace.workspaceFolders?.find(
+        (f) => f.uri.toString() === origin.document.sourceFolderUri,
+      );
+      if (!folder) {
+        void vscode.window.showErrorMessage('Origin folder is no longer in the workspace.');
+        return;
+      }
+      const resolved = resolveUnderSource(
+        hrefPath,
+        origin.document.sourcePath,
+        origin.document.sourceFolderUri,
+        folder.uri.fsPath,
+      );
+      if (!resolved) {
+        void vscode.window.showErrorMessage('Could not resolve markdown link.');
+        return;
+      }
+      try {
+        const realFile = fs.realpathSync(resolved.absolutePath);
+        const realRoot = fs.realpathSync(folder.uri.fsPath);
+        if (!isCanonicalInsideRoot(realFile, realRoot)) {
+          void vscode.window.showErrorMessage('Link target is outside the workspace folder.');
+          return;
+        }
+        targetAbs = realFile;
+        sourcePath = resolved.relativePath;
+        sourceFolderUri = origin.document.sourceFolderUri;
+        targetId = presentationIdFromFolderAndRelativePath(sourceFolderUri, sourcePath);
+        title = titleFromMarkdownPath(targetAbs);
+      } catch {
+        void vscode.window.showErrorMessage('Could not open markdown link.');
+        return;
+      }
+    } else {
+      // Generated artifact without bound source: reject relative links; absolute
+      // (file:/drive) must uniquely match exactly one workspace folder after realpath.
+      const trimmedHref = hrefPath.trim();
+      const isRelative =
+        !/^file:/i.test(trimmedHref) &&
+        !/^[A-Za-z]:[\\/]/.test(trimmedHref) &&
+        !trimmedHref.startsWith('\\\\');
+      // Leading `/` without file: is workspace-relative protocol → reject without source bind.
+      if (isRelative || (trimmedHref.startsWith('/') && !/^file:/i.test(trimmedHref))) {
+        void vscode.window.showErrorMessage(
+          'Relative markdown links require a workspace-backed presentation source.',
+        );
+        return;
+      }
+      const folders =
+        vscode.workspace.workspaceFolders?.map((f) => ({
+          fsPath: f.uri.fsPath,
+          uri: f.uri.toString(),
+        })) ?? [];
+      const matches: Array<{
+        absolutePath: string;
+        sourcePath: string;
+        sourceFolderUri: string;
+        presentationId: string;
+        title: string;
+      }> = [];
+      for (const f of folders) {
+        const target = resolveWorkspaceMarkdownPath(hrefPath, [f]);
+        if (!target) continue;
+        try {
+          const realFile = fs.realpathSync(target.absolutePath);
+          const realRoot = fs.realpathSync(f.fsPath);
+          if (!isCanonicalInsideRoot(realFile, realRoot)) continue;
+          matches.push({
+            absolutePath: realFile,
+            sourcePath: target.sourcePath,
+            sourceFolderUri: target.sourceFolderUri,
+            presentationId: target.presentationId,
+            title: target.title,
+          });
+        } catch {
+          // skip unreadable
+        }
+      }
+      if (matches.length !== 1) {
+        void vscode.window.showErrorMessage('Could not uniquely resolve markdown link.');
+        return;
+      }
+      const only = matches[0];
+      targetAbs = only.absolutePath;
+      sourcePath = only.sourcePath;
+      sourceFolderUri = only.sourceFolderUri;
+      targetId = only.presentationId;
+      title = only.title;
+    }
+
+    let markdown: string;
+    try {
+      markdown = clampPresentationMarkdown(fs.readFileSync(targetAbs!, 'utf8'));
+    } catch {
+      void vscode.window.showErrorMessage('Could not read markdown file.');
+      return;
+    }
+    if (!markdown.trim()) {
+      void vscode.window.showErrorMessage('Markdown file is empty.');
+      return;
+    }
+
+    const result = await presentationManager.openWorkspaceDocument(origin.rootId, {
+      presentationId: targetId!,
+      ownerTaskId: origin.document.ownerTaskId,
+      title: title!,
+      markdown,
+      kind: 'document',
+      sourcePath,
+      sourceFolderUri,
+    });
+    if (!result.ok) {
+      void vscode.window.showErrorMessage('Could not open presentation.');
+      return;
+    }
+    if (fragment) {
+      presentationManager.navigateFragment(origin.rootId, targetId!, fragment);
+    }
+  };
+
+  const presentationHandlers = {
+    revealLinkedChat,
+    openPresentationSource,
+    openWorkspaceMarkdown: openWorkspaceMarkdownFromPresentation,
+  };
+
   presentationManager = new PresentationManager(
-    createPresentationPanelFactory(presentationHost, context.extensionUri, revealLinkedChat),
+    createPresentationPanelFactory(presentationHost, context.extensionUri, presentationHandlers),
   );
   presentationManager.setOwnerResolver((ownerTaskId) => {
     const file = taskStore?.getFile();
@@ -2529,7 +2708,12 @@ export async function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.window.registerWebviewPanelSerializer(
       'muster.presentation',
-      createPresentationPanelSerializer(presentationHost, context.extensionUri, presentationManager, revealLinkedChat),
+      createPresentationPanelSerializer(
+        presentationHost,
+        context.extensionUri,
+        presentationManager,
+        presentationHandlers,
+      ),
     ),
   );
   context.subscriptions.push({
