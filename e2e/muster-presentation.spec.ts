@@ -6,6 +6,9 @@ interface PresentationDocument {
   revision: number;
   title: string;
   markdown: string;
+  kind?: 'plan' | 'spec' | 'document';
+  sourcePath?: string;
+  updatedAt?: string;
 }
 
 async function openPresentation(page: Page, persistedState?: unknown) {
@@ -61,6 +64,7 @@ test('reveals linked chat with identity-free messages and accessible typed statu
   const chatStatus = page.getByRole('status', { name: 'Linked chat status' });
   await expect(chatStatus).toHaveText('Opening linked chat…');
   await expect.poll(() => page.evaluate(() => window.__musterPostedMessages ?? [])).toEqual([
+    { type: 'presentationReady' },
     { type: 'revealLinkedChat' },
   ]);
 
@@ -149,6 +153,59 @@ test('renders a guarded Markdown presentation from a host update', async ({ page
   await expect(page.locator('[data-presentation-revision]')).toHaveAttribute('data-presentation-revision', '1');
 });
 
+test('keeps presentation chrome compact, aligned, and overflow-safe', async ({ page }) => {
+  await page.setViewportSize({ width: 895, height: 520 });
+  const longBody = Array.from({ length: 60 }, (_, index) => `Dòng nội dung ${index + 1}.`).join('\n\n');
+  await openPresentation(page, presentation({
+    title: 'plan',
+    kind: 'document',
+    sourcePath: 'docs/plans/ho-chi-minh-city-three-day-plan.md',
+    updatedAt: new Date().toISOString(),
+    markdown: `# Lịch trình TP.HCM 3 ngày 2 đêm\n\n## Nên ở đâu\n\n${longBody}`,
+  }));
+
+  const controlHeights = await page.locator(
+    '.presentation-revision, .presentation-header__actions button',
+  ).evaluateAll((elements) => elements.map((element) => element.getBoundingClientRect().height));
+  expect(controlHeights).toEqual([28, 28, 28]);
+
+  const contextHeights = await page.locator(
+    '.presentation-source-btn, .presentation-updated',
+  ).evaluateAll((elements) => elements.map((element) => element.getBoundingClientRect().height));
+  expect(contextHeights).toEqual([26, 26]);
+  await expect(page.locator('.presentation-header')).toHaveCSS('gap', '8px');
+  await expect(page.getByRole('status')).toHaveCount(0);
+
+  const tocToggle = page.getByRole('button', { name: 'Contents' });
+  await expect(tocToggle).toHaveAttribute('aria-expanded', 'true');
+  await expect(page.getByRole('navigation', { name: 'Contents' })).toBeVisible();
+  await expect(page.locator('.presentation-shell')).toHaveCSS('overflow', 'hidden');
+  await expect(page.locator('.presentation-content-scroll')).toHaveCSS('overflow-y', 'auto');
+
+  const pinnedBefore = await page.locator('.presentation-header, .presentation-toc')
+    .evaluateAll((elements) => elements.map((element) => element.getBoundingClientRect().top));
+  await page.locator('.presentation-content-scroll').evaluate((element) => {
+    element.scrollTop = 240;
+  });
+  await expect.poll(() => page.locator('.presentation-content-scroll').evaluate((element) => element.scrollTop))
+    .toBeGreaterThan(0);
+  const pinnedAfter = await page.locator('.presentation-header, .presentation-toc')
+    .evaluateAll((elements) => elements.map((element) => element.getBoundingClientRect().top));
+  expect(pinnedAfter).toEqual(pinnedBefore);
+
+  await tocToggle.click();
+  await expect(tocToggle).toHaveAttribute('aria-expanded', 'false');
+  await expect(page.getByRole('navigation', { name: 'Contents' })).toHaveCount(0);
+
+  await page.setViewportSize({ width: 360, height: 520 });
+  const overflow = await page.locator('.presentation-shell').evaluate((element) => ({
+    clientWidth: element.clientWidth,
+    scrollWidth: element.scrollWidth,
+  }));
+  expect(overflow.scrollWidth).toBeLessThanOrEqual(overflow.clientWidth);
+  await expect(page.getByRole('button', { name: 'Open linked chat' })).toBeVisible();
+});
+
 test('sanitizes hostile markup and routes only annotated links through the host', async ({ page }) => {
   await openPresentation(page);
   await postUpdate(page, presentation({
@@ -204,7 +261,7 @@ test('renders Mermaid diagrams locally without disturbing surrounding Markdown o
   await expect(page.getByRole('heading', { name: 'Diagram release' })).toBeVisible();
   await expect(page.getByRole('table')).toContainText('Guarded');
   await expect(page.locator('pre code.language-ts')).toContainText('const adjacent = true;');
-  await page.getByRole('link', { name: 'release' }).click();
+  await page.getByRole('link', { name: 'release', exact: true }).click();
   await expect.poll(() => page.evaluate(() => window.__musterPostedMessages ?? [])).toContainEqual({
     type: 'openExternal',
     url: 'https://example.com/release',

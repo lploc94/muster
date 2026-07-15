@@ -33,7 +33,7 @@
   let copyStatus = $state<'idle' | 'copied' | 'failed'>('idle');
   let copyResetTimer: ReturnType<typeof setTimeout> | undefined;
   let revealResetTimer: ReturnType<typeof setTimeout> | undefined;
-  let tocOpen = $state(false);
+  let tocOpen = $state(true);
   let activeHeadingId = $state<string | undefined>(undefined);
   let pendingFragment = $state<string | undefined>(undefined);
   let revisionAnnounce = $state<string>('');
@@ -42,12 +42,12 @@
   const rendered = $derived(document ? renderPresentationMarkdown(document.markdown) : undefined);
 
   function captureScrollAnchor(): { headingId?: string; ratio: number } {
-    const shell = article?.closest('.presentation-shell') as HTMLElement | null;
-    if (!shell || !article) return { ratio: 0 };
-    const max = Math.max(1, shell.scrollHeight - shell.clientHeight);
-    const ratio = shell.scrollTop / max;
+    const viewport = article?.closest('.presentation-content-scroll') as HTMLElement | null;
+    if (!viewport || !article) return { ratio: 0 };
+    const max = Math.max(1, viewport.scrollHeight - viewport.clientHeight);
+    const ratio = viewport.scrollTop / max;
     const headings = Array.from(article.querySelectorAll<HTMLElement>('h1[id], h2[id], h3[id]'));
-    const top = shell.getBoundingClientRect().top + 48;
+    const top = viewport.getBoundingClientRect().top;
     let headingId: string | undefined;
     for (const h of headings) {
       if (h.getBoundingClientRect().top <= top + 8) headingId = h.id;
@@ -57,8 +57,8 @@
 
   async function restoreScrollAnchor(anchor: { headingId?: string; ratio: number }): Promise<void> {
     await tick();
-    const shell = article?.closest('.presentation-shell') as HTMLElement | null;
-    if (!shell || !article) return;
+    const viewport = article?.closest('.presentation-content-scroll') as HTMLElement | null;
+    if (!viewport || !article) return;
     if (anchor.headingId) {
       const el = article.querySelector<HTMLElement>(`#${CSS.escape(anchor.headingId)}`);
       if (el) {
@@ -66,8 +66,8 @@
         return;
       }
     }
-    const max = Math.max(0, shell.scrollHeight - shell.clientHeight);
-    shell.scrollTop = max * Math.min(1, Math.max(0, anchor.ratio));
+    const max = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+    viewport.scrollTop = max * Math.min(1, Math.max(0, anchor.ratio));
   }
 
   function persist(): void {
@@ -291,6 +291,9 @@
     };
     window.addEventListener('message', handleMessage);
     window.addEventListener('click', handleContentClick);
+    // A restored VS Code panel can be configured before this script mounts.
+    // Tell the host it is now safe to replay the latest presentation document.
+    vscode.postMessage({ type: 'presentationReady' });
     const relativeInterval = setInterval(() => {
       relativeTick += 1;
     }, 30_000);
@@ -313,7 +316,7 @@
     const entries = rendered?.toc ?? [];
     const root = article;
     if (!root || entries.length === 0) return;
-    const shell = root.closest('.presentation-shell') as HTMLElement | null;
+    const viewport = root.closest('.presentation-content-scroll') as HTMLElement | null;
     const headings = entries
       .map((e) => root.querySelector<HTMLElement>(`#${CSS.escape(e.id)}`))
       .filter((el): el is HTMLElement => Boolean(el));
@@ -329,7 +332,7 @@
         }
       },
       {
-        root: shell ?? null,
+        root: viewport ?? null,
         rootMargin: '-10% 0px -70% 0px',
         threshold: [0, 0.1, 1],
       },
@@ -367,6 +370,7 @@
             aria-label={`Revision ${document.revision}`}
             title="Monotonic presentation revision"
           >
+            <span class="codicon codicon-git-commit" aria-hidden="true"></span>
             v{document.revision}
           </span>
           <button
@@ -376,62 +380,75 @@
             title="Copy markdown"
             aria-label="Copy markdown"
           >
+            <span class="codicon codicon-copy" aria-hidden="true"></span>
             {copyStatus === 'copied' ? 'Copied' : copyStatus === 'failed' ? 'Failed' : 'Copy'}
           </button>
           <button
             type="button"
             class="presentation-primary-btn"
+            aria-label="Open linked chat"
             disabled={revealStatus === 'pending'}
             onclick={revealLinkedChat}
           >
+            <span class="codicon codicon-comment-discussion" aria-hidden="true"></span>
             {revealStatus === 'pending' ? 'Opening…' : 'Open linked chat'}
           </button>
         </div>
       </div>
-      {#if showSecondary}
+      {#if showSecondary || revealStatus !== 'idle' || revisionAnnounce}
         <div class="presentation-header__secondary">
-          {#if document.sourcePath}
-            <button
-              type="button"
-              class="presentation-source presentation-source-btn"
-              title={document.sourcePath}
-              onclick={openPresentationSource}
-            >
-              {document.sourcePath}
-            </button>
-            <button type="button" class="presentation-icon-btn" onclick={openPresentationSource}>
-              Open source
-            </button>
-          {/if}
-          {#if relativeUpdated}
-            <span class="presentation-updated" title={document.updatedAt ?? ''}>{relativeUpdated}</span>
-          {/if}
+          <div class="presentation-header__context">
+            {#if document.sourcePath}
+              <button
+                type="button"
+                class="presentation-source-btn"
+                title={`Open source: ${document.sourcePath}`}
+                aria-label={`Open source ${document.sourcePath}`}
+                onclick={openPresentationSource}
+              >
+                <span class="codicon codicon-file-text" aria-hidden="true"></span>
+                <span class="presentation-source">{document.sourcePath}</span>
+                <span class="presentation-source-btn__action">Open source</span>
+              </button>
+            {/if}
+            {#if relativeUpdated}
+              <span class="presentation-updated" title={document.updatedAt ?? ''}>
+                <span class="codicon codicon-history" aria-hidden="true"></span>
+                {relativeUpdated}
+              </span>
+            {/if}
+          </div>
+          <div class="presentation-header__feedback">
+            {#if revealStatus !== 'idle'}
+              <span
+                class="presentation-status"
+                role="status"
+                aria-live="polite"
+                aria-label="Linked chat status"
+                data-status="linked-chat"
+                data-state={revealStatus}
+              >
+                {revealStatus === 'pending'
+                  ? 'Opening linked chat…'
+                  : revealStatus === 'success'
+                    ? 'Linked chat opened.'
+                    : 'Could not open linked chat.'}
+              </span>
+            {/if}
+            {#if revisionAnnounce}
+              <span
+                class="presentation-status presentation-status--revision"
+                role="status"
+                aria-live="polite"
+                aria-label="Revision status"
+                data-status="revision"
+              >
+                {revisionAnnounce}
+              </span>
+            {/if}
+          </div>
         </div>
       {/if}
-      <span
-        class="presentation-status"
-        role="status"
-        aria-live="polite"
-        aria-label="Linked chat status"
-        data-status="linked-chat"
-      >
-        {revealStatus === 'pending'
-          ? 'Opening linked chat…'
-          : revealStatus === 'success'
-            ? 'Linked chat opened.'
-            : revealStatus === 'failure'
-              ? 'Could not open linked chat.'
-              : ''}
-      </span>
-      <span
-        class="presentation-status presentation-status--revision"
-        role="status"
-        aria-live="polite"
-        aria-label="Revision status"
-        data-status="revision"
-      >
-        {revisionAnnounce}
-      </span>
     </header>
     {#if document.summary}
       <p class="presentation-summary">{document.summary}</p>
@@ -453,7 +470,12 @@
             tocOpen = !tocOpen;
           }}
         >
-          Contents
+          <span class="codicon codicon-list-tree" aria-hidden="true"></span>
+          <span>Contents</span>
+          <span
+            class={`codicon codicon-chevron-${tocOpen ? 'up' : 'down'} presentation-toc__chevron`}
+            aria-hidden="true"
+          ></span>
         </button>
         {#if tocOpen}
           <nav id="presentation-toc-list" class="presentation-toc__list" aria-label="Contents">
@@ -472,9 +494,11 @@
         {/if}
       </div>
     {/if}
-    <article bind:this={article} class="markdown-body presentation-content">
-      {@html rendered?.html ?? ''}
-    </article>
+    <div class="presentation-content-scroll">
+      <article bind:this={article} class="markdown-body presentation-content">
+        {@html rendered?.html ?? ''}
+      </article>
+    </div>
   </main>
 {:else}
   <main class="presentation-empty" aria-live="polite">Waiting for presentation content…</main>

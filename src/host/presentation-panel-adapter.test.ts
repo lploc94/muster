@@ -46,6 +46,8 @@ describe('presentation panel adapter', () => {
     await adapter.update({ presentationId: 'plan.main', ownerTaskId: 'root', revision: 1, title: 'Plan', markdown: '# Plan' });
 
     expect(panel.webview.html).toContain('/extension/dist/webview/assets/presentation.css');
+    expect(panel.webview.html).toContain('presentation.js?v=0');
+    expect(panel.webview.html).toContain('presentation.css?v=0');
     expect(panel.webview.html).not.toContain('?inline');
     expect(panel.messages).toEqual([{ type: 'presentationUpdate', document: expect.objectContaining({ revision: 1 }) }]);
     expect(panel.title).toBe('Plan');
@@ -95,6 +97,39 @@ describe('presentation panel adapter', () => {
     await vi.waitFor(() => expect(revealLinkedChat).toHaveBeenCalledWith('restored-owner'));
   });
 
+  it('replays the accepted document after a restored webview reports ready', async () => {
+    const panel = fakePanel();
+    let webviewReady = false;
+    panel.webview.postMessage = async (message) => {
+      // VS Code can accept a host post before the restored page has mounted,
+      // while no page listener exists to consume it.
+      if (webviewReady) panel.messages.push(message);
+      return true;
+    };
+    const adapter = createPresentationPanelAdapter(host, panel, '/extension');
+    const document = {
+      presentationId: 'restored-plan',
+      ownerTaskId: 'root',
+      revision: 2,
+      title: 'Restored plan',
+      markdown: '# Restored',
+    };
+
+    expect(await adapter.update(document, 'root', { restore: true })).toBe(true);
+    expect(panel.messages).toEqual([]);
+
+    webviewReady = true;
+    panel.receive({ type: 'presentationReady' });
+    await vi.waitFor(() => expect(panel.messages).toEqual([
+      { type: 'presentationUpdate', document, rootId: 'root', restore: true },
+    ]));
+
+    panel.messages.length = 0;
+    panel.receive({ type: 'presentationReady', forged: true });
+    await Promise.resolve();
+    expect(panel.messages).toEqual([]);
+  });
+
   it('factory disposes a host panel when configuration fails', () => {
     const panel = fakePanel();
     panel.webview.asWebviewUri = () => { throw new Error('assets unavailable'); };
@@ -113,8 +148,23 @@ describe('presentation panel adapter', () => {
     await serializer.deserializeWebviewPanel(accepted, { rootId: 'r' });
     await serializer.deserializeWebviewPanel(rejected, { broken: true });
 
-    expect(restore).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(restore).toHaveBeenCalledTimes(2));
     expect(accepted.disposeCount).toBe(0);
-    expect(rejected.disposeCount).toBe(1);
+    await vi.waitFor(() => expect(rejected.disposeCount).toBe(1));
+  });
+
+  it('does not keep VS Code waiting for host delivery before a restored panel becomes live', async () => {
+    const panel = fakePanel();
+    const restore = vi.fn(() => new Promise<never>(() => undefined));
+    const serializer = createPresentationPanelSerializer(host, '/extension', { restore });
+
+    let serializerReturned = false;
+    void serializer.deserializeWebviewPanel(panel, { rootId: 'r' }).then(() => {
+      serializerReturned = true;
+    });
+
+    await vi.waitFor(() => expect(serializerReturned).toBe(true));
+    expect(restore).toHaveBeenCalledTimes(1);
+    expect(panel.disposeCount).toBe(0);
   });
 });

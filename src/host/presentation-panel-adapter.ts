@@ -6,6 +6,7 @@ import {
   type PresentationResult,
 } from './presentation-manager';
 import { buildPresentationWebviewHtml, parseAllowedPresentationLink } from './webview-security';
+import { statSync } from 'node:fs';
 
 export type RevealLinkedChat = (ownerTaskId: string) => PromiseLike<boolean> | boolean;
 export type OpenPresentationSource = (document: PresentationDocument) => PromiseLike<void> | void;
@@ -56,10 +57,22 @@ interface PresentationRestorer {
 function configureWebview(host: PresentationHost, panel: VscodePanelLike, extensionUri: unknown): void {
   const resourceRoot = host.joinPath(extensionUri, 'dist', 'webview');
   const assets = host.joinPath(resourceRoot, 'assets');
+  const scriptFile = host.joinPath(assets, 'presentation.js');
+  const styleFile = host.joinPath(assets, 'presentation.css');
+  const version = (resource: unknown): string => {
+    if (typeof resource !== 'object' || resource === null || !('fsPath' in resource)) return '0';
+    const fsPath = (resource as { fsPath?: unknown }).fsPath;
+    if (typeof fsPath !== 'string') return '0';
+    try {
+      return String(Math.trunc(statSync(fsPath).mtimeMs));
+    } catch {
+      return '0';
+    }
+  };
   panel.webview.html = buildPresentationWebviewHtml({
     cspSource: panel.webview.cspSource,
-    scriptUri: panel.webview.asWebviewUri(host.joinPath(assets, 'presentation.js')).toString(),
-    styleUri: panel.webview.asWebviewUri(host.joinPath(assets, 'presentation.css')).toString(),
+    scriptUri: `${panel.webview.asWebviewUri(scriptFile).toString()}?v=${version(scriptFile)}`,
+    styleUri: `${panel.webview.asWebviewUri(styleFile).toString()}?v=${version(styleFile)}`,
   });
 }
 
@@ -80,10 +93,19 @@ export function createPresentationPanelAdapter(
   let boundOwnerTaskId = ownerTaskId;
   let lastDocument: PresentationDocument | undefined;
   let lastRootId: string | undefined;
+  let lastRestore = false;
+  let readyVersion = 0;
   panel.onDidDispose(() => { disposed = true; });
   panel.webview.onDidReceiveMessage((message: unknown) => {
     if (typeof message !== 'object' || message === null || Array.isArray(message)) return;
     const data = message as Record<string, unknown>;
+    if (Object.keys(data).length === 1 && data.type === 'presentationReady') {
+      readyVersion += 1;
+      if (!disposed && lastDocument) {
+        void Promise.resolve(postPresentationUpdate(lastDocument, lastRootId, lastRestore)).catch(() => undefined);
+      }
+      return;
+    }
     if (Object.keys(data).length === 1 && data.type === 'revealLinkedChat') {
       if (disposed || revealPending || !boundOwnerTaskId || !handlers.revealLinkedChat) return;
       revealPending = true;
@@ -131,6 +153,17 @@ export function createPresentationPanelAdapter(
     }
   }
 
+  function postPresentationUpdate(
+    document: PresentationDocument,
+    rootId: string | undefined,
+    restore: boolean,
+  ): PromiseLike<boolean> {
+    const message: Record<string, unknown> = { type: 'presentationUpdate', document };
+    if (rootId !== undefined) message.rootId = rootId;
+    if (restore) message.restore = true;
+    return panel.webview.postMessage(message);
+  }
+
   return {
     async update(
       document: PresentationDocument,
@@ -143,14 +176,23 @@ export function createPresentationPanelAdapter(
         boundOwnerTaskId = document.ownerTaskId;
       }
       if (!boundOwnerTaskId) boundOwnerTaskId = document.ownerTaskId;
-      const message: Record<string, unknown> = { type: 'presentationUpdate', document };
-      if (rootId !== undefined) message.rootId = rootId;
-      if (options?.restore) message.restore = true;
-      const accepted = await panel.webview.postMessage(message);
+      const readyAtSend = readyVersion;
+      const restore = options?.restore === true;
+      const accepted = await postPresentationUpdate(document, rootId, restore);
       if (accepted) {
         lastDocument = document;
         if (rootId !== undefined) lastRootId = rootId;
+        lastRestore = restore;
         try { panel.title = document.title; } catch { /* editor chrome is best-effort */ }
+        // If readiness raced the initial delivery, its handler had no accepted
+        // document to replay. Deliver once more now that the cache is bound.
+        if (readyVersion !== readyAtSend && !disposed) {
+          try {
+            await postPresentationUpdate(document, rootId, restore);
+          } catch {
+            // The original accepted delivery remains authoritative.
+          }
+        }
       }
       return accepted;
     },
@@ -217,10 +259,23 @@ export function createPresentationPanelSerializer(
         try { panel.dispose(); } catch { /* preserve fail-closed restore */ }
         return;
       }
-      const result = await manager.restore(adapter, state);
-      if (!result.ok) {
-        try { panel.dispose(); } catch { /* rejection remains content-free */ }
-      }
+      // Do not await delivery here. VS Code does not consider a restored panel
+      // fully live until this serializer returns, while postMessage can depend on
+      // the panel becoming live. The adapter's presentationReady handshake closes
+      // the delivery race after the bootstrap has mounted.
+      console.log('Muster: presentation restore scheduled');
+      void Promise.resolve(manager.restore(adapter, state)).then(
+        (result) => {
+          console.log(`Muster: presentation restore ${result.code}`);
+          if (!result.ok) {
+            try { panel.dispose(); } catch { /* rejection remains content-free */ }
+          }
+        },
+        () => {
+          console.warn('Muster: presentation restore failed');
+          try { panel.dispose(); } catch { /* rejection remains content-free */ }
+        },
+      );
     },
   };
 }

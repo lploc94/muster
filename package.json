@@ -30,7 +30,8 @@
     "vscode": "^1.94.0"
   },
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onWebviewPanel:muster.presentation"
   ],
   "main": "./dist/src/extension.js",
   "contributes": {

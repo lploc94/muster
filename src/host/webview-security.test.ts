@@ -11,11 +11,13 @@ describe('presentation webview security', () => {
   it('defines the canonical assembled presentation integration gate', () => {
     const packageJson = JSON.parse(readFileSync(resolve(process.cwd(), 'package.json'), 'utf8')) as {
       scripts?: Record<string, string>;
+      activationEvents?: string[];
     };
 
     expect(packageJson.scripts?.['test:presentation-integration']).toBe(
       'vitest run src/task/presentation-tool-auth.test.ts src/host/presentation-tool-router.test.ts src/host/presentation-manager.test.ts src/host/presentation-panel-adapter.test.ts src/host/presentation-chat-link.test.ts src/host/presentation-revision-loop.test.ts src/host/webview-security.test.ts && npm run compile && npm run test:webview -- e2e/muster-presentation.spec.ts',
     );
+    expect(packageJson.activationEvents).toContain('onWebviewPanel:muster.presentation');
   });
 
   it('keeps Mermaid SVG security isolated from the shared Markdown sanitizer', () => {
