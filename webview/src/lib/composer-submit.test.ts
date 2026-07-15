@@ -87,6 +87,44 @@ describe('resolveComposerKeyIntent', () => {
     });
     expect(resolveComposerKeyIntent(key({ key: 'Enter' }), { mode: 'draft' })).toEqual({ kind: 'send' });
   });
+
+  it('keeps Shift+Enter / Ctrl|Meta+Enter / plain Enter available when file-mention popup is inactive',
+    async () => {
+      // Composition contract with file-mention-keyboard: inactive popup returns none,
+      // so this submit policy remains the sole owner of Enter semantics.
+      const { resolveFileMentionKeyIntent } = await import('./file-mention-keyboard');
+      const inactive = { popupOpen: false, itemCount: 0, activeIndex: -1 as number };
+
+      expect(resolveFileMentionKeyIntent(key({ key: 'Enter' }), inactive)).toEqual({ kind: 'none' });
+      expect(resolveFileMentionKeyIntent(key({ key: 'Enter', shiftKey: true }), inactive)).toEqual({
+        kind: 'none',
+      });
+      expect(resolveFileMentionKeyIntent(key({ key: 'Enter', ctrlKey: true }), inactive)).toEqual({
+        kind: 'none',
+      });
+      expect(resolveFileMentionKeyIntent(key({ key: 'Enter', metaKey: true }), inactive)).toEqual({
+        kind: 'none',
+      });
+
+      // Existing submit mapping is unchanged for the same keys.
+      expect(resolveComposerKeyIntent(key({ key: 'Enter' }), { mode: 'task' })).toEqual({ kind: 'send' });
+      expect(resolveComposerKeyIntent(key({ key: 'Enter', shiftKey: true }), { mode: 'task' })).toEqual({
+        kind: 'none',
+      });
+      expect(
+        resolveComposerKeyIntent(key({ key: 'Enter', ctrlKey: true }), {
+          mode: 'task',
+          liveInjectEligible: true,
+        }),
+      ).toEqual({ kind: 'sendLiveInput' });
+      expect(
+        resolveComposerKeyIntent(key({ key: 'Enter', metaKey: true }), {
+          mode: 'task',
+          liveInjectEligible: true,
+        }),
+      ).toEqual({ kind: 'sendLiveInput' });
+    },
+  );
 });
 
 describe('buildTaskComposerMessage', () => {

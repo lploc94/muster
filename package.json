@@ -176,6 +176,7 @@
     "test:presentation-live-evidence": "node --test scripts/verify-presentation-live-host-evidence.test.mjs",
     "test:presentation-docs": "node --test scripts/verify-presentation-docs.test.mjs",
     "test:file-drop-live-evidence": "node --test scripts/verify-file-drop-live-host-evidence.test.mjs",
+    "test:file-mention-autocomplete-live-evidence": "node --test scripts/verify-file-mention-autocomplete-live-host-evidence.test.mjs",
     "test:file-drop-docs": "node --test scripts/verify-file-drop-docs.test.mjs",
     "test:queue-live-inject-docs": "node --test scripts/verify-queue-live-inject-docs.test.mjs",
     "test:task-export-docs": "node --test scripts/verify-task-export-docs.test.mjs",

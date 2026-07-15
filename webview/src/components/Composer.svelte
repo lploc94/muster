@@ -37,6 +37,25 @@
     type MentionBindingMap,
   } from '../lib/file-mention-bindings';
   import {
+    createFileMentionAutocompleteSession,
+    refineActiveFileMentionDirectory,
+    replaceActiveFileMentionQuery,
+    type FileMentionAutocompleteState,
+  } from '../lib/file-mention-autocomplete';
+  import {
+    resolveFileMentionKeyIntent,
+    shouldPreventDefaultForFileMentionKey,
+  } from '../lib/file-mention-keyboard';
+  import {
+    FILE_MENTION_LISTBOX_ID,
+    FILE_MENTION_LISTBOX_LABEL,
+    clampFileMentionActiveIndex,
+    fileMentionOptionId,
+    fileMentionStatusText,
+    resolveFileMentionActiveDescendant,
+  } from '../lib/file-mention-listbox';
+  import type { FileMentionSuggestionItem, FileMentionSuggestionsMessage } from '../lib/protocol';
+  import {
     buildTaskComposerMessage,
     resolveComposerKeyIntent,
     shouldPreventDefaultForComposerKey,
@@ -106,6 +125,115 @@
   let dropFeedback = $state<string | null>(null);
   let isAddContextMenuOpen = $state(false);
   let lastPrefillNonce = $state<number | null>(null);
+  /** Reactive mirror of the pure autocomplete session (request scope + listbox). */
+  let mentionAutocomplete = $state<FileMentionAutocompleteState>({
+    open: false,
+    items: [],
+    activeQuery: null,
+    pendingRequestId: null,
+    outcome: 'closed',
+  });
+  let mentionListboxRegion = $state<HTMLElement | undefined>(undefined);
+  /** Keyboard/mouse highlighted option; -1 means none until first Arrow or paint seed. */
+  let mentionActiveIndex = $state(-1);
+  let lastMentionItemsSignature = '';
+  /** Suppress autocomplete open/request while IME composition is in progress. */
+  let mentionImeComposing = $state(false);
+
+  function syncMentionAutocompleteFromSession() {
+    const next = mentionAutocompleteSession.getState();
+    const signature = `${next.outcome}:${next.pendingRequestId ?? ''}:${next.items.map((i) => i.id).join('|')}`;
+    // Seed/clamp active option when the item set or outcome changes; keep user
+    // highlight stable across identical paints.
+    if (signature !== lastMentionItemsSignature) {
+      lastMentionItemsSignature = signature;
+      if (next.outcome === 'ready' && next.items.length > 0) {
+        mentionActiveIndex = clampFileMentionActiveIndex(0, next.items.length);
+      } else {
+        mentionActiveIndex = -1;
+      }
+    } else if (next.items.length > 0) {
+      mentionActiveIndex = clampFileMentionActiveIndex(mentionActiveIndex, next.items.length);
+    } else {
+      mentionActiveIndex = -1;
+    }
+    mentionAutocomplete = next;
+  }
+
+  function closeFileMentionPopup() {
+    mentionAutocompleteSession.reset();
+    lastMentionItemsSignature = '';
+    mentionActiveIndex = -1;
+    syncMentionAutocompleteFromSession();
+  }
+
+  function scrollActiveMentionOptionIntoView(index: number) {
+    if (!mentionListboxRegion || index < 0) return;
+    const option = mentionListboxRegion.querySelector(`#${fileMentionOptionId(index)}`);
+    if (option instanceof HTMLElement) {
+      option.scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  function acceptFileMentionAtIndex(index: number) {
+    const item = mentionAutocomplete.items[index];
+    if (!item) return;
+    selectFileMentionSuggestion(item);
+  }
+
+  /** Keep textarea focus when clicking an option (mousedown before blur). */
+  function onMentionOptionMouseDown(e: MouseEvent) {
+    e.preventDefault();
+  }
+
+  function onMentionOptionMouseEnter(index: number) {
+    mentionActiveIndex = index;
+  }
+
+  function onComposerTextareaBlur(e: FocusEvent) {
+    // Close when focus leaves the composer input, but not when moving into the
+    // listbox region (mousedown already preserves focus; pointerdown outside closes).
+    const related = e.relatedTarget;
+    if (related instanceof Node && mentionListboxRegion?.contains(related)) return;
+    if (mentionAutocomplete.open) {
+      closeFileMentionPopup();
+    }
+  }
+
+  function notifyMentionAutocompleteCaret() {
+    // IME composition must not open the popup or post host requests mid-composition.
+    if (mentionImeComposing) {
+      if (mentionAutocomplete.open || mentionAutocomplete.pendingRequestId) {
+        closeFileMentionPopup();
+      }
+      return;
+    }
+    const caret = textareaEl?.selectionStart ?? draftText.length;
+    mentionAutocompleteSession.onCaretChange({
+      text: draftText,
+      caret,
+      canSend,
+      taskId: mode === 'task' ? taskId : undefined,
+    });
+    syncMentionAutocompleteFromSession();
+  }
+
+  function onMentionCompositionStart() {
+    mentionImeComposing = true;
+    if (mentionAutocomplete.open || mentionAutocomplete.pendingRequestId) {
+      closeFileMentionPopup();
+    }
+  }
+
+  function onMentionCompositionEnd() {
+    mentionImeComposing = false;
+    // Re-evaluate caret after composition commits (email-like / @query may now be valid).
+    notifyMentionAutocompleteCaret();
+  }
+
+  const mentionAutocompleteSession = createFileMentionAutocompleteSession({
+    post,
+  });
 
   /** Highlight layer mirrors draft; trailing newline needs an extra break for height parity. */
   const draftHighlightHtml = $derived.by(() => {
@@ -141,7 +269,7 @@
     }
     lastPrefillNonce = prefill.nonce;
     draftText = prefill.text;
-    mentionBindings = new Map();
+    mentionBindings = new Map(prefill.mentionBindings ?? []);
     dropFeedback = null;
     const appliedId = prefill.clientRequestId;
     tasks.clearComposerPrefill();
@@ -224,6 +352,11 @@
   $effect(() => {
     function onMessage(e: MessageEvent) {
       const msg = e.data;
+      if (msg?.type === 'fileMentionSuggestions') {
+        mentionAutocompleteSession.onResponse(msg as FileMentionSuggestionsMessage);
+        syncMentionAutocompleteFromSession();
+        return;
+      }
       if (msg?.type !== 'filePicked' || typeof msg.path !== 'string') return;
       dropFeedback = null;
       const displayName =
@@ -241,20 +374,51 @@
     if (!canSend && isAddContextMenuOpen) {
       closeAddContextMenu();
     }
+    if (!canSend) {
+      closeFileMentionPopup();
+    }
+  });
+
+  // Close autocomplete when focus target / draft-vs-task mode changes.
+  $effect(() => {
+    void mode;
+    void taskId;
+    closeFileMentionPopup();
+  });
+
+  // Scroll the active option into view when keyboard highlight moves.
+  $effect(() => {
+    if (!mentionAutocomplete.open || mentionActiveIndex < 0) return;
+    queueMicrotask(() => scrollActiveMentionOptionIntoView(mentionActiveIndex));
   });
 
   $effect(() => {
-    if (!isAddContextMenuOpen) return;
+    if (!isAddContextMenuOpen && !mentionAutocomplete.open) return;
 
     function onPointerDown(e: PointerEvent) {
       const target = e.target;
       if (target instanceof Node && addContextMenuRegion?.contains(target)) return;
+      if (target instanceof Node && mentionListboxRegion?.contains(target)) return;
       closeAddContextMenu();
+      if (mentionAutocomplete.open) {
+        closeFileMentionPopup();
+      }
     }
 
     window.addEventListener('pointerdown', onPointerDown, true);
     return () => window.removeEventListener('pointerdown', onPointerDown, true);
   });
+
+  const mentionStatus = $derived(fileMentionStatusText(mentionAutocomplete.outcome));
+  const mentionActiveDescendant = $derived(
+    resolveFileMentionActiveDescendant(mentionActiveIndex, mentionAutocomplete.items.length),
+  );
+  const mentionPopupVisible = $derived(
+    mentionAutocomplete.open &&
+      (mentionAutocomplete.items.length > 0 ||
+        mentionAutocomplete.outcome === 'empty' ||
+        mentionAutocomplete.outcome === 'error'),
+  );
 
   function submitComposer(intent: Exclude<ComposerSubmitIntent, { kind: 'none' }>) {
     if (!canSend) return;
@@ -299,6 +463,8 @@
         clientRequestId,
         text: displayText,
         llmText: llmText !== displayText ? llmText : undefined,
+        mentionBindings:
+          mentionBindings.size > 0 ? Array.from(mentionBindings.entries()) : undefined,
         backend,
         model: model ?? undefined,
         continuationOf: tasks.continuationOf ?? undefined,
@@ -363,6 +529,8 @@
         taskId,
         text: displayText,
         llmText: llmText !== displayText ? llmText : undefined,
+        mentionBindings:
+          mentionBindings.size > 0 ? Array.from(mentionBindings.entries()) : undefined,
         createdAt: Date.now(),
         status: 'pending',
       });
@@ -401,9 +569,48 @@
     const insertion = `${leading}${token}${trailing}`;
     draftText = `${before}${insertion}${after}`;
     const caret = start + insertion.length;
+    closeFileMentionPopup();
     queueMicrotask(() => {
       textareaEl?.focus();
       textareaEl?.setSelectionRange(caret, caret);
+      syncHighlightScroll();
+    });
+  }
+
+  /** Mouse selection of a host suggestion: files insert; directories refine and re-query. */
+  function selectFileMentionSuggestion(item: FileMentionSuggestionItem) {
+    if (!canSend) return;
+    const active = mentionAutocompleteSession.getState().activeQuery;
+    if (!active) return;
+
+    if (item.kind === 'directory') {
+      const refined = refineActiveFileMentionDirectory(
+        draftText,
+        { start: active.start, end: active.end },
+        item.insertionPath,
+      );
+      draftText = refined.text;
+      // Clear prior list while the refined directory query is requested.
+      closeFileMentionPopup();
+      queueMicrotask(() => {
+        textareaEl?.focus();
+        textareaEl?.setSelectionRange(refined.caret, refined.caret);
+        syncHighlightScroll();
+        // Re-parse @insertionPath/ and request children under that directory.
+        notifyMentionAutocompleteCaret();
+      });
+      return;
+    }
+
+    if (item.kind !== 'file') return;
+    const { token } = allocateDisplayToken(mentionBindings, item.insertionPath, item.label);
+    if (!token) return;
+    const replaced = replaceActiveFileMentionQuery(draftText, { start: active.start, end: active.end }, token);
+    draftText = replaced.text;
+    closeFileMentionPopup();
+    queueMicrotask(() => {
+      textareaEl?.focus();
+      textareaEl?.setSelectionRange(replaced.caret, replaced.caret);
       syncHighlightScroll();
     });
   }
@@ -418,6 +625,25 @@
     const el = e.currentTarget as HTMLTextAreaElement;
     draftText = el.value;
     syncHighlightScroll();
+    notifyMentionAutocompleteCaret();
+  }
+
+  function onDraftSelectOrKeyup(e?: Event) {
+    // Arrow/Enter/Tab/Escape keyups must not re-run caret sync while the popup
+    // is open — that would re-enter the autocomplete session and can reset the
+    // keyboard highlight (activeIndex) or briefly clear items.
+    if (
+      mentionAutocomplete.open &&
+      e instanceof KeyboardEvent &&
+      (e.key === 'ArrowDown' ||
+        e.key === 'ArrowUp' ||
+        e.key === 'Enter' ||
+        e.key === 'Tab' ||
+        e.key === 'Escape')
+    ) {
+      return;
+    }
+    notifyMentionAutocompleteCaret();
   }
 
   function closeAddContextMenu() {
@@ -535,6 +761,50 @@
       isComposing: e.isComposing,
       keyCode: e.keyCode,
     };
+
+    // File-mention popup policy composes ahead of composer submit (T01/T02).
+    const mentionKeyOpts = {
+      popupOpen: mentionAutocomplete.open,
+      itemCount: mentionAutocomplete.items.length,
+      activeIndex: mentionActiveIndex,
+      activeSelectable:
+        mentionActiveIndex >= 0 &&
+        mentionActiveIndex < mentionAutocomplete.items.length,
+    };
+    const mentionIntent = resolveFileMentionKeyIntent(policyInput, mentionKeyOpts);
+    if (mentionIntent.kind !== 'none') {
+      if (shouldPreventDefaultForFileMentionKey(policyInput, mentionKeyOpts)) {
+        e.preventDefault();
+      }
+      if (mentionIntent.kind === 'dismiss') {
+        closeFileMentionPopup();
+        return;
+      }
+      if (mentionIntent.kind === 'move') {
+        mentionActiveIndex = mentionIntent.activeIndex;
+        queueMicrotask(() => scrollActiveMentionOptionIntoView(mentionIntent.activeIndex));
+        return;
+      }
+      if (mentionIntent.kind === 'accept') {
+        acceptFileMentionAtIndex(mentionIntent.activeIndex);
+        return;
+      }
+    }
+    // Open empty/error popup: pure policy returns none (no option to accept),
+    // but Enter/Tab must not fall through to send until the popup is dismissed.
+    if (
+      mentionAutocomplete.open &&
+      (e.key === 'Enter' || e.key === 'Tab') &&
+      !e.shiftKey &&
+      !e.ctrlKey &&
+      !e.metaKey &&
+      !e.isComposing &&
+      e.keyCode !== 229
+    ) {
+      e.preventDefault();
+      return;
+    }
+
     const keyOpts = { mode, liveInjectEligible };
     const intent = resolveComposerKeyIntent(policyInput, keyOpts);
     if (intent.kind === 'none') return;
@@ -1009,8 +1279,65 @@
       oninput={onDraftInput}
       onscroll={syncHighlightScroll}
       onkeydown={onKeydown}
+      onkeyup={onDraftSelectOrKeyup}
+      onselect={onDraftSelectOrKeyup}
+      onclick={onDraftSelectOrKeyup}
+      onblur={onComposerTextareaBlur}
+      oncompositionstart={onMentionCompositionStart}
+      oncompositionend={onMentionCompositionEnd}
       spellcheck="true"
+      aria-autocomplete="list"
+      aria-controls={mentionPopupVisible ? FILE_MENTION_LISTBOX_ID : undefined}
+      aria-expanded={mentionPopupVisible ? 'true' : 'false'}
+      aria-haspopup="listbox"
+      aria-activedescendant={mentionPopupVisible ? mentionActiveDescendant : undefined}
     ></textarea>
+
+    {#if mentionPopupVisible}
+      <div
+        bind:this={mentionListboxRegion}
+        id={FILE_MENTION_LISTBOX_ID}
+        class="file-mention-listbox"
+        role="listbox"
+        aria-label={FILE_MENTION_LISTBOX_LABEL}
+        data-testid="file-mention-listbox"
+        data-outcome={mentionAutocomplete.outcome}
+      >
+        {#if mentionStatus}
+          <div
+            class="file-mention-listbox__status"
+            role="status"
+            aria-live="polite"
+            data-testid="file-mention-status"
+          >
+            {mentionStatus}
+          </div>
+        {/if}
+        {#each mentionAutocomplete.items as item, index (item.id)}
+          <button
+            type="button"
+            id={fileMentionOptionId(index)}
+            class="file-mention-listbox__item"
+            class:file-mention-listbox__item--directory={item.kind === 'directory'}
+            class:file-mention-listbox__item--active={index === mentionActiveIndex}
+            role="option"
+            aria-selected={index === mentionActiveIndex ? 'true' : 'false'}
+            aria-label={item.kind === 'directory' ? `${item.label}/` : item.label}
+            tabindex="-1"
+            data-testid="file-mention-option"
+            data-kind={item.kind}
+            data-insertion-path={item.insertionPath}
+            onmousedown={onMentionOptionMouseDown}
+            onmouseenter={() => onMentionOptionMouseEnter(index)}
+            onclick={() => selectFileMentionSuggestion(item)}
+          >
+            <span class="file-mention-listbox__item-label">
+              {item.kind === 'directory' ? `${item.label}/` : item.label}
+            </span>
+          </button>
+        {/each}
+      </div>
+    {/if}
   </div>
 
   <div class="flex items-center justify-between gap-2 pt-1" onkeydown={onKeydown}>

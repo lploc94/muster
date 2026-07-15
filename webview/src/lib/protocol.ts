@@ -400,6 +400,53 @@ export type ExtMessage =
       fileName: string;
       sourceRevision: number;
       exportedAt: string;
+    }
+  /**
+   * Host response to `requestFileMentionSuggestions`.
+   * Success returns relative suggestion items only (never absolute paths, cwd,
+   * or file contents). Failures use bounded codes with no free-form message.
+   */
+  | FileMentionSuggestionsMessage;
+
+/** Kind of a single autocomplete suggestion item. */
+export type FileMentionSuggestionKind = 'file' | 'directory';
+
+/** Bounded ascent from authoritative task/draft cwd (0 current, 1 parent, 2 grandparent). */
+export type FileMentionParentDepth = 0 | 1 | 2;
+
+/** Relative-only suggestion returned by the host for @ autocomplete. */
+export interface FileMentionSuggestionItem {
+  id: string;
+  kind: FileMentionSuggestionKind;
+  label: string;
+  /** Relative path inserted into the composer mention (never absolute). */
+  insertionPath: string;
+}
+
+export type FileMentionSuggestionsErrorCode =
+  | 'invalidRequest'
+  | 'unavailable'
+  | 'listingFailed';
+
+/**
+ * Host → webview suggestion payload.
+ * Success may omit `ok` (implicit true) or set `ok: true`.
+ * Failure requires `ok: false` and a bounded `code`.
+ */
+export type FileMentionSuggestionsMessage =
+  | {
+      type: 'fileMentionSuggestions';
+      ok?: true;
+      requestId: string;
+      parentDepth: FileMentionParentDepth;
+      relativeQuery: string;
+      items: FileMentionSuggestionItem[];
+    }
+  | {
+      type: 'fileMentionSuggestions';
+      ok: false;
+      requestId: string;
+      code: FileMentionSuggestionsErrorCode;
     };
 
 export type AskAnswer = { selected: string[]; freeText: string | null };
@@ -466,6 +513,17 @@ export type OutMessage =
   | { type: 'pickFile' }
   | { type: 'browseWorkspaceFiles' }
   | { type: 'resolveFileDrop'; candidates: string[] }
+  /**
+   * Request @ autocomplete suggestions for depth 0–2 relative to the
+   * authoritative task/draft cwd. Webview never supplies a filesystem path.
+   */
+  | {
+      type: 'requestFileMentionSuggestions';
+      requestId: string;
+      taskId?: string;
+      parentDepth: FileMentionParentDepth;
+      relativeQuery: string;
+    }
   /**
    * When the webview has file bytes but no filesystem path (Finder → sandboxed
    * webview), host writes a temp copy and replies with `filePicked` absolute path.
@@ -1058,9 +1116,91 @@ export function isExtMessage(data: unknown): data is ExtMessage {
         isExportResultTimestamp(data.exportedAt)
       );
 
+    case 'fileMentionSuggestions':
+      return isFileMentionSuggestionsMessage(data);
+
     default:
       return false;
   }
+}
+
+const FILE_MENTION_SUGGESTION_ERROR_CODES = new Set<FileMentionSuggestionsErrorCode>([
+  'invalidRequest',
+  'unavailable',
+  'listingFailed',
+]);
+
+/** Relative mention paths for autocomplete — absolute/drive/UNC rejected; up to two leading `../` allowed. */
+function isRelativeFileMentionPath(v: unknown): v is string {
+  if (typeof v !== 'string') return false;
+  const value = v.trim();
+  if (value.length === 0) return false;
+  if (value.startsWith('/') || value.startsWith('\\')) return false;
+  if (value.startsWith('//') || value.startsWith('\\\\')) return false;
+  if (/^[A-Za-z]:/.test(value)) return false;
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i);
+    if (code < 0x20 || code === 0x7f) return false;
+  }
+  const normalized = value.replace(/\\/g, '/');
+  let rest = normalized;
+  let parentDepth = 0;
+  while (parentDepth < 3) {
+    if (rest.startsWith('../')) {
+      parentDepth += 1;
+      rest = rest.slice(3);
+      continue;
+    }
+    break;
+  }
+  if (parentDepth > 2) return false;
+  // Bare ../ or ../../ is not a file/directory insertion path.
+  if (rest.length === 0) return false;
+  if (rest === '.' || rest === '..' || rest.startsWith('./') || rest.startsWith('../')) return false;
+  const segments = rest.split('/');
+  for (const segment of segments) {
+    if (segment === '' || segment === '.' || segment === '..') return false;
+  }
+  return true;
+}
+
+function isFileMentionSuggestionItem(v: unknown): v is FileMentionSuggestionItem {
+  if (!isRecord(v)) return false;
+  if (!hasOnlyKeys(v, ['id', 'kind', 'label', 'insertionPath'])) return false;
+  if (!isString(v.id) || v.id.trim().length === 0) return false;
+  if (v.kind !== 'file' && v.kind !== 'directory') return false;
+  if (!isString(v.label) || v.label.trim().length === 0) return false;
+  if (v.label.includes('/') || v.label.includes('\\')) return false;
+  return isRelativeFileMentionPath(v.insertionPath);
+}
+
+function isFileMentionSuggestionsMessage(data: Record<string, unknown>): boolean {
+  if (!isString(data.requestId) || data.requestId.trim().length === 0) return false;
+
+  if (data.ok === false) {
+    return (
+      hasOnlyKeys(data, ['type', 'ok', 'requestId', 'code']) &&
+      isString(data.code) &&
+      FILE_MENTION_SUGGESTION_ERROR_CODES.has(data.code as FileMentionSuggestionsErrorCode)
+    );
+  }
+
+  // Success: ok may be omitted or true.
+  if (data.ok !== undefined && data.ok !== true) return false;
+  const allowed =
+    data.ok === true
+      ? (['type', 'ok', 'requestId', 'parentDepth', 'relativeQuery', 'items'] as const)
+      : (['type', 'requestId', 'parentDepth', 'relativeQuery', 'items'] as const);
+  if (!hasOnlyKeys(data, allowed)) return false;
+  if (data.parentDepth !== 0 && data.parentDepth !== 1 && data.parentDepth !== 2) return false;
+  if (!isString(data.relativeQuery)) return false;
+  // relativeQuery may be empty (bare @) but must not carry control chars.
+  for (let i = 0; i < data.relativeQuery.length; i += 1) {
+    const code = data.relativeQuery.charCodeAt(i);
+    if (code < 0x20 || code === 0x7f) return false;
+  }
+  if (!Array.isArray(data.items)) return false;
+  return data.items.every(isFileMentionSuggestionItem);
 }
 
 /**

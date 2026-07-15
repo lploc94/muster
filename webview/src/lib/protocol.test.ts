@@ -813,3 +813,238 @@ describe('runtime handoff protocol', () => {
     ).toBe(true);
   });
 });
+
+describe('file mention suggestion protocol', () => {
+  it('posts a bounded requestFileMentionSuggestions OutMessage', () => {
+    vi.mocked(vscode.postMessage).mockClear();
+
+    const message: OutMessage = {
+      type: 'requestFileMentionSuggestions',
+      requestId: 'req-1',
+      taskId: 'task-1',
+      parentDepth: 0,
+      relativeQuery: 'src',
+    };
+    post(message);
+
+    expect(vscode.postMessage).toHaveBeenCalledWith({
+      type: 'requestFileMentionSuggestions',
+      requestId: 'req-1',
+      taskId: 'task-1',
+      parentDepth: 0,
+      relativeQuery: 'src',
+    });
+    // Webview must never send a cwd or absolute path for listing.
+    expect(JSON.stringify(message)).not.toContain('cwd');
+    expect(JSON.stringify(message)).not.toContain('/workspace');
+  });
+
+  it('allows parentDepth 1 and 2 on request and success responses', () => {
+    for (const parentDepth of [1, 2] as const) {
+      const request: OutMessage = {
+        type: 'requestFileMentionSuggestions',
+        requestId: `req-depth-${parentDepth}`,
+        parentDepth,
+        relativeQuery: parentDepth === 1 ? '' : 'lib/',
+      };
+      expect(JSON.stringify(request)).not.toContain('cwd');
+
+      expect(
+        isExtMessage({
+          type: 'fileMentionSuggestions',
+          requestId: `req-depth-${parentDepth}`,
+          parentDepth,
+          relativeQuery: parentDepth === 1 ? '' : 'lib/',
+          items: [
+            {
+              id: parentDepth === 1 ? 'dir:../sibling' : 'file:../../lib/util.ts',
+              kind: parentDepth === 1 ? 'directory' : 'file',
+              label: parentDepth === 1 ? 'sibling' : 'util.ts',
+              insertionPath: parentDepth === 1 ? '../sibling' : '../../lib/util.ts',
+            },
+          ],
+        }),
+      ).toBe(true);
+    }
+  });
+
+  it('allows optional taskId omission for draft composer scope', () => {
+    vi.mocked(vscode.postMessage).mockClear();
+
+    const message: OutMessage = {
+      type: 'requestFileMentionSuggestions',
+      requestId: 'req-draft',
+      parentDepth: 0,
+      relativeQuery: '',
+    };
+    post(message);
+
+    expect(vscode.postMessage).toHaveBeenCalledWith(message);
+  });
+
+  it('accepts a successful fileMentionSuggestions response with relative items only', () => {
+    expect(
+      isExtMessage({
+        type: 'fileMentionSuggestions',
+        requestId: 'req-1',
+        parentDepth: 0,
+        relativeQuery: '',
+        items: [
+          {
+            id: 'dir:src',
+            kind: 'directory',
+            label: 'src',
+            insertionPath: 'src',
+          },
+          {
+            id: 'file:README.md',
+            kind: 'file',
+            label: 'README.md',
+            insertionPath: 'README.md',
+          },
+        ],
+      }),
+    ).toBe(true);
+  });
+
+  it('accepts a failed fileMentionSuggestions response with bounded error codes', () => {
+    for (const code of ['invalidRequest', 'unavailable', 'listingFailed'] as const) {
+      expect(
+        isExtMessage({
+          type: 'fileMentionSuggestions',
+          requestId: 'req-1',
+          ok: false,
+          code,
+        }),
+      ).toBe(true);
+    }
+  });
+
+  it('accepts the explicit success envelope with ok: true', () => {
+    expect(
+      isExtMessage({
+        type: 'fileMentionSuggestions',
+        ok: true,
+        requestId: 'req-1',
+        parentDepth: 0,
+        relativeQuery: 're',
+        items: [
+          {
+            id: 'file:README.md',
+            kind: 'file',
+            label: 'README.md',
+            insertionPath: 'README.md',
+          },
+        ],
+      }),
+    ).toBe(true);
+  });
+
+  it('rejects malformed fileMentionSuggestions payloads', () => {
+    const bad = [
+      { type: 'fileMentionSuggestions' },
+      {
+        type: 'fileMentionSuggestions',
+        requestId: 'req-1',
+        parentDepth: 0,
+        relativeQuery: '',
+        // missing items
+      },
+      {
+        type: 'fileMentionSuggestions',
+        requestId: 'req-1',
+        parentDepth: 3, // depth > 2 rejected at the wire guard
+        relativeQuery: '',
+        items: [],
+      },
+      {
+        type: 'fileMentionSuggestions',
+        requestId: 'req-1',
+        parentDepth: -1,
+        relativeQuery: '',
+        items: [],
+      },
+      {
+        type: 'fileMentionSuggestions',
+        requestId: 'req-1',
+        parentDepth: 0,
+        relativeQuery: '',
+        items: [
+          {
+            id: 'file:a',
+            kind: 'file',
+            label: 'a',
+            insertionPath: '/etc/passwd', // absolute rejected
+          },
+        ],
+      },
+      {
+        type: 'fileMentionSuggestions',
+        requestId: 'req-1',
+        parentDepth: 0,
+        relativeQuery: '',
+        items: [
+          {
+            id: 'file:a',
+            kind: 'file',
+            label: 'a',
+            insertionPath: 'C:\\Windows\\a', // drive path rejected
+          },
+        ],
+      },
+      {
+        type: 'fileMentionSuggestions',
+        requestId: 'req-1',
+        parentDepth: 0,
+        relativeQuery: '',
+        items: [
+          {
+            id: 'file:a',
+            kind: 'file',
+            label: 'a',
+            insertionPath: '../../../secret', // depth > 2 rejected
+          },
+        ],
+      },
+      {
+        type: 'fileMentionSuggestions',
+        requestId: 'req-1',
+        parentDepth: 0,
+        relativeQuery: '',
+        items: [
+          {
+            id: 'file:a',
+            kind: 'symlink',
+            label: 'a',
+            insertionPath: 'a',
+          },
+        ],
+      },
+      {
+        type: 'fileMentionSuggestions',
+        requestId: 'req-1',
+        ok: false,
+        code: 'ENOENT', // raw fs codes rejected
+      },
+      {
+        type: 'fileMentionSuggestions',
+        requestId: 'req-1',
+        ok: false,
+        code: 'invalidRequest',
+        message: 'boom', // no free-form message channel
+      },
+      {
+        type: 'fileMentionSuggestions',
+        requestId: 'req-1',
+        parentDepth: 0,
+        relativeQuery: '',
+        items: [],
+        cwd: '/workspace', // host must never echo cwd
+      },
+    ];
+
+    for (const message of bad) {
+      expect(isExtMessage(message), JSON.stringify(message)).toBe(false);
+    }
+  });
+});

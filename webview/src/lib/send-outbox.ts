@@ -8,6 +8,8 @@ export interface OutboxEntry {
   taskId?: string;
   text: string;
   llmText?: string;
+  /** Display mention token -> agent-facing path, retained so a rejected send can retry safely. */
+  mentionBindings?: Array<[string, string]>;
   backend?: string;
   model?: string;
   continuationOf?: string;
@@ -26,11 +28,29 @@ type VsCodeStateApi = {
   setState?: (state: unknown) => void;
 };
 
+function normalizeMentionBindings(value: unknown): Array<[string, string]> | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const bindings = value.filter(
+    (entry): entry is [string, string] =>
+      Array.isArray(entry) &&
+      entry.length === 2 &&
+      typeof entry[0] === 'string' &&
+      entry[0].length > 0 &&
+      typeof entry[1] === 'string' &&
+      entry[1].length > 0,
+  );
+  return bindings.length > 0 ? bindings : undefined;
+}
+
 function readState(api: VsCodeStateApi | undefined): OutboxEntry[] {
   try {
     const raw = api?.getState?.() as { sendOutbox?: OutboxEntry[] } | undefined;
     const list = raw?.sendOutbox;
-    return Array.isArray(list) ? list : [];
+    if (!Array.isArray(list)) return [];
+    return list.map((entry) => ({
+      ...entry,
+      mentionBindings: normalizeMentionBindings(entry?.mentionBindings),
+    }));
   } catch {
     return [];
   }
