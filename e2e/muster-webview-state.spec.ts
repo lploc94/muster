@@ -4967,10 +4967,12 @@ test.describe('Owning-root task tree navigation', () => {
 
     await expect(page.getByText('only child transcript')).toBeVisible();
     await expect(page.getByText('Kick off children')).toHaveCount(0);
-    // Child focus shows breadcrumb (I3) and/or parent control (I1).
-    await expect(
-      page.getByTestId('task-tree-breadcrumb').or(page.getByTestId('task-tree-parent')),
-    ).toBeVisible();
+    // Child focus: wide view shows breadcrumb; parent control always present in DOM
+    // (may be CSS-hidden when breadcrumb is shown).
+    await expect(page.getByTestId('task-tree-nav')).toBeVisible();
+    const hasCrumb = await page.getByTestId('task-tree-breadcrumb').count();
+    const hasParent = await page.getByTestId('task-tree-parent').count();
+    expect(hasCrumb + hasParent).toBeGreaterThan(0);
   });
 });
 

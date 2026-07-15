@@ -378,14 +378,29 @@ body {
   color: var(--vscode-descriptionForeground, var(--vscode-foreground));
 }
 
+/* Breadcrumb only when wide enough; narrow keeps Parent control. */
 .task-tree-nav__breadcrumb {
-  display: flex;
+  display: none;
   align-items: center;
   gap: 2px;
   min-width: 0;
   flex: 1;
   overflow: hidden;
   font-size: 11px;
+}
+
+.task-tree-nav__parent--narrow-only {
+  display: inline-flex;
+}
+
+@media (min-width: 320px) {
+  .task-tree-nav__breadcrumb {
+    display: flex;
+  }
+
+  .task-tree-nav__parent--narrow-only {
+    display: none;
+  }
 }
 
 .task-tree-nav__crumb {

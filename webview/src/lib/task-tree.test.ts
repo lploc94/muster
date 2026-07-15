@@ -7,6 +7,7 @@ import {
   countTaskTree,
   defaultCollapsedIds,
   flattenTaskTree,
+  expandPathInCollapsed,
   flattenTaskTreeCollapsible,
   formatTaskTreeSummary,
   isTaskTreeActive,
@@ -106,5 +107,20 @@ describe('buildTaskTree', () => {
     expect(flat.map((n) => n.task.id)).toEqual(['root', 'a']);
     expect(taskRoleIcon('coordinator')).toBe('codicon-type-hierarchy-sub');
     expect(taskRoleIcon('worker')).toBe('codicon-tools');
+  });
+
+  it('expands ancestor path so focused deep node stays visible', () => {
+    const nodes = [
+      summary({ id: 'root', role: 'coordinator' }),
+      summary({ id: 'a', parentId: 'root' }),
+      summary({ id: 'nested', parentId: 'a' }),
+      summary({ id: 'deep', parentId: 'nested' }),
+    ];
+    const tree = buildTaskTree(nodes);
+    const collapsed = defaultCollapsedIds(tree, 1);
+    const path = breadcrumbPath(nodes[3]!, nodes);
+    const opened = expandPathInCollapsed(collapsed, path);
+    const flat = flattenTaskTreeCollapsible(tree, opened);
+    expect(flat.map((n) => n.task.id)).toContain('deep');
   });
 });

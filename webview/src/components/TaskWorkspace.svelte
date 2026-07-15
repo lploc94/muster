@@ -23,6 +23,7 @@
     compactBreadcrumb,
     countTaskTree,
     defaultCollapsedIds,
+    expandPathInCollapsed,
     flattenTaskTreeCollapsible,
     formatTaskTreeSummary,
     parentSummary,
@@ -55,13 +56,18 @@
   const runtime = $derived(focused ? effectiveRuntimeActivity(focused) : null);
   const treeCounts = $derived(countTaskTree(tasks.subtree));
   const treeForest = $derived(buildTaskTree(tasks.subtree));
-  const collapsedIds = $derived(
-    collapsedOverride ?? defaultCollapsedIds(treeForest, 2),
+  const focusedPath = $derived(
+    focused ? breadcrumbPath(focused, tasks.subtree) : [],
   );
+  const collapsedIds = $derived.by(() => {
+    if (collapsedOverride) return collapsedOverride;
+    const base = defaultCollapsedIds(treeForest, 2);
+    return focused ? expandPathInCollapsed(base, focusedPath) : base;
+  });
   const treeRows = $derived(flattenTaskTreeCollapsible(treeForest, collapsedIds));
   const parentTask = $derived(focused ? parentSummary(focused, tasks.subtree) : undefined);
   const crumbs = $derived(
-    focused ? compactBreadcrumb(breadcrumbPath(focused, tasks.subtree), 3) : [],
+    focusedPath.length > 0 ? compactBreadcrumb(focusedPath, 3) : [],
   );
   const showBreadcrumb = $derived(!!focused?.parentId && crumbs.length > 1);
   const showTaskNav = $derived(
@@ -359,37 +365,43 @@
         data-testid="task-tree-nav"
         style="border-color: var(--vscode-panel-border);"
       >
-        {#if showBreadcrumb}
-          <nav class="task-tree-nav__breadcrumb" aria-label="Task path" data-testid="task-tree-breadcrumb">
-            {#each crumbs as crumb, i (crumb.task.id)}
-              {#if crumb.ellipsisBefore}
-                <span class="task-tree-nav__crumb-sep" aria-hidden="true">…</span>
-                <span class="task-tree-nav__crumb-sep" aria-hidden="true">›</span>
-              {:else if i > 0}
-                <span class="task-tree-nav__crumb-sep" aria-hidden="true">›</span>
-              {/if}
-              {#if crumb.task.id === focused.id}
-                <span class="task-tree-nav__crumb task-tree-nav__crumb--current" aria-current="page">
-                  {shortGoal(crumb.task.goal)}
-                </span>
-              {:else}
-                <button
-                  type="button"
-                  class="task-tree-nav__crumb"
-                  data-testid="task-tree-breadcrumb-item"
-                  data-task-id={crumb.task.id}
-                  use:tip={crumb.task.goal}
-                  onclick={() => navSelectTask(crumb.task.id)}
-                >
-                  {shortGoal(crumb.task.goal)}
-                </button>
-              {/if}
-            {/each}
-          </nav>
-        {:else if focused.parentId}
+        {#if focused.parentId}
+          {#if showBreadcrumb}
+            <nav
+              class="task-tree-nav__breadcrumb"
+              aria-label="Task path"
+              data-testid="task-tree-breadcrumb"
+            >
+              {#each crumbs as crumb, i (crumb.task.id)}
+                {#if crumb.ellipsisBefore}
+                  <span class="task-tree-nav__crumb-sep" aria-hidden="true">…</span>
+                  <span class="task-tree-nav__crumb-sep" aria-hidden="true">›</span>
+                {:else if i > 0}
+                  <span class="task-tree-nav__crumb-sep" aria-hidden="true">›</span>
+                {/if}
+                {#if crumb.task.id === focused.id}
+                  <span class="task-tree-nav__crumb task-tree-nav__crumb--current" aria-current="page">
+                    {shortGoal(crumb.task.goal)}
+                  </span>
+                {:else}
+                  <button
+                    type="button"
+                    class="task-tree-nav__crumb"
+                    data-testid="task-tree-breadcrumb-item"
+                    data-task-id={crumb.task.id}
+                    use:tip={crumb.task.goal}
+                    onclick={() => navSelectTask(crumb.task.id)}
+                  >
+                    {shortGoal(crumb.task.goal)}
+                  </button>
+                {/if}
+              {/each}
+            </nav>
+          {/if}
           <button
             type="button"
             class="task-tree-nav__parent"
+            class:task-tree-nav__parent--narrow-only={showBreadcrumb}
             data-testid="task-tree-parent"
             aria-label={parentTask ? `Go to parent: ${parentTask.goal}` : 'Go to parent task'}
             use:tip={parentTask?.goal ?? 'Parent task'}

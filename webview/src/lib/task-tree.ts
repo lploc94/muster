@@ -202,3 +202,18 @@ export function defaultCollapsedIds(
   for (const root of roots) visit(root);
   return collapsed;
 }
+
+/**
+ * Ensure focused task remains visible: expand every ancestor on the path
+ * (remove from collapsed set). Does not force-expand siblings.
+ */
+export function expandPathInCollapsed(
+  collapsed: ReadonlySet<string>,
+  path: readonly TaskSummary[],
+): Set<string> {
+  const next = new Set(collapsed);
+  for (const node of path) {
+    next.delete(node.id);
+  }
+  return next;
+}
