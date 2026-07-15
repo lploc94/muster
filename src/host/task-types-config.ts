@@ -138,6 +138,15 @@ export function loadTaskTypeRegistry(
  * Pick the first explicitly defined object-setting value by scope priority.
  * Use with `WorkspaceConfiguration.inspect()` so workspace `{}` overrides
  * package defaults (VS Code `get()` merges object defaults into empty maps).
+ *
+ * When NO scope is set explicitly, fall back to the baked-in
+ * `MUSTER_DEFAULT_TASK_TYPES` (derived from this build's package.json) rather
+ * than `inspect().defaultValue`. A running extension host can report an
+ * `undefined` defaultValue when its manifest is stale / not yet re-registered
+ * after an update; that emptiness would otherwise block create/delegate and
+ * render the Settings panel as "Invalid · 0 of 32". Seeding the shipped
+ * defaults keeps the map usable and immune to manifest staleness, while an
+ * explicit `{}` at any scope is still honored above (deliberate opt-out).
  */
 export function pickExplicitTaskTypesValue(inspected: {
   workspaceFolderValue?: unknown;
@@ -149,7 +158,7 @@ export function pickExplicitTaskTypesValue(inspected: {
   if (inspected.workspaceValue !== undefined) return inspected.workspaceValue;
   if (inspected.globalValue !== undefined) return inspected.globalValue;
   if (inspected.defaultValue !== undefined) return inspected.defaultValue;
-  return undefined;
+  return MUSTER_DEFAULT_TASK_TYPES;
 }
 
 export function buildTaskTypesSettingsSnapshot(

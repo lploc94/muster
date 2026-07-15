@@ -212,6 +212,25 @@ describe('task-types host config', () => {
     ).toEqual(MUSTER_DEFAULT_TASK_TYPES);
   });
 
+  it('pickExplicitTaskTypesValue seeds shipped defaults when no scope is set (stale manifest)', () => {
+    // Nothing explicit and `inspect().defaultValue` is undefined (stale/not-yet-registered
+    // manifest). Seed the baked-in defaults instead of an empty/undefined map so the panel
+    // stays valid and create/delegate is not blocked.
+    expect(pickExplicitTaskTypesValue({})).toEqual(MUSTER_DEFAULT_TASK_TYPES);
+    expect(
+      pickExplicitTaskTypesValue({
+        workspaceFolderValue: undefined,
+        workspaceValue: undefined,
+        globalValue: undefined,
+        defaultValue: undefined,
+      }),
+    ).toEqual(MUSTER_DEFAULT_TASK_TYPES);
+    // An explicit `{}` at any scope is still a deliberate opt-out — never re-seeded,
+    // even when defaultValue is absent.
+    expect(pickExplicitTaskTypesValue({ globalValue: {} })).toEqual({});
+    expect(pickExplicitTaskTypesValue({ workspaceValue: {} })).toEqual({});
+  });
+
   it('validate rejects invalid role / briefKind / duplicate ids (no silent normalize)', () => {
     expect(
       validateTaskTypesUpdate({
