@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { canPromoteTurn } from './scheduler';
+import { canPromoteTurn, dependenciesBlockTask, dependencyTerminalOutcome } from './scheduler';
 import { DEFAULT_RESOURCE_LIMITS } from './limits';
-import type { TaskStoreFile } from './types';
+import type { MusterTask, TaskDependency, TaskStoreFile, TaskVerdict } from './types';
 
 function baseFile(): TaskStoreFile {
   return {
@@ -138,5 +138,105 @@ describe('scheduler', () => {
       ok: false,
       reason: 'dependencies not satisfied',
     });
+  });
+});
+
+describe('verdict-gated dependencies (verify-gate-loop Phase A)', () => {
+  function verdict(status: TaskVerdict['status']): TaskVerdict {
+    return { status, source: 'worker', at: 't0' };
+  }
+
+  function makeTask(partial: Partial<MusterTask> & { id: string }): MusterTask {
+    return {
+      role: 'worker',
+      lifecycle: 'open',
+      goal: 'g',
+      parentId: 'root',
+      dependencies: [],
+      backend: 'fake',
+      capabilities: [],
+      executionPolicy: {
+        maxTurns: 10,
+        maxAutomaticRetries: 0,
+        turnTimeoutMs: 60_000,
+        taskTimeoutMs: 120_000,
+      },
+      revision: 0,
+      createdAt: 't',
+      updatedAt: 't',
+      ...partial,
+    };
+  }
+
+  function gatedFile(dep: TaskDependency, producer: Partial<MusterTask>): TaskStoreFile {
+    return {
+      schemaVersion: 2,
+      revision: 1,
+      tasks: {
+        verify: makeTask({ id: 'verify', ...producer }),
+        impl: makeTask({ id: 'impl', dependencies: [dep] }),
+      },
+      turns: {},
+      messages: {},
+      operations: {},
+      cancelRequests: {},
+    };
+  }
+
+  const failGate: TaskDependency = {
+    taskId: 'verify',
+    requiredOutcome: 'succeeded',
+    onUnsatisfied: 'fail',
+    requiredVerdict: 'pass',
+  };
+
+  it('a failing verdict on a succeeded producer seals the dependent as failed (no hang)', () => {
+    const file = gatedFile(failGate, {
+      lifecycle: 'succeeded',
+      taskResult: { version: 1, revision: 1, summary: 's', verdict: verdict('fail') },
+    });
+    expect(dependencyTerminalOutcome(file, 'impl')).toBe('failed');
+    expect(dependenciesBlockTask(file, 'impl')).toBe(true);
+  });
+
+  it('an absent verdict on a succeeded producer also seals the dependent as failed', () => {
+    const file = gatedFile(failGate, {
+      lifecycle: 'succeeded',
+      taskResult: { version: 1, revision: 1, summary: 's' },
+    });
+    expect(dependencyTerminalOutcome(file, 'impl')).toBe('failed');
+  });
+
+  it('a passing verdict satisfies the gate: no terminal seal and not blocked', () => {
+    const file = gatedFile(failGate, {
+      lifecycle: 'succeeded',
+      taskResult: { version: 1, revision: 1, summary: 's', verdict: verdict('pass') },
+    });
+    expect(dependencyTerminalOutcome(file, 'impl')).toBeUndefined();
+    expect(dependenciesBlockTask(file, 'impl')).toBe(false);
+  });
+
+  it('onUnsatisfied:block with a failing verdict blocks but does not seal (Phase B remediation)', () => {
+    const blockGate: TaskDependency = { ...failGate, onUnsatisfied: 'block' };
+    const file = gatedFile(blockGate, {
+      lifecycle: 'succeeded',
+      taskResult: { version: 1, revision: 1, summary: 's', verdict: verdict('fail') },
+    });
+    expect(dependencyTerminalOutcome(file, 'impl')).toBeUndefined();
+    expect(dependenciesBlockTask(file, 'impl')).toBe(true);
+  });
+
+  it('without requiredVerdict, a failing verdict is ignored (unchanged behavior)', () => {
+    const plainGate: TaskDependency = {
+      taskId: 'verify',
+      requiredOutcome: 'succeeded',
+      onUnsatisfied: 'fail',
+    };
+    const file = gatedFile(plainGate, {
+      lifecycle: 'succeeded',
+      taskResult: { version: 1, revision: 1, summary: 's', verdict: verdict('fail') },
+    });
+    expect(dependencyTerminalOutcome(file, 'impl')).toBeUndefined();
+    expect(dependenciesBlockTask(file, 'impl')).toBe(false);
   });
 });

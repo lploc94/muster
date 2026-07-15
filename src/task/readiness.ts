@@ -53,8 +53,12 @@ function turnsForTask(file: TaskStoreFile, taskId: string): TaskTurn[] {
 function depBlockReasons(file: TaskStoreFile, task: MusterTask): ReadinessReason[] {
   const reasons: ReadinessReason[] = [];
   for (const dep of task.dependencies) {
-    const lifecycle = file.tasks[dep.taskId]?.lifecycle;
-    const outcome = evaluateDependency(dep, lifecycle);
+    const producer = file.tasks[dep.taskId];
+    const outcome = evaluateDependency(
+      dep,
+      producer?.lifecycle,
+      producer?.taskResult?.verdict?.status,
+    );
     if (outcome !== 'satisfied') {
       reasons.push({
         code: 'waiting_dependencies',

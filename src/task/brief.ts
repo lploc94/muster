@@ -87,8 +87,21 @@ export type TaskBriefOverlay = {
   definitionOfDone?: string[];
   readPaths?: string[];
   writePaths?: string[];
-  verification?: { commands?: string[]; manualChecks?: string[] };
+  verification?: {
+    commands?: string[];
+    manualChecks?: string[];
+    hostRun?: boolean;
+    emitVerdict?: boolean;
+  };
 };
+
+/**
+ * Structured-verdict instruction. Appended to a verify brief ONLY when it opts in via
+ * `verification.hostRun` or `verification.emitVerdict` (verify-gate-loop opt-in). The
+ * default verify preamble stays legacy/byte-identical when neither flag is set.
+ */
+const VERDICT_INSTRUCTION_SECTION =
+  "# Verdict\nWhen you finish, call complete_task with a structured verdict {status:'pass'|'fail'|'inconclusive', rationale, criteria[]}. Missing checks or missing evidence => 'inconclusive', never a default 'pass'.";
 
 function clampStringList(items: readonly string[] | undefined, itemMax = 500): string[] | undefined {
   if (!items) return undefined;
@@ -133,6 +146,8 @@ export function mergeBriefFromCreate(args: {
           ...(clampStringList(o.verification.manualChecks)
             ? { manualChecks: clampStringList(o.verification.manualChecks) }
             : {}),
+          ...(o.verification.hostRun === true ? { hostRun: true } : {}),
+          ...(o.verification.emitVerdict === true ? { emitVerdict: true } : {}),
         }
       : base.verification;
 
@@ -169,7 +184,13 @@ export function mergeBriefFromCreate(args: {
 
   if (readPaths && readPaths.length > 0) merged.readPaths = readPaths;
   if (writePaths && writePaths.length > 0) merged.writePaths = writePaths;
-  if (verification && (verification.commands?.length || verification.manualChecks?.length)) {
+  if (
+    verification &&
+    (verification.commands?.length ||
+      verification.manualChecks?.length ||
+      ('hostRun' in verification && verification.hostRun) ||
+      ('emitVerdict' in verification && verification.emitVerdict))
+  ) {
     merged.verification = verification;
   }
 
@@ -235,6 +256,12 @@ export function compileBriefBody(
     let body = lines.join('\n');
     if (body.length > BRIEF_SECTION_MAX) body = body.slice(0, BRIEF_SECTION_MAX);
     optional.push(`# Verification\n${body}`);
+  }
+  // Opt-in only: a verify task that runs the host gate or is asked to self-report a
+  // structured verdict gets the `# Verdict` instruction. Default verify tasks keep the
+  // legacy preamble byte-identical (backward compatible).
+  if (brief.verification?.hostRun === true || brief.verification?.emitVerdict === true) {
+    optional.push(VERDICT_INSTRUCTION_SECTION);
   }
 
   return { role, objective, optional };

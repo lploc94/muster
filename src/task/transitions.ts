@@ -14,6 +14,7 @@ import type {
   TaskRole,
   TaskSealedBy,
   TaskTurn,
+  TaskVerdict,
   TurnDisposition,
   TurnFailureClass,
   TurnInput,
@@ -454,7 +455,12 @@ export function applySuccessfulTurn(
   switch (disposition.kind) {
     case 'complete': {
       // Persist structured TaskResultV1 on propose and seal (W1 dataflow).
-      const taskResult = buildTaskResultFromSummary(disposition.result, task.taskResult);
+      // Attach the optional verify verdict so verdict-aware dependents can gate on it.
+      const taskResult = buildTaskResultFromSummary(
+        disposition.result,
+        task.taskResult,
+        disposition.verdict,
+      );
       // Root tasks: human-gated — propose only; lifecycle stays open (TASK-MANAGEMENT §5.3).
       // Eligible direct children: host parent-orchestration seals with sealedBy.coordinator.
       if (!mayParentSealDirect(task, options.rootChildOrchestrationSeal)) {
@@ -659,6 +665,8 @@ export function setTaskLifecycle(
     reason?: string;
     /** Required on every terminal seal (W4). */
     sealedBy?: TaskSealedBy;
+    /** Optional structured verify verdict to persist on the succeeded result. */
+    verdict?: TaskVerdict;
   },
 ): TransitionResult<MusterTask> {
   const sealedBy = options.sealedBy ?? { kind: 'user' as const };
@@ -703,7 +711,7 @@ export function setTaskLifecycle(
     // Only write TaskResultV1 when a real summary exists — empty string would
     // incorrectly satisfy required inputBindings (W1 / codex-impl-review).
     if (summary !== undefined) {
-      const taskResult = buildTaskResultFromSummary(summary, task.taskResult);
+      const taskResult = buildTaskResultFromSummary(summary, task.taskResult, options.verdict);
       patch.taskResult = taskResult;
       patch.result = taskResult.summary;
     }
@@ -1251,7 +1259,12 @@ function boundDisposition(
 ): TurnDisposition {
   switch (disposition.kind) {
     case 'complete':
-      return { kind: 'complete', result: clampString(disposition.result, limits.maxResult) };
+      // Pass the structured verdict through unchanged (already normalized/clamped upstream).
+      return {
+        kind: 'complete',
+        result: clampString(disposition.result, limits.maxResult),
+        ...(disposition.verdict ? { verdict: disposition.verdict } : {}),
+      };
     case 'fail':
       return { kind: 'fail', error: clampString(disposition.error, limits.maxError) };
     default:
