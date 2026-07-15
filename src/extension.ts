@@ -49,6 +49,10 @@ import {
 } from './host/composer-selection';
 import { pickWorkspaceFileMentionPath } from './host/workspace-files';
 import { resolveDroppedFileMention } from './host/file-mentions';
+import {
+  listFileMentionSuggestions,
+  type FileMentionSuggestionsRequest,
+} from './host/file-mention-suggestions';
 import { routeSendLiveInput } from './host/live-input';
 import { routeDeleteQueuedTurn, routeEditQueuedTurn } from './host/queued-turn-mutations';
 import { routeExportTask } from './host/task-export-route';
@@ -542,6 +546,105 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       }
     } catch {
       this.postCommandError('Unable to browse workspace files.');
+    }
+  }
+
+  /**
+   * Current-directory @ autocomplete (M011 S01).
+   * Derives cwd from the existing task or draft workspace context — never from
+   * a webview-supplied path. Posts a bounded relative-only response keyed by
+   * requestId. Diagnostics log request id / scope / code only (no cwd, paths,
+   * or file contents).
+   */
+  private async handleRequestFileMentionSuggestions(data: unknown): Promise<void> {
+    const payload =
+      data && typeof data === 'object'
+        ? (data as {
+            requestId?: unknown;
+            taskId?: unknown;
+            parentDepth?: unknown;
+            relativeQuery?: unknown;
+          })
+        : {};
+
+    const requestId =
+      typeof payload.requestId === 'string' ? payload.requestId.trim() : '';
+    const taskId =
+      typeof payload.taskId === 'string' && payload.taskId.trim().length > 0
+        ? payload.taskId.trim()
+        : undefined;
+
+    const request: FileMentionSuggestionsRequest = {
+      requestId: typeof payload.requestId === 'string' ? payload.requestId : '',
+      parentDepth: typeof payload.parentDepth === 'number' ? payload.parentDepth : -1,
+      relativeQuery: typeof payload.relativeQuery === 'string' ? payload.relativeQuery : '',
+      ...(taskId !== undefined ? { taskId } : {}),
+    };
+
+    try {
+      const result = await listFileMentionSuggestions(request, {
+        resolveCwd: (scope) => {
+          if (scope.taskId) {
+            const task = taskStore?.getTask(scope.taskId);
+            if (task?.cwd && task.cwd.trim().length > 0) {
+              return task.cwd;
+            }
+            // Known task without cwd still falls back to draft workspace cwd.
+            // Missing task id is treated the same — host owns the path.
+          }
+          return resolveTaskCwd();
+        },
+        readDirectory: async (dirPath) => {
+          const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
+          return entries;
+        },
+      });
+
+      if (result.ok) {
+        debugMuster('host.file_mention_suggestions', {
+          requestId: result.requestId,
+          taskId: taskId ?? null,
+          parentDepth: result.parentDepth,
+          itemCount: result.items.length,
+          outcome: 'ok',
+        });
+        this.post({
+          type: 'fileMentionSuggestions',
+          ok: true,
+          requestId: result.requestId,
+          parentDepth: result.parentDepth,
+          relativeQuery: result.relativeQuery,
+          items: result.items,
+        });
+        return;
+      }
+
+      debugMuster('host.file_mention_suggestions', {
+        requestId: result.requestId || requestId || null,
+        taskId: taskId ?? null,
+        parentDepth: request.parentDepth,
+        outcome: 'error',
+        code: result.code,
+      });
+      this.post({
+        type: 'fileMentionSuggestions',
+        ok: false,
+        requestId: result.requestId || requestId || 'invalid',
+        code: result.code,
+      });
+    } catch {
+      debugMuster('host.file_mention_suggestions', {
+        requestId: requestId || null,
+        taskId: taskId ?? null,
+        outcome: 'error',
+        code: 'listingFailed',
+      });
+      this.post({
+        type: 'fileMentionSuggestions',
+        ok: false,
+        requestId: requestId || 'invalid',
+        code: 'listingFailed',
+      });
     }
   }
 
@@ -2091,6 +2194,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           break;
         case 'browseWorkspaceFiles':
           await this.handleBrowseWorkspaceFiles();
+          break;
+        case 'requestFileMentionSuggestions':
+          await this.handleRequestFileMentionSuggestions(data);
           break;
         case 'resolveFileDrop':
           await this.handleResolveFileDrop(data.candidates);

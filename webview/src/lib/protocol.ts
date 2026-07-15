@@ -390,6 +390,50 @@ export type ExtMessage =
       fileName: string;
       sourceRevision: number;
       exportedAt: string;
+    }
+  /**
+   * Host response to `requestFileMentionSuggestions`.
+   * Success returns relative suggestion items only (never absolute paths, cwd,
+   * or file contents). Failures use bounded codes with no free-form message.
+   */
+  | FileMentionSuggestionsMessage;
+
+/** Kind of a single autocomplete suggestion item. */
+export type FileMentionSuggestionKind = 'file' | 'directory';
+
+/** Relative-only suggestion returned by the host for @ autocomplete. */
+export interface FileMentionSuggestionItem {
+  id: string;
+  kind: FileMentionSuggestionKind;
+  label: string;
+  /** Relative path inserted into the composer mention (never absolute). */
+  insertionPath: string;
+}
+
+export type FileMentionSuggestionsErrorCode =
+  | 'invalidRequest'
+  | 'unavailable'
+  | 'listingFailed';
+
+/**
+ * Host → webview suggestion payload.
+ * Success may omit `ok` (implicit true) or set `ok: true`.
+ * Failure requires `ok: false` and a bounded `code`.
+ */
+export type FileMentionSuggestionsMessage =
+  | {
+      type: 'fileMentionSuggestions';
+      ok?: true;
+      requestId: string;
+      parentDepth: 0;
+      relativeQuery: string;
+      items: FileMentionSuggestionItem[];
+    }
+  | {
+      type: 'fileMentionSuggestions';
+      ok: false;
+      requestId: string;
+      code: FileMentionSuggestionsErrorCode;
     };
 
 export type AskAnswer = { selected: string[]; freeText: string | null };
@@ -456,6 +500,18 @@ export type OutMessage =
   | { type: 'pickFile' }
   | { type: 'browseWorkspaceFiles' }
   | { type: 'resolveFileDrop'; candidates: string[] }
+  /**
+   * Request current-directory @ autocomplete suggestions.
+   * Host derives cwd from taskId (existing task) or draft workspace context.
+   * Webview never supplies a filesystem path.
+   */
+  | {
+      type: 'requestFileMentionSuggestions';
+      requestId: string;
+      taskId?: string;
+      parentDepth: 0;
+      relativeQuery: string;
+    }
   /**
    * When the webview has file bytes but no filesystem path (Finder → sandboxed
    * webview), host writes a temp copy and replies with `filePicked` absolute path.
@@ -1039,9 +1095,77 @@ export function isExtMessage(data: unknown): data is ExtMessage {
         isExportResultTimestamp(data.exportedAt)
       );
 
+    case 'fileMentionSuggestions':
+      return isFileMentionSuggestionsMessage(data);
+
     default:
       return false;
   }
+}
+
+const FILE_MENTION_SUGGESTION_ERROR_CODES = new Set<FileMentionSuggestionsErrorCode>([
+  'invalidRequest',
+  'unavailable',
+  'listingFailed',
+]);
+
+/** Relative mention paths for autocomplete — no absolute/drive/UNC/traversal. */
+function isRelativeFileMentionPath(v: unknown): v is string {
+  if (typeof v !== 'string') return false;
+  const value = v.trim();
+  if (value.length === 0) return false;
+  if (value.startsWith('/') || value.startsWith('\\')) return false;
+  if (value.startsWith('//') || value.startsWith('\\\\')) return false;
+  if (/^[A-Za-z]:/.test(value)) return false;
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i);
+    if (code < 0x20 || code === 0x7f) return false;
+  }
+  const normalized = value.replace(/\\/g, '/');
+  const segments = normalized.split('/');
+  for (const segment of segments) {
+    if (segment === '' || segment === '.' || segment === '..') return false;
+  }
+  return true;
+}
+
+function isFileMentionSuggestionItem(v: unknown): v is FileMentionSuggestionItem {
+  if (!isRecord(v)) return false;
+  if (!hasOnlyKeys(v, ['id', 'kind', 'label', 'insertionPath'])) return false;
+  if (!isString(v.id) || v.id.trim().length === 0) return false;
+  if (v.kind !== 'file' && v.kind !== 'directory') return false;
+  if (!isString(v.label) || v.label.trim().length === 0) return false;
+  if (v.label.includes('/') || v.label.includes('\\')) return false;
+  return isRelativeFileMentionPath(v.insertionPath);
+}
+
+function isFileMentionSuggestionsMessage(data: Record<string, unknown>): boolean {
+  if (!isString(data.requestId) || data.requestId.trim().length === 0) return false;
+
+  if (data.ok === false) {
+    return (
+      hasOnlyKeys(data, ['type', 'ok', 'requestId', 'code']) &&
+      isString(data.code) &&
+      FILE_MENTION_SUGGESTION_ERROR_CODES.has(data.code as FileMentionSuggestionsErrorCode)
+    );
+  }
+
+  // Success: ok may be omitted or true.
+  if (data.ok !== undefined && data.ok !== true) return false;
+  const allowed =
+    data.ok === true
+      ? (['type', 'ok', 'requestId', 'parentDepth', 'relativeQuery', 'items'] as const)
+      : (['type', 'requestId', 'parentDepth', 'relativeQuery', 'items'] as const);
+  if (!hasOnlyKeys(data, allowed)) return false;
+  if (data.parentDepth !== 0) return false;
+  if (!isString(data.relativeQuery)) return false;
+  // relativeQuery may be empty (bare @) but must not carry control chars.
+  for (let i = 0; i < data.relativeQuery.length; i += 1) {
+    const code = data.relativeQuery.charCodeAt(i);
+    if (code < 0x20 || code === 0x7f) return false;
+  }
+  if (!Array.isArray(data.items)) return false;
+  return data.items.every(isFileMentionSuggestionItem);
 }
 
 /**
