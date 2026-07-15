@@ -406,6 +406,194 @@ test('file mention autocomplete requests host suggestions and inserts a relative
   });
 });
 
+/**
+ * T04 full S01 browser-flow proof: draft + idle task, real typing/click,
+ * active-query replacement, and dual text/llmText send resolution.
+ * Playwright only — not native Extension Development Host proof.
+ */
+test('current-directory file mention flow covers draft and idle task dual-text send', async ({
+  page,
+}) => {
+  await openWebview(page);
+
+  // ── Draft mode ──────────────────────────────────────────────────────────
+  await postSnapshot(page, { type: 'snapshot', rootTasks: [], storeRevision: 20 });
+  await page.getByRole('button', { name: 'New task' }).first().click();
+  await expectPostedMessage(page, { type: 'newTask' });
+
+  const draftComposer = page.getByPlaceholder('Start a new coordinator task with claude…');
+  await draftComposer.click();
+  // Real typing — not fill/value injection — so caret-driven autocomplete runs.
+  await draftComposer.pressSequentially('Draft note @re', { delay: 20 });
+
+  const draftBefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(draftBefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+
+  const draftRequest = (await postedMessages(page))
+    .slice(draftBefore)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    type: string;
+    requestId: string;
+    parentDepth: number;
+    relativeQuery: string;
+    taskId?: string;
+  };
+  expect(draftRequest.parentDepth).toBe(0);
+  expect(draftRequest.relativeQuery).toBe('re');
+  expect(draftRequest.taskId).toBeUndefined();
+  expect(typeof draftRequest.requestId).toBe('string');
+  expect(draftRequest.requestId.length).toBeGreaterThan(0);
+
+  // Bounded current-directory fixture: relative items only; multi-segment
+  // insertionPath proves display-token → agent-path expand-on-send.
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: draftRequest.requestId,
+    parentDepth: 0,
+    relativeQuery: 're',
+    items: [
+      {
+        id: 'file:readme.md',
+        kind: 'file',
+        label: 'readme.md',
+        insertionPath: 'docs/readme.md',
+      },
+      {
+        id: 'dir:reports',
+        kind: 'directory',
+        label: 'reports',
+        insertionPath: 'reports',
+      },
+    ],
+  });
+
+  const draftListbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+  await expect(draftListbox).toBeVisible();
+  await expect(draftListbox.getByRole('option', { name: 'readme.md' })).toBeVisible();
+  // S01 mouse selection is file-only; directory rows are filtered out.
+  await expect(draftListbox.getByRole('option', { name: 'reports' })).toHaveCount(0);
+
+  await draftListbox.getByRole('option', { name: 'readme.md' }).click();
+  await expect(draftListbox).toHaveCount(0);
+  // Only the active @re token is replaced; leading text is preserved.
+  await expect(draftComposer).toHaveValue('Draft note @readme.md ');
+
+  await page.getByRole('button', { name: 'Send' }).click();
+  await expectPostedMessage(page, {
+    type: 'send',
+    text: 'Draft note @readme.md',
+    llmText: 'Draft note @docs/readme.md',
+    backend: 'claude',
+  });
+
+  // ── Idle existing task ──────────────────────────────────────────────────
+  await postSnapshot(page, {
+    type: 'snapshot',
+    rootTasks: [
+      task({
+        id: 'task-idle-mention',
+        goal: 'Idle task for current-directory mention flow',
+        viewStatus: 'idle',
+      }),
+    ],
+    focusedTaskId: 'task-idle-mention',
+    subtree: [
+      task({
+        id: 'task-idle-mention',
+        goal: 'Idle task for current-directory mention flow',
+        viewStatus: 'idle',
+      }),
+    ],
+    transcript: [{ id: 'msg-idle-mention', kind: 'assistant', content: 'Ready for mentions.' }],
+    storeRevision: 21,
+  });
+
+  await expect(page.getByText('Ready for mentions.')).toBeVisible();
+  const taskComposer = page.getByPlaceholder('Message this task…');
+  await expect(taskComposer).toBeEnabled();
+  await taskComposer.click();
+  await taskComposer.pressSequentially('Check @pa', { delay: 20 });
+
+  const taskBefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(taskBefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+
+  const taskRequest = (await postedMessages(page))
+    .slice(taskBefore)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    type: string;
+    requestId: string;
+    parentDepth: number;
+    relativeQuery: string;
+    taskId?: string;
+  };
+  expect(taskRequest.parentDepth).toBe(0);
+  expect(taskRequest.relativeQuery).toBe('pa');
+  expect(taskRequest.taskId).toBe('task-idle-mention');
+  expect(typeof taskRequest.requestId).toBe('string');
+  expect(taskRequest.requestId.length).toBeGreaterThan(0);
+
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: taskRequest.requestId,
+    parentDepth: 0,
+    relativeQuery: 'pa',
+    items: [
+      {
+        id: 'file:package.json',
+        kind: 'file',
+        label: 'package.json',
+        insertionPath: 'package.json',
+      },
+      {
+        id: 'dir:packages',
+        kind: 'directory',
+        label: 'packages',
+        insertionPath: 'packages',
+      },
+    ],
+  });
+
+  const taskListbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+  await expect(taskListbox).toBeVisible();
+  await expect(taskListbox.getByRole('option', { name: 'package.json' })).toBeVisible();
+  await expect(taskListbox.getByRole('option', { name: 'packages' })).toHaveCount(0);
+
+  await taskListbox.getByRole('option', { name: 'package.json' }).click();
+  await expect(taskListbox).toHaveCount(0);
+  await expect(taskComposer).toHaveValue('Check @package.json ');
+
+  await page.getByRole('button', { name: 'Send' }).click();
+  // Basename insertionPath === display token, so llmText equals text and is omitted.
+  await expectPostedMessage(page, {
+    type: 'send',
+    taskId: 'task-idle-mention',
+    text: 'Check @package.json',
+  });
+  const taskSend = (await postedMessages(page))
+    .slice(taskBefore)
+    .find(
+      (m) =>
+        (m as { type?: string }).type === 'send' &&
+        (m as { taskId?: string }).taskId === 'task-idle-mention',
+    ) as { type: string; text: string; llmText?: string; taskId: string };
+  expect(taskSend.text).toBe('Check @package.json');
+  expect(taskSend.llmText).toBeUndefined();
+});
+
 test('Add Context menu keeps the existing file picker and mention flow', async ({ page }) => {
     await openWebview(page);
 
