@@ -1409,7 +1409,7 @@ describe('engine graph batch create/delegate', () => {
 
     // Derived dependency + binding reference A's derived id.
     expect(store.getTask(bId)?.dependencies).toEqual([
-      { taskId: aId, requiredOutcome: 'succeeded', onUnsatisfied: 'block' },
+      { taskId: aId, requiredOutcome: 'succeeded', onUnsatisfied: 'fail' },
     ]);
     expect(store.getTask(bId)?.inputBindings).toEqual([
       { fromTaskId: aId, output: 'summary', as: 'plan' },
@@ -1466,6 +1466,230 @@ describe('engine graph batch create/delegate', () => {
     if (bTurn && bTurn.status === 'running') {
       engine.stageDisposition(bTurn.id, { kind: 'idle' }, 'op-b-idle');
     }
+    resume();
+    await engine.whenIdle();
+  });
+
+  async function waitTurnRunning(
+    store: TaskStore,
+    turnId: string,
+  ): Promise<void> {
+    for (let i = 0; i < 50; i++) {
+      if (store.getFile().turns[turnId]?.status === 'running') return;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    throw new Error(`turn ${turnId} never became running`);
+  }
+
+  it('P0: delegate_task waitForCompletion stages wait on created child in one op', async () => {
+    const { store, engine, credentials, resume } = makeHarness();
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child', 'wait_child', 'read_subtree'],
+    });
+    const started = engine.startTask('coord');
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    const turnId = started.value.turnId;
+    await waitTurnRunning(store, turnId);
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId,
+      allowedActions: new Set(['delegate_task', 'wait_for_tasks', 'complete_task']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    const result = await engine.handleToolCall(ctx, 'delegate_task', {
+      kind: 'delegate_task',
+      opId: 'op-dwait',
+      waitForCompletion: true,
+      spec: { goal: 'do work', taskType: 'worker', backend: 'grok' },
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const data = result.result as { taskId: string; waitStaged?: boolean; waitTaskIds?: string[] };
+    const childId = deriveEntityId(turnId, 'op-dwait', 'task');
+    expect(data.taskId).toBe(childId);
+    expect(data.waitStaged).toBe(true);
+    expect(data.waitTaskIds).toEqual([childId]);
+    expect(store.getFile().turns[turnId]?.disposition).toEqual({
+      kind: 'wait_tasks',
+      taskIds: [childId],
+    });
+    // Fire-and-forget still works when flag omitted.
+    engine.stageDisposition(turnId, { kind: 'idle' }, 'op-clear');
+    resume();
+    await engine.whenIdle();
+  });
+
+  it('P0: same opId with different waitForCompletion conflicts', async () => {
+    const { store, engine, credentials, resume } = makeHarness();
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child', 'wait_child'],
+    });
+    const started = engine.startTask('coord');
+    if (!started.ok) return;
+    const turnId = started.value.turnId;
+    await waitTurnRunning(store, turnId);
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId,
+      allowedActions: new Set(['delegate_task', 'wait_for_tasks']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    const first = await engine.handleToolCall(ctx, 'delegate_task', {
+      kind: 'delegate_task',
+      opId: 'op-same',
+      waitForCompletion: true,
+      spec: { goal: 'a', taskType: 'worker' },
+    });
+    expect(first.ok).toBe(true);
+    const second = await engine.handleToolCall(ctx, 'delegate_task', {
+      kind: 'delegate_task',
+      opId: 'op-same',
+      spec: { goal: 'a', taskType: 'worker' },
+    });
+    expect(second.ok).toBe(false);
+    if (!second.ok) expect(second.error).toContain('opId conflict');
+    engine.stageDisposition(turnId, { kind: 'idle' }, 'op-idle');
+    resume();
+    await engine.whenIdle();
+  });
+
+  it('P0: release_tasks waitForTaskIds stages exact wait subset', async () => {
+    const { store, engine, credentials, resume } = makeHarness();
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child', 'wait_child'],
+    });
+    const started = engine.startTask('coord');
+    if (!started.ok) return;
+    const turnId = started.value.turnId;
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId,
+      allowedActions: new Set(['create_tasks', 'release_tasks', 'wait_for_tasks']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    await engine.handleToolCall(ctx, 'create_tasks', {
+      kind: 'create_tasks',
+      opId: 'op-ct',
+      specs: [
+        { localId: 'a', goal: 'a', taskType: 'worker' },
+        { localId: 'b', goal: 'b', taskType: 'worker' },
+      ],
+    });
+    const aId = deriveEntityId(turnId, 'op-ct', 'task:a');
+    const bId = deriveEntityId(turnId, 'op-ct', 'task:b');
+    const released = await engine.handleToolCall(ctx, 'release_tasks', {
+      kind: 'release_tasks',
+      opId: 'op-rel-wait',
+      taskIds: [aId, bId],
+      waitForTaskIds: [bId],
+    });
+    expect(released.ok).toBe(true);
+    if (!released.ok) return;
+    const data = released.result as { waitStaged?: boolean; waitTaskIds?: string[] };
+    expect(data.waitStaged).toBe(true);
+    expect(data.waitTaskIds).toEqual([bId]);
+    expect(store.getFile().turns[turnId]?.disposition).toEqual({
+      kind: 'wait_tasks',
+      taskIds: [bId],
+    });
+    engine.stageDisposition(turnId, { kind: 'idle' }, 'op-idle');
+    resume();
+    await engine.whenIdle();
+  });
+
+  it('P0: compound wait requires wait_for_tasks permission', async () => {
+    const { store, engine, credentials, resume } = makeHarness();
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child'],
+    });
+    const started = engine.startTask('coord');
+    if (!started.ok) return;
+    const turnId = started.value.turnId;
+    await waitTurnRunning(store, turnId);
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId,
+      allowedActions: new Set(['delegate_task', 'release_tasks', 'delegate_tasks', 'create_tasks']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    const d = await engine.handleToolCall(ctx, 'delegate_task', {
+      kind: 'delegate_task',
+      opId: 'op-no-wait-cap',
+      waitForCompletion: true,
+      spec: { goal: 'x', taskType: 'worker' },
+    });
+    expect(d.ok).toBe(false);
+    if (!d.ok) expect(d.error).toContain('wait_for_tasks');
+    engine.stageDisposition(turnId, { kind: 'idle' }, 'op-idle');
+    resume();
+    await engine.whenIdle();
+  });
+
+  it('P0: delegate_tasks waitForLocalIds stages wait only for listed locals', async () => {
+    const { store, engine, credentials, resume } = makeHarness();
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child', 'wait_child'],
+    });
+    const started = engine.startTask('coord');
+    if (!started.ok) return;
+    const turnId = started.value.turnId;
+    await waitTurnRunning(store, turnId);
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId,
+      allowedActions: new Set(['delegate_tasks', 'wait_for_tasks']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    const result = await engine.handleToolCall(ctx, 'delegate_tasks', {
+      kind: 'delegate_tasks',
+      opId: 'op-dt',
+      waitForLocalIds: ['b'],
+      specs: [
+        { localId: 'a', goal: 'a', taskType: 'worker' },
+        { localId: 'b', goal: 'b', taskType: 'worker' },
+      ],
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const bId = deriveEntityId(turnId, 'op-dt', 'task:b');
+    const data = result.result as { waitTaskIds?: string[] };
+    expect(data.waitTaskIds).toEqual([bId]);
+    expect(store.getFile().turns[turnId]?.disposition).toEqual({
+      kind: 'wait_tasks',
+      taskIds: [bId],
+    });
+    engine.stageDisposition(turnId, { kind: 'idle' }, 'op-idle');
     resume();
     await engine.whenIdle();
   });

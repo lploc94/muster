@@ -77,6 +77,41 @@ export function fingerprintCommand(command: ToolCommand): string {
   return createHash('sha256').update(JSON.stringify(command)).digest('hex');
 }
 
+/**
+ * Stage wait_tasks on the caller turn for an exact child id set (compound delegate/release).
+ * Rejects conflicting prior disposition. Idempotent when same opId already staged wait.
+ */
+function stageCompoundWait(
+  draft: TaskStoreFile,
+  ctx: { turnId: string; callerTaskId: string },
+  opId: string,
+  waitTaskIds: string[],
+  limits: ResourceLimits,
+): { ok: true } | { ok: false; reason: string } {
+  if (waitTaskIds.length === 0) {
+    return { ok: false, reason: 'wait set must be non-empty' };
+  }
+  for (const id of waitTaskIds) {
+    const child = draft.tasks[id];
+    if (!child || child.parentId !== ctx.callerTaskId) {
+      return { ok: false, reason: `wait target not owned direct child: ${id}` };
+    }
+  }
+  const turn = draft.turns[ctx.turnId];
+  if (!turn) return { ok: false, reason: 'turn not found' };
+  const turnCap = canCreateTurn(draft, ctx.callerTaskId, limits);
+  if (!turnCap.ok) return turnCap;
+  const result = stageDisposition(
+    turn,
+    { kind: 'wait_tasks', taskIds: waitTaskIds },
+    opId,
+    { limits: { maxResult: limits.maxResultBytes, maxError: limits.maxErrorBytes } },
+  );
+  if (!result.ok) return result;
+  draft.turns[ctx.turnId] = result.next.turn;
+  return { ok: true };
+}
+
 function depGraphFromFile(file: TaskStoreFile): DepGraph {
   return {
     rootOf: (taskId) => {
@@ -341,6 +376,21 @@ export async function executeToolCommand(
   if (ctx.allowedActions && !ctx.allowedActions.has(actionForCommand(command))) {
     return { ok: false, error: `action not permitted: ${actionForCommand(command)}` };
   }
+  // Compound wait fields require wait_for_tasks / wait_child in addition to create_child tools.
+  const wantsCompoundWait =
+    (command.kind === 'delegate_task' && command.waitForCompletion === true) ||
+    (command.kind === 'delegate_tasks' &&
+      command.waitForLocalIds !== undefined &&
+      command.waitForLocalIds.length > 0) ||
+    (command.kind === 'release_tasks' &&
+      command.waitForTaskIds !== undefined &&
+      command.waitForTaskIds.length > 0);
+  if (wantsCompoundWait && ctx.allowedActions && !ctx.allowedActions.has('wait_for_tasks')) {
+    return {
+      ok: false,
+      error: 'action not permitted: wait_for_tasks (required for compound wait fields)',
+    };
+  }
 
   if (
     command.kind !== 'get_task_status' &&
@@ -556,6 +606,11 @@ export async function executeToolCommand(
           queuedTurnId = turnId;
         }
 
+        if (command.kind === 'delegate_task' && command.waitForCompletion === true) {
+          const waitStaged = stageCompoundWait(draft, ctx, command.opId, [childId], limits);
+          if (!waitStaged.ok) return waitStaged;
+        }
+
         const result: OpResult = {
           ok: true,
           data: {
@@ -568,6 +623,9 @@ export async function executeToolCommand(
               role: resolvedRole,
               briefKind: brief.kind,
             },
+            ...(command.kind === 'delegate_task' && command.waitForCompletion === true
+              ? { waitStaged: true, waitTaskIds: [childId] }
+              : {}),
           },
         };
         writeLedger(draft, ctx.turnId, command.opId, fingerprint, result);
@@ -791,9 +849,10 @@ export async function executeToolCommand(
           for (const dep of spec.dependencies ?? []) {
             depMap.set(dep.taskId, dep);
           }
+          // Batch dependsOn: fail (not silent block) so sink-only waits resolve on upstream fail.
           for (const sib of spec.dependsOn ?? []) {
             const depId = idByLocal.get(sib)!;
-            depMap.set(depId, { taskId: depId, requiredOutcome: 'succeeded', onUnsatisfied: 'block' });
+            depMap.set(depId, { taskId: depId, requiredOutcome: 'succeeded', onUnsatisfied: 'fail' });
           }
 
           const bindings: TaskInputBinding[] = [];
@@ -814,7 +873,7 @@ export async function executeToolCommand(
               depMap.set(fromTaskId, {
                 taskId: fromTaskId,
                 requiredOutcome: 'succeeded',
-                onUnsatisfied: 'block',
+                onUnsatisfied: 'fail',
               });
             }
           }
@@ -889,11 +948,21 @@ export async function executeToolCommand(
           }
         }
 
+        let waitTaskIds: string[] | undefined;
+        if (isDelegate && command.kind === 'delegate_tasks' && command.waitForLocalIds) {
+          waitTaskIds = command.waitForLocalIds.map((localId) => idByLocal.get(localId)!);
+          const waitStaged = stageCompoundWait(draft, ctx, command.opId, waitTaskIds, limits);
+          if (!waitStaged.ok) return waitStaged;
+        }
+
         const result: OpResult = {
           ok: true,
           data: {
             taskIds: orderedTaskIds,
             turnIds: isDelegate ? orderedTurnIds : [],
+            ...(waitTaskIds !== undefined
+              ? { waitStaged: true, waitTaskIds }
+              : {}),
           },
         };
         writeLedger(draft, ctx.turnId, command.opId, fingerprint, result);
@@ -906,7 +975,7 @@ export async function executeToolCommand(
 
       const batchLedger = deps.store.getFile().operations?.[opLedgerKey(ctx.turnId, command.opId)];
       const ledgerData = batchLedger?.result.data as
-        | { taskIds?: string[]; turnIds?: string[] }
+        | { taskIds?: string[]; turnIds?: string[]; waitStaged?: boolean; waitTaskIds?: string[] }
         | undefined;
       if (isDelegate) {
         // Schedule from the ledger's turnIds — authoritative on both a fresh create and
@@ -1084,9 +1153,46 @@ export async function executeToolCommand(
           }
         }
 
+        let waitTaskIds: string[] | undefined;
+        if (command.waitForTaskIds && command.waitForTaskIds.length > 0) {
+          // Exact subset: each id must be in the release set OR already an owned released child.
+          for (const waitId of command.waitForTaskIds) {
+            const task = draft.tasks[waitId];
+            if (!task || task.parentId !== ctx.callerTaskId) {
+              return {
+                ok: false,
+                reason: JSON.stringify({
+                  code: 'wait_not_owned',
+                  message: `waitForTaskIds target not owned direct child: ${waitId}`,
+                }),
+              };
+            }
+            const inRelease = resolved.has(waitId);
+            const alreadyReleased = (task.releaseState ?? 'draft') === 'released';
+            if (!inRelease && !alreadyReleased) {
+              return {
+                ok: false,
+                reason: JSON.stringify({
+                  code: 'wait_not_released',
+                  message: `waitForTaskIds target not in release set and not already released: ${waitId}`,
+                }),
+              };
+            }
+          }
+          waitTaskIds = [...command.waitForTaskIds];
+          const waitStaged = stageCompoundWait(draft, ctx, command.opId, waitTaskIds, limits);
+          if (!waitStaged.ok) return waitStaged;
+        }
+
         writeLedger(draft, ctx.turnId, command.opId, fingerprint, {
           ok: true,
-          data: { taskIds: members, turnIds },
+          data: {
+            taskIds: members,
+            turnIds,
+            ...(waitTaskIds !== undefined
+              ? { waitStaged: true, waitTaskIds }
+              : {}),
+          },
         });
         scheduledTurnIds.push(...turnIds);
         return { ok: true };

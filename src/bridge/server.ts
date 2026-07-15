@@ -166,7 +166,7 @@ const BATCH_CHILD_SCHEMA = {
     backend: { type: 'string', minLength: 1, maxLength: 200 },
     model: { type: 'string', minLength: 1, maxLength: 200 },
     role: { enum: ['coordinator', 'worker'] },
-    /** Sibling localIds this item waits for (→ succeeded/block dependency). */
+    /** Sibling localIds this item waits for (→ succeeded/fail dependency). */
     dependsOn: { type: 'array', items: { type: 'string', minLength: 1 } },
     /** Ordering edges onto pre-existing tasks in the same root. */
     dependencies: { type: 'array', items: DEPENDENCY_SCHEMA },
@@ -202,7 +202,14 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
   delegate_task: {
     type: 'object',
     required: ['opId', 'goal', 'taskType'],
-    properties: CREATE_SPEC_PROPERTIES,
+    properties: {
+      ...CREATE_SPEC_PROPERTIES,
+      waitForCompletion: {
+        type: 'boolean',
+        description:
+          'When true, stage wait on this child in the same call (preferred one-shot spawn+barrier).',
+      },
+    },
     additionalProperties: false,
   },
   create_tasks: {
@@ -220,6 +227,12 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
     properties: {
       opId: OP_ID,
       tasks: { type: 'array', minItems: 1, maxItems: 16, items: BATCH_CHILD_SCHEMA },
+      waitForLocalIds: {
+        type: 'array',
+        items: { type: 'string', minLength: 1 },
+        minItems: 1,
+        description: 'Exact batch-local ids to wait on (subset of tasks[].localId).',
+      },
     },
     additionalProperties: false,
   },
@@ -235,6 +248,13 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
       opId: OP_ID,
       taskIds: { type: 'array', items: OP_ID, minItems: 1 },
       includeDependencies: { type: 'boolean' },
+      waitForTaskIds: {
+        type: 'array',
+        items: OP_ID,
+        minItems: 1,
+        description:
+          'Exact direct-child ids to wait on after release (subset of release set or already released).',
+      },
     },
     additionalProperties: false,
   },
@@ -403,14 +423,22 @@ function createMcpServer(
           name === 'get_host_context'
             ? 'Refresh trusted host env, self ids, task-type registry summary, and role rules (same data as first-turn host block).'
             : name === 'list_task_types'
-              ? 'List configured muster.taskTypes presets (id, backend, model, role, briefKind). Create children by taskType; omit backend/model unless the user named an override.'
-              : name === 'create_task' || name === 'delegate_task'
-                ? `Create a child by required taskType from muster.taskTypes (backend/model optional user overrides only). Tool: ${name}.`
-                : name === 'create_tasks' || name === 'delegate_tasks'
-                  ? `Batch-expand a structured checklist into up to 16 children in one atomic step: derives ids, topo-sorts intra-batch dependsOn/inputBindings (each item needs a unique localId), auto-wires a succeeded/block dependency per intra-batch binding. ${name === 'delegate_tasks' ? 'Releases and runs every child immediately.' : 'Leaves every child as a draft to release later.'} Tool: ${name}.`
-                : name === 'set_task_lifecycle'
-                  ? "Parent-seal a direct child's lifecycle (succeeded/failed/…). Use when child did not complete_task."
-                  : `Muster coordinator tool: ${name}`,
+              ? 'Refresh configured muster.taskTypes (first-turn host context already lists them). Prefer taskType from host snapshot; omit backend/model unless the user named an override.'
+              : name === 'delegate_task'
+                ? 'Create a released child by taskType and queue first turn. Prefer waitForCompletion:true for one-shot spawn+wait. Omit wait fields for fire-and-forget. Requires wait_for_tasks when waiting.'
+                : name === 'create_task'
+                  ? 'Create a draft child by taskType (not scheduled until release_tasks). Prefer rich brief.'
+                  : name === 'delegate_tasks'
+                    ? 'Batch create+release up to 16 children (topo-sorts dependsOn/inputBindings; intra-batch deps use succeeded/fail). Optional waitForLocalIds for exact wait subset. Requires wait_for_tasks when waiting.'
+                    : name === 'create_tasks'
+                      ? 'Batch create draft children (up to 16). Release later with release_tasks({ waitForTaskIds }). Intra-batch dependsOn → succeeded/fail.'
+                      : name === 'release_tasks'
+                        ? 'Atomically release drafts and queue first turns. Optional waitForTaskIds for exact wait subset (requires wait_for_tasks). No start_task.'
+                        : name === 'wait_for_tasks'
+                          ? 'Advanced: stage wait on already-running or earlier fire-and-forget children. Prefer compound wait fields on delegate/release for the happy path.'
+                          : name === 'set_task_lifecycle'
+                            ? "Parent-seal a direct child's lifecycle (succeeded/failed/…). Use when child did not complete_task."
+                            : `Muster coordinator tool: ${name}`,
         inputSchema: TOOL_INPUT_SCHEMAS[name],
       })),
     };

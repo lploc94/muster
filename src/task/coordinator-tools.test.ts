@@ -211,6 +211,56 @@ describe('coordinator-tools dispatch', () => {
     }
   });
 
+  it('maps delegate_task waitForCompletion', () => {
+    const result = dispatch(
+      'delegate_task',
+      { opId: 'op-1', goal: 'g', taskType: 'worker', waitForCompletion: true },
+      ctx(['delegate_task']),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && result.command.kind === 'delegate_task') {
+      expect(result.command.waitForCompletion).toBe(true);
+    }
+  });
+
+  it('maps release_tasks waitForTaskIds', () => {
+    const result = dispatch(
+      'release_tasks',
+      { opId: 'op-rel', taskIds: ['a', 'b'], waitForTaskIds: ['b'] },
+      ctx(['release_tasks']),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && result.command.kind === 'release_tasks') {
+      expect(result.command.waitForTaskIds).toEqual(['b']);
+    }
+  });
+
+  it('maps delegate_tasks waitForLocalIds and rejects unknown localId', () => {
+    const ok = dispatch(
+      'delegate_tasks',
+      {
+        opId: 'op-1',
+        waitForLocalIds: ['a'],
+        tasks: [{ localId: 'a', goal: 'x', taskType: 'worker' }],
+      },
+      ctx(['delegate_tasks']),
+    );
+    expect(ok.ok).toBe(true);
+    if (ok.ok && ok.command.kind === 'delegate_tasks') {
+      expect(ok.command.waitForLocalIds).toEqual(['a']);
+    }
+    const bad = dispatch(
+      'delegate_tasks',
+      {
+        opId: 'op-1',
+        waitForLocalIds: ['ghost'],
+        tasks: [{ localId: 'a', goal: 'x', taskType: 'worker' }],
+      },
+      ctx(['delegate_tasks']),
+    );
+    expect(bad.ok).toBe(false);
+  });
+
   it('rejects release_tasks with empty taskIds', () => {
     const result = dispatch(
       'release_tasks',

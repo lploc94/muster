@@ -819,9 +819,10 @@ tools.
 | Tool | Caller | Purpose |
 |------|--------|---------|
 | `create_task` | Coordinator | Create a **draft** direct child (no first turn). **Required:** `goal`, **`taskType`**. Optional: `backend`/`model` **only as user overrides**, `role`, `dependencies`, `executionPolicy`, **`description`**, **`brief`**, **`inputBindings`**, **`claimsGit`**, **`writePaths`/`readPaths`**. Resolves `taskType` from workspace `muster.taskTypes` before persist |
-| `delegate_task` | Coordinator | Atomically create a **released** child + queue first-turn intent (same args as `create_task`) |
-| `list_task_types` | Coordinator (`create_child`) | Live registry summary (id, backend, model?, role, briefKind) + diagnostics. **No `opId`**, no ledger |
-| `release_tasks` | Coordinator | Atomic draft→released for `taskIds[]` (+ optional dep closure); queues first-turn intents. Uses **persisted** backend/model — never re-resolves registry |
+| `delegate_task` | Coordinator | Atomically create a **released** child + queue first-turn intent (same args as `create_task`). Optional **`waitForCompletion: true`** stages wait on that child in the same op (requires `wait_child`) |
+| `list_task_types` | Coordinator (`create_child`) | Live registry summary (id, backend, model?, role, briefKind) + diagnostics. **No `opId`**, no ledger. Prefer types already in first-turn host context; call to refresh only |
+| `release_tasks` | Coordinator | Atomic draft→released for `taskIds[]` (+ optional dep closure); queues first-turn intents. Optional **`waitForTaskIds`** exact wait subset (requires `wait_child`). Uses **persisted** backend/model — never re-resolves registry |
+| `delegate_tasks` | Coordinator | Batch create+release (up to 16). Optional **`waitForLocalIds`** exact wait subset. Intra-batch `dependsOn` / bindings → `succeeded`/`fail` deps |
 | `start_task` | **Host / recovery only** | Not in coordinator MCP `allowedActions`; rejects draft |
 | `interrupt_task` | Coordinator | Interrupt an active direct child turn (`interrupt_child` cap) |
 | `cancel_task` | Coordinator | Cancel direct child + cascade unfinished descendants (`cancel_child` cap); `sealedBy.coordinator` |
@@ -836,7 +837,13 @@ tools.
 
 **Task types (v1):** Config SoT is resource-scoped VS Code setting `muster.taskTypes` (id → `{ backend, model?, role?, briefKind?, description? }`). Empty registry → create/delegate fail with `task_types_not_configured` (zero mutations). Malformed → `invalid_task_type_config`. Unknown type → `unknown_task_type` even if `backend` override is present. Typo backend id → `backend_unsupported`. No built-in product default types.
 
-**Happy path (multi-node graph):** `list_task_types` → `create_task*` (draft by type) → `release_tasks` → `wait_for_tasks`.  
+**Happy paths (prefer compound wait fields):**  
+- Simple: `delegate_task({ waitForCompletion: true })`  
+- Parallel: `delegate_tasks({ waitForLocalIds: [...] })`  
+- Planned graph: `create_tasks` → `release_tasks({ waitForTaskIds: [...] })`  
+
+Standalone `wait_for_tasks` is **advanced** (re-arm barrier / earlier fire-and-forget).  
+Omitted wait fields = fire-and-forget. Compound wait requires `wait_child` in addition to `create_child`.  
 Coordinator does **not** start CLI processes via `start_task`.
 
 **Capability grants:** root coordinators and coordinator-role children include
@@ -872,21 +879,26 @@ dedicated cards: `acceptOutcome`, `rejectOutcome { reason?: string }`,
 Coordinators never block a live CLI process while children run:
 
 ```text
-1. Coordinator turn delegates or starts child tasks.
-2. Coordinator calls wait_for_tasks({ taskIds }).
-3. The MCP call stages TurnDisposition.wait_tasks and returns immediately.
+1. Coordinator turn delegates (optionally with waitForCompletion / waitForLocalIds)
+   or releases (optionally with waitForTaskIds).
+2. Prefer compound wait fields so create/release + wait stage in one MCP call.
+   Advanced: call wait_for_tasks({ taskIds }) separately.
+3. The staged TurnDisposition.wait_tasks returns immediately (no process block).
 4. Coordinator finishes its CLI turn.
 5. On turnCompleted, the engine commits the wait set and releases the process.
 6. Child tasks progress independently.
-7. When every waited task is terminal, the engine queues one continuation turn.
+7. When every waited task is terminal (or attention wake), the engine queues one
+   continuation turn.
 8. That turn receives structured `child_results` followed by pending user messages
    in a deterministic order.
 ```
 
-Only IDs explicitly passed to `wait_for_tasks` belong to the barrier. A child may
-be fire-and-forget. A child that settles before the parent turn finishes is still
-handled correctly: after committing the wait set, the engine immediately observes
-that the barrier is complete and queues the continuation.
+Only IDs explicitly passed via compound wait fields or `wait_for_tasks` belong to
+the barrier. Batch `dependsOn` edges use `onUnsatisfied: fail` so sink-only waits
+do not hang forever on upstream failure. A child may be fire-and-forget. A child
+that settles before the parent turn finishes is still handled correctly: after
+committing the wait set, the engine immediately observes that the barrier is
+complete and queues the continuation.
 
 The wait set is keyed by the registering parent turn ID. Completion handling and
 continuation creation use idempotency keys, preventing duplicate parent turns after

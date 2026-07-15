@@ -91,14 +91,28 @@ const STABLE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 
 export type ToolCommand =
   | { kind: 'create_task'; opId: string; spec: CreateChildSpec }
-  | { kind: 'delegate_task'; opId: string; spec: CreateChildSpec }
+  | {
+      kind: 'delegate_task';
+      opId: string;
+      spec: CreateChildSpec;
+      /** When true, stage wait on the created child in the same op. */
+      waitForCompletion?: boolean;
+    }
   | { kind: 'create_tasks'; opId: string; specs: BatchChildSpec[] }
-  | { kind: 'delegate_tasks'; opId: string; specs: BatchChildSpec[] }
+  | {
+      kind: 'delegate_tasks';
+      opId: string;
+      specs: BatchChildSpec[];
+      /** Wait only these batch-local children (exact set; order preserved). */
+      waitForLocalIds?: string[];
+    }
   | {
       kind: 'release_tasks';
       opId: string;
       taskIds: string[];
       includeDependencies?: boolean;
+      /** Wait only this explicit subset of released/owned direct children. */
+      waitForTaskIds?: string[];
     }
   | { kind: 'start_task'; opId: string; childId: string }
   | { kind: 'interrupt_task'; opId: string; childId: string }
@@ -578,7 +592,18 @@ export function dispatch(
         if (!spec) {
           return { ok: false, toolError: 'invalid delegate_task arguments' };
         }
-        return { ok: true, command: { kind: 'delegate_task', opId, spec } };
+        if (args.waitForCompletion !== undefined && typeof args.waitForCompletion !== 'boolean') {
+          return { ok: false, toolError: 'waitForCompletion must be a boolean' };
+        }
+        return {
+          ok: true,
+          command: {
+            kind: 'delegate_task',
+            opId,
+            spec,
+            ...(args.waitForCompletion === true ? { waitForCompletion: true } : {}),
+          },
+        };
       }
       case 'create_tasks':
       case 'delegate_tasks': {
@@ -586,8 +611,35 @@ export function dispatch(
         if (!specs) {
           return { ok: false, toolError: `invalid ${tool} arguments` };
         }
-        const kind = tool === 'create_tasks' ? ('create_tasks' as const) : ('delegate_tasks' as const);
-        return { ok: true, command: { kind, opId, specs } };
+        if (tool === 'create_tasks') {
+          return { ok: true, command: { kind: 'create_tasks', opId, specs } };
+        }
+        let waitForLocalIds: string[] | undefined;
+        if (args.waitForLocalIds !== undefined) {
+          if (
+            !Array.isArray(args.waitForLocalIds) ||
+            args.waitForLocalIds.length === 0 ||
+            !args.waitForLocalIds.every((id) => typeof id === 'string' && id.length > 0)
+          ) {
+            return { ok: false, toolError: 'waitForLocalIds must be a non-empty string array' };
+          }
+          const localSet = new Set(specs.map((s) => s.localId));
+          for (const id of args.waitForLocalIds) {
+            if (!localSet.has(id)) {
+              return { ok: false, toolError: `waitForLocalIds unknown localId: ${id}` };
+            }
+          }
+          waitForLocalIds = args.waitForLocalIds as string[];
+        }
+        return {
+          ok: true,
+          command: {
+            kind: 'delegate_tasks',
+            opId,
+            specs,
+            ...(waitForLocalIds !== undefined ? { waitForLocalIds } : {}),
+          },
+        };
       }
       case 'release_tasks': {
         const raw = args.taskIds;
@@ -599,6 +651,17 @@ export function dispatch(
         if (args.includeDependencies !== undefined && typeof args.includeDependencies !== 'boolean') {
           return { ok: false, toolError: 'includeDependencies must be a boolean' };
         }
+        let waitForTaskIds: string[] | undefined;
+        if (args.waitForTaskIds !== undefined) {
+          if (
+            !Array.isArray(args.waitForTaskIds) ||
+            args.waitForTaskIds.length === 0 ||
+            !args.waitForTaskIds.every((id) => typeof id === 'string' && id.length > 0)
+          ) {
+            return { ok: false, toolError: 'waitForTaskIds must be a non-empty string array' };
+          }
+          waitForTaskIds = args.waitForTaskIds as string[];
+        }
         return {
           ok: true,
           command: {
@@ -606,6 +669,7 @@ export function dispatch(
             opId,
             taskIds: raw as string[],
             includeDependencies,
+            ...(waitForTaskIds !== undefined ? { waitForTaskIds } : {}),
           },
         };
       }

@@ -87,9 +87,9 @@ export const HOST_RULES_BASE: readonly string[] = [
  * When types are configured, the last 4 bullets are replaced by HOST_RULES_TASK_TYPES.
  */
 export const HOST_RULES_COORDINATOR: readonly string[] = [
-  'Create children as **draft** (`create_task`); run graph with **`release_tasks`** (all-or-nothing).',
-  'There is **no** coordinator MCP `start_task` — release or `delegate_task` queues first turns.',
-  'Use **`wait_for_tasks`** to block on children; host continues the parent when wait resolves.',
+  'Simple spawn: **`delegate_task({ waitForCompletion: true })`** — one call create+run+wait.',
+  'Parallel: **`delegate_tasks({ waitForLocalIds })`**. Planned graph: **`create_tasks` → `release_tasks({ waitForTaskIds })`**.',
+  'Standalone **`wait_for_tasks`** is advanced (re-arm barrier / earlier fire-and-forget). No MCP `start_task`.',
   'If a child omits disposition, parent may **`set_task_lifecycle`** on **direct children** only.',
   'Optional `model` on create/delegate is an ACP model id for that child backend; omit → agent default.',
   'Prefer rich `brief` on create/delegate so children need not re-derive the job.',
