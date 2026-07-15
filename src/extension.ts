@@ -1080,15 +1080,41 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
    * (success or user-visible failure).
    */
   private tryOpenWorkspaceMarkdownPresentation(url: string): boolean {
-    const roots =
-      vscode.workspace.workspaceFolders?.map((f) => f.uri.fsPath).filter(Boolean) ?? [];
-    const target = resolveWorkspaceMarkdownPath(url, roots);
+    const folders =
+      vscode.workspace.workspaceFolders?.map((f) => ({
+        fsPath: f.uri.fsPath,
+        uri: f.uri.toString(),
+      })) ?? [];
+    const target = resolveWorkspaceMarkdownPath(url, folders);
     if (!target) return false;
 
     if (!presentationManager) {
       this.postCommandError('Presentation is not available.');
       return true;
     }
+
+    const file = taskStore?.getFile();
+    const focused = this.focusedTaskId ? file?.tasks[this.focusedTaskId] : undefined;
+    let rootTask = focused;
+    if (focused && file) {
+      let cur = focused;
+      while (cur.parentId) {
+        const parent = file.tasks[cur.parentId];
+        if (!parent) break;
+        cur = parent;
+      }
+      rootTask = cur;
+    }
+    // Fail closed: only real root coordinators may own review panels.
+    if (!rootTask || rootTask.role !== 'coordinator' || rootTask.parentId !== null) {
+      void vscode.workspace.openTextDocument(target.absolutePath).then(
+        (doc) => vscode.window.showTextDocument(doc, { preview: true }),
+        () => this.postCommandError('Could not open markdown file.'),
+      );
+      return true;
+    }
+    const rootId = rootTask.id;
+    const ownerTaskId = rootTask.id;
 
     let markdown: string;
     try {
@@ -1103,26 +1129,15 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     }
     markdown = clampPresentationMarkdown(markdown);
 
-    const file = taskStore?.getFile();
-    const focused = this.focusedTaskId ? file?.tasks[this.focusedTaskId] : undefined;
-    let rootId = focused?.id ?? 'workspace';
-    if (focused && file) {
-      let cur = focused;
-      while (cur.parentId) {
-        const parent = file.tasks[cur.parentId];
-        if (!parent) break;
-        cur = parent;
-      }
-      rootId = cur.id;
-    }
-    const ownerTaskId = focused?.id ?? rootId;
-
     void presentationManager
       .openWorkspaceDocument(rootId, {
         presentationId: target.presentationId,
         ownerTaskId,
         title: target.title,
         markdown,
+        kind: 'document',
+        sourcePath: target.sourcePath,
+        sourceFolderUri: target.sourceFolderUri,
       })
       .then((result) => {
         if (!result.ok) {
@@ -2498,6 +2513,19 @@ export async function activate(context: vscode.ExtensionContext) {
   presentationManager = new PresentationManager(
     createPresentationPanelFactory(presentationHost, context.extensionUri, revealLinkedChat),
   );
+  presentationManager.setOwnerResolver((ownerTaskId) => {
+    const file = taskStore?.getFile();
+    const task = file?.tasks[ownerTaskId];
+    if (!task) return undefined;
+    let cur = task;
+    while (cur.parentId) {
+      const parent = file!.tasks[cur.parentId];
+      if (!parent) break;
+      cur = parent;
+    }
+    if (cur.role === 'coordinator' && cur.parentId === null) return cur.id;
+    return undefined;
+  });
   context.subscriptions.push(
     vscode.window.registerWebviewPanelSerializer(
       'muster.presentation',

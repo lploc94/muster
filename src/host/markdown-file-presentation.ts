@@ -3,6 +3,7 @@
  * Host resolves and reads the file; webview only forwards the raw href.
  */
 
+import { createHash } from 'crypto';
 import {
   PRESENTATION_ID_MAX_LENGTH,
   PRESENTATION_MARKDOWN_MAX_LENGTH,
@@ -18,6 +19,16 @@ export type MarkdownFileOpenTarget = {
   absolutePath: string;
   presentationId: string;
   title: string;
+  /** Workspace-relative posix path. */
+  sourcePath: string;
+  /** vscode.Uri.toString() of the workspace folder that owns the file. */
+  sourceFolderUri: string;
+};
+
+export type WorkspaceFolderRoot = {
+  fsPath: string;
+  /** Stable folder identity, e.g. Uri.toString(). */
+  uri: string;
 };
 
 /**
@@ -45,9 +56,34 @@ export function titleFromMarkdownPath(absoluteOrRelative: string): string {
     : title.slice(0, PRESENTATION_TITLE_MAX_LENGTH);
 }
 
+function shortHash(input: string, bytes = 10): string {
+  return createHash('sha256').update(input).digest('base64url').slice(0, bytes);
+}
+
 /**
- * Stable presentation id from a workspace-relative path (posix separators).
- * Example: docs/plans/foo.md → md:docs-plans-foo.md
+ * Collision-safe presentation id from folder URI + workspace-relative path.
+ * Example: md.a1b2c3d4e5.f6g7h8i9j0
+ */
+export function presentationIdFromFolderAndRelativePath(
+  folderUri: string,
+  relativePath: string,
+): string {
+  const posix = stripQueryHash(relativePath).replace(/\\/g, '/').replace(/^\/+/, '');
+  const folderKey = shortHash(folderUri, 10);
+  const pathKey = shortHash(posix || 'file', 10);
+  let id = `md.${folderKey}.${pathKey}`;
+  if (id.length > PRESENTATION_ID_MAX_LENGTH) {
+    id = id.slice(0, PRESENTATION_ID_MAX_LENGTH);
+  }
+  if (!STABLE_ID_PATTERN.test(id)) {
+    id = `md.${folderKey}.file`;
+  }
+  return id;
+}
+
+/**
+ * @deprecated Prefer presentationIdFromFolderAndRelativePath — slug collides for a-b vs a/b.
+ * Kept for tests that assert legacy behavior during migration windows.
  */
 export function presentationIdFromRelativePath(relativePath: string): string {
   const posix = stripQueryHash(relativePath).replace(/\\/g, '/').replace(/^\/+/, '');
@@ -67,11 +103,11 @@ export function presentationIdFromRelativePath(relativePath: string): string {
 
 /**
  * Resolve a raw webview href to an absolute path under one of `workspaceRoots`.
- * Returns undefined when outside workspace, not markdown, or invalid.
+ * `workspaceRoots` may be plain fs paths (legacy) or `{ fsPath, uri }` for multi-root identity.
  */
 export function resolveWorkspaceMarkdownPath(
   raw: string,
-  workspaceRoots: readonly string[],
+  workspaceRoots: readonly (string | WorkspaceFolderRoot)[],
 ): MarkdownFileOpenTarget | undefined {
   if (!isWorkspaceMarkdownHref(raw) || workspaceRoots.length === 0) return undefined;
 
@@ -85,18 +121,23 @@ export function resolveWorkspaceMarkdownPath(
 
   for (const root of workspaceRoots) {
     if (!root) continue;
-    const rootNorm = normalizeFsPath(root);
+    const fsPath = typeof root === 'string' ? root : root.fsPath;
+    const folderUri = typeof root === 'string' ? `file://${normalizeFsPath(root)}` : root.uri;
+    if (!fsPath) continue;
+    const rootNorm = normalizeFsPath(fsPath);
     const candidate = isAbs
       ? normalizeFsPath(asPath)
       : normalizeFsPath(joinFs(rootNorm, asPath));
     if (!isPathInsideRoot(candidate, rootNorm)) continue;
     if (!MD_EXT.test(candidate)) continue;
 
-    const rel = relativeToRoot(candidate, rootNorm);
+    const rel = relativeToRoot(candidate, rootNorm).replace(/\\/g, '/');
     return {
       absolutePath: candidate,
-      presentationId: presentationIdFromRelativePath(rel),
+      presentationId: presentationIdFromFolderAndRelativePath(folderUri, rel),
       title: titleFromMarkdownPath(candidate),
+      sourcePath: rel,
+      sourceFolderUri: folderUri,
     };
   }
   return undefined;

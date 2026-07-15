@@ -90,7 +90,7 @@ export const HOST_RULES_COORDINATOR: readonly string[] = [
   'Simple spawn: **`delegate_task({ waitForCompletion: true })`** — one call create+run+wait.',
   'Parallel: **`delegate_tasks({ waitForLocalIds })`**. Planned graph: **`create_tasks` → `release_tasks({ waitForTaskIds })`**.',
   'Standalone **`wait_for_tasks`** is advanced (re-arm barrier / earlier fire-and-forget). No MCP `start_task`.',
-  'REQUIRED for user-facing plans/specs: call MCP **`upsert_presentation`** with the full markdown (Mermaid fenced blocks allowed). Args: stable `presentationId` (e.g. plan-<taskId>), `ownerTaskId`=`self.taskId`, unique `opId`, `revision` (1 then ++), `title`, `markdown`. Do not only paste the plan in chat.',
+  'REQUIRED for user-facing plans/specs: call MCP **`upsert_presentation`** with the full markdown (Mermaid fenced blocks allowed). Args: stable `presentationId` (e.g. plan-<taskId>), `ownerTaskId`=`self.taskId`, unique `opId`, `revision` (1 then ++), `title`, `markdown`, optional `kind` (`plan`|`spec`|`document`), optional one-line `summary`. Never send `sourcePath`, `sourceFolderUri`, `updatedAt`, or `rootId` (host-owned). Do not only paste the plan in chat.',
   'If a child omits disposition, parent may **`set_task_lifecycle`** on **direct children** only.',
   'Optional `model` on create/delegate is an ACP model id for that child backend; omit → agent default.',
   'Prefer rich `brief` on create/delegate so children need not re-derive the job.',

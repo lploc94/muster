@@ -4,17 +4,41 @@
   import { renderPresentationMarkdown } from './lib/presentation-markdown';
   import {
     applyPresentationUpdate,
+    buildPersistedState,
+    kindLabel,
     parsePersistedPresentation,
+    parsePersistedPresentationState,
     parsePresentationRevealResult,
+    parsePresentationUpdate,
     type PresentationDocument,
   } from './lib/presentation-protocol';
   import { vscode } from './lib/vscode';
 
-  let document = $state<PresentationDocument | undefined>(parsePersistedPresentation(vscode.getState()));
+  function initialDocument(): PresentationDocument | undefined {
+    const state = vscode.getState();
+    const envelope = parsePersistedPresentationState(state);
+    if (envelope) return envelope.document;
+    return parsePersistedPresentation(state);
+  }
+
+  function initialRootId(): string | undefined {
+    return parsePersistedPresentationState(vscode.getState())?.rootId;
+  }
+
+  let document = $state<PresentationDocument | undefined>(initialDocument());
+  let rootId = $state<string | undefined>(initialRootId());
   let article = $state<HTMLElement>();
   let renderGeneration = 0;
   let revealStatus = $state<'idle' | 'pending' | 'success' | 'failure'>('idle');
+  let copyStatus = $state<'idle' | 'copied' | 'failed'>('idle');
+  let copyResetTimer: ReturnType<typeof setTimeout> | undefined;
+  let revealResetTimer: ReturnType<typeof setTimeout> | undefined;
   const rendered = $derived(document ? renderPresentationMarkdown(document.markdown) : undefined);
+
+  function persist(): void {
+    if (!document) return;
+    vscode.setState(buildPersistedState(rootId, document));
+  }
 
   function showFallback(element: HTMLElement, reason: string, source: string): void {
     element.replaceChildren();
@@ -56,13 +80,42 @@
     rendered;
     const generation = ++renderGeneration;
     void renderDiagrams(generation);
-    return () => { renderGeneration++; };
+    return () => {
+      renderGeneration++;
+    };
   });
 
   function revealLinkedChat(): void {
     if (revealStatus === 'pending') return;
+    if (revealResetTimer) clearTimeout(revealResetTimer);
     revealStatus = 'pending';
     vscode.postMessage({ type: 'revealLinkedChat' });
+  }
+
+  async function copyMarkdown(): Promise<void> {
+    if (!document?.markdown) return;
+    try {
+      await navigator.clipboard.writeText(document.markdown);
+      copyStatus = 'copied';
+    } catch {
+      copyStatus = 'failed';
+    }
+    if (copyResetTimer) clearTimeout(copyResetTimer);
+    copyResetTimer = setTimeout(() => {
+      copyStatus = 'idle';
+    }, 1500);
+  }
+
+  function formatRelativeUpdated(iso: string | undefined): string {
+    if (!iso) return '';
+    const t = Date.parse(iso);
+    if (!Number.isFinite(t)) return '';
+    const delta = Date.now() - t;
+    if (delta < 15_000) return 'Updated just now';
+    if (delta < 60_000) return 'Updated moments ago';
+    if (delta < 3_600_000) return `Updated ${Math.floor(delta / 60_000)}m ago`;
+    if (delta < 86_400_000) return `Updated ${Math.floor(delta / 3_600_000)}h ago`;
+    return `Updated ${new Date(t).toLocaleString()}`;
   }
 
   function handleContentClick(event: MouseEvent): void {
@@ -80,20 +133,34 @@
       const revealResult = parsePresentationRevealResult(event.data);
       if (revealResult && revealStatus === 'pending') {
         revealStatus = revealResult.status;
+        if (revealResult.status === 'success') {
+          if (revealResetTimer) clearTimeout(revealResetTimer);
+          revealResetTimer = setTimeout(() => {
+            if (revealStatus === 'success') revealStatus = 'idle';
+          }, 2000);
+        }
         return;
       }
+      const parsed = parsePresentationUpdate(event.data);
+      if (!parsed) return;
       const accepted = applyPresentationUpdate(document, event.data);
       if (accepted === document) return;
       document = accepted;
-      vscode.setState(accepted);
+      if (parsed.rootId) rootId = parsed.rootId;
+      persist();
     };
     window.addEventListener('message', handleMessage);
     window.addEventListener('click', handleContentClick);
     return () => {
       window.removeEventListener('message', handleMessage);
       window.removeEventListener('click', handleContentClick);
+      if (copyResetTimer) clearTimeout(copyResetTimer);
+      if (revealResetTimer) clearTimeout(revealResetTimer);
     };
   });
+
+  const showSecondary = $derived(Boolean(document?.updatedAt || document?.sourcePath));
+  const relativeUpdated = $derived(formatRelativeUpdated(document?.updatedAt));
 </script>
 
 {#if document}
@@ -101,13 +168,66 @@
     class="presentation-shell"
     data-presentation-id={document.presentationId}
     data-presentation-revision={document.revision}
+    data-presentation-kind={document.kind ?? 'document'}
   >
     <header class="presentation-header">
-      <h1>{document.title}</h1>
-      <span aria-label={`Revision ${document.revision}`}>Revision {document.revision}</span>
-      <button type="button" disabled={revealStatus === 'pending'} onclick={revealLinkedChat}>Open linked chat</button>
-      <span role="status" aria-live="polite">{revealStatus === 'pending' ? 'Opening linked chat…' : revealStatus === 'success' ? 'Linked chat opened.' : revealStatus === 'failure' ? 'Could not open linked chat.' : ''}</span>
+      <div class="presentation-header__primary">
+        <div class="presentation-header__identity">
+          <span class="presentation-kind" aria-label={`Kind ${kindLabel(document.kind)}`}>
+            {kindLabel(document.kind)}
+          </span>
+          <h1 title={document.title}>{document.title}</h1>
+        </div>
+        <div class="presentation-header__actions">
+          <span
+            class="presentation-revision"
+            aria-label={`Revision ${document.revision}`}
+            title="Monotonic presentation revision"
+          >
+            v{document.revision}
+          </span>
+          <button
+            type="button"
+            class="presentation-icon-btn"
+            onclick={copyMarkdown}
+            title="Copy markdown"
+            aria-label="Copy markdown"
+          >
+            {copyStatus === 'copied' ? 'Copied' : copyStatus === 'failed' ? 'Failed' : 'Copy'}
+          </button>
+          <button
+            type="button"
+            class="presentation-primary-btn"
+            disabled={revealStatus === 'pending'}
+            onclick={revealLinkedChat}
+          >
+            {revealStatus === 'pending' ? 'Opening…' : 'Open linked chat'}
+          </button>
+        </div>
+      </div>
+      {#if showSecondary}
+        <div class="presentation-header__secondary">
+          {#if document.sourcePath}
+            <span class="presentation-source" title={document.sourcePath}>{document.sourcePath}</span>
+          {/if}
+          {#if relativeUpdated}
+            <span class="presentation-updated" title={document.updatedAt ?? ''}>{relativeUpdated}</span>
+          {/if}
+        </div>
+      {/if}
+      <span class="presentation-status" role="status" aria-live="polite">
+        {revealStatus === 'pending'
+          ? 'Opening linked chat…'
+          : revealStatus === 'success'
+            ? 'Linked chat opened.'
+            : revealStatus === 'failure'
+              ? 'Could not open linked chat.'
+              : ''}
+      </span>
     </header>
+    {#if document.summary}
+      <p class="presentation-summary">{document.summary}</p>
+    {/if}
     <article bind:this={article} class="markdown-body presentation-content">
       {@html rendered?.html ?? ''}
     </article>

@@ -17,7 +17,11 @@ class FakePanel implements PresentationPanel {
   revealError?: Error;
   private readonly disposeListeners = new Set<() => void>();
 
-  async update(document: PresentationDocument): Promise<boolean> {
+  async update(
+    document: PresentationDocument,
+    _rootId?: string,
+    _options?: { restore?: boolean },
+  ): Promise<boolean> {
     this.updates.push(document);
     if (this.disposeDuringUpdate) this.dispose();
     if (this.updateResult instanceof Error) throw this.updateResult;
@@ -78,6 +82,12 @@ const request = {
   title: 'Launch plan',
   markdown: '# Launch\n\n<script>hostile()</script>',
 };
+
+
+function withoutHostStamps<T extends { updatedAt?: string }>(doc: T): Omit<T, 'updatedAt'> {
+  const { updatedAt: _u, ...rest } = doc;
+  return rest;
+}
 
 describe('PresentationManager.openWorkspaceDocument', () => {
   it('opens a new panel for a workspace markdown document', async () => {
@@ -164,15 +174,15 @@ describe('PresentationManager', () => {
     const result = await manager.upsert(context, request);
 
     expect(result).toEqual({ ok: true, code: 'opened' });
-    expect(factory.created).toEqual([
-      {
-        presentationId: 'plan.main',
-        ownerTaskId: 'root-1',
-        revision: 1,
-        title: 'Launch plan',
-        markdown: '# Launch\n\n<script>hostile()</script>',
-      },
-    ]);
+    expect(factory.created).toHaveLength(1);
+    expect(withoutHostStamps(factory.created[0])).toEqual({
+      presentationId: 'plan.main',
+      ownerTaskId: 'root-1',
+      revision: 1,
+      title: 'Launch plan',
+      markdown: '# Launch\n\n<script>hostile()</script>',
+    });
+    expect(factory.created[0].updatedAt).toEqual(expect.any(String));
     expect(factory.panels[0].updates).toEqual(factory.created);
   });
 
@@ -388,16 +398,45 @@ describe('PresentationManager', () => {
         markdown: request.markdown,
       }),
     ).toEqual({ ok: true, code: 'restored' });
-    expect(panel.updates).toEqual([
-      {
+    expect(panel.updates).toHaveLength(1);
+    expect(withoutHostStamps(panel.updates[0])).toEqual({
+      presentationId: request.presentationId,
+      ownerTaskId: request.ownerTaskId,
+      revision: request.revision,
+      title: request.title,
+      markdown: request.markdown,
+    });
+    expect(factory.created).toEqual([]);
+  });
+
+  it('migrates legacy child owner to root when resolver is set, rejects unresolved owners', async () => {
+    const factory = new FakeFactory();
+    const manager = new PresentationManager(factory);
+    manager.setOwnerResolver((ownerId) => (ownerId === 'child-1' || ownerId === 'root-1' ? 'root-1' : undefined));
+    const panel = new FakePanel();
+    expect(
+      await manager.restore(panel, {
+        rootId: 'root-1',
         presentationId: request.presentationId,
-        ownerTaskId: request.ownerTaskId,
-        revision: request.revision,
+        ownerTaskId: 'child-1',
+        revision: 1,
         title: request.title,
         markdown: request.markdown,
-      },
-    ]);
-    expect(factory.created).toEqual([]);
+      }),
+    ).toEqual({ ok: true, code: 'restored' });
+    expect(panel.updates[0]?.ownerTaskId).toBe('root-1');
+
+    const bad = new FakePanel();
+    expect(
+      await manager.restore(bad, {
+        rootId: 'root-1',
+        presentationId: 'other-plan',
+        ownerTaskId: 'missing',
+        revision: 1,
+        title: request.title,
+        markdown: request.markdown,
+      }),
+    ).toEqual({ ok: false, code: 'restore_rejected' });
   });
 
   it('rejects malformed, conflicting, and failed restores with stable content-free codes', async () => {

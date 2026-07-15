@@ -26,10 +26,13 @@ async function openPresentation(page: Page, persistedState?: unknown) {
   await page.goto('/presentation.html');
 }
 
-async function postUpdate(page: Page, document: PresentationDocument) {
-  await page.evaluate((value) => {
-    window.postMessage({ type: 'presentationUpdate', document: value }, '*');
-  }, document);
+async function postUpdate(page: Page, document: PresentationDocument, rootId = 'task-root') {
+  await page.evaluate(
+    ({ value, root }) => {
+      window.postMessage({ type: 'presentationUpdate', document: value, rootId: root }, '*');
+    },
+    { value: document, root: rootId },
+  );
 }
 
 async function postRawMessage(page: Page, message: unknown) {
@@ -63,6 +66,7 @@ test('reveals linked chat with identity-free messages and accessible typed statu
   await postRawMessage(page, { type: 'revealLinkedChatResult', status: 'success' });
   await expect(action).toBeEnabled();
   await expect(page.getByRole('status')).toHaveText('Linked chat opened.');
+  // Success status is transient (clears after ~2s); failure stays until retry.
 
   const presentationRoot = page.locator('[data-presentation-id]');
   await presentationRoot.evaluate((element) => { element.setAttribute('data-test-instance', 'original'); });
@@ -94,13 +98,16 @@ test('restores a validated persisted presentation on browser startup', async ({ 
   await expect(page.getByRole('heading', { name: 'Restored body', level: 1 })).toBeVisible();
 });
 
-test('persists the last accepted host revision as exact VS Code state', async ({ page }) => {
+test('persists the last accepted host revision as exact VS Code envelope state', async ({ page }) => {
   await openPresentation(page);
   const accepted = presentation({ revision: 3, title: 'Persisted title', markdown: '# Persisted body' });
 
-  await postUpdate(page, accepted);
+  await postUpdate(page, accepted, 'task-root');
 
-  await expect.poll(() => page.evaluate(() => window.__musterPersistedState)).toEqual(accepted);
+  await expect.poll(() => page.evaluate(() => window.__musterPersistedState)).toEqual({
+    rootId: 'task-root',
+    document: accepted,
+  });
 });
 
 test('renders the waiting state for malformed persisted presentation state', async ({ page }) => {
@@ -261,7 +268,10 @@ test('preserves the last accepted revision after malformed, stale, or conflictin
   await expect(page.getByRole('heading', { name: 'Accepted title', level: 1 })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Accepted body', level: 1 })).toBeVisible();
   await expect(page.getByText(/Malformed title|Stale title|Other title|Wrong owner/)).toHaveCount(0);
-  await expect.poll(() => page.evaluate(() => window.__musterPersistedState)).toEqual(accepted);
+  await expect.poll(() => page.evaluate(() => window.__musterPersistedState)).toEqual({
+    rootId: 'task-root',
+    document: accepted,
+  });
 });
 
 declare global {

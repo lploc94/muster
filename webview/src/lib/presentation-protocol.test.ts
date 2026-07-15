@@ -41,7 +41,79 @@ describe('presentation browser protocol', () => {
       markdown: '# Ready',
     };
 
-    expect(parsePresentationUpdate({ type: 'presentationUpdate', document })).toEqual(document);
+    expect(parsePresentationUpdate({ type: 'presentationUpdate', document })).toEqual({ document });
+  });
+
+  it('accepts host restore migration that changes owner at same revision', () => {
+    const current = {
+      presentationId: 'release-notes',
+      ownerTaskId: 'child-1',
+      revision: 2,
+      title: 'Plan',
+      markdown: '# Body',
+    };
+    const migrated = {
+      ...current,
+      ownerTaskId: 'task-root',
+    };
+    expect(
+      applyPresentationUpdate(current, {
+        type: 'presentationUpdate',
+        document: migrated,
+        rootId: 'task-root',
+        restore: true,
+      }),
+    ).toEqual(migrated);
+    expect(
+      applyPresentationUpdate(current, {
+        type: 'presentationUpdate',
+        document: migrated,
+        rootId: 'task-root',
+      }),
+    ).toBe(current);
+    // restore cannot roll back to older revision
+    expect(
+      applyPresentationUpdate(
+        { ...migrated, revision: 3 },
+        {
+          type: 'presentationUpdate',
+          document: { ...migrated, revision: 2 },
+          restore: true,
+        },
+      ),
+    ).toEqual({ ...migrated, revision: 3 });
+  });
+
+  it('accepts optional host and coordinator fields and envelope restore', () => {
+    const document = {
+      presentationId: 'release-notes',
+      ownerTaskId: 'task-root',
+      revision: 1,
+      title: 'Release notes',
+      markdown: '# Ready',
+      kind: 'plan' as const,
+      summary: 'Ship notes',
+      sourcePath: 'docs/plan.md',
+      sourceFolderUri: 'file:///ws',
+      updatedAt: '2026-07-15T00:00:00.000Z',
+    };
+    expect(parsePresentationUpdate({ type: 'presentationUpdate', document, rootId: 'root-1' })).toEqual({
+      document,
+      rootId: 'root-1',
+    });
+    expect(
+      parsePersistedPresentation({
+        rootId: 'root-1',
+        document,
+      }),
+    ).toEqual(document);
+    expect(
+      parsePresentationUpdate({
+        type: 'presentationUpdate',
+        document: { ...document, sourcePath: document.sourcePath },
+        rootId: 'bad id',
+      }),
+    ).toBeUndefined();
   });
 
   it('restores only an exact, bounded persisted presentation document', () => {

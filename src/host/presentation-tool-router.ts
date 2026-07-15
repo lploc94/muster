@@ -28,6 +28,9 @@ export class PresentationToolRouter implements ToolCallHandler {
       revision: command.revision,
       title: command.title,
       markdown: command.markdown,
+      ...(command.presentationKind !== undefined ? { kind: command.presentationKind } : {}),
+      ...(command.summary !== undefined ? { summary: command.summary } : {}),
+      ...(command.changeSummary !== undefined ? { changeSummary: command.changeSummary } : {}),
     };
     let result;
     try {

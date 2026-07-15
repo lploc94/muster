@@ -97,10 +97,21 @@ export function createPresentationPanelAdapter(
   }
 
   return {
-    async update(document: PresentationDocument): Promise<boolean> {
-      if (boundOwnerTaskId && document.ownerTaskId !== boundOwnerTaskId) return false;
+    async update(
+      document: PresentationDocument,
+      rootId?: string,
+      options?: { restore?: boolean },
+    ): Promise<boolean> {
+      if (boundOwnerTaskId && document.ownerTaskId !== boundOwnerTaskId) {
+        if (!options?.restore) return false;
+        // Host-authorized restore migration may rebind owner once.
+        boundOwnerTaskId = document.ownerTaskId;
+      }
       if (!boundOwnerTaskId) boundOwnerTaskId = document.ownerTaskId;
-      const accepted = await panel.webview.postMessage({ type: 'presentationUpdate', document });
+      const message: Record<string, unknown> = { type: 'presentationUpdate', document };
+      if (rootId !== undefined) message.rootId = rootId;
+      if (options?.restore) message.restore = true;
+      const accepted = await panel.webview.postMessage(message);
       if (accepted) {
         try { panel.title = document.title; } catch { /* editor chrome is best-effort */ }
       }
@@ -124,7 +135,12 @@ export function createPresentationPanelFactory(
         'muster.presentation',
         document.title,
         { viewColumn: host.besideColumn, preserveFocus: false },
-        { enableScripts: true, retainContextWhenHidden: true, localResourceRoots: [resourceRoot] },
+        {
+          enableScripts: true,
+          enableFindWidget: true,
+          retainContextWhenHidden: true,
+          localResourceRoots: [resourceRoot],
+        },
       );
       return configurePresentationPanel(panel, () =>
         createPresentationPanelAdapter(host, panel, extensionUri, document.ownerTaskId, revealLinkedChat),

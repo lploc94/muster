@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   clampPresentationMarkdown,
   isWorkspaceMarkdownHref,
+  presentationIdFromFolderAndRelativePath,
   presentationIdFromRelativePath,
   resolveWorkspaceMarkdownPath,
   titleFromMarkdownPath,
@@ -26,13 +27,16 @@ describe('isWorkspaceMarkdownHref', () => {
 
 describe('resolveWorkspaceMarkdownPath', () => {
   const root = '/Users/me/proj';
+  const folderUri = 'file:///Users/me/proj';
 
   it('resolves relative path under workspace', () => {
     const t = resolveWorkspaceMarkdownPath('docs/plan.md', [root]);
     expect(t).toEqual({
       absolutePath: '/Users/me/proj/docs/plan.md',
-      presentationId: presentationIdFromRelativePath('docs/plan.md'),
+      presentationId: presentationIdFromFolderAndRelativePath(folderUri, 'docs/plan.md'),
       title: 'plan',
+      sourcePath: 'docs/plan.md',
+      sourceFolderUri: folderUri,
     });
   });
 
@@ -45,11 +49,27 @@ describe('resolveWorkspaceMarkdownPath', () => {
     const t = resolveWorkspaceMarkdownPath('/Users/me/proj/docs/x.md', [root]);
     expect(t?.absolutePath).toBe('/Users/me/proj/docs/x.md');
     expect(t?.title).toBe('x');
+    expect(t?.sourcePath).toBe('docs/x.md');
+  });
+
+  it('gives distinct ids for a-b vs a/b and multi-root same relative path', () => {
+    const a = resolveWorkspaceMarkdownPath('docs/a-b.md', [root]);
+    const b = resolveWorkspaceMarkdownPath('docs/a/b.md', [root]);
+    expect(a?.presentationId).not.toBe(b?.presentationId);
+    const r1 = resolveWorkspaceMarkdownPath('notes/plan.md', [
+      { fsPath: '/ws/one', uri: 'file:///ws/one' },
+    ]);
+    const r2 = resolveWorkspaceMarkdownPath('notes/plan.md', [
+      { fsPath: '/ws/two', uri: 'file:///ws/two' },
+    ]);
+    expect(r1?.presentationId).not.toBe(r2?.presentationId);
+    expect(r1?.sourceFolderUri).toBe('file:///ws/one');
+    expect(r2?.sourceFolderUri).toBe('file:///ws/two');
   });
 });
 
 describe('presentationIdFromRelativePath', () => {
-  it('produces stable ids', () => {
+  it('produces legacy slug ids', () => {
     expect(presentationIdFromRelativePath('docs/plans/foo.md')).toBe('md:docs-plans-foo.md');
   });
 });

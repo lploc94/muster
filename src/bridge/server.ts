@@ -420,6 +420,9 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
       revision: { type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
       title: { type: 'string', minLength: 1, maxLength: PRESENTATION_TITLE_MAX_LENGTH },
       markdown: { type: 'string', minLength: 1, maxLength: PRESENTATION_MARKDOWN_MAX_LENGTH },
+      kind: { type: 'string', enum: ['plan', 'spec', 'document'] },
+      summary: { type: 'string', minLength: 1, maxLength: 600 },
+      changeSummary: { type: 'string', minLength: 1, maxLength: 1000 },
     },
     additionalProperties: false,
   },
@@ -491,7 +494,7 @@ function createMcpServer(
                           : name === 'set_task_lifecycle'
                             ? "Parent-seal a direct child's lifecycle (succeeded/failed/…). Use when child did not complete_task."
                             : name === 'upsert_presentation'
-                              ? 'Open or refresh a read-only IDE tab with Markdown (```mermaid``` fences supported). REQUIRED when the user asks to plan/spec for review or when a plan is ready: pass the full plan as markdown — do not only paste it in chat. Args: presentationId (stable, e.g. plan-<taskId>), ownerTaskId (must equal self.taskId), opId (unique per call), revision (1 then ++ on each update), title, markdown.'
+                              ? 'Open or refresh a read-only IDE tab with Markdown (```mermaid``` fences supported). REQUIRED when the user asks to plan/spec for review or when a plan is ready: pass the full plan as markdown — do not only paste it in chat. Args: presentationId (stable, e.g. plan-<taskId>), ownerTaskId (must equal self.taskId), opId (unique per call), revision (1 then ++), title, markdown, optional kind (plan|spec|document), optional summary. Never send sourcePath, sourceFolderUri, updatedAt, or rootId (host-owned).'
                             : `Muster coordinator tool: ${name}`,
         inputSchema: TOOL_INPUT_SCHEMAS[name],
       })),

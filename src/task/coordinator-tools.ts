@@ -87,7 +87,13 @@ const PRESENTATION_KEYS = new Set([
   'revision',
   'title',
   'markdown',
+  'kind',
+  'summary',
+  'changeSummary',
 ]);
+const PRESENTATION_KIND_VALUES = new Set(['plan', 'spec', 'document']);
+const PRESENTATION_SUMMARY_MAX_LENGTH = 600;
+const PRESENTATION_CHANGE_SUMMARY_MAX_LENGTH = 1000;
 const STABLE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 
 export type ToolCommand =
@@ -157,6 +163,9 @@ export type ToolCommand =
       revision: number;
       title: string;
       markdown: string;
+      presentationKind?: 'plan' | 'spec' | 'document';
+      summary?: string;
+      changeSummary?: string;
     };
 
 const MUTATING_TOOLS: ReadonlySet<string> = new Set([
@@ -261,7 +270,10 @@ function isPresentationPayloadTooLarge(args: Record<string, unknown>): boolean {
     (typeof args.ownerTaskId === 'string' && args.ownerTaskId.length > PRESENTATION_ID_MAX_LENGTH) ||
     (typeof args.opId === 'string' && args.opId.length > PRESENTATION_ID_MAX_LENGTH) ||
     (typeof args.title === 'string' && args.title.length > PRESENTATION_TITLE_MAX_LENGTH) ||
-    (typeof args.markdown === 'string' && args.markdown.length > PRESENTATION_MARKDOWN_MAX_LENGTH)
+    (typeof args.markdown === 'string' && args.markdown.length > PRESENTATION_MARKDOWN_MAX_LENGTH) ||
+    (typeof args.summary === 'string' && args.summary.length > PRESENTATION_SUMMARY_MAX_LENGTH) ||
+    (typeof args.changeSummary === 'string' &&
+      args.changeSummary.length > PRESENTATION_CHANGE_SUMMARY_MAX_LENGTH)
   );
 }
 
@@ -934,6 +946,27 @@ export function dispatch(
         if (ownerTaskId !== ctx.callerTaskId) {
           return { ok: false, toolError: 'owner_mismatch' };
         }
+        let presentationKind: 'plan' | 'spec' | 'document' | undefined;
+        if (args.kind !== undefined) {
+          if (typeof args.kind !== 'string' || !PRESENTATION_KIND_VALUES.has(args.kind)) {
+            return { ok: false, toolError: 'invalid_arguments' };
+          }
+          presentationKind = args.kind as 'plan' | 'spec' | 'document';
+        }
+        let summary: string | undefined;
+        if (args.summary !== undefined) {
+          if (typeof args.summary !== 'string' || args.summary.length === 0) {
+            return { ok: false, toolError: 'invalid_arguments' };
+          }
+          summary = args.summary;
+        }
+        let changeSummary: string | undefined;
+        if (args.changeSummary !== undefined) {
+          if (typeof args.changeSummary !== 'string' || args.changeSummary.length === 0) {
+            return { ok: false, toolError: 'invalid_arguments' };
+          }
+          changeSummary = args.changeSummary;
+        }
         return {
           ok: true,
           command: {
@@ -941,9 +974,12 @@ export function dispatch(
             presentationId,
             ownerTaskId,
             opId,
-            revision: args.revision,
+            revision: args.revision as number,
             title,
             markdown,
+            ...(presentationKind !== undefined ? { presentationKind } : {}),
+            ...(summary !== undefined ? { summary } : {}),
+            ...(changeSummary !== undefined ? { changeSummary } : {}),
           },
         };
       }
