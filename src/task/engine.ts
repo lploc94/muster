@@ -2812,13 +2812,36 @@ export class TaskEngine {
           failureClass: 'uncertain',
           dispatchPhase: draftTurn.dispatchPhase ?? 'prompt_outstanding',
         };
-        holdQueuedFollowUpsOnFailure(draft, draftTurn.taskId);
+        const task = draft.tasks[draftTurn.taskId];
+        // Preserve answer continuations while awaiting parent answer.
+        if (task?.attention?.code !== 'awaiting_parent_answer') {
+          holdQueuedFollowUpsOnFailure(draft, draftTurn.taskId);
+        }
+        // Reconstruct missing disposition-repair turns after reload.
+        if (task?.attention?.code === 'disposition_repair_pending' && task.lifecycle === 'open') {
+          const repairId = `${turn.id}-disposition-repair`;
+          if (!draft.turns[repairId]) {
+            // Mark for post-commit enqueue (cannot schedule inside commit).
+            draft.tasks[draftTurn.taskId] = {
+              ...task,
+              attention: {
+                ...task.attention,
+                message: `${task.attention.message}; reload will requeue repair`,
+              },
+            };
+          }
+        }
         return { ok: true };
       });
       this.acceptedOpIds.delete(turn.id);
       this.askBridge.cancelForTurn(turn.id, 'reload interrupt');
       this.dropElicitationWaits(turn.id);
       this.credentialRegistry?.revoke(turn.id);
+      // Re-queue disposition repair for interrupted turns that still need it.
+      const taskAfter = this.store.getFile().tasks[turn.taskId];
+      if (taskAfter?.attention?.code === 'disposition_repair_pending') {
+        this.enqueueDispositionRepair(turn.taskId, turn.id);
+      }
     }
 
     this.reconcileOrphanedHandoffs();
@@ -3314,6 +3337,8 @@ export class TaskEngine {
       }
       return { ok: true };
     });
+    // Do not call reconcileChildWaits here: scheduleTurn → applyDependencyTerminals
+    // would recurse. Parents wake on the next settle/afterTurnSettled path.
   }
 
   private afterTurnSettled(turnId: string): void {
@@ -4605,10 +4630,26 @@ export class TaskEngine {
             nextTask = { ...nextTask, committedSessionId: bindId };
           }
         }
+        // Repair turn failure: escalate to wakeable missing_disposition.
+        if (
+          turnId.endsWith('-disposition-repair') &&
+          nextTask.attention?.code === 'disposition_repair_pending'
+        ) {
+          nextTask = {
+            ...nextTask,
+            attention: {
+              code: 'missing_disposition',
+              message: 'disposition repair turn failed',
+              at: now,
+              sourceTurnId: turnId,
+            },
+          };
+        }
         draft.tasks[task.id] = nextTask;
-        // Freeze pre-existing FIFO follow-ups before auto-retry is created so
-        // the new retry turn is not holdAutoPromote-marked.
-        holdQueuedFollowUpsOnFailure(draft, task.id);
+        // Do not hold follow-ups when awaiting parent answer (answer continuation must promote).
+        if (nextTask.attention?.code !== 'awaiting_parent_answer') {
+          holdQueuedFollowUpsOnFailure(draft, task.id);
+        }
 
         for (const effect of result.effects) {
           if (effect.kind === 'enqueueRetry') {

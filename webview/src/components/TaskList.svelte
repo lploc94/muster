@@ -228,6 +228,11 @@
                 {#if task.continuationOf}
                   <span style="font-size: 10px;">↳ cont.</span>
                 {/if}
+                {#if task.childOrchestration?.label}
+                  <span class="text-[10px] leading-[12px] opacity-75" use:tip={task.childOrchestration.label}
+                    >{task.childOrchestration.label}</span
+                  >
+                {/if}
                 <span class="ml-auto text-[10px] opacity-60" use:tip={task.updatedAt}>
                   {new Date(task.updatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                 </span>

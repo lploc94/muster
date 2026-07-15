@@ -393,8 +393,12 @@ export function applySuccessfulTurn(
 
   const disposition = turn.disposition;
   if (!disposition || disposition.kind === 'idle') {
-    // Engine attention / child-question turns: no disposition expected.
-    if (turn.id.endsWith('-attention') || turn.id.includes('-child-question-')) {
+    // Engine attention / parent-question turns: no disposition expected.
+    if (
+      turn.id.endsWith('-attention') ||
+      turn.id.includes('-child-question-') ||
+      turn.id.includes('parent-q-')
+    ) {
       return {
         ok: true,
         next: { task, turn: succeededTurn },

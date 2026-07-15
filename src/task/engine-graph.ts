@@ -2052,46 +2052,79 @@ export async function executeToolCommand(
           revision: parent.revision + 1,
           updatedAt: now,
         };
-        // Idle open parent without active wait: queue deterministic turn with Q payload.
-        if (
-          parent.lifecycle === 'open' &&
-          !(parent.wait?.kind === 'children' && parent.wait.phase === 'active')
-        ) {
-          const hasLive = turnsForTask(draft, parentId).some(
-            (t) => t.status === 'running' || t.status === 'waiting_user' || t.status === 'queued',
-          );
-          if (!hasLive) {
-            const qTurnId = deriveEntityId(ctx.turnId, command.opId, 'parent-q');
-            const turnCap = canCreateTurn(draft, parentId, limits);
-            if (turnCap.ok && !draft.turns[qTurnId]) {
-              const messageId = randomUUID();
-              const qLines = questions
-                .map((q, i) => `Q${i + 1}: ${q.prompt}`)
-                .join('\n');
-              draft.messages[messageId] = {
-                id: messageId,
-                taskId: parentId,
-                role: 'user',
-                content:
-                  `Child ${ctx.callerTaskId} asks (questionId=${questionId}). ` +
-                  `Call answer_child_question with this questionId.\n${qLines}`,
-                state: 'assigned',
-                createdAt: now,
-                turnId: qTurnId,
+        // Deliver question to an open parent (or nearest open ancestor coordinator).
+        let deliverParentId = parentId;
+        let deliverParent = parentPatch;
+        if (deliverParent.lifecycle !== 'open') {
+          let walk = deliverParent.parentId;
+          const seen = new Set<string>();
+          while (walk && !seen.has(walk)) {
+            seen.add(walk);
+            const anc = draft.tasks[walk];
+            if (!anc) break;
+            if (anc.lifecycle === 'open' && anc.role === 'coordinator') {
+              deliverParentId = walk;
+              deliverParent = {
+                ...anc,
+                pendingChildQuestions: {
+                  ...(anc.pendingChildQuestions ?? {}),
+                  [questionId]: {
+                    fromChildId: ctx.callerTaskId,
+                    questions,
+                    askedAt: now,
+                  },
+                },
+                attention: {
+                  code: 'child_question',
+                  message: `child ${ctx.callerTaskId} needs input`,
+                  at: now,
+                  sourceTurnId: ctx.turnId,
+                },
+                revision: anc.revision + 1,
+                updatedAt: now,
               };
-              const cont = transitionContinueTask(parentPatch, turnsForTask(draft, parentId), {
+              break;
+            }
+            walk = anc.parentId;
+          }
+        }
+        // Queue deterministic turn with Q payload (FIFO behind live/queued work).
+        if (deliverParent.lifecycle === 'open') {
+          const qTurnId = deriveEntityId(ctx.turnId, command.opId, 'parent-q');
+          const turnCap = canCreateTurn(draft, deliverParentId, limits);
+          if (turnCap.ok && !draft.turns[qTurnId]) {
+            const messageId = randomUUID();
+            const qLines = questions.map((q, i) => `Q${i + 1}: ${q.prompt}`).join('\n');
+            draft.messages[messageId] = {
+              id: messageId,
+              taskId: deliverParentId,
+              role: 'user',
+              content:
+                `Child ${ctx.callerTaskId} asks (questionId=${questionId}). ` +
+                `Call answer_child_question with this questionId.\n${qLines}`,
+              state: 'assigned',
+              createdAt: now,
+              turnId: qTurnId,
+            };
+            const cont = transitionContinueTask(
+              deliverParent,
+              turnsForTask(draft, deliverParentId),
+              {
                 turnId: qTurnId,
                 now,
                 inputs: [{ kind: 'message', messageId }],
                 trigger: 'engine',
-              });
-              if (cont.ok) {
-                draft.turns[qTurnId] = cont.next;
-              }
+              },
+            );
+            if (cont.ok) {
+              draft.turns[qTurnId] = cont.next;
             }
           }
         }
         draft.tasks[parentId] = parentPatch;
+        if (deliverParentId !== parentId) {
+          draft.tasks[deliverParentId] = deliverParent;
+        }
         writeLedger(draft, ctx.turnId, command.opId, fingerprint, {
           ok: true,
           data: { questionId, parentTaskId: parentId },
