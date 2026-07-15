@@ -390,7 +390,7 @@ describe('applySuccessfulTurn', () => {
     }
   });
 
-  it('idle disposition sets missing_disposition attention without sealing', () => {
+  it('idle disposition sets disposition_repair_pending (non-wakeable) without sealing', () => {
     const result = applySuccessfulTurn(
       baseTask({ id: 'child-1', parentId: 'root-1' }),
       { ...running, taskId: 'child-1', disposition: { kind: 'idle' } },
@@ -399,8 +399,87 @@ describe('applySuccessfulTurn', () => {
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.next.task.lifecycle).toBe('open');
-      expect(result.next.task.attention?.code).toBe('missing_disposition');
+      expect(result.next.task.attention?.code).toBe('disposition_repair_pending');
       expect(result.next.task.sealedBy).toBeUndefined();
+    }
+  });
+
+  it('repair turn still omitting disposition sets wakeable missing_disposition', () => {
+    const result = applySuccessfulTurn(
+      baseTask({ id: 'child-1', parentId: 'root-1' }),
+      {
+        ...running,
+        id: 't1-disposition-repair',
+        taskId: 'child-1',
+        disposition: { kind: 'idle' },
+      },
+      { now: NOW },
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.next.task.attention?.code).toBe('missing_disposition');
+    }
+  });
+
+  it('resolveChildWait does not attention-wake on disposition_repair_pending', () => {
+    const parent = baseTask({
+      id: 'coord',
+      parentId: null,
+      wait: {
+        kind: 'children',
+        taskIds: ['child-1'],
+        registeredByTurnId: 't-wait',
+        wakeOn: ['terminal', 'needs_attention'],
+        phase: 'active',
+        terminalObserved: {},
+      },
+    });
+    const result = resolveChildWait(
+      parent,
+      new Map([['child-1', 'open']]),
+      [turn({ id: 't-wait', status: 'succeeded', sequence: 1 })],
+      {
+        continuationTurnId: 't-wait-continuation',
+        now: NOW,
+        childAttention: new Map([['child-1', { code: 'disposition_repair_pending' }]]),
+      },
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.next.turn).toBeUndefined();
+      const wait = result.next.task.wait;
+      expect(wait?.kind === 'children' ? wait.phase : undefined).not.toBe('suspended_attention');
+    }
+  });
+
+  it('resolveChildWait attention-wakes on missing_disposition', () => {
+    const parent = baseTask({
+      id: 'coord',
+      parentId: null,
+      wait: {
+        kind: 'children',
+        taskIds: ['child-1'],
+        registeredByTurnId: 't-wait',
+        wakeOn: ['terminal', 'needs_attention'],
+        phase: 'active',
+        terminalObserved: {},
+      },
+    });
+    const result = resolveChildWait(
+      parent,
+      new Map([['child-1', 'open']]),
+      [turn({ id: 't-wait', status: 'succeeded', sequence: 1 })],
+      {
+        continuationTurnId: 't-wait-continuation',
+        now: NOW,
+        childAttention: new Map([['child-1', { code: 'missing_disposition' }]]),
+      },
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.next.turn?.id).toBe('t-wait-attention');
+      const wait = result.next.task.wait;
+      expect(wait?.kind === 'children' ? wait.phase : undefined).toBe('suspended_attention');
     }
   });
 

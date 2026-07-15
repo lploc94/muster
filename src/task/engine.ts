@@ -4312,6 +4312,9 @@ export class TaskEngine {
               ? task.result.length
               : task?.taskResult?.summary?.length ?? 0,
         });
+        if (task?.attention?.code === 'disposition_repair_pending' && task.lifecycle === 'open') {
+          this.enqueueDispositionRepair(task.id, turnId);
+        }
       } else {
         console.info('[muster][task-orch] turn.settle.commit_failed', {
           turnId,
@@ -4321,6 +4324,75 @@ export class TaskEngine {
       return commit.ok;
     } finally {
       this.settling.delete(turnId);
+    }
+  }
+
+  /**
+   * P0.5: at most one disposition-repair turn after CLI success without complete/fail.
+   * Id derived from settled turn for reload idempotency. Never seals lifecycle.
+   */
+  private enqueueDispositionRepair(taskId: string, settledTurnId: string): void {
+    const repairTurnId = `${settledTurnId}-disposition-repair`;
+    const now = nowIso(this.clock);
+    const commit = this.store.commit((draft) => {
+      if (draft.turns[repairTurnId]) {
+        return { ok: true };
+      }
+      const task = draft.tasks[taskId];
+      if (!task || task.lifecycle !== 'open') {
+        return { ok: true };
+      }
+      if (task.attention?.code !== 'disposition_repair_pending') {
+        return { ok: true };
+      }
+      // Only auto-repair under parent_may_seal_direct (default) for non-root workers.
+      if (task.parentId === null) {
+        return { ok: true };
+      }
+      let rootId = task.id;
+      let walk: string | null = task.parentId;
+      const seen = new Set<string>();
+      while (walk && !seen.has(walk)) {
+        seen.add(walk);
+        rootId = walk;
+        walk = draft.tasks[walk]?.parentId ?? null;
+      }
+      const rootPolicy = draft.tasks[rootId]?.childOrchestrationSeal;
+      if (rootPolicy === 'propose_only') {
+        return { ok: true };
+      }
+      const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
+      if (!turnCap.ok) {
+        return { ok: true };
+      }
+      const messageId = randomUUID();
+      const content =
+        'Muster host: previous turn finished without complete_task/fail_task. ' +
+        'Inspect your prior work in this session and stage complete_task (with a short summary) ' +
+        'or fail_task. Do not invent success; do not start new work.';
+      draft.messages[messageId] = {
+        id: messageId,
+        taskId,
+        role: 'user',
+        content,
+        state: 'assigned',
+        createdAt: now,
+        turnId: repairTurnId,
+      };
+      const continued = transitionContinueTask(task, turnsForTask(draft, taskId), {
+        turnId: repairTurnId,
+        now,
+        inputs: [{ kind: 'message', messageId }],
+        trigger: 'engine',
+      });
+      if (!continued.ok) {
+        return continued;
+      }
+      draft.turns[repairTurnId] = continued.next;
+      return { ok: true };
+    });
+    if (commit.ok && this.store.getFile().turns[repairTurnId]?.status === 'queued') {
+      void this.scheduleTurn(repairTurnId);
     }
   }
 

@@ -88,6 +88,8 @@ export interface ResolvedInputPin {
 
 export type TaskAttentionCode =
   | 'missing_disposition'
+  /** Non-wakeable: disposition repair in progress (excluded from parent wait needs_attention). */
+  | 'disposition_repair_pending'
   | 'missing_input'
   | 'dependency_blocked'
   | 'recovery_exhausted'

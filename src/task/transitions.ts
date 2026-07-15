@@ -393,14 +393,20 @@ export function applySuccessfulTurn(
 
   const disposition = turn.disposition;
   if (!disposition || disposition.kind === 'idle') {
-    // CLI success without disposition: no seal; raise attention (W4).
+    // CLI success without disposition: no seal.
+    // First omission on a normal turn → non-wakeable repair_pending (P0.5).
+    // Repair turn still omitting → wakeable missing_disposition for parent.
+    const isRepairTurn = turn.id.endsWith('-disposition-repair');
+    const attentionCode = isRepairTurn ? 'missing_disposition' : 'disposition_repair_pending';
     return {
       ok: true,
       next: {
         task: bumpTask(task, options.now, {
           attention: {
-            code: 'missing_disposition',
-            message: 'turn succeeded without complete/fail disposition',
+            code: attentionCode,
+            message: isRepairTurn
+              ? 'disposition repair turn still omitted complete/fail'
+              : 'turn succeeded without complete/fail disposition; repair pending',
             at: options.now,
             sourceTurnId: turn.id,
           },
@@ -1093,7 +1099,11 @@ export function resolveChildWait(
     wait.phase !== 'suspended_attention' &&
     options.childAttention
   ) {
-    const attentionChild = wait.taskIds.find((id) => options.childAttention?.get(id));
+    const attentionChild = wait.taskIds.find((id) => {
+      const att = options.childAttention?.get(id);
+      // disposition_repair_pending must not wake the parent (P0.5).
+      return att !== undefined && att.code !== 'disposition_repair_pending';
+    });
     if (attentionChild && !wait.attentionContinuationTurnId) {
       const attentionTurnId = `${wait.registeredByTurnId}-attention`;
       if (!turns.some((t) => t.id === attentionTurnId)) {

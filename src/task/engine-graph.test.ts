@@ -1616,6 +1616,70 @@ describe('engine graph batch create/delegate', () => {
     await engine.whenIdle();
   });
 
+  it('P0.5: child turn without disposition queues one disposition-repair turn', async () => {
+    const { store, engine, credentials, resume } = makeHarness();
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child', 'wait_child'],
+    });
+    const started = engine.startTask('coord');
+    if (!started.ok) return;
+    const turnId = started.value.turnId;
+    await waitTurnRunning(store, turnId);
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId,
+      allowedActions: new Set(['delegate_task', 'wait_for_tasks']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    const del = await engine.handleToolCall(ctx, 'delegate_task', {
+      kind: 'delegate_task',
+      opId: 'op-repair-child',
+      waitForCompletion: true,
+      spec: { goal: 'work', taskType: 'worker' },
+    });
+    expect(del.ok).toBe(true);
+    const childId = deriveEntityId(turnId, 'op-repair-child', 'task');
+    const childTurn = Object.values(store.getFile().turns).find(
+      (t) => t.taskId === childId && t.sequence === 1,
+    );
+    expect(childTurn).toBeDefined();
+    // Wait child turn running, then settle with idle (no complete_task).
+    for (let i = 0; i < 50 && store.getFile().turns[childTurn!.id]?.status !== 'running'; i++) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    engine.stageDisposition(childTurn!.id, { kind: 'idle' }, 'op-child-idle');
+    resume();
+    await engine.whenIdle();
+    const child = store.getTask(childId);
+    // After idle settle: either repair_pending or already advanced to missing after repair.
+    const repairId = `${childTurn!.id}-disposition-repair`;
+    const repairTurn = store.getFile().turns[repairId];
+    // Repair should have been created (at most once).
+    expect(repairTurn).toBeDefined();
+    expect(repairTurn?.id).toBe(repairId);
+    // Parent wait should not have attention-woken solely for repair_pending mid-repair.
+    // (coord may still be running; child lifecycle open)
+    expect(child?.lifecycle).toBe('open');
+    engine.stageDisposition(turnId, { kind: 'idle' }, 'op-coord-idle');
+    if (repairTurn && (repairTurn.status === 'running' || repairTurn.status === 'queued')) {
+      // Drain repair if still live
+      for (let i = 0; i < 50 && store.getFile().turns[repairId]?.status === 'queued'; i++) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      if (store.getFile().turns[repairId]?.status === 'running') {
+        engine.stageDisposition(repairId, { kind: 'idle' }, 'op-repair-idle');
+      }
+    }
+    resume();
+    await engine.whenIdle();
+  });
+
   it('P0: compound wait requires wait_for_tasks permission', async () => {
     const { store, engine, credentials, resume } = makeHarness();
     engine.createTask({
