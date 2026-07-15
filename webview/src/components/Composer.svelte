@@ -149,7 +149,12 @@
   let mentionImeComposing = $state(false);
 
   // ---- Skill picker (hybrid autocomplete + chips) -----------------------------
-  /** Per-backend advertised skills + invocation prefix, fetched via `listSkills`. */
+  /**
+   * Discovered skills for the current backend + the uniform composer trigger
+   * prefix (always `/`, see SKILL_TRIGGER_PREFIX), fetched via `listSkills`. The
+   * prefix here is the trigger/display char, NOT the wire prefix — the host
+   * translates to `$` for Codex at injection time.
+   */
   let skillCatalog = $state<{ backend: string; prefix: string; skills: string[] } | null>(null);
   /** Backend for the in-flight/last `listSkills` request (avoids redundant posts). */
   let lastRequestedSkillBackend: string | null = null;
@@ -207,6 +212,14 @@
   function scrollActiveMentionOptionIntoView(index: number) {
     if (!mentionListboxRegion || index < 0) return;
     const option = mentionListboxRegion.querySelector(`#${fileMentionOptionId(index)}`);
+    if (option instanceof HTMLElement) {
+      option.scrollIntoView({ block: 'nearest' });
+    }
+  }
+
+  function scrollActiveSkillOptionIntoView(index: number) {
+    if (!skillListboxRegion || index < 0) return;
+    const option = skillListboxRegion.querySelector(`#${skillOptionId(index)}`);
     if (option instanceof HTMLElement) {
       option.scrollIntoView({ block: 'nearest' });
     }
@@ -1181,6 +1194,7 @@
       }
       if (skillIntent.kind === 'move') {
         skillActiveIndex = skillIntent.activeIndex;
+        queueMicrotask(() => scrollActiveSkillOptionIntoView(skillIntent.activeIndex));
         return;
       }
       if (skillIntent.kind === 'accept') {

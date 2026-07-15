@@ -20,7 +20,7 @@ import type {
   PermissionController,
   QuestionController,
 } from './backends/acp-client';
-import { skillPrefixForBackend } from './backends/skill-prefix';
+import { SKILL_TRIGGER_PREFIX, skillPrefixForBackend } from './backends/skill-prefix';
 import { discoverSkillNames } from './host/skill-discovery';
 import { ElicitationBridge } from './bridge/elicitation-bridge';
 import type { PermissionAuditEntry, PermissionMode } from './backends/permission-policy';
@@ -736,16 +736,18 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * Answer a `listSkills` request with the backend's per-backend invocation prefix
-   * and its advertised skill/command set. NOT cached: the advertised set is
-   * populated lazily after a backend first runs, so re-read on every request
-   * (reading the static prefix map + a read-only peek is cheap). `prefix` is
-   * ALWAYS returned so the webview trigger char works even when `skills` is empty
-   * (UNKNOWN / cold cache → graceful inline-text degrade).
+   * Answer a `listSkills` request with the uniform composer trigger prefix and the
+   * backend's discovered skills. The trigger prefix is ALWAYS `/`, identical for
+   * every backend: the picker UX is normalized to `/` and the host translates to
+   * the per-backend wire prefix (`$` for Codex) at injection time — so this is the
+   * TRIGGER/display prefix, NOT `skillPrefixForBackend` (the injection prefix).
+   * NOT cached: skills are re-discovered on every request (a cheap disk scan);
+   * `prefix` is ALWAYS returned so the trigger char works even when `skills` is
+   * empty (cold cache → graceful inline-text degrade).
    */
   private postAvailableSkills(backend: string): void {
     if (typeof backend !== 'string' || !backend) return;
-    const prefix = skillPrefixForBackend(backend);
+    const prefix = SKILL_TRIGGER_PREFIX;
     // Discover skills from disk (.claude/skills, .codex/skills, ...) so the picker
     // works cold and lists only real skills — the ACP advertised set is polluted
     // with built-in slash commands and only populates after a session has run.

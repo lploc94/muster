@@ -567,7 +567,10 @@ describe('composer selection protocol', () => {
 describe('skills protocol', () => {
   it('accepts host skillsAvailable messages (incl. empty cold-cache set)', () => {
     expect(
-      isExtMessage({ type: 'skillsAvailable', backend: 'codex', prefix: '$', skills: ['plan'] }),
+      // Host now sends the uniform `/` trigger prefix for every backend (Codex
+      // included); the `$` injection prefix is applied host-side and is never sent
+      // in the skillsAvailable webview message.
+      isExtMessage({ type: 'skillsAvailable', backend: 'codex', prefix: '/', skills: ['plan'] }),
     ).toBe(true);
     expect(
       isExtMessage({ type: 'skillsAvailable', backend: 'claude', prefix: '/', skills: [] }),
