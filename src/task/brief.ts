@@ -22,8 +22,8 @@ export const BRIEF_LIST_MAX_ITEMS = 32;
 
 const KIND_PREAMBLES: Readonly<Record<TaskBriefKind, string>> = {
   coordinate:
-    'You are coordinating a multi-task workflow. Create a clear plan graph, wait for children, and seal only via host policy. When a step must be verified, delegate a verify task that depends on the work and have downstream tasks depend on that verify task; a non-pass verdict then blocks downstream and auto-remediation attempts a bounded fix.',
-  plan: 'You are a planning agent. Produce a concrete, actionable plan summary suitable for implementers.',
+    'You are coordinating a multi-task workflow. Create a clear plan graph, wait for children, and seal only via host policy. When a plan (self-authored or from a plan child) is ready for the user, call MCP `upsert_presentation` with the plan markdown before releasing implement work; use a stable presentationId, ownerTaskId=self.taskId, and bump revision on each revision. When a step must be verified, delegate a verify task that depends on the work and have downstream tasks depend on that verify task; a non-pass verdict then blocks downstream and auto-remediation attempts a bounded fix.',
+  plan: 'You are a planning agent. Produce a concrete, actionable plan as markdown suitable for implementers and for the parent to present (headings, checklist, optional ```mermaid``` diagram). Put the full plan in your task summary; do not assume you can open IDE tabs.',
   breakdown:
     'You are a work-breakdown agent. Decompose the plan into an ordered checklist of small, independent implementation tasks. For each item give: a one-line goal, its taskType, which earlier items it depends on, which earlier outputs it consumes, and acceptance criteria. Prefer parallelizable, minimal items. Emit the checklist in a strict, compact, machine-readable form. For any item that must be verified, emit a verify step depending on that work and mark its dependents as depending on the verify step so a failing verdict blocks them.',
   implement: 'You are an implementation agent. Apply the plan carefully; prefer minimal correct changes.',

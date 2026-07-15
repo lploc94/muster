@@ -70,6 +70,25 @@ describe('breakdown briefKind', () => {
   });
 });
 
+describe('plan / coordinate presentation preambles', () => {
+  it('plan preamble asks for presentable markdown summary without IDE tab claims', () => {
+    const brief = synthesizeBriefFromGoal('Plan the work', undefined, 'plan');
+    const prompt = compileTaskPrompt(brief, [], { taskId: 'p1', goal: 'Plan the work' });
+    expect(prompt).toContain('planning agent');
+    expect(prompt).toContain('markdown');
+    expect(prompt).toContain('mermaid');
+    expect(prompt).toContain('task summary');
+  });
+
+  it('coordinate preamble requires upsert_presentation when a plan is ready', () => {
+    const brief = synthesizeBriefFromGoal('Coordinate work', undefined, 'coordinate');
+    const prompt = compileTaskPrompt(brief, [], { taskId: 'c1', goal: 'Coordinate work' });
+    expect(prompt).toContain('upsert_presentation');
+    expect(prompt).toContain('ownerTaskId=self.taskId');
+    expect(prompt).toContain('before releasing implement');
+  });
+});
+
 describe('verify preamble + verdict-by-default (ISSUE 6 / verify-gate-loop A)', () => {
   it('appends the # Verdict instruction for a plain verify-kind brief BY DEFAULT', () => {
     // verify-gate-loop A: emitting a verdict is the job of a verify task, so a plain

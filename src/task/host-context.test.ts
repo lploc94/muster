@@ -129,7 +129,9 @@ describe('buildHostContext', () => {
     for (const rule of HOST_RULES_TASK_TYPES) {
       expect(ctx.rules).toContain(rule);
     }
-    expect(ctx.rules).toHaveLength(12);
+    expect(ctx.rules).toContain(HOST_RULES_COORDINATOR[3]);
+    expect(ctx.rules).toContain(HOST_RULES_COORDINATOR[7]);
+    expect(ctx.rules).toHaveLength(13);
     const md = formatHostContextMarkdown(ctx);
     expect(md).toContain('## Task types');
     expect(md).toContain('`plan`');

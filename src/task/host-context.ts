@@ -10,7 +10,7 @@ import type { TaskTypeSummary } from './task-types';
 
 export const HOST_BLOCK_MAX = 6_000;
 export const HOST_MODELS_PER_BACKEND = 12;
-export const HOST_RULES_MAX = 12;
+export const HOST_RULES_MAX = 13;
 
 export interface HostEnvironmentSnapshot {
   cwd: string;
@@ -84,12 +84,13 @@ export const HOST_RULES_BASE: readonly string[] = [
 
 /**
  * Coordinator playbook rules when **no** task types configured.
- * When types are configured, the last 4 bullets are replaced by HOST_RULES_TASK_TYPES.
+ * When types are configured: keep core spawn + presentation + root seal; swap mid bullets for HOST_RULES_TASK_TYPES.
  */
 export const HOST_RULES_COORDINATOR: readonly string[] = [
   'Simple spawn: **`delegate_task({ waitForCompletion: true })`** — one call create+run+wait.',
   'Parallel: **`delegate_tasks({ waitForLocalIds })`**. Planned graph: **`create_tasks` → `release_tasks({ waitForTaskIds })`**.',
   'Standalone **`wait_for_tasks`** is advanced (re-arm barrier / earlier fire-and-forget). No MCP `start_task`.',
+  'When a plan (or revised plan) is ready for the user, call MCP **`upsert_presentation`** with markdown (Mermaid fenced code blocks allowed), stable `presentationId`, `ownerTaskId`=`self.taskId`, and a monotonic `revision`. Do not only paste the plan in chat.',
   'If a child omits disposition, parent may **`set_task_lifecycle`** on **direct children** only.',
   'Optional `model` on create/delegate is an ACP model id for that child backend; omit → agent default.',
   'Prefer rich `brief` on create/delegate so children need not re-derive the job.',
@@ -98,7 +99,7 @@ export const HOST_RULES_COORDINATOR: readonly string[] = [
 
 /**
  * Task-type routing rules (exact strings unit-tested).
- * When types configured: replace the last 4 HOST_RULES_COORDINATOR bullets so all 4 survive HOST_RULES_MAX.
+ * When types configured: replace mid HOST_RULES_COORDINATOR bullets so type rules + presentation + root seal survive HOST_RULES_MAX.
  */
 export const HOST_RULES_TASK_TYPES: readonly string[] = [
   'Prefer `taskType` from the list when creating children.',
@@ -107,8 +108,12 @@ export const HOST_RULES_TASK_TYPES: readonly string[] = [
   'Never invent types or silently fall back to parent backend.',
 ];
 
-/** Core coordinator bullets kept when task types are present (first 3 of playbook). */
+/** Core coordinator bullets kept when task types are present (spawn rules). */
 const HOST_RULES_COORDINATOR_CORE: readonly string[] = HOST_RULES_COORDINATOR.slice(0, 3);
+/** Presentation rule index — kept with task types configured. */
+const HOST_RULES_COORDINATOR_PRESENTATION_INDEX = 3;
+/** Root-seal rule index — kept with task types configured. */
+const HOST_RULES_COORDINATOR_ROOT_SEAL_INDEX = 7;
 
 /** Worker scope rules (appended after base). */
 export const HOST_RULES_WORKER: readonly string[] = [
@@ -130,12 +135,13 @@ function rulesForRole(role: TaskRole, hasTaskTypes: boolean): string[] {
     return [...base, ...HOST_RULES_WORKER].slice(0, HOST_RULES_MAX);
   }
   if (hasTaskTypes) {
-    // base(4) + core(3) + type rules(4) + root seal(1) = 12 — all type rules protected.
+    // base(4) + core(3) + presentation(1) + type rules(4) + root seal(1) = 13.
     return [
       ...base,
       ...HOST_RULES_COORDINATOR_CORE,
+      HOST_RULES_COORDINATOR[HOST_RULES_COORDINATOR_PRESENTATION_INDEX]!,
       ...HOST_RULES_TASK_TYPES,
-      HOST_RULES_COORDINATOR[6]!,
+      HOST_RULES_COORDINATOR[HOST_RULES_COORDINATOR_ROOT_SEAL_INDEX]!,
     ].slice(0, HOST_RULES_MAX);
   }
   return [...base, ...HOST_RULES_COORDINATOR].slice(0, HOST_RULES_MAX);
