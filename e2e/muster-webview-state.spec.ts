@@ -305,12 +305,9 @@ test.describe('Muster webview host state smoke', () => {
       storeRevision: 1,
     });
 
-    // Collapsed header card: title + status button (details hidden until expand).
+    // Compact chrome: title + status button (no legacy expand-details disclosure).
     await expect(page.locator('.task-workspace-banner').getByText('Wire browser regression harness')).toBeVisible();
     await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
-    await expect(page.locator('.task-workspace-banner').getByText('Task is open')).toHaveCount(0);
-    await page.locator('.task-workspace-banner').getByRole('button', { name: /Expand task details/i }).click();
-    await expect(page.locator('.task-workspace-banner').getByText('Task is open')).toBeVisible();
     // Between turns / idle open: no turn-activity strip (ready).
     await expect(page.locator('[data-turn-activity]')).toHaveCount(0);
     await expect(page.getByText('Harness ready.')).toBeVisible();
@@ -3856,7 +3853,6 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     }
     await page.getByRole('button', { name: /Recover failed analysis.*Task Open.*Backend claude/i }).click();
     await expectPostedMessage(page, { type: 'focusTask', taskId: 'task-recovery' });
-    await expectPostedMessage(page, { type: 'hydrateSubtree', taskId: 'task-recovery' });
 
     await postSnapshot(page, {
       type: 'snapshot',
@@ -3938,8 +3934,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     });
 
     await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
-    await page.locator('.task-workspace-banner').getByRole('button', { name: /Expand task details/i }).click();
-    await expect(page.locator('.task-workspace-orchestration').getByText(/Queued/i)).toBeVisible();
+    await expect(page.getByText(/A queued task turn is ready to start/i)).toBeVisible();
     await expect(page.getByRole('button', { name: 'Resume queued task' })).toBeVisible();
     // Live/queued composers stay editable with queue-oriented guidance (not a hard disable).
     await expect(
@@ -3963,7 +3958,6 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
 
     await expect(page.locator('.task-workspace-banner').getByRole('button', { name: /Task status: Failed/i })).toBeVisible();
     // Soft failed: reopen via send or Reopen on the same task id.
-    await page.locator('.task-workspace-banner').getByRole('button', { name: /Expand task details/i }).click();
     await expect(page.getByText(/This task is failed/i).first()).toBeVisible();
     await expect(page.getByRole('button', { name: 'Reopen' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Continue as new task' })).toHaveCount(0);
@@ -4269,7 +4263,6 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
 
     await page.getByRole('button', { name: /Keep chat state visible.*Task Open.*Backend claude/i }).click();
     await expectPostedMessage(page, { type: 'focusTask', taskId: 'task-settings' });
-    await expectPostedMessage(page, { type: 'hydrateSubtree', taskId: 'task-settings' });
     await postSnapshot(page, {
       type: 'snapshot',
       rootTasks: [task({ id: 'task-settings', goal: 'Keep chat state visible', viewStatus: 'idle' })],
