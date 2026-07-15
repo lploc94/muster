@@ -97,6 +97,8 @@ export type TaskAttentionCode =
   | 'missing_input'
   | 'dependency_blocked'
   | 'recovery_exhausted'
+  /** A declared brief skill is known-absent on the task's backend (non-fatal). */
+  | 'skill_unavailable'
   | string;
 
 /** Durable child→parent question (P0.5 ask_parent). */
@@ -151,6 +153,12 @@ export interface TaskBriefV1 {
   readPaths?: string[];
   writePaths?: string[];
   verification?: { commands?: string[]; manualChecks?: string[] };
+  /**
+   * Declared backend skills/slash-commands (bare validated names, no args).
+   * Injected as leading `/name` lines on the first-turn prompt when advertised
+   * by the backend; fail-closed on known-absent names.
+   */
+  skills?: string[];
   /** v1: only "summary" is meaningful for expected outputs. */
   expectedOutputs?: string[];
 }

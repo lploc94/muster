@@ -417,6 +417,38 @@ export function getSharedAcpClient(config: AcpAgentConfig): AcpClient {
   return client;
 }
 
+/**
+ * Return an already-constructed shared client for this backend key, or undefined.
+ * Never spawns a connection — for read-only queries such as advertised commands.
+ */
+export function peekSharedAcpClient(key: string): AcpClient | undefined {
+  return sharedClients.get(key);
+}
+
+/**
+ * Defensively extract command/skill names from an ACP `available_commands_update`.
+ * The notification field is `commands`; each item is `{ name, description?, input? }`
+ * per the ACP spec, though some agents may send bare strings. A non-object update,
+ * a missing/non-array field, or unrecognized items yield [] (recorded as a
+ * KNOWN-but-empty advertisement). Never throws on arbitrary `unknown` input.
+ */
+export function extractCommandNames(update: unknown): string[] {
+  if (!update || typeof update !== 'object') return [];
+  const cmds = (update as { commands?: unknown }).commands;
+  if (!Array.isArray(cmds)) return [];
+  const out: string[] = [];
+  for (const c of cmds) {
+    const name =
+      typeof c === 'string'
+        ? c
+        : c && typeof c === 'object' && typeof (c as { name?: unknown }).name === 'string'
+          ? (c as { name: string }).name
+          : undefined;
+    if (name) out.push(name);
+  }
+  return out;
+}
+
 /** Dispose every shared ACP client (called on extension deactivate). */
 export function disposeSharedAcpClient(): void {
   for (const client of sharedClients.values()) {
@@ -544,6 +576,13 @@ export class AcpClient {
   private extraEnv?: Record<string, string>;
   private authenticated = false;
   loadSessionSupported = false;
+  /**
+   * Agent-advertised command/skill names (ACP available_commands_update).
+   * Tri-state: undefined = the backend has NEVER advertised (UNKNOWN); a Set
+   * (even empty) = the list has been received at least once (KNOWN) and is the
+   * fail-closed source of truth for first-turn skill injection.
+   */
+  private advertisedCommands: Set<string> | undefined = undefined;
 
   constructor(private readonly config: AcpAgentConfig) {}
 
@@ -646,6 +685,23 @@ export class AcpClient {
     });
   }
 
+  /**
+   * Record the agent-advertised command/skill names (ACP
+   * available_commands_update). Replaces the known set — the agent re-advertises
+   * the full list on each update. An empty list records a KNOWN-but-empty set.
+   */
+  recordAdvertisedCommands(names: readonly string[]): void {
+    this.advertisedCommands = new Set(names);
+  }
+
+  /**
+   * Known advertised command names, or undefined when the backend has never
+   * advertised (UNKNOWN → first-turn skill injection stays optimistic).
+   */
+  getAdvertisedCommands(): ReadonlySet<string> | undefined {
+    return this.advertisedCommands;
+  }
+
   cancel(sessionId: string): void {
     // ACP defines session/cancel as a notification (no id).
     this.notify('session/cancel', { sessionId });
@@ -674,6 +730,9 @@ export class AcpClient {
     const proc = this.proc;
     this.proc = undefined;
     this.authenticated = false;
+    // Drop advertised commands with the process: a fresh connection re-advertises,
+    // so the cache must not survive teardown (stale → wrong fail-closed decisions).
+    this.advertisedCommands = undefined;
     this.rl?.close();
     this.rl = undefined;
     // Group SIGTERM now, escalate to group SIGKILL if the tree is still alive
@@ -717,6 +776,8 @@ export class AcpClient {
       if (this.proc !== proc) return;
       this.proc = undefined;
       this.authenticated = false;
+      // Stale advertisements must not outlive the process (see teardownProcess).
+      this.advertisedCommands = undefined;
       this.connectPromise = undefined;
       this.rejectAllPending(new Error(`${this.config.label} agent exited (code ${code})`));
     });
@@ -866,6 +927,13 @@ export class AcpClient {
       const sessionId = params?.sessionId;
       const update = params?.update;
       if (sessionId && update) {
+        // Advertised command/skill lists are backend-scoped and can arrive right
+        // after session/new — BEFORE any session sink is registered (see
+        // runAcpTurn). Record here at the source so the set is never lost to
+        // sink-registration timing; the sink path still drops it (no event).
+        if ((update as { sessionUpdate?: unknown }).sessionUpdate === 'available_commands_update') {
+          this.recordAdvertisedCommands(extractCommandNames(update));
+        }
         const sinks = this.sessionSinks.get(sessionId);
         if (sinks) {
           for (const sink of sinks) sink(update);

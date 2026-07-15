@@ -140,6 +140,13 @@ export interface TaskEngineConfig {
    * Passed through to GraphEngineDeps for create/list.
    */
   getTaskTypeRegistry?: (cwd?: string) => import('./task-types').TaskTypeRegistryResult;
+  /**
+   * ACP skill invocation: resolve a backend's advertised command/skill names for
+   * fail-closed first-turn skill injection. Injected by the host (extension.ts)
+   * to avoid a `task/` → `backends/` layering dependency. Returns undefined when
+   * the backend has never advertised (UNKNOWN → optimistic inject).
+   */
+  getAdvertisedCommands?: (backend: string) => ReadonlySet<string> | undefined;
 }
 
 export type EngineResult<T> =
@@ -528,6 +535,9 @@ export class TaskEngine {
   private readonly getTaskTypeRegistry?: (
     cwd?: string,
   ) => import('./task-types').TaskTypeRegistryResult;
+  private readonly getAdvertisedCommands?: (
+    backend: string,
+  ) => ReadonlySet<string> | undefined;
   /**
    * In-process handles for currently executing turns. Keyed by turnId so this
    * engine can abort only runs it owns and map session ids back to turns.
@@ -579,6 +589,7 @@ export class TaskEngine {
     this.getHostEnvironment = config.getHostEnvironment;
     this.workspaceFolder = config.workspaceFolder;
     this.getTaskTypeRegistry = config.getTaskTypeRegistry;
+    this.getAdvertisedCommands = config.getAdvertisedCommands;
   }
 
   /** 2s-capped host prepare before sequence-1 assemble (single freeze site). */
@@ -3540,6 +3551,9 @@ export class TaskEngine {
                 },
               ).taskTypes
             : undefined;
+        // Fail-closed skill injection: resolve the backend's advertised commands
+        // (undefined = UNKNOWN backend → optimistic inject). Read-only peek.
+        const advertisedCommands = this.getAdvertisedCommands?.(draftTask.backend);
         const assembled = assembleFirstTurnPrompt({
           snapshot,
           self: {
@@ -3556,6 +3570,7 @@ export class TaskEngine {
           resolvedInputs: pins,
           meta: { taskId: draftTask.id, goal: draftTask.goal },
           ...(taskTypesForHost !== undefined ? { taskTypes: taskTypesForHost } : {}),
+          ...(advertisedCommands !== undefined ? { advertisedCommands } : {}),
         });
 
         if (!assembled.ok) {
@@ -3605,8 +3620,23 @@ export class TaskEngine {
           return { ok: false, reason: pinned.reason };
         }
         turnForStart = pinned.next;
-        // Clear prior missing_input / budget attention once freeze succeeds.
-        if (
+        // First-turn attention (in-commit): raise skill_unavailable when declared
+        // skills are known-absent/invalid on this backend; otherwise clear any
+        // prior missing_input / budget attention now that freeze succeeded.
+        if (assembled.unavailableSkills.length > 0) {
+          taskForStart = {
+            ...draftTask,
+            revision: draftTask.revision + 1,
+            updatedAt: now,
+            attention: {
+              code: 'skill_unavailable',
+              message: `Skill(s) not available on backend ${draftTask.backend}: ${assembled.unavailableSkills.join(', ')}`,
+              at: now,
+              sourceTurnId: turnId,
+            },
+          };
+          draft.tasks[draftTask.id] = taskForStart;
+        } else if (
           draftTask.attention?.code === 'missing_input' ||
           draftTask.attention?.code === 'prompt_budget_exceeded'
         ) {

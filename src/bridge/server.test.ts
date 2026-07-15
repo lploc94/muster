@@ -243,6 +243,71 @@ describe('MusterBridgeServer auth', () => {
     expect(workerNames).not.toContain('delegate_tasks');
   });
 
+  it('round-trips brief.skills through create_task and create_tasks child specs', async () => {
+    const credentials = new CredentialRegistry();
+    const handled: Array<{ tool: string; command: unknown }> = [];
+    server = new MusterBridgeServer({
+      credentials,
+      toolHandler: {
+        handleToolCall: async (_ctx, tool, command) => {
+          handled.push({ tool, command });
+          return {
+            ok: true,
+            result: { taskId: 'task-a', turnId: 't1', taskIds: ['task-a'], turnIds: [] },
+          };
+        },
+      },
+    });
+    const { port } = await server.listen();
+    const token = credentials.issue({
+      rootId: 'root-1',
+      callerTaskId: 'task-1',
+      turnId: 'turn-coordinator',
+      allowedActions: new Set(['create_task', 'create_tasks']),
+      ttlMs: 60_000,
+    });
+    const coordinator = await openMcpSession(port, token);
+
+    // Schema advertises `skills` under the brief object.
+    const listed = await coordinator.request('tools/list');
+    const tools = (listed.result as {
+      tools: Array<{ name: string; inputSchema: Record<string, unknown> }>;
+    }).tools;
+    const createSchema = tools.find((tool) => tool.name === 'create_task')!.inputSchema;
+    const briefProps = (
+      (createSchema.properties as { brief: { properties: Record<string, unknown> } }).brief
+    ).properties;
+    expect(briefProps).toHaveProperty('skills');
+
+    const created = await coordinator.request('tools/call', {
+      name: 'create_task',
+      arguments: {
+        opId: 'op-1',
+        goal: 'implement',
+        taskType: 'worker',
+        brief: { kind: 'implement', skills: ['plan', 'review'] },
+      },
+    });
+    expect(created.result).not.toHaveProperty('isError', true);
+    expect(handled[0]).toMatchObject({
+      tool: 'create_task',
+      command: { kind: 'create_task', spec: { brief: { skills: ['plan', 'review'] } } },
+    });
+
+    const batch = await coordinator.request('tools/call', {
+      name: 'create_tasks',
+      arguments: {
+        opId: 'op-2',
+        tasks: [{ localId: 'a', goal: 'child', taskType: 'worker', brief: { skills: ['plan'] } }],
+      },
+    });
+    expect(batch.result).not.toHaveProperty('isError', true);
+    expect(handled[1]).toMatchObject({
+      tool: 'create_tasks',
+      command: { kind: 'create_tasks', specs: [{ brief: { skills: ['plan'] } }] },
+    });
+  });
+
   it('accepts valid token with loopback host and absent origin on initialize', async () => {
     const credentials = new CredentialRegistry();
     server = new MusterBridgeServer({

@@ -352,6 +352,146 @@ describe('W1 single freeze site + host prepare', () => {
     expect(impl?.lifecycle).toBe('open');
   });
 
+  it('KNOWN backend: known-absent skill → skill_unavailable attention + prompt omits command', async () => {
+    const { store } = makeTempStore();
+    let captured = '';
+    let resume: (() => void) | undefined;
+    const gate = new Promise<void>((r) => {
+      resume = r;
+    });
+    const backend: Backend = {
+      name: 'fake',
+      capabilities: MCP_CAPS,
+      async *run(options: RunOptions) {
+        captured = options.prompt ?? '';
+        yield { type: 'sessionStarted', sessionId: 's-skill-known' };
+        await gate;
+        yield { type: 'turnCompleted' };
+      },
+    };
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => backend,
+      clock: () => '2026-07-06T12:00:00.000Z',
+      getHostEnvironment: () => hostSnap(),
+      getTaskTypeRegistry: () => EMPTY_TASK_TYPES,
+      // KNOWN backend: advertises `plan` but not `ghost`.
+      getAdvertisedCommands: () => new Set(['plan']),
+    });
+
+    store.commit((draft) => {
+      const b = brief.synthesizeBriefFromGoal('implement');
+      b.skills = ['plan', 'ghost'];
+      draft.tasks.impl = {
+        id: 'impl',
+        role: 'worker',
+        lifecycle: 'open',
+        goal: 'implement',
+        parentId: null,
+        dependencies: [],
+        backend: 'fake',
+        capabilities: [],
+        executionPolicy: {
+          maxTurns: 10,
+          maxAutomaticRetries: 0,
+          turnTimeoutMs: 60_000,
+          taskTimeoutMs: 120_000,
+        },
+        brief: b,
+        releaseState: 'released',
+        revision: 0,
+        createdAt: '2026-07-06T12:00:00.000Z',
+        updatedAt: '2026-07-06T12:00:00.000Z',
+      };
+      return { ok: true };
+    });
+
+    const started = engine.startTask('impl', []);
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Advertised skill is injected as a leading line; known-absent one is not.
+    expect(captured.startsWith('/plan\n\n')).toBe(true);
+    expect(captured).not.toContain('/ghost');
+    const impl = store.getTask('impl');
+    expect(impl?.attention?.code).toBe('skill_unavailable');
+    expect(impl?.attention?.message).toContain('ghost');
+    expect(impl?.attention?.message).toContain('fake');
+
+    engine.stageDisposition(started.value.turnId, { kind: 'idle' }, 'op-skill');
+    resume?.();
+    await engine.whenIdle();
+  });
+
+  it('UNKNOWN backend: resolver returns undefined → skill injected, no attention', async () => {
+    const { store } = makeTempStore();
+    let captured = '';
+    let resume: (() => void) | undefined;
+    const gate = new Promise<void>((r) => {
+      resume = r;
+    });
+    const backend: Backend = {
+      name: 'fake',
+      capabilities: MCP_CAPS,
+      async *run(options: RunOptions) {
+        captured = options.prompt ?? '';
+        yield { type: 'sessionStarted', sessionId: 's-skill-unknown' };
+        await gate;
+        yield { type: 'turnCompleted' };
+      },
+    };
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => backend,
+      clock: () => '2026-07-06T12:00:00.000Z',
+      getHostEnvironment: () => hostSnap(),
+      getTaskTypeRegistry: () => EMPTY_TASK_TYPES,
+      // UNKNOWN backend: never advertised → optimistic inject, no fail-closed.
+      getAdvertisedCommands: () => undefined,
+    });
+
+    store.commit((draft) => {
+      const b = brief.synthesizeBriefFromGoal('implement');
+      b.skills = ['plan', 'ghost'];
+      draft.tasks.impl = {
+        id: 'impl',
+        role: 'worker',
+        lifecycle: 'open',
+        goal: 'implement',
+        parentId: null,
+        dependencies: [],
+        backend: 'fake',
+        capabilities: [],
+        executionPolicy: {
+          maxTurns: 10,
+          maxAutomaticRetries: 0,
+          turnTimeoutMs: 60_000,
+          taskTimeoutMs: 120_000,
+        },
+        brief: b,
+        releaseState: 'released',
+        revision: 0,
+        createdAt: '2026-07-06T12:00:00.000Z',
+        updatedAt: '2026-07-06T12:00:00.000Z',
+      };
+      return { ok: true };
+    });
+
+    const started = engine.startTask('impl', []);
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(captured.startsWith('/plan\n/ghost\n\n')).toBe(true);
+    const impl = store.getTask('impl');
+    expect(impl?.attention).toBeUndefined();
+
+    engine.stageDisposition(started.value.turnId, { kind: 'idle' }, 'op-skill-2');
+    resume?.();
+    await engine.whenIdle();
+  });
+
   it('release_tasks queues without assemble; promote assembles once per child', async () => {
     const { store } = makeTempStore();
     const spy = vi.spyOn(brief, 'assembleFirstTurnPrompt');
