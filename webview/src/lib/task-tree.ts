@@ -127,3 +127,78 @@ export function parentSummary(
   if (!focused.parentId) return undefined;
   return subtree.find((t) => t.id === focused.parentId) ?? undefined;
 }
+
+/** Ancestor chain root→…→focused (inclusive) for breadcrumb chrome. */
+export function breadcrumbPath(
+  focused: TaskSummary,
+  subtree: readonly TaskSummary[],
+): TaskSummary[] {
+  const byId = new Map(subtree.map((t) => [t.id, t]));
+  const chain: TaskSummary[] = [];
+  let current: TaskSummary | undefined = focused;
+  const visited = new Set<string>();
+  while (current && !visited.has(current.id)) {
+    visited.add(current.id);
+    chain.push(current);
+    current = current.parentId ? byId.get(current.parentId) : undefined;
+  }
+  return chain.reverse();
+}
+
+/** Compact breadcrumb labels when path is long: first, …, last two. */
+export function compactBreadcrumb(
+  path: readonly TaskSummary[],
+  maxNodes = 3,
+): Array<{ task: TaskSummary; ellipsisBefore: boolean }> {
+  if (path.length <= maxNodes) {
+    return path.map((task) => ({ task, ellipsisBefore: false }));
+  }
+  const head = path[0]!;
+  const tail = path.slice(-(maxNodes - 1));
+  return [
+    { task: head, ellipsisBefore: false },
+    ...tail.map((task, i) => ({ task, ellipsisBefore: i === 0 })),
+  ];
+}
+
+/** Codicon class for task role (I3). */
+export function taskRoleIcon(role: TaskSummary['role'] | string | undefined): string {
+  if (role === 'coordinator') return 'codicon-type-hierarchy-sub';
+  return 'codicon-tools';
+}
+
+/**
+ * Flatten with optional collapsed set: descendants of collapsed ids are hidden.
+ * Collapse only applies to nodes that have children.
+ */
+export function flattenTaskTreeCollapsible(
+  roots: readonly TaskTreeNode[],
+  collapsedIds: ReadonlySet<string>,
+): TaskTreeNode[] {
+  const out: TaskTreeNode[] = [];
+  const visit = (node: TaskTreeNode) => {
+    out.push(node);
+    if (node.children.length > 0 && collapsedIds.has(node.task.id)) {
+      return;
+    }
+    for (const child of node.children) visit(child);
+  };
+  for (const root of roots) visit(root);
+  return out;
+}
+
+/** Default collapsed: all nodes deeper than maxExpandedDepth that have children. */
+export function defaultCollapsedIds(
+  roots: readonly TaskTreeNode[],
+  maxExpandedDepth = 2,
+): Set<string> {
+  const collapsed = new Set<string>();
+  const visit = (node: TaskTreeNode) => {
+    if (node.children.length > 0 && node.depth >= maxExpandedDepth) {
+      collapsed.add(node.task.id);
+    }
+    for (const child of node.children) visit(child);
+  };
+  for (const root of roots) visit(root);
+  return collapsed;
+}

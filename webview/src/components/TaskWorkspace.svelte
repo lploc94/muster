@@ -18,11 +18,15 @@
   import { buildDeleteQueuedTurnMessage, queuedTurnControlState } from '../lib/queued-turns';
   import { selectTask as navSelectTask } from '../lib/task-nav';
   import {
+    breadcrumbPath,
     buildTaskTree,
+    compactBreadcrumb,
     countTaskTree,
-    flattenTaskTree,
+    defaultCollapsedIds,
+    flattenTaskTreeCollapsible,
     formatTaskTreeSummary,
     parentSummary,
+    taskRoleIcon,
   } from '../lib/task-tree';
   import { tip } from '../lib/tooltip';
 
@@ -42,14 +46,24 @@
   /** Collapsed by default — detail lines (headline, session, orchestration) only when expanded. */
   let detailsExpanded = $state(false);
   let treePanelOpen = $state(false);
+  /** User overrides for collapse; null = use defaultCollapsedIds. */
+  let collapsedOverride = $state<Set<string> | null>(null);
 
   const focused = $derived(tasks.focusedTask);
   const thread = $derived(threadStore.current);
   const presentation = $derived(focused ? getTaskPresentation(focused) : null);
   const runtime = $derived(focused ? effectiveRuntimeActivity(focused) : null);
   const treeCounts = $derived(countTaskTree(tasks.subtree));
-  const treeRows = $derived(flattenTaskTree(buildTaskTree(tasks.subtree)));
+  const treeForest = $derived(buildTaskTree(tasks.subtree));
+  const collapsedIds = $derived(
+    collapsedOverride ?? defaultCollapsedIds(treeForest, 2),
+  );
+  const treeRows = $derived(flattenTaskTreeCollapsible(treeForest, collapsedIds));
   const parentTask = $derived(focused ? parentSummary(focused, tasks.subtree) : undefined);
+  const crumbs = $derived(
+    focused ? compactBreadcrumb(breadcrumbPath(focused, tasks.subtree), 3) : [],
+  );
+  const showBreadcrumb = $derived(!!focused?.parentId && crumbs.length > 1);
   const showTaskNav = $derived(
     !!focused && (focused.parentId != null || tasks.subtree.length > 1),
   );
@@ -129,7 +143,16 @@
     detailsExpanded = false;
     statusMenuOpen = false;
     treePanelOpen = false;
+    collapsedOverride = null;
   });
+
+  function toggleCollapse(taskId: string, hasChildren: boolean) {
+    if (!hasChildren) return;
+    const next = new Set<string>(collapsedIds);
+    if (next.has(taskId)) next.delete(taskId);
+    else next.add(taskId);
+    collapsedOverride = next;
+  }
 
   $effect(() => {
     if (!treePanelOpen) return;
@@ -336,7 +359,34 @@
         data-testid="task-tree-nav"
         style="border-color: var(--vscode-panel-border);"
       >
-        {#if focused.parentId}
+        {#if showBreadcrumb}
+          <nav class="task-tree-nav__breadcrumb" aria-label="Task path" data-testid="task-tree-breadcrumb">
+            {#each crumbs as crumb, i (crumb.task.id)}
+              {#if crumb.ellipsisBefore}
+                <span class="task-tree-nav__crumb-sep" aria-hidden="true">…</span>
+                <span class="task-tree-nav__crumb-sep" aria-hidden="true">›</span>
+              {:else if i > 0}
+                <span class="task-tree-nav__crumb-sep" aria-hidden="true">›</span>
+              {/if}
+              {#if crumb.task.id === focused.id}
+                <span class="task-tree-nav__crumb task-tree-nav__crumb--current" aria-current="page">
+                  {shortGoal(crumb.task.goal)}
+                </span>
+              {:else}
+                <button
+                  type="button"
+                  class="task-tree-nav__crumb"
+                  data-testid="task-tree-breadcrumb-item"
+                  data-task-id={crumb.task.id}
+                  use:tip={crumb.task.goal}
+                  onclick={() => navSelectTask(crumb.task.id)}
+                >
+                  {shortGoal(crumb.task.goal)}
+                </button>
+              {/if}
+            {/each}
+          </nav>
+        {:else if focused.parentId}
           <button
             type="button"
             class="task-tree-nav__parent"
@@ -394,36 +444,63 @@
           {#each treeRows as row (row.task.id)}
             {@const nodePresentation = getTaskPresentation(row.task)}
             {@const isFocused = row.task.id === focused.id}
-            <button
-              type="button"
+            {@const hasChildren = row.children.length > 0}
+            {@const isCollapsed = collapsedIds.has(row.task.id)}
+            <div
               class="task-tree-panel__row"
               class:task-tree-panel__row--focused={isFocused}
-              aria-current={isFocused ? 'page' : undefined}
-              data-testid="task-tree-row"
-              data-task-id={row.task.id}
               style={`padding-left: ${8 + Math.min(row.depth, 4) * 12}px`}
-              onclick={() => activateTreeNode(row.task.id)}
             >
-              <span
-                class="codicon task-tree-panel__role"
-                class:codicon-type-hierarchy-sub={row.task.role === 'coordinator'}
-                class:codicon-file={row.task.role !== 'coordinator'}
-                aria-hidden="true"
-              ></span>
-              <span class="task-tree-panel__goal" use:tip={row.task.goal}>{shortGoal(row.task.goal)}</span>
-              <span
-                class={`task-tree-panel__status ${
-                  row.task.lifecycle === 'open' && nodePresentation.runtime
-                    ? `task-status task-status--${nodePresentation.runtime.tone}`
-                    : lifecycleClass(row.task.lifecycle)
-                }`}
-                use:tip={nodePresentation.listCopy}
+              {#if hasChildren}
+                <button
+                  type="button"
+                  class="task-tree-panel__twistie"
+                  aria-label={isCollapsed ? 'Expand' : 'Collapse'}
+                  aria-expanded={isCollapsed ? 'false' : 'true'}
+                  data-testid="task-tree-collapse"
+                  data-task-id={row.task.id}
+                  onclick={(e) => {
+                    e.stopPropagation();
+                    toggleCollapse(row.task.id, true);
+                  }}
+                >
+                  <span
+                    class="codicon"
+                    class:codicon-chevron-right={isCollapsed}
+                    class:codicon-chevron-down={!isCollapsed}
+                    aria-hidden="true"
+                  ></span>
+                </button>
+              {:else}
+                <span class="task-tree-panel__twistie task-tree-panel__twistie--spacer" aria-hidden="true"></span>
+              {/if}
+              <button
+                type="button"
+                class="task-tree-panel__select"
+                aria-current={isFocused ? 'page' : undefined}
+                data-testid="task-tree-row"
+                data-task-id={row.task.id}
+                onclick={() => activateTreeNode(row.task.id)}
               >
-                {row.task.lifecycle === 'open' && nodePresentation.runtime
-                  ? nodePresentation.runtime.label
-                  : nodePresentation.lifecycle.label}
-              </span>
-            </button>
+                <span
+                  class="codicon task-tree-panel__role {taskRoleIcon(row.task.role)}"
+                  aria-hidden="true"
+                ></span>
+                <span class="task-tree-panel__goal" use:tip={row.task.goal}>{shortGoal(row.task.goal)}</span>
+                <span
+                  class={`task-tree-panel__status ${
+                    row.task.lifecycle === 'open' && nodePresentation.runtime
+                      ? `task-status task-status--${nodePresentation.runtime.tone}`
+                      : lifecycleClass(row.task.lifecycle)
+                  }`}
+                  use:tip={nodePresentation.listCopy}
+                >
+                  {row.task.lifecycle === 'open' && nodePresentation.runtime
+                    ? nodePresentation.runtime.label
+                    : nodePresentation.lifecycle.label}
+                </span>
+              </button>
+            </div>
           {/each}
         </div>
       </div>

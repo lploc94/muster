@@ -378,6 +378,48 @@ body {
   color: var(--vscode-descriptionForeground, var(--vscode-foreground));
 }
 
+.task-tree-nav__breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  font-size: 11px;
+}
+
+.task-tree-nav__crumb {
+  min-width: 0;
+  max-width: 7rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 1px 4px;
+  border: 0;
+  border-radius: 3px;
+  color: var(--vscode-textLink-foreground, var(--vscode-foreground));
+  background: transparent;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.task-tree-nav__crumb:hover {
+  background: var(--vscode-list-hoverBackground, color-mix(in srgb, var(--vscode-foreground) 8%, transparent));
+}
+
+.task-tree-nav__crumb--current {
+  color: var(--vscode-foreground);
+  font-weight: 600;
+  cursor: default;
+}
+
+.task-tree-nav__crumb-sep {
+  flex-shrink: 0;
+  opacity: 0.55;
+  font-size: 10px;
+}
+
 .task-tree-nav__summary .codicon,
 .task-tree-nav__parent .codicon {
   font-size: 13px;
@@ -436,18 +478,13 @@ body {
 .task-tree-panel__row {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 2px;
   width: 100%;
   min-height: 28px;
-  padding: 3px 8px;
-  border: 0;
+  padding: 1px 4px 1px 0;
   border-radius: 3px;
   color: inherit;
-  background: transparent;
-  font: inherit;
   font-size: 11px;
-  text-align: left;
-  cursor: pointer;
 }
 
 .task-tree-panel__row:hover {
@@ -458,6 +495,47 @@ body {
   background: var(--vscode-list-activeSelectionBackground, var(--vscode-list-hoverBackground));
   color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground));
   box-shadow: inset 0 0 0 1px var(--vscode-focusBorder, #3794ff);
+}
+
+.task-tree-panel__twistie {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+}
+
+.task-tree-panel__twistie .codicon {
+  font-size: 12px;
+  opacity: 0.8;
+}
+
+.task-tree-panel__twistie--spacer {
+  pointer-events: none;
+}
+
+.task-tree-panel__select {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 3px 6px 3px 2px;
+  border: 0;
+  border-radius: 3px;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
 }
 
 .task-tree-panel__role {
