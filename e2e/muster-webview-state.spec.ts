@@ -332,7 +332,81 @@ test.describe('Muster webview host state smoke', () => {
     });
   });
 
-  test('Add Context menu keeps the existing file picker and mention flow', async ({ page }) => {
+  
+test('file mention autocomplete requests host suggestions and inserts a relative file on click', async ({ page }) => {
+  await openWebview(page);
+  await postSnapshot(page, { type: 'snapshot', rootTasks: [], storeRevision: 2 });
+  await page.getByRole('button', { name: 'New task' }).first().click();
+  await expectPostedMessage(page, { type: 'newTask' });
+
+  const composer = page.getByPlaceholder('Start a new coordinator task with claude…');
+  await composer.click();
+  // Real typing — not fill/value injection — so caret-driven autocomplete runs.
+  await composer.pressSequentially('Review @re', { delay: 20 });
+
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages.filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+
+  const request = (await postedMessages(page)).find(
+    (m) => (m as { type?: string }).type === 'requestFileMentionSuggestions',
+  ) as {
+    type: string;
+    requestId: string;
+    parentDepth: number;
+    relativeQuery: string;
+    taskId?: string;
+  };
+  expect(request.parentDepth).toBe(0);
+  expect(request.relativeQuery).toBe('re');
+  expect(request.taskId).toBeUndefined();
+  expect(typeof request.requestId).toBe('string');
+  expect(request.requestId.length).toBeGreaterThan(0);
+
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: request.requestId,
+    parentDepth: 0,
+    relativeQuery: 're',
+    items: [
+      {
+        id: 'file:readme.md',
+        kind: 'file',
+        label: 'readme.md',
+        insertionPath: 'readme.md',
+      },
+      {
+        id: 'dir:src',
+        kind: 'directory',
+        label: 'src',
+        insertionPath: 'src',
+      },
+    ],
+  });
+
+  const listbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+  await expect(listbox).toBeVisible();
+  // S01 mouse selection is file-only; directory rows are filtered out.
+  await expect(listbox.getByRole('option', { name: 'readme.md' })).toBeVisible();
+  await expect(listbox.getByRole('option', { name: 'src' })).toHaveCount(0);
+
+  await listbox.getByRole('option', { name: 'readme.md' }).click();
+  await expect(listbox).toHaveCount(0);
+  // Active @re token replaced; leading "Review " preserved.
+  await expect(composer).toHaveValue('Review @readme.md ');
+
+  await page.getByRole('button', { name: 'Send' }).click();
+  await expectPostedMessage(page, {
+    type: 'send',
+    text: 'Review @readme.md',
+    backend: 'claude',
+  });
+});
+
+test('Add Context menu keeps the existing file picker and mention flow', async ({ page }) => {
     await openWebview(page);
 
     await postSnapshot(page, {

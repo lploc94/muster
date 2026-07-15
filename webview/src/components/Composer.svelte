@@ -37,6 +37,12 @@
     type MentionBindingMap,
   } from '../lib/file-mention-bindings';
   import {
+    createFileMentionAutocompleteSession,
+    replaceActiveFileMentionQuery,
+    type FileMentionAutocompleteState,
+  } from '../lib/file-mention-autocomplete';
+  import type { FileMentionSuggestionItem, FileMentionSuggestionsMessage } from '../lib/protocol';
+  import {
     buildTaskComposerMessage,
     resolveComposerKeyIntent,
     shouldPreventDefaultForComposerKey,
@@ -106,6 +112,33 @@
   let dropFeedback = $state<string | null>(null);
   let isAddContextMenuOpen = $state(false);
   let lastPrefillNonce = $state<number | null>(null);
+  /** Reactive mirror of the pure autocomplete session (request scope + listbox). */
+  let mentionAutocomplete = $state<FileMentionAutocompleteState>({
+    open: false,
+    items: [],
+    activeQuery: null,
+    pendingRequestId: null,
+  });
+  let mentionListboxRegion = $state<HTMLElement | undefined>(undefined);
+
+  function syncMentionAutocompleteFromSession() {
+    mentionAutocomplete = mentionAutocompleteSession.getState();
+  }
+
+  function notifyMentionAutocompleteCaret() {
+    const caret = textareaEl?.selectionStart ?? draftText.length;
+    mentionAutocompleteSession.onCaretChange({
+      text: draftText,
+      caret,
+      canSend,
+      taskId: mode === 'task' ? taskId : undefined,
+    });
+    syncMentionAutocompleteFromSession();
+  }
+
+  const mentionAutocompleteSession = createFileMentionAutocompleteSession({
+    post,
+  });
 
   /** Highlight layer mirrors draft; trailing newline needs an extra break for height parity. */
   const draftHighlightHtml = $derived.by(() => {
@@ -224,6 +257,11 @@
   $effect(() => {
     function onMessage(e: MessageEvent) {
       const msg = e.data;
+      if (msg?.type === 'fileMentionSuggestions') {
+        mentionAutocompleteSession.onResponse(msg as FileMentionSuggestionsMessage);
+        syncMentionAutocompleteFromSession();
+        return;
+      }
       if (msg?.type !== 'filePicked' || typeof msg.path !== 'string') return;
       dropFeedback = null;
       const displayName =
@@ -241,15 +279,32 @@
     if (!canSend && isAddContextMenuOpen) {
       closeAddContextMenu();
     }
+    if (!canSend) {
+      mentionAutocompleteSession.reset();
+      syncMentionAutocompleteFromSession();
+    }
+  });
+
+  // Close autocomplete when focus target / draft-vs-task mode changes.
+  $effect(() => {
+    void mode;
+    void taskId;
+    mentionAutocompleteSession.reset();
+    syncMentionAutocompleteFromSession();
   });
 
   $effect(() => {
-    if (!isAddContextMenuOpen) return;
+    if (!isAddContextMenuOpen && !mentionAutocomplete.open) return;
 
     function onPointerDown(e: PointerEvent) {
       const target = e.target;
       if (target instanceof Node && addContextMenuRegion?.contains(target)) return;
+      if (target instanceof Node && mentionListboxRegion?.contains(target)) return;
       closeAddContextMenu();
+      if (mentionAutocomplete.open) {
+        mentionAutocompleteSession.reset();
+        syncMentionAutocompleteFromSession();
+      }
     }
 
     window.addEventListener('pointerdown', onPointerDown, true);
@@ -401,9 +456,29 @@
     const insertion = `${leading}${token}${trailing}`;
     draftText = `${before}${insertion}${after}`;
     const caret = start + insertion.length;
+    mentionAutocompleteSession.reset();
+    syncMentionAutocompleteFromSession();
     queueMicrotask(() => {
       textareaEl?.focus();
       textareaEl?.setSelectionRange(caret, caret);
+      syncHighlightScroll();
+    });
+  }
+
+  /** Mouse selection of a host suggestion: replace only the active @query range. */
+  function selectFileMentionSuggestion(item: FileMentionSuggestionItem) {
+    if (!canSend || item.kind !== 'file') return;
+    const active = mentionAutocompleteSession.getState().activeQuery;
+    if (!active) return;
+    const { token } = allocateDisplayToken(mentionBindings, item.insertionPath, item.label);
+    if (!token) return;
+    const replaced = replaceActiveFileMentionQuery(draftText, { start: active.start, end: active.end }, token);
+    draftText = replaced.text;
+    mentionAutocompleteSession.reset();
+    syncMentionAutocompleteFromSession();
+    queueMicrotask(() => {
+      textareaEl?.focus();
+      textareaEl?.setSelectionRange(replaced.caret, replaced.caret);
       syncHighlightScroll();
     });
   }
@@ -418,6 +493,11 @@
     const el = e.currentTarget as HTMLTextAreaElement;
     draftText = el.value;
     syncHighlightScroll();
+    notifyMentionAutocompleteCaret();
+  }
+
+  function onDraftSelectOrKeyup() {
+    notifyMentionAutocompleteCaret();
   }
 
   function closeAddContextMenu() {
@@ -523,6 +603,12 @@
     if (e.key === 'Escape' && isAddContextMenuOpen) {
       e.preventDefault();
       closeAddContextMenu();
+      return;
+    }
+    if (e.key === 'Escape' && mentionAutocomplete.open) {
+      e.preventDefault();
+      mentionAutocompleteSession.reset();
+      syncMentionAutocompleteFromSession();
       return;
     }
 
@@ -1007,8 +1093,40 @@
       oninput={onDraftInput}
       onscroll={syncHighlightScroll}
       onkeydown={onKeydown}
+      onkeyup={onDraftSelectOrKeyup}
+      onselect={onDraftSelectOrKeyup}
+      onclick={onDraftSelectOrKeyup}
       spellcheck="true"
+      aria-autocomplete="list"
+      aria-controls={mentionAutocomplete.open ? 'file-mention-listbox' : undefined}
+      aria-expanded={mentionAutocomplete.open ? 'true' : 'false'}
+      aria-haspopup="listbox"
     ></textarea>
+
+    {#if mentionAutocomplete.open && mentionAutocomplete.items.length > 0}
+      <div
+        bind:this={mentionListboxRegion}
+        id="file-mention-listbox"
+        class="file-mention-listbox"
+        role="listbox"
+        aria-label="File mention suggestions"
+        data-testid="file-mention-listbox"
+      >
+        {#each mentionAutocomplete.items as item (item.id)}
+          <button
+            type="button"
+            class="file-mention-listbox__item"
+            role="option"
+            aria-label={item.label}
+            data-testid="file-mention-option"
+            data-insertion-path={item.insertionPath}
+            onclick={() => selectFileMentionSuggestion(item)}
+          >
+            <span class="file-mention-listbox__item-label">{item.label}</span>
+          </button>
+        {/each}
+      </div>
+    {/if}
   </div>
 
   <div class="flex items-center justify-between gap-2 pt-1" onkeydown={onKeydown}>
