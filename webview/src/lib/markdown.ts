@@ -59,9 +59,10 @@ export function isWorkspaceMarkdownLinkHref(raw: string): boolean {
  * Bare path to a markdown file in prose (not already a markdown link).
  * Requires a path-like prefix (/, ./, file:, or drive) so plain words are not eaten.
  * Spaces in path segments are not supported for bare paths (use a markdown link).
+ * Trailing punctuation such as `):` or `,` is allowed after the path (not consumed).
  */
 const BARE_MD_PATH =
-  /(?<!\]\()(?<!["'`=])((?:file:\/\/\/[^\s]+\.(?:md|markdown|mdx)|(?:\.\/|\/|[A-Za-z]:[\\/])[A-Za-z0-9_./@%+\-]+\.(?:md|markdown|mdx)))(?![)\w])/gi;
+  /(?<!\]\()(?<!["'`=])((?:file:\/\/\/[^\s]+\.(?:md|markdown|mdx)|(?:\.\/|\/|[A-Za-z]:[\\/])[A-Za-z0-9_./@%+\-]+\.(?:md|markdown|mdx)))(?=$|[\s),.:;!?'"\]])/gi;
 
 /**
  * Turn bare `…/plan.md` paths into markdown links so they become clickable

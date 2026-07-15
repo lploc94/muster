@@ -267,6 +267,18 @@ describe('renderMarkdown — legitimate markdown still renders', () => {
     expect(a!.textContent).toBe('plan.md');
   });
 
+  test('bare path before closing paren/colon is still linkified', () => {
+    const out = renderMarkdown(
+      'Mở plan (file tại /Users/lploc94/projects/grok-worker/plan.md):',
+    );
+    const dom = parse(out);
+    const a = dom.querySelector('a.workspace-md-link');
+    expect(a).not.toBeNull();
+    expect(a!.getAttribute('data-workspace-md-href')).toBe(
+      '/Users/lploc94/projects/grok-worker/plan.md',
+    );
+  });
+
   test('bare path inside fenced code is not linkified', () => {
     const out = renderMarkdown('```\n/tmp/secret.md\n```');
     expect(out).not.toContain('data-workspace-md-href');
