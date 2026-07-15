@@ -20,8 +20,12 @@ describe('workspace file Quick Pick helper', () => {
     expect(findFiles).toHaveBeenCalledWith('**/*', '**/{.git,node_modules,dist,out}/**', 500);
     expect(showQuickPick).toHaveBeenCalledWith(
       [
-        { label: 'README.md', uri: { fsPath: '/workspace/README.md' } },
-        { label: 'src/extension.ts', uri: { fsPath: '/workspace/src/extension.ts' } },
+        { label: 'README.md', uri: { fsPath: '/workspace/README.md' }, iconId: 'markdown' },
+        {
+          label: 'src/extension.ts',
+          uri: { fsPath: '/workspace/src/extension.ts' },
+          iconId: 'file-code',
+        },
       ],
       {
         canPickMany: false,

@@ -20,6 +20,7 @@ describe('Add Context action model', () => {
     for (const action of ADD_CONTEXT_ACTIONS) {
       expect(action.label.trim(), action.id).not.toBe('');
       expect(action.description.trim(), action.id).not.toBe('');
+      expect(action.icon, action.id).toMatch(/^codicon-/);
     }
   });
 

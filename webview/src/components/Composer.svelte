@@ -54,6 +54,7 @@
     fileMentionStatusText,
     resolveFileMentionActiveDescendant,
   } from '../lib/file-mention-listbox';
+  import { fileMentionItemIcon } from '../lib/file-mention-icons';
   import type { FileMentionSuggestionItem, FileMentionSuggestionsMessage } from '../lib/protocol';
   import {
     buildTaskComposerMessage,
@@ -1331,6 +1332,10 @@
             onmouseenter={() => onMentionOptionMouseEnter(index)}
             onclick={() => selectFileMentionSuggestion(item)}
           >
+            <span
+              class="codicon file-mention-listbox__item-icon {fileMentionItemIcon(item.kind, item.label)}"
+              aria-hidden="true"
+            ></span>
             <span class="file-mention-listbox__item-label">
               {item.kind === 'directory' ? `${item.label}/` : item.label}
             </span>
@@ -1402,6 +1407,7 @@
                 disabled={action.state !== 'enabled'}
                 onclick={() => activateAddContextAction(action)}
               >
+                <span class="codicon add-context__menu-item-icon {action.icon}" aria-hidden="true"></span>
                 <span class="add-context__menu-item-label">{action.label}</span>
                 {#if action.state === 'comingSoon'}
                   <span class="add-context__menu-item-badge">Coming soon</span>

@@ -525,7 +525,16 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       const result = await pickWorkspaceFileMentionPath({
         workspaceFolders: vscode.workspace.workspaceFolders,
         findFiles: (include, exclude, maxResults) => vscode.workspace.findFiles(include, exclude, maxResults),
-        showQuickPick: (items, options) => vscode.window.showQuickPick(items, options),
+        showQuickPick: (items, options) =>
+          vscode.window.showQuickPick(
+            items.map((item) => ({
+              label: item.label,
+              uri: item.uri,
+              iconId: item.iconId,
+              iconPath: new vscode.ThemeIcon(item.iconId),
+            })),
+            options,
+          ),
       });
 
       switch (result.type) {

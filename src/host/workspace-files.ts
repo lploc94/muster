@@ -1,4 +1,5 @@
 import * as path from 'path';
+import { fileMentionThemeIconId } from '../shared/file-mention-icons';
 
 export interface WorkspaceFileUri {
   fsPath: string;
@@ -11,6 +12,8 @@ export interface WorkspaceFolderLike {
 export interface WorkspaceFileQuickPickItem {
   label: string;
   uri: WorkspaceFileUri;
+  /** Codicon / ThemeIcon id (no `codicon-` prefix), e.g. `file-code`. */
+  iconId: string;
 }
 
 export interface WorkspaceFilePickServices {
@@ -75,7 +78,14 @@ export async function pickWorkspaceFileMentionPath(
   const items = files
     .flatMap((uri) => {
       const label = mentionPathForUri(uri, workspaceFolders);
-      return label ? [{ label, uri }] : [];
+      if (!label) return [];
+      return [
+        {
+          label,
+          uri,
+          iconId: fileMentionThemeIconId('file', label),
+        },
+      ];
     })
     .sort((left, right) => left.label.localeCompare(right.label));
   if (items.length === 0) {

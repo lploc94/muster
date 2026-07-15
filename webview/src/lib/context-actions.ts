@@ -15,6 +15,8 @@ interface AddContextActionBase {
   id: AddContextActionId;
   label: string;
   description: string;
+  /** Full codicon class for the Add Context menu glyph. */
+  icon: string;
   state: AddContextActionState;
 }
 
@@ -38,6 +40,7 @@ export const ADD_CONTEXT_ACTIONS = [
     id: 'add-file',
     label: 'Add file',
     description: 'Pick a file and insert it as context.',
+    icon: 'codicon-file',
     state: 'enabled',
     hostMessage: { type: 'pickFile' },
   },
@@ -45,6 +48,7 @@ export const ADD_CONTEXT_ACTIONS = [
     id: 'browse-workspace-files',
     label: 'Browse workspace files',
     description: 'Browse the workspace and insert selected files as context.',
+    icon: 'codicon-folder-opened',
     state: 'enabled',
     hostMessage: { type: 'browseWorkspaceFiles' },
   },
@@ -52,6 +56,7 @@ export const ADD_CONTEXT_ACTIONS = [
     id: 'add-skill',
     label: 'Skill',
     description: 'Attach a project or user skill as task context.',
+    icon: 'codicon-lightbulb',
     state: 'comingSoon',
     disabledReason: 'Skill context is coming soon.',
   },
@@ -59,6 +64,7 @@ export const ADD_CONTEXT_ACTIONS = [
     id: 'add-wiki-page',
     label: 'Wiki page',
     description: 'Attach a project wiki page as task context.',
+    icon: 'codicon-book',
     state: 'comingSoon',
     disabledReason: 'Wiki page context is coming soon.',
   },
@@ -66,6 +72,7 @@ export const ADD_CONTEXT_ACTIONS = [
     id: 'add-agent',
     label: 'Agent',
     description: 'Attach an agent definition as task context.',
+    icon: 'codicon-robot',
     state: 'comingSoon',
     disabledReason: 'Agent context is coming soon.',
   },
@@ -73,6 +80,7 @@ export const ADD_CONTEXT_ACTIONS = [
     id: 'add-browser-tab',
     label: 'Browser tab',
     description: 'Attach an open browser tab as task context.',
+    icon: 'codicon-browser',
     state: 'comingSoon',
     disabledReason: 'Browser tab context is coming soon.',
   },
@@ -80,6 +88,7 @@ export const ADD_CONTEXT_ACTIONS = [
     id: 'add-web-search',
     label: 'Web search',
     description: 'Search the web and attach results as task context.',
+    icon: 'codicon-globe',
     state: 'comingSoon',
     disabledReason: 'Web search context is coming soon.',
   },
