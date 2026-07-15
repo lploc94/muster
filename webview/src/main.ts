@@ -12,6 +12,12 @@ import '@vscode-elements/elements/dist/vscode-badge/index.js';
 
 import { mount } from 'svelte';
 import App from './App.svelte';
+import { installCustomScrollbars } from './lib/scrollbar';
+
+// Opaque, always-visible scrollbars across the whole extension (light DOM +
+// web-component shadow roots). Must run after the elements above are defined so
+// their shadow roots exist when adopted.
+installCustomScrollbars();
 
 const target = document.getElementById('app');
 if (!target) {

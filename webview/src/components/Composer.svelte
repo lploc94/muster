@@ -698,9 +698,11 @@
     for (const opt of pickerOptions) {
       if (opt.label.length > maxChars) maxChars = opt.label.length;
     }
-    // ~7.2px per char + chevron/padding; clamp so narrow webviews still scroll.
+    // ~7.2px per char + chevron/padding as the preferred width. min-width:0 lets
+    // the control shrink in narrow webviews so it never pushes the send button
+    // off-screen; the open dropdown popup still shows the full labels.
     const px = Math.min(Math.max(Math.ceil(maxChars * 7.2 + 36), 140), 420);
-    return `width: ${px}px; min-width: ${px}px; max-width: min(100%, 420px);`;
+    return `width: ${px}px; min-width: 0; max-width: min(100%, 420px);`;
   });
 
   function modelInCatalog(backend: string, model: string): boolean {
@@ -1082,21 +1084,9 @@
           </div>
         {/if}
       </div>
-
-      <!-- Config button (placeholder) -->
-      <button
-        type="button"
-        class="icon-btn opacity-60"
-        style="width: 20px; height: 20px;"
-        aria-label="Config"
-        use:tip={'Config'}
-        disabled
-      >
-        <span class="codicon codicon-gear"></span>
-      </button>
     </div>
 
-    <div class="flex items-center gap-2">
+    <div class="flex items-center gap-2 shrink-0">
       {#if canCancel}
         <button
           type="button"

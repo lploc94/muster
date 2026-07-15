@@ -12,6 +12,30 @@
   color-scheme: light dark;
 }
 
+/* Scrollbar styling for light-DOM scroll surfaces (task list, chat thread,
+   settings, tool cards).
+
+   Uses the STANDARD `scrollbar-width`/`scrollbar-color`, not `::-webkit-scrollbar`:
+   VS Code's webview Chromium IGNORES the webkit pseudo-elements (verified — a
+   `::-webkit-scrollbar{width:16px;background:red}` probe had zero effect while a
+   plain `background:magenta` on the same element applied) but honours the standard
+   properties (a `scrollbar-color:red lime` probe recoloured the bar).
+
+   Declared on `*`, not `:root`: VS Code injects a body/html scrollbar-color into the
+   webview, and inheritance takes the nearest declared ancestor — so a `:root` value
+   is shadowed by that injected rule before it reaches our nested scrollers. `*`
+   declares the value on each element directly, which beats the inherited one.
+
+   Thumb = descriptionForeground (opaque, unlike the translucent scrollbarSlider
+   token); track transparent. Note: macOS renders `overflow:scroll` as a thick classic
+   scrollbar, so scroll surfaces use `overflow:auto` (thin overlay) instead.
+   lib/scrollbar.ts handles the one surface this cannot reach: the `.scrollbar-thumb`
+   of shadow-DOM <vscode-scrollable> (e.g. the model-picker dropdown). */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--vscode-descriptionForeground) transparent;
+}
+
 /*
  * VS Code webviews often grow with content when only height:100% is used, so the
  * document scales instead of scrolling. Pin the shell to the webview viewport.
@@ -598,10 +622,14 @@ body {
 
 .add-context__menu {
   position: absolute;
-  left: 0;
+  /* Anchor to the button's right edge and grow leftward so the menu stays
+     inside the panel — the "+" sits after the model picker on the right half
+     of the row, so opening rightward would overflow the panel edge. */
+  right: 0;
   bottom: calc(100% + 4px);
   z-index: 20;
   min-width: 196px;
+  max-width: calc(100vw - 24px);
   padding: 4px;
   border: 1px solid var(--vscode-menu-border, var(--vscode-panel-border));
   border-radius: 4px;
@@ -746,54 +774,48 @@ body {
   font-weight: 700;
 }
 
-.settings-panel__subtitle,
 .settings-panel__muted,
 .settings-panel__description,
-.settings-panel__placeholder,
 .settings-panel__hint,
 .settings-panel__saving {
   color: var(--vscode-descriptionForeground);
 }
 
-.settings-panel__subtitle {
-  margin: 2px 0 0;
-  font-size: 12px;
-}
-
 .settings-panel__body {
   display: block;
   gap: 0;
-  padding: 12px;
   min-height: 0;
   flex: 1 1 0;
-  /* Only this region scrolls; header stays put. */
+  /* Only this region scrolls; header stays put. No horizontal padding here so the
+     scrollbar hugs the panel edge — the inner wrapper carries symmetric padding
+     so content is not pushed off-centre by the scrollbar. */
   overflow-x: hidden;
-  overflow-y: scroll;
+  /* `auto` (not `scroll`): on macOS a persistent `scroll` scrollbar renders as the
+     thick CLASSIC scrollbar, while `auto` uses the thin overlay one that every other
+     scroll surface here gets. */
+  overflow-y: auto;
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
 }
 
+.settings-panel__body-inner {
+  padding: 12px;
+}
+
 /* Block children stack with gap without flex-grow fighting overflow. */
-.settings-panel__body > * + * {
+.settings-panel__body-inner > * + * {
   margin-top: 8px;
 }
 
-.settings-panel__intro,
 .settings-panel__notice,
 .settings-panel__muted {
   margin: 0;
 }
 
-.settings-panel__intro,
 .settings-panel__notice,
 .settings-panel__error,
 .settings-panel__success {
   overflow-wrap: anywhere;
-}
-
-.settings-panel__intro {
-  color: var(--vscode-foreground);
-  line-height: 1.45;
 }
 
 .settings-panel__notice {
@@ -808,106 +830,15 @@ body {
   background: color-mix(in srgb, var(--vscode-editor-background) 88%, var(--vscode-focusBorder, #3794ff) 12%);
 }
 
-.settings-panel__group {
-  display: flex;
-  min-width: 0;
-  flex-direction: column;
-  border: 1px solid var(--vscode-panel-border);
-  border-radius: 6px;
-  overflow: hidden;
-}
-
-.settings-panel__row {
-  display: flex;
-  min-width: 0;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 10px;
-}
-
-.settings-panel__row + .settings-panel__row {
-  border-top: 1px solid var(--vscode-panel-border);
-}
-
 .settings-panel__label {
   font-weight: 600;
 }
 
 .settings-panel__description,
-.settings-panel__placeholder,
 .settings-panel__hint,
 .settings-panel__field-error,
 .settings-panel__saving {
   font-size: 12px;
-}
-
-.settings-panel__placeholder {
-  flex: none;
-  border: 1px solid var(--vscode-panel-border);
-  border-radius: 999px;
-  padding: 1px 6px;
-}
-
-.settings-panel__row--editable {
-  align-items: stretch;
-}
-
-.settings-panel__copy {
-  min-width: 0;
-  flex: 1 1 auto;
-}
-
-.settings-panel__control {
-  display: flex;
-  flex: 0 0 180px;
-  flex-direction: column;
-  gap: 6px;
-  align-items: stretch;
-}
-
-/* Toolbar of actions next to a label (Add / Reset / Save) — do not use fixed 180px column. */
-.settings-panel__control--row {
-  display: flex;
-  flex: 1 1 auto;
-  flex-direction: row;
-  flex-wrap: wrap;
-  gap: 6px;
-  align-items: center;
-  justify-content: flex-end;
-  min-width: 0;
-}
-
-.settings-panel__control--row .settings-panel__save {
-  flex: 0 0 auto;
-  width: auto;
-  white-space: nowrap;
-}
-
-/* Task-type editor rows: full-width form, not side-by-side with 180px control. */
-.settings-panel__row--type {
-  display: flex;
-  flex-direction: column;
-  align-items: stretch;
-  gap: 8px;
-}
-
-.settings-panel__type-grid {
-  display: grid;
-  grid-template-columns: minmax(4.5rem, auto) minmax(0, 1fr);
-  gap: 6px 10px;
-  align-items: center;
-  width: 100%;
-  min-width: 0;
-}
-
-.settings-panel__type-grid .settings-panel__label {
-  font-size: 12px;
-}
-
-.settings-panel__type-actions {
-  display: flex;
-  justify-content: flex-end;
 }
 
 .settings-panel__input {
@@ -922,38 +853,16 @@ body {
   font: inherit;
 }
 
-/* Native <select> must re-apply theme; Tailwind preflight leaves them bare otherwise. */
-select.settings-panel__input {
-  appearance: auto;
-  cursor: pointer;
-}
-
 .settings-panel__input[aria-invalid="true"] {
   border-color: var(--vscode-inputValidation-errorBorder, var(--vscode-errorForeground));
 }
 
 .settings-panel__input:focus-visible,
-.settings-panel__save:focus-visible,
 .settings-panel__back:focus-visible {
   outline: 1px solid var(--vscode-focusBorder, #3794ff);
   outline-offset: 2px;
 }
 
-.settings-panel__save {
-  min-height: 26px;
-  color: var(--vscode-button-foreground, var(--vscode-foreground));
-  background: var(--vscode-button-background, transparent);
-  border: 1px solid var(--vscode-button-border, var(--vscode-button-background, var(--vscode-panel-border)));
-  border-radius: 3px;
-  padding: 3px 8px;
-  white-space: normal;
-}
-
-.settings-panel__save:hover:not(:disabled) {
-  background: var(--vscode-button-hoverBackground, var(--vscode-toolbar-hoverBackground));
-}
-
-.settings-panel__save:disabled,
 .settings-panel__input:disabled {
   opacity: 0.65;
 }
@@ -985,34 +894,320 @@ select.settings-panel__input {
   line-height: 1.45;
 }
 
+/* ===== Settings sections ===== */
+.settings-section {
+  min-width: 0;
+}
+
+.settings-panel__body-inner > .settings-section + .settings-section {
+  margin-top: 20px;
+  padding-top: 18px;
+  border-top: 1px solid var(--vscode-panel-border);
+}
+
+.settings-section__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px 12px;
+  min-width: 0;
+}
+
+.settings-section__heading {
+  flex: 1 1 200px;
+  min-width: 0;
+}
+
+.settings-section__title {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--vscode-foreground);
+}
+
+.settings-section__desc {
+  margin: 4px 0 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--vscode-descriptionForeground);
+}
+
+.settings-section__desc code {
+  padding: 0 3px;
+  border-radius: 3px;
+  font-size: 11px;
+  background: color-mix(in srgb, var(--vscode-foreground) 12%, transparent);
+}
+
+.settings-section__actions {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.settings-section__status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.settings-section__count {
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+}
+
+.type-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 8px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.type-status__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.type-status--ok {
+  color: var(--vscode-testing-iconPassed, #73c991);
+  background: color-mix(in srgb, var(--vscode-testing-iconPassed, #73c991) 14%, transparent);
+  border-color: color-mix(in srgb, var(--vscode-testing-iconPassed, #73c991) 34%, transparent);
+}
+
+.type-status--empty {
+  color: var(--vscode-descriptionForeground);
+  background: color-mix(in srgb, var(--vscode-descriptionForeground) 12%, transparent);
+  border-color: color-mix(in srgb, var(--vscode-descriptionForeground) 30%, transparent);
+}
+
+.type-status--invalid {
+  color: var(--vscode-errorForeground, #f14c4c);
+  background: color-mix(in srgb, var(--vscode-errorForeground, #f14c4c) 12%, transparent);
+  border-color: color-mix(in srgb, var(--vscode-errorForeground, #f14c4c) 34%, transparent);
+}
+
+/* ===== Settings buttons ===== */
+.settings-panel__btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-height: 26px;
+  padding: 3px 12px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  font: inherit;
+  font-size: 12px;
+  line-height: 18px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.settings-panel__btn .codicon {
+  font-size: 14px;
+}
+
+.settings-panel__btn--primary {
+  color: var(--vscode-button-foreground, #ffffff);
+  background: var(--vscode-button-background, #0e639c);
+  border-color: var(--vscode-button-border, transparent);
+}
+
+.settings-panel__btn--primary:hover:not(:disabled) {
+  background: var(--vscode-button-hoverBackground, #1177bb);
+}
+
+.settings-panel__btn--ghost {
+  color: var(--vscode-foreground);
+  background: transparent;
+  border-color: var(--vscode-panel-border);
+}
+
+.settings-panel__btn--ghost:hover:not(:disabled) {
+  background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
+  border-color: var(--vscode-focusBorder);
+}
+
+.settings-panel__icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--vscode-descriptionForeground);
+  cursor: pointer;
+}
+
+.settings-panel__icon-btn .codicon {
+  font-size: 15px;
+}
+
+.settings-panel__icon-btn:hover:not(:disabled) {
+  color: var(--vscode-foreground);
+  background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
+}
+
+.settings-panel__icon-btn--danger:hover:not(:disabled) {
+  color: var(--vscode-errorForeground, #f14c4c);
+  background: color-mix(in srgb, var(--vscode-errorForeground, #f14c4c) 14%, transparent);
+}
+
+.settings-panel__btn:disabled,
+.settings-panel__icon-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.settings-panel__btn:focus-visible,
+.settings-panel__icon-btn:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder, #3794ff);
+  outline-offset: 1px;
+}
+
+/* ===== Task-type cards ===== */
+.settings-types {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 12px;
+  min-width: 0;
+}
+
+.type-card {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--vscode-foreground) 3%, transparent);
+}
+
+.type-card__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.type-card__id {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-weight: 600;
+}
+
+.type-card__grid {
+  display: grid;
+  grid-template-columns: minmax(4.5rem, auto) minmax(0, 1fr);
+  gap: 6px 10px;
+  align-items: center;
+  margin-top: 10px;
+  min-width: 0;
+}
+
+.type-card__grid .settings-panel__label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--vscode-descriptionForeground);
+}
+
+/* ===== Retention fields ===== */
+.settings-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 12px;
+  min-width: 0;
+}
+
+.field-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.field-row__copy {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.field-row__copy .settings-panel__description {
+  margin: 2px 0 0;
+  line-height: 1.4;
+}
+
+.field-row__copy .settings-panel__hint {
+  margin: 3px 0 0;
+}
+
+.field-row__control {
+  display: flex;
+  flex: none;
+  flex-direction: column;
+  gap: 4px;
+  align-items: flex-end;
+}
+
+.field-row__input-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.field-row__input-group .settings-panel__input {
+  width: 96px;
+}
+
 @media (max-width: 440px) {
   .settings-panel__header,
-  .settings-panel__body {
+  .settings-panel__body-inner {
     padding: 10px;
   }
 
-  .settings-panel__row--editable {
+  .settings-section__actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .field-row {
     flex-direction: column;
     gap: 8px;
   }
 
-  .settings-panel__control {
-    flex-basis: auto;
+  .field-row__control {
+    align-items: stretch;
     width: 100%;
   }
 
-  .settings-panel__control--row {
-    width: 100%;
-    justify-content: stretch;
-  }
-
-  .settings-panel__control--row .settings-panel__save,
-  .settings-panel__save {
+  .field-row__input-group {
     width: 100%;
   }
 
-  .settings-panel__type-grid {
+  .field-row__input-group .settings-panel__input {
+    flex: 1 1 auto;
+    width: auto;
+  }
+
+  .type-card__grid {
     grid-template-columns: 1fr;
+    gap: 4px 10px;
   }
 }
 

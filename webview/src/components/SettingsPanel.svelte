@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Select from './Select.svelte';
   import type {
     RetentionSettingId,
     RetentionSettingSnapshot,
@@ -30,6 +31,12 @@
   const LABELS: Record<RetentionSettingId, string> = {
     maxTurnsPerTask: 'Maximum turns per task',
     maxStoredOutputChars: 'Maximum stored output characters',
+  };
+
+  const TASK_TYPE_STATUS_LABEL: Record<TaskTypesSettingsSnapshot['status'], string> = {
+    ok: 'Valid',
+    empty: 'Empty',
+    invalid: 'Invalid',
   };
 
   let {
@@ -252,12 +259,12 @@
       </button>
       <div class="min-w-0">
         <h2 id="settings-panel-title" class="settings-panel__title">Settings</h2>
-        <p class="settings-panel__subtitle">Backed by VS Code configuration</p>
       </div>
     </div>
   </div>
 
   <div class="settings-panel__body">
+    <div class="settings-panel__body-inner">
     {#if globalError}
       <div class="settings-panel__error" role="alert">
         <div class="settings-panel__error-title">Settings save failed</div>
@@ -269,208 +276,227 @@
       <div class="settings-panel__success" role="status">{savedMessage}</div>
     {/if}
 
-    <!-- Task types -->
-    <p class="settings-panel__intro">
-      Task types map coordinator create/delegate to backend (and optional model). Stored as
-      <code>muster.taskTypes</code> in workspace settings.
-    </p>
-
-    {#if taskTypesLoading && !taskTypesSnapshot}
-      <p class="settings-panel__notice" role="status">Loading task types…</p>
-    {:else if taskTypesSnapshot}
-      <p class="settings-panel__notice" role="status">
-        Muster ships defaults without model pins. Edit and Save to persist; agents use these presets.
-      </p>
-    {/if}
-
-    {#if taskTypesError}
-      <div class="settings-panel__error" role="alert">
-        <div class="settings-panel__error-title">Task types save failed</div>
-        <div>{taskTypesError}</div>
-      </div>
-    {/if}
-
-    {#if taskTypesSavedMessage}
-      <div class="settings-panel__success" role="status">{taskTypesSavedMessage}</div>
-    {/if}
-
-    {#if typeDraftError}
-      <div class="settings-panel__field-error" role="alert">{typeDraftError}</div>
-    {/if}
-
-    {#if taskTypesSnapshot}
-      <div class="settings-panel__group" aria-label="Task type presets">
-        <div class="settings-panel__row">
-          <div class="settings-panel__copy">
-            <div class="settings-panel__label">Task types</div>
-            <div class="settings-panel__description">
-              Status: {taskTypesSnapshot.status}. Max {taskTypesSnapshot.constraints.maxTypes} types.
-            </div>
-          </div>
-          <div class="settings-panel__control settings-panel__control--row">
-            <button type="button" class="settings-panel__save" disabled={taskTypesSaving} onclick={addTypeRow}>Add type</button>
-            <button type="button" class="settings-panel__save" disabled={taskTypesSaving} onclick={resetTypes}>Reset defaults</button>
-            <button type="button" class="settings-panel__save" disabled={taskTypesSaving} onclick={saveTypes}>
-              {taskTypesSaving ? 'Saving…' : 'Save task types'}
-            </button>
-          </div>
+    <!-- ===== Task Types ===== -->
+    <section class="settings-section" aria-label="Task types">
+      <div class="settings-section__head">
+        <div class="settings-section__heading">
+          <h3 class="settings-section__title">Task Types</h3>
+          <p class="settings-section__desc">
+            Map coordinator create/delegate to a backend and optional model.
+          </p>
         </div>
-
-        {#each typeDrafts as row, index (index)}
-          <div class="settings-panel__row settings-panel__row--editable settings-panel__row--type">
-            <div class="settings-panel__type-grid">
-              <label class="settings-panel__label" for={`tt-id-${index}`}>Id</label>
-              <input
-                id={`tt-id-${index}`}
-                class="settings-panel__input"
-                type="text"
-                value={row.id}
-                disabled={taskTypesSaving}
-                oninput={(e) => updateTypeRow(index, { id: (e.currentTarget as HTMLInputElement).value })}
-              />
-
-              <label class="settings-panel__label" for={`tt-backend-${index}`}>Backend</label>
-              <select
-                id={`tt-backend-${index}`}
-                class="settings-panel__input"
-                value={row.backend}
-                disabled={taskTypesSaving}
-                onchange={(e) => {
-                  const backend = (e.currentTarget as HTMLSelectElement).value;
-                  updateTypeRow(index, { backend, model: undefined });
-                }}
-              >
-                {#each backendOptions() as b}
-                  <option value={b}>{b}</option>
-                {/each}
-              </select>
-
-              <label class="settings-panel__label" for={`tt-model-${index}`}>Model</label>
-              <select
-                id={`tt-model-${index}`}
-                class="settings-panel__input"
-                value={row.model ?? ''}
-                disabled={taskTypesSaving}
-                onchange={(e) => {
-                  const v = (e.currentTarget as HTMLSelectElement).value;
-                  updateTypeRow(index, { model: v || undefined });
-                }}
-              >
-                <option value="">(agent default)</option>
-                {#each modelOptions(row.backend, row.model) as opt}
-                  <option value={opt.value}>{opt.name || opt.value}</option>
-                {/each}
-              </select>
-
-              <label class="settings-panel__label" for={`tt-role-${index}`}>Role</label>
-              <select
-                id={`tt-role-${index}`}
-                class="settings-panel__input"
-                value={row.role}
-                disabled={taskTypesSaving}
-                onchange={(e) =>
-                  updateTypeRow(index, {
-                    role: (e.currentTarget as HTMLSelectElement).value as 'coordinator' | 'worker',
-                  })}
-              >
-                {#each taskTypesSnapshot.constraints.roles as role}
-                  <option value={role}>{role}</option>
-                {/each}
-              </select>
-
-              <label class="settings-panel__label" for={`tt-kind-${index}`}>Brief kind</label>
-              <select
-                id={`tt-kind-${index}`}
-                class="settings-panel__input"
-                value={row.briefKind}
-                disabled={taskTypesSaving}
-                onchange={(e) => updateTypeRow(index, { briefKind: (e.currentTarget as HTMLSelectElement).value })}
-              >
-                {#each taskTypesSnapshot.constraints.briefKinds as kind}
-                  <option value={kind}>{kind}</option>
-                {/each}
-              </select>
-
-              <label class="settings-panel__label" for={`tt-desc-${index}`}>Description</label>
-              <input
-                id={`tt-desc-${index}`}
-                class="settings-panel__input"
-                type="text"
-                maxlength={taskTypesSnapshot.constraints.descriptionMax}
-                value={row.description ?? ''}
-                disabled={taskTypesSaving}
-                oninput={(e) =>
-                  updateTypeRow(index, { description: (e.currentTarget as HTMLInputElement).value || undefined })}
-              />
-            </div>
-            <div class="settings-panel__type-actions">
-              <button
-                type="button"
-                class="settings-panel__save"
-                disabled={taskTypesSaving}
-                onclick={() => removeTypeRow(index)}
-              >Remove</button>
-            </div>
+        {#if taskTypesSnapshot}
+          <div class="settings-section__actions">
+            <button
+              type="button"
+              class="settings-panel__btn settings-panel__btn--ghost"
+              disabled={taskTypesSaving}
+              onclick={addTypeRow}
+            >
+              <span class="codicon codicon-add" aria-hidden="true"></span>Add
+            </button>
+            <button
+              type="button"
+              class="settings-panel__btn settings-panel__btn--ghost"
+              disabled={taskTypesSaving}
+              onclick={resetTypes}
+            >Reset</button>
+            <button
+              type="button"
+              class="settings-panel__btn settings-panel__btn--primary"
+              disabled={taskTypesSaving}
+              onclick={saveTypes}
+            >{taskTypesSaving ? 'Saving…' : 'Save'}</button>
           </div>
-        {/each}
-
-        {#if typeDrafts.length === 0}
-          <p class="settings-panel__notice">No types (empty map fails closed for create/delegate). Add types or Reset defaults.</p>
         {/if}
       </div>
-    {/if}
 
-    <!-- Retention -->
-    <p class="settings-panel__intro">Retention keeps recent task history usable without storing unlimited completed-turn output.</p>
+      {#if taskTypesLoading && !taskTypesSnapshot}
+        <p class="settings-panel__notice" role="status">Loading task types…</p>
+      {:else if taskTypesSnapshot}
+        <div class="settings-section__status">
+          <span class={`type-status type-status--${taskTypesSnapshot.status}`}>
+            <span class="type-status__dot" aria-hidden="true"></span>
+            {TASK_TYPE_STATUS_LABEL[taskTypesSnapshot.status]}
+          </span>
+          <span class="settings-section__count">
+            {typeDrafts.length} of {taskTypesSnapshot.constraints.maxTypes} types
+          </span>
+        </div>
+      {/if}
 
-    {#if loading && !snapshot}
-      <p class="settings-panel__notice" role="status">Loading retention settings from VS Code…</p>
-    {:else if snapshot}
-      <p class="settings-panel__notice" role="status">Edit one retention field at a time; each Save writes only that VS Code setting.</p>
-    {:else}
-      <p class="settings-panel__notice">These values are read from and saved back to VS Code settings.</p>
-    {/if}
+      {#if taskTypesError}
+        <div class="settings-panel__error" role="alert">
+          <div class="settings-panel__error-title">Task types save failed</div>
+          <div>{taskTypesError}</div>
+        </div>
+      {/if}
 
-    {#if snapshot}
-      <div class="settings-panel__group" aria-label="Retention settings">
-        {#each snapshot.settings as setting (setting.id)}
-          {@const label = displayLabel(setting.id)}
-          {@const error = localFieldErrors[setting.id] ?? fieldErrors[setting.id]}
-          <div class="settings-panel__row settings-panel__row--editable">
-            <div class="settings-panel__copy">
-              <label class="settings-panel__label" for={fieldId(setting.id)}>{label}</label>
-              <div class="settings-panel__description">{setting.description}</div>
-              <div class="settings-panel__hint">Minimum {setting.minimum}. Default {setting.defaultValue}.</div>
-              {#if error}
-                <div class="settings-panel__field-error" id={`${fieldId(setting.id)}-error`} role="alert">{error}</div>
-              {/if}
+      {#if taskTypesSavedMessage}
+        <div class="settings-panel__success" role="status">{taskTypesSavedMessage}</div>
+      {/if}
+
+      {#if typeDraftError}
+        <div class="settings-panel__field-error" role="alert">{typeDraftError}</div>
+      {/if}
+
+      {#if taskTypesSnapshot}
+        <div class="settings-types">
+          {#each typeDrafts as row, index (index)}
+            <div class="type-card">
+              <div class="type-card__head">
+                <input
+                  id={`tt-id-${index}`}
+                  class="settings-panel__input type-card__id"
+                  type="text"
+                  placeholder="type-id"
+                  aria-label="Type id"
+                  value={row.id}
+                  disabled={taskTypesSaving}
+                  oninput={(e) => updateTypeRow(index, { id: (e.currentTarget as HTMLInputElement).value })}
+                />
+                <button
+                  type="button"
+                  class="settings-panel__icon-btn settings-panel__icon-btn--danger"
+                  disabled={taskTypesSaving}
+                  aria-label="Remove type"
+                  title="Remove type"
+                  onclick={() => removeTypeRow(index)}
+                >
+                  <span class="codicon codicon-trash" aria-hidden="true"></span>
+                </button>
+              </div>
+
+              <div class="type-card__grid">
+                <label class="settings-panel__label" for={`tt-backend-${index}`}>Backend</label>
+                <Select
+                  id={`tt-backend-${index}`}
+                  value={row.backend}
+                  disabled={taskTypesSaving}
+                  ariaLabel="Backend"
+                  options={backendOptions().map((b) => ({ value: b, label: b }))}
+                  onchange={(backend) => updateTypeRow(index, { backend, model: undefined })}
+                />
+
+                <label class="settings-panel__label" for={`tt-model-${index}`}>Model</label>
+                <Select
+                  id={`tt-model-${index}`}
+                  value={row.model ?? ''}
+                  disabled={taskTypesSaving}
+                  ariaLabel="Model"
+                  placeholder="(agent default)"
+                  options={[
+                    { value: '', label: '(agent default)' },
+                    ...modelOptions(row.backend, row.model).map((opt) => ({
+                      value: opt.value,
+                      label: opt.name || opt.value,
+                    })),
+                  ]}
+                  onchange={(v) => updateTypeRow(index, { model: v || undefined })}
+                />
+
+                <label class="settings-panel__label" for={`tt-role-${index}`}>Role</label>
+                <Select
+                  id={`tt-role-${index}`}
+                  value={row.role}
+                  disabled={taskTypesSaving}
+                  ariaLabel="Role"
+                  options={taskTypesSnapshot.constraints.roles.map((role) => ({ value: role, label: role }))}
+                  onchange={(v) => updateTypeRow(index, { role: v as 'coordinator' | 'worker' })}
+                />
+
+                <label class="settings-panel__label" for={`tt-kind-${index}`}>Brief kind</label>
+                <Select
+                  id={`tt-kind-${index}`}
+                  value={row.briefKind}
+                  disabled={taskTypesSaving}
+                  ariaLabel="Brief kind"
+                  options={taskTypesSnapshot.constraints.briefKinds.map((kind) => ({ value: kind, label: kind }))}
+                  onchange={(v) => updateTypeRow(index, { briefKind: v })}
+                />
+
+                <label class="settings-panel__label" for={`tt-desc-${index}`}>Description</label>
+                <input
+                  id={`tt-desc-${index}`}
+                  class="settings-panel__input"
+                  type="text"
+                  maxlength={taskTypesSnapshot.constraints.descriptionMax}
+                  value={row.description ?? ''}
+                  disabled={taskTypesSaving}
+                  oninput={(e) =>
+                    updateTypeRow(index, { description: (e.currentTarget as HTMLInputElement).value || undefined })}
+                />
+              </div>
             </div>
-            <div class="settings-panel__control">
-              <input
-                id={fieldId(setting.id)}
-                class="settings-panel__input"
-                type="number"
-                min={setting.minimum}
-                step="1"
-                value={drafts[setting.id]}
-                aria-invalid={error ? 'true' : 'false'}
-                aria-describedby={error ? `${fieldId(setting.id)}-error` : undefined}
-                disabled={savingSettingId === setting.id}
-                oninput={(event) => onDraftInput(setting.id, event)}
-              />
-              <button
-                type="button"
-                class="settings-panel__save"
-                disabled={savingSettingId === setting.id}
-                onclick={() => saveSetting(setting.id, setting.minimum)}
-              >Save {label}</button>
-              {#if savingSettingId === setting.id}
-                <div class="settings-panel__saving" role="status">Saving {label}…</div>
-              {/if}
-            </div>
-          </div>
-        {/each}
+          {/each}
+
+          {#if typeDrafts.length === 0}
+            <p class="settings-panel__notice">
+              No task types. Add one or Reset to defaults — an empty map blocks create/delegate.
+            </p>
+          {/if}
+        </div>
+      {/if}
+    </section>
+
+    <!-- ===== Retention ===== -->
+    <section class="settings-section" aria-label="Retention">
+      <div class="settings-section__heading">
+        <h3 class="settings-section__title">Retention</h3>
+        <p class="settings-section__desc">
+          Retention keeps recent task history usable without storing unlimited completed-turn output.
+        </p>
       </div>
-    {/if}
+
+      {#if loading && !snapshot}
+        <p class="settings-panel__notice" role="status">Loading retention settings from VS Code…</p>
+      {/if}
+
+      {#if snapshot}
+        <div class="settings-fields">
+          {#each snapshot.settings as setting (setting.id)}
+            {@const label = displayLabel(setting.id)}
+            {@const error = localFieldErrors[setting.id] ?? fieldErrors[setting.id]}
+            <div class="field-row">
+              <div class="field-row__copy">
+                <label class="settings-panel__label" for={fieldId(setting.id)}>{label}</label>
+                <p class="settings-panel__description">{setting.description}</p>
+                <p class="settings-panel__hint">Min {setting.minimum} · Default {setting.defaultValue}</p>
+                {#if error}
+                  <div class="settings-panel__field-error" id={`${fieldId(setting.id)}-error`} role="alert">{error}</div>
+                {/if}
+              </div>
+              <div class="field-row__control">
+                <div class="field-row__input-group">
+                  <input
+                    id={fieldId(setting.id)}
+                    class="settings-panel__input"
+                    type="number"
+                    min={setting.minimum}
+                    step="1"
+                    value={drafts[setting.id]}
+                    aria-invalid={error ? 'true' : 'false'}
+                    aria-describedby={error ? `${fieldId(setting.id)}-error` : undefined}
+                    disabled={savingSettingId === setting.id}
+                    oninput={(event) => onDraftInput(setting.id, event)}
+                  />
+                  <button
+                    type="button"
+                    class="settings-panel__btn settings-panel__btn--primary"
+                    disabled={savingSettingId === setting.id}
+                    aria-label={`Save ${label}`}
+                    onclick={() => saveSetting(setting.id, setting.minimum)}
+                  >Save</button>
+                </div>
+                {#if savingSettingId === setting.id}
+                  <div class="settings-panel__saving" role="status">Saving {label}…</div>
+                {/if}
+              </div>
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </section>
+    </div>
   </div>
 </section>
