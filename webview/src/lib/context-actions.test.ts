@@ -25,19 +25,31 @@ describe('Add Context action model', () => {
   });
 
   it('marks implemented actions as enabled host-postable messages without changing protocol payloads', () => {
-    const implemented = ADD_CONTEXT_ACTIONS.filter((action) => action.state === 'enabled');
+    const enabled = ADD_CONTEXT_ACTIONS.filter((action) => action.state === 'enabled');
 
-    expect(implemented.map((action) => [action.id, action.hostMessage])).toEqual([
-      ['add-file', { type: 'pickFile' } satisfies OutMessage],
-      ['browse-workspace-files', { type: 'browseWorkspaceFiles' } satisfies OutMessage],
+    expect(enabled.map((action) => action.id)).toEqual([
+      'add-file',
+      'browse-workspace-files',
+      'add-skill',
     ]);
+
+    // Host-postable enabled actions carry a protocol message.
+    expect(getAddContextActionHostMessage('add-file')).toEqual({ type: 'pickFile' } satisfies OutMessage);
+    expect(getAddContextActionHostMessage('browse-workspace-files')).toEqual(
+      { type: 'browseWorkspaceFiles' } satisfies OutMessage,
+    );
+
+    // The skill picker is enabled but handled in-webview (client action, no host message).
+    const skill = getAddContextAction('add-skill');
+    expect(skill.state).toBe('enabled');
+    expect(skill.state === 'enabled' ? skill.clientAction : undefined).toBe('openSkillPicker');
+    expect(getAddContextActionHostMessage('add-skill')).toBeNull();
   });
 
   it('prevents disabled and coming-soon actions from emitting host messages', () => {
     const unavailable = ADD_CONTEXT_ACTIONS.filter((action) => action.state !== 'enabled');
 
     expect(unavailable.map((action) => [action.id, action.state])).toEqual([
-      ['add-skill', 'comingSoon'],
       ['add-wiki-page', 'comingSoon'],
       ['add-agent', 'comingSoon'],
       ['add-browser-tab', 'comingSoon'],

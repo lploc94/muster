@@ -415,6 +415,22 @@ describe('resolveSkillInvocation', () => {
       unavailable: [],
     });
   });
+
+  it('default prefix stays `/` when omitted (back-compat)', () => {
+    expect(resolveSkillInvocation(['plan'], undefined).commandLines).toEqual(['/plan']);
+  });
+
+  it('per-backend prefix `$` emits `$name` (Codex)', () => {
+    const r = resolveSkillInvocation(['plan', 'review'], undefined, '$');
+    expect(r.commandLines).toEqual(['$plan', '$review']);
+    expect(r.unavailable).toEqual([]);
+  });
+
+  it('prefix does not bypass fail-closed resolution (KNOWN set)', () => {
+    const r = resolveSkillInvocation(['plan', 'ghost'], new Set(['plan']), '$');
+    expect(r.commandLines).toEqual(['$plan']);
+    expect(r.unavailable).toEqual(['ghost']);
+  });
 });
 
 describe('mergeBriefFromCreate — skills', () => {
@@ -457,6 +473,28 @@ describe('assembleFirstTurnPrompt — skill injection', () => {
     expect(result.prompt.startsWith('/')).toBe(false);
     expect(result.prompt.startsWith('# Muster host context')).toBe(true);
     expect(result.unavailableSkills).toEqual([]);
+  });
+
+  it('default skillPrefix omitted → `/name` lines (back-compat)', () => {
+    const brief = synthesizeBriefFromGoal('Implement X', undefined, 'implement');
+    brief.skills = ['plan'];
+    const result = assembleFirstTurnPrompt({ ...baseInput(), brief });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.prompt.startsWith('/plan\n\n')).toBe(true);
+  });
+
+  it('skillPrefix `$` → `$name` lines (Codex)', () => {
+    const brief = synthesizeBriefFromGoal('Implement X', undefined, 'implement');
+    brief.skills = ['plan', 'review'];
+    const result = assembleFirstTurnPrompt({ ...baseInput(), brief, skillPrefix: '$' });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.prompt.startsWith('$plan\n$review\n\n')).toBe(true);
+    expect(result.prompt).not.toContain('/plan');
+    expect(result.prompt.indexOf('$plan')).toBeLessThan(
+      result.prompt.indexOf('# Muster host context'),
+    );
   });
 
   it('KNOWN backend: injects only advertised skills and surfaces the rest', () => {

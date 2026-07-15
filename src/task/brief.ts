@@ -151,10 +151,13 @@ export interface SkillResolution {
  * - advertised === undefined → UNKNOWN backend → inject optimistically (valid names only).
  * - advertised is a Set → KNOWN → strict: only inject names present in the set.
  * A name failing SKILL_NAME_RE is never injected and is reported as unavailable.
+ * `prefix` is the per-backend invocation char (`/` for most, `$` for Codex);
+ * defaults to `/` for back-compat with callers that predate per-backend prefixes.
  */
 export function resolveSkillInvocation(
   skills: readonly string[] | undefined,
   advertised: ReadonlySet<string> | undefined,
+  prefix: string = '/',
 ): SkillResolution {
   const commandLines: string[] = [];
   const unavailable: string[] = [];
@@ -164,7 +167,7 @@ export function resolveSkillInvocation(
       continue;
     }
     const ok = advertised === undefined ? true : advertised.has(name);
-    if (ok) commandLines.push(`/${name}`);
+    if (ok) commandLines.push(`${prefix}${name}`);
     else unavailable.push(name);
   }
   return { commandLines, unavailable };
@@ -382,6 +385,11 @@ export interface AssembleFirstTurnInput {
    * undefined → UNKNOWN backend → inject declared skills optimistically.
    */
   advertisedCommands?: ReadonlySet<string>;
+  /**
+   * Per-backend skill invocation prefix (`/` for most backends, `$` for Codex).
+   * Defaults to `/` when omitted. Threaded from the engine via getSkillPrefix.
+   */
+  skillPrefix?: string;
 }
 
 /**
@@ -415,9 +423,10 @@ export function assembleFirstTurnPrompt(input: AssembleFirstTurnInput): Assemble
   const { commandLines, unavailable } = resolveSkillInvocation(
     input.brief.skills,
     input.advertisedCommands,
+    input.skillPrefix ?? '/',
   );
-  const skillPrefix = commandLines.length ? `${commandLines.join('\n')}\n\n` : '';
-  const budget = COMPILED_PROMPT_MAX - skillPrefix.length;
+  const skillBlock = commandLines.length ? `${commandLines.join('\n')}\n\n` : '';
+  const budget = COMPILED_PROMPT_MAX - skillBlock.length;
 
   // Protected minimum: host + role + objective (+ complete pins last if any)
   const minParts = [hostMd, role, objective];
@@ -440,7 +449,7 @@ export function assembleFirstTurnPrompt(input: AssembleFirstTurnInput): Assemble
       return {
         ok: false,
         code: 'prompt_budget_exceeded',
-        message: `First-turn prompt core (host+role+objective+pins${skillPrefix ? '+skills' : ''}) exceeds ${COMPILED_PROMPT_MAX} chars (${minPrompt.length + skillPrefix.length})`,
+        message: `First-turn prompt core (host+role+objective+pins${skillBlock ? '+skills' : ''}) exceeds ${COMPILED_PROMPT_MAX} chars (${minPrompt.length + skillBlock.length})`,
       };
     }
   }
@@ -460,7 +469,7 @@ export function assembleFirstTurnPrompt(input: AssembleFirstTurnInput): Assemble
     ? `${hostMd}\n\n${briefBody}\n\n${pinSection}`
     : `${hostMd}\n\n${briefBody}`;
 
-  const prompt = skillPrefix ? `${skillPrefix}${assembled}` : assembled;
+  const prompt = skillBlock ? `${skillBlock}${assembled}` : assembled;
 
   // Safety net: `assembled` is packed within `budget` = MAX - prefix, so the full
   // prompt should already fit; this guards only against accounting drift.

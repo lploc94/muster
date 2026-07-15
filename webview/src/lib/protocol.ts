@@ -375,6 +375,11 @@ export type ExtMessage =
   /** `path` = resolve target for LLM; optional `displayName` = short chip label. */
   | { type: 'filePicked'; path: string; displayName?: string }
   | { type: 'backendsAvailable'; backends: string[] }
+  /**
+   * A backend's advertised skills + its per-backend invocation prefix (`/` or `$`).
+   * `prefix` is always present (static map) even when `skills` is empty (cold cache).
+   */
+  | { type: 'skillsAvailable'; backend: string; prefix: string; skills: string[] }
   | { type: 'modelsAvailable'; models: Record<string, BackendModels> }
   /**
    * Host-persisted last-used composer backend/model (globalState). Sent on
@@ -455,6 +460,8 @@ export type OutMessage =
       backend?: string;
       model?: string;
       continuationOf?: string;
+      /** Structured skill chips; injected into a NEW task's first turn only. */
+      skills?: string[];
       /** Phase C idempotent send key (stable across resend). */
       clientRequestId?: string;
     }
@@ -551,6 +558,8 @@ export type OutMessage =
   | { type: 'updateTaskTypes'; types: TaskTypeSettingsRow[] }
   | { type: 'listBackends' }
   | { type: 'listModels' }
+  /** Ask the host for a backend's advertised skills + invocation prefix. */
+  | { type: 'listSkills'; backend: string }
   /** Webview → host debug line for Output channel "Muster Debug". */
   | { type: 'debugLog'; event: string; details?: Record<string, unknown> }
   /**
@@ -1080,6 +1089,14 @@ export function isExtMessage(data: unknown): data is ExtMessage {
 
     case 'backendsAvailable':
       return Array.isArray(data.backends) && data.backends.every(isString);
+
+    case 'skillsAvailable':
+      return (
+        isString(data.backend) &&
+        isString(data.prefix) &&
+        Array.isArray(data.skills) &&
+        data.skills.every(isString)
+      );
 
     case 'modelsAvailable':
       return typeof data.models === 'object' && data.models !== null;

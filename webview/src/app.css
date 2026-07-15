@@ -982,6 +982,61 @@ body {
   background: color-mix(in srgb, var(--vscode-editor-selectionBackground, #264f78) 70%, transparent);
 }
 
+/* Removable skill chips sit above the composer input; styled like a small badge. */
+.skill-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.skill-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 1px 4px 1px 8px;
+  border: 1px solid var(--vscode-badge-background, var(--vscode-panel-border));
+  border-radius: 10px;
+  color: var(--vscode-badge-foreground, var(--vscode-foreground));
+  background: color-mix(in srgb, var(--vscode-badge-background, #4d4d4d) 35%, transparent);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.skill-chip__label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skill-chip__remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  opacity: 0.75;
+}
+
+.skill-chip__remove:hover,
+.skill-chip__remove:focus-visible {
+  opacity: 1;
+  background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
+  outline: none;
+}
+
+.skill-chip__remove .codicon {
+  font-size: 12px;
+  line-height: 1;
+}
+
 .add-context {
   position: relative;
 }

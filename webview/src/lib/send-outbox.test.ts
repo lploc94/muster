@@ -38,6 +38,39 @@ describe('send outbox mention bindings', () => {
     expect(outboxRejected(api)).toHaveLength(1);
   });
 
+  it('retains skill chips when a send is rejected and drops malformed skill entries', () => {
+    const api = stateApi();
+    outboxAdd(api, {
+      clientRequestId: 'request-skills',
+      text: 'Plan the migration',
+      skills: ['planning', 'brainstorm'],
+      createdAt: 3,
+      status: 'pending',
+    });
+
+    const rejected = outboxMarkRejected(api, 'request-skills');
+    expect(rejected).toMatchObject({
+      status: 'rejected',
+      skills: ['planning', 'brainstorm'],
+    });
+
+    // Malformed persisted skills are filtered to string-only, non-empty values.
+    const dirty = stateApi({
+      sendOutbox: [
+        {
+          clientRequestId: 'request-dirty',
+          text: 'Retry',
+          skills: ['ok', '', 42, null],
+          createdAt: 4,
+          status: 'rejected',
+        },
+      ],
+    });
+    expect(outboxList(dirty)).toEqual([
+      expect.objectContaining({ clientRequestId: 'request-dirty', skills: ['ok'] }),
+    ]);
+  });
+
   it('drops malformed persisted mention bindings instead of exposing them to Map construction', () => {
     const api = stateApi({
       sendOutbox: [

@@ -3726,7 +3726,12 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     const menu = page.getByRole('menu', { name: 'Add Context' });
     await expect(menu).toBeVisible();
 
-    for (const label of ['Skill', 'Wiki page', 'Agent', 'Browser tab', 'Web search']) {
+    // Skill is now an enabled action that opens the in-webview skill picker.
+    const skillItem = menu.getByRole('menuitem', { name: 'Skill' });
+    await expect(skillItem).toBeVisible();
+    await expect(skillItem).toBeEnabled();
+
+    for (const label of ['Wiki page', 'Agent', 'Browser tab', 'Web search']) {
       const item = menu.getByRole('menuitem', { name: label });
       await expect(item).toBeVisible();
       await expect(item).toBeDisabled();
@@ -3734,11 +3739,12 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       await expect(item.locator('.add-context__menu-item-badge')).toHaveText('Coming soon');
     }
 
-    await menu.getByRole('menuitem', { name: 'Skill' }).click({ force: true });
+    // Choosing Skill opens the in-webview picker (dismissing the menu) and posts no
+    // file-pick host messages.
+    await skillItem.click();
+    await expect(menu).toBeHidden();
     expect(await postedMessages(page)).not.toContainEqual({ type: 'pickFile' });
     expect(await postedMessages(page)).not.toContainEqual({ type: 'browseWorkspaceFiles' });
-    await expect(menu).toBeVisible();
-    await expect(addContextButton).toHaveAttribute('aria-expanded', 'true');
   });
 
   test('Add Context menu hardens dismissal states without losing draft text', async ({ page }) => {

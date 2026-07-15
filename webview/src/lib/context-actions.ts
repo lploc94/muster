@@ -22,9 +22,15 @@ interface AddContextActionBase {
 
 export type AddContextHostMessage = Extract<OutMessage, { type: 'pickFile' | 'browseWorkspaceFiles' }>;
 
+/** Client-side (in-webview) activation id for actions handled without a host round-trip. */
+export type AddContextClientAction = 'openSkillPicker';
+
 export interface EnabledAddContextAction extends AddContextActionBase {
   state: 'enabled';
-  hostMessage: AddContextHostMessage;
+  /** Posted to the host on activation. Omitted for client-only actions. */
+  hostMessage?: AddContextHostMessage;
+  /** Handled in-webview (opens a picker) instead of posting to the host. */
+  clientAction?: AddContextClientAction;
 }
 
 export interface UnavailableAddContextAction extends AddContextActionBase {
@@ -57,8 +63,8 @@ export const ADD_CONTEXT_ACTIONS = [
     label: 'Skill',
     description: 'Attach a project or user skill as task context.',
     icon: 'codicon-lightbulb',
-    state: 'comingSoon',
-    disabledReason: 'Skill context is coming soon.',
+    state: 'enabled',
+    clientAction: 'openSkillPicker',
   },
   {
     id: 'add-wiki-page',
@@ -100,5 +106,5 @@ export function getAddContextAction(id: AddContextActionId): AddContextAction {
 
 export function getAddContextActionHostMessage(id: AddContextActionId): AddContextHostMessage | null {
   const action = getAddContextAction(id);
-  return action.state === 'enabled' ? action.hostMessage : null;
+  return action.state === 'enabled' ? (action.hostMessage ?? null) : null;
 }

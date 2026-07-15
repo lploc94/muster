@@ -7,7 +7,12 @@ import { runTurn as defaultRunTurn } from '../runner';
 import type { Backend, NormalizedEvent, RunOptions } from '../types';
 import type { TaskHandoffPhase, TurnTrigger } from './types';
 import { canBindTaskToBackend } from './backend-eligibility';
-import { assembleFirstTurnPrompt, mergeBriefFromCreate, synthesizeBriefFromGoal } from './brief';
+import {
+  assembleFirstTurnPrompt,
+  mergeBriefFromCreate,
+  normalizeSkillNames,
+  synthesizeBriefFromGoal,
+} from './brief';
 import { capabilitiesFor } from './capabilities';
 import { summarizeTaskTypes } from './task-types';
 import {
@@ -185,6 +190,12 @@ export interface TaskEngineConfig {
    * the backend has never advertised (UNKNOWN → optimistic inject).
    */
   getAdvertisedCommands?: (backend: string) => ReadonlySet<string> | undefined;
+  /**
+   * Per-backend skill invocation prefix (`/` for most, `$` for Codex). Injected
+   * by the host (extension.ts) to keep the per-backend map out of `task/`
+   * (no `task/` → `backends/` dependency). Defaults to `/` when absent.
+   */
+  getSkillPrefix?: (backend: string) => string;
 }
 
 export type EngineResult<T> =
@@ -584,6 +595,7 @@ export class TaskEngine {
   private readonly getAdvertisedCommands?: (
     backend: string,
   ) => ReadonlySet<string> | undefined;
+  private readonly getSkillPrefix?: (backend: string) => string;
   /**
    * Phase C host-authorization master switch (default false — never execute). Held as
    * the raw config value (static boolean OR live resolver) and evaluated per settle via
@@ -648,6 +660,7 @@ export class TaskEngine {
     this.workspaceFolder = config.workspaceFolder;
     this.getTaskTypeRegistry = config.getTaskTypeRegistry;
     this.getAdvertisedCommands = config.getAdvertisedCommands;
+    this.getSkillPrefix = config.getSkillPrefix;
     // Preserve the raw value (boolean or resolver); resolveAllowHostVerification()
     // evaluates it live at settle time so a mid-session setting toggle takes effect.
     this.allowHostVerification = config.allowHostVerification ?? false;
@@ -1047,6 +1060,12 @@ export class TaskEngine {
     agentMessage?: string;
     /** Workspace directory the agent runs in for this task's turns. */
     cwd?: string;
+    /**
+     * ACP skills to invoke on the new task's first turn (structured chips from the
+     * composer). Applies ONLY to a genuinely new task's first-turn brief; ignored
+     * for a continuation (`continuationOf` set → no fresh first turn to inject into).
+     */
+    skills?: string[];
     /** Phase C idempotent send key. */
     clientRequestId?: string;
   }): EngineResult<{ taskId: string; messageId: string; turnId: string; clientRequestId?: string }> {
@@ -1098,6 +1117,9 @@ export class TaskEngine {
     const turnId = randomUUID();
     const now = nowIso(this.clock);
     const role = params.role ?? 'coordinator';
+    // Skills inject into the FIRST turn only. A continuation reuses an existing
+    // conversation with no fresh first turn, so skip skill attach there.
+    const skills = params.continuationOf ? undefined : normalizeSkillNames(params.skills);
     const input: CreateTaskInput = {
       id: taskId,
       role,
@@ -1118,12 +1140,17 @@ export class TaskEngine {
       executionPolicy: DEFAULT_POLICY,
       // Host composer create-and-run: atomic released (plan W3 matrix).
       releaseState: 'released',
-      // Root host tasks are coordinators by default — use coordinate preamble (presentation + graph playbook).
-      brief: synthesizeBriefFromGoal(
-        params.goal,
-        undefined,
-        role === 'coordinator' ? 'coordinate' : 'generic',
-      ),
+      // Root host tasks are coordinators by default — use coordinate preamble
+      // (presentation + graph playbook); attach any composer skill chips for the
+      // first-turn injection (undefined for a continuation).
+      brief: {
+        ...synthesizeBriefFromGoal(
+          params.goal,
+          undefined,
+          role === 'coordinator' ? 'coordinate' : 'generic',
+        ),
+        ...(skills ? { skills } : {}),
+      },
     };
 
     const commit = this.store.commit((draft) => {
@@ -4159,6 +4186,8 @@ export class TaskEngine {
         // Fail-closed skill injection: resolve the backend's advertised commands
         // (undefined = UNKNOWN backend → optimistic inject). Read-only peek.
         const advertisedCommands = this.getAdvertisedCommands?.(draftTask.backend);
+        // Per-backend skill invocation prefix (`/` default, `$` for Codex).
+        const skillPrefix = this.getSkillPrefix?.(draftTask.backend) ?? '/';
         const assembled = assembleFirstTurnPrompt({
           snapshot,
           self: {
@@ -4176,6 +4205,7 @@ export class TaskEngine {
           meta: { taskId: draftTask.id, goal: draftTask.goal },
           ...(taskTypesForHost !== undefined ? { taskTypes: taskTypesForHost } : {}),
           ...(advertisedCommands !== undefined ? { advertisedCommands } : {}),
+          skillPrefix,
         });
 
         if (!assembled.ok) {

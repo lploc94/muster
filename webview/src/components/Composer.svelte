@@ -62,6 +62,7 @@
     resolveFileMentionActiveDescendant,
   } from '../lib/file-mention-listbox';
   import { fileMentionItemIcon } from '../lib/file-mention-icons';
+  import { parseActiveSkillQuery, stripActiveSkillQuery } from '../lib/skill-mention-query';
   import type { FileMentionSuggestionItem, FileMentionSuggestionsMessage } from '../lib/protocol';
   import {
     buildTaskComposerMessage,
@@ -147,6 +148,35 @@
   /** Suppress autocomplete open/request while IME composition is in progress. */
   let mentionImeComposing = $state(false);
 
+  // ---- Skill picker (hybrid autocomplete + chips) -----------------------------
+  /** Per-backend advertised skills + invocation prefix, fetched via `listSkills`. */
+  let skillCatalog = $state<{ backend: string; prefix: string; skills: string[] } | null>(null);
+  /** Backend for the in-flight/last `listSkills` request (avoids redundant posts). */
+  let lastRequestedSkillBackend: string | null = null;
+  /** Structured skill chips that travel with the send payload (NEW task only). */
+  let selectedSkills = $state<string[]>([]);
+  /**
+   * Backend the current chips belong to (plain coordination state, not rendered).
+   * Lets the backend-change cleanup and a hydration-deferred prefill restore write
+   * `selectedSkills` order-independently: cleanup only discards chips that do NOT
+   * belong to the new backend, so a just-restored set for the new backend survives.
+   */
+  let selectedSkillsBackend: string | null = null;
+  /** Skill suggestion popup state (local filter; no per-keystroke host round-trip). */
+  let skillAutocompleteOpen = $state(false);
+  let skillItems = $state<string[]>([]);
+  let skillActiveIndex = $state(-1);
+  /** Text range of the active `prefix+query`; null when opened via the Add-skill button. */
+  let skillQueryRange = $state<{ start: number; end: number } | null>(null);
+  let skillListboxRegion = $state<HTMLElement | undefined>(undefined);
+  /** Cold-cache hint shown when a backend has advertised no skills yet. */
+  let skillColdHint = $state<string | null>(null);
+  /** Button-open requested against an empty catalog; auto-open once skills arrive. */
+  let skillPickerPendingOpen = $state(false);
+  const SKILL_LISTBOX_ID = 'skill-mention-listbox';
+  const skillOptionId = (index: number) => `skill-mention-option-${index}`;
+  const MAX_SKILL_CHIPS = 8;
+
   function syncMentionAutocompleteFromSession() {
     const next = mentionAutocompleteSession.getState();
     const signature = `${next.outcome}:${next.pendingRequestId ?? ''}:${next.items.map((i) => i.id).join('|')}`;
@@ -202,8 +232,12 @@
     // listbox region (mousedown already preserves focus; pointerdown outside closes).
     const related = e.relatedTarget;
     if (related instanceof Node && mentionListboxRegion?.contains(related)) return;
+    if (related instanceof Node && skillListboxRegion?.contains(related)) return;
     if (mentionAutocomplete.open) {
       closeFileMentionPopup();
+    }
+    if (skillAutocompleteOpen) {
+      closeSkillPopup();
     }
   }
 
@@ -230,17 +264,175 @@
     if (mentionAutocomplete.open || mentionAutocomplete.pendingRequestId) {
       closeFileMentionPopup();
     }
+    if (skillAutocompleteOpen) {
+      closeSkillPopup();
+    }
   }
 
   function onMentionCompositionEnd() {
     mentionImeComposing = false;
     // Re-evaluate caret after composition commits (email-like / @query may now be valid).
     notifyMentionAutocompleteCaret();
+    notifySkillAutocompleteCaret();
   }
 
   const mentionAutocompleteSession = createFileMentionAutocompleteSession({
     post,
   });
+
+  function closeSkillPopup() {
+    skillAutocompleteOpen = false;
+    skillItems = [];
+    skillActiveIndex = -1;
+    skillQueryRange = null;
+    skillPickerPendingOpen = false;
+  }
+
+  function skillColdHintText(): string {
+    const label = currentBackend ? currentBackend : 'this backend';
+    return `No skills found for ${label}. Add a SKILL.md under its skills folder.`;
+  }
+
+  /** Returns true when the chip is now present (added or already selected). */
+  function addSkillChip(name: string): boolean {
+    const trimmed = name.trim();
+    if (!trimmed) return false;
+    if (selectedSkills.includes(trimmed)) return true; // already present → idempotent success
+    if (selectedSkills.length >= MAX_SKILL_CHIPS) return false; // cap reached → do NOT strip
+    selectedSkills = [...selectedSkills, trimmed];
+    selectedSkillsBackend = currentBackend; // tag the chips with their backend
+    return true;
+  }
+
+  function removeSkillChip(name: string): void {
+    selectedSkills = selectedSkills.filter((s) => s !== name);
+  }
+
+  /**
+   * Choose a skill: strip the typed `prefix+query` from the draft (when the
+   * popup was opened by typing) and add it as a structured chip instead.
+   */
+  function selectSkillSuggestion(name: string): void {
+    if (!canSend) return;
+    const range = skillQueryRange;
+    const added = addSkillChip(name);
+    if (!added) {
+      // Cap reached (or empty name): surface the limit and do NOT strip the draft.
+      closeSkillPopup();
+      skillColdHint = `You can attach at most ${MAX_SKILL_CHIPS} skills.`;
+      return;
+    }
+    if (range) {
+      const stripped = stripActiveSkillQuery(draftText, range);
+      draftText = stripped.text;
+      closeSkillPopup();
+      queueMicrotask(() => {
+        textareaEl?.focus();
+        textareaEl?.setSelectionRange(stripped.caret, stripped.caret);
+        syncHighlightScroll();
+      });
+      return;
+    }
+    // Button-opened picker: no text to strip.
+    closeSkillPopup();
+    queueMicrotask(() => textareaEl?.focus());
+  }
+
+  function acceptSkillAtIndex(index: number): void {
+    const name = skillItems[index];
+    if (name == null) return;
+    selectSkillSuggestion(name);
+  }
+
+  /** Keep textarea focus when clicking a skill option (mousedown before blur). */
+  function onSkillOptionMouseDown(e: MouseEvent) {
+    e.preventDefault();
+  }
+
+  /**
+   * Re-evaluate the skill trigger at the caret. Skills are a small per-backend
+   * list already fetched via `listSkills`, so filter LOCALLY (no host request).
+   */
+  function notifySkillAutocompleteCaret(): void {
+    // Mutual exclusion: the @-file-mention popup has priority. When it is open OR
+    // a mention request is in flight (pending, not yet open), never coexist with a
+    // skill popup (closes a button-opened picker too, and cancels a pending open).
+    if (mentionAutocomplete.open || mentionAutocomplete.pendingRequestId) {
+      // Cancel an open OR a deferred (pending) skill picker — closeSkillPopup also
+      // clears skillPickerPendingOpen so a queued auto-open cannot fire later.
+      if (skillAutocompleteOpen || skillPickerPendingOpen) closeSkillPopup();
+      skillColdHint = null;
+      return;
+    }
+    if (mentionImeComposing) {
+      if (skillAutocompleteOpen) closeSkillPopup();
+      skillColdHint = null;
+      return;
+    }
+    const catalog = skillCatalog;
+    const caret = textareaEl?.selectionStart ?? draftText.length;
+    const active =
+      catalog && canSend ? parseActiveSkillQuery(draftText, caret, catalog.prefix) : null;
+    if (!active) {
+      // Preserve a button-opened picker (range null) when there is no active query.
+      if (skillAutocompleteOpen && skillQueryRange !== null) closeSkillPopup();
+      skillColdHint = null;
+      return;
+    }
+    // Cold cache: no advertised skills → do not open a popup; surface a hint.
+    if (!catalog || catalog.skills.length === 0) {
+      if (skillAutocompleteOpen && skillQueryRange !== null) closeSkillPopup();
+      skillColdHint = skillColdHintText();
+      return;
+    }
+    const needle = active.query.toLowerCase();
+    const items = catalog.skills.filter((s) => s.toLowerCase().includes(needle));
+    if (items.length === 0) {
+      if (skillAutocompleteOpen) closeSkillPopup();
+      skillColdHint = null;
+      return;
+    }
+    skillQueryRange = { start: active.start, end: active.end };
+    const sameItems =
+      items.length === skillItems.length && items.every((s, i) => s === skillItems[i]);
+    skillItems = items;
+    if (!sameItems || skillActiveIndex < 0 || skillActiveIndex >= items.length) {
+      skillActiveIndex = 0;
+    }
+    skillAutocompleteOpen = true;
+    skillColdHint = null;
+  }
+
+  /** Add-skill button: open a picker over the full advertised list (no query). */
+  function openSkillPicker(): void {
+    if (!canSend) return;
+    const skills = skillCatalog?.skills ?? [];
+    if (skills.length === 0) {
+      // Cold cache: nothing to suggest yet — remember the intent so the next
+      // `skillsAvailable` for this backend auto-opens the picker (caller re-posts).
+      closeSkillPopup();
+      skillPickerPendingOpen = true;
+      skillColdHint = skillColdHintText();
+      return;
+    }
+    skillPickerPendingOpen = false;
+    // Mutually exclusive with the @-file-mention popup (ISSUE 3).
+    closeFileMentionPopup();
+    skillQueryRange = null; // button-driven: no draft text to strip on select
+    skillItems = skills;
+    skillActiveIndex = 0;
+    skillAutocompleteOpen = true;
+    skillColdHint = null;
+    queueMicrotask(() => textareaEl?.focus());
+  }
+
+  const skillPopupVisible = $derived(skillAutocompleteOpen && skillItems.length > 0);
+  const skillActiveDescendant = $derived(
+    skillPopupVisible && skillActiveIndex >= 0 && skillActiveIndex < skillItems.length
+      ? skillOptionId(skillActiveIndex)
+      : undefined,
+  );
+  const skillChipPrefix = $derived(skillCatalog?.prefix ?? '/');
 
   /** Highlight layer mirrors draft; trailing newline needs an extra break for height parity. */
   const draftHighlightHtml = $derived.by(() => {
@@ -269,14 +461,38 @@
     const prefill = tasks.composerPrefill;
     if (!prefill || prefill.nonce === lastPrefillNonce) return;
     if (!canSend) return;
-    if (draftText.trim().length > 0) {
-      // Refuse: keep prefill for a later empty-composer attempt; mark nonce seen
-      // so we don't spin, but restore only when draft becomes empty.
+    if (draftText.trim().length > 0 || selectedSkills.length > 0) {
+      // Refuse: the composer already holds a fresh draft (text OR skill chips).
+      // Keep the prefill unconsumed for a later empty-composer attempt so a late
+      // sendRejected can never overwrite a new chip-only draft.
+      return;
+    }
+    // Defer a backend-scoped skill restore until the composer backend is hydrated
+    // from the host: consuming during the mount handshake window could drop valid
+    // chips on a transient pre-hydration backend value. Left unconsumed, the effect
+    // re-runs when hostHydrated flips (or currentBackend settles). A settled match
+    // restores the chips; a genuine cross-backend mismatch still drops them.
+    if (
+      prefill.skills &&
+      prefill.skillsBackend &&
+      prefill.skillsBackend !== currentBackend &&
+      !tasks.hostHydrated
+    ) {
       return;
     }
     lastPrefillNonce = prefill.nonce;
     draftText = prefill.text;
     mentionBindings = new Map(prefill.mentionBindings ?? []);
+    // Restore skill chips carried by a rejected send (ISSUE 2), but ONLY when they
+    // belong to the composer's current backend — skills are backend-specific, so a
+    // draft rejected under backend A must not re-attach its chips under backend B.
+    if (prefill.skills && prefill.skillsBackend === currentBackend) {
+      selectedSkills = prefill.skills;
+      selectedSkillsBackend = currentBackend;
+    } else {
+      selectedSkills = [];
+      selectedSkillsBackend = null;
+    }
     dropFeedback = null;
     const appliedId = prefill.clientRequestId;
     tasks.clearComposerPrefill();
@@ -405,6 +621,37 @@
       if (msg?.type === 'fileMentionSuggestions') {
         mentionAutocompleteSession.onResponse(msg as FileMentionSuggestionsMessage);
         syncMentionAutocompleteFromSession();
+        // A late mention response may open the mention popup; enforce mutual
+        // exclusion against a button-opened skill picker held during the request.
+        if (mentionAutocomplete.open && skillAutocompleteOpen) closeSkillPopup();
+        return;
+      }
+      if (msg?.type === 'skillsAvailable') {
+        // Only accept the catalog for the composer's current backend; stale
+        // responses for a since-changed backend are ignored.
+        if (msg.backend === currentBackend) {
+          skillCatalog = { backend: msg.backend, prefix: msg.prefix, skills: msg.skills };
+          if (msg.skills.length > 0) skillColdHint = null;
+          if (mentionAutocomplete.open || mentionAutocomplete.pendingRequestId) {
+            // Mention has priority — never auto-open a skill picker over it; cancel
+            // any deferred open that arrived while a mention was active.
+            skillPickerPendingOpen = false;
+          } else if (skillPickerPendingOpen && msg.skills.length > 0) {
+            // A button-open was deferred against a cold catalog — open it now.
+            skillPickerPendingOpen = false;
+            openSkillPicker();
+          } else if (skillAutocompleteOpen && skillQueryRange === null) {
+            // A button-opened picker is live: refresh it with the fresh list.
+            if (msg.skills.length > 0) {
+              skillItems = msg.skills;
+              skillActiveIndex = 0;
+            } else {
+              closeSkillPopup();
+            }
+          }
+          // Re-evaluate an open trigger now that skills are known.
+          notifySkillAutocompleteCaret();
+        }
         return;
       }
       if (msg?.type !== 'filePicked' || typeof msg.path !== 'string') return;
@@ -420,12 +667,40 @@
     return () => window.removeEventListener('message', onMessage);
   });
 
+  // Fetch the advertised skill catalog when the selected backend changes (and on
+  // mount). Reads `currentBackend` so the effect re-runs on backend switches.
+  $effect(() => {
+    const backend = currentBackend;
+    if (!backend) return;
+    if (backend === lastRequestedSkillBackend) return;
+    const prev = lastRequestedSkillBackend;
+    lastRequestedSkillBackend = backend;
+    // Drop a stale catalog so the trigger prefix is never taken from a prior backend.
+    if (skillCatalog && skillCatalog.backend !== backend) {
+      skillCatalog = null;
+      closeSkillPopup();
+      skillColdHint = null;
+    }
+    skillPickerPendingOpen = false; // cancel any deferred auto-open across backends
+    // Chips are backend-specific: on a real switch (not initial mount) discard chips
+    // that do NOT belong to the new backend. The affinity check keeps a set just
+    // restored FOR the new backend by a hydration-deferred prefill (the two effects
+    // race on a B→A switch; without it, cleanup could wipe the valid A chips).
+    if (prev !== null && prev !== backend && selectedSkillsBackend !== backend) {
+      selectedSkills = [];
+      selectedSkillsBackend = null;
+    }
+    post({ type: 'listSkills', backend });
+  });
+
   $effect(() => {
     if (!canSend && isAddContextMenuOpen) {
       closeAddContextMenu();
     }
     if (!canSend) {
       closeFileMentionPopup();
+      closeSkillPopup();
+      skillColdHint = null;
     }
   });
 
@@ -434,6 +709,10 @@
     void mode;
     void taskId;
     closeFileMentionPopup();
+    closeSkillPopup();
+    skillColdHint = null;
+    // Chips are scoped to a single draft/task composer; drop them on switch.
+    selectedSkills = [];
   });
 
   // Scroll the active option into view when keyboard highlight moves.
@@ -443,15 +722,19 @@
   });
 
   $effect(() => {
-    if (!isAddContextMenuOpen && !mentionAutocomplete.open) return;
+    if (!isAddContextMenuOpen && !mentionAutocomplete.open && !skillAutocompleteOpen) return;
 
     function onPointerDown(e: PointerEvent) {
       const target = e.target;
       if (target instanceof Node && addContextMenuRegion?.contains(target)) return;
       if (target instanceof Node && mentionListboxRegion?.contains(target)) return;
+      if (target instanceof Node && skillListboxRegion?.contains(target)) return;
       closeAddContextMenu();
       if (mentionAutocomplete.open) {
         closeFileMentionPopup();
+      }
+      if (skillAutocompleteOpen) {
+        closeSkillPopup();
       }
     }
 
@@ -504,11 +787,16 @@
         backend: string;
         model?: string;
         continuationOf?: string;
+        skills?: string[];
         clientRequestId: string;
       } = { type: 'send', text: displayText, backend, clientRequestId };
       if (llmText !== displayText) payload.llmText = llmText;
       if (model) payload.model = model;
       if (tasks.continuationOf) payload.continuationOf = tasks.continuationOf;
+      // Skill chips inject only into a NEW task's first turn — never a continuation.
+      if (selectedSkills.length > 0 && !tasks.continuationOf) {
+        payload.skills = [...selectedSkills];
+      }
       outboxAdd(vscode, {
         clientRequestId,
         text: displayText,
@@ -518,6 +806,8 @@
         backend,
         model: model ?? undefined,
         continuationOf: tasks.continuationOf ?? undefined,
+        // Persist chips so a rejected send restores them with the draft (ISSUE 2).
+        skills: selectedSkills.length > 0 ? [...selectedSkills] : undefined,
         createdAt: Date.now(),
         status: 'pending',
       });
@@ -539,6 +829,8 @@
       // Keep draft until sendAccepted; clear only on success (App restores on reject).
       draftText = '';
       mentionBindings = new Map();
+      selectedSkills = [];
+      closeSkillPopup();
       return;
     }
 
@@ -561,6 +853,8 @@
       post(message);
       draftText = '';
       mentionBindings = new Map();
+      selectedSkills = [];
+      closeSkillPopup();
       return;
     }
 
@@ -589,6 +883,8 @@
     // Optimistic clear; sendRejected restores from outbox text.
     draftText = '';
     mentionBindings = new Map();
+    selectedSkills = [];
+    closeSkillPopup();
   }
 
   function send() {
@@ -676,14 +972,15 @@
     draftText = el.value;
     syncHighlightScroll();
     notifyMentionAutocompleteCaret();
+    notifySkillAutocompleteCaret();
   }
 
   function onDraftSelectOrKeyup(e?: Event) {
-    // Arrow/Enter/Tab/Escape keyups must not re-run caret sync while the popup
-    // is open — that would re-enter the autocomplete session and can reset the
-    // keyboard highlight (activeIndex) or briefly clear items.
+    // Arrow/Enter/Tab/Escape keyups must not re-run caret sync while a popup
+    // is open — that would re-enter the autocomplete/skill session and can reset
+    // the keyboard highlight (activeIndex) or briefly clear items.
     if (
-      mentionAutocomplete.open &&
+      (mentionAutocomplete.open || skillAutocompleteOpen) &&
       e instanceof KeyboardEvent &&
       (e.key === 'ArrowDown' ||
         e.key === 'ArrowUp' ||
@@ -694,6 +991,7 @@
       return;
     }
     notifyMentionAutocompleteCaret();
+    notifySkillAutocompleteCaret();
   }
 
   function closeAddContextMenu() {
@@ -707,6 +1005,15 @@
 
   function activateAddContextAction(action: AddContextAction) {
     if (!canSend) return;
+    // Skill picker is handled entirely in-webview (no host round-trip): it opens
+    // a dropdown over the already-fetched skill catalog to add a chip.
+    if (action.state === 'enabled' && action.clientAction === 'openSkillPicker') {
+      closeAddContextMenu();
+      // Refresh the catalog opportunistically so a warmed backend shows new skills.
+      if (currentBackend) post({ type: 'listSkills', backend: currentBackend });
+      openSkillPicker();
+      return;
+    }
     const hostMessage = getAddContextActionHostMessage(action.id);
     if (!hostMessage) return;
     closeAddContextMenu();
@@ -853,6 +1160,33 @@
     ) {
       e.preventDefault();
       return;
+    }
+
+    // Skill picker popup composes ahead of composer submit, same as mentions.
+    // Reuse the file-mention keyboard policy (pure: state in / intent out).
+    const skillKeyOpts = {
+      popupOpen: skillAutocompleteOpen,
+      itemCount: skillItems.length,
+      activeIndex: skillActiveIndex,
+      activeSelectable: skillActiveIndex >= 0 && skillActiveIndex < skillItems.length,
+    };
+    const skillIntent = resolveFileMentionKeyIntent(policyInput, skillKeyOpts);
+    if (skillIntent.kind !== 'none') {
+      if (shouldPreventDefaultForFileMentionKey(policyInput, skillKeyOpts)) {
+        e.preventDefault();
+      }
+      if (skillIntent.kind === 'dismiss') {
+        closeSkillPopup();
+        return;
+      }
+      if (skillIntent.kind === 'move') {
+        skillActiveIndex = skillIntent.activeIndex;
+        return;
+      }
+      if (skillIntent.kind === 'accept') {
+        acceptSkillAtIndex(skillIntent.activeIndex);
+        return;
+      }
     }
 
     const keyOpts = { mode, liveInjectEligible };
@@ -1317,6 +1651,25 @@
     </div>
   {/if}
 
+  {#if selectedSkills.length > 0}
+    <div class="skill-chips" role="list" aria-label="Selected skills" data-testid="skill-chips">
+      {#each selectedSkills as name (name)}
+        <span class="skill-chip" role="listitem" data-testid="skill-chip" data-skill={name}>
+          <span class="skill-chip__label">{skillChipPrefix}{name}</span>
+          <button
+            type="button"
+            class="skill-chip__remove"
+            aria-label={`Remove ${skillChipPrefix}${name}`}
+            data-testid="skill-chip-remove"
+            onclick={() => removeSkillChip(name)}
+          >
+            <span class="codicon codicon-close" aria-hidden="true"></span>
+          </button>
+        </span>
+      {/each}
+    </div>
+  {/if}
+
   <!-- Layered input: highlight backdrop + transparent textarea (Cursor-style live chips). -->
   <div class="composer-input" class:composer-input--disabled={!canSend}>
     <div
@@ -1342,10 +1695,18 @@
       oncompositionend={onMentionCompositionEnd}
       spellcheck="true"
       aria-autocomplete="list"
-      aria-controls={mentionPopupVisible ? FILE_MENTION_LISTBOX_ID : undefined}
-      aria-expanded={mentionPopupVisible ? 'true' : 'false'}
+      aria-controls={mentionPopupVisible
+        ? FILE_MENTION_LISTBOX_ID
+        : skillPopupVisible
+          ? SKILL_LISTBOX_ID
+          : undefined}
+      aria-expanded={mentionPopupVisible || skillPopupVisible ? 'true' : 'false'}
       aria-haspopup="listbox"
-      aria-activedescendant={mentionPopupVisible ? mentionActiveDescendant : undefined}
+      aria-activedescendant={mentionPopupVisible
+        ? mentionActiveDescendant
+        : skillPopupVisible
+          ? skillActiveDescendant
+          : undefined}
     ></textarea>
 
     {#if mentionPopupVisible}
@@ -1397,7 +1758,48 @@
         {/each}
       </div>
     {/if}
+
+    {#if skillPopupVisible}
+      <div
+        bind:this={skillListboxRegion}
+        id={SKILL_LISTBOX_ID}
+        class="file-mention-listbox"
+        role="listbox"
+        aria-label="Skill suggestions"
+        data-testid="skill-mention-listbox"
+      >
+        {#each skillItems as name, index (name)}
+          <button
+            type="button"
+            id={skillOptionId(index)}
+            class="file-mention-listbox__item"
+            class:file-mention-listbox__item--active={index === skillActiveIndex}
+            role="option"
+            aria-selected={index === skillActiveIndex ? 'true' : 'false'}
+            aria-label={`${skillChipPrefix}${name}`}
+            tabindex="-1"
+            data-testid="skill-mention-option"
+            data-skill={name}
+            onmousedown={onSkillOptionMouseDown}
+            onmouseenter={() => (skillActiveIndex = index)}
+            onclick={() => selectSkillSuggestion(name)}
+          >
+            <span
+              class="codicon file-mention-listbox__item-icon codicon-lightbulb"
+              aria-hidden="true"
+            ></span>
+            <span class="file-mention-listbox__item-label">{skillChipPrefix}{name}</span>
+          </button>
+        {/each}
+      </div>
+    {/if}
   </div>
+
+  {#if skillColdHint}
+    <div class="composer-guidance" role="note" data-composer-guidance="info" data-testid="skill-cold-hint">
+      {skillColdHint}
+    </div>
+  {/if}
 
   <div class="flex items-center justify-between gap-2 pt-1" onkeydown={onKeydown}>
     <div class="flex items-center gap-1.5 min-w-0">
