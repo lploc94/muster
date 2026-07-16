@@ -1584,7 +1584,9 @@ export async function executeToolCommand(
     }
 
     case 'cancel_tasks': {
-      // All-or-nothing ownership validation, then cancel each via singular path semantics.
+      // All-or-nothing ownership validation. The complete descendant set,
+      // remote cancel requests, terminal state and parent ledger are published
+      // by one repository transaction.
       const file = deps.store.getFile();
       for (const childId of command.childIds) {
         const child = file.tasks[childId];
@@ -1598,25 +1600,57 @@ export async function executeToolCommand(
           };
         }
       }
-      const cancelled: string[] = [];
-      for (const childId of command.childIds) {
-        const sub = await executeToolCommand(deps, ctx, {
-          kind: 'cancel_task',
-          opId: `${command.opId}:${childId}`,
-          childId,
-        });
-        if (!sub.ok) {
-          return { ok: false, error: sub.error };
+      const cancelled = [...command.childIds];
+      const localLiveIds: string[] = [];
+      const mutation = await executeGraphMutation(deps, (draft) => {
+        const coordinatorSeal = {
+          kind: 'coordinator' as const,
+          taskId: ctx.callerTaskId,
+          turnId: ctx.turnId,
+          mode: 'cancel_task',
+        };
+        const ids = [...new Set(command.childIds.flatMap((id) => [id, ...descendantIds(draft, id)]))].reverse();
+        for (const taskId of ids) {
+          const task = draft.tasks[taskId];
+          if (!task || isTerminalLifecycle(task.lifecycle)) continue;
+          const currentPending = turnsForTask(draft, taskId).filter(
+            (turn) => turn.status === 'queued' || turn.status === 'running' || turn.status === 'waiting_user',
+          );
+          const currentLive = currentPending.find(
+            (turn) => turn.status === 'running' || turn.status === 'waiting_user',
+          );
+          const remoteOwned = !!currentLive && deps.leaseOwnerAlive(currentLive.id) && !deps.ownsLease(currentLive.id);
+          if (currentLive && remoteOwned) {
+            draft.cancelRequests = draft.cancelRequests ?? {};
+            draft.cancelRequests[currentLive.id] = {
+              kind: 'cancel', by: ctx.callerTaskId, opId: command.opId, at: now,
+              sealedBy: coordinatorSeal,
+            };
+            continue;
+          }
+          if (currentLive) localLiveIds.push(currentLive.id);
+          const next = transitionCancelTask(task, { liveTurn: currentLive, now, sealedBy: coordinatorSeal });
+          if (!next.ok) return next;
+          draft.tasks[taskId] = clearPendingParentQuestionOnCancel(draft, next.next.task, now);
+          if (next.next.turn) draft.turns[next.next.turn.id] = next.next.turn;
+          for (const pending of currentPending) {
+            if (pending.id === currentLive?.id) continue;
+            const settled = cancelPendingTurn(pending, { now });
+            if (!settled.ok) return settled;
+            draft.turns[pending.id] = settled.next;
+          }
         }
-        cancelled.push(childId);
-      }
-      deps.store.commit((draft) => {
         writeLedger(draft, ctx.turnId, command.opId, fingerprint, {
           ok: true,
           data: { cancelled },
         });
         return { ok: true };
       });
+      if (!mutation.ok) return { ok: false, error: mutation.error };
+      for (const turnId of localLiveIds) {
+        deps.liveRuns.get(turnId)?.controller.abort();
+        cleanupTurnResources(deps, turnId);
+      }
       deps.onRescanSchedulableTurns?.();
       return { ok: true, result: { cancelled } };
     }
@@ -1638,18 +1672,19 @@ export async function executeToolCommand(
       // interrupt only: remote early-return (no subtree). cancel always cascades.
       if (command.kind === 'interrupt_task') {
         if (remoteLeased) {
-          deps.writeCancelRequest(liveTurn!.id, 'interrupt', ctx.callerTaskId, command.opId);
           const result: OpResult = { ok: true, data: { requested: true } };
-          deps.store.commit((draft) => {
+          const requested = await executeGraphMutation(deps, (draft) => {
+            draft.cancelRequests = draft.cancelRequests ?? {};
+            draft.cancelRequests[liveTurn!.id] = {
+              kind: 'interrupt', by: ctx.callerTaskId, opId: command.opId, at: now,
+            };
             writeLedger(draft, ctx.turnId, command.opId, fingerprint, result);
             return { ok: true };
           });
+          if (!requested.ok) return { ok: false, error: requested.error };
           return { ok: true, result: result.data };
         }
-        if (liveTurn && deps.ownsLease(liveTurn.id)) {
-          deps.liveRuns.get(liveTurn.id)?.controller.abort();
-        }
-        const commit = deps.store.commit((draft) => {
+        const interrupted = await executeGraphMutation(deps, (draft) => {
           const turn = liveTurn ? draft.turns[liveTurn.id] : undefined;
           if (turn) {
             const interrupted = interruptTurn(turn, { now });
@@ -1663,8 +1698,11 @@ export async function executeToolCommand(
           });
           return { ok: true };
         });
-        if (!commit.ok) return { ok: false, error: commit.detail ?? commit.reason };
-        if (liveTurn) cleanupTurnResources(deps, liveTurn.id);
+        if (!interrupted.ok) return { ok: false, error: interrupted.error };
+        if (liveTurn) {
+          deps.liveRuns.get(liveTurn.id)?.controller.abort();
+          cleanupTurnResources(deps, liveTurn.id);
+        }
         return { ok: true, result: { interrupted: true } };
       }
 
@@ -1674,29 +1712,29 @@ export async function executeToolCommand(
         turnId: ctx.turnId,
         mode: 'cancel_task',
       };
-      const ids = [command.childId, ...descendantIds(deps.store.getFile(), command.childId)].reverse();
-      for (const taskId of ids) {
-        const pendingTurns = turnsForTask(deps.store.getFile(), taskId).filter(
-          (t) => t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user',
-        );
-        const lt = pendingTurns.find(
-          (t) => t.status === 'running' || t.status === 'waiting_user',
-        );
-        if (lt && deps.leaseOwnerAlive(lt.id) && !deps.ownsLease(lt.id)) {
-          // Remote owner will seal task + settle turns atomically via processCancelRequests.
-          deps.writeCancelRequest(lt.id, 'cancel', ctx.callerTaskId, command.opId, coordinatorSeal);
-          continue;
-        }
-        if (lt && deps.ownsLease(lt.id)) deps.liveRuns.get(lt.id)?.controller.abort();
-        deps.store.commit((draft) => {
+      const localLiveIds: string[] = [];
+      const mutation = await executeGraphMutation(deps, (draft) => {
+        const ids = [command.childId, ...descendantIds(draft, command.childId)].reverse();
+        for (const taskId of ids) {
           const task = draft.tasks[taskId];
-          if (!task || isTerminalLifecycle(task.lifecycle)) return { ok: true };
+          if (!task || isTerminalLifecycle(task.lifecycle)) continue;
           const currentPending = turnsForTask(draft, taskId).filter(
-            (t) => t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user',
+            (turn) => turn.status === 'queued' || turn.status === 'running' || turn.status === 'waiting_user',
           );
           const currentLive = currentPending.find(
-            (t) => t.status === 'running' || t.status === 'waiting_user',
+            (turn) => turn.status === 'running' || turn.status === 'waiting_user',
           );
+          if (currentLive && deps.leaseOwnerAlive(currentLive.id) && !deps.ownsLease(currentLive.id)) {
+            // Remote owner will seal task + settle turns atomically via the
+            // cancel consumer. The request itself is part of this transaction.
+            draft.cancelRequests = draft.cancelRequests ?? {};
+            draft.cancelRequests[currentLive.id] = {
+              kind: 'cancel', by: ctx.callerTaskId, opId: command.opId, at: now,
+              sealedBy: coordinatorSeal,
+            };
+            continue;
+          }
+          if (currentLive) localLiveIds.push(currentLive.id);
           const cancelled = transitionCancelTask(task, {
             liveTurn: currentLive,
             now,
@@ -1715,17 +1753,18 @@ export async function executeToolCommand(
             if (!settled.ok) return settled;
             draft.turns[pending.id] = settled.next;
           }
-          return { ok: true };
-        });
-        if (lt) cleanupTurnResources(deps, lt.id);
-      }
-      deps.store.commit((draft) => {
+        }
         writeLedger(draft, ctx.turnId, command.opId, fingerprint, {
           ok: true,
           data: { cancelled: command.childId },
         });
         return { ok: true };
       });
+      if (!mutation.ok) return { ok: false, error: mutation.error };
+      for (const turnId of localLiveIds) {
+        deps.liveRuns.get(turnId)?.controller.abort();
+        cleanupTurnResources(deps, turnId);
+      }
       // Full rescan: dependents outside the cancelled subtree may now be ready.
       deps.onRescanSchedulableTurns?.();
       return { ok: true, result: { cancelled: command.childId } };
@@ -1762,7 +1801,7 @@ export async function executeToolCommand(
         const ids = [command.taskId, ...descendantIds(file, command.taskId)].reverse();
         const liveToCleanup: string[] = [];
         let noop = false;
-        const cascade = deps.store.commit((draft) => {
+        const cascade = await executeGraphMutation(deps, (draft) => {
           const direct = draft.tasks[command.taskId];
           if (!direct) return { ok: false, reason: 'task not found' };
           const probe = transitionSetTaskLifecycle(direct, command.lifecycle, {
@@ -1868,7 +1907,7 @@ export async function executeToolCommand(
           return { ok: true };
         });
         if (!cascade.ok) {
-          return { ok: false, error: cascade.detail ?? cascade.reason };
+          return { ok: false, error: cascade.error };
         }
         if (!noop) {
           for (const turnId of liveToCleanup) {
@@ -1890,7 +1929,7 @@ export async function executeToolCommand(
       // succeeded | failed — seal target only (no grandchild cascade)
       let sealChanged = false;
       let liveIdToCleanup: string | undefined;
-      const commit = deps.store.commit((draft) => {
+      const commit = await executeGraphMutation(deps, (draft) => {
         const task = draft.tasks[command.taskId];
         if (!task) return { ok: false, reason: 'task not found' };
         const sealed = transitionSetTaskLifecycle(task, command.lifecycle, {
@@ -1945,7 +1984,7 @@ export async function executeToolCommand(
         return { ok: true };
       });
       if (!commit.ok) {
-        return { ok: false, error: commit.detail ?? commit.reason };
+        return { ok: false, error: commit.error };
       }
       if (sealChanged && liveIdToCleanup) {
         deps.liveRuns.get(liveIdToCleanup)?.controller.abort();
