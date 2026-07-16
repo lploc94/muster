@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PermissionBridge, type PermissionRequest } from './permission-bridge';
 
 function makeRequest(overrides: Partial<PermissionRequest> = {}): PermissionRequest {
@@ -106,5 +106,52 @@ describe('PermissionBridge', () => {
     bridge.cancelAll();
     await expect(promise).resolves.toEqual({ allow: false, remember: false, timedOut: false });
     expect(bridge.isAllowlisted('s1', 'execute:Run tests')).toBe(false);
+  });
+});
+
+describe('M012 S03 flow: pending ask-mode bridge prompts stay pending until user/timeout/cancel', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('keeps a pending prompt open across unrelated config changes until the user resolves it', async () => {
+    const bridge = new PermissionBridge();
+    const promise = bridge.register('perm-pending', makeRequest(), 5_000);
+
+    // Simulated Settings save while the runtime card is still open — bridge state is independent.
+    expect(bridge.hasPending('perm-pending')).toBe(true);
+    expect(bridge.peek('perm-pending')?.title).toBe('Run tests');
+
+    // User eventually denies; config changes never auto-resolve the pending prompt.
+    expect(bridge.submit('perm-pending', { optionId: 'reject_once', remember: false })).toBe(true);
+    await expect(promise).resolves.toEqual({ allow: false, remember: false, timedOut: false });
+    expect(bridge.hasPending('perm-pending')).toBe(false);
+  });
+
+  it('clears pending timers on cancel so no timeout fires after resolution', async () => {
+    vi.useFakeTimers();
+    const bridge = new PermissionBridge();
+    const promise = bridge.register('perm-timer', makeRequest(), 1_000);
+
+    bridge.cancel('perm-timer');
+    await expect(promise).resolves.toEqual({ allow: false, remember: false, timedOut: false });
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(bridge.hasPending('perm-timer')).toBe(false);
+  });
+
+  it('cleans all pending timers and controllers via cancelAll', async () => {
+    vi.useFakeTimers();
+    const bridge = new PermissionBridge();
+    const first = bridge.register('a', makeRequest({ title: 'Write a' }), 2_000);
+    const second = bridge.register('b', makeRequest({ title: 'Write b' }), 2_000);
+
+    bridge.cancelAll();
+    await expect(first).resolves.toEqual({ allow: false, remember: false, timedOut: false });
+    await expect(second).resolves.toEqual({ allow: false, remember: false, timedOut: false });
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(bridge.hasPending('a')).toBe(false);
+    expect(bridge.hasPending('b')).toBe(false);
   });
 });

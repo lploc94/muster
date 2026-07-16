@@ -19,6 +19,9 @@
   import type {
     PendingAsk,
     PendingPermission,
+    PermissionModeSetting,
+    PermissionSettingsSnapshot,
+    PermissionSettingsUpdateResult,
     RetentionSettingId,
     RetentionSettingSnapshot,
     SettingsUpdateResult,
@@ -29,12 +32,25 @@
   import { tip } from './lib/tooltip';
   import { outboxList, outboxMarkRejected, outboxPending, outboxRejected, outboxRemove } from './lib/send-outbox';
   import { selectTask as navSelectTask } from './lib/task-nav';
+  import {
+    SETTINGS_VIEW_STATE_VERSION,
+    applyPermissionSnapshotToDraft,
+    applyRetentionSnapshotToDrafts,
+    applyTaskTypesSnapshotToDrafts,
+    cloneRetentionDrafts,
+    cloneTaskTypeDrafts,
+    createEmptyRetentionDrafts,
+    isPermissionDraftDirty,
+    isRetentionDraftsDirty,
+    isTaskTypeDraftsDirty,
+    readSettingsViewState,
+    reducePermissionSettingsUpdateResult,
+    reduceRetentionUpdateResult,
+    writeSettingsViewState,
+    type RetentionDrafts,
+  } from './lib/settings-view-state';
+  import type { SettingsTopicId } from './lib/settings-topics';
   import { vscode } from './lib/vscode';
-
-  const SETTING_LABELS: Record<RetentionSettingId, string> = {
-    maxTurnsPerTask: 'Maximum turns per task',
-    maxStoredOutputChars: 'Maximum stored output characters',
-  };
 
   type PendingElicitation =
     | {
@@ -88,14 +104,117 @@
   let settingsSnapshot = $state<RetentionSettingSnapshot | null>(null);
   let settingsLoading = $state(false);
   let settingsSavingSettingId = $state<RetentionSettingId | null>(null);
-  let settingsSavedMessage = $state<string | null>(null);
-  let settingsGlobalError = $state<string | null>(null);
-  let settingsFieldErrors = $state<Partial<Record<RetentionSettingId, string>>>({});
+  /** Retention-local success banner (never shown on Task Types). */
+  let retentionSavedMessage = $state<string | null>(null);
+  /** Retention-local alert for host write/load failures (never shown on Task Types). */
+  let retentionError = $state<string | null>(null);
+  /** Host-side field errors for Retention (validation codes from settingsUpdateResult). */
+  let retentionFieldErrors = $state<Partial<Record<RetentionSettingId, string>>>({});
   let taskTypesSnapshot = $state<TaskTypesSettingsSnapshot | null>(null);
   let taskTypesLoading = $state(false);
   let taskTypesSaving = $state(false);
   let taskTypesSavedMessage = $state<string | null>(null);
   let taskTypesError = $state<string | null>(null);
+  /** After a successful host write, the next snapshot must win even if drafts still look dirty. */
+  let taskTypesForceHydrate = $state(false);
+  let permissionSettingsSnapshot = $state<PermissionSettingsSnapshot | null>(null);
+  let permissionSettingsLoading = $state(false);
+  let permissionSettingsSaving = $state(false);
+  let permissionSettingsSavedMessage = $state<string | null>(null);
+  let permissionSettingsError = $state<string | null>(null);
+  /** After a successful host write, the next snapshot must win even if draft still looks dirty. */
+  let permissionSettingsForceHydrate = $state(false);
+
+  // App-owned Settings drafts + navigation (survive close/reopen and hide/reveal).
+  // Restored once from vscode.getState; subsequent edits persist via writeSettingsViewState.
+  const restoredSettingsView = readSettingsViewState(vscode);
+  let settingsActiveTopicId = $state<SettingsTopicId>(restoredSettingsView.activeTopicId);
+  /**
+   * undefined = not yet initialized from a host snapshot (and nothing restored).
+   * object = owned draft, including restored dirty values or pristine snapshot copy.
+   */
+  let retentionDrafts = $state<RetentionDrafts | undefined>(
+    restoredSettingsView.retentionDrafts
+      ? cloneRetentionDrafts(restoredSettingsView.retentionDrafts)
+      : undefined,
+  );
+  /** undefined = not yet initialized from a host snapshot; array (incl. empty) = owned draft. */
+  let taskTypeDrafts = $state<TaskTypeSettingsRow[] | undefined>(
+    restoredSettingsView.taskTypeDrafts
+      ? cloneTaskTypeDrafts(restoredSettingsView.taskTypeDrafts)
+      : undefined,
+  );
+  /** undefined = not yet initialized from a host snapshot; mode string = owned draft. */
+  let permissionDraftMode = $state<PermissionModeSetting | undefined>(
+    restoredSettingsView.permissionDraftMode,
+  );
+  let retentionLocalFieldErrors = $state<Partial<Record<RetentionSettingId, string>>>({});
+  let taskTypesDraftError = $state<string | null>(null);
+
+  function persistSettingsViewState() {
+    const envelope: {
+      v: typeof SETTINGS_VIEW_STATE_VERSION;
+      activeTopicId: SettingsTopicId;
+      taskTypeDrafts?: TaskTypeSettingsRow[];
+      retentionDrafts?: RetentionDrafts;
+      permissionDraftMode?: PermissionModeSetting;
+    } = {
+      v: SETTINGS_VIEW_STATE_VERSION,
+      activeTopicId: settingsActiveTopicId,
+    };
+    // Persist drafts only when owned so we never write empty placeholders that
+    // would look dirty after restore against a later snapshot.
+    if (taskTypeDrafts !== undefined) {
+      envelope.taskTypeDrafts = cloneTaskTypeDrafts(taskTypeDrafts);
+    }
+    if (retentionDrafts !== undefined) {
+      const dirty =
+        !settingsSnapshot || isRetentionDraftsDirty(retentionDrafts, settingsSnapshot);
+      if (dirty) {
+        envelope.retentionDrafts = cloneRetentionDrafts(retentionDrafts);
+      }
+    }
+    if (permissionDraftMode !== undefined) {
+      const dirty =
+        !permissionSettingsSnapshot ||
+        isPermissionDraftDirty(permissionDraftMode, permissionSettingsSnapshot);
+      if (dirty) {
+        envelope.permissionDraftMode = permissionDraftMode;
+      }
+    }
+    writeSettingsViewState(vscode, envelope);
+  }
+
+  function setSettingsActiveTopicId(topicId: SettingsTopicId) {
+    settingsActiveTopicId = topicId;
+    persistSettingsViewState();
+  }
+
+  function setRetentionDrafts(next: RetentionDrafts) {
+    retentionDrafts = cloneRetentionDrafts(next);
+    persistSettingsViewState();
+  }
+
+  function setTaskTypeDrafts(next: TaskTypeSettingsRow[]) {
+    taskTypeDrafts = cloneTaskTypeDrafts(next);
+    taskTypesDraftError = null;
+    persistSettingsViewState();
+  }
+
+  function setPermissionDraftMode(next: PermissionModeSetting) {
+    permissionDraftMode = next;
+    permissionSettingsSavedMessage = null;
+    // Selecting a mode is draft-only — never post until explicit Save.
+    persistSettingsViewState();
+  }
+
+  function setRetentionLocalFieldErrors(next: Partial<Record<RetentionSettingId, string>>) {
+    retentionLocalFieldErrors = { ...next };
+  }
+
+  function setTaskTypesDraftError(message: string | null) {
+    taskTypesDraftError = message;
+  }
 
   function selectTask(taskId: string) {
     navSelectTask(taskId);
@@ -119,14 +238,19 @@
     historyOpen = false;
     settingsOpen = true;
     settingsLoading = !settingsSnapshot;
-    settingsGlobalError = null;
-    settingsSavedMessage = null;
-    settingsFieldErrors = {};
+    // Keep Retention feedback scoped; do not clear dirty drafts on open.
+    retentionError = null;
+    retentionSavedMessage = null;
+    retentionFieldErrors = {};
     taskTypesLoading = !taskTypesSnapshot;
     taskTypesError = null;
     taskTypesSavedMessage = null;
+    permissionSettingsLoading = !permissionSettingsSnapshot;
+    permissionSettingsError = null;
+    permissionSettingsSavedMessage = null;
     post({ type: 'requestSettings' });
     post({ type: 'requestTaskTypesSettings' });
+    post({ type: 'requestPermissionSettings' });
     post({ type: 'listBackends' });
     post({ type: 'listModels' });
   }
@@ -145,10 +269,6 @@
     post({ type: 'blurTask' });
   }
 
-  function settingLabel(settingId: RetentionSettingId): string {
-    return SETTING_LABELS[settingId];
-  }
-
   function updateSnapshotValue(settingId: RetentionSettingId, value: number) {
     if (!settingsSnapshot) return;
     settingsSnapshot = {
@@ -161,33 +281,36 @@
   function applySettingsUpdateResult(result: SettingsUpdateResult) {
     settingsLoading = false;
     settingsSavingSettingId = null;
-    settingsSavedMessage = null;
 
-    if (result.ok) {
-      updateSnapshotValue(result.settingId, result.value);
-      settingsFieldErrors = { ...settingsFieldErrors, [result.settingId]: undefined };
-      settingsGlobalError = null;
-      settingsSavedMessage = `Saved ${settingLabel(result.settingId)}.`;
-      return;
+    const next = reduceRetentionUpdateResult(
+      {
+        drafts: retentionDrafts ?? createEmptyRetentionDrafts(),
+        fieldErrors: retentionFieldErrors,
+        localFieldErrors: retentionLocalFieldErrors,
+      },
+      result,
+    );
+
+    // On host write failure: keep attempted draft, keep prior saved snapshot authoritative.
+    // Never rehydrate inputs back to saved merely because an error arrived.
+    retentionDrafts = next.drafts;
+    retentionFieldErrors = next.fieldErrors;
+    retentionLocalFieldErrors = next.localFieldErrors;
+    retentionError = next.error;
+    retentionSavedMessage = next.savedMessage;
+
+    if (next.confirmed) {
+      updateSnapshotValue(next.confirmed.settingId, next.confirmed.value);
+      persistSettingsViewState();
     }
-
-    if ('settingId' in result) {
-      if (result.code === 'updateFailed') {
-        settingsGlobalError = `Unable to save ${settingLabel(result.settingId)}. Check the VS Code setting and try again.`;
-      } else {
-        settingsFieldErrors = { ...settingsFieldErrors, [result.settingId]: result.message };
-      }
-      return;
-    }
-
-    settingsGlobalError = 'Unable to load or save settings. Check the VS Code setting and try again.';
+    // Failure path intentionally does not touch Task Types state or force draft rehydrate.
   }
 
   function saveSetting(settingId: RetentionSettingId, value: number) {
     settingsSavingSettingId = settingId;
-    settingsSavedMessage = null;
-    settingsGlobalError = null;
-    settingsFieldErrors = { ...settingsFieldErrors, [settingId]: undefined };
+    retentionSavedMessage = null;
+    retentionError = null;
+    retentionFieldErrors = { ...retentionFieldErrors, [settingId]: undefined };
     post({ type: 'updateSetting', settingId, value });
   }
 
@@ -195,10 +318,14 @@
     taskTypesSaving = false;
     taskTypesLoading = false;
     if (result.ok) {
+      // Force the following snapshot to replace drafts so Reset/Save clear dirty only after host success.
+      taskTypesForceHydrate = true;
       taskTypesError = null;
       taskTypesSavedMessage = 'Saved task types to workspace settings.';
       return;
     }
+    // Failure: keep drafts + prior saved snapshot; never force-hydrate from a stale host read.
+    taskTypesForceHydrate = false;
     taskTypesSavedMessage = null;
     const diag = result.diagnostics?.[0]?.message;
     taskTypesError = diag ?? result.message;
@@ -213,7 +340,43 @@
 
   function resetTaskTypesToDefaults() {
     if (!taskTypesSnapshot) return;
+    // Explicit host update only — do not clear dirty drafts until success + snapshot.
     saveTaskTypes(taskTypesSnapshot.defaults.map((t) => ({ ...t })));
+  }
+
+  function applyPermissionSettingsUpdateResult(result: PermissionSettingsUpdateResult) {
+    permissionSettingsSaving = false;
+    permissionSettingsLoading = false;
+    const next = reducePermissionSettingsUpdateResult(
+      { draftMode: permissionDraftMode ?? permissionSettingsSnapshot?.mode ?? 'ask' },
+      result,
+    );
+    permissionDraftMode = next.draftMode;
+    permissionSettingsError = next.error;
+    permissionSettingsSavedMessage = next.savedMessage;
+    if (next.confirmed) {
+      // Force the following snapshot to replace draft so dirty clears only after host success.
+      permissionSettingsForceHydrate = true;
+      if (permissionSettingsSnapshot) {
+        permissionSettingsSnapshot = {
+          ...permissionSettingsSnapshot,
+          mode: next.confirmed.mode,
+        };
+      }
+      persistSettingsViewState();
+      return;
+    }
+    // Failure: keep attempted draft + prior saved snapshot; never force-hydrate.
+    permissionSettingsForceHydrate = false;
+    persistSettingsViewState();
+  }
+
+  function savePermissionSettings() {
+    if (permissionDraftMode === undefined) return;
+    permissionSettingsSaving = true;
+    permissionSettingsSavedMessage = null;
+    permissionSettingsError = null;
+    post({ type: 'updatePermissionSettings', mode: permissionDraftMode });
   }
 
   onMount(() => {
@@ -290,24 +453,82 @@
           break;
         }
 
-        case 'settingsSnapshot':
-          settingsSnapshot = msg.snapshot;
+        case 'settingsSnapshot': {
+          const next = msg.snapshot;
+          // Preserve owned drafts only when they already differ from saved/incoming.
+          // Uninitialized (undefined) drafts always hydrate from the snapshot.
+          // A later host snapshot may refresh saved state but cannot overwrite a dirty draft.
+          const dirtyAgainstIncoming =
+            retentionDrafts !== undefined &&
+            (isRetentionDraftsDirty(retentionDrafts, settingsSnapshot) ||
+              isRetentionDraftsDirty(retentionDrafts, next));
+          settingsSnapshot = next;
           settingsLoading = false;
-          settingsGlobalError = null;
+          // Preserve Retention-local failure banners across incidental snapshots
+          // (mirrors Task Types). Success path already cleared error via update result.
+          retentionDrafts = applyRetentionSnapshotToDrafts(
+            retentionDrafts,
+            next,
+            dirtyAgainstIncoming,
+          );
+          persistSettingsViewState();
           break;
+        }
 
         case 'settingsUpdateResult':
           applySettingsUpdateResult(msg.result);
           break;
 
-        case 'taskTypesSettingsSnapshot':
-          taskTypesSnapshot = msg.snapshot;
+        case 'taskTypesSettingsSnapshot': {
+          const next = msg.snapshot;
+          const forceHydrate = taskTypesForceHydrate;
+          taskTypesForceHydrate = false;
+          const dirtyAgainstIncoming =
+            !forceHydrate &&
+            taskTypeDrafts !== undefined &&
+            (isTaskTypeDraftsDirty(taskTypeDrafts, taskTypesSnapshot?.types ?? null) ||
+              isTaskTypeDraftsDirty(taskTypeDrafts, next.types));
+          taskTypesSnapshot = next;
           taskTypesLoading = false;
-          if (!taskTypesSaving) taskTypesError = null;
+          // Preserve save/reset failure banners across incidental snapshots.
+          // Success path already cleared error and set saved message before force-hydrate.
+          taskTypeDrafts = applyTaskTypesSnapshotToDrafts(
+            taskTypeDrafts,
+            next.types,
+            dirtyAgainstIncoming,
+          );
+          persistSettingsViewState();
           break;
+        }
 
         case 'taskTypesSettingsUpdateResult':
           applyTaskTypesUpdateResult(msg.result);
+          break;
+
+        case 'permissionSettingsSnapshot': {
+          const next = msg.snapshot;
+          const forceHydrate = permissionSettingsForceHydrate;
+          permissionSettingsForceHydrate = false;
+          const dirtyAgainstIncoming =
+            !forceHydrate &&
+            permissionDraftMode !== undefined &&
+            (isPermissionDraftDirty(permissionDraftMode, permissionSettingsSnapshot) ||
+              isPermissionDraftDirty(permissionDraftMode, next));
+          permissionSettingsSnapshot = next;
+          permissionSettingsLoading = false;
+          // Preserve Permissions-local failure banners across incidental snapshots.
+          // Success path already cleared error and set saved message before force-hydrate.
+          permissionDraftMode = applyPermissionSnapshotToDraft(
+            permissionDraftMode,
+            next,
+            dirtyAgainstIncoming,
+          );
+          persistSettingsViewState();
+          break;
+        }
+
+        case 'permissionSettingsUpdateResult':
+          applyPermissionSettingsUpdateResult(msg.result);
           break;
 
         case 'turnStart':
@@ -577,15 +798,33 @@
     snapshot={settingsSnapshot}
     loading={settingsLoading}
     savingSettingId={settingsSavingSettingId}
-    savedMessage={settingsSavedMessage}
-    globalError={settingsGlobalError}
-    fieldErrors={settingsFieldErrors}
+    savedMessage={retentionSavedMessage}
+    retentionError={retentionError}
+    fieldErrors={retentionFieldErrors}
+    localFieldErrors={retentionLocalFieldErrors}
+    retentionDrafts={retentionDrafts ?? createEmptyRetentionDrafts()}
+    onRetentionDraftsChange={setRetentionDrafts}
+    onLocalFieldErrorsChange={setRetentionLocalFieldErrors}
     onSave={saveSetting}
     taskTypesSnapshot={taskTypesSnapshot}
     taskTypesLoading={taskTypesLoading}
     taskTypesSaving={taskTypesSaving}
     taskTypesSavedMessage={taskTypesSavedMessage}
     taskTypesError={taskTypesError}
+    taskTypeDrafts={taskTypeDrafts ?? []}
+    taskTypesDraftError={taskTypesDraftError}
+    onTaskTypeDraftsChange={setTaskTypeDrafts}
+    onTaskTypesDraftErrorChange={setTaskTypesDraftError}
+    permissionSettingsSnapshot={permissionSettingsSnapshot}
+    permissionSettingsLoading={permissionSettingsLoading}
+    permissionSettingsSaving={permissionSettingsSaving}
+    permissionSettingsSavedMessage={permissionSettingsSavedMessage}
+    permissionSettingsError={permissionSettingsError}
+    permissionDraftMode={permissionDraftMode}
+    onPermissionDraftModeChange={setPermissionDraftMode}
+    onSavePermissionSettings={savePermissionSettings}
+    activeTopicId={settingsActiveTopicId}
+    onActiveTopicIdChange={setSettingsActiveTopicId}
     availableBackends={tasks.availableBackends ?? []}
     modelsByBackend={tasks.modelsByBackend ?? {}}
     onSaveTaskTypes={saveTaskTypes}

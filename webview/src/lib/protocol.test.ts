@@ -348,6 +348,19 @@ describe('settings protocol guard', () => {
         },
       }),
     ).toBe(true);
+
+    // Host write failures travel as sanitized updateFailed results (no raw stack/path codes).
+    expect(
+      isExtMessage({
+        type: 'settingsUpdateResult',
+        result: {
+          ok: false,
+          settingId: 'maxTurnsPerTask',
+          code: 'updateFailed',
+          message: 'Unable to update Max turns per task.',
+        },
+      }),
+    ).toBe(true);
   });
 
   it('rejects malformed settings update results from the host', () => {
@@ -359,6 +372,8 @@ describe('settings protocol guard', () => {
       { type: 'settingsUpdateResult', result: { ok: false, settingId: 'maxTurnsPerTask', code: 'raw-stack', message: 'x' } },
       { type: 'settingsUpdateResult', result: { ok: false, settingId: 'maxTurnsPerTask', code: 'invalidType' } },
       { type: 'settingsUpdateResult', result: { ok: false, settingId: 'unknown', code: 'unknownSetting', message: 'x' } },
+      // updateFailed without settingId is not a valid Retention failure shape
+      { type: 'settingsUpdateResult', result: { ok: false, code: 'updateFailed', message: 'Unable to update.' } },
     ];
 
     for (const message of malformedMessages) {
@@ -533,6 +548,265 @@ describe('settings outbound protocol', () => {
       settingId: 'maxStoredOutputChars',
       value: 4096,
     });
+  });
+});
+
+
+describe('permission settings protocol', () => {
+  const permissionSnapshot = {
+    mode: 'ask' as const,
+    defaultMode: 'ask' as const,
+    description:
+      "How Muster handles agent tool-permission requests. 'ask' (safe): auto-allow read-only, prompt for writes/commands. 'allow': auto-approve everything (less safe). 'readonly': deny all writes/commands.",
+    options: [
+      {
+        mode: 'ask' as const,
+        label: 'Ask',
+        description: 'Safe: auto-allow read-only tool calls, prompt for writes/commands/unknown actions.',
+        risk: 'recommended' as const,
+      },
+      {
+        mode: 'allow' as const,
+        label: 'Allow',
+        description: 'Auto-approve every tool-permission request (least safe; still audit-logged).',
+        risk: 'least-safe' as const,
+      },
+      {
+        mode: 'readonly' as const,
+        label: 'Read only',
+        description: 'Allow read-only tool calls, deny all writes/commands without prompting.',
+        risk: 'restricted' as const,
+      },
+    ],
+  };
+
+  it('accepts a valid permission settings snapshot from the host', () => {
+    expect(
+      isExtMessage({ type: 'permissionSettingsSnapshot', snapshot: permissionSnapshot }),
+    ).toBe(true);
+  });
+
+  it('rejects unknown modes, missing fields, extra keys, malformed options, and oversized copy', () => {
+    const oversizedDescription = 'x'.repeat(513);
+    const oversizedOptionDescription = 'y'.repeat(257);
+    const oversizedLabel = 'z'.repeat(65);
+    const malformed = [
+      { type: 'permissionSettingsSnapshot' },
+      { type: 'permissionSettingsSnapshot', snapshot: { ...permissionSnapshot, mode: 'prompt' } },
+      { type: 'permissionSettingsSnapshot', snapshot: { ...permissionSnapshot, defaultMode: 'prompt' } },
+      {
+        type: 'permissionSettingsSnapshot',
+        snapshot: { ...permissionSnapshot, description: oversizedDescription },
+      },
+      {
+        type: 'permissionSettingsSnapshot',
+        snapshot: {
+          ...permissionSnapshot,
+          options: [
+            { ...permissionSnapshot.options[0], label: oversizedLabel },
+            permissionSnapshot.options[1],
+            permissionSnapshot.options[2],
+          ],
+        },
+      },
+      {
+        type: 'permissionSettingsSnapshot',
+        snapshot: {
+          ...permissionSnapshot,
+          options: [
+            { ...permissionSnapshot.options[0], description: oversizedOptionDescription },
+            permissionSnapshot.options[1],
+            permissionSnapshot.options[2],
+          ],
+        },
+      },
+      {
+        type: 'permissionSettingsSnapshot',
+        snapshot: {
+          ...permissionSnapshot,
+          options: [
+            { ...permissionSnapshot.options[0], risk: 'unsafe' },
+            permissionSnapshot.options[1],
+            permissionSnapshot.options[2],
+          ],
+        },
+      },
+      {
+        type: 'permissionSettingsSnapshot',
+        snapshot: {
+          ...permissionSnapshot,
+          options: [permissionSnapshot.options[0], permissionSnapshot.options[1]],
+        },
+      },
+      {
+        type: 'permissionSettingsSnapshot',
+        snapshot: {
+          ...permissionSnapshot,
+          options: [
+            permissionSnapshot.options[0],
+            permissionSnapshot.options[0],
+            permissionSnapshot.options[2],
+          ],
+        },
+      },
+      {
+        type: 'permissionSettingsSnapshot',
+        snapshot: permissionSnapshot,
+        extra: true,
+      },
+      {
+        type: 'permissionSettingsSnapshot',
+        snapshot: { ...permissionSnapshot, secret: 'token=abc' },
+      },
+    ];
+
+    for (const message of malformed) {
+      expect(isExtMessage(message), JSON.stringify(message)).toBe(false);
+    }
+  });
+
+  it('accepts sanitized permission settings update results and rejects raw failure shapes', () => {
+    expect(
+      isExtMessage({
+        type: 'permissionSettingsUpdateResult',
+        result: { ok: true, mode: 'readonly' },
+      }),
+    ).toBe(true);
+
+    expect(
+      isExtMessage({
+        type: 'permissionSettingsUpdateResult',
+        result: {
+          ok: false,
+          code: 'invalidPayload',
+          message: 'Unsupported permission mode update.',
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isExtMessage({
+        type: 'permissionSettingsUpdateResult',
+        result: {
+          ok: false,
+          code: 'unknownMode',
+          message: 'Unsupported permission mode.',
+        },
+      }),
+    ).toBe(true);
+
+    expect(
+      isExtMessage({
+        type: 'permissionSettingsUpdateResult',
+        result: {
+          ok: false,
+          code: 'updateFailed',
+          message: 'Unable to update permission mode.',
+        },
+      }),
+    ).toBe(true);
+
+    const malformed = [
+      {
+        type: 'permissionSettingsUpdateResult',
+        result: { ok: true, mode: 'prompt' },
+      },
+      {
+        type: 'permissionSettingsUpdateResult',
+        result: { ok: true },
+      },
+      {
+        type: 'permissionSettingsUpdateResult',
+        result: {
+          ok: false,
+          code: 'ENOENT',
+          message: 'ENOENT /secret/path token=abc123',
+        },
+      },
+      {
+        type: 'permissionSettingsUpdateResult',
+        result: {
+          ok: false,
+          code: 'updateFailed',
+          message: 'Unable to update permission mode.',
+          stack: 'Error: boom',
+        },
+      },
+      {
+        type: 'permissionSettingsUpdateResult',
+        result: {
+          ok: false,
+          code: 'updateFailed',
+          message: 'x'.repeat(257),
+        },
+      },
+      {
+        type: 'permissionSettingsUpdateResult',
+        result: { ok: false, code: 'updateFailed' },
+      },
+      {
+        type: 'permissionSettingsUpdateResult',
+        result: {
+          ok: false,
+          code: 'updateFailed',
+          message: 'Unable to update permission mode.',
+        },
+        extra: true,
+      },
+    ];
+
+    for (const message of malformed) {
+      expect(isExtMessage(message), JSON.stringify(message)).toBe(false);
+    }
+  });
+
+  it('posts requestPermissionSettings and updatePermissionSettings as distinct OutMessages', () => {
+    vi.mocked(vscode.postMessage).mockClear();
+
+    const request: OutMessage = { type: 'requestPermissionSettings' };
+    const update: OutMessage = { type: 'updatePermissionSettings', mode: 'allow' };
+    const runtimeSubmit: OutMessage = {
+      type: 'submitPermission',
+      permissionId: 'perm-1',
+      optionId: 'allow_once',
+      remember: false,
+    };
+
+    post(request);
+    post(update);
+    post(runtimeSubmit);
+
+    expect(vscode.postMessage).toHaveBeenNthCalledWith(1, { type: 'requestPermissionSettings' });
+    expect(vscode.postMessage).toHaveBeenNthCalledWith(2, {
+      type: 'updatePermissionSettings',
+      mode: 'allow',
+    });
+    expect(vscode.postMessage).toHaveBeenNthCalledWith(3, runtimeSubmit);
+    expect(request.type).not.toBe(runtimeSubmit.type);
+    expect(update.type).not.toBe('submitPermission');
+    expect(update.type).not.toBe('permissionPending');
+  });
+
+  it('keeps runtime permissionPending messages distinct from configuration snapshots', () => {
+    expect(
+      isExtMessage({
+        type: 'permissionPending',
+        sessionId: 'sess-1',
+        permissionId: 'perm-1',
+        title: 'Write file',
+        kind: 'edit',
+        classification: 'write',
+        options: [{ optionId: 'allow_once', name: 'Allow once', kind: 'allow_once' }],
+      }),
+    ).toBe(true);
+
+    expect(
+      isExtMessage({
+        type: 'permissionSettingsSnapshot',
+        snapshot: permissionSnapshot,
+        permissionId: 'perm-1',
+      }),
+    ).toBe(false);
   });
 });
 

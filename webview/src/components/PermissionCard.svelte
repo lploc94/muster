@@ -48,6 +48,9 @@
 <div
   class="mx-2 my-1 rounded p-2 flex flex-col gap-2 text-xs"
   style="border: 1px solid var(--vscode-inputValidation-warningBorder, var(--vscode-editorWarning-foreground)); background: var(--vscode-editor-background);"
+  data-testid="runtime-permission-card"
+  role="region"
+  aria-label="Runtime permission request"
 >
   <div class="flex items-center gap-2">
     <span class="codicon codicon-shield" style="font-size: 14px;"></span>

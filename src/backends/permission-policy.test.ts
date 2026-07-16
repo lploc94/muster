@@ -122,3 +122,22 @@ describe('pickOption', () => {
     expect(pickOption([], false)).toBeNull();
   });
 });
+
+describe('M012 S03 flow: policy decisions for saved permission modes', () => {
+  it('ask auto-allows reads and prompts new writes', () => {
+    expect(resolvePolicy('ask', 'read', false).decision).toBe('allow');
+    expect(resolvePolicy('ask', 'write', false).decision).toBe('prompt');
+    expect(resolvePolicy('ask', 'unknown', false).decision).toBe('prompt');
+  });
+
+  it('readonly denies new writes while still allowing reads', () => {
+    expect(resolvePolicy('readonly', 'read', false).decision).toBe('allow');
+    expect(resolvePolicy('readonly', 'write', false).decision).toBe('deny');
+    expect(resolvePolicy('readonly', 'unknown', false).decision).toBe('deny');
+  });
+
+  it('allow permits new writes without prompting', () => {
+    expect(resolvePolicy('allow', 'write', false).decision).toBe('allow');
+    expect(resolvePolicy('allow', 'unknown', false).decision).toBe('allow');
+  });
+});

@@ -207,12 +207,15 @@ describe('retention settings helper', () => {
   it('converts thrown update failures into sanitized error results', () => {
     const raw = new Error('ENOENT /secret/path token=abc123');
 
-    expect(sanitizeRetentionSettingsError('maxTurnsPerTask', raw)).toEqual({
+    const sanitized = sanitizeRetentionSettingsError('maxTurnsPerTask', raw);
+    expect(sanitized).toEqual({
       ok: false,
       settingId: 'maxTurnsPerTask',
       code: 'updateFailed',
       message: 'Unable to update Max turns per task.',
     });
+    // Sanitized Retention failure must never echo raw host paths or tokens.
+    expect(JSON.stringify(sanitized)).not.toMatch(/ENOENT|\/secret\/|token=/);
   });
 
   it('returns an update result followed by a refreshed settings snapshot for update actions', async () => {

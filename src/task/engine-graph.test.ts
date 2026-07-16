@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { AskBridge } from '../bridge/ask-bridge';
 import { CredentialRegistry } from '../bridge/credentials';
 import {
@@ -35,6 +35,23 @@ const MCP_CAPS: BackendCapabilities = {
   supportsDetailedToolEvents: false,
 };
 
+const activeHarnesses = new Set<{ engine: TaskEngine; resume: () => void }>();
+
+afterEach(async () => {
+  const harnesses = [...activeHarnesses];
+  activeHarnesses.clear();
+
+  for (const harness of harnesses) {
+    harness.resume();
+  }
+  // Let schedules already queued by the assertion path register their promises,
+  // then drain both current turns and any settlement-triggered continuations.
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await Promise.all(harnesses.map(({ engine }) => engine.whenIdle()));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await Promise.all(harnesses.map(({ engine }) => engine.whenIdle()));
+});
+
 function makeHarness() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-graph-'));
   const store = TaskStore.load({ filePath: path.join(dir, '.muster-tasks.json') });
@@ -64,8 +81,10 @@ function makeHarness() {
     bridgePort: 19999,
     getTaskTypeRegistry: () => TEST_TASK_TYPES,
   });
+  const resumeHarness = () => resume?.();
+  activeHarnesses.add({ engine, resume: resumeHarness });
 
-  return { store, engine, credentials, resume: () => resume?.() };
+  return { store, engine, credentials, resume: resumeHarness };
 }
 
 describe('engine graph orchestration', () => {
