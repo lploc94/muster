@@ -1245,7 +1245,7 @@ export async function executeToolCommand(
         };
       }
       const scheduledTurnIds: string[] = [];
-      const commit = deps.store.commit((draft) => {
+      const commit = await executeGraphMutation(deps, (draft) => {
         ensureCoordinationMaps(draft);
         const caller = draft.tasks[ctx.callerTaskId];
         if (!caller || caller.lifecycle !== 'open') {
@@ -1456,8 +1456,7 @@ export async function executeToolCommand(
 
       if (!commit.ok) {
         // Prefer structured JSON error when present.
-        const detail = commit.detail ?? commit.reason;
-        return { ok: false, error: detail };
+        return { ok: false, error: commit.error };
       }
       for (const turnId of scheduledTurnIds) {
         deps.onScheduleTurn(turnId);
@@ -1478,7 +1477,7 @@ export async function executeToolCommand(
         };
       }
       const scheduleIds: string[] = [];
-      const commit = deps.store.commit((draft) => {
+      const commit = await executeGraphMutation(deps, (draft) => {
         ensureCoordinationMaps(draft);
         const prior = readLedger(draft, ctx.turnId, command.opId);
         if (prior) {
@@ -1575,7 +1574,7 @@ export async function executeToolCommand(
         return { ok: true };
       });
       if (!commit.ok) {
-        return { ok: false, error: commit.detail ?? commit.reason };
+        return { ok: false, error: commit.error };
       }
       for (const id of scheduleIds) {
         deps.onScheduleTurn(id);
@@ -1966,7 +1965,7 @@ export async function executeToolCommand(
     case 'wait_for_tasks': {
       const owned = command.taskIds.every((id) => draftChildOwned(deps.store.getFile(), ctx.callerTaskId, id));
       if (!owned) return { ok: false, error: 'taskIds must be owned direct children' };
-      const staged = deps.store.commit((draft) => {
+      const staged = await executeGraphMutation(deps, (draft) => {
         const turn = draft.turns[ctx.turnId];
         if (!turn) return { ok: false, reason: 'turn not found' };
         const result = mergeWaitDisposition(turn, command.taskIds);
@@ -1985,7 +1984,7 @@ export async function executeToolCommand(
         });
         return { ok: true };
       });
-      if (!staged.ok) return { ok: false, error: staged.detail ?? staged.reason };
+      if (!staged.ok) return { ok: false, error: staged.error };
       const ledger = deps.store.getFile().operations?.[opLedgerKey(ctx.turnId, command.opId)];
       return { ok: true, result: ledger?.result.data };
     }
@@ -1995,7 +1994,7 @@ export async function executeToolCommand(
       // `verdict.at` is deterministic per staging and the command fingerprint (parsed
       // upstream, timeless) stays stable across idempotent retries. Absent → no verdict.
       const verdict = normalizeVerdict(command.verdict, { at: now, source: 'worker' });
-      const staged = deps.store.commit((draft) => {
+      const staged = await executeGraphMutation(deps, (draft) => {
         const turn = draft.turns[ctx.turnId];
         if (!turn) return { ok: false, reason: 'turn not found' };
         const result = stageDisposition(
@@ -2011,12 +2010,12 @@ export async function executeToolCommand(
         writeLedger(draft, ctx.turnId, command.opId, fingerprint, { ok: true, data: { staged: true } });
         return { ok: true };
       });
-      if (!staged.ok) return { ok: false, error: staged.detail ?? staged.reason };
+      if (!staged.ok) return { ok: false, error: staged.error };
       return { ok: true, result: { staged: true } };
     }
 
     case 'fail_task': {
-      const staged = deps.store.commit((draft) => {
+      const staged = await executeGraphMutation(deps, (draft) => {
         const turn = draft.turns[ctx.turnId];
         if (!turn) return { ok: false, reason: 'turn not found' };
         const result = stageDisposition(turn, { kind: 'fail', error: command.error }, command.opId, {
@@ -2027,7 +2026,7 @@ export async function executeToolCommand(
         writeLedger(draft, ctx.turnId, command.opId, fingerprint, { ok: true, data: { staged: true } });
         return { ok: true };
       });
-      if (!staged.ok) return { ok: false, error: staged.detail ?? staged.reason };
+      if (!staged.ok) return { ok: false, error: staged.error };
       return { ok: true, result: { staged: true } };
     }
 
