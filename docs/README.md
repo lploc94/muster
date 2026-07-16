@@ -22,11 +22,12 @@ Read in this order when onboarding:
 | [MCP-INJECTION.md](MCP-INJECTION.md) | `context_engine` + `coordinator` MCP per turn |
 | [MUSTER-BRIDGE.md](MUSTER-BRIDGE.md) | Bridge / elicitation (MCP `ask_user` disabled — see cleanup C3) |
 | [WEBVIEW.md](WEBVIEW.md) | Chat UI, workspace file-drop mention contract, read-only presentation review, queued follow-ups and interrupt & send, task Markdown export, lifecycle, and diagnostics |
-| [SETTINGS.md](SETTINGS.md) | Host-backed Settings pattern for feature configuration |
+| [SETTINGS.md](SETTINGS.md) | Host-backed five-topic Settings shell (Task Types, Permissions, Retention, plus Coming soon Models and CLIs / Context and MCP) |
 
 Operational evidence:
 
 - [File-drop live-host evidence](uat/m007-s02/file-drop-live-host-evidence.md) — scenario-local Extension Development Host verdicts and proof boundary.
 - [Task-export live-host evidence](uat/m009-s03/task-export-live-host-evidence.md) — native Save As / cancel / overwrite / Unicode filename / write-failure ledger (PASS, FAIL, or ENVIRONMENT BLOCKED).
+- [Settings live-host evidence](uat/m012-s04/settings-live-host-evidence.md) — five-topic Settings Extension Development Host ledger (PASS, FAIL, or ENVIRONMENT BLOCKED); browser results are supportive only.
 
 All docs are living — update when CLI versions or spikes change behavior.

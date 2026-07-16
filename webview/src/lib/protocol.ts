@@ -291,6 +291,43 @@ export interface TaskTypesSettingsUpdateResultMessage {
   result: TaskTypesSettingsUpdateResult;
 }
 
+
+/** Security-sensitive permission mode (mirrors host PermissionMode). */
+export type PermissionModeSetting = 'ask' | 'allow' | 'readonly';
+
+export type PermissionModeRisk = 'recommended' | 'least-safe' | 'restricted';
+
+export interface PermissionModeOptionView {
+  mode: PermissionModeSetting;
+  label: string;
+  description: string;
+  risk: PermissionModeRisk;
+}
+
+/** Host snapshot for the Settings Permissions topic. Distinct from runtime prompts. */
+export interface PermissionSettingsSnapshot {
+  mode: PermissionModeSetting;
+  defaultMode: PermissionModeSetting;
+  options: readonly PermissionModeOptionView[];
+  description: string;
+}
+
+export type PermissionSettingsErrorCode = 'invalidPayload' | 'unknownMode' | 'updateFailed';
+
+export type PermissionSettingsUpdateResult =
+  | { ok: true; mode: PermissionModeSetting }
+  | { ok: false; code: PermissionSettingsErrorCode; message: string };
+
+export interface PermissionSettingsSnapshotMessage {
+  type: 'permissionSettingsSnapshot';
+  snapshot: PermissionSettingsSnapshot;
+}
+
+export interface PermissionSettingsUpdateResultMessage {
+  type: 'permissionSettingsUpdateResult';
+  result: PermissionSettingsUpdateResult;
+}
+
 /** A backend's selectable models, reported by the host for the model picker. */
 export interface BackendModelOption {
   value: string;
@@ -308,6 +345,8 @@ export type ExtMessage =
   | SettingsUpdateResultMessage
   | TaskTypesSettingsSnapshotMessage
   | TaskTypesSettingsUpdateResultMessage
+  | PermissionSettingsSnapshotMessage
+  | PermissionSettingsUpdateResultMessage
   | { type: 'taskUpdated'; taskId: string; storeRevision: number; patch: Partial<TaskSummary> }
   | { type: 'turnStart'; taskId: string; turnId: string; trigger: TurnTrigger }
   | { type: 'event'; taskId: string; turnId: string; event: NormalizedEvent }
@@ -556,6 +595,8 @@ export type OutMessage =
   | { type: 'updateSetting'; settingId: RetentionSettingId; value: number }
   | { type: 'requestTaskTypesSettings' }
   | { type: 'updateTaskTypes'; types: TaskTypeSettingsRow[] }
+  | { type: 'requestPermissionSettings' }
+  | { type: 'updatePermissionSettings'; mode: PermissionModeSetting }
   | { type: 'listBackends' }
   | { type: 'listModels' }
   /** Ask the host for a backend's advertised skills + invocation prefix. */
@@ -726,6 +767,73 @@ function isTaskTypesSettingsUpdateResult(v: unknown): v is TaskTypesSettingsUpda
     }
   }
   return true;
+}
+
+
+const PERMISSION_MODE_SETTINGS = new Set<PermissionModeSetting>(['ask', 'allow', 'readonly']);
+const PERMISSION_MODE_RISKS = new Set<PermissionModeRisk>(['recommended', 'least-safe', 'restricted']);
+const PERMISSION_SETTINGS_ERROR_CODES = new Set<PermissionSettingsErrorCode>([
+  'invalidPayload',
+  'unknownMode',
+  'updateFailed',
+]);
+
+/** Keep permission Settings copy bounded so oversized host payloads fail closed. */
+const PERMISSION_SETTINGS_DESCRIPTION_MAX = 512;
+const PERMISSION_SETTINGS_OPTION_DESCRIPTION_MAX = 256;
+const PERMISSION_SETTINGS_LABEL_MAX = 64;
+const PERMISSION_SETTINGS_ERROR_MESSAGE_MAX = 256;
+
+function isPermissionModeSetting(v: unknown): v is PermissionModeSetting {
+  return isString(v) && PERMISSION_MODE_SETTINGS.has(v as PermissionModeSetting);
+}
+
+function isPermissionModeRisk(v: unknown): v is PermissionModeRisk {
+  return isString(v) && PERMISSION_MODE_RISKS.has(v as PermissionModeRisk);
+}
+
+function isBoundedPermissionCopy(v: unknown, max: number): v is string {
+  return isString(v) && v.length > 0 && v.length <= max;
+}
+
+function isPermissionModeOptionView(v: unknown): v is PermissionModeOptionView {
+  if (!isRecord(v) || !hasOnlyKeys(v, ['mode', 'label', 'description', 'risk'])) return false;
+  return (
+    isPermissionModeSetting(v.mode) &&
+    isBoundedPermissionCopy(v.label, PERMISSION_SETTINGS_LABEL_MAX) &&
+    isBoundedPermissionCopy(v.description, PERMISSION_SETTINGS_OPTION_DESCRIPTION_MAX) &&
+    isPermissionModeRisk(v.risk)
+  );
+}
+
+function isPermissionSettingsSnapshot(v: unknown): v is PermissionSettingsSnapshot {
+  if (!isRecord(v) || !hasOnlyKeys(v, ['mode', 'defaultMode', 'options', 'description'])) return false;
+  if (!isPermissionModeSetting(v.mode) || !isPermissionModeSetting(v.defaultMode)) return false;
+  if (!isBoundedPermissionCopy(v.description, PERMISSION_SETTINGS_DESCRIPTION_MAX)) return false;
+  if (!Array.isArray(v.options) || v.options.length !== 3) return false;
+  const seen = new Set<PermissionModeSetting>();
+  for (const option of v.options) {
+    if (!isPermissionModeOptionView(option) || seen.has(option.mode)) return false;
+    seen.add(option.mode);
+  }
+  return (
+    seen.has('ask') &&
+    seen.has('allow') &&
+    seen.has('readonly')
+  );
+}
+
+function isPermissionSettingsUpdateResult(v: unknown): v is PermissionSettingsUpdateResult {
+  if (!isRecord(v) || typeof v.ok !== 'boolean') return false;
+  if (v.ok === true) {
+    return hasOnlyKeys(v, ['ok', 'mode']) && isPermissionModeSetting(v.mode);
+  }
+  return (
+    hasOnlyKeys(v, ['ok', 'code', 'message']) &&
+    isString(v.code) &&
+    PERMISSION_SETTINGS_ERROR_CODES.has(v.code as PermissionSettingsErrorCode) &&
+    isBoundedPermissionCopy(v.message, PERMISSION_SETTINGS_ERROR_MESSAGE_MAX)
+  );
 }
 
 function isSettingsUpdateResult(v: unknown): v is SettingsUpdateResult {
@@ -984,6 +1092,12 @@ export function isExtMessage(data: unknown): data is ExtMessage {
 
     case 'taskTypesSettingsUpdateResult':
       return hasOnlyKeys(data, ['type', 'result']) && isTaskTypesSettingsUpdateResult(data.result);
+
+    case 'permissionSettingsSnapshot':
+      return hasOnlyKeys(data, ['type', 'snapshot']) && isPermissionSettingsSnapshot(data.snapshot);
+
+    case 'permissionSettingsUpdateResult':
+      return hasOnlyKeys(data, ['type', 'result']) && isPermissionSettingsUpdateResult(data.result);
 
     case 'taskUpdated':
       return isString(data.taskId) && isNumber(data.storeRevision) && isRecord(data.patch);

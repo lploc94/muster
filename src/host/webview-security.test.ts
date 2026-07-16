@@ -155,3 +155,125 @@ describe('host queued-turn mutation routing contract', () => {
     }
   });
 });
+
+
+describe('permission settings host routing contract', () => {
+  const extensionSource = readFileSync(resolve(process.cwd(), 'src/extension.ts'), 'utf8');
+  const protocolSource = readFileSync(resolve(process.cwd(), 'webview/src/lib/protocol.ts'), 'utf8');
+  const appSource = readFileSync(resolve(process.cwd(), 'webview/src/App.svelte'), 'utf8');
+
+  it('wires requestPermissionSettings and updatePermissionSettings through the T01 helper with Workspace target', () => {
+    expect(extensionSource).toContain("from './host/permission-settings'");
+    expect(extensionSource).toContain('buildPermissionSettingsSnapshot');
+    expect(extensionSource).toContain('handlePermissionSettingsUpdateAction');
+    expect(extensionSource).toContain("case 'requestPermissionSettings'");
+    expect(extensionSource).toContain("case 'updatePermissionSettings'");
+    expect(extensionSource).toContain('postPermissionSettingsSnapshot');
+    expect(extensionSource).toContain('handleUpdatePermissionSettings');
+    expect(extensionSource).toContain("getConfiguration('muster.permissions')");
+    expect(extensionSource).toContain('vscode.ConfigurationTarget.Workspace');
+
+    const requestCase = extensionSource.match(
+      /case 'requestPermissionSettings':[\s\S]*?case 'updatePermissionSettings':/,
+    )?.[0];
+    expect(requestCase).toBeDefined();
+    expect(requestCase).toContain('postPermissionSettingsSnapshot');
+
+    const updateCase = extensionSource.match(
+      /case 'updatePermissionSettings':[\s\S]*?case 'listBackends':/,
+    )?.[0];
+    expect(updateCase).toBeDefined();
+    expect(updateCase).toContain('handleUpdatePermissionSettings');
+
+    const updateMethod = extensionSource.match(
+      /private async handleUpdatePermissionSettings\([\s\S]*?\n  \}/,
+    )?.[0];
+    expect(updateMethod).toBeDefined();
+    expect(updateMethod).toContain('handlePermissionSettingsUpdateAction');
+    expect(updateMethod).toContain('vscode.ConfigurationTarget.Workspace');
+    // Never Global or WorkspaceFolder from the custom Permissions Settings path.
+    expect(updateMethod).not.toContain('ConfigurationTarget.Global');
+    expect(updateMethod).not.toContain('ConfigurationTarget.WorkspaceFolder');
+  });
+
+  it('opens Settings requesting the permission snapshot alongside Task Types and Retention', () => {
+    const openSettings = appSource.match(/function openSettings\(\)[\s\S]*?\n  \}/)?.[0];
+    expect(openSettings).toBeDefined();
+    expect(openSettings).toContain("type: 'requestSettings'");
+    expect(openSettings).toContain("type: 'requestTaskTypesSettings'");
+    expect(openSettings).toContain("type: 'requestPermissionSettings'");
+
+    const requestSettingsCase = extensionSource.match(
+      /case 'requestSettings':[\s\S]*?case 'updateSetting':/,
+    )?.[0];
+    expect(requestSettingsCase).toBeDefined();
+    expect(requestSettingsCase).toContain('postSettingsSnapshot');
+    expect(requestSettingsCase).toContain('postTaskTypesSettingsSnapshot');
+    expect(requestSettingsCase).toContain('postPermissionSettingsSnapshot');
+  });
+
+  it('keeps runtime permission prompt routes distinct from configuration messages', () => {
+    expect(extensionSource).toContain("case 'submitPermission'");
+    expect(extensionSource).toContain("case 'cancelPermission'");
+    expect(protocolSource).toContain("type: 'permissionPending'");
+    expect(protocolSource).toContain("type: 'permissionCleared'");
+    expect(protocolSource).toContain("type: 'permissionSettingsSnapshot'");
+    expect(protocolSource).toContain("type: 'permissionSettingsUpdateResult'");
+    expect(protocolSource).toContain("type: 'requestPermissionSettings'");
+    expect(protocolSource).toContain("type: 'updatePermissionSettings'");
+
+    // Runtime option submission remains separate from settings mode updates.
+    const submitCase = extensionSource.match(
+      /case 'submitPermission':[\s\S]*?case 'cancelPermission':/,
+    )?.[0];
+    expect(submitCase).toBeDefined();
+    expect(submitCase).not.toContain('handleUpdatePermissionSettings');
+    expect(submitCase).not.toContain('handlePermissionSettingsUpdateAction');
+  });
+
+  it('proves malformed updates never reach configuration.update and raw errors never cross the webview boundary', async () => {
+    const {
+      handlePermissionSettingsUpdateAction,
+    } = await import('./permission-settings');
+
+    const update = vi.fn().mockResolvedValue(undefined);
+    const get = vi.fn(() => 'ask');
+    const configuration = { get, update };
+
+    const malformed = await handlePermissionSettingsUpdateAction(
+      configuration,
+      { mode: 'prompt', extra: true },
+      Symbol('workspace-target'),
+    );
+    expect(update).not.toHaveBeenCalled();
+    expect(malformed).toEqual([
+      {
+        type: 'permissionSettingsUpdateResult',
+        result: {
+          ok: false,
+          code: 'invalidPayload',
+          message: 'Unsupported permission mode update.',
+        },
+      },
+    ]);
+
+    update.mockRejectedValueOnce(new Error('ENOENT /secret/path token=abc123\n    at update (extension.ts:1:1)'));
+    const failed = await handlePermissionSettingsUpdateAction(
+      configuration,
+      { mode: 'allow' },
+      Symbol('workspace-target'),
+    );
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(failed).toEqual([
+      {
+        type: 'permissionSettingsUpdateResult',
+        result: {
+          ok: false,
+          code: 'updateFailed',
+          message: 'Unable to update permission mode.',
+        },
+      },
+    ]);
+    expect(JSON.stringify(failed)).not.toMatch(/ENOENT|\/secret\/|token=|extension\.ts/);
+  });
+});

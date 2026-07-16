@@ -101,6 +101,21 @@ describe('turn lease hardening', () => {
     expect(fs.readdirSync(dir).filter((n) => n.endsWith('.stale') || n.endsWith('.tmp'))).toEqual([]);
   });
 
+  it('encodes batch turn ids so distinct Windows lease paths cannot collide', () => {
+    const storePath = makeStorePath();
+    const producer = 'turn:producer-abc123';
+    const consumer = 'turn:consumer-def456';
+
+    const producerSuffix = leasePath(storePath, producer).slice(storePath.length);
+    expect(leasePath(storePath, producer)).not.toBe(leasePath(storePath, consumer));
+    expect(producerSuffix).not.toContain(':');
+
+    const producerLease = tryAcquireLease(storePath, producer);
+    const consumerLease = tryAcquireLease(storePath, consumer);
+    expect(producerLease).toBeDefined();
+    expect(consumerLease).toBeDefined();
+  });
+
   it('acquires atomically, leaving a complete record and no temp file', () => {
     const storePath = makeStorePath();
     const turnId = 'turn-fresh';

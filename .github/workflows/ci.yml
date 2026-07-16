@@ -2,7 +2,10 @@
 # and can also be triggered manually from GitHub Actions → CI → Run workflow.
 #
 # It runs the shared local verifier (`npm test`), the M002 quality-gate
-# checks, and the M004 Settings docs/webview checks on Node 24 LTS.
+# checks, Svelte check, Settings docs + live-evidence ledger verifiers, and
+# the full Playwright webview suite on Node 24 LTS.
+# A valid ENVIRONMENT BLOCKED Settings ledger records blocked host attempts;
+# local CI still only covers docs, ledger shape, and browser webview gates.
 
 name: CI
 
@@ -30,6 +33,7 @@ jobs:
       - run: npm run test:evidence
       - run: npm run test:source-boundary:fixtures
       - run: npm run test:settings-docs
+      - run: npm run test:settings-live-evidence
       - run: npm run compile
       - run: npm run check:svelte
       - run: npx playwright install --with-deps chromium

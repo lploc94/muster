@@ -46,6 +46,10 @@ import {
   loadTaskTypeRegistry,
   pickExplicitTaskTypesValue,
 } from './host/task-types-config';
+import {
+  buildPermissionSettingsSnapshot,
+  handlePermissionSettingsUpdateAction,
+} from './host/permission-settings';
 import { detectAvailableBackends, installAugmentedPath } from './host/backend-availability';
 import {
   parseComposerSelection,
@@ -451,6 +455,47 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       payload,
       vscode.ConfigurationTarget.Workspace,
       () => this.readTaskTypesRaw(),
+    );
+    for (const message of messages) {
+      this.post(message);
+    }
+  }
+
+  private postPermissionSettingsSnapshot(): void {
+    try {
+      this.post({
+        type: 'permissionSettingsSnapshot',
+        snapshot: buildPermissionSettingsSnapshot((key) =>
+          vscode.workspace.getConfiguration('muster.permissions').get(key),
+        ),
+      });
+    } catch {
+      this.post({
+        type: 'permissionSettingsUpdateResult',
+        result: {
+          ok: false,
+          code: 'updateFailed',
+          message: 'Unable to update permission mode.',
+        },
+      });
+    }
+  }
+
+  private async handleUpdatePermissionSettings(data: unknown): Promise<void> {
+    const payload =
+      typeof data === 'object' && data !== null && 'mode' in data
+        ? { mode: (data as { mode: unknown }).mode }
+        : data;
+    const messages = await handlePermissionSettingsUpdateAction(
+      {
+        get: (key) => vscode.workspace.getConfiguration('muster.permissions').get(key),
+        update: (key, value, target) =>
+          vscode.workspace
+            .getConfiguration('muster.permissions')
+            .update(key, value, target as vscode.ConfigurationTarget),
+      },
+      payload,
+      vscode.ConfigurationTarget.Workspace,
     );
     for (const message of messages) {
       this.post(message);
@@ -2422,6 +2467,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         case 'requestSettings':
           this.postSettingsSnapshot();
           this.postTaskTypesSettingsSnapshot();
+          this.postPermissionSettingsSnapshot();
           break;
         case 'updateSetting':
           await this.handleUpdateSetting(data);
@@ -2431,6 +2477,12 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           break;
         case 'updateTaskTypes':
           await this.handleUpdateTaskTypes(data);
+          break;
+        case 'requestPermissionSettings':
+          this.postPermissionSettingsSnapshot();
+          break;
+        case 'updatePermissionSettings':
+          await this.handleUpdatePermissionSettings(data);
           break;
         case 'listBackends':
           void this.postAvailableBackends();

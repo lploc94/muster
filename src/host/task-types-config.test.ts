@@ -9,8 +9,12 @@ import {
   pickExplicitTaskTypesValue,
   readTaskTypeRegistryFromRaw,
   rowsToTaskTypesMap,
+  sanitizeTaskTypesUpdateError,
   validateTaskTypesUpdate,
 } from './task-types-config';
+
+/** VS Code ConfigurationTarget.Workspace — custom Settings writes this target only. */
+const CONFIGURATION_TARGET_WORKSPACE = 2;
 
 const props = packageJson.contributes.configuration.properties;
 
@@ -259,5 +263,121 @@ describe('task-types host config', () => {
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.code).toBe('invalid_task_type_config');
+  });
+
+  it('buildTaskTypesSettingsSnapshot surfaces empty status with no diagnostics', () => {
+    const snap = buildTaskTypesSettingsSnapshot(() => ({}));
+    expect(snap.status).toBe('empty');
+    expect(snap.types).toEqual([]);
+    expect(snap.diagnostics).toEqual([]);
+    expect(snap.defaults.length).toBeGreaterThan(0);
+  });
+
+  it('buildTaskTypesSettingsSnapshot surfaces invalid diagnostics without types', () => {
+    const snap = buildTaskTypesSettingsSnapshot(() => ({
+      plan: { backend: 123 },
+    }));
+    expect(snap.status).toBe('invalid');
+    expect(snap.types).toEqual([]);
+    expect(snap.diagnostics.length).toBeGreaterThan(0);
+    expect(snap.diagnostics[0]?.message.length).toBeGreaterThan(0);
+  });
+
+  it('persist writes validated map using ConfigurationTarget.Workspace only', async () => {
+    const update = vi.fn(async () => {});
+    const result = await persistTaskTypesUpdate(
+      { update },
+      MUSTER_DEFAULT_TASK_TYPES,
+      CONFIGURATION_TARGET_WORKSPACE,
+    );
+    expect(result).toEqual({ ok: true });
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(update).toHaveBeenCalledWith(
+      'taskTypes',
+      expect.objectContaining({
+        plan: expect.objectContaining({ backend: 'codex' }),
+      }),
+      CONFIGURATION_TARGET_WORKSPACE,
+    );
+    // Never Global (1) or WorkspaceFolder (3) from the custom Settings path.
+    expect(update.mock.calls[0]?.[2]).toBe(CONFIGURATION_TARGET_WORKSPACE);
+  });
+
+  it('sanitizeTaskTypesUpdateError strips raw host exceptions', () => {
+    const result = sanitizeTaskTypesUpdateError(
+      new Error('EACCES /Users/secret/settings.json path=/home/private'),
+    );
+    expect(result).toEqual({
+      ok: false,
+      code: 'updateFailed',
+      message: 'Unable to update muster.taskTypes.',
+    });
+    expect(JSON.stringify(result)).not.toMatch(/EACCES|secret|private/i);
+  });
+
+  it('persist sanitizes write failures and does not claim success', async () => {
+    const update = vi.fn(async () => {
+      throw new Error('EPERM /tmp/secret-workspace/.vscode/settings.json');
+    });
+    const result = await persistTaskTypesUpdate(
+      { update },
+      MUSTER_DEFAULT_TASK_TYPES,
+      CONFIGURATION_TARGET_WORKSPACE,
+    );
+    expect(result).toEqual({
+      ok: false,
+      code: 'updateFailed',
+      message: 'Unable to update muster.taskTypes.',
+    });
+    expect(JSON.stringify(result)).not.toMatch(/EPERM|secret-workspace/i);
+  });
+
+  it('handle update action omits snapshot on write failure (saved state unchanged)', async () => {
+    let stored: unknown = { plan: { backend: 'codex', role: 'worker', briefKind: 'plan' } };
+    const messages = await handleTaskTypesSettingsUpdateAction(
+      {
+        update: async () => {
+          throw new Error('disk full /Users/secret');
+        },
+      },
+      MUSTER_DEFAULT_TASK_TYPES,
+      CONFIGURATION_TARGET_WORKSPACE,
+      () => stored,
+    );
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({
+      type: 'taskTypesSettingsUpdateResult',
+      result: { ok: false, code: 'updateFailed', message: 'Unable to update muster.taskTypes.' },
+    });
+    // Host storage untouched — success-then-snapshot only.
+    expect(stored).toEqual({ plan: { backend: 'codex', role: 'worker', briefKind: 'plan' } });
+  });
+
+  it('handle update action returns result then snapshot on Workspace success', async () => {
+    let stored: unknown = {};
+    const update = vi.fn(async (_k: string, value: unknown, target: unknown) => {
+      expect(target).toBe(CONFIGURATION_TARGET_WORKSPACE);
+      stored = value;
+    });
+    const messages = await handleTaskTypesSettingsUpdateAction(
+      { update },
+      MUSTER_DEFAULT_TASK_TYPES,
+      CONFIGURATION_TARGET_WORKSPACE,
+      () => stored,
+    );
+    expect(update).toHaveBeenCalledWith(
+      'taskTypes',
+      expect.any(Object),
+      CONFIGURATION_TARGET_WORKSPACE,
+    );
+    expect(messages[0]).toMatchObject({
+      type: 'taskTypesSettingsUpdateResult',
+      result: { ok: true },
+    });
+    expect(messages[1]?.type).toBe('taskTypesSettingsSnapshot');
+    if (messages[1]?.type === 'taskTypesSettingsSnapshot') {
+      expect(messages[1].snapshot.status).toBe('ok');
+      expect(messages[1].snapshot.types.length).toBeGreaterThan(0);
+    }
   });
 });
