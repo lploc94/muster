@@ -150,8 +150,12 @@ export class DbClient {
   }
 
   /** Run an ordered statement batch inside one IMMEDIATE transaction (all-or-nothing). */
-  async transaction(statements: SqlStatement[]): Promise<void> {
-    await this.send({ kind: 'transaction', statements });
+  async transaction(
+    statements: SqlStatement[],
+    options: { abortIfFirstUnchanged?: boolean } = {},
+  ): Promise<RunResult[]> {
+    const res = await this.send({ kind: 'transaction', statements, ...options });
+    return res.kind === 'transaction' ? res.results : [];
   }
 
   async pragma(pragma: string): Promise<number> {

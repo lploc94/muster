@@ -72,10 +72,16 @@ function handle(req: DbRequest): DbResponse {
       // busy_timeout wait rather than mid-batch after partial work.
       conn.exec('BEGIN IMMEDIATE TRANSACTION');
       try {
+        const results: RunResult[] = [];
         for (const stmt of req.statements) {
-          runStatement(stmt.sql, stmt.params);
+          results.push(runStatement(stmt.sql, stmt.params));
+          if (req.abortIfFirstUnchanged && results.length === 1 && results[0]?.changes === 0) {
+            conn.exec('ROLLBACK');
+            return { kind: 'transaction', requestId: req.requestId, results };
+          }
         }
         conn.exec('COMMIT');
+        return { kind: 'transaction', requestId: req.requestId, results };
       } catch (error) {
         try {
           conn.exec('ROLLBACK');
@@ -84,7 +90,6 @@ function handle(req: DbRequest): DbResponse {
         }
         throw error;
       }
-      return { kind: 'ok', requestId: req.requestId };
     }
     case 'pragma': {
       // Closed allowlist: refuse any pragma name not explicitly permitted, so a

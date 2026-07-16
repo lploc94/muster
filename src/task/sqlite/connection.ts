@@ -9,7 +9,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import {
   MUSTER_APPLICATION_ID,
-  SCHEMA_V1_STATEMENTS,
+  SCHEMA_MIGRATIONS,
   SQLITE_SCHEMA_VERSION,
 } from './schema';
 
@@ -56,11 +56,14 @@ function readScalar(db: DatabaseSync, pragma: string): number {
  * per-connection settings; synchronous NORMAL + busy_timeout tune write coordination.
  */
 export function applyPragmas(db: DatabaseSync, busyTimeoutMs: number): void {
+  // Install the wait policy BEFORE journal_mode. Two extension hosts can open a
+  // brand-new profile DB concurrently; changing journal mode itself may need the
+  // database lock, so setting busy_timeout last would make that race fail fast.
+  db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(busyTimeoutMs))}`);
   // journal_mode is persistent once set; issuing it every open is harmless.
   db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA foreign_keys = ON');
   db.exec('PRAGMA synchronous = NORMAL');
-  db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(busyTimeoutMs))}`);
 }
 
 /**
@@ -105,8 +108,12 @@ export function migrateToLatest(db: DatabaseSync): number {
     // we waited to acquire it.
     const underLock = readScalar(db, 'user_version');
     if (underLock < SQLITE_SCHEMA_VERSION) {
-      if (underLock < 1) {
-        for (const stmt of SCHEMA_V1_STATEMENTS) {
+      for (let version = underLock; version < SQLITE_SCHEMA_VERSION; version += 1) {
+        const migration = SCHEMA_MIGRATIONS[version];
+        if (!migration) {
+          throw new Error(`missing SQLite schema migration for version ${version + 1}`);
+        }
+        for (const stmt of migration) {
           db.exec(stmt);
         }
       }

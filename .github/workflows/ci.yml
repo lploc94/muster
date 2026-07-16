@@ -38,3 +38,30 @@ jobs:
       - run: npm run check:svelte
       - run: npx playwright install --with-deps chromium
       - run: npm run test:webview
+
+  sqlite-extension-host:
+    name: SQLite Extension Host (${{ matrix.vscode-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - vscode-version: "1.100.0"
+            expect-incompatible: "1"
+          - vscode-version: "1.101.0"
+            expect-incompatible: "0"
+          - vscode-version: "stable"
+            expect-incompatible: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - run: npm ci
+      - run: xvfb-run -a npm run test:sqlite-extension-host
+        env:
+          MUSTER_VSCODE_VERSION: ${{ matrix.vscode-version }}
+          MUSTER_EXPECT_INCOMPATIBLE: ${{ matrix.expect-incompatible }}

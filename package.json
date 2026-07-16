@@ -46,7 +46,14 @@
       "properties": {
         "muster.execution.runLimit": {
           "type": "string",
-          "enum": ["15m", "30m", "1h", "2h", "4h", "8h"],
+          "enum": [
+            "15m",
+            "30m",
+            "1h",
+            "2h",
+            "4h",
+            "8h"
+          ],
           "enumDescriptions": [
             "15 minutes",
             "30 minutes",
@@ -137,18 +144,38 @@
           "description": "Named task type presets (id → { backend, model?, role?, briefKind?, description? }). Muster ships defaults (no model pins); edit in Settings or VS Code settings.json. Explicit empty map fails closed for create/delegate.",
           "additionalProperties": {
             "type": "object",
-            "required": ["backend"],
+            "required": [
+              "backend"
+            ],
             "properties": {
-              "backend": { "type": "string", "description": "ACP backend id (e.g. codex, grok, opencode)." },
-              "model": { "type": "string", "description": "Optional ACP model id for this type." },
+              "backend": {
+                "type": "string",
+                "description": "ACP backend id (e.g. codex, grok, opencode)."
+              },
+              "model": {
+                "type": "string",
+                "description": "Optional ACP model id for this type."
+              },
               "role": {
                 "type": "string",
-                "enum": ["coordinator", "worker"],
+                "enum": [
+                  "coordinator",
+                  "worker"
+                ],
                 "description": "Default child role (default worker)."
               },
               "briefKind": {
                 "type": "string",
-                "enum": ["coordinate", "plan", "breakdown", "implement", "test", "verify", "research", "generic"],
+                "enum": [
+                  "coordinate",
+                  "plan",
+                  "breakdown",
+                  "implement",
+                  "test",
+                  "verify",
+                  "research",
+                  "generic"
+                ],
                 "description": "Default brief.kind preamble for children of this type."
               },
               "description": {
@@ -213,6 +240,7 @@
     "test:task-export-docs": "node --test scripts/verify-task-export-docs.test.mjs",
     "test:task-export-live-evidence": "node --test scripts/verify-task-export-live-host-evidence.test.mjs",
     "test:live-inject-smoke": "node --test scripts/verify-live-inject-smoke.test.mjs",
+    "test:sqlite-extension-host": "node scripts/run-sqlite-extension-host-smoke.mjs",
     "test:watch": "vitest",
     "check:svelte": "svelte-check --workspace webview --tsconfig ./tsconfig.json",
     "test:source-boundary": "node scripts/source-boundary-smoke.mjs",
@@ -224,9 +252,12 @@
     "@playwright/test": "^1.61.1",
     "@sveltejs/vite-plugin-svelte": "^7.1.2",
     "@tailwindcss/vite": "^4.3.2",
+    "@types/adm-zip": "^0.5.8",
     "@types/node": "^26.1.0",
     "@types/vscode": "^1.101.0",
+    "@vscode/test-electron": "^3.0.0",
     "@vscode/vsce": "^3.9.2",
+    "adm-zip": "^0.6.0",
     "jsdom": "^29.1.1",
     "svelte": "^5.56.4",
     "svelte-check": "^4.7.2",

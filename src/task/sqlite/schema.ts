@@ -15,7 +15,7 @@
 export const MUSTER_APPLICATION_ID = 0x4d555354; // 'MUST'
 
 /** Current schema version, tracked via `PRAGMA user_version`. */
-export const SQLITE_SCHEMA_VERSION = 1;
+export const SQLITE_SCHEMA_VERSION = 2;
 
 /**
  * Ordered DDL statements for schema v1. Applied inside a single exclusive
@@ -217,4 +217,86 @@ export const SCHEMA_V1_STATEMENTS: readonly string[] = [
   `CREATE INDEX IF NOT EXISTS idx_messages_turn ON messages(workspace_id, turn_id, ordering)`,
   `CREATE INDEX IF NOT EXISTS idx_reasoning_turn_order ON reasoning_segments(workspace_id, turn_id, ordering)`,
   `CREATE INDEX IF NOT EXISTS idx_tool_calls_turn_order ON tool_calls(workspace_id, turn_id, ordering)`,
+];
+
+/**
+ * Schema v2 completes the row-level parity primitives that cannot safely live in
+ * a task-wide JSON payload:
+ *
+ * - turn inputs are individually addressable and ordered;
+ * - session claims prevent two extension hosts from prompting the same backend
+ *   conversation concurrently;
+ * - resource claims make git/path serialization a database invariant rather than
+ *   a best-effort in-memory scheduler check.
+ *
+ * The claim rows are intentionally ephemeral. A successful promotion inserts
+ * them in the same transaction that marks a turn running; every terminal
+ * settlement removes them in its transaction.
+ */
+export const SCHEMA_V2_STATEMENTS: readonly string[] = [
+  `CREATE TABLE IF NOT EXISTS turn_inputs (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    turn_id TEXT NOT NULL,
+    ordering INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, turn_id, ordering),
+    FOREIGN KEY (workspace_id, turn_id)
+      REFERENCES turns(workspace_id, id) ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS session_claims (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    claimed_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, session_id),
+    UNIQUE (workspace_id, turn_id),
+    FOREIGN KEY (workspace_id, turn_id)
+      REFERENCES turns(workspace_id, id) ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS resource_claims (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    resource_key TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    claimed_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, resource_key),
+    UNIQUE (workspace_id, turn_id, resource_key),
+    FOREIGN KEY (workspace_id, task_id)
+      REFERENCES tasks(workspace_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, turn_id)
+      REFERENCES turns(workspace_id, id) ON DELETE CASCADE
+  )`,
+
+  // v1's cancel_requests primary key was task_id, while the domain aggregate is
+  // keyed by turnId. Keep that empty compatibility table untouched for a safe
+  // forward migration; all Phase-3 writes use this correctly keyed table.
+  `CREATE TABLE IF NOT EXISTS turn_cancel_requests (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    turn_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    op_id TEXT NOT NULL,
+    requested_by TEXT NOT NULL,
+    requested_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, turn_id),
+    FOREIGN KEY (workspace_id, turn_id)
+      REFERENCES turns(workspace_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, task_id)
+      REFERENCES tasks(workspace_id, id) ON DELETE CASCADE
+  )`,
+
+  `CREATE INDEX IF NOT EXISTS idx_turn_inputs_turn_order ON turn_inputs(workspace_id, turn_id, ordering)`,
+  `CREATE INDEX IF NOT EXISTS idx_session_claims_turn ON session_claims(workspace_id, turn_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_resource_claims_turn ON resource_claims(workspace_id, turn_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_turn_cancel_requests_task ON turn_cancel_requests(workspace_id, task_id)`,
+];
+
+/** Ordered migrations; index n contains the statements that create version n+1. */
+export const SCHEMA_MIGRATIONS: readonly (readonly string[])[] = [
+  SCHEMA_V1_STATEMENTS,
+  SCHEMA_V2_STATEMENTS,
 ];

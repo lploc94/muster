@@ -11,7 +11,7 @@ import {
   SchemaTooNewError,
   verifyOrStampApplicationId,
 } from './connection';
-import { MUSTER_APPLICATION_ID, SQLITE_SCHEMA_VERSION } from './schema';
+import { MUSTER_APPLICATION_ID, SCHEMA_V1_STATEMENTS, SQLITE_SCHEMA_VERSION } from './schema';
 
 const tempDirs: string[] = [];
 
@@ -33,7 +33,7 @@ function scalar(db: DatabaseSync, pragma: string): number {
 }
 
 describe('openStoreDatabase', () => {
-  it('creates the file, stamps application_id, and migrates to v1', () => {
+  it('creates the file, stamps application_id, and migrates to the latest schema', () => {
     const dbPath = tempDbPath();
     const db = openStoreDatabase({ path: dbPath });
     try {
@@ -53,6 +53,10 @@ describe('openStoreDatabase', () => {
       expect(tables).toContain('reasoning_segments');
       expect(tables).toContain('change_log');
       expect(tables).toContain('migration_state');
+      expect(tables).toContain('turn_inputs');
+      expect(tables).toContain('session_claims');
+      expect(tables).toContain('resource_claims');
+      expect(tables).toContain('turn_cancel_requests');
     } finally {
       db.close();
     }
@@ -166,6 +170,33 @@ describe('verifyOrStampApplicationId', () => {
 });
 
 describe('migrateToLatest', () => {
+  it('upgrades a populated v1 database to v2 without rewriting legacy rows', () => {
+    const db = new DatabaseSync(tempDbPath());
+    try {
+      applyPragmas(db, 5000);
+      verifyOrStampApplicationId(db);
+      db.exec('BEGIN IMMEDIATE');
+      for (const statement of SCHEMA_V1_STATEMENTS) db.exec(statement);
+      db.exec('PRAGMA user_version = 1');
+      db.exec('COMMIT');
+      db.prepare(
+        `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
+         VALUES (?,?,?,?,?)`,
+      ).run('ws', 'identity', 'Workspace', 'now', 'now');
+      db.prepare(
+        `INSERT INTO tasks
+         (id, workspace_id, role, lifecycle, goal, backend, revision, created_at, updated_at, payload_json)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      ).run('task', 'ws', 'worker', 'open', 'goal', 'codex', 0, 'now', 'now', '{"legacy":true}');
+      migrateToLatest(db);
+      expect(scalar(db, 'user_version')).toBe(SQLITE_SCHEMA_VERSION);
+      expect((db.prepare('SELECT COUNT(*) AS n FROM tasks').get() as { n: number }).n).toBe(1);
+      expect((db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='turn_inputs'").get() as { name: string }).name).toBe('turn_inputs');
+    } finally {
+      db.close();
+    }
+  });
+
   it('refuses a schema newer than supported', () => {
     const db = new DatabaseSync(tempDbPath());
     try {

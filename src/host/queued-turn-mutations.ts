@@ -162,6 +162,23 @@ export interface DeleteQueuedTurnRouteDeps {
   ) => EngineResult<{ turnId: string; deletedMessageIds: string[] }>;
 }
 
+export interface AsyncEditQueuedTurnRouteDeps {
+  engineReady: boolean;
+  editQueuedTurn: (
+    taskId: string,
+    turnId: string,
+    content: string,
+  ) => Promise<EngineResult<{ turnId: string; messageId: string }>>;
+}
+
+export interface AsyncDeleteQueuedTurnRouteDeps {
+  engineReady: boolean;
+  deleteQueuedTurn: (
+    taskId: string,
+    turnId: string,
+  ) => Promise<EngineResult<{ turnId: string; deletedMessageIds: string[] }>>;
+}
+
 /**
  * Host routing for editQueuedTurn: validate, delegate once to the engine, and
  * return either a success ack or a sanitized command-error payload. Never falls
@@ -223,4 +240,36 @@ export function routeDeleteQueuedTurn(
     taskId: parsed.taskId,
     message: queuedMutationRefusalMessage(result.reason),
   };
+}
+
+/** Async repository route used by the extension host during the transition. The
+ * synchronous exports remain for legacy unit consumers until every entry point
+ * has moved off TaskStore. */
+export async function routeEditQueuedTurnAsync(
+  data: unknown,
+  deps: AsyncEditQueuedTurnRouteDeps,
+): Promise<QueuedMutationHostOutcome> {
+  if (!deps.engineReady) return { kind: 'error', message: 'task engine not ready' };
+  const parsed = parseEditQueuedTurnMessage(data);
+  if (!parsed.ok) return { kind: 'error', taskId: parsed.taskId, message: parsed.message };
+  const result = await deps.editQueuedTurn(parsed.taskId, parsed.turnId, parsed.content);
+  return result.ok
+    ? { kind: 'ack', taskId: parsed.taskId, turnId: result.value.turnId, messageId: result.value.messageId }
+    : { kind: 'error', taskId: parsed.taskId, message: queuedMutationRefusalMessage(result.reason) };
+}
+
+export async function routeDeleteQueuedTurnAsync(
+  data: unknown,
+  deps: AsyncDeleteQueuedTurnRouteDeps,
+): Promise<QueuedMutationHostOutcome> {
+  if (!deps.engineReady) return { kind: 'error', message: 'task engine not ready' };
+  const parsed = parseDeleteQueuedTurnMessage(data);
+  if (!parsed.ok) return { kind: 'error', taskId: parsed.taskId, message: parsed.message };
+  const result = await deps.deleteQueuedTurn(parsed.taskId, parsed.turnId);
+  return result.ok
+    ? {
+        kind: 'ack', taskId: parsed.taskId, turnId: result.value.turnId,
+        deletedMessageIds: result.value.deletedMessageIds,
+      }
+    : { kind: 'error', taskId: parsed.taskId, message: queuedMutationRefusalMessage(result.reason) };
 }

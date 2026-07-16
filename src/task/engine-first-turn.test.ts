@@ -78,7 +78,7 @@ describe('W1 single freeze site + host prepare', () => {
       getTaskTypeRegistry: () => EMPTY_TASK_TYPES,
     });
 
-    const started = engine.startNewTask({
+    const started = await engine.startNewTask({
       goal: 'Coordinate the work',
       backend: 'fake',
       role: 'coordinator',
@@ -267,7 +267,7 @@ describe('W1 single freeze site + host prepare', () => {
       workspaceFolder: '/fallback-cwd',
     });
 
-    const started = engine.startNewTask({
+    const started = await engine.startNewTask({
       goal: 'minimal host',
       backend: 'fake',
       message: 'minimal host',
@@ -782,7 +782,7 @@ describe('startNewTask — skills wiring + per-backend prefix', () => {
       getTaskTypeRegistry: () => EMPTY_TASK_TYPES,
     });
 
-    const started = engine.startNewTask({
+    const started = await engine.startNewTask({
       goal: 'Coordinate the work',
       backend: 'fake',
       role: 'coordinator',
@@ -813,7 +813,7 @@ describe('startNewTask — skills wiring + per-backend prefix', () => {
       getTaskTypeRegistry: () => EMPTY_TASK_TYPES,
     });
 
-    const started = engine.startNewTask({
+    const started = await engine.startNewTask({
       goal: 'Continue prior work',
       backend: 'fake',
       role: 'coordinator',
@@ -847,7 +847,7 @@ describe('startNewTask — skills wiring + per-backend prefix', () => {
       getSkillPrefix: () => '$',
     });
 
-    const started = engine.startNewTask({
+    const started = await engine.startNewTask({
       goal: 'Coordinate the work',
       backend: 'fake',
       role: 'coordinator',

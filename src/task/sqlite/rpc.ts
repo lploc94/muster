@@ -53,6 +53,13 @@ export type DbRequest =
       kind: 'transaction';
       requestId: number;
       statements: SqlStatement[];
+      /**
+       * Conditional write guard. If the first statement affects no row, the
+       * worker rolls the IMMEDIATE transaction back and returns that one result
+       * without evaluating later statements. This lets repository commands use
+       * optimistic guards without a race or partial aggregate write.
+       */
+      abortIfFirstUnchanged?: boolean;
     }
   | { kind: 'pragma'; requestId: number; pragma: string }
   | { kind: 'close'; requestId: number };
@@ -69,6 +76,8 @@ export type DbResponse =
   | { kind: 'rows'; requestId: number; rows: unknown[] }
   | { kind: 'row'; requestId: number; row: unknown }
   | { kind: 'run'; requestId: number; result: RunResult }
+  /** Results are in the same order as the submitted transaction statements. */
+  | { kind: 'transaction'; requestId: number; results: RunResult[] }
   | { kind: 'scalar'; requestId: number; value: number }
   | {
       kind: 'error';

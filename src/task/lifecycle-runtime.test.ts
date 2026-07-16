@@ -115,7 +115,7 @@ describe('task lifecycle runtime regression harness', () => {
     });
     const engine = makeEngine(store, () => backend);
 
-    const started = engine.startNewTask({ goal: 'Run a lifecycle task', backend: 'fake' });
+    const started = await engine.startNewTask({ goal: 'Run a lifecycle task', backend: 'fake' });
 
     expect(started.ok).toBe(true);
     if (!started.ok) return;
@@ -168,7 +168,7 @@ describe('task lifecycle runtime regression harness', () => {
     });
     const engine = makeEngine(store, () => backend);
 
-    const started = engine.startNewTask({ goal: 'Finish the task', backend: 'fake' });
+    const started = await engine.startNewTask({ goal: 'Finish the task', backend: 'fake' });
     expect(started.ok).toBe(true);
     if (!started.ok) return;
     await waitFor(

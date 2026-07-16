@@ -1276,7 +1276,7 @@ describe('TaskEngine workspace cwd', () => {
       },
     });
 
-    const started = engine.startNewTask({
+    const started = await engine.startNewTask({
       goal: 'do a thing',
       backend: 'fake',
       cwd: '/workspace/root',
@@ -1306,7 +1306,7 @@ describe('TaskEngine workspace cwd', () => {
       },
     });
 
-    const started = engine.startNewTask({ goal: 'no cwd', backend: 'fake' });
+    const started = await engine.startNewTask({ goal: 'no cwd', backend: 'fake' });
     expect(started.ok).toBe(true);
     if (!started.ok) return;
     await engine.whenIdle();
@@ -2235,5 +2235,28 @@ describe('TaskEngine runtime switch v2', () => {
     expect(store.getTask('epoch-fence')?.committedSessionId).toBeUndefined();
     expect(Object.values(store.getFile().turns)[0]?.status).toBe('interrupted');
     expect(JSON.stringify(store.getFile().messages)).not.toContain('late source text');
+  });
+
+  it('uses the repository command boundary for async host sends and receipt replay', async () => {
+    const { store } = makeTempStore();
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => scriptedBackend([], MCP_CAPS),
+      clock: () => '2026-07-16T14:00:00.000Z',
+    });
+    expect(engine.createTask({
+      id: 'repo-send', goal: 'queue safely', backend: 'fake',
+      executionPolicy: { maxTurns: 5, maxAutomaticRetries: 0 },
+    }).ok).toBe(true);
+    const first = await engine.sendAsync('repo-send', 'first queued prompt', { clientRequestId: 'repo-send-1' });
+    expect(first).toMatchObject({ ok: true, value: { clientRequestId: 'repo-send-1' } });
+    await engine.whenIdle();
+    const replay = await engine.sendAsync('repo-send', 'first queued prompt', { clientRequestId: 'repo-send-1' });
+    expect(replay).toEqual(first);
+    expect(store.getTurnsForTask('repo-send')).toHaveLength(1);
+    expect(store.getMessagesForTask('repo-send')).toHaveLength(1);
+    expect(store.getFile().sendReceipts?.['repo-send-1']).toMatchObject({
+      taskId: 'repo-send', turnId: first.ok ? first.value.turnId : undefined,
+    });
   });
 });

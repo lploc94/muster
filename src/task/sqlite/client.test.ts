@@ -70,6 +70,24 @@ describe('DbClient <-> worker RPC', () => {
     expect(rows).toHaveLength(1);
   }, 20_000);
 
+  it('rolls back and skips dependent statements when a conditional first write is unchanged', async () => {
+    const client = makeClient();
+    await client.open(tempDbPath());
+    const results = await client.transaction([
+      {
+        sql: 'UPDATE workspaces SET display_name = ? WHERE id = ?',
+        params: ['never', 'missing'],
+      },
+      {
+        sql: `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
+              VALUES (?,?,?,?,?)`,
+        params: ['must-not-exist', 'key', 'Skipped', 'now', 'now'],
+      },
+    ], { abortIfFirstUnchanged: true });
+    expect(results).toEqual([expect.objectContaining({ changes: 0 })]);
+    await expect(client.get('SELECT id FROM workspaces WHERE id = ?', ['must-not-exist'])).resolves.toBeUndefined();
+  }, 20_000);
+
   it('rolls back the whole batch when one statement fails', async () => {
     const client = makeClient();
     await client.open(tempDbPath());

@@ -2,8 +2,15 @@
 
 ## Trạng thái
 
-**PROPOSED — chưa triển khai**  
-Ngày lập: 2026-07-16
+**IN PROGRESS — chưa cutover production.**
+Cập nhật: 2026-07-16
+
+- Phase 1: worker/RPC, schema migration, global-storage registry đã có.
+- Phase 2: repository boundary đang được chuyển dần; các host flow create/send/queue
+  đã async named-command, scheduler/graph/snapshot chưa hoàn tất.
+- Phase 3: entity parity, atomic claim/idempotency/claims và row-level retention đã có;
+  runtime parity chỉ hoàn tất sau khi các flow còn lại rời `TaskStore`.
+- Chưa bắt đầu Phase 4 hay migration/cutover Phase 5.
 
 ## 1. Kết quả sản phẩm mong muốn
 
@@ -474,6 +481,151 @@ extension-host heartbeat/UI command.
 - Retention chuyển thành indexed DELETE theo workspace/task.
 
 **Gate:** SQLite đạt behavior parity và không full-table/full-database rewrite khi stream.
+
+#### Kế hoạch khép Phase 1–3 theo 10 wave
+
+Không bắt đầu Phase 4 chỉ vì các SQLite primitive đã tồn tại. Audit ngày 2026-07-17
+ghi nhận **44 runtime mutation sites** còn gọi `TaskStore.commit()` ngoài JSON adapter:
+23 trong `engine.ts`, 17 trong `engine-graph.ts` và 4 trong `extension.ts`. Mười wave
+dưới đây là execution plan bắt buộc để đưa con số đó về 0 và khép đầy đủ gate của
+Phase 1–3.
+
+Mỗi wave là một change set/commit độc lập, có targeted tests và typecheck. Full suite
+chạy ở các milestone được nêu dưới đây. Không dùng command tổng quát kiểu
+`applyGraphMutation(TaskStoreFile)` để giảm số call site giả tạo: mọi mutation phải là
+named command với invariant, revision/epoch fence và worker-owned transaction rõ ràng.
+Các wave được tiếp tục tuần tự; chỉ dừng khi có blocker thực sự. Phase 4 chỉ được bắt đầu
+sau khi Wave 10 qua toàn bộ gate.
+
+| Wave | Phạm vi | Runtime mutation sites dự kiến loại bỏ |
+|---|---|---:|
+| 1 | Khép Phase 1 infrastructure gate | 0 |
+| 2 | Host mutations, snapshot và export boundary | 4 |
+| 3 | Engine queue và user-facing mutations | 9 |
+| 4 | Engine lifecycle và reconciliation | 8 |
+| 5 | Scheduler, settlement, handoff và bỏ `TaskStore` khỏi engine | 6 |
+| 6 | Graph delegate đơn và batch | 2 |
+| 7 | Graph release, continue, wait, complete và fail | 5 |
+| 8 | Graph cancellation và lifecycle cascade | 7 |
+| 9 | Graph questions và cancel consumer | 3 |
+| 10 | Phase 3 parity audit và gate cuối | 0 |
+
+##### Wave 1 — Khép Phase 1 infrastructure gate
+
+- Dựng Extension Host/packaged VSIX smoke test trên minimum VS Code 1.101 và stable
+  hiện hành; xác nhận packaged `worker.js` chạy thật với `node:sqlite`.
+- Test engine compatibility từ chối VS Code 1.100 trở xuống.
+- Test lock contention thật bằng hai DB workers: một connection giữ write lock khoảng
+  5 giây, connection còn lại chờ `busy_timeout`, trong khi extension-host heartbeat vẫn
+  đáp ứng.
+- Test terminate worker/process giữa transaction rồi reopen DB để xác nhận rollback và
+  WAL recovery; test concurrent schema migration/open.
+- Chạy Remote Extension Host test/UAT. Không có evidence Remote thì Phase 1 chưa qua gate.
+- Ghi rõ policy: probe có thể advisory khi JSON còn là production source; nó trở thành
+  hard gate ở Phase 5 ngay trước khi SQLite là writable source duy nhất. Không được fallback
+  sang JSON sau cutover.
+
+##### Wave 2 — Extension/provider boundary
+
+- Thay bốn direct commits của host bằng named commands:
+  `clearHistory`, `deleteTaskSubtreeIfIdle`, `renameTask`, `applyRetentionPolicy`.
+- Các lệnh clear/delete phải kiểm tra toàn subtree và live-turn safety trong cùng
+  transaction, không quyết định trên snapshot cũ rồi mới delete.
+- Dựng snapshot bằng repository queries; `postSnapshot()` không được gọi
+  `readEnvelopeForMigration()` hoặc materialize toàn workspace.
+- Export chỉ đọc qua repository; bỏ `getStoreFile` fallback. Export/migration là hai
+  nơi duy nhất được phép materialize compatibility envelope.
+- Chạy cùng host/snapshot/export contract tests trên JSON và SQLite adapters.
+
+##### Wave 3 — Engine queue và user-facing mutations
+
+- Chuyển reserve queued follow-up, resume queued turn, create task, send/enqueue,
+  edit/delete queued message, start/continue task và interrupt turn sang async named
+  commands.
+- Loại runtime sync mutation paths và mọi fire-and-forget persistence liên quan; caller
+  phải await kết quả durable trước khi ACK, schedule hoặc phát side effect.
+- Mỗi command có task revision, turn status/epoch, FIFO và idempotent receipt guards phù hợp.
+- Chạy cùng ingress/queue behavior suite trên JSON và SQLite adapters.
+
+##### Wave 4 — Engine lifecycle và reconciliation
+
+- Chuyển `stageDisposition`, `setTaskLifecycle`, `skipTask`, `cancelTask`, reload
+  reconciliation, child-wait reconciliation, dependency-terminal propagation và verdict
+  remediation sang named commands.
+- Dependency/wait/lifecycle effects liên quan phải commit atomically; không để một task
+  terminal nhưng dependent/wait state ở revision cũ.
+- Mỗi operation phải có ownership, revision và runtime-epoch fence; chạy cùng contract
+  suite trên cả hai adapters.
+
+##### Wave 5 — Scheduler, settlement, handoff và engine boundary
+
+- Chuyển runtime handoff, verdict revalidation, post-settlement follow-up draining,
+  missing-input attention và disposition repair sang named commands.
+- Xóa compatibility bridge đang clone full `TaskStoreFile` để chuẩn bị dispatch hoặc
+  settlement; chỉ query và persist các aggregate/rows thực sự liên quan.
+- Thay filesystem `.lease.<turnId>` bằng repository-owned runtime claim có owner,
+  expiry/heartbeat và stale-claim recovery.
+- Scheduler database transaction tự suy ra owning root từ candidate task; không tin
+  `rootTaskId` do caller truyền để enforce `maxConcurrentPerRoot`.
+- Bỏ `store: TaskStore` bắt buộc khỏi `TaskEngineConfig`; engine phải chạy hoàn toàn trên
+  `JsonTaskRepository` hoặc `SqliteTaskRepository`.
+- Sau wave này `engine.ts` không còn direct `TaskStore.commit()`. Chạy full test suite.
+
+##### Wave 6 — Graph delegate đơn và batch
+
+- Implement transactional commands cho `create_task`/`delegate_task` và
+  `create_tasks`/`delegate_tasks`.
+- Task, dependencies, input bindings, initial turns, limits, ownership/capabilities và
+  operation-ledger result phải cùng transaction.
+- Same operation id + fingerprint replay kết quả cũ; fingerprint khác conflict và không
+  để lại partial graph.
+
+##### Wave 7 — Graph release và completion
+
+- Implement transactional commands cho `release_tasks`, `continue_child`,
+  `wait_for_tasks`, `complete_task` và `fail_task`.
+- Release/readiness, wait state, task/turn result, continuation turn và operation ledger
+  phải atomically visible.
+- Chạy behavior suite tương ứng trên JSON và SQLite adapters, gồm contention/replay.
+
+##### Wave 8 — Graph cancellation và lifecycle cascade
+
+- Implement transactional commands cho `cancel_tasks`, `interrupt_task`, `cancel_task`,
+  `set_task_lifecycle` và descendant cancellation/cascade.
+- Remote-owned live turn chỉ nhận durable cancel request; local backend abort chỉ diễn ra
+  sau khi transaction thành công.
+- Terminal state, queued descendant handling, task sealing, claim release và operation
+  ledger phải nhất quán trong cùng transaction hoặc một protocol có owner fence rõ ràng.
+
+##### Wave 9 — Graph questions và cancel consumer
+
+- Implement transactional commands cho `ask_parent`, `answer_child_question` và
+  `consumeCancelRequest`.
+- `consumeCancelRequest` phải atomically claim đúng request/owner, settle hoặc cancel
+  turn/task, áp dụng follow-up hold/cancel policy, release session/resource/runtime claims,
+  xóa request và ghi đúng một workspace revision/change-log batch.
+- Sau wave này direct `TaskStore.commit()` ngoài `JsonTaskRepository` phải bằng 0. Chạy
+  full test suite và source-boundary audit.
+
+##### Wave 10 — Phase 3 parity audit và gate cuối
+
+- Enforce source-boundary checks: engine/graph/snapshot không import `TaskStore`;
+  `readEnvelopeForMigration()` chỉ xuất hiện trong migration/export; không còn direct
+  commit ngoài JSON adapter/legacy store implementation.
+- Cập nhật entity matrix cho runtime owner/lease, expiry và stale-claim recovery; audit
+  mọi domain field/aggregate qua codec hoặc promoted column.
+- Chạy toàn bộ scheduler/lifecycle/graph behavior suite trên cả JSON và SQLite, gồm
+  multi-worker contention, operation replay/conflict, orphan recovery và retention
+  không xóa live/reference data.
+- Benchmark database lớn để chứng minh `appendTranscriptBatch` chỉ chạm các row liên quan,
+  tạo một revision/feed batch và không tăng tuyến tính theo tổng database size.
+- Chạy full `npm test`, TypeScript/webview build, packaged Extension Host smoke và Remote
+  evidence; cập nhật command/entity matrices theo trạng thái thực tế.
+
+**Gate trước Phase 4:** Wave 1–10 đều hoàn tất; 44 runtime mutation sites đã về 0 ngoài
+JSON compatibility adapter; engine/graph/snapshot chạy qua repository boundary; dual-adapter
+scheduler/lifecycle/graph suites xanh; Phase 1 VSIX/lock/crash/Remote evidence đầy đủ; và
+SQLite đạt row-level behavior parity dưới contention.
 
 ### Phase 4 — Pagination và incremental wire protocol
 

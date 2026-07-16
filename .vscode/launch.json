@@ -26,6 +26,25 @@
         "group": "muster",
         "order": 2
       }
+    },
+    {
+      "name": "SQLite Remote Host Smoke",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}",
+        "--extensionTestsPath=${workspaceFolder}/dist/scripts/sqlite-extension-host-smoke.js"
+      ],
+      "env": {
+        "MUSTER_REQUIRE_REMOTE": "1"
+      },
+      "outFiles": ["${workspaceFolder}/dist/**/*.js"],
+      "preLaunchTask": "compile",
+      "presentation": {
+        "hidden": false,
+        "group": "muster",
+        "order": 3
+      }
     }
   ]
 }

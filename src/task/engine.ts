@@ -58,7 +58,7 @@ import {
 import { BATCH_EXPAND_MAX, type ToolCommand } from './coordinator-tools';
 import { evaluateTaskReadiness } from './readiness';
 import { canPromoteTurn, dependencyTerminalOutcome } from './scheduler';
-import { canCreateTurn, DEFAULT_RESOURCE_LIMITS, type ResourceLimits } from './limits';
+import { canCreateTurn, DEFAULT_RESOURCE_LIMITS, effectiveTurnCap, type ResourceLimits } from './limits';
 import {
   DEFAULT_RUN_LIMIT_MS,
   resolveTaskExecutionPolicy,
@@ -68,6 +68,7 @@ import {
 import { TASK_ERROR_MAX_BYTES, TASK_RESULT_MAX_BYTES } from './content-limits';
 import { selectCommittedSessionId } from './session-select';
 import { TaskStore } from './store';
+import { deriveResourceClaimKeys, JsonTaskRepository, type TaskRepository } from './repository';
 import {
   applyDependencyTerminal,
   applyFailedTurn,
@@ -97,6 +98,8 @@ import {
 } from './transitions';
 import type {
   MusterTask,
+  PersistedReasoning,
+  PersistedToolCall,
   TaskAttentionCode,
   TaskCapability,
   TaskDependency,
@@ -125,6 +128,10 @@ export type EngineEvent =
 
 export interface TaskEngineConfig {
   store: TaskStore;
+  /** Transitional async persistence boundary. JSON is injected by legacy tests;
+   * SQLite becomes the production implementation at cutover. */
+  repository?: TaskRepository;
+  workspaceId?: string;
   makeBackend: (name: string) => Backend;
   runTurn?: (backend: Backend, options: RunOptions) => AsyncIterable<NormalizedEvent>;
   dispositionLimits?: DispositionLimits;
@@ -610,6 +617,8 @@ export function viewStatusFromDraft(draft: TaskStoreFile, taskId: string) {
 
 export class TaskEngine {
   private readonly store: TaskStore;
+  private readonly repository: TaskRepository;
+  private readonly workspaceId: string;
   private readonly makeBackend: (name: string) => Backend;
   private readonly runTurnFn: (backend: Backend, options: RunOptions) => AsyncIterable<NormalizedEvent>;
   private readonly limits: DispositionLimits;
@@ -674,6 +683,8 @@ export class TaskEngine {
 
   private constructor(config: TaskEngineConfig, storePath: string) {
     this.store = config.store;
+    this.workspaceId = config.workspaceId ?? 'legacy-workspace';
+    this.repository = config.repository ?? new JsonTaskRepository(config.store, this.workspaceId);
     this.makeBackend = config.makeBackend;
     this.runTurnFn = config.runTurn ?? defaultRunTurn;
     this.limits = config.dispositionLimits ?? DEFAULT_LIMITS;
@@ -798,17 +809,18 @@ export class TaskEngine {
       leaseOwnerAlive: (turnId) => leaseOwnerAlive(this.storePath, turnId),
       ownsLease: (turnId) => ownsLocalLease(this.storePath, turnId),
       writeCancelRequest: (turnId, kind, by, opId, sealedBy) => {
-        this.store.commit((draft) => {
-          draft.cancelRequests = draft.cancelRequests ?? {};
-          draft.cancelRequests[turnId] = {
+        void this.repository.execute({
+          kind: 'putCancelRequest',
+          workspaceId: this.workspaceId,
+          turnId,
+          request: {
             kind,
             by,
             opId,
             at: nowIso(this.clock),
             ...(sealedBy ? { sealedBy } : {}),
-          };
-          return { ok: true };
-        });
+          },
+        }).catch(() => undefined);
       },
     };
   }
@@ -830,24 +842,33 @@ export class TaskEngine {
    * Mark live turn waiting_user for an RFD elicitation prompt (no AskBridge).
    * Returns turnId when a live turn was found.
    */
-  beginElicitationWait(
+  async beginElicitationWait(
     sessionId: string,
     promptId: string,
-  ): { turnId: string } | undefined {
+  ): Promise<{ turnId: string } | undefined> {
     const live = this.findLiveTurnBySessionId(sessionId);
     if (!live) return undefined;
     if (!this.mayDirectAskUser(sessionId)) return undefined;
-    const commit = this.store.commit((draft) => {
-      const turn = draft.turns[live.turnId];
-      if (!turn) return { ok: false, reason: 'turn not found' };
-      if (turn.status === 'waiting_user') return { ok: true };
-      if (turn.status !== 'running') return { ok: false, reason: 'turn is not live' };
-      const asked = registerAsk(turn);
-      if (!asked.ok) return asked;
-      draft.turns[live.turnId] = asked.next;
-      return { ok: true };
+    const current = await this.repository.getTurn(live.turnId);
+    if (!current) return undefined;
+    const expectedStatus = current.status === 'waiting_user'
+      ? 'waiting_user'
+      : current.status === 'running'
+        ? 'running'
+        : undefined;
+    if (!expectedStatus) return undefined;
+    const next = current.status === 'waiting_user'
+      ? current
+      : current.status === 'running'
+        ? registerAsk(current)
+        : undefined;
+    if (!next || ('ok' in next && !next.ok)) return undefined;
+    const turn = 'next' in next ? next.next : next;
+    const write = await this.repository.execute({
+      kind: 'recordAsk', workspaceId: this.workspaceId, turn,
+      expectedRuntimeEpoch: current.runtimeEpoch ?? 1,
     });
-    if (!commit.ok) return undefined;
+    if (!write.changed) return undefined;
     let set = this.elicitationWaitTokens.get(live.turnId);
     if (!set) {
       set = new Set();
@@ -858,20 +879,21 @@ export class TaskEngine {
   }
 
   /** Soft release: resume only if this token existed and set is now empty. */
-  endElicitationWait(turnId: string, promptId: string): void {
+  async endElicitationWait(turnId: string, promptId: string): Promise<void> {
     const set = this.elicitationWaitTokens.get(turnId);
     // Hard-cleared turns have no set — do not revive.
     if (!set || !set.has(promptId)) return;
     set.delete(promptId);
     if (set.size > 0) return;
     this.elicitationWaitTokens.delete(turnId);
-    this.store.commit((draft) => {
-      const turn = draft.turns[turnId];
-      if (!turn || turn.status !== 'waiting_user') return { ok: true };
-      const resumed = submitAnswer(turn);
-      if (resumed.ok) draft.turns[turnId] = resumed.next;
-      return { ok: true };
-    });
+    const current = await this.repository.getTurn(turnId);
+    if (!current || current.status !== 'waiting_user') return;
+    const resumed = submitAnswer(current);
+    if (!resumed.ok) return;
+    await this.repository.execute({
+      kind: 'answerAsk', workspaceId: this.workspaceId, turn: resumed.next,
+      expectedRuntimeEpoch: current.runtimeEpoch ?? 1,
+    }).catch(() => undefined);
   }
 
   /** Hard clear tokens without resuming (turn cancel / backend exit / deactivate). */
@@ -912,13 +934,15 @@ export class TaskEngine {
    * the live turn for `sessionId`, pause the turn as waiting_user, and return
    * the AskBridge promise the host can await for webview answers.
    */
-  registerAgentAsk(
+  async registerAgentAsk(
     sessionId: string,
     questions: import('../bridge/ask-bridge').Question[],
     deadlineMs: number,
   ):
+    Promise<
     | { ok: true; ref: AskRef; promise: Promise<Answers> }
-    | { ok: false; reason: string } {
+    | { ok: false; reason: string }
+    > {
     const live = this.findLiveTurnBySessionId(sessionId);
     if (!live) {
       return { ok: false, reason: 'no live turn for session' };
@@ -927,7 +951,7 @@ export class TaskEngine {
       return { ok: false, reason: 'questions required' };
     }
     // Non-root tasks must not reach the user by default (ask_parent path).
-    const liveTask = this.store.getFile().tasks[live.taskId];
+    const liveTask = await this.repository.getTask(live.taskId);
     if (liveTask?.parentId) {
       return {
         ok: false,
@@ -936,71 +960,65 @@ export class TaskEngine {
     }
     const askId = this.askBridge.generateAskId();
     const ref: AskRef = { taskId: live.taskId, turnId: live.turnId, askId };
-    const commit = this.store.commit((draft) => {
-      const turn = draft.turns[ref.turnId];
-      if (!turn) return { ok: false, reason: 'turn not found' };
-      if (turn.status === 'waiting_user') {
-        return { ok: true };
-      }
-      if (turn.status !== 'running') {
-        return { ok: false, reason: 'turn is not live' };
-      }
-      const asked = registerAsk(turn);
-      if (!asked.ok) return asked;
-      draft.turns[ref.turnId] = asked.next;
-      return { ok: true };
+    const turn = await this.repository.getTurn(ref.turnId);
+    if (!turn) return { ok: false, reason: 'turn not found' };
+    const expectedStatus = turn.status === 'waiting_user'
+      ? 'waiting_user'
+      : turn.status === 'running'
+        ? 'running'
+        : undefined;
+    if (!expectedStatus) return { ok: false, reason: 'turn is not live' };
+    const next = turn.status === 'waiting_user'
+      ? turn
+      : turn.status === 'running'
+        ? registerAsk(turn)
+        : undefined;
+    if (!next || ('ok' in next && !next.ok)) return { ok: false, reason: 'turn is not live' };
+    const write = await this.repository.execute({
+      kind: 'recordAsk', workspaceId: this.workspaceId,
+      turn: 'next' in next ? next.next : next,
+      expectedRuntimeEpoch: turn.runtimeEpoch ?? 1,
     });
-    if (!commit.ok) {
-      return { ok: false, reason: commit.detail ?? commit.reason };
-    }
+    if (!write.changed) return { ok: false, reason: write.reason ?? 'turn is not live' };
     const promise = this.askBridge.register(ref, questions, deadlineMs);
     return { ok: true, ref, promise };
   }
 
-  submitAskAnswer(ref: AskRef, answers: Answers): EngineResult<void> {
+  async submitAskAnswer(ref: AskRef, answers: Answers): Promise<EngineResult<void>> {
     if (!this.askBridge.hasPending(ref)) {
       return { ok: false, reason: 'no matching pending ask' };
     }
-    const commit = this.store.commit((draft) => {
-      const turn = draft.turns[ref.turnId];
-      if (!turn || turn.status !== 'waiting_user') {
-        return { ok: false, reason: 'turn is not waiting for user' };
-      }
-      const resumed = submitAnswer(turn);
-      if (!resumed.ok) return resumed;
-      draft.turns[ref.turnId] = resumed.next;
-      return { ok: true };
+    const turn = await this.repository.getTurn(ref.turnId);
+    if (!turn || turn.status !== 'waiting_user') return { ok: false, reason: 'turn is not waiting for user' };
+    const resumed = submitAnswer(turn);
+    if (!resumed.ok) return resumed;
+    const write = await this.repository.execute({
+      kind: 'answerAsk', workspaceId: this.workspaceId, turn: resumed.next,
+      expectedRuntimeEpoch: turn.runtimeEpoch ?? 1,
     });
-    if (!commit.ok) {
-      return { ok: false, reason: commit.detail ?? commit.reason };
-    }
+    if (!write.changed) return { ok: false, reason: write.reason ?? 'turn is not waiting for user' };
     if (!this.askBridge.submit(ref, answers)) {
       return { ok: false, reason: 'ask disappeared before submit' };
     }
     return { ok: true, value: undefined };
   }
 
-  cancelAskTurn(ref: AskRef): EngineResult<void> {
+  async cancelAskTurn(ref: AskRef): Promise<EngineResult<void>> {
     if (!this.askBridge.hasPending(ref)) {
       return { ok: false, reason: 'no matching pending ask' };
     }
     // Soft dismiss: commit the waiting_user → resumed transition first, then
     // reject the pending ask so MCP/agent paths can continue (cancelled).
     // Cancel only after commit so a failed commit leaves the ask retryable.
-    const commit = this.store.commit((draft) => {
-      const turn = draft.turns[ref.turnId];
-      if (!turn) return { ok: false, reason: 'turn not found' };
-      if (turn.status !== 'waiting_user') {
-        return { ok: false, reason: 'turn is not waiting for user' };
-      }
-      const resumed = submitAnswer(turn);
-      if (!resumed.ok) return resumed;
-      draft.turns[ref.turnId] = resumed.next;
-      return { ok: true };
+    const turn = await this.repository.getTurn(ref.turnId);
+    if (!turn || turn.status !== 'waiting_user') return { ok: false, reason: 'turn is not waiting for user' };
+    const resumed = submitAnswer(turn);
+    if (!resumed.ok) return resumed;
+    const write = await this.repository.execute({
+      kind: 'answerAsk', workspaceId: this.workspaceId, turn: resumed.next,
+      expectedRuntimeEpoch: turn.runtimeEpoch ?? 1,
     });
-    if (!commit.ok) {
-      return { ok: false, reason: commit.detail ?? commit.reason };
-    }
+    if (!write.changed) return { ok: false, reason: write.reason ?? 'turn is not waiting for user' };
     this.askBridge.cancel(ref, 'user dismissed ask');
     return { ok: true, value: undefined };
   }
@@ -1076,7 +1094,7 @@ export class TaskEngine {
     return engine;
   }
 
-  startNewTask(params: {
+  async startNewTask(params: {
     goal: string;
     backend: string;
     /** Model id selected for this task (ACP session config option value). */
@@ -1097,7 +1115,7 @@ export class TaskEngine {
     skills?: string[];
     /** Phase C idempotent send key. */
     clientRequestId?: string;
-  }): EngineResult<{ taskId: string; messageId: string; turnId: string; clientRequestId?: string }> {
+  }): Promise<EngineResult<{ taskId: string; messageId: string; turnId: string; clientRequestId?: string }>> {
     const trust = this.requireWorkspaceTrusted();
     if (!trust.ok) return trust;
     const backend = this.makeBackend(params.backend);
@@ -1124,7 +1142,7 @@ export class TaskEngine {
       goal: params.goal,
     });
     if (clientRequestId) {
-      const existing = this.store.getFile().sendReceipts?.[clientRequestId];
+      const existing = await this.repository.getSendReceipt(clientRequestId);
       if (existing) {
         if (existing.fingerprint !== fingerprint) {
           return { ok: false, reason: 'clientRequestId conflict: different payload' };
@@ -1182,68 +1200,81 @@ export class TaskEngine {
       },
     };
 
-    const commit = this.store.commit((draft) => {
+    // Root creation has no dependencies, so it never needs a materialized graph
+    // snapshot. Keep this intentionally tiny graph contract rather than reaching
+    // into TaskStoreFile for a callback mutation.
+    const created = createTask(input, {
+      rootId: taskId,
+      graph: { rootOf: () => undefined, dependsOn: () => [] },
+      now,
+    });
+    if (!created.ok) return created;
+    const task: MusterTask = { ...created.next, releasedAt: now };
+    const message: TaskMessage = {
+      id: messageId,
+      taskId,
+      role: 'user',
+      content: messageContent,
+      ...(agentContent ? { agentContent } : {}),
+      state: 'pending',
+      createdAt: now,
+    };
+    const queued = transitionStartTask(task, [], {
+      turnId,
+      now,
+      inputs: [{ kind: 'message', messageId }],
+    });
+    if (!queued.ok) return queued;
+    try {
+      const write = await this.repository.execute({
+        kind: 'createRootAndInitialTurn',
+        workspaceId: this.workspaceId,
+        task,
+        message,
+        turn: queued.next,
+        ...(clientRequestId
+          ? {
+              receipt: {
+                clientRequestId,
+                fingerprint,
+                taskId,
+                messageId,
+                turnId,
+                createdAt: now,
+              },
+            }
+          : {}),
+      });
+      if (!write.changed) {
+        return { ok: false, reason: write.reason ?? 'could not create task' };
+      }
+    } catch (error) {
+      // A resend racing the first request may hit the unique receipt after its
+      // preflight read. Re-read once: exact fingerprint is a normal idempotent
+      // replay; any other error remains visible to the host.
       if (clientRequestId) {
-        const race = draft.sendReceipts?.[clientRequestId];
+        const race = await this.repository.getSendReceipt(clientRequestId);
         if (race) {
           if (race.fingerprint !== fingerprint) {
             return { ok: false, reason: 'clientRequestId conflict: different payload' };
           }
-          return { ok: true };
+          void this.scheduleTurn(race.turnId);
+          return {
+            ok: true,
+            value: {
+              taskId: race.taskId,
+              messageId: race.messageId,
+              turnId: race.turnId,
+              clientRequestId,
+            },
+          };
         }
       }
-      if (draft.tasks[taskId]) {
-        return { ok: false, reason: 'task id already exists' };
-      }
-      const graph = depGraphFromFile(draft);
-      const created = createTask(input, { rootId: taskId, graph, now });
-      if (!created.ok) {
-        return created;
-      }
-      draft.tasks[taskId] = {
-        ...created.next,
-        releasedAt: now,
-      };
-
-      draft.messages[messageId] = {
-        id: messageId,
-        taskId,
-        role: 'user',
-        content: messageContent,
-        ...(agentContent ? { agentContent } : {}),
-        state: 'pending',
-        createdAt: now,
-      };
-
-      const queued = transitionStartTask(created.next, [], {
-        turnId,
-        now,
-        inputs: [{ kind: 'message', messageId }],
-      });
-      if (!queued.ok) {
-        return queued;
-      }
-      draft.turns[turnId] = queued.next;
-      if (clientRequestId) {
-        draft.sendReceipts = draft.sendReceipts ?? {};
-        draft.sendReceipts[clientRequestId] = {
-          clientRequestId,
-          fingerprint,
-          taskId,
-          messageId,
-          turnId,
-          createdAt: now,
-        };
-      }
-      return { ok: true };
-    });
-
-    if (!commit.ok) {
-      return { ok: false, reason: commit.detail ?? commit.reason };
+      return { ok: false, reason: error instanceof Error ? error.message : String(error) };
     }
 
     if (clientRequestId) {
-      const receipt = this.store.getFile().sendReceipts?.[clientRequestId];
+      const receipt = await this.repository.getSendReceipt(clientRequestId);
       if (receipt) {
         void this.scheduleTurn(receipt.turnId);
         return {
@@ -1350,6 +1381,49 @@ export class TaskEngine {
     };
   }
 
+  /** Repository-backed variant used by the host's interrupt-and-send action. */
+  async interruptAndSendAsync(
+    taskId: string,
+    instruction: string,
+  ): Promise<EngineResult<{
+    messageId: string;
+    turnId: string;
+    outcome: 'queued' | 'scheduled';
+    interruptedTurnId?: string;
+  }>> {
+    const live = (await this.repository.listTurns(taskId)).find(
+      (turn) => turn.status === 'running' || turn.status === 'waiting_user',
+    );
+    const sent = await this.sendAsync(taskId, instruction);
+    if (!sent.ok || !sent.value.turnId) {
+      return sent.ok
+        ? { ok: false, reason: 'send did not create a queued turn' }
+        : sent;
+    }
+    if (!live) {
+      return {
+        ok: true,
+        value: { messageId: sent.value.messageId, turnId: sent.value.turnId, outcome: 'scheduled' },
+      };
+    }
+    if (this.liveRuns.has(live.id)) {
+      this.interruptTurn(live.id);
+      return {
+        ok: true,
+        value: {
+          messageId: sent.value.messageId,
+          turnId: sent.value.turnId,
+          outcome: 'queued',
+          interruptedTurnId: live.id,
+        },
+      };
+    }
+    return {
+      ok: true,
+      value: { messageId: sent.value.messageId, turnId: sent.value.turnId, outcome: 'queued' },
+    };
+  }
+
   /** Durable queue row only — does not schedule or interrupt. */
   private reserveQueuedFollowUp(
     taskId: string,
@@ -1429,6 +1503,23 @@ export class TaskEngine {
     const promote = canPromoteTurn(this.store.getFile(), turnId, this.resourceLimits);
     if (!promote.ok) {
       return { ok: false, reason: promote.reason };
+    }
+    this.deferredQueuedTurns.delete(turnId);
+    void this.scheduleTurn(turnId);
+    return { ok: true, value: undefined };
+  }
+
+  async resumeQueuedTurnAsync(taskId: string, turnId: string): Promise<EngineResult<void>> {
+    const turn = (await this.repository.listTurns(taskId)).find((candidate) => candidate.id === turnId);
+    if (!turn) return { ok: false, reason: 'turn not found' };
+    if (turn.status !== 'queued') return { ok: false, reason: 'turn is not queued' };
+    if (turn.holdAutoPromote) {
+      const cleared = await this.repository.execute({
+        kind: 'clearQueuedTurnHold', workspaceId: this.workspaceId, taskId, turnId,
+      });
+      if (!cleared.changed) {
+        return { ok: false, reason: cleared.reason ?? 'turn is no longer queued' };
+      }
     }
     this.deferredQueuedTurns.delete(turnId);
     void this.scheduleTurn(turnId);
@@ -1829,6 +1920,140 @@ export class TaskEngine {
   }
 
   /**
+   * Async repository-backed host send path. Kept alongside the legacy sync
+   * method while the JSON adapter remains available to existing engine tests;
+   * extension-host requests use this path, so task/message/turn/receipt are one
+   * named transaction rather than a TaskStore callback.
+   */
+  async sendAsync(
+    taskId: string,
+    content: string,
+    options?: { agentContent?: string; clientRequestId?: string },
+  ): Promise<EngineResult<{ messageId: string; turnId?: string; clientRequestId?: string }>> {
+    const clientRequestId =
+      typeof options?.clientRequestId === 'string' && options.clientRequestId.trim()
+        ? options.clientRequestId.trim()
+        : undefined;
+    const agentContent =
+      options?.agentContent && options.agentContent !== content ? options.agentContent : undefined;
+    const fingerprint = sendFingerprint({ kind: 'existing', taskId, content, agentContent });
+    const replay = async (): Promise<EngineResult<{ messageId: string; turnId?: string; clientRequestId?: string }> | undefined> => {
+      if (!clientRequestId) return undefined;
+      const receipt = await this.repository.getSendReceipt(clientRequestId);
+      if (!receipt) return undefined;
+      if (receipt.fingerprint !== fingerprint) {
+        return { ok: false, reason: 'clientRequestId conflict: different payload' };
+      }
+      const task = await this.repository.getTask(taskId);
+      const handoffBusy = task?.handoff?.version === 1 && isActiveHandoffPhase(task.handoff.phase);
+      if (!handoffBusy && !this.deferredQueuedTurns.has(receipt.turnId)) {
+        void this.scheduleTurn(receipt.turnId);
+      }
+      return {
+        ok: true,
+        value: { messageId: receipt.messageId, turnId: receipt.turnId, clientRequestId },
+      };
+    };
+
+    const existing = await replay();
+    if (existing) return existing;
+
+    const current = await this.repository.getTask(taskId);
+    if (!current) return { ok: false, reason: 'task not found' };
+    const existingTurns = await this.repository.listTurns(taskId);
+    const now = nowIso(this.clock);
+    let nextTask = current;
+    if (isTerminalLifecycle(nextTask.lifecycle)) {
+      const reopened = reopenTask(nextTask, { now });
+      if (!reopened.ok) return reopened;
+      nextTask = reopened.next;
+    }
+    if (nextTask.outcomeProposal) {
+      nextTask = {
+        ...nextTask,
+        outcomeProposal: undefined,
+        revision: nextTask.revision + 1,
+        updatedAt: now,
+      };
+    }
+    if ((nextTask.releaseState ?? 'draft') === 'draft') {
+      nextTask = {
+        ...nextTask,
+        releaseState: 'released',
+        releasedAt: now,
+        releaseAttemptId: `host:send:${randomUUID()}`,
+        revision: nextTask.revision + 1,
+        updatedAt: now,
+      };
+    }
+    const epoch = nextTask.executionEpoch ?? 1;
+    const slotsUsed = existingTurns.filter(
+      (turn) => (turn.executionEpoch ?? 1) === epoch,
+    ).length;
+    if (slotsUsed >= effectiveTurnCap(nextTask, this.resourceLimits)) {
+      return { ok: false, reason: 'max turns per task exceeded' };
+    }
+
+    const messageId = randomUUID();
+    const turnId = randomUUID();
+    const message: TaskMessage = {
+      id: messageId,
+      taskId,
+      role: 'user',
+      content,
+      ...(agentContent ? { agentContent } : {}),
+      state: 'pending',
+      createdAt: now,
+    };
+    const queue = existingTurns.length === 0
+      ? transitionStartTask(nextTask, existingTurns, {
+          turnId, now, inputs: [{ kind: 'message', messageId }],
+        })
+      : transitionContinueTask(nextTask, existingTurns, {
+          turnId, now, inputs: [{ kind: 'message', messageId }],
+        });
+    if (!queue.ok) return queue;
+
+    try {
+      const write = await this.repository.execute({
+        kind: 'enqueueMessageTurn',
+        workspaceId: this.workspaceId,
+        expectedTaskRevision: current.revision,
+        maxTurnsPerTask: this.resourceLimits.maxTurnsPerTask,
+        task: nextTask,
+        message,
+        turn: queue.next,
+        ...(clientRequestId
+          ? {
+              receipt: {
+                clientRequestId,
+                fingerprint,
+                taskId,
+                messageId,
+                turnId,
+                createdAt: now,
+              },
+            }
+          : {}),
+      });
+      if (!write.changed) return { ok: false, reason: write.reason ?? 'task changed; retry send' };
+    } catch (error) {
+      const raced = await replay();
+      if (raced) return raced;
+      return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+    }
+
+    const handoffBusy = nextTask.handoff?.version === 1 && isActiveHandoffPhase(nextTask.handoff.phase);
+    if (!handoffBusy && !this.deferredQueuedTurns.has(turnId)) {
+      void this.scheduleTurn(turnId);
+    }
+    return {
+      ok: true,
+      value: { messageId, turnId, ...(clientRequestId ? { clientRequestId } : {}) },
+    };
+  }
+
+  /**
    * Hard upper bound for queued follow-up message content (edit path).
    * Host boundary may apply a tighter limit; this protects the engine store.
    */
@@ -1888,6 +2113,25 @@ export class TaskEngine {
     return { ok: true, value: { turnId, messageId: editedMessageId } };
   }
 
+  async editQueuedTurnAsync(
+    taskId: string,
+    turnId: string,
+    content: string,
+  ): Promise<EngineResult<{ turnId: string; messageId: string }>> {
+    if (typeof content !== 'string' || content.length > TaskEngine.MAX_QUEUED_MESSAGE_CHARS) {
+      return { ok: false, reason: 'invalid content' };
+    }
+    const normalized = content.trim();
+    if (!normalized) return { ok: false, reason: 'invalid content' };
+    const result = await this.repository.execute({
+      kind: 'editQueuedMessage', workspaceId: this.workspaceId, taskId, turnId, content: normalized,
+    });
+    if (!result.changed || !result.messageId) {
+      return { ok: false, reason: result.reason ?? 'turn is no longer queued' };
+    }
+    return { ok: true, value: { turnId, messageId: result.messageId } };
+  }
+
   /**
    * R013: remove an undispatched queued turn and its bound pending user message(s).
    * Does not cancelProcess, does not touch live/settled turns or task lifecycle.
@@ -1920,6 +2164,17 @@ export class TaskEngine {
       ok: true,
       value: { turnId, deletedMessageIds: deletedMessageIds ?? [] },
     };
+  }
+
+  async deleteQueuedTurnAsync(
+    taskId: string,
+    turnId: string,
+  ): Promise<EngineResult<{ turnId: string; deletedMessageIds: string[] }>> {
+    const result = await this.repository.execute({
+      kind: 'deleteQueuedTurnAndMessages', workspaceId: this.workspaceId, taskId, turnId,
+    });
+    if (!result.changed) return { ok: false, reason: result.reason ?? 'turn is no longer queued' };
+    return { ok: true, value: { turnId, deletedMessageIds: [...(result.deletedMessageIds ?? [])] } };
   }
 
   startTask(
@@ -2092,6 +2347,51 @@ export class TaskEngine {
     if (!commit.ok) {
       return { ok: false, reason: commit.detail ?? commit.reason };
     }
+    void this.scheduleTurn(newTurnId);
+    return { ok: true, value: { turnId: newTurnId } };
+  }
+
+  async retryTurnAsync(
+    taskId: string,
+    turnId: string,
+    instruction: string,
+    options?: { reuseOriginalInputs?: boolean },
+  ): Promise<EngineResult<{ turnId: string }>> {
+    const oldTurn = await this.repository.getTurn(turnId);
+    if (!oldTurn) return { ok: false, reason: 'turn not found' };
+    if (oldTurn.taskId !== taskId) return { ok: false, reason: 'turn does not belong to task' };
+    const task = await this.repository.getTask(oldTurn.taskId);
+    if (!task) return { ok: false, reason: 'turn not found' };
+    const turns = await this.repository.listTurns(task.id);
+    const now = nowIso(this.clock);
+    const newTurnId = randomUUID();
+    const retry = retryTurn(task, turns, oldTurn, {
+      turnId: newTurnId,
+      instruction,
+      now,
+      reuseOriginalInputs: options?.reuseOriginalInputs === true,
+    });
+    if (!retry.ok) return retry;
+    let nextTask = task;
+    if (
+      !task.committedSessionId &&
+      task.handoff?.version === 2 &&
+      task.handoff.continuation.status === 'assigned' &&
+      task.handoff.continuation.turnId === oldTurn.id
+    ) {
+      nextTask = {
+        ...task,
+        handoff: {
+          ...task.handoff,
+          continuation: { status: 'assigned', turnId: newTurnId, assignedAt: now },
+        },
+      };
+    }
+    const write = await this.repository.execute({
+      kind: 'retryTurn', workspaceId: this.workspaceId, expectedTaskRevision: task.revision,
+      maxTurnsPerTask: this.resourceLimits.maxTurnsPerTask, task: nextTask, turn: retry.next,
+    });
+    if (!write.changed) return { ok: false, reason: write.reason ?? 'task changed; retry' };
     void this.scheduleTurn(newTurnId);
     return { ok: true, value: { turnId: newTurnId } };
   }
@@ -3423,6 +3723,308 @@ export class TaskEngine {
     return promise;
   }
 
+  /**
+   * Deterministically freeze the state needed to dispatch one turn.  This is a
+   * pure draft transform: the caller persists its result through the named
+   * `prepareDispatch` repository command, whose transaction is the actual
+   * scheduler/claim gate.  Keeping prompt construction out of that transaction
+   * avoids holding the SQLite write lock while resolving host configuration.
+   */
+  private prepareDispatchDraft(
+    draft: TaskStoreFile,
+    turnId: string,
+    expectedTaskId: string,
+    now: string,
+  ): EngineResult<void> {
+    const draftTurn = draft.turns[turnId];
+    const draftTask = draft.tasks[expectedTaskId];
+    if (!draftTurn || draftTurn.status !== 'queued' || !draftTask) {
+      return { ok: false, reason: 'turn is no longer schedulable' };
+    }
+    const promote = canPromoteTurn(draft, turnId, this.resourceLimits);
+    if (!promote.ok) return { ok: false, reason: promote.reason };
+    if (isTerminalLifecycle(draftTask.lifecycle)) return { ok: false, reason: 'task is terminal' };
+    if ((draftTurn.runtimeEpoch ?? 1) !== (draftTask.runtimeEpoch ?? 1)) {
+      return { ok: false, reason: 'turn belongs to a superseded runtime binding' };
+    }
+
+    let turnForStart = draftTurn;
+    let taskForStart = draftTask;
+    const continuation = draftTask.handoff?.version === 2 ? draftTask.handoff : undefined;
+    const claimsContinuation =
+      continuation?.version === 2 &&
+      continuation.target.runtimeEpoch === (draftTurn.runtimeEpoch ?? 1) &&
+      (continuation.continuation.status === 'pending' ||
+        (continuation.continuation.status === 'assigned' &&
+          continuation.continuation.turnId === draftTurn.id));
+    const isFreshSessionTurn = draftTurn.sequence === 1 || claimsContinuation;
+
+    if (isFreshSessionTurn && draftTurn.resolvedInputs === undefined) {
+      let pins: import('./types').ResolvedInputPin[] = [];
+      const bindings = draftTask.inputBindings;
+      if (draftTurn.sequence === 1 && bindings && bindings.length > 0) {
+        const resolved = resolveInputBindings(bindings, draft.tasks);
+        if (!resolved.ok) {
+          draft.tasks[draftTask.id] = {
+            ...draftTask,
+            revision: draftTask.revision + 1,
+            updatedAt: now,
+            attention: {
+              code: 'missing_input', message: resolved.reason, at: now, sourceTurnId: turnId,
+            },
+          };
+          return { ok: true, value: undefined };
+        }
+        pins = resolved.pins;
+      }
+
+      const brief = draftTask.brief ?? synthesizeBriefFromGoal(draftTask.goal, draftTask.description);
+      const snapshot = this.resolveHostSnapshot(draftTask);
+      const registryCwd =
+        (draftTask.cwd && draftTask.cwd.length > 0 ? draftTask.cwd : undefined) ??
+        snapshot.cwd ?? this.workspaceFolder;
+      const registryResult = this.getTaskTypeRegistry
+        ? this.getTaskTypeRegistry(registryCwd)
+        : undefined;
+      const taskTypesForHost =
+        draftTask.role === 'coordinator'
+          ? summarizeTaskTypes(registryResult ?? {
+            status: 'empty' as const, registry: new Map(), diagnostics: [],
+          }).taskTypes
+          : undefined;
+      const assembled = assembleFirstTurnPrompt({
+        snapshot,
+        self: {
+          taskId: draftTask.id,
+          role: draftTask.role,
+          backend: draftTask.backend,
+          ...(draftTask.model !== undefined ? { model: draftTask.model } : {}),
+          ...(draftTask.parentId ? { parentTaskId: draftTask.parentId } : {}),
+          ...(draftTask.goal ? { goal: draftTask.goal } : {}),
+        },
+        tools: [...capabilitiesFor(draftTask)].sort(),
+        taskCwd: draftTask.cwd,
+        brief,
+        resolvedInputs: pins,
+        meta: { taskId: draftTask.id, goal: draftTask.goal },
+        ...(taskTypesForHost !== undefined ? { taskTypes: taskTypesForHost } : {}),
+        ...(this.getAdvertisedCommands?.(draftTask.backend) !== undefined
+          ? { advertisedCommands: this.getAdvertisedCommands!(draftTask.backend) }
+          : {}),
+        skillPrefix: this.getSkillPrefix?.(draftTask.backend) ?? '/',
+      });
+
+      if (!assembled.ok) {
+        for (const input of draftTurn.inputs) {
+          if (input.kind !== 'message') continue;
+          const message = draft.messages[input.messageId];
+          if (!message || message.taskId !== expectedTaskId) continue;
+          if (message.state === 'pending' || message.state === 'assigned') {
+            draft.messages[input.messageId] = { ...message, state: 'complete', turnId };
+          }
+        }
+        const started = startProcess(draftTurn, { now });
+        if (!started.ok) return { ok: false, reason: started.reason };
+        const failed = applyFailedTurn(draftTask, started.next, {
+          error: assembled.message,
+          retryCount: 0,
+          policy: draftTask.executionPolicy,
+          onExhausted: 'recover',
+          now,
+          failureClass: 'unclassified',
+        });
+        if (!failed.ok) return { ok: false, reason: failed.reason };
+        draft.tasks[draftTask.id] = {
+          ...failed.next.task,
+          attention: {
+            code: 'prompt_budget_exceeded', message: assembled.message, at: now, sourceTurnId: turnId,
+          },
+        };
+        draft.turns[turnId] = failed.next.turn;
+        return { ok: true, value: undefined };
+      }
+
+      const remainingContinuationBudget = Math.max(0, COMPILED_PROMPT_MAX - assembled.prompt.length - 2);
+      const compactContinuation = claimsContinuation && remainingContinuationBudget > 0
+        ? buildCompactContinuationContext(draft, draftTask.id, continuation!, Math.min(16_000, remainingContinuationBudget))
+        : undefined;
+      const pinned = pinResolvedInputs(
+        draftTurn,
+        pins,
+        compactContinuation ? `${assembled.prompt}\n\n${compactContinuation}` : assembled.prompt,
+      );
+      if (!pinned.ok) return { ok: false, reason: pinned.reason };
+      turnForStart = pinned.next;
+      if (claimsContinuation && continuation!.continuation.status === 'pending') {
+        taskForStart = {
+          ...taskForStart,
+          handoff: {
+            ...continuation!,
+            continuation: { status: 'assigned', turnId, assignedAt: now },
+          },
+        };
+        draft.tasks[draftTask.id] = taskForStart;
+      }
+      if (assembled.unavailableSkills.length > 0) {
+        taskForStart = {
+          ...taskForStart,
+          revision: draftTask.revision + 1,
+          updatedAt: now,
+          attention: {
+            code: 'skill_unavailable',
+            message: `Skill(s) not available on backend ${draftTask.backend}: ${assembled.unavailableSkills.join(', ')}`,
+            at: now,
+            sourceTurnId: turnId,
+          },
+        };
+        draft.tasks[draftTask.id] = taskForStart;
+      } else if (
+        draftTask.attention?.code === 'missing_input' ||
+        draftTask.attention?.code === 'prompt_budget_exceeded'
+      ) {
+        taskForStart = {
+          ...taskForStart, revision: draftTask.revision + 1, updatedAt: now, attention: undefined,
+        };
+        draft.tasks[draftTask.id] = taskForStart;
+      }
+    }
+
+    const inputs: TurnInput[] = [...turnForStart.inputs];
+    for (const input of inputs) {
+      if (input.kind !== 'message') continue;
+      const message = draft.messages[input.messageId];
+      if (!message || message.taskId !== expectedTaskId) continue;
+      if (message.state === 'pending' || message.state === 'assigned') {
+        draft.messages[input.messageId] = { ...message, state: 'assigned', turnId };
+      }
+    }
+    const started = startProcess({ ...turnForStart, inputs }, { now });
+    if (!started.ok) return { ok: false, reason: started.reason };
+    const frozenDeadline =
+      started.next.effectiveRunLimitMs !== undefined && started.next.runDeadlineAt
+        ? { effectiveRunLimitMs: started.next.effectiveRunLimitMs, runDeadlineAt: started.next.runDeadlineAt }
+        : resolveTurnRunDeadline(draftTask.executionPolicy, this.getRunLimitMs(), now);
+    draft.turns[turnId] = { ...started.next, ...frozenDeadline, dispatchPhase: 'pre_dispatch' };
+    return { ok: true, value: undefined };
+  }
+
+  /** Persist a prepared dispatch with optimistic task revision fencing. */
+  private async prepareAndPersistDispatch(
+    turnId: string,
+    expectedTaskId: string,
+    now: string,
+  ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const before = JSON.parse(JSON.stringify(this.store.getFile())) as TaskStoreFile;
+    const beforeTask = before.tasks[expectedTaskId];
+    if (!beforeTask) return { ok: false, reason: 'task not found' };
+    const prepared = this.prepareDispatchDraft(before, turnId, expectedTaskId, now);
+    if (!prepared.ok) return prepared;
+    const task = before.tasks[expectedTaskId];
+    const turn = before.turns[turnId];
+    if (!task || !turn) return { ok: false, reason: 'dispatch state disappeared' };
+    const messages = Object.values(before.messages).filter((message) => {
+      const prior = this.store.getFile().messages[message.id];
+      return JSON.stringify(prior) !== JSON.stringify(message);
+    });
+    let rootTaskId = task.id;
+    const seen = new Set<string>();
+    while (before.tasks[rootTaskId]?.parentId && !seen.has(rootTaskId)) {
+      seen.add(rootTaskId);
+      rootTaskId = before.tasks[rootTaskId]!.parentId!;
+    }
+    try {
+      const write = await this.repository.execute({
+        kind: 'prepareDispatch',
+        workspaceId: this.workspaceId,
+        expectedTaskRevision: beforeTask.revision,
+        task,
+        turn,
+        messages,
+        startedAt: now,
+        rootTaskId,
+        maxConcurrentTurns: this.resourceLimits.maxConcurrentTurns,
+        maxConcurrentPerRoot: this.resourceLimits.maxConcurrentPerRoot,
+        maxConcurrentPerBackend: this.resourceLimits.maxConcurrentPerBackend,
+        ...(task.committedSessionId ? { sessionId: task.committedSessionId } : {}),
+        resourceKeys: deriveResourceClaimKeys(task),
+      });
+      return write.changed
+        ? { ok: true }
+        : { ok: false, reason: write.reason ?? 'turn is no longer schedulable' };
+    } catch (error) {
+      return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  /** Persist a small live-turn activity change without materializing or
+   * mutating a TaskStoreFile. The repository re-checks the status and epoch in
+   * its own transaction, so late stream events cannot revive a superseded run. */
+  private async replaceLiveTurn(
+    turnId: string,
+    update: (turn: TaskTurn) => TaskTurn,
+  ): Promise<EngineResult<TaskTurn>> {
+    const current = await this.repository.getTurn(turnId);
+    if (!current || (current.status !== 'running' && current.status !== 'waiting_user')) {
+      return { ok: false, reason: 'turn is no longer live' };
+    }
+    const task = await this.repository.getTask(current.taskId);
+    const epoch = current.runtimeEpoch ?? 1;
+    if (!task || (task.runtimeEpoch ?? 1) !== epoch) {
+      return { ok: false, reason: 'runtime binding was superseded' };
+    }
+    const next = update(current);
+    const write = await this.repository.execute({
+      kind: 'replaceLiveTurn',
+      workspaceId: this.workspaceId,
+      turn: next,
+      expectedStatuses: [current.status],
+      expectedRuntimeEpoch: epoch,
+    });
+    return write.changed
+      ? { ok: true, value: next }
+      : { ok: false, reason: write.reason ?? 'turn is no longer live' };
+  }
+
+  /** Persist the compact diff produced by a terminal transition.  The command
+   * owns the terminal guard and claim release; this helper never sends a whole
+   * TaskStoreFile across the repository boundary. */
+  private async persistSettlementDraft(
+    before: TaskStoreFile,
+    draft: TaskStoreFile,
+    turnId: string,
+  ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const previousTurn = before.turns[turnId];
+    const nextTurn = draft.turns[turnId];
+    const nextTask = nextTurn ? draft.tasks[nextTurn.taskId] : undefined;
+    const previousTask = previousTurn ? before.tasks[previousTurn.taskId] : undefined;
+    if (!previousTurn || !previousTask || !nextTurn || !nextTask) {
+      return { ok: false, reason: 'settlement state disappeared' };
+    }
+    const relatedTurns = Object.values(draft.turns).filter(
+      (turn) => turn.id !== turnId && JSON.stringify(before.turns[turn.id]) !== JSON.stringify(turn),
+    );
+    const messages = Object.values(draft.messages).filter(
+      (message) => JSON.stringify(before.messages[message.id]) !== JSON.stringify(message),
+    );
+    try {
+      const write = await this.repository.execute({
+        kind: 'settleTurnAndApplyEffects',
+        workspaceId: this.workspaceId,
+        expectedTaskRevision: previousTask.revision,
+        task: nextTask,
+        turn: nextTurn,
+        expectedStatuses: previousTurn.status === 'waiting_user' ? ['waiting_user'] : ['running'],
+        relatedTurns,
+        messages,
+      });
+      return write.changed
+        ? { ok: true }
+        : { ok: false, reason: write.reason ?? 'turn is no longer live' };
+    } catch (error) {
+      return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
   private async executeTurn(turnId: string): Promise<void> {
     // Acquire the per-turn lease UNDER the cross-process store lock so lease
     // read/reclaim/publish is serialized across VS Code windows. This eliminates the
@@ -3462,253 +4064,7 @@ export class TaskEngine {
       await this.prepareHostForFirstTurn();
     }
 
-    const startCommit = this.store.commit((draft) => {
-      const draftTurn = draft.turns[turnId];
-      const draftTask = draft.tasks[turn.taskId];
-      if (!draftTurn || draftTurn.status !== 'queued' || !draftTask) {
-        return { ok: false, reason: 'turn is no longer schedulable' };
-      }
-      const promote = canPromoteTurn(draft, turnId, this.resourceLimits);
-      if (!promote.ok) {
-        return { ok: false, reason: promote.reason };
-      }
-      if (isTerminalLifecycle(draftTask.lifecycle)) {
-        return { ok: false, reason: 'task is terminal' };
-      }
-      if ((draftTurn.runtimeEpoch ?? 1) !== (draftTask.runtimeEpoch ?? 1)) {
-        return { ok: false, reason: 'turn belongs to a superseded runtime binding' };
-      }
-
-      // Single freeze site for a new task or first real turn after a switch.
-      // Presence of resolvedInputs (even []) is the durable pin marker — never re-assemble.
-      let turnForStart = draftTurn;
-      let taskForStart = draftTask;
-
-      const continuation = draftTask.handoff?.version === 2 ? draftTask.handoff : undefined;
-      const claimsContinuation =
-        continuation?.version === 2 &&
-        continuation.target.runtimeEpoch === (draftTurn.runtimeEpoch ?? 1) &&
-        (continuation.continuation.status === 'pending' ||
-          (continuation.continuation.status === 'assigned' &&
-            continuation.continuation.turnId === draftTurn.id));
-      const isFreshSessionTurn = draftTurn.sequence === 1 || claimsContinuation;
-
-      if (isFreshSessionTurn && draftTurn.resolvedInputs === undefined) {
-        let pins: import('./types').ResolvedInputPin[] = [];
-        const bindings = draftTask.inputBindings;
-        if (draftTurn.sequence === 1 && bindings && bindings.length > 0) {
-          const resolved = resolveInputBindings(bindings, draft.tasks);
-          if (!resolved.ok) {
-            draft.tasks[draftTask.id] = {
-              ...draftTask,
-              revision: draftTask.revision + 1,
-              updatedAt: now,
-              attention: {
-                code: 'missing_input',
-                message: resolved.reason,
-                at: now,
-                sourceTurnId: turnId,
-              },
-            };
-            // Leave turn queued; caller detects status !== running.
-            return { ok: true };
-          }
-          pins = resolved.pins;
-        }
-
-        const brief =
-          draftTask.brief ??
-          synthesizeBriefFromGoal(draftTask.goal, draftTask.description);
-        const snapshot = this.resolveHostSnapshot(draftTask);
-        const tools = [...capabilitiesFor(draftTask)].sort();
-        const registryCwd =
-          (draftTask.cwd && draftTask.cwd.length > 0 ? draftTask.cwd : undefined) ??
-          snapshot.cwd ??
-          this.workspaceFolder;
-        const registryResult = this.getTaskTypeRegistry
-          ? this.getTaskTypeRegistry(registryCwd)
-          : undefined;
-        // Coordinators always get taskTypes array (empty when unconfigured) for guidance.
-        const taskTypesForHost =
-          draftTask.role === 'coordinator'
-            ? summarizeTaskTypes(
-                registryResult ?? {
-                  status: 'empty' as const,
-                  registry: new Map(),
-                  diagnostics: [],
-                },
-              ).taskTypes
-            : undefined;
-        // Fail-closed skill injection: resolve the backend's advertised commands
-        // (undefined = UNKNOWN backend → optimistic inject). Read-only peek.
-        const advertisedCommands = this.getAdvertisedCommands?.(draftTask.backend);
-        // Per-backend skill invocation prefix (`/` default, `$` for Codex).
-        const skillPrefix = this.getSkillPrefix?.(draftTask.backend) ?? '/';
-        // Protected bootstrap/task layers first. Continuation shrinks to the
-        // remaining budget so history never displaces the common first-session contract.
-        const assembled = assembleFirstTurnPrompt({
-          snapshot,
-          self: {
-            taskId: draftTask.id,
-            role: draftTask.role,
-            backend: draftTask.backend,
-            ...(draftTask.model !== undefined ? { model: draftTask.model } : {}),
-            ...(draftTask.parentId ? { parentTaskId: draftTask.parentId } : {}),
-            ...(draftTask.goal ? { goal: draftTask.goal } : {}),
-          },
-          tools,
-          taskCwd: draftTask.cwd,
-          brief,
-          resolvedInputs: pins,
-          meta: { taskId: draftTask.id, goal: draftTask.goal },
-          ...(taskTypesForHost !== undefined ? { taskTypes: taskTypesForHost } : {}),
-          ...(advertisedCommands !== undefined ? { advertisedCommands } : {}),
-          skillPrefix,
-        });
-
-        if (!assembled.ok) {
-          // Budget fail: assign bound messages, fail turn in-commit (no adapter run).
-          for (const input of draftTurn.inputs) {
-            if (input.kind !== 'message') continue;
-            const message = draft.messages[input.messageId];
-            if (!message || message.taskId !== turn.taskId) continue;
-            if (message.state === 'pending' || message.state === 'assigned') {
-              draft.messages[input.messageId] = {
-                ...message,
-                state: 'complete',
-                turnId,
-              };
-            }
-          }
-          const started = startProcess(draftTurn, { now });
-          if (!started.ok) {
-            return started;
-          }
-          const failed = applyFailedTurn(draftTask, started.next, {
-            error: assembled.message,
-            retryCount: 0,
-            policy: draftTask.executionPolicy,
-            onExhausted: 'recover',
-            now,
-            failureClass: 'unclassified',
-          });
-          if (!failed.ok) {
-            return { ok: false, reason: failed.reason };
-          }
-          draft.tasks[draftTask.id] = {
-            ...failed.next.task,
-            attention: {
-              code: 'prompt_budget_exceeded',
-              message: assembled.message,
-              at: now,
-              sourceTurnId: turnId,
-            },
-          };
-          draft.turns[turnId] = failed.next.turn;
-          return { ok: true };
-        }
-
-        const remainingContinuationBudget = Math.max(
-          0,
-          COMPILED_PROMPT_MAX - assembled.prompt.length - 2,
-        );
-        const compactContinuation =
-          claimsContinuation && remainingContinuationBudget > 0
-            ? buildCompactContinuationContext(
-                draft,
-                draftTask.id,
-                continuation,
-                Math.min(16_000, remainingContinuationBudget),
-              )
-            : undefined;
-        const compiledPrompt = compactContinuation
-          ? `${assembled.prompt}\n\n${compactContinuation}`
-          : assembled.prompt;
-        const pinned = pinResolvedInputs(draftTurn, pins, compiledPrompt);
-        if (!pinned.ok) {
-          return { ok: false, reason: pinned.reason };
-        }
-        turnForStart = pinned.next;
-        if (claimsContinuation && continuation.continuation.status === 'pending') {
-          taskForStart = {
-            ...taskForStart,
-            handoff: {
-              ...continuation,
-              continuation: { status: 'assigned', turnId, assignedAt: now },
-            },
-          };
-          draft.tasks[draftTask.id] = taskForStart;
-        }
-        // First-turn attention (in-commit): raise skill_unavailable when declared
-        // skills are known-absent/invalid on this backend; otherwise clear any
-        // prior missing_input / budget attention now that freeze succeeded.
-        if (assembled.unavailableSkills.length > 0) {
-          taskForStart = {
-            ...taskForStart,
-            revision: draftTask.revision + 1,
-            updatedAt: now,
-            attention: {
-              code: 'skill_unavailable',
-              message: `Skill(s) not available on backend ${draftTask.backend}: ${assembled.unavailableSkills.join(', ')}`,
-              at: now,
-              sourceTurnId: turnId,
-            },
-          };
-          draft.tasks[draftTask.id] = taskForStart;
-        } else if (
-          draftTask.attention?.code === 'missing_input' ||
-          draftTask.attention?.code === 'prompt_budget_exceeded'
-        ) {
-          taskForStart = {
-            ...taskForStart,
-            revision: draftTask.revision + 1,
-            updatedAt: now,
-            attention: undefined,
-          };
-          draft.tasks[draftTask.id] = taskForStart;
-        }
-      }
-
-      // R012: assign only messages already bound to this turn. Do not sweep other
-      // pending user messages onto this turn (that batching is removed for FIFO).
-      const inputs: TurnInput[] = [...turnForStart.inputs];
-      for (const input of inputs) {
-        if (input.kind !== 'message') continue;
-        const message = draft.messages[input.messageId];
-        if (!message || message.taskId !== turn.taskId) continue;
-        if (message.state === 'pending' || message.state === 'assigned') {
-          draft.messages[input.messageId] = {
-            ...message,
-            state: 'assigned',
-            turnId,
-          };
-        }
-      }
-
-      const withInputs = { ...turnForStart, inputs };
-      const started = startProcess(withInputs, { now });
-      if (!started.ok) {
-        return started;
-      }
-      // Phase C: durable pre_dispatch until onBeforePrompt flips to prompt_outstanding.
-      const frozenDeadline =
-        started.next.effectiveRunLimitMs !== undefined && started.next.runDeadlineAt
-          ? {
-              effectiveRunLimitMs: started.next.effectiveRunLimitMs,
-              runDeadlineAt: started.next.runDeadlineAt,
-            }
-          : resolveTurnRunDeadline(
-              draftTask.executionPolicy,
-              this.getRunLimitMs(),
-              now,
-            );
-      draft.turns[turnId] = {
-        ...started.next,
-        ...frozenDeadline,
-        dispatchPhase: 'pre_dispatch',
-      };
-      return { ok: true };
-    });
+    const startCommit = await this.prepareAndPersistDispatch(turnId, turn.taskId, now);
 
     if (!startCommit.ok) {
       releaseLease(this.storePath, turnId, lease);
@@ -3775,28 +4131,23 @@ export class TaskEngine {
     // A recovered/frozen deadline may already be expired. Arm a zero-delay
     // watchdog instead of treating 0 as "no timeout" and running forever.
     const turnTimer = setTimeout(() => {
-      const timeoutTurn = this.store.getFile().turns[turnId];
-      const limitMs = timeoutTurn?.effectiveRunLimitMs ?? remainingRunMs;
-      const deadlineAt = timeoutTurn?.runDeadlineAt ?? new Date().toISOString();
-      this.store.commit((draft) => {
-        const live = draft.turns[turnId];
-        if (!live || (live.status !== 'running' && live.status !== 'waiting_user')) {
-          return { ok: true };
-        }
-        draft.turns[turnId] = {
-          ...live,
+      void (async () => {
+        const live = await this.repository.getTurn(turnId);
+        const limitMs = live?.effectiveRunLimitMs ?? remainingRunMs;
+        const deadlineAt = live?.runDeadlineAt ?? new Date().toISOString();
+        await this.replaceLiveTurn(turnId, (current) => ({
+          ...current,
           termination: { kind: 'run_timeout', limitMs, deadlineAt },
-        };
-        return { ok: true };
-      });
-      console.info('[muster][task-orch] turn.settle.timeout', {
-        taskId: taskForDispatch.id,
-        turnId,
-        backend: taskForDispatch.backend,
-        limitMs,
-        deadlineAt,
-      });
-      abort.abort();
+        })).catch(() => undefined);
+        console.info('[muster][task-orch] turn.settle.timeout', {
+          taskId: taskForDispatch.id,
+          turnId,
+          backend: taskForDispatch.backend,
+          limitMs,
+          deadlineAt,
+        });
+        abort.abort();
+      })();
     }, Math.max(0, remainingRunMs));
 
     let rawOutput = '';
@@ -3812,7 +4163,15 @@ export class TaskEngine {
       const liveHandle = this.liveRuns.get(turnId);
       if (liveHandle) liveHandle.nextOrder = nextOrder;
     }
-    let currentAssistantSegment: { storeId: string; sourceMessageId: string } | undefined;
+    let currentAssistantSegment: {
+      storeId: string;
+      sourceMessageId: string;
+      content: string;
+      createdAt: string;
+      order: number;
+    } | undefined;
+    let currentReasoning: PersistedReasoning | undefined;
+    const streamedTools = new Map<string, PersistedToolCall>();
     let mcpConfigPath: string | undefined;
 
     try {
@@ -3878,24 +4237,15 @@ export class TaskEngine {
       built.options = {
         ...built.options,
         onBeforePrompt: async () => {
-          const commit = this.store.commit((draft) => {
-            const t = draft.turns[turnId];
-            const currentTask = t ? draft.tasks[t.taskId] : undefined;
-            if (!t || (t.status !== 'running' && t.status !== 'waiting_user')) {
-              return { ok: false, reason: 'turn is not live for prompt dispatch marker' };
+          const commit = await this.replaceLiveTurn(turnId, (current) => {
+            if (current.dispatchPhase === 'prompt_outstanding' || current.dispatchPhase === 'terminal_received') {
+              return current;
             }
-            if (!currentTask || (t.runtimeEpoch ?? 1) !== (currentTask.runtimeEpoch ?? 1)) {
-              return { ok: false, reason: 'runtime binding was superseded before prompt dispatch' };
-            }
-            if (t.dispatchPhase === 'prompt_outstanding' || t.dispatchPhase === 'terminal_received') {
-              return { ok: true };
-            }
-            draft.turns[turnId] = { ...t, dispatchPhase: 'prompt_outstanding' };
-            return { ok: true };
+            return { ...current, dispatchPhase: 'prompt_outstanding' };
           });
           if (!commit.ok) {
             throw new Error(
-              `failed to persist prompt_outstanding dispatch marker: ${commit.detail ?? commit.reason}`,
+              `failed to persist prompt_outstanding dispatch marker: ${commit.reason}`,
             );
           }
         },
@@ -3940,18 +4290,10 @@ export class TaskEngine {
               observedSessionId = event.sessionId;
               const liveHandle = this.liveRuns.get(turnId);
               if (liveHandle) liveHandle.sessionId = event.sessionId;
-              this.store.commit((draft) => {
-                const draftTurn = draft.turns[turnId];
-                const draftTask = draftTurn ? draft.tasks[draftTurn.taskId] : undefined;
-                if (!draftTurn || !draftTask) {
-                  return { ok: false, reason: 'turn not found' };
-                }
-                if ((draftTurn.runtimeEpoch ?? 1) !== (draftTask.runtimeEpoch ?? 1)) {
-                  return { ok: true };
-                }
-                draft.turns[turnId] = { ...draftTurn, observedSessionId: event.sessionId };
-                return { ok: true };
-              });
+              await this.replaceLiveTurn(turnId, (current) => ({
+                ...current,
+                observedSessionId: event.sessionId,
+              })).catch(() => undefined);
             }
             break;
           case 'assistantDelta': {
@@ -3959,42 +4301,44 @@ export class TaskEngine {
             // changed (mirrors the live reducer). Segment store id = `${turnId}:${order}`.
             const openNew =
               !currentAssistantSegment || currentAssistantSegment.sourceMessageId !== event.messageId;
-            let segmentId: string;
-            let segmentOrder = -1;
             if (openNew) {
-              segmentOrder = nextOrder();
-              segmentId = `${turnId}:${segmentOrder}`;
-              currentAssistantSegment = { storeId: segmentId, sourceMessageId: event.messageId };
+              const order = nextOrder();
+              currentAssistantSegment = {
+                storeId: `${turnId}:${order}`,
+                sourceMessageId: event.messageId,
+                content: event.content,
+                createdAt: nowIso(this.clock),
+                order,
+              };
             } else {
-              segmentId = currentAssistantSegment!.storeId;
+              currentAssistantSegment = {
+                ...currentAssistantSegment!,
+                content: currentAssistantSegment!.content + event.content,
+              };
             }
-            const commit = this.store.commit((draft) => {
-              const draftTurn = draft.turns[turnId];
-              if (!draftTurn) {
-                return { ok: false, reason: 'turn not found' };
-              }
-              const existing = draft.messages[segmentId];
-              if (!existing) {
-                draft.messages[segmentId] = {
-                  id: segmentId,
-                  taskId: draftTurn.taskId,
+            const segment = currentAssistantSegment;
+            let failMessage: string | undefined;
+            try {
+              const persisted = await this.repository.execute({
+                kind: 'appendTranscriptBatch',
+                workspaceId: this.workspaceId,
+                taskId: eventTurn.taskId,
+                messages: [{
+                  id: segment.storeId,
+                  taskId: eventTurn.taskId,
                   role: 'assistant',
-                  content: event.content,
+                  content: segment.content,
                   state: 'partial',
-                  createdAt: nowIso(this.clock),
+                  createdAt: segment.createdAt,
                   turnId,
-                  order: segmentOrder,
-                };
-              } else {
-                draft.messages[segmentId] = {
-                  ...existing,
-                  content: existing.content + event.content,
-                };
-              }
-              return { ok: true };
-            });
-            if (!commit.ok) {
-              const failMessage = commit.detail ?? 'assistant persistence failed';
+                  order: segment.order,
+                }],
+              });
+              if (!persisted.changed) failMessage = persisted.reason ?? 'assistant persistence failed';
+            } catch (error) {
+              failMessage = error instanceof Error ? error.message : String(error);
+            }
+            if (failMessage) {
               terminalSettled = await this.settleFailed(
                 turnId,
                 failMessage,
@@ -4012,33 +4356,31 @@ export class TaskEngine {
               type: 'event',
               taskId: turn.taskId,
               turnId,
-              event: { type: 'assistantDelta', content: event.content, messageId: segmentId },
+              event: { type: 'assistantDelta', content: event.content, messageId: segment.storeId },
             });
             break;
           }
           case 'reasoningDelta': {
-            const commit = this.store.commit((draft) => {
-              const draftTurn = draft.turns[turnId];
-              if (!draftTurn) {
-                return { ok: false, reason: 'turn not found' };
-              }
-              draft.reasoning = draft.reasoning ?? {};
-              const now = nowIso(this.clock);
-              const existing = draft.reasoning[turnId];
-              draft.reasoning[turnId] = existing
-                ? { ...existing, content: existing.content + event.content, updatedAt: now }
-                : {
-                    id: turnId,
-                    taskId: draftTurn.taskId,
-                    turnId,
-                    content: event.content,
-                    createdAt: now,
-                    updatedAt: now,
-                  };
-              return { ok: true };
-            });
-            if (!commit.ok) {
-              const failMessage = commit.detail ?? 'reasoning persistence failed';
+            const at = nowIso(this.clock);
+            currentReasoning = currentReasoning
+              ? { ...currentReasoning, content: currentReasoning.content + event.content, updatedAt: at }
+              : {
+                  id: turnId, taskId: eventTurn.taskId, turnId, content: event.content,
+                  createdAt: at, updatedAt: at,
+                };
+            let failMessage: string | undefined;
+            try {
+              const persisted = await this.repository.execute({
+                kind: 'appendTranscriptBatch',
+                workspaceId: this.workspaceId,
+                taskId: eventTurn.taskId,
+                reasoning: [currentReasoning],
+              });
+              if (!persisted.changed) failMessage = persisted.reason ?? 'reasoning persistence failed';
+            } catch (error) {
+              failMessage = error instanceof Error ? error.message : String(error);
+            }
+            if (failMessage) {
               terminalSettled = await this.settleFailed(
                 turnId,
                 failMessage,
@@ -4057,32 +4399,33 @@ export class TaskEngine {
             // A tool closes the current assistant segment (matches live commitStreaming).
             currentAssistantSegment = undefined;
             const compositeId = `${turnId}:${event.toolCallId}`;
-            const commit = this.store.commit((draft) => {
-              const draftTurn = draft.turns[turnId];
-              if (!draftTurn) {
-                return { ok: false, reason: 'turn not found' };
-              }
-              draft.toolCalls = draft.toolCalls ?? {};
-              if (!draft.toolCalls[compositeId]) {
-                const now = nowIso(this.clock);
-                draft.toolCalls[compositeId] = {
-                  id: compositeId,
-                  taskId: draftTurn.taskId,
-                  turnId,
-                  toolCallId: event.toolCallId,
-                  order: nextOrder(),
-                  name: event.name,
-                  kind: event.kind,
-                  status: 'running',
-                  input: event.input,
-                  createdAt: now,
-                  updatedAt: now,
-                };
-              }
-              return { ok: true };
-            });
-            if (!commit.ok) {
-              const failMessage = commit.detail ?? 'tool persistence failed';
+            if (!streamedTools.has(compositeId)) {
+              const at = nowIso(this.clock);
+              streamedTools.set(compositeId, {
+                id: compositeId,
+                taskId: eventTurn.taskId,
+                turnId,
+                toolCallId: event.toolCallId,
+                order: nextOrder(),
+                name: event.name,
+                kind: event.kind,
+                status: 'running',
+                input: event.input,
+                createdAt: at,
+                updatedAt: at,
+              });
+            }
+            let failMessage: string | undefined;
+            try {
+              const persisted = await this.repository.execute({
+                kind: 'appendTranscriptBatch', workspaceId: this.workspaceId, taskId: eventTurn.taskId,
+                toolCalls: [streamedTools.get(compositeId)!],
+              });
+              if (!persisted.changed) failMessage = persisted.reason ?? 'tool persistence failed';
+            } catch (error) {
+              failMessage = error instanceof Error ? error.message : String(error);
+            }
+            if (failMessage) {
               terminalSettled = await this.settleFailed(
                 turnId,
                 failMessage,
@@ -4099,37 +4442,31 @@ export class TaskEngine {
           }
           case 'toolUpdated': {
             const compositeId = `${turnId}:${event.toolCallId}`;
-            const commit = this.store.commit((draft) => {
-              const draftTurn = draft.turns[turnId];
-              if (!draftTurn) {
-                return { ok: false, reason: 'turn not found' };
-              }
-              draft.toolCalls = draft.toolCalls ?? {};
-              const now = nowIso(this.clock);
-              const existing = draft.toolCalls[compositeId];
-              draft.toolCalls[compositeId] = existing
-                ? {
-                    ...existing,
-                    // Adapter `toolUpdated.input` is a full snapshot — replace, not merge.
-                    input: event.input !== undefined ? event.input : existing.input,
-                    updatedAt: now,
-                  }
-                : {
-                    id: compositeId,
-                    taskId: draftTurn.taskId,
-                    turnId,
-                    toolCallId: event.toolCallId,
-                    order: nextOrder(),
-                    name: 'tool',
-                    status: 'running',
-                    input: event.input,
-                    createdAt: now,
-                    updatedAt: now,
-                  };
-              return { ok: true };
-            });
-            if (!commit.ok) {
-              const failMessage = commit.detail ?? 'tool persistence failed';
+            const at = nowIso(this.clock);
+            const existing = streamedTools.get(compositeId);
+            const nextTool: PersistedToolCall = existing
+              ? {
+                  ...existing,
+                  input: event.input !== undefined ? event.input : existing.input,
+                  updatedAt: at,
+                }
+              : {
+                  id: compositeId, taskId: eventTurn.taskId, turnId, toolCallId: event.toolCallId,
+                  order: nextOrder(), name: 'tool', status: 'running', input: event.input,
+                  createdAt: at, updatedAt: at,
+                };
+            streamedTools.set(compositeId, nextTool);
+            let failMessage: string | undefined;
+            try {
+              const persisted = await this.repository.execute({
+                kind: 'appendTranscriptBatch', workspaceId: this.workspaceId, taskId: eventTurn.taskId,
+                toolCalls: [nextTool],
+              });
+              if (!persisted.changed) failMessage = persisted.reason ?? 'tool persistence failed';
+            } catch (error) {
+              failMessage = error instanceof Error ? error.message : String(error);
+            }
+            if (failMessage) {
               terminalSettled = await this.settleFailed(
                 turnId,
                 failMessage,
@@ -4147,39 +4484,38 @@ export class TaskEngine {
           case 'toolCompleted': {
             const compositeId = `${turnId}:${event.toolCallId}`;
             const outcome = event.outcome;
-            const commit = this.store.commit((draft) => {
-              const draftTurn = draft.turns[turnId];
-              if (!draftTurn) {
-                return { ok: false, reason: 'turn not found' };
-              }
-              draft.toolCalls = draft.toolCalls ?? {};
-              const now = nowIso(this.clock);
-              const existing = draft.toolCalls[compositeId];
-              const base =
-                existing ??
-                {
-                  id: compositeId,
-                  taskId: draftTurn.taskId,
-                  turnId,
-                  toolCallId: event.toolCallId,
-                  order: nextOrder(),
-                  name: 'tool',
-                  status: 'running' as const,
-                  createdAt: now,
-                  updatedAt: now,
-                };
-              draft.toolCalls[compositeId] = {
-                ...base,
-                status: outcome === 'error' ? 'error' : 'success',
-                updatedAt: now,
-                ...(outcome === 'error'
-                  ? { error: event.error, output: undefined }
-                  : { output: event.output, error: undefined }),
-              };
-              return { ok: true };
-            });
-            if (!commit.ok) {
-              const failMessage = commit.detail ?? 'tool persistence failed';
+            const at = nowIso(this.clock);
+            const base = streamedTools.get(compositeId) ?? {
+              id: compositeId,
+              taskId: eventTurn.taskId,
+              turnId,
+              toolCallId: event.toolCallId,
+              order: nextOrder(),
+              name: 'tool',
+              status: 'running' as const,
+              createdAt: at,
+              updatedAt: at,
+            };
+            const nextTool: PersistedToolCall = {
+              ...base,
+              status: outcome === 'error' ? 'error' : 'success',
+              updatedAt: at,
+              ...(outcome === 'error'
+                ? { error: event.error, output: undefined }
+                : { output: event.output, error: undefined }),
+            };
+            streamedTools.set(compositeId, nextTool);
+            let failMessage: string | undefined;
+            try {
+              const persisted = await this.repository.execute({
+                kind: 'appendTranscriptBatch', workspaceId: this.workspaceId, taskId: eventTurn.taskId,
+                toolCalls: [nextTool],
+              });
+              if (!persisted.changed) failMessage = persisted.reason ?? 'tool persistence failed';
+            } catch (error) {
+              failMessage = error instanceof Error ? error.message : String(error);
+            }
+            if (failMessage) {
               terminalSettled = await this.settleFailed(
                 turnId,
                 failMessage,
@@ -4374,7 +4710,9 @@ export class TaskEngine {
       // store lock is never held across the subprocess.
       const hostVerdict = this.computeHostVerdictForSettle(turnId);
       let missingSession = false;
-      const commit = this.store.commit((draft) => {
+      const before = JSON.parse(JSON.stringify(this.store.getFile())) as TaskStoreFile;
+      const draft = JSON.parse(JSON.stringify(before)) as TaskStoreFile;
+      const prepared = (() => {
         const turn = draft.turns[turnId];
         const task = turn ? draft.tasks[turn.taskId] : undefined;
         if (!turn || !task || turn.status !== 'running') {
@@ -4472,7 +4810,10 @@ export class TaskEngine {
         }
 
         return { ok: true };
-      });
+      })();
+      const commit = prepared.ok
+        ? await this.persistSettlementDraft(before, draft, turnId)
+        : prepared;
       if (commit.ok) {
         const file = this.store.getFile();
         const turn = file.turns[turnId];
@@ -4504,7 +4845,7 @@ export class TaskEngine {
       }
       console.info('[muster][task-orch] turn.settle.commit_failed', {
         turnId,
-        reason: commit.detail ?? commit.reason,
+        reason: commit.reason,
       });
       return false;
     } finally {
@@ -4618,7 +4959,9 @@ export class TaskEngine {
     this.settling.add(turnId);
     const now = nowIso(this.clock);
     try {
-      const commit = this.store.commit((draft) => {
+      const before = JSON.parse(JSON.stringify(this.store.getFile())) as TaskStoreFile;
+      const draft = JSON.parse(JSON.stringify(before)) as TaskStoreFile;
+      const prepared = (() => {
         const turn = draft.turns[turnId];
         if (!turn || (turn.status !== 'running' && turn.status !== 'waiting_user')) {
           return { ok: false, reason: 'turn is not live' };
@@ -4698,7 +5041,10 @@ export class TaskEngine {
           draft.tasks[turn.taskId] = nextTask;
         }
         return { ok: true };
-      });
+      })();
+      const commit = prepared.ok
+        ? await this.persistSettlementDraft(before, draft, turnId)
+        : prepared;
       return commit.ok;
     } finally {
       this.settling.delete(turnId);
@@ -4722,7 +5068,9 @@ export class TaskEngine {
     this.settling.add(turnId);
     const now = nowIso(this.clock);
     try {
-      const commit = this.store.commit((draft) => {
+      const before = JSON.parse(JSON.stringify(this.store.getFile())) as TaskStoreFile;
+      const draft = JSON.parse(JSON.stringify(before)) as TaskStoreFile;
+      const prepared = (() => {
         const turn = draft.turns[turnId];
         const task = turn ? draft.tasks[turn.taskId] : undefined;
         if (!turn || !task || turn.status !== 'running') {
@@ -4841,7 +5189,10 @@ export class TaskEngine {
           }
         }
         return { ok: true };
-      });
+      })();
+      const commit = prepared.ok
+        ? await this.persistSettlementDraft(before, draft, turnId)
+        : prepared;
 
       if (commit.ok) {
         const file = this.store.getFile();

@@ -65,7 +65,10 @@ import {
   listFileMentionSuggestions,
   type FileMentionSuggestionsRequest,
 } from './host/file-mention-suggestions';
-import { routeDeleteQueuedTurn, routeEditQueuedTurn } from './host/queued-turn-mutations';
+import {
+  routeDeleteQueuedTurnAsync,
+  routeEditQueuedTurnAsync,
+} from './host/queued-turn-mutations';
 import { routeExportTask } from './host/task-export-route';
 import { routeRuntimeHandoff } from './host/runtime-handoff-route';
 import { importDroppedFileBytes } from './host/import-dropped-file';
@@ -93,7 +96,10 @@ import { TaskEngine, type EngineEvent, viewStatusFromDraft } from './task/engine
 import type { HostEnvironmentSnapshot } from './task/host-context';
 import { TaskStore, computeAffectedTaskIds, type CommitResult } from './task/store';
 import { JsonTaskRepository, type TaskRepository } from './task/repository';
+import { DbClient, resolveWorkerPath } from './task/sqlite/client';
 import { probeNodeSqlite } from './task/sqlite/probe';
+import { WorkspaceRegistry } from './task/sqlite/workspace-registry';
+import { resolveWorkspaceIdentity, type WorkspaceContext } from './task/sqlite/workspace-identity';
 import { isTerminalLifecycle } from './task/transitions';
 import { resolveWorkspaceCwd } from './task/workspace-cwd';
 import type { TaskStoreFile } from './task/types';
@@ -117,6 +123,9 @@ let taskStore: TaskStore | undefined;
 let taskRepository: TaskRepository | undefined;
 let storePath: string | undefined;
 let workspaceRoot: string | undefined;
+/** SQLite stays shadow/registry-only until the Phase 5 migration cutover. */
+let sqliteClient: DbClient | undefined;
+let sqliteWorkspaceId: string | undefined;
 
 /** Shared host-env cache for first-turn inject + get_host_context (W1). */
 let hostEnvCache: HostEnvironmentSnapshot | undefined;
@@ -1706,7 +1715,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         usedDefaultBackend: data.backend === undefined,
       });
 
-      const result = taskEngine.startNewTask({
+      const result = await taskEngine.startNewTask({
         goal: shortGoal,
         message: text,
         agentMessage: llmText !== text ? llmText : undefined,
@@ -1806,7 +1815,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    const result = taskEngine.send(data.taskId, text, {
+    const result = await taskEngine.sendAsync(data.taskId, text, {
       agentContent: llmText !== text ? llmText : undefined,
       clientRequestId,
     });
@@ -1991,7 +2000,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           }
           break;
         case 'retryTurn':
-          if (!taskEngine || !taskStore) {
+          if (!taskEngine) {
             this.postCommandError('task engine not ready');
             break;
           }
@@ -2013,12 +2022,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
               this.postCommandError('instruction too long', data.taskId);
               break;
             }
-            const turn = taskStore.getFile().turns[data.turnId];
-            if (!turn || turn.taskId !== data.taskId) {
-              this.postCommandError('turn does not belong to task', data.taskId);
-              break;
-            }
-            const result = taskEngine.retryTurn(data.turnId, effectiveInstruction, {
+            const result = await taskEngine.retryTurnAsync(data.taskId, data.turnId, effectiveInstruction, {
               reuseOriginalInputs,
             });
             if (!result.ok) {
@@ -2045,7 +2049,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
               this.postCommandError('instruction too long', data.taskId);
               break;
             }
-            const result = taskEngine.continueTaskWithMessage(data.taskId, instruction);
+            const result = await taskEngine.sendAsync(data.taskId, instruction);
             if (!result.ok) {
               this.postCommandError(result.reason, data.taskId);
               break;
@@ -2085,7 +2089,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             this.postCommandError('instruction too long', taskId);
             break;
           }
-          const result = engine.interruptAndSend(taskId, instruction);
+          const result = await engine.interruptAndSendAsync(taskId, instruction);
           if (!result.ok) {
             this.postCommandError(result.reason, taskId);
             break;
@@ -2097,13 +2101,13 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           // R013: edit undispatched queued follow-up by turn identity.
           // Validate + engine.editQueuedTurn only; never continueTask fallthrough.
           const engine = taskEngine;
-          const outcome = routeEditQueuedTurn(data, {
+          const outcome = await routeEditQueuedTurnAsync(data, {
             engineReady: Boolean(engine),
-            editQueuedTurn: (taskId, turnId, content) => {
+            editQueuedTurn: async (taskId, turnId, content) => {
               if (!engine) {
                 return { ok: false, reason: 'task engine not ready' };
               }
-              return engine.editQueuedTurn(taskId, turnId, content);
+              return engine.editQueuedTurnAsync(taskId, turnId, content);
             },
           });
           if (outcome.kind === 'error') {
@@ -2118,13 +2122,13 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           // R013: remove undispatched queued follow-up by turn identity.
           // Validate + engine.deleteQueuedTurn only; never cancelProcess.
           const engine = taskEngine;
-          const outcome = routeDeleteQueuedTurn(data, {
+          const outcome = await routeDeleteQueuedTurnAsync(data, {
             engineReady: Boolean(engine),
-            deleteQueuedTurn: (taskId, turnId) => {
+            deleteQueuedTurn: async (taskId, turnId) => {
               if (!engine) {
                 return { ok: false, reason: 'task engine not ready' };
               }
-              return engine.deleteQueuedTurn(taskId, turnId);
+              return engine.deleteQueuedTurnAsync(taskId, turnId);
             },
           });
           if (outcome.kind === 'error') {
@@ -2135,7 +2139,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           break;
         }
         case 'resumeQueuedTurn':
-          if (!taskEngine || !taskStore) {
+          if (!taskEngine) {
             this.postCommandError('task engine not ready');
             break;
           }
@@ -2144,12 +2148,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             break;
           }
           {
-            const turn = taskStore.getFile().turns[data.turnId];
-            if (!turn || turn.taskId !== data.taskId) {
-              this.postCommandError('turn does not belong to task', data.taskId);
-              break;
-            }
-            const result = taskEngine.resumeQueuedTurn(data.turnId);
+            const result = await taskEngine.resumeQueuedTurnAsync(data.taskId, data.turnId);
             if (!result.ok) {
               this.postCommandError(result.reason, data.taskId);
             }
@@ -2220,10 +2219,10 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
               });
               break;
             }
-            const result = taskEngine?.submitAskAnswer(
+            const result = taskEngine ? await taskEngine.submitAskAnswer(
               { taskId: data.taskId, turnId: data.turnId, askId: data.askId },
               data.answers,
-            );
+            ) : undefined;
             if (!result || !result.ok) {
               const message = result?.reason ?? 'task engine unavailable';
               debugElicitation('host.ask_submit_rejected', {
@@ -2367,11 +2366,11 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             typeof data.turnId === 'string' &&
             typeof data.askId === 'string'
           ) {
-            const result = taskEngine?.cancelAskTurn({
+            const result = taskEngine ? await taskEngine.cancelAskTurn({
               taskId: data.taskId,
               turnId: data.turnId,
               askId: data.askId,
-            });
+            }) : undefined;
             if (!result || !result.ok) {
               const message = result?.reason ?? 'task engine unavailable';
               this.postCommandError(message, data.taskId);
@@ -2577,6 +2576,29 @@ function resolveTaskCwd(): string {
   return resolveWorkspaceCwd(folders, activeFile) ?? process.cwd();
 }
 
+/** Adapt VS Code's workspace shape to the pure registry identity contract. */
+function resolveCurrentWorkspaceIdentity(context: vscode.ExtensionContext) {
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  const workspaceFileUri = vscode.workspace.workspaceFile?.toString();
+  const workspaceContext: WorkspaceContext =
+    folders.length === 0
+      ? {
+          kind: 'empty',
+          // VS Code does not expose a stable profile UUID here. globalStorageUri
+          // is profile+extension-host scoped by contract, and its URI is stable
+          // across empty-window activations in that scope.
+          profileAuthority: `${vscode.env.remoteName ?? 'local'}:${context.globalStorageUri.toString()}`,
+        }
+      : folders.length === 1 && !workspaceFileUri
+        ? { kind: 'single-root', folderUri: folders[0]!.uri.toString() }
+        : {
+            kind: 'multi-root',
+            ...(workspaceFileUri ? { workspaceFileUri } : {}),
+            folderUris: folders.map((folder) => folder.uri.toString()),
+          };
+  return resolveWorkspaceIdentity(workspaceContext);
+}
+
 export async function activate(context: vscode.ExtensionContext) {
   await migrateLegacyRetentionSetting();
   // Patch PATH from the login shell BEFORE anything spawns a backend CLI, so a
@@ -2605,6 +2627,43 @@ export async function activate(context: vscode.ExtensionContext) {
   // create eagerly — otherwise lock creation fails with ENOENT and surfaces as the
   // misleading "could not acquire store lock".
   fs.mkdirSync(path.dirname(storePath), { recursive: true });
+
+  // Phase 1 registry runtime: open the single profile/authority database under
+  // globalStorage and resolve the current window to its durable UUID. JSON remains
+  // the writable task source until the later migration/cutover gate; this does not
+  // dual-write task state. Keeping the registry live now verifies worker packaging,
+  // WAL connection setup and workspace identity behavior in real extension hosts.
+  if (sqliteProbe.available) {
+    const candidate = new DbClient({ workerPath: resolveWorkerPath() });
+    try {
+      fs.mkdirSync(context.globalStorageUri.fsPath, { recursive: true });
+      await candidate.open(path.join(context.globalStorageUri.fsPath, 'muster.sqlite3'));
+      const workspace = await new WorkspaceRegistry(candidate).getOrCreate(
+        resolveCurrentWorkspaceIdentity(context),
+        new Date().toISOString(),
+      );
+      sqliteClient = candidate;
+      sqliteWorkspaceId = workspace.id;
+      debugMuster('sqlite.registry.ready', {
+        workspaceId: workspace.id,
+      });
+      context.subscriptions.push({
+        dispose: () => {
+          const current = sqliteClient;
+          sqliteClient = undefined;
+          sqliteWorkspaceId = undefined;
+          void current?.close();
+        },
+      });
+    } catch (error) {
+      await candidate.close();
+      // Advisory through Phase 4: JSON remains untouched and usable, but leave a
+      // clear diagnostic so a DB/worker packaging issue is not silently hidden.
+      debugMuster('sqlite.registry.unavailable', {
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
 
   runSessionMigration(context, workspaceRoot);
 
@@ -2936,7 +2995,7 @@ export async function activate(context: vscode.ExtensionContext) {
           debugElicitation('host.grok_prompt_cancelled', { reason: 'task engine unavailable' });
           return { outcome: 'cancelled' };
         }
-        const registered = engine.registerAgentAsk(
+        const registered = await engine.registerAgentAsk(
           req.sessionId,
           req.questions,
           USER_INTERACTION_TIMEOUT_MS,
@@ -3038,7 +3097,7 @@ export async function activate(context: vscode.ExtensionContext) {
         });
         let waitTurnId: string | undefined;
         if (form.sessionId && taskEngine) {
-          waitTurnId = taskEngine.beginElicitationWait(form.sessionId, promptId)?.turnId;
+          waitTurnId = (await taskEngine.beginElicitationWait(form.sessionId, promptId))?.turnId;
         }
         try {
           const result = await promise;
@@ -3049,12 +3108,12 @@ export async function activate(context: vscode.ExtensionContext) {
           });
           // Soft resume only if engine still owns this wait (hard clear drops tokens first).
           if (waitTurnId && taskEngine) {
-            taskEngine.endElicitationWait(waitTurnId, promptId);
+            await taskEngine.endElicitationWait(waitTurnId, promptId);
           }
           return result;
         } catch {
           if (waitTurnId && taskEngine) {
-            taskEngine.endElicitationWait(waitTurnId, promptId);
+            await taskEngine.endElicitationWait(waitTurnId, promptId);
           }
           return { action: 'cancel' as const };
         }
@@ -3107,7 +3166,7 @@ export async function activate(context: vscode.ExtensionContext) {
         }
       },
     });
-    taskRepository = new JsonTaskRepository(taskStore);
+    taskRepository = new JsonTaskRepository(taskStore, sqliteWorkspaceId ?? 'legacy-workspace');
     applyRetentionToStore(taskStore);
     lastObservedFile = JSON.parse(JSON.stringify(taskStore.getFile())) as TaskStoreFile;
     lastObservedRevision = taskStore.getFile().revision;
@@ -3125,6 +3184,8 @@ export async function activate(context: vscode.ExtensionContext) {
 
     taskEngine = TaskEngine.load({
       store: taskStore,
+      repository: taskRepository,
+      workspaceId: sqliteWorkspaceId ?? 'legacy-workspace',
       makeBackend,
       askBridge,
       credentialRegistry,
