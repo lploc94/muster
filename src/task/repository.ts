@@ -93,6 +93,11 @@ export type RepositoryCommand =
       kind: 'retryTurn'; workspaceId: string; expectedTaskRevision: number;
       maxTurnsPerTask: number; task: MusterTask; turn: TaskTurn;
     }
+  | {
+      /** Queue/start/continue boundary without a user message. */
+      kind: 'queueTaskTurn'; workspaceId: string; expectedTaskRevision: number;
+      maxTurnsPerTask: number; task: MusterTask; turn: TaskTurn;
+    }
   | { kind: 'upsertTask'; workspaceId: string; task: MusterTask }
   | { kind: 'deleteTask'; workspaceId: string; taskId: string }
   /** Atomically remove every idle/terminal root except the focused root. */
@@ -243,6 +248,8 @@ export interface TaskRepository {
   /** Current workspace revision without materializing the compatibility envelope. */
   getWorkspaceRevision?(): Promise<number>;
   execute(command: RepositoryCommand): Promise<RepositoryCommandResult>;
+  /** Test/legacy compatibility only; production runtime uses async execute(). */
+  executeSync?(command: RepositoryCommand): RepositoryCommandResult;
   /** Compatibility-only export/migration view; never expose this to mutation code. */
   readEnvelopeForMigration(): Promise<Readonly<TaskStoreFile>>;
 }
@@ -300,6 +307,20 @@ function validateRetryTurn(
   if (!command.turn.retryOf) return 'retry turn must reference an earlier turn';
   if ((command.turn.executionEpoch ?? 1) !== (command.task.executionEpoch ?? 1)) {
     return 'retry turn execution epoch mismatch';
+  }
+  return undefined;
+}
+
+function validateQueueTaskTurn(
+  command: Extract<RepositoryCommand, { kind: 'queueTaskTurn' }>,
+): string | undefined {
+  if (!Number.isInteger(command.maxTurnsPerTask) || command.maxTurnsPerTask < 1) {
+    return 'max turns per task must be a positive integer';
+  }
+  if (command.turn.taskId !== command.task.id) return 'queued turn task mismatch';
+  if (command.turn.status !== 'queued') return 'queued turn must be queued';
+  if ((command.turn.executionEpoch ?? 1) !== (command.task.executionEpoch ?? 1)) {
+    return 'queued turn execution epoch mismatch';
   }
   return undefined;
 }
@@ -600,7 +621,7 @@ export class JsonTaskRepository implements TaskRepository {
     return clone(this.store.getFile());
   }
 
-  async execute(command: RepositoryCommand): Promise<RepositoryCommandResult> {
+  executeSync(command: RepositoryCommand): RepositoryCommandResult {
     if (this.workspaceId !== undefined && this.workspaceId !== command.workspaceId) {
       throw new Error('repository workspace mismatch');
     }
@@ -680,6 +701,24 @@ export class JsonTaskRepository implements TaskRepository {
           if (draft.turns[command.turn.id]) return { ok: false, reason: 'turn already exists' };
           const epoch = command.task.executionEpoch ?? 1;
           const cap = Math.min(command.maxTurnsPerTask, current.executionPolicy.maxTurns);
+          const slotsUsed = Object.values(draft.turns).filter(
+            (candidate) => candidate.taskId === current.id && (candidate.executionEpoch ?? 1) === epoch,
+          ).length;
+          if (slotsUsed >= cap) return { ok: false, reason: 'max turns per task exceeded' };
+          draft.tasks[command.task.id] = clone(command.task);
+          draft.turns[command.turn.id] = clone(command.turn);
+          changed = true;
+          return { ok: true };
+        }
+        case 'queueTaskTurn': {
+          const invalid = validateQueueTaskTurn(command);
+          if (invalid) return { ok: false, reason: invalid };
+          const current = draft.tasks[command.task.id];
+          if (!current) return { ok: false, reason: 'task not found' };
+          if (current.revision !== command.expectedTaskRevision) return { ok: false, reason: 'task changed; retry' };
+          if (draft.turns[command.turn.id]) return { ok: false, reason: 'turn already exists' };
+          const cap = Math.min(command.maxTurnsPerTask, current.executionPolicy.maxTurns);
+          const epoch = command.task.executionEpoch ?? 1;
           const slotsUsed = Object.values(draft.turns).filter(
             (candidate) => candidate.taskId === current.id && (candidate.executionEpoch ?? 1) === epoch,
           ).length;
@@ -1130,6 +1169,10 @@ export class JsonTaskRepository implements TaskRepository {
       ...(messageId ? { messageId } : {}),
       ...(deletedMessageIds ? { deletedMessageIds } : {}),
     };
+  }
+
+  async execute(command: RepositoryCommand): Promise<RepositoryCommandResult> {
+    return this.executeSync(command);
   }
 }
 
@@ -1612,6 +1655,8 @@ export class SqliteTaskRepository implements TaskRepository {
         return this.enqueueMessageTurn(command);
       case 'retryTurn':
         return this.retryTurn(command);
+      case 'queueTaskTurn':
+        return this.queueTaskTurn(command);
       case 'upsertTask':
         return this.writeTask(command.task, true);
       case 'clearHistory':
@@ -1972,6 +2017,30 @@ export class SqliteTaskRepository implements TaskRepository {
       changed: (results[0]?.changes ?? 0) > 0,
       ...((results[0]?.changes ?? 0) === 0 ? { reason: 'task changed or max turns per task exceeded; retry' } : {}),
     };
+  }
+
+  private async queueTaskTurn(
+    command: Extract<RepositoryCommand, { kind: 'queueTaskTurn' }>,
+  ): Promise<RepositoryCommandResult> {
+    const invalid = validateQueueTaskTurn(command);
+    if (invalid) return { ok: true, changed: false, reason: invalid };
+    const rest: SqlStatement[] = [
+      { sql: 'DELETE FROM task_dependencies WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, command.task.id] },
+      ...command.task.dependencies.map((dependency) => dependencyStatement(this.workspaceId, command.task.id, dependency)),
+      turnStatement(this.workspaceId, command.turn, false),
+      ...command.turn.inputs.map((input, ordering) => turnInputStatement(this.workspaceId, command.turn.id, ordering, input)),
+    ];
+    const results = await this.writeIfFirstChanged(
+      guardedTaskUpdateStatement(this.workspaceId, command.task, command.expectedTaskRevision, command.maxTurnsPerTask),
+      rest,
+      [
+        { kind: 'task', id: command.task.id, change: 'queue' },
+        { kind: 'turn', id: command.turn.id, taskId: command.task.id, change: 'insert' },
+      ],
+      command.turn.createdAt,
+    );
+    const changed = (results[0]?.changes ?? 0) > 0;
+    return { ok: true, changed, ...(changed ? {} : { reason: 'task changed or max turns per task exceeded; retry' }) };
   }
 
   private async claimOperation(

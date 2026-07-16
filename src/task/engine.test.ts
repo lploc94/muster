@@ -2259,4 +2259,27 @@ describe('TaskEngine runtime switch v2', () => {
       taskId: 'repo-send', turnId: first.ok ? first.value.turnId : undefined,
     });
   });
+
+  it('queues async start/continue through named repository commands', async () => {
+    const { store } = makeTempStore();
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => scriptedBackend([], MCP_CAPS),
+      clock: () => '2026-07-16T15:00:00.000Z',
+    });
+    expect(engine.createTask({ id: 'async-queue', goal: 'queue', backend: 'fake' }).ok).toBe(true);
+    const started = await engine.startTaskAsync('async-queue');
+    expect(started).toMatchObject({ ok: true });
+    if (!started.ok) return;
+    await engine.whenIdle();
+    const continued = await engine.continueTaskAsync('async-queue', [{ kind: 'recovery', interruptedTurnId: started.value.turnId, instruction: 'continue' }]);
+    expect(continued).toMatchObject({ ok: true });
+    await engine.whenIdle();
+    if (!continued.ok) return;
+    const turns = store.getTurnsForTask('async-queue');
+    expect(turns.map((turn) => turn.id)).toEqual(expect.arrayContaining([
+      started.value.turnId,
+      continued.value.turnId,
+    ]));
+  });
 });

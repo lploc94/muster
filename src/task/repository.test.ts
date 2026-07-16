@@ -135,6 +135,20 @@ describe('SqliteTaskRepository', () => {
           expectedTaskRevision: 0, updatedAt: '2026-07-16T00:00:04.000Z',
         })).resolves.toMatchObject({ changed: false });
 
+        const queuedTask = makeTask(`history-queue-command-${index}`);
+        await repository.execute({ kind: 'createTask', workspaceId: 'ws', task: queuedTask });
+        await expect(repository.execute({
+          kind: 'queueTaskTurn', workspaceId: 'ws', expectedTaskRevision: queuedTask.revision,
+          maxTurnsPerTask: 10, task: queuedTask,
+          turn: {
+            id: `history-queue-turn-${index}`, taskId: queuedTask.id, sequence: 1,
+            status: 'queued', trigger: 'engine', inputs: [], createdAt: '2026-07-16T00:00:02.500Z',
+          },
+        })).resolves.toMatchObject({ changed: true });
+        await expect(repository.listTurns(queuedTask.id)).resolves.toMatchObject([
+          { id: `history-queue-turn-${index}`, status: 'queued' },
+        ]);
+
         await expect(repository.execute({
           kind: 'deleteTaskSubtreeIfIdle', workspaceId: 'ws', rootTaskId: queued.id,
         })).resolves.toMatchObject({ changed: false });

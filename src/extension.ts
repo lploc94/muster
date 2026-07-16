@@ -1927,7 +1927,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
               break;
             }
             const sessionId = turn.observedSessionId;
-            const result = taskEngine.interruptTurn(data.turnId);
+            const result = await taskEngine.interruptTurnAsync(data.turnId);
             if (!result.ok) {
               this.postCommandError(result.reason, data.taskId);
             } else if (sessionId) {

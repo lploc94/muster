@@ -68,7 +68,13 @@ import {
 import { TASK_ERROR_MAX_BYTES, TASK_RESULT_MAX_BYTES } from './content-limits';
 import { selectCommittedSessionId } from './session-select';
 import { TaskStore } from './store';
-import { deriveResourceClaimKeys, JsonTaskRepository, type TaskRepository } from './repository';
+import {
+  deriveResourceClaimKeys,
+  JsonTaskRepository,
+  type RepositoryCommand,
+  type RepositoryCommandResult,
+  type TaskRepository,
+} from './repository';
 import {
   applyDependencyTerminal,
   applyFailedTurn,
@@ -716,7 +722,24 @@ export class TaskEngine {
       ((commands, cwd) =>
         defaultRunVerificationGate(commands, cwd, {
           computeRevision: (c) => this.computeSourceRevision(c),
-        }));
+      }));
+  }
+
+  /**
+   * Synchronous compatibility bridge for legacy unit callers that construct the
+   * JSON adapter. Production/SQLite paths must use the async repository API;
+   * keeping this bridge here removes direct TaskStore mutation from engine code
+   * without pretending a worker-backed SQLite command can be synchronous.
+   */
+  private executeLegacySync(command: RepositoryCommand): RepositoryCommandResult {
+    if (!this.repository.executeSync) {
+      return { ok: true, changed: false, reason: 'use the async repository mutation path' };
+    }
+    try {
+      return this.repository.executeSync(command);
+    } catch (error) {
+      return { ok: true, changed: false, reason: error instanceof Error ? error.message : String(error) };
+    }
   }
 
   /** 2s-capped host prepare before sequence-1 assemble (single freeze site). */
@@ -1407,7 +1430,8 @@ export class TaskEngine {
       };
     }
     if (this.liveRuns.has(live.id)) {
-      this.interruptTurn(live.id);
+      const interrupted = await this.interruptTurnAsync(live.id);
+      if (!interrupted.ok) return interrupted;
       return {
         ok: true,
         value: {
@@ -1432,46 +1456,36 @@ export class TaskEngine {
     const messageId = randomUUID();
     const turnId = randomUUID();
     const now = nowIso(this.clock);
-
-    const commit = this.store.commit((draft) => {
-      const task = draft.tasks[taskId];
-      if (!task) {
-        return { ok: false, reason: 'task not found' };
-      }
-      if (isTerminalLifecycle(task.lifecycle)) {
-        return { ok: false, reason: 'task is terminal' };
-      }
-
-      draft.messages[messageId] = {
+    const file = this.store.getFile();
+    const task = file.tasks[taskId];
+    if (!task) return { ok: false, reason: 'task not found' };
+    if (isTerminalLifecycle(task.lifecycle)) return { ok: false, reason: 'task is terminal' };
+    const turnCap = canCreateTurn(file, taskId, this.resourceLimits);
+    if (!turnCap.ok) return turnCap;
+    const turns = turnsForTask(file, taskId);
+    const queued = transitionContinueTask(task, turns, {
+      turnId,
+      now,
+      inputs: [{ kind: 'message', messageId }],
+    });
+    if (!queued.ok) return queued;
+    const write = this.executeLegacySync({
+      kind: 'enqueueMessageTurn',
+      workspaceId: this.workspaceId,
+      expectedTaskRevision: task.revision,
+      maxTurnsPerTask: this.resourceLimits.maxTurnsPerTask,
+      task,
+      message: {
         id: messageId,
         taskId,
         role: 'user',
         content: instruction,
         state: 'pending',
         createdAt: now,
-      };
-
-      const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
-      if (!turnCap.ok) {
-        return turnCap;
-      }
-
-      const queued = transitionContinueTask(task, turnsForTask(draft, taskId), {
-        turnId,
-        now,
-        inputs: [{ kind: 'message', messageId }],
-      });
-      if (!queued.ok) {
-        return queued;
-      }
-      // Handoff barrier is canPromoteTurn (active handoff phase), not holdAutoPromote.
-      draft.turns[turnId] = queued.next;
-      return { ok: true };
+      },
+      turn: queued.next,
     });
-
-    if (!commit.ok) {
-      return { ok: false, reason: commit.detail ?? commit.reason };
-    }
+    if (!write.changed) return { ok: false, reason: write.reason ?? 'task changed; retry' };
     return { ok: true, value: { messageId, turnId } };
   }
 
@@ -1486,18 +1500,12 @@ export class TaskEngine {
     }
     // Explicit resume clears MEM030 hold so this turn may auto-promote.
     if (turn.holdAutoPromote) {
-      const clear = this.store.commit((draft) => {
-        const current = draft.turns[turnId];
-        if (!current || current.status !== 'queued') {
-          return { ok: false, reason: 'turn is not queued' };
-        }
-        const { holdAutoPromote: _hold, ...rest } = current;
-        void _hold;
-        draft.turns[turnId] = rest;
-        return { ok: true };
+      const clear = this.executeLegacySync({
+        kind: 'clearQueuedTurnHold', workspaceId: this.workspaceId,
+        taskId: turn.taskId, turnId,
       });
-      if (!clear.ok) {
-        return { ok: false, reason: clear.detail ?? clear.reason };
+      if (!clear.changed) {
+        return { ok: false, reason: clear.reason ?? 'turn is no longer queued' };
       }
     }
     const promote = canPromoteTurn(this.store.getFile(), turnId, this.resourceLimits);
@@ -1522,7 +1530,7 @@ export class TaskEngine {
       }
     }
     this.deferredQueuedTurns.delete(turnId);
-    void this.scheduleTurn(turnId);
+    await this.scheduleTurn(turnId);
     return { ok: true, value: undefined };
   }
 
@@ -1573,22 +1581,13 @@ export class TaskEngine {
       }),
     };
 
-    const commit = this.store.commit((draft) => {
-      if (draft.tasks[taskId]) {
-        return { ok: false, reason: 'task id already exists' };
-      }
-      const graph = depGraphFromFile(draft);
-      const result = createTask(input, { rootId: taskId, graph, now });
-      if (!result.ok) {
-        return result;
-      }
-      draft.tasks[taskId] = result.next;
-      return { ok: true };
-    });
-
-    if (!commit.ok) {
-      return { ok: false, reason: commit.detail ?? commit.reason };
-    }
+    const file = this.store.getFile();
+    if (file.tasks[taskId]) return { ok: false, reason: 'task id already exists' };
+    const graph = depGraphFromFile(file);
+    const result = createTask(input, { rootId: taskId, graph, now });
+    if (!result.ok) return result;
+    const write = this.executeLegacySync({ kind: 'createTask', workspaceId: this.workspaceId, task: result.next });
+    if (!write.changed) return { ok: false, reason: write.reason ?? 'could not create task' };
     return { ok: true, value: { taskId } };
   }
 
@@ -1738,185 +1737,75 @@ export class TaskEngine {
       agentContent,
     });
 
-    if (clientRequestId) {
-      const existing = this.store.getFile().sendReceipts?.[clientRequestId];
-      if (existing) {
-        if (existing.fingerprint !== fingerprint) {
-          return { ok: false, reason: 'clientRequestId conflict: different payload' };
-        }
-        const liveTask = this.store.getTask(taskId);
-        const handoffBusy =
-          liveTask?.handoff?.version === 1 && isActiveHandoffPhase(liveTask.handoff.phase);
-        if (
-          !handoffBusy &&
-          existing.turnId &&
-          !this.deferredQueuedTurns.has(existing.turnId)
-        ) {
-          void this.scheduleTurn(existing.turnId);
-        }
-        return {
-          ok: true,
-          value: {
-            messageId: existing.messageId,
-            turnId: existing.turnId,
-            clientRequestId,
-          },
-        };
+    const file = this.store.getFile();
+    const existing = clientRequestId ? file.sendReceipts?.[clientRequestId] : undefined;
+    if (existing) {
+      if (existing.fingerprint !== fingerprint) {
+        return { ok: false, reason: 'clientRequestId conflict: different payload' };
       }
+      const task = file.tasks[taskId];
+      const handoffBusy = task?.handoff?.version === 1 && isActiveHandoffPhase(task.handoff.phase);
+      if (!handoffBusy && !this.deferredQueuedTurns.has(existing.turnId)) {
+        void this.scheduleTurn(existing.turnId);
+      }
+      return { ok: true, value: { messageId: existing.messageId, turnId: existing.turnId, clientRequestId } };
     }
 
-    const messageId = randomUUID();
+    const current = file.tasks[taskId];
+    if (!current) return { ok: false, reason: 'task not found' };
     const now = nowIso(this.clock);
-    let queuedTurnId: string | undefined;
-
-    const commit = this.store.commit((draft) => {
-      if (clientRequestId) {
-        const race = draft.sendReceipts?.[clientRequestId];
-        if (race) {
-          if (race.fingerprint !== fingerprint) {
-            return { ok: false, reason: 'clientRequestId conflict: different payload' };
-          }
-          queuedTurnId = race.turnId;
-          return { ok: true };
-        }
-      }
-
-      let draftTask = draft.tasks[taskId];
-      if (!draftTask) {
-        return { ok: false, reason: 'task not found' };
-      }
-      // Any terminal lifecycle: reopen to open on the same task id, then queue.
-      if (isTerminalLifecycle(draftTask.lifecycle)) {
-        const reopened = reopenTask(draftTask, { now });
-        if (!reopened.ok) {
-          return reopened;
-        }
-        draft.tasks[taskId] = reopened.next;
-        draftTask = reopened.next;
-      }
-
-      // New user message supersedes a pending outcome proposal (implicit continue).
-      if (draftTask.outcomeProposal) {
-        draftTask = {
-          ...draftTask,
-          outcomeProposal: undefined,
-          revision: draftTask.revision + 1,
-          updatedAt: now,
-        };
-        draft.tasks[taskId] = draftTask;
-      }
-
-      // Host user send is create-and-run for drafts (same policy as startTask).
-      if ((draftTask.releaseState ?? 'draft') === 'draft') {
-        draftTask = {
-          ...draftTask,
-          releaseState: 'released',
-          releasedAt: now,
-          releaseAttemptId: `host:send:${randomUUID()}`,
-          revision: draftTask.revision + 1,
-          updatedAt: now,
-        };
-        draft.tasks[taskId] = draftTask;
-      }
-
-      // R012: every Enter/send becomes one distinct FIFO turn bound to this message.
-      // Concurrent sends while a turn is live/queued still create queued turns
-      // (scheduler promotes one-at-a-time). Refuse visibly when a turn cannot be
-      // created — never leave free-floating pending messages without turn identity.
-      // Phase B: free-form send after failed/interrupted is a normal continuation
-      // turn (not retryOf); needs_recovery no longer blocks admission.
-      // Active handoff does NOT block send — messages queue; canPromoteTurn gates promote.
-
-      const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
-      if (!turnCap.ok) {
-        return turnCap;
-      }
-
-      draft.messages[messageId] = {
-        id: messageId,
-        taskId,
-        role: 'user',
-        content,
-        ...(agentContent ? { agentContent } : {}),
-        state: 'pending',
-        createdAt: now,
+    let nextTask = current;
+    if (isTerminalLifecycle(nextTask.lifecycle)) {
+      const reopened = reopenTask(nextTask, { now });
+      if (!reopened.ok) return reopened;
+      nextTask = reopened.next;
+    }
+    if (nextTask.outcomeProposal) {
+      nextTask = { ...nextTask, outcomeProposal: undefined, revision: nextTask.revision + 1, updatedAt: now };
+    }
+    if ((nextTask.releaseState ?? 'draft') === 'draft') {
+      nextTask = {
+        ...nextTask,
+        releaseState: 'released',
+        releasedAt: now,
+        releaseAttemptId: `host:send:${randomUUID()}`,
+        revision: nextTask.revision + 1,
+        updatedAt: now,
       };
-
-      const turns = turnsForTask(draft, taskId);
-      const turnId = randomUUID();
-      const queue =
-        turns.length === 0
-          ? transitionStartTask(draftTask, turns, {
-              turnId,
-              now,
-              inputs: [{ kind: 'message', messageId }],
-            })
-          : transitionContinueTask(draftTask, turns, {
-              turnId,
-              now,
-              inputs: [{ kind: 'message', messageId }],
-            });
-      if (!queue.ok) {
-        // Roll back the message so we never persist orphan pending content.
-        delete draft.messages[messageId];
-        return queue;
-      }
-      // Admit during handoff; canPromoteTurn refuses until handoff is terminal.
-      draft.turns[turnId] = queue.next;
-      queuedTurnId = turnId;
-      if (clientRequestId) {
-        draft.sendReceipts = draft.sendReceipts ?? {};
-        draft.sendReceipts[clientRequestId] = {
-          clientRequestId,
-          fingerprint,
-          taskId,
-          messageId,
-          turnId,
-          createdAt: now,
-        };
-      }
-      return { ok: true };
-    });
-
-    if (!commit.ok) {
-      return { ok: false, reason: commit.detail ?? commit.reason };
     }
-
-    // Do not schedule while a runtime handoff is still active — release after rebind.
-    // canPromoteTurn also refuses during active handoff (without touching MEM030 holds).
-    const liveTask = this.store.getTask(taskId);
-    const handoffBusy =
-      liveTask?.handoff?.version === 1 && isActiveHandoffPhase(liveTask.handoff.phase);
-
-    if (clientRequestId) {
-      const receipt = this.store.getFile().sendReceipts?.[clientRequestId];
-      if (receipt) {
-        if (
-          receipt.turnId &&
-          !this.deferredQueuedTurns.has(receipt.turnId) &&
-          !handoffBusy
-        ) {
-          void this.scheduleTurn(receipt.turnId);
-        }
-        return {
-          ok: true,
-          value: {
-            messageId: receipt.messageId,
-            turnId: receipt.turnId,
-            clientRequestId,
-          },
-        };
-      }
-    }
-
-    if (queuedTurnId && !handoffBusy && !this.deferredQueuedTurns.has(queuedTurnId)) {
-      void this.scheduleTurn(queuedTurnId);
-    }
-
-    return {
-      ok: true,
-      value: { messageId, turnId: queuedTurnId, ...(clientRequestId ? { clientRequestId } : {}) },
+    const turns = turnsForTask(file, taskId);
+    const turnCap = canCreateTurn(file, taskId, this.resourceLimits);
+    if (!turnCap.ok) return turnCap;
+    const messageId = randomUUID();
+    const turnId = randomUUID();
+    const message: TaskMessage = {
+      id: messageId, taskId, role: 'user', content,
+      ...(agentContent ? { agentContent } : {}), state: 'pending', createdAt: now,
     };
+    const queue = turns.length === 0
+      ? transitionStartTask(nextTask, turns, { turnId, now, inputs: [{ kind: 'message', messageId }] })
+      : transitionContinueTask(nextTask, turns, { turnId, now, inputs: [{ kind: 'message', messageId }] });
+    if (!queue.ok) return queue;
+    const write = this.executeLegacySync({
+      kind: 'enqueueMessageTurn', workspaceId: this.workspaceId,
+      expectedTaskRevision: current.revision,
+      maxTurnsPerTask: this.resourceLimits.maxTurnsPerTask,
+      task: nextTask, message, turn: queue.next,
+      ...(clientRequestId ? {
+        receipt: { clientRequestId, fingerprint, taskId, messageId, turnId, createdAt: now },
+      } : {}),
+    });
+    if (!write.changed) {
+      const raced = clientRequestId ? this.store.getFile().sendReceipts?.[clientRequestId] : undefined;
+      if (raced && raced.fingerprint === fingerprint) {
+        void this.scheduleTurn(raced.turnId);
+        return { ok: true, value: { messageId: raced.messageId, turnId: raced.turnId, clientRequestId } };
+      }
+      return { ok: false, reason: write.reason ?? 'task changed; retry send' };
+    }
+    const handoffBusy = nextTask.handoff?.version === 1 && isActiveHandoffPhase(nextTask.handoff.phase);
+    if (!handoffBusy && !this.deferredQueuedTurns.has(turnId)) void this.scheduleTurn(turnId);
+    return { ok: true, value: { messageId, turnId, ...(clientRequestId ? { clientRequestId } : {}) } };
   }
 
   /**
@@ -2078,39 +1967,18 @@ export class TaskEngine {
       };
     }
 
-    let editedMessageId: string | undefined;
-    const commit = this.store.commit((draft) => {
-      if (!draft.tasks[taskId]) {
-        return { ok: false, reason: 'task not found' };
-      }
-      const prepared = prepareEditQueuedTurn(taskId, draft.turns[turnId], draft.messages, content);
-      if (!prepared.ok) {
-        return prepared;
-      }
-      const message = draft.messages[prepared.next.messageId];
-      if (!message) {
-        return { ok: false, reason: 'message not found' };
-      }
-      // Clear stale agentContent: edited display text must drive projectPrompt.
-      // Callers that expand mentions on edit can pass agentContent via a future
-      // option; plain edit replaces content and drops the prior expansion.
-      const { agentContent: _staleAgentContent, ...rest } = message;
-      void _staleAgentContent;
-      draft.messages[prepared.next.messageId] = {
-        ...rest,
-        content: prepared.next.content,
-      };
-      editedMessageId = prepared.next.messageId;
-      return { ok: true };
+    const file = this.store.getFile();
+    if (!file.tasks[taskId]) return { ok: false, reason: 'task not found' };
+    const prepared = prepareEditQueuedTurn(taskId, file.turns[turnId], file.messages, content);
+    if (!prepared.ok) return prepared;
+    const result = this.executeLegacySync({
+      kind: 'editQueuedMessage', workspaceId: this.workspaceId, taskId, turnId,
+      content: prepared.next.content,
     });
-
-    if (!commit.ok) {
-      return { ok: false, reason: commit.detail ?? commit.reason };
+    if (!result.changed || !result.messageId) {
+      return { ok: false, reason: result.reason ?? 'turn is no longer queued' };
     }
-    if (!editedMessageId) {
-      return { ok: false, reason: 'message not found' };
-    }
-    return { ok: true, value: { turnId, messageId: editedMessageId } };
+    return { ok: true, value: { turnId, messageId: result.messageId } };
   }
 
   async editQueuedTurnAsync(
@@ -2140,30 +2008,15 @@ export class TaskEngine {
     taskId: string,
     turnId: string,
   ): EngineResult<{ turnId: string; deletedMessageIds: string[] }> {
-    let deletedMessageIds: string[] | undefined;
-    const commit = this.store.commit((draft) => {
-      if (!draft.tasks[taskId]) {
-        return { ok: false, reason: 'task not found' };
-      }
-      const prepared = prepareDeleteQueuedTurn(taskId, draft.turns[turnId], draft.messages);
-      if (!prepared.ok) {
-        return prepared;
-      }
-      for (const messageId of prepared.next.messageIds) {
-        delete draft.messages[messageId];
-      }
-      delete draft.turns[turnId];
-      deletedMessageIds = prepared.next.messageIds;
-      return { ok: true };
+    const file = this.store.getFile();
+    if (!file.tasks[taskId]) return { ok: false, reason: 'task not found' };
+    const prepared = prepareDeleteQueuedTurn(taskId, file.turns[turnId], file.messages);
+    if (!prepared.ok) return prepared;
+    const result = this.executeLegacySync({
+      kind: 'deleteQueuedTurnAndMessages', workspaceId: this.workspaceId, taskId, turnId,
     });
-
-    if (!commit.ok) {
-      return { ok: false, reason: commit.detail ?? commit.reason };
-    }
-    return {
-      ok: true,
-      value: { turnId, deletedMessageIds: deletedMessageIds ?? [] },
-    };
+    if (!result.changed) return { ok: false, reason: result.reason ?? 'turn is no longer queued' };
+    return { ok: true, value: { turnId, deletedMessageIds: [...(result.deletedMessageIds ?? prepared.next.messageIds)] } };
   }
 
   async deleteQueuedTurnAsync(
@@ -2185,47 +2038,31 @@ export class TaskEngine {
     if (!trust.ok) return trust;
     const turnId = randomUUID();
     const now = nowIso(this.clock);
-    const commit = this.store.commit((draft) => {
-      const task = draft.tasks[taskId];
-      if (!task) {
-        return { ok: false, reason: 'task not found' };
-      }
-      if (isTerminalLifecycle(task.lifecycle)) {
-        return { ok: false, reason: 'task is terminal' };
-      }
-      // Host recovery / create-and-run: atomically release drafts in the same commit
-      // (coordinator MCP cannot start drafts — use release_tasks instead).
-      let taskForStart = task;
-      if ((task.releaseState ?? 'draft') === 'draft') {
-        taskForStart = {
-          ...task,
-          releaseState: 'released',
-          releasedAt: now,
-          releaseAttemptId: `host:startTask:${turnId}`,
-          revision: task.revision + 1,
-          updatedAt: now,
-        };
-        draft.tasks[taskId] = taskForStart;
-      }
-      const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
-      if (!turnCap.ok) {
-        return turnCap;
-      }
-      const result = transitionStartTask(taskForStart, turnsForTask(draft, taskId), {
-        turnId,
-        now,
-        inputs,
-        trigger: 'engine',
-      });
-      if (!result.ok) {
-        return result;
-      }
-      draft.turns[turnId] = result.next;
-      return { ok: true };
-    });
-    if (!commit.ok) {
-      return { ok: false, reason: commit.detail ?? commit.reason };
+    const file = this.store.getFile();
+    const task = file.tasks[taskId];
+    if (!task) return { ok: false, reason: 'task not found' };
+    if (isTerminalLifecycle(task.lifecycle)) return { ok: false, reason: 'task is terminal' };
+    let taskForStart = task;
+    if ((task.releaseState ?? 'draft') === 'draft') {
+      taskForStart = {
+        ...task,
+        releaseState: 'released', releasedAt: now,
+        releaseAttemptId: `host:startTask:${turnId}`,
+        revision: task.revision + 1, updatedAt: now,
+      };
     }
+    const turnCap = canCreateTurn(file, taskId, this.resourceLimits);
+    if (!turnCap.ok) return turnCap;
+    const result = transitionStartTask(taskForStart, turnsForTask(file, taskId), {
+      turnId, now, inputs, trigger: 'engine',
+    });
+    if (!result.ok) return result;
+    const write = this.executeLegacySync({
+      kind: 'queueTaskTurn', workspaceId: this.workspaceId,
+      expectedTaskRevision: task.revision, maxTurnsPerTask: this.resourceLimits.maxTurnsPerTask,
+      task: taskForStart, turn: result.next,
+    });
+    if (!write.changed) return { ok: false, reason: write.reason ?? 'task changed; retry' };
     void this.scheduleTurn(turnId);
     return { ok: true, value: { turnId } };
   }
@@ -2236,28 +2073,86 @@ export class TaskEngine {
   ): EngineResult<{ turnId: string }> {
     const turnId = randomUUID();
     const now = nowIso(this.clock);
-    const commit = this.store.commit((draft) => {
-      const task = draft.tasks[taskId];
-      if (!task) {
-        return { ok: false, reason: 'task not found' };
-      }
-      if (isTerminalLifecycle(task.lifecycle)) {
-        return { ok: false, reason: 'task is terminal' };
-      }
-      const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
-      if (!turnCap.ok) {
-        return turnCap;
-      }
-      const result = transitionContinueTask(task, turnsForTask(draft, taskId), { turnId, now, inputs });
-      if (!result.ok) {
-        return result;
-      }
-      draft.turns[turnId] = result.next;
-      return { ok: true };
+    const file = this.store.getFile();
+    const task = file.tasks[taskId];
+    if (!task) return { ok: false, reason: 'task not found' };
+    if (isTerminalLifecycle(task.lifecycle)) return { ok: false, reason: 'task is terminal' };
+    const turnCap = canCreateTurn(file, taskId, this.resourceLimits);
+    if (!turnCap.ok) return turnCap;
+    const result = transitionContinueTask(task, turnsForTask(file, taskId), { turnId, now, inputs });
+    if (!result.ok) return result;
+    const write = this.executeLegacySync({
+      kind: 'queueTaskTurn', workspaceId: this.workspaceId,
+      expectedTaskRevision: task.revision, maxTurnsPerTask: this.resourceLimits.maxTurnsPerTask,
+      task, turn: result.next,
     });
-    if (!commit.ok) {
-      return { ok: false, reason: commit.detail ?? commit.reason };
+    if (!write.changed) return { ok: false, reason: write.reason ?? 'task changed; retry' };
+    void this.scheduleTurn(turnId);
+    return { ok: true, value: { turnId } };
+  }
+
+  /** Repository-backed start boundary used by host/graph async callers. */
+  async startTaskAsync(
+    taskId: string,
+    inputs: TurnInput[] = [],
+  ): Promise<EngineResult<{ turnId: string }>> {
+    const trust = this.requireWorkspaceTrusted();
+    if (!trust.ok) return trust;
+    const task = await this.repository.getTask(taskId);
+    if (!task) return { ok: false, reason: 'task not found' };
+    if (isTerminalLifecycle(task.lifecycle)) return { ok: false, reason: 'task is terminal' };
+    const turns = await this.repository.listTurns(taskId);
+    if (turns.length > 0) return { ok: false, reason: 'startTask is only valid before the first turn' };
+    const now = nowIso(this.clock);
+    const turnId = randomUUID();
+    const nextTask = (task.releaseState ?? 'draft') === 'draft'
+      ? {
+          ...task,
+          releaseState: 'released' as const,
+          releasedAt: now,
+          releaseAttemptId: `host:startTask:${turnId}`,
+          revision: task.revision + 1,
+          updatedAt: now,
+        }
+      : task;
+    const result = transitionStartTask(nextTask, turns, { turnId, now, inputs, trigger: 'engine' });
+    if (!result.ok) return result;
+    const write = await this.repository.execute({
+      kind: 'queueTaskTurn', workspaceId: this.workspaceId,
+      expectedTaskRevision: task.revision,
+      maxTurnsPerTask: this.resourceLimits.maxTurnsPerTask,
+      task: nextTask, turn: result.next,
+    });
+    if (!write.changed) return { ok: false, reason: write.reason ?? 'task changed; retry' };
+    void this.scheduleTurn(turnId);
+    return { ok: true, value: { turnId } };
+  }
+
+  /** Repository-backed continuation boundary used by async graph/host callers. */
+  async continueTaskAsync(
+    taskId: string,
+    inputs: TurnInput[] = [],
+  ): Promise<EngineResult<{ turnId: string }>> {
+    const task = await this.repository.getTask(taskId);
+    if (!task) return { ok: false, reason: 'task not found' };
+    if (isTerminalLifecycle(task.lifecycle)) return { ok: false, reason: 'task is terminal' };
+    const turns = await this.repository.listTurns(taskId);
+    const cap = effectiveTurnCap(task, this.resourceLimits);
+    const epoch = task.executionEpoch ?? 1;
+    if (turns.filter((turn) => (turn.executionEpoch ?? 1) === epoch).length >= cap) {
+      return { ok: false, reason: 'max turns per task exceeded' };
     }
+    const now = nowIso(this.clock);
+    const turnId = randomUUID();
+    const result = transitionContinueTask(task, turns, { turnId, now, inputs });
+    if (!result.ok) return result;
+    const write = await this.repository.execute({
+      kind: 'queueTaskTurn', workspaceId: this.workspaceId,
+      expectedTaskRevision: task.revision,
+      maxTurnsPerTask: this.resourceLimits.maxTurnsPerTask,
+      task, turn: result.next,
+    });
+    if (!write.changed) return { ok: false, reason: write.reason ?? 'task changed; retry' };
     void this.scheduleTurn(turnId);
     return { ok: true, value: { turnId } };
   }
@@ -2297,6 +2192,25 @@ export class TaskEngine {
       handle.interruptArmed = true;
       handle.controller.abort();
     }
+    return { ok: true, value: undefined };
+  }
+
+  /** Durable interrupt request followed by aborting only a locally-owned run. */
+  async interruptTurnAsync(turnId: string): Promise<EngineResult<void>> {
+    const turn = await this.repository.getTurn(turnId);
+    if (!turn) return { ok: false, reason: 'turn not found' };
+    if (turn.status !== 'running' && turn.status !== 'waiting_user') {
+      return { ok: false, reason: 'turn is not live' };
+    }
+    const now = nowIso(this.clock);
+    const request = await this.repository.execute({
+      kind: 'putCancelRequest',
+      workspaceId: this.workspaceId,
+      turnId,
+      request: { kind: 'interrupt', by: 'user', opId: `interrupt:${turnId}:${now}`, at: now },
+    });
+    if (!request.changed) return { ok: false, reason: request.reason ?? 'turn is no longer live' };
+    this.interruptTurn(turnId);
     return { ok: true, value: undefined };
   }
 
