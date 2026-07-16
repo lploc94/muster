@@ -1708,6 +1708,7 @@
       oncompositionstart={onMentionCompositionStart}
       oncompositionend={onMentionCompositionEnd}
       spellcheck="true"
+      role="combobox"
       aria-autocomplete="list"
       aria-controls={mentionPopupVisible
         ? FILE_MENTION_LISTBOX_ID
