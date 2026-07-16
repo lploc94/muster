@@ -50,7 +50,9 @@ describe('buildTaskResultFromSummary', () => {
     const r = buildTaskResultFromSummary('hello');
     expect(r).toEqual({ version: 1, revision: 1, summary: 'hello' });
     const long = 'x'.repeat(TASK_RESULT_SUMMARY_MAX + 50);
-    expect(buildTaskResultFromSummary(long).summary.length).toBe(TASK_RESULT_SUMMARY_MAX);
+    const clamped = buildTaskResultFromSummary(long);
+    expect(clamped.truncated).toBe(true);
+    expect(Buffer.byteLength(clamped.summary, 'utf8')).toBeLessThanOrEqual(TASK_RESULT_SUMMARY_MAX);
   });
 
   it('increments revision from previous', () => {

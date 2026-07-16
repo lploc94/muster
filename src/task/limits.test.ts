@@ -5,6 +5,7 @@ import {
   clampExecutionPolicy,
   DEFAULT_EXECUTION_POLICY_BOUNDS,
   DEFAULT_RESOURCE_LIMITS,
+  HARD_BRIDGE_TOKEN_TTL_MS,
   MAX_BRIDGE_TOKEN_TTL_MS,
   type ExecutionPolicyBounds,
 } from './limits';
@@ -95,7 +96,7 @@ describe('bridgeTokenTtlMs', () => {
   });
 
   it('caps at hard bound', () => {
-    expect(bridgeTokenTtlMs(Number.MAX_SAFE_INTEGER)).toBe(7_200_000);
+    expect(bridgeTokenTtlMs(Number.MAX_SAFE_INTEGER)).toBe(HARD_BRIDGE_TOKEN_TTL_MS);
   });
 
   it('honours a custom cap', () => {
@@ -164,5 +165,42 @@ describe('canCreateTurn queued reservations', () => {
       reason: 'max turns per task exceeded',
     });
   });
-});
 
+  it('ignores retained turns from a previous execution epoch after reopen', () => {
+    const file: TaskStoreFile = {
+      schemaVersion: 6,
+      revision: 1,
+      tasks: {
+        t: {
+          id: 't',
+          role: 'coordinator',
+          lifecycle: 'open',
+          goal: 'reopened',
+          parentId: null,
+          dependencies: [],
+          backend: 'fake',
+          capabilities: [],
+          executionPolicy: { maxTurns: 1, maxAutomaticRetries: 0 },
+          executionEpoch: 2,
+          revision: 0,
+          createdAt: 't',
+          updatedAt: 't',
+        },
+      },
+      turns: {
+        old: {
+          id: 'old',
+          taskId: 't',
+          sequence: 1,
+          trigger: 'user',
+          status: 'succeeded',
+          executionEpoch: 1,
+          inputs: [],
+          createdAt: 't',
+        },
+      },
+      messages: {},
+    };
+    expect(canCreateTurn(file, 't', DEFAULT_RESOURCE_LIMITS)).toEqual({ ok: true });
+  });
+});

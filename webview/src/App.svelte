@@ -22,8 +22,9 @@
     PermissionModeSetting,
     PermissionSettingsSnapshot,
     PermissionSettingsUpdateResult,
-    RetentionSettingId,
-    RetentionSettingSnapshot,
+    RuntimeStorageSettingId,
+    RuntimeStorageSettingsSnapshot,
+    RunLimitSetting,
     SettingsUpdateResult,
     TaskTypeSettingsRow,
     TaskTypesSettingsSnapshot,
@@ -101,15 +102,15 @@
   const inChat = $derived(tasks.draftMode || !!tasks.focusedTaskId);
   let historyOpen = $state(false);
   let settingsOpen = $state(false);
-  let settingsSnapshot = $state<RetentionSettingSnapshot | null>(null);
+  let settingsSnapshot = $state<RuntimeStorageSettingsSnapshot | null>(null);
   let settingsLoading = $state(false);
-  let settingsSavingSettingId = $state<RetentionSettingId | null>(null);
+  let settingsSavingSettingId = $state<RuntimeStorageSettingId | null>(null);
   /** Retention-local success banner (never shown on Task Types). */
   let retentionSavedMessage = $state<string | null>(null);
   /** Retention-local alert for host write/load failures (never shown on Task Types). */
   let retentionError = $state<string | null>(null);
   /** Host-side field errors for Retention (validation codes from settingsUpdateResult). */
-  let retentionFieldErrors = $state<Partial<Record<RetentionSettingId, string>>>({});
+  let retentionFieldErrors = $state<Partial<Record<RuntimeStorageSettingId, string>>>({});
   let taskTypesSnapshot = $state<TaskTypesSettingsSnapshot | null>(null);
   let taskTypesLoading = $state(false);
   let taskTypesSaving = $state(false);
@@ -148,7 +149,7 @@
   let permissionDraftMode = $state<PermissionModeSetting | undefined>(
     restoredSettingsView.permissionDraftMode,
   );
-  let retentionLocalFieldErrors = $state<Partial<Record<RetentionSettingId, string>>>({});
+  let retentionLocalFieldErrors = $state<Partial<Record<RuntimeStorageSettingId, string>>>({});
   let taskTypesDraftError = $state<string | null>(null);
 
   function persistSettingsViewState() {
@@ -208,7 +209,7 @@
     persistSettingsViewState();
   }
 
-  function setRetentionLocalFieldErrors(next: Partial<Record<RetentionSettingId, string>>) {
+  function setRetentionLocalFieldErrors(next: Partial<Record<RuntimeStorageSettingId, string>>) {
     retentionLocalFieldErrors = { ...next };
   }
 
@@ -269,11 +270,11 @@
     post({ type: 'blurTask' });
   }
 
-  function updateSnapshotValue(settingId: RetentionSettingId, value: number) {
+  function updateSnapshotValue(settingId: RuntimeStorageSettingId, value: number | RunLimitSetting) {
     if (!settingsSnapshot) return;
     settingsSnapshot = {
       settings: settingsSnapshot.settings.map((setting) =>
-        setting.id === settingId ? { ...setting, value } : setting,
+        setting.id === settingId ? { ...setting, value } as typeof setting : setting,
       ),
     };
   }
@@ -306,7 +307,7 @@
     // Failure path intentionally does not touch Task Types state or force draft rehydrate.
   }
 
-  function saveSetting(settingId: RetentionSettingId, value: number) {
+  function saveSetting(settingId: RuntimeStorageSettingId, value: number | RunLimitSetting) {
     settingsSavingSettingId = settingId;
     retentionSavedMessage = null;
     retentionError = null;

@@ -1,215 +1,257 @@
 import packageJson from '../../package.json';
+import {
+  DEFAULT_RUN_LIMIT,
+  parseRunLimit,
+  type RunLimitSetting,
+} from '../task/execution-policy';
 
-export type RetentionSettingId = 'maxTurnsPerTask' | 'maxStoredOutputChars';
+export type RuntimeStorageSettingId =
+  | 'runLimit'
+  | 'maxRetainedTurnsPerTask'
+  | 'maxStoredOutputChars';
+/** Compatibility export for existing host/webview plumbing. */
+export type RetentionSettingId = RuntimeStorageSettingId;
 
-export type RetentionSettingErrorCode =
+export type RuntimeStorageSettingErrorCode =
   | 'unknownSetting'
   | 'invalidType'
+  | 'invalidEnum'
   | 'nonFinite'
   | 'nonInteger'
   | 'belowMinimum'
   | 'updateFailed';
+export type RetentionSettingErrorCode = RuntimeStorageSettingErrorCode;
 
-export interface RetentionSettingDefinition {
-  id: RetentionSettingId;
-  configKey: RetentionSettingId;
+interface EnumDefinition {
+  kind: 'enum';
+  id: 'runLimit';
+  configKey: 'runLimit';
+  label: string;
+  description: string;
+  defaultValue: RunLimitSetting;
+  options: RunLimitSetting[];
+}
+
+interface NumberDefinition {
+  kind: 'number';
+  id: 'maxRetainedTurnsPerTask' | 'maxStoredOutputChars';
+  configKey: 'maxRetainedTurnsPerTask' | 'maxStoredOutputChars';
   label: string;
   description: string;
   defaultValue: number;
   minimum: number;
 }
 
-export interface RetentionSettingValue {
-  id: RetentionSettingId;
-  label: string;
-  description: string;
-  value: number;
-  defaultValue: number;
-  minimum: number;
+export type RuntimeStorageSettingDefinition = EnumDefinition | NumberDefinition;
+export type RetentionSettingDefinition = RuntimeStorageSettingDefinition;
+
+export type RuntimeStorageSettingValue =
+  | (Omit<EnumDefinition, 'configKey'> & { value: RunLimitSetting })
+  | (Omit<NumberDefinition, 'configKey'> & { value: number });
+export type RetentionSettingValue = RuntimeStorageSettingValue;
+
+export interface RuntimeStorageSettingsSnapshot {
+  settings: RuntimeStorageSettingValue[];
+}
+export type RetentionSettingSnapshot = RuntimeStorageSettingsSnapshot;
+
+export type RuntimeStorageSettingsValidationResult =
+  | { ok: true; settingId: 'runLimit'; value: RunLimitSetting }
+  | {
+      ok: true;
+      settingId: 'maxRetainedTurnsPerTask' | 'maxStoredOutputChars';
+      value: number;
+    }
+  | {
+      ok: false;
+      settingId?: RuntimeStorageSettingId;
+      code: RuntimeStorageSettingErrorCode;
+      message: string;
+    };
+export type RetentionSettingsValidationResult = RuntimeStorageSettingsValidationResult;
+
+export interface RuntimeStorageSettingsConfiguration {
+  update(
+    key: RuntimeStorageSettingId,
+    value: number | RunLimitSetting,
+    target: unknown,
+  ): Thenable<void> | Promise<void> | void;
 }
 
-export interface RetentionSettingSnapshot {
-  settings: RetentionSettingValue[];
+export interface RuntimeStorageSettingsReadableConfiguration
+  extends RuntimeStorageSettingsConfiguration {
+  get(key: RuntimeStorageSettingId): unknown;
 }
+export type RetentionSettingsConfiguration = RuntimeStorageSettingsConfiguration;
+export type RetentionSettingsReadableConfiguration = RuntimeStorageSettingsReadableConfiguration;
 
-export type RetentionSettingsValidationResult =
-  | { ok: true; settingId: RetentionSettingId; value: number }
-  | { ok: false; settingId?: RetentionSettingId; code: RetentionSettingErrorCode; message: string };
-
-export interface RetentionSettingsConfiguration {
-  update(key: RetentionSettingId, value: number, target: unknown): Thenable<void> | Promise<void> | void;
-}
-
-export interface RetentionSettingsReadableConfiguration extends RetentionSettingsConfiguration {
-  get(key: RetentionSettingId): unknown;
-}
-
-export type RetentionSettingsHostMessage =
-  | { type: 'settingsUpdateResult'; result: RetentionSettingsValidationResult }
-  | { type: 'settingsSnapshot'; snapshot: RetentionSettingSnapshot };
+export type RuntimeStorageSettingsHostMessage =
+  | { type: 'settingsUpdateResult'; result: RuntimeStorageSettingsValidationResult }
+  | { type: 'settingsSnapshot'; snapshot: RuntimeStorageSettingsSnapshot };
+export type RetentionSettingsHostMessage = RuntimeStorageSettingsHostMessage;
 
 const properties = packageJson.contributes.configuration.properties;
+const runProperty = properties['muster.execution.runLimit'];
+const retainedProperty = properties['muster.retention.maxRetainedTurnsPerTask'];
+const outputProperty = properties['muster.retention.maxStoredOutputChars'];
 
-/** Shape of a `muster.retention.*` package.json configuration property. Cast at
- * the read site below because `properties` also holds non-retention entries
- * (e.g. `muster.permissions.mode`, an enum/string property) whose union would
- * otherwise widen `default`/`minimum` to types retention settings never use. */
-interface RetentionConfigProperty {
-  readonly default: number;
-  readonly minimum: number;
-  readonly description: string;
-}
-
-function packageProperty(settingId: RetentionSettingId): RetentionConfigProperty {
-  return properties[`muster.retention.${settingId}` as keyof typeof properties] as unknown as RetentionConfigProperty;
-}
-
-export const RETENTION_SETTING_DEFINITIONS: RetentionSettingDefinition[] = [
+export const RUNTIME_STORAGE_SETTING_DEFINITIONS: RuntimeStorageSettingDefinition[] = [
   {
-    id: 'maxTurnsPerTask',
-    configKey: 'maxTurnsPerTask',
-    label: 'Max turns per task',
-    description: packageProperty('maxTurnsPerTask').description,
-    defaultValue: packageProperty('maxTurnsPerTask').default,
-    minimum: packageProperty('maxTurnsPerTask').minimum,
+    kind: 'enum',
+    id: 'runLimit',
+    configKey: 'runLimit',
+    label: 'Maximum uninterrupted agent run',
+    description: runProperty.description,
+    defaultValue: DEFAULT_RUN_LIMIT,
+    options: [...runProperty.enum] as RunLimitSetting[],
   },
   {
+    kind: 'number',
+    id: 'maxRetainedTurnsPerTask',
+    configKey: 'maxRetainedTurnsPerTask',
+    label: 'Retained turns per completed task',
+    description: retainedProperty.description,
+    defaultValue: retainedProperty.default,
+    minimum: retainedProperty.minimum,
+  },
+  {
+    kind: 'number',
     id: 'maxStoredOutputChars',
     configKey: 'maxStoredOutputChars',
-    label: 'Max stored output characters',
-    description: packageProperty('maxStoredOutputChars').description,
-    defaultValue: packageProperty('maxStoredOutputChars').default,
-    minimum: packageProperty('maxStoredOutputChars').minimum,
+    label: 'Stored output per turn',
+    description: outputProperty.description,
+    defaultValue: outputProperty.default,
+    minimum: outputProperty.minimum,
   },
 ];
+export const RETENTION_SETTING_DEFINITIONS = RUNTIME_STORAGE_SETTING_DEFINITIONS;
 
-export function isRetentionSettingId(value: unknown): value is RetentionSettingId {
-  return value === 'maxTurnsPerTask' || value === 'maxStoredOutputChars';
+/** New explicit value wins; legacy explicit value is the one-release fallback. */
+export function selectRetainedTurnsValue(
+  nextExplicit: unknown,
+  legacyExplicit: unknown,
+  configuredDefault: unknown,
+): unknown {
+  return nextExplicit !== undefined
+    ? nextExplicit
+    : legacyExplicit !== undefined
+      ? legacyExplicit
+      : configuredDefault;
 }
 
-export function retentionSettingDefinition(settingId: RetentionSettingId): RetentionSettingDefinition {
-  return RETENTION_SETTING_DEFINITIONS.find((definition) => definition.id === settingId)!;
+export function isRetentionSettingId(value: unknown): value is RuntimeStorageSettingId {
+  return value === 'runLimit' ||
+    value === 'maxRetainedTurnsPerTask' ||
+    value === 'maxStoredOutputChars';
 }
 
-function isValidRetentionSettingValue(value: unknown, definition: RetentionSettingDefinition): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) && value >= definition.minimum;
+export function retentionSettingDefinition(
+  settingId: RuntimeStorageSettingId,
+): RuntimeStorageSettingDefinition {
+  return RUNTIME_STORAGE_SETTING_DEFINITIONS.find((definition) => definition.id === settingId)!;
 }
 
-export function buildRetentionSettingsSnapshot(readConfigValue: (key: RetentionSettingId) => unknown): RetentionSettingSnapshot {
+export function buildRetentionSettingsSnapshot(
+  readConfigValue: (key: RuntimeStorageSettingId) => unknown,
+): RuntimeStorageSettingsSnapshot {
   return {
-    settings: RETENTION_SETTING_DEFINITIONS.map((definition) => {
+    settings: RUNTIME_STORAGE_SETTING_DEFINITIONS.map((definition) => {
       const configuredValue = readConfigValue(definition.configKey);
-      const value = isValidRetentionSettingValue(configuredValue, definition)
-        ? configuredValue
-        : definition.defaultValue;
-
+      if (definition.kind === 'enum') {
+        const value = parseRunLimit(configuredValue);
+        return {
+          kind: definition.kind,
+          id: definition.id,
+          label: definition.label,
+          description: definition.description,
+          defaultValue: definition.defaultValue,
+          options: definition.options,
+          value,
+        };
+      }
+      const value =
+        typeof configuredValue === 'number' &&
+        Number.isFinite(configuredValue) &&
+        Number.isInteger(configuredValue) &&
+        configuredValue >= definition.minimum
+          ? configuredValue
+          : definition.defaultValue;
       return {
+        kind: definition.kind,
         id: definition.id,
         label: definition.label,
         description: definition.description,
-        value,
         defaultValue: definition.defaultValue,
         minimum: definition.minimum,
+        value,
       };
     }),
   };
 }
 
-export function validateRetentionSettingUpdate(input: unknown): RetentionSettingsValidationResult {
-  if (typeof input !== 'object' || input === null) {
-    return {
-      ok: false,
-      code: 'unknownSetting',
-      message: 'Unsupported retention setting.',
-    };
+export function validateRetentionSettingUpdate(
+  input: unknown,
+): RuntimeStorageSettingsValidationResult {
+  if (typeof input !== 'object' || input === null || !Object.hasOwn(input, 'settingId')) {
+    return { ok: false, code: 'unknownSetting', message: 'Unsupported runtime or storage setting.' };
   }
-
-  if (!Object.hasOwn(input, 'settingId')) {
-    return {
-      ok: false,
-      code: 'unknownSetting',
-      message: 'Unsupported retention setting.',
-    };
-  }
-
   const candidate = input as { settingId?: unknown; value?: unknown };
-
   if (!isRetentionSettingId(candidate.settingId)) {
-    return {
-      ok: false,
-      code: 'unknownSetting',
-      message: 'Unsupported retention setting.',
-    };
+    return { ok: false, code: 'unknownSetting', message: 'Unsupported runtime or storage setting.' };
   }
-
   const definition = retentionSettingDefinition(candidate.settingId);
-
-  if (!Object.hasOwn(input, 'value') || typeof candidate.value !== 'number') {
+  if (!Object.hasOwn(input, 'value')) {
     return {
       ok: false,
       settingId: definition.id,
       code: 'invalidType',
-      message: `${definition.label} must be a number.`,
+      message: `${definition.label} has an invalid value.`,
     };
   }
-
+  if (definition.kind === 'enum') {
+    if (typeof candidate.value !== 'string') {
+      return { ok: false, settingId: definition.id, code: 'invalidType', message: `${definition.label} must be a duration.` };
+    }
+    if (!definition.options.includes(candidate.value as RunLimitSetting)) {
+      return { ok: false, settingId: definition.id, code: 'invalidEnum', message: `${definition.label} is not supported.` };
+    }
+    return { ok: true, settingId: definition.id, value: candidate.value as RunLimitSetting };
+  }
+  if (typeof candidate.value !== 'number') {
+    return { ok: false, settingId: definition.id, code: 'invalidType', message: `${definition.label} must be a number.` };
+  }
   if (!Number.isFinite(candidate.value)) {
-    return {
-      ok: false,
-      settingId: definition.id,
-      code: 'nonFinite',
-      message: `${definition.label} must be finite.`,
-    };
+    return { ok: false, settingId: definition.id, code: 'nonFinite', message: `${definition.label} must be finite.` };
   }
-
   if (!Number.isInteger(candidate.value)) {
-    return {
-      ok: false,
-      settingId: definition.id,
-      code: 'nonInteger',
-      message: `${definition.label} must be an integer.`,
-    };
+    return { ok: false, settingId: definition.id, code: 'nonInteger', message: `${definition.label} must be an integer.` };
   }
-
   if (candidate.value < definition.minimum) {
-    return {
-      ok: false,
-      settingId: definition.id,
-      code: 'belowMinimum',
-      message: `${definition.label} must be at least ${definition.minimum}.`,
-    };
+    return { ok: false, settingId: definition.id, code: 'belowMinimum', message: `${definition.label} must be at least ${definition.minimum}.` };
   }
-
-  return {
-    ok: true,
-    settingId: definition.id,
-    value: candidate.value,
-  };
+  return { ok: true, settingId: definition.id, value: candidate.value };
 }
 
 export function sanitizeRetentionSettingsError(
-  settingId: RetentionSettingId,
+  settingId: RuntimeStorageSettingId,
   _error: unknown,
-): RetentionSettingsValidationResult {
+): RuntimeStorageSettingsValidationResult {
   const definition = retentionSettingDefinition(settingId);
   return {
     ok: false,
-    settingId: definition.id,
+    settingId,
     code: 'updateFailed',
     message: `Unable to update ${definition.label}.`,
   };
 }
 
 export async function persistRetentionSettingUpdate(
-  configuration: RetentionSettingsConfiguration,
+  configuration: RuntimeStorageSettingsConfiguration,
   input: unknown,
   target: unknown,
-): Promise<RetentionSettingsValidationResult> {
+): Promise<RuntimeStorageSettingsValidationResult> {
   const validation = validateRetentionSettingUpdate(input);
-  if (!validation.ok) {
-    return validation;
-  }
-
+  if (!validation.ok) return validation;
   try {
     await configuration.update(validation.settingId, validation.value, target);
     return validation;
@@ -219,13 +261,14 @@ export async function persistRetentionSettingUpdate(
 }
 
 export async function handleRetentionSettingUpdateAction(
-  configuration: RetentionSettingsReadableConfiguration,
+  configuration: RuntimeStorageSettingsReadableConfiguration,
   input: unknown,
   target: unknown,
-): Promise<RetentionSettingsHostMessage[]> {
+): Promise<RuntimeStorageSettingsHostMessage[]> {
   const result = await persistRetentionSettingUpdate(configuration, input, target);
-  const messages: RetentionSettingsHostMessage[] = [{ type: 'settingsUpdateResult', result }];
-
+  const messages: RuntimeStorageSettingsHostMessage[] = [
+    { type: 'settingsUpdateResult', result },
+  ];
   if (result.ok) {
     try {
       messages.push({
@@ -233,10 +276,8 @@ export async function handleRetentionSettingUpdateAction(
         snapshot: buildRetentionSettingsSnapshot((key) => configuration.get(key)),
       });
     } catch {
-      // Preserve the successful update result. The webview can display saved state
-      // even when VS Code configuration cannot be read for a refreshed snapshot.
+      // Successful write remains authoritative even if refresh fails.
     }
   }
-
   return messages;
 }

@@ -5,6 +5,9 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { AskBridge } from '../bridge/ask-bridge';
 import { CredentialRegistry } from '../bridge/credentials';
 import {
+  ACP_DEADLINE_BUFFER_MS,
+  CREDENTIAL_DEADLINE_BUFFER_MS,
+  buildRunOptionsForTurn,
   clearPendingParentQuestionOnCancel,
   deriveEntityId,
   issueTurnCredential,
@@ -1037,8 +1040,10 @@ describe('engine graph orchestration', () => {
     const policy = store.getFile().tasks[childId]!.executionPolicy;
     expect(policy.maxTurns).toBe(DEFAULT_EXECUTION_POLICY_BOUNDS.maxTurns);
     expect(policy.maxAutomaticRetries).toBe(DEFAULT_EXECUTION_POLICY_BOUNDS.maxAutomaticRetries);
-    expect(policy.turnTimeoutMs).toBe(DEFAULT_EXECUTION_POLICY_BOUNDS.maxTurnTimeoutMs);
-    expect(policy.taskTimeoutMs).toBe(DEFAULT_EXECUTION_POLICY_BOUNDS.maxTaskTimeoutMs);
+    // Creation clamps only to hard bounds; live user ceiling is applied at promote.
+    expect(policy.runTimeoutOverrideMs).toBe(DEFAULT_EXECUTION_POLICY_BOUNDS.maxTurnTimeoutMs);
+    expect(policy.turnTimeoutMs).toBeUndefined();
+    expect(policy.taskTimeoutMs).toBeUndefined();
   });
 
   it('caps the issued bridge token TTL below a large turn timeout', () => {
@@ -1085,6 +1090,64 @@ describe('engine graph orchestration', () => {
     // W8: token covers turn budget up to hard cap (not soft 15m floor only).
     expect(remainingMs).toBeGreaterThan(MAX_BRIDGE_TOKEN_TTL_MS - 1_000);
     expect(remainingMs).toBeLessThanOrEqual(HARD_BRIDGE_TOKEN_TTL_MS + 1_000);
+  });
+
+  it('derives ACP and credential lifetimes beyond the frozen run deadline', () => {
+    const { store, credentials } = makeHarness();
+    const before = Date.now();
+    const deadlineMs = before + 30 * 60_000;
+    store.commit((draft) => {
+      draft.tasks['deadline-task'] = {
+        id: 'deadline-task',
+        role: 'coordinator',
+        lifecycle: 'open',
+        goal: 'long run',
+        parentId: null,
+        dependencies: [],
+        backend: 'grok',
+        capabilities: ['create_child'],
+        executionPolicy: { maxTurns: 50, maxAutomaticRetries: 2 },
+        executionEpoch: 1,
+        revision: 0,
+        createdAt: new Date(before).toISOString(),
+        updatedAt: new Date(before).toISOString(),
+      };
+      draft.turns['deadline-turn'] = {
+        id: 'deadline-turn',
+        taskId: 'deadline-task',
+        sequence: 0,
+        trigger: 'user',
+        status: 'running',
+        inputs: [],
+        executionEpoch: 1,
+        effectiveRunLimitMs: 30 * 60_000,
+        runDeadlineAt: new Date(deadlineMs).toISOString(),
+        createdAt: new Date(before).toISOString(),
+        startedAt: new Date(before).toISOString(),
+      };
+      return { ok: true };
+    });
+    const deps = {
+      store,
+      credentials,
+      bridgePort: 19999,
+      makeBackend: () => ({ name: 'grok', capabilities: MCP_CAPS, run: async function* () {} }),
+    } as unknown as GraphEngineDeps;
+
+    const built = buildRunOptionsForTurn(deps, 'deadline-turn', { prompt: 'continue' });
+    expect(built.options.promptTimeoutMs).toBeGreaterThanOrEqual(
+      deadlineMs - Date.now() + ACP_DEADLINE_BUFFER_MS - 10,
+    );
+    expect(built.options.promptTimeoutMs).toBeLessThanOrEqual(
+      deadlineMs - before + ACP_DEADLINE_BUFFER_MS,
+    );
+    if (built.mcpConfigPath) fs.rmSync(built.mcpConfigPath, { force: true });
+
+    const token = issueTurnCredential(deps, 'deadline-turn')!;
+    const verified = credentials.verify(token)!;
+    expect(verified.expiry).toBeGreaterThanOrEqual(
+      deadlineMs + CREDENTIAL_DEADLINE_BUFFER_MS - 10,
+    );
   });
 
   it('task types: create_task resolves preset backend/model and persists taskType', async () => {
@@ -1813,6 +1876,17 @@ describe('engine graph batch create/delegate', () => {
       kind: 'wait_tasks',
       taskIds: [bId],
     });
+    const redundant = await engine.handleToolCall(ctx, 'wait_for_tasks', {
+      kind: 'wait_for_tasks',
+      opId: 'op-rel-redundant',
+      taskIds: [bId],
+    });
+    expect(redundant.ok && redundant.result).toMatchObject({
+      alreadyStaged: true,
+      waitTaskIds: [bId],
+      nextAction: 'end_current_turn',
+      doNotPoll: true,
+    });
     engine.stageDisposition(turnId, { kind: 'idle' }, 'op-idle');
     resume();
     await engine.whenIdle();
@@ -1872,6 +1946,17 @@ describe('engine graph batch create/delegate', () => {
     expect(store.getFile().turns[turnId]?.disposition).toEqual({
       kind: 'wait_tasks',
       taskIds: [childId],
+    });
+    const redundant = await engine.handleToolCall(ctx, 'wait_for_tasks', {
+      kind: 'wait_for_tasks',
+      opId: 'op-cont-redundant',
+      taskIds: [childId],
+    });
+    expect(redundant.ok && redundant.result).toMatchObject({
+      alreadyStaged: true,
+      waitTaskIds: [childId],
+      nextAction: 'end_current_turn',
+      doNotPoll: true,
     });
     engine.stageDisposition(turnId, { kind: 'idle' }, 'op-idle');
     resume();
@@ -2424,7 +2509,116 @@ describe('engine graph batch create/delegate', () => {
       kind: 'wait_tasks',
       taskIds: [bId],
     });
+    const redundant = await engine.handleToolCall(ctx, 'wait_for_tasks', {
+      kind: 'wait_for_tasks',
+      opId: 'op-dt-redundant',
+      taskIds: [bId],
+    });
+    expect(redundant.ok && redundant.result).toMatchObject({
+      alreadyStaged: true,
+      waitTaskIds: [bId],
+      nextAction: 'end_current_turn',
+      doNotPoll: true,
+    });
     engine.stageDisposition(turnId, { kind: 'idle' }, 'op-idle');
+    resume();
+    await engine.whenIdle();
+  });
+
+  it('makes a redundant standalone wait idempotent after compound delegate wait', async () => {
+    const { store, engine, credentials, resume } = makeHarness();
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child', 'wait_child', 'read_subtree'],
+    });
+    const started = engine.startTask('coord');
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    await waitTurnRunning(store, started.value.turnId);
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId: started.value.turnId,
+      allowedActions: new Set(['delegate_task', 'wait_for_tasks', 'get_task_status']),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+    const delegated = await engine.handleToolCall(ctx, 'delegate_task', {
+      kind: 'delegate_task',
+      opId: 'op-compound',
+      waitForCompletion: true,
+      spec: { goal: 'work', taskType: 'worker' },
+    });
+    expect(delegated.ok).toBe(true);
+    if (!delegated.ok) return;
+    const childId = (delegated.result as { taskId: string }).taskId;
+    const redundant = await engine.handleToolCall(ctx, 'wait_for_tasks', {
+      kind: 'wait_for_tasks',
+      opId: 'op-redundant',
+      taskIds: [childId],
+    });
+    expect(redundant).toEqual({
+      ok: true,
+      result: {
+        staged: true,
+        alreadyStaged: true,
+        waitTaskIds: [childId],
+        nextAction: 'end_current_turn',
+        doNotPoll: true,
+      },
+    });
+    const status = await engine.handleToolCall(ctx, 'get_task_status', {
+      kind: 'get_task_status',
+      taskId: 'coord',
+    });
+    expect(status.ok && status.result).toMatchObject({
+      callerWaitStaged: true,
+      nextAction: 'end_current_turn',
+      doNotPoll: true,
+    });
+    resume();
+    await engine.whenIdle();
+  });
+
+  it('unions children from two singular compound delegates in stable order', async () => {
+    const { store, engine, credentials, resume } = makeHarness();
+    engine.createTask({
+      id: 'coord',
+      goal: 'coord',
+      backend: 'grok',
+      role: 'coordinator',
+      capabilities: ['create_child', 'wait_child'],
+    });
+    const started = engine.startTask('coord');
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    await waitTurnRunning(store, started.value.turnId);
+    const ctx = credentials.verify(credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId: started.value.turnId,
+      allowedActions: new Set(['delegate_task', 'wait_for_tasks']),
+      ttlMs: 60_000,
+    }))!;
+    for (const opId of ['op-a', 'op-b']) {
+      const result = await engine.handleToolCall(ctx, 'delegate_task', {
+        kind: 'delegate_task',
+        opId,
+        waitForCompletion: true,
+        spec: { goal: opId, taskType: 'worker' },
+      });
+      expect(result.ok).toBe(true);
+    }
+    expect(store.getFile().turns[started.value.turnId]?.disposition).toEqual({
+      kind: 'wait_tasks',
+      taskIds: [
+        deriveEntityId(started.value.turnId, 'op-a', 'task'),
+        deriveEntityId(started.value.turnId, 'op-b', 'task'),
+      ],
+    });
     resume();
     await engine.whenIdle();
   });

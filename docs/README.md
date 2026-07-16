@@ -11,7 +11,7 @@ Read in this order when onboarding:
 | Doc | Topic |
 |-----|--------|
 | [SESSION-MANAGEMENT.md](SESSION-MANAGEMENT.md) | Explicit session IDs, resume flow |
-| [TASK-MANAGEMENT.md](TASK-MANAGEMENT.md) | Task/turn domain model, coordinator protocol, TaskEngine lifecycle, and task Markdown export contract |
+| [TASK-MANAGEMENT.md](TASK-MANAGEMENT.md) | Task/turn domain model, coordinator protocol, TaskEngine lifecycle, model-switch continuation contract, and task Markdown export contract |
 | [plans/task-orchestration-auto-run.md](plans/task-orchestration-auto-run.md) | **PARTIAL**: brief/result/release auto-run (cleanup gate pending) |
 | [plans/coordinator-host-context-and-seal.md](plans/coordinator-host-context-and-seal.md) | **IMPLEMENTED**: host context inject, rich create/delegate, parent seal, wait-queue UX (W0–W6) |
 | [plans/cleanup-legacy-debt.md](plans/cleanup-legacy-debt.md) | **PARTIAL** (2026-07-15): kill live-inject debt, plan status honesty, MCP/docs hygiene |
@@ -22,7 +22,7 @@ Read in this order when onboarding:
 | [MCP-INJECTION.md](MCP-INJECTION.md) | `context_engine` + `coordinator` MCP per turn |
 | [MUSTER-BRIDGE.md](MUSTER-BRIDGE.md) | Bridge / elicitation (MCP `ask_user` disabled — see cleanup C3) |
 | [WEBVIEW.md](WEBVIEW.md) | Chat UI, workspace file-drop mention contract, read-only presentation review, queued follow-ups and interrupt & send, task Markdown export, lifecycle, and diagnostics |
-| [SETTINGS.md](SETTINGS.md) | Host-backed five-topic Settings shell (Task Types, Permissions, Retention, plus Coming soon Models and CLIs / Context and MCP) |
+| [SETTINGS.md](SETTINGS.md) | Host-backed five-topic Settings shell (Task Types, Permissions, Runtime & Storage, plus Coming soon Models and CLIs / Context and MCP) |
 
 Operational evidence:
 

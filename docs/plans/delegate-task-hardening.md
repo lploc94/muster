@@ -120,7 +120,7 @@ Execution policy clamp bounds (`DEFAULT_EXECUTION_POLICY_BOUNDS`): turn timeout 
 
 ### 2.9 Progress
 
-`report_progress` is intentionally shallow today: truncated note echoed in the tool result. **No persistence, no event stream, no webview field.** Handoff progress is a separate surface (`TaskSummary.handoffProgress`) and must not be confused with worker progress notes.
+`report_progress` is intentionally shallow today: truncated note echoed in the tool result. **No persistence, no event stream, no webview field.** Model-switch feedback is a separate one-shot host notice; the destination contract has no durable multi-phase handoff-progress surface and it must not be confused with worker progress notes.
 
 ---
 

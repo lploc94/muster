@@ -13,9 +13,10 @@ import type {
   TaskVerdict,
 } from './types';
 import { renderVerdictForPrompt } from './verdict';
+import { TASK_RESULT_MAX_BYTES, truncateUtf8Bytes } from './content-limits';
 
 /** Max chars retained in a TaskResult summary / pin text. */
-export const TASK_RESULT_SUMMARY_MAX = 16_384;
+export const TASK_RESULT_SUMMARY_MAX = TASK_RESULT_MAX_BYTES;
 
 const ALLOWED_OUTPUT_KEYS: ReadonlySet<TaskResultOutputKey> = new Set([
   'summary',
@@ -23,8 +24,7 @@ const ALLOWED_OUTPUT_KEYS: ReadonlySet<TaskResultOutputKey> = new Set([
 ]);
 
 export function clampSummary(text: string, max = TASK_RESULT_SUMMARY_MAX): string {
-  if (text.length <= max) return text;
-  return text.slice(0, max);
+  return truncateUtf8Bytes(text, max).text;
 }
 
 /**
@@ -39,10 +39,12 @@ export function buildTaskResultFromSummary(
   verdict?: TaskVerdict,
 ): TaskResultV1 {
   const nextRevision = previous ? previous.revision + 1 : 1;
+  const clamped = truncateUtf8Bytes(summary, TASK_RESULT_SUMMARY_MAX);
   const result: TaskResultV1 = {
     version: 1,
     revision: nextRevision,
-    summary: clampSummary(summary),
+    summary: clamped.text,
+    ...(clamped.truncated ? { truncated: true } : {}),
   };
   if (verdict) result.verdict = verdict;
   return result;

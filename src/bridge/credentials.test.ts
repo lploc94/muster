@@ -29,5 +29,55 @@ describe('CredentialRegistry', () => {
     });
     registry.revoke('turn-2');
     expect(registry.verify(token)).toBeNull();
+    expect(registry.verifyDetailed(token)).toMatchObject({
+      ok: false,
+      reason: 'revoked',
+      callerTaskId: 't',
+      turnId: 'turn-2',
+    });
+    expect(registry.verifyDetailed('bad')).toEqual({ ok: false, reason: 'missing' });
+  });
+
+  it('distinguishes expired credentials without exposing their bearer token', () => {
+    const registry = new CredentialRegistry();
+    const token = registry.issue({
+      rootId: 'r',
+      callerTaskId: 'expired-task',
+      turnId: 'expired-turn',
+      allowedActions: new Set(['ask_user']),
+      ttlMs: -1,
+    });
+    const result = registry.verifyDetailed(token);
+    expect(result).toMatchObject({
+      ok: false,
+      reason: 'expired',
+      callerTaskId: 'expired-task',
+      turnId: 'expired-turn',
+    });
+    expect(JSON.stringify(result)).not.toContain(token);
+  });
+
+  it('revoking a parent turn never revokes a child turn credential', () => {
+    const registry = new CredentialRegistry();
+    const parent = registry.issue({
+      rootId: 'root',
+      callerTaskId: 'root',
+      turnId: 'parent-turn',
+      allowedActions: new Set(['wait_for_tasks']),
+      ttlMs: 60_000,
+    });
+    const child = registry.issue({
+      rootId: 'root',
+      callerTaskId: 'child',
+      turnId: 'child-turn',
+      allowedActions: new Set(['complete_task']),
+      ttlMs: 60_000,
+    });
+    registry.revoke('parent-turn');
+    expect(registry.verify(parent)).toBeNull();
+    expect(registry.verify(child)).toMatchObject({
+      callerTaskId: 'child',
+      turnId: 'child-turn',
+    });
   });
 });

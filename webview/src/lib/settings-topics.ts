@@ -45,7 +45,7 @@ export const SETTINGS_TOPICS: readonly SettingsTopic[] = [
   },
   {
     id: 'retention',
-    label: 'Retention',
+    label: 'Runtime & Storage',
     availability: 'active',
   },
   {

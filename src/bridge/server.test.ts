@@ -1,6 +1,6 @@
 import { describe, expect, it, afterEach } from 'vitest';
 import { CredentialRegistry } from './credentials';
-import { MusterBridgeServer } from './server';
+import { formatToolError, MusterBridgeServer } from './server';
 
 async function readJsonRpc(res: Response): Promise<Record<string, unknown> | undefined> {
   const text = await res.text();
@@ -65,6 +65,18 @@ async function openMcpSession(port: number, token: string): Promise<{
     },
   };
 }
+
+describe('formatToolError', () => {
+  it('projects disposition conflicts with a stable code and current kind', () => {
+    expect(JSON.parse(formatToolError('disposition conflict: current disposition is complete')))
+      .toEqual({
+        code: 'disposition_conflict',
+        currentDisposition: 'complete',
+        message: 'disposition conflict: current disposition is complete',
+      });
+    expect(formatToolError('task not found')).toBe('task not found');
+  });
+});
 
 describe('MusterBridgeServer auth', () => {
   let server: MusterBridgeServer | undefined;

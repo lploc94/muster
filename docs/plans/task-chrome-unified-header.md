@@ -19,7 +19,7 @@ Replace the **two-tier chrome** (`.task-tree-nav` + `.task-workspace-banner`) an
 1. Collapsed: shows current task identity + primary actions in ≤2 rows.  
 2. Expanded: shows **interactive task tree** (reuse I1–I3 rows/helpers).  
 3. Selecting a tree row focuses that task (header becomes that node).  
-4. Keeps feature parity for Parent/breadcrumb, counts, lifecycle menu, backend pill, export, handoff bar, draft contracts.
+4. Keeps feature parity for Parent/breadcrumb, counts, lifecycle menu, backend pill, export, model-switch notice, draft contracts.
 
 ### Problem (current)
 
@@ -36,7 +36,7 @@ Replace the **two-tier chrome** (`.task-tree-nav` + `.task-workspace-banner`) an
 - Auto-focus on child attention.  
 - Full ARIA treeview keyboard model.  
 - **Overlay / dual tree interaction models** (retired in this plan — see §2.7).  
-- Redesigning handoff chrome (stays below header).
+- Redesigning model-switch behavior (owned by `TASK-MANAGEMENT.md` §19); this layout must not reintroduce a durable multi-phase progress bar.
 
 ---
 
@@ -58,7 +58,7 @@ TaskWorkspace (focused task)
 │   │   └── Tasks n · active · need you   ← toggles treeExpanded
 │   └── .task-chrome__tree                ← when treeExpanded
 │         └── inline scrollable rows (reuse treeRows)
-├── handoff bar (unchanged)
+├── optional one-shot model-switch notice (no durable progress bar)
 ├── ChatThread (no scroll lock for this feature)
 ├── action panels / Composer
 ```
@@ -178,7 +178,7 @@ One card with existing banner tone border. Row min-height 28px; indent cap depth
 | Atomic select | Unchanged |
 | No auto-focus ask | Unchanged |
 | Lifecycle / export / backend | Bar |
-| Handoff | Below chrome |
+| Model switch | Brief one-shot notice; no durable handoff bar |
 | Lifecycle prose | Tips + muted under tree |
 | Draft on hop | Unchanged |
 
@@ -246,7 +246,7 @@ Status button tips; muted under-tree lines.
 6. Escape collapses.  
 7. **Stay expanded only when owning-root id unchanged** (not mere multi-node).  
 8. Collapse on different root / draft / solitary.  
-9. Parity: status menu, export, backend, handoff, icons, twistie.  
+9. Parity: status menu, export, backend, model-switch notice, icons, twistie.
 10. Solitary root: no empty expand.  
 11. Unit + E2E (including narrow) green.  
 12. Final gate: svelte-check + full webview e2e suite.  

@@ -21,7 +21,7 @@ import {
   isTaskScopedBannerVisible,
   post,
   type OutMessage,
-  type RetentionSettingSnapshot,
+  type RuntimeStorageSettingsSnapshot,
 } from './protocol';
 import { vscode } from './vscode';
 
@@ -268,10 +268,20 @@ describe('isExtMessage snapshot version tolerance', () => {
   });
 });
 
-const settingsSnapshot: RetentionSettingSnapshot = {
+const settingsSnapshot: RuntimeStorageSettingsSnapshot = {
   settings: [
     {
-      id: 'maxTurnsPerTask',
+      kind: 'enum',
+      id: 'runLimit',
+      label: 'Maximum uninterrupted agent run',
+      description: 'Applies to newly promoted runs.',
+      value: '2h',
+      defaultValue: '2h',
+      options: ['15m', '30m', '1h', '2h', '4h', '8h'],
+    },
+    {
+      kind: 'number',
+      id: 'maxRetainedTurnsPerTask',
       label: 'Max turns per task',
       description: 'Maximum persisted turns retained per terminal task.',
       value: 200,
@@ -279,6 +289,7 @@ const settingsSnapshot: RetentionSettingSnapshot = {
       minimum: 1,
     },
     {
+      kind: 'number',
       id: 'maxStoredOutputChars',
       label: 'Max stored output characters',
       description: 'Maximum stored assistant output characters per settled turn on open tasks.',
@@ -322,7 +333,13 @@ describe('settings protocol guard', () => {
     expect(
       isExtMessage({
         type: 'settingsUpdateResult',
-        result: { ok: true, settingId: 'maxTurnsPerTask', value: 50 },
+        result: { ok: true, settingId: 'runLimit', value: '4h' },
+      }),
+    ).toBe(true);
+    expect(
+      isExtMessage({
+        type: 'settingsUpdateResult',
+        result: { ok: true, settingId: 'maxRetainedTurnsPerTask', value: 50 },
       }),
     ).toBe(true);
 
@@ -355,7 +372,7 @@ describe('settings protocol guard', () => {
         type: 'settingsUpdateResult',
         result: {
           ok: false,
-          settingId: 'maxTurnsPerTask',
+          settingId: 'maxRetainedTurnsPerTask',
           code: 'updateFailed',
           message: 'Unable to update Max turns per task.',
         },
@@ -366,11 +383,11 @@ describe('settings protocol guard', () => {
   it('rejects malformed settings update results from the host', () => {
     const malformedMessages = [
       { type: 'settingsUpdateResult', result: { ok: true, settingId: 'unknown', value: 10 } },
-      { type: 'settingsUpdateResult', result: { ok: true, settingId: 'maxTurnsPerTask', value: '10' } },
-      { type: 'settingsUpdateResult', result: { ok: true, settingId: 'maxTurnsPerTask', value: 1.5 } },
+      { type: 'settingsUpdateResult', result: { ok: true, settingId: 'maxRetainedTurnsPerTask', value: '10' } },
+      { type: 'settingsUpdateResult', result: { ok: true, settingId: 'maxRetainedTurnsPerTask', value: 1.5 } },
       { type: 'settingsUpdateResult', result: { ok: true, settingId: 'maxStoredOutputChars', value: 1023 } },
-      { type: 'settingsUpdateResult', result: { ok: false, settingId: 'maxTurnsPerTask', code: 'raw-stack', message: 'x' } },
-      { type: 'settingsUpdateResult', result: { ok: false, settingId: 'maxTurnsPerTask', code: 'invalidType' } },
+      { type: 'settingsUpdateResult', result: { ok: false, settingId: 'maxRetainedTurnsPerTask', code: 'raw-stack', message: 'x' } },
+      { type: 'settingsUpdateResult', result: { ok: false, settingId: 'maxRetainedTurnsPerTask', code: 'invalidType' } },
       { type: 'settingsUpdateResult', result: { ok: false, settingId: 'unknown', code: 'unknownSetting', message: 'x' } },
       // updateFailed without settingId is not a valid Retention failure shape
       { type: 'settingsUpdateResult', result: { ok: false, code: 'updateFailed', message: 'Unable to update.' } },
@@ -386,7 +403,7 @@ describe('settings protocol guard', () => {
       { type: 'settingsSnapshot', snapshot: settingsSnapshot, extra: 'ignored?' },
       {
         type: 'settingsUpdateResult',
-        result: { ok: true, settingId: 'maxTurnsPerTask', value: 50 },
+        result: { ok: true, settingId: 'maxRetainedTurnsPerTask', value: 50 },
         extra: 'ignored?',
       },
       {
@@ -394,9 +411,9 @@ describe('settings protocol guard', () => {
         result: { ok: false, code: 'unknownSetting', message: 'Unsupported retention setting.' },
         extra: 'ignored?',
       },
-      { type: 'settingsUpdated', settingId: 'maxTurnsPerTask', value: 50 },
-      { type: 'settingsError', settingId: 'maxTurnsPerTask', message: 'Host rejected update.' },
-      { type: 'settingsSnapshot', snapshot: settingsSnapshot, result: { ok: true, settingId: 'maxTurnsPerTask', value: 50 } },
+      { type: 'settingsUpdated', settingId: 'maxRetainedTurnsPerTask', value: 50 },
+      { type: 'settingsError', settingId: 'maxRetainedTurnsPerTask', message: 'Host rejected update.' },
+      { type: 'settingsSnapshot', snapshot: settingsSnapshot, result: { ok: true, settingId: 'maxRetainedTurnsPerTask', value: 50 } },
       { type: 'unrelatedSettingsMessage', snapshot: settingsSnapshot },
     ];
 
@@ -529,7 +546,7 @@ describe('settings outbound protocol', () => {
     vi.mocked(vscode.postMessage).mockClear();
     const messages: OutMessage[] = [
       { type: 'requestSettings' },
-      { type: 'updateSetting', settingId: 'maxTurnsPerTask', value: 25 },
+      { type: 'updateSetting', settingId: 'maxRetainedTurnsPerTask', value: 25 },
       { type: 'updateSetting', settingId: 'maxStoredOutputChars', value: 4096 },
     ];
 
@@ -540,7 +557,7 @@ describe('settings outbound protocol', () => {
     expect(vscode.postMessage).toHaveBeenNthCalledWith(1, { type: 'requestSettings' });
     expect(vscode.postMessage).toHaveBeenNthCalledWith(2, {
       type: 'updateSetting',
-      settingId: 'maxTurnsPerTask',
+      settingId: 'maxRetainedTurnsPerTask',
       value: 25,
     });
     expect(vscode.postMessage).toHaveBeenNthCalledWith(3, {

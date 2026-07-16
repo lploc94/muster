@@ -12,6 +12,7 @@ import {
   isSoftTerminalLifecycle,
   isTerminalLifecycle,
   isTerminalTurn,
+  mergeWaitDisposition,
   hasActiveOrQueuedTurn,
   prepareDeleteQueuedTurn,
   prepareEditQueuedTurn,
@@ -88,6 +89,31 @@ describe('guard helpers', () => {
     expect(isTerminalTurn('queued')).toBe(false);
     expect(isSettledTurn('interrupted')).toBe(true);
     expect(isSettledTurn('running')).toBe(false);
+  });
+
+  it('merges wait dispositions monotonically while preserving terminal conflicts', () => {
+    const live = turn({ status: 'running' });
+    const first = mergeWaitDisposition(live, ['a', 'a', 'b']);
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    expect(first.next).toMatchObject({
+      addedTaskIds: ['a', 'b'],
+      alreadyStaged: false,
+      waitTaskIds: ['a', 'b'],
+    });
+    const second = mergeWaitDisposition(first.next.turn, ['b', 'c', 'a']);
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    expect(second.next).toMatchObject({
+      addedTaskIds: ['c'],
+      alreadyStaged: false,
+      waitTaskIds: ['a', 'b', 'c'],
+    });
+    const redundant = mergeWaitDisposition(second.next.turn, ['c', 'a']);
+    expect(redundant.ok && redundant.next.alreadyStaged).toBe(true);
+    expect(
+      mergeWaitDisposition({ ...live, disposition: { kind: 'complete', result: 'done' } }, ['a']),
+    ).toEqual({ ok: false, reason: 'disposition conflict: current disposition is complete' });
   });
 
   it('retryCountOf walks the retry chain', () => {

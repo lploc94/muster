@@ -8,9 +8,9 @@ Prior APPROVED plan was lost (never committed). This document is a full rewrite 
 - Design consensus: codex-think-about `codex-think-about-20260714-001`
 - Prior plan-review fixes ISSUE-1…11 + ISSUE-5 worker-seal clarification
 - Round-1 re-review ISSUE-12…17 (sealedBy paths, trust, reload, startNewTask, promote wake-ups, wakeOn default)
-- Current tree reality: store **schema v4**, M010 **TaskHandoff** on `MusterTask`, existing `create_task` / `delegate_task` / `start_task` / `wait_for_tasks` / `startNewTask`
+- Current-at-plan tree reality: store **schema v4**, legacy M010 `TaskHandoff` v1 on `MusterTask`, existing `create_task` / `delegate_task` / `start_task` / `wait_for_tasks` / `startNewTask`
 
-Normative product language also belongs in [`docs/TASK-MANAGEMENT.md`](../TASK-MANAGEMENT.md) (extend §5/§7/§8 + orchestration section when APPROVED; do not fight M010 handoff section).
+Normative product language also belongs in [`docs/TASK-MANAGEMENT.md`](../TASK-MANAGEMENT.md). Its §19 model-switch/continuation destination contract supersedes this plan's legacy M010 integration references.
 
 ---
 
@@ -43,7 +43,7 @@ root (coordinate)
 - Capability map + credential `allowedActions` enumerate tools explicitly (`capabilities.ts`)
 - Lifecycle ≠ CLI exit (docs); child seal still uses `parentId !== null` heuristic in `applySuccessfulTurn`
 - Limits, leases, reload interrupt without uncertain replay
-- Schema **v4** + optional `handoff?: TaskHandoffState` (M010) — must remain compatible
+- Schema **v4** + optional legacy `handoff?: TaskHandoffState` v1 — migration must remain compatible with the §19 v2 destination record
 - Credential TTL currently shorter than max turn timeout (must fix functionally in W8)
 
 **Gaps this plan closes**
@@ -64,7 +64,7 @@ root (coordinate)
 2. Plan → implement chain auto-runs with **plan summary injected** into implement first prompt via bindings + durable pin.
 3. Coordinator happy path: `create_task*` (draft) → `release_tasks` → `wait_for_tasks` (**no** coordinator `start_task`).
 4. Single readiness evaluator for scheduler + UI + `get_task_status`.
-5. Keep architecture: **records + pure transitions + `TaskEngine`** (no OOP `task.start()` domain entities). Coexist with existing M010 `TaskHandoff` aggregate.
+5. Keep architecture: **records + pure transitions + `TaskEngine`** (no OOP `task.start()` domain entities). Coexist with the persisted handoff field while §19 replaces the legacy phase aggregate with an atomic switch record.
 
 ## Non-goals (v1)
 
@@ -119,7 +119,7 @@ root (coordinate)
 
 ## Persisted state additions (cross-cutting)
 
-Bump store `schemaVersion` (v4 → **v5**). Migrate in `store.ts`. Preserve M010 `handoff` unchanged.
+Bump store `schemaVersion` (v4 → **v5**). Migrate in `store.ts`. Preserve legacy handoff data safely for the separate §19 v2 migration; never auto-run source-summary or receiver-bootstrap recovery.
 
 ```ts
 type TaskReleaseState = 'draft' | 'released';
@@ -342,7 +342,7 @@ Current main mainly rescans queued turns after an **executing turn settles**. Th
 | Cancel/skip cascade | Yes — affected subgraph |
 | Dependency policy terminal (fail/skip dependent) | Yes |
 | Resource/lock free (turn leaves running) | Yes |
-| Handoff completion (M010) if it unblocks work | Yes if task becomes runnable |
+| Atomic model-switch commit if it changes runnable binding/context | Yes if task becomes runnable |
 | Workspace trust granted | Yes — all held-for-trust |
 | Safe reload recovery complete | Yes — safe queued released turns |
 
@@ -486,7 +486,7 @@ npm run test:source-boundary
 
 ## Docs follow-up (after APPROVE, with implementation)
 
-- Update `TASK-MANAGEMENT.md`: create vs release, ordering vs dataflow, attention wake, tool surface, Phase F checklist (do not drop M010 handoff section).
+- Update `TASK-MANAGEMENT.md`: create vs release, ordering vs dataflow, attention wake, tool surface, Phase F checklist; retain §19's atomic model-switch/continuation contract.
 - Link this plan from `docs/README.md`.
 
 ---

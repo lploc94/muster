@@ -10,9 +10,11 @@ Post-read action: add a new setting to Muster using the same host-backed pattern
 
 This guide documents the destination pattern for feature settings and the assembled five-topic Settings shell. It is not a migration log and it does not claim evidence from an interactive Extension Development Host session.
 
+At least one real settings group is always backed by VS Code contributed configuration; the Runtime & Storage group is the current concrete example.
+
 ## Non-negotiable invariants
 
-- At least one real settings group is backed by VS Code contributed configuration. Today the retention group exposes `muster.retention.maxTurnsPerTask` and `muster.retention.maxStoredOutputChars` through the extension manifest so VS Code owns default values, minimums, and the user-facing Settings entry. The Permissions topic exposes security-sensitive `muster.permissions.mode` (`ask` | `allow` | `readonly`, default `ask`) through the same contributed-configuration path; the host validates exact enum updates, persists Workspace-target mode only after validation, and re-reads the stored mode live for each runtime permission request without treating Settings configuration as a runtime permission prompt. Task-type presets use resource-scoped `muster.taskTypes` (object map) with **Muster ship defaults** that include `coordinate`, `plan`, `breakdown`, `implement`, `verify`, and `research` (no model pins); the custom Settings panel can edit and **Save** the full map into workspace settings.json. Explicit empty map fails closed for coordinator create/delegate (see `docs/TASK-MANAGEMENT.md` §8).
+- Runtime & Storage is backed by VS Code configuration. It exposes one runtime enum, `muster.execution.runLimit` (`15m`–`8h`, default `2h`), plus `muster.retention.maxRetainedTurnsPerTask` and `muster.retention.maxStoredOutputChars`. The old `muster.retention.maxTurnsPerTask` key is a deprecated one-release read/migration fallback. The Permissions topic exposes security-sensitive `muster.permissions.mode` (`ask` | `allow` | `readonly`, default `ask`) through the same contributed-configuration path; the host validates exact enum updates, persists Workspace-target mode only after validation, and re-reads the stored mode live for each runtime permission request without treating Settings configuration as a runtime permission prompt. Task-type presets use resource-scoped `muster.taskTypes` (object map) with **Muster ship defaults** that include `coordinate`, `plan`, `breakdown`, `implement`, `verify`, and `research` (no model pins); the custom Settings panel can edit and **Save** the full map into workspace settings.json. Explicit empty map fails closed for coordinator create/delegate (see `docs/TASK-MANAGEMENT.md` §8).
 - The extension host owns reads and writes. It reads configuration into a snapshot, validates update requests, writes through VS Code configuration APIs, and sends the result back to the webview.
 - The webview is a typed view. It requests a snapshot, renders values from host messages, posts update requests, and waits for host results before treating a value as saved.
 - Webview messages are typed and runtime-guarded. Every new host-to-webview or webview-to-host settings message needs a static TypeScript shape and a runtime guard so malformed messages are ignored instead of partially applied.
@@ -28,11 +30,11 @@ The custom Settings panel is a fixed five-topic shell (presentation order is pro
 |------:|-------|--------|----------------|
 | 1 | **Task Types** | Active | Host-owned `muster.taskTypes` (workspace write from the panel; resource-scoped contributed config) |
 | 2 | **Permissions** | Active | Host-owned `muster.permissions.mode` enum |
-| 3 | **Retention** | Active | Host-owned retention numeric bounds |
+| 3 | **Runtime & Storage** | Active | Host-owned agent run enum and advanced history-retention bounds |
 | 4 | **Models and CLIs** | Coming soon | Placeholder only — no persisted settings domain yet |
 | 5 | **Context and MCP** | Coming soon | Placeholder only — no configurable context-engine URL/port yet |
 
-Three active host-owned topics — Task Types, Permissions, and Retention — use typed host snapshots and update results. Two selectable Coming soon topics — Models and CLIs, and Context and MCP — remain enabled tabs with truthful static copy and emit no host mutations (placeholder zero-mutation). Selecting either Coming soon panel must not post configuration updates, model-list mutations, or other host write requests.
+Three active host-owned topics — Task Types, Permissions, and Runtime & Storage — use typed host snapshots and update results. The topic keeps stable id `retention` for persisted navigation compatibility. Two selectable Coming soon topics — Models and CLIs, and Context and MCP — remain enabled tabs with truthful static copy and emit no host mutations (placeholder zero-mutation). Selecting either Coming soon panel must not post configuration updates, model-list mutations, or other host write requests.
 
 Keyboard and narrow layout for the tablist:
 
@@ -44,10 +46,11 @@ Keyboard and narrow layout for the tablist:
 
 Settings topics share one shell, but draft ownership and feedback stay topic-local. Treat saved snapshot, per-topic draft, and navigation state as three separate layers:
 
-- **App-owned drafts, not panel-owned.** `App.svelte` owns Task Types drafts, Retention draft strings, Permissions draft mode, and the active topic id above the conditional Settings panel. Closing Settings, switching tabs, or reopening the panel must not discard in-progress edits.
+- **App-owned drafts, not panel-owned.** `App.svelte` owns Task Types drafts, Runtime & Storage draft strings, Permissions draft mode, and the active topic id above the conditional Settings panel. Closing Settings, switching tabs, or reopening the panel must not discard in-progress edits.
 - **Saved host snapshots stay separate from drafts.** A host `settingsSnapshot`, `taskTypesSettingsSnapshot`, or `permissionSettingsSnapshot` may initialize pristine drafts, but must not overwrite dirty drafts. Only an explicit successful host write (then a force-hydrated snapshot for Task Types) clears dirty state.
 - **Navigation state** (active topic id and non-sensitive view restore) is independent of whether a draft is dirty or a snapshot is stale.
-- **Topic-local feedback.** Retention errors, field validation, and saved banners never render on Task Types or Permissions; Task Types diagnostics never render on Retention or Permissions; Permissions save failures stay on the Permissions tab. Hidden-topic dirty/error/saving/saved state remains inspectable on the owning tab badge.
+- **Topic-local feedback.** Runtime & Storage errors, field validation, and saved banners never render on Task Types or Permissions; Task Types diagnostics never render on Runtime & Storage or Permissions; Permissions save failures stay on the Permissions tab. Hidden-topic dirty/error/saving/saved state remains inspectable on the owning tab badge.
+- **Runtime deadline semantics.** The selected run limit is read when a queued turn promotes and is frozen on that turn. Changing Settings does not move a running deadline. Waiting for dependencies or children happens between backend turns and does not consume the uninterrupted-run budget.
 - **Permissions configuration is not a runtime prompt.** The Permissions tab only configures the default policy mode (`muster.permissions.mode`: `ask` | `allow` | `readonly`). Runtime permission cards still appear as separate in-session prompts when mode is `ask`; already-pending ask-mode requests stay pending until the user, timeout, or cancellation resolves them even if configuration changes (pending-request isolation).
 - **Webview hide/reveal persistence.** Non-sensitive navigation and drafts persist under the nested key `muster.settingsView.v1` via `vscode.getState` / `vscode.setState`. Writes merge into the existing bag and must not delete unrelated keys such as the send outbox. Fail-closed restore rejects malformed or out-of-bounds envelopes.
 - **Honest workspace scope for Task Types.** The custom editor writes the **workspace-level** `muster.taskTypes` map (`workspace settings.json`). Folder-specific resource overrides remain in native VS Code Settings and are not edited here. This guide documents that contract for contributors; it does not claim live Extension Development Host proof of the native Settings UI.
@@ -74,7 +77,7 @@ Settings topics share one shell, but draft ownership and feedback stay topic-loc
 4. Keep ownership boundaries clear in the UI.
    - Lift drafts into App-owned state so topic switches and panel unmount cannot discard edits.
    - The panel must not mark a value saved until the host returns a successful update result.
-   - Keep topic feedback local: Task Types, Retention, and Permissions each own their error/success surfaces and tab indicators.
+   - Keep topic feedback local: Task Types, Runtime & Storage, and Permissions each own their error/success surfaces and tab indicators.
    - Full-view Settings replaces the task list while open; Back restores the prior task/chat shell without dropping App-owned settings drafts.
    - Loading, saving, saved, field-error, and topic-local error states should remain inspectable with `role="status"` or `role="alert"` semantics, including text-equivalent tab badges when the topic is not selected.
    - Do not route new durable settings into Coming soon placeholders; placeholders stay zero-mutation until they gain a real host contract.

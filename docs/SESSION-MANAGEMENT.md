@@ -82,6 +82,19 @@ limits. Never run two processes against the same session ID.
 - **Reopen** on a terminal task sets lifecycle back to `open` on the **same** task
   id (via status menu or `send`). A separate conversation uses **New task**.
 
+## Backend/model switch
+
+A switch commits the target backend/model locally and clears
+`MusterTask.committedSessionId`; it does not call `session/new`, prompt the source,
+or initialize the receiver. The oldest eligible queued turn, or the user's next
+message, creates the fresh target session through the ordinary turn path.
+
+That first target turn receives the same runtime/task bootstrap and MCP wiring as a
+new task session, plus the one-shot compact continuation context defined by
+[`TASK-MANAGEMENT.md` §19](TASK-MANAGEMENT.md#19-cross-runtime-model-switch-and-continuation-destination-contract).
+The source session id is never passed to the target. A target-turn startup or model
+failure is a normal turn failure and does not roll back the completed switch.
+
 ## Cancellation
 
 If the user cancels mid-turn:

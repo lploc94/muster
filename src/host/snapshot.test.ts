@@ -63,6 +63,64 @@ function storeFrom(file: TaskStoreFile): TaskStore {
 }
 
 describe('host task snapshot projection', () => {
+  it('renders a human-readable configured run timeout reason', () => {
+    const file: TaskStoreFile = {
+      schemaVersion: 6,
+      revision: 1,
+      tasks: { timed: task('timed') },
+      turns: {
+        timeout: turn({
+          id: 'timeout',
+          taskId: 'timed',
+          status: 'interrupted',
+          sequence: 1,
+          termination: {
+            kind: 'run_timeout',
+            limitMs: 2 * 60 * 60_000,
+            deadlineAt: '2026-07-16T02:00:00.000Z',
+          },
+        }),
+      },
+      messages: {},
+      operations: {},
+      cancelRequests: {},
+    };
+    expect(projectTaskSummary(file, 'timed')?.runTimeoutMessage).toBe(
+      'Agent run reached the configured 2-hour limit.',
+    );
+  });
+
+  it('does not reuse a historical run-timeout label after a later ordinary failure', () => {
+    const file: TaskStoreFile = {
+      schemaVersion: 6,
+      revision: 1,
+      tasks: { timed: task('timed') },
+      turns: {
+        timeout: turn({
+          id: 'timeout',
+          taskId: 'timed',
+          status: 'interrupted',
+          sequence: 1,
+          termination: {
+            kind: 'run_timeout',
+            limitMs: 2 * 60 * 60_000,
+            deadlineAt: '2026-07-16T02:00:00.000Z',
+          },
+        }),
+        retry: turn({
+          id: 'retry',
+          taskId: 'timed',
+          status: 'failed',
+          sequence: 2,
+        }),
+      },
+      messages: {},
+      operations: {},
+      cancelRequests: {},
+    };
+    expect(projectTaskSummary(file, 'timed')?.runTimeoutMessage).toBeUndefined();
+  });
+
   it('orders roots by projected activity and projects a focused task contract', () => {
     const file: TaskStoreFile = {
       schemaVersion: 2,

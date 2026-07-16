@@ -19,7 +19,7 @@ import type {
   TaskViewStatus,
 } from './types';
 
-export const CURRENT_SCHEMA_VERSION = 5;
+export const CURRENT_SCHEMA_VERSION = 6;
 
 export interface StoreOptions {
   filePath: string;
@@ -461,6 +461,39 @@ export function migrate(file: TaskStoreFile, targetVersion: number): TaskStoreFi
         }
         if (!task.brief) {
           task.brief = synthesizeBriefFromGoal(task.goal, task.description);
+        }
+      }
+      continue;
+    }
+    if (current.schemaVersion === 5) {
+      current.schemaVersion = 6;
+      for (const task of Object.values(current.tasks)) {
+        task.executionEpoch = task.executionEpoch ?? 1;
+        const legacy = task.executionPolicy;
+        const exactLegacyDefaults =
+          legacy.turnTimeoutMs === 300_000 && legacy.taskTimeoutMs === 1_800_000;
+        task.executionPolicy = {
+          maxTurns: legacy.maxTurns,
+          maxAutomaticRetries: legacy.maxAutomaticRetries,
+          ...(!exactLegacyDefaults && legacy.turnTimeoutMs !== undefined
+            ? { runTimeoutOverrideMs: legacy.turnTimeoutMs }
+            : {}),
+        };
+      }
+      for (const turn of Object.values(current.turns)) {
+        const task = current.tasks[turn.taskId];
+        turn.executionEpoch = turn.executionEpoch ?? task?.executionEpoch ?? 1;
+        if (
+          (turn.status === 'running' || turn.status === 'waiting_user') &&
+          turn.effectiveRunLimitMs === undefined &&
+          turn.runDeadlineAt === undefined
+        ) {
+          const legacyLimit = task?.executionPolicy.runTimeoutOverrideMs ?? 300_000;
+          const startedMs = Date.parse(turn.startedAt ?? turn.createdAt);
+          if (Number.isFinite(startedMs)) {
+            turn.effectiveRunLimitMs = legacyLimit;
+            turn.runDeadlineAt = new Date(startedMs + legacyLimit).toISOString();
+          }
         }
       }
       continue;

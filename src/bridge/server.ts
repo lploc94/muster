@@ -8,7 +8,7 @@ import {
   ListToolsRequestSchema,
   isInitializeRequest,
 } from '@modelcontextprotocol/sdk/types.js';
-import type { CredentialRegistry } from './credentials';
+import type { CredentialRegistry, CredentialVerification } from './credentials';
 import type { ToolAction } from '../task/capabilities';
 import {
   dispatch,
@@ -102,8 +102,11 @@ const EXECUTION_POLICY_SCHEMA = {
   properties: {
     maxTurns: { type: 'integer', minimum: 1 },
     maxAutomaticRetries: { type: 'integer', minimum: 0 },
-    turnTimeoutMs: { type: 'integer', minimum: 1 },
-    taskTimeoutMs: { type: 'integer', minimum: 1 },
+    runTimeoutOverrideMs: {
+      type: 'integer',
+      minimum: 1,
+      description: 'Optional shorter run budget. The user-configured host limit is always the ceiling.',
+    },
   },
   additionalProperties: false,
 };
@@ -235,7 +238,7 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
       waitForCompletion: {
         type: 'boolean',
         description:
-          'When true, stage wait on this child in the same call (preferred one-shot spawn+barrier).',
+          'When true, stage wait on this child in the same call. On success the barrier is armed: end the current turn; do not wait or poll again.',
       },
     },
     additionalProperties: false,
@@ -259,7 +262,7 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
         type: 'array',
         items: { type: 'string', minLength: 1 },
         minItems: 1,
-        description: 'Exact batch-local ids to wait on (subset of tasks[].localId).',
+        description: 'Exact batch-local ids to wait on. On success end the current turn; do not wait or poll again.',
       },
     },
     additionalProperties: false,
@@ -281,7 +284,7 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
         items: OP_ID,
         minItems: 1,
         description:
-          'Exact direct-child ids to wait on after release (subset of release set or already released).',
+          'Exact direct-child ids to wait on after release. On success end the current turn; do not wait or poll again.',
       },
     },
     additionalProperties: false,
@@ -436,6 +439,27 @@ function parseBearer(header: string | undefined): string | undefined {
   return token.length > 0 ? token : undefined;
 }
 
+/** Preserve MCP's text content shape while making disposition conflicts machine-readable. */
+export function formatToolError(error: string): string {
+  const conflict = /^disposition conflict: current disposition is ([a-z_]+)$/i.exec(error);
+  if (!conflict) return error;
+  return JSON.stringify({
+    code: 'disposition_conflict',
+    currentDisposition: conflict[1],
+    message: error,
+  });
+}
+
+function logCredentialRejection(verification: CredentialVerification): void {
+  if (verification.ok) return;
+  console.info('[muster][bridge] credential.reject', {
+    credentialId: verification.credentialId ?? null,
+    callerTaskId: verification.callerTaskId ?? null,
+    turnId: verification.turnId ?? null,
+    reason: verification.reason,
+  });
+}
+
 function isLoopbackHost(host: string | undefined, port: number): boolean {
   if (!host) {
     return false;
@@ -469,7 +493,9 @@ function createMcpServer(
 
   server.setRequestHandler(ListToolsRequestSchema, async (request, extra) => {
     const authHeader = (extra as { authInfo?: { token?: string } }).authInfo?.token;
-    const ctx = authHeader ? credentials.verify(authHeader) : null;
+    const verification = credentials.verifyDetailed(authHeader ?? '');
+    if (!verification.ok) logCredentialRejection(verification);
+    const ctx = verification.ok ? verification.context : null;
     const allowed = ctx?.allowedActions ?? new Set<ToolAction>();
     return {
       tools: ALL_TOOLS.filter((name) => allowed.has(name)).map((name) => ({
@@ -480,17 +506,17 @@ function createMcpServer(
             : name === 'list_task_types'
               ? 'Refresh configured muster.taskTypes (first-turn host context already lists them). Prefer taskType from host snapshot; omit backend/model unless the user named an override.'
               : name === 'delegate_task'
-                ? 'Create a released child by taskType and queue first turn. Prefer waitForCompletion:true for one-shot spawn+wait. Omit wait fields for fire-and-forget. Requires wait_for_tasks when waiting.'
+                ? 'Create a released child by taskType and queue first turn. Prefer waitForCompletion:true for one-shot spawn+wait. A successful compound wait is already armed: end the turn and do not poll. Omit wait fields for fire-and-forget.'
                 : name === 'create_task'
                   ? 'Create a draft child by taskType (not scheduled until release_tasks). Prefer rich brief.'
                   : name === 'delegate_tasks'
-                    ? 'Batch create+release up to 16 children (topo-sorts dependsOn/inputBindings; intra-batch deps use succeeded/fail). Optional waitForLocalIds for exact wait subset. Requires wait_for_tasks when waiting.'
+                    ? 'Batch create+release up to 16 children. Optional waitForLocalIds arms the barrier; on success end the turn and do not poll.'
                     : name === 'create_tasks'
                       ? 'Batch create draft children (up to 16). Release later with release_tasks({ waitForTaskIds }). Intra-batch dependsOn → succeeded/fail.'
                       : name === 'release_tasks'
-                        ? 'Atomically release drafts and queue first turns. Optional waitForTaskIds for exact wait subset (requires wait_for_tasks). No start_task.'
+                        ? 'Atomically release drafts and queue first turns. Optional waitForTaskIds arms the barrier; on success end the turn and do not poll. No start_task.'
                         : name === 'wait_for_tasks'
-                          ? 'Advanced: stage wait on already-running or earlier fire-and-forget children. Prefer compound wait fields on delegate/release for the happy path.'
+                          ? 'Advanced: monotonically add children to the current wait barrier. Redundant calls succeed. After success end the current turn; do not poll get_task_status.'
                           : name === 'set_task_lifecycle'
                             ? "Parent-seal a direct child's lifecycle (succeeded/failed/…). Use when child did not complete_task."
                             : name === 'upsert_presentation'
@@ -504,10 +530,12 @@ function createMcpServer(
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const authHeader = (extra as { authInfo?: { token?: string } }).authInfo?.token;
     const token = authHeader ?? '';
-    const ctx = credentials.verify(token);
-    if (!ctx) {
+    const verification = credentials.verifyDetailed(token);
+    if (!verification.ok) {
+      logCredentialRejection(verification);
       return { content: [{ type: 'text', text: 'unauthorized' }], isError: true };
     }
+    const ctx = verification.context;
 
     const name = request.params.name;
     const args = request.params.arguments ?? {};
@@ -518,7 +546,7 @@ function createMcpServer(
 
     const result = await toolHandler.handleToolCall(ctx, name, routed.command);
     if (!result.ok) {
-      return { content: [{ type: 'text', text: result.error }], isError: true };
+      return { content: [{ type: 'text', text: formatToolError(result.error) }], isError: true };
     }
     return { content: [{ type: 'text', text: JSON.stringify(result.result) }] };
   });
@@ -547,7 +575,9 @@ export class MusterBridgeServer {
 
     app.all('/mcp', async (req: http.IncomingMessage & { body?: unknown }, res: http.ServerResponse & { status: (code: number) => { json: (body: unknown) => void } }) => {
       const token = parseBearer(req.headers.authorization);
-      if (!token || !this.credentials.verify(token)) {
+      const verification = this.credentials.verifyDetailed(token ?? '');
+      if (!token || !verification.ok) {
+        logCredentialRejection(verification);
         res.status(401).json({ error: 'unauthorized' });
         return;
       }

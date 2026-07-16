@@ -69,6 +69,13 @@ import { BATCH_EXPAND_MAX, type ToolCommand } from './coordinator-tools';
 import { evaluateTaskReadiness } from './readiness';
 import { canPromoteTurn, dependencyTerminalOutcome } from './scheduler';
 import { canCreateTurn, DEFAULT_RESOURCE_LIMITS, type ResourceLimits } from './limits';
+import {
+  DEFAULT_RUN_LIMIT_MS,
+  resolveTaskExecutionPolicy,
+  resolveTurnRunDeadline,
+  remainingRunTimeMs,
+} from './execution-policy';
+import { TASK_ERROR_MAX_BYTES, TASK_RESULT_MAX_BYTES } from './content-limits';
 import { selectCommittedSessionId } from './session-select';
 import { TaskStore } from './store';
 import {
@@ -136,6 +143,8 @@ export interface TaskEngineConfig {
   credentialRegistry?: CredentialRegistry;
   bridgePort?: number;
   resourceLimits?: ResourceLimits;
+  /** Live host ceiling, read only when a queued turn is durably promoted. */
+  getRunLimitMs?: () => number;
   emit?: (e: EngineEvent) => void;
   /**
    * W9: workspace trust gate for create-and-run / promote. Default true (tests).
@@ -210,16 +219,13 @@ export interface LeaseRecord {
    * field existed; a missing/unparseable value is treated as "very old" → reclaimable.
    */
   createdAt?: string;
+  /** New leases expire after their owning turn deadline plus cleanup buffer. */
+  expiresAt?: string;
 }
 
-/**
- * Max age a lease may reach before it is presumed abandoned and becomes reclaimable even
- * if its PID still appears alive. This defeats PID reuse: a recycled PID that happens to
- * match a dead owner's PID can no longer keep a stale lease "alive" forever. Sized to the
- * default task timeout — the longest a task (and therefore any of its turns/leases) can
- * legitimately run before it is force-cancelled anyway.
- */
+/** Compatibility age fallback for legacy lease records without `expiresAt`. */
 export const MAX_LEASE_AGE_MS = 1_800_000;
+export const LEASE_CLEANUP_BUFFER_MS = 60_000;
 
 /**
  * Attention message set when auto-remediation pauses on an identical recurring verify
@@ -228,14 +234,10 @@ export const MAX_LEASE_AGE_MS = 1_800_000;
  */
 const PAUSE_ATTENTION_MESSAGE = 'identical verify failure recurred; auto-remediation paused';
 
-const DEFAULT_POLICY: TaskExecutionPolicy = {
-  maxTurns: 50,
-  maxAutomaticRetries: 2,
-  turnTimeoutMs: 300_000,
-  taskTimeoutMs: 1_800_000,
+const DEFAULT_LIMITS: DispositionLimits = {
+  maxResult: TASK_RESULT_MAX_BYTES,
+  maxError: TASK_ERROR_MAX_BYTES,
 };
-
-const DEFAULT_LIMITS: DispositionLimits = { maxResult: 16_384, maxError: 4_096 };
 
 function nowIso(clock?: () => string): string {
   return clock?.() ?? new Date().toISOString();
@@ -274,9 +276,9 @@ export function leasePath(storePath: string, turnId: string): string {
 
 /**
  * A lease is reclaimable when it is missing/empty/unparseable, owned by a dead PID, or
- * older than {@link MAX_LEASE_AGE_MS}. A legacy record without `createdAt` is treated as
- * very old → reclaimable. This is the single source of truth for both acquisition
- * (reclaiming a stale lease) and reload reconciliation (deciding a turn is orphaned).
+ * past its explicit deadline. Legacy records without `expiresAt` use `createdAt` plus
+ * {@link MAX_LEASE_AGE_MS}; missing legacy timestamps are treated as very old. This is
+ * the single source of truth for acquisition and reload reconciliation.
  */
 export function isLeaseReclaimable(record: LeaseRecord | undefined): boolean {
   if (!record) {
@@ -284,6 +286,12 @@ export function isLeaseReclaimable(record: LeaseRecord | undefined): boolean {
   }
   if (isProcessDead(record.pid)) {
     return true;
+  }
+  if (record.expiresAt) {
+    const expires = Date.parse(record.expiresAt);
+    if (Number.isFinite(expires)) {
+      return Date.now() > expires;
+    }
   }
   if (!record.createdAt) {
     return true;
@@ -293,6 +301,29 @@ export function isLeaseReclaimable(record: LeaseRecord | undefined): boolean {
     return true;
   }
   return Date.now() - created > MAX_LEASE_AGE_MS;
+}
+
+function updateLeaseExpiry(
+  storePath: string,
+  turnId: string,
+  record: LeaseRecord,
+  runDeadlineAt: string,
+): void {
+  const target = leasePath(storePath, turnId);
+  const current = readLockRecord(target);
+  if (current?.pid !== record.pid || current.token !== record.token) return;
+  const deadline = Date.parse(runDeadlineAt);
+  if (!Number.isFinite(deadline)) return;
+  const next: LeaseRecord = {
+    ...current,
+    expiresAt: new Date(deadline + LEASE_CLEANUP_BUFFER_MS).toISOString(),
+  };
+  try {
+    fs.writeFileSync(target, JSON.stringify(next), 'utf8');
+    record.expiresAt = next.expiresAt;
+  } catch {
+    // Compatibility fallback remains createdAt age + PID liveness.
+  }
 }
 
 /**
@@ -445,7 +476,7 @@ export function projectPrompt(
   turn: TaskTurn,
   messages: ReadonlyMap<string, TaskMessage>,
   file?: TaskStoreFile,
-  maxChildResultBytes = 16_384,
+  maxChildResultBytes = TASK_RESULT_MAX_BYTES,
 ): string {
   const parts: string[] = [];
   // W1: durable pin / frozen compiled prompt precedes turn inputs.
@@ -589,6 +620,7 @@ export class TaskEngine {
   private readonly credentialRegistry?: CredentialRegistry;
   private readonly bridgePort: number;
   private readonly resourceLimits: ResourceLimits;
+  private readonly getRunLimitMs: () => number;
   private readonly emit?: (e: EngineEvent) => void;
   private readonly isWorkspaceTrusted: () => boolean;
   private readonly prepareHostEnvironment?: () => Promise<void>;
@@ -658,6 +690,7 @@ export class TaskEngine {
     this.credentialRegistry = config.credentialRegistry;
     this.bridgePort = config.bridgePort ?? 0;
     this.resourceLimits = config.resourceLimits ?? DEFAULT_RESOURCE_LIMITS;
+    this.getRunLimitMs = config.getRunLimitMs ?? (() => DEFAULT_RUN_LIMIT_MS);
     this.emit = config.emit;
     this.isWorkspaceTrusted = config.isWorkspaceTrusted ?? (() => true);
     this.prepareHostEnvironment = config.prepareHostEnvironment;
@@ -755,6 +788,7 @@ export class TaskEngine {
       askBridge: this.askBridge,
       bridgePort: this.bridgePort,
       resourceLimits: this.resourceLimits,
+      getRunLimitMs: this.getRunLimitMs,
       clock: this.clock,
       liveRuns: this.liveRuns,
       pendingAskPromises: this.pendingAskPromises,
@@ -1142,7 +1176,7 @@ export class TaskEngine {
         'cancel_child',
         'interrupt_child',
       ],
-      executionPolicy: DEFAULT_POLICY,
+      executionPolicy: resolveTaskExecutionPolicy(undefined, { userRunLimitMs: this.getRunLimitMs() }),
       // Host composer create-and-run: atomic released (plan W3 matrix).
       releaseState: 'released',
       // Root host tasks are coordinators by default — use coordinate preamble
@@ -1453,7 +1487,9 @@ export class TaskEngine {
           'cancel_child',
           'interrupt_child',
         ],
-      executionPolicy: params.executionPolicy ?? DEFAULT_POLICY,
+      executionPolicy: resolveTaskExecutionPolicy(params.executionPolicy, {
+        userRunLimitMs: this.getRunLimitMs(),
+      }),
     };
 
     const commit = this.store.commit((draft) => {
@@ -2876,7 +2912,6 @@ export class TaskEngine {
     this.reconcileOrphanedHandoffs();
     this.reconcileChildWaits({ schedule: false });
     this.deferReloadQueuedTurns();
-    this.reconcileTaskTimeouts();
     processCancelRequests(this.graphDeps());
   }
 
@@ -3195,48 +3230,6 @@ export class TaskEngine {
       } else {
         this.deferredQueuedTurns.add(turn.id);
       }
-    }
-  }
-
-  private reconcileTaskTimeouts(): void {
-    const deps = this.graphDeps();
-    const now = nowIso(this.clock);
-    const nowMs = Date.parse(now);
-    if (!Number.isFinite(nowMs)) return;
-    for (const task of Object.values(this.store.getFile().tasks)) {
-      if (isTerminalLifecycle(task.lifecycle)) continue;
-      const turns = this.store.getTurnsForTask(task.id);
-      // Timeout applies only to a currently live turn that has been running too long.
-      // Never use the task's first-ever startedAt (that permanently bricks long-lived
-      // tasks after taskTimeoutMs and cancelled every new send).
-      // Never cancel queued user follow-ups here — that made send appear to "do nothing".
-      const live = turns.find((t) => t.status === 'running' || t.status === 'waiting_user');
-      if (!live?.startedAt) continue;
-      const startedMs = Date.parse(live.startedAt);
-      if (!Number.isFinite(startedMs)) continue;
-      if (nowMs - startedMs <= task.executionPolicy.taskTimeoutMs) continue;
-      const remoteLeased =
-        deps.leaseOwnerAlive(live.id) && !deps.ownsLease(live.id);
-      if (remoteLeased) {
-        deps.writeCancelRequest(live.id, 'interrupt', 'engine', `task-timeout-${task.id}`);
-        continue;
-      }
-      this.liveRuns.get(live.id)?.controller.abort();
-      this.store.commit((draft) => {
-        const pending = draft.turns[live.id];
-        if (
-          !pending ||
-          (pending.status !== 'running' && pending.status !== 'waiting_user')
-        ) {
-          return { ok: true };
-        }
-        const interrupted = interruptTurn(pending, { now });
-        if (interrupted.ok) {
-          draft.turns[live.id] = interrupted.next;
-        }
-        // Task lifecycle stays open for user recovery / decision.
-        return { ok: true };
-      });
     }
   }
 
@@ -3962,7 +3955,10 @@ export class TaskEngine {
   private exceedsTurnLimit(taskId: string, candidateTurnId?: string): boolean {
     const task = this.store.getTask(taskId);
     if (!task) return true;
-    const turns = this.store.getTurnsForTask(taskId);
+    const executionEpoch = task.executionEpoch ?? 1;
+    const turns = this.store
+      .getTurnsForTask(taskId)
+      .filter((turn) => (turn.executionEpoch ?? 1) === executionEpoch);
     const cap = Math.min(this.resourceLimits.maxTurnsPerTask, task.executionPolicy.maxTurns);
     const slotsUsed = turns.filter(
       (t) => t.status !== 'queued' || t.id === candidateTurnId,
@@ -3995,7 +3991,6 @@ export class TaskEngine {
   }
 
   private scheduleTurn(turnId: string): Promise<void> {
-    this.reconcileTaskTimeouts();
     // Phase C: downgrade stale host verdicts (git-guarded, no-op without host
     // verdicts) BEFORE sealing so a re-blocked fail/skip dependent seals this tick.
     this.revalidateVerdicts();
@@ -4312,7 +4307,22 @@ export class TaskEngine {
         return started;
       }
       // Phase C: durable pre_dispatch until onBeforePrompt flips to prompt_outstanding.
-      draft.turns[turnId] = { ...started.next, dispatchPhase: 'pre_dispatch' };
+      const frozenDeadline =
+        started.next.effectiveRunLimitMs !== undefined && started.next.runDeadlineAt
+          ? {
+              effectiveRunLimitMs: started.next.effectiveRunLimitMs,
+              runDeadlineAt: started.next.runDeadlineAt,
+            }
+          : resolveTurnRunDeadline(
+              draftTask.executionPolicy,
+              this.getRunLimitMs(),
+              now,
+            );
+      draft.turns[turnId] = {
+        ...started.next,
+        ...frozenDeadline,
+        dispatchPhase: 'pre_dispatch',
+      };
       return { ok: true };
     });
 
@@ -4335,6 +4345,9 @@ export class TaskEngine {
 
     const startedTurn = this.store.getFile().turns[turnId];
     if (startedTurn) {
+      if (startedTurn.runDeadlineAt) {
+        updateLeaseExpiry(this.storePath, turnId, lease, startedTurn.runDeadlineAt);
+      }
       this.safeEmit({
         type: 'turnStart',
         taskId: startedTurn.taskId,
@@ -4354,17 +4367,41 @@ export class TaskEngine {
       taskId: turn.taskId,
       sessionId: undefined,
     });
-    const turnTimeoutMs = task.executionPolicy.turnTimeoutMs;
+    const engineNowMs = Date.parse(nowIso(this.clock));
+    const remainingRunMs =
+      remainingRunTimeMs(
+        startedTurn ?? {},
+        Number.isFinite(engineNowMs) ? engineNowMs : Date.now(),
+      ) ?? DEFAULT_RUN_LIMIT_MS;
     const cancelPoll = setInterval(() => {
-      this.reconcileTaskTimeouts();
       processCancelRequests(this.graphDeps());
     }, 250);
-    const turnTimer =
-      turnTimeoutMs > 0
-        ? setTimeout(() => {
-            abort.abort();
-          }, turnTimeoutMs)
-        : undefined;
+    // A recovered/frozen deadline may already be expired. Arm a zero-delay
+    // watchdog instead of treating 0 as "no timeout" and running forever.
+    const turnTimer = setTimeout(() => {
+      const timeoutTurn = this.store.getFile().turns[turnId];
+      const limitMs = timeoutTurn?.effectiveRunLimitMs ?? remainingRunMs;
+      const deadlineAt = timeoutTurn?.runDeadlineAt ?? new Date().toISOString();
+      this.store.commit((draft) => {
+        const live = draft.turns[turnId];
+        if (!live || (live.status !== 'running' && live.status !== 'waiting_user')) {
+          return { ok: true };
+        }
+        draft.turns[turnId] = {
+          ...live,
+          termination: { kind: 'run_timeout', limitMs, deadlineAt },
+        };
+        return { ok: true };
+      });
+      console.info('[muster][task-orch] turn.settle.timeout', {
+        taskId: task.id,
+        turnId,
+        backend: task.backend,
+        limitMs,
+        deadlineAt,
+      });
+      abort.abort();
+    }, Math.max(0, remainingRunMs));
 
     let rawOutput = '';
     let observedSessionId: string | undefined;
@@ -4767,13 +4804,18 @@ export class TaskEngine {
             break;
           case 'error':
             if (event.isCancellation) {
+              const runTimedOut =
+                this.store.getFile().turns[turnId]?.termination?.kind === 'run_timeout';
               // Confirmed only if we armed a local interrupt and adapter did not
               // force-timeout. Missing meta / spontaneous cancel → forced.
               const handle = this.liveRuns.get(turnId);
               const armed = handle?.interruptArmed === true;
               const adapterForced = event.meta?.interruptConfidence === 'forced';
-              const confidence: 'confirmed' | 'forced' =
-                armed && !adapterForced ? 'confirmed' : 'forced';
+              const confidence: 'confirmed' | 'forced' | 'run_timeout' = runTimedOut
+                ? 'run_timeout'
+                : armed && !adapterForced
+                  ? 'confirmed'
+                  : 'forced';
               terminalSettled = await this.settleInterrupted(
                 turnId,
                 observedSessionId,
@@ -4831,13 +4873,16 @@ export class TaskEngine {
       }
 
       if (!terminalSettled) {
-        terminalSettled = await this.settleFailed(
-          turnId,
-          'turn ended without terminal event',
-          observedSessionId,
-          rawOutput,
-          backend,
-        );
+        const runTimedOut = this.store.getFile().turns[turnId]?.termination?.kind === 'run_timeout';
+        terminalSettled = runTimedOut
+          ? await this.settleInterrupted(turnId, observedSessionId, rawOutput, backend, 'run_timeout')
+          : await this.settleFailed(
+              turnId,
+              'turn ended without terminal event',
+              observedSessionId,
+              rawOutput,
+              backend,
+            );
         if (terminalSettled) {
           this.safeEmit({
             type: 'turnError',
@@ -4850,14 +4895,17 @@ export class TaskEngine {
     } catch (error) {
       if (!terminalSettled) {
         const message = error instanceof Error ? error.message : String(error);
-        terminalSettled = await this.settleFailed(turnId, message, observedSessionId, rawOutput, backend);
+        const runTimedOut = this.store.getFile().turns[turnId]?.termination?.kind === 'run_timeout';
+        terminalSettled = runTimedOut
+          ? await this.settleInterrupted(turnId, observedSessionId, rawOutput, backend, 'run_timeout')
+          : await this.settleFailed(turnId, message, observedSessionId, rawOutput, backend);
         if (terminalSettled) {
           this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message });
         }
       }
     } finally {
       clearInterval(cancelPoll);
-      if (turnTimer) clearTimeout(turnTimer);
+      clearTimeout(turnTimer);
       // Hard clear elicitation wait tokens — do not soft-resume a settling turn.
       this.dropElicitationWaits(turnId);
       this.liveRuns.delete(turnId);
@@ -5093,7 +5141,7 @@ export class TaskEngine {
     observedSessionId: string | undefined,
     rawOutput: string,
     backend: Backend,
-    interruptConfidence: 'confirmed' | 'forced' = 'confirmed',
+    interruptConfidence: 'confirmed' | 'forced' | 'run_timeout' = 'confirmed',
   ): Promise<boolean> {
     if (this.settling.has(turnId)) {
       return false;
@@ -5121,8 +5169,8 @@ export class TaskEngine {
           ...result.next,
           observedSessionId: observed,
           candidateSessionId: candidate,
-          isCancellation: true,
-          interruptConfidence,
+          isCancellation: interruptConfidence !== 'run_timeout',
+          ...(interruptConfidence === 'run_timeout' ? {} : { interruptConfidence }),
         };
 
         const task = draft.tasks[turn.taskId];

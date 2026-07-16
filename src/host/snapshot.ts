@@ -86,6 +86,8 @@ export interface TaskSummary {
   currentTurnActivity: TurnActivity;
   /** Agent proposed complete/fail; root stays open until user continues or accepts. */
   hasOutcomeProposal?: boolean;
+  /** Sanitized explanation for the latest configured run-limit termination. */
+  runTimeoutMessage?: string;
   updatedAt: string;
   backend: string;
   /** Optional model id selected for this task (ACP session config option value). */
@@ -437,6 +439,16 @@ export function projectTaskSummary(file: TaskStoreFile, taskId: string): TaskSum
   const handoffProgress = projectHandoffProgress(task.handoff);
   const childOrchestration =
     task.role === 'coordinator' ? projectChildOrchestration(file, taskId) : undefined;
+  // Only the latest settled/live turn may present a run-timeout reason. Historical
+  // timeouts must not mislabel a later ordinary failure after retry.
+  const latestTurn = [...turns].sort((a, b) => b.sequence - a.sequence)[0];
+  const timedOut =
+    latestTurn?.termination?.kind === 'run_timeout' ? latestTurn : undefined;
+  const timeoutLabel = timedOut?.termination
+    ? timedOut.termination.limitMs >= 60 * 60_000 && timedOut.termination.limitMs % (60 * 60_000) === 0
+      ? `${timedOut.termination.limitMs / (60 * 60_000)}-hour`
+      : `${Math.max(1, Math.round(timedOut.termination.limitMs / 60_000))}-minute`
+    : undefined;
   return {
     id: task.id,
     parentId: task.parentId,
@@ -447,6 +459,9 @@ export function projectTaskSummary(file: TaskStoreFile, taskId: string): TaskSum
     viewStatus: deriveViewStatus(task, turns, deps),
     currentTurnActivity: projectCurrentTurnActivity(file, taskId),
     hasOutcomeProposal: task.outcomeProposal != null,
+    ...(timeoutLabel !== undefined
+      ? { runTimeoutMessage: `Agent run reached the configured ${timeoutLabel} limit.` }
+      : {}),
     updatedAt: projectActivityTime(file, taskId),
     backend: task.backend,
     model: task.model,

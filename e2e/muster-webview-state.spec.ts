@@ -202,22 +202,34 @@ function taskTypesOkSnapshot(overrides: Partial<{
 }
 
 function retentionSettingsSnapshot(values: {
-  maxTurnsPerTask: number;
+  maxRetainedTurnsPerTask: number;
   maxStoredOutputChars: number;
+  runLimit?: '15m' | '30m' | '1h' | '2h' | '4h' | '8h';
 }) {
   return {
     settings: [
       {
-        id: 'maxTurnsPerTask',
-        label: 'Max turns per task',
+        kind: 'enum',
+        id: 'runLimit',
+        label: 'Maximum uninterrupted agent run',
+        description: 'Maximum uninterrupted runtime for a newly promoted agent turn.',
+        value: values.runLimit ?? '2h',
+        defaultValue: '2h',
+        options: ['15m', '30m', '1h', '2h', '4h', '8h'],
+      },
+      {
+        kind: 'number',
+        id: 'maxRetainedTurnsPerTask',
+        label: 'Retained turns per completed task',
         description: 'Controls how many settled turns are retained for each terminal task.',
-        value: values.maxTurnsPerTask,
+        value: values.maxRetainedTurnsPerTask,
         defaultValue: 200,
         minimum: 1,
       },
       {
+        kind: 'number',
         id: 'maxStoredOutputChars',
-        label: 'Max stored output characters',
+        label: 'Stored output per turn',
         description: 'Limits retained assistant output for settled turns on open tasks.',
         value: values.maxStoredOutputChars,
         defaultValue: 200000,
@@ -225,6 +237,14 @@ function retentionSettingsSnapshot(values: {
       },
     ],
   };
+}
+
+async function openHistoryStorage(page: Page): Promise<void> {
+  const advanced = page.getByTestId('history-storage-advanced');
+  await expect(advanced).toBeVisible();
+  if ((await advanced.getAttribute('open')) === null) {
+    await advanced.locator('summary').click();
+  }
 }
 
 function permissionSettingsSnapshot(mode: 'ask' | 'allow' | 'readonly' = 'ask') {
@@ -305,7 +325,7 @@ function taskTypesSettingsSnapshot(overrides?: {
 // PROTOCOL_VERSION in webview/src/lib/protocol.ts. Test fixtures below always
 // send it so the version-mismatch banner doesn't mask the harness's own
 // snapshot messages.
-const PROTOCOL_VERSION = 4;
+const PROTOCOL_VERSION = 5;
 
 async function postSnapshot(page: Page, snapshot: SnapshotMessage) {
   await page.evaluate((message) => {
@@ -4348,64 +4368,49 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expectPostedMessage(page, { type: 'requestSettings' });
     await expectPostedMessage(page, { type: 'requestTaskTypesSettings' });
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
-    await page.getByRole('tab', { name: /Retention/i }).click();
-    await expect(page.getByRole('tab', { name: /Retention/i })).toHaveAttribute('aria-selected', 'true');
-    await expect(page.getByText('Retention keeps recent task history usable without storing unlimited completed-turn output.')).toBeVisible();
-    await expect(page.getByRole('status').getByText('Loading retention settings from VS Code…')).toBeVisible();
+    await page.getByRole('tab', { name: /Runtime & Storage/i }).click();
+    await expect(page.getByRole('tab', { name: /Runtime & Storage/i })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByText('Control uninterrupted agent runtime and how much completed history is retained.')).toBeVisible();
+    await expect(page.getByRole('status').getByText('Loading runtime and storage settings from VS Code…')).toBeVisible();
     // Full-view Settings replaces the task list (not an overlay).
     await expect(page.getByPlaceholder('Search tasks…')).toHaveCount(0);
     await expect(page.getByRole('button', { name: 'Back to tasks' })).toBeVisible();
 
     await postRawHostMessage(page, {
       type: 'settingsSnapshot',
-      snapshot: {
-        settings: [
-          {
-            id: 'maxTurnsPerTask',
-            label: 'Max turns per task',
-            description: 'Controls how many settled turns are retained for each terminal task.',
-            value: 200,
-            defaultValue: 200,
-            minimum: 1,
-          },
-          {
-            id: 'maxStoredOutputChars',
-            label: 'Max stored output characters',
-            description: 'Limits retained assistant output for settled turns on open tasks.',
-            value: 200000,
-            defaultValue: 200000,
-            minimum: 1024,
-          },
-        ],
-      },
+      snapshot: retentionSettingsSnapshot({
+        maxRetainedTurnsPerTask: 200,
+        maxStoredOutputChars: 200000,
+      }),
     });
 
     // Once the snapshot loads, the loading status is replaced by the editable fields.
-    await expect(page.getByText('Loading retention settings from VS Code…')).toHaveCount(0);
-    await expect(page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true })).toHaveValue('200');
-    await expect(page.getByRole('spinbutton', { name: 'Maximum stored output characters', exact: true })).toHaveValue('200000');
+    await expect(page.getByText('Loading runtime and storage settings from VS Code…')).toHaveCount(0);
+    await openHistoryStorage(page);
+    await expect(page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true })).toHaveValue('200');
+    await expect(page.getByRole('spinbutton', { name: 'Stored output per turn', exact: true })).toHaveValue('200000');
     await expect(page.getByText('Min 1 · Default 200')).toBeVisible();
     await expect(page.getByText('Min 1024 · Default 200000')).toBeVisible();
 
-    await page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true }).fill('0');
-    await page.getByRole('button', { name: 'Save Maximum turns per task' }).click();
-    await expect(page.getByRole('alert').getByText('Maximum turns per task must be at least 1.')).toBeVisible();
+    await page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true }).fill('0');
+    await page.getByRole('button', { name: 'Save Retained turns per completed task' }).click();
+    await expect(page.getByRole('alert').getByText('Retained turns per completed task must be at least 1.')).toBeVisible();
     await expect.poll(async () => (await postedMessages(page)).filter((message) => (message as { type?: string }).type === 'updateSetting')).toHaveLength(0);
 
-    await page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true }).fill('201');
-    await page.getByRole('button', { name: 'Save Maximum turns per task' }).click();
-    await expectPostedMessage(page, { type: 'updateSetting', settingId: 'maxTurnsPerTask', value: 201 });
-    await expect(page.getByText('Saving Maximum turns per task…')).toBeVisible();
+    await page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true }).fill('201');
+    await page.getByRole('button', { name: 'Save Retained turns per completed task' }).click();
+    await expectPostedMessage(page, { type: 'updateSetting', settingId: 'maxRetainedTurnsPerTask', value: 201 });
+    await expect(page.getByText('Saving Retained turns per completed task…')).toBeVisible();
 
     await postRawHostMessage(page, {
       type: 'settingsUpdateResult',
-      result: { ok: true, settingId: 'maxTurnsPerTask', value: 201 },
+      result: { ok: true, settingId: 'maxRetainedTurnsPerTask', value: 201 },
     });
-    await expect(page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true })).toHaveValue('201');
-    await expect(page.getByText('Saved Maximum turns per task.')).toBeVisible();
+    await expect(page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true })).toHaveValue('201');
+    await expect(page.getByText('Saved Retained turns per completed task.')).toBeVisible();
 
-    await page.getByRole('spinbutton', { name: 'Maximum stored output characters', exact: true }).fill('250000');
-    await page.getByRole('button', { name: 'Save Maximum stored output characters' }).click();
+    await page.getByRole('spinbutton', { name: 'Stored output per turn', exact: true }).fill('250000');
+    await page.getByRole('button', { name: 'Save Stored output per turn' }).click();
     await expectPostedMessage(page, { type: 'updateSetting', settingId: 'maxStoredOutputChars', value: 250000 });
     await postRawHostMessage(page, {
       type: 'settingsUpdateResult',
@@ -4416,15 +4421,15 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
         message: 'Error: leaked stack trace from vscode.workspace.getConfiguration().update',
       },
     });
-    await expect(page.getByRole('alert').getByText('Retention save failed')).toBeVisible();
-    await expect(page.getByRole('alert').getByText('Unable to save Maximum stored output characters. Check the VS Code setting and try again.')).toBeVisible();
+    await expect(page.getByRole('alert').getByText('Runtime & Storage save failed')).toBeVisible();
+    await expect(page.getByRole('alert').getByText('Unable to save Stored output per turn. Check the VS Code setting and try again.')).toBeVisible();
     await expect(page.getByText('leaked stack trace')).toHaveCount(0);
     // Failed save keeps the attempted draft (does not rehydrate back to prior saved).
-    await expect(page.getByRole('spinbutton', { name: 'Maximum stored output characters', exact: true })).toHaveValue('250000');
+    await expect(page.getByRole('spinbutton', { name: 'Stored output per turn', exact: true })).toHaveValue('250000');
 
     await page.setViewportSize({ width: 360, height: 720 });
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Save Maximum stored output characters' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Save Stored output per turn' })).toBeVisible();
     await expect
       .poll(() =>
         page.locator('.settings-panel').evaluate((panel) => panel.scrollWidth <= panel.clientWidth),
@@ -4483,7 +4488,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expect(tabs).toHaveCount(5);
     await expect(tabs.nth(0)).toHaveText(/Task Types/i);
     await expect(tabs.nth(1)).toHaveText(/Permissions/i);
-    await expect(tabs.nth(2)).toHaveText(/Retention/i);
+    await expect(tabs.nth(2)).toHaveText(/Runtime & Storage/i);
     await expect(tabs.nth(3)).toHaveText(/Models and CLIs/i);
     await expect(tabs.nth(4)).toHaveText(/Context and MCP/i);
 
@@ -4498,7 +4503,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expect(taskTypesPanel).toHaveAttribute('aria-labelledby', 'settings-tab-task-types');
     await expect(page.getByRole('heading', { name: 'Task Types' })).toBeVisible();
 
-    for (const name of [/Permissions/i, /Retention/i, /Models and CLIs/i, /Context and MCP/i]) {
+    for (const name of [/Permissions/i, /Runtime & Storage/i, /Models and CLIs/i, /Context and MCP/i]) {
       await expect(page.getByRole('tab', { name })).toHaveAttribute('aria-selected', 'false');
       await expect(page.getByRole('tab', { name })).toHaveAttribute('tabindex', '-1');
     }
@@ -4516,7 +4521,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     const permissionsTab = page.getByRole('tab', { name: /Permissions/i });
     await permissionsTab.focus();
     await permissionsTab.press('ArrowRight');
-    const retentionTab = page.getByRole('tab', { name: /Retention/i });
+    const retentionTab = page.getByRole('tab', { name: /Runtime & Storage/i });
     await expect(retentionTab).toHaveAttribute('aria-selected', 'true');
     await expect(page.locator('#settings-panel-retention')).toBeVisible();
 
@@ -4617,7 +4622,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     const topicOrder = [
       { name: /Task Types/i, id: 'task-types', panel: 'settings-panel-task-types' },
       { name: /Permissions/i, id: 'permissions', panel: 'settings-panel-permissions' },
-      { name: /Retention/i, id: 'retention', panel: 'settings-panel-retention' },
+      { name: /Runtime & Storage/i, id: 'retention', panel: 'settings-panel-retention' },
       { name: /Models and CLIs/i, id: 'models-and-clis', panel: 'settings-panel-models-and-clis' },
       { name: /Context and MCP/i, id: 'context-and-mcp', panel: 'settings-panel-context-and-mcp' },
     ] as const;
@@ -4710,8 +4715,8 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     expect(placeholderMutations).toEqual([]);
 
     // Tab / Shift+Tab: leave the tablist into the panel, then return; selected indicator stays.
-    await page.getByRole('tab', { name: /Retention/i }).click();
-    const retentionTab = page.getByRole('tab', { name: /Retention/i });
+    await page.getByRole('tab', { name: /Runtime & Storage/i }).click();
+    const retentionTab = page.getByRole('tab', { name: /Runtime & Storage/i });
     await expect(retentionTab).toHaveAttribute('aria-selected', 'true');
     await retentionTab.focus();
     await page.keyboard.press('Tab');
@@ -4742,43 +4747,28 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expect(retentionTab).toBeFocused();
     await expect(retentionTab).toHaveAttribute('aria-selected', 'true');
 
-    // Return to Retention with a real snapshot and usable controls.
+    // Return to Runtime & Storage with a real snapshot and usable controls.
     await postRawHostMessage(page, {
       type: 'settingsSnapshot',
-      snapshot: {
-        settings: [
-          {
-            id: 'maxTurnsPerTask',
-            label: 'Max turns per task',
-            description: 'Controls how many settled turns are retained for each terminal task.',
-            value: 150,
-            defaultValue: 200,
-            minimum: 1,
-          },
-          {
-            id: 'maxStoredOutputChars',
-            label: 'Max stored output characters',
-            description: 'Limits retained assistant output for settled turns on open tasks.',
-            value: 100000,
-            defaultValue: 200000,
-            minimum: 1024,
-          },
-        ],
-      },
+      snapshot: retentionSettingsSnapshot({
+        maxRetainedTurnsPerTask: 150,
+        maxStoredOutputChars: 100000,
+      }),
     });
-    await expect(page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true })).toHaveValue('150');
-    await expect(page.getByRole('spinbutton', { name: 'Maximum stored output characters', exact: true })).toHaveValue(
+    await openHistoryStorage(page);
+    await expect(page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true })).toHaveValue('150');
+    await expect(page.getByRole('spinbutton', { name: 'Stored output per turn', exact: true })).toHaveValue(
       '100000',
     );
-    await page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true }).fill('175');
-    await page.getByRole('button', { name: 'Save Maximum turns per task' }).click();
-    await expectPostedMessage(page, { type: 'updateSetting', settingId: 'maxTurnsPerTask', value: 175 });
+    await page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true }).fill('175');
+    await page.getByRole('button', { name: 'Save Retained turns per completed task' }).click();
+    await expectPostedMessage(page, { type: 'updateSetting', settingId: 'maxRetainedTurnsPerTask', value: 175 });
     await postRawHostMessage(page, {
       type: 'settingsUpdateResult',
-      result: { ok: true, settingId: 'maxTurnsPerTask', value: 175 },
+      result: { ok: true, settingId: 'maxRetainedTurnsPerTask', value: 175 },
     });
-    await expect(page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true })).toHaveValue('175');
-    await expect(page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true })).toBeEnabled();
+    await expect(page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true })).toHaveValue('175');
+    await expect(page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true })).toBeEnabled();
 
     // Seed Task Types so 320px containment can inspect real type cards.
     await page.getByRole('tab', { name: /Task Types/i }).click();
@@ -4856,16 +4846,17 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
         }),
       );
 
-    // Retention controls remain usable at 320px without panel horizontal overflow.
-    await page.getByRole('tab', { name: /Retention/i }).click();
-    await expect(page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true })).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Save Maximum turns per task' })).toBeVisible();
+    // Runtime & Storage controls remain usable at 320px without panel horizontal overflow.
+    await page.getByRole('tab', { name: /Runtime & Storage/i }).click();
+    await openHistoryStorage(page);
+    await expect(page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Save Retained turns per completed task' })).toBeVisible();
     await expect
       .poll(async () =>
         page.evaluate(() => {
           const panel = document.querySelector('.settings-panel');
           const fields = document.querySelector('.settings-fields');
-          const input = document.querySelector('#settings-maxTurnsPerTask');
+          const input = document.querySelector('#settings-maxRetainedTurnsPerTask');
           const noHOverflow = (el: Element | null) => {
             if (!el) return false;
             const node = el as HTMLElement;
@@ -4880,12 +4871,12 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       )
       .toEqual({ panelOk: true, fieldsOk: true, inputOk: true });
 
-    await page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true }).fill('180');
-    await page.getByRole('button', { name: 'Save Maximum turns per task' }).click();
-    await expectPostedMessage(page, { type: 'updateSetting', settingId: 'maxTurnsPerTask', value: 180 });
+    await page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true }).fill('180');
+    await page.getByRole('button', { name: 'Save Retained turns per completed task' }).click();
+    await expectPostedMessage(page, { type: 'updateSetting', settingId: 'maxRetainedTurnsPerTask', value: 180 });
   });
 
-  test('M012 S02 flow: Task Types and Retention state safety, isolation, hide/reveal, and 320px layout', async ({
+  test('M012 S02 flow: Task Types and Runtime & Storage state safety, isolation, hide/reveal, and 320px layout', async ({
     page,
   }) => {
     await openWebview(page);
@@ -5135,28 +5126,29 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await page.locator('#tt-desc-0').fill('Isolation TT draft');
     await expect(page.getByTestId('task-types-dirty')).toBeVisible();
 
-    // --- Retention: validation, success, failed save + draft preservation, stale snapshot ---
-    await page.getByRole('tab', { name: /Retention/i }).click();
-    await expect(page.getByRole('tab', { name: /Retention/i })).toHaveAttribute('aria-selected', 'true');
+    // --- Runtime & Storage: validation, success, failed save + draft preservation, stale snapshot ---
+    await page.getByRole('tab', { name: /Runtime & Storage/i }).click();
+    await expect(page.getByRole('tab', { name: /Runtime & Storage/i })).toHaveAttribute('aria-selected', 'true');
     await postRawHostMessage(page, {
       type: 'settingsSnapshot',
-      snapshot: retentionSettingsSnapshot({ maxTurnsPerTask: 200, maxStoredOutputChars: 200000 }),
+      snapshot: retentionSettingsSnapshot({ maxRetainedTurnsPerTask: 200, maxStoredOutputChars: 200000 }),
     });
-    await expect(page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true })).toHaveValue(
+    await openHistoryStorage(page);
+    await expect(page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true })).toHaveValue(
       '200',
     );
 
     // Client validation: empty / non-numeric / below-min do not post updateSetting.
-    const turns = page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true });
+    const turns = page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true });
     await turns.fill('');
-    await page.getByRole('button', { name: 'Save Maximum turns per task' }).click();
-    await expect(page.getByRole('alert').getByText('Maximum turns per task must be a number.')).toBeVisible();
+    await page.getByRole('button', { name: 'Save Retained turns per completed task' }).click();
+    await expect(page.getByRole('alert').getByText('Retained turns per completed task must be a number.')).toBeVisible();
     await turns.fill('1.5');
-    await page.getByRole('button', { name: 'Save Maximum turns per task' }).click();
-    await expect(page.getByRole('alert').getByText('Maximum turns per task must be an integer.')).toBeVisible();
+    await page.getByRole('button', { name: 'Save Retained turns per completed task' }).click();
+    await expect(page.getByRole('alert').getByText('Retained turns per completed task must be an integer.')).toBeVisible();
     await turns.fill('0');
-    await page.getByRole('button', { name: 'Save Maximum turns per task' }).click();
-    await expect(page.getByRole('alert').getByText('Maximum turns per task must be at least 1.')).toBeVisible();
+    await page.getByRole('button', { name: 'Save Retained turns per completed task' }).click();
+    await expect(page.getByRole('alert').getByText('Retained turns per completed task must be at least 1.')).toBeVisible();
     await expect
       .poll(async () =>
         (await postedMessages(page)).filter((m) => (m as { type?: string }).type === 'updateSetting'),
@@ -5165,20 +5157,20 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
 
     // Success path.
     await turns.fill('222');
-    await page.getByRole('button', { name: 'Save Maximum turns per task' }).click();
-    await expectPostedMessage(page, { type: 'updateSetting', settingId: 'maxTurnsPerTask', value: 222 });
+    await page.getByRole('button', { name: 'Save Retained turns per completed task' }).click();
+    await expectPostedMessage(page, { type: 'updateSetting', settingId: 'maxRetainedTurnsPerTask', value: 222 });
     await postRawHostMessage(page, {
       type: 'settingsUpdateResult',
-      result: { ok: true, settingId: 'maxTurnsPerTask', value: 222 },
+      result: { ok: true, settingId: 'maxRetainedTurnsPerTask', value: 222 },
     });
     await expect(turns).toHaveValue('222');
-    await expect(page.getByTestId('retention-local-success')).toContainText('Saved Maximum turns per task.');
-    await expect(page.getByRole('tab', { name: /Retention/i })).toHaveAttribute('data-tab-state', 'saved');
+    await expect(page.getByTestId('retention-local-success')).toContainText('Saved Retained turns per completed task.');
+    await expect(page.getByRole('tab', { name: /Runtime & Storage/i })).toHaveAttribute('data-tab-state', 'saved');
 
     // Failed save keeps attempted draft and prior saved snapshot authoritative.
-    const chars = page.getByRole('spinbutton', { name: 'Maximum stored output characters', exact: true });
+    const chars = page.getByRole('spinbutton', { name: 'Stored output per turn', exact: true });
     await chars.fill('333333');
-    await page.getByRole('button', { name: 'Save Maximum stored output characters' }).click();
+    await page.getByRole('button', { name: 'Save Stored output per turn' }).click();
     await expectPostedMessage(page, {
       type: 'updateSetting',
       settingId: 'maxStoredOutputChars',
@@ -5194,37 +5186,37 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       },
     });
     await expect(page.getByTestId('retention-local-error')).toBeVisible();
-    await expect(page.getByTestId('retention-local-error')).toContainText('Retention save failed');
+    await expect(page.getByTestId('retention-local-error')).toContainText('Runtime & Storage save failed');
     await expect(page.getByTestId('retention-local-error')).toContainText(
-      'Unable to save Maximum stored output characters. Check the VS Code setting and try again.',
+      'Unable to save Stored output per turn. Check the VS Code setting and try again.',
     );
     await expect(page.getByText('leaked stack trace')).toHaveCount(0);
     await expect(chars).toHaveValue('333333');
-    await expect(page.getByRole('tab', { name: /Retention/i })).toHaveAttribute('data-tab-state', 'error');
+    await expect(page.getByRole('tab', { name: /Runtime & Storage/i })).toHaveAttribute('data-tab-state', 'error');
     await expect(page.getByTestId('settings-tab-indicator-retention')).toHaveText('Error');
 
     // Stale snapshot refreshes saved state but cannot overwrite dirty retention draft.
     await postRawHostMessage(page, {
       type: 'settingsSnapshot',
-      snapshot: retentionSettingsSnapshot({ maxTurnsPerTask: 222, maxStoredOutputChars: 200000 }),
+      snapshot: retentionSettingsSnapshot({ maxRetainedTurnsPerTask: 222, maxStoredOutputChars: 200000 }),
     });
     await expect(chars).toHaveValue('333333');
     await expect(turns).toHaveValue('222');
 
     // --- Cross-topic isolation: drafts, dirty indicators, and topic-local errors ---
-    // Retention still dirty+error; Task Types dirty from Isolation TT draft.
+    // Runtime & Storage still dirty+error; Task Types dirty from Isolation TT draft.
     await page.getByRole('tab', { name: /Task Types/i }).click();
     await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('aria-selected', 'true');
     await expect(page.locator('#tt-desc-0')).toHaveValue('Isolation TT draft');
     await expect(page.getByTestId('task-types-dirty')).toBeVisible();
     await expect(page.getByTestId('task-types-save-error')).toHaveCount(0);
     await expect(page.getByTestId('retention-local-error')).toHaveCount(0);
-    // Hidden Retention still shows error indicator on its tab.
-    await expect(page.getByRole('tab', { name: /Retention/i })).toHaveAttribute('data-tab-state', 'error');
+    // Hidden Runtime & Storage still shows error indicator on its tab.
+    await expect(page.getByRole('tab', { name: /Runtime & Storage/i })).toHaveAttribute('data-tab-state', 'error');
     await expect(page.getByTestId('settings-tab-indicator-retention')).toHaveText('Error');
     await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('data-tab-state', 'dirty');
 
-    // Inject Task Types error while Retention error remains on its tab.
+    // Inject Task Types error while Runtime & Storage error remains on its tab.
     await page.getByRole('button', { name: /^Save$/ }).click();
     await postRawHostMessage(page, {
       type: 'taskTypesSettingsUpdateResult',
@@ -5238,7 +5230,8 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('data-tab-state', 'error');
 
     // Switch repeatedly — both topic indicators and drafts remain isolated.
-    await page.getByRole('tab', { name: /Retention/i }).click();
+    await page.getByRole('tab', { name: /Runtime & Storage/i }).click();
+    await openHistoryStorage(page);
     await expect(chars).toHaveValue('333333');
     await expect(page.getByTestId('retention-local-error')).toBeVisible();
     await expect(page.getByTestId('task-types-save-error')).toHaveCount(0);
@@ -5247,7 +5240,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await page.getByRole('tab', { name: /Permissions/i }).click();
     await expect(page.getByTestId('permissions-settings')).toBeVisible();
     await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('data-tab-state', 'error');
-    await expect(page.getByRole('tab', { name: /Retention/i })).toHaveAttribute('data-tab-state', 'error');
+    await expect(page.getByRole('tab', { name: /Runtime & Storage/i })).toHaveAttribute('data-tab-state', 'error');
 
     await page.getByRole('tab', { name: /Task Types/i }).click();
     await expect(page.locator('#tt-desc-0')).toHaveValue('Isolation TT draft');
@@ -5268,7 +5261,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     expect(capturedState).toEqual(
       expect.objectContaining({
         'muster.settingsView.v1': expect.objectContaining({
-          v: 1,
+          v: 2,
           activeTopicId: 'task-types',
           taskTypeDrafts: expect.arrayContaining([
             expect.objectContaining({ id: 'worker', description: 'Isolation TT draft' }),
@@ -5312,16 +5305,17 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     });
     await postRawHostMessage(page, {
       type: 'settingsSnapshot',
-      snapshot: retentionSettingsSnapshot({ maxTurnsPerTask: 222, maxStoredOutputChars: 200000 }),
+      snapshot: retentionSettingsSnapshot({ maxRetainedTurnsPerTask: 222, maxStoredOutputChars: 200000 }),
     });
     await expect(page.locator('#tt-desc-0')).toHaveValue('Isolation TT draft');
     await expect(page.getByTestId('task-types-dirty')).toBeVisible();
 
-    await page.getByRole('tab', { name: /Retention/i }).click();
+    await page.getByRole('tab', { name: /Runtime & Storage/i }).click();
+    await openHistoryStorage(page);
     await expect(
-      page.getByRole('spinbutton', { name: 'Maximum stored output characters', exact: true }),
+      page.getByRole('spinbutton', { name: 'Stored output per turn', exact: true }),
     ).toHaveValue('333333');
-    await expect(page.getByRole('tab', { name: /Retention/i })).toHaveAttribute('data-tab-state', 'dirty');
+    await expect(page.getByRole('tab', { name: /Runtime & Storage/i })).toHaveAttribute('data-tab-state', 'dirty');
 
     // Unrelated bag keys still present after settings writes during restore.
     const restoredBag = await readVsCodeState(page);
@@ -5332,7 +5326,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
         ]),
         'muster.composerSelection.v1': expect.objectContaining({ backend: 'claude' }),
         'muster.settingsView.v1': expect.objectContaining({
-          v: 1,
+          v: 2,
           activeTopicId: 'retention',
         }),
       }),
@@ -5361,9 +5355,10 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       )
       .toEqual({ panelOk: true, cardsOk: true });
 
-    await page.getByRole('tab', { name: /Retention/i }).click();
-    await expect(page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true })).toBeVisible();
-    await expect(page.getByRole('button', { name: 'Save Maximum turns per task' })).toBeVisible();
+    await page.getByRole('tab', { name: /Runtime & Storage/i }).click();
+    await openHistoryStorage(page);
+    await expect(page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Save Retained turns per completed task' })).toBeVisible();
     await expect
       .poll(async () =>
         page.evaluate(() => {
@@ -5396,7 +5391,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expectPostedMessage(page, { type: 'requestPermissionSettings' });
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
 
-    // Seed Task Types + Retention so isolation can prove they stay untouched.
+    // Seed Task Types + Runtime & Storage so isolation can prove they stay untouched.
     await postRawHostMessage(page, {
       type: 'taskTypesSettingsSnapshot',
       snapshot: taskTypesOkSnapshot({
@@ -5413,7 +5408,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     });
     await postRawHostMessage(page, {
       type: 'settingsSnapshot',
-      snapshot: retentionSettingsSnapshot({ maxTurnsPerTask: 111, maxStoredOutputChars: 150000 }),
+      snapshot: retentionSettingsSnapshot({ maxRetainedTurnsPerTask: 111, maxStoredOutputChars: 150000 }),
     });
 
     await page.getByRole('tab', { name: /Permissions/i }).click();
@@ -5527,9 +5522,10 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expect(page.locator('#tt-desc-0')).toHaveValue('S03 worker stays');
     await expect(page.getByTestId('task-types-dirty')).toHaveCount(0);
     await expect(page.getByTestId('task-types-save-error')).toHaveCount(0);
-    await page.getByRole('tab', { name: /Retention/i }).click();
+    await page.getByRole('tab', { name: /Runtime & Storage/i }).click();
+    await openHistoryStorage(page);
     await expect(
-      page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true }),
+      page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true }),
     ).toHaveValue('111');
     await expect(page.getByTestId('retention-local-error')).toHaveCount(0);
     await expect(page.getByRole('tab', { name: /Permissions/i })).toHaveAttribute(
@@ -5613,7 +5609,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     });
     await postRawHostMessage(page, {
       type: 'settingsSnapshot',
-      snapshot: retentionSettingsSnapshot({ maxTurnsPerTask: 122, maxStoredOutputChars: 160000 }),
+      snapshot: retentionSettingsSnapshot({ maxRetainedTurnsPerTask: 122, maxStoredOutputChars: 160000 }),
     });
 
     await page.getByRole('tab', { name: /Permissions/i }).click();
@@ -5679,9 +5675,10 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await page.getByRole('tab', { name: /Task Types/i }).click();
     await expect(page.locator('#tt-desc-0')).toHaveValue('S03 flow worker stays');
     await expect(page.getByTestId('task-types-dirty')).toHaveCount(0);
-    await page.getByRole('tab', { name: /Retention/i }).click();
+    await page.getByRole('tab', { name: /Runtime & Storage/i }).click();
+    await openHistoryStorage(page);
     await expect(
-      page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true }),
+      page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true }),
     ).toHaveValue('122');
     await expect(page.getByTestId('retention-local-error')).toHaveCount(0);
     await expect(page.getByRole('tab', { name: /Permissions/i })).toHaveAttribute(
@@ -6641,7 +6638,7 @@ test.describe('Task-tree chrome navigation', () => {
 
     await postRawHostMessage(page, {
       type: 'settingsSnapshot',
-      snapshot: retentionSettingsSnapshot({ maxTurnsPerTask: 120, maxStoredOutputChars: 150000 }),
+      snapshot: retentionSettingsSnapshot({ maxRetainedTurnsPerTask: 120, maxStoredOutputChars: 150000 }),
     });
     await postRawHostMessage(page, {
       type: 'taskTypesSettingsSnapshot',
@@ -6679,7 +6676,7 @@ test.describe('Task-tree chrome navigation', () => {
     await expect(tabs).toHaveCount(5);
     await expect(tabs.nth(0)).toHaveText(/Task Types/i);
     await expect(tabs.nth(1)).toHaveText(/Permissions/i);
-    await expect(tabs.nth(2)).toHaveText(/Retention/i);
+    await expect(tabs.nth(2)).toHaveText(/Runtime & Storage/i);
     await expect(tabs.nth(3)).toHaveText(/Models and CLIs/i);
     await expect(tabs.nth(4)).toHaveText(/Context and MCP/i);
 
@@ -6690,7 +6687,7 @@ test.describe('Task-tree chrome navigation', () => {
     await expect(page.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', 'settings-tab-task-types');
 
     // Mouse activation of each topic
-    for (const name of [/Permissions/i, /Retention/i, /Models and CLIs/i, /Context and MCP/i, /Task Types/i]) {
+    for (const name of [/Permissions/i, /Runtime & Storage/i, /Models and CLIs/i, /Context and MCP/i, /Task Types/i]) {
       await page.getByRole('tab', { name }).click();
       await expect(page.getByRole('tab', { name })).toHaveAttribute('aria-selected', 'true');
     }
@@ -6772,23 +6769,24 @@ test.describe('Task-tree chrome navigation', () => {
     await expect(page.getByTestId('permissions-local-success')).toBeVisible();
     await expect(page.locator('#permission-mode-readonly')).toBeChecked();
 
-    // --- Successful host-backed update: Retention ---
-    await page.getByRole('tab', { name: /Retention/i }).click();
-    const turns = page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true });
+    // --- Successful host-backed update: Runtime & Storage ---
+    await page.getByRole('tab', { name: /Runtime & Storage/i }).click();
+    await openHistoryStorage(page);
+    const turns = page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true });
     await turns.fill('180');
-    await page.getByRole('button', { name: 'Save Maximum turns per task' }).click();
+    await page.getByRole('button', { name: 'Save Retained turns per completed task' }).click();
     await expectPostedMessage(page, {
       type: 'updateSetting',
-      settingId: 'maxTurnsPerTask',
+      settingId: 'maxRetainedTurnsPerTask',
       value: 180,
     });
     await postRawHostMessage(page, {
       type: 'settingsUpdateResult',
-      result: { ok: true, settingId: 'maxTurnsPerTask', value: 180 },
+      result: { ok: true, settingId: 'maxRetainedTurnsPerTask', value: 180 },
     });
     await postRawHostMessage(page, {
       type: 'settingsSnapshot',
-      snapshot: retentionSettingsSnapshot({ maxTurnsPerTask: 180, maxStoredOutputChars: 150000 }),
+      snapshot: retentionSettingsSnapshot({ maxRetainedTurnsPerTask: 180, maxStoredOutputChars: 150000 }),
     });
     await expect(turns).toHaveValue('180');
     await expect(page.getByTestId('retention-local-success')).toBeVisible();
@@ -6817,8 +6815,9 @@ test.describe('Task-tree chrome navigation', () => {
     await expect(page.getByTestId('permissions-dirty')).toHaveCount(0);
     await expect(page.getByTestId('permissions-local-error')).toHaveCount(0);
 
-    // Retention saved snapshot + indicators remain
-    await page.getByRole('tab', { name: /Retention/i }).click();
+    // Runtime & Storage saved snapshot + indicators remain
+    await page.getByRole('tab', { name: /Runtime & Storage/i }).click();
+    await openHistoryStorage(page);
     await expect(turns).toHaveValue('180');
     await expect(page.getByTestId('retention-local-error')).toHaveCount(0);
 
@@ -6879,7 +6878,7 @@ test.describe('Task-tree chrome navigation', () => {
     });
     await expect(page.getByTestId('task-types-dirty')).toHaveCount(0);
 
-    // --- Complete user loops re-run (Task Types already above; Permissions allow; Retention chars) ---
+    // --- Complete user loops re-run (Task Types already above; Permissions allow; Runtime & Storage chars) ---
     await page.getByRole('tab', { name: /Permissions/i }).click();
     await page.getByTestId('permission-mode-option-allow').click();
     await page.getByTestId('permissions-save').click();
@@ -6894,10 +6893,11 @@ test.describe('Task-tree chrome navigation', () => {
     });
     await expect(page.locator('#permission-mode-allow')).toBeChecked();
 
-    await page.getByRole('tab', { name: /Retention/i }).click();
-    const chars = page.getByRole('spinbutton', { name: 'Maximum stored output characters', exact: true });
+    await page.getByRole('tab', { name: /Runtime & Storage/i }).click();
+    await openHistoryStorage(page);
+    const chars = page.getByRole('spinbutton', { name: 'Stored output per turn', exact: true });
     await chars.fill('250000');
-    await page.getByRole('button', { name: 'Save Maximum stored output characters' }).click();
+    await page.getByRole('button', { name: 'Save Stored output per turn' }).click();
     await expectPostedMessage(page, {
       type: 'updateSetting',
       settingId: 'maxStoredOutputChars',
@@ -6909,7 +6909,7 @@ test.describe('Task-tree chrome navigation', () => {
     });
     await postRawHostMessage(page, {
       type: 'settingsSnapshot',
-      snapshot: retentionSettingsSnapshot({ maxTurnsPerTask: 180, maxStoredOutputChars: 250000 }),
+      snapshot: retentionSettingsSnapshot({ maxRetainedTurnsPerTask: 180, maxStoredOutputChars: 250000 }),
     });
     await expect(chars).toHaveValue('250000');
 
@@ -6917,7 +6917,7 @@ test.describe('Task-tree chrome navigation', () => {
     await chars.fill('333333');
     await postRawHostMessage(page, {
       type: 'settingsSnapshot',
-      snapshot: retentionSettingsSnapshot({ maxTurnsPerTask: 180, maxStoredOutputChars: 999999 }),
+      snapshot: retentionSettingsSnapshot({ maxRetainedTurnsPerTask: 180, maxStoredOutputChars: 999999 }),
     });
     await expect(chars).toHaveValue('333333');
 
@@ -6928,7 +6928,8 @@ test.describe('Task-tree chrome navigation', () => {
       'true',
     );
     // Leave a dirty retention draft before recreation
-    await page.getByRole('tab', { name: /Retention/i }).click();
+    await page.getByRole('tab', { name: /Runtime & Storage/i }).click();
+    await openHistoryStorage(page);
     await chars.fill('444444');
 
     const captured = await page.evaluate(() => {
@@ -6945,7 +6946,7 @@ test.describe('Task-tree chrome navigation', () => {
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
     await postRawHostMessage(page, {
       type: 'settingsSnapshot',
-      snapshot: retentionSettingsSnapshot({ maxTurnsPerTask: 180, maxStoredOutputChars: 250000 }),
+      snapshot: retentionSettingsSnapshot({ maxRetainedTurnsPerTask: 180, maxStoredOutputChars: 250000 }),
     });
     await postRawHostMessage(page, {
       type: 'taskTypesSettingsSnapshot',
@@ -6975,9 +6976,10 @@ test.describe('Task-tree chrome navigation', () => {
     });
 
     // Restored navigation + dirty retention draft
-    await expect(page.getByRole('tab', { name: /Retention/i })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('tab', { name: /Runtime & Storage/i })).toHaveAttribute('aria-selected', 'true');
+    await openHistoryStorage(page);
     await expect(
-      page.getByRole('spinbutton', { name: 'Maximum stored output characters', exact: true }),
+      page.getByRole('spinbutton', { name: 'Stored output per turn', exact: true }),
     ).toHaveValue('444444');
 
     // --- 320px: containment, one-row tab overflow, keyboard, Coming soon no-op ---

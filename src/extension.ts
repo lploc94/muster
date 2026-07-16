@@ -36,7 +36,9 @@ import {
 import {
   buildRetentionSettingsSnapshot,
   handleRetentionSettingUpdateAction,
-  type RetentionSettingSnapshot,
+  type RuntimeStorageSettingsSnapshot,
+  type RuntimeStorageSettingId,
+  selectRetainedTurnsValue,
 } from './host/retention-settings';
 import {
   TASK_TYPES_CONFIG_KEY,
@@ -93,6 +95,8 @@ import { TaskStore, computeAffectedTaskIds, type CommitResult } from './task/sto
 import { isTerminalLifecycle } from './task/transitions';
 import { resolveWorkspaceCwd } from './task/workspace-cwd';
 import type { TaskStoreFile } from './task/types';
+import { runLimitMs } from './task/execution-policy';
+import { USER_INTERACTION_TIMEOUT_MS } from './host/interaction-timeouts';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -225,10 +229,10 @@ function debugElicitation(event: string, details: Record<string, unknown> = {}):
  * version is stamped on the bootstrap `snapshot` message, and a mismatch is
  * surfaced in the webview as a visible "reload the window" banner.
  */
-const PROTOCOL_VERSION = 4;
+const PROTOCOL_VERSION = 5;
 
 /** How long a permission prompt waits for a webview decision before safe-denying. */
-const PERMISSION_PROMPT_TIMEOUT_MS = 120_000;
+const PERMISSION_PROMPT_TIMEOUT_MS = USER_INTERACTION_TIMEOUT_MS;
 /** Reject oversized inbound webview identifiers/option ids (defense-in-depth). */
 const MAX_ID_CHARS = 256;
 
@@ -283,18 +287,68 @@ function isValidAskAnswers(
   return true;
 }
 
-function readRetentionSettingsSnapshot(): RetentionSettingSnapshot {
+function readRetentionSettingsSnapshot(): RuntimeStorageSettingsSnapshot {
+  return buildRetentionSettingsSnapshot((key) => runtimeStorageConfiguration().get(key));
+}
+
+function explicitConfigurationValue<T>(
+  inspected: ReturnType<vscode.WorkspaceConfiguration['inspect']> | undefined,
+): T | undefined {
+  return inspected?.workspaceFolderValue as T | undefined ??
+    inspected?.workspaceValue as T | undefined ??
+    inspected?.globalValue as T | undefined;
+}
+
+function readRetainedTurnsValue(): unknown {
   const config = vscode.workspace.getConfiguration('muster.retention');
-  return buildRetentionSettingsSnapshot((key) => config.get(key));
+  const next = explicitConfigurationValue<number>(config.inspect('maxRetainedTurnsPerTask'));
+  const legacy = explicitConfigurationValue<number>(config.inspect('maxTurnsPerTask'));
+  return selectRetainedTurnsValue(next, legacy, config.get('maxRetainedTurnsPerTask'));
+}
+
+function runtimeStorageConfiguration() {
+  return {
+    get(key: RuntimeStorageSettingId): unknown {
+      if (key === 'runLimit') {
+        return vscode.workspace.getConfiguration('muster.execution').get('runLimit');
+      }
+      if (key === 'maxRetainedTurnsPerTask') return readRetainedTurnsValue();
+      return vscode.workspace.getConfiguration('muster.retention').get('maxStoredOutputChars');
+    },
+    async update(key: RuntimeStorageSettingId, value: number | string, target: unknown): Promise<void> {
+      const configuration = key === 'runLimit'
+        ? vscode.workspace.getConfiguration('muster.execution')
+        : vscode.workspace.getConfiguration('muster.retention');
+      await configuration.update(key, value, target as vscode.ConfigurationTarget);
+    },
+  };
+}
+
+async function migrateLegacyRetentionSetting(): Promise<void> {
+  const config = vscode.workspace.getConfiguration('muster.retention');
+  if (explicitConfigurationValue(config.inspect('maxRetainedTurnsPerTask')) !== undefined) return;
+  const legacyInspect = config.inspect<number>('maxTurnsPerTask');
+  const candidates: Array<[number | undefined, vscode.ConfigurationTarget]> = [
+    [legacyInspect?.workspaceFolderValue, vscode.ConfigurationTarget.WorkspaceFolder],
+    [legacyInspect?.workspaceValue, vscode.ConfigurationTarget.Workspace],
+    [legacyInspect?.globalValue, vscode.ConfigurationTarget.Global],
+  ];
+  const explicit = candidates.find(([value]) => value !== undefined);
+  if (!explicit) return;
+  try {
+    await config.update('maxRetainedTurnsPerTask', explicit[0], explicit[1]);
+  } catch {
+    // One-release read fallback above preserves the old value if migration cannot write.
+  }
 }
 
 function getRetentionConfig(): RetentionConfig {
   const snapshot = readRetentionSettingsSnapshot();
   return {
     maxTurnsPerTask:
-      snapshot.settings.find((setting) => setting.id === 'maxTurnsPerTask')?.value ?? 200,
+      Number(snapshot.settings.find((setting) => setting.id === 'maxRetainedTurnsPerTask')?.value ?? 200),
     maxStoredOutputChars:
-      snapshot.settings.find((setting) => setting.id === 'maxStoredOutputChars')?.value ?? 200_000,
+      Number(snapshot.settings.find((setting) => setting.id === 'maxStoredOutputChars')?.value ?? 200_000),
   };
 }
 
@@ -409,7 +463,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
 
   private async handleUpdateSetting(data: unknown): Promise<void> {
     const messages = await handleRetentionSettingUpdateAction(
-      vscode.workspace.getConfiguration('muster.retention'),
+      runtimeStorageConfiguration(),
       data,
       vscode.ConfigurationTarget.Workspace,
     );
@@ -2569,6 +2623,7 @@ function resolveTaskCwd(): string {
 }
 
 export async function activate(context: vscode.ExtensionContext) {
+  await migrateLegacyRetentionSetting();
   // Patch PATH from the login shell BEFORE anything spawns a backend CLI, so a
   // GUI-launched editor (minimal PATH) can both detect and actually run the CLIs.
   await installAugmentedPath();
@@ -2915,7 +2970,11 @@ export async function activate(context: vscode.ExtensionContext) {
           debugElicitation('host.grok_prompt_cancelled', { reason: 'task engine unavailable' });
           return { outcome: 'cancelled' };
         }
-        const registered = engine.registerAgentAsk(req.sessionId, req.questions, 120_000);
+        const registered = engine.registerAgentAsk(
+          req.sessionId,
+          req.questions,
+          USER_INTERACTION_TIMEOUT_MS,
+        );
         if (!registered.ok) {
           debugElicitation('host.grok_prompt_cancelled', { reason: registered.reason });
           return { outcome: 'cancelled' };
@@ -2999,7 +3058,12 @@ export async function activate(context: vscode.ExtensionContext) {
           return { action: 'cancel' as const };
         }
         const askLike = isAskLikeForm(form);
-        const { promptId, promise } = eBridge.registerForm(key, form, askLike, 120_000);
+        const { promptId, promise } = eBridge.registerForm(
+          key,
+          form,
+          askLike,
+          USER_INTERACTION_TIMEOUT_MS,
+        );
         debugElicitation('host.elicitation_waiting', {
           promptId,
           clientKey: key,
@@ -3034,7 +3098,7 @@ export async function activate(context: vscode.ExtensionContext) {
         if (urlReq.sessionId && taskEngine && !taskEngine.mayDirectAskUser(urlReq.sessionId)) {
           return { action: 'cancel' as const };
         }
-        const { promise } = eBridge.registerUrl(key, urlReq, 120_000);
+        const { promise } = eBridge.registerUrl(key, urlReq, USER_INTERACTION_TIMEOUT_MS);
         try {
           return await promise;
         } catch {
@@ -3098,6 +3162,8 @@ export async function activate(context: vscode.ExtensionContext) {
       askBridge,
       credentialRegistry,
       bridgePort: port,
+      getRunLimitMs: () =>
+        runLimitMs(vscode.workspace.getConfiguration('muster.execution').get('runLimit')),
       isWorkspaceTrusted: () => vscode.workspace.isTrusted,
       // Host execution of a task's verification commands is OFF unless the USER
       // explicitly enables it — commands become host-authorized, not agent-triggerable.

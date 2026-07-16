@@ -12,8 +12,9 @@ import type {
   PermissionModeSetting,
   PermissionSettingsSnapshot,
   PermissionSettingsUpdateResult,
-  RetentionSettingId,
-  RetentionSettingSnapshot,
+  RuntimeStorageSettingId,
+  RuntimeStorageSettingsSnapshot,
+  RunLimitSetting,
   SettingsUpdateResult,
   TaskTypeSettingsRow,
 } from './protocol';
@@ -23,7 +24,7 @@ import { isSettingsTopicId, type SettingsTopicId } from './settings-topics';
 export const SETTINGS_VIEW_STATE_KEY = 'muster.settingsView.v1';
 
 /** Envelope version — bump only with a coordinated migration. */
-export const SETTINGS_VIEW_STATE_VERSION = 1 as const;
+export const SETTINGS_VIEW_STATE_VERSION = 2 as const;
 
 /** Bounds aligned with host task-type constraints (fail closed on restore). */
 export const SETTINGS_TASK_TYPE_DRAFT_MAX = 32;
@@ -32,31 +33,33 @@ export const SETTINGS_TASK_TYPE_STRING_MAX = 200;
 export const SETTINGS_TASK_TYPE_DESCRIPTION_MAX = 200;
 export const SETTINGS_RETENTION_DRAFT_STRING_MAX = 64;
 
-const RETENTION_IDS: readonly RetentionSettingId[] = [
-  'maxTurnsPerTask',
+const RETENTION_IDS: readonly RuntimeStorageSettingId[] = [
+  'runLimit',
+  'maxRetainedTurnsPerTask',
   'maxStoredOutputChars',
 ] as const;
 
 const ROLES = new Set(['coordinator', 'worker']);
 
-export type RetentionDrafts = Record<RetentionSettingId, string>;
+export type RetentionDrafts = Record<RuntimeStorageSettingId, string>;
 
 /** Display labels for Retention fields (UI + sanitized save messages). */
-export const RETENTION_SETTING_LABELS: Record<RetentionSettingId, string> = {
-  maxTurnsPerTask: 'Maximum turns per task',
-  maxStoredOutputChars: 'Maximum stored output characters',
+export const RETENTION_SETTING_LABELS: Record<RuntimeStorageSettingId, string> = {
+  runLimit: 'Maximum uninterrupted agent run',
+  maxRetainedTurnsPerTask: 'Retained turns per completed task',
+  maxStoredOutputChars: 'Stored output per turn',
 };
 
 export type SettingsTabIndicator = { kind: string; label: string };
 
 export interface RetentionUpdateUiState {
   drafts: RetentionDrafts;
-  fieldErrors: Partial<Record<RetentionSettingId, string>>;
-  localFieldErrors: Partial<Record<RetentionSettingId, string>>;
+  fieldErrors: Partial<Record<RuntimeStorageSettingId, string>>;
+  localFieldErrors: Partial<Record<RuntimeStorageSettingId, string>>;
   error: string | null;
   savedMessage: string | null;
   /** Present only on successful host write — App applies this to the saved snapshot. */
-  confirmed?: { settingId: RetentionSettingId; value: number };
+  confirmed?: { settingId: RuntimeStorageSettingId; value: number | RunLimitSetting };
 }
 
 export interface SettingsViewState {
@@ -187,7 +190,8 @@ export function createDefaultSettingsViewState(): SettingsViewState {
 
 export function createEmptyRetentionDrafts(): RetentionDrafts {
   return {
-    maxTurnsPerTask: '',
+    runLimit: '',
+    maxRetainedTurnsPerTask: '',
     maxStoredOutputChars: '',
   };
 }
@@ -208,7 +212,8 @@ export function cloneTaskTypeDrafts(rows: readonly TaskTypeSettingsRow[]): TaskT
 
 export function cloneRetentionDrafts(drafts: RetentionDrafts): RetentionDrafts {
   return {
-    maxTurnsPerTask: drafts.maxTurnsPerTask,
+    runLimit: drafts.runLimit,
+    maxRetainedTurnsPerTask: drafts.maxRetainedTurnsPerTask,
     maxStoredOutputChars: drafts.maxStoredOutputChars,
   };
 }
@@ -219,7 +224,7 @@ export function cloneRetentionDrafts(drafts: RetentionDrafts): RetentionDrafts {
  */
 export function parseSettingsViewState(raw: unknown): SettingsViewState | null {
   if (!isRecord(raw)) return null;
-  if (raw.v !== SETTINGS_VIEW_STATE_VERSION) return null;
+  if (raw.v !== SETTINGS_VIEW_STATE_VERSION && raw.v !== 1) return null;
   if (!isSettingsTopicId(raw.activeTopicId)) return null;
 
   const state: SettingsViewState = {
@@ -234,7 +239,17 @@ export function parseSettingsViewState(raw: unknown): SettingsViewState | null {
   }
 
   if ('retentionDrafts' in raw) {
-    const drafts = parseRetentionDrafts(raw.retentionDrafts);
+    const legacyDrafts = raw.v === 1 && isRecord(raw.retentionDrafts)
+      ? {
+          ...raw.retentionDrafts,
+          runLimit: '',
+          maxRetainedTurnsPerTask:
+            typeof raw.retentionDrafts.maxTurnsPerTask === 'string'
+              ? raw.retentionDrafts.maxTurnsPerTask
+              : '',
+        }
+      : raw.retentionDrafts;
+    const drafts = parseRetentionDrafts(legacyDrafts);
     if (!drafts) return null;
     state.retentionDrafts = drafts;
   }
@@ -337,7 +352,7 @@ export function isTaskTypeDraftsDirty(
 /** True when any retention draft string differs from the saved snapshot value. */
 export function isRetentionDraftsDirty(
   drafts: RetentionDrafts | undefined | null,
-  snapshot: RetentionSettingSnapshot | null | undefined,
+  snapshot: RuntimeStorageSettingsSnapshot | null | undefined,
 ): boolean {
   if (!drafts || !snapshot) return false;
   for (const setting of snapshot.settings) {
@@ -359,14 +374,23 @@ export function isPermissionDraftDirty(
 
 /**
  * Apply a host retention snapshot into draft strings.
- * When `dirty` is true, the existing drafts are preserved unchanged.
+ * When `dirty` is true, preserve user edits unchanged — except a blank `runLimit`
+ * left by v1 migration, which is still absent data and hydrates once from host.
  */
 export function applyRetentionSnapshotToDrafts(
   current: RetentionDrafts | null | undefined,
-  snapshot: RetentionSettingSnapshot,
+  snapshot: RuntimeStorageSettingsSnapshot,
   dirty: boolean,
 ): RetentionDrafts {
-  if (dirty && current) return cloneRetentionDrafts(current);
+  if (dirty && current) {
+    const next = cloneRetentionDrafts(current);
+    // Only the migration-missing runtime enum is filled; cleared number fields stay empty.
+    if (next.runLimit.trim() === '') {
+      const runLimit = snapshot.settings.find((s) => s.id === 'runLimit');
+      if (runLimit) next.runLimit = String(runLimit.value);
+    }
+    return next;
+  }
   const next = createEmptyRetentionDrafts();
   for (const setting of snapshot.settings) {
     next[setting.id] = String(setting.value);
@@ -410,8 +434,8 @@ export function applyPermissionSnapshotToDraft(
 export function reduceRetentionUpdateResult(
   prev: {
     drafts: RetentionDrafts;
-    fieldErrors: Partial<Record<RetentionSettingId, string>>;
-    localFieldErrors: Partial<Record<RetentionSettingId, string>>;
+    fieldErrors: Partial<Record<RuntimeStorageSettingId, string>>;
+    localFieldErrors: Partial<Record<RuntimeStorageSettingId, string>>;
   },
   result: SettingsUpdateResult,
 ): RetentionUpdateUiState {
@@ -463,12 +487,17 @@ export function reduceRetentionUpdateResult(
 
 /** Field-level Retention draft validation (empty / non-numeric / non-finite / non-integer / below min). */
 export function retentionDraftValidationMessage(
-  _settingId: RetentionSettingId,
+  settingId: RuntimeStorageSettingId,
   raw: string,
   minimum: number,
   label: string,
 ): string | null {
   const trimmed = raw.trim();
+  if (settingId === 'runLimit') {
+    return ['15m', '30m', '1h', '2h', '4h', '8h'].includes(trimmed)
+      ? null
+      : `${label} must be a supported duration.`;
+  }
   const value = Number(trimmed);
   if (!trimmed || !Number.isFinite(value)) return `${label} must be a number.`;
   if (!Number.isInteger(value)) return `${label} must be an integer.`;
@@ -480,8 +509,8 @@ export function retentionDraftValidationMessage(
 export function retentionTabIndicator(input: {
   saving: boolean;
   error: string | null;
-  fieldErrors: Partial<Record<RetentionSettingId, string>>;
-  localFieldErrors: Partial<Record<RetentionSettingId, string>>;
+  fieldErrors: Partial<Record<RuntimeStorageSettingId, string>>;
+  localFieldErrors: Partial<Record<RuntimeStorageSettingId, string>>;
   dirty: boolean;
   savedMessage: string | null;
 }): SettingsTabIndicator | null {

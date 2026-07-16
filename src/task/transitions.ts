@@ -21,6 +21,7 @@ import type {
   TurnStatus,
   TurnTrigger,
 } from './types';
+import { truncateUtf8Bytes } from './content-limits';
 
 /** Named parent-orchestration policy for child auto-seal (W4). */
 export type ChildOrchestrationSealMode = 'parent_may_seal_direct' | 'propose_only';
@@ -110,6 +111,7 @@ export function reopenTask(
       lifecycle: 'open',
       finishedAt: undefined,
       outcomeProposal: undefined,
+      executionEpoch: (task.executionEpoch ?? 1) + 1,
     }),
     effects: [{ kind: 'emitUpdate' }],
   };
@@ -259,6 +261,7 @@ function queueTurn(
     trigger: options.trigger ?? 'user',
     retryOf: options.retryOf,
     status: 'queued',
+    executionEpoch: task.executionEpoch ?? 1,
     inputs: [...options.inputs],
     createdAt: options.now,
   };
@@ -309,6 +312,7 @@ export function createTask(
     cwd: input.cwd,
     capabilities: [...input.capabilities],
     executionPolicy: { ...input.executionPolicy },
+    executionEpoch: 1,
     brief: input.brief ?? synthesizeBriefFromGoal(input.goal, input.description),
     releaseState: input.releaseState ?? 'draft',
     // Workspace default on roots: parent may seal direct children.
@@ -1246,10 +1250,6 @@ export function resolveChildWait(
   };
 }
 
-function clampString(value: string, max: number): string {
-  return value.length <= max ? value : value.slice(0, max);
-}
-
 function dispositionsEqual(a: TurnDisposition, b: TurnDisposition): boolean {
   if (a.kind !== b.kind) {
     return false;
@@ -1283,11 +1283,11 @@ function boundDisposition(
       // Pass the structured verdict through unchanged (already normalized/clamped upstream).
       return {
         kind: 'complete',
-        result: clampString(disposition.result, limits.maxResult),
+        result: truncateUtf8Bytes(disposition.result, limits.maxResult).text,
         ...(disposition.verdict ? { verdict: disposition.verdict } : {}),
       };
     case 'fail':
-      return { kind: 'fail', error: clampString(disposition.error, limits.maxError) };
+      return { kind: 'fail', error: truncateUtf8Bytes(disposition.error, limits.maxError).text };
     default:
       return disposition;
   }
@@ -1333,6 +1333,58 @@ export function stageDisposition(
   return { ok: false, reason: 'disposition already staged with a different opId' };
 }
 
+export interface WaitDispositionMerge {
+  turn: TaskTurn;
+  addedTaskIds: string[];
+  alreadyStaged: boolean;
+  waitTaskIds: string[];
+}
+
+/**
+ * Monotonically arms a child wait barrier on a live turn.
+ *
+ * Wait is deliberately different from terminal dispositions: independent compound
+ * operations may each add a child to the same barrier, and a coordinator may
+ * redundantly call `wait_for_tasks` after a compound wait.  Both cases are success.
+ * Complete/fail/idle remain mutually exclusive with wait and still fail closed.
+ */
+export function mergeWaitDisposition(
+  turn: TaskTurn,
+  requestedTaskIds: readonly string[],
+): TransitionResult<WaitDispositionMerge> {
+  if (!LIVE_TURN_STATUSES.has(turn.status)) {
+    return { ok: false, reason: 'mergeWaitDisposition requires a live turn' };
+  }
+  const requested = [...new Set(requestedTaskIds)];
+  if (requested.length === 0) {
+    return { ok: false, reason: 'wait set must be non-empty' };
+  }
+  if (turn.disposition && turn.disposition.kind !== 'wait_tasks') {
+    return {
+      ok: false,
+      reason: `disposition conflict: current disposition is ${turn.disposition.kind}`,
+    };
+  }
+
+  const existing = turn.disposition?.kind === 'wait_tasks'
+    ? [...new Set(turn.disposition.taskIds)]
+    : [];
+  const existingSet = new Set(existing);
+  const addedTaskIds = requested.filter((id) => !existingSet.has(id));
+  const waitTaskIds = [...existing, ...addedTaskIds];
+  const alreadyStaged = existing.length > 0 && addedTaskIds.length === 0;
+  const nextTurn =
+    turn.disposition?.kind === 'wait_tasks' && addedTaskIds.length === 0
+      ? turn
+      : { ...turn, disposition: { kind: 'wait_tasks' as const, taskIds: waitTaskIds } };
+
+  return {
+    ok: true,
+    next: { turn: nextTurn, addedTaskIds, alreadyStaged, waitTaskIds },
+    effects: [],
+  };
+}
+
 /**
  * MEM030: mark already-queued follow-ups so they are not auto-promoted after a
  * failed/interrupted live settlement. Call inside the same commit that settles
@@ -1348,4 +1400,3 @@ export function holdQueuedFollowUpsOnFailure(
     draft.turns[turn.id] = { ...turn, holdAutoPromote: true };
   }
 }
-

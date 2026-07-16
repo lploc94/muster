@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type {
   PermissionModeSetting,
   PermissionSettingsSnapshot,
-  RetentionSettingSnapshot,
+  RuntimeStorageSettingsSnapshot,
   TaskTypeSettingsRow,
 } from './protocol';
 import {
@@ -45,25 +45,40 @@ function sampleType(partial: Partial<TaskTypeSettingsRow> = {}): TaskTypeSetting
 }
 
 function sampleRetentionSnapshot(
-  values: Partial<Record<'maxTurnsPerTask' | 'maxStoredOutputChars', number>> = {},
-): RetentionSettingSnapshot {
+  values: {
+    runLimit?: '15m' | '30m' | '1h' | '2h' | '4h' | '8h';
+    maxRetainedTurnsPerTask?: number;
+    maxStoredOutputChars?: number;
+  } = {},
+): RuntimeStorageSettingsSnapshot {
   return {
     settings: [
       {
-        id: 'maxTurnsPerTask',
+        kind: 'enum',
+        id: 'runLimit',
+        label: 'Maximum uninterrupted agent run',
+        description: 'desc',
+        value: values.runLimit ?? '2h',
+        defaultValue: '2h',
+        options: ['15m', '30m', '1h', '2h', '4h', '8h'],
+      },
+      {
+        kind: 'number',
+        id: 'maxRetainedTurnsPerTask',
         label: 'Maximum turns per task',
         description: 'desc',
-        value: values.maxTurnsPerTask ?? 40,
-        defaultValue: 40,
+        value: values.maxRetainedTurnsPerTask ?? 40,
+        defaultValue: 200,
         minimum: 1,
       },
       {
+        kind: 'number',
         id: 'maxStoredOutputChars',
         label: 'Maximum stored output characters',
         description: 'desc',
         value: values.maxStoredOutputChars ?? 200_000,
         defaultValue: 200_000,
-        minimum: 1000,
+        minimum: 1024,
       },
     ],
   };
@@ -98,40 +113,59 @@ describe('parseSettingsViewState — fail closed', () => {
     expect(parseSettingsViewState(undefined)).toBeNull();
     expect(parseSettingsViewState('x')).toBeNull();
     expect(parseSettingsViewState([])).toBeNull();
-    expect(parseSettingsViewState({ v: 2, activeTopicId: 'task-types' })).toBeNull();
+    expect(parseSettingsViewState({ v: 999, activeTopicId: 'task-types' })).toBeNull();
     expect(parseSettingsViewState({ activeTopicId: 'task-types' })).toBeNull();
   });
 
   it('rejects unknown active topics and falls back via readSettingsViewState', () => {
-    expect(parseSettingsViewState({ v: 1, activeTopicId: 'appearance' })).toBeNull();
+    expect(parseSettingsViewState({ v: SETTINGS_VIEW_STATE_VERSION, activeTopicId: 'appearance' })).toBeNull();
     const api = memoryApi({
-      [SETTINGS_VIEW_STATE_KEY]: { v: 1, activeTopicId: 'telemetry' },
+      [SETTINGS_VIEW_STATE_KEY]: { v: SETTINGS_VIEW_STATE_VERSION, activeTopicId: 'telemetry' },
     });
     expect(readSettingsViewState(api)).toEqual(createDefaultSettingsViewState());
   });
 
   it('accepts known topics including coming-soon ids', () => {
-    expect(parseSettingsViewState({ v: 1, activeTopicId: 'retention' })).toEqual({
-      v: 1,
+    expect(parseSettingsViewState({ v: SETTINGS_VIEW_STATE_VERSION, activeTopicId: 'retention' })).toEqual({
+      v: SETTINGS_VIEW_STATE_VERSION,
       activeTopicId: 'retention',
     });
-    expect(parseSettingsViewState({ v: 1, activeTopicId: 'models-and-clis' })?.activeTopicId).toBe(
+    expect(parseSettingsViewState({ v: SETTINGS_VIEW_STATE_VERSION, activeTopicId: 'models-and-clis' })?.activeTopicId).toBe(
       'models-and-clis',
     );
+  });
+
+  it('migrates v1 retention drafts while preserving the stable retention topic id', () => {
+    expect(parseSettingsViewState({
+      v: 1,
+      activeTopicId: 'retention',
+      retentionDrafts: {
+        maxTurnsPerTask: '25',
+        maxStoredOutputChars: '5000',
+      },
+    })).toEqual({
+      v: SETTINGS_VIEW_STATE_VERSION,
+      activeTopicId: 'retention',
+      retentionDrafts: {
+        runLimit: '',
+        maxRetainedTurnsPerTask: '25',
+        maxStoredOutputChars: '5000',
+      },
+    });
   });
 
   it('bounds task type drafts and rejects oversized maps', () => {
     const tooMany = Array.from({ length: 33 }, (_, i) => sampleType({ id: `t${i}` }));
     expect(
       parseSettingsViewState({
-        v: 1,
+        v: SETTINGS_VIEW_STATE_VERSION,
         activeTopicId: 'task-types',
         taskTypeDrafts: tooMany,
       }),
     ).toBeNull();
 
     const badRole = parseSettingsViewState({
-      v: 1,
+      v: SETTINGS_VIEW_STATE_VERSION,
       activeTopicId: 'task-types',
       taskTypeDrafts: [sampleType({ role: 'admin' as 'worker' })],
     });
@@ -140,7 +174,7 @@ describe('parseSettingsViewState — fail closed', () => {
     const longDesc = 'x'.repeat(201);
     expect(
       parseSettingsViewState({
-        v: 1,
+        v: SETTINGS_VIEW_STATE_VERSION,
         activeTopicId: 'task-types',
         taskTypeDrafts: [sampleType({ description: longDesc })],
       }),
@@ -149,12 +183,12 @@ describe('parseSettingsViewState — fail closed', () => {
 
   it('accepts explicit empty task type maps', () => {
     const parsed = parseSettingsViewState({
-      v: 1,
+      v: SETTINGS_VIEW_STATE_VERSION,
       activeTopicId: 'task-types',
       taskTypeDrafts: [],
     });
     expect(parsed).toEqual({
-      v: 1,
+      v: SETTINGS_VIEW_STATE_VERSION,
       activeTopicId: 'task-types',
       taskTypeDrafts: [],
     });
@@ -162,29 +196,31 @@ describe('parseSettingsViewState — fail closed', () => {
 
   it('bounds retention draft strings and drops unknown keys', () => {
     const parsed = parseSettingsViewState({
-      v: 1,
+      v: SETTINGS_VIEW_STATE_VERSION,
       activeTopicId: 'retention',
       retentionDrafts: {
-        maxTurnsPerTask: '12',
+        runLimit: '',
+        maxRetainedTurnsPerTask: '12',
         maxStoredOutputChars: '999',
         unknown: 'nope',
-        maxTurnsPerTaskExtra: '1',
+        maxRetainedTurnsPerTaskExtra: '1',
       },
     });
     expect(parsed).toEqual({
-      v: 1,
+      v: SETTINGS_VIEW_STATE_VERSION,
       activeTopicId: 'retention',
       retentionDrafts: {
-        maxTurnsPerTask: '12',
+        runLimit: '',
+        maxRetainedTurnsPerTask: '12',
         maxStoredOutputChars: '999',
       },
     });
 
     expect(
       parseSettingsViewState({
-        v: 1,
+        v: SETTINGS_VIEW_STATE_VERSION,
         activeTopicId: 'retention',
-        retentionDrafts: { maxTurnsPerTask: 'x'.repeat(65) },
+        retentionDrafts: { maxRetainedTurnsPerTask: 'x'.repeat(65) },
       }),
     ).toBeNull();
   });
@@ -192,14 +228,14 @@ describe('parseSettingsViewState — fail closed', () => {
   it('rejects non-array taskTypeDrafts and non-object retentionDrafts', () => {
     expect(
       parseSettingsViewState({
-        v: 1,
+        v: SETTINGS_VIEW_STATE_VERSION,
         activeTopicId: 'task-types',
         taskTypeDrafts: { id: 'worker' },
       }),
     ).toBeNull();
     expect(
       parseSettingsViewState({
-        v: 1,
+        v: SETTINGS_VIEW_STATE_VERSION,
         activeTopicId: 'retention',
         retentionDrafts: ['12'],
       }),
@@ -216,7 +252,7 @@ describe('merge and persistence', () => {
       otherKey: true,
     };
     const view: SettingsViewState = {
-      v: 1,
+      v: SETTINGS_VIEW_STATE_VERSION,
       activeTopicId: 'retention',
       retentionDrafts: createEmptyRetentionDrafts(),
       taskTypeDrafts: [sampleType({ id: 'coord', role: 'coordinator' })],
@@ -236,7 +272,7 @@ describe('merge and persistence', () => {
     });
     const drafts = [sampleType({ id: 'a' })];
     writeSettingsViewState(api, {
-      v: 1,
+      v: SETTINGS_VIEW_STATE_VERSION,
       activeTopicId: 'permissions',
       taskTypeDrafts: drafts,
     });
@@ -252,10 +288,14 @@ describe('merge and persistence', () => {
 
   it('serializeSettingsViewState is clone-safe (JSON-safe plain data)', () => {
     const view: SettingsViewState = {
-      v: 1,
+      v: SETTINGS_VIEW_STATE_VERSION,
       activeTopicId: 'task-types',
       taskTypeDrafts: [sampleType({ model: 'm', description: 'd' })],
-      retentionDrafts: { maxTurnsPerTask: '3', maxStoredOutputChars: '4000' },
+      retentionDrafts: {
+        runLimit: '2h',
+        maxRetainedTurnsPerTask: '3',
+        maxStoredOutputChars: '4000',
+      },
     };
     const serialized = serializeSettingsViewState(view);
     const roundTrip = JSON.parse(JSON.stringify(serialized)) as SettingsViewState;
@@ -277,14 +317,15 @@ describe('merge and persistence', () => {
 
 describe('dirty helpers', () => {
   it('detects retention dirty fields against saved snapshot', () => {
-    const snapshot = sampleRetentionSnapshot({ maxTurnsPerTask: 40, maxStoredOutputChars: 200_000 });
+    const snapshot = sampleRetentionSnapshot({ maxRetainedTurnsPerTask: 40, maxStoredOutputChars: 200_000 });
     const pristine = {
-      maxTurnsPerTask: '40',
+      runLimit: '2h',
+      maxRetainedTurnsPerTask: '40',
       maxStoredOutputChars: '200000',
     };
     expect(isRetentionDraftsDirty(pristine, snapshot)).toBe(false);
     expect(
-      isRetentionDraftsDirty({ ...pristine, maxTurnsPerTask: '41' }, snapshot),
+      isRetentionDraftsDirty({ ...pristine, maxRetainedTurnsPerTask: '41' }, snapshot),
     ).toBe(true);
     expect(isRetentionDraftsDirty(pristine, null)).toBe(false);
   });
@@ -312,18 +353,44 @@ describe('dirty helpers', () => {
 
 describe('snapshot → draft application (dirty-safe)', () => {
   it('initializes pristine retention drafts from snapshot but never overwrites dirty ones', () => {
-    const snapshot = sampleRetentionSnapshot({ maxTurnsPerTask: 10 });
+    const snapshot = sampleRetentionSnapshot({ maxRetainedTurnsPerTask: 10 });
     const pristine = applyRetentionSnapshotToDrafts(null, snapshot, false);
     expect(pristine).toEqual({
-      maxTurnsPerTask: '10',
+      runLimit: '2h',
+      maxRetainedTurnsPerTask: '10',
       maxStoredOutputChars: '200000',
     });
 
     const dirty = {
-      maxTurnsPerTask: '99',
+      runLimit: '4h',
+      maxRetainedTurnsPerTask: '99',
       maxStoredOutputChars: '1234',
     };
     expect(applyRetentionSnapshotToDrafts(dirty, snapshot, true)).toEqual(dirty);
+  });
+
+  it('hydrates empty runLimit from host after v1 migration while keeping dirty retention fields', () => {
+    const snapshot = sampleRetentionSnapshot({ maxRetainedTurnsPerTask: 25, maxStoredOutputChars: 5000 });
+    const migrated = {
+      runLimit: '',
+      maxRetainedTurnsPerTask: '25',
+      maxStoredOutputChars: '999',
+    };
+    expect(applyRetentionSnapshotToDrafts(migrated, snapshot, true)).toEqual({
+      runLimit: '2h',
+      maxRetainedTurnsPerTask: '25',
+      maxStoredOutputChars: '999',
+    });
+  });
+
+  it('does not refill a user-cleared retention number draft from incidental snapshots', () => {
+    const snapshot = sampleRetentionSnapshot({ maxRetainedTurnsPerTask: 25, maxStoredOutputChars: 5000 });
+    const clearing = {
+      runLimit: '2h',
+      maxRetainedTurnsPerTask: '',
+      maxStoredOutputChars: '5000',
+    };
+    expect(applyRetentionSnapshotToDrafts(clearing, snapshot, true)).toEqual(clearing);
   });
 
   it('initializes pristine task type drafts from snapshot but never overwrites dirty ones', () => {
@@ -345,49 +412,51 @@ describe('snapshot → draft application (dirty-safe)', () => {
 
     const retention = createEmptyRetentionDrafts();
     const clonedR = cloneRetentionDrafts(retention);
-    clonedR.maxTurnsPerTask = '1';
-    expect(retention.maxTurnsPerTask).toBe('');
+    clonedR.maxRetainedTurnsPerTask = '1';
+    expect(retention.maxRetainedTurnsPerTask).toBe('');
   });
 });
 
 describe('reduceRetentionUpdateResult (topic-local failure isolation)', () => {
   const baseDrafts = {
-    maxTurnsPerTask: '99',
+    runLimit: '2h',
+    maxRetainedTurnsPerTask: '99',
     maxStoredOutputChars: '1234',
   };
   const prev = {
     drafts: baseDrafts,
-    fieldErrors: {} as Partial<Record<'maxTurnsPerTask' | 'maxStoredOutputChars', string>>,
-    localFieldErrors: {} as Partial<Record<'maxTurnsPerTask' | 'maxStoredOutputChars', string>>,
+    fieldErrors: {} as Partial<Record<'maxRetainedTurnsPerTask' | 'maxStoredOutputChars', string>>,
+    localFieldErrors: {} as Partial<Record<'maxRetainedTurnsPerTask' | 'maxStoredOutputChars', string>>,
   };
 
   it('on success updates only the confirmed field draft and clears only that field error', () => {
     const next = reduceRetentionUpdateResult(
       {
         ...prev,
-        fieldErrors: { maxTurnsPerTask: 'stale', maxStoredOutputChars: 'keep-me' },
-        localFieldErrors: { maxTurnsPerTask: 'client' },
+        fieldErrors: { maxRetainedTurnsPerTask: 'stale', maxStoredOutputChars: 'keep-me' },
+        localFieldErrors: { maxRetainedTurnsPerTask: 'client' },
       },
-      { ok: true, settingId: 'maxTurnsPerTask', value: 50 },
+      { ok: true, settingId: 'maxRetainedTurnsPerTask', value: 50 },
     );
     expect(next.drafts).toEqual({
-      maxTurnsPerTask: '50',
+      runLimit: '2h',
+      maxRetainedTurnsPerTask: '50',
       maxStoredOutputChars: '1234',
     });
     expect(next.error).toBeNull();
-    expect(next.savedMessage).toBe(`Saved ${RETENTION_SETTING_LABELS.maxTurnsPerTask}.`);
-    expect(next.fieldErrors.maxTurnsPerTask).toBeUndefined();
+    expect(next.savedMessage).toBe(`Saved ${RETENTION_SETTING_LABELS.maxRetainedTurnsPerTask}.`);
+    expect(next.fieldErrors.maxRetainedTurnsPerTask).toBeUndefined();
     expect(next.fieldErrors.maxStoredOutputChars).toBe('keep-me');
-    expect(next.localFieldErrors.maxTurnsPerTask).toBeUndefined();
-    expect(next.confirmed).toEqual({ settingId: 'maxTurnsPerTask', value: 50 });
+    expect(next.localFieldErrors.maxRetainedTurnsPerTask).toBeUndefined();
+    expect(next.confirmed).toEqual({ settingId: 'maxRetainedTurnsPerTask', value: 50 });
     // Original drafts object is not mutated.
-    expect(baseDrafts.maxTurnsPerTask).toBe('99');
+    expect(baseDrafts.maxRetainedTurnsPerTask).toBe('99');
   });
 
   it('on host write failure keeps the attempted draft and surfaces a sanitized Retention-local alert', () => {
     const next = reduceRetentionUpdateResult(prev, {
       ok: false,
-      settingId: 'maxTurnsPerTask',
+      settingId: 'maxRetainedTurnsPerTask',
       code: 'updateFailed',
       message: 'Unable to update Max turns per task.',
     });
@@ -396,7 +465,7 @@ describe('reduceRetentionUpdateResult (topic-local failure isolation)', () => {
     expect(next.confirmed).toBeUndefined();
     expect(next.savedMessage).toBeNull();
     expect(next.error).toBe(
-      `Unable to save ${RETENTION_SETTING_LABELS.maxTurnsPerTask}. Check the VS Code setting and try again.`,
+      `Unable to save ${RETENTION_SETTING_LABELS.maxRetainedTurnsPerTask}. Check the VS Code setting and try again.`,
     );
     // Never leak raw host paths/tokens into the Retention-local surface.
     expect(next.error).not.toMatch(/ENOENT|token=|\/secret/);
@@ -433,7 +502,7 @@ describe('reduceRetentionUpdateResult (topic-local failure isolation)', () => {
 
 describe('retentionDraftValidationMessage', () => {
   it('rejects empty, non-numeric, non-finite, non-integer, and below-minimum values', () => {
-    const id = 'maxTurnsPerTask' as const;
+    const id = 'maxRetainedTurnsPerTask' as const;
     const label = RETENTION_SETTING_LABELS[id];
     expect(retentionDraftValidationMessage(id, '', 1, label)).toBe(`${label} must be a number.`);
     expect(retentionDraftValidationMessage(id, '  ', 1, label)).toBe(`${label} must be a number.`);
@@ -505,19 +574,19 @@ describe('parseSettingsViewState — permission draft', () => {
   it('accepts known permission draft modes and rejects unknown modes', () => {
     expect(
       parseSettingsViewState({
-        v: 1,
+        v: SETTINGS_VIEW_STATE_VERSION,
         activeTopicId: 'permissions',
         permissionDraftMode: 'readonly',
       }),
     ).toEqual({
-      v: 1,
+      v: SETTINGS_VIEW_STATE_VERSION,
       activeTopicId: 'permissions',
       permissionDraftMode: 'readonly',
     });
 
     expect(
       parseSettingsViewState({
-        v: 1,
+        v: SETTINGS_VIEW_STATE_VERSION,
         activeTopicId: 'permissions',
         permissionDraftMode: 'prompt',
       }),
@@ -525,7 +594,7 @@ describe('parseSettingsViewState — permission draft', () => {
 
     expect(
       parseSettingsViewState({
-        v: 1,
+        v: SETTINGS_VIEW_STATE_VERSION,
         activeTopicId: 'permissions',
         permissionDraftMode: 1,
       }),
@@ -534,7 +603,7 @@ describe('parseSettingsViewState — permission draft', () => {
 
   it('serializes and restores permissionDraftMode without errors or sensitive fields', () => {
     const view: SettingsViewState = {
-      v: 1,
+      v: SETTINGS_VIEW_STATE_VERSION,
       activeTopicId: 'permissions',
       permissionDraftMode: 'allow',
     };
@@ -676,7 +745,7 @@ describe('retentionTabIndicator', () => {
       retentionTabIndicator({
         saving: false,
         error: null,
-        fieldErrors: { maxTurnsPerTask: 'bad' },
+        fieldErrors: { maxRetainedTurnsPerTask: 'bad' },
         localFieldErrors: {},
         dirty: true,
         savedMessage: null,

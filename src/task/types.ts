@@ -36,8 +36,12 @@ export type TaskCapability =
 export interface TaskExecutionPolicy {
   maxTurns: number;
   maxAutomaticRetries: number;
-  turnTimeoutMs: number;
-  taskTimeoutMs: number;
+  /** Optional per-task override; host run-limit remains the ceiling. */
+  runTimeoutOverrideMs?: number;
+  /** @deprecated schema-v5 compatibility only; migrated to runTimeoutOverrideMs. */
+  turnTimeoutMs?: number;
+  /** @deprecated schema-v5 compatibility only; never enforced as task lifetime. */
+  taskTimeoutMs?: number;
 }
 /**
  * Agent-proposed outcome awaiting an authorized sealer (user, or coordinator under
@@ -129,6 +133,8 @@ export interface TaskResultV1 {
   /** Monotonic per task; captured by dependents at pin time. */
   revision: number;
   summary: string;
+  /** True when summary was clamped to the canonical UTF-8 byte budget. */
+  truncated?: boolean;
   /**
    * Optional structured verify verdict (schema stays `version:1`; absent on
    * legacy/implement tasks). Read by verdict-aware dependencies + verdict bindings.
@@ -272,6 +278,8 @@ export interface MusterTask {
   cwd?: string;
   capabilities: TaskCapability[];
   executionPolicy: TaskExecutionPolicy;
+  /** Turn allocation generation. Reopen increments this independently of retention. */
+  executionEpoch?: number;
   /** Staged complete/fail for root (human-gated) or display; not a lifecycle seal. */
   outcomeProposal?: OutcomeProposal;
   /**
@@ -492,6 +500,16 @@ export interface TaskTurn {
   trigger: TurnTrigger;
   retryOf?: string;
   status: TurnStatus;
+  /** Allocation generation copied from the task when the turn is queued. */
+  executionEpoch?: number;
+  /** Frozen at durable promotion; setting changes cannot move a live deadline. */
+  effectiveRunLimitMs?: number;
+  runDeadlineAt?: string;
+  termination?: {
+    kind: 'run_timeout';
+    limitMs: number;
+    deadlineAt: string;
+  };
   inputs: TurnInput[];
   candidateSessionId?: string;
   observedSessionId?: string;

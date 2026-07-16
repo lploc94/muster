@@ -621,9 +621,10 @@ export class AcpClient {
   async newSession(
     cwd: string,
     mcpServers: McpServerConfig[],
+    timeoutMs?: number,
   ): Promise<{ sessionId: string; modelConfig?: AcpModelConfig }> {
     await this.ensureConnected();
-    const res = (await this.request('session/new', { cwd, mcpServers })) as {
+    const res = (await this.request('session/new', { cwd, mcpServers }, timeoutMs)) as {
       sessionId: string;
       configOptions?: unknown;
       models?: unknown;
@@ -635,18 +636,23 @@ export class AcpClient {
   }
 
   /** Set a session config option (e.g. the model) via ACP `session/set_config_option`. */
-  async setConfigOption(sessionId: string, configId: string, value: string): Promise<void> {
+  async setConfigOption(
+    sessionId: string,
+    configId: string,
+    value: string,
+    timeoutMs?: number,
+  ): Promise<void> {
     await this.ensureConnected();
-    await this.request('session/set_config_option', { sessionId, configId, value });
+    await this.request('session/set_config_option', { sessionId, configId, value }, timeoutMs);
   }
 
   /**
    * Select a model for agents that advertise `session.models` (Grok/Kiro) via
    * the legacy/stable `session/set_model` method (`{ sessionId, modelId }`).
    */
-  async setSessionModel(sessionId: string, modelId: string): Promise<void> {
+  async setSessionModel(sessionId: string, modelId: string, timeoutMs?: number): Promise<void> {
     await this.ensureConnected();
-    await this.request('session/set_model', { sessionId, modelId });
+    await this.request('session/set_model', { sessionId, modelId }, timeoutMs);
   }
 
   /** Best-effort `session/close` — used to release a transient enumeration session. */
@@ -662,23 +668,29 @@ export class AcpClient {
     sessionId: string,
     cwd: string,
     mcpServers: McpServerConfig[],
+    timeoutMs?: number,
   ): Promise<{ sessionId: string }> {
     await this.ensureConnected();
     if (!this.loadSessionSupported) {
       throw new Error(`${this.config.label} agent does not support session/load`);
     }
-    await this.request('session/load', { sessionId, cwd, mcpServers });
+    await this.request('session/load', { sessionId, cwd, mcpServers }, timeoutMs);
     return { sessionId };
   }
 
-  async prompt(sessionId: string, text: string, signal?: AbortSignal): Promise<PromptResult> {
+  async prompt(
+    sessionId: string,
+    text: string,
+    signal?: AbortSignal,
+    timeoutMs?: number,
+  ): Promise<PromptResult> {
     await this.ensureConnected();
     // Keep the request id so bounded cancellation can drop the pending entry
     // (and clear its 30-minute timeout) when force-settling a hung turn.
     const { id, promise } = this.sendRequest('session/prompt', {
       sessionId,
       prompt: [{ type: 'text', text }],
-    });
+    }, timeoutMs);
     return boundedPromptCancel(promise as Promise<PromptResult>, signal, {
       onCancel: () => this.cancel(sessionId),
       onForceSettle: () => this.dropPending(id),

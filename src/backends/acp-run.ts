@@ -271,7 +271,55 @@ export async function* runAcpTurn(
   try {
     unregisterConnection = client.registerConnectionSink(bufferConnectionLine);
 
-    await client.ensureConnected(options.extraEnv);
+    // One absolute setup deadline from remaining run budget; recompute per request.
+    const setupDeadlineAt =
+      options.setupTimeoutMs !== undefined
+        ? Date.now() + Math.max(1, options.setupTimeoutMs)
+        : undefined;
+    const remainingSetupMs = (): number | undefined => {
+      if (setupDeadlineAt === undefined) return undefined;
+      return Math.max(1, setupDeadlineAt - Date.now());
+    };
+    const raceSetup = async <T>(work: Promise<T>): Promise<T> => {
+      if (isAborted()) throw new Error('Turn cancelled');
+      const remaining = remainingSetupMs();
+      if (remaining === undefined) return work;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const onAbort = () => {
+        if (timer) clearTimeout(timer);
+      };
+      options.signal?.addEventListener('abort', onAbort, { once: true });
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        options.signal?.removeEventListener('abort', onAbort);
+      };
+      try {
+        return await Promise.race([
+          work,
+          new Promise<T>((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error('ACP setup timed out before run deadline')),
+              remaining,
+            );
+            if (isAborted()) {
+              reject(new Error('Turn cancelled'));
+              return;
+            }
+            const abortReject = () => reject(new Error('Turn cancelled'));
+            options.signal?.addEventListener('abort', abortReject, { once: true });
+            // Handled cleanup — do not use work.finally() (unhandled rejection on reject).
+            void work.then(
+              () => options.signal?.removeEventListener('abort', abortReject),
+              () => options.signal?.removeEventListener('abort', abortReject),
+            );
+          }),
+        ]);
+      } finally {
+        cleanup();
+      }
+    };
+
+    await raceSetup(client.ensureConnected(options.extraEnv));
     if (isAborted()) {
       yield cancellationTerminal();
       return;
@@ -282,7 +330,12 @@ export async function* runAcpTurn(
         yield { type: 'error', message: `${spec.label} agent does not support session resume` };
         return;
       }
-      const loaded = await client.loadSession(options.resumeId, cwd, mcpServers);
+      const setupMs = remainingSetupMs();
+      const loaded = await raceSetup(
+        setupMs === undefined
+          ? client.loadSession(options.resumeId, cwd, mcpServers)
+          : client.loadSession(options.resumeId, cwd, mcpServers, setupMs),
+      );
       activeSessionId = loaded.sessionId;
       if (isAborted()) {
         yield cancellationTerminal();
@@ -291,7 +344,12 @@ export async function* runAcpTurn(
       yield { type: 'sessionStarted', sessionId: activeSessionId };
       unregister = client.registerSessionSink(activeSessionId, bufferUpdate);
     } else {
-      const created = await client.newSession(cwd, mcpServers);
+      const setupMs = remainingSetupMs();
+      const created = await raceSetup(
+        setupMs === undefined
+          ? client.newSession(cwd, mcpServers)
+          : client.newSession(cwd, mcpServers, setupMs),
+      );
       activeSessionId = created.sessionId;
       modelConfig = created.modelConfig;
       if (isAborted()) {
@@ -307,21 +365,43 @@ export async function* runAcpTurn(
       return;
     }
 
-    // Apply the selected model before prompting. Best-effort: an unsupported
-    // option or an unknown value just falls back to the agent's default.
+    // Apply the selected model before prompting. Best-effort only for genuine
+    // model-selection failures; deadline/cancel must not proceed to onBeforePrompt.
     if (options.model) {
       try {
+        const setupMs = remainingSetupMs();
         if (modelConfig?.applyVia === 'session_set_model') {
-          await client.setSessionModel(activeSessionId, options.model);
+          await raceSetup(
+            setupMs === undefined
+              ? client.setSessionModel(activeSessionId, options.model)
+              : client.setSessionModel(activeSessionId, options.model, setupMs),
+          );
         } else {
           const configId = modelConfig?.id ?? spec.modelConfigId ?? 'model';
-          await client.setConfigOption(activeSessionId, configId, options.model);
+          await raceSetup(
+            setupMs === undefined
+              ? client.setConfigOption(activeSessionId, configId, options.model)
+              : client.setConfigOption(activeSessionId, configId, options.model, setupMs),
+          );
         }
-      } catch {
-        // Non-fatal — continue the turn with the agent's default model.
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (
+          message === 'Turn cancelled' ||
+          message === 'ACP setup timed out before run deadline' ||
+          isAborted()
+        ) {
+          yield cancellationTerminal();
+          return;
+        }
+        // Non-fatal model option failure — continue with agent default.
       }
     }
 
+    if (isAborted()) {
+      yield cancellationTerminal();
+      return;
+    }
     if (options.onBeforePrompt) {
       await options.onBeforePrompt();
     }
@@ -330,7 +410,12 @@ export async function* runAcpTurn(
       return;
     }
 
-    const promptPromise = client.prompt(activeSessionId, options.prompt, options.signal);
+    const promptPromise = client.prompt(
+      activeSessionId,
+      options.prompt,
+      options.signal,
+      options.promptTimeoutMs,
+    );
 
     while (true) {
       while (pendingUpdates.length > 0) {

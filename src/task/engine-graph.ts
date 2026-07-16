@@ -27,7 +27,6 @@ import {
   bridgeTokenTtlMs,
   canCreateTurn,
   checkLimit,
-  clampExecutionPolicy,
   countChildren,
   countRootChildren,
   DEFAULT_RESOURCE_LIMITS,
@@ -35,6 +34,16 @@ import {
   type ExecutionPolicyBounds,
   type ResourceLimits,
 } from './limits';
+import { TASK_RESULT_MAX_BYTES, TRUNCATED_CONTENT_MARKER } from './content-limits';
+import {
+  DEFAULT_RUN_LIMIT_MS,
+  remainingRunTimeMs,
+  resolveTaskExecutionPolicy,
+  type TaskExecutionHardBounds,
+} from './execution-policy';
+
+export const CREDENTIAL_DEADLINE_BUFFER_MS = 5 * 60_000;
+export const ACP_DEADLINE_BUFFER_MS = 90_000;
 import { evaluateTaskReadiness } from './readiness';
 import { canPromoteTurn } from './scheduler';
 import type { TaskStore } from './store';
@@ -46,6 +55,7 @@ import {
   interruptTurn,
   registerAsk,
   reopenTask,
+  mergeWaitDisposition,
   stageDisposition,
   startTask as transitionStartTask,
   submitAnswer,
@@ -87,10 +97,12 @@ export function fingerprintCommand(command: ToolCommand): string {
 function stageCompoundWait(
   draft: TaskStoreFile,
   ctx: { turnId: string; callerTaskId: string },
-  opId: string,
+  _opId: string,
   waitTaskIds: string[],
-  limits: ResourceLimits,
-): { ok: true } | { ok: false; reason: string } {
+  _limits: ResourceLimits,
+):
+  | { ok: true; addedTaskIds: string[]; alreadyStaged: boolean; waitTaskIds: string[] }
+  | { ok: false; reason: string } {
   if (waitTaskIds.length === 0) {
     return { ok: false, reason: 'wait set must be non-empty' };
   }
@@ -102,17 +114,15 @@ function stageCompoundWait(
   }
   const turn = draft.turns[ctx.turnId];
   if (!turn) return { ok: false, reason: 'turn not found' };
-  const turnCap = canCreateTurn(draft, ctx.callerTaskId, limits);
-  if (!turnCap.ok) return turnCap;
-  const result = stageDisposition(
-    turn,
-    { kind: 'wait_tasks', taskIds: waitTaskIds },
-    opId,
-    { limits: { maxResult: limits.maxResultBytes, maxError: limits.maxErrorBytes } },
-  );
+  const result = mergeWaitDisposition(turn, waitTaskIds);
   if (!result.ok) return result;
   draft.turns[ctx.turnId] = result.next.turn;
-  return { ok: true };
+  return {
+    ok: true,
+    addedTaskIds: result.next.addedTaskIds,
+    alreadyStaged: result.next.alreadyStaged,
+    waitTaskIds: result.next.waitTaskIds,
+  };
 }
 
 function depGraphFromFile(file: TaskStoreFile): DepGraph {
@@ -247,13 +257,6 @@ const DEFAULT_COORDINATOR_CHILD_CAPS: TaskCapability[] = [
   'cancel_child',
   'interrupt_child',
 ];
-const DEFAULT_POLICY: TaskExecutionPolicy = {
-  maxTurns: 50,
-  maxAutomaticRetries: 2,
-  turnTimeoutMs: 300_000,
-  taskTimeoutMs: 1_800_000,
-};
-
 export interface GraphEngineDeps {
   store: TaskStore;
   makeBackend: (name: string) => Backend;
@@ -261,6 +264,7 @@ export interface GraphEngineDeps {
   askBridge: AskBridge;
   bridgePort: number;
   resourceLimits?: ResourceLimits;
+  getRunLimitMs?: () => number;
   /** Bounds used to clamp agent-supplied execution policies. Defaults to DEFAULT_EXECUTION_POLICY_BOUNDS. */
   executionPolicyBounds?: ExecutionPolicyBounds;
   /** Independent hard cap on a bridge token's TTL. Defaults to MAX_BRIDGE_TOKEN_TTL_MS. */
@@ -344,6 +348,13 @@ export function issueTurnCredential(
   if (!turn || !task) return undefined;
   const rootId = findRootId(file, task.id);
   const actions = capabilitiesFor(task);
+  const deadlineMs = turn.runDeadlineAt ? Date.parse(turn.runDeadlineAt) : Number.NaN;
+  const remainingMs = Number.isFinite(deadlineMs)
+    ? Math.max(1, deadlineMs - Date.now())
+    : turn.effectiveRunLimitMs ??
+      task.executionPolicy.runTimeoutOverrideMs ??
+      task.executionPolicy.turnTimeoutMs ??
+      DEFAULT_RUN_LIMIT_MS;
   return deps.credentials.issue({
     rootId,
     callerTaskId: task.id,
@@ -351,7 +362,10 @@ export function issueTurnCredential(
     allowedActions: actions,
     // Independent hard cap: even a large (clamped) turn timeout must not mint a
     // token that outlives MAX_BRIDGE_TOKEN_TTL_MS.
-    ttlMs: bridgeTokenTtlMs(task.executionPolicy.turnTimeoutMs, deps.maxBridgeTokenTtlMs),
+    ttlMs: bridgeTokenTtlMs(
+      remainingMs + CREDENTIAL_DEADLINE_BUFFER_MS,
+      deps.maxBridgeTokenTtlMs,
+    ),
   });
 }
 
@@ -369,9 +383,17 @@ export function buildRunOptionsForTurn(
   const backend = deps.makeBackend(task.backend);
   const token = issueTurnCredential(deps, turnId) ?? '';
   const turnMcp = buildTurnMcp(backend, { port: deps.bridgePort }, token);
+  const remainingMs = remainingRunTimeMs(turn);
   return {
     options: {
       ...base,
+      ...(remainingMs !== undefined
+        ? {
+            setupTimeoutMs: Math.max(1, remainingMs),
+            promptTimeoutMs:
+              Math.max(1, remainingMs) + ACP_DEADLINE_BUFFER_MS,
+          }
+        : {}),
       ...(turnMcp.mcpServers ? { mcpServers: turnMcp.mcpServers } : {}),
       ...(turnMcp.mcpConfigPath ? { mcpConfigPath: turnMcp.mcpConfigPath } : {}),
     },
@@ -619,12 +641,20 @@ export async function executeToolCommand(
             resolvedRole === 'coordinator'
               ? DEFAULT_COORDINATOR_CHILD_CAPS
               : DEFAULT_WORKER_CAPS,
-          // Never trust the raw agent-supplied policy: clamp every field to bounds.
-          executionPolicy: clampExecutionPolicy(
-            DEFAULT_POLICY,
-            command.spec.executionPolicy,
-            deps.executionPolicyBounds,
-          ),
+          // Canonical resolver only — optional injected bounds map into hard bounds.
+          executionPolicy: resolveTaskExecutionPolicy(command.spec.executionPolicy, {
+            userRunLimitMs: deps.getRunLimitMs?.() ?? DEFAULT_RUN_LIMIT_MS,
+            ...(deps.executionPolicyBounds
+              ? {
+                  bounds: {
+                    maxTurns: deps.executionPolicyBounds.maxTurns,
+                    maxAutomaticRetries: deps.executionPolicyBounds.maxAutomaticRetries,
+                    minRunLimitMs: deps.executionPolicyBounds.minTurnTimeoutMs,
+                    maxRunLimitMs: deps.executionPolicyBounds.maxTurnTimeoutMs,
+                  } satisfies TaskExecutionHardBounds,
+                }
+              : {}),
+          }),
           // create_task stays draft; delegate_task is atomic released create-and-run.
           releaseState: command.kind === 'delegate_task' ? 'released' : 'draft',
           brief,
@@ -668,11 +698,16 @@ export async function executeToolCommand(
           queuedTurnId = turnId;
         }
 
+        let waitMetadata:
+          | { addedTaskIds: string[]; alreadyStaged: boolean; waitTaskIds: string[] }
+          | undefined;
         if (command.kind === 'delegate_task' && command.waitForCompletion === true) {
           const waitStaged = stageCompoundWait(draft, ctx, command.opId, [childId], limits);
           if (!waitStaged.ok) return waitStaged;
+          waitMetadata = waitStaged;
         }
 
+        const childPolicy = draft.tasks[childId]!.executionPolicy;
         const result: OpResult = {
           ok: true,
           data: {
@@ -685,8 +720,23 @@ export async function executeToolCommand(
               role: resolvedRole,
               briefKind: brief.kind,
             },
-            ...(command.kind === 'delegate_task' && command.waitForCompletion === true
-              ? { waitStaged: true, waitTaskIds: [childId] }
+            executionPolicy: {
+              maxTurns: childPolicy.maxTurns,
+              maxAutomaticRetries: childPolicy.maxAutomaticRetries,
+              ...(childPolicy.runTimeoutOverrideMs !== undefined
+                ? { runTimeoutOverrideMs: childPolicy.runTimeoutOverrideMs }
+                : {}),
+              hostRunLimitMs: deps.getRunLimitMs?.() ?? DEFAULT_RUN_LIMIT_MS,
+            },
+            ...(waitMetadata
+              ? {
+                  waitStaged: true,
+                  staged: true,
+                  alreadyStaged: waitMetadata.alreadyStaged,
+                  waitTaskIds: waitMetadata.waitTaskIds,
+                  nextAction: 'end_current_turn',
+                  doNotPoll: true,
+                }
               : {}),
           },
         };
@@ -968,11 +1018,19 @@ export async function executeToolCommand(
               item.role === 'coordinator'
                 ? DEFAULT_COORDINATOR_CHILD_CAPS
                 : DEFAULT_WORKER_CAPS,
-            executionPolicy: clampExecutionPolicy(
-              DEFAULT_POLICY,
-              spec.executionPolicy,
-              deps.executionPolicyBounds,
-            ),
+            executionPolicy: resolveTaskExecutionPolicy(spec.executionPolicy, {
+              userRunLimitMs: deps.getRunLimitMs?.() ?? DEFAULT_RUN_LIMIT_MS,
+              ...(deps.executionPolicyBounds
+                ? {
+                    bounds: {
+                      maxTurns: deps.executionPolicyBounds.maxTurns,
+                      maxAutomaticRetries: deps.executionPolicyBounds.maxAutomaticRetries,
+                      minRunLimitMs: deps.executionPolicyBounds.minTurnTimeoutMs,
+                      maxRunLimitMs: deps.executionPolicyBounds.maxTurnTimeoutMs,
+                    } satisfies TaskExecutionHardBounds,
+                  }
+                : {}),
+            }),
             releaseState: isDelegate ? 'released' : 'draft',
             brief,
             ...(bindings.length > 0 ? { inputBindings: bindings } : {}),
@@ -1011,19 +1069,43 @@ export async function executeToolCommand(
         }
 
         let waitTaskIds: string[] | undefined;
+        let waitMetadata:
+          | { addedTaskIds: string[]; alreadyStaged: boolean; waitTaskIds: string[] }
+          | undefined;
         if (isDelegate && command.kind === 'delegate_tasks' && command.waitForLocalIds) {
           waitTaskIds = command.waitForLocalIds.map((localId) => idByLocal.get(localId)!);
           const waitStaged = stageCompoundWait(draft, ctx, command.opId, waitTaskIds, limits);
           if (!waitStaged.ok) return waitStaged;
+          waitMetadata = waitStaged;
         }
 
+        const hostRunLimitMs = deps.getRunLimitMs?.() ?? DEFAULT_RUN_LIMIT_MS;
         const result: OpResult = {
           ok: true,
           data: {
             taskIds: orderedTaskIds,
             turnIds: isDelegate ? orderedTurnIds : [],
-            ...(waitTaskIds !== undefined
-              ? { waitStaged: true, waitTaskIds }
+            executionPolicies: orderedTaskIds.map((id) => {
+              const policy = draft.tasks[id]!.executionPolicy;
+              return {
+                taskId: id,
+                maxTurns: policy.maxTurns,
+                maxAutomaticRetries: policy.maxAutomaticRetries,
+                ...(policy.runTimeoutOverrideMs !== undefined
+                  ? { runTimeoutOverrideMs: policy.runTimeoutOverrideMs }
+                  : {}),
+                hostRunLimitMs,
+              };
+            }),
+            ...(waitMetadata
+              ? {
+                  waitStaged: true,
+                  staged: true,
+                  alreadyStaged: waitMetadata.alreadyStaged,
+                  waitTaskIds: waitMetadata.waitTaskIds,
+                  nextAction: 'end_current_turn',
+                  doNotPoll: true,
+                }
               : {}),
           },
         };
@@ -1216,6 +1298,9 @@ export async function executeToolCommand(
         }
 
         let waitTaskIds: string[] | undefined;
+        let waitMetadata:
+          | { addedTaskIds: string[]; alreadyStaged: boolean; waitTaskIds: string[] }
+          | undefined;
         if (command.waitForTaskIds && command.waitForTaskIds.length > 0) {
           // Exact subset: each id must be in the release set OR already an owned released child.
           for (const waitId of command.waitForTaskIds) {
@@ -1244,6 +1329,7 @@ export async function executeToolCommand(
           waitTaskIds = [...command.waitForTaskIds];
           const waitStaged = stageCompoundWait(draft, ctx, command.opId, waitTaskIds, limits);
           if (!waitStaged.ok) return waitStaged;
+          waitMetadata = waitStaged;
         }
 
         writeLedger(draft, ctx.turnId, command.opId, fingerprint, {
@@ -1251,8 +1337,15 @@ export async function executeToolCommand(
           data: {
             taskIds: members,
             turnIds,
-            ...(waitTaskIds !== undefined
-              ? { waitStaged: true, waitTaskIds }
+            ...(waitMetadata
+              ? {
+                  waitStaged: true,
+                  staged: true,
+                  alreadyStaged: waitMetadata.alreadyStaged,
+                  waitTaskIds: waitMetadata.waitTaskIds,
+                  nextAction: 'end_current_turn',
+                  doNotPoll: true,
+                }
               : {}),
           },
         });
@@ -1353,17 +1446,28 @@ export async function executeToolCommand(
         if (!cont.ok) return cont;
         draft.turns[contTurnId] = cont.next;
         scheduleIds.push(contTurnId);
+        let waitMetadata:
+          | { addedTaskIds: string[]; alreadyStaged: boolean; waitTaskIds: string[] }
+          | undefined;
         if (command.waitForCompletion === true) {
           const waitStaged = stageCompoundWait(draft, ctx, command.opId, [child.id], limits);
           if (!waitStaged.ok) return waitStaged;
+          waitMetadata = waitStaged;
         }
         writeLedger(draft, ctx.turnId, command.opId, fingerprint, {
           ok: true,
           data: {
             childId: child.id,
             turnId: contTurnId,
-            ...(command.waitForCompletion === true
-              ? { waitStaged: true, waitTaskIds: [child.id] }
+            ...(waitMetadata
+              ? {
+                  waitStaged: true,
+                  staged: true,
+                  alreadyStaged: waitMetadata.alreadyStaged,
+                  waitTaskIds: waitMetadata.waitTaskIds,
+                  nextAction: 'end_current_turn',
+                  doNotPoll: true,
+                }
               : {}),
           },
         });
@@ -1764,26 +1868,28 @@ export async function executeToolCommand(
       const staged = deps.store.commit((draft) => {
         const turn = draft.turns[ctx.turnId];
         if (!turn) return { ok: false, reason: 'turn not found' };
-        const turnCap = canCreateTurn(draft, ctx.callerTaskId, limits);
-        if (!turnCap.ok) return turnCap;
-        const result = stageDisposition(turn, { kind: 'wait_tasks', taskIds: command.taskIds }, command.opId, {
-          limits: { maxResult: limits.maxResultBytes, maxError: limits.maxErrorBytes },
-        });
+        const result = mergeWaitDisposition(turn, command.taskIds);
         if (!result.ok) return result;
         draft.turns[ctx.turnId] = result.next.turn;
+        const data = {
+          staged: true,
+          alreadyStaged: result.next.alreadyStaged,
+          waitTaskIds: result.next.waitTaskIds,
+          nextAction: 'end_current_turn',
+          doNotPoll: true,
+        };
         writeLedger(draft, ctx.turnId, command.opId, fingerprint, {
           ok: true,
-          data: { staged: true, taskIds: command.taskIds },
+          data,
         });
         return { ok: true };
       });
       if (!staged.ok) return { ok: false, error: staged.detail ?? staged.reason };
-      return { ok: true, result: { staged: true, taskIds: command.taskIds } };
+      const ledger = deps.store.getFile().operations?.[opLedgerKey(ctx.turnId, command.opId)];
+      return { ok: true, result: ledger?.result.data };
     }
 
     case 'complete_task': {
-      const sizeCheck = checkLimit('result_size', limits, { file: deps.store.getFile(), parentId: null, rootId: ctx.rootId, resultBytes: Buffer.byteLength(command.result, 'utf8') });
-      if (!sizeCheck.ok) return { ok: false, error: sizeCheck.reason };
       // Normalize the (untrusted) worker verdict here where the engine clock lives, so
       // `verdict.at` is deterministic per staging and the command fingerprint (parsed
       // upstream, timeless) stays stable across idempotent retries. Absent → no verdict.
@@ -1809,8 +1915,6 @@ export async function executeToolCommand(
     }
 
     case 'fail_task': {
-      const sizeCheck = checkLimit('error_size', limits, { file: deps.store.getFile(), parentId: null, rootId: ctx.rootId, errorBytes: Buffer.byteLength(command.error, 'utf8') });
-      if (!sizeCheck.ok) return { ok: false, error: sizeCheck.reason };
       const staged = deps.store.commit((draft) => {
         const turn = draft.turns[ctx.turnId];
         if (!turn) return { ok: false, reason: 'turn not found' };
@@ -1856,7 +1960,25 @@ export async function executeToolCommand(
           },
         };
       }).filter((n): n is NonNullable<typeof n> => n !== undefined);
-      return { ok: true, result: { root: targetId, tasks: nodes.slice(0, 32) } };
+      const callerTurn = file.turns[ctx.turnId];
+      const callerWait = callerTurn?.disposition?.kind === 'wait_tasks'
+        ? callerTurn.disposition
+        : undefined;
+      return {
+        ok: true,
+        result: {
+          root: targetId,
+          tasks: nodes.slice(0, 32),
+          ...(callerWait
+            ? {
+                callerWaitStaged: true,
+                waitTaskIds: callerWait.taskIds,
+                nextAction: 'end_current_turn',
+                doNotPoll: true,
+              }
+            : {}),
+        },
+      };
     }
 
     case 'get_host_context': {
@@ -2369,7 +2491,7 @@ export function processCancelRequests(deps: GraphEngineDeps): void {
 export function projectChildResults(
   taskIds: string[],
   file: TaskStoreFile,
-  maxBytes: number,
+  maxBytes: number = TASK_RESULT_MAX_BYTES,
 ): string {
   const header = '[child_results]';
   const parts: string[] = [header];
@@ -2395,8 +2517,15 @@ export function projectChildResults(
       ...(pendingQ ? { pendingParentQuestion: pendingQ } : {}),
     };
     const line = JSON.stringify(entry);
-    const lineBytes = Buffer.byteLength(line, 'utf8') + (parts.length > 0 ? 1 : 0);
-    if (used + lineBytes > maxBytes) break;
+    const lineBytes = Buffer.byteLength(line, 'utf8') + 1;
+    const marker = TRUNCATED_CONTENT_MARKER.trimStart();
+    const markerBytes = Buffer.byteLength(marker, 'utf8') + 1;
+    if (used + lineBytes > maxBytes) {
+      if (used + markerBytes <= maxBytes) {
+        parts.push(marker);
+      }
+      break;
+    }
     parts.push(line);
     used += lineBytes;
   }

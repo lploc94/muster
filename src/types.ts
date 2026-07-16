@@ -24,6 +24,13 @@ export interface RunOptions {
   cwd?: string;
   extraEnv?: Record<string, string>;
   signal?: AbortSignal;
+  /** Host-derived ACP request budget; always extends beyond the engine run deadline. */
+  promptTimeoutMs?: number;
+  /**
+   * Remaining wall-clock budget for ACP setup (connect/session/model) so backend
+   * init is included in the frozen run deadline. Absent when no deadline is frozen.
+   */
+  setupTimeoutMs?: number;
   /** Model to select for this turn's session (ACP `session/set_config_option`). */
   model?: string;
   /**

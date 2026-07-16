@@ -556,9 +556,9 @@
       </div>
     {:else if showFailedTurnCard}
       <div class="task-action-panel task-action-panel--danger" data-turn-activity="failed_turn">
-        <div class="font-semibold">Could not finish</div>
+        <div class="font-semibold">{focused?.runTimeoutMessage ? 'Agent run limit reached' : 'Could not finish'}</div>
         <p class="task-muted">
-          The last turn could not finish. Type a new message below to continue, or use Retry / Continue.
+          {focused?.runTimeoutMessage ?? 'The last turn could not finish. Type a new message below to continue, or use Retry / Continue.'}
         </p>
         {#if !recoveryTurnId}
           <p class="task-muted">No retryable turn is available for this task.</p>

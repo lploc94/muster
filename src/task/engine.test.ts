@@ -8,6 +8,7 @@ import { HANDOFF_SOURCE_SUMMARY_PROMPT } from './engine-handoff';
 import { TaskStore } from './store';
 import { buildSnapshot, buildTranscript } from '../host/snapshot';
 import type { TaskMessage, TaskTurn } from './types';
+import { RUN_LIMIT_MS } from './execution-policy';
 
 const tempDirs: string[] = [];
 
@@ -136,6 +137,166 @@ describe('projectPrompt', () => {
 });
 
 describe('TaskEngine', () => {
+  it('freezes a running deadline while later promotions read the updated host setting', async () => {
+    const { filePath, store } = makeTempStore();
+    let runLimit = RUN_LIMIT_MS['2h'];
+    const resolvers: Array<() => void> = [];
+    const backend: Backend = {
+      name: 'fake',
+      capabilities: MCP_CAPS,
+      async *run() {
+        yield { type: 'sessionStarted', sessionId: 'session' };
+        await new Promise<void>((resolve) => resolvers.push(resolve));
+        yield { type: 'turnCompleted' };
+      },
+    };
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => backend,
+      getRunLimitMs: () => runLimit,
+      clock: () => '2026-07-16T00:00:00.000Z',
+    });
+    engine.createTask({ id: 'task-1', goal: 'hello', backend: 'fake' });
+    const first = engine.startTask('task-1');
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    while (resolvers.length < 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(store.getFile().turns[first.value.turnId]).toMatchObject({
+      effectiveRunLimitMs: RUN_LIMIT_MS['2h'],
+      runDeadlineAt: '2026-07-16T02:00:00.000Z',
+    });
+    const firstLease = JSON.parse(
+      fs.readFileSync(`${filePath}.lease.${encodeURIComponent(first.value.turnId)}`, 'utf8'),
+    ) as { expiresAt?: string };
+    expect(firstLease.expiresAt).toBe('2026-07-16T02:01:00.000Z');
+    runLimit = RUN_LIMIT_MS['4h'];
+    expect(store.getFile().turns[first.value.turnId]?.effectiveRunLimitMs).toBe(RUN_LIMIT_MS['2h']);
+    engine.stageDisposition(first.value.turnId, { kind: 'idle' }, 'idle-1');
+    resolvers[0]!();
+    await engine.whenIdle();
+
+    const second = engine.continueTask('task-1');
+    expect(second.ok).toBe(true);
+    if (!second.ok) return;
+    while (resolvers.length < 2) await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(store.getFile().turns[second.value.turnId]?.effectiveRunLimitMs).toBe(RUN_LIMIT_MS['4h']);
+    engine.stageDisposition(second.value.turnId, { kind: 'idle' }, 'idle-2');
+    resolvers[1]!();
+    await engine.whenIdle();
+  });
+
+  it('classifies the run watchdog as configured timeout instead of forced user interrupt', async () => {
+    const { store } = makeTempStore();
+    const backend: Backend = {
+      name: 'fake',
+      capabilities: MCP_CAPS,
+      async *run(options) {
+        yield { type: 'sessionStarted', sessionId: 'session-timeout' };
+        await new Promise<void>((resolve) => {
+          if (options.signal?.aborted) return resolve();
+          options.signal?.addEventListener('abort', () => resolve(), { once: true });
+        });
+        yield { type: 'error', message: 'Turn cancelled', isCancellation: true };
+      },
+    };
+    const engine = TaskEngine.load({ store, makeBackend: () => backend });
+    engine.createTask({
+      id: 'timeout-task',
+      goal: 'long work',
+      backend: 'fake',
+      executionPolicy: {
+        maxTurns: 50,
+        maxAutomaticRetries: 0,
+        runTimeoutOverrideMs: 1_000,
+      },
+    });
+    const started = engine.startTask('timeout-task');
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    await engine.whenIdle();
+    const turn = store.getFile().turns[started.value.turnId];
+    expect(turn).toMatchObject({
+      status: 'interrupted',
+      termination: { kind: 'run_timeout', limitMs: 1_000 },
+    });
+    expect(turn?.interruptConfidence).toBeUndefined();
+    expect(buildSnapshot(store, 'timeout-task').subtree?.find((task) => task.id === 'timeout-task')?.runTimeoutMessage).toBe(
+      'Agent run reached the configured 1-minute limit.',
+    );
+  });
+
+  it('immediately times out a recovered queued turn whose frozen deadline is expired', async () => {
+    const { store } = makeTempStore();
+    store.commit((draft) => {
+      draft.tasks.expired = {
+        id: 'expired',
+        role: 'coordinator',
+        lifecycle: 'open',
+        goal: 'resume expired run',
+        parentId: null,
+        dependencies: [],
+        backend: 'fake',
+        capabilities: [],
+        executionPolicy: { maxTurns: 50, maxAutomaticRetries: 0 },
+        executionEpoch: 1,
+        releaseState: 'released',
+        revision: 0,
+        createdAt: '2026-07-15T23:00:00.000Z',
+        updatedAt: '2026-07-15T23:00:00.000Z',
+      };
+      draft.messages.input = {
+        id: 'input',
+        taskId: 'expired',
+        role: 'user',
+        content: 'continue',
+        state: 'assigned',
+        createdAt: '2026-07-15T23:00:00.000Z',
+        turnId: 'expired-turn',
+      };
+      draft.turns['expired-turn'] = {
+        id: 'expired-turn',
+        taskId: 'expired',
+        sequence: 1,
+        trigger: 'user',
+        status: 'queued',
+        inputs: [{ kind: 'message', messageId: 'input' }],
+        executionEpoch: 1,
+        effectiveRunLimitMs: 60_000,
+        runDeadlineAt: '2026-07-15T23:59:00.000Z',
+        createdAt: '2026-07-15T23:00:00.000Z',
+      };
+      return { ok: true };
+    });
+    const backend: Backend = {
+      name: 'fake',
+      capabilities: MCP_CAPS,
+      async *run(options) {
+        yield { type: 'sessionStarted', sessionId: 'expired-session' };
+        await new Promise<void>((resolve) => {
+          if (options.signal?.aborted) return resolve();
+          options.signal?.addEventListener('abort', () => resolve(), { once: true });
+        });
+        yield { type: 'error', message: 'Turn cancelled', isCancellation: true };
+      },
+    };
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => backend,
+      clock: () => '2026-07-16T00:00:00.000Z',
+    });
+    expect(engine.resumeQueuedTurn('expired-turn')).toEqual({ ok: true, value: undefined });
+    await engine.whenIdle();
+    expect(store.getFile().turns['expired-turn']).toMatchObject({
+      status: 'interrupted',
+      runDeadlineAt: '2026-07-15T23:59:00.000Z',
+      termination: {
+        kind: 'run_timeout',
+        limitMs: 60_000,
+        deadlineAt: '2026-07-15T23:59:00.000Z',
+      },
+    });
+  });
+
   it('rejects duplicate task ids and validates dependencies', () => {
     const { store } = makeTempStore();
     const engine = makeEngine(store, [{ type: 'turnCompleted' }]);

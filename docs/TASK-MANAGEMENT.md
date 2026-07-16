@@ -221,8 +221,7 @@ type TaskCapability =
 interface TaskExecutionPolicy {
   maxTurns: number;
   maxAutomaticRetries: number;
-  turnTimeoutMs: number;
-  taskTimeoutMs: number;
+  runTimeoutOverrideMs?: number; // optional shorter run; host setting is ceiling
 }
 
 interface MusterTask {
@@ -243,7 +242,10 @@ interface MusterTask {
 
   // Session binding
   backend: string;
+  model?: string;
   committedSessionId?: string;
+  /** Binding generation; missing legacy value migrates to 1. Increment on switch. */
+  runtimeEpoch: number;
 
   // Host-issued policy
   capabilities: TaskCapability[];
@@ -260,9 +262,9 @@ interface MusterTask {
   updatedAt: string;
   finishedAt?: string;
   /**
-   * Optional cross-runtime handoff state (schema-compatible: absent on legacy
-   * tasks). Owned by the TaskHandoff aggregate; never projected as ordinary
-   * TaskMessage chat. Malformed records are stripped on load (fail closed).
+   * Most recent cross-runtime switch plus its one-shot continuation context.
+   * The switch is already committed when this record exists; it never owns a
+   * hidden source or receiver model turn and is never projected as chat.
    */
   handoff?: TaskHandoffState;
 }
@@ -399,6 +401,8 @@ interface TaskTurn {
   id: string;
   taskId: string;
   sequence: number;
+  /** Task runtimeEpoch pinned when this turn is promoted. */
+  runtimeEpoch: number;
   trigger: TurnTrigger;
   retryOf?: string;
   status: TurnStatus;
@@ -865,10 +869,13 @@ Tool names describe requested host actions. The MCP response confirms the host
 **accepted the staging** (and, when mode allows, that a seal will apply on
 `turnCompleted`). Under `user_confirm`, staging is not a root lifecycle seal.
 
-Each turn has at most one staged disposition. Repeating the same disposition with
-the same tool-call/operation ID is idempotent; a conflicting disposition is
-rejected. The engine derives mutation idempotency from `(turnId, toolCallId)` or an
-equivalent stable operation ID.
+Each turn has one disposition kind. Wait dispositions are monotonic: compound and
+standalone wait calls stable-union their owned child IDs, and redundant waits
+succeed. A wait never replaces complete/fail/idle, which remain conflicting.
+Successful wait responses return `nextAction: end_current_turn` and
+`doNotPoll: true`; the coordinator must finish the turn so the host can park the
+task in `waiting_children`. The engine derives mutation idempotency from
+`(turnId, toolCallId)` or an equivalent stable operation ID.
 
 User decisions and mode control are **host/webview commands** (not MCP). Implemented
 today: `setTaskLifecycle` (user status menu; cancel/skip cascade via engine). Planned
@@ -884,7 +891,8 @@ Coordinators never block a live CLI process while children run:
    or releases (optionally with waitForTaskIds).
 2. Prefer compound wait fields so create/release + wait stage in one MCP call.
    Advanced: call wait_for_tasks({ taskIds }) separately.
-3. The staged TurnDisposition.wait_tasks returns immediately (no process block).
+3. The staged TurnDisposition.wait_tasks returns immediately with an explicit
+   end-turn/do-not-poll instruction (no process block).
 4. Coordinator finishes its CLI turn.
 5. On turnCompleted, the engine commits the wait set and releases the process.
 6. Child tasks progress independently.
@@ -1313,7 +1321,7 @@ Plan: [`plans/task-orchestration-auto-run.md`](plans/task-orchestration-auto-run
 - [x] W5 — Shared readiness evaluator + `rescanSchedulableTurns`
 - [x] W6 — Attention wake on `wait_for_tasks` (`wakeOn`, suspend phase)
 - [x] W7 — Shared-cwd writePaths / git mutex at promote
-- [x] W8 — Credential TTL ≥ turnTimeoutMs (hard 2h cap)
+- [x] W8 — Credential, ACP prompt and lease expiry derive from the frozen run deadline (up to the supported 8h ceiling plus cleanup buffers)
 - [x] W9 — Workspace trust gate + safe reload auto-resume for released never-dispatched turns
 
 ---
@@ -1390,86 +1398,132 @@ Webview trigger, notice chrome, and proof-class separation are specified in [WEB
 
 ---
 
-## 19. Cross-runtime task handoff (durable contract)
+## 19. Cross-runtime model switch and continuation (destination contract)
 
-Schema-compatible optional field on `MusterTask`. No store `schemaVersion` bump: legacy tasks without `handoff` remain valid; present-but-malformed handoff is **stripped on load/commit** (fail closed) without quarantining the whole store.
+A model/backend switch is a fast, local binding change. It does not call the source
+agent, create a receiver session, or wait for model output. The next real turn on the
+target runtime starts a fresh session through the same bootstrap path as a newly
+created task, with one additional compact continuation block.
 
-### Ownership and no-chat invariants
+This section is the normative destination design. The legacy source-summary turn,
+receiver-bootstrap turn, `preparing_receiver`/`transferring` phase machine, and
+`completeRuntimeHandoff` second step are obsolete and must be removed during
+implementation.
 
-- **Owner:** the TaskHandoff aggregate (domain object) owns legal phase transitions, serialization, and terminal/idempotent behavior. `TaskStore` only persists and sanitizes the record. Orchestration (engine/backends) drives transitions; it must not invent alternate phase machines or write handoff prompts into `messages`.
-- **Not chat:** handoff prompts, source-summary text, and exported conversation bodies are **never** written as ordinary `TaskMessage` rows and must not appear in the webview transcript or Markdown export as user/assistant turns.
-- **Projection boundary:** `buildTranscript` / `buildSnapshot` and `renderTaskMarkdownExport` read only `TaskMessage` (plus tool/reasoning for host chrome). They never read `MusterTask.handoff`. A task with in-progress or completed handoff projects the same transcript as an identical task without the field.
-- **Reload safety:** well-formed handoff reloads as task metadata only; message collections stay unchanged. Legacy tasks without `handoff` remain valid and message-stable when sibling tasks gain handoff records.
-- **Diagnostics only:** progress surfaces may show sanitized phase, source/target backend ids, `operationId`, and timestamps — never conversation text, credentials, raw CLI output, or absolute paths.
+### Prompt layers and ownership
 
-### Persisted shape (`TaskHandoffState`)
+Every fresh agent session receives the same first-session contract, whether it is
+the first session for a new task or the first target session after a model switch:
+
+1. **Runtime contract (always):** identity, role, task id, operating rules,
+   permission policy, coordination strategy, and the tools actually available.
+2. **Task contract (always):** goal, brief, cwd/workspace context, resolved inputs,
+   skills, and host context.
+3. **Continuation context (handoff only):** compact history and current work state
+   captured before the switch.
+4. **Current input (always):** the user message or queued engine instruction that
+   starts this turn.
+
+Layers 1–2 must be produced by the same shared first-session prompt builder. A
+handoff must not maintain a separate bootstrap prompt that can drift from new-task
+behavior. Layer 3 is an optional argument to that builder, not another model call.
+
+Tool availability has two mandatory halves:
+
+- The target session is created through the normal turn runner so its `RunOptions`
+  contains the same MCP servers/config and credentials as any other task turn.
+- The runtime contract advertises only those attached capabilities and explains
+  their operating semantics. Prompt text alone cannot provide a tool, and wiring a
+  tool without the common runtime contract loses strategy and policy.
+
+### Atomic switch invariants
+
+- **No hidden model work:** switching never prompts the source or target agent.
+- **No source summary:** conversation and durable task state are canonical; no LLM
+  summary is generated, cached, persisted, or required.
+- **Immediate commit:** one store transaction validates the request, records the
+  context cutoff, increments `task.runtimeEpoch`, changes
+  `task.backend`/`task.model`, clears `committedSessionId`, and records the completed
+  switch.
+- **No receiver rollback:** authentication, session creation, prompt, tool, or model
+  failures on the next turn are ordinary turn failures. They never restore the old
+  backend/model.
+- **Fresh target session:** the source session id is never copied into handoff state
+  or passed to the target. The first target turn creates and then commits its own
+  session id.
+- **Stale-source isolation:** a live source turn is interrupted before the binding
+  commit. Any late event or settlement from the old runtime generation may settle
+  its own turn but must not overwrite the new task binding/session.
+- **Repeated switches:** an unconsumed prior continuation is not an active-handoff
+  gate. A newer valid switch interrupts/fences any assigned target turn, recomputes
+  the cutoff from canonical records, and atomically supersedes the prior switch.
+- **Not chat:** continuation metadata and rendered compact context do not create
+  synthetic `TaskMessage` rows and do not appear as extra user/assistant messages in
+  transcript, snapshot, or Markdown export.
+
+### Persisted shape (`TaskHandoffState` v2)
+
+The handoff record represents an already-completed binding switch plus a one-shot
+continuation payload. It is not an asynchronous phase machine.
 
 ```ts
-type TaskHandoffPhase =
-  | 'requested'
-  | 'exporting_context'
-  | 'summarizing_source'
-  | 'preparing_receiver'
-  | 'transferring'
-  | 'completed'
-  | 'failed'
-  | 'cancelled';
-
-interface TaskHandoffRuntimeBinding {
+interface TaskHandoffRuntimeLabel {
   backend: string;
   model?: string;
-  sessionId?: string;
+  runtimeEpoch: number;
 }
 
-type TaskHandoffConversationContext =
-  | { status: 'pending' }
-  | { status: 'ready'; messageCount: number; contentDigest: string; exportedAt: string }
-  | { status: 'unavailable'; reason: string };
+interface TaskHandoffContextCutoff {
+  throughMessageId?: string; // absent when no committed conversation exists
+  throughTurnSequence: number; // 0 when the task has no source turn
+  sourceStoreRevision: number;
+  messageCount: number;
+  toolCallCount: number;
+  contextDigest: string;
+  capturedAt: string;
+}
 
-type TaskHandoffSourceSummary =
+type TaskHandoffContinuation =
   | { status: 'pending' }
-  | { status: 'ready'; contentDigest: string; summarizedAt: string }
-  | { status: 'unavailable'; reason: string }
-  | { status: 'skipped'; reason: string };
+  | { status: 'assigned'; turnId: string; assignedAt: string }
+  | { status: 'consumed'; turnId: string; consumedAt: string };
 
 interface TaskHandoffState {
-  version: 1;
+  version: 2;
   operationId: string;
-  phase: TaskHandoffPhase;
-  source: TaskHandoffRuntimeBinding;
-  target: TaskHandoffRuntimeBinding;
-  conversationContext: TaskHandoffConversationContext; // required metadata
-  sourceSummary?: TaskHandoffSourceSummary;            // optional; may be unavailable
-  createdAt: string;
-  updatedAt: string;
-  startedAt?: string;
-  finishedAt?: string;
-  completion?: { completedAt: string; boundBackend: string; boundSessionId?: string };
-  failure?: { code: string; message: string; at: string }; // message sanitized + bounded
+  source: TaskHandoffRuntimeLabel;
+  target: TaskHandoffRuntimeLabel;
+  contextCutoff: TaskHandoffContextCutoff;
+  continuation: TaskHandoffContinuation;
+  switchedAt: string;
 }
 ```
 
-### Required vs optional context
+The cutoff stores identity/count/digest metadata only. `throughTurnSequence` bounds
+assistant segments and persisted tool calls; pending queued messages are excluded so
+the first target message is not duplicated as history. Conversation bodies and
+tool-event details remain in their canonical task/turn records and are rebuilt at
+prompt compilation time. Handoff state never contains source or target session ids.
 
-| Field | Role |
-|-------|------|
-| `conversationContext` | **Required** export metadata (counts/digests only). Receiver setup depends on it. |
-| `sourceSummary` | **Best-effort.** Always attempted on product switch. `ready` when source CLI produces a summary; `unavailable` on CLI/summary failure (conversation-only transfer). |
-
-### Store validation policy
+### Store and migration policy
 
 | On-disk shape | Behavior |
 |---------------|----------|
-| No `handoff` field | Valid legacy task; unchanged. |
-| Well-formed `handoff` | Loaded, re-sanitized, and reloadable. |
-| Malformed `handoff` | Field stripped; task kept; store **not** quarantined. |
+| No `handoff` field | Valid task with no pending continuation. |
+| Well-formed v2 `handoff` | Reload exactly; pending/assigned continuation remains durable. |
+| Legacy v1 terminal handoff | Preserve the task's already-committed binding, then discard/migrate the legacy progress metadata; never run hidden recovery turns. |
+| Legacy v1 active handoff | Keep the binding currently stored on the task, discard the active legacy operation, and require an explicit new switch; never auto-summarize or auto-bootstrap. |
+| Malformed handoff | Strip only the handoff field; keep the task and conversation. |
 | Unparseable store file | Existing store-corrupt quarantine policy (unchanged). |
 
-Failure `message` is scrubbed of absolute paths and credential-like tokens and capped (≤240 chars) via `sanitizeHandoffFailureMessage` on load and commit.
+Reload must never manufacture a source-summary call or receiver turn. A pending v2
+continuation waits for the next eligible real turn after reload.
 
-### Engine orchestration (`TaskEngine.requestRuntimeHandoff`)
+### Engine switch (`TaskEngine.requestRuntimeHandoff`)
 
-S02 entrypoint for starting a cross-runtime handoff on an **idle** task. It drives the TaskHandoff aggregate through export (+ optional hidden source summary) into `preparing_receiver`, then **stops**. Receiver session init and runtime rebinding are owned by S03.
+The engine owns one synchronous store operation. It validates static/local gates,
+preempts source work, captures the cutoff, and commits the target binding without
+calling `runTurn`.
 
 **Command shape**
 
@@ -1480,141 +1534,195 @@ engine.requestRuntimeHandoff({
   targetModel?: string;
 }): Promise<EngineResult<{
   operationId: string;
-  phase: TaskHandoffPhase;
-  diagnostics: TaskHandoffDiagnostics; // sanitized; no digests/session ids
+  boundBackend: string;
+  boundModel?: string;
+  switchedAt: string;
 }>>
 ```
 
 **Happy path**
 
-1. Validate fail-closed gates (below).
-2. Create `TaskHandoff` with `source` = current task binding (`backend` / `model` / `committedSessionId`) and `target` = requested backend/model.
-3. Export **required** conversation-context metadata (messageCount + contentDigest only) from existing `TaskMessage` rows. Conversation history is **always** required for transfer.
-4. Source summary is **always attempted** (no product on/off flag):
-   - Run a **hidden internal turn** via `makeBackend(source)` + private `runTurnFn` with a fixed handoff prompt and the source session/model.
-   - Capture assistant text in memory, digest it into `sourceSummary.contentDigest`, discard raw text.
-   - Never create `TaskMessage` / `TaskTurn` rows and never emit ordinary `EngineEvent`s.
-   - Summary success → package carries **summary + conversation**.
-   - Summary error / empty / throw → `sourceSummary: unavailable` and transfer continues **conversation-only** (still completes the model switch).
-5. Persist `MusterTask.handoff` at phase `preparing_receiver`.
-6. **Do not** mutate `task.backend`, `task.model`, or `task.committedSessionId` — old runtime binding holds until receiver setup.
+1. Reject missing task, invalid/same target binding, malformed labels, or a target
+   backend that cannot support the task's required MCP contract.
+2. Interrupt a running/waiting source turn immediately. Keep queued turns FIFO; do
+   not delete their user messages and do not wait for the source process to exit.
+3. In the binding commit, increment `task.runtimeEpoch`; every promoted turn pins
+   its epoch, and late source events may commit session binding only when the turn
+   epoch still equals the task epoch.
+4. Capture a deterministic cutoff over committed pre-switch messages/events.
+5. Atomically write the incremented runtime epoch,
+   `task.backend = targetBackend`, `task.model = targetModel`,
+   `task.committedSessionId = undefined`, and `TaskHandoffState` v2 with
+   `continuation.status = pending`.
+6. Release scheduling. The oldest eligible queued turn consumes the continuation;
+   otherwise it waits for the user's next message.
+7. Return success immediately after the store commit. No backend authentication,
+   session creation, source summary, receiver acknowledgement, or model timeout is
+   part of this command.
 
 **Fail-closed gates** (no binding mutation, no handoff write on rejection)
 
 | Condition | Behavior |
 |-----------|----------|
 | Missing task | Reject; store unchanged |
-| Live / queued / `waiting_user` turn | **Preempt** — interrupt live turns immediately and **hold** queued turns (`holdAutoPromote`) so they promote after rebind; do **not** wait for the current turn to finish; then continue handoff |
-| Active (non-terminal) handoff already present | Reject |
+| Running / `waiting_user` source turn | Interrupt and fence it; switch without waiting |
+| Queued turns | Preserve FIFO; first eligible turn receives continuation after commit |
 | Target backend factory throws | Reject (`target backend unavailable`) |
 | Target lacks MCP | Reject (`backend does not support MCP`) |
+| Static validation/store commit fails | Source binding remains unchanged; return task-scoped error |
 
-**Isolation invariants**
+Backend availability may change after the local check. A later target-session
+startup failure belongs to that turn and does not retroactively fail the switch.
 
-- Handoff prompts, summary text, digests, and operation ids never appear in `buildTranscript` / `buildSnapshot` chat or Markdown export conversation bodies.
-- Diagnostics expose phase, source/target backend ids, `operationId`, timestamps, and status flags only.
-- Reload of a `preparing_receiver` task restores handoff metadata and keeps the **source** runtime binding until S03 rebinds.
+### Compact continuation context (`muster-continuation/v2`)
 
-### Receiver handoff package (`muster-handoff-package/v1`)
+The continuation is a deterministic model-facing projection of canonical records,
+not a stored JSON dump and not an LLM summary. It is rebuilt only up to
+`contextCutoff` and rendered chronologically under a strict token/character
+budget.
 
-S03 builds an **in-process, versioned `HandoffPackage`** at transfer time. It is **not** persisted on `MusterTask` and is never written as chat.
+Priority order under truncation:
 
-| Field | Role |
-|-------|------|
-| `version` | Package contract version (`1`). Independent of store `schemaVersion` and of `TaskHandoffState.version`. |
-| `operationId` / `taskId` / `taskGoal` / `builtAt` | Provenance of this transfer attempt. |
-| `provenance` | Source/target **backend** (+ optional models) only. **Never** includes source or target session ids. |
-| `conversation` | Bounded rebuild of visible `TaskMessage` rows (`user`/`assistant`, non-`pending`), preferring `agentContent` over display `content`. Newest messages retained under message-count and total-char budgets. |
-| `messageCount` / `conversationDigest` | Count + digest of the rebuilt rows (not full bodies). |
-| `sourceSummary?` | Optional ephemeral enrichment text supplied only from engine memory; omit when summary was skipped/unavailable. Bounded independently of conversation. |
-| `continuationInstructions` | Fixed instructions to continue the same task without addressing the user or resuming a prior session. |
+1. Common runtime/task bootstrap and current input (never displaced by history).
+2. Task goal/brief and the latest unfinished user request.
+3. Current durable state: last turn outcome, changed files, verification commands
+   and results, pending questions, and child results relevant to this task.
+4. Recent user/assistant text and state-changing/error tool events.
+5. Older conversation from newest to oldest until the remaining budget is full.
 
-**Rebuild rule (D020):** conversation is always reconstructed from current visible `TaskMessage` rows at transfer time. Optional source-summary **text** is never read from the store (only digests/status live on `TaskHandoffState`); when the engine still holds summary text for the operation, it may attach it as enrichment. After reload, transfer continues **conversation-only** without re-querying the source CLI.
+Render rules:
 
-**Bootstrap prompt:** `buildHandoffBootstrapPrompt(pkg)` renders a `<!-- muster-handoff-package/v1 -->` prompt for `makeBackend(target)+runTurn` **without** `resumeId` / source session id. Prompt and summary bodies must never enter logs, `EngineEvent`s, `TaskMessage`/`TaskTurn` rows, or projections.
+| Canonical record | Compact model form |
+|------------------|--------------------|
+| User/assistant message | Role plus `agentContent` when present, otherwise display text |
+| Edit/write tool | Operation, workspace-relative path, success/failure, bounded diff summary when available |
+| Shell tool | Command, exit code, and bounded relevant stdout/stderr tail |
+| Test/verification | Command, pass/fail, and failing cases/error excerpt |
+| Read/search tool | Omit repetitive successes or render a short operation/result line; preserve failures and state-relevant findings |
+| Permission/elicitation | Decision plus the answer needed to continue; omit transport ids |
+| Turn terminal | Completed/failed/interrupted plus bounded actionable error |
 
-**Bounds (defaults):** `MAX_HANDOFF_CONVERSATION_MESSAGES` (200), `MAX_HANDOFF_CONVERSATION_CHARS` (100_000), `MAX_HANDOFF_SOURCE_SUMMARY_CHARS` (16_384).
+Always omit message/tool/request ids, timestamps, token usage, protocol envelopes,
+absolute host paths, credentials, and unrelated raw output. The renderer consumes
+structured records internally but sends compact text rather than JSON, for example:
 
-### Engine transfer (`TaskEngine.completeRuntimeHandoff`)
+```text
+## Continuation context
 
-S03 entrypoint that finishes a handoff already at `preparing_receiver`. Builds the ephemeral package, initializes a **new** target session, and rebinds runtime only after the receiver is ready.
+User requested the model-switch timeout bug be fixed.
 
-**Command shape**
+Assistant:
+I will update file A, then run the handoff tests.
 
-```ts
-engine.completeRuntimeHandoff({
-  taskId: string;
-  operationId?: string; // optional stale-op guard
-}): Promise<EngineResult<{
-  operationId: string;
-  phase: TaskHandoffPhase;
-  diagnostics: TaskHandoffDiagnostics; // sanitized; no prompt/summary bodies
-  boundBackend: string;
-  boundSessionId?: string; // newly captured sessionStarted id only
-}>>
+edit A
+result: success
+
+bash npm run test
+exit: 1
+output:
+  receiver init timed out
+
+Current state:
+- A has been changed.
+- Tests still fail in receiver initialization.
+- No commit has been created.
 ```
 
-**Happy path**
+Workspace files remain the source of truth for edits. The compact context helps the
+new agent orient itself; it does not replace inspecting current files when needed.
+“Current state” lines must be derived from explicit persisted task/turn fields and
+tool outcomes, never guessed by another model or inferred from missing events.
 
-1. Require handoff phase `preparing_receiver` (optional `operationId` must match). Preempt any live/queued turns first (interrupt, do not wait).
-2. Advance `preparing_receiver` → `transferring` and persist.
-3. Rebuild `HandoffPackage` from current visible `TaskMessage` rows + optional in-process summary text for this `operationId` (D020).
-4. `makeBackend(target)` + `runTurn` with bootstrap prompt and **no** `resumeId` / source session id (D021).
-5. Capture the first `sessionStarted` id as the new bound session.
-6. Atomically commit `backend` / `model` / `committedSessionId` + `handoff.complete` in one store write; clear ephemeral summary cache.
+### First target turn and durable attachment
 
-**Fail-closed transfer errors** (source binding unchanged)
+A handoff creates no turn by itself. The oldest eligible queued turn, or the next
+message sent by the user, becomes the first target turn. A future explicit
+“switch and continue” feature may enqueue an ordinary visible continuation turn,
+but it must remain separate from switch success.
 
-| Condition | Behavior |
-|-----------|----------|
-| Target backend factory throws | `handoff.fail` (`target_backend_unavailable`) |
-| Target lacks MCP | `handoff.fail` (`target_backend_not_mcp`) |
-| Receiver init stream error / throw | `handoff.fail` (`receiver_init_failed`) |
-| Aggregate complete rejected | `handoff.fail` (`handoff_complete_rejected`) |
+When the first target turn is promoted, one transaction:
 
-**Session and reload invariants**
+1. Claims the `pending` continuation for that `turnId` (`assigned`).
+2. Rebuilds compact history only through the stored cutoff, so the current message
+   cannot appear both as history and current input.
+3. Compiles and freezes the prompt as:
 
-- Never reuse the source (or any prior) session id on the target: omit `resumeId`, bind only a newly observed `sessionStarted` id, and give each task its own target session.
-- After process reload at `preparing_receiver`, the ephemeral summary cache is empty; transfer continues **conversation-only** without re-querying the source CLI.
-- Bootstrap prompt and summary bodies never create `TaskMessage`/`TaskTurn` rows and never appear in `buildTranscript` / `buildSnapshot` chat or Markdown export conversation bodies.
+   ```text
+   common runtime contract
+   + common task contract
+   + compact continuation context
+   + current turn input
+   ```
+
+4. Creates normal MCP configuration/credentials through `buildRunOptionsForTurn`.
+5. Starts a fresh target session without `resumeId` and records the new observed
+   session id through the ordinary session-commit rules.
+
+Assignment is durable and tied to the target runtime epoch. A successful first
+target turn commits its session id and marks the continuation `consumed`. A proven
+pre-dispatch failure returns it to `pending`; a clean terminal failure with no
+committed target session may reattach the same frozen continuation on an explicit
+retry/recovery turn. An ambiguous prompt remains `assigned` and must use normal turn
+recovery—it must not be silently replayed or moved to an unrelated later message.
+
+If the target turn fails to authenticate, create a session, invoke a tool, or finish
+within its normal run deadline, surface a normal turn error. The selected
+backend/model remains bound, and the user may retry or switch again.
 
 ### Host route (`routeRuntimeHandoff`)
 
-The webview posts a typed `requestRuntimeHandoff` OutMessage (`taskId`, `targetBackend`, optional `targetModel`). There is **no** product `skipSummary` flag — the engine always best-effort summarizes. The extension wires this through a pure host route (export-route pattern) that:
+The webview posts one typed `requestRuntimeHandoff` message (`taskId`,
+`targetBackend`, optional `targetModel`). The route:
 
 1. Validates the inbound payload (safe labels only — no session ids, paths, or control characters).
 2. Refuses missing tasks and same-binding switches without calling engine APIs.
-3. Calls `requestRuntimeHandoff` (binding hold → `preparing_receiver`), optionally projects intermediate `handoffProgress` via snapshot refresh.
-4. Calls `completeRuntimeHandoff` for atomic rebind (or `handoff.fail` with source binding retained).
-5. Surfaces refusals/failures as task-scoped `commandError` with sanitized text (no stacks, absolute paths, or secrets).
-6. Never returns `boundSessionId`, digests, or summary/bootstrap bodies on the wire.
+3. Calls the single atomic engine switch operation.
+4. Refreshes the task snapshot and returns a bounded success acknowledgement.
+5. Surfaces local validation/commit failures as task-scoped `commandError` with
+   sanitized text (no stacks, absolute paths, or secrets).
+6. Never calls `completeRuntimeHandoff` and never returns session ids, digests, or
+   continuation bodies on the wire.
 
-Progress and final binding labels are observed only through `TaskSummary.handoffProgress` / `backend` / `model` on snapshot/taskUpdated — never as chat turns.
+Final binding labels are observed through `TaskSummary.backend` / `model` on
+snapshot/taskUpdated. The continuation lifecycle is internal task metadata, not a
+chat turn and not a long-running host request.
 
-### Webview projection (`TaskSummary.handoffProgress`)
+### Webview projection
 
-Task chrome may render handoff progress, but only through an omission-safe projection on `TaskSummary` (and therefore on `snapshot` / `taskUpdated` patches). The host projects:
+The switch has no multi-phase progress bar because there is no model work to wait
+for. Task chrome may show a short one-shot success notice after the host confirms
+the commit. Persisted task summaries project:
 
 | Field | Included |
 |-------|----------|
-| `operationId` | yes |
-| `phase` | yes (full `TaskHandoffPhase` enum) |
-| `source` / `target` | backend + optional model labels only |
-| `createdAt` / `updatedAt` / `startedAt` / `finishedAt` | yes when present |
-| `failure.code` / `failure.message` / `failure.at` | yes when failed/cancelled; message re-sanitized at projection |
+| `backend` / `model` | yes; authoritative selected binding |
+| Last switch source/target labels and `switchedAt` | optional bounded diagnostics/notice only |
+| Pending/assigned/consumed continuation status | omit from ordinary user chrome unless needed for diagnostics |
 
 Never projected on `TaskSummary`, transcript, or Markdown export conversation bodies:
 
-- `sessionId` / `boundSessionId`
-- `conversationContext` (including digests and message counts)
-- `sourceSummary` (including digests, reasons, and any summary body)
-- bootstrap / handoff package prompt bodies
+- source or target session ids
+- context cutoff digests/counts/ids
+- compiled continuation prompt bodies
 - raw CLI output, credentials, or absolute paths
 
-`handoffProgress` is omitted entirely when a task has no handoff. Refusals for model-switch requests use task-scoped `commandError` (same channel as other host command refusals); they do not invent chat turns.
+Refusals use task-scoped `commandError`; success uses the updated binding plus a
+brief notice. Neither path invents a chat message.
 
 ### Webview model-switch control
 
-On an **open** existing task the composer always shows an interactive CLI+model picker (`data-testid="task-model-switch"`) — never blocked by runtime activity or in-flight handoff chrome. Start uses the same picker to choose binding; later changes post `requestRuntimeHandoff` with labels only. The engine **interrupts** any live turn and **holds** queued turns (does not wait for the turn to finish), then best-effort source-summarizes (conversation always included; summary attached when the source CLI succeeds). Same-binding picks are no-ops locally; host/engine still refuse same-binding/active-handoff/missing-task via `commandError` (picker stays enabled).
+On an **open** task the composer always shows an interactive CLI+model picker
+(`data-testid="task-model-switch"`). Start uses the same picker to choose a binding;
+later changes post `requestRuntimeHandoff` with labels only. A valid switch should
+feel local and immediate: the picker may optimistically show the target, then the
+host-confirmed snapshot becomes authoritative.
 
-Task chrome renders sanitized `TaskSummary.handoffProgress` in a task-scoped progress bar (`data-testid="handoff-progress"`) beside the model picker — phase label + source → target bindings, and bounded `failure.message` on failed. In-flight progress stays visible; a terminal result is a one-shot toast only when the mounted composer observed that same operation in flight, so persisted terminal metadata cannot replay after a chat snapshot, task reopen, or extension reload. The bar never injects digests, session ids, summary/bootstrap bodies, or chat turns. The picker remains enabled during in-flight phases; after `completed`/`failed`/`cancelled` the bound `backend`/`model` labels (source retained on failure) remain the source of truth for the next switch.
+If a source turn is live, the engine interrupts and fences it without waiting. Queued
+messages remain FIFO and the first eligible one runs on the new binding with compact
+continuation context. If nothing is queued, no agent runs until the user sends the
+next message. Same-binding picks are local no-ops; missing-task, invalid-target, and
+commit failures restore the confirmed picker value and show `commandError`.
+
+The UI must not show “Preparing receiver” or wait on a fixed source/receiver model
+timeout. A later target-turn failure appears in normal turn activity/error chrome and
+does not make the completed model switch look rolled back.

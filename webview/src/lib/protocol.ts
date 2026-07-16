@@ -11,7 +11,7 @@ import type { NormalizedEvent, Question } from './types';
  * breaking change to the ExtMessage/OutMessage shapes below (and mirror it in
  * src/extension.ts).
  */
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 
 /**
  * Decide whether a peer's advertised protocol version is compatible with ours.
@@ -122,6 +122,7 @@ export interface TaskSummary {
   currentTurnActivity: TurnActivity;
   /** Agent proposed complete/fail while lifecycle remains open. */
   hasOutcomeProposal?: boolean;
+  runTimeoutMessage?: string;
   updatedAt: string;
   backend: string;
   /** Optional model id selected for this task (ACP session config option value). */
@@ -209,38 +210,61 @@ export interface SnapshotMessage {
   pendingAsk?: PendingAsk;
 }
 
-export type RetentionSettingId = 'maxTurnsPerTask' | 'maxStoredOutputChars';
+export type RunLimitSetting = '15m' | '30m' | '1h' | '2h' | '4h' | '8h';
+export type RuntimeStorageSettingId =
+  | 'runLimit'
+  | 'maxRetainedTurnsPerTask'
+  | 'maxStoredOutputChars';
 
-export interface RetentionSettingValue {
-  id: RetentionSettingId;
-  label: string;
-  description: string;
-  value: number;
-  defaultValue: number;
-  minimum: number;
+export type RuntimeStorageSettingValue =
+  | {
+      kind: 'enum';
+      id: 'runLimit';
+      label: string;
+      description: string;
+      value: RunLimitSetting;
+      defaultValue: RunLimitSetting;
+      options: RunLimitSetting[];
+    }
+  | {
+      kind: 'number';
+      id: 'maxRetainedTurnsPerTask' | 'maxStoredOutputChars';
+      label: string;
+      description: string;
+      value: number;
+      defaultValue: number;
+      minimum: number;
+    };
+
+export interface RuntimeStorageSettingsSnapshot {
+  settings: RuntimeStorageSettingValue[];
 }
 
-export interface RetentionSettingSnapshot {
-  settings: RetentionSettingValue[];
-}
+/** @deprecated Compatibility aliases for extensions built against protocol v4 names. */
+export type RetentionSettingId = RuntimeStorageSettingId;
+/** @deprecated Use RuntimeStorageSettingValue. */
+export type RetentionSettingValue = RuntimeStorageSettingValue;
+/** @deprecated Use RuntimeStorageSettingsSnapshot. */
+export type RetentionSettingSnapshot = RuntimeStorageSettingsSnapshot;
 
 export interface SettingsSnapshotMessage {
   type: 'settingsSnapshot';
-  snapshot: RetentionSettingSnapshot;
+  snapshot: RuntimeStorageSettingsSnapshot;
 }
 
 export type RetentionSettingErrorCode =
   | 'unknownSetting'
   | 'invalidType'
+  | 'invalidEnum'
   | 'nonFinite'
   | 'nonInteger'
   | 'belowMinimum'
   | 'updateFailed';
 
 export type SettingsUpdateResult =
-  | { ok: true; settingId: RetentionSettingId; value: number }
+  | { ok: true; settingId: RuntimeStorageSettingId; value: number | RunLimitSetting }
   | { ok: false; code: 'unknownSetting'; message: string }
-  | { ok: false; settingId: RetentionSettingId; code: Exclude<RetentionSettingErrorCode, 'unknownSetting'>; message: string };
+  | { ok: false; settingId: RuntimeStorageSettingId; code: Exclude<RetentionSettingErrorCode, 'unknownSetting'>; message: string };
 
 export interface SettingsUpdateResultMessage {
   type: 'settingsUpdateResult';
@@ -592,7 +616,7 @@ export type OutMessage =
     }
   | { type: 'blurTask' }
   | { type: 'requestSettings' }
-  | { type: 'updateSetting'; settingId: RetentionSettingId; value: number }
+  | { type: 'updateSetting'; settingId: RuntimeStorageSettingId; value: number | RunLimitSetting }
   | { type: 'requestTaskTypesSettings' }
   | { type: 'updateTaskTypes'; types: TaskTypeSettingsRow[] }
   | { type: 'requestPermissionSettings' }
@@ -673,43 +697,46 @@ function isExportResultTimestamp(v: unknown): v is string {
   return !Number.isNaN(ms);
 }
 
-function isRetentionSettingId(v: unknown): v is RetentionSettingId {
-  return v === 'maxTurnsPerTask' || v === 'maxStoredOutputChars';
+function isRuntimeStorageSettingId(v: unknown): v is RuntimeStorageSettingId {
+  return v === 'runLimit' || v === 'maxRetainedTurnsPerTask' || v === 'maxStoredOutputChars';
 }
 
-const RETENTION_SETTING_CONTRACT: Record<RetentionSettingId, { defaultValue: number; minimum: number }> = {
-  maxTurnsPerTask: { defaultValue: 200, minimum: 1 },
-  maxStoredOutputChars: { defaultValue: 200000, minimum: 1024 },
-};
+const RETENTION_SETTING_CONTRACT = {
+  runLimit: { kind: 'enum', defaultValue: '2h', options: ['15m', '30m', '1h', '2h', '4h', '8h'] },
+  maxRetainedTurnsPerTask: { kind: 'number', defaultValue: 200, minimum: 1 },
+  maxStoredOutputChars: { kind: 'number', defaultValue: 200000, minimum: 1024 },
+} as const;
 
-function isRetentionSettingValue(v: unknown): v is RetentionSettingValue {
-  if (!isRecord(v) || !isRetentionSettingId(v.id)) return false;
+function isRuntimeStorageSettingValue(v: unknown): v is RuntimeStorageSettingValue {
+  if (!isRecord(v) || !isRuntimeStorageSettingId(v.id)) return false;
   const contract = RETENTION_SETTING_CONTRACT[v.id];
-  return (
-    isString(v.label) &&
-    isString(v.description) &&
-    isInteger(v.value) &&
-    v.value >= contract.minimum &&
-    v.defaultValue === contract.defaultValue &&
-    v.minimum === contract.minimum
-  );
+  if (!isString(v.label) || !isString(v.description) || v.kind !== contract.kind) return false;
+  if (contract.kind === 'enum') {
+    return isString(v.value) && (contract.options as readonly string[]).includes(v.value) &&
+      v.defaultValue === contract.defaultValue && Array.isArray(v.options) &&
+      v.options.length === contract.options.length &&
+      v.options.every((option, index) => option === contract.options[index]);
+  }
+  return isInteger(v.value) && v.value >= contract.minimum &&
+    v.defaultValue === contract.defaultValue && v.minimum === contract.minimum;
 }
 
-function isRetentionSettingSnapshot(v: unknown): v is RetentionSettingSnapshot {
+function isRuntimeStorageSettingsSnapshot(v: unknown): v is RuntimeStorageSettingsSnapshot {
   if (!isRecord(v) || !Array.isArray(v.settings)) return false;
   if (v.settings.length !== Object.keys(RETENTION_SETTING_CONTRACT).length) return false;
-  const seen = new Set<RetentionSettingId>();
+  const seen = new Set<RuntimeStorageSettingId>();
   for (const setting of v.settings) {
-    if (!isRetentionSettingValue(setting) || seen.has(setting.id)) return false;
+    if (!isRuntimeStorageSettingValue(setting) || seen.has(setting.id)) return false;
     seen.add(setting.id);
   }
-  return Object.keys(RETENTION_SETTING_CONTRACT).every((id) => seen.has(id as RetentionSettingId));
+  return Object.keys(RETENTION_SETTING_CONTRACT).every((id) => seen.has(id as RuntimeStorageSettingId));
 }
 
 function isRetentionSettingErrorCode(v: unknown): v is RetentionSettingErrorCode {
   return (
     v === 'unknownSetting' ||
     v === 'invalidType' ||
+    v === 'invalidEnum' ||
     v === 'nonFinite' ||
     v === 'nonInteger' ||
     v === 'belowMinimum' ||
@@ -839,14 +866,17 @@ function isPermissionSettingsUpdateResult(v: unknown): v is PermissionSettingsUp
 function isSettingsUpdateResult(v: unknown): v is SettingsUpdateResult {
   if (!isRecord(v) || typeof v.ok !== 'boolean') return false;
   if (v.ok) {
-    if (!isRetentionSettingId(v.settingId) || !isInteger(v.value)) return false;
-    return v.value >= RETENTION_SETTING_CONTRACT[v.settingId].minimum;
+    if (!isRuntimeStorageSettingId(v.settingId)) return false;
+    const contract = RETENTION_SETTING_CONTRACT[v.settingId];
+    return contract.kind === 'enum'
+      ? isString(v.value) && (contract.options as readonly string[]).includes(v.value)
+      : isInteger(v.value) && v.value >= contract.minimum;
   }
   if (!isRetentionSettingErrorCode(v.code) || !isString(v.message)) return false;
   if (v.code === 'unknownSetting') {
     return v.settingId === undefined;
   }
-  return isRetentionSettingId(v.settingId);
+  return isRuntimeStorageSettingId(v.settingId);
 }
 
 function isTurnActivity(v: unknown): v is TurnActivity {
@@ -950,6 +980,7 @@ function isTaskSummary(v: unknown): v is TaskSummary {
     (v.model === undefined || isString(v.model)) &&
     (v.continuationOf === undefined || isString(v.continuationOf)) &&
     (v.hasOutcomeProposal === undefined || typeof v.hasOutcomeProposal === 'boolean') &&
+    (v.runTimeoutMessage === undefined || isString(v.runTimeoutMessage)) &&
     (v.runtimeActivity === undefined ||
       v.runtimeActivity === null ||
       isString(v.runtimeActivity)) &&
@@ -1082,7 +1113,7 @@ export function isExtMessage(data: unknown): data is ExtMessage {
       );
 
     case 'settingsSnapshot':
-      return hasOnlyKeys(data, ['type', 'snapshot']) && isRetentionSettingSnapshot(data.snapshot);
+      return hasOnlyKeys(data, ['type', 'snapshot']) && isRuntimeStorageSettingsSnapshot(data.snapshot);
 
     case 'settingsUpdateResult':
       return hasOnlyKeys(data, ['type', 'result']) && isSettingsUpdateResult(data.result);

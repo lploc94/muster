@@ -4,8 +4,9 @@
   import type {
     PermissionModeSetting,
     PermissionSettingsSnapshot,
-    RetentionSettingId,
-    RetentionSettingSnapshot,
+    RuntimeStorageSettingId,
+    RuntimeStorageSettingsSnapshot,
+    RunLimitSetting,
     TaskTypeSettingsRow,
     TaskTypesSettingsSnapshot,
   } from '../lib/protocol';
@@ -31,20 +32,20 @@
 
   interface Props {
     onClose: () => void;
-    snapshot: RetentionSettingSnapshot | null;
+    snapshot: RuntimeStorageSettingsSnapshot | null;
     loading: boolean;
-    savingSettingId: RetentionSettingId | null;
+    savingSettingId: RuntimeStorageSettingId | null;
     savedMessage: string | null;
     /** Retention-local host write/load failure (never shown on Task Types). */
     retentionError: string | null;
-    fieldErrors: Partial<Record<RetentionSettingId, string>>;
+    fieldErrors: Partial<Record<RuntimeStorageSettingId, string>>;
     /** App-owned client-side field errors (validation). */
-    localFieldErrors: Partial<Record<RetentionSettingId, string>>;
+    localFieldErrors: Partial<Record<RuntimeStorageSettingId, string>>;
     /** App-owned Retention draft strings. */
     retentionDrafts: RetentionDrafts;
     onRetentionDraftsChange: (drafts: RetentionDrafts) => void;
-    onLocalFieldErrorsChange: (errors: Partial<Record<RetentionSettingId, string>>) => void;
-    onSave: (settingId: RetentionSettingId, value: number) => void;
+    onLocalFieldErrorsChange: (errors: Partial<Record<RuntimeStorageSettingId, string>>) => void;
+    onSave: (settingId: RuntimeStorageSettingId, value: number | RunLimitSetting) => void;
     /** Task types (muster.taskTypes) */
     taskTypesSnapshot: TaskTypesSettingsSnapshot | null;
     taskTypesLoading: boolean;
@@ -129,24 +130,24 @@
 
   let tablistEl = $state<HTMLDivElement | null>(null);
 
-  function displayLabel(settingId: RetentionSettingId): string {
+  function displayLabel(settingId: RuntimeStorageSettingId): string {
     return RETENTION_SETTING_LABELS[settingId];
   }
 
-  function fieldId(settingId: RetentionSettingId): string {
+  function fieldId(settingId: RuntimeStorageSettingId): string {
     return `settings-${settingId}`;
   }
 
-  function updateDraft(settingId: RetentionSettingId, value: string) {
+  function updateDraft(settingId: RuntimeStorageSettingId, value: string) {
     onRetentionDraftsChange({ ...retentionDrafts, [settingId]: value });
     onLocalFieldErrorsChange({ ...localFieldErrors, [settingId]: undefined });
   }
 
-  function onDraftInput(settingId: RetentionSettingId, event: Event) {
+  function onDraftInput(settingId: RuntimeStorageSettingId, event: Event) {
     updateDraft(settingId, (event.currentTarget as HTMLInputElement).value);
   }
 
-  function validationMessage(settingId: RetentionSettingId, minimum: number): string | null {
+  function validationMessage(settingId: RuntimeStorageSettingId, minimum = 0): string | null {
     return retentionDraftValidationMessage(
       settingId,
       retentionDrafts[settingId] ?? '',
@@ -155,7 +156,7 @@
     );
   }
 
-  function saveSetting(settingId: RetentionSettingId, minimum: number) {
+  function saveSetting(settingId: RuntimeStorageSettingId, minimum = 0) {
     const message = validationMessage(settingId, minimum);
     if (message) {
       // Invalid drafts remain visible and send no update.
@@ -164,7 +165,12 @@
     }
 
     onLocalFieldErrorsChange({ ...localFieldErrors, [settingId]: undefined });
-    onSave(settingId, Number(retentionDrafts[settingId]));
+    onSave(
+      settingId,
+      settingId === 'runLimit'
+        ? retentionDrafts[settingId] as RunLimitSetting
+        : Number(retentionDrafts[settingId]),
+    );
   }
 
   function backendOptions(): string[] {
@@ -770,11 +776,11 @@
             {/if}
           </section>
         {:else if activeTopicId === 'retention'}
-          <section class="settings-section" aria-label="Retention">
+          <section class="settings-section" aria-label="Runtime and Storage">
             <div class="settings-section__heading">
-              <h3 class="settings-section__title">Retention</h3>
+              <h3 class="settings-section__title">Runtime &amp; Storage</h3>
               <p class="settings-section__desc">
-                Retention keeps recent task history usable without storing unlimited completed-turn output.
+                Control uninterrupted agent runtime and how much completed history is retained.
               </p>
             </div>
 
@@ -785,7 +791,7 @@
                 data-testid="retention-local-error"
                 data-topic-error="retention"
               >
-                <div class="settings-panel__error-title">Retention save failed</div>
+                <div class="settings-panel__error-title">Runtime &amp; Storage save failed</div>
                 <div>{retentionError}</div>
               </div>
             {/if}
@@ -800,43 +806,48 @@
             {/if}
 
             {#if loading && !snapshot}
-              <p class="settings-panel__notice" role="status">Loading retention settings from VS Code…</p>
+              <p class="settings-panel__notice" role="status">Loading runtime and storage settings from VS Code…</p>
             {/if}
 
             {#if snapshot}
               <div class="settings-fields">
-                {#each snapshot.settings as setting (setting.id)}
+                <div class="settings-section__heading">
+                  <h4 class="settings-section__title">Agent runtime</h4>
+                  <p class="settings-section__desc">Applies to new agent runs; running turns keep their current deadline.</p>
+                </div>
+                {#each snapshot.settings.filter((candidate) => candidate.id === 'runLimit') as setting (setting.id)}
                   {@const label = displayLabel(setting.id)}
                   {@const error = localFieldErrors[setting.id] ?? fieldErrors[setting.id]}
                   <div class="field-row">
                     <div class="field-row__copy">
                       <label class="settings-panel__label" for={fieldId(setting.id)}>{label}</label>
                       <p class="settings-panel__description">{setting.description}</p>
-                      <p class="settings-panel__hint">Min {setting.minimum} · Default {setting.defaultValue}</p>
+                      <p class="settings-panel__hint">Default {setting.defaultValue}; waiting for children does not consume this budget.</p>
                       {#if error}
                         <div class="settings-panel__field-error" id={`${fieldId(setting.id)}-error`} role="alert">{error}</div>
                       {/if}
                     </div>
                     <div class="field-row__control">
                       <div class="field-row__input-group">
-                        <input
+                        <select
                           id={fieldId(setting.id)}
                           class="settings-panel__input"
-                          type="number"
-                          min={setting.minimum}
-                          step="1"
                           value={retentionDrafts[setting.id]}
                           aria-invalid={error ? 'true' : 'false'}
                           aria-describedby={error ? `${fieldId(setting.id)}-error` : undefined}
                           disabled={savingSettingId === setting.id}
                           oninput={(event) => onDraftInput(setting.id, event)}
-                        />
+                        >
+                          {#each setting.options as option}
+                            <option value={option}>{option}</option>
+                          {/each}
+                        </select>
                         <button
                           type="button"
                           class="settings-panel__btn settings-panel__btn--primary"
                           disabled={savingSettingId === setting.id}
                           aria-label={`Save ${label}`}
-                          onclick={() => saveSetting(setting.id, setting.minimum)}
+                          onclick={() => saveSetting(setting.id)}
                         >Save</button>
                       </div>
                       {#if savingSettingId === setting.id}
@@ -845,6 +856,50 @@
                     </div>
                   </div>
                 {/each}
+                <details class="settings-section" data-testid="history-storage-advanced">
+                  <summary class="settings-section__title">History storage (Advanced)</summary>
+                  <p class="settings-section__desc">Limits retained terminal-task history. These values do not stop a running agent.</p>
+                  {#each snapshot.settings.filter((candidate) => candidate.kind === 'number') as setting (setting.id)}
+                    {@const label = displayLabel(setting.id)}
+                    {@const error = localFieldErrors[setting.id] ?? fieldErrors[setting.id]}
+                    <div class="field-row">
+                      <div class="field-row__copy">
+                        <label class="settings-panel__label" for={fieldId(setting.id)}>{label}</label>
+                        <p class="settings-panel__description">{setting.description}</p>
+                        <p class="settings-panel__hint">Min {setting.minimum} · Default {setting.defaultValue}</p>
+                        {#if error}
+                          <div class="settings-panel__field-error" id={`${fieldId(setting.id)}-error`} role="alert">{error}</div>
+                        {/if}
+                      </div>
+                      <div class="field-row__control">
+                        <div class="field-row__input-group">
+                          <input
+                            id={fieldId(setting.id)}
+                            class="settings-panel__input"
+                            type="number"
+                            min={setting.minimum}
+                            step="1"
+                            value={retentionDrafts[setting.id]}
+                            aria-invalid={error ? 'true' : 'false'}
+                            aria-describedby={error ? `${fieldId(setting.id)}-error` : undefined}
+                            disabled={savingSettingId === setting.id}
+                            oninput={(event) => onDraftInput(setting.id, event)}
+                          />
+                          <button
+                            type="button"
+                            class="settings-panel__btn settings-panel__btn--primary"
+                            disabled={savingSettingId === setting.id}
+                            aria-label={`Save ${label}`}
+                            onclick={() => saveSetting(setting.id, setting.minimum)}
+                          >Save</button>
+                        </div>
+                        {#if savingSettingId === setting.id}
+                          <div class="settings-panel__saving" role="status">Saving {label}…</div>
+                        {/if}
+                      </div>
+                    </div>
+                  {/each}
+                </details>
               </div>
             {/if}
           </section>

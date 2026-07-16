@@ -289,15 +289,10 @@ function parseExecutionPolicy(value: Record<string, unknown>): Partial<TaskExecu
     if (maxAutomaticRetries === undefined) return undefined;
     policy.maxAutomaticRetries = maxAutomaticRetries;
   }
-  if ('turnTimeoutMs' in value) {
-    const turnTimeoutMs = positiveInt(value.turnTimeoutMs);
-    if (turnTimeoutMs === undefined) return undefined;
-    policy.turnTimeoutMs = turnTimeoutMs;
-  }
-  if ('taskTimeoutMs' in value) {
-    const taskTimeoutMs = positiveInt(value.taskTimeoutMs);
-    if (taskTimeoutMs === undefined) return undefined;
-    policy.taskTimeoutMs = taskTimeoutMs;
+  if ('runTimeoutOverrideMs' in value) {
+    const runTimeoutOverrideMs = positiveInt(value.runTimeoutOverrideMs);
+    if (runTimeoutOverrideMs === undefined) return undefined;
+    policy.runTimeoutOverrideMs = runTimeoutOverrideMs;
   }
   return policy;
 }
@@ -487,7 +482,7 @@ function parseCreateSpec(args: Record<string, unknown>): CreateChildSpec | undef
   }
   if (args.executionPolicy !== undefined) {
     if (!isRecord(args.executionPolicy)) return undefined;
-    const allowed = new Set(['maxTurns', 'maxAutomaticRetries', 'turnTimeoutMs', 'taskTimeoutMs']);
+    const allowed = new Set(['maxTurns', 'maxAutomaticRetries', 'runTimeoutOverrideMs']);
     if (Object.keys(args.executionPolicy).some((k) => !allowed.has(k))) return undefined;
     const policy = parseExecutionPolicy(args.executionPolicy);
     if (policy === undefined) return undefined;

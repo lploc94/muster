@@ -14,9 +14,29 @@ interface StoredCredential extends CredentialContext {
   token: string;
 }
 
+export type CredentialRejectionReason = 'missing' | 'expired' | 'revoked';
+export type CredentialVerification =
+  | { ok: true; context: CredentialContext }
+  | {
+      ok: false;
+      reason: CredentialRejectionReason;
+      credentialId?: string;
+      callerTaskId?: string;
+      turnId?: string;
+    };
+
+const MAX_INVALIDATED_CREDENTIALS = 256;
+
 export class CredentialRegistry {
   private readonly byToken = new Map<string, StoredCredential>();
   private readonly byTurnId = new Map<string, string>();
+  /** Bounded tombstones make 401 diagnostics useful without ever logging bearer tokens. */
+  private readonly invalidated = new Map<
+    string,
+    Pick<CredentialContext, 'credentialId' | 'callerTaskId' | 'turnId'> & {
+      reason: Exclude<CredentialRejectionReason, 'missing'>;
+    }
+  >();
 
   issue(params: {
     rootId: string;
@@ -43,21 +63,38 @@ export class CredentialRegistry {
   }
 
   verify(token: string): CredentialContext | null {
+    const verified = this.verifyDetailed(token);
+    return verified.ok ? verified.context : null;
+  }
+
+  verifyDetailed(token: string): CredentialVerification {
     const stored = this.byToken.get(token);
     if (!stored) {
-      return null;
+      const invalidated = this.invalidated.get(token);
+      return invalidated
+        ? { ok: false, ...invalidated }
+        : { ok: false, reason: 'missing' };
     }
     if (Date.now() > stored.expiry) {
-      this.revoke(stored.turnId);
-      return null;
+      this.invalidate(token, stored, 'expired');
+      return {
+        ok: false,
+        reason: 'expired',
+        credentialId: stored.credentialId,
+        callerTaskId: stored.callerTaskId,
+        turnId: stored.turnId,
+      };
     }
     return {
-      credentialId: stored.credentialId,
-      rootId: stored.rootId,
-      callerTaskId: stored.callerTaskId,
-      turnId: stored.turnId,
-      allowedActions: stored.allowedActions,
-      expiry: stored.expiry,
+      ok: true,
+      context: {
+        credentialId: stored.credentialId,
+        rootId: stored.rootId,
+        callerTaskId: stored.callerTaskId,
+        turnId: stored.turnId,
+        allowedActions: stored.allowedActions,
+        expiry: stored.expiry,
+      },
     };
   }
 
@@ -66,12 +103,34 @@ export class CredentialRegistry {
     if (!token) {
       return;
     }
-    this.byToken.delete(token);
-    this.byTurnId.delete(turnId);
+    const stored = this.byToken.get(token);
+    if (!stored) return;
+    this.invalidate(token, stored, 'revoked');
   }
 
   revokeAll(): void {
-    this.byToken.clear();
-    this.byTurnId.clear();
+    for (const [token, stored] of this.byToken) {
+      this.invalidate(token, stored, 'revoked');
+    }
+  }
+
+  private invalidate(
+    token: string,
+    stored: StoredCredential,
+    reason: Exclude<CredentialRejectionReason, 'missing'>,
+  ): void {
+    this.byToken.delete(token);
+    this.byTurnId.delete(stored.turnId);
+    this.invalidated.set(token, {
+      credentialId: stored.credentialId,
+      callerTaskId: stored.callerTaskId,
+      turnId: stored.turnId,
+      reason,
+    });
+    while (this.invalidated.size > MAX_INVALIDATED_CREDENTIALS) {
+      const oldest = this.invalidated.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.invalidated.delete(oldest);
+    }
   }
 }

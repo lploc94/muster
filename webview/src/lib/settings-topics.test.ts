@@ -35,7 +35,7 @@ describe('SETTINGS_TOPICS taxonomy', () => {
     expect(SETTINGS_TOPICS.map((topic) => topic.label)).toEqual([
       'Task Types',
       'Permissions',
-      'Retention',
+      'Runtime & Storage',
       'Models and CLIs',
       'Context and MCP',
     ]);

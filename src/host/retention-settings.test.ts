@@ -1,309 +1,213 @@
 import { describe, expect, it, vi } from 'vitest';
-import packageJson from '../../package.json';
 import {
   RETENTION_SETTING_DEFINITIONS,
   buildRetentionSettingsSnapshot,
   handleRetentionSettingUpdateAction,
   persistRetentionSettingUpdate,
-  sanitizeRetentionSettingsError,
+  selectRetainedTurnsValue,
   validateRetentionSettingUpdate,
 } from './retention-settings';
 
-const configProperties = packageJson.contributes.configuration.properties;
-
-describe('retention settings helper', () => {
-  it('defines the two allowed retention settings from package configuration metadata', () => {
-    expect(RETENTION_SETTING_DEFINITIONS).toEqual([
-      {
-        id: 'maxTurnsPerTask',
-        configKey: 'maxTurnsPerTask',
-        label: 'Max turns per task',
-        description: configProperties['muster.retention.maxTurnsPerTask'].description,
-        defaultValue: configProperties['muster.retention.maxTurnsPerTask'].default,
-        minimum: configProperties['muster.retention.maxTurnsPerTask'].minimum,
-      },
-      {
-        id: 'maxStoredOutputChars',
-        configKey: 'maxStoredOutputChars',
-        label: 'Max stored output characters',
-        description: configProperties['muster.retention.maxStoredOutputChars'].description,
-        defaultValue: configProperties['muster.retention.maxStoredOutputChars'].default,
-        minimum: configProperties['muster.retention.maxStoredOutputChars'].minimum,
-      },
-    ]);
+describe('runtime & storage settings helper', () => {
+  it('uses new explicit retention value before legacy fallback and package default', () => {
+    expect(selectRetainedTurnsValue(10, 20, 200)).toBe(10);
+    expect(selectRetainedTurnsValue(undefined, 20, 200)).toBe(20);
+    expect(selectRetainedTurnsValue(undefined, undefined, 200)).toBe(200);
   });
-
-  it('builds a settings snapshot using configured numeric values and package defaults', () => {
-    const snapshot = buildRetentionSettingsSnapshot((key) => {
-      if (key === 'maxTurnsPerTask') return 75;
-      return undefined;
+  it('exposes one runtime enum and two advanced storage numbers', () => {
+    expect(RETENTION_SETTING_DEFINITIONS.map((entry) => [entry.id, entry.kind])).toEqual([
+      ['runLimit', 'enum'],
+      ['maxRetainedTurnsPerTask', 'number'],
+      ['maxStoredOutputChars', 'number'],
+    ]);
+    expect(RETENTION_SETTING_DEFINITIONS[0]).toMatchObject({
+      label: 'Maximum uninterrupted agent run',
+      defaultValue: '2h',
+      options: ['15m', '30m', '1h', '2h', '4h', '8h'],
     });
+  });
 
-    expect(snapshot.settings).toEqual([
-      {
-        id: 'maxTurnsPerTask',
-        label: 'Max turns per task',
-        description: configProperties['muster.retention.maxTurnsPerTask'].description,
-        value: 75,
-        defaultValue: 200,
-        minimum: 1,
-      },
-      {
-        id: 'maxStoredOutputChars',
-        label: 'Max stored output characters',
-        description: configProperties['muster.retention.maxStoredOutputChars'].description,
-        value: 200000,
-        defaultValue: 200000,
-        minimum: 1024,
-      },
+  it('hydrates valid configured values', () => {
+    const snapshot = buildRetentionSettingsSnapshot((key) => ({
+      runLimit: '4h',
+      maxRetainedTurnsPerTask: 75,
+      maxStoredOutputChars: 50_000,
+    })[key]);
+    expect(snapshot.settings.map(({ id, value }) => [id, value])).toEqual([
+      ['runLimit', '4h'],
+      ['maxRetainedTurnsPerTask', 75],
+      ['maxStoredOutputChars', 50_000],
     ]);
   });
 
-  it('falls back to defaults when configured values would violate the protocol contract', () => {
-    const snapshot = buildRetentionSettingsSnapshot((key) => {
-      if (key === 'maxTurnsPerTask') return 0;
-      return 1024.5;
-    });
-
-    expect(snapshot.settings.map((setting) => [setting.id, setting.value])).toEqual([
-      ['maxTurnsPerTask', 200],
-      ['maxStoredOutputChars', 200000],
+  it('falls back to manifest defaults for invalid reads', () => {
+    const snapshot = buildRetentionSettingsSnapshot(() => null);
+    expect(snapshot.settings.map(({ id, value }) => [id, value])).toEqual([
+      ['runLimit', '2h'],
+      ['maxRetainedTurnsPerTask', 200],
+      ['maxStoredOutputChars', 200_000],
     ]);
   });
 
-  it('accepts valid integer updates for allowed setting IDs', () => {
-    expect(validateRetentionSettingUpdate({ settingId: 'maxTurnsPerTask', value: 1 })).toEqual({
+  it('validates runtime enum and numeric storage values', () => {
+    expect(validateRetentionSettingUpdate({ settingId: 'runLimit', value: '8h' })).toEqual({
       ok: true,
-      settingId: 'maxTurnsPerTask',
-      value: 1,
+      settingId: 'runLimit',
+      value: '8h',
     });
-    expect(validateRetentionSettingUpdate({ settingId: 'maxStoredOutputChars', value: 4096 })).toEqual({
+    expect(validateRetentionSettingUpdate({ settingId: 'runLimit', value: 'none' })).toMatchObject({
+      ok: false,
+      settingId: 'runLimit',
+      code: 'invalidEnum',
+    });
+    expect(validateRetentionSettingUpdate({ settingId: 'maxRetainedTurnsPerTask', value: 25 })).toEqual({
       ok: true,
-      settingId: 'maxStoredOutputChars',
-      value: 4096,
+      settingId: 'maxRetainedTurnsPerTask',
+      value: 25,
+    });
+    expect(validateRetentionSettingUpdate({ settingId: 'maxStoredOutputChars', value: 1 })).toMatchObject({
+      ok: false,
+      code: 'belowMinimum',
     });
   });
 
-  it('returns sanitized validation errors for malformed update payloads', () => {
-    expect(validateRetentionSettingUpdate({ settingId: 'unknown', value: 10 })).toEqual({
+  it('returns sanitized type/finite/integer validation errors', () => {
+    expect(validateRetentionSettingUpdate(undefined)).toMatchObject({
       ok: false,
       code: 'unknownSetting',
-      message: 'Unsupported retention setting.',
     });
-    expect(validateRetentionSettingUpdate({ settingId: 'maxTurnsPerTask', value: '10' })).toEqual({
+    expect(validateRetentionSettingUpdate({ settingId: 'runLimit', value: 2 })).toMatchObject({
       ok: false,
-      settingId: 'maxTurnsPerTask',
+      settingId: 'runLimit',
       code: 'invalidType',
-      message: 'Max turns per task must be a number.',
     });
-    expect(validateRetentionSettingUpdate({ settingId: 'maxTurnsPerTask', value: Number.NaN })).toEqual({
+    expect(validateRetentionSettingUpdate({ settingId: 'maxRetainedTurnsPerTask', value: '10' })).toMatchObject({
       ok: false,
-      settingId: 'maxTurnsPerTask',
+      code: 'invalidType',
+    });
+    expect(validateRetentionSettingUpdate({ settingId: 'maxRetainedTurnsPerTask', value: Number.NaN })).toMatchObject({
+      ok: false,
       code: 'nonFinite',
-      message: 'Max turns per task must be finite.',
     });
-    expect(validateRetentionSettingUpdate({ settingId: 'maxTurnsPerTask', value: Number.POSITIVE_INFINITY })).toEqual({
+    expect(validateRetentionSettingUpdate({ settingId: 'maxRetainedTurnsPerTask', value: 1.5 })).toMatchObject({
       ok: false,
-      settingId: 'maxTurnsPerTask',
-      code: 'nonFinite',
-      message: 'Max turns per task must be finite.',
-    });
-    expect(validateRetentionSettingUpdate({ settingId: 'maxTurnsPerTask', value: 1.5 })).toEqual({
-      ok: false,
-      settingId: 'maxTurnsPerTask',
       code: 'nonInteger',
-      message: 'Max turns per task must be an integer.',
-    });
-    expect(validateRetentionSettingUpdate({ settingId: 'maxStoredOutputChars', value: 1023 })).toEqual({
-      ok: false,
-      settingId: 'maxStoredOutputChars',
-      code: 'belowMinimum',
-      message: 'Max stored output characters must be at least 1024.',
     });
   });
 
-  it('rejects inherited update payload fields without persisting', async () => {
-    const update = vi.fn().mockResolvedValue(undefined);
-    const input = Object.create({ settingId: 'maxTurnsPerTask', value: 25 }) as unknown;
-
-    await expect(
-      persistRetentionSettingUpdate({ update }, input, Symbol('workspace-target')),
-    ).resolves.toEqual({
+  it('fails closed for inherited/unknown payload fields', async () => {
+    const update = vi.fn();
+    const inherited = Object.create({ settingId: 'runLimit', value: '2h' });
+    await expect(persistRetentionSettingUpdate({ update }, inherited, 'workspace')).resolves.toMatchObject({
       ok: false,
       code: 'unknownSetting',
-      message: 'Unsupported retention setting.',
     });
-
     expect(update).not.toHaveBeenCalled();
   });
 
-  it('persists valid updates using the package leaf key and supplied workspace target', async () => {
-    const update = vi.fn().mockResolvedValue(undefined);
-    const workspaceTarget = Symbol('workspace-target');
-
+  it('sanitizes write errors', async () => {
+    const update = vi.fn(async () => { throw new Error('secret stack'); });
     await expect(
       persistRetentionSettingUpdate(
         { update },
-        { settingId: 'maxStoredOutputChars', value: 4096 },
-        workspaceTarget,
-      ),
-    ).resolves.toEqual({ ok: true, settingId: 'maxStoredOutputChars', value: 4096 });
-
-    expect(update).toHaveBeenCalledTimes(1);
-    expect(update).toHaveBeenCalledWith('maxStoredOutputChars', 4096, workspaceTarget);
-  });
-
-  it('fails closed without persisting malformed update payloads', async () => {
-    const update = vi.fn().mockResolvedValue(undefined);
-
-    await expect(
-      persistRetentionSettingUpdate({ update }, undefined, Symbol('workspace-target')),
-    ).resolves.toEqual({
-      ok: false,
-      code: 'unknownSetting',
-      message: 'Unsupported retention setting.',
-    });
-
-    expect(update).not.toHaveBeenCalled();
-  });
-
-  it('fails closed without persisting below-minimum values', async () => {
-    const update = vi.fn().mockResolvedValue(undefined);
-
-    await expect(
-      persistRetentionSettingUpdate(
-        { update },
-        { settingId: 'maxStoredOutputChars', value: 1023 },
-        Symbol('workspace-target'),
-      ),
-    ).resolves.toEqual({
-      ok: false,
-      settingId: 'maxStoredOutputChars',
-      code: 'belowMinimum',
-      message: 'Max stored output characters must be at least 1024.',
-    });
-
-    expect(update).not.toHaveBeenCalled();
-  });
-
-  it('converts rejected update promises into sanitized error results', async () => {
-    const update = vi.fn().mockRejectedValue(new Error('ENOENT /secret/path token=abc123'));
-
-    await expect(
-      persistRetentionSettingUpdate(
-        { update },
-        { settingId: 'maxTurnsPerTask', value: 25 },
-        Symbol('workspace-target'),
-      ),
-    ).resolves.toEqual({
-      ok: false,
-      settingId: 'maxTurnsPerTask',
-      code: 'updateFailed',
-      message: 'Unable to update Max turns per task.',
-    });
-    expect(update).toHaveBeenCalledTimes(1);
-  });
-
-  it('converts thrown update failures into sanitized error results', () => {
-    const raw = new Error('ENOENT /secret/path token=abc123');
-
-    const sanitized = sanitizeRetentionSettingsError('maxTurnsPerTask', raw);
-    expect(sanitized).toEqual({
-      ok: false,
-      settingId: 'maxTurnsPerTask',
-      code: 'updateFailed',
-      message: 'Unable to update Max turns per task.',
-    });
-    // Sanitized Retention failure must never echo raw host paths or tokens.
-    expect(JSON.stringify(sanitized)).not.toMatch(/ENOENT|\/secret\/|token=/);
-  });
-
-  it('returns an update result followed by a refreshed settings snapshot for update actions', async () => {
-    const values = new Map([
-      ['maxTurnsPerTask', 25],
-      ['maxStoredOutputChars', 200000],
-    ]);
-    const configuration = {
-      get: vi.fn((key: 'maxTurnsPerTask' | 'maxStoredOutputChars') => values.get(key)),
-      update: vi.fn(async (key: 'maxTurnsPerTask' | 'maxStoredOutputChars', value: number) => {
-        values.set(key, value);
-      }),
-    };
-
-    await expect(
-      handleRetentionSettingUpdateAction(
-        configuration,
-        { settingId: 'maxTurnsPerTask', value: 50 },
+        { settingId: 'runLimit', value: '2h' },
         'workspace',
       ),
-    ).resolves.toEqual([
-      {
-        type: 'settingsUpdateResult',
-        result: { ok: true, settingId: 'maxTurnsPerTask', value: 50 },
-      },
-      {
-        type: 'settingsSnapshot',
-        snapshot: expect.objectContaining({
-          settings: expect.arrayContaining([
-            expect.objectContaining({ id: 'maxTurnsPerTask', value: 50 }),
-          ]),
-        }),
-      },
-    ]);
-
-    expect(configuration.update).toHaveBeenCalledWith('maxTurnsPerTask', 50, 'workspace');
+    ).resolves.toEqual({
+      ok: false,
+      settingId: 'runLimit',
+      code: 'updateFailed',
+      message: 'Unable to update Maximum uninterrupted agent run.',
+    });
   });
 
-  it('does not refresh the settings snapshot after a failed update result', async () => {
-    const configuration = {
-      get: vi.fn(() => 200),
-      update: vi.fn().mockRejectedValue(new Error('permission denied token=abc123')),
-    };
-
+  it('does not persist invalid values', async () => {
+    const update = vi.fn();
     await expect(
-      handleRetentionSettingUpdateAction(
-        configuration,
-        { settingId: 'maxTurnsPerTask', value: 50 },
+      persistRetentionSettingUpdate(
+        { update },
+        { settingId: 'maxStoredOutputChars', value: 100 },
         'workspace',
       ),
-    ).resolves.toEqual([
+    ).resolves.toMatchObject({ ok: false, code: 'belowMinimum' });
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it('passes the validated id/value and target to configuration.update', async () => {
+    const update = vi.fn(async () => undefined);
+    const target = Symbol('workspace');
+    await expect(
+      persistRetentionSettingUpdate(
+        { update },
+        { settingId: 'maxRetainedTurnsPerTask', value: 50 },
+        target,
+      ),
+    ).resolves.toEqual({
+      ok: true,
+      settingId: 'maxRetainedTurnsPerTask',
+      value: 50,
+    });
+    expect(update).toHaveBeenCalledWith('maxRetainedTurnsPerTask', 50, target);
+  });
+
+  it('returns authoritative refreshed snapshot after a successful save', async () => {
+    const values = new Map<string, unknown>([
+      ['runLimit', '2h'],
+      ['maxRetainedTurnsPerTask', 200],
+      ['maxStoredOutputChars', 200_000],
+    ]);
+    const configuration = {
+      get: (key: 'runLimit' | 'maxRetainedTurnsPerTask' | 'maxStoredOutputChars') => values.get(key),
+      update: async (key: string, value: unknown) => { values.set(key, value); },
+    };
+    const messages = await handleRetentionSettingUpdateAction(
+      configuration,
+      { settingId: 'runLimit', value: '4h' },
+      'workspace',
+    );
+    expect(messages[0]).toEqual({
+      type: 'settingsUpdateResult',
+      result: { ok: true, settingId: 'runLimit', value: '4h' },
+    });
+    expect(messages[1]?.type).toBe('settingsSnapshot');
+    if (messages[1]?.type === 'settingsSnapshot') {
+      expect(messages[1].snapshot.settings).toContainEqual(
+        expect.objectContaining({ id: 'runLimit', value: '4h' }),
+      );
+    }
+  });
+
+  it('does not refresh after update failure', async () => {
+    const get = vi.fn(() => '2h');
+    const messages = await handleRetentionSettingUpdateAction(
+      { get, update: async () => { throw new Error('/secret/path'); } },
+      { settingId: 'runLimit', value: '4h' },
+      'workspace',
+    );
+    expect(messages).toEqual([
       {
         type: 'settingsUpdateResult',
         result: {
           ok: false,
-          settingId: 'maxTurnsPerTask',
+          settingId: 'runLimit',
           code: 'updateFailed',
-          message: 'Unable to update Max turns per task.',
+          message: 'Unable to update Maximum uninterrupted agent run.',
         },
       },
     ]);
-
-    expect(configuration.get).not.toHaveBeenCalled();
+    expect(get).not.toHaveBeenCalled();
   });
 
-  it('still returns the sanitized update failure when refreshing the snapshot also fails', async () => {
-    const configuration = {
-      get: vi.fn(() => {
-        throw new Error('ENOENT /secret/path token=abc123');
-      }),
-      update: vi.fn().mockRejectedValue(new Error('permission denied token=abc123')),
-    };
-
-    await expect(
-      handleRetentionSettingUpdateAction(
-        configuration,
-        { settingId: 'maxTurnsPerTask', value: 50 },
-        'workspace',
-      ),
-    ).resolves.toEqual([
+  it('preserves successful update result if authoritative refresh throws', async () => {
+    const messages = await handleRetentionSettingUpdateAction(
+      { get: () => { throw new Error('read failed'); }, update: async () => undefined },
+      { settingId: 'runLimit', value: '1h' },
+      'workspace',
+    );
+    expect(messages).toEqual([
       {
         type: 'settingsUpdateResult',
-        result: {
-          ok: false,
-          settingId: 'maxTurnsPerTask',
-          code: 'updateFailed',
-          message: 'Unable to update Max turns per task.',
-        },
+        result: { ok: true, settingId: 'runLimit', value: '1h' },
       },
     ]);
   });

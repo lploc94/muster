@@ -408,7 +408,7 @@ describe('TaskStore', () => {
       sendReceipts: {},
     };
     const migrated = migrate(v4, CURRENT_SCHEMA_VERSION);
-    expect(migrated.schemaVersion).toBe(5);
+    expect(migrated.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
     expect(migrated.tasks['with-turn']?.goal).toBe('legacy goal A');
     expect(migrated.tasks['with-turn']?.releaseState).toBe('released');
     expect(migrated.tasks['with-turn']?.brief?.objective).toBe('legacy goal A');
@@ -417,6 +417,62 @@ describe('TaskStore', () => {
     expect(migrated.tasks['no-turn']?.brief?.objective).toBe('legacy goal B');
     // Never invent turns for draft tasks.
     expect(Object.values(migrated.turns).filter((t) => t.taskId === 'no-turn')).toHaveLength(0);
+  });
+
+  it('migrates v5 execution policy, epoch, and freezes legacy live deadlines', () => {
+    const defaults = sampleTask('defaults');
+    defaults.executionPolicy = {
+      maxTurns: 50,
+      maxAutomaticRetries: 2,
+      turnTimeoutMs: 300_000,
+      taskTimeoutMs: 1_800_000,
+    };
+    const custom = sampleTask('custom');
+    custom.executionPolicy = {
+      maxTurns: 80,
+      maxAutomaticRetries: 3,
+      turnTimeoutMs: 900_000,
+      taskTimeoutMs: 9_999_999,
+    };
+    const v5: TaskStoreFile = {
+      schemaVersion: 5,
+      revision: 1,
+      tasks: { defaults, custom },
+      turns: {
+        live: {
+          id: 'live',
+          taskId: 'defaults',
+          sequence: 1,
+          trigger: 'user',
+          status: 'running',
+          inputs: [],
+          createdAt: '2026-07-16T00:00:00.000Z',
+          startedAt: '2026-07-16T00:01:00.000Z',
+        },
+      },
+      messages: {},
+      operations: {},
+      cancelRequests: {},
+      toolCalls: {},
+      reasoning: {},
+      sendReceipts: {},
+    };
+    const migrated = migrate(v5, CURRENT_SCHEMA_VERSION);
+    expect(migrated.tasks.defaults?.executionPolicy).toEqual({
+      maxTurns: 50,
+      maxAutomaticRetries: 2,
+    });
+    expect(migrated.tasks.custom?.executionPolicy).toEqual({
+      maxTurns: 80,
+      maxAutomaticRetries: 3,
+      runTimeoutOverrideMs: 900_000,
+    });
+    expect(migrated.tasks.defaults?.executionEpoch).toBe(1);
+    expect(migrated.turns.live).toMatchObject({
+      executionEpoch: 1,
+      effectiveRunLimitMs: 300_000,
+      runDeadlineAt: '2026-07-16T00:06:00.000Z',
+    });
   });
 
   it('persists toolCalls/reasoning across commit and reload (retention writeback plumbing)', () => {

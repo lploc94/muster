@@ -1,4 +1,6 @@
 import type { TaskExecutionPolicy, TaskStoreFile } from './types';
+import { TASK_ERROR_MAX_BYTES, TASK_RESULT_MAX_BYTES } from './content-limits';
+import { TASK_EXECUTION_HARD_BOUNDS } from './execution-policy';
 
 export interface ResourceLimits {
   maxDepth: number;
@@ -16,12 +18,14 @@ export const DEFAULT_RESOURCE_LIMITS: ResourceLimits = {
   maxDepth: 8,
   maxChildrenPerTask: 32,
   maxChildrenPerRoot: 64,
-  maxTurnsPerTask: 50,
+  // Hard allocation safety bound. The per-task policy supplies the normal 50-turn
+  // budget; keeping this at 50 made the advertised policy max of 500 unreachable.
+  maxTurnsPerTask: TASK_EXECUTION_HARD_BOUNDS.maxTurns,
   maxConcurrentTurns: 4,
   maxConcurrentPerRoot: 4,
   maxConcurrentPerBackend: 2,
-  maxResultBytes: 16_384,
-  maxErrorBytes: 4_096,
+  maxResultBytes: TASK_RESULT_MAX_BYTES,
+  maxErrorBytes: TASK_ERROR_MAX_BYTES,
 };
 
 /**
@@ -40,13 +44,17 @@ export interface ExecutionPolicyBounds {
   maxAutomaticRetries: number;
 }
 
+/**
+ * Schema-v5 compatibility adapter. Values derive from the canonical V2 hard
+ * bounds; production task creation resolves through execution-policy.ts.
+ */
 export const DEFAULT_EXECUTION_POLICY_BOUNDS: ExecutionPolicyBounds = {
-  minTurnTimeoutMs: 1_000, // 1 second
-  maxTurnTimeoutMs: 1_800_000, // 30 minutes
-  minTaskTimeoutMs: 1_000, // 1 second
-  maxTaskTimeoutMs: 14_400_000, // 4 hours
-  maxTurns: 500,
-  maxAutomaticRetries: 20,
+  minTurnTimeoutMs: TASK_EXECUTION_HARD_BOUNDS.minRunLimitMs,
+  maxTurnTimeoutMs: TASK_EXECUTION_HARD_BOUNDS.maxRunLimitMs,
+  minTaskTimeoutMs: TASK_EXECUTION_HARD_BOUNDS.minRunLimitMs,
+  maxTaskTimeoutMs: TASK_EXECUTION_HARD_BOUNDS.maxRunLimitMs,
+  maxTurns: TASK_EXECUTION_HARD_BOUNDS.maxTurns,
+  maxAutomaticRetries: TASK_EXECUTION_HARD_BOUNDS.maxAutomaticRetries,
 };
 
 /**
@@ -55,8 +63,8 @@ export const DEFAULT_EXECUTION_POLICY_BOUNDS: ExecutionPolicyBounds = {
  * max(turnTimeoutMs, this floor) then applies a hard safety cap.
  */
 export const MAX_BRIDGE_TOKEN_TTL_MS = 900_000; // 15 minutes
-/** Absolute hard cap (2h) so a misconfigured turnTimeout cannot mint multi-day tokens. */
-export const HARD_BRIDGE_TOKEN_TTL_MS = 7_200_000;
+/** Covers the longest supported 8h run plus cleanup without permitting multi-day tokens. */
+export const HARD_BRIDGE_TOKEN_TTL_MS = 8 * 60 * 60_000 + 5 * 60_000;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
@@ -74,12 +82,23 @@ export function clampExecutionPolicy(
   bounds: ExecutionPolicyBounds = DEFAULT_EXECUTION_POLICY_BOUNDS,
 ): TaskExecutionPolicy {
   const merged = { ...base, ...requested };
-  return {
+  const result: TaskExecutionPolicy = {
     maxTurns: clamp(merged.maxTurns, 1, bounds.maxTurns),
     maxAutomaticRetries: clamp(merged.maxAutomaticRetries, 0, bounds.maxAutomaticRetries),
-    turnTimeoutMs: clamp(merged.turnTimeoutMs, bounds.minTurnTimeoutMs, bounds.maxTurnTimeoutMs),
-    taskTimeoutMs: clamp(merged.taskTimeoutMs, bounds.minTaskTimeoutMs, bounds.maxTaskTimeoutMs),
   };
+  const override = merged.runTimeoutOverrideMs;
+  if (override !== undefined) {
+    result.runTimeoutOverrideMs = clamp(override, bounds.minTurnTimeoutMs, bounds.maxTurnTimeoutMs);
+  }
+  // Preserve schema-v5 values only for compatibility callers. New engine creation
+  // goes through resolveTaskExecutionPolicy and never emits these fields.
+  if (merged.turnTimeoutMs !== undefined) {
+    result.turnTimeoutMs = clamp(merged.turnTimeoutMs, bounds.minTurnTimeoutMs, bounds.maxTurnTimeoutMs);
+  }
+  if (merged.taskTimeoutMs !== undefined) {
+    result.taskTimeoutMs = clamp(merged.taskTimeoutMs, bounds.minTaskTimeoutMs, bounds.maxTaskTimeoutMs);
+  }
+  return result;
 }
 
 /**
@@ -141,7 +160,10 @@ export function canCreateTurn(
   // Count every turn row for the task, including still-queued reservations, so
   // operators cannot oversubscribe the effective cap with FIFO follow-ups that
   // can never all execute.
-  const slotsUsed = Object.values(file.turns).filter((turn) => turn.taskId === taskId).length;
+  const epoch = task.executionEpoch ?? 1;
+  const slotsUsed = Object.values(file.turns).filter(
+    (turn) => turn.taskId === taskId && (turn.executionEpoch ?? 1) === epoch,
+  ).length;
   if (slotsUsed >= cap) {
     return { ok: false, reason: 'max turns per task exceeded' };
   }
