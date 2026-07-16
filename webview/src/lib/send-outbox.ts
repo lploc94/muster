@@ -10,6 +10,8 @@ export interface OutboxEntry {
   llmText?: string;
   /** Display mention token -> agent-facing path, retained so a rejected send can retry safely. */
   mentionBindings?: Array<[string, string]>;
+  /** Skill chips attached to a new-task send, restored with the draft on reject. */
+  skills?: string[];
   backend?: string;
   model?: string;
   continuationOf?: string;
@@ -42,6 +44,29 @@ function normalizeMentionBindings(value: unknown): Array<[string, string]> | und
   return bindings.length > 0 ? bindings : undefined;
 }
 
+/** Max persisted skill chips; mirrors Composer's MAX_SKILL_CHIPS. */
+const MAX_PERSISTED_SKILLS = 8;
+
+/**
+ * Sanitize persisted skill chips: trim, drop blanks, dedupe, and cap at
+ * MAX_PERSISTED_SKILLS so a restored draft can never violate the composer's
+ * chip invariants (dedup + cap) or collide the keyed `{#each ... (name)}` block.
+ */
+function normalizeSkills(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const s of value) {
+    if (typeof s !== 'string') continue;
+    const trimmed = s.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    out.push(trimmed);
+    if (out.length >= MAX_PERSISTED_SKILLS) break;
+  }
+  return out.length > 0 ? out : undefined;
+}
+
 function readState(api: VsCodeStateApi | undefined): OutboxEntry[] {
   try {
     const raw = api?.getState?.() as { sendOutbox?: OutboxEntry[] } | undefined;
@@ -50,6 +75,7 @@ function readState(api: VsCodeStateApi | undefined): OutboxEntry[] {
     return list.map((entry) => ({
       ...entry,
       mentionBindings: normalizeMentionBindings(entry?.mentionBindings),
+      skills: normalizeSkills(entry?.skills),
     }));
   } catch {
     return [];
