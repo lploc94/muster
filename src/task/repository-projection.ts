@@ -1,0 +1,194 @@
+import { deriveViewStatus } from './derived-status';
+import type {
+  RepositoryCommand,
+  RepositoryCommandResult,
+  TaskRepository,
+} from './repository';
+import type {
+  MusterTask,
+  TaskStoreFile,
+  TaskTurn,
+  TaskViewStatus,
+} from './types';
+
+/**
+ * Read-only in-memory projection used by legacy synchronous engine selectors
+ * when the writable source is an async repository. It never writes JSON and it
+ * is refreshed only for aggregates touched by a successful named command.
+ */
+export class RepositoryProjection {
+  private constructor(
+    private readonly source: TaskRepository,
+    private readonly workspaceId: string,
+    private readonly file: TaskStoreFile,
+  ) {}
+
+  static async load(source: TaskRepository, workspaceId: string): Promise<RepositoryProjection> {
+    const projection = new RepositoryProjection(source, workspaceId, {
+      schemaVersion: 6,
+      revision: await (source.getWorkspaceRevision?.() ?? Promise.resolve(0)),
+      tasks: {}, turns: {}, messages: {}, toolCalls: {}, reasoning: {},
+      operations: {}, cancelRequests: {}, sendReceipts: {}, runtimeClaims: {},
+    });
+    await projection.refreshAll();
+    return projection;
+  }
+
+  getFile(): Readonly<TaskStoreFile> {
+    return this.file;
+  }
+
+  getTask(taskId: string): MusterTask | undefined {
+    return this.file.tasks[taskId];
+  }
+
+  getTurnsForTask(taskId: string): TaskTurn[] {
+    return Object.values(this.file.turns)
+      .filter((turn) => turn.taskId === taskId)
+      .sort((a, b) => a.sequence - b.sequence || a.createdAt.localeCompare(b.createdAt));
+  }
+
+  viewStatusOf(taskId: string): TaskViewStatus | undefined {
+    const task = this.file.tasks[taskId];
+    if (!task) return undefined;
+    const dependencies = new Map(
+      task.dependencies
+        .map((dependency) => [dependency.taskId, this.file.tasks[dependency.taskId]?.lifecycle] as const)
+        .filter((entry): entry is [string, NonNullable<(typeof entry)[1]>] => entry[1] !== undefined),
+    );
+    return deriveViewStatus(task, this.getTurnsForTask(taskId), dependencies);
+  }
+
+  async refreshAll(): Promise<void> {
+    const tasks = [...await this.source.listTasks(this.workspaceId)];
+    const liveIds = new Set(tasks.map((task) => task.id));
+    for (const id of Object.keys(this.file.tasks)) {
+      if (!liveIds.has(id)) this.removeTask(id);
+    }
+    await Promise.all(tasks.map((task) => this.refreshTask(task.id, task)));
+    this.file.revision = await (this.source.getWorkspaceRevision?.() ?? Promise.resolve(this.file.revision));
+  }
+
+  async refreshTask(taskId: string, knownTask?: MusterTask): Promise<void> {
+    const task = knownTask ?? await this.source.getTask(taskId);
+    if (!task) {
+      this.removeTask(taskId);
+      return;
+    }
+    const [turns, messages, tools, reasoning] = await Promise.all([
+      this.source.listTurns(taskId), this.source.listMessages(taskId),
+      this.source.listToolCalls(taskId), this.source.listReasoning(taskId),
+    ]);
+    this.removeTaskRows(taskId);
+    this.file.tasks[taskId] = task;
+    for (const turn of turns) this.file.turns[turn.id] = turn;
+    for (const message of messages) this.file.messages[message.id] = message;
+    for (const tool of tools) this.file.toolCalls![tool.id] = tool;
+    for (const segment of reasoning) this.file.reasoning![segment.id] = segment;
+  }
+
+  async afterExecute(command: RepositoryCommand, result: RepositoryCommandResult): Promise<void> {
+    if (!result.changed) return;
+    if (command.kind === 'claimRuntime' || command.kind === 'heartbeatRuntime' || command.kind === 'releaseRuntime') {
+      const claim = await this.source.getRuntimeClaim(command.turnId);
+      if (claim) this.file.runtimeClaims![command.turnId] = claim;
+      else delete this.file.runtimeClaims![command.turnId];
+      await this.refreshRevision();
+      return;
+    }
+    this.applyCoordination(command);
+    if (command.kind === 'clearHistory' || command.kind === 'deleteTask' || command.kind === 'deleteTaskSubtreeIfIdle') {
+      await this.refreshAll();
+      return;
+    }
+    const ids = this.affectedTaskIds(command);
+    await Promise.all([...ids].map((id) => this.refreshTask(id)));
+    await this.refreshRevision();
+  }
+
+  private async refreshRevision(): Promise<void> {
+    this.file.revision = await (this.source.getWorkspaceRevision?.() ?? Promise.resolve(this.file.revision + 1));
+  }
+
+  private affectedTaskIds(command: RepositoryCommand): Set<string> {
+    const ids = new Set<string>();
+    if ('taskId' in command && typeof command.taskId === 'string') ids.add(command.taskId);
+    if ('task' in command && command.task && typeof command.task === 'object' && 'id' in command.task) ids.add(command.task.id);
+    if ('tasks' in command && Array.isArray(command.tasks)) for (const task of command.tasks) ids.add(task.id);
+    if ('turn' in command && command.turn && typeof command.turn === 'object' && 'taskId' in command.turn) ids.add(command.turn.taskId);
+    if ('turns' in command && Array.isArray(command.turns)) for (const turn of command.turns) ids.add(turn.taskId);
+    if ('message' in command && command.message && typeof command.message === 'object' && 'taskId' in command.message) ids.add(command.message.taskId);
+    if ('messages' in command && Array.isArray(command.messages)) for (const message of command.messages) ids.add(message.taskId);
+    if ('mutations' in command && Array.isArray(command.mutations)) for (const mutation of command.mutations) ids.add(mutation.taskId);
+    if ('rootTaskId' in command && typeof command.rootTaskId === 'string') ids.add(command.rootTaskId);
+    if ('turnId' in command && typeof command.turnId === 'string') {
+      const taskId = this.file.turns[command.turnId]?.taskId;
+      if (taskId) ids.add(taskId);
+    }
+    return ids;
+  }
+
+  private applyCoordination(command: RepositoryCommand): void {
+    switch (command.kind) {
+      case 'putOperation':
+      case 'claimOperation':
+        this.file.operations![command.ledgerKey] = command.entry;
+        break;
+      case 'deleteOperationsForTurn':
+        for (const key of Object.keys(this.file.operations!)) if (key.startsWith(`${command.turnId}:`)) delete this.file.operations![key];
+        break;
+      case 'putCancelRequest':
+        this.file.cancelRequests![command.turnId] = command.request;
+        break;
+      case 'deleteCancelRequest':
+        delete this.file.cancelRequests![command.turnId];
+        break;
+      case 'putSendReceipt':
+        this.file.sendReceipts![command.receipt.clientRequestId] = command.receipt;
+        break;
+      case 'deleteSendReceipt':
+        delete this.file.sendReceipts![command.clientRequestId];
+        break;
+      default:
+        break;
+    }
+  }
+
+  private removeTask(taskId: string): void {
+    delete this.file.tasks[taskId];
+    this.removeTaskRows(taskId);
+  }
+
+  private removeTaskRows(taskId: string): void {
+    const turnIds = new Set(Object.values(this.file.turns).filter((turn) => turn.taskId === taskId).map((turn) => turn.id));
+    for (const [id, turn] of Object.entries(this.file.turns)) if (turn.taskId === taskId) delete this.file.turns[id];
+    for (const [id, message] of Object.entries(this.file.messages)) if (message.taskId === taskId) delete this.file.messages[id];
+    for (const [id, tool] of Object.entries(this.file.toolCalls ?? {})) if (tool.taskId === taskId) delete this.file.toolCalls![id];
+    for (const [id, segment] of Object.entries(this.file.reasoning ?? {})) if (segment.taskId === taskId) delete this.file.reasoning![id];
+    for (const turnId of turnIds) {
+      delete this.file.cancelRequests![turnId];
+      delete this.file.runtimeClaims![turnId];
+    }
+  }
+}
+
+/** Wrap repository writes so the synchronous projection becomes visible before
+ * a durable command resolves to its engine caller. */
+export function withRepositoryProjection(
+  source: TaskRepository,
+  projection: RepositoryProjection,
+): TaskRepository {
+  return new Proxy(source, {
+    get(target, property, receiver) {
+      if (property === 'execute') {
+        return async (command: RepositoryCommand): Promise<RepositoryCommandResult> => {
+          const result = await target.execute(command);
+          await projection.afterExecute(command, result);
+          return result;
+        };
+      }
+      const value = Reflect.get(target, property, receiver) as unknown;
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}

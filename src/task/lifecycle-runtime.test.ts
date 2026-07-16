@@ -990,13 +990,15 @@ describe('task lifecycle runtime regression harness', () => {
           createdAt: '2026-07-06T12:00:00.000Z',
           startedAt: '2026-07-06T12:00:00.000Z',
         };
+        draft.runtimeClaims = {
+          'remote-turn': {
+            turnId: 'remote-turn', ownerId: `remote-${remoteOwner.pid}`,
+            claimedAt: '2026-07-06T12:00:00.000Z', heartbeatAt: '2026-07-06T12:00:00.000Z',
+            expiresAt: '2099-01-01T00:00:00.000Z',
+          },
+        };
         return { ok: true };
       });
-      fs.writeFileSync(
-        `${filePath}.lease.remote-turn`,
-        JSON.stringify({ pid: remoteOwner.pid, token: 'remote-owner', createdAt: new Date().toISOString() }),
-        'utf8',
-      );
       const reloadedStore = TaskStore.load({ filePath });
       const reloaded = makeEngine(reloadedStore, () => eventBackend([{ type: 'turnCompleted' }]));
 

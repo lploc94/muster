@@ -8,6 +8,7 @@ import type {
   SendReceipt,
   TaskDependency,
   TaskMessage,
+  RuntimeClaim,
   TaskStoreFile,
   TaskTurn,
   TurnInput,
@@ -98,6 +99,30 @@ export type RepositoryCommand =
       /** Queue/start/continue boundary without a user message. */
       kind: 'queueTaskTurn'; workspaceId: string; expectedTaskRevision: number;
       maxTurnsPerTask: number; task: MusterTask; turn: TaskTurn;
+    }
+  | {
+      /** Post-settlement FIFO drain: update the task and create all derived
+       * continuation turns in one revision-fenced transaction. */
+      kind: 'drainPendingSends'; workspaceId: string; expectedTaskRevision: number;
+      maxTurnsPerTask: number; task: MusterTask; turns: readonly TaskTurn[]; messages?: readonly TaskMessage[];
+    }
+  | {
+      /** Readiness attention marker guarded by the current task revision. */
+      kind: 'setTaskAttention'; workspaceId: string; expectedTaskRevision: number;
+      task: MusterTask;
+    }
+  | {
+      /** Idempotent disposition-repair allocation and attention escalation. */
+      kind: 'enqueueDispositionRepair'; workspaceId: string; expectedTaskRevision: number;
+      maxTurnsPerTask: number; task: MusterTask; turn?: TaskTurn; message?: TaskMessage;
+    }
+  | {
+      /** Atomically supersede a task runtime binding and preempt/retag its
+       * current turns behind task/turn ownership fences. */
+      kind: 'requestRuntimeHandoff'; workspaceId: string; taskId: string;
+      expectedTaskRevision: number; task: MusterTask; turns: readonly TaskTurn[];
+      expectedTurns: readonly { id: string; status: TurnStatus; runtimeEpoch?: number }[];
+      cancelRequests?: readonly { turnId: string; request: CancelRequest }[];
     }
   | {
       /** Stage one disposition on a live turn behind a status/runtime fence. */
@@ -203,6 +228,19 @@ export type RepositoryCommand =
       entry: OperationLedgerEntry; createdAt: string;
     }
   | { kind: 'deleteOperationsForTurn'; workspaceId: string; turnId: string }
+  | {
+      /** Repository-owned runtime ownership fence. Claim/reclaim is conditional
+       * on the row being absent, expired, or already owned by this owner. */
+      kind: 'claimRuntime'; workspaceId: string; turnId: string; ownerId: string;
+      claimedAt: string; heartbeatAt: string; expiresAt: string;
+    }
+  | {
+      kind: 'heartbeatRuntime'; workspaceId: string; turnId: string; ownerId: string;
+      heartbeatAt: string; expiresAt: string;
+    }
+  | {
+      kind: 'releaseRuntime'; workspaceId: string; turnId: string; ownerId?: string;
+    }
   | { kind: 'putCancelRequest'; workspaceId: string; turnId: string; request: CancelRequest }
   | { kind: 'deleteCancelRequest'; workspaceId: string; turnId: string }
   | { kind: 'putSendReceipt'; workspaceId: string; receipt: SendReceipt }
@@ -296,6 +334,7 @@ export interface TaskRepository {
   listReasoning(taskId: string): Promise<readonly PersistedReasoning[]>;
   getOperation(ledgerKey: string): Promise<OperationLedgerEntry | undefined>;
   getCancelRequest(turnId: string): Promise<CancelRequest | undefined>;
+  getRuntimeClaim(turnId: string): Promise<RuntimeClaim | undefined>;
   getSendReceipt(clientRequestId: string): Promise<SendReceipt | undefined>;
   getTranscriptPage(taskId: string, cursor?: string, limit?: number): Promise<TranscriptPage>;
   /** Current workspace revision without materializing the compatibility envelope. */
@@ -562,6 +601,7 @@ function deleteTaskIdsFromFile(file: TaskStoreFile, ids: readonly string[]): voi
   }
   for (const turnId of deletedTurnIds) {
     delete file.cancelRequests?.[turnId];
+    delete file.runtimeClaims?.[turnId];
     for (const key of Object.keys(file.operations ?? {})) {
       if (key.startsWith(`${turnId}:`)) delete file.operations?.[key];
     }
@@ -678,6 +718,11 @@ export class JsonTaskRepository implements TaskRepository {
   async getCancelRequest(turnId: string): Promise<CancelRequest | undefined> {
     const request = this.store.getFile().cancelRequests?.[turnId];
     return request ? clone(request) : undefined;
+  }
+
+  async getRuntimeClaim(turnId: string): Promise<RuntimeClaim | undefined> {
+    const claim = this.store.getFile().runtimeClaims?.[turnId];
+    return claim ? clone(claim) : undefined;
   }
 
   async getSendReceipt(clientRequestId: string): Promise<SendReceipt | undefined> {
@@ -808,6 +853,64 @@ export class JsonTaskRepository implements TaskRepository {
           if (slotsUsed >= cap) return { ok: false, reason: 'max turns per task exceeded' };
           draft.tasks[command.task.id] = clone(command.task);
           draft.turns[command.turn.id] = clone(command.turn);
+          changed = true;
+          return { ok: true };
+        }
+        case 'drainPendingSends': {
+          const current = draft.tasks[command.task.id];
+          if (!current) return { ok: false, reason: 'task not found' };
+          if (current.revision !== command.expectedTaskRevision) return { ok: false, reason: 'task changed; retry' };
+          if (command.turns.some((turn) => turn.taskId !== command.task.id || turn.status !== 'queued')) {
+            return { ok: false, reason: 'continuation turn is invalid' };
+          }
+          if (command.turns.some((turn) => draft.turns[turn.id])) return { ok: false, reason: 'turn already exists' };
+          for (const message of command.messages ?? []) {
+            if (message.taskId !== command.task.id) return { ok: false, reason: 'message task mismatch' };
+            draft.messages[message.id] = clone(message);
+          }
+          draft.tasks[command.task.id] = clone(command.task);
+          for (const turn of command.turns) draft.turns[turn.id] = clone(turn);
+          changed = command.turns.length > 0 || (command.messages?.length ?? 0) > 0;
+          return { ok: true };
+        }
+        case 'setTaskAttention': {
+          const current = draft.tasks[command.task.id];
+          if (!current) return { ok: false, reason: 'task not found' };
+          if (current.revision !== command.expectedTaskRevision) return { ok: false, reason: 'task changed; retry' };
+          draft.tasks[command.task.id] = clone(command.task);
+          changed = true;
+          return { ok: true };
+        }
+        case 'enqueueDispositionRepair': {
+          const current = draft.tasks[command.task.id];
+          if (!current) return { ok: false, reason: 'task not found' };
+          if (current.revision !== command.expectedTaskRevision) return { ok: false, reason: 'task changed; retry' };
+          if (command.turn && draft.turns[command.turn.id]) return { ok: true };
+          if (command.turn && command.turn.taskId !== command.task.id) return { ok: false, reason: 'repair turn task mismatch' };
+          if (command.message && command.message.taskId !== command.task.id) return { ok: false, reason: 'repair message task mismatch' };
+          draft.tasks[command.task.id] = clone(command.task);
+          if (command.turn) draft.turns[command.turn.id] = clone(command.turn);
+          if (command.message) draft.messages[command.message.id] = clone(command.message);
+          changed = true;
+          return { ok: true };
+        }
+        case 'requestRuntimeHandoff': {
+          const current = draft.tasks[command.taskId];
+          if (!current) return { ok: false, reason: 'task not found' };
+          if (current.revision !== command.expectedTaskRevision) return { ok: false, reason: 'task changed; retry' };
+          for (const expected of command.expectedTurns) {
+            const turn = draft.turns[expected.id];
+            if (!turn || turn.status !== expected.status ||
+              (expected.runtimeEpoch !== undefined && (turn.runtimeEpoch ?? 1) !== expected.runtimeEpoch)) {
+              return { ok: false, reason: 'turn changed; retry' };
+            }
+          }
+          draft.tasks[command.taskId] = clone(command.task);
+          for (const turn of command.turns) draft.turns[turn.id] = clone(turn);
+          for (const entry of command.cancelRequests ?? []) {
+            draft.cancelRequests = draft.cancelRequests ?? {};
+            draft.cancelRequests[entry.turnId] = clone(entry.request);
+          }
           changed = true;
           return { ok: true };
         }
@@ -1064,6 +1167,7 @@ export class JsonTaskRepository implements TaskRepository {
           }
           delete draft.reasoning?.[command.turnId];
           delete draft.cancelRequests?.[command.turnId];
+          delete draft.runtimeClaims?.[command.turnId];
           for (const ledgerKey of Object.keys(draft.operations ?? {})) {
             if (ledgerKey.startsWith(`${command.turnId}:`)) delete draft.operations?.[ledgerKey];
           }
@@ -1191,6 +1295,51 @@ export class JsonTaskRepository implements TaskRepository {
           changed = deleted;
           return { ok: true };
         }
+        case 'claimRuntime': {
+          if (!draft.turns[command.turnId]) return { ok: false, reason: 'turn not found' };
+          draft.runtimeClaims = draft.runtimeClaims ?? {};
+          const existing = draft.runtimeClaims[command.turnId];
+          const expired = existing ? Date.parse(existing.expiresAt) <= Date.parse(command.claimedAt) : true;
+          if (existing && !expired && existing.ownerId !== command.ownerId) {
+            return { ok: false, reason: 'runtime claim is owned by another worker' };
+          }
+          const next: RuntimeClaim = {
+            turnId: command.turnId,
+            ownerId: command.ownerId,
+            claimedAt: existing?.ownerId === command.ownerId && !expired ? existing.claimedAt : command.claimedAt,
+            heartbeatAt: command.heartbeatAt,
+            expiresAt: command.expiresAt,
+          };
+          if (existing && JSON.stringify(existing) === JSON.stringify(next)) return { ok: true };
+          draft.runtimeClaims[command.turnId] = next;
+          changed = true;
+          return { ok: true };
+        }
+        case 'heartbeatRuntime': {
+          const existing = draft.runtimeClaims?.[command.turnId];
+          if (!existing || existing.ownerId !== command.ownerId) {
+            return { ok: false, reason: 'runtime claim owner mismatch' };
+          }
+          if (Date.parse(existing.expiresAt) <= Date.parse(command.heartbeatAt)) {
+            return { ok: false, reason: 'runtime claim expired' };
+          }
+          draft.runtimeClaims![command.turnId] = {
+            ...existing,
+            heartbeatAt: command.heartbeatAt,
+            expiresAt: command.expiresAt,
+          };
+          changed = true;
+          return { ok: true };
+        }
+        case 'releaseRuntime': {
+          const existing = draft.runtimeClaims?.[command.turnId];
+          if (!existing || (command.ownerId !== undefined && existing.ownerId !== command.ownerId)) {
+            return { ok: true };
+          }
+          delete draft.runtimeClaims![command.turnId];
+          changed = true;
+          return { ok: true };
+        }
         case 'putCancelRequest':
           if (!draft.turns[command.turnId]) return { ok: false, reason: 'turn not found' };
           draft.cancelRequests = draft.cancelRequests ?? {};
@@ -1281,6 +1430,7 @@ export class JsonTaskRepository implements TaskRepository {
               }
               delete draft.reasoning?.[turn.id];
               delete draft.cancelRequests?.[turn.id];
+              delete draft.runtimeClaims?.[turn.id];
               for (const key of Object.keys(draft.operations ?? {})) {
                 if (key.startsWith(`${turn.id}:`)) delete draft.operations?.[key];
               }
@@ -1356,6 +1506,7 @@ export class JsonTaskRepository implements TaskRepository {
           for (const turn of command.relatedTurns) draft.turns[turn.id] = clone(turn);
           for (const message of command.messages) draft.messages[message.id] = clone(message);
           delete draft.cancelRequests?.[command.turn.id];
+          delete draft.runtimeClaims?.[command.turn.id];
           changed = true;
           return { ok: true };
         }
@@ -1568,6 +1719,15 @@ export class SqliteTaskRepository implements TaskRepository {
     return row ? decodeCancelRequest(row) : undefined;
   }
 
+  async getRuntimeClaim(turnId: string): Promise<RuntimeClaim | undefined> {
+    const row = await this.db.get<RuntimeClaimRow>(
+      `SELECT turn_id, owner_id, claimed_at, heartbeat_at, expires_at
+         FROM runtime_claims WHERE workspace_id = ? AND turn_id = ?`,
+      [this.workspaceId, turnId],
+    );
+    return row ? decodeRuntimeClaim(row) : undefined;
+  }
+
   async getSendReceipt(clientRequestId: string): Promise<SendReceipt | undefined> {
     const row = await this.db.get<ReceiptRow>(
       `SELECT client_request_id, fingerprint, task_id, message_id, turn_id, created_at
@@ -1612,7 +1772,7 @@ export class SqliteTaskRepository implements TaskRepository {
   }
 
   async readEnvelopeForMigration(): Promise<Readonly<TaskStoreFile>> {
-    const [tasks, turnRows, messageRows, toolRows, reasoningRows, operationRows, cancelRows, receiptRows, revisionRow] = await Promise.all([
+    const [tasks, turnRows, messageRows, toolRows, reasoningRows, operationRows, cancelRows, runtimeClaimRows, receiptRows, revisionRow] = await Promise.all([
       this.listTasks(this.workspaceId),
       this.db.all<TurnRow>(`${turnSelect('WHERE workspace_id = ?')} ORDER BY task_id, sequence, created_at, id`, [this.workspaceId]),
       this.db.all<MessageRow>(`${messageSelect('WHERE workspace_id = ?')} ORDER BY created_at, id`, [this.workspaceId]),
@@ -1630,6 +1790,10 @@ export class SqliteTaskRepository implements TaskRepository {
       this.db.all<CancelRow>(
         `SELECT turn_id, kind, op_id, requested_by, requested_at, payload_json
            FROM turn_cancel_requests WHERE workspace_id = ?`, [this.workspaceId],
+      ),
+      this.db.all<RuntimeClaimRow>(
+        `SELECT turn_id, owner_id, claimed_at, heartbeat_at, expires_at
+           FROM runtime_claims WHERE workspace_id = ?`, [this.workspaceId],
       ),
       this.db.all<ReceiptRow>(
         `SELECT client_request_id, fingerprint, task_id, message_id, turn_id, created_at
@@ -1649,6 +1813,7 @@ export class SqliteTaskRepository implements TaskRepository {
       })),
       operations: Object.fromEntries(operationRows.map((row) => [row.ledger_key, decodeOperation(row)])),
       cancelRequests: Object.fromEntries(cancelRows.map((row) => [row.turn_id, decodeCancelRequest(row)])),
+      runtimeClaims: Object.fromEntries(runtimeClaimRows.map((row) => [row.turn_id, decodeRuntimeClaim(row)])),
       toolCalls: Object.fromEntries(toolRows.map((row) => {
         const dto = decodeToolCall(row);
         return [dto.id, dto];
@@ -1871,6 +2036,14 @@ export class SqliteTaskRepository implements TaskRepository {
         return this.retryTurn(command);
       case 'queueTaskTurn':
         return this.queueTaskTurn(command);
+      case 'drainPendingSends':
+        return this.drainPendingSends(command);
+      case 'setTaskAttention':
+        return this.setTaskAttention(command);
+      case 'enqueueDispositionRepair':
+        return this.enqueueDispositionRepair(command);
+      case 'requestRuntimeHandoff':
+        return this.requestRuntimeHandoff(command);
       case 'stageDisposition':
         return this.stageDisposition(command);
       case 'applyTaskLifecycle':
@@ -1983,6 +2156,12 @@ export class SqliteTaskRepository implements TaskRepository {
         );
         return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
       }
+      case 'claimRuntime':
+        return this.claimRuntime(command);
+      case 'heartbeatRuntime':
+        return this.heartbeatRuntime(command);
+      case 'releaseRuntime':
+        return this.releaseRuntime(command);
       case 'putCancelRequest': {
         const results = await this.writeIfFirstChanged(
           cancelRequestStatement(this.workspaceId, command), [],
@@ -2273,6 +2452,110 @@ export class SqliteTaskRepository implements TaskRepository {
     return { ok: true, changed, ...(changed ? {} : { reason: 'task changed or max turns per task exceeded; retry' }) };
   }
 
+  private async drainPendingSends(
+    command: Extract<RepositoryCommand, { kind: 'drainPendingSends' }>,
+  ): Promise<RepositoryCommandResult> {
+    if (command.turns.some((turn) => turn.taskId !== command.task.id || turn.status !== 'queued')) {
+      return { ok: true, changed: false, reason: 'continuation turn is invalid' };
+    }
+    const rest: SqlStatement[] = [
+      { sql: 'DELETE FROM task_dependencies WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, command.task.id] },
+      ...command.task.dependencies.map((dependency) => dependencyStatement(this.workspaceId, command.task.id, dependency)),
+      ...command.turns.flatMap((turn) => [
+        turnStatement(this.workspaceId, turn, false),
+        ...turn.inputs.map((input, ordering) => turnInputStatement(this.workspaceId, turn.id, ordering, input)),
+      ]),
+      ...(command.messages ?? []).map((message) => messageStatement(this.workspaceId, message, true)),
+    ];
+    const changes: ChangeRecord[] = [
+      { kind: 'task', id: command.task.id, change: 'drain_pending_sends' },
+      ...command.turns.map((turn) => ({ kind: 'turn' as const, id: turn.id, taskId: turn.taskId, change: 'continuation' })),
+      ...(command.messages ?? []).map((message) => ({ kind: 'message' as const, id: message.id, taskId: message.taskId, change: 'assign' })),
+    ];
+    const results = await this.writeIfFirstChanged(
+      guardedTaskUpdateStatement(this.workspaceId, command.task, command.expectedTaskRevision, command.maxTurnsPerTask),
+      rest,
+      changes,
+      command.task.updatedAt,
+    );
+    const changed = (results[0]?.changes ?? 0) > 0;
+    return { ok: true, changed, ...(changed ? {} : { reason: 'task changed; retry' }) };
+  }
+
+  private async setTaskAttention(
+    command: Extract<RepositoryCommand, { kind: 'setTaskAttention' }>,
+  ): Promise<RepositoryCommandResult> {
+    const results = await this.writeIfFirstChanged(
+      {
+        sql: `UPDATE tasks SET parent_id=?, role=?, lifecycle=?, release_state=?, goal=?, backend=?, model=?,
+                revision=?, created_at=?, updated_at=?, payload_json=?
+              WHERE workspace_id=? AND id=? AND revision=?`,
+        params: [command.task.parentId, command.task.role, command.task.lifecycle,
+          command.task.releaseState ?? null, command.task.goal, command.task.backend,
+          command.task.model ?? null, command.task.revision, command.task.createdAt,
+          command.task.updatedAt, taskPayload(command.task), this.workspaceId,
+          command.task.id, command.expectedTaskRevision],
+      },
+      [],
+      { kind: 'task', id: command.task.id, change: 'attention' },
+      command.task.updatedAt,
+    );
+    const changed = (results[0]?.changes ?? 0) > 0;
+    return { ok: true, changed, ...(changed ? {} : { reason: 'task changed; retry' }) };
+  }
+
+  private async enqueueDispositionRepair(
+    command: Extract<RepositoryCommand, { kind: 'enqueueDispositionRepair' }>,
+  ): Promise<RepositoryCommandResult> {
+    const rest: SqlStatement[] = [];
+    if (command.turn) {
+      rest.push(turnStatement(this.workspaceId, command.turn, false));
+      rest.push(...command.turn.inputs.map((input, ordering) => turnInputStatement(this.workspaceId, command.turn!.id, ordering, input)));
+    }
+    if (command.message) rest.push(messageStatement(this.workspaceId, command.message, false));
+    const changes: ChangeRecord[] = [
+      { kind: 'task', id: command.task.id, change: 'disposition_repair' },
+      ...(command.turn ? [{ kind: 'turn' as const, id: command.turn.id, taskId: command.turn.taskId, change: 'disposition_repair' }] : []),
+      ...(command.message ? [{ kind: 'message' as const, id: command.message.id, taskId: command.message.taskId, change: 'disposition_repair' }] : []),
+    ];
+    const results = await this.writeIfFirstChanged(
+      guardedTaskUpdateStatement(this.workspaceId, command.task, command.expectedTaskRevision, command.maxTurnsPerTask),
+      rest,
+      changes,
+      command.task.updatedAt,
+    );
+    const changed = (results[0]?.changes ?? 0) > 0;
+    return { ok: true, changed, ...(changed ? {} : { reason: 'task changed or repair already exists' }) };
+  }
+
+  private async requestRuntimeHandoff(
+    command: Extract<RepositoryCommand, { kind: 'requestRuntimeHandoff' }>,
+  ): Promise<RepositoryCommandResult> {
+    const fence = appendTurnFence(
+      'UPDATE tasks SET updated_at = updated_at WHERE workspace_id = ? AND id = ? AND revision = ?',
+      [this.workspaceId, command.taskId, command.expectedTaskRevision],
+      this.workspaceId,
+      command.expectedTurns,
+    );
+    const rest: SqlStatement[] = [
+      ...taskMutationStatements(this.workspaceId, command.task),
+      ...command.turns.flatMap((turn) => turnMutationStatements(this.workspaceId, turn)),
+      ...(command.cancelRequests ?? []).map((entry) => cancelRequestStatement(this.workspaceId, {
+        kind: 'putCancelRequest', workspaceId: this.workspaceId, turnId: entry.turnId, request: entry.request,
+      })),
+    ];
+    const changes: ChangeRecord[] = [
+      { kind: 'task', id: command.taskId, change: 'runtime_handoff' },
+      ...command.turns.map((turn) => ({ kind: 'turn' as const, id: turn.id, taskId: turn.taskId, change: 'runtime_handoff' })),
+      ...(command.cancelRequests ?? []).map((entry) => ({ kind: 'cancel_request' as const, id: entry.turnId, change: 'runtime_handoff' })),
+    ];
+    const results = await this.writeIfFirstChanged(
+      { sql: fence.sql, params: fence.params }, rest, changes, command.task.updatedAt,
+    );
+    const changed = (results[0]?.changes ?? 0) > 0;
+    return { ok: true, changed, ...(changed ? {} : { reason: 'task or turn changed; retry' }) };
+  }
+
   private async stageDisposition(
     command: Extract<RepositoryCommand, { kind: 'stageDisposition' }>,
   ): Promise<RepositoryCommandResult> {
@@ -2506,6 +2789,69 @@ export class SqliteTaskRepository implements TaskRepository {
     return { ok: true, changed: inserted, operation };
   }
 
+  private async claimRuntime(
+    command: Extract<RepositoryCommand, { kind: 'claimRuntime' }>,
+  ): Promise<RepositoryCommandResult> {
+    const results = await this.writeIfFirstChanged(
+      {
+        sql: `INSERT INTO runtime_claims
+                (workspace_id, turn_id, owner_id, claimed_at, heartbeat_at, expires_at)
+              SELECT ?, id, ?, ?, ?, ? FROM turns
+               WHERE workspace_id = ? AND id = ?
+              ON CONFLICT(workspace_id, turn_id) DO UPDATE SET
+                owner_id = excluded.owner_id,
+                claimed_at = CASE WHEN runtime_claims.owner_id = excluded.owner_id
+                                  THEN runtime_claims.claimed_at ELSE excluded.claimed_at END,
+                heartbeat_at = excluded.heartbeat_at,
+                expires_at = excluded.expires_at
+               WHERE runtime_claims.owner_id = excluded.owner_id
+                  OR runtime_claims.expires_at <= excluded.claimed_at`,
+        params: [this.workspaceId, command.ownerId, command.claimedAt, command.heartbeatAt,
+          command.expiresAt, this.workspaceId, command.turnId],
+      },
+      [],
+      { kind: 'runtime_claim', id: command.turnId, change: 'claim' },
+      command.heartbeatAt,
+    );
+    const changed = (results[0]?.changes ?? 0) > 0;
+    return { ok: true, changed, ...(changed ? {} : { reason: 'runtime claim is owned by another worker or turn is missing' }) };
+  }
+
+  private async heartbeatRuntime(
+    command: Extract<RepositoryCommand, { kind: 'heartbeatRuntime' }>,
+  ): Promise<RepositoryCommandResult> {
+    const results = await this.writeIfFirstChanged(
+      {
+        sql: `UPDATE runtime_claims
+                 SET heartbeat_at = ?, expires_at = ?
+               WHERE workspace_id = ? AND turn_id = ? AND owner_id = ?
+                 AND expires_at > ?`,
+        params: [command.heartbeatAt, command.expiresAt, this.workspaceId, command.turnId,
+          command.ownerId, command.heartbeatAt],
+      },
+      [],
+      { kind: 'runtime_claim', id: command.turnId, change: 'heartbeat' },
+      command.heartbeatAt,
+    );
+    const changed = (results[0]?.changes ?? 0) > 0;
+    return { ok: true, changed, ...(changed ? {} : { reason: 'runtime claim owner mismatch or expired' }) };
+  }
+
+  private async releaseRuntime(
+    command: Extract<RepositoryCommand, { kind: 'releaseRuntime' }>,
+  ): Promise<RepositoryCommandResult> {
+    const ownerPredicate = command.ownerId === undefined ? '' : ' AND owner_id = ?';
+    const params: SqlValue[] = [this.workspaceId, command.turnId,
+      ...(command.ownerId === undefined ? [] : [command.ownerId])];
+    const results = await this.writeIfFirstChanged(
+      { sql: `DELETE FROM runtime_claims WHERE workspace_id = ? AND turn_id = ?${ownerPredicate}`, params },
+      [],
+      { kind: 'runtime_claim', id: command.turnId, change: 'release' },
+      new Date().toISOString(),
+    );
+    return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
+  }
+
   private async writeTurn(turn: TaskTurn, upsert: boolean): Promise<RepositoryCommandResult> {
     const statements: SqlStatement[] = [turnStatement(this.workspaceId, turn, upsert)];
     if (upsert) statements.push({ sql: 'DELETE FROM turn_inputs WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, turn.id] });
@@ -2630,6 +2976,7 @@ export class SqliteTaskRepository implements TaskRepository {
       ...command.messages.map((message) => messageStatement(this.workspaceId, message, true)),
       { sql: 'DELETE FROM session_claims WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, command.turn.id] },
       { sql: 'DELETE FROM resource_claims WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, command.turn.id] },
+      { sql: 'DELETE FROM runtime_claims WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, command.turn.id] },
       { sql: 'DELETE FROM turn_cancel_requests WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, command.turn.id] },
     ];
     const changes: ChangeRecord[] = [
@@ -2738,7 +3085,8 @@ export class SqliteTaskRepository implements TaskRepository {
 
 type ChangeKind =
   | 'workspace' | 'workspace_location' | 'task' | 'turn' | 'message'
-  | 'tool_call' | 'reasoning' | 'operation' | 'cancel_request' | 'send_receipt';
+  | 'tool_call' | 'reasoning' | 'operation' | 'cancel_request' | 'send_receipt'
+  | 'runtime_claim';
 
 interface ChangeRecord {
   kind: ChangeKind;
@@ -3284,8 +3632,21 @@ function claimTurnStatement(
     ? [command.expectedTaskRevision]
     : [];
   return {
-    sql: `WITH RECURSIVE root_tree(id) AS (
-            SELECT id FROM tasks WHERE workspace_id = ? AND id = ?
+    sql: `WITH RECURSIVE ancestors(id, parent_id) AS (
+            SELECT candidate.id, candidate.parent_id
+              FROM turns candidate_turn
+              JOIN tasks candidate
+                ON candidate.workspace_id = candidate_turn.workspace_id
+               AND candidate.id = candidate_turn.task_id
+             WHERE candidate_turn.workspace_id = ? AND candidate_turn.id = ?
+            UNION
+            SELECT parent.id, parent.parent_id
+              FROM tasks parent JOIN ancestors child ON parent.id = child.parent_id
+             WHERE parent.workspace_id = ?
+          ), owning_root(id) AS (
+            SELECT id FROM ancestors WHERE parent_id IS NULL LIMIT 1
+          ), root_tree(id) AS (
+            SELECT id FROM owning_root
             UNION
             SELECT child.id FROM tasks child JOIN root_tree parent ON child.parent_id = parent.id
              WHERE child.workspace_id = ?
@@ -3349,7 +3710,7 @@ function claimTurnStatement(
                       AND live_task.backend = (SELECT backend FROM tasks WHERE workspace_id = turns.workspace_id AND id = turns.task_id)) < ?
              ${sessionPredicate}
              ${resource.sql}`,
-    params: [workspaceId, command.rootTaskId, workspaceId, command.startedAt, workspaceId, turnId,
+    params: [workspaceId, turnId, workspaceId, workspaceId, command.startedAt, workspaceId, turnId,
       ...revisionParams, command.maxConcurrentTurns, command.maxConcurrentPerRoot, command.maxConcurrentPerBackend,
       ...sessionParams, ...resource.params],
   };
@@ -3503,6 +3864,14 @@ interface CancelRow {
   requested_by: string;
   requested_at: string;
   payload_json: string;
+}
+
+interface RuntimeClaimRow {
+  turn_id: string;
+  owner_id: string;
+  claimed_at: string;
+  heartbeat_at: string;
+  expires_at: string;
 }
 
 interface ReceiptRow {
@@ -3884,6 +4253,16 @@ function decodeCancelRequest(row: CancelRow): CancelRequest {
   if (payload.sealedBy !== undefined) request.sealedBy = payload.sealedBy as CancelRequest['sealedBy'];
   if (payload.reason !== undefined) request.reason = requiredString(payload.reason, 'reason', 'cancel request');
   return request;
+}
+
+function decodeRuntimeClaim(row: RuntimeClaimRow): RuntimeClaim {
+  return {
+    turnId: requiredString(row.turn_id, 'turn_id', 'runtime claim'),
+    ownerId: requiredString(row.owner_id, 'owner_id', 'runtime claim'),
+    claimedAt: requiredString(row.claimed_at, 'claimed_at', 'runtime claim'),
+    heartbeatAt: requiredString(row.heartbeat_at, 'heartbeat_at', 'runtime claim'),
+    expiresAt: requiredString(row.expires_at, 'expires_at', 'runtime claim'),
+  };
 }
 
 function decodeReceipt(row: ReceiptRow): SendReceipt {

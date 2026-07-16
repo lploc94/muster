@@ -137,7 +137,7 @@ describe('projectPrompt', () => {
 
 describe('TaskEngine', () => {
   it('freezes a running deadline while later promotions read the updated host setting', async () => {
-    const { filePath, store } = makeTempStore();
+    const { store } = makeTempStore();
     let runLimit = RUN_LIMIT_MS['2h'];
     const resolvers: Array<() => void> = [];
     const backend: Backend = {
@@ -164,10 +164,7 @@ describe('TaskEngine', () => {
       effectiveRunLimitMs: RUN_LIMIT_MS['2h'],
       runDeadlineAt: '2026-07-16T02:00:00.000Z',
     });
-    const firstLease = JSON.parse(
-      fs.readFileSync(`${filePath}.lease.${encodeURIComponent(first.value.turnId)}`, 'utf8'),
-    ) as { expiresAt?: string };
-    expect(firstLease.expiresAt).toBe('2026-07-16T02:01:00.000Z');
+    expect(store.getFile().runtimeClaims?.[first.value.turnId]?.expiresAt).toBe('2026-07-16T02:01:00.000Z');
     runLimit = RUN_LIMIT_MS['4h'];
     expect(store.getFile().turns[first.value.turnId]?.effectiveRunLimitMs).toBe(RUN_LIMIT_MS['2h']);
     engine.stageDisposition(first.value.turnId, { kind: 'idle' }, 'idle-1');
@@ -1080,15 +1077,15 @@ describe('TaskEngine', () => {
         createdAt: '2026-07-06T00:00:00.000Z',
         startedAt: '2026-07-06T00:00:00.000Z',
       };
+      draft.runtimeClaims = {
+        'turn-1': {
+          turnId: 'turn-1', ownerId: 'another-host',
+          claimedAt: '2026-07-06T00:00:00.000Z', heartbeatAt: '2026-07-06T00:00:00.000Z',
+          expiresAt: '2099-01-01T00:00:00.000Z',
+        },
+      };
       return { ok: true };
     });
-    fs.writeFileSync(
-      `${filePath}.lease.turn-1`,
-      // A fresh lease held by this (live) process — createdAt is now, so it is not
-      // reclaimable by the max-age PID-reuse defense.
-      JSON.stringify({ pid: process.pid, token: 'live', createdAt: new Date().toISOString() }),
-      'utf8',
-    );
 
     TaskEngine.load({
       store: TaskStore.load({ filePath }),
@@ -1097,7 +1094,6 @@ describe('TaskEngine', () => {
     });
     const reloaded = TaskStore.load({ filePath });
     expect(reloaded.getFile().turns['turn-1'].status).toBe('running');
-    fs.unlinkSync(`${filePath}.lease.turn-1`);
   });
 
   it('marks reload running turns interrupted when lease is absent', async () => {

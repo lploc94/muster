@@ -510,6 +510,58 @@ describe('SqliteTaskRepository', () => {
     }
   }, 20_000);
 
+  it('claims, heartbeats, reclaims, and releases runtime ownership on both adapters', async () => {
+    const jsonPath = `/tmp/muster-repository-runtime-${Date.now()}-${Math.random()}.json`;
+    const json = new JsonTaskRepository(TaskStore.load({ filePath: jsonPath }), 'ws');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-runtime-sqlite-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      await client.run(
+        `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at) VALUES (?,?,?,?,?)`,
+        ['ws', 'runtime-identity', 'Runtime', 'now', 'now'],
+      );
+      for (const [index, repository] of [json, new SqliteTaskRepository(client, 'ws')].entries()) {
+        const task = makeTask(`runtime-task-${index}`);
+        const turnId = `runtime-turn-${index}`;
+        await repository.execute({ kind: 'createTask', workspaceId: 'ws', task });
+        await repository.execute({ kind: 'createTurn', workspaceId: 'ws', turn: {
+          id: turnId, taskId: task.id, sequence: 1, status: 'queued', trigger: 'engine', inputs: [],
+          createdAt: '2026-07-16T00:00:00.000Z',
+        } });
+        await expect(repository.execute({
+          kind: 'claimRuntime', workspaceId: 'ws', turnId, ownerId: 'owner-a',
+          claimedAt: '2026-07-16T00:00:01.000Z', heartbeatAt: '2026-07-16T00:00:01.000Z',
+          expiresAt: '2026-07-16T00:00:10.000Z',
+        })).resolves.toMatchObject({ changed: true });
+        await expect(repository.execute({
+          kind: 'claimRuntime', workspaceId: 'ws', turnId, ownerId: 'owner-b',
+          claimedAt: '2026-07-16T00:00:02.000Z', heartbeatAt: '2026-07-16T00:00:02.000Z',
+          expiresAt: '2026-07-16T00:00:20.000Z',
+        })).resolves.toMatchObject({ changed: false });
+        await expect(repository.execute({
+          kind: 'heartbeatRuntime', workspaceId: 'ws', turnId, ownerId: 'owner-a',
+          heartbeatAt: '2026-07-16T00:00:05.000Z', expiresAt: '2026-07-16T00:00:15.000Z',
+        })).resolves.toMatchObject({ changed: true });
+        await expect(repository.execute({
+          kind: 'claimRuntime', workspaceId: 'ws', turnId, ownerId: 'owner-b',
+          claimedAt: '2026-07-16T00:00:16.000Z', heartbeatAt: '2026-07-16T00:00:16.000Z',
+          expiresAt: '2026-07-16T00:00:30.000Z',
+        })).resolves.toMatchObject({ changed: true });
+        await expect(repository.getRuntimeClaim(turnId)).resolves.toMatchObject({ ownerId: 'owner-b' });
+        await expect(repository.execute({ kind: 'releaseRuntime', workspaceId: 'ws', turnId, ownerId: 'owner-a' }))
+          .resolves.toMatchObject({ changed: false });
+        await expect(repository.execute({ kind: 'releaseRuntime', workspaceId: 'ws', turnId, ownerId: 'owner-b' }))
+          .resolves.toMatchObject({ changed: true });
+        await expect(repository.getRuntimeClaim(turnId)).resolves.toBeUndefined();
+      }
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+      try { fs.unlinkSync(jsonPath); } catch { /* test cleanup */ }
+    }
+  }, 20_000);
+
   it('hydrates domain DTOs from promoted columns and compatibility payloads', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-sqlite-'));
     const dbPath = path.join(dir, 'muster.sqlite3');
@@ -797,6 +849,39 @@ describe('SqliteTaskRepository', () => {
       expect(await one.all('SELECT * FROM resource_claims WHERE workspace_id = ?', ['ws'])).toHaveLength(1);
     } finally {
       await Promise.all([one.close(), two.close()]);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('derives the owning root in SQLite instead of trusting the caller root id', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-root-claim-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const repository = new SqliteTaskRepository(client, 'ws');
+      await repository.execute({ kind: 'upsertWorkspace', workspaceId: 'ws', identityKey: 'root-claim', displayName: 'Root claim', createdAt: 'now', lastOpenedAt: 'now' });
+      const rootA = makeTask('root-a'); rootA.releaseState = 'released';
+      const rootB = makeTask('root-b'); rootB.releaseState = 'released';
+      const a1 = makeTask('a-1'); a1.parentId = rootA.id; a1.releaseState = 'released';
+      const a2 = makeTask('a-2'); a2.parentId = rootA.id; a2.releaseState = 'released';
+      const b1 = makeTask('b-1'); b1.parentId = rootB.id; b1.releaseState = 'released';
+      for (const task of [rootA, rootB, a1, a2, b1]) await repository.execute({ kind: 'createTask', workspaceId: 'ws', task });
+      for (const [turnId, taskId] of [['ta1', a1.id], ['ta2', a2.id], ['tb1', b1.id]] as const) {
+        await repository.execute({ kind: 'createTurn', workspaceId: 'ws', turn: {
+          id: turnId, taskId, sequence: 1, status: 'queued', trigger: 'engine', inputs: [], createdAt: '2026-07-16T00:00:00.000Z',
+        } });
+      }
+      const claim = (turnId: string, callerRoot: string) => repository.execute({
+        kind: 'claimTurn' as const, workspaceId: 'ws', turnId, startedAt: `2026-07-16T00:00:0${turnId.length}.000Z`,
+        rootTaskId: callerRoot, maxConcurrentTurns: 10, maxConcurrentPerRoot: 1,
+        maxConcurrentPerBackend: 10, resourceKeys: [],
+      });
+      await expect(claim('ta1', rootA.id)).resolves.toMatchObject({ changed: true });
+      // Lying with root-b must not bypass root-a's concurrency ceiling.
+      await expect(claim('ta2', rootB.id)).resolves.toMatchObject({ changed: false });
+      await expect(claim('tb1', rootA.id)).resolves.toMatchObject({ changed: true });
+    } finally {
+      await client.close();
       fs.rmSync(dir, { recursive: true, force: true });
     }
   }, 20_000);

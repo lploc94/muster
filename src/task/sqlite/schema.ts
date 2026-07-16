@@ -15,7 +15,7 @@
 export const MUSTER_APPLICATION_ID = 0x4d555354; // 'MUST'
 
 /** Current schema version, tracked via `PRAGMA user_version`. */
-export const SQLITE_SCHEMA_VERSION = 2;
+export const SQLITE_SCHEMA_VERSION = 3;
 
 /**
  * Ordered DDL statements for schema v1. Applied inside a single exclusive
@@ -295,8 +295,25 @@ export const SCHEMA_V2_STATEMENTS: readonly string[] = [
   `CREATE INDEX IF NOT EXISTS idx_turn_cancel_requests_task ON turn_cancel_requests(workspace_id, task_id)`,
 ];
 
+/** Schema v3 moves per-turn runtime ownership out of filesystem lease files. */
+export const SCHEMA_V3_STATEMENTS: readonly string[] = [
+  `CREATE TABLE IF NOT EXISTS runtime_claims (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    turn_id TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    claimed_at TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, turn_id),
+    FOREIGN KEY (workspace_id, turn_id)
+      REFERENCES turns(workspace_id, id) ON DELETE CASCADE
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_runtime_claims_expiry ON runtime_claims(workspace_id, expires_at)`,
+];
+
 /** Ordered migrations; index n contains the statements that create version n+1. */
 export const SCHEMA_MIGRATIONS: readonly (readonly string[])[] = [
   SCHEMA_V1_STATEMENTS,
   SCHEMA_V2_STATEMENTS,
+  SCHEMA_V3_STATEMENTS,
 ];

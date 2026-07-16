@@ -688,6 +688,15 @@ export interface SendReceipt {
   createdAt: string;
 }
 
+/** Repository-owned runtime ownership fence for one live turn. */
+export interface RuntimeClaim {
+  turnId: string;
+  ownerId: string;
+  claimedAt: string;
+  heartbeatAt: string;
+  expiresAt: string;
+}
+
 export interface TaskStoreFile {
   schemaVersion: number;
   revision: number;
@@ -706,6 +715,8 @@ export interface TaskStoreFile {
    * Retained for the resend window so duplicate delivery re-ACKs without a second commit.
    */
   sendReceipts?: Record<string, SendReceipt>;
+  /** Transitional JSON projection of repository-owned runtime claims. */
+  runtimeClaims?: Record<string, RuntimeClaim>;
 }
 
 /**

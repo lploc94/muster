@@ -39,9 +39,7 @@ import {
   deriveEntityId,
   executeToolCommand,
   processCancelRequests,
-  pruneLedgerForTurn,
   projectChildResults,
-  tryPromoteTurn,
   type GraphEngineDeps,
 } from './engine-graph';
 import {
@@ -75,6 +73,7 @@ import {
   type RepositoryCommandResult,
   type TaskRepository,
 } from './repository';
+import { RepositoryProjection, withRepositoryProjection } from './repository-projection';
 import {
   applyDependencyTerminal,
   applyFailedTurn,
@@ -133,7 +132,8 @@ export type EngineEvent =
   | { type: 'turnError'; taskId: string; turnId: string; message: string };
 
 export interface TaskEngineConfig {
-  store: TaskStore;
+  /** Legacy JSON read projection. Optional when an async repository is supplied. */
+  store?: TaskStore;
   /** Transitional async persistence boundary. JSON is injected by legacy tests;
    * SQLite becomes the production implementation at cutover. */
   repository?: TaskRepository;
@@ -244,6 +244,10 @@ const DEFAULT_LIMITS: DispositionLimits = {
 
 function nowIso(clock?: () => string): string {
   return clock?.() ?? new Date().toISOString();
+}
+
+function cloneTaskStoreFile(file: TaskStoreFile): TaskStoreFile {
+  return structuredClone(file);
 }
 
 /** Non-empty backend/model label: no control bytes, length-capped. */
@@ -622,7 +626,7 @@ export function viewStatusFromDraft(draft: TaskStoreFile, taskId: string) {
 }
 
 export class TaskEngine {
-  private readonly store: TaskStore;
+  private readonly store: TaskStore | RepositoryProjection;
   private readonly repository: TaskRepository;
   private readonly workspaceId: string;
   private readonly makeBackend: (name: string) => Backend;
@@ -630,6 +634,8 @@ export class TaskEngine {
   private readonly limits: DispositionLimits;
   private readonly clock?: () => string;
   private readonly storePath: string;
+  /** Stable owner identity for repository runtime claims in this extension host. */
+  private readonly runtimeOwnerId: string;
   private readonly askBridge: AskBridge;
   private readonly credentialRegistry?: CredentialRegistry;
   private readonly bridgePort: number;
@@ -687,15 +693,21 @@ export class TaskEngine {
   private readonly pendingAskPromises = new Map<string, { promise: Promise<Answers>; fingerprint: string }>();
   private settling = new Set<string>();
 
-  private constructor(config: TaskEngineConfig, storePath: string) {
-    this.store = config.store;
+  private constructor(
+    config: TaskEngineConfig,
+    store: TaskStore | RepositoryProjection,
+    repository: TaskRepository,
+    storePath: string,
+  ) {
+    this.store = store;
     this.workspaceId = config.workspaceId ?? 'legacy-workspace';
-    this.repository = config.repository ?? new JsonTaskRepository(config.store, this.workspaceId);
+    this.repository = repository;
     this.makeBackend = config.makeBackend;
     this.runTurnFn = config.runTurn ?? defaultRunTurn;
     this.limits = config.dispositionLimits ?? DEFAULT_LIMITS;
     this.clock = config.clock;
     this.storePath = storePath;
+    this.runtimeOwnerId = `${process.pid}:${randomUUID()}`;
     this.askBridge = config.askBridge ?? new AskBridge();
     this.credentialRegistry = config.credentialRegistry;
     this.bridgePort = config.bridgePort ?? 0;
@@ -740,6 +752,55 @@ export class TaskEngine {
     } catch (error) {
       return { ok: true, changed: false, reason: error instanceof Error ? error.message : String(error) };
     }
+  }
+
+  /** Acquire a durable per-turn runtime claim. Claims are the cross-process
+   * ownership fence; filesystem lease files are retained only as legacy test
+   * helpers and are not consulted by dispatch. */
+  private async claimRuntimeTurn(turnId: string, expiresAt: string): Promise<boolean> {
+    const now = nowIso(this.clock);
+    try {
+      const result = await this.repository.execute({
+        kind: 'claimRuntime', workspaceId: this.workspaceId, turnId,
+        ownerId: this.runtimeOwnerId, claimedAt: now, heartbeatAt: now, expiresAt,
+      });
+      return result.changed === true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async heartbeatRuntimeTurn(turnId: string, expiresAt: string): Promise<boolean> {
+    const now = nowIso(this.clock);
+    try {
+      const result = await this.repository.execute({
+        kind: 'heartbeatRuntime', workspaceId: this.workspaceId, turnId,
+        ownerId: this.runtimeOwnerId, heartbeatAt: now, expiresAt,
+      });
+      return result.changed === true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async releaseRuntimeTurn(turnId: string): Promise<void> {
+    try {
+      await this.repository.execute({
+        kind: 'releaseRuntime', workspaceId: this.workspaceId, turnId,
+        ownerId: this.runtimeOwnerId,
+      });
+    } catch {
+      // Best-effort cleanup; expiry makes abandoned claims reclaimable.
+    }
+  }
+
+  private runtimeClaimAlive(turnId: string): boolean {
+    const claim = this.store.getFile().runtimeClaims?.[turnId];
+    return !!claim && Number.isFinite(Date.parse(claim.expiresAt)) && Date.parse(claim.expiresAt) > Date.parse(nowIso(this.clock));
+  }
+
+  private ownsRuntimeClaim(turnId: string): boolean {
+    return this.store.getFile().runtimeClaims?.[turnId]?.ownerId === this.runtimeOwnerId;
   }
 
   /** 2s-capped host prepare before sequence-1 assemble (single freeze site). */
@@ -809,7 +870,7 @@ export class TaskEngine {
   private graphDeps(): GraphEngineDeps {
     const credentials = this.credentialRegistry ?? new CredentialRegistry();
     return {
-      store: this.store,
+      store: this.store as TaskStore,
       makeBackend: this.makeBackend,
       credentials,
       askBridge: this.askBridge,
@@ -829,8 +890,8 @@ export class TaskEngine {
       getTaskTypeRegistry: this.getTaskTypeRegistry
         ? (cwd) => this.getTaskTypeRegistry!(cwd)
         : undefined,
-      leaseOwnerAlive: (turnId) => leaseOwnerAlive(this.storePath, turnId),
-      ownsLease: (turnId) => ownsLocalLease(this.storePath, turnId),
+      leaseOwnerAlive: (turnId) => this.runtimeClaimAlive(turnId),
+      ownsLease: (turnId) => this.ownsRuntimeClaim(turnId),
       writeCancelRequest: (turnId, kind, by, opId, sealedBy) => {
         void this.repository.execute({
           kind: 'putCancelRequest',
@@ -1051,6 +1112,15 @@ export class TaskEngine {
     _tool: string,
     command: ToolCommand,
   ): Promise<{ ok: true; result: unknown } | { ok: false; error: string }> {
+    // Test/host callers can deliver a tool invocation in the same tick that a
+    // queued first turn is being promoted. Give the durable promotion a short
+    // chance to publish `running`; never wait for the backend turn itself.
+    for (let attempt = 0; attempt < 25; attempt += 1) {
+      const callerTurn = await this.repository.getTurn(ctx.turnId);
+      if (!callerTurn || callerTurn.status === 'running' || callerTurn.status === 'waiting_user') break;
+      if (callerTurn.status !== 'queued') break;
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
     const kind = command.kind;
     if (
       kind === 'create_task' ||
@@ -1112,8 +1182,22 @@ export class TaskEngine {
   }
 
   static load(config: TaskEngineConfig): TaskEngine {
-    const engine = new TaskEngine(config, config.store.getStorePath());
+    if (!config.store) throw new Error('TaskEngine.load requires store; use loadAsync with a repository');
+    const repository = config.repository ?? new JsonTaskRepository(config.store, config.workspaceId ?? 'legacy-workspace');
+    const engine = new TaskEngine(config, config.store, repository, config.store.getStorePath());
     engine.reconcileReload();
+    return engine;
+  }
+
+  /** Repository-only constructor. No JSON file is created or used. */
+  static async loadAsync(config: TaskEngineConfig): Promise<TaskEngine> {
+    if (config.store) return TaskEngine.load(config);
+    if (!config.repository) throw new Error('TaskEngine requires either store or repository');
+    const workspaceId = config.workspaceId ?? 'legacy-workspace';
+    const projection = await RepositoryProjection.load(config.repository, workspaceId);
+    const repository = withRepositoryProjection(config.repository, projection);
+    const engine = new TaskEngine(config, projection, repository, '');
+    await engine.reconcileReloadFromRepository();
     return engine;
   }
 
@@ -1535,7 +1619,13 @@ export class TaskEngine {
   }
 
   async whenIdle(): Promise<void> {
-    await Promise.all([...this.turnPromises.values()]);
+    // Settlement may synchronously enqueue the next FIFO turn from a promise
+    // finalizer. Keep draining until no registered schedule remains instead of
+    // observing only the first snapshot of the map.
+    while (this.turnPromises.size > 0) {
+      await Promise.all([...this.turnPromises.values()]);
+      await Promise.resolve();
+    }
   }
 
   viewStatus(taskId: string) {
@@ -1610,7 +1700,7 @@ export class TaskEngine {
       switchedAt: string;
     }>
   > {
-    const task = this.store.getTask(params.taskId);
+    const task = await this.repository.getTask(params.taskId);
     if (!task) return { ok: false, reason: 'task not found' };
 
     const targetBackendId = normalizeRuntimeLabel(params.targetBackend, 128);
@@ -1638,33 +1728,35 @@ export class TaskEngine {
 
     const now = nowIso(this.clock);
     const operationId = randomUUID();
-    let boundModel: string | undefined;
-    const commit = this.store.commit((draft) => {
-      const current = draft.tasks[params.taskId];
-      if (!current) return { ok: false, reason: 'task not found' };
-      if (
-        current.backend === targetBackendId &&
-        (current.model ?? undefined) === (targetModelId ?? undefined)
-      ) {
-        return { ok: false, reason: 'target backend/model is already bound' };
-      }
-
-      const preempted = this.applyHandoffTurnPreemption(draft, params.taskId, now);
-      if (!preempted.ok) return preempted;
-
-      const sourceEpoch = current.runtimeEpoch ?? 1;
-      const targetEpoch = sourceEpoch + 1;
-      const contextCutoff = captureContinuationCutoff(draft, params.taskId, now);
-      const nextTask: MusterTask = {
-        ...current,
+    if (task.backend === targetBackendId && (task.model ?? undefined) === (targetModelId ?? undefined)) {
+      return { ok: false, reason: 'target backend/model is already bound' };
+    }
+    const [turns, messages, toolCalls] = await Promise.all([
+      this.repository.listTurns(params.taskId),
+      this.repository.listMessages(params.taskId),
+      this.repository.listToolCalls(params.taskId),
+    ]);
+    const aggregate: TaskStoreFile = {
+      schemaVersion: 6,
+      revision: await (this.repository.getWorkspaceRevision?.() ?? Promise.resolve(0)),
+      tasks: { [task.id]: task },
+      turns: Object.fromEntries(turns.map((turn) => [turn.id, turn])),
+      messages: Object.fromEntries(messages.map((message) => [message.id, message])),
+      toolCalls: Object.fromEntries(toolCalls.map((tool) => [tool.id, tool])),
+    };
+    const sourceEpoch = task.runtimeEpoch ?? 1;
+    const targetEpoch = sourceEpoch + 1;
+    const contextCutoff = captureContinuationCutoff(aggregate, params.taskId, now);
+    const nextTask: MusterTask = {
+        ...task,
         backend: targetBackendId,
         runtimeEpoch: targetEpoch,
         handoff: {
           version: 2,
           operationId,
           source: {
-            backend: current.backend,
-            ...(current.model ? { model: current.model } : {}),
+            backend: task.backend,
+            ...(task.model ? { model: task.model } : {}),
             runtimeEpoch: sourceEpoch,
           },
           target: {
@@ -1676,25 +1768,37 @@ export class TaskEngine {
           continuation: { status: 'pending' },
           switchedAt: now,
         },
-        revision: current.revision + 1,
+        revision: task.revision + 1,
         updatedAt: now,
       };
-      if (targetModelId !== undefined) nextTask.model = targetModelId;
-      else delete nextTask.model;
-      delete nextTask.committedSessionId;
-      draft.tasks[params.taskId] = nextTask;
-      boundModel = targetModelId;
-
-      // Turns queued before the click now belong to the new binding. The oldest
-      // one will atomically claim the continuation at the prompt freeze site.
-      for (const queued of turnsForTask(draft, params.taskId)) {
-        if (queued.status === 'queued') {
-          draft.turns[queued.id] = { ...queued, runtimeEpoch: targetEpoch };
-        }
+    if (targetModelId !== undefined) nextTask.model = targetModelId;
+    else delete nextTask.model;
+    delete nextTask.committedSessionId;
+    const changedTurns: TaskTurn[] = [];
+    const expectedTurns: { id: string; status: TaskTurn['status']; runtimeEpoch?: number }[] = [];
+    const cancelRequests: { turnId: string; request: import('./types').CancelRequest }[] = [];
+    for (const currentTurn of turns.filter((turn) => turn.status === 'queued' || turn.status === 'running' || turn.status === 'waiting_user')) {
+      expectedTurns.push({ id: currentTurn.id, status: currentTurn.status, runtimeEpoch: currentTurn.runtimeEpoch });
+      if (currentTurn.status === 'queued') {
+        changedTurns.push({ ...currentTurn, runtimeEpoch: targetEpoch });
+        continue;
       }
-      return { ok: true };
+      const claim = await this.repository.getRuntimeClaim(currentTurn.id);
+      if (claim && claim.ownerId !== this.runtimeOwnerId && Date.parse(claim.expiresAt) > Date.parse(now)) {
+        cancelRequests.push({ turnId: currentTurn.id, request: {
+          kind: 'interrupt', by: 'engine', opId: `handoff-preempt-${params.taskId}-${currentTurn.id}`, at: now,
+        } });
+      }
+      const interrupted = interruptTurn(currentTurn, { now });
+      if (!interrupted.ok) return interrupted;
+      changedTurns.push({ ...interrupted.next, isCancellation: true, interruptConfidence: 'confirmed' });
+    }
+    const commit = await this.repository.execute({
+      kind: 'requestRuntimeHandoff', workspaceId: this.workspaceId, taskId: params.taskId,
+      expectedTaskRevision: task.revision, task: nextTask, turns: changedTurns,
+      expectedTurns, cancelRequests,
     });
-    if (!commit.ok) return { ok: false, reason: commit.detail ?? commit.reason };
+    if (!commit.changed) return { ok: false, reason: commit.reason ?? 'task or turn changed; retry' };
 
     // The durable epoch fence is already committed. Abort local source streams;
     // late events can no longer write a target binding.
@@ -1713,7 +1817,7 @@ export class TaskEngine {
       value: {
         operationId,
         boundBackend: targetBackendId,
-        ...(boundModel !== undefined ? { boundModel } : {}),
+        ...(targetModelId !== undefined ? { boundModel: targetModelId } : {}),
         switchedAt: now,
       },
     };
@@ -2249,42 +2353,28 @@ export class TaskEngine {
     }
     const newTurnId = randomUUID();
     const now = nowIso(this.clock);
-    const commit = this.store.commit((draft) => {
-      const task = draft.tasks[taskId];
-      const turns = turnsForTask(draft, taskId);
-      const oldTurn = draft.turns[turnId];
-      if (!task || !oldTurn) {
-        return { ok: false, reason: 'turn not found' };
-      }
-      const result = retryTurn(task, turns, oldTurn, {
-        turnId: newTurnId,
-        instruction,
-        now,
-        reuseOriginalInputs: options?.reuseOriginalInputs === true,
-      });
-      if (!result.ok) {
-        return result;
-      }
-      draft.turns[newTurnId] = result.next;
-      if (
-        !task.committedSessionId &&
-        task.handoff?.version === 2 &&
-        task.handoff.continuation.status === 'assigned' &&
-        task.handoff.continuation.turnId === oldTurn.id
-      ) {
-        draft.tasks[taskId] = {
-          ...task,
-          handoff: {
-            ...task.handoff,
-            continuation: { status: 'assigned', turnId: newTurnId, assignedAt: now },
-          },
-        };
-      }
-      return { ok: true };
+    const file = this.store.getFile();
+    const task = file.tasks[taskId];
+    const oldTurn = file.turns[turnId];
+    if (!task || !oldTurn) return { ok: false, reason: 'turn not found' };
+    const result = retryTurn(task, turnsForTask(file, taskId), oldTurn, {
+      turnId: newTurnId, instruction, now,
+      reuseOriginalInputs: options?.reuseOriginalInputs === true,
     });
-    if (!commit.ok) {
-      return { ok: false, reason: commit.detail ?? commit.reason };
+    if (!result.ok) return result;
+    let nextTask = task;
+    if (!task.committedSessionId && task.handoff?.version === 2 &&
+      task.handoff.continuation.status === 'assigned' && task.handoff.continuation.turnId === oldTurn.id) {
+      nextTask = { ...task, handoff: { ...task.handoff,
+        continuation: { status: 'assigned', turnId: newTurnId, assignedAt: now } } };
     }
+    const write = this.executeLegacySync({
+      kind: 'retryTurn', workspaceId: this.workspaceId,
+      expectedTaskRevision: task.revision,
+      maxTurnsPerTask: this.resourceLimits.maxTurnsPerTask,
+      task: nextTask, turn: result.next,
+    });
+    if (!write.changed) return { ok: false, reason: write.reason ?? 'task changed; retry' };
     void this.scheduleTurn(newTurnId);
     return { ok: true, value: { turnId: newTurnId } };
   }
@@ -2354,7 +2444,7 @@ export class TaskEngine {
     if (!task) return { ok: false, reason: 'task not found' };
     const turns = turnsForTask(file, taskId);
     const live = turns.find((t) => t.status === 'running' || t.status === 'waiting_user');
-    const remoteOwned = !!live && leaseOwnerAlive(this.storePath, live.id) && !ownsLocalLease(this.storePath, live.id);
+    const remoteOwned = !!live && this.runtimeClaimAlive(live.id) && !this.ownsRuntimeClaim(live.id);
     const transitioned = transitionSetTaskLifecycle(task, lifecycle, {
       now, result: options?.result, error: options?.error, sealedBy: { kind: 'user' },
     });
@@ -2415,7 +2505,8 @@ export class TaskEngine {
     if (!task) return { ok: false, reason: 'task not found' };
     const turns = await this.repository.listTurns(taskId);
     const live = turns.find((turn) => turn.status === 'running' || turn.status === 'waiting_user');
-    const remoteOwned = !!live && leaseOwnerAlive(this.storePath, live.id) && !ownsLocalLease(this.storePath, live.id);
+    const liveClaim = live ? await this.repository.getRuntimeClaim(live.id) : undefined;
+    const remoteOwned = !!liveClaim && liveClaim.ownerId !== this.runtimeOwnerId && Date.parse(liveClaim.expiresAt) > Date.parse(nowIso(this.clock));
     const now = nowIso(this.clock);
     const transitioned = transitionSetTaskLifecycle(task, lifecycle, {
       now, result: options?.result, error: options?.error, sealedBy: { kind: 'user' },
@@ -2468,8 +2559,8 @@ export class TaskEngine {
     const taskIds = [taskId, ...descendantIds(file, taskId)].reverse();
     const liveTurnIds = taskIds.flatMap((id) => pendingTurnsForTask(file, id)
       .filter((turn) => turn.status === 'running' || turn.status === 'waiting_user').map((turn) => turn.id));
-    const remoteLiveTurnIds = new Set(liveTurnIds.filter((id) => leaseOwnerAlive(this.storePath, id) && !ownsLocalLease(this.storePath, id)));
-    const draft = JSON.parse(JSON.stringify(file)) as TaskStoreFile;
+    const remoteLiveTurnIds = new Set(liveTurnIds.filter((id) => this.runtimeClaimAlive(id) && !this.ownsRuntimeClaim(id)));
+    const draft = cloneTaskStoreFile(file);
     const cancelRequests: { turnId: string; request: import('./types').CancelRequest }[] = [];
     for (const id of taskIds) {
       const task = draft.tasks[id];
@@ -2647,7 +2738,7 @@ export class TaskEngine {
       if (turn.status !== 'running' && turn.status !== 'waiting_user') {
         continue;
       }
-      if (leaseOwnerAlive(this.storePath, turn.id)) {
+      if (this.runtimeClaimAlive(turn.id)) {
         continue;
       }
       const currentTask = file.tasks[turn.taskId];
@@ -2688,13 +2779,43 @@ export class TaskEngine {
       // Re-queue disposition repair for interrupted turns that still need it.
       const taskAfter = this.store.getFile().tasks[turn.taskId];
       if (taskAfter?.attention?.code === 'disposition_repair_pending') {
-        this.enqueueDispositionRepair(turn.taskId, turn.id);
+        void this.enqueueDispositionRepair(turn.taskId, turn.id);
       }
     }
 
     this.reconcileChildWaits({ schedule: false });
     this.deferReloadQueuedTurns();
     processCancelRequests(this.graphDeps());
+  }
+
+  /** Repository-only reload recovery. A non-expired runtime claim belongs to
+   * another live host; missing/expired claims are reconciled behind the same
+   * task/turn fences as the JSON compatibility path. */
+  private async reconcileReloadFromRepository(): Promise<void> {
+    const file = this.store.getFile();
+    const now = nowIso(this.clock);
+    for (const turn of Object.values(file.turns)) {
+      if (turn.status !== 'running' && turn.status !== 'waiting_user') continue;
+      const claim = await this.repository.getRuntimeClaim(turn.id);
+      if (claim && Date.parse(claim.expiresAt) > Date.parse(now)) continue;
+      const task = await this.repository.getTask(turn.taskId);
+      if (!task) continue;
+      const interrupted = interruptTurn(turn, { now });
+      if (!interrupted.ok) continue;
+      const turns = await this.repository.listTurns(task.id);
+      const heldTurns = task.attention?.code === 'awaiting_parent_answer'
+        ? []
+        : turns.filter((candidate) => candidate.status === 'queued' && !candidate.holdAutoPromote)
+          .map((candidate) => ({ ...candidate, holdAutoPromote: true }));
+      await this.repository.execute({
+        kind: 'reconcileOrphanTurn', workspaceId: this.workspaceId, taskId: task.id,
+        expectedTaskRevision: task.revision, expectedTurnStatus: turn.status,
+        task, turn: { ...interrupted.next, failureClass: 'uncertain', dispatchPhase: turn.dispatchPhase ?? 'prompt_outstanding' },
+        heldTurns,
+      });
+      await this.repository.execute({ kind: 'releaseRuntime', workspaceId: this.workspaceId, turnId: turn.id });
+    }
+    this.deferReloadQueuedTurns();
   }
 
   /** Interrupt live source turns in the same commit; queued turns are retagged to target epoch. */
@@ -2711,8 +2832,8 @@ export class TaskEngine {
         // Notify remote owners before marking interrupted in the shared store.
         if (
           !this.liveRuns.has(turn.id) &&
-          leaseOwnerAlive(this.storePath, turn.id) &&
-          !ownsLocalLease(this.storePath, turn.id)
+          this.runtimeClaimAlive(turn.id) &&
+          !this.ownsRuntimeClaim(turn.id)
         ) {
           draft.cancelRequests = draft.cancelRequests ?? {};
           draft.cancelRequests[turn.id] = {
@@ -2878,7 +2999,7 @@ export class TaskEngine {
   private applyDependencyTerminals(): void {
     const now = nowIso(this.clock);
     const before = this.store.getFile();
-    const draft = JSON.parse(JSON.stringify(before)) as TaskStoreFile;
+    const draft = cloneTaskStoreFile(before);
     for (const task of Object.values(before.tasks)) {
       const current = draft.tasks[task.id];
       if (!current || isTerminalLifecycle(current.lifecycle)) continue;
@@ -2953,7 +3074,7 @@ export class TaskEngine {
     const now = nowIso(this.clock);
     const turnsToSchedule: string[] = [];
     const before = this.store.getFile();
-    const draft = JSON.parse(JSON.stringify(before)) as TaskStoreFile;
+    const draft = cloneTaskStoreFile(before);
     const mutate = (): void => {
       const graph = depGraphFromFile(draft);
 
@@ -3354,7 +3475,7 @@ export class TaskEngine {
    * Phase C host gate (settle helper). Returns a source-bound HOST verdict when the
    * settling turn belongs to a verify task with `brief.verification.hostRun === true`
    * and carries a `complete` disposition; otherwise `undefined` (Phase A worker
-   * self-report is left unchanged). MUST be called OUTSIDE `store.commit` because the
+   * self-report is left unchanged). MUST be called outside the persistence transaction because the
    * runner blocks (spawnSync) for the whole command duration.
    */
   private computeHostVerdictForSettle(turnId: string): TaskVerdict | undefined {
@@ -3401,14 +3522,14 @@ export class TaskEngine {
    * (new commit or dirty edit) the stored `pass` is stale and is downgraded to
    * `inconclusive`, which re-blocks any `requiredVerdict:'pass'` dependent.
    *
-   * CRITICAL: git is invoked ONCE per cwd, OUTSIDE `store.commit` (it blocks for the
+   * CRITICAL: git is invoked ONCE per cwd, outside the persistence transaction (it blocks for the
    * whole subprocess). Cheap pre-scan first — if no producer carries a `source:'host'`
    * passing verdict, this is a strict no-op and git is NEVER shelled, so a graph with
    * no host verdicts keeps today's behavior and perf. Runs before
    * {@link applyDependencyTerminals} in the tick so a re-blocked `onUnsatisfied:'fail'`
    * dependent still seals in the same pass.
    */
-  private revalidateVerdicts(): void {
+  private async revalidateVerdicts(): Promise<void> {
     // ISSUE 2 — never shell git on an untrusted workspace. Skip the drift probe when
     // untrusted (no host spawn); stale verdicts are simply left intact until trust is
     // granted, which re-runs the tick.
@@ -3455,93 +3576,85 @@ export class TaskEngine {
     if (staleIds.length === 0) return;
 
     const now = nowIso(this.clock);
-    this.store.commit((draft) => {
-      for (const id of staleIds) {
-        const task = draft.tasks[id];
-        const verdict = task?.taskResult?.verdict;
-        if (!task || !task.taskResult || !verdict) continue;
-        if (verdict.source !== 'host' || verdict.status !== 'pass') continue;
-        draft.tasks[id] = {
-          ...task,
-          revision: task.revision + 1,
-          updatedAt: now,
-          taskResult: {
-            ...task.taskResult,
-            // ISSUE 9 — bump the RESULT revision on downgrade so downstream pins /
-            // readiness observe the change (not just the task revision below).
-            revision: task.taskResult.revision + 1,
-            verdict: { ...verdict, status: 'inconclusive' },
-          },
-        };
-      }
-      return { ok: true };
+    const updates: MusterTask[] = [];
+    const expectedTaskRevisions: { id: string; revision: number }[] = [];
+    for (const id of staleIds) {
+      const task = file.tasks[id];
+      const verdict = task?.taskResult?.verdict;
+      if (!task || !task.taskResult || !verdict || verdict.source !== 'host' || verdict.status !== 'pass') continue;
+      updates.push({
+        ...task,
+        revision: task.revision + 1,
+        updatedAt: now,
+        taskResult: {
+          ...task.taskResult,
+          // ISSUE 9 — bump the RESULT revision on downgrade so downstream pins /
+          // readiness observe the change (not just the task revision below).
+          revision: task.taskResult.revision + 1,
+          verdict: { ...verdict, status: 'inconclusive' },
+        },
+      });
+      expectedTaskRevisions.push({ id: task.id, revision: task.revision });
+    }
+    if (updates.length === 0) return;
+    await this.repository.execute({
+      kind: 'applyVerdictRemediation', workspaceId: this.workspaceId,
+      expectedTaskRevisions, tasks: updates, turns: [], messages: [],
     });
   }
 
-  private afterTurnSettled(turnId: string): void {
-    this.store.commit((draft) => {
-      pruneLedgerForTurn(draft, turnId);
-      return { ok: true };
+  private async afterTurnSettled(turnId: string): Promise<void> {
+    await this.repository.execute({
+      kind: 'deleteOperationsForTurn', workspaceId: this.workspaceId, turnId,
     });
     // Apply dependency terminals before child waits so block-policy sinks get
     // attention and parents wake without waiting for an unrelated rescan.
     this.applyDependencyTerminals();
     this.reconcileChildWaits();
-    this.drainPendingSendsAfterSettlement(turnId);
+    await this.drainPendingSendsAfterSettlement(turnId);
   }
 
-  private drainPendingSendsAfterSettlement(settledTurnId: string): void {
-    const continuationTurnIds: string[] = [];
+  private async drainPendingSendsAfterSettlement(settledTurnId: string): Promise<void> {
+    const settledTurn = await this.repository.getTurn(settledTurnId);
+    if (!settledTurn || settledTurn.status !== 'succeeded') return;
+    const task = await this.repository.getTask(settledTurn.taskId);
+    if (!task || isTerminalLifecycle(task.lifecycle)) return;
+    const turns = [...await this.repository.listTurns(task.id)];
+    // R012: eager queue entries already represent the FIFO; only free-floating
+    // pending messages become continuations here.
+    if (turns.some((turn) => turn.status === 'queued')) return;
+    const messages = [...await this.repository.listMessages(task.id)];
+    const pending = messages.filter((message) => message.role === 'user' && message.state === 'pending' && !message.turnId);
+    if (pending.length === 0) return;
     const now = nowIso(this.clock);
-    const commit = this.store.commit((draft) => {
-      const settledTurn = draft.turns[settledTurnId];
-      if (!settledTurn || settledTurn.status !== 'succeeded') {
-        return { ok: true };
-      }
-      const task = draft.tasks[settledTurn.taskId];
-      if (!task || isTerminalLifecycle(task.lifecycle)) {
-        return { ok: true };
-      }
-      // R012: when follow-ups were eagerly queued on send, do not create a
-      // second continuation from free-floating pending messages — the scheduler
-      // promotes existing queued turns one-at-a-time.
-      if (turnsForTask(draft, task.id).some((turn) => turn.status === 'queued')) {
-        return { ok: true };
-      }
-      const pending = pendingUserMessages(draft, task.id);
-      if (pending.length === 0) {
-        return { ok: true };
-      }
-      // R012/T02: one free-floating pending message → one continuation turn.
-      // Never batch multiple pending messages into a single turn's inputs
-      // (projectPrompt would join them into one multi-message backend prompt).
-      for (const message of pending) {
-        const turnCap = canCreateTurn(draft, task.id, this.resourceLimits);
-        if (!turnCap.ok) {
-          break;
-        }
-        const turnId = randomUUID();
-        const inputs: TurnInput[] = [{ kind: 'message', messageId: message.id }];
-        const queued = transitionContinueTask(task, turnsForTask(draft, task.id), {
-          turnId,
-          now,
-          inputs,
-        });
-        if (!queued.ok) {
-          break;
-        }
-        draft.turns[turnId] = queued.next;
-        continuationTurnIds.push(turnId);
-      }
-      return { ok: true };
+    const continuationTurns: TaskTurn[] = [];
+    let workingTask = task;
+    let workingTurns = turns;
+    for (const message of pending) {
+      const cap = canCreateTurn({
+        schemaVersion: 6, revision: 0,
+        tasks: Object.fromEntries([workingTask].map((entry) => [entry.id, entry])),
+        turns: Object.fromEntries(workingTurns.map((entry) => [entry.id, entry])), messages: {},
+      }, task.id, this.resourceLimits);
+      if (!cap.ok) break;
+      const queued = transitionContinueTask(workingTask, workingTurns, {
+        turnId: randomUUID(), now, inputs: [{ kind: 'message', messageId: message.id }], trigger: 'engine',
+      });
+      if (!queued.ok) break;
+      continuationTurns.push(queued.next);
+      workingTurns = [...workingTurns, queued.next];
+    }
+    if (continuationTurns.length === 0) return;
+    const nextTask = { ...workingTask, revision: workingTask.revision + 1, updatedAt: now };
+    const write = await this.repository.execute({
+      kind: 'drainPendingSends', workspaceId: this.workspaceId,
+      expectedTaskRevision: task.revision, maxTurnsPerTask: this.resourceLimits.maxTurnsPerTask,
+      task: nextTask, turns: continuationTurns,
+      messages: pending.map((message) => ({ ...message, state: 'assigned' as const, turnId: continuationTurns.find((turn) => turn.inputs.some((input) => input.kind === 'message' && input.messageId === message.id))?.id })),
     });
-
-    if (commit.ok) {
-      for (const continuationTurnId of continuationTurnIds) {
-        if (!this.deferredQueuedTurns.has(continuationTurnId)) {
-          void this.scheduleTurn(continuationTurnId);
-        }
-      }
+    if (!write.changed) return;
+    for (const continuationTurn of continuationTurns) {
+      if (!this.deferredQueuedTurns.has(continuationTurn.id)) void this.scheduleTurn(continuationTurn.id);
     }
   }
 
@@ -3584,20 +3697,52 @@ export class TaskEngine {
   }
 
   private scheduleTurn(turnId: string): Promise<void> {
+    const existing = this.turnPromises.get(turnId);
+    if (existing) return existing;
+    // Register before the first await so callers of whenIdle cannot observe a
+    // false idle window and duplicate schedules cannot start the same turn.
+    const promise = this.runScheduledTurn(turnId);
+    this.turnPromises.set(turnId, promise);
+    void promise.finally(async () => {
+      this.turnPromises.delete(turnId);
+      const file = this.store.getFile();
+      const settled = file.turns[turnId];
+      const confirmedInterrupt = settled?.status === 'interrupted' && settled.interruptConfidence === 'confirmed';
+      const allowSameTaskFollowUps = settled?.status === 'succeeded' || confirmedInterrupt;
+      const settledTaskId = settled?.taskId;
+      const afterFlush = this.store.getFile();
+      const queued = Object.values(afterFlush.turns)
+        .filter((turn) => turn.status === 'queued')
+        .sort((a, b) => a.sequence - b.sequence || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+      this.applyDependencyTerminals();
+      for (const queuedTurn of queued) {
+        if (this.deferredQueuedTurns.has(queuedTurn.id)) continue;
+        if (settledTaskId && queuedTurn.taskId === settledTaskId) {
+          if (!allowSameTaskFollowUps) continue;
+        } else if (isQueuedTurnAutoPromoteFrozen(afterFlush, queuedTurn.taskId, queuedTurn.id)) {
+          continue;
+        }
+        if (canPromoteTurn(this.store.getFile(), queuedTurn.id, this.resourceLimits).ok) void this.scheduleTurn(queuedTurn.id);
+      }
+    });
+    return promise;
+  }
+
+  private async runScheduledTurn(turnId: string): Promise<void> {
     // Phase C: downgrade stale host verdicts (git-guarded, no-op without host
     // verdicts) BEFORE sealing so a re-blocked fail/skip dependent seals this tick.
-    this.revalidateVerdicts();
+    await this.revalidateVerdicts();
     this.applyDependencyTerminals();
     this.applyVerdictRemediation();
     processCancelRequests(this.graphDeps());
     if (!this.isWorkspaceTrusted()) {
-      return Promise.resolve();
+      return;
     }
     const turn = this.store.getFile().turns[turnId];
     if (turn && this.exceedsTurnLimit(turn.taskId, turnId)) {
-      return Promise.resolve();
+      return;
     }
-    if (!tryPromoteTurn(this.store, turnId, this.resourceLimits)) {
+    if (!canPromoteTurn(this.store.getFile(), turnId, this.resourceLimits).ok) {
       // Persist missing_input attention when readiness blocks pin (W1/W5).
       const file = this.store.getFile();
       const t = file.turns[turnId];
@@ -3608,75 +3753,29 @@ export class TaskEngine {
           file.tasks[t.taskId]?.attention?.code !== 'missing_input'
         ) {
           const now = nowIso(this.clock);
-          this.store.commit((draft) => {
-            const task = draft.tasks[t.taskId];
-            if (!task) return { ok: true };
-            draft.tasks[t.taskId] = {
-              ...task,
-              revision: task.revision + 1,
-              updatedAt: now,
-              attention: {
-                code: 'missing_input',
-                message: 'missing required input binding',
-                at: now,
-                sourceTurnId: turnId,
+          const task = file.tasks[t.taskId];
+          if (task) {
+            await this.repository.execute({
+              kind: 'setTaskAttention', workspaceId: this.workspaceId,
+              expectedTaskRevision: task.revision,
+              task: {
+                ...task,
+                revision: task.revision + 1,
+                updatedAt: now,
+                attention: {
+                  code: 'missing_input',
+                  message: 'missing required input binding',
+                  at: now,
+                  sourceTurnId: turnId,
+                },
               },
-            };
-            return { ok: true };
-          });
+            });
+          }
         }
       }
-      return Promise.resolve();
+      return;
     }
-    const existing = this.turnPromises.get(turnId);
-    if (existing) {
-      return existing;
-    }
-    const promise = this.executeTurn(turnId);
-    this.turnPromises.set(turnId, promise);
-    void promise.finally(async () => {
-      this.turnPromises.delete(turnId);
-      const file = this.store.getFile();
-      const settled = file.turns[turnId];
-      // Success always drains same-task FIFO. Confirmed interrupt with queued
-      // follow-ups also drains (interrupt-and-send / Enter-then-Stop). Forced
-      // interrupt and failed settlements keep MEM030 freeze.
-      const confirmedInterrupt =
-        settled?.status === 'interrupted' && settled.interruptConfidence === 'confirmed';
-      const allowSameTaskFollowUps =
-        settled?.status === 'succeeded' || confirmedInterrupt;
-      const settledTaskId = settled?.taskId;
-
-      const afterFlush = this.store.getFile();
-      const queued = Object.values(afterFlush.turns)
-        .filter((t) => t.status === 'queued')
-        .sort(
-          (a, b) =>
-            a.sequence - b.sequence ||
-            a.createdAt.localeCompare(b.createdAt) ||
-            a.id.localeCompare(b.id),
-        );
-      // Always re-apply dependency terminals after settlement so blocked sinks
-      // get attention even when tryPromoteTurn fails and scheduleTurn never runs.
-      this.applyDependencyTerminals();
-      for (const turn of queued) {
-        if (this.deferredQueuedTurns.has(turn.id)) {
-          continue;
-        }
-        if (settledTaskId && turn.taskId === settledTaskId) {
-          if (!allowSameTaskFollowUps) continue;
-          // Confirmed interrupt path already cleared holds in settleInterrupted.
-        } else if (isQueuedTurnAutoPromoteFrozen(afterFlush, turn.taskId, turn.id)) {
-          // Unrelated settlement must not thaw pre-failure follow-ups; post-
-          // settlement recovery/retry turns are not frozen (see helper).
-          continue;
-        }
-        if (tryPromoteTurn(this.store, turn.id, this.resourceLimits)) {
-          void this.scheduleTurn(turn.id);
-        }
-      }
-    });
-    return promise;
+    await this.executeTurn(turnId);
   }
 
   /**
@@ -3864,13 +3963,66 @@ export class TaskEngine {
     return { ok: true, value: undefined };
   }
 
+  /** Load only the aggregate rows needed to prepare/settle one task. Related
+   * task DTOs are limited to ancestors, dependencies, input producers and child
+   * result references; transcript rows are loaded only for the target task. */
+  private async loadTaskAggregate(taskId: string): Promise<TaskStoreFile | undefined> {
+    const task = await this.repository.getTask(taskId);
+    if (!task) return undefined;
+    const tasks = new Map<string, MusterTask>([[task.id, task]]);
+    const turns = [...await this.repository.listTurns(task.id)];
+    const relatedIds = new Set<string>();
+    for (const dependency of task.dependencies) relatedIds.add(dependency.taskId);
+    for (const binding of task.inputBindings ?? []) relatedIds.add(binding.fromTaskId);
+    for (const turn of turns) {
+      for (const input of turn.inputs) {
+        if (input.kind === 'child_results') for (const id of input.taskIds) relatedIds.add(id);
+      }
+    }
+    let parentId = task.parentId;
+    const seenParents = new Set<string>();
+    while (parentId && !seenParents.has(parentId)) {
+      seenParents.add(parentId);
+      const parent = await this.repository.getTask(parentId);
+      if (!parent) break;
+      tasks.set(parent.id, parent);
+      parentId = parent.parentId;
+    }
+    for (const id of relatedIds) {
+      if (tasks.has(id)) continue;
+      const related = await this.repository.getTask(id);
+      if (related) tasks.set(related.id, related);
+    }
+    const [messages, toolCalls, reasoning] = await Promise.all([
+      this.repository.listMessages(task.id),
+      this.repository.listToolCalls(task.id),
+      this.repository.listReasoning(task.id),
+    ]);
+    return {
+      schemaVersion: 6,
+      revision: await (this.repository.getWorkspaceRevision?.() ?? Promise.resolve(0)),
+      tasks: Object.fromEntries([...tasks].map(([id, value]) => [id, value])),
+      turns: Object.fromEntries(turns.map((value) => [value.id, value])),
+      messages: Object.fromEntries(messages.map((value) => [value.id, value])),
+      toolCalls: Object.fromEntries(toolCalls.map((value) => [value.id, value])),
+      reasoning: Object.fromEntries(reasoning.map((value) => [value.id, value])),
+    };
+  }
+
+  private async loadTurnAggregate(turnId: string): Promise<TaskStoreFile | undefined> {
+    const turn = await this.repository.getTurn(turnId);
+    return turn ? this.loadTaskAggregate(turn.taskId) : undefined;
+  }
+
   /** Persist a prepared dispatch with optimistic task revision fencing. */
   private async prepareAndPersistDispatch(
     turnId: string,
     expectedTaskId: string,
     now: string,
   ): Promise<{ ok: true } | { ok: false; reason: string }> {
-    const before = JSON.parse(JSON.stringify(this.store.getFile())) as TaskStoreFile;
+    const source = await this.loadTaskAggregate(expectedTaskId);
+    if (!source) return { ok: false, reason: 'task not found' };
+    const before = cloneTaskStoreFile(source);
     const beforeTask = before.tasks[expectedTaskId];
     if (!beforeTask) return { ok: false, reason: 'task not found' };
     const prepared = this.prepareDispatchDraft(before, turnId, expectedTaskId, now);
@@ -3878,10 +4030,8 @@ export class TaskEngine {
     const task = before.tasks[expectedTaskId];
     const turn = before.turns[turnId];
     if (!task || !turn) return { ok: false, reason: 'dispatch state disappeared' };
-    const messages = Object.values(before.messages).filter((message) => {
-      const prior = this.store.getFile().messages[message.id];
-      return JSON.stringify(prior) !== JSON.stringify(message);
-    });
+    const messages = Object.values(before.messages).filter((message) =>
+      JSON.stringify(source.messages[message.id]) !== JSON.stringify(message));
     let rootTaskId = task.id;
     const seen = new Set<string>();
     while (before.tasks[rootTaskId]?.parentId && !seen.has(rootTaskId)) {
@@ -3982,25 +4132,24 @@ export class TaskEngine {
   }
 
   private async executeTurn(turnId: string): Promise<void> {
-    // Acquire the per-turn lease UNDER the cross-process store lock so lease
-    // read/reclaim/publish is serialized across VS Code windows. This eliminates the
-    // multi-process reclaim race (two engines reclaiming the same stale lease and both
-    // running one turn) that no plain-fs primitive can close on its own — only one
-    // process can be inside this critical section at a time.
-    const lease = this.store.runExclusive(() => tryAcquireLease(this.storePath, turnId));
-    if (!lease) {
+    // Acquire a repository-owned runtime claim before any backend side effect.
+    // The conditional row update is the cross-process fence and stale claims are
+    // reclaimed by expiry.
+    const initialExpiry = new Date(Date.now() + DEFAULT_RUN_LIMIT_MS + LEASE_CLEANUP_BUFFER_MS).toISOString();
+    if (!(await this.claimRuntimeTurn(turnId, initialExpiry))) {
       return;
     }
+    const releaseClaim = (): void => { void this.releaseRuntimeTurn(turnId); };
 
     const file = this.store.getFile();
     const turn = file.turns[turnId];
     if (!turn || turn.status !== 'queued') {
-      releaseLease(this.storePath, turnId, lease);
+      releaseClaim();
       return;
     }
     const task = file.tasks[turn.taskId];
     if (!task) {
-      releaseLease(this.storePath, turnId, lease);
+      releaseClaim();
       return;
     }
 
@@ -4023,7 +4172,7 @@ export class TaskEngine {
     const startCommit = await this.prepareAndPersistDispatch(turnId, turn.taskId, now);
 
     if (!startCommit.ok) {
-      releaseLease(this.storePath, turnId, lease);
+      releaseClaim();
       return;
     }
     // Pin gate / budget fail: leave queued or failed without adapter dispatch.
@@ -4032,9 +4181,9 @@ export class TaskEngine {
       if (!afterPin || afterPin.status !== 'running') {
         if (afterPin?.status === 'failed') {
           // Budget fail: wake parent waits (needs_attention) + prune ledger.
-          this.afterTurnSettled(turnId);
+          await this.afterTurnSettled(turnId);
         }
-        releaseLease(this.storePath, turnId, lease);
+        releaseClaim();
         return;
       }
     }
@@ -4047,15 +4196,21 @@ export class TaskEngine {
       ? postStartFile.tasks[startedTurn.taskId]
       : undefined;
     if (!startedTurn || !taskForDispatch) {
-      releaseLease(this.storePath, turnId, lease);
+      releaseClaim();
       return;
     }
     if ((startedTurn.runtimeEpoch ?? 1) !== (taskForDispatch.runtimeEpoch ?? 1)) {
-      releaseLease(this.storePath, turnId, lease);
+      releaseClaim();
       return;
     }
     if (startedTurn.runDeadlineAt) {
-      updateLeaseExpiry(this.storePath, turnId, lease, startedTurn.runDeadlineAt);
+      const deadline = Date.parse(startedTurn.runDeadlineAt);
+      if (Number.isFinite(deadline)) {
+        void this.heartbeatRuntimeTurn(
+          turnId,
+          new Date(deadline + LEASE_CLEANUP_BUFFER_MS).toISOString(),
+        );
+      }
     }
     this.safeEmit({
       type: 'turnStart',
@@ -4636,8 +4791,8 @@ export class TaskEngine {
       if (this.credentialRegistry) {
         cleanupTurnResources(this.graphDeps(), turnId, mcpConfigPath);
       }
-      this.afterTurnSettled(turnId);
-      releaseLease(this.storePath, turnId, lease);
+      await this.afterTurnSettled(turnId);
+      releaseClaim();
     }
   }
 
@@ -4662,12 +4817,14 @@ export class TaskEngine {
       // `brief.verification.hostRun`, the ENGINE runs the declared commands on the
       // host and OVERRIDES the worker's self-report. CRITICAL: `spawnSync`/git block
       // for the whole command duration, so the gate runs HERE — before/outside the
-      // store.commit — and is threaded into the disposition inside the commit. The
+      // host gate runs outside the persistence transaction and is threaded into the disposition. The
       // store lock is never held across the subprocess.
       const hostVerdict = this.computeHostVerdictForSettle(turnId);
       let missingSession = false;
-      const before = JSON.parse(JSON.stringify(this.store.getFile())) as TaskStoreFile;
-      const draft = JSON.parse(JSON.stringify(before)) as TaskStoreFile;
+      const source = await this.loadTurnAggregate(turnId);
+      if (!source) return false;
+      const before = cloneTaskStoreFile(source);
+      const draft = cloneTaskStoreFile(before);
       const prepared = (() => {
         const turn = draft.turns[turnId];
         const task = turn ? draft.tasks[turn.taskId] : undefined;
@@ -4791,7 +4948,7 @@ export class TaskEngine {
           task.lifecycle === 'open' &&
           !task.pendingParentQuestion
         ) {
-          this.enqueueDispositionRepair(task.id, turnId);
+          await this.enqueueDispositionRepair(task.id, turnId);
         }
         return 'ok';
       }
@@ -4813,92 +4970,60 @@ export class TaskEngine {
    * P0.5: at most one disposition-repair turn after CLI success without complete/fail.
    * Id derived from settled turn for reload idempotency. Never seals lifecycle.
    */
-  private enqueueDispositionRepair(taskId: string, settledTurnId: string): void {
+  private async enqueueDispositionRepair(taskId: string, settledTurnId: string): Promise<void> {
     const repairTurnId = `${settledTurnId}-disposition-repair`;
     const now = nowIso(this.clock);
-    const commit = this.store.commit((draft) => {
-      if (draft.turns[repairTurnId]) {
-        return { ok: true };
-      }
-      const task = draft.tasks[taskId];
-      if (!task || task.lifecycle !== 'open') {
-        return { ok: true };
-      }
-      if (task.attention?.code !== 'disposition_repair_pending') {
-        return { ok: true };
-      }
-      // Only auto-repair under parent_may_seal_direct (default) for non-root workers.
-      if (task.parentId === null) {
-        return { ok: true };
-      }
-      let rootId = task.id;
-      let walk: string | null = task.parentId;
-      const seen = new Set<string>();
-      while (walk && !seen.has(walk)) {
-        seen.add(walk);
-        rootId = walk;
-        walk = draft.tasks[walk]?.parentId ?? null;
-      }
-      const rootPolicy = draft.tasks[rootId]?.childOrchestrationSeal;
-      if (rootPolicy === 'propose_only') {
-        return { ok: true };
-      }
-      const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
-      if (!turnCap.ok) {
-        // Cannot repair: escalate to wakeable missing_disposition for parent.
-        draft.tasks[taskId] = {
-          ...task,
-          attention: {
-            code: 'missing_disposition',
-            message: 'disposition repair could not be scheduled',
-            at: now,
-            sourceTurnId: settledTurnId,
-          },
-          revision: task.revision + 1,
-          updatedAt: now,
-        };
-        return { ok: true };
-      }
-      const messageId = randomUUID();
-      const content =
-        'Muster host: previous turn finished without complete_task/fail_task. ' +
-        'Inspect your prior work in this session and stage complete_task (with a short summary) ' +
-        'or fail_task. Do not invent success; do not start new work.';
-      draft.messages[messageId] = {
-        id: messageId,
-        taskId,
-        role: 'user',
-        content,
-        state: 'assigned',
-        createdAt: now,
-        turnId: repairTurnId,
-      };
-      const continued = transitionContinueTask(task, turnsForTask(draft, taskId), {
-        turnId: repairTurnId,
-        now,
-        inputs: [{ kind: 'message', messageId }],
-        trigger: 'engine',
-      });
-      if (!continued.ok) {
-        draft.tasks[taskId] = {
-          ...task,
-          attention: {
-            code: 'missing_disposition',
-            message: 'disposition repair failed to create turn',
-            at: now,
-            sourceTurnId: settledTurnId,
-          },
-          revision: task.revision + 1,
-          updatedAt: now,
-        };
-        return { ok: true };
-      }
-      draft.turns[repairTurnId] = continued.next;
-      return { ok: true };
-    });
-    if (commit.ok && this.store.getFile().turns[repairTurnId]?.status === 'queued') {
-      void this.scheduleTurn(repairTurnId);
+    if (await this.repository.getTurn(repairTurnId)) return;
+    const task = await this.repository.getTask(taskId);
+    if (!task || task.lifecycle !== 'open' || task.attention?.code !== 'disposition_repair_pending' || task.parentId === null) return;
+    let root = task;
+    while (root.parentId) {
+      const parent = await this.repository.getTask(root.parentId);
+      if (!parent) break;
+      root = parent;
     }
+    if (root.childOrchestrationSeal === 'propose_only') return;
+    const turns = [...await this.repository.listTurns(taskId)];
+    const aggregate: TaskStoreFile = {
+      schemaVersion: 6, revision: 0,
+      tasks: Object.fromEntries([task].map((entry) => [entry.id, entry])),
+      turns: Object.fromEntries(turns.map((entry) => [entry.id, entry])), messages: {},
+    };
+    const turnCap = canCreateTurn(aggregate, taskId, this.resourceLimits);
+    if (!turnCap.ok) {
+      const write = await this.repository.execute({
+        kind: 'setTaskAttention', workspaceId: this.workspaceId,
+        expectedTaskRevision: task.revision,
+        task: { ...task, revision: task.revision + 1, updatedAt: now,
+          attention: { code: 'missing_disposition', message: 'disposition repair could not be scheduled', at: now, sourceTurnId: settledTurnId } },
+      });
+      void write;
+      return;
+    }
+    const messageId = randomUUID();
+    const content =
+      'Muster host: previous turn finished without complete_task/fail_task. ' +
+      'Inspect your prior work in this session and stage complete_task (with a short summary) ' +
+      'or fail_task. Do not invent success; do not start new work.';
+    const message: TaskMessage = { id: messageId, taskId, role: 'user', content, state: 'assigned', createdAt: now, turnId: repairTurnId };
+    const continued = transitionContinueTask(task, turns, {
+      turnId: repairTurnId, now, inputs: [{ kind: 'message', messageId }], trigger: 'engine',
+    });
+    if (!continued.ok) {
+      await this.repository.execute({
+        kind: 'setTaskAttention', workspaceId: this.workspaceId,
+        expectedTaskRevision: task.revision,
+        task: { ...task, revision: task.revision + 1, updatedAt: now,
+          attention: { code: 'missing_disposition', message: 'disposition repair failed to create turn', at: now, sourceTurnId: settledTurnId } },
+      });
+      return;
+    }
+    const write = await this.repository.execute({
+      kind: 'enqueueDispositionRepair', workspaceId: this.workspaceId,
+      expectedTaskRevision: task.revision, maxTurnsPerTask: this.resourceLimits.maxTurnsPerTask,
+      task: { ...task, revision: task.revision + 1, updatedAt: now }, turn: continued.next, message,
+    });
+    if (write.changed) void this.scheduleTurn(repairTurnId);
     this.reconcileChildWaits();
   }
 
@@ -4915,8 +5040,10 @@ export class TaskEngine {
     this.settling.add(turnId);
     const now = nowIso(this.clock);
     try {
-      const before = JSON.parse(JSON.stringify(this.store.getFile())) as TaskStoreFile;
-      const draft = JSON.parse(JSON.stringify(before)) as TaskStoreFile;
+      const source = await this.loadTurnAggregate(turnId);
+      if (!source) return false;
+      const before = cloneTaskStoreFile(source);
+      const draft = cloneTaskStoreFile(before);
       const prepared = (() => {
         const turn = draft.turns[turnId];
         if (!turn || (turn.status !== 'running' && turn.status !== 'waiting_user')) {
@@ -5024,8 +5151,10 @@ export class TaskEngine {
     this.settling.add(turnId);
     const now = nowIso(this.clock);
     try {
-      const before = JSON.parse(JSON.stringify(this.store.getFile())) as TaskStoreFile;
-      const draft = JSON.parse(JSON.stringify(before)) as TaskStoreFile;
+      const source = await this.loadTurnAggregate(turnId);
+      if (!source) return false;
+      const before = cloneTaskStoreFile(source);
+      const draft = cloneTaskStoreFile(before);
       const prepared = (() => {
         const turn = draft.turns[turnId];
         const task = turn ? draft.tasks[turn.taskId] : undefined;
