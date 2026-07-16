@@ -129,7 +129,7 @@ Validate the ledger with `npm run test:task-export-live-evidence` once the T04 v
 
 ## Settings verification and live-host evidence
 
-The assembled five-topic Settings shell (Task Types, Permissions, Retention, plus Coming soon Models and CLIs / Context and MCP) has distinct local and native proof classes. Before collecting live evidence, run:
+The assembled Settings domain shell (4-domain IA — Agents, Execution, Connections, Data — with three actionable tabs rendered: Agents / Execution / Data, and Connections reserved) has distinct local and native proof classes. Before collecting live evidence, run:
 
 ```bash
 npm run test:settings-docs
@@ -139,9 +139,9 @@ npm run test:settings-webview
 npm run test:settings-acceptance
 ```
 
-Focused Playwright (`e2e/muster-webview-state.spec.ts` against the Vite webview with mocked VS Code APIs) proves browser-visible tab keyboard behavior, host-mocked save loops, draft isolation, Coming soon zero-mutation, and 320px reflow. Those results are **supportive only**. They do not prove live Extension Development Host configuration writes or native Settings UI outcomes, and they must never be promoted to live proof.
+Focused Playwright (`e2e/muster-webview-state.spec.ts` against the Vite webview with mocked VS Code APIs) proves browser-visible tab keyboard behavior, host-mocked save loops, draft isolation, cross-domain feedback isolation between Run limits (Execution) and History/Outputs (Data), and 320px reflow. Those results are **supportive only**. They do not prove live Extension Development Host configuration writes or native Settings UI outcomes, and they must never be promoted to live proof.
 
-Next, press **F5** to launch the actual VS Code **Extension Development Host**. Attempt the nine ledger scenarios in `docs/uat/m012-s04/settings-live-host-evidence.md` (tab keyboard focus, Task Types / Permissions / Retention persistence, pending-permission isolation, hide/reveal restore, 320px reflow, Coming soon no-op, and final cleanup).
+Next, press **F5** to launch the actual VS Code **Extension Development Host**. Attempt the nine ledger scenarios in `docs/uat/m012-s04/settings-live-host-evidence.md` (tab keyboard focus, Task profiles / Tool access / History and Outputs persistence, pending-permission isolation, hide/reveal restore, 320px reflow, domain feedback isolation, and final cleanup).
 
 Record each scenario with exactly one `PASS`, `FAIL`, or `ENVIRONMENT BLOCKED` verdict, a UTC timestamp, expected and observed results, bounded evidence, blocker detail, and cleanup. Use `ENVIRONMENT BLOCKED` only after naming the attempted step and concrete unavailable control. Never promote unit or Playwright results to live proof, and never record absolute paths, workspace identity, secrets, raw config dumps, or task-store data. Validate the ledger with `npm run test:settings-live-evidence`. A valid ENVIRONMENT BLOCKED ledger records blocked host attempts; local CI still only covers docs, ledger shape, and browser webview gates.
 

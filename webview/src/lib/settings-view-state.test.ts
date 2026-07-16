@@ -6,12 +6,14 @@ import type {
   TaskTypeSettingsRow,
 } from './protocol';
 import {
+  DATA_RUNTIME_STORAGE_IDS,
+  EXECUTION_RUNTIME_STORAGE_IDS,
   PERMISSION_MODE_RISK_LABELS,
   RETENTION_SETTING_LABELS,
   SETTINGS_VIEW_STATE_KEY,
   SETTINGS_VIEW_STATE_VERSION,
   applyPermissionSnapshotToDraft,
-  applyRetentionSnapshotToDrafts,
+  applyRuntimeStorageSnapshotToDrafts,
   applyTaskTypesSnapshotToDrafts,
   cloneRetentionDrafts,
   cloneTaskTypeDrafts,
@@ -19,14 +21,16 @@ import {
   createEmptyRetentionDrafts,
   isPermissionDraftDirty,
   isRetentionDraftsDirty,
+  isRuntimeStorageDraftDirtyFor,
   isTaskTypeDraftsDirty,
+  mergeSettingsIndicators,
   mergeSettingsViewState,
   parseSettingsViewState,
   readSettingsViewState,
   reducePermissionSettingsUpdateResult,
   reduceRetentionUpdateResult,
   retentionDraftValidationMessage,
-  retentionTabIndicator,
+  runtimeStorageTabIndicatorFor,
   permissionTabIndicator,
   serializeSettingsViewState,
   writeSettingsViewState,
@@ -99,10 +103,10 @@ function memoryApi(initial: Record<string, unknown> = {}): VsCodeStateApi & {
 }
 
 describe('createDefaultSettingsViewState', () => {
-  it('starts on task-types with no drafts', () => {
+  it('starts on the agents domain with no drafts', () => {
     expect(createDefaultSettingsViewState()).toEqual({
       v: SETTINGS_VIEW_STATE_VERSION,
-      activeTopicId: 'task-types',
+      activeTopicId: 'agents',
     });
   });
 });
@@ -113,11 +117,11 @@ describe('parseSettingsViewState — fail closed', () => {
     expect(parseSettingsViewState(undefined)).toBeNull();
     expect(parseSettingsViewState('x')).toBeNull();
     expect(parseSettingsViewState([])).toBeNull();
-    expect(parseSettingsViewState({ v: 999, activeTopicId: 'task-types' })).toBeNull();
-    expect(parseSettingsViewState({ activeTopicId: 'task-types' })).toBeNull();
+    expect(parseSettingsViewState({ v: 999, activeTopicId: 'agents' })).toBeNull();
+    expect(parseSettingsViewState({ activeTopicId: 'agents' })).toBeNull();
   });
 
-  it('rejects unknown active topics and falls back via readSettingsViewState', () => {
+  it('rejects unknown active domains and falls back via readSettingsViewState', () => {
     expect(parseSettingsViewState({ v: SETTINGS_VIEW_STATE_VERSION, activeTopicId: 'appearance' })).toBeNull();
     const api = memoryApi({
       [SETTINGS_VIEW_STATE_KEY]: { v: SETTINGS_VIEW_STATE_VERSION, activeTopicId: 'telemetry' },
@@ -125,17 +129,90 @@ describe('parseSettingsViewState — fail closed', () => {
     expect(readSettingsViewState(api)).toEqual(createDefaultSettingsViewState());
   });
 
-  it('accepts known topics including coming-soon ids', () => {
-    expect(parseSettingsViewState({ v: SETTINGS_VIEW_STATE_VERSION, activeTopicId: 'retention' })).toEqual({
-      v: SETTINGS_VIEW_STATE_VERSION,
-      activeTopicId: 'retention',
-    });
-    expect(parseSettingsViewState({ v: SETTINGS_VIEW_STATE_VERSION, activeTopicId: 'models-and-clis' })?.activeTopicId).toBe(
-      'models-and-clis',
-    );
+  it('accepts the three rendered v3 domain ids', () => {
+    for (const id of ['agents', 'execution', 'data'] as const) {
+      expect(
+        parseSettingsViewState({ v: SETTINGS_VIEW_STATE_VERSION, activeTopicId: id })?.activeTopicId,
+      ).toBe(id);
+    }
   });
 
-  it('migrates v1 retention drafts while preserving the stable retention topic id', () => {
+  it('rejects the reserved (non-rendered) connections domain', () => {
+    expect(
+      parseSettingsViewState({ v: SETTINGS_VIEW_STATE_VERSION, activeTopicId: 'connections' }),
+    ).toBeNull();
+  });
+
+  it('does not migrate legacy topic ids inside a v3 envelope', () => {
+    for (const legacy of [
+      'task-types',
+      'permissions',
+      'retention',
+      'models-and-clis',
+      'context-and-mcp',
+    ]) {
+      expect(
+        parseSettingsViewState({ v: SETTINGS_VIEW_STATE_VERSION, activeTopicId: legacy }),
+      ).toBeNull();
+    }
+  });
+
+  describe('legacy topic id migration (v1/v2 → v3 domain)', () => {
+    const cases: Array<[string, SettingsViewState['activeTopicId']]> = [
+      ['task-types', 'agents'],
+      ['permissions', 'execution'],
+      ['retention', 'data'],
+      ['models-and-clis', 'agents'],
+      ['context-and-mcp', 'agents'],
+    ];
+
+    for (const version of [1, 2] as const) {
+      for (const [legacy, expected] of cases) {
+        it(`v${version}: ${legacy} → ${expected}`, () => {
+          expect(
+            parseSettingsViewState({ v: version, activeTopicId: legacy })?.activeTopicId,
+          ).toBe(expected);
+        });
+      }
+    }
+
+    it('rejects an unknown legacy id fail-closed (no fallback-and-reject ambiguity)', () => {
+      expect(parseSettingsViewState({ v: 1, activeTopicId: 'appearance' })).toBeNull();
+      expect(parseSettingsViewState({ v: 2, activeTopicId: 'context-engine' })).toBeNull();
+      expect(parseSettingsViewState({ v: 1, activeTopicId: 'agents' })).toBeNull();
+      expect(parseSettingsViewState({ v: 2, activeTopicId: 'data' })).toBeNull();
+    });
+  });
+
+  it('accepts unique v3 dirty-field metadata only when retention drafts exist', () => {
+    const raw = {
+      v: SETTINGS_VIEW_STATE_VERSION,
+      activeTopicId: 'data',
+      retentionDrafts: {
+        runLimit: '2h',
+        maxRetainedTurnsPerTask: '99',
+        maxStoredOutputChars: '200000',
+      },
+      retentionDirtySettingIds: ['maxRetainedTurnsPerTask'],
+    };
+    expect(parseSettingsViewState(raw)).toEqual(raw);
+    expect(
+      parseSettingsViewState({
+        v: SETTINGS_VIEW_STATE_VERSION,
+        activeTopicId: 'data',
+        retentionDirtySettingIds: ['maxRetainedTurnsPerTask'],
+      }),
+    ).toBeNull();
+    expect(parseSettingsViewState({ ...raw, retentionDirtySettingIds: ['unknown'] })).toBeNull();
+    expect(
+      parseSettingsViewState({
+        ...raw,
+        retentionDirtySettingIds: ['maxRetainedTurnsPerTask', 'maxRetainedTurnsPerTask'],
+      }),
+    ).toBeNull();
+  });
+
+  it('migrates v1 retention drafts (maxTurnsPerTask → maxRetainedTurnsPerTask) and remaps topic id', () => {
     expect(parseSettingsViewState({
       v: 1,
       activeTopicId: 'retention',
@@ -145,7 +222,7 @@ describe('parseSettingsViewState — fail closed', () => {
       },
     })).toEqual({
       v: SETTINGS_VIEW_STATE_VERSION,
-      activeTopicId: 'retention',
+      activeTopicId: 'data',
       retentionDrafts: {
         runLimit: '',
         maxRetainedTurnsPerTask: '25',
@@ -159,14 +236,14 @@ describe('parseSettingsViewState — fail closed', () => {
     expect(
       parseSettingsViewState({
         v: SETTINGS_VIEW_STATE_VERSION,
-        activeTopicId: 'task-types',
+        activeTopicId: 'agents',
         taskTypeDrafts: tooMany,
       }),
     ).toBeNull();
 
     const badRole = parseSettingsViewState({
       v: SETTINGS_VIEW_STATE_VERSION,
-      activeTopicId: 'task-types',
+      activeTopicId: 'agents',
       taskTypeDrafts: [sampleType({ role: 'admin' as 'worker' })],
     });
     expect(badRole).toBeNull();
@@ -175,7 +252,7 @@ describe('parseSettingsViewState — fail closed', () => {
     expect(
       parseSettingsViewState({
         v: SETTINGS_VIEW_STATE_VERSION,
-        activeTopicId: 'task-types',
+        activeTopicId: 'agents',
         taskTypeDrafts: [sampleType({ description: longDesc })],
       }),
     ).toBeNull();
@@ -184,12 +261,12 @@ describe('parseSettingsViewState — fail closed', () => {
   it('accepts explicit empty task type maps', () => {
     const parsed = parseSettingsViewState({
       v: SETTINGS_VIEW_STATE_VERSION,
-      activeTopicId: 'task-types',
+      activeTopicId: 'agents',
       taskTypeDrafts: [],
     });
     expect(parsed).toEqual({
       v: SETTINGS_VIEW_STATE_VERSION,
-      activeTopicId: 'task-types',
+      activeTopicId: 'agents',
       taskTypeDrafts: [],
     });
   });
@@ -197,7 +274,7 @@ describe('parseSettingsViewState — fail closed', () => {
   it('bounds retention draft strings and drops unknown keys', () => {
     const parsed = parseSettingsViewState({
       v: SETTINGS_VIEW_STATE_VERSION,
-      activeTopicId: 'retention',
+      activeTopicId: 'data',
       retentionDrafts: {
         runLimit: '',
         maxRetainedTurnsPerTask: '12',
@@ -208,7 +285,7 @@ describe('parseSettingsViewState — fail closed', () => {
     });
     expect(parsed).toEqual({
       v: SETTINGS_VIEW_STATE_VERSION,
-      activeTopicId: 'retention',
+      activeTopicId: 'data',
       retentionDrafts: {
         runLimit: '',
         maxRetainedTurnsPerTask: '12',
@@ -219,7 +296,7 @@ describe('parseSettingsViewState — fail closed', () => {
     expect(
       parseSettingsViewState({
         v: SETTINGS_VIEW_STATE_VERSION,
-        activeTopicId: 'retention',
+        activeTopicId: 'data',
         retentionDrafts: { maxRetainedTurnsPerTask: 'x'.repeat(65) },
       }),
     ).toBeNull();
@@ -229,14 +306,14 @@ describe('parseSettingsViewState — fail closed', () => {
     expect(
       parseSettingsViewState({
         v: SETTINGS_VIEW_STATE_VERSION,
-        activeTopicId: 'task-types',
+        activeTopicId: 'agents',
         taskTypeDrafts: { id: 'worker' },
       }),
     ).toBeNull();
     expect(
       parseSettingsViewState({
         v: SETTINGS_VIEW_STATE_VERSION,
-        activeTopicId: 'retention',
+        activeTopicId: 'data',
         retentionDrafts: ['12'],
       }),
     ).toBeNull();
@@ -253,7 +330,7 @@ describe('merge and persistence', () => {
     };
     const view: SettingsViewState = {
       v: SETTINGS_VIEW_STATE_VERSION,
-      activeTopicId: 'retention',
+      activeTopicId: 'data',
       retentionDrafts: createEmptyRetentionDrafts(),
       taskTypeDrafts: [sampleType({ id: 'coord', role: 'coordinator' })],
     };
@@ -273,7 +350,7 @@ describe('merge and persistence', () => {
     const drafts = [sampleType({ id: 'a' })];
     writeSettingsViewState(api, {
       v: SETTINGS_VIEW_STATE_VERSION,
-      activeTopicId: 'permissions',
+      activeTopicId: 'execution',
       taskTypeDrafts: drafts,
     });
     // Mutating the original drafts must not affect stored state.
@@ -289,7 +366,7 @@ describe('merge and persistence', () => {
   it('serializeSettingsViewState is clone-safe (JSON-safe plain data)', () => {
     const view: SettingsViewState = {
       v: SETTINGS_VIEW_STATE_VERSION,
-      activeTopicId: 'task-types',
+      activeTopicId: 'agents',
       taskTypeDrafts: [sampleType({ model: 'm', description: 'd' })],
       retentionDrafts: {
         runLimit: '2h',
@@ -330,6 +407,25 @@ describe('dirty helpers', () => {
     expect(isRetentionDraftsDirty(pristine, null)).toBe(false);
   });
 
+  it('scopes dirtiness per domain subset so one domain never marks the other dirty', () => {
+    const snapshot = sampleRetentionSnapshot({ maxRetainedTurnsPerTask: 40, maxStoredOutputChars: 200_000 });
+    const pristine = {
+      runLimit: '2h',
+      maxRetainedTurnsPerTask: '40',
+      maxStoredOutputChars: '200000',
+    };
+
+    // A dirty Data field must not mark the Execution run-limit subset dirty.
+    const dirtyData = { ...pristine, maxRetainedTurnsPerTask: '41' };
+    expect(isRuntimeStorageDraftDirtyFor(EXECUTION_RUNTIME_STORAGE_IDS, dirtyData, snapshot)).toBe(false);
+    expect(isRuntimeStorageDraftDirtyFor(DATA_RUNTIME_STORAGE_IDS, dirtyData, snapshot)).toBe(true);
+
+    // A dirty run-limit must not mark the Data subset dirty.
+    const dirtyRun = { ...pristine, runLimit: '4h' };
+    expect(isRuntimeStorageDraftDirtyFor(EXECUTION_RUNTIME_STORAGE_IDS, dirtyRun, snapshot)).toBe(true);
+    expect(isRuntimeStorageDraftDirtyFor(DATA_RUNTIME_STORAGE_IDS, dirtyRun, snapshot)).toBe(false);
+  });
+
   it('detects task type draft dirtiness including explicit empty maps', () => {
     const saved = [sampleType({ id: 'worker' }), sampleType({ id: 'coord', role: 'coordinator' })];
     expect(isTaskTypeDraftsDirty(cloneTaskTypeDrafts(saved), saved)).toBe(false);
@@ -351,48 +447,118 @@ describe('dirty helpers', () => {
   });
 });
 
-describe('snapshot → draft application (dirty-safe)', () => {
-  it('initializes pristine retention drafts from snapshot but never overwrites dirty ones', () => {
+describe('applyRuntimeStorageSnapshotToDrafts (field-by-field hydration)', () => {
+  it('initializes uninitialized drafts fully from the snapshot', () => {
     const snapshot = sampleRetentionSnapshot({ maxRetainedTurnsPerTask: 10 });
-    const pristine = applyRetentionSnapshotToDrafts(null, snapshot, false);
-    expect(pristine).toEqual({
+    expect(applyRuntimeStorageSnapshotToDrafts(null, snapshot)).toEqual({
       runLimit: '2h',
       maxRetainedTurnsPerTask: '10',
       maxStoredOutputChars: '200000',
     });
-
-    const dirty = {
-      runLimit: '4h',
-      maxRetainedTurnsPerTask: '99',
-      maxStoredOutputChars: '1234',
-    };
-    expect(applyRetentionSnapshotToDrafts(dirty, snapshot, true)).toEqual(dirty);
   });
 
-  it('hydrates empty runLimit from host after v1 migration while keeping dirty retention fields', () => {
-    const snapshot = sampleRetentionSnapshot({ maxRetainedTurnsPerTask: 25, maxStoredOutputChars: 5000 });
+  it('hydrates a pristine Execution run-limit even when a Data field is dirty', () => {
+    // Drafts were hydrated from prev; user then edited only maxRetainedTurnsPerTask.
+    const prev = sampleRetentionSnapshot({
+      runLimit: '2h',
+      maxRetainedTurnsPerTask: 40,
+      maxStoredOutputChars: 200_000,
+    });
+    const dirtyDataDraft = {
+      runLimit: '2h',
+      maxRetainedTurnsPerTask: '99',
+      maxStoredOutputChars: '200000',
+    };
+    const incoming = sampleRetentionSnapshot({
+      runLimit: '4h',
+      maxRetainedTurnsPerTask: 40,
+      maxStoredOutputChars: 200_000,
+    });
+    expect(applyRuntimeStorageSnapshotToDrafts(dirtyDataDraft, incoming, prev)).toEqual({
+      runLimit: '4h', // pristine → refreshed
+      maxRetainedTurnsPerTask: '99', // dirty → preserved
+      maxStoredOutputChars: '200000',
+    });
+  });
+
+  it('hydrates pristine Data fields even when the run-limit is dirty', () => {
+    const prev = sampleRetentionSnapshot({
+      runLimit: '2h',
+      maxRetainedTurnsPerTask: 40,
+      maxStoredOutputChars: 200_000,
+    });
+    const dirtyRunDraft = {
+      runLimit: '8h',
+      maxRetainedTurnsPerTask: '40',
+      maxStoredOutputChars: '200000',
+    };
+    const incoming = sampleRetentionSnapshot({
+      runLimit: '2h',
+      maxRetainedTurnsPerTask: 55,
+      maxStoredOutputChars: 300_000,
+    });
+    expect(applyRuntimeStorageSnapshotToDrafts(dirtyRunDraft, incoming, prev)).toEqual({
+      runLimit: '8h', // dirty → preserved
+      maxRetainedTurnsPerTask: '55', // pristine → refreshed
+      maxStoredOutputChars: '300000', // pristine → refreshed
+    });
+  });
+
+  it('uses persisted v3 dirty-field ownership on the first snapshot after restore', () => {
+    const restoredDrafts = {
+      runLimit: '2h',
+      maxRetainedTurnsPerTask: '99',
+      maxStoredOutputChars: '200000',
+    };
+    const incoming = sampleRetentionSnapshot({
+      runLimit: '4h',
+      maxRetainedTurnsPerTask: 40,
+      maxStoredOutputChars: 300_000,
+    });
+    expect(
+      applyRuntimeStorageSnapshotToDrafts(
+        restoredDrafts,
+        incoming,
+        null,
+        ['maxRetainedTurnsPerTask'],
+      ),
+    ).toEqual({
+      runLimit: '4h',
+      maxRetainedTurnsPerTask: '99',
+      maxStoredOutputChars: '300000',
+    });
+  });
+
+  it('hydrates an empty runLimit left by v1 migration from the host', () => {
     const migrated = {
       runLimit: '',
       maxRetainedTurnsPerTask: '25',
       maxStoredOutputChars: '999',
     };
-    expect(applyRetentionSnapshotToDrafts(migrated, snapshot, true)).toEqual({
-      runLimit: '2h',
-      maxRetainedTurnsPerTask: '25',
-      maxStoredOutputChars: '999',
+    const incoming = sampleRetentionSnapshot({ maxRetainedTurnsPerTask: 25, maxStoredOutputChars: 5000 });
+    expect(applyRuntimeStorageSnapshotToDrafts(migrated, incoming)).toEqual({
+      runLimit: '2h', // migration-blank enum hydrates once
+      maxRetainedTurnsPerTask: '25', // matches incoming → refreshed (no-op)
+      maxStoredOutputChars: '999', // dirty → preserved
     });
   });
 
-  it('does not refill a user-cleared retention number draft from incidental snapshots', () => {
-    const snapshot = sampleRetentionSnapshot({ maxRetainedTurnsPerTask: 25, maxStoredOutputChars: 5000 });
+  it('does not refill a user-cleared Data number draft from incidental snapshots', () => {
     const clearing = {
       runLimit: '2h',
       maxRetainedTurnsPerTask: '',
       maxStoredOutputChars: '5000',
     };
-    expect(applyRetentionSnapshotToDrafts(clearing, snapshot, true)).toEqual(clearing);
+    const incoming = sampleRetentionSnapshot({ maxRetainedTurnsPerTask: 25, maxStoredOutputChars: 5000 });
+    expect(applyRuntimeStorageSnapshotToDrafts(clearing, incoming)).toEqual({
+      runLimit: '2h',
+      maxRetainedTurnsPerTask: '', // cleared, dirty → preserved
+      maxStoredOutputChars: '5000',
+    });
   });
+});
 
+describe('task type snapshot → draft application (dirty-safe)', () => {
   it('initializes pristine task type drafts from snapshot but never overwrites dirty ones', () => {
     const saved = [sampleType({ id: 'worker' })];
     const next = applyTaskTypesSnapshotToDrafts(undefined, saved, false);
@@ -417,7 +583,7 @@ describe('snapshot → draft application (dirty-safe)', () => {
   });
 });
 
-describe('reduceRetentionUpdateResult (topic-local failure isolation)', () => {
+describe('reduceRetentionUpdateResult (owner-aware failure isolation)', () => {
   const baseDrafts = {
     runLimit: '2h',
     maxRetainedTurnsPerTask: '99',
@@ -429,7 +595,7 @@ describe('reduceRetentionUpdateResult (topic-local failure isolation)', () => {
     localFieldErrors: {} as Partial<Record<'maxRetainedTurnsPerTask' | 'maxStoredOutputChars', string>>,
   };
 
-  it('on success updates only the confirmed field draft and clears only that field error', () => {
+  it('on success updates only the confirmed field draft, sets feedbackOwner, and clears only that field error', () => {
     const next = reduceRetentionUpdateResult(
       {
         ...prev,
@@ -445,6 +611,7 @@ describe('reduceRetentionUpdateResult (topic-local failure isolation)', () => {
     });
     expect(next.error).toBeNull();
     expect(next.savedMessage).toBe(`Saved ${RETENTION_SETTING_LABELS.maxRetainedTurnsPerTask}.`);
+    expect(next.feedbackOwner).toBe('maxRetainedTurnsPerTask');
     expect(next.fieldErrors.maxRetainedTurnsPerTask).toBeUndefined();
     expect(next.fieldErrors.maxStoredOutputChars).toBe('keep-me');
     expect(next.localFieldErrors.maxRetainedTurnsPerTask).toBeUndefined();
@@ -453,7 +620,13 @@ describe('reduceRetentionUpdateResult (topic-local failure isolation)', () => {
     expect(baseDrafts.maxRetainedTurnsPerTask).toBe('99');
   });
 
-  it('on host write failure keeps the attempted draft and surfaces a sanitized Retention-local alert', () => {
+  it('routes a run-limit save success to the runLimit owner', () => {
+    const next = reduceRetentionUpdateResult(prev, { ok: true, settingId: 'runLimit', value: '4h' });
+    expect(next.feedbackOwner).toBe('runLimit');
+    expect(next.confirmed).toEqual({ settingId: 'runLimit', value: '4h' });
+  });
+
+  it('on host write failure keeps the attempted draft, sets owner, and surfaces a sanitized alert', () => {
     const next = reduceRetentionUpdateResult(prev, {
       ok: false,
       settingId: 'maxRetainedTurnsPerTask',
@@ -464,14 +637,15 @@ describe('reduceRetentionUpdateResult (topic-local failure isolation)', () => {
     expect(next.drafts).not.toBe(baseDrafts);
     expect(next.confirmed).toBeUndefined();
     expect(next.savedMessage).toBeNull();
+    expect(next.feedbackOwner).toBe('maxRetainedTurnsPerTask');
     expect(next.error).toBe(
       `Unable to save ${RETENTION_SETTING_LABELS.maxRetainedTurnsPerTask}. Check the VS Code setting and try again.`,
     );
-    // Never leak raw host paths/tokens into the Retention-local surface.
+    // Never leak raw host paths/tokens into the domain surface.
     expect(next.error).not.toMatch(/ENOENT|token=|\/secret/);
   });
 
-  it('on field validation failure from host keeps drafts and maps message to that field only', () => {
+  it('on field validation failure from host keeps drafts, sets owner, and maps message to that field only', () => {
     const next = reduceRetentionUpdateResult(prev, {
       ok: false,
       settingId: 'maxStoredOutputChars',
@@ -481,12 +655,13 @@ describe('reduceRetentionUpdateResult (topic-local failure isolation)', () => {
     expect(next.drafts).toEqual(baseDrafts);
     expect(next.error).toBeNull();
     expect(next.savedMessage).toBeNull();
+    expect(next.feedbackOwner).toBe('maxStoredOutputChars');
     expect(next.fieldErrors).toEqual({
       maxStoredOutputChars: 'Max stored output characters must be at least 1024.',
     });
   });
 
-  it('on unknownSetting failure keeps drafts and uses Retention-local load/save alert', () => {
+  it('on unknownSetting failure keeps drafts and uses a Settings-level alert with no owner', () => {
     const next = reduceRetentionUpdateResult(prev, {
       ok: false,
       code: 'unknownSetting',
@@ -497,6 +672,23 @@ describe('reduceRetentionUpdateResult (topic-local failure isolation)', () => {
       'Unable to load or save settings. Check the VS Code setting and try again.',
     );
     expect(next.savedMessage).toBeNull();
+    expect(next.feedbackOwner).toBeNull();
+  });
+
+  it('attributes an unknownSetting failure to the pending save when available', () => {
+    const next = reduceRetentionUpdateResult(
+      prev,
+      {
+        ok: false,
+        code: 'unknownSetting',
+        message: 'Unsupported setting.',
+      },
+      'runLimit',
+    );
+    expect(next.feedbackOwner).toBe('runLimit');
+    expect(next.error).toBe(
+      'Unable to load or save settings. Check the VS Code setting and try again.',
+    );
   });
 });
 
@@ -575,19 +767,19 @@ describe('parseSettingsViewState — permission draft', () => {
     expect(
       parseSettingsViewState({
         v: SETTINGS_VIEW_STATE_VERSION,
-        activeTopicId: 'permissions',
+        activeTopicId: 'execution',
         permissionDraftMode: 'readonly',
       }),
     ).toEqual({
       v: SETTINGS_VIEW_STATE_VERSION,
-      activeTopicId: 'permissions',
+      activeTopicId: 'execution',
       permissionDraftMode: 'readonly',
     });
 
     expect(
       parseSettingsViewState({
         v: SETTINGS_VIEW_STATE_VERSION,
-        activeTopicId: 'permissions',
+        activeTopicId: 'execution',
         permissionDraftMode: 'prompt',
       }),
     ).toBeNull();
@@ -595,7 +787,7 @@ describe('parseSettingsViewState — permission draft', () => {
     expect(
       parseSettingsViewState({
         v: SETTINGS_VIEW_STATE_VERSION,
-        activeTopicId: 'permissions',
+        activeTopicId: 'execution',
         permissionDraftMode: 1,
       }),
     ).toBeNull();
@@ -604,7 +796,7 @@ describe('parseSettingsViewState — permission draft', () => {
   it('serializes and restores permissionDraftMode without errors or sensitive fields', () => {
     const view: SettingsViewState = {
       v: SETTINGS_VIEW_STATE_VERSION,
-      activeTopicId: 'permissions',
+      activeTopicId: 'execution',
       permissionDraftMode: 'allow',
     };
     const serialized = serializeSettingsViewState(view);
@@ -616,7 +808,7 @@ describe('parseSettingsViewState — permission draft', () => {
   });
 });
 
-describe('reducePermissionSettingsUpdateResult (topic-local failure isolation)', () => {
+describe('reducePermissionSettingsUpdateResult (domain-local failure isolation)', () => {
   it('on success updates draft mode, clears error, and exposes confirmed mode', () => {
     const next = reducePermissionSettingsUpdateResult(
       { draftMode: 'allow' },
@@ -628,7 +820,7 @@ describe('reducePermissionSettingsUpdateResult (topic-local failure isolation)',
     expect(next.confirmed).toEqual({ mode: 'allow' });
   });
 
-  it('on host write failure keeps attempted draft and surfaces a sanitized Permissions-local alert', () => {
+  it('on host write failure keeps attempted draft and surfaces a sanitized Tool access alert', () => {
     const next = reducePermissionSettingsUpdateResult(
       { draftMode: 'allow' },
       {
@@ -665,48 +857,19 @@ describe('reducePermissionSettingsUpdateResult (topic-local failure isolation)',
 describe('permissionTabIndicator', () => {
   it('prioritizes saving, error, dirty, then saved', () => {
     expect(
-      permissionTabIndicator({
-        saving: true,
-        error: 'x',
-        dirty: true,
-        savedMessage: 'Saved',
-      }),
+      permissionTabIndicator({ saving: true, error: 'x', dirty: true, savedMessage: 'Saved' }),
     ).toEqual({ kind: 'saving', label: 'Saving' });
-
     expect(
-      permissionTabIndicator({
-        saving: false,
-        error: 'Unable to save',
-        dirty: true,
-        savedMessage: null,
-      }),
+      permissionTabIndicator({ saving: false, error: 'Unable to save', dirty: true, savedMessage: null }),
     ).toEqual({ kind: 'error', label: 'Error' });
-
     expect(
-      permissionTabIndicator({
-        saving: false,
-        error: null,
-        dirty: true,
-        savedMessage: 'Saved',
-      }),
+      permissionTabIndicator({ saving: false, error: null, dirty: true, savedMessage: 'Saved' }),
     ).toEqual({ kind: 'dirty', label: 'Unsaved' });
-
     expect(
-      permissionTabIndicator({
-        saving: false,
-        error: null,
-        dirty: false,
-        savedMessage: 'Saved permission mode.',
-      }),
+      permissionTabIndicator({ saving: false, error: null, dirty: false, savedMessage: 'Saved permission mode.' }),
     ).toEqual({ kind: 'saved', label: 'Saved' });
-
     expect(
-      permissionTabIndicator({
-        saving: false,
-        error: null,
-        dirty: false,
-        savedMessage: null,
-      }),
+      permissionTabIndicator({ saving: false, error: null, dirty: false, savedMessage: null }),
     ).toBeNull();
   });
 
@@ -717,83 +880,125 @@ describe('permissionTabIndicator', () => {
   });
 });
 
-describe('retentionTabIndicator', () => {
-  it('prioritizes saving, error, dirty, then saved; field errors count as error', () => {
+describe('runtimeStorageTabIndicatorFor (per-domain subset)', () => {
+  const clean = {
+    savingSettingId: null,
+    error: null,
+    feedbackOwner: null,
+    fieldErrors: {},
+    localFieldErrors: {},
+    dirty: false,
+    savedMessage: null,
+  } as const;
+
+  it('only counts saving for a setting in the subset', () => {
     expect(
-      retentionTabIndicator({
-        saving: true,
-        error: 'x',
-        fieldErrors: {},
-        localFieldErrors: {},
-        dirty: true,
-        savedMessage: 'Saved',
+      runtimeStorageTabIndicatorFor(EXECUTION_RUNTIME_STORAGE_IDS, {
+        ...clean,
+        savingSettingId: 'runLimit',
       }),
     ).toEqual({ kind: 'saving', label: 'Saving' });
-
+    // A Data field saving does not mark Execution as saving.
     expect(
-      retentionTabIndicator({
-        saving: false,
-        error: 'Unable to save',
-        fieldErrors: {},
-        localFieldErrors: {},
-        dirty: true,
-        savedMessage: null,
-      }),
-    ).toEqual({ kind: 'error', label: 'Error' });
-
-    expect(
-      retentionTabIndicator({
-        saving: false,
-        error: null,
-        fieldErrors: { maxRetainedTurnsPerTask: 'bad' },
-        localFieldErrors: {},
-        dirty: true,
-        savedMessage: null,
-      }),
-    ).toEqual({ kind: 'error', label: 'Error' });
-
-    expect(
-      retentionTabIndicator({
-        saving: false,
-        error: null,
-        fieldErrors: {},
-        localFieldErrors: { maxStoredOutputChars: 'client' },
-        dirty: false,
-        savedMessage: null,
-      }),
-    ).toEqual({ kind: 'error', label: 'Error' });
-
-    expect(
-      retentionTabIndicator({
-        saving: false,
-        error: null,
-        fieldErrors: {},
-        localFieldErrors: {},
-        dirty: true,
-        savedMessage: 'Saved',
-      }),
-    ).toEqual({ kind: 'dirty', label: 'Unsaved' });
-
-    expect(
-      retentionTabIndicator({
-        saving: false,
-        error: null,
-        fieldErrors: {},
-        localFieldErrors: {},
-        dirty: false,
-        savedMessage: 'Saved Maximum turns per task.',
-      }),
-    ).toEqual({ kind: 'saved', label: 'Saved' });
-
-    expect(
-      retentionTabIndicator({
-        saving: false,
-        error: null,
-        fieldErrors: {},
-        localFieldErrors: {},
-        dirty: false,
-        savedMessage: null,
+      runtimeStorageTabIndicatorFor(EXECUTION_RUNTIME_STORAGE_IDS, {
+        ...clean,
+        savingSettingId: 'maxRetainedTurnsPerTask',
       }),
     ).toBeNull();
+  });
+
+  it('only counts field errors for settings in the subset', () => {
+    expect(
+      runtimeStorageTabIndicatorFor(DATA_RUNTIME_STORAGE_IDS, {
+        ...clean,
+        fieldErrors: { maxStoredOutputChars: 'bad' },
+      }),
+    ).toEqual({ kind: 'error', label: 'Error' });
+    expect(
+      runtimeStorageTabIndicatorFor(EXECUTION_RUNTIME_STORAGE_IDS, {
+        ...clean,
+        fieldErrors: { maxStoredOutputChars: 'bad' },
+      }),
+    ).toBeNull();
+  });
+
+  it('routes shared error/saved banners only to the owning subset', () => {
+    // A run-limit save error/owner does not create a Data indicator, and vice versa.
+    expect(
+      runtimeStorageTabIndicatorFor(DATA_RUNTIME_STORAGE_IDS, {
+        ...clean,
+        error: 'Run limit save failed',
+        feedbackOwner: 'runLimit',
+      }),
+    ).toBeNull();
+    expect(
+      runtimeStorageTabIndicatorFor(EXECUTION_RUNTIME_STORAGE_IDS, {
+        ...clean,
+        error: 'Run limit save failed',
+        feedbackOwner: 'runLimit',
+      }),
+    ).toEqual({ kind: 'error', label: 'Error' });
+
+    expect(
+      runtimeStorageTabIndicatorFor(EXECUTION_RUNTIME_STORAGE_IDS, {
+        ...clean,
+        savedMessage: 'Saved Retained turns per completed task.',
+        feedbackOwner: 'maxRetainedTurnsPerTask',
+      }),
+    ).toBeNull();
+    expect(
+      runtimeStorageTabIndicatorFor(DATA_RUNTIME_STORAGE_IDS, {
+        ...clean,
+        savedMessage: 'Saved Retained turns per completed task.',
+        feedbackOwner: 'maxRetainedTurnsPerTask',
+      }),
+    ).toEqual({ kind: 'saved', label: 'Saved' });
+  });
+
+  it('prioritizes saving > error > dirty > saved within a subset', () => {
+    expect(
+      runtimeStorageTabIndicatorFor(DATA_RUNTIME_STORAGE_IDS, {
+        ...clean,
+        savingSettingId: 'maxStoredOutputChars',
+        fieldErrors: { maxStoredOutputChars: 'bad' },
+        dirty: true,
+        savedMessage: 'Saved',
+        feedbackOwner: 'maxStoredOutputChars',
+      }),
+    ).toEqual({ kind: 'saving', label: 'Saving' });
+    expect(
+      runtimeStorageTabIndicatorFor(DATA_RUNTIME_STORAGE_IDS, { ...clean, dirty: true }),
+    ).toEqual({ kind: 'dirty', label: 'Unsaved' });
+  });
+});
+
+describe('mergeSettingsIndicators', () => {
+  it('folds indicators by severity: saving > error > dirty > diagnostic > saved', () => {
+    expect(
+      mergeSettingsIndicators(
+        { kind: 'saved', label: 'Saved' },
+        { kind: 'error', label: 'Error' },
+      ),
+    ).toEqual({ kind: 'error', label: 'Error' });
+    expect(
+      mergeSettingsIndicators(
+        { kind: 'dirty', label: 'Unsaved' },
+        { kind: 'saving', label: 'Saving' },
+      ),
+    ).toEqual({ kind: 'saving', label: 'Saving' });
+    expect(
+      mergeSettingsIndicators(
+        { kind: 'diagnostic', label: 'Needs attention' },
+        { kind: 'saved', label: 'Saved' },
+      ),
+    ).toEqual({ kind: 'diagnostic', label: 'Needs attention' });
+  });
+
+  it('ignores null/undefined inputs and returns null when nothing is set', () => {
+    expect(mergeSettingsIndicators(null, undefined)).toBeNull();
+    expect(mergeSettingsIndicators(null, { kind: 'dirty', label: 'Unsaved' })).toEqual({
+      kind: 'dirty',
+      label: 'Unsaved',
+    });
   });
 });

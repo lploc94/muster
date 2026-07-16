@@ -1,12 +1,12 @@
 # Settings design
 
-**Status:** Proposed target design; not the current implementation contract  
+**Status:** Adopted; three actionable domains rendered (Agents, Execution, Data); Connections reserved
 **Last updated:** 2026-07-16  
 **Scope:** Muster Settings information architecture, naming, navigation, and responsive presentation
 
 Related documents:
 
-- [SETTINGS.md](SETTINGS.md) documents the current host-backed implementation contract and five-topic shell.
+- [SETTINGS.md](SETTINGS.md) documents the current host-backed implementation contract and the rendered Settings domain shell.
 - [WEBVIEW.md](WEBVIEW.md) documents the surrounding chat webview.
 - [MCP-INJECTION.md](MCP-INJECTION.md) documents the current and planned MCP/context-engine integration.
 
@@ -21,7 +21,7 @@ This document is for contributors designing or reviewing a Muster setting. After
 
 ## Decision summary
 
-The target Settings taxonomy has four top-level domains:
+The Settings taxonomy has four top-level domains:
 
 1. **Agents**
 2. **Execution**
@@ -42,7 +42,7 @@ This taxonomy is an ownership contract. Every level has a defined job, and every
 - Keep navigation no deeper than two levels: domain, then settings group/detail.
 - Make every visible navigation destination actionable; do not use empty `Coming soon` tabs.
 - Keep all major tabs visible in one row at a 320-pixel webview width.
-- Preserve keyboard navigation, screen-reader relationships, host-backed persistence, and topic-local feedback.
+- Preserve keyboard navigation, screen-reader relationships, host-backed persistence, and domain-local feedback.
 - Leave room for planned backend/model and context/MCP configuration without another taxonomy rewrite.
 
 ## Non-goals
@@ -51,27 +51,34 @@ This proposal does not by itself:
 
 - rename public protocol fields, `muster.*` setting IDs, or task-management API fields;
 - change which configuration scope owns a setting;
-- replace the current five-topic shell before its implementation, tests, state migration, and documentation are updated together;
+- replace the shell before its implementation, tests, state migration, and documentation are updated together (this coordinated migration has now landed);
 - turn roadmap ideas into durable settings without a host-owned read/write contract.
 
-## Current-state audit
+## Pre-refactor baseline
 
-The current webview presents five peer tabs:
+This design has been adopted. The webview now renders three actionable domains — **Agents**, **Execution**, and **Data** — with **Connections** reserved (see [Rendering by product maturity](#rendering-by-product-maturity)). The table below records the superseded five-peer-tab shell so the motivation for the change stays legible; it is history, not the current shape.
 
-| Current tab | Actual content | Granularity issue |
+| Superseded tab | Actual content | Granularity issue that motivated the change |
 |---|---|---|
-| **Task Types** | A repeated-item editor for task presets | A large configuration object is treated as a top-level product domain. |
-| **Permissions** | One default tool-permission policy | A single policy is placed beside much broader compound domains. |
-| **Runtime & Storage** | One run limit plus two retention/output limits | Two unrelated product concerns are combined to save a tab. |
-| **Models and CLIs** | Non-actionable placeholder | Two future resource groups occupy a top-level destination before they exist. |
-| **Context and MCP** | Non-actionable placeholder | Two future connection groups occupy another top-level destination. |
+| **Task Types** | A repeated-item editor for task presets | A large configuration object was treated as a top-level product domain. |
+| **Permissions** | One default tool-permission policy | A single policy sat beside much broader compound domains. |
+| **Runtime & Storage** | One run limit plus two retention/output limits | Two unrelated product concerns were combined to save a tab. |
+| **Models and CLIs** | Non-actionable placeholder | Two future resource groups occupied a top-level destination before they existed. |
+| **Context and MCP** | Non-actionable placeholder | Two future connection groups occupied another top-level destination. |
 
-Additional observations:
+How the baseline was resolved in the adopted shell:
 
-- `muster.verification.hostRun` exists in contributed VS Code configuration but has no custom-webview home.
-- History retention is hidden under **History storage (Advanced)** even though it is a first-class data concern.
-- Long labels and text badges cause the five-tab row to scroll horizontally at narrow widths. The current implementation handles containment correctly, but discoverability still depends on horizontal scrolling.
-- The current ARIA tab roles, roving `tabindex`, ArrowLeft/ArrowRight wrapping, Home/End behavior, and topic-local state indicators are sound and should be retained.
+- **Task Types** became the **Task profiles** group under **Agents** (label change only; internal id/config key `muster.taskTypes` is unchanged).
+- **Permissions** became the **Tool access** section under **Execution** (`muster.permissions.mode`, unchanged semantics).
+- **Runtime & Storage** was split visually: its `runLimit` renders as the **Run limits** section under **Execution**, and its two retention/output numbers render as the **History** and **Outputs** sections under **Data**. The single `RuntimeStorageSettingsSnapshot` host surface is unchanged; only its fields are regrouped in the webview.
+- **Models and CLIs** and **Context and MCP** placeholder tabs were removed. No `Coming soon` tab is rendered; unavailable domains simply do not appear.
+
+Additional notes carried into the adopted shell:
+
+- `muster.verification.hostRun` still exists in contributed VS Code configuration but has no custom-webview home; it is a reserved destination in Execution (see [Verification staging and host contract](#verification-staging-and-host-contract)).
+- History retention is no longer hidden under a **History storage (Advanced)** disclosure. **History** and **Outputs** are now flat, first-class sections under **Data**.
+- The three-tab row fits in one row at 320 pixels without horizontal scrolling.
+- The ARIA tab roles, roving `tabindex`, ArrowLeft/ArrowRight wrapping, Home/End behavior, and domain-local state indicators are retained.
 
 ## Design principles
 
@@ -217,7 +224,7 @@ Entry test: changing the value changes agent selection or a reusable selection p
 | **Backends** | Future CLI discovery, installed/available status, executable selection, and backend defaults. |
 | **Models** | Future model catalog, preferred/default model, and backend-specific availability. |
 
-**Task profiles** is the preferred display name because the rows behave as reusable presets. Internal identifiers such as `task-types`, `taskType`, and `muster.taskTypes` can remain stable. If the product keeps **Task types** as the visible term, it must use that same term consistently in the overview, child title, actions, and help text.
+**Task profiles** is the adopted display name because the rows behave as reusable presets. Internal identifiers such as `task-types`, `taskType`, and `muster.taskTypes` remain stable. User-facing headings, actions, validation messages, help text, and accessible labels use **Task profiles** consistently.
 
 Backends and Models belong here because they are inputs to the profile editor. They should not become separate top-level tabs unless their product scope grows beyond agent configuration.
 
@@ -236,6 +243,48 @@ Entry test: changing the value affects a run after its agent/backend/model has a
 | **Verification** | `muster.verification.hostRun` and future verification-execution policies. |
 
 **Tool access** is more precise than **Permissions** because the current policy affects agent tool requests, not VS Code permissions, account roles, or all security behavior.
+
+#### Verification staging and host contract
+
+`muster.verification.hostRun` currently has a runtime read path but no Settings snapshot/update path. The engine resolves it live at settle time as a fail-closed authorization gate. That runtime read is not sufficient evidence that the custom webview owns an editable setting.
+
+The refactor therefore follows these rules:
+
+1. **Do not add `hostRun` to `RuntimeStorageSettingsSnapshot`.** Verification is an Execution policy with boolean validation, security copy, and live-revocation semantics. Combining it with runtime/storage numeric fields would recreate the cross-domain contract this redesign is intended to remove.
+2. **Do not render an editable or disabled Verification child before a host contract exists.** A planned destination in this document is not an actionable Settings destination.
+3. **Keep native VS Code Settings as the current edit path.** This refactor does not add an **Open Muster settings in VS Code** link because that action would require a new host command/message. Native Settings navigation can be added later only with its own explicit host contract.
+4. **Require a dedicated Verification contract before custom UI.** The contract lands before or in the same change as the Verification control.
+
+The dedicated contract should contain:
+
+```text
+requestVerificationSettings
+  -> verificationSettingsSnapshot { hostRun, defaultHostRun, description, targetScope }
+
+updateVerificationSettings { hostRun: boolean }
+  -> verificationSettingsUpdateResult
+  -> refreshed verificationSettingsSnapshot on success
+```
+
+Its host implementation owns:
+
+- an exact-boolean runtime guard and host validator;
+- fallback to the contributed default `false` for malformed stored values;
+- `ConfigurationTarget.Workspace` for custom-webview writes and truthful `Workspace` scope copy;
+- sanitized write failures and a refreshed snapshot after successful writes;
+- no mutation when the payload is malformed or the write fails.
+
+The refactor does not silently change the contributed setting's schema scope or add folder-aware runtime resolution. Native VS Code Settings remains the path for other supported scopes. If per-folder verification is proposed later, its runtime read must become resource-aware in the same change; UI scope alone must not imply semantics the engine does not implement.
+
+Its UI copy must explain all three gates:
+
+- the workspace setting must be enabled;
+- the verification task brief must opt in with `verification.hostRun`;
+- the workspace must still be trusted immediately before execution.
+
+Effective-time copy must say that the value is read live at settle time. Turning it off revokes host verification for the next eligible settle without reload; turning it on does not itself run commands or bypass the task-level opt-in and workspace-trust gates.
+
+The contract remains separate from Permission settings even though both are security-sensitive: Tool access governs backend tool-permission requests, while Verification authorizes Muster host execution of declared verification commands. Their failures, drafts, indicators, and audit semantics stay local to their own child groups.
 
 ### Connections
 
@@ -293,7 +342,7 @@ Agents | Execution | Data
 ```
 
 - Agents renders Task profiles.
-- Execution renders Run limits and Tool access; Verification is added when the custom surface gains a host-backed snapshot/update path, or it links to the native setting until then.
+- Execution renders Run limits and Tool access. Verification is not rendered as a child until its dedicated host-backed snapshot/update contract exists; native VS Code Settings remains its edit path in the meantime.
 - Data renders History and Outputs.
 
 If a domain has only one actionable child, skip a redundant child navigator and render the child section directly.
@@ -326,7 +375,7 @@ Each domain page contains:
 2. one short description;
 3. optional scope/status metadata;
 4. child groups in priority order;
-5. topic-local feedback and actions.
+5. domain-local feedback and actions.
 
 Do not repeat the selected domain label as both the tab label and an otherwise empty section heading. The headings below the domain title should be child groups such as **Run limits** or **History**.
 
@@ -473,20 +522,20 @@ Only after these answers are stable should the setting receive a control in the 
 ### Step 7: Verify the placement
 
 - Compare its breadth with every sibling group.
-- Verify 320-pixel layout, keyboard navigation, state restoration, and topic-local errors.
+- Verify 320-pixel layout, keyboard navigation, state restoration, and domain-local errors.
 - Verify that a hidden/unavailable future control does not create an empty navigation destination.
 - Update this design document, [SETTINGS.md](SETTINGS.md), tests, and evidence claims together when the implemented taxonomy changes.
 
 ## Migration considerations
 
-Changing the current shell requires a coordinated migration rather than label-only edits:
+The adopted shell used a coordinated migration rather than label-only edits:
 
 - map old topic IDs to new domain and child IDs;
 - migrate `muster.settingsView.v1` active-topic state and preserve valid drafts;
 - aggregate existing Task Types, Permissions, and Retention indicators at the new parent-domain level;
-- keep host save contracts topic-local even when several topics share a domain page;
+- keep host save contracts group-local even when several groups share a domain page;
 - update Playwright selectors and keyboard-order expectations;
-- update the current five-topic contract in [SETTINGS.md](SETTINGS.md), documentation verifiers, and live-host evidence scenarios;
+- update the implementation contract in [SETTINGS.md](SETTINGS.md), documentation verifiers, and live-host evidence scenarios;
 - preserve zero mutation for anything still unavailable during a staged rollout.
 
 Suggested migration mapping:

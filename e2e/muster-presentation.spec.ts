@@ -206,6 +206,26 @@ test('keeps presentation chrome compact, aligned, and overflow-safe', async ({ p
   await expect(page.getByRole('button', { name: 'Open linked chat' })).toBeVisible();
 });
 
+test('expands a long table of contents without an internal scrollbar', async ({ page }) => {
+  await page.setViewportSize({ width: 895, height: 720 });
+  const headings = Array.from(
+    { length: 12 },
+    (_, index) => `## Section ${index + 1}\n\nSection ${index + 1} content.`,
+  ).join('\n\n');
+  await openPresentation(page, presentation({ markdown: `# Long plan\n\n${headings}` }));
+
+  const toc = page.getByRole('navigation', { name: 'Contents' });
+  await expect(toc).toBeVisible();
+  await expect(toc.getByRole('link')).toHaveCount(13);
+  const overflow = await toc.evaluate((element) => ({
+    clientHeight: element.clientHeight,
+    scrollHeight: element.scrollHeight,
+    overflowY: getComputedStyle(element).overflowY,
+  }));
+  expect(overflow.scrollHeight).toBe(overflow.clientHeight);
+  expect(overflow.overflowY).toBe('visible');
+});
+
 test('sanitizes hostile markup and routes only annotated links through the host', async ({ page }) => {
   await openPresentation(page);
   await postUpdate(page, presentation({

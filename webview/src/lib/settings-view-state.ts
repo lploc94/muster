@@ -1,10 +1,14 @@
 /**
  * Versioned Settings view-state envelope for webview hide/reveal.
  *
- * Persists only the active topic and non-sensitive Task Types / Retention /
- * Permissions drafts through vscode.getState / setState. Not a generic topic
- * registry — host save contracts remain explicit per domain. Errors and raw
- * host failure payloads are never stored in the envelope.
+ * Persists only the active domain and non-sensitive Task profiles / runtime &
+ * storage / permission drafts through vscode.getState / setState. Not a generic
+ * topic registry — host save contracts remain explicit per config surface.
+ * Errors and raw host failure payloads are never stored in the envelope.
+ *
+ * v3 adopts the four-domain product taxonomy (Agents / Execution / Connections /
+ * Data). Only actionable domains render, so persisted navigation uses the
+ * rendered domain ids and legacy v1/v2 topic ids are migrated on restore.
  */
 
 import type {
@@ -24,7 +28,23 @@ import { isSettingsTopicId, type SettingsTopicId } from './settings-topics';
 export const SETTINGS_VIEW_STATE_KEY = 'muster.settingsView.v1';
 
 /** Envelope version — bump only with a coordinated migration. */
-export const SETTINGS_VIEW_STATE_VERSION = 2 as const;
+export const SETTINGS_VIEW_STATE_VERSION = 3 as const;
+
+/**
+ * Legacy (v1/v2) flat topic ids mapped to the rendered v3 product domain.
+ * Task Types → Agents; Permissions → Execution (Tool access); Runtime & Storage →
+ * Data (History/Outputs; the runLimit control also lives under Execution but the
+ * saved domain id for a Runtime & Storage tab is Data). Models and CLIs / Context
+ * and MCP were non-actionable placeholders; both fall back to Agents because
+ * Connections is not a rendered domain yet.
+ */
+const LEGACY_TOPIC_ID_MIGRATION: Readonly<Record<string, SettingsTopicId>> = {
+  'task-types': 'agents',
+  permissions: 'execution',
+  retention: 'data',
+  'models-and-clis': 'agents',
+  'context-and-mcp': 'agents',
+};
 
 /** Bounds aligned with host task-type constraints (fail closed on restore). */
 export const SETTINGS_TASK_TYPE_DRAFT_MAX = 32;
@@ -50,7 +70,10 @@ export const RETENTION_SETTING_LABELS: Record<RuntimeStorageSettingId, string> =
   maxStoredOutputChars: 'Stored output per turn',
 };
 
-export type SettingsTabIndicator = { kind: string; label: string };
+export type SettingsTabIndicator = {
+  kind: 'saving' | 'error' | 'dirty' | 'diagnostic' | 'saved';
+  label: string;
+};
 
 export interface RetentionUpdateUiState {
   drafts: RetentionDrafts;
@@ -58,6 +81,12 @@ export interface RetentionUpdateUiState {
   localFieldErrors: Partial<Record<RuntimeStorageSettingId, string>>;
   error: string | null;
   savedMessage: string | null;
+  /**
+   * settingId that owns `error` / `savedMessage`, used to route banner feedback to
+   * the domain that hosts that field (runLimit → Execution; retention numbers →
+   * Data). Null when a failure carries no attributable owner (Settings-level).
+   */
+  feedbackOwner: RuntimeStorageSettingId | null;
   /** Present only on successful host write — App applies this to the saved snapshot. */
   confirmed?: { settingId: RuntimeStorageSettingId; value: number | RunLimitSetting };
 }
@@ -65,10 +94,16 @@ export interface RetentionUpdateUiState {
 export interface SettingsViewState {
   v: typeof SETTINGS_VIEW_STATE_VERSION;
   activeTopicId: SettingsTopicId;
-  /** Present when the user has an in-progress Task Types draft (including empty). */
+  /** Present when the user has an in-progress Task profiles draft (including empty). */
   taskTypeDrafts?: TaskTypeSettingsRow[];
   /** Present when the user has in-progress Retention field drafts. */
   retentionDrafts?: RetentionDrafts;
+  /**
+   * Exact runtime/storage fields that were dirty when the v3 envelope was
+   * written. The full draft record stays unchanged; this metadata lets the
+   * first host snapshot after hide/reveal hydrate pristine fields independently.
+   */
+  retentionDirtySettingIds?: RuntimeStorageSettingId[];
   /** Present when the user has an in-progress Permissions mode draft. */
   permissionDraftMode?: PermissionModeSetting;
 }
@@ -184,8 +219,45 @@ function parseRetentionDrafts(raw: unknown): RetentionDrafts | null {
 export function createDefaultSettingsViewState(): SettingsViewState {
   return {
     v: SETTINGS_VIEW_STATE_VERSION,
-    activeTopicId: 'task-types',
+    activeTopicId: 'agents',
   };
+}
+
+/**
+ * Resolve a persisted active-topic id to a rendered v3 domain. A v3 envelope
+ * accepts only current domain ids; v1/v2 envelopes migrate only the five known
+ * legacy topic ids. Everything else is rejected fail-closed.
+ */
+function resolveActiveTopicId(
+  raw: unknown,
+  version: 1 | 2 | typeof SETTINGS_VIEW_STATE_VERSION,
+): SettingsTopicId | null {
+  if (version === SETTINGS_VIEW_STATE_VERSION) {
+    return isSettingsTopicId(raw) ? raw : null;
+  }
+  if (
+    typeof raw === 'string' &&
+    Object.prototype.hasOwnProperty.call(LEGACY_TOPIC_ID_MIGRATION, raw)
+  ) {
+    return LEGACY_TOPIC_ID_MIGRATION[raw] ?? null;
+  }
+  return null;
+}
+
+function parseRuntimeStorageSettingIds(raw: unknown): RuntimeStorageSettingId[] | null {
+  if (!Array.isArray(raw)) return null;
+  const out: RuntimeStorageSettingId[] = [];
+  const seen = new Set<RuntimeStorageSettingId>();
+  for (const value of raw) {
+    if (typeof value !== 'string' || !RETENTION_IDS.includes(value as RuntimeStorageSettingId)) {
+      return null;
+    }
+    const id = value as RuntimeStorageSettingId;
+    if (seen.has(id)) return null;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
 }
 
 export function createEmptyRetentionDrafts(): RetentionDrafts {
@@ -224,12 +296,13 @@ export function cloneRetentionDrafts(drafts: RetentionDrafts): RetentionDrafts {
  */
 export function parseSettingsViewState(raw: unknown): SettingsViewState | null {
   if (!isRecord(raw)) return null;
-  if (raw.v !== SETTINGS_VIEW_STATE_VERSION && raw.v !== 1) return null;
-  if (!isSettingsTopicId(raw.activeTopicId)) return null;
+  if (raw.v !== SETTINGS_VIEW_STATE_VERSION && raw.v !== 1 && raw.v !== 2) return null;
+  const activeTopicId = resolveActiveTopicId(raw.activeTopicId, raw.v);
+  if (activeTopicId === null) return null;
 
   const state: SettingsViewState = {
     v: SETTINGS_VIEW_STATE_VERSION,
-    activeTopicId: raw.activeTopicId,
+    activeTopicId,
   };
 
   if ('taskTypeDrafts' in raw) {
@@ -254,6 +327,13 @@ export function parseSettingsViewState(raw: unknown): SettingsViewState | null {
     state.retentionDrafts = drafts;
   }
 
+  if ('retentionDirtySettingIds' in raw) {
+    if (raw.v !== SETTINGS_VIEW_STATE_VERSION || !state.retentionDrafts) return null;
+    const ids = parseRuntimeStorageSettingIds(raw.retentionDirtySettingIds);
+    if (!ids) return null;
+    state.retentionDirtySettingIds = ids;
+  }
+
   if ('permissionDraftMode' in raw) {
     if (!isPermissionModeSetting(raw.permissionDraftMode)) return null;
     state.permissionDraftMode = raw.permissionDraftMode;
@@ -273,6 +353,9 @@ export function serializeSettingsViewState(state: SettingsViewState): SettingsVi
   }
   if (state.retentionDrafts) {
     out.retentionDrafts = cloneRetentionDrafts(state.retentionDrafts);
+  }
+  if (state.retentionDirtySettingIds) {
+    out.retentionDirtySettingIds = [...state.retentionDirtySettingIds];
   }
   if (state.permissionDraftMode !== undefined) {
     out.permissionDraftMode = state.permissionDraftMode;
@@ -363,6 +446,40 @@ export function isRetentionDraftsDirty(
   return false;
 }
 
+/**
+ * Runtime & Storage config keys grouped by rendered domain. The single host
+ * snapshot is split visually: the run-limit enum lives under Execution, while
+ * the history/output number fields live under Data.
+ */
+export const EXECUTION_RUNTIME_STORAGE_IDS: readonly RuntimeStorageSettingId[] = [
+  'runLimit',
+] as const;
+export const DATA_RUNTIME_STORAGE_IDS: readonly RuntimeStorageSettingId[] = [
+  'maxRetainedTurnsPerTask',
+  'maxStoredOutputChars',
+] as const;
+
+/**
+ * True when any draft in `ids` differs from the saved snapshot value. Subset
+ * variant of {@link isRetentionDraftsDirty} so a dirty Data field never marks
+ * the Execution run-limit dirty (and vice versa).
+ */
+export function isRuntimeStorageDraftDirtyFor(
+  ids: readonly RuntimeStorageSettingId[],
+  drafts: RetentionDrafts | undefined | null,
+  snapshot: RuntimeStorageSettingsSnapshot | null | undefined,
+): boolean {
+  if (!drafts || !snapshot) return false;
+  const wanted = new Set(ids);
+  for (const setting of snapshot.settings) {
+    if (!wanted.has(setting.id)) continue;
+    const draft = drafts[setting.id];
+    if (draft === undefined) continue;
+    if (draft.trim() !== String(setting.value)) return true;
+  }
+  return false;
+}
+
 /** True when the permission draft mode differs from the last saved snapshot mode. */
 export function isPermissionDraftDirty(
   draft: PermissionModeSetting | undefined | null,
@@ -373,27 +490,72 @@ export function isPermissionDraftDirty(
 }
 
 /**
- * Apply a host retention snapshot into draft strings.
- * When `dirty` is true, preserve user edits unchanged — except a blank `runLimit`
- * left by v1 migration, which is still absent data and hydrates once from host.
+ * Apply a host snapshot into draft strings field-by-field.
+ *
+ * The Runtime & Storage snapshot backs two rendered domains (Execution's run
+ * limit and Data's history/output numbers). Hydration must therefore decide per
+ * field: a field the user has edited (dirty) is preserved, while a pristine
+ * field always takes the incoming saved value. This means a dirty Data field can
+ * never block a pristine Execution run-limit from refreshing, and vice versa.
+ *
+ * "Dirty" is measured against `prevSnapshot` (the last saved snapshot the drafts
+ * were hydrated from) — a field whose draft still matches the previously saved
+ * value is pristine and refreshes; a field the user changed away from it is
+ * preserved. On the first snapshot after restore, v3 dirty-field metadata makes
+ * the same decision without a prior in-memory snapshot; legacy envelopes without
+ * that metadata are preserved conservatively.
+ *
+ * The v1-migration special case is preserved: a blank `runLimit` left behind by
+ * an old envelope is treated as absent data and hydrates once from the host even
+ * though it differs from any previously saved value.
  */
-export function applyRetentionSnapshotToDrafts(
+export function applyRuntimeStorageSnapshotToDrafts(
   current: RetentionDrafts | null | undefined,
   snapshot: RuntimeStorageSettingsSnapshot,
-  dirty: boolean,
+  prevSnapshot?: RuntimeStorageSettingsSnapshot | null,
+  restoredDirtySettingIds?: readonly RuntimeStorageSettingId[],
 ): RetentionDrafts {
-  if (dirty && current) {
-    const next = cloneRetentionDrafts(current);
-    // Only the migration-missing runtime enum is filled; cleared number fields stay empty.
-    if (next.runLimit.trim() === '') {
-      const runLimit = snapshot.settings.find((s) => s.id === 'runLimit');
-      if (runLimit) next.runLimit = String(runLimit.value);
-    }
-    return next;
+  // No drafts at all → hydrate fully from host.
+  if (!current) {
+    const fresh = createEmptyRetentionDrafts();
+    for (const setting of snapshot.settings) fresh[setting.id] = String(setting.value);
+    return fresh;
   }
-  const next = createEmptyRetentionDrafts();
+
+  const next = cloneRetentionDrafts(current);
+  const prevById = new Map<RuntimeStorageSettingId, string>();
+  for (const setting of prevSnapshot?.settings ?? []) {
+    prevById.set(setting.id, String(setting.value));
+  }
+
   for (const setting of snapshot.settings) {
-    next[setting.id] = String(setting.value);
+    const incoming = String(setting.value);
+    const draft = current[setting.id];
+
+    let fieldDirty: boolean;
+    if (!prevSnapshot) {
+      // A v3 envelope records the exact dirty field ids so pristine siblings can
+      // take a fresh host value on the first snapshot after hide/reveal. Older
+      // envelopes lack that metadata; preserve their fields conservatively.
+      fieldDirty = restoredDirtySettingIds
+        ? restoredDirtySettingIds.includes(setting.id)
+        : draft !== undefined;
+    } else {
+      // Incidental refresh: a field is pristine when its draft still equals the
+      // value it was last hydrated from (prevSnapshot). Pristine fields take the
+      // incoming value; edited fields are preserved.
+      const prevValue = prevById.get(setting.id);
+      fieldDirty = draft !== undefined && draft.trim() !== (prevValue ?? '');
+    }
+
+    if (!fieldDirty) {
+      next[setting.id] = incoming;
+      continue;
+    }
+    // Dirty field is preserved, except the migration-blank runtime enum.
+    if (setting.id === 'runLimit' && draft.trim() === '') {
+      next.runLimit = incoming;
+    }
   }
   return next;
 }
@@ -427,9 +589,9 @@ export function applyPermissionSnapshotToDraft(
 }
 
 /**
- * Reduce a host settingsUpdateResult into Retention-local UI state.
+ * Reduce a host settingsUpdateResult into owner-aware Runtime & Storage UI state.
  * Drafts are never rehydrated to saved on failure; only confirmed success updates one field.
- * Task Types state is intentionally not part of this reducer.
+ * Task profiles state is intentionally not part of this reducer.
  */
 export function reduceRetentionUpdateResult(
   prev: {
@@ -438,6 +600,7 @@ export function reduceRetentionUpdateResult(
     localFieldErrors: Partial<Record<RuntimeStorageSettingId, string>>;
   },
   result: SettingsUpdateResult,
+  pendingSettingId: RuntimeStorageSettingId | null = null,
 ): RetentionUpdateUiState {
   const drafts = cloneRetentionDrafts(prev.drafts);
   const fieldErrors = { ...prev.fieldErrors };
@@ -453,6 +616,7 @@ export function reduceRetentionUpdateResult(
       localFieldErrors,
       error: null,
       savedMessage: `Saved ${RETENTION_SETTING_LABELS[result.settingId]}.`,
+      feedbackOwner: result.settingId,
       confirmed: { settingId: result.settingId, value: result.value },
     };
   }
@@ -465,6 +629,7 @@ export function reduceRetentionUpdateResult(
         localFieldErrors,
         error: `Unable to save ${RETENTION_SETTING_LABELS[result.settingId]}. Check the VS Code setting and try again.`,
         savedMessage: null,
+        feedbackOwner: result.settingId,
       };
     }
     return {
@@ -473,15 +638,19 @@ export function reduceRetentionUpdateResult(
       localFieldErrors,
       error: null,
       savedMessage: null,
+      feedbackOwner: result.settingId,
     };
   }
 
+  // unknownSetting omits settingId by protocol. Attribute it to the pending save
+  // when available; unsolicited/unmatched failures remain Settings-level.
   return {
     drafts,
     fieldErrors,
     localFieldErrors,
     error: 'Unable to load or save settings. Check the VS Code setting and try again.',
     savedMessage: null,
+    feedbackOwner: pendingSettingId,
   };
 }
 
@@ -505,23 +674,66 @@ export function retentionDraftValidationMessage(
   return null;
 }
 
-/** Topic-local Retention tab badge priority: saving > error > dirty > saved. */
-export function retentionTabIndicator(input: {
-  saving: boolean;
-  error: string | null;
-  fieldErrors: Partial<Record<RuntimeStorageSettingId, string>>;
-  localFieldErrors: Partial<Record<RuntimeStorageSettingId, string>>;
-  dirty: boolean;
-  savedMessage: string | null;
-}): SettingsTabIndicator | null {
-  if (input.saving) return { kind: 'saving', label: 'Saving' };
-  const hasFieldError =
-    Object.values(input.fieldErrors).some((v) => Boolean(v)) ||
-    Object.values(input.localFieldErrors).some((v) => Boolean(v));
-  if (input.error || hasFieldError) return { kind: 'error', label: 'Error' };
+/**
+ * Runtime & Storage tab indicator scoped to a subset of setting ids.
+ *
+ * Only field-errors, dirty state, saving, and saved feedback attributable to a
+ * setting in `ids` count — so the Execution run-limit and the Data history/output
+ * fields produce independent indicators from the one shared host snapshot. The
+ * shared `error` / `savedMessage` banners belong to a single `feedbackOwner`
+ * setting and only count for the subset that owns them.
+ */
+export function runtimeStorageTabIndicatorFor(
+  ids: readonly RuntimeStorageSettingId[],
+  input: {
+    savingSettingId: RuntimeStorageSettingId | null;
+    error: string | null;
+    feedbackOwner: RuntimeStorageSettingId | null;
+    fieldErrors: Partial<Record<RuntimeStorageSettingId, string>>;
+    localFieldErrors: Partial<Record<RuntimeStorageSettingId, string>>;
+    dirty: boolean;
+    savedMessage: string | null;
+  },
+): SettingsTabIndicator | null {
+  const wanted = new Set(ids);
+  const ownedByThisSubset = input.feedbackOwner !== null && wanted.has(input.feedbackOwner);
+
+  if (input.savingSettingId !== null && wanted.has(input.savingSettingId)) {
+    return { kind: 'saving', label: 'Saving' };
+  }
+  const hasFieldError = ids.some(
+    (id) => Boolean(input.fieldErrors[id]) || Boolean(input.localFieldErrors[id]),
+  );
+  if ((input.error && ownedByThisSubset) || hasFieldError) {
+    return { kind: 'error', label: 'Error' };
+  }
   if (input.dirty) return { kind: 'dirty', label: 'Unsaved' };
-  if (input.savedMessage) return { kind: 'saved', label: 'Saved' };
+  if (input.savedMessage && ownedByThisSubset) return { kind: 'saved', label: 'Saved' };
   return null;
+}
+
+/**
+ * Merge several tab indicators into one, respecting a fixed severity order:
+ * saving > error > dirty > needs-attention (diagnostic) > saved. Used to fold a
+ * domain that renders multiple config surfaces (e.g. Execution = run limit +
+ * permission mode) into a single tab badge. Null inputs are ignored.
+ */
+export function mergeSettingsIndicators(
+  ...indicators: (SettingsTabIndicator | null | undefined)[]
+): SettingsTabIndicator | null {
+  const order = ['saving', 'error', 'dirty', 'diagnostic', 'saved'];
+  let best: SettingsTabIndicator | null = null;
+  let bestRank = order.length;
+  for (const indicator of indicators) {
+    if (!indicator) continue;
+    const rank = order.indexOf(indicator.kind);
+    const effectiveRank = rank < 0 ? order.length - 1 : rank;
+    if (effectiveRank < bestRank) {
+      best = indicator;
+      bestRank = effectiveRank;
+    }
+  }
+  return best;
 }
 
 /**

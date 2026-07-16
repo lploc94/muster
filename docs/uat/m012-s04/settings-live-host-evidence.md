@@ -2,7 +2,7 @@
 
 ## Proof Boundary
 
-This tracked ledger is the acceptance contract for the assembled five-topic Muster Settings experience in a real VS Code Extension Development Host. Only direct observation in that host may establish `PASS` or `FAIL`. Unit, browser, and Playwright checks are supportive only and cannot establish a live verdict for keyboard tab focus, Task Types persistence, permission mode policy, pending-permission isolation, retention persistence, hide/reveal restoration, 320px reflow, placeholder no-op, or final cleanup. Each verdict is scenario-local.
+This tracked ledger is the acceptance contract for the assembled three-domain Muster Settings experience (Agents, Execution, Data; Connections reserved and not rendered) in a real VS Code Extension Development Host. Only direct observation in that host may establish `PASS` or `FAIL`. Unit, browser, and Playwright checks are supportive only and cannot establish a live verdict for keyboard tab focus, Task profiles persistence, permission mode policy, pending-permission isolation, retention persistence, hide/reveal restoration, 320px reflow, cross-domain feedback isolation, or final cleanup. Each verdict is scenario-local.
 
 T02 detected the available launch surface and evaluated whether this agent session could control and observe a real Extension Development Host Settings UI. A VS Code launcher was available (`code` 1.128.1), but the session was non-interactive and exposed neither desktop UI automation nor a controllable webview keyboard surface. PowerShell UIAutomation assemblies load, yet no agent-accessible automation driver can focus Muster Chat, open Settings, drive tabs, or inspect host-owned persistence. Launching an unobservable host would not produce direct evidence, so every affected scenario remains independently `ENVIRONMENT BLOCKED`; local automated checks remain supporting-only.
 
@@ -11,7 +11,7 @@ T02 detected the available launch surface and evaluated whether this agent sessi
 ### SETTINGS-TAB-KEYBOARD-FOCUS
 - Verdict: ENVIRONMENT BLOCKED
 - Timestamp: 2026-07-16T00:37:52Z
-- Expected: Open Settings in the live host, focus the topic tablist, and observe ArrowLeft/ArrowRight wrap, Home, End, mouse activation, Tab into the panel, and WAI-ARIA selected/controlled relationships across all five topics.
+- Expected: Open Settings in the live host, focus the topic tablist, and observe ArrowLeft/ArrowRight wrap, Home, End, mouse activation, Tab into the panel, and WAI-ARIA selected/controlled relationships across the three rendered domains (Agents, Execution, Data).
 - Observed: Launcher discovery found VS Code, but the non-interactive session could not open Settings or inject keyboard focus into the live webview tablist.
 - Blocker: Attempted: detect a VS Code launcher and a desktop accessibility or host UI control surface for Settings tab focus and keyboard traversal. Blocker: the session has no desktop accessibility surface, so host UI state cannot be controlled or directly observed.
 - Cleanup: No Settings UI, tab focus, or host window was created; later live runs must close Settings and restore focus to the chat surface.
@@ -20,10 +20,10 @@ T02 detected the available launch surface and evaluated whether this agent sessi
 ### SETTINGS-TASK-TYPES-PERSISTENCE
 - Verdict: ENVIRONMENT BLOCKED
 - Timestamp: 2026-07-16T00:37:52Z
-- Expected: Change a Task Types host-owned value, save successfully, reload the Extension Development Host, and observe the saved snapshot restored without drafts, secrets, or machine-local path leakage.
-- Observed: Task Types host-backed update and post-reload restoration could not be driven or inspected without live Settings control.
-- Blocker: Attempted: detect a controllable host surface for Task Types save, reload, and snapshot inspection. Blocker: desktop UI automation and live webview inspection are unavailable in this session.
-- Cleanup: No Task Types draft or saved value was mutated; later live runs must restore prior Task Types snapshots after scenario saves.
+- Expected: Change a Task profiles (Agents domain) host-owned value, save successfully, reload the Extension Development Host, and observe the saved snapshot restored without drafts, secrets, or machine-local path leakage.
+- Observed: Task profiles host-backed update and post-reload restoration could not be driven or inspected without live Settings control.
+- Blocker: Attempted: detect a controllable host surface for Task profiles save, reload, and snapshot inspection. Blocker: desktop UI automation and live webview inspection are unavailable in this session.
+- Cleanup: No Task profiles draft or saved value was mutated; later live runs must restore prior Task profiles snapshots after scenario saves.
 - Evidence: supportive-only: scripts/verify-settings-live-host-evidence.test.mjs
 
 ### SETTINGS-PERMISSION-MODE-POLICY
@@ -71,13 +71,13 @@ T02 detected the available launch surface and evaluated whether this agent sessi
 - Cleanup: No host window was resized; later live runs must restore the prior webview size after measurement.
 - Evidence: supportive-only: scripts/verify-settings-live-host-evidence.test.mjs
 
-### SETTINGS-PLACEHOLDER-NOOP
+### SETTINGS-DOMAIN-FEEDBACK-ISOLATION
 - Verdict: ENVIRONMENT BLOCKED
 - Timestamp: 2026-07-16T00:37:52Z
-- Expected: Activate both Coming soon topics, interact with their placeholder panels, and observe zero host mutation, no save requests, and no draft or snapshot changes in active topics.
-- Observed: Placeholder no-op behavior could not be activated or inspected in a live Extension Development Host.
-- Blocker: Attempted: detect a controllable host surface for selecting Coming soon topics and confirming zero host mutation. Blocker: desktop UI automation is unavailable in this non-interactive session.
-- Cleanup: No placeholder interaction or host mutation occurred; later live runs must still verify no residual drafts after placeholder visits.
+- Expected: In the live host, save the Execution Run limits control and the Data History/Outputs controls in turn, and observe that saved/error/dirty feedback stays within its owning domain — a Run limit result never renders in Data and a History/Outputs result never renders in Execution — while the shared Runtime & Storage host snapshot backs both.
+- Observed: Cross-domain feedback isolation between the Execution run-limit control and the Data history/output controls could not be driven or inspected without live Settings control.
+- Blocker: Attempted: detect a controllable host surface for saving the Execution run limit and Data history/output values and observing per-domain feedback routing. Blocker: desktop UI automation and live webview inspection are unavailable in this non-interactive session.
+- Cleanup: No Execution or Data value was mutated; later live runs must restore prior Runtime & Storage snapshots after scenario saves.
 - Evidence: supportive-only: scripts/verify-settings-live-host-evidence.test.mjs
 
 ### SETTINGS-FINAL-CLEANUP
@@ -106,7 +106,7 @@ T02 detected the available launch surface and evaluated whether this agent sessi
 | Evidence filesystem | Ledger is missing, unreadable, or empty. | The Node verifier fails and bubbles the diagnostic; evidence is not accepted. |
 | Manual ledger editing | A scenario, field, verdict, timestamp, blocker detail, cleanup action, or evidence reference is malformed or omitted. | Fixture-backed assertions fail closed and identify the scenario or field. |
 | VS Code Extension Development Host | Launcher is absent, launch times out, UI control is lost, or reload is unavailable. | Record `ENVIRONMENT BLOCKED` separately for every affected scenario with attempted step and concrete blocker. |
-| Settings host protocol | Host update fails, times out, or returns a sanitized error for Task Types, Permissions, or Retention. | Record `FAIL` with bounded observed sanitized feedback when reproducible in the live host; never paste machine-local paths, secrets, or unredacted exceptions. |
+| Settings host protocol | Host update fails, times out, or returns a sanitized error for Task profiles (Agents), Run limits or Tool access (Execution), or History/Outputs (Data). | Record `FAIL` with bounded observed sanitized feedback when reproducible in the live host; never paste machine-local paths, secrets, or unredacted exceptions. |
 | Pending permission prompts | Prompt cannot be staged, dismissed, or isolated from Settings mutation. | Block only isolation scenarios when prompts cannot be controlled; do not infer isolation from Playwright. |
 | Webview viewport control | Host window cannot be resized to 320px or inspected for overflow. | Record `ENVIRONMENT BLOCKED` for reflow when window control is unavailable; do not promote browser viewport checks to native proof. |
 | Evidence hygiene | Text includes a secret marker, absolute path, unredacted runtime claim, placeholder, or mocked-live promotion. | The verifier rejects the entire ledger. |

@@ -34,15 +34,17 @@
   import { outboxList, outboxMarkRejected, outboxPending, outboxRejected, outboxRemove } from './lib/send-outbox';
   import { selectTask as navSelectTask } from './lib/task-nav';
   import {
+    DATA_RUNTIME_STORAGE_IDS,
+    EXECUTION_RUNTIME_STORAGE_IDS,
     SETTINGS_VIEW_STATE_VERSION,
     applyPermissionSnapshotToDraft,
-    applyRetentionSnapshotToDrafts,
+    applyRuntimeStorageSnapshotToDrafts,
     applyTaskTypesSnapshotToDrafts,
     cloneRetentionDrafts,
     cloneTaskTypeDrafts,
     createEmptyRetentionDrafts,
     isPermissionDraftDirty,
-    isRetentionDraftsDirty,
+    isRuntimeStorageDraftDirtyFor,
     isTaskTypeDraftsDirty,
     readSettingsViewState,
     reducePermissionSettingsUpdateResult,
@@ -107,8 +109,14 @@
   let settingsSavingSettingId = $state<RuntimeStorageSettingId | null>(null);
   /** Retention-local success banner (never shown on Task Types). */
   let retentionSavedMessage = $state<string | null>(null);
-  /** Retention-local alert for host write/load failures (never shown on Task Types). */
+  /** Runtime & Storage host write/load failure, routed to its owning domain only. */
   let retentionError = $state<string | null>(null);
+  /**
+   * settingId that owns the current retentionError / retentionSavedMessage so the
+   * panel renders the banner in the domain that hosts that field (runLimit →
+   * Execution; retention numbers → Data). Null = Settings-level (no owner).
+   */
+  let retentionFeedbackOwner = $state<RuntimeStorageSettingId | null>(null);
   /** Host-side field errors for Retention (validation codes from settingsUpdateResult). */
   let retentionFieldErrors = $state<Partial<Record<RuntimeStorageSettingId, string>>>({});
   let taskTypesSnapshot = $state<TaskTypesSettingsSnapshot | null>(null);
@@ -139,6 +147,18 @@
       ? cloneRetentionDrafts(restoredSettingsView.retentionDrafts)
       : undefined,
   );
+  /**
+   * Exact dirty runtime/storage fields restored from a v3 envelope. Consumed by
+   * the first host snapshot so pristine fields in the other domain still refresh.
+   * Undefined means legacy/no metadata and therefore uses conservative restore.
+   */
+  let pendingRetentionRestoreDirtySettingIds = $state<
+    RuntimeStorageSettingId[] | undefined
+  >(
+    restoredSettingsView.retentionDirtySettingIds
+      ? [...restoredSettingsView.retentionDirtySettingIds]
+      : undefined,
+  );
   /** undefined = not yet initialized from a host snapshot; array (incl. empty) = owned draft. */
   let taskTypeDrafts = $state<TaskTypeSettingsRow[] | undefined>(
     restoredSettingsView.taskTypeDrafts
@@ -158,6 +178,7 @@
       activeTopicId: SettingsTopicId;
       taskTypeDrafts?: TaskTypeSettingsRow[];
       retentionDrafts?: RetentionDrafts;
+      retentionDirtySettingIds?: RuntimeStorageSettingId[];
       permissionDraftMode?: PermissionModeSetting;
     } = {
       v: SETTINGS_VIEW_STATE_VERSION,
@@ -169,10 +190,22 @@
       envelope.taskTypeDrafts = cloneTaskTypeDrafts(taskTypeDrafts);
     }
     if (retentionDrafts !== undefined) {
-      const dirty =
-        !settingsSnapshot || isRetentionDraftsDirty(retentionDrafts, settingsSnapshot);
-      if (dirty) {
+      if (!settingsSnapshot) {
         envelope.retentionDrafts = cloneRetentionDrafts(retentionDrafts);
+        if (pendingRetentionRestoreDirtySettingIds !== undefined) {
+          envelope.retentionDirtySettingIds = [...pendingRetentionRestoreDirtySettingIds];
+        }
+      } else {
+        const dirtySettingIds = [
+          ...EXECUTION_RUNTIME_STORAGE_IDS,
+          ...DATA_RUNTIME_STORAGE_IDS,
+        ].filter((id) =>
+          isRuntimeStorageDraftDirtyFor([id], retentionDrafts, settingsSnapshot),
+        );
+        if (dirtySettingIds.length > 0) {
+          envelope.retentionDrafts = cloneRetentionDrafts(retentionDrafts);
+          envelope.retentionDirtySettingIds = dirtySettingIds;
+        }
       }
     }
     if (permissionDraftMode !== undefined) {
@@ -192,6 +225,17 @@
   }
 
   function setRetentionDrafts(next: RetentionDrafts) {
+    if (!settingsSnapshot && retentionDrafts) {
+      const changedIds = [
+        ...EXECUTION_RUNTIME_STORAGE_IDS,
+        ...DATA_RUNTIME_STORAGE_IDS,
+      ].filter((id) => next[id] !== retentionDrafts?.[id]);
+      if (changedIds.length > 0) {
+        pendingRetentionRestoreDirtySettingIds = [
+          ...new Set([...(pendingRetentionRestoreDirtySettingIds ?? []), ...changedIds]),
+        ];
+      }
+    }
     retentionDrafts = cloneRetentionDrafts(next);
     persistSettingsViewState();
   }
@@ -242,6 +286,7 @@
     // Keep Retention feedback scoped; do not clear dirty drafts on open.
     retentionError = null;
     retentionSavedMessage = null;
+    retentionFeedbackOwner = null;
     retentionFieldErrors = {};
     taskTypesLoading = !taskTypesSnapshot;
     taskTypesError = null;
@@ -281,7 +326,7 @@
 
   function applySettingsUpdateResult(result: SettingsUpdateResult) {
     settingsLoading = false;
-    settingsSavingSettingId = null;
+    const pendingSettingId = settingsSavingSettingId;
 
     const next = reduceRetentionUpdateResult(
       {
@@ -290,7 +335,9 @@
         localFieldErrors: retentionLocalFieldErrors,
       },
       result,
+      pendingSettingId,
     );
+    settingsSavingSettingId = null;
 
     // On host write failure: keep attempted draft, keep prior saved snapshot authoritative.
     // Never rehydrate inputs back to saved merely because an error arrived.
@@ -299,6 +346,9 @@
     retentionLocalFieldErrors = next.localFieldErrors;
     retentionError = next.error;
     retentionSavedMessage = next.savedMessage;
+    // Route the banner to the domain that owns the acted-on setting (runLimit →
+    // Execution; retention numbers → Data). Null owner = Settings-level failure.
+    retentionFeedbackOwner = next.feedbackOwner;
 
     if (next.confirmed) {
       updateSnapshotValue(next.confirmed.settingId, next.confirmed.value);
@@ -311,6 +361,8 @@
     settingsSavingSettingId = settingId;
     retentionSavedMessage = null;
     retentionError = null;
+    // The in-flight save owns feedback for its domain until the result routes it.
+    retentionFeedbackOwner = settingId;
     retentionFieldErrors = { ...retentionFieldErrors, [settingId]: undefined };
     post({ type: 'updateSetting', settingId, value });
   }
@@ -322,7 +374,7 @@
       // Force the following snapshot to replace drafts so Reset/Save clear dirty only after host success.
       taskTypesForceHydrate = true;
       taskTypesError = null;
-      taskTypesSavedMessage = 'Saved task types to workspace settings.';
+      taskTypesSavedMessage = 'Saved task profiles to workspace settings.';
       return;
     }
     // Failure: keep drafts + prior saved snapshot; never force-hydrate from a stale host read.
@@ -456,22 +508,22 @@
 
         case 'settingsSnapshot': {
           const next = msg.snapshot;
-          // Preserve owned drafts only when they already differ from saved/incoming.
-          // Uninitialized (undefined) drafts always hydrate from the snapshot.
-          // A later host snapshot may refresh saved state but cannot overwrite a dirty draft.
-          const dirtyAgainstIncoming =
-            retentionDrafts !== undefined &&
-            (isRetentionDraftsDirty(retentionDrafts, settingsSnapshot) ||
-              isRetentionDraftsDirty(retentionDrafts, next));
-          settingsSnapshot = next;
-          settingsLoading = false;
-          // Preserve Retention-local failure banners across incidental snapshots
-          // (mirrors Task Types). Success path already cleared error via update result.
-          retentionDrafts = applyRetentionSnapshotToDrafts(
+          const prev = settingsSnapshot;
+          // Hydrate field-by-field against the prior saved snapshot: a field whose
+          // draft still matches the previously saved value is pristine and takes the
+          // incoming value, while a field the user edited is preserved. This splits
+          // ownership across domains — a dirty Data field never blocks a pristine
+          // Execution run-limit from refreshing, and vice versa. Retention-local
+          // failure banners are preserved across incidental snapshots.
+          retentionDrafts = applyRuntimeStorageSnapshotToDrafts(
             retentionDrafts,
             next,
-            dirtyAgainstIncoming,
+            prev,
+            prev ? undefined : pendingRetentionRestoreDirtySettingIds,
           );
+          pendingRetentionRestoreDirtySettingIds = undefined;
+          settingsSnapshot = next;
+          settingsLoading = false;
           persistSettingsViewState();
           break;
         }
@@ -809,6 +861,7 @@
     savingSettingId={settingsSavingSettingId}
     savedMessage={retentionSavedMessage}
     retentionError={retentionError}
+    retentionFeedbackOwner={retentionFeedbackOwner}
     fieldErrors={retentionFieldErrors}
     localFieldErrors={retentionLocalFieldErrors}
     retentionDrafts={retentionDrafts ?? createEmptyRetentionDrafts()}

@@ -13,21 +13,24 @@
   import {
     SETTINGS_TOPICS,
     type SettingsTopicId,
-    getSettingsTopic,
     resolveSettingsTabKeyIntent,
     settingsPanelId,
     settingsTabId,
   } from '../lib/settings-topics';
   import {
+    DATA_RUNTIME_STORAGE_IDS,
+    EXECUTION_RUNTIME_STORAGE_IDS,
     PERMISSION_MODE_RISK_LABELS,
     RETENTION_SETTING_LABELS,
     isPermissionDraftDirty,
-    isRetentionDraftsDirty,
+    isRuntimeStorageDraftDirtyFor,
     isTaskTypeDraftsDirty,
+    mergeSettingsIndicators,
     retentionDraftValidationMessage,
-    retentionTabIndicator,
+    runtimeStorageTabIndicatorFor,
     permissionTabIndicator,
     type RetentionDrafts,
+    type SettingsTabIndicator,
   } from '../lib/settings-view-state';
 
   interface Props {
@@ -36,8 +39,14 @@
     loading: boolean;
     savingSettingId: RuntimeStorageSettingId | null;
     savedMessage: string | null;
-    /** Retention-local host write/load failure (never shown on Task Types). */
+    /** Runtime & Storage host write/load failure (routed to the owning domain only). */
     retentionError: string | null;
+    /**
+     * settingId that owns the current `retentionError` / `savedMessage`, so the
+     * banner renders only in the domain that hosts that field (runLimit →
+     * Execution; retention numbers → Data). Null = Settings-level (no owner).
+     */
+    retentionFeedbackOwner: RuntimeStorageSettingId | null;
     fieldErrors: Partial<Record<RuntimeStorageSettingId, string>>;
     /** App-owned client-side field errors (validation). */
     localFieldErrors: Partial<Record<RuntimeStorageSettingId, string>>;
@@ -97,6 +106,7 @@
     savingSettingId,
     savedMessage,
     retentionError,
+    retentionFeedbackOwner,
     fieldErrors,
     localFieldErrors,
     retentionDrafts,
@@ -200,7 +210,7 @@
   function addTypeRow() {
     const max = taskTypesSnapshot?.constraints.maxTypes ?? 32;
     if (taskTypeDrafts.length >= max) {
-      onTaskTypesDraftErrorChange(`At most ${max} task types.`);
+      onTaskTypesDraftErrorChange(`At most ${max} task profiles.`);
       return;
     }
     onTaskTypeDraftsChange([
@@ -221,19 +231,19 @@
       try {
         idRe = new RegExp(c.idPattern);
       } catch {
-        return 'Invalid type id pattern from host.';
+        return 'Invalid task profile ID pattern from host.';
       }
     }
     const descMax = c?.descriptionMax ?? 200;
     const seen = new Set<string>();
     for (const row of taskTypeDrafts) {
-      if (!row.id.trim()) return 'Each type needs an id.';
-      if (!idRe.test(row.id)) return `Invalid type id "${row.id}".`;
-      if (seen.has(row.id)) return `Duplicate type id "${row.id}".`;
+      if (!row.id.trim()) return 'Each task profile needs an ID.';
+      if (!idRe.test(row.id)) return `Invalid task profile ID "${row.id}".`;
+      if (seen.has(row.id)) return `Duplicate task profile ID "${row.id}".`;
       seen.add(row.id);
-      if (!row.backend.trim()) return `Type "${row.id}" needs a backend.`;
+      if (!row.backend.trim()) return `Task profile "${row.id}" needs a backend.`;
       if (row.description && row.description.length > descMax) {
-        return `Description for "${row.id}" exceeds ${descMax} characters.`;
+        return `Description for task profile "${row.id}" exceeds ${descMax} characters.`;
       }
     }
     return null;
@@ -306,7 +316,6 @@
     void activateTopic(intent.topicId, { focusTab: true });
   }
 
-  const activeTopic = $derived(getSettingsTopic(activeTopicId));
   const activeTabDomId = $derived(settingsTabId(activeTopicId) ?? '');
   const activePanelDomId = $derived(settingsPanelId(activeTopicId) ?? '');
 
@@ -321,25 +330,47 @@
     ),
   );
 
-  function taskTypesTabIndicator(): { kind: string; label: string } | null {
+  function taskTypesTabIndicator(): SettingsTabIndicator | null {
     if (taskTypesSaving) return { kind: 'saving', label: 'Saving' };
     if (taskTypesHasError) return { kind: 'error', label: 'Error' };
     if (taskTypesDirty) return { kind: 'dirty', label: 'Unsaved' };
-    if (taskTypesSavedMessage) return { kind: 'saved', label: 'Saved' };
     if (taskTypesHasDiagnostics) return { kind: 'diagnostic', label: 'Needs attention' };
+    if (taskTypesSavedMessage) return { kind: 'saved', label: 'Saved' };
     return null;
   }
 
   const taskTypesIndicator = $derived(taskTypesTabIndicator());
 
-  const retentionDirty = $derived(isRetentionDraftsDirty(retentionDrafts, snapshot));
-  const retentionIndicator = $derived(
-    retentionTabIndicator({
-      saving: savingSettingId !== null,
+  // The single Runtime & Storage snapshot backs two rendered domains: the run
+  // limit under Execution, and the history/output numbers under Data. Dirty state,
+  // field errors, and saved/error feedback are scoped per setting subset so one
+  // domain never leaks feedback onto the other.
+  const runLimitDirty = $derived(
+    isRuntimeStorageDraftDirtyFor(EXECUTION_RUNTIME_STORAGE_IDS, retentionDrafts, snapshot),
+  );
+  const dataRetentionDirty = $derived(
+    isRuntimeStorageDraftDirtyFor(DATA_RUNTIME_STORAGE_IDS, retentionDrafts, snapshot),
+  );
+
+  const runLimitIndicator = $derived(
+    runtimeStorageTabIndicatorFor(EXECUTION_RUNTIME_STORAGE_IDS, {
+      savingSettingId,
       error: retentionError,
+      feedbackOwner: retentionFeedbackOwner,
       fieldErrors,
       localFieldErrors,
-      dirty: retentionDirty,
+      dirty: runLimitDirty,
+      savedMessage,
+    }),
+  );
+  const dataRetentionIndicator = $derived(
+    runtimeStorageTabIndicatorFor(DATA_RUNTIME_STORAGE_IDS, {
+      savingSettingId,
+      error: retentionError,
+      feedbackOwner: retentionFeedbackOwner,
+      fieldErrors,
+      localFieldErrors,
+      dirty: dataRetentionDirty,
       savedMessage,
     }),
   );
@@ -356,10 +387,29 @@
     }),
   );
 
-  function topicIndicator(topicId: SettingsTopicId): { kind: string; label: string } | null {
-    if (topicId === 'task-types') return taskTypesIndicator;
-    if (topicId === 'permissions') return permissionIndicator;
-    if (topicId === 'retention') return retentionIndicator;
+  // Execution folds the run-limit and permission surfaces into one tab badge.
+  const executionIndicator = $derived(
+    mergeSettingsIndicators(runLimitIndicator, permissionIndicator),
+  );
+
+  // Feedback banners are only rendered when their owner setting belongs to the
+  // domain currently on screen — used by the Execution / Data run-storage panels.
+  const runLimitOwnsFeedback = $derived(retentionFeedbackOwner === 'runLimit');
+  const dataOwnsFeedback = $derived(
+    retentionFeedbackOwner !== null &&
+      DATA_RUNTIME_STORAGE_IDS.includes(retentionFeedbackOwner),
+  );
+  const settingsLevelRetentionError = $derived(
+    retentionFeedbackOwner === null ? retentionError : null,
+  );
+  const dataFeedbackSectionTitle = $derived(
+    retentionFeedbackOwner === 'maxRetainedTurnsPerTask' ? 'History' : 'Outputs',
+  );
+
+  function topicIndicator(topicId: SettingsTopicId): SettingsTabIndicator | null {
+    if (topicId === 'agents') return taskTypesIndicator;
+    if (topicId === 'execution') return executionIndicator;
+    if (topicId === 'data') return dataRetentionIndicator;
     return null;
   }
 </script>
@@ -385,7 +435,7 @@
   <div
     class="settings-panel__tabs"
     role="tablist"
-    aria-label="Settings topics"
+    aria-label="Settings domains"
     bind:this={tablistEl}
   >
     {#each SETTINGS_TOPICS as topic (topic.id)}
@@ -408,7 +458,6 @@
         aria-controls={panelId}
         tabindex={selected ? 0 : -1}
         data-topic-id={topic.id}
-        data-availability={topic.availability}
         data-tab-state={indicator?.kind ?? undefined}
         aria-label={indicator ? `${topic.label}, ${indicator.label}` : topic.label}
         onclick={() => onTabClick(topic.id)}
@@ -422,29 +471,35 @@
             aria-hidden="true"
           >{indicator.label}</span>
         {/if}
-        {#if topic.availability === 'coming-soon'}
-          <span class="settings-panel__tab-badge">Coming soon</span>
-        {/if}
       </button>
     {/each}
   </div>
 
   <div class="settings-panel__body">
     <div class="settings-panel__body-inner">
+      {#if settingsLevelRetentionError}
+        <div
+          class="settings-panel__error"
+          role="alert"
+          data-testid="settings-level-error"
+        >
+          <div class="settings-panel__error-title">Settings update failed</div>
+          <div>{settingsLevelRetentionError}</div>
+        </div>
+      {/if}
       <div
         class="settings-panel__tabpanel"
         role="tabpanel"
         id={activePanelDomId}
         aria-labelledby={activeTabDomId}
         data-topic-id={activeTopicId}
-        data-availability={activeTopic?.availability ?? 'active'}
         tabindex="0"
       >
-        {#if activeTopicId === 'task-types'}
-          <section class="settings-section" aria-label="Task types">
+        {#if activeTopicId === 'agents'}
+          <section class="settings-section" aria-label="Task profiles">
             <div class="settings-section__head">
               <div class="settings-section__heading">
-                <h3 class="settings-section__title">Task Types</h3>
+                <h3 class="settings-section__title">Task profiles</h3>
                 <p class="settings-section__desc">
                   Map coordinator create/delegate to a backend and optional model.
                 </p>
@@ -484,7 +539,7 @@
             </p>
 
             {#if taskTypesLoading && !taskTypesSnapshot}
-              <p class="settings-panel__notice" role="status">Loading task types…</p>
+              <p class="settings-panel__notice" role="status">Loading task profiles…</p>
             {:else if taskTypesSnapshot}
               <div class="settings-section__status">
                 <span class={`type-status type-status--${taskTypesSnapshot.status}`}>
@@ -492,7 +547,7 @@
                   {TASK_TYPE_STATUS_LABEL[taskTypesSnapshot.status]}
                 </span>
                 <span class="settings-section__count">
-                  {taskTypeDrafts.length} of {taskTypesSnapshot.constraints.maxTypes} types
+                  {taskTypeDrafts.length} of {taskTypesSnapshot.constraints.maxTypes} profiles
                 </span>
                 {#if taskTypesDirty}
                   <span class="settings-section__dirty" data-testid="task-types-dirty" role="status">Unsaved changes</span>
@@ -505,8 +560,8 @@
                   role="status"
                   data-testid="task-types-diagnostic-empty"
                 >
-                  Host map is empty. Coordinator create/delegate fail closed until types are saved.
-                  Use Reset for ship defaults or Add to define types, then Save to workspace settings.
+                  Host map is empty. Coordinator create/delegate fail closed until profiles are saved.
+                  Use Reset for ship defaults or Add to define profiles, then Save to workspace settings.
                 </div>
               {:else if taskTypesSnapshot.status === 'invalid'}
                 <div
@@ -514,7 +569,7 @@
                   role="alert"
                   data-testid="task-types-diagnostic-invalid"
                 >
-                  <div class="settings-panel__error-title">Host task types are invalid</div>
+                  <div class="settings-panel__error-title">Host task profiles are invalid</div>
                   <p class="settings-panel__description">
                     The saved workspace map could not be loaded. Fix the diagnostics below, then Save a valid map.
                     Drafts below stay editable and are not overwritten while dirty.
@@ -544,7 +599,7 @@
 
             {#if taskTypesError}
               <div class="settings-panel__error" role="alert" data-testid="task-types-save-error">
-                <div class="settings-panel__error-title">Task types save failed</div>
+                <div class="settings-panel__error-title">Task profiles save failed</div>
                 <div>{taskTypesError}</div>
               </div>
             {/if}
@@ -566,8 +621,8 @@
                         id={`tt-id-${index}`}
                         class="settings-panel__input type-card__id"
                         type="text"
-                        placeholder="type-id"
-                        aria-label="Type id"
+                        placeholder="profile-id"
+                        aria-label="Task profile ID"
                         value={row.id}
                         disabled={taskTypesSaving}
                         oninput={(e) => updateTypeRow(index, { id: (e.currentTarget as HTMLInputElement).value })}
@@ -576,8 +631,8 @@
                         type="button"
                         class="settings-panel__icon-btn settings-panel__icon-btn--danger"
                         disabled={taskTypesSaving}
-                        aria-label="Remove type"
-                        title="Remove type"
+                        aria-label="Remove task profile"
+                        title="Remove task profile"
                         onclick={() => removeTypeRow(index)}
                       >
                         <span class="codicon codicon-trash" aria-hidden="true"></span>
@@ -649,17 +704,102 @@
 
                 {#if taskTypeDrafts.length === 0}
                   <p class="settings-panel__notice">
-                    No task types. Add one or Reset to defaults — an empty map blocks create/delegate.
+                    No task profiles. Add one or Reset to defaults — an empty map blocks create/delegate.
                   </p>
                 {/if}
               </div>
             {/if}
           </section>
-        {:else if activeTopicId === 'permissions'}
-          <section class="settings-section" aria-label="Permissions" data-testid="permissions-settings">
+        {:else if activeTopicId === 'execution'}
+          <!-- Run limits: the runLimit enum from the shared Runtime & Storage snapshot. -->
+          <section class="settings-section" aria-label="Run limits" data-testid="execution-run-limits">
+            <div class="settings-section__heading">
+              <h3 class="settings-section__title">Run limits</h3>
+              <p class="settings-section__desc">
+                How long an agent may run uninterrupted before Muster pauses it. Applies to new
+                agent runs; running turns keep their current deadline.
+              </p>
+            </div>
+
+            {#if runLimitOwnsFeedback && retentionError}
+              <div
+                class="settings-panel__error"
+                role="alert"
+                data-testid="run-limits-local-error"
+                data-topic-error="execution"
+              >
+                <div class="settings-panel__error-title">Run limit save failed</div>
+                <div>{retentionError}</div>
+              </div>
+            {/if}
+
+            {#if runLimitOwnsFeedback && savedMessage}
+              <div
+                class="settings-panel__success"
+                role="status"
+                data-testid="run-limits-local-success"
+                data-topic-success="execution"
+              >{savedMessage}</div>
+            {/if}
+
+            {#if loading && !snapshot}
+              <p class="settings-panel__notice" role="status">Loading run limits from VS Code…</p>
+            {/if}
+
+            {#if snapshot}
+              <div class="settings-fields">
+                {#each snapshot.settings.filter((candidate) => candidate.id === 'runLimit') as setting (setting.id)}
+                  {@const label = displayLabel(setting.id)}
+                  {@const error = localFieldErrors[setting.id] ?? fieldErrors[setting.id]}
+                  <div class="field-row">
+                    <div class="field-row__copy">
+                      <label class="settings-panel__label" for={fieldId(setting.id)}>{label}</label>
+                      <p class="settings-panel__description">{setting.description}</p>
+                      <p class="settings-panel__hint">Default {setting.defaultValue}; waiting for children does not consume this budget.</p>
+                      {#if error}
+                        <div class="settings-panel__field-error" id={`${fieldId(setting.id)}-error`} role="alert">{error}</div>
+                      {/if}
+                    </div>
+                    <div class="field-row__control">
+                      <div class="field-row__input-group">
+                        <select
+                          id={fieldId(setting.id)}
+                          class="settings-panel__input"
+                          value={retentionDrafts[setting.id]}
+                          aria-invalid={error ? 'true' : 'false'}
+                          aria-describedby={error ? `${fieldId(setting.id)}-error` : undefined}
+                          disabled={savingSettingId === setting.id}
+                          oninput={(event) => onDraftInput(setting.id, event)}
+                        >
+                          {#each setting.options as option}
+                            <option value={option}>{option}</option>
+                          {/each}
+                        </select>
+                        <button
+                          type="button"
+                          class="settings-panel__btn settings-panel__btn--primary"
+                          disabled={savingSettingId === setting.id}
+                          aria-label={`Save ${label}`}
+                          onclick={() => saveSetting(setting.id)}
+                        >Save</button>
+                      </div>
+                      {#if savingSettingId === setting.id}
+                        <div class="settings-panel__saving" role="status">Saving {label}…</div>
+                      {/if}
+                    </div>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          </section>
+
+          <div class="settings-section__separator" role="presentation"></div>
+
+          <!-- Tool access: the muster.permissions.mode enum (configuration only). -->
+          <section class="settings-section" aria-label="Tool access" data-testid="permissions-settings">
             <div class="settings-section__head">
               <div class="settings-section__heading">
-                <h3 class="settings-section__title">Permissions</h3>
+                <h3 class="settings-section__title">Tool access</h3>
                 <p class="settings-section__desc">
                   {permissionSettingsSnapshot?.description ??
                     'How Muster handles agent tool-permission requests.'}
@@ -692,7 +832,7 @@
                 class="settings-panel__error"
                 role="alert"
                 data-testid="permissions-local-error"
-                data-topic-error="permissions"
+                data-topic-error="execution"
               >
                 <div class="settings-panel__error-title">Permission mode save failed</div>
                 <div>{permissionSettingsError}</div>
@@ -704,7 +844,7 @@
                 class="settings-panel__success"
                 role="status"
                 data-testid="permissions-local-success"
-                data-topic-success="permissions"
+                data-topic-success="execution"
               >{permissionSettingsSavedMessage}</div>
             {/if}
 
@@ -775,93 +915,55 @@
               </div>
             {/if}
           </section>
-        {:else if activeTopicId === 'retention'}
-          <section class="settings-section" aria-label="Runtime and Storage">
-            <div class="settings-section__heading">
-              <h3 class="settings-section__title">Runtime &amp; Storage</h3>
-              <p class="settings-section__desc">
-                Control uninterrupted agent runtime and how much completed history is retained.
-              </p>
-            </div>
-
-            {#if retentionError}
+        {:else if activeTopicId === 'data'}
+          <div class="settings-domain" data-testid="data-settings">
+            {#if dataOwnsFeedback && retentionError}
               <div
                 class="settings-panel__error"
                 role="alert"
-                data-testid="retention-local-error"
-                data-topic-error="retention"
+                data-testid="data-local-error"
+                data-topic-error="data"
               >
-                <div class="settings-panel__error-title">Runtime &amp; Storage save failed</div>
+                <div class="settings-panel__error-title">{dataFeedbackSectionTitle} save failed</div>
                 <div>{retentionError}</div>
               </div>
             {/if}
 
-            {#if savedMessage}
+            {#if dataOwnsFeedback && savedMessage}
               <div
                 class="settings-panel__success"
                 role="status"
-                data-testid="retention-local-success"
-                data-topic-success="retention"
+                data-testid="data-local-success"
+                data-topic-success="data"
               >{savedMessage}</div>
             {/if}
 
             {#if loading && !snapshot}
-              <p class="settings-panel__notice" role="status">Loading runtime and storage settings from VS Code…</p>
+              <p class="settings-panel__notice" role="status">Loading history and output settings from VS Code…</p>
             {/if}
 
             {#if snapshot}
-              <div class="settings-fields">
-                <div class="settings-section__heading">
-                  <h4 class="settings-section__title">Agent runtime</h4>
-                  <p class="settings-section__desc">Applies to new agent runs; running turns keep their current deadline.</p>
-                </div>
-                {#each snapshot.settings.filter((candidate) => candidate.id === 'runLimit') as setting (setting.id)}
-                  {@const label = displayLabel(setting.id)}
-                  {@const error = localFieldErrors[setting.id] ?? fieldErrors[setting.id]}
-                  <div class="field-row">
-                    <div class="field-row__copy">
-                      <label class="settings-panel__label" for={fieldId(setting.id)}>{label}</label>
-                      <p class="settings-panel__description">{setting.description}</p>
-                      <p class="settings-panel__hint">Default {setting.defaultValue}; waiting for children does not consume this budget.</p>
-                      {#if error}
-                        <div class="settings-panel__field-error" id={`${fieldId(setting.id)}-error`} role="alert">{error}</div>
-                      {/if}
-                    </div>
-                    <div class="field-row__control">
-                      <div class="field-row__input-group">
-                        <select
-                          id={fieldId(setting.id)}
-                          class="settings-panel__input"
-                          value={retentionDrafts[setting.id]}
-                          aria-invalid={error ? 'true' : 'false'}
-                          aria-describedby={error ? `${fieldId(setting.id)}-error` : undefined}
-                          disabled={savingSettingId === setting.id}
-                          oninput={(event) => onDraftInput(setting.id, event)}
-                        >
-                          {#each setting.options as option}
-                            <option value={option}>{option}</option>
-                          {/each}
-                        </select>
-                        <button
-                          type="button"
-                          class="settings-panel__btn settings-panel__btn--primary"
-                          disabled={savingSettingId === setting.id}
-                          aria-label={`Save ${label}`}
-                          onclick={() => saveSetting(setting.id)}
-                        >Save</button>
-                      </div>
-                      {#if savingSettingId === setting.id}
-                        <div class="settings-panel__saving" role="status">Saving {label}…</div>
-                      {/if}
-                    </div>
+              {#each snapshot.settings.filter((candidate) => candidate.kind === 'number') as setting, sectionIndex (setting.id)}
+                {@const label = displayLabel(setting.id)}
+                {@const error = localFieldErrors[setting.id] ?? fieldErrors[setting.id]}
+                {@const sectionTitle = setting.id === 'maxRetainedTurnsPerTask' ? 'History' : 'Outputs'}
+                {#if sectionIndex > 0}
+                  <div class="settings-section__separator" role="presentation"></div>
+                {/if}
+                <section
+                  class="settings-section"
+                  aria-label={sectionTitle}
+                  data-testid={`data-section-${setting.id}`}
+                >
+                  <div class="settings-section__heading">
+                    <h3 class="settings-section__title">{sectionTitle}</h3>
+                    <p class="settings-section__desc">
+                      {setting.id === 'maxRetainedTurnsPerTask'
+                        ? 'How much completed task history Muster retains.'
+                        : 'How much output Muster stores for each retained turn.'}
+                    </p>
                   </div>
-                {/each}
-                <details class="settings-section" data-testid="history-storage-advanced">
-                  <summary class="settings-section__title">History storage (Advanced)</summary>
-                  <p class="settings-section__desc">Limits retained terminal-task history. These values do not stop a running agent.</p>
-                  {#each snapshot.settings.filter((candidate) => candidate.kind === 'number') as setting (setting.id)}
-                    {@const label = displayLabel(setting.id)}
-                    {@const error = localFieldErrors[setting.id] ?? fieldErrors[setting.id]}
+                  <div class="settings-fields">
                     <div class="field-row">
                       <div class="field-row__copy">
                         <label class="settings-panel__label" for={fieldId(setting.id)}>{label}</label>
@@ -898,19 +1000,11 @@
                         {/if}
                       </div>
                     </div>
-                  {/each}
-                </details>
-              </div>
+                  </div>
+                </section>
+              {/each}
             {/if}
-          </section>
-        {:else if activeTopic?.availability === 'coming-soon'}
-          <section class="settings-section settings-section--coming-soon" aria-label={activeTopic.label}>
-            <div class="settings-section__heading">
-              <h3 class="settings-section__title">{activeTopic.label}</h3>
-              <p class="settings-section__status-line" role="status">Coming soon</p>
-              <p class="settings-section__desc">{activeTopic.description}</p>
-            </div>
-          </section>
+          </div>
         {/if}
       </div>
     </div>

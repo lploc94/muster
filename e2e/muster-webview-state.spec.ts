@@ -239,14 +239,6 @@ function retentionSettingsSnapshot(values: {
   };
 }
 
-async function openHistoryStorage(page: Page): Promise<void> {
-  const advanced = page.getByTestId('history-storage-advanced');
-  await expect(advanced).toBeVisible();
-  if ((await advanced.getAttribute('open')) === null) {
-    await advanced.locator('summary').click();
-  }
-}
-
 function permissionSettingsSnapshot(mode: 'ask' | 'allow' | 'readonly' = 'ask') {
   return {
     mode,
@@ -4368,10 +4360,9 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expectPostedMessage(page, { type: 'requestSettings' });
     await expectPostedMessage(page, { type: 'requestTaskTypesSettings' });
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
-    await page.getByRole('tab', { name: /Runtime & Storage/i }).click();
-    await expect(page.getByRole('tab', { name: /Runtime & Storage/i })).toHaveAttribute('aria-selected', 'true');
-    await expect(page.getByText('Control uninterrupted agent runtime and how much completed history is retained.')).toBeVisible();
-    await expect(page.getByRole('status').getByText('Loading runtime and storage settings from VS Code…')).toBeVisible();
+    await page.getByRole('tab', { name: /Data/i }).click();
+    await expect(page.getByRole('tab', { name: /Data/i })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('status').getByText('Loading history and output settings from VS Code…')).toBeVisible();
     // Full-view Settings replaces the task list (not an overlay).
     await expect(page.getByPlaceholder('Search tasks…')).toHaveCount(0);
     await expect(page.getByRole('button', { name: 'Back to tasks' })).toBeVisible();
@@ -4385,8 +4376,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     });
 
     // Once the snapshot loads, the loading status is replaced by the editable fields.
-    await expect(page.getByText('Loading runtime and storage settings from VS Code…')).toHaveCount(0);
-    await openHistoryStorage(page);
+    await expect(page.getByText('Loading history and output settings from VS Code…')).toHaveCount(0);
     await expect(page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true })).toHaveValue('200');
     await expect(page.getByRole('spinbutton', { name: 'Stored output per turn', exact: true })).toHaveValue('200000');
     await expect(page.getByText('Min 1 · Default 200')).toBeVisible();
@@ -4421,7 +4411,8 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
         message: 'Error: leaked stack trace from vscode.workspace.getConfiguration().update',
       },
     });
-    await expect(page.getByRole('alert').getByText('Runtime & Storage save failed')).toBeVisible();
+    await expect(page.getByTestId('data-local-error')).toBeVisible();
+    await expect(page.getByTestId('data-local-error')).toContainText('Outputs save failed');
     await expect(page.getByRole('alert').getByText('Unable to save Stored output per turn. Check the VS Code setting and try again.')).toBeVisible();
     await expect(page.getByText('leaked stack trace')).toHaveCount(0);
     // Failed save keeps the attempted draft (does not rehydrate back to prior saved).
@@ -4469,7 +4460,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expect(page.getByRole('alert').getByText('Host command remains visible.')).toBeVisible();
   });
 
-  test('M012 S01 semantics: Settings tablist exposes five topics with ARIA relationships and keyboard activation', async ({ page }) => {
+  test('M012 S01 semantics: Settings tablist exposes three domains with ARIA relationships and keyboard activation', async ({ page }) => {
     await openWebview(page);
     await postSnapshot(page, {
       type: 'snapshot',
@@ -4481,70 +4472,74 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expectPostedMessage(page, { type: 'requestSettings' });
     await expectPostedMessage(page, { type: 'requestTaskTypesSettings' });
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+    await postRawHostMessage(page, {
+      type: 'settingsSnapshot',
+      snapshot: retentionSettingsSnapshot({
+        maxRetainedTurnsPerTask: 200,
+        maxStoredOutputChars: 200000,
+      }),
+    });
 
-    const tablist = page.getByRole('tablist', { name: 'Settings topics' });
+    const tablist = page.getByRole('tablist', { name: 'Settings domains' });
     await expect(tablist).toBeVisible();
     const tabs = tablist.getByRole('tab');
-    await expect(tabs).toHaveCount(5);
-    await expect(tabs.nth(0)).toHaveText(/Task Types/i);
-    await expect(tabs.nth(1)).toHaveText(/Permissions/i);
-    await expect(tabs.nth(2)).toHaveText(/Runtime & Storage/i);
-    await expect(tabs.nth(3)).toHaveText(/Models and CLIs/i);
-    await expect(tabs.nth(4)).toHaveText(/Context and MCP/i);
+    await expect(tabs).toHaveCount(3);
+    await expect(tabs.nth(0)).toHaveText(/Agents/i);
+    await expect(tabs.nth(1)).toHaveText(/Execution/i);
+    await expect(tabs.nth(2)).toHaveText(/Data/i);
 
-    const taskTypesTab = page.getByRole('tab', { name: /Task Types/i });
-    await expect(taskTypesTab).toHaveAttribute('aria-selected', 'true');
-    await expect(taskTypesTab).toHaveAttribute('tabindex', '0');
-    await expect(taskTypesTab).toHaveAttribute('id', 'settings-tab-task-types');
-    await expect(taskTypesTab).toHaveAttribute('aria-controls', 'settings-panel-task-types');
-    const taskTypesPanel = page.locator('#settings-panel-task-types');
-    await expect(taskTypesPanel).toBeVisible();
-    await expect(taskTypesPanel).toHaveAttribute('role', 'tabpanel');
-    await expect(taskTypesPanel).toHaveAttribute('aria-labelledby', 'settings-tab-task-types');
-    await expect(page.getByRole('heading', { name: 'Task Types' })).toBeVisible();
+    const agentsTab = page.getByRole('tab', { name: /Agents/i });
+    await expect(agentsTab).toHaveAttribute('aria-selected', 'true');
+    await expect(agentsTab).toHaveAttribute('tabindex', '0');
+    await expect(agentsTab).toHaveAttribute('id', 'settings-tab-agents');
+    await expect(agentsTab).toHaveAttribute('aria-controls', 'settings-panel-agents');
+    const agentsPanel = page.locator('#settings-panel-agents');
+    await expect(agentsPanel).toBeVisible();
+    await expect(agentsPanel).toHaveAttribute('role', 'tabpanel');
+    await expect(agentsPanel).toHaveAttribute('aria-labelledby', 'settings-tab-agents');
+    await expect(page.getByRole('heading', { name: 'Task profiles' })).toBeVisible();
 
-    for (const name of [/Permissions/i, /Runtime & Storage/i, /Models and CLIs/i, /Context and MCP/i]) {
+    for (const name of [/Execution/i, /Data/i]) {
       await expect(page.getByRole('tab', { name })).toHaveAttribute('aria-selected', 'false');
       await expect(page.getByRole('tab', { name })).toHaveAttribute('tabindex', '-1');
     }
 
-    await page.getByRole('tab', { name: /Permissions/i }).click();
-    await expect(page.getByRole('tab', { name: /Permissions/i })).toHaveAttribute('aria-selected', 'true');
-    await expect(page.getByRole('tab', { name: /Permissions/i })).toHaveAttribute('tabindex', '0');
-    await expect(page.locator('#settings-panel-permissions')).toBeVisible();
+    await page.getByRole('tab', { name: /Execution/i }).click();
+    await expect(page.getByRole('tab', { name: /Execution/i })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('tab', { name: /Execution/i })).toHaveAttribute('tabindex', '0');
+    await expect(page.locator('#settings-panel-execution')).toBeVisible();
+    await expect(page.getByTestId('execution-run-limits')).toBeVisible();
     await expect(page.getByTestId('permissions-settings')).toBeVisible();
     await expect(page.getByTestId('permissions-runtime-note')).toContainText(
       'Runtime permission prompts still appear as in-session permission cards',
     );
-    await expect(page.getByRole('spinbutton')).toHaveCount(0);
 
-    const permissionsTab = page.getByRole('tab', { name: /Permissions/i });
-    await permissionsTab.focus();
-    await permissionsTab.press('ArrowRight');
-    const retentionTab = page.getByRole('tab', { name: /Runtime & Storage/i });
-    await expect(retentionTab).toHaveAttribute('aria-selected', 'true');
-    await expect(page.locator('#settings-panel-retention')).toBeVisible();
+    const executionTab = page.getByRole('tab', { name: /Execution/i });
+    await executionTab.focus();
+    await executionTab.press('ArrowRight');
+    const dataTab = page.getByRole('tab', { name: /Data/i });
+    await expect(dataTab).toHaveAttribute('aria-selected', 'true');
+    await expect(page.locator('#settings-panel-data')).toBeVisible();
+    await expect(page.getByTestId('data-settings')).toBeVisible();
+    await expect(page.getByRole('region', { name: 'History' })).toBeVisible();
+    await expect(page.getByRole('region', { name: 'Outputs' })).toBeVisible();
 
-    await retentionTab.press('End');
-    const contextTab = page.getByRole('tab', { name: /Context and MCP/i });
-    await expect(contextTab).toHaveAttribute('aria-selected', 'true');
-    await expect(page.locator('#settings-panel-context-and-mcp')).toBeVisible();
-    await expect(page.getByRole('status').filter({ hasText: 'Coming soon' })).toBeVisible();
-    await expect(page.getByText(/Future configuration for context-engine endpoints/i)).toBeVisible();
+    await dataTab.press('End');
+    await expect(page.getByRole('tab', { name: /Data/i })).toHaveAttribute('aria-selected', 'true');
 
-    await contextTab.press('Home');
-    const taskTypesTabAfterHome = page.getByRole('tab', { name: /Task Types/i });
-    await expect(taskTypesTabAfterHome).toHaveAttribute('aria-selected', 'true');
+    await page.getByRole('tab', { name: /Data/i }).press('Home');
+    const agentsTabAfterHome = page.getByRole('tab', { name: /Agents/i });
+    await expect(agentsTabAfterHome).toHaveAttribute('aria-selected', 'true');
 
-    await taskTypesTabAfterHome.press('ArrowLeft');
-    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toHaveAttribute('aria-selected', 'true');
+    await agentsTabAfterHome.press('ArrowLeft');
+    await expect(page.getByRole('tab', { name: /Data/i })).toHaveAttribute('aria-selected', 'true');
   });
 
-  test('M012 S01 semantics: Coming soon panels stay truthful and emit zero host mutations', async ({ page }) => {
+  test('M012 S01 semantics: only the three actionable domains render with no reserved/placeholder navigation', async ({ page }) => {
     await openWebview(page);
     await postSnapshot(page, {
       type: 'snapshot',
-      rootTasks: [task({ id: 'task-m012-soon', goal: 'Placeholder panels', viewStatus: 'idle' })],
+      rootTasks: [task({ id: 'task-m012-soon', goal: 'Domain shell', viewStatus: 'idle' })],
       storeRevision: 13,
     });
 
@@ -4552,50 +4547,64 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expectPostedMessage(page, { type: 'requestSettings' });
     await expectPostedMessage(page, { type: 'requestTaskTypesSettings' });
 
-    const baseline = await postedMessages(page);
-    const baselineCount = baseline.length;
+    const tablist = page.getByRole('tablist', { name: 'Settings domains' });
+    await expect(tablist).toBeVisible();
+    const tabs = tablist.getByRole('tab');
+    await expect(tabs).toHaveCount(3);
+    await expect(tabs.nth(0)).toHaveText(/Agents/i);
+    await expect(tabs.nth(1)).toHaveText(/Execution/i);
+    await expect(tabs.nth(2)).toHaveText(/Data/i);
 
-    await page.getByRole('tab', { name: /Models and CLIs/i }).click();
-    await expect(page.getByRole('tab', { name: /Models and CLIs/i })).toHaveAttribute('aria-selected', 'true');
-    await expect(page.locator('#settings-panel-models-and-clis')).toBeVisible();
-    await expect(page.getByRole('heading', { name: 'Models and CLIs' })).toBeVisible();
-    await expect(page.getByRole('status').filter({ hasText: 'Coming soon' })).toBeVisible();
-    await expect(page.getByText(/Future configuration for backend CLI discovery/i)).toBeVisible();
-    await expect(page.getByRole('spinbutton')).toHaveCount(0);
-    await expect(page.getByRole('textbox')).toHaveCount(0);
-    await expect(page.getByRole('button', { name: /^Save$/ })).toHaveCount(0);
-    await expect(page.getByRole('button', { name: /Saving/i })).toHaveCount(0);
-    await expect(page.getByRole('tab', { name: /Models and CLIs/i })).toBeEnabled();
-    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toBeEnabled();
+    // No reserved/placeholder navigation and no "Coming soon" affordance anywhere.
+    await expect(page.getByText('Coming soon')).toHaveCount(0);
+    for (const gone of [/Connections/i, /Models and CLIs/i, /Context and MCP/i]) {
+      await expect(page.getByRole('tab', { name: gone })).toHaveCount(0);
+    }
 
-    await page.getByRole('tab', { name: /Context and MCP/i }).click();
-    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toHaveAttribute('aria-selected', 'true');
-    await expect(page.locator('#settings-panel-context-and-mcp')).toBeVisible();
-    await expect(page.getByText(/Future configuration for context-engine endpoints/i)).toBeVisible();
-
-    const contextSoonTab = page.getByRole('tab', { name: /Context and MCP/i });
-    await contextSoonTab.focus();
-    await contextSoonTab.press('ArrowLeft');
-    const modelsSoonTab = page.getByRole('tab', { name: /Models and CLIs/i });
-    await expect(modelsSoonTab).toHaveAttribute('aria-selected', 'true');
-    await modelsSoonTab.press('ArrowRight');
-    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toHaveAttribute('aria-selected', 'true');
-
-    const after = await postedMessages(page);
-    expect(after).toHaveLength(baselineCount);
+    // Opening Settings emits only the legit request/catalog messages — no mutations.
+    const legitTypes = new Set([
+      'requestSettings',
+      'requestTaskTypesSettings',
+      'requestPermissionSettings',
+      'listBackends',
+      'listModels',
+    ]);
     const mutationTypes = new Set([
       'updateSetting',
       'updateTaskTypes',
-      'requestSettings',
-      'requestTaskTypesSettings',
-      'listBackends',
-      'listModels',
+      'updatePermissionSettings',
       'setComposerSelection',
       'send',
       'focusTask',
     ]);
+    const opened = await postedMessages(page);
+    for (const message of opened) {
+      const type = (message as { type?: string }).type ?? '';
+      expect(mutationTypes.has(type)).toBe(false);
+      if (type) expect(legitTypes.has(type)).toBe(true);
+    }
+
+    const baseline = await postedMessages(page);
+    const baselineCount = baseline.length;
+
+    // Navigate across all three tabs by mouse then keyboard — zero additional mutations.
+    for (const name of [/Execution/i, /Data/i, /Agents/i]) {
+      await page.getByRole('tab', { name }).click();
+      await expect(page.getByRole('tab', { name })).toHaveAttribute('aria-selected', 'true');
+    }
+    const agentsTab = page.getByRole('tab', { name: /Agents/i });
+    await agentsTab.focus();
+    await agentsTab.press('ArrowRight');
+    await expect(page.getByRole('tab', { name: /Execution/i })).toHaveAttribute('aria-selected', 'true');
+    await page.getByRole('tab', { name: /Execution/i }).press('End');
+    await expect(page.getByRole('tab', { name: /Data/i })).toHaveAttribute('aria-selected', 'true');
+    await page.getByRole('tab', { name: /Data/i }).press('Home');
+    await expect(page.getByRole('tab', { name: /Agents/i })).toHaveAttribute('aria-selected', 'true');
+
+    const after = await postedMessages(page);
     const extra = after.slice(baselineCount).filter((message) => mutationTypes.has((message as { type?: string }).type ?? ''));
     expect(extra).toEqual([]);
+    await expect(page.getByText('Coming soon')).toHaveCount(0);
   });
 
   test('M012 S01 flow: Settings entry opens tab shell; mouse/keyboard traverse all topics; 320px keeps forms contained', async ({
@@ -4614,17 +4623,15 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expectPostedMessage(page, { type: 'requestTaskTypesSettings' });
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
 
-    const tablist = page.getByRole('tablist', { name: 'Settings topics' });
+    const tablist = page.getByRole('tablist', { name: 'Settings domains' });
     await expect(tablist).toBeVisible();
     const tabs = tablist.getByRole('tab');
-    await expect(tabs).toHaveCount(5);
+    await expect(tabs).toHaveCount(3);
 
     const topicOrder = [
-      { name: /Task Types/i, id: 'task-types', panel: 'settings-panel-task-types' },
-      { name: /Permissions/i, id: 'permissions', panel: 'settings-panel-permissions' },
-      { name: /Runtime & Storage/i, id: 'retention', panel: 'settings-panel-retention' },
-      { name: /Models and CLIs/i, id: 'models-and-clis', panel: 'settings-panel-models-and-clis' },
-      { name: /Context and MCP/i, id: 'context-and-mcp', panel: 'settings-panel-context-and-mcp' },
+      { name: /Agents/i, id: 'agents', panel: 'settings-panel-agents' },
+      { name: /Execution/i, id: 'execution', panel: 'settings-panel-execution' },
+      { name: /Data/i, id: 'data', panel: 'settings-panel-data' },
     ] as const;
 
     // Mouse: visit every topic in order and assert ARIA relationships + single live panel.
@@ -4649,78 +4656,41 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     }
 
     // Keyboard: ArrowLeft / ArrowRight wraparound, Home, End from the active tab.
-    const contextTab = page.getByRole('tab', { name: /Context and MCP/i });
-    await contextTab.focus();
-    await expect(contextTab).toBeFocused();
-    await contextTab.press('ArrowRight');
-    const taskTypesTab = page.getByRole('tab', { name: /Task Types/i });
-    await expect(taskTypesTab).toHaveAttribute('aria-selected', 'true');
-    await expect(taskTypesTab).toBeFocused();
+    const dataTab = page.getByRole('tab', { name: /Data/i });
+    await dataTab.focus();
+    await expect(dataTab).toBeFocused();
+    await dataTab.press('ArrowRight');
+    const agentsTab = page.getByRole('tab', { name: /Agents/i });
+    await expect(agentsTab).toHaveAttribute('aria-selected', 'true');
+    await expect(agentsTab).toBeFocused();
 
-    await taskTypesTab.press('ArrowLeft');
-    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toHaveAttribute('aria-selected', 'true');
-    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toBeFocused();
+    await agentsTab.press('ArrowLeft');
+    await expect(page.getByRole('tab', { name: /Data/i })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('tab', { name: /Data/i })).toBeFocused();
 
-    await page.getByRole('tab', { name: /Context and MCP/i }).press('Home');
-    await expect(taskTypesTab).toHaveAttribute('aria-selected', 'true');
-    await expect(taskTypesTab).toBeFocused();
+    await page.getByRole('tab', { name: /Data/i }).press('Home');
+    await expect(agentsTab).toHaveAttribute('aria-selected', 'true');
+    await expect(agentsTab).toBeFocused();
 
-    await taskTypesTab.press('End');
-    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toHaveAttribute('aria-selected', 'true');
-    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toBeFocused();
+    await agentsTab.press('End');
+    await expect(page.getByRole('tab', { name: /Data/i })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('tab', { name: /Data/i })).toBeFocused();
 
-    await page.getByRole('tab', { name: /Context and MCP/i }).press('ArrowLeft');
-    const modelsTab = page.getByRole('tab', { name: /Models and CLIs/i });
-    await expect(modelsTab).toHaveAttribute('aria-selected', 'true');
-    await expect(modelsTab).toBeFocused();
+    await page.getByRole('tab', { name: /Data/i }).press('ArrowLeft');
+    const executionTab = page.getByRole('tab', { name: /Execution/i });
+    await expect(executionTab).toHaveAttribute('aria-selected', 'true');
+    await expect(executionTab).toBeFocused();
 
-    await modelsTab.press('ArrowRight');
-    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toHaveAttribute('aria-selected', 'true');
-
-    // Coming soon panels: truthful static copy, enabled tabs, zero host mutations.
-    const mutationTypes = new Set([
-      'updateSetting',
-      'updateTaskTypes',
-      'requestSettings',
-      'requestTaskTypesSettings',
-      'listBackends',
-      'listModels',
-      'setComposerSelection',
-      'send',
-      'focusTask',
-    ]);
-    const baseline = await postedMessages(page);
-    const baselineCount = baseline.length;
-
-    await page.getByRole('tab', { name: /Models and CLIs/i }).click();
-    await expect(page.locator('#settings-panel-models-and-clis')).toBeVisible();
-    await expect(page.getByRole('heading', { name: 'Models and CLIs' })).toBeVisible();
-    await expect(page.getByRole('status').filter({ hasText: 'Coming soon' })).toBeVisible();
-    await expect(page.getByText(/Future configuration for backend CLI discovery/i)).toBeVisible();
-    await expect(page.locator('.settings-section--coming-soon input, .settings-section--coming-soon button')).toHaveCount(0);
-    await expect(page.getByRole('spinbutton')).toHaveCount(0);
-    await expect(page.getByRole('button', { name: /^Save$/ })).toHaveCount(0);
-    await expect(page.getByRole('tab', { name: /Models and CLIs/i })).toBeEnabled();
-
-    await page.getByRole('tab', { name: /Context and MCP/i }).click();
-    await expect(page.locator('#settings-panel-context-and-mcp')).toBeVisible();
-    await expect(page.getByText(/Future configuration for context-engine endpoints/i)).toBeVisible();
-    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toBeEnabled();
-
-    const afterPlaceholders = await postedMessages(page);
-    expect(afterPlaceholders).toHaveLength(baselineCount);
-    const placeholderMutations = afterPlaceholders
-      .slice(baselineCount)
-      .filter((message) => mutationTypes.has((message as { type?: string }).type ?? ''));
-    expect(placeholderMutations).toEqual([]);
+    await executionTab.press('ArrowRight');
+    await expect(page.getByRole('tab', { name: /Data/i })).toHaveAttribute('aria-selected', 'true');
 
     // Tab / Shift+Tab: leave the tablist into the panel, then return; selected indicator stays.
-    await page.getByRole('tab', { name: /Runtime & Storage/i }).click();
-    const retentionTab = page.getByRole('tab', { name: /Runtime & Storage/i });
+    await page.getByRole('tab', { name: /Data/i }).click();
+    const retentionTab = page.getByRole('tab', { name: /Data/i });
     await expect(retentionTab).toHaveAttribute('aria-selected', 'true');
     await retentionTab.focus();
     await page.keyboard.press('Tab');
-    const retentionPanel = page.locator('#settings-panel-retention');
+    const retentionPanel = page.locator('#settings-panel-data');
     await expect(retentionPanel).toBeFocused();
     await expect(retentionTab).toHaveAttribute('aria-selected', 'true');
     await expect(retentionTab).toHaveClass(/settings-panel__tab--selected/);
@@ -4747,7 +4717,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expect(retentionTab).toBeFocused();
     await expect(retentionTab).toHaveAttribute('aria-selected', 'true');
 
-    // Return to Runtime & Storage with a real snapshot and usable controls.
+    // Return to Data with a real snapshot and usable controls.
     await postRawHostMessage(page, {
       type: 'settingsSnapshot',
       snapshot: retentionSettingsSnapshot({
@@ -4755,7 +4725,6 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
         maxStoredOutputChars: 100000,
       }),
     });
-    await openHistoryStorage(page);
     await expect(page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true })).toHaveValue('150');
     await expect(page.getByRole('spinbutton', { name: 'Stored output per turn', exact: true })).toHaveValue(
       '100000',
@@ -4770,8 +4739,8 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expect(page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true })).toHaveValue('175');
     await expect(page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true })).toBeEnabled();
 
-    // Seed Task Types so 320px containment can inspect real type cards.
-    await page.getByRole('tab', { name: /Task Types/i }).click();
+    // Seed Task profiles so 320px containment can inspect real type cards.
+    await page.getByRole('tab', { name: /Agents/i }).click();
     await postRawHostMessage(page, {
       type: 'taskTypesSettingsSnapshot',
       snapshot: {
@@ -4806,7 +4775,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     });
     await expect(page.locator('.type-card').first()).toBeVisible();
 
-    // 320 CSS px: only the tablist may overflow horizontally; document/panel/forms stay contained.
+    // 320 CSS px: tabs stay equal-width on one no-scroll row; document/panel/forms stay contained.
     await page.setViewportSize({ width: 320, height: 720 });
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
 
@@ -4829,9 +4798,10 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
             appOk: noHOverflow(app),
             panelOk: noHOverflow(panel),
             cardsOk: cards.length > 0 && cards.every((card) => noHOverflow(card)),
-            tabsMayOverflow: Boolean(tabsEl && (tabsEl as HTMLElement).scrollWidth >= (tabsEl as HTMLElement).clientWidth),
+            // Three equal-width tabs fit on one row with no horizontal scroll.
+            tabsNoScroll: Boolean(tabsEl && (tabsEl as HTMLElement).scrollWidth <= (tabsEl as HTMLElement).clientWidth + 1),
             tabsNowrap: tabsEl
-              ? getComputedStyle(tabsEl).flexWrap === 'nowrap' && getComputedStyle(tabsEl).overflowX === 'auto'
+              ? getComputedStyle(tabsEl).flexWrap === 'nowrap' && getComputedStyle(tabsEl).overflowX === 'hidden'
               : false,
           };
         }),
@@ -4842,13 +4812,13 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
           appOk: true,
           panelOk: true,
           cardsOk: true,
+          tabsNoScroll: true,
           tabsNowrap: true,
         }),
       );
 
-    // Runtime & Storage controls remain usable at 320px without panel horizontal overflow.
-    await page.getByRole('tab', { name: /Runtime & Storage/i }).click();
-    await openHistoryStorage(page);
+    // Data controls remain usable at 320px without panel horizontal overflow.
+    await page.getByRole('tab', { name: /Data/i }).click();
     await expect(page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Save Retained turns per completed task' })).toBeVisible();
     await expect
@@ -4876,7 +4846,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expectPostedMessage(page, { type: 'updateSetting', settingId: 'maxRetainedTurnsPerTask', value: 180 });
   });
 
-  test('M012 S02 flow: Task Types and Runtime & Storage state safety, isolation, hide/reveal, and 320px layout', async ({
+  test('M012 S02 flow: Agents and Data state safety, isolation, hide/reveal, and 320px layout', async ({
     page,
   }) => {
     await openWebview(page);
@@ -4891,7 +4861,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expectPostedMessage(page, { type: 'requestSettings' });
     await expectPostedMessage(page, { type: 'requestTaskTypesSettings' });
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
-    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('tab', { name: /Agents/i })).toHaveAttribute('aria-selected', 'true');
 
     // --- Task Types: ok first so drafts hydrate pristine, then empty/invalid diagnostics ---
     // (Posting empty before any hydrate would own an empty draft and block later ok hydrate.)
@@ -4913,11 +4883,11 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       'Optional note from host.',
     );
     await expect(page.locator('.type-card')).toHaveCount(1);
-    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute(
+    await expect(page.getByRole('tab', { name: /Agents/i })).toHaveAttribute(
       'data-tab-state',
       'diagnostic',
     );
-    await expect(page.getByTestId('settings-tab-indicator-task-types')).toHaveText('Needs attention');
+    await expect(page.getByTestId('settings-tab-indicator-agents')).toHaveText('Needs attention');
 
     // Empty host map: dirty drafts stay (not overwritten); diagnostic + tab badge still show.
     await postRawHostMessage(page, {
@@ -4927,9 +4897,9 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expect(page.locator('.type-status--empty')).toHaveText('Empty');
     await expect(page.getByTestId('task-types-diagnostic-empty')).toBeVisible();
     await expect(page.getByText(/Host map is empty/i)).toBeVisible();
-    await expect(page.getByRole('textbox', { name: 'Type id' })).toHaveValue('worker');
+    await expect(page.getByRole('textbox', { name: 'Task profile ID' })).toHaveValue('worker');
     // Preserved drafts vs empty host map mark the tab dirty; diagnostic copy remains visible.
-    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute(
+    await expect(page.getByRole('tab', { name: /Agents/i })).toHaveAttribute(
       'data-tab-state',
       'dirty',
     );
@@ -4945,16 +4915,16 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     });
     await expect(page.locator('.type-status--invalid')).toHaveText('Invalid');
     await expect(page.getByTestId('task-types-diagnostic-invalid')).toBeVisible();
-    await expect(page.getByText('Host task types are invalid')).toBeVisible();
+    await expect(page.getByText('Host task profiles are invalid')).toBeVisible();
     await expect(page.getByText('Type id "Bad Id" is invalid.')).toBeVisible();
-    await expect(page.getByRole('textbox', { name: 'Type id' })).toHaveValue('worker');
+    await expect(page.getByRole('textbox', { name: 'Task profile ID' })).toHaveValue('worker');
 
     // Return to a clean ok snapshot for the edit loop.
     await postRawHostMessage(page, {
       type: 'taskTypesSettingsSnapshot',
       snapshot: taskTypesOkSnapshot(),
     });
-    await expect(page.getByRole('textbox', { name: 'Type id' })).toHaveValue('worker');
+    await expect(page.getByRole('textbox', { name: 'Task profile ID' })).toHaveValue('worker');
     await expect(page.locator('.type-status--ok')).toHaveText('Valid');
     // UI dirty compares drafts to the current snapshot types (not intermediate maps).
     await expect(page.getByTestId('task-types-dirty')).toHaveCount(0);
@@ -4963,12 +4933,12 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await page.getByRole('button', { name: /^Add$/ }).click();
     await expect(page.locator('.type-card')).toHaveCount(2);
     await expect(page.getByTestId('task-types-dirty')).toBeVisible();
-    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('data-tab-state', 'dirty');
-    await expect(page.getByTestId('settings-tab-indicator-task-types')).toHaveText('Unsaved');
+    await expect(page.getByRole('tab', { name: /Agents/i })).toHaveAttribute('data-tab-state', 'dirty');
+    await expect(page.getByTestId('settings-tab-indicator-agents')).toHaveText('Unsaved');
 
-    const newId = page.locator('.type-card').nth(1).getByRole('textbox', { name: 'Type id' });
+    const newId = page.locator('.type-card').nth(1).getByRole('textbox', { name: 'Task profile ID' });
     await newId.fill('helper');
-    await page.locator('.type-card').nth(1).getByRole('button', { name: 'Remove type' }).click();
+    await page.locator('.type-card').nth(1).getByRole('button', { name: 'Remove task profile' }).click();
     await expect(page.locator('.type-card')).toHaveCount(1);
 
     // Edit existing row description so draft stays dirty for isolation checks.
@@ -4981,7 +4951,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     ).length;
     await page.getByRole('button', { name: /^Add$/ }).click();
     await page.getByRole('button', { name: /^Save$/ }).click();
-    await expect(page.getByTestId('task-types-draft-error')).toHaveText('Each type needs an id.');
+    await expect(page.getByTestId('task-types-draft-error')).toHaveText('Each task profile needs an ID.');
     await expect
       .poll(async () =>
         (await postedMessages(page)).filter((m) => (m as { type?: string }).type === 'updateTaskTypes')
@@ -4989,7 +4959,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       )
       .toBe(updateTaskTypesBeforeReject);
     // Fill valid id for later save.
-    await page.locator('.type-card').nth(1).getByRole('textbox', { name: 'Type id' }).fill('helper');
+    await page.locator('.type-card').nth(1).getByRole('textbox', { name: 'Task profile ID' }).fill('helper');
     await page.locator('.type-card').nth(1).locator('#tt-desc-1').fill('Helper type');
 
     // Valid save success path.
@@ -5002,14 +4972,14 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       ]),
     });
     await expect(page.getByRole('button', { name: /Saving/i })).toBeVisible();
-    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('data-tab-state', 'saving');
+    await expect(page.getByRole('tab', { name: /Agents/i })).toHaveAttribute('data-tab-state', 'saving');
 
     await postRawHostMessage(page, {
       type: 'taskTypesSettingsUpdateResult',
       result: { ok: true },
     });
     await expect(page.getByTestId('task-types-saved')).toContainText(
-      'Saved task types to workspace settings.',
+      'Saved task profiles to workspace settings.',
     );
     // Force-hydrate snapshot clears dirty only after host success.
     await postRawHostMessage(page, {
@@ -5034,7 +5004,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       }),
     });
     await expect(page.getByTestId('task-types-dirty')).toHaveCount(0);
-    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('data-tab-state', 'saved');
+    await expect(page.getByRole('tab', { name: /Agents/i })).toHaveAttribute('data-tab-state', 'saved');
     await expect(page.locator('.type-card')).toHaveCount(2);
 
     // Sanitized host failure preserves draft and prior saved snapshot.
@@ -5061,14 +5031,14 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       },
     });
     await expect(page.getByTestId('task-types-save-error')).toBeVisible();
-    await expect(page.getByTestId('task-types-save-error')).toContainText('Task types save failed');
+    await expect(page.getByTestId('task-types-save-error')).toContainText('Task profiles save failed');
     await expect(page.getByTestId('task-types-save-error')).toContainText(
       'Unable to update muster.taskTypes.',
     );
     await expect(page.getByText('leaked stack')).toHaveCount(0);
     await expect(page.locator('#tt-desc-0')).toHaveValue('Should stay after failure');
-    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('data-tab-state', 'error');
-    await expect(page.getByTestId('settings-tab-indicator-task-types')).toHaveText('Error');
+    await expect(page.getByRole('tab', { name: /Agents/i })).toHaveAttribute('data-tab-state', 'error');
+    await expect(page.getByTestId('settings-tab-indicator-agents')).toHaveText('Error');
 
     // Stale snapshot must not overwrite dirty Task Types drafts.
     await postRawHostMessage(page, {
@@ -5119,21 +5089,20 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       }),
     });
     await expect(page.locator('.type-card')).toHaveCount(2);
-    await expect(page.getByRole('textbox', { name: 'Type id' }).first()).toHaveValue('worker');
+    await expect(page.getByRole('textbox', { name: 'Task profile ID' }).first()).toHaveValue('worker');
     await expect(page.getByTestId('task-types-dirty')).toHaveCount(0);
 
     // Dirty Task Types again for cross-topic isolation.
     await page.locator('#tt-desc-0').fill('Isolation TT draft');
     await expect(page.getByTestId('task-types-dirty')).toBeVisible();
 
-    // --- Runtime & Storage: validation, success, failed save + draft preservation, stale snapshot ---
-    await page.getByRole('tab', { name: /Runtime & Storage/i }).click();
-    await expect(page.getByRole('tab', { name: /Runtime & Storage/i })).toHaveAttribute('aria-selected', 'true');
+    // --- Data: validation, success, failed save + draft preservation, stale snapshot ---
+    await page.getByRole('tab', { name: /Data/i }).click();
+    await expect(page.getByRole('tab', { name: /Data/i })).toHaveAttribute('aria-selected', 'true');
     await postRawHostMessage(page, {
       type: 'settingsSnapshot',
       snapshot: retentionSettingsSnapshot({ maxRetainedTurnsPerTask: 200, maxStoredOutputChars: 200000 }),
     });
-    await openHistoryStorage(page);
     await expect(page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true })).toHaveValue(
       '200',
     );
@@ -5164,8 +5133,8 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       result: { ok: true, settingId: 'maxRetainedTurnsPerTask', value: 222 },
     });
     await expect(turns).toHaveValue('222');
-    await expect(page.getByTestId('retention-local-success')).toContainText('Saved Retained turns per completed task.');
-    await expect(page.getByRole('tab', { name: /Runtime & Storage/i })).toHaveAttribute('data-tab-state', 'saved');
+    await expect(page.getByTestId('data-local-success')).toContainText('Saved Retained turns per completed task.');
+    await expect(page.getByRole('tab', { name: /Data/i })).toHaveAttribute('data-tab-state', 'saved');
 
     // Failed save keeps attempted draft and prior saved snapshot authoritative.
     const chars = page.getByRole('spinbutton', { name: 'Stored output per turn', exact: true });
@@ -5185,15 +5154,15 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
         message: 'Error: leaked stack trace from vscode.workspace.getConfiguration().update',
       },
     });
-    await expect(page.getByTestId('retention-local-error')).toBeVisible();
-    await expect(page.getByTestId('retention-local-error')).toContainText('Runtime & Storage save failed');
-    await expect(page.getByTestId('retention-local-error')).toContainText(
+    await expect(page.getByTestId('data-local-error')).toBeVisible();
+    await expect(page.getByTestId('data-local-error')).toContainText('Outputs save failed');
+    await expect(page.getByTestId('data-local-error')).toContainText(
       'Unable to save Stored output per turn. Check the VS Code setting and try again.',
     );
     await expect(page.getByText('leaked stack trace')).toHaveCount(0);
     await expect(chars).toHaveValue('333333');
-    await expect(page.getByRole('tab', { name: /Runtime & Storage/i })).toHaveAttribute('data-tab-state', 'error');
-    await expect(page.getByTestId('settings-tab-indicator-retention')).toHaveText('Error');
+    await expect(page.getByRole('tab', { name: /Data/i })).toHaveAttribute('data-tab-state', 'error');
+    await expect(page.getByTestId('settings-tab-indicator-data')).toHaveText('Error');
 
     // Stale snapshot refreshes saved state but cannot overwrite dirty retention draft.
     await postRawHostMessage(page, {
@@ -5203,20 +5172,20 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expect(chars).toHaveValue('333333');
     await expect(turns).toHaveValue('222');
 
-    // --- Cross-topic isolation: drafts, dirty indicators, and topic-local errors ---
-    // Runtime & Storage still dirty+error; Task Types dirty from Isolation TT draft.
-    await page.getByRole('tab', { name: /Task Types/i }).click();
-    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('aria-selected', 'true');
+    // --- Cross-domain isolation: drafts, dirty indicators, and domain-local errors ---
+    // Data still dirty+error; Agents dirty from Isolation TT draft.
+    await page.getByRole('tab', { name: /Agents/i }).click();
+    await expect(page.getByRole('tab', { name: /Agents/i })).toHaveAttribute('aria-selected', 'true');
     await expect(page.locator('#tt-desc-0')).toHaveValue('Isolation TT draft');
     await expect(page.getByTestId('task-types-dirty')).toBeVisible();
     await expect(page.getByTestId('task-types-save-error')).toHaveCount(0);
-    await expect(page.getByTestId('retention-local-error')).toHaveCount(0);
-    // Hidden Runtime & Storage still shows error indicator on its tab.
-    await expect(page.getByRole('tab', { name: /Runtime & Storage/i })).toHaveAttribute('data-tab-state', 'error');
-    await expect(page.getByTestId('settings-tab-indicator-retention')).toHaveText('Error');
-    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('data-tab-state', 'dirty');
+    await expect(page.getByTestId('data-local-error')).toHaveCount(0);
+    // Hidden Data still shows error indicator on its tab.
+    await expect(page.getByRole('tab', { name: /Data/i })).toHaveAttribute('data-tab-state', 'error');
+    await expect(page.getByTestId('settings-tab-indicator-data')).toHaveText('Error');
+    await expect(page.getByRole('tab', { name: /Agents/i })).toHaveAttribute('data-tab-state', 'dirty');
 
-    // Inject Task Types error while Runtime & Storage error remains on its tab.
+    // Inject Agents error while Data error remains on its tab.
     await page.getByRole('button', { name: /^Save$/ }).click();
     await postRawHostMessage(page, {
       type: 'taskTypesSettingsUpdateResult',
@@ -5227,22 +5196,21 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       },
     });
     await expect(page.getByTestId('task-types-save-error')).toBeVisible();
-    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('data-tab-state', 'error');
+    await expect(page.getByRole('tab', { name: /Agents/i })).toHaveAttribute('data-tab-state', 'error');
 
     // Switch repeatedly — both topic indicators and drafts remain isolated.
-    await page.getByRole('tab', { name: /Runtime & Storage/i }).click();
-    await openHistoryStorage(page);
+    await page.getByRole('tab', { name: /Data/i }).click();
     await expect(chars).toHaveValue('333333');
-    await expect(page.getByTestId('retention-local-error')).toBeVisible();
+    await expect(page.getByTestId('data-local-error')).toBeVisible();
     await expect(page.getByTestId('task-types-save-error')).toHaveCount(0);
-    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('data-tab-state', 'error');
+    await expect(page.getByRole('tab', { name: /Agents/i })).toHaveAttribute('data-tab-state', 'error');
 
-    await page.getByRole('tab', { name: /Permissions/i }).click();
+    await page.getByRole('tab', { name: /Execution/i }).click();
     await expect(page.getByTestId('permissions-settings')).toBeVisible();
-    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('data-tab-state', 'error');
-    await expect(page.getByRole('tab', { name: /Runtime & Storage/i })).toHaveAttribute('data-tab-state', 'error');
+    await expect(page.getByRole('tab', { name: /Agents/i })).toHaveAttribute('data-tab-state', 'error');
+    await expect(page.getByRole('tab', { name: /Data/i })).toHaveAttribute('data-tab-state', 'error');
 
-    await page.getByRole('tab', { name: /Task Types/i }).click();
+    await page.getByRole('tab', { name: /Agents/i }).click();
     await expect(page.locator('#tt-desc-0')).toHaveValue('Isolation TT draft');
     await expect(page.getByTestId('task-types-save-error')).toBeVisible();
 
@@ -5261,14 +5229,15 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     expect(capturedState).toEqual(
       expect.objectContaining({
         'muster.settingsView.v1': expect.objectContaining({
-          v: 2,
-          activeTopicId: 'task-types',
+          v: 3,
+          activeTopicId: 'agents',
           taskTypeDrafts: expect.arrayContaining([
             expect.objectContaining({ id: 'worker', description: 'Isolation TT draft' }),
           ]),
           retentionDrafts: expect.objectContaining({
             maxStoredOutputChars: '333333',
           }),
+          retentionDirtySettingIds: ['maxStoredOutputChars'],
         }),
         'muster.sendOutbox.v1': expect.arrayContaining([
           expect.objectContaining({ clientRequestId: 'outbox-keep' }),
@@ -5292,7 +5261,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expectPostedMessage(page, { type: 'requestTaskTypesSettings' });
 
     // Active topic restored to Task Types; drafts restored before host snapshots.
-    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('tab', { name: /Agents/i })).toHaveAttribute('aria-selected', 'true');
     // Host snapshots arrive after restore; dirty drafts must not be overwritten.
     await postRawHostMessage(page, {
       type: 'taskTypesSettingsSnapshot',
@@ -5305,17 +5274,29 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     });
     await postRawHostMessage(page, {
       type: 'settingsSnapshot',
-      snapshot: retentionSettingsSnapshot({ maxRetainedTurnsPerTask: 222, maxStoredOutputChars: 200000 }),
+      snapshot: retentionSettingsSnapshot({
+        runLimit: '4h',
+        maxRetainedTurnsPerTask: 225,
+        maxStoredOutputChars: 200000,
+      }),
     });
     await expect(page.locator('#tt-desc-0')).toHaveValue('Isolation TT draft');
     await expect(page.getByTestId('task-types-dirty')).toBeVisible();
 
-    await page.getByRole('tab', { name: /Runtime & Storage/i }).click();
-    await openHistoryStorage(page);
+    await page.getByRole('tab', { name: /Data/i }).click();
+    await expect(
+      page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true }),
+    ).toHaveValue('225');
     await expect(
       page.getByRole('spinbutton', { name: 'Stored output per turn', exact: true }),
     ).toHaveValue('333333');
-    await expect(page.getByRole('tab', { name: /Runtime & Storage/i })).toHaveAttribute('data-tab-state', 'dirty');
+    await expect(page.getByRole('tab', { name: /Data/i })).toHaveAttribute('data-tab-state', 'dirty');
+
+    await page.getByRole('tab', { name: /Execution/i }).click();
+    await expect(
+      page.getByRole('combobox', { name: 'Maximum uninterrupted agent run' }),
+    ).toHaveValue('4h');
+    await page.getByRole('tab', { name: /Data/i }).click();
 
     // Unrelated bag keys still present after settings writes during restore.
     const restoredBag = await readVsCodeState(page);
@@ -5326,8 +5307,8 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
         ]),
         'muster.composerSelection.v1': expect.objectContaining({ backend: 'claude' }),
         'muster.settingsView.v1': expect.objectContaining({
-          v: 2,
-          activeTopicId: 'retention',
+          v: 3,
+          activeTopicId: 'data',
         }),
       }),
     );
@@ -5335,7 +5316,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     // --- 320px layout remains usable for both topics ---
     await page.setViewportSize({ width: 320, height: 720 });
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
-    await page.getByRole('tab', { name: /Task Types/i }).click();
+    await page.getByRole('tab', { name: /Agents/i }).click();
     await expect(page.locator('.type-card').first()).toBeVisible();
     await expect
       .poll(async () =>
@@ -5355,8 +5336,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       )
       .toEqual({ panelOk: true, cardsOk: true });
 
-    await page.getByRole('tab', { name: /Runtime & Storage/i }).click();
-    await openHistoryStorage(page);
+    await page.getByRole('tab', { name: /Data/i }).click();
     await expect(page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Save Retained turns per completed task' })).toBeVisible();
     await expect
@@ -5391,7 +5371,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expectPostedMessage(page, { type: 'requestPermissionSettings' });
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
 
-    // Seed Task Types + Runtime & Storage so isolation can prove they stay untouched.
+    // Seed Agents + Data so isolation can prove they stay untouched.
     await postRawHostMessage(page, {
       type: 'taskTypesSettingsSnapshot',
       snapshot: taskTypesOkSnapshot({
@@ -5411,8 +5391,8 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       snapshot: retentionSettingsSnapshot({ maxRetainedTurnsPerTask: 111, maxStoredOutputChars: 150000 }),
     });
 
-    await page.getByRole('tab', { name: /Permissions/i }).click();
-    await expect(page.getByRole('tab', { name: /Permissions/i })).toHaveAttribute('aria-selected', 'true');
+    await page.getByRole('tab', { name: /Execution/i }).click();
+    await expect(page.getByRole('tab', { name: /Execution/i })).toHaveAttribute('aria-selected', 'true');
     await expect(page.getByTestId('permissions-loading')).toBeVisible();
     await expect(page.getByTestId('permissions-runtime-note')).toContainText(
       'Runtime permission prompts still appear as in-session permission cards',
@@ -5439,11 +5419,11 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await page.getByTestId('permission-mode-option-readonly').click();
     await expect(page.locator('#permission-mode-readonly')).toBeChecked();
     await expect(page.getByTestId('permissions-dirty')).toBeVisible();
-    await expect(page.getByRole('tab', { name: /Permissions/i })).toHaveAttribute(
+    await expect(page.getByRole('tab', { name: /Execution/i })).toHaveAttribute(
       'data-tab-state',
       'dirty',
     );
-    await expect(page.getByTestId('settings-tab-indicator-permissions')).toHaveText('Unsaved');
+    await expect(page.getByTestId('settings-tab-indicator-execution')).toHaveText('Unsaved');
     await expect(page.getByTestId('permissions-save')).toBeEnabled();
     await expect
       .poll(async () =>
@@ -5456,7 +5436,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     // Success path: explicit Save posts update, then host success + snapshot clear dirty.
     await page.getByTestId('permissions-save').click();
     await expectPostedMessage(page, { type: 'updatePermissionSettings', mode: 'readonly' });
-    await expect(page.getByRole('tab', { name: /Permissions/i })).toHaveAttribute(
+    await expect(page.getByRole('tab', { name: /Execution/i })).toHaveAttribute(
       'data-tab-state',
       'saving',
     );
@@ -5473,7 +5453,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     });
     await expect(page.getByTestId('permissions-dirty')).toHaveCount(0);
     await expect(page.locator('#permission-mode-readonly')).toBeChecked();
-    await expect(page.getByRole('tab', { name: /Permissions/i })).toHaveAttribute(
+    await expect(page.getByRole('tab', { name: /Execution/i })).toHaveAttribute(
       'data-tab-state',
       'saved',
     );
@@ -5503,11 +5483,11 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expect(page.getByText('leaked stack')).toHaveCount(0);
     await expect(page.locator('#permission-mode-allow')).toBeChecked();
     await expect(page.getByTestId('permissions-dirty')).toBeVisible();
-    await expect(page.getByRole('tab', { name: /Permissions/i })).toHaveAttribute(
+    await expect(page.getByRole('tab', { name: /Execution/i })).toHaveAttribute(
       'data-tab-state',
       'error',
     );
-    await expect(page.getByTestId('settings-tab-indicator-permissions')).toHaveText('Error');
+    await expect(page.getByTestId('settings-tab-indicator-execution')).toHaveText('Error');
 
     // Stale snapshot must not overwrite dirty Permissions draft.
     await postRawHostMessage(page, {
@@ -5518,17 +5498,16 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expect(page.getByTestId('permissions-dirty')).toBeVisible();
 
     // Other topics remain untouched by permission failure.
-    await page.getByRole('tab', { name: /Task Types/i }).click();
+    await page.getByRole('tab', { name: /Agents/i }).click();
     await expect(page.locator('#tt-desc-0')).toHaveValue('S03 worker stays');
     await expect(page.getByTestId('task-types-dirty')).toHaveCount(0);
     await expect(page.getByTestId('task-types-save-error')).toHaveCount(0);
-    await page.getByRole('tab', { name: /Runtime & Storage/i }).click();
-    await openHistoryStorage(page);
+    await page.getByRole('tab', { name: /Data/i }).click();
     await expect(
       page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true }),
     ).toHaveValue('111');
-    await expect(page.getByTestId('retention-local-error')).toHaveCount(0);
-    await expect(page.getByRole('tab', { name: /Permissions/i })).toHaveAttribute(
+    await expect(page.getByTestId('data-local-error')).toHaveCount(0);
+    await expect(page.getByRole('tab', { name: /Execution/i })).toHaveAttribute(
       'data-tab-state',
       'error',
     );
@@ -5559,7 +5538,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     // Settings replaces the task surface (runtime card unmounts) and never renders prompt actions.
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
     await expectPostedMessage(page, { type: 'requestPermissionSettings' });
-    await page.getByRole('tab', { name: /Permissions/i }).click();
+    await page.getByRole('tab', { name: /Execution/i }).click();
     await postRawHostMessage(page, {
       type: 'permissionSettingsSnapshot',
       snapshot: permissionSettingsSnapshot('readonly'),
@@ -5612,7 +5591,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       snapshot: retentionSettingsSnapshot({ maxRetainedTurnsPerTask: 122, maxStoredOutputChars: 160000 }),
     });
 
-    await page.getByRole('tab', { name: /Permissions/i }).click();
+    await page.getByRole('tab', { name: /Execution/i }).click();
     await postRawHostMessage(page, {
       type: 'permissionSettingsSnapshot',
       snapshot: permissionSettingsSnapshot('ask'),
@@ -5672,19 +5651,149 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expect(page.locator('#permission-mode-ask')).toBeChecked();
     await expect(page.getByTestId('permissions-dirty')).toBeVisible();
 
-    await page.getByRole('tab', { name: /Task Types/i }).click();
+    await page.getByRole('tab', { name: /Agents/i }).click();
     await expect(page.locator('#tt-desc-0')).toHaveValue('S03 flow worker stays');
     await expect(page.getByTestId('task-types-dirty')).toHaveCount(0);
-    await page.getByRole('tab', { name: /Runtime & Storage/i }).click();
-    await openHistoryStorage(page);
+    await page.getByRole('tab', { name: /Data/i }).click();
     await expect(
       page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true }),
     ).toHaveValue('122');
-    await expect(page.getByTestId('retention-local-error')).toHaveCount(0);
-    await expect(page.getByRole('tab', { name: /Permissions/i })).toHaveAttribute(
+    await expect(page.getByTestId('data-local-error')).toHaveCount(0);
+    await expect(page.getByRole('tab', { name: /Execution/i })).toHaveAttribute(
       'data-tab-state',
       'error',
     );
+  });
+
+  test('M012 S03 isolation: Execution run-limit and Data history feedback never leak across domains', async ({
+    page,
+  }) => {
+    await openWebview(page);
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-m012-s03-iso', goal: 'Cross-domain feedback isolation', viewStatus: 'idle' })],
+      storeRevision: 32,
+    });
+
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await expectPostedMessage(page, { type: 'requestSettings' });
+    await expectPostedMessage(page, { type: 'requestTaskTypesSettings' });
+    await expectPostedMessage(page, { type: 'requestPermissionSettings' });
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+
+    // Seed all three snapshots so every domain hydrates its controls.
+    await postRawHostMessage(page, {
+      type: 'settingsSnapshot',
+      snapshot: retentionSettingsSnapshot({
+        maxRetainedTurnsPerTask: 200,
+        maxStoredOutputChars: 200000,
+        runLimit: '2h',
+      }),
+    });
+    await postRawHostMessage(page, {
+      type: 'taskTypesSettingsSnapshot',
+      snapshot: taskTypesSettingsSnapshot(),
+    });
+    await postRawHostMessage(page, {
+      type: 'permissionSettingsSnapshot',
+      snapshot: permissionSettingsSnapshot('ask'),
+    });
+
+    // An unsolicited unknown-setting failure has no pending owner and therefore
+    // remains visible as a Settings-level alert instead of leaking into a domain.
+    await postRawHostMessage(page, {
+      type: 'settingsUpdateResult',
+      result: {
+        ok: false,
+        code: 'unknownSetting',
+        message: 'Unsupported setting.',
+      },
+    });
+    await expect(page.getByTestId('settings-level-error')).toContainText(
+      'Unable to load or save settings. Check the VS Code setting and try again.',
+    );
+
+    // --- Execution: change runLimit select and save; success stays in Execution ---
+    await page.getByRole('tab', { name: /Execution/i }).click();
+    await expect(page.getByRole('tab', { name: /Execution/i })).toHaveAttribute('aria-selected', 'true');
+    const runLimit = page.getByRole('combobox', { name: 'Maximum uninterrupted agent run' });
+    await expect(runLimit).toHaveValue('2h');
+    await runLimit.selectOption('4h');
+    await page.getByRole('button', { name: 'Save Maximum uninterrupted agent run' }).click();
+    await expectPostedMessage(page, { type: 'updateSetting', settingId: 'runLimit', value: '4h' });
+    await postRawHostMessage(page, {
+      type: 'settingsUpdateResult',
+      result: { ok: true, settingId: 'runLimit', value: '4h' },
+    });
+    await postRawHostMessage(page, {
+      type: 'settingsSnapshot',
+      snapshot: retentionSettingsSnapshot({
+        maxRetainedTurnsPerTask: 200,
+        maxStoredOutputChars: 200000,
+        runLimit: '4h',
+      }),
+    });
+    await expect(page.getByTestId('run-limits-local-success')).toBeVisible();
+    await expect(page.getByTestId('settings-level-error')).toHaveCount(0);
+    // runLimit success never renders in the Data panel.
+    await expect(page.getByTestId('data-local-success')).toHaveCount(0);
+
+    // unknownSetting omits settingId in the result, so App must capture the
+    // pending run-limit owner before clearing the in-flight save state.
+    await runLimit.selectOption('8h');
+    await page.getByRole('button', { name: 'Save Maximum uninterrupted agent run' }).click();
+    await expectPostedMessage(page, { type: 'updateSetting', settingId: 'runLimit', value: '8h' });
+    await postRawHostMessage(page, {
+      type: 'settingsUpdateResult',
+      result: {
+        ok: false,
+        code: 'unknownSetting',
+        message: 'Unsupported setting.',
+      },
+    });
+    await expect(page.getByTestId('run-limits-local-error')).toBeVisible();
+    await expect(page.getByTestId('settings-level-error')).toHaveCount(0);
+
+    // --- Data: neither run-limit success nor its later error leaked here ---
+    await page.getByRole('tab', { name: /Data/i }).click();
+    await expect(page.getByRole('tab', { name: /Data/i })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByTestId('data-local-success')).toHaveCount(0);
+    await expect(page.getByTestId('data-local-error')).toHaveCount(0);
+
+    // Change a Data number field and drive a failing save.
+    const turns = page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true });
+    await turns.fill('210');
+    await page.getByRole('button', { name: 'Save Retained turns per completed task' }).click();
+    await expectPostedMessage(page, {
+      type: 'updateSetting',
+      settingId: 'maxRetainedTurnsPerTask',
+      value: 210,
+    });
+    await postRawHostMessage(page, {
+      type: 'settingsUpdateResult',
+      result: {
+        ok: false,
+        settingId: 'maxRetainedTurnsPerTask',
+        code: 'updateFailed',
+        message: 'Error: /secret leak',
+      },
+    });
+    await expect(page.getByTestId('data-local-error')).toBeVisible();
+    await expect(page.getByTestId('data-local-error')).toContainText('History save failed');
+    await expect(page.getByText('/secret leak')).toHaveCount(0);
+
+    // --- Execution: the Data failure did not leak here ---
+    await page.getByRole('tab', { name: /Execution/i }).click();
+    await expect(page.getByTestId('run-limits-local-error')).toHaveCount(0);
+    // The Data failure leaves Execution outside the error state.
+    await expect(page.getByRole('tab', { name: /Execution/i })).not.toHaveAttribute('data-tab-state', 'error');
+
+    // --- Tab indicators: Data reads Error while Execution does not ---
+    await expect(page.getByTestId('settings-tab-indicator-data')).toHaveText('Error');
+    // Execution's indicator is either absent or non-error, but never reads Error.
+    await expect(
+      page.getByTestId('settings-tab-indicator-execution').filter({ hasText: 'Error' }),
+    ).toHaveCount(0);
   });
 
   test('Enter queues a FIFO follow-up while running; Ctrl+Enter posts sendLiveInput only', async ({ page }) => {
@@ -6622,7 +6731,7 @@ test.describe('Task-tree chrome navigation', () => {
     await expect(page.getByTestId('task-tree-row').filter({ hasText: 'Auth worker' })).toHaveAttribute('aria-current', 'page');
   });
 
-  test('M012 S04 integrated settings acceptance: five-topic keyboard mouse isolation host loops state restore and 320px', async ({
+  test('M012 S04 integrated settings acceptance: three-domain keyboard mouse isolation host loops state restore and 320px', async ({
     page,
   }) => {
     await openWebview(page, {
@@ -6669,25 +6778,23 @@ test.describe('Task-tree chrome navigation', () => {
 
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
 
-    // --- Five-topic taxonomy + WAI-ARIA relationships ---
-    const tablist = page.getByRole('tablist', { name: 'Settings topics' });
+    // --- Three-domain taxonomy + WAI-ARIA relationships ---
+    const tablist = page.getByRole('tablist', { name: 'Settings domains' });
     await expect(tablist).toBeVisible();
     const tabs = tablist.getByRole('tab');
-    await expect(tabs).toHaveCount(5);
-    await expect(tabs.nth(0)).toHaveText(/Task Types/i);
-    await expect(tabs.nth(1)).toHaveText(/Permissions/i);
-    await expect(tabs.nth(2)).toHaveText(/Runtime & Storage/i);
-    await expect(tabs.nth(3)).toHaveText(/Models and CLIs/i);
-    await expect(tabs.nth(4)).toHaveText(/Context and MCP/i);
+    await expect(tabs).toHaveCount(3);
+    await expect(tabs.nth(0)).toHaveText(/Agents/i);
+    await expect(tabs.nth(1)).toHaveText(/Execution/i);
+    await expect(tabs.nth(2)).toHaveText(/Data/i);
 
-    const taskTypesTab = page.getByRole('tab', { name: /Task Types/i });
+    const taskTypesTab = page.getByRole('tab', { name: /Agents/i });
     await expect(taskTypesTab).toHaveAttribute('aria-selected', 'true');
-    await expect(taskTypesTab).toHaveAttribute('aria-controls', 'settings-panel-task-types');
-    await expect(page.getByRole('tabpanel')).toHaveAttribute('id', 'settings-panel-task-types');
-    await expect(page.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', 'settings-tab-task-types');
+    await expect(taskTypesTab).toHaveAttribute('aria-controls', 'settings-panel-agents');
+    await expect(page.getByRole('tabpanel')).toHaveAttribute('id', 'settings-panel-agents');
+    await expect(page.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', 'settings-tab-agents');
 
     // Mouse activation of each topic
-    for (const name of [/Permissions/i, /Runtime & Storage/i, /Models and CLIs/i, /Context and MCP/i, /Task Types/i]) {
+    for (const name of [/Execution/i, /Data/i, /Agents/i]) {
       await page.getByRole('tab', { name }).click();
       await expect(page.getByRole('tab', { name })).toHaveAttribute('aria-selected', 'true');
     }
@@ -6696,14 +6803,14 @@ test.describe('Task-tree chrome navigation', () => {
     await taskTypesTab.focus();
     await expect(taskTypesTab).toBeFocused();
     await taskTypesTab.press('ArrowRight');
-    await expect(page.getByRole('tab', { name: /Permissions/i })).toHaveAttribute('aria-selected', 'true');
-    await page.getByRole('tab', { name: /Permissions/i }).press('End');
-    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toHaveAttribute('aria-selected', 'true');
-    await page.getByRole('tab', { name: /Context and MCP/i }).press('Home');
+    await expect(page.getByRole('tab', { name: /Execution/i })).toHaveAttribute('aria-selected', 'true');
+    await page.getByRole('tab', { name: /Execution/i }).press('End');
+    await expect(page.getByRole('tab', { name: /Data/i })).toHaveAttribute('aria-selected', 'true');
+    await page.getByRole('tab', { name: /Data/i }).press('Home');
     await expect(taskTypesTab).toHaveAttribute('aria-selected', 'true');
     await taskTypesTab.press('ArrowLeft');
-    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toHaveAttribute('aria-selected', 'true');
-    await page.getByRole('tab', { name: /Context and MCP/i }).press('ArrowRight');
+    await expect(page.getByRole('tab', { name: /Data/i })).toHaveAttribute('aria-selected', 'true');
+    await page.getByRole('tab', { name: /Data/i }).press('ArrowRight');
     await expect(taskTypesTab).toHaveAttribute('aria-selected', 'true');
 
     // Tab into panel; selected tab remains selected after focus enters controls
@@ -6711,7 +6818,7 @@ test.describe('Task-tree chrome navigation', () => {
     await expect(taskTypesTab).toHaveAttribute('aria-selected', 'true');
     await expect(page.getByRole('tabpanel')).toBeFocused();
 
-    // --- Successful host-backed update: Task Types ---
+    // --- Successful host-backed update: Task profiles ---
     await page.locator('#tt-desc-0').fill('S04 integrated worker');
     await expect(page.getByTestId('task-types-dirty')).toBeVisible();
     await page.getByRole('button', { name: 'Save', exact: true }).click();
@@ -6749,10 +6856,10 @@ test.describe('Task-tree chrome navigation', () => {
     });
     await expect(page.getByTestId('task-types-dirty')).toHaveCount(0);
     await expect(page.getByTestId('task-types-saved')).toBeVisible();
-    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('data-tab-state', 'saved');
+    await expect(page.getByRole('tab', { name: /Agents/i })).toHaveAttribute('data-tab-state', 'saved');
 
-    // --- Successful host-backed update: Permissions ---
-    await page.getByRole('tab', { name: /Permissions/i }).click();
+    // --- Successful host-backed update: Tool access (Execution) ---
+    await page.getByRole('tab', { name: /Execution/i }).click();
     await page.getByTestId('permission-mode-option-readonly').click();
     await expect(page.getByTestId('permissions-dirty')).toBeVisible();
     await page.getByTestId('permissions-save').click();
@@ -6769,9 +6876,8 @@ test.describe('Task-tree chrome navigation', () => {
     await expect(page.getByTestId('permissions-local-success')).toBeVisible();
     await expect(page.locator('#permission-mode-readonly')).toBeChecked();
 
-    // --- Successful host-backed update: Runtime & Storage ---
-    await page.getByRole('tab', { name: /Runtime & Storage/i }).click();
-    await openHistoryStorage(page);
+    // --- Successful host-backed update: Data ---
+    await page.getByRole('tab', { name: /Data/i }).click();
     const turns = page.getByRole('spinbutton', { name: 'Retained turns per completed task', exact: true });
     await turns.fill('180');
     await page.getByRole('button', { name: 'Save Retained turns per completed task' }).click();
@@ -6789,10 +6895,10 @@ test.describe('Task-tree chrome navigation', () => {
       snapshot: retentionSettingsSnapshot({ maxRetainedTurnsPerTask: 180, maxStoredOutputChars: 150000 }),
     });
     await expect(turns).toHaveValue('180');
-    await expect(page.getByTestId('retention-local-success')).toBeVisible();
+    await expect(page.getByTestId('data-local-success')).toBeVisible();
 
-    // --- Cross-topic isolation: inject sanitized failure into Task Types; others unchanged ---
-    await page.getByRole('tab', { name: /Task Types/i }).click();
+    // --- Cross-topic isolation: inject sanitized failure into Agents; others unchanged ---
+    await page.getByRole('tab', { name: /Agents/i }).click();
     await page.locator('#tt-desc-0').fill('Should stay after failure');
     await expect(page.getByTestId('task-types-dirty')).toBeVisible();
     await page.getByRole('button', { name: 'Save', exact: true }).click();
@@ -6809,20 +6915,19 @@ test.describe('Task-tree chrome navigation', () => {
     await expect(page.locator('#tt-desc-0')).toHaveValue('Should stay after failure');
     await expect(page.getByTestId('task-types-dirty')).toBeVisible();
 
-    // Permissions saved snapshot + indicators remain
-    await page.getByRole('tab', { name: /Permissions/i }).click();
+    // Execution (Tool access) saved snapshot + indicators remain
+    await page.getByRole('tab', { name: /Execution/i }).click();
     await expect(page.locator('#permission-mode-readonly')).toBeChecked();
     await expect(page.getByTestId('permissions-dirty')).toHaveCount(0);
     await expect(page.getByTestId('permissions-local-error')).toHaveCount(0);
 
-    // Runtime & Storage saved snapshot + indicators remain
-    await page.getByRole('tab', { name: /Runtime & Storage/i }).click();
-    await openHistoryStorage(page);
+    // Data saved snapshot + indicators remain
+    await page.getByRole('tab', { name: /Data/i }).click();
     await expect(turns).toHaveValue('180');
-    await expect(page.getByTestId('retention-local-error')).toHaveCount(0);
+    await expect(page.getByTestId('data-local-error')).toHaveCount(0);
 
-    // Dirty Task Types draft survives stale snapshot
-    await page.getByRole('tab', { name: /Task Types/i }).click();
+    // Dirty Agents draft survives stale snapshot
+    await page.getByRole('tab', { name: /Agents/i }).click();
     await postRawHostMessage(page, {
       type: 'taskTypesSettingsSnapshot',
       snapshot: taskTypesOkSnapshot({
@@ -6878,8 +6983,8 @@ test.describe('Task-tree chrome navigation', () => {
     });
     await expect(page.getByTestId('task-types-dirty')).toHaveCount(0);
 
-    // --- Complete user loops re-run (Task Types already above; Permissions allow; Runtime & Storage chars) ---
-    await page.getByRole('tab', { name: /Permissions/i }).click();
+    // --- Complete user loops re-run (Agents already above; Execution allow; Data chars) ---
+    await page.getByRole('tab', { name: /Execution/i }).click();
     await page.getByTestId('permission-mode-option-allow').click();
     await page.getByTestId('permissions-save').click();
     await expectPostedMessage(page, { type: 'updatePermissionSettings', mode: 'allow' });
@@ -6893,8 +6998,7 @@ test.describe('Task-tree chrome navigation', () => {
     });
     await expect(page.locator('#permission-mode-allow')).toBeChecked();
 
-    await page.getByRole('tab', { name: /Runtime & Storage/i }).click();
-    await openHistoryStorage(page);
+    await page.getByRole('tab', { name: /Data/i }).click();
     const chars = page.getByRole('spinbutton', { name: 'Stored output per turn', exact: true });
     await chars.fill('250000');
     await page.getByRole('button', { name: 'Save Stored output per turn' }).click();
@@ -6922,14 +7026,13 @@ test.describe('Task-tree chrome navigation', () => {
     await expect(chars).toHaveValue('333333');
 
     // --- Capture/restore webview state across page recreation ---
-    await page.getByRole('tab', { name: /Models and CLIs/i }).click();
-    await expect(page.getByRole('tab', { name: /Models and CLIs/i })).toHaveAttribute(
+    await page.getByRole('tab', { name: /Execution/i }).click();
+    await expect(page.getByRole('tab', { name: /Execution/i })).toHaveAttribute(
       'aria-selected',
       'true',
     );
     // Leave a dirty retention draft before recreation
-    await page.getByRole('tab', { name: /Runtime & Storage/i }).click();
-    await openHistoryStorage(page);
+    await page.getByRole('tab', { name: /Data/i }).click();
     await chars.fill('444444');
 
     const captured = await page.evaluate(() => {
@@ -6976,15 +7079,14 @@ test.describe('Task-tree chrome navigation', () => {
     });
 
     // Restored navigation + dirty retention draft
-    await expect(page.getByRole('tab', { name: /Runtime & Storage/i })).toHaveAttribute('aria-selected', 'true');
-    await openHistoryStorage(page);
+    await expect(page.getByRole('tab', { name: /Data/i })).toHaveAttribute('aria-selected', 'true');
     await expect(
       page.getByRole('spinbutton', { name: 'Stored output per turn', exact: true }),
     ).toHaveValue('444444');
 
-    // --- 320px: containment, one-row tab overflow, keyboard, Coming soon no-op ---
+    // --- 320px: containment, single-row tabs (no scroll), keyboard ---
     await page.setViewportSize({ width: 320, height: 720 });
-    const tablistNarrow = page.getByRole('tablist', { name: 'Settings topics' });
+    const tablistNarrow = page.getByRole('tablist', { name: 'Settings domains' });
     await expect
       .poll(async () =>
         tablistNarrow.evaluate((el) => {
@@ -6993,53 +7095,28 @@ test.describe('Task-tree chrome navigation', () => {
             wrap: style.flexWrap,
             overflowX: style.overflowX,
             singleRow: (el as HTMLElement).scrollHeight <= (el as HTMLElement).clientHeight + 8,
-            canScroll: (el as HTMLElement).scrollWidth > (el as HTMLElement).clientWidth,
+            // Three equal-width tabs fit; the tablist does not scroll horizontally.
+            canScroll: (el as HTMLElement).scrollWidth > (el as HTMLElement).clientWidth + 1,
           };
         }),
       )
       .toEqual(
         expect.objectContaining({
           wrap: 'nowrap',
-          overflowX: expect.stringMatching(/auto|scroll/),
+          overflowX: 'hidden',
           singleRow: true,
-          canScroll: true,
+          canScroll: false,
         }),
       );
 
-    // Keyboard still reaches last tab
-    await page.getByRole('tab', { name: /Task Types/i }).focus();
-    await page.getByRole('tab', { name: /Task Types/i }).press('End');
-    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toHaveAttribute(
+    // Keyboard still reaches last tab (Data)
+    await page.getByRole('tab', { name: /Agents/i }).focus();
+    await page.getByRole('tab', { name: /Agents/i }).press('End');
+    await expect(page.getByRole('tab', { name: /Data/i })).toHaveAttribute(
       'aria-selected',
       'true',
     );
-    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toBeFocused();
-
-    // Coming soon panels: zero mutation
-    const baseline = await postedMessages(page);
-    const baselineCount = baseline.length;
-    for (const name of [/Models and CLIs/i, /Context and MCP/i]) {
-      await page.getByRole('tab', { name }).click();
-      await expect(page.getByRole('status').filter({ hasText: 'Coming soon' })).toBeVisible();
-    }
-    const after = await postedMessages(page);
-    const mutationTypes = new Set([
-      'updateSetting',
-      'updateTaskTypes',
-      'updatePermissionSettings',
-      'requestSettings',
-      'requestTaskTypesSettings',
-      'requestPermissionSettings',
-      'listBackends',
-      'listModels',
-      'setComposerSelection',
-      'send',
-      'focusTask',
-    ]);
-    const extra = after
-      .slice(baselineCount)
-      .filter((message) => mutationTypes.has((message as { type?: string }).type ?? ''));
-    expect(extra).toEqual([]);
+    await expect(page.getByRole('tab', { name: /Data/i })).toBeFocused();
 
     // Page containment at 320
     await expect

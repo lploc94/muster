@@ -40,8 +40,8 @@ const requiredSettingsConcepts = [
     pattern: /unit[\s\S]*protocol[\s\S]*Playwright/i,
   },
   {
-    name: 'App-owned drafts and topic-local feedback',
-    pattern: /App-owned drafts[\s\S]*topic-local/i,
+    name: 'App-owned drafts and domain-local feedback',
+    pattern: /App-owned drafts[\s\S]*domain-local/i,
   },
   {
     name: 'settings view-state hide/reveal key',
@@ -52,29 +52,38 @@ const requiredSettingsConcepts = [
     pattern: /workspace-level[\s\S]*muster\.taskTypes[\s\S]*Folder-specific resource overrides/i,
   },
   {
-    name: 'five-topic Settings taxonomy',
+    name: 'Settings domain taxonomy',
     pattern:
-      /five[- ]topic[\s\S]*Task Types[\s\S]*Permissions[\s\S]*Retention[\s\S]*Models and CLIs[\s\S]*Context and MCP/i,
+      /four[- ]domain[\s\S]*Agents[\s\S]*Execution[\s\S]*Connections[\s\S]*Data/i,
   },
   {
-    name: 'three active host-owned topics',
-    pattern: /three active host-owned topics[\s\S]*Task Types[\s\S]*Permissions[\s\S]*Retention/i,
+    name: 'three rendered actionable domains',
+    pattern: /three[\s\S]*(?:tabs|domains)[\s\S]*Agents[\s\S]*Execution[\s\S]*Data/i,
   },
   {
-    name: 'two selectable Coming soon topics',
-    pattern: /Coming soon[\s\S]*Models and CLIs[\s\S]*Context and MCP/i,
+    name: 'Connections reserved and not rendered',
+    pattern: /Connections[\s\S]*reserved[\s\S]*not rendered|reserved[\s\S]*Connections/i,
   },
   {
-    name: 'placeholder zero-mutation contract',
-    pattern: /zero[- ]mutation|emit no host mutations|no host mutation/i,
+    name: 'no empty or placeholder navigation',
+    pattern: /no[\s\S]*(?:empty|placeholder)[\s\S]*navigation|no `?Coming soon`? tab/i,
+  },
+  {
+    name: 'rendered section names',
+    pattern: /Task profiles[\s\S]*Run limits[\s\S]*Tool access[\s\S]*History[\s\S]*Outputs/i,
+  },
+  {
+    name: 'cross-domain feedback isolation contract',
+    pattern: /(?:cross-domain|across the two domains|owning domain)[\s\S]*(?:leak|bleed|not render|surface only)/i,
   },
   {
     name: 'WAI-ARIA keyboard tablist behavior',
     pattern: /WAI-ARIA[\s\S]*ArrowLeft[\s\S]*ArrowRight[\s\S]*Home[\s\S]*End/i,
   },
   {
-    name: '320-pixel single-row overflow',
-    pattern: /320[\s\S]*(?:single[- ]row|one[- ]row)[\s\S]*overflow/i,
+    name: '320-pixel equal-width no-scroll row',
+    pattern:
+      /320[\s\S]*(?:equal[- ]width|same width)[\s\S]*(?:one|single)[- ]row[\s\S]*(?:without|no)[- ]horizontal[- ]scroll/i,
   },
   {
     name: 'saved snapshot versus draft versus navigation state',
@@ -119,7 +128,7 @@ const requiredHeadings = [
   '# Settings pattern',
   '## Reader and action',
   '## Non-negotiable invariants',
-  '## Five-topic Settings taxonomy',
+  '## Settings domain taxonomy',
   '## State ownership and workspace scope',
   '## How to add a setting',
   '## Settings addition checklist',
@@ -220,11 +229,16 @@ describe('Settings documentation contract', () => {
     ]);
 
     assert.match(readme, /docs\/SETTINGS\.md/, 'README.md should link docs/SETTINGS.md');
+    assert.match(
+      readme,
+      /SETTINGS-DESIGN\.md[\s\S]*Adopted[\s\S]*three actionable tabs[\s\S]*Connections reserved/i,
+      'README.md should describe the adopted Settings design precisely',
+    );
     assert.match(docsIndex, /\[`?SETTINGS\.md`?\]\(SETTINGS\.md\)/, 'docs/README.md should link SETTINGS.md');
     assert.match(
       docsIndex,
-      /five[- ]topic|Task Types|Permissions|Retention/i,
-      'docs/README.md should advertise the multi-topic Settings surface',
+      /Agents[\s\S]*Execution[\s\S]*Connections[\s\S]*Data|domain shell/i,
+      'docs/README.md should advertise the Settings domain surface',
     );
     assert.match(
       docsIndex,
@@ -315,7 +329,7 @@ describe('Settings documentation contract', () => {
     assert.ok(missingConcepts.includes('extension host owns reads and writes'));
     assert.ok(missingConcepts.includes('invalid updates fail closed with sanitized feedback'));
     assert.ok(missingConcepts.includes('unit and protocol coverage pairs with Playwright harness'));
-    assert.ok(missingConcepts.includes('five-topic Settings taxonomy'));
+    assert.ok(missingConcepts.includes('Settings domain taxonomy'));
     assert.ok(missingConcepts.includes('WAI-ARIA keyboard tablist behavior'));
     assert.ok(missingConcepts.includes('Task Types ship defaults include breakdown'));
   });
@@ -336,7 +350,7 @@ Post-read action: add a new setting to Muster using the same host-backed pattern
 - Settings documentation is part of R008.
 
 ## State ownership and workspace scope
-- App-owned drafts and topic-local feedback.
+- App-owned drafts and domain-local feedback.
 - muster.settingsView.v1
 - workspace-level muster.taskTypes Folder-specific resource overrides
 
@@ -357,11 +371,14 @@ npx playwright test e2e/muster-webview-state.spec.ts
 
     const missing = missingRequiredConcepts(partialGuide);
     for (const name of [
-      'five-topic Settings taxonomy',
+      'Settings domain taxonomy',
       'WAI-ARIA keyboard tablist behavior',
-      '320-pixel single-row overflow',
+      '320-pixel equal-width no-scroll row',
       'permission enum and pending-request isolation',
-      'placeholder zero-mutation contract',
+      'Connections reserved and not rendered',
+      'no empty or placeholder navigation',
+      'rendered section names',
+      'cross-domain feedback isolation contract',
       'browser-versus-native proof boundary',
       'Task Types ship defaults include breakdown',
     ]) {
