@@ -470,6 +470,46 @@ describe('SqliteTaskRepository', () => {
     }
   }, 20_000);
 
+  it('keeps lifecycle, disposition, and cascade commands fenced and atomic on both adapters', async () => {
+    const jsonPath = `/tmp/muster-repository-lifecycle-${Date.now()}-${Math.random()}.json`;
+    const json = new JsonTaskRepository(TaskStore.load({ filePath: jsonPath }), 'ws');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-lifecycle-sqlite-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      await client.run(`INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at) VALUES (?,?,?,?,?)`, ['ws', 'lifecycle-contract', 'Lifecycle', 'now', 'now']);
+      for (const [index, repository] of [json, new SqliteTaskRepository(client, 'ws')].entries()) {
+        const task = makeTask(`lifecycle-task-${index}`);
+        task.releaseState = 'released';
+        await repository.execute({ kind: 'createTask', workspaceId: 'ws', task });
+        const live = { id: `lifecycle-turn-${index}`, taskId: task.id, sequence: 1, status: 'running' as const, trigger: 'user' as const, inputs: [], createdAt: '2026-07-16T00:00:00.000Z' };
+        await repository.execute({ kind: 'createTurn', workspaceId: 'ws', turn: live });
+        const staged = { ...live, disposition: { kind: 'complete' as const, result: 'done' }, status: 'running' as const };
+        await expect(repository.execute({ kind: 'stageDisposition', workspaceId: 'ws', turnId: live.id, opId: 'op-1', turn: staged, expectedStatuses: ['running'] })).resolves.toMatchObject({ changed: true });
+        await expect(repository.execute({ kind: 'stageDisposition', workspaceId: 'ws', turnId: live.id, opId: 'stale', turn: { ...staged, disposition: { kind: 'fail', error: 'bad' } }, expectedStatuses: ['running'], expectedDisposition: staged.disposition })).resolves.toMatchObject({ changed: false });
+        const sealedTask = { ...task, lifecycle: 'cancelled' as const, revision: 1, updatedAt: '2026-07-16T00:00:01.000Z' };
+        const sealedTurn = { ...staged, status: 'interrupted' as const, finishedAt: '2026-07-16T00:00:01.000Z' };
+        await expect(repository.execute({ kind: 'applyTaskLifecycle', workspaceId: 'ws', taskId: task.id, expectedTaskRevision: task.revision, task: sealedTask, turns: [sealedTurn], expectedTurns: [{ id: live.id, status: 'running' }] })).resolves.toMatchObject({ changed: true });
+        await expect(repository.getTask(task.id)).resolves.toMatchObject({ lifecycle: 'cancelled', revision: 1 });
+        await expect(repository.listTurns(task.id)).resolves.toMatchObject([{ status: 'interrupted' }]);
+        await expect(repository.execute({ kind: 'applyTaskLifecycle', workspaceId: 'ws', taskId: task.id, expectedTaskRevision: task.revision, task: sealedTask, turns: [], expectedTurns: [{ id: live.id, status: 'running' }] })).resolves.toMatchObject({ changed: false });
+
+        const root = makeTask(`cascade-root-${index}`);
+        const child = makeTask(`cascade-child-${index}`); child.parentId = root.id;
+        await repository.execute({ kind: 'createTask', workspaceId: 'ws', task: root });
+        await repository.execute({ kind: 'createTask', workspaceId: 'ws', task: child });
+        const skippedRoot = { ...root, lifecycle: 'skipped' as const, revision: 1, updatedAt: '2026-07-16T00:00:02.000Z' };
+        const skippedChild = { ...child, lifecycle: 'skipped' as const, revision: 1, updatedAt: '2026-07-16T00:00:02.000Z' };
+        await expect(repository.execute({ kind: 'cascadeTaskLifecycle', workspaceId: 'ws', rootTaskId: root.id, mode: 'skip', expectedTasks: [{ id: root.id, revision: 0 }, { id: child.id, revision: 0 }], tasks: [skippedChild, skippedRoot], turns: [] })).resolves.toMatchObject({ changed: true });
+        await expect(repository.listSubtree(root.id)).resolves.toMatchObject([{ lifecycle: 'skipped' }, { lifecycle: 'skipped' }]);
+      }
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+      try { fs.unlinkSync(jsonPath); } catch { /* test cleanup */ }
+    }
+  }, 20_000);
+
   it('hydrates domain DTOs from promoted columns and compatibility payloads', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-sqlite-'));
     const dbPath = path.join(dir, 'muster.sqlite3');

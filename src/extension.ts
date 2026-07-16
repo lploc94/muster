@@ -2114,8 +2114,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           // setTaskLifecycle routes 'skipped' → skipTask and 'cancelled' is handled here.
           const result =
             lifecycle === 'cancelled'
-              ? taskEngine.cancelTask(data.taskId)
-              : taskEngine.setTaskLifecycle(data.taskId, lifecycle, {
+              ? await taskEngine.cancelTaskAsync(data.taskId)
+              : await taskEngine.setTaskLifecycleAsync(data.taskId, lifecycle, {
                   result: typeof data.result === 'string' ? data.result : undefined,
                   error: typeof data.error === 'string' ? data.error : undefined,
                 });

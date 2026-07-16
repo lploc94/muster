@@ -11,6 +11,7 @@ import type {
   TaskStoreFile,
   TaskTurn,
   TurnInput,
+  TurnDisposition,
   TurnStatus,
 } from './types';
 import { isMutatingTask, normalizedWritePaths } from './resources';
@@ -97,6 +98,58 @@ export type RepositoryCommand =
       /** Queue/start/continue boundary without a user message. */
       kind: 'queueTaskTurn'; workspaceId: string; expectedTaskRevision: number;
       maxTurnsPerTask: number; task: MusterTask; turn: TaskTurn;
+    }
+  | {
+      /** Stage one disposition on a live turn behind a status/runtime fence. */
+      kind: 'stageDisposition'; workspaceId: string; turnId: string; opId: string;
+      turn: TaskTurn; expectedStatuses: readonly Extract<TurnStatus, 'running' | 'waiting_user'>[];
+      expectedDisposition?: TurnDisposition;
+      expectedRuntimeEpoch?: number;
+    }
+  | {
+      /** Atomically seal one task and settle/cancel its related turns. */
+      kind: 'applyTaskLifecycle'; workspaceId: string; taskId: string;
+      expectedTaskRevision: number; task: MusterTask; turns: readonly TaskTurn[];
+      expectedTurns?: readonly { id: string; status: TurnStatus; runtimeEpoch?: number }[];
+      cancelRequests?: readonly { turnId: string; request: CancelRequest }[];
+    }
+  | {
+      /** Atomically apply a user lifecycle cascade to a task subtree. */
+      kind: 'cascadeTaskLifecycle'; workspaceId: string; rootTaskId: string;
+      mode: 'skip' | 'cancel';
+      expectedTasks: readonly { id: string; revision: number }[];
+      tasks: readonly MusterTask[]; turns: readonly TaskTurn[];
+      expectedTurns?: readonly { id: string; status: TurnStatus; runtimeEpoch?: number }[];
+      cancelRequests?: readonly { turnId: string; request: CancelRequest }[];
+    }
+  | {
+      /** Reconcile a child wait and optionally create its continuation turn. */
+      kind: 'resolveChildWait'; workspaceId: string; taskId: string;
+      expectedTaskRevision: number; task: MusterTask; turn?: TaskTurn;
+    }
+  | {
+      /** Seal a dependency-policy terminal and its live/queued turn atomically. */
+      kind: 'applyDependencyTerminal'; workspaceId: string; taskId: string;
+      expectedTaskRevision: number; task: MusterTask; turn?: TaskTurn;
+    }
+  | {
+      /** Propagate dependency terminal outcomes for a batch of affected tasks. */
+      kind: 'applyDependencyTerminals'; workspaceId: string;
+      expectedTasks: readonly { id: string; revision: number }[];
+      mutations: readonly { taskId: string; task: MusterTask; turn?: TaskTurn }[];
+    }
+  | {
+      /** Reload recovery for one orphan live turn, including queued follow-up holds. */
+      kind: 'reconcileOrphanTurn'; workspaceId: string; taskId: string;
+      expectedTaskRevision: number; expectedTurnStatus: Extract<TurnStatus, 'running' | 'waiting_user'>;
+      task: MusterTask; turn: TaskTurn; heldTurns: readonly TaskTurn[];
+    }
+  | {
+      /** Persist bounded verdict-remediation changes as one named batch. */
+      kind: 'applyVerdictRemediation'; workspaceId: string;
+      expectedTaskRevisions: readonly { id: string; revision: number }[];
+      tasks: readonly MusterTask[]; turns: readonly TaskTurn[];
+      messages: readonly TaskMessage[]; deletedTaskIds?: readonly string[];
     }
   | { kind: 'upsertTask'; workspaceId: string; task: MusterTask }
   | { kind: 'deleteTask'; workspaceId: string; taskId: string }
@@ -322,6 +375,36 @@ function validateQueueTaskTurn(
   if ((command.turn.executionEpoch ?? 1) !== (command.task.executionEpoch ?? 1)) {
     return 'queued turn execution epoch mismatch';
   }
+  return undefined;
+}
+
+function validateLifecycleTask(
+  command: Extract<RepositoryCommand, { kind: 'applyTaskLifecycle' | 'cascadeTaskLifecycle' }>,
+): string | undefined {
+  const tasks: readonly MusterTask[] = command.kind === 'applyTaskLifecycle' ? [command.task] : command.tasks;
+  if (tasks.length === 0) return 'lifecycle command requires at least one task';
+  if (new Set(tasks.map((task) => task.id)).size !== tasks.length) return 'lifecycle command contains duplicate tasks';
+  for (const task of tasks) {
+    if (task.id.length === 0) return 'lifecycle task id is empty';
+    if (task.parentId === task.id) return 'lifecycle task cannot parent itself';
+  }
+  for (const turn of command.turns) {
+    if (!tasks.some((task) => task.id === turn.taskId)) return 'lifecycle turn task is outside aggregate';
+  }
+  return undefined;
+}
+
+function validateAggregateTaskChanges(
+  tasks: readonly MusterTask[],
+  turns: readonly TaskTurn[],
+  messages: readonly TaskMessage[] = [],
+): string | undefined {
+  const taskIds = new Set(tasks.map((task) => task.id));
+  if (new Set(tasks.map((task) => task.id)).size !== tasks.length) return 'aggregate contains duplicate tasks';
+  if (new Set(turns.map((turn) => turn.id)).size !== turns.length) return 'aggregate contains duplicate turns';
+  if (new Set(messages.map((message) => message.id)).size !== messages.length) return 'aggregate contains duplicate messages';
+  if (turns.some((turn) => !taskIds.has(turn.taskId))) return 'aggregate turn task mismatch';
+  if (messages.some((message) => !taskIds.has(message.taskId))) return 'aggregate message task mismatch';
   return undefined;
 }
 
@@ -726,6 +809,137 @@ export class JsonTaskRepository implements TaskRepository {
           draft.tasks[command.task.id] = clone(command.task);
           draft.turns[command.turn.id] = clone(command.turn);
           changed = true;
+          return { ok: true };
+        }
+        case 'stageDisposition': {
+          const existing = draft.turns[command.turnId];
+          const task = existing ? draft.tasks[existing.taskId] : undefined;
+          if (!existing || !task || existing.id !== command.turn.id || existing.taskId !== command.turn.taskId) {
+            return { ok: false, reason: 'turn not found' };
+          }
+          if (!command.expectedStatuses.includes(existing.status as never)) {
+            return { ok: false, reason: 'stageDisposition requires a live turn' };
+          }
+          if (command.expectedDisposition !== undefined && JSON.stringify(existing.disposition) !== JSON.stringify(command.expectedDisposition)) {
+            return { ok: false, reason: 'disposition changed; retry' };
+          }
+          // A live turn may only stage its first disposition. Replays of the
+          // exact same disposition are idempotent; a different payload/op can
+          // never overwrite the winner.
+          if (existing.disposition !== undefined && JSON.stringify(existing.disposition) !== JSON.stringify(command.turn.disposition)) {
+            return { ok: false, reason: 'disposition already staged' };
+          }
+          if (command.expectedRuntimeEpoch !== undefined &&
+            ((existing.runtimeEpoch ?? 1) !== command.expectedRuntimeEpoch || (task.runtimeEpoch ?? 1) !== command.expectedRuntimeEpoch)) {
+            return { ok: false, reason: 'runtime binding was superseded' };
+          }
+          if (JSON.stringify(existing) === JSON.stringify(command.turn)) return { ok: true };
+          draft.turns[command.turnId] = clone(command.turn);
+          changed = true;
+          return { ok: true };
+        }
+        case 'applyTaskLifecycle': {
+          const invalid = validateLifecycleTask(command);
+          if (invalid) return { ok: false, reason: invalid };
+          const current = draft.tasks[command.taskId];
+          if (!current) return { ok: false, reason: 'task not found' };
+          if (current.revision !== command.expectedTaskRevision) return { ok: false, reason: 'task changed; retry' };
+          if (command.task.id !== command.taskId) return { ok: false, reason: 'lifecycle task id mismatch' };
+          for (const expected of command.expectedTurns ?? []) {
+            const currentTurn = draft.turns[expected.id];
+            if (!currentTurn || currentTurn.status !== expected.status ||
+              (expected.runtimeEpoch !== undefined && (currentTurn.runtimeEpoch ?? 1) !== expected.runtimeEpoch)) {
+              return { ok: false, reason: 'turn changed; retry' };
+            }
+          }
+          draft.tasks[command.taskId] = clone(command.task);
+          for (const turn of command.turns) draft.turns[turn.id] = clone(turn);
+          for (const entry of command.cancelRequests ?? []) {
+            draft.cancelRequests = draft.cancelRequests ?? {};
+            draft.cancelRequests[entry.turnId] = clone(entry.request);
+          }
+          changed = true;
+          return { ok: true };
+        }
+        case 'cascadeTaskLifecycle': {
+          const invalid = validateLifecycleTask(command);
+          if (invalid) return { ok: false, reason: invalid };
+          const expected = new Map(command.expectedTasks.map((entry) => [entry.id, entry.revision]));
+          for (const task of command.tasks) {
+            const current = draft.tasks[task.id];
+            if (!current || current.revision !== expected.get(task.id)) return { ok: false, reason: 'task changed; retry' };
+          }
+          for (const expectedTurn of command.expectedTurns ?? []) {
+            const currentTurn = draft.turns[expectedTurn.id];
+            if (!currentTurn || currentTurn.status !== expectedTurn.status ||
+              (expectedTurn.runtimeEpoch !== undefined && (currentTurn.runtimeEpoch ?? 1) !== expectedTurn.runtimeEpoch)) {
+              return { ok: false, reason: 'turn changed; retry' };
+            }
+          }
+          for (const task of command.tasks) draft.tasks[task.id] = clone(task);
+          for (const turn of command.turns) draft.turns[turn.id] = clone(turn);
+          for (const entry of command.cancelRequests ?? []) {
+            draft.cancelRequests = draft.cancelRequests ?? {};
+            draft.cancelRequests[entry.turnId] = clone(entry.request);
+          }
+          changed = command.tasks.length > 0;
+          return { ok: true };
+        }
+        case 'resolveChildWait':
+        case 'applyDependencyTerminal': {
+          const current = draft.tasks[command.taskId];
+          if (!current) return { ok: false, reason: 'task not found' };
+          if (current.revision !== command.expectedTaskRevision) return { ok: false, reason: 'task changed; retry' };
+          if (command.task.id !== command.taskId) return { ok: false, reason: 'task id mismatch' };
+          draft.tasks[command.taskId] = clone(command.task);
+          if (command.turn) draft.turns[command.turn.id] = clone(command.turn);
+          changed = true;
+          return { ok: true };
+        }
+        case 'applyDependencyTerminals': {
+          const expected = new Map(command.expectedTasks.map((entry) => [entry.id, entry.revision]));
+          for (const mutation of command.mutations) {
+            const current = draft.tasks[mutation.taskId];
+            if (!current || current.revision !== expected.get(mutation.taskId)) return { ok: false, reason: 'task changed; retry' };
+            if (mutation.task.id !== mutation.taskId) return { ok: false, reason: 'dependency task id mismatch' };
+          }
+          for (const mutation of command.mutations) {
+            draft.tasks[mutation.taskId] = clone(mutation.task);
+            if (mutation.turn) draft.turns[mutation.turn.id] = clone(mutation.turn);
+          }
+          changed = command.mutations.length > 0;
+          return { ok: true };
+        }
+        case 'reconcileOrphanTurn': {
+          const currentTask = draft.tasks[command.taskId];
+          const currentTurn = draft.turns[command.turn.id];
+          if (!currentTask || !currentTurn) return { ok: false, reason: 'orphan turn not found' };
+          if (currentTask.revision !== command.expectedTaskRevision || currentTurn.status !== command.expectedTurnStatus) {
+            return { ok: false, reason: 'orphan state changed; retry' };
+          }
+          if (command.task.id !== command.taskId || command.turn.taskId !== command.taskId) {
+            return { ok: false, reason: 'orphan aggregate mismatch' };
+          }
+          draft.tasks[command.taskId] = clone(command.task);
+          draft.turns[command.turn.id] = clone(command.turn);
+          for (const held of command.heldTurns) {
+            if (draft.turns[held.id]?.status === 'queued') draft.turns[held.id] = clone(held);
+          }
+          changed = true;
+          return { ok: true };
+        }
+        case 'applyVerdictRemediation': {
+          const invalid = validateAggregateTaskChanges(command.tasks, command.turns, command.messages);
+          if (invalid) return { ok: false, reason: invalid };
+          for (const expected of command.expectedTaskRevisions) {
+            const current = draft.tasks[expected.id];
+            if (!current || current.revision !== expected.revision) return { ok: false, reason: 'task changed; retry' };
+          }
+          if (command.deletedTaskIds?.length) deleteTaskIdsFromFile(draft, command.deletedTaskIds);
+          for (const task of command.tasks) draft.tasks[task.id] = clone(task);
+          for (const turn of command.turns) draft.turns[turn.id] = clone(turn);
+          for (const message of command.messages) draft.messages[message.id] = clone(message);
+          changed = command.tasks.length > 0 || command.turns.length > 0 || command.messages.length > 0 || (command.deletedTaskIds?.length ?? 0) > 0;
           return { ok: true };
         }
         case 'upsertTask':
@@ -1657,6 +1871,22 @@ export class SqliteTaskRepository implements TaskRepository {
         return this.retryTurn(command);
       case 'queueTaskTurn':
         return this.queueTaskTurn(command);
+      case 'stageDisposition':
+        return this.stageDisposition(command);
+      case 'applyTaskLifecycle':
+        return this.applyTaskLifecycle(command);
+      case 'cascadeTaskLifecycle':
+        return this.cascadeTaskLifecycle(command);
+      case 'resolveChildWait':
+        return this.resolveChildWait(command);
+      case 'applyDependencyTerminal':
+        return this.applyDependencyTerminal(command);
+      case 'applyDependencyTerminals':
+        return this.applyDependencyTerminals(command);
+      case 'reconcileOrphanTurn':
+        return this.reconcileOrphanTurn(command);
+      case 'applyVerdictRemediation':
+        return this.applyVerdictRemediation(command);
       case 'upsertTask':
         return this.writeTask(command.task, true);
       case 'clearHistory':
@@ -2043,6 +2273,200 @@ export class SqliteTaskRepository implements TaskRepository {
     return { ok: true, changed, ...(changed ? {} : { reason: 'task changed or max turns per task exceeded; retry' }) };
   }
 
+  private async stageDisposition(
+    command: Extract<RepositoryCommand, { kind: 'stageDisposition' }>,
+  ): Promise<RepositoryCommandResult> {
+    if (command.expectedStatuses.length === 0) return { ok: true, changed: false, reason: 'expected live status required' };
+    if (command.expectedDisposition !== undefined && JSON.stringify(command.expectedDisposition) !== JSON.stringify(command.turn.disposition)) {
+      return { ok: true, changed: false, reason: 'disposition already staged' };
+    }
+    const results = await this.writeIfFirstChanged(
+      guardedStageDispositionStatement(this.workspaceId, command),
+      [],
+      { kind: 'turn', id: command.turnId, taskId: command.turn.taskId, change: 'stage_disposition' },
+      command.turn.startedAt ?? command.turn.createdAt,
+    );
+    return {
+      ok: true,
+      changed: (results[0]?.changes ?? 0) > 0,
+      ...((results[0]?.changes ?? 0) === 0 ? { reason: 'turn is no longer live' } : {}),
+    };
+  }
+
+  private async applyTaskLifecycle(
+    command: Extract<RepositoryCommand, { kind: 'applyTaskLifecycle' }>,
+  ): Promise<RepositoryCommandResult> {
+    const invalid = validateLifecycleTask(command);
+    if (invalid || command.task.id !== command.taskId) return { ok: true, changed: false, reason: invalid ?? 'lifecycle task id mismatch' };
+    const rest: SqlStatement[] = [
+      ...taskMutationStatements(this.workspaceId, command.task),
+      ...command.turns.flatMap((turn) => turnMutationStatements(this.workspaceId, turn)),
+      ...(command.cancelRequests ?? []).map((entry) => cancelRequestStatement(this.workspaceId, {
+        kind: 'putCancelRequest', workspaceId: this.workspaceId, turnId: entry.turnId, request: entry.request,
+      })),
+    ];
+    const changes: ChangeRecord[] = [
+      { kind: 'task', id: command.task.id, change: 'lifecycle' },
+      ...command.turns.map((turn) => ({ kind: 'turn' as const, id: turn.id, taskId: turn.taskId, change: 'lifecycle' })),
+      ...(command.cancelRequests ?? []).map((entry) => ({ kind: 'cancel_request' as const, id: entry.turnId, change: 'put' })),
+    ];
+    const lifecycleGuard = appendTurnFence(
+      `UPDATE tasks SET updated_at = updated_at
+         WHERE workspace_id = ? AND id = ? AND revision = ?`,
+      [this.workspaceId, command.taskId, command.expectedTaskRevision],
+      this.workspaceId,
+      command.expectedTurns,
+    );
+    const results = await this.writeIfFirstChanged(
+      { sql: lifecycleGuard.sql, params: lifecycleGuard.params },
+      rest,
+      changes,
+      command.task.updatedAt,
+    );
+    return { ok: true, changed: (results[0]?.changes ?? 0) > 0, ...((results[0]?.changes ?? 0) === 0 ? { reason: 'task changed; retry' } : {}) };
+  }
+
+  private async cascadeTaskLifecycle(
+    command: Extract<RepositoryCommand, { kind: 'cascadeTaskLifecycle' }>,
+  ): Promise<RepositoryCommandResult> {
+    const invalid = validateLifecycleTask(command);
+    if (invalid) return { ok: true, changed: false, reason: invalid };
+    const rest: SqlStatement[] = [
+      ...command.tasks.flatMap((task) => taskMutationStatements(this.workspaceId, task)),
+      ...command.turns.flatMap((turn) => turnMutationStatements(this.workspaceId, turn)),
+      ...(command.cancelRequests ?? []).map((entry) => cancelRequestStatement(this.workspaceId, {
+        kind: 'putCancelRequest', workspaceId: this.workspaceId, turnId: entry.turnId, request: entry.request,
+      })),
+    ];
+    const changes: ChangeRecord[] = [
+      ...command.tasks.map((task) => ({ kind: 'task' as const, id: task.id, change: `cascade_${command.mode}` })),
+      ...command.turns.map((turn) => ({ kind: 'turn' as const, id: turn.id, taskId: turn.taskId, change: `cascade_${command.mode}` })),
+      ...(command.cancelRequests ?? []).map((entry) => ({ kind: 'cancel_request' as const, id: entry.turnId, change: 'put' })),
+    ];
+    const cascadeGuard = taskRevisionGuardStatement(this.workspaceId, command.expectedTasks);
+    const fencedCascade = appendTurnFence(cascadeGuard.sql, cascadeGuard.params ?? [], this.workspaceId, command.expectedTurns);
+    const results = await this.writeIfFirstChanged(
+      { sql: fencedCascade.sql, params: fencedCascade.params },
+      rest,
+      changes,
+      command.tasks[0]?.updatedAt ?? new Date().toISOString(),
+    );
+    return { ok: true, changed: (results[0]?.changes ?? 0) > 0, ...((results[0]?.changes ?? 0) === 0 ? { reason: 'task changed; retry' } : {}) };
+  }
+
+  private async resolveChildWait(
+    command: Extract<RepositoryCommand, { kind: 'resolveChildWait' }>,
+  ): Promise<RepositoryCommandResult> {
+    return this.applyTaskAndOptionalTurn(command, 'child_wait');
+  }
+
+  private async applyDependencyTerminal(
+    command: Extract<RepositoryCommand, { kind: 'applyDependencyTerminal' }>,
+  ): Promise<RepositoryCommandResult> {
+    return this.applyTaskAndOptionalTurn(command, 'dependency_terminal');
+  }
+
+  private async applyDependencyTerminals(
+    command: Extract<RepositoryCommand, { kind: 'applyDependencyTerminals' }>,
+  ): Promise<RepositoryCommandResult> {
+    if (command.mutations.length === 0 || command.expectedTasks.length === 0) return { ok: true, changed: false };
+    const rest: SqlStatement[] = [];
+    for (const mutation of command.mutations) {
+      rest.push(...taskMutationStatements(this.workspaceId, mutation.task));
+      if (mutation.turn) rest.push(...turnMutationStatements(this.workspaceId, mutation.turn));
+    }
+    const changes: ChangeRecord[] = command.mutations.flatMap((mutation) => [
+      { kind: 'task' as const, id: mutation.taskId, change: 'dependency_terminal' },
+      ...(mutation.turn ? [{ kind: 'turn' as const, id: mutation.turn.id, taskId: mutation.turn.taskId, change: 'dependency_terminal' }] : []),
+    ]);
+    const results = await this.writeIfFirstChanged(
+      taskRevisionGuardStatement(this.workspaceId, command.expectedTasks),
+      rest,
+      changes,
+      command.mutations[0]!.task.updatedAt,
+    );
+    return { ok: true, changed: (results[0]?.changes ?? 0) > 0, ...((results[0]?.changes ?? 0) === 0 ? { reason: 'task changed; retry' } : {}) };
+  }
+
+  private async applyTaskAndOptionalTurn(
+    command:
+      | Extract<RepositoryCommand, { kind: 'resolveChildWait' }>
+      | Extract<RepositoryCommand, { kind: 'applyDependencyTerminal' }>,
+    change: string,
+  ): Promise<RepositoryCommandResult> {
+    const rest: SqlStatement[] = [
+      ...taskMutationStatements(this.workspaceId, command.task),
+      ...(command.turn ? turnMutationStatements(this.workspaceId, command.turn) : []),
+    ];
+    const changes: ChangeRecord[] = [
+      { kind: 'task', id: command.task.id, change },
+      ...(command.turn ? [{ kind: 'turn' as const, id: command.turn.id, taskId: command.turn.taskId, change }] : []),
+    ];
+    const results = await this.writeIfFirstChanged(
+      { sql: 'UPDATE tasks SET updated_at = updated_at WHERE workspace_id = ? AND id = ? AND revision = ?', params: [this.workspaceId, command.taskId, command.expectedTaskRevision] },
+      rest,
+      changes,
+      command.task.updatedAt,
+    );
+    return { ok: true, changed: (results[0]?.changes ?? 0) > 0, ...((results[0]?.changes ?? 0) === 0 ? { reason: 'task changed; retry' } : {}) };
+  }
+
+  private async reconcileOrphanTurn(
+    command: Extract<RepositoryCommand, { kind: 'reconcileOrphanTurn' }>,
+  ): Promise<RepositoryCommandResult> {
+    const rest: SqlStatement[] = [
+      ...taskMutationStatements(this.workspaceId, command.task),
+      ...turnMutationStatements(this.workspaceId, command.turn),
+      ...command.heldTurns.flatMap((turn) => turnMutationStatements(this.workspaceId, turn)),
+    ];
+    const changes: ChangeRecord[] = [
+      { kind: 'task', id: command.task.id, change: 'reload_reconcile' },
+      { kind: 'turn', id: command.turn.id, taskId: command.task.id, change: 'reload_reconcile' },
+      ...command.heldTurns.map((turn) => ({ kind: 'turn' as const, id: turn.id, taskId: turn.taskId, change: 'hold_follow_up' })),
+    ];
+    const results = await this.writeIfFirstChanged(
+      {
+        sql: `UPDATE tasks SET updated_at = updated_at
+               WHERE workspace_id = ? AND id = ? AND revision = ?
+                 AND EXISTS (SELECT 1 FROM turns WHERE workspace_id = ? AND id = ? AND status = ?)`,
+        params: [this.workspaceId, command.taskId, command.expectedTaskRevision, this.workspaceId, command.turn.id, command.expectedTurnStatus],
+      },
+      rest,
+      changes,
+      command.turn.finishedAt ?? command.turn.createdAt,
+    );
+    return { ok: true, changed: (results[0]?.changes ?? 0) > 0, ...((results[0]?.changes ?? 0) === 0 ? { reason: 'orphan state changed; retry' } : {}) };
+  }
+
+  private async applyVerdictRemediation(
+    command: Extract<RepositoryCommand, { kind: 'applyVerdictRemediation' }>,
+  ): Promise<RepositoryCommandResult> {
+    const invalid = validateAggregateTaskChanges(command.tasks, command.turns, command.messages);
+    if (invalid || command.expectedTaskRevisions.length === 0) {
+      return { ok: true, changed: false, reason: invalid ?? 'remediation revision guard is empty' };
+    }
+    const rest: SqlStatement[] = [];
+    for (const id of command.deletedTaskIds ?? []) {
+      rest.push({ sql: 'DELETE FROM tasks WHERE workspace_id = ? AND id = ?', params: [this.workspaceId, id] });
+    }
+    for (const task of command.tasks) rest.push(...taskMutationStatements(this.workspaceId, task));
+    for (const turn of command.turns) rest.push(...turnMutationStatements(this.workspaceId, turn));
+    for (const message of command.messages) rest.push(messageStatement(this.workspaceId, message, true));
+    const changes: ChangeRecord[] = [
+      ...command.deletedTaskIds?.map((id) => ({ kind: 'task' as const, id, change: 'delete_remediation' })) ?? [],
+      ...command.tasks.map((task) => ({ kind: 'task' as const, id: task.id, change: 'verdict_remediation' })),
+      ...command.turns.map((turn) => ({ kind: 'turn' as const, id: turn.id, taskId: turn.taskId, change: 'verdict_remediation' })),
+      ...command.messages.map((message) => ({ kind: 'message' as const, id: message.id, taskId: message.taskId, change: 'verdict_remediation' })),
+    ];
+    const results = await this.writeIfFirstChanged(
+      taskRevisionGuardStatement(this.workspaceId, command.expectedTaskRevisions),
+      rest,
+      changes,
+      command.tasks[0]?.updatedAt ?? new Date().toISOString(),
+    );
+    return { ok: true, changed: (results[0]?.changes ?? 0) > 0, ...((results[0]?.changes ?? 0) === 0 ? { reason: 'task changed; retry' } : {}) };
+  }
+
   private async claimOperation(
     command: Extract<RepositoryCommand, { kind: 'claimOperation' }>,
   ): Promise<RepositoryCommandResult> {
@@ -2413,6 +2837,86 @@ function taskStatement(workspaceId: string, task: MusterTask, upsert: boolean): 
   };
 }
 
+function taskMutationStatements(workspaceId: string, task: MusterTask): SqlStatement[] {
+  return [
+    taskStatement(workspaceId, task, true),
+    { sql: 'DELETE FROM task_dependencies WHERE workspace_id = ? AND task_id = ?', params: [workspaceId, task.id] },
+    ...task.dependencies.map((dependency) => dependencyStatement(workspaceId, task.id, dependency)),
+  ];
+}
+
+function turnMutationStatements(workspaceId: string, turn: TaskTurn): SqlStatement[] {
+  return [
+    turnStatement(workspaceId, turn, true),
+    { sql: 'DELETE FROM turn_inputs WHERE workspace_id = ? AND turn_id = ?', params: [workspaceId, turn.id] },
+    ...turn.inputs.map((input, ordering) => turnInputStatement(workspaceId, turn.id, ordering, input)),
+  ];
+}
+
+function taskRevisionGuardStatement(
+  workspaceId: string,
+  expected: readonly { id: string; revision: number }[],
+): SqlStatement {
+  if (expected.length === 0) {
+    throw new Error('task revision guard requires at least one task');
+  }
+  const first = expected[0]!;
+  const mismatch = expected
+    .map(() => '(checked.id = ? AND checked.revision <> ?)')
+    .join(' OR ');
+  const mismatchParams = expected.flatMap((entry) => [entry.id, entry.revision] as SqlValue[]);
+  const ids = placeholders(expected.length);
+  return {
+    sql: `UPDATE tasks SET updated_at = updated_at
+           WHERE workspace_id = ? AND id = ? AND revision = ?
+             AND (SELECT COUNT(*) FROM tasks present
+                    WHERE present.workspace_id = ? AND present.id IN (${ids})) = ?
+             AND NOT EXISTS (
+                   SELECT 1 FROM tasks checked
+                    WHERE checked.workspace_id = ? AND (${mismatch})
+             )`,
+    params: [
+      workspaceId, first.id, first.revision,
+      workspaceId, ...expected.map((entry) => entry.id), expected.length,
+      workspaceId, ...mismatchParams,
+    ],
+  };
+}
+
+function appendTurnFence(
+  baseSql: string,
+  baseParams: SqlValue[],
+  workspaceId: string,
+  expectedTurns: readonly { id: string; status: TurnStatus; runtimeEpoch?: number }[] | undefined,
+): { sql: string; params: SqlValue[] } {
+  if (!expectedTurns || expectedTurns.length === 0) return { sql: baseSql, params: baseParams };
+  const mismatch = expectedTurns.map((entry) =>
+    entry.runtimeEpoch === undefined
+      ? '(checked_turn.id = ? AND checked_turn.status <> ?)'
+      : `(checked_turn.id = ? AND (checked_turn.status <> ? OR COALESCE(json_extract(checked_turn.payload_json, '$.runtimeEpoch'), 1) <> ?))`,
+  ).join(' OR ');
+  const mismatchParams = expectedTurns.flatMap((entry) =>
+    entry.runtimeEpoch === undefined
+      ? [entry.id, entry.status] as SqlValue[]
+      : [entry.id, entry.status, entry.runtimeEpoch] as SqlValue[],
+  );
+  const ids = placeholders(expectedTurns.length);
+  return {
+    sql: `${baseSql}
+      AND (SELECT COUNT(*) FROM turns present_turn
+             WHERE present_turn.workspace_id = ? AND present_turn.id IN (${ids})) = ?
+      AND NOT EXISTS (
+            SELECT 1 FROM turns checked_turn
+             WHERE checked_turn.workspace_id = ? AND (${mismatch})
+          )`,
+    params: [
+      ...baseParams,
+      workspaceId, ...expectedTurns.map((entry) => entry.id), expectedTurns.length,
+      workspaceId, ...mismatchParams,
+    ],
+  };
+}
+
 /**
  * Optimistic task update used by the FIFO enqueue command. The turn-cap
  * predicate is evaluated while the IMMEDIATE transaction owns the write lock,
@@ -2522,6 +3026,37 @@ function guardedLiveTurnReplaceStatement(
     params: [
       turn.taskId, turn.sequence, turn.status, turn.trigger, turn.createdAt, turn.startedAt ?? null,
       turn.finishedAt ?? null, turnPayload(turn), workspaceId, turn.id, ...statuses,
+      ...(command.expectedRuntimeEpoch === undefined ? [] : [command.expectedRuntimeEpoch]),
+    ],
+  };
+}
+
+function guardedStageDispositionStatement(
+  workspaceId: string,
+  command: Extract<RepositoryCommand, { kind: 'stageDisposition' }>,
+): SqlStatement {
+  const dispositionPredicate = command.expectedDisposition === undefined
+    ? (command.turn.disposition === undefined
+      ? ` AND json_extract(payload_json, '$.disposition') IS NULL`
+      : ` AND (json_extract(payload_json, '$.disposition') IS NULL OR json_extract(payload_json, '$.disposition') = json(?))`)
+    : ` AND json_extract(payload_json, '$.disposition') = json(?)`;
+  const epochPredicate = command.expectedRuntimeEpoch === undefined
+    ? ''
+    : ` AND EXISTS (
+          SELECT 1 FROM tasks task
+           WHERE task.workspace_id = turns.workspace_id AND task.id = turns.task_id
+             AND COALESCE(json_extract(task.payload_json, '$.runtimeEpoch'), 1) = ?
+        )`;
+  return {
+    sql: `UPDATE turns
+             SET task_id=?, sequence=?, status=?, trigger=?, created_at=?, started_at=?, settled_at=?, payload_json=?
+           WHERE workspace_id=? AND id=? AND status IN (${placeholders(command.expectedStatuses.length)})${dispositionPredicate}${epochPredicate}`,
+    params: [
+      command.turn.taskId, command.turn.sequence, command.turn.status, command.turn.trigger, command.turn.createdAt,
+      command.turn.startedAt ?? null, command.turn.finishedAt ?? null, turnPayload(command.turn), workspaceId, command.turnId,
+      ...command.expectedStatuses,
+      ...(command.turn.disposition === undefined || command.expectedDisposition !== undefined ? [] : [JSON.stringify(command.turn.disposition)]),
+      ...(command.expectedDisposition === undefined ? [] : [JSON.stringify(command.expectedDisposition)]),
       ...(command.expectedRuntimeEpoch === undefined ? [] : [command.expectedRuntimeEpoch]),
     ],
   };
