@@ -291,6 +291,7 @@ describe('Settings documentation contract', () => {
       'npm test',
       'npm run test:settings-docs',
       'npm run test:settings-live-evidence',
+      'npm run compile',
       'npm run check:svelte',
       'npm run test:webview',
     ]) {
@@ -303,12 +304,8 @@ describe('Settings documentation contract', () => {
       /(?:^|[^\w-])(?:CI|hosted CI|GitHub Actions)\s+(?:ran|runs|proves|proved|validates|validated)\s+(?:native|live[- ]host|Extension Development Host)\s+(?:UAT|proof|scenarios?)/im,
       'CI must not claim native UAT ran',
     );
-    // Source-boundary smoke still forbids a bare `npm run compile` CI step.
-    assert.doesNotMatch(
-      ciText,
-      /^\s*-\s*run:\s*npm run compile\s*(?:#.*)?$/m,
-      'CI must not retain a bare compile-only step',
-    );
+    // Align with source-boundary: compile is required after npm test (not compile-only).
+    assert.match(ciText, /run: npm test[\s\S]*run: npm run compile/, 'CI must run compile after npm test');
   });
 
   it('rejects fixture docs that omit required host-backed concepts', () => {
