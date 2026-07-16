@@ -143,6 +143,53 @@ describe('SqliteTaskRepository', () => {
     }
   }, 20_000);
 
+  it('consumes a cancel request with owner/request fences and releases all claims', async () => {
+    const jsonPath = `/tmp/muster-repository-cancel-consumer-${Date.now()}-${Math.random()}.json`;
+    const jsonStore = TaskStore.load({ filePath: jsonPath });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-cancel-consumer-sqlite-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      await client.run(`INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at) VALUES (?,?,?,?,?)`, ['ws', 'cancel-consumer', 'Cancel', 'now', 'now']);
+      const repositories = [new JsonTaskRepository(jsonStore, 'ws'), new SqliteTaskRepository(client, 'ws')];
+      for (const repository of repositories) {
+        const task = { ...makeTask(`cancel-task-${Math.random()}`), releaseState: 'released' as const };
+        const turn = { id: `${task.id}-turn`, taskId: task.id, sequence: 1, status: 'running' as const, trigger: 'engine' as const, inputs: [], createdAt: '2026-07-16T00:00:01.000Z' };
+        await repository.execute({ kind: 'createTask', workspaceId: 'ws', task });
+        await repository.execute({ kind: 'createTurn', workspaceId: 'ws', turn });
+        await repository.execute({ kind: 'claimRuntime', workspaceId: 'ws', turnId: turn.id, ownerId: 'owner', claimedAt: '2026-07-16T00:00:01.000Z', heartbeatAt: '2026-07-16T00:00:01.000Z', expiresAt: '2099-01-01T00:00:00.000Z' });
+        const request = { kind: 'cancel' as const, by: 'user', opId: 'cancel-op', at: '2026-07-16T00:00:02.000Z' };
+        await repository.execute({ kind: 'putCancelRequest', workspaceId: 'ws', turnId: turn.id, request });
+        // SQLite-only claim tables are inserted explicitly; JSON treats these
+        // as compatibility no-ops and still exercises request/owner parity.
+        if (repository instanceof SqliteTaskRepository) {
+          await client.run(`INSERT INTO session_claims (workspace_id, session_id, turn_id, claimed_at) VALUES (?,?,?,?)`, ['ws', `${turn.id}-session`, turn.id, 'now']);
+          await client.run(`INSERT INTO resource_claims (workspace_id, resource_key, task_id, turn_id, claimed_at) VALUES (?,?,?,?,?)`, ['ws', 'git', task.id, turn.id, 'now']);
+        }
+        const nextTurn = { ...turn, status: 'cancelled' as const, finishedAt: '2026-07-16T00:00:03.000Z' };
+        await expect(repository.execute({
+          kind: 'applyGraphMutation', workspaceId: 'ws', expectedTasks: [{ id: task.id, revision: task.revision }],
+          expectedTurns: [{ id: turn.id, status: 'running' }], expectedRuntimeClaims: [{ turnId: turn.id, ownerId: 'owner' }],
+          expectedCancelRequests: [{ turnId: turn.id, kind: 'cancel', opId: request.opId }],
+          tasks: [], turns: [nextTurn], messages: [], deleteOperationKeys: [],
+          deleteCancelRequestTurnIds: [turn.id], deleteRuntimeClaimTurnIds: [turn.id],
+          deleteSessionClaimTurnIds: [turn.id], deleteResourceClaimTurnIds: [turn.id],
+        })).resolves.toMatchObject({ changed: true });
+        await expect(repository.getCancelRequest(turn.id)).resolves.toBeUndefined();
+        await expect(repository.getRuntimeClaim(turn.id)).resolves.toBeUndefined();
+        await expect(repository.getTurn(turn.id)).resolves.toMatchObject({ status: 'cancelled' });
+        if (repository instanceof SqliteTaskRepository) {
+          await expect(client.get(`SELECT 1 AS present FROM session_claims WHERE workspace_id=? AND turn_id=?`, ['ws', turn.id])).resolves.toBeUndefined();
+          await expect(client.get(`SELECT 1 AS present FROM resource_claims WHERE workspace_id=? AND turn_id=?`, ['ws', turn.id])).resolves.toBeUndefined();
+        }
+      }
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+      try { fs.unlinkSync(jsonPath); } catch { /* test cleanup */ }
+    }
+  }, 20_000);
+
   it('keeps host history commands atomic and parity-compatible across adapters', async () => {
     const jsonPath = `/tmp/muster-repository-history-${Date.now()}-${Math.random()}.json`;
     const jsonStore = TaskStore.load({ filePath: jsonPath });

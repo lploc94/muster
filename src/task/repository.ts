@@ -86,10 +86,15 @@ export interface GraphMutationCommand {
   deleteTaskIds?: readonly string[];
   deleteTurnIds?: readonly string[];
   deleteMessageIds?: readonly string[];
+  deleteOperationKeys?: readonly string[];
   operation?: { ledgerKey: string; entry: OperationLedgerEntry; createdAt: string };
   cancelRequests?: readonly { turnId: string; request: CancelRequest }[];
   deleteCancelRequestTurnIds?: readonly string[];
   deleteRuntimeClaimTurnIds?: readonly string[];
+  expectedRuntimeClaims?: readonly { turnId: string; ownerId: string }[];
+  expectedCancelRequests?: readonly { turnId: string; kind: CancelRequest['kind']; opId: string }[];
+  deleteSessionClaimTurnIds?: readonly string[];
+  deleteResourceClaimTurnIds?: readonly string[];
 }
 
 export type RepositoryCommand =
@@ -869,6 +874,18 @@ export class JsonTaskRepository implements TaskRepository {
               return { ok: false, reason: 'turn changed; retry' };
             }
           }
+          for (const expected of command.expectedRuntimeClaims ?? []) {
+            const claim = draft.runtimeClaims?.[expected.turnId];
+            if (!claim || claim.ownerId !== expected.ownerId) {
+              return { ok: false, reason: 'runtime claim changed; retry' };
+            }
+          }
+          for (const expected of command.expectedCancelRequests ?? []) {
+            const request = draft.cancelRequests?.[expected.turnId];
+            if (!request || request.kind !== expected.kind || request.opId !== expected.opId) {
+              return { ok: false, reason: 'cancel request changed; retry' };
+            }
+          }
           const insertTasks = new Set(command.insertTaskIds ?? []);
           const insertTurns = new Set(command.insertTurnIds ?? []);
           const insertMessages = new Set(command.insertMessageIds ?? []);
@@ -947,6 +964,12 @@ export class JsonTaskRepository implements TaskRepository {
           for (const turnId of command.deleteRuntimeClaimTurnIds ?? []) {
             if (draft.runtimeClaims?.[turnId]) {
               delete draft.runtimeClaims[turnId];
+              changed = true;
+            }
+          }
+          for (const ledgerKey of command.deleteOperationKeys ?? []) {
+            if (draft.operations?.[ledgerKey]) {
+              delete draft.operations[ledgerKey];
               changed = true;
             }
           }
@@ -2120,6 +2143,16 @@ export class SqliteTaskRepository implements TaskRepository {
       statements.push(graphTurnFenceStatement(this.workspaceId, command.expectedTurns));
       abortIfUnchangedAt.push(index);
     }
+    if (command.expectedRuntimeClaims && command.expectedRuntimeClaims.length > 0) {
+      const index = statements.length;
+      statements.push(graphRuntimeClaimFenceStatement(this.workspaceId, command.expectedRuntimeClaims));
+      abortIfUnchangedAt.push(index);
+    }
+    if (command.expectedCancelRequests && command.expectedCancelRequests.length > 0) {
+      const index = statements.length;
+      statements.push(graphCancelRequestFenceStatement(this.workspaceId, command.expectedCancelRequests));
+      abortIfUnchangedAt.push(index);
+    }
 
     // Delete dependent rows before parent rows. Foreign-key cascades handle
     // turn-bound artifacts, while explicit message deletes cover turn-less
@@ -2188,6 +2221,18 @@ export class SqliteTaskRepository implements TaskRepository {
       statements.push({ sql: 'DELETE FROM runtime_claims WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, turnId] });
       changes.push({ kind: 'runtime_claim', id: turnId, change: 'delete' });
     }
+    for (const ledgerKey of command.deleteOperationKeys ?? []) {
+      statements.push({ sql: 'DELETE FROM operations WHERE workspace_id = ? AND ledger_key = ?', params: [this.workspaceId, ledgerKey] });
+      changes.push({ kind: 'operation', id: ledgerKey, change: 'delete' });
+    }
+    for (const turnId of command.deleteSessionClaimTurnIds ?? []) {
+      statements.push({ sql: 'DELETE FROM session_claims WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, turnId] });
+      changes.push({ kind: 'runtime_claim', id: `${turnId}:session`, change: 'release' });
+    }
+    for (const turnId of command.deleteResourceClaimTurnIds ?? []) {
+      statements.push({ sql: 'DELETE FROM resource_claims WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, turnId] });
+      changes.push({ kind: 'runtime_claim', id: `${turnId}:resource`, change: 'release' });
+    }
     if (command.operation) {
       changes.push({ kind: 'operation', id: command.operation.ledgerKey, change: 'insert' });
     }
@@ -2225,6 +2270,12 @@ export class SqliteTaskRepository implements TaskRepository {
         return { ok: true, changed: false, reason: 'opId conflict: different arguments', conflict: true, operation: existing };
       }
       return { ok: true, changed: false, reason: 'task changed; retry' };
+    }
+    for (const index of abortIfUnchangedAt) {
+      if (index === 0 && command.operation) continue;
+      if (results[index]?.changes === 0) {
+        return { ok: true, changed: false, reason: 'graph ownership fence changed; retry' };
+      }
     }
     const guardIndex = command.operation ? 1 : 0;
     if (command.expectedTasks.length > 0 && results[guardIndex]?.changes === 0) {
@@ -3918,6 +3969,42 @@ function graphTurnFenceStatement(
              AND NOT EXISTS (SELECT 1 FROM turns checked WHERE checked.workspace_id = ? AND (${mismatch}))`,
     params: [workspaceId, expected[0]!.id, expected[0]!.status,
       workspaceId, ...expected.map((entry) => entry.id), expected.length,
+      workspaceId, ...mismatchParams],
+  };
+}
+
+function graphRuntimeClaimFenceStatement(
+  workspaceId: string,
+  expected: readonly { turnId: string; ownerId: string }[],
+): SqlStatement {
+  if (expected.length === 0) throw new Error('runtime claim fence requires at least one claim');
+  const mismatch = expected.map(() => '(checked.turn_id = ? AND checked.owner_id <> ?)').join(' OR ');
+  const mismatchParams = expected.flatMap((entry) => [entry.turnId, entry.ownerId] as SqlValue[]);
+  return {
+    sql: `UPDATE runtime_claims SET heartbeat_at = heartbeat_at
+           WHERE workspace_id = ? AND turn_id = ? AND owner_id = ?
+             AND (SELECT COUNT(*) FROM runtime_claims present WHERE present.workspace_id = ? AND present.turn_id IN (${placeholders(expected.length)})) = ?
+             AND NOT EXISTS (SELECT 1 FROM runtime_claims checked WHERE checked.workspace_id = ? AND (${mismatch}))`,
+    params: [workspaceId, expected[0]!.turnId, expected[0]!.ownerId,
+      workspaceId, ...expected.map((entry) => entry.turnId), expected.length,
+      workspaceId, ...mismatchParams],
+  };
+}
+
+function graphCancelRequestFenceStatement(
+  workspaceId: string,
+  expected: readonly { turnId: string; kind: CancelRequest['kind']; opId: string }[],
+): SqlStatement {
+  if (expected.length === 0) throw new Error('cancel request fence requires at least one request');
+  const mismatch = expected.map(() => '(checked.turn_id = ? AND (checked.kind <> ? OR checked.op_id <> ?))').join(' OR ');
+  const mismatchParams = expected.flatMap((entry) => [entry.turnId, entry.kind, entry.opId] as SqlValue[]);
+  return {
+    sql: `UPDATE turn_cancel_requests SET requested_at = requested_at
+           WHERE workspace_id = ? AND turn_id = ? AND kind = ? AND op_id = ?
+             AND (SELECT COUNT(*) FROM turn_cancel_requests present WHERE present.workspace_id = ? AND present.turn_id IN (${placeholders(expected.length)})) = ?
+             AND NOT EXISTS (SELECT 1 FROM turn_cancel_requests checked WHERE checked.workspace_id = ? AND (${mismatch}))`,
+    params: [workspaceId, expected[0]!.turnId, expected[0]!.kind, expected[0]!.opId,
+      workspaceId, ...expected.map((entry) => entry.turnId), expected.length,
       workspaceId, ...mismatchParams],
   };
 }

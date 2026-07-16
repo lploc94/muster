@@ -292,6 +292,8 @@ export interface GraphEngineDeps {
   getTaskTypeRegistry?: (cwd?: string) => TaskTypeRegistryResult;
   leaseOwnerAlive: (turnId: string) => boolean;
   ownsLease: (turnId: string) => boolean;
+  /** Stable owner id used by the cancel consumer's claim fence. */
+  runtimeOwnerId?: string;
   writeCancelRequest: (
     turnId: string,
     kind: 'interrupt' | 'cancel',
@@ -347,6 +349,14 @@ function equalGraphValue(a: unknown, b: unknown): boolean {
 async function executeGraphMutation(
   deps: GraphEngineDeps,
   mutate: (draft: TaskStoreFile) => GraphApplyResult,
+  fences: {
+    expectedTasks?: readonly { id: string; revision: number }[];
+    expectedTurns?: readonly { id: string; status: import('./types').TurnStatus; runtimeEpoch?: number }[];
+    expectedRuntimeClaims?: readonly { turnId: string; ownerId: string }[];
+    expectedCancelRequests?: readonly { turnId: string; kind: import('./types').CancelRequest['kind']; opId: string }[];
+    deleteSessionClaimTurnIds?: readonly string[];
+    deleteResourceClaimTurnIds?: readonly string[];
+  } = {},
 ): Promise<{ ok: true; result?: GraphApplyResult } | { ok: false; error: string }> {
   const before = structuredClone(deps.store.getFile()) as TaskStoreFile;
   const draft = structuredClone(before) as TaskStoreFile;
@@ -373,16 +383,16 @@ async function executeGraphMutation(
 
   // A graph operation writes at most one ledger entry. More than one indicates
   // a transition bug; fail closed rather than silently dropping a result.
-  if (changedOperations.length > 1 || deletedOperationKeys.length > 0) {
+  if (changedOperations.length > 1) {
     return { ok: false, error: 'graph mutation produced an unsupported operation delta' };
   }
   const operation = changedOperations[0]
     ? { ledgerKey: changedOperations[0][0], entry: changedOperations[0][1], createdAt: nowIso(deps.clock) }
     : undefined;
-  const expectedTasks = changedTasks
+  const expectedTasks = fences.expectedTasks ?? changedTasks
     .filter((task) => before.tasks[task.id] !== undefined)
     .map((task) => ({ id: task.id, revision: before.tasks[task.id]!.revision }));
-  const expectedTurns = changedTurns
+  const expectedTurns = fences.expectedTurns ?? changedTurns
     .filter((turn) => before.turns[turn.id] !== undefined)
     .map((turn) => ({ id: turn.id, status: before.turns[turn.id]!.status, runtimeEpoch: before.turns[turn.id]!.runtimeEpoch }));
   const command: RepositoryCommand = {
@@ -400,9 +410,22 @@ async function executeGraphMutation(
     ...(deletedTurnIds.length > 0 ? { deleteTurnIds: deletedTurnIds } : {}),
     ...(deletedMessageIds.length > 0 ? { deleteMessageIds: deletedMessageIds } : {}),
     ...(operation ? { operation } : {}),
+    ...(deletedOperationKeys.length > 0 ? { deleteOperationKeys: deletedOperationKeys } : {}),
     ...(changedCancelRequests.length > 0 ? { cancelRequests: changedCancelRequests } : {}),
     ...(deletedCancelRequestTurnIds.length > 0 ? { deleteCancelRequestTurnIds: deletedCancelRequestTurnIds } : {}),
     ...(deletedRuntimeClaimTurnIds.length > 0 ? { deleteRuntimeClaimTurnIds: deletedRuntimeClaimTurnIds } : {}),
+    ...(fences.expectedRuntimeClaims && fences.expectedRuntimeClaims.length > 0
+      ? { expectedRuntimeClaims: fences.expectedRuntimeClaims }
+      : {}),
+    ...(fences.expectedCancelRequests && fences.expectedCancelRequests.length > 0
+      ? { expectedCancelRequests: fences.expectedCancelRequests }
+      : {}),
+    ...(fences.deleteSessionClaimTurnIds && fences.deleteSessionClaimTurnIds.length > 0
+      ? { deleteSessionClaimTurnIds: fences.deleteSessionClaimTurnIds }
+      : {}),
+    ...(fences.deleteResourceClaimTurnIds && fences.deleteResourceClaimTurnIds.length > 0
+      ? { deleteResourceClaimTurnIds: fences.deleteResourceClaimTurnIds }
+      : {}),
   };
   const persisted = await deps.repository.execute(command);
   if (persisted.conflict) return { ok: false, error: persisted.reason ?? 'opId conflict: different arguments' };
@@ -2232,7 +2255,7 @@ export async function executeToolCommand(
         return { ok: false, error: 'questions required' };
       }
       const questionId = deriveEntityId(ctx.turnId, command.opId, 'q');
-      const commit = deps.store.commit((draft) => {
+      const commit = await executeGraphMutation(deps, (draft) => {
         ensureCoordinationMaps(draft);
         const child = draft.tasks[ctx.callerTaskId];
         const parentId = child?.parentId;
@@ -2386,7 +2409,7 @@ export async function executeToolCommand(
         return { ok: true };
       });
       if (!commit.ok) {
-        return { ok: false, error: commit.detail ?? commit.reason };
+        return { ok: false, error: commit.error };
       }
       // Abort child live process to free concurrency (scheduler-safe).
       const childLive = turnsForTask(deps.store.getFile(), ctx.callerTaskId).find(
@@ -2406,7 +2429,7 @@ export async function executeToolCommand(
 
     case 'answer_child_question': {
       const scheduleIds: string[] = [];
-      const commit = deps.store.commit((draft) => {
+      const commit = await executeGraphMutation(deps, (draft) => {
         ensureCoordinationMaps(draft);
         const parent = draft.tasks[ctx.callerTaskId];
         if (!parent || parent.lifecycle !== 'open') {
@@ -2528,7 +2551,7 @@ export async function executeToolCommand(
         return { ok: true };
       });
       if (!commit.ok) {
-        return { ok: false, error: commit.detail ?? commit.reason };
+        return { ok: false, error: commit.error };
       }
       for (const id of scheduleIds) {
         deps.onScheduleTurn(id);
@@ -2560,69 +2583,86 @@ export function tryPromoteTurn(
   return check.ok;
 }
 
-export function processCancelRequests(deps: GraphEngineDeps): void {
-  const file = deps.store.getFile();
-  const requests = file.cancelRequests ?? {};
+export async function processCancelRequests(deps: GraphEngineDeps): Promise<void> {
+  const requests = Object.entries(deps.store.getFile().cancelRequests ?? {});
   const now = nowIso(deps.clock);
 
-  for (const [turnId, request] of Object.entries(requests)) {
-    if (!deps.ownsLease(turnId)) {
-      continue;
-    }
-    deps.liveRuns.get(turnId)?.controller.abort();
-    deps.store.commit((draft) => {
-      const turn = draft.turns[turnId];
-      if (!turn) {
-        delete draft.cancelRequests?.[turnId];
-        return { ok: true };
-      }
-      if (request.kind === 'interrupt') {
-        const interrupted = interruptTurn(turn, { now });
-        if (interrupted.ok) {
-          draft.turns[turnId] = interrupted.next;
-          holdQueuedFollowUpsOnFailure(draft, turn.taskId);
-        }
-      } else {
-        const task = draft.tasks[turn.taskId];
-        if (task) {
-          const pendingTurns = turnsForTask(draft, task.id).filter(
-            (t) => t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user',
-          );
-          const cancelled = transitionCancelTask(task, {
-            liveTurn: turn,
-            now,
-            sealedBy:
-              request.sealedBy ??
-              (request.by === 'engine' || request.by === 'user'
-                ? { kind: 'user' }
-                : {
-                    kind: 'coordinator',
-                    taskId: request.by,
-                    mode: 'cancel_task',
-                  }),
-          });
-          if (cancelled.ok) {
-            // parent_seal always applies reason (including undefined to clear stale).
-            const isParentSeal =
-              request.sealedBy?.kind === 'coordinator' &&
-              request.sealedBy.mode === 'parent_seal';
-            const sealedTask = isParentSeal
-              ? { ...cancelled.next.task, reason: request.reason }
-              : cancelled.next.task;
-            draft.tasks[task.id] = clearPendingParentQuestionOnCancel(draft, sealedTask, now);
-            if (cancelled.next.turn) draft.turns[cancelled.next.turn.id] = cancelled.next.turn;
-            for (const pending of pendingTurns) {
-              if (pending.id === turn.id) continue;
-              const settled = cancelPendingTurn(pending, { now });
-              if (settled.ok) draft.turns[pending.id] = settled.next;
+  for (const [turnId, request] of requests) {
+    const claim = deps.store.getFile().runtimeClaims?.[turnId];
+    const ownerId = deps.runtimeOwnerId ?? claim?.ownerId;
+    // Only the current runtime owner may consume a request. The owner fence is
+    // re-checked inside the same IMMEDIATE transaction as settlement/deletion.
+    if (!ownerId || !deps.ownsLease(turnId) || claim?.ownerId !== ownerId) continue;
+    const localTurn = deps.store.getFile().turns[turnId];
+    const expectedTasks = localTurn
+      ? [{ id: localTurn.taskId, revision: deps.store.getFile().tasks[localTurn.taskId]?.revision ?? 0 }]
+      : [];
+    const expectedTurns = localTurn
+      ? [{ id: turnId, status: localTurn.status, runtimeEpoch: localTurn.runtimeEpoch }]
+      : [];
+    const consumed = await executeGraphMutation(
+      deps,
+      (draft) => {
+        const currentRequest = draft.cancelRequests?.[turnId];
+        const currentClaim = draft.runtimeClaims?.[turnId];
+        if (!currentRequest || !currentClaim || currentClaim.ownerId !== ownerId) return { ok: true };
+        const turn = draft.turns[turnId];
+        if (turn) {
+          if (currentRequest.kind === 'interrupt') {
+            const interrupted = interruptTurn(turn, { now });
+            if (interrupted.ok) {
+              draft.turns[turnId] = interrupted.next;
+              holdQueuedFollowUpsOnFailure(draft, turn.taskId);
+            }
+          } else {
+            const task = draft.tasks[turn.taskId];
+            if (task) {
+              const pendingTurns = turnsForTask(draft, task.id).filter(
+                (candidate) => candidate.status === 'queued' || candidate.status === 'running' || candidate.status === 'waiting_user',
+              );
+              const cancelled = transitionCancelTask(task, {
+                liveTurn: turn,
+                now,
+                sealedBy:
+                  currentRequest.sealedBy ??
+                  (currentRequest.by === 'engine' || currentRequest.by === 'user'
+                    ? { kind: 'user' }
+                    : { kind: 'coordinator', taskId: currentRequest.by, mode: 'cancel_task' }),
+              });
+              if (cancelled.ok) {
+                const isParentSeal = currentRequest.sealedBy?.kind === 'coordinator' && currentRequest.sealedBy.mode === 'parent_seal';
+                const sealedTask = isParentSeal
+                  ? { ...cancelled.next.task, reason: currentRequest.reason }
+                  : cancelled.next.task;
+                draft.tasks[task.id] = clearPendingParentQuestionOnCancel(draft, sealedTask, now);
+                if (cancelled.next.turn) draft.turns[cancelled.next.turn.id] = cancelled.next.turn;
+                for (const pending of pendingTurns) {
+                  if (pending.id === turn.id) continue;
+                  const settled = cancelPendingTurn(pending, { now });
+                  if (settled.ok) draft.turns[pending.id] = settled.next;
+                }
+              }
             }
           }
         }
-      }
-      delete draft.cancelRequests?.[turnId];
-      pruneLedgerForTurn(draft, turnId);
-      return { ok: true };
-    });
+        delete draft.cancelRequests![turnId];
+        pruneLedgerForTurn(draft, turnId);
+        delete draft.runtimeClaims![turnId];
+        return { ok: true };
+      },
+      {
+        expectedTasks,
+        expectedTurns,
+        expectedRuntimeClaims: [{ turnId, ownerId }],
+        expectedCancelRequests: [{ turnId, kind: request.kind, opId: request.opId }],
+        deleteSessionClaimTurnIds: [turnId],
+        deleteResourceClaimTurnIds: [turnId],
+      },
+    );
+    if (!consumed.ok) continue;
+    // Abort only after the durable consumer transaction wins its owner/request
+    // fences; a remote replacement can therefore never be killed by a stale host.
+    deps.liveRuns.get(turnId)?.controller.abort();
     cleanupTurnResources(deps, turnId);
   }
 }

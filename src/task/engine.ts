@@ -894,6 +894,7 @@ export class TaskEngine {
         : undefined,
       leaseOwnerAlive: (turnId) => this.runtimeClaimAlive(turnId),
       ownsLease: (turnId) => this.ownsRuntimeClaim(turnId),
+      runtimeOwnerId: this.runtimeOwnerId,
       writeCancelRequest: (turnId, kind, by, opId, sealedBy) => {
         void this.repository.execute({
           kind: 'putCancelRequest',
@@ -2787,7 +2788,7 @@ export class TaskEngine {
 
     this.reconcileChildWaits({ schedule: false });
     this.deferReloadQueuedTurns();
-    processCancelRequests(this.graphDeps());
+    void processCancelRequests(this.graphDeps());
   }
 
   /** Repository-only reload recovery. A non-expired runtime claim belongs to
@@ -3736,7 +3737,7 @@ export class TaskEngine {
     await this.revalidateVerdicts();
     this.applyDependencyTerminals();
     this.applyVerdictRemediation();
-    processCancelRequests(this.graphDeps());
+    await processCancelRequests(this.graphDeps());
     if (!this.isWorkspaceTrusted()) {
       return;
     }
@@ -4239,7 +4240,7 @@ export class TaskEngine {
         Number.isFinite(engineNowMs) ? engineNowMs : Date.now(),
       ) ?? DEFAULT_RUN_LIMIT_MS;
     const cancelPoll = setInterval(() => {
-      processCancelRequests(this.graphDeps());
+      void processCancelRequests(this.graphDeps());
     }, 250);
     // A recovered/frozen deadline may already be expired. Arm a zero-delay
     // watchdog instead of treating 0 as "no timeout" and running forever.
@@ -4365,7 +4366,7 @@ export class TaskEngine {
       };
 
       for await (const event of this.runTurnFn(backend, built.options)) {
-        processCancelRequests(this.graphDeps());
+        await processCancelRequests(this.graphDeps());
         if (terminalSettled) {
           break;
         }
