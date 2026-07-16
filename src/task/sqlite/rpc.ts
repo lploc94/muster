@@ -4,11 +4,9 @@
  * host never touches the connection directly. A `busy_timeout` stall then blocks
  * the worker, not the VS Code event loop.
  *
- * Phase 1 exposes only the primitives needed to prove the foundation: open the DB,
- * run a named query/exec, run a transactional batch, and close. Named domain
- * commands (createTurn, appendTranscriptBatch, …) arrive in Phase 3 as additional
- * request kinds — each one runs its whole transaction inside the worker, never as a
- * cross-thread callback (plan §5).
+ * The repository layer builds named domain commands from these worker-owned
+ * transaction primitives. SQL never crosses into engine/snapshot code, and no
+ * callback is serialized over the RPC boundary.
  */
 
 /** Bound parameter value. No content/path is ever interpolated into SQL (plan §3.4). */

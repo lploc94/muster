@@ -92,6 +92,7 @@ import { applyRetention, retentionChanged, type RetentionConfig } from './task/r
 import { TaskEngine, type EngineEvent, viewStatusFromDraft } from './task/engine';
 import type { HostEnvironmentSnapshot } from './task/host-context';
 import { TaskStore, computeAffectedTaskIds, type CommitResult } from './task/store';
+import { JsonTaskRepository, type TaskRepository } from './task/repository';
 import { probeNodeSqlite } from './task/sqlite/probe';
 import { isTerminalLifecycle } from './task/transitions';
 import { resolveWorkspaceCwd } from './task/workspace-cwd';
@@ -113,6 +114,7 @@ let credentialRegistry: CredentialRegistry | undefined;
 let bridgeServer: MusterBridgeServer | undefined;
 let taskEngine: TaskEngine | undefined;
 let taskStore: TaskStore | undefined;
+let taskRepository: TaskRepository | undefined;
 let storePath: string | undefined;
 let workspaceRoot: string | undefined;
 
@@ -428,6 +430,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   private availableBackendsPromise?: Promise<string[]>;
   /** In-flight/cached per-backend model enumeration (computed once). */
   private availableModelsPromise?: Promise<Record<string, BackendModels>>;
+  /** Discards stale async repository snapshots when focus/commits race. */
+  private snapshotGeneration = 0;
   focusedTaskId?: string;
 
   constructor(
@@ -1084,20 +1088,28 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   }
 
   postSnapshot(focusedTaskId?: string): void {
-    if (!taskStore) {
+    if (!taskRepository) {
       return;
     }
     const focus = focusedTaskId ?? this.focusedTaskId;
-    const snapshot: TaskSnapshot = buildSnapshot(taskStore, focus, activePendingAsks);
-    // Stamp the wire version on the bootstrap message so the webview can detect
-    // host<->webview drift once (and show a reload banner) instead of silently
-    // dropping mismatched messages.
-    this.post({ type: 'snapshot', protocolVersion: PROTOCOL_VERSION, ...snapshot });
-    this.replayPendingElicitations();
-    if (focus) {
-      this.focusedTaskId = focus;
-    }
-    this.seedObservation(taskStore.getFile());
+    const generation = ++this.snapshotGeneration;
+    void taskRepository.readEnvelopeForMigration().then((file) => {
+      if (generation !== this.snapshotGeneration) return;
+      const snapshot: TaskSnapshot = buildSnapshot({ getFile: () => file }, focus, activePendingAsks);
+      // Stamp the wire version on the bootstrap message so the webview can detect
+      // host<->webview drift once (and show a reload banner) instead of silently
+      // dropping mismatched messages.
+      this.post({ type: 'snapshot', protocolVersion: PROTOCOL_VERSION, ...snapshot });
+      this.replayPendingElicitations();
+      if (focus) {
+        this.focusedTaskId = focus;
+      }
+      this.seedObservation(file as TaskStoreFile);
+    }).catch(() => {
+      if (generation === this.snapshotGeneration) {
+        this.postCommandError('Unable to load task snapshot.');
+      }
+    });
   }
 
   /** Replay durable elicitation prompts after snapshot / webview resolve. */
@@ -1515,9 +1527,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       this.postCommandError('task store not ready');
       return;
     }
-    const store = taskStore;
     const outcome = await routeExportTask(data, {
-      getStoreFile: () => store.getFile(),
+      getRepository: () => taskRepository!,
       showSaveDialog: async ({ defaultFileName }) => {
         const defaultUri = workspaceRoot
           ? vscode.Uri.file(path.join(workspaceRoot, defaultFileName))
@@ -3096,6 +3107,7 @@ export async function activate(context: vscode.ExtensionContext) {
         }
       },
     });
+    taskRepository = new JsonTaskRepository(taskStore);
     applyRetentionToStore(taskStore);
     lastObservedFile = JSON.parse(JSON.stringify(taskStore.getFile())) as TaskStoreFile;
     lastObservedRevision = taskStore.getFile().revision;
@@ -3200,12 +3212,14 @@ export async function activate(context: vscode.ExtensionContext) {
     credentialRegistry = undefined;
     taskEngine = undefined;
     taskStore = undefined;
+    taskRepository = undefined;
     const message = error instanceof Error ? error.message : String(error);
     void vscode.window.showErrorMessage(`Muster task engine disabled: ${message}`);
   }
 }
 
 export function deactivate() {
+  taskRepository = undefined;
   presentationManager?.dispose();
   presentationManager = undefined;
   askBridge?.cancelAll('deactivate');

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { MusterTask, TaskMessage, TaskStoreFile, TaskTurn } from '../task/types';
+import type { TaskRepository } from '../task/repository';
 import {
   DEFAULT_TASK_MARKDOWN_EXPORT_MAX_CHARS,
   TASK_MARKDOWN_EXPORT_FORMAT,
@@ -226,6 +227,20 @@ describe('sanitizeTaskExportErrorText', () => {
 });
 
 describe('routeExportTask', () => {
+  it('reads export data through the repository boundary when provided', async () => {
+    const file = baseFile();
+    const getStoreFile = vi.fn(() => { throw new Error('legacy accessor must not run'); });
+    const readEnvelopeForMigration = vi.fn(async () => file);
+    const { deps } = makeDeps(file, {
+      getStoreFile,
+      getRepository: () => ({ readEnvelopeForMigration } as unknown as TaskRepository),
+    });
+    const outcome = await routeExportTask({ type: 'exportTask', taskId: 'task-a' }, deps);
+    expect(outcome.kind).toBe('messages');
+    expect(readEnvelopeForMigration).toHaveBeenCalledOnce();
+    expect(getStoreFile).not.toHaveBeenCalled();
+  });
+
   it('renders, opens Save As with suggested name, writes UTF-8, and returns exportResult basename only', async () => {
     const file = baseFile();
     const before = JSON.stringify(file);

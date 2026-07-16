@@ -2,7 +2,6 @@ import type { Question } from '../bridge/ask-bridge';
 import { deriveRuntimeActivity, deriveViewStatus } from '../task/derived-status';
 import { dependenciesBlockTask } from '../task/scheduler';
 import { sanitizeHandoffFailureMessage } from '../task/store';
-import type { TaskStore } from '../task/store';
 import type {
   MusterTask,
   TaskHandoffPhase,
@@ -176,6 +175,10 @@ export interface PendingAskOverlay {
   turnId: string;
   askId: string;
   questions: Question[];
+}
+
+export interface TaskSnapshotReader {
+  getFile(): Readonly<TaskStoreFile>;
 }
 
 function turnsForTask(file: TaskStoreFile, taskId: string): TaskTurn[] {
@@ -681,7 +684,7 @@ export function activeTurnIdForTask(file: TaskStoreFile, taskId: string): string
 }
 
 export function buildSnapshot(
-  store: TaskStore,
+  store: TaskSnapshotReader,
   focusedTaskId?: string,
   activePendingAsks?: ReadonlyMap<string, PendingAskOverlay>,
 ): TaskSnapshot {
