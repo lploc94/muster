@@ -1451,10 +1451,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
 
   /**
    * Host-orchestrated runtime model/backend switch for an existing idle task.
-   * Pure route validates the inbound request, chains requestRuntimeHandoff →
-   * completeRuntimeHandoff, posts sanitized commandError on refusal/failure,
-   * and refreshes snapshot so handoffProgress + binding labels update. Never
-   * posts session ids, digests, or hidden handoff turn content to chat.
+   * Pure route validates the inbound request and atomically commits the new
+   * binding + continuation cutoff. No hidden model turn runs during the click.
    */
   private async handleRequestRuntimeHandoff(data: unknown): Promise<void> {
     debugMuster('handoff.host_received', {
@@ -1482,30 +1480,16 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         debugMuster(
           'handoff.engine_request_result',
           result.ok
-            ? { ok: true, phase: result.value.phase, operationId: result.value.operationId }
-            : { ok: false, reason: result.reason },
-        );
-        return result;
-      },
-      completeRuntimeHandoff: async (params) => {
-        debugMuster('handoff.engine_complete', params as unknown as Record<string, unknown>);
-        const result = await engine.completeRuntimeHandoff(params);
-        debugMuster(
-          'handoff.engine_complete_result',
-          result.ok
             ? {
                 ok: true,
-                phase: result.value.phase,
+                operationId: result.value.operationId,
                 boundBackend: result.value.boundBackend,
+                boundModel: result.value.boundModel,
+                switchedAt: result.value.switchedAt,
               }
             : { ok: false, reason: result.reason },
         );
         return result;
-      },
-      afterRequestCommitted: (taskId) => {
-        // Project intermediate preparing_receiver progress before transfer.
-        debugMuster('handoff.after_request_snapshot', { taskId });
-        this.postSnapshot(taskId);
       },
     });
     debugMuster('handoff.route_outcome', {
@@ -1762,10 +1746,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     }
 
     // Existing task: if the composer picker asked for a different backend/model,
-    // hand off first (interrupt + switch), then send on the rebound binding.
-    // Covers cases where picker change didn't fire requestRuntimeHandoff.
-    // When a matching handoff is already in flight (picker change), skip a
-    // duplicate request and let engine.send queue with holdAutoPromote.
+    // atomically switch first, then send on the rebound binding. This covers
+    // cases where picker change did not fire requestRuntimeHandoff beforehand.
     const existing = taskStore.getTask(data.taskId);
     if (existing && data.backend && WEBVIEW_BACKENDS.has(data.backend)) {
       const targetModel =
@@ -1777,76 +1759,37 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       const bindingDiffers =
         existing.backend !== data.backend || currentModel !== targetModel;
       if (bindingDiffers) {
-        const handoff = existing.handoff;
-        const handoffActive =
-          !!handoff &&
-          handoff.phase !== 'completed' &&
-          handoff.phase !== 'failed' &&
-          handoff.phase !== 'cancelled';
-        const handoffTargetModel =
-          typeof handoff?.target.model === 'string' && handoff.target.model.trim()
-            ? handoff.target.model.trim()
+        console.info('[muster][host-send] handoff-before-send', {
+          taskId: data.taskId,
+          from: { backend: existing.backend, model: currentModel ?? null },
+          to: { backend: data.backend, model: targetModel ?? null },
+        });
+        await this.handleRequestRuntimeHandoff({
+          type: 'requestRuntimeHandoff',
+          taskId: data.taskId,
+          targetBackend: data.backend,
+          ...(targetModel ? { targetModel } : {}),
+        });
+        const after = taskStore.getTask(data.taskId);
+        const afterModel =
+          typeof after?.model === 'string' && after.model.trim()
+            ? after.model.trim()
             : undefined;
-        const matchingHandoff =
-          handoffActive &&
-          handoff!.target.backend === data.backend &&
-          handoffTargetModel === targetModel;
-
-        if (!matchingHandoff) {
-          console.info('[muster][host-send] handoff-before-send', {
-            taskId: data.taskId,
-            from: { backend: existing.backend, model: currentModel ?? null },
-            to: { backend: data.backend, model: targetModel ?? null },
-          });
-          await this.handleRequestRuntimeHandoff({
-            type: 'requestRuntimeHandoff',
-            taskId: data.taskId,
-            targetBackend: data.backend,
-            ...(targetModel ? { targetModel } : {}),
-          });
-          const after = taskStore.getTask(data.taskId);
-          const afterModel =
-            typeof after?.model === 'string' && after.model.trim()
-              ? after.model.trim()
-              : undefined;
-          if (
-            !after ||
-            after.backend !== data.backend ||
-            afterModel !== targetModel
-          ) {
-            // Still in-flight toward the same target → queue via send below.
-            const afterHandoff = after?.handoff;
-            const afterActive =
-              !!afterHandoff &&
-              afterHandoff.phase !== 'completed' &&
-              afterHandoff.phase !== 'failed' &&
-              afterHandoff.phase !== 'cancelled';
-            const afterTargetModel =
-              typeof afterHandoff?.target.model === 'string' &&
-              afterHandoff.target.model.trim()
-                ? afterHandoff.target.model.trim()
-                : undefined;
-            const stillMatching =
-              afterActive &&
-              afterHandoff!.target.backend === data.backend &&
-              afterTargetModel === targetModel;
-            if (!stillMatching) {
-              const reason =
-                'Model switch did not complete; message was not sent on the previous backend.';
-              if (clientRequestId) {
-                this.post({
-                  type: 'sendRejected',
-                  clientRequestId,
-                  taskId: data.taskId,
-                  reason,
-                  code: 'unknown',
-                });
-              } else {
-                this.postCommandError(reason, data.taskId);
-              }
-              return;
-            }
+        if (!after || after.backend !== data.backend || afterModel !== targetModel) {
+          const reason =
+            'Model switch did not commit; message was not sent on the previous backend.';
+          if (clientRequestId) {
+            this.post({
+              type: 'sendRejected',
+              clientRequestId,
+              taskId: data.taskId,
+              reason,
+              code: 'unknown',
+            });
+          } else {
+            this.postCommandError(reason, data.taskId);
           }
+          return;
         }
       }
     }

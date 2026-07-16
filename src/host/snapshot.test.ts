@@ -867,7 +867,7 @@ describe('host task snapshot projection', () => {
     expect(summaryJson).not.toContain(handoffCanaries.sourceSessionId);
   });
 
-  it('projects sanitized handoffProgress on TaskSummary without secrets', () => {
+  it('omits multi-phase handoffProgress (v2 switch has no progress chrome)', () => {
     const canaries = {
       contentDigest: 'handoff-digest-SECRET',
       summaryReason: 'SOURCE_SUMMARY_BODY_MUST_NOT_APPEAR',
@@ -925,23 +925,16 @@ describe('host task snapshot projection', () => {
     };
 
     const summary = projectTaskSummary(file, 'hop');
-    expect(summary?.handoffProgress).toEqual({
-      operationId: 'hop-op-1',
-      phase: 'preparing_receiver',
-      source: { backend: 'claude-cli', model: 'sonnet' },
-      target: { backend: 'codex', model: 'gpt-5' },
-      createdAt: '2026-07-06T00:00:00.000Z',
-      updatedAt: '2026-07-06T00:10:45.000Z',
-      startedAt: '2026-07-06T00:00:01.000Z',
-    });
+    // §19: no multi-phase progress bar; legacy phase machine is not projected.
+    expect(summary).not.toHaveProperty('handoffProgress');
     expect(summary).not.toHaveProperty('handoff');
     expect(projectTaskSummary(file, 'idle')).not.toHaveProperty('handoffProgress');
 
     const snapshot = buildSnapshot(storeFrom(file), 'hop');
     const hopRoot = snapshot.rootTasks.find((t) => t.id === 'hop');
     const hopSubtree = snapshot.subtree?.find((t) => t.id === 'hop');
-    expect(hopRoot?.handoffProgress?.phase).toBe('preparing_receiver');
-    expect(hopSubtree?.handoffProgress?.operationId).toBe('hop-op-1');
+    expect(hopRoot).not.toHaveProperty('handoffProgress');
+    expect(hopSubtree).not.toHaveProperty('handoffProgress');
 
     const projectedJson = JSON.stringify({
       summary,
@@ -952,15 +945,15 @@ describe('host task snapshot projection', () => {
     for (const needle of Object.values(canaries)) {
       expect(projectedJson, `projection must not contain ${needle}`).not.toContain(needle);
     }
-    // Explicit absence of internal handoff fields / bodies.
     expect(projectedJson).not.toContain('contentDigest');
     expect(projectedJson).not.toContain('sourceSummary');
     expect(projectedJson).not.toContain('conversationContext');
     expect(projectedJson).not.toContain('sessionId');
     expect(projectedJson).not.toContain('boundSessionId');
+    expect(projectedJson).not.toContain('preparing_receiver');
   });
 
-  it('projects bounded handoff failure metadata only on failed handoffProgress', () => {
+  it('does not project legacy failed handoff phase chrome or secrets', () => {
     const rawFailure =
       'Receiver init failed at C:\\Users\\secret\\repo\\handoff with sk-live-SECRETTOKEN12345 dump';
     const file: TaskStoreFile = {
@@ -1002,26 +995,13 @@ describe('host task snapshot projection', () => {
       cancelRequests: {},
     };
 
-    const progress = projectTaskSummary(file, 'fail')?.handoffProgress;
-    expect(progress).toMatchObject({
-      operationId: 'hop-fail-1',
-      phase: 'failed',
-      source: { backend: 'claude-cli', model: 'sonnet' },
-      target: { backend: 'codex', model: 'gpt-5' },
-      finishedAt: '2026-07-06T00:02:00.000Z',
-      failure: {
-        code: 'receiver_init_failed',
-        at: '2026-07-06T00:02:00.000Z',
-      },
-    });
-    expect(progress?.failure?.message).toBeTruthy();
-    expect(progress?.failure?.message.length).toBeLessThanOrEqual(240);
-    expect(progress?.failure?.message).not.toMatch(/C:\\Users/);
-    expect(progress?.failure?.message).not.toContain('sk-live-SECRETTOKEN12345');
-    const progressJson = JSON.stringify(progress);
+    const summary = projectTaskSummary(file, 'fail');
+    expect(summary).not.toHaveProperty('handoffProgress');
+    const progressJson = JSON.stringify(summary);
     expect(progressJson).not.toContain('src-sess-SECRET');
     expect(progressJson).not.toContain('handoff-digest-SECRET');
     expect(progressJson).not.toContain('SOURCE_SUMMARY_BODY_MUST_NOT_APPEAR');
+    expect(progressJson).not.toContain('sk-live-SECRETTOKEN12345');
     expect(progressJson).not.toContain('contentDigest');
     expect(progressJson).not.toContain('sessionId');
   });

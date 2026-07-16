@@ -271,6 +271,12 @@ export interface MusterTask {
    */
   committedSessionId?: string;
   /**
+   * Monotonic runtime binding generation. Every queued turn is pinned to the
+   * generation it was created under; late events from an older runtime must not
+   * bind a session after a model/backend switch.
+   */
+  runtimeEpoch?: number;
+  /**
    * Workspace directory the agent runs in for this task's turns (schema-compatible:
    * optional, absent value tolerated so no schema bump is required). Populated at
    * task creation from the resolved workspace root; children inherit the parent's.
@@ -349,7 +355,8 @@ export interface MusterTask {
    * Owned by the TaskHandoff aggregate; never projected as ordinary TaskMessage chat.
    * Malformed records are stripped on load (fail closed) without quarantining the store.
    */
-  handoff?: TaskHandoffState;
+  /** Versioned runtime-switch metadata. v1 is stripped on load; v2 is current. */
+  handoff?: TaskHandoffState | TaskContinuationHandoffState;
 }
 
 // ---------------------------------------------------------------------------
@@ -461,6 +468,46 @@ export interface TaskHandoffState {
   failure?: TaskHandoffFailure;
 }
 
+// ---------------------------------------------------------------------------
+// Runtime switch continuation contract (v2).
+//
+// Unlike the legacy v1 phase machine, v2 represents an already-committed local
+// binding switch. It never drives hidden source/receiver model turns.
+// ---------------------------------------------------------------------------
+
+export interface TaskHandoffRuntimeLabel {
+  backend: string;
+  model?: string;
+  runtimeEpoch: number;
+}
+
+export interface TaskHandoffContextCutoff {
+  throughMessageId?: string;
+  throughToolCallId?: string;
+  throughTurnSequence: number;
+  sourceStoreRevision: number;
+  messageCount: number;
+  toolCallCount: number;
+  contextDigest: string;
+  capturedAt: string;
+}
+
+export type TaskHandoffContinuation =
+  | { status: 'pending' }
+  | { status: 'assigned'; turnId: string; assignedAt: string }
+  | { status: 'consumed'; turnId: string; consumedAt: string };
+
+/** Durable metadata for the compact context attached to the first real target turn. */
+export interface TaskContinuationHandoffState {
+  version: 2;
+  operationId: string;
+  source: TaskHandoffRuntimeLabel;
+  target: TaskHandoffRuntimeLabel;
+  contextCutoff: TaskHandoffContextCutoff;
+  continuation: TaskHandoffContinuation;
+  switchedAt: string;
+}
+
 // Turns (§4.2)
 export type TurnStatus =
   | 'queued' | 'running' | 'waiting_user' | 'succeeded' | 'failed' | 'interrupted' | 'cancelled';
@@ -510,6 +557,8 @@ export interface TaskTurn {
     limitMs: number;
     deadlineAt: string;
   };
+  /** Runtime generation captured when the turn is queued. */
+  runtimeEpoch?: number;
   inputs: TurnInput[];
   candidateSessionId?: string;
   observedSessionId?: string;

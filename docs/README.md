@@ -23,6 +23,7 @@ Read in this order when onboarding:
 | [MUSTER-BRIDGE.md](MUSTER-BRIDGE.md) | Bridge / elicitation (MCP `ask_user` disabled — see cleanup C3) |
 | [WEBVIEW.md](WEBVIEW.md) | Chat UI, workspace file-drop mention contract, read-only presentation review, queued follow-ups and interrupt & send, task Markdown export, lifecycle, and diagnostics |
 | [SETTINGS.md](SETTINGS.md) | Host-backed five-topic Settings shell (Task Types, Permissions, Runtime & Storage, plus Coming soon Models and CLIs / Context and MCP) |
+| [SETTINGS-DESIGN.md](SETTINGS-DESIGN.md) | Proposed Settings information architecture, naming, responsive layout, and migration guidance |
 
 Operational evidence:
 

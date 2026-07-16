@@ -177,7 +177,7 @@ export function canPromoteTurn(
   if (task.wait?.kind === 'external') {
     return { ok: false, reason: 'waiting on external blocker' };
   }
-  if (task.handoff && isActiveHandoffPhase(task.handoff.phase)) {
+  if (task.handoff?.version === 1 && isActiveHandoffPhase(task.handoff.phase)) {
     return { ok: false, reason: 'runtime handoff in progress' };
   }
 

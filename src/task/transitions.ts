@@ -262,6 +262,7 @@ function queueTurn(
     retryOf: options.retryOf,
     status: 'queued',
     executionEpoch: task.executionEpoch ?? 1,
+    runtimeEpoch: task.runtimeEpoch ?? 1,
     inputs: [...options.inputs],
     createdAt: options.now,
   };
@@ -308,6 +309,7 @@ export function createTask(
     dependencies,
     backend: input.backend,
     model: input.model,
+    runtimeEpoch: 1,
     ...(input.taskType !== undefined ? { taskType: input.taskType } : {}),
     cwd: input.cwd,
     capabilities: [...input.capabilities],

@@ -182,7 +182,7 @@ export function evaluateTaskReadiness(file: TaskStoreFile, taskId: string): Task
     });
   }
 
-  if (task.handoff && isActiveHandoffPhase(task.handoff.phase)) {
+  if (task.handoff?.version === 1 && isActiveHandoffPhase(task.handoff.phase)) {
     reasons.push({
       code: 'handoff_active',
       message: 'runtime handoff in progress',

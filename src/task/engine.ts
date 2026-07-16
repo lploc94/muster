@@ -5,10 +5,11 @@ import { AskBridge } from '../bridge/ask-bridge';
 import { CredentialRegistry } from '../bridge/credentials';
 import { runTurn as defaultRunTurn } from '../runner';
 import type { Backend, NormalizedEvent, RunOptions } from '../types';
-import type { TaskHandoffPhase, TurnTrigger } from './types';
+import type { TurnTrigger } from './types';
 import { canBindTaskToBackend } from './backend-eligibility';
 import {
   assembleFirstTurnPrompt,
+  COMPILED_PROMPT_MAX,
   mergeBriefFromCreate,
   normalizeSkillNames,
   synthesizeBriefFromGoal,
@@ -25,21 +26,10 @@ import {
   type HostEnvironmentSnapshot,
 } from './host-context';
 import {
-  buildHandoffBootstrapPrompt,
-  buildHandoffPackage,
-  collectInternalSummaryTurnText,
-  digestSourceSummaryText,
-  exportConversationContextMetadata,
-  HANDOFF_SOURCE_SUMMARY_PROMPT,
+  buildCompactContinuationContext,
+  captureContinuationCutoff,
   isActiveHandoffPhase,
-  type SourceSummaryOutcome,
 } from './engine-handoff';
-
-/** Best-effort source summary budget — never hang the model switch forever. */
-const HANDOFF_SOURCE_SUMMARY_TIMEOUT_MS = 20_000;
-/** Receiver bootstrap budget for completeRuntimeHandoff. */
-const HANDOFF_RECEIVER_INIT_TIMEOUT_MS = 45_000;
-import { TaskHandoff, type TaskHandoffDiagnostics } from './task-handoff';
 import { deriveViewStatus } from './derived-status';
 import type { DepGraph } from './deps';
 import {
@@ -241,6 +231,15 @@ const DEFAULT_LIMITS: DispositionLimits = {
 
 function nowIso(clock?: () => string): string {
   return clock?.() ?? new Date().toISOString();
+}
+
+/** Non-empty backend/model label: no control bytes, length-capped. */
+function normalizeRuntimeLabel(value: string, max: number): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > max) return undefined;
+  if (/[\u0000-\u001f\u007f]/.test(trimmed)) return undefined;
+  return trimmed;
 }
 
 function isProcessDead(pid: number): boolean {
@@ -671,12 +670,6 @@ export class TaskEngine {
   private readonly acceptedOpIds = new Map<string, string>();
   private readonly turnPromises = new Map<string, Promise<void>>();
   private readonly pendingAskPromises = new Map<string, { promise: Promise<Answers>; fingerprint: string }>();
-  /**
-   * Ephemeral source-summary text keyed by handoff operationId (D020).
-   * In-process only — never persisted; cleared after transfer/failure.
-   * After reload the map is empty and transfer continues conversation-only.
-   */
-  private readonly handoffSourceSummaryByOperationId = new Map<string, string>();
   private settling = new Set<string>();
 
   private constructor(config: TaskEngineConfig, storePath: string) {
@@ -1080,9 +1073,6 @@ export class TaskEngine {
   static load(config: TaskEngineConfig): TaskEngine {
     const engine = new TaskEngine(config, config.store.getStorePath());
     engine.reconcileReload();
-    // Resume incomplete receiver transfers after reload without re-summarizing.
-    // Fire-and-forget: load stays sync; failures leave source binding + handoff.fail.
-    void engine.resumePendingRuntimeHandoffs();
     return engine;
   }
 
@@ -1293,7 +1283,7 @@ export class TaskEngine {
     }
     const liveTask = this.store.getTask(taskId);
     const handoffBusy =
-      !!liveTask?.handoff && isActiveHandoffPhase(liveTask.handoff.phase);
+      liveTask?.handoff?.version === 1 && isActiveHandoffPhase(liveTask.handoff.phase);
     if (!handoffBusy) {
       void this.scheduleTurn(reserved.value.turnId);
     }
@@ -1512,20 +1502,11 @@ export class TaskEngine {
   }
 
   /**
-   * Start a cross-runtime handoff (M010/S02).
+   * Atomically switch an existing task to a new runtime binding.
    *
-   * Creates TaskHandoff, exports conversation-context metadata from existing
-   * messages, always best-effort runs a *hidden* source-summary internal turn
-   * against the current backend (no TaskMessage/TaskTurn rows, no EngineEvent
-   * emission), then advances to preparing_receiver. Never rebinds task.backend /
-   * model / committedSessionId (S03 owns receiver setup).
-   *
-   * Live turns are interrupted immediately (do not wait for them to finish);
-   * queued turns for the task are cancelled so handoff can start. Fail-closed
-   * for missing task, active handoff, or non-MCP target.
-   *
-   * Summary failure/empty response never blocks preparing_receiver when
-   * conversation context is ready (D017/D018/D019).
+   * No model is called here. The source conversation cutoff is persisted and
+   * compiled into the first real target turn, which goes through the ordinary
+   * prompt/MCP/session path.
    */
   async requestRuntimeHandoff(params: {
     taskId: string;
@@ -1534,22 +1515,29 @@ export class TaskEngine {
   }): Promise<
     EngineResult<{
       operationId: string;
-      phase: TaskHandoffPhase;
-      diagnostics: TaskHandoffDiagnostics;
+      boundBackend: string;
+      boundModel?: string;
+      switchedAt: string;
     }>
   > {
     const task = this.store.getTask(params.taskId);
-    if (!task) {
-      return { ok: false, reason: 'task not found' };
+    if (!task) return { ok: false, reason: 'task not found' };
+
+    const targetBackendId = normalizeRuntimeLabel(params.targetBackend, 128);
+    if (!targetBackendId) {
+      return { ok: false, reason: 'target backend is invalid' };
+    }
+    const targetModelId =
+      params.targetModel === undefined
+        ? undefined
+        : normalizeRuntimeLabel(params.targetModel, 256);
+    if (params.targetModel !== undefined && targetModelId === undefined) {
+      return { ok: false, reason: 'target model is invalid' };
     }
 
-    if (task.handoff && isActiveHandoffPhase(task.handoff.phase)) {
-      return { ok: false, reason: 'active handoff in progress' };
-    }
-
-    let targetBackend;
+    let targetBackend: Backend;
     try {
-      targetBackend = this.makeBackend(params.targetBackend);
+      targetBackend = this.makeBackend(targetBackendId);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       return { ok: false, reason: `target backend unavailable: ${message}` };
@@ -1558,559 +1546,87 @@ export class TaskEngine {
       return { ok: false, reason: 'backend does not support MCP' };
     }
 
-    // Preempt live work: interrupt running/waiting turns and drop queued FIFO
-    // so handoff starts immediately (never wait for the current turn to finish).
-    const preemption = this.preemptTaskTurnsForHandoff(params.taskId);
-    if (!preemption.ok) {
-      return preemption;
-    }
-
     const now = nowIso(this.clock);
     const operationId = randomUUID();
-    let handoff = TaskHandoff.create({
-      operationId,
-      source: {
-        backend: task.backend,
-        ...(task.model ? { model: task.model } : {}),
-        ...(task.committedSessionId ? { sessionId: task.committedSessionId } : {}),
-      },
-      target: {
-        backend: params.targetBackend,
-        ...(params.targetModel ? { model: params.targetModel } : {}),
-      },
-      now,
-    });
-
-    // Reserve active handoff BEFORE the async source-summary turn so concurrent
-    // switch/send cannot race the same task/session (compare-and-set on commit).
-    const messages = this.store.getMessagesForTask(params.taskId);
-    const op = { now, operationId };
-    const started = handoff.startExport(op);
-    if (!started.ok) {
-      return { ok: false, reason: started.reason };
-    }
-    handoff = started.next;
-    const exported = exportConversationContextMetadata(messages, now);
-    const conversationReady = handoff.markConversationReady({
-      ...op,
-      messageCount: exported.messageCount,
-      contentDigest: exported.contentDigest,
-      exportedAt: exported.exportedAt,
-    });
-    if (!conversationReady.ok) {
-      return { ok: false, reason: conversationReady.reason };
-    }
-    handoff = conversationReady.next;
-    const summarizing = handoff.beginSummarizing(op);
-    if (!summarizing.ok) {
-      return { ok: false, reason: summarizing.reason };
-    }
-    handoff = summarizing.next;
-
-    const reserveCommit = this.store.commit((draft) => {
+    let boundModel: string | undefined;
+    const commit = this.store.commit((draft) => {
       const current = draft.tasks[params.taskId];
-      if (!current) {
-        return { ok: false, reason: 'task not found' };
+      if (!current) return { ok: false, reason: 'task not found' };
+      if (
+        current.backend === targetBackendId &&
+        (current.model ?? undefined) === (targetModelId ?? undefined)
+      ) {
+        return { ok: false, reason: 'target backend/model is already bound' };
       }
-      if (current.handoff && isActiveHandoffPhase(current.handoff.phase)) {
-        return { ok: false, reason: 'active handoff in progress' };
-      }
-      // Re-preempt inside the same CAS so a turn that started between preemption
-      // and reserve cannot slip through.
-      const clear = this.applyHandoffTurnPreemption(draft, params.taskId, now, {
-        cancelQueued: false,
-      });
-      if (!clear.ok) {
-        return clear;
-      }
-      draft.tasks[params.taskId] = {
-        ...current,
-        handoff: handoff.toState(),
-        revision: current.revision + 1,
-        updatedAt: now,
-      };
-      return { ok: true };
-    });
-    if (!reserveCommit.ok) {
-      return { ok: false, reason: reserveCommit.detail ?? reserveCommit.reason };
-    }
 
-    // Always best-effort source summary. Conversation history is already exported.
-    // Summary failure / timeout → unavailable; transfer still continues conversation-only.
-    const summary = await this.runHiddenSourceSummaryTurn(task, now, {
-      timeoutMs: HANDOFF_SOURCE_SUMMARY_TIMEOUT_MS,
-    });
-    const summaryNow = nowIso(this.clock);
+      const preempted = this.applyHandoffTurnPreemption(draft, params.taskId, now);
+      if (!preempted.ok) return preempted;
 
-    // Re-load + CAS: only this operationId at summarizing_source may finish.
-    const reservedTask = this.store.getTask(params.taskId);
-    if (!reservedTask?.handoff || reservedTask.handoff.operationId !== operationId) {
-      return { ok: false, reason: 'stale handoff operation' };
-    }
-    const restored = TaskHandoff.restore(reservedTask.handoff);
-    if (!restored.ok) {
-      return { ok: false, reason: restored.reason };
-    }
-    handoff = restored.next;
-    if (handoff.phase !== 'summarizing_source') {
-      return { ok: false, reason: `handoff is not summarizing_source (phase=${handoff.phase})` };
-    }
-
-    if (summary.kind === 'ready') {
-      const marked = handoff.markSummaryReady({
-        now: summaryNow,
-        operationId,
-        contentDigest: summary.contentDigest,
-        summarizedAt: summary.summarizedAt,
-      });
-      if (!marked.ok) {
-        return { ok: false, reason: marked.reason };
-      }
-      handoff = marked.next;
-    } else {
-      const reason =
-        summary.kind === 'unavailable'
-          ? summary.reason
-          : summary.kind === 'skipped'
-            ? summary.reason
-            : 'source summary unavailable';
-      const marked = handoff.markSummaryUnavailable({
-        now: summaryNow,
-        operationId,
-        reason,
-      });
-      if (!marked.ok) {
-        return { ok: false, reason: marked.reason };
-      }
-      handoff = marked.next;
-    }
-
-    const prepared = handoff.beginPreparingReceiver({ now: summaryNow, operationId });
-    if (!prepared.ok) {
-      return { ok: false, reason: prepared.reason };
-    }
-    handoff = prepared.next;
-    const nextState = handoff.toState();
-
-    const finishCommit = this.store.commit((draft) => {
-      const current = draft.tasks[params.taskId];
-      if (!current?.handoff) {
-        return { ok: false, reason: 'task not found' };
-      }
-      if (current.handoff.operationId !== operationId) {
-        return { ok: false, reason: 'stale operation' };
-      }
-      if (current.handoff.phase !== 'summarizing_source') {
-        return { ok: false, reason: 'handoff is not summarizing_source' };
-      }
-      // Only interrupt live turns that reappeared; keep user messages queued during handoff.
-      const clear = this.applyHandoffTurnPreemption(draft, params.taskId, summaryNow, {
-        cancelQueued: false,
-      });
-      if (!clear.ok) {
-        return clear;
-      }
-      // Persist handoff only — never rebind backend/model/session here.
-      draft.tasks[params.taskId] = {
-        ...current,
-        handoff: nextState,
-        revision: current.revision + 1,
-        updatedAt: summaryNow,
-      };
-      return { ok: true };
-    });
-
-    if (!finishCommit.ok) {
-      return { ok: false, reason: finishCommit.detail ?? finishCommit.reason };
-    }
-
-    // Cache raw summary text ephemerally for S03 receiver package (D020).
-    // Only digests live on MusterTask; text is never reloaded after process restart.
-    if (summary.kind === 'ready' && typeof summary.text === 'string' && summary.text.trim().length > 0) {
-      this.handoffSourceSummaryByOperationId.set(operationId, summary.text);
-    }
-
-    return {
-      ok: true,
-      value: {
-        operationId,
-        phase: nextState.phase,
-        diagnostics: handoff.toDiagnostics(),
-      },
-    };
-  }
-
-  /**
-   * S03 receiver transfer: build HandoffPackage from visible TaskMessage rows +
-   * optional ephemeral summary, init a *new* target session (no resumeId), capture
-   * sessionStarted id, and atomically rebind backend/model/committedSessionId with
-   * handoff.complete. Source binding is unchanged on init failure (D021).
-   */
-  async completeRuntimeHandoff(params: {
-    taskId: string;
-    operationId?: string;
-  }): Promise<
-    EngineResult<{
-      operationId: string;
-      phase: TaskHandoffPhase;
-      diagnostics: TaskHandoffDiagnostics;
-      boundBackend: string;
-      boundSessionId?: string;
-    }>
-  > {
-    const task = this.store.getTask(params.taskId);
-    if (!task) {
-      return { ok: false, reason: 'task not found' };
-    }
-    if (!task.handoff) {
-      return { ok: false, reason: 'no handoff in progress' };
-    }
-
-    const restored = TaskHandoff.restore(task.handoff);
-    if (!restored.ok) {
-      return { ok: false, reason: restored.reason };
-    }
-    let handoff = restored.next;
-
-    if (params.operationId && params.operationId !== handoff.operationId) {
-      return { ok: false, reason: 'stale operation' };
-    }
-    if (handoff.phase !== 'preparing_receiver') {
-      return { ok: false, reason: `handoff is not preparing_receiver (phase=${handoff.phase})` };
-    }
-
-    // Preempt any live/queued work before receiver transfer (do not wait).
-    const preemption = this.preemptTaskTurnsForHandoff(params.taskId);
-    if (!preemption.ok) {
-      return preemption;
-    }
-
-    const now = nowIso(this.clock);
-    const operationId = handoff.operationId;
-    const state = handoff.toState();
-
-    const transferring = handoff.beginTransfer({ now, operationId });
-    if (!transferring.ok) {
-      return { ok: false, reason: transferring.reason };
-    }
-    handoff = transferring.next;
-
-    const persistTransferring = this.store.commit((draft) => {
-      const current = draft.tasks[params.taskId];
-      if (!current || !current.handoff) {
-        return { ok: false, reason: 'task not found' };
-      }
-      if (current.handoff.operationId !== operationId) {
-        return { ok: false, reason: 'stale operation' };
-      }
-      if (current.handoff.phase !== 'preparing_receiver') {
-        return { ok: false, reason: 'handoff is not preparing_receiver' };
-      }
-      const clear = this.applyHandoffTurnPreemption(draft, params.taskId, now, {
-        cancelQueued: false,
-      });
-      if (!clear.ok) {
-        return clear;
-      }
-      draft.tasks[params.taskId] = {
-        ...current,
-        handoff: handoff.toState(),
-        revision: current.revision + 1,
-        updatedAt: now,
-      };
-      return { ok: true };
-    });
-    if (!persistTransferring.ok) {
-      return { ok: false, reason: persistTransferring.detail ?? persistTransferring.reason };
-    }
-
-    const messages = this.store.getMessagesForTask(params.taskId);
-    const sourceSummaryText = this.handoffSourceSummaryByOperationId.get(operationId);
-    const pkg = buildHandoffPackage({
-      taskId: params.taskId,
-      taskGoal: task.goal,
-      handoff,
-      messages,
-      builtAt: now,
-      ...(sourceSummaryText ? { sourceSummaryText } : {}),
-    });
-    const bootstrapPrompt = buildHandoffBootstrapPrompt(pkg);
-
-    let targetBackend;
-    try {
-      targetBackend = this.makeBackend(state.target.backend);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return this.failRuntimeHandoffTransfer({
-        taskId: params.taskId,
-        operationId,
-        code: 'target_backend_unavailable',
-        message: `target backend unavailable: ${message}`,
-        now,
-      });
-    }
-    if (!canBindTaskToBackend(targetBackend.capabilities)) {
-      return this.failRuntimeHandoffTransfer({
-        taskId: params.taskId,
-        operationId,
-        code: 'target_backend_not_mcp',
-        message: 'backend does not support MCP',
-        now,
-      });
-    }
-
-    let boundSessionId: string | undefined;
-    let initError: string | undefined;
-    const initAbort = new AbortController();
-    let initTimer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      const runOptions: RunOptions = {
-        prompt: bootstrapPrompt,
-        // Intentionally omit resumeId — new session only (D021).
-        ...(state.target.model ? { model: state.target.model } : {}),
-        ...(task.cwd ? { cwd: task.cwd } : {}),
-        signal: initAbort.signal,
-      };
-      const initResult = await Promise.race([
-        (async () => {
-          let sessionId: string | undefined;
-          let errorMessage: string | undefined;
-          let completed = false;
-          for await (const event of this.runTurnFn(targetBackend, runOptions)) {
-            if (event.type === 'sessionStarted' && event.sessionId) {
-              if (!sessionId) sessionId = event.sessionId;
-            } else if (event.type === 'error') {
-              errorMessage = event.isCancellation
-                ? event.message?.trim() || 'receiver init cancelled'
-                : event.message;
-            } else if (event.type === 'turnCompleted') {
-              completed = true;
-            }
-          }
-          if (errorMessage !== undefined) {
-            return { sessionId, errorMessage };
-          }
-          if (!completed) {
-            return {
-              sessionId,
-              errorMessage: 'receiver init ended without completion',
-            };
-          }
-          return { sessionId, errorMessage: undefined as string | undefined };
-        })(),
-        new Promise<{ sessionId?: string; errorMessage: string }>((resolve) => {
-          initTimer = setTimeout(() => {
-            initAbort.abort();
-            resolve({
-              errorMessage: `receiver init timed out after ${HANDOFF_RECEIVER_INIT_TIMEOUT_MS}ms`,
-            });
-          }, HANDOFF_RECEIVER_INIT_TIMEOUT_MS);
-        }),
-      ]);
-      // Prefer explicit timeout/error; only bind session when init completed cleanly.
-      initError = initResult.errorMessage;
-      if (!initError) {
-        boundSessionId = initResult.sessionId;
-      }
-    } catch (error) {
-      initError = error instanceof Error ? error.message : String(error);
-    } finally {
-      if (initTimer) clearTimeout(initTimer);
-      if (!initAbort.signal.aborted) initAbort.abort();
-    }
-
-    if (initError) {
-      return this.failRuntimeHandoffTransfer({
-        taskId: params.taskId,
-        operationId,
-        code: 'receiver_init_failed',
-        message: initError,
-        now: nowIso(this.clock),
-      });
-    }
-
-    const completeNow = nowIso(this.clock);
-    const completed = handoff.complete({
-      now: completeNow,
-      operationId,
-      boundBackend: state.target.backend,
-      ...(boundSessionId ? { boundSessionId } : {}),
-    });
-    if (!completed.ok) {
-      return this.failRuntimeHandoffTransfer({
-        taskId: params.taskId,
-        operationId,
-        code: 'handoff_complete_rejected',
-        message: completed.reason,
-        now: completeNow,
-      });
-    }
-    handoff = completed.next;
-
-    const bindCommit = this.store.commit((draft) => {
-      const current = draft.tasks[params.taskId];
-      if (!current || !current.handoff) {
-        return { ok: false, reason: 'task not found' };
-      }
-      if (current.handoff.operationId !== operationId) {
-        return { ok: false, reason: 'stale operation' };
-      }
-      if (current.handoff.phase !== 'transferring') {
-        return { ok: false, reason: 'handoff is not transferring' };
-      }
+      const sourceEpoch = current.runtimeEpoch ?? 1;
+      const targetEpoch = sourceEpoch + 1;
+      const contextCutoff = captureContinuationCutoff(draft, params.taskId, now);
       const nextTask: MusterTask = {
         ...current,
-        backend: state.target.backend,
-        handoff: handoff.toState(),
+        backend: targetBackendId,
+        runtimeEpoch: targetEpoch,
+        handoff: {
+          version: 2,
+          operationId,
+          source: {
+            backend: current.backend,
+            ...(current.model ? { model: current.model } : {}),
+            runtimeEpoch: sourceEpoch,
+          },
+          target: {
+            backend: targetBackendId,
+            ...(targetModelId ? { model: targetModelId } : {}),
+            runtimeEpoch: targetEpoch,
+          },
+          contextCutoff,
+          continuation: { status: 'pending' },
+          switchedAt: now,
+        },
         revision: current.revision + 1,
-        updatedAt: completeNow,
+        updatedAt: now,
       };
-      if (state.target.model !== undefined) {
-        nextTask.model = state.target.model;
-      } else {
-        delete nextTask.model;
-      }
-      if (boundSessionId) {
-        nextTask.committedSessionId = boundSessionId;
-      } else {
-        delete nextTask.committedSessionId;
-      }
+      if (targetModelId !== undefined) nextTask.model = targetModelId;
+      else delete nextTask.model;
+      delete nextTask.committedSessionId;
       draft.tasks[params.taskId] = nextTask;
+      boundModel = targetModelId;
+
+      // Turns queued before the click now belong to the new binding. The oldest
+      // one will atomically claim the continuation at the prompt freeze site.
+      for (const queued of turnsForTask(draft, params.taskId)) {
+        if (queued.status === 'queued') {
+          draft.turns[queued.id] = { ...queued, runtimeEpoch: targetEpoch };
+        }
+      }
       return { ok: true };
     });
+    if (!commit.ok) return { ok: false, reason: commit.detail ?? commit.reason };
 
-    if (!bindCommit.ok) {
-      return { ok: false, reason: bindCommit.detail ?? bindCommit.reason };
+    // The durable epoch fence is already committed. Abort local source streams;
+    // late events can no longer write a target binding.
+    for (const [turnId, handle] of this.liveRuns) {
+      if (handle.taskId !== params.taskId) continue;
+      handle.interruptArmed = true;
+      handle.controller.abort();
+      this.acceptedOpIds.delete(turnId);
+      this.askBridge.cancelForTurn(turnId, 'runtime switch');
+      this.dropElicitationWaits(turnId);
+      this.credentialRegistry?.revoke(turnId);
     }
-
-    this.handoffSourceSummaryByOperationId.delete(operationId);
-    // Promote messages that were queued during the handoff window.
     this.releaseQueuedTurnsAfterHandoff(params.taskId);
-
     return {
       ok: true,
       value: {
         operationId,
-        phase: handoff.phase,
-        diagnostics: handoff.toDiagnostics(),
-        boundBackend: state.target.backend,
-        ...(boundSessionId ? { boundSessionId } : {}),
+        boundBackend: targetBackendId,
+        ...(boundModel !== undefined ? { boundModel } : {}),
+        switchedAt: now,
       },
     };
-  }
-
-  /**
-   * Record handoff.fail after a transfer-time error. Does not rebind runtime.
-   * Clears ephemeral summary cache for the operation.
-   */
-  private failRuntimeHandoffTransfer(params: {
-    taskId: string;
-    operationId: string;
-    code: string;
-    message: string;
-    now: string;
-  }): EngineResult<{
-    operationId: string;
-    phase: TaskHandoffPhase;
-    diagnostics: TaskHandoffDiagnostics;
-    boundBackend: string;
-    boundSessionId?: string;
-  }> {
-    this.handoffSourceSummaryByOperationId.delete(params.operationId);
-    const task = this.store.getTask(params.taskId);
-    if (!task?.handoff) {
-      return { ok: false, reason: params.message };
-    }
-    const restored = TaskHandoff.restore(task.handoff);
-    if (!restored.ok) {
-      return { ok: false, reason: params.message };
-    }
-    const failed = restored.next.fail({
-      now: params.now,
-      operationId: params.operationId,
-      code: params.code,
-      message: params.message,
-    });
-    if (failed.ok) {
-      this.store.commit((draft) => {
-        const current = draft.tasks[params.taskId];
-        if (!current) return { ok: false, reason: 'task not found' };
-        draft.tasks[params.taskId] = {
-          ...current,
-          handoff: failed.next.toState(),
-          revision: current.revision + 1,
-          updatedAt: params.now,
-        };
-        return { ok: true };
-      });
-      // Failed handoffs keep the source binding; thaw held messages so send is not stuck.
-      this.releaseQueuedTurnsAfterHandoff(params.taskId);
-    }
-    return { ok: false, reason: params.message };
-  }
-
-  /**
-   * Hidden internal source-summary turn. Calls makeBackend(source)+runTurnFn with
-   * the source session/model, captures assistant text in-memory for digesting only,
-   * and never creates TaskMessage/TaskTurn rows or emits EngineEvents.
-   *
-   * Failures / timeout yield `unavailable` — conversation-ready handoffs still advance.
-   */
-  private async runHiddenSourceSummaryTurn(
-    task: MusterTask,
-    now: string,
-    options: { timeoutMs?: number } = {},
-  ): Promise<SourceSummaryOutcome> {
-    const timeoutMs = options.timeoutMs ?? HANDOFF_SOURCE_SUMMARY_TIMEOUT_MS;
-    const abort = new AbortController();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      const sourceBackend = this.makeBackend(task.backend);
-      const runOptions: RunOptions = {
-        prompt: HANDOFF_SOURCE_SUMMARY_PROMPT,
-        ...(task.committedSessionId ? { resumeId: task.committedSessionId } : {}),
-        ...(task.model ? { model: task.model } : {}),
-        ...(task.cwd ? { cwd: task.cwd } : {}),
-        signal: abort.signal,
-      };
-      const collected = await Promise.race([
-        collectInternalSummaryTurnText(this.runTurnFn(sourceBackend, runOptions)),
-        new Promise<{ text: string; errorMessage: string }>((resolve) => {
-          timer = setTimeout(() => {
-            abort.abort();
-            resolve({
-              text: '',
-              errorMessage: `source summary timed out after ${timeoutMs}ms`,
-            });
-          }, timeoutMs);
-        }),
-      ]);
-      if (collected.errorMessage) {
-        return {
-          kind: 'unavailable',
-          reason: collected.errorMessage.slice(0, 120),
-        };
-      }
-      const text = collected.text.trim();
-      if (!text) {
-        return { kind: 'unavailable', reason: 'empty source summary' };
-      }
-      return {
-        kind: 'ready',
-        contentDigest: digestSourceSummaryText(text),
-        summarizedAt: now,
-        text,
-      };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return {
-        kind: 'unavailable',
-        reason: message.slice(0, 120),
-      };
-    } finally {
-      if (timer) clearTimeout(timer);
-      if (!abort.signal.aborted) abort.abort();
-    }
   }
 
   send(
@@ -2139,7 +1655,7 @@ export class TaskEngine {
         }
         const liveTask = this.store.getTask(taskId);
         const handoffBusy =
-          !!liveTask?.handoff && isActiveHandoffPhase(liveTask.handoff.phase);
+          liveTask?.handoff?.version === 1 && isActiveHandoffPhase(liveTask.handoff.phase);
         if (
           !handoffBusy &&
           existing.turnId &&
@@ -2279,7 +1795,7 @@ export class TaskEngine {
     // canPromoteTurn also refuses during active handoff (without touching MEM030 holds).
     const liveTask = this.store.getTask(taskId);
     const handoffBusy =
-      !!liveTask?.handoff && isActiveHandoffPhase(liveTask.handoff.phase);
+      liveTask?.handoff?.version === 1 && isActiveHandoffPhase(liveTask.handoff.phase);
 
     if (clientRequestId) {
       const receipt = this.store.getFile().sendReceipts?.[clientRequestId];
@@ -2557,6 +2073,20 @@ export class TaskEngine {
         return result;
       }
       draft.turns[newTurnId] = result.next;
+      if (
+        !task.committedSessionId &&
+        task.handoff?.version === 2 &&
+        task.handoff.continuation.status === 'assigned' &&
+        task.handoff.continuation.turnId === oldTurn.id
+      ) {
+        draft.tasks[taskId] = {
+          ...task,
+          handoff: {
+            ...task.handoff,
+            continuation: { status: 'assigned', turnId: newTurnId, assignedAt: now },
+          },
+        };
+      }
       return { ok: true };
     });
     if (!commit.ok) {
@@ -2909,96 +2439,21 @@ export class TaskEngine {
       }
     }
 
-    this.reconcileOrphanedHandoffs();
     this.reconcileChildWaits({ schedule: false });
     this.deferReloadQueuedTurns();
     processCancelRequests(this.graphDeps());
   }
 
-  /**
-   * Interrupt live turns so handoff can start immediately. Queued turns stay
-   * queued; canPromoteTurn refuses while the handoff is active (does not use
-   * holdAutoPromote — that flag is MEM030 failure-safety only).
-   * Local leases abort via liveRuns; remote-owned leases get cancelRequests
-   * inside the store-side preemption (covers CAS re-preempt paths too).
-   * Does not wait for the backend stream to finish.
-   */
-  private preemptTaskTurnsForHandoff(taskId: string): EngineResult<void> {
-    const file = this.store.getFile();
-    const pending = pendingTurnsForTask(file, taskId);
-    if (pending.length === 0) {
-      return { ok: true, value: undefined };
-    }
-
-    const liveIds = pending
-      .filter((turn) => turn.status === 'running' || turn.status === 'waiting_user')
-      .map((turn) => turn.id);
-    for (const turnId of liveIds) {
-      const handle = this.liveRuns.get(turnId);
-      if (handle) {
-        handle.interruptArmed = true;
-        handle.controller.abort();
-      }
-    }
-
-    const now = nowIso(this.clock);
-    const commit = this.store.commit((draft) =>
-      this.applyHandoffTurnPreemption(draft, taskId, now, { cancelQueued: false }),
-    );
-    if (!commit.ok) {
-      return { ok: false, reason: commit.detail ?? commit.reason };
-    }
-
-    // Also abort any liveRuns that appeared after the pre-commit snapshot.
-    for (const turn of pendingTurnsForTask(this.store.getFile(), taskId)) {
-      if (turn.status !== 'running' && turn.status !== 'waiting_user' && turn.status !== 'interrupted') {
-        continue;
-      }
-      const handle = this.liveRuns.get(turn.id);
-      if (handle) {
-        handle.interruptArmed = true;
-        handle.controller.abort();
-      }
-    }
-
-    for (const turnId of liveIds) {
-      this.acceptedOpIds.delete(turnId);
-      this.askBridge.cancelForTurn(turnId, 'runtime handoff');
-      this.dropElicitationWaits(turnId);
-      this.credentialRegistry?.revoke(turnId);
-    }
-    return { ok: true, value: undefined };
-  }
-
-  /**
-   * Store-side preemption used inside CAS commits: interrupt live turns.
-   * Remote-owned live leases get interrupt cancelRequests on the same draft
-   * (covers races where a turn becomes live between snapshot and commit).
-   * When cancelQueued is true, also cancel queued turns; otherwise leave them
-   * queued (handoff phase blocks promotion via canPromoteTurn).
-   */
+  /** Interrupt live source turns in the same commit; queued turns are retagged to target epoch. */
   private applyHandoffTurnPreemption(
     draft: TaskStoreFile,
     taskId: string,
     now: string,
-    options: { cancelQueued?: boolean } = {},
   ): { ok: true } | { ok: false; reason: string } {
-    const cancelQueued = options.cancelQueued === true;
     const pending = pendingTurnsForTask(draft, taskId);
     for (const turn of pending) {
       if (turn.status === 'queued') {
-        if (cancelQueued) {
-          const cancelled = cancelPendingTurn(turn, { now });
-          if (!cancelled.ok) {
-            return cancelled;
-          }
-          draft.turns[turn.id] = {
-            ...cancelled.next,
-            isCancellation: true,
-            interruptConfidence: 'confirmed',
-          };
-        }
-        // else: leave queued; do not touch holdAutoPromote (MEM030).
+        continue;
       } else {
         // Notify remote owners before marking interrupted in the shared store.
         if (
@@ -3058,125 +2513,7 @@ export class TaskEngine {
     }
   }
 
-  /**
-   * After process reload, in-process source-summary work is gone. Advance any
-   * orphaned summarizing_source reservation to preparing_receiver with summary
-   * unavailable so host/engine can still complete conversation-only transfer
-   * without re-querying the source CLI. Never rebinds runtime here.
-   *
-   * Orphaned `transferring` is fail-closed: receiver side effects are uncertain,
-   * so mark failed (source binding retained) so a fresh handoff and queue thaw
-   * can proceed.
-   */
-  private reconcileOrphanedHandoffs(): void {
-    const now = nowIso(this.clock);
-    for (const task of Object.values(this.store.getFile().tasks)) {
-      if (!task.handoff) continue;
-
-      if (task.handoff.phase === 'transferring') {
-        const restored = TaskHandoff.restore(task.handoff);
-        if (!restored.ok) continue;
-        const operationId = restored.next.operationId;
-        const failed = restored.next.fail({
-          now,
-          operationId,
-          code: 'handoff_interrupted_by_reload',
-          message: 'receiver transfer interrupted by reload',
-        });
-        if (!failed.ok) continue;
-        this.store.commit((draft) => {
-          const current = draft.tasks[task.id];
-          if (!current?.handoff || current.handoff.operationId !== operationId) {
-            return { ok: true };
-          }
-          if (current.handoff.phase !== 'transferring') {
-            return { ok: true };
-          }
-          draft.tasks[task.id] = {
-            ...current,
-            handoff: failed.next.toState(),
-            revision: current.revision + 1,
-            updatedAt: now,
-          };
-          return { ok: true };
-        });
-        this.handoffSourceSummaryByOperationId.delete(operationId);
-        this.releaseQueuedTurnsAfterHandoff(task.id);
-        continue;
-      }
-
-      if (task.handoff.phase !== 'summarizing_source') {
-        continue;
-      }
-      const restored = TaskHandoff.restore(task.handoff);
-      if (!restored.ok) {
-        continue;
-      }
-      const operationId = restored.next.operationId;
-      let handoff = restored.next;
-      const marked = handoff.markSummaryUnavailable({
-        now,
-        operationId,
-        reason: 'source summary interrupted by reload',
-      });
-      if (!marked.ok) {
-        continue;
-      }
-      handoff = marked.next;
-      const prepared = handoff.beginPreparingReceiver({ now, operationId });
-      if (!prepared.ok) {
-        continue;
-      }
-      handoff = prepared.next;
-      this.store.commit((draft) => {
-        const current = draft.tasks[task.id];
-        if (!current?.handoff || current.handoff.operationId !== operationId) {
-          return { ok: true };
-        }
-        if (current.handoff.phase !== 'summarizing_source') {
-          return { ok: true };
-        }
-        draft.tasks[task.id] = {
-          ...current,
-          handoff: handoff.toState(),
-          revision: current.revision + 1,
-          updatedAt: now,
-        };
-        return { ok: true };
-      });
-      // Ephemeral summary cache does not survive reload (D020).
-      this.handoffSourceSummaryByOperationId.delete(operationId);
-    }
-  }
-
-  /**
-   * Product recovery: after reload, finish any handoff already at
-   * preparing_receiver (including ones just recovered from summarizing_source).
-   * Conversation-only when summary text is gone. Does not re-run source summary.
-   */
-  private async resumePendingRuntimeHandoffs(): Promise<void> {
-    const pending: Array<{ taskId: string; operationId: string }> = [];
-    for (const task of Object.values(this.store.getFile().tasks)) {
-      if (task.handoff?.phase === 'preparing_receiver') {
-        pending.push({ taskId: task.id, operationId: task.handoff.operationId });
-      }
-    }
-    for (const item of pending) {
-      try {
-        await this.completeRuntimeHandoff({
-          taskId: item.taskId,
-          operationId: item.operationId,
-        });
-      } catch {
-        // Fail-closed inside completeRuntimeHandoff records handoff.fail when possible.
-      }
-    }
-  }
-
-  /**
-   * W9 reload: hold uncertain / non-safe queued turns; auto-resume
-   * safe_never_dispatched released engine turns when workspace trusted.
-   */
+  /** Reload policy for ordinary queued turns; runtime switches need no recovery work. */
   private deferReloadQueuedTurns(): void {
     const file = this.store.getFile();
     const trusted = this.isWorkspaceTrusted();
@@ -4111,10 +3448,17 @@ export class TaskEngine {
 
     const now = nowIso(this.clock);
 
-    // Host-context W1: prepare only at the single freeze site (seq-1, unpinned).
-    const needsFirstTurnAssemble =
-      turn.sequence === 1 && turn.resolvedInputs === undefined;
-    if (needsFirstTurnAssemble) {
+    // Every fresh backend session gets the same host/runtime/task bootstrap.
+    // After a switch, the first real target turn is also a fresh-session boundary.
+    const hasPendingContinuation =
+      task.handoff?.version === 2 &&
+      task.handoff.target.runtimeEpoch === (turn.runtimeEpoch ?? 1) &&
+      (task.handoff.continuation.status === 'pending' ||
+        (task.handoff.continuation.status === 'assigned' &&
+          task.handoff.continuation.turnId === turn.id));
+    const needsFreshSessionAssemble =
+      turn.resolvedInputs === undefined && (turn.sequence === 1 || hasPendingContinuation);
+    if (needsFreshSessionAssemble) {
       await this.prepareHostForFirstTurn();
     }
 
@@ -4131,16 +3475,28 @@ export class TaskEngine {
       if (isTerminalLifecycle(draftTask.lifecycle)) {
         return { ok: false, reason: 'task is terminal' };
       }
+      if ((draftTurn.runtimeEpoch ?? 1) !== (draftTask.runtimeEpoch ?? 1)) {
+        return { ok: false, reason: 'turn belongs to a superseded runtime binding' };
+      }
 
-      // Single freeze site: sequence === 1 only. Queue paths never assemble.
+      // Single freeze site for a new task or first real turn after a switch.
       // Presence of resolvedInputs (even []) is the durable pin marker — never re-assemble.
       let turnForStart = draftTurn;
       let taskForStart = draftTask;
 
-      if (draftTurn.sequence === 1 && draftTurn.resolvedInputs === undefined) {
+      const continuation = draftTask.handoff?.version === 2 ? draftTask.handoff : undefined;
+      const claimsContinuation =
+        continuation?.version === 2 &&
+        continuation.target.runtimeEpoch === (draftTurn.runtimeEpoch ?? 1) &&
+        (continuation.continuation.status === 'pending' ||
+          (continuation.continuation.status === 'assigned' &&
+            continuation.continuation.turnId === draftTurn.id));
+      const isFreshSessionTurn = draftTurn.sequence === 1 || claimsContinuation;
+
+      if (isFreshSessionTurn && draftTurn.resolvedInputs === undefined) {
         let pins: import('./types').ResolvedInputPin[] = [];
         const bindings = draftTask.inputBindings;
-        if (bindings && bindings.length > 0) {
+        if (draftTurn.sequence === 1 && bindings && bindings.length > 0) {
           const resolved = resolveInputBindings(bindings, draft.tasks);
           if (!resolved.ok) {
             draft.tasks[draftTask.id] = {
@@ -4188,6 +3544,8 @@ export class TaskEngine {
         const advertisedCommands = this.getAdvertisedCommands?.(draftTask.backend);
         // Per-backend skill invocation prefix (`/` default, `$` for Codex).
         const skillPrefix = this.getSkillPrefix?.(draftTask.backend) ?? '/';
+        // Protected bootstrap/task layers first. Continuation shrinks to the
+        // remaining budget so history never displaces the common first-session contract.
         const assembled = assembleFirstTurnPrompt({
           snapshot,
           self: {
@@ -4250,17 +3608,43 @@ export class TaskEngine {
           return { ok: true };
         }
 
-        const pinned = pinResolvedInputs(draftTurn, pins, assembled.prompt);
+        const remainingContinuationBudget = Math.max(
+          0,
+          COMPILED_PROMPT_MAX - assembled.prompt.length - 2,
+        );
+        const compactContinuation =
+          claimsContinuation && remainingContinuationBudget > 0
+            ? buildCompactContinuationContext(
+                draft,
+                draftTask.id,
+                continuation,
+                Math.min(16_000, remainingContinuationBudget),
+              )
+            : undefined;
+        const compiledPrompt = compactContinuation
+          ? `${assembled.prompt}\n\n${compactContinuation}`
+          : assembled.prompt;
+        const pinned = pinResolvedInputs(draftTurn, pins, compiledPrompt);
         if (!pinned.ok) {
           return { ok: false, reason: pinned.reason };
         }
         turnForStart = pinned.next;
+        if (claimsContinuation && continuation.continuation.status === 'pending') {
+          taskForStart = {
+            ...taskForStart,
+            handoff: {
+              ...continuation,
+              continuation: { status: 'assigned', turnId, assignedAt: now },
+            },
+          };
+          draft.tasks[draftTask.id] = taskForStart;
+        }
         // First-turn attention (in-commit): raise skill_unavailable when declared
         // skills are known-absent/invalid on this backend; otherwise clear any
         // prior missing_input / budget attention now that freeze succeeded.
         if (assembled.unavailableSkills.length > 0) {
           taskForStart = {
-            ...draftTask,
+            ...taskForStart,
             revision: draftTask.revision + 1,
             updatedAt: now,
             attention: {
@@ -4276,7 +3660,7 @@ export class TaskEngine {
           draftTask.attention?.code === 'prompt_budget_exceeded'
         ) {
           taskForStart = {
-            ...draftTask,
+            ...taskForStart,
             revision: draftTask.revision + 1,
             updatedAt: now,
             attention: undefined,
@@ -4343,28 +3727,40 @@ export class TaskEngine {
       }
     }
 
-    const startedTurn = this.store.getFile().turns[turnId];
-    if (startedTurn) {
-      if (startedTurn.runDeadlineAt) {
-        updateLeaseExpiry(this.storePath, turnId, lease, startedTurn.runDeadlineAt);
-      }
-      this.safeEmit({
-        type: 'turnStart',
-        taskId: startedTurn.taskId,
-        turnId,
-        trigger: startedTurn.trigger,
-      });
+    // Re-pin task/turn after the promote commit so a switch that landed during
+    // prepareHostForFirstTurn cannot dispatch the frozen prompt on a stale binding.
+    const postStartFile = this.store.getFile();
+    const startedTurn = postStartFile.turns[turnId];
+    const taskForDispatch = startedTurn
+      ? postStartFile.tasks[startedTurn.taskId]
+      : undefined;
+    if (!startedTurn || !taskForDispatch) {
+      releaseLease(this.storePath, turnId, lease);
+      return;
     }
+    if ((startedTurn.runtimeEpoch ?? 1) !== (taskForDispatch.runtimeEpoch ?? 1)) {
+      releaseLease(this.storePath, turnId, lease);
+      return;
+    }
+    if (startedTurn.runDeadlineAt) {
+      updateLeaseExpiry(this.storePath, turnId, lease, startedTurn.runDeadlineAt);
+    }
+    this.safeEmit({
+      type: 'turnStart',
+      taskId: startedTurn.taskId,
+      turnId,
+      trigger: startedTurn.trigger,
+    });
 
     const abort = new AbortController();
     // Placeholder backend until factory succeeds.
     let backend: Backend = {
-      name: task.backend,
+      name: taskForDispatch.backend,
       run: async function* () {},
     };
     this.liveRuns.set(turnId, {
       controller: abort,
-      taskId: turn.taskId,
+      taskId: startedTurn.taskId,
       sessionId: undefined,
     });
     const engineNowMs = Date.parse(nowIso(this.clock));
@@ -4394,9 +3790,9 @@ export class TaskEngine {
         return { ok: true };
       });
       console.info('[muster][task-orch] turn.settle.timeout', {
-        taskId: task.id,
+        taskId: taskForDispatch.id,
         turnId,
-        backend: task.backend,
+        backend: taskForDispatch.backend,
         limitMs,
         deadlineAt,
       });
@@ -4421,7 +3817,7 @@ export class TaskEngine {
 
     try {
       try {
-        backend = this.makeBackend(task.backend);
+        backend = this.makeBackend(taskForDispatch.backend);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         terminalSettled = await this.settleFailed(
@@ -4434,7 +3830,7 @@ export class TaskEngine {
         if (terminalSettled) {
           this.safeEmit({
             type: 'turnError',
-            taskId: turn.taskId,
+            taskId: startedTurn.taskId,
             turnId,
             message: `backend factory failed: ${message}`,
           });
@@ -4446,34 +3842,34 @@ export class TaskEngine {
       const messages = messageMapFromFile(current);
       const prompt = projectPrompt(currentTurn, messages, current, this.resourceLimits.maxResultBytes);
       console.info('[muster][task-orch] turn.run', {
-        taskId: task.id,
+        taskId: taskForDispatch.id,
         turnId,
-        parentId: task.parentId,
-        backend: task.backend,
-        model: task.model ?? null,
-        releaseState: task.releaseState ?? null,
-        cwd: task.cwd ?? null,
+        parentId: taskForDispatch.parentId,
+        backend: taskForDispatch.backend,
+        model: taskForDispatch.model ?? null,
+        releaseState: taskForDispatch.releaseState ?? null,
+        cwd: taskForDispatch.cwd ?? null,
         trigger: currentTurn?.trigger ?? null,
         promptChars: prompt.length,
       });
       const built = this.bridgePort > 0 && this.credentialRegistry
         ? buildRunOptionsForTurn(this.graphDeps(), turnId, {
             prompt,
-            resumeId: task.committedSessionId,
+            resumeId: taskForDispatch.committedSessionId,
             signal: abort.signal,
             // Run the agent in the task's workspace directory so ACP adapters
             // pass it as session/new|load { cwd } instead of falling back to
             // process.cwd() (wrong dir in a packaged extension).
-            cwd: task.cwd,
-            model: task.model,
+            cwd: taskForDispatch.cwd,
+            model: taskForDispatch.model,
           })
         : {
             options: {
               prompt,
-              resumeId: task.committedSessionId,
+              resumeId: taskForDispatch.committedSessionId,
               signal: abort.signal,
-              cwd: task.cwd,
-              model: task.model,
+              cwd: taskForDispatch.cwd,
+              model: taskForDispatch.model,
             },
           };
       mcpConfigPath = built.mcpConfigPath;
@@ -4484,8 +3880,12 @@ export class TaskEngine {
         onBeforePrompt: async () => {
           const commit = this.store.commit((draft) => {
             const t = draft.turns[turnId];
+            const currentTask = t ? draft.tasks[t.taskId] : undefined;
             if (!t || (t.status !== 'running' && t.status !== 'waiting_user')) {
               return { ok: false, reason: 'turn is not live for prompt dispatch marker' };
+            }
+            if (!currentTask || (t.runtimeEpoch ?? 1) !== (currentTask.runtimeEpoch ?? 1)) {
+              return { ok: false, reason: 'runtime binding was superseded before prompt dispatch' };
             }
             if (t.dispatchPhase === 'prompt_outstanding' || t.dispatchPhase === 'terminal_received') {
               return { ok: true };
@@ -4505,6 +3905,19 @@ export class TaskEngine {
         processCancelRequests(this.graphDeps());
         if (terminalSettled) {
           break;
+        }
+        const eventFile = this.store.getFile();
+        const eventTurn = eventFile.turns[turnId];
+        const eventTask = eventTurn ? eventFile.tasks[eventTurn.taskId] : undefined;
+        if (
+          !eventTurn ||
+          !eventTask ||
+          (eventTurn.status !== 'running' && eventTurn.status !== 'waiting_user') ||
+          (eventTurn.runtimeEpoch ?? 1) !== (eventTask.runtimeEpoch ?? 1)
+        ) {
+          // A runtime switch can settle/interrupt this source turn without
+          // waiting for a misbehaving adapter stream. Drain but ignore late data.
+          continue;
         }
 
         // Auxiliary streaming events are forwarded raw. `assistantDelta` is
@@ -4529,8 +3942,12 @@ export class TaskEngine {
               if (liveHandle) liveHandle.sessionId = event.sessionId;
               this.store.commit((draft) => {
                 const draftTurn = draft.turns[turnId];
-                if (!draftTurn) {
+                const draftTask = draftTurn ? draft.tasks[draftTurn.taskId] : undefined;
+                if (!draftTurn || !draftTask) {
                   return { ok: false, reason: 'turn not found' };
+                }
+                if ((draftTurn.runtimeEpoch ?? 1) !== (draftTask.runtimeEpoch ?? 1)) {
+                  return { ok: true };
                 }
                 draft.turns[turnId] = { ...draftTurn, observedSessionId: event.sessionId };
                 return { ok: true };
@@ -4780,28 +4197,42 @@ export class TaskEngine {
           case 'raw':
             rawOutput += `${event.line}\n`;
             break;
-          case 'turnCompleted':
-            terminalSettled = await this.settleSuccess(turnId, observedSessionId, rawOutput, backend);
-            if (terminalSettled) {
+          case 'turnCompleted': {
+            const successOutcome = await this.settleSuccess(
+              turnId,
+              observedSessionId,
+              rawOutput,
+              backend,
+            );
+            if (successOutcome === 'ok') {
+              terminalSettled = true;
               this.safeEmit({ type: 'turnDone', taskId: turn.taskId, turnId });
             } else {
+              const failMessage =
+                successOutcome === 'missing_session'
+                  ? 'target session was not observed after runtime switch'
+                  : 'failed to settle successful turn';
               terminalSettled = await this.settleFailed(
                 turnId,
-                'failed to settle successful turn',
+                failMessage,
                 observedSessionId,
                 rawOutput,
                 backend,
+                successOutcome === 'missing_session'
+                  ? { failureClass: 'uncertain' }
+                  : undefined,
               );
               if (terminalSettled) {
                 this.safeEmit({
                   type: 'turnError',
                   taskId: turn.taskId,
                   turnId,
-                  message: 'failed to settle successful turn',
+                  message: failMessage,
                 });
               }
             }
             break;
+          }
           case 'error':
             if (event.isCancellation) {
               const runTimedOut =
@@ -4918,12 +4349,17 @@ export class TaskEngine {
     }
   }
 
+  /**
+   * @returns `'ok'` on success settlement, `'missing_session'` when an assigned
+   * handoff turn completed without a bindable target session (caller must route
+   * through settleFailed), or `false` when settlement could not run.
+   */
   private async settleSuccess(
     turnId: string,
     observedSessionId: string | undefined,
     rawOutput: string,
     backend: Backend,
-  ): Promise<boolean> {
+  ): Promise<'ok' | 'missing_session' | false> {
     if (this.settling.has(turnId)) {
       return false;
     }
@@ -4937,11 +4373,15 @@ export class TaskEngine {
       // store.commit — and is threaded into the disposition inside the commit. The
       // store lock is never held across the subprocess.
       const hostVerdict = this.computeHostVerdictForSettle(turnId);
+      let missingSession = false;
       const commit = this.store.commit((draft) => {
         const turn = draft.turns[turnId];
         const task = turn ? draft.tasks[turn.taskId] : undefined;
         if (!turn || !task || turn.status !== 'running') {
           return { ok: false, reason: 'turn is not running' };
+        }
+        if ((turn.runtimeEpoch ?? 1) !== (task.runtimeEpoch ?? 1)) {
+          return { ok: false, reason: 'turn belongs to a superseded runtime binding' };
         }
 
         const observed = observedSessionId ?? turn.observedSessionId;
@@ -4965,6 +4405,23 @@ export class TaskEngine {
           walk = draft.tasks[walk]?.parentId ?? null;
         }
         const rootPolicy = draft.tasks[rootId]?.childOrchestrationSeal;
+        const sessionId = selectCommittedSessionId(
+          backend,
+          { observedSessionId: observed },
+          rawOutput,
+          task.committedSessionId,
+        );
+        const assignedContinuation =
+          task.handoff?.version === 2 &&
+          task.handoff.continuation.status === 'assigned' &&
+          task.handoff.continuation.turnId === turnId;
+        // Detect missing target session without mutating state here — the caller
+        // routes through settleFailed so follow-ups freeze and turnError emits.
+        if (assignedContinuation && !sessionId) {
+          missingSession = true;
+          return { ok: false, reason: 'target session was not observed after runtime switch' };
+        }
+
         const result = applySuccessfulTurn(task, withObserved, {
           now,
           rootChildOrchestrationSeal: rootPolicy,
@@ -4982,18 +4439,26 @@ export class TaskEngine {
           return result;
         }
 
-        const sessionId = selectCommittedSessionId(
-          backend,
-          { observedSessionId: observed },
-          rawOutput,
-          task.committedSessionId,
-        );
-
         draft.turns[turnId] = result.next.turn;
-        draft.tasks[task.id] = {
+        let nextTask: MusterTask = {
           ...result.next.task,
           committedSessionId: sessionId ?? result.next.task.committedSessionId,
         };
+        if (
+          sessionId &&
+          nextTask.handoff?.version === 2 &&
+          nextTask.handoff.continuation.status === 'assigned' &&
+          nextTask.handoff.continuation.turnId === turnId
+        ) {
+          nextTask = {
+            ...nextTask,
+            handoff: {
+              ...nextTask.handoff,
+              continuation: { status: 'consumed', turnId, consumedAt: now },
+            },
+          };
+        }
+        draft.tasks[task.id] = nextTask;
 
         for (const effect of result.effects) {
           this.applyEffect(draft, effect, turnId, now);
@@ -5031,13 +4496,17 @@ export class TaskEngine {
         ) {
           this.enqueueDispositionRepair(task.id, turnId);
         }
-      } else {
-        console.info('[muster][task-orch] turn.settle.commit_failed', {
-          turnId,
-          reason: commit.detail ?? commit.reason,
-        });
+        return 'ok';
       }
-      return commit.ok;
+      if (missingSession) {
+        console.info('[muster][task-orch] turn.settle.missing_session', { turnId });
+        return 'missing_session';
+      }
+      console.info('[muster][task-orch] turn.settle.commit_failed', {
+        turnId,
+        reason: commit.detail ?? commit.reason,
+      });
+      return false;
     } finally {
       this.settling.delete(turnId);
     }
@@ -5178,13 +4647,18 @@ export class TaskEngine {
           (t) => t.status === 'queued',
         );
 
+        let nextTask = task;
         if (interruptConfidence === 'confirmed') {
           // ISSUE-1: bind observed session for first-turn interrupt when unset.
-          if (task && !task.committedSessionId) {
+          if (
+            nextTask &&
+            !nextTask.committedSessionId &&
+            (turn.runtimeEpoch ?? 1) === (nextTask.runtimeEpoch ?? 1)
+          ) {
             const bindId = observed ?? candidate;
             if (bindId) {
-              draft.tasks[turn.taskId] = {
-                ...task,
+              nextTask = {
+                ...nextTask,
                 committedSessionId: bindId,
               };
             }
@@ -5202,6 +4676,26 @@ export class TaskEngine {
         } else {
           // Forced / unconfirmed: freeze follow-ups; do not commit session.
           holdQueuedFollowUpsOnFailure(draft, turn.taskId);
+        }
+        // Proven pre-dispatch stop never ran the target prompt — free the
+        // one-shot continuation so the next eligible turn can claim it.
+        if (
+          nextTask &&
+          (turn.dispatchPhase === undefined || turn.dispatchPhase === 'pre_dispatch') &&
+          nextTask.handoff?.version === 2 &&
+          nextTask.handoff.continuation.status === 'assigned' &&
+          nextTask.handoff.continuation.turnId === turnId
+        ) {
+          nextTask = {
+            ...nextTask,
+            handoff: {
+              ...nextTask.handoff,
+              continuation: { status: 'pending' },
+            },
+          };
+        }
+        if (nextTask && nextTask !== task) {
+          draft.tasks[turn.taskId] = nextTask;
         }
         return { ok: true };
       });
@@ -5238,7 +4732,13 @@ export class TaskEngine {
         const turns = turnsForTask(draft, task.id);
         const failureClass =
           opts?.failureClass ??
-          (opts?.terminalReceived ? 'terminal_received' : 'unclassified');
+          (opts?.terminalReceived
+            ? 'terminal_received'
+            : turn.dispatchPhase === 'pre_dispatch'
+              ? 'safe_to_retry'
+              : turn.dispatchPhase === 'prompt_outstanding'
+                ? 'uncertain'
+                : 'unclassified');
         const result = applyFailedTurn(task, turn, {
           error: errorMessage,
           retryCount: retryCountOf(turns, turn.id),
@@ -5266,12 +4766,30 @@ export class TaskEngine {
         // Phase B: bind only terminal_received + nonblank observed session id
         // (never speculative candidate from raw output).
         let nextTask = result.next.task;
-        if (opts?.terminalReceived && !nextTask.committedSessionId) {
+        if (
+          opts?.terminalReceived &&
+          !nextTask.committedSessionId &&
+          (turn.runtimeEpoch ?? 1) === (nextTask.runtimeEpoch ?? 1)
+        ) {
           const bindId =
             typeof observed === 'string' && observed.trim().length > 0 ? observed.trim() : undefined;
           if (bindId) {
             nextTask = { ...nextTask, committedSessionId: bindId };
           }
+        }
+        if (
+          failureClass === 'safe_to_retry' &&
+          nextTask.handoff?.version === 2 &&
+          nextTask.handoff.continuation.status === 'assigned' &&
+          nextTask.handoff.continuation.turnId === turnId
+        ) {
+          nextTask = {
+            ...nextTask,
+            handoff: {
+              ...nextTask.handoff,
+              continuation: { status: 'pending' },
+            },
+          };
         }
         // Repair turn failure: escalate to wakeable missing_disposition.
         if (

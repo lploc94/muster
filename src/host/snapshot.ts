@@ -342,39 +342,13 @@ function projectHandoffBinding(binding: {
 }
 
 /**
- * Project durable TaskHandoff state into omission-safe chrome progress.
- * Labels + phase + timestamps + bounded failure only — never digests, bodies,
- * or session identifiers (MEM156 / D018).
+ * v2 switches are local and instantaneous — no multi-phase progress chrome.
+ * Legacy v1 phase records are stripped on store load, so this always omits.
  */
 export function projectHandoffProgress(
-  handoff: TaskHandoffState | undefined,
+  _handoff: TaskHandoffState | undefined,
 ): HandoffProgress | undefined {
-  if (!handoff) {
-    return undefined;
-  }
-  const progress: HandoffProgress = {
-    operationId: handoff.operationId,
-    phase: handoff.phase,
-    source: projectHandoffBinding(handoff.source),
-    target: projectHandoffBinding(handoff.target),
-    createdAt: handoff.createdAt,
-    updatedAt: handoff.updatedAt,
-  };
-  if (handoff.startedAt) {
-    progress.startedAt = handoff.startedAt;
-  }
-  if (handoff.finishedAt) {
-    progress.finishedAt = handoff.finishedAt;
-  }
-  if (handoff.failure) {
-    progress.failure = {
-      code: handoff.failure.code,
-      // Re-sanitize at the projection boundary so raw/legacy failure text cannot leak.
-      message: sanitizeHandoffFailureMessage(handoff.failure.message),
-      at: handoff.failure.at,
-    };
-  }
-  return progress;
+  return undefined;
 }
 
 function projectChildOrchestration(
@@ -436,7 +410,9 @@ export function projectTaskSummary(file: TaskStoreFile, taskId: string): TaskSum
   }
   const turns = turnsForTask(file, taskId);
   const deps = depLifecyclesForTask(file, task);
-  const handoffProgress = projectHandoffProgress(task.handoff);
+  const handoffProgress = projectHandoffProgress(
+    task.handoff?.version === 1 ? task.handoff : undefined,
+  );
   const childOrchestration =
     task.role === 'coordinator' ? projectChildOrchestration(file, taskId) : undefined;
   // Only the latest settled/live turn may present a run-timeout reason. Historical

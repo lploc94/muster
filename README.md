@@ -92,6 +92,7 @@ Dev-only file IPC proof — production design uses [Muster Bridge](docs/MUSTER-B
 | [docs/SESSION-MANAGEMENT.md](docs/SESSION-MANAGEMENT.md) | Session IDs & resume |
 | [docs/TASK-MANAGEMENT.md](docs/TASK-MANAGEMENT.md) | Task/turn model, TaskEngine, and Markdown export contract |
 | [docs/SETTINGS.md](docs/SETTINGS.md) | Host-backed Settings pattern |
+| [docs/SETTINGS-DESIGN.md](docs/SETTINGS-DESIGN.md) | Proposed Settings information architecture and UI design |
 | [docs/WEBVIEW.md](docs/WEBVIEW.md) | Chat UI, read-only presentation review/revision, and task Markdown export UX |
 
 Full index: [docs/README.md](docs/README.md).

@@ -35,15 +35,9 @@ export type RuntimeHandoffEngineResult<T> =
 
 export interface RuntimeHandoffRequestValue {
   operationId: string;
-  phase: string;
-}
-
-export interface RuntimeHandoffCompleteValue {
-  operationId: string;
-  phase: string;
   boundBackend: string;
-  /** Engine may return this; the route never forwards it to the webview. */
-  boundSessionId?: string;
+  boundModel?: string;
+  switchedAt: string;
 }
 
 export interface RuntimeHandoffRouteDeps {
@@ -54,15 +48,6 @@ export interface RuntimeHandoffRouteDeps {
     targetBackend: string;
     targetModel?: string;
   }) => Promise<RuntimeHandoffEngineResult<RuntimeHandoffRequestValue>>;
-  completeRuntimeHandoff: (params: {
-    taskId: string;
-    operationId?: string;
-  }) => Promise<RuntimeHandoffEngineResult<RuntimeHandoffCompleteValue>>;
-  /**
-   * Optional hook after requestRuntimeHandoff commits preparing_receiver so the
-   * host can project intermediate handoffProgress before receiver transfer.
-   */
-  afterRequestCommitted?: (taskId: string) => void | Promise<void>;
 }
 
 export type RuntimeHandoffHostMessage = {
@@ -198,7 +183,7 @@ export function parseRequestRuntimeHandoffMessage(
   }
   if (
     taskId.length > MAX_TASK_MARKDOWN_EXPORT_ID_CHARS ||
-    taskId.includes('\0')
+    /[\u0000-\u001f\u007f]/.test(taskId)
   ) {
     return {
       ok: false,
@@ -206,6 +191,19 @@ export function parseRequestRuntimeHandoffMessage(
       message: 'requestRuntimeHandoff taskId is invalid',
       taskId: taskId.slice(0, MAX_TASK_MARKDOWN_EXPORT_ID_CHARS),
     };
+  }
+
+  // Labels only — reject unknown keys so session ids / paths cannot ride along.
+  const allowedKeys = new Set(['type', 'taskId', 'targetBackend', 'targetModel']);
+  for (const key of Object.keys(record)) {
+    if (!allowedKeys.has(key)) {
+      return {
+        ok: false,
+        code: 'invalid_request',
+        message: 'requestRuntimeHandoff contains unsupported fields',
+        taskId,
+      };
+    }
   }
 
   if (typeof record.targetBackend !== 'string') {
@@ -254,8 +252,6 @@ export function parseRequestRuntimeHandoffMessage(
     }
   }
 
-  // skipSummary is not a product control: engine always best-effort summarizes.
-  // Unknown/extra fields (including legacy skipSummary) are ignored.
   return {
     ok: true,
     taskId,
@@ -281,10 +277,8 @@ function sameBinding(
  * Host routing for requestRuntimeHandoff:
  * 1. Validate the inbound switch request.
  * 2. Refuse missing task / same binding without calling engine APIs.
- * 3. requestRuntimeHandoff → preparing_receiver (binding hold).
- * 4. Optionally project intermediate handoffProgress via afterRequestCommitted.
- * 5. completeRuntimeHandoff → atomic rebind (or failed handoff with source hold).
- * 6. Surface sanitized commandError on refusal/failure; never return session ids.
+ * 3. requestRuntimeHandoff atomically commits the new local binding + context cutoff.
+ * 4. Surface sanitized commandError on refusal; never return session ids.
  */
 export async function routeRuntimeHandoff(
   data: unknown,
@@ -304,8 +298,7 @@ export async function routeRuntimeHandoff(
     !deps ||
     typeof deps !== 'object' ||
     typeof deps.getTask !== 'function' ||
-    typeof deps.requestRuntimeHandoff !== 'function' ||
-    typeof deps.completeRuntimeHandoff !== 'function'
+    typeof deps.requestRuntimeHandoff !== 'function'
   ) {
     console.info('[muster][handoff-route] deps unavailable');
     return refused('Runtime handoff is unavailable.', parsed.taskId);
@@ -363,56 +356,15 @@ export async function routeRuntimeHandoff(
     return refused(requested.reason, parsed.taskId);
   }
 
-  // Intermediate projection: preparing_receiver is now durable on the task.
-  if (typeof deps.afterRequestCommitted === 'function') {
-    try {
-      await deps.afterRequestCommitted(parsed.taskId);
-    } catch {
-      // Projection refresh is best-effort; transfer still proceeds.
-    }
-  }
-
-  let completed: RuntimeHandoffEngineResult<RuntimeHandoffCompleteValue>;
-  try {
-    completed = await deps.completeRuntimeHandoff({
-      taskId: parsed.taskId,
-      operationId: requested.value.operationId,
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return {
-      kind: 'failed',
-      taskId: parsed.taskId,
-      operationId: requested.value.operationId,
-      refreshSnapshot: true,
-      messages: [
-        commandErrorMessage(
-          parsed.taskId,
-          `Runtime handoff transfer failed: ${message}`,
-        ),
-      ],
-    };
-  }
-
-  if (!completed.ok) {
-    // completeRuntimeHandoff records handoff.fail without rebinding source.
-    // Refresh so webview can show failed handoffProgress + prior binding.
-    return {
-      kind: 'failed',
-      taskId: parsed.taskId,
-      operationId: requested.value.operationId,
-      refreshSnapshot: true,
-      messages: [commandErrorMessage(parsed.taskId, completed.reason)],
-    };
-  }
-
-  // Success — never include boundSessionId or diagnostics bodies.
+  // Success is the atomic request commit; target session creation is deferred to
+  // the next real user/queued turn and uses the ordinary MCP-enabled run path.
   return {
     kind: 'completed',
     taskId: parsed.taskId,
-    operationId: completed.value.operationId,
-    boundBackend: completed.value.boundBackend,
+    operationId: requested.value.operationId,
+    boundBackend: requested.value.boundBackend,
     refreshSnapshot: true,
     messages: [],
   };
 }
+

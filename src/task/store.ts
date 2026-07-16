@@ -5,6 +5,7 @@ import { synthesizeBriefFromGoal } from './brief';
 import { deriveViewStatus } from './derived-status';
 import type {
   MusterTask,
+  TaskContinuationHandoffState,
   TaskHandoffCompletion,
   TaskHandoffConversationContext,
   TaskHandoffFailure,
@@ -158,6 +159,17 @@ export function sanitizeHandoffFailureMessage(message: string): string {
     .replace(/(?:^|[\s"'`(=])(\/(?:[^\s"'`)]+\/)+[^\s"'`)]+)/g, (match, pathPart: string) =>
       match.replace(pathPart, '[path]'),
     )
+    // Authorization / cookie / set-cookie headers — full value through EOL
+    .replace(
+      /\b((?:authorization|proxy-authorization|cookie|set-cookie)\s*[:=]\s*)[^\r\n]+/gi,
+      '$1[redacted]',
+    )
+    .replace(/\bBearer\s+[A-Za-z0-9\-._~+/]+=*/gi, 'Bearer [redacted]')
+    // password/token/secret/key assignment forms (PASSWORD=…, PASSWORD="…", AWS_SECRET_ACCESS_KEY: …)
+    .replace(
+      /\b((?:password|passwd|pwd|passphrase|api[_-]?key|access[_-]?key|secret[_-]?access[_-]?key|secret|token|auth[_-]?token|private[_-]?key|aws_secret_access_key|aws_access_key_id)\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
+      '$1[redacted]',
+    )
     // Common secret / token shapes (sk-…, api_key-…, etc.)
     .replace(
       /\b(?:sk|pk|api[_-]?key|token|secret|key)[-_][A-Za-z0-9][-_A-Za-z0-9]{4,}\b/gi,
@@ -304,7 +316,7 @@ function sanitizeFailure(raw: unknown): TaskHandoffFailure | undefined {
  * Returns undefined when the record is absent or malformed (fail closed — strip field,
  * keep the task). Never quarantines the whole store for a bad handoff field.
  */
-export function sanitizeTaskHandoffState(raw: unknown): TaskHandoffState | undefined {
+export function sanitizeTaskHandoffState(raw: unknown): TaskContinuationHandoffState | undefined {
   if (raw === undefined || raw === null) {
     return undefined;
   }
@@ -312,71 +324,109 @@ export function sanitizeTaskHandoffState(raw: unknown): TaskHandoffState | undef
     return undefined;
   }
   const obj = raw as Record<string, unknown>;
-  if (obj.version !== 1) {
+  // Legacy v1 represented an incomplete multi-phase workflow with hidden model
+  // turns. Never resume it after upgrade; preserve the task's current binding and
+  // strip the obsolete workflow record.
+  if (obj.version !== 2) {
     return undefined;
   }
   if (!isNonEmptyString(obj.operationId)) {
     return undefined;
   }
-  if (typeof obj.phase !== 'string' || !HANDOFF_PHASES.has(obj.phase)) {
+  const source = sanitizeRuntimeLabelV2(obj.source);
+  const target = sanitizeRuntimeLabelV2(obj.target);
+  const contextCutoff = sanitizeContextCutoffV2(obj.contextCutoff);
+  const continuation = sanitizeContinuationV2(obj.continuation);
+  if (!source || !target || !contextCutoff || !continuation || !isNonEmptyString(obj.switchedAt)) {
     return undefined;
   }
-  const source = sanitizeRuntimeBinding(obj.source);
-  const target = sanitizeRuntimeBinding(obj.target);
-  const conversationContext = sanitizeConversationContext(obj.conversationContext);
-  if (!source || !target || !conversationContext) {
-    return undefined;
-  }
-  if (!isNonEmptyString(obj.createdAt) || !isNonEmptyString(obj.updatedAt)) {
-    return undefined;
-  }
-  if (!isOptionalString(obj.startedAt) || !isOptionalString(obj.finishedAt)) {
-    return undefined;
-  }
-
-  const sourceSummary =
-    obj.sourceSummary === undefined ? undefined : sanitizeSourceSummary(obj.sourceSummary);
-  // Present-but-malformed optional sourceSummary fails the whole handoff closed.
-  if (obj.sourceSummary !== undefined && sourceSummary === undefined) {
-    return undefined;
-  }
-
-  const completion = obj.completion === undefined ? undefined : sanitizeCompletion(obj.completion);
-  if (obj.completion !== undefined && completion === undefined) {
-    return undefined;
-  }
-
-  const failure = obj.failure === undefined ? undefined : sanitizeFailure(obj.failure);
-  if (obj.failure !== undefined && failure === undefined) {
-    return undefined;
-  }
-
-  const state: TaskHandoffState = {
-    version: 1,
+  return {
+    version: 2,
     operationId: obj.operationId.slice(0, 128),
-    phase: obj.phase as TaskHandoffPhase,
     source,
     target,
-    conversationContext,
-    createdAt: obj.createdAt,
-    updatedAt: obj.updatedAt,
+    contextCutoff,
+    continuation,
+    switchedAt: obj.switchedAt,
   };
-  if (typeof obj.startedAt === 'string' && obj.startedAt.length > 0) {
-    state.startedAt = obj.startedAt;
+}
+
+function sanitizeRuntimeLabelV2(raw: unknown): TaskContinuationHandoffState['source'] | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const obj = raw as Record<string, unknown>;
+  if (
+    !isNonEmptyString(obj.backend) ||
+    !isOptionalString(obj.model) ||
+    typeof obj.runtimeEpoch !== 'number' ||
+    !Number.isInteger(obj.runtimeEpoch) ||
+    obj.runtimeEpoch < 1
+  ) {
+    return undefined;
   }
-  if (typeof obj.finishedAt === 'string' && obj.finishedAt.length > 0) {
-    state.finishedAt = obj.finishedAt;
+  return {
+    backend: obj.backend.slice(0, 128),
+    ...(typeof obj.model === 'string' && obj.model ? { model: obj.model.slice(0, 256) } : {}),
+    runtimeEpoch: obj.runtimeEpoch,
+  };
+}
+
+function sanitizeContextCutoffV2(
+  raw: unknown,
+): TaskContinuationHandoffState['contextCutoff'] | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const obj = raw as Record<string, unknown>;
+  const integers = [
+    obj.throughTurnSequence,
+    obj.sourceStoreRevision,
+    obj.messageCount,
+    obj.toolCallCount,
+  ];
+  if (
+    integers.some((value) => typeof value !== 'number' || !Number.isInteger(value) || value < 0) ||
+    !isOptionalString(obj.throughMessageId) ||
+    !isOptionalString(obj.throughToolCallId) ||
+    !isNonEmptyString(obj.contextDigest) ||
+    !isNonEmptyString(obj.capturedAt)
+  ) {
+    return undefined;
   }
-  if (sourceSummary) {
-    state.sourceSummary = sourceSummary;
+  return {
+    ...(typeof obj.throughMessageId === 'string' && obj.throughMessageId
+      ? { throughMessageId: obj.throughMessageId.slice(0, 128) }
+      : {}),
+    ...(typeof obj.throughToolCallId === 'string' && obj.throughToolCallId
+      ? { throughToolCallId: obj.throughToolCallId.slice(0, 256) }
+      : {}),
+    throughTurnSequence: obj.throughTurnSequence as number,
+    sourceStoreRevision: obj.sourceStoreRevision as number,
+    messageCount: obj.messageCount as number,
+    toolCallCount: obj.toolCallCount as number,
+    contextDigest: obj.contextDigest.slice(0, 128),
+    capturedAt: obj.capturedAt,
+  };
+}
+
+function sanitizeContinuationV2(
+  raw: unknown,
+): TaskContinuationHandoffState['continuation'] | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const obj = raw as Record<string, unknown>;
+  if (obj.status === 'pending') return { status: 'pending' };
+  if (
+    obj.status === 'assigned' &&
+    isNonEmptyString(obj.turnId) &&
+    isNonEmptyString(obj.assignedAt)
+  ) {
+    return { status: 'assigned', turnId: obj.turnId, assignedAt: obj.assignedAt };
   }
-  if (completion) {
-    state.completion = completion;
+  if (
+    obj.status === 'consumed' &&
+    isNonEmptyString(obj.turnId) &&
+    isNonEmptyString(obj.consumedAt)
+  ) {
+    return { status: 'consumed', turnId: obj.turnId, consumedAt: obj.consumedAt };
   }
-  if (failure) {
-    state.failure = failure;
-  }
-  return state;
+  return undefined;
 }
 
 /**
@@ -385,14 +435,31 @@ export function sanitizeTaskHandoffState(raw: unknown): TaskHandoffState | undef
  */
 export function sanitizeTaskHandoffs(file: TaskStoreFile): TaskStoreFile {
   for (const task of Object.values(file.tasks)) {
-    if (!Object.prototype.hasOwnProperty.call(task, 'handoff')) {
-      continue;
-    }
-    const sanitized = sanitizeTaskHandoffState((task as MusterTask & { handoff?: unknown }).handoff);
+    // v1 is an obsolete phase machine. Preserve the already-committed task
+    // binding but never resume its hidden work after upgrade.
+    const sanitized = sanitizeTaskHandoffState(
+      (task as MusterTask & { handoff?: unknown }).handoff,
+    );
     if (sanitized) {
       task.handoff = sanitized;
     } else {
       delete task.handoff;
+    }
+    if (!Number.isInteger(task.runtimeEpoch) || (task.runtimeEpoch ?? 0) < 1) {
+      task.runtimeEpoch = sanitized?.target.runtimeEpoch ?? 1;
+    }
+    if (
+      task.handoff?.version === 2 &&
+      (task.handoff.target.runtimeEpoch !== task.runtimeEpoch ||
+        task.handoff.target.backend !== task.backend ||
+        (task.handoff.target.model ?? undefined) !== (task.model ?? undefined))
+    ) {
+      delete task.handoff;
+    }
+  }
+  for (const turn of Object.values(file.turns)) {
+    if (!Number.isInteger(turn.runtimeEpoch) || (turn.runtimeEpoch ?? 0) < 1) {
+      turn.runtimeEpoch = file.tasks[turn.taskId]?.runtimeEpoch ?? 1;
     }
   }
   return file;

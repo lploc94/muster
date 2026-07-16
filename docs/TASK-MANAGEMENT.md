@@ -1475,6 +1475,7 @@ interface TaskHandoffRuntimeLabel {
 
 interface TaskHandoffContextCutoff {
   throughMessageId?: string; // absent when no committed conversation exists
+  throughToolCallId?: string; // absent when no committed tool call exists
   throughTurnSequence: number; // 0 when the task has no source turn
   sourceStoreRevision: number;
   messageCount: number;

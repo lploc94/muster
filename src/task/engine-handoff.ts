@@ -1,533 +1,440 @@
 /**
- * Engine-side helpers for runtime handoff orchestration (M010/S02–S03).
+ * Pure helpers for the v2 runtime-switch continuation contract.
  *
- * Pure functions over TaskHandoff + TaskMessage — no webview projection, no
- * backend rebinding. TaskEngine.requestRuntimeHandoff owns persistence of
- * digests; S03 receiver transfer builds an ephemeral HandoffPackage at transfer
- * time from visible TaskMessage rows + optional in-process summary text.
- *
- * Optional source-summary text is digested in-memory only; raw prompt/response
- * never become TaskMessage/TaskTurn rows (M010/S02 T02, D017/D018/D019).
- *
- * HandoffPackage / bootstrap prompt bodies are never logged, never projected
- * into EngineEvents, and never written as chat (M010/S03 T01, D020).
+ * A switch persists only a deterministic cutoff and digest. The readable
+ * continuation is rebuilt from committed store rows when the first real target
+ * turn is frozen. No source-summary or receiver-bootstrap agent turn exists.
  */
 
 import { createHash } from 'crypto';
-import { TaskHandoff, type TaskHandoffResult } from './task-handoff';
-import type { TaskHandoffPhase, TaskMessage } from './types';
-import type { NormalizedEvent } from '../types';
+import * as path from 'path';
+import type {
+  MusterTask,
+  PersistedToolCall,
+  TaskContinuationHandoffState,
+  TaskHandoffContextCutoff,
+  TaskMessage,
+  TaskStoreFile,
+  TaskTurn,
+} from './types';
+import { sanitizeHandoffFailureMessage } from './store';
 
-/**
- * Prompt sent to the *source* backend during an optional internal summary turn.
- * Must never be written as a TaskMessage or projected into buildTranscript.
- */
-export const HANDOFF_SOURCE_SUMMARY_PROMPT =
-  'Prepare a concise handoff summary of this conversation for another agent that will continue the work. Include goals, decisions, open questions, and next steps. Do not address the user.';
+export const MAX_CONTINUATION_MESSAGES = 160;
+export const MAX_CONTINUATION_TOOL_CALLS = 160;
+export const MAX_CONTINUATION_CHARS = 64_000;
+const MAX_ENTRY_CHARS = 4_000;
 
-/** Contract version for the in-process receiver handoff package (not store schema). */
-export const HANDOFF_PACKAGE_VERSION = 1 as const;
-
-/** Max visible user/assistant messages kept when rebuilding conversation for transfer. */
-export const MAX_HANDOFF_CONVERSATION_MESSAGES = 200;
-
-/** Max total characters of conversation content in the receiver package. */
-export const MAX_HANDOFF_CONVERSATION_CHARS = 100_000;
-
-/** Max characters of optional ephemeral source-summary text in the package. */
-export const MAX_HANDOFF_SOURCE_SUMMARY_CHARS = 16_384;
-
-/** Default continuation instructions embedded in every HandoffPackage. */
-export const HANDOFF_CONTINUATION_INSTRUCTIONS =
-  'Continue this existing Muster task from the provided context. Preserve the task goal, prior decisions, and open work. Do not address the user unless the conversation already requires a user-facing reply. Do not invent a new task id or resume any prior backend session.';
-
-/** One visible conversation turn exported into the receiver package. */
-export interface HandoffConversationMessage {
-  id: string;
-  role: 'user' | 'assistant';
-  /** Agent-facing content (agentContent when present, else display content). */
-  content: string;
+interface ContextRows {
+  messages: TaskMessage[];
+  toolCalls: PersistedToolCall[];
+  turns: TaskTurn[];
+  throughTurnSequence: number;
 }
 
-/** Provenance carried into the receiver — backends/models only, never session ids. */
-export interface HandoffPackageProvenance {
-  sourceBackend: string;
-  sourceModel?: string;
-  targetBackend: string;
-  targetModel?: string;
+function turnMapForTask(file: TaskStoreFile, taskId: string): Map<string, TaskTurn> {
+  return new Map(
+    Object.values(file.turns)
+      .filter((turn) => turn.taskId === taskId)
+      .map((turn) => [turn.id, turn]),
+  );
 }
 
-/**
- * Versioned, in-process package handed to the target runtime at transfer time.
- * Not persisted on MusterTask; rebuild from TaskMessage rows (+ optional summary
- * text held only in engine memory) whenever transfer runs (D020).
- */
-export interface HandoffPackage {
-  version: typeof HANDOFF_PACKAGE_VERSION;
-  operationId: string;
-  taskId: string;
-  taskGoal: string;
-  builtAt: string;
-  provenance: HandoffPackageProvenance;
-  conversation: HandoffConversationMessage[];
-  messageCount: number;
-  /** Digest of the rebuilt conversation rows (not full bodies). */
-  conversationDigest: string;
-  /** Optional ephemeral source-summary text — omit when unavailable/skipped. */
-  sourceSummary?: string;
-  continuationInstructions: string;
+function committedRows(
+  file: TaskStoreFile,
+  taskId: string,
+  throughTurnSequence = Number.POSITIVE_INFINITY,
+): ContextRows {
+  const turns = turnMapForTask(file, taskId);
+  const includedTurns = [...turns.values()]
+    .filter((turn) => turn.status !== 'queued' && turn.sequence <= throughTurnSequence)
+    .sort((a, b) => a.sequence - b.sequence || a.id.localeCompare(b.id));
+  const includedTurnIds = new Set(includedTurns.map((turn) => turn.id));
+  const through = includedTurns.reduce((max, turn) => Math.max(max, turn.sequence), 0);
+
+  const messages = Object.values(file.messages)
+    .filter((message) => {
+      if (message.taskId !== taskId || message.role === 'system') return false;
+      if (message.state === 'pending') return false;
+      if (message.turnId) return includedTurnIds.has(message.turnId);
+      // User messages are linked from turn.inputs rather than message.turnId.
+      return [...includedTurnIds].some((turnId) =>
+        turns.get(turnId)?.inputs.some(
+          (input) => input.kind === 'message' && input.messageId === message.id,
+        ),
+      );
+    })
+    .sort((a, b) => {
+      const aSeq = a.turnId ? turns.get(a.turnId)?.sequence ?? 0 : messageSequence(a.id, turns);
+      const bSeq = b.turnId ? turns.get(b.turnId)?.sequence ?? 0 : messageSequence(b.id, turns);
+      return aSeq - bSeq || (a.order ?? -1) - (b.order ?? -1) || a.id.localeCompare(b.id);
+    });
+
+  const toolCalls = Object.values(file.toolCalls ?? {})
+    .filter(
+      (call) =>
+        call.taskId === taskId &&
+        includedTurnIds.has(call.turnId) &&
+        call.status !== 'running',
+    )
+    .sort((a, b) => {
+      const aSeq = turns.get(a.turnId)?.sequence ?? 0;
+      const bSeq = turns.get(b.turnId)?.sequence ?? 0;
+      return aSeq - bSeq || a.order - b.order || a.id.localeCompare(b.id);
+    });
+
+  return { messages, toolCalls, turns: includedTurns, throughTurnSequence: through };
 }
 
-export interface RebuildHandoffConversationOptions {
-  maxMessages?: number;
-  maxChars?: number;
-}
-
-export interface BuildHandoffPackageInput {
-  taskId: string;
-  taskGoal: string;
-  handoff: TaskHandoff;
-  messages: readonly TaskMessage[];
-  builtAt: string;
-  /** Optional in-process source-summary text (never read from the store). */
-  sourceSummaryText?: string;
-  maxMessages?: number;
-  maxChars?: number;
-  maxSummaryChars?: number;
-}
-
-function isVisibleHandoffMessage(message: TaskMessage): boolean {
-  if (message.role !== 'user' && message.role !== 'assistant') {
-    return false;
+function messageSequence(messageId: string, turns: ReadonlyMap<string, TaskTurn>): number {
+  for (const turn of turns.values()) {
+    if (turn.inputs.some((input) => input.kind === 'message' && input.messageId === messageId)) {
+      return turn.sequence;
+    }
   }
-  // Pending drafts are not yet part of committed conversation history.
-  if (message.state === 'pending') {
-    return false;
-  }
-  return true;
+  return 0;
 }
 
-function messageAgentText(message: TaskMessage): string {
-  return message.agentContent ?? message.content;
-}
-
-function digestHandoffConversation(messages: readonly HandoffConversationMessage[]): string {
+function digestRows(messages: readonly TaskMessage[], toolCalls: readonly PersistedToolCall[]): string {
   const hash = createHash('sha256');
   for (const message of messages) {
-    hash.update(message.id);
-    hash.update('\0');
-    hash.update(message.role);
-    hash.update('\0');
-    hash.update(message.content);
+    hash.update(`m\0${message.role}\0${message.agentContent ?? message.content}\n`);
+  }
+  for (const call of toolCalls) {
+    hash.update(`t\0${call.name}\0${stableValue(call.input)}\0${call.status}\0`);
+    hash.update(call.error ?? stableValue(call.output));
     hash.update('\n');
   }
   return hash.digest('hex').slice(0, 32);
 }
 
-/**
- * Rebuild bounded conversation rows for receiver transfer from visible
- * TaskMessage rows at transfer time (D020). System and pending messages are
- * excluded; agentContent is preferred over display content. Newest messages are
- * retained when message-count or char budgets force truncation.
- */
-export function rebuildHandoffConversation(
-  messages: readonly TaskMessage[],
-  options: RebuildHandoffConversationOptions = {},
-): HandoffConversationMessage[] {
-  const maxMessages = options.maxMessages ?? MAX_HANDOFF_CONVERSATION_MESSAGES;
-  const maxChars = options.maxChars ?? MAX_HANDOFF_CONVERSATION_CHARS;
-
-  const ordered = messages
-    .filter(isVisibleHandoffMessage)
-    .slice()
-    .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
-    .map((message) => ({
-      id: message.id,
-      role: message.role as 'user' | 'assistant',
-      content: messageAgentText(message),
-    }));
-
-  // Keep the most recent messages under the count budget.
-  let selected =
-    ordered.length > maxMessages ? ordered.slice(ordered.length - maxMessages) : ordered;
-
-  // Then enforce total char budget from the tail (newest) forward.
-  let total = 0;
-  for (const message of selected) {
-    total += message.content.length;
-  }
-  if (total > maxChars) {
-    const kept: HandoffConversationMessage[] = [];
-    let used = 0;
-    for (let i = selected.length - 1; i >= 0; i -= 1) {
-      const message = selected[i];
-      const next = used + message.content.length;
-      if (kept.length > 0 && next > maxChars) {
-        break;
-      }
-      if (kept.length === 0 && message.content.length > maxChars) {
-        // Single oversized newest message: keep a tail slice so transfer still has context.
-        kept.unshift({
-          ...message,
-          content: message.content.slice(message.content.length - maxChars),
-        });
-        used = maxChars;
-        break;
-      }
-      kept.unshift(message);
-      used = next;
-    }
-    selected = kept;
-  }
-
-  return selected;
-}
-
-/**
- * Build a versioned HandoffPackage for the target runtime. Conversation is always
- * rebuilt from TaskMessage rows; source-summary text is optional enrichment held
- * only ephemerally by the caller (D020). Never includes source session ids.
- */
-export function buildHandoffPackage(input: BuildHandoffPackageInput): HandoffPackage {
-  const state = input.handoff.toState();
-  const conversation = rebuildHandoffConversation(input.messages, {
-    maxMessages: input.maxMessages,
-    maxChars: input.maxChars,
-  });
-
-  const maxSummaryChars = input.maxSummaryChars ?? MAX_HANDOFF_SOURCE_SUMMARY_CHARS;
-  let sourceSummary: string | undefined;
-  if (input.sourceSummaryText !== undefined) {
-    const trimmed = input.sourceSummaryText.trim();
-    if (trimmed.length > 0) {
-      sourceSummary =
-        trimmed.length > maxSummaryChars ? trimmed.slice(0, maxSummaryChars) : trimmed;
-    }
-  }
-
-  const provenance: HandoffPackageProvenance = {
-    sourceBackend: state.source.backend,
-    targetBackend: state.target.backend,
-  };
-  if (state.source.model) {
-    provenance.sourceModel = state.source.model;
-  }
-  if (state.target.model) {
-    provenance.targetModel = state.target.model;
-  }
-
-  const pkg: HandoffPackage = {
-    version: HANDOFF_PACKAGE_VERSION,
-    operationId: state.operationId,
-    taskId: input.taskId,
-    taskGoal: input.taskGoal,
-    builtAt: input.builtAt,
-    provenance,
-    conversation,
-    messageCount: conversation.length,
-    conversationDigest: digestHandoffConversation(conversation),
-    continuationInstructions: HANDOFF_CONTINUATION_INSTRUCTIONS,
-  };
-  if (sourceSummary !== undefined) {
-    pkg.sourceSummary = sourceSummary;
-  }
-  return pkg;
-}
-
-/**
- * Render the bootstrap prompt used to initialize a *new* target session from a
- * HandoffPackage. Callers must pass this as runTurn prompt without resumeId.
- * Prompt body must never be persisted as TaskMessage or emitted as EngineEvent.
- */
-export function buildHandoffBootstrapPrompt(pkg: HandoffPackage): string {
-  const lines: string[] = [
-    '<!-- muster-handoff-package/v1 -->',
-    'You are receiving an existing Muster task via cross-runtime handoff.',
-    'Start a fresh session for this task. Do not resume any prior backend session.',
-    '',
-    '## Task',
-    `- id: ${pkg.taskId}`,
-    `- goal: ${pkg.taskGoal}`,
-    `- operationId: ${pkg.operationId}`,
-    `- builtAt: ${pkg.builtAt}`,
-    '',
-    '## Provenance',
-    `- sourceBackend: ${pkg.provenance.sourceBackend}`,
-  ];
-  if (pkg.provenance.sourceModel) {
-    lines.push(`- sourceModel: ${pkg.provenance.sourceModel}`);
-  }
-  lines.push(`- targetBackend: ${pkg.provenance.targetBackend}`);
-  if (pkg.provenance.targetModel) {
-    lines.push(`- targetModel: ${pkg.provenance.targetModel}`);
-  }
-
-  lines.push('', '## Continuation instructions', pkg.continuationInstructions, '');
-
-  if (pkg.sourceSummary) {
-    lines.push('## Source summary', pkg.sourceSummary, '');
-  } else {
-    lines.push(
-      '## Context mode',
-      'No source summary is available; continue from the conversation only.',
-      '',
-    );
-  }
-
-  lines.push(`## Conversation (${pkg.messageCount} messages)`);
-  if (pkg.conversation.length === 0) {
-    lines.push('(empty)');
-  } else {
-    for (const message of pkg.conversation) {
-      lines.push(`[${message.role}] ${message.content}`);
-    }
-  }
-
-  return lines.join('\n');
-}
-
-export interface ConversationContextExport {
-  messageCount: number;
-  contentDigest: string;
-  exportedAt: string;
-}
-
-const ACTIVE_HANDOFF_PHASES: ReadonlySet<TaskHandoffPhase> = new Set([
-  'requested',
-  'exporting_context',
-  'summarizing_source',
-  'preparing_receiver',
-  'transferring',
-]);
-
-/**
- * True while a handoff is still in flight and must block a second request.
- * Terminal phases (completed/failed/cancelled) are not active.
- */
-export function isActiveHandoffPhase(phase: TaskHandoffPhase): boolean {
-  return ACTIVE_HANDOFF_PHASES.has(phase);
-}
-
-/**
- * Build required conversation-context metadata from existing task messages.
- * Digests/counts only — never full bodies or credentials.
- *
- * Digest is order-stable: messages are sorted by createdAt then id before hash.
- */
-export function exportConversationContextMetadata(
-  messages: readonly TaskMessage[],
-  exportedAt: string,
-): ConversationContextExport {
-  const ordered = [...messages].sort(
-    (a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id),
-  );
-
-  const hash = createHash('sha256');
-  for (const message of ordered) {
-    hash.update(message.id);
-    hash.update('\0');
-    hash.update(message.role);
-    hash.update('\0');
-    hash.update(message.content);
-    hash.update('\0');
-    if (message.agentContent) {
-      hash.update(message.agentContent);
-    }
-    hash.update('\n');
-  }
-
+/** Capture the immutable boundary used by the first real turn after a switch. */
+export function captureContinuationCutoff(
+  file: TaskStoreFile,
+  taskId: string,
+  capturedAt: string,
+): TaskHandoffContextCutoff {
+  const rows = committedRows(file, taskId);
+  const messages = rows.messages.slice(-MAX_CONTINUATION_MESSAGES);
+  const toolCalls = rows.toolCalls.slice(-MAX_CONTINUATION_TOOL_CALLS);
+  const lastMessage = messages.at(-1);
+  const lastToolCall = toolCalls.at(-1);
   return {
-    messageCount: ordered.length,
-    contentDigest: hash.digest('hex').slice(0, 32),
-    exportedAt,
+    ...(lastMessage ? { throughMessageId: lastMessage.id } : {}),
+    ...(lastToolCall ? { throughToolCallId: lastToolCall.id } : {}),
+    throughTurnSequence: rows.throughTurnSequence,
+    sourceStoreRevision: file.revision,
+    messageCount: messages.length,
+    toolCallCount: toolCalls.length,
+    contextDigest: digestRows(messages, toolCalls),
+    capturedAt,
   };
 }
 
-export interface AdvanceHandoffToPreparingReceiverInput {
-  handoff: TaskHandoff;
-  messages: readonly TaskMessage[];
-  now: string;
-  /** Reason recorded on sourceSummary when skipping the optional summary turn. */
-  skipSummaryReason?: string;
-  operationId?: string;
+function stableValue(value: unknown): string {
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) return value.map(stableValue).filter(Boolean).join('\n');
+  if (typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return Object.keys(record)
+      .sort()
+      .map((key) => `${key}: ${stableValue(record[key])}`)
+      .join('\n');
+  }
+  return String(value);
 }
 
-/**
- * Advance a freshly created handoff through:
- *   requested → exporting_context → conversation ready → skip summary → preparing_receiver
- *
- * Used by the skip-summary path of requestRuntimeHandoff. Does not rebind runtime.
- */
-export function advanceHandoffToPreparingReceiver(
-  input: AdvanceHandoffToPreparingReceiverInput,
-): TaskHandoffResult {
-  const op = {
-    now: input.now,
-    ...(input.operationId ? { operationId: input.operationId } : {}),
-  };
-
-  let current = input.handoff;
-
-  const started = current.startExport(op);
-  if (!started.ok) {
-    return started;
-  }
-  current = started.next;
-
-  const exported = exportConversationContextMetadata(input.messages, input.now);
-  const ready = current.markConversationReady({
-    ...op,
-    messageCount: exported.messageCount,
-    contentDigest: exported.contentDigest,
-    exportedAt: exported.exportedAt,
-  });
-  if (!ready.ok) {
-    return ready;
-  }
-  current = ready.next;
-
-  const skipped = current.skipSummary({
-    ...op,
-    reason: input.skipSummaryReason ?? 'summary not requested',
-  });
-  if (!skipped.ok) {
-    return skipped;
-  }
-  current = skipped.next;
-
-  return current.beginPreparingReceiver(op);
+function redactText(text: string): string {
+  return sanitizeHandoffFailureMessage(text)
+    .replace(/\b(?:session[_-]?id|request[_-]?id|message[_-]?id|tool[_-]?call[_-]?id)\b\s*[:=]\s*\S+/gi, '[id]')
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi, '[id]');
 }
 
-/**
- * Digest of optional source-summary text for TaskHandoff.sourceSummary.
- * Raw summary text is never persisted — only this digest.
- */
-export function digestSourceSummaryText(text: string): string {
-  return createHash('sha256').update(text).digest('hex').slice(0, 32);
-}
-
-/**
- * Collect assistant text (and optional error) from a backend turn stream.
- * Used only for the hidden internal handoff summary turn — callers must not
- * persist the returned text as TaskMessage/TaskTurn content.
- *
- * Success requires a `turnCompleted` terminal with no error. Cancellation and
- * stream end without completion are treated as failures so partial deltas are
- * never promoted to a ready summary.
- */
-export async function collectInternalSummaryTurnText(
-  events: AsyncIterable<NormalizedEvent>,
-): Promise<{ text: string; errorMessage?: string }> {
-  let text = '';
-  let errorMessage: string | undefined;
-  let completed = false;
-  for await (const event of events) {
-    if (event.type === 'assistantDelta') {
-      text += event.content;
-    } else if (event.type === 'error') {
-      errorMessage = event.isCancellation
-        ? event.message?.trim() || 'source summary cancelled'
-        : event.message;
-    } else if (event.type === 'turnCompleted') {
-      completed = true;
+function workspaceRelativePath(raw: string, cwd?: string): string {
+  const cleaned = raw.trim();
+  if (!cleaned) return cleaned;
+  if (cwd) {
+    const absCwd = path.resolve(cwd);
+    const absPath = path.isAbsolute(cleaned) ? path.resolve(cleaned) : path.resolve(absCwd, cleaned);
+    if (absPath === absCwd) return '.';
+    if (absPath.startsWith(`${absCwd}${path.sep}`)) {
+      return path.relative(absCwd, absPath).split(path.sep).join('/');
     }
   }
-  if (errorMessage !== undefined) {
-    return { text, errorMessage };
+  if (path.isAbsolute(cleaned) || /^[A-Za-z]:[\\/]/.test(cleaned)) {
+    return path.basename(cleaned);
   }
-  if (!completed) {
-    return { text, errorMessage: 'source summary ended without completion' };
-  }
-  return { text };
+  return cleaned.replace(/\\/g, '/');
 }
 
-export type SourceSummaryOutcome =
-  | { kind: 'ready'; contentDigest: string; summarizedAt: string; text?: string }
-  | { kind: 'unavailable'; reason: string }
-  | { kind: 'skipped'; reason: string };
-
-export interface AdvanceHandoffWithSourceSummaryInput {
-  handoff: TaskHandoff;
-  messages: readonly TaskMessage[];
-  now: string;
-  operationId?: string;
-  /** Outcome of the optional internal summary turn (or skip). */
-  summary: SourceSummaryOutcome;
+function clip(text: string, max = MAX_ENTRY_CHARS): string {
+  const normalized = redactText(text.replace(/\r\n/g, '\n').trim());
+  return normalized.length <= max ? normalized : `${normalized.slice(0, max - 1)}…`;
 }
 
-/**
- * Advance a freshly created handoff through context export and optional summary
- * resolution into preparing_receiver.
- *
- * When summary.kind is 'ready'/'unavailable', walks summarizing_source.
- * When 'skipped', uses the skip path (no summarizing_source phase).
- */
-export function advanceHandoffWithSourceSummary(
-  input: AdvanceHandoffWithSourceSummaryInput,
-): TaskHandoffResult {
-  const op = {
-    now: input.now,
-    ...(input.operationId ? { operationId: input.operationId } : {}),
-  };
-
-  let current = input.handoff;
-
-  const started = current.startExport(op);
-  if (!started.ok) {
-    return started;
+function pickString(value: unknown, keys: readonly string[]): string | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  for (const key of keys) {
+    const item = record[key];
+    if (typeof item === 'string' && item.trim()) return item.trim();
   }
-  current = started.next;
+  return undefined;
+}
 
-  const exported = exportConversationContextMetadata(input.messages, input.now);
-  const ready = current.markConversationReady({
-    ...op,
-    messageCount: exported.messageCount,
-    contentDigest: exported.contentDigest,
-    exportedAt: exported.exportedAt,
-  });
-  if (!ready.ok) {
-    return ready;
-  }
-  current = ready.next;
-
-  if (input.summary.kind === 'skipped') {
-    const skipped = current.skipSummary({
-      ...op,
-      reason: input.summary.reason,
-    });
-    if (!skipped.ok) {
-      return skipped;
+function pickNumber(value: unknown, keys: readonly string[]): number | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  for (const key of keys) {
+    const item = record[key];
+    if (typeof item === 'number' && Number.isFinite(item)) return item;
+    if (typeof item === 'string' && item.trim() && /^-?\d+$/.test(item.trim())) {
+      return Number(item.trim());
     }
-    current = skipped.next;
-    return current.beginPreparingReceiver(op);
   }
+  return undefined;
+}
 
-  const summarizing = current.beginSummarizing(op);
-  if (!summarizing.ok) {
-    return summarizing;
-  }
-  current = summarizing.next;
+function formatTool(call: PersistedToolCall, cwd?: string): string[] {
+  const lower = call.name.toLowerCase();
+  const isShell = /bash|shell|terminal|exec_command|run_command/.test(lower);
+  const isEdit = /edit|write|apply_patch|create_file/.test(lower);
+  const isRead = /read|search|grep|glob|list_dir|find/.test(lower);
+  const command = pickString(call.input, ['cmd', 'command', 'script']);
+  const rawPath = pickString(call.input, ['file_path', 'path', 'file', 'target']);
+  const relPath = rawPath ? workspaceRelativePath(rawPath, cwd) : undefined;
+  const exitCode = pickNumber(call.output, ['exitCode', 'exit_code', 'code', 'status']);
+  const outputText =
+    typeof call.output === 'string'
+      ? call.output
+      : pickString(call.output, ['stdout', 'stderr', 'output', 'content', 'text']);
+  const lines: string[] = [];
 
-  if (input.summary.kind === 'ready') {
-    const marked = current.markSummaryReady({
-      ...op,
-      contentDigest: input.summary.contentDigest,
-      summarizedAt: input.summary.summarizedAt,
-    });
-    if (!marked.ok) {
-      return marked;
+  if (isShell) {
+    // Never serialize arbitrary input objects (env/argv dumps can carry secrets).
+    lines.push(command ? `bash ${clip(command, 1_000)}` : `bash ${call.name}`);
+    if (exitCode !== undefined) lines.push(`exit: ${exitCode}`);
+    else if (call.status === 'error') lines.push('exit: error');
+    const tail = clip(call.error ?? outputText ?? '', 800);
+    if (tail) {
+      lines.push('output:');
+      for (const line of tail.split('\n').slice(-8)) lines.push(`  ${line}`);
     }
-    current = marked.next;
+  } else if (isEdit) {
+    lines.push(`edit ${clip(relPath ?? command ?? call.name, 500)}`);
+    lines.push(`result: ${call.status === 'error' ? 'failure' : 'success'}`);
+    const err = call.error ? clip(call.error, 400) : '';
+    if (err) lines.push(`error: ${err}`);
+  } else if (isRead) {
+    if (call.status === 'error') {
+      lines.push(`tool ${call.name}${relPath ? `: ${clip(relPath, 300)}` : ''}`);
+      lines.push(`error: ${clip(call.error ?? 'tool failed', 400)}`);
+    }
+    // Omit repetitive successful read/search noise.
   } else {
-    const marked = current.markSummaryUnavailable({
-      ...op,
-      reason: input.summary.reason,
+    const summary = command ?? relPath;
+    lines.push(`tool ${call.name}${summary ? `: ${clip(summary, 500)}` : ''}`);
+    if (call.status === 'error') lines.push(`error: ${clip(call.error ?? 'tool failed', 400)}`);
+    else if (call.status === 'success') lines.push('result: success');
+  }
+  return lines;
+}
+
+interface TimelineEntry {
+  sequence: number;
+  order: number;
+  tie: string;
+  priority: number;
+  lines: string[];
+}
+
+function formatTurnTerminal(turn: TaskTurn): string[] {
+  if (turn.status === 'queued' || turn.status === 'running' || turn.status === 'waiting_user') {
+    return [];
+  }
+  const label =
+    turn.status === 'succeeded'
+      ? 'completed'
+      : turn.status === 'failed'
+        ? 'failed'
+        : turn.status === 'interrupted'
+          ? 'interrupted'
+          : turn.status;
+  const error =
+    typeof turn.error === 'string' && turn.error.trim()
+      ? clip(turn.error, 400)
+          : turn.disposition?.kind === 'fail' && typeof turn.disposition.error === 'string'
+        ? clip(turn.disposition.error, 400)
+        : '';
+  return error ? [`turn ${turn.sequence}: ${label} — ${error}`] : [`turn ${turn.sequence}: ${label}`];
+}
+
+function currentStateLines(task: MusterTask | undefined, turns: readonly TaskTurn[]): string[] {
+  const lines: string[] = [];
+  const latest = [...turns].sort((a, b) => b.sequence - a.sequence)[0];
+  if (latest) {
+    const terminal = formatTurnTerminal(latest);
+    if (terminal.length > 0) lines.push(...terminal.map((line) => `- ${line}`));
+  }
+  if (task?.attention?.message) {
+    lines.push(`- attention: ${clip(task.attention.message, 300)}`);
+  }
+  if (task?.pendingParentQuestion) {
+    lines.push('- pending parent question');
+  }
+  if (typeof task?.result === 'string' && task.result.trim()) {
+    lines.push(`- last result: ${clip(task.result, 300)}`);
+  } else if (task?.taskResult?.summary) {
+    lines.push(`- last result: ${clip(task.taskResult.summary, 300)}`);
+  }
+  if (typeof task?.error === 'string' && task.error.trim()) {
+    lines.push(`- last error: ${clip(task.error, 300)}`);
+  }
+  return lines;
+}
+
+/**
+ * Render useful state as compact prose/tool notation, never protocol JSON. The
+ * result intentionally precedes the current user message in projectPrompt.
+ *
+ * Priority under truncation (newest retained first, then chronological render):
+ * 1. current durable state / latest unfinished user request
+ * 2. recent user/assistant + state-changing/error tools
+ * 3. older history
+ */
+export function buildCompactContinuationContext(
+  file: TaskStoreFile,
+  taskId: string,
+  handoff: TaskContinuationHandoffState,
+  maxChars = MAX_CONTINUATION_CHARS,
+): string {
+  const rows = committedRows(file, taskId, handoff.contextCutoff.throughTurnSequence);
+  const turns = turnMapForTask(file, taskId);
+  const task = file.tasks[taskId];
+  const cwd = task?.cwd;
+  const messageBoundary = handoff.contextCutoff.throughMessageId
+    ? rows.messages.findIndex((message) => message.id === handoff.contextCutoff.throughMessageId)
+    : -1;
+  const toolBoundary = handoff.contextCutoff.throughToolCallId
+    ? rows.toolCalls.findIndex((call) => call.id === handoff.contextCutoff.throughToolCallId)
+    : -1;
+  const messagesThroughCutoff = handoff.contextCutoff.messageCount === 0
+    ? []
+    : messageBoundary >= 0
+      ? rows.messages.slice(0, messageBoundary + 1)
+      : [];
+  const toolsThroughCutoff = handoff.contextCutoff.toolCallCount === 0
+    ? []
+    : toolBoundary >= 0
+      ? rows.toolCalls.slice(0, toolBoundary + 1)
+      : [];
+  const messages = handoff.contextCutoff.messageCount > 0
+    ? messagesThroughCutoff.slice(-handoff.contextCutoff.messageCount)
+    : [];
+  const toolCalls = handoff.contextCutoff.toolCallCount > 0
+    ? toolsThroughCutoff.slice(-handoff.contextCutoff.toolCallCount)
+    : [];
+  const entries: TimelineEntry[] = [];
+
+  const latestUserId = [...messages].reverse().find((message) => message.role === 'user')?.id;
+  for (const message of messages) {
+    const sequence = message.turnId
+      ? turns.get(message.turnId)?.sequence ?? 0
+      : messageSequence(message.id, turns);
+    const body = clip(message.agentContent ?? message.content);
+    if (!body) continue;
+    const isLatestUser = message.role === 'user' && message.id === latestUserId;
+    entries.push({
+      sequence,
+      order: message.role === 'user' ? -1 : message.order ?? 0,
+      tie: `m:${message.id}`,
+      // Only the latest unfinished user request outranks durable state.
+      priority: isLatestUser ? 100 : message.role === 'user' ? 55 : 45,
+      lines: [`${message.role === 'user' ? 'User' : 'Assistant'}: ${body}`],
     });
-    if (!marked.ok) {
-      return marked;
-    }
-    current = marked.next;
+  }
+  for (const call of toolCalls) {
+    const lines = formatTool(call, cwd);
+    if (lines.length === 0) continue;
+    const lower = call.name.toLowerCase();
+    const isShell = /bash|shell|terminal|exec_command|run_command/.test(lower);
+    const isEdit = /edit|write|apply_patch|create_file/.test(lower);
+    const isVerify = /test|verify|check/.test(lower) || isShell;
+    entries.push({
+      sequence: turns.get(call.turnId)?.sequence ?? 0,
+      order: call.order,
+      tie: `t:${call.id}`,
+      priority:
+        call.status === 'error' ? 90 : isEdit || isVerify ? 85 : isShell ? 80 : 40,
+      lines,
+    });
+  }
+  for (const turn of rows.turns) {
+    const lines = formatTurnTerminal(turn);
+    if (lines.length === 0) continue;
+    entries.push({
+      sequence: turn.sequence,
+      order: 10_000,
+      tie: `turn:${turn.id}`,
+      // Terminal/current durable state outranks ordinary conversation history.
+      priority: turn.status === 'failed' || turn.status === 'interrupted' ? 95 : 88,
+      lines,
+    });
   }
 
-  return current.beginPreparingReceiver(op);
+  const header = [
+    '## Continuation context',
+    '',
+    'This is the compact committed context from the runtime used before the model switch.',
+    'Continue the same task. Treat the following as prior conversation/work, not as a new user request.',
+    '',
+  ];
+  const stateLines = currentStateLines(task, rows.turns);
+  const stateBlock =
+    stateLines.length > 0 ? ['Current state:', ...stateLines, ''] : [];
+  const footer: string[] = [];
+  const fixed = [...header, ...stateBlock, ...footer].join('\n');
+  if (fixed.length > maxChars) {
+    return fixed.slice(0, Math.max(0, maxChars - 1)) + (maxChars > 0 ? '…' : '');
+  }
+
+  // Newest-first retention under budget, then restore chronological order.
+  const ranked = [...entries].sort(
+    (a, b) =>
+      b.priority - a.priority ||
+      b.sequence - a.sequence ||
+      b.order - a.order ||
+      b.tie.localeCompare(a.tie),
+  );
+  const retained = new Set<string>();
+  let used = fixed.length;
+  for (const entry of ranked) {
+    const chunk = `${entry.lines.join('\n')}\n`;
+    if (used + chunk.length > maxChars) continue;
+    retained.add(entry.tie);
+    used += chunk.length;
+  }
+
+  const chronological = entries
+    .filter((entry) => retained.has(entry.tie))
+    .sort((a, b) => a.sequence - b.sequence || a.order - b.order || a.tie.localeCompare(b.tie));
+
+  const output = [...header, ...stateBlock];
+  for (const entry of chronological) {
+    output.push(...entry.lines, '');
+  }
+  while (output.length > 0 && output[output.length - 1] === '') output.pop();
+  return output.join('\n');
+}
+
+/** Legacy v1 phases remain blocked only until store migration strips the record. */
+export function isActiveHandoffPhase(phase: unknown): boolean {
+  return typeof phase === 'string' && [
+    'requested',
+    'exporting_context',
+    'summarizing_source',
+    'preparing_receiver',
+    'transferring',
+  ].includes(phase);
 }

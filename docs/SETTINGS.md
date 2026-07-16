@@ -10,6 +10,8 @@ Post-read action: add a new setting to Muster using the same host-backed pattern
 
 This guide documents the destination pattern for feature settings and the assembled five-topic Settings shell. It is not a migration log and it does not claim evidence from an interactive Extension Development Host session.
 
+[SETTINGS-DESIGN.md](SETTINGS-DESIGN.md) defines the proposed product taxonomy and placement rules for future settings. Until that proposal is implemented with state, test, documentation, and evidence migration, the five-topic shell in this guide remains the current implementation contract.
+
 At least one real settings group is always backed by VS Code contributed configuration; the Runtime & Storage group is the current concrete example.
 
 ## Non-negotiable invariants

@@ -4,7 +4,6 @@ import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { Backend, BackendCapabilities, NormalizedEvent, RunOptions } from '../types';
 import { TaskEngine, projectPrompt } from './engine';
-import { HANDOFF_SOURCE_SUMMARY_PROMPT } from './engine-handoff';
 import { TaskStore } from './store';
 import { buildSnapshot, buildTranscript } from '../host/snapshot';
 import type { TaskMessage, TaskTurn } from './types';
@@ -2097,309 +2096,144 @@ describe('TaskEngine.interruptAndSend', () => {
   });
 });
 
-describe('TaskEngine.requestRuntimeHandoff (S02 engine demo)', () => {
-  it('requests a model switch, runs hidden handoff turn, isolates transcript, holds old runtime', async () => {
+describe('TaskEngine runtime switch v2', () => {
+  it('switches atomically without a hidden run, then attaches context to the next real turn', async () => {
     const { store } = makeTempStore();
-    const SUMMARY_TEXT = 'ENGINE_TEST_HANDOFF_SUMMARY_CANARY';
-    const captured: RunOptions[] = [];
-    const engineEvents: unknown[] = [];
-
+    const captured: Array<{ backend: string; options: RunOptions }> = [];
     const engine = TaskEngine.load({
       store,
-      makeBackend: (name) => ({
-        ...scriptedBackend([{ type: 'turnCompleted' }], MCP_CAPS),
-        name,
-      }),
-      runTurn: async function* (_backend: Backend, options: RunOptions) {
-        captured.push(options);
-        yield {
-          type: 'assistantDelta',
-          content: SUMMARY_TEXT,
-          messageId: 'engine-demo-hidden',
-        };
+      makeBackend: (name) => ({ ...scriptedBackend([], MCP_CAPS), name }),
+      runTurn: async function* (backend: Backend, options: RunOptions) {
+        captured.push({ backend: backend.name, options });
+        await options.onBeforePrompt?.();
+        yield { type: 'sessionStarted', sessionId: 'target-session' };
+        yield { type: 'assistantDelta', content: 'continued', messageId: 'a-target' };
         yield { type: 'turnCompleted' };
       },
-      clock: () => '2026-07-14T11:00:00.000Z',
-      emit: (e) => {
-        engineEvents.push(e);
-      },
+      clock: () => '2026-07-16T12:00:00.000Z',
     });
 
     const created = engine.createTask({
-      id: 'task-handoff-demo',
-      goal: 'switch runtime demo',
-      backend: 'claude-cli',
+      id: 'switch-v2',
+      goal: 'finish the implementation',
+      backend: 'claude',
       executionPolicy: {
         maxTurns: 8,
-        maxAutomaticRetries: 2,
+        maxAutomaticRetries: 0,
         turnTimeoutMs: 300_000,
         taskTimeoutMs: 3_600_000,
       },
     });
     expect(created.ok).toBe(true);
-
-    // Seed model + committed source session + completed conversation without a live turn.
-    // createTask does not accept model; bind it on the task record like production selection does.
     store.commit((draft) => {
-      const task = draft.tasks['task-handoff-demo'];
-      if (!task) {
-        return { ok: false, reason: 'missing task' };
-      }
-      draft.tasks['task-handoff-demo'] = {
+      const task = draft.tasks['switch-v2']!;
+      draft.tasks['switch-v2'] = {
         ...task,
         model: 'sonnet',
-        committedSessionId: 'sess-engine-demo',
-        revision: task.revision + 1,
-        updatedAt: '2026-07-14T11:00:00.000Z',
+        committedSessionId: 'source-session',
+        runtimeEpoch: 1,
+        releaseState: 'released',
       };
-      draft.messages['u-demo'] = {
-        id: 'u-demo',
-        taskId: 'task-handoff-demo',
-        role: 'user',
-        content: 'visible user chat',
-        state: 'complete',
-        createdAt: '2026-07-14T10:59:00.000Z',
+      draft.turns.old = {
+        id: 'old', taskId: 'switch-v2', sequence: 1, trigger: 'user', status: 'succeeded',
+        runtimeEpoch: 1, inputs: [{ kind: 'message', messageId: 'u-old' }],
+        createdAt: '2026-07-16T11:00:00.000Z', finishedAt: '2026-07-16T11:01:00.000Z',
       };
-      draft.messages['a-demo'] = {
-        id: 'a-demo',
-        taskId: 'task-handoff-demo',
-        role: 'assistant',
-        content: 'visible assistant chat',
-        state: 'complete',
-        createdAt: '2026-07-14T10:59:30.000Z',
+      draft.messages['u-old'] = {
+        id: 'u-old', taskId: 'switch-v2', role: 'user', content: 'edit file A', state: 'complete',
+        createdAt: '2026-07-16T11:00:00.000Z',
+      };
+      draft.messages['a-old'] = {
+        id: 'a-old', taskId: 'switch-v2', role: 'assistant', content: 'I edited file A',
+        state: 'complete', createdAt: '2026-07-16T11:00:30.000Z', turnId: 'old', order: 0,
+      };
+      draft.toolCalls = {
+        'old:test': {
+          id: 'old:test', taskId: 'switch-v2', turnId: 'old', toolCallId: 'test', order: 1,
+          name: 'exec_command', status: 'success', input: { cmd: 'npm test' }, output: 'passed',
+          createdAt: '2026-07-16T11:00:40.000Z', updatedAt: '2026-07-16T11:00:50.000Z',
+        },
       };
       return { ok: true };
     });
 
-    const before = store.getTask('task-handoff-demo')!;
-    const messageCountBefore = Object.keys(store.getFile().messages).length;
-    const turnCountBefore = Object.keys(store.getFile().turns).length;
-
-    const result = await engine.requestRuntimeHandoff({
-      taskId: 'task-handoff-demo',
-      targetBackend: 'codex',
-      targetModel: 'gpt-5',
+    const switched = await engine.requestRuntimeHandoff({
+      taskId: 'switch-v2', targetBackend: 'codex', targetModel: 'gpt-5',
     });
-    expect(result.ok).toBe(true);
-    if (!result.ok) throw new Error(result.reason);
+    expect(switched.ok).toBe(true);
+    expect(captured).toHaveLength(0);
+    expect(store.getTask('switch-v2')).toMatchObject({
+      backend: 'codex', model: 'gpt-5', runtimeEpoch: 2,
+      handoff: { version: 2, continuation: { status: 'pending' } },
+    });
+    expect(store.getTask('switch-v2')?.committedSessionId).toBeUndefined();
+
+    const sent = engine.send('switch-v2', 'continue with the next step');
+    expect(sent.ok).toBe(true);
+    await engine.whenIdle();
 
     expect(captured).toHaveLength(1);
-    expect(captured[0].prompt).toBe(HANDOFF_SOURCE_SUMMARY_PROMPT);
-    expect(captured[0].resumeId).toBe('sess-engine-demo');
-    expect(captured[0].model).toBe('sonnet');
-
-    const task = store.getTask('task-handoff-demo')!;
-    expect(task.handoff?.phase).toBe('preparing_receiver');
-    expect(task.handoff?.target).toEqual({ backend: 'codex', model: 'gpt-5' });
-    expect(task.backend).toBe(before.backend);
-    expect(task.model).toBe(before.model);
-    expect(task.committedSessionId).toBe(before.committedSessionId);
-
-    expect(Object.keys(store.getFile().messages).length).toBe(messageCountBefore);
-    expect(Object.keys(store.getFile().turns).length).toBe(turnCountBefore);
-    expect(engineEvents).toHaveLength(0);
-
-    const transcript = JSON.stringify(buildTranscript(store.getFile(), 'task-handoff-demo'));
-    expect(transcript).toContain('visible user chat');
-    expect(transcript).toContain('visible assistant chat');
-    expect(transcript).not.toContain(SUMMARY_TEXT);
-    expect(transcript).not.toContain(HANDOFF_SOURCE_SUMMARY_PROMPT);
-
-    const snapshot = buildSnapshot(store, 'task-handoff-demo');
-    const snapshotJson = JSON.stringify(snapshot.transcript);
-    expect(snapshotJson).not.toContain(SUMMARY_TEXT);
-    expect(snapshotJson).not.toContain(result.value.operationId);
+    expect(captured[0].backend).toBe('codex');
+    expect(captured[0].options.resumeId).toBeUndefined();
+    expect(captured[0].options.model).toBe('gpt-5');
+    expect(captured[0].options.prompt).toContain('## Continuation context');
+    expect(captured[0].options.prompt).toContain('User: edit file A');
+    expect(captured[0].options.prompt).toContain('bash npm test');
+    expect(captured[0].options.prompt).toContain('continue with the next step');
+    const handoff = store.getTask('switch-v2')?.handoff;
+    expect(handoff?.version === 2 ? handoff.continuation.status : undefined).toBe('consumed');
+    expect(store.getTask('switch-v2')?.committedSessionId).toBe('target-session');
   });
 
-  it('interrupts a non-idle task and still starts handoff without rebinding yet', async () => {
+  it('ignores a late source session event after the runtime epoch advances', async () => {
     const { store } = makeTempStore();
+    let markStarted!: () => void;
+    let releaseSource!: () => void;
+    const started = new Promise<void>((resolve) => { markStarted = resolve; });
+    const release = new Promise<void>((resolve) => { releaseSource = resolve; });
     const engine = TaskEngine.load({
       store,
-      makeBackend: () => scriptedBackend([{ type: 'turnCompleted' }]),
-      runTurn: async function* () {
-        yield { type: 'error', message: 'summary unavailable' };
-      },
-      clock: () => '2026-07-14T11:01:00.000Z',
-    });
-    const created = engine.createTask({
-      id: 'task-busy',
-      goal: 'busy',
-      backend: 'claude-cli',
-      executionPolicy: {
-        maxTurns: 8,
-        maxAutomaticRetries: 2,
-        turnTimeoutMs: 300_000,
-        taskTimeoutMs: 3_600_000,
-      },
-    });
-    expect(created.ok).toBe(true);
-
-    store.commit((draft) => {
-      draft.turns['busy-1'] = {
-        id: 'busy-1',
-        taskId: 'task-busy',
-        sequence: 1,
-        trigger: 'user',
-        status: 'running',
-        inputs: [],
-        createdAt: '2026-07-14T11:00:00.000Z',
-        startedAt: '2026-07-14T11:00:01.000Z',
-      };
-      return { ok: true };
-    });
-
-    const before = store.getTask('task-busy')!;
-    const result = await engine.requestRuntimeHandoff({
-      taskId: 'task-busy',
-      targetBackend: 'codex',
-    });
-    expect(result.ok).toBe(true);
-    if (!result.ok) throw new Error(result.reason);
-    const after = store.getTask('task-busy')!;
-    expect(after.backend).toBe(before.backend);
-    expect(after.model).toBe(before.model);
-    expect(after.committedSessionId).toBe(before.committedSessionId);
-    expect(after.handoff?.phase).toBe('preparing_receiver');
-    expect(store.getFile().turns['busy-1']?.status).toBe('interrupted');
-  });
-});
-
-describe('TaskEngine.completeRuntimeHandoff (S03 engine demo)', () => {
-  it('starts a new target session with provenance, no source session reuse, projection isolation', async () => {
-    const SOURCE_SESSION = 'sess-engine-source';
-    const TARGET_SESSION = 'sess-engine-target-new';
-    const SUMMARY_TEXT = 'ENGINE_COMPLETE_HANDOFF_SUMMARY_CANARY';
-    const { store } = makeTempStore();
-    const captured: RunOptions[] = [];
-    const engineEvents: unknown[] = [];
-    let clock = '2026-07-14T13:00:00.000Z';
-
-    const engine = TaskEngine.load({
-      store,
-      makeBackend: (name) => ({
-        ...scriptedBackend([{ type: 'turnCompleted' }], MCP_CAPS),
-        name,
-      }),
+      makeBackend: (name) => ({ ...scriptedBackend([], MCP_CAPS), name }),
       runTurn: async function* (_backend: Backend, options: RunOptions) {
-        captured.push(options);
-        if (options.prompt === HANDOFF_SOURCE_SUMMARY_PROMPT) {
-          yield {
-            type: 'assistantDelta',
-            content: SUMMARY_TEXT,
-            messageId: 'engine-complete-hidden',
-          };
-          yield { type: 'turnCompleted' };
-          return;
-        }
-        // Receiver bootstrap: new session only.
-        expect(options.resumeId).toBeUndefined();
-        yield { type: 'sessionStarted', sessionId: TARGET_SESSION };
+        await options.onBeforePrompt?.();
+        markStarted();
+        await release;
+        // Deliberately misbehaving adapter: emits after AbortSignal. Epoch/status
+        // fences must prevent this source session from rebinding the target task.
+        yield { type: 'assistantDelta', content: 'late source text', messageId: 'late-source' };
+        yield { type: 'sessionStarted', sessionId: 'late-source-session' };
         yield { type: 'turnCompleted' };
       },
-      clock: () => clock,
-      emit: (e) => {
-        engineEvents.push(e);
-      },
+      clock: () => '2026-07-16T13:00:00.000Z',
     });
-
     const created = engine.createTask({
-      id: 'task-handoff-complete-demo',
-      goal: 'complete transfer demo',
-      backend: 'claude-cli',
+      id: 'epoch-fence', goal: 'keep binding safe', backend: 'claude',
       executionPolicy: {
-        maxTurns: 8,
-        maxAutomaticRetries: 2,
-        turnTimeoutMs: 300_000,
-        taskTimeoutMs: 3_600_000,
+        maxTurns: 8, maxAutomaticRetries: 0, turnTimeoutMs: 300_000, taskTimeoutMs: 3_600_000,
       },
     });
     expect(created.ok).toBe(true);
-
     store.commit((draft) => {
-      const task = draft.tasks['task-handoff-complete-demo'];
-      if (!task) {
-        return { ok: false, reason: 'missing task' };
-      }
-      draft.tasks['task-handoff-complete-demo'] = {
-        ...task,
-        model: 'sonnet',
-        committedSessionId: SOURCE_SESSION,
-        revision: task.revision + 1,
-        updatedAt: clock,
-      };
-      draft.messages['u-complete'] = {
-        id: 'u-complete',
-        taskId: 'task-handoff-complete-demo',
-        role: 'user',
-        content: 'complete-demo user chat',
-        state: 'complete',
-        createdAt: '2026-07-14T12:59:00.000Z',
-      };
-      draft.messages['a-complete'] = {
-        id: 'a-complete',
-        taskId: 'task-handoff-complete-demo',
-        role: 'assistant',
-        content: 'complete-demo assistant chat',
-        state: 'complete',
-        createdAt: '2026-07-14T12:59:30.000Z',
+      draft.tasks['epoch-fence'] = {
+        ...draft.tasks['epoch-fence']!, releaseState: 'released', runtimeEpoch: 1,
       };
       return { ok: true };
     });
+    expect(engine.send('epoch-fence', 'start source work').ok).toBe(true);
+    await started;
 
-    const messageCountBefore = Object.keys(store.getFile().messages).length;
-    const turnCountBefore = Object.keys(store.getFile().turns).length;
-
-    const requested = await engine.requestRuntimeHandoff({
-      taskId: 'task-handoff-complete-demo',
-      targetBackend: 'codex',
-      targetModel: 'gpt-5',
+    const switched = await engine.requestRuntimeHandoff({
+      taskId: 'epoch-fence', targetBackend: 'codex', targetModel: 'gpt-5',
     });
-    expect(requested.ok).toBe(true);
-    if (!requested.ok) throw new Error(requested.reason);
-    expect(store.getTask('task-handoff-complete-demo')!.committedSessionId).toBe(SOURCE_SESSION);
+    expect(switched.ok).toBe(true);
+    releaseSource();
+    await engine.whenIdle();
 
-    clock = '2026-07-14T13:01:00.000Z';
-    const transferred = await engine.completeRuntimeHandoff({
-      taskId: 'task-handoff-complete-demo',
-      operationId: requested.value.operationId,
+    expect(store.getTask('epoch-fence')).toMatchObject({
+      backend: 'codex', model: 'gpt-5', runtimeEpoch: 2,
     });
-    expect(transferred.ok).toBe(true);
-    if (!transferred.ok) throw new Error(transferred.reason);
-
-    // Two turns: hidden summary (source resume) + receiver bootstrap (no resume).
-    expect(captured).toHaveLength(2);
-    expect(captured[0]!.prompt).toBe(HANDOFF_SOURCE_SUMMARY_PROMPT);
-    expect(captured[0]!.resumeId).toBe(SOURCE_SESSION);
-    expect(captured[1]!.resumeId).toBeUndefined();
-    expect(captured[1]!.prompt).toContain('muster-handoff-package/v1');
-    expect(captured[1]!.prompt).toContain('complete-demo user chat');
-    expect(captured[1]!.prompt).toContain(SUMMARY_TEXT);
-    expect(captured[1]!.prompt).toMatch(/continue/i);
-    expect(captured[1]!.prompt).not.toContain(SOURCE_SESSION);
-
-    const after = store.getTask('task-handoff-complete-demo')!;
-    expect(after.backend).toBe('codex');
-    expect(after.model).toBe('gpt-5');
-    expect(after.committedSessionId).toBe(TARGET_SESSION);
-    expect(after.committedSessionId).not.toBe(SOURCE_SESSION);
-    expect(after.handoff?.phase).toBe('completed');
-    expect(transferred.value.boundSessionId).toBe(TARGET_SESSION);
-    expect(transferred.value.boundBackend).toBe('codex');
-
-    // Bootstrap/summary isolation: no new chat/turn rows, no bodies in projections.
-    expect(Object.keys(store.getFile().messages).length).toBe(messageCountBefore);
-    expect(Object.keys(store.getFile().turns).length).toBe(turnCountBefore);
-    expect(engineEvents).toHaveLength(0);
-
-    const transcript = JSON.stringify(buildTranscript(store.getFile(), 'task-handoff-complete-demo'));
-    expect(transcript).toContain('complete-demo user chat');
-    expect(transcript).not.toContain(SUMMARY_TEXT);
-    expect(transcript).not.toContain('muster-handoff-package/v1');
-    expect(transcript).not.toContain(HANDOFF_SOURCE_SUMMARY_PROMPT);
-
-    const snapshot = buildSnapshot(store, 'task-handoff-complete-demo');
-    const snapshotJson = JSON.stringify(snapshot.transcript);
-    expect(snapshotJson).not.toContain(SUMMARY_TEXT);
-    expect(snapshotJson).not.toContain(requested.value.operationId);
+    expect(store.getTask('epoch-fence')?.committedSessionId).toBeUndefined();
+    expect(Object.values(store.getFile().turns)[0]?.status).toBe('interrupted');
+    expect(JSON.stringify(store.getFile().messages)).not.toContain('late source text');
   });
 });

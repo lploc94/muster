@@ -390,6 +390,8 @@ export interface AssembleFirstTurnInput {
    * Defaults to `/` when omitted. Threaded from the engine via getSkillPrefix.
    */
   skillPrefix?: string;
+  /** Space reserved for a deterministic continuation block appended by the engine. */
+  reservedTailChars?: number;
 }
 
 /**
@@ -426,7 +428,8 @@ export function assembleFirstTurnPrompt(input: AssembleFirstTurnInput): Assemble
     input.skillPrefix ?? '/',
   );
   const skillBlock = commandLines.length ? `${commandLines.join('\n')}\n\n` : '';
-  const budget = COMPILED_PROMPT_MAX - skillBlock.length;
+  const reservedTailChars = Math.max(0, Math.floor(input.reservedTailChars ?? 0));
+  const budget = COMPILED_PROMPT_MAX - skillBlock.length - reservedTailChars;
 
   // Protected minimum: host + role + objective (+ complete pins last if any)
   const minParts = [hostMd, role, objective];

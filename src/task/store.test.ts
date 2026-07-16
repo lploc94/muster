@@ -3,7 +3,13 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { CURRENT_SCHEMA_VERSION, TaskStore, migrate, sleep } from './store';
+import {
+  CURRENT_SCHEMA_VERSION,
+  sanitizeHandoffFailureMessage,
+  TaskStore,
+  migrate,
+  sleep,
+} from './store';
 import type { MusterTask, TaskStoreFile } from './types';
 
 const tempDirs: string[] = [];
@@ -594,40 +600,6 @@ describe('TaskStore', () => {
     expect(store.getTask('task-2')?.handoff).toBeUndefined();
   });
 
-  it('persists and reloads a well-formed handoff state on a task', () => {
-    const { filePath } = makeTempStore();
-    const store = TaskStore.load({ filePath });
-    const handoff = {
-      version: 1 as const,
-      operationId: 'hop-1',
-      phase: 'preparing_receiver' as const,
-      source: { backend: 'claude-cli', model: 'sonnet', sessionId: 'src-sess' },
-      target: { backend: 'codex', model: 'gpt-5' },
-      conversationContext: {
-        status: 'ready' as const,
-        messageCount: 4,
-        contentDigest: 'digest-abc',
-        exportedAt: '2026-07-06T00:10:00.000Z',
-      },
-      sourceSummary: {
-        status: 'unavailable' as const,
-        reason: 'source_summary_unsupported',
-      },
-      createdAt: '2026-07-06T00:00:00.000Z',
-      updatedAt: '2026-07-06T00:10:00.000Z',
-      startedAt: '2026-07-06T00:00:01.000Z',
-    };
-
-    const commit = store.commit((draft) => {
-      draft.tasks['task-1'] = { ...sampleTask('task-1'), handoff };
-      return { ok: true };
-    });
-    expect(commit.ok).toBe(true);
-
-    const reloaded = TaskStore.load({ filePath });
-    expect(reloaded.getTask('task-1')?.handoff).toEqual(handoff);
-  });
-
   it('strips malformed handoff on load (fail closed) without quarantining the store', () => {
     const { filePath } = makeTempStore();
     const raw = {
@@ -688,51 +660,26 @@ describe('TaskStore', () => {
     // Malformed handoff is dropped; the task itself remains loadable.
     expect(store.getTask('task-1')?.handoff).toBeUndefined();
     expect(store.getTask('task-1')?.id).toBe('task-1');
-    // Well-formed sibling handoff is preserved.
-    expect(store.getTask('task-2')?.handoff?.operationId).toBe('hop-ok');
-    expect(store.getTask('task-2')?.handoff?.phase).toBe('completed');
+    // Obsolete v1 records are stripped even when structurally valid; the task
+    // binding itself is preserved and no hidden recovery is resumed.
+    expect(store.getTask('task-2')?.handoff).toBeUndefined();
   });
 
-  it('sanitizes handoff diagnostics to exclude conversation bodies and absolute paths', () => {
-    const { filePath } = makeTempStore();
-    const store = TaskStore.load({ filePath });
-    const commit = store.commit((draft) => {
-      draft.tasks['task-1'] = {
-        ...sampleTask('task-1'),
-        handoff: {
-          version: 1,
-          operationId: 'hop-fail',
-          phase: 'failed',
-          source: { backend: 'claude-cli' },
-          target: { backend: 'codex' },
-          conversationContext: {
-            status: 'unavailable',
-            reason: 'export_empty',
-          },
-          createdAt: '2026-07-06T00:00:00.000Z',
-          updatedAt: '2026-07-06T00:01:00.000Z',
-          finishedAt: '2026-07-06T00:01:00.000Z',
-          failure: {
-            code: 'export_failed',
-            // Intentionally hostile payload — must be bounded/sanitized on load.
-            message:
-              'failed at C:\\Users\\secret\\proj with body: ' +
-              'A'.repeat(2_000) +
-              ' sk-secret-key',
-            at: '2026-07-06T00:01:00.000Z',
-          },
-        },
-      };
-      return { ok: true };
-    });
-    expect(commit.ok).toBe(true);
+  it('redacts multi-token headers and quoted secret assignments', () => {
+    const auth = sanitizeHandoffFailureMessage('Authorization: Bearer topsecret');
+    expect(auth).toContain('[redacted]');
+    expect(auth).not.toContain('topsecret');
+    expect(auth).not.toContain('Bearer topsecret');
 
-    const reloaded = TaskStore.load({ filePath });
-    const failure = reloaded.getTask('task-1')?.handoff?.failure;
-    expect(failure?.code).toBe('export_failed');
-    expect(failure?.message.length).toBeLessThanOrEqual(240);
-    expect(failure?.message).not.toMatch(/C:\\Users/i);
-    expect(failure?.message).not.toMatch(/sk-secret/);
-    expect(failure?.message).not.toMatch(/A{50}/);
+    const cookie = sanitizeHandoffFailureMessage('Cookie: session=abc; refresh=def');
+    expect(cookie).toContain('[redacted]');
+    expect(cookie).not.toContain('session=abc');
+    expect(cookie).not.toContain('refresh=def');
+
+    const quoted = sanitizeHandoffFailureMessage('PASSWORD="hunter two" AWS_SECRET_ACCESS_KEY=\'s3cr3t\'');
+    expect(quoted).not.toContain('hunter two');
+    expect(quoted).not.toContain('s3cr3t');
+    expect(quoted).toMatch(/PASSWORD\s*=\s*\[redacted\]/i);
   });
+
 });
