@@ -200,7 +200,12 @@ function readLockRecord(lockPath: string): LeaseRecord | undefined {
 }
 
 export function leasePath(storePath: string, turnId: string): string {
-  return `${storePath}.lease.${turnId}`;
+  // Batch entity ids include their local id in the suffix (for example
+  // `turn:producer-<hash>`). A raw colon starts an NTFS alternate data stream on
+  // Windows, collapsing distinct turn leases onto `<store>.lease.turn` and making
+  // workers spin forever while contending for the same file. encodeURIComponent keeps
+  // ordinary `turn-...` ids readable while making every lease a portable file name.
+  return `${storePath}.lease.${encodeURIComponent(turnId)}`;
 }
 
 /**

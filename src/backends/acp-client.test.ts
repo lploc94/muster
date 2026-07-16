@@ -9,10 +9,13 @@ import {
   LIVE_INPUT_METHOD,
   normalizeAgentQuestions,
   parseElicitationCreate,
+  setPermissionController,
   terminateProcessTree,
   type KillableProcess,
+  type PermissionController,
   type PromptResult,
 } from './acp-client';
+import type { PermissionMode } from './permission-policy';
 
 /**
  * Lightweight fake ChildProcess: an EventEmitter carrying the pid/exitCode/kill
@@ -485,5 +488,221 @@ describe('RFD elicitation parse (via acp-client re-export)', () => {
         { '0': { selected: ['A'], freeText: null } },
       ),
     ).toEqual({ 'Pick one?': 'A' });
+  });
+});
+
+describe('M012 S03 flow: permission mode is sampled per request from mutable config', () => {
+  afterEach(() => {
+    setPermissionController(null);
+  });
+
+  type HandlePermission = (
+    id: number | string,
+    params: Record<string, unknown>,
+  ) => Promise<void>;
+
+  type ClientWithGate = {
+    handlePermissionRequest: HandlePermission;
+    respondOk: (id: number | string, result?: unknown) => void;
+    dispose: () => void;
+  };
+
+  const permissionOptions = [
+    { optionId: 'allow_once', kind: 'allow_once', name: 'Allow once' },
+    { optionId: 'reject_once', kind: 'reject_once', name: 'Deny' },
+  ];
+
+  function makeMutableModeReader(initial: PermissionMode) {
+    let mode: PermissionMode = initial;
+    return {
+      get: () => mode,
+      set: (next: PermissionMode) => {
+        mode = next;
+      },
+    };
+  }
+
+  function makeController(
+    modeReader: { get: () => PermissionMode },
+    hooks: {
+      prompt?: PermissionController['prompt'];
+      audit?: PermissionController['audit'];
+    } = {},
+  ): PermissionController {
+    return {
+      mode: () => modeReader.get(),
+      isAllowlisted: () => false,
+      remember: vi.fn(),
+      audit: hooks.audit ?? vi.fn(),
+      prompt: hooks.prompt ?? (async () => ({ allow: false, remember: false })),
+    };
+  }
+
+  async function installClient(controller: PermissionController): Promise<{
+    client: ClientWithGate;
+    responses: Array<{ id: number | string; result: unknown }>;
+  }> {
+    const { AcpClient } = await import('./acp-client');
+    const client = new AcpClient({
+      key: 'permission-flow-test',
+      label: 'TestAgent',
+      command: 'false',
+      args: [],
+    }) as unknown as ClientWithGate;
+    const responses: Array<{ id: number | string; result: unknown }> = [];
+    client.respondOk = (id, result = {}) => {
+      responses.push({ id, result });
+    };
+    setPermissionController(controller);
+    return { client, responses };
+  }
+
+  async function requestPermission(
+    client: ClientWithGate,
+    id: number,
+    kind: string,
+    title: string,
+  ): Promise<void> {
+    await client.handlePermissionRequest(id, {
+      sessionId: 'sess-flow',
+      toolCall: { kind, title },
+      options: permissionOptions,
+    });
+  }
+
+  it('ask auto-allows reads without prompting', async () => {
+    const mode = makeMutableModeReader('ask');
+    const prompt = vi.fn(async () => ({ allow: false, remember: false }));
+    const audit = vi.fn();
+    const { client, responses } = await installClient(makeController(mode, { prompt, audit }));
+
+    await requestPermission(client, 1, 'read', 'Read package.json');
+
+    expect(prompt).not.toHaveBeenCalled();
+    expect(responses).toEqual([
+      { id: 1, result: { outcome: { outcome: 'selected', optionId: 'allow_once' } } },
+    ]);
+    expect(audit).toHaveBeenCalledWith(
+      expect.objectContaining({ decision: 'allow', source: 'read', classification: 'read' }),
+    );
+    client.dispose();
+  });
+
+  it('readonly denies new writes without prompting', async () => {
+    const mode = makeMutableModeReader('readonly');
+    const prompt = vi.fn(async () => ({ allow: true, remember: false }));
+    const audit = vi.fn();
+    const { client, responses } = await installClient(makeController(mode, { prompt, audit }));
+
+    await requestPermission(client, 2, 'edit', 'Write src/host/permission-settings.ts');
+
+    expect(prompt).not.toHaveBeenCalled();
+    expect(responses).toEqual([
+      { id: 2, result: { outcome: { outcome: 'selected', optionId: 'reject_once' } } },
+    ]);
+    expect(audit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        decision: 'deny',
+        source: 'mode-readonly',
+        classification: 'write',
+      }),
+    );
+    client.dispose();
+  });
+
+  it('allow permits new writes without prompting', async () => {
+    const mode = makeMutableModeReader('allow');
+    const prompt = vi.fn(async () => ({ allow: false, remember: false }));
+    const audit = vi.fn();
+    const { client, responses } = await installClient(makeController(mode, { prompt, audit }));
+
+    await requestPermission(client, 3, 'execute', 'Run tests');
+
+    expect(prompt).not.toHaveBeenCalled();
+    expect(responses).toEqual([
+      { id: 3, result: { outcome: { outcome: 'selected', optionId: 'allow_once' } } },
+    ]);
+    expect(audit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        decision: 'allow',
+        source: 'mode-allow',
+        classification: 'write',
+      }),
+    );
+    client.dispose();
+  });
+
+  it('samples mode once per request and re-reads for the next request after config change', async () => {
+    let resolvePrompt!: (value: { allow: boolean; remember: boolean }) => void;
+    const pendingPrompt = new Promise<{ allow: boolean; remember: boolean }>((resolve) => {
+      resolvePrompt = resolve;
+    });
+    const mode = makeMutableModeReader('ask');
+    const prompt = vi.fn(async () => pendingPrompt);
+    const audit = vi.fn();
+    const { client, responses } = await installClient(makeController(mode, { prompt, audit }));
+
+    // Ask-mode write samples mode once and stays pending until the user resolves it.
+    const pendingWrite = client.handlePermissionRequest(20, {
+      sessionId: 'sess-flow',
+      toolCall: { kind: 'edit', title: 'Write pending' },
+      options: permissionOptions,
+    });
+    await Promise.resolve();
+    expect(prompt).toHaveBeenCalledTimes(1);
+    expect(responses).toHaveLength(0);
+
+    // Config flips to allow while the first request is still pending — must stay pending.
+    mode.set('allow');
+    expect(responses).toHaveLength(0);
+
+    // A concurrent new write under allow auto-allows without waiting on the pending ask.
+    await client.handlePermissionRequest(21, {
+      sessionId: 'sess-flow',
+      toolCall: { kind: 'edit', title: 'Write after allow' },
+      options: permissionOptions,
+    });
+    expect(responses).toEqual([
+      { id: 21, result: { outcome: { outcome: 'selected', optionId: 'allow_once' } } },
+    ]);
+    expect(prompt).toHaveBeenCalledTimes(1);
+
+    // User resolves the original ask-mode request (deny).
+    resolvePrompt({ allow: false, remember: false });
+    await pendingWrite;
+    expect(responses).toEqual([
+      { id: 21, result: { outcome: { outcome: 'selected', optionId: 'allow_once' } } },
+      { id: 20, result: { outcome: { outcome: 'selected', optionId: 'reject_once' } } },
+    ]);
+    expect(audit).toHaveBeenCalledWith(
+      expect.objectContaining({ decision: 'deny', source: 'user' }),
+    );
+
+    // Next request re-reads the mutated allow mode.
+    await client.handlePermissionRequest(22, {
+      sessionId: 'sess-flow',
+      toolCall: { kind: 'execute', title: 'Run after allow' },
+      options: permissionOptions,
+    });
+    expect(responses.at(-1)).toEqual({
+      id: 22,
+      result: { outcome: { outcome: 'selected', optionId: 'allow_once' } },
+    });
+    expect(prompt).toHaveBeenCalledTimes(1);
+
+    // Flip to readonly — next write is denied without prompting.
+    mode.set('readonly');
+    await client.handlePermissionRequest(23, {
+      sessionId: 'sess-flow',
+      toolCall: { kind: 'edit', title: 'Write after readonly' },
+      options: permissionOptions,
+    });
+    expect(responses.at(-1)).toEqual({
+      id: 23,
+      result: { outcome: { outcome: 'selected', optionId: 'reject_once' } },
+    });
+    expect(prompt).toHaveBeenCalledTimes(1);
+
+    client.dispose();
   });
 });

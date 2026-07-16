@@ -112,9 +112,12 @@ interface CommandErrorMessage {
   message: string;
 }
 
-async function openWebview(page: Page) {
-  await page.addInitScript(() => {
-    const state = { value: undefined as unknown };
+async function openWebview(page: Page, options?: { initialState?: unknown }) {
+  await page.addInitScript((seed) => {
+    // Seed survives reload when tests re-open with captured getState/setState data.
+    // State is exposed on window so hide/reveal checks can capture the bag.
+    const bag = { value: seed as unknown };
+    (window as unknown as { __musterVsCodeState: { value: unknown } }).__musterVsCodeState = bag;
     window.acquireVsCodeApi = () => ({
       postMessage(message: unknown) {
         // Match VS Code's webview boundary: messages must survive structured
@@ -124,17 +127,179 @@ async function openWebview(page: Page) {
         window.dispatchEvent(new CustomEvent('muster:test:postMessage', { detail: cloned }));
       },
       getState() {
-        return state.value;
+        return (window as unknown as { __musterVsCodeState: { value: unknown } }).__musterVsCodeState
+          .value;
       },
       setState(nextState: unknown) {
-        state.value = nextState;
+        (window as unknown as { __musterVsCodeState: { value: unknown } }).__musterVsCodeState.value =
+          nextState;
       },
     });
-  });
+  }, options?.initialState ?? undefined);
 
   await page.goto('/');
+  await page.evaluate(() => {
+    window.__musterPostedMessages = [];
+  });
   await expect(page.getByText('New task')).toBeVisible();
 }
+
+async function readVsCodeState(page: Page): Promise<unknown> {
+  return page.evaluate(() => {
+    const bag = (window as unknown as { __musterVsCodeState?: { value: unknown } }).__musterVsCodeState;
+    return bag?.value;
+  });
+}
+
+/** Seed a full ok task-types host snapshot for Settings flow tests. */
+function taskTypesOkSnapshot(overrides: Partial<{
+  status: 'ok' | 'empty' | 'invalid';
+  types: Array<{
+    id: string;
+    backend: string;
+    role: 'coordinator' | 'worker';
+    briefKind: string;
+    description?: string;
+    model?: string;
+  }>;
+  diagnostics: Array<{ code: string; message: string }>;
+}> = {}) {
+  return {
+    status: overrides.status ?? 'ok',
+    diagnostics: overrides.diagnostics ?? [],
+    types: overrides.types ?? [
+      {
+        id: 'worker',
+        backend: 'claude',
+        role: 'worker' as const,
+        briefKind: 'generic',
+        description: 'Default worker',
+      },
+    ],
+    defaults: [
+      {
+        id: 'worker',
+        backend: 'claude',
+        role: 'worker' as const,
+        briefKind: 'generic',
+      },
+      {
+        id: 'coordinator',
+        backend: 'claude',
+        role: 'coordinator' as const,
+        briefKind: 'generic',
+      },
+    ],
+    constraints: {
+      maxTypes: 32,
+      idPattern: '^[a-z][a-z0-9_-]{0,63}$',
+      descriptionMax: 200,
+      stringMax: 128,
+      roles: ['coordinator', 'worker'] as Array<'coordinator' | 'worker'>,
+      briefKinds: ['generic', 'investigation', 'implementation'],
+    },
+  };
+}
+
+function retentionSettingsSnapshot(values: {
+  maxTurnsPerTask: number;
+  maxStoredOutputChars: number;
+}) {
+  return {
+    settings: [
+      {
+        id: 'maxTurnsPerTask',
+        label: 'Max turns per task',
+        description: 'Controls how many settled turns are retained for each terminal task.',
+        value: values.maxTurnsPerTask,
+        defaultValue: 200,
+        minimum: 1,
+      },
+      {
+        id: 'maxStoredOutputChars',
+        label: 'Max stored output characters',
+        description: 'Limits retained assistant output for settled turns on open tasks.',
+        value: values.maxStoredOutputChars,
+        defaultValue: 200000,
+        minimum: 1024,
+      },
+    ],
+  };
+}
+
+function permissionSettingsSnapshot(mode: 'ask' | 'allow' | 'readonly' = 'ask') {
+  return {
+    mode,
+    defaultMode: 'ask' as const,
+    description:
+      "How Muster handles agent tool-permission requests. 'ask' (safe): auto-allow read-only, prompt for writes/commands. 'allow': auto-approve everything (less safe). 'readonly': deny all writes/commands.",
+    options: [
+      {
+        mode: 'ask' as const,
+        label: 'Ask',
+        description: 'Safe: auto-allow read-only tool calls, prompt for writes/commands/unknown actions.',
+        risk: 'recommended' as const,
+      },
+      {
+        mode: 'allow' as const,
+        label: 'Allow',
+        description: 'Auto-approve every tool-permission request (least safe; still audit-logged).',
+        risk: 'least-safe' as const,
+      },
+      {
+        mode: 'readonly' as const,
+        label: 'Read only',
+        description: 'Allow read-only tool calls, deny all writes/commands without prompting.',
+        risk: 'restricted' as const,
+      },
+    ],
+  };
+}
+
+function taskTypesSettingsSnapshot(overrides?: {
+  status?: 'ok' | 'empty' | 'invalid';
+  types?: Array<{
+    id: string;
+    backend: string;
+    role: 'coordinator' | 'worker';
+    briefKind: string;
+    description?: string;
+    model?: string;
+  }>;
+  diagnostics?: Array<{ code: string; message: string }>;
+}) {
+  const types = overrides?.types ?? [
+    {
+      id: 'worker',
+      backend: 'claude',
+      role: 'worker' as const,
+      briefKind: 'generic',
+      description: 'Default worker',
+    },
+    {
+      id: 'coordinator',
+      backend: 'claude',
+      role: 'coordinator' as const,
+      briefKind: 'generic',
+      description: 'Default coordinator',
+    },
+  ];
+  return {
+    status: overrides?.status ?? 'ok',
+    types,
+    diagnostics: overrides?.diagnostics ?? [],
+    defaults: types.map((t) => ({ ...t })),
+    constraints: {
+      maxTypes: 32,
+      idPattern: '^[a-z][a-z0-9_-]{0,63}$',
+      descriptionMax: 200,
+      stringMax: 128,
+      roles: ['coordinator', 'worker'] as Array<'coordinator' | 'worker'>,
+      briefKinds: ['generic', 'investigation', 'implementation'],
+    },
+  };
+}
+
 
 // Wire protocol version the webview currently stamps/expects; kept in sync with
 // PROTOCOL_VERSION in webview/src/lib/protocol.ts. Test fixtures below always
@@ -4182,7 +4347,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     ).toHaveLength(2);
   });
 
-  test('Settings panel edits host-backed retention values without losing task or chat state', async ({ page }) => {
+  test('M012 S01 retention regression: Settings panel edits host-backed retention values without losing task or chat state', async ({ page }) => {
     await openWebview(page);
 
     await postSnapshot(page, {
@@ -4192,10 +4357,12 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     });
 
     await expect(page.getByPlaceholder('Search tasks…')).toBeVisible();
-    await page.getByRole('button', { name: 'Settings' }).click();
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
     await expectPostedMessage(page, { type: 'requestSettings' });
     await expectPostedMessage(page, { type: 'requestTaskTypesSettings' });
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+    await page.getByRole('tab', { name: /Retention/i }).click();
+    await expect(page.getByRole('tab', { name: /Retention/i })).toHaveAttribute('aria-selected', 'true');
     await expect(page.getByText('Retention keeps recent task history usable without storing unlimited completed-turn output.')).toBeVisible();
     await expect(page.getByRole('status').getByText('Loading retention settings from VS Code…')).toBeVisible();
     // Full-view Settings replaces the task list (not an overlay).
@@ -4262,10 +4429,11 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
         message: 'Error: leaked stack trace from vscode.workspace.getConfiguration().update',
       },
     });
-    await expect(page.getByRole('alert').getByText('Settings save failed')).toBeVisible();
+    await expect(page.getByRole('alert').getByText('Retention save failed')).toBeVisible();
     await expect(page.getByRole('alert').getByText('Unable to save Maximum stored output characters. Check the VS Code setting and try again.')).toBeVisible();
     await expect(page.getByText('leaked stack trace')).toHaveCount(0);
-    await expect(page.getByRole('spinbutton', { name: 'Maximum stored output characters', exact: true })).toHaveValue('200000');
+    // Failed save keeps the attempted draft (does not rehydrate back to prior saved).
+    await expect(page.getByRole('spinbutton', { name: 'Maximum stored output characters', exact: true })).toHaveValue('250000');
 
     await page.setViewportSize({ width: 360, height: 720 });
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
@@ -4299,7 +4467,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
 
     await expect(page.getByText('Chat context remains visible.')).toBeVisible();
     await expect(page.getByRole('alert').getByText('Host command remains visible.')).toBeVisible();
-    await page.getByRole('button', { name: 'Settings' }).click();
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
     await expectPostedMessage(page, { type: 'requestSettings' });
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
     // Full-view Settings hides chat until Back.
@@ -4308,6 +4476,1232 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expect(page.getByRole('heading', { name: 'Settings' })).toHaveCount(0);
     await expect(page.getByText('Chat context remains visible.')).toBeVisible();
     await expect(page.getByRole('alert').getByText('Host command remains visible.')).toBeVisible();
+  });
+
+  test('M012 S01 semantics: Settings tablist exposes five topics with ARIA relationships and keyboard activation', async ({ page }) => {
+    await openWebview(page);
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-m012-sem', goal: 'Topic shell smoke', viewStatus: 'idle' })],
+      storeRevision: 12,
+    });
+
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await expectPostedMessage(page, { type: 'requestSettings' });
+    await expectPostedMessage(page, { type: 'requestTaskTypesSettings' });
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+
+    const tablist = page.getByRole('tablist', { name: 'Settings topics' });
+    await expect(tablist).toBeVisible();
+    const tabs = tablist.getByRole('tab');
+    await expect(tabs).toHaveCount(5);
+    await expect(tabs.nth(0)).toHaveText(/Task Types/i);
+    await expect(tabs.nth(1)).toHaveText(/Permissions/i);
+    await expect(tabs.nth(2)).toHaveText(/Retention/i);
+    await expect(tabs.nth(3)).toHaveText(/Models and CLIs/i);
+    await expect(tabs.nth(4)).toHaveText(/Context and MCP/i);
+
+    const taskTypesTab = page.getByRole('tab', { name: /Task Types/i });
+    await expect(taskTypesTab).toHaveAttribute('aria-selected', 'true');
+    await expect(taskTypesTab).toHaveAttribute('tabindex', '0');
+    await expect(taskTypesTab).toHaveAttribute('id', 'settings-tab-task-types');
+    await expect(taskTypesTab).toHaveAttribute('aria-controls', 'settings-panel-task-types');
+    const taskTypesPanel = page.locator('#settings-panel-task-types');
+    await expect(taskTypesPanel).toBeVisible();
+    await expect(taskTypesPanel).toHaveAttribute('role', 'tabpanel');
+    await expect(taskTypesPanel).toHaveAttribute('aria-labelledby', 'settings-tab-task-types');
+    await expect(page.getByRole('heading', { name: 'Task Types' })).toBeVisible();
+
+    for (const name of [/Permissions/i, /Retention/i, /Models and CLIs/i, /Context and MCP/i]) {
+      await expect(page.getByRole('tab', { name })).toHaveAttribute('aria-selected', 'false');
+      await expect(page.getByRole('tab', { name })).toHaveAttribute('tabindex', '-1');
+    }
+
+    await page.getByRole('tab', { name: /Permissions/i }).click();
+    await expect(page.getByRole('tab', { name: /Permissions/i })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('tab', { name: /Permissions/i })).toHaveAttribute('tabindex', '0');
+    await expect(page.locator('#settings-panel-permissions')).toBeVisible();
+    await expect(page.getByTestId('permissions-settings')).toBeVisible();
+    await expect(page.getByTestId('permissions-runtime-note')).toContainText(
+      'Runtime permission prompts still appear as in-session permission cards',
+    );
+    await expect(page.getByRole('spinbutton')).toHaveCount(0);
+
+    const permissionsTab = page.getByRole('tab', { name: /Permissions/i });
+    await permissionsTab.focus();
+    await permissionsTab.press('ArrowRight');
+    const retentionTab = page.getByRole('tab', { name: /Retention/i });
+    await expect(retentionTab).toHaveAttribute('aria-selected', 'true');
+    await expect(page.locator('#settings-panel-retention')).toBeVisible();
+
+    await retentionTab.press('End');
+    const contextTab = page.getByRole('tab', { name: /Context and MCP/i });
+    await expect(contextTab).toHaveAttribute('aria-selected', 'true');
+    await expect(page.locator('#settings-panel-context-and-mcp')).toBeVisible();
+    await expect(page.getByRole('status').filter({ hasText: 'Coming soon' })).toBeVisible();
+    await expect(page.getByText(/Future configuration for context-engine endpoints/i)).toBeVisible();
+
+    await contextTab.press('Home');
+    const taskTypesTabAfterHome = page.getByRole('tab', { name: /Task Types/i });
+    await expect(taskTypesTabAfterHome).toHaveAttribute('aria-selected', 'true');
+
+    await taskTypesTabAfterHome.press('ArrowLeft');
+    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toHaveAttribute('aria-selected', 'true');
+  });
+
+  test('M012 S01 semantics: Coming soon panels stay truthful and emit zero host mutations', async ({ page }) => {
+    await openWebview(page);
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-m012-soon', goal: 'Placeholder panels', viewStatus: 'idle' })],
+      storeRevision: 13,
+    });
+
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await expectPostedMessage(page, { type: 'requestSettings' });
+    await expectPostedMessage(page, { type: 'requestTaskTypesSettings' });
+
+    const baseline = await postedMessages(page);
+    const baselineCount = baseline.length;
+
+    await page.getByRole('tab', { name: /Models and CLIs/i }).click();
+    await expect(page.getByRole('tab', { name: /Models and CLIs/i })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.locator('#settings-panel-models-and-clis')).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Models and CLIs' })).toBeVisible();
+    await expect(page.getByRole('status').filter({ hasText: 'Coming soon' })).toBeVisible();
+    await expect(page.getByText(/Future configuration for backend CLI discovery/i)).toBeVisible();
+    await expect(page.getByRole('spinbutton')).toHaveCount(0);
+    await expect(page.getByRole('textbox')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: /^Save$/ })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: /Saving/i })).toHaveCount(0);
+    await expect(page.getByRole('tab', { name: /Models and CLIs/i })).toBeEnabled();
+    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toBeEnabled();
+
+    await page.getByRole('tab', { name: /Context and MCP/i }).click();
+    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.locator('#settings-panel-context-and-mcp')).toBeVisible();
+    await expect(page.getByText(/Future configuration for context-engine endpoints/i)).toBeVisible();
+
+    const contextSoonTab = page.getByRole('tab', { name: /Context and MCP/i });
+    await contextSoonTab.focus();
+    await contextSoonTab.press('ArrowLeft');
+    const modelsSoonTab = page.getByRole('tab', { name: /Models and CLIs/i });
+    await expect(modelsSoonTab).toHaveAttribute('aria-selected', 'true');
+    await modelsSoonTab.press('ArrowRight');
+    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toHaveAttribute('aria-selected', 'true');
+
+    const after = await postedMessages(page);
+    expect(after).toHaveLength(baselineCount);
+    const mutationTypes = new Set([
+      'updateSetting',
+      'updateTaskTypes',
+      'requestSettings',
+      'requestTaskTypesSettings',
+      'listBackends',
+      'listModels',
+      'setComposerSelection',
+      'send',
+      'focusTask',
+    ]);
+    const extra = after.slice(baselineCount).filter((message) => mutationTypes.has((message as { type?: string }).type ?? ''));
+    expect(extra).toEqual([]);
+  });
+
+  test('M012 S01 flow: Settings entry opens tab shell; mouse/keyboard traverse all topics; 320px keeps forms contained', async ({
+    page,
+  }) => {
+    await openWebview(page);
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-m012-flow', goal: 'Flow proof shell', viewStatus: 'idle' })],
+      storeRevision: 14,
+    });
+
+    // Real Settings entry point (toolbar), not a CSS-only harness.
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await expectPostedMessage(page, { type: 'requestSettings' });
+    await expectPostedMessage(page, { type: 'requestTaskTypesSettings' });
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+
+    const tablist = page.getByRole('tablist', { name: 'Settings topics' });
+    await expect(tablist).toBeVisible();
+    const tabs = tablist.getByRole('tab');
+    await expect(tabs).toHaveCount(5);
+
+    const topicOrder = [
+      { name: /Task Types/i, id: 'task-types', panel: 'settings-panel-task-types' },
+      { name: /Permissions/i, id: 'permissions', panel: 'settings-panel-permissions' },
+      { name: /Retention/i, id: 'retention', panel: 'settings-panel-retention' },
+      { name: /Models and CLIs/i, id: 'models-and-clis', panel: 'settings-panel-models-and-clis' },
+      { name: /Context and MCP/i, id: 'context-and-mcp', panel: 'settings-panel-context-and-mcp' },
+    ] as const;
+
+    // Mouse: visit every topic in order and assert ARIA relationships + single live panel.
+    for (const topic of topicOrder) {
+      const tab = page.getByRole('tab', { name: topic.name });
+      await tab.click();
+      await expect(tab).toHaveAttribute('aria-selected', 'true');
+      await expect(tab).toHaveAttribute('tabindex', '0');
+      await expect(tab).toHaveAttribute('id', `settings-tab-${topic.id}`);
+      await expect(tab).toHaveAttribute('aria-controls', topic.panel);
+      const panel = page.locator(`#${topic.panel}`);
+      await expect(panel).toBeVisible();
+      await expect(panel).toHaveAttribute('role', 'tabpanel');
+      await expect(panel).toHaveAttribute('aria-labelledby', `settings-tab-${topic.id}`);
+      await expect(page.getByRole('tabpanel')).toHaveCount(1);
+      for (const other of topicOrder) {
+        if (other.id === topic.id) continue;
+        await expect(page.getByRole('tab', { name: other.name })).toHaveAttribute('aria-selected', 'false');
+        await expect(page.getByRole('tab', { name: other.name })).toHaveAttribute('tabindex', '-1');
+        await expect(page.locator(`#${other.panel}`)).toHaveCount(0);
+      }
+    }
+
+    // Keyboard: ArrowLeft / ArrowRight wraparound, Home, End from the active tab.
+    const contextTab = page.getByRole('tab', { name: /Context and MCP/i });
+    await contextTab.focus();
+    await expect(contextTab).toBeFocused();
+    await contextTab.press('ArrowRight');
+    const taskTypesTab = page.getByRole('tab', { name: /Task Types/i });
+    await expect(taskTypesTab).toHaveAttribute('aria-selected', 'true');
+    await expect(taskTypesTab).toBeFocused();
+
+    await taskTypesTab.press('ArrowLeft');
+    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toBeFocused();
+
+    await page.getByRole('tab', { name: /Context and MCP/i }).press('Home');
+    await expect(taskTypesTab).toHaveAttribute('aria-selected', 'true');
+    await expect(taskTypesTab).toBeFocused();
+
+    await taskTypesTab.press('End');
+    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toBeFocused();
+
+    await page.getByRole('tab', { name: /Context and MCP/i }).press('ArrowLeft');
+    const modelsTab = page.getByRole('tab', { name: /Models and CLIs/i });
+    await expect(modelsTab).toHaveAttribute('aria-selected', 'true');
+    await expect(modelsTab).toBeFocused();
+
+    await modelsTab.press('ArrowRight');
+    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toHaveAttribute('aria-selected', 'true');
+
+    // Coming soon panels: truthful static copy, enabled tabs, zero host mutations.
+    const mutationTypes = new Set([
+      'updateSetting',
+      'updateTaskTypes',
+      'requestSettings',
+      'requestTaskTypesSettings',
+      'listBackends',
+      'listModels',
+      'setComposerSelection',
+      'send',
+      'focusTask',
+    ]);
+    const baseline = await postedMessages(page);
+    const baselineCount = baseline.length;
+
+    await page.getByRole('tab', { name: /Models and CLIs/i }).click();
+    await expect(page.locator('#settings-panel-models-and-clis')).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Models and CLIs' })).toBeVisible();
+    await expect(page.getByRole('status').filter({ hasText: 'Coming soon' })).toBeVisible();
+    await expect(page.getByText(/Future configuration for backend CLI discovery/i)).toBeVisible();
+    await expect(page.locator('.settings-section--coming-soon input, .settings-section--coming-soon button')).toHaveCount(0);
+    await expect(page.getByRole('spinbutton')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: /^Save$/ })).toHaveCount(0);
+    await expect(page.getByRole('tab', { name: /Models and CLIs/i })).toBeEnabled();
+
+    await page.getByRole('tab', { name: /Context and MCP/i }).click();
+    await expect(page.locator('#settings-panel-context-and-mcp')).toBeVisible();
+    await expect(page.getByText(/Future configuration for context-engine endpoints/i)).toBeVisible();
+    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toBeEnabled();
+
+    const afterPlaceholders = await postedMessages(page);
+    expect(afterPlaceholders).toHaveLength(baselineCount);
+    const placeholderMutations = afterPlaceholders
+      .slice(baselineCount)
+      .filter((message) => mutationTypes.has((message as { type?: string }).type ?? ''));
+    expect(placeholderMutations).toEqual([]);
+
+    // Tab / Shift+Tab: leave the tablist into the panel, then return; selected indicator stays.
+    await page.getByRole('tab', { name: /Retention/i }).click();
+    const retentionTab = page.getByRole('tab', { name: /Retention/i });
+    await expect(retentionTab).toHaveAttribute('aria-selected', 'true');
+    await retentionTab.focus();
+    await page.keyboard.press('Tab');
+    const retentionPanel = page.locator('#settings-panel-retention');
+    await expect(retentionPanel).toBeFocused();
+    await expect(retentionTab).toHaveAttribute('aria-selected', 'true');
+    await expect(retentionTab).toHaveClass(/settings-panel__tab--selected/);
+    // Selected indicator is structural (border/box-shadow), not color-only.
+    await expect
+      .poll(async () =>
+        retentionTab.evaluate((el) => {
+          const styles = getComputedStyle(el);
+          return {
+            borderBottomWidth: styles.borderBottomWidth,
+            boxShadow: styles.boxShadow,
+            fontWeight: styles.fontWeight,
+          };
+        }),
+      )
+      .toEqual(
+        expect.objectContaining({
+          borderBottomWidth: expect.not.stringMatching(/^0px$/),
+          boxShadow: expect.not.stringMatching(/^none$/),
+        }),
+      );
+
+    await page.keyboard.press('Shift+Tab');
+    await expect(retentionTab).toBeFocused();
+    await expect(retentionTab).toHaveAttribute('aria-selected', 'true');
+
+    // Return to Retention with a real snapshot and usable controls.
+    await postRawHostMessage(page, {
+      type: 'settingsSnapshot',
+      snapshot: {
+        settings: [
+          {
+            id: 'maxTurnsPerTask',
+            label: 'Max turns per task',
+            description: 'Controls how many settled turns are retained for each terminal task.',
+            value: 150,
+            defaultValue: 200,
+            minimum: 1,
+          },
+          {
+            id: 'maxStoredOutputChars',
+            label: 'Max stored output characters',
+            description: 'Limits retained assistant output for settled turns on open tasks.',
+            value: 100000,
+            defaultValue: 200000,
+            minimum: 1024,
+          },
+        ],
+      },
+    });
+    await expect(page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true })).toHaveValue('150');
+    await expect(page.getByRole('spinbutton', { name: 'Maximum stored output characters', exact: true })).toHaveValue(
+      '100000',
+    );
+    await page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true }).fill('175');
+    await page.getByRole('button', { name: 'Save Maximum turns per task' }).click();
+    await expectPostedMessage(page, { type: 'updateSetting', settingId: 'maxTurnsPerTask', value: 175 });
+    await postRawHostMessage(page, {
+      type: 'settingsUpdateResult',
+      result: { ok: true, settingId: 'maxTurnsPerTask', value: 175 },
+    });
+    await expect(page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true })).toHaveValue('175');
+    await expect(page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true })).toBeEnabled();
+
+    // Seed Task Types so 320px containment can inspect real type cards.
+    await page.getByRole('tab', { name: /Task Types/i }).click();
+    await postRawHostMessage(page, {
+      type: 'taskTypesSettingsSnapshot',
+      snapshot: {
+        status: 'ok',
+        diagnostics: [],
+        types: [
+          {
+            id: 'worker',
+            backend: 'claude',
+            role: 'worker',
+            briefKind: 'generic',
+            description: 'Default worker',
+          },
+        ],
+        defaults: [
+          {
+            id: 'worker',
+            backend: 'claude',
+            role: 'worker',
+            briefKind: 'generic',
+          },
+        ],
+        constraints: {
+          maxTypes: 32,
+          idPattern: '^[a-z][a-z0-9_-]{0,63}$',
+          descriptionMax: 200,
+          stringMax: 128,
+          roles: ['coordinator', 'worker'],
+          briefKinds: ['generic', 'investigation', 'implementation'],
+        },
+      },
+    });
+    await expect(page.locator('.type-card').first()).toBeVisible();
+
+    // 320 CSS px: only the tablist may overflow horizontally; document/panel/forms stay contained.
+    await page.setViewportSize({ width: 320, height: 720 });
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+
+    await expect
+      .poll(async () =>
+        page.evaluate(() => {
+          const docEl = document.documentElement;
+          const body = document.body;
+          const app = document.querySelector('#app');
+          const panel = document.querySelector('.settings-panel');
+          const tabsEl = document.querySelector('.settings-panel__tabs');
+          const cards = [...document.querySelectorAll('.type-card')];
+          const noHOverflow = (el: Element | null) => {
+            if (!el) return false;
+            const node = el as HTMLElement;
+            return node.scrollWidth <= node.clientWidth + 1;
+          };
+          return {
+            docOk: noHOverflow(docEl) && noHOverflow(body),
+            appOk: noHOverflow(app),
+            panelOk: noHOverflow(panel),
+            cardsOk: cards.length > 0 && cards.every((card) => noHOverflow(card)),
+            tabsMayOverflow: Boolean(tabsEl && (tabsEl as HTMLElement).scrollWidth >= (tabsEl as HTMLElement).clientWidth),
+            tabsNowrap: tabsEl
+              ? getComputedStyle(tabsEl).flexWrap === 'nowrap' && getComputedStyle(tabsEl).overflowX === 'auto'
+              : false,
+          };
+        }),
+      )
+      .toEqual(
+        expect.objectContaining({
+          docOk: true,
+          appOk: true,
+          panelOk: true,
+          cardsOk: true,
+          tabsNowrap: true,
+        }),
+      );
+
+    // Retention controls remain usable at 320px without panel horizontal overflow.
+    await page.getByRole('tab', { name: /Retention/i }).click();
+    await expect(page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Save Maximum turns per task' })).toBeVisible();
+    await expect
+      .poll(async () =>
+        page.evaluate(() => {
+          const panel = document.querySelector('.settings-panel');
+          const fields = document.querySelector('.settings-fields');
+          const input = document.querySelector('#settings-maxTurnsPerTask');
+          const noHOverflow = (el: Element | null) => {
+            if (!el) return false;
+            const node = el as HTMLElement;
+            return node.scrollWidth <= node.clientWidth + 1;
+          };
+          return {
+            panelOk: noHOverflow(panel),
+            fieldsOk: noHOverflow(fields),
+            inputOk: noHOverflow(input),
+          };
+        }),
+      )
+      .toEqual({ panelOk: true, fieldsOk: true, inputOk: true });
+
+    await page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true }).fill('180');
+    await page.getByRole('button', { name: 'Save Maximum turns per task' }).click();
+    await expectPostedMessage(page, { type: 'updateSetting', settingId: 'maxTurnsPerTask', value: 180 });
+  });
+
+  test('M012 S02 flow: Task Types and Retention state safety, isolation, hide/reveal, and 320px layout', async ({
+    page,
+  }) => {
+    await openWebview(page);
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-m012-s02', goal: 'S02 state safety', viewStatus: 'idle' })],
+      storeRevision: 20,
+    });
+
+    // Real Settings entry point (toolbar).
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await expectPostedMessage(page, { type: 'requestSettings' });
+    await expectPostedMessage(page, { type: 'requestTaskTypesSettings' });
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('aria-selected', 'true');
+
+    // --- Task Types: ok first so drafts hydrate pristine, then empty/invalid diagnostics ---
+    // (Posting empty before any hydrate would own an empty draft and block later ok hydrate.)
+    await postRawHostMessage(page, {
+      type: 'taskTypesSettingsSnapshot',
+      snapshot: taskTypesOkSnapshot({
+        status: 'ok',
+        diagnostics: [{ code: 'note', message: 'Optional note from host.' }],
+      }),
+    });
+    await expect(page.locator('.type-status--ok')).toHaveText('Valid');
+    await expect(page.getByTestId('task-types-workspace-scope')).toContainText(
+      'workspace-level muster.taskTypes map',
+    );
+    await expect(page.getByTestId('task-types-workspace-scope')).toContainText(
+      'Folder-specific resource overrides remain in native VS Code Settings',
+    );
+    await expect(page.getByTestId('task-types-diagnostic-ok-with-notes')).toContainText(
+      'Optional note from host.',
+    );
+    await expect(page.locator('.type-card')).toHaveCount(1);
+    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute(
+      'data-tab-state',
+      'diagnostic',
+    );
+    await expect(page.getByTestId('settings-tab-indicator-task-types')).toHaveText('Needs attention');
+
+    // Empty host map: dirty drafts stay (not overwritten); diagnostic + tab badge still show.
+    await postRawHostMessage(page, {
+      type: 'taskTypesSettingsSnapshot',
+      snapshot: taskTypesOkSnapshot({ status: 'empty', types: [], diagnostics: [] }),
+    });
+    await expect(page.locator('.type-status--empty')).toHaveText('Empty');
+    await expect(page.getByTestId('task-types-diagnostic-empty')).toBeVisible();
+    await expect(page.getByText(/Host map is empty/i)).toBeVisible();
+    await expect(page.getByRole('textbox', { name: 'Type id' })).toHaveValue('worker');
+    // Preserved drafts vs empty host map mark the tab dirty; diagnostic copy remains visible.
+    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute(
+      'data-tab-state',
+      'dirty',
+    );
+
+    // Invalid host map: same non-overwrite + diagnostic surface.
+    await postRawHostMessage(page, {
+      type: 'taskTypesSettingsSnapshot',
+      snapshot: taskTypesOkSnapshot({
+        status: 'invalid',
+        types: [],
+        diagnostics: [{ code: 'invalid_map', message: 'Type id "Bad Id" is invalid.' }],
+      }),
+    });
+    await expect(page.locator('.type-status--invalid')).toHaveText('Invalid');
+    await expect(page.getByTestId('task-types-diagnostic-invalid')).toBeVisible();
+    await expect(page.getByText('Host task types are invalid')).toBeVisible();
+    await expect(page.getByText('Type id "Bad Id" is invalid.')).toBeVisible();
+    await expect(page.getByRole('textbox', { name: 'Type id' })).toHaveValue('worker');
+
+    // Return to a clean ok snapshot for the edit loop.
+    await postRawHostMessage(page, {
+      type: 'taskTypesSettingsSnapshot',
+      snapshot: taskTypesOkSnapshot(),
+    });
+    await expect(page.getByRole('textbox', { name: 'Type id' })).toHaveValue('worker');
+    await expect(page.locator('.type-status--ok')).toHaveText('Valid');
+    // UI dirty compares drafts to the current snapshot types (not intermediate maps).
+    await expect(page.getByTestId('task-types-dirty')).toHaveCount(0);
+
+    // Add + edit + remove (draft ownership).
+    await page.getByRole('button', { name: /^Add$/ }).click();
+    await expect(page.locator('.type-card')).toHaveCount(2);
+    await expect(page.getByTestId('task-types-dirty')).toBeVisible();
+    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('data-tab-state', 'dirty');
+    await expect(page.getByTestId('settings-tab-indicator-task-types')).toHaveText('Unsaved');
+
+    const newId = page.locator('.type-card').nth(1).getByRole('textbox', { name: 'Type id' });
+    await newId.fill('helper');
+    await page.locator('.type-card').nth(1).getByRole('button', { name: 'Remove type' }).click();
+    await expect(page.locator('.type-card')).toHaveCount(1);
+
+    // Edit existing row description so draft stays dirty for isolation checks.
+    await page.locator('#tt-desc-0').fill('Edited worker draft');
+    await expect(page.getByTestId('task-types-dirty')).toBeVisible();
+
+    // Client rejection: empty id blocks host update.
+    const updateTaskTypesBeforeReject = (await postedMessages(page)).filter(
+      (m) => (m as { type?: string }).type === 'updateTaskTypes',
+    ).length;
+    await page.getByRole('button', { name: /^Add$/ }).click();
+    await page.getByRole('button', { name: /^Save$/ }).click();
+    await expect(page.getByTestId('task-types-draft-error')).toHaveText('Each type needs an id.');
+    await expect
+      .poll(async () =>
+        (await postedMessages(page)).filter((m) => (m as { type?: string }).type === 'updateTaskTypes')
+          .length,
+      )
+      .toBe(updateTaskTypesBeforeReject);
+    // Fill valid id for later save.
+    await page.locator('.type-card').nth(1).getByRole('textbox', { name: 'Type id' }).fill('helper');
+    await page.locator('.type-card').nth(1).locator('#tt-desc-1').fill('Helper type');
+
+    // Valid save success path.
+    await page.getByRole('button', { name: /^Save$/ }).click();
+    await expectPostedMessage(page, {
+      type: 'updateTaskTypes',
+      types: expect.arrayContaining([
+        expect.objectContaining({ id: 'worker', description: 'Edited worker draft' }),
+        expect.objectContaining({ id: 'helper', description: 'Helper type' }),
+      ]),
+    });
+    await expect(page.getByRole('button', { name: /Saving/i })).toBeVisible();
+    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('data-tab-state', 'saving');
+
+    await postRawHostMessage(page, {
+      type: 'taskTypesSettingsUpdateResult',
+      result: { ok: true },
+    });
+    await expect(page.getByTestId('task-types-saved')).toContainText(
+      'Saved task types to workspace settings.',
+    );
+    // Force-hydrate snapshot clears dirty only after host success.
+    await postRawHostMessage(page, {
+      type: 'taskTypesSettingsSnapshot',
+      snapshot: taskTypesOkSnapshot({
+        types: [
+          {
+            id: 'worker',
+            backend: 'claude',
+            role: 'worker',
+            briefKind: 'generic',
+            description: 'Edited worker draft',
+          },
+          {
+            id: 'helper',
+            backend: 'opencode',
+            role: 'worker',
+            briefKind: 'generic',
+            description: 'Helper type',
+          },
+        ],
+      }),
+    });
+    await expect(page.getByTestId('task-types-dirty')).toHaveCount(0);
+    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('data-tab-state', 'saved');
+    await expect(page.locator('.type-card')).toHaveCount(2);
+
+    // Sanitized host failure preserves draft and prior saved snapshot.
+    await page.locator('#tt-desc-0').fill('Should stay after failure');
+    await page.getByRole('button', { name: /^Save$/ }).click();
+    await expectPostedMessage(page, {
+      type: 'updateTaskTypes',
+      types: expect.arrayContaining([
+        expect.objectContaining({ id: 'worker', description: 'Should stay after failure' }),
+      ]),
+    });
+    await postRawHostMessage(page, {
+      type: 'taskTypesSettingsUpdateResult',
+      result: {
+        ok: false,
+        code: 'updateFailed',
+        message: 'Unable to update muster.taskTypes.',
+        diagnostics: [
+          {
+            code: 'updateFailed',
+            message: 'Unable to update muster.taskTypes.',
+          },
+        ],
+      },
+    });
+    await expect(page.getByTestId('task-types-save-error')).toBeVisible();
+    await expect(page.getByTestId('task-types-save-error')).toContainText('Task types save failed');
+    await expect(page.getByTestId('task-types-save-error')).toContainText(
+      'Unable to update muster.taskTypes.',
+    );
+    await expect(page.getByText('leaked stack')).toHaveCount(0);
+    await expect(page.locator('#tt-desc-0')).toHaveValue('Should stay after failure');
+    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('data-tab-state', 'error');
+    await expect(page.getByTestId('settings-tab-indicator-task-types')).toHaveText('Error');
+
+    // Stale snapshot must not overwrite dirty Task Types drafts.
+    await postRawHostMessage(page, {
+      type: 'taskTypesSettingsSnapshot',
+      snapshot: taskTypesOkSnapshot({
+        types: [
+          {
+            id: 'worker',
+            backend: 'claude',
+            role: 'worker',
+            briefKind: 'generic',
+            description: 'Edited worker draft',
+          },
+          {
+            id: 'helper',
+            backend: 'opencode',
+            role: 'worker',
+            briefKind: 'generic',
+            description: 'Helper type',
+          },
+        ],
+      }),
+    });
+    await expect(page.locator('#tt-desc-0')).toHaveValue('Should stay after failure');
+
+    // Reset posts defaults as an explicit host update and keeps dirty until success.
+    await page.getByRole('button', { name: /^Reset$/ }).click();
+    await expectPostedMessage(page, {
+      type: 'updateTaskTypes',
+      types: [
+        expect.objectContaining({ id: 'worker' }),
+        expect.objectContaining({ id: 'coordinator' }),
+      ],
+    });
+    // Drafts still show pre-reset dirty content until force-hydrate.
+    await expect(page.locator('#tt-desc-0')).toHaveValue('Should stay after failure');
+    await postRawHostMessage(page, {
+      type: 'taskTypesSettingsUpdateResult',
+      result: { ok: true },
+    });
+    await postRawHostMessage(page, {
+      type: 'taskTypesSettingsSnapshot',
+      snapshot: taskTypesOkSnapshot({
+        types: [
+          { id: 'worker', backend: 'claude', role: 'worker', briefKind: 'generic' },
+          { id: 'coordinator', backend: 'claude', role: 'coordinator', briefKind: 'generic' },
+        ],
+      }),
+    });
+    await expect(page.locator('.type-card')).toHaveCount(2);
+    await expect(page.getByRole('textbox', { name: 'Type id' }).first()).toHaveValue('worker');
+    await expect(page.getByTestId('task-types-dirty')).toHaveCount(0);
+
+    // Dirty Task Types again for cross-topic isolation.
+    await page.locator('#tt-desc-0').fill('Isolation TT draft');
+    await expect(page.getByTestId('task-types-dirty')).toBeVisible();
+
+    // --- Retention: validation, success, failed save + draft preservation, stale snapshot ---
+    await page.getByRole('tab', { name: /Retention/i }).click();
+    await expect(page.getByRole('tab', { name: /Retention/i })).toHaveAttribute('aria-selected', 'true');
+    await postRawHostMessage(page, {
+      type: 'settingsSnapshot',
+      snapshot: retentionSettingsSnapshot({ maxTurnsPerTask: 200, maxStoredOutputChars: 200000 }),
+    });
+    await expect(page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true })).toHaveValue(
+      '200',
+    );
+
+    // Client validation: empty / non-numeric / below-min do not post updateSetting.
+    const turns = page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true });
+    await turns.fill('');
+    await page.getByRole('button', { name: 'Save Maximum turns per task' }).click();
+    await expect(page.getByRole('alert').getByText('Maximum turns per task must be a number.')).toBeVisible();
+    await turns.fill('1.5');
+    await page.getByRole('button', { name: 'Save Maximum turns per task' }).click();
+    await expect(page.getByRole('alert').getByText('Maximum turns per task must be an integer.')).toBeVisible();
+    await turns.fill('0');
+    await page.getByRole('button', { name: 'Save Maximum turns per task' }).click();
+    await expect(page.getByRole('alert').getByText('Maximum turns per task must be at least 1.')).toBeVisible();
+    await expect
+      .poll(async () =>
+        (await postedMessages(page)).filter((m) => (m as { type?: string }).type === 'updateSetting'),
+      )
+      .toHaveLength(0);
+
+    // Success path.
+    await turns.fill('222');
+    await page.getByRole('button', { name: 'Save Maximum turns per task' }).click();
+    await expectPostedMessage(page, { type: 'updateSetting', settingId: 'maxTurnsPerTask', value: 222 });
+    await postRawHostMessage(page, {
+      type: 'settingsUpdateResult',
+      result: { ok: true, settingId: 'maxTurnsPerTask', value: 222 },
+    });
+    await expect(turns).toHaveValue('222');
+    await expect(page.getByTestId('retention-local-success')).toContainText('Saved Maximum turns per task.');
+    await expect(page.getByRole('tab', { name: /Retention/i })).toHaveAttribute('data-tab-state', 'saved');
+
+    // Failed save keeps attempted draft and prior saved snapshot authoritative.
+    const chars = page.getByRole('spinbutton', { name: 'Maximum stored output characters', exact: true });
+    await chars.fill('333333');
+    await page.getByRole('button', { name: 'Save Maximum stored output characters' }).click();
+    await expectPostedMessage(page, {
+      type: 'updateSetting',
+      settingId: 'maxStoredOutputChars',
+      value: 333333,
+    });
+    await postRawHostMessage(page, {
+      type: 'settingsUpdateResult',
+      result: {
+        ok: false,
+        settingId: 'maxStoredOutputChars',
+        code: 'updateFailed',
+        message: 'Error: leaked stack trace from vscode.workspace.getConfiguration().update',
+      },
+    });
+    await expect(page.getByTestId('retention-local-error')).toBeVisible();
+    await expect(page.getByTestId('retention-local-error')).toContainText('Retention save failed');
+    await expect(page.getByTestId('retention-local-error')).toContainText(
+      'Unable to save Maximum stored output characters. Check the VS Code setting and try again.',
+    );
+    await expect(page.getByText('leaked stack trace')).toHaveCount(0);
+    await expect(chars).toHaveValue('333333');
+    await expect(page.getByRole('tab', { name: /Retention/i })).toHaveAttribute('data-tab-state', 'error');
+    await expect(page.getByTestId('settings-tab-indicator-retention')).toHaveText('Error');
+
+    // Stale snapshot refreshes saved state but cannot overwrite dirty retention draft.
+    await postRawHostMessage(page, {
+      type: 'settingsSnapshot',
+      snapshot: retentionSettingsSnapshot({ maxTurnsPerTask: 222, maxStoredOutputChars: 200000 }),
+    });
+    await expect(chars).toHaveValue('333333');
+    await expect(turns).toHaveValue('222');
+
+    // --- Cross-topic isolation: drafts, dirty indicators, and topic-local errors ---
+    // Retention still dirty+error; Task Types dirty from Isolation TT draft.
+    await page.getByRole('tab', { name: /Task Types/i }).click();
+    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.locator('#tt-desc-0')).toHaveValue('Isolation TT draft');
+    await expect(page.getByTestId('task-types-dirty')).toBeVisible();
+    await expect(page.getByTestId('task-types-save-error')).toHaveCount(0);
+    await expect(page.getByTestId('retention-local-error')).toHaveCount(0);
+    // Hidden Retention still shows error indicator on its tab.
+    await expect(page.getByRole('tab', { name: /Retention/i })).toHaveAttribute('data-tab-state', 'error');
+    await expect(page.getByTestId('settings-tab-indicator-retention')).toHaveText('Error');
+    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('data-tab-state', 'dirty');
+
+    // Inject Task Types error while Retention error remains on its tab.
+    await page.getByRole('button', { name: /^Save$/ }).click();
+    await postRawHostMessage(page, {
+      type: 'taskTypesSettingsUpdateResult',
+      result: {
+        ok: false,
+        code: 'updateFailed',
+        message: 'Unable to update muster.taskTypes.',
+      },
+    });
+    await expect(page.getByTestId('task-types-save-error')).toBeVisible();
+    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('data-tab-state', 'error');
+
+    // Switch repeatedly — both topic indicators and drafts remain isolated.
+    await page.getByRole('tab', { name: /Retention/i }).click();
+    await expect(chars).toHaveValue('333333');
+    await expect(page.getByTestId('retention-local-error')).toBeVisible();
+    await expect(page.getByTestId('task-types-save-error')).toHaveCount(0);
+    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('data-tab-state', 'error');
+
+    await page.getByRole('tab', { name: /Permissions/i }).click();
+    await expect(page.getByTestId('permissions-settings')).toBeVisible();
+    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('data-tab-state', 'error');
+    await expect(page.getByRole('tab', { name: /Retention/i })).toHaveAttribute('data-tab-state', 'error');
+
+    await page.getByRole('tab', { name: /Task Types/i }).click();
+    await expect(page.locator('#tt-desc-0')).toHaveValue('Isolation TT draft');
+    await expect(page.getByTestId('task-types-save-error')).toBeVisible();
+
+    // --- Hide/reveal: capture getState bag, re-open webview, restore drafts + active topic ---
+    // Seed unrelated bag keys so merge-not-replace is proven.
+    await page.evaluate(() => {
+      const api = window.acquireVsCodeApi();
+      const prev = (api.getState?.() as Record<string, unknown> | undefined) ?? {};
+      api.setState?.({
+        ...prev,
+        'muster.sendOutbox.v1': [{ clientRequestId: 'outbox-keep', status: 'pending' }],
+        'muster.composerSelection.v1': { backend: 'claude', model: 'sonnet' },
+      });
+    });
+    const capturedState = await readVsCodeState(page);
+    expect(capturedState).toEqual(
+      expect.objectContaining({
+        'muster.settingsView.v1': expect.objectContaining({
+          v: 1,
+          activeTopicId: 'task-types',
+          taskTypeDrafts: expect.arrayContaining([
+            expect.objectContaining({ id: 'worker', description: 'Isolation TT draft' }),
+          ]),
+          retentionDrafts: expect.objectContaining({
+            maxStoredOutputChars: '333333',
+          }),
+        }),
+        'muster.sendOutbox.v1': expect.arrayContaining([
+          expect.objectContaining({ clientRequestId: 'outbox-keep' }),
+        ]),
+        'muster.composerSelection.v1': expect.objectContaining({ backend: 'claude' }),
+      }),
+    );
+
+    // Unmount Settings, then fully recreate the webview with the captured bag.
+    await page.getByRole('button', { name: 'Back to tasks' }).click();
+    await expect(page.getByRole('heading', { name: 'Settings' })).toHaveCount(0);
+
+    await openWebview(page, { initialState: capturedState });
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-m012-s02', goal: 'S02 state safety', viewStatus: 'idle' })],
+      storeRevision: 21,
+    });
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await expectPostedMessage(page, { type: 'requestSettings' });
+    await expectPostedMessage(page, { type: 'requestTaskTypesSettings' });
+
+    // Active topic restored to Task Types; drafts restored before host snapshots.
+    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('aria-selected', 'true');
+    // Host snapshots arrive after restore; dirty drafts must not be overwritten.
+    await postRawHostMessage(page, {
+      type: 'taskTypesSettingsSnapshot',
+      snapshot: taskTypesOkSnapshot({
+        types: [
+          { id: 'worker', backend: 'claude', role: 'worker', briefKind: 'generic' },
+          { id: 'coordinator', backend: 'claude', role: 'coordinator', briefKind: 'generic' },
+        ],
+      }),
+    });
+    await postRawHostMessage(page, {
+      type: 'settingsSnapshot',
+      snapshot: retentionSettingsSnapshot({ maxTurnsPerTask: 222, maxStoredOutputChars: 200000 }),
+    });
+    await expect(page.locator('#tt-desc-0')).toHaveValue('Isolation TT draft');
+    await expect(page.getByTestId('task-types-dirty')).toBeVisible();
+
+    await page.getByRole('tab', { name: /Retention/i }).click();
+    await expect(
+      page.getByRole('spinbutton', { name: 'Maximum stored output characters', exact: true }),
+    ).toHaveValue('333333');
+    await expect(page.getByRole('tab', { name: /Retention/i })).toHaveAttribute('data-tab-state', 'dirty');
+
+    // Unrelated bag keys still present after settings writes during restore.
+    const restoredBag = await readVsCodeState(page);
+    expect(restoredBag).toEqual(
+      expect.objectContaining({
+        'muster.sendOutbox.v1': expect.arrayContaining([
+          expect.objectContaining({ clientRequestId: 'outbox-keep' }),
+        ]),
+        'muster.composerSelection.v1': expect.objectContaining({ backend: 'claude' }),
+        'muster.settingsView.v1': expect.objectContaining({
+          v: 1,
+          activeTopicId: 'retention',
+        }),
+      }),
+    );
+
+    // --- 320px layout remains usable for both topics ---
+    await page.setViewportSize({ width: 320, height: 720 });
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+    await page.getByRole('tab', { name: /Task Types/i }).click();
+    await expect(page.locator('.type-card').first()).toBeVisible();
+    await expect
+      .poll(async () =>
+        page.evaluate(() => {
+          const panel = document.querySelector('.settings-panel');
+          const cards = [...document.querySelectorAll('.type-card')];
+          const noHOverflow = (el: Element | null) => {
+            if (!el) return false;
+            const node = el as HTMLElement;
+            return node.scrollWidth <= node.clientWidth + 1;
+          };
+          return {
+            panelOk: noHOverflow(panel),
+            cardsOk: cards.length > 0 && cards.every((card) => noHOverflow(card)),
+          };
+        }),
+      )
+      .toEqual({ panelOk: true, cardsOk: true });
+
+    await page.getByRole('tab', { name: /Retention/i }).click();
+    await expect(page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Save Maximum turns per task' })).toBeVisible();
+    await expect
+      .poll(async () =>
+        page.evaluate(() => {
+          const panel = document.querySelector('.settings-panel');
+          const fields = document.querySelector('.settings-fields');
+          return {
+            panelOk: Boolean(panel && (panel as HTMLElement).scrollWidth <= (panel as HTMLElement).clientWidth + 1),
+            fieldsOk: Boolean(
+              fields && (fields as HTMLElement).scrollWidth <= (fields as HTMLElement).clientWidth + 1,
+            ),
+          };
+        }),
+      )
+      .toEqual({ panelOk: true, fieldsOk: true });
+  });
+
+  test('M012 S03 permissions UI: loading, selection, success, sanitized failure, stale snapshot, runtime card isolation', async ({
+    page,
+  }) => {
+    await openWebview(page);
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-m012-s03', goal: 'S03 permissions UI', viewStatus: 'idle' })],
+      storeRevision: 30,
+    });
+
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await expectPostedMessage(page, { type: 'requestSettings' });
+    await expectPostedMessage(page, { type: 'requestTaskTypesSettings' });
+    await expectPostedMessage(page, { type: 'requestPermissionSettings' });
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+
+    // Seed Task Types + Retention so isolation can prove they stay untouched.
+    await postRawHostMessage(page, {
+      type: 'taskTypesSettingsSnapshot',
+      snapshot: taskTypesOkSnapshot({
+        types: [
+          {
+            id: 'worker',
+            backend: 'claude',
+            role: 'worker',
+            briefKind: 'generic',
+            description: 'S03 worker stays',
+          },
+        ],
+      }),
+    });
+    await postRawHostMessage(page, {
+      type: 'settingsSnapshot',
+      snapshot: retentionSettingsSnapshot({ maxTurnsPerTask: 111, maxStoredOutputChars: 150000 }),
+    });
+
+    await page.getByRole('tab', { name: /Permissions/i }).click();
+    await expect(page.getByRole('tab', { name: /Permissions/i })).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByTestId('permissions-loading')).toBeVisible();
+    await expect(page.getByTestId('permissions-runtime-note')).toContainText(
+      'Runtime permission prompts still appear as in-session permission cards',
+    );
+
+    // Loading → host snapshot hydrates Ask as recommended default.
+    await postRawHostMessage(page, {
+      type: 'permissionSettingsSnapshot',
+      snapshot: permissionSettingsSnapshot('ask'),
+    });
+    await expect(page.getByTestId('permissions-loading')).toHaveCount(0);
+    await expect(page.getByTestId('permissions-mode-group')).toBeVisible();
+    await expect(page.locator('#permission-mode-ask')).toBeChecked();
+    await expect(page.getByTestId('permission-mode-risk-ask')).toHaveText(/Recommended default/i);
+    await expect(page.getByTestId('permission-mode-risk-allow')).toHaveText(/Least safe/i);
+    await expect(page.getByTestId('permission-mode-option-allow')).toHaveAttribute(
+      'data-risk',
+      'least-safe',
+    );
+    await expect(page.getByTestId('permissions-dirty')).toHaveCount(0);
+    await expect(page.getByTestId('permissions-save')).toBeDisabled();
+
+    // Selection is draft-only until Save.
+    await page.getByTestId('permission-mode-option-readonly').click();
+    await expect(page.locator('#permission-mode-readonly')).toBeChecked();
+    await expect(page.getByTestId('permissions-dirty')).toBeVisible();
+    await expect(page.getByRole('tab', { name: /Permissions/i })).toHaveAttribute(
+      'data-tab-state',
+      'dirty',
+    );
+    await expect(page.getByTestId('settings-tab-indicator-permissions')).toHaveText('Unsaved');
+    await expect(page.getByTestId('permissions-save')).toBeEnabled();
+    await expect
+      .poll(async () =>
+        (await postedMessages(page)).filter(
+          (m) => (m as { type?: string }).type === 'updatePermissionSettings',
+        ),
+      )
+      .toHaveLength(0);
+
+    // Success path: explicit Save posts update, then host success + snapshot clear dirty.
+    await page.getByTestId('permissions-save').click();
+    await expectPostedMessage(page, { type: 'updatePermissionSettings', mode: 'readonly' });
+    await expect(page.getByRole('tab', { name: /Permissions/i })).toHaveAttribute(
+      'data-tab-state',
+      'saving',
+    );
+    await postRawHostMessage(page, {
+      type: 'permissionSettingsUpdateResult',
+      result: { ok: true, mode: 'readonly' },
+    });
+    await expect(page.getByTestId('permissions-local-success')).toContainText(
+      'Saved permission mode.',
+    );
+    await postRawHostMessage(page, {
+      type: 'permissionSettingsSnapshot',
+      snapshot: permissionSettingsSnapshot('readonly'),
+    });
+    await expect(page.getByTestId('permissions-dirty')).toHaveCount(0);
+    await expect(page.locator('#permission-mode-readonly')).toBeChecked();
+    await expect(page.getByRole('tab', { name: /Permissions/i })).toHaveAttribute(
+      'data-tab-state',
+      'saved',
+    );
+
+    // Sanitized failure keeps unsaved draft; prior saved mode remains authoritative in snapshot.
+    await page.getByTestId('permission-mode-option-allow').click();
+    await expect(page.locator('#permission-mode-allow')).toBeChecked();
+    await page.getByTestId('permissions-save').click();
+    await expectPostedMessage(page, { type: 'updatePermissionSettings', mode: 'allow' });
+    await postRawHostMessage(page, {
+      type: 'permissionSettingsUpdateResult',
+      result: {
+        ok: false,
+        code: 'updateFailed',
+        message: 'Error: ENOENT /secret/token=abc leaked stack',
+      },
+    });
+    await expect(page.getByTestId('permissions-local-error')).toBeVisible();
+    await expect(page.getByTestId('permissions-local-error')).toContainText(
+      'Permission mode save failed',
+    );
+    await expect(page.getByTestId('permissions-local-error')).toContainText(
+      'Unable to save permission mode. Check the VS Code setting and try again.',
+    );
+    await expect(page.getByText('ENOENT')).toHaveCount(0);
+    await expect(page.getByText('token=abc')).toHaveCount(0);
+    await expect(page.getByText('leaked stack')).toHaveCount(0);
+    await expect(page.locator('#permission-mode-allow')).toBeChecked();
+    await expect(page.getByTestId('permissions-dirty')).toBeVisible();
+    await expect(page.getByRole('tab', { name: /Permissions/i })).toHaveAttribute(
+      'data-tab-state',
+      'error',
+    );
+    await expect(page.getByTestId('settings-tab-indicator-permissions')).toHaveText('Error');
+
+    // Stale snapshot must not overwrite dirty Permissions draft.
+    await postRawHostMessage(page, {
+      type: 'permissionSettingsSnapshot',
+      snapshot: permissionSettingsSnapshot('readonly'),
+    });
+    await expect(page.locator('#permission-mode-allow')).toBeChecked();
+    await expect(page.getByTestId('permissions-dirty')).toBeVisible();
+
+    // Other topics remain untouched by permission failure.
+    await page.getByRole('tab', { name: /Task Types/i }).click();
+    await expect(page.locator('#tt-desc-0')).toHaveValue('S03 worker stays');
+    await expect(page.getByTestId('task-types-dirty')).toHaveCount(0);
+    await expect(page.getByTestId('task-types-save-error')).toHaveCount(0);
+    await page.getByRole('tab', { name: /Retention/i }).click();
+    await expect(
+      page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true }),
+    ).toHaveValue('111');
+    await expect(page.getByTestId('retention-local-error')).toHaveCount(0);
+    await expect(page.getByRole('tab', { name: /Permissions/i })).toHaveAttribute(
+      'data-tab-state',
+      'error',
+    );
+
+    // Runtime PermissionCard must remain distinct from Settings configuration.
+    await page.getByRole('button', { name: 'Back to tasks' }).click();
+    await expect(page.getByRole('heading', { name: 'Settings' })).toHaveCount(0);
+    await postRawHostMessage(page, {
+      type: 'permissionPending',
+      sessionId: 'sess-s03',
+      permissionId: 'perm-s03',
+      title: 'Write src/host/permission-settings.ts',
+      kind: 'edit',
+      classification: 'write',
+      options: [
+        { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
+        { optionId: 'reject', name: 'Deny', kind: 'reject' },
+      ],
+    });
+    await expect(page.getByTestId('runtime-permission-card')).toBeVisible();
+    await expect(page.getByRole('region', { name: 'Runtime permission request' })).toBeVisible();
+    await expect(page.getByText('Write src/host/permission-settings.ts')).toBeVisible();
+    await expect(page.getByText(/This agent wants to run a write \/ command action/i)).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Deny' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Allow once' })).toBeVisible();
+
+    // Re-open Settings while a runtime permission is pending — configuration UI stays distinct.
+    // Settings replaces the task surface (runtime card unmounts) and never renders prompt actions.
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await expectPostedMessage(page, { type: 'requestPermissionSettings' });
+    await page.getByRole('tab', { name: /Permissions/i }).click();
+    await postRawHostMessage(page, {
+      type: 'permissionSettingsSnapshot',
+      snapshot: permissionSettingsSnapshot('readonly'),
+    });
+    // Dirty draft (allow) survives reopen via view-state; runtime card is not Settings UI.
+    await expect(page.locator('#permission-mode-allow')).toBeChecked();
+    await expect(page.getByTestId('permissions-settings')).toBeVisible();
+    await expect(page.getByTestId('runtime-permission-card')).toHaveCount(0);
+    await expect(page.getByRole('region', { name: 'Runtime permission request' })).toHaveCount(0);
+    await expect(page.getByText('Write src/host/permission-settings.ts')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Deny' })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Allow once' })).toHaveCount(0);
+    // Settings modes are radios under Permission mode — not runtime prompt buttons.
+    await expect(page.getByTestId('permissions-mode-group')).toBeVisible();
+    await expect(page.getByTestId('permissions-runtime-note')).toContainText(
+      'This tab only configures the default policy mode',
+    );
+  });
+
+  test('M012 S03 flow: save readonly then allow, exact outbound update, sanitized failure keeps draft', async ({
+    page,
+  }) => {
+    await openWebview(page);
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-m012-s03-flow', goal: 'S03 permissions flow', viewStatus: 'idle' })],
+      storeRevision: 31,
+    });
+
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await expectPostedMessage(page, { type: 'requestPermissionSettings' });
+
+    // Seed sibling topics so isolation is observable after a permission failure.
+    await postRawHostMessage(page, {
+      type: 'taskTypesSettingsSnapshot',
+      snapshot: taskTypesOkSnapshot({
+        types: [
+          {
+            id: 'worker',
+            backend: 'claude',
+            role: 'worker',
+            briefKind: 'generic',
+            description: 'S03 flow worker stays',
+          },
+        ],
+      }),
+    });
+    await postRawHostMessage(page, {
+      type: 'settingsSnapshot',
+      snapshot: retentionSettingsSnapshot({ maxTurnsPerTask: 122, maxStoredOutputChars: 160000 }),
+    });
+
+    await page.getByRole('tab', { name: /Permissions/i }).click();
+    await postRawHostMessage(page, {
+      type: 'permissionSettingsSnapshot',
+      snapshot: permissionSettingsSnapshot('ask'),
+    });
+    await expect(page.locator('#permission-mode-ask')).toBeChecked();
+
+    // Save readonly: exact outbound update, then host success + refreshed snapshot.
+    await page.getByTestId('permission-mode-option-readonly').click();
+    await page.getByTestId('permissions-save').click();
+    await expectPostedMessage(page, { type: 'updatePermissionSettings', mode: 'readonly' });
+    await postRawHostMessage(page, {
+      type: 'permissionSettingsUpdateResult',
+      result: { ok: true, mode: 'readonly' },
+    });
+    await postRawHostMessage(page, {
+      type: 'permissionSettingsSnapshot',
+      snapshot: permissionSettingsSnapshot('readonly'),
+    });
+    await expect(page.locator('#permission-mode-readonly')).toBeChecked();
+    await expect(page.getByTestId('permissions-dirty')).toHaveCount(0);
+    await expect(page.getByTestId('permissions-local-success')).toContainText('Saved permission mode.');
+
+    // Save allow after success: exact outbound update for the new mode.
+    await page.getByTestId('permission-mode-option-allow').click();
+    await page.getByTestId('permissions-save').click();
+    await expectPostedMessage(page, { type: 'updatePermissionSettings', mode: 'allow' });
+    await postRawHostMessage(page, {
+      type: 'permissionSettingsUpdateResult',
+      result: { ok: true, mode: 'allow' },
+    });
+    await postRawHostMessage(page, {
+      type: 'permissionSettingsSnapshot',
+      snapshot: permissionSettingsSnapshot('allow'),
+    });
+    await expect(page.locator('#permission-mode-allow')).toBeChecked();
+    await expect(page.getByTestId('permissions-dirty')).toHaveCount(0);
+
+    // Failure keeps unsaved draft without leaking raw errors or altering other topics.
+    await page.getByTestId('permission-mode-option-ask').click();
+    await page.getByTestId('permissions-save').click();
+    await expectPostedMessage(page, { type: 'updatePermissionSettings', mode: 'ask' });
+    await postRawHostMessage(page, {
+      type: 'permissionSettingsUpdateResult',
+      result: {
+        ok: false,
+        code: 'updateFailed',
+        message: 'Error: EPERM /secret/token=xyz stack',
+      },
+    });
+    await expect(page.getByTestId('permissions-local-error')).toBeVisible();
+    await expect(page.getByTestId('permissions-local-error')).toContainText(
+      'Unable to save permission mode. Check the VS Code setting and try again.',
+    );
+    await expect(page.getByText('EPERM')).toHaveCount(0);
+    await expect(page.getByText('token=xyz')).toHaveCount(0);
+    await expect(page.getByText('/secret/')).toHaveCount(0);
+    await expect(page.locator('#permission-mode-ask')).toBeChecked();
+    await expect(page.getByTestId('permissions-dirty')).toBeVisible();
+
+    await page.getByRole('tab', { name: /Task Types/i }).click();
+    await expect(page.locator('#tt-desc-0')).toHaveValue('S03 flow worker stays');
+    await expect(page.getByTestId('task-types-dirty')).toHaveCount(0);
+    await page.getByRole('tab', { name: /Retention/i }).click();
+    await expect(
+      page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true }),
+    ).toHaveValue('122');
+    await expect(page.getByTestId('retention-local-error')).toHaveCount(0);
+    await expect(page.getByRole('tab', { name: /Permissions/i })).toHaveAttribute(
+      'data-tab-state',
+      'error',
+    );
   });
 
   test('Enter queues a FIFO follow-up while running; Ctrl+Enter posts sendLiveInput only', async ({ page }) => {
@@ -4930,6 +6324,441 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expect(page.getByTestId('task-model-switch')).toBeVisible();
     await expect(page.getByTestId('task-model-readonly')).toHaveCount(0);
   });
+
+  test('M012 S04 integrated settings acceptance: five-topic keyboard mouse isolation host loops state restore and 320px', async ({
+    page,
+  }) => {
+    await openWebview(page, {
+      rootTasks: [task({ id: 'task-m012-s04', goal: 'Integrated settings acceptance', viewStatus: 'idle' })],
+      storeRevision: 40,
+    });
+
+    // --- Real Settings entry + host snapshots for all three active topics ---
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await expectPostedMessage(page, { type: 'requestSettings' });
+    await expectPostedMessage(page, { type: 'requestTaskTypesSettings' });
+    await expectPostedMessage(page, { type: 'requestPermissionSettings' });
+
+    await postRawHostMessage(page, {
+      type: 'settingsSnapshot',
+      snapshot: retentionSettingsSnapshot({ maxTurnsPerTask: 120, maxStoredOutputChars: 150000 }),
+    });
+    await postRawHostMessage(page, {
+      type: 'taskTypesSettingsSnapshot',
+      snapshot: taskTypesOkSnapshot({
+        status: 'ok',
+        types: [
+          {
+            id: 'worker',
+            backend: 'claude',
+            role: 'worker',
+            briefKind: 'generic',
+            description: 'S04 worker',
+          },
+          {
+            id: 'coordinator',
+            backend: 'claude',
+            role: 'coordinator',
+            briefKind: 'generic',
+            description: 'S04 coordinator',
+          },
+        ],
+      }),
+    });
+    await postRawHostMessage(page, {
+      type: 'permissionSettingsSnapshot',
+      snapshot: permissionSettingsSnapshot('ask'),
+    });
+
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+
+    // --- Five-topic taxonomy + WAI-ARIA relationships ---
+    const tablist = page.getByRole('tablist', { name: 'Settings topics' });
+    await expect(tablist).toBeVisible();
+    const tabs = tablist.getByRole('tab');
+    await expect(tabs).toHaveCount(5);
+    await expect(tabs.nth(0)).toHaveText(/Task Types/i);
+    await expect(tabs.nth(1)).toHaveText(/Permissions/i);
+    await expect(tabs.nth(2)).toHaveText(/Retention/i);
+    await expect(tabs.nth(3)).toHaveText(/Models and CLIs/i);
+    await expect(tabs.nth(4)).toHaveText(/Context and MCP/i);
+
+    const taskTypesTab = page.getByRole('tab', { name: /Task Types/i });
+    await expect(taskTypesTab).toHaveAttribute('aria-selected', 'true');
+    await expect(taskTypesTab).toHaveAttribute('aria-controls', 'settings-panel-task-types');
+    await expect(page.getByRole('tabpanel')).toHaveAttribute('id', 'settings-panel-task-types');
+    await expect(page.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', 'settings-tab-task-types');
+
+    // Mouse activation of each topic
+    for (const name of [/Permissions/i, /Retention/i, /Models and CLIs/i, /Context and MCP/i, /Task Types/i]) {
+      await page.getByRole('tab', { name }).click();
+      await expect(page.getByRole('tab', { name })).toHaveAttribute('aria-selected', 'true');
+    }
+
+    // Keyboard: ArrowRight wrap, ArrowLeft wrap, Home, End, Tab into panel
+    await taskTypesTab.focus();
+    await expect(taskTypesTab).toBeFocused();
+    await taskTypesTab.press('ArrowRight');
+    await expect(page.getByRole('tab', { name: /Permissions/i })).toHaveAttribute('aria-selected', 'true');
+    await page.getByRole('tab', { name: /Permissions/i }).press('End');
+    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toHaveAttribute('aria-selected', 'true');
+    await page.getByRole('tab', { name: /Context and MCP/i }).press('Home');
+    await expect(taskTypesTab).toHaveAttribute('aria-selected', 'true');
+    await taskTypesTab.press('ArrowLeft');
+    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toHaveAttribute('aria-selected', 'true');
+    await page.getByRole('tab', { name: /Context and MCP/i }).press('ArrowRight');
+    await expect(taskTypesTab).toHaveAttribute('aria-selected', 'true');
+
+    // Tab into panel; selected tab remains selected after focus enters controls
+    await taskTypesTab.press('Tab');
+    await expect(taskTypesTab).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('tabpanel')).toBeFocused();
+
+    // --- Successful host-backed update: Task Types ---
+    await page.locator('#tt-desc-0').fill('S04 integrated worker');
+    await expect(page.getByTestId('task-types-dirty')).toBeVisible();
+    await page.getByRole('button', { name: 'Save', exact: true }).click();
+    await expectPostedMessage(page, {
+      type: 'updateTaskTypes',
+      types: expect.arrayContaining([
+        expect.objectContaining({ id: 'worker', description: 'S04 integrated worker' }),
+      ]),
+    });
+    await postRawHostMessage(page, {
+      type: 'taskTypesSettingsUpdateResult',
+      result: { ok: true },
+    });
+    await postRawHostMessage(page, {
+      type: 'taskTypesSettingsSnapshot',
+      snapshot: taskTypesOkSnapshot({
+        status: 'ok',
+        types: [
+          {
+            id: 'worker',
+            backend: 'claude',
+            role: 'worker',
+            briefKind: 'generic',
+            description: 'S04 integrated worker',
+          },
+          {
+            id: 'coordinator',
+            backend: 'claude',
+            role: 'coordinator',
+            briefKind: 'generic',
+            description: 'S04 coordinator',
+          },
+        ],
+      }),
+    });
+    await expect(page.getByTestId('task-types-dirty')).toHaveCount(0);
+    await expect(page.getByTestId('task-types-saved')).toBeVisible();
+    await expect(page.getByRole('tab', { name: /Task Types/i })).toHaveAttribute('data-tab-state', 'saved');
+
+    // --- Successful host-backed update: Permissions ---
+    await page.getByRole('tab', { name: /Permissions/i }).click();
+    await page.getByTestId('permission-mode-option-readonly').click();
+    await expect(page.getByTestId('permissions-dirty')).toBeVisible();
+    await page.getByTestId('permissions-save').click();
+    await expectPostedMessage(page, { type: 'updatePermissionSettings', mode: 'readonly' });
+    await postRawHostMessage(page, {
+      type: 'permissionSettingsUpdateResult',
+      result: { ok: true, mode: 'readonly' },
+    });
+    await postRawHostMessage(page, {
+      type: 'permissionSettingsSnapshot',
+      snapshot: permissionSettingsSnapshot('readonly'),
+    });
+    await expect(page.getByTestId('permissions-dirty')).toHaveCount(0);
+    await expect(page.getByTestId('permissions-local-success')).toBeVisible();
+    await expect(page.locator('#permission-mode-readonly')).toBeChecked();
+
+    // --- Successful host-backed update: Retention ---
+    await page.getByRole('tab', { name: /Retention/i }).click();
+    const turns = page.getByRole('spinbutton', { name: 'Maximum turns per task', exact: true });
+    await turns.fill('180');
+    await page.getByRole('button', { name: 'Save Maximum turns per task' }).click();
+    await expectPostedMessage(page, {
+      type: 'updateSetting',
+      settingId: 'maxTurnsPerTask',
+      value: 180,
+    });
+    await postRawHostMessage(page, {
+      type: 'settingsUpdateResult',
+      result: { ok: true, settingId: 'maxTurnsPerTask', value: 180 },
+    });
+    await postRawHostMessage(page, {
+      type: 'settingsSnapshot',
+      snapshot: retentionSettingsSnapshot({ maxTurnsPerTask: 180, maxStoredOutputChars: 150000 }),
+    });
+    await expect(turns).toHaveValue('180');
+    await expect(page.getByTestId('retention-local-success')).toBeVisible();
+
+    // --- Cross-topic isolation: inject sanitized failure into Task Types; others unchanged ---
+    await page.getByRole('tab', { name: /Task Types/i }).click();
+    await page.locator('#tt-desc-0').fill('Should stay after failure');
+    await expect(page.getByTestId('task-types-dirty')).toBeVisible();
+    await page.getByRole('button', { name: 'Save', exact: true }).click();
+    await postRawHostMessage(page, {
+      type: 'taskTypesSettingsUpdateResult',
+      result: {
+        ok: false,
+        code: 'updateFailed',
+        message: 'Error: EPERM /secret/token=xyz stack',
+      },
+    });
+    // Failure path sanitizes / keeps draft
+    await expect(page.getByTestId('task-types-save-error')).toBeVisible();
+    await expect(page.locator('#tt-desc-0')).toHaveValue('Should stay after failure');
+    await expect(page.getByTestId('task-types-dirty')).toBeVisible();
+
+    // Permissions saved snapshot + indicators remain
+    await page.getByRole('tab', { name: /Permissions/i }).click();
+    await expect(page.locator('#permission-mode-readonly')).toBeChecked();
+    await expect(page.getByTestId('permissions-dirty')).toHaveCount(0);
+    await expect(page.getByTestId('permissions-local-error')).toHaveCount(0);
+
+    // Retention saved snapshot + indicators remain
+    await page.getByRole('tab', { name: /Retention/i }).click();
+    await expect(turns).toHaveValue('180');
+    await expect(page.getByTestId('retention-local-error')).toHaveCount(0);
+
+    // Dirty Task Types draft survives stale snapshot
+    await page.getByRole('tab', { name: /Task Types/i }).click();
+    await postRawHostMessage(page, {
+      type: 'taskTypesSettingsSnapshot',
+      snapshot: taskTypesOkSnapshot({
+        status: 'ok',
+        types: [
+          {
+            id: 'worker',
+            backend: 'claude',
+            role: 'worker',
+            briefKind: 'generic',
+            description: 'S04 integrated worker',
+          },
+          {
+            id: 'coordinator',
+            backend: 'claude',
+            role: 'coordinator',
+            briefKind: 'generic',
+            description: 'S04 coordinator',
+          },
+        ],
+      }),
+    });
+    await expect(page.locator('#tt-desc-0')).toHaveValue('Should stay after failure');
+    await expect(page.getByTestId('task-types-dirty')).toBeVisible();
+
+    // Explicit success clears dirty
+    await page.getByRole('button', { name: 'Save', exact: true }).click();
+    await postRawHostMessage(page, {
+      type: 'taskTypesSettingsUpdateResult',
+      result: { ok: true },
+    });
+    await postRawHostMessage(page, {
+      type: 'taskTypesSettingsSnapshot',
+      snapshot: taskTypesOkSnapshot({
+        status: 'ok',
+        types: [
+          {
+            id: 'worker',
+            backend: 'claude',
+            role: 'worker',
+            briefKind: 'generic',
+            description: 'Should stay after failure',
+          },
+          {
+            id: 'coordinator',
+            backend: 'claude',
+            role: 'coordinator',
+            briefKind: 'generic',
+            description: 'S04 coordinator',
+          },
+        ],
+      }),
+    });
+    await expect(page.getByTestId('task-types-dirty')).toHaveCount(0);
+
+    // --- Complete user loops re-run (Task Types already above; Permissions allow; Retention chars) ---
+    await page.getByRole('tab', { name: /Permissions/i }).click();
+    await page.getByTestId('permission-mode-option-allow').click();
+    await page.getByTestId('permissions-save').click();
+    await expectPostedMessage(page, { type: 'updatePermissionSettings', mode: 'allow' });
+    await postRawHostMessage(page, {
+      type: 'permissionSettingsUpdateResult',
+      result: { ok: true, mode: 'allow' },
+    });
+    await postRawHostMessage(page, {
+      type: 'permissionSettingsSnapshot',
+      snapshot: permissionSettingsSnapshot('allow'),
+    });
+    await expect(page.locator('#permission-mode-allow')).toBeChecked();
+
+    await page.getByRole('tab', { name: /Retention/i }).click();
+    const chars = page.getByRole('spinbutton', { name: 'Maximum stored output characters', exact: true });
+    await chars.fill('250000');
+    await page.getByRole('button', { name: 'Save Maximum stored output characters' }).click();
+    await expectPostedMessage(page, {
+      type: 'updateSetting',
+      settingId: 'maxStoredOutputChars',
+      value: 250000,
+    });
+    await postRawHostMessage(page, {
+      type: 'settingsUpdateResult',
+      result: { ok: true, settingId: 'maxStoredOutputChars', value: 250000 },
+    });
+    await postRawHostMessage(page, {
+      type: 'settingsSnapshot',
+      snapshot: retentionSettingsSnapshot({ maxTurnsPerTask: 180, maxStoredOutputChars: 250000 }),
+    });
+    await expect(chars).toHaveValue('250000');
+
+    // Dirty draft survives stale retention snapshot
+    await chars.fill('333333');
+    await postRawHostMessage(page, {
+      type: 'settingsSnapshot',
+      snapshot: retentionSettingsSnapshot({ maxTurnsPerTask: 180, maxStoredOutputChars: 999999 }),
+    });
+    await expect(chars).toHaveValue('333333');
+
+    // --- Capture/restore webview state across page recreation ---
+    await page.getByRole('tab', { name: /Models and CLIs/i }).click();
+    await expect(page.getByRole('tab', { name: /Models and CLIs/i })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+    // Leave a dirty retention draft before recreation
+    await page.getByRole('tab', { name: /Retention/i }).click();
+    await chars.fill('444444');
+
+    const captured = await page.evaluate(() => {
+      const api = window.acquireVsCodeApi();
+      return api.getState?.() ?? null;
+    });
+    expect(captured).toBeTruthy();
+
+    await openWebview(page, {
+      rootTasks: [task({ id: 'task-m012-s04', goal: 'Integrated settings acceptance', viewStatus: 'idle' })],
+      storeRevision: 41,
+      initialState: captured as never,
+    });
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await postRawHostMessage(page, {
+      type: 'settingsSnapshot',
+      snapshot: retentionSettingsSnapshot({ maxTurnsPerTask: 180, maxStoredOutputChars: 250000 }),
+    });
+    await postRawHostMessage(page, {
+      type: 'taskTypesSettingsSnapshot',
+      snapshot: taskTypesOkSnapshot({
+        status: 'ok',
+        types: [
+          {
+            id: 'worker',
+            backend: 'claude',
+            role: 'worker',
+            briefKind: 'generic',
+            description: 'Should stay after failure',
+          },
+          {
+            id: 'coordinator',
+            backend: 'claude',
+            role: 'coordinator',
+            briefKind: 'generic',
+            description: 'S04 coordinator',
+          },
+        ],
+      }),
+    });
+    await postRawHostMessage(page, {
+      type: 'permissionSettingsSnapshot',
+      snapshot: permissionSettingsSnapshot('allow'),
+    });
+
+    // Restored navigation + dirty retention draft
+    await expect(page.getByRole('tab', { name: /Retention/i })).toHaveAttribute('aria-selected', 'true');
+    await expect(
+      page.getByRole('spinbutton', { name: 'Maximum stored output characters', exact: true }),
+    ).toHaveValue('444444');
+
+    // --- 320px: containment, one-row tab overflow, keyboard, Coming soon no-op ---
+    await page.setViewportSize({ width: 320, height: 720 });
+    const tablistNarrow = page.getByRole('tablist', { name: 'Settings topics' });
+    await expect
+      .poll(async () =>
+        tablistNarrow.evaluate((el) => {
+          const style = window.getComputedStyle(el);
+          return {
+            wrap: style.flexWrap,
+            overflowX: style.overflowX,
+            singleRow: (el as HTMLElement).scrollHeight <= (el as HTMLElement).clientHeight + 8,
+            canScroll: (el as HTMLElement).scrollWidth > (el as HTMLElement).clientWidth,
+          };
+        }),
+      )
+      .toEqual(
+        expect.objectContaining({
+          wrap: 'nowrap',
+          overflowX: expect.stringMatching(/auto|scroll/),
+          singleRow: true,
+          canScroll: true,
+        }),
+      );
+
+    // Keyboard still reaches last tab
+    await page.getByRole('tab', { name: /Task Types/i }).focus();
+    await page.getByRole('tab', { name: /Task Types/i }).press('End');
+    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+    await expect(page.getByRole('tab', { name: /Context and MCP/i })).toBeFocused();
+
+    // Coming soon panels: zero mutation
+    const baseline = await postedMessages(page);
+    const baselineCount = baseline.length;
+    for (const name of [/Models and CLIs/i, /Context and MCP/i]) {
+      await page.getByRole('tab', { name }).click();
+      await expect(page.getByRole('status').filter({ hasText: 'Coming soon' })).toBeVisible();
+    }
+    const after = await postedMessages(page);
+    const mutationTypes = new Set([
+      'updateSetting',
+      'updateTaskTypes',
+      'updatePermissionSettings',
+      'requestSettings',
+      'requestTaskTypesSettings',
+      'requestPermissionSettings',
+      'listBackends',
+      'listModels',
+      'setComposerSelection',
+      'send',
+      'focusTask',
+    ]);
+    const extra = after
+      .slice(baselineCount)
+      .filter((message) => mutationTypes.has((message as { type?: string }).type ?? ''));
+    expect(extra).toEqual([]);
+
+    // Page containment at 320
+    await expect
+      .poll(async () =>
+        page.evaluate(() => {
+          const panel = document.querySelector('.settings-panel');
+          const body = document.querySelector('.settings-panel__body');
+          return {
+            panelOk: Boolean(
+              panel && (panel as HTMLElement).scrollWidth <= (panel as HTMLElement).clientWidth + 1,
+            ),
+            bodyOk: Boolean(
+              body && (body as HTMLElement).scrollWidth <= (body as HTMLElement).clientWidth + 1,
+            ),
+          };
+        }),
+      )
+      .toEqual({ panelOk: true, bodyOk: true });
+  });
+
+
 });
 
 declare global {

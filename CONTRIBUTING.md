@@ -127,6 +127,24 @@ Record each scenario in `docs/uat/m009-s03/task-export-live-host-evidence.md`:
 
 Validate the ledger with `npm run test:task-export-live-evidence` once the T04 verifier and ledger land; its errors identify the scenario or evidence rule that failed.
 
+## Settings verification and live-host evidence
+
+The assembled five-topic Settings shell (Task Types, Permissions, Retention, plus Coming soon Models and CLIs / Context and MCP) has distinct local and native proof classes. Before collecting live evidence, run:
+
+```bash
+npm run test:settings-docs
+npm run test:settings-live-evidence
+npm run test:settings-webview
+# Aggregate local acceptance (Vitest, compile, Svelte check, source/evidence, docs, ledger, webview)
+npm run test:settings-acceptance
+```
+
+Focused Playwright (`e2e/muster-webview-state.spec.ts` against the Vite webview with mocked VS Code APIs) proves browser-visible tab keyboard behavior, host-mocked save loops, draft isolation, Coming soon zero-mutation, and 320px reflow. Those results are **supportive only**. They do not prove live Extension Development Host configuration writes or native Settings UI outcomes, and they must never be promoted to live proof.
+
+Next, press **F5** to launch the actual VS Code **Extension Development Host**. Attempt the nine ledger scenarios in `docs/uat/m012-s04/settings-live-host-evidence.md` (tab keyboard focus, Task Types / Permissions / Retention persistence, pending-permission isolation, hide/reveal restore, 320px reflow, Coming soon no-op, and final cleanup).
+
+Record each scenario with exactly one `PASS`, `FAIL`, or `ENVIRONMENT BLOCKED` verdict, a UTC timestamp, expected and observed results, bounded evidence, blocker detail, and cleanup. Use `ENVIRONMENT BLOCKED` only after naming the attempted step and concrete unavailable control. Never promote unit or Playwright results to live proof, and never record absolute paths, workspace identity, secrets, raw config dumps, or task-store data. Validate the ledger with `npm run test:settings-live-evidence`. A valid ENVIRONMENT BLOCKED ledger records blocked host attempts; local CI still only covers docs, ledger shape, and browser webview gates.
+
 ## Queue and interrupt-and-send verification
 
 Multi-queued FIFO follow-ups and Ctrl+Enter interrupt & send are documented in

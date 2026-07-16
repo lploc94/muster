@@ -40,6 +40,18 @@ describe('parseTaskTypeRegistry', () => {
     }
   });
 
+  it('empty is distinct from invalid (fail-closed create/delegate path)', () => {
+    const empty = parseTaskTypeRegistry({});
+    const invalid = parseTaskTypeRegistry({ plan: { backend: 123 } });
+    expect(empty.status).toBe('empty');
+    expect(invalid.status).toBe('invalid');
+    expect(empty.diagnostics).toEqual([]);
+    expect(invalid.diagnostics.length).toBeGreaterThan(0);
+    // Both yield empty registry — callers must branch on status, not size alone.
+    expect(empty.registry.size).toBe(0);
+    expect(invalid.registry.size).toBe(0);
+  });
+
   it('parses a valid registry as ok', () => {
     const r = parseTaskTypeRegistry(sampleRaw);
     expect(r.status).toBe('ok');
