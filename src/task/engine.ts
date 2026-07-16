@@ -871,6 +871,8 @@ export class TaskEngine {
     const credentials = this.credentialRegistry ?? new CredentialRegistry();
     return {
       store: this.store as TaskStore,
+      repository: this.repository,
+      workspaceId: this.workspaceId,
       makeBackend: this.makeBackend,
       credentials,
       askBridge: this.askBridge,

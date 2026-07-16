@@ -75,7 +75,10 @@ function handle(req: DbRequest): DbResponse {
         const results: RunResult[] = [];
         for (const stmt of req.statements) {
           results.push(runStatement(stmt.sql, stmt.params));
-          if (req.abortIfFirstUnchanged && results.length === 1 && results[0]?.changes === 0) {
+          const shouldAbort =
+            (req.abortIfFirstUnchanged && results.length === 1 && results[0]?.changes === 0) ||
+            (req.abortIfUnchangedAt?.includes(results.length - 1) && results.at(-1)?.changes === 0);
+          if (shouldAbort) {
             conn.exec('ROLLBACK');
             return { kind: 'transaction', requestId: req.requestId, results };
           }

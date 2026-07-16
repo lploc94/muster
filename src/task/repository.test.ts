@@ -91,6 +91,58 @@ describe('JsonTaskRepository', () => {
 });
 
 describe('SqliteTaskRepository', () => {
+  it('applies graph create atomically with operation replay/conflict parity', async () => {
+    const jsonPath = `/tmp/muster-repository-graph-${Date.now()}-${Math.random()}.json`;
+    const jsonStore = TaskStore.load({ filePath: jsonPath });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-graph-sqlite-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      await client.run(
+        `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at) VALUES (?,?,?,?,?)`,
+        ['ws', 'graph-identity', 'Graph', 'now', 'now'],
+      );
+      for (const repository of [
+        new JsonTaskRepository(jsonStore, 'ws'),
+        new SqliteTaskRepository(client, 'ws'),
+      ]) {
+        const root = makeTask(`graph-root-${Math.random()}`);
+        await repository.execute({ kind: 'createTask', workspaceId: 'ws', task: root });
+        const child = { ...makeTask(`${root.id}-child`), parentId: root.id, revision: 0 };
+        const message = {
+          id: `${child.id}-message`, taskId: child.id, role: 'user' as const,
+          content: 'run', state: 'assigned' as const, turnId: `${child.id}-turn`,
+          createdAt: '2026-07-16T00:00:01.000Z',
+        };
+        const turn = {
+          id: `${child.id}-turn`, taskId: child.id, sequence: 1, status: 'queued' as const,
+          trigger: 'engine' as const, inputs: [{ kind: 'message' as const, messageId: message.id }],
+          createdAt: '2026-07-16T00:00:01.000Z',
+        };
+        const operation = { ledgerKey: `${root.id}:graph-op`, entry: {
+          fingerprint: 'graph-fingerprint', result: { ok: true, data: { taskId: child.id, turnId: turn.id } },
+        }, createdAt: '2026-07-16T00:00:01.000Z' };
+        const command = {
+          kind: 'applyGraphMutation' as const, workspaceId: 'ws', expectedTasks: [{ id: root.id, revision: root.revision }],
+          insertTaskIds: [child.id], tasks: [child], insertTurnIds: [turn.id], turns: [turn],
+          insertMessageIds: [message.id], messages: [message], operation,
+        };
+        await expect(repository.execute(command)).resolves.toMatchObject({ changed: true, operation: operation.entry });
+        await expect(repository.getTask(child.id)).resolves.toMatchObject({ parentId: root.id });
+        await expect(repository.getTurn(turn.id)).resolves.toMatchObject({ taskId: child.id });
+        await expect(repository.execute(command)).resolves.toMatchObject({ changed: false, operation: operation.entry });
+        await expect(repository.execute({ ...command, operation: { ...operation, entry: { ...operation.entry, fingerprint: 'different' } } })).resolves.toMatchObject({ conflict: true });
+        const badChild = { ...makeTask(`${root.id}-bad`), parentId: root.id, dependencies: [{ taskId: 'missing', requiredOutcome: 'succeeded' as const, onUnsatisfied: 'fail' as const }] };
+        await expect(repository.execute({ ...command, operation: { ...operation, ledgerKey: `${root.id}:bad`, entry: { ...operation.entry, fingerprint: 'bad' } }, insertTaskIds: [badChild.id], tasks: [badChild], insertTurnIds: [], turns: [], insertMessageIds: [], messages: [] })).resolves.toMatchObject({ changed: false });
+        await expect(repository.getTask(badChild.id)).resolves.toBeUndefined();
+      }
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+      try { fs.unlinkSync(jsonPath); } catch { /* test cleanup */ }
+    }
+  }, 20_000);
+
   it('keeps host history commands atomic and parity-compatible across adapters', async () => {
     const jsonPath = `/tmp/muster-repository-history-${Date.now()}-${Math.random()}.json`;
     const jsonStore = TaskStore.load({ filePath: jsonPath });

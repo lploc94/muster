@@ -47,6 +47,7 @@ export const ACP_DEADLINE_BUFFER_MS = 90_000;
 import { evaluateTaskReadiness } from './readiness';
 import { canPromoteTurn } from './scheduler';
 import type { TaskStore } from './store';
+import type { RepositoryCommand, TaskRepository } from './repository';
 import {
   createTask,
   cancelPendingTurn,
@@ -259,6 +260,9 @@ const DEFAULT_COORDINATOR_CHILD_CAPS: TaskCapability[] = [
 ];
 export interface GraphEngineDeps {
   store: TaskStore;
+  /** Writable domain boundary; graph mutations never call store.commit(). */
+  repository: TaskRepository;
+  workspaceId: string;
   makeBackend: (name: string) => Backend;
   credentials: CredentialRegistry;
   askBridge: AskBridge;
@@ -324,6 +328,86 @@ function writeLedger(
 ): void {
   ensureCoordinationMaps(draft);
   draft.operations![opLedgerKey(turnId, opId)] = { fingerprint, result };
+}
+
+type GraphApplyResult =
+  | { ok: true; [key: string]: unknown }
+  | { ok: false; reason: string };
+
+function equalGraphValue(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/**
+ * Run a graph transition against an isolated projection and publish only the
+ * rows that changed through the named repository command.  This keeps the
+ * existing transition helpers synchronous/pure while making the durable write
+ * atomic for both JSON compatibility and SQLite production adapters.
+ */
+async function executeGraphMutation(
+  deps: GraphEngineDeps,
+  mutate: (draft: TaskStoreFile) => GraphApplyResult,
+): Promise<{ ok: true; result?: GraphApplyResult } | { ok: false; error: string }> {
+  const before = structuredClone(deps.store.getFile()) as TaskStoreFile;
+  const draft = structuredClone(before) as TaskStoreFile;
+  const applied = mutate(draft);
+  if (!applied.ok) return { ok: false, error: applied.reason };
+
+  const changedTasks = Object.values(draft.tasks).filter((task) => !equalGraphValue(task, before.tasks[task.id]));
+  const changedTurns = Object.values(draft.turns).filter((turn) => !equalGraphValue(turn, before.turns[turn.id]));
+  const changedMessages = Object.values(draft.messages).filter((message) => !equalGraphValue(message, before.messages[message.id]));
+  const deletedTaskIds = Object.keys(before.tasks).filter((id) => !draft.tasks[id]);
+  const deletedTurnIds = Object.keys(before.turns).filter((id) => !draft.turns[id]);
+  const deletedMessageIds = Object.keys(before.messages).filter((id) => !draft.messages[id]);
+  const changedCancelRequests = Object.entries(draft.cancelRequests ?? {})
+    .filter(([id, request]) => !equalGraphValue(request, before.cancelRequests?.[id]))
+    .map(([turnId, request]) => ({ turnId, request }));
+  const deletedCancelRequestTurnIds = Object.keys(before.cancelRequests ?? {})
+    .filter((id) => !draft.cancelRequests?.[id]);
+  const deletedRuntimeClaimTurnIds = Object.keys(before.runtimeClaims ?? {})
+    .filter((id) => !draft.runtimeClaims?.[id]);
+  const changedOperations = Object.entries(draft.operations ?? {})
+    .filter(([key, entry]) => !equalGraphValue(entry, before.operations?.[key]));
+  const deletedOperationKeys = Object.keys(before.operations ?? {})
+    .filter((key) => !draft.operations?.[key]);
+
+  // A graph operation writes at most one ledger entry. More than one indicates
+  // a transition bug; fail closed rather than silently dropping a result.
+  if (changedOperations.length > 1 || deletedOperationKeys.length > 0) {
+    return { ok: false, error: 'graph mutation produced an unsupported operation delta' };
+  }
+  const operation = changedOperations[0]
+    ? { ledgerKey: changedOperations[0][0], entry: changedOperations[0][1], createdAt: nowIso(deps.clock) }
+    : undefined;
+  const expectedTasks = changedTasks
+    .filter((task) => before.tasks[task.id] !== undefined)
+    .map((task) => ({ id: task.id, revision: before.tasks[task.id]!.revision }));
+  const expectedTurns = changedTurns
+    .filter((turn) => before.turns[turn.id] !== undefined)
+    .map((turn) => ({ id: turn.id, status: before.turns[turn.id]!.status, runtimeEpoch: before.turns[turn.id]!.runtimeEpoch }));
+  const command: RepositoryCommand = {
+    kind: 'applyGraphMutation',
+    workspaceId: deps.workspaceId,
+    expectedTasks,
+    ...(expectedTurns.length > 0 ? { expectedTurns } : {}),
+    insertTaskIds: changedTasks.filter((task) => before.tasks[task.id] === undefined).map((task) => task.id),
+    tasks: changedTasks,
+    insertTurnIds: changedTurns.filter((turn) => before.turns[turn.id] === undefined).map((turn) => turn.id),
+    turns: changedTurns,
+    insertMessageIds: changedMessages.filter((message) => before.messages[message.id] === undefined).map((message) => message.id),
+    messages: changedMessages,
+    ...(deletedTaskIds.length > 0 ? { deleteTaskIds: deletedTaskIds } : {}),
+    ...(deletedTurnIds.length > 0 ? { deleteTurnIds: deletedTurnIds } : {}),
+    ...(deletedMessageIds.length > 0 ? { deleteMessageIds: deletedMessageIds } : {}),
+    ...(operation ? { operation } : {}),
+    ...(changedCancelRequests.length > 0 ? { cancelRequests: changedCancelRequests } : {}),
+    ...(deletedCancelRequestTurnIds.length > 0 ? { deleteCancelRequestTurnIds: deletedCancelRequestTurnIds } : {}),
+    ...(deletedRuntimeClaimTurnIds.length > 0 ? { deleteRuntimeClaimTurnIds: deletedRuntimeClaimTurnIds } : {}),
+  };
+  const persisted = await deps.repository.execute(command);
+  if (persisted.conflict) return { ok: false, error: persisted.reason ?? 'opId conflict: different arguments' };
+  if (persisted.changed === false && persisted.reason) return { ok: false, error: persisted.reason };
+  return { ok: true, result: applied };
 }
 
 export function pruneLedgerForTurn(draft: TaskStoreFile, turnId: string): void {
@@ -577,7 +661,7 @@ export async function executeToolCommand(
       const resolvedTaskType = resolved.resolved.taskType;
       const resolvedBriefKind = resolved.resolved.briefKind;
 
-      const commit = deps.store.commit((draft) => {
+      const commit = await executeGraphMutation(deps, (draft) => {
         ensureCoordinationMaps(draft);
         const caller = draft.tasks[ctx.callerTaskId];
         if (!caller || caller.lifecycle !== 'open') {
@@ -707,6 +791,15 @@ export async function executeToolCommand(
           waitMetadata = waitStaged;
         }
 
+        // Child creation is also an ownership/limit fence. Bump the caller
+        // revision in the same graph transaction so concurrent coordinators
+        // cannot both pass the child-count check from one stale snapshot.
+        draft.tasks[ctx.callerTaskId] = {
+          ...draft.tasks[ctx.callerTaskId]!,
+          revision: draft.tasks[ctx.callerTaskId]!.revision + 1,
+          updatedAt: now,
+        };
+
         const childPolicy = draft.tasks[childId]!.executionPolicy;
         const result: OpResult = {
           ok: true,
@@ -745,7 +838,7 @@ export async function executeToolCommand(
       });
 
       if (!commit.ok) {
-        return { ok: false, error: commit.detail ?? commit.reason };
+        return { ok: false, error: commit.error };
       }
 
       if (command.kind === 'delegate_task') {
@@ -818,7 +911,7 @@ export async function executeToolCommand(
       const orderedTaskIds = command.specs.map((s) => idByLocal.get(s.localId)!);
       const orderedTurnIds = command.specs.map((s) => turnIdByLocal.get(s.localId)!);
 
-      const commit = deps.store.commit((draft) => {
+      const commit = await executeGraphMutation(deps, (draft) => {
         ensureCoordinationMaps(draft);
         // Idempotent replay: a cached ledger for this (turn, opId) short-circuits
         // before any caller/config check or write. Compare the fingerprint so a reused
@@ -1079,6 +1172,14 @@ export async function executeToolCommand(
           waitMetadata = waitStaged;
         }
 
+        // Serialize ownership and per-parent/root limits with the caller task
+        // revision; this is part of the same mutation as every child row.
+        draft.tasks[ctx.callerTaskId] = {
+          ...draft.tasks[ctx.callerTaskId]!,
+          revision: draft.tasks[ctx.callerTaskId]!.revision + 1,
+          updatedAt: now,
+        };
+
         const hostRunLimitMs = deps.getRunLimitMs?.() ?? DEFAULT_RUN_LIMIT_MS;
         const result: OpResult = {
           ok: true,
@@ -1114,7 +1215,7 @@ export async function executeToolCommand(
       });
 
       if (!commit.ok) {
-        return { ok: false, error: commit.detail ?? commit.reason };
+        return { ok: false, error: commit.error };
       }
 
       const batchLedger = deps.store.getFile().operations?.[opLedgerKey(ctx.turnId, command.opId)];

@@ -60,6 +60,9 @@ export type DbRequest =
        * optimistic guards without a race or partial aggregate write.
        */
       abortIfFirstUnchanged?: boolean;
+      /** Additional statement indexes whose zero-change result aborts the
+       * transaction. Used when an operation claim precedes a revision fence. */
+      abortIfUnchangedAt?: number[];
     }
   | { kind: 'pragma'; requestId: number; pragma: string }
   | { kind: 'close'; requestId: number };

@@ -63,7 +63,37 @@ export interface RepositoryWorkspaceLocation {
   lastSeenAt: string;
 }
 
+/**
+ * A bounded graph mutation.  Graph tools prepare their transition against a
+ * read projection, then submit only the rows they created/changed.  The
+ * repository re-checks every expected revision and applies the complete graph
+ * plus its operation ledger in one transaction on both adapters.
+ */
+export interface GraphMutationCommand {
+  kind: 'applyGraphMutation';
+  workspaceId: string;
+  /** Existing task revisions that must still match before the mutation. */
+  expectedTasks: readonly { id: string; revision: number }[];
+  /** Existing live-turn fences (status/runtime epoch) required by the mutation. */
+  expectedTurns?: readonly { id: string; status: TurnStatus; runtimeEpoch?: number }[];
+  /** Rows that must be inserted; all other supplied rows are revision-fenced upserts. */
+  insertTaskIds?: readonly string[];
+  tasks: readonly MusterTask[];
+  insertTurnIds?: readonly string[];
+  turns: readonly TaskTurn[];
+  insertMessageIds?: readonly string[];
+  messages?: readonly TaskMessage[];
+  deleteTaskIds?: readonly string[];
+  deleteTurnIds?: readonly string[];
+  deleteMessageIds?: readonly string[];
+  operation?: { ledgerKey: string; entry: OperationLedgerEntry; createdAt: string };
+  cancelRequests?: readonly { turnId: string; request: CancelRequest }[];
+  deleteCancelRequestTurnIds?: readonly string[];
+  deleteRuntimeClaimTurnIds?: readonly string[];
+}
+
 export type RepositoryCommand =
+  | GraphMutationCommand
   | {
       kind: 'upsertWorkspace'; workspaceId: string; identityKey: string;
       displayName: string; createdAt: string; lastOpenedAt: string;
@@ -447,6 +477,61 @@ function validateAggregateTaskChanges(
   return undefined;
 }
 
+function validateGraphMutation(command: GraphMutationCommand): string | undefined {
+  const taskIds = new Set(command.tasks.map((task) => task.id));
+  const turnIds = new Set(command.turns.map((turn) => turn.id));
+  const messageIds = new Set((command.messages ?? []).map((message) => message.id));
+  if (taskIds.size !== command.tasks.length) return 'graph mutation contains duplicate tasks';
+  if (turnIds.size !== command.turns.length) return 'graph mutation contains duplicate turns';
+  if (messageIds.size !== (command.messages ?? []).length) return 'graph mutation contains duplicate messages';
+  const insertTasks = new Set(command.insertTaskIds ?? []);
+  const insertTurns = new Set(command.insertTurnIds ?? []);
+  const insertMessages = new Set(command.insertMessageIds ?? []);
+  for (const id of insertTasks) if (!taskIds.has(id)) return `graph insert task missing row: ${id}`;
+  for (const id of insertTurns) if (!turnIds.has(id)) return `graph insert turn missing row: ${id}`;
+  for (const id of insertMessages) if (!messageIds.has(id)) return `graph insert message missing row: ${id}`;
+  const expected = new Set(command.expectedTasks.map((entry) => entry.id));
+  if (expected.size !== command.expectedTasks.length) return 'graph mutation contains duplicate task fences';
+  const expectedTurns = new Set((command.expectedTurns ?? []).map((entry) => entry.id));
+  if (expectedTurns.size !== (command.expectedTurns ?? []).length) return 'graph mutation contains duplicate turn fences';
+  for (const task of command.tasks) {
+    if (task.parentId === task.id) return 'graph task cannot parent itself';
+    if (task.parentId && !taskIds.has(task.parentId)) {
+      // Existing parents need not be part of the bounded write set; the adapter
+      // checks the FK/query fence before applying the row.
+    }
+    for (const dependency of task.dependencies) {
+      if (dependency.taskId === task.id) return 'graph task cannot depend on itself';
+    }
+  }
+  for (const turn of command.turns) {
+    for (const input of turn.inputs) {
+      if (input.kind === 'message' && !messageIds.has(input.messageId)) {
+        // A pre-existing message is valid; the adapter verifies it belongs to
+        // the same task when the row is present.
+      }
+    }
+  }
+  for (const message of command.messages ?? []) {
+    if (message.turnId && !turnIds.has(message.turnId)) {
+      // Existing turn references are valid for an upsert; SQLite FK enforces it.
+    }
+  }
+  if (command.operation && command.operation.ledgerKey.length === 0) return 'graph operation key is empty';
+  return undefined;
+}
+
+function graphOperationConflict(
+  existing: OperationLedgerEntry | undefined,
+  command: GraphMutationCommand,
+): RepositoryCommandResult | undefined {
+  if (!existing || !command.operation) return undefined;
+  if (existing.fingerprint !== command.operation.entry.fingerprint) {
+    return { ok: true, changed: false, reason: 'opId conflict: different arguments', conflict: true, operation: existing };
+  }
+  return { ok: true, changed: false, operation: existing };
+}
+
 function validatePrepareDispatch(
   command: Extract<RepositoryCommand, { kind: 'prepareDispatch' }>,
 ): string | undefined {
@@ -759,6 +844,135 @@ export class JsonTaskRepository implements TaskRepository {
     let deletedMessageIds: string[] | undefined;
     const result = this.store.commit((draft) => {
       switch (command.kind) {
+        case 'applyGraphMutation': {
+          const invalid = validateGraphMutation(command);
+          if (invalid) return { ok: false, reason: invalid };
+          const prior = command.operation
+            ? draft.operations?.[command.operation.ledgerKey]
+            : undefined;
+          if (prior) {
+            if (prior.fingerprint !== command.operation!.entry.fingerprint) {
+              return { ok: false, reason: '__graph_conflict__' };
+            }
+            return { ok: false, reason: '__graph_replay__' };
+          }
+          for (const expected of command.expectedTasks) {
+            const current = draft.tasks[expected.id];
+            if (!current || current.revision !== expected.revision) {
+              return { ok: false, reason: 'task changed; retry' };
+            }
+          }
+          for (const expected of command.expectedTurns ?? []) {
+            const current = draft.turns[expected.id];
+            if (!current || current.status !== expected.status ||
+              (expected.runtimeEpoch !== undefined && (current.runtimeEpoch ?? 1) !== expected.runtimeEpoch)) {
+              return { ok: false, reason: 'turn changed; retry' };
+            }
+          }
+          const insertTasks = new Set(command.insertTaskIds ?? []);
+          const insertTurns = new Set(command.insertTurnIds ?? []);
+          const insertMessages = new Set(command.insertMessageIds ?? []);
+          for (const task of command.tasks) {
+            const current = draft.tasks[task.id];
+            if (insertTasks.has(task.id)) {
+              if (current) return { ok: false, reason: 'task already exists' };
+            } else if (!current) {
+              return { ok: false, reason: 'task not found' };
+            }
+          }
+          for (const turn of command.turns) {
+            const current = draft.turns[turn.id];
+            if (insertTurns.has(turn.id)) {
+              if (current) return { ok: false, reason: 'turn already exists' };
+            } else if (!current) {
+              return { ok: false, reason: 'turn not found' };
+            }
+          }
+          for (const message of command.messages ?? []) {
+            const current = draft.messages[message.id];
+            if (insertMessages.has(message.id)) {
+              if (current) return { ok: false, reason: 'message already exists' };
+            } else if (!current) {
+              return { ok: false, reason: 'message not found' };
+            }
+          }
+          // Deletions happen first so a mutation can atomically remove a queued
+          // row and replace it with its continuation under one operation.
+          for (const messageId of command.deleteMessageIds ?? []) {
+            if (draft.messages[messageId]) {
+              delete draft.messages[messageId];
+              changed = true;
+            }
+          }
+          for (const turnId of command.deleteTurnIds ?? []) {
+            if (draft.turns[turnId]) {
+              delete draft.turns[turnId];
+              for (const messageId of Object.keys(draft.messages)) {
+                if (draft.messages[messageId]?.turnId === turnId) delete draft.messages[messageId];
+              }
+              delete draft.cancelRequests?.[turnId];
+              delete draft.runtimeClaims?.[turnId];
+              changed = true;
+            }
+          }
+          for (const taskId of command.deleteTaskIds ?? []) {
+            if (draft.tasks[taskId]) {
+              deleteTaskIdsFromFile(draft, [taskId]);
+              changed = true;
+            }
+          }
+          for (const task of command.tasks) {
+            draft.tasks[task.id] = clone(task);
+            changed = true;
+          }
+          for (const turn of command.turns) {
+            draft.turns[turn.id] = clone(turn);
+            changed = true;
+          }
+          for (const message of command.messages ?? []) {
+            draft.messages[message.id] = clone(message);
+            changed = true;
+          }
+          for (const entry of command.cancelRequests ?? []) {
+            draft.cancelRequests = draft.cancelRequests ?? {};
+            draft.cancelRequests[entry.turnId] = clone(entry.request);
+            changed = true;
+          }
+          for (const turnId of command.deleteCancelRequestTurnIds ?? []) {
+            if (draft.cancelRequests?.[turnId]) {
+              delete draft.cancelRequests[turnId];
+              changed = true;
+            }
+          }
+          for (const turnId of command.deleteRuntimeClaimTurnIds ?? []) {
+            if (draft.runtimeClaims?.[turnId]) {
+              delete draft.runtimeClaims[turnId];
+              changed = true;
+            }
+          }
+          // Validate references against the post-mutation graph before the JSON
+          // adapter publishes it; SQLite gets the same protection from FKs.
+          for (const task of command.tasks) {
+            if (task.parentId && !draft.tasks[task.parentId]) return { ok: false, reason: 'parent task not found' };
+            for (const dependency of task.dependencies) {
+              if (!draft.tasks[dependency.taskId]) return { ok: false, reason: 'dependency task not found' };
+            }
+          }
+          for (const turn of command.turns) {
+            if (!draft.tasks[turn.taskId]) return { ok: false, reason: 'turn task not found' };
+            for (const input of turn.inputs) {
+              if (input.kind === 'message' && !draft.messages[input.messageId]) {
+                return { ok: false, reason: 'turn message input not found' };
+              }
+            }
+          }
+          if (command.operation) {
+            draft.operations = draft.operations ?? {};
+            draft.operations![command.operation.ledgerKey] = clone(command.operation.entry);
+            changed = true;
+          }
+          return { ok: true };
+        }
         case 'upsertWorkspace':
         case 'recordWorkspaceLocation':
           // A legacy JSON file is intrinsically scoped to its one workspace.
@@ -1518,6 +1732,15 @@ export class JsonTaskRepository implements TaskRepository {
     });
     if (!result.ok) {
       if (result.reason === 'rejected') {
+        if (command.kind === 'applyGraphMutation' &&
+          (result.detail === '__graph_replay__' || result.detail === '__graph_conflict__')) {
+          const operation = command.operation
+            ? this.store.getFile().operations?.[command.operation.ledgerKey]
+            : undefined;
+          return result.detail === '__graph_replay__'
+            ? { ok: true, changed: false, ...(operation ? { operation } : {}) }
+            : { ok: true, changed: false, reason: 'opId conflict: different arguments', conflict: true, ...(operation ? { operation } : {}) };
+        }
         return {
           ok: true,
           changed: false,
@@ -1530,6 +1753,9 @@ export class JsonTaskRepository implements TaskRepository {
     return {
       ok: true,
       changed,
+      ...(command.kind === 'applyGraphMutation' && command.operation
+        ? { operation: command.operation.entry }
+        : {}),
       ...(command.kind === 'claimOperation' && operation ? { operation } : {}),
       ...(messageId ? { messageId } : {}),
       ...(deletedMessageIds ? { deletedMessageIds } : {}),
@@ -1868,6 +2094,149 @@ export class SqliteTaskRepository implements TaskRepository {
     };
   }
 
+  private async applyGraphMutation(
+    command: GraphMutationCommand,
+  ): Promise<RepositoryCommandResult> {
+    const invalid = validateGraphMutation(command);
+    if (invalid) return { ok: true, changed: false, reason: invalid };
+
+    const statements: SqlStatement[] = [];
+    const abortIfUnchangedAt: number[] = [];
+    const changes: ChangeRecord[] = [];
+    const insertTasks = new Set(command.insertTaskIds ?? []);
+    const insertTurns = new Set(command.insertTurnIds ?? []);
+    const insertMessages = new Set(command.insertMessageIds ?? []);
+
+    if (command.operation) {
+      statements.push(graphOperationClaimStatement(this.workspaceId, command.operation));
+      abortIfUnchangedAt.push(0);
+    }
+    if (command.expectedTasks.length > 0) {
+      const index = statements.length;
+      statements.push(taskRevisionGuardStatement(this.workspaceId, command.expectedTasks));
+      abortIfUnchangedAt.push(index);
+    } else if (command.expectedTurns && command.expectedTurns.length > 0) {
+      const index = statements.length;
+      statements.push(graphTurnFenceStatement(this.workspaceId, command.expectedTurns));
+      abortIfUnchangedAt.push(index);
+    }
+
+    // Delete dependent rows before parent rows. Foreign-key cascades handle
+    // turn-bound artifacts, while explicit message deletes cover turn-less
+    // user messages.
+    for (const messageId of command.deleteMessageIds ?? []) {
+      statements.push({
+        sql: 'DELETE FROM messages WHERE workspace_id = ? AND id = ?',
+        params: [this.workspaceId, messageId],
+      });
+      changes.push({ kind: 'message', id: messageId, change: 'delete' });
+    }
+    for (const turnId of command.deleteTurnIds ?? []) {
+      statements.push({
+        sql: 'DELETE FROM turns WHERE workspace_id = ? AND id = ?',
+        params: [this.workspaceId, turnId],
+      });
+      changes.push({ kind: 'turn', id: turnId, change: 'delete' });
+    }
+    for (const taskId of command.deleteTaskIds ?? []) {
+      statements.push({
+        sql: 'DELETE FROM tasks WHERE workspace_id = ? AND id = ?',
+        params: [this.workspaceId, taskId],
+      });
+      changes.push({ kind: 'task', id: taskId, change: 'delete' });
+    }
+
+    // Insert/update task rows first, then dependencies. This allows sibling
+    // dependencies in one batch to reference a task inserted later in the
+    // caller's deterministic list.
+    for (const task of command.tasks) {
+      statements.push(taskStatement(this.workspaceId, task, !insertTasks.has(task.id)));
+      changes.push({ kind: 'task', id: task.id, change: insertTasks.has(task.id) ? 'insert' : 'update' });
+    }
+    for (const task of command.tasks) {
+      statements.push({ sql: 'DELETE FROM task_dependencies WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, task.id] });
+      for (const dependency of task.dependencies) {
+        statements.push(dependencyStatement(this.workspaceId, task.id, dependency));
+      }
+    }
+
+    // Turns precede message rows because messages may carry a turn FK; inputs
+    // are inserted after the turn row and before messages.
+    for (const turn of command.turns) {
+      statements.push(turnStatement(this.workspaceId, turn, !insertTurns.has(turn.id)));
+      changes.push({ kind: 'turn', id: turn.id, taskId: turn.taskId, change: insertTurns.has(turn.id) ? 'insert' : 'update' });
+    }
+    for (const turn of command.turns) {
+      statements.push({ sql: 'DELETE FROM turn_inputs WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, turn.id] });
+      for (const input of turn.inputs) {
+        statements.push(turnInputStatement(this.workspaceId, turn.id, turn.inputs.indexOf(input), input));
+      }
+    }
+    for (const message of command.messages ?? []) {
+      statements.push(messageStatement(this.workspaceId, message, !insertMessages.has(message.id)));
+      changes.push({ kind: 'message', id: message.id, taskId: message.taskId, change: insertMessages.has(message.id) ? 'insert' : 'update' });
+    }
+    for (const entry of command.cancelRequests ?? []) {
+      statements.push(cancelRequestStatement(this.workspaceId, { kind: 'putCancelRequest', workspaceId: this.workspaceId, turnId: entry.turnId, request: entry.request }));
+      changes.push({ kind: 'cancel_request', id: entry.turnId, change: 'upsert' });
+    }
+    for (const turnId of command.deleteCancelRequestTurnIds ?? []) {
+      statements.push({ sql: 'DELETE FROM turn_cancel_requests WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, turnId] });
+      changes.push({ kind: 'cancel_request', id: turnId, change: 'delete' });
+    }
+    for (const turnId of command.deleteRuntimeClaimTurnIds ?? []) {
+      statements.push({ sql: 'DELETE FROM runtime_claims WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, turnId] });
+      changes.push({ kind: 'runtime_claim', id: turnId, change: 'delete' });
+    }
+    if (command.operation) {
+      changes.push({ kind: 'operation', id: command.operation.ledgerKey, change: 'insert' });
+    }
+
+    // A graph mutation with no row work is a valid replay/no-op but must not
+    // manufacture a workspace revision. Operation claims still make it safe to
+    // return the prior result under contention.
+    const uniqueChanges = [...new Map(changes.map((entry) => [`${entry.kind}:${entry.id}`, entry])).values()];
+    const at = command.operation?.createdAt ?? command.tasks[0]?.updatedAt ?? new Date().toISOString();
+    if (uniqueChanges.length > 0) {
+      statements.push(...revisionStatements(this.workspaceId, uniqueChanges, at));
+    }
+
+    let results: readonly import('./sqlite/rpc').RunResult[];
+    try {
+      results = await this.db.transaction(statements, {
+        abortIfUnchangedAt: abortIfUnchangedAt.length > 0 ? abortIfUnchangedAt : undefined,
+      });
+    } catch (error) {
+      // Do not leak SQL/row payloads through the repository boundary. The
+      // caller can retry a stale graph or surface a stable validation reason.
+      const message = error instanceof Error ? error.message : String(error);
+      if (/constraint|unique|foreign key/i.test(message)) {
+        return { ok: true, changed: false, reason: 'graph mutation rejected' };
+      }
+      throw error;
+    }
+
+    if (command.operation && results[0]?.changes === 0) {
+      const existing = await this.getOperation(command.operation.ledgerKey);
+      if (existing && existing.fingerprint === command.operation.entry.fingerprint) {
+        return { ok: true, changed: false, operation: existing };
+      }
+      if (existing) {
+        return { ok: true, changed: false, reason: 'opId conflict: different arguments', conflict: true, operation: existing };
+      }
+      return { ok: true, changed: false, reason: 'task changed; retry' };
+    }
+    const guardIndex = command.operation ? 1 : 0;
+    if (command.expectedTasks.length > 0 && results[guardIndex]?.changes === 0) {
+      return { ok: true, changed: false, reason: 'task changed; retry' };
+    }
+    return {
+      ok: true,
+      changed: uniqueChanges.length > 0,
+      ...(command.operation ? { operation: command.operation.entry } : {}),
+    };
+  }
+
   /**
    * Delete one or all top-level roots only when every task in each candidate
    * subtree is currently removable. The recursive CTE and the live/queued/
@@ -2018,6 +2387,8 @@ export class SqliteTaskRepository implements TaskRepository {
   async execute(command: RepositoryCommand): Promise<RepositoryCommandResult> {
     if (command.workspaceId !== this.workspaceId) throw new Error('repository workspace mismatch');
     switch (command.kind) {
+      case 'applyGraphMutation':
+        return this.applyGraphMutation(command);
       case 'upsertWorkspace': {
         await this.write([workspaceStatement(command)], [{ kind: 'workspace', id: command.workspaceId, change: 'upsert' }], command.lastOpenedAt);
         return { ok: true, changed: true };
@@ -3514,6 +3885,40 @@ function operationStatement(workspaceId: string, command: Extract<RepositoryComm
           fingerprint=excluded.fingerprint, result_json=excluded.result_json, created_at=excluded.created_at`,
     params: [workspaceId, command.ledgerKey, command.entry.fingerprint,
       encodePayload({ result: command.entry.result }), command.createdAt],
+  };
+}
+
+function graphOperationClaimStatement(
+  workspaceId: string,
+  operation: NonNullable<GraphMutationCommand['operation']>,
+): SqlStatement {
+  return {
+    sql: `INSERT INTO operations (workspace_id, ledger_key, fingerprint, result_json, created_at)
+          VALUES (?,?,?,?,?) ON CONFLICT(workspace_id, ledger_key) DO NOTHING`,
+    params: [workspaceId, operation.ledgerKey, operation.entry.fingerprint,
+      JSON.stringify(operation.entry.result), operation.createdAt],
+  };
+}
+
+function graphTurnFenceStatement(
+  workspaceId: string,
+  expected: readonly { id: string; status: TurnStatus; runtimeEpoch?: number }[],
+): SqlStatement {
+  if (expected.length === 0) throw new Error('turn fence requires at least one turn');
+  const mismatch = expected.map((entry) => entry.runtimeEpoch === undefined
+    ? '(checked.id = ? AND checked.status <> ?)'
+    : `(checked.id = ? AND (checked.status <> ? OR COALESCE(json_extract(checked.payload_json, '$.runtimeEpoch'), 1) <> ?))`).join(' OR ');
+  const mismatchParams = expected.flatMap((entry) => entry.runtimeEpoch === undefined
+    ? [entry.id, entry.status] as SqlValue[]
+    : [entry.id, entry.status, entry.runtimeEpoch] as SqlValue[]);
+  return {
+    sql: `UPDATE turns SET payload_json = payload_json
+           WHERE workspace_id = ? AND id = ? AND status = ?
+             AND (SELECT COUNT(*) FROM turns present WHERE present.workspace_id = ? AND present.id IN (${placeholders(expected.length)})) = ?
+             AND NOT EXISTS (SELECT 1 FROM turns checked WHERE checked.workspace_id = ? AND (${mismatch}))`,
+    params: [workspaceId, expected[0]!.id, expected[0]!.status,
+      workspaceId, ...expected.map((entry) => entry.id), expected.length,
+      workspaceId, ...mismatchParams],
   };
 }
 
