@@ -752,6 +752,49 @@ describe('host task snapshot projection', () => {
     ]);
   });
 
+  it('shows the opening queued prompt in chat immediately without a queue-panel flash', () => {
+    const file: TaskStoreFile = {
+      schemaVersion: 2,
+      revision: 1,
+      tasks: {
+        t: task('t', { role: 'coordinator', goal: 'Fresh chat' }),
+      },
+      turns: {
+        opening: turn({
+          id: 'opening',
+          taskId: 't',
+          sequence: 1,
+          status: 'queued',
+          inputs: [{ kind: 'message', messageId: 'msg-opening' }],
+        }),
+      },
+      messages: {
+        'msg-opening': message({
+          id: 'msg-opening',
+          taskId: 't',
+          role: 'user',
+          content: 'Start immediately',
+          state: 'pending',
+        }),
+      },
+      operations: {},
+      cancelRequests: {},
+    };
+
+    const snapshot = buildSnapshot(storeFrom(file), 't');
+    expect(snapshot.transcript).toEqual([
+      {
+        id: 'msg-opening',
+        kind: 'user',
+        content: 'Start immediately',
+        turnId: 'opening',
+        order: undefined,
+        state: 'pending',
+      },
+    ]);
+    expect(snapshot.queuedTurns).toEqual([]);
+  });
+
   it('does not project TaskHandoff state into the webview transcript', () => {
     const handoffCanaries = {
       operationId: 'hop-secret-op',

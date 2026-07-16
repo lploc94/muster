@@ -21,9 +21,11 @@ export const DEFAULT_RESOURCE_LIMITS: ResourceLimits = {
   // Hard allocation safety bound. The per-task policy supplies the normal 50-turn
   // budget; keeping this at 50 made the advertised policy max of 500 unreachable.
   maxTurnsPerTask: TASK_EXECUTION_HARD_BOUNDS.maxTurns,
-  maxConcurrentTurns: 4,
-  maxConcurrentPerRoot: 4,
-  maxConcurrentPerBackend: 2,
+  // Keep the default high enough for coordinator fan-out (for example, eight
+  // independent domain audits) while retaining a finite safety bound.
+  maxConcurrentTurns: 10,
+  maxConcurrentPerRoot: 10,
+  maxConcurrentPerBackend: 10,
   maxResultBytes: TASK_RESULT_MAX_BYTES,
   maxErrorBytes: TASK_ERROR_MAX_BYTES,
 };

@@ -184,6 +184,20 @@ function turnsForTask(file: TaskStoreFile, taskId: string): TaskTurn[] {
     .sort((a, b) => a.sequence - b.sequence);
 }
 
+/**
+ * A newly-created task briefly has one queued turn before the scheduler starts it.
+ * Present that opening prompt as chat immediately; the queue panel is reserved for
+ * follow-ups waiting behind an existing turn.
+ */
+function isOpeningQueuedTurn(turn: TaskTurn, taskTurns: readonly TaskTurn[]): boolean {
+  return (
+    turn.status === 'queued' &&
+    taskTurns.length === 1 &&
+    turn.trigger === 'user' &&
+    turn.inputs.some((input) => input.kind === 'message')
+  );
+}
+
 function depLifecyclesForTask(file: TaskStoreFile, task: MusterTask): Map<string, TaskLifecycleState> {
   const map = new Map<string, TaskLifecycleState>();
   for (const dep of task.dependencies) {
@@ -480,11 +494,12 @@ export function buildTranscript(file: TaskStoreFile, taskId: string): Transcript
       continue;
     }
     const turnId = message.role === 'assistant' ? message.turnId : (message.turnId ?? msgTurn.get(message.id));
-    // FIFO follow-ups stay in the queue panel only until their turn starts.
-    // Do not project user messages bound to still-queued turns into chat.
+    // FIFO follow-ups stay in the queue panel only until their turn starts. The
+    // opening prompt is the exception: scheduler latency should not make the first
+    // chat bubble flash in the queue panel before appearing in the transcript.
     if (message.role === 'user' && turnId) {
       const boundTurn = file.turns[turnId];
-      if (boundTurn?.status === 'queued') {
+      if (boundTurn?.status === 'queued' && !isOpeningQueuedTurn(boundTurn, turns)) {
         continue;
       }
     }
@@ -604,8 +619,9 @@ export function previewTextForQueuedTurn(file: TaskStoreFile, turn: TaskTurn): s
 }
 
 export function projectQueuedTurns(file: TaskStoreFile, taskId: string): QueuedTurnProjection[] {
-  return turnsForTask(file, taskId)
-    .filter((turn) => turn.status === 'queued')
+  const taskTurns = turnsForTask(file, taskId);
+  return taskTurns
+    .filter((turn) => turn.status === 'queued' && !isOpeningQueuedTurn(turn, taskTurns))
     .sort(
       (a, b) =>
         a.sequence - b.sequence ||

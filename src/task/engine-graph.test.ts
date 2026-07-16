@@ -332,7 +332,11 @@ describe('engine graph orchestration', () => {
     expect(turnsA).toHaveLength(1);
     expect(turnsB).toHaveLength(1);
     expect(turnsA[0]?.trigger).toBe('engine');
-    expect(turnsA[0]?.status).toBe('queued');
+    // With maxConcurrentPerBackend raised to 10, the scheduler auto-promotes the
+    // released first-turn immediately, so it may already be running rather than
+    // still queued. The atomic-release invariant is "exactly one non-terminal
+    // first-turn per child", not the transient queued state.
+    expect(['queued', 'running']).toContain(turnsA[0]?.status);
 
     // Idempotent same opId.
     const again = await engine.handleToolCall(ctx, 'release_tasks', {
