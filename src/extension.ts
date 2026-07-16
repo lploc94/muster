@@ -25,14 +25,13 @@ import { discoverSkillNames } from './host/skill-discovery';
 import { ElicitationBridge } from './bridge/elicitation-bridge';
 import type { PermissionAuditEntry, PermissionMode } from './backends/permission-policy';
 import {
-  buildSnapshot,
   collectAncestorIds,
   owningRootMembershipChanged,
   projectTaskSummary,
   type PendingAskOverlay,
-  type TaskSnapshot,
   type TranscriptItem,
 } from './host/snapshot';
+import { buildRepositorySnapshot } from './host/repository-snapshot';
 import {
   buildRetentionSettingsSnapshot,
   handleRetentionSettingUpdateAction,
@@ -91,10 +90,10 @@ import {
 } from './host/markdown-file-presentation';
 import { enumerateModels, type BackendModels } from './backends/model-catalog';
 import { SESSION_MIGRATION_MARKER, migrateLegacySessions } from './task/migration-sessions';
-import { applyRetention, retentionChanged, type RetentionConfig } from './task/retention';
-import { TaskEngine, type EngineEvent, viewStatusFromDraft } from './task/engine';
+import { type RetentionConfig } from './task/retention';
+import { TaskEngine, type EngineEvent } from './task/engine';
 import type { HostEnvironmentSnapshot } from './task/host-context';
-import { TaskStore, computeAffectedTaskIds, type CommitResult } from './task/store';
+import { TaskStore, computeAffectedTaskIds } from './task/store';
 import { JsonTaskRepository, type TaskRepository } from './task/repository';
 import { DbClient, resolveWorkerPath } from './task/sqlite/client';
 import { probeNodeSqlite } from './task/sqlite/probe';
@@ -377,23 +376,37 @@ function runSessionMigration(context: vscode.ExtensionContext, wsRoot?: string):
   }
 }
 
-function applyRetentionToStore(store: TaskStore): void {
+let retentionInFlight: Promise<void> | undefined;
+
+function repositoryWorkspaceId(): string {
+  return sqliteWorkspaceId ?? 'legacy-workspace';
+}
+
+/** Apply retention through named repository commands; never rewrite the host envelope. */
+async function applyRetentionToRepository(repository: TaskRepository): Promise<void> {
   const config = getRetentionConfig();
-  const before = store.getFile();
-  const pruned = applyRetention(before, config);
-  if (!retentionChanged(before, pruned)) {
-    return;
+  const tasks = await repository.listTasks(repositoryWorkspaceId());
+  for (const task of tasks) {
+    await repository.execute({
+      kind: 'applyRetentionPolicy',
+      workspaceId: repositoryWorkspaceId(),
+      taskId: task.id,
+      keepLatestTurns: config.maxTurnsPerTask,
+      maxStoredOutputChars: config.maxStoredOutputChars,
+    });
   }
-  store.commit((draft) => {
-    draft.tasks = pruned.tasks;
-    draft.turns = pruned.turns;
-    draft.messages = pruned.messages;
-    draft.operations = pruned.operations;
-    draft.cancelRequests = pruned.cancelRequests;
-    draft.toolCalls = pruned.toolCalls ?? {};
-    draft.reasoning = pruned.reasoning ?? {};
-    return { ok: true };
-  });
+}
+
+function scheduleRetention(): void {
+  const repository = taskRepository;
+  if (!repository || retentionInFlight) return;
+  retentionInFlight = applyRetentionToRepository(repository)
+    .catch(() => {
+      // Retention is maintenance; a failed pass must not interrupt a user turn.
+    })
+    .finally(() => {
+      retentionInFlight = undefined;
+    });
 }
 
 /**
@@ -1102,18 +1115,17 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     }
     const focus = focusedTaskId ?? this.focusedTaskId;
     const generation = ++this.snapshotGeneration;
-    void taskRepository.readEnvelopeForMigration().then((file) => {
+    void buildRepositorySnapshot(taskRepository, repositoryWorkspaceId(), focus, activePendingAsks).then((projection) => {
       if (generation !== this.snapshotGeneration) return;
-      const snapshot: TaskSnapshot = buildSnapshot({ getFile: () => file }, focus, activePendingAsks);
       // Stamp the wire version on the bootstrap message so the webview can detect
       // host<->webview drift once (and show a reload banner) instead of silently
       // dropping mismatched messages.
-      this.post({ type: 'snapshot', protocolVersion: PROTOCOL_VERSION, ...snapshot });
+      this.post({ type: 'snapshot', protocolVersion: PROTOCOL_VERSION, ...projection.snapshot });
       this.replayPendingElicitations();
       if (focus) {
         this.focusedTaskId = focus;
       }
-      this.seedObservation(file as TaskStoreFile);
+      this.seedObservation(projection.observation);
     }).catch(() => {
       if (generation === this.snapshotGeneration) {
         this.postCommandError('Unable to load task snapshot.');
@@ -1299,159 +1311,76 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     return true;
   }
 
-  /**
-   * A task is removable only if it is idle or terminal (not actively working)
-   * and it is not the currently focused task. Removability is derived from the
-   * fresh `draft` (via viewStatusFromDraft) so the check is consistent with the
-   * exact bytes a commit is about to write — see the guard-inside-commit note on
-   * handleDeleteTask/handleClearHistory.
-   */
-  private isDraftTaskRemovable(draft: TaskStoreFile, id: string, focus: string | undefined): boolean {
-    if (id === focus) return false;
-    const viewStatus = viewStatusFromDraft(draft, id);
-    return (
-      viewStatus === 'idle' ||
-      viewStatus === 'succeeded' ||
-      viewStatus === 'failed' ||
-      viewStatus === 'cancelled' ||
-      viewStatus === 'skipped'
-    );
-  }
-
-  /** Index children by parent id so whole subtrees can be inspected. */
-  private buildChildrenIndex(tasks: TaskStoreFile['tasks']): Map<string, string[]> {
-    const childrenOf = new Map<string, string[]>();
-    for (const t of Object.values(tasks)) {
-      if (t.parentId) {
-        const list = childrenOf.get(t.parentId);
-        if (list) list.push(t.id);
-        else childrenOf.set(t.parentId, [t.id]);
-      }
-    }
-    return childrenOf;
-  }
-
-  /**
-   * Return every task id in the subtree rooted at `rootId` IF every task in it
-   * is removable; otherwise null. A root can be idle/terminal while a delegated
-   * child is still queued/running, and deleting the subtree would otherwise nuke
-   * that in-flight work — so the whole subtree must be clear before removal.
-   */
-  private removableSubtree(
-    draft: TaskStoreFile,
-    rootId: string,
-    childrenOf: Map<string, string[]>,
-    focus: string | undefined,
-  ): string[] | null {
-    const subtree: string[] = [];
-    const stack: string[] = [rootId];
-    while (stack.length > 0) {
-      const id = stack.pop()!;
-      subtree.push(id);
-      if (!this.isDraftTaskRemovable(draft, id, focus)) return null;
-      for (const child of childrenOf.get(id) ?? []) stack.push(child);
-    }
-    return subtree;
-  }
-
-  /**
-   * Mutate `draft` in place: delete the given task ids and their
-   * turns/messages/toolCalls/reasoning. Called from inside a `commit` callback
-   * (operations/cancelRequests are turn-keyed or ledger; safe to leave).
-   */
-  private applyTaskDeletion(draft: TaskStoreFile, ids: Iterable<string>): void {
-    const idSet = ids instanceof Set ? (ids as Set<string>) : new Set(ids);
-    for (const id of idSet) {
-      delete draft.tasks[id];
-      for (const turnId of Object.keys(draft.turns)) {
-        if (draft.turns[turnId].taskId === id) delete draft.turns[turnId];
-      }
-      for (const msgId of Object.keys(draft.messages)) {
-        if (draft.messages[msgId].taskId === id) delete draft.messages[msgId];
-      }
-      if (draft.toolCalls) {
-        for (const key of Object.keys(draft.toolCalls)) {
-          if (draft.toolCalls[key].taskId === id) delete draft.toolCalls[key];
-        }
-      }
-      if (draft.reasoning) {
-        for (const key of Object.keys(draft.reasoning)) {
-          if (draft.reasoning[key].taskId === id) delete draft.reasoning[key];
-        }
-      }
-    }
-    // ensure optionals exist
-    draft.operations = draft.operations ?? {};
-    draft.cancelRequests = draft.cancelRequests ?? {};
-  }
-
-  /** Surface a failed commit as a command error. Returns true when it failed. */
-  private reportCommitFailure(result: CommitResult): boolean {
-    if (result.ok) return false;
-    this.postCommandError(result.detail ?? `store ${result.reason}`);
-    return true;
-  }
-
-  private handleClearHistory(): void {
-    if (!taskStore) {
+  private async handleClearHistory(): Promise<void> {
+    const repository = taskRepository;
+    if (!repository) {
       this.postCommandError('task store not ready');
       return;
     }
     const focus = this.focusedTaskId;
-    let focusRemoved = false;
-    // Compute removable subtrees INSIDE the commit against the fresh `draft` that
-    // commit re-reads under the store lock. Deciding on the pre-commit snapshot
-    // would be TOCTOU-unsafe: another window could add a delegated descendant or
-    // flip a task to running between the check and the write, orphaning the child
-    // or deleting active work.
-    const result = taskStore.commit((draft) => {
-      const childrenOf = this.buildChildrenIndex(draft.tasks);
-      const toRemove = new Set<string>();
-      for (const task of Object.values(draft.tasks)) {
-        if (task.parentId !== null) continue;
-        const subtree = this.removableSubtree(draft, task.id, childrenOf, focus);
-        if (subtree) for (const id of subtree) toRemove.add(id);
+    let preserveRootTaskId: string | undefined;
+    if (focus) {
+      const tasks = await repository.listTasks(repositoryWorkspaceId());
+      const byId = new Map(tasks.map((task) => [task.id, task]));
+      let current = byId.get(focus);
+      const seen = new Set<string>();
+      while (current?.parentId && !seen.has(current.id)) {
+        seen.add(current.id);
+        current = byId.get(current.parentId);
       }
-      if (toRemove.size === 0) return { ok: true }; // nothing removable — no-op
-      this.applyTaskDeletion(draft, toRemove);
-      if (focus && toRemove.has(focus)) focusRemoved = true;
-      return { ok: true };
+      preserveRootTaskId = current?.id;
+    }
+    const result = await repository.execute({
+      kind: 'clearHistory',
+      workspaceId: repositoryWorkspaceId(),
+      ...(preserveRootTaskId ? { preserveRootTaskId } : {}),
     });
-    if (this.reportCommitFailure(result)) return;
-    if (focusRemoved) this.focusedTaskId = undefined;
+    if (result.reason && !result.changed) {
+      this.postCommandError(result.reason);
+      return;
+    }
+    if (focus && !(await repository.getTask(focus))) this.focusedTaskId = undefined;
     this.postSnapshot(this.focusedTaskId);
   }
 
-  /** Delete a single top-level task (and its whole subtree) from history. */
-  private handleDeleteTask(taskId: string): void {
-    if (!taskStore) {
+  /** Delete a single top-level task (and its whole subtree) through the repository. */
+  private async handleDeleteTask(taskId: string): Promise<void> {
+    const repository = taskRepository;
+    if (!repository) {
       this.postCommandError('task store not ready');
       return;
     }
     const focus = this.focusedTaskId;
-    let focusRemoved = false;
-    // Validate + delete atomically against the fresh `draft` (see handleClearHistory).
-    const result = taskStore.commit((draft) => {
-      const task = draft.tasks[taskId];
-      if (!task) return { ok: true }; // already gone — no-op
-      if (task.parentId !== null) return { ok: false, reason: 'Only top-level tasks can be deleted.' };
-      const childrenOf = this.buildChildrenIndex(draft.tasks);
-      const subtree = this.removableSubtree(draft, taskId, childrenOf, focus);
-      if (!subtree) {
-        return { ok: false, reason: 'Cannot delete a task while it or a subtask is still running.' };
+    let preserveRootTaskId: string | undefined;
+    if (focus) {
+      const tasks = await repository.listTasks(repositoryWorkspaceId());
+      const byId = new Map(tasks.map((task) => [task.id, task]));
+      let current = byId.get(focus);
+      const seen = new Set<string>();
+      while (current?.parentId && !seen.has(current.id)) {
+        seen.add(current.id);
+        current = byId.get(current.parentId);
       }
-      this.applyTaskDeletion(draft, subtree);
-      if (focus && subtree.includes(focus)) focusRemoved = true;
-      return { ok: true };
+      preserveRootTaskId = current?.id;
+    }
+    const result = await repository.execute({
+      kind: 'deleteTaskSubtreeIfIdle',
+      workspaceId: repositoryWorkspaceId(),
+      rootTaskId: taskId,
+      ...(preserveRootTaskId ? { preserveRootTaskId } : {}),
     });
-    if (this.reportCommitFailure(result)) return;
-    if (focusRemoved) this.focusedTaskId = undefined;
+    if (result.reason && !result.changed) {
+      this.postCommandError(result.reason, taskId);
+      return;
+    }
+    if (focus && !(await repository.getTask(focus))) this.focusedTaskId = undefined;
     this.postSnapshot(this.focusedTaskId);
   }
 
   /** Rename a task by replacing its goal (the display label). */
-  private handleRenameTask(taskId: string, goal: string): void {
-    if (!taskStore) {
+  private async handleRenameTask(taskId: string, goal: string): Promise<void> {
+    const repository = taskRepository;
+    if (!repository) {
       this.postCommandError('task store not ready');
       return;
     }
@@ -1461,13 +1390,20 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       return;
     }
     const capped = trimmed.length > MAX_MESSAGE_CHARS ? trimmed.slice(0, MAX_MESSAGE_CHARS) : trimmed;
-    const result = taskStore.commit((draft) => {
-      const t = draft.tasks[taskId];
-      if (!t) return { ok: true }; // gone — no-op
-      t.goal = capped;
-      return { ok: true };
+    const current = await repository.getTask(taskId);
+    if (!current) return;
+    const result = await repository.execute({
+      kind: 'renameTask',
+      workspaceId: repositoryWorkspaceId(),
+      taskId,
+      goal: capped,
+      expectedTaskRevision: current.revision,
+      updatedAt: new Date().toISOString(),
     });
-    if (this.reportCommitFailure(result)) return;
+    if (result.reason && !result.changed) {
+      this.postCommandError(result.reason, taskId);
+      return;
+    }
     this.postSnapshot(this.focusedTaskId);
   }
 
@@ -1532,7 +1468,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
    * never mutates task-store state. Cancel is intentionally silent.
    */
   private async handleExportTask(data: unknown): Promise<void> {
-    if (!taskStore) {
+    if (!taskRepository) {
       this.postCommandError('task store not ready');
       return;
     }
@@ -2449,16 +2385,16 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           this.handleOpenLink(data.url);
           break;
         case 'clearHistory':
-          this.handleClearHistory();
+          await this.handleClearHistory();
           break;
         case 'deleteTask':
           if (typeof data.taskId === 'string') {
-            this.handleDeleteTask(data.taskId);
+            await this.handleDeleteTask(data.taskId);
           }
           break;
         case 'renameTask':
           if (typeof data.taskId === 'string' && typeof data.goal === 'string') {
-            this.handleRenameTask(data.taskId, data.goal);
+            await this.handleRenameTask(data.taskId, data.goal);
           }
           break;
         case 'exportTask':
@@ -3160,14 +3096,14 @@ export async function activate(context: vscode.ExtensionContext) {
       onCommit: (file, affectedTaskIds) => {
         try {
           provider.reprojectChanged(file, affectedTaskIds);
-          applyRetentionToStore(taskStore!);
+          scheduleRetention();
         } catch {
           // best-effort projection
         }
       },
     });
     taskRepository = new JsonTaskRepository(taskStore, sqliteWorkspaceId ?? 'legacy-workspace');
-    applyRetentionToStore(taskStore);
+    scheduleRetention();
     lastObservedFile = JSON.parse(JSON.stringify(taskStore.getFile())) as TaskStoreFile;
     lastObservedRevision = taskStore.getFile().revision;
 

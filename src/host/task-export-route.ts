@@ -1,4 +1,3 @@
-import type { TaskStoreFile } from '../task/types';
 import type { TaskRepository } from '../task/repository';
 import {
   MAX_TASK_MARKDOWN_EXPORT_ID_CHARS,
@@ -45,10 +44,8 @@ export interface TaskExportSaveDialogOptions {
 }
 
 export interface TaskExportRouteDeps {
-  /** Transitional compatibility accessor; new callers should provide getRepository. */
-  getStoreFile?: () => TaskStoreFile;
-  /** Read-only repository accessor. The route only uses its migration/export view. */
-  getRepository?: () => TaskRepository;
+  /** Read-only repository accessor. Export is the only runtime compatibility-envelope reader. */
+  getRepository: () => TaskRepository;
   /**
    * Injected native Save As seam. Return `undefined` when the user cancels.
    * Tests inject a mock; production wires `vscode.window.showSaveDialog`.
@@ -220,7 +217,7 @@ export async function routeExportTask(
   if (
     !deps ||
     typeof deps !== 'object' ||
-    (typeof deps.getStoreFile !== 'function' && typeof deps.getRepository !== 'function') ||
+    typeof deps.getRepository !== 'function' ||
     typeof deps.showSaveDialog !== 'function' ||
     typeof deps.writeFile !== 'function' ||
     typeof deps.exportedAt !== 'string'
@@ -228,11 +225,9 @@ export async function routeExportTask(
     return commandError('invalid_request', parsed.taskId);
   }
 
-  let file: TaskStoreFile;
+  let file: Awaited<ReturnType<TaskRepository['readEnvelopeForMigration']>>;
   try {
-    file = deps.getRepository
-      ? await deps.getRepository().readEnvelopeForMigration()
-      : deps.getStoreFile!();
+    file = await deps.getRepository().readEnvelopeForMigration();
   } catch {
     return commandError('invalid_request', parsed.taskId);
   }

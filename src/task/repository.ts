@@ -17,6 +17,7 @@ import { isMutatingTask, normalizedWritePaths } from './resources';
 import { canPromoteTurn } from './scheduler';
 import { DEFAULT_RESOURCE_LIMITS } from './limits';
 import { isTerminalLifecycle } from './transitions';
+import { deriveViewStatus } from './derived-status';
 import { TRUNCATION_MARKER } from './retention';
 import type { DbClient } from './sqlite/client';
 import type { SqlStatement, SqlValue } from './sqlite/rpc';
@@ -94,6 +95,18 @@ export type RepositoryCommand =
     }
   | { kind: 'upsertTask'; workspaceId: string; task: MusterTask }
   | { kind: 'deleteTask'; workspaceId: string; taskId: string }
+  /** Atomically remove every idle/terminal root except the focused root. */
+  | { kind: 'clearHistory'; workspaceId: string; preserveRootTaskId?: string }
+  /** Atomically remove one complete root subtree when every member is idle/terminal. */
+  | {
+      kind: 'deleteTaskSubtreeIfIdle'; workspaceId: string; rootTaskId: string;
+      preserveRootTaskId?: string;
+    }
+  /** Host rename boundary with an optimistic task-revision fence. */
+  | {
+      kind: 'renameTask'; workspaceId: string; taskId: string; goal: string;
+      expectedTaskRevision?: number; updatedAt: string;
+    }
   | { kind: 'createTurn'; workspaceId: string; turn: TaskTurn }
   | { kind: 'upsertTurn'; workspaceId: string; turn: TaskTurn }
   /** Replace a live turn only when its status/runtime binding still matches.
@@ -181,6 +194,11 @@ export type RepositoryCommand =
        * only truncate settled rendered output. */
       kind: 'applyRetention'; workspaceId: string; taskId: string; keepLatestTurns: number;
       maxStoredOutputChars?: number;
+    }
+  /** Stable host-facing name for the retention policy command. */
+  | {
+      kind: 'applyRetentionPolicy'; workspaceId: string; taskId: string; keepLatestTurns: number;
+      maxStoredOutputChars?: number;
     };
 
 export interface RepositoryCommandResult {
@@ -212,6 +230,8 @@ export interface TaskRepository {
   listSubtree(rootTaskId: string): Promise<readonly MusterTask[]>;
   getTurn(turnId: string): Promise<TaskTurn | undefined>;
   listTurns(taskId: string): Promise<readonly TaskTurn[]>;
+  /** Optional bulk projection primitive; adapters fall back to per-task reads. */
+  listTurnsForTasks?(taskIds: readonly string[]): Promise<readonly TaskTurn[]>;
   listQueuedTurns(taskId: string): Promise<readonly TaskTurn[]>;
   listMessages(taskId: string): Promise<readonly TaskMessage[]>;
   listToolCalls(taskId: string): Promise<readonly PersistedToolCall[]>;
@@ -220,6 +240,8 @@ export interface TaskRepository {
   getCancelRequest(turnId: string): Promise<CancelRequest | undefined>;
   getSendReceipt(clientRequestId: string): Promise<SendReceipt | undefined>;
   getTranscriptPage(taskId: string, cursor?: string, limit?: number): Promise<TranscriptPage>;
+  /** Current workspace revision without materializing the compatibility envelope. */
+  getWorkspaceRevision?(): Promise<number>;
   execute(command: RepositoryCommand): Promise<RepositoryCommandResult>;
   /** Compatibility-only export/migration view; never expose this to mutation code. */
   readEnvelopeForMigration(): Promise<Readonly<TaskStoreFile>>;
@@ -344,6 +366,110 @@ function isDescendantOf(
 }
 
 /**
+ * The host history actions use the same derived status as the webview. Keeping
+ * this predicate in the repository boundary means JSON and SQLite make the
+ * removable decision against the state they are about to mutate, rather than
+ * against a stale host snapshot.
+ */
+function taskIsRemovable(
+  file: TaskStoreFile,
+  taskId: string,
+  preserveRootTaskId?: string,
+): boolean {
+  if (taskId === preserveRootTaskId) return false;
+  const task = file.tasks[taskId];
+  if (!task) return false;
+  const dependencies = new Map(
+    task.dependencies
+      .map((dependency) => [dependency.taskId, file.tasks[dependency.taskId]?.lifecycle] as const)
+      .filter((entry): entry is [string, NonNullable<(typeof entry)[1]>] => entry[1] !== undefined),
+  );
+  const turns = Object.values(file.turns)
+    .filter((turn) => turn.taskId === taskId)
+    .sort((a, b) => a.sequence - b.sequence || a.createdAt.localeCompare(b.createdAt));
+  if (turns.some((turn) => turn.status === 'running' || turn.status === 'waiting_user' || turn.status === 'queued')) {
+    return false;
+  }
+  const status = deriveViewStatus(task, turns, dependencies);
+  return status === 'idle' || status === 'succeeded' || status === 'failed' ||
+    status === 'cancelled' || status === 'skipped';
+}
+
+function subtreeIdsFromFile(file: TaskStoreFile, rootTaskId: string): string[] {
+  const children = new Map<string, string[]>();
+  for (const task of Object.values(file.tasks)) {
+    if (!task.parentId) continue;
+    const list = children.get(task.parentId) ?? [];
+    list.push(task.id);
+    children.set(task.parentId, list);
+  }
+  const result: string[] = [];
+  const seen = new Set<string>();
+  const pending = [rootTaskId];
+  while (pending.length > 0) {
+    const id = pending.pop()!;
+    if (seen.has(id) || !file.tasks[id]) continue;
+    seen.add(id);
+    result.push(id);
+    pending.push(...(children.get(id) ?? []));
+  }
+  return result;
+}
+
+function removableRootIdsFromFile(
+  file: TaskStoreFile,
+  preserveRootTaskId?: string,
+  rootTaskId?: string,
+): string[][] {
+  const roots = Object.values(file.tasks)
+    .filter((task) => task.parentId === null)
+    .filter((task) => rootTaskId === undefined || task.id === rootTaskId);
+  const removable: string[][] = [];
+  for (const root of roots) {
+    const ids = subtreeIdsFromFile(file, root.id);
+    if (ids.length > 0 && ids.every((id) => taskIsRemovable(file, id, preserveRootTaskId))) {
+      removable.push(ids);
+    }
+  }
+  return removable;
+}
+
+function deleteTaskIdsFromFile(file: TaskStoreFile, ids: readonly string[]): void {
+  const idSet = new Set(ids);
+  const deletedTurnIds = new Set<string>();
+  for (const [turnId, turn] of Object.entries(file.turns)) {
+    if (!idSet.has(turn.taskId)) continue;
+    deletedTurnIds.add(turnId);
+    delete file.turns[turnId];
+  }
+  for (const [taskId] of Object.entries(file.tasks)) {
+    if (idSet.has(taskId)) delete file.tasks[taskId];
+  }
+  for (const [messageId, message] of Object.entries(file.messages)) {
+    if (idSet.has(message.taskId) || (message.turnId !== undefined && deletedTurnIds.has(message.turnId))) {
+      delete file.messages[messageId];
+    }
+  }
+  for (const [id, tool] of Object.entries(file.toolCalls ?? {})) {
+    if (idSet.has(tool.taskId) || deletedTurnIds.has(tool.turnId)) delete file.toolCalls?.[id];
+  }
+  for (const [id, reasoning] of Object.entries(file.reasoning ?? {})) {
+    if (idSet.has(reasoning.taskId) || deletedTurnIds.has(reasoning.turnId)) delete file.reasoning?.[id];
+  }
+  for (const turnId of deletedTurnIds) {
+    delete file.cancelRequests?.[turnId];
+    for (const key of Object.keys(file.operations ?? {})) {
+      if (key.startsWith(`${turnId}:`)) delete file.operations?.[key];
+    }
+  }
+  for (const [clientRequestId, receipt] of Object.entries(file.sendReceipts ?? {})) {
+    if (idSet.has(receipt.taskId) || deletedTurnIds.has(receipt.turnId)) {
+      delete file.sendReceipts?.[clientRequestId];
+    }
+  }
+}
+
+/**
  * Compatibility adapter over the current JSON TaskStore.
  *
  * Returning cloned values makes accidental mutation fail closed: changing a DTO
@@ -402,6 +528,14 @@ export class JsonTaskRepository implements TaskRepository {
       .map((turn) => clone(turn));
   }
 
+  async listTurnsForTasks(taskIds: readonly string[]): Promise<readonly TaskTurn[]> {
+    const ids = new Set(taskIds);
+    return Object.values(this.store.getFile().turns)
+      .filter((turn) => ids.has(turn.taskId))
+      .sort((a, b) => a.taskId.localeCompare(b.taskId) || a.sequence - b.sequence || a.createdAt.localeCompare(b.createdAt))
+      .map((turn) => clone(turn));
+  }
+
   async getTurn(turnId: string): Promise<TaskTurn | undefined> {
     const turn = this.store.getFile().turns[turnId];
     return turn ? clone(turn) : undefined;
@@ -456,6 +590,10 @@ export class JsonTaskRepository implements TaskRepository {
       Object.values(file.reasoning ?? {}).filter((reasoning) => reasoning.taskId === taskId),
     );
     return pageTranscript(items, Object.values(file.turns).filter((turn) => turn.taskId === taskId), cursor, limit, file.revision);
+  }
+
+  async getWorkspaceRevision(): Promise<number> {
+    return this.store.getFile().revision;
   }
 
   async readEnvelopeForMigration(): Promise<Readonly<TaskStoreFile>> {
@@ -555,26 +693,55 @@ export class JsonTaskRepository implements TaskRepository {
           draft.tasks[command.task.id] = clone(command.task);
           changed = true;
           return { ok: true };
+        case 'clearHistory': {
+          const groups = removableRootIdsFromFile(draft, command.preserveRootTaskId);
+          const ids = groups.flat();
+          if (ids.length === 0) return { ok: true };
+          deleteTaskIdsFromFile(draft, ids);
+          changed = true;
+          return { ok: true };
+        }
+        case 'deleteTaskSubtreeIfIdle': {
+          const root = draft.tasks[command.rootTaskId];
+          if (!root) return { ok: true };
+          if (root.parentId !== null) return { ok: false, reason: 'Only top-level tasks can be deleted.' };
+          const groups = removableRootIdsFromFile(
+            draft,
+            command.preserveRootTaskId,
+            command.rootTaskId,
+          );
+          const ids = groups[0];
+          if (!ids) {
+            return { ok: false, reason: 'Cannot delete a task while it or a subtask is still active.' };
+          }
+          deleteTaskIdsFromFile(draft, ids);
+          changed = true;
+          return { ok: true };
+        }
+        case 'renameTask': {
+          const task = draft.tasks[command.taskId];
+          if (!task) return { ok: true };
+          if (
+            command.expectedTaskRevision !== undefined &&
+            task.revision !== command.expectedTaskRevision
+          ) {
+            return { ok: false, reason: 'task changed; retry' };
+          }
+          task.goal = command.goal;
+          task.revision += 1;
+          task.updatedAt = command.updatedAt;
+          changed = true;
+          return { ok: true };
+        }
         case 'deleteTask':
           if (!draft.tasks[command.taskId]) return { ok: true };
           // JSON compatibility preserves the database cascade semantics.
-          for (const [id, task] of Object.entries(draft.tasks)) {
-            if (task.id === command.taskId || isDescendantOf(draft.tasks, task.id, command.taskId)) {
-              delete draft.tasks[id];
-              for (const [turnId, turn] of Object.entries(draft.turns)) {
-                if (turn.taskId === task.id) delete draft.turns[turnId];
-              }
-              for (const [messageId, message] of Object.entries(draft.messages)) {
-                if (message.taskId === task.id) delete draft.messages[messageId];
-              }
-              for (const [toolId, tool] of Object.entries(draft.toolCalls ?? {})) {
-                if (tool.taskId === task.id) delete draft.toolCalls?.[toolId];
-              }
-              for (const [reasoningId, reasoning] of Object.entries(draft.reasoning ?? {})) {
-                if (reasoning.taskId === task.id) delete draft.reasoning?.[reasoningId];
-              }
-            }
-          }
+          deleteTaskIdsFromFile(
+            draft,
+            Object.values(draft.tasks)
+              .filter((task) => task.id === command.taskId || isDescendantOf(draft.tasks, task.id, command.taskId))
+              .map((task) => task.id),
+          );
           changed = true;
           return { ok: true };
         case 'createTurn':
@@ -842,6 +1009,7 @@ export class JsonTaskRepository implements TaskRepository {
           changed = true;
           return { ok: true };
         }
+        case 'applyRetentionPolicy':
         case 'applyRetention': {
           const task = draft.tasks[command.taskId];
           if (!task) return { ok: true };
@@ -1075,6 +1243,15 @@ export class SqliteTaskRepository implements TaskRepository {
     return this.hydrateTurns(rows);
   }
 
+  async listTurnsForTasks(taskIds: readonly string[]): Promise<readonly TaskTurn[]> {
+    if (taskIds.length === 0) return [];
+    const rows = await this.db.all<TurnRow>(
+      `${turnSelect(`WHERE workspace_id = ? AND task_id IN (${placeholders(taskIds.length)})`)} ORDER BY task_id, sequence, created_at, id`,
+      [this.workspaceId, ...taskIds],
+    );
+    return this.hydrateTurns(rows);
+  }
+
   async getTurn(turnId: string): Promise<TaskTurn | undefined> {
     const row = await this.db.get<TurnRow>(
       turnSelect('WHERE workspace_id = ? AND id = ?'),
@@ -1169,6 +1346,14 @@ export class SqliteTaskRepository implements TaskRepository {
     );
   }
 
+  async getWorkspaceRevision(): Promise<number> {
+    const row = await this.db.get<{ revision: number }>(
+      'SELECT revision FROM workspace_revisions WHERE workspace_id = ?',
+      [this.workspaceId],
+    );
+    return row?.revision ?? 0;
+  }
+
   async readEnvelopeForMigration(): Promise<Readonly<TaskStoreFile>> {
     const [tasks, turnRows, messageRows, toolRows, reasoningRows, operationRows, cancelRows, receiptRows, revisionRow] = await Promise.all([
       this.listTasks(this.workspaceId),
@@ -1231,6 +1416,163 @@ export class SqliteTaskRepository implements TaskRepository {
     return this.db.transaction([...statements, ...revisionStatements(this.workspaceId, changed, at)]);
   }
 
+  private async renameTask(
+    command: Extract<RepositoryCommand, { kind: 'renameTask' }>,
+  ): Promise<RepositoryCommandResult> {
+    const revisionPredicate = command.expectedTaskRevision === undefined ? '' : ' AND revision = ?';
+    const params: SqlValue[] = [
+      command.goal,
+      command.updatedAt,
+      this.workspaceId,
+      command.taskId,
+      ...(command.expectedTaskRevision === undefined ? [] : [command.expectedTaskRevision]),
+    ];
+    const results = await this.writeIfFirstChanged(
+      {
+        sql: `UPDATE tasks
+                 SET goal = ?, updated_at = ?, revision = revision + 1
+               WHERE workspace_id = ? AND id = ?${revisionPredicate}`,
+        params,
+      },
+      [],
+      { kind: 'task', id: command.taskId, change: 'rename' },
+      command.updatedAt,
+    );
+    const changed = (results[0]?.changes ?? 0) > 0;
+    return {
+      ok: true,
+      changed,
+      ...(changed ? {} : { reason: 'task changed or no longer exists' }),
+    };
+  }
+
+  /**
+   * Delete one or all top-level roots only when every task in each candidate
+   * subtree is currently removable. The recursive CTE and the live/queued/
+   * dependency predicates execute inside the same IMMEDIATE transaction as the
+   * DELETE, so a late child or turn cannot be orphaned by a stale host read.
+   */
+  private async deleteTaskRootsIfIdle(
+    command:
+      | Extract<RepositoryCommand, { kind: 'clearHistory' }>
+      | Extract<RepositoryCommand, { kind: 'deleteTaskSubtreeIfIdle' }>,
+  ): Promise<RepositoryCommandResult> {
+    const isSingle = command.kind === 'deleteTaskSubtreeIfIdle';
+    if (isSingle) {
+      const root = await this.db.get<{ parent_id: string | null }>(
+        'SELECT parent_id FROM tasks WHERE workspace_id = ? AND id = ?',
+        [this.workspaceId, command.rootTaskId],
+      );
+      if (!root) return { ok: true, changed: false };
+      if (root.parent_id !== null) {
+        return { ok: true, changed: false, reason: 'Only top-level tasks can be deleted.' };
+      }
+      if (command.preserveRootTaskId === command.rootTaskId) {
+        return { ok: true, changed: false, reason: 'Cannot delete the focused task.' };
+      }
+    }
+    const rootFilter = isSingle ? 'AND id = ?' : '';
+    const rootParams: SqlValue[] = isSingle ? [command.rootTaskId] : [];
+    const preserve = command.preserveRootTaskId ?? null;
+    const sql = `WITH RECURSIVE candidate(id, root_id) AS (
+          SELECT id, id
+            FROM tasks
+           WHERE workspace_id = ? AND parent_id IS NULL
+             ${rootFilter}
+             AND (? IS NULL OR id <> ?)
+          UNION
+          SELECT child.id, candidate.root_id
+            FROM tasks child
+            JOIN candidate ON child.parent_id = candidate.id
+           WHERE child.workspace_id = ?
+        ), blocked(root_id) AS (
+          SELECT DISTINCT candidate.root_id
+            FROM candidate
+            JOIN tasks task ON task.workspace_id = ? AND task.id = candidate.id
+           WHERE EXISTS (
+                   SELECT 1 FROM turns live
+                    WHERE live.workspace_id = task.workspace_id
+                      AND live.task_id = task.id
+                      AND live.status IN ('running', 'waiting_user')
+                 )
+              OR EXISTS (
+                   SELECT 1 FROM turns queued
+                    WHERE queued.workspace_id = task.workspace_id
+                      AND queued.task_id = task.id
+                      AND queued.status = 'queued'
+                 )
+              OR (
+                   task.lifecycle = 'open' AND (
+                     json_extract(task.payload_json, '$.wait.kind') IS NOT NULL
+                     OR json_extract(task.payload_json, '$.outcomeProposal') IS NOT NULL
+                     OR EXISTS (
+                          SELECT 1
+                            FROM task_dependencies dependency
+                            LEFT JOIN tasks producer
+                              ON producer.workspace_id = dependency.workspace_id
+                             AND producer.id = dependency.dependency_task_id
+                           WHERE dependency.workspace_id = task.workspace_id
+                             AND dependency.task_id = task.id
+                             AND NOT (
+                               ((dependency.required_outcome = 'succeeded' AND producer.lifecycle = 'succeeded')
+                                 OR (dependency.required_outcome = 'settled' AND producer.lifecycle IN ('succeeded','failed','cancelled','skipped')))
+                               AND (dependency.required_verdict IS NULL
+                                 OR json_extract(producer.payload_json, '$.taskResult.verdict.status') = 'pass')
+                             )
+                        )
+                     OR EXISTS (
+                          SELECT 1
+                            FROM turns latest
+                           WHERE latest.workspace_id = task.workspace_id
+                             AND latest.task_id = task.id
+                             AND latest.status IN ('failed', 'interrupted')
+                             AND NOT EXISTS (
+                                  SELECT 1 FROM turns newer
+                                   WHERE newer.workspace_id = latest.workspace_id
+                                     AND newer.task_id = latest.task_id
+                                     AND (newer.sequence > latest.sequence OR
+                                          (newer.sequence = latest.sequence AND newer.id > latest.id))
+                                )
+                        )
+                   )
+                 )
+        )
+        DELETE FROM tasks
+         WHERE workspace_id = ?
+           AND id IN (
+             SELECT candidate.id FROM candidate
+              WHERE candidate.root_id NOT IN (SELECT root_id FROM blocked)
+           )`;
+    const params: SqlValue[] = [
+      this.workspaceId,
+      ...rootParams,
+      preserve,
+      preserve,
+      this.workspaceId,
+      this.workspaceId,
+      this.workspaceId,
+    ];
+    const change: ChangeRecord = {
+      kind: 'task',
+      id: isSingle ? command.rootTaskId : this.workspaceId,
+      change: isSingle ? 'delete_subtree' : 'clear_history',
+    };
+    const results = await this.writeIfFirstChanged(
+      { sql, params },
+      [],
+      change,
+      new Date().toISOString(),
+    );
+    const changed = (results[0]?.changes ?? 0) > 0;
+    return {
+      ok: true,
+      changed,
+      ...(!changed && isSingle
+        ? { reason: 'Cannot delete a task while it or a subtask is still active.' }
+        : {}),
+    };
+  }
+
   /**
    * Conditional commands (claim/promote/delete/retention) must not create a
    * revision/feed event when their guarded first statement changes no rows. The
@@ -1272,6 +1614,12 @@ export class SqliteTaskRepository implements TaskRepository {
         return this.retryTurn(command);
       case 'upsertTask':
         return this.writeTask(command.task, true);
+      case 'clearHistory':
+        return this.deleteTaskRootsIfIdle(command);
+      case 'deleteTaskSubtreeIfIdle':
+        return this.deleteTaskRootsIfIdle(command);
+      case 'renameTask':
+        return this.renameTask(command);
       case 'deleteTask': {
         const results = await this.writeIfFirstChanged(
           { sql: 'DELETE FROM tasks WHERE workspace_id = ? AND id = ?', params: [this.workspaceId, command.taskId] }, [],
@@ -1396,6 +1744,7 @@ export class SqliteTaskRepository implements TaskRepository {
       case 'settleTurnAndApplyEffects':
         return this.settleTurnAndApplyEffects(command);
       case 'applyRetention':
+      case 'applyRetentionPolicy':
         return this.applyRetention(command);
       default: {
         const _exhaustive: never = command;
@@ -1809,7 +2158,11 @@ export class SqliteTaskRepository implements TaskRepository {
     };
   }
 
-  private async applyRetention(command: Extract<RepositoryCommand, { kind: 'applyRetention' }>): Promise<RepositoryCommandResult> {
+  private async applyRetention(
+    command:
+      | Extract<RepositoryCommand, { kind: 'applyRetention' }>
+      | Extract<RepositoryCommand, { kind: 'applyRetentionPolicy' }>,
+  ): Promise<RepositoryCommandResult> {
     const task = await this.getTask(command.taskId);
     if (!task) return { ok: true, changed: false };
     if (isTerminalLifecycle(task.lifecycle)) {

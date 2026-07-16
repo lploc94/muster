@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { JsonTaskRepository, SqliteTaskRepository } from './repository';
+import { JsonTaskRepository, SqliteTaskRepository, type TaskRepository } from './repository';
 import { TaskStore } from './store';
 import type { MusterTask, OperationLedgerEntry, TaskStoreFile } from './types';
 import { DbClient } from './sqlite/client';
@@ -91,6 +91,70 @@ describe('JsonTaskRepository', () => {
 });
 
 describe('SqliteTaskRepository', () => {
+  it('keeps host history commands atomic and parity-compatible across adapters', async () => {
+    const jsonPath = `/tmp/muster-repository-history-${Date.now()}-${Math.random()}.json`;
+    const jsonStore = TaskStore.load({ filePath: jsonPath });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-history-sqlite-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const repositories: TaskRepository[] = [
+        new JsonTaskRepository(jsonStore, 'ws'),
+        new SqliteTaskRepository(client, 'ws'),
+      ];
+      await client.run(
+        `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at) VALUES (?,?,?,?,?)`,
+        ['ws', 'history-identity', 'History', 'now', 'now'],
+      );
+      for (const [index, repository] of repositories.entries()) {
+        const root = makeTask(`history-root-${index}`);
+        const child = makeTask(`history-child-${index}`);
+        child.parentId = root.id;
+        const active = makeTask(`history-active-${index}`);
+        const queued = makeTask(`history-queued-${index}`);
+        await repository.execute({ kind: 'createTask', workspaceId: 'ws', task: root });
+        await repository.execute({ kind: 'createTask', workspaceId: 'ws', task: child });
+        await repository.execute({ kind: 'createTask', workspaceId: 'ws', task: active });
+        await repository.execute({ kind: 'createTask', workspaceId: 'ws', task: queued });
+        await repository.execute({
+          kind: 'createTurn', workspaceId: 'ws',
+          turn: { id: `active-turn-${index}`, taskId: active.id, sequence: 1, status: 'running', trigger: 'user', inputs: [], createdAt: '2026-07-16T00:00:01.000Z' },
+        });
+        await repository.execute({
+          kind: 'createTurn', workspaceId: 'ws',
+          turn: { id: `queued-turn-${index}`, taskId: queued.id, sequence: 1, status: 'queued', trigger: 'user', inputs: [], createdAt: '2026-07-16T00:00:02.000Z' },
+        });
+
+        await expect(repository.execute({
+          kind: 'renameTask', workspaceId: 'ws', taskId: root.id, goal: 'renamed',
+          expectedTaskRevision: 0, updatedAt: '2026-07-16T00:00:03.000Z',
+        })).resolves.toMatchObject({ changed: true });
+        await expect(repository.getTask(root.id)).resolves.toMatchObject({ goal: 'renamed', revision: 1 });
+        await expect(repository.execute({
+          kind: 'renameTask', workspaceId: 'ws', taskId: root.id, goal: 'stale',
+          expectedTaskRevision: 0, updatedAt: '2026-07-16T00:00:04.000Z',
+        })).resolves.toMatchObject({ changed: false });
+
+        await expect(repository.execute({
+          kind: 'deleteTaskSubtreeIfIdle', workspaceId: 'ws', rootTaskId: queued.id,
+        })).resolves.toMatchObject({ changed: false });
+        await expect(repository.getTask(queued.id)).resolves.toBeDefined();
+
+        await expect(repository.execute({
+          kind: 'clearHistory', workspaceId: 'ws', preserveRootTaskId: active.id,
+        })).resolves.toMatchObject({ changed: true });
+        await expect(repository.getTask(root.id)).resolves.toBeUndefined();
+        await expect(repository.getTask(child.id)).resolves.toBeUndefined();
+        await expect(repository.getTask(active.id)).resolves.toBeDefined();
+        await expect(repository.getTask(queued.id)).resolves.toBeDefined();
+      }
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+      try { fs.unlinkSync(jsonPath); } catch { /* test cleanup */ }
+    }
+  }, 20_000);
+
   it('runs the same named-command and transcript-page contract on JSON and SQLite', async () => {
     const task = makeTask('contract-task');
     const turn = {
@@ -213,7 +277,7 @@ describe('SqliteTaskRepository', () => {
         const exported = await repository.readEnvelopeForMigration();
         expect(exported.toolCalls?.[`${turn.id}:tool`]).toMatchObject({ output: 'done' });
         expect(exported.reasoning?.[`${turn.id}:reasoning`]).toMatchObject({ content: 'think' });
-        await expect(repository.execute({ kind: 'applyRetention', workspaceId: 'ws', taskId: task.id, keepLatestTurns: 1 })).resolves.toMatchObject({ changed: false });
+        await expect(repository.execute({ kind: 'applyRetentionPolicy', workspaceId: 'ws', taskId: task.id, keepLatestTurns: 1 })).resolves.toMatchObject({ changed: false });
       }
     } finally {
       await client.close();
