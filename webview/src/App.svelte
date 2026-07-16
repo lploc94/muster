@@ -853,6 +853,60 @@
   </div>
 {/if}
 
+<!-- Global runtime interaction stack: pending permission + elicitation prompts stay
+     mounted independently of Settings/task mutual exclusion so they remain operable
+     and wheel-scrollable under html/body/#app overflow:hidden. -->
+{#if pendingPermission || pendingElicitations.length > 0}
+  <div
+    class="runtime-interaction-stack"
+    data-testid="runtime-interaction-stack"
+    role="region"
+    aria-label="Runtime interaction prompts"
+  >
+    {#if pendingPermission}
+      <PermissionCard
+        permissionId={pendingPermission.permissionId}
+        title={pendingPermission.title}
+        kind={pendingPermission.kind}
+        classification={pendingPermission.classification}
+        options={pendingPermission.options}
+      />
+    {/if}
+
+    {#each pendingElicitations as pe (pe.promptId)}
+      {#if pe.kind === 'form'}
+        <ElicitationFormCard
+          promptId={pe.promptId}
+          message={pe.message}
+          fields={pe.fields as Array<{
+            key: string;
+            type: string;
+            title?: string;
+            description?: string;
+            options?: string[];
+            required?: boolean;
+            default?: unknown;
+          }>}
+          required={pe.required}
+          askLike={pe.askLike}
+          submissionError={pe.submissionError}
+          submissionVersion={pe.submissionVersion}
+        />
+      {:else}
+        <ElicitationUrlCard
+          promptId={pe.promptId}
+          elicitationId={pe.elicitationId}
+          url={pe.url}
+          message={pe.message}
+          waiting={pe.waiting}
+          submissionError={pe.submissionError}
+          submissionVersion={pe.submissionVersion}
+        />
+      {/if}
+    {/each}
+  </div>
+{/if}
+
 {#if settingsOpen}
   <SettingsPanel
     onClose={closeSettings}
@@ -921,48 +975,6 @@
   </div>
 {/if}
 
-{#if pendingPermission}
-  <PermissionCard
-    permissionId={pendingPermission.permissionId}
-    title={pendingPermission.title}
-    kind={pendingPermission.kind}
-    classification={pendingPermission.classification}
-    options={pendingPermission.options}
-  />
-{/if}
-
-{#each pendingElicitations as pe (pe.promptId)}
-  {#if pe.kind === 'form'}
-    <ElicitationFormCard
-      promptId={pe.promptId}
-      message={pe.message}
-      fields={pe.fields as Array<{
-        key: string;
-        type: string;
-        title?: string;
-        description?: string;
-        options?: string[];
-        required?: boolean;
-        default?: unknown;
-      }>}
-      required={pe.required}
-      askLike={pe.askLike}
-      submissionError={pe.submissionError}
-      submissionVersion={pe.submissionVersion}
-    />
-  {:else}
-    <ElicitationUrlCard
-      promptId={pe.promptId}
-      elicitationId={pe.elicitationId}
-      url={pe.url}
-      message={pe.message}
-      waiting={pe.waiting}
-      submissionError={pe.submissionError}
-      submissionVersion={pe.submissionVersion}
-    />
-  {/if}
-{/each}
-
 {#if !inChat}
   <!-- Entry: New task action, then the searchable previous-tasks list.
        Sidebar background across the whole entry so the New-task header shares one
@@ -980,7 +992,7 @@
       <button
         type="button"
         class="icon-btn shrink-0 mr-2"
-        style="width: 22px; height: 22px;"
+       
         onclick={openSettings}
         aria-label="Settings"
         aria-pressed={settingsOpen}
@@ -1007,7 +1019,7 @@
       <button
         type="button"
         class="icon-btn"
-        style="width: 22px; height: 22px;"
+       
         onclick={backToList}
         aria-label="Back to tasks list"
         use:tip={'Back to tasks list'}
@@ -1020,7 +1032,7 @@
       <button
         type="button"
         class="icon-btn"
-        style="width: 22px; height: 22px;"
+       
         onclick={() => (historyOpen = !historyOpen)}
         aria-label="History (previous coordinator tasks)"
         use:tip={'History (previous coordinator tasks)'}
@@ -1031,7 +1043,7 @@
       <button
         type="button"
         class="icon-btn"
-        style="width: 22px; height: 22px;"
+       
         onclick={() => { tasks.openNewTaskDraft(); post({ type: 'newTask' }); historyOpen = false; }}
         aria-label="New task"
         use:tip={'New task'}
@@ -1042,7 +1054,7 @@
       <button
         type="button"
         class="icon-btn"
-        style="width: 22px; height: 22px;"
+       
         aria-label="Export task/chat"
         data-testid="export-task-chat"
         use:tip={'Export task/chat'}
@@ -1059,7 +1071,7 @@
       <button
         type="button"
         class="icon-btn"
-        style="width: 22px; height: 22px;"
+       
         onclick={openSettings}
         aria-label="Settings"
         aria-pressed={settingsOpen}
@@ -1082,12 +1094,12 @@
       <button
         type="button"
         aria-label="Close history"
-        class="absolute left-0 right-0 bottom-0 top-[28px] z-40 cursor-default"
+        class="absolute left-0 right-0 bottom-0 top-9 z-40 cursor-default"
         style="background: transparent; border: none;"
         onclick={() => (historyOpen = false)}
       ></button>
       <div
-        class="absolute right-3 top-[28px] z-50 w-80 max-w-[min(20rem,calc(100%-1rem))] max-h-[min(55vh,320px)] overflow-auto rounded border shadow"
+        class="absolute right-3 top-9 z-50 w-80 max-w-[min(20rem,calc(100%-1rem))] max-h-[min(55vh,320px)] overflow-auto rounded border shadow"
         style="background: var(--vscode-editor-background); border-color: var(--vscode-panel-border);"
       >
         <div class="flex items-center justify-between px-2 py-1 border-b text-xs" style="border-color: var(--vscode-panel-border);">

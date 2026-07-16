@@ -1011,6 +1011,29 @@ body {
   color: inherit;
 }
 
+/* Bounded global stack for pending PermissionCard / Elicitation prompts.
+ * Lives outside Settings/task mutual exclusion so prompts remain operable while
+ * Settings is open. Local overflow-y:auto is the only scroll surface under the
+ * html/body/#app overflow:hidden pin — wheel events over the stack reach Accept. */
+.runtime-interaction-stack {
+  flex: 0 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  min-width: 0;
+  min-height: 0;
+  /* Leave room for Settings / task chrome below; long forms scroll inside. */
+  max-height: min(70vh, 100%);
+  overflow-x: hidden;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  box-sizing: border-box;
+  border-bottom: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-editor-background, var(--vscode-sideBar-background));
+  z-index: 2;
+}
+
 .settings-panel {
   display: flex;
   flex: 1 1 0;
@@ -1020,9 +1043,8 @@ body {
   max-width: 100%;
   min-width: 0;
   min-height: 0;
-  /* Fill the fixed #app viewport; never grow past it. */
-  height: 100%;
-  max-height: 100%;
+  /* Share remaining #app column space with the runtime stack (no height:100%
+   * so a pending permission above Settings stays visible). */
   overflow: hidden;
   box-sizing: border-box;
   background: var(--vscode-editor-background, var(--vscode-sideBar-background));
@@ -1786,12 +1808,18 @@ body {
   vertical-align: middle;
 }
 
-/* Consistent icon button style for toolbar actions */
+/* Consistent icon button style for toolbar actions.
+   Minimum 28×28 CSS-pixel hit area (WCAG practical target for compact chrome). */
 .icon-btn {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 0.25rem;
+  box-sizing: border-box;
+  min-width: 28px;
+  min-height: 28px;
+  width: 28px;
+  height: 28px;
+  padding: 0;
   border-radius: 0.25rem;
   background: none;
   border: none;
@@ -2000,6 +2028,13 @@ body {
 
 @keyframes blink {
   50% { opacity: 0; }
+}
+
+/* Stop infinite streaming cursor blink when the user prefers reduced motion. */
+@media (prefers-reduced-motion: reduce) {
+  .streaming-cursor {
+    animation: none;
+  }
 }
 
 /* When we switch from streaming to final markdown, try to reduce flash */
