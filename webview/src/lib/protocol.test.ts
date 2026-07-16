@@ -838,6 +838,46 @@ describe('composer selection protocol', () => {
   });
 });
 
+describe('skills protocol', () => {
+  it('accepts host skillsAvailable messages (incl. empty cold-cache set)', () => {
+    expect(
+      // Host now sends the uniform `/` trigger prefix for every backend (Codex
+      // included); the `$` injection prefix is applied host-side and is never sent
+      // in the skillsAvailable webview message.
+      isExtMessage({ type: 'skillsAvailable', backend: 'codex', prefix: '/', skills: ['plan'] }),
+    ).toBe(true);
+    expect(
+      isExtMessage({ type: 'skillsAvailable', backend: 'claude', prefix: '/', skills: [] }),
+    ).toBe(true);
+  });
+
+  it('rejects malformed skillsAvailable messages', () => {
+    expect(isExtMessage({ type: 'skillsAvailable', backend: 'codex', prefix: '$' })).toBe(false);
+    expect(
+      isExtMessage({ type: 'skillsAvailable', backend: 'codex', prefix: 1, skills: [] }),
+    ).toBe(false);
+    expect(
+      isExtMessage({ type: 'skillsAvailable', backend: 'codex', prefix: '$', skills: [1] }),
+    ).toBe(false);
+  });
+
+  it('posts listSkills to the host', () => {
+    vi.mocked(vscode.postMessage).mockClear();
+    const message: OutMessage = { type: 'listSkills', backend: 'codex' };
+    post(message);
+    expect(vscode.postMessage).toHaveBeenCalledWith({ type: 'listSkills', backend: 'codex' });
+  });
+
+  it('send OutMessage carries structured skills', () => {
+    vi.mocked(vscode.postMessage).mockClear();
+    const message: OutMessage = { type: 'send', text: 'hi', skills: ['plan', 'review'] };
+    post(message);
+    expect(vscode.postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'send', text: 'hi', skills: ['plan', 'review'] }),
+    );
+  });
+});
+
 describe('task export protocol', () => {
   it('posts exportTask as a distinct OutMessage with taskId only', () => {
     vi.mocked(vscode.postMessage).mockClear();

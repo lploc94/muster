@@ -748,3 +748,120 @@ describe('W1 single freeze site + host prepare', () => {
     }
   });
 });
+
+describe('startNewTask — skills wiring + per-backend prefix', () => {
+  // Gated backend that records the compiled first-turn prompt.
+  function gatedBackend(): { backend: Backend; captured: () => string; resume: () => void } {
+    let capturedPrompt = '';
+    let resumeFn: (() => void) | undefined;
+    const gate = new Promise<void>((r) => {
+      resumeFn = r;
+    });
+    const backend: Backend = {
+      name: 'fake',
+      capabilities: MCP_CAPS,
+      async *run(options: RunOptions) {
+        capturedPrompt = options.prompt ?? '';
+        yield { type: 'sessionStarted', sessionId: 's-skill-wiring' };
+        await gate;
+        yield { type: 'turnCompleted' };
+      },
+    };
+    return { backend, captured: () => capturedPrompt, resume: () => resumeFn?.() };
+  }
+
+  it('normalizes skills onto the new task brief (dedupe + drop blanks)', async () => {
+    const { store } = makeTempStore();
+    const { backend, resume } = gatedBackend();
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => backend,
+      clock: () => '2026-07-06T12:00:00.000Z',
+      getHostEnvironment: () => hostSnap(),
+      isWorkspaceTrusted: () => true,
+      getTaskTypeRegistry: () => EMPTY_TASK_TYPES,
+    });
+
+    const started = engine.startNewTask({
+      goal: 'Coordinate the work',
+      backend: 'fake',
+      role: 'coordinator',
+      skills: ['plan', 'plan', '  review  ', ''],
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+
+    // Brief is committed synchronously during startNewTask.
+    const task = store.getTask(started.value.taskId);
+    expect(task?.brief?.skills).toEqual(['plan', 'review']);
+
+    await new Promise((r) => setTimeout(r, 40));
+    engine.stageDisposition(started.value.turnId, { kind: 'idle' }, 'op-skills');
+    resume();
+    await engine.whenIdle();
+  });
+
+  it('continuation (continuationOf set) ignores skills — no first turn to inject into', async () => {
+    const { store } = makeTempStore();
+    const { backend, resume } = gatedBackend();
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => backend,
+      clock: () => '2026-07-06T12:00:00.000Z',
+      getHostEnvironment: () => hostSnap(),
+      isWorkspaceTrusted: () => true,
+      getTaskTypeRegistry: () => EMPTY_TASK_TYPES,
+    });
+
+    const started = engine.startNewTask({
+      goal: 'Continue prior work',
+      backend: 'fake',
+      role: 'coordinator',
+      continuationOf: 'prior-task-id',
+      skills: ['plan'],
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+
+    const task = store.getTask(started.value.taskId);
+    expect(task?.brief?.skills).toBeUndefined();
+
+    await new Promise((r) => setTimeout(r, 40));
+    engine.stageDisposition(started.value.turnId, { kind: 'idle' }, 'op-cont');
+    resume();
+    await engine.whenIdle();
+  });
+
+  it('threads the per-backend prefix into the first-turn injection (Codex `$`)', async () => {
+    const { store } = makeTempStore();
+    const { backend, captured, resume } = gatedBackend();
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => backend,
+      clock: () => '2026-07-06T12:00:00.000Z',
+      getHostEnvironment: () => hostSnap(),
+      isWorkspaceTrusted: () => true,
+      getTaskTypeRegistry: () => EMPTY_TASK_TYPES,
+      // UNKNOWN advertised set → optimistic inject; `$` prefix from DI.
+      getAdvertisedCommands: () => undefined,
+      getSkillPrefix: () => '$',
+    });
+
+    const started = engine.startNewTask({
+      goal: 'Coordinate the work',
+      backend: 'fake',
+      role: 'coordinator',
+      skills: ['plan'],
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+
+    await new Promise((r) => setTimeout(r, 40));
+    expect(captured().startsWith('$plan\n\n')).toBe(true);
+    expect(captured()).not.toContain('/plan');
+
+    engine.stageDisposition(started.value.turnId, { kind: 'idle' }, 'op-prefix');
+    resume();
+    await engine.whenIdle();
+  });
+});

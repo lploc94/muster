@@ -705,6 +705,8 @@
                 rejected.text,
                 rejected.clientRequestId,
                 rejected.mentionBindings,
+                rejected.skills,
+                rejected.backend,
               );
             }
             // Outbox stays until muster:prefill-applied confirms restore.
@@ -779,7 +781,13 @@
     });
     if (!entry) return;
     if (tasks.composerPrefill?.clientRequestId === entry.clientRequestId) return;
-    tasks.prefillComposer(entry.text, entry.clientRequestId, entry.mentionBindings);
+    tasks.prefillComposer(
+      entry.text,
+      entry.clientRequestId,
+      entry.mentionBindings,
+      entry.skills,
+      entry.backend,
+    );
   });
 </script>
 

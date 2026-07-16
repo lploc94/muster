@@ -54,6 +54,14 @@ class TasksState {
    */
   selectedBackend = $state<WebviewBackendId>('claude');
 
+  /**
+   * True once the host init handshake has reached the composer (backendsAvailable,
+   * always posted on init — and any composerSelection override). Gates a
+   * backend-scoped skill-chip restore so we do not drop valid chips on a transient
+   * pre-hydration backend value.
+   */
+  hostHydrated = $state(false);
+
   /** Model shown for selectedBackend; null = backend default. */
   selectedModel = $state<string | null>(null);
 
@@ -96,6 +104,9 @@ class TasksState {
     nonce: number;
     clientRequestId?: string;
     mentionBindings?: Array<[string, string]>;
+    skills?: string[];
+    /** Backend the restored skills belong to; chips restore only when it matches. */
+    skillsBackend?: string;
   } | null>(null);
   private prefillNonceSeq = 0;
 
@@ -160,6 +171,9 @@ class TasksState {
 
   setAvailableBackends(ids: string[]): void {
     this.availableBackends = ids;
+    // The host always posts backendsAvailable on init → the composer backend is
+    // now considered hydrated for the purpose of a backend-scoped chip restore.
+    this.hostHydrated = true;
     // Recompute display only — never overwrite preferredBackend/model.
     this.syncDisplaySelection();
   }
@@ -389,6 +403,8 @@ class TasksState {
     text: string,
     clientRequestId?: string,
     mentionBindings?: Array<[string, string]>,
+    skills?: string[],
+    skillsBackend?: string,
   ): void {
     this.prefillNonceSeq += 1;
     this.composerPrefill = {
@@ -396,6 +412,8 @@ class TasksState {
       nonce: this.prefillNonceSeq,
       ...(clientRequestId ? { clientRequestId } : {}),
       ...(mentionBindings && mentionBindings.length > 0 ? { mentionBindings } : {}),
+      ...(skills && skills.length > 0 ? { skills } : {}),
+      ...(skillsBackend ? { skillsBackend } : {}),
     };
   }
 

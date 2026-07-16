@@ -20,6 +20,8 @@ import type {
   PermissionController,
   QuestionController,
 } from './backends/acp-client';
+import { SKILL_TRIGGER_PREFIX, skillPrefixForBackend } from './backends/skill-prefix';
+import { discoverSkillNames } from './host/skill-discovery';
 import { ElicitationBridge } from './bridge/elicitation-bridge';
 import type { PermissionAuditEntry, PermissionMode } from './backends/permission-policy';
 import {
@@ -92,6 +94,7 @@ import { isTerminalLifecycle } from './task/transitions';
 import { resolveWorkspaceCwd } from './task/workspace-cwd';
 import type { TaskStoreFile } from './task/types';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 
 let askBridge: AskBridge | undefined;
@@ -780,6 +783,26 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       // the webview meanwhile fails open and shows all backends.
       this.availableBackendsPromise = undefined;
     }
+  }
+
+  /**
+   * Answer a `listSkills` request with the uniform composer trigger prefix and the
+   * backend's discovered skills. The trigger prefix is ALWAYS `/`, identical for
+   * every backend: the picker UX is normalized to `/` and the host translates to
+   * the per-backend wire prefix (`$` for Codex) at injection time — so this is the
+   * TRIGGER/display prefix, NOT `skillPrefixForBackend` (the injection prefix).
+   * NOT cached: skills are re-discovered on every request (a cheap disk scan);
+   * `prefix` is ALWAYS returned so the trigger char works even when `skills` is
+   * empty (cold cache → graceful inline-text degrade).
+   */
+  private postAvailableSkills(backend: string): void {
+    if (typeof backend !== 'string' || !backend) return;
+    const prefix = SKILL_TRIGGER_PREFIX;
+    // Discover skills from disk (.claude/skills, .codex/skills, ...) so the picker
+    // works cold and lists only real skills — the ACP advertised set is polluted
+    // with built-in slash commands and only populates after a session has run.
+    const skills = discoverSkillNames(backend, resolveTaskCwd(), os.homedir());
+    this.post({ type: 'skillsAvailable', backend, prefix, skills });
   }
 
   /** Push host-persisted last-used backend/model so the picker survives restarts. */
@@ -1518,6 +1541,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     backend?: string;
     model?: string;
     continuationOf?: string;
+    /** Structured skill chips for a NEW task's first-turn injection. */
+    skills?: string[];
     clientRequestId?: string;
   }): Promise<void> {
     const clientRequestId =
@@ -1638,6 +1663,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         backend: resolvedBackend,
         model: resolvedModel,
         continuationOf: data.continuationOf,
+        // Skills are first-turn-only; startNewTask ignores them for continuations.
+        ...(Array.isArray(data.skills) && data.skills.length ? { skills: data.skills } : {}),
         // Capture the workspace cwd at task-creation time so every turn (and any
         // delegated child) runs in the right directory instead of process.cwd().
         cwd: resolveTaskCwd(),
@@ -2460,6 +2487,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         case 'listBackends':
           void this.postAvailableBackends();
           break;
+        case 'listSkills':
+          this.postAvailableSkills((data as { backend: string }).backend);
+          break;
         case 'listModels':
           void this.postAvailableModels();
           break;
@@ -3085,6 +3115,9 @@ export async function activate(context: vscode.ExtensionContext) {
       // command set (keyed by backend id == AcpAgentConfig.key). Never spawns.
       getAdvertisedCommands: (backend: string) =>
         peekSharedAcpClient(backend)?.getAdvertisedCommands(),
+      // Per-backend skill invocation prefix (`/` default, `$` for Codex). Kept in
+      // backends/ so task/ never imports it; supplied to the engine via DI.
+      getSkillPrefix: (backend: string) => skillPrefixForBackend(backend),
       emit: (event) => {
         try {
           provider.forwardTurnEvent(event);
