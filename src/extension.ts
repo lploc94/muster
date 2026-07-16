@@ -92,6 +92,7 @@ import { applyRetention, retentionChanged, type RetentionConfig } from './task/r
 import { TaskEngine, type EngineEvent, viewStatusFromDraft } from './task/engine';
 import type { HostEnvironmentSnapshot } from './task/host-context';
 import { TaskStore, computeAffectedTaskIds, type CommitResult } from './task/store';
+import { probeNodeSqlite } from './task/sqlite/probe';
 import { isTerminalLifecycle } from './task/transitions';
 import { resolveWorkspaceCwd } from './task/workspace-cwd';
 import type { TaskStoreFile } from './task/types';
@@ -2570,6 +2571,17 @@ export async function activate(context: vscode.ExtensionContext) {
   // Patch PATH from the login shell BEFORE anything spawns a backend CLI, so a
   // GUI-launched editor (minimal PATH) can both detect and actually run the CLIs.
   await installAugmentedPath();
+
+  // Feature-probe node:sqlite at activation (plan §3.5). While the JSON store is
+  // still the source of truth this is ADVISORY only: a host that satisfies
+  // engines.vscode ^1.101 but lacks node:sqlite (an exotic fork/repackaging) must
+  // not be bricked when SQLite is not yet used. We surface a clear diagnostic now
+  // so the gap is visible before the Phase 5 cutover, at which point this becomes a
+  // hard gate (SQLite becomes the only writable source).
+  const sqliteProbe = probeNodeSqlite();
+  if (!sqliteProbe.available) {
+    debugMuster('sqlite.probe.unavailable', { reason: sqliteProbe.reason });
+  }
 
   const wsFolder = vscode.workspace.workspaceFolders?.[0];
   workspaceRoot = wsFolder?.uri.fsPath;

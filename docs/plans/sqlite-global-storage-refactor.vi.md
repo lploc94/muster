@@ -115,28 +115,31 @@ worker thread sở hữu connection; host giao tiếp qua typed request/response
 write queue FIFO cục bộ, còn SQLite WAL điều phối giữa các process. Timeout/busy xảy ra
 trong worker và trả structured error; không chặn VS Code event loop.
 
-### 3.5 Driver và packaging — gate bắt buộc
+### 3.5 Driver chốt: `node:sqlite`
 
-Không dùng `node:sqlite` ở baseline hiện tại: module này chỉ xuất hiện từ Node 22.5,
-trong khi extension khai báo VS Code `^1.94.0` và không thể giả định mọi desktop/remote
-extension host chạy Node đủ mới.
+Chọn built-in `node:sqlite` (`DatabaseSync`) và nâng `engines.vscode` từ `^1.94.0` lên
+`^1.101.0`. Lý do: VS Code 1.101 nâng Node extension host từ v20 lên v22; `node:sqlite`
+đã có từ Node 22.5 và từ Node 22.13 không còn cần flag. Node người dùng cài trong terminal
+không quyết định runtime extension — desktop/remote extension host mới là runtime thật.
 
-Ứng viên mặc định là `better-sqlite3` vì API transaction synchronous phù hợp engine hiện
-tại, nhưng đây là native dependency. Phase 1 phải hoàn tất spike packaging trước khi viết
-repository production:
+Lợi ích so với `better-sqlite3`:
 
-- externalize native module khỏi TypeScript/webview bundle;
-- sửa `.vscodeignore` (hiện đang loại toàn bộ `node_modules/**`) để VSIX chứa đúng binary;
-- build platform-specific VSIX cho `darwin-arm64`, `darwin-x64`, `linux-x64`,
-  `linux-arm64`, `win32-x64` (và target khác nếu project tuyên bố support);
-- test cả desktop Electron extension host và Remote/VS Code Server Node host; native ABI
-  có thể khác nhau, không tái dùng mù quáng cùng `.node` binary;
-- pin exact driver version và checksum/prebuild provenance trong lockfile/CI;
-- có activation smoke test mở DB, transaction, close/reopen từ VSIX đã đóng gói.
+- không native dependency trong VSIX;
+- không Electron/Node ABI matrix;
+- không cần platform-specific package chỉ vì SQLite;
+- desktop và Remote host dùng module built-in của chính runtime đang chạy;
+- giảm supply-chain và release maintenance.
 
-Nếu spike không pass đủ target, dừng ở decision gate và lập ADR chọn driver khác. Không
-fallback sang `sql.js` nếu nó phải serialize toàn database sau mỗi write, vì như vậy tái
-tạo bottleneck JSON dưới dạng khác.
+Điều kiện bắt buộc:
+
+- cập nhật `package.json.engines.vscode` và test install refusal trên VS Code cũ;
+- activation feature-probe bằng `require('node:sqlite')`; fork/host khai tương thích nhưng
+  thiếu module phải fail rõ với hướng dẫn upgrade, không fallback im lặng sang JSON;
+- DB vẫn chạy trong worker thread vì `DatabaseSync` là synchronous;
+- CI/Extension Host test chạy trên minimum VS Code 1.101 và stable VS Code hiện hành;
+- test cả desktop và Remote extension host;
+- không thêm fallback `better-sqlite3`/`sql.js`: hai driver production làm tăng matrix,
+  migration risk và behavior drift.
 
 ## 4. Schema v1 đề xuất
 
@@ -447,12 +450,13 @@ Không duy trì JSON và SQLite song song sau cutover vì dễ split-brain. Có 
 
 ### Phase 1 — SQLite foundation
 
-- Chọn driver hỗ trợ VS Code extension packaging trên macOS/Linux/Windows.
+- Nâng minimum VS Code lên `^1.101.0`, thêm runtime feature-probe cho `node:sqlite`.
 - Tạo DB worker/RPC, connection manager, pragmas, schema migrations và workspace registry.
 - Test WAL multi-connection, busy timeout, crash transaction và foreign keys.
 
-**Gate:** packaged VSIX load được native dependency trên các target platform; artificial
-5-second DB lock không block extension-host heartbeat/UI command.
+**Gate:** VSIX chạy `node:sqlite` trên minimum/current desktop + Remote host; VS Code cũ
+bị từ chối đúng bởi engine compatibility; artificial 5-second DB lock không block
+extension-host heartbeat/UI command.
 
 ### Phase 2 — Repository boundary
 
@@ -525,7 +529,7 @@ performance budget pass trước khi feature flag mặc định chuyển sang SQ
 
 ## 11. Rủi ro cần chốt trước Phase 1
 
-1. Driver SQLite và chiến lược đóng gói native binaries cho VSIX/platform targets.
+1. Xác nhận product chấp nhận bỏ support VS Code 1.94–1.100 khi nâng minimum lên 1.101.
 2. Empty-window identity và cách relink khi workspace folder được rename/move.
 3. Retention của reasoning/tool payload và artifact files.
 4. Mức backward compatibility khi downgrade extension.
@@ -557,13 +561,9 @@ performance budget pass trước khi feature flag mặc định chuyển sang SQ
 
 ## 14. Tài liệu kỹ thuật tham chiếu
 
-- VS Code extension bundling và native external dependencies:
-  https://code.visualstudio.com/api/working-with-extensions/bundling-extension
-- VS Code platform-specific VSIX/native modules:
-  https://code.visualstudio.com/api/working-with-extensions/publishing-extension
-- VS Code Remote extension host và native module ABI:
-  https://code.visualstudio.com/api/advanced-topics/remote-extensions
-- Node built-in SQLite version history (lý do không giả định `node:sqlite` trên baseline):
+- VS Code 1.101 release notes (Node extension host v22):
+  https://code.visualstudio.com/updates/v1_101
+- Node built-in SQLite version history/API:
   https://nodejs.org/api/sqlite.html
-- better-sqlite3 repository/WAL/worker support:
-  https://github.com/WiseLibs/better-sqlite3
+- VS Code Remote extension host behavior:
+  https://code.visualstudio.com/api/advanced-topics/remote-extensions
