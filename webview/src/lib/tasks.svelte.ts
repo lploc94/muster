@@ -31,9 +31,6 @@ class TasksState {
   subtree = $state<TaskSummary[]>([]);
   storeRevision = $state(0);
 
-  /** Per-task watermark for stale taskUpdated guard (ISSUE-13). */
-  private revisionWatermarks = $state<Map<string, number>>(new Map());
-
   /**
    * Protocol v8 revision gap/invariant recovery. While true, live patches are
    * ignored until the next authoritative snapshot hydrate.
@@ -43,7 +40,7 @@ class TasksState {
   /** Unpersisted composer — first send has no taskId. */
   draftMode = $state(false);
 
-  /** Optional link when creating a draft after another task (legacy protocol field). */
+  /** Optional link when creating a draft after another task. */
   continuationOf = $state<string | null>(null);
 
   /**
@@ -308,12 +305,10 @@ class TasksState {
     const next = new Map<string, TaskSummary>();
     for (const task of snapshot.rootTasks) {
       next.set(task.id, task);
-      this.seedWatermark(task.id, snapshot.storeRevision);
     }
     if (snapshot.subtree) {
       for (const task of snapshot.subtree) {
         next.set(task.id, task);
-        this.seedWatermark(task.id, snapshot.storeRevision);
       }
     }
     this.tasks = next;
@@ -332,8 +327,16 @@ class TasksState {
       this.continuationOf = null;
       this.queuedTurns = sortQueuedTurns(snapshot.queuedTurns ?? []);
       this.reconcilePendingHandoffTarget(snapshot.focusedTaskId);
-    } else if (!this.draftMode) {
-      this.queuedTurns = [];
+    } else {
+      // Authoritative unfocused snapshot clears chat focus unless the user is
+      // intentionally composing a new draft task.
+      if (!this.draftMode) {
+        this.focusedTaskId = null;
+        this.pendingFocusTaskId = null;
+        this.queuedTurns = [];
+      } else {
+        this.queuedTurns = [];
+      }
     }
   }
 
@@ -346,9 +349,6 @@ class TasksState {
     this.needsRecovery = state.needsRecovery;
     this.tasks = new Map(state.tasks);
     this.subtree = [...state.subtree];
-    for (const task of state.tasks.values()) {
-      this.seedWatermark(task.id, state.revision);
-    }
     if (state.focusedTaskId) {
       this.focusedTaskId = state.focusedTaskId;
       this.queuedTurns = sortQueuedTurns(state.queuedTurns);
@@ -363,41 +363,6 @@ class TasksState {
 
   markNeedsRecovery(): void {
     this.needsRecovery = true;
-  }
-
-  applyTaskUpdated(taskId: string, storeRevision: number, patch: Partial<TaskSummary>): void {
-    const watermark = this.revisionWatermarks.get(taskId) ?? 0;
-    if (storeRevision <= watermark) return;
-
-    const existing = this.tasks.get(taskId);
-    const merged: TaskSummary = {
-      ...(existing ?? {
-        id: taskId,
-        parentId: null,
-        goal: '',
-        role: 'coordinator',
-        lifecycle: 'open',
-        runtimeActivity: 'idle',
-        viewStatus: 'idle',
-        currentTurnActivity: null,
-        updatedAt: new Date(0).toISOString(),
-        backend: '',
-      }),
-      ...patch,
-      id: taskId,
-    };
-    // Reassign Map so $state consumers (root list / focusedTask) refresh.
-    const nextTasks = new Map(this.tasks);
-    nextTasks.set(taskId, merged);
-    this.tasks = nextTasks;
-    this.revisionWatermarks.set(taskId, storeRevision);
-    this.storeRevision = Math.max(this.storeRevision, storeRevision);
-
-    // Update existing subtree members only (including root) — never invent membership.
-    if (this.subtree.some((t) => t.id === taskId)) {
-      this.subtree = this.subtree.map((t) => (t.id === taskId ? merged : t));
-    }
-    this.reconcilePendingHandoffTarget(taskId);
   }
 
   setCommandError(message: string | null, taskId: string | null = null): void {
@@ -460,7 +425,7 @@ class TasksState {
 
   /**
    * Request a host-orchestrated runtime handoff (model/backend switch) on an
-   * existing task. The host returns the durable binding through snapshot/taskUpdated;
+   * existing task. The host returns the durable binding through snapshot/workspacePatchBatch;
    * refusals use setCommandError via commandError inbound messages.
    */
   requestRuntimeHandoff(
@@ -499,10 +464,6 @@ class TasksState {
     this.pendingHandoffTarget = null;
   }
 
-  private seedWatermark(taskId: string, revision: number): void {
-    const prev = this.revisionWatermarks.get(taskId) ?? 0;
-    if (revision > prev) this.revisionWatermarks.set(taskId, revision);
-  }
 }
 
 export const tasks = new TasksState();

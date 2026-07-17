@@ -2,7 +2,7 @@
 
 ## Trạng thái
 
-**IN PROGRESS — Phase 4 pagination/incremental wire (P4-W3 ✅; P4-W4 ✅; P4-W5 ✅; P4-W6 ✅; P4-W7+ chưa bắt đầu).**
+**IN PROGRESS — Phase 4 pagination/incremental wire (P4-W3 ✅; P4-W4 ✅; P4-W5 ✅; P4-W6 ✅; P4-W7 ✅; P4-W8+ chưa bắt đầu).**
 Cập nhật: 2026-07-17
 
 - Phase 1: **đã qua gate** — worker/RPC, schema bootstrap, global-storage registry,
@@ -634,7 +634,7 @@ sau bắt đầu ngay khi wave trước đạt gate, chỉ dừng khi có blocke
 | P4-W4 ✅ | Bounded bootstrap | Snapshot focused task chỉ chứa 100 item + page metadata |
 | P4-W5 ✅ | Load older UX | Typed request/response, prepend idempotent, giữ scroll anchor |
 | P4-W6 ✅ | Revisioned patch reducer | Duplicate/stale patch là no-op; revision gap yêu cầu recovery |
-| P4-W7 | Local patch routing | Queue/tree/transcript update không kéo theo focused full snapshot |
+| P4-W7 ✅ | Local patch routing | Queue/tree/transcript update không kéo theo focused full snapshot |
 | P4-W8 | Stream batching | Assistant/reasoning persist + post coalesce 50–100 ms, flush ở tool/terminal boundary |
 | P4-W9 | Change-feed contract | Bounded feed, prune watermark, explicit gap result |
 | P4-W10 | Multi-window polling | Visible/focus polling + backoff; hai process hội tụ hoặc full-recover khi gap |
@@ -819,7 +819,8 @@ request; fixed page limit 100; **no W6 recovery**.
 
 ##### P4-W7 — Local patch routing
 
-- Host mutation nội bộ phát named patches sau durable commit.
+- Host mutation nội bộ phát atomic `workspacePatchBatch` sau durable commit + projection
+  refresh (`onAfterCommit` trên `withRepositoryProjection`).
 - Full snapshot chỉ dùng bootstrap, focus change hoặc recovery; queue/tree change không
   rebuild transcript nếu focused task không bị ảnh hưởng.
 - Loại `transcriptAppend`/`taskUpdated` one-off messages sau khi mọi caller chuyển xong.

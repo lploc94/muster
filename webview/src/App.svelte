@@ -593,20 +593,6 @@
           break;
         }
 
-        case 'taskUpdated': {
-          tasks.applyTaskUpdated(msg.taskId, msg.storeRevision, msg.patch);
-          if (msg.taskId === tasks.focusedTaskId) {
-            const focused = tasks.tasks.get(msg.taskId);
-            if (focused) {
-              threadStore.updateReadOnly(focused.lifecycle);
-              threadStore.updateRuntimeFlags(effectiveRuntimeActivity(focused));
-            } else if (msg.patch.lifecycle) {
-              threadStore.updateReadOnly(msg.patch.lifecycle);
-            }
-          }
-          break;
-        }
-
         case 'settingsSnapshot': {
           const next = msg.snapshot;
           const prev = settingsSnapshot;
@@ -708,10 +694,6 @@
           if (msg.taskId === tasks.focusedTaskId && msg.turnId === activeTurnId) {
             activeTurnId = null;
           }
-          break;
-
-        case 'transcriptAppend':
-          threadStore.onTranscriptAppend(msg.taskId, msg.item);
           break;
 
         case 'transcriptPageResult': {

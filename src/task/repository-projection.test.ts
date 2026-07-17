@@ -222,6 +222,55 @@ describe('RepositoryProjection — bounded activation (P4-W4 A)', () => {
 });
 
 describe('RepositoryProjection — bounded after-write refresh (P4-W4 B)', () => {
+  it('serializes concurrent execute → refresh → publish lifecycles by revision', async () => {
+    await withRepo('projection-concurrent-publish', async (repo) => {
+      const projection = await RepositoryProjection.load(repo, 'ws');
+      const baseRevision = projection.getFile().revision;
+      const publications: Array<{
+        previousRevision: number;
+        beforeRevision: number;
+        afterRevision: number;
+        commandTaskId: string;
+        visibleTaskIds: string[];
+      }> = [];
+      const wrapped = withRepositoryProjection(repo, projection, {
+        onAfterCommit: async (ctx) => {
+          const commandTaskId =
+            'task' in ctx.command && ctx.command.task ? ctx.command.task.id : 'unknown';
+          publications.push({
+            previousRevision: ctx.previousRevision,
+            beforeRevision: ctx.beforeFile.revision,
+            afterRevision: ctx.projection.getFile().revision,
+            commandTaskId,
+            visibleTaskIds: Object.keys(ctx.projection.getFile().tasks).sort(),
+          });
+        },
+      });
+
+      await Promise.all([
+        wrapped.execute({ kind: 'createTask', workspaceId: 'ws', task: makeTask('a') }),
+        wrapped.execute({ kind: 'createTask', workspaceId: 'ws', task: makeTask('b') }),
+      ]);
+
+      expect(publications).toEqual([
+        {
+          previousRevision: baseRevision,
+          beforeRevision: baseRevision,
+          afterRevision: baseRevision + 1,
+          commandTaskId: 'a',
+          visibleTaskIds: ['a'],
+        },
+        {
+          previousRevision: baseRevision + 1,
+          beforeRevision: baseRevision + 1,
+          afterRevision: baseRevision + 2,
+          commandTaskId: 'b',
+          visibleTaskIds: ['a', 'b'],
+        },
+      ]);
+    });
+  }, 20_000);
+
   it('refreshTask keeps only activity turns and active inputs after a write', async () => {
     await withRepo('projection-after-write', async (repo, client) => {
       const task = makeTask('write-task');

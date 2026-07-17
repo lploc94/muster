@@ -67,6 +67,41 @@ export async function buildRepositorySnapshot(
   focusedTaskId: string | undefined,
   activePendingAsks: ReadonlyMap<string, PendingAskOverlay>,
 ): Promise<RepositorySnapshotProjection> {
+  const readStableSnapshot = async (): Promise<RepositorySnapshotProjection> => {
+    // Separate repository queries are not an implicit SQLite read transaction.
+    // Verify the revision at both ends so an external writer cannot produce a
+    // snapshot stamped N with task metadata from N-1. Local writes are also
+    // excluded by runConsistentRead when the projection wrapper is present.
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const startRevision = await repository.getWorkspaceRevision();
+      const projection = await buildRepositorySnapshotAttempt(
+        repository,
+        workspaceId,
+        focusedTaskId,
+        activePendingAsks,
+      );
+      const endRevision = await repository.getWorkspaceRevision();
+      if (
+        startRevision === endRevision &&
+        projection.snapshot.storeRevision === endRevision
+      ) {
+        return projection;
+      }
+    }
+    throw new Error('workspace changed while building bounded snapshot');
+  };
+
+  return repository.runConsistentRead
+    ? repository.runConsistentRead(readStableSnapshot)
+    : readStableSnapshot();
+}
+
+async function buildRepositorySnapshotAttempt(
+  repository: TaskRepository,
+  workspaceId: string,
+  focusedTaskId: string | undefined,
+  activePendingAsks: ReadonlyMap<string, PendingAskOverlay>,
+): Promise<RepositorySnapshotProjection> {
   const tasks = await repository.listTasks(workspaceId);
   const taskMap = new Map(tasks.map((task) => [task.id, task]));
   const taskIds = tasks.map((task) => task.id);

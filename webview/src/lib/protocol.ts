@@ -403,12 +403,10 @@ export type ExtMessage =
   | PermissionSettingsSnapshotMessage
   | PermissionSettingsUpdateResultMessage
   | WorkspacePatchBatchMessage
-  | { type: 'taskUpdated'; taskId: string; storeRevision: number; patch: Partial<TaskSummary> }
   | { type: 'turnStart'; taskId: string; turnId: string; trigger: TurnTrigger }
   | { type: 'event'; taskId: string; turnId: string; event: NormalizedEvent }
   | { type: 'turnDone'; taskId: string; turnId: string }
   | { type: 'turnError'; taskId: string; turnId: string; message: string }
-  | { type: 'transcriptAppend'; taskId: string; item: TranscriptItem }
   | { type: 'askPending'; taskId: string; turnId: string; askId: string; questions: Question[] }
   | { type: 'askCleared'; taskId: string; turnId: string; askId: string }
   | {
@@ -1460,9 +1458,6 @@ export function isExtMessage(data: unknown): data is ExtMessage {
     case 'permissionSettingsUpdateResult':
       return hasOnlyKeys(data, ['type', 'result']) && isPermissionSettingsUpdateResult(data.result);
 
-    case 'taskUpdated':
-      return isString(data.taskId) && isNumber(data.storeRevision) && isRecord(data.patch);
-
     case 'workspacePatchBatch':
       return isWorkspacePatchBatchMessage(data);
 
@@ -1477,9 +1472,6 @@ export function isExtMessage(data: unknown): data is ExtMessage {
 
     case 'turnError':
       return isString(data.message);
-
-    case 'transcriptAppend':
-      return isString(data.taskId) && isTranscriptItem(data.item);
 
     case 'transcriptPageResult':
       return isTranscriptPageResultMessage(data);

@@ -168,6 +168,35 @@ describe('buildRepositorySnapshot', () => {
       });
     });
   }, 20_000);
+
+  it('retries the bounded read when a workspace revision changes mid-snapshot', async () => {
+    await withRepo('repository-snapshot-stable-retry', async (repo) => {
+      const first = task('first');
+      const late = task('late');
+      await repo.execute({ kind: 'createTask', workspaceId: 'ws', task: first });
+
+      const listTasks = repo.listTasks.bind(repo);
+      let listCalls = 0;
+      vi.spyOn(repo, 'listTasks').mockImplementation(async (workspaceId) => {
+        const rows = await listTasks(workspaceId);
+        listCalls += 1;
+        if (listCalls === 1) {
+          // Commit after rows were read, producing an intentionally torn first
+          // attempt. The revision fence must discard it and rebuild.
+          await repo.execute({ kind: 'createTask', workspaceId: 'ws', task: late });
+        }
+        return rows;
+      });
+
+      const projection = await buildRepositorySnapshot(repo, 'ws', undefined, new Map());
+      expect(listCalls).toBe(2);
+      expect(projection.snapshot.rootTasks.map((summary) => summary.id).sort()).toEqual([
+        first.id,
+        late.id,
+      ]);
+      expect(projection.snapshot.storeRevision).toBe(await repo.getWorkspaceRevision());
+    });
+  }, 20_000);
 });
 
 describe('buildRepositorySnapshot — bounded page (P4-W4 C)', () => {

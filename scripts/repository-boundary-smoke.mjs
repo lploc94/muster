@@ -113,6 +113,7 @@ export async function runRepositoryBoundarySmoke(rootDir = ROOT) {
     'src/host/repository-snapshot.ts',
     'src/task/repository-projection.ts',
     'src/host/transcript-page-route.ts',
+    'src/host/workspace-patch.ts',
   ]) {
     const raw = texts.get(rel);
     if (raw === undefined) {
@@ -153,6 +154,28 @@ export async function runRepositoryBoundarySmoke(rootDir = ROOT) {
         failures.push(`${rel} must not introduce loadHistory/historyChunk compatibility aliases.`);
       }
     }
+    // P4-W7: local patch projection must not rehydrate full transcripts.
+    if (rel === 'src/host/workspace-patch.ts') {
+      if (code.includes('getTranscriptPage')) {
+        failures.push(`${rel} must not call getTranscriptPage on the mutation path.`);
+      }
+      if (!code.includes('projectWorkspacePatches')) {
+        failures.push(`${rel} must export projectWorkspacePatches.`);
+      }
+    }
+  }
+
+  // P4-W7: production host must not post legacy one-off messages.
+  const extension = texts.get('src/extension.ts') ?? '';
+  const extensionCode = stripComments(extension);
+  if (/type:\s*['"]taskUpdated['"]/.test(extensionCode)) {
+    failures.push(`src/extension.ts still posts production taskUpdated; use workspacePatchBatch.`);
+  }
+  if (/type:\s*['"]transcriptAppend['"]/.test(extensionCode)) {
+    failures.push(`src/extension.ts still posts production transcriptAppend; use workspacePatchBatch.`);
+  }
+  if (!extensionCode.includes('workspacePatchBatch') && !extensionCode.includes('buildWorkspacePatchBatch')) {
+    failures.push(`src/extension.ts must publish workspacePatchBatch after durable commits.`);
   }
 
   try {

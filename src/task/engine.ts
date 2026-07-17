@@ -68,7 +68,11 @@ import {
   deriveResourceClaimKeys,
   type TaskRepository,
 } from './repository';
-import { RepositoryProjection, withRepositoryProjection } from './repository-projection';
+import {
+  RepositoryProjection,
+  withRepositoryProjection,
+  type RepositoryCommitContext,
+} from './repository-projection';
 import {
   applyDependencyTerminal,
   applyFailedTurn,
@@ -202,6 +206,11 @@ export interface TaskEngineConfig {
    * (no `task/` → `backends/` dependency). Defaults to `/` when absent.
    */
   getSkillPrefix?: (backend: string) => string;
+  /**
+   * Host post-commit hook after a successful durable repository.execute and
+   * projection refresh. Used to publish one workspacePatchBatch per revision.
+   */
+  onAfterCommit?: (ctx: RepositoryCommitContext) => void | Promise<void>;
 }
 
 export type EngineResult<T> =
@@ -937,7 +946,9 @@ export class TaskEngine {
   /** Repository-only constructor. No JSON file is created or used. */
   static async loadAsync(config: TaskEngineConfig): Promise<TaskEngine> {
     const projection = await RepositoryProjection.load(config.repository, config.workspaceId);
-    const repository = withRepositoryProjection(config.repository, projection);
+    const repository = withRepositoryProjection(config.repository, projection, {
+      onAfterCommit: config.onAfterCommit,
+    });
     const engine = new TaskEngine(config, projection, repository);
     await engine.reconcileReloadFromRepository();
     return engine;

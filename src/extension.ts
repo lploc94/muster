@@ -33,6 +33,11 @@ import {
 } from './host/snapshot';
 import { buildRepositorySnapshot } from './host/repository-snapshot';
 import {
+  buildWorkspacePatchBatch,
+  projectWorkspacePatches,
+} from './host/workspace-patch';
+import type { RepositoryCommitContext } from './task/repository-projection';
+import {
   buildRetentionSettingsSnapshot,
   handleRetentionSettingUpdateAction,
   type RuntimeStorageSettingsSnapshot,
@@ -424,6 +429,11 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   /** Discards stale async repository snapshots when focus/commits race. */
   private snapshotGeneration = 0;
   focusedTaskId?: string;
+  /**
+   * Host mirror of focused transcript entity IDs (bootstrap page + older pages +
+   * published patches). Used to choose transcriptItemsAppended vs transcriptItemPatched.
+   */
+  private knownTranscriptIds = new Set<string>();
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -435,6 +445,60 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       this._view?.webview.postMessage(message);
     } catch {
       // best-effort
+    }
+  }
+
+  /**
+   * Central post-commit publisher: one workspacePatchBatch per changed revision
+   * after SQLite commit + projection refresh. Empty patches still advance revision.
+   */
+  async publishAfterCommit(ctx: RepositoryCommitContext): Promise<void> {
+    if (!this._view?.visible) {
+      // Still advance lastObserved so the next snapshot is coherent.
+      lastObservedRevision = ctx.projection.getFile().revision;
+      lastObservedFile = JSON.parse(JSON.stringify(ctx.projection.getFile())) as TaskStoreFile;
+      return;
+    }
+    const after = ctx.projection.getFile();
+    const patches = projectWorkspacePatches({
+      command: ctx.command,
+      result: ctx.result,
+      before: ctx.beforeFile as TaskStoreFile,
+      after,
+      focusedTaskId: this.focusedTaskId,
+      knownTranscriptIds: this.knownTranscriptIds,
+    });
+    // Track newly published transcript entity ids.
+    for (const patch of patches) {
+      if (patch.type === 'transcriptItemsAppended') {
+        for (const item of patch.items) this.knownTranscriptIds.add(item.id);
+      } else if (patch.type === 'transcriptItemPatched') {
+        this.knownTranscriptIds.add(patch.item.id);
+      } else if (patch.type === 'taskRemoved' && patch.taskId === this.focusedTaskId) {
+        this.knownTranscriptIds.clear();
+      }
+    }
+    this.post(buildWorkspacePatchBatch(after.revision, patches));
+    lastObservedRevision = after.revision;
+    lastObservedFile = JSON.parse(JSON.stringify(after)) as TaskStoreFile;
+
+    // Ask-clear side channel when a waiting_user turn leaves that state.
+    const previous = ctx.beforeFile;
+    for (const turnId of Object.keys(after.turns)) {
+      const prevTurn = previous.turns[turnId];
+      const nextTurn = after.turns[turnId];
+      if (prevTurn?.status === 'waiting_user' && nextTurn && nextTurn.status !== 'waiting_user') {
+        const overlay = [...activePendingAsks.values()].find((entry) => entry.turnId === turnId);
+        if (overlay) {
+          activePendingAsks.delete(overlay.taskId);
+          this.post({
+            type: 'askCleared',
+            taskId: overlay.taskId,
+            turnId: overlay.turnId,
+            askId: overlay.askId,
+          });
+        }
+      }
     }
   }
 
@@ -933,24 +997,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           turnId: event.turnId,
           trigger: event.trigger,
         });
-        // Turn left the FIFO queue — project its user message(s) into chat now.
-        // Snapshot rebuild also includes them; append is idempotent by message id.
-        if (event.taskId === this.focusedTaskId && taskStore) {
-          const turn = taskStore.getFile().turns[event.turnId];
-          if (turn) {
-            for (const input of turn.inputs) {
-              if (input.kind !== 'message') continue;
-              const item = this.transcriptItemFromMessage(input.messageId);
-              if (item) {
-                this.post({
-                  type: 'transcriptAppend',
-                  taskId: event.taskId,
-                  item: { ...item, turnId: event.turnId },
-                });
-              }
-            }
-          }
-        }
+        // Durable promote of queued user messages is published via workspace
+        // patches from prepareDispatch/replaceLiveTurn post-commit.
         break;
       case 'event':
         this.post({
@@ -983,74 +1031,13 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     lastObservedFile = JSON.parse(JSON.stringify(file)) as TaskStoreFile;
   }
 
-  reprojectChanged(file: TaskStoreFile, affectedTaskIds: string[], before?: TaskStoreFile): void {
-    const previous = before ?? lastObservedFile;
-    if (!previous) {
-      this.seedObservation(file);
-      return;
-    }
-
-    // Reproject ancestors so childOrchestration / derived aggregates stay fresh.
-    const expanded = new Set<string>(affectedTaskIds);
-    for (const taskId of affectedTaskIds) {
-      for (const ancestorId of collectAncestorIds(file, taskId)) {
-        expanded.add(ancestorId);
-      }
-      // Also walk previous file in case of reparent/delete.
-      for (const ancestorId of collectAncestorIds(previous, taskId)) {
-        expanded.add(ancestorId);
-      }
-    }
-
-    for (const taskId of expanded) {
-      const patch = projectTaskSummary(file, taskId);
-      if (!patch) {
-        continue;
-      }
-      this.post({
-        type: 'taskUpdated',
-        taskId,
-        storeRevision: file.revision,
-        patch,
-      });
-    }
-
-    for (const turnId of Object.keys(file.turns)) {
-      const prevTurn = previous.turns[turnId];
-      const nextTurn = file.turns[turnId];
-      if (prevTurn?.status === 'waiting_user' && nextTurn && nextTurn.status !== 'waiting_user') {
-        const overlay = [...activePendingAsks.values()].find((entry) => entry.turnId === turnId);
-        if (overlay) {
-          activePendingAsks.delete(overlay.taskId);
-          this.post({
-            type: 'askCleared',
-            taskId: overlay.taskId,
-            turnId: overlay.turnId,
-            askId: overlay.askId,
-          });
-        }
-      }
-    }
-
-    lastObservedRevision = file.revision;
-    lastObservedFile = JSON.parse(JSON.stringify(file)) as TaskStoreFile;
-
-    if (!this._view?.visible || !this.focusedTaskId) {
-      return;
-    }
-
-    // Membership under owning root (new/removed sibling) requires full subtree snapshot.
-    if (owningRootMembershipChanged(previous, file, this.focusedTaskId)) {
-      this.postSnapshot();
-      return;
-    }
-
-    if (
-      expanded.has(this.focusedTaskId) &&
-      taskRecordsChanged(previous, file, this.focusedTaskId)
-    ) {
-      this.postSnapshot();
-    }
+  /**
+   * @deprecated P4-W7: local mutations publish workspacePatchBatch via
+   * onAfterCommit. Kept as a no-op shell so any residual test callers do not
+   * reintroduce taskUpdated/transcriptAppend.
+   */
+  reprojectChanged(_file: TaskStoreFile, _affectedTaskIds: string[], _before?: TaskStoreFile): void {
+    // no-op — revisioned patches are published from repository onAfterCommit
   }
 
   handleExternalStoreChange(): void {
@@ -1062,6 +1049,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
 
   focusTask(taskId: string): void {
     this.focusedTaskId = taskId;
+    this.knownTranscriptIds.clear();
     this.postSnapshot(taskId);
   }
 
@@ -1080,7 +1068,13 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       this.replayPendingElicitations();
       if (focus) {
         this.focusedTaskId = focus;
+      } else {
+        this.focusedTaskId = undefined;
       }
+      // Seed known transcript ids from the bounded focus page only.
+      this.knownTranscriptIds = new Set(
+        (projection.snapshot.transcript ?? []).map((item) => item.id),
+      );
       this.seedObservation(projection.observation);
     }).catch(() => {
       if (generation === this.snapshotGeneration) {
@@ -1295,8 +1289,14 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       this.postCommandError(result.reason);
       return;
     }
-    if (focus && !(await repository.getTask(focus))) this.focusedTaskId = undefined;
-    this.postSnapshot(this.focusedTaskId);
+    if (focus && !(await repository.getTask(focus))) {
+      this.focusedTaskId = undefined;
+      this.knownTranscriptIds.clear();
+      // Focus invalidation after destructive clear — bounded no-focus snapshot.
+      this.postSnapshot(undefined);
+      return;
+    }
+    // Ordinary clearHistory results publish via onAfterCommit patches.
   }
 
   /** Delete a single top-level task (and its whole subtree) through the repository. */
@@ -1329,8 +1329,13 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       this.postCommandError(result.reason, taskId);
       return;
     }
-    if (focus && !(await repository.getTask(focus))) this.focusedTaskId = undefined;
-    this.postSnapshot(this.focusedTaskId);
+    if (focus && !(await repository.getTask(focus))) {
+      this.focusedTaskId = undefined;
+      this.knownTranscriptIds.clear();
+      this.postSnapshot(undefined);
+      return;
+    }
+    // Ordinary delete results publish via onAfterCommit patches.
   }
 
   /** Rename a task by replacing its goal (the display label). */
@@ -1360,7 +1365,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       this.postCommandError(result.reason, taskId);
       return;
     }
-    this.postSnapshot(this.focusedTaskId);
+    // Rename publishes taskUpserted via onAfterCommit.
   }
 
   /**
@@ -1414,9 +1419,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     for (const message of outcome.messages) {
       this.post(message);
     }
-    if (outcome.refreshSnapshot) {
-      this.postSnapshot(outcome.taskId ?? this.focusedTaskId);
-    }
+    // Handoff binding updates publish via onAfterCommit patches (no full snapshot).
   }
 
   /**
@@ -1495,6 +1498,15 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     });
     if (outcome.kind === 'message') {
       this.post(outcome.message);
+      if (
+        outcome.message.type === 'transcriptPageResult' &&
+        outcome.message.ok === true &&
+        outcome.message.taskId === this.focusedTaskId
+      ) {
+        for (const item of outcome.message.items) {
+          this.knownTranscriptIds.add(item.id);
+        }
+      }
     }
   }
 
@@ -1818,30 +1830,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         turnId: result.value.turnId,
       });
     }
-    // Only project into chat when the turn is not a FIFO follow-up still sitting
-    // in the queue. Queued messages appear in the queue panel only; they enter
-    // chat when the turn promotes to running (snapshot rebuild).
-    if (data.taskId === this.focusedTaskId && this.shouldAppendSendToTranscript(result.value.turnId)) {
-      const item = this.transcriptItemFromMessage(result.value.messageId);
-      if (item) {
-        this.post({ type: 'transcriptAppend', taskId: data.taskId, item });
-      }
-    }
-    // Always refresh so queue panel / turn activity / binding labels update.
-    this.postSnapshot(data.taskId ?? this.focusedTaskId);
-  }
-
-  /**
-   * True when a newly created turn should appear in chat immediately.
-   * Queued FIFO follow-ups stay out of chat (queue panel + snapshot.previewText only)
-   * until the turn promotes to running (turnStart / snapshot rebuild).
-   */
-  private shouldAppendSendToTranscript(turnId: string | undefined): boolean {
-    if (!turnId || !taskStore) {
-      return false;
-    }
-    const turn = taskStore.getFile().turns[turnId];
-    return Boolean(turn && turn.status !== 'queued');
+    // Transcript/queue/activity publish via onAfterCommit workspacePatchBatch.
   }
 
   /**
@@ -1862,7 +1851,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           return !!turn && turn.status !== 'queued';
         })());
     if (stale) {
-      this.postSnapshot(taskId ?? this.focusedTaskId);
+      // Race with drain: durable state already published via patches if changed.
       return;
     }
     this.postCommandError(message, taskId);
@@ -2025,15 +2014,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
               this.postCommandError(result.reason, data.taskId);
               break;
             }
-            if (
-              data.taskId === this.focusedTaskId &&
-              this.shouldAppendSendToTranscript(result.value.turnId)
-            ) {
-              const item = this.transcriptItemFromMessage(result.value.messageId);
-              if (item) {
-                this.post({ type: 'transcriptAppend', taskId: data.taskId, item });
-              }
-            }
+            // Transcript/queue publish via onAfterCommit workspacePatchBatch.
           }
           break;
         case 'sendLiveInput': {
@@ -2065,7 +2046,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             this.postCommandError(result.reason, taskId);
             break;
           }
-          this.postSnapshot(taskId);
+          // Queue/activity publish via onAfterCommit.
           break;
         }
         case 'editQueuedTurn': {
@@ -2083,10 +2064,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           });
           if (outcome.kind === 'error') {
             this.handleQueuedMutationOutcome(outcome.message, outcome.taskId, data?.turnId);
-          } else {
-            // Always reproject so queue panel / previewText stay authoritative.
-            this.postSnapshot(outcome.taskId ?? this.focusedTaskId);
           }
+          // Success: queuedTurnsChanged via onAfterCommit.
           break;
         }
         case 'deleteQueuedTurn': {
@@ -2104,9 +2083,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           });
           if (outcome.kind === 'error') {
             this.handleQueuedMutationOutcome(outcome.message, outcome.taskId, data?.turnId);
-          } else {
-            this.postSnapshot(outcome.taskId ?? this.focusedTaskId);
           }
+          // Success: queuedTurnsChanged via onAfterCommit.
           break;
         }
         case 'resumeQueuedTurn':
@@ -2165,7 +2143,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             );
             const sessionId = live?.observedSessionId;
             if (sessionId) elicitationBridge?.cancelForSession(sessionId);
-            this.postSnapshot(this.focusedTaskId ?? data.taskId);
+            // Lifecycle patches publish via onAfterCommit.
           }
           break;
         }
@@ -2448,6 +2426,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           // Webview returned to the task list; drop the host-side focus so a
           // later snapshot (e.g. after Clear history) doesn't re-open a stale chat.
           this.focusedTaskId = undefined;
+          this.knownTranscriptIds.clear();
           break;
         case 'requestSettings':
           this.postSettingsSnapshot();
@@ -3139,6 +3118,7 @@ export async function activate(context: vscode.ExtensionContext) {
       // Per-backend skill invocation prefix (`/` default, `$` for Codex). Kept in
       // backends/ so task/ never imports it; supplied to the engine via DI.
       getSkillPrefix: (backend: string) => skillPrefixForBackend(backend),
+      onAfterCommit: (ctx) => provider.publishAfterCommit(ctx),
       emit: (event) => {
         try {
           provider.forwardTurnEvent(event);

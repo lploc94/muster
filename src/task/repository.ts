@@ -479,6 +479,13 @@ export interface TaskRepository {
   getTranscriptPage(taskId: string, cursor?: string, limit?: number): Promise<TranscriptPage>;
   /** Current workspace revision. */
   getWorkspaceRevision(): Promise<number>;
+  /**
+   * Optional local-host read barrier supplied by the projection wrapper. The
+   * callback runs between complete execute→refresh→publish lifecycles, so a
+   * multi-query bounded snapshot cannot interleave with this host's writes.
+   * Raw repositories omit it; callers must still verify revision stability.
+   */
+  runConsistentRead?<T>(read: () => Promise<T>): Promise<T>;
   execute(command: RepositoryCommand): Promise<RepositoryCommandResult>;
 }
 

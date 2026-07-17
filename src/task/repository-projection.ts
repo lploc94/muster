@@ -284,20 +284,102 @@ export class RepositoryProjection {
   }
 }
 
+/** Context delivered after a successful durable commit + projection refresh. */
+export interface RepositoryCommitContext {
+  command: RepositoryCommand;
+  result: RepositoryCommandResult;
+  projection: RepositoryProjection;
+  previousRevision: number;
+  /** Snapshot of the projection file before this command's afterExecute refresh. */
+  beforeFile: Readonly<TaskStoreFile>;
+}
+
+export interface WithRepositoryProjectionOptions {
+  /**
+   * Invoked only when result.changed is true, after afterExecute completes.
+   * Host uses this to publish one workspacePatchBatch per commit.
+   */
+  onAfterCommit?: (ctx: RepositoryCommitContext) => void | Promise<void>;
+}
+
+/**
+ * Shallow map snapshot of the bounded projection used for before/after patch
+ * projection. Avoids full deep-clone of every nested entity on each write.
+ * Safe because afterExecute replaces map entries rather than mutating them in place.
+ */
+export function snapshotProjectionBefore(
+  file: Readonly<TaskStoreFile>,
+): TaskStoreFile {
+  return {
+    schemaVersion: file.schemaVersion,
+    revision: file.revision,
+    tasks: { ...file.tasks },
+    turns: { ...file.turns },
+    messages: { ...file.messages },
+    toolCalls: { ...(file.toolCalls ?? {}) },
+    reasoning: { ...(file.reasoning ?? {}) },
+    operations: { ...(file.operations ?? {}) },
+    cancelRequests: { ...(file.cancelRequests ?? {}) },
+    sendReceipts: { ...(file.sendReceipts ?? {}) },
+    runtimeClaims: { ...(file.runtimeClaims ?? {}) },
+  };
+}
+
 /** Wrap repository writes so the synchronous projection becomes visible before
  * a durable command resolves to its engine caller. */
 export function withRepositoryProjection(
   source: TaskRepository,
   projection: RepositoryProjection,
+  options?: WithRepositoryProjectionOptions,
 ): TaskRepository {
+  // SQLite serializes transactions, but callers can enqueue several execute()
+  // calls before the first projection refresh runs. Without a host-side tail,
+  // commit A can refresh after commit B and both callbacks publish revision B,
+  // creating an immediate reducer gap. Keep the whole local write lifecycle —
+  // durable execute, bounded refresh, and post-commit publish — in commit order.
+  let executeTail: Promise<void> = Promise.resolve();
+
+  const runInWriteOrder = <T>(operation: () => Promise<T>): Promise<T> => {
+    const pending = executeTail.then(operation, operation);
+    executeTail = pending.then(
+      () => undefined,
+      () => undefined,
+    );
+    return pending;
+  };
+
+  const executeSerially = (
+    target: TaskRepository,
+    command: RepositoryCommand,
+  ): Promise<RepositoryCommandResult> => {
+    const run = async (): Promise<RepositoryCommandResult> => {
+      const previousRevision = projection.getFile().revision;
+      const beforeFile = snapshotProjectionBefore(projection.getFile());
+      const result = await target.execute(command);
+      await projection.afterExecute(command, result);
+      if (result.changed && options?.onAfterCommit) {
+        await options.onAfterCommit({
+          command,
+          result,
+          projection,
+          previousRevision,
+          beforeFile,
+        });
+      }
+      return result;
+    };
+
+    return runInWriteOrder(run);
+  };
+
   return new Proxy(source, {
     get(target, property, receiver) {
       if (property === 'execute') {
-        return async (command: RepositoryCommand): Promise<RepositoryCommandResult> => {
-          const result = await target.execute(command);
-          await projection.afterExecute(command, result);
-          return result;
-        };
+        return (command: RepositoryCommand): Promise<RepositoryCommandResult> =>
+          executeSerially(target, command);
+      }
+      if (property === 'runConsistentRead') {
+        return <T>(read: () => Promise<T>): Promise<T> => runInWriteOrder(read);
       }
       const value = Reflect.get(target, property, receiver) as unknown;
       return typeof value === 'function' ? value.bind(target) : value;
