@@ -69,6 +69,7 @@ import {
 } from './host/queued-turn-mutations';
 import { routeExportTask } from './host/task-export-route';
 import { routeRuntimeHandoff } from './host/runtime-handoff-route';
+import { routeLoadTranscriptPage } from './host/transcript-page-route';
 import { importDroppedFileBytes } from './host/import-dropped-file';
 import { PresentationManager } from './host/presentation-manager';
 import {
@@ -237,7 +238,7 @@ function debugElicitation(event: string, details: Record<string, unknown> = {}):
  * version is stamped on the bootstrap `snapshot` message, and a mismatch is
  * surfaced in the webview as a visible "reload the window" banner.
  */
-const PROTOCOL_VERSION = 6;
+const PROTOCOL_VERSION = 7;
 
 /** How long a permission prompt waits for a webview decision before safe-denying. */
 const PERMISSION_PROMPT_TIMEOUT_MS = USER_INTERACTION_TIMEOUT_MS;
@@ -1419,6 +1420,44 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   }
 
   /**
+   * Load one bounded older transcript page for the focused task (protocol v7).
+   * Valid failures post transcriptPageResult with fixed codes — never commandError.
+   */
+  private async handleLoadTranscriptPage(data: unknown): Promise<void> {
+    if (!taskRepository) {
+      // Repository not ready is unavailable (not taskNotFound). getTask throws so
+      // the pure route maps the failure after safe correlation validation.
+      const outcome = await routeLoadTranscriptPage(data, {
+        getFocused: () => ({
+          taskId: this.focusedTaskId,
+          generation: this.snapshotGeneration,
+        }),
+        getTask: async () => {
+          throw new Error('task repository not ready');
+        },
+        getTranscriptPage: async () => {
+          throw new Error('task repository not ready');
+        },
+      });
+      if (outcome.kind === 'message') this.post(outcome.message);
+      return;
+    }
+    const repository = taskRepository;
+    const outcome = await routeLoadTranscriptPage(data, {
+      getFocused: () => ({
+        taskId: this.focusedTaskId,
+        generation: this.snapshotGeneration,
+      }),
+      getTask: (taskId: string) => repository.getTask(taskId),
+      getTranscriptPage: (taskId: string, beforeCursor: string, limit: number) =>
+        repository.getTranscriptPage(taskId, beforeCursor, limit),
+    });
+    if (outcome.kind === 'message') {
+      this.post(outcome.message);
+    }
+  }
+
+  /**
    * Export one task as Markdown via native Save As. Read-only store access;
    * never mutates task-store state. Cancel is intentionally silent.
    */
@@ -2354,6 +2393,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           break;
         case 'exportTask':
           await this.handleExportTask(data);
+          break;
+        case 'loadTranscriptPage':
+          await this.handleLoadTranscriptPage(data);
           break;
         case 'requestRuntimeHandoff':
           await this.handleRequestRuntimeHandoff(data);

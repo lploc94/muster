@@ -614,6 +614,13 @@
           threadStore.onTranscriptAppend(msg.taskId, msg.item);
           break;
 
+        case 'transcriptPageResult': {
+          // Drop early if the message is not for the currently focused task.
+          if (msg.taskId !== tasks.focusedTaskId) break;
+          threadStore.onTranscriptPageResult(msg);
+          break;
+        }
+
         case 'askPending': {
           // Never auto-focus another task (owning-root makes siblings known).
           // Tree attention counts surface needs-you; user opens via tree nav.

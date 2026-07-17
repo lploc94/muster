@@ -152,7 +152,7 @@ describe('isExtMessage snapshot version tolerance', () => {
   });
 });
 
-describe('protocol v6 focused transcriptPage contract', () => {
+describe('protocol v7 focused transcriptPage contract', () => {
   const baseSnapshot = {
     type: 'snapshot',
     rootTasks: [baseTaskSummary],
@@ -170,8 +170,8 @@ describe('protocol v6 focused transcriptPage contract', () => {
     transcriptPage: validPage,
   };
 
-  it('is exactly version 6', () => {
-    expect(PROTOCOL_VERSION).toBe(6);
+  it('is exactly version 7', () => {
+    expect(PROTOCOL_VERSION).toBe(7);
   });
 
   it('accepts focused snapshot with transcript + transcriptPage', () => {
@@ -1323,5 +1323,194 @@ describe('file mention suggestion protocol', () => {
     for (const message of bad) {
       expect(isExtMessage(message), JSON.stringify(message)).toBe(false);
     }
+  });
+});
+
+describe('protocol v7 loadTranscriptPage / transcriptPageResult', () => {
+  const validSuccess = {
+    type: 'transcriptPageResult',
+    requestId: 'req-1',
+    taskId: 'task-1',
+    ok: true as const,
+    items: [{ id: 'u1', kind: 'user' as const, content: 'older' }],
+    transcriptPage: {
+      hasMoreBefore: true,
+      beforeCursor: 'v2.next',
+      workspaceRevision: 3,
+    },
+  };
+
+  it('accepts valid success with <=100 items and page metadata', () => {
+    expect(isExtMessage(validSuccess)).toBe(true);
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: Array.from({ length: 100 }, (_, i) => ({
+          id: `u${i}`,
+          kind: 'user',
+          content: `m${i}`,
+        })),
+      }),
+    ).toBe(true);
+  });
+
+  it('accepts each fixed failure code', () => {
+    for (const code of [
+      'invalidRequest',
+      'staleFocus',
+      'taskNotFound',
+      'invalidCursor',
+      'unavailable',
+    ] as const) {
+      expect(
+        isExtMessage({
+          type: 'transcriptPageResult',
+          requestId: 'req-1',
+          taskId: 'task-1',
+          ok: false,
+          code,
+        }),
+        code,
+      ).toBe(true);
+    }
+  });
+
+  it('rejects oversized/missing requestId and malformed taskId', () => {
+    expect(isExtMessage({ ...validSuccess, requestId: '' })).toBe(false);
+    expect(isExtMessage({ ...validSuccess, requestId: 'x'.repeat(129) })).toBe(false);
+    expect(isExtMessage({ ...validSuccess, taskId: '' })).toBe(false);
+    expect(isExtMessage({ ...validSuccess, taskId: 't'.repeat(513) })).toBe(false);
+  });
+
+  it('rejects more than 100 items and malformed page metadata', () => {
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: Array.from({ length: 101 }, (_, i) => ({
+          id: `u${i}`,
+          kind: 'user',
+          content: `m${i}`,
+        })),
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        transcriptPage: { hasMoreBefore: true, workspaceRevision: 1 },
+      }),
+    ).toBe(false);
+  });
+
+  it('rejects success missing items/page and error with free-form message/unknown code', () => {
+    const { items: _i, ...noItems } = validSuccess;
+    expect(isExtMessage(noItems)).toBe(false);
+    const { transcriptPage: _p, ...noPage } = validSuccess;
+    expect(isExtMessage(noPage)).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'transcriptPageResult',
+        requestId: 'req-1',
+        taskId: 'task-1',
+        ok: false,
+        code: 'unavailable',
+        message: 'boom',
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'transcriptPageResult',
+        requestId: 'req-1',
+        taskId: 'task-1',
+        ok: false,
+        code: 'ENOENT',
+      }),
+    ).toBe(false);
+  });
+
+  it('posts loadTranscriptPage outbound shape without history aliases', () => {
+    vi.mocked(vscode.postMessage).mockClear();
+    const message: OutMessage = {
+      type: 'loadTranscriptPage',
+      requestId: 'req-1',
+      taskId: 'task-1',
+      beforeCursor: 'v2.cursor',
+    };
+    post(message);
+    expect(vscode.postMessage).toHaveBeenCalledWith(message);
+    expect(message).not.toHaveProperty('type', 'loadHistory');
+    expect(JSON.stringify(message)).not.toContain('historyChunk');
+  });
+
+  it('rejects user items with wrong optional types or extra fields', () => {
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [{ id: 'u1', kind: 'user', content: 'ok', turnId: 123 }],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [{ id: 'u1', kind: 'user', content: 'ok', order: 'bad' }],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [{ id: 'u1', kind: 'user', content: 'ok', extra: true }],
+      }),
+    ).toBe(false);
+  });
+
+  it('rejects host error transcript items and transcriptPage extra fields', () => {
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [{ id: 'e1', kind: 'error', content: { message: 'x' } }],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        transcriptPage: {
+          hasMoreBefore: false,
+          workspaceRevision: 1,
+          leaked: true,
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it('rejects invalid tool status/toolKind and nested extra fields', () => {
+    const baseTool = {
+      id: 'tool-1',
+      kind: 'tool' as const,
+      turnId: 't1',
+      order: 1,
+      content: {
+        toolCallId: 'c1',
+        name: 'bash',
+        status: 'success' as const,
+      },
+    };
+    expect(isExtMessage({ ...validSuccess, items: [baseTool] })).toBe(true);
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [{ ...baseTool, content: { ...baseTool.content, status: 'pending' } }],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [{ ...baseTool, content: { ...baseTool.content, toolKind: 'shell' } }],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [{ ...baseTool, content: { ...baseTool.content, nestedExtra: 1 } }],
+      }),
+    ).toBe(false);
   });
 });

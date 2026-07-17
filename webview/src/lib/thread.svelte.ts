@@ -1,6 +1,19 @@
 import type { NormalizedEvent } from './types';
-import type { TaskRuntimeActivity, TaskViewStatus, TranscriptItem, TranscriptPageState } from './protocol';
+import type {
+  TaskRuntimeActivity,
+  TaskViewStatus,
+  TranscriptItem,
+  TranscriptPageErrorCode,
+  TranscriptPageResultMessage,
+  TranscriptPageState,
+} from './protocol';
 import type { ThreadItem } from './turn-state.svelte';
+import {
+  applyTranscriptPageResult,
+  beginLoadOlder,
+  ownershipFromTranscript,
+  type TranscriptPageWindowState,
+} from './transcript-page-reducer';
 
 function asText(content: unknown): string {
   if (typeof content === 'string') return content;
@@ -78,13 +91,53 @@ export class TaskThread {
    */
   revision = $state(0);
   /**
-   * W4 transcript page metadata for the focused thread (protocol v6). The
-   * transcript is a bounded latest-N page; these fields let W5 request older
-   * pages. Hydrate/focus replaces them; reset clears them.
+   * W4/W5 transcript page metadata for the focused thread. The transcript is a
+   * bounded latest-N page plus optional older pages prepended via
+   * loadTranscriptPage. Hydrate/focus replaces the window; reset clears it.
    */
   beforeCursor = $state<string | undefined>(undefined);
   hasMoreBefore = $state(false);
   transcriptWorkspaceRevision = $state<number | undefined>(undefined);
+  /** Ownership of transcript entity IDs (list + reasoning) for idempotent prepend. */
+  private loadedTranscriptIds = new Set<string>();
+  olderPageLoading = $state(false);
+  pendingRequestId = $state<string | undefined>(undefined);
+  pendingTaskId = $state<string | undefined>(undefined);
+  pendingCursor = $state<string | undefined>(undefined);
+  olderPageError = $state<TranscriptPageErrorCode | undefined>(undefined);
+  lastAppliedRequestId = $state<string | undefined>(undefined);
+
+  private pageWindowState(): TranscriptPageWindowState {
+    return {
+      items: this.items,
+      reasoningByTurn: this.reasoningByTurn,
+      loadedTranscriptIds: this.loadedTranscriptIds,
+      beforeCursor: this.beforeCursor,
+      hasMoreBefore: this.hasMoreBefore,
+      transcriptWorkspaceRevision: this.transcriptWorkspaceRevision,
+      olderPageLoading: this.olderPageLoading,
+      pendingRequestId: this.pendingRequestId,
+      pendingTaskId: this.pendingTaskId,
+      pendingCursor: this.pendingCursor,
+      olderPageError: this.olderPageError,
+      lastAppliedRequestId: this.lastAppliedRequestId,
+    };
+  }
+
+  private applyPageWindowState(state: TranscriptPageWindowState): void {
+    this.items = state.items;
+    this.reasoningByTurn = state.reasoningByTurn;
+    this.loadedTranscriptIds = new Set(state.loadedTranscriptIds);
+    this.beforeCursor = state.beforeCursor;
+    this.hasMoreBefore = state.hasMoreBefore;
+    this.transcriptWorkspaceRevision = state.transcriptWorkspaceRevision;
+    this.olderPageLoading = state.olderPageLoading;
+    this.pendingRequestId = state.pendingRequestId;
+    this.pendingTaskId = state.pendingTaskId;
+    this.pendingCursor = state.pendingCursor;
+    this.olderPageError = state.olderPageError;
+    this.lastAppliedRequestId = state.lastAppliedRequestId;
+  }
 
   hydrate(
     transcript: TranscriptItem[],
@@ -123,12 +176,20 @@ export class TaskThread {
 
     this.items = next;
     this.reasoningByTurn = reasoning;
+    this.loadedTranscriptIds = ownershipFromTranscript(transcript);
     if (!keepStreaming) this.streaming = null;
     this.activeTurnId = activeTurnId ?? null;
-    // Replace transcript-page metadata on every hydrate/focus (protocol v6).
+    // Replace transcript-page metadata on every hydrate/focus (protocol v6+).
     this.beforeCursor = opts?.transcriptPage?.beforeCursor;
     this.hasMoreBefore = opts?.transcriptPage?.hasMoreBefore ?? false;
     this.transcriptWorkspaceRevision = opts?.transcriptPage?.workspaceRevision;
+    // Focus/hydrate invalidates any in-flight older-page request for this window.
+    this.olderPageLoading = false;
+    this.pendingRequestId = undefined;
+    this.pendingTaskId = undefined;
+    this.pendingCursor = undefined;
+    this.olderPageError = undefined;
+    this.lastAppliedRequestId = undefined;
     const runtime = opts?.runtimeActivity ?? (viewStatus === 'running' || viewStatus === 'waiting_user' ? viewStatus : null);
     this.running = runtime === 'running' || runtime === 'waiting_user';
     // Restore "had a process" after reload: live/recovery runtime, or any transcript
@@ -151,6 +212,45 @@ export class TaskThread {
     this.beforeCursor = undefined;
     this.hasMoreBefore = false;
     this.transcriptWorkspaceRevision = undefined;
+    this.loadedTranscriptIds = new Set();
+    this.olderPageLoading = false;
+    this.pendingRequestId = undefined;
+    this.pendingTaskId = undefined;
+    this.pendingCursor = undefined;
+    this.olderPageError = undefined;
+    this.lastAppliedRequestId = undefined;
+  }
+
+  /**
+   * Begin a single in-flight older-page request when cursor/hasMore allow it.
+   * Returns the outbound payload fields, or null when the request is refused.
+   */
+  beginLoadOlder(taskId: string, requestId: string): {
+    requestId: string;
+    taskId: string;
+    beforeCursor: string;
+  } | null {
+    const result = beginLoadOlder(this.pageWindowState(), { taskId, requestId });
+    this.applyPageWindowState(result.state);
+    if (!result.ok) return null;
+    return {
+      requestId: result.requestId,
+      taskId: result.taskId,
+      beforeCursor: result.beforeCursor,
+    };
+  }
+
+  /** Apply a host transcriptPageResult with focus + request correlation. */
+  applyTranscriptPageResult(
+    message: TranscriptPageResultMessage,
+    focusedTaskId: string | null,
+  ): boolean {
+    const result = applyTranscriptPageResult(this.pageWindowState(), message, focusedTaskId);
+    if (result.applied) {
+      this.applyPageWindowState(result.state);
+      if (result.kind === 'success') this.revision++;
+    }
+    return result.applied;
   }
 
   setReadOnly(readOnly: boolean): void {
@@ -158,6 +258,7 @@ export class TaskThread {
   }
 
   appendTranscript(item: TranscriptItem): void {
+    this.loadedTranscriptIds.add(item.id);
     if (item.kind === 'reasoning') {
       if (item.turnId) this.reasoningByTurn[item.turnId] = asText(item.content);
       return;
@@ -185,7 +286,9 @@ export class TaskThread {
 
   pushError(message: string, isCancellation = false): void {
     this.commitStreaming();
-    this.items.push({ kind: 'error', id: `err-${Date.now()}`, message, isCancellation });
+    const id = `err-${Date.now()}`;
+    this.loadedTranscriptIds.add(id);
+    this.items.push({ kind: 'error', id, message, isCancellation });
   }
 
   private commitStreaming(): void {
@@ -212,6 +315,7 @@ export class TaskThread {
         }
       }
       // messageId is the deterministic segment id; dedupe by id.
+      this.loadedTranscriptIds.add(id);
       const existing = this.items.find((it) => it.id === id);
       if (existing && existing.kind === 'assistant') {
         existing.text = this.streaming.text;
@@ -247,6 +351,8 @@ export class TaskThread {
             if (it.kind === 'assistant') seed = it.text;
             this.items.splice(idx, 1);
           }
+          // Own the live segment id so older pages cannot prepend a stale duplicate.
+          this.loadedTranscriptIds.add(ev.messageId);
           this.streaming = { messageId: ev.messageId, text: seed };
         }
         this.streaming.text += ev.content;
@@ -259,6 +365,9 @@ export class TaskThread {
 
       case 'reasoningDelta':
         if (this.activeTurnId) {
+          // SQLite reasoning entity id is the turn id (activeTurnId), not the
+          // backend messageId. Own it so older pages cannot overwrite live text.
+          this.loadedTranscriptIds.add(this.activeTurnId);
           this.reasoningByTurn[this.activeTurnId] =
             (this.reasoningByTurn[this.activeTurnId] ?? '') + ev.content;
         }
@@ -269,6 +378,7 @@ export class TaskThread {
         this.commitStreaming();
         if (!this.activeTurnId) break;
         const id = `${this.activeTurnId}:${ev.toolCallId}`;
+        this.loadedTranscriptIds.add(id);
         const existing = this.findTool(id);
         if (existing) {
           existing.name = ev.name;
@@ -292,6 +402,7 @@ export class TaskThread {
       case 'toolUpdated': {
         if (!this.activeTurnId) break;
         const id = `${this.activeTurnId}:${ev.toolCallId}`;
+        this.loadedTranscriptIds.add(id);
         const tool = this.findTool(id);
         if (tool) {
           if (ev.input !== undefined) tool.input = ev.input;
@@ -311,6 +422,7 @@ export class TaskThread {
       case 'toolCompleted': {
         if (!this.activeTurnId) break;
         const id = `${this.activeTurnId}:${ev.toolCallId}`;
+        this.loadedTranscriptIds.add(id);
         const tool = this.findTool(id);
         const status = ev.outcome === 'error' ? 'error' : 'success';
         if (tool) {
@@ -432,6 +544,30 @@ class ThreadStore {
 
   onTranscriptAppend(taskId: string, item: TranscriptItem): void {
     this.getOrCreate(taskId).appendTranscript(item);
+  }
+
+  /**
+   * Start one older-page request for the focused thread. Enforces single
+   * in-flight request + hasMore/cursor gates. Returns outbound fields or null.
+   */
+  beginLoadOlder(requestId: string): {
+    requestId: string;
+    taskId: string;
+    beforeCursor: string;
+  } | null {
+    if (!this.currentTaskId) return null;
+    return this.current.beginLoadOlder(this.currentTaskId, requestId);
+  }
+
+  /**
+   * Apply transcriptPageResult only when task is focused and request correlates.
+   * Stale/mismatched responses are no-ops.
+   */
+  onTranscriptPageResult(message: TranscriptPageResultMessage): boolean {
+    if (!this.currentTaskId || message.taskId !== this.currentTaskId) {
+      return false;
+    }
+    return this.current.applyTranscriptPageResult(message, this.currentTaskId);
   }
 
   updateReadOnly(_lifecycleOrViewStatus: string): void {

@@ -112,6 +112,7 @@ export async function runRepositoryBoundarySmoke(rootDir = ROOT) {
   for (const rel of [
     'src/host/repository-snapshot.ts',
     'src/task/repository-projection.ts',
+    'src/host/transcript-page-route.ts',
   ]) {
     const raw = texts.get(rel);
     if (raw === undefined) {
@@ -138,6 +139,18 @@ export async function runRepositoryBoundarySmoke(rootDir = ROOT) {
       }
       if (!code.includes('listActiveTurnInputMessages')) {
         failures.push(`${rel} must load active inputs via listActiveTurnInputMessages.`);
+      }
+    }
+    // P4-W5: older-page host route must stay on getTranscriptPage with fixed limit 100.
+    if (rel === 'src/host/transcript-page-route.ts') {
+      if (!code.includes('getTranscriptPage')) {
+        failures.push(`${rel} must call getTranscriptPage for older transcript pages.`);
+      }
+      if (!code.includes('TRANSCRIPT_PAGE_LIMIT') && !code.includes('BOOTSTRAP_TRANSCRIPT_LIMIT')) {
+        failures.push(`${rel} must keep a fixed page limit constant (100).`);
+      }
+      if (code.includes('loadHistory') || code.includes('historyChunk')) {
+        failures.push(`${rel} must not introduce loadHistory/historyChunk compatibility aliases.`);
       }
     }
   }

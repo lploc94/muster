@@ -2,7 +2,7 @@
 
 ## Trạng thái
 
-**IN PROGRESS — Phase 4 pagination/incremental wire (P4-W3 ✅; P4-W4 ✅; P4-W5+ chưa bắt đầu).**
+**IN PROGRESS — Phase 4 pagination/incremental wire (P4-W3 ✅; P4-W4 ✅; P4-W5 ✅; P4-W6+ chưa bắt đầu).**
 Cập nhật: 2026-07-17
 
 - Phase 1: **đã qua gate** — worker/RPC, schema bootstrap, global-storage registry,
@@ -632,7 +632,7 @@ sau bắt đầu ngay khi wave trước đạt gate, chỉ dừng khi có blocke
 | P4-W2 ✅ | Xóa legacy storage/runtime API | Không còn `JsonTaskRepository`, filesystem `TaskStore`, sync engine constructor hoặc full-envelope export; **no migration/no backward compatibility** |
 | P4-W3 ✅ | Canonical cursor + SQL keyset page | SQLite query bounded `limit + 1`, không load full transcript |
 | P4-W4 ✅ | Bounded bootstrap | Snapshot focused task chỉ chứa 100 item + page metadata |
-| P4-W5 | Load older UX | Typed request/response, prepend idempotent, giữ scroll anchor |
+| P4-W5 ✅ | Load older UX | Typed request/response, prepend idempotent, giữ scroll anchor |
 | P4-W6 | Revisioned patch reducer | Duplicate/stale patch là no-op; revision gap yêu cầu recovery |
 | P4-W7 | Local patch routing | Queue/tree/transcript update không kéo theo focused full snapshot |
 | P4-W8 | Stream batching | Assistant/reasoning persist + post coalesce 50–100 ms, flush ở tool/terminal boundary |
@@ -775,13 +775,34 @@ database là hard gate và filesystem JSON watcher/path đã bị loại khỏi 
   safe-retry); active-input EXPLAIN; snapshot deleted-focus + fixture budget
   evidence; protocol v6 page guards; full suite green.
 
-##### P4-W5 — Load older UX
+##### P4-W5 — Load older UX ✅
 
-- Webview gửi `loadTranscriptPage(taskId, beforeCursor)`; host validate focus/task/cursor
-  và trả typed page result hoặc bounded error.
-- Reducer prepend theo stable ID, chống duplicate/replayed response và không ghi đè item
-  mới hơn; component giữ scroll anchor sau prepend.
-- Focus đổi trong lúc query làm response cũ bị bỏ.
+**Hoàn tất:** protocol **v7** `loadTranscriptPage` / `transcriptPageResult`; host pure
+route validate focus/task/cursor + focus-generation race; webview stable-ID reducer
+prepend idempotent (reasoning ownership); ChatThread scroll anchor + single in-flight
+request; fixed page limit 100; **no W6 recovery**.
+
+- **Protocol v7.** Webview `PROTOCOL_VERSION = 7` + host mirror; request
+  `{ type:'loadTranscriptPage', requestId, taskId, beforeCursor }`; response union
+  success (`items` ≤100 + `transcriptPage`) / failure fixed codes only
+  (`invalidRequest`|`staleFocus`|`taskNotFound`|`invalidCursor`|`unavailable`).
+  No free-form message/stack/SQL/cursor echo; no `loadHistory`/`historyChunk` aliases.
+- **Host route.** `src/host/transcript-page-route.ts` runtime-validates correlation,
+  captures focus+`snapshotGeneration`, refuses wrong focus with zero page queries,
+  `getTask` then exactly `getTranscriptPage(taskId, beforeCursor, 100)`, maps
+  `InvalidTranscriptCursorError`→`invalidCursor`, re-checks focus generation after
+  await (A→B and A→B→A reject stale success). Reuses exported `toHostTranscriptItem`.
+- **Reducer.** Pure `transcript-page-reducer.ts`: existing item/reasoning IDs win;
+  replay/stale request/task are no-ops; success prepends + advances cursor/hasMore;
+  revision uses `max(current, response)`; matching error clears loading for Retry;
+  hydrate/focus/reset invalidates pending. No revision-gap/`needsRecovery` (W6).
+- **Scroll anchor.** ChatThread top control + edge-triggered near-top auto-load;
+  `data-transcript-id` rows; capture stable row top before request; restore after
+  matching success via top delta (height fallback); suppress auto-scroll-to-bottom
+  while restoring; one in-flight request; no load when `scrollLocked`/no cursor.
+- **Tests.** Protocol v7 guards; host route focus-race + multi-page ~300 item walk;
+  reducer ownership/replay; scroll helpers; boundary smoke requires route
+  `getTranscriptPage` and bans full hydration/aliases.
 
 ##### P4-W6 — Revisioned patch reducer
 

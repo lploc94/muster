@@ -19,7 +19,7 @@ export interface RepositorySnapshotProjection {
 }
 
 /** Map a repository transcript row to the host wire transcript item. */
-function toHostTranscriptItem(item: RepositoryTranscriptItem): TranscriptItem {
+export function toHostTranscriptItem(item: RepositoryTranscriptItem): TranscriptItem {
   if (item.kind === 'tool') {
     const content = item.content as Record<string, unknown>;
     return {

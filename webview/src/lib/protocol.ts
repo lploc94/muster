@@ -11,7 +11,7 @@ import type { NormalizedEvent, Question } from './types';
  * breaking change to the ExtMessage/OutMessage shapes below (and mirror it in
  * src/extension.ts).
  */
-export const PROTOCOL_VERSION = 6;
+export const PROTOCOL_VERSION = 7;
 
 /**
  * Require an exact peer protocol version. A different or malformed version
@@ -145,15 +145,55 @@ export interface QueuedTurnProjection {
 }
 
 /**
- * Current-only transcript page metadata (protocol v6). Present iff a task is
+ * Current-only transcript page metadata (protocol v6+). Present iff a task is
  * focused; carries the keyset cursor/hasMore flags and the page's workspace
- * revision so the webview can (in W5) request older pages.
+ * revision so the webview can request older pages (W5).
  */
 export interface TranscriptPageState {
   beforeCursor?: string;
   hasMoreBefore: boolean;
   workspaceRevision: number;
 }
+
+/** Bounds for loadTranscriptPage request correlation/payload fields (protocol v7). */
+export const TRANSCRIPT_PAGE_REQUEST_ID_MAX = 128;
+export const TRANSCRIPT_PAGE_TASK_ID_MAX = 512;
+export const TRANSCRIPT_PAGE_CURSOR_MAX = 4096;
+export const TRANSCRIPT_PAGE_MAX_ITEMS = 100;
+
+/** Fixed failure codes for transcriptPageResult (no free-form message). */
+export type TranscriptPageErrorCode =
+  | 'invalidRequest'
+  | 'staleFocus'
+  | 'taskNotFound'
+  | 'invalidCursor'
+  | 'unavailable';
+
+export const TRANSCRIPT_PAGE_ERROR_CODES: readonly TranscriptPageErrorCode[] = [
+  'invalidRequest',
+  'staleFocus',
+  'taskNotFound',
+  'invalidCursor',
+  'unavailable',
+] as const;
+
+/** Host → webview older-page response (protocol v7). */
+export type TranscriptPageResultMessage =
+  | {
+      type: 'transcriptPageResult';
+      requestId: string;
+      taskId: string;
+      ok: true;
+      items: TranscriptItem[];
+      transcriptPage: TranscriptPageState;
+    }
+  | {
+      type: 'transcriptPageResult';
+      requestId: string;
+      taskId: string;
+      ok: false;
+      code: TranscriptPageErrorCode;
+    };
 
 export interface SnapshotMessage {
   type: 'snapshot';
@@ -417,6 +457,11 @@ export type ExtMessage =
       exportedAt: string;
     }
   /**
+   * Older transcript page response (protocol v7). Success carries ≤100 items +
+   * page metadata; failures use fixed codes only (no free-form message/stack).
+   */
+  | TranscriptPageResultMessage
+  /**
    * Host response to `requestFileMentionSuggestions`.
    * Success returns relative suggestion items only (never absolute paths, cwd,
    * or file contents). Failures use bounded codes with no free-form message.
@@ -485,6 +530,17 @@ export type OutMessage =
     }
   | { type: 'focusTask'; taskId: string }
   | { type: 'hydrateSubtree'; taskId: string }
+  /**
+   * Request one bounded older transcript page for the focused task (protocol v7).
+   * Host replies with `transcriptPageResult` (typed success or fixed error code).
+   * No loadHistory/historyChunk aliases.
+   */
+  | {
+      type: 'loadTranscriptPage';
+      requestId: string;
+      taskId: string;
+      beforeCursor: string;
+    }
   | { type: 'newTask' }
   | { type: 'cancelTurn'; taskId: string; turnId: string }
   | { type: 'submitAsk'; taskId: string; turnId: string; askId: string; answers: Record<string, AskAnswer> }
@@ -893,23 +949,58 @@ function isTaskSummary(v: unknown): v is TaskSummary {
 }
 
 function isTranscriptItem(v: unknown): v is TranscriptItem {
-  if (!isRecord(v) || !isString(v.id)) return false;
+  if (!isRecord(v) || !isString(v.id) || v.id.length === 0) return false;
   switch (v.kind) {
     case 'user':
-    case 'assistant':
-      return isString(v.content);
-    case 'reasoning':
-      // Turn-scoped, string content, no order.
-      return isString(v.turnId) && isString(v.content);
+    case 'assistant': {
+      // Exact allowed keys; content is string; optional turnId/order/state typed.
+      if (!hasOnlyKeys(v, ['id', 'kind', 'content', 'turnId', 'order', 'state'])) return false;
+      if (!isString(v.content)) return false;
+      if (v.turnId !== undefined && !isString(v.turnId)) return false;
+      if (v.order !== undefined && !isNumber(v.order)) return false;
+      if (v.state !== undefined && !isString(v.state)) return false;
+      return true;
+    }
+    case 'reasoning': {
+      // Exact keys; non-empty turnId; string content. Host never sends order/state.
+      if (!hasOnlyKeys(v, ['id', 'kind', 'turnId', 'content'])) return false;
+      return isString(v.turnId) && v.turnId.length > 0 && isString(v.content);
+    }
     case 'tool': {
-      // Requires turnId + numeric order + structured tool content.
+      // Exact top-level keys; structured tool content with fixed status/toolKind.
+      if (!hasOnlyKeys(v, ['id', 'kind', 'turnId', 'order', 'content'])) return false;
       if (!isString(v.turnId) || !isNumber(v.order) || !isRecord(v.content)) return false;
       const c = v.content;
-      return isString(c.toolCallId) && isString(c.name) && isString(c.status);
+      if (
+        !hasOnlyKeys(c, [
+          'toolCallId',
+          'name',
+          'toolKind',
+          'status',
+          'input',
+          'output',
+          'error',
+        ])
+      ) {
+        return false;
+      }
+      if (!isString(c.toolCallId) || !isString(c.name)) return false;
+      if (c.status !== 'running' && c.status !== 'success' && c.status !== 'error') return false;
+      if (
+        c.toolKind !== undefined &&
+        c.toolKind !== 'mcp' &&
+        c.toolKind !== 'builtin' &&
+        c.toolKind !== 'other'
+      ) {
+        return false;
+      }
+      if (c.error !== undefined && !isString(c.error)) return false;
+      // input/output remain unknown payloads when present.
+      return true;
     }
     case 'error':
-      // Locally-synthesized only; the host never sends error transcript items.
-      return true;
+      // Locally-synthesized only; host isExtMessage must reject error items.
+      return false;
     default:
       return false;
   }
@@ -917,6 +1008,8 @@ function isTranscriptItem(v: unknown): v is TranscriptItem {
 
 function isTranscriptPageState(v: unknown): v is TranscriptPageState {
   if (!isRecord(v)) return false;
+  // Exact keys: hasMoreBefore + workspaceRevision + optional beforeCursor.
+  if (!hasOnlyKeys(v, ['hasMoreBefore', 'workspaceRevision', 'beforeCursor'])) return false;
   if (typeof v.hasMoreBefore !== 'boolean') return false;
   // workspaceRevision: finite, non-negative safe integer.
   if (
@@ -929,11 +1022,48 @@ function isTranscriptPageState(v: unknown): v is TranscriptPageState {
   }
   // beforeCursor is present only when there is an older page to fetch.
   if (v.hasMoreBefore) {
-    if (!isString(v.beforeCursor)) return false;
+    if (!isString(v.beforeCursor) || v.beforeCursor.length === 0 || v.beforeCursor.length > TRANSCRIPT_PAGE_CURSOR_MAX) {
+      return false;
+    }
   } else if (v.beforeCursor !== undefined) {
     return false;
   }
   return true;
+}
+
+function isBoundedId(v: unknown, max: number): v is string {
+  return isString(v) && v.length > 0 && v.length <= max && !v.includes('\0');
+}
+
+function isTranscriptPageErrorCode(v: unknown): v is TranscriptPageErrorCode {
+  return (
+    v === 'invalidRequest' ||
+    v === 'staleFocus' ||
+    v === 'taskNotFound' ||
+    v === 'invalidCursor' ||
+    v === 'unavailable'
+  );
+}
+
+function isTranscriptPageResultMessage(data: Record<string, unknown>): boolean {
+  if (data.type !== 'transcriptPageResult') return false;
+  if (!isBoundedId(data.requestId, TRANSCRIPT_PAGE_REQUEST_ID_MAX)) return false;
+  if (!isBoundedId(data.taskId, TRANSCRIPT_PAGE_TASK_ID_MAX)) return false;
+  if (data.ok === true) {
+    if (
+      !hasOnlyKeys(data, ['type', 'requestId', 'taskId', 'ok', 'items', 'transcriptPage'])
+    ) {
+      return false;
+    }
+    if (!Array.isArray(data.items) || data.items.length > TRANSCRIPT_PAGE_MAX_ITEMS) return false;
+    if (!data.items.every(isTranscriptItem)) return false;
+    return isTranscriptPageState(data.transcriptPage);
+  }
+  if (data.ok === false) {
+    if (!hasOnlyKeys(data, ['type', 'requestId', 'taskId', 'ok', 'code'])) return false;
+    return isTranscriptPageErrorCode(data.code);
+  }
+  return false;
 }
 
 function isQueuedTurnProjection(v: unknown): v is QueuedTurnProjection {
@@ -1079,6 +1209,9 @@ export function isExtMessage(data: unknown): data is ExtMessage {
 
     case 'transcriptAppend':
       return isString(data.taskId) && isTranscriptItem(data.item);
+
+    case 'transcriptPageResult':
+      return isTranscriptPageResultMessage(data);
 
     case 'askPending':
       return isString(data.askId) && Array.isArray(data.questions) && data.questions.every(isQuestion);
