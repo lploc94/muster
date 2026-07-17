@@ -60,7 +60,13 @@ jobs:
       # scripts/run-visual-baselines.mjs runs inside lockfile-pinned
       # mcr.microsoft.com/playwright:v*-jammy (Docker available on ubuntu-latest).
       - name: Compare visual baselines (pinned Linux Chromium)
-        run: npm run test:visual:linux
+        run: |
+          # Match container user to the Actions runner so bind-mounted
+          # test-results/playwright-report are not root-owned (EACCES).
+          export MUSTER_VISUAL_UID="$(id -u)"
+          export MUSTER_VISUAL_GID="$(id -g)"
+          mkdir -p test-results playwright-report
+          npm run test:visual:linux
 
       - uses: actions/upload-artifact@v4
         if: failure()

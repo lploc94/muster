@@ -129,12 +129,51 @@ export function toDockerMountPath(hostPath, { style = 'native' } = {}) {
   return `/mnt/${m[1].toLowerCase()}/${m[2]}`;
 }
 
+
+/**
+ * Resolve host uid/gid for Docker --user so bind-mounted artifacts are not
+ * root-owned. Prefer explicit MUSTER_VISUAL_UID/GID (CI), then getuid/getgid.
+ */
+export function resolveHostUserIds(env = process.env) {
+  let uid = String(env.MUSTER_VISUAL_UID || env.UID || '').trim();
+  let gid = String(env.MUSTER_VISUAL_GID || env.GID || '').trim();
+  if ((!uid || !gid) && typeof process.getuid === 'function') {
+    try {
+      uid = uid || String(process.getuid());
+    } catch {
+      /* ignore platforms without getuid */
+    }
+    try {
+      gid = gid || String(process.getgid());
+    } catch {
+      /* ignore */
+    }
+  }
+  if (!uid || !gid || !/^\d+$/.test(uid) || !/^\d+$/.test(gid)) {
+    return null;
+  }
+  return { uid, gid };
+}
+
+/**
+ * Docker args that run the container as the host user. Without this, Linux CI
+ * produces root-owned test-results/ and the host writeDiagnostics step fails
+ * with EACCES even when Playwright itself passed.
+ */
+export function dockerUserArgs(env = process.env) {
+  const ids = resolveHostUserIds(env);
+  if (!ids) return [];
+  // Non-root Playwright image needs a writable HOME for npm/cache temp files.
+  return ['--user', ids.uid + ':' + ids.gid, '-e', 'HOME=/tmp'];
+}
+
 export function buildDockerArgs({
   image,
   workdir,
   hostRepo,
   command,
   mountStyle = 'native',
+  userArgs = dockerUserArgs(),
 }) {
   const mountPath = toDockerMountPath(hostRepo, { style: mountStyle });
   const mount = `${mountPath}:${workdir}`;
@@ -150,6 +189,7 @@ export function buildDockerArgs({
   return [
     'run',
     '--rm',
+    ...userArgs,
     '-v',
     mount,
     '-v',
@@ -286,9 +326,25 @@ function collectHostDiagnostics() {
 }
 
 function writeDiagnostics(payload, outPath) {
-  mkdirSync(path.dirname(outPath), { recursive: true });
-  writeFileSync(outPath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
-  console.log(`Wrote visual diagnostics: ${path.relative(REPO_ROOT, outPath)}`);
+  const body = `${JSON.stringify(payload, null, 2)}\n`;
+  try {
+    mkdirSync(path.dirname(outPath), { recursive: true });
+    writeFileSync(outPath, body, 'utf8');
+    console.log(`Wrote visual diagnostics: ${path.relative(REPO_ROOT, outPath)}`);
+    return outPath;
+  } catch (err) {
+    // Docker as root can leave test-results/ unwritable for the host user.
+    // Prefer a repo-root fallback over crashing a green Playwright run.
+    if (err && (err.code === 'EACCES' || err.code === 'EPERM')) {
+      const fallback = path.join(REPO_ROOT, path.basename(outPath));
+      writeFileSync(fallback, body, 'utf8');
+      console.warn(
+        `WARN: could not write ${outPath} (${err.code}); wrote fallback ${path.relative(REPO_ROOT, fallback)}`,
+      );
+      return fallback;
+    }
+    throw err;
+  }
 }
 
 function runDocker(engine, args) {
@@ -352,6 +408,9 @@ function main(argv = process.argv.slice(2)) {
   const workdir = '/work';
   const hostRepo = process.env.MUSTER_VISUAL_HOST_REPO || REPO_ROOT;
   const mountPath = toDockerMountPath(hostRepo, { style: engine.mountStyle });
+  // Host-owned dirs first so container writes (as --user) land on writable paths.
+  mkdirSync(path.join(REPO_ROOT, 'test-results'), { recursive: true });
+  mkdirSync(path.join(REPO_ROOT, 'playwright-report'), { recursive: true });
 
   if (args.diagnosticsOnly) {
     const diagCmd = [
@@ -364,6 +423,7 @@ function main(argv = process.argv.slice(2)) {
     const diagArgs = [
       'run',
       '--rm',
+      ...dockerUserArgs(),
       '-v',
       `${mountPath}:${workdir}`,
       '-v',

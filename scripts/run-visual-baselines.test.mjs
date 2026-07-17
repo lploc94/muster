@@ -3,7 +3,9 @@ import test from 'node:test';
 import {
   buildDockerArgs,
   buildPlaywrightCommand,
+  dockerUserArgs,
   parseArgs,
+  resolveHostUserIds,
   playwrightDockerImage,
   resolvePlaywrightVersionFromLock,
   toDockerMountPath,
@@ -106,7 +108,7 @@ test('parseArgs keeps --update while forwarding remaining Playwright args', () =
 
 test('buildPlaywrightCommand never includes update-snapshots in compare mode', () => {
   const cmd = buildPlaywrightCommand({ update: false });
-  assert.match(cmd, /playwright test e2e\/visual --project=visual-chromium/);
+  assert.match(cmd, /playwright test 'e2e\/visual' --project=visual-chromium/);
   assert.doesNotMatch(cmd, /update-snapshots/);
 });
 
@@ -145,6 +147,7 @@ test('buildDockerArgs mounts repo read-write, isolates node_modules, pins image'
     workdir: '/work',
     hostRepo: '/repo',
     command: 'npm run test:visual',
+    userArgs: [],
   });
   assert.ok(args.includes('--rm'));
   assert.ok(args.includes('-v'));
@@ -167,6 +170,42 @@ test('buildDockerArgs converts Windows host path when mountStyle=wsl', () => {
     hostRepo: 'D:\\_Dev\\muster',
     command: 'npx playwright test e2e/visual --project=visual-chromium',
     mountStyle: 'wsl',
+    userArgs: [],
   });
   assert.ok(args.includes('/mnt/d/_Dev/muster:/work'));
+});
+
+
+test('resolveHostUserIds prefers MUSTER_VISUAL_UID/GID', () => {
+  assert.deepEqual(
+    resolveHostUserIds({ MUSTER_VISUAL_UID: '1001', MUSTER_VISUAL_GID: '1001' }),
+    { uid: '1001', gid: '1001' },
+  );
+});
+
+test('dockerUserArgs emits --user and HOME=/tmp when ids present', () => {
+  assert.deepEqual(dockerUserArgs({ MUSTER_VISUAL_UID: '1001', MUSTER_VISUAL_GID: '1001' }), [
+    '--user',
+    '1001:1001',
+    '-e',
+    'HOME=/tmp',
+  ]);
+});
+
+test('dockerUserArgs is empty when ids missing', () => {
+  assert.deepEqual(dockerUserArgs({}), []);
+});
+
+test('buildDockerArgs inserts --user before image when userArgs provided', () => {
+  const args = buildDockerArgs({
+    image: 'mcr.microsoft.com/playwright:v1.61.1-jammy',
+    workdir: '/work',
+    hostRepo: '/repo',
+    command: 'true',
+    userArgs: ['--user', '1001:1001', '-e', 'HOME=/tmp'],
+  });
+  const imageIdx = args.indexOf('mcr.microsoft.com/playwright:v1.61.1-jammy');
+  const userIdx = args.indexOf('--user');
+  assert.ok(userIdx >= 0 && userIdx < imageIdx);
+  assert.equal(args[userIdx + 1], '1001:1001');
 });
