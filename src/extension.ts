@@ -238,7 +238,7 @@ function debugElicitation(event: string, details: Record<string, unknown> = {}):
  * version is stamped on the bootstrap `snapshot` message, and a mismatch is
  * surfaced in the webview as a visible "reload the window" banner.
  */
-const PROTOCOL_VERSION = 7;
+const PROTOCOL_VERSION = 8;
 
 /** How long a permission prompt waits for a webview decision before safe-denying. */
 const PERMISSION_PROMPT_TIMEOUT_MS = USER_INTERACTION_TIMEOUT_MS;
@@ -1420,6 +1420,47 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   }
 
   /**
+   * Protocol v8 recovery: webview observed a revision gap/invariant failure.
+   * Validate exact keys and return a bounded snapshot. Protocol mismatch still
+   * requires Reload Window and is not handled here.
+   */
+  private handleRequestWorkspaceRecovery(data: unknown): void {
+    if (!data || typeof data !== 'object') return;
+    const msg = data as Record<string, unknown>;
+    if (msg.type !== 'requestWorkspaceRecovery') return;
+    const keys = Object.keys(msg);
+    const allowed = new Set(['type', 'taskId', 'currentRevision', 'observedRevision']);
+    if (keys.some((k) => !allowed.has(k))) return;
+    if (
+      typeof msg.currentRevision !== 'number' ||
+      !Number.isFinite(msg.currentRevision) ||
+      !Number.isSafeInteger(msg.currentRevision) ||
+      msg.currentRevision < 0
+    ) {
+      return;
+    }
+    if (
+      typeof msg.observedRevision !== 'number' ||
+      !Number.isFinite(msg.observedRevision) ||
+      !Number.isSafeInteger(msg.observedRevision) ||
+      msg.observedRevision < 0
+    ) {
+      return;
+    }
+    if (msg.taskId !== undefined) {
+      if (typeof msg.taskId !== 'string' || msg.taskId.length === 0 || msg.taskId.length > 512) {
+        return;
+      }
+      if (msg.taskId.includes('\0')) return;
+    }
+    const focus =
+      typeof msg.taskId === 'string' && msg.taskId.length > 0
+        ? msg.taskId
+        : this.focusedTaskId;
+    this.postSnapshot(focus);
+  }
+
+  /**
    * Load one bounded older transcript page for the focused task (protocol v7).
    * Valid failures post transcriptPageResult with fixed codes — never commandError.
    */
@@ -2396,6 +2437,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           break;
         case 'loadTranscriptPage':
           await this.handleLoadTranscriptPage(data);
+          break;
+        case 'requestWorkspaceRecovery':
+          this.handleRequestWorkspaceRecovery(data);
           break;
         case 'requestRuntimeHandoff':
           await this.handleRequestRuntimeHandoff(data);

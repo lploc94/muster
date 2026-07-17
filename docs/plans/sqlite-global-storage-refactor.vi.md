@@ -2,7 +2,7 @@
 
 ## Trạng thái
 
-**IN PROGRESS — Phase 4 pagination/incremental wire (P4-W3 ✅; P4-W4 ✅; P4-W5 ✅; P4-W6+ chưa bắt đầu).**
+**IN PROGRESS — Phase 4 pagination/incremental wire (P4-W3 ✅; P4-W4 ✅; P4-W5 ✅; P4-W6 ✅; P4-W7+ chưa bắt đầu).**
 Cập nhật: 2026-07-17
 
 - Phase 1: **đã qua gate** — worker/RPC, schema bootstrap, global-storage registry,
@@ -633,7 +633,7 @@ sau bắt đầu ngay khi wave trước đạt gate, chỉ dừng khi có blocke
 | P4-W3 ✅ | Canonical cursor + SQL keyset page | SQLite query bounded `limit + 1`, không load full transcript |
 | P4-W4 ✅ | Bounded bootstrap | Snapshot focused task chỉ chứa 100 item + page metadata |
 | P4-W5 ✅ | Load older UX | Typed request/response, prepend idempotent, giữ scroll anchor |
-| P4-W6 | Revisioned patch reducer | Duplicate/stale patch là no-op; revision gap yêu cầu recovery |
+| P4-W6 ✅ | Revisioned patch reducer | Duplicate/stale patch là no-op; revision gap yêu cầu recovery |
 | P4-W7 | Local patch routing | Queue/tree/transcript update không kéo theo focused full snapshot |
 | P4-W8 | Stream batching | Assistant/reasoning persist + post coalesce 50–100 ms, flush ở tool/terminal boundary |
 | P4-W9 | Change-feed contract | Bounded feed, prune watermark, explicit gap result |
@@ -806,10 +806,15 @@ request; fixed page limit 100; **no W6 recovery**.
 
 ##### P4-W6 — Revisioned patch reducer
 
-- Wire messages: `taskUpserted`, `turnActivityChanged`, `transcriptItemsAppended`,
+- Wire messages: atomic `workspacePatchBatch` envelope (protocol v8) carrying
+  `taskUpserted`, `turnActivityChanged`, `transcriptItemsAppended`,
   `transcriptItemPatched`, `queuedTurnsChanged`, `taskRemoved`.
-- Mỗi patch có workspace revision và stable entity identity. Reducer là idempotent;
-  stale/duplicate là no-op, gap chuyển state sang `needsRecovery`.
+- Envelope `revision` is the effective workspace revision of the whole batch;
+  empty `patches: []` still advances revision. Never coalesce two workspace
+  revisions into one envelope.
+- Mỗi patch có stable entity identity. Reducer là idempotent; stale/duplicate
+  là no-op, gap/invariant chuyển state sang `needsRecovery` (atomic, no partial).
+- Recovery via exact `requestWorkspaceRecovery` → bounded snapshot hydrate.
 - Exact protocol mismatch chỉ hiện reload banner; không parse/translate protocol cũ.
 
 ##### P4-W7 — Local patch routing

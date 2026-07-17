@@ -63,6 +63,7 @@ const baseTaskSummary = {
   goal: 'Goal',
   role: 'worker',
   lifecycle: 'open',
+  runtimeActivity: 'idle',
   viewStatus: 'idle',
   currentTurnActivity: null,
   updatedAt: '2026-07-06T00:00:00.000Z',
@@ -170,8 +171,8 @@ describe('protocol v7 focused transcriptPage contract', () => {
     transcriptPage: validPage,
   };
 
-  it('is exactly version 7', () => {
-    expect(PROTOCOL_VERSION).toBe(7);
+  it('is exactly version 8', () => {
+    expect(PROTOCOL_VERSION).toBe(8);
   });
 
   it('accepts focused snapshot with transcript + transcriptPage', () => {
@@ -1510,6 +1511,212 @@ describe('protocol v7 loadTranscriptPage / transcriptPageResult', () => {
       isExtMessage({
         ...validSuccess,
         items: [{ ...baseTool, content: { ...baseTool.content, nestedExtra: 1 } }],
+      }),
+    ).toBe(false);
+  });
+});
+
+describe('protocol v8 workspacePatchBatch', () => {
+  const summary = {
+    id: 'task-1',
+    parentId: null,
+    goal: 'Goal',
+    role: 'worker',
+    lifecycle: 'open',
+    runtimeActivity: 'idle',
+    viewStatus: 'idle',
+    currentTurnActivity: null,
+    updatedAt: '2026-07-06T00:00:00.000Z',
+    backend: 'claude-cli',
+  };
+
+  const summary2 = { ...summary, id: 'task-2', goal: 'Other' };
+  const validBatch = {
+    type: 'workspacePatchBatch',
+    revision: 2,
+    patches: [
+      { type: 'taskUpserted', task: summary },
+      { type: 'turnActivityChanged', task: summary2 },
+      {
+        type: 'transcriptItemsAppended',
+        taskId: 'task-1',
+        items: [{ id: 'u1', kind: 'user', content: 'hi', turnId: 't1', order: 0 }],
+      },
+      {
+        type: 'transcriptItemPatched',
+        taskId: 'task-1',
+        item: { id: 'a1', kind: 'assistant', content: 'yo', turnId: 't1', order: 1 },
+      },
+      {
+        type: 'queuedTurnsChanged',
+        taskId: 'task-1',
+        queuedTurns: [
+          {
+            turnId: 'q1',
+            sequence: 1,
+            status: 'queued',
+            messageIds: ['m1'],
+            createdAt: '2026-07-06T00:00:00.000Z',
+          },
+        ],
+      },
+      { type: 'taskRemoved', taskId: 'task-3' },
+    ],
+  };
+
+  it('is exactly version 8', () => {
+    expect(PROTOCOL_VERSION).toBe(8);
+  });
+
+  it('accepts a multi-kind batch and empty patches', () => {
+    expect(isExtMessage(validBatch)).toBe(true);
+    expect(isExtMessage({ type: 'workspacePatchBatch', revision: 0, patches: [] })).toBe(true);
+  });
+
+  it('rejects extra fields, bad revision, and malformed nested payloads', () => {
+    expect(isExtMessage({ ...validBatch, extra: 1 })).toBe(false);
+    expect(isExtMessage({ type: 'workspacePatchBatch', revision: -1, patches: [] })).toBe(false);
+    expect(isExtMessage({ type: 'workspacePatchBatch', revision: 1.5, patches: [] })).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [{ type: 'taskUpserted', task: summary, extra: true }],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [{ type: 'taskRemoved' }],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [
+          {
+            type: 'transcriptItemsAppended',
+            taskId: 'task-1',
+            items: [{ id: 'e1', kind: 'error', content: 'x' }],
+          },
+        ],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [{ type: 'taskUpserted', task: { ...summary, nestedExtra: true } }],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [{ type: 'taskUpserted', task: { ...summary, runtimeActivity: undefined } }],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [
+          {
+            type: 'queuedTurnsChanged',
+            taskId: 'task-1',
+            queuedTurns: [
+              {
+                turnId: 'q1',
+                sequence: 1.5,
+                status: 'queued',
+                messageIds: ['m1'],
+                createdAt: '2026-07-06T00:00:00.000Z',
+                nestedExtra: true,
+              },
+            ],
+          },
+        ],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [
+          {
+            type: 'transcriptItemsAppended',
+            taskId: 'task-1',
+            items: [{ id: 'bad\0id', kind: 'user', content: 'x' }],
+          },
+        ],
+      }),
+    ).toBe(false);
+  });
+
+  it('rejects duplicate stable identities in one batch', () => {
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [
+          { type: 'taskUpserted', task: summary },
+          { type: 'turnActivityChanged', task: summary },
+        ],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [
+          {
+            type: 'transcriptItemsAppended',
+            taskId: 'task-1',
+            items: [
+              { id: 'u1', kind: 'user', content: 'a' },
+              { id: 'u1', kind: 'user', content: 'b' },
+            ],
+          },
+        ],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [
+          {
+            type: 'transcriptItemsAppended',
+            taskId: 'task-1',
+            items: [{ id: 'u1', kind: 'user', content: 'a' }],
+          },
+          {
+            type: 'transcriptItemPatched',
+            taskId: 'task-1',
+            item: { id: 'u1', kind: 'user', content: 'b' },
+          },
+        ],
+      }),
+    ).toBe(false);
+  });
+
+  it('bounds transcript entities across the whole patch envelope', () => {
+    const makeItems = (prefix: string) =>
+      Array.from({ length: 251 }, (_, index) => ({
+        id: `${prefix}-${index}`,
+        kind: 'assistant' as const,
+        content: 'x',
+      }));
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [
+          { type: 'transcriptItemsAppended', taskId: 'task-1', items: makeItems('a') },
+          { type: 'transcriptItemsAppended', taskId: 'task-2', items: makeItems('b') },
+        ],
       }),
     ).toBe(false);
   });

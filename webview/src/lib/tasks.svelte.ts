@@ -3,6 +3,7 @@ import { isHardTerminalLifecycle, post } from './protocol';
 import { sortQueuedTurns } from './queued-turns';
 import { parseBackendId, parseModelFromSelectValue } from './backend-resolve';
 import { vscode } from './vscode';
+import type { WorkspacePatchViewState } from './workspace-patch-reducer';
 
 export interface CommandErrorState {
   taskId: string | null;
@@ -32,6 +33,12 @@ class TasksState {
 
   /** Per-task watermark for stale taskUpdated guard (ISSUE-13). */
   private revisionWatermarks = $state<Map<string, number>>(new Map());
+
+  /**
+   * Protocol v8 revision gap/invariant recovery. While true, live patches are
+   * ignored until the next authoritative snapshot hydrate.
+   */
+  needsRecovery = $state(false);
 
   /** Unpersisted composer — first send has no taskId. */
   draftMode = $state(false);
@@ -296,6 +303,7 @@ class TasksState {
 
   applySnapshot(snapshot: SnapshotMessage): void {
     this.storeRevision = snapshot.storeRevision;
+    this.needsRecovery = false;
 
     const next = new Map<string, TaskSummary>();
     for (const task of snapshot.rootTasks) {
@@ -327,6 +335,34 @@ class TasksState {
     } else if (!this.draftMode) {
       this.queuedTurns = [];
     }
+  }
+
+  /**
+   * Sync task chrome from a pure workspace-patch reducer result (protocol v8).
+   * Does not touch draftMode/pending focus beyond focusedTaskId when removed.
+   */
+  applyPatchView(state: WorkspacePatchViewState): void {
+    this.storeRevision = state.revision;
+    this.needsRecovery = state.needsRecovery;
+    this.tasks = new Map(state.tasks);
+    this.subtree = [...state.subtree];
+    for (const task of state.tasks.values()) {
+      this.seedWatermark(task.id, state.revision);
+    }
+    if (state.focusedTaskId) {
+      this.focusedTaskId = state.focusedTaskId;
+      this.queuedTurns = sortQueuedTurns(state.queuedTurns);
+      this.reconcilePendingHandoffTarget(state.focusedTaskId);
+    } else {
+      if (this.focusedTaskId && !state.tasks.has(this.focusedTaskId)) {
+        this.focusedTaskId = null;
+      }
+      this.queuedTurns = [];
+    }
+  }
+
+  markNeedsRecovery(): void {
+    this.needsRecovery = true;
   }
 
   applyTaskUpdated(taskId: string, storeRevision: number, patch: Partial<TaskSummary>): void {

@@ -102,8 +102,8 @@ const protocolSource = fs.readFileSync(
 
 describe('protocol v7 host+webview version contract', () => {
   it('keeps exact version 7 in both host and webview constants', () => {
-    expect(protocolSource).toMatch(/export const PROTOCOL_VERSION = 7;/);
-    expect(extensionSource).toMatch(/const PROTOCOL_VERSION = 7;/);
+    expect(protocolSource).toMatch(/export const PROTOCOL_VERSION = 8;/);
+    expect(extensionSource).toMatch(/const PROTOCOL_VERSION = 8;/);
   });
 
   it('maps missing repository via getTask throw to unavailable', () => {

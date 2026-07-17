@@ -14,6 +14,7 @@ import {
   ownershipFromTranscript,
   type TranscriptPageWindowState,
 } from './transcript-page-reducer';
+import type { WorkspacePatchViewState } from './workspace-patch-reducer';
 
 function asText(content: unknown): string {
   if (typeof content === 'string') return content;
@@ -269,6 +270,37 @@ export class TaskThread {
     }
     const mapped = transcriptToThreadItem(item);
     if (mapped) this.items.push(mapped);
+  }
+
+  /**
+   * Apply focused transcript window from pure patch-reducer state while
+   * preserving live streaming buffer and older-page request metadata.
+   */
+  applyPatchTranscript(state: WorkspacePatchViewState): void {
+    const keepStreaming = !!this.streaming;
+    const streamingId = this.streaming?.messageId;
+    let items = state.transcriptItems.slice();
+    if (keepStreaming && streamingId) {
+      items = items.filter((item) => item.id !== streamingId);
+    }
+    this.items = items;
+    this.reasoningByTurn = { ...state.reasoningByTurn };
+    const owned = new Set(state.loadedTranscriptIds);
+    for (const item of this.items) owned.add(item.id);
+    if (streamingId) owned.add(streamingId);
+    this.loadedTranscriptIds = owned;
+    if (state.transcriptWorkspaceRevision !== undefined) {
+      const prev = this.transcriptWorkspaceRevision;
+      this.transcriptWorkspaceRevision =
+        prev === undefined
+          ? state.transcriptWorkspaceRevision
+          : Math.max(prev, state.transcriptWorkspaceRevision);
+    }
+    this.revision++;
+  }
+
+  getLoadedTranscriptIds(): ReadonlySet<string> {
+    return this.loadedTranscriptIds;
   }
 
   startTurn(turnId: string): void {
@@ -542,8 +574,18 @@ class ThreadStore {
     thread.endTurn();
   }
 
-  onTranscriptAppend(taskId: string, item: TranscriptItem): void {
-    this.getOrCreate(taskId).appendTranscript(item);
+  /**
+   * Apply focused transcript window from a pure workspace-patch reducer result.
+   * Preserves live streaming buffer and older-page request metadata.
+   */
+  applyPatchView(state: WorkspacePatchViewState): void {
+    if (!state.focusedTaskId || this.currentTaskId !== state.focusedTaskId) {
+      if (!state.focusedTaskId && this.currentTaskId && !state.tasks.has(this.currentTaskId)) {
+        this.clearFocus();
+      }
+      return;
+    }
+    this.current.applyPatchTranscript(state);
   }
 
   /**
