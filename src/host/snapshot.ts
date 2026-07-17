@@ -1,6 +1,15 @@
 import type { Question } from '../bridge/ask-bridge';
 import { deriveRuntimeActivity, deriveViewStatus } from '../task/derived-status';
 import { dependenciesBlockTask } from '../task/scheduler';
+import {
+  ASSISTANT_ORDERING_FALLBACK,
+  KIND_RANK,
+  REASONING_ORDERING,
+  UNBOUND_TURN_SEQUENCE,
+  USER_ORDERING_FALLBACK,
+  compareTranscriptKeys,
+  type TranscriptSortKey,
+} from '../task/transcript-order';
 import type {
   MusterTask,
   TaskLifecycleState,
@@ -423,10 +432,7 @@ export function buildTranscript(file: TaskStoreFile, taskId: string): Transcript
 
   interface Entry {
     item: TranscriptItem;
-    seq: number;
-    order: number;
-    createdAt: string;
-    id: string;
+    key: TranscriptSortKey;
   }
   const entries: Entry[] = [];
 
@@ -447,15 +453,15 @@ export function buildTranscript(file: TaskStoreFile, taskId: string): Transcript
         continue;
       }
     }
-    const seq = turnId !== undefined && seqOf.has(turnId) ? seqOf.get(turnId)! : -1;
-    // Opening user prompts use order -2 (before reasoning -1 / assistant >=0).
-    // Explicit message.order (if present) is respected for ordered segments.
-    const order =
+    const seq = turnId !== undefined && seqOf.has(turnId) ? seqOf.get(turnId)! : UNBOUND_TURN_SEQUENCE;
+    // Canonical contract (src/task/transcript-order.ts): user prompts rank ahead
+    // of reasoning ahead of the assistant/tool stream within a turn. Explicit
+    // message.order (if present) is respected for ordered segments.
+    const kindRank = KIND_RANK[message.role];
+    const ordering =
       message.role === 'assistant'
-        ? (message.order ?? 0)
-        : message.order !== undefined
-          ? message.order
-          : -2;
+        ? (message.order ?? ASSISTANT_ORDERING_FALLBACK)
+        : (message.order ?? USER_ORDERING_FALLBACK);
     entries.push({
       item: {
         id: message.id,
@@ -465,10 +471,7 @@ export function buildTranscript(file: TaskStoreFile, taskId: string): Transcript
         order: message.order,
         state: message.state,
       },
-      seq,
-      order,
-      createdAt: message.createdAt,
-      id: message.id,
+      key: { turnSequence: seq, kindRank, ordering, createdAt: message.createdAt, entityId: message.id },
     });
   }
 
@@ -476,7 +479,7 @@ export function buildTranscript(file: TaskStoreFile, taskId: string): Transcript
     if (tc.taskId !== taskId) {
       continue;
     }
-    const seq = seqOf.has(tc.turnId) ? seqOf.get(tc.turnId)! : -1;
+    const seq = seqOf.has(tc.turnId) ? seqOf.get(tc.turnId)! : UNBOUND_TURN_SEQUENCE;
     entries.push({
       item: {
         id: tc.id,
@@ -493,10 +496,7 @@ export function buildTranscript(file: TaskStoreFile, taskId: string): Transcript
           error: tc.error,
         },
       },
-      seq,
-      order: tc.order,
-      createdAt: tc.createdAt,
-      id: tc.id,
+      key: { turnSequence: seq, kindRank: KIND_RANK.tool, ordering: tc.order, createdAt: tc.createdAt, entityId: tc.id },
     });
   }
 
@@ -504,23 +504,14 @@ export function buildTranscript(file: TaskStoreFile, taskId: string): Transcript
     if (r.taskId !== taskId) {
       continue;
     }
-    const seq = seqOf.has(r.turnId) ? seqOf.get(r.turnId)! : -1;
+    const seq = seqOf.has(r.turnId) ? seqOf.get(r.turnId)! : UNBOUND_TURN_SEQUENCE;
     entries.push({
       item: { id: r.id, kind: 'reasoning', turnId: r.turnId, content: r.content },
-      seq,
-      order: -1,
-      createdAt: r.createdAt,
-      id: r.id,
+      key: { turnSequence: seq, kindRank: KIND_RANK.reasoning, ordering: REASONING_ORDERING, createdAt: r.createdAt, entityId: r.id },
     });
   }
 
-  entries.sort(
-    (a, b) =>
-      a.seq - b.seq ||
-      a.order - b.order ||
-      a.createdAt.localeCompare(b.createdAt) ||
-      a.id.localeCompare(b.id),
-  );
+  entries.sort((a, b) => compareTranscriptKeys(a.key, b.key));
   return entries.map((entry) => entry.item);
 }
 

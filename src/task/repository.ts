@@ -20,9 +20,22 @@ import { isTerminalLifecycle, isTerminalTurn } from './transitions';
 import { TRUNCATION_MARKER } from './retention';
 import type { DbClient } from './sqlite/client';
 import type { SqlStatement, SqlValue } from './sqlite/rpc';
+import {
+  ASSISTANT_ORDERING_FALLBACK,
+  KIND_RANK,
+  REASONING_ORDERING,
+  UNBOUND_TURN_SEQUENCE,
+  USER_ORDERING_FALLBACK,
+  type TranscriptSortKey,
+} from './transcript-order';
+import {
+  decodeTranscriptCursor,
+  encodeTranscriptCursor,
+} from './transcript-cursor';
 
-/** Small page contract shared by the transitional adapters. Cursor encoding is
- * intentionally deferred to Phase 4, where transcript sort keys are finalized. */
+/** Small page contract shared by the transitional adapters. Transcript keyset
+ * pagination and its opaque cursor are implemented in P4-W3 (see
+ * ./transcript-cursor and ./transcript-order). */
 export interface RepositoryPageRequest {
   limit?: number;
 }
@@ -870,29 +883,51 @@ export class SqliteTaskRepository implements TaskRepository {
   }
 
   async getTranscriptPage(taskId: string, cursor?: string, limit?: number): Promise<TranscriptPage> {
-    const [turns, messages, tools, reasoning, revisionRow] = await Promise.all([
-      this.listTurns(taskId),
-      this.listMessages(taskId),
-      this.db.all<ToolRow>(
-        `SELECT id, task_id, turn_id, tool_call_id, ordering, status, name, payload_json, created_at, updated_at
-           FROM tool_calls WHERE workspace_id = ? AND task_id = ?`,
-        [this.workspaceId, taskId],
-      ),
-      this.db.all<ReasoningRow>(
-        `SELECT id, task_id, turn_id, content, created_at, updated_at
-           FROM reasoning_segments WHERE workspace_id = ? AND task_id = ?`,
-        [this.workspaceId, taskId],
-      ),
-      this.db.get<{ revision: number }>('SELECT revision FROM workspace_revisions WHERE workspace_id = ?', [this.workspaceId]),
-    ]);
-    const parsedReasoning = reasoning.map(decodeReasoning);
-    return pageTranscript(
-      composeTranscript(turns, messages, tools.map(decodeToolCall), parsedReasoning),
-      turns,
-      cursor,
-      limit,
-      revisionRow?.revision ?? 0,
-    );
+    const bounded = normalizeLimit(limit);
+    const scope = { workspaceId: this.workspaceId, taskId };
+    // A cursor is decoded/validated up front so an invalid one fails before any SQL,
+    // and its key components enter the query only as bound parameters (never interpolated).
+    const cursorKey = cursor === undefined ? undefined : decodeTranscriptCursor(cursor, scope);
+
+    // Single read snapshot: one statement selects both the revision and the page, so
+    // transcript rows and workspaceRevision are read consistently. The revision is
+    // carried via a `rev` CTE cross-joined to the page so it survives an empty page
+    // (LEFT JOIN yields one sentinel row with NULL entity columns + the revision).
+    // Parameter order mirrors the `?` placeholders in transcriptPageSql, top to bottom:
+    const params: SqlValue[] = [this.workspaceId]; // rev CTE
+    params.push(this.workspaceId, taskId); // task_turns CTE (scopes every branch)
+    params.push(this.workspaceId, taskId); // user branch WHERE
+    params.push(this.workspaceId); // user branch queued-visibility EXISTS
+    params.push(this.workspaceId, taskId); // assistant branch WHERE
+    // reasoning & tool branches drive off task_turns — no additional bound params.
+    // Keyset compares against the NORMALIZED sort column (sort_ordering), the same
+    // column the ORDER BY uses; cursorKey.ordering already carries the normalized value.
+    const keysetPredicate = cursorKey
+      ? `WHERE (turn_sequence, kind_rank, sort_ordering, created_at, entity_id) < (?, ?, ?, ?, ?)`
+      : '';
+    if (cursorKey) {
+      params.push(cursorKey.turnSequence, cursorKey.kindRank, cursorKey.ordering, cursorKey.createdAt, cursorKey.entityId);
+    }
+    params.push(bounded + 1); // limit + 1: the extra row only decides hasMoreBefore.
+
+    const rows = await this.db.all<TranscriptPageRow>(transcriptPageSql(keysetPredicate), params);
+    const revision = rows[0]?.revision ?? 0;
+    // Drop the sentinel (empty-page) row; keep only real transcript rows, newest-first.
+    const realRows = rows.filter((row): row is TranscriptPageRow & { entity_id: string } => row.entity_id !== null);
+    const hasMoreBefore = realRows.length > bounded;
+    // Decode at most `bounded` items; the limit+1 row is never materialized as a DTO.
+    const pageDesc = realRows.slice(0, bounded);
+    const oldestInPage = pageDesc[pageDesc.length - 1];
+    const items = pageDesc.map(decodeTranscriptRow).reverse(); // reverse → ascending render order
+
+    return {
+      items,
+      ...(hasMoreBefore && oldestInPage
+        ? { beforeCursor: encodeTranscriptCursor(scope, transcriptRowKey(oldestInPage)) }
+        : {}),
+      hasMoreBefore,
+      workspaceRevision: revision,
+    };
   }
 
   async getWorkspaceRevision(): Promise<number> {
@@ -3220,106 +3255,223 @@ interface ReceiptRow {
   created_at: string;
 }
 
-interface TranscriptEntry {
-  item: RepositoryTranscriptItem;
-  seq: number;
-  order: number;
-  createdAt: string;
-  id: string;
+/**
+ * One row of the keyset page query. Columns are shared across the four UNION
+ * branches; a `revision`-only sentinel row (all entity columns NULL) is emitted
+ * when the page is empty so the workspace revision is always readable.
+ */
+interface TranscriptPageRow {
+  revision: number;
+  entity_id: string | null;
+  kind: string | null;
+  turn_id: string | null;
+  turn_sequence: number | null;
+  kind_rank: number | null;
+  /** Normalized ordering used for sort/keyset/cursor (never null on a real row). */
+  sort_ordering: number | null;
+  /** Raw source ordering: nullable for user/assistant, tool's own counter, NULL for reasoning. */
+  ordering: number | null;
+  created_at: string | null;
+  content: string | null;
+  payload_json: string | null;
+  status: string | null;
+  name: string | null;
+  tool_call_id: string | null;
+  state: string | null;
 }
 
-function composeTranscript(
-  turns: readonly TaskTurn[],
-  messages: readonly TaskMessage[],
-  toolCalls: readonly PersistedToolCall[],
-  reasoning: readonly PersistedReasoning[],
-): RepositoryTranscriptItem[] {
-  const orderedTurns = [...turns].sort((a, b) => a.sequence - b.sequence || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
-  const seqOf = new Map(orderedTurns.map((turn) => [turn.id, turn.sequence]));
-  const msgTurn = new Map<string, string>();
-  for (const turn of orderedTurns) {
-    for (const input of turn.inputs) {
-      if (input.kind === 'message') msgTurn.set(input.messageId, turn.id);
-    }
-  }
-  const entries: TranscriptEntry[] = [];
-  const openingQueued = orderedTurns.length === 1 && orderedTurns[0]?.status === 'queued' && orderedTurns[0].trigger === 'user';
-  for (const message of messages) {
-    if (message.role !== 'user' && message.role !== 'assistant') continue;
-    const turnId = message.role === 'assistant' ? message.turnId : (message.turnId ?? msgTurn.get(message.id));
-    const boundTurn = turnId ? orderedTurns.find((turn) => turn.id === turnId) : undefined;
-    if (message.role === 'user' && boundTurn?.status === 'queued' && !openingQueued) continue;
-    entries.push({
-      item: { id: message.id, kind: message.role, content: message.content, turnId, order: message.order, state: message.state, createdAt: message.createdAt },
-      seq: turnId && seqOf.has(turnId) ? seqOf.get(turnId)! : -1,
-      order: message.role === 'assistant' ? (message.order ?? 0) : (message.order ?? -2),
-      createdAt: message.createdAt,
-      id: message.id,
-    });
-  }
-  for (const tool of toolCalls) {
-    if (!seqOf.has(tool.turnId)) continue;
-    entries.push({
-      item: {
-        id: tool.id, kind: 'tool', turnId: tool.turnId, order: tool.order,
-        content: { toolCallId: tool.toolCallId, name: tool.name, toolKind: tool.kind, status: tool.status,
-          input: tool.input, output: tool.output, error: tool.error }, createdAt: tool.createdAt,
-      },
-      seq: seqOf.get(tool.turnId)!, order: tool.order, createdAt: tool.createdAt, id: tool.id,
-    });
-  }
-  for (const item of reasoning) {
-    if (!seqOf.has(item.turnId)) continue;
-    entries.push({ item: { id: item.id, kind: 'reasoning', turnId: item.turnId, content: item.content, createdAt: item.createdAt },
-      seq: seqOf.get(item.turnId)!, order: -1, createdAt: item.createdAt, id: item.id });
-  }
-  entries.sort((a, b) => a.seq - b.seq || a.order - b.order || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
-  return entries.map((entry) => entry.item);
+/**
+ * Canonical keyset page query (P4-W3). One statement — hence one implicit read
+ * snapshot — selects the workspace revision and a `limit + 1` newest-first window
+ * of transcript items across four UNION ALL branches (user message, reasoning,
+ * assistant message, tool call). The sort key and per-kind ranks/orderings mirror
+ * `buildTranscript()` via the shared constants in ./transcript-order.
+ *
+ * User messages carry no `turn_id`; they bind to a turn through `turn_inputs`
+ * (kind='message', messageId in payload_json). A user message whose bound turn is
+ * still `queued` is hidden unless that turn is the sole, user-triggered opening
+ * turn — matching the projector's queued-visibility rule.
+ *
+ * `keysetPredicate` is either empty (latest page) or a strict `<` tuple comparison
+ * bound to the cursor key (older page). All cursor components arrive as bound
+ * parameters; nothing is interpolated.
+ */
+export function transcriptPageSql(keysetPredicate: string): string {
+  const userOrdering = `COALESCE(m.ordering, ${USER_ORDERING_FALLBACK})`;
+  const assistantOrdering = `COALESCE(m.ordering, ${ASSISTANT_ORDERING_FALLBACK})`;
+  return `
+WITH rev AS (
+  SELECT COALESCE((SELECT revision FROM workspace_revisions WHERE workspace_id = ?), 0) AS revision
+),
+-- Scope every branch to this task's turns up front (idx_turns_task_sequence). MATERIALIZED
+-- stops SQLite from flattening this CTE back into each branch (which would let the planner
+-- reorder joins and seek reasoning/tool/turn_inputs by workspace_id alone — scanning every
+-- row of that table for the workspace). Materialized once, it is a tiny bounded row source
+-- that the CROSS JOINs below use as the outer driver so each detail table is sought per turn.
+task_turns AS MATERIALIZED (
+  SELECT id, sequence, status, trigger, workspace_id
+  FROM turns
+  WHERE workspace_id = ? AND task_id = ?
+),
+turn_count AS (
+  SELECT COUNT(*) AS n FROM task_turns
+),
+-- Resolve each user message's owning turn via turn_inputs, last-write-wins by turn
+-- sequence then input ordering — parity with the projector's msgTurn map, which
+-- overwrites in ascending turn order so the highest-sequence binding survives.
+input_bindings AS (
+  SELECT message_id, turn_id FROM (
+    SELECT
+      json_extract(ti.payload_json, '$.messageId') AS message_id,
+      ti.turn_id AS turn_id,
+      ROW_NUMBER() OVER (
+        PARTITION BY json_extract(ti.payload_json, '$.messageId')
+        ORDER BY tt.sequence DESC, ti.ordering DESC
+      ) AS rn
+    -- CROSS JOIN pins task_turns as the outer loop: SQLite will not reorder it to drive
+    -- from turn_inputs (workspace_id alone), so each binding is sought by (workspace_id, turn_id).
+    FROM task_turns tt
+    CROSS JOIN turn_inputs ti
+      ON ti.workspace_id = tt.workspace_id AND ti.turn_id = tt.id AND ti.kind = 'message'
+  )
+  WHERE rn = 1
+),
+items AS (
+  -- User messages: bind turn via direct turn_id or turn_inputs. Unbound messages
+  -- (no turn_id, no binding) stay visible at turn_sequence = -1; queued follow-ups
+  -- hide unless this is the sole opening user turn.
+  SELECT
+    m.id AS entity_id, 'user' AS kind, bt.id AS turn_id,
+    COALESCE(bt.sequence, ${UNBOUND_TURN_SEQUENCE}) AS turn_sequence,
+    ${KIND_RANK.user} AS kind_rank,
+    ${userOrdering} AS sort_ordering, m.ordering AS ordering,
+    m.created_at AS created_at, m.content AS content, m.payload_json AS payload_json,
+    NULL AS status, NULL AS name, NULL AS tool_call_id, m.state AS state
+  FROM messages m
+  LEFT JOIN input_bindings ib ON ib.message_id = m.id
+  LEFT JOIN task_turns bt ON bt.id = COALESCE(m.turn_id, ib.turn_id)
+  WHERE m.workspace_id = ? AND m.task_id = ? AND m.role = 'user'
+    AND (
+      bt.id IS NULL                       -- unbound: always visible
+      OR bt.status <> 'queued'            -- resolved / running: visible
+      OR (                                 -- queued: only the sole opening user turn
+        bt.trigger = 'user'
+        AND (SELECT n FROM turn_count) = 1
+        AND EXISTS (
+          SELECT 1 FROM turn_inputs ti2
+          WHERE ti2.workspace_id = ? AND ti2.turn_id = bt.id AND ti2.kind = 'message'
+        )
+      )
+    )
+
+  UNION ALL
+
+  -- Assistant messages: carry a direct turn_id; scoped to this task's turns.
+  SELECT
+    m.id, 'assistant', at.id,
+    COALESCE(at.sequence, ${UNBOUND_TURN_SEQUENCE}),
+    ${KIND_RANK.assistant},
+    ${assistantOrdering}, m.ordering,
+    m.created_at, m.content, m.payload_json,
+    NULL, NULL, NULL, m.state
+  FROM messages m
+  LEFT JOIN task_turns at ON at.id = m.turn_id
+  WHERE m.workspace_id = ? AND m.task_id = ? AND m.role = 'assistant'
+
+  UNION ALL
+
+  -- Reasoning: CROSS JOIN pins task_turns as the driver so each turn's reasoning is
+  -- sought by (workspace_id, turn_id) via idx_reasoning_turn_order — never a workspace scan.
+  SELECT
+    r.id, 'reasoning', r.turn_id,
+    rt.sequence,
+    ${KIND_RANK.reasoning}, ${REASONING_ORDERING}, NULL,
+    r.created_at, r.content, NULL,
+    NULL, NULL, NULL, NULL
+  FROM task_turns rt
+  CROSS JOIN reasoning_segments r ON r.workspace_id = rt.workspace_id AND r.turn_id = rt.id
+
+  UNION ALL
+
+  -- Tool calls: CROSS JOIN pins task_turns as the driver so each turn's tool calls are
+  -- sought by (workspace_id, turn_id) via idx_tool_calls_turn_order — never a workspace scan.
+  SELECT
+    tc.id, 'tool', tc.turn_id,
+    tt.sequence,
+    ${KIND_RANK.tool}, tc.ordering, tc.ordering,
+    tc.created_at, NULL, tc.payload_json,
+    tc.status, tc.name, tc.tool_call_id, NULL
+  FROM task_turns tt
+  CROSS JOIN tool_calls tc ON tc.workspace_id = tt.workspace_id AND tc.turn_id = tt.id
+),
+page AS (
+  SELECT * FROM items
+  ${keysetPredicate}
+  ORDER BY turn_sequence DESC, kind_rank DESC, sort_ordering DESC, created_at DESC, entity_id DESC
+  LIMIT ?
+)
+SELECT rev.revision AS revision, page.entity_id AS entity_id, page.kind AS kind, page.turn_id AS turn_id,
+       page.turn_sequence AS turn_sequence, page.kind_rank AS kind_rank,
+       page.sort_ordering AS sort_ordering, page.ordering AS ordering,
+       page.created_at AS created_at, page.content AS content, page.payload_json AS payload_json,
+       page.status AS status, page.name AS name, page.tool_call_id AS tool_call_id, page.state AS state
+  FROM rev LEFT JOIN page ON 1 = 1
+  ORDER BY page.turn_sequence DESC, page.kind_rank DESC, page.sort_ordering DESC,
+           page.created_at DESC, page.entity_id DESC
+`;
 }
 
-function transcriptKey(item: RepositoryTranscriptItem, turns: readonly TaskTurn[]): string {
-  const turnId = 'turnId' in item ? item.turnId : undefined;
-  const seq = turnId ? turns.find((turn) => turn.id === turnId)?.sequence ?? -1 : -1;
-  const order = 'order' in item ? item.order : -1;
-  return `${seq}\u0000${order}\u0000${item.createdAt ?? ''}\u0000${item.id}`;
-}
-
-function encodeTranscriptCursor(item: RepositoryTranscriptItem, turns: readonly TaskTurn[]): string {
-  return `v1.${Buffer.from(transcriptKey(item, turns), 'utf8').toString('base64url')}`;
-}
-
-function decodeTranscriptCursor(cursor: string): string {
-  try {
-    if (!cursor.startsWith('v1.')) throw new Error('invalid version');
-    const decoded = Buffer.from(cursor.slice(3), 'base64url').toString('utf8');
-    if (!decoded.includes('\u0000')) throw new Error('invalid');
-    return decoded;
-  } catch {
-    throw new Error('invalid transcript cursor');
-  }
-}
-
-function pageTranscript(items: readonly RepositoryTranscriptItem[], turns: readonly TaskTurn[], cursor: string | undefined, limit: number | undefined, revision: number): TranscriptPage {
-  const bounded = normalizeLimit(limit);
-  // Items are already in canonical order. Cursor points at the newest item on
-  // the previous page; older pages therefore select strictly smaller keys.
-  const cursorKey = cursor ? decodeTranscriptCursor(cursor) : undefined;
-  const cursorId = cursorKey?.split('\u0000').pop();
-  const start = cursorId
-    ? items.findIndex((item) => item.id === cursorId)
-    : items.length;
-  if (cursorId && start < 0) {
-    throw new Error('transcript cursor is no longer valid');
-  }
-  const end = cursorKey ? start : items.length;
-  const from = Math.max(0, end - bounded);
-  const page = items.slice(from, end);
-  const hasMoreBefore = from > 0;
+/** Recover the canonical sort key from a page row (used to mint `beforeCursor`). */
+function transcriptRowKey(row: TranscriptPageRow & { entity_id: string }): TranscriptSortKey {
   return {
-    items: page,
-    ...(hasMoreBefore && page[0] ? { beforeCursor: encodeTranscriptCursor(page[0], turns) } : {}),
-    hasMoreBefore,
-    workspaceRevision: revision,
+    turnSequence: row.turn_sequence ?? UNBOUND_TURN_SEQUENCE,
+    kindRank: row.kind_rank ?? 0,
+    // Mint the cursor from the NORMALIZED ordering (matches ORDER BY + keyset), not
+    // the raw source column which is nullable for user/assistant messages.
+    ordering: row.sort_ordering ?? 0,
+    createdAt: row.created_at ?? '',
+    entityId: row.entity_id,
+  };
+}
+
+/** Decode one non-sentinel page row into a repository transcript item. */
+function decodeTranscriptRow(row: TranscriptPageRow & { entity_id: string }): RepositoryTranscriptItem {
+  const createdAt = row.created_at ?? undefined;
+  if (row.kind === 'user' || row.kind === 'assistant') {
+    return {
+      id: row.entity_id,
+      kind: row.kind,
+      content: row.content ?? '',
+      ...(row.turn_id !== null ? { turnId: row.turn_id } : {}),
+      ...(row.ordering !== null ? { order: row.ordering } : {}),
+      ...(row.state !== null ? { state: row.state as TaskMessage['state'] } : {}),
+      ...(createdAt !== undefined ? { createdAt } : {}),
+    };
+  }
+  if (row.kind === 'reasoning') {
+    return {
+      id: row.entity_id,
+      kind: 'reasoning',
+      turnId: row.turn_id ?? '',
+      content: row.content ?? '',
+      ...(createdAt !== undefined ? { createdAt } : {}),
+    };
+  }
+  // Tool call: content object is composed from promoted columns + payload_json.
+  const payload = row.payload_json ? parsePayload(row.payload_json, 'tool call') : {};
+  delete payload.payloadVersion;
+  return {
+    id: row.entity_id,
+    kind: 'tool',
+    turnId: row.turn_id ?? '',
+    order: row.ordering ?? 0,
+    content: {
+      ...payload,
+      ...(row.tool_call_id !== null ? { toolCallId: row.tool_call_id } : {}),
+      ...(row.name !== null ? { name: row.name } : {}),
+      ...(row.status !== null ? { status: row.status } : {}),
+    },
+    ...(createdAt !== undefined ? { createdAt } : {}),
   };
 }
 

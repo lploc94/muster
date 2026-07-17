@@ -2,7 +2,7 @@
 
 ## Trạng thái
 
-**IN PROGRESS — Phase 4 pagination/incremental wire chưa bắt đầu (P4-W3+).**
+**IN PROGRESS — Phase 4 pagination/incremental wire (P4-W3 ✅; P4-W4+ chưa bắt đầu).**
 Cập nhật: 2026-07-17
 
 - Phase 1: **đã qua gate** — worker/RPC, schema bootstrap, global-storage registry,
@@ -630,7 +630,7 @@ sau bắt đầu ngay khi wave trước đạt gate, chỉ dừng khi có blocke
 |---|---|---|
 | P4-W1 ✅ | SQLite-only activation cutover | Không tạo/đọc/ghi/watch `.muster-tasks.json`; probe là hard gate |
 | P4-W2 ✅ | Xóa legacy storage/runtime API | Không còn `JsonTaskRepository`, filesystem `TaskStore`, sync engine constructor hoặc full-envelope export; **no migration/no backward compatibility** |
-| P4-W3 | Canonical cursor + SQL keyset page | SQLite query bounded `limit + 1`, không load full transcript |
+| P4-W3 ✅ | Canonical cursor + SQL keyset page | SQLite query bounded `limit + 1`, không load full transcript |
 | P4-W4 | Bounded bootstrap | Snapshot focused task chỉ chứa 100 item + page metadata |
 | P4-W5 | Load older UX | Typed request/response, prepend idempotent, giữ scroll anchor |
 | P4-W6 | Revisioned patch reducer | Duplicate/stale patch là no-op; revision gap yêu cầu recovery |
@@ -672,13 +672,84 @@ database là hard gate và filesystem JSON watcher/path đã bị loại khỏi 
   Concurrent first-open: peer chờ exclusive lock hoặc thấy post-commit current markers —
   không quan sát partial claim bền vững.
 
-##### P4-W3 — Canonical cursor + SQL keyset page
+##### P4-W3 — Canonical cursor + SQL keyset page ✅
 
-- Chốt sort key `(turn.sequence, kind_rank, ordering, created_at, entity_id)` và dùng chung
-  cho projector/cursor.
-- SQLite dùng UNION/keyset query `limit + 1` trong một read snapshot, response kèm
-  `workspaceRevision`; cursor opaque/versioned và invalid cursor fail rõ.
-- Test insert concurrent, equal timestamps/ordering, queued-message visibility và 10k rows.
+- **Canonical ordering contract.** Sort key `(turn_sequence, kind_rank, ordering,
+  created_at, entity_id)`, so sánh lexicographic ascending, mọi trường non-null sau
+  normalize. Hai trường TEXT (`created_at`, `entity_id`) so **bytewise UTF-8** qua
+  `compareBinary` (`Buffer.compare`) — khớp đúng SQLite default `BINARY` collation, độc
+  lập locale/máy (KHÔNG dùng `localeCompare`, vốn phụ thuộc ICU host). Chốt tại
+  `src/task/transcript-order.ts` (constants + `compareBinary` + `compareTranscriptKeys`)
+  và dùng chung cho `buildTranscript()`, cursor, và SQL query (ORDER BY + `<` tuple đều
+  chạy trên cột TEXT với BINARY collation nên khớp exact):
+
+  | Item | kind_rank | ordering |
+  |---|---:|---:|
+  | user message | 0 | `message.order ?? -2` |
+  | reasoning | 1 | `-1` |
+  | assistant message | 2 | `message.order ?? 0` |
+  | tool call | 2 | `tool.order` |
+
+  `turn_sequence = -1` nếu item không gắn được turn; system message bị loại; assistant +
+  tool cùng rank 2 để interleave theo shared `ordering`. `kind_rank` là axis riêng giữa
+  `turn_sequence` và `ordering` (thay cho magic -2/-1/0 gộp vào order trước đây).
+
+- **Cursor version 2.** `src/task/transcript-cursor.ts`: payload opaque self-contained
+  `{version:2, workspaceId, taskId, turnSequence, kindRank, ordering, createdAt, entityId}`,
+  encode `v2.<base64url(JSON)>`. Validate prefix/base64url-canonical/size-cap/JSON-shape/
+  field-types/finite-integer + scope (workspace+task). Không hỗ trợ cursor v1. Sai →
+  `InvalidTranscriptCursorError` (message cố định, không echo raw cursor/content). Keyset
+  thuần: không cần anchor entity còn tồn tại.
+
+- **SQL keyset limit + 1, không full hydration.** `getTranscriptPage` dùng một `db.all`
+  duy nhất: CTE `rev` + `task_turns` (scope turns của task qua `idx_turns_task_sequence`) +
+  `turn_count` + `input_bindings` (resolve user message → turn qua `turn_inputs`,
+  last-write-wins theo `sequence DESC, ordering DESC` parity `msgTurn` của projector) +
+  `items` (UNION ALL 4 nhánh; reasoning/tool **drive từ `task_turns`** nên seek turn-index
+  thay vì scan workspace; queued visibility quyết định trong SQL) + `page`
+  (`WHERE (…) < (?,?,?,?,?)` strict, ORDER BY DESC, `LIMIT bounded+1`) + outer `ORDER BY`
+  ổn định thứ tự sau `LEFT JOIN rev`. Default limit 100, clamp 1..500. Row thứ limit+1 chỉ
+  để tính `hasMoreBefore`; decode tối đa `limit` item; reverse về ascending render order.
+  `beforeCursor` chỉ trả khi `hasMoreBefore`, encode key item cũ nhất trong page. Đã xóa
+  `composeTranscript`/`pageTranscript`/cursor string cũ/full-array lookup — không còn
+  fallback load toàn transcript.
+
+- **User message unbound vẫn hiện.** Nhánh user dùng điều kiện "keep" 3-vế NULL-safe:
+  `bt.id IS NULL` (unbound: `turn_sequence = -1`, luôn hiện) ∨ `status <> 'queued'` ∨
+  (queued nhưng là sole opening user turn). Trước đây `NOT (queued AND …)` vô tình loại
+  user message không gắn turn — nay đã sửa, parity với projector.
+
+- **Tách `sort_ordering` khỏi raw `order`.** `items` output cả hai cột: `sort_ordering`
+  (normalized: user `COALESCE(order,-2)`, assistant `COALESCE(order,0)`, reasoning `-1`,
+  tool `ordering`) dùng cho ORDER BY + keyset + cursor; và `ordering` (raw source, nullable
+  cho user/assistant, NULL cho reasoning) để decode DTO đúng — user/assistant không có
+  `order` ⇒ property `order` absent (không phải fallback -2/0).
+
+- **Read snapshot + revision.** Một statement = một implicit read snapshot: transcript rows
+  và `workspaceRevision` đọc nhất quán, không còn `Promise.all` nhiều query độc lập. CTE
+  `rev` cross-join `LEFT JOIN page ON 1=1` giữ sentinel row nên revision luôn có kể cả page
+  rỗng.
+
+- **Index/schema (task-scoped plan).** Sau khi rewrite CTE, `EXPLAIN QUERY PLAN` cho thấy
+  mọi nhánh drive từ `task_turns` (seek `idx_turns_task_sequence`) rồi seek turn-index cho
+  detail tables — **không còn `SCAN reasoning_segments` / `SCAN tool_calls` /
+  `SCAN turn_inputs`**. Cụ thể: user/assistant qua `idx_messages_task_created`, reasoning qua
+  `idx_reasoning_turn_order`, tool qua `idx_tool_calls_turn_order`, binding qua
+  `idx_turn_inputs_turn_order`, join turns qua `sqlite_autoindex_turns_1`. `USE TEMP B-TREE
+  FOR ORDER BY` inherent cho UNION+composite sort, bounded theo task size. Test
+  `EXPLAIN QUERY PLAN` + fixture sibling-task assert không leak row task khác. **Không thêm
+  index, không đổi schema — `SQLITE_SCHEMA_VERSION` giữ 4.**
+
+- **10k fixture.** Seed 10.000 message rows bằng batched `client.transaction` (không 10k
+  named command). Assert: SQL trả ≤ limit+1 rows; public result = limit (100);
+  hasMoreBefore/beforeCursor đúng; không gọi `listTurns`/`listMessages`/`listToolCalls`/
+  `listReasoning`; không materialize 10k DTO. Elapsed/query-plan ghi làm evidence (perf gate
+  ở W11).
+
+- Test khác: cursor validation đầy đủ, pagination correctness (empty/single/multi-page
+  limit 1 & 100, no dup/gap, ascending trong page, default/clamp, anchor deleted),
+  deterministic ordering parity với `buildTranscript()`, queued visibility (opening
+  visible / follow-up hidden / running visible / multi-queued hidden), concurrent mutation.
 
 ##### P4-W4 — Bounded bootstrap
 
