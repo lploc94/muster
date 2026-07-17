@@ -55,12 +55,54 @@ const validEvidenceDocument = [
   'It does not verify live VS Code activation, live provider subprocess execution, live MCP transport behavior, package publishing, marketplace readiness, remote workflow execution, or runtime session persistence.',
 ].join('\n');
 
+const validVisualCiWorkflow = [
+  'name: CI',
+  'on:',
+  '  push:',
+  '    branches: [main]',
+  '  pull_request:',
+  '    branches: [main]',
+  '  workflow_dispatch:',
+  'jobs:',
+  '  test:',
+  '    runs-on: ubuntu-latest',
+  '    steps:',
+  '      - uses: actions/checkout@v4',
+  '      - uses: actions/setup-node@v4',
+  '        with:',
+  '          node-version: "24"',
+  '          cache: npm',
+  '      - run: npm ci',
+  '      - run: npm test',
+  '      - run: npm run test:webview',
+  '  visual:',
+  '    runs-on: ubuntu-latest',
+  '    steps:',
+  '      - uses: actions/checkout@v4',
+  '      - uses: actions/setup-node@v4',
+  '        with:',
+  '          node-version: "24"',
+  '          cache: npm',
+  '      - run: npm ci',
+  '      - run: npm run test:visual:linux',
+  '      - uses: actions/upload-artifact@v4',
+  '        if: failure()',
+  '        with:',
+  '          name: visual-regression-failure',
+  '          path: |',
+  '            test-results/',
+  '            playwright-report/',
+  '          retention-days: 14',
+].join('\n');
+
 const validFixture = {
   'package.json': JSON.stringify({
     scripts: {
       compile: 'tsc -p .',
       test: 'vitest run',
       'test:source-boundary': 'node scripts/source-boundary-smoke.mjs',
+      'test:visual:linux': 'node scripts/run-visual-baselines.mjs',
+      'test:visual:linux:update': 'node scripts/run-visual-baselines.mjs --update',
     },
   }),
   'tsconfig.json': JSON.stringify({
@@ -72,7 +114,7 @@ const validFixture = {
     },
     include: ['src/**/*', 'scripts/**/*'],
   }),
-  '.github/workflows/ci.yml': 'name: CI\non:\n  push:\n    branches: [main]\n  pull_request:\n    branches: [main]\n  workflow_dispatch:\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - uses: actions/setup-node@v4\n        with:\n          node-version: "24"\n          cache: npm\n      - run: npm ci\n      - run: npm test\n',
+  '.github/workflows/ci.yml': validVisualCiWorkflow,
   'docs/VERIFICATION-EVIDENCE.md': validEvidenceDocument,
   'src/extension.ts': "import * as vscode from 'vscode';\nimport { makeBackend } from './backends/index';\nwebview.postMessage({ type: 'done' });\n",
   'src/backends/claude.ts': "import { spawn } from 'child_process';\nimport { Backend, NormalizedEvent, RunOptions } from '../types';\nspawn('claude', []);\nyield { type: 'turnCompleted' };\n",
@@ -114,6 +156,62 @@ test('repository GitHub Actions workflow runs npm test automatically on main pus
   // compile is allowed only after npm test (not compile-only).
   assert.match(workflow, /run: npm run compile/);
   assert.doesNotMatch(workflow, /strategy:\n\s+matrix:/);
+  // M014 visual gate is a distinct required job with compare-only + failure artifacts.
+  assert.match(workflow, /^ {2}visual:\s*$/m);
+  assert.match(workflow, /run: npm run test:visual:linux/);
+  assert.match(workflow, /run: npm run test:webview/);
+  assert.match(workflow, /name: visual-regression-failure/);
+  assert.match(workflow, /retention-days: 14/);
+  assert.match(workflow, /if: failure\(\)/);
+  // Comments may mention update policy; executable run steps must not update.
+  assert.doesNotMatch(workflow, /^\s*-\s*run:.*--update-snapshots/m);
+  assert.doesNotMatch(workflow, /^\s*-\s*run:.*test:visual:linux:update/m);
+});
+
+test('repository package.json separates Linux visual compare from explicit update', async () => {
+  const packageJsonUrl = new URL('../package.json', import.meta.url);
+  const packageJson = JSON.parse(await readFile(packageJsonUrl, 'utf8'));
+
+  assert.equal(packageJson.scripts?.['test:visual:linux'], 'node scripts/run-visual-baselines.mjs');
+  assert.equal(
+    packageJson.scripts?.['test:visual:linux:update'],
+    'node scripts/run-visual-baselines.mjs --update',
+  );
+});
+
+test('rejects fixture missing visual CI gate wiring', async () => {
+  const fixture = {
+    ...validFixture,
+    '.github/workflows/ci.yml': [
+      'name: CI',
+      'on:',
+      '  push:',
+      '    branches: [main]',
+      '  pull_request:',
+      '    branches: [main]',
+      '  workflow_dispatch:',
+      'jobs:',
+      '  test:',
+      '    runs-on: ubuntu-latest',
+      '    steps:',
+      '      - uses: actions/checkout@v4',
+      '      - uses: actions/setup-node@v4',
+      '        with:',
+      '          node-version: "24"',
+      '          cache: npm',
+      '      - run: npm ci',
+      '      - run: npm test',
+      '      - run: npm run test:webview',
+    ].join('\n'),
+  };
+
+  await withFixture(fixture, async (rootDir) => {
+    const result = await runSourceBoundarySmoke({ rootDir });
+
+    assert.equal(result.ok, false);
+    assert.match(result.failures.join('\n'), /jobs\.visual/);
+    assert.match(result.failures.join('\n'), /test:visual:linux/);
+  });
 });
 
 test('reports actionable diagnostics for missing source-boundary script wiring', async () => {

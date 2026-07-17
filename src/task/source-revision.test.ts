@@ -12,6 +12,11 @@ import {
 
 // Phase C — source-revision token binds a host verdict to the working-tree state.
 
+/** Platforms without O_NOFOLLOW + O_NONBLOCK (e.g. win32) fail closed for untracked hashing. */
+const HAS_SAFE_OPEN_FLAGS = Boolean(
+  fs.constants.O_NOFOLLOW && fs.constants.O_NONBLOCK,
+);
+
 const tempDirs: string[] = [];
 
 function tempDir(prefix: string): string {
@@ -125,7 +130,9 @@ describe('computeSourceRevision (real git repo)', () => {
     expect(computeSourceRevision(plain)).toBe(NO_GIT_REVISION);
   });
 
-  it('folds UNTRACKED file content into the token — a new/edited untracked file moves it (ISSUE 5)', () => {
+  it.skipIf(!HAS_SAFE_OPEN_FLAGS)(
+    'folds UNTRACKED file content into the token — a new/edited untracked file moves it (ISSUE 5)',
+    () => {
     const repo = tempDir('muster-source-rev-untracked-');
     const git = (...args: string[]): void => {
       execFileSync('git', args, { cwd: repo, encoding: 'utf8' });
@@ -152,9 +159,12 @@ describe('computeSourceRevision (real git repo)', () => {
 
     // Stable when nothing changes.
     expect(computeSourceRevision(repo)).toBe(editedUntracked);
-  });
+  },
+  );
 
-  it('hashes a dangling SYMLINK by its TARGET (never follows/hangs) and moves on target change (ISSUE 5/14)', () => {
+  it.skipIf(!HAS_SAFE_OPEN_FLAGS)(
+    'hashes a dangling SYMLINK by its TARGET (never follows/hangs) and moves on target change (ISSUE 5/14)',
+    () => {
     const repo = tempDir('muster-source-rev-symlink-');
     const git = (...args: string[]): void => {
       execFileSync('git', args, { cwd: repo, encoding: 'utf8' });
@@ -186,9 +196,12 @@ describe('computeSourceRevision (real git repo)', () => {
     const withB = computeSourceRevision(repo);
     expect(withB).not.toBe(withA);
     expect(withB).not.toBe(SOURCE_REVISION_UNAVAILABLE);
-  });
+  },
+  );
 
-  it('folds a FIFO/special untracked entry as nonfile and never hangs (ISSUE 14)', () => {
+  it.skipIf(!HAS_SAFE_OPEN_FLAGS)(
+    'folds a FIFO/special untracked entry as nonfile and never hangs (ISSUE 14)',
+    () => {
     // git ls-files does NOT surface a FIFO, so inject the untracked list to exercise the
     // non-regular branch directly against a REAL FIFO on disk. The entry is opened
     // O_RDONLY|O_NONBLOCK (no blocking) and fstat'd (non-regular) — it is NEVER read (a
@@ -207,7 +220,8 @@ describe('computeSourceRevision (real git repo)', () => {
     expect(token).not.toBe(SOURCE_REVISION_UNAVAILABLE);
     // Deterministic (mode-based marker) across calls.
     expect(computeSourceRevision(dir, run)).toBe(token);
-  });
+  },
+  );
 
   it('yields UNAVAILABLE for an untracked file over the byte cap, deterministically (ISSUE 5/14)', () => {
     const repo = tempDir('muster-source-rev-oversized-');
@@ -237,7 +251,9 @@ describe('computeSourceRevision (real git repo)', () => {
     expect(over).not.toBe(clean);
   });
 
-  it('is CONTENT-bound (not size-bound) for a multi-chunk under-cap untracked file (ISSUE 5)', () => {
+  it.skipIf(!HAS_SAFE_OPEN_FLAGS)(
+    'is CONTENT-bound (not size-bound) for a multi-chunk under-cap untracked file (ISSUE 5)',
+    () => {
     const repo = tempDir('muster-source-rev-content-');
     const git = (...args: string[]): void => {
       execFileSync('git', args, { cwd: repo, encoding: 'utf8' });
@@ -266,7 +282,8 @@ describe('computeSourceRevision (real git repo)', () => {
     expect(v2).not.toBe(SOURCE_REVISION_UNAVAILABLE);
     // Stable when nothing changes.
     expect(computeSourceRevision(repo)).toBe(v2);
-  });
+  },
+  );
 });
 
 describe('computeSourceRevision (missing O_NOFOLLOW/O_NONBLOCK safety flags)', () => {
@@ -309,6 +326,9 @@ describe('computeSourceRevision (missing O_NOFOLLOW/O_NONBLOCK safety flags)', (
     expect(mod.computeSourceRevision(dir, run)).toBe(mod.SOURCE_REVISION_UNAVAILABLE);
     // Control on real flags (statically imported, unmocked fs): the SAME entry opens and
     // hashes to a normal token — proving the missing flag, not the open, forces the fail.
+    // On platforms that lack the flags natively (win32), product already fail-closes; the
+    // mock path above still proves the guard. Skip the control when flags are unavailable.
+    if (!HAS_SAFE_OPEN_FLAGS) return;
     const token = computeSourceRevision(dir, run);
     expect(token).toHaveLength(16);
     expect(token).not.toBe(SOURCE_REVISION_UNAVAILABLE);

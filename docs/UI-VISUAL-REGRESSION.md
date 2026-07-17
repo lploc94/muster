@@ -138,13 +138,133 @@ Contract tests that pin the workflow artifact name and retention:
 node --test scripts/verify-visual-ci.test.mjs
 ```
 
+## Ownership
+
+| Surface | Owner |
+|---------|--------|
+| Visual matrix cases + goldens (`e2e/visual/`) | Maintainer who lands the UI change that requires a baseline update |
+| Pinned Linux runner (`scripts/run-visual-baselines.mjs`) | Platform / CI maintainers |
+| CI `jobs.visual` + artifact contract (`.github/workflows/ci.yml`) | Platform / CI maintainers |
+| Operations guide (this doc) | Any maintainer updating visual tooling |
+| Deferred product UI work | Tracked in [UI-IMPROVEMENT-ROADMAP.md](UI-IMPROVEMENT-ROADMAP.md) — **not** implemented by M014 visual slices |
+
+PR authors own intentional golden updates in the same PR as the product/fixture
+change. Reviewers own the **update review** checklist below before merge.
+
+## Compare path (normal day-to-day)
+
+Use the **authoritative compare** only when judging green/red for baselines:
+
+```bash
+npm run test:visual:linux
+```
+
+This invokes `scripts/run-visual-baselines.mjs` inside the lockfile-pinned
+Playwright Docker image. It never updates snapshots.
+
+Host-only shortcuts (`npm run test:visual`, entrypoint-scoped host scripts) are
+dev feedback loops. They are **not** interchangeable with Linux goldens and must
+not be used as the sole proof for a PR.
+
+## Pinned authoring and explicit update
+
+Authoring is an **explicit** command, separate from compare:
+
+```bash
+npm run test:visual:linux:update
+```
+
+Rules:
+
+- Never pass `--update-snapshots` (or `test:visual:linux:update`) in standing CI.
+- Never commit host-OS screenshots from `npm run test:visual:update`.
+- Prefer updating only the cases whose fixtures or product chrome intentionally
+  changed; re-read the matrix in `e2e/visual/visual-cases.manifest.json`.
+- After an explicit update, always re-run two clean compares (see Authoring
+  baselines above) before push.
+
+## Update review
+
+When a PR touches `e2e/visual/*-snapshots/**` or visual fixtures, reviewers must:
+
+1. Confirm the PR description explains **why** goldens changed (product fix vs
+   fixture sanitization vs intentional chrome change).
+2. Open every new/changed PNG and reject images with secrets, tokens, absolute
+   local paths, real user transcripts, stale Settings taxonomy, clipped critical
+   chrome, or unreadable contrast (Presentation black-on-black fails closed via
+   `assertPresentationReadableContrast`).
+3. Confirm CI `Visual regression` is green on the PR head **without** any
+   update-snapshots step in the workflow diff.
+4. Confirm behavioral jobs remain independently required (`compile` / webview
+   suite) — visual green does not replace behavioral green.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Recovery |
+|---------|--------------|----------|
+| Local Linux compare cannot start Docker | Docker Desktop down / WSL engine unavailable | Start Docker or WSL docker-ce; re-run `npm run test:visual:linux`. Diagnostics land in `test-results/visual-linux-diagnostics.json`. |
+| Host compare green, Linux CI red | OS font/rasterization drift | Trust Linux goldens only; re-author with `npm run test:visual:linux:update`, never commit host screenshots. |
+| Single case red after intentional UI change | Fixture or product chrome changed | Inspect expected/actual/diff under `test-results/`; if intentional, explicit-update that case and re-compare twice. |
+| Many cases red after dependency bump | Playwright / Chromium raster change | Follow **Playwright upgrade** below; re-author the full matrix once in pinned Linux. |
+| CI red but no downloadable evidence | Artifact upload path drift | Check `jobs.visual` still uploads `test-results/` + `playwright-report/` as `visual-regression-failure` on `if: failure()`. Contract: `node --test scripts/verify-visual-ci.test.mjs`. |
+| Need to prove failure artifacts without dirty goldens | — | `node scripts/probe-visual-failure.mjs` (restores fixtures; never writes snapshots). |
+| Docker image tag mismatch | Lockfile `@playwright/test` drift vs cached image | Re-run via `run-visual-baselines.mjs` (resolves tag from lockfile); avoid hard-coding image tags in docs or CI. |
+
+Health signals: green `npm run test:visual:linux` twice + `git diff --exit-code -- e2e/visual`.
+Failure signals: non-zero visual job, `visual-regression-failure` artifact present.
+Recovery signals: probe restores fixtures; explicit update is human-gated; standing CI stays compare-only.
+
+## Playwright upgrade
+
+Upgrading `@playwright/test` (and thus the Chromium revision inside
+`mcr.microsoft.com/playwright:v*-jammy`) can shift subpixel rasterization and
+break committed goldens even with no product CSS change.
+
+Procedure:
+
+1. Bump `@playwright/test` in `package.json` / lockfile in an isolated PR when
+   possible.
+2. Run `npm install` so `package-lock.json` records the new version.
+3. Re-author **all** matrix goldens in the new pinned image:
+
+   ```bash
+   npm run test:visual:linux:update
+   npm run test:visual:linux
+   npm run test:visual:linux
+   git diff --stat -- e2e/visual
+   ```
+
+4. Review every changed PNG (update review checklist).
+5. Keep behavioral suites green (`npm run test:webview`, Presentation specs).
+6. Do **not** leave a temporary CI authoring workflow enabled after the upgrade.
+
+`scripts/run-visual-baselines.mjs` must continue to resolve the image tag from
+the lockfile so docs, CI, and local authoring cannot drift independently.
+
+## Browser-versus-native proof boundary
+
+| Proof class | What it covers | What it does **not** cover |
+|-------------|----------------|----------------------------|
+| Pinned Linux visual matrix (this guide) | Extension-owned main-webview + Presentation DOM chrome under synthetic theme tokens, fixed fonts/locale/clock, reduced-motion fixtures | Native VS Code workbench chrome, activity bar, panel layout, OS window decorations, real host zoom UI |
+| Behavioral Playwright (`test:webview`, presentation specs) | Interaction contracts with mocked `acquireVsCodeApi` | Live Extension Development Host, real ACP backends |
+| Native host / live-host ledgers | Extension Development Host UAT when environment allows | Must not be claimed from browser-only green |
+
+Synthetic browser theme tokens and body classes prove **extension-owned**
+webview chrome stability. They do **not** prove native VS Code host chrome
+rendering, workbench layout, or OS window decorations. Pilot fixtures are
+static sanitized contracts (no live ACP backends, no real user content).
+
+When a requirement needs native theme, forced-colors, or 200% zoom acceptance,
+track it under [UI-IMPROVEMENT-ROADMAP.md](UI-IMPROVEMENT-ROADMAP.md) and prove
+it with the appropriate native or dual-class gate — not by expanding PNG
+goldens alone.
+
 ## Scope limits
 
-- Synthetic browser theme tokens and body classes prove **extension-owned**
-  webview chrome stability. They do **not** prove native VS Code host chrome
-  rendering, workbench layout, or OS window decorations.
-- Pilot fixtures are static sanitized contracts (no live ACP backends, no real
-  user content).
+- Visual CI is a **distinct** required check (`jobs.visual`) and does not replace
+  the behavioral `compile` job.
+- Baselines are never auto-accepted; compare and explicit update stay separate.
+- M014 records deferred product UI work without implementing redesigns here.
 
 ## M014 S01 dual-entrypoint flow
 
