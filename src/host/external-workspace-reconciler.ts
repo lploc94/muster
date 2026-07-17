@@ -47,6 +47,9 @@ const COORDINATION_ENTITY_KINDS = new Set([
   'runtime_claim',
   'workspace',
   'workspace_location',
+  // Host-local durable surfaces: revision advance only; not projected as UI patches.
+  'send_outbox',
+  'presentation',
 ]);
 
 const FORCE_RECOVERY_CHANGE_KINDS = new Set([
@@ -125,6 +128,7 @@ export async function reconcileExternalWorkspaceChanges(
   const focusedToolIds: string[] = [];
   const focusedReasoningIds: string[] = [];
   let needsFullTaskRefresh = false;
+  let focusedTranscriptDelete = false;
 
   for (const change of allChanges) {
     if (change.entityKind === 'task') {
@@ -137,6 +141,16 @@ export async function reconcileExternalWorkspaceChanges(
       if (change.entityKind === 'message') focusedMessageIds.push(change.entityId);
       if (change.entityKind === 'tool_call') focusedToolIds.push(change.entityId);
       if (change.entityKind === 'reasoning') focusedReasoningIds.push(change.entityId);
+      // Wire protocol has no transcriptItemRemoved; deletes need bounded recovery
+      // so peer windows do not keep stale focused transcript rows.
+      if (
+        change.changeKind === 'delete' &&
+        (change.entityKind === 'message' ||
+          change.entityKind === 'tool_call' ||
+          change.entityKind === 'reasoning')
+      ) {
+        focusedTranscriptDelete = true;
+      }
     }
     // Coordination-only rows without taskId still need a revision advance; empty
     // final batch is fine when no task surface changed.
@@ -147,6 +161,10 @@ export async function reconcileExternalWorkspaceChanges(
     ) {
       return { kind: 'recovery', reason: 'unrepresentable' };
     }
+  }
+
+  if (focusedTranscriptDelete) {
+    return { kind: 'recovery', reason: 'unrepresentable' };
   }
 
   try {

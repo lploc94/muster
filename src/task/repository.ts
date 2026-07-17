@@ -433,6 +433,11 @@ export interface TaskRepository {
   getWorkspace(): Promise<RepositoryWorkspace | undefined>;
   listWorkspaceLocations(): Promise<readonly RepositoryWorkspaceLocation[]>;
   getTask(taskId: string): Promise<MusterTask | undefined>;
+  /**
+   * Batched task hydration by id for external feed reconciliation.
+   * One SQL query for the whole set — never N+1 getTask RPCs.
+   */
+  listTasksByIds(taskIds: readonly string[]): Promise<readonly MusterTask[]>;
   listTasks(workspaceId: string): Promise<readonly MusterTask[]>;
   listRootTasks(workspaceId: string, page?: RepositoryPageRequest): Promise<RepositoryPage<MusterTask>>;
   listSubtree(rootTaskId: string): Promise<readonly MusterTask[]>;
@@ -921,6 +926,17 @@ export class SqliteTaskRepository implements TaskRepository {
   async getTask(taskId: string): Promise<MusterTask | undefined> {
     const row = await this.db.get<TaskRow>(taskSelect('WHERE workspace_id = ? AND id = ?'), [this.workspaceId, taskId]);
     return row ? (await this.hydrateTasks([row]))[0] : undefined;
+  }
+
+  async listTasksByIds(taskIds: readonly string[]): Promise<readonly MusterTask[]> {
+    if (taskIds.length === 0) return [];
+    const uniqueIds = [...new Set(taskIds)];
+    const rows = await this.db.all<TaskRow>(
+      `${taskSelect(`WHERE workspace_id = ? AND id IN (${placeholders(uniqueIds.length)})`)}
+       ORDER BY created_at, id`,
+      [this.workspaceId, ...uniqueIds],
+    );
+    return this.hydrateTasks(rows);
   }
 
   async listTasks(workspaceId: string): Promise<readonly MusterTask[]> {
@@ -1943,9 +1959,20 @@ export class SqliteTaskRepository implements TaskRepository {
         return { ok: true, changed: true };
       }
       case 'deleteMessage': {
+        // Capture task_id before delete so feed metadata stays scoped for peers.
+        const existing = await this.db.get<{ task_id: string }>(
+          'SELECT task_id FROM messages WHERE workspace_id = ? AND id = ?',
+          [this.workspaceId, command.messageId],
+        );
         const results = await this.writeIfFirstChanged(
           { sql: 'DELETE FROM messages WHERE workspace_id = ? AND id = ?', params: [this.workspaceId, command.messageId] }, [],
-          { kind: 'message', id: command.messageId, change: 'delete' }, new Date().toISOString(),
+          {
+            kind: 'message',
+            id: command.messageId,
+            ...(existing?.task_id ? { taskId: existing.task_id } : {}),
+            change: 'delete',
+          },
+          new Date().toISOString(),
         );
         return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
       }

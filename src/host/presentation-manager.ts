@@ -290,6 +290,12 @@ export class PresentationManager {
   private readonly operations = new Map<string, string>();
   private ownerResolver: OwnerResolver | undefined;
   private documentStore: PresentationDocumentStore | undefined;
+  /** Restores that arrived before the SQLite store was wired. */
+  private pendingRestores: Array<{
+    panel: PresentationPanel;
+    state: unknown;
+    resolve: (result: PresentationResult) => void;
+  }> = [];
 
   constructor(private readonly factory: PresentationPanelFactory) {}
 
@@ -301,6 +307,12 @@ export class PresentationManager {
   /** SQLite-backed presentation document store (required for restart restore). */
   setDocumentStore(store: PresentationDocumentStore | undefined): void {
     this.documentStore = store;
+    if (!store) return;
+    const pending = this.pendingRestores;
+    this.pendingRestores = [];
+    for (const entry of pending) {
+      void this.restore(entry.panel, entry.state).then(entry.resolve);
+    }
   }
 
   private async persistDocument(
@@ -308,7 +320,8 @@ export class PresentationManager {
     document: PresentationDocument,
     opFingerprint?: string,
   ): Promise<boolean> {
-    if (!this.documentStore) return true;
+    // Fail closed: never claim durable success without a store (persist-before-visible).
+    if (!this.documentStore) return false;
     try {
       await this.documentStore.putPresentation({
         ...document,
@@ -372,6 +385,8 @@ export class PresentationManager {
         sourcePath: document.sourcePath,
         sourceFolderUri: document.sourceFolderUri,
       });
+      const durable = await this.persistDocument(rootId, next);
+      if (!durable) return { ok: false, code: 'host_delivery_failed' };
       let accepted = false;
       try {
         accepted = await existing.panel.update(next, rootId);
@@ -473,8 +488,14 @@ export class PresentationManager {
 
   async restore(panel: PresentationPanel, state: unknown): Promise<PresentationResult> {
     const parsed = parsePersistedState(state);
-    if (!parsed || !this.documentStore) {
+    if (!parsed) {
       return { ok: false, code: 'restore_rejected' };
+    }
+    // Serializer may run before engine/store is ready; queue until store is wired.
+    if (!this.documentStore) {
+      return new Promise<PresentationResult>((resolve) => {
+        this.pendingRestores.push({ panel, state, resolve });
+      });
     }
     const { rootId, presentationId } = parsed;
     const loaded = await this.documentStore.getPresentation(presentationId);

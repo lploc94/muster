@@ -200,6 +200,8 @@ describe('external workspace reconciler', () => {
       const projectionB = await RepositoryProjection.load(pair.b, 'ws');
       const activity = vi.spyOn(pair.b, 'listTurnActivityForTasks');
       const inputs = vi.spyOn(pair.b, 'listActiveTurnInputMessages');
+      const listTasksByIds = vi.spyOn(pair.b, 'listTasksByIds');
+      const getTask = vi.spyOn(pair.b, 'getTask');
       const result = await reconcileExternalWorkspaceChanges({
         repository: pair.b,
         projection: projectionB,
@@ -209,9 +211,83 @@ describe('external workspace reconciler', () => {
       expect(result.kind).toBe('batches');
       expect(activity.mock.calls.length).toBeLessThanOrEqual(2);
       expect(inputs.mock.calls.length).toBeLessThanOrEqual(2);
+      expect(listTasksByIds.mock.calls.length).toBeLessThanOrEqual(2);
+      expect(getTask).not.toHaveBeenCalled();
       if (activity.mock.calls[0]) {
         expect(activity.mock.calls[0][0].length).toBeGreaterThan(1);
       }
+      if (listTasksByIds.mock.calls[0]) {
+        expect(listTasksByIds.mock.calls[0][0].length).toBeGreaterThan(1);
+      }
+    } finally {
+      await pair.close();
+    }
+  }, 30_000);
+
+  it('treats send_outbox without taskId as coordination (no recovery storm)', async () => {
+    const pair = await openPair();
+    try {
+      await pair.a.execute({ kind: 'createTask', workspaceId: 'ws', task: makeTask('t1') });
+      const afterTask = await pair.a.getWorkspaceRevision();
+      await pair.a.execute({
+        kind: 'putSendOutbox',
+        workspaceId: 'ws',
+        entry: {
+          clientRequestId: 'cr-1',
+          status: 'pending',
+          payload: { version: 1, text: 'hello' },
+          createdAt: '2026-07-16T00:00:00.000Z',
+          updatedAt: '2026-07-16T00:00:00.000Z',
+        },
+      });
+      const projectionB = await RepositoryProjection.load(pair.b, 'ws');
+      const result = await reconcileExternalWorkspaceChanges({
+        repository: pair.b,
+        projection: projectionB,
+        afterRevision: afterTask,
+        knownTranscriptIds: new Set(),
+      });
+      expect(result.kind).toBe('batches');
+      if (result.kind !== 'batches') return;
+      expect(result.batches.at(-1)?.patches ?? []).toEqual([]);
+    } finally {
+      await pair.close();
+    }
+  }, 20_000);
+
+  it('recovers when focused transcript entity is deleted (no stale peer rows)', async () => {
+    const pair = await openPair();
+    try {
+      const task = makeTask('focus');
+      await pair.a.execute({ kind: 'createTask', workspaceId: 'ws', task });
+      await pair.a.execute({
+        kind: 'appendTranscriptBatch',
+        workspaceId: 'ws',
+        taskId: task.id,
+        messages: [{
+          id: 'm-del',
+          taskId: task.id,
+          role: 'user' as const,
+          content: 'bye',
+          state: 'assigned' as const,
+          createdAt: '2026-07-16T00:00:01.000Z',
+        }],
+      });
+      const afterAppend = await pair.a.getWorkspaceRevision();
+      await pair.a.execute({
+        kind: 'deleteMessage',
+        workspaceId: 'ws',
+        messageId: 'm-del',
+      });
+      const projectionB = await RepositoryProjection.load(pair.b, 'ws');
+      const result = await reconcileExternalWorkspaceChanges({
+        repository: pair.b,
+        projection: projectionB,
+        afterRevision: afterAppend,
+        focusedTaskId: task.id,
+        knownTranscriptIds: new Set(['m-del']),
+      });
+      expect(result.kind).toBe('recovery');
     } finally {
       await pair.close();
     }

@@ -88,10 +88,22 @@ function withoutHostStamps<T extends { updatedAt?: string }>(doc: T): Omit<T, 'u
   return rest;
 }
 
+function wireMemoryStore(manager: PresentationManager): Map<string, PresentationDocument> {
+  const docs = new Map<string, PresentationDocument>();
+  manager.setDocumentStore({
+    getPresentation: async (id) => docs.get(id),
+    putPresentation: async (doc) => {
+      docs.set(doc.presentationId, doc);
+    },
+  });
+  return docs;
+}
+
 describe('PresentationManager.openWorkspaceDocument', () => {
   it('opens a new panel for a workspace markdown document', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
     const result = await manager.openWorkspaceDocument('root-1', {
       presentationId: 'md:docs-plan.md',
       ownerTaskId: 'root-1',
@@ -110,6 +122,7 @@ describe('PresentationManager.openWorkspaceDocument', () => {
   it('reveals without bumping when content is unchanged', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
     await manager.openWorkspaceDocument('root-1', {
       presentationId: 'md:docs-plan.md',
       ownerTaskId: 'root-1',
@@ -131,6 +144,7 @@ describe('PresentationManager.openWorkspaceDocument', () => {
   it('bumps revision when file content changed', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    const docs = wireMemoryStore(manager);
     await manager.openWorkspaceDocument('root-1', {
       presentationId: 'md:docs-plan.md',
       ownerTaskId: 'root-1',
@@ -146,6 +160,20 @@ describe('PresentationManager.openWorkspaceDocument', () => {
     expect(result).toEqual({ ok: true, code: 'opened' });
     expect(factory.panels[0].updates.at(-1)?.revision).toBe(2);
     expect(factory.panels[0].updates.at(-1)?.markdown).toBe('# v2');
+    expect(docs.get('md:docs-plan.md')?.markdown).toBe('# v2');
+  });
+
+  it('fails closed when document store is not wired', async () => {
+    const factory = new FakeFactory();
+    const manager = new PresentationManager(factory);
+    const result = await manager.openWorkspaceDocument('root-1', {
+      presentationId: 'md:docs-plan.md',
+      ownerTaskId: 'root-1',
+      title: 'plan',
+      markdown: '# From file',
+    });
+    expect(result).toEqual({ ok: false, code: 'host_delivery_failed' });
+    expect(factory.created).toHaveLength(0);
   });
 });
 
@@ -169,6 +197,7 @@ describe('PresentationManager', () => {
   it('opens a panel and posts the requested document through the panel boundary', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
 
     const result = await manager.upsert(context, request);
 
@@ -188,6 +217,7 @@ describe('PresentationManager', () => {
   it('rejects an owner mismatch before creating panel state', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
 
     const result = await manager.upsert(context, { ...request, ownerTaskId: 'other-task' });
 
@@ -198,6 +228,7 @@ describe('PresentationManager', () => {
   it('makes exact same-turn operation retries idempotent and rejects conflicting reuse', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
 
     expect(await manager.upsert(context, request)).toEqual({ ok: true, code: 'opened' });
     expect(await manager.upsert(context, { ...request })).toEqual({ ok: true, code: 'idempotent' });
@@ -212,6 +243,7 @@ describe('PresentationManager', () => {
   it('rejects malformed and oversized requests before calling the panel factory', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
 
     await expect(manager.upsert(context, { ...request, revision: 0 })).resolves.toEqual({
       ok: false,
@@ -230,6 +262,7 @@ describe('PresentationManager', () => {
   it('rejects stale and equal same-ID revisions without mutating or revealing the panel', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
     await manager.upsert(context, { ...request, revision: 2 });
 
     expect(
@@ -245,6 +278,7 @@ describe('PresentationManager', () => {
   it('keeps the registered owner immutable across authenticated callers', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
     await manager.upsert(context, request);
 
     expect(
@@ -259,6 +293,7 @@ describe('PresentationManager', () => {
   it('returns a stable host delivery failure when an existing panel rejects an update', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
     await manager.upsert(context, request);
     factory.panels[0].updateResult = new Error(`delivery leaked ${request.markdown}`);
 
@@ -271,6 +306,7 @@ describe('PresentationManager', () => {
   it('posts a newer revision to the existing panel and reveals it', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
     await manager.upsert(context, request);
 
     const result = await manager.upsert(context, {
@@ -290,6 +326,7 @@ describe('PresentationManager', () => {
   it('keeps an accepted existing-panel update successful when reveal fails', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
     await manager.upsert(context, request);
     factory.panels[0].revealError = new Error(`reveal leaked ${request.markdown}`);
 
@@ -305,6 +342,7 @@ describe('PresentationManager', () => {
   it('sanitizes panel factory and initial update failures and disposes partial panels', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
     factory.createError = new Error(`factory leaked ${request.markdown}`);
 
     await expect(manager.upsert(context, request)).resolves.toEqual({
@@ -331,6 +369,7 @@ describe('PresentationManager', () => {
   it('does not acknowledge or ledger a panel disposed during its initial update', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
     factory.nextDisposeDuringUpdate = true;
 
     expect(await manager.upsert(context, request)).toEqual({
@@ -344,6 +383,7 @@ describe('PresentationManager', () => {
   it('recreates disposed panels and ignores stale callbacks from their predecessors', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
     await manager.upsert(context, request);
     const disposedPanel = factory.panels[0];
     disposedPanel.dispose();
@@ -359,6 +399,7 @@ describe('PresentationManager', () => {
   it('keeps distinct presentation IDs under one authenticated root isolated', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
     await manager.upsert(context, request);
     await manager.upsert(context, {
       ...request,
@@ -517,6 +558,7 @@ describe('PresentationManager', () => {
   it('isolates identical presentation IDs by authenticated root and disposes all live panels', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
     await manager.upsert(context, request);
     await manager.upsert(
       { ...context, rootId: 'root-2', turnId: 'turn-2' },

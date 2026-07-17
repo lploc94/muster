@@ -59,6 +59,8 @@ export class WorkspaceRevisionPoller {
   private pendingImmediate = false;
   private intervalMs: number;
   private lastDataVersion: number | undefined;
+  /** Highest workspace revision observed; used to re-poll after failed recovery. */
+  private observedRevision: number | undefined;
   private pollCount = 0;
 
   constructor(options: WorkspaceRevisionPollerOptions) {
@@ -147,20 +149,24 @@ export class WorkspaceRevisionPoller {
     let sawChange = false;
     try {
       const dataVersion = await this.getStorageDataVersion();
-      if (
-        this.lastDataVersion !== undefined &&
-        dataVersion === this.lastDataVersion
-      ) {
-        // Cheap path: no DB mutation observed on this connection's view of the file.
-        // Still re-check revision occasionally is unnecessary — data_version covers
-        // external writers. Own-connection writes update data_version too.
+      const appliedBefore = this.getAppliedRevision();
+      const dataUnchanged =
+        this.lastDataVersion !== undefined && dataVersion === this.lastDataVersion;
+      // If a prior poll observed a higher revision but apply/recovery did not advance
+      // the cursor, re-check even when data_version is sticky (failed recovery).
+      const appliedBehindObserved =
+        this.observedRevision !== undefined && appliedBefore < this.observedRevision;
+
+      if (dataUnchanged && !appliedBehindObserved) {
+        // Cheap idle path: no DB mutation and applied cursor is caught up.
       } else {
-        this.lastDataVersion = dataVersion;
         const currentRevision = await this.getWorkspaceRevision();
+        this.observedRevision = currentRevision;
         const applied = this.getAppliedRevision();
         if (currentRevision < applied) {
           await this.onRecovery('invariant');
           this.intervalMs = this.activeIntervalMs;
+          // Do not commit lastDataVersion — recovery must re-run if it failed.
           return;
         }
         if (currentRevision > applied) {
@@ -169,7 +175,16 @@ export class WorkspaceRevisionPoller {
             afterRevision: applied,
             currentRevision,
           });
+          // Only commit the cheap data_version cursor after apply/recovery advanced
+          // the applied revision to (or past) what we observed. Otherwise the next
+          // poll must re-enter even if data_version is unchanged.
+          if (this.getAppliedRevision() >= currentRevision) {
+            this.lastDataVersion = dataVersion;
+          }
           this.intervalMs = this.activeIntervalMs;
+        } else {
+          // current === applied: no external work; safe to arm cheap path.
+          this.lastDataVersion = dataVersion;
         }
       }
       if (!sawChange) {

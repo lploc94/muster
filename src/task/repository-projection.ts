@@ -146,14 +146,14 @@ export class RepositoryProjection {
       return;
     }
     const [tasks, turns, messages] = await Promise.all([
-      Promise.all(uniqueIds.map((id) => this.source.getTask(id))),
+      this.source.listTasksByIds(uniqueIds),
       this.source.listTurnActivityForTasks(uniqueIds),
       this.source.listActiveTurnInputMessages(uniqueIds),
     ]);
     for (const taskId of uniqueIds) this.removeTaskRows(taskId);
-    for (let i = 0; i < uniqueIds.length; i += 1) {
-      const task = tasks[i];
-      const taskId = uniqueIds[i]!;
+    const byId = new Map(tasks.map((task) => [task.id, task]));
+    for (const taskId of uniqueIds) {
+      const task = byId.get(taskId);
       if (!task) {
         delete this.file.tasks[taskId];
         continue;

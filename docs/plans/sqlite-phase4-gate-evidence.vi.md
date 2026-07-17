@@ -1,18 +1,19 @@
 # Phase 4 gate evidence
 
-**Date:** 2026-07-17  
-**Schema:** `SQLITE_SCHEMA_VERSION = 6`  
-**Retention:** `CHANGE_FEED_RETAIN_REVISIONS = 4096`  
-**Status:** Phase 4 COMPLETE; Phase 5 not started.
+**Date:** 2026-07-17
+**Schema:** `SQLITE_SCHEMA_VERSION = 6`
+**Retention:** `CHANGE_FEED_RETAIN_REVISIONS = 4096`
+**Status:** Phase 4 IN PROGRESS (W9/W10 landed; W11 durability fixes applied; final COMPLETE not claimed).
 
 ## Commits
 
 | Wave | Hash | Message |
 |------|------|---------|
 | P4-W8 baseline | `0da76a5` | perf: batch durable transcript streaming |
-| P4-W9 | (this series) | feat: add bounded workspace change feed |
-| P4-W10 | (this series) | feat: synchronize sqlite changes across windows |
-| P4-W11 | (this series) | feat: complete phase 4 sqlite synchronization gates |
+| P4-W9 | `d04bd2e` | feat: add bounded workspace change feed |
+| P4-W10 | `b031242` | feat: synchronize sqlite changes across windows |
+| P4-W11 | `0f8da39` | feat: complete phase 4 sqlite synchronization gates |
+| Follow-up | (working tree) | durability/poller/outbox/presentation/reconciler fixes |
 
 ## Feed contract (W9)
 
@@ -27,17 +28,21 @@
 
 - Poller: active 250 ms → idle factor 2 → max 5 s
 - Runs only when webview visible AND window focused; immediate tick on start/focus/visible
+- `lastDataVersion` commits only after applied revision catches observed revision
+- Failed recovery keeps sticky-data_version re-entry via `observedRevision`
 - External reconciler: feed → bounded projection refresh → contiguous `workspacePatchBatch`
 - Intermediate revisions: empty batches; final revision carries reconciliation patches
-- Gap/corrupt/unrepresentable → bounded `postSnapshot` recovery
+- Gap/corrupt/unrepresentable → awaited bounded snapshot recovery
+- `send_outbox` / `presentation` treated as coordination-only
+- Focused transcript delete → recovery (no stale peer items)
 
 ## Durable cleanup (W11)
 
 | Surface | Ownership |
 |---------|-----------|
 | Composer backend/model | VS Code Settings `muster.composerSelection` (Global) |
-| Pending/rejected sends | SQLite `send_outbox` |
-| Presentation documents | SQLite `presentations` |
+| Pending/rejected sends | SQLite `send_outbox` (reject/delete on every host path) |
+| Presentation documents | SQLite `presentations` (fail-closed without store; queue restore) |
 | Webview setState | Ephemeral UI chrome / opaque presentation IDs only |
 | SecretStorage | credentials (unchanged) |
 
@@ -53,21 +58,25 @@ Machine: darwin arm64, Node from host, mode `tsx-worker-release-contract`, fixtu
 | bootstrap wire | 12.3 KiB | — | < 500 KiB |
 | materialized page rows | 100 | — | bounded ≤ 100 |
 
-Command: `npm run bench:phase4-release:assert` → **BUDGET PASS**
+Command: `npm run bench:phase4-release:assert` → **BUDGET PASS** (worker contract path)
+
+Open vs plan budgets:
+
+- activation@100k messages p95 < 300 ms — not measured
+- heap on large history — not measured
+- packaged/release EH bench path — not used
 
 ## Gates
 
 | Gate | Result |
 |------|--------|
-| `npx tsc -p . --noEmit` | pass |
-| `npm run check:svelte` | 0 errors |
-| `npm run build:webview` / `npm run compile` | pass |
-| `npm test` | 115 files / 1650 tests pass |
-| `npm run test:source-boundary` | pass |
-| `npm run test:source-boundary:fixtures` | 13 pass |
-| `npm run bench:phase4-release:assert` | BUDGET PASS |
-| `npm run test:sqlite-extension-host` | pass (VSIX packages worker/client; EH opens node:sqlite; schema v6) |
-| `git diff --check` | pass |
+| `npx tsc -p . --noEmit` | re-run after durability fixes |
+| `npm run check:svelte` | re-run after durability fixes |
+| `npm run build:webview` / `npm run compile` | re-run after durability fixes |
+| `npm test` | re-run after durability fixes |
+| `npm run test:source-boundary` | prior pass |
+| `npm run bench:phase4-release:assert` | prior BUDGET PASS |
+| `npm run test:sqlite-extension-host` | prior pass (fresh user-data-dir) |
 
 ## UAT coverage (automated)
 
@@ -75,10 +84,18 @@ Command: `npm run bench:phase4-release:assert` → **BUDGET PASS**
 - Local write not re-applied by poller applied-cursor
 - Gap after prune → recovery path
 - Focused transcript hydrate-by-id (no full listMessages)
-- Call-count batching (no N+1 activity queries)
-- Outbox memory-only + host durable put/reject/delete
-- Presentation restore via opaque IDs + SQLite store
+- Call-count batching (`listTasksByIds` + activity; no N+1 `getTask`)
+- Outbox memory-only + host durable put/reject/delete all paths
+- Outbox snapshot ordered before task snapshot; late outbox still replays pending
+- Presentation restore via opaque IDs + SQLite store; fail-closed without store
 - Composer Settings read/write (no globalState key)
+
+## Not yet claimed as Phase 4 COMPLETE
+
+- Full suite re-green after durability follow-up
+- activation@100k / heap budgets
+- Two real VS Code windows UAT artifact
+- Disk-full / WAL crash as Phase-4 gate (Phase 5 territory unless re-scoped)
 
 ## Known pre-existing warnings
 

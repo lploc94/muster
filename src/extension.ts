@@ -1032,14 +1032,22 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   }
 
   postSnapshot(focusedTaskId?: string, retryAttempt = 0): void {
+    void this.postSnapshotAsync(focusedTaskId, retryAttempt);
+  }
+
+  /**
+   * Awaitable snapshot for poller recovery paths. Resolves after the snapshot is
+   * posted (or retries are exhausted) so lastDataVersion is not committed early.
+   */
+  private postSnapshotAsync(focusedTaskId?: string, retryAttempt = 0): Promise<void> {
     if (!taskRepository) {
-      return;
+      return Promise.resolve();
     }
     // Caller is responsible for flushing the previous focus when switching.
     // Prefer explicit arg; fall back to current host focus (after transitionFocus).
     const focus = focusedTaskId ?? this.focusedTaskId;
     const generation = ++this.snapshotGeneration;
-    void buildRepositorySnapshot(taskRepository, repositoryWorkspaceId(), focus, activePendingAsks).then((projection) => {
+    return buildRepositorySnapshot(taskRepository, repositoryWorkspaceId(), focus, activePendingAsks).then(async (projection) => {
       if (generation !== this.snapshotGeneration) return;
       // A local commit may have completed after the snapshot's final read but
       // before this continuation ran. Never post an older snapshot after its
@@ -1049,7 +1057,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         projectedRevision !== undefined &&
         projection.snapshot.storeRevision < projectedRevision
       ) {
-        this.postSnapshot(focus);
+        await this.postSnapshotAsync(focus);
         return;
       }
       // Stamp the wire version on the bootstrap message so the webview can detect
@@ -1070,18 +1078,18 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       if (projection.snapshot.storeRevision > this.appliedWorkspaceRevision) {
         this.appliedWorkspaceRevision = projection.snapshot.storeRevision;
       }
-    }).catch(() => {
-      if (generation === this.snapshotGeneration) {
-        if (retryAttempt < 3) {
-          setTimeout(() => {
-            if (generation === this.snapshotGeneration) {
-              this.postSnapshot(focus, retryAttempt + 1);
-            }
-          }, 25 * (retryAttempt + 1));
-        } else {
-          this.postCommandError('Unable to load task snapshot.');
+    }).catch(async () => {
+      if (generation !== this.snapshotGeneration) return;
+      if (retryAttempt < 3) {
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 25 * (retryAttempt + 1));
+        });
+        if (generation === this.snapshotGeneration) {
+          await this.postSnapshotAsync(focus, retryAttempt + 1);
         }
+        return;
       }
+      this.postCommandError('Unable to load task snapshot.');
     });
   }
 
@@ -1445,7 +1453,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         await this.reconcileExternalRevisions(afterRevision, currentRevision);
       },
       onRecovery: async () => {
-        this.postSnapshot(this.focusedTaskId);
+        await this.postSnapshotAsync(this.focusedTaskId);
       },
     });
   }
@@ -1476,7 +1484,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         knownTranscriptIds: this.knownTranscriptIds,
       });
       if (result.kind === 'gap' || result.kind === 'recovery') {
-        this.postSnapshot(this.focusedTaskId);
+        await this.postSnapshotAsync(this.focusedTaskId);
         return;
       }
       if (!this._view?.visible) {
@@ -1773,6 +1781,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     }
     if (text.length > MAX_MESSAGE_CHARS) {
       if (clientRequestId) {
+        await this.rejectDurableOutbox(clientRequestId);
         this.post({
           type: 'sendRejected',
           clientRequestId,
@@ -1789,6 +1798,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       typeof data.llmText === 'string' && data.llmText.trim() ? data.llmText.trim() : text;
     if (llmText.length > MAX_MESSAGE_CHARS) {
       if (clientRequestId) {
+        await this.rejectDurableOutbox(clientRequestId);
         this.post({
           type: 'sendRejected',
           clientRequestId,
@@ -1807,6 +1817,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         const continuationError = this.validateContinuationOf(data.continuationOf);
         if (continuationError) {
           if (clientRequestId) {
+            await this.rejectDurableOutbox(clientRequestId);
             this.post({
               type: 'sendRejected',
               clientRequestId,
@@ -1855,6 +1866,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             : /capacity|maxTurns|turn cap/i.test(result.reason)
               ? 'capacity'
               : 'unknown';
+          await this.rejectDurableOutbox(clientRequestId);
           this.post({
             type: 'sendRejected',
             clientRequestId,
@@ -1873,6 +1885,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       });
       this.focusedTaskId = result.value.taskId;
       if (clientRequestId) {
+        await this.clearDurableOutbox(clientRequestId);
         this.post({
           type: 'sendAccepted',
           clientRequestId,
@@ -1919,6 +1932,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           const reason =
             'Model switch did not commit; message was not sent on the previous backend.';
           if (clientRequestId) {
+            await this.rejectDurableOutbox(clientRequestId);
             this.post({
               type: 'sendRejected',
               clientRequestId,
@@ -1945,18 +1959,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           : /capacity|maxTurns|turn cap/i.test(result.reason)
             ? 'capacity'
             : 'unknown';
-        if (taskRepository) {
-          try {
-            await taskRepository.execute({
-              kind: 'markSendOutboxRejected',
-              workspaceId: repositoryWorkspaceId(),
-              clientRequestId,
-              updatedAt: new Date().toISOString(),
-            });
-          } catch {
-            // still surface rejection to webview
-          }
-        }
+        await this.rejectDurableOutbox(clientRequestId);
         this.post({
           type: 'sendRejected',
           clientRequestId,
@@ -1971,17 +1974,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     }
     if (clientRequestId && result.value.messageId) {
       // Receipt already durable via send path; ACK only after outbox delete succeeds.
-      if (taskRepository) {
-        try {
-          await taskRepository.execute({
-            kind: 'deleteSendOutbox',
-            workspaceId: repositoryWorkspaceId(),
-            clientRequestId,
-          });
-        } catch {
-          // Keep outbox so reload can de-dupe via send receipt + clientRequestId.
-        }
-      }
+      await this.clearDurableOutbox(clientRequestId);
       this.post({
         type: 'sendAccepted',
         clientRequestId,
@@ -1991,6 +1984,35 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       });
     }
     // Transcript/queue/activity publish via onAfterCommit workspacePatchBatch.
+  }
+
+  /** Mark durable outbox rejected after put — every reject path after durable put. */
+  private async rejectDurableOutbox(clientRequestId: string): Promise<void> {
+    if (!taskRepository) return;
+    try {
+      await taskRepository.execute({
+        kind: 'markSendOutboxRejected',
+        workspaceId: repositoryWorkspaceId(),
+        clientRequestId,
+        updatedAt: new Date().toISOString(),
+      });
+    } catch {
+      // still surface rejection to webview
+    }
+  }
+
+  /** Delete durable outbox after successful send (new-task and existing-task). */
+  private async clearDurableOutbox(clientRequestId: string): Promise<void> {
+    if (!taskRepository) return;
+    try {
+      await taskRepository.execute({
+        kind: 'deleteSendOutbox',
+        workspaceId: repositoryWorkspaceId(),
+        clientRequestId,
+      });
+    } catch {
+      // Keep outbox so reload can de-dupe via send receipt + clientRequestId.
+    }
   }
 
   /** Push durable SQLite outbox entries so webview can restore drafts after reload. */
@@ -2695,7 +2717,11 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
 
     // Do not auto-focus on open — entry UI shows previous tasks list (per redesign)
     // User selects from list or New task to enter chat.
-    this.postSnapshot(this.focusedTaskId);
+    // Outbox must hydrate before snapshot so pending replay after snapshot sees rows.
+    void (async () => {
+      await this.postSendOutboxSnapshot();
+      this.postSnapshot(this.focusedTaskId);
+    })();
     // Tell the webview which backends are actually installed so its picker only
     // offers callable ones (the webview also requests this on mount).
     void this.postAvailableBackends();
@@ -2703,8 +2729,6 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     void this.postAvailableModels();
     // Restore last-used backend/model from VS Code Settings (survives restarts).
     this.postComposerSelection();
-    // Restore durable SQLite send outbox into webview memory (no setState text).
-    void this.postSendOutboxSnapshot();
   }
 
   private _getHtmlForWebview(webview: vscode.Webview): string {

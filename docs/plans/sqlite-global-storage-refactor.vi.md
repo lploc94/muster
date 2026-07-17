@@ -2,7 +2,7 @@
 
 ## Trạng thái
 
-**COMPLETE — Phase 4 pagination/incremental wire (P4-W1…W11 ✅). Phase 5 not started.**
+**IN PROGRESS — Phase 4 W9–W11 implemented; durability/poller fixes applied; final W11 gate not re-closed.**
 Cập nhật: 2026-07-17
 
 - Phase 1: **đã qua gate** — worker/RPC, schema bootstrap, global-storage registry,
@@ -636,9 +636,9 @@ sau bắt đầu ngay khi wave trước đạt gate, chỉ dừng khi có blocke
 | P4-W6 ✅ | Revisioned patch reducer | Duplicate/stale patch là no-op; revision gap yêu cầu recovery |
 | P4-W7 ✅ | Local patch routing | Queue/tree/transcript update không kéo theo focused full snapshot |
 | P4-W8 ✅ | Stream batching | Assistant/reasoning persist + post coalesce 50–100 ms, flush ở tool/terminal boundary |
-| P4-W9 | Change-feed contract | Bounded feed, prune watermark, explicit gap result |
-| P4-W10 | Multi-window polling | Visible/focus polling + backoff; hai process hội tụ hoặc full-recover khi gap |
-| P4-W11 | Performance/UAT gate | 10k fixture, size/latency budgets, full suite/build/VSIX evidence |
+| P4-W9 ✅ | Change-feed contract | Bounded feed, prune watermark, explicit gap result |
+| P4-W10 ✅ | Multi-window polling | Visible/focus polling + backoff; hai process hội tụ hoặc full-recover khi gap |
+| P4-W11 🔧 | Performance/UAT gate | 10k fixture budgets measured; durability fixes pending re-gate |
 
 ##### P4-W1 — SQLite-only activation cutover
 
@@ -864,17 +864,20 @@ request; fixed page limit 100; **no W6 recovery**.
   rebuild bounded snapshot.
 - Test hai DB clients/processes ghi xen kẽ và hội tụ cùng reducer state.
 
-##### P4-W11 — Performance/UAT gate ✅
+##### P4-W11 — Performance/UAT gate 🔧
 
 - Benchmark release fixture 10k transcript items: focus latest 100, load page 100,
-  bootstrap bytes, stream-batch p50/p95 và heap/row count (`bench:phase4-release`).
-- UAT transcript append trong lúc paging, duplicate delivery, gap prune, two-window
-  convergence và focus race (unit/integration + two-client suites).
+  bootstrap bytes, stream-batch p50/p95 (`bench:phase4-release`) — measured on
+  `tsx-worker-release-contract` (not packaged EH); activation@100k / heap still open.
+- UAT: two-client feed convergence, gap prune, outbox/presentation durability unit paths.
 - Composer → VS Code Settings `muster.composerSelection`; send outbox → SQLite
   `send_outbox`; presentation → SQLite `presentations` (serializer opaque IDs only).
 - Schema v6 current-bootstrap only.
-- Chạy full tests, TypeScript, webview build/check, source-boundary audit và packaged VSIX;
-  ghi evidence trước khi đánh dấu Phase 4 hoàn tất.
+- Durability follow-ups applied: poller sticky data_version, outbox reject/delete all
+  paths, outbox-before-snapshot restore, presentation fail-closed + queued restore,
+  coordination for outbox/presentation, focused transcript delete → recovery,
+  batched `listTasksByIds`.
+- Full suite/build/VSIX re-gate required before marking Phase 4 COMPLETE.
 
 ##### Cleanup trước P4-W11 ✅
 

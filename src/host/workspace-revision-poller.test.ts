@@ -185,4 +185,49 @@ describe('WorkspaceRevisionPoller', () => {
     expect(poller.getIntervalMs()).toBeGreaterThan(WORKSPACE_POLL_ACTIVE_MS);
     poller.dispose();
   });
+
+  it('re-checks revision after failed external apply even when data_version is sticky', async () => {
+    const clock = createFakeTimers();
+    let applied = 0;
+    let dataVersion = 1;
+    let revision = 0;
+    let externalCalls = 0;
+    const onExternal = vi.fn(async ({ currentRevision }) => {
+      externalCalls += 1;
+      // First attempt fails to advance applied (simulates gap → failed snapshot).
+      if (externalCalls === 1) return;
+      applied = currentRevision;
+    });
+
+    const poller = new WorkspaceRevisionPoller({
+      getStorageDataVersion: async () => dataVersion,
+      getWorkspaceRevision: async () => revision,
+      getAppliedRevision: () => applied,
+      isActive: () => true,
+      onExternalRevisions: onExternal,
+      onRecovery: async () => undefined,
+      schedule: clock.schedule,
+      clearSchedule: clock.clearSchedule,
+      activeIntervalMs: 100,
+      maxIntervalMs: 400,
+      idleFactor: 2,
+    });
+
+    poller.start();
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+
+    dataVersion = 2;
+    revision = 4;
+    poller.tickNow();
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+    expect(onExternal).toHaveBeenCalledTimes(1);
+    expect(applied).toBe(0);
+
+    // data_version unchanged; applied still behind observed → must re-enter.
+    poller.tickNow();
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+    expect(onExternal).toHaveBeenCalledTimes(2);
+    expect(applied).toBe(4);
+    poller.dispose();
+  });
 });

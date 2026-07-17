@@ -898,7 +898,7 @@
 
         case 'sendOutboxSnapshot': {
           outboxReplaceAll(msg.entries);
-          // Restore rejected drafts for the current scope; pending entries replay after snapshot.
+          // Restore rejected drafts for the current scope.
           for (const entry of outboxRejected()) {
             const sameScope =
               (!entry.taskId && tasks.draftMode) ||
@@ -912,6 +912,21 @@
                 entry.backend,
               );
               break;
+            }
+          }
+          // If snapshot already applied (outbox arrived late), still replay pending.
+          if (outboxReplayed && !protocolMismatch) {
+            for (const entry of outboxPending(vscode)) {
+              post({
+                type: 'send',
+                taskId: entry.taskId,
+                text: entry.text,
+                llmText: entry.llmText,
+                backend: entry.backend,
+                model: entry.model,
+                continuationOf: entry.continuationOf,
+                clientRequestId: entry.clientRequestId,
+              });
             }
           }
           break;
