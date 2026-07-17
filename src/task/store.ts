@@ -3,6 +3,7 @@ import * as path from 'path';
 import { createHash, randomBytes } from 'crypto';
 import { synthesizeBriefFromGoal } from './brief';
 import { deriveViewStatus } from './derived-status';
+import { sanitizeHandoffFailureMessage } from './sanitization';
 import type {
   MusterTask,
   TaskContinuationHandoffState,
@@ -137,8 +138,6 @@ const HANDOFF_PHASES: ReadonlySet<string> = new Set([
   'cancelled',
 ]);
 
-const HANDOFF_FAILURE_MESSAGE_MAX = 240;
-
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0;
 }
@@ -147,42 +146,9 @@ function isOptionalString(value: unknown): value is string | undefined {
   return value === undefined || typeof value === 'string';
 }
 
-/**
- * Bound and scrub handoff failure text so diagnostics never retain absolute paths,
- * credential-like tokens, or long conversation/CLI bodies.
- */
-export function sanitizeHandoffFailureMessage(message: string): string {
-  let text = message
-    // Windows absolute paths (C:\...)
-    .replace(/[A-Za-z]:\\(?:[^\\\s]+\\)*[^\\\s]*/g, '[path]')
-    // POSIX absolute paths
-    .replace(/(?:^|[\s"'`(=])(\/(?:[^\s"'`)]+\/)+[^\s"'`)]+)/g, (match, pathPart: string) =>
-      match.replace(pathPart, '[path]'),
-    )
-    // Authorization / cookie / set-cookie headers — full value through EOL
-    .replace(
-      /\b((?:authorization|proxy-authorization|cookie|set-cookie)\s*[:=]\s*)[^\r\n]+/gi,
-      '$1[redacted]',
-    )
-    .replace(/\bBearer\s+[A-Za-z0-9\-._~+/]+=*/gi, 'Bearer [redacted]')
-    // password/token/secret/key assignment forms (PASSWORD=…, PASSWORD="…", AWS_SECRET_ACCESS_KEY: …)
-    .replace(
-      /\b((?:password|passwd|pwd|passphrase|api[_-]?key|access[_-]?key|secret[_-]?access[_-]?key|secret|token|auth[_-]?token|private[_-]?key|aws_secret_access_key|aws_access_key_id)\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
-      '$1[redacted]',
-    )
-    // Common secret / token shapes (sk-…, api_key-…, etc.)
-    .replace(
-      /\b(?:sk|pk|api[_-]?key|token|secret|key)[-_][A-Za-z0-9][-_A-Za-z0-9]{4,}\b/gi,
-      '[redacted]',
-    )
-    // Collapse long runs (conversation dumps / raw CLI)
-    .replace(/([A-Za-z0-9])\1{20,}/g, '$1$1$1…');
-
-  if (text.length > HANDOFF_FAILURE_MESSAGE_MAX) {
-    text = `${text.slice(0, HANDOFF_FAILURE_MESSAGE_MAX - 1)}…`;
-  }
-  return text;
-}
+// Compatibility export for legacy migration/tests. Runtime modules import the
+// standalone sanitizer so they do not pull the JSON file store into their graph.
+export { sanitizeHandoffFailureMessage } from './sanitization';
 
 function sanitizeRuntimeBinding(raw: unknown): TaskHandoffRuntimeBinding | undefined {
   if (!raw || typeof raw !== 'object') {

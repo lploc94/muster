@@ -1,7 +1,7 @@
 import type { Question } from '../bridge/ask-bridge';
 import { deriveRuntimeActivity, deriveViewStatus } from '../task/derived-status';
 import { dependenciesBlockTask } from '../task/scheduler';
-import { sanitizeHandoffFailureMessage } from '../task/store';
+import { sanitizeHandoffFailureMessage } from '../task/sanitization';
 import type {
   MusterTask,
   TaskHandoffPhase,

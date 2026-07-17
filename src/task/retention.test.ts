@@ -163,6 +163,35 @@ describe('applyRetention', () => {
     expect(pruned.reasoning!['t1'].content.endsWith(TRUNCATION_MARKER)).toBe(true);
   });
 
+  it('never truncates transcript rows owned by a live turn', () => {
+    const file = emptyFile();
+    file.schemaVersion = 3;
+    file.toolCalls = {};
+    file.reasoning = {};
+    file.tasks['task-1'] = sampleTask('task-1', 'open');
+    file.turns['t1'] = turn('t1', 'task-1', 1, 'running');
+    const huge = 'l'.repeat(300_000);
+    file.messages['m1'] = {
+      id: 'm1', taskId: 'task-1', turnId: 't1', role: 'assistant', content: huge,
+      state: 'partial', createdAt: '2026-07-06T00:00:01.000Z',
+    };
+    file.toolCalls['t1:tc1'] = {
+      id: 't1:tc1', taskId: 'task-1', turnId: 't1', toolCallId: 'tc1', order: 0,
+      name: 'read', status: 'running', output: huge,
+      createdAt: '2026-07-06T00:00:01.000Z', updatedAt: '2026-07-06T00:00:01.000Z',
+    };
+    file.reasoning['t1'] = {
+      id: 't1', taskId: 'task-1', turnId: 't1', content: huge,
+      createdAt: '2026-07-06T00:00:01.000Z', updatedAt: '2026-07-06T00:00:01.000Z',
+    };
+
+    const retained = applyRetention(file, { maxTurnsPerTask: 1, maxStoredOutputChars: 30 });
+    expect(retained.turns.t1).toEqual(file.turns.t1);
+    expect(retained.messages.m1).toEqual(file.messages.m1);
+    expect(retained.toolCalls?.['t1:tc1']).toEqual(file.toolCalls['t1:tc1']);
+    expect(retained.reasoning?.t1).toEqual(file.reasoning.t1);
+  });
+
   it('drops tool calls and reasoning for pruned turns on terminal tasks', () => {
     const file = emptyFile();
     file.schemaVersion = 3;

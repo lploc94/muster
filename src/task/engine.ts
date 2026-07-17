@@ -65,7 +65,7 @@ import {
 } from './execution-policy';
 import { TASK_ERROR_MAX_BYTES, TASK_RESULT_MAX_BYTES } from './content-limits';
 import { selectCommittedSessionId } from './session-select';
-import { TaskStore } from './store';
+import type { LegacyStorePort, TaskReadPort } from './store-port';
 import {
   deriveResourceClaimKeys,
   JsonTaskRepository,
@@ -133,7 +133,7 @@ export type EngineEvent =
 
 export interface TaskEngineConfig {
   /** Legacy JSON read projection. Optional when an async repository is supplied. */
-  store?: TaskStore;
+  store?: LegacyStorePort;
   /** Transitional async persistence boundary. JSON is injected by legacy tests;
    * SQLite becomes the production implementation at cutover. */
   repository?: TaskRepository;
@@ -343,7 +343,7 @@ function updateLeaseExpiry(
 }
 
 /**
- * Reclaim a stale lease safely, mirroring the store lock's {@link TaskStore} reclaim.
+ * Reclaim a stale lease safely, mirroring the legacy store's lock reclaim.
  * Never disturbs a live, well-formed lease. A suspicious lease is claimed atomically via
  * rename — only one contender can win that rename, and each operates on the exact file
  * instance it removed — which closes the read-then-unlink TOCTOU where a stale read could
@@ -626,7 +626,7 @@ export function viewStatusFromDraft(draft: TaskStoreFile, taskId: string) {
 }
 
 export class TaskEngine {
-  private readonly store: TaskStore | RepositoryProjection;
+  private readonly store: TaskReadPort | RepositoryProjection;
   private readonly repository: TaskRepository;
   private readonly workspaceId: string;
   private readonly makeBackend: (name: string) => Backend;
@@ -695,7 +695,7 @@ export class TaskEngine {
 
   private constructor(
     config: TaskEngineConfig,
-    store: TaskStore | RepositoryProjection,
+    store: TaskReadPort | RepositoryProjection,
     repository: TaskRepository,
     storePath: string,
   ) {
@@ -740,7 +740,7 @@ export class TaskEngine {
   /**
    * Synchronous compatibility bridge for legacy unit callers that construct the
    * JSON adapter. Production/SQLite paths must use the async repository API;
-   * keeping this bridge here removes direct TaskStore mutation from engine code
+   * keeping this bridge here removes direct legacy-store mutation from engine code
    * without pretending a worker-backed SQLite command can be synchronous.
    */
   private executeLegacySync(command: RepositoryCommand): RepositoryCommandResult {
@@ -870,7 +870,7 @@ export class TaskEngine {
   private graphDeps(): GraphEngineDeps {
     const credentials = this.credentialRegistry ?? new CredentialRegistry();
     return {
-      store: this.store as TaskStore,
+      store: this.store,
       repository: this.repository,
       workspaceId: this.workspaceId,
       makeBackend: this.makeBackend,
@@ -1919,7 +1919,7 @@ export class TaskEngine {
    * Async repository-backed host send path. Kept alongside the legacy sync
    * method while the JSON adapter remains available to existing engine tests;
    * extension-host requests use this path, so task/message/turn/receipt are one
-   * named transaction rather than a TaskStore callback.
+   * named transaction rather than a filesystem-store callback.
    */
   async sendAsync(
     taskId: string,

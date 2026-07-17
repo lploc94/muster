@@ -17,7 +17,7 @@ import type {
   TaskStoreFile,
   TaskTurn,
 } from './types';
-import { sanitizeHandoffFailureMessage } from './store';
+import { sanitizeHandoffFailureMessage } from './sanitization';
 
 export const MAX_CONTINUATION_MESSAGES = 160;
 export const MAX_CONTINUATION_TOOL_CALLS = 160;

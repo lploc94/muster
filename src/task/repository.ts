@@ -1,4 +1,4 @@
-import type { TaskStore } from './store';
+import type { LegacyStorePort } from './store-port';
 import type {
   CancelRequest,
   MusterTask,
@@ -18,7 +18,7 @@ import type {
 import { isMutatingTask, normalizedWritePaths } from './resources';
 import { canPromoteTurn } from './scheduler';
 import { DEFAULT_RESOURCE_LIMITS } from './limits';
-import { isTerminalLifecycle } from './transitions';
+import { isTerminalLifecycle, isTerminalTurn } from './transitions';
 import { deriveViewStatus } from './derived-status';
 import { TRUNCATION_MARKER } from './retention';
 import type { DbClient } from './sqlite/client';
@@ -63,14 +63,42 @@ export interface RepositoryWorkspaceLocation {
   lastSeenAt: string;
 }
 
+export interface RepositoryOperationEntry {
+  ledgerKey: string;
+  entry: OperationLedgerEntry;
+}
+
+export interface RepositoryCancelEntry {
+  turnId: string;
+  request: CancelRequest;
+}
+
 /**
- * A bounded graph mutation.  Graph tools prepare their transition against a
- * read projection, then submit only the rows they created/changed.  The
- * repository re-checks every expected revision and applies the complete graph
- * plus its operation ledger in one transaction on both adapters.
+ * Shared payload for the named graph commands. Graph tools prepare their
+ * transition against a read projection, then submit only the rows they
+ * created/changed. The public discriminant is deliberately domain-specific so
+ * an audit can map every mutation to the coordinator operation that owns it;
+ * the adapters may share one private row-transaction implementation.
  */
-export interface GraphMutationCommand {
-  kind: 'applyGraphMutation';
+export type GraphCommandKind =
+  | 'createChildTask'
+  | 'delegateChildTask'
+  | 'createChildTaskBatch'
+  | 'delegateChildTaskBatch'
+  | 'releaseChildTasks'
+  | 'continueChildTask'
+  | 'cancelChildTasks'
+  | 'interruptChildTask'
+  | 'cancelChildTask'
+  | 'setChildTaskLifecycle'
+  | 'waitForChildTasks'
+  | 'completeGraphTask'
+  | 'failGraphTask'
+  | 'askParent'
+  | 'answerChildQuestion'
+  | 'consumeCancelRequest';
+
+export interface GraphCommandPayload {
   workspaceId: string;
   /** Existing task revisions that must still match before the mutation. */
   expectedTasks: readonly { id: string; revision: number }[];
@@ -97,8 +125,10 @@ export interface GraphMutationCommand {
   deleteResourceClaimTurnIds?: readonly string[];
 }
 
+export type GraphCommand = GraphCommandPayload & { kind: GraphCommandKind };
+
 export type RepositoryCommand =
-  | GraphMutationCommand
+  | GraphCommand
   | {
       kind: 'upsertWorkspace'; workspaceId: string; identityKey: string;
       displayName: string; createdAt: string; lastOpenedAt: string;
@@ -332,6 +362,17 @@ export type RepositoryCommand =
       maxStoredOutputChars?: number;
     };
 
+export function isGraphCommand(command: RepositoryCommand): command is GraphCommand {
+  return command.kind === 'createChildTask' || command.kind === 'delegateChildTask' ||
+    command.kind === 'createChildTaskBatch' || command.kind === 'delegateChildTaskBatch' ||
+    command.kind === 'releaseChildTasks' || command.kind === 'continueChildTask' ||
+    command.kind === 'cancelChildTasks' || command.kind === 'interruptChildTask' ||
+    command.kind === 'cancelChildTask' || command.kind === 'setChildTaskLifecycle' ||
+    command.kind === 'waitForChildTasks' || command.kind === 'completeGraphTask' ||
+    command.kind === 'failGraphTask' || command.kind === 'askParent' ||
+    command.kind === 'answerChildQuestion' || command.kind === 'consumeCancelRequest';
+}
+
 export interface RepositoryCommandResult {
   ok: true;
   changed?: boolean;
@@ -363,13 +404,23 @@ export interface TaskRepository {
   listTurns(taskId: string): Promise<readonly TaskTurn[]>;
   /** Optional bulk projection primitive; adapters fall back to per-task reads. */
   listTurnsForTasks?(taskIds: readonly string[]): Promise<readonly TaskTurn[]>;
+  /**
+   * Bounded activity projection for tree/root summaries. It includes every
+   * queued/live turn plus the latest terminal turn per task; callers that need
+   * a complete transcript must use listTurns(taskId) or getTranscriptPage().
+   */
+  listTurnActivityForTasks?(taskIds: readonly string[]): Promise<readonly TaskTurn[]>;
   listQueuedTurns(taskId: string): Promise<readonly TaskTurn[]>;
   listMessages(taskId: string): Promise<readonly TaskMessage[]>;
   listToolCalls(taskId: string): Promise<readonly PersistedToolCall[]>;
   listReasoning(taskId: string): Promise<readonly PersistedReasoning[]>;
   getOperation(ledgerKey: string): Promise<OperationLedgerEntry | undefined>;
+  /** Coordination rows needed to recover live graph turns after host reload. */
+  listOperationsForTurns?(turnIds: readonly string[]): Promise<readonly RepositoryOperationEntry[]>;
   getCancelRequest(turnId: string): Promise<CancelRequest | undefined>;
+  listCancelRequests?(): Promise<readonly RepositoryCancelEntry[]>;
   getRuntimeClaim(turnId: string): Promise<RuntimeClaim | undefined>;
+  listRuntimeClaims?(): Promise<readonly RuntimeClaim[]>;
   getSendReceipt(clientRequestId: string): Promise<SendReceipt | undefined>;
   getTranscriptPage(taskId: string, cursor?: string, limit?: number): Promise<TranscriptPage>;
   /** Current workspace revision without materializing the compatibility envelope. */
@@ -482,13 +533,13 @@ function validateAggregateTaskChanges(
   return undefined;
 }
 
-function validateGraphMutation(command: GraphMutationCommand): string | undefined {
+function validateGraphCommand(command: GraphCommand): string | undefined {
   const taskIds = new Set(command.tasks.map((task) => task.id));
   const turnIds = new Set(command.turns.map((turn) => turn.id));
   const messageIds = new Set((command.messages ?? []).map((message) => message.id));
-  if (taskIds.size !== command.tasks.length) return 'graph mutation contains duplicate tasks';
-  if (turnIds.size !== command.turns.length) return 'graph mutation contains duplicate turns';
-  if (messageIds.size !== (command.messages ?? []).length) return 'graph mutation contains duplicate messages';
+  if (taskIds.size !== command.tasks.length) return 'graph command contains duplicate tasks';
+  if (turnIds.size !== command.turns.length) return 'graph command contains duplicate turns';
+  if (messageIds.size !== (command.messages ?? []).length) return 'graph command contains duplicate messages';
   const insertTasks = new Set(command.insertTaskIds ?? []);
   const insertTurns = new Set(command.insertTurnIds ?? []);
   const insertMessages = new Set(command.insertMessageIds ?? []);
@@ -496,9 +547,9 @@ function validateGraphMutation(command: GraphMutationCommand): string | undefine
   for (const id of insertTurns) if (!turnIds.has(id)) return `graph insert turn missing row: ${id}`;
   for (const id of insertMessages) if (!messageIds.has(id)) return `graph insert message missing row: ${id}`;
   const expected = new Set(command.expectedTasks.map((entry) => entry.id));
-  if (expected.size !== command.expectedTasks.length) return 'graph mutation contains duplicate task fences';
+  if (expected.size !== command.expectedTasks.length) return 'graph command contains duplicate task fences';
   const expectedTurns = new Set((command.expectedTurns ?? []).map((entry) => entry.id));
-  if (expectedTurns.size !== (command.expectedTurns ?? []).length) return 'graph mutation contains duplicate turn fences';
+  if (expectedTurns.size !== (command.expectedTurns ?? []).length) return 'graph command contains duplicate turn fences';
   for (const task of command.tasks) {
     if (task.parentId === task.id) return 'graph task cannot parent itself';
     if (task.parentId && !taskIds.has(task.parentId)) {
@@ -523,12 +574,17 @@ function validateGraphMutation(command: GraphMutationCommand): string | undefine
     }
   }
   if (command.operation && command.operation.ledgerKey.length === 0) return 'graph operation key is empty';
+  if (command.kind === 'consumeCancelRequest' &&
+      ((command.expectedRuntimeClaims?.length ?? 0) === 0 ||
+       (command.expectedCancelRequests?.length ?? 0) === 0)) {
+    return 'cancel consumer requires runtime/request ownership fences';
+  }
   return undefined;
 }
 
 function graphOperationConflict(
   existing: OperationLedgerEntry | undefined,
-  command: GraphMutationCommand,
+  command: GraphCommand,
 ): RepositoryCommandResult | undefined {
   if (!existing || !command.operation) return undefined;
   if (existing.fingerprint !== command.operation.entry.fingerprint) {
@@ -704,14 +760,14 @@ function deleteTaskIdsFromFile(file: TaskStoreFile, ids: readonly string[]): voi
 }
 
 /**
- * Compatibility adapter over the current JSON TaskStore.
+ * Compatibility adapter over the current JSON file store.
  *
  * Returning cloned values makes accidental mutation fail closed: changing a DTO
- * returned by a repository query cannot silently mutate TaskStore's in-memory file.
+ * returned by a repository query cannot silently mutate the in-memory file.
  */
 export class JsonTaskRepository implements TaskRepository {
   /** JSON stores are currently one-workspace-per-file; SQLite adds explicit workspace IDs. */
-  constructor(private readonly store: TaskStore, private readonly workspaceId?: string) {}
+  constructor(private readonly store: LegacyStorePort, private readonly workspaceId?: string) {}
 
   async getWorkspace(): Promise<RepositoryWorkspace | undefined> {
     // JSON stores predate the workspace registry. Returning undefined makes this
@@ -770,6 +826,33 @@ export class JsonTaskRepository implements TaskRepository {
       .map((turn) => clone(turn));
   }
 
+  async listTurnActivityForTasks(taskIds: readonly string[]): Promise<readonly TaskTurn[]> {
+    const ids = new Set(taskIds);
+    const byTask = new Map<string, TaskTurn[]>();
+    for (const turn of Object.values(this.store.getFile().turns)) {
+      if (!ids.has(turn.taskId)) continue;
+      const list = byTask.get(turn.taskId) ?? [];
+      list.push(turn);
+      byTask.set(turn.taskId, list);
+    }
+    const selected: TaskTurn[] = [];
+    for (const turns of byTask.values()) {
+      const liveOrQueued = turns.filter((turn) =>
+        turn.status === 'queued' || turn.status === 'running' || turn.status === 'waiting_user',
+      );
+      const terminal = turns
+        .filter((turn) =>
+          turn.status === 'succeeded' || turn.status === 'failed' ||
+          turn.status === 'interrupted' || turn.status === 'cancelled',
+        )
+        .sort((a, b) => b.sequence - a.sequence || b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id))[0];
+      selected.push(...liveOrQueued, ...(terminal ? [terminal] : []));
+    }
+    return selected
+      .sort((a, b) => a.taskId.localeCompare(b.taskId) || a.sequence - b.sequence || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
+      .map((turn) => clone(turn));
+  }
+
   async getTurn(turnId: string): Promise<TaskTurn | undefined> {
     const turn = this.store.getFile().turns[turnId];
     return turn ? clone(turn) : undefined;
@@ -805,14 +888,30 @@ export class JsonTaskRepository implements TaskRepository {
     return entry ? clone(entry) : undefined;
   }
 
+  async listOperationsForTurns(turnIds: readonly string[]): Promise<readonly RepositoryOperationEntry[]> {
+    const prefixes = turnIds.map((turnId) => `${turnId}:`);
+    return Object.entries(this.store.getFile().operations ?? {})
+      .filter(([ledgerKey]) => prefixes.some((prefix) => ledgerKey.startsWith(prefix)))
+      .map(([ledgerKey, entry]) => ({ ledgerKey, entry: clone(entry) }));
+  }
+
   async getCancelRequest(turnId: string): Promise<CancelRequest | undefined> {
     const request = this.store.getFile().cancelRequests?.[turnId];
     return request ? clone(request) : undefined;
   }
 
+  async listCancelRequests(): Promise<readonly RepositoryCancelEntry[]> {
+    return Object.entries(this.store.getFile().cancelRequests ?? {})
+      .map(([turnId, request]) => ({ turnId, request: clone(request) }));
+  }
+
   async getRuntimeClaim(turnId: string): Promise<RuntimeClaim | undefined> {
     const claim = this.store.getFile().runtimeClaims?.[turnId];
     return claim ? clone(claim) : undefined;
+  }
+
+  async listRuntimeClaims(): Promise<readonly RuntimeClaim[]> {
+    return Object.values(this.store.getFile().runtimeClaims ?? {}).map((claim) => clone(claim));
   }
 
   async getSendReceipt(clientRequestId: string): Promise<SendReceipt | undefined> {
@@ -849,8 +948,23 @@ export class JsonTaskRepository implements TaskRepository {
     let deletedMessageIds: string[] | undefined;
     const result = this.store.commit((draft) => {
       switch (command.kind) {
-        case 'applyGraphMutation': {
-          const invalid = validateGraphMutation(command);
+        case 'createChildTask':
+        case 'delegateChildTask':
+        case 'createChildTaskBatch':
+        case 'delegateChildTaskBatch':
+        case 'releaseChildTasks':
+        case 'continueChildTask':
+        case 'cancelChildTasks':
+        case 'interruptChildTask':
+        case 'cancelChildTask':
+        case 'setChildTaskLifecycle':
+        case 'waitForChildTasks':
+        case 'completeGraphTask':
+        case 'failGraphTask':
+        case 'askParent':
+        case 'answerChildQuestion':
+        case 'consumeCancelRequest': {
+          const invalid = validateGraphCommand(command);
           if (invalid) return { ok: false, reason: invalid };
           const prior = command.operation
             ? draft.operations?.[command.operation.ledgerKey]
@@ -1690,8 +1804,14 @@ export class JsonTaskRepository implements TaskRepository {
             return { ok: true };
           }
           const maxChars = Math.max(0, Math.floor(command.maxStoredOutputChars ?? Number.MAX_SAFE_INTEGER));
+          const settledTurnIds = new Set(
+            Object.values(draft.turns)
+              .filter((turn) => turn.taskId === task.id && isTerminalTurn(turn.status))
+              .map((turn) => turn.id),
+          );
           for (const message of Object.values(draft.messages)) {
-            if (message.taskId === task.id && message.role === 'assistant' && message.state === 'complete') {
+            if (message.taskId === task.id && message.role === 'assistant' && message.state === 'complete' &&
+              message.turnId && settledTurnIds.has(message.turnId)) {
               const content = truncateRetentionContent(message.content, maxChars);
               if (content !== message.content) {
                 draft.messages[message.id] = { ...message, content };
@@ -1700,7 +1820,7 @@ export class JsonTaskRepository implements TaskRepository {
             }
           }
           for (const tool of Object.values(draft.toolCalls ?? {})) {
-            if (tool.taskId === task.id && typeof tool.output === 'string') {
+            if (tool.taskId === task.id && settledTurnIds.has(tool.turnId) && typeof tool.output === 'string') {
               const output = truncateRetentionContent(tool.output, maxChars);
               if (output !== tool.output) {
                 draft.toolCalls![tool.id] = { ...tool, output };
@@ -1709,7 +1829,7 @@ export class JsonTaskRepository implements TaskRepository {
             }
           }
           for (const reasoning of Object.values(draft.reasoning ?? {})) {
-            if (reasoning.taskId === task.id) {
+            if (reasoning.taskId === task.id && settledTurnIds.has(reasoning.turnId)) {
               const content = truncateRetentionContent(reasoning.content, maxChars);
               if (content !== reasoning.content) {
                 draft.reasoning![reasoning.id] = { ...reasoning, content };
@@ -1755,7 +1875,7 @@ export class JsonTaskRepository implements TaskRepository {
     });
     if (!result.ok) {
       if (result.reason === 'rejected') {
-        if (command.kind === 'applyGraphMutation' &&
+        if (isGraphCommand(command) &&
           (result.detail === '__graph_replay__' || result.detail === '__graph_conflict__')) {
           const operation = command.operation
             ? this.store.getFile().operations?.[command.operation.ledgerKey]
@@ -1776,7 +1896,7 @@ export class JsonTaskRepository implements TaskRepository {
     return {
       ok: true,
       changed,
-      ...(command.kind === 'applyGraphMutation' && command.operation
+      ...(isGraphCommand(command) && command.operation
         ? { operation: command.operation.entry }
         : {}),
       ...(command.kind === 'claimOperation' && operation ? { operation } : {}),
@@ -1909,6 +2029,28 @@ export class SqliteTaskRepository implements TaskRepository {
     return this.hydrateTurns(rows);
   }
 
+  async listTurnActivityForTasks(taskIds: readonly string[]): Promise<readonly TaskTurn[]> {
+    if (taskIds.length === 0) return [];
+    const ids = placeholders(taskIds.length);
+    const rows = await this.db.all<TurnRow>(
+      `${turnSelect(`WHERE workspace_id = ? AND task_id IN (${ids}) AND (
+          status IN ('queued', 'running', 'waiting_user') OR
+          (status IN ('succeeded', 'failed', 'interrupted', 'cancelled') AND
+           NOT EXISTS (
+             SELECT 1 FROM turns newer
+              WHERE newer.workspace_id = turns.workspace_id
+                AND newer.task_id = turns.task_id
+                AND newer.status IN ('succeeded', 'failed', 'interrupted', 'cancelled')
+                AND (newer.sequence > turns.sequence OR
+                     (newer.sequence = turns.sequence AND newer.created_at > turns.created_at) OR
+                     (newer.sequence = turns.sequence AND newer.created_at = turns.created_at AND newer.id > turns.id))
+           ))
+        )`)} ORDER BY task_id, sequence, created_at, id`,
+      [this.workspaceId, ...taskIds],
+    );
+    return this.hydrateTurns(rows);
+  }
+
   async getTurn(turnId: string): Promise<TaskTurn | undefined> {
     const row = await this.db.get<TurnRow>(
       turnSelect('WHERE workspace_id = ? AND id = ?'),
@@ -1959,6 +2101,17 @@ export class SqliteTaskRepository implements TaskRepository {
     return row ? decodeOperation(row) : undefined;
   }
 
+  async listOperationsForTurns(turnIds: readonly string[]): Promise<readonly RepositoryOperationEntry[]> {
+    if (turnIds.length === 0) return [];
+    const predicates = turnIds.map(() => 'ledger_key GLOB ?').join(' OR ');
+    const rows = await this.db.all<OperationRow>(
+      `SELECT ledger_key, fingerprint, result_json FROM operations
+        WHERE workspace_id = ? AND (${predicates}) ORDER BY ledger_key`,
+      [this.workspaceId, ...turnIds.map((turnId) => `${escapeGlob(turnId)}:*`)],
+    );
+    return rows.map((row) => ({ ledgerKey: row.ledger_key, entry: decodeOperation(row) }));
+  }
+
   async getCancelRequest(turnId: string): Promise<CancelRequest | undefined> {
     const row = await this.db.get<CancelRow>(
       `SELECT turn_id, kind, op_id, requested_by, requested_at, payload_json
@@ -1968,6 +2121,15 @@ export class SqliteTaskRepository implements TaskRepository {
     return row ? decodeCancelRequest(row) : undefined;
   }
 
+  async listCancelRequests(): Promise<readonly RepositoryCancelEntry[]> {
+    const rows = await this.db.all<CancelRow>(
+      `SELECT turn_id, kind, op_id, requested_by, requested_at, payload_json
+         FROM turn_cancel_requests WHERE workspace_id = ? ORDER BY turn_id`,
+      [this.workspaceId],
+    );
+    return rows.map((row) => ({ turnId: row.turn_id, request: decodeCancelRequest(row) }));
+  }
+
   async getRuntimeClaim(turnId: string): Promise<RuntimeClaim | undefined> {
     const row = await this.db.get<RuntimeClaimRow>(
       `SELECT turn_id, owner_id, claimed_at, heartbeat_at, expires_at
@@ -1975,6 +2137,15 @@ export class SqliteTaskRepository implements TaskRepository {
       [this.workspaceId, turnId],
     );
     return row ? decodeRuntimeClaim(row) : undefined;
+  }
+
+  async listRuntimeClaims(): Promise<readonly RuntimeClaim[]> {
+    const rows = await this.db.all<RuntimeClaimRow>(
+      `SELECT turn_id, owner_id, claimed_at, heartbeat_at, expires_at
+         FROM runtime_claims WHERE workspace_id = ? ORDER BY turn_id`,
+      [this.workspaceId],
+    );
+    return rows.map(decodeRuntimeClaim);
   }
 
   async getSendReceipt(clientRequestId: string): Promise<SendReceipt | undefined> {
@@ -2117,10 +2288,10 @@ export class SqliteTaskRepository implements TaskRepository {
     };
   }
 
-  private async applyGraphMutation(
-    command: GraphMutationCommand,
+  private async applyGraphCommand(
+    command: GraphCommand,
   ): Promise<RepositoryCommandResult> {
-    const invalid = validateGraphMutation(command);
+    const invalid = validateGraphCommand(command);
     if (invalid) return { ok: true, changed: false, reason: invalid };
 
     const statements: SqlStatement[] = [];
@@ -2138,7 +2309,11 @@ export class SqliteTaskRepository implements TaskRepository {
       const index = statements.length;
       statements.push(taskRevisionGuardStatement(this.workspaceId, command.expectedTasks));
       abortIfUnchangedAt.push(index);
-    } else if (command.expectedTurns && command.expectedTurns.length > 0) {
+    }
+    // Task revision and live-turn epoch/status are independent fences. Graph
+    // commands commonly carry both (notably cancel consumption); checking only
+    // the task fence would let a stale worker settle a superseded turn.
+    if (command.expectedTurns && command.expectedTurns.length > 0) {
       const index = statements.length;
       statements.push(graphTurnFenceStatement(this.workspaceId, command.expectedTurns));
       abortIfUnchangedAt.push(index);
@@ -2237,7 +2412,7 @@ export class SqliteTaskRepository implements TaskRepository {
       changes.push({ kind: 'operation', id: command.operation.ledgerKey, change: 'insert' });
     }
 
-    // A graph mutation with no row work is a valid replay/no-op but must not
+    // A graph command with no row work is a valid replay/no-op but must not
     // manufacture a workspace revision. Operation claims still make it safe to
     // return the prior result under contention.
     const uniqueChanges = [...new Map(changes.map((entry) => [`${entry.kind}:${entry.id}`, entry])).values()];
@@ -2256,7 +2431,7 @@ export class SqliteTaskRepository implements TaskRepository {
       // caller can retry a stale graph or surface a stable validation reason.
       const message = error instanceof Error ? error.message : String(error);
       if (/constraint|unique|foreign key/i.test(message)) {
-        return { ok: true, changed: false, reason: 'graph mutation rejected' };
+        return { ok: true, changed: false, reason: 'graph command rejected' };
       }
       throw error;
     }
@@ -2438,8 +2613,23 @@ export class SqliteTaskRepository implements TaskRepository {
   async execute(command: RepositoryCommand): Promise<RepositoryCommandResult> {
     if (command.workspaceId !== this.workspaceId) throw new Error('repository workspace mismatch');
     switch (command.kind) {
-      case 'applyGraphMutation':
-        return this.applyGraphMutation(command);
+      case 'createChildTask':
+      case 'delegateChildTask':
+      case 'createChildTaskBatch':
+      case 'delegateChildTaskBatch':
+      case 'releaseChildTasks':
+      case 'continueChildTask':
+      case 'cancelChildTasks':
+      case 'interruptChildTask':
+      case 'cancelChildTask':
+      case 'setChildTaskLifecycle':
+      case 'waitForChildTasks':
+      case 'completeGraphTask':
+      case 'failGraphTask':
+      case 'askParent':
+      case 'answerChildQuestion':
+      case 'consumeCancelRequest':
+        return this.applyGraphCommand(command);
       case 'upsertWorkspace': {
         await this.write([workspaceStatement(command)], [{ kind: 'workspace', id: command.workspaceId, change: 'upsert' }], command.lastOpenedAt);
         return { ok: true, changed: true };
@@ -3471,10 +3661,20 @@ export class SqliteTaskRepository implements TaskRepository {
     }
 
     const maxChars = Math.max(0, Math.floor(command.maxStoredOutputChars ?? Number.MAX_SAFE_INTEGER));
+    // An open task may have a live turn while retention runs in another
+    // window. Only settled turns are eligible: trimming reasoning or a tool
+    // result that is still streaming would corrupt the active transcript just
+    // as surely as deleting the row.
+    const settledTurnIds = new Set(
+      (await this.listTurns(task.id))
+        .filter((turn) => isTerminalTurn(turn.status))
+        .map((turn) => turn.id),
+    );
     const statements: SqlStatement[] = [];
     const changes: ChangeRecord[] = [];
     for (const message of await this.listMessages(task.id)) {
-      if (message.role !== 'assistant' || message.state !== 'complete') continue;
+      if (message.role !== 'assistant' || message.state !== 'complete' ||
+        !message.turnId || !settledTurnIds.has(message.turnId)) continue;
       const content = truncateRetentionContent(message.content, maxChars);
       if (content === message.content) continue;
       statements.push({
@@ -3484,13 +3684,14 @@ export class SqliteTaskRepository implements TaskRepository {
       changes.push({ kind: 'message', id: message.id, taskId: task.id, change: 'truncate' });
     }
     for (const tool of await this.listToolCalls(task.id)) {
-      if (typeof tool.output !== 'string') continue;
+      if (!settledTurnIds.has(tool.turnId) || typeof tool.output !== 'string') continue;
       const output = truncateRetentionContent(tool.output, maxChars);
       if (output === tool.output) continue;
       statements.push(toolCallStatement(this.workspaceId, { ...tool, output }));
       changes.push({ kind: 'tool_call', id: tool.id, taskId: task.id, change: 'truncate' });
     }
     for (const reasoning of await this.listReasoning(task.id)) {
+      if (!settledTurnIds.has(reasoning.turnId)) continue;
       const content = truncateRetentionContent(reasoning.content, maxChars);
       if (content === reasoning.content) continue;
       statements.push({
@@ -3941,7 +4142,7 @@ function operationStatement(workspaceId: string, command: Extract<RepositoryComm
 
 function graphOperationClaimStatement(
   workspaceId: string,
-  operation: NonNullable<GraphMutationCommand['operation']>,
+  operation: NonNullable<GraphCommand['operation']>,
 ): SqlStatement {
   return {
     sql: `INSERT INTO operations (workspace_id, ledger_key, fingerprint, result_json, created_at)

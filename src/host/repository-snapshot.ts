@@ -31,11 +31,16 @@ function rootIdForTask(
   return current.id;
 }
 
-async function allTurns(
+async function activityTurns(
   repository: TaskRepository,
   taskIds: readonly string[],
 ): Promise<readonly import('../task/types').TaskTurn[]> {
+  if (repository.listTurnActivityForTasks) {
+    return repository.listTurnActivityForTasks(taskIds);
+  }
   if (repository.listTurnsForTasks) {
+    // Compatibility fallback for third-party adapters predating the bounded
+    // activity query. SQLite/JSON shipped adapters implement the bounded path.
     return repository.listTurnsForTasks(taskIds);
   }
   const groups = await Promise.all(taskIds.map((taskId) => repository.listTurns(taskId)));
@@ -51,7 +56,7 @@ export async function buildRepositorySnapshot(
 ): Promise<RepositorySnapshotProjection> {
   const tasks = await repository.listTasks(workspaceId);
   const taskMap = new Map(tasks.map((task) => [task.id, task]));
-  const turns = await allTurns(repository, tasks.map((task) => task.id));
+  const summaryTurns = await activityTurns(repository, tasks.map((task) => task.id));
 
   const focusedTask = focusedTaskId ? taskMap.get(focusedTaskId) : undefined;
   const owningRootId = focusedTask
@@ -60,6 +65,13 @@ export async function buildRepositorySnapshot(
   const focusedTaskIds = focusedTask
     ? (await repository.listSubtree(owningRootId!)).map((task) => task.id)
     : [];
+  // A focused transcript needs its complete turn/input map; tree summaries only
+  // need the bounded activity projection above. This is the key distinction that
+  // prevents opening a workspace from materializing every historical turn.
+  const focusedTurns = focusedTask ? await repository.listTurns(focusedTask.id) : [];
+  const turnsById = new Map(summaryTurns.map((turn) => [turn.id, turn]));
+  for (const turn of focusedTurns) turnsById.set(turn.id, turn);
+  const turns = [...turnsById.values()];
   const focusedMessages = focusedTask
     ? await repository.listMessages(focusedTask.id)
     : [];

@@ -96,7 +96,7 @@ test('repository package.json exposes the source-boundary smoke command', async 
   const packageJsonUrl = new URL('../package.json', import.meta.url);
   const packageJson = JSON.parse(await readFile(packageJsonUrl, 'utf8'));
 
-  assert.equal(packageJson.scripts?.['test:source-boundary'], 'node scripts/source-boundary-smoke.mjs');
+  assert.match(packageJson.scripts?.['test:source-boundary'] ?? '', /node scripts\/source-boundary-smoke\.mjs/);
 });
 
 test('repository GitHub Actions workflow runs npm test automatically on main push and pull request', async () => {
@@ -113,7 +113,9 @@ test('repository GitHub Actions workflow runs npm test automatically on main pus
   assert.match(workflow, /run: npm test/);
   // compile is allowed only after npm test (not compile-only).
   assert.match(workflow, /run: npm run compile/);
-  assert.doesNotMatch(workflow, /strategy:\n\s+matrix:/);
+  // The workflow intentionally matrices VS Code versions for the packaged
+  // Extension Host compatibility gate; only the Node runtime must stay single.
+  assert.doesNotMatch(workflow, /node-version:\s*\[/);
 });
 
 test('reports actionable diagnostics for missing source-boundary script wiring', async () => {

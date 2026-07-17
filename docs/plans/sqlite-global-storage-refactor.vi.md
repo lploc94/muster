@@ -3,14 +3,20 @@
 ## Trạng thái
 
 **IN PROGRESS — chưa cutover production.**
-Cập nhật: 2026-07-16
+Cập nhật: 2026-07-17
 
-- Phase 1: worker/RPC, schema migration, global-storage registry đã có.
-- Phase 2: repository boundary đang được chuyển dần; các host flow create/send/queue
-  đã async named-command, scheduler/graph/snapshot chưa hoàn tất.
-- Phase 3: entity parity, atomic claim/idempotency/claims và row-level retention đã có;
-  runtime parity chỉ hoàn tất sau khi các flow còn lại rời `TaskStore`.
-- Chưa bắt đầu Phase 4 hay migration/cutover Phase 5.
+- Phase 1: **đã qua gate** — worker/RPC, schema migration, global-storage registry,
+  lock/crash/concurrent-migration checks, packaged desktop smoke trên minimum/current
+  host, old-host refusal và Remote SSH evidence đều xanh.
+- Phase 2: **đã hoàn tất** — host/engine/scheduler/lifecycle/graph/handoff/retention
+  đi qua repository boundary và named commands; direct runtime commit ngoài JSON
+  compatibility adapter bằng 0.
+- Phase 3: **đã qua parity gate** — dual-adapter behavior suites, contention/replay/
+  conflict/orphan/retention checks, bounded snapshot query, source-boundary audit và
+  transcript benchmark đã chạy; entity/command matrices phản ánh trạng thái thực tế.
+- Phase 4 chưa bắt đầu. Phase 5/6 chưa bắt đầu; JSON vẫn là compatibility/source path
+  cho đến migration/cutover có chủ đích. Kết quả Wave 10 được ghi tại
+  [`sqlite-phase3-gate-evidence.vi.md`](./sqlite-phase3-gate-evidence.vi.md).
 
 ## 1. Kết quả sản phẩm mong muốn
 
@@ -621,6 +627,11 @@ sau khi Wave 10 qua toàn bộ gate.
   tạo một revision/feed batch và không tăng tuyến tính theo tổng database size.
 - Chạy full `npm test`, TypeScript/webview build, packaged Extension Host smoke và Remote
   evidence; cập nhật command/entity matrices theo trạng thái thực tế.
+
+Entity matrix được chốt tại [`sqlite-entity-matrix.vi.md`](./sqlite-entity-matrix.vi.md),
+bao gồm runtime owner/lease, expiry, stale-claim recovery và codec của từng domain
+field. Command matrix được chốt tại [`sqlite-engine-command-matrix.vi.md`](./sqlite-engine-command-matrix.vi.md).
+Evidence cuối Wave 10: [`sqlite-phase3-gate-evidence.vi.md`](./sqlite-phase3-gate-evidence.vi.md).
 
 **Gate trước Phase 4:** Wave 1–10 đều hoàn tất; 44 runtime mutation sites đã về 0 ngoài
 JSON compatibility adapter; engine/graph/snapshot chạy qua repository boundary; dual-adapter

@@ -46,8 +46,8 @@ export const CREDENTIAL_DEADLINE_BUFFER_MS = 5 * 60_000;
 export const ACP_DEADLINE_BUFFER_MS = 90_000;
 import { evaluateTaskReadiness } from './readiness';
 import { canPromoteTurn } from './scheduler';
-import type { TaskStore } from './store';
-import type { RepositoryCommand, TaskRepository } from './repository';
+import type { GraphCommandKind, RepositoryCommand, TaskRepository } from './repository';
+import type { TaskReadPort } from './store-port';
 import {
   createTask,
   cancelPendingTurn,
@@ -259,7 +259,7 @@ const DEFAULT_COORDINATOR_CHILD_CAPS: TaskCapability[] = [
   'interrupt_child',
 ];
 export interface GraphEngineDeps {
-  store: TaskStore;
+  store: TaskReadPort;
   /** Writable domain boundary; graph mutations never call store.commit(). */
   repository: TaskRepository;
   workspaceId: string;
@@ -346,8 +346,9 @@ function equalGraphValue(a: unknown, b: unknown): boolean {
  * existing transition helpers synchronous/pure while making the durable write
  * atomic for both JSON compatibility and SQLite production adapters.
  */
-async function executeGraphMutation(
+async function executeGraphCommand(
   deps: GraphEngineDeps,
+  kind: GraphCommandKind,
   mutate: (draft: TaskStoreFile) => GraphApplyResult,
   fences: {
     expectedTasks?: readonly { id: string; revision: number }[];
@@ -396,7 +397,7 @@ async function executeGraphMutation(
     .filter((turn) => before.turns[turn.id] !== undefined)
     .map((turn) => ({ id: turn.id, status: before.turns[turn.id]!.status, runtimeEpoch: before.turns[turn.id]!.runtimeEpoch }));
   const command: RepositoryCommand = {
-    kind: 'applyGraphMutation',
+    kind,
     workspaceId: deps.workspaceId,
     expectedTasks,
     ...(expectedTurns.length > 0 ? { expectedTurns } : {}),
@@ -589,7 +590,8 @@ export async function executeToolCommand(
     command.kind !== 'get_host_context' &&
     command.kind !== 'list_task_types'
   ) {
-    const existing = deps.store.getFile().operations?.[opLedgerKey(ctx.turnId, command.opId)];
+    const key = opLedgerKey(ctx.turnId, command.opId);
+    const existing = deps.store.getFile().operations?.[key] ?? await deps.repository.getOperation(key);
     if (existing) {
       if (existing.fingerprint !== fingerprint) {
         return { ok: false, error: 'opId conflict: different arguments' };
@@ -684,7 +686,10 @@ export async function executeToolCommand(
       const resolvedTaskType = resolved.resolved.taskType;
       const resolvedBriefKind = resolved.resolved.briefKind;
 
-      const commit = await executeGraphMutation(deps, (draft) => {
+      const commit = await executeGraphCommand(
+        deps,
+        command.kind === 'delegate_task' ? 'delegateChildTask' : 'createChildTask',
+        (draft) => {
         ensureCoordinationMaps(draft);
         const caller = draft.tasks[ctx.callerTaskId];
         if (!caller || caller.lifecycle !== 'open') {
@@ -858,7 +863,8 @@ export async function executeToolCommand(
         };
         writeLedger(draft, ctx.turnId, command.opId, fingerprint, result);
         return { ok: true };
-      });
+        },
+      );
 
       if (!commit.ok) {
         return { ok: false, error: commit.error };
@@ -934,7 +940,10 @@ export async function executeToolCommand(
       const orderedTaskIds = command.specs.map((s) => idByLocal.get(s.localId)!);
       const orderedTurnIds = command.specs.map((s) => turnIdByLocal.get(s.localId)!);
 
-      const commit = await executeGraphMutation(deps, (draft) => {
+      const commit = await executeGraphCommand(
+        deps,
+        isDelegate ? 'delegateChildTaskBatch' : 'createChildTaskBatch',
+        (draft) => {
         ensureCoordinationMaps(draft);
         // Idempotent replay: a cached ledger for this (turn, opId) short-circuits
         // before any caller/config check or write. Compare the fingerprint so a reused
@@ -1235,7 +1244,8 @@ export async function executeToolCommand(
         };
         writeLedger(draft, ctx.turnId, command.opId, fingerprint, result);
         return { ok: true };
-      });
+        },
+      );
 
       if (!commit.ok) {
         return { ok: false, error: commit.error };
@@ -1268,7 +1278,7 @@ export async function executeToolCommand(
         };
       }
       const scheduledTurnIds: string[] = [];
-      const commit = await executeGraphMutation(deps, (draft) => {
+      const commit = await executeGraphCommand(deps, 'releaseChildTasks', (draft) => {
         ensureCoordinationMaps(draft);
         const caller = draft.tasks[ctx.callerTaskId];
         if (!caller || caller.lifecycle !== 'open') {
@@ -1500,7 +1510,7 @@ export async function executeToolCommand(
         };
       }
       const scheduleIds: string[] = [];
-      const commit = await executeGraphMutation(deps, (draft) => {
+      const commit = await executeGraphCommand(deps, 'continueChildTask', (draft) => {
         ensureCoordinationMaps(draft);
         const prior = readLedger(draft, ctx.turnId, command.opId);
         if (prior) {
@@ -1625,7 +1635,7 @@ export async function executeToolCommand(
       }
       const cancelled = [...command.childIds];
       const localLiveIds: string[] = [];
-      const mutation = await executeGraphMutation(deps, (draft) => {
+      const mutation = await executeGraphCommand(deps, 'cancelChildTasks', (draft) => {
         const coordinatorSeal = {
           kind: 'coordinator' as const,
           taskId: ctx.callerTaskId,
@@ -1696,7 +1706,7 @@ export async function executeToolCommand(
       if (command.kind === 'interrupt_task') {
         if (remoteLeased) {
           const result: OpResult = { ok: true, data: { requested: true } };
-          const requested = await executeGraphMutation(deps, (draft) => {
+          const requested = await executeGraphCommand(deps, 'interruptChildTask', (draft) => {
             draft.cancelRequests = draft.cancelRequests ?? {};
             draft.cancelRequests[liveTurn!.id] = {
               kind: 'interrupt', by: ctx.callerTaskId, opId: command.opId, at: now,
@@ -1707,7 +1717,7 @@ export async function executeToolCommand(
           if (!requested.ok) return { ok: false, error: requested.error };
           return { ok: true, result: result.data };
         }
-        const interrupted = await executeGraphMutation(deps, (draft) => {
+        const interrupted = await executeGraphCommand(deps, 'interruptChildTask', (draft) => {
           const turn = liveTurn ? draft.turns[liveTurn.id] : undefined;
           if (turn) {
             const interrupted = interruptTurn(turn, { now });
@@ -1736,7 +1746,7 @@ export async function executeToolCommand(
         mode: 'cancel_task',
       };
       const localLiveIds: string[] = [];
-      const mutation = await executeGraphMutation(deps, (draft) => {
+      const mutation = await executeGraphCommand(deps, 'cancelChildTask', (draft) => {
         const ids = [command.childId, ...descendantIds(draft, command.childId)].reverse();
         for (const taskId of ids) {
           const task = draft.tasks[taskId];
@@ -1824,7 +1834,7 @@ export async function executeToolCommand(
         const ids = [command.taskId, ...descendantIds(file, command.taskId)].reverse();
         const liveToCleanup: string[] = [];
         let noop = false;
-        const cascade = await executeGraphMutation(deps, (draft) => {
+        const cascade = await executeGraphCommand(deps, 'setChildTaskLifecycle', (draft) => {
           const direct = draft.tasks[command.taskId];
           if (!direct) return { ok: false, reason: 'task not found' };
           const probe = transitionSetTaskLifecycle(direct, command.lifecycle, {
@@ -1952,7 +1962,7 @@ export async function executeToolCommand(
       // succeeded | failed — seal target only (no grandchild cascade)
       let sealChanged = false;
       let liveIdToCleanup: string | undefined;
-      const commit = await executeGraphMutation(deps, (draft) => {
+      const commit = await executeGraphCommand(deps, 'setChildTaskLifecycle', (draft) => {
         const task = draft.tasks[command.taskId];
         if (!task) return { ok: false, reason: 'task not found' };
         const sealed = transitionSetTaskLifecycle(task, command.lifecycle, {
@@ -2027,7 +2037,7 @@ export async function executeToolCommand(
     case 'wait_for_tasks': {
       const owned = command.taskIds.every((id) => draftChildOwned(deps.store.getFile(), ctx.callerTaskId, id));
       if (!owned) return { ok: false, error: 'taskIds must be owned direct children' };
-      const staged = await executeGraphMutation(deps, (draft) => {
+      const staged = await executeGraphCommand(deps, 'waitForChildTasks', (draft) => {
         const turn = draft.turns[ctx.turnId];
         if (!turn) return { ok: false, reason: 'turn not found' };
         const result = mergeWaitDisposition(turn, command.taskIds);
@@ -2056,7 +2066,7 @@ export async function executeToolCommand(
       // `verdict.at` is deterministic per staging and the command fingerprint (parsed
       // upstream, timeless) stays stable across idempotent retries. Absent → no verdict.
       const verdict = normalizeVerdict(command.verdict, { at: now, source: 'worker' });
-      const staged = await executeGraphMutation(deps, (draft) => {
+      const staged = await executeGraphCommand(deps, 'completeGraphTask', (draft) => {
         const turn = draft.turns[ctx.turnId];
         if (!turn) return { ok: false, reason: 'turn not found' };
         const result = stageDisposition(
@@ -2077,7 +2087,7 @@ export async function executeToolCommand(
     }
 
     case 'fail_task': {
-      const staged = await executeGraphMutation(deps, (draft) => {
+      const staged = await executeGraphCommand(deps, 'failGraphTask', (draft) => {
         const turn = draft.turns[ctx.turnId];
         if (!turn) return { ok: false, reason: 'turn not found' };
         const result = stageDisposition(turn, { kind: 'fail', error: command.error }, command.opId, {
@@ -2255,7 +2265,7 @@ export async function executeToolCommand(
         return { ok: false, error: 'questions required' };
       }
       const questionId = deriveEntityId(ctx.turnId, command.opId, 'q');
-      const commit = await executeGraphMutation(deps, (draft) => {
+      const commit = await executeGraphCommand(deps, 'askParent', (draft) => {
         ensureCoordinationMaps(draft);
         const child = draft.tasks[ctx.callerTaskId];
         const parentId = child?.parentId;
@@ -2429,7 +2439,7 @@ export async function executeToolCommand(
 
     case 'answer_child_question': {
       const scheduleIds: string[] = [];
-      const commit = await executeGraphMutation(deps, (draft) => {
+      const commit = await executeGraphCommand(deps, 'answerChildQuestion', (draft) => {
         ensureCoordinationMaps(draft);
         const parent = draft.tasks[ctx.callerTaskId];
         if (!parent || parent.lifecycle !== 'open') {
@@ -2574,7 +2584,7 @@ function draftChildOwned(file: TaskStoreFile, parentId: string, childId: string)
 }
 
 export function tryPromoteTurn(
-  store: TaskStore,
+  store: TaskReadPort,
   turnId: string,
   limits: ResourceLimits,
 ): boolean {
@@ -2600,8 +2610,9 @@ export async function processCancelRequests(deps: GraphEngineDeps): Promise<void
     const expectedTurns = localTurn
       ? [{ id: turnId, status: localTurn.status, runtimeEpoch: localTurn.runtimeEpoch }]
       : [];
-    const consumed = await executeGraphMutation(
+    const consumed = await executeGraphCommand(
       deps,
+      'consumeCancelRequest',
       (draft) => {
         const currentRequest = draft.cancelRequests?.[turnId];
         const currentClaim = draft.runtimeClaims?.[turnId];

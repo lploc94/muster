@@ -20,6 +20,29 @@ export interface OpenOptions {
   busyTimeoutMs?: number;
 }
 
+const OPEN_RETRY_WAIT = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+
+function isRetryableOpenLock(error: unknown): boolean {
+  const candidate = error as { code?: unknown; message?: unknown };
+  const code = typeof candidate.code === 'string' ? candidate.code : '';
+  const message = typeof candidate.message === 'string' ? candidate.message : String(error);
+  // node:sqlite currently reports lock failures as ERR_SQLITE_ERROR, so the
+  // SQLite message remains part of the predicate. Do not retry arbitrary I/O,
+  // foreign-database or schema errors.
+  return (
+    code === 'SQLITE_BUSY' ||
+    code === 'SQLITE_LOCKED' ||
+    /database (?:table )?is locked|database is busy/i.test(message)
+  );
+}
+
+function waitBeforeOpenRetry(attempt: number): void {
+  // This module runs in the DB worker in production. A short synchronous wait
+  // therefore delays only this connection bootstrap, never the extension host.
+  const delayMs = Math.min(250, 10 * (2 ** Math.min(attempt, 5)));
+  Atomics.wait(OPEN_RETRY_WAIT, 0, 0, delayMs);
+}
+
 /** Thrown when the DB file belongs to a different application_id (not Muster's). */
 export class ForeignDatabaseError extends Error {
   constructor(readonly observedApplicationId: number) {
@@ -138,14 +161,33 @@ export function migrateToLatest(db: DatabaseSync): number {
  * (DB worker) owns close().
  */
 export function openStoreDatabase(opts: OpenOptions): DatabaseSync {
-  const db = new DatabaseSync(opts.path);
-  try {
-    applyPragmas(db, opts.busyTimeoutMs ?? 5000);
-    verifyOrStampApplicationId(db);
-    migrateToLatest(db);
-    return db;
-  } catch (error) {
-    db.close();
-    throw error;
+  const busyTimeoutMs = Math.max(0, Math.floor(opts.busyTimeoutMs ?? 5000));
+  // A simultaneous first open can fail immediately while multiple connections
+  // switch a brand-new file to WAL, before SQLite's busy handler gets a chance to
+  // wait. Reopen and re-verify the durable markers within a bounded budget. This
+  // also implements the plan's loser-of-migration-race contract instead of
+  // assuming BEGIN EXCLUSIVE alone covers WAL bootstrap.
+  const retryDeadline = Date.now() + Math.max(1_000, busyTimeoutMs * 2);
+  let attempt = 0;
+
+  for (;;) {
+    const db = new DatabaseSync(opts.path);
+    try {
+      applyPragmas(db, busyTimeoutMs);
+      verifyOrStampApplicationId(db);
+      migrateToLatest(db);
+      return db;
+    } catch (error) {
+      try {
+        db.close();
+      } catch {
+        // The original initialization error is the actionable failure.
+      }
+      if (!isRetryableOpenLock(error) || Date.now() >= retryDeadline) {
+        throw error;
+      }
+      waitBeforeOpenRetry(attempt);
+      attempt += 1;
+    }
   }
 }

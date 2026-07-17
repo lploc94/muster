@@ -1,13 +1,10 @@
 import { randomUUID } from 'crypto';
 import * as http from 'http';
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { createMcpExpressApp } from '@modelcontextprotocol/sdk/server/express.js';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-  isInitializeRequest,
-} from '@modelcontextprotocol/sdk/types.js';
+import * as path from 'path';
+import type * as McpServerModule from '@modelcontextprotocol/sdk/server/index.js';
+import type * as McpExpressModule from '@modelcontextprotocol/sdk/server/express.js';
+import type * as McpStreamableHttpModule from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import type * as McpTypesModule from '@modelcontextprotocol/sdk/types.js';
 import type { CredentialRegistry, CredentialVerification } from './credentials';
 import type { ToolAction } from '../task/capabilities';
 import {
@@ -16,6 +13,26 @@ import {
   PRESENTATION_MARKDOWN_MAX_LENGTH,
   PRESENTATION_TITLE_MAX_LENGTH,
 } from '../task/coordinator-tools';
+
+// VS Code's Extension Host resolver does not consistently honor this package's
+// wildcard exports (for example `./server/index.js`) in a packaged VSIX. Resolve
+// the SDK's explicit `./server` export once, then load its CommonJS siblings by
+// absolute paths so desktop and remote hosts use the same deterministic files.
+// The package's `.` require export points to a file absent in SDK 1.29.0.
+const mcpCjsRoot = path.dirname(path.dirname(require.resolve('@modelcontextprotocol/sdk/server')));
+const { Server } = require(path.join(mcpCjsRoot, 'server', 'index.js')) as typeof McpServerModule;
+const { createMcpExpressApp } = require(
+  path.join(mcpCjsRoot, 'server', 'express.js'),
+) as typeof McpExpressModule;
+const { StreamableHTTPServerTransport } = require(
+  path.join(mcpCjsRoot, 'server', 'streamableHttp.js'),
+) as typeof McpStreamableHttpModule;
+const { CallToolRequestSchema, ListToolsRequestSchema, isInitializeRequest } = require(
+  path.join(mcpCjsRoot, 'types.js'),
+) as typeof McpTypesModule;
+
+type McpServer = InstanceType<typeof Server>;
+type McpStreamableHttpTransport = InstanceType<typeof StreamableHTTPServerTransport>;
 
 export interface ToolCallHandler {
   handleToolCall(
@@ -488,7 +505,7 @@ function isLoopbackOrigin(origin: string | undefined): boolean {
 function createMcpServer(
   credentials: CredentialRegistry,
   toolHandler: ToolCallHandler,
-): Server {
+): McpServer {
   const server = new Server({ name: 'muster_bridge', version: '0.1.0' }, { capabilities: { tools: {} } });
 
   server.setRequestHandler(ListToolsRequestSchema, async (request, extra) => {
@@ -559,7 +576,7 @@ export class MusterBridgeServer {
   private readonly toolHandler: ToolCallHandler;
   private httpServer?: http.Server;
   private port = 0;
-  private readonly transports = new Map<string, StreamableHTTPServerTransport>();
+  private readonly transports = new Map<string, McpStreamableHttpTransport>();
 
   constructor(options: MusterBridgeServerOptions) {
     this.credentials = options.credentials;
@@ -592,7 +609,7 @@ export class MusterBridgeServer {
 
       try {
         const sessionId = req.headers['mcp-session-id'] as string | undefined;
-        let transport: StreamableHTTPServerTransport | undefined;
+        let transport: McpStreamableHttpTransport | undefined;
         const body = req.body;
 
         if (sessionId && this.transports.has(sessionId)) {

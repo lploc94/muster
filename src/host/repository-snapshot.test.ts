@@ -37,6 +37,16 @@ describe('buildRepositorySnapshot', () => {
         id: 'childTurn', taskId: 'child', sequence: 1, status: 'succeeded', trigger: 'user',
         inputs: [{ kind: 'message', messageId: 'childMessage' }], createdAt: '2026-07-17T00:00:01.000Z',
       };
+      // Historical turns on an unrelated task must stay out of the bounded
+      // tree projection; only the focused task gets its complete turn map.
+      draft.turns.otherOld = {
+        id: 'otherOld', taskId: 'other', sequence: 1, status: 'succeeded', trigger: 'user',
+        inputs: [], createdAt: '2026-07-16T00:00:01.000Z',
+      };
+      draft.turns.otherLatest = {
+        id: 'otherLatest', taskId: 'other', sequence: 2, status: 'succeeded', trigger: 'user',
+        inputs: [], createdAt: '2026-07-17T00:00:01.000Z',
+      };
       draft.messages.childMessage = {
         id: 'childMessage', taskId: 'child', role: 'user', content: 'focused', state: 'complete',
         createdAt: '2026-07-17T00:00:02.000Z',
@@ -56,6 +66,7 @@ describe('buildRepositorySnapshot', () => {
       expect(projection.snapshot.rootTasks.map((summary) => summary.id)).toEqual(['other', 'root']);
       expect(projection.snapshot.subtree?.map((summary) => summary.id)).toEqual(['root', 'child']);
       expect(projection.snapshot.transcript?.map((item) => item.id)).toEqual(['childMessage']);
+      expect(Object.keys(projection.observation.turns).sort()).toEqual(['childTurn', 'otherLatest']);
       expect(JSON.stringify(projection.observation)).not.toContain('must stay out');
       expect(projection.snapshot.storeRevision).toBe(store.getFile().revision);
       expect(migrationReader).not.toHaveBeenCalled();

@@ -6,8 +6,54 @@ import { TaskEngine } from './engine';
 import { SqliteTaskRepository } from './repository';
 import { DbClient } from './sqlite/client';
 import type { MusterTask } from './types';
+import { CredentialRegistry } from '../bridge/credentials';
+import { deriveEntityId } from './engine-graph';
+import { parseTaskTypeRegistry } from './task-types';
+import { RepositoryProjection, withRepositoryProjection } from './repository-projection';
 
 describe('TaskEngine repository-only boundary', () => {
+  it('hydrates live operation/cancel/runtime coordination rows on reload', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-engine-coordination-reload-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const repository = new SqliteTaskRepository(client, 'ws');
+      await repository.execute({ kind: 'upsertWorkspace', workspaceId: 'ws', identityKey: 'coord-reload', displayName: 'Coord reload', createdAt: 'now', lastOpenedAt: 'now' });
+      const task: MusterTask = {
+        id: 'reload-task', role: 'coordinator', lifecycle: 'open', goal: 'reload coordination',
+        parentId: null, dependencies: [], backend: 'grok', capabilities: ['create_child'],
+        executionPolicy: { maxTurns: 4, maxAutomaticRetries: 0 }, releaseState: 'released',
+        revision: 0, createdAt: '2026-07-16T00:00:00.000Z', updatedAt: '2026-07-16T00:00:00.000Z',
+      };
+      const turn = {
+        id: 'reload-turn', taskId: task.id, sequence: 1, status: 'running' as const,
+        trigger: 'user' as const, inputs: [], createdAt: '2026-07-16T00:00:01.000Z',
+      };
+      await repository.execute({ kind: 'createTask', workspaceId: 'ws', task });
+      await repository.execute({ kind: 'createTurn', workspaceId: 'ws', turn });
+      await repository.execute({
+        kind: 'putOperation', workspaceId: 'ws', ledgerKey: `${turn.id}:op`,
+        entry: { fingerprint: 'fp', result: { ok: true, data: { replay: true } } }, createdAt: 'now',
+      });
+      await repository.execute({
+        kind: 'claimRuntime', workspaceId: 'ws', turnId: turn.id, ownerId: 'owner',
+        claimedAt: 'now', heartbeatAt: 'now', expiresAt: '2099-01-01T00:00:00.000Z',
+      });
+      const projection = await RepositoryProjection.load(repository, 'ws');
+      const wrapped = withRepositoryProjection(repository, projection);
+      expect(projection.getFile().operations?.[`${turn.id}:op`]?.result.data).toEqual({ replay: true });
+      expect(projection.getFile().runtimeClaims?.[turn.id]?.ownerId).toBe('owner');
+      await wrapped.execute({
+        kind: 'putCancelRequest', workspaceId: 'ws', turnId: turn.id,
+        request: { kind: 'interrupt', by: 'user', opId: 'cancel-op', at: 'now' },
+      });
+      expect(projection.getFile().cancelRequests?.[turn.id]?.opId).toBe('cancel-op');
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it('dispatches and settles with SQLite without a TaskStore', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-engine-repository-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
@@ -36,6 +82,148 @@ describe('TaskEngine repository-only boundary', () => {
       await expect(repository.getTurn('repository-turn')).resolves.toMatchObject({ status: 'succeeded' });
       await expect(repository.getRuntimeClaim('repository-turn')).resolves.toBeUndefined();
     } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('runs graph create/replay/conflict behavior through the SQLite projection', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-engine-graph-repository-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let engine: TaskEngine | undefined;
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const repository = new SqliteTaskRepository(client, 'ws');
+      await repository.execute({ kind: 'upsertWorkspace', workspaceId: 'ws', identityKey: 'engine-graph-repository', displayName: 'Engine graph repository', createdAt: 'now', lastOpenedAt: 'now' });
+      const credentials = new CredentialRegistry();
+      engine = await TaskEngine.loadAsync({
+        repository,
+        workspaceId: 'ws',
+        credentialRegistry: credentials,
+        makeBackend: (name) => ({
+          name,
+          capabilities: { supportsMCP: true, supportsReasoning: false, supportsDetailedToolEvents: false },
+          run: async function* () {},
+        }),
+        runTurn: async function* () {
+          await gate;
+          yield { type: 'turnCompleted' };
+        },
+        getTaskTypeRegistry: () => parseTaskTypeRegistry({
+          worker: { backend: 'grok', role: 'worker', briefKind: 'generic' },
+        }),
+      });
+      const started = await engine.startNewTask({ goal: 'coordinate via sqlite', backend: 'grok', role: 'coordinator' });
+      expect(started.ok).toBe(true);
+      if (!started.ok) return;
+      const { taskId, turnId } = started.value;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((await repository.getTurn(turnId))?.status === 'running') break;
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+      await expect(repository.getTurn(turnId)).resolves.toMatchObject({ status: 'running' });
+      const token = credentials.issue({
+        rootId: taskId,
+        callerTaskId: taskId,
+        turnId,
+        allowedActions: new Set([
+          'create_task', 'create_tasks', 'delegate_task', 'release_tasks', 'set_task_lifecycle',
+          'continue_child', 'cancel_tasks', 'answer_child_question', 'complete_task',
+        ]),
+        ttlMs: 60_000,
+      });
+      const context = credentials.verify(token)!;
+      const command = {
+        kind: 'create_task' as const,
+        opId: 'sqlite-create',
+        spec: { goal: 'sqlite child', taskType: 'worker', backend: 'grok', role: 'worker' as const },
+      };
+      await expect(engine.handleToolCall(context, 'create_task', command)).resolves.toMatchObject({ ok: true });
+      const childId = deriveEntityId(turnId, command.opId, 'task');
+      await expect(repository.getTask(childId)).resolves.toMatchObject({ parentId: taskId, releaseState: 'draft' });
+      await expect(engine.handleToolCall(context, 'create_task', command)).resolves.toMatchObject({ ok: true });
+      await expect(engine.handleToolCall(context, 'create_task', {
+        ...command,
+        spec: { ...command.spec, goal: 'different payload' },
+      })).resolves.toMatchObject({ ok: false, error: expect.stringContaining('conflict') });
+
+      await expect(engine.handleToolCall(context, 'create_tasks', {
+        kind: 'create_tasks', opId: 'sqlite-batch', specs: [
+          { localId: 'a', goal: 'batch a', taskType: 'worker' },
+          { localId: 'b', goal: 'batch b', taskType: 'worker' },
+        ],
+      })).resolves.toMatchObject({ ok: true });
+      const batchA = deriveEntityId(turnId, 'sqlite-batch', 'task:a');
+      const batchB = deriveEntityId(turnId, 'sqlite-batch', 'task:b');
+      await expect(engine.handleToolCall(context, 'cancel_tasks', {
+        kind: 'cancel_tasks', opId: 'sqlite-cancel-batch', childIds: [batchA, batchB],
+      })).resolves.toMatchObject({ ok: true });
+      await expect(repository.getTask(batchA)).resolves.toMatchObject({ lifecycle: 'cancelled' });
+      await expect(repository.getTask(batchB)).resolves.toMatchObject({ lifecycle: 'cancelled' });
+
+      await expect(engine.handleToolCall(context, 'release_tasks', {
+        kind: 'release_tasks', opId: 'sqlite-release', taskIds: [childId],
+      })).resolves.toMatchObject({ ok: true });
+      await expect(repository.getTask(childId)).resolves.toMatchObject({ releaseState: 'released' });
+      await expect(engine.handleToolCall(context, 'set_task_lifecycle', {
+        kind: 'set_task_lifecycle', opId: 'sqlite-seal', taskId: childId,
+        lifecycle: 'succeeded', result: 'first result',
+      })).resolves.toMatchObject({ ok: true });
+      await expect(repository.getTask(childId)).resolves.toMatchObject({ lifecycle: 'succeeded' });
+      await expect(engine.handleToolCall(context, 'continue_child', {
+        kind: 'continue_child', opId: 'sqlite-continue', childId, instruction: 'revise result',
+      })).resolves.toMatchObject({ ok: true });
+      const continuationId = deriveEntityId(turnId, 'sqlite-continue', 'turn');
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((await repository.getTurn(continuationId))?.status === 'running') break;
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+      await expect(repository.getTurn(continuationId)).resolves.toMatchObject({ status: 'running' });
+      const childToken = credentials.issue({
+        rootId: taskId, callerTaskId: childId, turnId: continuationId,
+        allowedActions: new Set(['complete_task']), ttlMs: 60_000,
+      });
+      await expect(engine.handleToolCall(credentials.verify(childToken)!, 'complete_task', {
+        kind: 'complete_task', opId: 'sqlite-child-complete', result: 'revised result',
+      })).resolves.toMatchObject({ ok: true });
+
+      await expect(engine.handleToolCall(context, 'delegate_task', {
+        kind: 'delegate_task', opId: 'sqlite-question-child',
+        spec: { goal: 'ask parent', taskType: 'worker' },
+      })).resolves.toMatchObject({ ok: true });
+      const questionChildId = deriveEntityId(turnId, 'sqlite-question-child', 'task');
+      let questionTurnId: string | undefined;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const turns = await repository.listTurns(questionChildId);
+        const live = turns.find((turn) => turn.status === 'running');
+        if (live) { questionTurnId = live.id; break; }
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+      expect(questionTurnId).toBeTruthy();
+      const questionToken = credentials.issue({
+        rootId: taskId, callerTaskId: questionChildId, turnId: questionTurnId!,
+        allowedActions: new Set(['ask_parent', 'complete_task']), ttlMs: 60_000,
+      });
+      const questionContext = credentials.verify(questionToken)!;
+      const asked = await engine.handleToolCall(questionContext, 'ask_parent', {
+        kind: 'ask_parent', opId: 'sqlite-ask', questions: [{ prompt: 'Which option?' }],
+      });
+      expect(asked).toMatchObject({ ok: true });
+      if (!asked.ok) return;
+      const questionId = (asked.result as { questionId: string }).questionId;
+      await expect(repository.getTask(taskId)).resolves.toMatchObject({
+        pendingChildQuestions: { [questionId]: { fromChildId: questionChildId } },
+      });
+      await expect(engine.handleToolCall(context, 'answer_child_question', {
+        kind: 'answer_child_question', opId: 'sqlite-answer', questionId, answers: ['option A'],
+      })).resolves.toMatchObject({ ok: true });
+      expect((await repository.getTask(taskId))?.pendingChildQuestions?.[questionId]).toBeUndefined();
+      await expect(repository.listSubtree(taskId)).resolves.toHaveLength(5);
+    } finally {
+      release();
+      await engine?.whenIdle();
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });
     }

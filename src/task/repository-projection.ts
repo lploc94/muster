@@ -4,6 +4,7 @@ import type {
   RepositoryCommandResult,
   TaskRepository,
 } from './repository';
+import { isGraphCommand } from './repository';
 import type {
   MusterTask,
   TaskStoreFile,
@@ -66,6 +67,17 @@ export class RepositoryProjection {
       if (!liveIds.has(id)) this.removeTask(id);
     }
     await Promise.all(tasks.map((task) => this.refreshTask(task.id, task)));
+    const activeTurnIds = Object.values(this.file.turns)
+      .filter((turn) => turn.status === 'queued' || turn.status === 'running' || turn.status === 'waiting_user')
+      .map((turn) => turn.id);
+    const [operations, cancelRequests, runtimeClaims] = await Promise.all([
+      this.source.listOperationsForTurns?.(activeTurnIds) ?? Promise.resolve([]),
+      this.source.listCancelRequests?.() ?? Promise.resolve([]),
+      this.source.listRuntimeClaims?.() ?? Promise.resolve([]),
+    ]);
+    this.file.operations = Object.fromEntries(operations.map(({ ledgerKey, entry }) => [ledgerKey, entry]));
+    this.file.cancelRequests = Object.fromEntries(cancelRequests.map(({ turnId, request }) => [turnId, request]));
+    this.file.runtimeClaims = Object.fromEntries(runtimeClaims.map((claim) => [claim.turnId, claim]));
     this.file.revision = await (this.source.getWorkspaceRevision?.() ?? Promise.resolve(this.file.revision));
   }
 
@@ -96,13 +108,15 @@ export class RepositoryProjection {
       await this.refreshRevision();
       return;
     }
-    this.applyCoordination(command);
     if (command.kind === 'clearHistory' || command.kind === 'deleteTask' || command.kind === 'deleteTaskSubtreeIfIdle') {
       await this.refreshAll();
       return;
     }
     const ids = this.affectedTaskIds(command);
     await Promise.all([...ids].map((id) => this.refreshTask(id)));
+    // Apply coordination rows after aggregate refresh: refreshTask removes the
+    // previous turn-bound coordination projection before loading current rows.
+    this.applyCoordination(command);
     await this.refreshRevision();
   }
 
@@ -121,6 +135,17 @@ export class RepositoryProjection {
     if ('messages' in command && Array.isArray(command.messages)) for (const message of command.messages) ids.add(message.taskId);
     if ('mutations' in command && Array.isArray(command.mutations)) for (const mutation of command.mutations) ids.add(mutation.taskId);
     if ('rootTaskId' in command && typeof command.rootTaskId === 'string') ids.add(command.rootTaskId);
+    if (isGraphCommand(command)) {
+      for (const id of command.deleteTaskIds ?? []) ids.add(id);
+      for (const id of command.deleteTurnIds ?? []) {
+        const taskId = this.file.turns[id]?.taskId;
+        if (taskId) ids.add(taskId);
+      }
+      for (const id of command.deleteMessageIds ?? []) {
+        const taskId = this.file.messages[id]?.taskId;
+        if (taskId) ids.add(taskId);
+      }
+    }
     if ('turnId' in command && typeof command.turnId === 'string') {
       const taskId = this.file.turns[command.turnId]?.taskId;
       if (taskId) ids.add(taskId);
@@ -130,6 +155,36 @@ export class RepositoryProjection {
 
   private applyCoordination(command: RepositoryCommand): void {
     switch (command.kind) {
+      case 'createChildTask':
+      case 'delegateChildTask':
+      case 'createChildTaskBatch':
+      case 'delegateChildTaskBatch':
+      case 'releaseChildTasks':
+      case 'continueChildTask':
+      case 'cancelChildTasks':
+      case 'interruptChildTask':
+      case 'cancelChildTask':
+      case 'setChildTaskLifecycle':
+      case 'waitForChildTasks':
+      case 'completeGraphTask':
+      case 'failGraphTask':
+      case 'askParent':
+      case 'answerChildQuestion':
+      case 'consumeCancelRequest':
+        if (command.operation) {
+          this.file.operations![command.operation.ledgerKey] = command.operation.entry;
+        }
+        for (const key of command.deleteOperationKeys ?? []) delete this.file.operations![key];
+        for (const entry of command.cancelRequests ?? []) {
+          this.file.cancelRequests![entry.turnId] = entry.request;
+        }
+        for (const turnId of command.deleteCancelRequestTurnIds ?? []) {
+          delete this.file.cancelRequests![turnId];
+        }
+        for (const turnId of command.deleteRuntimeClaimTurnIds ?? []) {
+          delete this.file.runtimeClaims![turnId];
+        }
+        break;
       case 'putOperation':
       case 'claimOperation':
         this.file.operations![command.ledgerKey] = command.entry;

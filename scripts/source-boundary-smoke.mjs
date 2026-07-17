@@ -167,10 +167,13 @@ function expectCiWorkflowContract(workflowText, failures) {
     failures,
     `Expected ${workflowPath} to run \`npm test\` when using \`npm run compile\` (reject compile-only CI).`,
   );
+  // A VS Code-version matrix is intentional for the packaged Extension Host
+  // compatibility smoke (old engine rejection + minimum/current hosts). The
+  // invariant here is narrower: CI must not fan out the Node runtime itself.
   expectCondition(
-    !hasYamlLine(workflowText, /^\s*matrix:\s*(?:#.*)?$/) && !/node-version:\s*\[/.test(workflowText),
+    !/node-version\s*:\s*\[/.test(workflowText),
     failures,
-    `Expected ${workflowPath} to use one Node 24 LTS environment, not a Node version matrix.`,
+    `Expected ${workflowPath} to use one Node 24 LTS runtime, not a node-version matrix.`,
   );
 }
 

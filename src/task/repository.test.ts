@@ -123,7 +123,7 @@ describe('SqliteTaskRepository', () => {
           fingerprint: 'graph-fingerprint', result: { ok: true, data: { taskId: child.id, turnId: turn.id } },
         }, createdAt: '2026-07-16T00:00:01.000Z' };
         const command = {
-          kind: 'applyGraphMutation' as const, workspaceId: 'ws', expectedTasks: [{ id: root.id, revision: root.revision }],
+          kind: 'createChildTask' as const, workspaceId: 'ws', expectedTasks: [{ id: root.id, revision: root.revision }],
           insertTaskIds: [child.id], tasks: [child], insertTurnIds: [turn.id], turns: [turn],
           insertMessageIds: [message.id], messages: [message], operation,
         };
@@ -167,14 +167,23 @@ describe('SqliteTaskRepository', () => {
           await client.run(`INSERT INTO resource_claims (workspace_id, resource_key, task_id, turn_id, claimed_at) VALUES (?,?,?,?,?)`, ['ws', 'git', task.id, turn.id, 'now']);
         }
         const nextTurn = { ...turn, status: 'cancelled' as const, finishedAt: '2026-07-16T00:00:03.000Z' };
-        await expect(repository.execute({
-          kind: 'applyGraphMutation', workspaceId: 'ws', expectedTasks: [{ id: task.id, revision: task.revision }],
+        const consume = {
+          kind: 'consumeCancelRequest', workspaceId: 'ws', expectedTasks: [{ id: task.id, revision: task.revision }],
           expectedTurns: [{ id: turn.id, status: 'running' }], expectedRuntimeClaims: [{ turnId: turn.id, ownerId: 'owner' }],
           expectedCancelRequests: [{ turnId: turn.id, kind: 'cancel', opId: request.opId }],
           tasks: [], turns: [nextTurn], messages: [], deleteOperationKeys: [],
           deleteCancelRequestTurnIds: [turn.id], deleteRuntimeClaimTurnIds: [turn.id],
           deleteSessionClaimTurnIds: [turn.id], deleteResourceClaimTurnIds: [turn.id],
-        })).resolves.toMatchObject({ changed: true });
+        } as const;
+        await expect(repository.execute({
+          ...consume,
+          expectedTurns: [{ id: turn.id, status: 'waiting_user' as const }],
+        })).resolves.toMatchObject({ changed: false });
+        await expect(repository.getCancelRequest(turn.id)).resolves.toEqual(request);
+        await expect(repository.getRuntimeClaim(turn.id)).resolves.toMatchObject({ ownerId: 'owner' });
+        await expect(repository.getTurn(turn.id)).resolves.toMatchObject({ status: 'running' });
+
+        await expect(repository.execute(consume)).resolves.toMatchObject({ changed: true });
         await expect(repository.getCancelRequest(turn.id)).resolves.toBeUndefined();
         await expect(repository.getRuntimeClaim(turn.id)).resolves.toBeUndefined();
         await expect(repository.getTurn(turn.id)).resolves.toMatchObject({ status: 'cancelled' });
@@ -661,6 +670,73 @@ describe('SqliteTaskRepository', () => {
     }
   }, 20_000);
 
+  it('keeps live transcript rows byte-for-byte during retention on both adapters', async () => {
+    const jsonPath = `/tmp/muster-repository-live-retention-${Date.now()}-${Math.random()}.json`;
+    const jsonStore = TaskStore.load({ filePath: jsonPath });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-live-retention-'));
+    const client = new DbClient({
+      workerPath: path.join(__dirname, 'sqlite', 'worker.ts'),
+      execArgv: ['--import', 'tsx'],
+    });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      await client.run(
+        `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
+         VALUES (?,?,?,?,?)`,
+        ['ws', 'live-retention', 'Live retention', 'now', 'now'],
+      );
+      const repositories: TaskRepository[] = [
+        new JsonTaskRepository(jsonStore, 'ws'),
+        new SqliteTaskRepository(client, 'ws'),
+      ];
+      const oversized = 'live-output'.repeat(20);
+      for (const [index, repository] of repositories.entries()) {
+        const task = makeTask(`live-retention-task-${index}`);
+        const turn = {
+          id: `live-retention-turn-${index}`, taskId: task.id, sequence: 1,
+          status: 'running' as const, trigger: 'engine' as const, inputs: [],
+          createdAt: '2026-07-16T00:00:01.000Z', startedAt: '2026-07-16T00:00:02.000Z',
+        };
+        await repository.execute({ kind: 'createTask', workspaceId: 'ws', task });
+        await repository.execute({ kind: 'createTurn', workspaceId: 'ws', turn });
+        await repository.execute({
+          kind: 'appendTranscriptBatch', workspaceId: 'ws', taskId: task.id,
+          messages: [{
+            id: `live-retention-message-${index}`, taskId: task.id, turnId: turn.id,
+            role: 'assistant', content: oversized, state: 'partial', order: 0,
+            createdAt: '2026-07-16T00:00:03.000Z',
+          }],
+          toolCalls: [{
+            id: `${turn.id}:tool`, taskId: task.id, turnId: turn.id, toolCallId: 'tool',
+            order: 1, name: 'read', status: 'running', output: oversized,
+            createdAt: '2026-07-16T00:00:03.000Z', updatedAt: '2026-07-16T00:00:04.000Z',
+          }],
+          reasoning: [{
+            id: turn.id, taskId: task.id, turnId: turn.id, content: oversized,
+            createdAt: '2026-07-16T00:00:03.000Z', updatedAt: '2026-07-16T00:00:04.000Z',
+          }],
+        });
+
+        await expect(repository.execute({
+          kind: 'applyRetentionPolicy', workspaceId: 'ws', taskId: task.id,
+          keepLatestTurns: 1, maxStoredOutputChars: 30,
+        })).resolves.toMatchObject({ changed: false });
+        await expect(repository.getTurn(turn.id)).resolves.toMatchObject({ status: 'running' });
+        await expect(repository.listMessages(task.id)).resolves.toMatchObject([{ content: oversized }]);
+        await expect(repository.listToolCalls(task.id)).resolves.toEqual(expect.arrayContaining([
+          expect.objectContaining({ id: `${turn.id}:tool`, output: oversized }),
+        ]));
+        await expect(repository.listReasoning(task.id)).resolves.toEqual(expect.arrayContaining([
+          expect.objectContaining({ id: turn.id, content: oversized }),
+        ]));
+      }
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+      try { fs.unlinkSync(jsonPath); } catch { /* test cleanup */ }
+    }
+  }, 20_000);
+
   it('hydrates domain DTOs from promoted columns and compatibility payloads', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-sqlite-'));
     const dbPath = path.join(dir, 'muster.sqlite3');
@@ -802,6 +878,7 @@ describe('SqliteTaskRepository', () => {
       const consumer = makeTask('consumer');
       consumer.dependencies = [{ taskId: producer.id, requiredOutcome: 'succeeded', onUnsatisfied: 'block' }];
       consumer.description = 'consumer payload';
+      consumer.wait = { kind: 'external', key: 'approval', message: 'waiting for approval' };
       consumer.releaseState = 'released';
       await repository.execute({ kind: 'createTask', workspaceId: 'ws', task: producer });
       await repository.execute({ kind: 'createTask', workspaceId: 'ws', task: consumer });
@@ -859,7 +936,11 @@ describe('SqliteTaskRepository', () => {
       expect(await client.all('SELECT * FROM turn_inputs WHERE workspace_id = ? AND turn_id = ?', ['ws', turn.id])).toHaveLength(2);
 
       const envelope = await repository.readEnvelopeForMigration();
-      expect(envelope.tasks.consumer).toMatchObject({ dependencies: consumer.dependencies, description: consumer.description });
+      expect(envelope.tasks.consumer).toMatchObject({
+        dependencies: consumer.dependencies,
+        description: consumer.description,
+        wait: consumer.wait,
+      });
       expect(envelope.turns[turn.id]).toMatchObject({ inputs: turn.inputs });
       expect(envelope.messages[message.id]).toMatchObject({ agentContent: message.agentContent });
       expect(envelope.toolCalls?.['turn-1:tool-1']).toMatchObject({ output: 'ok' });
@@ -1100,27 +1181,47 @@ describe('SqliteTaskRepository', () => {
         trigger: 'user' as const, inputs: [], createdAt: '2026-07-16T00:01:00.000Z',
       };
       await repository.execute({ kind: 'createTurn', workspaceId: 'ws', turn: openTurn });
+      const liveTurn = {
+        id: 'open-live-turn', taskId: open.id, sequence: 2, status: 'running' as const,
+        trigger: 'engine' as const, inputs: [], createdAt: '2026-07-16T00:02:00.000Z',
+        startedAt: '2026-07-16T00:02:01.000Z',
+      };
+      await repository.execute({ kind: 'createTurn', workspaceId: 'ws', turn: liveTurn });
       const oversized = 'x'.repeat(100);
       await repository.execute({
         kind: 'appendTranscriptBatch', workspaceId: 'ws', taskId: open.id,
-        messages: [{ id: 'open-assistant', taskId: open.id, turnId: openTurn.id, role: 'assistant', content: oversized, state: 'complete', order: 0, createdAt: openTurn.createdAt }],
-        toolCalls: [{ id: 'open-tool', taskId: open.id, turnId: openTurn.id, toolCallId: 'tool', order: 1, name: 'read', status: 'success', output: oversized, createdAt: openTurn.createdAt, updatedAt: openTurn.createdAt }],
-        reasoning: [{ id: 'open-reasoning', taskId: open.id, turnId: openTurn.id, content: oversized, createdAt: openTurn.createdAt, updatedAt: openTurn.createdAt }],
+        messages: [
+          { id: 'open-assistant', taskId: open.id, turnId: openTurn.id, role: 'assistant', content: oversized, state: 'complete', order: 0, createdAt: openTurn.createdAt },
+          { id: 'live-assistant', taskId: open.id, turnId: liveTurn.id, role: 'assistant', content: oversized, state: 'partial', order: 0, createdAt: liveTurn.createdAt },
+        ],
+        toolCalls: [
+          { id: 'open-tool', taskId: open.id, turnId: openTurn.id, toolCallId: 'tool', order: 1, name: 'read', status: 'success', output: oversized, createdAt: openTurn.createdAt, updatedAt: openTurn.createdAt },
+          { id: 'live-tool', taskId: open.id, turnId: liveTurn.id, toolCallId: 'live-tool', order: 1, name: 'read', status: 'running', output: oversized, createdAt: liveTurn.createdAt, updatedAt: liveTurn.createdAt },
+        ],
+        reasoning: [
+          { id: 'open-reasoning', taskId: open.id, turnId: openTurn.id, content: oversized, createdAt: openTurn.createdAt, updatedAt: openTurn.createdAt },
+          { id: 'live-reasoning', taskId: open.id, turnId: liveTurn.id, content: oversized, createdAt: liveTurn.createdAt, updatedAt: liveTurn.createdAt },
+        ],
       });
       await expect(repository.execute({
         kind: 'applyRetention', workspaceId: 'ws', taskId: open.id, keepLatestTurns: 1,
         maxStoredOutputChars: 30,
       })).resolves.toMatchObject({ changed: true });
-      await expect(repository.listTurns(open.id)).resolves.toMatchObject([{ id: openTurn.id }]);
+      await expect(repository.listTurns(open.id)).resolves.toMatchObject([
+        { id: openTurn.id }, { id: liveTurn.id, status: 'running' },
+      ]);
       await expect(repository.listMessages(open.id)).resolves.toMatchObject([
         { id: 'open-assistant', content: expect.stringContaining('[output truncated by retention policy]') },
+        { id: 'live-assistant', content: oversized },
       ]);
-      await expect(repository.listToolCalls(open.id)).resolves.toMatchObject([
-        { id: 'open-tool', output: expect.stringContaining('[output truncated by retention policy]') },
-      ]);
-      await expect(repository.listReasoning(open.id)).resolves.toMatchObject([
-        { id: 'open-reasoning', content: expect.stringContaining('[output truncated by retention policy]') },
-      ]);
+      await expect(repository.listToolCalls(open.id)).resolves.toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: 'open-tool', output: expect.stringContaining('[output truncated by retention policy]') }),
+        expect.objectContaining({ id: 'live-tool', output: oversized }),
+      ]));
+      await expect(repository.listReasoning(open.id)).resolves.toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: 'open-reasoning', content: expect.stringContaining('[output truncated by retention policy]') }),
+        expect.objectContaining({ id: 'live-reasoning', content: oversized }),
+      ]));
     } finally {
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });
