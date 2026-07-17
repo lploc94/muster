@@ -89,12 +89,11 @@ import {
   titleFromMarkdownPath,
 } from './host/markdown-file-presentation';
 import { enumerateModels, type BackendModels } from './backends/model-catalog';
-import { SESSION_MIGRATION_MARKER, migrateLegacySessions } from './task/migration-sessions';
 import { type RetentionConfig } from './task/retention';
 import { TaskEngine, type EngineEvent } from './task/engine';
 import type { HostEnvironmentSnapshot } from './task/host-context';
-import { TaskStore, computeAffectedTaskIds } from './task/store';
-import { JsonTaskRepository, type TaskRepository } from './task/repository';
+import type { TaskReadPort } from './task/store-port';
+import { SqliteTaskRepository, type TaskRepository } from './task/repository';
 import { DbClient, resolveWorkerPath } from './task/sqlite/client';
 import { probeNodeSqlite } from './task/sqlite/probe';
 import { WorkspaceRegistry } from './task/sqlite/workspace-registry';
@@ -118,11 +117,10 @@ let musterDebugChannel: vscode.OutputChannel | undefined;
 let credentialRegistry: CredentialRegistry | undefined;
 let bridgeServer: MusterBridgeServer | undefined;
 let taskEngine: TaskEngine | undefined;
-let taskStore: TaskStore | undefined;
+let taskStore: TaskReadPort | undefined;
 let taskRepository: TaskRepository | undefined;
-let storePath: string | undefined;
 let workspaceRoot: string | undefined;
-/** SQLite stays shadow/registry-only until the Phase 5 migration cutover. */
+/** SQLite is the only task storage source. */
 let sqliteClient: DbClient | undefined;
 let sqliteWorkspaceId: string | undefined;
 
@@ -363,23 +361,13 @@ function getRetentionConfig(): RetentionConfig {
   };
 }
 
-function runSessionMigration(context: vscode.ExtensionContext, wsRoot?: string): void {
-  if (!wsRoot) {
-    return;
-  }
-  const result = migrateLegacySessions(wsRoot);
-  if (result.action !== 'none') {
-    void context.workspaceState.update(SESSION_MIGRATION_MARKER, true);
-    if (result.message) {
-      void vscode.window.showInformationMessage(result.message);
-    }
-  }
-}
-
 let retentionInFlight: Promise<void> | undefined;
 
 function repositoryWorkspaceId(): string {
-  return sqliteWorkspaceId ?? 'legacy-workspace';
+  if (!sqliteWorkspaceId) {
+    throw new Error('SQLite workspace is not ready');
+  }
+  return sqliteWorkspaceId;
 }
 
 /** Apply retention through named repository commands; never rewrite the host envelope. */
@@ -1085,23 +1073,10 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   }
 
   handleExternalStoreChange(): void {
-    if (!taskStore) {
-      return;
-    }
-    taskStore.reload();
-    const file = taskStore.getFile();
-    if (file.revision <= lastObservedRevision) {
-      return;
-    }
-    const previous = lastObservedFile;
-    if (!previous) {
-      this.seedObservation(file);
-      return;
-    }
-    // Union-key diff (deletion-aware): a task is affected when any of its
-    // tasks/turns/messages/toolCalls/reasoning records was added, changed, OR removed.
-    const affected = computeAffectedTaskIds(previous, file);
-    this.reprojectChanged(file, affected, previous);
+    // Filesystem-store notifications no longer exist. Keep this narrow hook until
+    // P4-W10 replaces it with revision polling so restored provider tests can ask
+    // for a bounded refresh without reaching a JSON reload path.
+    this.postSnapshot(this.focusedTaskId);
   }
 
   focusTask(taskId: string): void {
@@ -2541,67 +2516,45 @@ export async function activate(context: vscode.ExtensionContext) {
   // GUI-launched editor (minimal PATH) can both detect and actually run the CLIs.
   await installAugmentedPath();
 
-  // Feature-probe node:sqlite at activation (plan §3.5). While the JSON store is
-  // still the source of truth this is ADVISORY only: a host that satisfies
-  // engines.vscode ^1.101 but lacks node:sqlite (an exotic fork/repackaging) must
-  // not be bricked when SQLite is not yet used. We surface a clear diagnostic now
-  // so the gap is visible before the Phase 5 cutover, at which point this becomes a
-  // hard gate (SQLite becomes the only writable source).
+  // SQLite is the only writable source. A host that advertises our minimum VS Code
+  // version but omits node:sqlite cannot safely activate the task engine.
   const sqliteProbe = probeNodeSqlite();
   if (!sqliteProbe.available) {
     debugMuster('sqlite.probe.unavailable', { reason: sqliteProbe.reason });
+    const message = `Muster requires node:sqlite in the VS Code extension host: ${sqliteProbe.reason}`;
+    void vscode.window.showErrorMessage(message);
+    throw new Error(message);
   }
 
   const wsFolder = vscode.workspace.workspaceFolders?.[0];
   workspaceRoot = wsFolder?.uri.fsPath;
-  storePath = wsFolder
-    ? path.join(wsFolder.uri.fsPath, '.muster-tasks.json')
-    : path.join(context.globalStorageUri.fsPath, '.muster-tasks.json');
-
-  // Ensure the store's parent directory exists before any store/lock IO. Without
-  // a workspace folder the path falls back to globalStorage, which VS Code does not
-  // create eagerly — otherwise lock creation fails with ENOENT and surfaces as the
-  // misleading "could not acquire store lock".
-  fs.mkdirSync(path.dirname(storePath), { recursive: true });
-
-  // Phase 1 registry runtime: open the single profile/authority database under
-  // globalStorage and resolve the current window to its durable UUID. JSON remains
-  // the writable task source until the later migration/cutover gate; this does not
-  // dual-write task state. Keeping the registry live now verifies worker packaging,
-  // WAL connection setup and workspace identity behavior in real extension hosts.
-  if (sqliteProbe.available) {
-    const candidate = new DbClient({ workerPath: resolveWorkerPath() });
-    try {
-      fs.mkdirSync(context.globalStorageUri.fsPath, { recursive: true });
-      await candidate.open(path.join(context.globalStorageUri.fsPath, 'muster.sqlite3'));
-      const workspace = await new WorkspaceRegistry(candidate).getOrCreate(
-        resolveCurrentWorkspaceIdentity(context),
-        new Date().toISOString(),
-      );
-      sqliteClient = candidate;
-      sqliteWorkspaceId = workspace.id;
-      debugMuster('sqlite.registry.ready', {
-        workspaceId: workspace.id,
-      });
-      context.subscriptions.push({
-        dispose: () => {
-          const current = sqliteClient;
-          sqliteClient = undefined;
-          sqliteWorkspaceId = undefined;
-          void current?.close();
-        },
-      });
-    } catch (error) {
-      await candidate.close();
-      // Advisory through Phase 4: JSON remains untouched and usable, but leave a
-      // clear diagnostic so a DB/worker packaging issue is not silently hidden.
-      debugMuster('sqlite.registry.unavailable', {
-        reason: error instanceof Error ? error.message : String(error),
-      });
-    }
+  const candidate = new DbClient({ workerPath: resolveWorkerPath() });
+  try {
+    fs.mkdirSync(context.globalStorageUri.fsPath, { recursive: true });
+    await candidate.open(path.join(context.globalStorageUri.fsPath, 'muster.sqlite3'));
+    const workspace = await new WorkspaceRegistry(candidate).getOrCreate(
+      resolveCurrentWorkspaceIdentity(context),
+      new Date().toISOString(),
+    );
+    sqliteClient = candidate;
+    sqliteWorkspaceId = workspace.id;
+    debugMuster('sqlite.registry.ready', { workspaceId: workspace.id });
+    context.subscriptions.push({
+      dispose: () => {
+        const current = sqliteClient;
+        sqliteClient = undefined;
+        sqliteWorkspaceId = undefined;
+        void current?.close();
+      },
+    });
+  } catch (error) {
+    await candidate.close();
+    const reason = error instanceof Error ? error.message : String(error);
+    debugMuster('sqlite.registry.unavailable', { reason });
+    const message = `Muster could not open its SQLite database: ${reason}`;
+    void vscode.window.showErrorMessage(message);
+    throw new Error(message);
   }
-
-  runSessionMigration(context, workspaceRoot);
 
   const provider = new MusterChatProvider(context.extensionUri, context.globalState);
   const revealLinkedChat = async (ownerTaskId: string): Promise<boolean> => {
@@ -3091,37 +3044,10 @@ export async function activate(context: vscode.ExtensionContext) {
     });
     const { port } = await bridgeServer.listen();
 
-    taskStore = TaskStore.load({
-      filePath: storePath,
-      onCommit: (file, affectedTaskIds) => {
-        try {
-          provider.reprojectChanged(file, affectedTaskIds);
-          scheduleRetention();
-        } catch {
-          // best-effort projection
-        }
-      },
-    });
-    taskRepository = new JsonTaskRepository(taskStore, sqliteWorkspaceId ?? 'legacy-workspace');
-    scheduleRetention();
-    lastObservedFile = JSON.parse(JSON.stringify(taskStore.getFile())) as TaskStoreFile;
-    lastObservedRevision = taskStore.getFile().revision;
-
-    if (taskStore.isCorrupt()) {
-      // The store could not be read (corrupt or written by a newer version). It is
-      // preserved and never overwritten; run in recovery mode instead of bricking.
-      const info = taskStore.getRecoveryInfo();
-      void vscode.window.showWarningMessage(
-        `Muster: the task store could not be read. Your data is preserved at ${
-          info?.backupPath ?? 'a .corrupt backup'
-        }. Muster is in recovery mode and will not overwrite it — remove or repair the file to resume.`,
-      );
-    }
-
-    taskEngine = TaskEngine.load({
-      store: taskStore,
-      repository: taskRepository,
-      workspaceId: sqliteWorkspaceId ?? 'legacy-workspace',
+    const sqliteRepository = new SqliteTaskRepository(candidate, repositoryWorkspaceId());
+    taskEngine = await TaskEngine.loadAsync({
+      repository: sqliteRepository,
+      workspaceId: repositoryWorkspaceId(),
       makeBackend,
       askBridge,
       credentialRegistry,
@@ -3156,6 +3082,13 @@ export async function activate(context: vscode.ExtensionContext) {
         }
       },
     });
+    // Share the engine's write-through projection wrapper with host commands so
+    // every successful repository mutation is visible to synchronous UI selectors.
+    taskStore = taskEngine.getReadModel();
+    taskRepository = taskEngine.getRepository();
+    scheduleRetention();
+    lastObservedFile = JSON.parse(JSON.stringify(taskStore.getFile())) as TaskStoreFile;
+    lastObservedRevision = taskStore.getFile().revision;
 
     context.subscriptions.push(
       vscode.workspace.onDidGrantWorkspaceTrust(() => {
@@ -3166,18 +3099,6 @@ export async function activate(context: vscode.ExtensionContext) {
         }
       }),
     );
-
-    if (storePath) {
-      const storeDir = path.dirname(storePath);
-      const storeFileName = path.basename(storePath);
-      const watcher = vscode.workspace.createFileSystemWatcher(
-        new vscode.RelativePattern(storeDir, storeFileName),
-      );
-      const onStoreChange = () => provider.handleExternalStoreChange();
-      watcher.onDidChange(onStoreChange);
-      watcher.onDidCreate(onStoreChange);
-      context.subscriptions.push(watcher);
-    }
 
     context.subscriptions.push({
       dispose: () => {

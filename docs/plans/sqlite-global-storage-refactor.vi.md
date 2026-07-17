@@ -5,18 +5,31 @@
 **IN PROGRESS — chưa cutover production.**
 Cập nhật: 2026-07-17
 
-- Phase 1: **đã qua gate** — worker/RPC, schema migration, global-storage registry,
-  lock/crash/concurrent-migration checks, packaged desktop smoke trên minimum/current
+- Phase 1: **đã qua gate** — worker/RPC, schema bootstrap, global-storage registry,
+  lock/crash/concurrent-open checks, packaged desktop smoke trên minimum/current
   host, old-host refusal và Remote SSH evidence đều xanh.
 - Phase 2: **đã hoàn tất** — host/engine/scheduler/lifecycle/graph/handoff/retention
-  đi qua repository boundary và named commands; direct runtime commit ngoài JSON
-  compatibility adapter bằng 0.
-- Phase 3: **đã qua parity gate** — dual-adapter behavior suites, contention/replay/
+  đi qua repository boundary và named commands; direct runtime commit bằng 0.
+- Phase 3: **đã qua parity gate** — SQLite behavior suites, contention/replay/
   conflict/orphan/retention checks, bounded snapshot query, source-boundary audit và
   transcript benchmark đã chạy; entity/command matrices phản ánh trạng thái thực tế.
-- Phase 4 chưa bắt đầu. Phase 5/6 chưa bắt đầu; JSON vẫn là compatibility/source path
-  cho đến migration/cutover có chủ đích. Kết quả Wave 10 được ghi tại
+- Phase 4 bắt đầu bằng **SQLite-only cutover + xóa legacy JSON path** theo quyết định
+  dev-phase ngày 2026-07-17. Không import dữ liệu cũ và không giữ backward compatibility.
+  Kết quả Wave 10 được ghi tại
   [`sqlite-phase3-gate-evidence.vi.md`](./sqlite-phase3-gate-evidence.vi.md).
+
+### Quyết định dev-phase: SQLite-only, không chuyển dữ liệu cũ
+
+- `globalStorageUri/muster.sqlite3` là writable source duy nhất ngay từ wave đầu Phase 4.
+- Không discover, đọc, import, shadow-verify, backup hay ghi `.muster-tasks.json`.
+- Không giữ `JsonTaskRepository`, filesystem `TaskStore`, sync engine constructor hoặc
+  dual-adapter test matrix sau wave cleanup.
+- Không hỗ trợ protocol cũ: host và webview chỉ chấp nhận đúng protocol version hiện tại.
+  Mismatch vẫn hiện reload banner để xử lý stale webview asset, không có downgrade path.
+- Không chuyển dữ liệu dev đã tồn tại. Khi schema dev không tương thích, fail rõ và yêu
+  cầu reset database; tuyệt đối không silently reinterpret row cũ.
+- Schema versioning/transactional DDL vẫn được giữ cho correctness của database hiện tại;
+  nó không phải cam kết chuyển dữ liệu của release cũ.
 
 ## 1. Kết quả sản phẩm mong muốn
 
@@ -26,11 +39,11 @@ Cập nhật: 2026-07-17
 - Conversation/task dài không còn làm mỗi commit clone, parse và ghi lại toàn bộ store.
 - Mở workspace chỉ đọc metadata cần thiết; transcript được phân trang.
 - Streaming dùng batch write và incremental UI patch, không rebuild/gửi lại toàn bộ snapshot cho mỗi chunk.
-- Có migration an toàn từ `.muster-tasks.json`, có backup và có thể retry; không mất dữ liệu khi upgrade bị gián đoạn.
+- Không có storage sidecar/legacy path: runtime chỉ đọc và ghi SQLite.
 
 ## 2. Hiện trạng và bottleneck
 
-Hiện tại extension chọn store tại:
+Trước refactor extension từng chọn store tại:
 
 ```text
 <workspace>/.muster-tasks.json
@@ -38,7 +51,7 @@ Hiện tại extension chọn store tại:
 
 hoặc `context.globalStorageUri/.muster-tasks.json` khi không có workspace folder.
 
-`TaskStore.commit()` hiện:
+Filesystem `TaskStore.commit()` cũ từng:
 
 1. lấy cross-process file lock;
 2. đọc và parse toàn bộ JSON từ disk;
@@ -75,7 +88,7 @@ muster.sqlite3-shm
 |---|---|
 | Tasks, dependencies, turns, messages, queue | SQLite |
 | Reasoning, tool calls/results, operations, receipts | SQLite |
-| Session/runtime bindings, asks, handoffs, migration state | SQLite |
+| Session/runtime bindings, asks, handoffs | SQLite |
 | User configuration | VS Code Settings |
 | API keys, access tokens, credentials | VS Code SecretStorage |
 | Binary/file artifact do Muster sở hữu | SQLite BLOB + metadata; không tạo sidecar data store |
@@ -115,10 +128,10 @@ PRAGMA busy_timeout = 5000;
 - Transaction ghi phải ngắn.
 - Không giữ transaction trong lúc gọi backend hoặc chờ user.
 - Scheduler claim/promote dùng transaction có điều kiện, không dùng read-then-write ngoài transaction.
-- Mọi migration schema dùng `PRAGMA user_version` và transaction.
-- Set/verify một `PRAGMA application_id` riêng của Muster trước khi đọc schema. Schema
-  migration được serialize bằng exclusive migration transaction; process thua race phải
-  reopen/verify version, không chạy lại DDL dựa trên state cũ.
+- Schema bootstrap/version check dùng `PRAGMA user_version` và transaction.
+- Set/verify một `PRAGMA application_id` riêng của Muster trước khi đọc schema. DDL được
+  serialize bằng exclusive transaction; process thua race phải reopen/verify version,
+  không chạy lại DDL dựa trên state cũ.
 - Mọi SQL value dùng bound parameter; không nội suy content/path vào SQL.
 - Checkpoint WAL chỉ chạy khi connection idle; không `VACUUM` trong activation path.
 
@@ -151,14 +164,13 @@ Lợi ích so với `better-sqlite3`:
 - DB vẫn chạy trong worker thread vì `DatabaseSync` là synchronous;
 - CI/Extension Host test chạy trên minimum VS Code 1.101 và stable VS Code hiện hành;
 - test cả desktop và Remote extension host;
-- không thêm fallback `better-sqlite3`/`sql.js`: hai driver production làm tăng matrix,
-  migration risk và behavior drift.
+- không thêm driver thứ hai như `better-sqlite3`/`sql.js`.
 
 ## 4. Schema v1 đề xuất
 
 Các cột payload ít query có thể là JSON text có version; state/query keys phải là cột
 chuẩn. Một field chỉ có **một source of truth**: field đã promote thành column không được
-lặp lại trong `payload_json`. Mỗi payload có codec/version validator và migration test;
+lặp lại trong `payload_json`. Mỗi payload có codec/version validator;
 không `JSON.parse` rồi cast thẳng sang domain type.
 
 ```sql
@@ -282,13 +294,13 @@ CREATE TABLE tool_calls (
 );
 ```
 
-Các bảng tiếp theo giữ parity với `TaskStoreFile`: `operations`, `cancel_requests`,
+Các bảng tiếp theo lưu các aggregate domain: `operations`, `cancel_requests`,
 `send_receipts`, pending asks/handoff state, turn inputs và artifact BLOB metadata. Không
 gom operation ledger hoặc input bindings vào một JSON workspace-wide nếu chúng tham gia
 query, foreign key, idempotency hay scheduler decisions.
 
 `TaskEngine.createTask` cho phép caller cung cấp task ID; vì vậy ID không được giả định
-unique giữa các JSON store cũ. Schema chốt composite identity
+unique toàn database. Schema chốt composite identity
 `(workspace_id, entity_id)` cho mọi entity và FK. Các bảng parity bổ sung phải tuân theo
 cùng quy tắc; không được quay lại `id TEXT PRIMARY KEY` global.
 
@@ -355,12 +367,9 @@ trong DB worker.
 Query trả domain DTO immutable. Repository không trả mutable object cache có thể bị code
 ngoài transaction thay đổi mà không persist.
 
-`TaskStoreFile` được giữ tạm làm compatibility DTO trong migration, tests và export; không còn là runtime source of truth.
-
-Repository phải có hai implementation trong giai đoạn chuyển tiếp:
-
-- `JsonTaskStoreAdapter`: bọc behavior hiện tại để characterization test.
-- `SqliteTaskRepository`: implementation production mới.
+`TaskStoreFile`, filesystem `TaskStore` và JSON repository adapter bị xóa sau SQLite-only
+cutover. Test dùng SQLite repository hoặc purpose-built in-memory fixture, không dùng lại
+production JSON storage dưới tên khác.
 
 ## 6. Transcript và webview contract
 
@@ -370,7 +379,7 @@ Repository phải có hai implementation trong giai đoạn chuyển tiếp:
 - Response có `beforeCursor`, `hasMoreBefore`.
 - Khi scroll lên, webview gửi `loadTranscriptPage`.
 - Cursor opaque, versioned và dựa trên canonical transcript sort key
-  `(turn.sequence, kind_rank, ordering, created_at, entity_id)`; `kind_rank` và fallback
+  `(turn.sequence, kind_rank, ordering, created_at, entity_id)`; `kind_rank` và default
   ordering phải khớp chính xác `buildTranscript()` hiện tại. Không dùng offset.
 - Page query chạy trong read transaction/snapshot nhất quán; response mang
   `workspaceRevision` để reducer phát hiện gap.
@@ -401,53 +410,16 @@ correctness mechanism.
 - Stable item IDs để patch không remount cả transcript.
 - Queue/tree updates không kéo theo transcript rebuild nếu focused task không bị ảnh hưởng.
 
-## 7. Migration từ JSON
+## 7. Dev reset và recovery
 
-### 7.1 State machine
-
-SQLite lưu migration record:
-
-```text
-not_started → importing → verified → active
-                         ↘ failed
-```
-
-Quy trình:
-
-1. Tạo/migrate schema trong transaction.
-2. Với workspace đang mở, lazy-discover `<workspace>/.muster-tasks.json`; một global DB
-   không thể tự tìm mọi repository từng tồn tại trên máy.
-3. Đọc và validate bằng loader schema-v6 hiện tại.
-4. Import toàn bộ envelope trong một transaction idempotent.
-5. So sánh count, IDs và content digest theo từng entity.
-6. Commit `verified`, sau đó mới chọn SQLite làm active source.
-7. Sau khi SQLite commit `active`, rename JSON thành
-   `.muster-tasks.json.migrated-<timestamp>`; không xóa tự động trong release đầu.
-
-Store legacy ở `globalStorageUri/.muster-tasks.json` (empty-window fallback) được import
-vào logical empty workspace riêng. Không gán nó tùy tiện cho workspace folder đầu tiên.
-
-Nếu crash trước bước 6, lần activate sau rollback/retry import. Composite identity +
-migration source digest ngăn import trùng.
-
-Import không được giữ nguyên timestamp string hoặc enum không hợp lệ chỉ vì JSON parse
-thành công: luôn đi qua sanitizer/migrator hiện tại trước khi insert. Với reasoning hiện
-tại là một record mỗi turn, importer tạo đúng một segment có canonical ordering.
-
-### 7.2 Không dual-write dài hạn
-
-Không duy trì JSON và SQLite song song sau cutover vì dễ split-brain. Có thể dùng shadow-read trong development để so projection, nhưng production phải có một source of truth sau `active`.
-
-### 7.3 Rollback
-
-- Trước `active`: tiếp tục dùng JSON.
-- Sau `active`: rollback extension không tự ghi đè JSON backup.
-- Cung cấp command export SQLite workspace thành JSON/Markdown để recovery.
-- Corrupt DB: đóng connection, copy DB/WAL/SHM cùng một recovery set vào quarantine,
-  hiển thị recovery UI; không copy riêng main DB khi còn committed WAL và không tạo DB
-  rỗng rồi ghi đè âm thầm.
-- Backup/export DB live dùng SQLite backup API hoặc checkpoint + coordinated copy, không
-  dùng `fs.copyFile(muster.sqlite3)` đơn lẻ.
+- Runtime không đọc hoặc ghi `.muster-tasks.json`; file cũ nếu còn trên disk bị bỏ qua.
+- Không import data từ schema/application version cũ. Version không tương thích phải fail
+  rõ với đường dẫn database và hướng dẫn reset dành cho developer.
+- Corrupt DB: đóng connection và báo lỗi; không tự tạo database rỗng đè lên file lỗi.
+- Markdown export vẫn là tính năng người dùng, nhưng projector phải đọc named repository
+  queries. Không materialize một workspace envelope chỉ để export một task.
+- Backup database live (nếu bổ sung sau này) phải dùng SQLite backup API hoặc checkpoint
+  có phối hợp; không copy riêng file main khi còn WAL.
 
 ## 8. Các phase triển khai
 
@@ -464,11 +436,11 @@ Không duy trì JSON và SQLite song song sau cutover vì dễ split-brain. Có 
 ### Phase 1 — SQLite foundation
 
 - Nâng minimum VS Code lên `^1.101.0`, thêm runtime feature-probe cho `node:sqlite`.
-- Tạo DB worker/RPC, connection manager, pragmas, schema migrations và workspace registry.
+- Tạo DB worker/RPC, connection manager, pragmas, schema bootstrap và workspace registry.
 - Test WAL multi-connection, busy timeout, crash transaction và foreign keys.
 
 **Gate:** VSIX chạy `node:sqlite` trên minimum/current desktop + Remote host; VS Code cũ
-bị từ chối đúng bởi engine compatibility; artificial 5-second DB lock không block
+bị từ chối đúng bởi minimum-version gate; artificial 5-second DB lock không block
 extension-host heartbeat/UI command.
 
 ### Phase 2 — Repository boundary
@@ -476,9 +448,9 @@ extension-host heartbeat/UI command.
 - Tách engine/snapshot/export khỏi `TaskStoreFile` mutation API.
 - Chuyển call chain liên quan sang async named commands/query API; không bọc sync API bằng
   fire-and-forget.
-- Chạy cùng contract suite trên JSON adapter và SQLite repository.
+- Chạy contract suite trên SQLite repository.
 
-**Gate:** scheduler/lifecycle tests pass trên cả hai implementations.
+**Gate:** scheduler/lifecycle tests pass trên SQLite repository.
 
 ### Phase 3 — SQLite parity
 
@@ -491,7 +463,7 @@ extension-host heartbeat/UI command.
 #### Kế hoạch khép Phase 1–3 theo 10 wave
 
 Không bắt đầu Phase 4 chỉ vì các SQLite primitive đã tồn tại. Audit ngày 2026-07-17
-ghi nhận **44 runtime mutation sites** còn gọi `TaskStore.commit()` ngoài JSON adapter:
+ghi nhận **44 runtime mutation sites** còn gọi `TaskStore.commit()`:
 23 trong `engine.ts`, 17 trong `engine-graph.ts` và 4 trong `extension.ts`. Mười wave
 dưới đây là execution plan bắt buộc để đưa con số đó về 0 và khép đầy đủ gate của
 Phase 1–3.
@@ -520,16 +492,14 @@ sau khi Wave 10 qua toàn bộ gate.
 
 - Dựng Extension Host/packaged VSIX smoke test trên minimum VS Code 1.101 và stable
   hiện hành; xác nhận packaged `worker.js` chạy thật với `node:sqlite`.
-- Test engine compatibility từ chối VS Code 1.100 trở xuống.
+- Test minimum-version gate từ chối VS Code 1.100 trở xuống.
 - Test lock contention thật bằng hai DB workers: một connection giữ write lock khoảng
   5 giây, connection còn lại chờ `busy_timeout`, trong khi extension-host heartbeat vẫn
   đáp ứng.
 - Test terminate worker/process giữa transaction rồi reopen DB để xác nhận rollback và
-  WAL recovery; test concurrent schema migration/open.
+  WAL recovery; test concurrent schema bootstrap/open.
 - Chạy Remote Extension Host test/UAT. Không có evidence Remote thì Phase 1 chưa qua gate.
-- Ghi rõ policy: probe có thể advisory khi JSON còn là production source; nó trở thành
-  hard gate ở Phase 5 ngay trước khi SQLite là writable source duy nhất. Không được fallback
-  sang JSON sau cutover.
+- Packaged probe evidence phải xanh; Phase 4 chuyển probe thành hard gate.
 
 ##### Wave 2 — Extension/provider boundary
 
@@ -537,11 +507,9 @@ sau khi Wave 10 qua toàn bộ gate.
   `clearHistory`, `deleteTaskSubtreeIfIdle`, `renameTask`, `applyRetentionPolicy`.
 - Các lệnh clear/delete phải kiểm tra toàn subtree và live-turn safety trong cùng
   transaction, không quyết định trên snapshot cũ rồi mới delete.
-- Dựng snapshot bằng repository queries; `postSnapshot()` không được gọi
-  `readEnvelopeForMigration()` hoặc materialize toàn workspace.
-- Export chỉ đọc qua repository; bỏ `getStoreFile` fallback. Export/migration là hai
-  nơi duy nhất được phép materialize compatibility envelope.
-- Chạy cùng host/snapshot/export contract tests trên JSON và SQLite adapters.
+- Dựng snapshot bằng repository queries; `postSnapshot()` không được materialize toàn workspace.
+- Export chỉ đọc qua repository queries; không có full-workspace envelope fallback.
+- Chạy host/snapshot/export contract tests trên SQLite.
 
 ##### Wave 3 — Engine queue và user-facing mutations
 
@@ -551,7 +519,7 @@ sau khi Wave 10 qua toàn bộ gate.
 - Loại runtime sync mutation paths và mọi fire-and-forget persistence liên quan; caller
   phải await kết quả durable trước khi ACK, schedule hoặc phát side effect.
 - Mỗi command có task revision, turn status/epoch, FIFO và idempotent receipt guards phù hợp.
-- Chạy cùng ingress/queue behavior suite trên JSON và SQLite adapters.
+- Chạy ingress/queue behavior suite trên SQLite.
 
 ##### Wave 4 — Engine lifecycle và reconciliation
 
@@ -560,21 +528,21 @@ sau khi Wave 10 qua toàn bộ gate.
   remediation sang named commands.
 - Dependency/wait/lifecycle effects liên quan phải commit atomically; không để một task
   terminal nhưng dependent/wait state ở revision cũ.
-- Mỗi operation phải có ownership, revision và runtime-epoch fence; chạy cùng contract
-  suite trên cả hai adapters.
+- Mỗi operation phải có ownership, revision và runtime-epoch fence; chạy contract suite
+  trên SQLite.
 
 ##### Wave 5 — Scheduler, settlement, handoff và engine boundary
 
 - Chuyển runtime handoff, verdict revalidation, post-settlement follow-up draining,
   missing-input attention và disposition repair sang named commands.
-- Xóa compatibility bridge đang clone full `TaskStoreFile` để chuẩn bị dispatch hoặc
+- Xóa bridge đang clone full `TaskStoreFile` để chuẩn bị dispatch hoặc
   settlement; chỉ query và persist các aggregate/rows thực sự liên quan.
 - Thay filesystem `.lease.<turnId>` bằng repository-owned runtime claim có owner,
   expiry/heartbeat và stale-claim recovery.
 - Scheduler database transaction tự suy ra owning root từ candidate task; không tin
   `rootTaskId` do caller truyền để enforce `maxConcurrentPerRoot`.
-- Bỏ `store: TaskStore` bắt buộc khỏi `TaskEngineConfig`; engine phải chạy hoàn toàn trên
-  `JsonTaskRepository` hoặc `SqliteTaskRepository`.
+- Bỏ `store: TaskStore` bắt buộc khỏi `TaskEngineConfig`; engine chạy trên
+  `SqliteTaskRepository`.
 - Sau wave này `engine.ts` không còn direct `TaskStore.commit()`. Chạy full test suite.
 
 ##### Wave 6 — Graph delegate đơn và batch
@@ -592,7 +560,7 @@ sau khi Wave 10 qua toàn bộ gate.
   `wait_for_tasks`, `complete_task` và `fail_task`.
 - Release/readiness, wait state, task/turn result, continuation turn và operation ledger
   phải atomically visible.
-- Chạy behavior suite tương ứng trên JSON và SQLite adapters, gồm contention/replay.
+- Chạy behavior suite tương ứng trên SQLite, gồm contention/replay.
 
 ##### Wave 8 — Graph cancellation và lifecycle cascade
 
@@ -610,17 +578,16 @@ sau khi Wave 10 qua toàn bộ gate.
 - `consumeCancelRequest` phải atomically claim đúng request/owner, settle hoặc cancel
   turn/task, áp dụng follow-up hold/cancel policy, release session/resource/runtime claims,
   xóa request và ghi đúng một workspace revision/change-log batch.
-- Sau wave này direct `TaskStore.commit()` ngoài `JsonTaskRepository` phải bằng 0. Chạy
+- Sau wave này direct `TaskStore.commit()` phải bằng 0. Chạy
   full test suite và source-boundary audit.
 
 ##### Wave 10 — Phase 3 parity audit và gate cuối
 
-- Enforce source-boundary checks: engine/graph/snapshot không import `TaskStore`;
-  `readEnvelopeForMigration()` chỉ xuất hiện trong migration/export; không còn direct
-  commit ngoài JSON adapter/legacy store implementation.
+- Enforce source-boundary checks: engine/graph/snapshot không import `TaskStore`; không
+  còn direct commit hoặc full-workspace envelope runtime.
 - Cập nhật entity matrix cho runtime owner/lease, expiry và stale-claim recovery; audit
   mọi domain field/aggregate qua codec hoặc promoted column.
-- Chạy toàn bộ scheduler/lifecycle/graph behavior suite trên cả JSON và SQLite, gồm
+- Chạy toàn bộ scheduler/lifecycle/graph behavior suite trên SQLite, gồm
   multi-worker contention, operation replay/conflict, orphan recovery và retention
   không xóa live/reference data.
 - Benchmark database lớn để chứng minh `appendTranscriptBatch` chỉ chạm các row liên quan,
@@ -633,38 +600,144 @@ bao gồm runtime owner/lease, expiry, stale-claim recovery và codec của từ
 field. Command matrix được chốt tại [`sqlite-engine-command-matrix.vi.md`](./sqlite-engine-command-matrix.vi.md).
 Evidence cuối Wave 10: [`sqlite-phase3-gate-evidence.vi.md`](./sqlite-phase3-gate-evidence.vi.md).
 
-**Gate trước Phase 4:** Wave 1–10 đều hoàn tất; 44 runtime mutation sites đã về 0 ngoài
-JSON compatibility adapter; engine/graph/snapshot chạy qua repository boundary; dual-adapter
-scheduler/lifecycle/graph suites xanh; Phase 1 VSIX/lock/crash/Remote evidence đầy đủ; và
+**Gate trước Phase 4:** Wave 1–10 đều hoàn tất; 44 runtime mutation sites đã về 0;
+engine/graph/snapshot chạy qua repository boundary; SQLite scheduler/lifecycle/graph suites
+xanh; Phase 1 VSIX/lock/crash/Remote evidence đầy đủ; và
 SQLite đạt row-level behavior parity dưới contention.
 
 ### Phase 4 — Pagination và incremental wire protocol
 
+- Cutover runtime sang SQLite-only và xóa filesystem JSON path trước khi đổi wire protocol.
 - Transcript cursor API, load-older action, patches và stream batching.
-- Webview reducer idempotent; protocol-version fallback/reload banner.
+- Webview reducer idempotent; exact protocol-version gate + reload banner cho stale asset.
 - Cross-process revision polling + `change_log` gap recovery.
 
 **Gate:** task 10k transcript items mở nhanh, bootstrap size bounded và hai window hội tụ
 về cùng UI state mà không reload thủ công.
 
-### Phase 5 — Migration/cutover
+#### Kế hoạch Phase 4 theo 11 wave
 
-- Import validator, digest verification, backup rename và recovery command.
-- Feature flag nội bộ để dogfood; telemetry chỉ dùng timing/count, không gửi content/path.
-- Rollout theo `json → sqlite_shadow_verify → sqlite`; flag là host-internal, không tạo
-  hai writable sources. `sqlite_shadow_verify` chỉ import/read/compare projection.
-- Cutover production sang `globalStorageUri/muster.sqlite3`.
+Mỗi wave là một commit độc lập. Targeted tests + typecheck phải xanh trước commit; wave
+sau bắt đầu ngay khi wave trước đạt gate, chỉ dừng khi có blocker thật.
 
-**Gate:** test crash ở từng migration boundary, UAT với store thật đã sao lưu và mọi
-performance budget pass trước khi feature flag mặc định chuyển sang SQLite.
+| Wave | Phạm vi | Gate chính |
+|---|---|---|
+| P4-W1 ✅ | SQLite-only activation cutover | Không tạo/đọc/ghi/watch `.muster-tasks.json`; probe là hard gate |
+| P4-W2 | Xóa legacy storage/runtime API | Không còn `JsonTaskRepository`, filesystem `TaskStore`, sync engine constructor hoặc full-envelope export |
+| P4-W3 | Canonical cursor + SQL keyset page | SQLite query bounded `limit + 1`, không load full transcript |
+| P4-W4 | Bounded bootstrap | Snapshot focused task chỉ chứa 100 item + page metadata |
+| P4-W5 | Load older UX | Typed request/response, prepend idempotent, giữ scroll anchor |
+| P4-W6 | Revisioned patch reducer | Duplicate/stale patch là no-op; revision gap yêu cầu recovery |
+| P4-W7 | Local patch routing | Queue/tree/transcript update không kéo theo focused full snapshot |
+| P4-W8 | Stream batching | Assistant/reasoning persist + post coalesce 50–100 ms, flush ở tool/terminal boundary |
+| P4-W9 | Change-feed contract | Bounded feed, prune watermark, explicit gap result |
+| P4-W10 | Multi-window polling | Visible/focus polling + backoff; hai process hội tụ hoặc full-recover khi gap |
+| P4-W11 | Performance/UAT gate | 10k fixture, size/latency budgets, full suite/build/VSIX evidence |
+
+##### P4-W1 — SQLite-only activation cutover
+
+**Hoàn tất:** activation dùng `SqliteTaskRepository` + `TaskEngine.loadAsync`, probe/open
+database là hard gate và filesystem JSON watcher/path đã bị loại khỏi runtime host.
+
+- Activation bắt buộc mở `globalStorageUri/muster.sqlite3`, resolve workspace và tạo
+  `SqliteTaskRepository`; lỗi probe/open làm task engine fail rõ.
+- `TaskEngine.loadAsync()` là constructor runtime duy nhất.
+- Bỏ filesystem watcher và mọi runtime reference tới workspace JSON file.
+
+##### P4-W2 — Xóa legacy storage/runtime API
+
+- Xóa `JsonTaskRepository`, filesystem `TaskStore`, `LegacyStorePort`, sync execute/load và
+  session/data importer cũ.
+- Host reads đi qua named repository queries hoặc repository projection.
+- Markdown export query đúng task/subtree cần thiết, không gọi full-envelope API.
+- Test dùng SQLite repository hoặc fixture test chuyên biệt; không giữ production JSON
+  adapter chỉ để test tiện hơn.
+
+##### P4-W3 — Canonical cursor + SQL keyset page
+
+- Chốt sort key `(turn.sequence, kind_rank, ordering, created_at, entity_id)` và dùng chung
+  cho projector/cursor.
+- SQLite dùng UNION/keyset query `limit + 1` trong một read snapshot, response kèm
+  `workspaceRevision`; cursor opaque/versioned và invalid cursor fail rõ.
+- Test insert concurrent, equal timestamps/ordering, queued-message visibility và 10k rows.
+
+##### P4-W4 — Bounded bootstrap
+
+- `buildRepositorySnapshot()` gọi `getTranscriptPage(..., 100)`, không `listMessages`,
+  `listToolCalls`, `listReasoning` cho toàn focused task.
+- Snapshot mang `beforeCursor`, `hasMoreBefore`, `workspaceRevision`; serialized payload
+  có budget test.
+
+##### P4-W5 — Load older UX
+
+- Webview gửi `loadTranscriptPage(taskId, beforeCursor)`; host validate focus/task/cursor
+  và trả typed page result hoặc bounded error.
+- Reducer prepend theo stable ID, chống duplicate/replayed response và không ghi đè item
+  mới hơn; component giữ scroll anchor sau prepend.
+- Focus đổi trong lúc query làm response cũ bị bỏ.
+
+##### P4-W6 — Revisioned patch reducer
+
+- Wire messages: `taskUpserted`, `turnActivityChanged`, `transcriptItemsAppended`,
+  `transcriptItemPatched`, `queuedTurnsChanged`, `taskRemoved`.
+- Mỗi patch có workspace revision và stable entity identity. Reducer là idempotent;
+  stale/duplicate là no-op, gap chuyển state sang `needsRecovery`.
+- Exact protocol mismatch chỉ hiện reload banner; không parse/translate protocol cũ.
+
+##### P4-W7 — Local patch routing
+
+- Host mutation nội bộ phát named patches sau durable commit.
+- Full snapshot chỉ dùng bootstrap, focus change hoặc recovery; queue/tree change không
+  rebuild transcript nếu focused task không bị ảnh hưởng.
+- Loại `transcriptAppend`/`taskUpdated` one-off messages sau khi mọi caller chuyển xong.
+
+##### P4-W8 — Stream batching
+
+- Coalesce assistant/reasoning updates trong cửa sổ 50–100 ms trước một
+  `appendTranscriptBatch` transaction và một UI patch batch.
+- Flush trước tool boundary, turn done/error/cancel, focus teardown và deactivate.
+- Lỗi persist không được ACK/post như durable; ordering và partial-segment IDs giữ ổn định.
+
+##### P4-W9 — Change-feed contract
+
+- Repository expose current revision + changes-since query theo revision boundary.
+- Feed có retention bound/watermark. Consumer nhận explicit `gap` khi revision cần thiết
+  đã bị prune; không đoán từ danh sách rỗng.
+- Feed chỉ chứa metadata IDs/change kind, không chứa prompt/tool payload/path.
+
+##### P4-W10 — Multi-window polling
+
+- Khi view visible, poll `data_version`/workspace revision với adaptive backoff; poll ngay
+  khi view hoặc VS Code window regain focus; hidden view dừng timer.
+- Apply feed thành patches; gap, protocol recovery hoặc projection invariant failure thì
+  rebuild bounded snapshot.
+- Test hai DB clients/processes ghi xen kẽ và hội tụ cùng reducer state.
+
+##### P4-W11 — Performance/UAT gate
+
+- Benchmark release fixture 10k transcript items: focus latest 100, load page 100,
+  bootstrap bytes, stream-batch p50/p95 và heap/row count.
+- UAT transcript append trong lúc paging, duplicate delivery, gap prune, two-window
+  convergence và focus race.
+- Chạy full tests, TypeScript, webview build/check, source-boundary audit và packaged VSIX;
+  ghi evidence trước khi đánh dấu Phase 4 hoàn tất.
+
+### Phase 5 — SQLite hardening
+
+- Corrupt/disk-full diagnostics và explicit developer reset command.
+- Telemetry nếu có chỉ dùng timing/count, không gửi content/path.
+- Live backup/export policy dùng SQLite-aware mechanism.
+
+**Gate:** fault-injection cho corrupt/disk-full/backup và mọi lỗi đều fail rõ, không reset
+hay mất row âm thầm.
 
 ### Phase 6 — Virtualization và cleanup
 
 - Virtualize chat/tree nếu profiling chứng minh cần thiết.
-- Xóa JSON runtime adapter sau một compatibility window.
-- Giữ import/export tooling và migration backup policy có thời hạn rõ ràng.
+- Xóa projection/cache nào profiling chứng minh thừa sau incremental protocol.
+- Giữ Markdown export và SQLite recovery tooling tối thiểu.
 
-**Gate:** không còn code path production ghi `.muster-tasks.json`.
+**Gate:** DOM/heap bounded trên history lớn và không còn dead storage/protocol path.
 
 ## 9. Performance budgets
 
@@ -680,33 +753,30 @@ performance budget pass trước khi feature flag mặc định chuyển sang SQ
 ## 10. Test/UAT bắt buộc
 
 - Fresh install, empty window, single-root và multi-root.
-- Import schema-v1…v6 JSON; corrupt/truncated JSON; duplicate import retry.
 - Hai VS Code windows ghi cùng DB; hai workspace chạy agent đồng thời.
 - 10 concurrent backend turns stream vào các task khác nhau.
 - Dependency promotion và operation idempotency dưới transaction contention.
 - Clear history/retention không xóa task đang live hoặc artifact còn được tham chiếu.
 - Transcript paging trong lúc turn đang append; không duplicate/mất item.
 - Database/WAL crash recovery và disk-full behavior.
-- Export Markdown/JSON parity trước và sau migration.
-- Secret canary không xuất hiện trong SQLite, logs, migration backup ngoài dữ liệu conversation mà user chủ động lưu.
+- Export Markdown parity từ repository projection.
+- Secret canary không xuất hiện trong SQLite hoặc logs ngoài dữ liệu conversation mà user chủ động lưu.
 
 ## 11. Rủi ro cần chốt trước Phase 1
 
 1. Xác nhận product chấp nhận bỏ support VS Code 1.94–1.100 khi nâng minimum lên 1.101.
 2. Empty-window identity và cách relink khi workspace folder được rename/move.
 3. Retention của reasoning/tool payload và artifact files.
-4. Mức backward compatibility khi downgrade extension.
-5. Có mã hóa database at rest hay dựa vào OS/user-profile protection; không tuyên bố SQLite là encrypted nếu chưa dùng SQLCipher.
+4. Có mã hóa database at rest hay dựa vào OS/user-profile protection; không tuyên bố SQLite là encrypted nếu chưa dùng SQLCipher.
 
 ## 12. Definition of done
 
 - Một `muster.sqlite3` chung dưới `globalStorageUri` là production source of truth.
-- Không tạo hoặc cập nhật `.muster-tasks.json` trong workspace mới.
-- Store JSON cũ được import idempotent, verify và backup trước cutover.
+- Không có runtime filesystem JSON store hoặc data importer.
 - Settings vẫn ở VS Code configuration; credentials vẫn ở SecretStorage.
 - Engine mutation là row-level transaction; không full-store clone/write.
 - Transcript được cursor-page và UI nhận incremental patches.
-- Multi-window/WAL, crash recovery, migration và performance gates đều pass.
+- Multi-window/WAL, crash recovery và performance gates đều pass.
 - Documentation mô tả location, backup/export, privacy và recovery workflow.
 
 ## 13. Handoff rules cho implementer
@@ -715,8 +785,7 @@ performance budget pass trước khi feature flag mặc định chuyển sang SQ
   full-envelope JSON vào một SQLite cell và không đạt mục tiêu.
 - Không ship schema minh họa thiếu bảng parity. Trước Phase 3 gate phải có entity matrix:
   mỗi field của `TaskStoreFile`/domain type map tới column, payload codec hoặc derived-only.
-- Không thay toàn bộ engine trong một commit. Mỗi phase có tests và compatibility seam;
-  JSON production path chỉ bị tắt sau migration + pagination gates.
+- Không thay toàn bộ engine trong một commit; đi theo wave/gate ở trên.
 - Không silently reset DB, silently skip malformed rows hoặc swallow `SQLITE_BUSY`.
 - Không log SQL parameters chứa prompt, tool result, path hoặc credential.
 - Mọi benchmark phải ghi fixture size, release/debug mode, machine và before/after; không

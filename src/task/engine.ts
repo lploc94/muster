@@ -1204,6 +1204,16 @@ export class TaskEngine {
     return engine;
   }
 
+  /** Host read model backed by the same projection refreshed after every durable write. */
+  getReadModel(): TaskReadPort {
+    return this.store;
+  }
+
+  /** Repository wrapper whose successful writes refresh {@link getReadModel}. */
+  getRepository(): TaskRepository {
+    return this.repository;
+  }
+
   async startNewTask(params: {
     goal: string;
     backend: string;
