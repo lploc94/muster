@@ -27,6 +27,8 @@ image tag cannot drift from `@playwright/test` in `package-lock.json`.
 | `npm run test:visual:linux:update` | **Authoritative author/update** in pinned Linux Docker |
 | `npm run test:webview:visual` | Host compare for main-webview pilot only |
 | `npm run test:presentation:visual` | Host compare for Presentation pilot only |
+| `npm run test:webview:visual:linux` | Authoritative Linux compare (webview matrix) |
+| `npm run test:presentation:visual:linux` | Authoritative Linux compare (presentation matrix) |
 
 Behavioral suites (`test:webview`, `e2e/muster-presentation.spec.ts`) stay
 independent of visual scripts.
@@ -104,6 +106,63 @@ the per-entrypoint pilot specs and is the named slice verification entrypoint:
 npm run test:visual:linux -- --grep "M014 S01 flow: deterministic dual-entrypoint pilot"
 ```
 
+
+## M014 S02 representative visual matrix
+
+Bounded committed matrix (hard cap **eight** cases, currently six) covering both
+entrypoints, compact 320px main-webview and narrow Presentation containment, and
+light / dark / high-contrast browser theme tokens.
+
+Machine-checkable source of truth:
+
+- `e2e/visual/visual-cases.manifest.json` — case ids, owners, entrypoints, states,
+  layouts, viewports, themes, requirement mapping, snapshot paths, fixture factories
+- `e2e/visual/visual-cases.ts` — typed re-export (`VISUAL_MATRIX_CASES`,
+  `M014_S02_FLOW_TITLE`, `VISUAL_MATRIX_MAX_CASES`)
+- `scripts/verify-visual-baselines.test.mjs` — contract + negative tests
+  (`node --test scripts/verify-visual-baselines.test.mjs`)
+
+Stable independently executable proof (exact Playwright title):
+
+```text
+M014 S02 flow: representative visual matrix
+```
+
+Spec: `e2e/visual/m014-slice-flows.spec.ts`
+
+This named flow **must** be grepped independently. Aggregate `npm run test:visual:linux`
+matrix runs cannot substitute for it:
+
+```bash
+npm run test:visual:linux -- --grep "M014 S02 flow: representative visual matrix"
+node --test scripts/verify-visual-baselines.test.mjs
+npm run test:visual:linux
+npm run test:visual:linux
+git diff --exit-code -- e2e/visual
+```
+
+### Matrix case IDs
+
+| ID | Entrypoint | Layout | Theme | Spec snapshot |
+|----|------------|--------|-------|---------------|
+| `V01-webview-compact-dark` | webview | compact 320×600 | dark | `muster-webview.visual.spec.ts-snapshots/` |
+| `V02-presentation-rich-dark` | presentation | standard 1280×720 | dark | `muster-presentation.visual.spec.ts-snapshots/` |
+| `V03-webview-autocomplete-light` | webview | compact 320×600 | light | `muster-webview.visual.spec.ts-snapshots/` |
+| `V04-webview-settings-prompt-hc` | webview | compact 320×600 | high-contrast | `muster-webview.visual.spec.ts-snapshots/` |
+| `V05-webview-validation-errors-dark` | webview | compact 320×600 | dark | `muster-webview.visual.spec.ts-snapshots/` |
+| `V06-presentation-narrow-light` | presentation | narrow 360×600 | light | `muster-presentation.visual.spec.ts-snapshots/` |
+
+Flow-owned goldens under `m014-slice-flows.spec.ts-snapshots/` use the `S02-`
+prefix so they do not collide with the S01 dual-entrypoint pilot snapshots that
+share V01/V02 ids at a different viewport.
+
+Before commit, inspect every image for:
+
+- clipping of critical chrome
+- stale Settings taxonomy / placeholder ("Coming soon") tabs
+- unreadable contrast
+- secrets, absolute paths, or real user content
+
 ## Pilot IDs
 
 | Entrypoint | Pilot ID | Spec |
@@ -112,4 +171,8 @@ npm run test:visual:linux -- --grep "M014 S01 flow: deterministic dual-entrypoin
 | Presentation (rich, dark) | `V02-presentation-rich-dark` | `e2e/visual/muster-presentation.visual.spec.ts` |
 | Presentation (narrow, light) | `V06-presentation-narrow-light` | `e2e/visual/muster-presentation.visual.spec.ts` |
 | Dual-entrypoint flow | `M014 S01 flow: deterministic dual-entrypoint pilot` | `e2e/visual/m014-slice-flows.spec.ts` |
+| Autocomplete (light) | `V03-webview-autocomplete-light` | `e2e/visual/muster-webview.visual.spec.ts` |
+| Settings + prompt (HC) | `V04-webview-settings-prompt-hc` | `e2e/visual/muster-webview.visual.spec.ts` |
+| Validation errors (dark) | `V05-webview-validation-errors-dark` | `e2e/visual/muster-webview.visual.spec.ts` |
+| Matrix flow | `M014 S02 flow: representative visual matrix` | `e2e/visual/m014-slice-flows.spec.ts` |
 

@@ -1,0 +1,115 @@
+{
+  "version": 1,
+  "maxCases": 8,
+  "flowTitle": "M014 S02 flow: representative visual matrix",
+  "cases": [
+    {
+      "id": "V01-webview-compact-dark",
+      "owner": "m014-s02-webview",
+      "entrypoint": "webview",
+      "state": "compact-idle-workspace",
+      "layout": "compact",
+      "viewport": {
+        "width": 320,
+        "height": 600
+      },
+      "theme": "dark",
+      "requirements": [
+        "M014-S02-compact",
+        "M014-S02-theme-dark"
+      ],
+      "snapshotPath": "e2e/visual/muster-webview.visual.spec.ts-snapshots/V01-webview-compact-dark.png",
+      "fixtureFactory": "createStaticWebviewFixture"
+    },
+    {
+      "id": "V02-presentation-rich-dark",
+      "owner": "m014-s02-presentation",
+      "entrypoint": "presentation",
+      "state": "rich-document-mermaid",
+      "layout": "standard",
+      "viewport": {
+        "width": 1280,
+        "height": 720
+      },
+      "theme": "dark",
+      "requirements": [
+        "M014-S02-presentation-rich",
+        "M014-S02-theme-dark"
+      ],
+      "snapshotPath": "e2e/visual/muster-presentation.visual.spec.ts-snapshots/V02-presentation-rich-dark.png",
+      "fixtureFactory": "createStaticPresentationFixture"
+    },
+    {
+      "id": "V03-webview-autocomplete-light",
+      "owner": "m014-s02-webview",
+      "entrypoint": "webview",
+      "state": "composer-file-mention-autocomplete",
+      "layout": "compact",
+      "viewport": {
+        "width": 320,
+        "height": 600
+      },
+      "theme": "light",
+      "requirements": [
+        "M014-S02-autocomplete",
+        "M014-S02-theme-light"
+      ],
+      "snapshotPath": "e2e/visual/muster-webview.visual.spec.ts-snapshots/V03-webview-autocomplete-light.png",
+      "fixtureFactory": "createStaticFileMentionSuggestions"
+    },
+    {
+      "id": "V04-webview-settings-prompt-hc",
+      "owner": "m014-s02-webview",
+      "entrypoint": "webview",
+      "state": "settings-open-runtime-permission",
+      "layout": "compact",
+      "viewport": {
+        "width": 320,
+        "height": 600
+      },
+      "theme": "high-contrast",
+      "requirements": [
+        "M014-S02-settings-prompt",
+        "M014-S02-theme-high-contrast"
+      ],
+      "snapshotPath": "e2e/visual/muster-webview.visual.spec.ts-snapshots/V04-webview-settings-prompt-hc.png",
+      "fixtureFactory": "createStaticWebviewFixture"
+    },
+    {
+      "id": "V05-webview-validation-errors-dark",
+      "owner": "m014-s02-webview",
+      "entrypoint": "webview",
+      "state": "accessible-ask-validation-errors",
+      "layout": "compact",
+      "viewport": {
+        "width": 320,
+        "height": 600
+      },
+      "theme": "dark",
+      "requirements": [
+        "M014-S02-validation-errors",
+        "M014-S02-theme-dark"
+      ],
+      "snapshotPath": "e2e/visual/muster-webview.visual.spec.ts-snapshots/V05-webview-validation-errors-dark.png",
+      "fixtureFactory": "createStaticPendingAsk"
+    },
+    {
+      "id": "V06-presentation-narrow-light",
+      "owner": "m014-s02-presentation",
+      "entrypoint": "presentation",
+      "state": "narrow-containment",
+      "layout": "narrow",
+      "viewport": {
+        "width": 360,
+        "height": 600
+      },
+      "theme": "light",
+      "requirements": [
+        "M014-S02-presentation-narrow",
+        "M014-S02-theme-light"
+      ],
+      "snapshotPath": "e2e/visual/muster-presentation.visual.spec.ts-snapshots/V06-presentation-narrow-light.png",
+      "fixtureFactory": "createStaticNarrowPresentationFixture"
+    }
+  ]
+}
