@@ -188,6 +188,46 @@ describe('openStoreDatabase', () => {
     }
   });
 
+  it('rejects incomplete owned Muster DB (application_id set, user_version=0) without mutation or retry', () => {
+    const dbPath = tempDbPath();
+    {
+      const seed = new DatabaseSync(dbPath);
+      seed.exec('PRAGMA journal_mode = DELETE');
+      seed.exec(`PRAGMA application_id = ${MUSTER_APPLICATION_ID}`);
+      seed.exec('PRAGMA user_version = 0');
+      seed.close();
+    }
+
+    const started = Date.now();
+    expect(() => openStoreDatabase({ path: dbPath, busyTimeoutMs: 5_000 })).toThrow(
+      IncompatibleSchemaError,
+    );
+    // Permanent ownership failure must not burn the busy-timeout retry budget.
+    expect(Date.now() - started).toBeLessThan(1_000);
+
+    try {
+      openStoreDatabase({ path: dbPath, busyTimeoutMs: 5_000 });
+      expect.unreachable('openStoreDatabase should have rejected incomplete owned DB');
+    } catch (error) {
+      expect(error).toBeInstanceOf(IncompatibleSchemaError);
+      expect((error as Error).message).toMatch(/Reset the Muster development database/);
+    }
+
+    const after = reopenReadonly(dbPath);
+    try {
+      expect(scalar(after, 'application_id')).toBe(MUSTER_APPLICATION_ID);
+      expect(scalar(after, 'user_version')).toBe(0);
+      expect(journalMode(after)).toBe('delete');
+      const tables = after
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+        .all()
+        .map((r) => (r as { name: string }).name);
+      expect(tables).toEqual([]);
+    } finally {
+      after.close();
+    }
+  });
+
   it('converges concurrent first-open claims on one valid schema', async () => {
     const dbPath = tempDbPath();
     const { DbClient } = await import('./client');

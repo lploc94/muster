@@ -12,6 +12,11 @@
  *    user_version, schema, or data.
  * 3. Only a truly blank DB may be claimed (stamp + current schema bootstrap).
  * 4. Runtime pragmas including WAL are applied only after ownership is confirmed.
+ *
+ * Concurrent first-open is serialized by BEGIN EXCLUSIVE inside the claim path.
+ * Peers either wait on the lock or observe the post-commit state
+ * (Muster application_id + current user_version). They never observe a durable
+ * partial claim, and they never retry a persisted incomplete Muster DB.
  */
 import { DatabaseSync } from 'node:sqlite';
 import {
@@ -30,15 +35,12 @@ export interface OpenOptions {
 const OPEN_RETRY_WAIT = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
 
 function isRetryableOpenLock(error: unknown): boolean {
-  const candidate = error as { code?: unknown; message?: unknown; name?: unknown };
+  const candidate = error as { code?: unknown; message?: unknown };
   const code = typeof candidate.code === 'string' ? candidate.code : '';
-  const name = typeof candidate.name === 'string' ? candidate.name : '';
   const message = typeof candidate.message === 'string' ? candidate.message : String(error);
-  // node:sqlite currently reports lock failures as ERR_SQLITE_ERROR, so the
-  // SQLite message remains part of the predicate. Do not retry foreign-database
-  // or permanent schema-incompatibility errors.
+  // Retry only real SQLite lock contention. Permanent ownership/schema failures
+  // must surface immediately with reset guidance.
   return (
-    name === 'BootstrapInProgressError' ||
     code === 'SQLITE_BUSY' ||
     code === 'SQLITE_LOCKED' ||
     /database (?:table )?is locked|database is busy/i.test(message)
@@ -63,7 +65,10 @@ export class ForeignDatabaseError extends Error {
   }
 }
 
-/** Thrown when an existing development DB does not match the current schema. */
+/**
+ * Thrown when an existing development DB does not match the current schema, or a
+ * Muster-owned file is incomplete/corrupt. Always includes developer reset guidance.
+ */
 export class IncompatibleSchemaError extends Error {
   constructor(readonly observedVersion: number) {
     super(
@@ -88,17 +93,6 @@ export class NonEmptyUnclaimedDatabaseError extends Error {
   }
 }
 
-/**
- * Transient: another host is mid first-open claim. Caller should close and retry
- * within the open budget rather than mutate the file.
- */
-export class BootstrapInProgressError extends Error {
-  constructor() {
-    super('Muster SQLite bootstrap is in progress in another connection; retrying open');
-    this.name = 'BootstrapInProgressError';
-  }
-}
-
 function readScalar(db: DatabaseSync, pragma: string): number {
   const row = db.prepare(`PRAGMA ${pragma}`).get() as Record<string, number> | undefined;
   if (!row) {
@@ -108,13 +102,8 @@ function readScalar(db: DatabaseSync, pragma: string): number {
   return typeof value === 'number' ? value : 0;
 }
 
-function readJournalMode(db: DatabaseSync): string {
-  const row = db.prepare('PRAGMA journal_mode').get() as { journal_mode?: string } | undefined;
-  return typeof row?.journal_mode === 'string' ? row.journal_mode.toLowerCase() : 'unknown';
-}
-
 /** True when the DB already has any non-internal table/view/index/trigger. */
-export function hasUserSchemaObjects(db: DatabaseSync): boolean {
+function hasUserSchemaObjects(db: DatabaseSync): boolean {
   const row = db
     .prepare(
       `SELECT COUNT(*) AS n
@@ -129,7 +118,7 @@ export function hasUserSchemaObjects(db: DatabaseSync): boolean {
  * Connection-local wait policy only. Safe during preflight because busy_timeout is
  * not a durable file mutation (unlike journal_mode / application_id / user_version).
  */
-export function applyConnectionBusyTimeout(db: DatabaseSync, busyTimeoutMs: number): void {
+function applyConnectionBusyTimeout(db: DatabaseSync, busyTimeoutMs: number): void {
   db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(busyTimeoutMs))}`);
 }
 
@@ -137,28 +126,20 @@ export function applyConnectionBusyTimeout(db: DatabaseSync, busyTimeoutMs: numb
  * Runtime pragmas for an owned Muster connection. WAL is durable and must only run
  * after ownership/schema validation succeeds.
  */
-export function applyRuntimePragmas(db: DatabaseSync, busyTimeoutMs: number): void {
+function applyRuntimePragmas(db: DatabaseSync, busyTimeoutMs: number): void {
   applyConnectionBusyTimeout(db, busyTimeoutMs);
   db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA foreign_keys = ON');
   db.exec('PRAGMA synchronous = NORMAL');
 }
 
-/** @deprecated Prefer applyRuntimePragmas after ownership is confirmed. */
-export function applyPragmas(db: DatabaseSync, busyTimeoutMs: number): void {
-  applyRuntimePragmas(db, busyTimeoutMs);
-}
-
-type PreflightState =
-  | { kind: 'current' }
-  | { kind: 'blank' }
-  | { kind: 'bootstrap_in_progress' };
+type PreflightState = { kind: 'current' } | { kind: 'blank' };
 
 /**
  * Read-only ownership/schema preflight. Never stamps application_id, never changes
  * journal mode, and never writes schema.
  */
-export function preflightDatabase(db: DatabaseSync): PreflightState {
+function preflightDatabase(db: DatabaseSync): PreflightState {
   const applicationId = readScalar(db, 'application_id');
   const userVersion = readScalar(db, 'user_version');
 
@@ -167,12 +148,11 @@ export function preflightDatabase(db: DatabaseSync): PreflightState {
   }
 
   if (applicationId === MUSTER_APPLICATION_ID) {
+    // Owned file must already be fully current. Incomplete owned DBs
+    // (including user_version=0) fail closed with reset guidance — they are not
+    // "bootstrap in progress", because exclusive claim commits atomically.
     if (userVersion === SQLITE_SCHEMA_VERSION) {
       return { kind: 'current' };
-    }
-    // Another host may have stamped ownership and still be writing DDL.
-    if (userVersion === 0) {
-      return { kind: 'bootstrap_in_progress' };
     }
     throw new IncompatibleSchemaError(userVersion);
   }
@@ -189,14 +169,10 @@ export function preflightDatabase(db: DatabaseSync): PreflightState {
 
 /**
  * Claim a blank DB under exclusive lock: create current schema, stamp application_id
- * and user_version. Concurrent first-open losers re-read under the lock and accept a
- * completed bootstrap without rewriting DDL.
- *
- * Note: some PRAGMAs are not fully transactional. user_version is set last as the
- * "schema ready" marker; peers that observe Muster application_id with user_version=0
- * treat that as bootstrap-in-progress and retry without mutating.
+ * and user_version. Concurrent first-open losers block on the exclusive lock, then
+ * re-read post-commit markers and accept a completed bootstrap without rewriting DDL.
  */
-export function claimAndBootstrapBlankDatabase(db: DatabaseSync): void {
+function claimAndBootstrapBlankDatabase(db: DatabaseSync): void {
   db.exec('BEGIN EXCLUSIVE TRANSACTION');
   try {
     const applicationId = readScalar(db, 'application_id');
@@ -210,9 +186,6 @@ export function claimAndBootstrapBlankDatabase(db: DatabaseSync): void {
         db.exec('COMMIT');
         return;
       }
-      if (userVersion === 0) {
-        throw new BootstrapInProgressError();
-      }
       throw new IncompatibleSchemaError(userVersion);
     }
     if (userVersion !== 0) {
@@ -222,10 +195,8 @@ export function claimAndBootstrapBlankDatabase(db: DatabaseSync): void {
       throw new NonEmptyUnclaimedDatabaseError();
     }
 
-    // Claim ownership before DDL so concurrent readers never see unclaimed tables.
-    db.exec(`PRAGMA application_id = ${MUSTER_APPLICATION_ID}`);
     for (const statement of CURRENT_SCHEMA_STATEMENTS) db.exec(statement);
-    // Ready marker last: peers treat MUSTER + user_version=0 as in-progress.
+    db.exec(`PRAGMA application_id = ${MUSTER_APPLICATION_ID}`);
     db.exec(`PRAGMA user_version = ${SQLITE_SCHEMA_VERSION}`);
     db.exec('COMMIT');
   } catch (error) {
@@ -239,75 +210,15 @@ export function claimAndBootstrapBlankDatabase(db: DatabaseSync): void {
 }
 
 /**
- * @deprecated Prefer preflightDatabase + claimAndBootstrapBlankDatabase via openStoreDatabase.
- * Kept for unit tests that exercise the schema-only path after ownership is already valid.
- */
-export function verifyOrStampApplicationId(db: DatabaseSync): void {
-  const observed = readScalar(db, 'application_id');
-  if (observed === MUSTER_APPLICATION_ID) {
-    return;
-  }
-  if (observed === 0) {
-    if (hasUserSchemaObjects(db) || readScalar(db, 'user_version') !== 0) {
-      if (readScalar(db, 'user_version') !== 0) {
-        throw new IncompatibleSchemaError(readScalar(db, 'user_version'));
-      }
-      throw new NonEmptyUnclaimedDatabaseError();
-    }
-    db.exec(`PRAGMA application_id = ${MUSTER_APPLICATION_ID}`);
-    return;
-  }
-  throw new ForeignDatabaseError(observed);
-}
-
-/**
- * @deprecated Prefer claimAndBootstrapBlankDatabase. Only bootstraps schema for blank DBs
- * that already passed ownership preflight; does not stamp application_id.
- */
-export function initializeCurrentSchema(db: DatabaseSync): number {
-  const current = readScalar(db, 'user_version');
-  if (current === SQLITE_SCHEMA_VERSION) {
-    return current;
-  }
-  if (current !== 0) {
-    throw new IncompatibleSchemaError(current);
-  }
-  if (hasUserSchemaObjects(db)) {
-    throw new NonEmptyUnclaimedDatabaseError();
-  }
-  db.exec('BEGIN EXCLUSIVE TRANSACTION');
-  try {
-    const underLock = readScalar(db, 'user_version');
-    if (underLock === 0) {
-      if (hasUserSchemaObjects(db)) {
-        throw new NonEmptyUnclaimedDatabaseError();
-      }
-      for (const statement of CURRENT_SCHEMA_STATEMENTS) db.exec(statement);
-      db.exec(`PRAGMA user_version = ${SQLITE_SCHEMA_VERSION}`);
-    } else if (underLock !== SQLITE_SCHEMA_VERSION) {
-      throw new IncompatibleSchemaError(underLock);
-    }
-    db.exec('COMMIT');
-  } catch (error) {
-    try {
-      db.exec('ROLLBACK');
-    } catch {
-      // ignore rollback failure — original error is the real signal
-    }
-    throw error;
-  }
-  return SQLITE_SCHEMA_VERSION;
-}
-
-/**
  * Open the store DB with validation-before-mutation:
  * preflight → claim/bootstrap blank only → runtime pragmas (incl. WAL).
  * Rejected databases are closed without durable side effects.
+ * Retry is limited to SQLite BUSY/LOCKED contention.
  */
 export function openStoreDatabase(opts: OpenOptions): DatabaseSync {
   const busyTimeoutMs = Math.max(0, Math.floor(opts.busyTimeoutMs ?? 5000));
-  // Concurrent first-open may observe bootstrap-in-progress or lock contention.
-  // Reopen and re-verify durable markers within a bounded budget.
+  // Concurrent first-open may contend on BEGIN EXCLUSIVE. Reopen within a budget
+  // only for real lock errors; permanent ownership/schema failures fail immediately.
   const retryDeadline = Date.now() + Math.max(1_000, busyTimeoutMs * 2);
   let attempt = 0;
 
@@ -317,9 +228,6 @@ export function openStoreDatabase(opts: OpenOptions): DatabaseSync {
       // Connection-local only — does not mutate durable journal/application markers.
       applyConnectionBusyTimeout(db, busyTimeoutMs);
       const preflight = preflightDatabase(db);
-      if (preflight.kind === 'bootstrap_in_progress') {
-        throw new BootstrapInProgressError();
-      }
       if (preflight.kind === 'blank') {
         claimAndBootstrapBlankDatabase(db);
       }
@@ -339,9 +247,4 @@ export function openStoreDatabase(opts: OpenOptions): DatabaseSync {
       attempt += 1;
     }
   }
-}
-
-/** Test helper: journal mode without opening through the production path. */
-export function inspectJournalMode(db: DatabaseSync): string {
-  return readJournalMode(db);
 }

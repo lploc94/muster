@@ -665,9 +665,12 @@ database là hard gate và filesystem JSON watcher/path đã bị loại khỏi 
   sang `engine-repository` SQLite integration tests.
 - **Open-path validation-before-mutation (follow-up):** `openStoreDatabase` preflight
   `application_id` + `user_version` + `sqlite_schema` trước mọi durable write. Foreign DB,
-  unclaimed incompatible version, và unclaimed non-empty file đều reject mà không đổi
-  journal mode / stamp / schema. Chỉ blank DB được claim + bootstrap; WAL/runtime pragmas
-  chỉ sau ownership confirmed. Concurrent first-open hội tụ dưới exclusive lock.
+  unclaimed incompatible version, unclaimed non-empty file, và incomplete owned Muster DB
+  (application_id=Muster nhưng user_version ≠ current, kể cả 0) đều reject ngay với reset
+  guidance, không đổi journal mode / stamp / schema, không retry. Chỉ blank DB được claim
+  + bootstrap trong `BEGIN EXCLUSIVE`; WAL/runtime pragmas chỉ sau ownership confirmed.
+  Concurrent first-open: peer chờ exclusive lock hoặc thấy post-commit current markers —
+  không quan sát partial claim bền vững.
 
 ##### P4-W3 — Canonical cursor + SQL keyset page
 
