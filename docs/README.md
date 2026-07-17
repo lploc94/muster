@@ -24,6 +24,8 @@ Read in this order when onboarding:
 | [WEBVIEW.md](WEBVIEW.md) | Chat UI, workspace file-drop mention contract, read-only presentation review, queued follow-ups and interrupt & send, task Markdown export, lifecycle, and diagnostics |
 | [SETTINGS.md](SETTINGS.md) | Host-backed Settings domain shell: 4-domain IA (Agents, Execution, Connections, Data) with three actionable tabs rendered (Agents / Execution / Data) and Connections reserved |
 | [SETTINGS-DESIGN.md](SETTINGS-DESIGN.md) | Adopted Settings information architecture, naming, responsive layout, and migration guidance |
+| [UI-VISUAL-REGRESSION.md](UI-VISUAL-REGRESSION.md) | Pinned Linux visual regression operations: compare vs explicit update, CI artifact download, troubleshooting, Playwright upgrades, browser-versus-native proof boundary |
+| [UI-IMPROVEMENT-ROADMAP.md](UI-IMPROVEMENT-ROADMAP.md) | Deferred prioritized UI roadmap (search/rename a11y, hit targets, reduced motion, theme/zoom, long-conversation benchmarks, task-profile density, primitives) — not implemented in M014 |
 
 Operational evidence:
 

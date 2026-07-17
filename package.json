@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "publisher": "tlelabs",
   "license": "MIT",
-  "description": "Muster — an open-source coordinator for multiple AI CLIs (Claude, Grok, Codex, Antigravity) with streaming and session resume",
+  "description": "Muster \u2014 an open-source coordinator for multiple AI CLIs (Claude, Grok, Codex, Antigravity) with streaming and session resume",
   "repository": {
     "type": "git",
     "url": "https://github.com/lploc94/muster.git"
@@ -46,7 +46,14 @@
       "properties": {
         "muster.execution.runLimit": {
           "type": "string",
-          "enum": ["15m", "30m", "1h", "2h", "4h", "8h"],
+          "enum": [
+            "15m",
+            "30m",
+            "1h",
+            "2h",
+            "4h",
+            "8h"
+          ],
           "enumDescriptions": [
             "15 minutes",
             "30 minutes",
@@ -134,21 +141,41 @@
             }
           },
           "scope": "resource",
-          "description": "Named task type presets (id → { backend, model?, role?, briefKind?, description? }). Muster ships defaults (no model pins); edit in Settings or VS Code settings.json. Explicit empty map fails closed for create/delegate.",
+          "description": "Named task type presets (id \u2192 { backend, model?, role?, briefKind?, description? }). Muster ships defaults (no model pins); edit in Settings or VS Code settings.json. Explicit empty map fails closed for create/delegate.",
           "additionalProperties": {
             "type": "object",
-            "required": ["backend"],
+            "required": [
+              "backend"
+            ],
             "properties": {
-              "backend": { "type": "string", "description": "ACP backend id (e.g. codex, grok, opencode)." },
-              "model": { "type": "string", "description": "Optional ACP model id for this type." },
+              "backend": {
+                "type": "string",
+                "description": "ACP backend id (e.g. codex, grok, opencode)."
+              },
+              "model": {
+                "type": "string",
+                "description": "Optional ACP model id for this type."
+              },
               "role": {
                 "type": "string",
-                "enum": ["coordinator", "worker"],
+                "enum": [
+                  "coordinator",
+                  "worker"
+                ],
                 "description": "Default child role (default worker)."
               },
               "briefKind": {
                 "type": "string",
-                "enum": ["coordinate", "plan", "breakdown", "implement", "test", "verify", "research", "generic"],
+                "enum": [
+                  "coordinate",
+                  "plan",
+                  "breakdown",
+                  "implement",
+                  "test",
+                  "verify",
+                  "research",
+                  "generic"
+                ],
                 "description": "Default brief.kind preamble for children of this type."
               },
               "description": {
@@ -203,6 +230,12 @@
     "test:settings-webview": "playwright test e2e/muster-webview-state.spec.ts",
     "test:settings-acceptance": "npm test && npm run compile && npm run check:svelte && npm run test:source-boundary && npm run test:evidence && npm run test:settings-docs && npm run test:settings-live-evidence && npm run test:settings-webview",
     "test:webview": "playwright test e2e/muster-webview-state.spec.ts",
+    "test:webview:visual": "playwright test e2e/visual/muster-webview.visual.spec.ts --project=visual-chromium",
+    "test:presentation:visual": "playwright test e2e/visual/muster-presentation.visual.spec.ts --project=visual-chromium",
+    "test:visual": "playwright test e2e/visual --project=visual-chromium",
+    "test:visual:update": "playwright test e2e/visual --project=visual-chromium --update-snapshots",
+    "test:visual:linux": "node scripts/run-visual-baselines.mjs",
+    "test:visual:linux:update": "node scripts/run-visual-baselines.mjs --update",
     "test:presentation-integration": "vitest run src/task/presentation-tool-auth.test.ts src/host/presentation-tool-router.test.ts src/host/presentation-manager.test.ts src/host/presentation-panel-adapter.test.ts src/host/presentation-chat-link.test.ts src/host/presentation-revision-loop.test.ts src/host/webview-security.test.ts && npm run compile && npm run test:webview -- e2e/muster-presentation.spec.ts",
     "test:presentation-live-evidence": "node --test scripts/verify-presentation-live-host-evidence.test.mjs",
     "test:presentation-docs": "node --test scripts/verify-presentation-docs.test.mjs",
@@ -218,7 +251,11 @@
     "test:source-boundary": "node scripts/source-boundary-smoke.mjs",
     "test:evidence": "node --test scripts/verify-verification-evidence.test.mjs",
     "test:source-boundary:fixtures": "node --test scripts/source-boundary-smoke.test.mjs",
-    "mvp:grok-interrupt-and-send": "tsx scripts/test-grok-interrupt-and-send.ts"
+    "mvp:grok-interrupt-and-send": "tsx scripts/test-grok-interrupt-and-send.ts",
+    "test:webview:visual:linux": "node scripts/run-visual-baselines.mjs e2e/visual/muster-webview.visual.spec.ts",
+    "test:webview:visual:linux:update": "node scripts/run-visual-baselines.mjs --update e2e/visual/muster-webview.visual.spec.ts",
+    "test:presentation:visual:linux": "node scripts/run-visual-baselines.mjs e2e/visual/muster-presentation.visual.spec.ts",
+    "test:presentation:visual:linux:update": "node scripts/run-visual-baselines.mjs --update e2e/visual/muster-presentation.visual.spec.ts"
   },
   "devDependencies": {
     "@playwright/test": "^1.61.1",

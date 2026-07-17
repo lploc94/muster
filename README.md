@@ -94,6 +94,8 @@ Dev-only file IPC proof — production design uses [Muster Bridge](docs/MUSTER-B
 | [docs/SETTINGS.md](docs/SETTINGS.md) | Host-backed Settings pattern |
 | [docs/SETTINGS-DESIGN.md](docs/SETTINGS-DESIGN.md) | Adopted four-domain Settings information architecture; three actionable tabs rendered and Connections reserved |
 | [docs/WEBVIEW.md](docs/WEBVIEW.md) | Chat UI, read-only presentation review/revision, and task Markdown export UX |
+| [docs/UI-VISUAL-REGRESSION.md](docs/UI-VISUAL-REGRESSION.md) | Pinned Linux visual baselines: compare, explicit update, CI artifacts, troubleshooting |
+| [docs/UI-IMPROVEMENT-ROADMAP.md](docs/UI-IMPROVEMENT-ROADMAP.md) | Deferred prioritized UI work (a11y, hit targets, motion, theme/zoom, density) — not implemented in M014 |
 
 Full index: [docs/README.md](docs/README.md).
 

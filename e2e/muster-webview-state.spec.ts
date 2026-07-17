@@ -3,6 +3,10 @@ import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {
+  openMusterWebview,
+  readMusterWebviewState,
+} from './fixtures/muster-webview';
+import {
   isFileMentionDirectorySymlink,
   listFileMentionSuggestions,
 } from '../src/host/file-mention-suggestions';
@@ -113,42 +117,16 @@ interface CommandErrorMessage {
 }
 
 async function openWebview(page: Page, options?: { initialState?: unknown }) {
-  await page.addInitScript((seed) => {
-    // Seed survives reload when tests re-open with captured getState/setState data.
-    // State is exposed on window so hide/reveal checks can capture the bag.
-    const bag = { value: seed as unknown };
-    (window as unknown as { __musterVsCodeState: { value: unknown } }).__musterVsCodeState = bag;
-    window.acquireVsCodeApi = () => ({
-      postMessage(message: unknown) {
-        // Match VS Code's webview boundary: messages must survive structured
-        // clone. This catches accidental Svelte `$state` Proxy payloads.
-        const cloned = structuredClone(message);
-        window.__musterPostedMessages = [...(window.__musterPostedMessages ?? []), cloned];
-        window.dispatchEvent(new CustomEvent('muster:test:postMessage', { detail: cloned }));
-      },
-      getState() {
-        return (window as unknown as { __musterVsCodeState: { value: unknown } }).__musterVsCodeState
-          .value;
-      },
-      setState(nextState: unknown) {
-        (window as unknown as { __musterVsCodeState: { value: unknown } }).__musterVsCodeState.value =
-          nextState;
-      },
-    });
-  }, options?.initialState ?? undefined);
-
-  await page.goto('/');
-  await page.evaluate(() => {
-    window.__musterPostedMessages = [];
+  // Shared harness: structured-clone VS Code API mock + deterministic open path.
+  await openMusterWebview(page, {
+    initialState: options?.initialState,
+    structuredCloneMessages: true,
+    stateMode: 'bag',
   });
-  await expect(page.getByText('New task')).toBeVisible();
 }
 
 async function readVsCodeState(page: Page): Promise<unknown> {
-  return page.evaluate(() => {
-    const bag = (window as unknown as { __musterVsCodeState?: { value: unknown } }).__musterVsCodeState;
-    return bag?.value;
-  });
+  return readMusterWebviewState(page);
 }
 
 /** Seed a full ok task-types host snapshot for Settings flow tests. */
