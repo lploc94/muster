@@ -109,6 +109,7 @@ npm run test:visual:linux -- --grep "M014 S01 flow: deterministic dual-entrypoin
 | Entrypoint | Pilot ID | Spec |
 |------------|----------|------|
 | Main webview | `V01-webview-compact-dark` | `e2e/visual/muster-webview.visual.spec.ts` |
-| Presentation | `V02-presentation-rich-dark` | `e2e/visual/muster-presentation.visual.spec.ts` |
+| Presentation (rich, dark) | `V02-presentation-rich-dark` | `e2e/visual/muster-presentation.visual.spec.ts` |
+| Presentation (narrow, light) | `V06-presentation-narrow-light` | `e2e/visual/muster-presentation.visual.spec.ts` |
 | Dual-entrypoint flow | `M014 S01 flow: deterministic dual-entrypoint pilot` | `e2e/visual/m014-slice-flows.spec.ts` |
 

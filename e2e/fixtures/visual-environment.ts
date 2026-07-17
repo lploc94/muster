@@ -6,6 +6,9 @@ export const VISUAL_CLOCK_ISO = '2026-03-15T12:00:00.000Z';
 /** Compact main-webview containment for risk-coverage matrix cases. */
 export const COMPACT_WEBVIEW_VIEWPORT = { width: 320, height: 600 } as const;
 
+/** Narrow Presentation containment viewport (overflow-safe chrome + TOC collapse risk). */
+export const NARROW_PRESENTATION_VIEWPORT = { width: 360, height: 600 } as const;
+
 /** Pinned locale for visual pilots and Playwright project config. */
 export const VISUAL_LOCALE = 'en-US';
 
@@ -729,7 +732,7 @@ export function createStaticFileMentionSuggestions(
   };
 }
 
-/** Static Presentation pilot fixture. */
+/** Static rich Presentation pilot fixture (Markdown, table, code, links, Mermaid). */
 export function createStaticPresentationFixture() {
   const fixture = {
     presentationId: 'visual-pilot-presentation',
@@ -741,9 +744,16 @@ export function createStaticPresentationFixture() {
       '',
       'Synthetic document used only for deterministic screenshots.',
       '',
+      'See the [synthetic guide](https://example.invalid/visual-guide) for fixture rules.',
+      '',
       '| Area | State |',
       '| --- | --- |',
       '| Baseline | Pinned |',
+      '| Theme | Synthetic dark |',
+      '',
+      '```ts',
+      'const ready: boolean = true;',
+      '```',
       '',
       '```mermaid',
       'flowchart LR',
@@ -752,6 +762,56 @@ export function createStaticPresentationFixture() {
     ].join('\n'),
     kind: 'document' as const,
     sourcePath: 'synthetic/visual-pilot.md',
+    updatedAt: VISUAL_CLOCK_ISO,
+  };
+  assertSanitizedVisualFixture(fixture);
+  return fixture;
+}
+
+/**
+ * Static narrow-containment Presentation fixture.
+ * Longer TOC-oriented body exercises overflow-safe chrome at NARROW_PRESENTATION_VIEWPORT.
+ */
+export function createStaticNarrowPresentationFixture() {
+  const sectionBody = (label: string) =>
+    [
+      `## ${label}`,
+      '',
+      `Synthetic ${label.toLowerCase()} body for narrow containment screenshots.`,
+      '',
+      'Relative source only: [notes](https://example.invalid/narrow-notes).',
+      '',
+    ].join('\n');
+
+  const fixture = {
+    presentationId: 'visual-narrow-presentation',
+    ownerTaskId: 'task-visual-narrow',
+    revision: 2,
+    title: 'Narrow containment presentation',
+    markdown: [
+      '# Narrow containment presentation',
+      '',
+      'Deterministic narrow layout fixture — no live timestamps or host paths.',
+      '',
+      '| Area | State |',
+      '| --- | --- |',
+      '| Containment | Narrow |',
+      '| Theme | Synthetic light |',
+      '',
+      '```ts',
+      'const narrow: boolean = true;',
+      '```',
+      '',
+      sectionBody('Section Alpha'),
+      sectionBody('Section Beta'),
+      sectionBody('Section Gamma'),
+      '```mermaid',
+      'flowchart TD',
+      '  N[Narrow] --> C[Contained]',
+      '```',
+    ].join('\n'),
+    kind: 'document' as const,
+    sourcePath: 'synthetic/visual-narrow.md',
     updatedAt: VISUAL_CLOCK_ISO,
   };
   assertSanitizedVisualFixture(fixture);

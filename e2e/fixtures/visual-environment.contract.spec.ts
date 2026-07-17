@@ -1,11 +1,13 @@
 import { expect, test } from '@playwright/test';
 import {
+  NARROW_PRESENTATION_VIEWPORT,
   VISUAL_CLOCK_ISO,
   VISUAL_FONT_STACK,
   VISUAL_LOCALE,
   VISUAL_PLAYWRIGHT_USE,
   VISUAL_TIMEZONE,
   assertSanitizedVisualFixture,
+  createStaticNarrowPresentationFixture,
   createStaticPresentationFixture,
   createStaticWebviewFixture,
   ensureVisualEnvironmentApplied,
@@ -62,8 +64,20 @@ test('installs deterministic visual environment seams for screenshot authoring',
 
   const webviewFixture = createStaticWebviewFixture();
   const presentationFixture = createStaticPresentationFixture();
+  const narrowFixture = createStaticNarrowPresentationFixture();
   expect(() => assertSanitizedVisualFixture(webviewFixture)).not.toThrow();
   expect(() => assertSanitizedVisualFixture(presentationFixture)).not.toThrow();
+  expect(() => assertSanitizedVisualFixture(narrowFixture)).not.toThrow();
+  expect(presentationFixture.markdown).toMatch(/```ts/);
+  expect(presentationFixture.markdown).toMatch(/```mermaid/);
+  expect(presentationFixture.markdown).toMatch(/\[.*\]\(https:\/\/example\.invalid\//);
+  expect(presentationFixture.markdown).toMatch(/\| Area \| State \|/);
+  expect(narrowFixture.presentationId).toBe('visual-narrow-presentation');
+  expect(narrowFixture.revision).toBe(2);
+  expect(narrowFixture.updatedAt).toBe(VISUAL_CLOCK_ISO);
+  expect(narrowFixture.markdown).toMatch(/## Section/);
+  expect(narrowFixture.markdown).toMatch(/```ts/);
+  expect(NARROW_PRESENTATION_VIEWPORT).toEqual({ width: 360, height: 600 });
   expect(() =>
     assertSanitizedVisualFixture({
       markdown: 'C:/Users/secret/project and sk-live-abcdefghijklmnopqrstuvwxyz012345',
