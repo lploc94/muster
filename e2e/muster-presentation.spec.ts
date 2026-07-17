@@ -348,6 +348,209 @@ test('preserves the last accepted revision after malformed, stale, or conflictin
   });
 });
 
+async function installScrollIntoViewSpy(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    type ScrollCall = { behavior?: ScrollBehavior | string };
+    const calls: ScrollCall[] = [];
+    (window as Window & { __musterScrollIntoViewCalls?: ScrollCall[] }).__musterScrollIntoViewCalls = calls;
+    const original = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function scrollIntoViewSpy(
+      this: Element,
+      arg?: boolean | ScrollIntoViewOptions,
+    ) {
+      if (arg && typeof arg === 'object') {
+        calls.push({ behavior: arg.behavior });
+      } else {
+        calls.push({ behavior: undefined });
+      }
+      return original.call(this, arg as never);
+    };
+  });
+}
+
+async function clearScrollIntoViewCalls(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const bag = window as Window & { __musterScrollIntoViewCalls?: Array<{ behavior?: ScrollBehavior | string }> };
+    if (bag.__musterScrollIntoViewCalls) bag.__musterScrollIntoViewCalls.length = 0;
+  });
+}
+
+async function scrollIntoViewBehaviors(page: Page): Promise<Array<ScrollBehavior | string | undefined>> {
+  return page.evaluate(() => {
+    const bag = window as Window & { __musterScrollIntoViewCalls?: Array<{ behavior?: ScrollBehavior | string }> };
+    return (bag.__musterScrollIntoViewCalls ?? []).map((call) => call.behavior);
+  });
+}
+
+function multiHeadingMarkdown(): string {
+  const filler = Array.from({ length: 24 }, () => 'Paragraph of presentation body content for scroll distance.').join('\n\n');
+  return [
+    '# Overview',
+    '',
+    filler,
+    '',
+    '## First section',
+    '',
+    filler,
+    '',
+    '## Second section',
+    '',
+    filler,
+    '',
+    '## Third section',
+    '',
+    filler,
+  ].join('\n');
+}
+
+test('presentation reduced-motion heading scroll does not use smooth behavior', async ({ page }) => {
+  // JS scrollIntoView({ behavior }) is the gate — CSS reduced-motion alone cannot stop it.
+  await installScrollIntoViewSpy(page);
+  await page.setViewportSize({ width: 900, height: 640 });
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+
+  await openPresentation(page, presentation({
+    title: 'Reduced motion plan',
+    markdown: multiHeadingMarkdown(),
+  }));
+
+  const toc = page.getByRole('navigation', { name: 'Contents' });
+  await expect(toc).toBeVisible();
+  await expect(toc.getByRole('link', { name: 'Third section' })).toBeVisible();
+
+  await clearScrollIntoViewCalls(page);
+  await toc.getByRole('link', { name: 'Third section' }).click();
+
+  await expect.poll(async () => {
+    const behaviors = await scrollIntoViewBehaviors(page);
+    return behaviors.filter((behavior) => behavior !== undefined);
+  }).not.toEqual([]);
+
+  const reducedBehaviors = (await scrollIntoViewBehaviors(page)).filter((behavior) => behavior !== undefined);
+  // Under prefers-reduced-motion, heading navigation must request instant scroll.
+  for (const behavior of reducedBehaviors) {
+    expect(['auto', 'instant']).toContain(behavior);
+    expect(behavior).not.toBe('smooth');
+  }
+  await expect(page.locator('a.presentation-toc__item.active')).toHaveAttribute('data-toc-href', 'third-section');
+
+  // Control: without reduced motion, smooth remains the preferred heading-nav behavior.
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
+  await clearScrollIntoViewCalls(page);
+  await toc.getByRole('link', { name: 'Second section' }).click();
+
+  await expect.poll(async () => {
+    const behaviors = await scrollIntoViewBehaviors(page);
+    return behaviors.filter((behavior) => behavior !== undefined);
+  }).not.toEqual([]);
+
+  const preferredBehaviors = (await scrollIntoViewBehaviors(page)).filter((behavior) => behavior !== undefined);
+  expect(preferredBehaviors).toContain('smooth');
+});
+
+test('M015 S03 flow: presentation reduced motion', async ({ page }) => {
+  // Assembled S03 closeout: reduced-motion instant heading nav + smooth control + clean console.
+  const consoleErrors: string[] = [];
+  const pageErrors: string[] = [];
+  const failedRequests: string[] = [];
+
+  page.on('console', (msg) => {
+    if (msg.type() !== 'error') return;
+    const text = msg.text();
+    // Chromium logs HTTP status on optional subresources (favicon/fonts) as console.error.
+    // Those are not app pageerrors and do not surface on requestfailed when the response completes.
+    if (/Failed to load resource: the server responded with a status of (403|404)/i.test(text)) return;
+    consoleErrors.push(text);
+  });
+  page.on('pageerror', (err) => {
+    pageErrors.push(err.message);
+  });
+  page.on('requestfailed', (req) => {
+    // Ignore aborted navigations / optional assets that do not affect presentation heading nav.
+    const failure = req.failure();
+    if (failure?.errorText === 'net::ERR_ABORTED') return;
+    failedRequests.push(`${req.method()} ${req.url()} ${failure?.errorText ?? 'failed'}`);
+  });
+
+  await installScrollIntoViewSpy(page);
+  await page.setViewportSize({ width: 900, height: 640 });
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+
+  await openPresentation(page, presentation({
+    title: 'S03 reduced motion flow',
+    markdown: multiHeadingMarkdown(),
+  }));
+
+  const toc = page.getByRole('navigation', { name: 'Contents' });
+  await expect(toc).toBeVisible();
+  const third = toc.getByRole('link', { name: 'Third section' });
+  await expect(third).toBeVisible();
+
+  await clearScrollIntoViewCalls(page);
+  await third.click();
+
+  await expect.poll(async () => {
+    const behaviors = await scrollIntoViewBehaviors(page);
+    return behaviors.filter((behavior) => behavior !== undefined);
+  }).not.toEqual([]);
+
+  const reducedBehaviors = (await scrollIntoViewBehaviors(page)).filter((behavior) => behavior !== undefined);
+  for (const behavior of reducedBehaviors) {
+    expect(['auto', 'instant']).toContain(behavior);
+    expect(behavior).not.toBe('smooth');
+  }
+
+  // Instant scroll reaches the target inside the nested content scroller and marks active TOC.
+  await expect(page.locator('a.presentation-toc__item.active')).toHaveAttribute('data-toc-href', 'third-section');
+  await expect.poll(async () => {
+    return page.evaluate(() => {
+      const heading = document.querySelector('#third-section');
+      const viewport = document.querySelector('.presentation-content-scroll');
+      if (!(heading instanceof HTMLElement) || !(viewport instanceof HTMLElement)) return null;
+      const h = heading.getBoundingClientRect();
+      const v = viewport.getBoundingClientRect();
+      // block:'start' places the heading near the top of the nested scroll container.
+      return {
+        scrollTop: viewport.scrollTop,
+        deltaTop: Math.abs(h.top - v.top),
+      };
+    });
+  }).toEqual(expect.objectContaining({
+    // Must have scrolled away from the top of the long document.
+    scrollTop: expect.any(Number),
+  }));
+  const thirdScroll = await page.evaluate(() => {
+    const heading = document.querySelector('#third-section');
+    const viewport = document.querySelector('.presentation-content-scroll');
+    if (!(heading instanceof HTMLElement) || !(viewport instanceof HTMLElement)) {
+      return { scrollTop: 0, deltaTop: Number.POSITIVE_INFINITY };
+    }
+    const h = heading.getBoundingClientRect();
+    const v = viewport.getBoundingClientRect();
+    return { scrollTop: viewport.scrollTop, deltaTop: Math.abs(h.top - v.top) };
+  });
+  expect(thirdScroll.scrollTop).toBeGreaterThan(100);
+  expect(thirdScroll.deltaTop).toBeLessThan(48);
+
+  // Control path: without reduced motion, heading navigation still requests smooth scroll.
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
+  await clearScrollIntoViewCalls(page);
+  await toc.getByRole('link', { name: 'Second section' }).click();
+
+  await expect.poll(async () => {
+    const behaviors = await scrollIntoViewBehaviors(page);
+    return behaviors.filter((behavior) => behavior !== undefined);
+  }).not.toEqual([]);
+
+  const preferredBehaviors = (await scrollIntoViewBehaviors(page)).filter((behavior) => behavior !== undefined);
+  expect(preferredBehaviors).toContain('smooth');
+  await expect(page.locator('a.presentation-toc__item.active')).toHaveAttribute('data-toc-href', 'second-section');
+
+  expect(consoleErrors, `console errors: ${consoleErrors.join(' | ')}`).toEqual([]);
+  expect(pageErrors, `page errors: ${pageErrors.join(' | ')}`).toEqual([]);
+  expect(failedRequests, `failed requests: ${failedRequests.join(' | ')}`).toEqual([]);
+});
+
 declare global {
   interface Window {
     acquireVsCodeApi: () => {
@@ -357,5 +560,6 @@ declare global {
     };
     __musterPostedMessages?: unknown[];
     __musterPersistedState?: unknown;
+    __musterScrollIntoViewCalls?: Array<{ behavior?: ScrollBehavior | string }>;
   }
 }

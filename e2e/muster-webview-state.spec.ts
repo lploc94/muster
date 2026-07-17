@@ -8359,6 +8359,406 @@ test.describe('Task-tree chrome navigation', () => {
 
 });
 
+
+test.describe('M015 S01 task list search and rename accessibility', () => {
+  test('search accessible name', async ({ page }) => {
+    await openWebview(page);
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-a11y-search', goal: 'Named search target', viewStatus: 'idle' })],
+      storeRevision: 1501,
+    });
+
+    // Acceptance: resolve by accessible name (not placeholder-only).
+    // Requires type="search" + aria-label="Search tasks" (T02).
+    await expect(page.getByRole('searchbox', { name: 'Search tasks' })).toBeVisible();
+  });
+
+  test('rename focus and invalid', async ({ page }) => {
+    await openWebview(page);
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-a11y-rename', goal: 'Rename me please', viewStatus: 'idle' })],
+      storeRevision: 1502,
+    });
+
+    // Full list is the default shell (no focusedTaskId).
+    await expect(page.getByRole('searchbox', { name: 'Search tasks' })).toBeVisible();
+
+    const row = page.locator('.group').filter({ hasText: 'Rename me please' }).first();
+    await row.hover();
+    await page.getByRole('button', { name: 'Rename task' }).click();
+
+    // Rename field must resolve by accessible name (T02 wires aria-label="Task name").
+    const renameField = page.getByRole('textbox', { name: 'Task name' });
+    await expect(renameField).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Save name' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Cancel rename' })).toBeVisible();
+
+    // Invalid empty/whitespace must surface associated error text, not silently exit edit mode.
+    await renameField.fill('   ');
+    await page.getByRole('button', { name: 'Save name' }).click();
+
+    await expect(renameField).toBeVisible();
+    await expect(renameField).toHaveAttribute('aria-invalid', 'true');
+    const describedBy = await renameField.getAttribute('aria-describedby');
+    expect(describedBy, 'rename field must expose aria-describedby for the invalid-state message').toBeTruthy();
+    // Prefer attribute selector: Node test runner has no browser CSS.escape global.
+    const error = page.locator(`[id="${describedBy}"]`);
+    await expect(error).toBeVisible();
+    await expect(error).toContainText(/empty|name|required|whitespace/i);
+  });
+
+  test('M015 S01 flow: task search and rename a11y', async ({ page }) => {
+    const consoleErrors: string[] = [];
+    const pageErrors: string[] = [];
+    const failedRequests: string[] = [];
+    // Harness noise: optional assets (favicon/codicon font) may 403 or abort under vite without app impact.
+    const isHarnessNoise = (text: string) =>
+      /403\s*\(Forbidden\)/i.test(text) ||
+      /Failed to load resource:.*403/i.test(text) ||
+      /favicon\.ico/i.test(text) ||
+      /codicon\.(ttf|woff2?|css)/i.test(text) ||
+      /@vscode\/codicons/i.test(text) ||
+      /net::ERR_ABORTED/i.test(text);
+    page.on('console', (msg) => {
+      if (msg.type() !== 'error') return;
+      const text = msg.text();
+      if (isHarnessNoise(text)) return;
+      consoleErrors.push(text);
+    });
+    page.on('pageerror', (err) => {
+      pageErrors.push(String(err?.message ?? err));
+    });
+    page.on('requestfailed', (req) => {
+      const entry = `${req.method()} ${req.url()} ${req.failure()?.errorText ?? ''}`;
+      if (isHarnessNoise(entry) || /favicon\.ico/i.test(req.url())) return;
+      failedRequests.push(entry);
+    });
+
+    await openWebview(page);
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [
+        task({ id: 'task-m015-s01-keep', goal: 'Alpha keep-me target', viewStatus: 'idle' }),
+        task({ id: 'task-m015-s01-hide', goal: 'Beta hide-me other', viewStatus: 'idle' }),
+      ],
+      storeRevision: 1503,
+    });
+
+    // 1) Named search control filters the full task list.
+    const search = page.getByRole('searchbox', { name: 'Search tasks' });
+    await expect(search).toBeVisible();
+    await search.fill('keep-me');
+    await expect(page.getByText('Alpha keep-me target')).toBeVisible();
+    await expect(page.getByText('Beta hide-me other')).toHaveCount(0);
+
+    // Clear filter so rename targets the keep-me row in a full list context.
+    await search.fill('');
+    await expect(page.getByText('Beta hide-me other')).toBeVisible();
+
+    // 2) Enter rename mode; field + Save/Cancel resolve by accessible name.
+    // Scope rename to the row — full list has one Rename control per task.
+    const row = page.locator('.group').filter({ hasText: 'Alpha keep-me target' }).first();
+    await row.hover();
+    await row.getByRole('button', { name: 'Rename task' }).click();
+
+    const renameField = page.getByRole('textbox', { name: 'Task name' });
+    const saveBtn = page.getByRole('button', { name: 'Save name' });
+    const cancelBtn = page.getByRole('button', { name: 'Cancel rename' });
+    await expect(renameField).toBeVisible();
+    await expect(saveBtn).toBeVisible();
+    await expect(cancelBtn).toBeVisible();
+
+    // 3) Invalid whitespace first so later focus probes that blur the field keep edit mode open.
+    await renameField.fill('   ');
+    await saveBtn.click();
+    await expect(renameField).toBeVisible();
+    await expect(renameField).toHaveAttribute('aria-invalid', 'true');
+    const describedBy = await renameField.getAttribute('aria-describedby');
+    expect(describedBy, 'rename field must expose aria-describedby for the invalid-state message').toBeTruthy();
+    const error = page.locator(`[id="${describedBy}"]`);
+    await expect(error).toBeVisible();
+    await expect(error).toContainText(/empty|name|required|whitespace/i);
+
+    // 4) Visible :focus-visible rings on rename field + Save/Cancel (shared focus tokens).
+    // FocusOptions.focusVisible marks keyboard modality so Chromium applies the ring CSS.
+    // Seed invalid state above so onblur commit keeps edit mode while probing buttons.
+    const expectVisibleFocusRing = async (
+      locator: import('@playwright/test').Locator,
+      label: string,
+    ) => {
+      await locator.evaluate((el) => {
+        (el as HTMLElement).focus({ focusVisible: true } as FocusOptions);
+      });
+      const ring = await locator.evaluate((el) => {
+        const style = window.getComputedStyle(el);
+        return {
+          active: document.activeElement === el,
+          focusVisible: el.matches(':focus-visible'),
+          outlineStyle: style.outlineStyle,
+          outlineWidth: style.outlineWidth,
+          outlineColor: style.outlineColor,
+          className: el.className,
+        };
+      });
+      expect(ring.active, `${label} should be document.activeElement: ${JSON.stringify(ring)}`).toBe(true);
+      expect(ring.focusVisible, `${label} should match :focus-visible: ${JSON.stringify(ring)}`).toBe(true);
+      expect(ring.outlineStyle, `${label} outline style: ${JSON.stringify(ring)}`).toBe('solid');
+      expect(ring.outlineWidth, `${label} outline width: ${JSON.stringify(ring)}`).toBe('1px');
+    };
+
+    await expectVisibleFocusRing(renameField, 'Task name');
+    await expectVisibleFocusRing(saveBtn, 'Save name');
+    await expect(renameField).toBeVisible(); // still editing after Save focus (invalid name)
+    await expectVisibleFocusRing(cancelBtn, 'Cancel rename');
+    await expect(renameField).toBeVisible(); // still editing after Cancel focus (invalid name)
+
+    // 5) Correct name and Save successfully → renameTask host message + exit edit mode.
+    const before = (await postedMessages(page)).length;
+    await renameField.fill('Alpha renamed keep-me');
+    await saveBtn.click();
+
+    await expect(renameField).toHaveCount(0);
+    await expect
+      .poll(async () => {
+        const messages = await postedMessages(page);
+        return messages.slice(before).some((m) => {
+          const msg = m as { type?: string; taskId?: string; goal?: string };
+          return (
+            msg.type === 'renameTask' &&
+            msg.taskId === 'task-m015-s01-keep' &&
+            msg.goal === 'Alpha renamed keep-me'
+          );
+        });
+      })
+      .toBe(true);
+
+    // Console and network stay clean for this assembled a11y flow.
+    expect(consoleErrors, `console errors: ${consoleErrors.join(' | ')}`).toEqual([]);
+    expect(pageErrors, `page errors: ${pageErrors.join(' | ')}`).toEqual([]);
+    expect(failedRequests, `failed requests: ${failedRequests.join(' | ')}`).toEqual([]);
+  });
+});
+
+
+test.describe('M015 S02 compact hit targets', () => {
+  /**
+   * Hit-target policy (T01 RED / T02 GREEN):
+   * - Compact standard for .icon-btn: >= 28x28 CSS px
+   * - Dense exception (settings-panel__icon-btn or .icon-btn--dense): >= 26x26 CSS px
+   * Silent inline width/height shrinks below the applicable minimum are not allowed.
+   *
+   * Audit (T02 GREEN):
+   * - TaskList Clear search: .icon-btn → compact 28
+   * - TaskList Rename/Save/Cancel/Delete: .icon-btn.icon-btn--dense → dense 26 (no inline shrink)
+   * - Composer Settings / toolbar icons: .icon-btn, no silent inline size → compact 28
+   * - settings-panel__icon-btn: mapped to dense floor 26 in app.css
+   */
+  test('icon controls meet compact hit targets', async ({ page }) => {
+    const COMPACT_MIN = 28;
+    const DENSE_MIN = 26;
+
+    await openWebview(page);
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-hit-target', goal: 'Hit target sample task', viewStatus: 'idle' })],
+      storeRevision: 1520,
+    });
+
+    const assertHitTarget = async (
+      locator: import('@playwright/test').Locator,
+      label: string,
+      options?: { dense?: boolean },
+    ) => {
+      await expect(locator, `${label} should be visible`).toBeVisible();
+      const box = await locator.boundingBox();
+      expect(box, `${label} should have a bounding box`).toBeTruthy();
+      const min = options?.dense ? DENSE_MIN : COMPACT_MIN;
+      const meta = await locator.evaluate((el) => {
+        const style = (el as HTMLElement).getAttribute('style') ?? '';
+        const className = (el as HTMLElement).className ?? '';
+        const cs = window.getComputedStyle(el as HTMLElement);
+        return {
+          style,
+          className,
+          width: cs.width,
+          height: cs.height,
+          minWidth: cs.minWidth,
+          minHeight: cs.minHeight,
+        };
+      });
+      // Silent inline shrinks below the applicable minimum are policy violations.
+      const inlineW = /width:\s*(\d+(?:\.\d+)?)px/i.exec(meta.style);
+      const inlineH = /height:\s*(\d+(?:\.\d+)?)px/i.exec(meta.style);
+      if (inlineW) {
+        expect(
+          Number(inlineW[1]),
+          `${label} silent inline width ${inlineW[1]}px must be >= ${min} (${JSON.stringify(meta)})`,
+        ).toBeGreaterThanOrEqual(min);
+      }
+      if (inlineH) {
+        expect(
+          Number(inlineH[1]),
+          `${label} silent inline height ${inlineH[1]}px must be >= ${min} (${JSON.stringify(meta)})`,
+        ).toBeGreaterThanOrEqual(min);
+      }
+      expect(
+        box!.width,
+        `${label} width ${box!.width}px must be >= ${min} CSS px (${JSON.stringify({ box, meta })})`,
+      ).toBeGreaterThanOrEqual(min - 0.5);
+      expect(
+        box!.height,
+        `${label} height ${box!.height}px must be >= ${min} CSS px (${JSON.stringify({ box, meta })})`,
+      ).toBeGreaterThanOrEqual(min - 0.5);
+    };
+
+    // 1) Task-list clear-search (compact .icon-btn).
+    const search = page.getByRole('searchbox', { name: 'Search tasks' });
+    await expect(search).toBeVisible();
+    await search.fill('Hit target');
+    const clearSearch = page.getByRole('button', { name: 'Clear search' });
+    await assertHitTarget(clearSearch, 'Clear search');
+
+    // Row chrome uses explicit dense variant (no silent inline shrink).
+    const row = page.locator('.group').filter({ hasText: 'Hit target sample task' }).first();
+    await row.hover();
+    const renameBtn = row.getByRole('button', { name: 'Rename task' });
+    await assertHitTarget(renameBtn, 'Rename task', { dense: true });
+    const renameMeta = await renameBtn.evaluate((el) => ({
+      className: (el as HTMLElement).className ?? '',
+      style: (el as HTMLElement).getAttribute('style') ?? '',
+    }));
+    expect(renameMeta.className, 'Rename task must use icon-btn--dense').toMatch(/icon-btn--dense/);
+    expect(renameMeta.style, 'Rename task must not use silent inline width/height').not.toMatch(
+      /width\s*:|height\s*:/i,
+    );
+
+    // 2) Representative composer icon control (compact).
+    const composerSettings = page.getByRole('button', { name: 'Settings', exact: true });
+    await assertHitTarget(composerSettings, 'Composer Settings');
+
+    // 3) Representative settings icon control (header back uses standard .icon-btn).
+    // Dense floor for settings-panel__icon-btn is documented/mapped in app.css.
+    await composerSettings.click();
+    const backToTasks = page.getByRole('button', { name: 'Back to tasks' });
+    await assertHitTarget(backToTasks, 'Back to tasks');
+  });
+
+  /**
+   * M015 S02 assembled flow evidence: one scenario at 320px samples critical
+   * migrated icon controls against compact/dense floors, bans silent inline
+   * shrinks, and keeps console + failed requests clean.
+   */
+  test('M015 S02 flow: compact hit targets', async ({ page }) => {
+    const COMPACT_MIN = 28;
+    const DENSE_MIN = 26;
+
+    const consoleErrors: string[] = [];
+    const pageErrors: string[] = [];
+    const failedRequests: string[] = [];
+    // Harness noise: optional assets (favicon/codicon font) may 403 or abort under vite without app impact.
+    const isHarnessNoise = (text: string) =>
+      /403\s*\(Forbidden\)/i.test(text) ||
+      /Failed to load resource:.*403/i.test(text) ||
+      /favicon\.ico/i.test(text) ||
+      /codicon\.(ttf|woff2?|css)/i.test(text) ||
+      /@vscode\/codicons/i.test(text) ||
+      /net::ERR_ABORTED/i.test(text);
+    page.on('console', (msg) => {
+      if (msg.type() !== 'error') return;
+      const text = msg.text();
+      if (isHarnessNoise(text)) return;
+      consoleErrors.push(text);
+    });
+    page.on('pageerror', (err) => {
+      pageErrors.push(String(err?.message ?? err));
+    });
+    page.on('requestfailed', (req) => {
+      const entry = `${req.method()} ${req.url()} ${req.failure()?.errorText ?? ''}`;
+      if (isHarnessNoise(entry) || /favicon\.ico/i.test(req.url())) return;
+      failedRequests.push(entry);
+    });
+
+    await page.setViewportSize({ width: 320, height: 720 });
+    await openWebview(page);
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-m015-s02-hit', goal: 'S02 flow hit target task', viewStatus: 'idle' })],
+      storeRevision: 1521,
+    });
+
+    const assertHitTarget = async (
+      locator: import('@playwright/test').Locator,
+      label: string,
+      options?: { dense?: boolean },
+    ) => {
+      await expect(locator, `${label} should be visible`).toBeVisible();
+      const box = await locator.boundingBox();
+      expect(box, `${label} should have a bounding box`).toBeTruthy();
+      const min = options?.dense ? DENSE_MIN : COMPACT_MIN;
+      const meta = await locator.evaluate((el) => {
+        const style = (el as HTMLElement).getAttribute('style') ?? '';
+        const className = (el as HTMLElement).className ?? '';
+        const cs = window.getComputedStyle(el as HTMLElement);
+        return {
+          style,
+          className,
+          width: cs.width,
+          height: cs.height,
+          minWidth: cs.minWidth,
+          minHeight: cs.minHeight,
+        };
+      });
+      // No silent inline shrink below the applicable floor.
+      expect(meta.style, `${label} must not use silent inline width/height`).not.toMatch(
+        /width\s*:|height\s*:/i,
+      );
+      expect(
+        box!.width,
+        `${label} width ${box!.width}px must be >= ${min} CSS px at 320px (${JSON.stringify({ box, meta })})`,
+      ).toBeGreaterThanOrEqual(min - 0.5);
+      expect(
+        box!.height,
+        `${label} height ${box!.height}px must be >= ${min} CSS px at 320px (${JSON.stringify({ box, meta })})`,
+      ).toBeGreaterThanOrEqual(min - 0.5);
+    };
+
+    // 1) Task-list clear-search (compact .icon-btn) at 320px.
+    const search = page.getByRole('searchbox', { name: 'Search tasks' });
+    await expect(search).toBeVisible();
+    await search.fill('S02 flow');
+    const clearSearch = page.getByRole('button', { name: 'Clear search' });
+    await assertHitTarget(clearSearch, 'Clear search');
+
+    // Dense row chrome: explicit .icon-btn--dense, no inline size.
+    const row = page.locator('.group').filter({ hasText: 'S02 flow hit target task' }).first();
+    await row.hover();
+    const renameBtn = row.getByRole('button', { name: 'Rename task' });
+    await assertHitTarget(renameBtn, 'Rename task', { dense: true });
+    const renameMeta = await renameBtn.evaluate((el) => ({
+      className: (el as HTMLElement).className ?? '',
+      style: (el as HTMLElement).getAttribute('style') ?? '',
+    }));
+    expect(renameMeta.className, 'Rename task must use icon-btn--dense').toMatch(/icon-btn--dense/);
+
+    // 2) Composer Settings (compact .icon-btn).
+    const composerSettings = page.getByRole('button', { name: 'Settings', exact: true });
+    await assertHitTarget(composerSettings, 'Composer Settings');
+
+    // 3) Settings header Back (compact .icon-btn).
+    await composerSettings.click();
+    const backToTasks = page.getByRole('button', { name: 'Back to tasks' });
+    await assertHitTarget(backToTasks, 'Back to tasks');
+
+    expect(consoleErrors, `console errors: ${consoleErrors.join(' | ')}`).toEqual([]);
+    expect(pageErrors, `page errors: ${pageErrors.join(' | ')}`).toEqual([]);
+    expect(failedRequests, `failed requests: ${failedRequests.join(' | ')}`).toEqual([]);
+  });
+});
+
+
+
 declare global {
   interface Window {
     acquireVsCodeApi: () => {

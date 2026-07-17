@@ -31,54 +31,77 @@ does not collapse into vague bullets.
 ### UI-01: Task-list search and rename accessibility
 
 - **Priority:** P1
-- **Evidence:** `webview/src/components/TaskList.svelte` search `<input>` uses
-  `placeholder="Search tasks…"` without an accessible name (`aria-label` /
-  `<label>`). Rename controls expose some `aria-label`s (Save/Cancel/Rename), but
-  focus-visible treatment is incomplete relative to Settings/icon-button patterns
-  (`:focus-visible` exists on settings icon buttons; task-list search chrome does
-  not guarantee equivalent keyboard focus rings).
-- **User impact:** Keyboard and screen-reader users cannot reliably discover or
-  operate task search and may lose rename focus context in the compact sidebar.
+- **Status:** **Delivered in M015 S01** (task-list search + rename a11y).
+- **Evidence (pre-fix):** `webview/src/components/TaskList.svelte` search `<input>`
+  used `placeholder="Search tasks…"` without an accessible name; rename controls
+  had partial `aria-label`s but incomplete `:focus-visible` treatment vs Settings
+  icon-button patterns.
+- **Delivered:** Search uses `type="search"` + `aria-label="Search tasks"`.
+  Rename field is named `Task name` with `aria-invalid` / `aria-describedby`
+  error association on empty/whitespace; Save/Cancel keep accessible names;
+  shared `:focus-visible` outline tokens match settings icon-button focus rings.
+  Acceptance: Playwright unit checks (`search accessible name`, `rename focus and
+  invalid`) plus assembled flow `M015 S01 flow: task search and rename a11y`.
+- **User impact addressed:** Keyboard and screen-reader users can discover task
+  search by name, see rename focus rings, and hear invalid rename errors.
 - **Acceptance direction:** Search input has a stable accessible name and
   description; rename edit field and confirm/cancel controls expose names, error
   text when invalid, and visible `:focus-visible` rings; Playwright a11y checks
   cover search + rename without requiring a visual redesign of the list.
-- **Proposed milestone boundary:** **M015** (accessibility vertical slice) —
-  ship search/rename a11y only; no task-list visual restyle beyond focus tokens.
+- **Milestone boundary:** **M015 S01** — search/rename a11y only; no task-list
+  visual restyle beyond focus tokens (dense clear-search hit-target deferred to
+  UI-02 / S02).
 
 ### UI-02: Complete hit-target policy
 
 - **Priority:** P1
-- **Evidence:** Shared toolbar `.icon-btn` documents a 28×28 CSS-pixel minimum in
-  `webview/src/app.css`, but callers override smaller hit areas (for example
-  TaskList clear-search uses inline `width: 16px; height: 16px`). Settings
-  `.settings-panel__icon-btn` uses 26×26. Policy is incomplete beyond the shared
-  toolbar class.
-- **User impact:** Compact chrome controls are easy to miss-click/miss-tap,
-  especially at 320px sidebar width and on pen/touch hosts.
+- **Status:** **Delivered in M015 S02** (compact/dense hit-target policy + icon chrome migration).
+- **Evidence (pre-fix):** Shared toolbar `.icon-btn` documented a 28×28 CSS-pixel
+  minimum in `webview/src/app.css`, but callers overrode smaller hit areas
+  (TaskList row chrome used silent inline 22×22). Settings
+  `.settings-panel__icon-btn` used 26×26 without an explicit dense policy peer.
+- **Delivered:** Repository hit-target policy next to `.icon-btn`: compact floor
+  28×28 CSS px; explicit dense exception floor 26×26 via `.icon-btn--dense` and
+  `.settings-panel__icon-btn` (min-width/min-height). TaskList row icon chrome
+  migrated off silent inline shrinks onto `.icon-btn--dense`; Composer toolbar
+  drops redundant inline 28px and relies on standard `.icon-btn`. Playwright unit
+  regression (`icon controls meet compact hit targets`) plus assembled flow
+  `M015 S02 flow: compact hit targets` at 320px sample clear-search, dense
+  rename, composer Settings, and settings Back with no silent inline shrink.
+- **User impact addressed:** Compact chrome controls no longer silently shrink
+  below the documented floors at 320px sidebar width; dense row chrome is an
+  explicit opt-in rather than an invisible override.
 - **Acceptance direction:** Repository-wide minimum hit-target policy (document
   28px practical compact target; call out any WCAG 44px exceptions) applied to
   task list, composer, presentation, and settings icon controls; ban silent
   inline shrinks without an explicit densified pattern; contract tests or
   Playwright assertions sample critical controls.
-- **Proposed milestone boundary:** **M015** or early **M016** — policy + fixes for
-  interactive chrome only; not a global spacing rewrite.
+- **Milestone boundary:** **M015 S02** — policy + fixes for interactive icon
+  chrome only; not a global spacing rewrite.
 
 ### UI-03: Presentation reduced-motion handling
 
 - **Priority:** P1
-- **Evidence:** `webview/src/Presentation.svelte` `scrollToHeading` always uses
-  `behavior: 'smooth'`. Global `prefers-reduced-motion` handling in `app.css`
+- **Status:** **Delivered in M015 S03** (Presentation heading-nav reduced-motion).
+- **Evidence (pre-fix):** `webview/src/Presentation.svelte` `scrollToHeading` always
+  used `behavior: 'smooth'`. Global `prefers-reduced-motion` handling in `app.css`
   only disables the streaming cursor blink — it does not gate Presentation
-  smooth scrolling.
-- **User impact:** Users who prefer reduced motion still receive animated scroll
-  jumps in long presentation documents, which can cause vestibular discomfort.
+  smooth scrolling. CSS alone cannot override an explicit JS `behavior` argument.
+- **Delivered:** `scrollToHeading` gates `scrollIntoView` via
+  `matchMedia('(prefers-reduced-motion: reduce)')` (with `matchMedia` undefined
+  guard): `behavior: 'auto'` under reduce, `'smooth'` otherwise. Playwright unit
+  regression (`presentation reduced-motion heading scroll does not use smooth
+  behavior`) plus assembled flow `M015 S03 flow: presentation reduced motion`
+  prove non-smooth under reduce, smooth without it, active heading update, and
+  clean console/failed-request surfaces. No presentation layout restyle.
+- **User impact addressed:** Users who prefer reduced motion get instant heading
+  jumps instead of animated scroll in long presentation documents.
 - **Acceptance direction:** Honor `prefers-reduced-motion: reduce` (and any host
   reduced-motion signal already used by the visual fixture) by using instant
   scroll (`auto`/`instant`) for heading navigation; add a Playwright or unit
   proof that reduced-motion path does not request smooth behavior.
-- **Proposed milestone boundary:** **M015** — isolated Presentation motion fix;
-  no presentation layout redesign.
+- **Milestone boundary:** **M015 S03** — isolated Presentation motion fix; no
+  presentation layout redesign.
 
 ### UI-04: Browser and native theme and zoom acceptance
 

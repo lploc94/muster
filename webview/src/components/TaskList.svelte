@@ -22,7 +22,10 @@
   let query = $state('');
   let editingId = $state<string | null>(null);
   let editValue = $state('');
+  let renameError = $state<string | null>(null);
   let confirmDeleteId = $state<string | null>(null);
+
+  const renameErrorId = 'task-rename-error';
 
   const filtered = $derived.by(() => {
     const q = query.trim().toLowerCase();
@@ -75,6 +78,7 @@
 
   function startRename(task: TaskSummary) {
     confirmDeleteId = null;
+    renameError = null;
     editingId = task.id;
     editValue = task.goal;
   }
@@ -82,11 +86,21 @@
     const id = editingId;
     if (!id) return;
     const v = editValue.trim();
+    if (!v) {
+      // Keep edit mode open and associate visible error text for AT users.
+      renameError = 'Task name cannot be empty or whitespace.';
+      return;
+    }
+    renameError = null;
     editingId = null;
-    if (v && onRename) onRename(id, v);
+    if (onRename) onRename(id, v);
   }
   function cancelRename() {
+    renameError = null;
     editingId = null;
+  }
+  function onEditInput() {
+    if (renameError) renameError = null;
   }
   function onEditKey(e: KeyboardEvent) {
     if (e.key === 'Enter') {
@@ -123,16 +137,17 @@
       >
         <span class="codicon codicon-search" style="font-size: 13px; opacity: 0.6;"></span>
         <input
-          class="flex-1 min-w-0 bg-transparent border-none outline-none text-xs"
+          type="search"
+          class="task-list__search-input flex-1 min-w-0 bg-transparent border-none text-xs"
           style="color: var(--vscode-input-foreground);"
           placeholder="Search tasks…"
+          aria-label="Search tasks"
           bind:value={query}
         />
         {#if query}
           <button
             type="button"
             class="icon-btn shrink-0"
-            style="width: 16px; height: 16px;"
             aria-label="Clear search"
             use:tip={'Clear search'}
             onclick={() => (query = '')}
@@ -167,36 +182,52 @@
             : ''}
         >
           {#if isEditing}
-            <input
-              class="flex-1 min-w-0 rounded px-1 py-0.5 text-xs outline-none"
-              style="color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-focusBorder);"
-              bind:value={editValue}
-              onkeydown={onEditKey}
-              onblur={commitRename}
-              use:autofocus
-            />
-            <button
-              type="button"
-              class="icon-btn shrink-0"
-              style="width: 22px; height: 22px;"
-              aria-label="Save name"
-              use:tip={'Save'}
-              onmousedown={(e) => e.preventDefault()}
-              onclick={commitRename}
-            >
-              <span class="codicon codicon-check"></span>
-            </button>
-            <button
-              type="button"
-              class="icon-btn shrink-0"
-              style="width: 22px; height: 22px;"
-              aria-label="Cancel rename"
-              use:tip={'Cancel'}
-              onmousedown={(e) => e.preventDefault()}
-              onclick={cancelRename}
-            >
-              <span class="codicon codicon-close"></span>
-            </button>
+            <div class="flex-1 min-w-0 flex flex-col gap-0.5">
+              <div class="flex items-center gap-1 min-w-0">
+                <input
+                  type="text"
+                  class="task-list__rename-input flex-1 min-w-0 rounded px-1 py-0.5 text-xs"
+                  style="color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-focusBorder);"
+                  aria-label="Task name"
+                  aria-invalid={renameError ? 'true' : 'false'}
+                  aria-describedby={renameError ? renameErrorId : undefined}
+                  bind:value={editValue}
+                  oninput={onEditInput}
+                  onkeydown={onEditKey}
+                  onblur={commitRename}
+                  use:autofocus
+                />
+                <button
+                  type="button"
+                  class="icon-btn icon-btn--dense shrink-0"
+                  aria-label="Save name"
+                  use:tip={'Save'}
+                  onmousedown={(e) => e.preventDefault()}
+                  onclick={commitRename}
+                >
+                  <span class="codicon codicon-check"></span>
+                </button>
+                <button
+                  type="button"
+                  class="icon-btn icon-btn--dense shrink-0"
+                  aria-label="Cancel rename"
+                  use:tip={'Cancel'}
+                  onmousedown={(e) => e.preventDefault()}
+                  onclick={cancelRename}
+                >
+                  <span class="codicon codicon-close"></span>
+                </button>
+              </div>
+              {#if renameError}
+                <div
+                  id={renameErrorId}
+                  class="task-list__rename-error"
+                  role="alert"
+                >
+                  {renameError}
+                </div>
+              {/if}
+            </div>
           {:else}
             <button
               type="button"
@@ -249,8 +280,7 @@
               {#if isConfirming}
                 <button
                   type="button"
-                  class="icon-btn"
-                  style="width: 22px; height: 22px;"
+                  class="icon-btn icon-btn--dense"
                   aria-label="Confirm delete"
                   use:tip={'Confirm delete'}
                   onclick={() => confirmDelete(task.id)}
@@ -259,8 +289,7 @@
                 </button>
                 <button
                   type="button"
-                  class="icon-btn"
-                  style="width: 22px; height: 22px;"
+                  class="icon-btn icon-btn--dense"
                   aria-label="Cancel delete"
                   use:tip={'Cancel'}
                   onclick={() => (confirmDeleteId = null)}
@@ -270,8 +299,7 @@
               {:else}
                 <button
                   type="button"
-                  class="icon-btn"
-                  style="width: 22px; height: 22px;"
+                  class="icon-btn icon-btn--dense"
                   aria-label="Rename task"
                   use:tip={'Rename'}
                   onclick={() => startRename(task)}
@@ -280,8 +308,7 @@
                 </button>
                 <button
                   type="button"
-                  class="icon-btn"
-                  style="width: 22px; height: 22px;"
+                  class="icon-btn icon-btn--dense"
                   aria-label="Delete task"
                   use:tip={'Delete'}
                   onclick={() => requestDelete(task.id)}

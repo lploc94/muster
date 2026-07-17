@@ -157,10 +157,21 @@
     vscode.postMessage({ type: 'openPresentationSource' });
   }
 
+  function prefersReducedMotion(): boolean {
+    try {
+      return typeof window.matchMedia === 'function'
+        && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    } catch {
+      return false;
+    }
+  }
+
   function scrollToHeading(id: string): void {
     const el = article?.querySelector<HTMLElement>(`#${CSS.escape(id)}`);
     if (!el) return;
-    el.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    // JS scrollIntoView behavior is not gated by CSS reduced-motion — honor the preference here.
+    const behavior: ScrollBehavior = prefersReducedMotion() ? 'auto' : 'smooth';
+    el.scrollIntoView({ block: 'start', behavior });
     activeHeadingId = id;
   }
 
