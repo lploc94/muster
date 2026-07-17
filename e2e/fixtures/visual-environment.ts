@@ -499,7 +499,9 @@ export function assertSanitizedVisualFixture(value: unknown): void {
 export function createStaticWebviewFixture() {
   const fixture = {
     type: 'snapshot' as const,
-    protocolVersion: 1,
+    // Must match webview/src/lib/protocol.ts PROTOCOL_VERSION so the pilot
+    // does not render the host/UI version-mismatch banner.
+    protocolVersion: 5,
     rootTasks: [
       {
         id: 'task-visual-pilot',
