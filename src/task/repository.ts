@@ -20,6 +20,7 @@ import { isTerminalLifecycle, isTerminalTurn } from './transitions';
 import { TRUNCATION_MARKER } from './retention';
 import type { DbClient } from './sqlite/client';
 import type { SqlStatement, SqlValue } from './sqlite/rpc';
+import { CHANGE_FEED_RETAIN_REVISIONS } from './sqlite/schema';
 import {
   ASSISTANT_ORDERING_FALLBACK,
   KIND_RANK,
@@ -480,6 +481,16 @@ export interface TaskRepository {
   /** Current workspace revision. */
   getWorkspaceRevision(): Promise<number>;
   /**
+   * SQLite `PRAGMA data_version` via the named repository boundary. Host/webview
+   * code must not issue this pragma directly.
+   */
+  getStorageDataVersion(): Promise<number>;
+  /**
+   * Bounded change feed since a revision boundary. Cursor is a revision, never a
+   * row offset. Returns explicit `gap` when the requested range is pruned.
+   */
+  getWorkspaceChangesSince(afterRevision: number, limit?: number): Promise<WorkspaceChangeFeedResult>;
+  /**
    * Optional local-host read barrier supplied by the projection wrapper. The
    * callback runs between complete execute→refresh→publish lifecycles, so a
    * multi-query bounded snapshot cannot interleave with this host's writes.
@@ -487,6 +498,71 @@ export interface TaskRepository {
    */
   runConsistentRead?<T>(read: () => Promise<T>): Promise<T>;
   execute(command: RepositoryCommand): Promise<RepositoryCommandResult>;
+}
+
+/** Metadata-only change-feed entity kinds (no content/path/payload). */
+export const WORKSPACE_CHANGE_ENTITY_KINDS = [
+  'workspace',
+  'workspace_location',
+  'task',
+  'turn',
+  'message',
+  'tool_call',
+  'reasoning',
+  'operation',
+  'cancel_request',
+  'send_receipt',
+  'runtime_claim',
+] as const;
+
+export type WorkspaceChangeEntityKind = (typeof WORKSPACE_CHANGE_ENTITY_KINDS)[number];
+
+export interface WorkspaceChangeMetadata {
+  entityKind: WorkspaceChangeEntityKind;
+  entityId: string;
+  taskId?: string;
+  changeKind: string;
+}
+
+export type WorkspaceChangeFeedResult =
+  | {
+      kind: 'changes';
+      requestedAfterRevision: number;
+      currentRevision: number;
+      retainedFromRevision: number;
+      revisions: Array<{
+        revision: number;
+        changes: WorkspaceChangeMetadata[];
+      }>;
+      hasMore: boolean;
+    }
+  | {
+      kind: 'gap';
+      requestedAfterRevision: number;
+      currentRevision: number;
+      retainedFromRevision: number;
+    };
+
+export class InvalidWorkspaceChangeFeedRequestError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidWorkspaceChangeFeedRequestError';
+  }
+}
+
+export class CorruptWorkspaceChangeFeedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CorruptWorkspaceChangeFeedError';
+  }
+}
+
+export interface SqliteTaskRepositoryOptions {
+  /**
+   * Production default is {@link CHANGE_FEED_RETAIN_REVISIONS}. Tests may inject a
+   * smaller bound; this is constructor-local and never global mutable state.
+   */
+  changeFeedRetainRevisions?: number;
 }
 
 /**
@@ -691,10 +767,19 @@ function retainedTurnIds(turns: readonly TaskTurn[], keepLatestTurns: number): S
 
 /** SQLite-backed repository for one workspace in the shared global database. */
 export class SqliteTaskRepository implements TaskRepository {
+  private readonly changeFeedRetainRevisions: number;
+
   constructor(
     private readonly db: DbClient,
     private readonly workspaceId: string,
-  ) {}
+    options: SqliteTaskRepositoryOptions = {},
+  ) {
+    const retain = options.changeFeedRetainRevisions ?? CHANGE_FEED_RETAIN_REVISIONS;
+    if (!Number.isSafeInteger(retain) || retain < 1) {
+      throw new Error('changeFeedRetainRevisions must be a positive safe integer');
+    }
+    this.changeFeedRetainRevisions = retain;
+  }
 
   async getWorkspace(): Promise<RepositoryWorkspace | undefined> {
     const row = await this.db.get<WorkspaceRow>(
@@ -1077,12 +1162,154 @@ export class SqliteTaskRepository implements TaskRepository {
     return row?.revision ?? 0;
   }
 
+  async getStorageDataVersion(): Promise<number> {
+    return this.db.pragma('data_version');
+  }
+
+  async getWorkspaceChangesSince(
+    afterRevision: number,
+    limit?: number,
+  ): Promise<WorkspaceChangeFeedResult> {
+    if (!Number.isSafeInteger(afterRevision) || afterRevision < 0) {
+      throw new InvalidWorkspaceChangeFeedRequestError(
+        'afterRevision must be a non-negative safe integer',
+      );
+    }
+    const pageLimit = limit === undefined ? DEFAULT_CHANGE_FEED_PAGE_LIMIT : limit;
+    if (!Number.isSafeInteger(pageLimit) || pageLimit < 1) {
+      throw new InvalidWorkspaceChangeFeedRequestError(
+        'limit must be a positive safe integer',
+      );
+    }
+
+    const currentRevision = await this.getWorkspaceRevision();
+    if (afterRevision > currentRevision) {
+      throw new InvalidWorkspaceChangeFeedRequestError(
+        `afterRevision ${afterRevision} is ahead of currentRevision ${currentRevision}`,
+      );
+    }
+
+    const watermarkRow = await this.db.get<{ retained_from_revision: number }>(
+      'SELECT retained_from_revision FROM change_feed_watermarks WHERE workspace_id = ?',
+      [this.workspaceId],
+    );
+    const retainedFromRevision = watermarkRow?.retained_from_revision ?? 1;
+    if (afterRevision + 1 < retainedFromRevision) {
+      return {
+        kind: 'gap',
+        requestedAfterRevision: afterRevision,
+        currentRevision,
+        retainedFromRevision,
+      };
+    }
+
+    if (afterRevision === currentRevision) {
+      return {
+        kind: 'changes',
+        requestedAfterRevision: afterRevision,
+        currentRevision,
+        retainedFromRevision,
+        revisions: [],
+        hasMore: false,
+      };
+    }
+
+    // Fetch one extra revision boundary so hasMore is exact without splitting
+    // rows that share a revision across pages.
+    const revisionRows = await this.db.all<{ revision: number }>(
+      `SELECT DISTINCT revision
+         FROM change_log
+        WHERE workspace_id = ?
+          AND revision > ?
+          AND revision <= ?
+        ORDER BY revision ASC
+        LIMIT ?`,
+      [this.workspaceId, afterRevision, currentRevision, pageLimit + 1],
+    );
+    const hasMore = revisionRows.length > pageLimit;
+    const pageRevisions = revisionRows.slice(0, pageLimit).map((row) => row.revision);
+    if (pageRevisions.length === 0) {
+      // Contiguous durable revisions always write at least one metadata row.
+      // Empty mid-range means the feed is corrupt or pruned without watermark.
+      throw new CorruptWorkspaceChangeFeedError(
+        `change feed missing revisions after ${afterRevision} up to ${currentRevision}`,
+      );
+    }
+
+    const minRev = pageRevisions[0]!;
+    const maxRev = pageRevisions[pageRevisions.length - 1]!;
+    const feedRows = await this.db.all<ChangeLogRow>(
+      `SELECT revision, entity_kind, entity_id, task_id, change_kind
+         FROM change_log
+        WHERE workspace_id = ?
+          AND revision >= ?
+          AND revision <= ?
+        ORDER BY revision ASC, entity_kind ASC, entity_id ASC`,
+      [this.workspaceId, minRev, maxRev],
+    );
+
+    const byRevision = new Map<number, WorkspaceChangeMetadata[]>();
+    for (const revision of pageRevisions) byRevision.set(revision, []);
+    for (const row of feedRows) {
+      const entityKind = parseWorkspaceChangeEntityKind(row.entity_kind);
+      if (!entityKind) {
+        throw new CorruptWorkspaceChangeFeedError(
+          `unknown change_log entity_kind ${JSON.stringify(row.entity_kind)}`,
+        );
+      }
+      if (typeof row.entity_id !== 'string' || row.entity_id.length === 0) {
+        throw new CorruptWorkspaceChangeFeedError('change_log entity_id missing');
+      }
+      if (typeof row.change_kind !== 'string' || row.change_kind.length === 0) {
+        throw new CorruptWorkspaceChangeFeedError('change_log change_kind missing');
+      }
+      const bucket = byRevision.get(row.revision);
+      if (!bucket) continue;
+      bucket.push({
+        entityKind,
+        entityId: row.entity_id,
+        ...(row.task_id ? { taskId: row.task_id } : {}),
+        changeKind: row.change_kind,
+      });
+    }
+
+    const revisions: Array<{ revision: number; changes: WorkspaceChangeMetadata[] }> = [];
+    let expected = afterRevision + 1;
+    for (const revision of pageRevisions) {
+      if (revision !== expected) {
+        throw new CorruptWorkspaceChangeFeedError(
+          `change feed non-contiguous: expected revision ${expected}, got ${revision}`,
+        );
+      }
+      const changes = byRevision.get(revision) ?? [];
+      if (changes.length === 0) {
+        throw new CorruptWorkspaceChangeFeedError(
+          `change feed revision ${revision} has no metadata rows`,
+        );
+      }
+      revisions.push({ revision, changes });
+      expected += 1;
+    }
+
+    return {
+      kind: 'changes',
+      requestedAfterRevision: afterRevision,
+      currentRevision,
+      retainedFromRevision,
+      revisions,
+      hasMore,
+    };
+  }
+
   private async write(
     statements: readonly SqlStatement[],
     changed: readonly ChangeRecord[],
     at: string,
   ): Promise<readonly import('./sqlite/rpc').RunResult[]> {
-    return this.db.transaction([...statements, ...revisionStatements(this.workspaceId, changed, at)]);
+    return this.db.transaction([
+      ...statements,
+      ...revisionStatements(this.workspaceId, changed, at, this.changeFeedRetainRevisions),
+    ]);
   }
 
   private async renameTask(
@@ -1132,6 +1359,7 @@ export class SqliteTaskRepository implements TaskRepository {
       statements.push(graphOperationClaimStatement(this.workspaceId, command.operation));
       abortIfUnchangedAt.push(0);
     }
+    // revision/feed statements are appended after mutation assembly below.
     if (command.expectedTasks.length > 0) {
       const index = statements.length;
       statements.push(taskRevisionGuardStatement(this.workspaceId, command.expectedTasks));
@@ -1245,7 +1473,12 @@ export class SqliteTaskRepository implements TaskRepository {
     const uniqueChanges = [...new Map(changes.map((entry) => [`${entry.kind}:${entry.id}`, entry])).values()];
     const at = command.operation?.createdAt ?? command.tasks[0]?.updatedAt ?? new Date().toISOString();
     if (uniqueChanges.length > 0) {
-      statements.push(...revisionStatements(this.workspaceId, uniqueChanges, at));
+      statements.push(...revisionStatements(
+        this.workspaceId,
+        uniqueChanges,
+        at,
+        this.changeFeedRetainRevisions,
+      ));
     }
 
     let results: readonly import('./sqlite/rpc').RunResult[];
@@ -1432,7 +1665,12 @@ export class SqliteTaskRepository implements TaskRepository {
   ): Promise<readonly import('./sqlite/rpc').RunResult[]> {
     return this.db.transaction([
       first,
-      ...conditionalRevisionStatements(this.workspaceId, change, at),
+      ...conditionalRevisionStatements(
+        this.workspaceId,
+        change,
+        at,
+        this.changeFeedRetainRevisions,
+      ),
       ...rest,
     ], { abortIfFirstUnchanged: true });
   }
@@ -2202,18 +2440,12 @@ export class SqliteTaskRepository implements TaskRepository {
         params: [this.workspaceId, command.ledgerKey, command.entry.fingerprint,
           encodePayload({ result: command.entry.result }), command.createdAt],
       },
-      {
-        sql: `INSERT INTO workspace_revisions (workspace_id, revision)
-              SELECT ?, 1 WHERE changes() > 0
-              ON CONFLICT(workspace_id) DO UPDATE SET revision = workspace_revisions.revision + 1`,
-        params: [this.workspaceId],
-      },
-      {
-        sql: `INSERT INTO change_log (workspace_id, revision, entity_kind, entity_id, task_id, change_kind, created_at)
-              SELECT ?, revision, 'operation', ?, NULL, 'insert', ?
-                FROM workspace_revisions WHERE workspace_id = ? AND changes() > 0`,
-        params: [this.workspaceId, command.ledgerKey, command.createdAt, this.workspaceId],
-      },
+      ...conditionalRevisionStatements(
+        this.workspaceId,
+        { kind: 'operation', id: command.ledgerKey, change: 'insert' },
+        command.createdAt,
+        this.changeFeedRetainRevisions,
+      ),
     ]);
     const inserted = (results[0]?.changes ?? 0) > 0;
     const row = await this.db.get<OperationRow>(
@@ -3102,7 +3334,67 @@ function sendReceiptStatement(workspaceId: string, receipt: SendReceipt): SqlSta
   };
 }
 
-function revisionStatements(workspaceId: string, changes: readonly ChangeRecord[], at: string): SqlStatement[] {
+const DEFAULT_CHANGE_FEED_PAGE_LIMIT = 256;
+const WORKSPACE_CHANGE_ENTITY_KIND_SET = new Set<string>(WORKSPACE_CHANGE_ENTITY_KINDS);
+
+interface ChangeLogRow {
+  revision: number;
+  entity_kind: string;
+  entity_id: string;
+  task_id: string | null;
+  change_kind: string;
+}
+
+function parseWorkspaceChangeEntityKind(value: string): WorkspaceChangeEntityKind | undefined {
+  return WORKSPACE_CHANGE_ENTITY_KIND_SET.has(value)
+    ? (value as WorkspaceChangeEntityKind)
+    : undefined;
+}
+
+/**
+ * After a revision advances, persist the explicit low watermark and prune whole
+ * revisions older than the retention window. These statements must run only after
+ * the revision bump and feed inserts so they never overwrite a guarded mutation's
+ * `changes()` signal.
+ */
+function changeFeedRetentionStatements(
+  workspaceId: string,
+  retainRevisions: number,
+): SqlStatement[] {
+  return [
+    {
+      // First durable revision initializes retained_from=1. Later advances keep
+      // max(1, current - retain + 1) without lowering an already higher watermark.
+      sql: `INSERT INTO change_feed_watermarks (workspace_id, retained_from_revision)
+            SELECT ?, MAX(1, revision - ? + 1)
+              FROM workspace_revisions
+             WHERE workspace_id = ?
+            ON CONFLICT(workspace_id) DO UPDATE SET
+              retained_from_revision = MAX(
+                change_feed_watermarks.retained_from_revision,
+                excluded.retained_from_revision
+              )`,
+      params: [workspaceId, retainRevisions, workspaceId],
+    },
+    {
+      sql: `DELETE FROM change_log
+             WHERE workspace_id = ?
+               AND revision < (
+                 SELECT retained_from_revision
+                   FROM change_feed_watermarks
+                  WHERE workspace_id = ?
+               )`,
+      params: [workspaceId, workspaceId],
+    },
+  ];
+}
+
+function revisionStatements(
+  workspaceId: string,
+  changes: readonly ChangeRecord[],
+  at: string,
+  retainRevisions: number,
+): SqlStatement[] {
   if (changes.length === 0) return [];
   return [
     {
@@ -3115,18 +3407,22 @@ function revisionStatements(workspaceId: string, changes: readonly ChangeRecord[
             SELECT ?, revision, ?, ?, ?, ?, ? FROM workspace_revisions WHERE workspace_id = ?`,
       params: [workspaceId, change.kind, change.id, change.taskId ?? null, change.change, at, workspaceId],
     })),
+    ...changeFeedRetentionStatements(workspaceId, retainRevisions),
   ];
 }
 
 /**
  * `changes()` refers to the immediately preceding statement. This helper is
  * deliberately used only directly after a guarded primary mutation, before any
- * cleanup statement can overwrite that signal.
+ * cleanup statement can overwrite that signal. Feed inserts after the revision
+ * bump chain on the previous statement's changes() so multi-row revisions do not
+ * drop later metadata when an intermediate insert is a no-op.
  */
 function conditionalRevisionStatements(
   workspaceId: string,
   change: ChangeRecord | readonly ChangeRecord[],
   at: string,
+  retainRevisions: number,
 ): SqlStatement[] {
   const changes = Array.isArray(change) ? change : [change];
   if (changes.length === 0) return [];
@@ -3143,6 +3439,9 @@ function conditionalRevisionStatements(
               FROM workspace_revisions WHERE workspace_id = ? AND changes() > 0`,
       params: [workspaceId, entry.kind, entry.id, entry.taskId ?? null, entry.change, at, workspaceId],
     })),
+    // Watermark/prune run only after feed rows. abortIfFirstUnchanged means a
+    // committed conditional write always advanced revision before reaching here.
+    ...changeFeedRetentionStatements(workspaceId, retainRevisions),
   ];
 }
 

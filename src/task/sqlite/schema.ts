@@ -14,7 +14,14 @@
 export const MUSTER_APPLICATION_ID = 0x4d555354; // 'MUST'
 
 /** Current schema version, tracked via `PRAGMA user_version`. */
-export const SQLITE_SCHEMA_VERSION = 4;
+export const SQLITE_SCHEMA_VERSION = 5;
+
+/**
+ * Production change-feed retention bound (revisions kept after the low watermark).
+ * Tests may inject a smaller bound via repository options; production does not
+ * depend on test-only global state.
+ */
+export const CHANGE_FEED_RETAIN_REVISIONS = 4096;
 
 /**
  * Current DDL applied only to a fresh database inside one exclusive transaction.
@@ -181,7 +188,15 @@ export const CURRENT_SCHEMA_STATEMENTS: readonly string[] = [
     PRIMARY KEY (workspace_id, revision, entity_kind, entity_id)
   )`,
 
+  // Explicit low watermark for gap detection. retained_from_revision is the
+  // smallest revision still fully readable; revision 0 workspaces use 1.
+  `CREATE TABLE IF NOT EXISTS change_feed_watermarks (
+    workspace_id TEXT PRIMARY KEY REFERENCES workspaces(id) ON DELETE CASCADE,
+    retained_from_revision INTEGER NOT NULL
+  )`,
+
   // Minimum indexes (plan §4).
+  `CREATE INDEX IF NOT EXISTS idx_change_log_workspace_revision ON change_log(workspace_id, revision)`,
   `CREATE INDEX IF NOT EXISTS idx_tasks_workspace_parent ON tasks(workspace_id, parent_id)`,
   `CREATE INDEX IF NOT EXISTS idx_tasks_workspace_lifecycle ON tasks(workspace_id, lifecycle, updated_at)`,
   `CREATE INDEX IF NOT EXISTS idx_turns_task_sequence ON turns(workspace_id, task_id, sequence)`,

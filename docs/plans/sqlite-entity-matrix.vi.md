@@ -54,6 +54,7 @@ are deleted/reclaimed transactionally with the owning turn.
 | `TaskStoreFile.revision` | `workspace_revisions(workspace_id, revision)` | Mỗi transaction logical tạo tối đa một workspace revision. |
 | `TaskStoreFile.tasks`, `turns`, `messages`, `toolCalls`, `reasoning`, `operations`, `cancelRequests`, `sendReceipts`, `runtimeClaims` | Các normalized tables liệt kê trong tài liệu này | Chỉ là projection nội bộ theo phạm vi task, không có full-workspace export API. |
 | Incremental invalidation | `change_log(workspace_id, revision, entity_kind, entity_id, task_id, change_kind, created_at)` | Metadata feed, không chứa prompt/tool payload hay secret. |
+| Change-feed low watermark | `change_feed_watermarks(workspace_id, retained_from_revision)` | Explicit retained-from revision for gap detection (not MIN(change_log) alone). |
 
 ## Codec and audit rules
 

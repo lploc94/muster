@@ -183,10 +183,24 @@ export async function runRepositoryBoundarySmoke(rootDir = ROOT) {
     for (const term of [
       'TaskStoreFile.schemaVersion', 'workspace_revisions', 'SQLite-only',
       'runtime_claims', 'expires_at', 'stale', 'taskPayload', 'wait',
-      'turn_inputs', 'reasoning_segments', 'change_log',
+      'turn_inputs', 'reasoning_segments', 'change_log', 'change_feed_watermarks',
     ]) {
       if (!matrix.includes(term)) failures.push(`sqlite-entity-matrix.vi.md is missing required parity marker: ${term}`);
     }
+
+  // P4-W9: change feed / data_version stay behind named repository APIs.
+  const repoText = texts.get('src/task/repository.ts') ?? '';
+  if (!repoText.includes('getWorkspaceChangesSince') || !repoText.includes('getStorageDataVersion')) {
+    failures.push('src/task/repository.ts must expose getWorkspaceChangesSince and getStorageDataVersion.');
+  }
+  for (const [rel, raw] of texts) {
+    if (rel === 'src/task/repository.ts' || rel.startsWith('src/task/sqlite/')) continue;
+    if (rel.endsWith('.test.ts') || rel.endsWith('.testkit.ts')) continue;
+    const code = stripComments(raw);
+    if (/\bchange_log\b/.test(code) || /PRAGMA\s+data_version/i.test(code) || /\.pragma\(\s*['"]data_version['"]/.test(code)) {
+      failures.push(`${rel} must not query change_log or data_version directly; use TaskRepository feed APIs.`);
+    }
+  }
   } catch (error) {
     failures.push(`Missing entity matrix: docs/plans/sqlite-entity-matrix.vi.md (${error.message})`);
   }
