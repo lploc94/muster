@@ -33,6 +33,8 @@ import {
   buildWorkspacePatchBatch,
   projectWorkspacePatches,
 } from './host/workspace-patch';
+import { WorkspaceRevisionPoller } from './host/workspace-revision-poller';
+import { reconcileExternalWorkspaceChanges } from './host/external-workspace-reconciler';
 import type { RepositoryCommitContext } from './task/repository-projection';
 import {
   buildRetentionSettingsSnapshot,
@@ -393,6 +395,14 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
    * published patches). Used to choose transcriptItemsAppended vs transcriptItemPatched.
    */
   private knownTranscriptIds = new Set<string>();
+  /**
+   * Highest workspace revision this host has published (local patches) or
+   * recovered to (snapshot). Poller never re-applies at or below this cursor.
+   */
+  private appliedWorkspaceRevision = 0;
+  private revisionPoller: WorkspaceRevisionPoller | undefined;
+  private windowFocused = true;
+  private windowStateSub: vscode.Disposable | undefined;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -412,11 +422,16 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
    * after SQLite commit + projection refresh. Empty patches still advance revision.
    */
   async publishAfterCommit(ctx: RepositoryCommitContext): Promise<void> {
+    const after = ctx.projection.getFile();
+    // Always advance the local applied cursor so the poller does not re-publish
+    // this host's own durable revision when it later observes data_version.
+    if (after.revision > this.appliedWorkspaceRevision) {
+      this.appliedWorkspaceRevision = after.revision;
+    }
     if (!this._view?.visible) {
       // Visibility regain performs a bounded authoritative snapshot.
       return;
     }
-    const after = ctx.projection.getFile();
     const patches = projectWorkspacePatches({
       command: ctx.command,
       result: ctx.result,
@@ -1038,6 +1053,10 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       this.knownTranscriptIds = new Set(
         (projection.snapshot.transcript ?? []).map((item) => item.id),
       );
+      // Recovery/bootstrap cursor: poller continues from the accepted snapshot.
+      if (projection.snapshot.storeRevision > this.appliedWorkspaceRevision) {
+        this.appliedWorkspaceRevision = projection.snapshot.storeRevision;
+      }
     }).catch(() => {
       if (generation === this.snapshotGeneration) {
         if (retryAttempt < 3) {
@@ -1390,6 +1409,99 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       this.post(message);
     }
     // Handoff binding updates publish via onAfterCommit patches (no full snapshot).
+  }
+
+  /**
+   * Create the multi-window revision poller once. Polling runs only while the
+   * webview is visible and the VS Code window is focused.
+   */
+  private ensureRevisionPoller(): void {
+    if (this.revisionPoller) return;
+    this.revisionPoller = new WorkspaceRevisionPoller({
+      getStorageDataVersion: async () => {
+        if (!taskRepository) throw new Error('repository unavailable');
+        return taskRepository.getStorageDataVersion();
+      },
+      getWorkspaceRevision: async () => {
+        if (!taskRepository) throw new Error('repository unavailable');
+        return taskRepository.getWorkspaceRevision();
+      },
+      getAppliedRevision: () => this.appliedWorkspaceRevision,
+      isActive: () => Boolean(this._view?.visible) && this.windowFocused,
+      onExternalRevisions: async ({ afterRevision, currentRevision }) => {
+        await this.reconcileExternalRevisions(afterRevision, currentRevision);
+      },
+      onRecovery: async () => {
+        this.postSnapshot(this.focusedTaskId);
+      },
+    });
+  }
+
+  /**
+   * Apply peer revisions through the change feed under the same write-order
+   * barrier as local execute→publish so patches cannot interleave mid-batch.
+   */
+  private async reconcileExternalRevisions(
+    afterRevision: number,
+    _currentRevision: number,
+  ): Promise<void> {
+    if (!taskRepository || !taskEngine) return;
+    if (afterRevision < this.appliedWorkspaceRevision) {
+      afterRevision = this.appliedWorkspaceRevision;
+    }
+    const projection = taskEngine.getProjection();
+    if (!projection) {
+      this.postSnapshot(this.focusedTaskId);
+      return;
+    }
+    const run = async (): Promise<void> => {
+      const result = await reconcileExternalWorkspaceChanges({
+        repository: taskRepository!,
+        projection,
+        afterRevision,
+        focusedTaskId: this.focusedTaskId,
+        knownTranscriptIds: this.knownTranscriptIds,
+      });
+      if (result.kind === 'gap' || result.kind === 'recovery') {
+        this.postSnapshot(this.focusedTaskId);
+        return;
+      }
+      if (!this._view?.visible) {
+        if (result.appliedRevision > this.appliedWorkspaceRevision) {
+          this.appliedWorkspaceRevision = result.appliedRevision;
+        }
+        return;
+      }
+      for (const batch of result.batches) {
+        if (batch.revision <= this.appliedWorkspaceRevision) continue;
+        for (const patch of batch.patches) {
+          if (patch.type === 'transcriptItemsAppended') {
+            for (const item of patch.items) this.knownTranscriptIds.add(item.id);
+          } else if (patch.type === 'transcriptItemPatched') {
+            this.knownTranscriptIds.add(patch.item.id);
+          } else if (patch.type === 'taskRemoved' && patch.taskId === this.focusedTaskId) {
+            this.knownTranscriptIds.clear();
+          }
+        }
+        this.post(batch);
+        this.appliedWorkspaceRevision = batch.revision;
+      }
+      if (result.appliedRevision > this.appliedWorkspaceRevision) {
+        this.appliedWorkspaceRevision = result.appliedRevision;
+      }
+    };
+    if (typeof taskRepository.runConsistentRead === 'function') {
+      await taskRepository.runConsistentRead(run);
+    } else {
+      await run();
+    }
+  }
+
+  disposeRevisionPoller(): void {
+    this.revisionPoller?.dispose();
+    this.revisionPoller = undefined;
+    this.windowStateSub?.dispose();
+    this.windowStateSub = undefined;
   }
 
   /**
@@ -1841,11 +1953,30 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
 
     webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
 
+    this.ensureRevisionPoller();
+    this.windowStateSub?.dispose();
+    this.windowStateSub = vscode.window.onDidChangeWindowState((state) => {
+      this.windowFocused = state.focused;
+      if (state.focused && webviewView.visible) {
+        this.revisionPoller?.start();
+      } else if (!state.focused) {
+        this.revisionPoller?.stop();
+      }
+    });
+
     webviewView.onDidChangeVisibility(() => {
       if (webviewView.visible) {
         this.postSnapshot(this.focusedTaskId);
+        if (this.windowFocused) {
+          this.revisionPoller?.start();
+        }
+      } else {
+        this.revisionPoller?.stop();
       }
     });
+    if (webviewView.visible && this.windowFocused) {
+      this.revisionPoller?.start();
+    }
 
     webviewView.webview.onDidReceiveMessage(async (data) => {
       if (data?.type === 'debugLog') {
@@ -2577,6 +2708,9 @@ export async function activate(context: vscode.ExtensionContext) {
   }
 
   const provider = new MusterChatProvider(context.extensionUri, context.globalState);
+  context.subscriptions.push({
+    dispose: () => provider.disposeRevisionPoller(),
+  });
   const revealLinkedChat = async (ownerTaskId: string): Promise<boolean> => {
     if (!taskStore) return false;
     const reveal = createPresentationChatLink(
@@ -3160,6 +3294,8 @@ export async function deactivate(): Promise<void> {
   } catch {
     // Stream failures are already routed through durable turn settlement.
   }
+  // provider is module-scoped only via registration; poller is stopped via
+  // subscriptions. Clear repository so any late poll exits cleanly.
   taskRepository = undefined;
   presentationManager?.dispose();
   presentationManager = undefined;

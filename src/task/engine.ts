@@ -1059,6 +1059,14 @@ export class TaskEngine {
     return this.store;
   }
 
+  /**
+   * Mutable projection used by external multi-window reconciliation. Same object
+   * as {@link getReadModel} when the engine is repository-backed.
+   */
+  getProjection(): RepositoryProjection | undefined {
+    return this.store instanceof RepositoryProjection ? this.store : undefined;
+  }
+
   /** Repository wrapper whose successful writes refresh {@link getReadModel}. */
   getRepository(): TaskRepository {
     return this.repository;

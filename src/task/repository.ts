@@ -460,6 +460,13 @@ export interface TaskRepository {
   listMessages(taskId: string): Promise<readonly TaskMessage[]>;
   listToolCalls(taskId: string): Promise<readonly PersistedToolCall[]>;
   listReasoning(taskId: string): Promise<readonly PersistedReasoning[]>;
+  /**
+   * Bounded entity hydration by id for external feed reconciliation. One query
+   * per entity kind — never N+1 and never full-task transcript list.
+   */
+  listMessagesByIds(ids: readonly string[]): Promise<readonly TaskMessage[]>;
+  listToolCallsByIds(ids: readonly string[]): Promise<readonly PersistedToolCall[]>;
+  listReasoningByIds(ids: readonly string[]): Promise<readonly PersistedReasoning[]>;
   getOperation(ledgerKey: string): Promise<OperationLedgerEntry | undefined>;
   /** Coordination rows needed to recover live graph turns after host reload. */
   listOperationsForTurns(turnIds: readonly string[]): Promise<readonly RepositoryOperationEntry[]>;
@@ -1016,6 +1023,16 @@ export class SqliteTaskRepository implements TaskRepository {
     return rows.map(decodeMessage);
   }
 
+  async listMessagesByIds(ids: readonly string[]): Promise<readonly TaskMessage[]> {
+    if (ids.length === 0) return [];
+    const rows = await this.db.all<MessageRow>(
+      `${messageSelect(`WHERE workspace_id = ? AND id IN (${placeholders(ids.length)})`)}
+       ORDER BY created_at, id`,
+      [this.workspaceId, ...ids],
+    );
+    return rows.map(decodeMessage);
+  }
+
   async listToolCalls(taskId: string): Promise<readonly PersistedToolCall[]> {
     const rows = await this.db.all<ToolRow>(
       `SELECT id, task_id, turn_id, tool_call_id, ordering, status, name, payload_json, created_at, updated_at
@@ -1025,11 +1042,35 @@ export class SqliteTaskRepository implements TaskRepository {
     return rows.map(decodeToolCall);
   }
 
+  async listToolCallsByIds(ids: readonly string[]): Promise<readonly PersistedToolCall[]> {
+    if (ids.length === 0) return [];
+    const rows = await this.db.all<ToolRow>(
+      `SELECT id, task_id, turn_id, tool_call_id, ordering, status, name, payload_json, created_at, updated_at
+         FROM tool_calls
+        WHERE workspace_id = ? AND id IN (${placeholders(ids.length)})
+        ORDER BY turn_id, ordering, id`,
+      [this.workspaceId, ...ids],
+    );
+    return rows.map(decodeToolCall);
+  }
+
   async listReasoning(taskId: string): Promise<readonly PersistedReasoning[]> {
     const rows = await this.db.all<ReasoningRow>(
       `SELECT id, task_id, turn_id, content, created_at, updated_at
          FROM reasoning_segments WHERE workspace_id = ? AND task_id = ? ORDER BY created_at, id`,
       [this.workspaceId, taskId],
+    );
+    return rows.map(decodeReasoning);
+  }
+
+  async listReasoningByIds(ids: readonly string[]): Promise<readonly PersistedReasoning[]> {
+    if (ids.length === 0) return [];
+    const rows = await this.db.all<ReasoningRow>(
+      `SELECT id, task_id, turn_id, content, created_at, updated_at
+         FROM reasoning_segments
+        WHERE workspace_id = ? AND id IN (${placeholders(ids.length)})
+        ORDER BY created_at, id`,
+      [this.workspaceId, ...ids],
     );
     return rows.map(decodeReasoning);
   }

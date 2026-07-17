@@ -135,6 +135,64 @@ export class RepositoryProjection {
   }
 
   /**
+   * Batched multi-task refresh for external feed reconciliation. Uses one
+   * listTurnActivityForTasks + one listActiveTurnInputMessages for the whole set
+   * (no per-task N+1), then reloads coordination for surviving active turns.
+   */
+  async refreshTasks(taskIds: readonly string[]): Promise<void> {
+    const uniqueIds = [...new Set(taskIds)].sort();
+    if (uniqueIds.length === 0) {
+      this.file.revision = await this.source.getWorkspaceRevision();
+      return;
+    }
+    const [tasks, turns, messages] = await Promise.all([
+      Promise.all(uniqueIds.map((id) => this.source.getTask(id))),
+      this.source.listTurnActivityForTasks(uniqueIds),
+      this.source.listActiveTurnInputMessages(uniqueIds),
+    ]);
+    for (const taskId of uniqueIds) this.removeTaskRows(taskId);
+    for (let i = 0; i < uniqueIds.length; i += 1) {
+      const task = tasks[i];
+      const taskId = uniqueIds[i]!;
+      if (!task) {
+        delete this.file.tasks[taskId];
+        continue;
+      }
+      this.file.tasks[taskId] = task;
+    }
+    for (const turn of turns) this.file.turns[turn.id] = turn;
+    for (const message of messages) this.file.messages[message.id] = message;
+    const activeTurnIds = turns
+      .filter((turn) =>
+        turn.status === 'queued' || turn.status === 'running' || turn.status === 'waiting_user',
+      )
+      .map((turn) => turn.id);
+    await this.reloadActiveCoordination(activeTurnIds);
+    this.file.revision = await this.source.getWorkspaceRevision();
+  }
+
+  /** Merge focused transcript entities hydrated by id (external reconcile only). */
+  mergeFocusedTranscriptEntities(args: {
+    taskId: string;
+    messages?: readonly import('./types').TaskMessage[];
+    toolCalls?: readonly import('./types').PersistedToolCall[];
+    reasoning?: readonly import('./types').PersistedReasoning[];
+  }): void {
+    const { taskId } = args;
+    for (const message of args.messages ?? []) {
+      if (message.taskId === taskId) this.file.messages[message.id] = message;
+    }
+    if (!this.file.toolCalls) this.file.toolCalls = {};
+    for (const tool of args.toolCalls ?? []) {
+      if (tool.taskId === taskId) this.file.toolCalls[tool.id] = tool;
+    }
+    if (!this.file.reasoning) this.file.reasoning = {};
+    for (const segment of args.reasoning ?? []) {
+      if (segment.taskId === taskId) this.file.reasoning[segment.id] = segment;
+    }
+  }
+
+  /**
    * Bounded reload of ops/cancel/claims for the given active turn ids only.
    * Constant call count (3 batched queries) — never N+1 per-turn RPCs.
    */
