@@ -6,6 +6,7 @@ import {
   parseArgs,
   playwrightDockerImage,
   resolvePlaywrightVersionFromLock,
+  toDockerMountPath,
 } from './run-visual-baselines.mjs';
 
 test('resolvePlaywrightVersionFromLock reads packages lockfile entry', () => {
@@ -65,7 +66,19 @@ test('buildPlaywrightCommand includes update-snapshots only when requested', () 
   assert.match(cmd, /--update-snapshots/);
 });
 
-test('buildDockerArgs mounts repo read-write and pins image', () => {
+test('toDockerMountPath converts Windows paths for WSL docker-ce', () => {
+  assert.equal(
+    toDockerMountPath('D:\\_Dev\\muster', { style: 'wsl' }),
+    '/mnt/d/_Dev/muster',
+  );
+  assert.equal(
+    toDockerMountPath('D:/_Dev/muster', { style: 'native' }),
+    'D:/_Dev/muster',
+  );
+  assert.equal(toDockerMountPath('/repo', { style: 'wsl' }), '/repo');
+});
+
+test('buildDockerArgs mounts repo read-write, isolates node_modules, pins image', () => {
   const args = buildDockerArgs({
     image: 'mcr.microsoft.com/playwright:v1.61.1-jammy',
     workdir: '/work',
@@ -75,10 +88,24 @@ test('buildDockerArgs mounts repo read-write and pins image', () => {
   assert.ok(args.includes('--rm'));
   assert.ok(args.includes('-v'));
   assert.ok(args.includes('/repo:/work'));
+  assert.ok(args.includes('/work/node_modules'));
   assert.ok(args.includes('mcr.microsoft.com/playwright:v1.61.1-jammy'));
   assert.ok(args.includes('bash'));
   assert.ok(args.includes('-lc'));
+  assert.ok(!args.includes('-t'));
   const shell = args[args.length - 1];
   assert.match(shell, /npm run test:visual/);
   assert.match(shell, /cd \/work/);
+  assert.match(shell, /npm ci/);
+});
+
+test('buildDockerArgs converts Windows host path when mountStyle=wsl', () => {
+  const args = buildDockerArgs({
+    image: 'mcr.microsoft.com/playwright:v1.61.1-jammy',
+    workdir: '/work',
+    hostRepo: 'D:\\_Dev\\muster',
+    command: 'npx playwright test e2e/visual --project=visual-chromium',
+    mountStyle: 'wsl',
+  });
+  assert.ok(args.includes('/mnt/d/_Dev/muster:/work'));
 });

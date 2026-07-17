@@ -73,25 +73,48 @@ export function buildPlaywrightCommand({ update }) {
   return update ? `${base} --update-snapshots` : base;
 }
 
-export function buildDockerArgs({ image, workdir, hostRepo, command }) {
-  // Use POSIX path form for the container mount target.
-  const mount = `${hostRepo}:${workdir}`;
+/**
+ * Convert a host filesystem path into a mount path Docker can bind.
+ * Docker Desktop on Windows accepts native Windows paths; docker-ce inside WSL
+ * needs /mnt/<drive>/... form for Windows-drive checkouts.
+ */
+export function toDockerMountPath(hostPath, { style = 'native' } = {}) {
+  const normalized = String(hostPath).replace(/\\/g, '/');
+  if (style !== 'wsl') {
+    return normalized;
+  }
+  const m = normalized.match(/^([A-Za-z]):\/(.*)$/);
+  if (!m) {
+    return normalized;
+  }
+  return `/mnt/${m[1].toLowerCase()}/${m[2]}`;
+}
+
+export function buildDockerArgs({
+  image,
+  workdir,
+  hostRepo,
+  command,
+  mountStyle = 'native',
+}) {
+  const mountPath = toDockerMountPath(hostRepo, { style: mountStyle });
+  const mount = `${mountPath}:${workdir}`;
   const shell = [
-    `set -euo pipefail`,
+    'set -euo pipefail',
     `cd ${workdir}`,
-    // Prefer npm ci when node_modules is absent/mismatched inside the container volume.
-    `if [ ! -d node_modules/@playwright/test ]; then npm ci; fi`,
-    // Browsers ship in the image; still ensure project deps are present.
-    `node -e "const {spawnSync}=require('child_process'); const r=spawnSync('npx',['playwright','--version'],{encoding:'utf8'}); console.log(String(r.stdout||r.stderr||'').trim())"`,
+    // Isolate from host node_modules via anonymous volume (see -v workdir/node_modules).
+    'npm ci',
+    "node -e \"const {spawnSync}=require('child_process'); const r=spawnSync('npx',['playwright','--version'],{encoding:'utf8'}); console.log(String(r.stdout||r.stderr||'').trim())\"",
     command,
   ].join(' && ');
 
   return [
     'run',
     '--rm',
-    '-t',
     '-v',
     mount,
+    '-v',
+    `${workdir}/node_modules`,
     '-w',
     workdir,
     '-e',
@@ -119,6 +142,10 @@ Options:
 Environment:
   MUSTER_VISUAL_DIAGNOSTICS_PATH  Override diagnostics JSON path
   MUSTER_VISUAL_SKIP_DOCKER=1     Fail with a clear message (do not fall back to host)
+  MUSTER_VISUAL_HOST_REPO         Override bind-mount source path
+  MUSTER_VISUAL_MOUNT_STYLE       native|wsl (auto-detected when unset)
+  MUSTER_DOCKER_BIN               Optional docker executable override
+  MUSTER_WSL_DOCKER_DISTRO        WSL distro for docker-ce fallback (default Ubuntu-24.04)
 `);
 }
 
@@ -128,12 +155,81 @@ function readLockfileVersion(repoRoot = REPO_ROOT) {
   return resolvePlaywrightVersionFromLock(lock);
 }
 
-function dockerAvailable() {
-  const result = spawnSync('docker', ['info'], {
+export function resolveDockerEngine({
+  spawn = spawnSync,
+  env = process.env,
+  platform = process.platform,
+} = {}) {
+  if (env.MUSTER_VISUAL_SKIP_DOCKER === '1') {
+    return null;
+  }
+
+  if (env.MUSTER_DOCKER_BIN) {
+    const probe = spawn(env.MUSTER_DOCKER_BIN, ['info'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (probe.status === 0) {
+      const osLine = String(probe.stdout || '');
+      const mountStyle =
+        env.MUSTER_VISUAL_MOUNT_STYLE ||
+        (/Docker Desktop/i.test(osLine) ? 'native' : platform === 'win32' ? 'wsl' : 'native');
+      return {
+        command: env.MUSTER_DOCKER_BIN,
+        prefixArgs: [],
+        mountStyle,
+        engine: 'custom',
+      };
+    }
+  }
+
+  const desktop = spawn('docker', ['info'], {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  return result.status === 0;
+  if (desktop.status === 0) {
+    const osLine = String(desktop.stdout || '');
+    const mountStyle =
+      env.MUSTER_VISUAL_MOUNT_STYLE ||
+      (/Docker Desktop/i.test(osLine) || platform !== 'win32' ? 'native' : 'wsl');
+    return {
+      command: 'docker',
+      prefixArgs: [],
+      mountStyle,
+      engine: /Docker Desktop/i.test(osLine) ? 'docker-desktop' : 'docker',
+    };
+  }
+
+  if (platform === 'win32') {
+    const distro = env.MUSTER_WSL_DOCKER_DISTRO || 'Ubuntu-24.04';
+    spawn(
+      'wsl.exe',
+      [
+        '-d',
+        distro,
+        '--',
+        'bash',
+        '-lc',
+        'if ! /usr/bin/docker info >/dev/null 2>&1; then nohup dockerd >/tmp/dockerd.log 2>&1 & for i in $(seq 1 40); do /usr/bin/docker info >/dev/null 2>&1 && break; sleep 1; done; fi; /usr/bin/docker info >/dev/null',
+      ],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    const wsl = spawn(
+      'wsl.exe',
+      ['-d', distro, '--', '/usr/bin/docker', 'info'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    if (wsl.status === 0) {
+      return {
+        command: 'wsl.exe',
+        prefixArgs: ['-d', distro, '--', '/usr/bin/docker'],
+        mountStyle: env.MUSTER_VISUAL_MOUNT_STYLE || 'wsl',
+        engine: 'wsl-docker-ce',
+      };
+    }
+  }
+
+  return null;
 }
 
 function collectHostDiagnostics() {
@@ -148,50 +244,26 @@ function collectHostDiagnostics() {
   };
 }
 
-function collectContainerDiagnosticsScript() {
-  // Runs inside the Playwright Linux image and prints one JSON object.
-  return `node -e ${JSON.stringify(`
-const { execSync } = require('child_process');
-const os = require('os');
-const fs = require('fs');
-function sh(cmd) {
-  try { return execSync(cmd, { encoding: 'utf8' }).trim(); }
-  catch (e) { return String(e.stdout || e.stderr || e.message || e).trim(); }
-}
-const fonts = sh("fc-list : family | sort -u | head -80");
-const diagnostics = {
-  capturedAt: new Date().toISOString(),
-  container: {
-    platform: process.platform,
-    arch: process.arch,
-    node: process.version,
-    osType: os.type(),
-    osRelease: os.release(),
-    uname: sh('uname -a'),
-    playwrightVersion: sh('npx playwright --version'),
-    chromium: sh('ls /ms-playwright 2>/dev/null || true'),
-    locale: process.env.LANG || process.env.LC_ALL || null,
-    timezone: sh('date +%Z'),
-    fontFamilies: fonts.split(/\\n/).filter(Boolean),
-  }
-};
-process.stdout.write(JSON.stringify(diagnostics, null, 2));
-`)}`;
-}
-
 function writeDiagnostics(payload, outPath) {
   mkdirSync(path.dirname(outPath), { recursive: true });
   writeFileSync(outPath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8');
   console.log(`Wrote visual diagnostics: ${path.relative(REPO_ROOT, outPath)}`);
 }
 
-function runDocker(args) {
-  console.log(`docker ${args.filter((a, i) => !(args[i - 1] === '-lc')).join(' ').slice(0, 240)}…`);
-  const result = spawnSync('docker', args, {
+function runDocker(engine, args) {
+  const full = [...engine.prefixArgs, ...args];
+  console.log(
+    `${engine.command} ${full
+      .filter((a, i) => !(full[i - 1] === '-lc'))
+      .join(' ')
+      .slice(0, 240)}…`,
+  );
+  const result = spawnSync(engine.command, full, {
     cwd: REPO_ROOT,
     encoding: 'utf8',
     stdio: 'inherit',
     env: process.env,
+    windowsHide: true,
   });
   return result.status ?? 1;
 }
@@ -212,11 +284,11 @@ function main(argv = process.argv.slice(2)) {
   console.log(`Pinned Docker image: ${image}`);
   console.log(`Mode: ${args.mode}`);
 
-  if (!dockerAvailable()) {
-    const host = collectHostDiagnostics();
+  const engine = resolveDockerEngine();
+  if (!engine) {
     writeDiagnostics(
       {
-        ...host,
+        ...collectHostDiagnostics(),
         error:
           'Docker engine is unavailable. Start Docker Desktop (or a compatible engine), then re-run. Do not author goldens on the host OS — Linux Chromium in the pinned image is required for committed baselines.',
         image,
@@ -232,22 +304,29 @@ function main(argv = process.argv.slice(2)) {
     return 2;
   }
 
+  console.log(
+    `Docker engine: ${engine.engine} (mountStyle=${engine.mountStyle})`,
+  );
+
   const workdir = '/work';
-  // Docker Desktop on Windows accepts the host path as-is when quoted via spawn.
-  const hostRepo = REPO_ROOT;
+  const hostRepo = process.env.MUSTER_VISUAL_HOST_REPO || REPO_ROOT;
+  const mountPath = toDockerMountPath(hostRepo, { style: engine.mountStyle });
 
   if (args.diagnosticsOnly) {
     const diagCmd = [
       'set -euo pipefail',
       `cd ${workdir}`,
-      `if [ ! -d node_modules/@playwright/test ]; then npm ci; fi`,
-      collectContainerDiagnosticsScript(),
+      'npm ci',
+      'node scripts/collect-visual-linux-diagnostics.mjs test-results/visual-linux-diagnostics.container.json',
+      'cat test-results/visual-linux-diagnostics.container.json',
     ].join(' && ');
     const diagArgs = [
       'run',
       '--rm',
       '-v',
-      `${hostRepo}:${workdir}`,
+      `${mountPath}:${workdir}`,
+      '-v',
+      `${workdir}/node_modules`,
       '-w',
       workdir,
       '-e',
@@ -257,39 +336,41 @@ function main(argv = process.argv.slice(2)) {
       '-lc',
       diagCmd,
     ];
-    const result = spawnSync('docker', diagArgs, {
-      cwd: REPO_ROOT,
-      encoding: 'utf8',
-      env: process.env,
-    });
-    if (result.status !== 0) {
-      console.error(result.stderr || result.stdout || 'diagnostics failed');
-      return result.status ?? 1;
-    }
-    let container;
-    try {
-      container = JSON.parse(result.stdout);
-    } catch {
-      container = { raw: result.stdout };
+    const status = runDocker(engine, diagArgs);
+    let container = null;
+    const containerDiagPath = path.join(
+      REPO_ROOT,
+      'test-results',
+      'visual-linux-diagnostics.container.json',
+    );
+    if (existsSync(containerDiagPath)) {
+      try {
+        container = JSON.parse(readFileSync(containerDiagPath, 'utf8'));
+      } catch {
+        container = { parseError: true };
+      }
     }
     writeDiagnostics(
       {
         ...collectHostDiagnostics(),
         image,
         version,
-        container: container.container || container,
+        engine: engine.engine,
+        mountStyle: engine.mountStyle,
+        mountPath,
+        exitCode: status,
+        container: container?.container || container,
       },
       diagnosticsPath,
     );
-    return 0;
+    return status;
   }
 
   const playwrightCmd = buildPlaywrightCommand({ update: args.update });
-  // Capture diagnostics after tests so font/rasterization context is next to results.
   const command = [
     playwrightCmd,
-    // Best-effort diagnostics; do not fail the run if font listing is unavailable.
-    `(${collectContainerDiagnosticsScript()} > ${workdir}/test-results/visual-linux-diagnostics.container.json || true)`,
+    'mkdir -p test-results',
+    'node scripts/collect-visual-linux-diagnostics.mjs test-results/visual-linux-diagnostics.container.json',
   ].join(' && ');
 
   const dockerArgs = buildDockerArgs({
@@ -297,9 +378,10 @@ function main(argv = process.argv.slice(2)) {
     workdir,
     hostRepo,
     command,
+    mountStyle: engine.mountStyle,
   });
 
-  const status = runDocker(dockerArgs);
+  const status = runDocker(engine, dockerArgs);
 
   const containerDiagPath = path.join(
     REPO_ROOT,
@@ -321,6 +403,9 @@ function main(argv = process.argv.slice(2)) {
       version,
       mode: args.mode,
       exitCode: status,
+      engine: engine.engine,
+      mountStyle: engine.mountStyle,
+      mountPath,
       container: container?.container || container,
     },
     diagnosticsPath,
