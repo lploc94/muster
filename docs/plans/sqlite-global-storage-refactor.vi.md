@@ -18,6 +18,9 @@ Cập nhật: 2026-07-17
   - **P4-W2 ✅** legacy storage/runtime API removed (JSON store, sync engine,
     full-envelope migration/export, dual adapters). Current schema bootstrap only;
     incompatible `user_version` fails closed with developer reset guidance.
+    **Validation-before-mutation:** foreign / unclaimed-incompatible / non-empty
+    unclaimed DBs are rejected without durable side effects (no WAL switch, no
+    application_id stamp, no schema/data rewrite). Only a truly blank DB is claimed.
   Kết quả Wave 10 được ghi tại
   [`sqlite-phase3-gate-evidence.vi.md`](./sqlite-phase3-gate-evidence.vi.md).
 
@@ -660,6 +663,11 @@ database là hard gate và filesystem JSON watcher/path đã bị loại khỏi 
   `WorkspaceFolderRoot`; host/webview protocol chỉ shape hiện tại.
 - Test runtime dùng SQLite repository/current contract; coverage quan trọng đã port
   sang `engine-repository` SQLite integration tests.
+- **Open-path validation-before-mutation (follow-up):** `openStoreDatabase` preflight
+  `application_id` + `user_version` + `sqlite_schema` trước mọi durable write. Foreign DB,
+  unclaimed incompatible version, và unclaimed non-empty file đều reject mà không đổi
+  journal mode / stamp / schema. Chỉ blank DB được claim + bootstrap; WAL/runtime pragmas
+  chỉ sau ownership confirmed. Concurrent first-open hội tụ dưới exclusive lock.
 
 ##### P4-W3 — Canonical cursor + SQL keyset page
 
@@ -671,6 +679,14 @@ database là hard gate và filesystem JSON watcher/path đã bị loại khỏi 
 
 ##### P4-W4 — Bounded bootstrap
 
+- **Hiện trạng cần thay:** `TaskEngine.loadAsync` → `RepositoryProjection.load` →
+  `refreshAll` đang hydrate toàn bộ transcript aggregate (messages / tool calls /
+  reasoning) của workspace vào memory. Đây không phải bounded activation.
+- W4 phải thay projection activation bằng **bounded/lazy hydration**:
+  - Activation chỉ load task metadata, dependencies và các turn queued/running/waiting
+    cần reconcile (cancel, orphan live, child-wait continuation).
+  - Transcript aggregate chỉ tải khi focus, và phải đi qua `getTranscriptPage`.
+  - Không giữ toàn bộ message/tool/reasoning của mọi task trong memory khi startup.
 - `buildRepositorySnapshot()` gọi `getTranscriptPage(..., 100)`, không `listMessages`,
   `listToolCalls`, `listReasoning` cho toàn focused task.
 - Snapshot mang `beforeCursor`, `hasMoreBefore`, `workspaceRevision`; serialized payload
@@ -729,6 +745,18 @@ database là hard gate và filesystem JSON watcher/path đã bị loại khỏi 
   convergence và focus race.
 - Chạy full tests, TypeScript, webview build/check, source-boundary audit và packaged VSIX;
   ghi evidence trước khi đánh dấu Phase 4 hoàn tất.
+
+##### Cleanup trước P4-W11 (plan only — chưa implement ở W2)
+
+Rà soát durable state còn nằm ngoài SQLite trước gate performance/UAT:
+
+- Composer backend/model preference hiện ở `globalState` → chuyển VS Code Settings
+  hoặc SQLite (chốt product ownership).
+- `send-outbox` chứa user message hiện ở webview `setState` → chuyển SQLite durable
+  outbox **hoặc** chỉ volatile memory theo contract được chốt; không để user content
+  durable ngoài SQLite.
+- Rà presentation / webview persisted state: durable domain/user content không được
+  nằm ngoài SQLite; webview `setState` chỉ UI chrome ephemeral (scroll, draft UI flags).
 
 ### Phase 5 — SQLite hardening
 

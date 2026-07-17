@@ -4,12 +4,10 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
-  applyPragmas,
   ForeignDatabaseError,
   IncompatibleSchemaError,
-  initializeCurrentSchema,
+  NonEmptyUnclaimedDatabaseError,
   openStoreDatabase,
-  verifyOrStampApplicationId,
 } from './connection';
 import { MUSTER_APPLICATION_ID, SQLITE_SCHEMA_VERSION } from './schema';
 
@@ -32,6 +30,15 @@ function scalar(db: DatabaseSync, pragma: string): number {
   return Object.values(row)[0] as number;
 }
 
+function journalMode(db: DatabaseSync): string {
+  const row = db.prepare('PRAGMA journal_mode').get() as { journal_mode: string };
+  return row.journal_mode.toLowerCase();
+}
+
+function reopenReadonly(dbPath: string): DatabaseSync {
+  return new DatabaseSync(dbPath);
+}
+
 describe('openStoreDatabase', () => {
   it('creates the file, stamps application_id, and initializes the current schema', () => {
     const dbPath = tempDbPath();
@@ -40,7 +47,7 @@ describe('openStoreDatabase', () => {
       expect(fs.existsSync(dbPath)).toBe(true);
       expect(scalar(db, 'application_id')).toBe(MUSTER_APPLICATION_ID);
       expect(scalar(db, 'user_version')).toBe(SQLITE_SCHEMA_VERSION);
-      // All v1 tables exist.
+      expect(journalMode(db)).toBe('wal');
       const tables = db
         .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
         .all()
@@ -62,11 +69,10 @@ describe('openStoreDatabase', () => {
     }
   });
 
-  it('applies WAL journal mode', () => {
+  it('applies WAL journal mode only after claiming a blank database', () => {
     const db = openStoreDatabase({ path: tempDbPath() });
     try {
-      const mode = db.prepare('PRAGMA journal_mode').get() as { journal_mode: string };
-      expect(mode.journal_mode.toLowerCase()).toBe('wal');
+      expect(journalMode(db)).toBe('wal');
     } finally {
       db.close();
     }
@@ -80,10 +86,135 @@ describe('openStoreDatabase', () => {
     try {
       expect(scalar(second, 'user_version')).toBe(SQLITE_SCHEMA_VERSION);
       expect(scalar(second, 'application_id')).toBe(MUSTER_APPLICATION_ID);
+      expect(journalMode(second)).toBe('wal');
     } finally {
       second.close();
     }
   });
+
+  it('rejects foreign application_id without mutating journal mode or markers', () => {
+    const dbPath = tempDbPath();
+    {
+      const seed = new DatabaseSync(dbPath);
+      seed.exec('PRAGMA journal_mode = DELETE');
+      seed.exec('PRAGMA application_id = 12345');
+      seed.exec('CREATE TABLE foreign_table (id INTEGER PRIMARY KEY)');
+      seed.close();
+    }
+
+    expect(() => openStoreDatabase({ path: dbPath })).toThrow(ForeignDatabaseError);
+
+    const after = reopenReadonly(dbPath);
+    try {
+      expect(scalar(after, 'application_id')).toBe(12345);
+      expect(scalar(after, 'user_version')).toBe(0);
+      expect(journalMode(after)).toBe('delete');
+      const tables = after
+        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+        .all()
+        .map((r) => (r as { name: string }).name);
+      expect(tables).toEqual(['foreign_table']);
+    } finally {
+      after.close();
+    }
+  });
+
+  it('rejects unclaimed incompatible user_version without stamping application_id or WAL', () => {
+    const dbPath = tempDbPath();
+    {
+      const seed = new DatabaseSync(dbPath);
+      seed.exec('PRAGMA journal_mode = DELETE');
+      seed.exec('PRAGMA user_version = 1');
+      seed.close();
+    }
+
+    expect(() => openStoreDatabase({ path: dbPath })).toThrow(IncompatibleSchemaError);
+
+    const after = reopenReadonly(dbPath);
+    try {
+      expect(scalar(after, 'application_id')).toBe(0);
+      expect(scalar(after, 'user_version')).toBe(1);
+      expect(journalMode(after)).toBe('delete');
+    } finally {
+      after.close();
+    }
+  });
+
+  it('rejects unclaimed non-empty version-0 DB without stamping or WAL', () => {
+    const dbPath = tempDbPath();
+    {
+      const seed = new DatabaseSync(dbPath);
+      seed.exec('PRAGMA journal_mode = DELETE');
+      seed.exec('CREATE TABLE leftover (id INTEGER PRIMARY KEY)');
+      seed.close();
+    }
+
+    expect(() => openStoreDatabase({ path: dbPath })).toThrow(NonEmptyUnclaimedDatabaseError);
+
+    const after = reopenReadonly(dbPath);
+    try {
+      expect(scalar(after, 'application_id')).toBe(0);
+      expect(scalar(after, 'user_version')).toBe(0);
+      expect(journalMode(after)).toBe('delete');
+      const tables = after
+        .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+        .all()
+        .map((r) => (r as { name: string }).name);
+      expect(tables).toEqual(['leftover']);
+    } finally {
+      after.close();
+    }
+  });
+
+  it('rejects existing Muster DB with wrong schema version without migration', () => {
+    const dbPath = tempDbPath();
+    {
+      const seed = openStoreDatabase({ path: dbPath });
+      seed.close();
+      const rewrite = new DatabaseSync(dbPath);
+      rewrite.exec(`PRAGMA user_version = ${SQLITE_SCHEMA_VERSION + 1}`);
+      rewrite.close();
+    }
+
+    expect(() => openStoreDatabase({ path: dbPath })).toThrow(IncompatibleSchemaError);
+
+    const after = reopenReadonly(dbPath);
+    try {
+      expect(scalar(after, 'application_id')).toBe(MUSTER_APPLICATION_ID);
+      expect(scalar(after, 'user_version')).toBe(SQLITE_SCHEMA_VERSION + 1);
+      expect(journalMode(after)).toBe('wal');
+    } finally {
+      after.close();
+    }
+  });
+
+  it('converges concurrent first-open claims on one valid schema', async () => {
+    const dbPath = tempDbPath();
+    const { DbClient } = await import('./client');
+    const workerPath = path.join(__dirname, 'worker.ts');
+    const contenders = Array.from({ length: 4 }, () =>
+      new DbClient({ workerPath, execArgv: ['--import', 'tsx'] }),
+    );
+    try {
+      await Promise.all(contenders.map((client) => client.open(dbPath, 10_000)));
+      await Promise.all(
+        contenders.map(async (client) => {
+          expect(await client.pragma('application_id')).toBe(MUSTER_APPLICATION_ID);
+          expect(await client.pragma('user_version')).toBe(SQLITE_SCHEMA_VERSION);
+          await expect(
+            client.get<{ journal_mode: string }>('PRAGMA journal_mode'),
+          ).resolves.toEqual({ journal_mode: 'wal' });
+          await expect(
+            client.get<{ name: string }>(
+              "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'workspaces'",
+            ),
+          ).resolves.toEqual({ name: 'workspaces' });
+        }),
+      );
+    } finally {
+      await Promise.all(contenders.map((client) => client.close()));
+    }
+  }, 30_000);
 
   it('rejects tasks that do not match the current release-state contract', () => {
     const db = openStoreDatabase({ path: tempDbPath() });
@@ -113,7 +244,6 @@ describe('foreign_keys enforcement', () => {
   it('rejects a child row whose workspace FK is missing', () => {
     const db = openStoreDatabase({ path: tempDbPath() });
     try {
-      // A task referencing a non-existent workspace must be rejected by the FK.
       expect(() =>
         db
           .prepare(
@@ -174,56 +304,6 @@ describe('composite identity', () => {
       }
       const rows = db.prepare('SELECT workspace_id FROM tasks WHERE id=?').all('shared-id');
       expect(rows).toHaveLength(2);
-    } finally {
-      db.close();
-    }
-  });
-});
-
-describe('verifyOrStampApplicationId', () => {
-  it('refuses a foreign non-zero application_id', () => {
-    const db = new DatabaseSync(tempDbPath());
-    try {
-      db.exec('PRAGMA application_id = 12345');
-      expect(() => verifyOrStampApplicationId(db)).toThrow(ForeignDatabaseError);
-    } finally {
-      db.close();
-    }
-  });
-});
-
-describe('initializeCurrentSchema', () => {
-  it('refuses an older schema instead of migrating its data', () => {
-    const db = new DatabaseSync(tempDbPath());
-    try {
-      applyPragmas(db, 5000);
-      verifyOrStampApplicationId(db);
-      db.exec('PRAGMA user_version = 1');
-      expect(() => initializeCurrentSchema(db)).toThrow(IncompatibleSchemaError);
-      expect(scalar(db, 'user_version')).toBe(1);
-    } finally {
-      db.close();
-    }
-  });
-
-  it('refuses a schema newer than current', () => {
-    const db = new DatabaseSync(tempDbPath());
-    try {
-      applyPragmas(db, 5000);
-      db.exec(`PRAGMA user_version = ${SQLITE_SCHEMA_VERSION + 1}`);
-      expect(() => initializeCurrentSchema(db)).toThrow(IncompatibleSchemaError);
-    } finally {
-      db.close();
-    }
-  });
-
-  it('initializes a fresh database atomically', () => {
-    const db = new DatabaseSync(tempDbPath());
-    try {
-      applyPragmas(db, 5000);
-      expect(scalar(db, 'user_version')).toBe(0);
-      initializeCurrentSchema(db);
-      expect(scalar(db, 'user_version')).toBe(SQLITE_SCHEMA_VERSION);
     } finally {
       db.close();
     }
