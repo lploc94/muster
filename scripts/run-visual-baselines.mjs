@@ -91,11 +91,22 @@ export function parseArgs(argv) {
 }
 
 export function buildPlaywrightCommand({ update, playwrightArgs = [] } = {}) {
-  const parts = ['npx playwright test e2e/visual --project=visual-chromium'];
+  // Path filters must precede options so --update-snapshots does not consume them as mode.
+  const rawArgs = playwrightArgs.map(String);
+  const pathArgs = rawArgs.filter(
+    (a) => a.startsWith('e2e/') || /\.(spec|test)\.tsx?$/.test(a),
+  );
+  const otherArgs = rawArgs.filter((a) => !pathArgs.includes(a));
+  const testPaths = pathArgs.length > 0 ? pathArgs : ['e2e/visual'];
+  const parts = [
+    'npx playwright test',
+    ...testPaths.map((p) => shellQuote(p)),
+    '--project=visual-chromium',
+  ];
   if (update) {
     parts.push('--update-snapshots');
   }
-  for (const arg of playwrightArgs) {
+  for (const arg of otherArgs) {
     parts.push(shellQuote(arg));
   }
   return parts.join(' ');

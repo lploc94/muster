@@ -3,6 +3,9 @@ import type { Page } from '@playwright/test';
 /** Pinned authoring clock for visual pilots (static, timezone-independent ISO). */
 export const VISUAL_CLOCK_ISO = '2026-03-15T12:00:00.000Z';
 
+/** Compact main-webview containment for risk-coverage matrix cases. */
+export const COMPACT_WEBVIEW_VIEWPORT = { width: 320, height: 600 } as const;
+
 /** Pinned locale for visual pilots and Playwright project config. */
 export const VISUAL_LOCALE = 'en-US';
 
@@ -454,6 +457,23 @@ export async function waitForVisualReady(
 }
 
 /** Blur focus and reset scroll so screenshots do not capture transient chrome. */
+/**
+ * Reset scroll without blurring focus. Use when the case intentionally keeps
+ * focus (composer autocomplete, validation focus rings).
+ */
+export async function normalizeVisualScroll(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    window.scrollTo(0, 0);
+    document.documentElement.scrollTop = 0;
+    document.body.scrollTop = 0;
+    for (const el of Array.from(document.querySelectorAll('*'))) {
+      if (el instanceof HTMLElement && el.scrollTop) {
+        el.scrollTop = 0;
+      }
+    }
+  });
+}
+
 export async function normalizeVisualChrome(page: Page): Promise<void> {
   await page.evaluate(() => {
     const active = document.activeElement;
@@ -495,53 +515,218 @@ export function assertSanitizedVisualFixture(value: unknown): void {
   }
 }
 
-/** Static main-webview pilot fixture (no secrets / absolute paths / real transcripts). */
-export function createStaticWebviewFixture() {
+/** Options for deterministic main-webview host snapshots (protocol v5). */
+export interface StaticWebviewFixtureOptions {
+  /** When set, projects a static Ask card for accessible validation coverage. */
+  pendingAsk?: {
+    turnId: string;
+    askId: string;
+    questions: Array<{ prompt: string; options: string[]; allowFreeText?: boolean }>;
+  };
+  taskId?: string;
+  goal?: string;
+  transcriptContent?: string;
+  runtimeActivity?: 'idle' | 'running' | 'waiting';
+  viewStatus?: 'idle' | 'running' | 'waiting' | 'error';
+}
+
+/**
+ * Deterministic main-webview host snapshot: fixed ids, UTC timestamps, and no
+ * secrets, absolute paths, or real user transcripts. Protocol v5 shape.
+ */
+export function createStaticWebviewFixture(
+  options: StaticWebviewFixtureOptions = {},
+) {
+  const taskId = options.taskId ?? 'task-visual-pilot';
+  const goal = options.goal ?? 'Visual pilot workspace';
+  const task = {
+    id: taskId,
+    parentId: null,
+    goal,
+    role: 'coordinator',
+    lifecycle: 'active',
+    runtimeActivity: (options.runtimeActivity ?? 'idle') as 'idle',
+    viewStatus: (options.viewStatus ?? 'idle') as 'idle',
+    currentTurnActivity: null,
+    updatedAt: VISUAL_CLOCK_ISO,
+    backend: 'claude',
+  };
   const fixture = {
     type: 'snapshot' as const,
     // Must match webview/src/lib/protocol.ts PROTOCOL_VERSION so the pilot
     // does not render the host/UI version-mismatch banner.
     protocolVersion: 5,
-    rootTasks: [
-      {
-        id: 'task-visual-pilot',
-        parentId: null,
-        goal: 'Visual pilot workspace',
-        role: 'coordinator',
-        lifecycle: 'active',
-        runtimeActivity: 'idle' as const,
-        viewStatus: 'idle' as const,
-        currentTurnActivity: null,
-        updatedAt: VISUAL_CLOCK_ISO,
-        backend: 'claude',
-      },
-    ],
-    focusedTaskId: 'task-visual-pilot',
-    subtree: [
-      {
-        id: 'task-visual-pilot',
-        parentId: null,
-        goal: 'Visual pilot workspace',
-        role: 'coordinator',
-        lifecycle: 'active',
-        runtimeActivity: 'idle' as const,
-        viewStatus: 'idle' as const,
-        currentTurnActivity: null,
-        updatedAt: VISUAL_CLOCK_ISO,
-        backend: 'claude',
-      },
-    ],
+    rootTasks: [task],
+    focusedTaskId: taskId,
+    subtree: [task],
     transcript: [
       {
         id: 'msg-visual-pilot-1',
         kind: 'assistant' as const,
-        content: 'Synthetic visual pilot transcript.',
+        content: options.transcriptContent ?? 'Synthetic visual pilot transcript.',
       },
     ],
     storeRevision: 1400,
+    ...(options.pendingAsk ? { pendingAsk: options.pendingAsk } : {}),
   };
   assertSanitizedVisualFixture(fixture);
   return fixture;
+}
+
+/** Static free-text Ask used for accessible validation-error baselines. */
+export function createStaticPendingAsk() {
+  return {
+    turnId: 'turn-visual-ask',
+    askId: 'ask-visual-validation',
+    questions: [
+      {
+        prompt: 'Confirm the visual gate fixture label',
+        options: [] as string[],
+        allowFreeText: true,
+      },
+    ],
+  };
+}
+
+/** Static runtime permission payload for compact Settings + prompt baselines. */
+export function createStaticPendingPermission() {
+  return {
+    sessionId: 'session-visual-prompt',
+    permissionId: 'perm-visual-prompt',
+    title: 'Write docs/UI-VISUAL-REGRESSION.md',
+    kind: 'write',
+    classification: 'write' as const,
+    options: [
+      { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' as const },
+      { optionId: 'reject', name: 'Deny', kind: 'reject' as const },
+    ],
+  };
+}
+
+/** Host message that projects a runtime permission card. */
+export function createStaticPermissionPendingMessage() {
+  return {
+    type: 'permissionPending' as const,
+    protocolVersion: 5,
+    ...createStaticPendingPermission(),
+  };
+}
+
+/** Sanitized runtime storage settings snapshot for Settings panel baselines. */
+export function createStaticRuntimeStorageSettingsSnapshot() {
+  return {
+    settings: [
+      {
+        id: 'runLimit',
+        kind: 'enum',
+        description: 'Maximum uninterrupted agent run duration.',
+        defaultValue: '30m',
+        value: '30m',
+        options: ['15m', '30m', '1h', '2h', '4h', '8h'],
+      },
+      {
+        id: 'maxRetainedTurnsPerTask',
+        kind: 'number',
+        description: 'Completed turns kept per task.',
+        defaultValue: 50,
+        value: 50,
+        minimum: 1,
+      },
+      {
+        id: 'maxStoredOutputChars',
+        kind: 'number',
+        description: 'Stored output characters per retained turn.',
+        defaultValue: 200_000,
+        value: 200_000,
+        minimum: 1_000,
+      },
+    ],
+  };
+}
+
+/** Sanitized permission policy snapshot for Settings panel baselines. */
+export function createStaticPermissionSettingsSnapshot() {
+  return {
+    activeMode: 'ask' as const,
+    options: [
+      {
+        mode: 'ask' as const,
+        label: 'Ask',
+        description:
+          'Safe: auto-allow read-only tool calls, prompt for writes/commands/unknown actions.',
+        risk: 'recommended' as const,
+      },
+      {
+        mode: 'allow' as const,
+        label: 'Allow',
+        description: 'Auto-allow all tool calls for this workspace session.',
+        risk: 'elevated' as const,
+      },
+    ],
+  };
+}
+
+/** Sanitized task-type catalog snapshot for Settings panel baselines. */
+export function createStaticTaskTypesSettingsSnapshot() {
+  return {
+    types: [
+      {
+        id: 'worker',
+        label: 'Worker',
+        description: 'Default worker task type for visual fixtures.',
+        backend: 'claude',
+        role: 'worker' as const,
+        briefKind: 'generic' as const,
+        isDefault: true,
+        isBuiltIn: true,
+      },
+    ],
+    defaults: [
+      {
+        id: 'worker',
+        backend: 'claude',
+        role: 'worker' as const,
+        briefKind: 'generic' as const,
+      },
+    ],
+    constraints: {
+      maxTypes: 32,
+      idPattern: '^[a-z][a-z0-9_-]{0,63}$',
+      descriptionMax: 200,
+      stringMax: 128,
+      roles: ['coordinator', 'worker'] as Array<'coordinator' | 'worker'>,
+      briefKinds: ['generic', 'investigation', 'implementation'],
+    },
+  };
+}
+
+/** Relative-only file mention suggestions (no absolute paths or cwd). */
+export function createStaticFileMentionSuggestions(
+  requestId: string,
+  options: { parentDepth?: 0 | 1 | 2; relativeQuery?: string } = {},
+) {
+  // Protocol success shape: items + parentDepth + relativeQuery (not `suggestions`).
+  // Type guard rejects unknown keys and requires these fields.
+  return {
+    type: 'fileMentionSuggestions' as const,
+    requestId,
+    parentDepth: (options.parentDepth ?? 0) as 0 | 1 | 2,
+    relativeQuery: options.relativeQuery ?? 're',
+    items: [
+      {
+        id: 'file:readme.md',
+        kind: 'file' as const,
+        label: 'readme.md',
+        insertionPath: 'readme.md',
+      },
+      {
+        id: 'dir:docs',
+        kind: 'directory' as const,
+        label: 'docs',
+        insertionPath: 'docs',
+      },
+    ],
+  };
 }
 
 /** Static Presentation pilot fixture. */

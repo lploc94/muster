@@ -127,3 +127,29 @@ export async function readMusterWebviewState(page: Page): Promise<unknown> {
 export async function readMusterPresentationState(page: Page): Promise<unknown> {
   return page.evaluate(() => window.__musterPersistedState);
 }
+
+/** Read host-bound postMessage traffic recorded by the VS Code API mock. */
+export async function readPostedMessages(page: Page): Promise<unknown[]> {
+  return page.evaluate(() => window.__musterPostedMessages ?? []);
+}
+
+/** Deliver a typed host → webview message through the same window.postMessage channel App.svelte listens on. */
+export async function postHostMessage(page: Page, message: unknown): Promise<void> {
+  await page.evaluate((msg) => {
+    window.postMessage(msg, '*');
+  }, message);
+}
+
+/** Find the latest posted message matching a type predicate. */
+export async function findLatestPostedMessage<
+  T extends { type?: string } = { type?: string },
+>(page: Page, type: string): Promise<T | undefined> {
+  const messages = await readPostedMessages(page);
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const msg = messages[i] as T | undefined;
+    if (msg && typeof msg === 'object' && (msg as { type?: string }).type === type) {
+      return msg;
+    }
+  }
+  return undefined;
+}

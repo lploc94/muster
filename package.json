@@ -251,7 +251,11 @@
     "test:source-boundary": "node scripts/source-boundary-smoke.mjs",
     "test:evidence": "node --test scripts/verify-verification-evidence.test.mjs",
     "test:source-boundary:fixtures": "node --test scripts/source-boundary-smoke.test.mjs",
-    "mvp:grok-interrupt-and-send": "tsx scripts/test-grok-interrupt-and-send.ts"
+    "mvp:grok-interrupt-and-send": "tsx scripts/test-grok-interrupt-and-send.ts",
+    "test:webview:visual:linux": "node scripts/run-visual-baselines.mjs e2e/visual/muster-webview.visual.spec.ts",
+    "test:webview:visual:linux:update": "node scripts/run-visual-baselines.mjs --update e2e/visual/muster-webview.visual.spec.ts",
+    "test:presentation:visual:linux": "node scripts/run-visual-baselines.mjs e2e/visual/muster-presentation.visual.spec.ts",
+    "test:presentation:visual:linux:update": "node scripts/run-visual-baselines.mjs --update e2e/visual/muster-presentation.visual.spec.ts"
   },
   "devDependencies": {
     "@playwright/test": "^1.61.1",
