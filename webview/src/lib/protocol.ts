@@ -580,8 +580,10 @@ export type OutMessage =
       continuationOf?: string;
       /** Structured skill chips; injected into a NEW task's first turn only. */
       skills?: string[];
-      /** Phase C idempotent send key (stable across resend). */
-      clientRequestId?: string;
+      /** Display mention → resolved path pairs needed to restore rejected drafts. */
+      mentionBindings?: Array<[string, string]>;
+      /** Durable idempotent send key (stable across resend). */
+      clientRequestId: string;
     }
   | { type: 'focusTask'; taskId: string }
   | { type: 'hydrateSubtree'; taskId: string }
@@ -704,7 +706,7 @@ export type OutMessage =
   /** Webview → host debug line for Output channel "Muster Debug". */
   | { type: 'debugLog'; event: string; details?: Record<string, unknown> }
   /**
-   * Persist the composer's last-used backend/model on the host (globalState)
+   * Persist the composer's last-used backend/model in VS Code Settings
    * so the preference survives full restarts and webview recreation.
    */
   | { type: 'setComposerSelection'; backend: string; model?: string | null }
@@ -757,6 +759,76 @@ function hasOnlyKeys(v: Record<string, unknown>, allowedKeys: readonly string[])
 
 function isInteger(v: unknown): v is number {
   return isNumber(v) && Number.isInteger(v);
+}
+
+const SEND_OUTBOX_ENTRY_KEYS = [
+  'clientRequestId', 'status', 'taskId', 'text', 'llmText', 'mentionBindings',
+  'skills', 'backend', 'model', 'continuationOf', 'createdAt',
+] as const;
+
+function isBoundedOutboxString(value: unknown, max: number): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= max && !value.includes('\0');
+}
+
+function isSendOutboxSnapshotEntry(value: unknown): boolean {
+  if (!isRecord(value) || Array.isArray(value) || !hasOnlyKeys(value, SEND_OUTBOX_ENTRY_KEYS)) {
+    return false;
+  }
+  if (
+    !isBoundedOutboxString(value.clientRequestId, 256) ||
+    (value.status !== 'pending' && value.status !== 'rejected') ||
+    !isBoundedOutboxString(value.text, 100_000) ||
+    !Number.isSafeInteger(value.createdAt) ||
+    (value.createdAt as number) < 0
+  ) {
+    return false;
+  }
+  for (const [key, max] of [
+    ['taskId', 256],
+    ['llmText', 100_000],
+    ['backend', 32],
+    ['model', 512],
+    ['continuationOf', 256],
+  ] as const) {
+    if (value[key] !== undefined && !isBoundedOutboxString(value[key], max)) return false;
+  }
+  if (value.skills !== undefined) {
+    const seenSkills = new Set<string>();
+    if (
+      !Array.isArray(value.skills) ||
+      value.skills.length > 8 ||
+      !value.skills.every((skill) =>
+        typeof skill === 'string' &&
+        skill.length > 0 &&
+        skill.length <= 128 &&
+        /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(skill) &&
+        !seenSkills.has(skill) &&
+        Boolean(seenSkills.add(skill))
+      )
+    ) {
+      return false;
+    }
+  }
+  if (value.mentionBindings !== undefined) {
+    const seenLabels = new Set<string>();
+    if (
+      !Array.isArray(value.mentionBindings) ||
+      value.mentionBindings.length > 64 ||
+      !value.mentionBindings.every((binding) =>
+        Array.isArray(binding) &&
+        binding.length === 2 &&
+        isBoundedOutboxString(binding[0], 512) &&
+        !/[\r\n]/.test(binding[0]) &&
+        isBoundedOutboxString(binding[1], 4096) &&
+        !/[\r\n]/.test(binding[1]) &&
+        !seenLabels.has(binding[0]) &&
+        Boolean(seenLabels.add(binding[0]))
+      )
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /** Basename-only export file names — never path segments or drive prefixes. */
@@ -1607,16 +1679,10 @@ export function isExtMessage(data: unknown): data is ExtMessage {
       return (
         hasOnlyKeys(data, ['type', 'entries']) &&
         Array.isArray(data.entries) &&
-        data.entries.every(
-          (entry) =>
-            typeof entry === 'object' &&
-            entry !== null &&
-            isString((entry as { clientRequestId?: unknown }).clientRequestId) &&
-            ((entry as { status?: unknown }).status === 'pending' ||
-              (entry as { status?: unknown }).status === 'rejected') &&
-            isString((entry as { text?: unknown }).text) &&
-            typeof (entry as { createdAt?: unknown }).createdAt === 'number',
-        )
+        data.entries.length <= 32 &&
+        data.entries.every(isSendOutboxSnapshotEntry) &&
+        new Set(data.entries.map((entry) => (entry as { clientRequestId: string }).clientRequestId)).size ===
+          data.entries.length
       );
 
     case 'exportResult':

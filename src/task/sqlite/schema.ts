@@ -14,7 +14,7 @@
 export const MUSTER_APPLICATION_ID = 0x4d555354; // 'MUST'
 
 /** Current schema version, tracked via `PRAGMA user_version`. */
-export const SQLITE_SCHEMA_VERSION = 6;
+export const SQLITE_SCHEMA_VERSION = 7;
 
 /**
  * Production change-feed retention bound (revisions kept after the low watermark).
@@ -290,6 +290,17 @@ export const CURRENT_SCHEMA_STATEMENTS: readonly string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_send_outbox_workspace_status
      ON send_outbox(workspace_id, status, created_at)`,
+  `CREATE TRIGGER IF NOT EXISTS trg_send_outbox_capacity
+     BEFORE INSERT ON send_outbox
+     WHEN NOT EXISTS (
+            SELECT 1 FROM send_outbox
+             WHERE workspace_id = NEW.workspace_id
+               AND client_request_id = NEW.client_request_id
+          )
+      AND (SELECT COUNT(*) FROM send_outbox WHERE workspace_id = NEW.workspace_id) >= 32
+     BEGIN
+       SELECT RAISE(ABORT, 'send outbox capacity reached');
+     END`,
 
   // Canonical presentation documents (P4-W11). Serializer keeps opaque IDs only.
   `CREATE TABLE IF NOT EXISTS presentations (
@@ -302,10 +313,24 @@ export const CURRENT_SCHEMA_STATEMENTS: readonly string[] = [
     markdown TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, presentation_id),
+    PRIMARY KEY (workspace_id, root_id, presentation_id),
     FOREIGN KEY (workspace_id, owner_task_id)
       REFERENCES tasks(workspace_id, id) ON DELETE CASCADE
   )`,
   `CREATE INDEX IF NOT EXISTS idx_presentations_workspace_owner
      ON presentations(workspace_id, owner_task_id)`,
+  `CREATE TABLE IF NOT EXISTS presentation_operations (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    operation_key TEXT NOT NULL,
+    root_id TEXT NOT NULL,
+    presentation_id TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, operation_key),
+    FOREIGN KEY (workspace_id, root_id, presentation_id)
+      REFERENCES presentations(workspace_id, root_id, presentation_id)
+      ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_presentation_operations_document
+     ON presentation_operations(workspace_id, root_id, presentation_id)`,
 ];

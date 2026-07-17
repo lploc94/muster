@@ -2,7 +2,8 @@
 
 ## Trạng thái
 
-**IN PROGRESS — Phase 4 W9–W11 implemented; durability/poller fixes applied; final W11 gate not re-closed.**
+**COMPLETE — Phase 4 W1–W11 đã qua SQLite-only cutover, paging/patching,
+multi-window convergence và release/UAT gates.**
 Cập nhật: 2026-07-17
 
 - Phase 1: **đã qua gate** — worker/RPC, schema bootstrap, global-storage registry,
@@ -21,6 +22,9 @@ Cập nhật: 2026-07-17
     **Validation-before-mutation:** foreign / unclaimed-incompatible / non-empty
     unclaimed DBs are rejected without durable side effects (no WAL switch, no
     application_id stamp, no schema/data rewrite). Only a truly blank DB is claimed.
+  - **P4-W3–W11 ✅** transcript keyset paging, bounded bootstrap, load-older UX,
+    revisioned patches, local routing, stream batching, bounded change feed,
+    multi-window reconciliation và release benchmark/UAT đều đã đóng gate.
   Kết quả Wave 10 được ghi tại
   [`sqlite-phase3-gate-evidence.vi.md`](./sqlite-phase3-gate-evidence.vi.md).
 
@@ -638,7 +642,7 @@ sau bắt đầu ngay khi wave trước đạt gate, chỉ dừng khi có blocke
 | P4-W8 ✅ | Stream batching | Assistant/reasoning persist + post coalesce 50–100 ms, flush ở tool/terminal boundary |
 | P4-W9 ✅ | Change-feed contract | Bounded feed, prune watermark, explicit gap result |
 | P4-W10 ✅ | Multi-window polling | Visible/focus polling + backoff; hai process hội tụ hoặc full-recover khi gap |
-| P4-W11 🔧 | Performance/UAT gate | 10k fixture budgets measured; durability fixes pending re-gate |
+| P4-W11 ✅ | Performance/UAT gate | Compiled 100k fixture + retained heap + packaged Extension Host smoke đều pass |
 
 ##### P4-W1 — SQLite-only activation cutover
 
@@ -659,7 +663,7 @@ database là hard gate và filesystem JSON watcher/path đã bị loại khỏi 
 - Host reads/export đi qua named repository queries hoặc repository projection.
 - Schema hiện tại bootstrap trực tiếp; DB `user_version` khác bị reject và yêu cầu reset.
 - `releaseState` bắt buộc `draft | released`; outcome chỉ qua `taskResult`.
-- Presentation restore chỉ nhận envelope `{ rootId, document }`; markdown roots chỉ
+- Presentation restore chỉ nhận opaque handle `{ rootId, presentationId }`; markdown roots chỉ
   `WorkspaceFolderRoot`; host/webview protocol chỉ shape hiện tại.
 - Test runtime dùng SQLite repository/current contract; coverage quan trọng đã port
   sang `engine-repository` SQLite integration tests.
@@ -849,35 +853,54 @@ request; fixed page limit 100; **no W6 recovery**.
 
 ##### P4-W9 — Change-feed contract ✅
 
-- Repository expose current revision + changes-since query theo revision boundary.
+- Repository expose current revision + changes-since query theo revision boundary. Toàn bộ
+  revision/watermark/page metadata được đọc bằng **một SQL statement / một read snapshot**;
+  writer append/prune giữa các RPC không thể tạo false gap hoặc partial page.
 - Feed có retention bound/watermark (`CHANGE_FEED_RETAIN_REVISIONS=4096`, explicit
   `change_feed_watermarks`). Consumer nhận explicit `gap` khi revision cần thiết
   đã bị prune; không đoán từ danh sách rỗng.
-- Feed chỉ chứa metadata IDs/change kind, không chứa prompt/tool payload/path.
+- Page bị chặn ở tối đa 512 revisions và 4096 metadata rows; revision quá lớn fail bounded
+  sang snapshot recovery, không materialize vô hạn và không bao giờ cắt đôi revision.
+- Feed chỉ chứa metadata IDs/change kind, không chứa prompt/tool payload/path. Workspace
+  location dùng opaque workspace ID (không canonical URI); turn changes mang task scope;
+  delete cascade dùng explicit recovery marker.
 - Schema v5 current-bootstrap only.
 
 ##### P4-W10 — Multi-window polling ✅
 
 - Khi view visible, poll `data_version`/workspace revision với adaptive backoff; poll ngay
   khi view hoặc VS Code window regain focus; hidden view dừng timer.
-- Apply feed thành patches; gap, protocol recovery hoặc projection invariant failure thì
-  rebuild bounded snapshot.
-- Test hai DB clients/processes ghi xen kẽ và hội tụ cùng reducer state.
+- Poller chỉ bắt đầu sau authoritative snapshot của focus hiện tại; focus/visibility hydrate
+  dừng polling, stale generation không thể clear anchor/cursor mới. Revision chỉ advance sau
+  batch thật sự được post; hidden/unhydrated view không silently skip durable changes.
+- Reconciler drain feed → hydrate bounded projection → đọc end-revision fence; writer commit
+  giữa hydrate làm vòng lặp mở rộng feed (tối đa 8 stability attempts/1024 revisions/16384
+  metadata rows), không stamp projection bằng revision cũ. Gap/corrupt/delete không biểu diễn
+  được thì rebuild bounded snapshot.
+- Queued follow-up vẫn ẩn đến khi promote dù user message bind qua `turn_inputs`; coordination-
+  only revision advance không ép full refresh; focused transcript delete/cascade dùng recovery.
+- Test hai independent DB clients/workers ghi xen kẽ, concurrent-writer-during-hydrate và
+  reducer hội tụ không N+1/full transcript hydration.
 
-##### P4-W11 — Performance/UAT gate 🔧
+##### P4-W11 — Performance/UAT gate ✅
 
-- Benchmark release fixture 10k transcript items: focus latest 100, load page 100,
-  bootstrap bytes, stream-batch p50/p95 (`bench:phase4-release`) — measured on
-  `tsx-worker-release-contract` (not packaged EH); activation@100k / heap still open.
-- UAT: two-client feed convergence, gap prune, outbox/presentation durability unit paths.
+- `bench:phase4-release:assert` compile trước rồi chạy worker JS trong `dist` với 100k
+  persisted messages (10k focused), 12 iterations trên Apple M4/Node 26. Kết quả: activation
+  p95 **0.45 ms**, retained heap delta **0.01 MiB**, focus latest-100 p95 **12.23 ms**,
+  older-page-100 p95 **12.85 ms**, stream batch p95 **0.44 ms**, bootstrap **12.6 KiB**;
+  10 concurrent stream commits đều durable. Mọi budget đều pass.
+- Packaged VSIX smoke chạy trong VS Code 1.129 Extension Host/Node 24.18: activation,
+  built-in `node:sqlite`, compiled worker/client/schema, WAL/FK, schema 7 và durable
+  tables/trigger đều pass.
+- UAT tự động: two-client feed convergence/gap prune/concurrent hydrate; strict outbox
+  reload/reject/delete/capacity; root-scoped presentation restart/idempotency/conflict.
 - Composer → VS Code Settings `muster.composerSelection`; send outbox → SQLite
-  `send_outbox`; presentation → SQLite `presentations` (serializer opaque IDs only).
-- Schema v6 current-bootstrap only.
-- Durability follow-ups applied: poller sticky data_version, outbox reject/delete all
-  paths, outbox-before-snapshot restore, presentation fail-closed + queued restore,
-  coordination for outbox/presentation, focused transcript delete → recovery,
-  batched `listTasksByIds`.
-- Full suite/build/VSIX re-gate required before marking Phase 4 COMPLETE.
+  `send_outbox` (strict payload, max 32); presentation → root-scoped SQLite
+  `presentations` + durable `presentation_operations` (serializer opaque IDs only).
+- Schema v7 current-bootstrap only; no migration/backward-compatible path.
+- Final gates: TypeScript, Svelte (0 errors), webview build, 117 files/1671 tests,
+  source/repository boundaries, 100k benchmark, packaged Extension Host smoke và
+  `git diff --check` đều xanh. Chi tiết ở `sqlite-phase4-gate-evidence.vi.md`.
 
 ##### Cleanup trước P4-W11 ✅
 

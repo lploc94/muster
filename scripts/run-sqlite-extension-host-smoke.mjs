@@ -35,8 +35,9 @@ async function main() {
   const zip = new AdmZip(vsixPath);
   const packagedWorker = 'extension/dist/src/task/sqlite/worker.js';
   const packagedClient = 'extension/dist/src/task/sqlite/client.js';
-  if (!zip.getEntry(packagedWorker) || !zip.getEntry(packagedClient)) {
-    throw new Error(`VSIX is missing compiled SQLite worker/client (${packagedWorker})`);
+  const packagedSchema = 'extension/dist/src/task/sqlite/schema.js';
+  if (!zip.getEntry(packagedWorker) || !zip.getEntry(packagedClient) || !zip.getEntry(packagedSchema)) {
+    throw new Error(`VSIX is missing compiled SQLite worker/client/schema (${packagedWorker})`);
   }
   const manifest = JSON.parse(zip.readAsText('extension/package.json'));
   if (manifest.engines?.vscode !== '^1.101.0') {

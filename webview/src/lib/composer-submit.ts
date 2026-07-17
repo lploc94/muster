@@ -81,6 +81,7 @@ export interface TaskComposerMessageParams {
    */
   backend?: string;
   model?: string | null;
+  mentionBindings?: Array<[string, string]>;
 }
 
 /**
@@ -123,5 +124,8 @@ export function buildTaskComposerMessage(
   if (llmText !== text) base.llmText = llmText;
   if (backend) base.backend = backend;
   if (model) base.model = model;
+  if (params.mentionBindings && params.mentionBindings.length > 0) {
+    base.mentionBindings = params.mentionBindings.map(([label, resolved]) => [label, resolved]);
+  }
   return base;
 }

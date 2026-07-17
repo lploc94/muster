@@ -39,6 +39,18 @@ export class RepositoryProjection {
     return this.file;
   }
 
+  /**
+   * Advance the projection cursor after an external feed reconciliation proved
+   * its start/end revision fence stable. Coordination-only revisions have no
+   * task rows to refresh, so they must not force a workspace-wide metadata read.
+   */
+  markWorkspaceRevision(revision: number): void {
+    if (!Number.isSafeInteger(revision) || revision < this.file.revision) {
+      throw new Error('projection revision must advance monotonically');
+    }
+    this.file.revision = revision;
+  }
+
   getTask(taskId: string): MusterTask | undefined {
     return this.file.tasks[taskId];
   }

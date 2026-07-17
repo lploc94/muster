@@ -745,6 +745,7 @@
         model?: string;
         continuationOf?: string;
         skills?: string[];
+        mentionBindings?: Array<[string, string]>;
         clientRequestId: string;
       } = { type: 'send', text: displayText, backend, clientRequestId };
       if (llmText !== displayText) payload.llmText = llmText;
@@ -753,6 +754,9 @@
       // Skill chips inject only into a NEW task's first turn — never a continuation.
       if (selectedSkills.length > 0 && !tasks.continuationOf) {
         payload.skills = [...selectedSkills];
+      }
+      if (mentionBindings.size > 0) {
+        payload.mentionBindings = Array.from(mentionBindings.entries());
       }
       outboxAdd(vscode, {
         clientRequestId,
@@ -767,15 +771,6 @@
         skills: selectedSkills.length > 0 ? [...selectedSkills] : undefined,
         createdAt: Date.now(),
         status: 'pending',
-      });
-      // DEBUG: temporary — remove after diagnosing grok→claude draft send.
-      console.info('[muster][draft-send]', {
-        selectValue: raw,
-        fromDom,
-        preferredBackend: tasks.preferredBackend,
-        preferredModel: tasks.preferredModel,
-        payloadBackend: payload.backend,
-        payloadModel: payload.model ?? null,
       });
       threadStore.current.appendTranscript({
         id: `local-${Date.now()}`,
@@ -820,6 +815,8 @@
       taskId,
       text: displayText,
       llmText,
+      mentionBindings:
+        mentionBindings.size > 0 ? Array.from(mentionBindings.entries()) : undefined,
       ...(pickerBackend ? { backend: pickerBackend } : {}),
       ...(pickerModel ? { model: pickerModel } : {}),
     });

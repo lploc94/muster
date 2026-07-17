@@ -1,4 +1,4 @@
-# SQLite entity matrix (Phase 3 gate)
+# SQLite entity matrix (current Phase 4 schema)
 
 Tài liệu này là inventory chính thức giữa `TaskStoreFile`/domain types và
 `muster.sqlite3`. Mỗi field chỉ có một nguồn sự thật: field dùng cho query,
@@ -56,7 +56,8 @@ are deleted/reclaimed transactionally with the owning turn.
 | Incremental invalidation | `change_log(workspace_id, revision, entity_kind, entity_id, task_id, change_kind, created_at)` | Metadata feed, không chứa prompt/tool payload hay secret. |
 | Change-feed low watermark | `change_feed_watermarks(workspace_id, retained_from_revision)` | Explicit retained-from revision for gap detection (not MIN(change_log) alone). |
 | Durable send outbox | `send_outbox(workspace_id, client_request_id, status, task_id, payload_json, …)` | Pending/rejected user sends; webview setState must not hold text. |
-| Presentation documents | `presentations(workspace_id, presentation_id, owner_task_id, root_id, revision, title, markdown, …)` | Canonical presentation durability; serializer keeps opaque IDs only. |
+| Presentation documents | `presentations(workspace_id, root_id, presentation_id, owner_task_id, revision, title, markdown, …)` | Canonical document identity is root-scoped; serializer keeps only opaque `{rootId,presentationId}`. |
+| Presentation operations | `presentation_operations(workspace_id, operation_key, root_id, presentation_id, fingerprint, created_at)` | Durable op replay/conflict fence; deferred composite FK makes operation claim + document revision one atomic transaction. |
 
 ## Codec and audit rules
 

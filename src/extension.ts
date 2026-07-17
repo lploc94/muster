@@ -62,6 +62,7 @@ import {
 } from './host/composer-selection';
 import { pickWorkspaceFileMentionPath } from './host/workspace-files';
 import { resolveDroppedFileMention } from './host/file-mentions';
+import { parseHostSendRequest, type HostSendRequest } from './host/send-request';
 import {
   isFileMentionDirectorySymlink,
   listFileMentionSuggestions,
@@ -402,6 +403,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   private appliedWorkspaceRevision = 0;
   private revisionPoller: WorkspaceRevisionPoller | undefined;
   private windowFocused = true;
+  /** Polling starts only after the current view/focus has an authoritative snapshot. */
+  private pollingReady = false;
   private windowStateSub: vscode.Disposable | undefined;
 
   constructor(
@@ -422,13 +425,10 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
    */
   async publishAfterCommit(ctx: RepositoryCommitContext): Promise<void> {
     const after = ctx.projection.getFile();
-    // Always advance the local applied cursor so the poller does not re-publish
-    // this host's own durable revision when it later observes data_version.
-    if (after.revision > this.appliedWorkspaceRevision) {
-      this.appliedWorkspaceRevision = after.revision;
-    }
-    if (!this._view?.visible) {
-      // Visibility regain performs a bounded authoritative snapshot.
+    if (!this._view?.visible || !this.pollingReady) {
+      // This revision is durable but was not published. Do not advance the wire
+      // cursor: visibility/focus hydration must successfully deliver an
+      // authoritative bounded snapshot before the UI is considered caught up.
       return;
     }
     const patches = projectWorkspacePatches({
@@ -450,6 +450,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       }
     }
     this.post(buildWorkspacePatchBatch(after.revision, patches));
+    if (after.revision > this.appliedWorkspaceRevision) {
+      this.appliedWorkspaceRevision = after.revision;
+    }
 
     // Ask-clear side channel when a waiting_user turn leaves that state.
     const previous = ctx.beforeFile;
@@ -1028,27 +1031,47 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     }
     this.focusedTaskId = nextFocus;
     this.knownTranscriptIds.clear();
-    this.postSnapshot(nextFocus);
+    await this.hydrateSnapshotAndResumePolling(nextFocus);
   }
 
   postSnapshot(focusedTaskId?: string, retryAttempt = 0): void {
-    void this.postSnapshotAsync(focusedTaskId, retryAttempt);
+    void this.hydrateSnapshotAndResumePolling(focusedTaskId, retryAttempt);
+  }
+
+  /**
+   * Stop peer patches while a focus/visibility snapshot is in flight. This keeps
+   * first activation and focus transitions from receiving revision batches
+   * against an unhydrated or previous-task reducer state.
+   */
+  private async hydrateSnapshotAndResumePolling(
+    focusedTaskId?: string,
+    retryAttempt = 0,
+  ): Promise<boolean> {
+    this.pollingReady = false;
+    this.revisionPoller?.stop();
+    const hydrated = await this.postSnapshotAsync(focusedTaskId, retryAttempt);
+    if (!hydrated) return false;
+    this.pollingReady = true;
+    if (this._view?.visible && this.windowFocused) {
+      this.revisionPoller?.start();
+    }
+    return true;
   }
 
   /**
    * Awaitable snapshot for poller recovery paths. Resolves after the snapshot is
    * posted (or retries are exhausted) so lastDataVersion is not committed early.
    */
-  private postSnapshotAsync(focusedTaskId?: string, retryAttempt = 0): Promise<void> {
+  private postSnapshotAsync(focusedTaskId?: string, retryAttempt = 0): Promise<boolean> {
     if (!taskRepository) {
-      return Promise.resolve();
+      return Promise.resolve(false);
     }
     // Caller is responsible for flushing the previous focus when switching.
     // Prefer explicit arg; fall back to current host focus (after transitionFocus).
     const focus = focusedTaskId ?? this.focusedTaskId;
     const generation = ++this.snapshotGeneration;
     return buildRepositorySnapshot(taskRepository, repositoryWorkspaceId(), focus, activePendingAsks).then(async (projection) => {
-      if (generation !== this.snapshotGeneration) return;
+      if (generation !== this.snapshotGeneration) return false;
       // A local commit may have completed after the snapshot's final read but
       // before this continuation ran. Never post an older snapshot after its
       // patch; rebuild in write order so the webview revision cannot regress.
@@ -1057,19 +1080,20 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         projectedRevision !== undefined &&
         projection.snapshot.storeRevision < projectedRevision
       ) {
-        await this.postSnapshotAsync(focus);
-        return;
+        if (retryAttempt < 3) {
+          return this.postSnapshotAsync(focus, retryAttempt + 1);
+        }
+        this.postCommandError('Unable to load task snapshot.');
+        return false;
       }
       // Stamp the wire version on the bootstrap message so the webview can detect
       // host<->webview drift once (and show a reload banner) instead of silently
       // dropping mismatched messages.
       this.post({ type: 'snapshot', protocolVersion: PROTOCOL_VERSION, ...projection.snapshot });
       this.replayPendingElicitations();
-      if (focus) {
-        this.focusedTaskId = focus;
-      } else {
-        this.focusedTaskId = undefined;
-      }
+      // The repository normalizes a deleted/stale requested focus to no-focus.
+      // Mirror the accepted snapshot, never the stale request argument.
+      this.focusedTaskId = projection.snapshot.focusedTaskId;
       // Seed known transcript ids from the bounded focus page only.
       this.knownTranscriptIds = new Set(
         (projection.snapshot.transcript ?? []).map((item) => item.id),
@@ -1078,18 +1102,20 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       if (projection.snapshot.storeRevision > this.appliedWorkspaceRevision) {
         this.appliedWorkspaceRevision = projection.snapshot.storeRevision;
       }
+      return true;
     }).catch(async () => {
-      if (generation !== this.snapshotGeneration) return;
+      if (generation !== this.snapshotGeneration) return false;
       if (retryAttempt < 3) {
         await new Promise<void>((resolve) => {
           setTimeout(resolve, 25 * (retryAttempt + 1));
         });
         if (generation === this.snapshotGeneration) {
-          await this.postSnapshotAsync(focus, retryAttempt + 1);
+          return this.postSnapshotAsync(focus, retryAttempt + 1);
         }
-        return;
+        return false;
       }
       this.postCommandError('Unable to load task snapshot.');
+      return false;
     });
   }
 
@@ -1448,7 +1474,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         return taskRepository.getWorkspaceRevision();
       },
       getAppliedRevision: () => this.appliedWorkspaceRevision,
-      isActive: () => Boolean(this._view?.visible) && this.windowFocused,
+      isActive: () => Boolean(this._view?.visible) && this.windowFocused && this.pollingReady,
       onExternalRevisions: async ({ afterRevision, currentRevision }) => {
         await this.reconcileExternalRevisions(afterRevision, currentRevision);
       },
@@ -1472,7 +1498,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     }
     const projection = taskEngine.getProjection();
     if (!projection) {
-      this.postSnapshot(this.focusedTaskId);
+      await this.postSnapshotAsync(this.focusedTaskId);
       return;
     }
     const run = async (): Promise<void> => {
@@ -1487,10 +1513,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         await this.postSnapshotAsync(this.focusedTaskId);
         return;
       }
-      if (!this._view?.visible) {
-        if (result.appliedRevision > this.appliedWorkspaceRevision) {
-          this.appliedWorkspaceRevision = result.appliedRevision;
-        }
+      if (!this._view?.visible || !this.pollingReady) {
+        // No patch was delivered. Visibility recovery owns cursor advancement.
         return;
       }
       for (const batch of result.batches) {
@@ -1521,6 +1545,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   disposeRevisionPoller(): void {
     this.revisionPoller?.dispose();
     this.revisionPoller = undefined;
+    this.pollingReady = false;
     this.windowStateSub?.dispose();
     this.windowStateSub = undefined;
   }
@@ -1678,19 +1703,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     return undefined;
   }
 
-  private async handleSend(data: {
-    taskId?: string;
-    text: string;
-    /** Expanded mention paths for the agent; defaults to `text`. */
-    llmText?: string;
-    backend?: string;
-    model?: string;
-    continuationOf?: string;
-    /** Structured skill chips for a NEW task's first-turn injection. */
-    skills?: string[];
-    clientRequestId?: string;
-    mentionBindings?: Array<[string, string]>;
-  }): Promise<void> {
+  private async handleSend(data: HostSendRequest): Promise<void> {
     const clientRequestId =
       typeof data.clientRequestId === 'string' && data.clientRequestId.trim()
         ? data.clientRequestId.trim()
@@ -1836,15 +1849,6 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       const resolvedBackend = data.backend ?? 'claude';
       const resolvedModel =
         typeof data.model === 'string' && data.model ? data.model : undefined;
-      // DEBUG: temporary — remove after diagnosing grok→claude draft send.
-      console.info('[muster][host-send]', {
-        inboundBackend: data.backend,
-        inboundModel: data.model,
-        resolvedBackend,
-        resolvedModel: resolvedModel ?? null,
-        usedDefaultBackend: data.backend === undefined,
-      });
-
       const result = await taskEngine.startNewTask({
         goal: shortGoal,
         message: text,
@@ -1878,11 +1882,6 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         }
         return;
       }
-      console.info('[muster][host-send] task created', {
-        taskId: result.value.taskId,
-        backend: resolvedBackend,
-        model: resolvedModel ?? null,
-      });
       this.focusedTaskId = result.value.taskId;
       if (clientRequestId) {
         await this.clearDurableOutbox(clientRequestId);
@@ -1912,11 +1911,6 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       const bindingDiffers =
         existing.backend !== data.backend || currentModel !== targetModel;
       if (bindingDiffers) {
-        console.info('[muster][host-send] handoff-before-send', {
-          taskId: data.taskId,
-          from: { backend: existing.backend, model: currentModel ?? null },
-          to: { backend: data.backend, model: targetModel ?? null },
-        });
         await this.handleRequestRuntimeHandoff({
           type: 'requestRuntimeHandoff',
           taskId: data.taskId,
@@ -1973,7 +1967,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       return;
     }
     if (clientRequestId && result.value.messageId) {
-      // Receipt already durable via send path; ACK only after outbox delete succeeds.
+      // Receipt is already durable. Attempt outbox cleanup before ACK; if SQLite
+      // cleanup is transiently unavailable, reload replay de-dupes by receipt and
+      // retries the same delete without creating a second message.
       await this.clearDurableOutbox(clientRequestId);
       this.post({
         type: 'sendAccepted',
@@ -2071,6 +2067,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     _token: vscode.CancellationToken,
   ) {
     this._view = webviewView;
+    this.windowFocused = vscode.window.state.focused;
+    this.pollingReady = false;
 
     webviewView.webview.options = {
       enableScripts: true,
@@ -2083,7 +2081,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     this.windowStateSub?.dispose();
     this.windowStateSub = vscode.window.onDidChangeWindowState((state) => {
       this.windowFocused = state.focused;
-      if (state.focused && webviewView.visible) {
+      if (state.focused && webviewView.visible && this.pollingReady) {
         this.revisionPoller?.start();
       } else if (!state.focused) {
         this.revisionPoller?.stop();
@@ -2092,17 +2090,15 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
 
     webviewView.onDidChangeVisibility(() => {
       if (webviewView.visible) {
-        this.postSnapshot(this.focusedTaskId);
-        if (this.windowFocused) {
-          this.revisionPoller?.start();
-        }
+        // Snapshot delivery establishes the cursor for every local/external
+        // revision missed while hidden. Start polling only after that recovery
+        // completes so patches cannot race ahead of the authoritative hydrate.
+        void this.hydrateSnapshotAndResumePolling(this.focusedTaskId);
       } else {
+        this.pollingReady = false;
         this.revisionPoller?.stop();
       }
     });
-    if (webviewView.visible && this.windowFocused) {
-      this.revisionPoller?.start();
-    }
 
     webviewView.webview.onDidReceiveMessage(async (data) => {
       if (data?.type === 'debugLog') {
@@ -2143,9 +2139,25 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         });
       }
       switch (data?.type) {
-        case 'send':
-          await this.handleSend(data);
+        case 'send': {
+          const parsed = parseHostSendRequest(data);
+          if (!parsed.ok) {
+            if (parsed.clientRequestId) {
+              this.post({
+                type: 'sendRejected',
+                clientRequestId: parsed.clientRequestId,
+                ...(parsed.taskId ? { taskId: parsed.taskId } : {}),
+                reason: 'invalid send request',
+                code: 'validation',
+              });
+            } else {
+              this.postCommandError('invalid send request');
+            }
+            break;
+          }
+          await this.handleSend(parsed.value);
           break;
+        }
         case 'newTask':
           await this.transitionFocus(undefined);
           break;
@@ -2694,9 +2706,19 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           this.handleSetComposerSelection(data);
           break;
         case 'ackSendOutbox': {
+          const keys =
+            typeof data === 'object' && data !== null && !Array.isArray(data)
+              ? Object.keys(data as Record<string, unknown>)
+              : [];
+          const rawId = (data as { clientRequestId?: unknown })?.clientRequestId;
           const id =
-            typeof (data as { clientRequestId?: unknown }).clientRequestId === 'string'
-              ? (data as { clientRequestId: string }).clientRequestId.trim()
+            keys.length === 2 &&
+            keys.includes('type') &&
+            keys.includes('clientRequestId') &&
+            typeof rawId === 'string' &&
+            rawId.length <= MAX_ID_CHARS &&
+            /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(rawId)
+              ? rawId
               : '';
           if (id && taskRepository) {
             void taskRepository.execute({
@@ -2720,7 +2742,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     // Outbox must hydrate before snapshot so pending replay after snapshot sees rows.
     void (async () => {
       await this.postSendOutboxSnapshot();
-      this.postSnapshot(this.focusedTaskId);
+      await this.hydrateSnapshotAndResumePolling(this.focusedTaskId);
     })();
     // Tell the webview which backends are actually installed so its picker only
     // offers callable ones (the webview also requests this on mount).
@@ -3392,8 +3414,8 @@ export async function activate(context: vscode.ExtensionContext) {
     taskStore = taskEngine.getReadModel();
     taskRepository = taskEngine.getRepository();
     presentationManager?.setDocumentStore({
-      getPresentation: async (presentationId) => {
-        const row = await taskRepository!.getPresentation(presentationId);
+      getPresentation: async (rootId, presentationId) => {
+        const row = await taskRepository!.getPresentation(rootId, presentationId);
         if (!row) return undefined;
         return {
           presentationId: row.presentationId,
@@ -3410,7 +3432,7 @@ export async function activate(context: vscode.ExtensionContext) {
         };
       },
       putPresentation: async (document) => {
-        await taskRepository!.execute({
+        const result = await taskRepository!.execute({
           kind: 'putPresentation',
           workspaceId: repositoryWorkspaceId(),
           document: {
@@ -3426,9 +3448,35 @@ export async function activate(context: vscode.ExtensionContext) {
             ...(document.kind ? { kind: document.kind } : {}),
             ...(document.sourcePath ? { sourcePath: document.sourcePath } : {}),
             ...(document.sourceFolderUri ? { sourceFolderUri: document.sourceFolderUri } : {}),
-            ...(document.opFingerprint ? { opFingerprint: document.opFingerprint } : {}),
           },
         });
+        return result.changed === true;
+      },
+      commitPresentationOperation: async ({ operationKey, fingerprint, document }) => {
+        const result = await taskRepository!.execute({
+          kind: 'commitPresentationOperation',
+          workspaceId: repositoryWorkspaceId(),
+          operationKey,
+          fingerprint,
+          document: {
+            presentationId: document.presentationId,
+            ownerTaskId: document.ownerTaskId,
+            rootId: document.rootId,
+            revision: document.revision,
+            title: document.title,
+            markdown: document.markdown,
+            updatedAt: document.updatedAt,
+            ...(document.summary ? { summary: document.summary } : {}),
+            ...(document.changeSummary ? { changeSummary: document.changeSummary } : {}),
+            ...(document.kind ? { kind: document.kind } : {}),
+            ...(document.sourcePath ? { sourcePath: document.sourcePath } : {}),
+            ...(document.sourceFolderUri ? { sourceFolderUri: document.sourceFolderUri } : {}),
+          },
+        });
+        if (!result.presentationStatus) {
+          throw new Error('presentation commit returned no status');
+        }
+        return result.presentationStatus;
       },
     });
     scheduleRetention();

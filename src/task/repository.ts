@@ -342,8 +342,17 @@ export type RepositoryCommand =
       document: PresentationRecord;
     }
   | {
+      /** Atomic durable coordinator idempotency claim + presentation commit. */
+      kind: 'commitPresentationOperation';
+      workspaceId: string;
+      operationKey: string;
+      fingerprint: string;
+      document: PresentationRecord;
+    }
+  | {
       kind: 'deletePresentation';
       workspaceId: string;
+      rootId: string;
       presentationId: string;
     }
   | { kind: 'deleteSendReceipt'; workspaceId: string; clientRequestId: string }
@@ -421,6 +430,12 @@ export interface RepositoryCommandResult {
   /** Queue mutation result fields; absent for unrelated commands. */
   messageId?: string;
   deletedMessageIds?: readonly string[];
+  presentationStatus?:
+    | 'committed'
+    | 'idempotent'
+    | 'op_conflict'
+    | 'stale_revision'
+    | 'owner_mismatch';
 }
 
 /**
@@ -517,7 +532,7 @@ export interface TaskRepository {
   getSendReceipt(clientRequestId: string): Promise<SendReceipt | undefined>;
   listSendOutbox(limit?: number): Promise<readonly SendOutboxEntry[]>;
   getSendOutbox(clientRequestId: string): Promise<SendOutboxEntry | undefined>;
-  getPresentation(presentationId: string): Promise<PresentationRecord | undefined>;
+  getPresentation(rootId: string, presentationId: string): Promise<PresentationRecord | undefined>;
   getTranscriptPage(taskId: string, cursor?: string, limit?: number): Promise<TranscriptPage>;
   /** Current workspace revision. */
   getWorkspaceRevision(): Promise<number>;
@@ -544,8 +559,10 @@ export interface TaskRepository {
 /** Strict versioned send-outbox payload (P4-W11). Bound field sizes; no freeform blobs. */
 export const SEND_OUTBOX_PAYLOAD_VERSION = 1;
 export const SEND_OUTBOX_MAX_ENTRIES = 32;
-export const SEND_OUTBOX_TEXT_MAX = 32_000;
+export const SEND_OUTBOX_TEXT_MAX = 100_000;
 export const SEND_OUTBOX_SKILLS_MAX = 8;
+export const SEND_OUTBOX_MENTION_BINDINGS_MAX = 64;
+export const SEND_OUTBOX_PATH_MAX = 4096;
 
 export interface SendOutboxPayloadV1 {
   version: typeof SEND_OUTBOX_PAYLOAD_VERSION;
@@ -580,8 +597,6 @@ export interface PresentationRecord {
   sourcePath?: string;
   sourceFolderUri?: string;
   updatedAt: string;
-  /** Durable op fingerprint for idempotent open/update across restarts. */
-  opFingerprint?: string;
 }
 
 /** Metadata-only change-feed entity kinds (no content/path/payload). */
@@ -640,6 +655,13 @@ export class CorruptWorkspaceChangeFeedError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'CorruptWorkspaceChangeFeedError';
+  }
+}
+
+export class WorkspaceChangeFeedOverflowError extends Error {
+  constructor() {
+    super('workspace change feed revision exceeds the bounded metadata page');
+    this.name = 'WorkspaceChangeFeedOverflowError';
   }
 }
 
@@ -1263,12 +1285,12 @@ export class SqliteTaskRepository implements TaskRepository {
     return row ? decodeSendOutboxRow(row) : undefined;
   }
 
-  async getPresentation(presentationId: string): Promise<PresentationRecord | undefined> {
+  async getPresentation(rootId: string, presentationId: string): Promise<PresentationRecord | undefined> {
     const row = await this.db.get<PresentationRow>(
       `SELECT presentation_id, owner_task_id, root_id, revision, title, markdown, payload_json, updated_at
          FROM presentations
-        WHERE workspace_id = ? AND presentation_id = ?`,
-      [this.workspaceId, presentationId],
+        WHERE workspace_id = ? AND root_id = ? AND presentation_id = ?`,
+      [this.workspaceId, rootId, presentationId],
     );
     return row ? decodePresentationRow(row) : undefined;
   }
@@ -1343,24 +1365,101 @@ export class SqliteTaskRepository implements TaskRepository {
       );
     }
     const pageLimit = limit === undefined ? DEFAULT_CHANGE_FEED_PAGE_LIMIT : limit;
-    if (!Number.isSafeInteger(pageLimit) || pageLimit < 1) {
+    if (
+      !Number.isSafeInteger(pageLimit) ||
+      pageLimit < 1 ||
+      pageLimit > MAX_CHANGE_FEED_PAGE_REVISIONS
+    ) {
       throw new InvalidWorkspaceChangeFeedRequestError(
-        'limit must be a positive safe integer',
+        `limit must be a safe integer between 1 and ${MAX_CHANGE_FEED_PAGE_REVISIONS}`,
       );
     }
 
-    const currentRevision = await this.getWorkspaceRevision();
+    /*
+     * One statement is essential here. Reading revision, watermark, revision ids,
+     * and metadata through separate RPCs lets another WAL writer prune/append
+     * between reads, manufacturing a false gap or corruption result. The CTEs all
+     * share one SQLite read snapshot. Host materialization is bounded both by
+     * revision count and by metadata rows; an oversized single revision fails into
+     * bounded snapshot recovery instead of allocating an unbounded JS array.
+     */
+    const rows = await this.db.all<ChangeFeedQueryRow>(
+      `WITH state AS MATERIALIZED (
+         SELECT COALESCE((SELECT revision
+                            FROM workspace_revisions
+                           WHERE workspace_id = ?), 0) AS current_revision,
+                COALESCE((SELECT retained_from_revision
+                            FROM change_feed_watermarks
+                           WHERE workspace_id = ?), 1) AS retained_from_revision
+       ),
+       candidate_revisions AS MATERIALIZED (
+         SELECT DISTINCT cl.revision
+           FROM change_log cl
+           CROSS JOIN state s
+          WHERE cl.workspace_id = ?
+            AND cl.revision > ?
+            AND cl.revision <= s.current_revision
+            AND ? + 1 >= s.retained_from_revision
+          ORDER BY cl.revision ASC
+          LIMIT ?
+       ),
+       page_revisions AS MATERIALIZED (
+         SELECT revision
+           FROM candidate_revisions
+          ORDER BY revision ASC
+          LIMIT ?
+       ),
+       page_rows AS MATERIALIZED (
+         SELECT cl.revision, cl.entity_kind, cl.entity_id, cl.task_id, cl.change_kind
+           FROM change_log cl
+           CROSS JOIN page_revisions pr
+          WHERE cl.workspace_id = ?
+            AND cl.revision = pr.revision
+          ORDER BY cl.revision ASC, cl.entity_kind ASC, cl.entity_id ASC
+          LIMIT ?
+       )
+       SELECT s.current_revision,
+              s.retained_from_revision,
+              (SELECT COUNT(*) FROM candidate_revisions) AS candidate_revision_count,
+              pr.revision AS page_revision,
+              p.revision,
+              p.entity_kind,
+              p.entity_id,
+              p.task_id,
+              p.change_kind
+         FROM state s
+         LEFT JOIN page_revisions pr ON 1 = 1
+         LEFT JOIN page_rows p ON p.revision = pr.revision
+        ORDER BY pr.revision ASC, p.entity_kind ASC, p.entity_id ASC`,
+      [
+        this.workspaceId,
+        this.workspaceId,
+        this.workspaceId,
+        afterRevision,
+        afterRevision,
+        pageLimit + 1,
+        pageLimit,
+        this.workspaceId,
+        MAX_CHANGE_FEED_METADATA_ROWS + 1,
+      ],
+    );
+    const state = rows[0];
+    if (
+      !state ||
+      !Number.isSafeInteger(state.current_revision) ||
+      state.current_revision < 0 ||
+      !Number.isSafeInteger(state.retained_from_revision) ||
+      state.retained_from_revision < 1
+    ) {
+      throw new CorruptWorkspaceChangeFeedError('change feed state is invalid');
+    }
+    const currentRevision = state.current_revision;
+    const retainedFromRevision = state.retained_from_revision;
     if (afterRevision > currentRevision) {
       throw new InvalidWorkspaceChangeFeedRequestError(
         `afterRevision ${afterRevision} is ahead of currentRevision ${currentRevision}`,
       );
     }
-
-    const watermarkRow = await this.db.get<{ retained_from_revision: number }>(
-      'SELECT retained_from_revision FROM change_feed_watermarks WHERE workspace_id = ?',
-      [this.workspaceId],
-    );
-    const retainedFromRevision = watermarkRow?.retained_from_revision ?? 1;
     if (afterRevision + 1 < retainedFromRevision) {
       return {
         kind: 'gap',
@@ -1381,20 +1480,20 @@ export class SqliteTaskRepository implements TaskRepository {
       };
     }
 
-    // Fetch one extra revision boundary so hasMore is exact without splitting
-    // rows that share a revision across pages.
-    const revisionRows = await this.db.all<{ revision: number }>(
-      `SELECT DISTINCT revision
-         FROM change_log
-        WHERE workspace_id = ?
-          AND revision > ?
-          AND revision <= ?
-        ORDER BY revision ASC
-        LIMIT ?`,
-      [this.workspaceId, afterRevision, currentRevision, pageLimit + 1],
-    );
-    const hasMore = revisionRows.length > pageLimit;
-    const pageRevisions = revisionRows.slice(0, pageLimit).map((row) => row.revision);
+    const candidateRevisionCount = state.candidate_revision_count;
+    if (
+      !Number.isSafeInteger(candidateRevisionCount) ||
+      candidateRevisionCount < 0 ||
+      candidateRevisionCount > pageLimit + 1
+    ) {
+      throw new CorruptWorkspaceChangeFeedError('change feed revision count is invalid');
+    }
+    const hasMore = candidateRevisionCount > pageLimit;
+    const pageRevisions = [...new Set(
+      rows
+        .map((row) => row.page_revision)
+        .filter((revision): revision is number => revision !== null),
+    )];
     if (pageRevisions.length === 0) {
       // Contiguous durable revisions always write at least one metadata row.
       // Empty mid-range means the feed is corrupt or pruned without watermark.
@@ -1403,17 +1502,28 @@ export class SqliteTaskRepository implements TaskRepository {
       );
     }
 
-    const minRev = pageRevisions[0]!;
-    const maxRev = pageRevisions[pageRevisions.length - 1]!;
-    const feedRows = await this.db.all<ChangeLogRow>(
-      `SELECT revision, entity_kind, entity_id, task_id, change_kind
-         FROM change_log
-        WHERE workspace_id = ?
-          AND revision >= ?
-          AND revision <= ?
-        ORDER BY revision ASC, entity_kind ASC, entity_id ASC`,
-      [this.workspaceId, minRev, maxRev],
-    );
+    const feedRows: ChangeLogRow[] = rows
+      .filter((row): row is ChangeFeedQueryRow & {
+        revision: number;
+        entity_kind: string;
+        entity_id: string;
+        change_kind: string;
+      } => row.revision !== null)
+      .map((row) => ({
+        revision: row.revision,
+        entity_kind: row.entity_kind,
+        entity_id: row.entity_id,
+        task_id: row.task_id,
+        change_kind: row.change_kind,
+      }));
+    if (feedRows.length > MAX_CHANGE_FEED_METADATA_ROWS) {
+      throw new WorkspaceChangeFeedOverflowError();
+    }
+    // A page revision with no joined row can only mean page_rows hit its cap or
+    // the feed is corrupt. Both require bounded recovery; never return partial.
+    if (rows.some((row) => row.page_revision !== null && row.revision === null)) {
+      throw new WorkspaceChangeFeedOverflowError();
+    }
 
     const byRevision = new Map<number, WorkspaceChangeMetadata[]>();
     for (const revision of pageRevisions) byRevision.set(revision, []);
@@ -1477,6 +1587,85 @@ export class SqliteTaskRepository implements TaskRepository {
       ...statements,
       ...revisionStatements(this.workspaceId, changed, at, this.changeFeedRetainRevisions),
     ]);
+  }
+
+  private async commitPresentationOperation(
+    command: Extract<RepositoryCommand, { kind: 'commitPresentationOperation' }>,
+  ): Promise<RepositoryCommandResult> {
+    validatePresentationRecord(command.document);
+    if (!/^[a-f0-9]{64}$/.test(command.operationKey) || !/^[a-f0-9]{64}$/.test(command.fingerprint)) {
+      throw new Error('presentation operation fingerprint invalid');
+    }
+    const document = command.document;
+    const results = await this.db.transaction(
+      [
+        {
+          sql: `INSERT INTO presentation_operations
+                  (workspace_id, operation_key, root_id, presentation_id, fingerprint, created_at)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(workspace_id, operation_key) DO NOTHING`,
+          params: [
+            this.workspaceId,
+            command.operationKey,
+            document.rootId,
+            document.presentationId,
+            command.fingerprint,
+            document.updatedAt,
+          ],
+        },
+        presentationStatement(this.workspaceId, document, true),
+        ...revisionStatements(
+          this.workspaceId,
+          [{
+            kind: 'presentation',
+            id: presentationFeedId(document.rootId, document.presentationId),
+            taskId: document.ownerTaskId,
+            change: 'upsert',
+          }],
+          document.updatedAt,
+          this.changeFeedRetainRevisions,
+        ),
+      ],
+      { abortIfFirstUnchanged: true, abortIfUnchangedAt: [1] },
+    );
+
+    if ((results[0]?.changes ?? 0) === 0) {
+      const prior = await this.db.get<{
+        root_id: string;
+        presentation_id: string;
+        fingerprint: string;
+      }>(
+        `SELECT root_id, presentation_id, fingerprint
+           FROM presentation_operations
+          WHERE workspace_id = ? AND operation_key = ?`,
+        [this.workspaceId, command.operationKey],
+      );
+      if (!prior) throw new Error('presentation operation disappeared after claim');
+      const idempotent =
+        prior.root_id === document.rootId &&
+        prior.presentation_id === document.presentationId &&
+        prior.fingerprint === command.fingerprint;
+      return {
+        ok: true,
+        changed: false,
+        presentationStatus: idempotent ? 'idempotent' : 'op_conflict',
+        ...(!idempotent ? { reason: 'presentation operation fingerprint conflict' } : {}),
+      };
+    }
+
+    if ((results[1]?.changes ?? 0) === 0) {
+      const existing = await this.getPresentation(document.rootId, document.presentationId);
+      if (!existing) throw new Error('presentation commit guard rejected without existing row');
+      const ownerMismatch = existing.ownerTaskId !== document.ownerTaskId;
+      return {
+        ok: true,
+        changed: false,
+        presentationStatus: ownerMismatch ? 'owner_mismatch' : 'stale_revision',
+        reason: ownerMismatch ? 'presentation owner mismatch' : 'presentation revision is stale',
+      };
+    }
+
+    return { ok: true, changed: true, presentationStatus: 'committed' };
   }
 
   private async renameTask(
@@ -1867,7 +2056,14 @@ export class SqliteTaskRepository implements TaskRepository {
         return { ok: true, changed: true };
       }
       case 'recordWorkspaceLocation': {
-        await this.write([workspaceLocationStatement(command)], [{ kind: 'workspace_location', id: command.canonicalUri, change: 'upsert' }], command.lastSeenAt);
+        // The feed is metadata-only. A canonical URI is user data/path, never an
+        // entity id exposed to feed consumers; the workspace id is the opaque
+        // invalidation key because locations are reconciled as one workspace set.
+        await this.write(
+          [workspaceLocationStatement(command)],
+          [{ kind: 'workspace_location', id: command.workspaceId, change: 'upsert' }],
+          command.lastSeenAt,
+        );
         return { ok: true, changed: true };
       }
       case 'createTask':
@@ -1938,9 +2134,18 @@ export class SqliteTaskRepository implements TaskRepository {
           expectedRuntimeEpoch: command.expectedRuntimeEpoch,
         });
       case 'deleteTurn': {
+        const taskId = await this.lookupTurnTaskId(command.turnId);
         const results = await this.writeIfFirstChanged(
           { sql: 'DELETE FROM turns WHERE workspace_id = ? AND id = ?', params: [this.workspaceId, command.turnId] }, [],
-          { kind: 'turn', id: command.turnId, change: 'delete' }, new Date().toISOString(),
+          {
+            kind: 'turn',
+            id: command.turnId,
+            ...(taskId ? { taskId } : {}),
+            // FK cascades may remove transcript rows without individual feed
+            // metadata, so peers must choose bounded recovery for this command.
+            change: 'delete_cascade',
+          },
+          new Date().toISOString(),
         );
         return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
       }
@@ -2084,26 +2289,37 @@ export class SqliteTaskRepository implements TaskRepository {
       }
       case 'putPresentation': {
         validatePresentationRecord(command.document);
-        await this.write(
-          [presentationStatement(this.workspaceId, command.document)],
-          [{
+        const results = await this.writeIfFirstChanged(
+          presentationStatement(this.workspaceId, command.document),
+          [],
+          {
             kind: 'presentation',
-            id: command.document.presentationId,
+            id: presentationFeedId(command.document.rootId, command.document.presentationId),
             taskId: command.document.ownerTaskId,
             change: 'upsert',
-          }],
+          },
           command.document.updatedAt,
         );
-        return { ok: true, changed: true };
+        return {
+          ok: true,
+          changed: (results[0]?.changes ?? 0) > 0,
+          ...((results[0]?.changes ?? 0) === 0 ? { reason: 'presentation revision or owner conflict' } : {}),
+        };
       }
+      case 'commitPresentationOperation':
+        return this.commitPresentationOperation(command);
       case 'deletePresentation': {
         const results = await this.writeIfFirstChanged(
           {
-            sql: 'DELETE FROM presentations WHERE workspace_id = ? AND presentation_id = ?',
-            params: [this.workspaceId, command.presentationId],
+            sql: 'DELETE FROM presentations WHERE workspace_id = ? AND root_id = ? AND presentation_id = ?',
+            params: [this.workspaceId, command.rootId, command.presentationId],
           },
           [],
-          { kind: 'presentation', id: command.presentationId, change: 'delete' },
+          {
+            kind: 'presentation',
+            id: presentationFeedId(command.rootId, command.presentationId),
+            change: 'delete',
+          },
           new Date().toISOString(),
         );
         return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
@@ -2795,19 +3011,26 @@ export class SqliteTaskRepository implements TaskRepository {
   }
 
   private async promote(turnId: string, startedAt: string): Promise<RepositoryCommandResult> {
+    const taskId = await this.lookupTurnTaskId(turnId);
     const results = await this.writeIfFirstChanged(
       { sql: `UPDATE turns SET status = 'running', started_at = ? WHERE workspace_id = ? AND id = ? AND status = 'queued'`, params: [startedAt, this.workspaceId, turnId] }, [],
-      { kind: 'turn', id: turnId, change: 'promote' }, startedAt,
+      { kind: 'turn', id: turnId, ...(taskId ? { taskId } : {}), change: 'promote' }, startedAt,
     );
     return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
   }
 
   private async claim(command: Extract<RepositoryCommand, { kind: 'claimTurn' }>): Promise<RepositoryCommandResult> {
+    const taskId = await this.lookupTurnTaskId(command.turnId);
     const update = claimTurnStatement(this.workspaceId, command);
     const rest: SqlStatement[] = [];
     if (command.sessionId) rest.push(sessionClaimStatement(this.workspaceId, command.turnId, command.sessionId, command.startedAt));
     for (const key of command.resourceKeys) rest.push(resourceClaimStatement(this.workspaceId, command.turnId, key, command.startedAt));
-    const results = await this.writeIfFirstChanged(update, rest, { kind: 'turn', id: command.turnId, change: 'promote' }, command.startedAt);
+    const results = await this.writeIfFirstChanged(
+      update,
+      rest,
+      { kind: 'turn', id: command.turnId, ...(taskId ? { taskId } : {}), change: 'promote' },
+      command.startedAt,
+    );
     return { ok: true, changed: (results[0]?.changes ?? 0) > 0, ...((results[0]?.changes ?? 0) === 0 ? { reason: 'turn is no longer eligible' } : {}) };
   }
 
@@ -2858,6 +3081,7 @@ export class SqliteTaskRepository implements TaskRepository {
   }
 
   private async settle(command: Extract<RepositoryCommand, { kind: 'settleTurn' }>): Promise<RepositoryCommandResult> {
+    const taskId = await this.lookupTurnTaskId(command.turnId);
     const payloadExpression = command.error === undefined
       ? "json_remove(payload_json, '$.error')"
       : "json_set(payload_json, '$.error', ?)";
@@ -2871,8 +3095,21 @@ export class SqliteTaskRepository implements TaskRepository {
       }, [
       { sql: 'DELETE FROM session_claims WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, command.turnId] },
       { sql: 'DELETE FROM resource_claims WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, command.turnId] },
-    ], { kind: 'turn', id: command.turnId, change: 'settle' }, command.finishedAt);
+    ], {
+      kind: 'turn',
+      id: command.turnId,
+      ...(taskId ? { taskId } : {}),
+      change: 'settle',
+    }, command.finishedAt);
     return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
+  }
+
+  private async lookupTurnTaskId(turnId: string): Promise<string | undefined> {
+    const row = await this.db.get<{ task_id: string }>(
+      'SELECT task_id FROM turns WHERE workspace_id = ? AND id = ?',
+      [this.workspaceId, turnId],
+    );
+    return row?.task_id;
   }
 
   private async settleTurnAndApplyEffects(
@@ -3035,40 +3272,154 @@ interface PresentationRow {
 }
 
 function validateSendOutboxEntry(entry: SendOutboxEntry): void {
-  if (!entry.clientRequestId || entry.clientRequestId.length > 512) {
+  const stableId = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+  const payloadKeys = new Set([
+    'version', 'text', 'llmText', 'mentionBindings', 'skills', 'backend', 'model', 'continuationOf',
+  ]);
+  if (
+    !entry.clientRequestId ||
+    entry.clientRequestId.length > 256 ||
+    !stableId.test(entry.clientRequestId)
+  ) {
     throw new Error('send outbox clientRequestId invalid');
+  }
+  if (entry.taskId !== undefined && (!entry.taskId || entry.taskId.length > 256 || !stableId.test(entry.taskId))) {
+    throw new Error('send outbox taskId invalid');
   }
   if (entry.status !== 'pending' && entry.status !== 'rejected') {
     throw new Error('send outbox status invalid');
   }
+  if (!Number.isFinite(Date.parse(entry.createdAt)) || !Number.isFinite(Date.parse(entry.updatedAt))) {
+    throw new Error('send outbox timestamp invalid');
+  }
   const payload = entry.payload;
-  if (!payload || payload.version !== SEND_OUTBOX_PAYLOAD_VERSION) {
+  if (
+    !payload ||
+    typeof payload !== 'object' ||
+    Array.isArray(payload) ||
+    Object.keys(payload).some((key) => !payloadKeys.has(key)) ||
+    payload.version !== SEND_OUTBOX_PAYLOAD_VERSION
+  ) {
     throw new Error('send outbox payload version invalid');
   }
-  if (typeof payload.text !== 'string' || payload.text.length === 0 || payload.text.length > SEND_OUTBOX_TEXT_MAX) {
+  if (
+    typeof payload.text !== 'string' ||
+    payload.text.length === 0 ||
+    payload.text.length > SEND_OUTBOX_TEXT_MAX ||
+    payload.text.includes('\0')
+  ) {
     throw new Error('send outbox text invalid');
   }
   if (payload.llmText !== undefined) {
-    if (typeof payload.llmText !== 'string' || payload.llmText.length > SEND_OUTBOX_TEXT_MAX) {
+    if (
+      typeof payload.llmText !== 'string' ||
+      payload.llmText.length === 0 ||
+      payload.llmText.length > SEND_OUTBOX_TEXT_MAX ||
+      payload.llmText.includes('\0')
+    ) {
       throw new Error('send outbox llmText invalid');
     }
   }
-  if (payload.skills && payload.skills.length > SEND_OUTBOX_SKILLS_MAX) {
-    throw new Error('send outbox skills bound exceeded');
+  if (payload.mentionBindings !== undefined) {
+    const labels = new Set<string>();
+    if (
+      !Array.isArray(payload.mentionBindings) ||
+      payload.mentionBindings.length > SEND_OUTBOX_MENTION_BINDINGS_MAX ||
+      payload.mentionBindings.some((binding) =>
+        !Array.isArray(binding) ||
+        binding.length !== 2 ||
+        typeof binding[0] !== 'string' ||
+        binding[0].length === 0 ||
+        binding[0].length > 512 ||
+        /[\0\r\n]/.test(binding[0]) ||
+        typeof binding[1] !== 'string' ||
+        binding[1].length === 0 ||
+        binding[1].length > SEND_OUTBOX_PATH_MAX ||
+        /[\0\r\n]/.test(binding[1]) ||
+        labels.has(binding[0]) ||
+        !labels.add(binding[0])
+      )
+    ) {
+      throw new Error('send outbox mention bindings invalid');
+    }
+  }
+  if (payload.skills !== undefined) {
+    const skills = new Set<string>();
+    if (
+      !Array.isArray(payload.skills) ||
+      payload.skills.length > SEND_OUTBOX_SKILLS_MAX ||
+      payload.skills.some((skill) =>
+        typeof skill !== 'string' ||
+        skill.length === 0 ||
+        skill.length > 128 ||
+        !stableId.test(skill) ||
+        skills.has(skill) ||
+        !skills.add(skill)
+      )
+    ) {
+      throw new Error('send outbox skills invalid');
+    }
+  }
+  if (
+    payload.backend !== undefined &&
+    (typeof payload.backend !== 'string' || !['claude', 'grok', 'kiro', 'codex', 'opencode'].includes(payload.backend))
+  ) {
+    throw new Error('send outbox backend invalid');
+  }
+  if (
+    payload.model !== undefined &&
+    (typeof payload.model !== 'string' || payload.model.length === 0 || payload.model.length > 512 || /[\0\r\n]/.test(payload.model))
+  ) {
+    throw new Error('send outbox model invalid');
+  }
+  if (
+    payload.continuationOf !== undefined &&
+    (typeof payload.continuationOf !== 'string' || payload.continuationOf.length > 256 || !stableId.test(payload.continuationOf))
+  ) {
+    throw new Error('send outbox continuation invalid');
   }
 }
 
 function validatePresentationRecord(doc: PresentationRecord): void {
-  if (!doc.presentationId || doc.presentationId.length > 512) {
+  const stableId = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+  if (!doc.presentationId || doc.presentationId.length > 512 || !stableId.test(doc.presentationId)) {
     throw new Error('presentation id invalid');
   }
-  if (!doc.ownerTaskId || !doc.rootId) throw new Error('presentation owner/root required');
+  if (
+    !doc.ownerTaskId ||
+    doc.ownerTaskId.length > 512 ||
+    !stableId.test(doc.ownerTaskId) ||
+    !doc.rootId ||
+    doc.rootId.length > 512 ||
+    !stableId.test(doc.rootId)
+  ) {
+    throw new Error('presentation owner/root invalid');
+  }
   if (!Number.isSafeInteger(doc.revision) || doc.revision < 1) {
     throw new Error('presentation revision invalid');
   }
-  if (!doc.title || doc.title.length > 512) throw new Error('presentation title invalid');
-  if (!doc.markdown || doc.markdown.length > 100_000) {
+  if (!doc.title || doc.title.length > 512 || doc.title.includes('\0')) {
+    throw new Error('presentation title invalid');
+  }
+  if (!doc.markdown || doc.markdown.length > 100_000 || doc.markdown.includes('\0')) {
     throw new Error('presentation markdown invalid');
+  }
+  if (doc.kind !== undefined && !['plan', 'spec', 'document'].includes(doc.kind)) {
+    throw new Error('presentation kind invalid');
+  }
+  if (doc.summary !== undefined && (!doc.summary || doc.summary.length > 600)) {
+    throw new Error('presentation summary invalid');
+  }
+  if (doc.changeSummary !== undefined && (!doc.changeSummary || doc.changeSummary.length > 1000)) {
+    throw new Error('presentation change summary invalid');
+  }
+  for (const value of [doc.sourcePath, doc.sourceFolderUri]) {
+    if (value !== undefined && (!value || value.length > 4096 || value.includes('\0'))) {
+      throw new Error('presentation source path invalid');
+    }
+  }
+  if (!Number.isFinite(Date.parse(doc.updatedAt))) {
+    throw new Error('presentation timestamp invalid');
   }
 }
 
@@ -3094,27 +3445,34 @@ function sendOutboxStatement(workspaceId: string, entry: SendOutboxEntry): SqlSt
   };
 }
 
-function presentationStatement(workspaceId: string, doc: PresentationRecord): SqlStatement {
+function presentationStatement(
+  workspaceId: string,
+  doc: PresentationRecord,
+  onlyIfPreviousChanged = false,
+): SqlStatement {
   const payload = {
     summary: doc.summary,
     changeSummary: doc.changeSummary,
     kind: doc.kind,
     sourcePath: doc.sourcePath,
     sourceFolderUri: doc.sourceFolderUri,
-    opFingerprint: doc.opFingerprint,
   };
+  const values = onlyIfPreviousChanged
+    ? 'SELECT ?,?,?,?,?,?,?,?,? WHERE changes() > 0'
+    : 'VALUES (?,?,?,?,?,?,?,?,?)';
   return {
     sql: `INSERT INTO presentations
           (workspace_id, presentation_id, owner_task_id, root_id, revision, title, markdown, payload_json, updated_at)
-          VALUES (?,?,?,?,?,?,?,?,?)
-          ON CONFLICT(workspace_id, presentation_id) DO UPDATE SET
+          ${values}
+          ON CONFLICT(workspace_id, root_id, presentation_id) DO UPDATE SET
             owner_task_id = excluded.owner_task_id,
-            root_id = excluded.root_id,
             revision = excluded.revision,
             title = excluded.title,
             markdown = excluded.markdown,
             payload_json = excluded.payload_json,
-            updated_at = excluded.updated_at`,
+            updated_at = excluded.updated_at
+          WHERE presentations.owner_task_id = excluded.owner_task_id
+            AND excluded.revision > presentations.revision`,
     params: [
       workspaceId,
       doc.presentationId,
@@ -3129,6 +3487,10 @@ function presentationStatement(workspaceId: string, doc: PresentationRecord): Sq
   };
 }
 
+function presentationFeedId(rootId: string, presentationId: string): string {
+  return `${rootId.length}:${rootId}${presentationId}`;
+}
+
 function decodeSendOutboxRow(row: SendOutboxRow): SendOutboxEntry {
   let payload: SendOutboxPayloadV1;
   try {
@@ -3136,30 +3498,39 @@ function decodeSendOutboxRow(row: SendOutboxRow): SendOutboxEntry {
   } catch {
     throw new Error('send outbox payload corrupt');
   }
-  if (!payload || payload.version !== SEND_OUTBOX_PAYLOAD_VERSION || typeof payload.text !== 'string') {
-    throw new Error('send outbox payload invalid');
-  }
-  if (row.status !== 'pending' && row.status !== 'rejected') {
-    throw new Error('send outbox status corrupt');
-  }
-  return {
+  const entry: SendOutboxEntry = {
     clientRequestId: row.client_request_id,
-    status: row.status,
+    status: row.status as SendOutboxEntry['status'],
     ...(row.task_id ? { taskId: row.task_id } : {}),
     payload,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+  validateSendOutboxEntry(entry);
+  return entry;
 }
 
 function decodePresentationRow(row: PresentationRow): PresentationRecord {
-  let extra: Record<string, unknown> = {};
+  let extra: Record<string, unknown>;
   try {
-    extra = JSON.parse(row.payload_json) as Record<string, unknown>;
+    const parsed = JSON.parse(row.payload_json) as unknown;
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new Error('not an object');
+    }
+    extra = parsed as Record<string, unknown>;
   } catch {
     throw new Error('presentation payload corrupt');
   }
-  return {
+  const allowed = new Set(['summary', 'changeSummary', 'kind', 'sourcePath', 'sourceFolderUri']);
+  if (Object.keys(extra).some((key) => !allowed.has(key))) {
+    throw new Error('presentation payload corrupt');
+  }
+  for (const key of allowed) {
+    if (extra[key] !== undefined && typeof extra[key] !== 'string') {
+      throw new Error('presentation payload corrupt');
+    }
+  }
+  const document: PresentationRecord = {
     presentationId: row.presentation_id,
     ownerTaskId: row.owner_task_id,
     rootId: row.root_id,
@@ -3172,8 +3543,9 @@ function decodePresentationRow(row: PresentationRow): PresentationRecord {
     ...(typeof extra.kind === 'string' ? { kind: extra.kind } : {}),
     ...(typeof extra.sourcePath === 'string' ? { sourcePath: extra.sourcePath } : {}),
     ...(typeof extra.sourceFolderUri === 'string' ? { sourceFolderUri: extra.sourceFolderUri } : {}),
-    ...(typeof extra.opFingerprint === 'string' ? { opFingerprint: extra.opFingerprint } : {}),
   };
+  validatePresentationRecord(document);
+  return document;
 }
 
 interface ChangeRecord {
@@ -3741,6 +4113,8 @@ function sendReceiptStatement(workspaceId: string, receipt: SendReceipt): SqlSta
 }
 
 const DEFAULT_CHANGE_FEED_PAGE_LIMIT = 256;
+export const MAX_CHANGE_FEED_PAGE_REVISIONS = 512;
+export const MAX_CHANGE_FEED_METADATA_ROWS = 4096;
 const WORKSPACE_CHANGE_ENTITY_KIND_SET = new Set<string>(WORKSPACE_CHANGE_ENTITY_KINDS);
 
 interface ChangeLogRow {
@@ -3749,6 +4123,18 @@ interface ChangeLogRow {
   entity_id: string;
   task_id: string | null;
   change_kind: string;
+}
+
+interface ChangeFeedQueryRow {
+  current_revision: number;
+  retained_from_revision: number;
+  candidate_revision_count: number;
+  page_revision: number | null;
+  revision: number | null;
+  entity_kind: string | null;
+  entity_id: string | null;
+  task_id: string | null;
+  change_kind: string | null;
 }
 
 function parseWorkspaceChangeEntityKind(value: string): WorkspaceChangeEntityKind | undefined {

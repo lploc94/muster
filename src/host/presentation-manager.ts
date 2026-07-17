@@ -20,22 +20,6 @@ const REQUEST_KEYS = new Set([
   'summary',
   'changeSummary',
 ]);
-const REQUIRED_DOCUMENT_KEYS = new Set([
-  'presentationId',
-  'ownerTaskId',
-  'revision',
-  'title',
-  'markdown',
-]);
-const OPTIONAL_DOCUMENT_KEYS = new Set([
-  'kind',
-  'summary',
-  'changeSummary',
-  'sourcePath',
-  'sourceFolderUri',
-  'updatedAt',
-]);
-const DOCUMENT_KEYS = new Set([...REQUIRED_DOCUMENT_KEYS, ...OPTIONAL_DOCUMENT_KEYS]);
 
 export type PresentationKind = 'plan' | 'spec' | 'document';
 
@@ -109,8 +93,13 @@ export interface PersistedPresentationState {
 }
 
 export type PresentationDocumentStore = {
-  getPresentation(presentationId: string): Promise<PresentationDocument | undefined>;
-  putPresentation(document: PresentationDocument & { rootId: string; updatedAt: string; opFingerprint?: string }): Promise<void>;
+  getPresentation(rootId: string, presentationId: string): Promise<PresentationDocument | undefined>;
+  putPresentation(document: PresentationDocument & { rootId: string; updatedAt: string }): Promise<boolean>;
+  commitPresentationOperation(args: {
+    operationKey: string;
+    fingerprint: string;
+    document: PresentationDocument & { rootId: string; updatedAt: string };
+  }): Promise<'committed' | 'idempotent' | 'op_conflict' | 'stale_revision' | 'owner_mismatch'>;
 };
 
 export type PresentationResult =
@@ -138,73 +127,13 @@ function isStableId(value: unknown): value is string {
   );
 }
 
-function isIsoTimestamp(value: unknown): value is string {
-  if (typeof value !== 'string' || value.length < 10 || value.length > 40) return false;
-  return Number.isFinite(Date.parse(value));
-}
-
-function parseOptionalBounded(
-  value: unknown,
-  max: number,
-): string | undefined | false {
-  if (value === undefined) return undefined;
-  if (typeof value !== 'string' || value.length === 0 || value.length > max) return false;
-  return value;
-}
-
-function parseDocumentFields(raw: Record<string, unknown>): PresentationDocument | undefined {
-  if (Object.keys(raw).some((key) => !DOCUMENT_KEYS.has(key))) return undefined;
-  for (const key of REQUIRED_DOCUMENT_KEYS) {
-    if (!(key in raw)) return undefined;
-  }
-  if (
-    !isStableId(raw.presentationId) ||
-    !isStableId(raw.ownerTaskId) ||
-    !Number.isSafeInteger(raw.revision) ||
-    (raw.revision as number) <= 0 ||
-    typeof raw.title !== 'string' ||
-    raw.title.length === 0 ||
-    raw.title.length > PRESENTATION_TITLE_MAX_LENGTH ||
-    typeof raw.markdown !== 'string' ||
-    raw.markdown.length === 0 ||
-    raw.markdown.length > PRESENTATION_MARKDOWN_MAX_LENGTH
-  ) {
-    return undefined;
-  }
-  const doc: PresentationDocument = {
-    presentationId: raw.presentationId as string,
-    ownerTaskId: raw.ownerTaskId as string,
-    revision: raw.revision as number,
-    title: raw.title as string,
-    markdown: raw.markdown as string,
-  };
-  if (raw.kind !== undefined) {
-    if (typeof raw.kind !== 'string' || !KIND_VALUES.has(raw.kind)) return undefined;
-    doc.kind = raw.kind as PresentationKind;
-  }
-  const summary = parseOptionalBounded(raw.summary, SUMMARY_MAX_LENGTH);
-  if (summary === false) return undefined;
-  if (summary !== undefined) doc.summary = summary;
-  const changeSummary = parseOptionalBounded(raw.changeSummary, CHANGE_SUMMARY_MAX_LENGTH);
-  if (changeSummary === false) return undefined;
-  if (changeSummary !== undefined) doc.changeSummary = changeSummary;
-  const sourcePath = parseOptionalBounded(raw.sourcePath, 4096);
-  if (sourcePath === false) return undefined;
-  if (sourcePath !== undefined) doc.sourcePath = sourcePath;
-  const sourceFolderUri = parseOptionalBounded(raw.sourceFolderUri, 4096);
-  if (sourceFolderUri === false) return undefined;
-  if (sourceFolderUri !== undefined) doc.sourceFolderUri = sourceFolderUri;
-  if (raw.updatedAt !== undefined) {
-    if (!isIsoTimestamp(raw.updatedAt)) return undefined;
-    doc.updatedAt = raw.updatedAt;
-  }
-  return doc;
-}
-
 function parsePersistedState(value: unknown): PersistedPresentationState | undefined {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
   const raw = value as Record<string, unknown>;
   // Accept only opaque ID handles. Full document restore from serializer is rejected.
+  if (Object.keys(raw).length !== 2 || !('rootId' in raw) || !('presentationId' in raw)) {
+    return undefined;
+  }
   if (!isStableId(raw.rootId) || !isStableId(raw.presentationId)) return undefined;
   return { rootId: raw.rootId, presentationId: raw.presentationId };
 }
@@ -257,7 +186,8 @@ function validateRequest(request: PresentationUpsertRequest): PresentationResult
     typeof request.title !== 'string' ||
     request.title.length === 0 ||
     typeof request.markdown !== 'string' ||
-    request.markdown.length === 0
+    request.markdown.length === 0 ||
+    request.markdown.includes('\0')
   ) {
     return { ok: false, code: 'invalid_arguments' };
   }
@@ -285,17 +215,26 @@ interface PanelEntry {
   rootId: string;
 }
 
+interface PendingRestore {
+  panel: PresentationPanel;
+  state: unknown;
+  resolve: (result: PresentationResult) => void;
+}
+
+type PresentationDeliveryResult = 'ok' | 'panel_open_failed' | 'host_delivery_failed';
+
 export class PresentationManager {
   private readonly panels = new Map<string, PanelEntry>();
   private readonly operations = new Map<string, string>();
+  private disposed = false;
   private ownerResolver: OwnerResolver | undefined;
   private documentStore: PresentationDocumentStore | undefined;
   /** Restores that arrived before the SQLite store was wired. */
-  private pendingRestores: Array<{
-    panel: PresentationPanel;
-    state: unknown;
-    resolve: (result: PresentationResult) => void;
-  }> = [];
+  private pendingRestores: PendingRestore[] = [];
+  /** Queued restores currently blocked inside the durable store read. */
+  private readonly inFlightRestores = new Set<PendingRestore>();
+  /** Avoid double-dispose when a cancelled durable read eventually resumes. */
+  private readonly cancelledRestorePanels = new WeakSet<PresentationPanel>();
 
   constructor(private readonly factory: PresentationPanelFactory) {}
 
@@ -306,30 +245,32 @@ export class PresentationManager {
 
   /** SQLite-backed presentation document store (required for restart restore). */
   setDocumentStore(store: PresentationDocumentStore | undefined): void {
+    if (this.disposed) return;
     this.documentStore = store;
     if (!store) return;
     const pending = this.pendingRestores;
     this.pendingRestores = [];
     for (const entry of pending) {
-      void this.restore(entry.panel, entry.state).then(entry.resolve);
+      this.inFlightRestores.add(entry);
+      void this.restore(entry.panel, entry.state).then(
+        (result) => this.settleInFlightRestore(entry, result),
+        () => this.settleInFlightRestore(entry, { ok: false, code: 'restore_rejected' }),
+      );
     }
   }
 
   private async persistDocument(
     rootId: string,
     document: PresentationDocument,
-    opFingerprint?: string,
   ): Promise<boolean> {
     // Fail closed: never claim durable success without a store (persist-before-visible).
     if (!this.documentStore) return false;
     try {
-      await this.documentStore.putPresentation({
+      return await this.documentStore.putPresentation({
         ...document,
         rootId,
         updatedAt: document.updatedAt ?? new Date().toISOString(),
-        ...(opFingerprint ? { opFingerprint } : {}),
       });
-      return true;
     } catch {
       return false;
     }
@@ -342,6 +283,7 @@ export class PresentationManager {
     rootId: string,
     document: Omit<PresentationDocument, 'revision'> & { revision?: number },
   ): Promise<PresentationResult> {
+    if (this.disposed) return { ok: false, code: 'host_delivery_failed' };
     if (!isStableId(rootId) || !isStableId(document.presentationId) || !isStableId(document.ownerTaskId)) {
       return { ok: false, code: 'invalid_arguments' };
     }
@@ -351,79 +293,67 @@ export class PresentationManager {
       document.title.length > PRESENTATION_TITLE_MAX_LENGTH ||
       typeof document.markdown !== 'string' ||
       document.markdown.length === 0 ||
-      document.markdown.length > PRESENTATION_MARKDOWN_MAX_LENGTH
+      document.markdown.length > PRESENTATION_MARKDOWN_MAX_LENGTH ||
+      document.markdown.includes('\0')
     ) {
       return { ok: false, code: 'invalid_arguments' };
     }
 
+    if (!this.documentStore) return { ok: false, code: 'host_delivery_failed' };
+    let stored: PresentationDocument | undefined;
+    try {
+      stored = await this.documentStore.getPresentation(rootId, document.presentationId);
+    } catch {
+      return { ok: false, code: 'host_delivery_failed' };
+    }
+    if (this.disposed) return { ok: false, code: 'host_delivery_failed' };
+    if (stored && stored.ownerTaskId !== document.ownerTaskId) {
+      return { ok: false, code: 'owner_mismatch' };
+    }
+    const sameContent = Boolean(
+      stored &&
+      stored.title === document.title &&
+      stored.markdown === document.markdown &&
+      stored.sourcePath === document.sourcePath &&
+      stored.sourceFolderUri === document.sourceFolderUri,
+    );
     const key = this.presentationKey(rootId, document.presentationId);
-    const existing = this.panels.get(key);
-    if (existing) {
-      const sameContent =
-        existing.document.title === document.title &&
-        existing.document.markdown === document.markdown &&
-        existing.document.ownerTaskId === document.ownerTaskId &&
-        existing.document.sourcePath === document.sourcePath &&
-        existing.document.sourceFolderUri === document.sourceFolderUri;
-      if (sameContent) {
-        try {
-          existing.panel.reveal();
-        } catch {
-          // best-effort focus
-        }
-        return { ok: true, code: 'idempotent' };
-      }
-      const next = stampUpdatedAt({
-        presentationId: document.presentationId,
-        ownerTaskId: existing.document.ownerTaskId,
-        revision: existing.document.revision + 1,
-        title: document.title,
-        markdown: document.markdown,
-        kind: document.kind ?? existing.document.kind ?? 'document',
-        summary: document.summary,
-        changeSummary: document.changeSummary,
-        sourcePath: document.sourcePath,
-        sourceFolderUri: document.sourceFolderUri,
-      });
-      const durable = await this.persistDocument(rootId, next);
-      if (!durable) return { ok: false, code: 'host_delivery_failed' };
-      let accepted = false;
-      try {
-        accepted = await existing.panel.update(next, rootId);
-      } catch {
-        // content-free failure
-      }
-      if (!accepted || this.panels.get(key) !== existing) {
-        return { ok: false, code: 'host_delivery_failed' };
-      }
-      existing.document = next;
-      try {
-        existing.panel.reveal();
-      } catch {
-        // best-effort
-      }
-      return { ok: true, code: 'opened' };
+    if (stored && sameContent) {
+      const delivered = await this.deliverCanonicalDocument(rootId, key, stored);
+      return delivered === 'ok'
+        ? { ok: true, code: 'idempotent' }
+        : { ok: false, code: delivered };
     }
 
-    const created = stampUpdatedAt({
+    const next = stampUpdatedAt({
       presentationId: document.presentationId,
-      ownerTaskId: document.ownerTaskId,
-      revision: document.revision && document.revision > 0 ? document.revision : 1,
+      ownerTaskId: stored?.ownerTaskId ?? document.ownerTaskId,
+      revision: stored
+        ? stored.revision + 1
+        : document.revision && document.revision > 0
+          ? document.revision
+          : 1,
       title: document.title,
       markdown: document.markdown,
-      kind: document.kind ?? 'document',
+      kind: document.kind ?? stored?.kind ?? 'document',
       summary: document.summary,
       changeSummary: document.changeSummary,
       sourcePath: document.sourcePath,
       sourceFolderUri: document.sourceFolderUri,
     });
-    return this.createAndDeliver(rootId, key, created);
+    const durable = await this.persistDocument(rootId, next);
+    if (!durable) return { ok: false, code: 'host_delivery_failed' };
+    const delivered = await this.deliverCanonicalDocument(rootId, key, next);
+    return delivered === 'ok'
+      ? { ok: true, code: 'opened' }
+      : { ok: false, code: delivered };
   }
 
   async upsert(
     context: PresentationContext,
     request: PresentationUpsertRequest,
   ): Promise<PresentationResult> {
+    if (this.disposed) return { ok: false, code: 'host_delivery_failed' };
     const validationError = validateRequest(request);
     if (validationError) return validationError;
     if (request.ownerTaskId !== context.callerTaskId) {
@@ -450,43 +380,48 @@ export class PresentationManager {
         : { ok: false, code: 'op_conflict' };
     }
 
+    if (!this.documentStore) return { ok: false, code: 'host_delivery_failed' };
     const document = stampUpdatedAt(base);
-    const key = this.presentationKey(context.rootId, request.presentationId);
-    const existing = this.panels.get(key);
-    if (existing) {
-      if (document.ownerTaskId !== existing.document.ownerTaskId) {
-        return { ok: false, code: 'owner_mismatch' };
-      }
-      if (document.revision <= existing.document.revision) {
-        return { ok: false, code: 'stale_revision' };
-      }
-      const durable = await this.persistDocument(context.rootId, document, fingerprint);
-      if (!durable) return { ok: false, code: 'host_delivery_failed' };
-      let accepted = false;
+    let status: Awaited<ReturnType<PresentationDocumentStore['commitPresentationOperation']>>;
+    try {
+      status = await this.documentStore.commitPresentationOperation({
+        operationKey,
+        fingerprint,
+        document: { ...document, rootId: context.rootId, updatedAt: document.updatedAt! },
+      });
+    } catch {
+      return { ok: false, code: 'host_delivery_failed' };
+    }
+    if (this.disposed) return { ok: false, code: 'host_delivery_failed' };
+    if (status === 'op_conflict') return { ok: false, code: 'op_conflict' };
+    if (status === 'stale_revision') return { ok: false, code: 'stale_revision' };
+    if (status === 'owner_mismatch') return { ok: false, code: 'owner_mismatch' };
+
+    let canonical = document;
+    if (status === 'idempotent') {
       try {
-        accepted = await existing.panel.update(document, context.rootId);
+        const loaded = await this.documentStore.getPresentation(
+          context.rootId,
+          request.presentationId,
+        );
+        if (!loaded) return { ok: false, code: 'host_delivery_failed' };
+        canonical = loaded;
       } catch {
-        // Presentation content and host errors must never cross this boundary.
-      }
-      if (!accepted || this.panels.get(key) !== existing) {
         return { ok: false, code: 'host_delivery_failed' };
       }
-      existing.document = document;
-      this.operations.set(operationKey, fingerprint);
-      try {
-        existing.panel.reveal();
-      } catch {
-        // Delivery succeeded; editor focus is best-effort and content-free.
-      }
-      return { ok: true, code: 'opened' };
+      if (this.disposed) return { ok: false, code: 'host_delivery_failed' };
     }
-
-    const result = await this.createAndDeliver(context.rootId, key, document);
-    if (result.ok) this.operations.set(operationKey, fingerprint);
-    return result;
+    const key = this.presentationKey(context.rootId, request.presentationId);
+    const delivered = await this.deliverCanonicalDocument(context.rootId, key, canonical);
+    if (delivered !== 'ok') {
+      return { ok: false, code: delivered };
+    }
+    this.operations.set(operationKey, fingerprint);
+    return { ok: true, code: status === 'idempotent' ? 'idempotent' : 'opened' };
   }
 
   async restore(panel: PresentationPanel, state: unknown): Promise<PresentationResult> {
+    if (this.disposed) return { ok: false, code: 'restore_rejected' };
     const parsed = parsePersistedState(state);
     if (!parsed) {
       return { ok: false, code: 'restore_rejected' };
@@ -498,7 +433,23 @@ export class PresentationManager {
       });
     }
     const { rootId, presentationId } = parsed;
-    const loaded = await this.documentStore.getPresentation(presentationId);
+    let loaded: PresentationDocument | undefined;
+    try {
+      loaded = await this.documentStore.getPresentation(rootId, presentationId);
+    } catch {
+      return { ok: false, code: 'restore_rejected' };
+    }
+    if (this.disposed) {
+      if (!this.cancelledRestorePanels.has(panel)) {
+        this.cancelledRestorePanels.add(panel);
+        try {
+          panel.dispose();
+        } catch {
+          // Disposal already owns this restore; keep the stable rejection.
+        }
+      }
+      return { ok: false, code: 'restore_rejected' };
+    }
     if (!loaded) {
       return { ok: false, code: 'restore_rejected' };
     }
@@ -562,6 +513,21 @@ export class PresentationManager {
   }
 
   dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.documentStore = undefined;
+    const pending = [...this.pendingRestores, ...this.inFlightRestores];
+    this.pendingRestores = [];
+    this.inFlightRestores.clear();
+    for (const entry of pending) {
+      entry.resolve({ ok: false, code: 'restore_rejected' });
+      this.cancelledRestorePanels.add(entry.panel);
+      try {
+        entry.panel.dispose();
+      } catch {
+        // Continue releasing live panels.
+      }
+    }
     const entries = [...this.panels.values()];
     this.panels.clear();
     this.operations.clear();
@@ -579,18 +545,41 @@ export class PresentationManager {
     }
   }
 
-  private async createAndDeliver(
+  private async deliverCanonicalDocument(
     rootId: string,
     key: string,
     document: PresentationDocument,
-  ): Promise<PresentationResult> {
-    const durable = await this.persistDocument(rootId, document);
-    if (!durable) return { ok: false, code: 'host_delivery_failed' };
+  ): Promise<PresentationDeliveryResult> {
+    if (this.disposed) return 'host_delivery_failed';
+    const existing = this.panels.get(key);
+    if (existing) {
+      if (existing.document.ownerTaskId !== document.ownerTaskId) return 'host_delivery_failed';
+      const same = documentFingerprint(existing.document) === documentFingerprint(document);
+      if (document.revision < existing.document.revision) return 'host_delivery_failed';
+      if (document.revision === existing.document.revision && !same) return 'host_delivery_failed';
+      if (!same) {
+        let accepted = false;
+        try {
+          accepted = await existing.panel.update(document, rootId);
+        } catch {
+          // Content-free failure.
+        }
+        if (!accepted || this.panels.get(key) !== existing) return 'host_delivery_failed';
+        existing.document = document;
+      }
+      try {
+        existing.panel.reveal();
+      } catch {
+        // Canonical delivery succeeded; focus is best-effort.
+      }
+      return 'ok';
+    }
+
     let panel: PresentationPanel;
     try {
       panel = this.factory.create(document);
     } catch {
-      return { ok: false, code: 'panel_open_failed' };
+      return 'panel_open_failed';
     }
     let disposeListener: { dispose(): void };
     try {
@@ -604,7 +593,7 @@ export class PresentationManager {
       } catch {
         // ignore
       }
-      return { ok: false, code: 'panel_open_failed' };
+      return 'panel_open_failed';
     }
     this.panels.set(key, { panel, disposeListener, document, rootId });
     let accepted = false;
@@ -625,16 +614,24 @@ export class PresentationManager {
       } catch {
         // ignore
       }
-      return { ok: false, code: 'panel_open_failed' };
+      return 'panel_open_failed';
     }
-    return { ok: true, code: 'opened' };
+    return 'ok';
   }
 
   private operationKey(rootId: string, turnId: string, opId: string): string {
-    return `${rootId.length}:${rootId}${turnId.length}:${turnId}${opId}`;
+    return createHash('sha256')
+      .update(`${rootId.length}:${rootId}${turnId.length}:${turnId}${opId}`)
+      .digest('hex');
   }
 
   private presentationKey(rootId: string, presentationId: string): string {
     return `${rootId.length}:${rootId}${presentationId}`;
+  }
+
+  private settleInFlightRestore(entry: PendingRestore, result: PresentationResult): void {
+    // dispose() already rejected/settled entries removed from this set.
+    if (!this.inFlightRestores.delete(entry)) return;
+    entry.resolve(result);
   }
 }

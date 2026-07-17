@@ -184,7 +184,7 @@ export async function runRepositoryBoundarySmoke(rootDir = ROOT) {
       'TaskStoreFile.schemaVersion', 'workspace_revisions', 'SQLite-only',
       'runtime_claims', 'expires_at', 'stale', 'taskPayload', 'wait',
       'turn_inputs', 'reasoning_segments', 'change_log', 'change_feed_watermarks',
-      'send_outbox', 'presentations',
+      'send_outbox', 'presentations', 'presentation_operations',
     ]) {
       if (!matrix.includes(term)) failures.push(`sqlite-entity-matrix.vi.md is missing required parity marker: ${term}`);
     }

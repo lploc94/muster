@@ -1,11 +1,14 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {
   CorruptWorkspaceChangeFeedError,
   InvalidWorkspaceChangeFeedRequestError,
+  MAX_CHANGE_FEED_METADATA_ROWS,
+  MAX_CHANGE_FEED_PAGE_REVISIONS,
   SqliteTaskRepository,
+  WorkspaceChangeFeedOverflowError,
 } from './repository';
 import type { MusterTask } from './types';
 import { DbClient } from './sqlite/client';
@@ -156,6 +159,41 @@ describe('workspace change feed', () => {
     });
   });
 
+  it('reads state, watermark, revision boundaries, and rows in one SQLite snapshot', async () => {
+    await withRepo(4096, async (repo, client) => {
+      await repo.execute({ kind: 'createTask', workspaceId: 'ws', task: makeTask('one-read') });
+      const all = vi.spyOn(client, 'all');
+      const result = await repo.getWorkspaceChangesSince(0);
+      expect(result.kind).toBe('changes');
+      expect(all).toHaveBeenCalledTimes(1);
+      expect(String(all.mock.calls[0]?.[0])).toContain('WITH state AS MATERIALIZED');
+    });
+  });
+
+  it('never exposes canonical workspace paths in metadata-only feed rows', async () => {
+    await withRepo(4096, async (repo) => {
+      const before = await repo.getWorkspaceRevision();
+      const canonicalUri = 'file:///Users/secret/private-project';
+      await repo.execute({
+        kind: 'recordWorkspaceLocation',
+        workspaceId: 'ws',
+        canonicalUri,
+        firstSeenAt: 'now',
+        lastSeenAt: 'now',
+      });
+      const feed = await repo.getWorkspaceChangesSince(before);
+      expect(feed.kind).toBe('changes');
+      if (feed.kind !== 'changes') return;
+      expect(feed.revisions[0]?.changes).toContainEqual({
+        entityKind: 'workspace_location',
+        entityId: 'ws',
+        changeKind: 'upsert',
+      });
+      expect(JSON.stringify(feed)).not.toContain(canonicalUri);
+      expect(JSON.stringify(feed)).not.toContain('/Users/secret');
+    });
+  });
+
   it('paginates by revision without splitting multi-row revisions', async () => {
     await withRepo(4096, async (repo) => {
       for (let i = 0; i < 5; i += 1) {
@@ -211,6 +249,38 @@ describe('workspace change feed', () => {
       await expect(repo.getWorkspaceChangesSince(0, 0)).rejects.toBeInstanceOf(
         InvalidWorkspaceChangeFeedRequestError,
       );
+      await expect(
+        repo.getWorkspaceChangesSince(0, MAX_CHANGE_FEED_PAGE_REVISIONS + 1),
+      ).rejects.toBeInstanceOf(InvalidWorkspaceChangeFeedRequestError);
+    });
+  });
+
+  it('fails into bounded recovery when one revision contains too many metadata rows', async () => {
+    await withRepo(4096, async (repo, client) => {
+      await client.transaction([
+        {
+          sql: 'UPDATE workspace_revisions SET revision = 2 WHERE workspace_id = ?',
+          params: ['ws'],
+        },
+        {
+          sql: `WITH d(v) AS (VALUES(0),(1),(2),(3),(4),(5),(6),(7),(8),(9)),
+                       nums(n) AS (
+                         SELECT a.v + 10*b.v + 100*c.v + 1000*e.v + 10000*f.v
+                           FROM d a CROSS JOIN d b CROSS JOIN d c CROSS JOIN d e CROSS JOIN d f
+                       )
+                INSERT INTO change_log
+                  (workspace_id, revision, entity_kind, entity_id, task_id, change_kind, created_at)
+                SELECT 'ws', 2, 'message', 'overflow-' || n, 'task-overflow', 'upsert', 'now'
+                  FROM nums
+                 WHERE n < ?`,
+          params: [MAX_CHANGE_FEED_METADATA_ROWS + 1],
+        },
+      ]);
+      const all = vi.spyOn(client, 'all');
+      await expect(repo.getWorkspaceChangesSince(1)).rejects.toBeInstanceOf(
+        WorkspaceChangeFeedOverflowError,
+      );
+      expect(all).toHaveBeenCalledTimes(1);
     });
   });
 

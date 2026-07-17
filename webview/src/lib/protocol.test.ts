@@ -831,6 +831,49 @@ describe('composer selection protocol', () => {
     ).toBe(false);
   });
 
+  it('strictly validates bounded SQLite send-outbox snapshots', () => {
+    const entry = {
+      clientRequestId: 'request-1',
+      status: 'rejected',
+      taskId: 'task-1',
+      text: '@plan',
+      llmText: '/workspace/docs/plan.md',
+      mentionBindings: [['@plan', '/workspace/docs/plan.md']],
+      skills: ['review'],
+      backend: 'grok',
+      model: 'grok-4',
+      createdAt: 1,
+    };
+    expect(isExtMessage({ type: 'sendOutboxSnapshot', entries: [entry] })).toBe(true);
+    expect(isExtMessage({
+      type: 'sendOutboxSnapshot',
+      entries: [{ ...entry, unexpected: true }],
+    })).toBe(false);
+    expect(isExtMessage({
+      type: 'sendOutboxSnapshot',
+      entries: [{ ...entry, mentionBindings: [['broken']] }],
+    })).toBe(false);
+    expect(isExtMessage({
+      type: 'sendOutboxSnapshot',
+      entries: [{ ...entry, skills: ['bad skill'] }],
+    })).toBe(false);
+    expect(isExtMessage({
+      type: 'sendOutboxSnapshot',
+      entries: [{ ...entry, skills: ['review', 'review'] }],
+    })).toBe(false);
+    expect(isExtMessage({
+      type: 'sendOutboxSnapshot',
+      entries: [{
+        ...entry,
+        mentionBindings: [['@plan', '/a'], ['@plan', '/b']],
+      }],
+    })).toBe(false);
+    expect(isExtMessage({
+      type: 'sendOutboxSnapshot',
+      entries: [entry, entry],
+    })).toBe(false);
+  });
+
   it('posts setComposerSelection to the host', () => {
     vi.mocked(vscode.postMessage).mockClear();
     const message: OutMessage = { type: 'setComposerSelection', backend: 'grok', model: 'm1' };
@@ -875,10 +918,17 @@ describe('skills protocol', () => {
 
   it('send OutMessage carries structured skills', () => {
     vi.mocked(vscode.postMessage).mockClear();
-    const message: OutMessage = { type: 'send', text: 'hi', skills: ['plan', 'review'] };
+    const message: OutMessage = {
+      type: 'send',
+      text: 'hi',
+      skills: ['plan', 'review'],
+      clientRequestId: 'request-1',
+    };
     post(message);
     expect(vscode.postMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ type: 'send', text: 'hi', skills: ['plan', 'review'] }),
+      expect.objectContaining({
+        type: 'send', text: 'hi', skills: ['plan', 'review'], clientRequestId: 'request-1',
+      }),
     );
   });
 });

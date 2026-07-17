@@ -7,6 +7,7 @@ import * as vscode from 'vscode';
 interface PackagedDbClient {
   open(dbPath: string, busyTimeoutMs?: number): Promise<void>;
   get<T>(sql: string, params?: unknown[]): Promise<T | undefined>;
+  all<T>(sql: string, params?: unknown[]): Promise<T[]>;
   pragma(name: string): Promise<number>;
   close(): Promise<void>;
 }
@@ -73,10 +74,32 @@ export async function run(): Promise<void> {
     await client.open(dbPath);
     assert.equal(await client.pragma('application_id'), 0x4d555354);
     assert.equal(await client.pragma('foreign_keys'), 1);
+    assert.equal(schema.SQLITE_SCHEMA_VERSION, 7, 'packaged Phase 4 schema version drifted');
     assert.equal(await client.pragma('user_version'), schema.SQLITE_SCHEMA_VERSION);
     assert.deepEqual(await client.get<{ journal_mode: string }>('PRAGMA journal_mode'), {
       journal_mode: 'wal',
     });
+    const durableTables = await client.all<{ name: string }>(
+      `SELECT name FROM sqlite_schema
+        WHERE type = 'table'
+          AND name IN ('change_log', 'change_feed_watermarks', 'send_outbox',
+                       'presentations', 'presentation_operations')
+        ORDER BY name`,
+    );
+    assert.deepEqual(durableTables.map((row) => row.name), [
+      'change_feed_watermarks',
+      'change_log',
+      'presentation_operations',
+      'presentations',
+      'send_outbox',
+    ]);
+    assert.deepEqual(
+      await client.get<{ name: string }>(
+        `SELECT name FROM sqlite_schema
+          WHERE type = 'trigger' AND name = 'trg_send_outbox_capacity'`,
+      ),
+      { name: 'trg_send_outbox_capacity' },
+    );
     console.log(
       `[muster-sqlite-host-smoke] ok vscode=${vscode.version} node=${process.versions.node} ` +
         `remote=${vscode.env.remoteName ?? 'desktop'}`,

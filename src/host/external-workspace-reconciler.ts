@@ -56,7 +56,12 @@ const FORCE_RECOVERY_CHANGE_KINDS = new Set([
   'clear_history',
   'retention',
   'delete_subtree',
+  'delete_cascade',
 ]);
+
+const MAX_RECONCILE_STABILITY_ATTEMPTS = 8;
+const MAX_RECONCILE_REVISIONS = 1_024;
+const MAX_RECONCILE_METADATA_ROWS = 16_384;
 
 /**
  * Consume the bounded change feed and produce contiguous workspacePatchBatch
@@ -77,134 +82,158 @@ export async function reconcileExternalWorkspaceChanges(
     feedPageLimit = 256,
   } = args;
 
+  const before = snapshotProjectionBefore(projection.getFile());
   let cursor = afterRevision;
   const collected: Array<{ revision: number; changes: WorkspaceChangeMetadata[] }> = [];
-  let lastCurrent = afterRevision;
-  let lastRetained = 1;
+  let analyzedRevision = afterRevision;
+  let metadataRows = 0;
+  const affectedTaskIds = new Set<string>();
+  const focusedMessageIds = new Set<string>();
+  const focusedToolIds = new Set<string>();
+  const focusedReasoningIds = new Set<string>();
+  let needsFullTaskRefresh = false;
+  let stable = false;
 
-  // Drain feed pages until up-to-date or gap. Page by revision, never by row offset.
-  for (;;) {
-    let feed: WorkspaceChangeFeedResult;
+  for (let attempt = 0; attempt < MAX_RECONCILE_STABILITY_ATTEMPTS; attempt += 1) {
+    // Drain from the last exact revision. Every feed call is one read snapshot;
+    // if a writer commits while hydration runs, the end fence below expands the
+    // feed and retries instead of silently stamping a partial projection current.
+    for (;;) {
+      let feed: WorkspaceChangeFeedResult;
+      try {
+        feed = await repository.getWorkspaceChangesSince(cursor, feedPageLimit);
+      } catch {
+        return { kind: 'recovery', reason: 'corrupt' };
+      }
+      if (feed.kind === 'gap') {
+        return {
+          kind: 'gap',
+          currentRevision: feed.currentRevision,
+          retainedFromRevision: feed.retainedFromRevision,
+        };
+      }
+      if (feed.currentRevision < cursor) {
+        return { kind: 'recovery', reason: 'invariant' };
+      }
+      if (feed.revisions.length === 0) break;
+      for (const entry of feed.revisions) {
+        collected.push(entry);
+        metadataRows += entry.changes.length;
+      }
+      if (
+        collected.length > MAX_RECONCILE_REVISIONS ||
+        metadataRows > MAX_RECONCILE_METADATA_ROWS
+      ) {
+        return { kind: 'recovery', reason: 'unrepresentable' };
+      }
+      cursor = feed.revisions[feed.revisions.length - 1]!.revision;
+      if (!feed.hasMore || cursor >= feed.currentRevision) break;
+    }
+
+    const newEntries = collected.filter((entry) => entry.revision > analyzedRevision);
+    for (const entry of newEntries) {
+      for (const change of entry.changes) {
+        if (FORCE_RECOVERY_CHANGE_KINDS.has(change.changeKind)) {
+          return { kind: 'recovery', reason: 'unrepresentable' };
+        }
+        if (change.entityKind === 'task') {
+          affectedTaskIds.add(change.entityId);
+          if (change.changeKind === 'delete') needsFullTaskRefresh = true;
+        } else if (change.taskId) {
+          affectedTaskIds.add(change.taskId);
+        }
+        if (focusedTaskId && change.taskId === focusedTaskId) {
+          if (change.entityKind === 'message') focusedMessageIds.add(change.entityId);
+          if (change.entityKind === 'tool_call') focusedToolIds.add(change.entityId);
+          if (change.entityKind === 'reasoning') focusedReasoningIds.add(change.entityId);
+          // Wire protocol has no transcriptItemRemoved; deletes need bounded
+          // recovery so peer windows cannot retain a stale focused row.
+          if (
+            change.changeKind === 'delete' &&
+            (change.entityKind === 'message' ||
+              change.entityKind === 'tool_call' ||
+              change.entityKind === 'reasoning')
+          ) {
+            return { kind: 'recovery', reason: 'unrepresentable' };
+          }
+        }
+        if (
+          !change.taskId &&
+          change.entityKind !== 'task' &&
+          !COORDINATION_ENTITY_KINDS.has(change.entityKind)
+        ) {
+          return { kind: 'recovery', reason: 'unrepresentable' };
+        }
+      }
+      analyzedRevision = entry.revision;
+    }
+
     try {
-      feed = await repository.getWorkspaceChangesSince(cursor, feedPageLimit);
+      if (needsFullTaskRefresh) {
+        // Cascading task deletion is the one metadata path that needs the whole
+        // bounded task/activity surface to discover descendants that disappeared.
+        await projection.refreshAll();
+      } else if (affectedTaskIds.size > 0) {
+        await projection.refreshTasks([...affectedTaskIds].sort());
+      }
+
+      if (focusedTaskId && affectedTaskIds.has(focusedTaskId)) {
+        // A queued follow-up becoming running changes only its turn row. The
+        // active-input projection already contains its user message, so include
+        // all bounded focused active inputs as visibility candidates.
+        for (const message of Object.values(projection.getFile().messages)) {
+          if (message.taskId === focusedTaskId) focusedMessageIds.add(message.id);
+        }
+      }
+
+      if (focusedTaskId) {
+        const [messages, tools, reasoning] = await Promise.all([
+          repository.listMessagesByIds([...focusedMessageIds]),
+          repository.listToolCallsByIds([...focusedToolIds]),
+          repository.listReasoningByIds([...focusedReasoningIds]),
+        ]);
+        projection.mergeFocusedTranscriptEntities({
+          taskId: focusedTaskId,
+          messages,
+          toolCalls: tools,
+          reasoning,
+        });
+      }
+
+      const endRevision = await repository.getWorkspaceRevision();
+      if (endRevision < cursor) {
+        return { kind: 'recovery', reason: 'invariant' };
+      }
+      if (endRevision > cursor) {
+        continue;
+      }
+      projection.markWorkspaceRevision(cursor);
+      stable = true;
+      break;
     } catch {
       return { kind: 'recovery', reason: 'corrupt' };
     }
-    lastCurrent = feed.currentRevision;
-    lastRetained = feed.retainedFromRevision;
-    if (feed.kind === 'gap') {
-      return {
-        kind: 'gap',
-        currentRevision: feed.currentRevision,
-        retainedFromRevision: feed.retainedFromRevision,
-      };
+  }
+
+  if (!stable) {
+    // Do not leave a subset projection stamped at a later revision after a hot
+    // writer exhausted the fence retries. Best-effort bounded full metadata
+    // refresh; the caller still sends an authoritative bounded snapshot.
+    try {
+      await projection.refreshAll();
+    } catch {
+      // Recovery path reports only the stable reason, never row/content errors.
     }
-    if (feed.revisions.length === 0) break;
-    for (const entry of feed.revisions) collected.push(entry);
-    cursor = feed.revisions[feed.revisions.length - 1]!.revision;
-    if (!feed.hasMore || cursor >= feed.currentRevision) break;
+    return { kind: 'recovery', reason: 'invariant' };
   }
 
   if (collected.length === 0) {
-    return {
-      kind: 'batches',
-      batches: [],
-      appliedRevision: lastCurrent,
-    };
-  }
-
-  const allChanges = collected.flatMap((entry) => entry.changes);
-  for (const change of allChanges) {
-    if (FORCE_RECOVERY_CHANGE_KINDS.has(change.changeKind)) {
-      return { kind: 'recovery', reason: 'unrepresentable' };
-    }
+    return { kind: 'batches', batches: [], appliedRevision: cursor };
   }
 
   const finalRevision = collected[collected.length - 1]!.revision;
-  const before = snapshotProjectionBefore(projection.getFile());
-
-  const affectedTaskIds = new Set<string>();
-  const focusedMessageIds: string[] = [];
-  const focusedToolIds: string[] = [];
-  const focusedReasoningIds: string[] = [];
-  let needsFullTaskRefresh = false;
-  let focusedTranscriptDelete = false;
-
-  for (const change of allChanges) {
-    if (change.entityKind === 'task') {
-      affectedTaskIds.add(change.entityId);
-      if (change.changeKind === 'delete') needsFullTaskRefresh = true;
-    } else if (change.taskId) {
-      affectedTaskIds.add(change.taskId);
-    }
-    if (focusedTaskId && change.taskId === focusedTaskId) {
-      if (change.entityKind === 'message') focusedMessageIds.push(change.entityId);
-      if (change.entityKind === 'tool_call') focusedToolIds.push(change.entityId);
-      if (change.entityKind === 'reasoning') focusedReasoningIds.push(change.entityId);
-      // Wire protocol has no transcriptItemRemoved; deletes need bounded recovery
-      // so peer windows do not keep stale focused transcript rows.
-      if (
-        change.changeKind === 'delete' &&
-        (change.entityKind === 'message' ||
-          change.entityKind === 'tool_call' ||
-          change.entityKind === 'reasoning')
-      ) {
-        focusedTranscriptDelete = true;
-      }
-    }
-    // Coordination-only rows without taskId still need a revision advance; empty
-    // final batch is fine when no task surface changed.
-    if (
-      !change.taskId &&
-      change.entityKind !== 'task' &&
-      !COORDINATION_ENTITY_KINDS.has(change.entityKind)
-    ) {
-      return { kind: 'recovery', reason: 'unrepresentable' };
-    }
-  }
-
-  if (focusedTranscriptDelete) {
-    return { kind: 'recovery', reason: 'unrepresentable' };
-  }
-
-  try {
-    if (needsFullTaskRefresh || affectedTaskIds.size === 0) {
-      // Deletion or pure coordination: bounded full task metadata refresh is safe.
-      // refreshAll never hydrates full transcripts.
-      await projection.refreshAll();
-    } else {
-      await projection.refreshTasks([...affectedTaskIds].sort());
-    }
-
-    if (focusedTaskId) {
-      const [messages, tools, reasoning] = await Promise.all([
-        repository.listMessagesByIds(unique(focusedMessageIds)),
-        repository.listToolCallsByIds(unique(focusedToolIds)),
-        repository.listReasoningByIds(unique(focusedReasoningIds)),
-      ]);
-      projection.mergeFocusedTranscriptEntities({
-        taskId: focusedTaskId,
-        messages,
-        toolCalls: tools,
-        reasoning,
-      });
-    }
-
-    // Stamp projection revision to the final feed revision (source of truth).
-    const liveRevision = await repository.getWorkspaceRevision();
-    if (liveRevision < finalRevision) {
-      return { kind: 'recovery', reason: 'invariant' };
-    }
-    // refreshAll/refreshTasks already set revision from DB; ensure not behind final.
-    if (projection.getFile().revision < finalRevision) {
-      await projection.refreshAll();
-    }
-  } catch {
-    return { kind: 'recovery', reason: 'corrupt' };
-  }
-
   const after = projection.getFile();
-  if (after.revision < finalRevision) {
+  if (after.revision !== finalRevision) {
     return { kind: 'recovery', reason: 'invariant' };
   }
 
@@ -214,9 +243,9 @@ export async function reconcileExternalWorkspaceChanges(
     affectedTaskIds,
     focusedTaskId,
     knownTranscriptIds,
-    focusedMessageIds: unique(focusedMessageIds),
-    focusedToolIds: unique(focusedToolIds),
-    focusedReasoningIds: unique(focusedReasoningIds),
+    focusedMessageIds: [...focusedMessageIds],
+    focusedToolIds: [...focusedToolIds],
+    focusedReasoningIds: [...focusedReasoningIds],
   });
 
   const batches: WorkspacePatchBatch[] = [];
@@ -230,7 +259,7 @@ export async function reconcileExternalWorkspaceChanges(
   return {
     kind: 'batches',
     batches,
-    appliedRevision: Math.max(finalRevision, after.revision, lastCurrent),
+    appliedRevision: finalRevision,
   };
 }
 
@@ -302,9 +331,10 @@ export function projectExternalWorkspacePatches(args: {
     for (const id of focusedMessageIds) {
       const message = after.messages[id];
       if (!message || message.taskId !== focusedTaskId) continue;
+      const turnId = resolveMessageTurnId(after, message);
       // Queue-only follow-ups stay out of the chat transcript until promote.
-      if (message.role === 'user' && isQueuedOnlyFollowUp(after, message)) continue;
-      pushItem(messageToItem(message));
+      if (message.role === 'user' && isQueuedOnlyFollowUp(after, message, turnId)) continue;
+      pushItem(messageToItem(message, turnId));
     }
     for (const id of focusedToolIds) {
       const tool = after.toolCalls?.[id];
@@ -336,9 +366,33 @@ export function projectExternalWorkspacePatches(args: {
   return patches;
 }
 
-function isQueuedOnlyFollowUp(file: TaskStoreFile, message: TaskMessage): boolean {
-  if (!message.turnId) return false;
-  const turn = file.turns[message.turnId];
+/**
+ * User messages normally bind through turn_inputs and intentionally carry no
+ * message.turnId. Resolve the same last-turn-wins mapping as buildTranscript;
+ * otherwise an external enqueue would flash a queued follow-up into chat.
+ */
+function resolveMessageTurnId(file: TaskStoreFile, message: TaskMessage): string | undefined {
+  if (message.turnId) return message.turnId;
+  if (message.role !== 'user') return undefined;
+  let resolved: string | undefined;
+  const turns = Object.values(file.turns)
+    .filter((turn) => turn.taskId === message.taskId)
+    .sort((a, b) => a.sequence - b.sequence || a.id.localeCompare(b.id));
+  for (const turn of turns) {
+    if (turn.inputs.some((input) => input.kind === 'message' && input.messageId === message.id)) {
+      resolved = turn.id;
+    }
+  }
+  return resolved;
+}
+
+function isQueuedOnlyFollowUp(
+  file: TaskStoreFile,
+  message: TaskMessage,
+  turnId: string | undefined,
+): boolean {
+  if (!turnId) return false;
+  const turn = file.turns[turnId];
   if (!turn || turn.status !== 'queued' || turn.trigger !== 'user') return false;
   const taskTurns = Object.values(file.turns).filter((t) => t.taskId === message.taskId);
   // Opening prompt (sole user-triggered turn) still appears in chat.
@@ -348,13 +402,16 @@ function isQueuedOnlyFollowUp(file: TaskStoreFile, message: TaskMessage): boolea
   );
 }
 
-function messageToItem(message: TaskMessage): TranscriptItem | null {
+function messageToItem(
+  message: TaskMessage,
+  resolvedTurnId = message.turnId,
+): TranscriptItem | null {
   if (message.role !== 'user' && message.role !== 'assistant') return null;
   return {
     id: message.id,
     kind: message.role,
     content: message.content,
-    ...(message.turnId !== undefined ? { turnId: message.turnId } : {}),
+    ...(resolvedTurnId !== undefined ? { turnId: resolvedTurnId } : {}),
     ...(message.order !== undefined ? { order: message.order } : {}),
     ...(message.state !== undefined ? { state: message.state } : {}),
   };
@@ -385,8 +442,4 @@ function reasoningToItem(segment: PersistedReasoning): TranscriptItem {
     turnId: segment.turnId,
     content: segment.content,
   };
-}
-
-function unique(values: readonly string[]): string[] {
-  return [...new Set(values)];
 }

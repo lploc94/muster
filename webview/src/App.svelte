@@ -581,6 +581,8 @@
                 backend: entry.backend,
                 model: entry.model,
                 continuationOf: entry.continuationOf,
+                mentionBindings: entry.mentionBindings,
+                skills: entry.skills,
                 clientRequestId: entry.clientRequestId,
               });
             }
@@ -925,6 +927,8 @@
                 backend: entry.backend,
                 model: entry.model,
                 continuationOf: entry.continuationOf,
+                mentionBindings: entry.mentionBindings,
+                skills: entry.skills,
                 clientRequestId: entry.clientRequestId,
               });
             }

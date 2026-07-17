@@ -316,7 +316,8 @@ export function serializeSettingsViewState(state: SettingsViewState): SettingsVi
 
 /**
  * Merge a settings view envelope into an existing webview state bag without
- * dropping unrelated keys (composer selection, send outbox, etc.).
+ * dropping unrelated ephemeral UI chrome. Composer selection lives in VS Code
+ * Settings and durable user data (including send drafts) lives in SQLite.
  */
 export function mergeSettingsViewState(
   prev: unknown,
