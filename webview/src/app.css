@@ -2432,6 +2432,8 @@ body {
   max-width: none;
   padding: 20px 0 48px;
   overflow-wrap: anywhere;
+  color: var(--vscode-editor-foreground);
+  background: var(--vscode-editor-background);
 }
 
 .presentation-content h1,
@@ -2453,6 +2455,27 @@ body {
   overflow-x: auto;
 }
 
+/* Readable table body/header text under synthetic dark/light themes. */
+.presentation-content table {
+  color: var(--vscode-editor-foreground);
+  border-collapse: collapse;
+  width: 100%;
+}
+
+.presentation-content table th,
+.presentation-content table td {
+  color: var(--vscode-editor-foreground);
+  border: 1px solid var(--vscode-panel-border);
+  padding: 6px 10px;
+  background: var(--vscode-editor-background);
+}
+
+.presentation-content table th {
+  background: var(--vscode-editorWidget-background);
+  color: var(--vscode-foreground);
+  font-weight: 600;
+}
+
 .mermaid-diagram {
   max-width: 100%;
   margin: 1rem 0;
@@ -2465,6 +2488,41 @@ body {
   max-width: 100%;
   height: auto;
   margin-inline: auto;
+}
+
+/*
+ * Mermaid readability after sanitize strips embedded <style> tags.
+ * Class attributes remain; force theme-token fills/strokes/labels so
+ * nodes are never black-on-black or dark-on-black.
+ */
+.mermaid-diagram svg .node rect,
+.mermaid-diagram svg .node circle,
+.mermaid-diagram svg .node ellipse,
+.mermaid-diagram svg .node polygon,
+.mermaid-diagram svg .node path {
+  fill: var(--vscode-editorWidget-background, #252526) !important;
+  stroke: var(--vscode-focusBorder, #007fd4) !important;
+}
+
+.mermaid-diagram svg .edgePath path,
+.mermaid-diagram svg .flowchart-link,
+.mermaid-diagram svg path.path {
+  stroke: var(--vscode-foreground, #cccccc) !important;
+  fill: none !important;
+}
+
+.mermaid-diagram svg text,
+.mermaid-diagram svg .nodeLabel,
+.mermaid-diagram svg .edgeLabel,
+.mermaid-diagram svg .label,
+.mermaid-diagram svg tspan {
+  fill: var(--vscode-editor-foreground, #d4d4d4) !important;
+  color: var(--vscode-editor-foreground, #d4d4d4) !important;
+}
+
+.mermaid-diagram svg marker path {
+  fill: var(--vscode-foreground, #cccccc) !important;
+  stroke: var(--vscode-foreground, #cccccc) !important;
 }
 
 .mermaid-diagram[data-mermaid-state="fallback"] {

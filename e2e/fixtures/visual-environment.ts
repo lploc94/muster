@@ -359,7 +359,7 @@ export async function installVisualEnvironment(
         : seed.hideCaret
           ? `*,*::before,*::after{caret-color:transparent!important;}`
           : '';
-      style.textContent = `:root{color-scheme:${seed.theme === 'light' ? 'light' : 'dark'};--vscode-font-family:${seed.fontStack};--vscode-editor-font-family:${seed.editorFontStack};${tokenLines}}html,body{font-family:${seed.fontStack};}${motionRules}`;
+      style.textContent = `:root{color-scheme:${seed.theme === 'light' ? 'light' : 'dark'};--vscode-font-family:${seed.fontStack};--vscode-editor-font-family:${seed.editorFontStack};${tokenLines}}html,body{font-family:${seed.fontStack};background:var(--vscode-editor-background);color:var(--vscode-editor-foreground);}${motionRules}`;
       return true;
     };
     (window as unknown as { __musterApplyVisualEnvironment?: () => boolean }).__musterApplyVisualEnvironment =
@@ -424,6 +424,8 @@ ${tokenLines}
 }
 html, body {
   font-family: ${seed.fontStack};
+  background: var(--vscode-editor-background);
+  color: var(--vscode-editor-foreground);
 }
 ${motionRules}
 `;
