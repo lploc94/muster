@@ -261,6 +261,8 @@ describe('visual matrix baseline contract (M014 S02)', () => {
     assert.match(docs, /V01-webview-compact-dark/);
     assert.match(docs, /V06-presentation-narrow-light/);
     assert.match(docs, /high-contrast|high contrast/i);
+    assert.match(docs, /assertPresentationReadableContrast/);
+    assert.match(docs, /black-on-black|unreadable contrast/i);
   });
 
   it('rejects over-cap and incomplete coverage manifests (negative)', () => {

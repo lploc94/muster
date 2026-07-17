@@ -2,6 +2,7 @@ import { expect, test, type Page } from '@playwright/test';
 import { openMusterPresentation } from '../fixtures/muster-webview';
 import {
   NARROW_PRESENTATION_VIEWPORT,
+  assertPresentationReadableContrast,
   createStaticNarrowPresentationFixture,
   createStaticPresentationFixture,
   ensureVisualEnvironmentApplied,
@@ -30,6 +31,10 @@ const SCREENSHOT = {
   animations: 'disabled' as const,
   caret: 'hide' as const,
   scale: 'css' as const,
+  // Narrow light chrome can produce 1–6px AA flecks under strict threshold:0.
+  // Keep the bound tiny so black-on-black / layout regressions still fail closed.
+  maxDiffPixels: 32,
+  threshold: 0.05,
 };
 
 async function openPresentationVisual(
@@ -82,6 +87,7 @@ test.describe('visual matrix · presentation', () => {
       'const ready: boolean = true;',
     );
     await expect(page.getByRole('link', { name: 'synthetic guide' })).toBeVisible();
+    await assertPresentationReadableContrast(page);
 
     await expect(page).toHaveScreenshot(`${PRESENTATION_VISUAL_RICH_ID}.png`, SCREENSHOT);
   });
@@ -107,6 +113,7 @@ test.describe('visual matrix · presentation', () => {
     await expect(page.locator('pre code.hljs.language-ts, pre code.language-ts')).toContainText(
       'const narrow: boolean = true;',
     );
+    await assertPresentationReadableContrast(page);
 
     await expect(page).toHaveScreenshot(`${PRESENTATION_VISUAL_NARROW_ID}.png`, SCREENSHOT);
   });

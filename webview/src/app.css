@@ -2432,14 +2432,25 @@ body {
   max-width: none;
   padding: 20px 0 48px;
   overflow-wrap: anywhere;
-  color: var(--vscode-editor-foreground);
-  background: var(--vscode-editor-background);
+  /* Remap GitHub Markdown CSS variables so tables/code follow VS Code tokens
+     instead of prefers-color-scheme black/white defaults (V02/V06 contrast). */
+  --bgColor-default: var(--vscode-editor-background);
+  --bgColor-muted: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  --bgColor-neutral-muted: color-mix(in srgb, var(--vscode-foreground) 12%, transparent);
+  --borderColor-default: var(--vscode-panel-border);
+  --borderColor-muted: var(--vscode-panel-border);
+  --fgColor-default: var(--vscode-editor-foreground);
+  --fgColor-muted: var(--vscode-descriptionForeground);
+  --fgColor-accent: var(--vscode-textLink-foreground);
+  color: var(--vscode-editor-foreground) !important;
+  background: var(--vscode-editor-background) !important;
 }
 
 .presentation-content h1,
 .presentation-content h2,
 .presentation-content h3 {
   scroll-margin-top: 12px;
+  color: var(--vscode-editor-foreground) !important;
 }
 
 /* Chat markdown: workspace .md links open presentation tabs (host-handled). */
@@ -2455,24 +2466,35 @@ body {
   overflow-x: auto;
 }
 
-/* Readable table body/header text under synthetic dark/light themes. */
+/* Readable table body/header text under synthetic dark/light themes.
+   Beat GitHub Markdown tr/td defaults that force near-black cells. */
 .presentation-content table {
-  color: var(--vscode-editor-foreground);
+  color: var(--vscode-editor-foreground) !important;
   border-collapse: collapse;
   width: 100%;
+  background: var(--vscode-editor-background) !important;
+}
+
+.presentation-content table tr {
+  background-color: var(--vscode-editor-background) !important;
+  border-top-color: var(--vscode-panel-border) !important;
+}
+
+.presentation-content table tr:nth-child(2n) {
+  background-color: var(--vscode-editorWidget-background, var(--vscode-editor-background)) !important;
 }
 
 .presentation-content table th,
 .presentation-content table td {
-  color: var(--vscode-editor-foreground);
-  border: 1px solid var(--vscode-panel-border);
+  color: var(--vscode-editor-foreground) !important;
+  border: 1px solid var(--vscode-panel-border) !important;
   padding: 6px 10px;
-  background: var(--vscode-editor-background);
+  background: transparent !important;
 }
 
 .presentation-content table th {
-  background: var(--vscode-editorWidget-background);
-  color: var(--vscode-foreground);
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background)) !important;
+  color: var(--vscode-foreground) !important;
   font-weight: 600;
 }
 
@@ -2480,6 +2502,7 @@ body {
   max-width: 100%;
   margin: 1rem 0;
   overflow-x: auto;
+  color: var(--vscode-editor-foreground);
 }
 
 .mermaid-diagram svg {
@@ -2488,6 +2511,7 @@ body {
   max-width: 100%;
   height: auto;
   margin-inline: auto;
+  background: transparent;
 }
 
 /*
@@ -2499,14 +2523,18 @@ body {
 .mermaid-diagram svg .node circle,
 .mermaid-diagram svg .node ellipse,
 .mermaid-diagram svg .node polygon,
-.mermaid-diagram svg .node path {
+.mermaid-diagram svg .node path,
+.mermaid-diagram svg .basic.label-container,
+.mermaid-diagram svg rect.basic,
+.mermaid-diagram svg .label-container {
   fill: var(--vscode-editorWidget-background, #252526) !important;
   stroke: var(--vscode-focusBorder, #007fd4) !important;
 }
 
 .mermaid-diagram svg .edgePath path,
 .mermaid-diagram svg .flowchart-link,
-.mermaid-diagram svg path.path {
+.mermaid-diagram svg path.path,
+.mermaid-diagram svg .edge-thickness-normal {
   stroke: var(--vscode-foreground, #cccccc) !important;
   fill: none !important;
 }
@@ -2515,6 +2543,8 @@ body {
 .mermaid-diagram svg .nodeLabel,
 .mermaid-diagram svg .edgeLabel,
 .mermaid-diagram svg .label,
+.mermaid-diagram svg .label B,
+.mermaid-diagram svg .label span,
 .mermaid-diagram svg tspan {
   fill: var(--vscode-editor-foreground, #d4d4d4) !important;
   color: var(--vscode-editor-foreground, #d4d4d4) !important;

@@ -1,5 +1,16 @@
 import type { Page } from '@playwright/test';
 
+export {
+  assertPresentationReadableContrast,
+  contrastRatio,
+  measurePresentationReadableContrast,
+  parseCssRgb,
+  relativeLuminance,
+  type PresentationContrastReport,
+  type PresentationContrastSample,
+} from './presentation-contrast';
+
+
 /** Pinned authoring clock for visual pilots (static, timezone-independent ISO). */
 export const VISUAL_CLOCK_ISO = '2026-03-15T12:00:00.000Z';
 
@@ -325,9 +336,10 @@ export async function installVisualEnvironment(
   const config = buildVisualInitConfig(options);
   PAGE_VISUAL_CONFIG.set(page, config);
 
-  if (config.reducedMotion) {
-    await page.emulateMedia({ reducedMotion: 'reduce' });
-  }
+  await page.emulateMedia({
+    colorScheme: config.theme === 'light' ? 'light' : 'dark',
+    reducedMotion: config.reducedMotion ? 'reduce' : 'no-preference',
+  });
 
   // Prefer Playwright's clock for deterministic Date.now / timers.
   await page.clock.install({ time: config.nowMs });
@@ -359,7 +371,7 @@ export async function installVisualEnvironment(
         : seed.hideCaret
           ? `*,*::before,*::after{caret-color:transparent!important;}`
           : '';
-      style.textContent = `:root{color-scheme:${seed.theme === 'light' ? 'light' : 'dark'};--vscode-font-family:${seed.fontStack};--vscode-editor-font-family:${seed.editorFontStack};${tokenLines}}html,body{font-family:${seed.fontStack};background:var(--vscode-editor-background);color:var(--vscode-editor-foreground);}${motionRules}`;
+      style.textContent = `:root{color-scheme:${seed.theme === 'light' ? 'light' : 'dark'};--vscode-font-family:${seed.fontStack};--vscode-editor-font-family:${seed.editorFontStack};${tokenLines}}html,body{font-family:${seed.fontStack};background:var(--vscode-editor-background);color:var(--vscode-editor-foreground);-webkit-font-smoothing:none;text-rendering:geometricPrecision;}${motionRules}`;
       return true;
     };
     (window as unknown as { __musterApplyVisualEnvironment?: () => boolean }).__musterApplyVisualEnvironment =
@@ -426,6 +438,8 @@ html, body {
   font-family: ${seed.fontStack};
   background: var(--vscode-editor-background);
   color: var(--vscode-editor-foreground);
+  -webkit-font-smoothing: none;
+  text-rendering: geometricPrecision;
 }
 ${motionRules}
 `;

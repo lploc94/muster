@@ -6,12 +6,15 @@ import {
   VISUAL_LOCALE,
   VISUAL_PLAYWRIGHT_USE,
   VISUAL_TIMEZONE,
+  assertPresentationReadableContrast,
   assertSanitizedVisualFixture,
+  contrastRatio,
   createStaticNarrowPresentationFixture,
   createStaticPresentationFixture,
   createStaticWebviewFixture,
   ensureVisualEnvironmentApplied,
   installVisualEnvironment,
+  measurePresentationReadableContrast,
   normalizeVisualChrome,
   waitForVisualReady,
 } from './visual-environment';
@@ -83,4 +86,40 @@ test('installs deterministic visual environment seams for screenshot authoring',
       markdown: 'C:/Users/secret/project and sk-live-abcdefghijklmnopqrstuvwxyz012345',
     }),
   ).toThrow(/sanitized visual fixture/i);
+});
+
+test('rejects black-on-black presentation contrast samples', async ({ page }) => {
+  await installVisualEnvironment(page, { theme: 'dark' });
+  await page.setContent(`
+    <main class="presentation-shell">
+      <article class="markdown-body presentation-content" style="background:#1e1e1e;color:#000">
+        <table>
+          <tr><th style="background:#0d1117;color:#000">Area</th><th style="background:#0d1117;color:#000">State</th></tr>
+          <tr><td style="background:#0d1117;color:#000">Baseline</td><td style="background:#0d1117;color:#000">Pinned</td></tr>
+        </table>
+        <div class="mermaid-diagram" data-mermaid-state="rendered">
+          <svg width="120" height="40">
+            <g class="node"><rect width="50" height="30" fill="#000000"></rect><text x="8" y="20" fill="#000000">Start</text></g>
+          </svg>
+        </div>
+      </article>
+    </main>
+  `);
+  await ensureVisualEnvironmentApplied(page);
+  // Force the pathological paints the contract must catch (inline styles beat theme tokens).
+  await page.addStyleTag({
+    content: `
+      .presentation-content table th, .presentation-content table td {
+        color: #000 !important;
+        background: #0d1117 !important;
+      }
+      .mermaid-diagram svg .node rect { fill: #000 !important; }
+      .mermaid-diagram svg text { fill: #000 !important; }
+    `,
+  });
+  const report = await measurePresentationReadableContrast(page, { minRatio: 3 });
+  expect(report.ok).toBe(false);
+  expect(report.failures.join(' ')).toMatch(/table-cell|mermaid/i);
+  await expect(assertPresentationReadableContrast(page)).rejects.toThrow(/contrast contract failed/i);
+  expect(contrastRatio([0, 0, 0], [13, 17, 23])).toBeLessThan(1.5);
 });

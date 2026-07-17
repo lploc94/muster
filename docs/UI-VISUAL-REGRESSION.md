@@ -161,6 +161,7 @@ Before commit, inspect every image for:
 - clipping of critical chrome
 - stale Settings taxonomy / placeholder ("Coming soon") tabs
 - unreadable contrast
+- Presentation table/Mermaid contrast via `assertPresentationReadableContrast` (fails closed on black-on-black)
 - secrets, absolute paths, or real user content
 
 ## Pilot IDs

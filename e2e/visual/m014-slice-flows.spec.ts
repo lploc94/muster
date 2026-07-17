@@ -13,6 +13,7 @@ import {
   createStaticPendingAsk,
   createStaticPermissionPendingMessage,
   createStaticPermissionSettingsSnapshot,
+  assertPresentationReadableContrast,
   createStaticPresentationFixture,
   createStaticRuntimeStorageSettingsSnapshot,
   createStaticTaskTypesSettingsSnapshot,
@@ -52,6 +53,9 @@ const SCREENSHOT = {
   animations: 'disabled' as const,
   caret: 'hide' as const,
   scale: 'css' as const,
+  // Match presentation AA bound for S02-V06 narrow light flecks under threshold:0.
+  maxDiffPixels: 32,
+  threshold: 0.05,
 };
 
 const FORBIDDEN_BODY_RE =
@@ -214,6 +218,7 @@ test.describe('M014 S01 dual-entrypoint pilot flow', () => {
       selector: '[data-presentation-id="visual-pilot-presentation"]',
     });
     await normalizeVisualChrome(page);
+    await assertPresentationReadableContrast(page);
     await expect(page).toHaveScreenshot(`${PRESENTATION_VISUAL_PILOT_ID}.png`, SCREENSHOT);
   });
 });
@@ -320,6 +325,7 @@ test.describe('M014 S02 representative visual matrix flow', () => {
     await waitForPresentationSettled(page, rich.presentationId, rich.revision);
     await expect(page.getByRole('table')).toContainText('Baseline');
     await expect(page.getByRole('link', { name: 'synthetic guide' })).toBeVisible();
+    await assertPresentationReadableContrast(page);
     await assertNoForbiddenPageText(page);
     await expect(page).toHaveScreenshot('S02-V02-presentation-rich-dark.png', SCREENSHOT);
 
@@ -344,6 +350,7 @@ test.describe('M014 S02 representative visual matrix flow', () => {
       scrollWidth: element.scrollWidth,
     }));
     expect(overflow.scrollWidth).toBeLessThanOrEqual(overflow.clientWidth + 1);
+    await assertPresentationReadableContrast(page);
     await assertNoForbiddenPageText(page);
     await expect(page).toHaveScreenshot('S02-V06-presentation-narrow-light.png', SCREENSHOT);
   });

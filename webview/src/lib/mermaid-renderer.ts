@@ -6,8 +6,69 @@ export type MermaidRenderOutcome =
   | { state: 'rendered'; svg: string }
   | { state: 'fallback'; reason: MermaidFallbackReason; source: string };
 
-const SVG_TAGS = ['svg', 'g', 'path', 'rect', 'circle', 'ellipse', 'line', 'polyline', 'polygon', 'text', 'tspan', 'defs', 'marker', 'clipPath', 'linearGradient', 'stop', 'title', 'desc'];
-const SVG_ATTRS = ['viewBox', 'width', 'height', 'class', 'id', 'role', 'aria-label', 'aria-labelledby', 'd', 'x', 'y', 'x1', 'y1', 'x2', 'y2', 'cx', 'cy', 'r', 'rx', 'ry', 'points', 'transform', 'fill', 'fill-opacity', 'stroke', 'stroke-width', 'stroke-dasharray', 'stroke-linecap', 'stroke-linejoin', 'opacity', 'font-size', 'font-family', 'font-weight', 'text-anchor', 'dominant-baseline', 'marker-start', 'marker-end', 'offset', 'stop-color', 'stop-opacity', 'clip-path'];
+const SVG_TAGS = [
+  'svg',
+  'g',
+  'path',
+  'rect',
+  'circle',
+  'ellipse',
+  'line',
+  'polyline',
+  'polygon',
+  'text',
+  'tspan',
+  'defs',
+  'marker',
+  'clipPath',
+  'linearGradient',
+  'stop',
+  'title',
+  'desc',
+];
+const SVG_ATTRS = [
+  'viewBox',
+  'width',
+  'height',
+  'class',
+  'id',
+  'role',
+  'aria-label',
+  'aria-labelledby',
+  'd',
+  'x',
+  'y',
+  'x1',
+  'y1',
+  'x2',
+  'y2',
+  'cx',
+  'cy',
+  'r',
+  'rx',
+  'ry',
+  'points',
+  'transform',
+  'fill',
+  'fill-opacity',
+  'stroke',
+  'stroke-width',
+  'stroke-dasharray',
+  'stroke-linecap',
+  'stroke-linejoin',
+  'opacity',
+  'font-size',
+  'font-family',
+  'font-weight',
+  'text-anchor',
+  'dominant-baseline',
+  'marker-start',
+  'marker-end',
+  'offset',
+  'stop-color',
+  'stop-opacity',
+  'clip-path',
+];
 
 let initialized = false;
 let initializedTheme: 'dark' | 'default' | null = null;
@@ -16,10 +77,7 @@ function resolveMermaidTheme(): 'dark' | 'default' {
   if (typeof document === 'undefined') return 'default';
   const body = document.body;
   if (!body) return 'default';
-  if (
-    body.classList.contains('vscode-dark') ||
-    body.classList.contains('vscode-high-contrast')
-  ) {
+  if (body.classList.contains('vscode-dark') || body.classList.contains('vscode-high-contrast')) {
     return 'dark';
   }
   return 'default';
@@ -106,9 +164,13 @@ export function inlineMermaidSvgStyles(svg: string): string {
 
 /** Returns null rather than attempting to repair any active SVG capability. */
 export function sanitizeMermaidSvg(svg: string): string | null {
-  if (/<s*(?:script|foreignObject|a|use)/i.test(svg)
-    || /son[a-z]+s*=/i.test(svg)
-    || /s(?:href|xlink:href|src)s*=s*["']?s*(?:javascript:|https?:|data:)/i.test(svg)) return null;
+  if (
+    /<\s*(?:script|foreignObject|a|use)\b/i.test(svg) ||
+    /\son[a-z]+\s*=/i.test(svg) ||
+    /\s(?:href|xlink:href|src)\s*=\s*["']?\s*(?:javascript:|https?:|data:)/i.test(svg)
+  ) {
+    return null;
+  }
   const clean = DOMPurify.sanitize(svg, {
     USE_PROFILES: { svg: true, svgFilters: false },
     ALLOWED_TAGS: SVG_TAGS,
@@ -116,7 +178,7 @@ export function sanitizeMermaidSvg(svg: string): string | null {
     ALLOW_DATA_ATTR: false,
     FORBID_TAGS: ['script', 'foreignObject', 'a', 'use', 'image', 'style'],
   });
-  return /^<svg(?:s|>)/i.test(clean.trim()) ? clean : null;
+  return /^<svg(?:\s|>)/i.test(clean.trim()) ? clean : null;
 }
 
 export async function renderMermaidDiagram(diagram: MermaidDiagram): Promise<MermaidRenderOutcome> {
@@ -126,9 +188,15 @@ export async function renderMermaidDiagram(diagram: MermaidDiagram): Promise<Mer
     const { svg } = await mermaid.render(`muster-${diagram.id}`, diagram.source);
     const inlined = inlineMermaidSvgStyles(svg);
     const safe = sanitizeMermaidSvg(inlined);
-    return safe ? { state: 'rendered', svg: safe } : { state: 'fallback', reason: 'unsafe-output', source: diagram.source };
+    return safe
+      ? { state: 'rendered', svg: safe }
+      : { state: 'fallback', reason: 'unsafe-output', source: diagram.source };
   } catch (error) {
     const malformed = error instanceof Error && /parse|syntax|lexical/i.test(error.message);
-    return { state: 'fallback', reason: malformed ? 'malformed' : 'renderer-failure', source: diagram.source };
+    return {
+      state: 'fallback',
+      reason: malformed ? 'malformed' : 'renderer-failure',
+      source: diagram.source,
+    };
   }
 }
