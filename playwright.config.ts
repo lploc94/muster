@@ -14,7 +14,12 @@ export default defineConfig({
     timeout: 5_000,
   },
   fullyParallel: false,
-  reporter: [['list']],
+  // Stable artifact roots for CI failure uploads (M014/S03 T02).
+  outputDir: 'test-results',
+  reporter: [
+    ['list'],
+    ['html', { open: 'never', outputFolder: 'playwright-report' }],
+  ],
   // Predictable artifact path: e2e/visual/<file>.ts-snapshots/<name>.png
   snapshotPathTemplate: '{testDir}/{testFilePath}-snapshots/{arg}{ext}',
   use: {

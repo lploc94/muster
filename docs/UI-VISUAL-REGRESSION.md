@@ -80,6 +80,64 @@ listings sufficient to reproduce rasterization context.
   developer machine, then **delete** the temporary authoring path. Do not leave
   update-snapshots enabled on the standing `ci.yml` workflow.
 
+## Failure evidence (expected / actual / diff / trace / HTML)
+
+When a visual compare fails, Playwright writes diagnosable evidence under stable
+repository-relative paths. CI uploads the same roots as a single artifact.
+
+| Kind | Path pattern | Notes |
+|------|--------------|-------|
+| Expected golden | `test-results/**/*-expected.png` | Copy of the committed baseline used for compare |
+| Actual screenshot | `test-results/**/*-actual.png` | What Chromium rendered in this run |
+| Diff image | `test-results/**/*-diff.png` | Pixel-level highlight of the mismatch |
+| Trace | `test-results/**/trace.zip` | Playwright trace (`trace: retain-on-failure`) |
+| Failure screenshot | `test-results/**/test-failed-*.png` | Page capture on failure (`screenshot: only-on-failure`) |
+| HTML report | `playwright-report/index.html` | Aggregated Playwright HTML report |
+
+### Local controlled mismatch probe
+
+Prove the failure path without committing baseline changes:
+
+```bash
+# 1) Clean green compare
+npm run test:visual:linux
+
+# 2) Disposable mismatch → expect fail + full artifact inventory → restore fixture
+node scripts/probe-visual-failure.mjs
+
+# 3) Green again; committed goldens untouched
+npm run test:visual:linux
+git diff --exit-code -- e2e/visual
+```
+
+The probe temporarily recolors the dark-theme `--vscode-foreground` token in
+`e2e/fixtures/visual-environment.ts` for case `V01-webview-compact-dark`, runs
+the pinned Linux compare, inventories the six required artifact kinds, then
+**always** restores the fixture. It never writes under `e2e/visual/*-snapshots`.
+
+Unit coverage for inventory / mismatch helpers:
+
+```bash
+node --test scripts/probe-visual-failure.test.mjs
+```
+
+### CI artifact download
+
+On a failed `visual` job:
+
+1. Open the GitHub Actions run → **visual** job.
+2. Download the artifact named **`visual-regression-failure`** (retention **14** days).
+3. Unpack locally; open `playwright-report/index.html` and inspect
+   `test-results/**/*-{expected,actual,diff}.png` plus `trace.zip`.
+4. Fix the product/fixture regression **or** intentionally re-author goldens via
+   `npm run test:visual:linux:update` (never enable update-snapshots in CI).
+
+Contract tests that pin the workflow artifact name and retention:
+
+```bash
+node --test scripts/verify-visual-ci.test.mjs
+```
+
 ## Scope limits
 
 - Synthetic browser theme tokens and body classes prove **extension-owned**
