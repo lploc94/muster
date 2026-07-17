@@ -25,9 +25,6 @@ import { discoverSkillNames } from './host/skill-discovery';
 import { ElicitationBridge } from './bridge/elicitation-bridge';
 import type { PermissionAuditEntry, PermissionMode } from './backends/permission-policy';
 import {
-  collectAncestorIds,
-  owningRootMembershipChanged,
-  projectTaskSummary,
   type PendingAskOverlay,
   type TranscriptItem,
 } from './host/snapshot';
@@ -199,8 +196,6 @@ function getTaskTypeRegistry(cwd?: string) {
   return loadTaskTypeRegistry((folderCwd) => readExplicitTaskTypesRaw(folderCwd), cwd);
 }
 let presentationManager: PresentationManager | undefined;
-let lastObservedRevision = 0;
-let lastObservedFile: TaskStoreFile | undefined;
 const activePendingAsks = new Map<string, PendingAskOverlay>();
 
 function ensureMusterDebugChannel(): vscode.OutputChannel {
@@ -383,42 +378,6 @@ function scheduleRetention(): void {
     });
 }
 
-/**
- * True when any record belonging to `taskId` differs between `previous` and `file`,
- * including additions AND deletions (a record present in one snapshot but absent in
- * the other). Used to decide whether a focused snapshot must be re-posted.
- */
-function taskRecordsChanged(
-  previous: TaskStoreFile,
-  file: TaskStoreFile,
-  taskId: string,
-): boolean {
-  const differs = <T extends { taskId: string }>(
-    prevMap: Record<string, T> | undefined,
-    nextMap: Record<string, T> | undefined,
-  ): boolean => {
-    const prev = prevMap ?? {};
-    const next = nextMap ?? {};
-    for (const key of new Set([...Object.keys(prev), ...Object.keys(next)])) {
-      const p = prev[key];
-      const n = next[key];
-      if (p?.taskId !== taskId && n?.taskId !== taskId) {
-        continue;
-      }
-      if (JSON.stringify(p) !== JSON.stringify(n)) {
-        return true;
-      }
-    }
-    return false;
-  };
-  return (
-    differs(previous.messages, file.messages) ||
-    differs(previous.toolCalls, file.toolCalls) ||
-    differs(previous.reasoning, file.reasoning) ||
-    differs(previous.turns, file.turns)
-  );
-}
-
 class MusterChatProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'muster.chat';
   private _view?: vscode.WebviewView;
@@ -454,9 +413,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
    */
   async publishAfterCommit(ctx: RepositoryCommitContext): Promise<void> {
     if (!this._view?.visible) {
-      // Still advance lastObserved so the next snapshot is coherent.
-      lastObservedRevision = ctx.projection.getFile().revision;
-      lastObservedFile = JSON.parse(JSON.stringify(ctx.projection.getFile())) as TaskStoreFile;
+      // Visibility regain performs a bounded authoritative snapshot.
       return;
     }
     const after = ctx.projection.getFile();
@@ -479,8 +436,6 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       }
     }
     this.post(buildWorkspacePatchBatch(after.revision, patches));
-    lastObservedRevision = after.revision;
-    lastObservedFile = JSON.parse(JSON.stringify(after)) as TaskStoreFile;
 
     // Ask-clear side channel when a waiting_user turn leaves that state.
     const previous = ctx.beforeFile;
@@ -1026,41 +981,49 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private seedObservation(file: TaskStoreFile): void {
-    lastObservedRevision = file.revision;
-    lastObservedFile = JSON.parse(JSON.stringify(file)) as TaskStoreFile;
+  focusTask(taskId: string): void {
+    void this.transitionFocus(taskId);
   }
 
   /**
-   * @deprecated P4-W7: local mutations publish workspacePatchBatch via
-   * onAfterCommit. Kept as a no-op shell so any residual test callers do not
-   * reintroduce taskUpdated/transcriptAppend.
+   * Flush the previous focused stream (if any), then swap focus/known ids and
+   * post a bounded snapshot. Shared by protocol handlers and presentation links.
    */
-  reprojectChanged(_file: TaskStoreFile, _affectedTaskIds: string[], _before?: TaskStoreFile): void {
-    // no-op — revisioned patches are published from repository onAfterCommit
-  }
-
-  handleExternalStoreChange(): void {
-    // Filesystem-store notifications no longer exist. Keep this narrow hook until
-    // P4-W10 replaces it with revision polling so restored provider tests can ask
-    // for a bounded refresh without reaching a JSON reload path.
-    this.postSnapshot(this.focusedTaskId);
-  }
-
-  focusTask(taskId: string): void {
-    this.focusedTaskId = taskId;
+  private async transitionFocus(nextFocus: string | undefined): Promise<void> {
+    const previous = this.focusedTaskId;
+    if (previous && previous !== nextFocus && taskEngine) {
+      try {
+        await taskEngine.flushPendingTranscriptForTask(previous);
+      } catch {
+        // Best-effort durable flush before handoff.
+      }
+    }
+    this.focusedTaskId = nextFocus;
     this.knownTranscriptIds.clear();
-    this.postSnapshot(taskId);
+    this.postSnapshot(nextFocus);
   }
 
-  postSnapshot(focusedTaskId?: string): void {
+  postSnapshot(focusedTaskId?: string, retryAttempt = 0): void {
     if (!taskRepository) {
       return;
     }
+    // Caller is responsible for flushing the previous focus when switching.
+    // Prefer explicit arg; fall back to current host focus (after transitionFocus).
     const focus = focusedTaskId ?? this.focusedTaskId;
     const generation = ++this.snapshotGeneration;
     void buildRepositorySnapshot(taskRepository, repositoryWorkspaceId(), focus, activePendingAsks).then((projection) => {
       if (generation !== this.snapshotGeneration) return;
+      // A local commit may have completed after the snapshot's final read but
+      // before this continuation ran. Never post an older snapshot after its
+      // patch; rebuild in write order so the webview revision cannot regress.
+      const projectedRevision = taskStore?.getFile().revision;
+      if (
+        projectedRevision !== undefined &&
+        projection.snapshot.storeRevision < projectedRevision
+      ) {
+        this.postSnapshot(focus);
+        return;
+      }
       // Stamp the wire version on the bootstrap message so the webview can detect
       // host<->webview drift once (and show a reload banner) instead of silently
       // dropping mismatched messages.
@@ -1075,10 +1038,17 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       this.knownTranscriptIds = new Set(
         (projection.snapshot.transcript ?? []).map((item) => item.id),
       );
-      this.seedObservation(projection.observation);
     }).catch(() => {
       if (generation === this.snapshotGeneration) {
-        this.postCommandError('Unable to load task snapshot.');
+        if (retryAttempt < 3) {
+          setTimeout(() => {
+            if (generation === this.snapshotGeneration) {
+              this.postSnapshot(focus, retryAttempt + 1);
+            }
+          }, 25 * (retryAttempt + 1));
+        } else {
+          this.postCommandError('Unable to load task snapshot.');
+        }
       }
     });
   }
@@ -1920,19 +1890,16 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           await this.handleSend(data);
           break;
         case 'newTask':
-          this.focusedTaskId = undefined;
-          this.postSnapshot(undefined);
+          await this.transitionFocus(undefined);
           break;
         case 'focusTask':
           if (typeof data.taskId === 'string') {
-            this.focusedTaskId = data.taskId;
-            this.postSnapshot(data.taskId);
+            await this.transitionFocus(data.taskId);
           }
           break;
         case 'hydrateSubtree':
           if (typeof data.taskId === 'string') {
-            this.focusedTaskId = data.taskId;
-            this.postSnapshot(data.taskId);
+            await this.transitionFocus(data.taskId);
           }
           break;
         case 'cancelTurn':
@@ -2422,12 +2389,21 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         case 'requestRuntimeHandoff':
           await this.handleRequestRuntimeHandoff(data);
           break;
-        case 'blurTask':
-          // Webview returned to the task list; drop the host-side focus so a
+        case 'blurTask': {
+          // Webview returned to the task list; flush then drop host-side focus so a
           // later snapshot (e.g. after Clear history) doesn't re-open a stale chat.
+          const previous = this.focusedTaskId;
+          if (previous && taskEngine) {
+            try {
+              await taskEngine.flushPendingTranscriptForTask(previous);
+            } catch {
+              // best-effort
+            }
+          }
           this.focusedTaskId = undefined;
           this.knownTranscriptIds.clear();
           break;
+        }
         case 'requestSettings':
           this.postSettingsSnapshot();
           this.postTaskTypesSettingsSnapshot();
@@ -3132,9 +3108,6 @@ export async function activate(context: vscode.ExtensionContext) {
     taskStore = taskEngine.getReadModel();
     taskRepository = taskEngine.getRepository();
     scheduleRetention();
-    lastObservedFile = JSON.parse(JSON.stringify(taskStore.getFile())) as TaskStoreFile;
-    lastObservedRevision = taskStore.getFile().revision;
-
     context.subscriptions.push(
       vscode.workspace.onDidGrantWorkspaceTrust(() => {
         try {
@@ -3181,7 +3154,12 @@ export async function activate(context: vscode.ExtensionContext) {
   }
 }
 
-export function deactivate() {
+export async function deactivate(): Promise<void> {
+  try {
+    await taskEngine?.shutdown();
+  } catch {
+    // Stream failures are already routed through durable turn settlement.
+  }
   taskRepository = undefined;
   presentationManager?.dispose();
   presentationManager = undefined;

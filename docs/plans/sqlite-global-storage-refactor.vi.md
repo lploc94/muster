@@ -2,7 +2,7 @@
 
 ## Trạng thái
 
-**IN PROGRESS — Phase 4 pagination/incremental wire (P4-W3 ✅; P4-W4 ✅; P4-W5 ✅; P4-W6 ✅; P4-W7 ✅; P4-W8+ chưa bắt đầu).**
+**IN PROGRESS — Phase 4 pagination/incremental wire (P4-W3 ✅; P4-W4 ✅; P4-W5 ✅; P4-W6 ✅; P4-W7 ✅; P4-W8 ✅; P4-W9+ chưa bắt đầu).**
 Cập nhật: 2026-07-17
 
 - Phase 1: **đã qua gate** — worker/RPC, schema bootstrap, global-storage registry,
@@ -635,7 +635,7 @@ sau bắt đầu ngay khi wave trước đạt gate, chỉ dừng khi có blocke
 | P4-W5 ✅ | Load older UX | Typed request/response, prepend idempotent, giữ scroll anchor |
 | P4-W6 ✅ | Revisioned patch reducer | Duplicate/stale patch là no-op; revision gap yêu cầu recovery |
 | P4-W7 ✅ | Local patch routing | Queue/tree/transcript update không kéo theo focused full snapshot |
-| P4-W8 | Stream batching | Assistant/reasoning persist + post coalesce 50–100 ms, flush ở tool/terminal boundary |
+| P4-W8 ✅ | Stream batching | Assistant/reasoning persist + post coalesce 50–100 ms, flush ở tool/terminal boundary |
 | P4-W9 | Change-feed contract | Bounded feed, prune watermark, explicit gap result |
 | P4-W10 | Multi-window polling | Visible/focus polling + backoff; hai process hội tụ hoặc full-recover khi gap |
 | P4-W11 | Performance/UAT gate | 10k fixture, size/latency budgets, full suite/build/VSIX evidence |
@@ -816,6 +816,10 @@ request; fixed page limit 100; **no W6 recovery**.
   là no-op, gap/invariant chuyển state sang `needsRecovery` (atomic, no partial).
 - Recovery via exact `requestWorkspaceRecovery` → bounded snapshot hydrate.
 - Exact protocol mismatch chỉ hiện reload banner; không parse/translate protocol cũ.
+- Runtime guard kiểm tra exact-key cả envelope lẫn nested task/turn/queue/transcript,
+  giới hạn tổng payload và stable identity. Malformed revision hiện tại đi vào recovery
+  single-flight; malformed stale replay là no-op. Snapshot cũ hơn revision đã apply không
+  được phép ghi đè task/thread state.
 
 ##### P4-W7 — Local patch routing
 
@@ -824,13 +828,24 @@ request; fixed page limit 100; **no W6 recovery**.
 - Full snapshot chỉ dùng bootstrap, focus change hoặc recovery; queue/tree change không
   rebuild transcript nếu focused task không bị ảnh hưởng.
 - Loại `transcriptAppend`/`taskUpdated` one-off messages sau khi mọi caller chuyển xong.
+- Wrapper serialize trọn `execute → bounded projection refresh → publish`, nên hai local
+  writer đồng thời vẫn phát đúng N rồi N+1. Bounded snapshot chạy qua cùng read barrier;
+  raw repository còn có start/end revision fence và retry để không trộn row từ hai revision.
 
 ##### P4-W8 — Stream batching
 
-- Coalesce assistant/reasoning updates trong cửa sổ 50–100 ms trước một
-  `appendTranscriptBatch` transaction và một UI patch batch.
-- Flush trước tool boundary, turn done/error/cancel, focus teardown và deactivate.
+- Coalesce assistant/reasoning updates trong cửa sổ cố định **75 ms** trước một
+  `appendTranscriptBatch` transaction và một `workspacePatchBatch` (via onAfterCommit).
+- Flush trước tool boundary, turn done/error/cancel, focus teardown và deactivate
+  (`flushPendingTranscriptForTask` / `flushAllPendingTranscript`; deactivate awaitable).
 - Lỗi persist không được ACK/post như durable; ordering và partial-segment IDs giữ ổn định.
+- Durable-before-visible: no raw assistant/reasoning durable UI post before commit.
+- Timer persist failure được report một lần và settle turn failed, không retry storm/ACK giả;
+  buffer chỉ retry ở explicit boundary. Graph transition, interrupt, lifecycle cascade,
+  handoff và timeout đều flush trước durable cancel/physical abort. `deactivate()` await
+  engine shutdown: chặn dispatch mới, flush, abort adapter, chờ settle rồi final flush.
+- SQLite integration tests chốt thứ tự `appendTranscriptBatch → putCancelRequest`, injected
+  disk-full chỉ một attempt/một failed turn, và shutdown giữ last pre-abort window.
 
 ##### P4-W9 — Change-feed contract
 

@@ -74,6 +74,11 @@ import {
   type RepositoryCommitContext,
 } from './repository-projection';
 import {
+  TranscriptStreamBatcher,
+  type StreamBatchPayload,
+  type StreamFlushResult,
+} from './transcript-stream-batcher';
+import {
   applyDependencyTerminal,
   applyFailedTurn,
   applySuccessfulTurn,
@@ -470,8 +475,16 @@ export class TaskEngine {
   private readonly deferredQueuedTurns = new Set<string>();
   private readonly acceptedOpIds = new Map<string, string>();
   private readonly turnPromises = new Map<string, Promise<void>>();
+  private shuttingDown = false;
   private readonly pendingAskPromises = new Map<string, { promise: Promise<Answers>; fingerprint: string }>();
   private settling = new Set<string>();
+  /** Live executeTurn closures used to settle unobserved timer flush failures. */
+  private readonly streamFailureHandlers = new Map<
+    string,
+    (message: string) => Promise<void>
+  >();
+  /** Per-turn assistant/reasoning coalescer (P4-W8). */
+  private readonly streamBatcher: TranscriptStreamBatcher;
 
   private constructor(
     config: TaskEngineConfig,
@@ -513,6 +526,89 @@ export class TaskEngine {
         defaultRunVerificationGate(commands, cwd, {
           computeRevision: (c) => this.computeSourceRevision(c),
       }));
+    this.streamBatcher = new TranscriptStreamBatcher({
+      persist: async (payload: StreamBatchPayload) => {
+        const result = await this.repository.execute({
+          kind: 'appendTranscriptBatch',
+          workspaceId: this.workspaceId,
+          taskId: payload.taskId,
+          ...(payload.messages ? { messages: payload.messages } : {}),
+          ...(payload.reasoning ? { reasoning: payload.reasoning } : {}),
+        });
+        return { changed: result.changed === true, reason: result.reason };
+      },
+      onTimerFlushError: (turnId, message) =>
+        this.reportStreamFlushFailure(turnId, message),
+    });
+  }
+
+  /** Flush pending assistant/reasoning for one task before focus teardown. */
+  async flushPendingTranscriptForTask(taskId: string): Promise<void> {
+    await this.requireSuccessfulFlushes(await this.streamBatcher.flushTask(taskId));
+  }
+
+  /** Flush all pending stream batches (deactivate / global barriers). */
+  async flushAllPendingTranscript(): Promise<void> {
+    await this.requireSuccessfulFlushes(await this.streamBatcher.flushAll());
+  }
+
+  /**
+   * Awaitable extension-host teardown. Stop new dispatch, persist the current
+   * windows, abort adapters, then perform a final flush for deltas that raced
+   * the first barrier.
+   */
+  async shutdown(): Promise<void> {
+    if (this.shuttingDown) return;
+    this.shuttingDown = true;
+    let flushError: unknown;
+    try {
+      await this.flushAllPendingTranscript();
+    } catch (error) {
+      flushError = error;
+    }
+
+    for (const handle of this.liveRuns.values()) {
+      handle.controller.abort();
+    }
+
+    if (this.turnPromises.size > 0) {
+      await Promise.race([
+        Promise.allSettled([...this.turnPromises.values()]).then(() => undefined),
+        new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
+      ]);
+    }
+    try {
+      await this.flushAllPendingTranscript();
+    } catch (error) {
+      flushError ??= error;
+    } finally {
+      this.streamBatcher.disposeAll();
+    }
+    if (flushError) throw flushError;
+  }
+
+  private async reportStreamFlushFailure(turnId: string, message: string): Promise<void> {
+    await this.streamFailureHandlers.get(turnId)?.(message);
+  }
+
+  private async requireSuccessfulFlushes(results: readonly StreamFlushResult[]): Promise<void> {
+    const failures = results.filter(
+      (result): result is Extract<StreamFlushResult, { ok: false }> => !result.ok,
+    );
+    for (const failure of failures) {
+      await this.reportStreamFlushFailure(failure.turnId, failure.message);
+    }
+    if (failures.length > 0) {
+      throw new Error(failures.map((failure) => failure.message).join('; '));
+    }
+  }
+
+  private async flushTurnBoundary(turnId: string): Promise<StreamFlushResult> {
+    const result = await this.streamBatcher.flushTurn(turnId);
+    if (!result.ok) {
+      await this.reportStreamFlushFailure(turnId, result.message);
+    }
+    return result;
   }
 
   /** Acquire the durable per-turn cross-process ownership claim. */
@@ -640,6 +736,10 @@ export class TaskEngine {
       getRunLimitMs: this.getRunLimitMs,
       clock: this.clock,
       liveRuns: this.liveRuns,
+      flushPendingTranscript: async (turnId) => {
+        const result = await this.flushTurnBoundary(turnId);
+        return result.ok ? { ok: true } : { ok: false, message: result.message };
+      },
       pendingAskPromises: this.pendingAskPromises,
       onScheduleTurn: (turnId) => void this.scheduleTurn(turnId),
       onRescanSchedulableTurns: (ids) => this.rescanSchedulableTurns(ids),
@@ -1291,6 +1391,12 @@ export class TaskEngine {
     if (task.backend === targetBackendId && (task.model ?? undefined) === (targetModelId ?? undefined)) {
       return { ok: false, reason: 'target backend/model is already bound' };
     }
+    const preHandoff = await this.flushLocalTurnsBeforeMutation(
+      [...this.liveRuns]
+        .filter(([, handle]) => handle.taskId === params.taskId)
+        .map(([turnId]) => turnId),
+    );
+    if (!preHandoff.ok) return preHandoff;
     const [turns, messages, toolCalls] = await Promise.all([
       this.repository.listTurns(params.taskId),
       this.repository.listMessages(params.taskId),
@@ -1647,6 +1753,22 @@ export class TaskEngine {
     }
   }
 
+  private async flushLocalTurnsBeforeMutation(
+    turnIds: readonly string[],
+  ): Promise<EngineResult<void>> {
+    for (const turnId of new Set(turnIds)) {
+      if (!this.liveRuns.has(turnId)) continue;
+      const flushed = await this.flushTurnBoundary(turnId);
+      if (!flushed.ok) {
+        return {
+          ok: false,
+          reason: `transcript persistence failed: ${flushed.message}`,
+        };
+      }
+    }
+    return { ok: true, value: undefined };
+  }
+
   /** Durable interrupt request followed by aborting only a locally-owned run. */
   async interruptTurnAsync(turnId: string): Promise<EngineResult<void>> {
     const turn = await this.repository.getTurn(turnId);
@@ -1654,6 +1776,8 @@ export class TaskEngine {
     if (turn.status !== 'running' && turn.status !== 'waiting_user') {
       return { ok: false, reason: 'turn is not live' };
     }
+    const preInterrupt = await this.flushLocalTurnsBeforeMutation([turnId]);
+    if (!preInterrupt.ok) return preInterrupt;
     const now = nowIso(this.clock);
     const request = await this.repository.execute({
       kind: 'putCancelRequest',
@@ -1744,6 +1868,10 @@ export class TaskEngine {
           if (interrupted.ok) changedTurns.push({ ...interrupted.next, isCancellation: lifecycle === 'cancelled' });
         }
       }
+    }
+    if (live && !remoteOwned && lifecycle !== 'open') {
+      const preLifecycle = await this.flushLocalTurnsBeforeMutation([live.id]);
+      if (!preLifecycle.ok) return preLifecycle;
     }
     const write = await this.repository.execute({
       kind: 'applyTaskLifecycle', workspaceId: this.workspaceId, taskId,
@@ -1856,6 +1984,10 @@ export class TaskEngine {
     const now = nowIso(this.clock);
     const prepared = this.prepareLifecycleCascade(taskId, 'skip', file, now);
     if (!prepared.ok) return prepared;
+    const preSkip = await this.flushLocalTurnsBeforeMutation(
+      prepared.liveTurnIds.filter((turnId) => !prepared.remoteLiveTurnIds.has(turnId)),
+    );
+    if (!preSkip.ok) return preSkip;
     const write = await this.repository.execute({ kind: 'cascadeTaskLifecycle', workspaceId: this.workspaceId, rootTaskId: taskId, mode: 'skip', expectedTasks: prepared.expectedTasks, expectedTurns: prepared.expectedTurns, tasks: prepared.tasks, turns: prepared.turns, cancelRequests: prepared.cancelRequests });
     if (!write.changed) return { ok: false, reason: write.reason ?? 'task changed; retry' };
     for (const turnId of prepared.liveTurnIds) {
@@ -1879,6 +2011,10 @@ export class TaskEngine {
     const now = nowIso(this.clock);
     const prepared = this.prepareLifecycleCascade(taskId, 'cancel', file, now);
     if (!prepared.ok) return prepared;
+    const preCancel = await this.flushLocalTurnsBeforeMutation(
+      prepared.liveTurnIds.filter((turnId) => !prepared.remoteLiveTurnIds.has(turnId)),
+    );
+    if (!preCancel.ok) return preCancel;
     const write = await this.repository.execute({ kind: 'cascadeTaskLifecycle', workspaceId: this.workspaceId, rootTaskId: taskId, mode: 'cancel', expectedTasks: prepared.expectedTasks, expectedTurns: prepared.expectedTurns, tasks: prepared.tasks, turns: prepared.turns, cancelRequests: prepared.cancelRequests });
     if (!write.changed) return { ok: false, reason: write.reason ?? 'task changed; retry' };
     for (const turnId of prepared.liveTurnIds) {
@@ -2831,6 +2967,7 @@ export class TaskEngine {
    * (release, lifecycle seal, dependency terminal, settle, trust grant).
    */
   private rescanSchedulableTurns(affectedTaskIds?: readonly string[]): void {
+    if (this.shuttingDown) return;
     const file = this.store.getFile();
     const queued = Object.values(file.turns)
       .filter((t) => t.status === 'queued')
@@ -2851,6 +2988,7 @@ export class TaskEngine {
   }
 
   private scheduleTurn(turnId: string): Promise<void> {
+    if (this.shuttingDown) return Promise.resolve();
     const existing = this.turnPromises.get(turnId);
     if (existing) return existing;
     // Register before the first await so callers of whenIdle cannot observe a
@@ -3397,6 +3535,8 @@ export class TaskEngine {
     // watchdog instead of treating 0 as "no timeout" and running forever.
     const turnTimer = setTimeout(() => {
       void (async () => {
+        const flushed = await this.flushTurnBoundary(turnId);
+        if (!flushed.ok) return;
         const live = await this.repository.getTurn(turnId);
         const limitMs = live?.effectiveRunLimitMs ?? remainingRunMs;
         const deadlineAt = live?.runDeadlineAt ?? new Date().toISOString();
@@ -3418,6 +3558,64 @@ export class TaskEngine {
     let rawOutput = '';
     let observedSessionId: string | undefined;
     let terminalSettled = false;
+    let streamFailureStarted = false;
+    let streamFailureMessage: string | undefined;
+    let streamFailurePromise: Promise<void> | undefined;
+    const settleStreamPersistenceFailure = (message: string): Promise<void> => {
+      if (streamFailurePromise) return streamFailurePromise;
+      streamFailureStarted = true;
+      streamFailureMessage = message;
+      streamFailurePromise = (async () => {
+        try {
+          if (!terminalSettled) {
+            terminalSettled = await this.settleFailed(
+              turnId,
+              message,
+              observedSessionId,
+              rawOutput,
+              backend,
+            );
+            if (terminalSettled) {
+              this.safeEmit({
+                type: 'turnError',
+                taskId: startedTurn.taskId,
+                turnId,
+                message,
+              });
+            }
+          }
+        } catch {
+          // The regular executeTurn catch/finally path remains the final
+          // settlement fallback; timer callbacks must never reject globally.
+        } finally {
+          abort.abort();
+        }
+      })();
+      return streamFailurePromise;
+    };
+    const finishStreamPersistenceFailure = async (): Promise<boolean> => {
+      if (!streamFailureStarted) return false;
+      if (streamFailurePromise) await streamFailurePromise;
+      if (!terminalSettled && streamFailureMessage) {
+        terminalSettled = await this.settleFailed(
+          turnId,
+          streamFailureMessage,
+          observedSessionId,
+          rawOutput,
+          backend,
+        );
+        if (terminalSettled) {
+          this.safeEmit({
+            type: 'turnError',
+            taskId: startedTurn.taskId,
+            turnId,
+            message: streamFailureMessage,
+          });
+        }
+      }
+      return true;
+    };
+    this.streamFailureHandlers.set(turnId, settleStreamPersistenceFailure);
     // Per-turn render ordering + assistant segmentation (see WEBVIEW-IMPROVEMENT-PLAN §5.1.1).
     // `order` is a per-turn monotonic counter shared by assistant segments, tools,
     // and mid-turn user messages; `(turn.sequence, order)` reconstructs
@@ -3518,7 +3716,7 @@ export class TaskEngine {
 
       for await (const event of this.runTurnFn(backend, built.options)) {
         await processCancelRequests(this.graphDeps());
-        if (terminalSettled) {
+        if (terminalSettled || streamFailureStarted || this.shuttingDown) {
           break;
         }
         const eventFile = this.store.getFile();
@@ -3535,17 +3733,9 @@ export class TaskEngine {
           continue;
         }
 
-        // Auxiliary streaming events are forwarded raw. `assistantDelta` is
-        // forwarded AFTER persistence with a rewritten, deterministic messageId
-        // (`${turnId}:${order}`) so the live stream and hydrated snapshot reconcile
-        // by identical id (see WEBVIEW-IMPROVEMENT-PLAN §5.1.1).
-        if (
-          event.type === 'reasoningDelta' ||
-          event.type === 'toolStarted' ||
-          event.type === 'toolUpdated' ||
-          event.type === 'toolCompleted' ||
-          event.type === 'usage'
-        ) {
+        // Ephemeral usage only — durable assistant/reasoning/tool UI posts only
+        // after successful appendTranscriptBatch (P4-W8 durable-before-visible).
+        if (event.type === 'usage') {
           this.safeEmit({ type: 'event', taskId: turn.taskId, turnId, event });
         }
 
@@ -3567,6 +3757,14 @@ export class TaskEngine {
             const openNew =
               !currentAssistantSegment || currentAssistantSegment.sourceMessageId !== event.messageId;
             if (openNew) {
+              // Flush prior segment before opening a new stable id/order.
+              if (currentAssistantSegment) {
+                const flushed = await this.streamBatcher.flushTurn(turnId);
+                if (!flushed.ok) {
+                  await settleStreamPersistenceFailure(flushed.message);
+                  break;
+                }
+              }
               const order = nextOrder();
               currentAssistantSegment = {
                 storeId: `${turnId}:${order}`,
@@ -3582,46 +3780,14 @@ export class TaskEngine {
               };
             }
             const segment = currentAssistantSegment;
-            let failMessage: string | undefined;
-            try {
-              const persisted = await this.repository.execute({
-                kind: 'appendTranscriptBatch',
-                workspaceId: this.workspaceId,
-                taskId: eventTurn.taskId,
-                messages: [{
-                  id: segment.storeId,
-                  taskId: eventTurn.taskId,
-                  role: 'assistant',
-                  content: segment.content,
-                  state: 'partial',
-                  createdAt: segment.createdAt,
-                  turnId,
-                  order: segment.order,
-                }],
-              });
-              if (!persisted.changed) failMessage = persisted.reason ?? 'assistant persistence failed';
-            } catch (error) {
-              failMessage = error instanceof Error ? error.message : String(error);
-            }
-            if (failMessage) {
-              terminalSettled = await this.settleFailed(
-                turnId,
-                failMessage,
-                observedSessionId,
-                rawOutput,
-                backend,
-              );
-              if (terminalSettled) {
-                this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message: failMessage });
-              }
-              break;
-            }
-            // Forward a rewritten delta carrying the deterministic segment id.
-            this.safeEmit({
-              type: 'event',
-              taskId: turn.taskId,
+            this.streamBatcher.noteAssistant({
+              storeId: segment.storeId,
+              sourceMessageId: segment.sourceMessageId,
+              content: segment.content,
+              createdAt: segment.createdAt,
+              order: segment.order,
+              taskId: eventTurn.taskId,
               turnId,
-              event: { type: 'assistantDelta', content: event.content, messageId: segment.storeId },
             });
             break;
           }
@@ -3633,34 +3799,16 @@ export class TaskEngine {
                   id: turnId, taskId: eventTurn.taskId, turnId, content: event.content,
                   createdAt: at, updatedAt: at,
                 };
-            let failMessage: string | undefined;
-            try {
-              const persisted = await this.repository.execute({
-                kind: 'appendTranscriptBatch',
-                workspaceId: this.workspaceId,
-                taskId: eventTurn.taskId,
-                reasoning: [currentReasoning],
-              });
-              if (!persisted.changed) failMessage = persisted.reason ?? 'reasoning persistence failed';
-            } catch (error) {
-              failMessage = error instanceof Error ? error.message : String(error);
-            }
-            if (failMessage) {
-              terminalSettled = await this.settleFailed(
-                turnId,
-                failMessage,
-                observedSessionId,
-                rawOutput,
-                backend,
-              );
-              if (terminalSettled) {
-                this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message: failMessage });
-              }
-              break;
-            }
+            this.streamBatcher.noteReasoning(currentReasoning);
             break;
           }
           case 'toolStarted': {
+            // Flush assistant/reasoning before tool boundary (ordering).
+            const preTool = await this.streamBatcher.flushTurn(turnId);
+            if (!preTool.ok) {
+              await settleStreamPersistenceFailure(preTool.message);
+              break;
+            }
             // A tool closes the current assistant segment (matches live commitStreaming).
             currentAssistantSegment = undefined;
             const compositeId = `${turnId}:${event.toolCallId}`;
@@ -3691,21 +3839,18 @@ export class TaskEngine {
               failMessage = error instanceof Error ? error.message : String(error);
             }
             if (failMessage) {
-              terminalSettled = await this.settleFailed(
-                turnId,
-                failMessage,
-                observedSessionId,
-                rawOutput,
-                backend,
-              );
-              if (terminalSettled) {
-                this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message: failMessage });
-              }
+              await settleStreamPersistenceFailure(failMessage);
               break;
             }
+            this.safeEmit({ type: 'event', taskId: turn.taskId, turnId, event });
             break;
           }
           case 'toolUpdated': {
+            const preTool = await this.streamBatcher.flushTurn(turnId);
+            if (!preTool.ok) {
+              await settleStreamPersistenceFailure(preTool.message);
+              break;
+            }
             const compositeId = `${turnId}:${event.toolCallId}`;
             const at = nowIso(this.clock);
             const existing = streamedTools.get(compositeId);
@@ -3732,21 +3877,18 @@ export class TaskEngine {
               failMessage = error instanceof Error ? error.message : String(error);
             }
             if (failMessage) {
-              terminalSettled = await this.settleFailed(
-                turnId,
-                failMessage,
-                observedSessionId,
-                rawOutput,
-                backend,
-              );
-              if (terminalSettled) {
-                this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message: failMessage });
-              }
+              await settleStreamPersistenceFailure(failMessage);
               break;
             }
+            this.safeEmit({ type: 'event', taskId: turn.taskId, turnId, event });
             break;
           }
           case 'toolCompleted': {
+            const preTool = await this.streamBatcher.flushTurn(turnId);
+            if (!preTool.ok) {
+              await settleStreamPersistenceFailure(preTool.message);
+              break;
+            }
             const compositeId = `${turnId}:${event.toolCallId}`;
             const outcome = event.outcome;
             const at = nowIso(this.clock);
@@ -3781,24 +3923,21 @@ export class TaskEngine {
               failMessage = error instanceof Error ? error.message : String(error);
             }
             if (failMessage) {
-              terminalSettled = await this.settleFailed(
-                turnId,
-                failMessage,
-                observedSessionId,
-                rawOutput,
-                backend,
-              );
-              if (terminalSettled) {
-                this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message: failMessage });
-              }
+              await settleStreamPersistenceFailure(failMessage);
               break;
             }
+            this.safeEmit({ type: 'event', taskId: turn.taskId, turnId, event });
             break;
           }
           case 'raw':
             rawOutput += `${event.line}\n`;
             break;
           case 'turnCompleted': {
+            const preDone = await this.streamBatcher.flushTurn(turnId);
+            if (!preDone.ok) {
+              await settleStreamPersistenceFailure(preDone.message);
+              break;
+            }
             const successOutcome = await this.settleSuccess(
               turnId,
               observedSessionId,
@@ -3834,7 +3973,12 @@ export class TaskEngine {
             }
             break;
           }
-          case 'error':
+          case 'error': {
+            const preError = await this.streamBatcher.flushTurn(turnId);
+            if (!preError.ok) {
+              await settleStreamPersistenceFailure(preError.message);
+              break;
+            }
             if (event.isCancellation) {
               const runTimedOut =
                 this.store.getFile().turns[turnId]?.termination?.kind === 'run_timeout';
@@ -3899,47 +4043,70 @@ export class TaskEngine {
               }
             }
             break;
+          }
           default:
             break;
         }
       }
 
-      if (!terminalSettled) {
-        const runTimedOut = this.store.getFile().turns[turnId]?.termination?.kind === 'run_timeout';
-        terminalSettled = runTimedOut
-          ? await this.settleInterrupted(turnId, observedSessionId, rawOutput, backend, 'run_timeout')
-          : await this.settleFailed(
+      const streamFailureHandled = await finishStreamPersistenceFailure();
+      if (!terminalSettled && !streamFailureHandled) {
+        // Flush any coalesced assistant/reasoning before abnormal settlement.
+        const preAbnormal = await this.streamBatcher.flushTurn(turnId);
+        if (!preAbnormal.ok) {
+          await settleStreamPersistenceFailure(preAbnormal.message);
+        } else {
+          const runTimedOut = this.store.getFile().turns[turnId]?.termination?.kind === 'run_timeout';
+          terminalSettled = runTimedOut
+            ? await this.settleInterrupted(turnId, observedSessionId, rawOutput, backend, 'run_timeout')
+            : this.shuttingDown
+              ? await this.settleInterrupted(turnId, observedSessionId, rawOutput, backend, 'forced')
+              : await this.settleFailed(
+                  turnId,
+                  'turn ended without terminal event',
+                  observedSessionId,
+                  rawOutput,
+                  backend,
+                );
+          if (terminalSettled) {
+            this.safeEmit({
+              type: 'turnError',
+              taskId: turn.taskId,
               turnId,
-              'turn ended without terminal event',
-              observedSessionId,
-              rawOutput,
-              backend,
-            );
-        if (terminalSettled) {
-          this.safeEmit({
-            type: 'turnError',
-            taskId: turn.taskId,
-            turnId,
-            message: 'turn ended without terminal event',
-          });
+              message: 'turn ended without terminal event',
+            });
+          }
         }
       }
     } catch (error) {
-      if (!terminalSettled) {
-        const message = error instanceof Error ? error.message : String(error);
-        const runTimedOut = this.store.getFile().turns[turnId]?.termination?.kind === 'run_timeout';
-        terminalSettled = runTimedOut
-          ? await this.settleInterrupted(turnId, observedSessionId, rawOutput, backend, 'run_timeout')
-          : await this.settleFailed(turnId, message, observedSessionId, rawOutput, backend);
-        if (terminalSettled) {
-          this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message });
+      const streamFailureHandled = await finishStreamPersistenceFailure();
+      if (!terminalSettled && !streamFailureHandled) {
+        // Best-effort flush before dispose so the last window is not dropped.
+        const preCatch = await this.streamBatcher.flushTurn(turnId);
+        if (!preCatch.ok) {
+          await settleStreamPersistenceFailure(preCatch.message);
+        } else {
+          const message = error instanceof Error ? error.message : String(error);
+          const runTimedOut = this.store.getFile().turns[turnId]?.termination?.kind === 'run_timeout';
+          terminalSettled = runTimedOut
+            ? await this.settleInterrupted(turnId, observedSessionId, rawOutput, backend, 'run_timeout')
+            : this.shuttingDown
+              ? await this.settleInterrupted(turnId, observedSessionId, rawOutput, backend, 'forced')
+              : await this.settleFailed(turnId, message, observedSessionId, rawOutput, backend);
+          if (terminalSettled) {
+            this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message });
+          }
         }
       }
     } finally {
       clearInterval(cancelPoll);
       clearTimeout(turnTimer);
+      if (streamFailurePromise) await streamFailurePromise;
+      this.streamFailureHandlers.delete(turnId);
       // Hard clear elicitation wait tokens — do not soft-resume a settling turn.
       this.dropElicitationWaits(turnId);
+      // Drop only after terminal paths have flushed (or failed explicitly).
+      this.streamBatcher.disposeTurn(turnId);
       this.liveRuns.delete(turnId);
       this.acceptedOpIds.delete(turnId);
       if (this.credentialRegistry) {

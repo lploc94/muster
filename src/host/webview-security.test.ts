@@ -94,7 +94,8 @@ describe('host interrupt-and-send routing contract', () => {
     )?.[0];
     expect(liveCase).toBeDefined();
     expect(liveCase).toContain('interruptAndSend');
-    expect(liveCase).toContain('postSnapshot');
+    // P4-W7: ordinary mutations publish via onAfterCommit patches, not postSnapshot.
+    expect(liveCase).not.toContain('postSnapshot');
     // Must not use concurrent inject path for composer direct messages.
     expect(liveCase).not.toContain('routeSendLiveInput');
     expect(liveCase).not.toContain('engine.sendLiveInput');

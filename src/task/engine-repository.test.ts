@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -101,6 +101,176 @@ describe('TaskEngine repository-only boundary', () => {
       await expect(repository.getTurn('repository-turn')).resolves.toMatchObject({ status: 'succeeded' });
       await expect(repository.getRuntimeClaim('repository-turn')).resolves.toBeUndefined();
     } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('fails a live turn exactly once when a timer stream flush cannot persist', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-engine-stream-failure-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const repository = new SqliteTaskRepository(client, 'ws');
+      await repository.execute({ kind: 'upsertWorkspace', workspaceId: 'ws', identityKey: 'stream-failure', displayName: 'Stream failure', createdAt: 'now', lastOpenedAt: 'now' });
+      const task = currentTask('stream-failure-task');
+      await repository.execute({ kind: 'createTask', workspaceId: 'ws', task });
+      await repository.execute({
+        kind: 'createTurn', workspaceId: 'ws', turn: {
+          id: 'stream-failure-turn', taskId: task.id, sequence: 1, status: 'queued',
+          trigger: 'engine', inputs: [], createdAt: '2026-07-16T00:00:01.000Z', runtimeEpoch: 1,
+        },
+      });
+
+      const execute = repository.execute.bind(repository);
+      let appendAttempts = 0;
+      vi.spyOn(repository, 'execute').mockImplementation(async (command) => {
+        if (command.kind === 'appendTranscriptBatch') {
+          appendAttempts += 1;
+          return { changed: false, reason: 'injected disk full' };
+        }
+        return execute(command);
+      });
+      const engine = await TaskEngine.loadAsync({
+        repository,
+        workspaceId: 'ws',
+        makeBackend: () => ({ name: 'fake', run: async function* () {} }),
+        runTurn: async function* (_backend, options) {
+          yield { type: 'assistantDelta', messageId: 'assistant-1', content: 'durable me' };
+          await new Promise<void>((resolve) => setTimeout(resolve, 150));
+          if (!options.signal?.aborted) yield { type: 'turnCompleted' };
+        },
+        clock: () => '2026-07-16T00:00:02.000Z',
+      });
+
+      await engine.resumeQueuedTurnAsync(task.id, 'stream-failure-turn');
+      await engine.whenIdle();
+
+      expect(appendAttempts).toBe(1);
+      await expect(repository.getTurn('stream-failure-turn')).resolves.toMatchObject({
+        status: 'failed',
+        error: expect.stringContaining('injected disk full'),
+      });
+    } finally {
+      vi.restoreAllMocks();
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('flushes the pending stream batch before committing a local interrupt request', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-engine-stream-interrupt-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let deltaProcessed!: () => void;
+    const processed = new Promise<void>((resolve) => { deltaProcessed = resolve; });
+    let engine: TaskEngine | undefined;
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const repository = new SqliteTaskRepository(client, 'ws');
+      await repository.execute({ kind: 'upsertWorkspace', workspaceId: 'ws', identityKey: 'stream-interrupt', displayName: 'Stream interrupt', createdAt: 'now', lastOpenedAt: 'now' });
+      const task = currentTask('stream-interrupt-task');
+      await repository.execute({ kind: 'createTask', workspaceId: 'ws', task });
+      await repository.execute({
+        kind: 'createTurn', workspaceId: 'ws', turn: {
+          id: 'stream-interrupt-turn', taskId: task.id, sequence: 1, status: 'queued',
+          trigger: 'engine', inputs: [], createdAt: '2026-07-16T00:00:01.000Z', runtimeEpoch: 1,
+        },
+      });
+
+      const durableOrder: string[] = [];
+      const execute = repository.execute.bind(repository);
+      vi.spyOn(repository, 'execute').mockImplementation(async (command) => {
+        if (command.kind === 'appendTranscriptBatch' || command.kind === 'putCancelRequest') {
+          durableOrder.push(command.kind);
+        }
+        return execute(command);
+      });
+      engine = await TaskEngine.loadAsync({
+        repository,
+        workspaceId: 'ws',
+        makeBackend: () => ({ name: 'fake', run: async function* () {} }),
+        runTurn: async function* () {
+          yield { type: 'assistantDelta', messageId: 'assistant-1', content: 'last window' };
+          deltaProcessed();
+          await gate;
+        },
+        clock: () => '2026-07-16T00:00:02.000Z',
+      });
+
+      const runPromise = engine.resumeQueuedTurnAsync(task.id, 'stream-interrupt-turn');
+      await processed;
+      await expect(engine.interruptTurnAsync('stream-interrupt-turn')).resolves.toEqual({
+        ok: true,
+        value: undefined,
+      });
+      expect(durableOrder.slice(-2)).toEqual(['appendTranscriptBatch', 'putCancelRequest']);
+      expect((await repository.listMessages(task.id)).some(
+        (message) => message.content === 'last window',
+      )).toBe(true);
+      release();
+      await runPromise;
+    } finally {
+      release();
+      await engine?.whenIdle();
+      vi.restoreAllMocks();
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('shutdown flushes before abort and awaits forced turn settlement', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-engine-stream-shutdown-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    let started!: () => void;
+    const streaming = new Promise<void>((resolve) => { started = resolve; });
+    let engine: TaskEngine | undefined;
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const repository = new SqliteTaskRepository(client, 'ws');
+      await repository.execute({ kind: 'upsertWorkspace', workspaceId: 'ws', identityKey: 'stream-shutdown', displayName: 'Stream shutdown', createdAt: 'now', lastOpenedAt: 'now' });
+      const task = currentTask('stream-shutdown-task');
+      await repository.execute({ kind: 'createTask', workspaceId: 'ws', task });
+      await repository.execute({
+        kind: 'createTurn', workspaceId: 'ws', turn: {
+          id: 'stream-shutdown-turn', taskId: task.id, sequence: 1, status: 'queued',
+          trigger: 'engine', inputs: [], createdAt: '2026-07-16T00:00:01.000Z', runtimeEpoch: 1,
+        },
+      });
+      engine = await TaskEngine.loadAsync({
+        repository,
+        workspaceId: 'ws',
+        makeBackend: () => ({ name: 'fake', run: async function* () {} }),
+        runTurn: async function* (_backend, options) {
+          yield { type: 'assistantDelta', messageId: 'assistant-1', content: 'before shutdown' };
+          started();
+          await new Promise<void>((resolve) => {
+            if (options.signal?.aborted) resolve();
+            else options.signal?.addEventListener('abort', () => resolve(), { once: true });
+          });
+          // A misbehaving adapter may emit once after abort. The shutdown gate
+          // must ignore this late event rather than opening a new dirty window.
+          yield { type: 'assistantDelta', messageId: 'assistant-1', content: 'late' };
+        },
+        clock: () => '2026-07-16T00:00:02.000Z',
+      });
+
+      const runPromise = engine.resumeQueuedTurnAsync(task.id, 'stream-shutdown-turn');
+      await streaming;
+      await engine.shutdown();
+      await runPromise;
+
+      const messages = await repository.listMessages(task.id);
+      expect(messages.find((message) => message.id === 'stream-shutdown-turn:0')?.content).toBe(
+        'before shutdown',
+      );
+      await expect(repository.getTurn('stream-shutdown-turn')).resolves.toMatchObject({
+        status: 'interrupted',
+        interruptConfidence: 'forced',
+      });
+    } finally {
+      await engine?.shutdown().catch(() => undefined);
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });
     }

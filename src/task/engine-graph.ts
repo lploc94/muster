@@ -276,6 +276,13 @@ export interface GraphEngineDeps {
   clock?: () => string;
   /** Active in-process runs keyed by turnId. Handles expose abort controllers. */
   liveRuns: Map<string, { controller: AbortController }>;
+  /**
+   * Durable stream barrier supplied by TaskEngine. Graph transitions that
+   * mutate a locally-live turn must cross it before their own transaction.
+   */
+  flushPendingTranscript?: (
+    turnId: string,
+  ) => Promise<{ ok: true } | { ok: false; message: string }>;
   pendingAskPromises: Map<string, { promise: Promise<Answers>; fingerprint: string }>;
   onScheduleTurn: (turnId: string) => void;
   /** W5: rescan queued released turns after lifecycle/resource changes. */
@@ -442,6 +449,39 @@ async function executeGraphCommand(
       ? { deleteResourceClaimTurnIds: fences.deleteResourceClaimTurnIds }
       : {}),
   };
+
+  // A graph tool can settle/cancel a sibling, consume a remote cancel request,
+  // or stage an idle disposition on its own live turn (ask_parent). Persist the
+  // last coalescing window before that durable transition and before any later
+  // physical abort. Remote-owned turns have no local buffer in this process.
+  const localLiveTurnIds = new Set<string>();
+  for (const turn of changedTurns) {
+    const prior = before.turns[turn.id];
+    if (
+      prior &&
+      (prior.status === 'running' || prior.status === 'waiting_user') &&
+      deps.liveRuns.has(turn.id)
+    ) {
+      localLiveTurnIds.add(turn.id);
+    }
+  }
+  for (const turnId of deletedTurnIds) {
+    const prior = before.turns[turnId];
+    if (
+      prior &&
+      (prior.status === 'running' || prior.status === 'waiting_user') &&
+      deps.liveRuns.has(turnId)
+    ) {
+      localLiveTurnIds.add(turnId);
+    }
+  }
+  for (const turnId of localLiveTurnIds) {
+    const flushed = await deps.flushPendingTranscript?.(turnId);
+    if (flushed && !flushed.ok) {
+      return { ok: false, error: `transcript persistence failed: ${flushed.message}` };
+    }
+  }
+
   const persisted = await deps.repository.execute(command);
   if (persisted.conflict) return { ok: false, error: persisted.reason ?? 'opId conflict: different arguments' };
   if (persisted.changed === false && persisted.reason) return { ok: false, error: persisted.reason };
