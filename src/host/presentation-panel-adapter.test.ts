@@ -43,13 +43,13 @@ describe('presentation panel adapter', () => {
     const panel = fakePanel();
     const adapter = createPresentationPanelAdapter(host, panel, '/extension');
 
-    await adapter.update({ presentationId: 'plan.main', ownerTaskId: 'root', revision: 1, title: 'Plan', markdown: '# Plan' });
+    await adapter.update({ presentationId: 'plan.main', ownerTaskId: 'root', revision: 1, title: 'Plan', markdown: '# Plan' }, 'root');
 
     expect(panel.webview.html).toContain('/extension/dist/webview/assets/presentation.css');
     expect(panel.webview.html).toContain('presentation.js?v=0');
     expect(panel.webview.html).toContain('presentation.css?v=0');
     expect(panel.webview.html).not.toContain('?inline');
-    expect(panel.messages).toEqual([{ type: 'presentationUpdate', document: expect.objectContaining({ revision: 1 }) }]);
+    expect(panel.messages).toEqual([{ type: 'presentationUpdate', document: expect.objectContaining({ revision: 1 }), rootId: 'root' }]);
     expect(panel.title).toBe('Plan');
   });
 
@@ -91,8 +91,8 @@ describe('presentation panel adapter', () => {
     const revealLinkedChat = vi.fn().mockResolvedValue(true);
     const adapter = createPresentationPanelAdapter(host, panel, '/extension', undefined, revealLinkedChat);
 
-    expect(await adapter.update({ presentationId: 'p', ownerTaskId: 'restored-owner', revision: 1, title: 'T', markdown: 'M' })).toBe(true);
-    expect(await adapter.update({ presentationId: 'p', ownerTaskId: 'changed-owner', revision: 2, title: 'T2', markdown: 'M2' })).toBe(false);
+    expect(await adapter.update({ presentationId: 'p', ownerTaskId: 'restored-owner', revision: 1, title: 'T', markdown: 'M' }, 'root')).toBe(true);
+    expect(await adapter.update({ presentationId: 'p', ownerTaskId: 'changed-owner', revision: 2, title: 'T2', markdown: 'M2' }, 'root')).toBe(false);
     panel.receive({ type: 'revealLinkedChat' });
     await vi.waitFor(() => expect(revealLinkedChat).toHaveBeenCalledWith('restored-owner'));
   });
@@ -115,13 +115,13 @@ describe('presentation panel adapter', () => {
       markdown: '# Restored',
     };
 
-    expect(await adapter.update(document, 'root', { restore: true })).toBe(true);
+    expect(await adapter.update(document, 'root')).toBe(true);
     expect(panel.messages).toEqual([]);
 
     webviewReady = true;
     panel.receive({ type: 'presentationReady' });
     await vi.waitFor(() => expect(panel.messages).toEqual([
-      { type: 'presentationUpdate', document, rootId: 'root', restore: true },
+      { type: 'presentationUpdate', document, rootId: 'root' },
     ]));
 
     panel.messages.length = 0;

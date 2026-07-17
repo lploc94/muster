@@ -283,9 +283,7 @@ function currentStateLines(task: MusterTask | undefined, turns: readonly TaskTur
   if (task?.pendingParentQuestion) {
     lines.push('- pending parent question');
   }
-  if (typeof task?.result === 'string' && task.result.trim()) {
-    lines.push(`- last result: ${clip(task.result, 300)}`);
-  } else if (task?.taskResult?.summary) {
+  if (task?.taskResult?.summary) {
     lines.push(`- last result: ${clip(task.taskResult.summary, 300)}`);
   }
   if (typeof task?.error === 'string' && task.error.trim()) {
@@ -426,15 +424,4 @@ export function buildCompactContinuationContext(
   }
   while (output.length > 0 && output[output.length - 1] === '') output.pop();
   return output.join('\n');
-}
-
-/** Legacy v1 phases remain blocked only until store migration strips the record. */
-export function isActiveHandoffPhase(phase: unknown): boolean {
-  return typeof phase === 'string' && [
-    'requested',
-    'exporting_context',
-    'summarizing_source',
-    'preparing_receiver',
-    'transferring',
-  ].includes(phase);
 }

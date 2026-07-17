@@ -1,15 +1,13 @@
 import { spawn } from 'child_process';
-import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import { AskBridge } from '../src/bridge/ask-bridge';
 import { CredentialRegistry } from '../src/bridge/credentials';
 import { MusterBridgeServer } from '../src/bridge/server';
 import { deriveEntityId } from '../src/task/engine-graph';
 import { TaskEngine } from '../src/task/engine';
-import { TaskStore } from '../src/task/store';
 import { parseTaskTypeRegistry } from '../src/task/task-types';
 import type { Backend, BackendCapabilities, NormalizedEvent, RunOptions } from '../src/types';
+import { openScriptEngine } from './sqlite-engine-harness';
 
 const MCP_CAPS: BackendCapabilities = {
   supportsMCP: true,
@@ -37,8 +35,6 @@ async function runBridgeToolAgent(url: string, token: string, script: string): P
 }
 
 async function main(): Promise<void> {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-bridge-e2e-'));
-  const store = TaskStore.load({ filePath: path.join(dir, '.muster-tasks.json') });
   const credentials = new CredentialRegistry();
   const askBridge = new AskBridge({
     onRegister: (ref) => {
@@ -99,28 +95,23 @@ async function main(): Promise<void> {
   const taskTypes = parseTaskTypeRegistry({
     worker: { backend: 'grok', role: 'worker', briefKind: 'generic' },
   });
-  engine = TaskEngine.load({
-    store,
+  const harness = await openScriptEngine('muster-bridge-e2e-', {
     makeBackend: () => backend,
     askBridge,
     credentialRegistry: credentials,
     bridgePort: port,
     getTaskTypeRegistry: () => taskTypes,
   });
+  engine = harness.engine;
 
-  const created = engine.createTask({
-    id: 'coord',
+  const started = await engine.startNewTask({
     goal: 'Bridge e2e',
+    message: 'run bridge smoke',
     backend: 'grok',
     role: 'coordinator',
-    capabilities: ['create_child', 'start_child', 'wait_child', 'read_subtree'],
   });
-  if (!created.ok) throw new Error(created.reason);
-
-  const sent = engine.send('coord', 'run bridge smoke');
-  if (!sent.ok) throw new Error(sent.reason);
-  if (!sent.value?.turnId) throw new Error('send did not queue a coordinator turn');
-  const coordTurnId = sent.value.turnId;
+  if (!started.ok) throw new Error(started.reason);
+  const { taskId: coordTaskId, turnId: coordTurnId } = started.value;
   const childId = deriveEntityId(coordTurnId, 'd1', 'task');
   const continuationId = `${coordTurnId}-continuation`;
 
@@ -128,9 +119,8 @@ async function main(): Promise<void> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       await engine.whenIdle();
-      const file = store.getFile();
-      const child = file.tasks[childId];
-      const continuation = file.turns[continuationId];
+      const child = await harness.repository.getTask(childId);
+      const continuation = await harness.repository.getTurn(continuationId);
       if (child?.lifecycle === 'succeeded' && continuation?.status === 'succeeded') {
         return;
       }
@@ -141,9 +131,8 @@ async function main(): Promise<void> {
 
   await waitForGraph();
 
-  const file = store.getFile();
-  const child = file.tasks[childId];
-  const continuation = file.turns[continuationId];
+  const child = await harness.repository.getTask(childId);
+  const continuation = await harness.repository.getTurn(continuationId);
 
   const badRes = await fetch(`http://127.0.0.1:${port}/mcp`, {
     method: 'POST',
@@ -160,6 +149,7 @@ async function main(): Promise<void> {
   console.log('bad-token status:', badRes.status);
 
   await server.close();
+  await harness.close();
 
   if (!injectedMcp) throw new Error('MCP injection not verified');
   if (!coordInitialRan) throw new Error('coordinator initial bridge agent did not run');
@@ -171,6 +161,7 @@ async function main(): Promise<void> {
   }
   if (badRes.status === 200) throw new Error('bad token should be rejected');
   console.log('\n=== bridge smoke OK ===');
+  void coordTaskId;
 }
 
 main().catch((error) => {

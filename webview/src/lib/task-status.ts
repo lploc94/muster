@@ -272,21 +272,9 @@ export function getRuntimePresentation(
   return unknownPresentation(String(activity));
 }
 
-/**
- * Resolve presentation for a task summary (preferred) or a legacy single status string.
- */
 export function getTaskPresentation(
-  taskOrStatus:
-    | Pick<TaskSummary, 'lifecycle' | 'runtimeActivity' | 'viewStatus'>
-    | TaskViewStatus
-    | string
-    | null
-    | undefined,
+  taskOrStatus: Pick<TaskSummary, 'lifecycle' | 'runtimeActivity' | 'viewStatus'>,
 ): TaskStatusPresentation {
-  if (taskOrStatus == null || typeof taskOrStatus === 'string') {
-    return getTaskStatusPresentation(taskOrStatus);
-  }
-
   const lifecycleKey = isTaskLifecycleState(taskOrStatus.lifecycle)
     ? taskOrStatus.lifecycle
     : 'open';
@@ -338,10 +326,7 @@ export function getTaskPresentation(
   };
 }
 
-/**
- * Legacy single-axis lookup (viewStatus or raw string).
- * Prefer getTaskPresentation(task) when a TaskSummary is available.
- */
+/** Resolve a standalone current view status when no task summary is available. */
 export function getTaskStatusPresentation(
   status: TaskViewStatus | string | null | undefined,
 ): TaskStatusPresentation {

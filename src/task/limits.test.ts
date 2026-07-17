@@ -14,8 +14,7 @@ import type { TaskExecutionPolicy, TaskStoreFile } from './types';
 const BASE: TaskExecutionPolicy = {
   maxTurns: 50,
   maxAutomaticRetries: 2,
-  turnTimeoutMs: 300_000,
-  taskTimeoutMs: 1_800_000,
+  runTimeoutOverrideMs: 300_000,
 };
 
 describe('clampExecutionPolicy', () => {
@@ -23,8 +22,7 @@ describe('clampExecutionPolicy', () => {
     const requested: Partial<TaskExecutionPolicy> = {
       maxTurns: 10,
       maxAutomaticRetries: 3,
-      turnTimeoutMs: 60_000,
-      taskTimeoutMs: 600_000,
+      runTimeoutOverrideMs: 60_000,
     };
     expect(clampExecutionPolicy(BASE, requested)).toEqual(requested);
   });
@@ -37,26 +35,22 @@ describe('clampExecutionPolicy', () => {
     const clamped = clampExecutionPolicy(BASE, {
       maxTurns: 1_000_000,
       maxAutomaticRetries: 9_999,
-      turnTimeoutMs: 999_999_999,
-      taskTimeoutMs: 999_999_999,
+      runTimeoutOverrideMs: 999_999_999,
     });
     expect(clamped).toEqual({
       maxTurns: DEFAULT_EXECUTION_POLICY_BOUNDS.maxTurns,
       maxAutomaticRetries: DEFAULT_EXECUTION_POLICY_BOUNDS.maxAutomaticRetries,
-      turnTimeoutMs: DEFAULT_EXECUTION_POLICY_BOUNDS.maxTurnTimeoutMs,
-      taskTimeoutMs: DEFAULT_EXECUTION_POLICY_BOUNDS.maxTaskTimeoutMs,
+      runTimeoutOverrideMs: DEFAULT_EXECUTION_POLICY_BOUNDS.maxTurnTimeoutMs,
     });
   });
 
   it('raises below-minimum timeouts and turn budget up to the minima', () => {
     const clamped = clampExecutionPolicy(BASE, {
       maxTurns: 0,
-      turnTimeoutMs: 0,
-      taskTimeoutMs: 1,
+      runTimeoutOverrideMs: 0,
     });
     expect(clamped.maxTurns).toBe(1);
-    expect(clamped.turnTimeoutMs).toBe(DEFAULT_EXECUTION_POLICY_BOUNDS.minTurnTimeoutMs);
-    expect(clamped.taskTimeoutMs).toBe(DEFAULT_EXECUTION_POLICY_BOUNDS.minTaskTimeoutMs);
+    expect(clamped.runTimeoutOverrideMs).toBe(DEFAULT_EXECUTION_POLICY_BOUNDS.minTurnTimeoutMs);
     // Untouched fields still come from the trusted base.
     expect(clamped.maxAutomaticRetries).toBe(BASE.maxAutomaticRetries);
   });
@@ -65,21 +59,18 @@ describe('clampExecutionPolicy', () => {
     const strict: ExecutionPolicyBounds = {
       minTurnTimeoutMs: 5_000,
       maxTurnTimeoutMs: 10_000,
-      minTaskTimeoutMs: 5_000,
-      maxTaskTimeoutMs: 20_000,
       maxTurns: 3,
       maxAutomaticRetries: 1,
     };
     const clamped = clampExecutionPolicy(
       BASE,
-      { maxTurns: 100, turnTimeoutMs: 1_000_000, taskTimeoutMs: 1_000_000, maxAutomaticRetries: 100 },
+      { maxTurns: 100, runTimeoutOverrideMs: 1_000_000, maxAutomaticRetries: 100 },
       strict,
     );
     expect(clamped).toEqual({
       maxTurns: 3,
       maxAutomaticRetries: 1,
-      turnTimeoutMs: 10_000,
-      taskTimeoutMs: 20_000,
+      runTimeoutOverrideMs: 10_000,
     });
   });
 });

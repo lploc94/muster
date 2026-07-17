@@ -1,11 +1,8 @@
 import type { Question } from '../bridge/ask-bridge';
 import { deriveRuntimeActivity, deriveViewStatus } from '../task/derived-status';
 import { dependenciesBlockTask } from '../task/scheduler';
-import { sanitizeHandoffFailureMessage } from '../task/sanitization';
 import type {
   MusterTask,
-  TaskHandoffPhase,
-  TaskHandoffState,
   TaskLifecycleState,
   TaskMessageState,
   TaskRole,
@@ -37,33 +34,6 @@ export type TurnActivity =
   | { state: 'uncertain'; turnId: string; requiresConfirmation: true }
   | null;
 
-/**
- * Sanitized, task-scoped handoff chrome for the webview.
- * Never includes digests, summary/bootstrap bodies, session ids, or credentials.
- */
-export interface HandoffProgressBinding {
-  backend: string;
-  model?: string;
-}
-
-export interface HandoffProgressFailure {
-  code: string;
-  message: string;
-  at: string;
-}
-
-export interface HandoffProgress {
-  operationId: string;
-  phase: TaskHandoffPhase;
-  source: HandoffProgressBinding;
-  target: HandoffProgressBinding;
-  createdAt: string;
-  updatedAt: string;
-  startedAt?: string;
-  finishedAt?: string;
-  failure?: HandoffProgressFailure;
-}
-
 export interface TaskSummary {
   id: string;
   parentId: string | null;
@@ -92,12 +62,6 @@ export interface TaskSummary {
   /** Optional model id selected for this task (ACP session config option value). */
   model?: string;
   continuationOf?: string;
-  /**
-   * Optional sanitized handoff progress for model-switch chrome (D018 / §19).
-   * Omitted when the task has no handoff. Never carries digests, session ids,
-   * or summary/bootstrap bodies — those stay off TaskSummary and chat.
-   */
-  handoffProgress?: HandoffProgress;
   /**
    * Aggregate direct-child orchestration chrome for coordinators (P2).
    * Omitted when there are no children.
@@ -349,25 +313,6 @@ export function projectCurrentTurnActivity(file: TaskStoreFile, taskId: string):
   return { state: 'failed_turn', turnId: latest.id, retryable: true };
 }
 
-function projectHandoffBinding(binding: {
-  backend: string;
-  model?: string;
-}): HandoffProgressBinding {
-  return binding.model
-    ? { backend: binding.backend, model: binding.model }
-    : { backend: binding.backend };
-}
-
-/**
- * v2 switches are local and instantaneous — no multi-phase progress chrome.
- * Legacy v1 phase records are stripped on store load, so this always omits.
- */
-export function projectHandoffProgress(
-  _handoff: TaskHandoffState | undefined,
-): HandoffProgress | undefined {
-  return undefined;
-}
-
 function projectChildOrchestration(
   file: TaskStoreFile,
   parentId: string,
@@ -427,9 +372,6 @@ export function projectTaskSummary(file: TaskStoreFile, taskId: string): TaskSum
   }
   const turns = turnsForTask(file, taskId);
   const deps = depLifecyclesForTask(file, task);
-  const handoffProgress = projectHandoffProgress(
-    task.handoff?.version === 1 ? task.handoff : undefined,
-  );
   const childOrchestration =
     task.role === 'coordinator' ? projectChildOrchestration(file, taskId) : undefined;
   // Only the latest settled/live turn may present a run-timeout reason. Historical
@@ -459,7 +401,6 @@ export function projectTaskSummary(file: TaskStoreFile, taskId: string): TaskSum
     backend: task.backend,
     model: task.model,
     continuationOf: task.continuationOf,
-    ...(handoffProgress ? { handoffProgress } : {}),
     ...(childOrchestration ? { childOrchestration } : {}),
   };
 }

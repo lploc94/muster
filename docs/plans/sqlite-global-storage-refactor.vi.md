@@ -2,7 +2,7 @@
 
 ## Trạng thái
 
-**IN PROGRESS — chưa cutover production.**
+**IN PROGRESS — Phase 4 pagination/incremental wire chưa bắt đầu (P4-W3+).**
 Cập nhật: 2026-07-17
 
 - Phase 1: **đã qua gate** — worker/RPC, schema bootstrap, global-storage registry,
@@ -13,8 +13,11 @@ Cập nhật: 2026-07-17
 - Phase 3: **đã qua parity gate** — SQLite behavior suites, contention/replay/
   conflict/orphan/retention checks, bounded snapshot query, source-boundary audit và
   transcript benchmark đã chạy; entity/command matrices phản ánh trạng thái thực tế.
-- Phase 4 bắt đầu bằng **SQLite-only cutover + xóa legacy JSON path** theo quyết định
-  dev-phase ngày 2026-07-17. Không import dữ liệu cũ và không giữ backward compatibility.
+- Phase 4 dev-phase: **SQLite-only, no migration/no backward compatibility.**
+  - **P4-W1 ✅** SQLite-only activation cutover.
+  - **P4-W2 ✅** legacy storage/runtime API removed (JSON store, sync engine,
+    full-envelope migration/export, dual adapters). Current schema bootstrap only;
+    incompatible `user_version` fails closed with developer reset guidance.
   Kết quả Wave 10 được ghi tại
   [`sqlite-phase3-gate-evidence.vi.md`](./sqlite-phase3-gate-evidence.vi.md).
 
@@ -623,7 +626,7 @@ sau bắt đầu ngay khi wave trước đạt gate, chỉ dừng khi có blocke
 | Wave | Phạm vi | Gate chính |
 |---|---|---|
 | P4-W1 ✅ | SQLite-only activation cutover | Không tạo/đọc/ghi/watch `.muster-tasks.json`; probe là hard gate |
-| P4-W2 | Xóa legacy storage/runtime API | Không còn `JsonTaskRepository`, filesystem `TaskStore`, sync engine constructor hoặc full-envelope export |
+| P4-W2 ✅ | Xóa legacy storage/runtime API | Không còn `JsonTaskRepository`, filesystem `TaskStore`, sync engine constructor hoặc full-envelope export; **no migration/no backward compatibility** |
 | P4-W3 | Canonical cursor + SQL keyset page | SQLite query bounded `limit + 1`, không load full transcript |
 | P4-W4 | Bounded bootstrap | Snapshot focused task chỉ chứa 100 item + page metadata |
 | P4-W5 | Load older UX | Typed request/response, prepend idempotent, giữ scroll anchor |
@@ -646,12 +649,17 @@ database là hard gate và filesystem JSON watcher/path đã bị loại khỏi 
 
 ##### P4-W2 — Xóa legacy storage/runtime API
 
-- Xóa `JsonTaskRepository`, filesystem `TaskStore`, `LegacyStorePort`, sync execute/load và
-  session/data importer cũ.
-- Host reads đi qua named repository queries hoặc repository projection.
-- Markdown export query đúng task/subtree cần thiết, không gọi full-envelope API.
-- Test dùng SQLite repository hoặc fixture test chuyên biệt; không giữ production JSON
-  adapter chỉ để test tiện hơn.
+**Hoàn tất (2026-07-17): no migration / no backward compatibility.**
+
+- Đã xóa `JsonTaskRepository`, filesystem `TaskStore`, `LegacyStorePort`, sync
+  execute/load, session/data importer, `readEnvelopeForMigration`, full-envelope export.
+- Host reads/export đi qua named repository queries hoặc repository projection.
+- Schema hiện tại bootstrap trực tiếp; DB `user_version` khác bị reject và yêu cầu reset.
+- `releaseState` bắt buộc `draft | released`; outcome chỉ qua `taskResult`.
+- Presentation restore chỉ nhận envelope `{ rootId, document }`; markdown roots chỉ
+  `WorkspaceFolderRoot`; host/webview protocol chỉ shape hiện tại.
+- Test runtime dùng SQLite repository/current contract; coverage quan trọng đã port
+  sang `engine-repository` SQLite integration tests.
 
 ##### P4-W3 — Canonical cursor + SQL keyset page
 

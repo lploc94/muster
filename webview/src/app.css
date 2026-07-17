@@ -222,19 +222,6 @@ body {
   font-weight: 400;
 }
 
-/* Task-scoped model-switch progress (never chat). */
-.handoff-progress-bar {
-  min-width: 0;
-  max-width: min(52vw, 520px);
-  white-space: nowrap;
-}
-
-.handoff-progress-bar .turn-activity-bar__label {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 .turn-live-dot {
   width: 7px;
   height: 7px;

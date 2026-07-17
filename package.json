@@ -72,13 +72,6 @@
           "minimum": 1,
           "description": "Maximum persisted turns retained per completed task."
         },
-        "muster.retention.maxTurnsPerTask": {
-          "type": "number",
-          "default": 200,
-          "minimum": 1,
-          "deprecationMessage": "Use muster.retention.maxRetainedTurnsPerTask instead.",
-          "description": "Deprecated compatibility key for retained completed-task history."
-        },
         "muster.retention.maxStoredOutputChars": {
           "type": "number",
           "default": 200000,

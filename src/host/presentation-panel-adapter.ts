@@ -93,7 +93,6 @@ export function createPresentationPanelAdapter(
   let boundOwnerTaskId = ownerTaskId;
   let lastDocument: PresentationDocument | undefined;
   let lastRootId: string | undefined;
-  let lastRestore = false;
   let readyVersion = 0;
   panel.onDidDispose(() => { disposed = true; });
   panel.webview.onDidReceiveMessage((message: unknown) => {
@@ -101,8 +100,8 @@ export function createPresentationPanelAdapter(
     const data = message as Record<string, unknown>;
     if (Object.keys(data).length === 1 && data.type === 'presentationReady') {
       readyVersion += 1;
-      if (!disposed && lastDocument) {
-        void Promise.resolve(postPresentationUpdate(lastDocument, lastRootId, lastRestore)).catch(() => undefined);
+      if (!disposed && lastDocument && lastRootId) {
+        void Promise.resolve(postPresentationUpdate(lastDocument, lastRootId)).catch(() => undefined);
       }
       return;
     }
@@ -155,40 +154,31 @@ export function createPresentationPanelAdapter(
 
   function postPresentationUpdate(
     document: PresentationDocument,
-    rootId: string | undefined,
-    restore: boolean,
+    rootId: string,
   ): PromiseLike<boolean> {
-    const message: Record<string, unknown> = { type: 'presentationUpdate', document };
-    if (rootId !== undefined) message.rootId = rootId;
-    if (restore) message.restore = true;
-    return panel.webview.postMessage(message);
+    return panel.webview.postMessage({ type: 'presentationUpdate', document, rootId });
   }
 
   return {
     async update(
       document: PresentationDocument,
-      rootId?: string,
-      options?: { restore?: boolean },
+      rootId: string,
     ): Promise<boolean> {
       if (boundOwnerTaskId && document.ownerTaskId !== boundOwnerTaskId) {
-        if (!options?.restore) return false;
-        // Host-authorized restore migration may rebind owner once.
-        boundOwnerTaskId = document.ownerTaskId;
+        return false;
       }
       if (!boundOwnerTaskId) boundOwnerTaskId = document.ownerTaskId;
       const readyAtSend = readyVersion;
-      const restore = options?.restore === true;
-      const accepted = await postPresentationUpdate(document, rootId, restore);
+      const accepted = await postPresentationUpdate(document, rootId);
       if (accepted) {
         lastDocument = document;
-        if (rootId !== undefined) lastRootId = rootId;
-        lastRestore = restore;
+        lastRootId = rootId;
         try { panel.title = document.title; } catch { /* editor chrome is best-effort */ }
         // If readiness raced the initial delivery, its handler had no accepted
         // document to replay. Deliver once more now that the cache is bound.
         if (readyVersion !== readyAtSend && !disposed) {
           try {
-            await postPresentationUpdate(document, rootId, restore);
+            await postPresentationUpdate(document, rootId);
           } catch {
             // The original accepted delivery remains authoritative.
           }

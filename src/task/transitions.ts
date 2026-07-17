@@ -496,7 +496,6 @@ export function applySuccessfulTurn(
           next: {
             task: bumpTask(task, options.now, {
               taskResult,
-              result: taskResult.summary,
               outcomeProposal: {
                 kind: 'complete',
                 result: taskResult.summary,
@@ -521,7 +520,6 @@ export function applySuccessfulTurn(
           task: bumpTask(task, options.now, {
             lifecycle: 'succeeded',
             taskResult,
-            result: taskResult.summary,
             finishedAt: options.now,
             outcomeProposal: undefined,
             sealedBy,
@@ -664,7 +662,7 @@ function terminalPayloadMatches(
   options: { result?: string; error?: string; reason?: string },
 ): boolean {
   if (lifecycle === 'succeeded') {
-    const existing = task.taskResult?.summary ?? task.result ?? '';
+    const existing = task.taskResult?.summary ?? '';
     const next = options.result ?? '';
     return existing === next;
   }
@@ -680,7 +678,7 @@ function terminalPayloadMatches(
 /**
  * User (or authorized coordinator host path) sets task lifecycle explicitly.
  * Not driven by CLI process status.
- * Compatible terminal replay = exact payload equality → identity no-op (no sealedBy mutate).
+ * Idempotent terminal replay = exact payload equality → identity no-op (no sealedBy mutate).
  */
 export function setTaskLifecycle(
   task: MusterTask,
@@ -701,7 +699,7 @@ export function setTaskLifecycle(
   if (task.lifecycle === lifecycle) {
     if (isTerminalLifecycle(lifecycle)) {
       if (terminalPayloadMatches(task, lifecycle, options)) {
-        // Compatible replay: preserve sealedBy, revision, timestamps.
+        // Exact replay: preserve sealedBy, revision, timestamps.
         return { ok: true, next: task, effects: [] };
       }
       return { ok: false, reason: 'already_terminal' };
@@ -728,7 +726,7 @@ export function setTaskLifecycle(
   if (lifecycle === 'succeeded') {
     const fromProposal =
       task.outcomeProposal?.kind === 'complete' ? task.outcomeProposal.result : undefined;
-    const summary = options.result ?? fromProposal ?? task.result;
+    const summary = options.result ?? fromProposal ?? task.taskResult?.summary;
     const patch: Partial<MusterTask> = {
       lifecycle: 'succeeded',
       finishedAt: options.now,
@@ -740,7 +738,6 @@ export function setTaskLifecycle(
     if (summary !== undefined) {
       const taskResult = buildTaskResultFromSummary(summary, task.taskResult, options.verdict);
       patch.taskResult = taskResult;
-      patch.result = taskResult.summary;
     }
     return {
       ok: true,
@@ -1112,16 +1109,10 @@ function hasContinuationForWait(
   );
 }
 
-/**
- * Effective wakeOn for a children wait.
- * Missing field (legacy) → terminal only; new waits store both explicitly.
- */
+/** Wake events persisted with every children wait. */
 export function effectiveWaitWakeOn(
   wait: Extract<MusterTask['wait'], { kind: 'children' }>,
 ): Array<'terminal' | 'needs_attention'> {
-  if (!wait.wakeOn || wait.wakeOn.length === 0) {
-    return ['terminal'];
-  }
   return wait.wakeOn;
 }
 

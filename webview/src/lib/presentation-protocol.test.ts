@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   applyPresentationUpdate,
-  parsePersistedPresentation,
+  parsePersistedPresentationState,
   parsePresentationRevealRequest,
   parsePresentationRevealResult,
   parsePresentationUpdate,
@@ -41,47 +41,10 @@ describe('presentation browser protocol', () => {
       markdown: '# Ready',
     };
 
-    expect(parsePresentationUpdate({ type: 'presentationUpdate', document })).toEqual({ document });
-  });
-
-  it('accepts host restore migration that changes owner at same revision', () => {
-    const current = {
-      presentationId: 'release-notes',
-      ownerTaskId: 'child-1',
-      revision: 2,
-      title: 'Plan',
-      markdown: '# Body',
-    };
-    const migrated = {
-      ...current,
-      ownerTaskId: 'task-root',
-    };
-    expect(
-      applyPresentationUpdate(current, {
-        type: 'presentationUpdate',
-        document: migrated,
-        rootId: 'task-root',
-        restore: true,
-      }),
-    ).toEqual(migrated);
-    expect(
-      applyPresentationUpdate(current, {
-        type: 'presentationUpdate',
-        document: migrated,
-        rootId: 'task-root',
-      }),
-    ).toBe(current);
-    // restore cannot roll back to older revision
-    expect(
-      applyPresentationUpdate(
-        { ...migrated, revision: 3 },
-        {
-          type: 'presentationUpdate',
-          document: { ...migrated, revision: 2 },
-          restore: true,
-        },
-      ),
-    ).toEqual({ ...migrated, revision: 3 });
+    expect(parsePresentationUpdate({ type: 'presentationUpdate', document, rootId: 'task-root' })).toEqual({
+      document,
+      rootId: 'task-root',
+    });
   });
 
   it('accepts optional host and coordinator fields and envelope restore', () => {
@@ -102,11 +65,11 @@ describe('presentation browser protocol', () => {
       rootId: 'root-1',
     });
     expect(
-      parsePersistedPresentation({
+      parsePersistedPresentationState({
         rootId: 'root-1',
         document,
       }),
-    ).toEqual(document);
+    ).toEqual({ rootId: 'root-1', document });
     expect(
       parsePresentationUpdate({
         type: 'presentationUpdate',
@@ -125,9 +88,13 @@ describe('presentation browser protocol', () => {
       markdown: '# Restored',
     };
 
-    expect(parsePersistedPresentation(document)).toEqual(document);
-    expect(parsePersistedPresentation({ ...document, injected: true })).toBeUndefined();
-    expect(parsePersistedPresentation({ ...document, markdown: '' })).toBeUndefined();
+    expect(parsePersistedPresentationState(document)).toBeUndefined();
+    expect(parsePersistedPresentationState({ rootId: 'task-root', document })).toEqual({
+      rootId: 'task-root',
+      document,
+    });
+    expect(parsePersistedPresentationState({ rootId: 'task-root', document, injected: true })).toBeUndefined();
+    expect(parsePersistedPresentationState({ rootId: 'task-root', document: { ...document, markdown: '' } })).toBeUndefined();
   });
 
   it('rejects unknown message or document fields', () => {
@@ -140,9 +107,9 @@ describe('presentation browser protocol', () => {
       injected: true,
     };
 
-    expect(parsePresentationUpdate({ type: 'presentationUpdate', document })).toBeUndefined();
+    expect(parsePresentationUpdate({ type: 'presentationUpdate', document, rootId: 'task-root' })).toBeUndefined();
     expect(
-      parsePresentationUpdate({ type: 'presentationUpdate', document: { ...document, injected: undefined }, extra: true }),
+      parsePresentationUpdate({ type: 'presentationUpdate', document: { ...document, injected: undefined }, rootId: 'task-root', extra: true }),
     ).toBeUndefined();
   });
 
@@ -155,10 +122,10 @@ describe('presentation browser protocol', () => {
       markdown: '# Accepted body',
     };
     const rejected = [
-      { type: 'presentationUpdate', document: { ...current, revision: 3, markdown: '' } },
-      { type: 'presentationUpdate', document: { ...current, revision: 2, title: 'Stale title' } },
-      { type: 'presentationUpdate', document: { ...current, revision: 3, presentationId: 'other' } },
-      { type: 'presentationUpdate', document: { ...current, revision: 3, ownerTaskId: 'other-task' } },
+      { type: 'presentationUpdate', document: { ...current, revision: 3, markdown: '' }, rootId: 'task-root' },
+      { type: 'presentationUpdate', document: { ...current, revision: 2, title: 'Stale title' }, rootId: 'task-root' },
+      { type: 'presentationUpdate', document: { ...current, revision: 3, presentationId: 'other' }, rootId: 'task-root' },
+      { type: 'presentationUpdate', document: { ...current, revision: 3, ownerTaskId: 'other-task' }, rootId: 'task-root' },
     ];
 
     for (const message of rejected) {
@@ -186,7 +153,7 @@ describe('presentation browser protocol', () => {
       markdown: '# Ready',
       ...(typeof value === 'object' && value !== null ? value : {}),
     };
-    const message = value === null ? null : { type: 'presentationUpdate', document };
+    const message = value === null ? null : { type: 'presentationUpdate', document, rootId: 'task-root' };
 
     expect(parsePresentationUpdate(message)).toBeUndefined();
   });

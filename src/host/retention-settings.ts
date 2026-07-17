@@ -9,8 +9,6 @@ export type RuntimeStorageSettingId =
   | 'runLimit'
   | 'maxRetainedTurnsPerTask'
   | 'maxStoredOutputChars';
-/** Compatibility export for existing host/webview plumbing. */
-export type RetentionSettingId = RuntimeStorageSettingId;
 
 export type RuntimeStorageSettingErrorCode =
   | 'unknownSetting'
@@ -20,7 +18,6 @@ export type RuntimeStorageSettingErrorCode =
   | 'nonInteger'
   | 'belowMinimum'
   | 'updateFailed';
-export type RetentionSettingErrorCode = RuntimeStorageSettingErrorCode;
 
 interface EnumDefinition {
   kind: 'enum';
@@ -43,17 +40,14 @@ interface NumberDefinition {
 }
 
 export type RuntimeStorageSettingDefinition = EnumDefinition | NumberDefinition;
-export type RetentionSettingDefinition = RuntimeStorageSettingDefinition;
 
 export type RuntimeStorageSettingValue =
   | (Omit<EnumDefinition, 'configKey'> & { value: RunLimitSetting })
   | (Omit<NumberDefinition, 'configKey'> & { value: number });
-export type RetentionSettingValue = RuntimeStorageSettingValue;
 
 export interface RuntimeStorageSettingsSnapshot {
   settings: RuntimeStorageSettingValue[];
 }
-export type RetentionSettingSnapshot = RuntimeStorageSettingsSnapshot;
 
 export type RuntimeStorageSettingsValidationResult =
   | { ok: true; settingId: 'runLimit'; value: RunLimitSetting }
@@ -124,21 +118,6 @@ export const RUNTIME_STORAGE_SETTING_DEFINITIONS: RuntimeStorageSettingDefinitio
     minimum: outputProperty.minimum,
   },
 ];
-export const RETENTION_SETTING_DEFINITIONS = RUNTIME_STORAGE_SETTING_DEFINITIONS;
-
-/** New explicit value wins; legacy explicit value is the one-release fallback. */
-export function selectRetainedTurnsValue(
-  nextExplicit: unknown,
-  legacyExplicit: unknown,
-  configuredDefault: unknown,
-): unknown {
-  return nextExplicit !== undefined
-    ? nextExplicit
-    : legacyExplicit !== undefined
-      ? legacyExplicit
-      : configuredDefault;
-}
-
 export function isRetentionSettingId(value: unknown): value is RuntimeStorageSettingId {
   return value === 'runLimit' ||
     value === 'maxRetainedTurnsPerTask' ||

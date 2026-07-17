@@ -74,8 +74,7 @@ export interface PresentationDocument {
 export interface PresentationPanel {
   update(
     document: PresentationDocument,
-    rootId?: string,
-    options?: { restore?: boolean },
+    rootId: string,
   ): Promise<boolean>;
   reveal(): void;
   dispose(): void;
@@ -103,15 +102,9 @@ export function configurePresentationPanel<T extends { dispose(): void }, R>(
   }
 }
 
-/** Nested envelope preferred; flat legacy still accepted on restore. */
 export interface PersistedPresentationState {
   rootId: string;
   document: PresentationDocument;
-}
-
-/** @deprecated flat shape — still accepted on restore for migration */
-export interface PersistedPresentationDocument extends PresentationDocument {
-  rootId: string;
 }
 
 export type PresentationResult =
@@ -205,22 +198,14 @@ function parseDocumentFields(raw: Record<string, unknown>): PresentationDocument
 function parsePersistedState(value: unknown): PersistedPresentationState | undefined {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
   const raw = value as Record<string, unknown>;
-  if ('document' in raw && 'rootId' in raw) {
-    if (Object.keys(raw).some((k) => k !== 'rootId' && k !== 'document')) return undefined;
-    if (!isStableId(raw.rootId)) return undefined;
-    if (typeof raw.document !== 'object' || raw.document === null || Array.isArray(raw.document)) {
-      return undefined;
-    }
-    const document = parseDocumentFields(raw.document as Record<string, unknown>);
-    if (!document) return undefined;
-    return { rootId: raw.rootId, document };
-  }
-  // Flat legacy
+  if (Object.keys(raw).some((k) => k !== 'rootId' && k !== 'document')) return undefined;
   if (!isStableId(raw.rootId)) return undefined;
-  const { rootId, ...rest } = raw;
-  const document = parseDocumentFields(rest as Record<string, unknown>);
+  if (typeof raw.document !== 'object' || raw.document === null || Array.isArray(raw.document)) {
+    return undefined;
+  }
+  const document = parseDocumentFields(raw.document as Record<string, unknown>);
   if (!document) return undefined;
-  return { rootId: rootId as string, document };
+  return { rootId: raw.rootId, document };
 }
 
 /** Fingerprint coordinator-owned fields only (excludes host stamps). */
@@ -306,7 +291,7 @@ export class PresentationManager {
 
   constructor(private readonly factory: PresentationPanelFactory) {}
 
-  /** Optional: map child owner → root coordinator id for legacy restore migration. */
+  /** Resolve an owner task to its authenticated root during restore validation. */
   setOwnerResolver(resolver: OwnerResolver | undefined): void {
     this.ownerResolver = resolver;
   }
@@ -463,18 +448,13 @@ export class PresentationManager {
     if (!parsed) {
       return { ok: false, code: 'restore_rejected' };
     }
-    let { rootId, document } = parsed;
-    let migrated = false;
+    const { rootId, document } = parsed;
 
     // When resolver is wired: require owner maps to the envelope rootId (fail closed).
     if (this.ownerResolver) {
       const resolved = this.ownerResolver(document.ownerTaskId);
       if (!resolved || resolved !== rootId) {
         return { ok: false, code: 'restore_rejected' };
-      }
-      if (resolved !== document.ownerTaskId) {
-        document = { ...document, ownerTaskId: resolved };
-        migrated = true;
       }
     }
 
@@ -494,8 +474,7 @@ export class PresentationManager {
     this.panels.set(key, entry);
     let accepted = false;
     try {
-      // restore:true only when owner was migrated so webview can rebind at same revision.
-      accepted = await panel.update(document, rootId, migrated ? { restore: true } : undefined);
+      accepted = await panel.update(document, rootId);
     } catch {
       // Persisted content and host errors must never cross this boundary.
     }

@@ -6,9 +6,8 @@
  * topic registry — host save contracts remain explicit per config surface.
  * Errors and raw host failure payloads are never stored in the envelope.
  *
- * v3 adopts the four-domain product taxonomy (Agents / Execution / Connections /
- * Data). Only actionable domains render, so persisted navigation uses the
- * rendered domain ids and legacy v1/v2 topic ids are migrated on restore.
+ * Only the current envelope and rendered domain ids are accepted. Development
+ * builds intentionally discard stale webview state instead of migrating it.
  */
 
 import type {
@@ -25,26 +24,10 @@ import type {
 import { isSettingsTopicId, type SettingsTopicId } from './settings-topics';
 
 /** Nested key under the shared vscode webview state bag. */
-export const SETTINGS_VIEW_STATE_KEY = 'muster.settingsView.v1';
+export const SETTINGS_VIEW_STATE_KEY = 'muster.settingsView.v3';
 
-/** Envelope version — bump only with a coordinated migration. */
+/** Exact envelope version; stale versions are rejected. */
 export const SETTINGS_VIEW_STATE_VERSION = 3 as const;
-
-/**
- * Legacy (v1/v2) flat topic ids mapped to the rendered v3 product domain.
- * Task Types → Agents; Permissions → Execution (Tool access); Runtime & Storage →
- * Data (History/Outputs; the runLimit control also lives under Execution but the
- * saved domain id for a Runtime & Storage tab is Data). Models and CLIs / Context
- * and MCP were non-actionable placeholders; both fall back to Agents because
- * Connections is not a rendered domain yet.
- */
-const LEGACY_TOPIC_ID_MIGRATION: Readonly<Record<string, SettingsTopicId>> = {
-  'task-types': 'agents',
-  permissions: 'execution',
-  retention: 'data',
-  'models-and-clis': 'agents',
-  'context-and-mcp': 'agents',
-};
 
 /** Bounds aligned with host task-type constraints (fail closed on restore). */
 export const SETTINGS_TASK_TYPE_DRAFT_MAX = 32;
@@ -223,27 +206,6 @@ export function createDefaultSettingsViewState(): SettingsViewState {
   };
 }
 
-/**
- * Resolve a persisted active-topic id to a rendered v3 domain. A v3 envelope
- * accepts only current domain ids; v1/v2 envelopes migrate only the five known
- * legacy topic ids. Everything else is rejected fail-closed.
- */
-function resolveActiveTopicId(
-  raw: unknown,
-  version: 1 | 2 | typeof SETTINGS_VIEW_STATE_VERSION,
-): SettingsTopicId | null {
-  if (version === SETTINGS_VIEW_STATE_VERSION) {
-    return isSettingsTopicId(raw) ? raw : null;
-  }
-  if (
-    typeof raw === 'string' &&
-    Object.prototype.hasOwnProperty.call(LEGACY_TOPIC_ID_MIGRATION, raw)
-  ) {
-    return LEGACY_TOPIC_ID_MIGRATION[raw] ?? null;
-  }
-  return null;
-}
-
 function parseRuntimeStorageSettingIds(raw: unknown): RuntimeStorageSettingId[] | null {
   if (!Array.isArray(raw)) return null;
   const out: RuntimeStorageSettingId[] = [];
@@ -296,9 +258,8 @@ export function cloneRetentionDrafts(drafts: RetentionDrafts): RetentionDrafts {
  */
 export function parseSettingsViewState(raw: unknown): SettingsViewState | null {
   if (!isRecord(raw)) return null;
-  if (raw.v !== SETTINGS_VIEW_STATE_VERSION && raw.v !== 1 && raw.v !== 2) return null;
-  const activeTopicId = resolveActiveTopicId(raw.activeTopicId, raw.v);
-  if (activeTopicId === null) return null;
+  if (raw.v !== SETTINGS_VIEW_STATE_VERSION || !isSettingsTopicId(raw.activeTopicId)) return null;
+  const activeTopicId = raw.activeTopicId;
 
   const state: SettingsViewState = {
     v: SETTINGS_VIEW_STATE_VERSION,
@@ -312,23 +273,13 @@ export function parseSettingsViewState(raw: unknown): SettingsViewState | null {
   }
 
   if ('retentionDrafts' in raw) {
-    const legacyDrafts = raw.v === 1 && isRecord(raw.retentionDrafts)
-      ? {
-          ...raw.retentionDrafts,
-          runLimit: '',
-          maxRetainedTurnsPerTask:
-            typeof raw.retentionDrafts.maxTurnsPerTask === 'string'
-              ? raw.retentionDrafts.maxTurnsPerTask
-              : '',
-        }
-      : raw.retentionDrafts;
-    const drafts = parseRetentionDrafts(legacyDrafts);
+    const drafts = parseRetentionDrafts(raw.retentionDrafts);
     if (!drafts) return null;
     state.retentionDrafts = drafts;
   }
 
   if ('retentionDirtySettingIds' in raw) {
-    if (raw.v !== SETTINGS_VIEW_STATE_VERSION || !state.retentionDrafts) return null;
+    if (!state.retentionDrafts) return null;
     const ids = parseRuntimeStorageSettingIds(raw.retentionDirtySettingIds);
     if (!ids) return null;
     state.retentionDirtySettingIds = ids;
@@ -501,13 +452,8 @@ export function isPermissionDraftDirty(
  * "Dirty" is measured against `prevSnapshot` (the last saved snapshot the drafts
  * were hydrated from) — a field whose draft still matches the previously saved
  * value is pristine and refreshes; a field the user changed away from it is
- * preserved. On the first snapshot after restore, v3 dirty-field metadata makes
- * the same decision without a prior in-memory snapshot; legacy envelopes without
- * that metadata are preserved conservatively.
- *
- * The v1-migration special case is preserved: a blank `runLimit` left behind by
- * an old envelope is treated as absent data and hydrates once from the host even
- * though it differs from any previously saved value.
+ * preserved. On the first snapshot after restore, dirty-field metadata makes
+ * the same decision without a prior in-memory snapshot.
  */
 export function applyRuntimeStorageSnapshotToDrafts(
   current: RetentionDrafts | null | undefined,
@@ -534,12 +480,7 @@ export function applyRuntimeStorageSnapshotToDrafts(
 
     let fieldDirty: boolean;
     if (!prevSnapshot) {
-      // A v3 envelope records the exact dirty field ids so pristine siblings can
-      // take a fresh host value on the first snapshot after hide/reveal. Older
-      // envelopes lack that metadata; preserve their fields conservatively.
-      fieldDirty = restoredDirtySettingIds
-        ? restoredDirtySettingIds.includes(setting.id)
-        : draft !== undefined;
+      fieldDirty = restoredDirtySettingIds?.includes(setting.id) ?? false;
     } else {
       // Incidental refresh: a field is pristine when its draft still equals the
       // value it was last hydrated from (prevSnapshot). Pristine fields take the
@@ -551,10 +492,6 @@ export function applyRuntimeStorageSnapshotToDrafts(
     if (!fieldDirty) {
       next[setting.id] = incoming;
       continue;
-    }
-    // Dirty field is preserved, except the migration-blank runtime enum.
-    if (setting.id === 'runLimit' && draft.trim() === '') {
-      next.runLimit = incoming;
     }
   }
   return next;

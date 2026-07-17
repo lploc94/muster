@@ -6,12 +6,12 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   applyPragmas,
   ForeignDatabaseError,
-  migrateToLatest,
+  IncompatibleSchemaError,
+  initializeCurrentSchema,
   openStoreDatabase,
-  SchemaTooNewError,
   verifyOrStampApplicationId,
 } from './connection';
-import { MUSTER_APPLICATION_ID, SCHEMA_V1_STATEMENTS, SQLITE_SCHEMA_VERSION } from './schema';
+import { MUSTER_APPLICATION_ID, SQLITE_SCHEMA_VERSION } from './schema';
 
 const tempDirs: string[] = [];
 
@@ -33,7 +33,7 @@ function scalar(db: DatabaseSync, pragma: string): number {
 }
 
 describe('openStoreDatabase', () => {
-  it('creates the file, stamps application_id, and migrates to the latest schema', () => {
+  it('creates the file, stamps application_id, and initializes the current schema', () => {
     const dbPath = tempDbPath();
     const db = openStoreDatabase({ path: dbPath });
     try {
@@ -52,7 +52,7 @@ describe('openStoreDatabase', () => {
       expect(tables).toContain('tool_calls');
       expect(tables).toContain('reasoning_segments');
       expect(tables).toContain('change_log');
-      expect(tables).toContain('migration_state');
+      expect(tables).not.toContain('migration_state');
       expect(tables).toContain('turn_inputs');
       expect(tables).toContain('session_claims');
       expect(tables).toContain('resource_claims');
@@ -72,7 +72,7 @@ describe('openStoreDatabase', () => {
     }
   });
 
-  it('reopening an existing store is a no-op migration', () => {
+  it('reopening a current store is a no-op', () => {
     const dbPath = tempDbPath();
     const first = openStoreDatabase({ path: dbPath });
     first.close();
@@ -82,6 +82,29 @@ describe('openStoreDatabase', () => {
       expect(scalar(second, 'application_id')).toBe(MUSTER_APPLICATION_ID);
     } finally {
       second.close();
+    }
+  });
+
+  it('rejects tasks that do not match the current release-state contract', () => {
+    const db = openStoreDatabase({ path: tempDbPath() });
+    try {
+      db.prepare(
+        `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
+         VALUES (?,?,?,?,?)`,
+      ).run('ws-current', 'current-contract', 'Current', 'now', 'now');
+      const insert = db.prepare(
+        `INSERT INTO tasks
+         (id, workspace_id, role, lifecycle, release_state, goal, backend, revision, created_at, updated_at, payload_json)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+      );
+      expect(() => insert.run(
+        'missing-release', 'ws-current', 'worker', 'open', null, 'g', 'grok', 0, 'now', 'now', '{}',
+      )).toThrow(/NOT NULL/);
+      expect(() => insert.run(
+        'invalid-release', 'ws-current', 'worker', 'open', 'legacy', 'g', 'grok', 0, 'now', 'now', '{}',
+      )).toThrow(/CHECK constraint/);
+    } finally {
+      db.close();
     }
   });
 });
@@ -95,10 +118,10 @@ describe('foreign_keys enforcement', () => {
         db
           .prepare(
             `INSERT INTO tasks
-             (id, workspace_id, role, lifecycle, goal, backend, revision, created_at, updated_at, payload_json)
-             VALUES (?,?,?,?,?,?,?,?,?,?)`,
+             (id, workspace_id, role, lifecycle, release_state, goal, backend, revision, created_at, updated_at, payload_json)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
           )
-          .run('t1', 'ghost-ws', 'worker', 'open', 'g', 'grok', 0, 'now', 'now', '{}'),
+          .run('t1', 'ghost-ws', 'worker', 'open', 'draft', 'g', 'grok', 0, 'now', 'now', '{}'),
       ).toThrow();
     } finally {
       db.close();
@@ -114,9 +137,9 @@ describe('foreign_keys enforcement', () => {
       ).run('ws1', 'key1', 'WS', 'now', 'now');
       db.prepare(
         `INSERT INTO tasks
-         (id, workspace_id, role, lifecycle, goal, backend, revision, created_at, updated_at, payload_json)
-         VALUES (?,?,?,?,?,?,?,?,?,?)`,
-      ).run('t1', 'ws1', 'worker', 'open', 'g', 'grok', 0, 'now', 'now', '{}');
+         (id, workspace_id, role, lifecycle, release_state, goal, backend, revision, created_at, updated_at, payload_json)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+      ).run('t1', 'ws1', 'worker', 'open', 'draft', 'g', 'grok', 0, 'now', 'now', '{}');
       db.prepare(
         `INSERT INTO turns
          (id, workspace_id, task_id, sequence, status, trigger, created_at, payload_json)
@@ -145,9 +168,9 @@ describe('composite identity', () => {
         ).run(ws, `key-${ws}`, ws, 'now', 'now');
         db.prepare(
           `INSERT INTO tasks
-           (id, workspace_id, role, lifecycle, goal, backend, revision, created_at, updated_at, payload_json)
-           VALUES (?,?,?,?,?,?,?,?,?,?)`,
-        ).run('shared-id', ws, 'worker', 'open', 'g', 'grok', 0, 'now', 'now', '{}');
+           (id, workspace_id, role, lifecycle, release_state, goal, backend, revision, created_at, updated_at, payload_json)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+        ).run('shared-id', ws, 'worker', 'open', 'draft', 'g', 'grok', 0, 'now', 'now', '{}');
       }
       const rows = db.prepare('SELECT workspace_id FROM tasks WHERE id=?').all('shared-id');
       expect(rows).toHaveLength(2);
@@ -169,54 +192,37 @@ describe('verifyOrStampApplicationId', () => {
   });
 });
 
-describe('migrateToLatest', () => {
-  it('upgrades a populated v1 database to v2 without rewriting legacy rows', () => {
+describe('initializeCurrentSchema', () => {
+  it('refuses an older schema instead of migrating its data', () => {
     const db = new DatabaseSync(tempDbPath());
     try {
       applyPragmas(db, 5000);
       verifyOrStampApplicationId(db);
-      db.exec('BEGIN IMMEDIATE');
-      for (const statement of SCHEMA_V1_STATEMENTS) db.exec(statement);
       db.exec('PRAGMA user_version = 1');
-      db.exec('COMMIT');
-      db.prepare(
-        `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
-         VALUES (?,?,?,?,?)`,
-      ).run('ws', 'identity', 'Workspace', 'now', 'now');
-      db.prepare(
-        `INSERT INTO tasks
-         (id, workspace_id, role, lifecycle, goal, backend, revision, created_at, updated_at, payload_json)
-         VALUES (?,?,?,?,?,?,?,?,?,?)`,
-      ).run('task', 'ws', 'worker', 'open', 'goal', 'codex', 0, 'now', 'now', '{"legacy":true}');
-      migrateToLatest(db);
-      expect(scalar(db, 'user_version')).toBe(SQLITE_SCHEMA_VERSION);
-      expect((db.prepare('SELECT COUNT(*) AS n FROM tasks').get() as { n: number }).n).toBe(1);
-      expect((db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='turn_inputs'").get() as { name: string }).name).toBe('turn_inputs');
+      expect(() => initializeCurrentSchema(db)).toThrow(IncompatibleSchemaError);
+      expect(scalar(db, 'user_version')).toBe(1);
     } finally {
       db.close();
     }
   });
 
-  it('refuses a schema newer than supported', () => {
+  it('refuses a schema newer than current', () => {
     const db = new DatabaseSync(tempDbPath());
     try {
       applyPragmas(db, 5000);
       db.exec(`PRAGMA user_version = ${SQLITE_SCHEMA_VERSION + 1}`);
-      expect(() => migrateToLatest(db)).toThrow(SchemaTooNewError);
+      expect(() => initializeCurrentSchema(db)).toThrow(IncompatibleSchemaError);
     } finally {
       db.close();
     }
   });
 
-  it('rolls back cleanly and leaves user_version at 0 on DDL failure', () => {
-    // Simulate a torn migration: inject a broken statement is not directly possible
-    // via the public API, so instead assert the invariant that a fresh DB with a
-    // failed transaction keeps version 0 (no partial version bump).
+  it('initializes a fresh database atomically', () => {
     const db = new DatabaseSync(tempDbPath());
     try {
       applyPragmas(db, 5000);
       expect(scalar(db, 'user_version')).toBe(0);
-      migrateToLatest(db);
+      initializeCurrentSchema(db);
       expect(scalar(db, 'user_version')).toBe(SQLITE_SCHEMA_VERSION);
     } finally {
       db.close();

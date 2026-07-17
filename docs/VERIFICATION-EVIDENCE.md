@@ -14,7 +14,7 @@ The ledger is intentionally bounded to files and commands that can be reviewed o
 - `src/extension.ts`
 - `src/backends/claude.ts`
 - `src/runner.ts`
-- `src/task/store.ts`
+- `src/task/repository.ts`
 - `src/types.ts`
 - `mcp/muster-ask-server.mjs`
 
@@ -26,7 +26,7 @@ The ledger is intentionally bounded to files and commands that can be reviewed o
 | `1d35583d-5aa1-465b-a82f-b73e845f7b12` | Integration proof | `.github/workflows/ci.yml` | The CI workflow contract installs with `npm ci` and invokes `npm test` on `main` push and pull request events. | Proves tracked workflow shape, not remote runner outcome. |
 | `19e55c63-33c2-4f7a-850a-d3995078c926` | Operational proof | `scripts/source-boundary-smoke.mjs`, `node scripts/source-boundary-smoke.mjs` | The smoke checker emits actionable diagnostics for missing source-boundary files, malformed JSON, CI drift, missing command wiring, and unsupported runtime-scope phrases. | Proves local diagnostic behavior. |
 | `c926e218-ec60-4024-8a7c-fda53d5e8bb1` | Artifact-driven UAT proof | `scripts/source-boundary-smoke.test.mjs`, `node --test scripts/source-boundary-smoke.test.mjs` | Fixture tests cover accepted source-boundary shape and negative drift cases without requiring live services. | Proves artifact behavior under local fixtures. |
-| `64f78de1-e31f-425b-ac37-69f3a9ceafb8` | Contract proof | `src/extension.ts`, `src/backends/claude.ts`, `src/runner.ts`, `src/task/store.ts`, `src/types.ts`, `mcp/muster-ask-server.mjs` | Source references preserve extension wiring, backend delegation, normalized event contracts, task-store boundaries, and MCP bridge runtime dependency declaration. | Proves source-level boundaries only. |
+| `64f78de1-e31f-425b-ac37-69f3a9ceafb8` | Contract proof | `src/extension.ts`, `src/backends/claude.ts`, `src/runner.ts`, `src/task/repository.ts`, `src/types.ts`, `mcp/muster-ask-server.mjs` | Source references preserve extension wiring, backend delegation, normalized event contracts, SQLite repository boundaries, and MCP bridge runtime dependency declaration. | Proves source-level boundaries only. |
 
 Executable command references for this ledger are `npm test`, `npm run test:source-boundary`, `node scripts/source-boundary-smoke.mjs`, `node --test scripts/source-boundary-smoke.test.mjs`, and `node --test scripts/verify-verification-evidence.test.mjs`.
 

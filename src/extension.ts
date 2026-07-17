@@ -37,7 +37,6 @@ import {
   handleRetentionSettingUpdateAction,
   type RuntimeStorageSettingsSnapshot,
   type RuntimeStorageSettingId,
-  selectRetainedTurnsValue,
 } from './host/retention-settings';
 import {
   TASK_TYPES_CONFIG_KEY,
@@ -65,8 +64,8 @@ import {
   type FileMentionSuggestionsRequest,
 } from './host/file-mention-suggestions';
 import {
-  routeDeleteQueuedTurnAsync,
-  routeEditQueuedTurnAsync,
+  routeDeleteQueuedTurn,
+  routeEditQueuedTurn,
 } from './host/queued-turn-mutations';
 import { routeExportTask } from './host/task-export-route';
 import { routeRuntimeHandoff } from './host/runtime-handoff-route';
@@ -310,9 +309,8 @@ function explicitConfigurationValue<T>(
 
 function readRetainedTurnsValue(): unknown {
   const config = vscode.workspace.getConfiguration('muster.retention');
-  const next = explicitConfigurationValue<number>(config.inspect('maxRetainedTurnsPerTask'));
-  const legacy = explicitConfigurationValue<number>(config.inspect('maxTurnsPerTask'));
-  return selectRetainedTurnsValue(next, legacy, config.get('maxRetainedTurnsPerTask'));
+  return explicitConfigurationValue<number>(config.inspect('maxRetainedTurnsPerTask')) ??
+    config.get('maxRetainedTurnsPerTask');
 }
 
 function runtimeStorageConfiguration() {
@@ -331,24 +329,6 @@ function runtimeStorageConfiguration() {
       await configuration.update(key, value, target as vscode.ConfigurationTarget);
     },
   };
-}
-
-async function migrateLegacyRetentionSetting(): Promise<void> {
-  const config = vscode.workspace.getConfiguration('muster.retention');
-  if (explicitConfigurationValue(config.inspect('maxRetainedTurnsPerTask')) !== undefined) return;
-  const legacyInspect = config.inspect<number>('maxTurnsPerTask');
-  const candidates: Array<[number | undefined, vscode.ConfigurationTarget]> = [
-    [legacyInspect?.workspaceFolderValue, vscode.ConfigurationTarget.WorkspaceFolder],
-    [legacyInspect?.workspaceValue, vscode.ConfigurationTarget.Workspace],
-    [legacyInspect?.globalValue, vscode.ConfigurationTarget.Global],
-  ];
-  const explicit = candidates.find(([value]) => value !== undefined);
-  if (!explicit) return;
-  try {
-    await config.update('maxRetainedTurnsPerTask', explicit[0], explicit[1]);
-  } catch {
-    // One-release read fallback above preserves the old value if migration cannot write.
-  }
 }
 
 function getRetentionConfig(): RetentionConfig {
@@ -2012,7 +1992,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           // R013: edit undispatched queued follow-up by turn identity.
           // Validate + engine.editQueuedTurn only; never continueTask fallthrough.
           const engine = taskEngine;
-          const outcome = await routeEditQueuedTurnAsync(data, {
+          const outcome = await routeEditQueuedTurn(data, {
             engineReady: Boolean(engine),
             editQueuedTurn: async (taskId, turnId, content) => {
               if (!engine) {
@@ -2033,7 +2013,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           // R013: remove undispatched queued follow-up by turn identity.
           // Validate + engine.deleteQueuedTurn only; never cancelProcess.
           const engine = taskEngine;
-          const outcome = await routeDeleteQueuedTurnAsync(data, {
+          const outcome = await routeDeleteQueuedTurn(data, {
             engineReady: Boolean(engine),
             deleteQueuedTurn: async (taskId, turnId) => {
               if (!engine) {
@@ -2511,7 +2491,6 @@ function resolveCurrentWorkspaceIdentity(context: vscode.ExtensionContext) {
 }
 
 export async function activate(context: vscode.ExtensionContext) {
-  await migrateLegacyRetentionSetting();
   // Patch PATH from the login shell BEFORE anything spawns a backend CLI, so a
   // GUI-launched editor (minimal PATH) can both detect and actually run the CLIs.
   await installAugmentedPath();

@@ -14,9 +14,8 @@ import type { NormalizedEvent, Question } from './types';
 export const PROTOCOL_VERSION = 5;
 
 /**
- * Decide whether a peer's advertised protocol version is compatible with ours.
- * Same integer => compatible. A different version OR an absent/non-numeric one
- * (an old peer that predates version stamping) => incompatible, so the caller
+ * Require an exact peer protocol version. A different or malformed version
+ * is rejected so the caller
  * can surface a visible "reload the window" diagnostic instead of silently
  * proceeding against a drifted peer. Pure and side-effect free (unit-tested).
  */
@@ -42,7 +41,7 @@ export type TaskRuntimeActivity =
   | 'awaiting_outcome';
 
 /**
- * Compact single-axis status (host still sends for compatibility).
+ * Compact single-axis status used by the current summary contract.
  * Prefer lifecycle + runtimeActivity for UI.
  */
 export type TaskViewStatus = TaskLifecycleState | TaskRuntimeActivity;
@@ -69,46 +68,6 @@ export type TurnActivity =
   | { state: 'uncertain'; turnId: string; requiresConfirmation: true }
   | null;
 
-/** Explicit handoff progress phases (mirrors host TaskHandoffPhase). */
-export type TaskHandoffPhase =
-  | 'requested'
-  | 'exporting_context'
-  | 'summarizing_source'
-  | 'preparing_receiver'
-  | 'transferring'
-  | 'completed'
-  | 'failed'
-  | 'cancelled';
-
-/** Sanitized source/target labels only — never session ids. */
-export interface HandoffProgressBinding {
-  backend: string;
-  model?: string;
-}
-
-/** Bounded failure chrome for a failed/cancelled handoff. */
-export interface HandoffProgressFailure {
-  code: string;
-  message: string;
-  at: string;
-}
-
-/**
- * Task-scoped handoff chrome projected by the host (D018 / §19).
- * Never includes digests, summary/bootstrap bodies, session ids, or credentials.
- */
-export interface HandoffProgress {
-  operationId: string;
-  phase: TaskHandoffPhase;
-  source: HandoffProgressBinding;
-  target: HandoffProgressBinding;
-  createdAt: string;
-  updatedAt: string;
-  startedAt?: string;
-  finishedAt?: string;
-  failure?: HandoffProgressFailure;
-}
-
 export interface TaskSummary {
   id: string;
   parentId: string | null;
@@ -128,12 +87,6 @@ export interface TaskSummary {
   /** Optional model id selected for this task (ACP session config option value). */
   model?: string;
   continuationOf?: string;
-  /**
-   * Optional sanitized handoff progress for model-switch chrome.
-   * Omitted when the task has no handoff. Never carries digests, session ids,
-   * or summary/bootstrap bodies — those stay off TaskSummary and chat.
-   */
-  handoffProgress?: HandoffProgress;
   /** Aggregate direct-child orchestration chrome for coordinators. */
   childOrchestration?: {
     total: number;
@@ -193,12 +146,8 @@ export interface QueuedTurnProjection {
 
 export interface SnapshotMessage {
   type: 'snapshot';
-  /**
-   * Wire protocol version stamped by the host on this bootstrap message; see
-   * PROTOCOL_VERSION. Optional so an older host that predates version stamping
-   * still type-checks — its absence is treated as an (incompatible) mismatch.
-   */
-  protocolVersion?: number;
+  /** Exact wire protocol version stamped by the host. */
+  protocolVersion: number;
   rootTasks: TaskSummary[];
   focusedTaskId?: string;
   subtree?: TaskSummary[];
@@ -239,13 +188,6 @@ export type RuntimeStorageSettingValue =
 export interface RuntimeStorageSettingsSnapshot {
   settings: RuntimeStorageSettingValue[];
 }
-
-/** @deprecated Compatibility aliases for extensions built against protocol v4 names. */
-export type RetentionSettingId = RuntimeStorageSettingId;
-/** @deprecated Use RuntimeStorageSettingValue. */
-export type RetentionSettingValue = RuntimeStorageSettingValue;
-/** @deprecated Use RuntimeStorageSettingsSnapshot. */
-export type RetentionSettingSnapshot = RuntimeStorageSettingsSnapshot;
 
 export interface SettingsSnapshotMessage {
   type: 'settingsSnapshot';
@@ -604,9 +546,8 @@ export type OutMessage =
   /**
    * Request a runtime model/backend handoff on an existing idle task.
    * Host validates, chains requestRuntimeHandoff → completeRuntimeHandoff,
-   * and projects progress via snapshot/taskUpdated. Refusals use task-scoped
-   * `commandError`. Success is observed via updated TaskSummary.backend/model
-   * + handoffProgress (no chat turns, no session ids).
+   * and atomically returns the new binding via snapshot/taskUpdated. Refusals use
+   * task-scoped `commandError`; no synthetic chat turn is created.
    */
   | {
       type: 'requestRuntimeHandoff';
@@ -907,64 +848,6 @@ function isTurnActivity(v: unknown): v is TurnActivity {
   }
 }
 
-const TASK_HANDOFF_PHASES = new Set<TaskHandoffPhase>([
-  'requested',
-  'exporting_context',
-  'summarizing_source',
-  'preparing_receiver',
-  'transferring',
-  'completed',
-  'failed',
-  'cancelled',
-]);
-
-function isTaskHandoffPhase(v: unknown): v is TaskHandoffPhase {
-  return isString(v) && TASK_HANDOFF_PHASES.has(v as TaskHandoffPhase);
-}
-
-function isHandoffProgressBinding(v: unknown): v is HandoffProgressBinding {
-  if (!isRecord(v) || !isString(v.backend)) return false;
-  // Labels only — reject session ids or other secret-bearing keys at the wire guard.
-  if (!hasOnlyKeys(v, ['backend', 'model'])) return false;
-  return v.model === undefined || isString(v.model);
-}
-
-function isHandoffProgressFailure(v: unknown): v is HandoffProgressFailure {
-  if (!isRecord(v)) return false;
-  if (!hasOnlyKeys(v, ['code', 'message', 'at'])) return false;
-  return isString(v.code) && isString(v.message) && isString(v.at);
-}
-
-function isHandoffProgress(v: unknown): v is HandoffProgress {
-  if (!isRecord(v)) return false;
-  if (
-    !hasOnlyKeys(v, [
-      'operationId',
-      'phase',
-      'source',
-      'target',
-      'createdAt',
-      'updatedAt',
-      'startedAt',
-      'finishedAt',
-      'failure',
-    ])
-  ) {
-    return false;
-  }
-  return (
-    isString(v.operationId) &&
-    isTaskHandoffPhase(v.phase) &&
-    isHandoffProgressBinding(v.source) &&
-    isHandoffProgressBinding(v.target) &&
-    isString(v.createdAt) &&
-    isString(v.updatedAt) &&
-    (v.startedAt === undefined || isString(v.startedAt)) &&
-    (v.finishedAt === undefined || isString(v.finishedAt)) &&
-    (v.failure === undefined || isHandoffProgressFailure(v.failure))
-  );
-}
-
 function isTaskSummary(v: unknown): v is TaskSummary {
   if (!isRecord(v)) return false;
   return (
@@ -984,7 +867,6 @@ function isTaskSummary(v: unknown): v is TaskSummary {
     (v.runtimeActivity === undefined ||
       v.runtimeActivity === null ||
       isString(v.runtimeActivity)) &&
-    (v.handoffProgress === undefined || isHandoffProgress(v.handoffProgress)) &&
     (v.childOrchestration === undefined ||
       (isRecord(v.childOrchestration) &&
         typeof v.childOrchestration.total === 'number' &&
@@ -1094,7 +976,7 @@ export function isExtMessage(data: unknown): data is ExtMessage {
   switch (t) {
     case 'snapshot':
       return (
-        (data.protocolVersion === undefined || isNumber(data.protocolVersion)) &&
+        isNumber(data.protocolVersion) &&
         Array.isArray(data.rootTasks) &&
         data.rootTasks.every(isTaskSummary) &&
         isNumber(data.storeRevision) &&

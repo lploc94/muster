@@ -461,7 +461,6 @@ export function issueTurnCredential(
     ? Math.max(1, deadlineMs - Date.now())
     : turn.effectiveRunLimitMs ??
       task.executionPolicy.runTimeoutOverrideMs ??
-      task.executionPolicy.turnTimeoutMs ??
       DEFAULT_RUN_LIMIT_MS;
   return deps.credentials.issue({
     rootId,
@@ -1328,7 +1327,7 @@ export async function executeToolCommand(
             });
             continue;
           }
-          const releaseState = task.releaseState ?? 'draft';
+          const releaseState = task.releaseState;
           if (releaseState === 'released') {
             // Idempotent only when same releaseAttemptId.
             if (task.releaseAttemptId !== command.opId) {
@@ -1383,7 +1382,7 @@ export async function executeToolCommand(
         const turnIds: string[] = [];
         for (const taskId of members) {
           const task = draft.tasks[taskId]!;
-          if ((task.releaseState ?? 'draft') === 'released' && task.releaseAttemptId === command.opId) {
+          if (task.releaseState === 'released' && task.releaseAttemptId === command.opId) {
             // Already released under this attempt — leave existing first-turn.
             const existing = turnsForTask(draft, taskId).find((t) => t.sequence === 1);
             if (existing) turnIds.push(existing.id);
@@ -1449,7 +1448,7 @@ export async function executeToolCommand(
               };
             }
             const inRelease = resolved.has(waitId);
-            const alreadyReleased = (task.releaseState ?? 'draft') === 'released';
+            const alreadyReleased = task.releaseState === 'released';
             if (!inRelease && !alreadyReleased) {
               return {
                 ok: false,
@@ -2120,11 +2119,11 @@ export async function executeToolCommand(
         return {
           id: t.id,
           lifecycle: t.lifecycle,
-          releaseState: t.releaseState ?? 'draft',
+          releaseState: t.releaseState,
           goal: t.goal.slice(0, 128),
           parentId: t.parentId,
           attention: t.attention,
-          resultSummary: t.taskResult?.summary ?? t.result,
+          resultSummary: t.taskResult?.summary,
           readiness: {
             code: readiness.code,
             schedulable: readiness.schedulable,
@@ -2701,7 +2700,7 @@ export function projectChildResults(
     const entry = {
       id: task.id,
       lifecycle: task.lifecycle,
-      result: task.result?.slice(0, 512),
+      result: task.taskResult?.summary.slice(0, 512),
       error: task.error?.slice(0, 256),
       attention: task.attention?.code,
       ...(pendingQ ? { pendingParentQuestion: pendingQ } : {}),

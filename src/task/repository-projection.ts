@@ -13,8 +13,8 @@ import type {
 } from './types';
 
 /**
- * Read-only in-memory projection used by legacy synchronous engine selectors
- * when the writable source is an async repository. It never writes JSON and it
+ * Read-only in-memory projection used by engine selectors while the writable
+ * source is the async SQLite repository. It never writes JSON and it
  * is refreshed only for aggregates touched by a successful named command.
  */
 export class RepositoryProjection {
@@ -27,7 +27,7 @@ export class RepositoryProjection {
   static async load(source: TaskRepository, workspaceId: string): Promise<RepositoryProjection> {
     const projection = new RepositoryProjection(source, workspaceId, {
       schemaVersion: 6,
-      revision: await (source.getWorkspaceRevision?.() ?? Promise.resolve(0)),
+      revision: await source.getWorkspaceRevision(),
       tasks: {}, turns: {}, messages: {}, toolCalls: {}, reasoning: {},
       operations: {}, cancelRequests: {}, sendReceipts: {}, runtimeClaims: {},
     });
@@ -71,14 +71,14 @@ export class RepositoryProjection {
       .filter((turn) => turn.status === 'queued' || turn.status === 'running' || turn.status === 'waiting_user')
       .map((turn) => turn.id);
     const [operations, cancelRequests, runtimeClaims] = await Promise.all([
-      this.source.listOperationsForTurns?.(activeTurnIds) ?? Promise.resolve([]),
-      this.source.listCancelRequests?.() ?? Promise.resolve([]),
-      this.source.listRuntimeClaims?.() ?? Promise.resolve([]),
+      this.source.listOperationsForTurns(activeTurnIds),
+      this.source.listCancelRequests(),
+      this.source.listRuntimeClaims(),
     ]);
     this.file.operations = Object.fromEntries(operations.map(({ ledgerKey, entry }) => [ledgerKey, entry]));
     this.file.cancelRequests = Object.fromEntries(cancelRequests.map(({ turnId, request }) => [turnId, request]));
     this.file.runtimeClaims = Object.fromEntries(runtimeClaims.map((claim) => [claim.turnId, claim]));
-    this.file.revision = await (this.source.getWorkspaceRevision?.() ?? Promise.resolve(this.file.revision));
+    this.file.revision = await this.source.getWorkspaceRevision();
   }
 
   async refreshTask(taskId: string, knownTask?: MusterTask): Promise<void> {
@@ -121,7 +121,7 @@ export class RepositoryProjection {
   }
 
   private async refreshRevision(): Promise<void> {
-    this.file.revision = await (this.source.getWorkspaceRevision?.() ?? Promise.resolve(this.file.revision + 1));
+    this.file.revision = await this.source.getWorkspaceRevision();
   }
 
   private affectedTaskIds(command: RepositoryCommand): Set<string> {

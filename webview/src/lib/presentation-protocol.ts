@@ -1,4 +1,4 @@
-const MESSAGE_KEYS = new Set(['type', 'document', 'rootId', 'restore']);
+const MESSAGE_KEYS = new Set(['type', 'document', 'rootId']);
 const REQUIRED_DOCUMENT_KEYS = new Set([
   'presentationId',
   'ownerTaskId',
@@ -151,52 +151,27 @@ export function parsePresentationDocument(value: unknown): PresentationDocument 
   return doc;
 }
 
-/** @deprecated prefer parsePresentationDocument — kept as alias for host document shape */
-export function parsePersistedPresentation(value: unknown): PresentationDocument | undefined {
-  // Legacy: document-only setState (no envelope).
-  const asDoc = parsePresentationDocument(value);
-  if (asDoc) return asDoc;
-  // Envelope shape from setState after P0.
-  const envelope = parsePersistedPresentationState(value);
-  return envelope?.document;
-}
-
 export function parsePersistedPresentationState(value: unknown): PersistedPresentationState | undefined {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
   const raw = value as Record<string, unknown>;
-  // Nested envelope { rootId, document }
-  if (Object.keys(raw).every((k) => ENVELOPE_KEYS.has(k)) && 'rootId' in raw && 'document' in raw) {
-    if (Object.keys(raw).some((k) => !ENVELOPE_KEYS.has(k))) return undefined;
-    if (!isStableId(raw.rootId)) return undefined;
-    const document = parsePresentationDocument(raw.document);
-    if (!document) return undefined;
-    return { rootId: raw.rootId, document };
-  }
-  // Flat legacy host restore: rootId + document fields as siblings
+  if (Object.keys(raw).some((k) => !ENVELOPE_KEYS.has(k))) return undefined;
   if (!isStableId(raw.rootId)) return undefined;
-  const { rootId, ...rest } = raw;
-  const document = parsePresentationDocument(rest);
+  const document = parsePresentationDocument(raw.document);
   if (!document) return undefined;
-  return { rootId: rootId as string, document };
+  return { rootId: raw.rootId, document };
 }
 
 export function parsePresentationUpdate(
   value: unknown,
-): { document: PresentationDocument; rootId?: string; restore?: boolean } | undefined {
+): { document: PresentationDocument; rootId: string } | undefined {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
   const message = value as Record<string, unknown>;
   if (Object.keys(message).some((key) => !MESSAGE_KEYS.has(key))) return undefined;
   if (message.type !== 'presentationUpdate') return undefined;
   const document = parsePresentationDocument(message.document);
   if (!document) return undefined;
-  if (message.rootId !== undefined && !isStableId(message.rootId)) return undefined;
-  if (message.restore !== undefined && message.restore !== true) return undefined;
-  const result: { document: PresentationDocument; rootId?: string; restore?: boolean } = {
-    document,
-  };
-  if (message.rootId !== undefined) result.rootId = message.rootId;
-  if (message.restore === true) result.restore = true;
-  return result;
+  if (!isStableId(message.rootId)) return undefined;
+  return { document, rootId: message.rootId };
 }
 
 export function applyPresentationUpdate(
@@ -206,14 +181,6 @@ export function applyPresentationUpdate(
   const next = parsePresentationUpdate(message);
   if (!next) return current;
   if (!current) return next.document;
-  // Host-authorized restore/migration: same presentationId + same revision may rebind owner.
-  if (
-    next.restore === true &&
-    next.document.presentationId === current.presentationId &&
-    next.document.revision === current.revision
-  ) {
-    return next.document;
-  }
   if (
     next.document.presentationId !== current.presentationId ||
     next.document.ownerTaskId !== current.ownerTaskId ||
@@ -225,11 +192,10 @@ export function applyPresentationUpdate(
 }
 
 export function buildPersistedState(
-  rootId: string | undefined,
+  rootId: string,
   document: PresentationDocument,
-): PersistedPresentationState | PresentationDocument {
-  if (rootId && isStableId(rootId)) return { rootId, document };
-  return document;
+): PersistedPresentationState | undefined {
+  return isStableId(rootId) ? { rootId, document } : undefined;
 }
 
 export function kindLabel(kind: PresentationKind | undefined): string {

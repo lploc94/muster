@@ -386,10 +386,6 @@ class TasksState {
       this.pendingHandoffTarget = null;
       return;
     }
-    // Terminal failed handoff: stop optimistic target.
-    if (task.handoffProgress?.phase === 'failed' || task.handoffProgress?.phase === 'cancelled') {
-      this.pendingHandoffTarget = null;
-    }
   }
 
   setCommandNotice(message: string | null, taskId: string | null = null): void {
@@ -428,9 +424,8 @@ class TasksState {
 
   /**
    * Request a host-orchestrated runtime handoff (model/backend switch) on an
-   * existing task. Progress arrives via TaskSummary.handoffProgress on
-   * snapshot/taskUpdated — never as chat. Refusals use setCommandError via
-   * commandError inbound messages.
+   * existing task. The host returns the durable binding through snapshot/taskUpdated;
+   * refusals use setCommandError via commandError inbound messages.
    */
   requestRuntimeHandoff(
     taskId: string,

@@ -61,9 +61,9 @@ describe('DbClient <-> worker RPC', () => {
       },
       {
         sql: `INSERT INTO tasks
-              (id, workspace_id, role, lifecycle, goal, backend, revision, created_at, updated_at, payload_json)
-              VALUES (?,?,?,?,?,?,?,?,?,?)`,
-        params: ['t1', 'ws1', 'worker', 'open', 'g', 'grok', 0, 'now', 'now', '{}'],
+              (id, workspace_id, role, lifecycle, release_state, goal, backend, revision, created_at, updated_at, payload_json)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+        params: ['t1', 'ws1', 'worker', 'open', 'draft', 'g', 'grok', 0, 'now', 'now', '{}'],
       },
     ]);
     const rows = await client.all('SELECT id FROM tasks WHERE workspace_id = ?', ['ws1']);
@@ -101,9 +101,9 @@ describe('DbClient <-> worker RPC', () => {
         // Second statement violates the FK (ghost workspace) → whole batch rolls back.
         {
           sql: `INSERT INTO tasks
-                (id, workspace_id, role, lifecycle, goal, backend, revision, created_at, updated_at, payload_json)
-                VALUES (?,?,?,?,?,?,?,?,?,?)`,
-          params: ['t1', 'ghost', 'worker', 'open', 'g', 'grok', 0, 'now', 'now', '{}'],
+                (id, workspace_id, role, lifecycle, release_state, goal, backend, revision, created_at, updated_at, payload_json)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+          params: ['t1', 'ghost', 'worker', 'open', 'draft', 'g', 'grok', 0, 'now', 'now', '{}'],
         },
       ]),
     ).rejects.toBeInstanceOf(DbWorkerError);

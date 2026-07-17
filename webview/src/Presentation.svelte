@@ -6,7 +6,6 @@
     applyPresentationUpdate,
     buildPersistedState,
     kindLabel,
-    parsePersistedPresentation,
     parsePersistedPresentationState,
     parsePresentationRevealResult,
     parsePresentationUpdate,
@@ -15,10 +14,7 @@
   import { vscode } from './lib/vscode';
 
   function initialDocument(): PresentationDocument | undefined {
-    const state = vscode.getState();
-    const envelope = parsePersistedPresentationState(state);
-    if (envelope) return envelope.document;
-    return parsePersistedPresentation(state);
+    return parsePersistedPresentationState(vscode.getState())?.document;
   }
 
   function initialRootId(): string | undefined {
@@ -71,8 +67,9 @@
   }
 
   function persist(): void {
-    if (!document) return;
-    vscode.setState(buildPersistedState(rootId, document));
+    if (!document || !rootId) return;
+    const state = buildPersistedState(rootId, document);
+    if (state) vscode.setState(state);
   }
 
   function showFallback(element: HTMLElement, reason: string, source: string): void {
@@ -266,8 +263,7 @@
         previous &&
         accepted &&
         previous.presentationId === accepted.presentationId &&
-        accepted.revision > previous.revision &&
-        !parsed.restore
+        accepted.revision > previous.revision
           ? captureScrollAnchor()
           : undefined;
       document = accepted;
@@ -277,8 +273,7 @@
         previous &&
         accepted &&
         previous.presentationId === accepted.presentationId &&
-        accepted.revision > previous.revision &&
-        !parsed.restore
+        accepted.revision > previous.revision
       ) {
         revisionAnnounce = `Updated to revision ${accepted.revision}`;
         if (revisionAnnounceTimer) clearTimeout(revisionAnnounceTimer);

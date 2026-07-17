@@ -20,11 +20,8 @@ export type PersistedWait =
       kind: 'children';
       taskIds: string[];
       registeredByTurnId: string;
-      /**
-       * W6: events that re-enter the parent. New waits default to both;
-       * missing on load → terminal-only (legacy).
-       */
-      wakeOn?: WaitWakeOn[];
+      /** Events that re-enter the parent. */
+      wakeOn: WaitWakeOn[];
       phase?: 'active' | 'suspended_attention';
       attentionContinuationTurnId?: string;
       terminalObserved?: Record<string, 'succeeded' | 'failed' | 'cancelled' | 'skipped'>;
@@ -38,10 +35,6 @@ export interface TaskExecutionPolicy {
   maxAutomaticRetries: number;
   /** Optional per-task override; host run-limit remains the ceiling. */
   runTimeoutOverrideMs?: number;
-  /** @deprecated schema-v5 compatibility only; migrated to runTimeoutOverrideMs. */
-  turnTimeoutMs?: number;
-  /** @deprecated schema-v5 compatibility only; never enforced as task lifetime. */
-  taskTimeoutMs?: number;
 }
 /**
  * Agent-proposed outcome awaiting an authorized sealer (user, or coordinator under
@@ -289,12 +282,7 @@ export interface MusterTask {
   /** Staged complete/fail for root (human-gated) or display; not a lifecycle seal. */
   outcomeProposal?: OutcomeProposal;
   /**
-   * Legacy/display summary string. When `taskResult` is set, mirrors `taskResult.summary`.
-   * Prefer `taskResult` for dataflow pins (orchestration Phase F / W1).
-   */
-  result?: string;
-  /**
-   * Structured sealed/proposed outcome for dependency dataflow (schema ≥ 5).
+   * Structured sealed/proposed outcome for dependency dataflow.
    * `revision` is captured by dependents at pin time.
    */
   taskResult?: TaskResultV1;
@@ -303,11 +291,8 @@ export interface MusterTask {
    * Ordering still requires `dependencies` separately. v1: output key `summary` only.
    */
   inputBindings?: TaskInputBinding[];
-  /**
-   * Draft vs released for auto-run (schema ≥ 5). Missing on load is migrated:
-   * any turn present → released; else draft.
-   */
-  releaseState?: TaskReleaseState;
+  /** Draft vs released for auto-run. Required by the current SQLite schema. */
+  releaseState: TaskReleaseState;
   releasedAt?: string;
   releaseAttemptId?: string;
   /** Structured brief for prompt compilation (schema ≥ 5). */
@@ -350,129 +335,13 @@ export interface MusterTask {
    * Default at root creation: parent_may_seal_direct.
    */
   childOrchestrationSeal?: 'parent_may_seal_direct' | 'propose_only';
-  /**
-   * Optional cross-runtime handoff state (schema-compatible: absent on legacy tasks).
-   * Owned by the TaskHandoff aggregate; never projected as ordinary TaskMessage chat.
-   * Malformed records are stripped on load (fail closed) without quarantining the store.
-   */
-  /** Versioned runtime-switch metadata. v1 is stripped on load; v2 is current. */
-  handoff?: TaskHandoffState | TaskContinuationHandoffState;
+  /** Durable metadata for the current runtime-switch continuation contract. */
+  handoff?: TaskContinuationHandoffState;
 }
 
 // ---------------------------------------------------------------------------
-// Cross-runtime task handoff (M010) — durable contract only.
-// Phase transitions and orchestration live in the TaskHandoff aggregate (T02).
-// ---------------------------------------------------------------------------
-
-/** Explicit handoff progress phases. Terminal: completed | failed | cancelled. */
-export type TaskHandoffPhase =
-  | 'requested'
-  | 'exporting_context'
-  | 'summarizing_source'
-  | 'preparing_receiver'
-  | 'transferring'
-  | 'completed'
-  | 'failed'
-  | 'cancelled';
-
-/** Source or target runtime binding for a handoff operation. */
-export interface TaskHandoffRuntimeBinding {
-  /** Backend id (e.g. claude-cli, codex). Never a credential or absolute path. */
-  backend: string;
-  /** Optional model id for this side of the handoff. */
-  model?: string;
-  /** Optional backend session id already bound (source) or established (target). */
-  sessionId?: string;
-}
-
-/**
- * Required conversation-context export metadata.
- * Stores digests/counts only — never full conversation bodies or credentials.
- */
-export type TaskHandoffConversationContext =
-  | {
-      status: 'pending';
-    }
-  | {
-      status: 'ready';
-      messageCount: number;
-      /** Stable content digest of the exported conversation package. */
-      contentDigest: string;
-      exportedAt: string;
-    }
-  | {
-      status: 'unavailable';
-      reason: string;
-    };
-
-/**
- * Optional source-summary state. Distinct from required conversation context:
- * handoff may complete with summary unavailable when conversation context is ready.
- */
-export type TaskHandoffSourceSummary =
-  | {
-      status: 'pending';
-    }
-  | {
-      status: 'ready';
-      /** Digest of the source summary payload — not the summary text itself. */
-      contentDigest: string;
-      summarizedAt: string;
-    }
-  | {
-      status: 'unavailable';
-      reason: string;
-    }
-  | {
-      status: 'skipped';
-      reason: string;
-    };
-
-/** Terminal success metadata once the receiver is bound and ready for next turns. */
-export interface TaskHandoffCompletion {
-  completedAt: string;
-  boundBackend: string;
-  boundSessionId?: string;
-}
-
-/**
- * Bounded failure diagnostics for a failed/cancelled handoff.
- * `message` is sanitized (no absolute paths, credentials, or raw conversation bodies).
- */
-export interface TaskHandoffFailure {
-  code: string;
-  message: string;
-  at: string;
-}
-
-/**
- * Persisted handoff state on a MusterTask (versioned, bounded, reloadable).
- * Does not include chat messages, handoff prompts, raw CLI output, or secrets.
- */
-export interface TaskHandoffState {
-  /** Contract version for this handoff record (independent of store schemaVersion). */
-  version: 1;
-  /** Stable operation id for stale-op rejection and idempotent terminal handling. */
-  operationId: string;
-  phase: TaskHandoffPhase;
-  source: TaskHandoffRuntimeBinding;
-  target: TaskHandoffRuntimeBinding;
-  conversationContext: TaskHandoffConversationContext;
-  /** Optional; omit or set unavailable/skipped when source summary is not used. */
-  sourceSummary?: TaskHandoffSourceSummary;
-  createdAt: string;
-  updatedAt: string;
-  startedAt?: string;
-  finishedAt?: string;
-  completion?: TaskHandoffCompletion;
-  failure?: TaskHandoffFailure;
-}
-
-// ---------------------------------------------------------------------------
-// Runtime switch continuation contract (v2).
-//
-// Unlike the legacy v1 phase machine, v2 represents an already-committed local
-// binding switch. It never drives hidden source/receiver model turns.
+// Runtime switch continuation contract. It represents an already-committed local
+// binding switch and never drives hidden source/receiver model turns.
 // ---------------------------------------------------------------------------
 
 export interface TaskHandoffRuntimeLabel {
@@ -715,7 +584,7 @@ export interface TaskStoreFile {
    * Retained for the resend window so duplicate delivery re-ACKs without a second commit.
    */
   sendReceipts?: Record<string, SendReceipt>;
-  /** Transitional JSON projection of repository-owned runtime claims. */
+  /** Repository read projection of runtime claims. */
   runtimeClaims?: Record<string, RuntimeClaim>;
 }
 
@@ -735,7 +604,7 @@ export type TaskRuntimeActivity =
   | 'awaiting_outcome';
 
 /**
- * Compact single-axis status for backward-compatible indexes and older UI.
+ * Compact single-axis status for list indexes and loading states.
  * Prefer `lifecycle` + `runtimeActivity` for presentation.
  * When lifecycle is terminal, equals lifecycle; when open, equals runtime activity.
  */

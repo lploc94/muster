@@ -1,4 +1,5 @@
 import type { TaskRepository } from '../task/repository';
+import type { TaskStoreFile } from '../task/types';
 import {
   MAX_TASK_MARKDOWN_EXPORT_ID_CHARS,
   renderTaskMarkdownExport,
@@ -44,7 +45,7 @@ export interface TaskExportSaveDialogOptions {
 }
 
 export interface TaskExportRouteDeps {
-  /** Read-only repository accessor. Export is the only runtime compatibility-envelope reader. */
+  /** Read-only repository accessor. */
   getRepository: () => TaskRepository;
   /**
    * Injected native Save As seam. Return `undefined` when the user cancels.
@@ -225,9 +226,33 @@ export async function routeExportTask(
     return commandError('invalid_request', parsed.taskId);
   }
 
-  let file: Awaited<ReturnType<TaskRepository['readEnvelopeForMigration']>>;
+  let file: TaskStoreFile;
   try {
-    file = await deps.getRepository().readEnvelopeForMigration();
+    const repository = deps.getRepository();
+    const [task, turns, messages, sourceRevision] = await Promise.all([
+      repository.getTask(parsed.taskId),
+      repository.listTurns(parsed.taskId),
+      repository.listMessages(parsed.taskId),
+      repository.getWorkspaceRevision(),
+    ]);
+    if (!task) {
+      return commandError('task_not_found', parsed.taskId);
+    }
+    // The Markdown projector still uses the domain aggregate shape, but this
+    // object is task-scoped: export never materializes unrelated workspace rows.
+    file = {
+      schemaVersion: 6,
+      revision: sourceRevision,
+      tasks: { [task.id]: task },
+      turns: Object.fromEntries(turns.map((turn) => [turn.id, turn])),
+      messages: Object.fromEntries(messages.map((message) => [message.id, message])),
+      operations: {},
+      cancelRequests: {},
+      toolCalls: {},
+      reasoning: {},
+      sendReceipts: {},
+      runtimeClaims: {},
+    };
   } catch {
     return commandError('invalid_request', parsed.taskId);
   }

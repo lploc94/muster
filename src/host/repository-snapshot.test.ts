@@ -1,8 +1,7 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { buildRepositorySnapshot } from './repository-snapshot';
-import { JsonTaskRepository, SqliteTaskRepository } from '../task/repository';
-import { TaskStore } from '../task/store';
-import type { MusterTask, TaskStoreFile } from '../task/types';
+import { SqliteTaskRepository } from '../task/repository';
+import type { MusterTask } from '../task/types';
 import { DbClient } from '../task/sqlite/client';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -13,6 +12,7 @@ function task(id: string, parentId: string | null = null): MusterTask {
     id,
     role: parentId ? 'worker' : 'coordinator',
     lifecycle: 'open',
+    releaseState: 'draft',
     goal: id,
     parentId,
     dependencies: [],
@@ -26,57 +26,7 @@ function task(id: string, parentId: string | null = null): MusterTask {
 }
 
 describe('buildRepositorySnapshot', () => {
-  it('projects metadata plus focused transcript without reading the migration envelope', async () => {
-    const filePath = `/tmp/muster-repository-snapshot-${Date.now()}-${Math.random()}.json`;
-    const store = TaskStore.load({ filePath });
-    store.commit((draft: TaskStoreFile) => {
-      draft.tasks.root = task('root');
-      draft.tasks.child = task('child', 'root');
-      draft.tasks.other = task('other');
-      draft.turns.childTurn = {
-        id: 'childTurn', taskId: 'child', sequence: 1, status: 'succeeded', trigger: 'user',
-        inputs: [{ kind: 'message', messageId: 'childMessage' }], createdAt: '2026-07-17T00:00:01.000Z',
-      };
-      // Historical turns on an unrelated task must stay out of the bounded
-      // tree projection; only the focused task gets its complete turn map.
-      draft.turns.otherOld = {
-        id: 'otherOld', taskId: 'other', sequence: 1, status: 'succeeded', trigger: 'user',
-        inputs: [], createdAt: '2026-07-16T00:00:01.000Z',
-      };
-      draft.turns.otherLatest = {
-        id: 'otherLatest', taskId: 'other', sequence: 2, status: 'succeeded', trigger: 'user',
-        inputs: [], createdAt: '2026-07-17T00:00:01.000Z',
-      };
-      draft.messages.childMessage = {
-        id: 'childMessage', taskId: 'child', role: 'user', content: 'focused', state: 'complete',
-        createdAt: '2026-07-17T00:00:02.000Z',
-      };
-      draft.messages.otherMessage = {
-        id: 'otherMessage', taskId: 'other', role: 'user', content: 'must stay out', state: 'complete',
-        createdAt: '2026-07-17T00:00:03.000Z',
-      };
-      return { ok: true };
-    });
-    const repository = new JsonTaskRepository(store, 'ws');
-    const migrationReader = vi.spyOn(repository, 'readEnvelopeForMigration').mockRejectedValue(
-      new Error('snapshot must not materialize migration envelope'),
-    );
-    try {
-      const projection = await buildRepositorySnapshot(repository, 'ws', 'child', new Map());
-      expect(projection.snapshot.rootTasks.map((summary) => summary.id)).toEqual(['other', 'root']);
-      expect(projection.snapshot.subtree?.map((summary) => summary.id)).toEqual(['root', 'child']);
-      expect(projection.snapshot.transcript?.map((item) => item.id)).toEqual(['childMessage']);
-      expect(Object.keys(projection.observation.turns).sort()).toEqual(['childTurn', 'otherLatest']);
-      expect(JSON.stringify(projection.observation)).not.toContain('must stay out');
-      expect(projection.snapshot.storeRevision).toBe(store.getFile().revision);
-      expect(migrationReader).not.toHaveBeenCalled();
-    } finally {
-      migrationReader.mockRestore();
-      try { await import('node:fs').then((fs) => fs.unlinkSync(filePath)); } catch { /* cleanup */ }
-    }
-  });
-
-  it('uses the same bounded projection contract on SQLite', async () => {
+  it('projects metadata plus the focused transcript from SQLite queries', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-snapshot-sqlite-'));
     const client = new DbClient({ workerPath: path.join(__dirname, '../task/sqlite/worker.ts'), execArgv: ['--import', 'tsx'] });
     try {

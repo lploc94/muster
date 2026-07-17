@@ -11,7 +11,7 @@ const SOURCE_FILES = [
   'src/extension.ts',
   'src/backends/claude.ts',
   'src/runner.ts',
-  'src/task/store.ts',
+  'src/task/repository.ts',
   'src/types.ts',
   'mcp/muster-ask-server.mjs',
 ];
@@ -318,13 +318,13 @@ export async function runSourceBoundarySmoke(options = {}) {
   checked.push('runner boundary');
 
   expectText(
-    textFiles.get('src/task/store.ts'),
+    textFiles.get('src/task/repository.ts'),
     failures,
-    'src/task/store.ts',
-    'centralize task and session persistence without requiring smoke checks to read runtime session files',
-    ['TaskStore', 'TaskStoreFile', 'commit'],
+    'src/task/repository.ts',
+    'centralize SQLite persistence behind named repository commands',
+    ['SqliteTaskRepository', 'TaskRepository', 'execute'],
   );
-  checked.push('task-store boundary');
+  checked.push('task-repository boundary');
 
   expectText(
     textFiles.get('src/types.ts'),

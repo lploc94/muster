@@ -59,8 +59,7 @@ export function resolveTaskExecutionPolicy(
   // Store overrides clamped only to hard bounds. Live user ceiling (`userRunLimitMs`)
   // is applied at promotion via resolveTurnRunDeadline so unpromoted tasks can adopt
   // a raised setting without permanently shrinking the stored override.
-  const legacyTurnTimeout = requested?.turnTimeoutMs;
-  const requestedOverride = requested?.runTimeoutOverrideMs ?? legacyTurnTimeout;
+  const requestedOverride = requested?.runTimeoutOverrideMs;
   const runTimeoutOverrideMs = requestedOverride === undefined
     ? undefined
     : clamp(requestedOverride, bounds.minRunLimitMs, bounds.maxRunLimitMs);
@@ -94,7 +93,7 @@ export function resolveTurnRunDeadline(
     TASK_EXECUTION_HARD_BOUNDS.minRunLimitMs,
     TASK_EXECUTION_HARD_BOUNDS.maxRunLimitMs,
   );
-  const override = policy.runTimeoutOverrideMs ?? policy.turnTimeoutMs;
+  const override = policy.runTimeoutOverrideMs;
   const effectiveRunLimitMs = override === undefined
     ? ceiling
     : clamp(override, TASK_EXECUTION_HARD_BOUNDS.minRunLimitMs, ceiling);

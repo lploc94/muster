@@ -62,7 +62,7 @@ describe('buildTaskResultFromSummary', () => {
     expect(second.summary).toBe('b');
   });
 
-  it('omits verdict when none is provided (byte-identical to legacy shape)', () => {
+  it('omits verdict when none is provided', () => {
     expect(buildTaskResultFromSummary('s')).toEqual({ version: 1, revision: 1, summary: 's' });
     expect('verdict' in buildTaskResultFromSummary('s')).toBe(false);
   });
@@ -75,23 +75,17 @@ describe('buildTaskResultFromSummary', () => {
 });
 
 describe('effectiveTaskResult', () => {
-  it('prefers taskResult over legacy result string', () => {
+  it('returns the structured result', () => {
     const t = task({
       id: 'p',
-      result: 'legacy',
       taskResult: { version: 1, revision: 3, summary: 'structured' },
     });
     expect(effectiveTaskResult(t)?.summary).toBe('structured');
     expect(effectiveTaskResult(t)?.revision).toBe(3);
   });
 
-  it('falls back to legacy result as revision 1', () => {
-    const t = task({ id: 'p', result: 'only-string' });
-    expect(effectiveTaskResult(t)).toEqual({
-      version: 1,
-      revision: 1,
-      summary: 'only-string',
-    });
+  it('returns undefined when no structured result exists', () => {
+    expect(effectiveTaskResult(task({ id: 'p' }))).toBeUndefined();
   });
 });
 

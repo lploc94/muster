@@ -143,27 +143,6 @@ export function queuedMutationRefusalMessage(reason: string): string {
 
 export interface EditQueuedTurnRouteDeps {
   engineReady: boolean;
-  /**
-   * Engine entrypoint. Tests assert this is called at most once and only after
-   * payload validation succeeds — never continueTask / queue creation.
-   */
-  editQueuedTurn: (
-    taskId: string,
-    turnId: string,
-    content: string,
-  ) => EngineResult<{ turnId: string; messageId: string }>;
-}
-
-export interface DeleteQueuedTurnRouteDeps {
-  engineReady: boolean;
-  deleteQueuedTurn: (
-    taskId: string,
-    turnId: string,
-  ) => EngineResult<{ turnId: string; deletedMessageIds: string[] }>;
-}
-
-export interface AsyncEditQueuedTurnRouteDeps {
-  engineReady: boolean;
   editQueuedTurn: (
     taskId: string,
     turnId: string,
@@ -171,7 +150,7 @@ export interface AsyncEditQueuedTurnRouteDeps {
   ) => Promise<EngineResult<{ turnId: string; messageId: string }>>;
 }
 
-export interface AsyncDeleteQueuedTurnRouteDeps {
+export interface DeleteQueuedTurnRouteDeps {
   engineReady: boolean;
   deleteQueuedTurn: (
     taskId: string,
@@ -179,75 +158,10 @@ export interface AsyncDeleteQueuedTurnRouteDeps {
   ) => Promise<EngineResult<{ turnId: string; deletedMessageIds: string[] }>>;
 }
 
-/**
- * Host routing for editQueuedTurn: validate, delegate once to the engine, and
- * return either a success ack or a sanitized command-error payload. Never falls
- * through to continueTask or any other queue creation path.
- */
-export function routeEditQueuedTurn(
+/** Validate and route a queued edit through the async repository-backed engine. */
+export async function routeEditQueuedTurn(
   data: unknown,
   deps: EditQueuedTurnRouteDeps,
-): QueuedMutationHostOutcome {
-  if (!deps.engineReady) {
-    return { kind: 'error', message: 'task engine not ready' };
-  }
-  const parsed = parseEditQueuedTurnMessage(data);
-  if (!parsed.ok) {
-    return { kind: 'error', taskId: parsed.taskId, message: parsed.message };
-  }
-  const result = deps.editQueuedTurn(parsed.taskId, parsed.turnId, parsed.content);
-  if (result.ok) {
-    return {
-      kind: 'ack',
-      taskId: parsed.taskId,
-      turnId: result.value.turnId,
-      messageId: result.value.messageId,
-    };
-  }
-  return {
-    kind: 'error',
-    taskId: parsed.taskId,
-    message: queuedMutationRefusalMessage(result.reason),
-  };
-}
-
-/**
- * Host routing for deleteQueuedTurn: validate, delegate once to the engine, and
- * return either a success ack or a sanitized command-error payload.
- */
-export function routeDeleteQueuedTurn(
-  data: unknown,
-  deps: DeleteQueuedTurnRouteDeps,
-): QueuedMutationHostOutcome {
-  if (!deps.engineReady) {
-    return { kind: 'error', message: 'task engine not ready' };
-  }
-  const parsed = parseDeleteQueuedTurnMessage(data);
-  if (!parsed.ok) {
-    return { kind: 'error', taskId: parsed.taskId, message: parsed.message };
-  }
-  const result = deps.deleteQueuedTurn(parsed.taskId, parsed.turnId);
-  if (result.ok) {
-    return {
-      kind: 'ack',
-      taskId: parsed.taskId,
-      turnId: result.value.turnId,
-      deletedMessageIds: result.value.deletedMessageIds,
-    };
-  }
-  return {
-    kind: 'error',
-    taskId: parsed.taskId,
-    message: queuedMutationRefusalMessage(result.reason),
-  };
-}
-
-/** Async repository route used by the extension host during the transition. The
- * synchronous exports remain for legacy unit consumers until every entry point
- * has moved off TaskStore. */
-export async function routeEditQueuedTurnAsync(
-  data: unknown,
-  deps: AsyncEditQueuedTurnRouteDeps,
 ): Promise<QueuedMutationHostOutcome> {
   if (!deps.engineReady) return { kind: 'error', message: 'task engine not ready' };
   const parsed = parseEditQueuedTurnMessage(data);
@@ -258,9 +172,10 @@ export async function routeEditQueuedTurnAsync(
     : { kind: 'error', taskId: parsed.taskId, message: queuedMutationRefusalMessage(result.reason) };
 }
 
-export async function routeDeleteQueuedTurnAsync(
+/** Validate and route a queued delete through the async repository-backed engine. */
+export async function routeDeleteQueuedTurn(
   data: unknown,
-  deps: AsyncDeleteQueuedTurnRouteDeps,
+  deps: DeleteQueuedTurnRouteDeps,
 ): Promise<QueuedMutationHostOutcome> {
   if (!deps.engineReady) return { kind: 'error', message: 'task engine not ready' };
   const parsed = parseDeleteQueuedTurnMessage(data);

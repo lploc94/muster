@@ -1,5 +1,5 @@
 /**
- * SQLite connection lifecycle + schema migration for the global Muster store.
+ * SQLite connection lifecycle + fresh-schema initialization for the global Muster store.
  *
  * Runs INSIDE the DB worker thread only (plan §3.4): `DatabaseSync` is synchronous,
  * so it must never open on the extension-host main thread where a `busy_timeout`
@@ -8,8 +8,8 @@
  */
 import { DatabaseSync } from 'node:sqlite';
 import {
+  CURRENT_SCHEMA_STATEMENTS,
   MUSTER_APPLICATION_ID,
-  SCHEMA_MIGRATIONS,
   SQLITE_SCHEMA_VERSION,
 } from './schema';
 
@@ -54,14 +54,14 @@ export class ForeignDatabaseError extends Error {
   }
 }
 
-/** Thrown when the on-disk schema is newer than this build supports. */
-export class SchemaTooNewError extends Error {
+/** Thrown when an existing development DB does not match the current schema. */
+export class IncompatibleSchemaError extends Error {
   constructor(readonly observedVersion: number) {
     super(
-      `SQLite schema version ${observedVersion} is newer than supported ` +
-        `${SQLITE_SCHEMA_VERSION}; refusing to downgrade`,
+      `SQLite schema version ${observedVersion} does not match required version ` +
+        `${SQLITE_SCHEMA_VERSION}. Reset the Muster development database and reopen VS Code.`,
     );
-    this.name = 'SchemaTooNewError';
+    this.name = 'IncompatibleSchemaError';
   }
 }
 
@@ -109,39 +109,28 @@ export function verifyOrStampApplicationId(db: DatabaseSync): void {
 }
 
 /**
- * Run schema migrations up to {@link SQLITE_SCHEMA_VERSION} inside a single
- * exclusive transaction, keyed by `PRAGMA user_version`. A process that loses the
- * cross-process race blocks on the exclusive lock, then re-reads user_version and
- * finds nothing to do (plan §3.4: "process thua race phải reopen/verify version,
- * không chạy lại DDL dựa trên state cũ"). All v1 DDL is `IF NOT EXISTS`, so even a
- * torn prior attempt converges.
+ * Initialize the current schema only for a fresh database. Existing databases at
+ * another version are rejected: development builds do not carry data migrations.
+ * The exclusive transaction still serializes simultaneous first-open attempts.
  */
-export function migrateToLatest(db: DatabaseSync): number {
+export function initializeCurrentSchema(db: DatabaseSync): number {
   const current = readScalar(db, 'user_version');
-  if (current > SQLITE_SCHEMA_VERSION) {
-    throw new SchemaTooNewError(current);
-  }
   if (current === SQLITE_SCHEMA_VERSION) {
     return current;
   }
-  // BEGIN EXCLUSIVE serializes migration across processes sharing the WAL.
+  if (current !== 0) {
+    throw new IncompatibleSchemaError(current);
+  }
+  // BEGIN EXCLUSIVE serializes initialization across processes sharing the WAL.
   db.exec('BEGIN EXCLUSIVE TRANSACTION');
   try {
-    // Re-check under the exclusive lock: a racing process may have migrated while
-    // we waited to acquire it.
+    // Re-check under the lock: a racing process may have initialized the DB.
     const underLock = readScalar(db, 'user_version');
-    if (underLock < SQLITE_SCHEMA_VERSION) {
-      for (let version = underLock; version < SQLITE_SCHEMA_VERSION; version += 1) {
-        const migration = SCHEMA_MIGRATIONS[version];
-        if (!migration) {
-          throw new Error(`missing SQLite schema migration for version ${version + 1}`);
-        }
-        for (const stmt of migration) {
-          db.exec(stmt);
-        }
-      }
-      // user_version cannot be bound as a parameter; the value is a validated const.
+    if (underLock === 0) {
+      for (const statement of CURRENT_SCHEMA_STATEMENTS) db.exec(statement);
       db.exec(`PRAGMA user_version = ${SQLITE_SCHEMA_VERSION}`);
+    } else if (underLock !== SQLITE_SCHEMA_VERSION) {
+      throw new IncompatibleSchemaError(underLock);
     }
     db.exec('COMMIT');
   } catch (error) {
@@ -157,7 +146,7 @@ export function migrateToLatest(db: DatabaseSync): number {
 
 /**
  * Open the store DB with pragmas applied, application_id verified/stamped, and the
- * schema migrated to the latest version. Returns the live connection; the caller
+ * current schema initialized. Returns the live connection; the caller
  * (DB worker) owns close().
  */
 export function openStoreDatabase(opts: OpenOptions): DatabaseSync {
@@ -165,7 +154,7 @@ export function openStoreDatabase(opts: OpenOptions): DatabaseSync {
   // A simultaneous first open can fail immediately while multiple connections
   // switch a brand-new file to WAL, before SQLite's busy handler gets a chance to
   // wait. Reopen and re-verify the durable markers within a bounded budget. This
-  // also implements the plan's loser-of-migration-race contract instead of
+  // also implements the plan's loser-of-initialization-race contract instead of
   // assuming BEGIN EXCLUSIVE alone covers WAL bootstrap.
   const retryDeadline = Date.now() + Math.max(1_000, busyTimeoutMs * 2);
   let attempt = 0;
@@ -175,7 +164,7 @@ export function openStoreDatabase(opts: OpenOptions): DatabaseSync {
     try {
       applyPragmas(db, busyTimeoutMs);
       verifyOrStampApplicationId(db);
-      migrateToLatest(db);
+      initializeCurrentSchema(db);
       return db;
     } catch (error) {
       try {

@@ -47,7 +47,7 @@ The flat per-backend session file is **retired**. On extension activation, if
 rename to `.muster-sessions.json.migrated` (or `.muster-sessions.json.corrupt` if
 unparseable). A one-time notice is shown; there is **no** session-import path.
 
-The authoritative store is `.muster-tasks.json` (versioned `TaskStoreFile`). Per-task
+The authoritative store is SQLite under `globalStorageUri/muster.sqlite3`. Per-task
 `committedSessionId` replaces the flat `{ backend: sessionId }` map.
 
 ## Storage (target task flow)

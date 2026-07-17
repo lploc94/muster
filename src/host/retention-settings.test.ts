@@ -1,26 +1,20 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
-  RETENTION_SETTING_DEFINITIONS,
+  RUNTIME_STORAGE_SETTING_DEFINITIONS,
   buildRetentionSettingsSnapshot,
   handleRetentionSettingUpdateAction,
   persistRetentionSettingUpdate,
-  selectRetainedTurnsValue,
   validateRetentionSettingUpdate,
 } from './retention-settings';
 
 describe('runtime & storage settings helper', () => {
-  it('uses new explicit retention value before legacy fallback and package default', () => {
-    expect(selectRetainedTurnsValue(10, 20, 200)).toBe(10);
-    expect(selectRetainedTurnsValue(undefined, 20, 200)).toBe(20);
-    expect(selectRetainedTurnsValue(undefined, undefined, 200)).toBe(200);
-  });
   it('exposes one runtime enum and two advanced storage numbers', () => {
-    expect(RETENTION_SETTING_DEFINITIONS.map((entry) => [entry.id, entry.kind])).toEqual([
+    expect(RUNTIME_STORAGE_SETTING_DEFINITIONS.map((entry) => [entry.id, entry.kind])).toEqual([
       ['runLimit', 'enum'],
       ['maxRetainedTurnsPerTask', 'number'],
       ['maxStoredOutputChars', 'number'],
     ]);
-    expect(RETENTION_SETTING_DEFINITIONS[0]).toMatchObject({
+    expect(RUNTIME_STORAGE_SETTING_DEFINITIONS[0]).toMatchObject({
       label: 'Maximum uninterrupted agent run',
       defaultValue: '2h',
       options: ['15m', '30m', '1h', '2h', '4h', '8h'],

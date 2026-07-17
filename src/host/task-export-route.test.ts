@@ -114,6 +114,15 @@ function baseFile(overrides: Partial<TaskStoreFile> = {}): TaskStoreFile {
   };
 }
 
+function repositoryFromFile(file: TaskStoreFile): TaskRepository {
+  return {
+    getTask: async (taskId) => file.tasks[taskId],
+    listTurns: async (taskId) => Object.values(file.turns).filter((turn) => turn.taskId === taskId),
+    listMessages: async (taskId) => Object.values(file.messages).filter((item) => item.taskId === taskId),
+    getWorkspaceRevision: async () => file.revision,
+  } as TaskRepository;
+}
+
 function makeDeps(
   file: TaskStoreFile,
   overrides: Partial<TaskExportRouteDeps> = {},
@@ -138,9 +147,7 @@ function makeDeps(
     showSaveDialog,
     writeFile,
     deps: {
-      getRepository: () => ({
-        readEnvelopeForMigration: async () => file,
-      } as unknown as TaskRepository),
+      getRepository: () => repositoryFromFile(file),
       showSaveDialog,
       writeFile,
       exportedAt: EXPORTED_AT,
@@ -231,13 +238,18 @@ describe('sanitizeTaskExportErrorText', () => {
 describe('routeExportTask', () => {
   it('reads export data through the repository boundary', async () => {
     const file = baseFile();
-    const readEnvelopeForMigration = vi.fn(async () => file);
+    const repository = repositoryFromFile(file);
+    const getTask = vi.spyOn(repository, 'getTask');
+    const listTurns = vi.spyOn(repository, 'listTurns');
+    const listMessages = vi.spyOn(repository, 'listMessages');
     const { deps } = makeDeps(file, {
-      getRepository: () => ({ readEnvelopeForMigration } as unknown as TaskRepository),
+      getRepository: () => repository,
     });
     const outcome = await routeExportTask({ type: 'exportTask', taskId: 'task-a' }, deps);
     expect(outcome.kind).toBe('messages');
-    expect(readEnvelopeForMigration).toHaveBeenCalledOnce();
+    expect(getTask).toHaveBeenCalledOnce();
+    expect(listTurns).toHaveBeenCalledOnce();
+    expect(listMessages).toHaveBeenCalledOnce();
   });
 
   it('renders, opens Save As with suggested name, writes UTF-8, and returns exportResult basename only', async () => {

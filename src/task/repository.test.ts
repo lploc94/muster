@@ -2,9 +2,8 @@ import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { JsonTaskRepository, SqliteTaskRepository, type TaskRepository } from './repository';
-import { TaskStore } from './store';
-import type { MusterTask, OperationLedgerEntry, TaskStoreFile } from './types';
+import { SqliteTaskRepository, type TaskRepository } from './repository';
+import type { MusterTask, OperationLedgerEntry } from './types';
 import { DbClient } from './sqlite/client';
 
 function makeTask(id: string): MusterTask {
@@ -12,6 +11,7 @@ function makeTask(id: string): MusterTask {
     id,
     role: 'worker',
     lifecycle: 'open',
+    releaseState: 'draft',
     goal: id,
     parentId: null,
     dependencies: [],
@@ -24,76 +24,8 @@ function makeTask(id: string): MusterTask {
   };
 }
 
-function makeStore(filePath: string): TaskStore {
-  const store = TaskStore.load({ filePath });
-  store.commit((draft: TaskStoreFile) => {
-    draft.tasks.a = makeTask('a');
-    draft.turns.t2 = {
-      id: 't2', taskId: 'a', sequence: 2, status: 'succeeded', trigger: 'user',
-      inputs: [], createdAt: '2026-07-16T00:00:02.000Z',
-    };
-    draft.turns.t1 = {
-      id: 't1', taskId: 'a', sequence: 1, status: 'queued', trigger: 'user',
-      inputs: [], createdAt: '2026-07-16T00:00:01.000Z',
-    };
-    draft.messages.m = {
-      id: 'm', taskId: 'a', role: 'user', content: 'hello', state: 'pending',
-      createdAt: '2026-07-16T00:00:03.000Z',
-    };
-    return { ok: true };
-  });
-  return store;
-}
-
-describe('JsonTaskRepository', () => {
-  it('queries cloned, ordered DTOs without exposing the store envelope', async () => {
-    const path = `/tmp/muster-repository-${Date.now()}-${Math.random()}.json`;
-    const store = makeStore(path);
-    try {
-      const repository = new JsonTaskRepository(store, 'ws');
-      expect((await repository.listTasks('ws')).map((task) => task.id)).toEqual(['a']);
-      expect((await repository.listTurns('a')).map((turn) => turn.id)).toEqual(['t1', 't2']);
-      const task = await repository.getTask('a');
-      task!.goal = 'mutated outside repository';
-      expect(store.getFile().tasks.a.goal).toBe('a');
-    } finally {
-      try { fs.unlinkSync(path); } catch { /* test cleanup */ }
-    }
-  });
-
-  it('supports scheduler-oriented root, subtree, and queued-turn queries', async () => {
-    const filePath = `/tmp/muster-repository-${Date.now()}-${Math.random()}.json`;
-    const store = makeStore(filePath);
-    try {
-      store.commit((draft: TaskStoreFile) => {
-        const child = makeTask('child');
-        child.parentId = 'a';
-        draft.tasks.child = child;
-        draft.turns.queued = {
-          id: 'queued', taskId: 'a', sequence: 3, status: 'queued', trigger: 'engine',
-          inputs: [], createdAt: '2026-07-16T00:00:04.000Z',
-        };
-        return { ok: true };
-      });
-      const repository = new JsonTaskRepository(store, 'ws');
-      await expect(repository.listRootTasks('ws')).resolves.toMatchObject({ items: [{ id: 'a' }] });
-      await expect(repository.listSubtree('a')).resolves.toMatchObject([
-        { id: 'a' }, { id: 'child', parentId: 'a' },
-      ]);
-      await expect(repository.listQueuedTurns('a')).resolves.toEqual(expect.arrayContaining([
-        expect.objectContaining({ id: 't1' }),
-        expect.objectContaining({ id: 'queued' }),
-      ]));
-    } finally {
-      try { fs.unlinkSync(filePath); } catch { /* test cleanup */ }
-    }
-  });
-});
-
 describe('SqliteTaskRepository', () => {
   it('applies graph create atomically with operation replay/conflict parity', async () => {
-    const jsonPath = `/tmp/muster-repository-graph-${Date.now()}-${Math.random()}.json`;
-    const jsonStore = TaskStore.load({ filePath: jsonPath });
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-graph-sqlite-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
     try {
@@ -102,10 +34,7 @@ describe('SqliteTaskRepository', () => {
         `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at) VALUES (?,?,?,?,?)`,
         ['ws', 'graph-identity', 'Graph', 'now', 'now'],
       );
-      for (const repository of [
-        new JsonTaskRepository(jsonStore, 'ws'),
-        new SqliteTaskRepository(client, 'ws'),
-      ]) {
+      for (const repository of [new SqliteTaskRepository(client, 'ws')]) {
         const root = makeTask(`graph-root-${Math.random()}`);
         await repository.execute({ kind: 'createTask', workspaceId: 'ws', task: root });
         const child = { ...makeTask(`${root.id}-child`), parentId: root.id, revision: 0 };
@@ -139,19 +68,16 @@ describe('SqliteTaskRepository', () => {
     } finally {
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });
-      try { fs.unlinkSync(jsonPath); } catch { /* test cleanup */ }
     }
   }, 20_000);
 
   it('consumes a cancel request with owner/request fences and releases all claims', async () => {
-    const jsonPath = `/tmp/muster-repository-cancel-consumer-${Date.now()}-${Math.random()}.json`;
-    const jsonStore = TaskStore.load({ filePath: jsonPath });
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-cancel-consumer-sqlite-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
     try {
       await client.open(path.join(dir, 'muster.sqlite3'));
       await client.run(`INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at) VALUES (?,?,?,?,?)`, ['ws', 'cancel-consumer', 'Cancel', 'now', 'now']);
-      const repositories = [new JsonTaskRepository(jsonStore, 'ws'), new SqliteTaskRepository(client, 'ws')];
+      const repositories = [new SqliteTaskRepository(client, 'ws')];
       for (const repository of repositories) {
         const task = { ...makeTask(`cancel-task-${Math.random()}`), releaseState: 'released' as const };
         const turn = { id: `${task.id}-turn`, taskId: task.id, sequence: 1, status: 'running' as const, trigger: 'engine' as const, inputs: [], createdAt: '2026-07-16T00:00:01.000Z' };
@@ -160,12 +86,8 @@ describe('SqliteTaskRepository', () => {
         await repository.execute({ kind: 'claimRuntime', workspaceId: 'ws', turnId: turn.id, ownerId: 'owner', claimedAt: '2026-07-16T00:00:01.000Z', heartbeatAt: '2026-07-16T00:00:01.000Z', expiresAt: '2099-01-01T00:00:00.000Z' });
         const request = { kind: 'cancel' as const, by: 'user', opId: 'cancel-op', at: '2026-07-16T00:00:02.000Z' };
         await repository.execute({ kind: 'putCancelRequest', workspaceId: 'ws', turnId: turn.id, request });
-        // SQLite-only claim tables are inserted explicitly; JSON treats these
-        // as compatibility no-ops and still exercises request/owner parity.
-        if (repository instanceof SqliteTaskRepository) {
-          await client.run(`INSERT INTO session_claims (workspace_id, session_id, turn_id, claimed_at) VALUES (?,?,?,?)`, ['ws', `${turn.id}-session`, turn.id, 'now']);
-          await client.run(`INSERT INTO resource_claims (workspace_id, resource_key, task_id, turn_id, claimed_at) VALUES (?,?,?,?,?)`, ['ws', 'git', task.id, turn.id, 'now']);
-        }
+        await client.run(`INSERT INTO session_claims (workspace_id, session_id, turn_id, claimed_at) VALUES (?,?,?,?)`, ['ws', `${turn.id}-session`, turn.id, 'now']);
+        await client.run(`INSERT INTO resource_claims (workspace_id, resource_key, task_id, turn_id, claimed_at) VALUES (?,?,?,?,?)`, ['ws', 'git', task.id, turn.id, 'now']);
         const nextTurn = { ...turn, status: 'cancelled' as const, finishedAt: '2026-07-16T00:00:03.000Z' };
         const consume = {
           kind: 'consumeCancelRequest', workspaceId: 'ws', expectedTasks: [{ id: task.id, revision: task.revision }],
@@ -187,29 +109,21 @@ describe('SqliteTaskRepository', () => {
         await expect(repository.getCancelRequest(turn.id)).resolves.toBeUndefined();
         await expect(repository.getRuntimeClaim(turn.id)).resolves.toBeUndefined();
         await expect(repository.getTurn(turn.id)).resolves.toMatchObject({ status: 'cancelled' });
-        if (repository instanceof SqliteTaskRepository) {
-          await expect(client.get(`SELECT 1 AS present FROM session_claims WHERE workspace_id=? AND turn_id=?`, ['ws', turn.id])).resolves.toBeUndefined();
-          await expect(client.get(`SELECT 1 AS present FROM resource_claims WHERE workspace_id=? AND turn_id=?`, ['ws', turn.id])).resolves.toBeUndefined();
-        }
+        await expect(client.get(`SELECT 1 AS present FROM session_claims WHERE workspace_id=? AND turn_id=?`, ['ws', turn.id])).resolves.toBeUndefined();
+        await expect(client.get(`SELECT 1 AS present FROM resource_claims WHERE workspace_id=? AND turn_id=?`, ['ws', turn.id])).resolves.toBeUndefined();
       }
     } finally {
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });
-      try { fs.unlinkSync(jsonPath); } catch { /* test cleanup */ }
     }
   }, 20_000);
 
-  it('keeps host history commands atomic and parity-compatible across adapters', async () => {
-    const jsonPath = `/tmp/muster-repository-history-${Date.now()}-${Math.random()}.json`;
-    const jsonStore = TaskStore.load({ filePath: jsonPath });
+  it('keeps host history commands atomic in SQLite', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-history-sqlite-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
     try {
       await client.open(path.join(dir, 'muster.sqlite3'));
-      const repositories: TaskRepository[] = [
-        new JsonTaskRepository(jsonStore, 'ws'),
-        new SqliteTaskRepository(client, 'ws'),
-      ];
+      const repositories: TaskRepository[] = [new SqliteTaskRepository(client, 'ws')];
       await client.run(
         `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at) VALUES (?,?,?,?,?)`,
         ['ws', 'history-identity', 'History', 'now', 'now'],
@@ -273,12 +187,12 @@ describe('SqliteTaskRepository', () => {
     } finally {
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });
-      try { fs.unlinkSync(jsonPath); } catch { /* test cleanup */ }
     }
   }, 20_000);
 
-  it('runs the same named-command and transcript-page contract on JSON and SQLite', async () => {
+  it('runs the named-command and transcript-page contract on SQLite', async () => {
     const task = makeTask('contract-task');
+    task.releaseState = 'released';
     const turn = {
       id: 'contract-turn', taskId: task.id, sequence: 1, status: 'queued' as const,
       trigger: 'user' as const, inputs: [{ kind: 'message' as const, messageId: 'contract-user' }],
@@ -292,9 +206,6 @@ describe('SqliteTaskRepository', () => {
       id: 'contract-assistant', taskId: task.id, turnId: turn.id, role: 'assistant' as const,
       content: 'world', state: 'complete' as const, createdAt: '2026-07-16T00:00:03.000Z', order: 0,
     };
-    const jsonPath = `/tmp/muster-repository-contract-${Date.now()}-${Math.random()}.json`;
-    const jsonStore = TaskStore.load({ filePath: jsonPath });
-    const json = new JsonTaskRepository(jsonStore, 'ws');
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-contract-sqlite-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
     try {
@@ -304,7 +215,7 @@ describe('SqliteTaskRepository', () => {
         ['ws', 'contract-identity', 'Contract', 'now', 'now'],
       );
       const sqlite = new SqliteTaskRepository(client, 'ws');
-      for (const repository of [json, sqlite]) {
+      for (const repository of [sqlite]) {
         await expect(repository.execute({
           kind: 'createRootAndInitialTurn', workspaceId: 'ws', task, message: userMessage, turn,
           receipt: {
@@ -396,21 +307,15 @@ describe('SqliteTaskRepository', () => {
           taskId: task.id, messageId: userMessage.id, turnId: turn.id,
         });
         await expect(repository.getSendReceipt(`${turn.id}:send`)).resolves.toMatchObject({ turnId: turn.id });
-        const exported = await repository.readEnvelopeForMigration();
-        expect(exported.toolCalls?.[`${turn.id}:tool`]).toMatchObject({ output: 'done' });
-        expect(exported.reasoning?.[`${turn.id}:reasoning`]).toMatchObject({ content: 'think' });
         await expect(repository.execute({ kind: 'applyRetentionPolicy', workspaceId: 'ws', taskId: task.id, keepLatestTurns: 1 })).resolves.toMatchObject({ changed: false });
       }
     } finally {
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });
-      try { fs.unlinkSync(jsonPath); } catch { /* test cleanup */ }
     }
   }, 20_000);
 
-  it('atomically enqueues a message turn with revision and turn-cap guards in both adapters', async () => {
-    const jsonPath = `/tmp/muster-repository-enqueue-${Date.now()}-${Math.random()}.json`;
-    const jsonStore = TaskStore.load({ filePath: jsonPath });
+  it('atomically enqueues a message turn with revision and turn-cap guards', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-enqueue-sqlite-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
     try {
@@ -419,10 +324,7 @@ describe('SqliteTaskRepository', () => {
         `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at) VALUES (?,?,?,?,?)`,
         ['ws', 'enqueue-identity', 'Enqueue', 'now', 'now'],
       );
-      const repositories = [
-        new JsonTaskRepository(jsonStore, 'ws'),
-        new SqliteTaskRepository(client, 'ws'),
-      ];
+      const repositories = [new SqliteTaskRepository(client, 'ws')];
       for (const [index, repository] of repositories.entries()) {
         const task = makeTask(`enqueue-task-${index}`);
         task.releaseState = 'released';
@@ -469,13 +371,10 @@ describe('SqliteTaskRepository', () => {
     } finally {
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });
-      try { fs.unlinkSync(jsonPath); } catch { /* test cleanup */ }
     }
   }, 20_000);
 
-  it('edits, deletes, and resumes only queued message turns in both adapters', async () => {
-    const jsonPath = `/tmp/muster-repository-queue-mutations-${Date.now()}-${Math.random()}.json`;
-    const json = new JsonTaskRepository(TaskStore.load({ filePath: jsonPath }), 'ws');
+  it('edits, deletes, and resumes only queued message turns', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-queue-mutations-sqlite-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
     try {
@@ -485,7 +384,7 @@ describe('SqliteTaskRepository', () => {
         ['ws', 'queue-mutations', 'Queue mutations', 'now', 'now'],
       );
       const sqlite = new SqliteTaskRepository(client, 'ws');
-      for (const [index, repository] of [json, sqlite].entries()) {
+      for (const [index, repository] of [sqlite].entries()) {
         const task = makeTask(`queue-task-${index}`);
         task.releaseState = 'released';
         await repository.execute({ kind: 'createTask', workspaceId: 'ws', task });
@@ -532,13 +431,10 @@ describe('SqliteTaskRepository', () => {
     } finally {
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });
-      try { fs.unlinkSync(jsonPath); } catch { /* test cleanup */ }
     }
   }, 20_000);
 
-  it('allocates a retry turn atomically with its task state in both adapters', async () => {
-    const jsonPath = `/tmp/muster-repository-retry-${Date.now()}-${Math.random()}.json`;
-    const json = new JsonTaskRepository(TaskStore.load({ filePath: jsonPath }), 'ws');
+  it('allocates a retry turn atomically with its task state', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-retry-sqlite-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
     try {
@@ -547,7 +443,7 @@ describe('SqliteTaskRepository', () => {
         `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at) VALUES (?,?,?,?,?)`,
         ['ws', 'retry-contract', 'Retry contract', 'now', 'now'],
       );
-      for (const [index, repository] of [json, new SqliteTaskRepository(client, 'ws')].entries()) {
+      for (const [index, repository] of [new SqliteTaskRepository(client, 'ws')].entries()) {
         const task = makeTask(`retry-task-${index}`);
         task.releaseState = 'released';
         await repository.execute({ kind: 'createTask', workspaceId: 'ws', task });
@@ -574,19 +470,16 @@ describe('SqliteTaskRepository', () => {
     } finally {
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });
-      try { fs.unlinkSync(jsonPath); } catch { /* test cleanup */ }
     }
   }, 20_000);
 
-  it('keeps lifecycle, disposition, and cascade commands fenced and atomic on both adapters', async () => {
-    const jsonPath = `/tmp/muster-repository-lifecycle-${Date.now()}-${Math.random()}.json`;
-    const json = new JsonTaskRepository(TaskStore.load({ filePath: jsonPath }), 'ws');
+  it('keeps lifecycle, disposition, and cascade commands fenced and atomic', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-lifecycle-sqlite-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
     try {
       await client.open(path.join(dir, 'muster.sqlite3'));
       await client.run(`INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at) VALUES (?,?,?,?,?)`, ['ws', 'lifecycle-contract', 'Lifecycle', 'now', 'now']);
-      for (const [index, repository] of [json, new SqliteTaskRepository(client, 'ws')].entries()) {
+      for (const [index, repository] of [new SqliteTaskRepository(client, 'ws')].entries()) {
         const task = makeTask(`lifecycle-task-${index}`);
         task.releaseState = 'released';
         await repository.execute({ kind: 'createTask', workspaceId: 'ws', task });
@@ -614,13 +507,10 @@ describe('SqliteTaskRepository', () => {
     } finally {
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });
-      try { fs.unlinkSync(jsonPath); } catch { /* test cleanup */ }
     }
   }, 20_000);
 
-  it('claims, heartbeats, reclaims, and releases runtime ownership on both adapters', async () => {
-    const jsonPath = `/tmp/muster-repository-runtime-${Date.now()}-${Math.random()}.json`;
-    const json = new JsonTaskRepository(TaskStore.load({ filePath: jsonPath }), 'ws');
+  it('claims, heartbeats, reclaims, and releases runtime ownership', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-runtime-sqlite-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
     try {
@@ -629,7 +519,7 @@ describe('SqliteTaskRepository', () => {
         `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at) VALUES (?,?,?,?,?)`,
         ['ws', 'runtime-identity', 'Runtime', 'now', 'now'],
       );
-      for (const [index, repository] of [json, new SqliteTaskRepository(client, 'ws')].entries()) {
+      for (const [index, repository] of [new SqliteTaskRepository(client, 'ws')].entries()) {
         const task = makeTask(`runtime-task-${index}`);
         const turnId = `runtime-turn-${index}`;
         await repository.execute({ kind: 'createTask', workspaceId: 'ws', task });
@@ -666,13 +556,10 @@ describe('SqliteTaskRepository', () => {
     } finally {
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });
-      try { fs.unlinkSync(jsonPath); } catch { /* test cleanup */ }
     }
   }, 20_000);
 
-  it('keeps live transcript rows byte-for-byte during retention on both adapters', async () => {
-    const jsonPath = `/tmp/muster-repository-live-retention-${Date.now()}-${Math.random()}.json`;
-    const jsonStore = TaskStore.load({ filePath: jsonPath });
+  it('keeps live transcript rows byte-for-byte during retention', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-live-retention-'));
     const client = new DbClient({
       workerPath: path.join(__dirname, 'sqlite', 'worker.ts'),
@@ -685,10 +572,7 @@ describe('SqliteTaskRepository', () => {
          VALUES (?,?,?,?,?)`,
         ['ws', 'live-retention', 'Live retention', 'now', 'now'],
       );
-      const repositories: TaskRepository[] = [
-        new JsonTaskRepository(jsonStore, 'ws'),
-        new SqliteTaskRepository(client, 'ws'),
-      ];
+      const repositories: TaskRepository[] = [new SqliteTaskRepository(client, 'ws')];
       const oversized = 'live-output'.repeat(20);
       for (const [index, repository] of repositories.entries()) {
         const task = makeTask(`live-retention-task-${index}`);
@@ -733,11 +617,10 @@ describe('SqliteTaskRepository', () => {
     } finally {
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });
-      try { fs.unlinkSync(jsonPath); } catch { /* test cleanup */ }
     }
   }, 20_000);
 
-  it('hydrates domain DTOs from promoted columns and compatibility payloads', async () => {
+  it('hydrates current domain DTOs with promoted columns as the single source of truth', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-sqlite-'));
     const dbPath = path.join(dir, 'muster.sqlite3');
     const client = new DbClient({
@@ -747,8 +630,6 @@ describe('SqliteTaskRepository', () => {
     try {
       await client.open(dbPath);
       const task = makeTask('task-1');
-      task.goal = 'payload goal (stale)';
-      task.model = 'payload-model';
       const turn = {
         id: 'turn-1', taskId: 'task-1', sequence: 1, status: 'succeeded' as const,
         trigger: 'user' as const, inputs: [], createdAt: '2026-07-16T00:00:01.000Z',
@@ -772,7 +653,11 @@ describe('SqliteTaskRepository', () => {
           params: [
             'task-1', 'ws-1', null, 'worker', 'succeeded', 'released', 'column goal', 'codex',
             'column-model', 4, '2026-07-16T00:00:00.000Z', '2026-07-16T00:00:03.000Z',
-            JSON.stringify(task),
+            JSON.stringify({
+              payloadVersion: 1,
+              capabilities: task.capabilities,
+              executionPolicy: task.executionPolicy,
+            }),
           ],
         },
         {
@@ -781,7 +666,7 @@ describe('SqliteTaskRepository', () => {
                 VALUES (?,?,?,?,?,?,?,?,?,?)`,
           params: [
             'turn-1', 'ws-1', 'task-1', 1, 'succeeded', 'user', turn.createdAt, null,
-            '2026-07-16T00:00:02.000Z', JSON.stringify(turn),
+            '2026-07-16T00:00:02.000Z', JSON.stringify({ payloadVersion: 1 }),
           ],
         },
         {
@@ -790,7 +675,7 @@ describe('SqliteTaskRepository', () => {
                 VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
           params: [
             'message-1', 'ws-1', 'task-1', 'turn-1', 'assistant', 'complete', 7,
-            'column content', message.createdAt, null, JSON.stringify(message),
+            'column content', message.createdAt, null, JSON.stringify({ payloadVersion: 1 }),
           ],
         },
         {
@@ -799,10 +684,7 @@ describe('SqliteTaskRepository', () => {
                 VALUES (?,?,?,?,?,?,?,?,?,?)`,
           params: [
             'turn-queued', 'ws-1', 'task-1', 2, 'queued', 'engine', '2026-07-16T00:00:04.000Z',
-            null, null, JSON.stringify({
-              id: 'turn-queued', taskId: 'task-1', sequence: 2, status: 'queued', trigger: 'engine',
-              inputs: [], createdAt: '2026-07-16T00:00:04.000Z',
-            }),
+            null, null, JSON.stringify({ payloadVersion: 1 }),
           ],
         },
       ]);
@@ -828,7 +710,7 @@ describe('SqliteTaskRepository', () => {
     }
   }, 20_000);
 
-  it('rejects malformed compatibility payloads instead of returning partial DTOs', async () => {
+  it('rejects malformed current payloads instead of returning partial DTOs', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-sqlite-invalid-'));
     const dbPath = path.join(dir, 'muster.sqlite3');
     const client = new DbClient({
@@ -844,9 +726,9 @@ describe('SqliteTaskRepository', () => {
       );
       await client.run(
         `INSERT INTO tasks
-         (id, workspace_id, parent_id, role, lifecycle, goal, backend, revision, created_at, updated_at, payload_json)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-        ['task-1', 'ws-1', null, 'worker', 'open', 'goal', 'codex', 0, 'now', 'now', JSON.stringify({})],
+         (id, workspace_id, parent_id, role, lifecycle, release_state, goal, backend, revision, created_at, updated_at, payload_json)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+        ['task-1', 'ws-1', null, 'worker', 'open', 'draft', 'goal', 'codex', 0, 'now', 'now', JSON.stringify({ payloadVersion: 1 })],
       );
       const repository = new SqliteTaskRepository(client, 'ws-1');
       await expect(repository.getTask('task-1')).rejects.toThrow(/missing domain payload fields/);
@@ -856,7 +738,7 @@ describe('SqliteTaskRepository', () => {
     }
   }, 20_000);
 
-  it('persists every TaskStore aggregate as normalized rows and exports a parity envelope', async () => {
+  it('persists every task aggregate as normalized rows exposed by focused queries', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-parity-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
     try {
@@ -935,19 +817,15 @@ describe('SqliteTaskRepository', () => {
       expect(turnRow?.payload_json).not.toContain('"inputs"');
       expect(await client.all('SELECT * FROM turn_inputs WHERE workspace_id = ? AND turn_id = ?', ['ws', turn.id])).toHaveLength(2);
 
-      const envelope = await repository.readEnvelopeForMigration();
-      expect(envelope.tasks.consumer).toMatchObject({
+      await expect(repository.getTask(consumer.id)).resolves.toMatchObject({
         dependencies: consumer.dependencies,
         description: consumer.description,
         wait: consumer.wait,
       });
-      expect(envelope.turns[turn.id]).toMatchObject({ inputs: turn.inputs });
-      expect(envelope.messages[message.id]).toMatchObject({ agentContent: message.agentContent });
-      expect(envelope.toolCalls?.['turn-1:tool-1']).toMatchObject({ output: 'ok' });
-      expect(envelope.reasoning?.[turn.id]).toMatchObject({ content: 'reasoning' });
-      expect(envelope.operations?.['turn-1:op-1']).toEqual(operation);
-      expect(envelope.cancelRequests?.[turn.id]).toMatchObject({ kind: 'interrupt', reason: 'stop' });
-      expect(envelope.sendReceipts?.['request-1']).toMatchObject({ taskId: consumer.id });
+      await expect(repository.getTurn(turn.id)).resolves.toMatchObject({ inputs: turn.inputs });
+      await expect(repository.listMessages(consumer.id)).resolves.toContainEqual(
+        expect.objectContaining({ id: message.id, agentContent: message.agentContent }),
+      );
       await expect(repository.listToolCalls(consumer.id)).resolves.toMatchObject([{ id: 'turn-1:tool-1' }]);
       await expect(repository.listReasoning(consumer.id)).resolves.toMatchObject([{ id: turn.id }]);
       await expect(repository.getOperation('turn-1:op-1')).resolves.toEqual(operation);
@@ -1096,15 +974,6 @@ describe('SqliteTaskRepository', () => {
       await expect(claim()).resolves.toMatchObject({ changed: false });
 
       task.inputBindings = undefined;
-      task.handoff = {
-        version: 1, operationId: 'handoff', phase: 'requested', source: { backend: 'codex' },
-        target: { backend: 'grok' }, conversationContext: { status: 'pending' },
-        createdAt: '2026-07-16T00:00:00.000Z', updatedAt: '2026-07-16T00:00:00.000Z',
-      };
-      await repository.execute({ kind: 'upsertTask', workspaceId: 'ws', task });
-      await expect(claim()).resolves.toMatchObject({ changed: false });
-
-      task.handoff = undefined;
       await repository.execute({ kind: 'upsertTask', workspaceId: 'ws', task });
       await expect(claim()).resolves.toMatchObject({ changed: true });
     } finally {

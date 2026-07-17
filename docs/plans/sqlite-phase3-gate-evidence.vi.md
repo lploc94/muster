@@ -4,10 +4,9 @@ Cập nhật: **2026-07-17**
 
 Phạm vi: Wave 1–10 của kế hoạch chuyển repository sang SQLite.
 
-Tài liệu này ghi lại kết quả kiểm tra local đã chạy cho gate cuối Wave 10. Đây chưa
-phải là tuyên bố đã cutover production: Phase 4 (pagination/incremental wire protocol)
-và Phase 5 (migration/cutover) vẫn chưa bắt đầu; JSON adapter vẫn là compatibility/source
-path cho đến khi migration có backup, verify và rollout riêng.
+Tài liệu này là evidence lịch sử tại gate cuối Phase 3. Quyết định dev-phase sau đó đã
+cutover SQLite-only ở Phase 4 và bỏ JSON adapter/data migration; các số liệu bên dưới
+không phải trạng thái suite hiện tại.
 
 ## Runtime/packaging matrix
 
@@ -35,10 +34,8 @@ chỉ chạy test ở local host.
 | Boundary fixtures | `npm run test:source-boundary:fixtures` — **13/13 passed** |
 | Concurrent first-open stress | 100 fresh databases × 4 DB workers — **100/100 rounds passed** |
 
-Targeted parity suite gồm repository, engine-repository, scheduler, lifecycle-runtime,
-engine-graph, main-thread-nonblocking, crash-recovery, connection, workspace-registry và
-retention tests. Các test này chạy cả JSON compatibility adapter và SQLite repository ở
-những contract tương ứng.
+Targeted parity suite khi đó gồm repository, engine-repository, scheduler,
+main-thread-nonblocking, crash-recovery, connection, workspace-registry và retention.
 
 ## SQLite correctness coverage
 
@@ -52,9 +49,8 @@ những contract tương ứng.
   recovery và cancel/settlement paths.
 - Retention chỉ xóa row đủ điều kiện, không xóa live turn hoặc row còn được reference;
   transcript append dùng bounded query/row-level update.
-- Source scan cấm `TaskStore` import trong engine/graph/snapshot, cấm
-  `readEnvelopeForMigration()` ngoài migration/export và cấm generic graph mutation
-  boundary. Named graph commands được kiểm tra trong repository boundary script.
+- Source scan hiện cấm mọi `TaskStore`, `.commit()` và `readEnvelopeForMigration()`;
+  named graph commands được kiểm tra trong repository boundary script.
 
 Entity mapping và command/invariant mapping:
 
@@ -88,7 +84,5 @@ bootstrap, paging) vẫn là gate của Phase 4/5 và chưa được tuyên bố
 - Đây là evidence chạy local trên workspace này; chưa có hosted CI result mới được tuyên
   bố trong tài liệu này. Workflow CI vẫn là verifier cần chạy trên môi trường CI của repo.
 - Svelte/Vite/VSIX chỉ còn các warning đã nêu; không có TypeScript/Svelte error.
-- Probe hiện advisory khi JSON còn là source. Hard-gate/fail-closed sẽ được bật ngay
-  trước Phase 5 cutover, khi SQLite là writable source duy nhất.
-- Không claim encryption at rest, migration rollout, import backup/recovery hoặc bỏ hẳn
-  `.muster-tasks.json`; các mục đó thuộc Phase 5/6.
+- SQLite probe/open hiện là hard gate và SQLite là writable source duy nhất.
+- Không claim encryption at rest hoặc hosted CI evidence ngoài những artifact đã ghi.

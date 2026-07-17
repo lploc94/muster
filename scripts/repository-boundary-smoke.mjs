@@ -4,9 +4,8 @@
  * Phase 3 source-boundary audit.
  *
  * This is deliberately a small source scan rather than a runtime test: the
- * contract is about dependency direction. Runtime code may use repository
- * queries/commands, while the JSON envelope is restricted to the compatibility
- * adapter and explicit export/migration code.
+ * contract is about dependency direction. Runtime code may use only named
+ * repository queries/commands; no filesystem store or full-envelope escape hatch exists.
  */
 import { readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
@@ -18,8 +17,6 @@ const NO_STORE_IMPORT = [
   'src/task/engine-graph.ts',
   'src/host/snapshot.ts',
 ];
-const COMMIT_ALLOWED = new Set(['src/task/store.ts', 'src/task/repository.ts']);
-const MIGRATION_ALLOWED = new Set(['src/task/repository.ts', 'src/host/task-export-route.ts']);
 const NAMED_GRAPH_COMMANDS = [
   'createChildTask', 'delegateChildTask', 'createChildTaskBatch', 'delegateChildTaskBatch',
   'releaseChildTasks', 'continueChildTask', 'cancelChildTasks', 'interruptChildTask',
@@ -79,12 +76,12 @@ export async function runRepositoryBoundarySmoke(rootDir = ROOT) {
 
   for (const [rel, raw] of texts) {
     const text = stripComments(raw);
-    if (!COMMIT_ALLOWED.has(rel) && /\.commit\s*\(/.test(text)) {
+    if (/\.commit\s*\(/.test(text)) {
       const line = text.split('\n').findIndex((entry) => entry.includes('.commit(')) + 1;
-      failures.push(`${rel}:${line} calls .commit(); only the JSON compatibility adapter may do so.`);
+      failures.push(`${rel}:${line} calls .commit(); use a named repository command.`);
     }
-    if (text.includes('readEnvelopeForMigration') && !MIGRATION_ALLOWED.has(rel)) {
-      failures.push(`${rel} references readEnvelopeForMigration outside repository/export code.`);
+    if (text.includes('readEnvelopeForMigration')) {
+      failures.push(`${rel} references the removed full-envelope migration API.`);
     }
     if (text.includes('applyGraphMutation')) {
       failures.push(`${rel} still exposes the forbidden generic applyGraphMutation boundary; use a named graph command.`);
@@ -106,7 +103,7 @@ export async function runRepositoryBoundarySmoke(rootDir = ROOT) {
   try {
     const matrix = await readFile(path.join(rootDir, 'docs/plans/sqlite-entity-matrix.vi.md'), 'utf8');
     for (const term of [
-      'TaskStoreFile.schemaVersion', 'workspace_revisions', 'migration_state',
+      'TaskStoreFile.schemaVersion', 'workspace_revisions', 'SQLite-only',
       'runtime_claims', 'expires_at', 'stale', 'taskPayload', 'wait',
       'turn_inputs', 'reasoning_segments', 'change_log',
     ]) {

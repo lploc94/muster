@@ -13,7 +13,7 @@ import {
 } from './queued-turn-mutations';
 
 describe('parseEditQueuedTurnMessage', () => {
-  it('accepts a valid editQueuedTurn payload and trims ids', () => {
+  it('accepts a valid editQueuedTurn payload and trims ids', async () => {
     expect(
       parseEditQueuedTurnMessage({
         type: 'editQueuedTurn',
@@ -49,7 +49,7 @@ describe('parseEditQueuedTurnMessage', () => {
     }
   });
 
-  it('rejects oversized ids and content', () => {
+  it('rejects oversized ids and content', async () => {
     const longId = 'a'.repeat(MAX_QUEUED_MUTATION_ID_CHARS + 1);
     expect(
       parseEditQueuedTurnMessage({
@@ -82,7 +82,7 @@ describe('parseEditQueuedTurnMessage', () => {
     }
   });
 
-  it('rejects null bytes in ids and content', () => {
+  it('rejects null bytes in ids and content', async () => {
     expect(
       parseEditQueuedTurnMessage({
         type: 'editQueuedTurn',
@@ -111,7 +111,7 @@ describe('parseEditQueuedTurnMessage', () => {
 });
 
 describe('parseDeleteQueuedTurnMessage', () => {
-  it('accepts a valid deleteQueuedTurn payload and trims ids', () => {
+  it('accepts a valid deleteQueuedTurn payload and trims ids', async () => {
     expect(
       parseDeleteQueuedTurnMessage({
         type: 'deleteQueuedTurn',
@@ -137,7 +137,7 @@ describe('parseDeleteQueuedTurnMessage', () => {
 });
 
 describe('queuedMutationRefusalMessage', () => {
-  it('maps stable engine reasons to sanitized visible refusals', () => {
+  it('maps stable engine reasons to sanitized visible refusals', async () => {
     expect(queuedMutationRefusalMessage('turn is not queued')).toContain('not queued');
     expect(queuedMutationRefusalMessage('turn not found')).toContain('not found');
     expect(queuedMutationRefusalMessage('turn does not belong to task')).toContain('belong');
@@ -146,7 +146,7 @@ describe('queuedMutationRefusalMessage', () => {
     expect(queuedMutationRefusalMessage('task not found')).toContain('task not found');
   });
 
-  it('sanitizes control characters and bounds length', () => {
+  it('sanitizes control characters and bounds length', async () => {
     const message = queuedMutationRefusalMessage('boom\nstack\ttrace\x00secret');
     expect(message).not.toMatch(/[\n\t\x00]/);
     expect(message).toContain('boom');
@@ -155,7 +155,7 @@ describe('queuedMutationRefusalMessage', () => {
 });
 
 describe('sanitizeQueuedMutationText', () => {
-  it('bounds length with an ellipsis', () => {
+  it('bounds length with an ellipsis', async () => {
     const message = sanitizeQueuedMutationText('a'.repeat(500), 20);
     expect(message.length).toBe(20);
     expect(message.endsWith('…')).toBe(true);
@@ -163,9 +163,9 @@ describe('sanitizeQueuedMutationText', () => {
 });
 
 describe('routeEditQueuedTurn', () => {
-  it('refuses when the engine is not ready without calling editQueuedTurn', () => {
+  it('refuses when the engine is not ready without calling editQueuedTurn', async () => {
     const editQueuedTurn = vi.fn();
-    const outcome = routeEditQueuedTurn(
+    const outcome = await routeEditQueuedTurn(
       { type: 'editQueuedTurn', taskId: 't', turnId: 'q', content: 'x' },
       { engineReady: false, editQueuedTurn },
     );
@@ -173,9 +173,9 @@ describe('routeEditQueuedTurn', () => {
     expect(editQueuedTurn).not.toHaveBeenCalled();
   });
 
-  it('rejects malformed payloads without engine delegation', () => {
+  it('rejects malformed payloads without engine delegation', async () => {
     const editQueuedTurn = vi.fn();
-    const outcome = routeEditQueuedTurn(
+    const outcome = await routeEditQueuedTurn(
       { type: 'editQueuedTurn', taskId: 't', turnId: 'q', content: '' },
       { engineReady: true, editQueuedTurn },
     );
@@ -187,14 +187,14 @@ describe('routeEditQueuedTurn', () => {
     expect(editQueuedTurn).not.toHaveBeenCalled();
   });
 
-  it('delegates once on valid payload and returns ack for success', () => {
+  it('delegates once on valid payload and returns ack for success', async () => {
     const editQueuedTurn = vi.fn(
       (): EngineResult<{ turnId: string; messageId: string }> => ({
         ok: true,
         value: { turnId: 'turn-q', messageId: 'msg-1' },
       }),
     );
-    const outcome = routeEditQueuedTurn(
+    const outcome = await routeEditQueuedTurn(
       {
         type: 'editQueuedTurn',
         taskId: 'task-1',
@@ -219,14 +219,14 @@ describe('routeEditQueuedTurn', () => {
     ['turn does not belong to task', 'belong'],
     ['message is not pending', 'not pending'],
     ['invalid content', 'invalid content'],
-  ])('surfaces engine refusal %s as a visible command error', (reason, fragment) => {
+  ])('surfaces engine refusal %s as a visible command error', async (reason, fragment) => {
     const editQueuedTurn = vi.fn(
       (): EngineResult<{ turnId: string; messageId: string }> => ({
         ok: false,
         reason,
       }),
     );
-    const outcome = routeEditQueuedTurn(
+    const outcome = await routeEditQueuedTurn(
       {
         type: 'editQueuedTurn',
         taskId: 'task-1',
@@ -244,7 +244,7 @@ describe('routeEditQueuedTurn', () => {
     }
   });
 
-  it('never falls through to continueTask — only editQueuedTurn is invoked', () => {
+  it('never falls through to continueTask — only editQueuedTurn is invoked', async () => {
     const calls: string[] = [];
     const editQueuedTurn = vi.fn((): EngineResult<{ turnId: string; messageId: string }> => {
       calls.push('editQueuedTurn');
@@ -255,7 +255,7 @@ describe('routeEditQueuedTurn', () => {
       return { ok: true };
     });
 
-    routeEditQueuedTurn(
+    await routeEditQueuedTurn(
       {
         type: 'editQueuedTurn',
         taskId: 'task-1',
@@ -271,9 +271,9 @@ describe('routeEditQueuedTurn', () => {
 });
 
 describe('routeDeleteQueuedTurn', () => {
-  it('refuses when the engine is not ready without calling deleteQueuedTurn', () => {
+  it('refuses when the engine is not ready without calling deleteQueuedTurn', async () => {
     const deleteQueuedTurn = vi.fn();
-    const outcome = routeDeleteQueuedTurn(
+    const outcome = await routeDeleteQueuedTurn(
       { type: 'deleteQueuedTurn', taskId: 't', turnId: 'q' },
       { engineReady: false, deleteQueuedTurn },
     );
@@ -281,9 +281,9 @@ describe('routeDeleteQueuedTurn', () => {
     expect(deleteQueuedTurn).not.toHaveBeenCalled();
   });
 
-  it('rejects malformed payloads without engine delegation', () => {
+  it('rejects malformed payloads without engine delegation', async () => {
     const deleteQueuedTurn = vi.fn();
-    const outcome = routeDeleteQueuedTurn(
+    const outcome = await routeDeleteQueuedTurn(
       { type: 'deleteQueuedTurn', taskId: 't' },
       { engineReady: true, deleteQueuedTurn },
     );
@@ -291,14 +291,14 @@ describe('routeDeleteQueuedTurn', () => {
     expect(deleteQueuedTurn).not.toHaveBeenCalled();
   });
 
-  it('delegates once on valid payload and returns ack for success', () => {
+  it('delegates once on valid payload and returns ack for success', async () => {
     const deleteQueuedTurn = vi.fn(
       (): EngineResult<{ turnId: string; deletedMessageIds: string[] }> => ({
         ok: true,
         value: { turnId: 'turn-q', deletedMessageIds: ['msg-1'] },
       }),
     );
-    const outcome = routeDeleteQueuedTurn(
+    const outcome = await routeDeleteQueuedTurn(
       { type: 'deleteQueuedTurn', taskId: 'task-1', turnId: 'turn-q' },
       { engineReady: true, deleteQueuedTurn },
     );
@@ -312,14 +312,14 @@ describe('routeDeleteQueuedTurn', () => {
     });
   });
 
-  it('surfaces stale-dispatch refusal without leaking stack traces', () => {
+  it('surfaces stale-dispatch refusal without leaking stack traces', async () => {
     const deleteQueuedTurn = vi.fn(
       (): EngineResult<{ turnId: string; deletedMessageIds: string[] }> => ({
         ok: false,
         reason: 'turn is not queued\n    at TaskEngine.deleteQueuedTurn (engine.ts:1:1)',
       }),
     );
-    const outcome = routeDeleteQueuedTurn(
+    const outcome = await routeDeleteQueuedTurn(
       { type: 'deleteQueuedTurn', taskId: 'task-1', turnId: 'turn-q' },
       { engineReady: true, deleteQueuedTurn },
     );

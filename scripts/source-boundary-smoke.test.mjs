@@ -77,7 +77,7 @@ const validFixture = {
   'src/extension.ts': "import * as vscode from 'vscode';\nimport { makeBackend } from './backends/index';\nwebview.postMessage({ type: 'done' });\n",
   'src/backends/claude.ts': "import { spawn } from 'child_process';\nimport { Backend, NormalizedEvent, RunOptions } from '../types';\nspawn('claude', []);\nyield { type: 'turnCompleted' };\n",
   'src/runner.ts': "import { Backend, NormalizedEvent, RunOptions } from './types';\nexport async function* runTurn(backend: Backend, options: RunOptions): AsyncIterable<NormalizedEvent> { yield* backend.run(options); }\n",
-  'src/task/store.ts': "export class TaskStore { commit() {} }\nexport interface TaskStoreFile {}\n",
+  'src/task/repository.ts': "export interface TaskRepository { execute(command: unknown): Promise<unknown> }\nexport class SqliteTaskRepository implements TaskRepository { async execute(command) {} }\n",
   'src/types.ts': "export type NormalizedEvent = { type: 'turnCompleted' } | { type: 'error'; message: string };\nexport interface RunOptions { prompt: string; resumeId?: string; mcpConfigPath?: string; }\nexport interface Backend { run(options: RunOptions): AsyncIterable<NormalizedEvent>; }\n",
   'mcp/muster-ask-server.mjs': "import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';\nconst runtimeDir = process.env.MUSTER_RUNTIME_DIR;\nif (!runtimeDir) process.exit(1);\nawait server.connect(new StdioServerTransport());\n",
 };

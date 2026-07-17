@@ -4,7 +4,6 @@
  */
 
 import { evaluateDependency } from './deps';
-import { isActiveHandoffPhase } from './engine-handoff';
 import { effectiveTaskResult } from './dataflow';
 import type { MusterTask, TaskStoreFile, TaskTurn } from './types';
 
@@ -144,10 +143,7 @@ export function evaluateTaskReadiness(file: TaskStoreFile, taskId: string): Task
     };
   }
 
-  // Missing releaseState: legacy tasks with turns behave as released (matches migrate).
-  const releaseState: 'draft' | 'released' =
-    task.releaseState ?? (turns.length > 0 ? 'released' : 'draft');
-  if (releaseState === 'draft') {
+  if (task.releaseState === 'draft') {
     reasons.push({
       code: 'draft',
       message: 'task is draft (not released)',
@@ -182,14 +178,6 @@ export function evaluateTaskReadiness(file: TaskStoreFile, taskId: string): Task
     });
   }
 
-  if (task.handoff?.version === 1 && isActiveHandoffPhase(task.handoff.phase)) {
-    reasons.push({
-      code: 'handoff_active',
-      message: 'runtime handoff in progress',
-      detail: { phase: task.handoff.phase },
-    });
-  }
-
   const hasPromotableQueued = queued.some((t) => t.holdAutoPromote !== true);
   // Held follow-ups must not block a later non-held safe auto-retry (scheduler FIFO).
   if (queued.length > 0 && !hasPromotableQueued) {
@@ -202,7 +190,7 @@ export function evaluateTaskReadiness(file: TaskStoreFile, taskId: string): Task
 
   // Only schedulable when released, has non-held queued turn, and no hard blockers.
   const hardBlock =
-    releaseState === 'draft' ||
+    task.releaseState === 'draft' ||
     inputReasons.length > 0 ||
     reasons.some((r) =>
       (
@@ -218,7 +206,7 @@ export function evaluateTaskReadiness(file: TaskStoreFile, taskId: string): Task
         ] as ReadinessCode[]
       ).includes(r.code),
     );
-  const schedulable = releaseState === 'released' && hasPromotableQueued && !hardBlock;
+  const schedulable = task.releaseState === 'released' && hasPromotableQueued && !hardBlock;
 
   if (schedulable) {
     return {
@@ -236,8 +224,8 @@ export function evaluateTaskReadiness(file: TaskStoreFile, taskId: string): Task
 
   if (reasons.length === 0) {
     reasons.push({
-      code: releaseState === 'draft' ? 'draft' : 'ready',
-      message: releaseState === 'draft' ? 'draft' : 'no queued turn',
+      code: task.releaseState === 'draft' ? 'draft' : 'ready',
+      message: task.releaseState === 'draft' ? 'draft' : 'no queued turn',
     });
   }
 

@@ -11,6 +11,25 @@ import { deriveEntityId } from './engine-graph';
 import { parseTaskTypeRegistry } from './task-types';
 import { RepositoryProjection, withRepositoryProjection } from './repository-projection';
 
+function currentTask(id: string, overrides: Partial<MusterTask> = {}): MusterTask {
+  return {
+    id,
+    role: 'worker',
+    lifecycle: 'open',
+    releaseState: 'released',
+    goal: id,
+    parentId: null,
+    dependencies: [],
+    backend: 'fake',
+    capabilities: [],
+    executionPolicy: { maxTurns: 10, maxAutomaticRetries: 0 },
+    revision: 0,
+    createdAt: '2026-07-16T00:00:00.000Z',
+    updatedAt: '2026-07-16T00:00:00.000Z',
+    ...overrides,
+  };
+}
+
 describe('TaskEngine repository-only boundary', () => {
   it('hydrates live operation/cancel/runtime coordination rows on reload', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-engine-coordination-reload-'));
@@ -81,6 +100,256 @@ describe('TaskEngine repository-only boundary', () => {
       await engine.whenIdle();
       await expect(repository.getTurn('repository-turn')).resolves.toMatchObject({ status: 'succeeded' });
       await expect(repository.getRuntimeClaim('repository-turn')).resolves.toBeUndefined();
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('reconciles a completed child wait into a deferred SQLite continuation on reload', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-engine-child-wait-reload-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    let runCalls = 0;
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const repository = new SqliteTaskRepository(client, 'ws');
+      await repository.execute({
+        kind: 'upsertWorkspace', workspaceId: 'ws', identityKey: 'child-wait-reload',
+        displayName: 'Child wait reload', createdAt: 'now', lastOpenedAt: 'now',
+      });
+      const waitTurnId = 'wait-turn';
+      const parent = currentTask('parent', {
+        role: 'coordinator',
+        wait: {
+          kind: 'children', taskIds: ['child'], registeredByTurnId: waitTurnId,
+          wakeOn: ['terminal'],
+        },
+      });
+      const child = currentTask('child', {
+        parentId: parent.id,
+        lifecycle: 'succeeded',
+        taskResult: { version: 1, revision: 1, summary: 'done' },
+        finishedAt: '2026-07-16T00:00:01.000Z',
+      });
+      await repository.execute({ kind: 'createTask', workspaceId: 'ws', task: parent });
+      await repository.execute({ kind: 'createTask', workspaceId: 'ws', task: child });
+      await repository.execute({
+        kind: 'createTurn', workspaceId: 'ws', turn: {
+          id: waitTurnId, taskId: parent.id, sequence: 1, status: 'succeeded',
+          trigger: 'engine', inputs: [], createdAt: '2026-07-16T00:00:00.000Z',
+          finishedAt: '2026-07-16T00:00:00.500Z',
+        },
+      });
+
+      const engine = await TaskEngine.loadAsync({
+        repository,
+        workspaceId: 'ws',
+        makeBackend: () => ({ name: 'fake', run: async function* () {} }),
+        runTurn: async function* () {
+          runCalls += 1;
+          yield { type: 'turnCompleted' };
+        },
+        clock: () => '2026-07-16T00:00:02.000Z',
+      });
+
+      const continuationId = `${waitTurnId}-continuation`;
+      await expect(repository.getTurn(continuationId)).resolves.toMatchObject({
+        taskId: parent.id,
+        status: 'queued',
+        inputs: [{ kind: 'child_results', taskIds: [child.id] }],
+      });
+      expect((await repository.getTask(parent.id))?.wait).toBeUndefined();
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      expect(runCalls).toBe(0);
+
+      await expect(engine.resumeQueuedTurnAsync(parent.id, continuationId)).resolves.toEqual({
+        ok: true,
+        value: undefined,
+      });
+      await engine.whenIdle();
+      expect(runCalls).toBe(1);
+      await expect(repository.getTurn(continuationId)).resolves.toMatchObject({ status: 'succeeded' });
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('interrupts an unclaimed live turn and holds its queued follow-up on SQLite reload', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-engine-orphan-reload-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const repository = new SqliteTaskRepository(client, 'ws');
+      await repository.execute({
+        kind: 'upsertWorkspace', workspaceId: 'ws', identityKey: 'orphan-reload',
+        displayName: 'Orphan reload', createdAt: 'now', lastOpenedAt: 'now',
+      });
+      const task = currentTask('orphan-task');
+      await repository.execute({ kind: 'createTask', workspaceId: 'ws', task });
+      await repository.execute({
+        kind: 'createTurn', workspaceId: 'ws', turn: {
+          id: 'live-turn', taskId: task.id, sequence: 1, status: 'running', trigger: 'user',
+          inputs: [], createdAt: '2026-07-16T00:00:01.000Z', startedAt: '2026-07-16T00:00:01.500Z',
+        },
+      });
+      await repository.execute({
+        kind: 'createTurn', workspaceId: 'ws', turn: {
+          id: 'follow-up', taskId: task.id, sequence: 2, status: 'queued', trigger: 'user',
+          inputs: [], createdAt: '2026-07-16T00:00:02.000Z',
+        },
+      });
+
+      await TaskEngine.loadAsync({
+        repository,
+        workspaceId: 'ws',
+        makeBackend: () => ({ name: 'fake', run: async function* () {} }),
+        clock: () => '2026-07-16T00:00:03.000Z',
+      });
+
+      await expect(repository.getTurn('live-turn')).resolves.toMatchObject({
+        status: 'interrupted',
+        failureClass: 'uncertain',
+        dispatchPhase: 'prompt_outstanding',
+      });
+      await expect(repository.getTurn('follow-up')).resolves.toMatchObject({
+        status: 'queued',
+        holdAutoPromote: true,
+      });
+      await expect(repository.getRuntimeClaim('live-turn')).resolves.toBeUndefined();
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('edits and deletes queued follow-ups through the async SQLite engine boundary', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-engine-queued-mutations-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let engine: TaskEngine | undefined;
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const repository = new SqliteTaskRepository(client, 'ws');
+      await repository.execute({
+        kind: 'upsertWorkspace', workspaceId: 'ws', identityKey: 'queued-mutations',
+        displayName: 'Queued mutations', createdAt: 'now', lastOpenedAt: 'now',
+      });
+      engine = await TaskEngine.loadAsync({
+        repository,
+        workspaceId: 'ws',
+        makeBackend: () => ({
+          name: 'fake',
+          capabilities: { supportsMCP: true, supportsReasoning: false, supportsDetailedToolEvents: false },
+          run: async function* () {},
+        }),
+        runTurn: async function* () {
+          await gate;
+          yield { type: 'turnCompleted' };
+        },
+        clock: () => '2026-07-16T00:00:05.000Z',
+      });
+      const started = await engine.startNewTask({ goal: 'queue mutations', backend: 'fake' });
+      expect(started.ok).toBe(true);
+      if (!started.ok) return;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((await repository.getTurn(started.value.turnId))?.status === 'running') break;
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+      await expect(repository.getTurn(started.value.turnId)).resolves.toMatchObject({ status: 'running' });
+
+      const queued = await engine.sendAsync(started.value.taskId, 'original follow-up');
+      expect(queued.ok).toBe(true);
+      if (!queued.ok || !queued.value.turnId) return;
+      await expect(repository.getTurn(queued.value.turnId)).resolves.toMatchObject({ status: 'queued' });
+
+      await expect(engine.editQueuedTurnAsync(
+        started.value.taskId,
+        queued.value.turnId,
+        '  revised follow-up  ',
+      )).resolves.toMatchObject({ ok: true });
+      expect((await repository.listMessages(started.value.taskId)).find(
+        (message) => message.id === queued.value.messageId,
+      )?.content).toBe('revised follow-up');
+
+      await expect(engine.deleteQueuedTurnAsync(
+        started.value.taskId,
+        queued.value.turnId,
+      )).resolves.toMatchObject({
+        ok: true,
+        value: { turnId: queued.value.turnId, deletedMessageIds: [queued.value.messageId] },
+      });
+      await expect(repository.getTurn(queued.value.turnId)).resolves.toBeUndefined();
+      expect((await repository.listMessages(started.value.taskId)).some(
+        (message) => message.id === queued.value.messageId,
+      )).toBe(false);
+
+      await expect(engine.stageDispositionAsync(
+        started.value.turnId,
+        { kind: 'idle' },
+        'queued-mutations-idle',
+      )).resolves.toEqual({ ok: true, value: undefined });
+      release();
+      await engine.whenIdle();
+      await expect(repository.getTurn(started.value.turnId)).resolves.toMatchObject({ status: 'succeeded' });
+    } finally {
+      release();
+      await engine?.whenIdle();
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('applies dependency terminal policy before a queued SQLite turn can dispatch', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-engine-dependency-terminal-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    let runCalls = 0;
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const repository = new SqliteTaskRepository(client, 'ws');
+      await repository.execute({
+        kind: 'upsertWorkspace', workspaceId: 'ws', identityKey: 'dependency-terminal',
+        displayName: 'Dependency terminal', createdAt: 'now', lastOpenedAt: 'now',
+      });
+      const producer = currentTask('producer', {
+        lifecycle: 'failed',
+        error: 'producer failed',
+        finishedAt: '2026-07-16T00:00:01.000Z',
+      });
+      const dependent = currentTask('dependent', {
+        dependencies: [{ taskId: producer.id, requiredOutcome: 'succeeded', onUnsatisfied: 'skip' }],
+      });
+      await repository.execute({ kind: 'createTask', workspaceId: 'ws', task: producer });
+      await repository.execute({ kind: 'createTask', workspaceId: 'ws', task: dependent });
+      await repository.execute({
+        kind: 'createTurn', workspaceId: 'ws', turn: {
+          id: 'dependent-turn', taskId: dependent.id, sequence: 1, status: 'queued', trigger: 'engine',
+          inputs: [], createdAt: '2026-07-16T00:00:02.000Z',
+        },
+      });
+      const engine = await TaskEngine.loadAsync({
+        repository,
+        workspaceId: 'ws',
+        makeBackend: () => ({ name: 'fake', run: async function* () {} }),
+        runTurn: async function* () {
+          runCalls += 1;
+          yield { type: 'turnCompleted' };
+        },
+        clock: () => '2026-07-16T00:00:03.000Z',
+      });
+
+      await expect(engine.resumeQueuedTurnAsync(dependent.id, 'dependent-turn')).resolves.toEqual({
+        ok: true,
+        value: undefined,
+      });
+      await engine.whenIdle();
+      expect(runCalls).toBe(0);
+      await expect(repository.getTask(dependent.id)).resolves.toMatchObject({
+        lifecycle: 'skipped',
+        sealedBy: { kind: 'coordinator', mode: 'dependency_policy' },
+      });
+      await expect(repository.getTurn('dependent-turn')).resolves.toMatchObject({ status: 'cancelled' });
     } finally {
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });

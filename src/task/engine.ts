@@ -1,5 +1,4 @@
-import { randomBytes, randomUUID } from 'crypto';
-import * as fs from 'fs';
+import { randomUUID } from 'crypto';
 import type { Answers, AskRef } from '../bridge/ask-bridge';
 import { AskBridge } from '../bridge/ask-bridge';
 import { CredentialRegistry } from '../bridge/credentials';
@@ -28,7 +27,6 @@ import {
 import {
   buildCompactContinuationContext,
   captureContinuationCutoff,
-  isActiveHandoffPhase,
 } from './engine-handoff';
 import { deriveViewStatus } from './derived-status';
 import type { DepGraph } from './deps';
@@ -65,12 +63,9 @@ import {
 } from './execution-policy';
 import { TASK_ERROR_MAX_BYTES, TASK_RESULT_MAX_BYTES } from './content-limits';
 import { selectCommittedSessionId } from './session-select';
-import type { LegacyStorePort, TaskReadPort } from './store-port';
+import type { TaskReadPort } from './store-port';
 import {
   deriveResourceClaimKeys,
-  JsonTaskRepository,
-  type RepositoryCommand,
-  type RepositoryCommandResult,
   type TaskRepository,
 } from './repository';
 import { RepositoryProjection, withRepositoryProjection } from './repository-projection';
@@ -120,6 +115,9 @@ import type {
   TurnInput,
 } from './types';
 
+/** Extra lifetime after the frozen run deadline before a runtime claim is reclaimable. */
+export const LEASE_CLEANUP_BUFFER_MS = 60_000;
+
 export interface DispositionLimits {
   maxResult: number;
   maxError: number;
@@ -132,12 +130,8 @@ export type EngineEvent =
   | { type: 'turnError'; taskId: string; turnId: string; message: string };
 
 export interface TaskEngineConfig {
-  /** Legacy JSON read projection. Optional when an async repository is supplied. */
-  store?: LegacyStorePort;
-  /** Transitional async persistence boundary. JSON is injected by legacy tests;
-   * SQLite becomes the production implementation at cutover. */
-  repository?: TaskRepository;
-  workspaceId?: string;
+  repository: TaskRepository;
+  workspaceId: string;
   makeBackend: (name: string) => Backend;
   runTurn?: (backend: Backend, options: RunOptions) => AsyncIterable<NormalizedEvent>;
   dispositionLimits?: DispositionLimits;
@@ -214,22 +208,6 @@ export type EngineResult<T> =
   | { ok: true; value: T }
   | { ok: false; reason: string };
 
-export interface LeaseRecord {
-  pid: number;
-  token: string;
-  /**
-   * ISO timestamp the lease was acquired. Absent on legacy records written before this
-   * field existed; a missing/unparseable value is treated as "very old" → reclaimable.
-   */
-  createdAt?: string;
-  /** New leases expire after their owning turn deadline plus cleanup buffer. */
-  expiresAt?: string;
-}
-
-/** Compatibility age fallback for legacy lease records without `expiresAt`. */
-export const MAX_LEASE_AGE_MS = 1_800_000;
-export const LEASE_CLEANUP_BUFFER_MS = 60_000;
-
 /**
  * Attention message set when auto-remediation pauses on an identical recurring verify
  * failure. Stable literal so the pause branch can detect it and stay idempotent across
@@ -257,212 +235,6 @@ function normalizeRuntimeLabel(value: string, max: number): string | undefined {
   if (!trimmed || trimmed.length > max) return undefined;
   if (/[\u0000-\u001f\u007f]/.test(trimmed)) return undefined;
   return trimmed;
-}
-
-function isProcessDead(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return false;
-  } catch (error) {
-    const err = error as NodeJS.ErrnoException;
-    return err.code === 'ESRCH';
-  }
-}
-
-function readLockRecord(lockPath: string): LeaseRecord | undefined {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(lockPath, 'utf8')) as LeaseRecord;
-    if (typeof parsed.pid === 'number' && typeof parsed.token === 'string') {
-      return parsed;
-    }
-  } catch {
-    return undefined;
-  }
-  return undefined;
-}
-
-export function leasePath(storePath: string, turnId: string): string {
-  // Batch entity ids include their local id in the suffix (for example
-  // `turn:producer-<hash>`). A raw colon starts an NTFS alternate data stream on
-  // Windows, collapsing distinct turn leases onto `<store>.lease.turn` and making
-  // workers spin forever while contending for the same file. encodeURIComponent keeps
-  // ordinary `turn-...` ids readable while making every lease a portable file name.
-  return `${storePath}.lease.${encodeURIComponent(turnId)}`;
-}
-
-/**
- * A lease is reclaimable when it is missing/empty/unparseable, owned by a dead PID, or
- * past its explicit deadline. Legacy records without `expiresAt` use `createdAt` plus
- * {@link MAX_LEASE_AGE_MS}; missing legacy timestamps are treated as very old. This is
- * the single source of truth for acquisition and reload reconciliation.
- */
-export function isLeaseReclaimable(record: LeaseRecord | undefined): boolean {
-  if (!record) {
-    return true;
-  }
-  if (isProcessDead(record.pid)) {
-    return true;
-  }
-  if (record.expiresAt) {
-    const expires = Date.parse(record.expiresAt);
-    if (Number.isFinite(expires)) {
-      return Date.now() > expires;
-    }
-  }
-  if (!record.createdAt) {
-    return true;
-  }
-  const created = Date.parse(record.createdAt);
-  if (Number.isNaN(created)) {
-    return true;
-  }
-  return Date.now() - created > MAX_LEASE_AGE_MS;
-}
-
-function updateLeaseExpiry(
-  storePath: string,
-  turnId: string,
-  record: LeaseRecord,
-  runDeadlineAt: string,
-): void {
-  const target = leasePath(storePath, turnId);
-  const current = readLockRecord(target);
-  if (current?.pid !== record.pid || current.token !== record.token) return;
-  const deadline = Date.parse(runDeadlineAt);
-  if (!Number.isFinite(deadline)) return;
-  const next: LeaseRecord = {
-    ...current,
-    expiresAt: new Date(deadline + LEASE_CLEANUP_BUFFER_MS).toISOString(),
-  };
-  try {
-    fs.writeFileSync(target, JSON.stringify(next), 'utf8');
-    record.expiresAt = next.expiresAt;
-  } catch {
-    // Compatibility fallback remains createdAt age + PID liveness.
-  }
-}
-
-/**
- * Reclaim a stale lease safely, mirroring the legacy store's lock reclaim.
- * Never disturbs a live, well-formed lease. A suspicious lease is claimed atomically via
- * rename — only one contender can win that rename, and each operates on the exact file
- * instance it removed — which closes the read-then-unlink TOCTOU where a stale read could
- * otherwise delete a freshly published live lease (letting two engines run one turn).
- * Returns true when the path was freed (a retry can now acquire).
- */
-function reclaimStaleLease(target: string): boolean {
-  const observed = readLockRecord(target);
-  if (!isLeaseReclaimable(observed)) {
-    return false;
-  }
-  // Looks stale (empty/corrupt, dead owner, or over max-age). Claim it atomically by
-  // renaming it aside rather than unlinking the path in place.
-  const quarantine = `${target}.${process.pid}.${randomBytes(4).toString('hex')}.stale`;
-  try {
-    fs.renameSync(target, quarantine);
-  } catch (error) {
-    // ENOENT: another contender already reclaimed it — the path is free now, so a retry
-    // can acquire. Any other error: leave the lease untouched.
-    return (error as NodeJS.ErrnoException).code === 'ENOENT';
-  }
-  // We now exclusively hold whatever WAS at `target`. Re-inspect that exact instance.
-  const claimed = readLockRecord(quarantine);
-  if (!isLeaseReclaimable(claimed)) {
-    // Rare race: a fresh, live lease was published between the observation and the rename.
-    // Best-effort restore so its owner is not silently displaced.
-    try {
-      fs.linkSync(quarantine, target);
-    } catch {
-      // target already re-taken by another acquirer; nothing safe to do
-    }
-    try {
-      fs.unlinkSync(quarantine);
-    } catch {
-      // best-effort
-    }
-    return false;
-  }
-  // Confirmed stale — discard it. `target` is now free for a retry.
-  try {
-    fs.unlinkSync(quarantine);
-  } catch {
-    // best-effort
-  }
-  return true;
-}
-
-export function tryAcquireLease(storePath: string, turnId: string): LeaseRecord | undefined {
-  const target = leasePath(storePath, turnId);
-  const record: LeaseRecord = {
-    pid: process.pid,
-    token: randomBytes(16).toString('hex'),
-    createdAt: new Date().toISOString(),
-  };
-  // Write the full record to a private temp file first, then publish it with an atomic,
-  // exclusive hard link. This mirrors the store lock's temp+link pattern: the lease path
-  // is therefore either absent or a fully-written record — never an empty/partial file,
-  // even if this process is killed mid-acquire. (The old openSync('wx')+writeFileSync
-  // could leave an EMPTY lease on a crash, which then permanently blocked that turn's
-  // lease — a deadlock, since readLockRecord returned undefined and the reclaim path
-  // refused it.)
-  const tmpPath = `${target}.${process.pid}.${record.token}.tmp`;
-  try {
-    fs.writeFileSync(tmpPath, JSON.stringify(record), 'utf8');
-  } catch {
-    return undefined;
-  }
-  try {
-    fs.linkSync(tmpPath, target);
-    return record;
-  } catch (error) {
-    const err = error as NodeJS.ErrnoException;
-    if (err.code !== 'EEXIST') {
-      return undefined;
-    }
-    // A lease is present. Reclaim it only if stale, then retry the atomic publish once.
-    // reclaimStaleLease claims via rename (never unlinks the path after a stale read), so
-    // it cannot delete a lease a peer published in the meantime.
-    if (!reclaimStaleLease(target)) {
-      return undefined;
-    }
-    try {
-      fs.linkSync(tmpPath, target);
-      return record;
-    } catch {
-      // Another contender re-took the freed path first — let the caller retry later.
-      return undefined;
-    }
-  } finally {
-    try {
-      fs.unlinkSync(tmpPath);
-    } catch {
-      // best-effort: an orphaned temp is harmless and uniquely named
-    }
-  }
-}
-
-function releaseLease(storePath: string, turnId: string, record: LeaseRecord): void {
-  const path = leasePath(storePath, turnId);
-  const existing = readLockRecord(path);
-  if (existing?.pid === record.pid && existing.token === record.token) {
-    try {
-      fs.unlinkSync(path);
-    } catch {
-      // best-effort
-    }
-  }
-}
-
-export function leaseOwnerAlive(storePath: string, turnId: string): boolean {
-  // "Alive" means a non-reclaimable lease: a live owner holding a fresh, well-formed
-  // record. A dead PID, empty/corrupt file, or an over-age lease (PID-reuse defense) all
-  // count as not-alive, so reload reconciliation reclaims the orphaned turn.
-  return !isLeaseReclaimable(readLockRecord(leasePath(storePath, turnId)));
-}
-
-function ownsLocalLease(storePath: string, turnId: string): boolean {
-  const existing = readLockRecord(leasePath(storePath, turnId));
-  return existing?.pid === process.pid;
 }
 
 /** Stable fingerprint for Phase C send idempotency (existing-task path). */
@@ -633,7 +405,6 @@ export class TaskEngine {
   private readonly runTurnFn: (backend: Backend, options: RunOptions) => AsyncIterable<NormalizedEvent>;
   private readonly limits: DispositionLimits;
   private readonly clock?: () => string;
-  private readonly storePath: string;
   /** Stable owner identity for repository runtime claims in this extension host. */
   private readonly runtimeOwnerId: string;
   private readonly askBridge: AskBridge;
@@ -697,16 +468,14 @@ export class TaskEngine {
     config: TaskEngineConfig,
     store: TaskReadPort | RepositoryProjection,
     repository: TaskRepository,
-    storePath: string,
   ) {
     this.store = store;
-    this.workspaceId = config.workspaceId ?? 'legacy-workspace';
+    this.workspaceId = config.workspaceId;
     this.repository = repository;
     this.makeBackend = config.makeBackend;
     this.runTurnFn = config.runTurn ?? defaultRunTurn;
     this.limits = config.dispositionLimits ?? DEFAULT_LIMITS;
     this.clock = config.clock;
-    this.storePath = storePath;
     this.runtimeOwnerId = `${process.pid}:${randomUUID()}`;
     this.askBridge = config.askBridge ?? new AskBridge();
     this.credentialRegistry = config.credentialRegistry;
@@ -737,26 +506,7 @@ export class TaskEngine {
       }));
   }
 
-  /**
-   * Synchronous compatibility bridge for legacy unit callers that construct the
-   * JSON adapter. Production/SQLite paths must use the async repository API;
-   * keeping this bridge here removes direct legacy-store mutation from engine code
-   * without pretending a worker-backed SQLite command can be synchronous.
-   */
-  private executeLegacySync(command: RepositoryCommand): RepositoryCommandResult {
-    if (!this.repository.executeSync) {
-      return { ok: true, changed: false, reason: 'use the async repository mutation path' };
-    }
-    try {
-      return this.repository.executeSync(command);
-    } catch (error) {
-      return { ok: true, changed: false, reason: error instanceof Error ? error.message : String(error) };
-    }
-  }
-
-  /** Acquire a durable per-turn runtime claim. Claims are the cross-process
-   * ownership fence; filesystem lease files are retained only as legacy test
-   * helpers and are not consulted by dispatch. */
+  /** Acquire the durable per-turn cross-process ownership claim. */
   private async claimRuntimeTurn(turnId: string, expiresAt: string): Promise<boolean> {
     const now = nowIso(this.clock);
     try {
@@ -1184,22 +934,11 @@ export class TaskEngine {
     return result;
   }
 
-  static load(config: TaskEngineConfig): TaskEngine {
-    if (!config.store) throw new Error('TaskEngine.load requires store; use loadAsync with a repository');
-    const repository = config.repository ?? new JsonTaskRepository(config.store, config.workspaceId ?? 'legacy-workspace');
-    const engine = new TaskEngine(config, config.store, repository, config.store.getStorePath());
-    engine.reconcileReload();
-    return engine;
-  }
-
   /** Repository-only constructor. No JSON file is created or used. */
   static async loadAsync(config: TaskEngineConfig): Promise<TaskEngine> {
-    if (config.store) return TaskEngine.load(config);
-    if (!config.repository) throw new Error('TaskEngine requires either store or repository');
-    const workspaceId = config.workspaceId ?? 'legacy-workspace';
-    const projection = await RepositoryProjection.load(config.repository, workspaceId);
+    const projection = await RepositoryProjection.load(config.repository, config.workspaceId);
     const repository = withRepositoryProjection(config.repository, projection);
-    const engine = new TaskEngine(config, projection, repository, '');
+    const engine = new TaskEngine(config, projection, repository);
     await engine.reconcileReloadFromRepository();
     return engine;
   }
@@ -1416,91 +1155,6 @@ export class TaskEngine {
     };
   }
 
-  /**
-   * Enqueue a user message as a FIFO follow-up turn (plain Enter / idle send).
-   * Does not interrupt a live turn. Schedules immediately when eligible.
-   */
-  continueTaskWithMessage(
-    taskId: string,
-    instruction: string,
-  ): EngineResult<{
-    messageId: string;
-    turnId: string;
-    outcome: 'queued' | 'scheduled';
-  }> {
-    const reserved = this.reserveQueuedFollowUp(taskId, instruction);
-    if (!reserved.ok) {
-      return reserved;
-    }
-    const liveTask = this.store.getTask(taskId);
-    const handoffBusy =
-      liveTask?.handoff?.version === 1 && isActiveHandoffPhase(liveTask.handoff.phase);
-    if (!handoffBusy) {
-      void this.scheduleTurn(reserved.value.turnId);
-    }
-    return {
-      ok: true,
-      value: {
-        ...reserved.value,
-        outcome: handoffBusy ? 'queued' : 'scheduled',
-      },
-    };
-  }
-
-  /**
-   * Direct message while live: **reserve first, interrupt second**.
-   * Never concurrent `backend.sendLiveInput`. On reserve failure the live turn
-   * keeps running. Interrupt only when a local liveRuns handle exists.
-   */
-  interruptAndSend(
-    taskId: string,
-    instruction: string,
-  ): EngineResult<{
-    messageId: string;
-    turnId: string;
-    outcome: 'queued' | 'scheduled';
-    interruptedTurnId?: string;
-  }> {
-    const file = this.store.getFile();
-    const live = turnsForTask(file, taskId).find(
-      (t) => t.status === 'running' || t.status === 'waiting_user',
-    );
-
-    if (!live) {
-      const cont = this.continueTaskWithMessage(taskId, instruction);
-      if (!cont.ok) return cont;
-      return { ok: true, value: cont.value };
-    }
-
-    // ISSUE-3: reserve continuation before any abort.
-    const reserved = this.reserveQueuedFollowUp(taskId, instruction);
-    if (!reserved.ok) {
-      return reserved;
-    }
-
-    const hasLocalHandle = this.liveRuns.has(live.id);
-    if (hasLocalHandle) {
-      this.interruptTurn(live.id);
-      return {
-        ok: true,
-        value: {
-          ...reserved.value,
-          outcome: 'queued',
-          interruptedTurnId: live.id,
-        },
-      };
-    }
-
-    // No local handle: message stays queued; do not fake interrupt success.
-    return {
-      ok: true,
-      value: {
-        ...reserved.value,
-        outcome: 'queued',
-      },
-    };
-  }
-
   /** Repository-backed variant used by the host's interrupt-and-send action. */
   async interruptAndSendAsync(
     taskId: string,
@@ -1545,75 +1199,6 @@ export class TaskEngine {
     };
   }
 
-  /** Durable queue row only — does not schedule or interrupt. */
-  private reserveQueuedFollowUp(
-    taskId: string,
-    instruction: string,
-  ): EngineResult<{ messageId: string; turnId: string }> {
-    const messageId = randomUUID();
-    const turnId = randomUUID();
-    const now = nowIso(this.clock);
-    const file = this.store.getFile();
-    const task = file.tasks[taskId];
-    if (!task) return { ok: false, reason: 'task not found' };
-    if (isTerminalLifecycle(task.lifecycle)) return { ok: false, reason: 'task is terminal' };
-    const turnCap = canCreateTurn(file, taskId, this.resourceLimits);
-    if (!turnCap.ok) return turnCap;
-    const turns = turnsForTask(file, taskId);
-    const queued = transitionContinueTask(task, turns, {
-      turnId,
-      now,
-      inputs: [{ kind: 'message', messageId }],
-    });
-    if (!queued.ok) return queued;
-    const write = this.executeLegacySync({
-      kind: 'enqueueMessageTurn',
-      workspaceId: this.workspaceId,
-      expectedTaskRevision: task.revision,
-      maxTurnsPerTask: this.resourceLimits.maxTurnsPerTask,
-      task,
-      message: {
-        id: messageId,
-        taskId,
-        role: 'user',
-        content: instruction,
-        state: 'pending',
-        createdAt: now,
-      },
-      turn: queued.next,
-    });
-    if (!write.changed) return { ok: false, reason: write.reason ?? 'task changed; retry' };
-    return { ok: true, value: { messageId, turnId } };
-  }
-
-  resumeQueuedTurn(turnId: string): EngineResult<void> {
-    const file = this.store.getFile();
-    const turn = file.turns[turnId];
-    if (!turn) {
-      return { ok: false, reason: 'turn not found' };
-    }
-    if (turn.status !== 'queued') {
-      return { ok: false, reason: 'turn is not queued' };
-    }
-    // Explicit resume clears MEM030 hold so this turn may auto-promote.
-    if (turn.holdAutoPromote) {
-      const clear = this.executeLegacySync({
-        kind: 'clearQueuedTurnHold', workspaceId: this.workspaceId,
-        taskId: turn.taskId, turnId,
-      });
-      if (!clear.changed) {
-        return { ok: false, reason: clear.reason ?? 'turn is no longer queued' };
-      }
-    }
-    const promote = canPromoteTurn(this.store.getFile(), turnId, this.resourceLimits);
-    if (!promote.ok) {
-      return { ok: false, reason: promote.reason };
-    }
-    this.deferredQueuedTurns.delete(turnId);
-    void this.scheduleTurn(turnId);
-    return { ok: true, value: undefined };
-  }
-
   async resumeQueuedTurnAsync(taskId: string, turnId: string): Promise<EngineResult<void>> {
     const turn = (await this.repository.listTurns(taskId)).find((candidate) => candidate.id === turnId);
     if (!turn) return { ok: false, reason: 'turn not found' };
@@ -1643,55 +1228,6 @@ export class TaskEngine {
 
   viewStatus(taskId: string) {
     return this.store.viewStatusOf(taskId);
-  }
-
-  createTask(params: {
-    id?: string;
-    goal: string;
-    backend: string;
-    role?: TaskRole;
-    dependencies?: TaskDependency[];
-    capabilities?: TaskCapability[];
-    executionPolicy?: TaskExecutionPolicy;
-    /** Workspace directory the agent runs in for this task's turns. */
-    cwd?: string;
-  }): EngineResult<{ taskId: string }> {
-    const backend = this.makeBackend(params.backend);
-    if (!canBindTaskToBackend(backend.capabilities)) {
-      return { ok: false, reason: 'backend does not support MCP' };
-    }
-
-    const taskId = params.id ?? randomUUID();
-    const now = nowIso(this.clock);
-    const input: CreateTaskInput = {
-      id: taskId,
-      role: params.role ?? 'coordinator',
-      goal: params.goal,
-      parentId: null,
-      dependencies: params.dependencies ?? [],
-      backend: params.backend,
-      cwd: params.cwd,
-      capabilities:
-        params.capabilities ?? [
-          'create_child',
-          'wait_child',
-          'read_subtree',
-          'cancel_child',
-          'interrupt_child',
-        ],
-      executionPolicy: resolveTaskExecutionPolicy(params.executionPolicy, {
-        userRunLimitMs: this.getRunLimitMs(),
-      }),
-    };
-
-    const file = this.store.getFile();
-    if (file.tasks[taskId]) return { ok: false, reason: 'task id already exists' };
-    const graph = depGraphFromFile(file);
-    const result = createTask(input, { rootId: taskId, graph, now });
-    if (!result.ok) return result;
-    const write = this.executeLegacySync({ kind: 'createTask', workspaceId: this.workspaceId, task: result.next });
-    if (!write.changed) return { ok: false, reason: write.reason ?? 'could not create task' };
-    return { ok: true, value: { taskId } };
   }
 
   /**
@@ -1751,7 +1287,7 @@ export class TaskEngine {
     ]);
     const aggregate: TaskStoreFile = {
       schemaVersion: 6,
-      revision: await (this.repository.getWorkspaceRevision?.() ?? Promise.resolve(0)),
+      revision: await this.repository.getWorkspaceRevision(),
       tasks: { [task.id]: task },
       turns: Object.fromEntries(turns.map((turn) => [turn.id, turn])),
       messages: Object.fromEntries(messages.map((message) => [message.id, message])),
@@ -1836,101 +1372,7 @@ export class TaskEngine {
     };
   }
 
-  send(
-    taskId: string,
-    content: string,
-    options?: { agentContent?: string; clientRequestId?: string },
-  ): EngineResult<{ messageId: string; turnId?: string; clientRequestId?: string }> {
-    const clientRequestId =
-      typeof options?.clientRequestId === 'string' && options.clientRequestId.trim()
-        ? options.clientRequestId.trim()
-        : undefined;
-    const agentContent =
-      options?.agentContent && options.agentContent !== content ? options.agentContent : undefined;
-    const fingerprint = sendFingerprint({
-      kind: 'existing',
-      taskId,
-      content,
-      agentContent,
-    });
-
-    const file = this.store.getFile();
-    const existing = clientRequestId ? file.sendReceipts?.[clientRequestId] : undefined;
-    if (existing) {
-      if (existing.fingerprint !== fingerprint) {
-        return { ok: false, reason: 'clientRequestId conflict: different payload' };
-      }
-      const task = file.tasks[taskId];
-      const handoffBusy = task?.handoff?.version === 1 && isActiveHandoffPhase(task.handoff.phase);
-      if (!handoffBusy && !this.deferredQueuedTurns.has(existing.turnId)) {
-        void this.scheduleTurn(existing.turnId);
-      }
-      return { ok: true, value: { messageId: existing.messageId, turnId: existing.turnId, clientRequestId } };
-    }
-
-    const current = file.tasks[taskId];
-    if (!current) return { ok: false, reason: 'task not found' };
-    const now = nowIso(this.clock);
-    let nextTask = current;
-    if (isTerminalLifecycle(nextTask.lifecycle)) {
-      const reopened = reopenTask(nextTask, { now });
-      if (!reopened.ok) return reopened;
-      nextTask = reopened.next;
-    }
-    if (nextTask.outcomeProposal) {
-      nextTask = { ...nextTask, outcomeProposal: undefined, revision: nextTask.revision + 1, updatedAt: now };
-    }
-    if ((nextTask.releaseState ?? 'draft') === 'draft') {
-      nextTask = {
-        ...nextTask,
-        releaseState: 'released',
-        releasedAt: now,
-        releaseAttemptId: `host:send:${randomUUID()}`,
-        revision: nextTask.revision + 1,
-        updatedAt: now,
-      };
-    }
-    const turns = turnsForTask(file, taskId);
-    const turnCap = canCreateTurn(file, taskId, this.resourceLimits);
-    if (!turnCap.ok) return turnCap;
-    const messageId = randomUUID();
-    const turnId = randomUUID();
-    const message: TaskMessage = {
-      id: messageId, taskId, role: 'user', content,
-      ...(agentContent ? { agentContent } : {}), state: 'pending', createdAt: now,
-    };
-    const queue = turns.length === 0
-      ? transitionStartTask(nextTask, turns, { turnId, now, inputs: [{ kind: 'message', messageId }] })
-      : transitionContinueTask(nextTask, turns, { turnId, now, inputs: [{ kind: 'message', messageId }] });
-    if (!queue.ok) return queue;
-    const write = this.executeLegacySync({
-      kind: 'enqueueMessageTurn', workspaceId: this.workspaceId,
-      expectedTaskRevision: current.revision,
-      maxTurnsPerTask: this.resourceLimits.maxTurnsPerTask,
-      task: nextTask, message, turn: queue.next,
-      ...(clientRequestId ? {
-        receipt: { clientRequestId, fingerprint, taskId, messageId, turnId, createdAt: now },
-      } : {}),
-    });
-    if (!write.changed) {
-      const raced = clientRequestId ? this.store.getFile().sendReceipts?.[clientRequestId] : undefined;
-      if (raced && raced.fingerprint === fingerprint) {
-        void this.scheduleTurn(raced.turnId);
-        return { ok: true, value: { messageId: raced.messageId, turnId: raced.turnId, clientRequestId } };
-      }
-      return { ok: false, reason: write.reason ?? 'task changed; retry send' };
-    }
-    const handoffBusy = nextTask.handoff?.version === 1 && isActiveHandoffPhase(nextTask.handoff.phase);
-    if (!handoffBusy && !this.deferredQueuedTurns.has(turnId)) void this.scheduleTurn(turnId);
-    return { ok: true, value: { messageId, turnId, ...(clientRequestId ? { clientRequestId } : {}) } };
-  }
-
-  /**
-   * Async repository-backed host send path. Kept alongside the legacy sync
-   * method while the JSON adapter remains available to existing engine tests;
-   * extension-host requests use this path, so task/message/turn/receipt are one
-   * named transaction rather than a filesystem-store callback.
-   */
+  /** Repository-backed host send path; task/message/turn/receipt are one transaction. */
   async sendAsync(
     taskId: string,
     content: string,
@@ -1951,8 +1393,7 @@ export class TaskEngine {
         return { ok: false, reason: 'clientRequestId conflict: different payload' };
       }
       const task = await this.repository.getTask(taskId);
-      const handoffBusy = task?.handoff?.version === 1 && isActiveHandoffPhase(task.handoff.phase);
-      if (!handoffBusy && !this.deferredQueuedTurns.has(receipt.turnId)) {
+      if (!this.deferredQueuedTurns.has(receipt.turnId)) {
         void this.scheduleTurn(receipt.turnId);
       }
       return {
@@ -1982,7 +1423,7 @@ export class TaskEngine {
         updatedAt: now,
       };
     }
-    if ((nextTask.releaseState ?? 'draft') === 'draft') {
+    if (nextTask.releaseState === 'draft') {
       nextTask = {
         ...nextTask,
         releaseState: 'released',
@@ -2049,8 +1490,7 @@ export class TaskEngine {
       return { ok: false, reason: error instanceof Error ? error.message : String(error) };
     }
 
-    const handoffBusy = nextTask.handoff?.version === 1 && isActiveHandoffPhase(nextTask.handoff.phase);
-    if (!handoffBusy && !this.deferredQueuedTurns.has(turnId)) {
+    if (!this.deferredQueuedTurns.has(turnId)) {
       void this.scheduleTurn(turnId);
     }
     return {
@@ -2064,39 +1504,6 @@ export class TaskEngine {
    * Host boundary may apply a tighter limit; this protects the engine store.
    */
   static readonly MAX_QUEUED_MESSAGE_CHARS = 100_000;
-
-  /**
-   * R013: edit the bound pending user message of an undispatched queued turn.
-   * Fail-closed once executeTurn's startCommit assigns messages / promotes to running.
-   */
-  editQueuedTurn(
-    taskId: string,
-    turnId: string,
-    content: string,
-  ): EngineResult<{ turnId: string; messageId: string }> {
-    if (typeof content !== 'string') {
-      return { ok: false, reason: 'invalid content' };
-    }
-    if (content.length > TaskEngine.MAX_QUEUED_MESSAGE_CHARS) {
-      return {
-        ok: false,
-        reason: `content exceeds ${TaskEngine.MAX_QUEUED_MESSAGE_CHARS} characters`,
-      };
-    }
-
-    const file = this.store.getFile();
-    if (!file.tasks[taskId]) return { ok: false, reason: 'task not found' };
-    const prepared = prepareEditQueuedTurn(taskId, file.turns[turnId], file.messages, content);
-    if (!prepared.ok) return prepared;
-    const result = this.executeLegacySync({
-      kind: 'editQueuedMessage', workspaceId: this.workspaceId, taskId, turnId,
-      content: prepared.next.content,
-    });
-    if (!result.changed || !result.messageId) {
-      return { ok: false, reason: result.reason ?? 'turn is no longer queued' };
-    }
-    return { ok: true, value: { turnId, messageId: result.messageId } };
-  }
 
   async editQueuedTurnAsync(
     taskId: string,
@@ -2117,25 +1524,6 @@ export class TaskEngine {
     return { ok: true, value: { turnId, messageId: result.messageId } };
   }
 
-  /**
-   * R013: remove an undispatched queued turn and its bound pending user message(s).
-   * Does not cancelProcess, does not touch live/settled turns or task lifecycle.
-   */
-  deleteQueuedTurn(
-    taskId: string,
-    turnId: string,
-  ): EngineResult<{ turnId: string; deletedMessageIds: string[] }> {
-    const file = this.store.getFile();
-    if (!file.tasks[taskId]) return { ok: false, reason: 'task not found' };
-    const prepared = prepareDeleteQueuedTurn(taskId, file.turns[turnId], file.messages);
-    if (!prepared.ok) return prepared;
-    const result = this.executeLegacySync({
-      kind: 'deleteQueuedTurnAndMessages', workspaceId: this.workspaceId, taskId, turnId,
-    });
-    if (!result.changed) return { ok: false, reason: result.reason ?? 'turn is no longer queued' };
-    return { ok: true, value: { turnId, deletedMessageIds: [...(result.deletedMessageIds ?? prepared.next.messageIds)] } };
-  }
-
   async deleteQueuedTurnAsync(
     taskId: string,
     turnId: string,
@@ -2145,67 +1533,6 @@ export class TaskEngine {
     });
     if (!result.changed) return { ok: false, reason: result.reason ?? 'turn is no longer queued' };
     return { ok: true, value: { turnId, deletedMessageIds: [...(result.deletedMessageIds ?? [])] } };
-  }
-
-  startTask(
-    taskId: string,
-    inputs: TurnInput[] = [],
-  ): EngineResult<{ turnId: string }> {
-    const trust = this.requireWorkspaceTrusted();
-    if (!trust.ok) return trust;
-    const turnId = randomUUID();
-    const now = nowIso(this.clock);
-    const file = this.store.getFile();
-    const task = file.tasks[taskId];
-    if (!task) return { ok: false, reason: 'task not found' };
-    if (isTerminalLifecycle(task.lifecycle)) return { ok: false, reason: 'task is terminal' };
-    let taskForStart = task;
-    if ((task.releaseState ?? 'draft') === 'draft') {
-      taskForStart = {
-        ...task,
-        releaseState: 'released', releasedAt: now,
-        releaseAttemptId: `host:startTask:${turnId}`,
-        revision: task.revision + 1, updatedAt: now,
-      };
-    }
-    const turnCap = canCreateTurn(file, taskId, this.resourceLimits);
-    if (!turnCap.ok) return turnCap;
-    const result = transitionStartTask(taskForStart, turnsForTask(file, taskId), {
-      turnId, now, inputs, trigger: 'engine',
-    });
-    if (!result.ok) return result;
-    const write = this.executeLegacySync({
-      kind: 'queueTaskTurn', workspaceId: this.workspaceId,
-      expectedTaskRevision: task.revision, maxTurnsPerTask: this.resourceLimits.maxTurnsPerTask,
-      task: taskForStart, turn: result.next,
-    });
-    if (!write.changed) return { ok: false, reason: write.reason ?? 'task changed; retry' };
-    void this.scheduleTurn(turnId);
-    return { ok: true, value: { turnId } };
-  }
-
-  continueTask(
-    taskId: string,
-    inputs: TurnInput[] = [],
-  ): EngineResult<{ turnId: string }> {
-    const turnId = randomUUID();
-    const now = nowIso(this.clock);
-    const file = this.store.getFile();
-    const task = file.tasks[taskId];
-    if (!task) return { ok: false, reason: 'task not found' };
-    if (isTerminalLifecycle(task.lifecycle)) return { ok: false, reason: 'task is terminal' };
-    const turnCap = canCreateTurn(file, taskId, this.resourceLimits);
-    if (!turnCap.ok) return turnCap;
-    const result = transitionContinueTask(task, turnsForTask(file, taskId), { turnId, now, inputs });
-    if (!result.ok) return result;
-    const write = this.executeLegacySync({
-      kind: 'queueTaskTurn', workspaceId: this.workspaceId,
-      expectedTaskRevision: task.revision, maxTurnsPerTask: this.resourceLimits.maxTurnsPerTask,
-      task, turn: result.next,
-    });
-    if (!write.changed) return { ok: false, reason: write.reason ?? 'task changed; retry' };
-    void this.scheduleTurn(turnId);
-    return { ok: true, value: { turnId } };
   }
 
   /** Repository-backed start boundary used by host/graph async callers. */
@@ -2222,7 +1549,7 @@ export class TaskEngine {
     if (turns.length > 0) return { ok: false, reason: 'startTask is only valid before the first turn' };
     const now = nowIso(this.clock);
     const turnId = randomUUID();
-    const nextTask = (task.releaseState ?? 'draft') === 'draft'
+    const nextTask = task.releaseState === 'draft'
       ? {
           ...task,
           releaseState: 'released' as const,
@@ -2274,32 +1601,6 @@ export class TaskEngine {
     return { ok: true, value: { turnId } };
   }
 
-  stageDisposition(
-    turnId: string,
-    disposition: TurnDisposition,
-    opId: string,
-  ): EngineResult<void> {
-    const turn = this.store.getFile().turns[turnId];
-    if (!turn) return { ok: false, reason: 'turn not found' };
-    const task = this.store.getFile().tasks[turn.taskId];
-    if (!task) return { ok: false, reason: 'task not found' };
-    const result = stageDisposition(turn, disposition, opId, {
-      acceptedOpId: this.acceptedOpIds.get(turnId), limits: this.limits,
-    });
-    if (!result.ok) return result;
-    const write = this.executeLegacySync({
-      kind: 'stageDisposition', workspaceId: this.workspaceId, turnId, opId,
-      turn: result.next.turn, expectedStatuses: [turn.status as 'running' | 'waiting_user'],
-      ...(turn.disposition ? { expectedDisposition: turn.disposition } : {}),
-      expectedRuntimeEpoch: task.runtimeEpoch,
-    });
-    if (!write.changed && JSON.stringify(result.next.turn) !== JSON.stringify(turn)) {
-      return { ok: false, reason: write.reason ?? 'turn changed; retry' };
-    }
-    this.acceptedOpIds.set(turnId, opId);
-    return { ok: true, value: undefined };
-  }
-
   async stageDispositionAsync(
     turnId: string,
     disposition: TurnDisposition,
@@ -2327,13 +1628,12 @@ export class TaskEngine {
   }
 
 
-  interruptTurn(turnId: string): EngineResult<void> {
+  private abortLocalTurn(turnId: string): void {
     const handle = this.liveRuns.get(turnId);
     if (handle) {
       handle.interruptArmed = true;
       handle.controller.abort();
     }
-    return { ok: true, value: undefined };
   }
 
   /** Durable interrupt request followed by aborting only a locally-owned run. */
@@ -2351,45 +1651,8 @@ export class TaskEngine {
       request: { kind: 'interrupt', by: 'user', opId: `interrupt:${turnId}:${now}`, at: now },
     });
     if (!request.changed) return { ok: false, reason: request.reason ?? 'turn is no longer live' };
-    this.interruptTurn(turnId);
+    this.abortLocalTurn(turnId);
     return { ok: true, value: undefined };
-  }
-
-  retryTurn(
-    turnId: string,
-    instruction: string,
-    options?: { reuseOriginalInputs?: boolean },
-  ): EngineResult<{ turnId: string }> {
-    const taskId = this.store.getFile().turns[turnId]?.taskId;
-    if (!taskId) {
-      return { ok: false, reason: 'turn not found' };
-    }
-    const newTurnId = randomUUID();
-    const now = nowIso(this.clock);
-    const file = this.store.getFile();
-    const task = file.tasks[taskId];
-    const oldTurn = file.turns[turnId];
-    if (!task || !oldTurn) return { ok: false, reason: 'turn not found' };
-    const result = retryTurn(task, turnsForTask(file, taskId), oldTurn, {
-      turnId: newTurnId, instruction, now,
-      reuseOriginalInputs: options?.reuseOriginalInputs === true,
-    });
-    if (!result.ok) return result;
-    let nextTask = task;
-    if (!task.committedSessionId && task.handoff?.version === 2 &&
-      task.handoff.continuation.status === 'assigned' && task.handoff.continuation.turnId === oldTurn.id) {
-      nextTask = { ...task, handoff: { ...task.handoff,
-        continuation: { status: 'assigned', turnId: newTurnId, assignedAt: now } } };
-    }
-    const write = this.executeLegacySync({
-      kind: 'retryTurn', workspaceId: this.workspaceId,
-      expectedTaskRevision: task.revision,
-      maxTurnsPerTask: this.resourceLimits.maxTurnsPerTask,
-      task: nextTask, turn: result.next,
-    });
-    if (!write.changed) return { ok: false, reason: write.reason ?? 'task changed; retry' };
-    void this.scheduleTurn(newTurnId);
-    return { ok: true, value: { turnId: newTurnId } };
   }
 
   async retryTurnAsync(
@@ -2435,77 +1698,6 @@ export class TaskEngine {
     if (!write.changed) return { ok: false, reason: write.reason ?? 'task changed; retry' };
     void this.scheduleTurn(newTurnId);
     return { ok: true, value: { turnId: newTurnId } };
-  }
-
-  /**
-   * User (or host UI) sets task lifecycle. Never driven by CLI process status.
-   * Cancels/interrupts live turns when sealing terminal outcomes.
-   * For `skipped`, cascades to unfinished descendants (see skipTask).
-   */
-  setTaskLifecycle(
-    taskId: string,
-    lifecycle: TaskLifecycleState,
-    options?: { result?: string; error?: string },
-  ): EngineResult<void> {
-    if (lifecycle === 'skipped') {
-      return this.skipTask(taskId);
-    }
-
-    const now = nowIso(this.clock);
-    const file = this.store.getFile();
-    const task = file.tasks[taskId];
-    if (!task) return { ok: false, reason: 'task not found' };
-    const turns = turnsForTask(file, taskId);
-    const live = turns.find((t) => t.status === 'running' || t.status === 'waiting_user');
-    const remoteOwned = !!live && this.runtimeClaimAlive(live.id) && !this.ownsRuntimeClaim(live.id);
-    const transitioned = transitionSetTaskLifecycle(task, lifecycle, {
-      now, result: options?.result, error: options?.error, sealedBy: { kind: 'user' },
-    });
-    if (!transitioned.ok) return transitioned;
-    const changedTurns: TaskTurn[] = [];
-    const cancelRequests: { turnId: string; request: import('./types').CancelRequest }[] = [];
-    if (lifecycle !== 'open') {
-      for (const pending of turns.filter((turn) =>
-        turn.status === 'queued' || turn.status === 'running' || turn.status === 'waiting_user')) {
-        if (live && remoteOwned && pending.id === live.id) {
-          cancelRequests.push({
-            turnId: pending.id,
-            request: { kind: 'interrupt', by: 'engine', opId: `lifecycle-${lifecycle}-${taskId}`, at: now },
-          });
-          continue;
-        }
-        if (pending.status === 'queued') {
-          const cancelled = cancelPendingTurn(pending, { now });
-          if (cancelled.ok) changedTurns.push(cancelled.next);
-        } else {
-          const interrupted = interruptTurn(pending, { now });
-          if (interrupted.ok) changedTurns.push({ ...interrupted.next, isCancellation: lifecycle === 'cancelled' });
-        }
-      }
-    }
-    const write = this.executeLegacySync({
-      kind: 'applyTaskLifecycle', workspaceId: this.workspaceId, taskId,
-      expectedTaskRevision: task.revision, task: transitioned.next,
-      turns: changedTurns,
-      expectedTurns: turns.filter((turn) => turn.status === 'queued' || turn.status === 'running' || turn.status === 'waiting_user')
-        .map((turn) => ({ id: turn.id, status: turn.status, runtimeEpoch: turn.runtimeEpoch })),
-      cancelRequests,
-    });
-    if (!write.changed) return { ok: false, reason: write.reason ?? 'task changed; retry' };
-
-    if (live && !remoteOwned && lifecycle !== 'open') {
-      this.liveRuns.get(live.id)?.controller.abort();
-    }
-
-    if (live && !remoteOwned) {
-      this.askBridge.cancelForTurn(live.id, 'task lifecycle changed');
-      this.dropElicitationWaits(live.id);
-      // Note: host elicitationBridge.cancelForSession is invoked from extension cancel paths when available.
-      this.credentialRegistry?.revoke(live.id);
-    }
-    // Seal may unblock dependents — rescan queued released turns.
-    this.rescanSchedulableTurns();
-    return { ok: true, value: undefined };
   }
 
   async setTaskLifecycleAsync(
@@ -2641,67 +1833,12 @@ export class TaskEngine {
     return { ok: true, taskIds, liveTurnIds, remoteLiveTurnIds, tasks, turns, expectedTasks, expectedTurns, cancelRequests };
   }
 
-  /**
-   * Skip task + unfinished descendants (user or authorized coordinator).
-   * Hard terminal: won’t perform. Live turns are interrupted first.
-   */
-  skipTask(taskId: string): EngineResult<void> {
-    const now = nowIso(this.clock);
-    const file = this.store.getFile();
-    const prepared = this.prepareLifecycleCascade(taskId, 'skip', file, now);
-    if (!prepared.ok) return prepared;
-    const write = this.executeLegacySync({
-      kind: 'cascadeTaskLifecycle', workspaceId: this.workspaceId, rootTaskId: taskId, mode: 'skip',
-      expectedTasks: prepared.expectedTasks, expectedTurns: prepared.expectedTurns,
-      tasks: prepared.tasks, turns: prepared.turns, cancelRequests: prepared.cancelRequests,
-    });
-    if (!write.changed) return { ok: false, reason: write.reason ?? 'task changed; retry' };
-    for (const turnId of prepared.liveTurnIds) {
-      if (prepared.remoteLiveTurnIds.has(turnId)) continue;
-      this.liveRuns.get(turnId)?.controller.abort();
-      this.acceptedOpIds.delete(turnId);
-      this.askBridge.cancelForTurn(turnId, 'task skipped');
-      this.dropElicitationWaits(turnId);
-      this.credentialRegistry?.revoke(turnId);
-    }
-    this.rescanSchedulableTurns();
-    return { ok: true, value: undefined };
-  }
-
-  /**
-   * Cancel task + descendants (user or authorized coordinator). Not driven by CLI exit.
-   */
-  cancelTask(taskId: string): EngineResult<void> {
-    const now = nowIso(this.clock);
-    const file = this.store.getFile();
-    const prepared = this.prepareLifecycleCascade(taskId, 'cancel', file, now);
-    if (!prepared.ok) return prepared;
-    const write = this.executeLegacySync({
-      kind: 'cascadeTaskLifecycle', workspaceId: this.workspaceId, rootTaskId: taskId, mode: 'cancel',
-      expectedTasks: prepared.expectedTasks, expectedTurns: prepared.expectedTurns,
-      tasks: prepared.tasks, turns: prepared.turns, cancelRequests: prepared.cancelRequests,
-    });
-    if (!write.changed) return { ok: false, reason: write.reason ?? 'task changed; retry' };
-    for (const turnId of prepared.liveTurnIds) {
-      if (prepared.remoteLiveTurnIds.has(turnId)) continue;
-      this.liveRuns.get(turnId)?.controller.abort();
-      this.acceptedOpIds.delete(turnId);
-      this.askBridge.cancelForTurn(turnId, 'task cancelled');
-      this.dropElicitationWaits(turnId);
-      this.credentialRegistry?.revoke(turnId);
-    }
-    this.rescanSchedulableTurns();
-    return { ok: true, value: undefined };
-  }
-
   async skipTaskAsync(taskId: string): Promise<EngineResult<void>> {
     const tasks = await this.repository.listSubtree(taskId);
     if (tasks.length === 0) return { ok: false, reason: 'task not found' };
-    const turns = this.repository.listTurnsForTasks
-      ? await this.repository.listTurnsForTasks(tasks.map((task) => task.id))
-      : (await Promise.all(tasks.map((task) => this.repository.listTurns(task.id)))).flat();
+    const turns = await this.repository.listTurnsForTasks(tasks.map((task) => task.id));
     const file: TaskStoreFile = {
-      schemaVersion: 6, revision: await (this.repository.getWorkspaceRevision?.() ?? Promise.resolve(0)),
+      schemaVersion: 6, revision: await this.repository.getWorkspaceRevision(),
       tasks: Object.fromEntries(tasks.map((task) => [task.id, task])),
       turns: Object.fromEntries(turns.map((turn) => [turn.id, turn])), messages: {},
     };
@@ -2722,11 +1859,9 @@ export class TaskEngine {
   async cancelTaskAsync(taskId: string): Promise<EngineResult<void>> {
     const tasks = await this.repository.listSubtree(taskId);
     if (tasks.length === 0) return { ok: false, reason: 'task not found' };
-    const turns = this.repository.listTurnsForTasks
-      ? await this.repository.listTurnsForTasks(tasks.map((task) => task.id))
-      : (await Promise.all(tasks.map((task) => this.repository.listTurns(task.id)))).flat();
+    const turns = await this.repository.listTurnsForTasks(tasks.map((task) => task.id));
     const file: TaskStoreFile = {
-      schemaVersion: 6, revision: await (this.repository.getWorkspaceRevision?.() ?? Promise.resolve(0)),
+      schemaVersion: 6, revision: await this.repository.getWorkspaceRevision(),
       tasks: Object.fromEntries(tasks.map((task) => [task.id, task])),
       turns: Object.fromEntries(turns.map((turn) => [turn.id, turn])), messages: {},
     };
@@ -2744,66 +1879,9 @@ export class TaskEngine {
     return { ok: true, value: undefined };
   }
 
-  private reconcileReload(): void {
-    const file = this.store.getFile();
-    const now = nowIso(this.clock);
-    for (const turn of Object.values(file.turns)) {
-      if (turn.status !== 'running' && turn.status !== 'waiting_user') {
-        continue;
-      }
-      if (this.runtimeClaimAlive(turn.id)) {
-        continue;
-      }
-      const currentTask = file.tasks[turn.taskId];
-      if (!currentTask) continue;
-      const interrupted = interruptTurn(turn, { now });
-      if (!interrupted.ok) continue;
-      const nextTurn: TaskTurn = {
-        ...interrupted.next,
-        failureClass: 'uncertain',
-        dispatchPhase: turn.dispatchPhase ?? 'prompt_outstanding',
-      };
-      const heldTurns: TaskTurn[] = [];
-      let nextTask = currentTask;
-      if (currentTask.attention?.code !== 'awaiting_parent_answer') {
-        for (const queued of turnsForTask(file, turn.taskId).filter((candidate) => candidate.status === 'queued' && !candidate.holdAutoPromote)) {
-          heldTurns.push({ ...queued, holdAutoPromote: true });
-        }
-      }
-      const repairId = `${turn.id}-disposition-repair`;
-      if (currentTask.attention?.code === 'disposition_repair_pending' && currentTask.lifecycle === 'open' && !file.turns[repairId]) {
-        nextTask = {
-          ...currentTask,
-          attention: { ...currentTask.attention, message: `${currentTask.attention.message}; reload will requeue repair` },
-          revision: currentTask.revision + 1,
-          updatedAt: now,
-        };
-      }
-      const write = this.executeLegacySync({
-        kind: 'reconcileOrphanTurn', workspaceId: this.workspaceId, taskId: turn.taskId,
-        expectedTaskRevision: currentTask.revision, expectedTurnStatus: turn.status,
-        task: nextTask, turn: nextTurn, heldTurns,
-      });
-      if (!write.changed) continue;
-      this.acceptedOpIds.delete(turn.id);
-      this.askBridge.cancelForTurn(turn.id, 'reload interrupt');
-      this.dropElicitationWaits(turn.id);
-      this.credentialRegistry?.revoke(turn.id);
-      // Re-queue disposition repair for interrupted turns that still need it.
-      const taskAfter = this.store.getFile().tasks[turn.taskId];
-      if (taskAfter?.attention?.code === 'disposition_repair_pending') {
-        void this.enqueueDispositionRepair(turn.taskId, turn.id);
-      }
-    }
-
-    this.reconcileChildWaits({ schedule: false });
-    this.deferReloadQueuedTurns();
-    void processCancelRequests(this.graphDeps());
-  }
-
   /** Repository-only reload recovery. A non-expired runtime claim belongs to
    * another live host; missing/expired claims are reconciled behind the same
-   * task/turn fences as the JSON compatibility path. */
+   * task/turn fences. */
   private async reconcileReloadFromRepository(): Promise<void> {
     const file = this.store.getFile();
     const now = nowIso(this.clock);
@@ -2828,7 +1906,9 @@ export class TaskEngine {
       });
       await this.repository.execute({ kind: 'releaseRuntime', workspaceId: this.workspaceId, turnId: turn.id });
     }
+    await this.reconcileChildWaits({ schedule: false });
     this.deferReloadQueuedTurns();
+    await processCancelRequests(this.graphDeps());
   }
 
   /** Interrupt live source turns in the same commit; queued turns are retagged to target epoch. */
@@ -2907,8 +1987,7 @@ export class TaskEngine {
     for (const turn of Object.values(file.turns)) {
       if (turn.status !== 'queued') continue;
       const task = file.tasks[turn.taskId];
-      const releaseState =
-        task?.releaseState ?? (Object.values(file.turns).some((t) => t.taskId === turn.taskId) ? 'released' : 'draft');
+      if (!task) continue;
       // safe_never_dispatched: never running, no prompt dispatch phase (or only pre-queue).
       const safeNeverDispatched =
         !turn.dispatchPhase ||
@@ -2918,7 +1997,7 @@ export class TaskEngine {
         file.turns[turn.retryOf]?.failureClass === 'safe_to_retry';
       if (
         trusted &&
-        releaseState === 'released' &&
+        task.releaseState === 'released' &&
         (safeNeverDispatched || safeRetry) &&
         turn.holdAutoPromote !== true
       ) {
@@ -2957,7 +2036,7 @@ export class TaskEngine {
     }
   }
 
-  private reconcileChildWaits(options?: { schedule?: boolean }): void {
+  private async reconcileChildWaits(options?: { schedule?: boolean }): Promise<void> {
     const schedule = options?.schedule ?? true;
     const file = this.store.getFile();
     const now = nowIso(this.clock);
@@ -2979,7 +2058,7 @@ export class TaskEngine {
         continuationTurnId, now, childAttention,
       });
       if (!result.ok) continue;
-      const write = this.executeLegacySync({
+      const write = await this.repository.execute({
         kind: 'resolveChildWait', workspaceId: this.workspaceId, taskId: task.id,
         expectedTaskRevision: task.revision, task: result.next.task, turn: result.next.turn,
       });
@@ -3009,7 +2088,7 @@ export class TaskEngine {
    * Seals dependents when a required dependency finished unsuccessfully.
    * `onUnsatisfied: block` remains open + blocked; publish wakeable attention (P0 ISSUE-6).
    */
-  private applyDependencyTerminals(): void {
+  private async applyDependencyTerminals(): Promise<void> {
     const now = nowIso(this.clock);
     const before = this.store.getFile();
     const draft = cloneTaskStoreFile(before);
@@ -3019,7 +2098,7 @@ export class TaskEngine {
       const outcome = dependencyTerminalOutcome(draft, task.id);
       if (!outcome) {
         if (
-          (current.releaseState ?? 'draft') === 'released' && current.lifecycle === 'open' &&
+          current.releaseState === 'released' && current.lifecycle === 'open' &&
           current.dependencies.some((dep) => {
             if (dep.onUnsatisfied !== 'block') return false;
             const depTask = draft.tasks[dep.taskId];
@@ -3051,7 +2130,7 @@ export class TaskEngine {
         ? { turn: Object.values(draft.turns).find((turn) => turn.taskId === task.id && JSON.stringify(turn) !== JSON.stringify(before.turns[turn.id])) } : {}),
     }));
     if (mutations.length > 0) {
-      this.executeLegacySync({
+      await this.repository.execute({
         kind: 'applyDependencyTerminals', workspaceId: this.workspaceId,
         expectedTasks: mutations.map((mutation) => ({ id: mutation.taskId, revision: before.tasks[mutation.taskId]!.revision })),
         mutations,
@@ -3083,7 +2162,7 @@ export class TaskEngine {
    * duplicate and never re-bumps `uses`. A graph with no `requiredVerdict` gate and no
    * `remediation.fixTaskId` is a strict no-op (default behavior unchanged).
    */
-  private applyVerdictRemediation(): void {
+  private async applyVerdictRemediation(): Promise<void> {
     const now = nowIso(this.clock);
     const turnsToSchedule: string[] = [];
     const before = this.store.getFile();
@@ -3452,7 +2531,7 @@ export class TaskEngine {
         .filter((task): task is MusterTask => !!task)
         .map((task) => ({ id: task.id, revision: task.revision }));
       if (expectedTaskRevisions.length > 0) {
-        this.executeLegacySync({
+        await this.repository.execute({
           kind: 'applyVerdictRemediation', workspaceId: this.workspaceId,
           expectedTaskRevisions, tasks, turns, messages, deletedTaskIds,
         });
@@ -3622,8 +2701,8 @@ export class TaskEngine {
     });
     // Apply dependency terminals before child waits so block-policy sinks get
     // attention and parents wake without waiting for an unrelated rescan.
-    this.applyDependencyTerminals();
-    this.reconcileChildWaits();
+    await this.applyDependencyTerminals();
+    await this.reconcileChildWaits();
     await this.drainPendingSendsAfterSettlement(turnId);
   }
 
@@ -3727,7 +2806,7 @@ export class TaskEngine {
       const queued = Object.values(afterFlush.turns)
         .filter((turn) => turn.status === 'queued')
         .sort((a, b) => a.sequence - b.sequence || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
-      this.applyDependencyTerminals();
+      await this.applyDependencyTerminals();
       for (const queuedTurn of queued) {
         if (this.deferredQueuedTurns.has(queuedTurn.id)) continue;
         if (settledTaskId && queuedTurn.taskId === settledTaskId) {
@@ -3745,8 +2824,8 @@ export class TaskEngine {
     // Phase C: downgrade stale host verdicts (git-guarded, no-op without host
     // verdicts) BEFORE sealing so a re-blocked fail/skip dependent seals this tick.
     await this.revalidateVerdicts();
-    this.applyDependencyTerminals();
-    this.applyVerdictRemediation();
+    await this.applyDependencyTerminals();
+    await this.applyVerdictRemediation();
     await processCancelRequests(this.graphDeps());
     if (!this.isWorkspaceTrusted()) {
       return;
@@ -4013,7 +3092,7 @@ export class TaskEngine {
     ]);
     return {
       schemaVersion: 6,
-      revision: await (this.repository.getWorkspaceRevision?.() ?? Promise.resolve(0)),
+      revision: await this.repository.getWorkspaceRevision(),
       tasks: Object.fromEntries([...tasks].map(([id, value]) => [id, value])),
       turns: Object.fromEntries(turns.map((value) => [value.id, value])),
       messages: Object.fromEntries(messages.map((value) => [value.id, value])),
@@ -4330,7 +3409,7 @@ export class TaskEngine {
         parentId: taskForDispatch.parentId,
         backend: taskForDispatch.backend,
         model: taskForDispatch.model ?? null,
-        releaseState: taskForDispatch.releaseState ?? null,
+        releaseState: taskForDispatch.releaseState,
         cwd: taskForDispatch.cwd ?? null,
         trigger: currentTurn?.trigger ?? null,
         promptChars: prompt.length,
@@ -4951,10 +4030,7 @@ export class TaskEngine {
           lifecycle: task?.lifecycle,
           disposition: turn?.disposition?.kind ?? null,
           sealedBy: task?.sealedBy ?? null,
-          resultChars:
-            typeof task?.result === 'string'
-              ? task.result.length
-              : task?.taskResult?.summary?.length ?? 0,
+          resultChars: task?.taskResult?.summary?.length ?? 0,
         });
         if (
           task?.attention?.code === 'disposition_repair_pending' &&
@@ -5037,7 +4113,7 @@ export class TaskEngine {
       task: { ...task, revision: task.revision + 1, updatedAt: now }, turn: continued.next, message,
     });
     if (write.changed) void this.scheduleTurn(repairTurnId);
-    this.reconcileChildWaits();
+    await this.reconcileChildWaits();
   }
 
   private async settleInterrupted(

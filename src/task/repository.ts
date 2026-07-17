@@ -1,4 +1,3 @@
-import type { LegacyStorePort } from './store-port';
 import type {
   CancelRequest,
   MusterTask,
@@ -9,7 +8,6 @@ import type {
   TaskDependency,
   TaskMessage,
   RuntimeClaim,
-  TaskStoreFile,
   TaskTurn,
   TurnInput,
   TurnDisposition,
@@ -19,7 +17,6 @@ import { isMutatingTask, normalizedWritePaths } from './resources';
 import { canPromoteTurn } from './scheduler';
 import { DEFAULT_RESOURCE_LIMITS } from './limits';
 import { isTerminalLifecycle, isTerminalTurn } from './transitions';
-import { deriveViewStatus } from './derived-status';
 import { TRUNCATION_MARKER } from './retention';
 import type { DbClient } from './sqlite/client';
 import type { SqlStatement, SqlValue } from './sqlite/rpc';
@@ -389,9 +386,8 @@ export interface RepositoryCommandResult {
 /**
  * Read-side boundary for task data.
  *
- * Phase 2 deliberately starts with queries only. Mutation commands are added as
- * named transactional operations once the JSON and SQLite implementations share
- * the same contract; callers must not receive a mutable store envelope.
+ * Callers receive focused queries and named transactional commands, never a
+ * mutable full-workspace envelope.
  */
 export interface TaskRepository {
   getWorkspace(): Promise<RepositoryWorkspace | undefined>;
@@ -402,38 +398,29 @@ export interface TaskRepository {
   listSubtree(rootTaskId: string): Promise<readonly MusterTask[]>;
   getTurn(turnId: string): Promise<TaskTurn | undefined>;
   listTurns(taskId: string): Promise<readonly TaskTurn[]>;
-  /** Optional bulk projection primitive; adapters fall back to per-task reads. */
-  listTurnsForTasks?(taskIds: readonly string[]): Promise<readonly TaskTurn[]>;
+  listTurnsForTasks(taskIds: readonly string[]): Promise<readonly TaskTurn[]>;
   /**
    * Bounded activity projection for tree/root summaries. It includes every
    * queued/live turn plus the latest terminal turn per task; callers that need
    * a complete transcript must use listTurns(taskId) or getTranscriptPage().
    */
-  listTurnActivityForTasks?(taskIds: readonly string[]): Promise<readonly TaskTurn[]>;
+  listTurnActivityForTasks(taskIds: readonly string[]): Promise<readonly TaskTurn[]>;
   listQueuedTurns(taskId: string): Promise<readonly TaskTurn[]>;
   listMessages(taskId: string): Promise<readonly TaskMessage[]>;
   listToolCalls(taskId: string): Promise<readonly PersistedToolCall[]>;
   listReasoning(taskId: string): Promise<readonly PersistedReasoning[]>;
   getOperation(ledgerKey: string): Promise<OperationLedgerEntry | undefined>;
   /** Coordination rows needed to recover live graph turns after host reload. */
-  listOperationsForTurns?(turnIds: readonly string[]): Promise<readonly RepositoryOperationEntry[]>;
+  listOperationsForTurns(turnIds: readonly string[]): Promise<readonly RepositoryOperationEntry[]>;
   getCancelRequest(turnId: string): Promise<CancelRequest | undefined>;
-  listCancelRequests?(): Promise<readonly RepositoryCancelEntry[]>;
+  listCancelRequests(): Promise<readonly RepositoryCancelEntry[]>;
   getRuntimeClaim(turnId: string): Promise<RuntimeClaim | undefined>;
-  listRuntimeClaims?(): Promise<readonly RuntimeClaim[]>;
+  listRuntimeClaims(): Promise<readonly RuntimeClaim[]>;
   getSendReceipt(clientRequestId: string): Promise<SendReceipt | undefined>;
   getTranscriptPage(taskId: string, cursor?: string, limit?: number): Promise<TranscriptPage>;
-  /** Current workspace revision without materializing the compatibility envelope. */
-  getWorkspaceRevision?(): Promise<number>;
+  /** Current workspace revision. */
+  getWorkspaceRevision(): Promise<number>;
   execute(command: RepositoryCommand): Promise<RepositoryCommandResult>;
-  /** Test/legacy compatibility only; production runtime uses async execute(). */
-  executeSync?(command: RepositoryCommand): RepositoryCommandResult;
-  /** Compatibility-only export/migration view; never expose this to mutation code. */
-  readEnvelopeForMigration(): Promise<Readonly<TaskStoreFile>>;
-}
-
-function clone<T>(value: T): T {
-  return JSON.parse(JSON.stringify(value)) as T;
 }
 
 /**
@@ -636,1282 +623,7 @@ function retainedTurnIds(turns: readonly TaskTurn[], keepLatestTurns: number): S
   return keep;
 }
 
-/** True when `candidateId` is a child/grandchild of `ancestorId`. Cycles are
- * treated as non-descendant after the first repeated node, matching the SQLite
- * recursive CTE's UNION de-duplication. */
-function isDescendantOf(
-  tasks: Readonly<Record<string, MusterTask>>,
-  candidateId: string,
-  ancestorId: string,
-): boolean {
-  const seen = new Set<string>();
-  let current = tasks[candidateId];
-  while (current?.parentId && !seen.has(current.id)) {
-    seen.add(current.id);
-    if (current.parentId === ancestorId) return true;
-    current = tasks[current.parentId];
-  }
-  return false;
-}
-
-/**
- * The host history actions use the same derived status as the webview. Keeping
- * this predicate in the repository boundary means JSON and SQLite make the
- * removable decision against the state they are about to mutate, rather than
- * against a stale host snapshot.
- */
-function taskIsRemovable(
-  file: TaskStoreFile,
-  taskId: string,
-  preserveRootTaskId?: string,
-): boolean {
-  if (taskId === preserveRootTaskId) return false;
-  const task = file.tasks[taskId];
-  if (!task) return false;
-  const dependencies = new Map(
-    task.dependencies
-      .map((dependency) => [dependency.taskId, file.tasks[dependency.taskId]?.lifecycle] as const)
-      .filter((entry): entry is [string, NonNullable<(typeof entry)[1]>] => entry[1] !== undefined),
-  );
-  const turns = Object.values(file.turns)
-    .filter((turn) => turn.taskId === taskId)
-    .sort((a, b) => a.sequence - b.sequence || a.createdAt.localeCompare(b.createdAt));
-  if (turns.some((turn) => turn.status === 'running' || turn.status === 'waiting_user' || turn.status === 'queued')) {
-    return false;
-  }
-  const status = deriveViewStatus(task, turns, dependencies);
-  return status === 'idle' || status === 'succeeded' || status === 'failed' ||
-    status === 'cancelled' || status === 'skipped';
-}
-
-function subtreeIdsFromFile(file: TaskStoreFile, rootTaskId: string): string[] {
-  const children = new Map<string, string[]>();
-  for (const task of Object.values(file.tasks)) {
-    if (!task.parentId) continue;
-    const list = children.get(task.parentId) ?? [];
-    list.push(task.id);
-    children.set(task.parentId, list);
-  }
-  const result: string[] = [];
-  const seen = new Set<string>();
-  const pending = [rootTaskId];
-  while (pending.length > 0) {
-    const id = pending.pop()!;
-    if (seen.has(id) || !file.tasks[id]) continue;
-    seen.add(id);
-    result.push(id);
-    pending.push(...(children.get(id) ?? []));
-  }
-  return result;
-}
-
-function removableRootIdsFromFile(
-  file: TaskStoreFile,
-  preserveRootTaskId?: string,
-  rootTaskId?: string,
-): string[][] {
-  const roots = Object.values(file.tasks)
-    .filter((task) => task.parentId === null)
-    .filter((task) => rootTaskId === undefined || task.id === rootTaskId);
-  const removable: string[][] = [];
-  for (const root of roots) {
-    const ids = subtreeIdsFromFile(file, root.id);
-    if (ids.length > 0 && ids.every((id) => taskIsRemovable(file, id, preserveRootTaskId))) {
-      removable.push(ids);
-    }
-  }
-  return removable;
-}
-
-function deleteTaskIdsFromFile(file: TaskStoreFile, ids: readonly string[]): void {
-  const idSet = new Set(ids);
-  const deletedTurnIds = new Set<string>();
-  for (const [turnId, turn] of Object.entries(file.turns)) {
-    if (!idSet.has(turn.taskId)) continue;
-    deletedTurnIds.add(turnId);
-    delete file.turns[turnId];
-  }
-  for (const [taskId] of Object.entries(file.tasks)) {
-    if (idSet.has(taskId)) delete file.tasks[taskId];
-  }
-  for (const [messageId, message] of Object.entries(file.messages)) {
-    if (idSet.has(message.taskId) || (message.turnId !== undefined && deletedTurnIds.has(message.turnId))) {
-      delete file.messages[messageId];
-    }
-  }
-  for (const [id, tool] of Object.entries(file.toolCalls ?? {})) {
-    if (idSet.has(tool.taskId) || deletedTurnIds.has(tool.turnId)) delete file.toolCalls?.[id];
-  }
-  for (const [id, reasoning] of Object.entries(file.reasoning ?? {})) {
-    if (idSet.has(reasoning.taskId) || deletedTurnIds.has(reasoning.turnId)) delete file.reasoning?.[id];
-  }
-  for (const turnId of deletedTurnIds) {
-    delete file.cancelRequests?.[turnId];
-    delete file.runtimeClaims?.[turnId];
-    for (const key of Object.keys(file.operations ?? {})) {
-      if (key.startsWith(`${turnId}:`)) delete file.operations?.[key];
-    }
-  }
-  for (const [clientRequestId, receipt] of Object.entries(file.sendReceipts ?? {})) {
-    if (idSet.has(receipt.taskId) || deletedTurnIds.has(receipt.turnId)) {
-      delete file.sendReceipts?.[clientRequestId];
-    }
-  }
-}
-
-/**
- * Compatibility adapter over the current JSON file store.
- *
- * Returning cloned values makes accidental mutation fail closed: changing a DTO
- * returned by a repository query cannot silently mutate the in-memory file.
- */
-export class JsonTaskRepository implements TaskRepository {
-  /** JSON stores are currently one-workspace-per-file; SQLite adds explicit workspace IDs. */
-  constructor(private readonly store: LegacyStorePort, private readonly workspaceId?: string) {}
-
-  async getWorkspace(): Promise<RepositoryWorkspace | undefined> {
-    // JSON stores predate the workspace registry. Returning undefined makes this
-    // limitation explicit instead of manufacturing an unstable identity.
-    return undefined;
-  }
-
-  async listWorkspaceLocations(): Promise<readonly RepositoryWorkspaceLocation[]> {
-    return [];
-  }
-
-  async getTask(taskId: string): Promise<MusterTask | undefined> {
-    const task = this.store.getFile().tasks[taskId];
-    return task ? clone(task) : undefined;
-  }
-
-  async listTasks(workspaceId: string): Promise<readonly MusterTask[]> {
-    if (this.workspaceId !== undefined && this.workspaceId !== workspaceId) return [];
-    return Object.values(this.store.getFile().tasks)
-      .map((task) => clone(task));
-  }
-
-  async listRootTasks(workspaceId: string, page: RepositoryPageRequest = {}): Promise<RepositoryPage<MusterTask>> {
-    const tasks = (await this.listTasks(workspaceId)).filter((task) => task.parentId === null);
-    return { items: tasks.slice(0, normalizeLimit(page.limit)) };
-  }
-
-  async listSubtree(rootTaskId: string): Promise<readonly MusterTask[]> {
-    const all = Object.values(this.store.getFile().tasks);
-    const result: MusterTask[] = [];
-    const pending = [rootTaskId];
-    while (pending.length > 0) {
-      const id = pending.shift()!;
-      const task = all.find((candidate) => candidate.id === id);
-      if (!task || result.some((candidate) => candidate.id === task.id)) continue;
-      result.push(clone(task));
-      for (const child of all) {
-        if (child.parentId === id) pending.push(child.id);
-      }
-    }
-    return result;
-  }
-
-  async listTurns(taskId: string): Promise<readonly TaskTurn[]> {
-    return Object.values(this.store.getFile().turns)
-      .filter((turn) => turn.taskId === taskId)
-      .sort((a, b) => a.sequence - b.sequence || a.createdAt.localeCompare(b.createdAt))
-      .map((turn) => clone(turn));
-  }
-
-  async listTurnsForTasks(taskIds: readonly string[]): Promise<readonly TaskTurn[]> {
-    const ids = new Set(taskIds);
-    return Object.values(this.store.getFile().turns)
-      .filter((turn) => ids.has(turn.taskId))
-      .sort((a, b) => a.taskId.localeCompare(b.taskId) || a.sequence - b.sequence || a.createdAt.localeCompare(b.createdAt))
-      .map((turn) => clone(turn));
-  }
-
-  async listTurnActivityForTasks(taskIds: readonly string[]): Promise<readonly TaskTurn[]> {
-    const ids = new Set(taskIds);
-    const byTask = new Map<string, TaskTurn[]>();
-    for (const turn of Object.values(this.store.getFile().turns)) {
-      if (!ids.has(turn.taskId)) continue;
-      const list = byTask.get(turn.taskId) ?? [];
-      list.push(turn);
-      byTask.set(turn.taskId, list);
-    }
-    const selected: TaskTurn[] = [];
-    for (const turns of byTask.values()) {
-      const liveOrQueued = turns.filter((turn) =>
-        turn.status === 'queued' || turn.status === 'running' || turn.status === 'waiting_user',
-      );
-      const terminal = turns
-        .filter((turn) =>
-          turn.status === 'succeeded' || turn.status === 'failed' ||
-          turn.status === 'interrupted' || turn.status === 'cancelled',
-        )
-        .sort((a, b) => b.sequence - a.sequence || b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id))[0];
-      selected.push(...liveOrQueued, ...(terminal ? [terminal] : []));
-    }
-    return selected
-      .sort((a, b) => a.taskId.localeCompare(b.taskId) || a.sequence - b.sequence || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
-      .map((turn) => clone(turn));
-  }
-
-  async getTurn(turnId: string): Promise<TaskTurn | undefined> {
-    const turn = this.store.getFile().turns[turnId];
-    return turn ? clone(turn) : undefined;
-  }
-
-  async listQueuedTurns(taskId: string): Promise<readonly TaskTurn[]> {
-    return (await this.listTurns(taskId)).filter((turn) => turn.status === 'queued');
-  }
-
-  async listMessages(taskId: string): Promise<readonly TaskMessage[]> {
-    return Object.values(this.store.getFile().messages)
-      .filter((message) => message.taskId === taskId)
-      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
-      .map((message) => clone(message));
-  }
-
-  async listToolCalls(taskId: string): Promise<readonly PersistedToolCall[]> {
-    return Object.values(this.store.getFile().toolCalls ?? {})
-      .filter((tool) => tool.taskId === taskId)
-      .sort((a, b) => a.turnId.localeCompare(b.turnId) || a.order - b.order || a.id.localeCompare(b.id))
-      .map((tool) => clone(tool));
-  }
-
-  async listReasoning(taskId: string): Promise<readonly PersistedReasoning[]> {
-    return Object.values(this.store.getFile().reasoning ?? {})
-      .filter((reasoning) => reasoning.taskId === taskId)
-      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id))
-      .map((reasoning) => clone(reasoning));
-  }
-
-  async getOperation(ledgerKey: string): Promise<OperationLedgerEntry | undefined> {
-    const entry = this.store.getFile().operations?.[ledgerKey];
-    return entry ? clone(entry) : undefined;
-  }
-
-  async listOperationsForTurns(turnIds: readonly string[]): Promise<readonly RepositoryOperationEntry[]> {
-    const prefixes = turnIds.map((turnId) => `${turnId}:`);
-    return Object.entries(this.store.getFile().operations ?? {})
-      .filter(([ledgerKey]) => prefixes.some((prefix) => ledgerKey.startsWith(prefix)))
-      .map(([ledgerKey, entry]) => ({ ledgerKey, entry: clone(entry) }));
-  }
-
-  async getCancelRequest(turnId: string): Promise<CancelRequest | undefined> {
-    const request = this.store.getFile().cancelRequests?.[turnId];
-    return request ? clone(request) : undefined;
-  }
-
-  async listCancelRequests(): Promise<readonly RepositoryCancelEntry[]> {
-    return Object.entries(this.store.getFile().cancelRequests ?? {})
-      .map(([turnId, request]) => ({ turnId, request: clone(request) }));
-  }
-
-  async getRuntimeClaim(turnId: string): Promise<RuntimeClaim | undefined> {
-    const claim = this.store.getFile().runtimeClaims?.[turnId];
-    return claim ? clone(claim) : undefined;
-  }
-
-  async listRuntimeClaims(): Promise<readonly RuntimeClaim[]> {
-    return Object.values(this.store.getFile().runtimeClaims ?? {}).map((claim) => clone(claim));
-  }
-
-  async getSendReceipt(clientRequestId: string): Promise<SendReceipt | undefined> {
-    const receipt = this.store.getFile().sendReceipts?.[clientRequestId];
-    return receipt ? clone(receipt) : undefined;
-  }
-
-  async getTranscriptPage(taskId: string, cursor?: string, limit?: number): Promise<TranscriptPage> {
-    const file = this.store.getFile();
-    const items = composeTranscript(
-      Object.values(file.turns).filter((turn) => turn.taskId === taskId),
-      Object.values(file.messages).filter((message) => message.taskId === taskId),
-      Object.values(file.toolCalls ?? {}).filter((tool) => tool.taskId === taskId),
-      Object.values(file.reasoning ?? {}).filter((reasoning) => reasoning.taskId === taskId),
-    );
-    return pageTranscript(items, Object.values(file.turns).filter((turn) => turn.taskId === taskId), cursor, limit, file.revision);
-  }
-
-  async getWorkspaceRevision(): Promise<number> {
-    return this.store.getFile().revision;
-  }
-
-  async readEnvelopeForMigration(): Promise<Readonly<TaskStoreFile>> {
-    return clone(this.store.getFile());
-  }
-
-  executeSync(command: RepositoryCommand): RepositoryCommandResult {
-    if (this.workspaceId !== undefined && this.workspaceId !== command.workspaceId) {
-      throw new Error('repository workspace mismatch');
-    }
-    let changed = false;
-    let operation: OperationLedgerEntry | undefined;
-    let messageId: string | undefined;
-    let deletedMessageIds: string[] | undefined;
-    const result = this.store.commit((draft) => {
-      switch (command.kind) {
-        case 'createChildTask':
-        case 'delegateChildTask':
-        case 'createChildTaskBatch':
-        case 'delegateChildTaskBatch':
-        case 'releaseChildTasks':
-        case 'continueChildTask':
-        case 'cancelChildTasks':
-        case 'interruptChildTask':
-        case 'cancelChildTask':
-        case 'setChildTaskLifecycle':
-        case 'waitForChildTasks':
-        case 'completeGraphTask':
-        case 'failGraphTask':
-        case 'askParent':
-        case 'answerChildQuestion':
-        case 'consumeCancelRequest': {
-          const invalid = validateGraphCommand(command);
-          if (invalid) return { ok: false, reason: invalid };
-          const prior = command.operation
-            ? draft.operations?.[command.operation.ledgerKey]
-            : undefined;
-          if (prior) {
-            if (prior.fingerprint !== command.operation!.entry.fingerprint) {
-              return { ok: false, reason: '__graph_conflict__' };
-            }
-            return { ok: false, reason: '__graph_replay__' };
-          }
-          for (const expected of command.expectedTasks) {
-            const current = draft.tasks[expected.id];
-            if (!current || current.revision !== expected.revision) {
-              return { ok: false, reason: 'task changed; retry' };
-            }
-          }
-          for (const expected of command.expectedTurns ?? []) {
-            const current = draft.turns[expected.id];
-            if (!current || current.status !== expected.status ||
-              (expected.runtimeEpoch !== undefined && (current.runtimeEpoch ?? 1) !== expected.runtimeEpoch)) {
-              return { ok: false, reason: 'turn changed; retry' };
-            }
-          }
-          for (const expected of command.expectedRuntimeClaims ?? []) {
-            const claim = draft.runtimeClaims?.[expected.turnId];
-            if (!claim || claim.ownerId !== expected.ownerId) {
-              return { ok: false, reason: 'runtime claim changed; retry' };
-            }
-          }
-          for (const expected of command.expectedCancelRequests ?? []) {
-            const request = draft.cancelRequests?.[expected.turnId];
-            if (!request || request.kind !== expected.kind || request.opId !== expected.opId) {
-              return { ok: false, reason: 'cancel request changed; retry' };
-            }
-          }
-          const insertTasks = new Set(command.insertTaskIds ?? []);
-          const insertTurns = new Set(command.insertTurnIds ?? []);
-          const insertMessages = new Set(command.insertMessageIds ?? []);
-          for (const task of command.tasks) {
-            const current = draft.tasks[task.id];
-            if (insertTasks.has(task.id)) {
-              if (current) return { ok: false, reason: 'task already exists' };
-            } else if (!current) {
-              return { ok: false, reason: 'task not found' };
-            }
-          }
-          for (const turn of command.turns) {
-            const current = draft.turns[turn.id];
-            if (insertTurns.has(turn.id)) {
-              if (current) return { ok: false, reason: 'turn already exists' };
-            } else if (!current) {
-              return { ok: false, reason: 'turn not found' };
-            }
-          }
-          for (const message of command.messages ?? []) {
-            const current = draft.messages[message.id];
-            if (insertMessages.has(message.id)) {
-              if (current) return { ok: false, reason: 'message already exists' };
-            } else if (!current) {
-              return { ok: false, reason: 'message not found' };
-            }
-          }
-          // Deletions happen first so a mutation can atomically remove a queued
-          // row and replace it with its continuation under one operation.
-          for (const messageId of command.deleteMessageIds ?? []) {
-            if (draft.messages[messageId]) {
-              delete draft.messages[messageId];
-              changed = true;
-            }
-          }
-          for (const turnId of command.deleteTurnIds ?? []) {
-            if (draft.turns[turnId]) {
-              delete draft.turns[turnId];
-              for (const messageId of Object.keys(draft.messages)) {
-                if (draft.messages[messageId]?.turnId === turnId) delete draft.messages[messageId];
-              }
-              delete draft.cancelRequests?.[turnId];
-              delete draft.runtimeClaims?.[turnId];
-              changed = true;
-            }
-          }
-          for (const taskId of command.deleteTaskIds ?? []) {
-            if (draft.tasks[taskId]) {
-              deleteTaskIdsFromFile(draft, [taskId]);
-              changed = true;
-            }
-          }
-          for (const task of command.tasks) {
-            draft.tasks[task.id] = clone(task);
-            changed = true;
-          }
-          for (const turn of command.turns) {
-            draft.turns[turn.id] = clone(turn);
-            changed = true;
-          }
-          for (const message of command.messages ?? []) {
-            draft.messages[message.id] = clone(message);
-            changed = true;
-          }
-          for (const entry of command.cancelRequests ?? []) {
-            draft.cancelRequests = draft.cancelRequests ?? {};
-            draft.cancelRequests[entry.turnId] = clone(entry.request);
-            changed = true;
-          }
-          for (const turnId of command.deleteCancelRequestTurnIds ?? []) {
-            if (draft.cancelRequests?.[turnId]) {
-              delete draft.cancelRequests[turnId];
-              changed = true;
-            }
-          }
-          for (const turnId of command.deleteRuntimeClaimTurnIds ?? []) {
-            if (draft.runtimeClaims?.[turnId]) {
-              delete draft.runtimeClaims[turnId];
-              changed = true;
-            }
-          }
-          for (const ledgerKey of command.deleteOperationKeys ?? []) {
-            if (draft.operations?.[ledgerKey]) {
-              delete draft.operations[ledgerKey];
-              changed = true;
-            }
-          }
-          // Validate references against the post-mutation graph before the JSON
-          // adapter publishes it; SQLite gets the same protection from FKs.
-          for (const task of command.tasks) {
-            if (task.parentId && !draft.tasks[task.parentId]) return { ok: false, reason: 'parent task not found' };
-            for (const dependency of task.dependencies) {
-              if (!draft.tasks[dependency.taskId]) return { ok: false, reason: 'dependency task not found' };
-            }
-          }
-          for (const turn of command.turns) {
-            if (!draft.tasks[turn.taskId]) return { ok: false, reason: 'turn task not found' };
-            for (const input of turn.inputs) {
-              if (input.kind === 'message' && !draft.messages[input.messageId]) {
-                return { ok: false, reason: 'turn message input not found' };
-              }
-            }
-          }
-          if (command.operation) {
-            draft.operations = draft.operations ?? {};
-            draft.operations![command.operation.ledgerKey] = clone(command.operation.entry);
-            changed = true;
-          }
-          return { ok: true };
-        }
-        case 'upsertWorkspace':
-        case 'recordWorkspaceLocation':
-          // A legacy JSON file is intrinsically scoped to its one workspace.
-          // The compatibility adapter has nowhere durable to put registry data,
-          // but accepting these commands keeps its domain contract useful while
-          // cutover remains SQLite-only.
-          return { ok: true };
-        case 'createTask':
-          if (draft.tasks[command.task.id]) return { ok: false, reason: 'task already exists' };
-          draft.tasks[command.task.id] = clone(command.task);
-          changed = true;
-          return { ok: true };
-        case 'createRootAndInitialTurn': {
-          const invalid = validateRootInitialTurn(command);
-          if (invalid) return { ok: false, reason: invalid };
-          if (draft.tasks[command.task.id]) return { ok: false, reason: 'task already exists' };
-          if (draft.turns[command.turn.id]) return { ok: false, reason: 'turn already exists' };
-          if (draft.messages[command.message.id]) return { ok: false, reason: 'message already exists' };
-          if (command.receipt && draft.sendReceipts?.[command.receipt.clientRequestId]) {
-            return { ok: false, reason: 'send receipt already exists' };
-          }
-          draft.tasks[command.task.id] = clone(command.task);
-          draft.turns[command.turn.id] = clone(command.turn);
-          draft.messages[command.message.id] = clone(command.message);
-          if (command.receipt) {
-            draft.sendReceipts = draft.sendReceipts ?? {};
-            draft.sendReceipts[command.receipt.clientRequestId] = clone(command.receipt);
-          }
-          changed = true;
-          return { ok: true };
-        }
-        case 'enqueueMessageTurn': {
-          const invalid = validateEnqueueMessageTurn(command);
-          if (invalid) return { ok: false, reason: invalid };
-          const current = draft.tasks[command.task.id];
-          if (!current) return { ok: false, reason: 'task not found' };
-          if (current.revision !== command.expectedTaskRevision) return { ok: false, reason: 'task changed; retry' };
-          if (draft.turns[command.turn.id]) return { ok: false, reason: 'turn already exists' };
-          if (draft.messages[command.message.id]) return { ok: false, reason: 'message already exists' };
-          if (command.receipt && draft.sendReceipts?.[command.receipt.clientRequestId]) {
-            return { ok: false, reason: 'send receipt already exists' };
-          }
-          const epoch = command.task.executionEpoch ?? 1;
-          const cap = Math.min(command.maxTurnsPerTask, current.executionPolicy.maxTurns);
-          const slotsUsed = Object.values(draft.turns).filter(
-            (candidate) => candidate.taskId === current.id && (candidate.executionEpoch ?? 1) === epoch,
-          ).length;
-          if (slotsUsed >= cap) return { ok: false, reason: 'max turns per task exceeded' };
-          if ((command.turn.executionEpoch ?? 1) !== (command.task.executionEpoch ?? 1)) {
-            return { ok: false, reason: 'queued turn execution epoch mismatch' };
-          }
-          draft.tasks[command.task.id] = clone(command.task);
-          draft.turns[command.turn.id] = clone(command.turn);
-          draft.messages[command.message.id] = clone(command.message);
-          if (command.receipt) {
-            draft.sendReceipts = draft.sendReceipts ?? {};
-            draft.sendReceipts[command.receipt.clientRequestId] = clone(command.receipt);
-          }
-          changed = true;
-          return { ok: true };
-        }
-        case 'retryTurn': {
-          const invalid = validateRetryTurn(command);
-          if (invalid) return { ok: false, reason: invalid };
-          const current = draft.tasks[command.task.id];
-          if (!current) return { ok: false, reason: 'task not found' };
-          if (current.revision !== command.expectedTaskRevision) return { ok: false, reason: 'task changed; retry' };
-          if (draft.turns[command.turn.id]) return { ok: false, reason: 'turn already exists' };
-          const epoch = command.task.executionEpoch ?? 1;
-          const cap = Math.min(command.maxTurnsPerTask, current.executionPolicy.maxTurns);
-          const slotsUsed = Object.values(draft.turns).filter(
-            (candidate) => candidate.taskId === current.id && (candidate.executionEpoch ?? 1) === epoch,
-          ).length;
-          if (slotsUsed >= cap) return { ok: false, reason: 'max turns per task exceeded' };
-          draft.tasks[command.task.id] = clone(command.task);
-          draft.turns[command.turn.id] = clone(command.turn);
-          changed = true;
-          return { ok: true };
-        }
-        case 'queueTaskTurn': {
-          const invalid = validateQueueTaskTurn(command);
-          if (invalid) return { ok: false, reason: invalid };
-          const current = draft.tasks[command.task.id];
-          if (!current) return { ok: false, reason: 'task not found' };
-          if (current.revision !== command.expectedTaskRevision) return { ok: false, reason: 'task changed; retry' };
-          if (draft.turns[command.turn.id]) return { ok: false, reason: 'turn already exists' };
-          const cap = Math.min(command.maxTurnsPerTask, current.executionPolicy.maxTurns);
-          const epoch = command.task.executionEpoch ?? 1;
-          const slotsUsed = Object.values(draft.turns).filter(
-            (candidate) => candidate.taskId === current.id && (candidate.executionEpoch ?? 1) === epoch,
-          ).length;
-          if (slotsUsed >= cap) return { ok: false, reason: 'max turns per task exceeded' };
-          draft.tasks[command.task.id] = clone(command.task);
-          draft.turns[command.turn.id] = clone(command.turn);
-          changed = true;
-          return { ok: true };
-        }
-        case 'drainPendingSends': {
-          const current = draft.tasks[command.task.id];
-          if (!current) return { ok: false, reason: 'task not found' };
-          if (current.revision !== command.expectedTaskRevision) return { ok: false, reason: 'task changed; retry' };
-          if (command.turns.some((turn) => turn.taskId !== command.task.id || turn.status !== 'queued')) {
-            return { ok: false, reason: 'continuation turn is invalid' };
-          }
-          if (command.turns.some((turn) => draft.turns[turn.id])) return { ok: false, reason: 'turn already exists' };
-          for (const message of command.messages ?? []) {
-            if (message.taskId !== command.task.id) return { ok: false, reason: 'message task mismatch' };
-            draft.messages[message.id] = clone(message);
-          }
-          draft.tasks[command.task.id] = clone(command.task);
-          for (const turn of command.turns) draft.turns[turn.id] = clone(turn);
-          changed = command.turns.length > 0 || (command.messages?.length ?? 0) > 0;
-          return { ok: true };
-        }
-        case 'setTaskAttention': {
-          const current = draft.tasks[command.task.id];
-          if (!current) return { ok: false, reason: 'task not found' };
-          if (current.revision !== command.expectedTaskRevision) return { ok: false, reason: 'task changed; retry' };
-          draft.tasks[command.task.id] = clone(command.task);
-          changed = true;
-          return { ok: true };
-        }
-        case 'enqueueDispositionRepair': {
-          const current = draft.tasks[command.task.id];
-          if (!current) return { ok: false, reason: 'task not found' };
-          if (current.revision !== command.expectedTaskRevision) return { ok: false, reason: 'task changed; retry' };
-          if (command.turn && draft.turns[command.turn.id]) return { ok: true };
-          if (command.turn && command.turn.taskId !== command.task.id) return { ok: false, reason: 'repair turn task mismatch' };
-          if (command.message && command.message.taskId !== command.task.id) return { ok: false, reason: 'repair message task mismatch' };
-          draft.tasks[command.task.id] = clone(command.task);
-          if (command.turn) draft.turns[command.turn.id] = clone(command.turn);
-          if (command.message) draft.messages[command.message.id] = clone(command.message);
-          changed = true;
-          return { ok: true };
-        }
-        case 'requestRuntimeHandoff': {
-          const current = draft.tasks[command.taskId];
-          if (!current) return { ok: false, reason: 'task not found' };
-          if (current.revision !== command.expectedTaskRevision) return { ok: false, reason: 'task changed; retry' };
-          for (const expected of command.expectedTurns) {
-            const turn = draft.turns[expected.id];
-            if (!turn || turn.status !== expected.status ||
-              (expected.runtimeEpoch !== undefined && (turn.runtimeEpoch ?? 1) !== expected.runtimeEpoch)) {
-              return { ok: false, reason: 'turn changed; retry' };
-            }
-          }
-          draft.tasks[command.taskId] = clone(command.task);
-          for (const turn of command.turns) draft.turns[turn.id] = clone(turn);
-          for (const entry of command.cancelRequests ?? []) {
-            draft.cancelRequests = draft.cancelRequests ?? {};
-            draft.cancelRequests[entry.turnId] = clone(entry.request);
-          }
-          changed = true;
-          return { ok: true };
-        }
-        case 'stageDisposition': {
-          const existing = draft.turns[command.turnId];
-          const task = existing ? draft.tasks[existing.taskId] : undefined;
-          if (!existing || !task || existing.id !== command.turn.id || existing.taskId !== command.turn.taskId) {
-            return { ok: false, reason: 'turn not found' };
-          }
-          if (!command.expectedStatuses.includes(existing.status as never)) {
-            return { ok: false, reason: 'stageDisposition requires a live turn' };
-          }
-          if (command.expectedDisposition !== undefined && JSON.stringify(existing.disposition) !== JSON.stringify(command.expectedDisposition)) {
-            return { ok: false, reason: 'disposition changed; retry' };
-          }
-          // A live turn may only stage its first disposition. Replays of the
-          // exact same disposition are idempotent; a different payload/op can
-          // never overwrite the winner.
-          if (existing.disposition !== undefined && JSON.stringify(existing.disposition) !== JSON.stringify(command.turn.disposition)) {
-            return { ok: false, reason: 'disposition already staged' };
-          }
-          if (command.expectedRuntimeEpoch !== undefined &&
-            ((existing.runtimeEpoch ?? 1) !== command.expectedRuntimeEpoch || (task.runtimeEpoch ?? 1) !== command.expectedRuntimeEpoch)) {
-            return { ok: false, reason: 'runtime binding was superseded' };
-          }
-          if (JSON.stringify(existing) === JSON.stringify(command.turn)) return { ok: true };
-          draft.turns[command.turnId] = clone(command.turn);
-          changed = true;
-          return { ok: true };
-        }
-        case 'applyTaskLifecycle': {
-          const invalid = validateLifecycleTask(command);
-          if (invalid) return { ok: false, reason: invalid };
-          const current = draft.tasks[command.taskId];
-          if (!current) return { ok: false, reason: 'task not found' };
-          if (current.revision !== command.expectedTaskRevision) return { ok: false, reason: 'task changed; retry' };
-          if (command.task.id !== command.taskId) return { ok: false, reason: 'lifecycle task id mismatch' };
-          for (const expected of command.expectedTurns ?? []) {
-            const currentTurn = draft.turns[expected.id];
-            if (!currentTurn || currentTurn.status !== expected.status ||
-              (expected.runtimeEpoch !== undefined && (currentTurn.runtimeEpoch ?? 1) !== expected.runtimeEpoch)) {
-              return { ok: false, reason: 'turn changed; retry' };
-            }
-          }
-          draft.tasks[command.taskId] = clone(command.task);
-          for (const turn of command.turns) draft.turns[turn.id] = clone(turn);
-          for (const entry of command.cancelRequests ?? []) {
-            draft.cancelRequests = draft.cancelRequests ?? {};
-            draft.cancelRequests[entry.turnId] = clone(entry.request);
-          }
-          changed = true;
-          return { ok: true };
-        }
-        case 'cascadeTaskLifecycle': {
-          const invalid = validateLifecycleTask(command);
-          if (invalid) return { ok: false, reason: invalid };
-          const expected = new Map(command.expectedTasks.map((entry) => [entry.id, entry.revision]));
-          for (const task of command.tasks) {
-            const current = draft.tasks[task.id];
-            if (!current || current.revision !== expected.get(task.id)) return { ok: false, reason: 'task changed; retry' };
-          }
-          for (const expectedTurn of command.expectedTurns ?? []) {
-            const currentTurn = draft.turns[expectedTurn.id];
-            if (!currentTurn || currentTurn.status !== expectedTurn.status ||
-              (expectedTurn.runtimeEpoch !== undefined && (currentTurn.runtimeEpoch ?? 1) !== expectedTurn.runtimeEpoch)) {
-              return { ok: false, reason: 'turn changed; retry' };
-            }
-          }
-          for (const task of command.tasks) draft.tasks[task.id] = clone(task);
-          for (const turn of command.turns) draft.turns[turn.id] = clone(turn);
-          for (const entry of command.cancelRequests ?? []) {
-            draft.cancelRequests = draft.cancelRequests ?? {};
-            draft.cancelRequests[entry.turnId] = clone(entry.request);
-          }
-          changed = command.tasks.length > 0;
-          return { ok: true };
-        }
-        case 'resolveChildWait':
-        case 'applyDependencyTerminal': {
-          const current = draft.tasks[command.taskId];
-          if (!current) return { ok: false, reason: 'task not found' };
-          if (current.revision !== command.expectedTaskRevision) return { ok: false, reason: 'task changed; retry' };
-          if (command.task.id !== command.taskId) return { ok: false, reason: 'task id mismatch' };
-          draft.tasks[command.taskId] = clone(command.task);
-          if (command.turn) draft.turns[command.turn.id] = clone(command.turn);
-          changed = true;
-          return { ok: true };
-        }
-        case 'applyDependencyTerminals': {
-          const expected = new Map(command.expectedTasks.map((entry) => [entry.id, entry.revision]));
-          for (const mutation of command.mutations) {
-            const current = draft.tasks[mutation.taskId];
-            if (!current || current.revision !== expected.get(mutation.taskId)) return { ok: false, reason: 'task changed; retry' };
-            if (mutation.task.id !== mutation.taskId) return { ok: false, reason: 'dependency task id mismatch' };
-          }
-          for (const mutation of command.mutations) {
-            draft.tasks[mutation.taskId] = clone(mutation.task);
-            if (mutation.turn) draft.turns[mutation.turn.id] = clone(mutation.turn);
-          }
-          changed = command.mutations.length > 0;
-          return { ok: true };
-        }
-        case 'reconcileOrphanTurn': {
-          const currentTask = draft.tasks[command.taskId];
-          const currentTurn = draft.turns[command.turn.id];
-          if (!currentTask || !currentTurn) return { ok: false, reason: 'orphan turn not found' };
-          if (currentTask.revision !== command.expectedTaskRevision || currentTurn.status !== command.expectedTurnStatus) {
-            return { ok: false, reason: 'orphan state changed; retry' };
-          }
-          if (command.task.id !== command.taskId || command.turn.taskId !== command.taskId) {
-            return { ok: false, reason: 'orphan aggregate mismatch' };
-          }
-          draft.tasks[command.taskId] = clone(command.task);
-          draft.turns[command.turn.id] = clone(command.turn);
-          for (const held of command.heldTurns) {
-            if (draft.turns[held.id]?.status === 'queued') draft.turns[held.id] = clone(held);
-          }
-          changed = true;
-          return { ok: true };
-        }
-        case 'applyVerdictRemediation': {
-          const invalid = validateAggregateTaskChanges(command.tasks, command.turns, command.messages);
-          if (invalid) return { ok: false, reason: invalid };
-          for (const expected of command.expectedTaskRevisions) {
-            const current = draft.tasks[expected.id];
-            if (!current || current.revision !== expected.revision) return { ok: false, reason: 'task changed; retry' };
-          }
-          if (command.deletedTaskIds?.length) deleteTaskIdsFromFile(draft, command.deletedTaskIds);
-          for (const task of command.tasks) draft.tasks[task.id] = clone(task);
-          for (const turn of command.turns) draft.turns[turn.id] = clone(turn);
-          for (const message of command.messages) draft.messages[message.id] = clone(message);
-          changed = command.tasks.length > 0 || command.turns.length > 0 || command.messages.length > 0 || (command.deletedTaskIds?.length ?? 0) > 0;
-          return { ok: true };
-        }
-        case 'upsertTask':
-          draft.tasks[command.task.id] = clone(command.task);
-          changed = true;
-          return { ok: true };
-        case 'clearHistory': {
-          const groups = removableRootIdsFromFile(draft, command.preserveRootTaskId);
-          const ids = groups.flat();
-          if (ids.length === 0) return { ok: true };
-          deleteTaskIdsFromFile(draft, ids);
-          changed = true;
-          return { ok: true };
-        }
-        case 'deleteTaskSubtreeIfIdle': {
-          const root = draft.tasks[command.rootTaskId];
-          if (!root) return { ok: true };
-          if (root.parentId !== null) return { ok: false, reason: 'Only top-level tasks can be deleted.' };
-          const groups = removableRootIdsFromFile(
-            draft,
-            command.preserveRootTaskId,
-            command.rootTaskId,
-          );
-          const ids = groups[0];
-          if (!ids) {
-            return { ok: false, reason: 'Cannot delete a task while it or a subtask is still active.' };
-          }
-          deleteTaskIdsFromFile(draft, ids);
-          changed = true;
-          return { ok: true };
-        }
-        case 'renameTask': {
-          const task = draft.tasks[command.taskId];
-          if (!task) return { ok: true };
-          if (
-            command.expectedTaskRevision !== undefined &&
-            task.revision !== command.expectedTaskRevision
-          ) {
-            return { ok: false, reason: 'task changed; retry' };
-          }
-          task.goal = command.goal;
-          task.revision += 1;
-          task.updatedAt = command.updatedAt;
-          changed = true;
-          return { ok: true };
-        }
-        case 'deleteTask':
-          if (!draft.tasks[command.taskId]) return { ok: true };
-          // JSON compatibility preserves the database cascade semantics.
-          deleteTaskIdsFromFile(
-            draft,
-            Object.values(draft.tasks)
-              .filter((task) => task.id === command.taskId || isDescendantOf(draft.tasks, task.id, command.taskId))
-              .map((task) => task.id),
-          );
-          changed = true;
-          return { ok: true };
-        case 'createTurn':
-          if (draft.turns[command.turn.id]) return { ok: false, reason: 'turn already exists' };
-          if (!draft.tasks[command.turn.taskId]) return { ok: false, reason: 'task not found' };
-          draft.turns[command.turn.id] = clone(command.turn);
-          changed = true;
-          return { ok: true };
-        case 'upsertTurn':
-          if (!draft.tasks[command.turn.taskId]) return { ok: false, reason: 'task not found' };
-          draft.turns[command.turn.id] = clone(command.turn);
-          changed = true;
-          return { ok: true };
-        case 'replaceLiveTurn': {
-          if (command.expectedStatuses.length === 0) return { ok: false, reason: 'expected live status required' };
-          const existing = draft.turns[command.turn.id];
-          const task = existing ? draft.tasks[existing.taskId] : undefined;
-          if (!existing || !task || !command.expectedStatuses.includes(existing.status as never)) {
-            return { ok: false, reason: 'turn is no longer live' };
-          }
-          if (
-            command.expectedRuntimeEpoch !== undefined &&
-            (existing.runtimeEpoch ?? 1) !== command.expectedRuntimeEpoch ||
-            command.expectedRuntimeEpoch !== undefined &&
-            (task.runtimeEpoch ?? 1) !== command.expectedRuntimeEpoch
-          ) {
-            return { ok: false, reason: 'runtime binding was superseded' };
-          }
-          draft.turns[command.turn.id] = clone(command.turn);
-          changed = true;
-          return { ok: true };
-        }
-        case 'recordAsk': {
-          const existing = draft.turns[command.turn.id];
-          const task = existing ? draft.tasks[existing.taskId] : undefined;
-          if (!existing || !task || (existing.status !== 'running' && existing.status !== 'waiting_user')) {
-            return { ok: false, reason: 'turn is no longer live' };
-          }
-          if (command.expectedRuntimeEpoch !== undefined && (task.runtimeEpoch ?? 1) !== command.expectedRuntimeEpoch) {
-            return { ok: false, reason: 'runtime binding was superseded' };
-          }
-          draft.turns[command.turn.id] = clone(command.turn);
-          changed = true;
-          return { ok: true };
-        }
-        case 'answerAsk': {
-          const existing = draft.turns[command.turn.id];
-          const task = existing ? draft.tasks[existing.taskId] : undefined;
-          if (!existing || !task || existing.status !== 'waiting_user') {
-            return { ok: false, reason: 'turn is not waiting for user' };
-          }
-          if (command.expectedRuntimeEpoch !== undefined && (task.runtimeEpoch ?? 1) !== command.expectedRuntimeEpoch) {
-            return { ok: false, reason: 'runtime binding was superseded' };
-          }
-          draft.turns[command.turn.id] = clone(command.turn);
-          changed = true;
-          return { ok: true };
-        }
-        case 'deleteTurn':
-          if (!draft.turns[command.turnId]) return { ok: true };
-          delete draft.turns[command.turnId];
-          for (const [messageId, message] of Object.entries(draft.messages)) {
-            if (message.turnId === command.turnId) delete draft.messages[messageId];
-          }
-          for (const [toolId, tool] of Object.entries(draft.toolCalls ?? {})) {
-            if (tool.turnId === command.turnId) delete draft.toolCalls?.[toolId];
-          }
-          delete draft.reasoning?.[command.turnId];
-          delete draft.cancelRequests?.[command.turnId];
-          delete draft.runtimeClaims?.[command.turnId];
-          for (const ledgerKey of Object.keys(draft.operations ?? {})) {
-            if (ledgerKey.startsWith(`${command.turnId}:`)) delete draft.operations?.[ledgerKey];
-          }
-          changed = true;
-          return { ok: true };
-        case 'editQueuedMessage': {
-          const turn = draft.turns[command.turnId];
-          if (!turn) return { ok: false, reason: 'turn not found' };
-          if (turn.taskId !== command.taskId) return { ok: false, reason: 'turn does not belong to task' };
-          if (turn.status !== 'queued') return { ok: false, reason: 'turn is not queued' };
-          const inputMessageIds = turn.inputs
-            .filter((input): input is Extract<TurnInput, { kind: 'message' }> => input.kind === 'message')
-            .map((input) => input.messageId);
-          if (inputMessageIds.length === 0) return { ok: false, reason: 'message not found' };
-          for (const id of inputMessageIds) {
-            const message = draft.messages[id];
-            if (!message || message.taskId !== command.taskId || message.role !== 'user' || message.state !== 'pending') {
-              return { ok: false, reason: 'message is not pending' };
-            }
-          }
-          const target = draft.messages[inputMessageIds[0]!];
-          const { agentContent: _staleAgentContent, ...rest } = target!;
-          void _staleAgentContent;
-          draft.messages[inputMessageIds[0]!] = { ...rest, content: command.content };
-          messageId = inputMessageIds[0]!;
-          changed = true;
-          return { ok: true };
-        }
-        case 'deleteQueuedTurnAndMessages': {
-          const turn = draft.turns[command.turnId];
-          if (!turn) return { ok: false, reason: 'turn not found' };
-          if (turn.taskId !== command.taskId) return { ok: false, reason: 'turn does not belong to task' };
-          if (turn.status !== 'queued') return { ok: false, reason: 'turn is not queued' };
-          const messageIds = turn.inputs
-            .filter((input): input is Extract<TurnInput, { kind: 'message' }> => input.kind === 'message')
-            .map((input) => input.messageId);
-          for (const id of messageIds) {
-            const message = draft.messages[id];
-            if (!message || message.taskId !== command.taskId || message.role !== 'user' || message.state !== 'pending') {
-              return { ok: false, reason: 'message is not pending' };
-            }
-          }
-          for (const id of messageIds) delete draft.messages[id];
-          delete draft.turns[turn.id];
-          deletedMessageIds = messageIds;
-          changed = true;
-          return { ok: true };
-        }
-        case 'clearQueuedTurnHold': {
-          const turn = draft.turns[command.turnId];
-          if (!turn) return { ok: false, reason: 'turn not found' };
-          if (turn.taskId !== command.taskId) return { ok: false, reason: 'turn does not belong to task' };
-          if (turn.status !== 'queued') return { ok: false, reason: 'turn is not queued' };
-          if (!turn.holdAutoPromote) return { ok: true };
-          const { holdAutoPromote: _hold, ...rest } = turn;
-          void _hold;
-          draft.turns[turn.id] = rest;
-          changed = true;
-          return { ok: true };
-        }
-        case 'appendMessage':
-          if (draft.messages[command.message.id]) return { ok: false, reason: 'message already exists' };
-          if (!draft.tasks[command.message.taskId]) return { ok: false, reason: 'task not found' };
-          draft.messages[command.message.id] = clone(command.message);
-          changed = true;
-          return { ok: true };
-        case 'upsertMessage':
-          if (!draft.tasks[command.message.taskId]) return { ok: false, reason: 'task not found' };
-          draft.messages[command.message.id] = clone(command.message);
-          changed = true;
-          return { ok: true };
-        case 'deleteMessage':
-          if (draft.messages[command.messageId]) {
-            delete draft.messages[command.messageId];
-            changed = true;
-          }
-          return { ok: true };
-        case 'appendTranscriptBatch': {
-          if (!draft.tasks[command.taskId]) return { ok: false, reason: 'task not found' };
-          for (const message of command.messages ?? []) {
-            if (message.taskId !== command.taskId) return { ok: false, reason: 'message task mismatch' };
-            draft.messages[message.id] = clone(message);
-          }
-          draft.toolCalls = draft.toolCalls ?? {};
-          for (const tool of command.toolCalls ?? []) {
-            if (tool.taskId !== command.taskId) return { ok: false, reason: 'tool call task mismatch' };
-            draft.toolCalls[tool.id] = clone(tool);
-          }
-          draft.reasoning = draft.reasoning ?? {};
-          for (const reasoning of command.reasoning ?? []) {
-            if (reasoning.taskId !== command.taskId) return { ok: false, reason: 'reasoning task mismatch' };
-            draft.reasoning[reasoning.id] = clone(reasoning);
-          }
-          changed = (command.messages?.length ?? 0) + (command.toolCalls?.length ?? 0) + (command.reasoning?.length ?? 0) > 0;
-          return { ok: true };
-        }
-        case 'putOperation':
-          draft.operations = draft.operations ?? {};
-          draft.operations[command.ledgerKey] = clone(command.entry);
-          changed = true;
-          return { ok: true };
-        case 'claimOperation': {
-          draft.operations = draft.operations ?? {};
-          const existing = draft.operations[command.ledgerKey];
-          if (existing) {
-            operation = clone(existing);
-            if (existing.fingerprint !== command.entry.fingerprint) {
-              return { ok: false, reason: 'operation fingerprint conflict' };
-            }
-            return { ok: true };
-          }
-          draft.operations[command.ledgerKey] = clone(command.entry);
-          operation = clone(command.entry);
-          changed = true;
-          return { ok: true };
-        }
-        case 'deleteOperationsForTurn': {
-          let deleted = false;
-          for (const key of Object.keys(draft.operations ?? {})) {
-            if (key.startsWith(`${command.turnId}:`)) {
-              delete draft.operations?.[key];
-              deleted = true;
-            }
-          }
-          changed = deleted;
-          return { ok: true };
-        }
-        case 'claimRuntime': {
-          if (!draft.turns[command.turnId]) return { ok: false, reason: 'turn not found' };
-          draft.runtimeClaims = draft.runtimeClaims ?? {};
-          const existing = draft.runtimeClaims[command.turnId];
-          const expired = existing ? Date.parse(existing.expiresAt) <= Date.parse(command.claimedAt) : true;
-          if (existing && !expired && existing.ownerId !== command.ownerId) {
-            return { ok: false, reason: 'runtime claim is owned by another worker' };
-          }
-          const next: RuntimeClaim = {
-            turnId: command.turnId,
-            ownerId: command.ownerId,
-            claimedAt: existing?.ownerId === command.ownerId && !expired ? existing.claimedAt : command.claimedAt,
-            heartbeatAt: command.heartbeatAt,
-            expiresAt: command.expiresAt,
-          };
-          if (existing && JSON.stringify(existing) === JSON.stringify(next)) return { ok: true };
-          draft.runtimeClaims[command.turnId] = next;
-          changed = true;
-          return { ok: true };
-        }
-        case 'heartbeatRuntime': {
-          const existing = draft.runtimeClaims?.[command.turnId];
-          if (!existing || existing.ownerId !== command.ownerId) {
-            return { ok: false, reason: 'runtime claim owner mismatch' };
-          }
-          if (Date.parse(existing.expiresAt) <= Date.parse(command.heartbeatAt)) {
-            return { ok: false, reason: 'runtime claim expired' };
-          }
-          draft.runtimeClaims![command.turnId] = {
-            ...existing,
-            heartbeatAt: command.heartbeatAt,
-            expiresAt: command.expiresAt,
-          };
-          changed = true;
-          return { ok: true };
-        }
-        case 'releaseRuntime': {
-          const existing = draft.runtimeClaims?.[command.turnId];
-          if (!existing || (command.ownerId !== undefined && existing.ownerId !== command.ownerId)) {
-            return { ok: true };
-          }
-          delete draft.runtimeClaims![command.turnId];
-          changed = true;
-          return { ok: true };
-        }
-        case 'putCancelRequest':
-          if (!draft.turns[command.turnId]) return { ok: false, reason: 'turn not found' };
-          draft.cancelRequests = draft.cancelRequests ?? {};
-          draft.cancelRequests[command.turnId] = clone(command.request);
-          changed = true;
-          return { ok: true };
-        case 'deleteCancelRequest':
-          if (draft.cancelRequests?.[command.turnId]) {
-            delete draft.cancelRequests[command.turnId];
-            changed = true;
-          }
-          return { ok: true };
-        case 'putSendReceipt':
-          draft.sendReceipts = draft.sendReceipts ?? {};
-          draft.sendReceipts[command.receipt.clientRequestId] = clone(command.receipt);
-          changed = true;
-          return { ok: true };
-        case 'deleteSendReceipt':
-          if (draft.sendReceipts?.[command.clientRequestId]) {
-            delete draft.sendReceipts[command.clientRequestId];
-            changed = true;
-          }
-          return { ok: true };
-        case 'claimTurn': {
-          const check = canPromoteTurn(draft, command.turnId, {
-            ...DEFAULT_RESOURCE_LIMITS,
-            maxConcurrentTurns: command.maxConcurrentTurns,
-            maxConcurrentPerRoot: command.maxConcurrentPerRoot,
-            maxConcurrentPerBackend: command.maxConcurrentPerBackend,
-          });
-          if (!check.ok) return { ok: false, reason: check.reason };
-          const turn = draft.turns[command.turnId]!;
-          draft.turns[command.turnId] = { ...turn, status: 'running', startedAt: command.startedAt };
-          changed = true;
-          return { ok: true };
-        }
-        case 'prepareDispatch': {
-          const invalid = validatePrepareDispatch(command);
-          if (invalid) return { ok: false, reason: invalid };
-          const currentTask = draft.tasks[command.task.id];
-          const currentTurn = draft.turns[command.turn.id];
-          if (!currentTask || !currentTurn) return { ok: false, reason: 'task or turn not found' };
-          if (currentTask.revision !== command.expectedTaskRevision) {
-            return { ok: false, reason: 'task changed before dispatch' };
-          }
-          if (currentTurn.status !== 'queued') return { ok: false, reason: 'turn is no longer queued' };
-          if (command.turn.status === 'running') {
-            const check = canPromoteTurn(draft, command.turn.id, {
-              ...DEFAULT_RESOURCE_LIMITS,
-              maxConcurrentTurns: command.maxConcurrentTurns,
-              maxConcurrentPerRoot: command.maxConcurrentPerRoot,
-              maxConcurrentPerBackend: command.maxConcurrentPerBackend,
-            });
-            if (!check.ok) return { ok: false, reason: check.reason };
-          }
-          draft.tasks[command.task.id] = clone(command.task);
-          draft.turns[command.turn.id] = clone(command.turn);
-          for (const message of command.messages) {
-            draft.messages[message.id] = clone(message);
-          }
-          changed = true;
-          return { ok: true };
-        }
-        case 'promoteTurn': {
-          const turn = draft.turns[command.turnId];
-          if (!turn || turn.status !== 'queued') return { ok: true };
-          turn.status = 'running';
-          turn.startedAt = command.startedAt;
-          changed = true;
-          return { ok: true };
-        }
-        case 'applyRetentionPolicy':
-        case 'applyRetention': {
-          const task = draft.tasks[command.taskId];
-          if (!task) return { ok: true };
-          if (isTerminalLifecycle(task.lifecycle)) {
-            const turns = Object.values(draft.turns).filter((turn) => turn.taskId === task.id);
-            const keep = retainedTurnIds(turns, command.keepLatestTurns);
-            const retained = turns.filter((turn) => !keep.has(turn.id));
-            const dropped = new Set(retained.map((turn) => turn.id));
-            for (const turn of retained) {
-              delete draft.turns[turn.id];
-              for (const [messageId, message] of Object.entries(draft.messages)) {
-                if (message.turnId === turn.id) delete draft.messages[messageId];
-              }
-              for (const [toolId, tool] of Object.entries(draft.toolCalls ?? {})) {
-                if (tool.turnId === turn.id) delete draft.toolCalls?.[toolId];
-              }
-              delete draft.reasoning?.[turn.id];
-              delete draft.cancelRequests?.[turn.id];
-              delete draft.runtimeClaims?.[turn.id];
-              for (const key of Object.keys(draft.operations ?? {})) {
-                if (key.startsWith(`${turn.id}:`)) delete draft.operations?.[key];
-              }
-            }
-            // User messages do not necessarily have turnId, so remove only rows
-            // no retained turn still references through its input list.
-            const referencedMessages = new Set(
-              Object.values(draft.turns)
-                .filter((turn) => turn.taskId === task.id)
-                .flatMap((turn) => turn.inputs)
-                .filter((input): input is Extract<TurnInput, { kind: 'message' }> => input.kind === 'message')
-                .map((input) => input.messageId),
-            );
-            for (const [messageId, message] of Object.entries(draft.messages)) {
-              if (message.taskId === task.id && !message.turnId && !referencedMessages.has(messageId)) {
-                delete draft.messages[messageId];
-              }
-            }
-            changed = dropped.size > 0;
-            return { ok: true };
-          }
-          const maxChars = Math.max(0, Math.floor(command.maxStoredOutputChars ?? Number.MAX_SAFE_INTEGER));
-          const settledTurnIds = new Set(
-            Object.values(draft.turns)
-              .filter((turn) => turn.taskId === task.id && isTerminalTurn(turn.status))
-              .map((turn) => turn.id),
-          );
-          for (const message of Object.values(draft.messages)) {
-            if (message.taskId === task.id && message.role === 'assistant' && message.state === 'complete' &&
-              message.turnId && settledTurnIds.has(message.turnId)) {
-              const content = truncateRetentionContent(message.content, maxChars);
-              if (content !== message.content) {
-                draft.messages[message.id] = { ...message, content };
-                changed = true;
-              }
-            }
-          }
-          for (const tool of Object.values(draft.toolCalls ?? {})) {
-            if (tool.taskId === task.id && settledTurnIds.has(tool.turnId) && typeof tool.output === 'string') {
-              const output = truncateRetentionContent(tool.output, maxChars);
-              if (output !== tool.output) {
-                draft.toolCalls![tool.id] = { ...tool, output };
-                changed = true;
-              }
-            }
-          }
-          for (const reasoning of Object.values(draft.reasoning ?? {})) {
-            if (reasoning.taskId === task.id && settledTurnIds.has(reasoning.turnId)) {
-              const content = truncateRetentionContent(reasoning.content, maxChars);
-              if (content !== reasoning.content) {
-                draft.reasoning![reasoning.id] = { ...reasoning, content };
-                changed = true;
-              }
-            }
-          }
-          return { ok: true };
-        }
-        case 'settleTurn': {
-          const turn = draft.turns[command.turnId];
-          if (!turn || (turn.status !== 'running' && turn.status !== 'waiting_user')) return { ok: true };
-          turn.status = command.status;
-          turn.finishedAt = command.finishedAt;
-          turn.error = command.error;
-          changed = true;
-          return { ok: true };
-        }
-        case 'settleTurnAndApplyEffects': {
-          if (command.expectedStatuses.length === 0) return { ok: false, reason: 'expected live status required' };
-          const current = draft.turns[command.turn.id];
-          const currentTask = current ? draft.tasks[current.taskId] : undefined;
-          if (!current || !currentTask || !command.expectedStatuses.includes(current.status as never)) {
-            return { ok: false, reason: 'turn is no longer live' };
-          }
-          if (currentTask.revision !== command.expectedTaskRevision) {
-            return { ok: false, reason: 'task changed before settlement' };
-          }
-          draft.tasks[command.task.id] = clone(command.task);
-          draft.turns[command.turn.id] = clone(command.turn);
-          for (const turn of command.relatedTurns) draft.turns[turn.id] = clone(turn);
-          for (const message of command.messages) draft.messages[message.id] = clone(message);
-          delete draft.cancelRequests?.[command.turn.id];
-          delete draft.runtimeClaims?.[command.turn.id];
-          changed = true;
-          return { ok: true };
-        }
-        default: {
-          const _exhaustive: never = command;
-          return _exhaustive;
-        }
-      }
-    });
-    if (!result.ok) {
-      if (result.reason === 'rejected') {
-        if (isGraphCommand(command) &&
-          (result.detail === '__graph_replay__' || result.detail === '__graph_conflict__')) {
-          const operation = command.operation
-            ? this.store.getFile().operations?.[command.operation.ledgerKey]
-            : undefined;
-          return result.detail === '__graph_replay__'
-            ? { ok: true, changed: false, ...(operation ? { operation } : {}) }
-            : { ok: true, changed: false, reason: 'opId conflict: different arguments', conflict: true, ...(operation ? { operation } : {}) };
-        }
-        return {
-          ok: true,
-          changed: false,
-          reason: result.detail ?? 'repository command rejected',
-          ...(command.kind === 'claimOperation' ? { conflict: true, operation } : {}),
-        };
-      }
-      throw new Error(result.detail ?? 'repository command rejected');
-    }
-    return {
-      ok: true,
-      changed,
-      ...(isGraphCommand(command) && command.operation
-        ? { operation: command.operation.entry }
-        : {}),
-      ...(command.kind === 'claimOperation' && operation ? { operation } : {}),
-      ...(messageId ? { messageId } : {}),
-      ...(deletedMessageIds ? { deletedMessageIds } : {}),
-    };
-  }
-
-  async execute(command: RepositoryCommand): Promise<RepositoryCommandResult> {
-    return this.executeSync(command);
-  }
-}
-
-/** SQLite row-level implementation. Every write is a short worker-owned
- * transaction; stream writes update only the affected rows. */
+/** SQLite-backed repository for one workspace in the shared global database. */
 export class SqliteTaskRepository implements TaskRepository {
   constructor(
     private readonly db: DbClient,
@@ -1952,7 +664,7 @@ export class SqliteTaskRepository implements TaskRepository {
       list.push(decodeDependency(dependency));
       byTask.set(dependency.task_id, list);
     }
-    return rows.map((row) => decodeTask(row, byTask.get(row.id)));
+    return rows.map((row) => decodeTask(row, byTask.get(row.id) ?? []));
   }
 
   private async hydrateTurns(rows: readonly TurnRow[]): Promise<TaskTurn[]> {
@@ -1971,7 +683,7 @@ export class SqliteTaskRepository implements TaskRepository {
       list.push(decodeTurnInput(input));
       byTurn.set(input.turn_id, list);
     }
-    return rows.map((row) => decodeTurn(row, byTurn.get(row.id)));
+    return rows.map((row) => decodeTurn(row, byTurn.get(row.id) ?? []));
   }
 
   async getTask(taskId: string): Promise<MusterTask | undefined> {
@@ -2189,65 +901,6 @@ export class SqliteTaskRepository implements TaskRepository {
       [this.workspaceId],
     );
     return row?.revision ?? 0;
-  }
-
-  async readEnvelopeForMigration(): Promise<Readonly<TaskStoreFile>> {
-    const [tasks, turnRows, messageRows, toolRows, reasoningRows, operationRows, cancelRows, runtimeClaimRows, receiptRows, revisionRow] = await Promise.all([
-      this.listTasks(this.workspaceId),
-      this.db.all<TurnRow>(`${turnSelect('WHERE workspace_id = ?')} ORDER BY task_id, sequence, created_at, id`, [this.workspaceId]),
-      this.db.all<MessageRow>(`${messageSelect('WHERE workspace_id = ?')} ORDER BY created_at, id`, [this.workspaceId]),
-      this.db.all<ToolRow>(
-        `SELECT id, task_id, turn_id, tool_call_id, ordering, status, name, payload_json, created_at, updated_at
-           FROM tool_calls WHERE workspace_id = ?`, [this.workspaceId],
-      ),
-      this.db.all<ReasoningRow>(
-        `SELECT id, task_id, turn_id, content, created_at, updated_at
-           FROM reasoning_segments WHERE workspace_id = ?`, [this.workspaceId],
-      ),
-      this.db.all<OperationRow>(
-        'SELECT ledger_key, fingerprint, result_json FROM operations WHERE workspace_id = ?', [this.workspaceId],
-      ),
-      this.db.all<CancelRow>(
-        `SELECT turn_id, kind, op_id, requested_by, requested_at, payload_json
-           FROM turn_cancel_requests WHERE workspace_id = ?`, [this.workspaceId],
-      ),
-      this.db.all<RuntimeClaimRow>(
-        `SELECT turn_id, owner_id, claimed_at, heartbeat_at, expires_at
-           FROM runtime_claims WHERE workspace_id = ?`, [this.workspaceId],
-      ),
-      this.db.all<ReceiptRow>(
-        `SELECT client_request_id, fingerprint, task_id, message_id, turn_id, created_at
-           FROM send_receipts WHERE workspace_id = ?`, [this.workspaceId],
-      ),
-      this.db.get<{ revision: number }>('SELECT revision FROM workspace_revisions WHERE workspace_id = ?', [this.workspaceId]),
-    ]);
-    const turns = await this.hydrateTurns(turnRows);
-    const file: TaskStoreFile = {
-      schemaVersion: 6,
-      revision: revisionRow?.revision ?? 0,
-      tasks: Object.fromEntries(tasks.map((task) => [task.id, task])),
-      turns: Object.fromEntries(turns.map((turn) => [turn.id, turn])),
-      messages: Object.fromEntries(messageRows.map((message) => {
-        const dto = decodeMessage(message);
-        return [dto.id, dto];
-      })),
-      operations: Object.fromEntries(operationRows.map((row) => [row.ledger_key, decodeOperation(row)])),
-      cancelRequests: Object.fromEntries(cancelRows.map((row) => [row.turn_id, decodeCancelRequest(row)])),
-      runtimeClaims: Object.fromEntries(runtimeClaimRows.map((row) => [row.turn_id, decodeRuntimeClaim(row)])),
-      toolCalls: Object.fromEntries(toolRows.map((row) => {
-        const dto = decodeToolCall(row);
-        return [dto.id, dto];
-      })),
-      reasoning: Object.fromEntries(reasoningRows.map((row) => {
-        const dto = decodeReasoning(row);
-        return [dto.id, dto];
-      })),
-      sendReceipts: Object.fromEntries(receiptRows.map((row) => {
-        const dto = decodeReceipt(row);
-        return [dto.clientRequestId, dto];
-      })),
-    };
-    return file;
   }
 
   private async write(
@@ -3103,7 +1756,7 @@ export class SqliteTaskRepository implements TaskRepository {
                 revision=?, created_at=?, updated_at=?, payload_json=?
               WHERE workspace_id=? AND id=? AND revision=?`,
         params: [command.task.parentId, command.task.role, command.task.lifecycle,
-          command.task.releaseState ?? null, command.task.goal, command.task.backend,
+          command.task.releaseState, command.task.goal, command.task.backend,
           command.task.model ?? null, command.task.revision, command.task.createdAt,
           command.task.updatedAt, taskPayload(command.task), this.workspaceId,
           command.task.id, command.expectedTaskRevision],
@@ -3802,7 +2455,7 @@ function taskStatement(workspaceId: string, task: MusterTask, upsert: boolean): 
           (id, workspace_id, parent_id, role, lifecycle, release_state, goal, backend, model,
            revision, created_at, updated_at, payload_json)
           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)${suffix}`,
-    params: [task.id, workspaceId, task.parentId, task.role, task.lifecycle, task.releaseState ?? null,
+    params: [task.id, workspaceId, task.parentId, task.role, task.lifecycle, task.releaseState,
       task.goal, task.backend, task.model ?? null, task.revision, task.createdAt, task.updatedAt,
       taskPayload(task)],
   };
@@ -3892,8 +2545,7 @@ function appendTurnFence(
  * Optimistic task update used by the FIFO enqueue command. The turn-cap
  * predicate is evaluated while the IMMEDIATE transaction owns the write lock,
  * so two extension hosts cannot both reserve the final slot of an execution
- * epoch. `turns.payload_json` still owns executionEpoch until that small field
- * is promoted in a later schema migration.
+ * epoch. `turns.payload_json` owns executionEpoch in the current schema.
  */
 function guardedTaskUpdateStatement(
   workspaceId: string,
@@ -3914,7 +2566,7 @@ function guardedTaskUpdateStatement(
                   AND COALESCE(json_extract(queued_epoch.payload_json, '$.executionEpoch'), 1) = ?
              ) < ?`,
     params: [
-      task.parentId, task.role, task.lifecycle, task.releaseState ?? null, task.goal, task.backend,
+      task.parentId, task.role, task.lifecycle, task.releaseState, task.goal, task.backend,
       task.model ?? null, task.revision, task.createdAt, task.updatedAt, taskPayload(task), workspaceId,
       task.id, expectedRevision, epoch, cap,
     ],
@@ -3941,7 +2593,7 @@ function guardedDispatchTaskUpdateStatement(
                 WHERE workspace_id = ? AND id = ? AND task_id = ? AND status = 'queued'
              )`,
     params: [
-      task.parentId, task.role, task.lifecycle, task.releaseState ?? null, task.goal, task.backend,
+      task.parentId, task.role, task.lifecycle, task.releaseState, task.goal, task.backend,
       task.model ?? null, task.revision, task.createdAt, task.updatedAt, taskPayload(task), workspaceId,
       task.id, command.expectedTaskRevision, workspaceId, command.turn.id, task.id,
     ],
@@ -4148,7 +2800,7 @@ function graphOperationClaimStatement(
     sql: `INSERT INTO operations (workspace_id, ledger_key, fingerprint, result_json, created_at)
           VALUES (?,?,?,?,?) ON CONFLICT(workspace_id, ledger_key) DO NOTHING`,
     params: [workspaceId, operation.ledgerKey, operation.entry.fingerprint,
-      JSON.stringify(operation.entry.result), operation.createdAt],
+      encodePayload({ result: operation.entry.result }), operation.createdAt],
   };
 }
 
@@ -4351,7 +3003,7 @@ function claimTurnStatement(
                           WHERE candidate.workspace_id = turns.workspace_id AND candidate.id = turns.task_id
                             ${revisionPredicate}
                             AND candidate.lifecycle = 'open'
-                            AND COALESCE(candidate.release_state, 'released') = 'released'
+                            AND candidate.release_state = 'released'
                             AND COALESCE(json_extract(turns.payload_json, '$.runtimeEpoch'), 1) =
                                 COALESCE(json_extract(candidate.payload_json, '$.runtimeEpoch'), 1)
                             AND json_extract(candidate.payload_json, '$.wait.kind') IS NOT 'external'
@@ -4360,11 +3012,6 @@ function claimTurnStatement(
                               json_extract(candidate.payload_json, '$.wait.kind') IS NOT 'children' OR
                               (turns.trigger = 'engine' AND (turns.id LIKE '%parent-q-%' OR turns.id LIKE '%-attention'))
                             )
-                            AND NOT (
-                              COALESCE(json_extract(candidate.payload_json, '$.handoff.version'), 0) = 1 AND
-                              json_extract(candidate.payload_json, '$.handoff.phase') IN
-                                ('requested', 'exporting_context', 'summarizing_source', 'preparing_receiver', 'transferring')
-                            )
                             AND NOT EXISTS (
                               SELECT 1 FROM json_each(candidate.payload_json, '$.inputBindings') binding
                                WHERE COALESCE(json_extract(binding.value, '$.required'), 1) <> 0
@@ -4372,10 +3019,7 @@ function claimTurnStatement(
                                    SELECT 1 FROM tasks producer
                                     WHERE producer.workspace_id = candidate.workspace_id
                                       AND producer.id = json_extract(binding.value, '$.fromTaskId')
-                                      AND (
-                                        json_extract(producer.payload_json, '$.taskResult.summary') IS NOT NULL OR
-                                        json_extract(producer.payload_json, '$.result') IS NOT NULL
-                                      )
+                                      AND json_extract(producer.payload_json, '$.taskResult.summary') IS NOT NULL
                                  )
                             ))
              AND NOT EXISTS (SELECT 1 FROM turns same_task
@@ -4455,7 +3099,7 @@ interface TaskRow {
   parent_id: string | null;
   role: string;
   lifecycle: string;
-  release_state: string | null;
+  release_state: string;
   goal: string;
   backend: string;
   model: string | null;
@@ -4690,7 +3334,7 @@ function parsePayload(raw: string, kind: string): Record<string, unknown> {
     throw new Error(`invalid ${kind} payload in SQLite store: expected object`);
   }
   const object = parsed as Record<string, unknown>;
-  if (object.payloadVersion !== undefined && object.payloadVersion !== 1) {
+  if (object.payloadVersion !== 1) {
     throw new Error(`invalid ${kind} payload in SQLite store: unsupported payloadVersion`);
   }
   return object;
@@ -4723,12 +3367,7 @@ function oneOf<T extends string>(value: string, allowed: readonly T[], field: st
   return value as T;
 }
 
-/**
- * Hydrate promoted columns over the compatibility payload. This is intentional:
- * query/state columns are the SQLite source of truth, while payload_json carries
- * the low-query fields. It also lets Phase 2 read rows produced by the legacy
- * JSON importer before the Phase 3 payload codec removes duplicated fields.
- */
+/** Hydrate promoted columns over a validated current-version payload. */
 function decodeWorkspace(row: WorkspaceRow): RepositoryWorkspace {
   return {
     id: requiredString(row.id, 'id', 'workspace'),
@@ -4759,26 +3398,7 @@ function decodeDependency(row: DependencyRow): TaskDependency {
   };
 }
 
-function legacyDependencies(payload: Record<string, unknown>): TaskDependency[] {
-  if (payload.dependencies === undefined) return [];
-  if (!Array.isArray(payload.dependencies)) {
-    throw new Error('invalid task row in SQLite store: dependencies must be an array');
-  }
-  return payload.dependencies.map((value) => {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {
-      throw new Error('invalid task row in SQLite store: dependency must be an object');
-    }
-    const row = value as Record<string, unknown>;
-    return {
-      taskId: requiredString(row.taskId, 'dependencies.taskId', 'task'),
-      requiredOutcome: oneOf(requiredString(row.requiredOutcome, 'dependencies.requiredOutcome', 'task'), ['succeeded', 'settled'] as const, 'dependencies.requiredOutcome', 'task'),
-      onUnsatisfied: oneOf(requiredString(row.onUnsatisfied, 'dependencies.onUnsatisfied', 'task'), ['block', 'fail', 'skip'] as const, 'dependencies.onUnsatisfied', 'task'),
-      ...(row.requiredVerdict === undefined ? {} : { requiredVerdict: oneOf(requiredString(row.requiredVerdict, 'dependencies.requiredVerdict', 'task'), ['pass'] as const, 'dependencies.requiredVerdict', 'task') }),
-    };
-  });
-}
-
-function decodeTask(row: TaskRow, dependencies?: readonly TaskDependency[]): MusterTask {
+function decodeTask(row: TaskRow, dependencies: readonly TaskDependency[]): MusterTask {
   const payload = parsePayload(row.payload_json, 'task');
   const task: Record<string, unknown> = {
     ...payload,
@@ -4792,22 +3412,14 @@ function decodeTask(row: TaskRow, dependencies?: readonly TaskDependency[]): Mus
     createdAt: requiredString(row.created_at, 'created_at', 'task'),
     updatedAt: requiredString(row.updated_at, 'updated_at', 'task'),
     ...(row.model === null ? { model: undefined } : { model: row.model }),
-    ...(row.release_state === null ? { releaseState: undefined } : { releaseState: row.release_state }),
-    dependencies: dependencies ?? legacyDependencies(payload),
+    releaseState: oneOf(row.release_state, ['draft', 'released'] as const, 'release_state', 'task'),
+    dependencies,
   };
   delete task.payloadVersion;
   if (!Array.isArray(task.capabilities) || !task.executionPolicy || typeof task.executionPolicy !== 'object') {
     throw new Error('invalid task row in SQLite store: missing domain payload fields');
   }
   return task as unknown as MusterTask;
-}
-
-function legacyTurnInputs(payload: Record<string, unknown>): TurnInput[] {
-  if (payload.inputs === undefined) return [];
-  if (!Array.isArray(payload.inputs)) {
-    throw new Error('invalid turn row in SQLite store: inputs must be an array');
-  }
-  return payload.inputs.map((input) => decodeTurnInputValue(input));
 }
 
 function decodeTurnInputValue(value: unknown): TurnInput {
@@ -4845,7 +3457,7 @@ function decodeTurnInput(row: TurnInputRow): TurnInput {
   return input;
 }
 
-function decodeTurn(row: TurnRow, inputs?: readonly TurnInput[]): TaskTurn {
+function decodeTurn(row: TurnRow, inputs: readonly TurnInput[]): TaskTurn {
   const payload = parsePayload(row.payload_json, 'turn');
   const turn: Record<string, unknown> = {
     ...payload,
@@ -4857,7 +3469,7 @@ function decodeTurn(row: TurnRow, inputs?: readonly TurnInput[]): TaskTurn {
     createdAt: requiredString(row.created_at, 'created_at', 'turn'),
     ...(row.started_at === null ? { startedAt: undefined } : { startedAt: row.started_at }),
     ...(row.settled_at === null ? { finishedAt: undefined } : { finishedAt: row.settled_at }),
-    inputs: inputs ?? legacyTurnInputs(payload),
+    inputs,
   };
   delete turn.payloadVersion;
   return turn as unknown as TaskTurn;
@@ -4912,16 +3524,10 @@ function decodeReasoning(row: ReasoningRow): PersistedReasoning {
 
 function decodeOperation(row: OperationRow): OperationLedgerEntry {
   const encoded = parsePayload(row.result_json, 'operation result');
-  // v1 Phase-3 rows carry `{ payloadVersion, result }`; tolerate the brief
-  // Phase-2 compatibility form where result_json itself was the OpResult.
-  const result = encoded.payloadVersion === 1
-    ? (() => {
-        if (!encoded.result || typeof encoded.result !== 'object' || Array.isArray(encoded.result)) {
-          throw new Error('invalid operation row in SQLite store: result must be object');
-        }
-        return encoded.result as Record<string, unknown>;
-      })()
-    : encoded;
+  if (!encoded.result || typeof encoded.result !== 'object' || Array.isArray(encoded.result)) {
+    throw new Error('invalid operation row in SQLite store: result must be object');
+  }
+  const result = encoded.result as Record<string, unknown>;
   if (typeof result.ok !== 'boolean') {
     throw new Error('invalid operation row in SQLite store: result.ok must be boolean');
   }

@@ -454,7 +454,6 @@ describe('applySuccessfulTurn', () => {
         revision: 1,
         summary: 'done',
       });
-      expect(result.next.task.result).toBe('done');
       expect(result.next.task.outcomeProposal).toEqual({
         kind: 'complete',
         result: 'done',
@@ -484,7 +483,6 @@ describe('applySuccessfulTurn', () => {
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.next.task.lifecycle).toBe('succeeded');
-      expect(result.next.task.result).toBe('done');
       expect(result.next.task.taskResult).toEqual({
         version: 1,
         revision: 1,
@@ -826,7 +824,6 @@ describe('applyFailedTurn', () => {
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.next.lifecycle).toBe('succeeded');
-      expect(result.next.result).toBe('shipped');
       expect(result.next.taskResult).toEqual({
         version: 1,
         revision: 1,
@@ -842,7 +839,6 @@ describe('applyFailedTurn', () => {
     if (result.ok) {
       expect(result.next.lifecycle).toBe('succeeded');
       expect(result.next.taskResult).toBeUndefined();
-      expect(result.next.result).toBeUndefined();
     }
   });
 

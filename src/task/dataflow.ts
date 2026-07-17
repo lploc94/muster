@@ -50,13 +50,8 @@ export function buildTaskResultFromSummary(
   return result;
 }
 
-/** Prefer structured taskResult; fall back to legacy result string as revision 1. */
 export function effectiveTaskResult(task: MusterTask): TaskResultV1 | undefined {
-  if (task.taskResult) return task.taskResult;
-  if (typeof task.result === 'string' && task.result.length > 0) {
-    return { version: 1, revision: 1, summary: clampSummary(task.result) };
-  }
-  return undefined;
+  return task.taskResult;
 }
 
 export function isAllowedBindingOutput(output: string): output is TaskResultOutputKey {

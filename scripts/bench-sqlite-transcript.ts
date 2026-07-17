@@ -15,8 +15,6 @@ import * as path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { DbClient } from '../src/task/sqlite/client';
 import { SqliteTaskRepository } from '../src/task/repository';
-import { TaskStore } from '../src/task/store';
-import type { MusterTask, TaskMessage, TaskStoreFile, TaskTurn } from '../src/task/types';
 
 const ISO = '2026-07-17T00:00:00.000Z';
 const WORKSPACE = 'bench-workspace';
@@ -85,81 +83,6 @@ interface Measurement {
   feedRevisions: number;
   feedRows: number;
   unrelatedUnchanged: boolean;
-  beforeJsonBytes: number;
-  beforeJsonP50Ms: number;
-  beforeJsonP95Ms: number;
-  beforeJsonUnrelatedUnchanged: boolean;
-}
-
-interface LegacyMeasurement {
-  bytes: number;
-  p50Ms: number;
-  p95Ms: number;
-  unrelatedUnchanged: boolean;
-}
-
-function legacyTask(id: string): MusterTask {
-  return {
-    id, parentId: null, role: 'worker', lifecycle: 'open', goal: id,
-    dependencies: [], backend: 'grok', capabilities: [],
-    executionPolicy: { maxTurns: 100, maxAutomaticRetries: 0 },
-    revision: 0, createdAt: ISO, updatedAt: ISO,
-  };
-}
-
-function measureLegacyJson(unrelatedMessages: number, iterations: number): LegacyMeasurement {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-json-transcript-bench-'));
-  const filePath = path.join(dir, '.muster-tasks.json');
-  try {
-    const focusTurn: TaskTurn = {
-      id: 'focus-turn', taskId: 'focus-task', sequence: 1, status: 'running',
-      trigger: 'user', inputs: [], createdAt: ISO, startedAt: ISO,
-    };
-    const file: TaskStoreFile = {
-      schemaVersion: 6, revision: 0,
-      tasks: { 'focus-task': legacyTask('focus-task'), 'unrelated-task': legacyTask('unrelated-task') },
-      turns: { [focusTurn.id]: focusTurn }, messages: {}, operations: {}, cancelRequests: {},
-      toolCalls: {}, reasoning: {}, sendReceipts: {}, runtimeClaims: {},
-    };
-    for (let i = 0; i < unrelatedMessages; i += 1) {
-      const message: TaskMessage = {
-        id: `unrelated-message-${i}`, taskId: 'unrelated-task', role: 'assistant',
-        content: `unrelated payload ${'x'.repeat(256)}`, state: 'complete', order: i,
-        createdAt: ISO,
-      };
-      file.messages[message.id] = message;
-    }
-    fs.writeFileSync(filePath, JSON.stringify(file, null, 2), 'utf8');
-    const bytes = fs.statSync(filePath).size;
-    const store = TaskStore.load({ filePath });
-    const baseline = store.getFile().messages['unrelated-message-0']?.content;
-    const beforeRevision = store.getFile().revision;
-    const durations: number[] = [];
-    for (let i = 0; i < iterations; i += 1) {
-      const started = performance.now();
-      const result = store.commit((draft) => {
-        const message: TaskMessage = {
-          id: `focused-stream-${i}`, taskId: 'focus-task', turnId: focusTurn.id,
-          role: 'assistant', content: `focused chunk ${i}`, state: 'partial', order: i,
-          createdAt: ISO,
-        };
-        draft.messages[message.id] = message;
-        return { ok: true };
-      });
-      if (!result.ok) throw new Error(`legacy JSON benchmark commit failed: ${result.reason}`);
-      durations.push(performance.now() - started);
-    }
-    return {
-      bytes,
-      p50Ms: percentile(durations, 50),
-      p95Ms: percentile(durations, 95),
-      unrelatedUnchanged:
-        store.getFile().messages['unrelated-message-0']?.content === baseline &&
-        store.getFile().revision - beforeRevision === iterations,
-    };
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
 }
 
 async function measure(unrelatedMessages: number, iterations: number): Promise<Measurement> {
@@ -201,7 +124,6 @@ async function measure(unrelatedMessages: number, iterations: number): Promise<M
     const unchanged = await client.get<{ content: string }>(
       'SELECT content FROM messages WHERE workspace_id = ? AND id = ?', [WORKSPACE, 'unrelated-message-0'],
     );
-    const legacy = measureLegacyJson(unrelatedMessages, iterations);
     return {
       unrelatedMessages,
       dbBytes: databaseBytes(dbPath),
@@ -210,10 +132,6 @@ async function measure(unrelatedMessages: number, iterations: number): Promise<M
       feedRevisions: feed?.revisions ?? 0,
       feedRows: feed?.rows ?? 0,
       unrelatedUnchanged: unchanged?.content === baseline?.content && (after?.revision ?? 0) - (revisionBefore?.revision ?? 0) === iterations,
-      beforeJsonBytes: legacy.bytes,
-      beforeJsonP50Ms: legacy.p50Ms,
-      beforeJsonP95Ms: legacy.p95Ms,
-      beforeJsonUnrelatedUnchanged: legacy.unrelatedUnchanged,
     };
   } finally {
     await client.close();
@@ -232,7 +150,7 @@ async function main(): Promise<void> {
   const meta = {
     machine: `${os.platform()} ${os.arch()} ${os.cpus()[0]?.model ?? 'unknown-cpu'}`,
     node: process.version,
-    mode: 'tsx development benchmark (SQLite TypeScript worker + legacy synchronous JSON TaskStore)',
+    mode: 'tsx development benchmark (SQLite TypeScript worker)',
     iterations,
     timestamp: new Date().toISOString(),
   };
@@ -245,12 +163,12 @@ async function main(): Promise<void> {
   console.log(`node       : ${meta.node}`);
   console.log(`mode       : ${meta.mode}`);
   console.log(`iterations : ${iterations} appends/size`);
-  console.log('size       JSON KiB JSON p95  SQLite KiB SQLite p95  feed(rev/rows)  unchanged');
-  console.log('--------------------------------------------------------------------------------');
+  console.log('size       SQLite KiB SQLite p95  feed(rev/rows)  unchanged');
+  console.log('---------------------------------------------------------------');
   for (const result of results) {
-    console.log(`${String(result.unrelatedMessages).padEnd(10)} ${(result.beforeJsonBytes / 1024).toFixed(1).padStart(8)} ${result.beforeJsonP95Ms.toFixed(2).padStart(8)} ${(result.dbBytes / 1024).toFixed(1).padStart(10)} ${result.p95Ms.toFixed(2).padStart(10)} ${`${result.feedRevisions}/${result.feedRows}`.padStart(15)} ${result.unrelatedUnchanged && result.beforeJsonUnrelatedUnchanged ? 'yes' : 'NO'}`);
+    console.log(`${String(result.unrelatedMessages).padEnd(10)} ${(result.dbBytes / 1024).toFixed(1).padStart(10)} ${result.p95Ms.toFixed(2).padStart(10)} ${`${result.feedRevisions}/${result.feedRows}`.padStart(15)} ${result.unrelatedUnchanged ? 'yes' : 'NO'}`);
   }
-  if (results.some((result) => !result.unrelatedUnchanged || !result.beforeJsonUnrelatedUnchanged ||
+  if (results.some((result) => !result.unrelatedUnchanged ||
       result.feedRows !== iterations || result.feedRevisions !== iterations)) {
     throw new Error('row-level benchmark invariant failed: unrelated rows or revision/feed cardinality changed');
   }

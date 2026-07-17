@@ -19,8 +19,7 @@ class FakePanel implements PresentationPanel {
 
   async update(
     document: PresentationDocument,
-    _rootId?: string,
-    _options?: { restore?: boolean },
+    _rootId: string,
   ): Promise<boolean> {
     this.updates.push(document);
     if (this.disposeDuringUpdate) this.dispose();
@@ -391,11 +390,13 @@ describe('PresentationManager', () => {
     expect(
       await manager.restore(panel, {
         rootId: context.rootId,
-        presentationId: request.presentationId,
-        ownerTaskId: request.ownerTaskId,
-        revision: request.revision,
-        title: request.title,
-        markdown: request.markdown,
+        document: {
+          presentationId: request.presentationId,
+          ownerTaskId: request.ownerTaskId,
+          revision: request.revision,
+          title: request.title,
+          markdown: request.markdown,
+        },
       }),
     ).toEqual({ ok: true, code: 'restored' });
     expect(panel.updates).toHaveLength(1);
@@ -409,7 +410,7 @@ describe('PresentationManager', () => {
     expect(factory.created).toEqual([]);
   });
 
-  it('migrates legacy child owner to root when resolver is set, rejects unresolved owners', async () => {
+  it('validates child ownership against the persisted root without rewriting identity', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
     manager.setOwnerResolver((ownerId) => (ownerId === 'child-1' || ownerId === 'root-1' ? 'root-1' : undefined));
@@ -417,24 +418,28 @@ describe('PresentationManager', () => {
     expect(
       await manager.restore(panel, {
         rootId: 'root-1',
-        presentationId: request.presentationId,
-        ownerTaskId: 'child-1',
-        revision: 1,
-        title: request.title,
-        markdown: request.markdown,
+        document: {
+          presentationId: request.presentationId,
+          ownerTaskId: 'child-1',
+          revision: 1,
+          title: request.title,
+          markdown: request.markdown,
+        },
       }),
     ).toEqual({ ok: true, code: 'restored' });
-    expect(panel.updates[0]?.ownerTaskId).toBe('root-1');
+    expect(panel.updates[0]?.ownerTaskId).toBe('child-1');
 
     const bad = new FakePanel();
     expect(
       await manager.restore(bad, {
         rootId: 'root-1',
-        presentationId: 'other-plan',
-        ownerTaskId: 'missing',
-        revision: 1,
-        title: request.title,
-        markdown: request.markdown,
+        document: {
+          presentationId: 'other-plan',
+          ownerTaskId: 'missing',
+          revision: 1,
+          title: request.title,
+          markdown: request.markdown,
+        },
       }),
     ).toEqual({ ok: false, code: 'restore_rejected' });
   });
@@ -444,11 +449,13 @@ describe('PresentationManager', () => {
     const manager = new PresentationManager(factory);
     const persisted = {
       rootId: context.rootId,
-      presentationId: request.presentationId,
-      ownerTaskId: request.ownerTaskId,
-      revision: request.revision,
-      title: request.title,
-      markdown: request.markdown,
+      document: {
+        presentationId: request.presentationId,
+        ownerTaskId: request.ownerTaskId,
+        revision: request.revision,
+        title: request.title,
+        markdown: request.markdown,
+      },
     };
 
     const malformedPanel = new FakePanel();
@@ -461,7 +468,10 @@ describe('PresentationManager', () => {
     const livePanel = new FakePanel();
     expect(await manager.restore(livePanel, persisted)).toEqual({ ok: true, code: 'restored' });
     const conflictPanel = new FakePanel();
-    expect(await manager.restore(conflictPanel, { ...persisted, revision: 2 })).toEqual({
+    expect(await manager.restore(conflictPanel, {
+      ...persisted,
+      document: { ...persisted.document, revision: 2 },
+    })).toEqual({
       ok: false,
       code: 'restore_conflict',
     });
