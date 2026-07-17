@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   buildDockerArgs,
   buildPlaywrightCommand,
+  buildChownArgs,
   dockerUserArgs,
   parseArgs,
   resolveHostUserIds,
@@ -208,4 +209,21 @@ test('buildDockerArgs inserts --user before image when userArgs provided', () =>
   const userIdx = args.indexOf('--user');
   assert.ok(userIdx >= 0 && userIdx < imageIdx);
   assert.equal(args[userIdx + 1], '1001:1001');
+});
+
+
+test('buildChownArgs chowns bind-mount outputs as root helper container', () => {
+  const args = buildChownArgs({
+    image: 'mcr.microsoft.com/playwright:v1.61.1-jammy',
+    workdir: '/work',
+    hostRepo: '/repo',
+    uid: '1001',
+    gid: '1001',
+  });
+  assert.ok(args.includes('--rm'));
+  assert.ok(args.includes('/repo:/work'));
+  assert.ok(args.includes('chown'));
+  assert.ok(args.includes('1001:1001'));
+  assert.ok(args.includes('test-results'));
+  assert.ok(args.includes('playwright-report'));
 });

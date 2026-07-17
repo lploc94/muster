@@ -167,13 +167,44 @@ export function dockerUserArgs(env = process.env) {
   return ['--user', ids.uid + ':' + ids.gid, '-e', 'HOME=/tmp'];
 }
 
+/**
+ * After a root container writes bind-mounted artifacts, chown them back to the
+ * host user so host-side writeDiagnostics / artifact upload can read them.
+ * Best-effort: never throws; writeDiagnostics also has an EACCES fallback.
+ */
+export function buildChownArgs({
+  image,
+  workdir,
+  hostRepo,
+  mountStyle = 'native',
+  uid,
+  gid,
+  paths = ['test-results', 'playwright-report'],
+}) {
+  const mountPath = toDockerMountPath(hostRepo, { style: mountStyle });
+  return [
+    'run',
+    '--rm',
+    '-v',
+    `${mountPath}:${workdir}`,
+    '-w',
+    workdir,
+    image,
+    'chown',
+    '-R',
+    `${uid}:${gid}`,
+    ...paths,
+  ];
+}
+
+
 export function buildDockerArgs({
   image,
   workdir,
   hostRepo,
   command,
   mountStyle = 'native',
-  userArgs = dockerUserArgs(),
+  userArgs = [],
 }) {
   const mountPath = toDockerMountPath(hostRepo, { style: mountStyle });
   const mount = `${mountPath}:${workdir}`;
@@ -423,7 +454,6 @@ function main(argv = process.argv.slice(2)) {
     const diagArgs = [
       'run',
       '--rm',
-      ...dockerUserArgs(),
       '-v',
       `${mountPath}:${workdir}`,
       '-v',
@@ -486,6 +516,22 @@ function main(argv = process.argv.slice(2)) {
   });
 
   const status = runDocker(engine, dockerArgs);
+
+  // Reclaim root-owned bind mounts so host writeDiagnostics does not EACCES.
+  const hostIds = resolveHostUserIds();
+  if (hostIds) {
+    runDocker(
+      engine,
+      buildChownArgs({
+        image,
+        workdir,
+        hostRepo,
+        mountStyle: engine.mountStyle,
+        uid: hostIds.uid,
+        gid: hostIds.gid,
+      }),
+    );
+  }
 
   const containerDiagPath = path.join(
     REPO_ROOT,
