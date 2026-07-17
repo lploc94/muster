@@ -31,7 +31,7 @@ export default defineConfig({
     },
     {
       name: 'visual-chromium',
-      testMatch: ['**/visual/**/*.visual.spec.ts'],
+      testMatch: ['**/visual/**/*.visual.spec.ts', '**/visual/**/*-slice-flows.spec.ts'],
       use: {
         ...devices['Desktop Chrome'],
         ...VISUAL_PLAYWRIGHT_USE,

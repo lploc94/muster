@@ -42,14 +42,20 @@ export function playwrightDockerImage(version) {
   return `mcr.microsoft.com/playwright:v${version}-jammy`;
 }
 
+export function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'"'"'`)}'`;
+}
+
 export function parseArgs(argv) {
   const result = {
     mode: 'compare',
     update: false,
     diagnosticsOnly: false,
     help: false,
+    playwrightArgs: [],
   };
-  for (const arg of argv) {
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
     if (arg === '--update') {
       result.mode = 'update';
       result.update = true;
@@ -63,14 +69,36 @@ export function parseArgs(argv) {
       result.help = true;
       continue;
     }
-    throw new Error(`Unknown argument: ${arg}`);
+    // npm often strips quotes around --grep patterns; reassemble multi-word values.
+    if (arg === '--grep' || arg === '-g') {
+      result.playwrightArgs.push('--grep');
+      const parts = [];
+      let j = i + 1;
+      while (j < argv.length && !argv[j].startsWith('-')) {
+        parts.push(argv[j]);
+        j += 1;
+      }
+      if (parts.length > 0) {
+        result.playwrightArgs.push(parts.join(' '));
+        i = j - 1;
+      }
+      continue;
+    }
+    // Forward remaining flags (e.g. --list) to Playwright.
+    result.playwrightArgs.push(arg);
   }
   return result;
 }
 
-export function buildPlaywrightCommand({ update }) {
-  const base = 'npx playwright test e2e/visual --project=visual-chromium';
-  return update ? `${base} --update-snapshots` : base;
+export function buildPlaywrightCommand({ update, playwrightArgs = [] } = {}) {
+  const parts = ['npx playwright test e2e/visual --project=visual-chromium'];
+  if (update) {
+    parts.push('--update-snapshots');
+  }
+  for (const arg of playwrightArgs) {
+    parts.push(shellQuote(arg));
+  }
+  return parts.join(' ');
 }
 
 /**
@@ -132,12 +160,14 @@ function printHelp() {
   console.log(`Pinned Linux visual baseline runner
 
 Usage:
-  node scripts/run-visual-baselines.mjs [--update] [--diagnostics-only]
+  node scripts/run-visual-baselines.mjs [--update] [--diagnostics-only] [--] [playwright args...]
 
 Options:
   --update             Author/update committed goldens inside Docker (explicit only)
   --diagnostics-only   Write platform/font diagnostics without running Playwright
   --help               Show this help
+
+Any other arguments (for example --grep or --list) are forwarded to Playwright.
 
 Environment:
   MUSTER_VISUAL_DIAGNOSTICS_PATH  Override diagnostics JSON path
@@ -366,7 +396,10 @@ function main(argv = process.argv.slice(2)) {
     return status;
   }
 
-  const playwrightCmd = buildPlaywrightCommand({ update: args.update });
+  const playwrightCmd = buildPlaywrightCommand({
+    update: args.update,
+    playwrightArgs: args.playwrightArgs,
+  });
   const command = [
     playwrightCmd,
     'mkdir -p test-results',

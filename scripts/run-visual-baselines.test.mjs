@@ -39,6 +39,7 @@ test('parseArgs defaults to compare mode without update', () => {
     update: false,
     diagnosticsOnly: false,
     help: false,
+    playwrightArgs: [],
   });
 });
 
@@ -48,11 +49,59 @@ test('parseArgs accepts explicit update mode', () => {
     update: true,
     diagnosticsOnly: false,
     help: false,
+    playwrightArgs: [],
   });
 });
 
-test('parseArgs rejects unknown flags', () => {
-  assert.throws(() => parseArgs(['--force']), /Unknown argument/);
+test('parseArgs forwards Playwright passthrough args after known flags', () => {
+  assert.deepEqual(
+    parseArgs(['--grep', 'M014 S01 flow: deterministic dual-entrypoint pilot']),
+    {
+      mode: 'compare',
+      update: false,
+      diagnosticsOnly: false,
+      help: false,
+      playwrightArgs: [
+        '--grep',
+        'M014 S01 flow: deterministic dual-entrypoint pilot',
+      ],
+    },
+  );
+});
+
+
+test('parseArgs reassembles multi-word --grep patterns stripped by npm', () => {
+  assert.deepEqual(
+    parseArgs([
+      '--grep',
+      'M014',
+      'S01',
+      'flow:',
+      'deterministic',
+      'dual-entrypoint',
+      'pilot',
+    ]),
+    {
+      mode: 'compare',
+      update: false,
+      diagnosticsOnly: false,
+      help: false,
+      playwrightArgs: [
+        '--grep',
+        'M014 S01 flow: deterministic dual-entrypoint pilot',
+      ],
+    },
+  );
+});
+
+test('parseArgs keeps --update while forwarding remaining Playwright args', () => {
+  assert.deepEqual(parseArgs(['--update', '--list']), {
+    mode: 'update',
+    update: true,
+    diagnosticsOnly: false,
+    help: false,
+    playwrightArgs: ['--list'],
+  });
 });
 
 test('buildPlaywrightCommand never includes update-snapshots in compare mode', () => {
@@ -64,6 +113,18 @@ test('buildPlaywrightCommand never includes update-snapshots in compare mode', (
 test('buildPlaywrightCommand includes update-snapshots only when requested', () => {
   const cmd = buildPlaywrightCommand({ update: true });
   assert.match(cmd, /--update-snapshots/);
+});
+
+test('buildPlaywrightCommand appends shell-safe Playwright passthrough args', () => {
+  const cmd = buildPlaywrightCommand({
+    update: false,
+    playwrightArgs: [
+      '--grep',
+      'M014 S01 flow: deterministic dual-entrypoint pilot',
+    ],
+  });
+  assert.match(cmd, /'--grep' 'M014 S01 flow: deterministic dual-entrypoint pilot'/);
+  assert.doesNotMatch(cmd, /update-snapshots/);
 });
 
 test('toDockerMountPath converts Windows paths for WSL docker-ce', () => {

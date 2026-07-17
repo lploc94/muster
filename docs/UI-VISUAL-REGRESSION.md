@@ -86,9 +86,29 @@ listings sufficient to reproduce rasterization context.
 - Pilot fixtures are static sanitized contracts (no live ACP backends, no real
   user content).
 
+## M014 S01 dual-entrypoint flow
+
+Stable independently executable proof (exact Playwright title):
+
+```text
+M014 S01 flow: deterministic dual-entrypoint pilot
+```
+
+Spec: `e2e/visual/m014-slice-flows.spec.ts`
+
+This flow exercises **both** main-webview and Presentation pilot boundaries in
+one test and compares them against the committed Linux goldens. It supplements
+the per-entrypoint pilot specs and is the named slice verification entrypoint:
+
+```bash
+npm run test:visual:linux -- --grep "M014 S01 flow: deterministic dual-entrypoint pilot"
+```
+
 ## Pilot IDs
 
 | Entrypoint | Pilot ID | Spec |
 |------------|----------|------|
-| Main webview | `muster-webview-visual-pilot` | `e2e/visual/muster-webview.visual.spec.ts` |
-| Presentation | `muster-presentation-visual-pilot` | `e2e/visual/muster-presentation.visual.spec.ts` |
+| Main webview | `V01-webview-compact-dark` | `e2e/visual/muster-webview.visual.spec.ts` |
+| Presentation | `V02-presentation-rich-dark` | `e2e/visual/muster-presentation.visual.spec.ts` |
+| Dual-entrypoint flow | `M014 S01 flow: deterministic dual-entrypoint pilot` | `e2e/visual/m014-slice-flows.spec.ts` |
+
