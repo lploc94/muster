@@ -65,7 +65,7 @@ function transcriptToThreadItem(item: TranscriptItem): ThreadItem | null {
   }
 }
 
-/** Pure workspace revision + focused transcript view for protocol v8 patches. */
+/** Pure workspace revision + focused transcript view for protocol v9 patches. */
 export interface WorkspacePatchViewState {
   revision: number;
   needsRecovery: boolean;
@@ -75,7 +75,11 @@ export interface WorkspacePatchViewState {
   queuedTurns: QueuedTurnProjection[];
   transcriptItems: ThreadItem[];
   reasoningByTurn: Record<string, string>;
+  /** Stable reasoning entity id -> rendered turn ownership. */
+  reasoningTurnByItemId: Record<string, string>;
   loadedTranscriptIds: ReadonlySet<string>;
+  /** IDs removed by the most recently applied batch (for live-stream teardown). */
+  removedTranscriptIds: ReadonlySet<string>;
   transcriptWorkspaceRevision?: number;
   /** Observed gap revision that triggered recovery (if any). */
   observedRevision?: number;
@@ -107,7 +111,9 @@ export function emptyWorkspacePatchViewState(): WorkspacePatchViewState {
     queuedTurns: [],
     transcriptItems: [],
     reasoningByTurn: {},
+    reasoningTurnByItemId: {},
     loadedTranscriptIds: new Set(),
+    removedTranscriptIds: new Set(),
   };
 }
 
@@ -132,12 +138,16 @@ export function applySnapshotToPatchView(
 
   const transcriptItems: ThreadItem[] = [];
   const reasoningByTurn: Record<string, string> = {};
+  const reasoningTurnByItemId: Record<string, string> = {};
   const loaded = new Set<string>();
   if (snapshot.transcript) {
     for (const item of snapshot.transcript) {
       loaded.add(item.id);
       if (item.kind === 'reasoning') {
-        if (item.turnId) reasoningByTurn[item.turnId] = asText(item.content);
+        if (item.turnId) {
+          reasoningByTurn[item.turnId] = asText(item.content);
+          reasoningTurnByItemId[item.id] = item.turnId;
+        }
         continue;
       }
       const mapped = transcriptToThreadItem(item);
@@ -154,7 +164,9 @@ export function applySnapshotToPatchView(
     queuedTurns: snapshot.focusedTaskId ? [...(snapshot.queuedTurns ?? [])] : [],
     transcriptItems,
     reasoningByTurn,
+    reasoningTurnByItemId,
     loadedTranscriptIds: loaded,
+    removedTranscriptIds: new Set(),
     transcriptWorkspaceRevision: snapshot.transcriptPage?.workspaceRevision,
     observedRevision: undefined,
   };
@@ -192,6 +204,7 @@ export function syncTranscriptPageIntoPatchView(
     focusedTaskId: string | null;
     transcriptItems: readonly ThreadItem[];
     reasoningByTurn: Readonly<Record<string, string>>;
+    reasoningTurnByItemId: Readonly<Record<string, string>>;
     loadedTranscriptIds: ReadonlySet<string>;
     transcriptWorkspaceRevision?: number;
   },
@@ -209,6 +222,7 @@ export function syncTranscriptPageIntoPatchView(
     ...state,
     transcriptItems: input.transcriptItems.slice(),
     reasoningByTurn: { ...input.reasoningByTurn },
+    reasoningTurnByItemId: { ...input.reasoningTurnByItemId },
     loadedTranscriptIds: new Set(input.loadedTranscriptIds),
     transcriptWorkspaceRevision: revision,
   };
@@ -222,6 +236,7 @@ function removeTaskFromView(
     queuedTurns: QueuedTurnProjection[];
     transcriptItems: ThreadItem[];
     reasoningByTurn: Record<string, string>;
+    reasoningTurnByItemId: Record<string, string>;
     loadedTranscriptIds: Set<string>;
   },
   taskId: string,
@@ -233,6 +248,7 @@ function removeTaskFromView(
     draft.queuedTurns = [];
     draft.transcriptItems = [];
     draft.reasoningByTurn = {};
+    draft.reasoningTurnByItemId = {};
     draft.loadedTranscriptIds = new Set();
   }
 }
@@ -242,6 +258,7 @@ function appendTranscriptItems(
     focusedTaskId: string | null;
     transcriptItems: ThreadItem[];
     reasoningByTurn: Record<string, string>;
+    reasoningTurnByItemId: Record<string, string>;
     loadedTranscriptIds: Set<string>;
   },
   taskId: string,
@@ -263,6 +280,7 @@ function appendTranscriptItems(
     if (item.kind === 'reasoning') {
       if (item.turnId) {
         draft.reasoningByTurn[item.turnId] = asText(item.content);
+        draft.reasoningTurnByItemId[item.id] = item.turnId;
       }
       continue;
     }
@@ -277,6 +295,7 @@ function patchTranscriptItem(
     focusedTaskId: string | null;
     transcriptItems: ThreadItem[];
     reasoningByTurn: Record<string, string>;
+    reasoningTurnByItemId: Record<string, string>;
     loadedTranscriptIds: Set<string>;
   },
   taskId: string,
@@ -289,6 +308,7 @@ function patchTranscriptItem(
     if (!draft.loadedTranscriptIds.has(item.id)) return 'invariant';
     // Reasoning owns the stable entity id (= turnId typically).
     draft.reasoningByTurn[item.turnId] = asText(item.content);
+    draft.reasoningTurnByItemId[item.id] = item.turnId;
     return 'ok';
   }
 
@@ -307,6 +327,35 @@ function patchTranscriptItem(
     return 'invariant';
   }
   draft.transcriptItems[idx] = mapped;
+  return 'ok';
+}
+
+function removeTranscriptItems(
+  draft: {
+    focusedTaskId: string | null;
+    transcriptItems: ThreadItem[];
+    reasoningByTurn: Record<string, string>;
+    reasoningTurnByItemId: Record<string, string>;
+    loadedTranscriptIds: Set<string>;
+  },
+  taskId: string,
+  itemIds: readonly string[],
+): 'ok' {
+  if (draft.focusedTaskId !== taskId) return 'ok';
+  const removed = new Set(itemIds);
+  draft.transcriptItems = draft.transcriptItems.filter((item) => !removed.has(item.id));
+  for (const itemId of itemIds) {
+    draft.loadedTranscriptIds.delete(itemId);
+    const turnId = draft.reasoningTurnByItemId[itemId];
+    if (turnId) {
+      delete draft.reasoningTurnByItemId[itemId];
+      // One canonical reasoning row is rendered per turn. Only clear the turn
+      // when the removed stable entity still owns it.
+      if (!Object.values(draft.reasoningTurnByItemId).includes(turnId)) {
+        delete draft.reasoningByTurn[turnId];
+      }
+    }
+  }
   return 'ok';
 }
 
@@ -351,6 +400,15 @@ function hasBatchIdentityInvariant(batch: WorkspacePatchBatchMessage): boolean {
         transcriptEntities.add(key);
         break;
       }
+      case 'transcriptItemsRemoved': {
+        if (removedTasks.has(patch.taskId)) return true;
+        for (const itemId of patch.itemIds) {
+          const key = `${patch.taskId}\0${itemId}`;
+          if (transcriptEntities.has(key)) return true;
+          transcriptEntities.add(key);
+        }
+        break;
+      }
     }
   }
 
@@ -392,6 +450,7 @@ function applyOnePatch(
     queuedTurns: QueuedTurnProjection[];
     transcriptItems: ThreadItem[];
     reasoningByTurn: Record<string, string>;
+    reasoningTurnByItemId: Record<string, string>;
     loadedTranscriptIds: Set<string>;
   },
   patch: WorkspacePatch,
@@ -428,6 +487,8 @@ function applyOnePatch(
       return appendTranscriptItems(draft, patch.taskId, patch.items);
     case 'transcriptItemPatched':
       return patchTranscriptItem(draft, patch.taskId, patch.item);
+    case 'transcriptItemsRemoved':
+      return removeTranscriptItems(draft, patch.taskId, patch.itemIds);
     default:
       return 'invariant';
   }
@@ -485,6 +546,7 @@ export function applyWorkspacePatchBatch(
     queuedTurns: [...state.queuedTurns],
     transcriptItems: state.transcriptItems.slice(),
     reasoningByTurn: { ...state.reasoningByTurn },
+    reasoningTurnByItemId: { ...state.reasoningTurnByItemId },
     loadedTranscriptIds: cloneIds(state.loadedTranscriptIds),
   };
 
@@ -505,6 +567,12 @@ export function applyWorkspacePatchBatch(
   }
 
   const nextRevision = batch.revision;
+  const removedTranscriptIds = new Set<string>();
+  for (const patch of batch.patches) {
+    if (patch.type === 'transcriptItemsRemoved' && patch.taskId === draft.focusedTaskId) {
+      for (const itemId of patch.itemIds) removedTranscriptIds.add(itemId);
+    }
+  }
   const transcriptWorkspaceRevision =
     state.transcriptWorkspaceRevision === undefined
       ? nextRevision
@@ -523,7 +591,9 @@ export function applyWorkspacePatchBatch(
       queuedTurns: draft.queuedTurns,
       transcriptItems: draft.transcriptItems,
       reasoningByTurn: draft.reasoningByTurn,
+      reasoningTurnByItemId: draft.reasoningTurnByItemId,
       loadedTranscriptIds: draft.loadedTranscriptIds,
+      removedTranscriptIds,
       transcriptWorkspaceRevision,
       observedRevision: undefined,
     },

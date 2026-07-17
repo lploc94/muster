@@ -280,6 +280,7 @@ describe('applyTranscriptPageResult', () => {
     const base: TranscriptPageWindowState = {
       ...seeded(['u1']),
       reasoningByTurn: { 'turn-live': 'live stream reasoning' },
+      reasoningTurnByItemId: { 'turn-live': 'turn-live' },
       loadedTranscriptIds: new Set(['u1', 'turn-live']),
       beforeCursor: 'v2.seed',
       hasMoreBefore: true,
@@ -303,6 +304,7 @@ describe('applyTranscriptPageResult', () => {
     const base: TranscriptPageWindowState = {
       ...seeded(['u1']),
       reasoningByTurn: { 'turn-a': 'live reasoning' },
+      reasoningTurnByItemId: { 'r-live': 'turn-a' },
       loadedTranscriptIds: new Set(['u1', 'r-live']),
       beforeCursor: 'v2.seed',
       hasMoreBefore: true,

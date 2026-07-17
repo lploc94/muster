@@ -43,8 +43,9 @@
   8 stability attempts, 1024 revisions and 16384 metadata rows.
 - Coordination-only changes advance revision without full projection refresh. Queue
   visibility resolves user messages through `turn_inputs`, so external queued follow-ups
-  do not flash into chat before promotion. Deletes that cannot be represented incrementally
-  use bounded snapshot recovery.
+  do not flash into chat before promotion. Protocol v9 carries `transcriptItemsRemoved`
+  for stable-ID deletes; cascades/retention without a complete entity list still use bounded
+  snapshot recovery.
 - Automated UAT uses independent SQLite clients/workers and covers interleaved commits,
   concurrent writer during hydration, prune gap, no N+1 hydration and reducer convergence.
 
@@ -77,11 +78,11 @@ Fixture: 100,000 persisted messages total; 10,000 on focused task; 12 iterations
 
 | Metric | p50 | p95 / retained | Budget |
 |--------|----:|---------------:|-------:|
-| Activation @100k | 0.38 ms | 0.45 ms | < 300 ms p95 |
+| Activation @100k | 0.35 ms | 0.39 ms | < 300 ms p95 |
 | Activation retained heap delta | — | 0.01 MiB | < 64 MiB |
-| Focus latest 100 | 11.92 ms | 12.23 ms | < 100 ms p95 |
-| Load older page 100 | 12.33 ms | 12.85 ms | < 100 ms p95 |
-| Stream batch commit | 0.19 ms | 0.44 ms | < 20 ms p95 |
+| Focus latest 100 | 11.02 ms | 11.51 ms | < 100 ms p95 |
+| Load older page 100 | 11.85 ms | 12.13 ms | < 100 ms p95 |
+| Stream batch commit | 0.15 ms | 0.45 ms | < 20 ms p95 |
 | Bootstrap wire | — | 12.6 KiB | < 500 KiB |
 
 Materialized focus rows = 100; all 10 concurrent stream commits persisted. Result:
@@ -98,19 +99,52 @@ Materialized focus rows = 100; all 10 concurrent stream commits persisted. Resul
 - `change_log`, `change_feed_watermarks`, `send_outbox`, `presentations`,
   `presentation_operations` and `trg_send_outbox_capacity` in the packaged schema.
 
+## Live two-window Extension Host UAT
+
+Command: `npm run test:sqlite-two-window-live-uat`
+
+This is **not** dual-`DbClient` unit coverage. The harness packages a fresh VSIX,
+launches **two real VS Code windows / Extension Hosts** (separate `--user-data-dir`,
+same workspace folder), and shares one Muster global-storage directory via symlink
+so both resolve the same `muster.sqlite3`.
+
+Proof of shared DB (redacted): both hosts report equal `dbFileToken` / `workspaceId` /
+`userVersion=7` / `application_id` / WAL. The runner verifies distinct Extension Host
+sessions but stores only the boolean result, never either session ID.
+
+| Scenario | Result | Detail (content-safe) |
+|----------|--------|------------------------|
+| A peer create converges | PASS | B converged to rev=1 without Reload Window |
+| B follow-up converges | PASS | A converged after B write rev=2 |
+| C interleaved writes | PASS | contiguous revs 3→4→5; both hosts same task set |
+| D queue then promote | PASS | queued hidden; promote visible once |
+| E hide/reveal catch-up | PASS | real sidebar hide stops polling; reveal rehydrates rev=8 |
+| F transcript paging | PASS | production route returns latest=2, older=6 |
+| G delete patch | PASS | protocol-v9 remove converges on both hosts without recovery |
+| H durable outbox/presentation | PASS | peer restarts; pending replay rejects safely; both hosts read durable state |
+| I simultaneous writers | PASS | final rev=24, 6 tasks, dbFileToken match |
+
+Artifact: `docs/plans/sqlite-phase4-two-window-live-uat-evidence.json`
+VS Code 1.129.0 / Extension Host Node 24.18.0 / schema 7. The live gate found and
+closed interleaved-local revision skipping plus missing transcript-remove routing before pass.
+
+UAT-only surface: `muster.uat.*` commands register only when `MUSTER_UAT_MODE=1` **and**
+`ExtensionMode` is non-production.
+
 ## Final gates
 
 | Gate | Result |
 |------|--------|
-| Targeted W9–W11 tests | 7 files / 136 tests pass |
+| Targeted W9–W11 tests | 7 files / 148 tests pass |
 | `npx tsc -p . --noEmit` | pass |
 | `npm run check:svelte` | 0 errors; 1 pre-existing textarea a11y warning |
 | `npm run build:webview` | pass |
-| `npm test` | 117 files / 1671 tests pass |
+| `npm test` | 118 files / 1678 tests pass |
 | `npm run test:source-boundary` | pass after current entity matrix update |
 | `npm run test:source-boundary:fixtures` | 13/13 pass |
 | `npm run bench:phase4-release:assert` | BUDGET PASS |
 | `npm run test:sqlite-extension-host` | pass on packaged VSIX |
+| `npm run test:sqlite-two-window-live-uat` | PASS scenarios A–I (two real EH) |
 | `git diff --check` | clean |
 
 Crash/open/locking coverage remains in the SQLite connection/crash suites; W8 retains the

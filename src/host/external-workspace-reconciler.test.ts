@@ -6,7 +6,11 @@ import { SqliteTaskRepository } from '../task/repository';
 import { RepositoryProjection, withRepositoryProjection } from '../task/repository-projection';
 import type { MusterTask } from '../task/types';
 import { DbClient } from '../task/sqlite/client';
-import { reconcileExternalWorkspaceChanges } from './external-workspace-reconciler';
+import {
+  reconcileExternalWorkspaceChanges,
+  reconcileInterleavedLocalCommit,
+  type ExternalReconcileResult,
+} from './external-workspace-reconciler';
 
 function makeTask(id: string): MusterTask {
   return {
@@ -58,6 +62,54 @@ async function openPair(retain = 64) {
 }
 
 describe('external workspace reconciler', () => {
+  it('repairs a peer revision serialized immediately before a local commit', async () => {
+    const pair = await openPair();
+    try {
+      const projectionA = await RepositoryProjection.load(pair.a, 'ws');
+      let repaired: ExternalReconcileResult | undefined;
+      const wrappedA = withRepositoryProjection(pair.a, projectionA, {
+        onAfterCommit: async (ctx) => {
+          repaired = await reconcileInterleavedLocalCommit({
+            repository: pair.a,
+            projection: ctx.projection,
+            previousRevision: ctx.previousRevision,
+            afterRevision: ctx.previousRevision,
+            knownTranscriptIds: new Set(),
+            beforeProjection: ctx.beforeFile,
+          });
+        },
+      });
+
+      await wrappedA.execute({
+        kind: 'createTask', workspaceId: 'ws', task: makeTask('local-before'),
+      });
+      expect(repaired).toBeUndefined();
+      await pair.b.execute({
+        kind: 'createTask', workspaceId: 'ws', task: makeTask('peer-between'),
+      });
+      await wrappedA.execute({
+        kind: 'createTask', workspaceId: 'ws', task: makeTask('local-after'),
+      });
+
+      expect(repaired?.kind).toBe('batches');
+      if (!repaired || repaired.kind !== 'batches') return;
+      expect(repaired.batches.map((batch) => batch.revision)).toEqual([3, 4]);
+      expect(Object.keys(projectionA.getFile().tasks).sort()).toEqual([
+        'local-after',
+        'local-before',
+        'peer-between',
+      ]);
+      const upserted = repaired.batches.flatMap((batch) => batch.patches)
+        .filter((patch) => patch.type === 'taskUpserted')
+        .map((patch) => patch.task.id)
+        .sort();
+      expect(upserted).toEqual(['local-after', 'peer-between']);
+      expect(projectionA.getFile().revision).toBe(4);
+    } finally {
+      await pair.close();
+    }
+  }, 30_000);
+
   it('converges two clients with interleaved writes via feed without full transcript list', async () => {
     const pair = await openPair();
     try {
@@ -421,7 +473,7 @@ describe('external workspace reconciler', () => {
     }
   }, 20_000);
 
-  it('recovers when focused transcript entity is deleted (no stale peer rows)', async () => {
+  it('emits a bounded remove patch when a known focused transcript entity is deleted', async () => {
     const pair = await openPair();
     try {
       const task = makeTask('focus');
@@ -453,7 +505,13 @@ describe('external workspace reconciler', () => {
         focusedTaskId: task.id,
         knownTranscriptIds: new Set(['m-del']),
       });
-      expect(result.kind).toBe('recovery');
+      expect(result.kind).toBe('batches');
+      if (result.kind !== 'batches') return;
+      expect(result.batches.at(-1)?.patches).toContainEqual({
+        type: 'transcriptItemsRemoved',
+        taskId: task.id,
+        itemIds: ['m-del'],
+      });
     } finally {
       await pair.close();
     }

@@ -1,0 +1,95 @@
+{
+  "ok": true,
+  "kind": "live-two-window-extension-host",
+  "vscodeVersion": "1.129.0",
+  "nodeVersion": "24.18.0",
+  "schemaVersion": 7,
+  "dbIdentity": {
+    "dbFileToken": "8a5d3828f2bb40f5",
+    "applicationId": 1297437524,
+    "userVersion": 7,
+    "pageCount": 71,
+    "byteSize": 282624,
+    "journalMode": "wal",
+    "workspaceId": "38dc6be4-4df1-4733-9a63-6c7e2a81ed5a",
+    "workspaceIdentityKind": "single"
+  },
+  "extensionHostsDistinct": true,
+  "peerRestarted": true,
+  "polling": {
+    "aPollCount": 9,
+    "bPollCount": 1,
+    "focusGateOverridden": true
+  },
+  "finalRevision": 24,
+  "finalTaskCount": 6,
+  "scenarios": [
+    {
+      "id": "A",
+      "verdict": "PASS",
+      "detail": "automatic peer poll converged rev=1 polls=5"
+    },
+    {
+      "id": "B",
+      "verdict": "PASS",
+      "detail": "automatic local poll converged rev=2 polls=4"
+    },
+    {
+      "id": "C",
+      "verdict": "PASS",
+      "detail": "contiguous revisions=3,4,5"
+    },
+    {
+      "id": "D",
+      "verdict": "PASS",
+      "detail": "queuedHidden=true promotedVisible=true rev=7"
+    },
+    {
+      "id": "E",
+      "verdict": "PASS",
+      "detail": "real hide stopped at rev=7; reveal hydrated rev=8"
+    },
+    {
+      "id": "F",
+      "verdict": "PASS",
+      "detail": "host route latest=2 older=6"
+    },
+    {
+      "id": "G",
+      "verdict": "PASS",
+      "detail": "remove patch converged without recovery at rev=13"
+    },
+    {
+      "id": "H",
+      "verdict": "PASS",
+      "detail": "peer restarted generation=2; pending replay rejected safely; durable surfaces restored"
+    },
+    {
+      "id": "I",
+      "verdict": "PASS",
+      "detail": "simultaneous writers converged rev=24 tasks=6"
+    }
+  ],
+  "launcher": {
+    "kind": "two-real-vscode-processes-and-extension-hosts",
+    "sameLocalAuthority": true,
+    "sharedWorkspaceFolder": true,
+    "sharedGlobalStorageDirectory": true,
+    "separateIsolatedUserDataDirs": true,
+    "packagedArtifactContents": true,
+    "peerRestartCount": 1,
+    "exitCodes": {
+      "a": 0,
+      "b": [
+        0,
+        0
+      ]
+    }
+  },
+  "contentSafety": {
+    "absolutePathsStoredInEvidence": false,
+    "messageBodiesStoredInEvidence": false,
+    "sessionIdsStoredInEvidence": false
+  },
+  "generatedAt": "2026-07-17T18:10:10.807Z"
+}

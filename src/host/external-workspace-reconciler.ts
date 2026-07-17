@@ -35,6 +35,13 @@ export type ExternalReconcileArgs = {
   focusedTaskId?: string;
   knownTranscriptIds: ReadonlySet<string>;
   /**
+   * Optional projection snapshot from before a local commit. When another host
+   * committed immediately before that local transaction, the write-through
+   * projection may already carry the final revision while still missing the
+   * peer aggregate. This preserves the real before-state for patch generation.
+   */
+  beforeProjection?: Readonly<TaskStoreFile>;
+  /**
    * Page size for feed reads. Revisions are never split across pages.
    */
   feedPageLimit?: number;
@@ -64,6 +71,21 @@ const MAX_RECONCILE_REVISIONS = 1_024;
 const MAX_RECONCILE_METADATA_ROWS = 16_384;
 
 /**
+ * Repair the write-through projection when a local commit observes more than
+ * one new revision. That can only mean at least one peer commit serialized
+ * immediately before it; advancing the local cursor without draining that
+ * range would permanently skip the peer aggregates.
+ */
+export async function reconcileInterleavedLocalCommit(
+  args: ExternalReconcileArgs & { previousRevision: number },
+): Promise<ExternalReconcileResult | undefined> {
+  if (args.projection.getFile().revision <= args.previousRevision + 1) {
+    return undefined;
+  }
+  return reconcileExternalWorkspaceChanges(args);
+}
+
+/**
  * Consume the bounded change feed and produce contiguous workspacePatchBatch
  * envelopes without full transcript hydration.
  *
@@ -79,10 +101,11 @@ export async function reconcileExternalWorkspaceChanges(
     afterRevision,
     focusedTaskId,
     knownTranscriptIds,
+    beforeProjection,
     feedPageLimit = 256,
   } = args;
 
-  const before = snapshotProjectionBefore(projection.getFile());
+  const before = beforeProjection ?? snapshotProjectionBefore(projection.getFile());
   let cursor = afterRevision;
   const collected: Array<{ revision: number; changes: WorkspaceChangeMetadata[] }> = [];
   let analyzedRevision = afterRevision;
@@ -91,6 +114,7 @@ export async function reconcileExternalWorkspaceChanges(
   const focusedMessageIds = new Set<string>();
   const focusedToolIds = new Set<string>();
   const focusedReasoningIds = new Set<string>();
+  const focusedRemovedTranscriptIds = new Set<string>();
   let needsFullTaskRefresh = false;
   let stable = false;
 
@@ -146,15 +170,20 @@ export async function reconcileExternalWorkspaceChanges(
           if (change.entityKind === 'message') focusedMessageIds.add(change.entityId);
           if (change.entityKind === 'tool_call') focusedToolIds.add(change.entityId);
           if (change.entityKind === 'reasoning') focusedReasoningIds.add(change.entityId);
-          // Wire protocol has no transcriptItemRemoved; deletes need bounded
-          // recovery so peer windows cannot retain a stale focused row.
           if (
-            change.changeKind === 'delete' &&
-            (change.entityKind === 'message' ||
-              change.entityKind === 'tool_call' ||
-              change.entityKind === 'reasoning')
+            change.entityKind === 'message' ||
+            change.entityKind === 'tool_call' ||
+            change.entityKind === 'reasoning'
           ) {
-            return { kind: 'recovery', reason: 'unrepresentable' };
+            if (change.changeKind === 'delete') {
+              if (knownTranscriptIds.has(change.entityId)) {
+                focusedRemovedTranscriptIds.add(change.entityId);
+              }
+            } else {
+              // A later upsert in the same drained range wins over an earlier
+              // delete; the final entity is hydrated and patched below.
+              focusedRemovedTranscriptIds.delete(change.entityId);
+            }
           }
         }
         if (
@@ -246,6 +275,7 @@ export async function reconcileExternalWorkspaceChanges(
     focusedMessageIds: [...focusedMessageIds],
     focusedToolIds: [...focusedToolIds],
     focusedReasoningIds: [...focusedReasoningIds],
+    focusedRemovedTranscriptIds: [...focusedRemovedTranscriptIds],
   });
 
   const batches: WorkspacePatchBatch[] = [];
@@ -264,14 +294,15 @@ export async function reconcileExternalWorkspaceChanges(
 }
 
 export function projectExternalWorkspacePatches(args: {
-  before: TaskStoreFile;
-  after: TaskStoreFile;
+  before: Readonly<TaskStoreFile>;
+  after: Readonly<TaskStoreFile>;
   affectedTaskIds: ReadonlySet<string>;
   focusedTaskId?: string;
   knownTranscriptIds: ReadonlySet<string>;
   focusedMessageIds: readonly string[];
   focusedToolIds: readonly string[];
   focusedReasoningIds: readonly string[];
+  focusedRemovedTranscriptIds: readonly string[];
 }): WorkspacePatch[] {
   const {
     before,
@@ -282,6 +313,7 @@ export function projectExternalWorkspacePatches(args: {
     focusedMessageIds,
     focusedToolIds,
     focusedReasoningIds,
+    focusedRemovedTranscriptIds,
   } = args;
 
   const patches: WorkspacePatch[] = [];
@@ -316,6 +348,18 @@ export function projectExternalWorkspacePatches(args: {
       type: 'queuedTurnsChanged',
       taskId: focusedTaskId,
       queuedTurns: projectQueuedTurns(after, focusedTaskId),
+    });
+  }
+
+  if (
+    focusedTaskId &&
+    after.tasks[focusedTaskId] &&
+    focusedRemovedTranscriptIds.length > 0
+  ) {
+    patches.push({
+      type: 'transcriptItemsRemoved',
+      taskId: focusedTaskId,
+      itemIds: [...new Set(focusedRemovedTranscriptIds)].sort(),
     });
   }
 

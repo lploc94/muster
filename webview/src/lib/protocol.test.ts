@@ -172,7 +172,7 @@ describe('protocol v7 focused transcriptPage contract', () => {
   };
 
   it('is exactly version 8', () => {
-    expect(PROTOCOL_VERSION).toBe(8);
+    expect(PROTOCOL_VERSION).toBe(9);
   });
 
   it('accepts focused snapshot with transcript + transcriptPage', () => {
@@ -1566,7 +1566,7 @@ describe('protocol v7 loadTranscriptPage / transcriptPageResult', () => {
   });
 });
 
-describe('protocol v8 workspacePatchBatch', () => {
+describe('protocol v9 workspacePatchBatch', () => {
   const summary = {
     id: 'task-1',
     parentId: null,
@@ -1598,6 +1598,11 @@ describe('protocol v8 workspacePatchBatch', () => {
         item: { id: 'a1', kind: 'assistant', content: 'yo', turnId: 't1', order: 1 },
       },
       {
+        type: 'transcriptItemsRemoved',
+        taskId: 'task-1',
+        itemIds: ['old-1'],
+      },
+      {
         type: 'queuedTurnsChanged',
         taskId: 'task-1',
         queuedTurns: [
@@ -1614,8 +1619,8 @@ describe('protocol v8 workspacePatchBatch', () => {
     ],
   };
 
-  it('is exactly version 8', () => {
-    expect(PROTOCOL_VERSION).toBe(8);
+  it('is exactly version 9', () => {
+    expect(PROTOCOL_VERSION).toBe(9);
   });
 
   it('accepts a multi-kind batch and empty patches', () => {
@@ -1638,7 +1643,43 @@ describe('protocol v8 workspacePatchBatch', () => {
       isExtMessage({
         type: 'workspacePatchBatch',
         revision: 1,
+        patches: [{ type: 'transcriptItemsRemoved', taskId: 'task-1', itemIds: [] }],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [{
+          type: 'transcriptItemsRemoved',
+          taskId: 'task-1',
+          itemIds: ['old-1', 'old-1'],
+        }],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
         patches: [{ type: 'taskRemoved' }],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [
+          {
+            type: 'transcriptItemsAppended',
+            taskId: 'task-1',
+            items: [{ id: 'u1', kind: 'user', content: 'a' }],
+          },
+          {
+            type: 'transcriptItemsRemoved',
+            taskId: 'task-1',
+            itemIds: ['u1'],
+          },
+        ],
       }),
     ).toBe(false);
     expect(

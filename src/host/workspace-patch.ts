@@ -9,7 +9,7 @@ import {
   type TranscriptItem,
 } from './snapshot';
 
-/** Host-side wire patch kinds (mirrors webview protocol v8). */
+/** Host-side wire patch kinds (mirrors webview protocol v9). */
 export type WorkspacePatch =
   | { type: 'taskUpserted'; task: TaskSummary }
   | { type: 'turnActivityChanged'; task: TaskSummary }
@@ -22,6 +22,11 @@ export type WorkspacePatch =
       type: 'transcriptItemPatched';
       taskId: string;
       item: TranscriptItem;
+    }
+  | {
+      type: 'transcriptItemsRemoved';
+      taskId: string;
+      itemIds: string[];
     }
   | {
       type: 'queuedTurnsChanged';
@@ -299,6 +304,56 @@ function shouldPublishUserTranscript(
 }
 
 /**
+ * Extract transcript entities explicitly removed by one named command. The
+ * current focused ownership set keeps this bounded to rows the webview can
+ * actually hold, including older pages loaded after the latest snapshot.
+ *
+ * Cascading turn deletion and retention are intentionally not guessed here:
+ * their command payloads do not enumerate every cascaded/truncated entity and
+ * the caller must use bounded snapshot recovery for those operations.
+ */
+function extractRemovedTranscriptIds(
+  command: RepositoryCommand,
+  result: RepositoryCommandResult,
+  knownTranscriptIds: ReadonlySet<string>,
+): string[] {
+  const candidates = new Set<string>();
+  if (command.kind === 'deleteMessage') candidates.add(command.messageId);
+  for (const messageId of result.deletedMessageIds ?? []) candidates.add(messageId);
+  if ('deleteMessageIds' in command && Array.isArray(command.deleteMessageIds)) {
+    for (const messageId of command.deleteMessageIds) candidates.add(messageId);
+  }
+  return [...candidates].filter((id) => knownTranscriptIds.has(id)).sort();
+}
+
+/**
+ * Local destructive commands whose full transcript effect is not represented
+ * by stable IDs in the command/result must still use an authoritative bounded
+ * snapshot. Explicit message deletion uses transcriptItemsRemoved instead.
+ */
+export function localCommitNeedsTranscriptRecovery(args: {
+  command: RepositoryCommand;
+  result: RepositoryCommandResult;
+  focusedTaskId?: string;
+  knownTranscriptIds: ReadonlySet<string>;
+}): boolean {
+  const { command, result, focusedTaskId, knownTranscriptIds } = args;
+  if (!result.changed || !focusedTaskId || knownTranscriptIds.size === 0) return false;
+  if (
+    (command.kind === 'applyRetention' || command.kind === 'applyRetentionPolicy') &&
+    command.taskId === focusedTaskId
+  ) {
+    return true;
+  }
+  if (command.kind === 'deleteTurn') return true;
+  return (
+    'deleteTurnIds' in command &&
+    Array.isArray(command.deleteTurnIds) &&
+    command.deleteTurnIds.length > 0
+  );
+}
+
+/**
  * Project one successful durable commit into a deterministic workspace patch list.
  * Does not query the repository. Transcript patches are derived from the command
  * payload and known-id set only (no full transcript hydration).
@@ -328,6 +383,10 @@ export function projectWorkspacePatches(args: ProjectWorkspacePatchesArgs): Work
   const queues: WorkspacePatch[] = [];
   const transcriptAppends: TranscriptItem[] = [];
   const transcriptPatches: TranscriptItem[] = [];
+  const transcriptRemovals =
+    focusedTaskId && after.tasks[focusedTaskId]
+      ? extractRemovedTranscriptIds(command, args.result, knownTranscriptIds)
+      : [];
   let transcriptTaskId: string | undefined;
 
   const metadata = isMetadataMembershipCommand(command.kind);
@@ -392,6 +451,13 @@ export function projectWorkspacePatches(args: ProjectWorkspacePatchesArgs): Work
   patches.push(...upserts);
   patches.push(...activities);
   patches.push(...queues);
+  if (focusedTaskId && transcriptRemovals.length > 0) {
+    patches.push({
+      type: 'transcriptItemsRemoved',
+      taskId: focusedTaskId,
+      itemIds: transcriptRemovals,
+    });
+  }
   if (transcriptTaskId && transcriptAppends.length > 0) {
     patches.push({
       type: 'transcriptItemsAppended',

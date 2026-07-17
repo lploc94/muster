@@ -709,6 +709,7 @@
               focusedTaskId: tasks.focusedTaskId,
               transcriptItems: thread.items,
               reasoningByTurn: thread.reasoningByTurn,
+              reasoningTurnByItemId: thread.getReasoningTurnByItemId(),
               loadedTranscriptIds: thread.getLoadedTranscriptIds(),
               transcriptWorkspaceRevision: thread.transcriptWorkspaceRevision,
             });

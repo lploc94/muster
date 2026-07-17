@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import type { RepositoryCommand } from '../task/repository';
 import type { MusterTask, TaskMessage, TaskStoreFile, TaskTurn } from '../task/types';
-import { projectWorkspacePatches } from './workspace-patch';
+import {
+  localCommitNeedsTranscriptRecovery,
+  projectWorkspacePatches,
+} from './workspace-patch';
 
 function emptyFile(revision = 0): TaskStoreFile {
   return {
@@ -257,6 +260,63 @@ describe('projectWorkspacePatches', () => {
       knownTranscriptIds: new Set(),
     });
     expect(patches).toContainEqual({ type: 'taskRemoved', taskId: 'child' });
+  });
+
+  it('deleteMessage removes a known focused transcript item without snapshot recovery', () => {
+    const before = emptyFile(1);
+    before.tasks['t1'] = task('t1');
+    before.messages['m1'] = userMessage('m1', 't1');
+    const after = emptyFile(2);
+    after.tasks['t1'] = task('t1');
+    const command: RepositoryCommand = {
+      kind: 'deleteMessage',
+      workspaceId: 'ws',
+      messageId: 'm1',
+    };
+    const result = { ok: true as const, changed: true };
+    const patches = projectWorkspacePatches({
+      command,
+      result,
+      before,
+      after,
+      focusedTaskId: 't1',
+      knownTranscriptIds: new Set(['m1', 'older-loaded']),
+    });
+    expect(patches).toContainEqual({
+      type: 'transcriptItemsRemoved',
+      taskId: 't1',
+      itemIds: ['m1'],
+    });
+    expect(localCommitNeedsTranscriptRecovery({
+      command,
+      result,
+      focusedTaskId: 't1',
+      knownTranscriptIds: new Set(['m1']),
+    })).toBe(false);
+  });
+
+  it('keeps bounded recovery for destructive effects without explicit entity ids', () => {
+    expect(localCommitNeedsTranscriptRecovery({
+      command: {
+        kind: 'deleteTurn',
+        workspaceId: 'ws',
+        turnId: 'turn-old',
+      },
+      result: { ok: true, changed: true },
+      focusedTaskId: 't1',
+      knownTranscriptIds: new Set(['older-loaded']),
+    })).toBe(true);
+    expect(localCommitNeedsTranscriptRecovery({
+      command: {
+        kind: 'applyRetentionPolicy',
+        workspaceId: 'ws',
+        taskId: 't1',
+        keepLatestTurns: 10,
+      },
+      result: { ok: true, changed: true },
+      focusedTaskId: 't1',
+      knownTranscriptIds: new Set(['older-loaded']),
+    })).toBe(true);
   });
 
   it('non-focused transcript mutations are omitted', () => {

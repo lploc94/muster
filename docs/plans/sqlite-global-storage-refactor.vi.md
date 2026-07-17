@@ -402,6 +402,7 @@ Tách bootstrap snapshot khỏi cập nhật runtime:
 - `turnActivityChanged`
 - `transcriptItemsAppended`
 - `transcriptItemPatched`
+- `transcriptItemsRemoved`
 - `queuedTurnsChanged`
 - `taskRemoved`
 
@@ -810,9 +811,9 @@ request; fixed page limit 100; **no W6 recovery**.
 
 ##### P4-W6 — Revisioned patch reducer
 
-- Wire messages: atomic `workspacePatchBatch` envelope (protocol v8) carrying
+- Wire messages: atomic `workspacePatchBatch` envelope (protocol v9) carrying
   `taskUpserted`, `turnActivityChanged`, `transcriptItemsAppended`,
-  `transcriptItemPatched`, `queuedTurnsChanged`, `taskRemoved`.
+  `transcriptItemPatched`, `transcriptItemsRemoved`, `queuedTurnsChanged`, `taskRemoved`.
 - Envelope `revision` is the effective workspace revision of the whole batch;
   empty `patches: []` still advances revision. Never coalesce two workspace
   revisions into one envelope.
@@ -878,7 +879,8 @@ request; fixed page limit 100; **no W6 recovery**.
   metadata rows), không stamp projection bằng revision cũ. Gap/corrupt/delete không biểu diễn
   được thì rebuild bounded snapshot.
 - Queued follow-up vẫn ẩn đến khi promote dù user message bind qua `turn_inputs`; coordination-
-  only revision advance không ép full refresh; focused transcript delete/cascade dùng recovery.
+  only revision advance không ép full refresh. Focused entity delete có stable ID dùng
+  `transcriptItemsRemoved`; cascade/retention không liệt kê đủ entity vẫn dùng bounded recovery.
 - Test hai independent DB clients/workers ghi xen kẽ, concurrent-writer-during-hydrate và
   reducer hội tụ không N+1/full transcript hydration.
 
@@ -886,21 +888,27 @@ request; fixed page limit 100; **no W6 recovery**.
 
 - `bench:phase4-release:assert` compile trước rồi chạy worker JS trong `dist` với 100k
   persisted messages (10k focused), 12 iterations trên Apple M4/Node 26. Kết quả: activation
-  p95 **0.45 ms**, retained heap delta **0.01 MiB**, focus latest-100 p95 **12.23 ms**,
-  older-page-100 p95 **12.85 ms**, stream batch p95 **0.44 ms**, bootstrap **12.6 KiB**;
+  p95 **0.39 ms**, retained heap delta **0.01 MiB**, focus latest-100 p95 **11.51 ms**,
+  older-page-100 p95 **12.13 ms**, stream batch p95 **0.45 ms**, bootstrap **12.6 KiB**;
   10 concurrent stream commits đều durable. Mọi budget đều pass.
 - Packaged VSIX smoke chạy trong VS Code 1.129 Extension Host/Node 24.18: activation,
   built-in `node:sqlite`, compiled worker/client/schema, WAL/FK, schema 7 và durable
   tables/trigger đều pass.
 - UAT tự động: two-client feed convergence/gap prune/concurrent hydrate; strict outbox
   reload/reject/delete/capacity; root-scoped presentation restart/idempotency/conflict.
+- **Live two-window UAT ✅:** `npm run test:sqlite-two-window-live-uat` packages a
+  fresh VSIX and runs scenarios A–I on **two real VS Code Extension Hosts** sharing
+  one `muster.sqlite3` (symlinked globalStorage, same workspace identity). Redacted
+  evidence: `sqlite-phase4-two-window-live-uat-evidence.json`. This is distinct from
+  dual-`DbClient` unit tests.
 - Composer → VS Code Settings `muster.composerSelection`; send outbox → SQLite
   `send_outbox` (strict payload, max 32); presentation → root-scoped SQLite
   `presentations` + durable `presentation_operations` (serializer opaque IDs only).
 - Schema v7 current-bootstrap only; no migration/backward-compatible path.
-- Final gates: TypeScript, Svelte (0 errors), webview build, 117 files/1671 tests,
-  source/repository boundaries, 100k benchmark, packaged Extension Host smoke và
-  `git diff --check` đều xanh. Chi tiết ở `sqlite-phase4-gate-evidence.vi.md`.
+- Final gates: TypeScript, Svelte (0 errors), webview build, unit tests,
+  source/repository boundaries, 100k benchmark, packaged Extension Host smoke,
+  live two-window UAT và `git diff --check` đều xanh. Chi tiết ở
+  `sqlite-phase4-gate-evidence.vi.md`.
 
 ##### Cleanup trước P4-W11 ✅
 

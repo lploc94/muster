@@ -74,7 +74,7 @@ function focusedSnapshot(revision: number, opts?: {
   const tasks = opts?.tasks ?? [task('task-1')];
   return {
     type: 'snapshot',
-    protocolVersion: 8,
+    protocolVersion: 9,
     rootTasks: tasks,
     focusedTaskId: 'task-1',
     subtree: tasks,
@@ -383,6 +383,55 @@ describe('workspace-patch-reducer', () => {
     expect(result.state.reasoningByTurn).toEqual({});
   });
 
+  it('removes loaded list and reasoning entities by stable id without recovery', () => {
+    const state = applySnapshotToPatchView(
+      emptyWorkspacePatchViewState(),
+      focusedSnapshot(1, {
+        transcript: [
+          userItem('u1'),
+          assistantItem('a1'),
+          { id: 'reasoning-1', kind: 'reasoning', turnId: 'turn-1', content: 'think' },
+          { id: 'reasoning-2', kind: 'reasoning', turnId: 'turn-2', content: 'keep' },
+        ],
+      }),
+    );
+    const result = applyWorkspacePatchBatch(
+      state,
+      batch(2, [{
+        type: 'transcriptItemsRemoved',
+        taskId: 'task-1',
+        itemIds: ['u1', 'reasoning-1', 'not-loaded'],
+      }]),
+    );
+    expect(result.kind).toBe('applied');
+    expect(result.state.needsRecovery).toBe(false);
+    expect(result.state.transcriptItems.map((item) => item.id)).toEqual(['a1']);
+    expect(result.state.loadedTranscriptIds.has('u1')).toBe(false);
+    expect(result.state.loadedTranscriptIds.has('reasoning-1')).toBe(false);
+    expect(result.state.reasoningByTurn).toEqual({ 'turn-2': 'keep' });
+    expect(result.state.reasoningTurnByItemId).toEqual({ 'reasoning-2': 'turn-2' });
+    expect([...result.state.removedTranscriptIds]).toEqual(['u1', 'reasoning-1', 'not-loaded']);
+    const next = applyWorkspacePatchBatch(result.state, batch(3, []));
+    expect(next.state.removedTranscriptIds.size).toBe(0);
+  });
+
+  it('rejects remove plus update of the same transcript identity atomically', () => {
+    const state = applySnapshotToPatchView(
+      emptyWorkspacePatchViewState(),
+      focusedSnapshot(1, { transcript: [assistantItem('a1')] }),
+    );
+    const result = applyWorkspacePatchBatch(
+      state,
+      batch(2, [
+        { type: 'transcriptItemsRemoved', taskId: 'task-1', itemIds: ['a1'] },
+        { type: 'transcriptItemPatched', taskId: 'task-1', item: assistantItem('a1', 'new') },
+      ]),
+    );
+    expect(result.kind).toBe('invariant');
+    expect(result.state.revision).toBe(1);
+    expect(result.state.transcriptItems).toHaveLength(1);
+  });
+
   it('duplicate stable identities recover before any patch is applied', () => {
     const state = applySnapshotToPatchView(emptyWorkspacePatchViewState(), focusedSnapshot(1));
     const result = applyWorkspacePatchBatch(
@@ -463,6 +512,7 @@ describe('workspace-patch-reducer', () => {
         { kind: 'user', id: 'u-live', text: 'hi', turnId: 'turn-1', order: 0 },
       ],
       reasoningByTurn: {},
+      reasoningTurnByItemId: {},
       loadedTranscriptIds: new Set(['u-old', 'u-live']),
       transcriptWorkspaceRevision: 2,
     });

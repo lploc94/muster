@@ -11,7 +11,7 @@ import type { NormalizedEvent, Question } from './types';
  * breaking change to the ExtMessage/OutMessage shapes below (and mirror it in
  * src/extension.ts).
  */
-export const PROTOCOL_VERSION = 8;
+export const PROTOCOL_VERSION = 9;
 
 /**
  * Require an exact peer protocol version. A different or malformed version
@@ -160,7 +160,7 @@ export const TRANSCRIPT_PAGE_TASK_ID_MAX = 512;
 export const TRANSCRIPT_PAGE_CURSOR_MAX = 4096;
 export const TRANSCRIPT_PAGE_MAX_ITEMS = 100;
 
-/** Bounds for workspacePatchBatch (protocol v8). */
+/** Bounds for workspacePatchBatch (protocol v9). */
 export const WORKSPACE_PATCH_MAX_PATCHES = 10_000;
 export const WORKSPACE_PATCH_MAX_ITEMS = 500;
 export const WORKSPACE_PATCH_MAX_QUEUED = 500;
@@ -363,7 +363,7 @@ export interface BackendModels {
 }
 
 /**
- * Atomic workspace revision envelope (protocol v8).
+ * Atomic workspace revision envelope (protocol v9).
  * One SQLite transaction maps to one envelope with a single effective revision.
  * Empty `patches: []` still advances the revision for invisible commits.
  */
@@ -379,6 +379,11 @@ export type WorkspacePatch =
       type: 'transcriptItemPatched';
       taskId: string;
       item: TranscriptItem;
+    }
+  | {
+      type: 'transcriptItemsRemoved';
+      taskId: string;
+      itemIds: string[];
     }
   | {
       type: 'queuedTurnsChanged';
@@ -600,7 +605,7 @@ export type OutMessage =
     }
   /**
    * Request a bounded workspace snapshot after a revision gap/invariant failure
-   * (protocol v8). Host replies with a normal `snapshot`. Single-flight on the
+   * (protocol v9). Host replies with a normal `snapshot`. Single-flight on the
    * webview; not used for protocol mismatch (that still requires Reload Window).
    */
   | {
@@ -1351,6 +1356,19 @@ function isWorkspacePatch(v: unknown): v is WorkspacePatch {
         isTranscriptItem(v.item) &&
         isWorkspacePatchIdentity(v.item.id)
       );
+    case 'transcriptItemsRemoved': {
+      if (!hasOnlyKeys(v, ['type', 'taskId', 'itemIds'])) return false;
+      if (!isWorkspacePatchIdentity(v.taskId)) return false;
+      if (!Array.isArray(v.itemIds) || v.itemIds.length === 0 || v.itemIds.length > WORKSPACE_PATCH_MAX_ITEMS) {
+        return false;
+      }
+      const seen = new Set<string>();
+      for (const itemId of v.itemIds) {
+        if (!isWorkspacePatchIdentity(itemId) || seen.has(itemId)) return false;
+        seen.add(itemId);
+      }
+      return true;
+    }
     case 'queuedTurnsChanged': {
       if (!hasOnlyKeys(v, ['type', 'taskId', 'queuedTurns'])) return false;
       if (!isWorkspacePatchIdentity(v.taskId)) return false;
@@ -1412,6 +1430,16 @@ function isWorkspacePatchBatchMessage(data: Record<string, unknown>): boolean {
         const key = `${patch.taskId}\0${patch.item.id}`;
         if (transcriptKeys.has(key)) return false;
         transcriptKeys.add(key);
+        break;
+      }
+      case 'transcriptItemsRemoved': {
+        totalTranscriptItems += patch.itemIds.length;
+        if (totalTranscriptItems > WORKSPACE_PATCH_MAX_ITEMS) return false;
+        for (const itemId of patch.itemIds) {
+          const key = `${patch.taskId}\0${itemId}`;
+          if (transcriptKeys.has(key)) return false;
+          transcriptKeys.add(key);
+        }
         break;
       }
       case 'queuedTurnsChanged': {

@@ -31,10 +31,29 @@ import {
 import { buildRepositorySnapshot } from './host/repository-snapshot';
 import {
   buildWorkspacePatchBatch,
+  localCommitNeedsTranscriptRecovery,
   projectWorkspacePatches,
 } from './host/workspace-patch';
 import { WorkspaceRevisionPoller } from './host/workspace-revision-poller';
-import { reconcileExternalWorkspaceChanges } from './host/external-workspace-reconciler';
+import {
+  reconcileExternalWorkspaceChanges,
+  reconcileInterleavedLocalCommit,
+} from './host/external-workspace-reconciler';
+import {
+  UAT_COMMANDS,
+  appendMessage,
+  createTaskWithMessage,
+  deleteMessage,
+  enqueueFollowUp,
+  isUatModeEnabled,
+  markSendOutboxRejected,
+  promoteFollowUp,
+  putPresentation,
+  putSendOutbox,
+  readDurableSurfaces,
+  readRedactedDbIdentity,
+  type UatHostState,
+} from './host/uat-commands';
 import type { RepositoryCommitContext } from './task/repository-projection';
 import {
   buildRetentionSettingsSnapshot,
@@ -128,6 +147,8 @@ let workspaceRoot: string | undefined;
 /** SQLite is the only task storage source. */
 let sqliteClient: DbClient | undefined;
 let sqliteWorkspaceId: string | undefined;
+/** Live UAT host surface (non-production Extension Host + MUSTER_UAT_MODE=1). */
+let uatChatProvider: MusterChatProvider | undefined;
 
 /** Shared host-env cache for first-turn inject + get_host_context (W1). */
 let hostEnvCache: HostEnvironmentSnapshot | undefined;
@@ -241,7 +262,7 @@ function debugElicitation(event: string, details: Record<string, unknown> = {}):
  * version is stamped on the bootstrap `snapshot` message, and a mismatch is
  * surfaced in the webview as a visible "reload the window" banner.
  */
-const PROTOCOL_VERSION = 8;
+const PROTOCOL_VERSION = 9;
 
 /** How long a permission prompt waits for a webview decision before safe-denying. */
 const PERMISSION_PROMPT_TIMEOUT_MS = USER_INTERACTION_TIMEOUT_MS;
@@ -403,6 +424,10 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   private appliedWorkspaceRevision = 0;
   private revisionPoller: WorkspaceRevisionPoller | undefined;
   private windowFocused = true;
+  /** Headless live-UAT override; never enabled in production Extension Hosts. */
+  private uatFocusGateOverridden = false;
+  /** Count of external-feed gap/delete recoveries, exposed only by the UAT gate. */
+  private externalRecoveryCount = 0;
   /** Polling starts only after the current view/focus has an authoritative snapshot. */
   private pollingReady = false;
   private windowStateSub: vscode.Disposable | undefined;
@@ -431,27 +456,68 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       // authoritative bounded snapshot before the UI is considered caught up.
       return;
     }
-    const patches = projectWorkspacePatches({
+    const trackPatches = (patches: ReturnType<typeof projectWorkspacePatches>): void => {
+      for (const patch of patches) {
+        if (patch.type === 'transcriptItemsAppended') {
+          for (const item of patch.items) this.knownTranscriptIds.add(item.id);
+        } else if (patch.type === 'transcriptItemPatched') {
+          this.knownTranscriptIds.add(patch.item.id);
+        } else if (patch.type === 'transcriptItemsRemoved') {
+          for (const itemId of patch.itemIds) this.knownTranscriptIds.delete(itemId);
+        } else if (patch.type === 'taskRemoved' && patch.taskId === this.focusedTaskId) {
+          this.knownTranscriptIds.clear();
+        }
+      }
+    };
+
+    // A peer can commit immediately before this local transaction. The local
+    // bounded refresh then observes the final workspace revision while touching
+    // only its own aggregate. Drain the missing feed range before publishing so
+    // the projection/cursor cannot skip the peer task forever.
+    const interleavedResult = taskRepository
+      ? await reconcileInterleavedLocalCommit({
+        repository: taskRepository,
+        projection: ctx.projection,
+        afterRevision: ctx.previousRevision,
+        previousRevision: ctx.previousRevision,
+        focusedTaskId: this.focusedTaskId,
+        knownTranscriptIds: this.knownTranscriptIds,
+        beforeProjection: ctx.beforeFile,
+      })
+      : undefined;
+    if (interleavedResult) {
+      if (interleavedResult.kind === 'batches') {
+        for (const batch of interleavedResult.batches) {
+          if (batch.revision <= this.appliedWorkspaceRevision) continue;
+          trackPatches(batch.patches);
+          this.post(batch);
+          this.appliedWorkspaceRevision = batch.revision;
+        }
+      } else {
+        this.externalRecoveryCount += 1;
+        await this.postSnapshotAsync(this.focusedTaskId);
+      }
+    } else if (localCommitNeedsTranscriptRecovery({
       command: ctx.command,
       result: ctx.result,
-      before: ctx.beforeFile as TaskStoreFile,
-      after,
       focusedTaskId: this.focusedTaskId,
       knownTranscriptIds: this.knownTranscriptIds,
-    });
-    // Track newly published transcript entity ids.
-    for (const patch of patches) {
-      if (patch.type === 'transcriptItemsAppended') {
-        for (const item of patch.items) this.knownTranscriptIds.add(item.id);
-      } else if (patch.type === 'transcriptItemPatched') {
-        this.knownTranscriptIds.add(patch.item.id);
-      } else if (patch.type === 'taskRemoved' && patch.taskId === this.focusedTaskId) {
-        this.knownTranscriptIds.clear();
+    })) {
+      await this.postSnapshotAsync(this.focusedTaskId);
+    } else {
+      const patches = projectWorkspacePatches({
+        command: ctx.command,
+        result: ctx.result,
+        before: ctx.beforeFile as TaskStoreFile,
+        after,
+        focusedTaskId: this.focusedTaskId,
+        knownTranscriptIds: this.knownTranscriptIds,
+      });
+      trackPatches(patches);
+      this.post(buildWorkspacePatchBatch(after.revision, patches));
+      if (after.revision > this.appliedWorkspaceRevision) {
+        this.appliedWorkspaceRevision = after.revision;
       }
-    }
-    this.post(buildWorkspacePatchBatch(after.revision, patches));
-    if (after.revision > this.appliedWorkspaceRevision) {
-      this.appliedWorkspaceRevision = after.revision;
     }
 
     // Ask-clear side channel when a waiting_user turn leaves that state.
@@ -1510,6 +1576,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         knownTranscriptIds: this.knownTranscriptIds,
       });
       if (result.kind === 'gap' || result.kind === 'recovery') {
+        this.externalRecoveryCount += 1;
         await this.postSnapshotAsync(this.focusedTaskId);
         return;
       }
@@ -1524,6 +1591,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             for (const item of patch.items) this.knownTranscriptIds.add(item.id);
           } else if (patch.type === 'transcriptItemPatched') {
             this.knownTranscriptIds.add(patch.item.id);
+          } else if (patch.type === 'transcriptItemsRemoved') {
+            for (const itemId of patch.itemIds) this.knownTranscriptIds.delete(itemId);
           } else if (patch.type === 'taskRemoved' && patch.taskId === this.focusedTaskId) {
             this.knownTranscriptIds.clear();
           }
@@ -1548,6 +1617,112 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     this.pollingReady = false;
     this.windowStateSub?.dispose();
     this.windowStateSub = undefined;
+  }
+
+  /** Keep both independent Electron processes polling while CI cannot focus both. */
+  forcePollingActiveForUat(): UatHostState {
+    this.uatFocusGateOverridden = true;
+    this.windowFocused = true;
+    if (this._view?.visible && this.pollingReady) {
+      this.revisionPoller?.start();
+    }
+    return this.hostStateForUat();
+  }
+
+  /** Read only the real engine projection/poller state; never query SQLite here. */
+  hostStateForUat(): UatHostState {
+    const file = taskEngine?.getProjection()?.getFile();
+    const taskIds = Object.keys(file?.tasks ?? {}).sort();
+    const messageIdsByTask: Record<string, string[]> = Object.fromEntries(
+      taskIds.map((taskId) => [taskId, []]),
+    );
+    const queuedTurnIdsByTask: Record<string, string[]> = Object.fromEntries(
+      taskIds.map((taskId) => [taskId, []]),
+    );
+    for (const message of Object.values(file?.messages ?? {})) {
+      (messageIdsByTask[message.taskId] ??= []).push(message.id);
+    }
+    for (const turn of Object.values(file?.turns ?? {})) {
+      if (turn.status === 'queued') {
+        (queuedTurnIdsByTask[turn.taskId] ??= []).push(turn.id);
+      }
+    }
+    for (const ids of Object.values(messageIdsByTask)) ids.sort();
+    for (const ids of Object.values(queuedTurnIdsByTask)) ids.sort();
+    return {
+      projectionRevision: file?.revision ?? 0,
+      appliedWorkspaceRevision: this.appliedWorkspaceRevision,
+      taskIds,
+      messageIdsByTask,
+      queuedTurnIdsByTask,
+      knownTranscriptIds: [...this.knownTranscriptIds].sort(),
+      ...(this.focusedTaskId ? { focusedTaskId: this.focusedTaskId } : {}),
+      viewResolved: Boolean(this._view),
+      viewVisible: Boolean(this._view?.visible),
+      pollingReady: this.pollingReady,
+      pollCount: this.revisionPoller?.getPollCount() ?? 0,
+      externalRecoveryCount: this.externalRecoveryCount,
+      focusGateOverridden: this.uatFocusGateOverridden,
+    };
+  }
+
+  async focusTaskForUat(taskId: string | undefined): Promise<UatHostState> {
+    await this.transitionFocus(taskId);
+    return this.hostStateForUat();
+  }
+
+  /** Exercise the production loadTranscriptPage route against a real focused view. */
+  async loadOlderTranscriptForUat(taskId: string, limit = 2): Promise<{
+    latestIds: string[];
+    olderIds: string[];
+    hasMoreBeforeLatest: boolean;
+    hasMoreBeforeOlder: boolean;
+    workspaceRevision: number;
+  }> {
+    if (!taskRepository) throw new Error('UAT repository unavailable');
+    const latest = await taskRepository.getTranscriptPage(taskId, undefined, limit);
+    if (!latest.beforeCursor) {
+      return {
+        latestIds: latest.items.map((item) => item.id),
+        olderIds: [],
+        hasMoreBeforeLatest: latest.hasMoreBefore,
+        hasMoreBeforeOlder: false,
+        workspaceRevision: latest.workspaceRevision,
+      };
+    }
+    const repository = taskRepository;
+    const outcome = await routeLoadTranscriptPage(
+      {
+        type: 'loadTranscriptPage',
+        requestId: 'uat-live-older-page',
+        taskId,
+        beforeCursor: latest.beforeCursor,
+      },
+      {
+        getFocused: () => ({
+          taskId: this.focusedTaskId,
+          generation: this.snapshotGeneration,
+        }),
+        getTask: (id) => repository.getTask(id),
+        getTranscriptPage: (id, beforeCursor, pageLimit) =>
+          repository.getTranscriptPage(id, beforeCursor, pageLimit),
+      },
+    );
+    if (outcome.kind !== 'message') {
+      throw new Error('UAT transcript route failed: silent');
+    }
+    if (!outcome.message.ok) {
+      throw new Error(`UAT transcript route failed: ${outcome.message.code}`);
+    }
+    this.post(outcome.message);
+    for (const item of outcome.message.items) this.knownTranscriptIds.add(item.id);
+    return {
+      latestIds: latest.items.map((item) => item.id),
+      olderIds: outcome.message.items.map((item) => item.id),
+      hasMoreBeforeLatest: latest.hasMoreBefore,
+      hasMoreBeforeOlder: outcome.message.transcriptPage.hasMoreBefore,
+      workspaceRevision: outcome.message.transcriptPage.workspaceRevision,
+    };
   }
 
   /**
@@ -2080,10 +2255,10 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     this.ensureRevisionPoller();
     this.windowStateSub?.dispose();
     this.windowStateSub = vscode.window.onDidChangeWindowState((state) => {
-      this.windowFocused = state.focused;
-      if (state.focused && webviewView.visible && this.pollingReady) {
+      this.windowFocused = this.uatFocusGateOverridden || state.focused;
+      if (this.windowFocused && webviewView.visible && this.pollingReady) {
         this.revisionPoller?.start();
-      } else if (!state.focused) {
+      } else if (!this.windowFocused) {
         this.revisionPoller?.stop();
       }
     });
@@ -2827,6 +3002,9 @@ function resolveCurrentWorkspaceIdentity(context: vscode.ExtensionContext) {
 }
 
 export async function activate(context: vscode.ExtensionContext) {
+  const liveUatEnabled = isUatModeEnabled(
+    context.extensionMode === vscode.ExtensionMode.Production,
+  );
   // Patch PATH from the login shell BEFORE anything spawns a backend CLI, so a
   // GUI-launched editor (minimal PATH) can both detect and actually run the CLIs.
   await installAugmentedPath();
@@ -2872,6 +3050,9 @@ export async function activate(context: vscode.ExtensionContext) {
   }
 
   const provider = new MusterChatProvider(context.extensionUri);
+  if (liveUatEnabled) {
+    uatChatProvider = provider;
+  }
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration('muster.composerSelection')) {
@@ -3111,6 +3292,10 @@ export async function activate(context: vscode.ExtensionContext) {
       vscode.commands.executeCommand('workbench.view.extension.muster'),
     ),
   );
+
+  if (liveUatEnabled) {
+    registerLiveUatCommands(context);
+  }
 
   try {
     elicitationDebugChannel = vscode.window.createOutputChannel('Muster Elicitation Debug');
@@ -3526,6 +3711,135 @@ export async function activate(context: vscode.ExtensionContext) {
   }
 }
 
+/**
+ * Live two-window UAT command surface. activate() calls this only for a
+ * non-production Extension Host with MUSTER_UAT_MODE=1.
+ */
+function registerLiveUatCommands(context: vscode.ExtensionContext): void {
+  const requireRepo = (): { repository: TaskRepository; workspaceId: string } => {
+    if (!taskRepository || !sqliteWorkspaceId) {
+      throw new Error('UAT repository unavailable');
+    }
+    return { repository: taskRepository, workspaceId: sqliteWorkspaceId };
+  };
+
+  const requireClient = (): DbClient => {
+    if (!sqliteClient) {
+      throw new Error('UAT sqlite client unavailable');
+    }
+    return sqliteClient;
+  };
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(UAT_COMMANDS.ping, async () => {
+      const extension = vscode.extensions.getExtension('tlelabs.muster');
+      return {
+        ok: true,
+        role: process.env.MUSTER_UAT_ROLE ?? 'unknown',
+        vscodeVersion: vscode.version,
+        nodeVersion: process.versions.node,
+        extensionActive: Boolean(extension?.isActive),
+        sessionId: vscode.env.sessionId,
+        remoteName: vscode.env.remoteName ?? 'desktop',
+        workspaceFolderCount: vscode.workspace.workspaceFolders?.length ?? 0,
+      };
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.identity, async () => {
+      const { repository } = requireRepo();
+      const client = requireClient();
+      const dbPath = path.join(context.globalStorageUri.fsPath, 'muster.sqlite3');
+      const { createHash } = await import('node:crypto');
+      return readRedactedDbIdentity(
+        repository,
+        dbPath,
+        (p) => {
+          const stat = fs.statSync(p);
+          return {
+            size: stat.size,
+            physicalIdentity: `${fs.realpathSync(p)}|${stat.dev}|${stat.ino}`,
+          };
+        },
+        (input) => createHash('sha256').update(input).digest('hex').slice(0, 16),
+        {
+          pragma: (name) => client.pragma(name),
+          get: <T>(sql: string, params?: unknown[]) =>
+            client.get<T>(sql, params as never),
+        },
+      );
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.createTaskWithMessage, async (args) => {
+      const { repository, workspaceId } = requireRepo();
+      return createTaskWithMessage(repository, workspaceId, args);
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.appendMessage, async (args) => {
+      const { repository, workspaceId } = requireRepo();
+      return appendMessage(repository, workspaceId, args);
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.enqueueFollowUp, async (args) => {
+      const { repository, workspaceId } = requireRepo();
+      return enqueueFollowUp(repository, workspaceId, args);
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.promoteFollowUp, async (args) => {
+      const { repository, workspaceId } = requireRepo();
+      return promoteFollowUp(repository, workspaceId, String(args.turnId));
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.deleteMessage, async (args) => {
+      const { repository, workspaceId } = requireRepo();
+      return deleteMessage(repository, workspaceId, String(args.messageId));
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.putSendOutbox, async (args) => {
+      const { repository, workspaceId } = requireRepo();
+      return putSendOutbox(repository, workspaceId, args);
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.markSendOutboxRejected, async (args) => {
+      const { repository, workspaceId } = requireRepo();
+      return markSendOutboxRejected(repository, workspaceId, String(args.clientRequestId));
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.putPresentation, async (args) => {
+      const { repository, workspaceId } = requireRepo();
+      return putPresentation(repository, workspaceId, args);
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.hostState, async () => {
+      if (!uatChatProvider) {
+        throw new Error('UAT chat provider unavailable');
+      }
+      return uatChatProvider.hostStateForUat();
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.forcePollingActive, async () => {
+      if (!uatChatProvider) {
+        throw new Error('UAT chat provider unavailable');
+      }
+      return uatChatProvider.forcePollingActiveForUat();
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.loadOlderTranscript, async (args) => {
+      if (!uatChatProvider) {
+        throw new Error('UAT chat provider unavailable');
+      }
+      return uatChatProvider.loadOlderTranscriptForUat(
+        String(args.taskId),
+        typeof args?.limit === 'number' ? args.limit : 2,
+      );
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.focusTask, async (args) => {
+      if (!uatChatProvider) {
+        throw new Error('UAT chat provider unavailable');
+      }
+      const taskId =
+        args?.taskId === null || args?.taskId === undefined
+          ? undefined
+          : String(args.taskId);
+      return uatChatProvider.focusTaskForUat(taskId);
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.readDurableSurfaces, async (args) => {
+      const { repository } = requireRepo();
+      return readDurableSurfaces(repository, {
+        rootId: String(args.rootId),
+        presentationId: String(args.presentationId),
+      });
+    }),
+  );
+}
+
 export async function deactivate(): Promise<void> {
   try {
     await taskEngine?.shutdown();
@@ -3535,6 +3849,7 @@ export async function deactivate(): Promise<void> {
   // provider is module-scoped only via registration; poller is stopped via
   // subscriptions. Clear repository so any late poll exits cleanly.
   taskRepository = undefined;
+  uatChatProvider = undefined;
   presentationManager?.dispose();
   presentationManager = undefined;
   askBridge?.cancelAll('deactivate');

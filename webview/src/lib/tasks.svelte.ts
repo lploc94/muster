@@ -312,7 +312,7 @@ class TasksState {
   }
 
   /**
-   * Sync task chrome from a pure workspace-patch reducer result (protocol v8).
+   * Sync task chrome from a pure workspace-patch reducer result (protocol v9).
    * Does not touch draftMode/pending focus beyond focusedTaskId when removed.
    */
   applyPatchView(state: WorkspacePatchViewState): void {

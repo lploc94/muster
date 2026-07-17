@@ -67,6 +67,8 @@ function transcriptToThreadItem(item: TranscriptItem): ThreadItem | null {
 export interface TranscriptPageWindowState {
   items: ThreadItem[];
   reasoningByTurn: Record<string, string>;
+  /** Stable reasoning entity id -> rendered turn ownership. */
+  reasoningTurnByItemId: Record<string, string>;
   /** All transcript entity IDs already owned (list items + reasoning). */
   loadedTranscriptIds: ReadonlySet<string>;
   beforeCursor?: string;
@@ -98,6 +100,7 @@ export function emptyTranscriptPageWindowState(): TranscriptPageWindowState {
   return {
     items: [],
     reasoningByTurn: {},
+    reasoningTurnByItemId: {},
     loadedTranscriptIds: new Set(),
     hasMoreBefore: false,
     olderPageLoading: false,
@@ -126,6 +129,16 @@ export function ownershipFromTranscript(items: readonly TranscriptItem[]): Set<s
     ids.add(item.id);
   }
   return ids;
+}
+
+export function reasoningOwnershipFromTranscript(
+  items: readonly TranscriptItem[],
+): Record<string, string> {
+  const ownership: Record<string, string> = {};
+  for (const item of items) {
+    if (item.kind === 'reasoning' && item.turnId) ownership[item.id] = item.turnId;
+  }
+  return ownership;
 }
 
 export function beginLoadOlder(
@@ -206,6 +219,7 @@ export function applyTranscriptPageResult(
   for (const item of state.items) owned.add(item.id);
   const prepended: ThreadItem[] = [];
   const reasoning = { ...state.reasoningByTurn };
+  const reasoningTurnByItemId = { ...state.reasoningTurnByItemId };
   // Turns that already had reasoning before this page keep live/newer text.
   // Within the older page, multiple rows for a new turn use hydrate's last-wins.
   const preexistingReasoningTurns = new Set(Object.keys(state.reasoningByTurn));
@@ -220,6 +234,7 @@ export function applyTranscriptPageResult(
       if (item.turnId && !preexistingReasoningTurns.has(item.turnId)) {
         reasoning[item.turnId] = asText(item.content);
       }
+      if (item.turnId) reasoningTurnByItemId[item.id] = item.turnId;
       continue;
     }
     const mapped = transcriptToThreadItem(item);
@@ -238,6 +253,7 @@ export function applyTranscriptPageResult(
     state: {
       items: [...prepended, ...state.items],
       reasoningByTurn: reasoning,
+      reasoningTurnByItemId,
       loadedTranscriptIds: owned,
       beforeCursor: page.beforeCursor,
       hasMoreBefore: page.hasMoreBefore,

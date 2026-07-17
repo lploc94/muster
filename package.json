@@ -250,6 +250,7 @@
     "test:task-export-live-evidence": "node --test scripts/verify-task-export-live-host-evidence.test.mjs",
     "test:live-inject-smoke": "node --test scripts/verify-live-inject-smoke.test.mjs",
     "test:sqlite-extension-host": "node scripts/run-sqlite-extension-host-smoke.mjs",
+    "test:sqlite-two-window-live-uat": "node scripts/run-sqlite-two-window-live-uat.mjs",
     "test:watch": "vitest",
     "check:svelte": "svelte-check --workspace webview --tsconfig ./tsconfig.json",
     "test:source-boundary": "node scripts/source-boundary-smoke.mjs && npm run test:repository-boundary",
