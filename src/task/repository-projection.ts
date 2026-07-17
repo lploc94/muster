@@ -60,20 +60,39 @@ export class RepositoryProjection {
     return deriveViewStatus(task, this.getTurnsForTask(taskId), dependencies);
   }
 
+  /**
+   * Bounded workspace reload. Loads task metadata, the bounded turn-activity
+   * projection (every queued/live turn plus the latest terminal turn per task),
+   * and the input messages of active turns. Full transcript history
+   * (all turns/messages/tool calls/reasoning) is never loaded here — that is the
+   * whole point of bounded bootstrap. `toolCalls`/`reasoning` stay empty.
+   */
   async refreshAll(): Promise<void> {
     const tasks = [...await this.source.listTasks(this.workspaceId)];
     const liveIds = new Set(tasks.map((task) => task.id));
     for (const id of Object.keys(this.file.tasks)) {
       if (!liveIds.has(id)) this.removeTask(id);
     }
-    await Promise.all(tasks.map((task) => this.refreshTask(task.id, task)));
+    const taskIds = tasks.map((task) => task.id);
+    const [activityTurns, inputMessages] = await Promise.all([
+      taskIds.length > 0 ? this.source.listTurnActivityForTasks(taskIds) : Promise.resolve([]),
+      taskIds.length > 0 ? this.source.listActiveTurnInputMessages(taskIds) : Promise.resolve([]),
+    ]);
+    // Replace the whole bounded surface atomically: clear then repopulate so
+    // stale terminal turns from a previous reload cannot linger.
+    this.file.tasks = Object.fromEntries(tasks.map((task) => [task.id, task]));
+    this.file.turns = Object.fromEntries(activityTurns.map((turn) => [turn.id, turn]));
+    this.file.messages = Object.fromEntries(inputMessages.map((message) => [message.id, message]));
+    this.file.toolCalls = {};
+    this.file.reasoning = {};
     const activeTurnIds = Object.values(this.file.turns)
       .filter((turn) => turn.status === 'queued' || turn.status === 'running' || turn.status === 'waiting_user')
       .map((turn) => turn.id);
+    // Bounded: only coordination for projected active turns (not workspace-wide).
     const [operations, cancelRequests, runtimeClaims] = await Promise.all([
       this.source.listOperationsForTurns(activeTurnIds),
-      this.source.listCancelRequests(),
-      this.source.listRuntimeClaims(),
+      this.source.listCancelRequestsForTurns(activeTurnIds),
+      this.source.listRuntimeClaimsForTurns(activeTurnIds),
     ]);
     this.file.operations = Object.fromEntries(operations.map(({ ledgerKey, entry }) => [ledgerKey, entry]));
     this.file.cancelRequests = Object.fromEntries(cancelRequests.map(({ turnId, request }) => [turnId, request]));
@@ -81,22 +100,60 @@ export class RepositoryProjection {
     this.file.revision = await this.source.getWorkspaceRevision();
   }
 
+  /**
+   * Bounded per-task refresh after a write. Reloads task metadata, the bounded
+   * turn-activity subset for that task, the input messages of its active turns,
+   * and coordination rows (ops/cancel/claims) for surviving active turns only.
+   * A long task never re-hydrates its full history after append/settle:
+   * terminal turns beyond the latest one, and non-active-turn transcript rows,
+   * are intentionally not projected. `toolCalls`/`reasoning` stay empty.
+   */
   async refreshTask(taskId: string, knownTask?: MusterTask): Promise<void> {
     const task = knownTask ?? await this.source.getTask(taskId);
     if (!task) {
       this.removeTask(taskId);
       return;
     }
-    const [turns, messages, tools, reasoning] = await Promise.all([
-      this.source.listTurns(taskId), this.source.listMessages(taskId),
-      this.source.listToolCalls(taskId), this.source.listReasoning(taskId),
+    const [turns, messages] = await Promise.all([
+      this.source.listTurnActivityForTasks([taskId]),
+      this.source.listActiveTurnInputMessages([taskId]),
     ]);
     this.removeTaskRows(taskId);
     this.file.tasks[taskId] = task;
     for (const turn of turns) this.file.turns[turn.id] = turn;
     for (const message of messages) this.file.messages[message.id] = message;
-    for (const tool of tools) this.file.toolCalls![tool.id] = tool;
-    for (const segment of reasoning) this.file.reasoning![segment.id] = segment;
+    // removeTaskRows drops cancel/claims for every prior projected turn of this
+    // task. Reload coordination only for still-active turns so ordinary writes
+    // (appendTranscriptBatch, replaceLiveTurn) cannot erase a live claim/cancel.
+    await this.reloadActiveCoordination(
+      turns
+        .filter((turn) =>
+          turn.status === 'queued' || turn.status === 'running' || turn.status === 'waiting_user',
+        )
+        .map((turn) => turn.id),
+    );
+  }
+
+  /**
+   * Bounded reload of ops/cancel/claims for the given active turn ids only.
+   * Constant call count (3 batched queries) — never N+1 per-turn RPCs.
+   */
+  private async reloadActiveCoordination(activeTurnIds: readonly string[]): Promise<void> {
+    if (activeTurnIds.length === 0) return;
+    const [operations, cancelEntries, claims] = await Promise.all([
+      this.source.listOperationsForTurns(activeTurnIds),
+      this.source.listCancelRequestsForTurns(activeTurnIds),
+      this.source.listRuntimeClaimsForTurns(activeTurnIds),
+    ]);
+    for (const { ledgerKey, entry } of operations) {
+      this.file.operations![ledgerKey] = entry;
+    }
+    for (const entry of cancelEntries) {
+      this.file.cancelRequests![entry.turnId] = entry.request;
+    }
+    for (const claim of claims) {
+      this.file.runtimeClaims![claim.turnId] = claim;
+    }
   }
 
   async afterExecute(command: RepositoryCommand, result: RepositoryCommandResult): Promise<void> {

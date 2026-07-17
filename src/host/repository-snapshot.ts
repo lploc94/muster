@@ -1,12 +1,16 @@
-import type { PendingAskOverlay, TaskSnapshot } from './snapshot';
+import type { PendingAskOverlay, TaskSnapshot, TranscriptItem, TranscriptPageState } from './snapshot';
 import { buildSnapshot } from './snapshot';
-import type { TaskRepository } from '../task/repository';
+import type { RepositoryTranscriptItem, TaskRepository } from '../task/repository';
 import type { TaskStoreFile } from '../task/types';
+
+/** Bounded page size for the focused-task bootstrap transcript (W4). */
+export const BOOTSTRAP_TRANSCRIPT_LIMIT = 100;
 
 /**
  * Opening chat must not read every transcript row in the workspace. This
- * projection contains task metadata and bounded turn metadata for
- * list/tree summaries, plus transcript rows for the focused task only.
+ * projection contains task metadata and bounded turn metadata for list/tree
+ * summaries, plus a bounded transcript PAGE (latest 100 items) for the focused
+ * task. It never materializes full turn/message/tool/reasoning history.
  */
 export interface RepositorySnapshotProjection {
   snapshot: TaskSnapshot;
@@ -14,30 +18,49 @@ export interface RepositorySnapshotProjection {
   observation: TaskStoreFile;
 }
 
-function rootIdForTask(
-  tasks: ReadonlyMap<string, { id: string; parentId: string | null }>,
-  taskId: string,
-): string | undefined {
-  let current = tasks.get(taskId);
-  if (!current) return undefined;
-  const seen = new Set<string>();
-  while (current.parentId && !seen.has(current.id)) {
-    seen.add(current.id);
-    const parent = tasks.get(current.parentId);
-    if (!parent) break;
-    current = parent;
+/** Map a repository transcript row to the host wire transcript item. */
+function toHostTranscriptItem(item: RepositoryTranscriptItem): TranscriptItem {
+  if (item.kind === 'tool') {
+    const content = item.content as Record<string, unknown>;
+    return {
+      id: item.id,
+      kind: 'tool',
+      turnId: item.turnId,
+      order: item.order,
+      content: {
+        toolCallId: String(content.toolCallId ?? ''),
+        name: String(content.name ?? ''),
+        ...(typeof content.toolKind === 'string'
+          ? { toolKind: content.toolKind as 'mcp' | 'builtin' | 'other' }
+          : {}),
+        status: (content.status as 'running' | 'success' | 'error') ?? 'running',
+        ...(content.input !== undefined ? { input: content.input } : {}),
+        ...(content.output !== undefined ? { output: content.output } : {}),
+        ...(typeof content.error === 'string' ? { error: content.error } : {}),
+      },
+    };
   }
-  return current.id;
+  if (item.kind === 'reasoning') {
+    return { id: item.id, kind: 'reasoning', turnId: item.turnId, content: item.content };
+  }
+  return {
+    id: item.id,
+    kind: item.kind,
+    content: item.content,
+    ...(item.turnId !== undefined ? { turnId: item.turnId } : {}),
+    ...(item.order !== undefined ? { order: item.order } : {}),
+    ...(item.state !== undefined ? { state: item.state } : {}),
+  };
 }
 
-async function activityTurns(
-  repository: TaskRepository,
-  taskIds: readonly string[],
-): Promise<readonly import('../task/types').TaskTurn[]> {
-  return repository.listTurnActivityForTasks(taskIds);
-}
-
-/** Build a chat snapshot from named repository queries, never from the migration envelope. */
+/**
+ * Build a chat snapshot from bounded repository queries. The focused transcript
+ * is a single keyset page (latest 100 items) from getTranscriptPage; tree/root
+ * summaries come from listTurnActivityForTasks; queued previews come from the
+ * focused task's active-turn input messages. Full transcript APIs are never called.
+ *
+ * Stale/deleted focus is normalized to a valid no-focus snapshot (protocol v6).
+ */
 export async function buildRepositorySnapshot(
   repository: TaskRepository,
   workspaceId: string,
@@ -46,57 +69,67 @@ export async function buildRepositorySnapshot(
 ): Promise<RepositorySnapshotProjection> {
   const tasks = await repository.listTasks(workspaceId);
   const taskMap = new Map(tasks.map((task) => [task.id, task]));
-  const summaryTurns = await activityTurns(repository, tasks.map((task) => task.id));
+  const taskIds = tasks.map((task) => task.id);
 
-  const focusedTask = focusedTaskId ? taskMap.get(focusedTaskId) : undefined;
-  const owningRootId = focusedTask
-    ? rootIdForTask(taskMap, focusedTask.id) ?? focusedTask.id
+  // Effective focus: only when the task still exists. Missing/deleted/stale ids
+  // produce a valid no-focus v6 snapshot (no focusedTaskId/transcript/page).
+  const effectiveFocusId =
+    focusedTaskId && taskMap.has(focusedTaskId) ? focusedTaskId : undefined;
+  const focusedTask = effectiveFocusId ? taskMap.get(effectiveFocusId) : undefined;
+
+  // Bounded turn activity for tree/current summaries (all tasks). Active input
+  // messages only for the focused task — no-focus needs no queue previews.
+  const [summaryTurns, activeInputMessages] = await Promise.all([
+    taskIds.length > 0
+      ? repository.listTurnActivityForTasks(taskIds)
+      : Promise.resolve([]),
+    focusedTask
+      ? repository.listActiveTurnInputMessages([focusedTask.id])
+      : Promise.resolve([]),
+  ]);
+
+  // Focused transcript is a single bounded keyset page. Revision travels with
+  // the page result so we do not query revision separately when focused.
+  const page = focusedTask
+    ? await repository.getTranscriptPage(focusedTask.id, undefined, BOOTSTRAP_TRANSCRIPT_LIMIT)
     : undefined;
-  const focusedTaskIds = focusedTask
-    ? (await repository.listSubtree(owningRootId!)).map((task) => task.id)
-    : [];
-  // A focused transcript needs its complete turn/input map; tree summaries only
-  // need the bounded activity projection above. This is the key distinction that
-  // prevents opening a workspace from materializing every historical turn.
-  const focusedTurns = focusedTask ? await repository.listTurns(focusedTask.id) : [];
-  const turnsById = new Map(summaryTurns.map((turn) => [turn.id, turn]));
-  for (const turn of focusedTurns) turnsById.set(turn.id, turn);
-  const turns = [...turnsById.values()];
-  const focusedMessages = focusedTask
-    ? await repository.listMessages(focusedTask.id)
-    : [];
-  const focusedTools = focusedTask
-    ? await repository.listToolCalls(focusedTask.id)
-    : [];
-  const focusedReasoning = focusedTask
-    ? await repository.listReasoning(focusedTask.id)
-    : [];
-  const revision = await repository.getWorkspaceRevision();
+  const revision = page ? page.workspaceRevision : await repository.getWorkspaceRevision();
 
   const observation: TaskStoreFile = {
     schemaVersion: 6,
     revision,
     tasks: Object.fromEntries(tasks.map((task) => [task.id, task])),
-    turns: Object.fromEntries(turns.map((turn) => [turn.id, turn])),
-    // Transcript payload is deliberately focused-task scoped. The remaining
-    // maps are intentionally empty because snapshot projection does not need them.
-    messages: Object.fromEntries(focusedMessages.map((message) => [message.id, message])),
+    turns: Object.fromEntries(summaryTurns.map((turn) => [turn.id, turn])),
+    // Only the focused task's active-turn inputs — powers queue previews.
+    messages: Object.fromEntries(activeInputMessages.map((message) => [message.id, message])),
     operations: {},
     cancelRequests: {},
-    toolCalls: Object.fromEntries(focusedTools.map((tool) => [tool.id, tool])),
-    reasoning: Object.fromEntries(focusedReasoning.map((reasoning) => [reasoning.id, reasoning])),
+    toolCalls: {},
+    reasoning: {},
     sendReceipts: {},
   };
 
-  // Keep the owning-root query explicit in the projection contract. The
-  // projector derives it from parentId; this assertion catches adapters that
-  // accidentally return a task outside the requested subtree.
-  if (focusedTask && focusedTaskIds.length > 0 && !focusedTaskIds.includes(focusedTask.id)) {
-    throw new Error('repository subtree projection does not contain focused task');
-  }
+  const transcript = page ? page.items.map(toHostTranscriptItem) : undefined;
+  const transcriptPage: TranscriptPageState | undefined = page
+    ? {
+        hasMoreBefore: page.hasMoreBefore,
+        workspaceRevision: page.workspaceRevision,
+        ...(page.hasMoreBefore && page.beforeCursor !== undefined
+          ? { beforeCursor: page.beforeCursor }
+          : {}),
+      }
+    : undefined;
 
+  // Focused ⇒ both transcript + transcriptPage required; no-focus ⇒ neither.
   return {
-    snapshot: buildSnapshot({ getFile: () => observation }, focusedTaskId, activePendingAsks),
+    snapshot: buildSnapshot(
+      { getFile: () => observation },
+      effectiveFocusId,
+      activePendingAsks,
+      focusedTask && transcript !== undefined && transcriptPage !== undefined
+        ? { transcript, transcriptPage }
+        : undefined,
+    ),
     observation,
   };
 }

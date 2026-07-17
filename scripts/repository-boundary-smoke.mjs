@@ -100,6 +100,48 @@ export async function runRepositoryBoundarySmoke(rootDir = ROOT) {
     failures.push('src/host/repository-snapshot.ts must use bounded repository queries, not the migration envelope.');
   }
 
+  // P4-W4: activation/bootstrap surfaces must stay on bounded helpers — never full
+  // listMessages/listToolCalls/listReasoning/listTurns hydration.
+  const BANNED_FULL_HYDRATION = [
+    'listMessages(',
+    'listToolCalls(',
+    'listReasoning(',
+    'listTurns(',
+    'listTurnsForTasks(',
+  ];
+  for (const rel of [
+    'src/host/repository-snapshot.ts',
+    'src/task/repository-projection.ts',
+  ]) {
+    const raw = texts.get(rel);
+    if (raw === undefined) {
+      failures.push(`Missing bounded bootstrap source file: ${rel}`);
+      continue;
+    }
+    const code = stripComments(raw);
+    for (const banned of BANNED_FULL_HYDRATION) {
+      if (code.includes(banned)) {
+        failures.push(`${rel} reintroduced full hydration call ${banned}; use bounded activity/page queries.`);
+      }
+    }
+    if (rel === 'src/host/repository-snapshot.ts') {
+      if (!code.includes('getTranscriptPage')) {
+        failures.push(`${rel} must call getTranscriptPage for the focused bootstrap transcript.`);
+      }
+      if (!code.includes('BOOTSTRAP_TRANSCRIPT_LIMIT')) {
+        failures.push(`${rel} must keep BOOTSTRAP_TRANSCRIPT_LIMIT as the focused page bound.`);
+      }
+    }
+    if (rel === 'src/task/repository-projection.ts') {
+      if (!code.includes('listTurnActivityForTasks')) {
+        failures.push(`${rel} must load turns via listTurnActivityForTasks.`);
+      }
+      if (!code.includes('listActiveTurnInputMessages')) {
+        failures.push(`${rel} must load active inputs via listActiveTurnInputMessages.`);
+      }
+    }
+  }
+
   try {
     const matrix = await readFile(path.join(rootDir, 'docs/plans/sqlite-entity-matrix.vi.md'), 'utf8');
     for (const term of [

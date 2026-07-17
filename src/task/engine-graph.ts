@@ -357,9 +357,23 @@ async function executeGraphCommand(
     expectedCancelRequests?: readonly { turnId: string; kind: import('./types').CancelRequest['kind']; opId: string }[];
     deleteSessionClaimTurnIds?: readonly string[];
     deleteResourceClaimTurnIds?: readonly string[];
+    /**
+     * Task ids whose FULL turn history must be present in the draft for correct
+     * turn-cap counting / sequence numbering. The bounded runtime projection
+     * only retains the latest terminal turn per task, so any handler that
+     * enforces maxTurns on an existing task (continue/answer/ask on a task with
+     * history) must hydrate it here. Rows are loaded ephemerally into both
+     * `before` and `draft`, so identical rows never produce spurious writes and
+     * nothing is cached back into the global projection.
+     */
+    hydrateFullTurnsForTaskIds?: readonly string[];
   } = {},
 ): Promise<{ ok: true; result?: GraphApplyResult } | { ok: false; error: string }> {
   const before = structuredClone(deps.store.getFile()) as TaskStoreFile;
+  for (const taskId of fences.hydrateFullTurnsForTaskIds ?? []) {
+    const fullTurns = await deps.repository.listTurns(taskId);
+    for (const turn of fullTurns) before.turns[turn.id] = turn;
+  }
   const draft = structuredClone(before) as TaskStoreFile;
   const applied = mutate(draft);
   if (!applied.ok) return { ok: false, error: applied.reason };
@@ -1604,7 +1618,7 @@ export async function executeToolCommand(
           },
         });
         return { ok: true };
-      });
+      }, { hydrateFullTurnsForTaskIds: [command.childId] });
       if (!commit.ok) {
         return { ok: false, error: commit.error };
       }
@@ -2264,6 +2278,20 @@ export async function executeToolCommand(
         return { ok: false, error: 'questions required' };
       }
       const questionId = deriveEntityId(ctx.turnId, command.opId, 'q');
+      // The parent-Q turn lands on the parent or the nearest open ancestor
+      // coordinator; hydrate the whole ancestor chain so canCreateTurn counts
+      // that task's full (possibly terminal) history, not the bounded subset.
+      const askParentChain: string[] = [];
+      {
+        const seen = new Set<string>();
+        let walk: string | null | undefined = caller.parentId;
+        const tasks = deps.store.getFile().tasks;
+        while (walk && !seen.has(walk)) {
+          seen.add(walk);
+          askParentChain.push(walk);
+          walk = tasks[walk]?.parentId;
+        }
+      }
       const commit = await executeGraphCommand(deps, 'askParent', (draft) => {
         ensureCoordinationMaps(draft);
         const child = draft.tasks[ctx.callerTaskId];
@@ -2416,7 +2444,7 @@ export async function executeToolCommand(
           data: { questionId, parentTaskId: parentId },
         });
         return { ok: true };
-      });
+      }, { hydrateFullTurnsForTaskIds: askParentChain });
       if (!commit.ok) {
         return { ok: false, error: commit.error };
       }
@@ -2438,6 +2466,11 @@ export async function executeToolCommand(
 
     case 'answer_child_question': {
       const scheduleIds: string[] = [];
+      // The continuation turn lands on the child that asked; hydrate its full
+      // turn history so canCreateTurn counts real slots, not the bounded subset.
+      const answerChildId =
+        deps.store.getFile().tasks[ctx.callerTaskId]?.pendingChildQuestions?.[command.questionId]
+          ?.fromChildId;
       const commit = await executeGraphCommand(deps, 'answerChildQuestion', (draft) => {
         ensureCoordinationMaps(draft);
         const parent = draft.tasks[ctx.callerTaskId];
@@ -2558,7 +2591,7 @@ export async function executeToolCommand(
           data: { questionId: command.questionId, continuationTurnId },
         });
         return { ok: true };
-      });
+      }, answerChildId ? { hydrateFullTurnsForTaskIds: [answerChildId] } : {});
       if (!commit.ok) {
         return { ok: false, error: commit.error };
       }

@@ -2,7 +2,7 @@
 
 ## Trạng thái
 
-**IN PROGRESS — Phase 4 pagination/incremental wire (P4-W3 ✅; P4-W4+ chưa bắt đầu).**
+**IN PROGRESS — Phase 4 pagination/incremental wire (P4-W3 ✅; P4-W4 ✅; P4-W5+ chưa bắt đầu).**
 Cập nhật: 2026-07-17
 
 - Phase 1: **đã qua gate** — worker/RPC, schema bootstrap, global-storage registry,
@@ -631,7 +631,7 @@ sau bắt đầu ngay khi wave trước đạt gate, chỉ dừng khi có blocke
 | P4-W1 ✅ | SQLite-only activation cutover | Không tạo/đọc/ghi/watch `.muster-tasks.json`; probe là hard gate |
 | P4-W2 ✅ | Xóa legacy storage/runtime API | Không còn `JsonTaskRepository`, filesystem `TaskStore`, sync engine constructor hoặc full-envelope export; **no migration/no backward compatibility** |
 | P4-W3 ✅ | Canonical cursor + SQL keyset page | SQLite query bounded `limit + 1`, không load full transcript |
-| P4-W4 | Bounded bootstrap | Snapshot focused task chỉ chứa 100 item + page metadata |
+| P4-W4 ✅ | Bounded bootstrap | Snapshot focused task chỉ chứa 100 item + page metadata |
 | P4-W5 | Load older UX | Typed request/response, prepend idempotent, giữ scroll anchor |
 | P4-W6 | Revisioned patch reducer | Duplicate/stale patch là no-op; revision gap yêu cầu recovery |
 | P4-W7 | Local patch routing | Queue/tree/transcript update không kéo theo focused full snapshot |
@@ -751,20 +751,29 @@ database là hard gate và filesystem JSON watcher/path đã bị loại khỏi 
   deterministic ordering parity với `buildTranscript()`, queued visibility (opening
   visible / follow-up hidden / running visible / multi-queued hidden), concurrent mutation.
 
-##### P4-W4 — Bounded bootstrap
+##### P4-W4 — Bounded bootstrap ✅
 
-- **Hiện trạng cần thay:** `TaskEngine.loadAsync` → `RepositoryProjection.load` →
-  `refreshAll` đang hydrate toàn bộ transcript aggregate (messages / tool calls /
-  reasoning) của workspace vào memory. Đây không phải bounded activation.
-- W4 phải thay projection activation bằng **bounded/lazy hydration**:
-  - Activation chỉ load task metadata, dependencies và các turn queued/running/waiting
-    cần reconcile (cancel, orphan live, child-wait continuation).
-  - Transcript aggregate chỉ tải khi focus, và phải đi qua `getTranscriptPage`.
-  - Không giữ toàn bộ message/tool/reasoning của mọi task trong memory khi startup.
-- `buildRepositorySnapshot()` gọi `getTranscriptPage(..., 100)`, không `listMessages`,
-  `listToolCalls`, `listReasoning` cho toàn focused task.
-- Snapshot mang `beforeCursor`, `hasMoreBefore`, `workspaceRevision`; serialized payload
-  có budget test.
+- **Projection activation bounded.** `RepositoryProjection.refreshAll` /
+  `refreshTask` chỉ load `listTurnActivityForTasks` + `listActiveTurnInputMessages`;
+  `toolCalls`/`reasoning` luôn `{}`. `refreshTask` reload coordination
+  (ops/cancel/claims) cho active turns còn sống — không mất claim/cancel sau
+  `appendTranscriptBatch` / `replaceLiveTurn`.
+- **loadAsync activation bounded.** Orphan reconcile dùng `listQueuedTurns`; retry
+  depth dùng `countRetryDepth` (recursive CTE); child-wait dùng
+  `countTurnsForTaskEpoch` + `getMaxTurnSequence` + `getTurn` +
+  `listEngineChildResultsAfter` — **zero** `listTurns`/`listMessages`/
+  `listToolCalls`/`listReasoning` trên path activation. Graph fences ephemeral
+  ngoài activation giữ nguyên nơi correctness yêu cầu.
+- **listActiveTurnInputMessages plan.** Drive từ active turns (MATERIALIZED) →
+  `turn_inputs` seek `(workspace_id, turn_id)` → messages PK. Không scan history.
+- **Bootstrap snapshot v6.** Focus chỉ khi task tồn tại; deleted/stale focus →
+  no-focus hợp lệ (không `focusedTaskId`/`transcript`/`transcriptPage`). Focused
+  luôn có cả hai; `getTranscriptPage(..., 100)` một lần; active inputs chỉ cho
+  focused task. `buildSnapshot` enforce invariant; `TaskThread.reset()` clear
+  page metadata.
+- **Tests.** Projection coord preserve; activation 10k fixtures (orphan/child-wait/
+  safe-retry); active-input EXPLAIN; snapshot deleted-focus + fixture budget
+  evidence; protocol v6 page guards; full suite green.
 
 ##### P4-W5 — Load older UX
 

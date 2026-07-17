@@ -126,11 +126,28 @@ export interface QueuedTurnProjection {
   previewText?: string;
 }
 
+/**
+ * Current-only transcript page metadata for the focused task. Sourced directly
+ * from the same repository.getTranscriptPage() result that produced the
+ * transcript, so the workspace revision is consistent with the page rows. W5
+ * will use beforeCursor/hasMoreBefore to load older pages; W4 only transports
+ * and stores the metadata.
+ */
+export interface TranscriptPageState {
+  /** Keyset cursor for the oldest row in the page; present only when hasMoreBefore. */
+  beforeCursor?: string;
+  hasMoreBefore: boolean;
+  /** Workspace revision of the page snapshot (not a separate query). */
+  workspaceRevision: number;
+}
+
 export interface TaskSnapshot {
   rootTasks: TaskSummary[];
   focusedTaskId?: string;
   subtree?: TaskSummary[];
   transcript?: TranscriptItem[];
+  /** Present iff a task is focused; current-page metadata for the transcript. */
+  transcriptPage?: TranscriptPageState;
   /**
    * Currently live (running/waiting_user) turn, or the sole queued turn when
    * nothing is live, or the latest retryable turn under needs_recovery.
@@ -619,6 +636,16 @@ export function buildSnapshot(
   store: TaskSnapshotReader,
   focusedTaskId?: string,
   activePendingAsks?: ReadonlyMap<string, PendingAskOverlay>,
+  options?: {
+    /**
+     * Bounded transcript page for the focused task, sourced from
+     * repository.getTranscriptPage(). Required together with transcriptPage
+     * whenever a task is focused (protocol v6 current-only contract). Never
+     * rebuilds transcript from a fully-hydrated observation.
+     */
+    transcript?: TranscriptItem[];
+    transcriptPage?: TranscriptPageState;
+  },
 ): TaskSnapshot {
   const file = store.getFile();
   const rootTasks = Object.values(file.tasks)
@@ -627,28 +654,38 @@ export function buildSnapshot(
     .filter((summary): summary is TaskSummary => summary !== undefined)
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.id.localeCompare(b.id));
 
+  // Focused current-only invariant: both transcript + transcriptPage must be
+  // supplied together. Missing/partial options normalize to no-focus so a
+  // stale caller cannot emit an invalid protocol v6 message.
+  const hasFocusedPage =
+    focusedTaskId !== undefined &&
+    options?.transcript !== undefined &&
+    options?.transcriptPage !== undefined;
+  const effectiveFocusId = hasFocusedPage ? focusedTaskId : undefined;
+
   const snapshot: TaskSnapshot = {
     rootTasks,
-    focusedTaskId,
+    ...(effectiveFocusId !== undefined ? { focusedTaskId: effectiveFocusId } : {}),
     storeRevision: file.revision,
   };
 
-  if (!focusedTaskId) {
+  if (!effectiveFocusId || !options?.transcript || !options?.transcriptPage) {
     return snapshot;
   }
 
   // Project the full owning-root tree so parent/sibling navigation remains
   // available while focused on a descendant (transcript stays focus-scoped).
-  const owningRootId = findOwningRoot(file, focusedTaskId) ?? focusedTaskId;
+  const owningRootId = findOwningRoot(file, effectiveFocusId) ?? effectiveFocusId;
   const subtreeIds = collectSubtreeIds(file, owningRootId);
   snapshot.subtree = subtreeIds
     .map((taskId) => projectTaskSummary(file, taskId))
     .filter((summary): summary is TaskSummary => summary !== undefined);
-  snapshot.transcript = buildTranscript(file, focusedTaskId);
-  snapshot.activeTurnId = activeTurnIdForTask(file, focusedTaskId);
-  snapshot.queuedTurns = projectQueuedTurns(file, focusedTaskId);
+  snapshot.transcript = options.transcript;
+  snapshot.transcriptPage = options.transcriptPage;
+  snapshot.activeTurnId = activeTurnIdForTask(file, effectiveFocusId);
+  snapshot.queuedTurns = projectQueuedTurns(file, effectiveFocusId);
 
-  const pending = activePendingAsks?.get(focusedTaskId);
+  const pending = activePendingAsks?.get(effectiveFocusId);
   if (pending) {
     snapshot.pendingAsk = {
       turnId: pending.turnId,

@@ -11,7 +11,7 @@ import type { NormalizedEvent, Question } from './types';
  * breaking change to the ExtMessage/OutMessage shapes below (and mirror it in
  * src/extension.ts).
  */
-export const PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 6;
 
 /**
  * Require an exact peer protocol version. A different or malformed version
@@ -144,6 +144,17 @@ export interface QueuedTurnProjection {
   previewText?: string;
 }
 
+/**
+ * Current-only transcript page metadata (protocol v6). Present iff a task is
+ * focused; carries the keyset cursor/hasMore flags and the page's workspace
+ * revision so the webview can (in W5) request older pages.
+ */
+export interface TranscriptPageState {
+  beforeCursor?: string;
+  hasMoreBefore: boolean;
+  workspaceRevision: number;
+}
+
 export interface SnapshotMessage {
   type: 'snapshot';
   /** Exact wire protocol version stamped by the host. */
@@ -152,6 +163,8 @@ export interface SnapshotMessage {
   focusedTaskId?: string;
   subtree?: TaskSummary[];
   transcript?: TranscriptItem[];
+  /** Present iff focusedTaskId is set (protocol v6, current-only). */
+  transcriptPage?: TranscriptPageState;
   activeTurnId?: string;
   /** Authoritative multi-queue projection (R012); optional for older hosts. */
   queuedTurns?: QueuedTurnProjection[];
@@ -902,6 +915,27 @@ function isTranscriptItem(v: unknown): v is TranscriptItem {
   }
 }
 
+function isTranscriptPageState(v: unknown): v is TranscriptPageState {
+  if (!isRecord(v)) return false;
+  if (typeof v.hasMoreBefore !== 'boolean') return false;
+  // workspaceRevision: finite, non-negative safe integer.
+  if (
+    typeof v.workspaceRevision !== 'number' ||
+    !Number.isFinite(v.workspaceRevision) ||
+    !Number.isSafeInteger(v.workspaceRevision) ||
+    v.workspaceRevision < 0
+  ) {
+    return false;
+  }
+  // beforeCursor is present only when there is an older page to fetch.
+  if (v.hasMoreBefore) {
+    if (!isString(v.beforeCursor)) return false;
+  } else if (v.beforeCursor !== undefined) {
+    return false;
+  }
+  return true;
+}
+
 function isQueuedTurnProjection(v: unknown): v is QueuedTurnProjection {
   if (!isRecord(v)) return false;
   return (
@@ -974,25 +1008,41 @@ export function isExtMessage(data: unknown): data is ExtMessage {
   }
 
   switch (t) {
-    case 'snapshot':
-      return (
-        isNumber(data.protocolVersion) &&
-        Array.isArray(data.rootTasks) &&
-        data.rootTasks.every(isTaskSummary) &&
-        isNumber(data.storeRevision) &&
-        (data.focusedTaskId === undefined || isString(data.focusedTaskId)) &&
-        (data.subtree === undefined || (Array.isArray(data.subtree) && data.subtree.every(isTaskSummary))) &&
-        (data.transcript === undefined || (Array.isArray(data.transcript) && data.transcript.every(isTranscriptItem))) &&
-        (data.activeTurnId === undefined || isString(data.activeTurnId)) &&
-        (data.queuedTurns === undefined ||
-          (Array.isArray(data.queuedTurns) && data.queuedTurns.every(isQueuedTurnProjection))) &&
-        (data.pendingAsk === undefined ||
-          (isRecord(data.pendingAsk) &&
-            isString(data.pendingAsk.turnId) &&
-            isString(data.pendingAsk.askId) &&
-            Array.isArray(data.pendingAsk.questions) &&
-            data.pendingAsk.questions.every(isQuestion)))
-      );
+    case 'snapshot': {
+      if (
+        !(
+          isNumber(data.protocolVersion) &&
+          Array.isArray(data.rootTasks) &&
+          data.rootTasks.every(isTaskSummary) &&
+          isNumber(data.storeRevision) &&
+          (data.focusedTaskId === undefined || isString(data.focusedTaskId)) &&
+          (data.subtree === undefined || (Array.isArray(data.subtree) && data.subtree.every(isTaskSummary))) &&
+          (data.transcript === undefined || (Array.isArray(data.transcript) && data.transcript.every(isTranscriptItem))) &&
+          (data.activeTurnId === undefined || isString(data.activeTurnId)) &&
+          (data.queuedTurns === undefined ||
+            (Array.isArray(data.queuedTurns) && data.queuedTurns.every(isQueuedTurnProjection))) &&
+          (data.pendingAsk === undefined ||
+            (isRecord(data.pendingAsk) &&
+              isString(data.pendingAsk.turnId) &&
+              isString(data.pendingAsk.askId) &&
+              Array.isArray(data.pendingAsk.questions) &&
+              data.pendingAsk.questions.every(isQuestion)))
+        )
+      ) {
+        return false;
+      }
+      // Protocol v6 current-only contract: a focused snapshot always carries a
+      // transcript array AND transcriptPage metadata; a no-focus snapshot has
+      // neither. No optional-fallback tolerance for the old (pre-v6) shape.
+      if (isString(data.focusedTaskId)) {
+        return (
+          Array.isArray(data.transcript) &&
+          data.transcript.every(isTranscriptItem) &&
+          isTranscriptPageState(data.transcriptPage)
+        );
+      }
+      return data.transcript === undefined && data.transcriptPage === undefined;
+    }
 
     case 'settingsSnapshot':
       return hasOnlyKeys(data, ['type', 'snapshot']) && isRuntimeStorageSettingsSnapshot(data.snapshot);

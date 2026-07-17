@@ -418,6 +418,43 @@ export interface TaskRepository {
    * a complete transcript must use listTurns(taskId) or getTranscriptPage().
    */
   listTurnActivityForTasks(taskIds: readonly string[]): Promise<readonly TaskTurn[]>;
+  /**
+   * Bounded input-message projection: user/assistant messages bound as inputs of
+   * queued/running/waiting_user turns for the given tasks. This is the only
+   * transcript content the runtime projection may hold — it powers queued
+   * previews and the turn-start user bubble without loading full history.
+   */
+  listActiveTurnInputMessages(taskIds: readonly string[]): Promise<readonly TaskMessage[]>;
+  /**
+   * Count turns for a task within an execution epoch, restricted to the given
+   * statuses (default: all). Turn-cap enforcement uses this so a bounded
+   * projection that omits historical terminal turns cannot undercount slots.
+   */
+  countTurnsForTaskEpoch(
+    taskId: string,
+    executionEpoch: number,
+    statuses?: readonly TaskTurn['status'][],
+  ): Promise<number>;
+  /**
+   * Highest turn sequence for a task (0 if none). Used by bootstrap reconcile
+   * to allocate the next sequence without hydrating full turn history.
+   */
+  getMaxTurnSequence(taskId: string): Promise<number>;
+  /**
+   * Depth of the `retryOf` chain ending at `turnId` (0 when the turn has no
+   * predecessor). Recursive CTE — O(depth), never loads the task's full history.
+   */
+  countRetryDepth(turnId: string): Promise<number>;
+  /**
+   * Engine-triggered turns after `afterSequence` whose inputs include
+   * `child_results`. Bounded (small LIMIT) — used by child-wait reconcile to
+   * detect an already-queued continuation without full history.
+   */
+  listEngineChildResultsAfter(
+    taskId: string,
+    afterSequence: number,
+    limit?: number,
+  ): Promise<readonly TaskTurn[]>;
   listQueuedTurns(taskId: string): Promise<readonly TaskTurn[]>;
   listMessages(taskId: string): Promise<readonly TaskMessage[]>;
   listToolCalls(taskId: string): Promise<readonly PersistedToolCall[]>;
@@ -426,9 +463,18 @@ export interface TaskRepository {
   /** Coordination rows needed to recover live graph turns after host reload. */
   listOperationsForTurns(turnIds: readonly string[]): Promise<readonly RepositoryOperationEntry[]>;
   getCancelRequest(turnId: string): Promise<CancelRequest | undefined>;
-  listCancelRequests(): Promise<readonly RepositoryCancelEntry[]>;
+  /**
+   * Batched cancel-request projection for the given turn ids (one SQL query).
+   * Empty input → []. Used by the bounded runtime projection so refresh never
+   * fans out to per-turn getCancelRequest RPCs.
+   */
+  listCancelRequestsForTurns(turnIds: readonly string[]): Promise<readonly RepositoryCancelEntry[]>;
   getRuntimeClaim(turnId: string): Promise<RuntimeClaim | undefined>;
-  listRuntimeClaims(): Promise<readonly RuntimeClaim[]>;
+  /**
+   * Batched runtime-claim projection for the given turn ids (one SQL query).
+   * Empty input → []. Same no-N+1 contract as listCancelRequestsForTurns.
+   */
+  listRuntimeClaimsForTurns(turnIds: readonly string[]): Promise<readonly RuntimeClaim[]>;
   getSendReceipt(clientRequestId: string): Promise<SendReceipt | undefined>;
   getTranscriptPage(taskId: string, cursor?: string, limit?: number): Promise<TranscriptPage>;
   /** Current workspace revision. */
@@ -776,6 +822,84 @@ export class SqliteTaskRepository implements TaskRepository {
     return this.hydrateTurns(rows);
   }
 
+  async listActiveTurnInputMessages(taskIds: readonly string[]): Promise<readonly TaskMessage[]> {
+    if (taskIds.length === 0) return [];
+    const rows = await this.db.all<MessageRow>(
+      activeTurnInputMessagesSql(taskIds.length),
+      [this.workspaceId, ...taskIds, ...taskIds],
+    );
+    return rows.map(decodeMessage);
+  }
+
+  async countTurnsForTaskEpoch(
+    taskId: string,
+    executionEpoch: number,
+    statuses?: readonly TaskTurn['status'][],
+  ): Promise<number> {
+    const statusFilter =
+      statuses && statuses.length > 0
+        ? ` AND status IN (${placeholders(statuses.length)})`
+        : '';
+    const row = await this.db.get<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM turns
+         WHERE workspace_id = ? AND task_id = ?
+           AND COALESCE(json_extract(payload_json, '$.executionEpoch'), 1) = ?${statusFilter}`,
+      [this.workspaceId, taskId, executionEpoch, ...(statuses ?? [])],
+    );
+    return row?.count ?? 0;
+  }
+
+  async getMaxTurnSequence(taskId: string): Promise<number> {
+    const row = await this.db.get<{ max_seq: number | null }>(
+      `SELECT MAX(sequence) AS max_seq FROM turns WHERE workspace_id = ? AND task_id = ?`,
+      [this.workspaceId, taskId],
+    );
+    return row?.max_seq ?? 0;
+  }
+
+  async countRetryDepth(turnId: string): Promise<number> {
+    // Walk retryOf predecessors via recursive CTE; depth is chain length, not
+    // including the seed turn itself (parity with retryCountOf).
+    const row = await this.db.get<{ depth: number }>(
+      `WITH RECURSIVE chain(id, depth, retry_of) AS (
+         SELECT id, 0, json_extract(payload_json, '$.retryOf')
+           FROM turns WHERE workspace_id = ? AND id = ?
+         UNION ALL
+         SELECT t.id, chain.depth + 1, json_extract(t.payload_json, '$.retryOf')
+           FROM chain
+           JOIN turns t ON t.workspace_id = ? AND t.id = chain.retry_of
+          WHERE chain.retry_of IS NOT NULL AND chain.depth < 64
+       )
+       SELECT COALESCE(MAX(depth), 0) AS depth FROM chain`,
+      [this.workspaceId, turnId, this.workspaceId],
+    );
+    return row?.depth ?? 0;
+  }
+
+  async listEngineChildResultsAfter(
+    taskId: string,
+    afterSequence: number,
+    limit = 32,
+  ): Promise<readonly TaskTurn[]> {
+    const bounded = Math.max(1, Math.min(limit, 64));
+    const rows = await this.db.all<TurnRow>(
+      `${turnSelect(`WHERE workspace_id = ? AND task_id = ?
+          AND trigger = 'engine'
+          AND sequence > ?
+          AND id NOT GLOB '*-attention'
+          AND EXISTS (
+            SELECT 1 FROM turn_inputs ti
+             WHERE ti.workspace_id = turns.workspace_id
+               AND ti.turn_id = turns.id
+               AND ti.kind = 'child_results'
+          )`)}
+       ORDER BY sequence, created_at, id
+       LIMIT ?`,
+      [this.workspaceId, taskId, afterSequence, bounded],
+    );
+    return this.hydrateTurns(rows);
+  }
+
   async getTurn(turnId: string): Promise<TaskTurn | undefined> {
     const row = await this.db.get<TurnRow>(
       turnSelect('WHERE workspace_id = ? AND id = ?'),
@@ -846,11 +970,16 @@ export class SqliteTaskRepository implements TaskRepository {
     return row ? decodeCancelRequest(row) : undefined;
   }
 
-  async listCancelRequests(): Promise<readonly RepositoryCancelEntry[]> {
+  async listCancelRequestsForTurns(
+    turnIds: readonly string[],
+  ): Promise<readonly RepositoryCancelEntry[]> {
+    if (turnIds.length === 0) return [];
     const rows = await this.db.all<CancelRow>(
       `SELECT turn_id, kind, op_id, requested_by, requested_at, payload_json
-         FROM turn_cancel_requests WHERE workspace_id = ? ORDER BY turn_id`,
-      [this.workspaceId],
+         FROM turn_cancel_requests
+        WHERE workspace_id = ? AND turn_id IN (${placeholders(turnIds.length)})
+        ORDER BY turn_id`,
+      [this.workspaceId, ...turnIds],
     );
     return rows.map((row) => ({ turnId: row.turn_id, request: decodeCancelRequest(row) }));
   }
@@ -864,11 +993,14 @@ export class SqliteTaskRepository implements TaskRepository {
     return row ? decodeRuntimeClaim(row) : undefined;
   }
 
-  async listRuntimeClaims(): Promise<readonly RuntimeClaim[]> {
+  async listRuntimeClaimsForTurns(turnIds: readonly string[]): Promise<readonly RuntimeClaim[]> {
+    if (turnIds.length === 0) return [];
     const rows = await this.db.all<RuntimeClaimRow>(
       `SELECT turn_id, owner_id, claimed_at, heartbeat_at, expires_at
-         FROM runtime_claims WHERE workspace_id = ? ORDER BY turn_id`,
-      [this.workspaceId],
+         FROM runtime_claims
+        WHERE workspace_id = ? AND turn_id IN (${placeholders(turnIds.length)})
+        ORDER BY turn_id`,
+      [this.workspaceId, ...turnIds],
     );
     return rows.map(decodeRuntimeClaim);
   }
@@ -2422,9 +2554,49 @@ function turnSelect(where: string): string {
                  started_at, settled_at, payload_json FROM turns ${where}`;
 }
 
-function messageSelect(where: string): string {
-  return `SELECT id, workspace_id, task_id, turn_id, role, state, ordering, content,
-                 created_at, updated_at, payload_json FROM messages ${where}`;
+function messageSelect(where: string, alias?: string): string {
+  const p = alias ? `${alias}.` : '';
+  const from = alias ? `messages ${alias}` : 'messages';
+  return `SELECT ${p}id, ${p}workspace_id, ${p}task_id, ${p}turn_id, ${p}role, ${p}state, ${p}ordering, ${p}content,
+                 ${p}created_at, ${p}updated_at, ${p}payload_json FROM ${from} ${where}`;
+}
+
+/**
+ * Bounded active-input SQL. Drive from task-scoped active turns first, seek
+ * turn_inputs by (workspace_id, turn_id), then seek messages by primary key.
+ * MATERIALIZE + CROSS JOIN keeps SQLite from reversing into a messages-history
+ * scan. Exported for EXPLAIN QUERY PLAN tests.
+ *
+ * Params: [workspaceId, ...taskIds, workspaceId, ...taskIds]
+ */
+export function activeTurnInputMessagesSql(taskIdCount: number): string {
+  const ids = placeholders(taskIdCount);
+  return `WITH active_turns AS MATERIALIZED (
+         SELECT workspace_id, id AS turn_id
+           FROM turns
+          WHERE workspace_id = ?
+            AND task_id IN (${ids})
+            AND status IN ('queued', 'running', 'waiting_user')
+       ),
+       active_message_ids AS MATERIALIZED (
+         SELECT DISTINCT
+                at.workspace_id AS workspace_id,
+                json_extract(ti.payload_json, '$.messageId') AS message_id
+           FROM active_turns at
+           CROSS JOIN turn_inputs ti
+          WHERE ti.workspace_id = at.workspace_id
+            AND ti.turn_id = at.turn_id
+            AND ti.kind = 'message'
+            AND json_extract(ti.payload_json, '$.messageId') IS NOT NULL
+       )
+       SELECT m.id, m.workspace_id, m.task_id, m.turn_id, m.role, m.state, m.ordering, m.content,
+              m.created_at, m.updated_at, m.payload_json
+         FROM active_message_ids ai
+         CROSS JOIN messages m
+        WHERE m.workspace_id = ai.workspace_id
+          AND m.id = ai.message_id
+          AND m.task_id IN (${ids})
+        ORDER BY m.created_at, m.id`;
 }
 
 function encodePayload(value: Record<string, unknown>): string {

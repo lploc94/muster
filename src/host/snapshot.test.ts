@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   activeTurnIdForTask,
   buildSnapshot,
+  buildTranscript,
   collectAncestorIds,
   collectSubtreeIds,
   findOwningRoot,
@@ -10,9 +11,26 @@ import {
   projectQueuedTurns,
   projectTaskSummary,
   type PendingAskOverlay,
+  type TranscriptItem,
+  type TranscriptPageState,
 } from './snapshot';
 import type { TaskReadPort } from '../task/store-port';
 import type { MusterTask, TaskMessage, TaskStoreFile, TaskTurn } from '../task/types';
+
+/** Focused v6 page fixture — production supplies this from getTranscriptPage. */
+function pageOpts(
+  transcript: TranscriptItem[],
+  page: Partial<TranscriptPageState> = {},
+): { transcript: TranscriptItem[]; transcriptPage: TranscriptPageState } {
+  return {
+    transcript,
+    transcriptPage: {
+      hasMoreBefore: false,
+      workspaceRevision: 0,
+      ...page,
+    },
+  };
+}
 
 const POLICY = {
   maxTurns: 10,
@@ -207,10 +225,17 @@ describe('host task snapshot projection', () => {
       taskId: 'root-active',
       turnId: 'root-active-running',
       askId: 'ask-1',
-      questions: [{ name: 'direction', question: 'Continue?', type: 'text' }],
+      questions: [{ prompt: 'Continue?' }],
     };
+    // W4: focused transcript is a bounded page option, not rebuilt from messages.
+    const focusedTranscript = buildTranscript(file, 'root-active');
 
-    const snapshot = buildSnapshot(storeFrom(file), 'root-active', new Map([['root-active', pendingAsk]]));
+    const snapshot = buildSnapshot(
+      storeFrom(file),
+      'root-active',
+      new Map([['root-active', pendingAsk]]),
+      pageOpts(focusedTranscript, { workspaceRevision: 7 }),
+    );
 
     expect(snapshot.storeRevision).toBe(7);
     expect(snapshot.rootTasks.map((summary) => summary.id)).toEqual(['root-active', 'root-old']);
@@ -230,24 +255,11 @@ describe('host task snapshot projection', () => {
       ['grandchild', 'open', 'idle', 'idle'],
       ['child-b', 'open', 'idle', 'idle'],
     ]);
-    expect(snapshot.transcript).toEqual([
-      {
-        id: 'user',
-        kind: 'user',
-        content: 'user request',
-        turnId: undefined,
-        order: undefined,
-        state: 'complete',
-      },
-      {
-        id: 'assistant',
-        kind: 'assistant',
-        content: 'assistant answer',
-        turnId: undefined,
-        order: undefined,
-        state: 'complete',
-      },
-    ]);
+    expect(snapshot.transcript).toEqual(focusedTranscript);
+    expect(snapshot.transcriptPage).toEqual({
+      hasMoreBefore: false,
+      workspaceRevision: 7,
+    });
     // Live turn wins over higher-sequence queued follow-ups (R012 multi-queue).
     expect(snapshot.activeTurnId).toBe('root-active-running');
     expect(snapshot.queuedTurns).toEqual([
@@ -262,7 +274,7 @@ describe('host task snapshot projection', () => {
     expect(snapshot.pendingAsk).toEqual({
       turnId: 'root-active-running',
       askId: 'ask-1',
-      questions: [{ name: 'direction', question: 'Continue?', type: 'text' }],
+      questions: [{ prompt: 'Continue?' }],
     });
   });
 
@@ -349,7 +361,12 @@ describe('host task snapshot projection', () => {
       },
     ]);
 
-    const snapshot = buildSnapshot(storeFrom(file), 'multi');
+    const snapshot = buildSnapshot(
+      storeFrom(file),
+      'multi',
+      undefined,
+      pageOpts(buildTranscript(file, 'multi'), { workspaceRevision: 3 }),
+    );
     expect(snapshot.activeTurnId).toBe('turn-live');
     expect(snapshot.queuedTurns).toEqual([
       {
@@ -429,7 +446,9 @@ describe('host task snapshot projection', () => {
         previewText: 'queued follow-up',
       },
     ]);
-    expect(buildSnapshot(storeFrom(file), 'ask').activeTurnId).toBe('live');
+    expect(
+      buildSnapshot(storeFrom(file), 'ask', undefined, pageOpts([])).activeTurnId,
+    ).toBe('live');
   });
 
   it('returns empty queuedTurns when only a live turn exists', () => {
@@ -445,7 +464,9 @@ describe('host task snapshot projection', () => {
       cancelRequests: {},
     };
     expect(projectQueuedTurns(file, 'only')).toEqual([]);
-    expect(buildSnapshot(storeFrom(file), 'only').queuedTurns).toEqual([]);
+    expect(
+      buildSnapshot(storeFrom(file), 'only', undefined, pageOpts([])).queuedTurns,
+    ).toEqual([]);
   });
 
   it('selects the latest retryable turn only for recovery state', () => {
@@ -734,7 +755,10 @@ describe('host task snapshot projection', () => {
       cancelRequests: {},
     };
     const store = storeFrom(file);
-    const snapshot = buildSnapshot(store, 't');
+    // Bounded page carries only chat-visible items (live prompt); queue panel
+    // is projected separately from observation messages.
+    const chatTranscript = buildTranscript(file, 't');
+    const snapshot = buildSnapshot(store, 't', undefined, pageOpts(chatTranscript));
     const userContents = (snapshot.transcript ?? [])
       .filter((item) => item.kind === 'user')
       .map((item) => item.content);
@@ -781,7 +805,9 @@ describe('host task snapshot projection', () => {
       cancelRequests: {},
     };
 
-    const snapshot = buildSnapshot(storeFrom(file), 't');
+    // Opening prompt is chat-visible (buildTranscript keeps sole queued user turn).
+    const openingTranscript = buildTranscript(file, 't');
+    const snapshot = buildSnapshot(storeFrom(file), 't', undefined, pageOpts(openingTranscript));
     expect(snapshot.transcript).toEqual([
       {
         id: 'msg-opening',
@@ -858,10 +884,11 @@ describe('host task snapshot projection', () => {
     expect(summary).not.toHaveProperty('handoff');
     expect(projectTaskSummary(file, 'idle')).not.toHaveProperty('handoffProgress');
 
-    const snapshot = buildSnapshot(storeFrom(file), 'hop');
+    const snapshot = buildSnapshot(storeFrom(file), 'hop', undefined, pageOpts([]));
     const hopRoot = snapshot.rootTasks.find((t) => t.id === 'hop');
     const hopSubtree = snapshot.subtree?.find((t) => t.id === 'hop');
     expect(hopRoot).not.toHaveProperty('handoffProgress');
+    expect(hopSubtree).toBeDefined();
     expect(hopSubtree).not.toHaveProperty('handoffProgress');
 
     const projectedJson = JSON.stringify({
@@ -956,10 +983,30 @@ describe('host task snapshot projection', () => {
     expect(collectAncestorIds(file, 'nested')).toEqual(['a', 'root']);
     expect(collectSubtreeIds(file, 'root')).toEqual(['root', 'a', 'nested', 'b']);
 
-    const snapshot = buildSnapshot(storeFrom(file), 'nested');
+    const nestedTranscript = buildTranscript(file, 'nested');
+    const snapshot = buildSnapshot(
+      storeFrom(file),
+      'nested',
+      undefined,
+      pageOpts(nestedTranscript),
+    );
     expect(snapshot.focusedTaskId).toBe('nested');
     expect(snapshot.subtree?.map((s) => s.id)).toEqual(['root', 'a', 'nested', 'b']);
     expect(snapshot.transcript?.map((item) => item.id)).toEqual(['nestedUser']);
+  });
+
+  it('normalizes focused snapshot without page options to no-focus (v6 invariant)', () => {
+    const file: TaskStoreFile = {
+      schemaVersion: 6,
+      revision: 1,
+      tasks: { t: task('t') },
+      turns: {},
+      messages: {},
+    };
+    const snapshot = buildSnapshot(storeFrom(file), 't');
+    expect(snapshot.focusedTaskId).toBeUndefined();
+    expect(snapshot.transcript).toBeUndefined();
+    expect(snapshot.transcriptPage).toBeUndefined();
   });
 
   it('detects owning-root membership changes for sibling create', () => {

@@ -152,6 +152,109 @@ describe('isExtMessage snapshot version tolerance', () => {
   });
 });
 
+describe('protocol v6 focused transcriptPage contract', () => {
+  const baseSnapshot = {
+    type: 'snapshot',
+    rootTasks: [baseTaskSummary],
+    storeRevision: 1,
+    protocolVersion: PROTOCOL_VERSION,
+  };
+  const validPage = {
+    hasMoreBefore: false,
+    workspaceRevision: 1,
+  };
+  const focusedBase = {
+    ...baseSnapshot,
+    focusedTaskId: 'task-1',
+    transcript: [],
+    transcriptPage: validPage,
+  };
+
+  it('is exactly version 6', () => {
+    expect(PROTOCOL_VERSION).toBe(6);
+  });
+
+  it('accepts focused snapshot with transcript + transcriptPage', () => {
+    expect(isExtMessage(focusedBase)).toBe(true);
+  });
+
+  it('rejects focused snapshot missing transcript', () => {
+    const { transcript: _t, ...rest } = focusedBase;
+    expect(isExtMessage(rest)).toBe(false);
+  });
+
+  it('rejects focused snapshot missing transcriptPage', () => {
+    const { transcriptPage: _p, ...rest } = focusedBase;
+    expect(isExtMessage(rest)).toBe(false);
+  });
+
+  it('rejects no-focus snapshot that carries transcript', () => {
+    expect(isExtMessage({ ...baseSnapshot, transcript: [] })).toBe(false);
+  });
+
+  it('rejects no-focus snapshot that carries transcriptPage', () => {
+    expect(isExtMessage({ ...baseSnapshot, transcriptPage: validPage })).toBe(false);
+  });
+
+  it('requires beforeCursor when hasMoreBefore is true', () => {
+    expect(
+      isExtMessage({
+        ...focusedBase,
+        transcriptPage: { hasMoreBefore: true, workspaceRevision: 1 },
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        ...focusedBase,
+        transcriptPage: {
+          hasMoreBefore: true,
+          beforeCursor: 'v2.abc',
+          workspaceRevision: 1,
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it('forbids beforeCursor when hasMoreBefore is false', () => {
+    expect(
+      isExtMessage({
+        ...focusedBase,
+        transcriptPage: {
+          hasMoreBefore: false,
+          beforeCursor: 'v2.abc',
+          workspaceRevision: 1,
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it('rejects non-finite / negative / non-integer workspaceRevision', () => {
+    for (const workspaceRevision of [NaN, Infinity, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(
+        isExtMessage({
+          ...focusedBase,
+          transcriptPage: { hasMoreBefore: false, workspaceRevision },
+        }),
+        String(workspaceRevision),
+      ).toBe(false);
+    }
+  });
+
+  it('rejects malformed page metadata shapes', () => {
+    for (const transcriptPage of [
+      null,
+      'page',
+      { hasMoreBefore: 'yes', workspaceRevision: 1 },
+      { hasMoreBefore: false },
+      { workspaceRevision: 1 },
+    ]) {
+      expect(isExtMessage({ ...focusedBase, transcriptPage }), JSON.stringify(transcriptPage)).toBe(
+        false,
+      );
+    }
+  });
+});
+
 const settingsSnapshot: RuntimeStorageSettingsSnapshot = {
   settings: [
     {

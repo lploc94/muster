@@ -468,6 +468,7 @@
               {
                 lifecycle: focused?.lifecycle,
                 runtimeActivity: focused ? effectiveRuntimeActivity(focused) : null,
+                ...(msg.transcriptPage ? { transcriptPage: msg.transcriptPage } : {}),
               },
             );
           } else if (tasks.draftMode) {

@@ -1893,10 +1893,11 @@ export class TaskEngine {
       if (!task) continue;
       const interrupted = interruptTurn(turn, { now });
       if (!interrupted.ok) continue;
-      const turns = await this.repository.listTurns(task.id);
+      // Bounded: only the task's queued followers need holdAutoPromote, not full history.
+      const queued = await this.repository.listQueuedTurns(task.id);
       const heldTurns = task.attention?.code === 'awaiting_parent_answer'
         ? []
-        : turns.filter((candidate) => candidate.status === 'queued' && !candidate.holdAutoPromote)
+        : queued.filter((candidate) => !candidate.holdAutoPromote)
           .map((candidate) => ({ ...candidate, holdAutoPromote: true }));
       await this.repository.execute({
         kind: 'reconcileOrphanTurn', workspaceId: this.workspaceId, taskId: task.id,
@@ -1907,7 +1908,7 @@ export class TaskEngine {
       await this.repository.execute({ kind: 'releaseRuntime', workspaceId: this.workspaceId, turnId: turn.id });
     }
     await this.reconcileChildWaits({ schedule: false });
-    this.deferReloadQueuedTurns();
+    await this.deferReloadQueuedTurns();
     await processCancelRequests(this.graphDeps());
   }
 
@@ -1981,7 +1982,7 @@ export class TaskEngine {
   }
 
   /** Reload policy for ordinary queued turns; runtime switches need no recovery work. */
-  private deferReloadQueuedTurns(): void {
+  private async deferReloadQueuedTurns(): Promise<void> {
     const file = this.store.getFile();
     const trusted = this.isWorkspaceTrusted();
     for (const turn of Object.values(file.turns)) {
@@ -2004,13 +2005,8 @@ export class TaskEngine {
         // Eligible for auto-resume — do not defer (or clear if safe retry).
         if (safeRetry) {
           this.deferredQueuedTurns.delete(turn.id);
-          const retryIndex = Math.max(
-            1,
-            retryCountOf(
-              Object.values(file.turns).filter((t) => t.taskId === turn.taskId),
-              turn.id,
-            ),
-          );
+          // Recursive CTE over retryOf — O(depth), never full task history.
+          const retryIndex = Math.max(1, await this.repository.countRetryDepth(turn.id));
           const baseMs = Math.min(30_000, 250 * 2 ** Math.min(retryIndex - 1, 6));
           const jitter = Math.floor(Math.random() * Math.min(500, baseMs));
           setTimeout(() => {
@@ -2052,9 +2048,52 @@ export class TaskEngine {
         if (child?.lifecycle) childLifecycles.set(childId, child.lifecycle);
         if (child?.attention) childAttention.set(childId, { code: child.attention.code });
       }
-      const turnCap = canCreateTurn(file, task.id, this.resourceLimits);
-      if (!turnCap.ok) continue;
-      const result = resolveChildWait(task, childLifecycles, turnsForTask(file, task.id), {
+      // Bootstrap must not hydrate full history. Use named bounded queries for
+      // turn-cap, next sequence, and continuation existence.
+      const executionEpoch = task.executionEpoch ?? 1;
+      const [slotsUsed, maxSequence] = await Promise.all([
+        this.repository.countTurnsForTaskEpoch(task.id, executionEpoch),
+        this.repository.getMaxTurnSequence(task.id),
+      ]);
+      const cap = Math.min(this.resourceLimits.maxTurnsPerTask, task.executionPolicy.maxTurns);
+      if (slotsUsed >= cap) continue;
+      // Already-queued continuation (exact id) short-circuits wait clearing.
+      if (await this.repository.getTurn(continuationTurnId)) {
+        const cleared = { ...task, wait: undefined, revision: task.revision + 1, updatedAt: now };
+        await this.repository.execute({
+          kind: 'resolveChildWait', workspaceId: this.workspaceId, taskId: task.id,
+          expectedTaskRevision: task.revision, task: cleared,
+        });
+        continue;
+      }
+      // Synthetic view: projected activity turns + sequence anchors so
+      // resolveChildWait can allocate nextSequence without full history.
+      const sequenceAnchors: TaskTurn[] = [];
+      if (maxSequence > 0) {
+        sequenceAnchors.push({
+          id: `__seq-anchor-${task.id}`,
+          taskId: task.id,
+          sequence: maxSequence,
+          status: 'succeeded',
+          trigger: 'engine',
+          inputs: [],
+          createdAt: now,
+        });
+      }
+      if (task.wait.registeredByTurnId) {
+        const registering = await this.repository.getTurn(task.wait.registeredByTurnId);
+        if (registering) sequenceAnchors.push(registering);
+        // Detect a prior engine child_results continuation after the wait turn
+        // (hasContinuationForWait heuristic without full listTurns).
+        const afterSeq = registering?.sequence ?? 0;
+        const prior = await this.repository.listEngineChildResultsAfter(task.id, afterSeq, 8);
+        sequenceAnchors.push(...prior);
+      }
+      const waitTurns = [
+        ...Object.values(file.turns).filter((t) => t.taskId === task.id),
+        ...sequenceAnchors,
+      ];
+      const result = resolveChildWait(task, childLifecycles, waitTurns, {
         continuationTurnId, now, childAttention,
       });
       if (!result.ok) continue;
@@ -2750,17 +2789,29 @@ export class TaskEngine {
     }
   }
 
-  private exceedsTurnLimit(taskId: string, candidateTurnId?: string): boolean {
+  /**
+   * Turn-cap gate. The bounded runtime projection only retains the latest
+   * terminal turn per task, so historical slots are counted via a durable
+   * repository query instead of the in-memory turn map. A slot is any turn that
+   * is not still queued; the candidate turn (about to promote) is counted as a
+   * consumed slot even while its row is still queued.
+   */
+  private async exceedsTurnLimit(taskId: string, candidateTurnId?: string): Promise<boolean> {
     const task = this.store.getTask(taskId);
     if (!task) return true;
     const executionEpoch = task.executionEpoch ?? 1;
-    const turns = this.store
-      .getTurnsForTask(taskId)
-      .filter((turn) => (turn.executionEpoch ?? 1) === executionEpoch);
     const cap = Math.min(this.resourceLimits.maxTurnsPerTask, task.executionPolicy.maxTurns);
-    const slotsUsed = turns.filter(
-      (t) => t.status !== 'queued' || t.id === candidateTurnId,
-    ).length;
+    // Non-queued turns are committed slots; count them durably. The candidate
+    // (still queued) consumes one more slot when it promotes.
+    const nonQueued = await this.repository.countTurnsForTaskEpoch(taskId, executionEpoch, [
+      'running',
+      'waiting_user',
+      'succeeded',
+      'failed',
+      'interrupted',
+      'cancelled',
+    ]);
+    const slotsUsed = candidateTurnId ? nonQueued + 1 : nonQueued;
     return slotsUsed > cap;
   }
 
@@ -2831,7 +2882,7 @@ export class TaskEngine {
       return;
     }
     const turn = this.store.getFile().turns[turnId];
-    if (turn && this.exceedsTurnLimit(turn.taskId, turnId)) {
+    if (turn && (await this.exceedsTurnLimit(turn.taskId, turnId))) {
       return;
     }
     if (!canPromoteTurn(this.store.getFile(), turnId, this.resourceLimits).ok) {
@@ -4386,15 +4437,8 @@ export class TaskEngine {
         if (retryTurnEntry) {
           // Bounded exponential backoff + jitter for safe auto-retries (Phase C).
           // Depth is measured from the new retry turn's chain, not the failed predecessor alone.
-          const retryIndex = Math.max(
-            1,
-            retryCountOf(
-              Object.values(this.store.getFile().turns).filter(
-                (t) => t.taskId === retryTurnEntry.taskId,
-              ),
-              retryTurnEntry.id,
-            ),
-          );
+          // Recursive CTE — never full task history.
+          const retryIndex = Math.max(1, await this.repository.countRetryDepth(retryTurnEntry.id));
           const baseMs = Math.min(30_000, 250 * 2 ** Math.min(retryIndex - 1, 6));
           const jitter = Math.floor(Math.random() * Math.min(500, baseMs));
           const delayMs = baseMs + jitter;

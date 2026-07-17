@@ -1,5 +1,5 @@
 import type { NormalizedEvent } from './types';
-import type { TaskRuntimeActivity, TaskViewStatus, TranscriptItem } from './protocol';
+import type { TaskRuntimeActivity, TaskViewStatus, TranscriptItem, TranscriptPageState } from './protocol';
 import type { ThreadItem } from './turn-state.svelte';
 
 function asText(content: unknown): string {
@@ -77,12 +77,24 @@ export class TaskThread {
    * that does not alter `items.length` or `streaming.text` — used for autoscroll.
    */
   revision = $state(0);
+  /**
+   * W4 transcript page metadata for the focused thread (protocol v6). The
+   * transcript is a bounded latest-N page; these fields let W5 request older
+   * pages. Hydrate/focus replaces them; reset clears them.
+   */
+  beforeCursor = $state<string | undefined>(undefined);
+  hasMoreBefore = $state(false);
+  transcriptWorkspaceRevision = $state<number | undefined>(undefined);
 
   hydrate(
     transcript: TranscriptItem[],
     activeTurnId?: string,
     viewStatus?: TaskViewStatus,
-    opts?: { lifecycle?: string; runtimeActivity?: TaskRuntimeActivity | null },
+    opts?: {
+      lifecycle?: string;
+      runtimeActivity?: TaskRuntimeActivity | null;
+      transcriptPage?: TranscriptPageState;
+    },
   ): void {
     // Keep the live streaming buffer only if it belongs to the still-active turn and
     // corresponds to a persisted `partial` assistant segment of the same id — the
@@ -113,6 +125,10 @@ export class TaskThread {
     this.reasoningByTurn = reasoning;
     if (!keepStreaming) this.streaming = null;
     this.activeTurnId = activeTurnId ?? null;
+    // Replace transcript-page metadata on every hydrate/focus (protocol v6).
+    this.beforeCursor = opts?.transcriptPage?.beforeCursor;
+    this.hasMoreBefore = opts?.transcriptPage?.hasMoreBefore ?? false;
+    this.transcriptWorkspaceRevision = opts?.transcriptPage?.workspaceRevision;
     const runtime = opts?.runtimeActivity ?? (viewStatus === 'running' || viewStatus === 'waiting_user' ? viewStatus : null);
     this.running = runtime === 'running' || runtime === 'waiting_user';
     // Restore "had a process" after reload: live/recovery runtime, or any transcript
@@ -132,6 +148,9 @@ export class TaskThread {
     this.activeTurnId = null;
     this.readOnly = false;
     this.hadProcess = false;
+    this.beforeCursor = undefined;
+    this.hasMoreBefore = false;
+    this.transcriptWorkspaceRevision = undefined;
   }
 
   setReadOnly(readOnly: boolean): void {
@@ -364,7 +383,11 @@ class ThreadStore {
     transcript?: TranscriptItem[],
     activeTurnId?: string,
     viewStatus?: TaskViewStatus,
-    opts?: { lifecycle?: string; runtimeActivity?: TaskRuntimeActivity | null },
+    opts?: {
+      lifecycle?: string;
+      runtimeActivity?: TaskRuntimeActivity | null;
+      transcriptPage?: TranscriptPageState;
+    },
   ): void {
     const thread = this.getOrCreate(taskId);
     this.current = thread;
