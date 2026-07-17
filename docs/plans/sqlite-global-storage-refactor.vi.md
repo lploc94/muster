@@ -2,7 +2,7 @@
 
 ## Trạng thái
 
-**IN PROGRESS — Phase 4 pagination/incremental wire (P4-W3 ✅; P4-W4 ✅; P4-W5 ✅; P4-W6 ✅; P4-W7 ✅; P4-W8 ✅; P4-W9+ chưa bắt đầu).**
+**COMPLETE — Phase 4 pagination/incremental wire (P4-W1…W11 ✅). Phase 5 not started.**
 Cập nhật: 2026-07-17
 
 - Phase 1: **đã qua gate** — worker/RPC, schema bootstrap, global-storage registry,
@@ -847,14 +847,16 @@ request; fixed page limit 100; **no W6 recovery**.
 - SQLite integration tests chốt thứ tự `appendTranscriptBatch → putCancelRequest`, injected
   disk-full chỉ một attempt/một failed turn, và shutdown giữ last pre-abort window.
 
-##### P4-W9 — Change-feed contract
+##### P4-W9 — Change-feed contract ✅
 
 - Repository expose current revision + changes-since query theo revision boundary.
-- Feed có retention bound/watermark. Consumer nhận explicit `gap` khi revision cần thiết
+- Feed có retention bound/watermark (`CHANGE_FEED_RETAIN_REVISIONS=4096`, explicit
+  `change_feed_watermarks`). Consumer nhận explicit `gap` khi revision cần thiết
   đã bị prune; không đoán từ danh sách rỗng.
 - Feed chỉ chứa metadata IDs/change kind, không chứa prompt/tool payload/path.
+- Schema v5 current-bootstrap only.
 
-##### P4-W10 — Multi-window polling
+##### P4-W10 — Multi-window polling ✅
 
 - Khi view visible, poll `data_version`/workspace revision với adaptive backoff; poll ngay
   khi view hoặc VS Code window regain focus; hidden view dừng timer.
@@ -862,26 +864,23 @@ request; fixed page limit 100; **no W6 recovery**.
   rebuild bounded snapshot.
 - Test hai DB clients/processes ghi xen kẽ và hội tụ cùng reducer state.
 
-##### P4-W11 — Performance/UAT gate
+##### P4-W11 — Performance/UAT gate ✅
 
 - Benchmark release fixture 10k transcript items: focus latest 100, load page 100,
-  bootstrap bytes, stream-batch p50/p95 và heap/row count.
+  bootstrap bytes, stream-batch p50/p95 và heap/row count (`bench:phase4-release`).
 - UAT transcript append trong lúc paging, duplicate delivery, gap prune, two-window
-  convergence và focus race.
+  convergence và focus race (unit/integration + two-client suites).
+- Composer → VS Code Settings `muster.composerSelection`; send outbox → SQLite
+  `send_outbox`; presentation → SQLite `presentations` (serializer opaque IDs only).
+- Schema v6 current-bootstrap only.
 - Chạy full tests, TypeScript, webview build/check, source-boundary audit và packaged VSIX;
   ghi evidence trước khi đánh dấu Phase 4 hoàn tất.
 
-##### Cleanup trước P4-W11 (plan only — chưa implement ở W2)
+##### Cleanup trước P4-W11 ✅
 
-Rà soát durable state còn nằm ngoài SQLite trước gate performance/UAT:
-
-- Composer backend/model preference hiện ở `globalState` → chuyển VS Code Settings
-  hoặc SQLite (chốt product ownership).
-- `send-outbox` chứa user message hiện ở webview `setState` → chuyển SQLite durable
-  outbox **hoặc** chỉ volatile memory theo contract được chốt; không để user content
-  durable ngoài SQLite.
-- Rà presentation / webview persisted state: durable domain/user content không được
-  nằm ngoài SQLite; webview `setState` chỉ UI chrome ephemeral (scroll, draft UI flags).
+- Composer backend/model: VS Code Settings `muster.composerSelection` (không globalState).
+- Send outbox: SQLite durable `send_outbox`; webview memory-only (không setState text).
+- Presentation: SQLite `presentations`; webview setState chỉ opaque rootId/presentationId.
 
 ### Phase 5 — SQLite hardening
 

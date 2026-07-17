@@ -320,6 +320,32 @@ export type RepositoryCommand =
   | { kind: 'putCancelRequest'; workspaceId: string; turnId: string; request: CancelRequest }
   | { kind: 'deleteCancelRequest'; workspaceId: string; turnId: string }
   | { kind: 'putSendReceipt'; workspaceId: string; receipt: SendReceipt }
+  | {
+      kind: 'putSendOutbox';
+      workspaceId: string;
+      entry: SendOutboxEntry;
+    }
+  | {
+      kind: 'markSendOutboxRejected';
+      workspaceId: string;
+      clientRequestId: string;
+      updatedAt: string;
+    }
+  | {
+      kind: 'deleteSendOutbox';
+      workspaceId: string;
+      clientRequestId: string;
+    }
+  | {
+      kind: 'putPresentation';
+      workspaceId: string;
+      document: PresentationRecord;
+    }
+  | {
+      kind: 'deletePresentation';
+      workspaceId: string;
+      presentationId: string;
+    }
   | { kind: 'deleteSendReceipt'; workspaceId: string; clientRequestId: string }
   | {
       /**
@@ -484,6 +510,9 @@ export interface TaskRepository {
    */
   listRuntimeClaimsForTurns(turnIds: readonly string[]): Promise<readonly RuntimeClaim[]>;
   getSendReceipt(clientRequestId: string): Promise<SendReceipt | undefined>;
+  listSendOutbox(limit?: number): Promise<readonly SendOutboxEntry[]>;
+  getSendOutbox(clientRequestId: string): Promise<SendOutboxEntry | undefined>;
+  getPresentation(presentationId: string): Promise<PresentationRecord | undefined>;
   getTranscriptPage(taskId: string, cursor?: string, limit?: number): Promise<TranscriptPage>;
   /** Current workspace revision. */
   getWorkspaceRevision(): Promise<number>;
@@ -507,6 +536,49 @@ export interface TaskRepository {
   execute(command: RepositoryCommand): Promise<RepositoryCommandResult>;
 }
 
+/** Strict versioned send-outbox payload (P4-W11). Bound field sizes; no freeform blobs. */
+export const SEND_OUTBOX_PAYLOAD_VERSION = 1;
+export const SEND_OUTBOX_MAX_ENTRIES = 32;
+export const SEND_OUTBOX_TEXT_MAX = 32_000;
+export const SEND_OUTBOX_SKILLS_MAX = 8;
+
+export interface SendOutboxPayloadV1 {
+  version: typeof SEND_OUTBOX_PAYLOAD_VERSION;
+  text: string;
+  llmText?: string;
+  mentionBindings?: Array<[string, string]>;
+  skills?: string[];
+  backend?: string;
+  model?: string;
+  continuationOf?: string;
+}
+
+export interface SendOutboxEntry {
+  clientRequestId: string;
+  status: 'pending' | 'rejected';
+  taskId?: string;
+  payload: SendOutboxPayloadV1;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PresentationRecord {
+  presentationId: string;
+  ownerTaskId: string;
+  rootId: string;
+  revision: number;
+  title: string;
+  markdown: string;
+  summary?: string;
+  changeSummary?: string;
+  kind?: string;
+  sourcePath?: string;
+  sourceFolderUri?: string;
+  updatedAt: string;
+  /** Durable op fingerprint for idempotent open/update across restarts. */
+  opFingerprint?: string;
+}
+
 /** Metadata-only change-feed entity kinds (no content/path/payload). */
 export const WORKSPACE_CHANGE_ENTITY_KINDS = [
   'workspace',
@@ -520,6 +592,8 @@ export const WORKSPACE_CHANGE_ENTITY_KINDS = [
   'cancel_request',
   'send_receipt',
   'runtime_claim',
+  'send_outbox',
+  'presentation',
 ] as const;
 
 export type WorkspaceChangeEntityKind = (typeof WORKSPACE_CHANGE_ENTITY_KINDS)[number];
@@ -1145,6 +1219,42 @@ export class SqliteTaskRepository implements TaskRepository {
       [this.workspaceId, clientRequestId],
     );
     return row ? decodeReceipt(row) : undefined;
+  }
+
+  async listSendOutbox(limit = SEND_OUTBOX_MAX_ENTRIES): Promise<readonly SendOutboxEntry[]> {
+    const capped = Math.min(
+      SEND_OUTBOX_MAX_ENTRIES,
+      Number.isSafeInteger(limit) && limit > 0 ? limit : SEND_OUTBOX_MAX_ENTRIES,
+    );
+    const rows = await this.db.all<SendOutboxRow>(
+      `SELECT client_request_id, status, task_id, payload_json, created_at, updated_at
+         FROM send_outbox
+        WHERE workspace_id = ?
+        ORDER BY created_at ASC, client_request_id ASC
+        LIMIT ?`,
+      [this.workspaceId, capped],
+    );
+    return rows.map(decodeSendOutboxRow);
+  }
+
+  async getSendOutbox(clientRequestId: string): Promise<SendOutboxEntry | undefined> {
+    const row = await this.db.get<SendOutboxRow>(
+      `SELECT client_request_id, status, task_id, payload_json, created_at, updated_at
+         FROM send_outbox
+        WHERE workspace_id = ? AND client_request_id = ?`,
+      [this.workspaceId, clientRequestId],
+    );
+    return row ? decodeSendOutboxRow(row) : undefined;
+  }
+
+  async getPresentation(presentationId: string): Promise<PresentationRecord | undefined> {
+    const row = await this.db.get<PresentationRow>(
+      `SELECT presentation_id, owner_task_id, root_id, revision, title, markdown, payload_json, updated_at
+         FROM presentations
+        WHERE workspace_id = ? AND presentation_id = ?`,
+      [this.workspaceId, presentationId],
+    );
+    return row ? decodePresentationRow(row) : undefined;
   }
 
   async getTranscriptPage(taskId: string, cursor?: string, limit?: number): Promise<TranscriptPage> {
@@ -1902,6 +2012,72 @@ export class SqliteTaskRepository implements TaskRepository {
         const results = await this.writeIfFirstChanged(
           { sql: 'DELETE FROM send_receipts WHERE workspace_id = ? AND client_request_id = ?', params: [this.workspaceId, command.clientRequestId] }, [],
           { kind: 'send_receipt', id: command.clientRequestId, change: 'delete' }, new Date().toISOString(),
+        );
+        return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
+      }
+      case 'putSendOutbox': {
+        validateSendOutboxEntry(command.entry);
+        await this.write(
+          [sendOutboxStatement(this.workspaceId, command.entry)],
+          [{
+            kind: 'send_outbox',
+            id: command.entry.clientRequestId,
+            taskId: command.entry.taskId,
+            change: 'upsert',
+          }],
+          command.entry.updatedAt,
+        );
+        return { ok: true, changed: true };
+      }
+      case 'markSendOutboxRejected': {
+        const results = await this.writeIfFirstChanged(
+          {
+            sql: `UPDATE send_outbox
+                     SET status = 'rejected', updated_at = ?
+                   WHERE workspace_id = ? AND client_request_id = ? AND status = 'pending'`,
+            params: [command.updatedAt, this.workspaceId, command.clientRequestId],
+          },
+          [],
+          { kind: 'send_outbox', id: command.clientRequestId, change: 'reject' },
+          command.updatedAt,
+        );
+        return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
+      }
+      case 'deleteSendOutbox': {
+        const results = await this.writeIfFirstChanged(
+          {
+            sql: 'DELETE FROM send_outbox WHERE workspace_id = ? AND client_request_id = ?',
+            params: [this.workspaceId, command.clientRequestId],
+          },
+          [],
+          { kind: 'send_outbox', id: command.clientRequestId, change: 'delete' },
+          new Date().toISOString(),
+        );
+        return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
+      }
+      case 'putPresentation': {
+        validatePresentationRecord(command.document);
+        await this.write(
+          [presentationStatement(this.workspaceId, command.document)],
+          [{
+            kind: 'presentation',
+            id: command.document.presentationId,
+            taskId: command.document.ownerTaskId,
+            change: 'upsert',
+          }],
+          command.document.updatedAt,
+        );
+        return { ok: true, changed: true };
+      }
+      case 'deletePresentation': {
+        const results = await this.writeIfFirstChanged(
+          {
+            sql: 'DELETE FROM presentations WHERE workspace_id = ? AND presentation_id = ?',
+            params: [this.workspaceId, command.presentationId],
+          },
+          [],
+          { kind: 'presentation', id: command.presentationId, change: 'delete' },
+          new Date().toISOString(),
         );
         return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
       }
@@ -2809,7 +2985,169 @@ export class SqliteTaskRepository implements TaskRepository {
 type ChangeKind =
   | 'workspace' | 'workspace_location' | 'task' | 'turn' | 'message'
   | 'tool_call' | 'reasoning' | 'operation' | 'cancel_request' | 'send_receipt'
-  | 'runtime_claim';
+  | 'runtime_claim' | 'send_outbox' | 'presentation';
+
+interface SendOutboxRow {
+  client_request_id: string;
+  status: string;
+  task_id: string | null;
+  payload_json: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface PresentationRow {
+  presentation_id: string;
+  owner_task_id: string;
+  root_id: string;
+  revision: number;
+  title: string;
+  markdown: string;
+  payload_json: string;
+  updated_at: string;
+}
+
+function validateSendOutboxEntry(entry: SendOutboxEntry): void {
+  if (!entry.clientRequestId || entry.clientRequestId.length > 512) {
+    throw new Error('send outbox clientRequestId invalid');
+  }
+  if (entry.status !== 'pending' && entry.status !== 'rejected') {
+    throw new Error('send outbox status invalid');
+  }
+  const payload = entry.payload;
+  if (!payload || payload.version !== SEND_OUTBOX_PAYLOAD_VERSION) {
+    throw new Error('send outbox payload version invalid');
+  }
+  if (typeof payload.text !== 'string' || payload.text.length === 0 || payload.text.length > SEND_OUTBOX_TEXT_MAX) {
+    throw new Error('send outbox text invalid');
+  }
+  if (payload.llmText !== undefined) {
+    if (typeof payload.llmText !== 'string' || payload.llmText.length > SEND_OUTBOX_TEXT_MAX) {
+      throw new Error('send outbox llmText invalid');
+    }
+  }
+  if (payload.skills && payload.skills.length > SEND_OUTBOX_SKILLS_MAX) {
+    throw new Error('send outbox skills bound exceeded');
+  }
+}
+
+function validatePresentationRecord(doc: PresentationRecord): void {
+  if (!doc.presentationId || doc.presentationId.length > 512) {
+    throw new Error('presentation id invalid');
+  }
+  if (!doc.ownerTaskId || !doc.rootId) throw new Error('presentation owner/root required');
+  if (!Number.isSafeInteger(doc.revision) || doc.revision < 1) {
+    throw new Error('presentation revision invalid');
+  }
+  if (!doc.title || doc.title.length > 512) throw new Error('presentation title invalid');
+  if (!doc.markdown || doc.markdown.length > 100_000) {
+    throw new Error('presentation markdown invalid');
+  }
+}
+
+function sendOutboxStatement(workspaceId: string, entry: SendOutboxEntry): SqlStatement {
+  return {
+    sql: `INSERT INTO send_outbox
+          (workspace_id, client_request_id, status, task_id, payload_json, created_at, updated_at)
+          VALUES (?,?,?,?,?,?,?)
+          ON CONFLICT(workspace_id, client_request_id) DO UPDATE SET
+            status = excluded.status,
+            task_id = excluded.task_id,
+            payload_json = excluded.payload_json,
+            updated_at = excluded.updated_at`,
+    params: [
+      workspaceId,
+      entry.clientRequestId,
+      entry.status,
+      entry.taskId ?? null,
+      JSON.stringify(entry.payload),
+      entry.createdAt,
+      entry.updatedAt,
+    ],
+  };
+}
+
+function presentationStatement(workspaceId: string, doc: PresentationRecord): SqlStatement {
+  const payload = {
+    summary: doc.summary,
+    changeSummary: doc.changeSummary,
+    kind: doc.kind,
+    sourcePath: doc.sourcePath,
+    sourceFolderUri: doc.sourceFolderUri,
+    opFingerprint: doc.opFingerprint,
+  };
+  return {
+    sql: `INSERT INTO presentations
+          (workspace_id, presentation_id, owner_task_id, root_id, revision, title, markdown, payload_json, updated_at)
+          VALUES (?,?,?,?,?,?,?,?,?)
+          ON CONFLICT(workspace_id, presentation_id) DO UPDATE SET
+            owner_task_id = excluded.owner_task_id,
+            root_id = excluded.root_id,
+            revision = excluded.revision,
+            title = excluded.title,
+            markdown = excluded.markdown,
+            payload_json = excluded.payload_json,
+            updated_at = excluded.updated_at`,
+    params: [
+      workspaceId,
+      doc.presentationId,
+      doc.ownerTaskId,
+      doc.rootId,
+      doc.revision,
+      doc.title,
+      doc.markdown,
+      JSON.stringify(payload),
+      doc.updatedAt,
+    ],
+  };
+}
+
+function decodeSendOutboxRow(row: SendOutboxRow): SendOutboxEntry {
+  let payload: SendOutboxPayloadV1;
+  try {
+    payload = JSON.parse(row.payload_json) as SendOutboxPayloadV1;
+  } catch {
+    throw new Error('send outbox payload corrupt');
+  }
+  if (!payload || payload.version !== SEND_OUTBOX_PAYLOAD_VERSION || typeof payload.text !== 'string') {
+    throw new Error('send outbox payload invalid');
+  }
+  if (row.status !== 'pending' && row.status !== 'rejected') {
+    throw new Error('send outbox status corrupt');
+  }
+  return {
+    clientRequestId: row.client_request_id,
+    status: row.status,
+    ...(row.task_id ? { taskId: row.task_id } : {}),
+    payload,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function decodePresentationRow(row: PresentationRow): PresentationRecord {
+  let extra: Record<string, unknown> = {};
+  try {
+    extra = JSON.parse(row.payload_json) as Record<string, unknown>;
+  } catch {
+    throw new Error('presentation payload corrupt');
+  }
+  return {
+    presentationId: row.presentation_id,
+    ownerTaskId: row.owner_task_id,
+    rootId: row.root_id,
+    revision: row.revision,
+    title: row.title,
+    markdown: row.markdown,
+    updatedAt: row.updated_at,
+    ...(typeof extra.summary === 'string' ? { summary: extra.summary } : {}),
+    ...(typeof extra.changeSummary === 'string' ? { changeSummary: extra.changeSummary } : {}),
+    ...(typeof extra.kind === 'string' ? { kind: extra.kind } : {}),
+    ...(typeof extra.sourcePath === 'string' ? { sourcePath: extra.sourcePath } : {}),
+    ...(typeof extra.sourceFolderUri === 'string' ? { sourceFolderUri: extra.sourceFolderUri } : {}),
+    ...(typeof extra.opFingerprint === 'string' ? { opFingerprint: extra.opFingerprint } : {}),
+  };
+}
 
 interface ChangeRecord {
   kind: ChangeKind;

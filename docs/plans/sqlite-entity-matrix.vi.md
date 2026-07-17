@@ -55,6 +55,8 @@ are deleted/reclaimed transactionally with the owning turn.
 | `TaskStoreFile.tasks`, `turns`, `messages`, `toolCalls`, `reasoning`, `operations`, `cancelRequests`, `sendReceipts`, `runtimeClaims` | Các normalized tables liệt kê trong tài liệu này | Chỉ là projection nội bộ theo phạm vi task, không có full-workspace export API. |
 | Incremental invalidation | `change_log(workspace_id, revision, entity_kind, entity_id, task_id, change_kind, created_at)` | Metadata feed, không chứa prompt/tool payload hay secret. |
 | Change-feed low watermark | `change_feed_watermarks(workspace_id, retained_from_revision)` | Explicit retained-from revision for gap detection (not MIN(change_log) alone). |
+| Durable send outbox | `send_outbox(workspace_id, client_request_id, status, task_id, payload_json, …)` | Pending/rejected user sends; webview setState must not hold text. |
+| Presentation documents | `presentations(workspace_id, presentation_id, owner_task_id, root_id, revision, title, markdown, …)` | Canonical presentation durability; serializer keeps opaque IDs only. |
 
 ## Codec and audit rules
 

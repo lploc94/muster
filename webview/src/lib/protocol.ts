@@ -475,11 +475,31 @@ export type ExtMessage =
   | { type: 'skillsAvailable'; backend: string; prefix: string; skills: string[] }
   | { type: 'modelsAvailable'; models: Record<string, BackendModels> }
   /**
-   * Host-persisted last-used composer backend/model (globalState). Sent on
-   * webview mount so the picker survives restarts — webview `setState` alone
-   * is not durable enough when the view is recreated.
+   * Host-persisted last-used composer backend/model (VS Code Settings). Sent on
+   * webview mount so the picker survives restarts — webview `setState` must not
+   * store backend/model.
    */
   | { type: 'composerSelection'; backend: string; model: string | null }
+  /**
+   * Durable SQLite send-outbox snapshot for reload restore. Webview keeps these
+   * in memory only; setState must never hold message text.
+   */
+  | {
+      type: 'sendOutboxSnapshot';
+      entries: Array<{
+        clientRequestId: string;
+        status: 'pending' | 'rejected';
+        taskId?: string;
+        text: string;
+        llmText?: string;
+        mentionBindings?: Array<[string, string]>;
+        skills?: string[];
+        backend?: string;
+        model?: string;
+        continuationOf?: string;
+        createdAt: number;
+      }>;
+    }
   /**
    * Task Markdown export succeeded. `fileName` is basename only — never an
    * absolute path. Failures use `commandError`; cancel is intentionally silent.
@@ -688,6 +708,8 @@ export type OutMessage =
    * so the preference survives full restarts and webview recreation.
    */
   | { type: 'setComposerSelection'; backend: string; model?: string | null }
+  /** Prefill-applied: delete durable rejected outbox entry in SQLite. */
+  | { type: 'ackSendOutbox'; clientRequestId: string }
   /** User sets task lifecycle (not CLI-driven). */
   | {
       type: 'setTaskLifecycle';
@@ -1579,6 +1601,22 @@ export function isExtMessage(data: unknown): data is ExtMessage {
         hasOnlyKeys(data, ['type', 'backend', 'model']) &&
         isString(data.backend) &&
         (data.model === null || isString(data.model))
+      );
+
+    case 'sendOutboxSnapshot':
+      return (
+        hasOnlyKeys(data, ['type', 'entries']) &&
+        Array.isArray(data.entries) &&
+        data.entries.every(
+          (entry) =>
+            typeof entry === 'object' &&
+            entry !== null &&
+            isString((entry as { clientRequestId?: unknown }).clientRequestId) &&
+            ((entry as { status?: unknown }).status === 'pending' ||
+              (entry as { status?: unknown }).status === 'rejected') &&
+            isString((entry as { text?: unknown }).text) &&
+            typeof (entry as { createdAt?: unknown }).createdAt === 'number',
+        )
       );
 
     case 'exportResult':

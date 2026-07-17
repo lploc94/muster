@@ -60,6 +60,8 @@ describe('openStoreDatabase', () => {
       expect(tables).toContain('reasoning_segments');
       expect(tables).toContain('change_log');
       expect(tables).toContain('change_feed_watermarks');
+      expect(tables).toContain('send_outbox');
+      expect(tables).toContain('presentations');
       expect(tables).not.toContain('migration_state');
       expect(tables).toContain('turn_inputs');
       expect(tables).toContain('session_claims');

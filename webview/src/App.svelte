@@ -40,7 +40,7 @@
     type WorkspacePatchViewState,
   } from './lib/workspace-patch-reducer';
   import { tip } from './lib/tooltip';
-  import { outboxList, outboxMarkRejected, outboxPending, outboxRejected, outboxRemove } from './lib/send-outbox';
+  import { outboxList, outboxMarkRejected, outboxPending, outboxRejected, outboxRemove, outboxReplaceAll } from './lib/send-outbox';
   import { selectTask as navSelectTask } from './lib/task-nav';
   import {
     DATA_RUNTIME_STORAGE_IDS,
@@ -895,6 +895,27 @@
         case 'composerSelection':
           tasks.applyHostComposerSelection(msg.backend, msg.model);
           break;
+
+        case 'sendOutboxSnapshot': {
+          outboxReplaceAll(msg.entries);
+          // Restore rejected drafts for the current scope; pending entries replay after snapshot.
+          for (const entry of outboxRejected()) {
+            const sameScope =
+              (!entry.taskId && tasks.draftMode) ||
+              (!!entry.taskId && entry.taskId === tasks.focusedTaskId);
+            if (sameScope && entry.text) {
+              tasks.prefillComposer(
+                entry.text,
+                entry.clientRequestId,
+                entry.mentionBindings,
+                entry.skills,
+                entry.backend,
+              );
+              break;
+            }
+          }
+          break;
+        }
       }
     }
 
@@ -902,6 +923,7 @@
       const id = (e as CustomEvent<{ clientRequestId?: string }>).detail?.clientRequestId;
       if (typeof id === 'string' && id) {
         outboxRemove(vscode, id);
+        post({ type: 'ackSendOutbox', clientRequestId: id });
       }
     }
 

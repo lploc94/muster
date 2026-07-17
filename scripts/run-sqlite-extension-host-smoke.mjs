@@ -47,7 +47,9 @@ async function main() {
   zip.extractAllTo(extractedRoot, true);
   const extensionDevelopmentPath = path.join(extractedRoot, 'extension');
   const workspacePath = path.join(tempDir, 'workspace');
+  const userDataDir = path.join(tempDir, 'user-data');
   fs.mkdirSync(workspacePath, { recursive: true });
+  fs.mkdirSync(userDataDir, { recursive: true });
 
   await runTests({
     ...(vscodeExecutablePath ? { vscodeExecutablePath } : { version }),
@@ -60,6 +62,9 @@ async function main() {
     },
     launchArgs: [
       workspacePath,
+      // Fresh user-data so globalStorage/muster.sqlite3 is blank current schema
+      // (no leftover incompatible user_version from prior smoke runs).
+      `--user-data-dir=${userDataDir}`,
       '--disable-workspace-trust',
       '--skip-welcome',
       '--skip-release-notes',

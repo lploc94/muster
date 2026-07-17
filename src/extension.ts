@@ -406,7 +406,6 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
-    private readonly _globalState: vscode.Memento,
   ) {}
 
   private post(message: unknown): void {
@@ -889,9 +888,13 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'skillsAvailable', backend, prefix, skills });
   }
 
-  /** Push host-persisted last-used backend/model so the picker survives restarts. */
-  private postComposerSelection(): void {
-    const selection = readComposerSelection(this._globalState);
+  /** Push Settings-backed last-used backend/model so the picker survives restarts. */
+  postComposerSelection(): void {
+    const selection = readComposerSelection({
+      get: (key) => vscode.workspace.getConfiguration().get(key),
+      update: (key, value, target) =>
+        vscode.workspace.getConfiguration().update(key, value, target as vscode.ConfigurationTarget),
+    });
     if (!selection) return;
     this.post({
       type: 'composerSelection',
@@ -906,7 +909,17 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       model: data.model === undefined ? null : data.model,
     });
     if (!selection) return;
-    void writeComposerSelection(this._globalState, selection);
+    void writeComposerSelection(
+      {
+        get: (key) => vscode.workspace.getConfiguration().get(key),
+        update: (key, value, target) =>
+          vscode.workspace
+            .getConfiguration()
+            .update(key, value, target as vscode.ConfigurationTarget),
+      },
+      selection,
+      vscode.ConfigurationTarget.Global,
+    );
   }
 
   /**
@@ -1668,12 +1681,13 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     /** Structured skill chips for a NEW task's first-turn injection. */
     skills?: string[];
     clientRequestId?: string;
+    mentionBindings?: Array<[string, string]>;
   }): Promise<void> {
     const clientRequestId =
       typeof data.clientRequestId === 'string' && data.clientRequestId.trim()
         ? data.clientRequestId.trim()
         : undefined;
-    if (!taskEngine || !taskStore) {
+    if (!taskEngine || !taskStore || !taskRepository) {
       if (clientRequestId) {
         this.post({
           type: 'sendRejected',
@@ -1716,6 +1730,46 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         this.postCommandError('message cannot be empty', data.taskId);
       }
       return;
+    }
+    // Durable outbox before processing so crash/reload can restore the draft.
+    if (clientRequestId && taskRepository) {
+      const now = new Date().toISOString();
+      try {
+        await taskRepository.execute({
+          kind: 'putSendOutbox',
+          workspaceId: repositoryWorkspaceId(),
+          entry: {
+            clientRequestId,
+            status: 'pending',
+            ...(data.taskId ? { taskId: data.taskId } : {}),
+            payload: {
+              version: 1,
+              text,
+              ...(typeof data.llmText === 'string' && data.llmText.trim()
+                ? { llmText: data.llmText.trim() }
+                : {}),
+              ...(Array.isArray(data.mentionBindings) ? { mentionBindings: data.mentionBindings } : {}),
+              ...(Array.isArray(data.skills) ? { skills: data.skills } : {}),
+              ...(typeof data.backend === 'string' ? { backend: data.backend } : {}),
+              ...(typeof data.model === 'string' ? { model: data.model } : {}),
+              ...(typeof data.continuationOf === 'string'
+                ? { continuationOf: data.continuationOf }
+                : {}),
+            },
+            createdAt: now,
+            updatedAt: now,
+          },
+        });
+      } catch {
+        this.post({
+          type: 'sendRejected',
+          clientRequestId,
+          taskId: data.taskId,
+          reason: 'unable to durably queue send',
+          code: 'store',
+        });
+        return;
+      }
     }
     if (text.length > MAX_MESSAGE_CHARS) {
       if (clientRequestId) {
@@ -1891,6 +1945,18 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           : /capacity|maxTurns|turn cap/i.test(result.reason)
             ? 'capacity'
             : 'unknown';
+        if (taskRepository) {
+          try {
+            await taskRepository.execute({
+              kind: 'markSendOutboxRejected',
+              workspaceId: repositoryWorkspaceId(),
+              clientRequestId,
+              updatedAt: new Date().toISOString(),
+            });
+          } catch {
+            // still surface rejection to webview
+          }
+        }
         this.post({
           type: 'sendRejected',
           clientRequestId,
@@ -1904,6 +1970,18 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       return;
     }
     if (clientRequestId && result.value.messageId) {
+      // Receipt already durable via send path; ACK only after outbox delete succeeds.
+      if (taskRepository) {
+        try {
+          await taskRepository.execute({
+            kind: 'deleteSendOutbox',
+            workspaceId: repositoryWorkspaceId(),
+            clientRequestId,
+          });
+        } catch {
+          // Keep outbox so reload can de-dupe via send receipt + clientRequestId.
+        }
+      }
       this.post({
         type: 'sendAccepted',
         clientRequestId,
@@ -1913,6 +1991,32 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       });
     }
     // Transcript/queue/activity publish via onAfterCommit workspacePatchBatch.
+  }
+
+  /** Push durable SQLite outbox entries so webview can restore drafts after reload. */
+  private async postSendOutboxSnapshot(): Promise<void> {
+    if (!taskRepository) return;
+    try {
+      const entries = await taskRepository.listSendOutbox();
+      this.post({
+        type: 'sendOutboxSnapshot',
+        entries: entries.map((entry) => ({
+          clientRequestId: entry.clientRequestId,
+          status: entry.status,
+          taskId: entry.taskId,
+          text: entry.payload.text,
+          llmText: entry.payload.llmText,
+          mentionBindings: entry.payload.mentionBindings,
+          skills: entry.payload.skills,
+          backend: entry.payload.backend,
+          model: entry.payload.model,
+          continuationOf: entry.payload.continuationOf,
+          createdAt: Date.parse(entry.createdAt) || Date.now(),
+        })),
+      });
+    } catch {
+      // best-effort restore
+    }
   }
 
   /**
@@ -2567,6 +2671,20 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         case 'setComposerSelection':
           this.handleSetComposerSelection(data);
           break;
+        case 'ackSendOutbox': {
+          const id =
+            typeof (data as { clientRequestId?: unknown }).clientRequestId === 'string'
+              ? (data as { clientRequestId: string }).clientRequestId.trim()
+              : '';
+          if (id && taskRepository) {
+            void taskRepository.execute({
+              kind: 'deleteSendOutbox',
+              workspaceId: repositoryWorkspaceId(),
+              clientRequestId: id,
+            });
+          }
+          break;
+        }
         default:
           // Unknown inbound type: log instead of silently ignoring. This surfaces
           // host<->webview protocol drift (e.g. a newer webview sending a message
@@ -2583,10 +2701,10 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     void this.postAvailableBackends();
     // Prefetch model catalog so New task can show [Backend] Model options promptly.
     void this.postAvailableModels();
-    // Restore last-used backend/model from globalState (survives full restarts).
-    // Posted after availability so the webview can re-apply preference once the
-    // picker list is known; applyHostComposerSelection does not require it.
+    // Restore last-used backend/model from VS Code Settings (survives restarts).
     this.postComposerSelection();
+    // Restore durable SQLite send outbox into webview memory (no setState text).
+    void this.postSendOutboxSnapshot();
   }
 
   private _getHtmlForWebview(webview: vscode.Webview): string {
@@ -2707,7 +2825,14 @@ export async function activate(context: vscode.ExtensionContext) {
     throw new Error(message);
   }
 
-  const provider = new MusterChatProvider(context.extensionUri, context.globalState);
+  const provider = new MusterChatProvider(context.extensionUri);
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration('muster.composerSelection')) {
+        provider.postComposerSelection();
+      }
+    }),
+  );
   context.subscriptions.push({
     dispose: () => provider.disposeRevisionPoller(),
   });
@@ -2910,6 +3035,7 @@ export async function activate(context: vscode.ExtensionContext) {
     if (cur.role === 'coordinator' && cur.parentId === null) return cur.id;
     return undefined;
   });
+  // Wire SQLite document store after engine load (below); provisional no-op until then.
   context.subscriptions.push(
     vscode.window.registerWebviewPanelSerializer(
       'muster.presentation',
@@ -3241,6 +3367,46 @@ export async function activate(context: vscode.ExtensionContext) {
     // every successful repository mutation is visible to synchronous UI selectors.
     taskStore = taskEngine.getReadModel();
     taskRepository = taskEngine.getRepository();
+    presentationManager?.setDocumentStore({
+      getPresentation: async (presentationId) => {
+        const row = await taskRepository!.getPresentation(presentationId);
+        if (!row) return undefined;
+        return {
+          presentationId: row.presentationId,
+          ownerTaskId: row.ownerTaskId,
+          revision: row.revision,
+          title: row.title,
+          markdown: row.markdown,
+          ...(row.kind ? { kind: row.kind as 'plan' | 'spec' | 'document' } : {}),
+          ...(row.summary ? { summary: row.summary } : {}),
+          ...(row.changeSummary ? { changeSummary: row.changeSummary } : {}),
+          ...(row.sourcePath ? { sourcePath: row.sourcePath } : {}),
+          ...(row.sourceFolderUri ? { sourceFolderUri: row.sourceFolderUri } : {}),
+          ...(row.updatedAt ? { updatedAt: row.updatedAt } : {}),
+        };
+      },
+      putPresentation: async (document) => {
+        await taskRepository!.execute({
+          kind: 'putPresentation',
+          workspaceId: repositoryWorkspaceId(),
+          document: {
+            presentationId: document.presentationId,
+            ownerTaskId: document.ownerTaskId,
+            rootId: document.rootId,
+            revision: document.revision,
+            title: document.title,
+            markdown: document.markdown,
+            updatedAt: document.updatedAt,
+            ...(document.summary ? { summary: document.summary } : {}),
+            ...(document.changeSummary ? { changeSummary: document.changeSummary } : {}),
+            ...(document.kind ? { kind: document.kind } : {}),
+            ...(document.sourcePath ? { sourcePath: document.sourcePath } : {}),
+            ...(document.sourceFolderUri ? { sourceFolderUri: document.sourceFolderUri } : {}),
+            ...(document.opFingerprint ? { opFingerprint: document.opFingerprint } : {}),
+          },
+        });
+      },
+    });
     scheduleRetention();
     context.subscriptions.push(
       vscode.workspace.onDidGrantWorkspaceTrust(() => {

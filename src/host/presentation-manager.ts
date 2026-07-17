@@ -102,10 +102,16 @@ export function configurePresentationPanel<T extends { dispose(): void }, R>(
   }
 }
 
+/** Opaque serializer handle — SQLite is canonical document storage. */
 export interface PersistedPresentationState {
   rootId: string;
-  document: PresentationDocument;
+  presentationId: string;
 }
+
+export type PresentationDocumentStore = {
+  getPresentation(presentationId: string): Promise<PresentationDocument | undefined>;
+  putPresentation(document: PresentationDocument & { rootId: string; updatedAt: string; opFingerprint?: string }): Promise<void>;
+};
 
 export type PresentationResult =
   | { ok: true; code: 'opened' | 'idempotent' | 'restored' }
@@ -198,14 +204,9 @@ function parseDocumentFields(raw: Record<string, unknown>): PresentationDocument
 function parsePersistedState(value: unknown): PersistedPresentationState | undefined {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
   const raw = value as Record<string, unknown>;
-  if (Object.keys(raw).some((k) => k !== 'rootId' && k !== 'document')) return undefined;
-  if (!isStableId(raw.rootId)) return undefined;
-  if (typeof raw.document !== 'object' || raw.document === null || Array.isArray(raw.document)) {
-    return undefined;
-  }
-  const document = parseDocumentFields(raw.document as Record<string, unknown>);
-  if (!document) return undefined;
-  return { rootId: raw.rootId, document };
+  // Accept only opaque ID handles. Full document restore from serializer is rejected.
+  if (!isStableId(raw.rootId) || !isStableId(raw.presentationId)) return undefined;
+  return { rootId: raw.rootId, presentationId: raw.presentationId };
 }
 
 /** Fingerprint coordinator-owned fields only (excludes host stamps). */
@@ -288,12 +289,37 @@ export class PresentationManager {
   private readonly panels = new Map<string, PanelEntry>();
   private readonly operations = new Map<string, string>();
   private ownerResolver: OwnerResolver | undefined;
+  private documentStore: PresentationDocumentStore | undefined;
 
   constructor(private readonly factory: PresentationPanelFactory) {}
 
   /** Resolve an owner task to its authenticated root during restore validation. */
   setOwnerResolver(resolver: OwnerResolver | undefined): void {
     this.ownerResolver = resolver;
+  }
+
+  /** SQLite-backed presentation document store (required for restart restore). */
+  setDocumentStore(store: PresentationDocumentStore | undefined): void {
+    this.documentStore = store;
+  }
+
+  private async persistDocument(
+    rootId: string,
+    document: PresentationDocument,
+    opFingerprint?: string,
+  ): Promise<boolean> {
+    if (!this.documentStore) return true;
+    try {
+      await this.documentStore.putPresentation({
+        ...document,
+        rootId,
+        updatedAt: document.updatedAt ?? new Date().toISOString(),
+        ...(opFingerprint ? { opFingerprint } : {}),
+      });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -419,6 +445,8 @@ export class PresentationManager {
       if (document.revision <= existing.document.revision) {
         return { ok: false, code: 'stale_revision' };
       }
+      const durable = await this.persistDocument(context.rootId, document, fingerprint);
+      if (!durable) return { ok: false, code: 'host_delivery_failed' };
       let accepted = false;
       try {
         accepted = await existing.panel.update(document, context.rootId);
@@ -445,10 +473,15 @@ export class PresentationManager {
 
   async restore(panel: PresentationPanel, state: unknown): Promise<PresentationResult> {
     const parsed = parsePersistedState(state);
-    if (!parsed) {
+    if (!parsed || !this.documentStore) {
       return { ok: false, code: 'restore_rejected' };
     }
-    const { rootId, document } = parsed;
+    const { rootId, presentationId } = parsed;
+    const loaded = await this.documentStore.getPresentation(presentationId);
+    if (!loaded) {
+      return { ok: false, code: 'restore_rejected' };
+    }
+    const document = loaded;
 
     // When resolver is wired: require owner maps to the envelope rootId (fail closed).
     if (this.ownerResolver) {
@@ -530,6 +563,8 @@ export class PresentationManager {
     key: string,
     document: PresentationDocument,
   ): Promise<PresentationResult> {
+    const durable = await this.persistDocument(rootId, document);
+    if (!durable) return { ok: false, code: 'host_delivery_failed' };
     let panel: PresentationPanel;
     try {
       panel = this.factory.create(document);

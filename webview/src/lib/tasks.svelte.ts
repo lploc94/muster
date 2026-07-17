@@ -115,22 +115,8 @@ class TasksState {
   private prefillNonceSeq = 0;
 
   constructor() {
-    // Restore the last-used backend/model from webview state (persists across reloads).
-    // Host globalState may overwrite this shortly via applyHostComposerSelection.
-    try {
-      const saved = vscode.getState() as { selectedBackend?: unknown; selectedModel?: unknown } | undefined;
-      const be = saved?.selectedBackend;
-      if (be === 'claude' || be === 'grok' || be === 'kiro' || be === 'codex' || be === 'opencode') {
-        this.preferredBackend = be;
-        this.selectedBackend = be;
-      }
-      if (typeof saved?.selectedModel === 'string') {
-        this.preferredModel = saved.selectedModel;
-        this.selectedModel = saved.selectedModel;
-      }
-    } catch {
-      // best-effort — fall back to defaults
-    }
+    // Selection is durable only via host VS Code Settings (composerSelection).
+    // Webview setState must not persist backend/model.
   }
 
   get rootTasks(): TaskSummary[] {
@@ -204,7 +190,6 @@ class TasksState {
     this.preferredBackend = backend;
     this.preferredModel = typeof model === 'string' && model.length > 0 ? model : null;
     this.syncDisplaySelection();
-    this.persistLocalSelection();
   }
 
   /**
@@ -231,26 +216,12 @@ class TasksState {
   }
 
   private persistSelection(): void {
-    this.persistLocalSelection();
-    // Durable copy on the host — webview setState alone is lost on full restart.
+    // Durable Settings only — never webview setState for backend/model.
     try {
       vscode.postMessage({
         type: 'setComposerSelection',
         backend: this.preferredBackend,
         model: this.preferredModel,
-      });
-    } catch {
-      // best-effort
-    }
-  }
-
-  private persistLocalSelection(): void {
-    try {
-      const prev = (vscode.getState() as Record<string, unknown> | undefined) ?? {};
-      vscode.setState({
-        ...prev,
-        selectedBackend: this.preferredBackend,
-        selectedModel: this.preferredModel,
       });
     } catch {
       // best-effort
