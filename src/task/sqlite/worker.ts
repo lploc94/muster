@@ -5,14 +5,19 @@
  * SQLite work — which is synchronous and would otherwise freeze the VS Code event
  * loop under a `busy_timeout` stall — happens here. The host talks to it purely via
  * the typed {@link DbRequest}/{@link DbResponse} RPC over `parentPort`.
+ *
+ * Backup (P5-W4) may await the native `node:sqlite.backup` Promise; FIFO ordering
+ * is preserved by serializing message handling (one in-flight handle at a time).
  */
 import { parentPort, workerData } from 'node:worker_threads';
 import type { DatabaseSync } from 'node:sqlite';
 import { openStoreDatabase } from './connection';
+import { backupOpenDatabase } from './backup';
 import type { DbRequest, DbResponse, RunResult, SqlValue } from './rpc';
 import { isAllowedReadPragma, serializeError } from './rpc';
 import type { SqliteOperationClass, SqliteWorkerData } from './errors';
-import { bootstrapFaultCapability, maybeInjectFault } from './fault-inject';
+import { MusterInvariantError } from './errors';
+import { bootstrapFaultCapability, isFaultCapabilityEnabled, maybeInjectFault } from './fault-inject';
 
 if (!parentPort) {
   throw new Error('sqlite worker must be spawned as a worker_thread');
@@ -22,6 +27,10 @@ const port = parentPort;
 bootstrapFaultCapability(workerData as SqliteWorkerData | undefined);
 
 let db: DatabaseSync | undefined;
+/** Path of the currently open store (needed for backup source-identity checks). */
+let openPath: string | undefined;
+/** Serialize handlers so async backup does not interleave with other RPC. */
+let chain: Promise<void> = Promise.resolve();
 
 function normalizeRowid(value: number | bigint): number {
   return typeof value === 'bigint' ? Number(value) : value;
@@ -58,6 +67,8 @@ function operationFor(req: DbRequest): SqliteOperationClass {
       return 'write';
     case 'transaction':
       return 'transaction';
+    case 'backup':
+      return 'backup';
     default: {
       const _exhaustive: never = req;
       return _exhaustive;
@@ -65,14 +76,110 @@ function operationFor(req: DbRequest): SqliteOperationClass {
   }
 }
 
-function handle(req: DbRequest): DbResponse {
+/**
+ * Exact backup-request guard (P5-W4). Rejects extra keys and invalid optional
+ * fields before any filesystem/SQLite work.
+ */
+function parseBackupRequest(req: Extract<DbRequest, { kind: 'backup' }>): {
+  destinationPath: string;
+  overwrite: boolean;
+  cancellationFlag?: SharedArrayBuffer;
+  forceMechanism?: 'api' | 'vacuum';
+  armCancelAfterSnapshot?: boolean;
+  corruptBeforeVerify?: boolean;
+  failBeforePublish?: boolean;
+  failDuringPublish?: boolean;
+  progressFlag?: SharedArrayBuffer;
+} {
+  const allowed = new Set([
+    'kind',
+    'requestId',
+    'destinationPath',
+    'overwrite',
+    'cancellationFlag',
+    'forceMechanism',
+    'armCancelAfterSnapshot',
+    'corruptBeforeVerify',
+    'failBeforePublish',
+    'failDuringPublish',
+    'progressFlag',
+  ]);
+  for (const key of Object.keys(req)) {
+    if (!allowed.has(key)) {
+      throw new MusterInvariantError('protocol', 'backup');
+    }
+  }
+  if (!Number.isSafeInteger(req.requestId) || req.requestId < 1) {
+    throw new MusterInvariantError('protocol', 'backup');
+  }
+  if (typeof req.destinationPath !== 'string' || req.destinationPath.trim() === '') {
+    throw new MusterInvariantError('protocol', 'backup');
+  }
+  if (typeof req.overwrite !== 'boolean') {
+    throw new MusterInvariantError('protocol', 'backup');
+  }
+  let cancellationFlag: SharedArrayBuffer | undefined;
+  if (req.cancellationFlag !== undefined) {
+    if (!(req.cancellationFlag instanceof SharedArrayBuffer)) {
+      throw new MusterInvariantError('protocol', 'backup');
+    }
+    if (req.cancellationFlag.byteLength !== Int32Array.BYTES_PER_ELEMENT) {
+      throw new MusterInvariantError('protocol', 'backup');
+    }
+    cancellationFlag = req.cancellationFlag;
+  }
+  let progressFlag: SharedArrayBuffer | undefined;
+  if (req.progressFlag !== undefined) {
+    if (!(req.progressFlag instanceof SharedArrayBuffer)) {
+      throw new MusterInvariantError('protocol', 'backup');
+    }
+    if (req.progressFlag.byteLength !== Int32Array.BYTES_PER_ELEMENT) {
+      throw new MusterInvariantError('protocol', 'backup');
+    }
+    progressFlag = req.progressFlag;
+  }
+  if (
+    req.forceMechanism !== undefined &&
+    req.forceMechanism !== 'api' &&
+    req.forceMechanism !== 'vacuum'
+  ) {
+    throw new MusterInvariantError('protocol', 'backup');
+  }
+  for (const flag of [
+    'armCancelAfterSnapshot',
+    'corruptBeforeVerify',
+    'failBeforePublish',
+    'failDuringPublish',
+  ] as const) {
+    const value = req[flag];
+    if (value !== undefined && value !== true) {
+      throw new MusterInvariantError('protocol', 'backup');
+    }
+  }
+  return {
+    destinationPath: req.destinationPath,
+    overwrite: req.overwrite,
+    ...(cancellationFlag ? { cancellationFlag } : {}),
+    ...(req.forceMechanism ? { forceMechanism: req.forceMechanism } : {}),
+    ...(req.armCancelAfterSnapshot ? { armCancelAfterSnapshot: true } : {}),
+    ...(req.corruptBeforeVerify ? { corruptBeforeVerify: true } : {}),
+    ...(req.failBeforePublish ? { failBeforePublish: true } : {}),
+    ...(req.failDuringPublish ? { failDuringPublish: true } : {}),
+    ...(progressFlag ? { progressFlag } : {}),
+  };
+}
+
+async function handle(req: DbRequest): Promise<DbResponse> {
   switch (req.kind) {
     case 'open': {
       maybeInjectFault('open');
       if (db) {
         db.close();
+        db = undefined;
+        openPath = undefined;
       }
       db = openStoreDatabase({ path: req.path, busyTimeoutMs: req.busyTimeoutMs });
+      openPath = req.path;
       return { kind: 'ok', requestId: req.requestId };
     }
     case 'all': {
@@ -134,10 +241,35 @@ function handle(req: DbRequest): DbResponse {
       const value = row ? (Object.values(row)[0] as number) : 0;
       return { kind: 'scalar', requestId: req.requestId, value: typeof value === 'number' ? value : 0 };
     }
+    case 'backup': {
+      const conn = requireDb();
+      if (!openPath) {
+        throw new MusterInvariantError('invariant', 'backup');
+      }
+      const parsed = parseBackupRequest(req);
+      const testOpts = isFaultCapabilityEnabled()
+        ? {
+            ...(parsed.forceMechanism ? { forceMechanism: parsed.forceMechanism } : {}),
+            ...(parsed.armCancelAfterSnapshot ? { armCancelAfterSnapshot: true } : {}),
+            ...(parsed.corruptBeforeVerify ? { corruptBeforeVerify: true } : {}),
+            ...(parsed.failBeforePublish ? { failBeforePublish: true } : {}),
+            ...(parsed.failDuringPublish ? { failDuringPublish: true } : {}),
+            ...(parsed.progressFlag ? { progressFlag: parsed.progressFlag } : {}),
+          }
+        : {};
+      const result = await backupOpenDatabase(conn, openPath, {
+        destinationPath: parsed.destinationPath,
+        overwrite: parsed.overwrite,
+        ...(parsed.cancellationFlag ? { cancellationFlag: parsed.cancellationFlag } : {}),
+        ...testOpts,
+      });
+      return { kind: 'backup', requestId: req.requestId, result };
+    }
     case 'close': {
       if (db) {
         db.close();
         db = undefined;
+        openPath = undefined;
       }
       return { kind: 'ok', requestId: req.requestId };
     }
@@ -150,19 +282,25 @@ function handle(req: DbRequest): DbResponse {
 
 port.on('message', (req: DbRequest) => {
   const operation = operationFor(req);
-  try {
-    port.postMessage(handle(req));
-  } catch (error) {
-    const serialized = serializeError(error, operation);
-    const response: DbResponse = {
-      kind: 'error',
-      requestId: req.requestId,
-      message: serialized.message,
-      code: serialized.code,
-      name: serialized.name,
-      operation: serialized.operation,
-      errorKind: serialized.errorKind,
-    };
-    port.postMessage(response);
-  }
+  chain = chain
+    .then(async () => {
+      try {
+        port.postMessage(await handle(req));
+      } catch (error) {
+        const serialized = serializeError(error, operation);
+        const response: DbResponse = {
+          kind: 'error',
+          requestId: req.requestId,
+          message: serialized.message,
+          code: serialized.code,
+          name: serialized.name,
+          operation: serialized.operation,
+          errorKind: serialized.errorKind,
+        };
+        port.postMessage(response);
+      }
+    })
+    .catch(() => {
+      // Individual request errors are already posted; keep the chain alive.
+    });
 });

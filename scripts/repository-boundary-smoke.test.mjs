@@ -30,6 +30,7 @@ async function withMutatedTree(mutate, expectMatch) {
       'src/task/sqlite/protocol.ts',
       'src/task/sqlite/schema-fingerprint.ts',
       'src/task/sqlite/connection.ts',
+      'src/task/sqlite/backup.ts',
       'src/task/engine.ts',
       'src/extension.ts',
       'src/task/repository.ts',
@@ -206,4 +207,35 @@ export function serializeBoundaryError(error) {
 `,
     );
   }, /raw SQLite error\.message/i);
+});
+
+test('fails when backup.ts uses copyFile as the backup mechanism', async () => {
+  await withMutatedTree((dir) => {
+    const file = path.join(dir, 'src/task/sqlite/backup.ts');
+    writeFileSync(
+      file,
+      `
+import * as fs from 'node:fs';
+export function preferredBackupMechanism() { return 'vacuum'; }
+export function assertDestinationNotLiveSource() {}
+export function verifyBackupArtifact() {}
+export async function backupOpenDatabase(db, openPath, opts) {
+  fs.copyFileSync(openPath, opts.destinationPath);
+  return { mechanism: 'vacuum', schemaVersion: 7, workspaceRevision: 0, byteSize: 1 };
+}
+export function maybeInjectFault() {}
+`,
+    );
+  }, /must not copyFile|copyFile\/cp the live source/i);
+});
+
+test('fails when host module calls node:sqlite.backup', async () => {
+  await withMutatedTree((dir) => {
+    const file = path.join(dir, 'src/extension.ts');
+    const text = readFileSync(path.join(ROOT, 'src/extension.ts'), 'utf8');
+    writeFileSync(
+      file,
+      `import { backup, DatabaseSync } from 'node:sqlite';\n${text}\nvoid backup(new DatabaseSync(':memory:'), '/tmp/x');\n`,
+    );
+  }, /must not call node:sqlite\.backup on the host thread/i);
 });

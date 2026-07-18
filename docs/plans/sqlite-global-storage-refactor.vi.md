@@ -992,7 +992,15 @@ thường.
 không ACK giả, không mất row âm thầm; TypeScript, Svelte, webview build, full unit suite và
 source/repository boundaries xanh; ba commit W1/W2/W3 riêng, worktree sạch.
 
-#### P5-W4 — SQLite-aware live backup primitive
+#### P5-W4 — SQLite-aware live backup primitive ✅
+
+**Hoàn tất (2026-07-18):** live backup primitive qua DB worker RPC (`DbClient.backup` →
+`worker` → `backupOpenDatabase`). Runtime probe `node:sqlite.backup` (API, Node ≥22.16 /
+current stable EH); fallback `VACUUM INTO` trên minimum VS Code 1.101 (Node 22.15.1).
+Không raw-copy live main; temp sibling + atomic publish; verify read-only
+(`application_id`, `user_version`, schema fingerprint, `quick_check`, workspace revision);
+reject destination alias của live main/WAL/SHM; cancellation qua request-scoped
+`SharedArrayBuffer` Int32 (publication-safe sau snapshot cho VACUUM).
 
 - Spike API thực tế trên minimum/current VS Code Extension Host rồi chọn mechanism được
   runtime support: ưu tiên SQLite backup API; fallback chỉ được là SQLite-coordinated

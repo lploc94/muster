@@ -9,6 +9,7 @@ import { Worker } from 'node:worker_threads';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import type {
+  BackupResultMeta,
   DbRequest,
   DbResponse,
   RunResult,
@@ -196,7 +197,15 @@ export class DbClient {
       }
       this.pending.delete(parsed.requestId);
       const err = new DbWorkerError(parsed.payload);
-      if (isTerminalStorageCode(parsed.payload.code) || parsed.payload.code === 'protocol') {
+      // Artifact verification failures on backup must not latch the live source
+      // client (P5-W4): corrupt/not_a_database there refers to the temp artifact.
+      const terminalBackupArtifact =
+        parsed.payload.operation === 'backup' &&
+        isTerminalStorageCode(parsed.payload.code);
+      if (
+        (isTerminalStorageCode(parsed.payload.code) || parsed.payload.code === 'protocol') &&
+        !terminalBackupArtifact
+      ) {
         // Re-queue current request so latchFatal rejectAll settles it with peers.
         this.pending.set(parsed.requestId, pending);
         this.latchFatal(err);
@@ -295,6 +304,58 @@ export class DbClient {
       throw new DbWorkerError(makeProtocolError());
     }
     return res.value;
+  }
+
+  /**
+   * SQLite-aware live backup (P5-W4). All SQLite/filesystem work runs in the
+   * worker. Returns only redacted metadata — never paths or row content.
+   *
+   * `cancellationFlag` is a request-scoped SharedArrayBuffer holding one Int32
+   * (0=run, non-zero=cancel). The host marks it with Atomics.store; the worker
+   * observes it before work, during native progress, and before publication.
+   */
+  async backup(
+    destinationPath: string,
+    options: {
+      overwrite?: boolean;
+      cancellationFlag?: SharedArrayBuffer;
+      /** Test/UAT only — ignored without faultCapability. */
+      forceMechanism?: 'api' | 'vacuum';
+      armCancelAfterSnapshot?: boolean;
+      corruptBeforeVerify?: boolean;
+      failBeforePublish?: boolean;
+      failDuringPublish?: boolean;
+      progressFlag?: SharedArrayBuffer;
+    } = {},
+  ): Promise<BackupResultMeta> {
+    const res = await this.send({
+      kind: 'backup',
+      destinationPath,
+      overwrite: options.overwrite === true,
+      ...(options.cancellationFlag ? { cancellationFlag: options.cancellationFlag } : {}),
+      ...(this.faultCapability && options.forceMechanism
+        ? { forceMechanism: options.forceMechanism }
+        : {}),
+      ...(this.faultCapability && options.armCancelAfterSnapshot
+        ? { armCancelAfterSnapshot: true }
+        : {}),
+      ...(this.faultCapability && options.corruptBeforeVerify
+        ? { corruptBeforeVerify: true }
+        : {}),
+      ...(this.faultCapability && options.failBeforePublish
+        ? { failBeforePublish: true }
+        : {}),
+      ...(this.faultCapability && options.failDuringPublish
+        ? { failDuringPublish: true }
+        : {}),
+      ...(this.faultCapability && options.progressFlag
+        ? { progressFlag: options.progressFlag }
+        : {}),
+    });
+    if (res.kind !== 'backup') {
+      throw new DbWorkerError(makeProtocolError());
+    }
+    return res.result;
   }
 
   async close(): Promise<void> {

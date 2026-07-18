@@ -130,6 +130,43 @@ describe('strict RPC wire validation', () => {
     expect(
       parseWireSuccessResponse({ kind: 'row', requestId: 1, row: null }).ok,
     ).toBe(true);
+    expect(
+      parseWireSuccessResponse({
+        kind: 'backup',
+        requestId: 1,
+        result: {
+          mechanism: 'vacuum',
+          schemaVersion: 7,
+          workspaceRevision: 3,
+          byteSize: 1024,
+        },
+      }).ok,
+    ).toBe(true);
+    expect(
+      parseWireSuccessResponse({
+        kind: 'backup',
+        requestId: 1,
+        result: {
+          mechanism: 'api',
+          schemaVersion: 7,
+          workspaceRevision: 3,
+          byteSize: 0,
+        },
+      }).ok,
+    ).toBe(false);
+    expect(
+      parseWireSuccessResponse({
+        kind: 'backup',
+        requestId: 1,
+        result: {
+          mechanism: 'vacuum',
+          schemaVersion: 7,
+          workspaceRevision: 3,
+          byteSize: 1024,
+          path: '/secret',
+        },
+      }).ok,
+    ).toBe(false);
   });
 
   it('makeProtocolError is fixed and redacted', () => {

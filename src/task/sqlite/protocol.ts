@@ -15,7 +15,7 @@ import {
   type SqliteErrorCode,
   type SqliteOperationClass,
 } from './errors';
-import type { DbResponse, RunResult } from './rpc';
+import type { BackupResultMeta, DbResponse, RunResult } from './rpc';
 
 export function makeProtocolError(
   operation: SqliteOperationClass = 'unknown',
@@ -175,9 +175,48 @@ export function parseWireSuccessResponse(input: unknown): {
       }
       return { ok: true, response: { kind: 'scalar', requestId, value: obj.value } };
     }
+    case 'backup': {
+      if (!exactKeys(obj, ['kind', 'requestId', 'result'])) {
+        return { ok: false, payload: makeProtocolError() };
+      }
+      const result = parseBackupResult(obj.result);
+      if (!result) return { ok: false, payload: makeProtocolError() };
+      return { ok: true, response: { kind: 'backup', requestId, result } };
+    }
     default:
       return { ok: false, payload: makeProtocolError() };
   }
+}
+
+function parseBackupResult(value: unknown): BackupResultMeta | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const obj = value as Record<string, unknown>;
+  if (
+    !exactKeys(obj, ['mechanism', 'schemaVersion', 'workspaceRevision', 'byteSize'])
+  ) {
+    return undefined;
+  }
+  if (obj.mechanism !== 'api' && obj.mechanism !== 'vacuum') return undefined;
+  if (
+    !Number.isSafeInteger(obj.schemaVersion) ||
+    !Number.isSafeInteger(obj.workspaceRevision) ||
+    !Number.isSafeInteger(obj.byteSize)
+  ) {
+    return undefined;
+  }
+  if (
+    (obj.schemaVersion as number) < 0 ||
+    (obj.workspaceRevision as number) < 0 ||
+    (obj.byteSize as number) <= 0
+  ) {
+    return undefined;
+  }
+  return {
+    mechanism: obj.mechanism,
+    schemaVersion: obj.schemaVersion as number,
+    workspaceRevision: obj.workspaceRevision as number,
+    byteSize: obj.byteSize as number,
+  };
 }
 
 /**

@@ -241,9 +241,50 @@ export async function runRepositoryBoundarySmoke(rootDir = ROOT) {
   if (txnBlock && /maybeInjectFault\('transaction'\)[\s\S]*for \(const stmt/.test(txnBlock[0])) {
     failures.push('src/task/sqlite/worker.ts must inject transaction faults after statements, before COMMIT.');
   }
+  // P5-W4: backup stays on the worker boundary via backupOpenDatabase; no raw live-main copy.
+  if (!workerText.includes("case 'backup'") || !workerText.includes('backupOpenDatabase')) {
+    failures.push('src/task/sqlite/worker.ts must dispatch backup via backupOpenDatabase.');
+  }
+  if (!workerText.includes('parseBackupRequest')) {
+    failures.push('src/task/sqlite/worker.ts must exact-guard backup requests via parseBackupRequest.');
+  }
+  const backupText = texts.get('src/task/sqlite/backup.ts') ?? '';
+  if (backupText) {
+    if (!backupText.includes('VACUUM INTO') || !backupText.includes('preferredBackupMechanism')) {
+      failures.push('src/task/sqlite/backup.ts must support VACUUM INTO fallback and runtime mechanism probe.');
+    }
+    if (!backupText.includes('assertDestinationNotLiveSource') || !backupText.includes('verifyBackupArtifact')) {
+      failures.push('src/task/sqlite/backup.ts must reject live-source destinations and verify artifacts.');
+    }
+    // Ban raw copy APIs in the backup implementation regardless of local variable names.
+    if (/\b(?:copyFileSync|copyFile|cpSync)\s*\(/.test(stripComments(backupText))) {
+      failures.push('src/task/sqlite/backup.ts must not copyFile/cp the live source database.');
+    }
+    if (!backupText.includes('maybeInjectFault') || !backupText.includes("'backup'")) {
+      failures.push('src/task/sqlite/backup.ts must inject maybeInjectFault at the backup durability boundary.');
+    }
+  } else {
+    failures.push('src/task/sqlite/backup.ts must exist for P5-W4 live backup.');
+  }
   const clientText = texts.get('src/task/sqlite/client.ts') ?? '';
   if (!clientText.includes('faultCapability') || !clientText.includes('workerData')) {
     failures.push('src/task/sqlite/client.ts must pass explicit faultCapability via workerData.');
+  }
+  if (!clientText.includes('async backup(') || !clientText.includes("kind: 'backup'")) {
+    failures.push('src/task/sqlite/client.ts must expose backup() that sends kind backup to the worker.');
+  }
+  // Host production modules must not call node:sqlite.backup on the main thread.
+  for (const [rel, raw] of texts) {
+    if (rel.startsWith('src/task/sqlite/')) continue;
+    if (!rel.startsWith('src/')) continue;
+    const code = stripComments(raw);
+    const importsSqlite =
+      /(?:from\s+['"]node:sqlite['"]|require\(\s*['"]node:sqlite['"]\s*\))/.test(code);
+    if (!importsSqlite) continue;
+    // Module-level backup(...) or sqlite.backup(...) / namespace.backup(...).
+    if (/\.backup\s*\(|(?:^|[^\w$.])backup\s*\(/.test(code)) {
+      failures.push(`${rel} must not call node:sqlite.backup on the host thread.`);
+    }
   }
   if (!clientText.includes('onTerminalStorageError') || !clientText.includes('isTerminalStorageCode')) {
     failures.push('src/task/sqlite/client.ts must latch terminal corrupt/not_a_database faults.');

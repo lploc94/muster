@@ -39,6 +39,14 @@ export function isAllowedReadPragma(value: string): value is ReadPragma {
   return (ALLOWED_READ_PRAGMAS as readonly string[]).includes(value);
 }
 
+/** Safe backup result metadata only — never paths or row content (P5-W4). */
+export type BackupResultMeta = {
+  mechanism: 'api' | 'vacuum';
+  schemaVersion: number;
+  workspaceRevision: number;
+  byteSize: number;
+};
+
 export type DbRequest =
   | { kind: 'open'; requestId: number; path: string; busyTimeoutMs?: number }
   | { kind: 'all'; requestId: number; sql: string; params?: SqlValue[] }
@@ -65,6 +73,30 @@ export type DbRequest =
       abortIfUnchangedAt?: number[];
     }
   | { kind: 'pragma'; requestId: number; pragma: string }
+  | {
+      /**
+       * SQLite-aware live backup (P5-W4). Destination path stays on the worker;
+       * the host only receives redacted metadata. Cancellation is a request-scoped
+       * SharedArrayBuffer Int32 (0=run, 1=cancel) observed before publish.
+       */
+      kind: 'backup';
+      requestId: number;
+      destinationPath: string;
+      overwrite: boolean;
+      cancellationFlag?: SharedArrayBuffer;
+      /** Test-only force of mechanism (ignored without fault capability). */
+      forceMechanism?: 'api' | 'vacuum';
+      /** Test-only: set cancel flag after snapshot (fault capability). */
+      armCancelAfterSnapshot?: boolean;
+      /** Test-only: corrupt temp before verify (fault capability). */
+      corruptBeforeVerify?: boolean;
+      /** Test-only fail after verify before publish (fault capability). */
+      failBeforePublish?: boolean;
+      /** Test-only fail during publish after verify (fault capability). */
+      failDuringPublish?: boolean;
+      /** Test-only progress barrier flag (fault capability). */
+      progressFlag?: SharedArrayBuffer;
+    }
   | { kind: 'close'; requestId: number };
 
 export interface RunResult {
@@ -82,6 +114,7 @@ export type DbResponse =
   /** Results are in the same order as the submitted transaction statements. */
   | { kind: 'transaction'; requestId: number; results: RunResult[] }
   | { kind: 'scalar'; requestId: number; value: number }
+  | { kind: 'backup'; requestId: number; result: BackupResultMeta }
   | {
       kind: 'error';
       requestId: number;

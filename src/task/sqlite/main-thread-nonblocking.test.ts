@@ -146,4 +146,65 @@ describe('main thread stays responsive during SQLite lock contention', () => {
     await holder.released;
     await expect(contender.get<{ n: number }>('SELECT COUNT(*) AS n FROM lock_probe')).resolves.toEqual({ n: 2 });
   }, 15_000);
+
+  it('keeps host heartbeat running while the worker performs a live backup (P5-W4)', async () => {
+    const dbPath = tempDbPath();
+    const client = makeClient();
+    await client.open(dbPath);
+    await client.run(
+      `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
+       VALUES (?,?,?,?,?)`,
+      ['ws', 'k', 'W', 'now', 'now'],
+    );
+    await client.run(
+      `INSERT INTO workspace_revisions (workspace_id, revision) VALUES (?, ?)`,
+      ['ws', 1],
+    );
+    // Large blob payload so VACUUM INTO / backup takes multiple event-loop turns.
+    const blob = 'x'.repeat(256 * 1024);
+    for (let i = 0; i < 40; i += 1) {
+      await client.run(
+        `INSERT INTO tasks
+         (id, workspace_id, role, lifecycle, release_state, goal, backend, revision, created_at, updated_at, payload_json)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          `t${i}`,
+          'ws',
+          'worker',
+          'open',
+          'draft',
+          `goal-${i}`,
+          'grok',
+          0,
+          'now',
+          'now',
+          JSON.stringify({ blob }),
+        ],
+      );
+    }
+
+    const dest = path.join(path.dirname(dbPath), 'backup.sqlite3');
+    let beats = 0;
+    let beatsDuringBackup = 0;
+    let backupSettled = false;
+    const timer = setInterval(() => {
+      beats += 1;
+      if (!backupSettled) beatsDuringBackup += 1;
+    }, 1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const beatsBefore = beats;
+    const started = Date.now();
+    try {
+      const meta = await client.backup(dest, { overwrite: false });
+      backupSettled = true;
+      const elapsed = Date.now() - started;
+      expect(meta.byteSize).toBeGreaterThan(0);
+      // Ticks must advance while the backup promise is unsettled (work is off-host).
+      expect(beatsDuringBackup - beatsBefore).toBeGreaterThan(0);
+      expect(elapsed).toBeLessThan(30_000);
+    } finally {
+      backupSettled = true;
+      clearInterval(timer);
+    }
+  }, 40_000);
 });

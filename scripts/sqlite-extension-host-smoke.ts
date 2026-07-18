@@ -8,7 +8,17 @@ interface PackagedDbClient {
   open(dbPath: string, busyTimeoutMs?: number): Promise<void>;
   get<T>(sql: string, params?: unknown[]): Promise<T | undefined>;
   all<T>(sql: string, params?: unknown[]): Promise<T[]>;
+  run(sql: string, params?: unknown[]): Promise<{ changes: number; lastInsertRowid: number }>;
   pragma(name: string): Promise<number>;
+  backup(
+    destinationPath: string,
+    options?: { overwrite?: boolean },
+  ): Promise<{
+    mechanism: 'api' | 'vacuum';
+    schemaVersion: number;
+    workspaceRevision: number;
+    byteSize: number;
+  }>;
   close(): Promise<void>;
 }
 
@@ -100,9 +110,70 @@ export async function run(): Promise<void> {
       ),
       { name: 'trg_send_outbox_capacity' },
     );
+
+    // P5-W4: packaged worker must create a verified backup using only capabilities
+    // present on this Extension Host. VS Code 1.101 (Node 22.15.1) has no
+    // node:sqlite.backup API and must use the VACUUM INTO fallback; newer hosts
+    // may use the API. Never require the API on the minimum host.
+    const sqliteMod = require('node:sqlite') as { backup?: unknown };
+    const hostHasBackupApi = typeof sqliteMod.backup === 'function';
+    await client.run(
+      `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
+       VALUES (?,?,?,?,?)`,
+      ['ws-smoke', 'smoke-key', 'Smoke', 'now', 'now'],
+    );
+    await client.run(
+      `INSERT INTO workspace_revisions (workspace_id, revision) VALUES (?, ?)`,
+      ['ws-smoke', 3],
+    );
+    const backupPath = path.join(tempDir, 'muster-backup.sqlite3');
+    const backupMeta = await client.backup(backupPath, { overwrite: false });
+    assert.ok(
+      backupMeta.mechanism === 'api' || backupMeta.mechanism === 'vacuum',
+      `unexpected backup mechanism: ${String(backupMeta.mechanism)}`,
+    );
+    if (!hostHasBackupApi) {
+      assert.equal(
+        backupMeta.mechanism,
+        'vacuum',
+        'minimum host without node:sqlite.backup must use VACUUM INTO fallback',
+      );
+    } else {
+      assert.equal(
+        backupMeta.mechanism,
+        'api',
+        'host with node:sqlite.backup must prefer the SQLite backup API',
+      );
+    }
+    assert.equal(backupMeta.schemaVersion, schema.SQLITE_SCHEMA_VERSION);
+    assert.equal(backupMeta.workspaceRevision, 3);
+    assert.ok(backupMeta.byteSize > 0);
+    assert.ok(fs.existsSync(backupPath), 'backup artifact missing');
+    // Reopen independently (read-only) without going through openStoreDatabase.
+    const artifact = new (require('node:sqlite') as {
+      DatabaseSync: new (p: string, o?: { readOnly?: boolean }) => {
+        prepare(sql: string): { get: (...a: unknown[]) => unknown; all: (...a: unknown[]) => unknown[] };
+        close(): void;
+      };
+    }).DatabaseSync(backupPath, { readOnly: true });
+    try {
+      const appId = artifact.prepare('PRAGMA application_id').get() as Record<string, number>;
+      assert.equal(Object.values(appId)[0], 0x4d555354);
+      const ver = artifact.prepare('PRAGMA user_version').get() as Record<string, number>;
+      assert.equal(Object.values(ver)[0], schema.SQLITE_SCHEMA_VERSION);
+      const quick = artifact.prepare('PRAGMA quick_check').all() as Array<Record<string, string>>;
+      assert.equal(Object.values(quick[0] ?? {})[0], 'ok');
+      const rev = artifact
+        .prepare('SELECT revision FROM workspace_revisions WHERE workspace_id = ?')
+        .get('ws-smoke') as { revision: number };
+      assert.equal(rev.revision, 3);
+    } finally {
+      artifact.close();
+    }
+
     console.log(
       `[muster-sqlite-host-smoke] ok vscode=${vscode.version} node=${process.versions.node} ` +
-        `remote=${vscode.env.remoteName ?? 'desktop'}`,
+        `remote=${vscode.env.remoteName ?? 'desktop'} backup=${backupMeta.mechanism}`,
     );
   } finally {
     await client.close();
