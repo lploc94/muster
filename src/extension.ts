@@ -97,6 +97,7 @@ import { isTerminalLifecycle } from './task/transitions';
 import { resolveWorkspaceCwd } from './task/workspace-cwd';
 import type { TaskStoreFile } from './task/types';
 import { runLimitMs } from './task/execution-policy';
+import { resourceLimitsFromSettings } from './task/limits';
 import { USER_INTERACTION_TIMEOUT_MS } from './host/interaction-timeouts';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -3116,6 +3117,17 @@ export async function activate(context: vscode.ExtensionContext) {
       getBridgeGeneration: () => bridgeServer?.getGeneration() ?? 1,
       getRunLimitMs: () =>
         runLimitMs(vscode.workspace.getConfiguration('muster.execution').get('runLimit')),
+      // M016: concurrency caps are read LIVE per scheduling pass (no cache),
+      // mirroring getRunLimitMs. Invalid/out-of-range values clamp to package
+      // bounds; structural caps stay on DEFAULT_RESOURCE_LIMITS.
+      getResourceLimits: () => {
+        const cfg = vscode.workspace.getConfiguration('muster.execution');
+        return resourceLimitsFromSettings({
+          maxConcurrentPerBackend: cfg.get('maxConcurrentPerBackend'),
+          maxConcurrentTurns: cfg.get('maxConcurrentTurns'),
+          maxConcurrentPerRoot: cfg.get('maxConcurrentPerRoot'),
+        });
+      },
       isWorkspaceTrusted: () => vscode.workspace.isTrusted,
       // Host execution of a task's verification commands is OFF unless the USER
       // explicitly enables it — commands become host-authorized, not agent-triggerable.

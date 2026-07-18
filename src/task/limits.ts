@@ -31,6 +31,67 @@ export const DEFAULT_RESOURCE_LIMITS: ResourceLimits = {
 };
 
 /**
+ * package.json contributes.configuration bounds for the three live
+ * muster.execution concurrency settings. Keep in lockstep with package.json
+ * minimum/maximum so host clamping matches the Settings UI.
+ */
+export const RESOURCE_CONCURRENCY_BOUNDS = {
+  maxConcurrentPerBackend: { min: 1, max: 32 },
+  maxConcurrentTurns: { min: 1, max: 64 },
+  maxConcurrentPerRoot: { min: 1, max: 64 },
+} as const;
+
+export interface ResourceConcurrencySettingsInput {
+  maxConcurrentPerBackend?: unknown;
+  maxConcurrentTurns?: unknown;
+  maxConcurrentPerRoot?: unknown;
+}
+
+function clampConcurrencySetting(
+  value: unknown,
+  min: number,
+  max: number,
+  fallback: number,
+): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return fallback;
+  }
+  return clamp(Math.floor(value), min, max);
+}
+
+/**
+ * Build a full {@link ResourceLimits} snapshot from live VS Code setting values.
+ * Concurrency caps clamp to package.json min/max (or fall back to
+ * {@link DEFAULT_RESOURCE_LIMITS}); structural caps always come from defaults.
+ * Pure — host reads settings and calls this on every scheduling pass (no cache).
+ */
+export function resourceLimitsFromSettings(
+  raw: ResourceConcurrencySettingsInput,
+): ResourceLimits {
+  return {
+    ...DEFAULT_RESOURCE_LIMITS,
+    maxConcurrentPerBackend: clampConcurrencySetting(
+      raw.maxConcurrentPerBackend,
+      RESOURCE_CONCURRENCY_BOUNDS.maxConcurrentPerBackend.min,
+      RESOURCE_CONCURRENCY_BOUNDS.maxConcurrentPerBackend.max,
+      DEFAULT_RESOURCE_LIMITS.maxConcurrentPerBackend,
+    ),
+    maxConcurrentTurns: clampConcurrencySetting(
+      raw.maxConcurrentTurns,
+      RESOURCE_CONCURRENCY_BOUNDS.maxConcurrentTurns.min,
+      RESOURCE_CONCURRENCY_BOUNDS.maxConcurrentTurns.max,
+      DEFAULT_RESOURCE_LIMITS.maxConcurrentTurns,
+    ),
+    maxConcurrentPerRoot: clampConcurrencySetting(
+      raw.maxConcurrentPerRoot,
+      RESOURCE_CONCURRENCY_BOUNDS.maxConcurrentPerRoot.min,
+      RESOURCE_CONCURRENCY_BOUNDS.maxConcurrentPerRoot.max,
+      DEFAULT_RESOURCE_LIMITS.maxConcurrentPerRoot,
+    ),
+  };
+}
+
+/**
  * Hard bounds applied to agent-supplied {@link TaskExecutionPolicy} values before
  * they are persisted. An AI coordinator can request an arbitrary execution policy
  * via the MCP bridge; without clamping it could set a multi-day turn/task timeout
