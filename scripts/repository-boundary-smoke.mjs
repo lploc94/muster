@@ -263,26 +263,50 @@ export async function runRepositoryBoundarySmoke(rootDir = ROOT) {
     failures.push('src/extension.ts must wire onTerminalStorageError for production DbClient.');
   }
   // Production terminal quiesce must stop the real production provider, not only UAT alias.
-  if (extensionTextForTerminal.includes('handleTerminalStorage')) {
-    const terminalFn = extensionTextForTerminal.match(
-      /handleTerminalStorage[\s\S]{0,2500}?const candidate = new DbClient/,
-    )?.[0] ?? extensionTextForTerminal.match(/handleTerminalStorage[\s\S]{0,1500}/)?.[0] ?? '';
-    if (
-      terminalFn.includes('uatChatProvider?.disposeRevisionPoller') &&
-      !terminalFn.includes('chatProvider') &&
-      !terminalFn.includes('productionProvider') &&
-      !terminalFn.includes('applyTerminalStorageQuiesce')
-    ) {
-      failures.push(
-        'src/extension.ts terminal handler must dispose production chatProvider, not only uatChatProvider.',
-      );
-    }
-    if (
-      /taskEngine\?\.shutdown\s*\(/.test(terminalFn) &&
-      !terminalFn.includes('quiesceForTerminalStorage')
-    ) {
+  if (!extensionTextForTerminal.includes('applyTerminalStorageQuiesce')) {
+    failures.push('src/extension.ts must call applyTerminalStorageQuiesce on terminal storage.');
+  }
+  if (
+    extensionTextForTerminal.includes('uatChatProvider?.disposeRevisionPoller') &&
+    !extensionTextForTerminal.includes('chatProvider') &&
+    !extensionTextForTerminal.includes('productionProvider')
+  ) {
+    failures.push(
+      'src/extension.ts terminal handler must dispose production chatProvider, not only uatChatProvider.',
+    );
+  }
+  if (
+    /taskEngine\?\.shutdown\s*\(/.test(extensionTextForTerminal) &&
+    !extensionTextForTerminal.includes('quiesceForTerminalStorage')
+  ) {
+    // Only fail if a terminal path uses graceful shutdown without hard quiesce.
+    const terminalSlice =
+      extensionTextForTerminal.match(
+        /onTerminalStorageError[\s\S]{0,3500}?const candidate = new DbClient/,
+      )?.[0] ?? '';
+    if (/taskEngine\?\.shutdown\s*\(/.test(terminalSlice) && !terminalSlice.includes('quiesceForTerminalStorage')) {
       failures.push(
         'src/extension.ts terminal handler must hard-quiesce via quiesceForTerminalStorage, not graceful shutdown.',
+      );
+    }
+  }
+  // P5-W3: durable host-send coordinator must be the production handleSend path.
+  const durableCoord = texts.get('src/host/durable-send-coordinator.ts') ?? '';
+  if (durableCoord.includes('export async function runDurableHostSend')) {
+    if (!extensionTextForTerminal.includes('runDurableHostSend')) {
+      failures.push(
+        'src/extension.ts must import/call runDurableHostSend when the coordinator exports it.',
+      );
+    }
+    let durableCallers = 0;
+    for (const [rel, raw] of texts) {
+      if (rel === 'src/host/durable-send-coordinator.ts') continue;
+      if (rel.endsWith('.test.ts') || rel.endsWith('.testkit.ts')) continue;
+      if (stripComments(raw).includes('runDurableHostSend')) durableCallers += 1;
+    }
+    if (durableCallers === 0) {
+      failures.push(
+        'runDurableHostSend must have a production caller; test-only helpers fail the gate.',
       );
     }
   }

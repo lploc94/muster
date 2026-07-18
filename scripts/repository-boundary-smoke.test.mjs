@@ -136,13 +136,22 @@ export function handle() {
 test('fails when terminal handler only disposes uatChatProvider', async () => {
   await withMutatedTree((dir) => {
     const file = path.join(dir, 'src/extension.ts');
-    const text = readFileSync(path.join(ROOT, 'src/extension.ts'), 'utf8');
     writeFileSync(
       file,
-      text
-        .replace(/applyTerminalStorageQuiesce[\s\S]*?\}\);/, 'uatChatProvider?.disposeRevisionPoller();\n    await taskEngine?.shutdown();')
-        .replace(/quiesceForTerminalStorage/g, 'shutdown')
-        .replace(/chatProvider/g, 'uatChatProviderOnly'),
+      `
+import { DbClient, resolveWorkerPath } from './task/sqlite/client';
+let uatChatProvider = { disposeRevisionPoller() {} };
+let taskEngine = { shutdown() { return Promise.resolve(); } };
+async function handleTerminalStorage() {
+  uatChatProvider?.disposeRevisionPoller();
+  await taskEngine?.shutdown();
+}
+const candidate = new DbClient({
+  workerPath: resolveWorkerPath(),
+  onTerminalStorageError: (err) => { void handleTerminalStorage(err); },
+});
+void candidate;
+`,
     );
   }, /production chatProvider|quiesceForTerminalStorage/i);
 });

@@ -1320,22 +1320,9 @@ export class TaskEngine {
       return { ok: false, reason: error instanceof Error ? error.message : String(error) };
     }
 
-    if (clientRequestId) {
-      const receipt = await this.repository.getSendReceipt(clientRequestId);
-      if (receipt) {
-        void this.scheduleTurn(receipt.turnId);
-        return {
-          ok: true,
-          value: {
-            taskId: receipt.taskId,
-            messageId: receipt.messageId,
-            turnId: receipt.turnId,
-            clientRequestId,
-          },
-        };
-      }
-    }
-
+    // The successful command atomically committed task/message/turn/receipt.
+    // Do not add a fallible receipt read between that commit and the host ACK;
+    // the known IDs are the canonical result for this writer.
     void this.scheduleTurn(turnId);
     return {
       ok: true,
@@ -3712,6 +3699,7 @@ export class TaskEngine {
     let streamFailureStarted = false;
     let streamFailureMessage: string | undefined;
     let streamFailurePromise: Promise<void> | undefined;
+    let streamFailureFinishPromise: Promise<boolean> | undefined;
     /** Timer path only: report once, abort backend, keep dirty buffer; no settle yet. */
     const markStreamPersistenceFailure = (message: string): Promise<void> => {
       if (streamFailurePromise) return streamFailurePromise;
@@ -3730,43 +3718,79 @@ export class TaskEngine {
       return streamFailurePromise;
     };
     /**
-     * Explicit lifecycle boundary: one bounded flushTurn retry, then settle
-     * failed only if the segment is durable (or retry also failed — keep dirty,
-     * no false success/ACK). Dispose only after successful flush + settle.
+     * Explicit lifecycle boundary after mark: one bounded flushTurn retry, then
+     * settle failed. When retry fails, keep dirty buffer (no false success).
+     * Returns true when stream-failure handling owns the boundary.
      */
-    const finishStreamPersistenceFailure = async (): Promise<boolean> => {
-      if (!streamFailureStarted) return false;
-      if (streamFailurePromise) await streamFailurePromise;
-      if (this.storageTerminal) return true;
-      if (terminalSettled) return true;
-      const message = streamFailureMessage ?? 'stream batch persistence failed';
-      // Exactly one bounded retry at the deterministic boundary.
-      let segmentDurable = !this.streamBatcher.hasPending(turnId);
-      if (!segmentDurable) {
-        const retry = await this.streamBatcher.flushTurn(turnId);
+    const finishStreamPersistenceFailure = (): Promise<boolean> => {
+      if (!streamFailureStarted) return Promise.resolve(false);
+      // A settlement read can itself fail and route execution through catch.
+      // Cache the whole finish operation so catch observes the same rejection
+      // instead of starting a third transcript flush/retry.
+      if (streamFailureFinishPromise) return streamFailureFinishPromise;
+      streamFailureFinishPromise = (async () => {
+        if (streamFailurePromise) await streamFailurePromise;
         if (this.storageTerminal) return true;
-        segmentDurable = retry.ok;
+        if (terminalSettled) return true;
+        const message = streamFailureMessage ?? 'stream batch persistence failed';
+        // Exactly one bounded retry at the deterministic boundary.
+        if (this.streamBatcher.hasPending(turnId)) {
+          const retry = await this.streamBatcher.flushTurn(turnId);
+          if (this.storageTerminal) return true;
+          void retry;
+        }
+        // Always attempt durable failed settlement after the bounded attempt.
+        // running + no claim is forbidden: if settle fails, retain claim below.
+        try {
+          terminalSettled = await this.settleFailed(
+            turnId,
+            message,
+            observedSessionId,
+            rawOutput,
+            backend,
+          );
+        } catch (error) {
+          const { diagnoseSqliteError } = await import('./sqlite/diagnostics');
+          const diagnostic = diagnoseSqliteError(error, 'transaction');
+          if (diagnostic.kind === 'invariant') throw error;
+          // Settlement could not read/write durable state. Keep the running
+          // claim and retained stream buffer; surface only the safe diagnostic.
+          this.safeEmit({
+            type: 'turnError',
+            taskId: startedTurn.taskId,
+            turnId,
+            message: diagnostic.message,
+          });
+          return true;
+        }
+        if (terminalSettled) {
+          this.safeEmit({
+            type: 'turnError',
+            taskId: startedTurn.taskId,
+            turnId,
+            message,
+          });
+        }
+        return true;
+      })();
+      return streamFailureFinishPromise;
+    };
+    /**
+     * Unified explicit boundary for normal completion and catch:
+     * finish started failure → else flushTurn → on fail mark + finish (one retry).
+     */
+    const flushBoundaryOrFinishStreamFailure = async (): Promise<boolean> => {
+      if (this.storageTerminal) return true;
+      if (streamFailureStarted) {
+        return finishStreamPersistenceFailure();
       }
-      // Always durably fail the turn after the bounded attempt. When retry
-      // fails, keep the dirty buffer (disposeTurn skipped below) so content is
-      // not silently discarded — but never emit success/ACK/patch for it.
-      terminalSettled = await this.settleFailed(
-        turnId,
-        message,
-        observedSessionId,
-        rawOutput,
-        backend,
-      );
-      if (terminalSettled) {
-        this.safeEmit({
-          type: 'turnError',
-          taskId: startedTurn.taskId,
-          turnId,
-          message,
-        });
+      const flushed = await this.streamBatcher.flushTurn(turnId);
+      if (this.storageTerminal) return true;
+      if (!flushed.ok) {
+        await markStreamPersistenceFailure(flushed.message);
+        return finishStreamPersistenceFailure();
       }
-      void segmentDurable;
-      return true;
+      return false;
     };
     this.streamFailureHandlers.set(turnId, markStreamPersistenceFailure);
     // Per-turn render ordering + assistant segmentation (see WEBVIEW-IMPROVEMENT-PLAN §5.1.1).
@@ -4212,74 +4236,62 @@ export class TaskEngine {
       }
 
       if (!this.storageTerminal) {
-        const streamFailureHandled = await finishStreamPersistenceFailure();
+        const streamFailureHandled = await flushBoundaryOrFinishStreamFailure();
         if (!terminalSettled && !streamFailureHandled) {
-          // Flush any coalesced assistant/reasoning before abnormal settlement.
-          const preAbnormal = await this.streamBatcher.flushTurn(turnId);
-          if (!preAbnormal.ok) {
-            await markStreamPersistenceFailure(preAbnormal.message);
+          const runTimedOut = this.store.getFile().turns[turnId]?.termination?.kind === 'run_timeout';
+          // Terminal storage must not settleInterrupted (graceful shutdown may).
+          if (this.storageTerminal) {
+            // skip durable settlement
+          } else if (runTimedOut) {
+            terminalSettled = await this.settleInterrupted(
+              turnId, observedSessionId, rawOutput, backend, 'run_timeout',
+            );
+          } else if (this.shuttingDown) {
+            terminalSettled = await this.settleInterrupted(
+              turnId, observedSessionId, rawOutput, backend, 'forced',
+            );
           } else {
-            const runTimedOut = this.store.getFile().turns[turnId]?.termination?.kind === 'run_timeout';
-            // Terminal storage must not settleInterrupted (graceful shutdown may).
-            if (this.storageTerminal) {
-              // skip durable settlement
-            } else if (runTimedOut) {
-              terminalSettled = await this.settleInterrupted(
-                turnId, observedSessionId, rawOutput, backend, 'run_timeout',
-              );
-            } else if (this.shuttingDown) {
-              terminalSettled = await this.settleInterrupted(
-                turnId, observedSessionId, rawOutput, backend, 'forced',
-              );
-            } else {
-              terminalSettled = await this.settleFailed(
-                turnId,
-                'turn ended without terminal event',
-                observedSessionId,
-                rawOutput,
-                backend,
-              );
-            }
-            if (terminalSettled) {
-              this.safeEmit({
-                type: 'turnError',
-                taskId: turn.taskId,
-                turnId,
-                message: 'turn ended without terminal event',
-              });
-            }
+            terminalSettled = await this.settleFailed(
+              turnId,
+              'turn ended without terminal event',
+              observedSessionId,
+              rawOutput,
+              backend,
+            );
+          }
+          if (terminalSettled) {
+            this.safeEmit({
+              type: 'turnError',
+              taskId: turn.taskId,
+              turnId,
+              message: 'turn ended without terminal event',
+            });
           }
         }
       }
     } catch (error) {
       if (!this.storageTerminal) {
-        const streamFailureHandled = await finishStreamPersistenceFailure();
+        const streamFailureHandled = await flushBoundaryOrFinishStreamFailure();
         if (!terminalSettled && !streamFailureHandled) {
-          // Best-effort flush before dispose so the last window is not dropped.
-          const preCatch = await this.streamBatcher.flushTurn(turnId);
-          if (!preCatch.ok) {
-            await markStreamPersistenceFailure(preCatch.message);
+          const message = error instanceof Error ? error.message : String(error);
+          const runTimedOut = this.store.getFile().turns[turnId]?.termination?.kind === 'run_timeout';
+          if (this.storageTerminal) {
+            // skip durable settlement after terminal latch
+          } else if (runTimedOut) {
+            terminalSettled = await this.settleInterrupted(
+              turnId, observedSessionId, rawOutput, backend, 'run_timeout',
+            );
+          } else if (this.shuttingDown) {
+            terminalSettled = await this.settleInterrupted(
+              turnId, observedSessionId, rawOutput, backend, 'forced',
+            );
           } else {
-            const message = error instanceof Error ? error.message : String(error);
-            const runTimedOut = this.store.getFile().turns[turnId]?.termination?.kind === 'run_timeout';
-            if (this.storageTerminal) {
-              // skip durable settlement after terminal latch
-            } else if (runTimedOut) {
-              terminalSettled = await this.settleInterrupted(
-                turnId, observedSessionId, rawOutput, backend, 'run_timeout',
-              );
-            } else if (this.shuttingDown) {
-              terminalSettled = await this.settleInterrupted(
-                turnId, observedSessionId, rawOutput, backend, 'forced',
-              );
-            } else {
-              terminalSettled = await this.settleFailed(
-                turnId, message, observedSessionId, rawOutput, backend,
-              );
-            }
-            if (terminalSettled) {
-              this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message });
-            }
+            terminalSettled = await this.settleFailed(
+              turnId, message, observedSessionId, rawOutput, backend,
+            );
+          }
+          if (terminalSettled) {
+            this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message });
           }
         }
       }
@@ -4305,10 +4317,9 @@ export class TaskEngine {
       this.dropElicitationWaits(turnId);
       // Drop buffer only when not terminal and no retained dirty stream state.
       // After a failed bounded retry the dirty buffer must remain for recovery.
-      if (
-        !this.storageTerminal &&
-        !(streamFailureStarted && this.streamBatcher.hasPending(turnId))
-      ) {
+      const retainDirtyStream =
+        streamFailureStarted && this.streamBatcher.hasPending(turnId);
+      if (!this.storageTerminal && !retainDirtyStream) {
         this.streamBatcher.disposeTurn(turnId);
       }
       this.liveRuns.delete(turnId);
@@ -4316,9 +4327,19 @@ export class TaskEngine {
       if (this.credentialRegistry) {
         cleanupTurnResources(this.graphDeps(), turnId, mcpConfigPath);
       }
+      // Never release claim while the durable turn is still running (stream
+      // failure that could not settle). running + no claim is forbidden.
       if (!this.storageTerminal) {
-        await this.afterTurnSettled(turnId);
-        this.safeReleaseClaim(releaseClaim);
+        if (terminalSettled) {
+          await this.afterTurnSettled(turnId);
+          this.safeReleaseClaim(releaseClaim);
+        } else if (!streamFailureStarted) {
+          await this.afterTurnSettled(turnId);
+          this.safeReleaseClaim(releaseClaim);
+        } else {
+          // Stream failure path without durable settlement: keep claim so the
+          // turn remains recoverable. Do not afterTurnSettled.
+        }
       }
     }
   }

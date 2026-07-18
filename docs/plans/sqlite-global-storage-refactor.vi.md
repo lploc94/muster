@@ -974,7 +974,7 @@ hoặc params vượt khỏi DB boundary.
 zero empty-store continuation, không mutate file bị reject và valid database vẫn mở bình
 thường.
 
-#### P5-W3 — Durable write failure: full/readonly/I/O/busy
+#### P5-W3 — Durable write failure: full/readonly/I/O/busy ✅
 
 - Normalize `SQLITE_FULL`, `SQLITE_READONLY`, relevant `SQLITE_IOERR`, và exhausted
   `SQLITE_BUSY`/`SQLITE_LOCKED` thành contract W1; retry chỉ bounded ở nơi policy cho phép,

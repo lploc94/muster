@@ -146,7 +146,8 @@ describe('TaskEngine repository-only boundary', () => {
       await engine.resumeQueuedTurnAsync(task.id, 'stream-failure-turn');
       await engine.whenIdle();
 
-      expect(appendAttempts).toBe(1);
+      // Timer flush + one bounded lifecycle-boundary retry.
+      expect(appendAttempts).toBe(2);
       await expect(repository.getTurn('stream-failure-turn')).resolves.toMatchObject({
         status: 'failed',
         error: expect.stringContaining('injected disk full'),

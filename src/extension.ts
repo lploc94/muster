@@ -128,6 +128,7 @@ import {
 } from './task/sqlite/diagnostics';
 import { applyTerminalStorageQuiesce } from './host/terminal-storage-coordinator';
 import { createTerminalStorageLifecycle } from './host/terminal-storage-lifecycle';
+import { runDurableHostSend } from './host/durable-send-coordinator';
 
 
 /** Activation fail-closed error: safe message only, no path/SQL/content. */
@@ -1901,151 +1902,125 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   }
 
   private async handleSend(data: HostSendRequest): Promise<void> {
-    const clientRequestId =
-      typeof data.clientRequestId === 'string' && data.clientRequestId.trim()
-        ? data.clientRequestId.trim()
-        : undefined;
+    // Strict parser requires clientRequestId — always durable path.
+    const clientRequestId = data.clientRequestId.trim();
     if (!taskEngine || !taskStore || !taskRepository) {
-      if (clientRequestId) {
-        this.post({
-          type: 'sendRejected',
-          clientRequestId,
-          taskId: data.taskId,
-          reason: 'task engine not ready',
-          code: 'store',
-        });
-      } else {
-        this.postCommandError('task engine not ready');
-      }
+      this.post({
+        type: 'sendRejected',
+        clientRequestId,
+        taskId: data.taskId,
+        reason: 'task engine not ready',
+        code: 'store',
+      });
       return;
     }
     if (data.backend !== undefined && !WEBVIEW_BACKENDS.has(data.backend)) {
-      if (clientRequestId) {
-        this.post({
-          type: 'sendRejected',
-          clientRequestId,
-          taskId: data.taskId,
-          reason: 'unknown backend',
-          code: 'validation',
-        });
-      } else {
-        this.postCommandError('unknown backend', data.taskId);
-      }
+      this.post({
+        type: 'sendRejected',
+        clientRequestId,
+        taskId: data.taskId,
+        reason: 'unknown backend',
+        code: 'validation',
+      });
       return;
     }
     // `text` = user-visible (display-name chips). `llmText` = agent payload when expanded.
     const text = data.text?.trim();
     if (!text) {
-      if (clientRequestId) {
-        this.post({
-          type: 'sendRejected',
-          clientRequestId,
-          taskId: data.taskId,
-          reason: 'message cannot be empty',
-          code: 'validation',
-        });
-      } else {
-        this.postCommandError('message cannot be empty', data.taskId);
-      }
-      return;
-    }
-    // Durable outbox before processing so crash/reload can restore the draft.
-    // Full control-flow for queue-only failure path uses durableQueueSend via
-    // runDurableHostSend when we need schedule/ACK isolation; for the main
-    // handleSend we still put outbox first then continue into engine below.
-    if (clientRequestId && taskRepository) {
-      const now = new Date().toISOString();
-      const entry = {
+      this.post({
+        type: 'sendRejected',
         clientRequestId,
-        status: 'pending' as const,
-        ...(data.taskId ? { taskId: data.taskId } : {}),
-        payload: {
-          version: 1 as const,
-          text,
-          ...(typeof data.llmText === 'string' && data.llmText.trim()
-            ? { llmText: data.llmText.trim() }
-            : {}),
-          ...(Array.isArray(data.mentionBindings) ? { mentionBindings: data.mentionBindings } : {}),
-          ...(Array.isArray(data.skills) ? { skills: data.skills } : {}),
-          ...(typeof data.backend === 'string' ? { backend: data.backend } : {}),
-          ...(typeof data.model === 'string' ? { model: data.model } : {}),
-          ...(typeof data.continuationOf === 'string'
-            ? { continuationOf: data.continuationOf }
-            : {}),
-        },
-        createdAt: now,
-        updatedAt: now,
-      };
-      try {
-        await taskRepository.execute({
-          kind: 'putSendOutbox',
-          workspaceId: repositoryWorkspaceId(),
-          entry,
-        });
-      } catch {
-        this.post({
-          type: 'sendRejected',
-          clientRequestId,
-          taskId: data.taskId,
-          reason: 'unable to durably queue send',
-          code: 'store',
-        });
-        return;
-      }
-    }
-    if (text.length > MAX_MESSAGE_CHARS) {
-      if (clientRequestId) {
-        await this.rejectDurableOutbox(clientRequestId);
-        this.post({
-          type: 'sendRejected',
-          clientRequestId,
-          taskId: data.taskId,
-          reason: 'message too long',
-          code: 'validation',
-        });
-      } else {
-        this.postCommandError('message too long', data.taskId);
-      }
+        taskId: data.taskId,
+        reason: 'message cannot be empty',
+        code: 'validation',
+      });
       return;
     }
+
     const llmText =
       typeof data.llmText === 'string' && data.llmText.trim() ? data.llmText.trim() : text;
-    if (llmText.length > MAX_MESSAGE_CHARS) {
-      if (clientRequestId) {
-        await this.rejectDurableOutbox(clientRequestId);
-        this.post({
-          type: 'sendRejected',
-          clientRequestId,
-          taskId: data.taskId,
-          reason: 'message too long',
-          code: 'validation',
-        });
-      } else {
-        this.postCommandError('message too long', data.taskId);
+
+    const now = new Date().toISOString();
+    const entry = {
+      clientRequestId,
+      status: 'pending' as const,
+      ...(data.taskId ? { taskId: data.taskId } : {}),
+      payload: {
+        version: 1 as const,
+        text,
+        ...(typeof data.llmText === 'string' && data.llmText.trim()
+          ? { llmText: data.llmText.trim() }
+          : {}),
+        ...(Array.isArray(data.mentionBindings) ? { mentionBindings: data.mentionBindings } : {}),
+        ...(Array.isArray(data.skills) ? { skills: data.skills } : {}),
+        ...(typeof data.backend === 'string' ? { backend: data.backend } : {}),
+        ...(typeof data.model === 'string' ? { model: data.model } : {}),
+        ...(typeof data.continuationOf === 'string'
+          ? { continuationOf: data.continuationOf }
+          : {}),
+      },
+      createdAt: now,
+      updatedAt: now,
+    };
+    await runDurableHostSend(
+      {
+        repository: taskRepository,
+        workspaceId: repositoryWorkspaceId(),
+        postMessage: (msg) => this.post(msg),
+        clearOutbox: (id) => this.clearDurableOutbox(id),
+        rejectOutbox: (id) => this.rejectDurableOutbox(id),
+        publishProjection: (taskId) => {
+          this.postSnapshot(taskId);
+        },
+        performSend: async () => this.performDurableSend(data, text, llmText, clientRequestId),
+      },
+      {
+        clientRequestId,
+        ...(data.taskId ? { taskId: data.taskId } : {}),
+        text,
+        entry,
+      },
+    );
+  }
+
+  /**
+   * Engine send after durable outbox commit.
+   * Must not post sendAccepted/sendRejected — coordinator owns ACK control flow.
+   * New-task success sets snapshotTaskId for one initial snapshot; existing-task
+   * relies on post-commit workspace patches (no extra snapshot).
+   */
+  private async performDurableSend(
+    data: HostSendRequest,
+    text: string,
+    llmText: string,
+    clientRequestId: string,
+  ): Promise<
+    | {
+        ok: true;
+        value: {
+          taskId: string;
+          messageId: string;
+          turnId?: string;
+          snapshotTaskId?: string;
+        };
       }
-      return;
+    | { ok: false; reason: string; code?: 'store' | 'validation' | 'conflict' | 'capacity' | 'unknown' }
+  > {
+    if (!taskEngine || !taskStore) {
+      return { ok: false, reason: 'task engine not ready', code: 'store' };
+    }
+    if (text.length > MAX_MESSAGE_CHARS || llmText.length > MAX_MESSAGE_CHARS) {
+      return { ok: false, reason: 'message too long', code: 'validation' };
     }
 
     if (!data.taskId) {
       if (data.continuationOf) {
         const continuationError = this.validateContinuationOf(data.continuationOf);
         if (continuationError) {
-          if (clientRequestId) {
-            await this.rejectDurableOutbox(clientRequestId);
-            this.post({
-              type: 'sendRejected',
-              clientRequestId,
-              reason: continuationError,
-              code: 'validation',
-            });
-          } else {
-            this.postCommandError(continuationError);
-          }
-          return;
+          return { ok: false, reason: continuationError, code: 'validation' };
         }
       }
 
-      // Goal from display text so task titles stay short (not absolute temp paths).
       const shortGoal = text.length <= 30 ? text : text.slice(0, 30).trim() + '…';
       const resolvedBackend = data.backend ?? 'claude';
       const resolvedModel =
@@ -2057,50 +2032,30 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         backend: resolvedBackend,
         model: resolvedModel,
         continuationOf: data.continuationOf,
-        // Skills are first-turn-only; startNewTask ignores them for continuations.
         ...(Array.isArray(data.skills) && data.skills.length ? { skills: data.skills } : {}),
-        // Capture the workspace cwd at task-creation time so every turn (and any
-        // delegated child) runs in the right directory instead of process.cwd().
         cwd: resolveTaskCwd(),
         clientRequestId,
       });
       if (!result.ok) {
-        if (clientRequestId) {
-          const code = /conflict/i.test(result.reason)
-            ? 'conflict'
-            : /capacity|maxTurns|turn cap/i.test(result.reason)
-              ? 'capacity'
-              : 'unknown';
-          await this.rejectDurableOutbox(clientRequestId);
-          this.post({
-            type: 'sendRejected',
-            clientRequestId,
-            reason: result.reason,
-            code,
-          });
-        } else {
-          this.postCommandError(result.reason);
-        }
-        return;
+        const code = /conflict/i.test(result.reason)
+          ? 'conflict'
+          : /capacity|maxTurns|turn cap/i.test(result.reason)
+            ? 'capacity'
+            : 'unknown';
+        return { ok: false, reason: result.reason, code };
       }
       this.focusedTaskId = result.value.taskId;
-      if (clientRequestId) {
-        await this.clearDurableOutbox(clientRequestId);
-        this.post({
-          type: 'sendAccepted',
-          clientRequestId,
+      return {
+        ok: true,
+        value: {
           taskId: result.value.taskId,
           messageId: result.value.messageId,
           turnId: result.value.turnId,
-        });
-      }
-      this.postSnapshot(result.value.taskId);
-      return;
+          snapshotTaskId: result.value.taskId,
+        },
+      };
     }
 
-    // Existing task: if the composer picker asked for a different backend/model,
-    // atomically switch first, then send on the rebound binding. This covers
-    // cases where picker change did not fire requestRuntimeHandoff beforehand.
     const existing = taskStore.getTask(data.taskId);
     if (existing && data.backend && WEBVIEW_BACKENDS.has(data.backend)) {
       const targetModel =
@@ -2124,21 +2079,12 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             ? after.model.trim()
             : undefined;
         if (!after || after.backend !== data.backend || afterModel !== targetModel) {
-          const reason =
-            'Model switch did not commit; message was not sent on the previous backend.';
-          if (clientRequestId) {
-            await this.rejectDurableOutbox(clientRequestId);
-            this.post({
-              type: 'sendRejected',
-              clientRequestId,
-              taskId: data.taskId,
-              reason,
-              code: 'unknown',
-            });
-          } else {
-            this.postCommandError(reason, data.taskId);
-          }
-          return;
+          return {
+            ok: false,
+            reason:
+              'Model switch did not commit; message was not sent on the previous backend.',
+            code: 'unknown',
+          };
         }
       }
     }
@@ -2148,39 +2094,25 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       clientRequestId,
     });
     if (!result.ok) {
-      if (clientRequestId) {
-        const code = /conflict/i.test(result.reason)
-          ? 'conflict'
-          : /capacity|maxTurns|turn cap/i.test(result.reason)
-            ? 'capacity'
-            : 'unknown';
-        await this.rejectDurableOutbox(clientRequestId);
-        this.post({
-          type: 'sendRejected',
-          clientRequestId,
-          taskId: data.taskId,
-          reason: result.reason,
-          code,
-        });
-      } else {
-        this.postCommandError(result.reason, data.taskId);
-      }
-      return;
+      const code = /conflict/i.test(result.reason)
+        ? 'conflict'
+        : /capacity|maxTurns|turn cap/i.test(result.reason)
+          ? 'capacity'
+          : 'unknown';
+      return { ok: false, reason: result.reason, code };
     }
-    if (clientRequestId && result.value.messageId) {
-      // Receipt is already durable. Attempt outbox cleanup before ACK; if SQLite
-      // cleanup is transiently unavailable, reload replay de-dupes by receipt and
-      // retries the same delete without creating a second message.
-      await this.clearDurableOutbox(clientRequestId);
-      this.post({
-        type: 'sendAccepted',
-        clientRequestId,
+    if (!result.value.messageId) {
+      return { ok: false, reason: 'send completed without message id', code: 'store' };
+    }
+    // Existing task: no snapshotTaskId — workspace patches already update UI.
+    return {
+      ok: true,
+      value: {
         taskId: data.taskId,
         messageId: result.value.messageId,
         turnId: result.value.turnId,
-      });
-    }
-    // Transcript/queue/activity publish via onAfterCommit workspacePatchBatch.
+      },
+    };
   }
 
   /** Mark durable outbox rejected after put — every reject path after durable put. */

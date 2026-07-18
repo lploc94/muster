@@ -1,6 +1,10 @@
 /**
  * Production transcript stream persist adapter (P5-W3).
+ *
+ * Shared by TaskEngine and tests so stream-failure evidence does not re-copy
+ * diagnose/throw logic.
  */
+
 import type { TaskRepository } from './repository';
 import { diagnoseSqliteError } from './sqlite/diagnostics';
 import type { StreamBatchPayload } from './transcript-stream-batcher';
@@ -8,6 +12,7 @@ import type { StreamBatchPayload } from './transcript-stream-batcher';
 export function createTranscriptStreamPersist(input: {
   repository: TaskRepository;
   workspaceId: string;
+  /** When true, refuse all repository access (terminal storage). */
   isStorageTerminal?: () => boolean;
 }): (payload: StreamBatchPayload) => Promise<{ changed: boolean; reason?: string }> {
   return async (payload) => {
