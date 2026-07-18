@@ -13,7 +13,11 @@ import { parentPort, workerData } from 'node:worker_threads';
 import type { DatabaseSync } from 'node:sqlite';
 import { openStoreDatabase } from './connection';
 import { backupOpenDatabase } from './backup';
-import { openDatabaseForReset, resetOpenDatabase } from './reset';
+import {
+  openDatabaseForReset,
+  resetOpenDatabase,
+  verifyResetCommittedConnection,
+} from './reset';
 import type { DbRequest, DbResponse, RunResult, SqlValue } from './rpc';
 import { isAllowedReadPragma, serializeError } from './rpc';
 import type { SqliteOperationClass, SqliteWorkerData } from './errors';
@@ -286,9 +290,9 @@ async function handle(req: DbRequest): Promise<DbResponse> {
         throw new MusterInvariantError('protocol', 'write');
       }
       const recovery = openDatabaseForReset(req.path);
+      let result: { schemaVersion: number };
       try {
-        const result = resetOpenDatabase(recovery, testOpts);
-        return { kind: 'reset', requestId: req.requestId, result };
+        result = resetOpenDatabase(recovery, testOpts);
       } finally {
         try {
           recovery.close();
@@ -296,6 +300,18 @@ async function handle(req: DbRequest): Promise<DbResponse> {
           // best-effort
         }
       }
+      // Reopen committed file independently before reporting success.
+      const verify = openDatabaseForReset(req.path);
+      try {
+        verifyResetCommittedConnection(verify);
+      } finally {
+        try {
+          verify.close();
+        } catch {
+          // best-effort
+        }
+      }
+      return { kind: 'reset', requestId: req.requestId, result };
     }
     case 'close': {
       if (db) {

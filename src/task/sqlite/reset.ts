@@ -114,6 +114,13 @@ function bootstrapCurrentSchema(db: DatabaseSync): void {
   db.exec(`PRAGMA user_version = ${SQLITE_SCHEMA_VERSION}`);
 }
 
+/** Exported for worker post-commit reopen verification. */
+export function verifyResetCommittedConnection(db: DatabaseSync): void {
+  assertResettableOwnership(db);
+  assertReadableConsistent(db);
+  verifyResetResult(db);
+}
+
 function verifyResetResult(db: DatabaseSync): void {
   if (readScalar(db, 'application_id') !== MUSTER_APPLICATION_ID) {
     throw new MusterSqliteError('foreign_database', 'write');
@@ -188,6 +195,10 @@ export function resetOpenDatabase(
     } catch {
       // best-effort post-commit pragmas
     }
+    // Re-verify the committed connection state before reporting success.
+    assertResettableOwnership(db);
+    assertReadableConsistent(db);
+    verifyResetResult(db);
     return { schemaVersion: SQLITE_SCHEMA_VERSION };
   } catch (error) {
     try {
@@ -247,8 +258,9 @@ export function resetDatabaseAtPath(
     return resetOpenDatabase(options.existingDb, options);
   }
   const db = openDatabaseForReset(filePath, options.busyTimeoutMs);
+  let result: ResetResultMeta;
   try {
-    return resetOpenDatabase(db, options);
+    result = resetOpenDatabase(db, options);
   } finally {
     try {
       db.close();
@@ -256,4 +268,17 @@ export function resetDatabaseAtPath(
       // best-effort
     }
   }
+  // Reopen committed file independently before reporting success.
+  const verify = openDatabaseForReset(filePath, options.busyTimeoutMs);
+  try {
+    assertReadableConsistent(verify);
+    verifyResetResult(verify);
+  } finally {
+    try {
+      verify.close();
+    } catch {
+      // best-effort
+    }
+  }
+  return result;
 }

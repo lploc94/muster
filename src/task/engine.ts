@@ -483,6 +483,11 @@ export class TaskEngine {
   private shuttingDown = false;
   /** Terminal storage latch: zero repository writes after this (distinct from graceful shutdown). */
   private storageTerminal = false;
+  /**
+   * Maintenance hold (P5-W5): reject new user/tool mutations while backup/reset
+   * is in progress. Distinct from storageTerminal (no hard abort of live runs).
+   */
+  private maintenanceHold = false;
   private readonly pendingAskPromises = new Map<string, { promise: Promise<Answers>; fingerprint: string }>();
   private settling = new Set<string>();
   /** Live executeTurn closures used to settle unobserved timer flush failures. */
@@ -648,6 +653,32 @@ export class TaskEngine {
   /** True after {@link quiesceForTerminalStorage}. Live paths must skip repository writes. */
   isStorageTerminal(): boolean {
     return this.storageTerminal;
+  }
+
+  /**
+   * Block new host/tool mutations during developer reset maintenance (P5-W5).
+   * Does not abort live runs; shutdown/quiesce still drain them.
+   */
+  beginMaintenanceHold(): void {
+    this.maintenanceHold = true;
+  }
+
+  endMaintenanceHold(): void {
+    this.maintenanceHold = false;
+  }
+
+  isMaintenanceHold(): boolean {
+    return this.maintenanceHold;
+  }
+
+  private rejectIfMaintenanceHold(): EngineResult<never> | undefined {
+    if (this.storageTerminal) {
+      return { ok: false, reason: 'storage terminal' };
+    }
+    if (this.maintenanceHold || this.shuttingDown) {
+      return { ok: false, reason: 'storage maintenance in progress' };
+    }
+    return undefined;
   }
 
   private async reportStreamFlushFailure(turnId: string, message: string): Promise<void> {
@@ -1040,6 +1071,10 @@ export class TaskEngine {
     _tool: string,
     command: ToolCommand,
   ): Promise<{ ok: true; result: unknown } | { ok: false; error: string }> {
+    if (this.storageTerminal) return { ok: false, error: 'storage terminal' };
+    if (this.maintenanceHold || this.shuttingDown) {
+      return { ok: false, error: 'storage maintenance in progress' };
+    }
     // Test/host callers can deliver a tool invocation in the same tick that a
     // queued first turn is being promoted. Give the durable promotion a short
     // chance to publish `running`; never wait for the backend turn itself.
@@ -1160,9 +1195,8 @@ export class TaskEngine {
     /** Phase C idempotent send key. */
     clientRequestId?: string;
   }): Promise<EngineResult<{ taskId: string; messageId: string; turnId: string; clientRequestId?: string }>> {
-    if (this.storageTerminal) {
-      return { ok: false, reason: 'storage terminal' };
-    }
+    const hold = this.rejectIfMaintenanceHold();
+    if (hold) return hold;
     const trust = this.requireWorkspaceTrusted();
     if (!trust.ok) return trust;
     const backend = this.makeBackend(params.backend);
@@ -1559,9 +1593,8 @@ export class TaskEngine {
     content: string,
     options?: { agentContent?: string; clientRequestId?: string },
   ): Promise<EngineResult<{ messageId: string; turnId?: string; clientRequestId?: string }>> {
-    if (this.storageTerminal) {
-      return { ok: false, reason: 'storage terminal' };
-    }
+    const hold = this.rejectIfMaintenanceHold();
+    if (hold) return hold;
     const clientRequestId =
       typeof options?.clientRequestId === 'string' && options.clientRequestId.trim()
         ? options.clientRequestId.trim()

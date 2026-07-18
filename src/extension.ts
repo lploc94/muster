@@ -1180,8 +1180,18 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         projectedRevision !== undefined &&
         projection.snapshot.storeRevision < projectedRevision
       ) {
+        // First treat as ordinary race (local commit during snapshot). After
+        // bounded retries, a still-lower repository revision is external reset.
         if (retryAttempt < 3) {
           return this.postSnapshotAsync(focus, retryAttempt + 1);
+        }
+        const highWater = Math.max(
+          this.appliedWorkspaceRevision,
+          projectedRevision,
+        );
+        if (projection.snapshot.storeRevision < highWater) {
+          await handlePeerExternalReset();
+          return false;
         }
         this.postCommandError('Unable to load task snapshot.');
         return false;
@@ -2249,6 +2259,10 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     });
 
     webviewView.webview.onDidReceiveMessage(async (data) => {
+      if (maintenanceActive && data?.type !== 'debugLog' && data?.type !== 'ready') {
+        this.postCommandError('Muster storage maintenance is in progress. Try again after reload.');
+        return;
+      }
       if (data?.type === 'debugLog') {
         debugMuster(
           typeof data.event === 'string' ? data.event : 'webview.debug',
@@ -3578,9 +3592,27 @@ export async function activate(context: vscode.ExtensionContext) {
         return taskEngine.handleToolCall(ctx, tool, command);
       },
     };
+    const presentationRouter = new PresentationToolRouter(
+      engineToolHandler,
+      presentationManager!,
+    );
+    // Guard before PresentationToolRouter so upsert_presentation cannot bypass
+    // the engine maintenance hold during backup-before-reset.
+    const gatedToolHandler = {
+      handleToolCall: async (
+        ctx: import('./bridge/credentials').CredentialContext,
+        tool: string,
+        command: import('./task/coordinator-tools').ToolCommand,
+      ) => {
+        if (maintenanceActive) {
+          return { ok: false as const, error: 'storage maintenance in progress' };
+        }
+        return presentationRouter.handleToolCall(ctx, tool, command);
+      },
+    };
     bridgeServer = new MusterBridgeServer({
       credentials: credentialRegistry,
-      toolHandler: new PresentationToolRouter(engineToolHandler, presentationManager),
+      toolHandler: gatedToolHandler,
     });
     const { port } = await bridgeServer.listen();
 
@@ -3845,6 +3877,16 @@ function registerSqliteMaintenanceCommands(
         isMaintenanceActive: () => maintenanceActive,
         setMaintenanceActive: (active) => {
           maintenanceActive = active;
+          try {
+            if (active) {
+              taskEngine?.beginMaintenanceHold();
+            } else {
+              // Release only when the engine is still attached (pre-quiesce cancel/fail).
+              taskEngine?.endMaintenanceHold();
+            }
+          } catch {
+            // best-effort
+          }
         },
         quiesceForMaintenance: async () => {
           await quiesceForMaintenance({
@@ -3859,10 +3901,38 @@ function registerSqliteMaintenanceCommands(
                 // best-effort
               }
               try {
+                elicitationBridge?.cancelAll();
+              } catch {
+                // best-effort
+              }
+              try {
                 permissionBridge?.cancelAll();
               } catch {
                 // best-effort
               }
+              try {
+                setPermissionController(null);
+                setQuestionController(null);
+                setElicitationController(null);
+              } catch {
+                // best-effort
+              }
+              try {
+                credentialRegistry?.revokeAll();
+              } catch {
+                // best-effort
+              }
+              try {
+                presentationManager?.setDocumentStore(undefined);
+              } catch {
+                // best-effort
+              }
+              try {
+                await bridgeServer?.close();
+              } catch {
+                // best-effort
+              }
+              bridgeServer = undefined;
             },
             clearHostRefs: () => {
               taskEngine = undefined;
