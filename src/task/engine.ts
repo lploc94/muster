@@ -611,31 +611,28 @@ export class TaskEngine {
     return result;
   }
 
-  /** Acquire the durable per-turn cross-process ownership claim. */
+  /**
+   * Acquire the durable per-turn cross-process ownership claim.
+   * Domain contention (changed=false) is normal. Storage busy/full/etc. must not
+   * collapse into false — rethrow so the scheduler can fail-clear with a signal
+   * instead of leaving a queued turn silent (P5-W1 finding 5).
+   */
   private async claimRuntimeTurn(turnId: string, expiresAt: string): Promise<boolean> {
     const now = nowIso(this.clock);
-    try {
-      const result = await this.repository.execute({
-        kind: 'claimRuntime', workspaceId: this.workspaceId, turnId,
-        ownerId: this.runtimeOwnerId, claimedAt: now, heartbeatAt: now, expiresAt,
-      });
-      return result.changed === true;
-    } catch {
-      return false;
-    }
+    const result = await this.repository.execute({
+      kind: 'claimRuntime', workspaceId: this.workspaceId, turnId,
+      ownerId: this.runtimeOwnerId, claimedAt: now, heartbeatAt: now, expiresAt,
+    });
+    return result.changed === true;
   }
 
   private async heartbeatRuntimeTurn(turnId: string, expiresAt: string): Promise<boolean> {
     const now = nowIso(this.clock);
-    try {
-      const result = await this.repository.execute({
-        kind: 'heartbeatRuntime', workspaceId: this.workspaceId, turnId,
-        ownerId: this.runtimeOwnerId, heartbeatAt: now, expiresAt,
-      });
-      return result.changed === true;
-    } catch {
-      return false;
-    }
+    const result = await this.repository.execute({
+      kind: 'heartbeatRuntime', workspaceId: this.workspaceId, turnId,
+      ownerId: this.runtimeOwnerId, heartbeatAt: now, expiresAt,
+    });
+    return result.changed === true;
   }
 
   private async releaseRuntimeTurn(turnId: string): Promise<void> {
@@ -3436,7 +3433,22 @@ export class TaskEngine {
     // The conditional row update is the cross-process fence and stale claims are
     // reclaimed by expiry.
     const initialExpiry = new Date(Date.now() + DEFAULT_RUN_LIMIT_MS + LEASE_CLEANUP_BUFFER_MS).toISOString();
-    if (!(await this.claimRuntimeTurn(turnId, initialExpiry))) {
+    try {
+      if (!(await this.claimRuntimeTurn(turnId, initialExpiry))) {
+        // Domain contention: another host owns the claim. Not a storage fault.
+        return;
+      }
+    } catch (error) {
+      // Storage busy/full/etc. must surface — never silent false (P5-W1).
+      const { diagnoseSqliteError } = await import('./sqlite/diagnostics');
+      const diagnostic = diagnoseSqliteError(error, 'transaction');
+      const taskId = this.store.getFile().turns[turnId]?.taskId ?? '';
+      this.safeEmit({
+        type: 'turnError',
+        taskId,
+        turnId,
+        message: diagnostic.message,
+      });
       return;
     }
     const releaseClaim = (): void => { void this.releaseRuntimeTurn(turnId); };
@@ -3509,7 +3521,16 @@ export class TaskEngine {
         void this.heartbeatRuntimeTurn(
           turnId,
           new Date(deadline + LEASE_CLEANUP_BUFFER_MS).toISOString(),
-        );
+        ).catch(async (error) => {
+          const { diagnoseSqliteError } = await import('./sqlite/diagnostics');
+          const diagnostic = diagnoseSqliteError(error, 'transaction');
+          this.safeEmit({
+            type: 'turnError',
+            taskId: startedTurn.taskId,
+            turnId,
+            message: diagnostic.message,
+          });
+        });
       }
     }
     this.safeEmit({

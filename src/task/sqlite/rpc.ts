@@ -85,24 +85,51 @@ export type DbResponse =
   | {
       kind: 'error';
       requestId: number;
-      /** Structured, non-secret error (plan §3.4: no SQL params / content in logs). */
+      /**
+       * Safe boundary envelope only (P5-W1). Fixed code + operation class +
+       * category; message is always rewritten from the taxonomy table.
+       */
       message: string;
-      code?: string;
+      code: string;
       name: string;
+      operation: string;
+      errorKind: string;
     };
 
 /** Serializable error shape for crossing the worker boundary without leaking params. */
 export interface SerializedDbError {
   message: string;
-  code?: string;
+  code: string;
   name: string;
+  operation: string;
+  errorKind: string;
 }
 
-export function serializeError(error: unknown): SerializedDbError {
-  const err = error as { message?: unknown; code?: unknown; name?: unknown };
+export {
+  mapToMusterSqliteError,
+  serializeMusterError,
+  type SqliteErrorCode,
+  type SqliteOperationClass,
+} from './errors';
+
+export { validateRpcErrorPayload, makeProtocolError } from './protocol';
+
+import { serializeMusterError, type SqliteOperationClass } from './errors';
+
+/**
+ * Serialize any thrown value into a safe RPC error. Raw SQLite messages, SQL,
+ * params and paths are never copied onto the wire.
+ */
+export function serializeError(
+  error: unknown,
+  operation: SqliteOperationClass = 'unknown',
+): SerializedDbError {
+  const safe = serializeMusterError(error, operation);
   return {
-    message: typeof err.message === 'string' ? err.message : String(error),
-    code: typeof err.code === 'string' ? err.code : undefined,
-    name: typeof err.name === 'string' ? err.name : 'Error',
+    message: safe.message,
+    code: safe.code,
+    name: safe.name,
+    operation: safe.operation,
+    errorKind: safe.kind,
   };
 }

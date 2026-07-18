@@ -3,12 +3,7 @@
  *
  * Spawns the DB worker thread, sends typed {@link DbRequest}s, and resolves typed
  * responses as promises. This is the ONLY object the extension host uses to reach
- * SQLite — it never opens `DatabaseSync` on the main thread. Requests are matched
- * to responses by a monotonic `requestId`; the worker replies to each exactly once.
- *
- * The worker script path differs by runtime: compiled `dist/.../worker.js` in a
- * packaged extension, or the `.ts` source under tsx in tests/dev. The caller passes
- * the resolved path so this module stays environment-agnostic and testable.
+ * SQLite — it never opens `DatabaseSync` on the main thread.
  */
 import { Worker } from 'node:worker_threads';
 import * as path from 'node:path';
@@ -20,15 +15,22 @@ import type {
   SqlStatement,
   SqlValue,
 } from './rpc';
+import {
+  MusterSqliteError,
+  isTerminalStorageCode,
+  mapToMusterSqliteError,
+  type SafeSerializedDbError,
+  type SqliteFaultPlan,
+  type SqliteWorkerData,
+} from './errors';
+import {
+  makeProtocolError,
+  parseWireErrorResponse,
+  parseWireSuccessResponse,
+} from './protocol';
 
 /**
  * Resolve the DB worker script for the CURRENT runtime.
- *
- * In a packaged/compiled extension this module is `dist/.../sqlite/client.js` and
- * the worker sits next to it as `worker.js`. Under tsx (tests/dev) `__dirname` is
- * the `.ts` source dir and only `worker.ts` exists. We prefer the sibling `.js`
- * (production) and fall back to `.ts` (dev) so callers never hard-code a path that
- * only works in one runtime — the packaging correctness gap the audit flagged.
  */
 export function resolveWorkerPath(dir: string = __dirname): string {
   const js = path.join(dir, 'worker.js');
@@ -38,11 +40,6 @@ export function resolveWorkerPath(dir: string = __dirname): string {
   return path.join(dir, 'worker.ts');
 }
 
-/**
- * A request minus its `requestId`, preserving the discriminated union. A plain
- * `Omit<DbRequest, 'requestId'>` collapses the union and drops each variant's own
- * properties (`sql`, `path`, …), so it must be distributed over the union first.
- */
 type PendingRequest = DbRequest extends infer R
   ? R extends { requestId: number }
     ? Omit<R, 'requestId'>
@@ -50,9 +47,16 @@ type PendingRequest = DbRequest extends infer R
   : never;
 
 export class DbWorkerError extends Error {
-  constructor(readonly detail: { name: string; code?: string; message: string }) {
+  readonly code: string;
+  readonly operation: string;
+  readonly kind: string;
+
+  constructor(readonly detail: SafeSerializedDbError) {
     super(detail.message);
     this.name = 'DbWorkerError';
+    this.code = detail.code;
+    this.operation = detail.operation;
+    this.kind = detail.kind;
   }
 }
 
@@ -62,10 +66,16 @@ interface Pending {
 }
 
 export interface DbClientOptions {
-  /** Resolved path to the worker script (dist worker.js in prod, worker.ts in tests). */
   workerPath: string;
-  /** Optional execArgv for the worker (tests pass tsx loader flags). */
   execArgv?: string[];
+  /**
+   * Explicit test/UAT fault capability. Production callers never set this.
+   * Ambient MUSTER_SQLITE_FAULT_* env is ignored without this flag.
+   */
+  faultCapability?: boolean;
+  faultPlan?: SqliteFaultPlan;
+  /** Called once when storage latches terminal (corrupt / not_a_database / protocol). */
+  onTerminalStorageError?: (error: DbWorkerError) => void;
 }
 
 export class DbClient {
@@ -73,43 +83,148 @@ export class DbClient {
   private readonly pending = new Map<number, Pending>();
   private nextRequestId = 1;
   private closed = false;
-  private fatalError: Error | undefined;
+  /** First latched fatal wins; never overwritten by exit/unknown. */
+  private fatalError: DbWorkerError | undefined;
+  private terminalNotified = false;
+  private intentionalTerminate = false;
+  private readonly onTerminalStorageError?: (error: DbWorkerError) => void;
+  private readonly faultCapability: boolean;
 
   constructor(opts: DbClientOptions) {
+    this.faultCapability = opts.faultCapability === true;
+    this.onTerminalStorageError = opts.onTerminalStorageError;
+    const data: SqliteWorkerData = this.faultCapability
+      ? {
+          faultCapability: true,
+          ...(opts.faultPlan ? { faultPlan: opts.faultPlan } : {}),
+        }
+      : {};
     this.worker = new Worker(opts.workerPath, {
       ...(opts.execArgv ? { execArgv: opts.execArgv } : {}),
+      workerData: data,
     });
-    this.worker.on('message', (res: DbResponse) => this.onMessage(res));
-    this.worker.on('error', (err: unknown) =>
-      this.onFatal(err instanceof Error ? err : new Error(String(err))),
-    );
+    this.worker.on('message', (res: unknown) => this.onMessage(res));
+    this.worker.on('error', (err: unknown) => this.onFatal(err, { fromWorker: true }));
     this.worker.on('exit', (code) => {
-      if (code !== 0 && !this.closed) {
-        this.onFatal(new Error(`sqlite worker exited unexpectedly with code ${code}`));
+      if (this.intentionalTerminate || this.closed) {
+        return;
       }
+      // Unexpected exit (including clean code 0) must fail closed and reject pending.
+      this.onFatal(new MusterSqliteError('unknown', 'unknown'), { fromWorker: true });
+      void code;
     });
   }
 
-  private onMessage(res: DbResponse): void {
-    const pending = this.pending.get(res.requestId);
-    if (!pending) {
-      return;
-    }
-    this.pending.delete(res.requestId);
-    if (res.kind === 'error') {
-      pending.reject(new DbWorkerError({ name: res.name, code: res.code, message: res.message }));
-      return;
-    }
-    pending.resolve(res);
+  private sanitizeFatal(error: unknown): DbWorkerError {
+    const mapped = mapToMusterSqliteError(error, 'unknown');
+    return new DbWorkerError({
+      name: mapped.name,
+      code: mapped.code,
+      operation: mapped.operation,
+      message: mapped.message,
+      kind: mapped.kind,
+    });
   }
 
-  /** Reject every in-flight request when the worker dies; no request hangs forever. */
-  private onFatal(error: Error): void {
+  private notifyTerminalOnce(error: DbWorkerError): void {
+    if (this.terminalNotified) return;
+    this.terminalNotified = true;
+    try {
+      this.onTerminalStorageError?.(error);
+    } catch {
+      // Host callback must never break the latch path.
+    }
+  }
+
+  /**
+   * Latch first fatal. Intentional terminate after latch does not overwrite.
+   * Terminal storage codes and protocol fatals both latch.
+   * Every pending request is rejected with the same first-fatal error.
+   */
+  private latchFatal(error: DbWorkerError, options?: { terminate?: boolean }): void {
+    if (this.fatalError) {
+      // First fatal wins — never overwrite corrupt with unknown.
+      this.rejectAll(this.fatalError);
+      return;
+    }
     this.fatalError = error;
+    this.notifyTerminalOnce(error);
+    this.rejectAll(error);
+    if (options?.terminate !== false) {
+      this.intentionalTerminate = true;
+      void this.worker.terminate();
+    }
+  }
+
+  private rejectAll(error: DbWorkerError): void {
     for (const [, pending] of this.pending) {
       pending.reject(error);
     }
     this.pending.clear();
+  }
+
+  private onFatal(error: unknown, _meta?: { fromWorker?: boolean }): void {
+    if (this.fatalError) {
+      // Already latched — reject any stragglers with the original code.
+      this.rejectAll(this.fatalError);
+      return;
+    }
+    const safe = this.sanitizeFatal(error);
+    this.latchFatal(safe, { terminate: false });
+    this.rejectAll(safe);
+  }
+
+  private onMessage(raw: unknown): void {
+    // Error envelope?
+    if (raw && typeof raw === 'object' && (raw as { kind?: unknown }).kind === 'error') {
+      const parsed = parseWireErrorResponse(raw);
+      if (!parsed.ok) {
+        const err = new DbWorkerError(parsed.payload);
+        this.latchFatal(err);
+        this.rejectAll(err);
+        return;
+      }
+      const pending = this.pending.get(parsed.requestId);
+      if (!pending) {
+        // Stale/unknown response id after fatal is ignored; otherwise protocol.
+        if (!this.fatalError) {
+          const err = new DbWorkerError(makeProtocolError());
+          this.latchFatal(err);
+          this.rejectAll(err);
+        }
+        return;
+      }
+      this.pending.delete(parsed.requestId);
+      const err = new DbWorkerError(parsed.payload);
+      if (isTerminalStorageCode(parsed.payload.code) || parsed.payload.code === 'protocol') {
+        // Re-queue current request so latchFatal rejectAll settles it with peers.
+        this.pending.set(parsed.requestId, pending);
+        this.latchFatal(err);
+        return;
+      }
+      pending.reject(err);
+      return;
+    }
+
+    const success = parseWireSuccessResponse(raw);
+    if (!success.ok) {
+      const err = new DbWorkerError(success.payload);
+      this.latchFatal(err);
+      this.rejectAll(err);
+      return;
+    }
+    const res = success.response;
+    const pending = this.pending.get(res.requestId);
+    if (!pending) {
+      if (!this.fatalError) {
+        const err = new DbWorkerError(makeProtocolError());
+        this.latchFatal(err);
+        this.rejectAll(err);
+      }
+      return;
+    }
+    this.pending.delete(res.requestId);
+    pending.resolve(res);
   }
 
   private send(req: PendingRequest): Promise<DbResponse> {
@@ -117,7 +232,15 @@ export class DbClient {
       return Promise.reject(this.fatalError);
     }
     if (this.closed) {
-      return Promise.reject(new Error('DbClient is closed'));
+      return Promise.reject(
+        new DbWorkerError({
+          name: 'MusterInvariantError',
+          code: 'invariant',
+          operation: 'close',
+          message: 'Muster hit an internal storage invariant error.',
+          kind: 'invariant',
+        }),
+      );
     }
     const requestId = this.nextRequestId++;
     const full = { ...req, requestId } as DbRequest;
@@ -133,34 +256,45 @@ export class DbClient {
 
   async all<T = unknown>(sql: string, params?: SqlValue[]): Promise<T[]> {
     const res = await this.send({ kind: 'all', sql, ...(params ? { params } : {}) });
-    return res.kind === 'rows' ? (res.rows as T[]) : [];
+    if (res.kind !== 'rows') {
+      throw new DbWorkerError(makeProtocolError());
+    }
+    return res.rows as T[];
   }
 
   async get<T = unknown>(sql: string, params?: SqlValue[]): Promise<T | undefined> {
     const res = await this.send({ kind: 'get', sql, ...(params ? { params } : {}) });
-    if (res.kind === 'row') {
-      return (res.row as T | null) ?? undefined;
+    if (res.kind !== 'row') {
+      throw new DbWorkerError(makeProtocolError());
     }
-    return undefined;
+    return (res.row as T | null) ?? undefined;
   }
 
   async run(sql: string, params?: SqlValue[]): Promise<RunResult> {
     const res = await this.send({ kind: 'run', sql, ...(params ? { params } : {}) });
-    return res.kind === 'run' ? res.result : { changes: 0, lastInsertRowid: 0 };
+    if (res.kind !== 'run') {
+      throw new DbWorkerError(makeProtocolError());
+    }
+    return res.result;
   }
 
-  /** Run an ordered statement batch inside one IMMEDIATE transaction (all-or-nothing). */
   async transaction(
     statements: SqlStatement[],
     options: { abortIfFirstUnchanged?: boolean; abortIfUnchangedAt?: number[] } = {},
   ): Promise<RunResult[]> {
     const res = await this.send({ kind: 'transaction', statements, ...options });
-    return res.kind === 'transaction' ? res.results : [];
+    if (res.kind !== 'transaction') {
+      throw new DbWorkerError(makeProtocolError());
+    }
+    return res.results;
   }
 
   async pragma(pragma: string): Promise<number> {
     const res = await this.send({ kind: 'pragma', pragma });
-    return res.kind === 'scalar' ? res.value : 0;
+    if (res.kind !== 'scalar') {
+      throw new DbWorkerError(makeProtocolError());
+    }
+    return res.value;
   }
 
   async close(): Promise<void> {
@@ -168,11 +302,14 @@ export class DbClient {
       return;
     }
     try {
-      await this.send({ kind: 'close' });
+      if (!this.fatalError) {
+        await this.send({ kind: 'close' });
+      }
     } catch {
-      // worker may already be gone; terminate regardless
+      // worker may already be gone
     }
     this.closed = true;
+    this.intentionalTerminate = true;
     await this.worker.terminate();
   }
 }

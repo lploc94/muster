@@ -24,6 +24,7 @@ import {
   MUSTER_APPLICATION_ID,
   SQLITE_SCHEMA_VERSION,
 } from './schema';
+import { MusterSqliteError } from './errors';
 
 export interface OpenOptions {
   /** Filesystem path to `muster.sqlite3` (or ':memory:' in tests). */
@@ -54,13 +55,13 @@ function waitBeforeOpenRetry(attempt: number): void {
   Atomics.wait(OPEN_RETRY_WAIT, 0, 0, delayMs);
 }
 
-/** Thrown when the DB file belongs to a different application_id (not Muster's). */
-export class ForeignDatabaseError extends Error {
+/**
+ * Thrown when the DB file belongs to a different application_id (not Muster's).
+ * Wire-safe: message has no path; observed id stays in a non-serialized field.
+ */
+export class ForeignDatabaseError extends MusterSqliteError {
   constructor(readonly observedApplicationId: number) {
-    super(
-      `SQLite application_id ${observedApplicationId} is not Muster's ` +
-        `(${MUSTER_APPLICATION_ID}); refusing to touch a foreign database`,
-    );
+    super('foreign_database', 'open');
     this.name = 'ForeignDatabaseError';
   }
 }
@@ -69,12 +70,9 @@ export class ForeignDatabaseError extends Error {
  * Thrown when an existing development DB does not match the current schema, or a
  * Muster-owned file is incomplete/corrupt. Always includes developer reset guidance.
  */
-export class IncompatibleSchemaError extends Error {
+export class IncompatibleSchemaError extends MusterSqliteError {
   constructor(readonly observedVersion: number) {
-    super(
-      `SQLite schema version ${observedVersion} does not match required version ` +
-        `${SQLITE_SCHEMA_VERSION}. Reset the Muster development database and reopen VS Code.`,
-    );
+    super('incompatible_schema', 'open');
     this.name = 'IncompatibleSchemaError';
   }
 }
@@ -83,15 +81,15 @@ export class IncompatibleSchemaError extends Error {
  * Thrown when application_id/user_version look blank but the file already has
  * user schema objects. Muster never silently claims a non-empty foreign file.
  */
-export class NonEmptyUnclaimedDatabaseError extends Error {
+export class NonEmptyUnclaimedDatabaseError extends MusterSqliteError {
   constructor() {
-    super(
-      'SQLite file is unclaimed (application_id=0, user_version=0) but already contains ' +
-        'schema objects. Reset or remove the file; Muster will not take ownership.',
-    );
+    super('nonempty_unclaimed', 'open');
     this.name = 'NonEmptyUnclaimedDatabaseError';
   }
 }
+
+// Schema version remains the ownership gate; it is not serialized on the RPC wire.
+void SQLITE_SCHEMA_VERSION;
 
 function readScalar(db: DatabaseSync, pragma: string): number {
   const row = db.prepare(`PRAGMA ${pragma}`).get() as Record<string, number> | undefined;

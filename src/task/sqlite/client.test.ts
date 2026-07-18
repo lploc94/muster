@@ -122,7 +122,69 @@ describe('DbClient <-> worker RPC', () => {
     } catch (error) {
       expect(error).toBeInstanceOf(DbWorkerError);
       const detail = (error as DbWorkerError).detail;
-      expect(detail.message).toMatch(/no such table/i);
+      // P5-W1: raw SQLite messages never cross the wire; fixed taxonomy only.
+      expect(detail.code).toBe('unknown');
+      expect(detail.name).toBe('MusterSqliteError');
+      expect(detail.operation).toBe('write');
+      expect(detail.message).toBe('Muster SQLite storage is temporarily unavailable.');
+      expect(JSON.stringify(detail)).not.toMatch(/nonexistent_table|SELECT|FROM/i);
+    }
+  }, 20_000);
+
+  it('injects a transaction fault at commit boundary and rolls back atomically', async () => {
+    // Explicit capability only — ambient env must not arm production clients.
+    process.env.MUSTER_SQLITE_FAULT_INJECT = '1';
+    process.env.MUSTER_SQLITE_FAULT_CODE = 'full';
+    try {
+      const ambient = new DbClient({ workerPath: WORKER_TS, execArgv: TSX_ARGV });
+      clients.push(ambient);
+      await ambient.open(tempDbPath());
+      await ambient.transaction([
+        {
+          sql: `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
+                VALUES (?,?,?,?,?)`,
+          params: ['ws-ambient', 'key-a', 'WS', 'now', 'now'],
+        },
+      ]);
+      expect(await ambient.all('SELECT id FROM workspaces')).toHaveLength(1);
+
+      const faultClient = new DbClient({
+        workerPath: WORKER_TS,
+        execArgv: TSX_ARGV,
+        faultCapability: true,
+        faultPlan: { code: 'full', operation: 'transaction', remaining: 1 },
+      });
+      clients.push(faultClient);
+      await faultClient.open(tempDbPath());
+      await expect(
+        faultClient.transaction([
+          {
+            sql: `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
+                  VALUES (?,?,?,?,?)`,
+            params: ['ws-fault', 'key-fault', 'WS', 'now', 'now'],
+          },
+        ]),
+      ).rejects.toMatchObject({
+        detail: {
+          code: 'full',
+          operation: 'transaction',
+          name: 'MusterSqliteError',
+          kind: 'operational',
+        },
+      });
+      // Fault exhausted after one shot; a later write succeeds and proves rollback.
+      await faultClient.transaction([
+        {
+          sql: `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
+                VALUES (?,?,?,?,?)`,
+          params: ['ws-ok', 'key-ok', 'WS', 'now', 'now'],
+        },
+      ]);
+      const rows = await faultClient.all<{ id: string }>('SELECT id FROM workspaces ORDER BY id');
+      expect(rows.map((r) => r.id)).toEqual(['ws-ok']);
+    } finally {
+      delete process.env.MUSTER_SQLITE_FAULT_INJECT;
+      delete process.env.MUSTER_SQLITE_FAULT_CODE;
     }
   }, 20_000);
 
@@ -149,6 +211,124 @@ describe('DbClient <-> worker RPC', () => {
     // WAL: a separate connection sees the committed row.
     const row = await reader.get<{ id: string }>('SELECT id FROM workspaces WHERE id = ?', ['ws1']);
     expect(row?.id).toBe('ws1');
+  }, 20_000);
+});
+
+describe('DbClient terminal latch lifecycle', () => {
+  it('rejects every concurrent pending request with the same corrupt code (no hang)', async () => {
+    const { Worker } = await import('node:worker_threads');
+    const { safeMessageForCode } = await import('./errors');
+    // Fake worker: first transaction → corrupt; second stays pending until host terminates.
+    const script = `
+      const { parentPort } = require('node:worker_threads');
+      let n = 0;
+      parentPort.on('message', (req) => {
+        if (req.kind === 'open') {
+          parentPort.postMessage({ kind: 'ok', requestId: req.requestId });
+          return;
+        }
+        if (req.kind === 'transaction') {
+          n += 1;
+          if (n === 1) {
+            parentPort.postMessage({
+              kind: 'error',
+              requestId: req.requestId,
+              name: 'MusterSqliteError',
+              code: 'corrupt',
+              operation: 'transaction',
+              message: ${JSON.stringify(safeMessageForCode('corrupt'))},
+              errorKind: 'operational',
+            });
+            return;
+          }
+          // leave second hanging; host must rejectAll on fatal
+        }
+      });
+    `;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-fake-worker-'));
+    tempDirs.push(dir);
+    const workerPath = path.join(dir, 'fake-worker.js');
+    fs.writeFileSync(workerPath, script, 'utf8');
+    const terminal = { count: 0 };
+    const client = new DbClient({
+      workerPath,
+      onTerminalStorageError: () => {
+        terminal.count += 1;
+      },
+    });
+    clients.push(client);
+    await client.open(tempDbPath());
+    const first = client.transaction([
+      { sql: 'SELECT 1', params: [] },
+    ]);
+    const second = client.transaction([
+      { sql: 'SELECT 2', params: [] },
+    ]);
+    const settled = await Promise.allSettled([first, second]);
+    expect(settled[0]?.status).toBe('rejected');
+    expect(settled[1]?.status).toBe('rejected');
+    expect((settled[0] as PromiseRejectedResult).reason).toMatchObject({
+      detail: { code: 'corrupt' },
+    });
+    expect((settled[1] as PromiseRejectedResult).reason).toMatchObject({
+      detail: { code: 'corrupt' },
+    });
+    expect(terminal.count).toBe(1);
+    await new Promise((r) => setTimeout(r, 150));
+    await expect(client.transaction([{ sql: 'SELECT 3' }])).rejects.toMatchObject({
+      detail: { code: 'corrupt' },
+    });
+    expect(terminal.count).toBe(1);
+  }, 20_000);
+
+  it('malformed response latches protocol and rejects every pending request', async () => {
+    const script = `
+      const { parentPort } = require('node:worker_threads');
+      parentPort.on('message', (req) => {
+        if (req.kind === 'open') {
+          parentPort.postMessage({ kind: 'ok', requestId: req.requestId });
+          return;
+        }
+        parentPort.postMessage({ kind: 'error', requestId: req.requestId, code: 'full' });
+      });
+    `;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-fake-worker-'));
+    tempDirs.push(dir);
+    const workerPath = path.join(dir, 'fake-worker.js');
+    fs.writeFileSync(workerPath, script, 'utf8');
+    const client = new DbClient({ workerPath });
+    clients.push(client);
+    await client.open(tempDbPath());
+    const a = client.transaction([{ sql: 'SELECT 1' }]);
+    const b = client.transaction([{ sql: 'SELECT 2' }]);
+    const settled = await Promise.allSettled([a, b]);
+    for (const s of settled) {
+      expect(s.status).toBe('rejected');
+      expect((s as PromiseRejectedResult).reason).toMatchObject({
+        detail: { code: 'protocol' },
+      });
+    }
+  }, 20_000);
+
+  it('unexpected clean worker exit rejects pending rather than hanging', async () => {
+    const script = `
+      const { parentPort } = require('node:worker_threads');
+      parentPort.on('message', (req) => {
+        if (req.kind === 'open') {
+          parentPort.postMessage({ kind: 'ok', requestId: req.requestId });
+          return;
+        }
+        process.exit(0);
+      });
+    `;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-fake-worker-'));
+    tempDirs.push(dir);
+    const workerPath = path.join(dir, 'fake-worker.js');
+    fs.writeFileSync(workerPath, script, 'utf8');
+    const client = new DbClient({ workerPath });
+    clients.push(client);
+    await client.open(tempDbPath());
+    await expect(client.transaction([{ sql: 'SELECT 1' }])).rejects.toBeInstanceOf(DbWorkerError);
   }, 20_000);
 });
 

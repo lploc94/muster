@@ -3,8 +3,9 @@
 ## Trạng thái
 
 **COMPLETE — Phase 4 W1–W11 đã qua SQLite-only cutover, paging/patching,
-multi-window convergence và release/UAT gates.**
-Cập nhật: 2026-07-17
+multi-window convergence và release/UAT gates. Phase 5 được chốt thành 7 wave,
+thực thi theo 3 batch hardening.**
+Cập nhật: 2026-07-18
 
 - Phase 1: **đã qua gate** — worker/RPC, schema bootstrap, global-storage registry,
   lock/crash/concurrent-open checks, packaged desktop smoke trên minimum/current
@@ -918,12 +919,165 @@ request; fixed page limit 100; **no W6 recovery**.
 
 ### Phase 5 — SQLite hardening
 
-- Corrupt/disk-full diagnostics và explicit developer reset command.
-- Telemetry nếu có chỉ dùng timing/count, không gửi content/path.
-- Live backup/export policy dùng SQLite-aware mechanism.
+Phase này chỉ harden **behavior của Muster tại SQLite boundary**; không viết test để chứng
+minh lại correctness nội tại của `node:sqlite`/SQLite. Không thêm migration, backward
+compatibility, JSON fallback, telemetry framework, activation `VACUUM`, full-history
+hydration hoặc raw-copy file main trong lúc WAL hoạt động. Các test Phase 4 còn đúng phải
+được reuse/strengthen, không nhân đôi chỉ để tăng số test.
 
-**Gate:** fault-injection cho corrupt/disk-full/backup và mọi lỗi đều fail rõ, không reset
-hay mất row âm thầm.
+#### Cách thực thi: 7 wave trong 3 batch
+
+- **Batch A:** P5-W1 → P5-W3. Agent chạy liên tục cả ba wave, tạo **một commit riêng cho
+  từng wave**, chạy targeted gate sau mỗi commit và full gate ở cuối batch; không dừng hỏi
+  giữa wave nếu không có blocker correctness thật.
+- **Batch B:** P5-W4 → P5-W5, cùng quy tắc hai commit riêng + full gate cuối batch.
+- **Batch C:** P5-W6 → P5-W7, cùng quy tắc hai commit riêng + full gate cuối batch.
+- Mỗi batch bắt đầu từ parent sạch, không amend/squash commit của batch trước và dừng sau
+  báo cáo cuối batch. Không tự bắt đầu batch kế tiếp.
+
+#### P5-W1 — Safe error contract và fault-injection boundary ✅
+
+- Inventory error path từ `node:sqlite` worker/RPC → client/repository → activation/engine/
+  command UI; chốt một structured error taxonomy tối thiểu cho corrupt/not-a-database,
+  full, readonly, I/O, busy/locked timeout, incompatible/foreign database và unknown.
+- Error qua RPC chỉ mang fixed code + safe operation class; user-facing message/action được
+  map ở host. Không serialize raw SQL, bound params, prompt/tool output, cursor, credential,
+  stack hoặc filesystem path vào RPC/log/telemetry/evidence. Path chỉ được hiện trực tiếp
+  trong recovery UI khi user cần tìm database, không đi qua diagnostic payload dùng chung.
+- Tạo deterministic fault-injection seam tại Muster DB boundary, chỉ bật trong test/UAT và
+  không có production setting/command. Nó inject lỗi trước commit/backup theo operation
+  class; không monkey-patch để kiểm thử implementation nội tại của SQLite.
+- Giữ programmer/invariant errors phân biệt với operational SQLite errors; không biến mọi
+  exception thành `unavailable` và không swallow `SQLITE_BUSY`.
+
+**Gate P5-W1:** mapping/error guards/fault seam có targeted tests; invalid payload fail
+closed; production build không expose fault control; source boundary cấm raw SQLite error
+hoặc params vượt khỏi DB boundary.
+
+#### P5-W2 — Corrupt database fail-closed và recovery diagnostics
+
+- Open/read path nhận diện corrupt/not-a-database và owned-but-incompatible state trước mọi
+  durable mutation. Không tự rename, delete, stamp, reset, bootstrap đè hoặc fallback sang
+  database/JSON rỗng.
+- Khi DB không dùng được: đóng connection, không khởi động scheduler/poller/writer trên
+  partial state, giữ Extension Host responsive và hiện diagnostic ổn định với recovery
+  action. Không chạy full `integrity_check` trên mọi activation nếu không có evidence cần.
+- Phân biệt foreign DB, schema dev không tương thích và physical corruption để hướng dẫn
+  đúng; tất cả vẫn fail closed. Malformed durable row tiếp tục là invariant error, không
+  silently skip.
+- Fault fixtures tối thiểu gồm garbage/not-a-database, truncated/corrupt owned DB, foreign
+  `application_id`, incompatible `user_version` và valid reopen. Reject case phải chứng
+  minh journal/application/schema/source bytes không bị Muster sửa ngoài side effect do
+  chính SQLite open không thể tránh.
+
+**Gate P5-W2:** activation/runtime corrupt cases báo rõ nhưng redacted, zero silent reset,
+zero empty-store continuation, không mutate file bị reject và valid database vẫn mở bình
+thường.
+
+#### P5-W3 — Durable write failure: full/readonly/I/O/busy
+
+- Normalize `SQLITE_FULL`, `SQLITE_READONLY`, relevant `SQLITE_IOERR`, và exhausted
+  `SQLITE_BUSY`/`SQLITE_LOCKED` thành contract W1; retry chỉ bounded ở nơi policy cho phép,
+  không retry storm hoặc biến lỗi thành success.
+- Transaction failure phải rollback atomically. Host không ACK/post patch/revision hoặc
+  cập nhật projection như durable trước commit; streaming buffer không được làm mất hoặc
+  nhân đôi segment khi explicit boundary xử lý lỗi.
+- Engine/command UI đi vào trạng thái lỗi recoverable/fail rõ theo operation thay vì tiếp
+  tục trên projection giả. Extension-host main thread vẫn không bị busy timeout block.
+- Reuse test durable-before-visible và injected disk-full của P4-W8; mở rộng vào repository
+  transaction, revision/change feed, outbox và một representative command path. Assert row/
+  revision trước lỗi không đổi và reopen đọc được state cũ.
+
+**Gate P5-W3 / Batch A:** fault tests full/readonly/I/O/busy đều rollback và redacted;
+không ACK giả, không mất row âm thầm; TypeScript, Svelte, webview build, full unit suite và
+source/repository boundaries xanh; ba commit W1/W2/W3 riêng, worktree sạch.
+
+#### P5-W4 — SQLite-aware live backup primitive
+
+- Spike API thực tế trên minimum/current VS Code Extension Host rồi chọn mechanism được
+  runtime support: ưu tiên SQLite backup API; fallback chỉ được là SQLite-coordinated
+  snapshot/checkpoint mechanism có correctness test. Tuyệt đối không `copyFile` riêng
+  `muster.sqlite3` khi WAL có thể chứa committed rows.
+- Backup chạy qua DB worker/lifecycle boundary, tạo consistent snapshot trong khi writer
+  khác có thể hoạt động, không block extension-host main thread và không giữ write
+  transaction suốt lúc user chọn destination.
+- Ghi vào temporary sibling của destination rồi publish atomically khi thành công; failure/
+  cancel dọn partial artifact nhưng không đụng source hay backup tốt có sẵn. Destination
+  overwrite phải explicit.
+- Verify artifact bằng reopen + Muster `application_id`/current schema và SQLite-aware
+  consistency check phù hợp. Kết quả API chỉ trả metadata cần cho UI; log/evidence không
+  chứa conversation content, raw path hoặc SQL params.
+- Test backup khi WAL có committed-but-not-checkpointed row và concurrent writer; artifact
+  phải là một snapshot hợp lệ (không yêu cầu chứa write commit sau snapshot), source tiếp
+  tục usable và backup mở độc lập được.
+
+**Gate P5-W4:** WAL/concurrent/failure/cancel/overwrite tests xanh; không có raw-copy live
+DB path; backup mở và đọc được consistent revision; source bytes/data không bị reset hay
+mất row.
+
+#### P5-W5 — Backup command và explicit developer reset
+
+- Contribute hai command rõ nghĩa: backup database và **developer reset global database**.
+  Backup dùng Save dialog và primitive W4; UI được phép hiện user-selected path nhưng path
+  đó không được log/telemetry hóa.
+- Reset modal phải nói rõ phạm vi: xóa toàn bộ Muster conversation/task/data của mọi
+  workspace trong cùng VS Code profile + extension-host authority. Cancel là strict no-op;
+  không có auto-reset khi activation/open/write lỗi.
+- Cho lựa chọn backup-before-reset; nếu user chọn backup mà backup fail/cancel thì reset
+  abort. Không giả vờ backup thành công trước khi artifact W4 đã verify/publish.
+- Reset quiesce local scheduler, poller, stream timers, writers và DB worker trước khi thay
+  state, rồi bootstrap đúng current schema và rebuild bounded empty UI. Failure phải để lại
+  source recoverable hoặc fail closed, không half-reset.
+- Vì database dùng chung nhiều cửa sổ/process, reset phải có cross-process safety được test:
+  ưu tiên exclusive in-database reset/maintenance protocol. Nếu implementation thay file
+  vật lý, nó phải chứng minh không có peer đang mở/ghi; nếu không chứng minh được thì abort
+  với hướng dẫn đóng các Muster window khác. Không unlink file đang mở để tạo split-brain;
+  `muster.sqlite3`, `-wal`, `-shm` chỉ được xử lý như một coordinated unit.
+- Không thêm migration/backward-compatible reset/import path. Markdown export tiếp tục là
+  named repository feature, không bị đổi thành full-database backup trá hình.
+
+**Gate P5-W5 / Batch B:** command registration/UI guards, backup-before-reset, cancel,
+success, injected failure và two-client/process contention tests xanh; không split-brain;
+hai commit W4/W5 riêng; full gates xanh và worktree sạch.
+
+#### P5-W6 — Privacy/redaction và recovery documentation
+
+- Audit toàn bộ SQLite error, backup/reset, command notification, output channel, UAT và
+  evidence path theo contract W1. Secret canary chỉ được tồn tại trong durable conversation
+  mà user chủ động lưu và backup user chủ động tạo; không xuất hiện trong log, diagnostic,
+  telemetry, exception payload, snapshot metadata hoặc test evidence.
+- Không thêm telemetry framework. Nếu repo đã có metric hook liên quan thì chỉ timing/count/
+  fixed error code; không content, workspace/task ID, URI/path, SQL hoặc raw exception.
+- Viết tài liệu người dùng/developer về vị trí theo `globalStorageUri` authority/profile,
+  global scope, WAL, backup/export khác nhau thế nào, backup/restore thủ công được support,
+  reset workflow, corrupt/disk-full/read-only recovery và privacy limitations. Không tuyên
+  bố SQLite encrypted at rest.
+- Source-boundary/static guard chặn regression log raw SQLite params/path/content và chặn
+  filesystem JSON/legacy importer quay lại.
+
+**Gate P5-W6:** secret-canary/redaction tests và docs assertions xanh; tài liệu khớp command
+ID/behavior thật; không thêm telemetry/content sink hoặc compatibility path.
+
+#### P5-W7 — Packaged fault UAT và Phase 5 closeout
+
+- Chạy packaged Extension Host UAT trên minimum supported VS Code và current stable cho:
+  corrupt open, incompatible/foreign reject, disk-full/readonly write rollback, busy worker
+  responsiveness, backup với WAL writer, backup reopen/consistency, reset cancel/success và
+  cross-window reset contention.
+- Evidence chỉ ghi runtime/version, scenario, fixed result code, duration/count và hash/size
+  không nhạy cảm khi thật sự cần; không ghi DB path, workspace URI, prompt/tool output,
+  cursor, SQL, stack hoặc secret canary.
+- Chạy lại Phase 4 release benchmark/smoke ở mức regression gate cần thiết, không dựng lại
+  benchmark hay test SQLite internals. Backup/reset không được làm activation/focus/stream
+  vượt budget đã chốt.
+- Re-audit production source: không silent reset, malformed-row skip, swallowed busy,
+  raw-copy live WAL DB, legacy JSON/migration/backcompat hoặc unbounded hydration.
+- Cập nhật evidence và đánh dấu P5-W1…W7/Phase 5 hoàn tất chỉ sau khi mọi gate thật sự xanh.
+
+**Gate P5-W7 / Batch C / Phase 5:** TypeScript, Svelte 0 errors, webview build, full tests,
+source/repository boundaries, packaged Extension Host fault UAT, relevant Phase 4 regression
+gate và `git diff --check` đều xanh; hai commit W6/W7 riêng, worktree sạch. Mọi lỗi fault
+injection fail rõ, redacted, không auto-reset và không mất row âm thầm.
 
 ### Phase 6 — Virtualization và cleanup
 

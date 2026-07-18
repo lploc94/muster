@@ -259,7 +259,7 @@
     "bench:phase4-release": "npm run compile && node --expose-gc dist/scripts/bench-phase4-release.js",
     "bench:phase4-release:assert": "npm run compile && node --expose-gc dist/scripts/bench-phase4-release.js --assert --iterations=12",
     "test:evidence": "node --test scripts/verify-verification-evidence.test.mjs",
-    "test:source-boundary:fixtures": "node --test scripts/source-boundary-smoke.test.mjs",
+    "test:source-boundary:fixtures": "node --test scripts/source-boundary-smoke.test.mjs scripts/repository-boundary-smoke.test.mjs",
     "mvp:grok-interrupt-and-send": "tsx scripts/test-grok-interrupt-and-send.ts"
   },
   "devDependencies": {

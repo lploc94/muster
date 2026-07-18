@@ -1845,8 +1845,15 @@ export class SqliteTaskRepository implements TaskRepository {
     } catch (error) {
       // Do not leak SQL/row payloads through the repository boundary. The
       // caller can retry a stale graph or surface a stable validation reason.
+      const detail = (error as { detail?: { code?: string; kind?: string }; code?: string })?.detail;
+      const code = detail?.code ?? (error as { code?: string }).code;
       const message = error instanceof Error ? error.message : String(error);
-      if (/constraint|unique|foreign key/i.test(message)) {
+      if (
+        code === 'constraint' ||
+        code === 'capacity' ||
+        message === 'constraint rejected' ||
+        /constraint|unique|foreign key/i.test(message)
+      ) {
         return { ok: true, changed: false, reason: 'graph command rejected' };
       }
       throw error;

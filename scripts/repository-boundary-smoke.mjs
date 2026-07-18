@@ -202,6 +202,188 @@ export async function runRepositoryBoundarySmoke(rootDir = ROOT) {
       failures.push(`${rel} must not query change_log or data_version directly; use TaskRepository feed APIs.`);
     }
   }
+
+  // P5-W1: safe error contract + fault seam stay inside the DB boundary.
+  const errorsText = texts.get('src/task/sqlite/errors.ts') ?? '';
+  if (!errorsText.includes('MusterSqliteError') || !errorsText.includes('serializeMusterError')) {
+    failures.push('src/task/sqlite/errors.ts must define MusterSqliteError and serializeMusterError.');
+  }
+  if (!errorsText.includes('MusterDomainError') || !errorsText.includes('MusterInvariantError')) {
+    failures.push('src/task/sqlite/errors.ts must distinguish domain and invariant error classes.');
+  }
+  const protocolText = texts.get('src/task/sqlite/protocol.ts') ?? '';
+  if (!protocolText.includes('validateRpcErrorPayload') || !protocolText.includes('parseWireErrorResponse')) {
+    failures.push('src/task/sqlite/protocol.ts must define strict wire validators.');
+  }
+  if (!protocolText.includes('exactKeys') && !protocolText.includes('parseWireSuccessResponse')) {
+    failures.push('src/task/sqlite/protocol.ts must validate exact success response shapes.');
+  }
+  const faultText = texts.get('src/task/sqlite/fault-inject.ts') ?? '';
+  if (!faultText.includes('maybeInjectFault') || !faultText.includes('bootstrapFaultCapability')) {
+    failures.push('src/task/sqlite/fault-inject.ts must export maybeInjectFault and bootstrapFaultCapability.');
+  }
+  // Ambient env must not arm faults without explicit capability.
+  if (/parseFaultPlanFromEnv|MUSTER_SQLITE_FAULT_INJECT/.test(faultText) && !faultText.includes('faultCapability')) {
+    failures.push('src/task/sqlite/fault-inject.ts must not arm faults from ambient env alone.');
+  }
+  if (faultText.includes('parseFaultPlanFromEnv(process.env)') || /process\.env\[.*MUSTER_SQLITE_FAULT/.test(faultText)) {
+    failures.push('src/task/sqlite/fault-inject.ts must not read ambient MUSTER_SQLITE_FAULT_* env.');
+  }
+  const workerText = texts.get('src/task/sqlite/worker.ts') ?? '';
+  if (!workerText.includes('maybeInjectFault') || !workerText.includes('serializeError')) {
+    failures.push('src/task/sqlite/worker.ts must use maybeInjectFault and serializeError.');
+  }
+  if (!workerText.includes('bootstrapFaultCapability')) {
+    failures.push('src/task/sqlite/worker.ts must bootstrap fault capability from workerData only.');
+  }
+  // Commit-boundary fault: statements before maybeInjectFault(transaction).
+  const txnBlock = workerText.match(/case 'transaction':[\s\S]*?case '/);
+  if (txnBlock && /maybeInjectFault\('transaction'\)[\s\S]*for \(const stmt/.test(txnBlock[0])) {
+    failures.push('src/task/sqlite/worker.ts must inject transaction faults after statements, before COMMIT.');
+  }
+  const clientText = texts.get('src/task/sqlite/client.ts') ?? '';
+  if (!clientText.includes('faultCapability') || !clientText.includes('workerData')) {
+    failures.push('src/task/sqlite/client.ts must pass explicit faultCapability via workerData.');
+  }
+  if (!clientText.includes('onTerminalStorageError') || !clientText.includes('isTerminalStorageCode')) {
+    failures.push('src/task/sqlite/client.ts must latch terminal corrupt/not_a_database faults.');
+  }
+  if (!clientText.includes('intentionalTerminate') && !clientText.includes('first fatal')) {
+    // Accept either intentional-terminate guard or first-fatal-wins comment/logic.
+    if (!clientText.includes('fatalError')) {
+      failures.push('src/task/sqlite/client.ts must keep a first-fatal-wins latch.');
+    }
+  }
+  const connectionText = texts.get('src/task/sqlite/connection.ts') ?? '';
+  if (!connectionText.includes('findSchemaFingerprintFailure') && !connectionText.includes('schema-fingerprint')) {
+    failures.push('src/task/sqlite/connection.ts must validate schema fingerprint beyond object names.');
+  }
+  const extensionTextForTerminal = texts.get('src/extension.ts') ?? '';
+  if (!extensionTextForTerminal.includes('onTerminalStorageError')) {
+    failures.push('src/extension.ts must wire onTerminalStorageError for production DbClient.');
+  }
+  // Production terminal quiesce must stop the real production provider, not only UAT alias.
+  if (extensionTextForTerminal.includes('handleTerminalStorage')) {
+    const terminalFn = extensionTextForTerminal.match(
+      /handleTerminalStorage[\s\S]{0,2500}?const candidate = new DbClient/,
+    )?.[0] ?? extensionTextForTerminal.match(/handleTerminalStorage[\s\S]{0,1500}/)?.[0] ?? '';
+    if (
+      terminalFn.includes('uatChatProvider?.disposeRevisionPoller') &&
+      !terminalFn.includes('chatProvider') &&
+      !terminalFn.includes('productionProvider') &&
+      !terminalFn.includes('applyTerminalStorageQuiesce')
+    ) {
+      failures.push(
+        'src/extension.ts terminal handler must dispose production chatProvider, not only uatChatProvider.',
+      );
+    }
+    if (
+      /taskEngine\?\.shutdown\s*\(/.test(terminalFn) &&
+      !terminalFn.includes('quiesceForTerminalStorage')
+    ) {
+      failures.push(
+        'src/extension.ts terminal handler must hard-quiesce via quiesceForTerminalStorage, not graceful shutdown.',
+      );
+    }
+  }
+  // Schema fingerprint must validate structure beyond object/column names.
+  const fingerprintText = texts.get('src/task/sqlite/schema-fingerprint.ts') ?? '';
+  if (fingerprintText) {
+    if (
+      fingerprintText.includes('REQUIRED_TABLE_COLUMNS') &&
+      !fingerprintText.includes('foreign_key_list') &&
+      !fingerprintText.includes('expectedSchemaManifest')
+    ) {
+      failures.push(
+        'src/task/sqlite/schema-fingerprint.ts must validate full schema structure, not only column names.',
+      );
+    }
+    if (
+      fingerprintText.includes('findSchemaFingerprintFailure') &&
+      (!fingerprintText.includes('foreign_key_list') ||
+        !fingerprintText.includes('index_info') ||
+        !fingerprintText.includes('normalizeSchemaSql'))
+    ) {
+      failures.push(
+        'src/task/sqlite/schema-fingerprint.ts must check FK, index columns, and normalized SQL.',
+      );
+    }
+  }
+  // Protocol must not use dummy exactKeys without real validation.
+  if (
+    protocolText.includes('function exactKeys') &&
+    !protocolText.includes('parseWireErrorResponse')
+  ) {
+    failures.push('src/task/sqlite/protocol.ts exactKeys must back real wire validation.');
+  }
+  if (
+    protocolText.includes('parseWireSuccessResponse') &&
+    !protocolText.includes('exactKeys') &&
+    !/Object\.keys/.test(protocolText)
+  ) {
+    failures.push('src/task/sqlite/protocol.ts must validate exact success response shapes.');
+  }
+  // Client must rejectAll on fatal latch (no hanging concurrent requests).
+  if (clientText.includes('latchFatal') && !clientText.includes('rejectAll')) {
+    failures.push('src/task/sqlite/client.ts must rejectAll pending requests on fatal latch.');
+  }
+  // Raw SQLite error.message must not be the wire/serialized message without the fixed table.
+  if (
+    errorsText.includes('mapToMusterSqliteError') &&
+    !errorsText.includes('safeMessageForCode') &&
+    /error\.message/.test(errorsText)
+  ) {
+    failures.push('src/task/sqlite/errors.ts must not forward raw SQLite error.message to the wire.');
+  }
+  if (
+    errorsText.includes('serializeBoundaryError') &&
+    /return\s*\{\s*[\s\S]*message:\s*error\.message/.test(errorsText) &&
+    !errorsText.includes('safeMessageForCode')
+  ) {
+    failures.push('src/task/sqlite/errors.ts must not forward raw SQLite error.message to the wire.');
+  }
+  // claimRuntimeTurn must not swallow all storage errors into false.
+  const engineText = texts.get('src/task/engine.ts') ?? '';
+  const claimFn = engineText.match(/claimRuntimeTurn[\s\S]*?heartbeatRuntimeTurn/);
+  if (claimFn && /catch\s*\{\s*return false;\s*\}/.test(claimFn[0])) {
+    failures.push('src/task/engine.ts claimRuntimeTurn must not swallow storage errors into false.');
+  }
+  // Production host/engine/repository must not import the fault seam or invent
+  // raw SQLITE_* error plumbing outside the sqlite package.
+  for (const [rel, raw] of texts) {
+    if (rel.startsWith('src/task/sqlite/')) continue;
+    if (rel.endsWith('.test.ts') || rel.endsWith('.testkit.ts')) continue;
+    const code = stripComments(raw);
+    if (code.includes('fault-inject') || code.includes('setFaultPlanForTests') || code.includes('MUSTER_SQLITE_FAULT_')) {
+      failures.push(`${rel} must not import or control the SQLite fault-injection seam.`);
+    }
+    if (/\bSQLITE_FULL\b|\bSQLITE_BUSY\b|\bSQLITE_IOERR\b|\bSQLITE_READONLY\b|\bSQLITE_CORRUPT\b/.test(code)) {
+      failures.push(`${rel} must not reference raw SQLITE_* codes; use the Muster error taxonomy.`);
+    }
+    // Negative: do not forward raw error.message/stack into logs without diagnostics.
+    if (rel === 'src/extension.ts') {
+      if (/debugMuster\([^)]*error\.message/.test(code) && !code.includes('redactedDiagnosticLogFields')) {
+        failures.push(`${rel} must not log raw error.message for SQLite open failures.`);
+      }
+      if (!code.includes('revealFileInOS') && !code.includes('Reveal Storage')) {
+        failures.push(`${rel} must offer a recovery action for fail-closed SQLite open.`);
+      }
+    }
+  }
+  // package.json must not contribute fault-control commands/settings.
+  try {
+    const pkg = JSON.parse(await readFile(path.join(rootDir, 'package.json'), 'utf8'));
+    const commands = (pkg.contributes?.commands ?? []).map((c) => String(c.command ?? ''));
+    const configKeys = Object.keys(pkg.contributes?.configuration?.properties ?? {});
+    if (commands.some((c) => /fault|inject/i.test(c))) {
+      failures.push('package.json must not contribute fault-injection commands.');
+    }
+    if (configKeys.some((k) => /fault|inject/i.test(k))) {
+      failures.push('package.json must not contribute fault-injection settings.');
+    }
+  } catch (error) {
+    failures.push(`Cannot read package.json for fault-control audit: ${error.message}`);
+  }
   } catch (error) {
     failures.push(`Missing entity matrix: docs/plans/sqlite-entity-matrix.vi.md (${error.message})`);
   }
