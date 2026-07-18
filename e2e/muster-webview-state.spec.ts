@@ -94,7 +94,20 @@ interface SnapshotMessage {
   rootTasks: TaskSummary[];
   focusedTaskId?: string;
   subtree?: TaskSummary[];
-  transcript?: Array<{ id: string; kind: 'user' | 'assistant' | 'tool' | 'error' | 'reasoning'; content: unknown }>;
+  transcript?: Array<{
+    id: string;
+    kind: 'user' | 'assistant' | 'tool' | 'error' | 'reasoning';
+    content: unknown;
+    turnId?: string;
+    order?: number;
+    state?: string;
+  }>;
+  /** Protocol v9: required when focusedTaskId is set. */
+  transcriptPage?: {
+    hasMoreBefore: boolean;
+    workspaceRevision: number;
+    beforeCursor?: string;
+  };
   activeTurnId?: string;
   /** Authoritative multi-queue projection for FIFO follow-ups (edit/delete + panel). */
   queuedTurns?: QueuedTurnProjection[];
@@ -317,12 +330,54 @@ function taskTypesSettingsSnapshot(overrides?: {
 // PROTOCOL_VERSION in webview/src/lib/protocol.ts. Test fixtures below always
 // send it so the version-mismatch banner doesn't mask the harness's own
 // snapshot messages.
-const PROTOCOL_VERSION = 5;
+const PROTOCOL_VERSION = 9;
+
+/**
+ * Normalize a focused snapshot to the protocol v9 current-only contract:
+ * focused => transcript[] + transcriptPage; host never ships error transcript items.
+ */
+function normalizeSnapshotMessage(snapshot: SnapshotMessage): SnapshotMessage & {
+  protocolVersion: number;
+} {
+  const focused = typeof snapshot.focusedTaskId === 'string' && snapshot.focusedTaskId.length > 0;
+  const rawTranscript = Array.isArray(snapshot.transcript) ? snapshot.transcript : [];
+  // Host isExtMessage rejects kind:'error' transcript rows (locally synthesized only).
+  const transcript = rawTranscript.filter((item) => item && item.kind !== 'error');
+  if (!focused) {
+    const { transcript: _t, transcriptPage: _p, ...rest } = snapshot as SnapshotMessage & {
+      transcriptPage?: unknown;
+    };
+    return {
+      ...rest,
+      protocolVersion: PROTOCOL_VERSION,
+    };
+  }
+  const hasMoreBefore = Boolean(
+    (snapshot as SnapshotMessage & { transcriptPage?: { hasMoreBefore?: boolean } }).transcriptPage
+      ?.hasMoreBefore,
+  );
+  const beforeCursor = (
+    snapshot as SnapshotMessage & { transcriptPage?: { beforeCursor?: string } }
+  ).transcriptPage?.beforeCursor;
+  const workspaceRevision =
+    (snapshot as SnapshotMessage & { transcriptPage?: { workspaceRevision?: number } })
+      .transcriptPage?.workspaceRevision ?? snapshot.storeRevision;
+  return {
+    ...snapshot,
+    protocolVersion: PROTOCOL_VERSION,
+    transcript,
+    transcriptPage: {
+      hasMoreBefore,
+      workspaceRevision,
+      ...(hasMoreBefore && beforeCursor ? { beforeCursor } : {}),
+    },
+  };
+}
 
 async function postSnapshot(page: Page, snapshot: SnapshotMessage) {
   await page.evaluate((message) => {
     window.postMessage(message, '*');
-  }, { protocolVersion: PROTOCOL_VERSION, ...snapshot });
+  }, normalizeSnapshotMessage(snapshot));
 }
 
 async function postCommandError(page: Page, message: CommandErrorMessage) {
