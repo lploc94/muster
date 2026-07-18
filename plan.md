@@ -98,7 +98,7 @@ Deliver P5-W6 and P5-W7 as two resumable commits: enforce and document the SQLit
 - Commit: `docs: define sqlite privacy and recovery contract`
 
 ## Phase 2: P5-W7 packaged fault UAT and Phase 5 closeout
-- Status: pending
+- Status: complete
 - Depends on: Phase 1
 - Goal: Exercise the real packaged worker and activated-host maintenance paths under the complete Phase 5 fault matrix on VS Code 1.101 and stable, publish strictly redacted evidence, rerun Phase 4 regression gates, and close Phase 5 truthfully.
 - Current behavior: `scripts/sqlite-extension-host-smoke.ts:run` activates a fresh VSIX and verifies current schema plus happy-path backup only. The Phase 4 two-window UAT uses two real Extension Hosts but has no fault/reset scenarios. Full corrupt/write/backup/reset coverage exists only in source-level tests, and there is no Phase 5 packaged evidence schema or closeout ledger.
@@ -132,13 +132,13 @@ Deliver P5-W6 and P5-W7 as two resumable commits: enforce and document the SQLit
   - Treat final history/worktree validation as a read-only post-commit handoff, not a tracked pre-commit checkbox: after the W7 commit, run `git log --oneline 036d740..HEAD` and `git status --short`, report exactly one W6 commit followed by one W7 commit and no output from status, and do not amend or create a bookkeeping commit.
   - Preserve the canonical schema mechanically: do not edit `src/task/sqlite/schema.ts` or `src/task/sqlite/schema-fingerprint.ts`, and run the baseline diff gate before review/commit so packaged “current schema” assertions cannot follow a changed DDL/version/fingerprint.
 - Acceptance criteria:
-  - [ ] AC-1: Freshly packaged VSIX runs on VS Code 1.101.0 and stable and reports PASS for corrupt/not-a-database, foreign/incompatible reject, injected full/readonly rollback, busy responsiveness, WAL-writer backup/reopen, reset cancel/success, and cross-window reset contention - proven by `npm run test:sqlite-packaged-fault-uat` and the tracked matrix evidence.
-  - [ ] AC-2: Every failure is fixed-code/redacted/fail-closed and independent reopen proves rejected opens do not mutate ownership, failed writes/resets preserve prior rows/revision, and no scenario auto-resets or silently loses rows - proven by packaged scenario assertions and evidence result codes.
-  - [ ] AC-3: Busy and reset contention use real separate workers/processes while host heartbeat remains responsive; successful reset preserves one physical DB identity and a stale peer hard-quiesces/reloads instead of writing - proven by the two-process packaged scenario's token, heartbeat, durable-state, and peer-state oracles.
-  - [ ] AC-4: Evidence contains exactly the allowlisted bounded fields for both runtimes and all scenarios, contains no canary/path/URI/content/IDs/cursor/SQL/stack/raw exception, and cannot claim completion with a missing or failed gate - proven by `scripts/verify-sqlite-phase5-evidence.test.mjs` positive and mutation tests.
-  - [ ] AC-5: Phase 4 benchmark budgets, existing packaged smoke, and live two-window UAT remain green without budget relaxation; full compile/Svelte/build/tests/boundaries/docs/evidence gates pass - proven by the phase-gate commands and Phase 5 gate ledger.
-  - [ ] AC-6: Immediately before the W7 commit, history since `036d740` contains exactly the completed W6 commit and the complete reviewed uncommitted diff contains only W7/closeout work with Phase 5 markers changed in that diff, not W6 - proven by `git log --oneline 036d740..HEAD`, `git diff --stat`, and marker inspection before review/commit. Final two-commit history and clean-worktree confirmation remain the read-only post-commit handoff obligation above.
-  - [ ] AC-7: Batch C leaves the schema version, canonical DDL, and schema fingerprint implementation exactly as they were at `036d740`, and packaged backup/reset verification still reports schema version 7 against that baseline - proven by `git diff --exit-code 036d740 -- src/task/sqlite/schema.ts src/task/sqlite/schema-fingerprint.ts` plus packaged scenario assertions.
+  - [x] AC-1: Freshly packaged VSIX runs on VS Code 1.101.0 and stable and reports PASS for corrupt/not-a-database, foreign/incompatible reject, injected full/readonly rollback, busy responsiveness, WAL-writer backup/reopen, reset cancel/success, and cross-window reset contention - proven by `npm run test:sqlite-packaged-fault-uat` and the tracked matrix evidence.
+  - [x] AC-2: Every failure is fixed-code/redacted/fail-closed and independent reopen proves rejected opens do not mutate ownership, failed writes/resets preserve prior rows/revision, and no scenario auto-resets or silently loses rows - proven by packaged scenario assertions and evidence result codes.
+  - [x] AC-3: Busy and reset contention use real separate workers/processes while host heartbeat remains responsive; successful reset preserves one physical DB identity and a stale peer hard-quiesces/reloads instead of writing - proven by the two-process packaged scenario's token, heartbeat, durable-state, and peer-state oracles.
+  - [x] AC-4: Evidence contains exactly the allowlisted bounded fields for both runtimes and all scenarios, contains no canary/path/URI/content/IDs/cursor/SQL/stack/raw exception, and cannot claim completion with a missing or failed gate - proven by `scripts/verify-sqlite-phase5-evidence.test.mjs` positive and mutation tests.
+  - [x] AC-5: Phase 4 benchmark budgets, existing packaged smoke, and live two-window UAT remain green without budget relaxation; full compile/Svelte/build/tests/boundaries/docs/evidence gates pass - proven by the phase-gate commands and Phase 5 gate ledger.
+  - [x] AC-6: Immediately before the W7 commit, history since `036d740` contains exactly the completed W6 commit and the complete reviewed uncommitted diff contains only W7/closeout work with Phase 5 markers changed in that diff, not W6 - proven by `git log --oneline 036d740..HEAD`, `git diff --stat`, and marker inspection before review/commit. Final two-commit history and clean-worktree confirmation remain the read-only post-commit handoff obligation above.
+  - [x] AC-7: Batch C leaves the schema version, canonical DDL, and schema fingerprint implementation exactly as they were at `036d740`, and packaged backup/reset verification still reports schema version 7 against that baseline - proven by `git diff --exit-code 036d740 -- src/task/sqlite/schema.ts src/task/sqlite/schema-fingerprint.ts` plus packaged scenario assertions.
 - Focused verification:
   - `npx vitest run src/host/uat-commands.test.ts src/host/sqlite-maintenance-commands.test.ts src/task/sqlite/connection.test.ts src/task/sqlite/write-failure.test.ts src/task/sqlite/backup.test.ts src/task/sqlite/reset.test.ts src/task/sqlite/main-thread-nonblocking.test.ts && node --test scripts/sqlite-phase5-evidence-schema.test.mjs`
 - Phase gates:
@@ -156,5 +156,5 @@ Deliver P5-W6 and P5-W7 as two resumable commits: enforce and document the SQLit
 ## Progress Log
 | Phase | Status | Commit | Verification | Review |
 |---|---|---|---|---|
-| 1 | complete | pending | focused + docs + boundaries + compile/svelte + full suite green | APPROVE |
-| 2 | pending | N/A | pending | pending |
+| 1 | complete | f86861e | focused + docs + boundaries + compile/svelte + full suite green | APPROVE |
+| 2 | complete | HEAD (P5-W7 commit) | packaged fault UAT 1.101+stable 12/12; evidence validators | pending |

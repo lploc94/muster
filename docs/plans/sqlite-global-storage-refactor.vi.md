@@ -1082,7 +1082,13 @@ debugMuster error/path/id, và fsPath trong maintenance notifications. Productio
 **Gate P5-W6:** secret-canary/redaction tests và docs assertions xanh; tài liệu khớp command
 ID/behavior thật; không thêm telemetry/content sink hoặc compatibility path.
 
-#### P5-W7 — Packaged fault UAT và Phase 5 closeout
+#### P5-W7 — Packaged fault UAT và Phase 5 closeout ✅
+
+**Hoàn tất (2026-07-18):** `npm run test:sqlite-packaged-fault-uat` chạy fresh VSIX trên
+VS Code 1.101.0 (Node 22.15.1) và stable (1.129.1 / Node 24.18.0); 12/12 scenario PASS mỗi
+runtime. Evidence redacted: `sqlite-phase5-packaged-fault-uat-evidence.json` +
+`sqlite-phase5-gate-evidence.vi.md`. Schema validators + mutation tests xanh. Canonical
+schema (`schema.ts` / `schema-fingerprint.ts`) không đổi so với baseline Batch B.
 
 - Chạy packaged Extension Host UAT trên minimum supported VS Code và current stable cho:
   corrupt open, incompatible/foreign reject, disk-full/readonly write rollback, busy worker
