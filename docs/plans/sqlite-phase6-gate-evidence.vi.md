@@ -10,7 +10,8 @@ Virtualization + cleanup closeout for `docs/plans/sqlite-global-storage-refactor
 |------|------|---------|
 | P6-W1 | `f4c62bc` | perf: virtualize large chat transcripts |
 | P6-W2 | `3558914` | perf: virtualize expanded task trees |
-| P6-W3 | *(this commit)* `test: close sqlite phase 6 virtualization gates` | closeout |
+| P6-W3 | `4c7d36b` | test: close sqlite phase 6 virtualization gates |
+| harden | `277fffd` | fix: harden phase 6 virtualization closeout |
 
 Baseline: `a5864fc`.
 

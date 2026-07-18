@@ -2,9 +2,10 @@
 
 ## Trạng thái
 
-**COMPLETE — Phase 4 W1–W11 đã qua SQLite-only cutover, paging/patching,
-multi-window convergence và release/UAT gates. Phase 5 được chốt thành 7 wave,
-thực thi theo 3 batch hardening.**
+**COMPLETE — Phase 1–6 đã đóng gate.** Phase 4 W1–W11: SQLite-only cutover,
+paging/patching, multi-window convergence và release/UAT. Phase 5: 7 wave hardening
+(3 batch). Phase 6: chat/tree virtualization + cleanup/evidence (`f4c62bc`…
+`4c7d36b`, harden `277fffd`).
 Cập nhật: 2026-07-18
 
 - Phase 1: **đã qua gate** — worker/RPC, schema bootstrap, global-storage registry,
@@ -1117,7 +1118,7 @@ injection fail rõ, redacted, không auto-reset và không mất row âm thầm.
 |------|--------|---------|
 | P6-W1 | `f4c62bc` | Virtualize settled chat (variable-height); streaming tail outside virtual track; protocol-conformant 2k-page UAT + bench |
 | P6-W2 | `3558914` | Virtualize expanded task tree; 5k-row bound + interaction/patch oracles |
-| P6-W3 | `test: close sqlite phase 6 virtualization gates` | Docs protocol cleanup, caller matrix, evidence JSON/ledger, boundaries |
+| P6-W3 | `4c7d36b` (+ harden `277fffd`) | Docs protocol cleanup, caller matrix, evidence JSON/ledger, boundaries |
 
 - Mounted DOM/heap bounded: chat ≤80 transcript rows, tree ≤100 task rows; retained heap ≤16 MiB / final ≤1.5× baseline (see `sqlite-phase6-webview-evidence.json`).
 - Không xóa projection/cache live: `RepositoryProjection`, snapshots, workspace patches, Markdown export, backup/reset đều retained (caller matrix trong `sqlite-phase6-gate-evidence.vi.md`).

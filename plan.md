@@ -183,4 +183,4 @@ Complete P6-W1 through P6-W3 so large loaded transcripts and expanded task trees
 |---|---|---|---|---|
 | 1 | complete | f4c62bc | vitest chat helpers + phase6 webview 5/5 + bench BUDGET PASS + compile/svelte/boundaries green; schema unchanged; impl-review APPROVE (5 rounds) | APPROVE |
 | 2 | complete | 3558914 | task-tree unit large fixtures + phase6 webview 6/6 + bench tree BUDGET PASS + existing tree chrome e2e; schema unchanged; impl-review APPROVE | APPROVE |
-| 3 | complete | pending-commit | phase6 evidence schema/verifier + WEBVIEW protocol cleanup + caller matrix + boundary scan; test:webview/phase6/bench/source-boundary green; schema unchanged; impl-review APPROVE (7 rounds) | APPROVE |
+| 3 | complete | 4c7d36b (+ 277fffd) | phase6 evidence schema/verifier + WEBVIEW protocol cleanup + caller matrix + boundary scan; test:webview/phase6/bench/source-boundary green; schema unchanged; impl-review APPROVE; final-range harden APPROVE | APPROVE |
