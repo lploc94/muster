@@ -66,6 +66,30 @@
           "scope": "resource",
           "description": "Maximum uninterrupted agent run. Applies to newly promoted runs; running turns keep their frozen deadline."
         },
+        "muster.execution.maxConcurrentPerBackend": {
+          "type": "number",
+          "default": 15,
+          "minimum": 1,
+          "maximum": 32,
+          "scope": "resource",
+          "description": "Maximum concurrent agent turns per ACP backend. Applies on each scheduling pass; already-running turns are not preempted when lowered. Bounded by shared ACP process capacity."
+        },
+        "muster.execution.maxConcurrentTurns": {
+          "type": "number",
+          "default": 30,
+          "minimum": 1,
+          "maximum": 64,
+          "scope": "resource",
+          "description": "Maximum concurrent agent turns across all backends. Applies on each scheduling pass; already-running turns are not preempted when lowered."
+        },
+        "muster.execution.maxConcurrentPerRoot": {
+          "type": "number",
+          "default": 20,
+          "minimum": 1,
+          "maximum": 64,
+          "scope": "resource",
+          "description": "Maximum concurrent agent turns under a single root task tree. Applies on each scheduling pass; already-running turns are not preempted when lowered."
+        },
         "muster.retention.maxRetainedTurnsPerTask": {
           "type": "number",
           "default": 200,
