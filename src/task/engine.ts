@@ -698,7 +698,7 @@ export class TaskEngine {
     this.bridgePort = config.bridgePort ?? 0;
     this.mcpReadiness = config.mcpReadiness;
     this.getBridgeGeneration = config.getBridgeGeneration;
-    this.resourceLimits = config.resourceLimits ?? DEFAULT_RESOURCE_LIMITS;
+    this.getResourceLimits() = config.resourceLimits ?? DEFAULT_RESOURCE_LIMITS;
     this.getRunLimitMs = config.getRunLimitMs ?? (() => DEFAULT_RUN_LIMIT_MS);
     this.emit = config.emit;
     this.isWorkspaceTrusted = config.isWorkspaceTrusted ?? (() => true);
@@ -796,7 +796,7 @@ export class TaskEngine {
       credentials,
       askBridge: this.askBridge,
       bridgePort: this.bridgePort,
-      resourceLimits: this.resourceLimits,
+      resourceLimits: this.getResourceLimits(),
       getRunLimitMs: this.getRunLimitMs,
       clock: this.clock,
       liveRuns: this.liveRuns,
@@ -1393,7 +1393,7 @@ export class TaskEngine {
         createdAt: now,
       };
 
-      const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
+      const turnCap = canCreateTurn(draft, taskId, this.getResourceLimits());
       if (!turnCap.ok) {
         return turnCap;
       }
@@ -1442,7 +1442,7 @@ export class TaskEngine {
         return { ok: false, reason: clear.detail ?? clear.reason };
       }
     }
-    const promote = canPromoteTurn(this.store.getFile(), turnId, this.resourceLimits);
+    const promote = canPromoteTurn(this.store.getFile(), turnId, this.getResourceLimits());
     if (!promote.ok) {
       return { ok: false, reason: promote.reason };
     }
@@ -1752,7 +1752,7 @@ export class TaskEngine {
       // turn (not retryOf); needs_recovery no longer blocks admission.
       // Active handoff does NOT block send — messages queue; canPromoteTurn gates promote.
 
-      const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
+      const turnCap = canCreateTurn(draft, taskId, this.getResourceLimits());
       if (!turnCap.ok) {
         return turnCap;
       }
@@ -1968,7 +1968,7 @@ export class TaskEngine {
         };
         draft.tasks[taskId] = taskForStart;
       }
-      const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
+      const turnCap = canCreateTurn(draft, taskId, this.getResourceLimits());
       if (!turnCap.ok) {
         return turnCap;
       }
@@ -2005,7 +2005,7 @@ export class TaskEngine {
       if (isTerminalLifecycle(task.lifecycle)) {
         return { ok: false, reason: 'task is terminal' };
       }
-      const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
+      const turnCap = canCreateTurn(draft, taskId, this.getResourceLimits());
       if (!turnCap.ok) {
         return turnCap;
       }
@@ -2593,7 +2593,7 @@ export class TaskEngine {
             childAttention.set(childId, { code: child.attention.code });
           }
         }
-        const turnCap = canCreateTurn(draft, task.id, this.resourceLimits);
+        const turnCap = canCreateTurn(draft, task.id, this.getResourceLimits());
         if (!turnCap.ok) {
           return { ok: true };
         }
@@ -2845,7 +2845,7 @@ export class TaskEngine {
           return;
         }
         draft.tasks[remediationId] = { ...created.next, releasedAt: now };
-        const turnCheck = canCreateTurn(draft, remediationId, this.resourceLimits);
+        const turnCheck = canCreateTurn(draft, remediationId, this.getResourceLimits());
         if (!turnCheck.ok) {
           // ISSUE 11 — roll back the partially-staged task in the SAME commit, then seal
           // (guarantees termination; never a silent delete-and-return hang).
@@ -3257,7 +3257,7 @@ export class TaskEngine {
       // Never batch multiple pending messages into a single turn's inputs
       // (projectPrompt would join them into one multi-message backend prompt).
       for (const message of pending) {
-        const turnCap = canCreateTurn(draft, task.id, this.resourceLimits);
+        const turnCap = canCreateTurn(draft, task.id, this.getResourceLimits());
         if (!turnCap.ok) {
           break;
         }
@@ -3287,13 +3287,14 @@ export class TaskEngine {
   }
 
   private exceedsTurnLimit(taskId: string, candidateTurnId?: string): boolean {
+    const limits = this.getResourceLimits();
     const task = this.store.getTask(taskId);
     if (!task) return true;
     const executionEpoch = task.executionEpoch ?? 1;
     const turns = this.store
       .getTurnsForTask(taskId)
       .filter((turn) => (turn.executionEpoch ?? 1) === executionEpoch);
-    const cap = Math.min(this.resourceLimits.maxTurnsPerTask, task.executionPolicy.maxTurns);
+    const cap = Math.min(limits.maxTurnsPerTask, task.executionPolicy.maxTurns);
     const slotsUsed = turns.filter(
       (t) => t.status !== 'queued' || t.id === candidateTurnId,
     ).length;
@@ -3325,6 +3326,8 @@ export class TaskEngine {
   }
 
   private scheduleTurn(turnId: string): Promise<void> {
+    // One consistent ResourceLimits snapshot for this scheduling pass.
+    const limits = this.getResourceLimits();
     // Phase C: downgrade stale host verdicts (git-guarded, no-op without host
     // verdicts) BEFORE sealing so a re-blocked fail/skip dependent seals this tick.
     this.revalidateVerdicts();
@@ -3338,7 +3341,7 @@ export class TaskEngine {
     if (turn && this.exceedsTurnLimit(turn.taskId, turnId)) {
       return Promise.resolve();
     }
-    if (!tryPromoteTurn(this.store, turnId, this.resourceLimits)) {
+    if (!tryPromoteTurn(this.store, turnId, limits)) {
       // Persist missing_input attention when readiness blocks pin (W1/W5).
       const file = this.store.getFile();
       const t = file.turns[turnId];
@@ -3412,7 +3415,7 @@ export class TaskEngine {
           // settlement recovery/retry turns are not frozen (see helper).
           continue;
         }
-        if (tryPromoteTurn(this.store, turn.id, this.resourceLimits)) {
+        if (tryPromoteTurn(this.store, turn.id, this.getResourceLimits())) {
           void this.scheduleTurn(turn.id);
         }
       }
@@ -3444,6 +3447,9 @@ export class TaskEngine {
     }
 
     const now = nowIso(this.clock);
+    // One consistent ResourceLimits snapshot for this execute/promote pass
+    // (canPromoteTurn, maxResultBytes projection, later canCreateTurn).
+    const limits = limits;
 
     // Every fresh backend session gets the same host/runtime/task bootstrap.
     // After a switch, the first real target turn is also a fresh-session boundary.
@@ -3465,7 +3471,7 @@ export class TaskEngine {
       if (!draftTurn || draftTurn.status !== 'queued' || !draftTask) {
         return { ok: false, reason: 'turn is no longer schedulable' };
       }
-      const promote = canPromoteTurn(draft, turnId, this.resourceLimits);
+      const promote = canPromoteTurn(draft, turnId, limits);
       if (!promote.ok) {
         return { ok: false, reason: promote.reason };
       }
@@ -3879,7 +3885,7 @@ export class TaskEngine {
       const current = this.store.getFile();
       const currentTurn = current.turns[turnId];
       const messages = messageMapFromFile(current);
-      const prompt = projectPrompt(currentTurn, messages, current, this.resourceLimits.maxResultBytes);
+      const prompt = projectPrompt(currentTurn, messages, current, limits.maxResultBytes);
       console.info('[muster][task-orch] turn.run', {
         taskId: taskForDispatch.id,
         turnId,
@@ -4759,7 +4765,7 @@ export class TaskEngine {
 
         for (const effect of result.effects) {
           if (effect.kind === 'enqueueRetry') {
-            const turnCap = canCreateTurn(draft, task.id, this.resourceLimits);
+            const turnCap = canCreateTurn(draft, task.id, this.getResourceLimits());
             if (!turnCap.ok) {
               continue;
             }

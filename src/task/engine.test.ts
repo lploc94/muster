@@ -10,6 +10,7 @@ import { TaskStore } from './store';
 import { buildSnapshot, buildTranscript } from '../host/snapshot';
 import type { TaskMessage, TaskTurn } from './types';
 import { RUN_LIMIT_MS } from './execution-policy';
+import { DEFAULT_RESOURCE_LIMITS, type ResourceLimits } from './limits';
 
 const tempDirs: string[] = [];
 
@@ -2517,6 +2518,123 @@ describe('MCP readiness supervisor and bridge instrumentation (M017-S04 / D037)'
     expect(turns.length).toBeGreaterThan(0);
     for (const turn of turns) {
       expect(turn.dispatchPhase).not.toBe('prompt_outstanding');
+    }
+  });
+});
+
+describe('TaskEngine live getResourceLimits (M016-S01 / T02)', () => {
+  async function waitForStatus(
+    store: TaskStore,
+    turnId: string,
+    status: string,
+    ms = 2000,
+  ): Promise<void> {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (store.getFile().turns[turnId]?.status === status) return;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  }
+
+  it('reads concurrency caps live so a raised getter takes effect on the next promote', async () => {
+    const { store } = makeTempStore();
+    let releaseA!: () => void;
+    const gateA = new Promise<void>((resolve) => {
+      releaseA = resolve;
+    });
+    let live = 0;
+    let peak = 0;
+
+    const backend: Backend = {
+      name: 'fake',
+      capabilities: MCP_CAPS,
+      async *run(options: RunOptions) {
+        live += 1;
+        peak = Math.max(peak, live);
+        yield { type: 'sessionStarted', sessionId: `sess-${live}` };
+        // First live turn holds the gate; later turns complete immediately so drain is clean.
+        if (live === 1) {
+          await gateA;
+          if (options.signal?.aborted) {
+            live -= 1;
+            return;
+          }
+        }
+        live -= 1;
+        yield { type: 'turnCompleted' };
+      },
+    };
+
+    let limits: ResourceLimits = {
+      ...DEFAULT_RESOURCE_LIMITS,
+      maxConcurrentTurns: 1,
+      maxConcurrentPerRoot: 1,
+      maxConcurrentPerBackend: 1,
+    };
+    let getterCalls = 0;
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => backend,
+      getResourceLimits: () => {
+        getterCalls += 1;
+        return limits;
+      },
+    });
+
+    expect(engine.createTask({ id: 'task-a', goal: 'a', backend: 'fake' }).ok).toBe(true);
+    expect(engine.createTask({ id: 'task-b', goal: 'b', backend: 'fake' }).ok).toBe(true);
+
+    const sentA = engine.send('task-a', 'go-a');
+    expect(sentA.ok).toBe(true);
+    if (!sentA.ok || !sentA.value.turnId) throw new Error('send A failed');
+    await waitForStatus(store, sentA.value.turnId, 'running');
+
+    const sentB = engine.send('task-b', 'go-b');
+    expect(sentB.ok).toBe(true);
+    if (!sentB.ok || !sentB.value.turnId) throw new Error('send B failed');
+
+    // Cap of 1 keeps B queued while A is live.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(store.getFile().turns[sentB.value.turnId]?.status).toBe('queued');
+    expect(peak).toBe(1);
+
+    // Raise caps via the live getter and re-drive scheduling for B.
+    limits = {
+      ...DEFAULT_RESOURCE_LIMITS,
+      maxConcurrentTurns: 4,
+      maxConcurrentPerRoot: 4,
+      maxConcurrentPerBackend: 4,
+    };
+    const resume = engine.resumeQueuedTurn(sentB.value.turnId);
+    expect(resume.ok).toBe(true);
+    await waitForStatus(store, sentB.value.turnId, 'running');
+    expect(peak).toBeGreaterThan(1);
+
+    releaseA();
+    await engine.whenIdle();
+    expect(getterCalls).toBeGreaterThan(0);
+    expect(store.getFile().turns[sentA.value.turnId]?.status).toBe('succeeded');
+    expect(store.getFile().turns[sentB.value.turnId]?.status).toBe('succeeded');
+  });
+
+  it('preserves static resourceLimits when no getter is injected', async () => {
+    const { store } = makeTempStore();
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => scriptedBackend([{ type: 'turnCompleted' }]),
+      resourceLimits: {
+        ...DEFAULT_RESOURCE_LIMITS,
+        maxConcurrentTurns: 2,
+        maxConcurrentPerRoot: 2,
+        maxConcurrentPerBackend: 1,
+      },
+    });
+    expect(engine.createTask({ id: 'static-a', goal: 'a', backend: 'fake' }).ok).toBe(true);
+    const sent = engine.send('static-a', 'go');
+    expect(sent.ok).toBe(true);
+    await engine.whenIdle();
+    if (sent.ok && sent.value.turnId) {
+      expect(store.getFile().turns[sent.value.turnId]?.status).toBe('succeeded');
     }
   });
 });
