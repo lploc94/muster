@@ -282,6 +282,7 @@
     "test:sqlite-storage-docs": "node --test scripts/verify-sqlite-storage-docs.test.mjs",
     "test:sqlite-packaged-fault-uat": "node scripts/run-sqlite-packaged-fault-uat.mjs",
     "test:sqlite-phase5-evidence": "node --test scripts/sqlite-phase5-evidence-schema.test.mjs scripts/verify-sqlite-phase5-evidence.test.mjs",
+    "test:sqlite-phase6-evidence": "node --test scripts/sqlite-phase6-evidence-schema.test.mjs scripts/verify-sqlite-phase6-evidence.test.mjs",
     "mvp:grok-interrupt-and-send": "tsx scripts/test-grok-interrupt-and-send.ts"
   },
   "devDependencies": {

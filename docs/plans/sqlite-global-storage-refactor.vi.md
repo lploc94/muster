@@ -792,7 +792,7 @@ request; fixed page limit 100; **no W6 recovery**.
   `{ type:'loadTranscriptPage', requestId, taskId, beforeCursor }`; response union
   success (`items` ≤100 + `transcriptPage`) / failure fixed codes only
   (`invalidRequest`|`staleFocus`|`taskNotFound`|`invalidCursor`|`unavailable`).
-  No free-form message/stack/SQL/cursor echo; no `loadHistory`/`historyChunk` aliases.
+   No free-form message/stack/SQL/cursor echo; no legacy transcript page aliases.
 - **Host route.** `src/host/transcript-page-route.ts` runtime-validates correlation,
   captures focus+`snapshotGeneration`, refuses wrong focus with zero page queries,
   `getTask` then exactly `getTranscriptPage(taskId, beforeCursor, 100)`, maps
@@ -1111,11 +1111,19 @@ injection fail rõ, redacted, không auto-reset và không mất row âm thầm.
 
 ### Phase 6 — Virtualization và cleanup
 
-- Virtualize chat/tree nếu profiling chứng minh cần thiết.
-- Xóa projection/cache nào profiling chứng minh thừa sau incremental protocol.
-- Giữ Markdown export và SQLite recovery tooling tối thiểu.
+**Status: complete**
 
-**Gate:** DOM/heap bounded trên history lớn và không còn dead storage/protocol path.
+| Wave | Commit | Phạm vi |
+|------|--------|---------|
+| P6-W1 | `f4c62bc` | Virtualize settled chat (variable-height); streaming tail outside virtual track; protocol-conformant 2k-page UAT + bench |
+| P6-W2 | `3558914` | Virtualize expanded task tree; 5k-row bound + interaction/patch oracles |
+| P6-W3 | `test: close sqlite phase 6 virtualization gates` | Docs protocol cleanup, caller matrix, evidence JSON/ledger, boundaries |
+
+- Mounted DOM/heap bounded: chat ≤80 transcript rows, tree ≤100 task rows; retained heap ≤16 MiB / final ≤1.5× baseline (see `sqlite-phase6-webview-evidence.json`).
+- Không xóa projection/cache live: `RepositoryProjection`, snapshots, workspace patches, Markdown export, backup/reset đều retained (caller matrix trong `sqlite-phase6-gate-evidence.vi.md`).
+- Docs: `loadTranscriptPage` / `transcriptPageResult` only (legacy transcript page aliases removed).
+
+**Gate:** DOM/heap bounded trên history lớn; không dead storage/protocol path; export/recovery preserved.
 
 ## 9. Performance budgets
 

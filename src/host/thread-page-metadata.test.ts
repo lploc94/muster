@@ -72,7 +72,12 @@ describe('ChatThread load-older UX source contract (P4-W5)', () => {
   it('uses stable data-transcript-id rows and loadTranscriptPage post', () => {
     expect(chatThreadSource).toContain('data-transcript-id');
     expect(chatThreadSource).toContain("type: 'loadTranscriptPage'");
-    expect(chatThreadSource).toContain('restorePrependScrollTop');
+    // Phase 6: virtualizer-aware restore; still captures prepend anchors.
+    expect(
+      chatThreadSource.includes('restorePrependScrollTop') ||
+        chatThreadSource.includes('restoreVirtualPrependOffset') ||
+        chatThreadSource.includes('refineActivePrependAnchor'),
+    ).toBe(true);
     expect(chatThreadSource).toContain('capturePrependAnchor');
     expect(chatThreadSource).toContain('Load earlier messages');
   });

@@ -42,6 +42,11 @@ async function withMutatedTree(mutate, expectMatch) {
       'src/task/engine-graph.ts',
       'package.json',
       'docs/plans/sqlite-entity-matrix.vi.md',
+      // Phase 6 virtualization / docs boundaries
+      'webview/src/components/ChatThread.svelte',
+      'webview/src/components/TaskWorkspace.svelte',
+      'docs/WEBVIEW.md',
+      'scripts/sqlite-phase6-evidence-schema.mjs',
     ];
     for (const rel of files) {
       const src = path.join(ROOT, rel);
@@ -336,4 +341,53 @@ export const MUSTER_DEVELOPER_RESET_COMMAND = 'muster.developerResetGlobalDataba
 `,
     );
   }, /must not show fsPath|must not include filesystem paths/i);
+});
+
+test('fails when ChatThread drops virtualization for full-list each', async () => {
+  await withMutatedTree((dir) => {
+    const file = path.join(dir, 'webview/src/components/ChatThread.svelte');
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(
+      file,
+      `
+<script>
+  // no Virtualizer
+</script>
+{#each thread.items as item (item.id)}
+  <div data-transcript-id={item.id}>{item.text}</div>
+{/each}
+`,
+    );
+  }, /Virtualizer|full-list #each/i);
+});
+
+test('fails when WEBVIEW docs reintroduce legacy transcript aliases', async () => {
+  await withMutatedTree((dir) => {
+    const file = path.join(dir, 'docs/WEBVIEW.md');
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(
+      file,
+      `
+# Webview
+loadTranscriptPage and transcriptPageResult are current.
+Also mentions loadHistory and historyChunk by mistake.
+`,
+    );
+  }, /loadHistory\/historyChunk/i);
+});
+
+test('fails when TaskWorkspace drops tree virtualization', async () => {
+  await withMutatedTree((dir) => {
+    const file = path.join(dir, 'webview/src/components/TaskWorkspace.svelte');
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(
+      file,
+      `
+<script></script>
+{#each visibleTreeRows as row (row.task.id)}
+  <div data-testid="task-tree-row">{row.task.goal}</div>
+{/each}
+`,
+    );
+  }, /virtualize expanded tree/i);
 });

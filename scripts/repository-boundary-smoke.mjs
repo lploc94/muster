@@ -604,6 +604,53 @@ export async function runRepositoryBoundarySmoke(rootDir = ROOT) {
   } catch {
     // optional when schema file is absent in partial fixtures
   }
+
+  // Phase 6: webview virtualization + protocol docs boundaries (skip when absent in fixtures).
+  try {
+    const chatPath = path.join(rootDir, 'webview/src/components/ChatThread.svelte');
+    const chatThread = await readFile(chatPath, 'utf8');
+    if (!chatThread.includes('Virtualizer') && !chatThread.includes('createVirtualizer')) {
+      failures.push('ChatThread.svelte must integrate a Virtualizer for settled rows.');
+    }
+    if (/\{#each\s+thread\.items\b/.test(chatThread) && !chatThread.includes('virtualItems')) {
+      failures.push('ChatThread.svelte must not full-list #each thread.items without virtualization.');
+    }
+  } catch {
+    // optional in mutated fixture trees
+  }
+  try {
+    const taskWorkspace = await readFile(
+      path.join(rootDir, 'webview/src/components/TaskWorkspace.svelte'),
+      'utf8',
+    );
+    if (!taskWorkspace.includes('Virtualizer') && !taskWorkspace.includes('treeVirtual')) {
+      failures.push('TaskWorkspace.svelte must virtualize expanded tree rows.');
+    }
+  } catch {
+    // optional in mutated fixture trees
+  }
+  try {
+    const webviewDocs = await readFile(path.join(rootDir, 'docs/WEBVIEW.md'), 'utf8');
+    if (/\bloadHistory\b|\bhistoryChunk\b/.test(webviewDocs)) {
+      failures.push('docs/WEBVIEW.md must not reference removed loadHistory/historyChunk protocol.');
+    }
+    if (!webviewDocs.includes('loadTranscriptPage') || !webviewDocs.includes('transcriptPageResult')) {
+      failures.push('docs/WEBVIEW.md must document loadTranscriptPage/transcriptPageResult.');
+    }
+  } catch {
+    // optional in mutated fixture trees
+  }
+  try {
+    const phase6Schema = await readFile(
+      path.join(rootDir, 'scripts/sqlite-phase6-evidence-schema.mjs'),
+      'utf8',
+    );
+    if (!phase6Schema.includes('validatePhase6Evidence') || !phase6Schema.includes('contentSafety')) {
+      failures.push('scripts/sqlite-phase6-evidence-schema.mjs must export validatePhase6Evidence with contentSafety.');
+    }
+  } catch {
+    // optional in mutated fixture trees
+  }
   for (const rel of [
     'src/task/sqlite/client.ts',
     'src/task/sqlite/rpc.ts',

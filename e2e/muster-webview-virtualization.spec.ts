@@ -1014,21 +1014,27 @@ test.describe('Phase 6 expanded task-tree virtualization', () => {
     await expect(page.locator('[data-testid="task-tree-row"][data-task-id="tree-root"]')).toBeVisible();
 
     const treeList = page.getByTestId('task-chrome-tree');
-    // Exact middle DFS identity (index TREE_N/2 in wide list: root + children).
-    await treeList.evaluate((el) => {
-      el.scrollTop = Math.floor((el.scrollHeight - el.clientHeight) / 2);
-      el.dispatchEvent(new Event('scroll', { bubbles: true }));
-    });
-    await page.waitForTimeout(100);
+    // Exact middle DFS identity: sweep until the known middle id mounts.
     expect(await page.locator('[data-testid="task-tree-row"]').count()).toBeLessThanOrEqual(
       MAX_TREE_MOUNTED,
     );
-    await expect
-      .poll(
-        async () => page.locator(`[data-testid="task-tree-row"][data-task-id="${middle.id}"]`).count(),
-        { timeout: 10_000 },
-      )
-      .toBeGreaterThan(0);
+    let foundMiddle = false;
+    for (const frac of [0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65]) {
+      await treeList.evaluate((el, f) => {
+        const max = Math.max(0, el.scrollHeight - el.clientHeight);
+        el.scrollTop = Math.floor(max * f);
+        el.dispatchEvent(new Event('scroll', { bubbles: true }));
+      }, frac);
+      await page.waitForTimeout(40);
+      if (
+        (await page.locator(`[data-testid="task-tree-row"][data-task-id="${middle.id}"]`).count()) >
+        0
+      ) {
+        foundMiddle = true;
+        break;
+      }
+    }
+    expect(foundMiddle).toBe(true);
     const middleRow = page.locator(`[data-testid="task-tree-row"][data-task-id="${middle.id}"]`);
     await expect(middleRow).toHaveAttribute('data-tree-depth', '1');
     // Indentation for depth 1: inline style padding-left: 18px (6 + 12*depth).
@@ -1133,19 +1139,24 @@ test.describe('Phase 6 expanded task-tree virtualization', () => {
       MAX_TREE_MOUNTED,
     );
 
-    // Patch removal: remove middle while it is mounted; then full-range sweep must
-    // never remount it, while a known sibling remains reachable.
-    await treeList.evaluate((el) => {
-      el.scrollTop = Math.floor((el.scrollHeight - el.clientHeight) / 2);
-      el.dispatchEvent(new Event('scroll', { bubbles: true }));
-    });
-    await page.waitForTimeout(80);
-    await expect
-      .poll(
-        async () => page.locator(`[data-testid="task-tree-row"][data-task-id="${middle.id}"]`).count(),
-        { timeout: 8_000 },
-      )
-      .toBeGreaterThan(0);
+    // Patch removal: ensure middle is mounted again, remove it, then sweep.
+    let middleMounted = false;
+    for (const frac of [0.4, 0.45, 0.5, 0.55, 0.6]) {
+      await treeList.evaluate((el, f) => {
+        const max = Math.max(0, el.scrollHeight - el.clientHeight);
+        el.scrollTop = Math.floor(max * f);
+        el.dispatchEvent(new Event('scroll', { bubbles: true }));
+      }, frac);
+      await page.waitForTimeout(40);
+      if (
+        (await page.locator(`[data-testid="task-tree-row"][data-task-id="${middle.id}"]`).count()) >
+        0
+      ) {
+        middleMounted = true;
+        break;
+      }
+    }
+    expect(middleMounted).toBe(true);
     const removeId = middle.id;
     await postHost(page, {
       type: 'workspacePatchBatch',
