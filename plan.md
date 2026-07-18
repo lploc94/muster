@@ -97,7 +97,7 @@ Complete P6-W1 through P6-W3 so large loaded transcripts and expanded task trees
 - Commit: `perf: virtualize large chat transcripts`
 
 ## Phase 2: P6-W2 Bound Expanded Task-Tree Rendering
-- Status: pending
+- Status: complete
 - Depends on: Phase 1
 - Goal: Keep expanded task-tree DOM bounded for wide/deep owning-root subtrees while preserving collapse, selection, status actions, focused-path visibility, and snapshot/patch convergence.
 - Current behavior: `TaskWorkspace.svelte:52-68` builds and flattens the full owning-root subtree, and `TaskWorkspace.svelte:347-453` mounts every `visibleTreeRows` entry when tree chrome is expanded. Default depth collapse limits deep descendants but does not bound wide levels or user-expanded branches; there is no large-tree test or virtual row window.
@@ -122,9 +122,9 @@ Complete P6-W1 through P6-W3 so large loaded transcripts and expanded task trees
   - Keep row presentation, indentation cap, twisties, role icons, lifecycle status/menu, ARIA attributes, tooltip text, Escape handling, and `navSelectTask`/`setLifecycle` messages behaviorally identical.
   - Reuse the Phase 1 dependency and established adapter style without creating a generic framework or changing host/protocol/storage code. Ensure a row leaving the virtual range closes or correctly reanchors its status menu rather than leaking menu state onto a recycled row.
 - Acceptance criteria:
-  - [ ] AC-1: A 5,000-visible-row expanded tree mounts at most 100 task rows, traverses first/middle/last in DFS order, keeps `retainedDeltaBytes <= 16 MiB`, `finalUsedBytes <= 1.5 * baselineUsedBytes`, sampled DOM within baseline +2500, and final DOM within baseline +250 - proven by Phase 6 Playwright and benchmark tree scenarios.
-  - [ ] AC-2: Collapse/expand, deep focused-path reveal, selection, lifecycle menu action, patch insertion/removal, owning-root change, and draft reset retain exact task identity and existing state rules - proven by `task-tree.test.ts` and large-tree Playwright interactions.
-  - [ ] AC-3: No tree pagination, wire, repository, or schema behavior changes - proven by reducer/snapshot focused tests and diff inspection.
+  - [x] AC-1: A 5,000-visible-row expanded tree mounts at most 100 task rows, traverses first/middle/last in DFS order, keeps `retainedDeltaBytes <= 16 MiB`, `finalUsedBytes <= 1.5 * baselineUsedBytes`, sampled DOM within baseline +2500, and final DOM within baseline +250 - proven by Phase 6 Playwright and benchmark tree scenarios.
+  - [x] AC-2: Collapse/expand, deep focused-path reveal, selection, lifecycle menu action, patch insertion/removal, owning-root change, and draft reset retain exact task identity and existing state rules - proven by `task-tree.test.ts` and large-tree Playwright interactions.
+  - [x] AC-3: No tree pagination, wire, repository, or schema behavior changes - proven by reducer/snapshot focused tests and diff inspection.
 - Focused verification:
   - `npx vitest run webview/src/lib/task-tree.test.ts webview/src/lib/workspace-patch-reducer.test.ts src/host/snapshot.test.ts src/host/repository-snapshot.test.ts src/host/workspace-patch.test.ts && npm run test:phase6-webview && npm run bench:phase6-webview`
 - Phase gates:
@@ -181,6 +181,6 @@ Complete P6-W1 through P6-W3 so large loaded transcripts and expanded task trees
 ## Progress Log
 | Phase | Status | Commit | Verification | Review |
 |---|---|---|---|---|
-| 1 | complete | pending-commit | vitest chat helpers + phase6 webview 5/5 + bench BUDGET PASS + compile/svelte/boundaries green; schema unchanged; impl-review APPROVE (5 rounds) | APPROVE |
-| 2 | pending | N/A | pending | pending |
+| 1 | complete | f4c62bc | vitest chat helpers + phase6 webview 5/5 + bench BUDGET PASS + compile/svelte/boundaries green; schema unchanged; impl-review APPROVE (5 rounds) | APPROVE |
+| 2 | complete | pending-commit | task-tree unit large fixtures + phase6 webview 6/6 + bench tree BUDGET PASS + existing tree chrome e2e; schema unchanged; impl-review APPROVE | APPROVE |
 | 3 | pending | N/A | pending | pending |

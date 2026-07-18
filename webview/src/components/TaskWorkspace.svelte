@@ -1,4 +1,13 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
+  import {
+    Virtualizer,
+    elementScroll,
+    measureElement,
+    observeElementOffset,
+    observeElementRect,
+    type VirtualItem,
+  } from '@tanstack/svelte-virtual';
   import ChatThread from './ChatThread.svelte';
   import Composer from './Composer.svelte';
   import AskCard from './AskCard.svelte';
@@ -19,8 +28,13 @@
     expandPathInCollapsed,
     flattenTaskTreeCollapsible,
     taskRoleIcon,
+    type TaskTreeNode,
   } from '../lib/task-tree';
   import { tip } from '../lib/tooltip';
+
+  /** Fixed estimate for a compact tree row (matches min-height + padding). */
+  const TREE_ROW_ESTIMATE_PX = 32;
+  const TREE_VIRTUAL_OVERSCAN = 12;
 
   interface Props {
     pendingAsk: PendingAsk | null;
@@ -40,6 +54,12 @@
   let treeExpanded = $state(false);
   /** User overrides for twistie collapse; null = use defaultCollapsedIds. */
   let collapsedOverride = $state<Set<string> | null>(null);
+  let treeScrollEl: HTMLDivElement | undefined = $state();
+  let treeVirtualizer: Virtualizer<HTMLDivElement, HTMLElement> | null = null;
+  let treeVirtualizerCleanup: (() => void) | null = null;
+  let treeVirtualItems = $state<VirtualItem[]>([]);
+  let treeTotalSize = $state(0);
+  let lastTreeSignature = '';
 
   const focused = $derived(tasks.focusedTask);
   /** Navigation may move optimistically; transcript focus remains snapshot-atomic. */
@@ -64,8 +84,114 @@
     if (!navigationTask) return [];
     // The collapsed chrome is sourced from focus, never from the flattened tree.
     // That matters when a child is selected while its owning root remains row 0.
-    return [{ task: navigationTask, depth: 0, children: [] }];
+    return [{ task: navigationTask, depth: 0, children: [] as TaskTreeNode[] }];
   });
+
+  function publishTreeSnapshot(): void {
+    if (!treeVirtualizer) {
+      treeVirtualItems = [];
+      treeTotalSize = 0;
+      lastTreeSignature = '';
+      return;
+    }
+    const items = treeVirtualizer.getVirtualItems();
+    const size = treeVirtualizer.getTotalSize();
+    const signature = `${size}|${items.map((r) => `${String(r.key)}:${r.start}:${r.size}`).join(',')}`;
+    if (signature === lastTreeSignature) return;
+    lastTreeSignature = signature;
+    treeVirtualItems = items;
+    treeTotalSize = size;
+    // Close status menu if its row left the mounted window (prevents recycled identity leak).
+    if (statusMenuTaskId) {
+      const mounted = new Set(items.map((r) => String(r.key)));
+      if (!mounted.has(statusMenuTaskId)) statusMenuTaskId = null;
+    }
+  }
+
+  function disposeTreeVirtualizer(): void {
+    treeVirtualizerCleanup?.();
+    treeVirtualizerCleanup = null;
+    treeVirtualizer = null;
+    treeVirtualItems = [];
+    treeTotalSize = 0;
+    lastTreeSignature = '';
+  }
+
+  function syncTreeVirtualizer(count: number): void {
+    if (!treeScrollEl || !treeExpanded) {
+      disposeTreeVirtualizer();
+      return;
+    }
+    if (!treeVirtualizer) {
+      const instance = new Virtualizer<HTMLDivElement, HTMLElement>({
+        count,
+        getScrollElement: () => treeScrollEl ?? null,
+        estimateSize: () => TREE_ROW_ESTIMATE_PX,
+        overscan: TREE_VIRTUAL_OVERSCAN,
+        getItemKey: (index) => treeRows[index]?.task.id ?? index,
+        observeElementRect,
+        observeElementOffset,
+        scrollToFn: elementScroll,
+        measureElement,
+        useCachedMeasurements: false,
+        onChange: () => publishTreeSnapshot(),
+      });
+      treeVirtualizer = instance;
+      treeVirtualizerCleanup = instance._didMount();
+      instance._willUpdate();
+      publishTreeSnapshot();
+      return;
+    }
+    treeVirtualizer.setOptions({
+      ...treeVirtualizer.options,
+      count,
+      getScrollElement: () => treeScrollEl ?? null,
+      estimateSize: () => TREE_ROW_ESTIMATE_PX,
+      overscan: TREE_VIRTUAL_OVERSCAN,
+      getItemKey: (index) => treeRows[index]?.task.id ?? index,
+      onChange: () => publishTreeSnapshot(),
+    });
+    treeVirtualizer._willUpdate();
+    publishTreeSnapshot();
+  }
+
+  function measureTreeRow(node: HTMLElement) {
+    treeVirtualizer?.measureElement(node);
+    return {
+      update() {
+        treeVirtualizer?.measureElement(node);
+      },
+    };
+  }
+
+  // Keep the expanded tree virtualizer aligned with flattened row count.
+  $effect(() => {
+    void treeExpanded;
+    void treeRows.length;
+    void treeScrollEl;
+    void statusMenuTaskId;
+    if (!treeExpanded) {
+      disposeTreeVirtualizer();
+      return;
+    }
+    syncTreeVirtualizer(treeRows.length);
+  });
+
+  // Scroll focused/pending navigation into view when the expanded tree changes.
+  $effect(() => {
+    if (!treeExpanded || !treeVirtualizer) return;
+    const targetId = navigationTask?.id;
+    if (!targetId) return;
+    const index = treeRows.findIndex((row) => row.task.id === targetId);
+    if (index < 0) return;
+    treeVirtualizer.scrollToIndex(index, { align: 'auto' });
+    publishTreeSnapshot();
+  });
+
+  onDestroy(() => {
+    disposeTreeVirtualizer();
+  });
+
   function statusButtonTip(task: NonNullable<typeof focused>): string {
     const taskPresentation = getTaskPresentation(task);
     const taskRuntime = effectiveRuntimeActivity(task);
@@ -340,117 +466,207 @@
       <div
         id="task-chrome-tree"
         class="task-tree-panel__list"
+        class:task-tree-panel__list--virtual={treeExpanded}
         role="navigation"
         aria-label="Current task tree"
         data-testid="task-chrome-tree"
+        bind:this={treeScrollEl}
       >
-        {#each visibleTreeRows as row (row.task.id)}
-          {@const nodePresentation = getTaskPresentation(row.task)}
-          {@const isFocused = row.task.id === navigationTask?.id}
-          {@const hasChildren = row.children.length > 0}
-          {@const isCollapsed = collapsedIds.has(row.task.id)}
-          {@const menuOpen = statusMenuTaskId === row.task.id}
-          {@const isChromeToggle = !treeExpanded
-            ? isFocused
-            : row.task.id === treeRows[0]?.task.id}
-          <div class="task-tree-panel__item">
-            <div
-              class="task-tree-panel__row"
-              class:task-tree-panel__row--focused={isFocused}
-              style={`padding-left: ${6 + (treeExpanded ? Math.min(row.depth, 4) * 12 : 0)}px`}
-            >
-              {#if isChromeToggle}
+        {#if treeExpanded}
+          <div class="task-tree-panel__virtual-sizer" style={`height: ${treeTotalSize}px;`}>
+            {#each treeVirtualItems as vRow (vRow.key)}
+              {@const row = treeRows[vRow.index]}
+              {#if row}
+                {@const nodePresentation = getTaskPresentation(row.task)}
+                {@const isFocused = row.task.id === navigationTask?.id}
+                {@const hasChildren = row.children.length > 0}
+                {@const isCollapsed = collapsedIds.has(row.task.id)}
+                {@const menuOpen = statusMenuTaskId === row.task.id}
+                {@const isChromeToggle = row.task.id === treeRows[0]?.task.id}
+                <div
+                  class="task-tree-panel__item task-tree-panel__virtual-row"
+                  data-index={vRow.index}
+                  style={`transform: translateY(${vRow.start}px);`}
+                  use:measureTreeRow
+                >
+                  <div
+                    class="task-tree-panel__row"
+                    class:task-tree-panel__row--focused={isFocused}
+                    style={`padding-left: ${6 + Math.min(row.depth, 4) * 12}px`}
+                  >
+                    {#if isChromeToggle}
+                      <button
+                        type="button"
+                        class="task-tree-panel__twistie task-tree-panel__chrome-toggle"
+                        aria-label={`${treeExpanded ? 'Collapse' : 'Expand'} task tree`}
+                        aria-expanded={treeExpanded ? 'true' : 'false'}
+                        aria-controls="task-chrome-tree"
+                        data-testid="task-tree-summary"
+                        use:tip={treeExpanded ? 'Collapse task tree' : `Expand task tree (${tasks.subtree.length})`}
+                        onclick={toggleTreeChrome}
+                      >
+                        <span
+                          class="codicon"
+                          class:codicon-chevron-right={!treeExpanded}
+                          class:codicon-chevron-down={treeExpanded}
+                          aria-hidden="true"
+                        ></span>
+                      </button>
+                    {:else if hasChildren}
+                      <button
+                        type="button"
+                        class="task-tree-panel__twistie"
+                        aria-label={`${isCollapsed ? 'Expand' : 'Collapse'} ${row.task.goal}`}
+                        aria-expanded={isCollapsed ? 'false' : 'true'}
+                        data-testid="task-tree-collapse"
+                        data-task-id={row.task.id}
+                        onclick={() => toggleCollapse(row.task.id, true)}
+                      >
+                        <span
+                          class="codicon"
+                          class:codicon-chevron-right={isCollapsed}
+                          class:codicon-chevron-down={!isCollapsed}
+                          aria-hidden="true"
+                        ></span>
+                      </button>
+                    {:else}
+                      <span class="task-tree-panel__twistie task-tree-panel__twistie--spacer" aria-hidden="true"></span>
+                    {/if}
+                    <button
+                      type="button"
+                      class="task-tree-panel__select"
+                      aria-current={isFocused ? 'page' : undefined}
+                      aria-expanded={isFocused ? (treeExpanded ? 'true' : 'false') : undefined}
+                      aria-controls={isFocused ? 'task-chrome-tree' : undefined}
+                      aria-label={`${row.task.goal}${isFocused ? ', current task' : ''}`}
+                      data-testid="task-tree-row"
+                      data-task-id={row.task.id}
+                      data-tree-depth={row.depth}
+                      onclick={() => activateTreeNode(row.task.id)}
+                    >
+                      <span
+                        class="codicon task-tree-panel__role {taskRoleIcon(row.task.role)}"
+                        aria-hidden="true"
+                      ></span>
+                      <span class="task-tree-panel__goal" use:tip={row.task.goal}>{shortGoal(row.task.goal)}</span>
+                    </button>
+                    <button
+                      type="button"
+                      class={`task-tree-panel__status-btn ${lifecycleClass(row.task.lifecycle)}`}
+                      data-task-lifecycle={row.task.lifecycle}
+                      aria-haspopup="menu"
+                      aria-expanded={menuOpen ? 'true' : 'false'}
+                      aria-label={`Task status: ${nodePresentation.lifecycle.label}. Change status for ${row.task.goal}.`}
+                      use:tip={statusButtonTip(row.task)}
+                      onclick={() => (statusMenuTaskId = menuOpen ? null : row.task.id)}
+                    >
+                      <span class={`codicon ${lifecycleIcon(row.task.lifecycle)}`} aria-hidden="true"></span>
+                      <span class="codicon codicon-chevron-down" aria-hidden="true"></span>
+                    </button>
+                  </div>
+                  {#if menuOpen}
+                    <div
+                      class="task-tree-panel__status-menu"
+                      role="menu"
+                      aria-label={`Set status for ${row.task.goal}`}
+                      style={`margin-left: ${30 + Math.min(row.depth, 4) * 12}px`}
+                    >
+                      {#each lifecycleActions(row.task.lifecycle) as action (action.lifecycle)}
+                        <button
+                          type="button"
+                          class="task-status-menu__item"
+                          role="menuitem"
+                          title={action.description}
+                          onclick={() => setLifecycle(row.task.id, action.lifecycle)}
+                        >
+                          <span class="task-status-menu__item-label">{action.label}</span>
+                          <span class="task-status-menu__item-desc">{action.description}</span>
+                        </button>
+                      {/each}
+                    </div>
+                  {/if}
+                </div>
+              {/if}
+            {/each}
+          </div>
+        {:else}
+          {#each visibleTreeRows as row (row.task.id)}
+            {@const nodePresentation = getTaskPresentation(row.task)}
+            {@const isFocused = row.task.id === navigationTask?.id}
+            {@const menuOpen = statusMenuTaskId === row.task.id}
+            <div class="task-tree-panel__item">
+              <div
+                class="task-tree-panel__row"
+                class:task-tree-panel__row--focused={isFocused}
+                style="padding-left: 6px"
+              >
                 <button
                   type="button"
                   class="task-tree-panel__twistie task-tree-panel__chrome-toggle"
-                  aria-label={`${treeExpanded ? 'Collapse' : 'Expand'} task tree`}
-                  aria-expanded={treeExpanded ? 'true' : 'false'}
+                  aria-label="Expand task tree"
+                  aria-expanded="false"
                   aria-controls="task-chrome-tree"
                   data-testid="task-tree-summary"
-                  use:tip={treeExpanded ? 'Collapse task tree' : `Expand task tree (${tasks.subtree.length})`}
+                  use:tip={`Expand task tree (${tasks.subtree.length})`}
                   onclick={toggleTreeChrome}
                 >
-                  <span
-                    class="codicon"
-                    class:codicon-chevron-right={!treeExpanded}
-                    class:codicon-chevron-down={treeExpanded}
-                    aria-hidden="true"
-                  ></span>
+                  <span class="codicon codicon-chevron-right" aria-hidden="true"></span>
                 </button>
-              {:else if hasChildren}
                 <button
                   type="button"
-                  class="task-tree-panel__twistie"
-                  aria-label={`${isCollapsed ? 'Expand' : 'Collapse'} ${row.task.goal}`}
-                  aria-expanded={isCollapsed ? 'false' : 'true'}
-                  data-testid="task-tree-collapse"
+                  class="task-tree-panel__select"
+                  aria-current={isFocused ? 'page' : undefined}
+                  aria-expanded="false"
+                  aria-controls="task-chrome-tree"
+                  aria-label={`${row.task.goal}${isFocused ? ', current task' : ''}`}
+                  data-testid="task-tree-row"
                   data-task-id={row.task.id}
-                  onclick={() => toggleCollapse(row.task.id, true)}
+                  onclick={() => activateTreeNode(row.task.id)}
                 >
                   <span
-                    class="codicon"
-                    class:codicon-chevron-right={isCollapsed}
-                    class:codicon-chevron-down={!isCollapsed}
+                    class="codicon task-tree-panel__role {taskRoleIcon(row.task.role)}"
                     aria-hidden="true"
                   ></span>
+                  <span class="task-tree-panel__goal" use:tip={row.task.goal}>{shortGoal(row.task.goal)}</span>
                 </button>
-              {:else}
-                <span class="task-tree-panel__twistie task-tree-panel__twistie--spacer" aria-hidden="true"></span>
-              {/if}
-              <button
-                type="button"
-                class="task-tree-panel__select"
-                aria-current={isFocused ? 'page' : undefined}
-                aria-expanded={isFocused ? (treeExpanded ? 'true' : 'false') : undefined}
-                aria-controls={isFocused ? 'task-chrome-tree' : undefined}
-                aria-label={`${row.task.goal}${isFocused ? ', current task' : ''}`}
-                data-testid="task-tree-row"
-                data-task-id={row.task.id}
-                onclick={() => activateTreeNode(row.task.id)}
-              >
-                <span
-                  class="codicon task-tree-panel__role {taskRoleIcon(row.task.role)}"
-                  aria-hidden="true"
-                ></span>
-                <span class="task-tree-panel__goal" use:tip={row.task.goal}>{shortGoal(row.task.goal)}</span>
-              </button>
-              <button
-                type="button"
-                class={`task-tree-panel__status-btn ${lifecycleClass(row.task.lifecycle)}`}
-                data-task-lifecycle={row.task.lifecycle}
-                aria-haspopup="menu"
-                aria-expanded={menuOpen ? 'true' : 'false'}
-                aria-label={`Task status: ${nodePresentation.lifecycle.label}. Change status for ${row.task.goal}.`}
-                use:tip={statusButtonTip(row.task)}
-                onclick={() => (statusMenuTaskId = menuOpen ? null : row.task.id)}
-              >
-                <span class={`codicon ${lifecycleIcon(row.task.lifecycle)}`} aria-hidden="true"></span>
-                <span class="codicon codicon-chevron-down" aria-hidden="true"></span>
-              </button>
-            </div>
-            {#if menuOpen}
-              <div
-                class="task-tree-panel__status-menu"
-                role="menu"
-                aria-label={`Set status for ${row.task.goal}`}
-                style={`margin-left: ${30 + (treeExpanded ? Math.min(row.depth, 4) * 12 : 0)}px`}
-              >
-                {#each lifecycleActions(row.task.lifecycle) as action (action.lifecycle)}
-                  <button
-                    type="button"
-                    class="task-status-menu__item"
-                    role="menuitem"
-                    title={action.description}
-                    onclick={() => setLifecycle(row.task.id, action.lifecycle)}
-                  >
-                    <span class="task-status-menu__item-label">{action.label}</span>
-                    <span class="task-status-menu__item-desc">{action.description}</span>
-                  </button>
-                {/each}
+                <button
+                  type="button"
+                  class={`task-tree-panel__status-btn ${lifecycleClass(row.task.lifecycle)}`}
+                  data-task-lifecycle={row.task.lifecycle}
+                  aria-haspopup="menu"
+                  aria-expanded={menuOpen ? 'true' : 'false'}
+                  aria-label={`Task status: ${nodePresentation.lifecycle.label}. Change status for ${row.task.goal}.`}
+                  use:tip={statusButtonTip(row.task)}
+                  onclick={() => (statusMenuTaskId = menuOpen ? null : row.task.id)}
+                >
+                  <span class={`codicon ${lifecycleIcon(row.task.lifecycle)}`} aria-hidden="true"></span>
+                  <span class="codicon codicon-chevron-down" aria-hidden="true"></span>
+                </button>
               </div>
-            {/if}
-          </div>
-        {/each}
+              {#if menuOpen}
+                <div
+                  class="task-tree-panel__status-menu"
+                  role="menu"
+                  aria-label={`Set status for ${row.task.goal}`}
+                  style="margin-left: 30px"
+                >
+                  {#each lifecycleActions(row.task.lifecycle) as action (action.lifecycle)}
+                    <button
+                      type="button"
+                      class="task-status-menu__item"
+                      role="menuitem"
+                      title={action.description}
+                      onclick={() => setLifecycle(row.task.id, action.lifecycle)}
+                    >
+                      <span class="task-status-menu__item-label">{action.label}</span>
+                      <span class="task-status-menu__item-desc">{action.description}</span>
+                    </button>
+                  {/each}
+                </div>
+              {/if}
+            </div>
+          {/each}
+        {/if}
       </div>
     </div>
 

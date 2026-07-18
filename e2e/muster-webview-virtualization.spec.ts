@@ -898,3 +898,354 @@ test.describe('Phase 6 chat virtualization', () => {
     void targetIndex;
   });
 });
+
+test.describe('Phase 6 expanded task-tree virtualization', () => {
+  const TREE_N = 5000;
+  const MAX_TREE_MOUNTED = 100;
+
+  function makeWideSubtree(count: number) {
+    const root = {
+      id: 'tree-root',
+      parentId: null as string | null,
+      goal: 'Root coordinator',
+      role: 'coordinator',
+      lifecycle: 'open',
+      runtimeActivity: 'idle',
+      viewStatus: 'idle',
+      currentTurnActivity: null,
+      updatedAt: '2026-07-18T00:00:00.000Z',
+      backend: 'claude',
+    };
+    const children = Array.from({ length: count - 1 }, (_, i) => ({
+      ...root,
+      id: `tree-c-${i}`,
+      parentId: 'tree-root',
+      goal: `Wide child ${i}`,
+      role: 'worker',
+    }));
+    return [root, ...children];
+  }
+
+  test('bounds mounted rows for a 5000-node expanded tree and preserves interactions', async ({
+    page,
+  }) => {
+    test.setTimeout(180_000);
+    await openWebview(page);
+    const subtree = makeWideSubtree(TREE_N);
+    const root = subtree[0]!;
+    const middle = subtree[Math.floor(TREE_N / 2)]!;
+    const last = subtree[TREE_N - 1]!;
+
+    // Build the large subtree inside the page to avoid huge Node↔browser clone cost.
+    await page.evaluate(
+      ({ protocolVersion, n }) => {
+        const subtree: Array<Record<string, unknown>> = [
+          {
+            id: 'tree-root',
+            parentId: null,
+            goal: 'Root coordinator',
+            role: 'coordinator',
+            lifecycle: 'open',
+            runtimeActivity: 'idle',
+            viewStatus: 'idle',
+            currentTurnActivity: null,
+            updatedAt: '2026-07-18T00:00:00.000Z',
+            backend: 'claude',
+          },
+        ];
+        for (let i = 0; i < n - 1; i += 1) {
+          subtree.push({
+            id: `tree-c-${i}`,
+            parentId: 'tree-root',
+            goal: `Wide child ${i}`,
+            role: 'worker',
+            lifecycle: 'open',
+            runtimeActivity: 'idle',
+            viewStatus: 'idle',
+            currentTurnActivity: null,
+            updatedAt: '2026-07-18T00:00:00.000Z',
+            backend: 'claude',
+          });
+        }
+        const root = subtree[0]!;
+        window.postMessage(
+          {
+            type: 'snapshot',
+            protocolVersion,
+            rootTasks: [root],
+            focusedTaskId: root.id,
+            subtree,
+            transcript: [
+              {
+                id: 'msg-tree',
+                kind: 'assistant',
+                content: 'Tree ready',
+                turnId: 'tt',
+                order: 1,
+                state: 'complete',
+              },
+            ],
+            transcriptPage: { hasMoreBefore: false, workspaceRevision: 1 },
+            storeRevision: 1,
+          },
+          '*',
+        );
+      },
+      { protocolVersion: PROTOCOL_VERSION, n: TREE_N },
+    );
+    void subtree;
+    void root;
+
+    await expect(page.getByTestId('task-tree-summary')).toBeVisible({ timeout: 60_000 });
+    await page.getByTestId('task-tree-summary').click();
+    await expect(page.locator('[data-testid="task-chrome"]')).toHaveAttribute(
+      'data-tree-expanded',
+      'true',
+    );
+
+    await expect
+      .poll(async () => page.locator('[data-testid="task-tree-row"]').count(), {
+        timeout: 15_000,
+      })
+      .toBeLessThanOrEqual(MAX_TREE_MOUNTED);
+    const initialMounted = await page.locator('[data-testid="task-tree-row"]').count();
+    expect(initialMounted).toBeGreaterThan(0);
+    expect(initialMounted).toBeLessThanOrEqual(MAX_TREE_MOUNTED);
+    await expect(page.locator('[data-testid="task-tree-row"][data-task-id="tree-root"]')).toBeVisible();
+
+    const treeList = page.getByTestId('task-chrome-tree');
+    // Exact middle DFS identity (index TREE_N/2 in wide list: root + children).
+    await treeList.evaluate((el) => {
+      el.scrollTop = Math.floor((el.scrollHeight - el.clientHeight) / 2);
+      el.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+    await page.waitForTimeout(100);
+    expect(await page.locator('[data-testid="task-tree-row"]').count()).toBeLessThanOrEqual(
+      MAX_TREE_MOUNTED,
+    );
+    await expect
+      .poll(
+        async () => page.locator(`[data-testid="task-tree-row"][data-task-id="${middle.id}"]`).count(),
+        { timeout: 10_000 },
+      )
+      .toBeGreaterThan(0);
+    const middleRow = page.locator(`[data-testid="task-tree-row"][data-task-id="${middle.id}"]`);
+    await expect(middleRow).toHaveAttribute('data-tree-depth', '1');
+    // Indentation for depth 1: inline style padding-left: 18px (6 + 12*depth).
+    const midPad = await middleRow.evaluate((el) => {
+      const row = el.closest('.task-tree-panel__row') as HTMLElement | null;
+      return row?.style.paddingLeft ?? '';
+    });
+    expect(midPad).toBe('18px');
+
+    // Last row reachable.
+    await treeList.evaluate((el) => {
+      el.scrollTop = el.scrollHeight;
+      el.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+    await page.waitForTimeout(100);
+    await expect
+      .poll(
+        async () => page.locator(`[data-testid="task-tree-row"][data-task-id="${last.id}"]`).count(),
+        { timeout: 10_000 },
+      )
+      .toBeGreaterThan(0);
+    expect(await page.locator('[data-testid="task-tree-row"]').count()).toBeLessThanOrEqual(
+      MAX_TREE_MOUNTED,
+    );
+
+    // Select far row → focusTask + focused visibility.
+    await clearPosted(page);
+    await page.locator(`[data-testid="task-tree-row"][data-task-id="${last.id}"]`).click();
+    await expect
+      .poll(async () => {
+        const msgs = await postedMessages(page);
+        return msgs.some(
+          (m) =>
+            typeof m === 'object' &&
+            m !== null &&
+            (m as { type?: string }).type === 'focusTask' &&
+            (m as { taskId?: string }).taskId === last.id,
+        );
+      }, { timeout: 5_000 })
+      .toBe(true);
+
+    // Lifecycle menu + recycle close: open menu then scroll its row out of range.
+    await treeList.evaluate((el) => {
+      el.scrollTop = 0;
+      el.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+    await page.waitForTimeout(80);
+    await clearPosted(page);
+    const rootStatus = page
+      .locator('[data-testid="task-tree-row"][data-task-id="tree-root"]')
+      .locator('xpath=..')
+      .locator('.task-tree-panel__status-btn');
+    await rootStatus.click({ force: true });
+    await expect(page.getByRole('menuitem').filter({ hasText: 'Mark done' }).first()).toBeVisible({
+      timeout: 3_000,
+    });
+    // Scroll away so the open menu's row leaves the virtual window → menu must close.
+    await treeList.evaluate((el) => {
+      el.scrollTop = el.scrollHeight;
+      el.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+    await page.waitForTimeout(120);
+    await expect(page.getByRole('menuitem')).toHaveCount(0);
+
+    // Re-open menu at top and complete a lifecycle action.
+    await treeList.evaluate((el) => {
+      el.scrollTop = 0;
+      el.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+    await page.waitForTimeout(80);
+    await rootStatus.click({ force: true });
+    await page.evaluate(() => {
+      const item = document.querySelector<HTMLElement>('[role="menuitem"]');
+      item?.click();
+    });
+    await expect
+      .poll(async () => {
+        const msgs = await postedMessages(page);
+        return msgs.some(
+          (m) =>
+            typeof m === 'object' &&
+            m !== null &&
+            (m as { type?: string }).type === 'setTaskLifecycle' &&
+            (m as { taskId?: string }).taskId === 'tree-root' &&
+            (m as { lifecycle?: string }).lifecycle === 'succeeded',
+        );
+      }, { timeout: 5_000 })
+      .toBe(true);
+
+    // Collapse root branch via chrome toggle (row 0) then re-expand.
+    await page.getByTestId('task-tree-summary').click();
+    await expect(page.locator('[data-testid="task-chrome"]')).toHaveAttribute(
+      'data-tree-expanded',
+      'false',
+    );
+    await page.getByTestId('task-tree-summary').click();
+    await expect(page.locator('[data-testid="task-chrome"]')).toHaveAttribute(
+      'data-tree-expanded',
+      'true',
+    );
+    expect(await page.locator('[data-testid="task-tree-row"]').count()).toBeLessThanOrEqual(
+      MAX_TREE_MOUNTED,
+    );
+
+    // Patch removal: remove middle while it is mounted; then full-range sweep must
+    // never remount it, while a known sibling remains reachable.
+    await treeList.evaluate((el) => {
+      el.scrollTop = Math.floor((el.scrollHeight - el.clientHeight) / 2);
+      el.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+    await page.waitForTimeout(80);
+    await expect
+      .poll(
+        async () => page.locator(`[data-testid="task-tree-row"][data-task-id="${middle.id}"]`).count(),
+        { timeout: 8_000 },
+      )
+      .toBeGreaterThan(0);
+    const removeId = middle.id;
+    await postHost(page, {
+      type: 'workspacePatchBatch',
+      revision: 2,
+      patches: [{ type: 'taskRemoved', taskId: removeId }],
+    });
+    // Immediately after patch, middle must leave the mounted set.
+    await expect
+      .poll(
+        async () => page.locator(`[data-testid="task-tree-row"][data-task-id="${removeId}"]`).count(),
+        { timeout: 5_000 },
+      )
+      .toBe(0);
+    // Full-range sweep: removed id never remounts; root remains reachable at top;
+    // last remains reachable at bottom; no duplicate keys; bound holds.
+    let sawRemoved = false;
+    for (const frac of [0, 0.25, 0.5, 0.75, 1]) {
+      await treeList.evaluate((el, f) => {
+        const max = Math.max(0, el.scrollHeight - el.clientHeight);
+        el.scrollTop = Math.floor(max * f);
+        el.dispatchEvent(new Event('scroll', { bubbles: true }));
+      }, frac);
+      await page.waitForTimeout(40);
+      if (
+        (await page.locator(`[data-testid="task-tree-row"][data-task-id="${removeId}"]`).count()) > 0
+      ) {
+        sawRemoved = true;
+      }
+      const ids = await page.locator('[data-testid="task-tree-row"]').evaluateAll((els) =>
+        els.map((el) => el.getAttribute('data-task-id') ?? ''),
+      );
+      expect(new Set(ids).size).toBe(ids.length);
+      expect(await page.locator('[data-testid="task-tree-row"]').count()).toBeLessThanOrEqual(
+        MAX_TREE_MOUNTED,
+      );
+    }
+    expect(sawRemoved).toBe(false);
+    await treeList.evaluate((el) => {
+      el.scrollTop = 0;
+      el.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+    await expect(page.locator('[data-testid="task-tree-row"][data-task-id="tree-root"]')).toBeVisible();
+    await treeList.evaluate((el) => {
+      el.scrollTop = el.scrollHeight;
+      el.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+    await expect
+      .poll(
+        async () => page.locator(`[data-testid="task-tree-row"][data-task-id="${last.id}"]`).count(),
+        { timeout: 5_000 },
+      )
+      .toBeGreaterThan(0);
+
+    // Patch insertion: upsert a new child and assert it appears exactly once when scrolled into range.
+    const insertedId = 'tree-c-inserted';
+    await postHost(page, {
+      type: 'workspacePatchBatch',
+      revision: 3,
+      patches: [
+        {
+          type: 'taskUpserted',
+          task: {
+            id: insertedId,
+            parentId: 'tree-root',
+            goal: 'Inserted child',
+            role: 'worker',
+            lifecycle: 'open',
+            runtimeActivity: 'idle',
+            viewStatus: 'idle',
+            currentTurnActivity: null,
+            updatedAt: '2026-07-18T00:00:01.000Z',
+            backend: 'claude',
+          },
+        },
+      ],
+    });
+    // Scroll through the list until the inserted row mounts (or top/bottom sweeps).
+    let foundInserted = false;
+    for (const frac of [0, 0.25, 0.5, 0.75, 1]) {
+      await treeList.evaluate((el, f) => {
+        const max = Math.max(0, el.scrollHeight - el.clientHeight);
+        el.scrollTop = Math.floor(max * f);
+        el.dispatchEvent(new Event('scroll', { bubbles: true }));
+      }, frac);
+      await page.waitForTimeout(40);
+      if (
+        (await page.locator(`[data-testid="task-tree-row"][data-task-id="${insertedId}"]`).count()) >
+        0
+      ) {
+        foundInserted = true;
+        break;
+      }
+    }
+    expect(foundInserted).toBe(true);
+    const insertedCount = await page
+      .locator(`[data-testid="task-tree-row"][data-task-id="${insertedId}"]`)
+      .count();
+    expect(insertedCount).toBe(1);
+    expect(await page.locator('[data-testid="task-tree-row"]').count()).toBeLessThanOrEqual(
+      MAX_TREE_MOUNTED,
+    );
+  });
+});

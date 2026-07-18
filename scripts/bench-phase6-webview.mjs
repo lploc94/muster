@@ -170,7 +170,7 @@ function startStaticServer(dir) {
   });
 }
 
-async function settleAndSample(page, cdp) {
+async function settleAndSample(page, cdp, mountedSelector = '[data-transcript-id]') {
   await page.evaluate(
     () =>
       new Promise((resolveSettle) => {
@@ -185,12 +185,38 @@ async function settleAndSample(page, cdp) {
   await cdp.send('HeapProfiler.collectGarbage');
   const heap = await cdp.send('Runtime.getHeapUsage');
   const dom = await cdp.send('Memory.getDOMCounters');
-  const mounted = await page.locator('[data-transcript-id]').count();
+  const mounted = await page.locator(mountedSelector).count();
   return {
     usedSize: heap.usedSize,
     domNodes: dom.nodes,
     mountedRows: mounted,
   };
+}
+
+function buildWideTree(count) {
+  const root = {
+    id: 'tree-root',
+    parentId: null,
+    goal: 'Root coordinator',
+    role: 'coordinator',
+    lifecycle: 'open',
+    runtimeActivity: 'idle',
+    viewStatus: 'idle',
+    currentTurnActivity: null,
+    updatedAt: '2026-07-18T00:00:00.000Z',
+    backend: 'claude',
+  };
+  const children = [];
+  for (let i = 0; i < count - 1; i += 1) {
+    children.push({
+      ...root,
+      id: `tree-c-${i}`,
+      parentId: 'tree-root',
+      goal: `Wide child ${i}`,
+      role: 'worker',
+    });
+  }
+  return [root, ...children];
 }
 
 async function main() {
@@ -325,17 +351,108 @@ async function main() {
     const domPeakOk = samples.every((s) => s.domNodes <= baseline.domNodes + MAX_DOM_PEAK_DELTA);
     const domFinalOk = finalSample.domNodes <= baseline.domNodes + MAX_DOM_FINAL_DELTA;
     const mountedOk = peakMounted <= MAX_MOUNTED && samples.every((s) => s.mountedRows <= MAX_MOUNTED);
-    const pass = heapOk && domPeakOk && domFinalOk && mountedOk;
+    const chatPass = heapOk && domPeakOk && domFinalOk && mountedOk;
+
+    // --- Expanded task-tree virtualization fixture (5000 visible rows) ---
+    const TREE_N = 5000;
+    const MAX_TREE_MOUNTED = 100;
+    const treeSubtree = buildWideTree(TREE_N);
+    const treeRoot = treeSubtree[0];
+    await page.evaluate(
+      ({ root, subtree }) => {
+        window.postMessage(
+          {
+            type: 'snapshot',
+            protocolVersion: 9,
+            rootTasks: [root],
+            focusedTaskId: root.id,
+            subtree,
+            transcript: [
+              {
+                id: 'msg-tree',
+                kind: 'assistant',
+                content: 'Tree ready',
+                turnId: 'tt',
+                order: 1,
+                state: 'complete',
+              },
+            ],
+            transcriptPage: { hasMoreBefore: false, workspaceRevision: 2 },
+            storeRevision: 2,
+          },
+          '*',
+        );
+      },
+      { root: treeRoot, subtree: treeSubtree },
+    );
+    await page.waitForSelector('[data-testid="task-tree-summary"]', { timeout: 30_000 });
+    await page.getByTestId('task-tree-summary').click();
+    await page.waitForTimeout(150);
+
+    const treeSamples = [];
+    let treePeakDom = 0;
+    let treePeakMounted = 0;
+    const treeBaseline = await settleAndSample(page, cdp, '[data-testid="task-tree-row"]');
+    treeSamples.push({ label: 'tree_baseline_expanded', ...treeBaseline });
+    treePeakDom = Math.max(treePeakDom, treeBaseline.domNodes);
+    treePeakMounted = Math.max(treePeakMounted, treeBaseline.mountedRows);
+
+    const treeList = page.getByTestId('task-chrome-tree');
+    await treeList.evaluate((el) => {
+      el.scrollTop = el.scrollHeight;
+      el.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+    await page.waitForTimeout(120);
+    const treeEnd = await settleAndSample(page, cdp, '[data-testid="task-tree-row"]');
+    treeSamples.push({ label: 'tree_end', ...treeEnd });
+    treePeakDom = Math.max(treePeakDom, treeEnd.domNodes);
+    treePeakMounted = Math.max(treePeakMounted, treeEnd.mountedRows);
+
+    await treeList.evaluate((el) => {
+      el.scrollTop = Math.floor((el.scrollHeight - el.clientHeight) / 2);
+      el.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+    await page.waitForTimeout(120);
+    const treeMid = await settleAndSample(page, cdp, '[data-testid="task-tree-row"]');
+    treeSamples.push({ label: 'tree_middle', ...treeMid });
+    treePeakDom = Math.max(treePeakDom, treeMid.domNodes);
+    treePeakMounted = Math.max(treePeakMounted, treeMid.mountedRows);
+
+    await treeList.evaluate((el) => {
+      el.scrollTop = 0;
+      el.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+    await page.waitForTimeout(120);
+    const treeFinal = await settleAndSample(page, cdp, '[data-testid="task-tree-row"]');
+    treeSamples.push({ label: 'tree_final_top', ...treeFinal });
+    treePeakDom = Math.max(treePeakDom, treeFinal.domNodes);
+    treePeakMounted = Math.max(treePeakMounted, treeFinal.mountedRows);
+
+    const treeRetained = Math.max(0, treeFinal.usedSize - treeBaseline.usedSize);
+    const treeHeapOk =
+      treeRetained <= MAX_RETAINED_DELTA && treeFinal.usedSize <= HEAP_RATIO * treeBaseline.usedSize;
+    const treeDomPeakOk = treeSamples.every(
+      (s) => s.domNodes <= treeBaseline.domNodes + MAX_DOM_PEAK_DELTA,
+    );
+    const treeDomFinalOk = treeFinal.domNodes <= treeBaseline.domNodes + MAX_DOM_FINAL_DELTA;
+    const treeMountedOk =
+      treePeakMounted <= MAX_TREE_MOUNTED &&
+      treeSamples.every((s) => s.mountedRows <= MAX_TREE_MOUNTED);
+    const treePass = treeHeapOk && treeDomPeakOk && treeDomFinalOk && treeMountedOk;
+
+    const pass = chatPass && treePass;
 
     const result = {
       status: pass ? 'PASS' : 'FAIL',
       fixture: {
         transcriptItems: TOTAL,
-        contentClasses: ['user', 'assistant', 'tool', 'reasoning', 'tall-markdown'],
+        treeVisibleRows: TREE_N,
+        contentClasses: ['user', 'assistant', 'tool', 'reasoning', 'tall-markdown', 'wide-tree'],
       },
       viewport: { width: 1280, height: 720 },
       thresholds: {
         maxMountedRows: MAX_MOUNTED,
+        maxTreeMountedRows: MAX_TREE_MOUNTED,
         maxRetainedDeltaBytes: MAX_RETAINED_DELTA,
         heapRatio: HEAP_RATIO,
         maxDomPeakDelta: MAX_DOM_PEAK_DELTA,
@@ -350,6 +467,17 @@ async function main() {
         finalDomNodes: finalSample.domNodes,
         peakMountedRows: peakMounted,
         samples,
+        tree: {
+          baselineUsedBytes: treeBaseline.usedSize,
+          finalUsedBytes: treeFinal.usedSize,
+          retainedDeltaBytes: treeRetained,
+          baselineDomNodes: treeBaseline.domNodes,
+          peakDomNodes: treePeakDom,
+          finalDomNodes: treeFinal.domNodes,
+          peakMountedRows: treePeakMounted,
+          logicalRows: TREE_N,
+          samples: treeSamples,
+        },
       },
       runtime: {
         node: process.version,

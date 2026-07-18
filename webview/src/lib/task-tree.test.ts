@@ -181,3 +181,62 @@ describe('owning-root expand retention', () => {
     expect(showTaskNavFor({ parentId: 'r' }, 1)).toBe(true);
   });
 });
+
+describe('large tree fixtures (Phase 6)', () => {
+  function wideTree(count: number) {
+    const root = summary({ id: 'root', role: 'coordinator' });
+    const children = Array.from({ length: count }, (_, i) =>
+      summary({ id: `c-${i}`, parentId: 'root', goal: `Child ${i}` }),
+    );
+    return [root, ...children];
+  }
+
+  function deepTree(depth: number) {
+    const nodes = [summary({ id: 'n0', role: 'coordinator' })];
+    for (let i = 1; i <= depth; i += 1) {
+      nodes.push(summary({ id: `n${i}`, parentId: `n${i - 1}`, goal: `Depth ${i}` }));
+    }
+    return nodes;
+  }
+
+  it('flattens a 5000-wide owning-root in stable DFS order', () => {
+    const nodes = wideTree(4999);
+    const tree = buildTaskTree(nodes);
+    const flat = flattenTaskTree(tree);
+    expect(flat).toHaveLength(5000);
+    expect(flat[0]!.task.id).toBe('root');
+    expect(flat[1]!.task.id).toBe('c-0');
+    expect(flat[4999]!.task.id).toBe('c-4998');
+    // Collapse root → only the root row is visible.
+    const collapsed = new Set(['root']);
+    expect(flattenTaskTreeCollapsible(tree, collapsed).map((n) => n.task.id)).toEqual(['root']);
+  });
+
+  it('default collapse bounds deep trees while focused path expands ancestors', () => {
+    const nodes = deepTree(40);
+    const tree = buildTaskTree(nodes);
+    const collapsed = defaultCollapsedIds(tree, 2);
+    // Depth >= 2 nodes with children are collapsed by default.
+    expect(collapsed.has('n2')).toBe(true);
+    const focused = nodes[nodes.length - 1]!;
+    const path = breadcrumbPath(focused, nodes);
+    const opened = expandPathInCollapsed(collapsed, path);
+    const flat = flattenTaskTreeCollapsible(tree, opened);
+    expect(flat.map((n) => n.task.id)).toContain('n40');
+    // Path length is depth+1; all ancestors must be present.
+    expect(flat.length).toBeGreaterThanOrEqual(41);
+  });
+
+  it('removal of a mid node drops its subtree from collapsible flatten', () => {
+    const nodes = [
+      summary({ id: 'root', role: 'coordinator' }),
+      summary({ id: 'a', parentId: 'root' }),
+      summary({ id: 'a1', parentId: 'a' }),
+      summary({ id: 'b', parentId: 'root' }),
+    ];
+    const withoutA = nodes.filter((n) => n.id !== 'a' && n.id !== 'a1');
+    const flat = flattenTaskTree(buildTaskTree(withoutA)).map((n) => n.task.id);
+    expect(flat).toEqual(['root', 'b']);
+    expect(flat).not.toContain('a1');
+  });
+});

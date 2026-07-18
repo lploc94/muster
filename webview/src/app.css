@@ -300,6 +300,22 @@ body {
   padding: 0;
 }
 
+.task-tree-panel__list--virtual {
+  position: relative;
+}
+
+.task-tree-panel__virtual-sizer {
+  position: relative;
+  width: 100%;
+}
+
+.task-tree-panel__virtual-row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+}
+
 .task-chrome[data-tree-expanded='false'] .task-tree-panel__list {
   max-height: none;
   overflow: visible;
@@ -437,6 +453,8 @@ body {
 }
 
 .task-tree-panel__status-menu {
+  position: relative;
+  z-index: 5;
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
   gap: 2px;
