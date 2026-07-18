@@ -122,6 +122,26 @@ test('rejects unknown keys, sensitive content, self-referential w3 commit', asyn
   }
   {
     const bad = structuredClone(base);
+    bad.fixture.transcriptItems = 1000;
+    assert.ok(validatePhase6Evidence(bad).some((f) => /transcriptItems must be 2000/.test(f)));
+  }
+  {
+    const bad = structuredClone(base);
+    bad.w1Commit = 'f4c62bcdeadbeefdeadbeefdeadbeefdeadbeef';
+    assert.ok(validatePhase6Evidence(bad).some((f) => /w1Commit/.test(f)));
+  }
+  {
+    const bad = structuredClone(base);
+    bad.commands = [];
+    assert.ok(validatePhase6Evidence(bad).some((f) => /commands/.test(f)));
+  }
+  {
+    const bad = structuredClone(base);
+    bad.commands = ['npm run bench:phase6-webview', 'npm run test:phase6-webview'];
+    assert.ok(validatePhase6Evidence(bad).some((f) => /commands must include/.test(f)));
+  }
+  {
+    const bad = structuredClone(base);
     bad.metrics.chat.retainedDeltaBytes = 99;
     assert.ok(validatePhase6Evidence(bad).some((f) => /retainedDeltaBytes/.test(f)));
   }

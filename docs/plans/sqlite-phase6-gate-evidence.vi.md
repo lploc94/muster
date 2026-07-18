@@ -32,8 +32,8 @@ Tracked artifact: [`sqlite-phase6-webview-evidence.json`](./sqlite-phase6-webvie
 
 - Chat: peak mounted transcript rows ≤ 80; retained heap ≤ 16 MiB; final ≤ 1.5× baseline; DOM peak/final vs baseline +2500/+250.
 - Tree: peak mounted task rows ≤ 100; same heap/DOM formulas on 5000-row expanded tree.
-- Commands: `npm run bench:phase6-webview`, `npm run test:phase6-webview`.
-- Result: **BUDGET PASS**.
+- Commands: `npm run bench:phase6-webview`, `npm run test:phase6-webview`, plus preservation gates (`compile`, `check:svelte`, `npm test`, `test:webview`, storage/export docs, source-boundary, phase5/phase6 evidence, phase4 release assert, schema-freeze).
+- Result: **BUDGET PASS** (virtualization) and preservation gates green on closeout HEAD.
 
 ## Protocol docs
 

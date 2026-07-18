@@ -82,8 +82,28 @@ function matchesApprovedSha(value, approvedFull) {
   if (typeof value !== 'string' || !SHA1.test(value)) return false;
   const v = value.toLowerCase();
   const a = approvedFull.toLowerCase();
-  return a.startsWith(v) || v.startsWith(a.slice(0, 7));
+  // Short prefixes (7–39) must uniquely prefix the approved full SHA.
+  // Full 40-char values must equal the approved SHA exactly.
+  if (v.length >= 40) return v === a;
+  return a.startsWith(v) && v.length >= 7;
 }
+
+const REQUIRED_CONTENT_CLASSES = ['user', 'assistant', 'tool', 'reasoning', 'tall-markdown', 'wide-tree'];
+const ALLOWED_COMMANDS = new Set([
+  'npm run bench:phase6-webview',
+  'npm run test:phase6-webview',
+  'npm run compile',
+  'npm run check:svelte',
+  'npm test',
+  'npm run test:webview',
+  'npm run test:sqlite-storage-docs',
+  'npm run test:task-export-docs',
+  'npm run test:source-boundary',
+  'npm run test:sqlite-phase5-evidence',
+  'npm run test:sqlite-phase6-evidence',
+  'npm run bench:phase4-release:assert',
+  'schema-freeze',
+]);
 
 function isFiniteNonNegInt(v) {
   return typeof v === 'number' && Number.isFinite(v) && Number.isInteger(v) && v >= 0;
@@ -233,20 +253,21 @@ export function validatePhase6Evidence(evidence, opts = {}) {
     for (const k of unknownKeys(evidence.fixture, ALLOWED_FIXTURE_KEYS)) {
       failures.push(`fixture unknown key: ${k}`);
     }
-    if (!isFiniteNonNegInt(evidence.fixture.transcriptItems) || evidence.fixture.transcriptItems < 1000) {
-      failures.push('fixture.transcriptItems must be >= 1000');
+    if (evidence.fixture.transcriptItems !== 2000) {
+      failures.push('fixture.transcriptItems must be 2000');
     }
-    if (!isFiniteNonNegInt(evidence.fixture.treeVisibleRows) || evidence.fixture.treeVisibleRows < 1000) {
-      failures.push('fixture.treeVisibleRows must be >= 1000');
+    if (evidence.fixture.treeVisibleRows !== 5000) {
+      failures.push('fixture.treeVisibleRows must be 5000');
     }
     if (
       !Array.isArray(evidence.fixture.contentClasses) ||
-      evidence.fixture.contentClasses.length < 3 ||
+      !REQUIRED_CONTENT_CLASSES.every((c) => evidence.fixture.contentClasses.includes(c)) ||
+      new Set(evidence.fixture.contentClasses).size !== evidence.fixture.contentClasses.length ||
       !evidence.fixture.contentClasses.every(
         (c) => typeof c === 'string' && ALLOWED_CONTENT_CLASSES.has(c),
       )
     ) {
-      failures.push('fixture.contentClasses must be approved non-empty strings');
+      failures.push('fixture.contentClasses must include required unique approved classes');
     }
   }
   if (!evidence.thresholds || typeof evidence.thresholds !== 'object') {
@@ -305,9 +326,22 @@ export function validatePhase6Evidence(evidence, opts = {}) {
   }
   if (
     !Array.isArray(evidence.commands) ||
-    !evidence.commands.every((c) => typeof c === 'string' && c.length > 0)
+    evidence.commands.length === 0 ||
+    !evidence.commands.every((c) => typeof c === 'string' && ALLOWED_COMMANDS.has(c))
   ) {
-    failures.push('commands must be non-empty string array');
+    failures.push('commands must be a non-empty allowlisted set');
+  }
+  for (const required of [
+    'npm run bench:phase6-webview',
+    'npm run test:phase6-webview',
+    'npm run compile',
+    'npm test',
+    'npm run test:webview',
+    'schema-freeze',
+  ]) {
+    if (!Array.isArray(evidence.commands) || !evidence.commands.includes(required)) {
+      failures.push(`commands must include ${required}`);
+    }
   }
   const blob = JSON.stringify(evidence);
   if (SENSITIVE.test(blob)) {

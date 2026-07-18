@@ -609,11 +609,19 @@ export async function runRepositoryBoundarySmoke(rootDir = ROOT) {
   try {
     const chatPath = path.join(rootDir, 'webview/src/components/ChatThread.svelte');
     const chatThread = await readFile(chatPath, 'utf8');
-    if (!chatThread.includes('Virtualizer') && !chatThread.includes('createVirtualizer')) {
+    if (!/\bVirtualizer\b/.test(chatThread)) {
       failures.push('ChatThread.svelte must integrate a Virtualizer for settled rows.');
     }
-    if (/\{#each\s+thread\.items\b/.test(chatThread) && !chatThread.includes('virtualItems')) {
-      failures.push('ChatThread.svelte must not full-list #each thread.items without virtualization.');
+    // Full-list settled render is forbidden even if "virtualItems" is mentioned elsewhere.
+    if (/\{#each\s+thread\.items\b/.test(chatThread)) {
+      failures.push('ChatThread.svelte must not full-list #each thread.items.');
+    }
+    if (!/\{#each\s+virtualItems\b/.test(chatThread)) {
+      failures.push('ChatThread.svelte must #each virtualItems for settled rows.');
+    }
+    if (/display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0/.test(chatThread) &&
+        /\{#each\s+thread\.items\b/.test(chatThread)) {
+      failures.push('ChatThread.svelte must not CSS-hide a full thread.items list.');
     }
   } catch {
     // optional in mutated fixture trees
@@ -623,8 +631,22 @@ export async function runRepositoryBoundarySmoke(rootDir = ROOT) {
       path.join(rootDir, 'webview/src/components/TaskWorkspace.svelte'),
       'utf8',
     );
-    if (!taskWorkspace.includes('Virtualizer') && !taskWorkspace.includes('treeVirtual')) {
+    if (!/\bVirtualizer\b/.test(taskWorkspace) && !/\btreeVirtualizer\b/.test(taskWorkspace)) {
       failures.push('TaskWorkspace.svelte must virtualize expanded tree rows.');
+    }
+    // Expanded path must virtualize; collapsed chrome may still #each the short focused path.
+    if (/\{#each\s+treeRows\b/.test(taskWorkspace)) {
+      failures.push('TaskWorkspace.svelte must not full-list #each treeRows.');
+    }
+    if (!/\{#each\s+treeVirtualItems\b/.test(taskWorkspace)) {
+      failures.push('TaskWorkspace.svelte must #each treeVirtualItems for expanded rows.');
+    }
+    // Expanded branch is the content between `{#if treeExpanded}` and the matching `{:else}`.
+    const expandedMatch = taskWorkspace.match(
+      /\{#if\s+treeExpanded\}([\s\S]*?)\{:else\}/,
+    );
+    if (expandedMatch && /\{#each\s+visibleTreeRows\b/.test(expandedMatch[1])) {
+      failures.push('TaskWorkspace.svelte expanded branch must not #each visibleTreeRows.');
     }
   } catch {
     // optional in mutated fixture trees

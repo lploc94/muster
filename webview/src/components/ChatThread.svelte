@@ -232,17 +232,26 @@
         publishVirtualSnapshot();
       },
     });
-    // Disable TanStack auto-adjust during our ownership of prepend continuity.
-    // After clearPrependRestore we re-enable default adjust via a fresh measure pass.
-    (
-      instance as Virtualizer<HTMLDivElement, HTMLElement> & {
-        shouldAdjustScrollPositionOnItemSizeChange?: () => boolean;
-      }
-    ).shouldAdjustScrollPositionOnItemSizeChange = () => false;
+    // Disable TanStack auto-adjust only while prepend restoration owns the anchor.
+    setScrollAdjustEnabled(instance, false);
     virtualizer = instance;
     virtualizerCleanup = instance._didMount();
     instance._willUpdate();
     publishVirtualSnapshot();
+  }
+
+  function setScrollAdjustEnabled(
+    instance: Virtualizer<HTMLDivElement, HTMLElement>,
+    enabled: boolean,
+  ): void {
+    const target = instance as Virtualizer<HTMLDivElement, HTMLElement> & {
+      shouldAdjustScrollPositionOnItemSizeChange?: (() => boolean) | undefined;
+    };
+    if (enabled) {
+      delete target.shouldAdjustScrollPositionOnItemSizeChange;
+    } else {
+      target.shouldAdjustScrollPositionOnItemSizeChange = () => false;
+    }
   }
 
   function syncVirtualizerOptions(): void {
@@ -267,11 +276,8 @@
         publishVirtualSnapshot();
       },
     });
-    (
-      virtualizer as Virtualizer<HTMLDivElement, HTMLElement> & {
-        shouldAdjustScrollPositionOnItemSizeChange?: () => boolean;
-      }
-    ).shouldAdjustScrollPositionOnItemSizeChange = () => false;
+    // Keep auto-adjust off while a prepend restore is in flight.
+    setScrollAdjustEnabled(virtualizer, !(freezeMeasurements || restoringPrependAnchor));
     virtualizer._willUpdate();
     publishVirtualSnapshot();
   }
@@ -575,7 +581,7 @@
     return () => ro?.disconnect();
   });
 
-  function clearPrependRestore(): void {
+  function finishPrependRestoreState(): void {
     restoreEpoch += 1;
     activeRestoreAttempt = null;
     pendingAnchor = null;
@@ -583,11 +589,19 @@
     pendingRestoreTaskId = undefined;
     restoringPrependAnchor = false;
     freezeMeasurements = false;
-    // Seed id→height from currently mounted DOM without notifying the virtualizer.
-    // Calling measureElement/_willUpdate here shifts itemSizeCache and breaks the
-    // just-settled 2px continuity (verified: residual jumps to tens of px).
-    // Live measureElement after unfreeze still records real heights on next RO tick
-    // or remount; estimateSizeForIndex also reads the seeded map for future mounts.
+  }
+
+  /**
+   * End prepend restore ownership.
+   * - Default (cancel/stale/focus): clear immediately.
+   * - `{ remeasure: true }` after a successful settle: keep the anchor identity
+   *   through a deferred resizeItem pass so actual heights replace frozen
+   *   estimates, refine once more, then clear.
+   */
+  function clearPrependRestore(options?: { remeasure?: boolean }): void {
+    const remeasure = options?.remeasure === true && !!pendingAnchor && restoringPrependAnchor;
+    freezeMeasurements = false;
+    // Seed id→height immediately for estimateSize lookups.
     if (scrollEl) {
       for (const row of Array.from(
         scrollEl.querySelectorAll<HTMLElement>('[data-transcript-id]'),
@@ -598,6 +612,41 @@
         if (h > 0) measuredHeightById.set(id, h);
       }
     }
+    if (!remeasure || !virtualizer || !scrollEl) {
+      finishPrependRestoreState();
+      if (virtualizer) setScrollAdjustEnabled(virtualizer, true);
+      return;
+    }
+    // Keep pendingAnchor + restoringPrependAnchor through deferred resize.
+    setScrollAdjustEnabled(virtualizer, false);
+    const v = virtualizer;
+    const el = scrollEl;
+    const epochAtSchedule = restoreEpoch;
+    requestAnimationFrame(() => {
+      if (virtualizer !== v || !el || restoreEpoch !== epochAtSchedule) return;
+      const idToIndex = new Map(thread.items.map((it, i) => [it.id, i] as const));
+      for (const row of Array.from(el.querySelectorAll<HTMLElement>('[data-transcript-id]'))) {
+        const id = row.getAttribute('data-transcript-id');
+        if (!id) continue;
+        const h = Math.round(row.getBoundingClientRect().height);
+        if (h <= 0) continue;
+        measuredHeightById.set(id, h);
+        const index = idToIndex.get(id);
+        if (index == null) continue;
+        try {
+          v.resizeItem(index, h);
+        } catch {
+          // ignore dispose races
+        }
+      }
+      // Correct identity offset after cache updates, then drop restore ownership.
+      if (restoringPrependAnchor && pendingAnchor) {
+        refineActivePrependAnchor();
+      }
+      finishPrependRestoreState();
+      setScrollAdjustEnabled(v, true);
+      publishVirtualSnapshot();
+    });
   }
 
   function applyRestoreFromAnchor(_anchor: PrependScrollAnchor): void {
@@ -711,7 +760,8 @@
         activeRestoreAttempt === attempt ||
         (pendingRestoreRequestId === attempt.requestId && restoreEpoch === attemptEpoch)
       ) {
-        clearPrependRestore();
+        // Successful settle: remeasure with anchor held through deferred resize.
+        clearPrependRestore({ remeasure: true });
       }
     })();
     return () => {

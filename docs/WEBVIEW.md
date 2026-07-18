@@ -409,11 +409,11 @@ Chat settled rows and expanded task-tree rows use **`@tanstack/svelte-virtual`**
 
 **Caveat:** stick-to-bottom and prepend anchoring must use virtualizer-aware offsets. Trigger lazy scrollback (§7.5) near the top / overscan: host `loadTranscriptPage` → `transcriptPageResult`.
 
-Repository keyset paging bounds **bootstrap/query payloads**; virtualization bounds **mounted DOM**. The full SQLite history is never materialised into the webview.
+Repository keyset paging bounds **bootstrap and each query payload** (latest-N / page size). Virtualization bounds **mounted DOM**. Loaded older pages remain **resident in `TaskThread.items`** for the current focus window (they can accumulate as the user scrolls back); SQLite still owns durable full history.
 
 ### 7.5 History window & lazy scrollback
 
-The webview never holds the whole thread. Host snapshots bootstrap a **latest-N page** (`transcript` + `transcriptPage`); older items are **lazy-loaded on scroll-up** via `loadTranscriptPage` → `transcriptPageResult` (protocol v7+ / v9 wire).
+Host snapshots bootstrap a **latest-N page** (`transcript` + `transcriptPage`); older items are **lazy-loaded on scroll-up** via `loadTranscriptPage` → `transcriptPageResult` (protocol v7+ / v9 wire). Each payload stays bounded; the in-memory window can grow as pages prepend.
 
 - Initial / after-restore render = latest N items (bootstrap limit 100); scrolling near the top prepends the previous page.
 - **Prepend without jump:** capture first-visible identity + viewport offset before insert; restore after the page applies (virtualizer total-size delta + identity lock). Do not stick-to-bottom during an upward load.

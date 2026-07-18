@@ -384,10 +384,34 @@ test('fails when TaskWorkspace drops tree virtualization', async () => {
       file,
       `
 <script></script>
-{#each visibleTreeRows as row (row.task.id)}
+{#if treeExpanded}
+{#each treeRows as row (row.task.id)}
   <div data-testid="task-tree-row">{row.task.goal}</div>
+{/each}
+{/if}
+`,
+    );
+  }, /virtualize expanded tree|full-list #each treeRows|treeVirtualItems/i);
+});
+
+test('fails when ChatThread CSS-hides a full thread list', async () => {
+  await withMutatedTree((dir) => {
+    const file = path.join(dir, 'webview/src/components/ChatThread.svelte');
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(
+      file,
+      `
+<script>
+  import { Virtualizer } from '@tanstack/svelte-virtual';
+  let virtualItems = [];
+</script>
+{#each thread.items as item (item.id)}
+  <div style="display: none" data-transcript-id={item.id}>{item.text}</div>
+{/each}
+{#each virtualItems as vRow (vRow.key)}
+  <div></div>
 {/each}
 `,
     );
-  }, /virtualize expanded tree/i);
+  }, /full-list #each thread\.items|CSS-hide/i);
 });

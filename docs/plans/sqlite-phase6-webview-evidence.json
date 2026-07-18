@@ -65,7 +65,18 @@
   "durationMs": 3401,
   "commands": [
     "npm run bench:phase6-webview",
-    "npm run test:phase6-webview"
+    "npm run test:phase6-webview",
+    "npm run compile",
+    "npm run check:svelte",
+    "npm test",
+    "npm run test:webview",
+    "npm run test:sqlite-storage-docs",
+    "npm run test:task-export-docs",
+    "npm run test:source-boundary",
+    "npm run test:sqlite-phase5-evidence",
+    "npm run test:sqlite-phase6-evidence",
+    "npm run bench:phase4-release:assert",
+    "schema-freeze"
   ],
   "verdict": "PASS"
 }

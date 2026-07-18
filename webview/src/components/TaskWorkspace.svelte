@@ -117,6 +117,26 @@
     lastTreeSignature = '';
   }
 
+  function captureTreeScrollAnchor(): { taskId: string; offset: number } | null {
+    if (!treeScrollEl || !treeVirtualizer) return null;
+    const items = treeVirtualizer.getVirtualItems();
+    if (items.length === 0) return null;
+    const scrollTop = treeScrollEl.scrollTop;
+    // First row whose bottom is past the viewport top.
+    const first = items.find((it) => it.start + it.size > scrollTop) ?? items[0];
+    if (!first) return null;
+    return { taskId: String(first.key), offset: scrollTop - first.start };
+  }
+
+  function restoreTreeScrollAnchor(anchor: { taskId: string; offset: number } | null): void {
+    if (!anchor || !treeScrollEl || !treeVirtualizer) return;
+    const index = treeRows.findIndex((row) => row.task.id === anchor.taskId);
+    if (index < 0) return;
+    const offsetPair = treeVirtualizer.getOffsetForIndex(index, 'start');
+    const start = offsetPair?.[0] ?? index * TREE_ROW_ESTIMATE_PX;
+    treeScrollEl.scrollTop = Math.max(0, start + anchor.offset);
+  }
+
   function syncTreeVirtualizer(count: number): void {
     if (!treeScrollEl || !treeExpanded) {
       disposeTreeVirtualizer();
@@ -142,6 +162,9 @@
       publishTreeSnapshot();
       return;
     }
+    // Preserve first-visible task identity + offset across count/key changes
+    // (patch-before-viewport / collapse) so scrollTop alone does not jump rows.
+    const anchor = captureTreeScrollAnchor();
     treeVirtualizer.setOptions({
       ...treeVirtualizer.options,
       count,
@@ -152,6 +175,7 @@
       onChange: () => publishTreeSnapshot(),
     });
     treeVirtualizer._willUpdate();
+    restoreTreeScrollAnchor(anchor);
     publishTreeSnapshot();
   }
 
