@@ -1016,6 +1016,29 @@ body {
   color: inherit;
 }
 
+/* Bounded global stack for pending PermissionCard / Elicitation prompts.
+ * Lives outside Settings/task mutual exclusion so prompts remain operable while
+ * Settings is open. Local overflow-y:auto is the only scroll surface under the
+ * html/body/#app overflow:hidden pin — wheel events over the stack reach Accept. */
+.runtime-interaction-stack {
+  flex: 0 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  min-width: 0;
+  min-height: 0;
+  /* Leave room for Settings / task chrome below; long forms scroll inside. */
+  max-height: min(70vh, 100%);
+  overflow-x: hidden;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  box-sizing: border-box;
+  border-bottom: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-editor-background, var(--vscode-sideBar-background));
+  z-index: 2;
+}
+
 .settings-panel {
   display: flex;
   flex: 1 1 0;
@@ -1025,9 +1048,8 @@ body {
   max-width: 100%;
   min-width: 0;
   min-height: 0;
-  /* Fill the fixed #app viewport; never grow past it. */
-  height: 100%;
-  max-height: 100%;
+  /* Share remaining #app column space with the runtime stack (no height:100%
+   * so a pending permission above Settings stays visible). */
   overflow: hidden;
   box-sizing: border-box;
   background: var(--vscode-editor-background, var(--vscode-sideBar-background));
@@ -1791,12 +1813,18 @@ body {
   vertical-align: middle;
 }
 
-/* Consistent icon button style for toolbar actions */
+/* Consistent icon button style for toolbar actions.
+   Minimum 28×28 CSS-pixel hit area (WCAG practical target for compact chrome). */
 .icon-btn {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 0.25rem;
+  box-sizing: border-box;
+  min-width: 28px;
+  min-height: 28px;
+  width: 28px;
+  height: 28px;
+  padding: 0;
   border-radius: 0.25rem;
   background: none;
   border: none;
@@ -2005,6 +2033,13 @@ body {
 
 @keyframes blink {
   50% { opacity: 0; }
+}
+
+/* Stop infinite streaming cursor blink when the user prefers reduced motion. */
+@media (prefers-reduced-motion: reduce) {
+  .streaming-cursor {
+    animation: none;
+  }
 }
 
 /* When we switch from streaming to final markdown, try to reduce flash */
@@ -2402,12 +2437,25 @@ body {
   max-width: none;
   padding: 20px 0 48px;
   overflow-wrap: anywhere;
+  /* Remap GitHub Markdown CSS variables so tables/code follow VS Code tokens
+     instead of prefers-color-scheme black/white defaults (V02/V06 contrast). */
+  --bgColor-default: var(--vscode-editor-background);
+  --bgColor-muted: var(--vscode-editorWidget-background, var(--vscode-editor-background));
+  --bgColor-neutral-muted: color-mix(in srgb, var(--vscode-foreground) 12%, transparent);
+  --borderColor-default: var(--vscode-panel-border);
+  --borderColor-muted: var(--vscode-panel-border);
+  --fgColor-default: var(--vscode-editor-foreground);
+  --fgColor-muted: var(--vscode-descriptionForeground);
+  --fgColor-accent: var(--vscode-textLink-foreground);
+  color: var(--vscode-editor-foreground) !important;
+  background: var(--vscode-editor-background) !important;
 }
 
 .presentation-content h1,
 .presentation-content h2,
 .presentation-content h3 {
   scroll-margin-top: 12px;
+  color: var(--vscode-editor-foreground) !important;
 }
 
 /* Chat markdown: workspace .md links open presentation tabs (host-handled). */
@@ -2423,10 +2471,43 @@ body {
   overflow-x: auto;
 }
 
+/* Readable table body/header text under synthetic dark/light themes.
+   Beat GitHub Markdown tr/td defaults that force near-black cells. */
+.presentation-content table {
+  color: var(--vscode-editor-foreground) !important;
+  border-collapse: collapse;
+  width: 100%;
+  background: var(--vscode-editor-background) !important;
+}
+
+.presentation-content table tr {
+  background-color: var(--vscode-editor-background) !important;
+  border-top-color: var(--vscode-panel-border) !important;
+}
+
+.presentation-content table tr:nth-child(2n) {
+  background-color: var(--vscode-editorWidget-background, var(--vscode-editor-background)) !important;
+}
+
+.presentation-content table th,
+.presentation-content table td {
+  color: var(--vscode-editor-foreground) !important;
+  border: 1px solid var(--vscode-panel-border) !important;
+  padding: 6px 10px;
+  background: transparent !important;
+}
+
+.presentation-content table th {
+  background: var(--vscode-editorWidget-background, var(--vscode-editor-background)) !important;
+  color: var(--vscode-foreground) !important;
+  font-weight: 600;
+}
+
 .mermaid-diagram {
   max-width: 100%;
   margin: 1rem 0;
   overflow-x: auto;
+  color: var(--vscode-editor-foreground);
 }
 
 .mermaid-diagram svg {
@@ -2435,6 +2516,48 @@ body {
   max-width: 100%;
   height: auto;
   margin-inline: auto;
+  background: transparent;
+}
+
+/*
+ * Mermaid readability after sanitize strips embedded <style> tags.
+ * Class attributes remain; force theme-token fills/strokes/labels so
+ * nodes are never black-on-black or dark-on-black.
+ */
+.mermaid-diagram svg .node rect,
+.mermaid-diagram svg .node circle,
+.mermaid-diagram svg .node ellipse,
+.mermaid-diagram svg .node polygon,
+.mermaid-diagram svg .node path,
+.mermaid-diagram svg .basic.label-container,
+.mermaid-diagram svg rect.basic,
+.mermaid-diagram svg .label-container {
+  fill: var(--vscode-editorWidget-background, #252526) !important;
+  stroke: var(--vscode-focusBorder, #007fd4) !important;
+}
+
+.mermaid-diagram svg .edgePath path,
+.mermaid-diagram svg .flowchart-link,
+.mermaid-diagram svg path.path,
+.mermaid-diagram svg .edge-thickness-normal {
+  stroke: var(--vscode-foreground, #cccccc) !important;
+  fill: none !important;
+}
+
+.mermaid-diagram svg text,
+.mermaid-diagram svg .nodeLabel,
+.mermaid-diagram svg .edgeLabel,
+.mermaid-diagram svg .label,
+.mermaid-diagram svg .label B,
+.mermaid-diagram svg .label span,
+.mermaid-diagram svg tspan {
+  fill: var(--vscode-editor-foreground, #d4d4d4) !important;
+  color: var(--vscode-editor-foreground, #d4d4d4) !important;
+}
+
+.mermaid-diagram svg marker path {
+  fill: var(--vscode-foreground, #cccccc) !important;
+  stroke: var(--vscode-foreground, #cccccc) !important;
 }
 
 .mermaid-diagram[data-mermaid-state="fallback"] {

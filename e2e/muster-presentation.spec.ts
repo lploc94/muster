@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { openMusterPresentation } from './fixtures/muster-webview';
 
 interface PresentationDocument {
   presentationId: string;
@@ -12,21 +13,12 @@ interface PresentationDocument {
 }
 
 async function openPresentation(page: Page, persistedState?: unknown) {
-  await page.addInitScript((initialState) => {
-    window.__musterPersistedState = initialState;
-    window.acquireVsCodeApi = () => ({
-      postMessage(message: unknown) {
-        window.__musterPostedMessages = [...(window.__musterPostedMessages ?? []), message];
-      },
-      getState() {
-        return window.__musterPersistedState;
-      },
-      setState(state: unknown) {
-        window.__musterPersistedState = state;
-      },
-    });
-  }, persistedState);
-  await page.goto('/presentation.html');
+  // Shared harness preserves Presentation's non-clone postMessage semantics.
+  await openMusterPresentation(page, {
+    initialState: persistedState,
+    structuredCloneMessages: false,
+    stateMode: 'direct',
+  });
 }
 
 async function postUpdate(page: Page, document: PresentationDocument, rootId = 'task-root') {

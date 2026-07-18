@@ -175,6 +175,54 @@ function expectCiWorkflowContract(workflowText, failures) {
     failures,
     `Expected ${workflowPath} to use one Node 24 LTS runtime, not a node-version matrix.`,
   );
+
+  // M014 visual gate: distinct job, compare-only, stable failure artifacts.
+  expectCondition(
+    hasYamlLine(workflowText, /^ {2}visual:\s*(?:#.*)?$/),
+    failures,
+    `Expected ${workflowPath} to define a distinct jobs.visual job for the pinned Linux visual gate.`,
+  );
+  expectCondition(
+    hasYamlLine(workflowText, /^\s*-?\s*run:\s*npm run test:visual:linux\s*(?:#.*)?$/),
+    failures,
+    `Expected ${workflowPath} visual job to run \`npm run test:visual:linux\` (compare-only).`,
+  );
+  expectCondition(
+    hasYamlLine(workflowText, /^\s*-?\s*run:\s*npm run test:webview\s*(?:#.*)?$/),
+    failures,
+    `Expected ${workflowPath} behavioral path to keep \`npm run test:webview\` independent of the visual gate.`,
+  );
+  expectCondition(
+    !hasYamlLine(workflowText, /(?:^|[\s"'])--update-snapshots(?:\s|$|"|')/) &&
+      !hasYamlLine(workflowText, /test:visual:linux:update/),
+    failures,
+    `Expected ${workflowPath} never to pass --update-snapshots or run test:visual:linux:update (baselines are explicit-update only).`,
+  );
+  expectCondition(
+    hasYamlLine(workflowText, /^\s*-?\s*uses:\s*actions\/upload-artifact@v4\s*(?:#.*)?$/),
+    failures,
+    `Expected ${workflowPath} to upload visual failure evidence via actions/upload-artifact@v4.`,
+  );
+  expectCondition(
+    hasYamlLine(workflowText, /^\s*name:\s*visual-regression-failure\s*(?:#.*)?$/),
+    failures,
+    `Expected ${workflowPath} failure artifact name to be exactly \`visual-regression-failure\`.`,
+  );
+  expectCondition(
+    hasYamlLine(workflowText, /^\s*retention-days:\s*(?:[1-9]|[12]\d|30)\s*(?:#.*)?$/),
+    failures,
+    `Expected ${workflowPath} visual artifact retention-days to be bounded (1-30).`,
+  );
+  expectCondition(
+    /if:\s*failure\(\)/.test(workflowText),
+    failures,
+    `Expected ${workflowPath} visual artifact upload to be gated with \`if: failure()\`.`,
+  );
+  expectCondition(
+    workflowText.includes('test-results/') && workflowText.includes('playwright-report/'),
+    failures,
+    `Expected ${workflowPath} visual artifact paths to include test-results/ and playwright-report/.`,
+  );
 }
 
 async function readText(rootDir, relativePath, failures) {
@@ -255,6 +303,26 @@ export async function runSourceBoundarySmoke(options = {}) {
       'Expected package.json scripts.test:source-boundary to run `node scripts/source-boundary-smoke.mjs`.',
     );
     checked.push('package.json scripts.test:source-boundary');
+
+    // M014: compare vs explicit update must stay separate for Linux visual goldens.
+    const visualCompare = scripts['test:visual:linux'];
+    const visualUpdate = scripts['test:visual:linux:update'];
+    expectCondition(
+      typeof visualCompare === 'string' &&
+        visualCompare.includes('run-visual-baselines.mjs') &&
+        !/(?:^|[\s"'])--update(?:-snapshots)?(?:\s|$)/.test(visualCompare),
+      failures,
+      'Expected package.json scripts.test:visual:linux to run scripts/run-visual-baselines.mjs compare-only (no --update).',
+    );
+    checked.push('package.json scripts.test:visual:linux');
+    expectCondition(
+      typeof visualUpdate === 'string' &&
+        visualUpdate.includes('run-visual-baselines.mjs') &&
+        /(?:^|[\s"'])--update(?:\s|$)/.test(visualUpdate),
+      failures,
+      'Expected package.json scripts.test:visual:linux:update to run scripts/run-visual-baselines.mjs with --update.',
+    );
+    checked.push('package.json scripts.test:visual:linux:update');
   }
 
   const tsconfig = await readJson(rootDir, 'tsconfig.json', failures);

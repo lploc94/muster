@@ -3,6 +3,10 @@ import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import {
+  openMusterWebview,
+  readMusterWebviewState,
+} from './fixtures/muster-webview';
+import {
   isFileMentionDirectorySymlink,
   listFileMentionSuggestions,
 } from '../src/host/file-mention-suggestions';
@@ -126,42 +130,16 @@ interface CommandErrorMessage {
 }
 
 async function openWebview(page: Page, options?: { initialState?: unknown }) {
-  await page.addInitScript((seed) => {
-    // Seed survives reload when tests re-open with captured getState/setState data.
-    // State is exposed on window so hide/reveal checks can capture the bag.
-    const bag = { value: seed as unknown };
-    (window as unknown as { __musterVsCodeState: { value: unknown } }).__musterVsCodeState = bag;
-    window.acquireVsCodeApi = () => ({
-      postMessage(message: unknown) {
-        // Match VS Code's webview boundary: messages must survive structured
-        // clone. This catches accidental Svelte `$state` Proxy payloads.
-        const cloned = structuredClone(message);
-        window.__musterPostedMessages = [...(window.__musterPostedMessages ?? []), cloned];
-        window.dispatchEvent(new CustomEvent('muster:test:postMessage', { detail: cloned }));
-      },
-      getState() {
-        return (window as unknown as { __musterVsCodeState: { value: unknown } }).__musterVsCodeState
-          .value;
-      },
-      setState(nextState: unknown) {
-        (window as unknown as { __musterVsCodeState: { value: unknown } }).__musterVsCodeState.value =
-          nextState;
-      },
-    });
-  }, options?.initialState ?? undefined);
-
-  await page.goto('/');
-  await page.evaluate(() => {
-    window.__musterPostedMessages = [];
+  // Shared harness: structured-clone VS Code API mock + deterministic open path.
+  await openMusterWebview(page, {
+    initialState: options?.initialState,
+    structuredCloneMessages: true,
+    stateMode: 'bag',
   });
-  await expect(page.getByText('New task')).toBeVisible();
 }
 
 async function readVsCodeState(page: Page): Promise<unknown> {
-  return page.evaluate(() => {
-    const bag = (window as unknown as { __musterVsCodeState?: { value: unknown } }).__musterVsCodeState;
-    return bag?.value;
-  });
+  return readMusterWebviewState(page);
 }
 
 /** Move file-mention highlight to option index (retries ArrowDown if the first key is dropped). */
@@ -426,6 +404,30 @@ async function expectPostedMessage(page: Page, expected: unknown) {
           : expected,
       ]),
     );
+}
+
+/** True when document focus is on `el` or inside its light/shadow tree. */
+async function controlHasFocus(locator: import('@playwright/test').Locator): Promise<boolean> {
+  return locator.evaluate((el) => {
+    const active = document.activeElement;
+    if (!active) return false;
+    if (el === active || el.contains(active)) return true;
+    let node: Node | null = active;
+    while (node) {
+      if (node === el) return true;
+      const root = node.getRootNode();
+      if (root instanceof ShadowRoot) {
+        node = root.host;
+        continue;
+      }
+      node = node.parentNode;
+    }
+    return false;
+  });
+}
+
+async function expectControlFocused(locator: import('@playwright/test').Locator): Promise<void> {
+  await expect.poll(async () => controlHasFocus(locator)).toBe(true);
 }
 
 async function dispatchFileDrag(page: Page, type: 'dragover' | 'drop', mime: string, value: string) {
@@ -2258,7 +2260,9 @@ test('accessible file mention keyboard flow', async ({ page }) => {
   await composer.click();
   await expect(composer).toBeFocused();
 
-  // Closed baseline: combobox-like list semantics present, popup collapsed.
+  // Closed baseline: valid combobox role (aria-expanded is unsupported on an
+  // implicit textarea textbox — role=combobox is required for the ARIA contract).
+  await expect(composer).toHaveAttribute('role', 'combobox');
   await expect(composer).toHaveAttribute('aria-autocomplete', 'list');
   await expect(composer).toHaveAttribute('aria-haspopup', 'listbox');
   await expect(composer).toHaveAttribute('aria-expanded', 'false');
@@ -2322,8 +2326,9 @@ test('accessible file mention keyboard flow', async ({ page }) => {
   await expect(listbox).toHaveAttribute('role', 'listbox');
   await expect(listbox).toHaveAttribute('aria-label', 'File mention suggestions');
 
-  // Textarea remains focused; listbox is controlled via aria-activedescendant.
+  // Combobox remains focused; listbox is controlled via aria-activedescendant.
   await expect(composer).toBeFocused();
+  await expect(composer).toHaveAttribute('role', 'combobox');
   await expect(composer).toHaveAttribute('aria-expanded', 'true');
   await expect(composer).toHaveAttribute('aria-controls', 'file-mention-listbox');
   await expect(composer).toHaveAttribute('aria-activedescendant', 'file-mention-option-0');
@@ -2764,6 +2769,216 @@ test('accessible file mention keyboard flow', async ({ page }) => {
   expect(consoleErrors, `console errors: ${consoleErrors.join(' | ')}`).toEqual([]);
   expect(pageErrors, `page errors: ${pageErrors.join(' | ')}`).toEqual([]);
   expect(failedRequests, `failed requests: ${failedRequests.join(' | ')}`).toEqual([]);
+});
+
+/**
+ * M013 S03 / T01: focused RED regressions for composer combobox semantics,
+ * reduced-motion streaming cursor, and compact icon hit areas at 320px.
+ * Implementation lands in T02; these must fail against current production UI.
+ */
+test('composer combobox semantics', async ({ page }) => {
+  await openWebview(page);
+  await postSnapshot(page, { type: 'snapshot', rootTasks: [], storeRevision: 1301 });
+  await page.getByRole('button', { name: 'New task' }).first().click();
+  await expectPostedMessage(page, { type: 'newTask' });
+
+  const composer = page.getByPlaceholder('Start a new coordinator task with claude…');
+  await composer.click();
+  await expect(composer).toBeFocused();
+
+  // Valid combobox role is required so aria-expanded is not pinned on an implicit textbox.
+  await expect(composer).toHaveAttribute('role', 'combobox');
+  await expect(composer).toHaveAttribute('aria-autocomplete', 'list');
+  await expect(composer).toHaveAttribute('aria-haspopup', 'listbox');
+  await expect(composer).toHaveAttribute('aria-expanded', 'false');
+  await expect(composer).not.toHaveAttribute('aria-activedescendant');
+
+  await composer.pressSequentially('Review @ac', { delay: 15 });
+  const openBefore = (await postedMessages(page)).length;
+  await expect
+    .poll(async () => {
+      const messages = await postedMessages(page);
+      return messages
+        .slice(openBefore)
+        .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+    })
+    .not.toHaveLength(0);
+
+  const openRequest = (await postedMessages(page))
+    .slice(openBefore)
+    .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+    requestId: string;
+  };
+
+  await postRawHostMessage(page, {
+    type: 'fileMentionSuggestions',
+    requestId: openRequest.requestId,
+    parentDepth: 0,
+    relativeQuery: 'ac',
+    items: [
+      {
+        id: 'file:access.md',
+        kind: 'file',
+        label: 'access.md',
+        insertionPath: 'docs/access.md',
+      },
+      {
+        id: 'file:actions.ts',
+        kind: 'file',
+        label: 'actions.ts',
+        insertionPath: 'src/actions.ts',
+      },
+    ],
+  });
+
+  const listbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+  await expect(listbox).toBeVisible();
+  await expect(composer).toHaveAttribute('role', 'combobox');
+  await expect(composer).toHaveAttribute('aria-expanded', 'true');
+  await expect(composer).toHaveAttribute('aria-controls', 'file-mention-listbox');
+  await expect(composer).toHaveAttribute('aria-activedescendant', 'file-mention-option-0');
+  await expect(listbox.getByRole('option').first()).toHaveAttribute('aria-selected', 'true');
+
+  // Keyboard selection must keep combobox focus and update active descendant.
+  await composer.press('ArrowDown');
+  await expect(composer).toHaveAttribute('aria-activedescendant', 'file-mention-option-1');
+  await expect(listbox.getByRole('option').nth(1)).toHaveAttribute('aria-selected', 'true');
+});
+
+test('reduced motion streaming cursor', async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await openWebview(page);
+  await postSnapshot(page, {
+    type: 'snapshot',
+    rootTasks: [
+      task({
+        id: 'task-m013-s03-stream',
+        goal: 'Streaming reduced-motion proof',
+        viewStatus: 'running',
+      }),
+    ],
+    focusedTaskId: 'task-m013-s03-stream',
+    subtree: [
+      task({
+        id: 'task-m013-s03-stream',
+        goal: 'Streaming reduced-motion proof',
+        viewStatus: 'running',
+      }),
+    ],
+    transcript: [],
+    activeTurnId: 'turn-m013-s03-stream',
+    storeRevision: 1302,
+  });
+
+  await postRawHostMessage(page, {
+    type: 'turnStart',
+    taskId: 'task-m013-s03-stream',
+    turnId: 'turn-m013-s03-stream',
+  });
+  await postRawHostMessage(page, {
+    type: 'event',
+    taskId: 'task-m013-s03-stream',
+    turnId: 'turn-m013-s03-stream',
+    event: {
+      type: 'assistantDelta',
+      content: 'Streaming under reduced motion…',
+      messageId: 'msg-m013-s03-stream',
+    },
+  });
+
+  const cursor = page.locator('.streaming-cursor');
+  await expect(cursor).toBeVisible();
+  await expect(cursor).toHaveText('▋');
+
+  // prefers-reduced-motion must stop the infinite blink animation.
+  const motion = await cursor.evaluate((el) => {
+    const style = getComputedStyle(el);
+    return {
+      animationName: style.animationName,
+      animationDuration: style.animationDuration,
+      animationIterationCount: style.animationIterationCount,
+      animationPlayState: style.animationPlayState,
+    };
+  });
+  const noInfiniteBlink =
+    motion.animationName === 'none' ||
+    motion.animationDuration === '0s' ||
+    motion.animationIterationCount === '0' ||
+    motion.animationPlayState === 'paused';
+  expect(
+    noInfiniteBlink,
+    `expected reduced-motion to disable infinite blink, got ${JSON.stringify(motion)}`,
+  ).toBe(true);
+});
+
+test('compact icon targets', async ({ page }) => {
+  await page.setViewportSize({ width: 320, height: 720 });
+  await openWebview(page);
+  await postSnapshot(page, {
+    type: 'snapshot',
+    rootTasks: [
+      task({
+        id: 'task-m013-s03-icons',
+        goal: 'Compact icon hit-area proof',
+        viewStatus: 'idle',
+      }),
+    ],
+    focusedTaskId: 'task-m013-s03-icons',
+    subtree: [
+      task({
+        id: 'task-m013-s03-icons',
+        goal: 'Compact icon hit-area proof',
+        viewStatus: 'idle',
+      }),
+    ],
+    transcript: [{ id: 'msg-m013-s03-icons', kind: 'assistant', content: 'Toolbar ready.' }],
+    storeRevision: 1303,
+  });
+
+  await expect(page.getByText('Toolbar ready.')).toBeVisible();
+
+  // Shared toolbar icon controls must expose practical ≥28×28 CSS-pixel hit areas.
+  const toolbarIcons = page.locator(
+    'button.icon-btn[aria-label="Back to tasks list"], button.icon-btn[aria-label="History (previous coordinator tasks)"], button.icon-btn[aria-label="New task"], button.icon-btn[aria-label="Export task/chat"], button.icon-btn[aria-label="Settings"]',
+  );
+  await expect(toolbarIcons).toHaveCount(5);
+
+  const boxes = await toolbarIcons.evaluateAll((els) =>
+    els.map((el) => {
+      const box = (el as HTMLElement).getBoundingClientRect();
+      return {
+        label: el.getAttribute('aria-label') ?? '(unlabeled)',
+        width: box.width,
+        height: box.height,
+      };
+    }),
+  );
+  for (const box of boxes) {
+    expect(
+      box.width,
+      `${box.label} width ${box.width}px must be ≥ 28 CSS px`,
+    ).toBeGreaterThanOrEqual(28);
+    expect(
+      box.height,
+      `${box.label} height ${box.height}px must be ≥ 28 CSS px`,
+    ).toBeGreaterThanOrEqual(28);
+  }
+
+  // Compact 320px toolbar must not force document horizontal overflow.
+  const overflow = await page.evaluate(() => {
+    const doc = document.documentElement;
+    const body = document.body;
+    return {
+      docOk: doc.scrollWidth <= doc.clientWidth + 1,
+      bodyOk: body.scrollWidth <= body.clientWidth + 1,
+      docScrollWidth: doc.scrollWidth,
+      docClientWidth: doc.clientWidth,
+    };
+  });
+  expect(
+    overflow.docOk && overflow.bodyOk,
+    `document horizontal overflow at 320px: ${JSON.stringify(overflow)}`,
+  ).toBe(true);
 });
 
 /**
@@ -4004,7 +4219,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await page.getByRole('button', { name: 'New task' }).first().click();
     await expectPostedMessage(page, { type: 'newTask' });
 
-    const composer = page.getByRole('textbox').first();
+    const composer = page.getByRole('combobox').first();
     const addContextButton = page.getByRole('button', { name: 'Add Context' });
     const menu = page.getByRole('menu', { name: 'Add Context' });
 
@@ -4056,7 +4271,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expect(menu).toHaveCount(0);
     await expect(addContextButton).toBeEnabled();
     await expect(addContextButton).toHaveAttribute('aria-expanded', 'false');
-    await expect(page.getByRole('textbox').first()).toBeEnabled();
+    await expect(page.getByRole('combobox').first()).toBeEnabled();
   });
 
   test('surfaces task-centric status feedback for active and failed tasks', async ({ page }) => {
@@ -4380,6 +4595,998 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
         (message as { type?: string }).type === 'submitElicitation',
       ),
     ).toHaveLength(2);
+  });
+
+  test('long RFD form keeps its actions reachable', async ({ page }) => {
+    // M013 S01: at 320×600 a long elicitation must wheel-scroll until Accept is
+    // in the viewport and can submit the existing submitElicitation envelope.
+    await page.setViewportSize({ width: 320, height: 600 });
+    await openWebview(page);
+
+    const longFields = Array.from({ length: 14 }, (_, i) => ({
+      key: `field_${i + 1}`,
+      type: 'string',
+      title: `Long field ${i + 1}`,
+      description:
+        `Extra description for field ${i + 1} so the form body exceeds the short viewport ` +
+        'and forces normal wheel scrolling before the action row is reachable.',
+      required: false,
+    }));
+
+    await postRawHostMessage(page, {
+      type: 'elicitationFormPending',
+      promptId: 'elicitation-long-reach',
+      message:
+        'Complete this long form. Actions must remain reachable after scrolling at a compact viewport.',
+      fields: longFields,
+      required: [],
+      askLike: true,
+    });
+
+    const accept = page.getByRole('button', { name: 'Accept' });
+    await expect(accept).toBeAttached();
+
+    // Accept starts below the fold at 320×600 with a long field list.
+    await expect
+      .poll(async () => {
+        const box = await accept.boundingBox();
+        if (!box) return false;
+        return box.y + box.height > 600;
+      })
+      .toBe(true);
+
+    // Normal wheel interaction (not programmatic scrollIntoView) must bring Accept into view.
+    for (let i = 0; i < 24; i++) {
+      await page.mouse.move(160, 300);
+      await page.mouse.wheel(0, 200);
+      const box = await accept.boundingBox();
+      if (box && box.y >= 0 && box.y + box.height <= 600) break;
+    }
+
+    await expect
+      .poll(async () => {
+        const box = await accept.boundingBox();
+        if (!box) return false;
+        return box.y >= 0 && box.y + box.height <= 600;
+      })
+      .toBe(true);
+
+    await accept.click();
+    await expectPostedMessage(page, {
+      type: 'submitElicitation',
+      promptId: 'elicitation-long-reach',
+      action: 'accept',
+      content: {},
+    });
+  });
+
+  test('M013 S01 flow: runtime prompt reachability', async ({ page }) => {
+    // Independent S01 evidence: one assembled journey at 320×600 covering
+    // long-elicitation wheel scroll + Accept, then Settings coexistence with a
+    // pending runtime permission whose Allow once still submits the existing
+    // envelope while policy controls stay distinct. Browser diagnostics must stay clean.
+    const consoleErrors: string[] = [];
+    const pageErrors: string[] = [];
+    const failedRequests: string[] = [];
+    page.on('console', (msg) => {
+      if (msg.type() !== 'error') return;
+      // Vite/dev asset 403s are harness noise, not product regressions.
+      const text = msg.text();
+      if (/status of 403|Failed to load resource/i.test(text)) return;
+      consoleErrors.push(text);
+    });
+    page.on('pageerror', (err) => {
+      pageErrors.push(err.message);
+    });
+    page.on('requestfailed', (req) => {
+      const failure = req.failure()?.errorText ?? '';
+      // Ignore harness asset 403/net::ERR noise from Vite/dev server.
+      if (/403|ERR_ABORTED|net::ERR/i.test(failure) || /403/.test(req.url())) return;
+      failedRequests.push(`${req.method()} ${req.url()} ${failure}`);
+    });
+
+    await page.setViewportSize({ width: 320, height: 600 });
+    await openWebview(page);
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-m013-s01-flow', goal: 'S01 reachability flow', viewStatus: 'idle' })],
+      storeRevision: 40,
+    });
+
+    // --- Phase 1: long elicitation must wheel-scroll until Accept is reachable ---
+    const longFields = Array.from({ length: 14 }, (_, i) => ({
+      key: `flow_field_${i + 1}`,
+      type: 'string',
+      title: `Flow field ${i + 1}`,
+      description:
+        `Extra description for flow field ${i + 1} so the form body exceeds the short viewport ` +
+        'and forces normal wheel scrolling before the action row is reachable.',
+      required: false,
+    }));
+
+    await postRawHostMessage(page, {
+      type: 'elicitationFormPending',
+      promptId: 'elicitation-m013-s01-flow',
+      message:
+        'Complete this long form. Actions must remain reachable after scrolling at a compact viewport.',
+      fields: longFields,
+      required: [],
+      askLike: true,
+    });
+
+    const accept = page.getByRole('button', { name: 'Accept' });
+    await expect(accept).toBeAttached();
+    await expect(page.getByTestId('runtime-interaction-stack')).toBeVisible();
+
+    // Accept starts below the fold at 320×600 with a long field list.
+    await expect
+      .poll(async () => {
+        const box = await accept.boundingBox();
+        if (!box) return false;
+        return box.y + box.height > 600;
+      })
+      .toBe(true);
+
+    // Normal wheel interaction (not programmatic scrollIntoView) must bring Accept into view.
+    for (let i = 0; i < 24; i++) {
+      await page.mouse.move(160, 300);
+      await page.mouse.wheel(0, 200);
+      const box = await accept.boundingBox();
+      if (box && box.y >= 0 && box.y + box.height <= 600) break;
+    }
+
+    await expect
+      .poll(async () => {
+        const box = await accept.boundingBox();
+        if (!box) return false;
+        return box.y >= 0 && box.y + box.height <= 600;
+      })
+      .toBe(true);
+
+    await accept.click();
+    await expectPostedMessage(page, {
+      type: 'submitElicitation',
+      promptId: 'elicitation-m013-s01-flow',
+      action: 'accept',
+      content: {},
+    });
+
+    // Clear the elicitation so the stack can host the permission card alone.
+    await postRawHostMessage(page, {
+      type: 'elicitationCleared',
+      promptId: 'elicitation-m013-s01-flow',
+    });
+    await expect(page.getByRole('button', { name: 'Accept' })).toHaveCount(0);
+
+    // --- Phase 2: Settings open + pending runtime permission remains operable ---
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await expectPostedMessage(page, { type: 'requestSettings' });
+    await expectPostedMessage(page, { type: 'requestTaskTypesSettings' });
+    await expectPostedMessage(page, { type: 'requestPermissionSettings' });
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+
+    await page.getByRole('tab', { name: /Execution/i }).click();
+    await postRawHostMessage(page, {
+      type: 'permissionSettingsSnapshot',
+      snapshot: permissionSettingsSnapshot('ask'),
+    });
+    await expect(page.getByTestId('permissions-mode-group')).toBeVisible();
+    await expect(page.locator('#permission-mode-ask')).toBeChecked();
+
+    await postRawHostMessage(page, {
+      type: 'permissionPending',
+      sessionId: 'sess-m013-s01-flow',
+      permissionId: 'perm-m013-s01-flow',
+      title: 'Write src/host/runtime-reachability.ts',
+      kind: 'edit',
+      classification: 'write',
+      options: [
+        { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
+        { optionId: 'reject', name: 'Deny', kind: 'reject' },
+      ],
+    });
+
+    // Runtime card stays mounted while Settings policy controls remain distinct.
+    await expect(page.getByTestId('runtime-interaction-stack')).toBeVisible();
+    await expect(page.getByTestId('runtime-permission-card')).toBeVisible();
+    await expect(page.getByRole('region', { name: 'Runtime permission request' })).toBeVisible();
+    await expect(page.getByText('Write src/host/runtime-reachability.ts')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Allow once' })).toBeVisible();
+    await expect(page.getByTestId('permissions-settings')).toBeVisible();
+    await expect(page.getByTestId('permissions-mode-group')).toBeVisible();
+    await expect(page.getByTestId('permissions-runtime-note')).toContainText(
+      'This tab only configures the default policy mode',
+    );
+
+    // Scoped Allow once submits the existing permission envelope while Settings stays open.
+    await page.getByRole('button', { name: 'Allow once' }).click();
+    await expectPostedMessage(page, {
+      type: 'submitPermission',
+      permissionId: 'perm-m013-s01-flow',
+      optionId: 'allow-once',
+      remember: false,
+    });
+
+    // Policy controls remain distinct from the runtime action that just fired.
+    await expect(page.getByTestId('permissions-mode-group')).toBeVisible();
+    await expect(page.locator('#permission-mode-ask')).toBeChecked();
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+
+    // Browser diagnostics must stay clean for the assembled journey.
+    expect(consoleErrors, `console errors: ${consoleErrors.join(' | ')}`).toEqual([]);
+    expect(pageErrors, `page errors: ${pageErrors.join(' | ')}`).toEqual([]);
+    expect(failedRequests, `failed requests: ${failedRequests.join(' | ')}`).toEqual([]);
+  });
+
+  test('accessible prompt labels associate Ask and Elicitation controls with visible titles', async ({
+    page,
+  }) => {
+    // M013 S02 / T01: controls are reachable by their visible accessible names,
+    // descriptions are programmatically associated, and the first useful control
+    // receives focus on appearance without trapping Tab.
+    await openWebview(page);
+
+    // --- Elicitation form: named string field + associated description ---
+    await postRawHostMessage(page, {
+      type: 'elicitationFormPending',
+      promptId: 'elicitation-a11y-labels',
+      message: 'Provide the deployment settings.',
+      fields: [
+        {
+          key: 'service_name',
+          type: 'string',
+          title: 'Service name',
+          description: 'DNS-safe name used in the deployment manifest.',
+          required: true,
+        },
+        {
+          key: 'replica_count',
+          type: 'number',
+          title: 'Replica count',
+          description: 'How many instances should run.',
+          required: true,
+        },
+      ],
+      required: ['service_name', 'replica_count'],
+      askLike: true,
+    });
+
+    await expect(page.getByText('Agent question')).toBeVisible();
+
+    const serviceName = page.getByRole('textbox', { name: 'Service name', exact: true });
+    const replicaCount = page.getByRole('spinbutton', { name: 'Replica count', exact: true });
+    await expect(serviceName).toBeVisible();
+    await expect(replicaCount).toBeVisible();
+
+    // Description association: control's aria-describedby resolves to visible description text.
+    await expect
+      .poll(async () =>
+        serviceName.evaluate((el) => {
+          const ids = (el.getAttribute('aria-describedby') ?? '').split(/\s+/).filter(Boolean);
+          return ids
+            .map((id) => document.getElementById(id)?.textContent?.trim() ?? '')
+            .join(' ');
+        }),
+      )
+      .toContain('DNS-safe name used in the deployment manifest.');
+
+    // Prompt appearance focuses the first useful control (no focus trap asserted).
+    await expectControlFocused(serviceName);
+
+    // Tab must still be able to leave the first field (escape without a trap).
+    await page.keyboard.press('Tab');
+    await expect
+      .poll(async () => controlHasFocus(serviceName))
+      .toBe(false);
+
+    // Clear elicitation so the Ask card can take over the stack.
+    await postRawHostMessage(page, {
+      type: 'elicitationCleared',
+      promptId: 'elicitation-a11y-labels',
+    });
+    await expect(page.getByRole('textbox', { name: 'Service name', exact: true })).toHaveCount(0);
+
+    // --- Ask card: free-text control named by the visible prompt ---
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-a11y-ask', goal: 'Answer named ask', viewStatus: 'waiting_user' })],
+      focusedTaskId: 'task-a11y-ask',
+      subtree: [task({ id: 'task-a11y-ask', goal: 'Answer named ask', viewStatus: 'waiting_user' })],
+      transcript: [],
+      activeTurnId: 'turn-a11y-ask',
+      pendingAsk: {
+        turnId: 'turn-a11y-ask',
+        askId: 'ask-a11y-labels',
+        questions: [
+          {
+            prompt: 'Deployment environment?',
+            allowFreeText: true,
+          },
+        ],
+      },
+      storeRevision: 70,
+    });
+
+    await expect(page.getByText('Agent question')).toBeVisible();
+    const askField = page.getByRole('textbox', { name: 'Deployment environment?', exact: true });
+    await expect(askField).toBeVisible();
+    await expectControlFocused(askField);
+
+    // Tab escape: focus leaves the free-text control without a trap.
+    await page.keyboard.press('Tab');
+    await expect.poll(async () => controlHasFocus(askField)).toBe(false);
+  });
+
+  test('invalid prompt field focus announces required errors on the first invalid control', async ({
+    page,
+  }) => {
+    // M013 S02 / T01: required-field validation exposes aria-invalid + aria-describedby
+    // error association and moves focus to the first invalid field.
+    await openWebview(page);
+
+    await postRawHostMessage(page, {
+      type: 'elicitationFormPending',
+      promptId: 'elicitation-a11y-invalid',
+      message: 'Fill every required field before continuing.',
+      fields: [
+        {
+          key: 'service_name',
+          type: 'string',
+          title: 'Service name',
+          description: 'DNS-safe name used in the deployment manifest.',
+          required: true,
+        },
+        {
+          key: 'replica_count',
+          type: 'number',
+          title: 'Replica count',
+          required: true,
+        },
+      ],
+      required: ['service_name', 'replica_count'],
+      askLike: true,
+    });
+
+    const serviceName = page.getByRole('textbox', { name: 'Service name', exact: true });
+    const replicaCount = page.getByRole('spinbutton', { name: 'Replica count', exact: true });
+    await expect(serviceName).toBeVisible();
+    await expect(replicaCount).toBeVisible();
+
+    // Submit empty required form — must not post submitElicitation.
+    await page.getByRole('button', { name: 'Accept' }).click();
+    expect(
+      (await postedMessages(page)).filter(
+        (message) => (message as { type?: string }).type === 'submitElicitation',
+      ),
+    ).toHaveLength(0);
+
+    await expect(page.getByRole('alert').getByText('Service name is required.')).toBeVisible();
+
+    // First invalid control exposes invalid state + error association.
+    await expect(serviceName).toHaveAttribute('aria-invalid', 'true');
+    await expect
+      .poll(async () =>
+        serviceName.evaluate((el) => {
+          const ids = (el.getAttribute('aria-describedby') ?? '').split(/\s+/).filter(Boolean);
+          return ids
+            .map((id) => document.getElementById(id)?.textContent?.trim() ?? '')
+            .join(' ');
+        }),
+      )
+      .toMatch(/Service name is required/i);
+
+    // Focus moves to the first invalid field after client validation.
+    await expectControlFocused(serviceName);
+
+    // Second field is also invalid but must not steal focus from the first.
+    await expect(replicaCount).toHaveAttribute('aria-invalid', 'true');
+
+    // --- Ask free-text required validation ---
+    await postRawHostMessage(page, {
+      type: 'elicitationCleared',
+      promptId: 'elicitation-a11y-invalid',
+    });
+    await expect(page.getByRole('textbox', { name: 'Service name', exact: true })).toHaveCount(0);
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-a11y-invalid', goal: 'Answer invalid ask', viewStatus: 'waiting_user' })],
+      focusedTaskId: 'task-a11y-invalid',
+      subtree: [task({ id: 'task-a11y-invalid', goal: 'Answer invalid ask', viewStatus: 'waiting_user' })],
+      transcript: [],
+      activeTurnId: 'turn-a11y-invalid',
+      pendingAsk: {
+        turnId: 'turn-a11y-invalid',
+        askId: 'ask-a11y-invalid',
+        questions: [
+          {
+            prompt: 'Deployment environment?',
+            allowFreeText: true,
+          },
+        ],
+      },
+      storeRevision: 71,
+    });
+
+    const askField = page.getByRole('textbox', { name: 'Deployment environment?', exact: true });
+    await expect(askField).toBeVisible();
+
+    // Empty free-text Accept must block and focus the invalid field.
+    await page.getByRole('button', { name: 'Accept' }).click();
+    expect(
+      (await postedMessages(page)).filter(
+        (message) => (message as { type?: string }).type === 'submitAsk',
+      ),
+    ).toHaveLength(0);
+
+    await expect(page.getByRole('alert').getByText(/Deployment environment\?/i)).toBeVisible();
+    await expect(askField).toHaveAttribute('aria-invalid', 'true');
+    await expect
+      .poll(async () =>
+        askField.evaluate((el) => {
+          const ids = (el.getAttribute('aria-describedby') ?? '').split(/\s+/).filter(Boolean);
+          return ids
+            .map((id) => document.getElementById(id)?.textContent?.trim() ?? '')
+            .join(' ');
+        }),
+      )
+      .toMatch(/required/i);
+    await expectControlFocused(askField);
+
+    // --- Multi-option required/invalid state on checkboxes (not role=group) ---
+    // Snapshot omits pendingAsk so the protocol clears the free-text Ask card.
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-a11y-invalid', goal: 'Answer invalid ask', viewStatus: 'waiting_user' })],
+      focusedTaskId: 'task-a11y-invalid',
+      subtree: [task({ id: 'task-a11y-invalid', goal: 'Answer invalid ask', viewStatus: 'waiting_user' })],
+      transcript: [],
+      activeTurnId: 'turn-a11y-invalid',
+      storeRevision: 72,
+    });
+    await expect(page.getByRole('textbox', { name: 'Deployment environment?', exact: true })).toHaveCount(0);
+
+    await postRawHostMessage(page, {
+      type: 'elicitationFormPending',
+      promptId: 'elicitation-a11y-multi',
+      message: 'Pick every required multi-option field.',
+      fields: [
+        {
+          key: 'targets',
+          type: 'multiEnum',
+          title: 'Deploy targets',
+          description: 'Select one or more environments.',
+          options: ['Staging', 'Production'],
+          required: true,
+        },
+      ],
+      required: ['targets'],
+      askLike: true,
+    });
+
+    const multiGroup = page.getByRole('group', { name: 'Deploy targets' });
+    const multiStaging = page.getByRole('checkbox', { name: 'Staging', exact: true });
+    await expect(multiGroup).toBeVisible();
+    await expect(multiStaging).toBeVisible();
+    await expect(multiStaging).toHaveAttribute('aria-required', 'true');
+    // Unsupported on role=group — required/invalid live on the checkboxes.
+    await expect(multiGroup).not.toHaveAttribute('aria-required', 'true');
+    await expect(multiGroup).not.toHaveAttribute('aria-invalid', 'true');
+
+    await page.getByRole('button', { name: 'Accept' }).click();
+    expect(
+      (await postedMessages(page)).filter(
+        (message) => (message as { type?: string }).type === 'submitElicitation',
+      ),
+    ).toHaveLength(0);
+    await expect(page.getByRole('alert').getByText('Deploy targets is required.')).toBeVisible();
+    await expect(multiStaging).toHaveAttribute('aria-invalid', 'true');
+    await expect(multiGroup).not.toHaveAttribute('aria-invalid', 'true');
+    await expectControlFocused(multiStaging);
+
+    await postRawHostMessage(page, {
+      type: 'elicitationCleared',
+      promptId: 'elicitation-a11y-multi',
+    });
+    await expect(page.getByRole('group', { name: 'Deploy targets' })).toHaveCount(0);
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-a11y-multi-ask', goal: 'Answer multi ask', viewStatus: 'waiting_user' })],
+      focusedTaskId: 'task-a11y-multi-ask',
+      subtree: [task({ id: 'task-a11y-multi-ask', goal: 'Answer multi ask', viewStatus: 'waiting_user' })],
+      transcript: [],
+      activeTurnId: 'turn-a11y-multi-ask',
+      pendingAsk: {
+        turnId: 'turn-a11y-multi-ask',
+        askId: 'ask-a11y-multi',
+        questions: [
+          {
+            prompt: 'Which regions?',
+            options: ['us-east', 'eu-west'],
+            multiSelect: true,
+          },
+        ],
+      },
+      storeRevision: 73,
+    });
+
+    const askMultiGroup = page.getByRole('group', { name: 'Which regions?' });
+    const askMultiOption = page.getByRole('checkbox', { name: 'us-east', exact: true });
+    await expect(askMultiGroup).toBeVisible();
+    await expect(askMultiOption).toHaveAttribute('aria-required', 'true');
+    await expect(askMultiGroup).not.toHaveAttribute('aria-required', 'true');
+    await expect(askMultiGroup).not.toHaveAttribute('aria-invalid', 'true');
+
+    await page.getByRole('button', { name: 'Accept' }).click();
+    expect(
+      (await postedMessages(page)).filter(
+        (message) => (message as { type?: string }).type === 'submitAsk',
+      ),
+    ).toHaveLength(0);
+    await expect(page.getByRole('alert').getByText(/Which regions\?/i)).toBeVisible();
+    await expect(askMultiOption).toHaveAttribute('aria-invalid', 'true');
+    await expect(askMultiGroup).not.toHaveAttribute('aria-invalid', 'true');
+    await expectControlFocused(askMultiOption);
+  });
+
+  test('M013 S02 flow: accessible prompt forms', async ({ page }) => {
+    // Independent S02 journey: Ask + Elicitation through the real webview —
+    // named controls, initial focus, keyboard nav, validation announcement,
+    // first-invalid focus, corrected values, and exact outbound envelopes.
+    const consoleErrors: string[] = [];
+    const pageErrors: string[] = [];
+    const failedRequests: string[] = [];
+    page.on('console', (msg) => {
+      if (msg.type() !== 'error') return;
+      const text = msg.text();
+      // Ignore harness asset 403/net::ERR noise from Vite/dev server.
+      if (/403|Failed to load resource|net::ERR/i.test(text)) return;
+      consoleErrors.push(text);
+    });
+    page.on('pageerror', (err) => pageErrors.push(String(err)));
+    page.on('requestfailed', (req) => {
+      const failure = req.failure()?.errorText ?? 'unknown';
+      // Ignore harness asset 403/net::ERR noise from Vite/dev server.
+      if (/403|ERR_ABORTED|net::ERR/i.test(failure) || /403/.test(req.url())) return;
+      if (/favicon|sourcemap/i.test(req.url())) return;
+      failedRequests.push(`${req.method()} ${req.url()} ${failure}`);
+    });
+
+    await openWebview(page);
+
+    // --- Phase 1: Elicitation form accessibility + submit envelope ---
+    await postRawHostMessage(page, {
+      type: 'elicitationFormPending',
+      promptId: 'elicitation-m013-s02-flow',
+      message: 'Provide the deployment settings for S02.',
+      fields: [
+        {
+          key: 'service_name',
+          type: 'string',
+          title: 'Service name',
+          description: 'DNS-safe name used in the deployment manifest.',
+          required: true,
+        },
+        {
+          key: 'replica_count',
+          type: 'number',
+          title: 'Replica count',
+          description: 'How many instances should run.',
+          required: true,
+        },
+      ],
+      required: ['service_name', 'replica_count'],
+      askLike: true,
+    });
+
+    await expect(page.getByText('Agent question')).toBeVisible();
+    const serviceName = page.getByRole('textbox', { name: 'Service name', exact: true });
+    const replicaCount = page.getByRole('spinbutton', { name: 'Replica count', exact: true });
+    await expect(serviceName).toBeVisible();
+    await expect(replicaCount).toBeVisible();
+
+    // Initial focus lands on the first useful control.
+    await expectControlFocused(serviceName);
+
+    // Description association via aria-describedby.
+    await expect
+      .poll(async () =>
+        serviceName.evaluate((el) => {
+          const ids = (el.getAttribute('aria-describedby') ?? '').split(/\s+/).filter(Boolean);
+          return ids
+            .map((id) => document.getElementById(id)?.textContent?.trim() ?? '')
+            .join(' ');
+        }),
+      )
+      .toContain('DNS-safe name used in the deployment manifest.');
+
+    // Keyboard navigation: Tab escapes the first field (no trap).
+    await page.keyboard.press('Tab');
+    await expect.poll(async () => controlHasFocus(serviceName)).toBe(false);
+
+    // Empty Accept: block submit, announce associated error, focus first invalid.
+    await page.getByRole('button', { name: 'Accept' }).click();
+    expect(
+      (await postedMessages(page)).filter(
+        (message) => (message as { type?: string }).type === 'submitElicitation',
+      ),
+    ).toHaveLength(0);
+    await expect(page.getByRole('alert').getByText('Service name is required.')).toBeVisible();
+    await expect(serviceName).toHaveAttribute('aria-invalid', 'true');
+    await expect
+      .poll(async () =>
+        serviceName.evaluate((el) => {
+          const ids = (el.getAttribute('aria-describedby') ?? '').split(/\s+/).filter(Boolean);
+          return ids
+            .map((id) => document.getElementById(id)?.textContent?.trim() ?? '')
+            .join(' ');
+        }),
+      )
+      .toMatch(/Service name is required/i);
+    await expectControlFocused(serviceName);
+    await expect(replicaCount).toHaveAttribute('aria-invalid', 'true');
+
+    // Correct values and submit exact existing envelope.
+    await serviceName.fill('m013-s02-service');
+    await replicaCount.fill('3');
+    await page.getByRole('button', { name: 'Accept' }).click();
+    await expectPostedMessage(page, {
+      type: 'submitElicitation',
+      promptId: 'elicitation-m013-s02-flow',
+      action: 'accept',
+      content: {
+        service_name: 'm013-s02-service',
+        replica_count: 3,
+      },
+    });
+
+    // Clear elicitation so Ask can take the stack.
+    await postRawHostMessage(page, {
+      type: 'elicitationCleared',
+      promptId: 'elicitation-m013-s02-flow',
+    });
+    await expect(page.getByRole('textbox', { name: 'Service name', exact: true })).toHaveCount(0);
+
+    // --- Phase 2: Ask card accessibility + submit envelope ---
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [
+        task({ id: 'task-m013-s02-flow', goal: 'Answer S02 ask', viewStatus: 'waiting_user' }),
+      ],
+      focusedTaskId: 'task-m013-s02-flow',
+      subtree: [
+        task({ id: 'task-m013-s02-flow', goal: 'Answer S02 ask', viewStatus: 'waiting_user' }),
+      ],
+      transcript: [],
+      activeTurnId: 'turn-m013-s02-flow',
+      pendingAsk: {
+        turnId: 'turn-m013-s02-flow',
+        askId: 'ask-m013-s02-flow',
+        questions: [
+          {
+            prompt: 'Deployment environment?',
+            allowFreeText: true,
+          },
+        ],
+      },
+      storeRevision: 80,
+    });
+
+    await expect(page.getByText('Agent question')).toBeVisible();
+    const askField = page.getByRole('textbox', { name: 'Deployment environment?', exact: true });
+    await expect(askField).toBeVisible();
+    await expectControlFocused(askField);
+
+    // Tab escape without a trap.
+    await page.keyboard.press('Tab');
+    await expect.poll(async () => controlHasFocus(askField)).toBe(false);
+
+    // Empty Accept: block submitAsk, announce associated error, focus invalid field.
+    await page.getByRole('button', { name: 'Accept' }).click();
+    expect(
+      (await postedMessages(page)).filter(
+        (message) => (message as { type?: string }).type === 'submitAsk',
+      ),
+    ).toHaveLength(0);
+    await expect(page.getByRole('alert').getByText(/Deployment environment\?/i)).toBeVisible();
+    await expect(askField).toHaveAttribute('aria-invalid', 'true');
+    await expect
+      .poll(async () =>
+        askField.evaluate((el) => {
+          const ids = (el.getAttribute('aria-describedby') ?? '').split(/\s+/).filter(Boolean);
+          return ids
+            .map((id) => document.getElementById(id)?.textContent?.trim() ?? '')
+            .join(' ');
+        }),
+      )
+      .toMatch(/required/i);
+    await expectControlFocused(askField);
+
+    // Correct value and submit exact existing envelope (no answer body logging).
+    await askField.fill('staging');
+    await page.getByRole('button', { name: 'Accept' }).click();
+    await expectPostedMessage(page, {
+      type: 'submitAsk',
+      taskId: 'task-m013-s02-flow',
+      turnId: 'turn-m013-s02-flow',
+      askId: 'ask-m013-s02-flow',
+      answers: {
+        '0': {
+          selected: [],
+          freeText: 'staging',
+        },
+      },
+    });
+
+    // Focused console / network diagnostics must stay clean for the assembled journey.
+    expect(consoleErrors, `console errors: ${consoleErrors.join(' | ')}`).toEqual([]);
+    expect(pageErrors, `page errors: ${pageErrors.join(' | ')}`).toEqual([]);
+    expect(failedRequests, `failed requests: ${failedRequests.join(' | ')}`).toEqual([]);
+  });
+
+  test('M013 S03 flow: composer motion and compact controls', async ({ page }) => {
+    // Independent S03 evidence: one assembled journey at 320px covering composer
+    // combobox/listbox semantics with active-descendant selection, reduced-motion
+    // streaming cursor (no infinite blink), and practical ≥28×28 toolbar icon hit
+    // areas without document horizontal overflow. Browser diagnostics must stay clean.
+    const consoleErrors: string[] = [];
+    const pageErrors: string[] = [];
+    const failedRequests: string[] = [];
+    page.on('console', (msg) => {
+      if (msg.type() !== 'error') return;
+      const text = msg.text();
+      // Vite/dev asset 403s are harness noise, not product regressions.
+      if (/status of 403|Failed to load resource|403|net::ERR/i.test(text)) return;
+      consoleErrors.push(text);
+    });
+    page.on('pageerror', (err) => {
+      pageErrors.push(err.message);
+    });
+    page.on('requestfailed', (req) => {
+      const failure = req.failure()?.errorText ?? '';
+      // Ignore harness asset 403/net::ERR noise from Vite/dev server.
+      if (/403|ERR_ABORTED|net::ERR/i.test(failure) || /403/.test(req.url())) return;
+      failedRequests.push(`${req.method()} ${req.url()} ${failure}`);
+    });
+
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await page.setViewportSize({ width: 320, height: 720 });
+    await openWebview(page);
+
+    // --- Phase 1: compact toolbar icons ≥28×28 with no horizontal overflow ---
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [
+        task({
+          id: 'task-m013-s03-flow',
+          goal: 'S03 composer motion and compact controls',
+          viewStatus: 'idle',
+        }),
+      ],
+      focusedTaskId: 'task-m013-s03-flow',
+      subtree: [
+        task({
+          id: 'task-m013-s03-flow',
+          goal: 'S03 composer motion and compact controls',
+          viewStatus: 'idle',
+        }),
+      ],
+      transcript: [{ id: 'msg-m013-s03-flow-ready', kind: 'assistant', content: 'S03 flow ready.' }],
+      storeRevision: 1401,
+    });
+    await expect(page.getByText('S03 flow ready.')).toBeVisible();
+
+    const toolbarIcons = page.locator(
+      'button.icon-btn[aria-label="Back to tasks list"], button.icon-btn[aria-label="History (previous coordinator tasks)"], button.icon-btn[aria-label="New task"], button.icon-btn[aria-label="Export task/chat"], button.icon-btn[aria-label="Settings"]',
+    );
+    await expect(toolbarIcons).toHaveCount(5);
+
+    const boxes = await toolbarIcons.evaluateAll((els) =>
+      els.map((el) => {
+        const box = (el as HTMLElement).getBoundingClientRect();
+        return {
+          label: el.getAttribute('aria-label') ?? '(unlabeled)',
+          width: box.width,
+          height: box.height,
+        };
+      }),
+    );
+    for (const box of boxes) {
+      expect(
+        box.width,
+        `${box.label} width ${box.width}px must be ≥ 28 CSS px`,
+      ).toBeGreaterThanOrEqual(28);
+      expect(
+        box.height,
+        `${box.label} height ${box.height}px must be ≥ 28 CSS px`,
+      ).toBeGreaterThanOrEqual(28);
+    }
+
+    const overflow = await page.evaluate(() => {
+      const doc = document.documentElement;
+      const body = document.body;
+      return {
+        docOk: doc.scrollWidth <= doc.clientWidth + 1,
+        bodyOk: body.scrollWidth <= body.clientWidth + 1,
+        docScrollWidth: doc.scrollWidth,
+        docClientWidth: doc.clientWidth,
+      };
+    });
+    expect(
+      overflow.docOk && overflow.bodyOk,
+      `document horizontal overflow at 320px: ${JSON.stringify(overflow)}`,
+    ).toBe(true);
+
+    // --- Phase 2: reduced-motion streaming cursor must not blink infinitely ---
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [
+        task({
+          id: 'task-m013-s03-flow',
+          goal: 'S03 composer motion and compact controls',
+          viewStatus: 'running',
+        }),
+      ],
+      focusedTaskId: 'task-m013-s03-flow',
+      subtree: [
+        task({
+          id: 'task-m013-s03-flow',
+          goal: 'S03 composer motion and compact controls',
+          viewStatus: 'running',
+        }),
+      ],
+      transcript: [],
+      activeTurnId: 'turn-m013-s03-flow',
+      storeRevision: 1402,
+    });
+
+    await postRawHostMessage(page, {
+      type: 'turnStart',
+      taskId: 'task-m013-s03-flow',
+      turnId: 'turn-m013-s03-flow',
+    });
+    await postRawHostMessage(page, {
+      type: 'event',
+      taskId: 'task-m013-s03-flow',
+      turnId: 'turn-m013-s03-flow',
+      event: {
+        type: 'assistantDelta',
+        content: 'Streaming under reduced motion for S03 flow…',
+        messageId: 'msg-m013-s03-flow-stream',
+      },
+    });
+
+    const cursor = page.locator('.streaming-cursor');
+    await expect(cursor).toBeVisible();
+    await expect(cursor).toHaveText('▋');
+
+    const motion = await cursor.evaluate((el) => {
+      const style = getComputedStyle(el);
+      return {
+        animationName: style.animationName,
+        animationDuration: style.animationDuration,
+        animationIterationCount: style.animationIterationCount,
+        animationPlayState: style.animationPlayState,
+      };
+    });
+    const noInfiniteBlink =
+      motion.animationName === 'none' ||
+      motion.animationDuration === '0s' ||
+      motion.animationIterationCount === '0' ||
+      motion.animationPlayState === 'paused';
+    expect(
+      noInfiniteBlink,
+      `expected reduced-motion to disable infinite blink, got ${JSON.stringify(motion)}`,
+    ).toBe(true);
+
+    // --- Phase 3: composer file suggestions expose valid combobox semantics ---
+    // Return to an idle task so the native composer is available for @ mentions.
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [
+        task({
+          id: 'task-m013-s03-flow',
+          goal: 'S03 composer motion and compact controls',
+          viewStatus: 'idle',
+        }),
+      ],
+      focusedTaskId: 'task-m013-s03-flow',
+      subtree: [
+        task({
+          id: 'task-m013-s03-flow',
+          goal: 'S03 composer motion and compact controls',
+          viewStatus: 'idle',
+        }),
+      ],
+      transcript: [
+        {
+          id: 'msg-m013-s03-flow-idle',
+          kind: 'assistant',
+          content: 'Ready for composer suggestions.',
+        },
+      ],
+      storeRevision: 1403,
+    });
+    await expect(page.getByText('Ready for composer suggestions.')).toBeVisible();
+
+    const composer = page.locator('.composer-input__textarea').first();
+    await composer.click();
+    await expect(composer).toBeFocused();
+
+    await expect(composer).toHaveAttribute('role', 'combobox');
+    await expect(composer).toHaveAttribute('aria-autocomplete', 'list');
+    await expect(composer).toHaveAttribute('aria-haspopup', 'listbox');
+    await expect(composer).toHaveAttribute('aria-expanded', 'false');
+    await expect(composer).not.toHaveAttribute('aria-activedescendant');
+
+    await composer.pressSequentially('Review @ac', { delay: 15 });
+    const openBefore = (await postedMessages(page)).length;
+    await expect
+      .poll(async () => {
+        const messages = await postedMessages(page);
+        return messages
+          .slice(openBefore)
+          .filter((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions');
+      })
+      .not.toHaveLength(0);
+
+    const openRequest = (await postedMessages(page))
+      .slice(openBefore)
+      .find((m) => (m as { type?: string }).type === 'requestFileMentionSuggestions') as {
+      requestId: string;
+    };
+
+    await postRawHostMessage(page, {
+      type: 'fileMentionSuggestions',
+      requestId: openRequest.requestId,
+      parentDepth: 0,
+      relativeQuery: 'ac',
+      items: [
+        {
+          id: 'file:access.md',
+          kind: 'file',
+          label: 'access.md',
+          insertionPath: 'docs/access.md',
+        },
+        {
+          id: 'file:actions.ts',
+          kind: 'file',
+          label: 'actions.ts',
+          insertionPath: 'src/actions.ts',
+        },
+      ],
+    });
+
+    const listbox = page.getByRole('listbox', { name: 'File mention suggestions' });
+    await expect(listbox).toBeVisible();
+    await expect(composer).toHaveAttribute('role', 'combobox');
+    await expect(composer).toHaveAttribute('aria-expanded', 'true');
+    await expect(composer).toHaveAttribute('aria-controls', 'file-mention-listbox');
+    await expect(composer).toHaveAttribute('aria-activedescendant', 'file-mention-option-0');
+    await expect(listbox.getByRole('option').first()).toHaveAttribute('aria-selected', 'true');
+
+    await composer.press('ArrowDown');
+    await expect(composer).toHaveAttribute('aria-activedescendant', 'file-mention-option-1');
+    await expect(listbox.getByRole('option').nth(1)).toHaveAttribute('aria-selected', 'true');
+
+    // Compact layout still holds after opening suggestions.
+    const overflowAfter = await page.evaluate(() => {
+      const doc = document.documentElement;
+      const body = document.body;
+      return {
+        docOk: doc.scrollWidth <= doc.clientWidth + 1,
+        bodyOk: body.scrollWidth <= body.clientWidth + 1,
+      };
+    });
+    expect(
+      overflowAfter.docOk && overflowAfter.bodyOk,
+      `document horizontal overflow after suggestions: ${JSON.stringify(overflowAfter)}`,
+    ).toBe(true);
+
+    expect(consoleErrors, `console errors: ${consoleErrors.join(' | ')}`).toEqual([]);
+    expect(pageErrors, `page errors: ${pageErrors.join(' | ')}`).toEqual([]);
+    expect(failedRequests, `failed requests: ${failedRequests.join(' | ')}`).toEqual([]);
   });
 
   test('RFD URL consent unlocks after host rejection', async ({ page }) => {
@@ -5601,8 +6808,8 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expect(page.getByRole('button', { name: 'Deny' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Allow once' })).toBeVisible();
 
-    // Re-open Settings while a runtime permission is pending — configuration UI stays distinct.
-    // Settings replaces the task surface (runtime card unmounts) and never renders prompt actions.
+    // Re-open Settings while a runtime permission is pending — configuration UI stays distinct,
+    // and the runtime card remains mounted/operable (M013 S01: no unmount under Settings).
     await page.getByRole('button', { name: 'Settings', exact: true }).click();
     await expectPostedMessage(page, { type: 'requestPermissionSettings' });
     await page.getByRole('tab', { name: /Execution/i }).click();
@@ -5613,16 +6820,28 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     // Dirty draft (allow) survives reopen via view-state; runtime card is not Settings UI.
     await expect(page.locator('#permission-mode-allow')).toBeChecked();
     await expect(page.getByTestId('permissions-settings')).toBeVisible();
-    await expect(page.getByTestId('runtime-permission-card')).toHaveCount(0);
-    await expect(page.getByRole('region', { name: 'Runtime permission request' })).toHaveCount(0);
-    await expect(page.getByText('Write src/host/permission-settings.ts')).toHaveCount(0);
-    await expect(page.getByRole('button', { name: 'Deny' })).toHaveCount(0);
-    await expect(page.getByRole('button', { name: 'Allow once' })).toHaveCount(0);
+    await expect(page.getByTestId('runtime-permission-card')).toBeVisible();
+    await expect(page.getByRole('region', { name: 'Runtime permission request' })).toBeVisible();
+    await expect(page.getByText('Write src/host/permission-settings.ts')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Deny' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Allow once' })).toBeVisible();
     // Settings modes are radios under Permission mode — not runtime prompt buttons.
     await expect(page.getByTestId('permissions-mode-group')).toBeVisible();
     await expect(page.getByTestId('permissions-runtime-note')).toContainText(
       'This tab only configures the default policy mode',
     );
+
+    // Scoped Allow once must submit the existing permission envelope while Settings stays open.
+    await page.getByRole('button', { name: 'Allow once' }).click();
+    await expectPostedMessage(page, {
+      type: 'submitPermission',
+      permissionId: 'perm-s03',
+      optionId: 'allow-once',
+      remember: false,
+    });
+    // Policy controls remain distinct from the runtime action that just fired.
+    await expect(page.getByTestId('permissions-mode-group')).toBeVisible();
+    await expect(page.locator('#permission-mode-allow')).toBeChecked();
   });
 
   test('M012 S03 flow: save readonly then allow, exact outbound update, sanitized failure keeps draft', async ({
@@ -5946,7 +7165,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       storeRevision: 120,
     });
 
-    const composer = page.getByRole('textbox').first();
+    const composer = page.getByRole('combobox').first();
     await expect(composer).toBeEnabled();
     await expect(page.getByTestId('composer-live-inject')).toHaveCount(0);
 
@@ -6031,7 +7250,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       turnId: 'turn-q1',
     });
     await expect(page.getByTestId('queued-turns-panel')).toHaveCount(0);
-    const composer = page.getByRole('textbox').first();
+    const composer = page.getByRole('combobox').first();
     await expect(composer).toHaveValue('First queued follow-up');
 
     // Host confirms empty queue.
