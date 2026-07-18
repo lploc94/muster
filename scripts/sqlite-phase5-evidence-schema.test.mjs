@@ -7,15 +7,42 @@ import {
   validatePhase5Scenario,
 } from './sqlite-phase5-evidence-schema.mjs';
 
+const DEFAULT_CODES = {
+  corrupt_open: 'corrupt',
+  not_a_database_open: 'not_a_database',
+  foreign_reject: 'foreign_database',
+  incompatible_reject: 'incompatible_schema',
+  write_full_rollback: 'full',
+  write_readonly_rollback: 'readonly',
+  busy_responsiveness: 'busy',
+  backup_wal_writer: 'ok',
+  backup_reopen_consistency: 'ok',
+  reset_cancel: 'cancel',
+  reset_success: 'ok',
+  cross_window_reset_contention: 'ok',
+};
+
 function completeScenario(id = 'corrupt_open') {
-  return {
+  const scenario = {
     scenarioId: id,
-    resultCode: 'ok',
+    resultCode: DEFAULT_CODES[id] ?? 'ok',
     verdict: 'PASS',
     durationMs: 12.5,
     count: 1,
     schemaVersion: 7,
   };
+  if (id === 'cross_window_reset_contention') {
+    scenario.hash = 'a1b2c3d4e5f60718';
+  }
+  if (id === 'backup_wal_writer') {
+    scenario.mechanism = 'vacuum';
+    scenario.byteSize = 4096;
+  }
+  if (id === 'backup_reopen_consistency') {
+    scenario.hash = 'abcdef0123456789';
+    scenario.byteSize = 4096;
+  }
+  return scenario;
 }
 
 function completeRuntime(runtimeClass = '1.101.0') {
@@ -83,8 +110,15 @@ test('rejects missing runtime, missing scenario, duplicate, FAIL, unknown key, p
   assert.ok(
     validatePhase5Scenario({
       ...completeScenario(),
-      resultCode: 'ok CANARY_abc /Users/secret',
-    }).some((f) => /sensitive/i.test(f)),
+      resultCode: 'file_tmp_workspace',
+    }).some((f) => /not allowlisted|fixed snake_case/i.test(f)),
+  );
+
+  assert.ok(
+    validatePhase5Scenario({
+      ...completeScenario('corrupt_open'),
+      resultCode: 'ok',
+    }).some((f) => /not allowlisted for corrupt_open/i.test(f)),
   );
 
   assert.ok(
@@ -97,6 +131,13 @@ test('rejects missing runtime, missing scenario, duplicate, FAIL, unknown key, p
   const freeText = completeScenario();
   freeText.detail = 'long free-form narrative';
   assert.ok(validatePhase5Scenario(freeText).some((f) => /unknown key: detail/i.test(f)));
+
+  const huge = completeScenario();
+  huge.durationMs = Number.MAX_SAFE_INTEGER;
+  assert.ok(validatePhase5Scenario(huge).some((f) => /durationMs/i.test(f)));
+
+  const badTs = { ...base, generatedAt: 'T file:///tmp/session' };
+  assert.ok(validatePhase5Evidence(badTs).some((f) => /generatedAt|sensitive/i.test(f)));
 });
 
 test('buildPhase5Evidence drops non-allowlisted fields from inputs', () => {

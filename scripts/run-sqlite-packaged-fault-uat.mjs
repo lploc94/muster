@@ -27,17 +27,32 @@ const downloadTimeout = Number.parseInt(
   process.env.MUSTER_VSCODE_DOWNLOAD_TIMEOUT_MS || '120000',
   10,
 );
+const runTimeoutMs = Number.parseInt(process.env.MUSTER_PHASE5_RUN_TIMEOUT_MS || '300000', 10);
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-p5-fault-run-'));
 
+async function withTimeout(promise, ms, label) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function runOne(version, extensionDevelopmentPath, compiledTest) {
-  const userDataDir = path.join(tempDir, `ud-${version.replace(/[^a-z0-9.-]/gi, '_')}`);
-  const workspacePath = path.join(tempDir, `ws-${version.replace(/[^a-z0-9.-]/gi, '_')}`);
-  const scenarioOut = path.join(tempDir, `scenarios-${version.replace(/[^a-z0-9.-]/gi, '_')}.json`);
+  const safe = version.replace(/[^a-z0-9.-]/gi, '_');
+  const userDataDir = path.join(tempDir, `ud-${safe}`);
+  const workspacePath = path.join(tempDir, `ws-${safe}`);
+  const scenarioOut = path.join(tempDir, `scenarios-${safe}.json`);
   fs.mkdirSync(workspacePath, { recursive: true });
   fs.mkdirSync(userDataDir, { recursive: true });
 
-  const runTimeoutMs = Number.parseInt(process.env.MUSTER_PHASE5_RUN_TIMEOUT_MS || '240000', 10);
-  await Promise.race([
+  await withTimeout(
     runTests({
       version,
       timeout: Number.isFinite(downloadTimeout) ? downloadTimeout : 120_000,
@@ -56,13 +71,9 @@ async function runOne(version, extensionDevelopmentPath, compiledTest) {
         '--disable-extensions',
       ],
     }),
-    new Promise((_, reject) => {
-      setTimeout(
-        () => reject(new Error(`packaged fault UAT timed out for ${version} after ${runTimeoutMs}ms`)),
-        Number.isFinite(runTimeoutMs) ? runTimeoutMs : 240_000,
-      );
-    }),
-  ]);
+    Number.isFinite(runTimeoutMs) ? runTimeoutMs : 300_000,
+    `packaged fault UAT ${version}`,
+  );
 
   if (!fs.existsSync(scenarioOut)) {
     throw new Error(`scenario output missing for ${version}`);

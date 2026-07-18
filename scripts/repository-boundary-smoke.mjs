@@ -589,6 +589,34 @@ export async function runRepositoryBoundarySmoke(rootDir = ROOT) {
   } catch {
     // optional in mutated fixture trees
   }
+  // Phase 5 evidence schema/builder must stay allowlisted and redacted-by-construction.
+  try {
+    const phase5Schema = await readFile(path.join(rootDir, 'scripts/sqlite-phase5-evidence-schema.mjs'), 'utf8');
+    if (!phase5Schema.includes('buildPhase5Evidence') || !phase5Schema.includes('contentSafety')) {
+      failures.push('scripts/sqlite-phase5-evidence-schema.mjs must export buildPhase5Evidence with contentSafety.');
+    }
+    if (!phase5Schema.includes('PHASE5_RESULT_CODES') || !phase5Schema.includes('FIXED_CODE')) {
+      failures.push('scripts/sqlite-phase5-evidence-schema.mjs must enforce fixed scenario result codes.');
+    }
+    if (/\bconsole\.(log|info|error|warn)\([^)]*\b(sql|params|dbPath|content)\b/.test(stripComments(phase5Schema))) {
+      failures.push('scripts/sqlite-phase5-evidence-schema.mjs must not log sql/params/path/content.');
+    }
+  } catch {
+    // optional when schema file is absent in partial fixtures
+  }
+  for (const rel of [
+    'src/task/sqlite/client.ts',
+    'src/task/sqlite/rpc.ts',
+    'src/task/sqlite/errors.ts',
+    'src/host/sqlite-maintenance-commands.ts',
+  ]) {
+    const raw = texts.get(rel);
+    if (!raw) continue;
+    const code = stripComments(raw);
+    if (/\bconsole\.(log|info|debug)\([^)]*\b(sql|params|dbPath|content|stack)\b/.test(code)) {
+      failures.push(`${rel} must not console-log sql/params/path/content/stack.`);
+    }
+  }
 
   } catch (error) {
     failures.push(`Missing entity matrix: docs/plans/sqlite-entity-matrix.vi.md (${error.message})`);

@@ -112,66 +112,11 @@ function serializeDebugLine(event: string, details: Record<string, unknown>): st
   return `${new Date().toISOString()} ${event} ${JSON.stringify(details)}`;
 }
 
-/**
- * Mirrors scripts/run-sqlite-two-window-live-uat.mjs buildEvidence allowlist:
- * only copies fixed metadata fields; drops any canary-bearing extras.
- */
-function buildEvidenceFromResult(
-  result: {
-    kind: string;
-    schemaVersion: number;
-    dbIdentity: {
-      dbFileToken: string;
-      applicationId: number;
-      userVersion: number;
-      pageCount?: number;
-      byteSize: number;
-      journalMode: string;
-      workspaceId?: string;
-      workspaceIdentityKind?: string;
-      /** Must never be published */
-      secretCanary?: string;
-      messageBody?: string;
-    };
-    scenarios: Array<{ id: string; verdict: string; detail: string; content?: string }>;
-    polling?: { aPollCount: number; bPollCount: number; focusGateOverridden: boolean };
-    finalRevision?: number;
-    finalTaskCount?: number;
-  },
-  exitA: { code: number },
-  peerExits: Array<{ code: number }>,
-): Record<string, unknown> {
-  return {
-    ok: true,
-    kind: result.kind,
-    schemaVersion: result.schemaVersion,
-    dbIdentity: {
-      dbFileToken: result.dbIdentity.dbFileToken,
-      applicationId: result.dbIdentity.applicationId,
-      userVersion: result.dbIdentity.userVersion,
-      pageCount: result.dbIdentity.pageCount,
-      byteSize: result.dbIdentity.byteSize,
-      journalMode: result.dbIdentity.journalMode,
-      workspaceId: result.dbIdentity.workspaceId,
-      workspaceIdentityKind: result.dbIdentity.workspaceIdentityKind,
-    },
-    extensionHostsDistinct: true,
-    peerRestarted: true,
-    polling: result.polling,
-    finalRevision: result.finalRevision,
-    finalTaskCount: result.finalTaskCount,
-    scenarios: result.scenarios.map(({ id, verdict, detail }) => ({ id, verdict, detail })),
-    launcher: {
-      kind: 'two-real-vscode-processes-and-extension-hosts',
-      exitCodes: { a: exitA.code, b: peerExits.map((e) => e.code) },
-    },
-    contentSafety: {
-      absolutePathsStoredInEvidence: false,
-      messageBodiesStoredInEvidence: false,
-      sessionIdsStoredInEvidence: false,
-    },
-  };
-}
+// Real Phase 5 evidence allowlist builder (JS module; no .d.ts).
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { buildPhase5Evidence } = require('../../../scripts/sqlite-phase5-evidence-schema.mjs') as {
+  buildPhase5Evidence: (runtimes: unknown[]) => Record<string, unknown>;
+};
 
 const RAW_FAULT_SHAPES: Array<{
   label: string;
@@ -451,42 +396,31 @@ describe('P5-W6 privacy canary allowlist', () => {
     expect(identity.dbFileToken).not.toContain('/');
     expect(identity.dbFileToken).not.toContain(canary);
 
-    // Real evidence-builder allowlist: canary-bearing extras on the input must not publish.
-    const evidence = buildEvidenceFromResult(
+    // Real Phase 5 evidence builder: canary-bearing extras must be dropped.
+    const evidence = buildPhase5Evidence([
       {
-        kind: 'live-two-window-extension-host',
-        schemaVersion: SQLITE_SCHEMA_VERSION,
-        dbIdentity: {
-          dbFileToken: identity.dbFileToken,
-          applicationId: identity.applicationId,
-          userVersion: identity.userVersion,
-          pageCount: identity.pageCount,
-          byteSize: identity.byteSize,
-          journalMode: identity.journalMode,
-          workspaceId: identity.workspaceId,
-          workspaceIdentityKind: 'folder',
-          secretCanary: canary,
-          messageBody: `user said ${canary}`,
-        },
+        runtimeClass: '1.101.0',
+        vscodeVersion: '1.101.0',
+        nodeVersion: '22.15.1',
+        secretCanary: canary,
+        messageBody: `user said ${canary}`,
         scenarios: [
           {
-            id: 'A',
+            scenarioId: 'corrupt_open',
+            resultCode: 'corrupt',
             verdict: 'PASS',
-            detail: 'redacted',
+            durationMs: 1,
             content: canary,
+            dbPath: `/Users/secret/${canary}`,
           },
         ],
-        polling: { aPollCount: 1, bPollCount: 1, focusGateOverridden: true },
-        finalRevision: 2,
-        finalTaskCount: 1,
       },
-      { code: 0 },
-      [{ code: 0 }],
-    );
+    ]);
     assertNoSensitiveLeak(evidence, canary);
     assertNoSensitiveLeak(JSON.stringify(evidence), reasoningCanary);
     expect(JSON.stringify(evidence)).not.toContain('secretCanary');
     expect(JSON.stringify(evidence)).not.toContain('messageBody');
+    expect(JSON.stringify(evidence)).not.toContain('dbPath');
 
     const page = await repo.getTranscriptPage(task.id, undefined, 100);
     expect(JSON.stringify(page.items)).toContain(canary);

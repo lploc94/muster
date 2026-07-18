@@ -20,6 +20,22 @@ export const PHASE5_SCENARIO_IDS = [
 
 export const PHASE5_RUNTIME_CLASSES = ['1.101.0', 'stable'];
 
+/** Scenario-specific allowlisted fixed result codes. */
+export const PHASE5_RESULT_CODES = {
+  corrupt_open: ['corrupt', 'not_a_database'],
+  not_a_database_open: ['not_a_database', 'corrupt'],
+  foreign_reject: ['foreign_database'],
+  incompatible_reject: ['incompatible_schema'],
+  write_full_rollback: ['full'],
+  write_readonly_rollback: ['readonly'],
+  busy_responsiveness: ['busy'],
+  backup_wal_writer: ['ok'],
+  backup_reopen_consistency: ['ok'],
+  reset_cancel: ['cancel'],
+  reset_success: ['ok'],
+  cross_window_reset_contention: ['ok', 'busy'],
+};
+
 const ALLOWED_RESULT_KEYS = new Set([
   'scenarioId',
   'resultCode',
@@ -48,8 +64,23 @@ const ALLOWED_ROOT_KEYS = new Set([
   'generatedAt',
 ]);
 
+const CONTENT_SAFETY_KEYS = [
+  'absolutePathsStoredInEvidence',
+  'messageBodiesStoredInEvidence',
+  'sessionIdsStoredInEvidence',
+  'canaryStoredInEvidence',
+];
+
 const SENSITIVE =
-  /CANARY_|\/Users\/|\/private\/tmp\/|\/var\/folders\/|\\\\Users\\\\|\bSELECT\s+\*|\bINSERT\s+INTO\b|stackTrace|toolOutput|messageBody|"prompt"\s*:/i;
+  /CANARY_|\/Users\/|\/private\/tmp\/|\/var\/folders\/|\/tmp\/[A-Za-z0-9._-]+|\\\\Users\\\\|file:\/\/|"workspaceId"\s*:|"taskId"\s*:|"sessionId"\s*:|\bSELECT\s+\*|\bINSERT\s+INTO\b|\bUPDATE\s+\w+\s+SET\b|\bDELETE\s+FROM\b|stackTrace|Error\\n|at Object\.|toolOutput|messageBody|"prompt"\s*:/i;
+
+const FIXED_CODE = /^[a-z][a-z0-9_]{0,31}$/;
+const VSCODE_VERSION = /^\d+\.\d+\.\d+(?:-.*)?$/;
+const NODE_VERSION = /^\d+\.\d+\.\d+(?:-.*)?$/;
+const ISO_TS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+const MAX_DURATION_MS = 600_000;
+const MAX_COUNT = 1_000_000;
+const MAX_BYTE_SIZE = 2_000_000_000;
 
 /**
  * @param {unknown} scenario
@@ -69,8 +100,16 @@ export function validatePhase5Scenario(scenario, opts = {}) {
   if (typeof scenario.scenarioId !== 'string' || !PHASE5_SCENARIO_IDS.includes(scenario.scenarioId)) {
     failures.push(`invalid scenarioId: ${String(scenario.scenarioId)}`);
   }
-  if (typeof scenario.resultCode !== 'string' || scenario.resultCode.length < 1 || scenario.resultCode.length > 64) {
-    failures.push('resultCode must be a short fixed string');
+  if (typeof scenario.resultCode !== 'string' || !FIXED_CODE.test(scenario.resultCode)) {
+    failures.push('resultCode must be a fixed snake_case token');
+  } else if (
+    scenario.scenarioId &&
+    PHASE5_RESULT_CODES[scenario.scenarioId] &&
+    !PHASE5_RESULT_CODES[scenario.scenarioId].includes(scenario.resultCode)
+  ) {
+    failures.push(
+      `resultCode ${scenario.resultCode} not allowlisted for ${scenario.scenarioId}`,
+    );
   }
   if (scenario.verdict !== 'PASS' && scenario.verdict !== 'FAIL') {
     failures.push('verdict must be PASS or FAIL');
@@ -78,14 +117,27 @@ export function validatePhase5Scenario(scenario, opts = {}) {
   if (opts.requirePass && scenario.verdict !== 'PASS') {
     failures.push(`scenario ${scenario.scenarioId} must be PASS`);
   }
-  if (typeof scenario.durationMs !== 'number' || !Number.isFinite(scenario.durationMs) || scenario.durationMs < 0) {
-    failures.push('durationMs must be a non-negative finite number');
+  if (
+    typeof scenario.durationMs !== 'number' ||
+    !Number.isFinite(scenario.durationMs) ||
+    scenario.durationMs < 0 ||
+    scenario.durationMs > MAX_DURATION_MS
+  ) {
+    failures.push('durationMs must be a finite number in [0, 600000]');
   }
-  if (scenario.count !== undefined && (!Number.isSafeInteger(scenario.count) || scenario.count < 0)) {
-    failures.push('count must be a non-negative safe integer when present');
+  if (
+    scenario.count !== undefined &&
+    (!Number.isSafeInteger(scenario.count) || scenario.count < 0 || scenario.count > MAX_COUNT)
+  ) {
+    failures.push('count must be a safe integer in [0, 1000000] when present');
   }
-  if (scenario.byteSize !== undefined && (!Number.isSafeInteger(scenario.byteSize) || scenario.byteSize < 0)) {
-    failures.push('byteSize must be a non-negative safe integer when present');
+  if (
+    scenario.byteSize !== undefined &&
+    (!Number.isSafeInteger(scenario.byteSize) ||
+      scenario.byteSize < 0 ||
+      scenario.byteSize > MAX_BYTE_SIZE)
+  ) {
+    failures.push('byteSize must be a safe integer in [0, 2e9] when present');
   }
   if (scenario.hash !== undefined) {
     if (typeof scenario.hash !== 'string' || !/^[a-f0-9]{8,64}$/.test(scenario.hash)) {
@@ -98,11 +150,22 @@ export function validatePhase5Scenario(scenario, opts = {}) {
   if (scenario.schemaVersion !== undefined && scenario.schemaVersion !== 7) {
     failures.push('schemaVersion must be 7 when present');
   }
+  if (
+    (scenario.scenarioId === 'backup_wal_writer' ||
+      scenario.scenarioId === 'backup_reopen_consistency' ||
+      scenario.scenarioId === 'reset_success') &&
+    scenario.schemaVersion !== 7
+  ) {
+    failures.push(`${scenario.scenarioId} must report schemaVersion 7`);
+  }
+  if (scenario.scenarioId === 'cross_window_reset_contention' && typeof scenario.hash !== 'string') {
+    failures.push('cross_window_reset_contention must include shared physical identity hash');
+  }
   const blob = JSON.stringify(scenario);
   if (SENSITIVE.test(blob)) {
     failures.push(`scenario ${scenario.scenarioId} contains sensitive/unredacted content`);
   }
-  if (blob.length > 2000) {
+  if (blob.length > 800) {
     failures.push(`scenario ${scenario.scenarioId} payload too large`);
   }
   return failures;
@@ -123,15 +186,20 @@ export function validatePhase5Runtime(runtime, opts = {}) {
   if (!PHASE5_RUNTIME_CLASSES.includes(runtime.runtimeClass)) {
     failures.push(`invalid runtimeClass: ${String(runtime.runtimeClass)}`);
   }
-  if (typeof runtime.vscodeVersion !== 'string' || runtime.vscodeVersion.length < 1) {
-    failures.push('vscodeVersion required');
+  if (typeof runtime.vscodeVersion !== 'string' || !VSCODE_VERSION.test(runtime.vscodeVersion)) {
+    failures.push('vscodeVersion must look like x.y.z');
   }
-  if (typeof runtime.nodeVersion !== 'string' || !/^\d+\./.test(runtime.nodeVersion)) {
-    failures.push('nodeVersion required');
+  if (typeof runtime.nodeVersion !== 'string' || !NODE_VERSION.test(runtime.nodeVersion)) {
+    failures.push('nodeVersion must look like x.y.z');
   }
   if (!Array.isArray(runtime.scenarios)) {
     failures.push('scenarios must be an array');
     return failures;
+  }
+  if (runtime.scenarios.length !== PHASE5_SCENARIO_IDS.length) {
+    failures.push(
+      `scenarios must contain exactly ${PHASE5_SCENARIO_IDS.length} entries for ${runtime.runtimeClass}`,
+    );
   }
   const ids = runtime.scenarios.map((s) => s?.scenarioId);
   for (const required of PHASE5_SCENARIO_IDS) {
@@ -185,17 +253,16 @@ export function validatePhase5Evidence(evidence, opts = { requirePass: true }) {
   if (!safety || typeof safety !== 'object') {
     failures.push('contentSafety required');
   } else {
-    for (const flag of [
-      'absolutePathsStoredInEvidence',
-      'messageBodiesStoredInEvidence',
-      'sessionIdsStoredInEvidence',
-      'canaryStoredInEvidence',
-    ]) {
+    const keys = Object.keys(safety).sort();
+    if (keys.join(',') !== [...CONTENT_SAFETY_KEYS].sort().join(',')) {
+      failures.push('contentSafety must contain exactly the allowlisted flags');
+    }
+    for (const flag of CONTENT_SAFETY_KEYS) {
       if (safety[flag] !== false) failures.push(`contentSafety.${flag} must be false`);
     }
   }
-  if (typeof evidence.generatedAt !== 'string' || !evidence.generatedAt.includes('T')) {
-    failures.push('generatedAt must be an ISO timestamp string');
+  if (typeof evidence.generatedAt !== 'string' || !ISO_TS.test(evidence.generatedAt)) {
+    failures.push('generatedAt must be an ISO-8601 UTC timestamp');
   }
   if (SENSITIVE.test(JSON.stringify(evidence))) {
     failures.push('evidence contains sensitive/unredacted content');
@@ -205,6 +272,7 @@ export function validatePhase5Evidence(evidence, opts = { requirePass: true }) {
 
 /**
  * Build published evidence from typed runtime results (allowlist only).
+ * Extra/canary-bearing fields on inputs are dropped.
  * @param {object[]} runtimes
  */
 export function buildPhase5Evidence(runtimes) {

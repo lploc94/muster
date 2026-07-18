@@ -238,14 +238,19 @@ export async function run(): Promise<void> {
 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-p5-fault-'));
   const results: ScenarioResult[] = [];
+  const openClients: PackagedDbClient[] = [];
 
-  const makeClient = (opts: { faultCapability?: boolean; faultPlan?: { code: string; operation: string; remaining: number } } = {}) =>
-    new clientMod.DbClient({
+  const makeClient = (opts: { faultCapability?: boolean; faultPlan?: { code: string; operation: string; remaining: number } } = {}) => {
+    const client = new clientMod.DbClient({
       workerPath,
       ...(opts.faultCapability ? { faultCapability: true } : {}),
       ...(opts.faultPlan ? { faultPlan: opts.faultPlan } : {}),
     });
+    openClients.push(client);
+    return client;
+  };
 
+  try {
   // --- corrupt_open ---
   results.push(
     await timed('corrupt_open', async () => {
@@ -360,15 +365,17 @@ export async function run(): Promise<void> {
         await seedMinimal(setup);
         await setup.close();
       }
-      const beforeRev = await (async () => {
-        const c = makeClient();
-        await c.open(dbPath);
-        const row = await c.get<{ r: number }>(
-          'SELECT COALESCE(MAX(revision),0) AS r FROM workspace_revisions',
-        );
-        await c.close();
-        return row?.r ?? 0;
-      })();
+      const baseline = makeClient();
+      await baseline.open(dbPath);
+      const beforeRev =
+        (
+          await baseline.get<{ r: number }>(
+            'SELECT COALESCE(MAX(revision),0) AS r FROM workspace_revisions',
+          )
+        )?.r ?? 0;
+      const beforeWs = await baseline.all<{ id: string }>('SELECT id FROM workspaces ORDER BY id');
+      await baseline.close();
+
       const c = makeClient({
         faultCapability: true,
         faultPlan: { code: 'full', operation: 'transaction', remaining: 1 },
@@ -381,21 +388,42 @@ export async function run(): Promise<void> {
                   VALUES (?,?,?,?,?)`,
             params: ['ws-full', 'k', 'F', 'now', 'now'],
           },
+          {
+            sql: `UPDATE workspace_revisions SET revision = revision + 1 WHERE workspace_id = ?`,
+            params: ['ws-fault'],
+          },
         ]);
         return { resultCode: 'unexpected_success', verdict: 'FAIL' };
       } catch (error) {
         const code = String((error as { code?: string }).code ?? 'unknown');
+        const message = String((error as { message?: string }).message ?? '');
         assert.equal(code, 'full');
-        const row = await c.get<{ r: number }>(
-          'SELECT COALESCE(MAX(revision),0) AS r FROM workspace_revisions',
-        );
-        assert.equal(row?.r ?? 0, beforeRev);
-        const ws = await c.get('SELECT id FROM workspaces WHERE id = ?', ['ws-full']);
-        assert.equal(ws, undefined);
-        return { resultCode: code, verdict: 'PASS', count: beforeRev };
+        assert.ok(!/\/Users\/|SELECT|INSERT|ws-full/i.test(message));
+        assert.ok(!/\/Users\/|SELECT|INSERT|ws-full/i.test(JSON.stringify(error)));
       } finally {
         await c.close().catch(() => undefined);
       }
+
+      const reopened = makeClient();
+      await reopened.open(dbPath);
+      try {
+        const afterRev =
+          (
+            await reopened.get<{ r: number }>(
+              'SELECT COALESCE(MAX(revision),0) AS r FROM workspace_revisions',
+            )
+          )?.r ?? 0;
+        assert.equal(afterRev, beforeRev);
+        const afterWs = await reopened.all<{ id: string }>('SELECT id FROM workspaces ORDER BY id');
+        assert.deepEqual(
+          afterWs.map((r) => r.id),
+          beforeWs.map((r) => r.id),
+        );
+        assert.equal(await reopened.get('SELECT id FROM workspaces WHERE id = ?', ['ws-full']), undefined);
+      } finally {
+        await reopened.close();
+      }
+      return { resultCode: 'full', verdict: 'PASS', count: beforeRev };
     }),
   );
 
@@ -409,6 +437,16 @@ export async function run(): Promise<void> {
         await seedMinimal(setup, 'ws-ro');
         await setup.close();
       }
+      const baseline = makeClient();
+      await baseline.open(dbPath);
+      const beforeRev =
+        (
+          await baseline.get<{ r: number }>(
+            'SELECT COALESCE(MAX(revision),0) AS r FROM workspace_revisions',
+          )
+        )?.r ?? 0;
+      await baseline.close();
+
       const c = makeClient({
         faultCapability: true,
         faultPlan: { code: 'readonly', operation: 'transaction', remaining: 1 },
@@ -421,17 +459,39 @@ export async function run(): Promise<void> {
                   VALUES (?,?,?,?,?)`,
             params: ['ws-ro-fail', 'k', 'R', 'now', 'now'],
           },
+          {
+            sql: `UPDATE workspace_revisions SET revision = revision + 1 WHERE workspace_id = ?`,
+            params: ['ws-ro'],
+          },
         ]);
         return { resultCode: 'unexpected_success', verdict: 'FAIL' };
       } catch (error) {
         const code = String((error as { code?: string }).code ?? 'unknown');
+        const message = String((error as { message?: string }).message ?? '');
         assert.equal(code, 'readonly');
-        const ws = await c.get('SELECT id FROM workspaces WHERE id = ?', ['ws-ro-fail']);
-        assert.equal(ws, undefined);
-        return { resultCode: code, verdict: 'PASS' };
+        assert.ok(!/\/Users\/|SELECT|INSERT|ws-ro-fail/i.test(message));
       } finally {
         await c.close().catch(() => undefined);
       }
+
+      const reopened = makeClient();
+      await reopened.open(dbPath);
+      try {
+        const afterRev =
+          (
+            await reopened.get<{ r: number }>(
+              'SELECT COALESCE(MAX(revision),0) AS r FROM workspace_revisions',
+            )
+          )?.r ?? 0;
+        assert.equal(afterRev, beforeRev);
+        assert.equal(
+          await reopened.get('SELECT id FROM workspaces WHERE id = ?', ['ws-ro-fail']),
+          undefined,
+        );
+      } finally {
+        await reopened.close();
+      }
+      return { resultCode: 'readonly', verdict: 'PASS', count: beforeRev };
     }),
   );
 
@@ -506,27 +566,52 @@ export async function run(): Promise<void> {
        VALUES (?,?,?,?,?,?,?,?)`,
       ['m-wal', 'ws-bak', 't1', 'assistant', 'final', 'WAL_ROW', 'now', '{}'],
     );
-    // Concurrent writer commits during backup window (best-effort second client).
+    await c.run(`UPDATE workspace_revisions SET revision = 2 WHERE workspace_id = ?`, ['ws-bak']);
+    const preRev =
+      (
+        await c.get<{ r: number }>(
+          'SELECT COALESCE(MAX(revision),0) AS r FROM workspace_revisions',
+        )
+      )?.r ?? 0;
+
+    // Confirmed concurrent writer commit (must succeed).
     const writer = makeClient();
     await writer.open(dbPath);
-    const writePromise = writer.run(
+    await writer.run(
       `INSERT INTO messages
         (id, workspace_id, task_id, role, state, content, created_at, payload_json)
        VALUES (?,?,?,?,?,?,?,?)`,
       ['m-concurrent', 'ws-bak', 't1', 'user', 'complete', 'later', 'now', '{}'],
     );
+    await writer.run(`UPDATE workspace_revisions SET revision = 3 WHERE workspace_id = ?`, ['ws-bak']);
+    const postRev =
+      (
+        await writer.get<{ r: number }>(
+          'SELECT COALESCE(MAX(revision),0) AS r FROM workspace_revisions',
+        )
+      )?.r ?? 0;
+    assert.ok(postRev >= preRev);
+
     const start = msNow();
     const meta = await c.backup(backupPath, { overwrite: false });
-    await writePromise.catch(() => undefined);
     const durationMs = msNow() - start;
     const art = reopenReadonly(backupPath);
     try {
       assert.equal(art.applicationId, schema.MUSTER_APPLICATION_ID);
       assert.equal(art.userVersion, schema.SQLITE_SCHEMA_VERSION);
       assert.equal(art.quickCheck, 'ok');
+      // Snapshot is one consistent pre-or-post revision, never mixed garbage.
+      assert.ok(art.revision === preRev || art.revision === postRev);
     } finally {
       art.close();
     }
+    // Source remains writable after backup.
+    await c.run(
+      `INSERT INTO messages
+        (id, workspace_id, task_id, role, state, content, created_at, payload_json)
+       VALUES (?,?,?,?,?,?,?,?)`,
+      ['m-after-backup', 'ws-bak', 't1', 'user', 'complete', 'after', 'now', '{}'],
+    );
     await writer.close().catch(() => undefined);
     await c.close().catch(() => undefined);
     return {
@@ -720,4 +805,8 @@ export async function run(): Promise<void> {
   console.log(
     `[phase5-fault-uat] ok runtime=${runtimeClass} vscode=${vscode.version} node=${process.versions.node} scenarios=${results.length}`,
   );
+  } finally {
+    await Promise.all(openClients.splice(0).map((c) => c.close().catch(() => undefined)));
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 }
