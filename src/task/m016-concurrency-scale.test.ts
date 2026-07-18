@@ -1,9 +1,12 @@
 /**
- * M016-S01 / D037 — named headless flow: m016-concurrency-scale
+ * M016 — named headless flow: m016-concurrency-scale
  *
- * Proves TaskEngine concurrency caps are enforced on a real engine with a
- * live getResourceLimits() getter, via the coordinator delegate_tasks path.
- * This is the S01 demo flow; S02 has its own higher-scale check.
+ * S01 / D037: live getResourceLimits() under a tight→raised per-backend cap
+ *   (workers stay queued under cap 2, then promote when raised to 5).
+ * S03 / SC4: scale proof — ≥30 workers on one backend saturate the shipped
+ *   default maxConcurrentPerBackend (15), not the legacy hard 2.
+ *
+ * S02 keeps its own settings-live-caps flow (raise/lower without recreate).
  */
 import * as fs from 'fs';
 import * as os from 'os';
@@ -256,4 +259,184 @@ describe('m016-concurrency-scale (M016-S01 / D037)', () => {
     expect(finalWorkerTurns).toHaveLength(WORKER_COUNT);
     expect(live).toBe(0);
   });
+
+  it(
+    'SC4: saturates shipped per-backend default (15) with 30+ single-backend workers',
+    async () => {
+    const { store } = makeTempStore();
+    const credentials = new CredentialRegistry();
+
+    let releaseWorkers!: () => void;
+    const workerGate = new Promise<void>((resolve) => {
+      releaseWorkers = resolve;
+    });
+    activeResumes.push(() => releaseWorkers());
+
+    let releaseCoord!: () => void;
+    const coordGate = new Promise<void>((resolve) => {
+      releaseCoord = resolve;
+    });
+    activeResumes.push(() => releaseCoord());
+
+    let live = 0;
+    let peak = 0;
+
+    const workerBackend: Backend = {
+      name: 'grok',
+      capabilities: MCP_CAPS,
+      async *run(_options: RunOptions): AsyncIterable<NormalizedEvent> {
+        live += 1;
+        peak = Math.max(peak, live);
+        try {
+          yield { type: 'sessionStarted', sessionId: `worker-sess-sc4-${live}` };
+          await workerGate;
+          yield { type: 'turnCompleted' };
+        } finally {
+          live -= 1;
+        }
+      },
+    };
+
+    const coordBackend: Backend = {
+      name: 'claude',
+      capabilities: MCP_CAPS,
+      async *run(_options: RunOptions): AsyncIterable<NormalizedEvent> {
+        yield { type: 'sessionStarted', sessionId: 'coord-sess-sc4' };
+        await coordGate;
+        yield { type: 'turnCompleted' };
+      },
+    };
+
+    // SC4: ship-default per-backend cap is the bottleneck. Global/root caps are
+    // high enough that they cannot explain a peak below the per-backend cap.
+    const PER_BACKEND_CAP = DEFAULT_RESOURCE_LIMITS.maxConcurrentPerBackend;
+    expect(PER_BACKEND_CAP).toBe(15);
+
+    const limits: ResourceLimits = {
+      ...DEFAULT_RESOURCE_LIMITS,
+      maxConcurrentPerBackend: PER_BACKEND_CAP,
+      maxConcurrentTurns: 40,
+      maxConcurrentPerRoot: 40,
+    };
+
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: (name) => {
+        if (name === 'claude') return { ...coordBackend, name: 'claude' };
+        return { ...workerBackend, name: name || 'grok' };
+      },
+      credentialRegistry: credentials,
+      bridgePort: 19998,
+      getTaskTypeRegistry: () => TEST_TASK_TYPES,
+      getResourceLimits: () => limits,
+    });
+    activeEngines.push(engine);
+
+    expect(
+      engine.createTask({
+        id: 'coord',
+        goal: 'coordinate SC4 scale workers',
+        backend: 'claude',
+        role: 'coordinator',
+        capabilities: ['create_child', 'wait_child', 'read_subtree'],
+      }).ok,
+    ).toBe(true);
+
+    const started = engine.startTask('coord');
+    expect(started.ok).toBe(true);
+    if (!started.ok) throw new Error('startTask failed');
+    const turnId = started.value.turnId;
+
+    await waitFor(() => store.getFile().turns[turnId]?.status === 'running');
+
+    const token = credentials.issue({
+      rootId: 'coord',
+      callerTaskId: 'coord',
+      turnId,
+      attemptId: 'a0-sc4',
+      allowedActions: new Set([
+        'delegate_task',
+        'delegate_tasks',
+        'create_task',
+        'release_tasks',
+        'complete_task',
+      ]),
+      ttlMs: 60_000,
+    });
+    const ctx = credentials.verify(token)!;
+
+    // BATCH_EXPAND_MAX is 16 — issue two batches that sum to ≥30 workers.
+    const WORKER_COUNT = 30;
+    const BATCH_SIZE = 15;
+    const specs = Array.from({ length: WORKER_COUNT }, (_, i) => ({
+      localId: `sc4-w${i}`,
+      goal: `sc4 worker ${i}`,
+      taskType: 'worker' as const,
+      backend: 'grok',
+      role: 'worker' as const,
+    }));
+
+    for (let batch = 0; batch * BATCH_SIZE < WORKER_COUNT; batch += 1) {
+      const slice = specs.slice(batch * BATCH_SIZE, (batch + 1) * BATCH_SIZE);
+      const delegated = await engine.handleToolCall(ctx, 'delegate_tasks', {
+        kind: 'delegate_tasks',
+        opId: `op-sc4-batch-${batch}`,
+        specs: slice,
+      });
+      if (!delegated.ok) {
+        throw new Error(`delegate_tasks batch ${batch} failed: ${JSON.stringify(delegated)}`);
+      }
+    }
+
+    // Peak must saturate at the configured per-backend default (15), not legacy 2.
+    await waitFor(() => peak >= Math.min(PER_BACKEND_CAP, WORKER_COUNT), 5000);
+    // Settle window so any over-cap promotion would surface.
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(peak).toBeGreaterThan(2);
+    expect(peak).toBeGreaterThanOrEqual(Math.min(PER_BACKEND_CAP, WORKER_COUNT));
+    expect(peak).toBeLessThanOrEqual(PER_BACKEND_CAP);
+
+    const workerTurns = Object.values(store.getFile().turns).filter(
+      (t) => t.taskId !== 'coord' && t.trigger === 'engine',
+    );
+    expect(workerTurns).toHaveLength(WORKER_COUNT);
+    // With 30 workers and cap 15, some must remain queued while peak is held.
+    expect(workerTurns.some((t) => t.status === 'queued')).toBe(true);
+    expect(workerTurns.filter((t) => t.status === 'running').length).toBeLessThanOrEqual(
+      PER_BACKEND_CAP,
+    );
+
+    releaseWorkers();
+    // Promote remaining waves: resume queued workers periodically until drained.
+    const drainDeadline = Date.now() + 10_000;
+    while (Date.now() < drainDeadline) {
+      for (const turn of Object.values(store.getFile().turns)) {
+        if (turn.taskId !== 'coord' && turn.status === 'queued') {
+          engine.resumeQueuedTurn(turn.id);
+        }
+      }
+      const workers = Object.values(store.getFile().turns).filter(
+        (t) => t.taskId !== 'coord' && t.trigger === 'engine',
+      );
+      if (workers.length === WORKER_COUNT && workers.every((t) => t.status === 'succeeded')) {
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    releaseCoord();
+    await engine.whenIdle();
+
+    const finalWorkerTurns = Object.values(store.getFile().turns).filter(
+      (t) => t.taskId !== 'coord' && t.trigger === 'engine',
+    );
+    const nonSucceeded = finalWorkerTurns
+      .filter((t) => t.status !== 'succeeded')
+      .map((t) => ({ id: t.id, taskId: t.taskId, status: t.status }));
+    expect(nonSucceeded).toEqual([]);
+    expect(finalWorkerTurns).toHaveLength(WORKER_COUNT);
+    expect(live).toBe(0);
+    },
+    20_000,
+  );
 });
