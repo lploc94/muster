@@ -12,6 +12,10 @@
 // `session/prompt` promise, and records calls (and their order) for assertions —
 // enough to drive the real `run()` loop and observe every `NormalizedEvent` it
 // emits.
+//
+// Multi-session sticky MCP failure (session A missing complete_task/fail_task
+// while session B streams on the same live process) lives in
+// acp-fault-harness.testkit.ts — keep this single-session harness minimal.
 
 import type { NormalizedEvent, RunOptions } from '../types';
 

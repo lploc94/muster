@@ -4,6 +4,7 @@ import type { Question } from './bridge/ask-bridge';
 import { PermissionBridge } from './bridge/permission-bridge';
 import type { PermissionRequest } from './bridge/permission-bridge';
 import { CredentialRegistry } from './bridge/credentials';
+import { McpReadinessSupervisor } from './bridge/mcp-readiness';
 import { MusterBridgeServer } from './bridge/server';
 import { makeBackend } from './backends/index';
 import {
@@ -109,6 +110,7 @@ let elicitationDebugChannel: vscode.OutputChannel | undefined;
 /** Visible Output channel for picker/handoff diagnostics (View → Output → Muster Debug). */
 let musterDebugChannel: vscode.OutputChannel | undefined;
 let credentialRegistry: CredentialRegistry | undefined;
+let mcpReadiness: McpReadinessSupervisor | undefined;
 let bridgeServer: MusterBridgeServer | undefined;
 let taskEngine: TaskEngine | undefined;
 let taskStore: TaskStore | undefined;
@@ -3055,6 +3057,7 @@ export async function activate(context: vscode.ExtensionContext) {
     setElicitationController(elicitationController);
 
     credentialRegistry = new CredentialRegistry();
+    mcpReadiness = new McpReadinessSupervisor();
     const engineToolHandler = {
       handleToolCall: async (
         ctx: import('./bridge/credentials').CredentialContext,
@@ -3070,8 +3073,12 @@ export async function activate(context: vscode.ExtensionContext) {
     bridgeServer = new MusterBridgeServer({
       credentials: credentialRegistry,
       toolHandler: new PresentationToolRouter(engineToolHandler, presentationManager),
+      onMcpObservation: (obs) => {
+        mcpReadiness?.recordObservation(obs);
+      },
     });
     const { port } = await bridgeServer.listen();
+    mcpReadiness.noteBridgeGeneration(bridgeServer.getGeneration());
 
     taskStore = TaskStore.load({
       filePath: storePath,
@@ -3105,6 +3112,8 @@ export async function activate(context: vscode.ExtensionContext) {
       askBridge,
       credentialRegistry,
       bridgePort: port,
+      mcpReadiness,
+      getBridgeGeneration: () => bridgeServer?.getGeneration() ?? 1,
       getRunLimitMs: () =>
         runLimitMs(vscode.workspace.getConfiguration('muster.execution').get('runLimit')),
       isWorkspaceTrusted: () => vscode.workspace.isTrusted,

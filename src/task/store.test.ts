@@ -425,6 +425,186 @@ describe('TaskStore', () => {
     expect(Object.values(migrated.turns).filter((t) => t.taskId === 'no-turn')).toHaveLength(0);
   });
 
+  it('migrates v6 disposition_repair_pending + queued repair turn → awaiting_parent_seal without repair turns', () => {
+    const now = '2026-07-17T12:00:00.000Z';
+    const child = sampleTask('child-1');
+    child.parentId = 'root-1';
+    child.role = 'worker';
+    child.executionPolicy = { maxTurns: 10, maxAutomaticRetries: 1 };
+    child.executionEpoch = 1;
+    child.attention = {
+      code: 'disposition_repair_pending',
+      message: 'missing disposition; repair turn scheduled',
+      at: now,
+      sourceTurnId: 'turn-child-1',
+    };
+    // No completionCandidate yet — legacy repair path never stored one.
+
+    const root = sampleTask('root-1');
+    root.parentId = null;
+    root.executionPolicy = { maxTurns: 10, maxAutomaticRetries: 1 };
+    root.executionEpoch = 1;
+
+    const v6: TaskStoreFile = {
+      schemaVersion: 6,
+      revision: 9,
+      tasks: { 'root-1': root, 'child-1': child },
+      turns: {
+        'turn-child-1': {
+          id: 'turn-child-1',
+          taskId: 'child-1',
+          sequence: 1,
+          trigger: 'user',
+          status: 'succeeded',
+          inputs: [],
+          executionEpoch: 1,
+          createdAt: now,
+          finishedAt: now,
+        },
+        'turn-child-1-disposition-repair': {
+          id: 'turn-child-1-disposition-repair',
+          taskId: 'child-1',
+          sequence: 2,
+          trigger: 'engine',
+          status: 'queued',
+          inputs: ['msg-repair'],
+          executionEpoch: 1,
+          createdAt: now,
+        },
+      },
+      messages: {
+        'msg-repair': {
+          id: 'msg-repair',
+          taskId: 'child-1',
+          role: 'user',
+          content: 'Please call complete_task or fail_task.',
+          state: 'assigned',
+          createdAt: now,
+          turnId: 'turn-child-1-disposition-repair',
+        },
+      },
+      operations: {},
+      cancelRequests: {},
+      toolCalls: {},
+      reasoning: {},
+      sendReceipts: {},
+    };
+
+    const migrated = migrate(v6, CURRENT_SCHEMA_VERSION);
+    expect(migrated.schemaVersion).toBe(7);
+    expect(CURRENT_SCHEMA_VERSION).toBe(7);
+
+    const migratedChild = migrated.tasks['child-1'];
+    expect(migratedChild?.attention?.code).toBe('awaiting_parent_seal');
+    expect(migratedChild?.attention?.code).not.toBe('disposition_repair_pending');
+    expect(migratedChild?.attention?.sourceTurnId).toBe('turn-child-1');
+    expect(migratedChild?.completionCandidate).toMatchObject({
+      version: 1,
+      sourceTurnId: 'turn-child-1',
+      reason: 'missing_disposition',
+    });
+    expect(migratedChild?.completionCandidate?.summary.length).toBeGreaterThan(0);
+
+    // No scheduled repair turn remains; source turn is preserved.
+    expect(migrated.turns['turn-child-1-disposition-repair']).toBeUndefined();
+    expect(
+      Object.keys(migrated.turns).some((id) => id.endsWith('-disposition-repair')),
+    ).toBe(false);
+    expect(migrated.turns['turn-child-1']?.status).toBe('succeeded');
+    expect(migrated.messages['msg-repair']).toBeUndefined();
+
+    // Root without repair state is untouched.
+    expect(migrated.tasks['root-1']?.attention).toBeUndefined();
+  });
+
+  it('migrates v6 root disposition_repair_pending by clearing attention (no seal request)', () => {
+    const now = '2026-07-17T12:00:00.000Z';
+    const root = sampleTask('root-only');
+    root.parentId = null;
+    root.executionPolicy = { maxTurns: 10, maxAutomaticRetries: 1 };
+    root.executionEpoch = 1;
+    root.attention = {
+      code: 'disposition_repair_pending',
+      message: 'missing disposition; repair turn scheduled',
+      at: now,
+      sourceTurnId: 'turn-root-1',
+    };
+    const v6: TaskStoreFile = {
+      schemaVersion: 6,
+      revision: 2,
+      tasks: { 'root-only': root },
+      turns: {
+        'turn-root-1-disposition-repair': {
+          id: 'turn-root-1-disposition-repair',
+          taskId: 'root-only',
+          sequence: 2,
+          trigger: 'engine',
+          status: 'running',
+          inputs: [],
+          executionEpoch: 1,
+          createdAt: now,
+          startedAt: now,
+        },
+      },
+      messages: {},
+      operations: {},
+      cancelRequests: {},
+      toolCalls: {},
+      reasoning: {},
+      sendReceipts: {},
+    };
+    const migrated = migrate(v6, CURRENT_SCHEMA_VERSION);
+    expect(migrated.tasks['root-only']?.attention).toBeUndefined();
+    expect(migrated.tasks['root-only']?.completionCandidate).toBeUndefined();
+    expect(migrated.turns['turn-root-1-disposition-repair']).toBeUndefined();
+  });
+
+  it('v7 migration preserves finished historical repair turns and non-repair attention', () => {
+    const now = '2026-07-17T12:00:00.000Z';
+    const child = sampleTask('child-hist');
+    child.parentId = 'root-hist';
+    child.role = 'worker';
+    child.executionPolicy = { maxTurns: 10, maxAutomaticRetries: 1 };
+    child.executionEpoch = 1;
+    child.attention = {
+      code: 'awaiting_parent_answer',
+      message: 'waiting for parent answers',
+      at: now,
+      sourceTurnId: 'turn-q',
+    };
+    const v6: TaskStoreFile = {
+      schemaVersion: 6,
+      revision: 3,
+      tasks: { 'child-hist': child },
+      turns: {
+        'turn-old-disposition-repair': {
+          id: 'turn-old-disposition-repair',
+          taskId: 'child-hist',
+          sequence: 3,
+          trigger: 'engine',
+          status: 'succeeded',
+          inputs: [],
+          executionEpoch: 1,
+          createdAt: now,
+          finishedAt: now,
+        },
+      },
+      messages: {},
+      operations: {},
+      cancelRequests: {},
+      toolCalls: {},
+      reasoning: {},
+      sendReceipts: {},
+    };
+    const migrated = migrate(v6, CURRENT_SCHEMA_VERSION);
+    expect(migrated.schemaVersion).toBe(7);
+    // Finished historical repair turns are not re-scheduled; keep transcript history.
+    expect(migrated.turns['turn-old-disposition-repair']?.status).toBe('succeeded');
+    // Unrelated attention codes must not be rewritten.
+    expect(migrated.tasks['child-hist']?.attention?.code).toBe('awaiting_parent_answer');
+    expect(migrated.tasks['child-hist']?.completionCandidate).toBeUndefined();
+  });
+
   it('migrates v5 execution policy, epoch, and freezes legacy live deadlines', () => {
     const defaults = sampleTask('defaults');
     defaults.executionPolicy = {

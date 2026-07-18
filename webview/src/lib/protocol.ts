@@ -140,7 +140,7 @@ export interface TaskSummary {
     running: number;
     open: number;
     terminal: number;
-    repairPending: number;
+    awaitingParentSeal: number;
     needsParentInput: number;
     label: string;
   };
@@ -991,7 +991,7 @@ function isTaskSummary(v: unknown): v is TaskSummary {
         typeof v.childOrchestration.running === 'number' &&
         typeof v.childOrchestration.open === 'number' &&
         typeof v.childOrchestration.terminal === 'number' &&
-        typeof v.childOrchestration.repairPending === 'number' &&
+        typeof v.childOrchestration.awaitingParentSeal === 'number' &&
         typeof v.childOrchestration.needsParentInput === 'number' &&
         isString(v.childOrchestration.label)))
   );

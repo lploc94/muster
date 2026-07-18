@@ -2,6 +2,8 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { CredentialRegistry } from '../bridge/credentials';
+import { McpReadinessSupervisor } from '../bridge/mcp-readiness';
 import type { Backend, BackendCapabilities, NormalizedEvent, RunOptions } from '../types';
 import { TaskEngine, projectPrompt } from './engine';
 import { TaskStore } from './store';
@@ -1261,6 +1263,227 @@ describe('TaskEngine transcript persistence (tool + reasoning + segmentation)', 
   });
 });
 
+// M017 S03 named flow check (D037).
+// Runtime boundary: real TaskEngine stream path → JsonTurnStreamBuffer.apply →
+// flushStreamBeforeTerminal → TaskStore durable commit → terminal emit.
+// Independently executable:
+//   npx vitest run src/task/engine.test.ts -t "TaskEngine stream batching"
+describe('TaskEngine stream batching (TurnStreamPersistence / D035)', () => {
+  it('batches 10k stream deltas with byte-exact transcript and bounded durable commits', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-task-engine-stream-'));
+    tempDirs.push(dir);
+    const filePath = path.join(dir, '.muster-tasks.json');
+    let commitCount = 0;
+    const store = TaskStore.load({
+      filePath,
+      onCommit: () => {
+        commitCount += 1;
+      },
+    });
+
+    // Demo contract: 10k chunks through the real engine stream path.
+    const N = 10_000;
+    const chunks = Array.from({ length: N }, (_, i) => `Δ${i}`);
+    const events: NormalizedEvent[] = [
+      ...chunks.slice(0, 5_000).map((content) => ({
+        type: 'assistantDelta' as const,
+        content,
+        messageId: 'a1',
+      })),
+      { type: 'reasoningDelta', content: 'r-a', messageId: 'r1' },
+      { type: 'reasoningDelta', content: 'r-b', messageId: 'r1' },
+      {
+        type: 'toolStarted',
+        toolCallId: 'tc1',
+        name: 'read_file',
+        kind: 'mcp',
+        input: { path: 'x' },
+      },
+      {
+        type: 'toolUpdated',
+        toolCallId: 'tc1',
+        input: { path: 'y' },
+      },
+      {
+        type: 'toolCompleted',
+        toolCallId: 'tc1',
+        outcome: 'success',
+        output: 'ok',
+      },
+      ...chunks.slice(5_000).map((content) => ({
+        type: 'assistantDelta' as const,
+        content,
+        messageId: 'a2',
+      })),
+      { type: 'turnCompleted' },
+    ];
+    const engine = makeEngine(store, events);
+    engine.createTask({ id: 'task-1', goal: 'g', backend: 'fake' });
+    const sent = engine.send('task-1', 'go');
+    expect(sent.ok).toBe(true);
+    if (!sent.ok || !sent.value.turnId) return;
+    await engine.whenIdle();
+
+    const turnId = sent.value.turnId;
+    const file = store.getFile();
+    const asst = Object.values(file.messages)
+      .filter((m) => m.role === 'assistant' && m.turnId === turnId)
+      .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+    expect(asst).toHaveLength(2);
+    expect(asst[0]?.content).toBe(chunks.slice(0, 5_000).join(''));
+    expect(asst[1]?.content).toBe(chunks.slice(5_000).join(''));
+    expect(file.reasoning?.[turnId]?.content).toBe('r-ar-b');
+
+    const toolKey = `${turnId}:tc1`;
+    const tc = file.toolCalls?.[toolKey];
+    expect(tc?.name).toBe('read_file');
+    expect(tc?.status).toBe('success');
+    expect(tc?.input).toEqual({ path: 'y' });
+    expect(tc?.output).toBe('ok');
+
+    // buildTranscript reconstructs interleaving: user, asst, reasoning, tool, asst
+    // (reasoning is turn-scoped and may sort relative to first assistant by order).
+    const transcript = buildTranscript(file, 'task-1');
+    const kinds = transcript.map((t) => t.kind);
+    expect(kinds).toContain('assistant');
+    expect(kinds).toContain('tool');
+    expect(kinds).toContain('reasoning');
+    const assistantTexts = transcript
+      .filter((t) => t.kind === 'assistant')
+      .map((t) => t.content as string);
+    expect(assistantTexts).toEqual([
+      chunks.slice(0, 5_000).join(''),
+      chunks.slice(5_000).join(''),
+    ]);
+
+    // S01 baseline was ~1.0 commit per chunk. Batched path must stay far below that.
+    const commitPerChunk = commitCount / N;
+    expect(commitPerChunk).toBeLessThan(0.01);
+    // Absolute ceiling: create/send/start/flush/settle overhead, not N stream commits.
+    expect(commitCount).toBeLessThan(40);
+  });
+
+  it('emits turnDone only after stream transcript is durable (flush-before-terminal)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-task-engine-flush-'));
+    tempDirs.push(dir);
+    const filePath = path.join(dir, '.muster-tasks.json');
+    const timeline: string[] = [];
+    let commitCount = 0;
+    const store = TaskStore.load({
+      filePath,
+      onCommit: (file) => {
+        commitCount += 1;
+        const asst = Object.values(file.messages).find((m) => m.role === 'assistant');
+        if (asst?.content.includes('stream-body')) {
+          timeline.push(`durable:${asst.content}`);
+        }
+        // Prefer the task turn that holds assistant content.
+        const relatedTurn = asst?.turnId ? file.turns[asst.turnId] : undefined;
+        if (
+          relatedTurn &&
+          relatedTurn.status !== 'running' &&
+          relatedTurn.status !== 'waiting_user' &&
+          relatedTurn.status !== 'queued'
+        ) {
+          timeline.push(`settled:${relatedTurn.status}`);
+        }
+      },
+    });
+
+    const events: NormalizedEvent[] = [
+      { type: 'assistantDelta', content: 'stream-body', messageId: 'a1' },
+      { type: 'assistantDelta', content: '-part2', messageId: 'a1' },
+      { type: 'turnCompleted' },
+    ];
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => scriptedBackend(events),
+      clock: () => '2026-07-06T12:00:00.000Z',
+      emit: (e) => {
+        if (e.type === 'turnDone' || e.type === 'turnError') {
+          timeline.push(e.type);
+        }
+      },
+    });
+    engine.createTask({ id: 'task-1', goal: 'g', backend: 'fake' });
+    const sent = engine.send('task-1', 'go');
+    expect(sent.ok).toBe(true);
+    if (!sent.ok || !sent.value.turnId) return;
+    await engine.whenIdle();
+
+    const durableIdx = timeline.findIndex((e) => e.startsWith('durable:stream-body'));
+    const terminalIdx = timeline.findIndex((e) => e === 'turnDone' || e === 'turnError');
+    expect(durableIdx).toBeGreaterThanOrEqual(0);
+    expect(terminalIdx).toBeGreaterThan(durableIdx);
+    // Transcript must be durable before terminal emit; settle may share the same commit
+    // window but must not precede durable content.
+    expect(timeline[durableIdx]).toBe('durable:stream-body-part2');
+    expect(store.getFile().messages[`${sent.value.turnId}:0`]?.content).toBe('stream-body-part2');
+    expect(commitCount).toBeGreaterThan(0);
+    expect(timeline).toContain('turnDone');
+    expect(timeline).not.toContain('turnError');
+  });
+
+  it('failed flush settles turnError without partial durable assistant content', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-task-engine-flush-fail-'));
+    tempDirs.push(dir);
+    const filePath = path.join(dir, '.muster-tasks.json');
+    const timeline: string[] = [];
+    const store = TaskStore.load({ filePath });
+
+    // Inject a flush failure: reject any commit that would persist assistant stream content.
+    // Create/send/start still succeed (user + turn only). The terminal flush is the first
+    // commit that materializes assistant messages, so it fails atomically.
+    const originalCommit = store.commit.bind(store);
+    store.commit = ((apply) =>
+      originalCommit((draft) => {
+        const result = apply(draft);
+        if (!result.ok) return result;
+        const hasAssistant = Object.values(draft.messages).some((m) => m.role === 'assistant');
+        if (hasAssistant) {
+          return { ok: false, reason: 'injected flush failure' };
+        }
+        return result;
+      })) as typeof store.commit;
+
+    const events: NormalizedEvent[] = [
+      { type: 'assistantDelta', content: 'should-not-land', messageId: 'a1' },
+      { type: 'assistantDelta', content: '-part2', messageId: 'a1' },
+      { type: 'turnCompleted' },
+    ];
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => scriptedBackend(events),
+      clock: () => '2026-07-06T12:00:00.000Z',
+      emit: (e) => {
+        if (e.type === 'turnDone' || e.type === 'turnError') {
+          timeline.push(
+            e.type === 'turnError' ? `turnError:${e.message}` : e.type,
+          );
+        }
+      },
+    });
+    engine.createTask({ id: 'task-1', goal: 'g', backend: 'fake' });
+    const sent = engine.send('task-1', 'go');
+    expect(sent.ok).toBe(true);
+    if (!sent.ok || !sent.value.turnId) return;
+    await engine.whenIdle();
+
+    const turnId = sent.value.turnId;
+    const file = store.getFile();
+    // Atomic: no partial assistant content on disk after failed flush.
+    const asst = Object.values(file.messages).filter(
+      (m) => m.role === 'assistant' && m.turnId === turnId,
+    );
+    expect(asst).toHaveLength(0);
+    expect(file.turns[turnId]?.status).toBe('failed');
+    expect(timeline.some((e) => e.startsWith('turnError:'))).toBe(true);
+    expect(timeline).not.toContain('turnDone');
+    // Failure message surfaces the flush rejection detail.
+    expect(timeline.find((e) => e.startsWith('turnError:'))).toContain('injected flush failure');
+  });
+});
+
 describe('TaskEngine workspace cwd', () => {
   it('persists a task cwd and passes it to the turn RunOptions', async () => {
     const { filePath, store } = makeTempStore();
@@ -2235,5 +2458,65 @@ describe('TaskEngine runtime switch v2', () => {
     expect(store.getTask('epoch-fence')?.committedSessionId).toBeUndefined();
     expect(Object.values(store.getFile().turns)[0]?.status).toBe('interrupted');
     expect(JSON.stringify(store.getFile().messages)).not.toContain('late source text');
+  });
+});
+
+describe('MCP readiness supervisor and bridge instrumentation (M017-S04 / D037)', () => {
+  it('onBeforePrompt does not mark prompt_outstanding when supervisor is not ready', async () => {
+    const { store } = makeTempStore();
+    const credentials = new CredentialRegistry();
+    const mcpReadiness = new McpReadinessSupervisor();
+    let onBeforePromptThrew = false;
+    const engine = TaskEngine.load({
+      store,
+      makeBackend: () => scriptedBackend([], MCP_CAPS),
+      runTurn: async function* (_backend: Backend, options: RunOptions) {
+        try {
+          await options.onBeforePrompt?.();
+        } catch (error) {
+          onBeforePromptThrew = true;
+          const message = error instanceof Error ? error.message : String(error);
+          expect(message).toMatch(/mcp readiness not ready/);
+          throw error;
+        }
+        yield { type: 'sessionStarted', sessionId: 'should-not-reach' };
+        yield { type: 'turnCompleted' };
+      },
+      credentialRegistry: credentials,
+      bridgePort: 9,
+      mcpReadiness,
+      getBridgeGeneration: () => 1,
+      clock: () => '2026-07-17T12:00:00.000Z',
+    });
+
+    const created = engine.createTask({
+      id: 'ready-gate',
+      goal: 'prove readiness gate',
+      backend: 'fake',
+      executionPolicy: {
+        maxTurns: 4,
+        maxAutomaticRetries: 0,
+        turnTimeoutMs: 60_000,
+        taskTimeoutMs: 300_000,
+      },
+    });
+    expect(created.ok).toBe(true);
+    store.commit((draft) => {
+      draft.tasks['ready-gate'] = {
+        ...draft.tasks['ready-gate']!,
+        releaseState: 'released',
+      };
+      return { ok: true };
+    });
+
+    expect(engine.send('ready-gate', 'start').ok).toBe(true);
+    await engine.whenIdle();
+
+    expect(onBeforePromptThrew).toBe(true);
+    const turns = Object.values(store.getFile().turns);
+    expect(turns.length).toBeGreaterThan(0);
+    for (const turn of turns) {
+      expect(turn.dispatchPhase).not.toBe('prompt_outstanding');
+    }
   });
 });

@@ -211,6 +211,7 @@ describe('engine graph orchestration', () => {
       rootId: 'root',
       callerTaskId: 'root',
       turnId: started.value!.turnId,
+      attemptId: 'a0',
       allowedActions: new Set(['complete_task', 'complete_task']),
       ttlMs: 60_000,
     });
@@ -238,6 +239,7 @@ describe('engine graph orchestration', () => {
       rootId: 'coord',
       callerTaskId: 'coord',
       turnId: started.value!.turnId,
+      attemptId: 'a0',
       allowedActions: new Set([
         'create_task',
         'delegate_task',
@@ -360,6 +362,7 @@ describe('engine graph orchestration', () => {
       rootId: 'coord',
       callerTaskId: 'coord',
       turnId: started.value.turnId,
+      attemptId: 'a0',
       allowedActions: new Set(['delegate_task', 'complete_task']),
       ttlMs: 60_000,
     });
@@ -393,6 +396,7 @@ describe('engine graph orchestration', () => {
       rootId: 'coord',
       callerTaskId: 'coord',
       turnId: started.value.turnId,
+      attemptId: 'a0',
       allowedActions: new Set(['create_task', 'set_task_lifecycle', 'complete_task']),
       ttlMs: 60_000,
     });
@@ -471,6 +475,7 @@ describe('engine graph orchestration', () => {
       rootId: 'coord',
       callerTaskId: 'coord',
       turnId: started.value.turnId,
+      attemptId: 'a0',
       allowedActions: new Set(['create_task', 'set_task_lifecycle']),
       ttlMs: 60_000,
     });
@@ -538,6 +543,7 @@ describe('engine graph orchestration', () => {
       rootId: 'coord',
       callerTaskId: 'coord',
       turnId: started.value.turnId,
+      attemptId: 'a0',
       allowedActions: new Set(['get_host_context', 'complete_task']),
       ttlMs: 60_000,
     });
@@ -588,6 +594,7 @@ describe('engine graph orchestration', () => {
       rootId: 'worker-1',
       callerTaskId: 'worker-1',
       turnId: started.value.turnId,
+      attemptId: 'a0',
       allowedActions: new Set(['get_host_context', 'complete_task']),
       ttlMs: 60_000,
     });
@@ -624,6 +631,7 @@ describe('engine graph orchestration', () => {
       rootId: 'coord',
       callerTaskId: 'coord',
       turnId: started.value.turnId,
+      attemptId: 'a0',
       allowedActions: new Set(['create_task', 'complete_task']),
       ttlMs: 60_000,
     });
@@ -670,6 +678,7 @@ describe('engine graph orchestration', () => {
       rootId: 'coord',
       callerTaskId: 'coord',
       turnId: started.value.turnId,
+      attemptId: 'a0',
       allowedActions: new Set(['create_task']),
       ttlMs: 60_000,
     });
@@ -703,6 +712,7 @@ describe('engine graph orchestration', () => {
       rootId: 'coord',
       callerTaskId: 'coord',
       turnId: started.value.turnId,
+      attemptId: 'a0',
       allowedActions: new Set(['delegate_task', 'complete_task']),
       ttlMs: 60_000,
     });
@@ -760,6 +770,7 @@ describe('engine graph orchestration', () => {
       rootId: 'coord',
       callerTaskId: 'coord',
       turnId: started.value.turnId,
+      attemptId: 'a0',
       allowedActions: new Set(['create_task', 'delegate_task', 'complete_task']),
       ttlMs: 60_000,
     });
@@ -839,6 +850,7 @@ describe('engine graph orchestration', () => {
       rootId: 'coord',
       callerTaskId: 'coord',
       turnId: 'coord-turn',
+      attemptId: 'a0',
       allowedActions: new Set(['delegate_task', 'complete_task']),
       ttlMs: 60_000,
     });
@@ -882,6 +894,7 @@ describe('engine graph orchestration', () => {
       rootId: 'coord-cancel',
       callerTaskId: 'coord-cancel',
       turnId: started.value.turnId,
+      attemptId: 'a0',
       allowedActions: new Set(['cancel_task']),
       ttlMs: 60_000,
     });
@@ -956,6 +969,7 @@ describe('engine graph orchestration', () => {
       rootId: 'coord-owner',
       callerTaskId: 'coord-owner',
       turnId: started.value.turnId,
+      attemptId: 'a0',
       allowedActions: new Set(['cancel_task']),
       ttlMs: 60_000,
     });
@@ -987,6 +1001,7 @@ describe('engine graph orchestration', () => {
       rootId: 'coord',
       callerTaskId: 'coord',
       turnId: started.value!.turnId,
+      attemptId: 'a0',
       allowedActions: new Set(['create_task']),
       ttlMs: 60_000,
     });
@@ -1015,6 +1030,7 @@ describe('engine graph orchestration', () => {
       rootId: 'coord',
       callerTaskId: 'coord',
       turnId: started.value!.turnId,
+      attemptId: 'a0',
       allowedActions: new Set(['create_task']),
       ttlMs: 60_000,
     });
@@ -1083,7 +1099,7 @@ describe('engine graph orchestration', () => {
 
     const deps = { store, credentials } as unknown as GraphEngineDeps;
     const before = Date.now();
-    const token = issueTurnCredential(deps, 'turn-t');
+    const token = issueTurnCredential(deps, 'turn-t', 'a0');
     expect(token).toBeDefined();
     const verified = credentials.verify(token!)!;
     const remainingMs = verified.expiry - before;
@@ -1143,7 +1159,7 @@ describe('engine graph orchestration', () => {
     );
     if (built.mcpConfigPath) fs.rmSync(built.mcpConfigPath, { force: true });
 
-    const token = issueTurnCredential(deps, 'deadline-turn')!;
+    const token = issueTurnCredential(deps, 'deadline-turn', 'a0')!;
     const verified = credentials.verify(token)!;
     expect(verified.expiry).toBeGreaterThanOrEqual(
       deadlineMs + CREDENTIAL_DEADLINE_BUFFER_MS - 10,
@@ -1166,6 +1182,7 @@ describe('engine graph orchestration', () => {
       rootId: 'coord',
       callerTaskId: 'coord',
       turnId: started.value.turnId,
+      attemptId: 'a0',
       allowedActions: new Set(['create_task', 'list_task_types', 'complete_task']),
       ttlMs: 60_000,
     });
@@ -1218,6 +1235,7 @@ describe('engine graph orchestration', () => {
       rootId: 'coord',
       callerTaskId: 'coord',
       turnId: started.value.turnId,
+      attemptId: 'a0',
       allowedActions: new Set(['create_task']),
       ttlMs: 60_000,
     });
@@ -1269,6 +1287,7 @@ describe('engine graph orchestration', () => {
       rootId: 'coord',
       callerTaskId: 'coord',
       turnId: started.value.turnId,
+      attemptId: 'a0',
       allowedActions: new Set(['create_task']),
       ttlMs: 60_000,
     });
@@ -1314,6 +1333,7 @@ describe('engine graph orchestration', () => {
       rootId: 'coord',
       callerTaskId: 'coord',
       turnId: started.value.turnId,
+      attemptId: 'a0',
       allowedActions: new Set(['create_task', 'list_task_types']),
       ttlMs: 60_000,
     });
@@ -1352,6 +1372,7 @@ describe('engine graph batch create/delegate', () => {
       rootId: 'coord',
       callerTaskId: 'coord',
       turnId: started.value.turnId,
+      attemptId: 'a0',
       allowedActions: new Set(actions as import('./capabilities').ToolAction[]),
       ttlMs: 60_000,
     });
@@ -1540,6 +1561,7 @@ describe('engine graph batch create/delegate', () => {
       rootId: 'root',
       callerTaskId: 'root',
       turnId: started.value.turnId,
+      attemptId: 'a0',
       // Worker credential never carries the batch action.
       allowedActions: new Set(['complete_task', 'complete_task']),
       ttlMs: 60_000,
@@ -2102,6 +2124,7 @@ describe('engine graph batch create/delegate', () => {
       rootId: 'coord',
       callerTaskId: childId,
       turnId: childTurn!.id,
+      attemptId: 'a0',
       allowedActions: new Set(['ask_parent']),
       ttlMs: 60_000,
     });
@@ -2199,6 +2222,7 @@ describe('engine graph batch create/delegate', () => {
       rootId: 'root',
       callerTaskId: 'leaf',
       turnId: 'leaf-turn-1',
+      attemptId: 'a0',
       allowedActions: new Set(['ask_parent']),
       ttlMs: 60_000,
     });
@@ -2272,6 +2296,7 @@ describe('engine graph batch create/delegate', () => {
       rootId: 'coord',
       callerTaskId: childId,
       turnId: childTurn!.id,
+      attemptId: 'a0',
       allowedActions: new Set(['ask_parent']),
       ttlMs: 60_000,
     });
@@ -2339,6 +2364,7 @@ describe('engine graph batch create/delegate', () => {
       rootId: 'coord',
       callerTaskId: childId,
       turnId: childTurn.id,
+      attemptId: 'a0',
       allowedActions: new Set(['ask_parent', 'complete_task']),
       ttlMs: 60_000,
     });
@@ -2372,7 +2398,7 @@ describe('engine graph batch create/delegate', () => {
     await engine.whenIdle();
   });
 
-  it('P0.5: child turn without disposition queues one disposition-repair turn', async () => {
+  it('P0.5: child turn without disposition settles once with awaiting_parent_seal (no repair turn)', async () => {
     const { store, engine, credentials, resume } = makeHarness();
     engine.createTask({
       id: 'coord',
@@ -2395,12 +2421,12 @@ describe('engine graph batch create/delegate', () => {
     const ctx = credentials.verify(token)!;
     const del = await engine.handleToolCall(ctx, 'delegate_task', {
       kind: 'delegate_task',
-      opId: 'op-repair-child',
+      opId: 'op-seal-child',
       waitForCompletion: true,
       spec: { goal: 'work', taskType: 'worker' },
     });
     expect(del.ok).toBe(true);
-    const childId = deriveEntityId(turnId, 'op-repair-child', 'task');
+    const childId = deriveEntityId(turnId, 'op-seal-child', 'task');
     const childTurn = Object.values(store.getFile().turns).find(
       (t) => t.taskId === childId && t.sequence === 1,
     );
@@ -2412,26 +2438,38 @@ describe('engine graph batch create/delegate', () => {
     engine.stageDisposition(childTurn!.id, { kind: 'idle' }, 'op-child-idle');
     resume();
     await engine.whenIdle();
+
     const child = store.getTask(childId);
-    // After idle settle: either repair_pending or already advanced to missing after repair.
+    // Single-settle lifecycle decoupling: no model repair turn is enqueued.
     const repairId = `${childTurn!.id}-disposition-repair`;
-    const repairTurn = store.getFile().turns[repairId];
-    // Repair should have been created (at most once).
-    expect(repairTurn).toBeDefined();
-    expect(repairTurn?.id).toBe(repairId);
-    // Parent wait should not have attention-woken solely for repair_pending mid-repair.
-    // (coord may still be running; child lifecycle open)
+    expect(store.getFile().turns[repairId]).toBeUndefined();
+    expect(
+      Object.keys(store.getFile().turns).some((id) => id.endsWith('-disposition-repair')),
+    ).toBe(false);
+
+    // Child stays open with wakeable seal request + durable candidate.
     expect(child?.lifecycle).toBe('open');
-    engine.stageDisposition(turnId, { kind: 'idle' }, 'op-coord-idle');
-    if (repairTurn && (repairTurn.status === 'running' || repairTurn.status === 'queued')) {
-      // Drain repair if still live
-      for (let i = 0; i < 50 && store.getFile().turns[repairId]?.status === 'queued'; i++) {
-        await new Promise((r) => setTimeout(r, 20));
-      }
-      if (store.getFile().turns[repairId]?.status === 'running') {
-        engine.stageDisposition(repairId, { kind: 'idle' }, 'op-repair-idle');
-      }
+    expect(child?.attention?.code).toBe('awaiting_parent_seal');
+    expect(child?.attention?.sourceTurnId).toBe(childTurn!.id);
+    expect(child?.completionCandidate).toMatchObject({
+      version: 1,
+      sourceTurnId: childTurn!.id,
+      reason: 'missing_disposition',
+    });
+    expect(child?.completionCandidate?.summary.length).toBeGreaterThan(0);
+    expect(child?.taskResult).toBeUndefined();
+    expect(child?.sealedBy).toBeUndefined();
+
+    // Parent wait attention-wakes on awaiting_parent_seal (repair_pending exclusion gone).
+    const parent = store.getTask('coord');
+    const wait = parent?.wait;
+    expect(wait?.kind).toBe('children');
+    if (wait?.kind === 'children') {
+      expect(wait.phase).toBe('suspended_attention');
+      expect(wait.attentionContinuationTurnId).toBeTruthy();
     }
+
+    engine.stageDisposition(turnId, { kind: 'idle' }, 'op-coord-idle');
     resume();
     await engine.whenIdle();
   });
@@ -2542,6 +2580,7 @@ describe('engine graph batch create/delegate', () => {
       rootId: 'coord',
       callerTaskId: 'coord',
       turnId: started.value.turnId,
+      attemptId: 'a0',
       allowedActions: new Set(['delegate_task', 'wait_for_tasks', 'get_task_status']),
       ttlMs: 60_000,
     });
@@ -2600,6 +2639,7 @@ describe('engine graph batch create/delegate', () => {
       rootId: 'coord',
       callerTaskId: 'coord',
       turnId: started.value.turnId,
+      attemptId: 'a0',
       allowedActions: new Set(['delegate_task', 'wait_for_tasks']),
       ttlMs: 60_000,
     }))!;

@@ -108,7 +108,8 @@ export interface TaskSummary {
     running: number;
     open: number;
     terminal: number;
-    repairPending: number;
+    /** Children waiting for parent seal after settle-once (no disposition). */
+    awaitingParentSeal: number;
     needsParentInput: number;
     label: string;
   };
@@ -360,7 +361,7 @@ function projectChildOrchestration(
   let running = 0;
   let open = 0;
   let terminal = 0;
-  let repairPending = 0;
+  let awaitingParentSeal = 0;
   let needsParentInput = 0;
   for (const child of children) {
     if (
@@ -377,7 +378,7 @@ function projectChildOrchestration(
       );
       if (live) running += 1;
     }
-    if (child.attention?.code === 'disposition_repair_pending') repairPending += 1;
+    if (child.attention?.code === 'awaiting_parent_seal') awaitingParentSeal += 1;
     if (
       child.pendingParentQuestion &&
       child.pendingParentQuestion.answers === undefined &&
@@ -390,14 +391,14 @@ function projectChildOrchestration(
   if (running > 0) parts.push(`${running} running`);
   if (open - running > 0) parts.push(`${open - running} open`);
   if (terminal > 0) parts.push(`${terminal} done`);
-  if (repairPending > 0) parts.push(`${repairPending} disposition retry`);
+  if (awaitingParentSeal > 0) parts.push(`${awaitingParentSeal} awaiting parent seal`);
   if (needsParentInput > 0) parts.push(`${needsParentInput} need input`);
   return {
     total: children.length,
     running,
     open,
     terminal,
-    repairPending,
+    awaitingParentSeal,
     needsParentInput,
     label: parts.length > 0 ? parts.join(' · ') : `${children.length} children`,
   };

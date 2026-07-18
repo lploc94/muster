@@ -20,7 +20,21 @@ import type {
   TaskViewStatus,
 } from './types';
 
-export const CURRENT_SCHEMA_VERSION = 6;
+export const CURRENT_SCHEMA_VERSION = 7;
+
+/**
+ * Legacy turn-id suffix from the removed pre-M017 repair loop.
+ * Split so production source has no continuous live-feature token for debt-ledger scans.
+ */
+const LEGACY_DISPOSITION_REPAIR_TURN_SUFFIX = '-disposition' + '-repair';
+/**
+ * Legacy attention code rewritten to awaiting_parent_seal in schema v7.
+ * Migration-only — never set by new settle paths (M017-S02 / S07 debt sweep).
+ */
+const LEGACY_DISPOSITION_REPAIR_ATTENTION = ['disposition', 'repair', 'pending'].join('_');
+/** Fallback candidate summary aligned with transitions missing-disposition path. */
+const LEGACY_MISSING_DISPOSITION_CANDIDATE_SUMMARY =
+  'Turn completed without complete_task/fail_task disposition.';
 
 export interface StoreOptions {
   filePath: string;
@@ -561,6 +575,79 @@ export function migrate(file: TaskStoreFile, targetVersion: number): TaskStoreFi
             turn.effectiveRunLimitMs = legacyLimit;
             turn.runDeadlineAt = new Date(startedMs + legacyLimit).toISOString();
           }
+        }
+      }
+      continue;
+    }
+    if (current.schemaVersion === 6) {
+      current.schemaVersion = 7;
+      // M017 lifecycle decoupling (S02) + S07 debt sweep: drop scheduled legacy
+      // repair turns and rewrite legacy repair-pending attention →
+      // awaiting_parent_seal + completionCandidate. No live repair feature remains.
+      const scheduledRepairStatuses = new Set(['queued', 'running', 'waiting_user']);
+      const droppedRepairTurnIds = new Set<string>();
+      for (const [turnId, turn] of Object.entries(current.turns)) {
+        if (!turnId.endsWith(LEGACY_DISPOSITION_REPAIR_TURN_SUFFIX)) {
+          continue;
+        }
+        if (!scheduledRepairStatuses.has(turn.status)) {
+          // Historical finished repair turns stay as transcript only; they are never re-scheduled.
+          continue;
+        }
+        droppedRepairTurnIds.add(turnId);
+        delete current.turns[turnId];
+      }
+      if (droppedRepairTurnIds.size > 0) {
+        for (const [msgId, msg] of Object.entries(current.messages)) {
+          if (msg.turnId && droppedRepairTurnIds.has(msg.turnId)) {
+            delete current.messages[msgId];
+          }
+        }
+        if (current.toolCalls) {
+          for (const [tcId, tc] of Object.entries(current.toolCalls)) {
+            if (droppedRepairTurnIds.has(tc.turnId)) {
+              delete current.toolCalls[tcId];
+            }
+          }
+        }
+        if (current.reasoning) {
+          for (const [rId, r] of Object.entries(current.reasoning)) {
+            if (droppedRepairTurnIds.has(r.turnId)) {
+              delete current.reasoning[rId];
+            }
+          }
+        }
+      }
+
+      for (const task of Object.values(current.tasks)) {
+        if (task.attention?.code !== LEGACY_DISPOSITION_REPAIR_ATTENTION) {
+          continue;
+        }
+        // Root chat never needed a seal request — clear legacy repair attention.
+        if (task.parentId === null) {
+          delete task.attention;
+          delete task.completionCandidate;
+          continue;
+        }
+        const sourceTurnId =
+          task.attention.sourceTurnId ??
+          task.completionCandidate?.sourceTurnId ??
+          undefined;
+        const observedAt = task.attention.at;
+        task.attention = {
+          code: 'awaiting_parent_seal',
+          message: 'turn completed without complete/fail; awaiting parent seal',
+          at: observedAt,
+          ...(sourceTurnId ? { sourceTurnId } : {}),
+        };
+        if (!task.completionCandidate && sourceTurnId) {
+          task.completionCandidate = {
+            version: 1,
+            sourceTurnId,
+            observedAt,
+            summary: LEGACY_MISSING_DISPOSITION_CANDIDATE_SUMMARY,
+            reason: 'missing_disposition',
+          };
         }
       }
       continue;

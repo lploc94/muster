@@ -499,21 +499,47 @@ describe('applySuccessfulTurn', () => {
     }
   });
 
-  it('idle disposition sets disposition_repair_pending (non-wakeable) without sealing', () => {
+  it('idle disposition on child sets awaiting_parent_seal with completionCandidate without sealing', () => {
     const result = applySuccessfulTurn(
       baseTask({ id: 'child-1', parentId: 'root-1' }),
       { ...running, taskId: 'child-1', disposition: { kind: 'idle' } },
+      { now: NOW, candidateSummary: 'child finished work' },
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.next.task.lifecycle).toBe('open');
+      expect(result.next.task.attention?.code).toBe('awaiting_parent_seal');
+      expect(result.next.task.attention?.sourceTurnId).toBe('t1');
+      expect(result.next.task.completionCandidate).toEqual({
+        version: 1,
+        sourceTurnId: 't1',
+        observedAt: NOW,
+        summary: 'child finished work',
+        reason: 'missing_disposition',
+      });
+      expect(result.next.task.taskResult).toBeUndefined();
+      expect(result.next.task.sealedBy).toBeUndefined();
+      expect(result.next.turn.status).toBe('succeeded');
+    }
+  });
+
+  it('idle disposition on root leaves open/idle without attention or completionCandidate', () => {
+    const result = applySuccessfulTurn(
+      baseTask({ parentId: null }),
+      { ...running, disposition: { kind: 'idle' } },
       { now: NOW },
     );
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.next.task.lifecycle).toBe('open');
-      expect(result.next.task.attention?.code).toBe('disposition_repair_pending');
+      expect(result.next.task.attention).toBeUndefined();
+      expect(result.next.task.completionCandidate).toBeUndefined();
       expect(result.next.task.sealedBy).toBeUndefined();
+      expect(result.next.turn.status).toBe('succeeded');
     }
   });
 
-  it('repair turn still omitting disposition sets wakeable missing_disposition', () => {
+  it('legacy disposition-repair turn id also settles to awaiting_parent_seal (no repair special-case)', () => {
     const result = applySuccessfulTurn(
       baseTask({ id: 'child-1', parentId: 'root-1' }),
       {
@@ -526,11 +552,14 @@ describe('applySuccessfulTurn', () => {
     );
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.next.task.attention?.code).toBe('missing_disposition');
+      expect(result.next.task.attention?.code).toBe('awaiting_parent_seal');
+      expect(result.next.task.completionCandidate?.sourceTurnId).toBe('t1-disposition-repair');
+      expect(result.next.task.completionCandidate?.reason).toBe('missing_disposition');
+      expect(result.next.task.completionCandidate?.summary.length).toBeGreaterThan(0);
     }
   });
 
-  it('resolveChildWait does not attention-wake on disposition_repair_pending', () => {
+  it('resolveChildWait attention-wakes on awaiting_parent_seal', () => {
     const parent = baseTask({
       id: 'coord',
       parentId: null,
@@ -550,14 +579,14 @@ describe('applySuccessfulTurn', () => {
       {
         continuationTurnId: 't-wait-continuation',
         now: NOW,
-        childAttention: new Map([['child-1', { code: 'disposition_repair_pending' }]]),
+        childAttention: new Map([['child-1', { code: 'awaiting_parent_seal' }]]),
       },
     );
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.next.turn).toBeUndefined();
+      expect(result.next.turn?.id).toBe('t-wait-attention');
       const wait = result.next.task.wait;
-      expect(wait?.kind === 'children' ? wait.phase : undefined).not.toBe('suspended_attention');
+      expect(wait?.kind === 'children' ? wait.phase : undefined).toBe('suspended_attention');
     }
   });
 
@@ -769,6 +798,24 @@ describe('applyFailedTurn', () => {
       expect(result.next.turn.finishedAt).toBe(NOW);
       expect(result.next.task.lifecycle).toBe('open');
       expect(result.effects).toEqual([{ kind: 'enqueueRetry', ofTurnId: 't1' }]);
+    }
+  });
+
+  it('suppresses generic auto-retry for mcp setup exhaustion even when safe_to_retry', () => {
+    const result = applyFailedTurn(baseTask(), running, {
+      error: 'mcp setup exhausted (attempts_exhausted): missing_evidence after 2 attempts',
+      retryCount: 0,
+      policy: defaultPolicy,
+      onExhausted: 'recover',
+      now: NOW,
+      failureClass: 'safe_to_retry',
+      suppressAutoRetry: true,
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.effects).toEqual([]);
+      expect(result.next.turn.failureClass).toBe('safe_to_retry');
+      expect(result.next.task.lifecycle).toBe('open');
     }
   });
 

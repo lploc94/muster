@@ -547,6 +547,7 @@ describe('W1 single freeze site + host prepare', () => {
       rootId: 'coord',
       callerTaskId: 'coord',
       turnId: started.value.turnId,
+      attemptId: 'a0',
       allowedActions: new Set(['create_task', 'release_tasks', 'complete_task']),
       ttlMs: 60_000,
     });
@@ -642,6 +643,7 @@ describe('W1 single freeze site + host prepare', () => {
       rootId: 'coord',
       callerTaskId: 'coord',
       turnId: started.value.turnId,
+      attemptId: 'a0',
       allowedActions: new Set(['delegate_task', 'complete_task']),
       ttlMs: 60_000,
     });

@@ -114,6 +114,7 @@ describe('MusterBridgeServer auth', () => {
       rootId: 'root-1',
       callerTaskId: 'task-1',
       turnId: 'turn-coordinator',
+      attemptId: 'a0',
       allowedActions: new Set(['upsert_presentation']),
       ttlMs: 60_000,
     });
@@ -156,6 +157,7 @@ describe('MusterBridgeServer auth', () => {
       rootId: 'root-1',
       callerTaskId: 'worker-1',
       turnId: 'turn-worker',
+      attemptId: 'a0',
       allowedActions: new Set(['complete_task']),
       ttlMs: 60_000,
     });
@@ -196,6 +198,7 @@ describe('MusterBridgeServer auth', () => {
       rootId: 'root-1',
       callerTaskId: 'task-1',
       turnId: 'turn-coordinator',
+      attemptId: 'a0',
       allowedActions: new Set(['create_tasks', 'delegate_tasks']),
       ttlMs: 60_000,
     });
@@ -247,6 +250,7 @@ describe('MusterBridgeServer auth', () => {
       rootId: 'root-1',
       callerTaskId: 'worker-1',
       turnId: 'turn-worker',
+      attemptId: 'a0',
       allowedActions: new Set(['complete_task']),
       ttlMs: 60_000,
     });
@@ -279,6 +283,7 @@ describe('MusterBridgeServer auth', () => {
       rootId: 'root-1',
       callerTaskId: 'task-1',
       turnId: 'turn-coordinator',
+      attemptId: 'a0',
       allowedActions: new Set(['create_task', 'create_tasks']),
       ttlMs: 60_000,
     });
@@ -335,6 +340,7 @@ describe('MusterBridgeServer auth', () => {
       rootId: 'r',
       callerTaskId: 't',
       turnId: 'turn-1',
+      attemptId: 'a0',
       allowedActions: new Set(['ask_user']),
       ttlMs: 60_000,
     });
@@ -357,5 +363,144 @@ describe('MusterBridgeServer auth', () => {
     });
     expect(res.status).not.toBe(401);
     expect(res.status).not.toBe(403);
+  });
+});
+
+describe('MusterBridgeServer generation, /health, and observers', () => {
+  let server: MusterBridgeServer | undefined;
+
+  afterEach(async () => {
+    await server?.close();
+    server = undefined;
+  });
+
+  it('GET /health returns status+generation without auth and getGeneration matches', async () => {
+    const credentials = new CredentialRegistry();
+    server = new MusterBridgeServer({
+      credentials,
+      toolHandler: { handleToolCall: async () => ({ ok: true, result: {} }) },
+    });
+    expect(server.getGeneration()).toBe(1);
+    const { port } = await server.listen();
+    expect(server.getGeneration()).toBe(1);
+
+    const res = await fetch(`http://127.0.0.1:${port}/health`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      status: string;
+      generation: number;
+      port?: number;
+    };
+    expect(body).toMatchObject({
+      status: 'ok',
+      generation: 1,
+      port,
+    });
+    // Health must not require Authorization and must not touch TaskStore (no import path).
+    expect(res.headers.get('www-authenticate')).toBeNull();
+  });
+
+  it('close+listen bumps generation and /health reports the new generation', async () => {
+    const credentials = new CredentialRegistry();
+    server = new MusterBridgeServer({
+      credentials,
+      toolHandler: { handleToolCall: async () => ({ ok: true, result: {} }) },
+    });
+    const first = await server.listen();
+    expect(server.getGeneration()).toBe(1);
+    await server.close();
+
+    const second = await server.listen();
+    expect(server.getGeneration()).toBe(2);
+    expect(second.port).toBeGreaterThan(0);
+
+    const res = await fetch(`http://127.0.0.1:${second.port}/health`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { status: string; generation: number; port?: number };
+    expect(body.generation).toBe(2);
+    expect(body.status).toBe('ok');
+    expect(body.port).toBe(second.port);
+    // First port is gone after restart — only assert generation monotonicity vs first listen.
+    void first;
+  });
+
+  it('ListTools fires onMcpObservation with exact credentialed catalog (no token)', async () => {
+    const credentials = new CredentialRegistry();
+    const observations: Array<Record<string, unknown>> = [];
+    server = new MusterBridgeServer({
+      credentials,
+      toolHandler: { handleToolCall: async () => ({ ok: true, result: {} }) },
+      onMcpObservation: (obs) => {
+        observations.push({ ...obs });
+      },
+    });
+    const { port } = await server.listen();
+    const token = credentials.issue({
+      rootId: 'root-1',
+      callerTaskId: 'task-1',
+      turnId: 'turn-obs',
+      attemptId: 'attempt-1',
+      allowedActions: new Set(['complete_task', 'fail_task']),
+      ttlMs: 60_000,
+    });
+    const verified = credentials.verify(token)!;
+    const session = await openMcpSession(port, token);
+    const listed = await session.request('tools/list');
+    const tools = (listed.result as { tools: Array<{ name: string }> }).tools;
+    const names = tools.map((t) => t.name).sort();
+    expect(names).toEqual(['complete_task', 'fail_task']);
+
+    const listObs = observations.filter((o) => o.phase === 'list_tools');
+    expect(listObs.length).toBeGreaterThanOrEqual(1);
+    const last = listObs[listObs.length - 1]!;
+    expect(last).toMatchObject({
+      phase: 'list_tools',
+      credentialId: verified.credentialId,
+      turnId: 'turn-obs',
+      attemptId: 'attempt-1',
+      generation: 1,
+    });
+    expect((last.toolNames as string[]).slice().sort()).toEqual(['complete_task', 'fail_task']);
+    // Never leak bearer token into observation.
+    const serialized = JSON.stringify(last);
+    expect(serialized).not.toContain(token);
+    expect(last).not.toHaveProperty('token');
+  });
+
+  it('concurrent initialize stress does not corrupt the session map', async () => {
+    const credentials = new CredentialRegistry();
+    server = new MusterBridgeServer({
+      credentials,
+      toolHandler: { handleToolCall: async () => ({ ok: true, result: {} }) },
+    });
+    const { port } = await server.listen();
+
+    const openOne = async (turnId: string) => {
+      const token = credentials.issue({
+        rootId: 'root-1',
+        callerTaskId: `task-${turnId}`,
+        turnId,
+        attemptId: 'a0',
+        allowedActions: new Set(['get_task_status']),
+        ttlMs: 60_000,
+      });
+      const session = await openMcpSession(port, token);
+      const listed = await session.request('tools/list');
+      const tools = (listed.result as { tools: Array<{ name: string }> }).tools;
+      expect(tools.map((t) => t.name)).toEqual(['get_task_status']);
+      return session;
+    };
+
+    const results = await Promise.all(
+      Array.from({ length: 8 }, (_, i) => openOne(`turn-race-${i}`)),
+    );
+    expect(results).toHaveLength(8);
+
+    // Existing sessions still work after concurrent setup.
+    for (const session of results) {
+      const listed = await session.request('tools/list');
+      const tools = (listed.result as { tools: Array<{ name: string }> }).tools;
+      expect(tools.map((t) => t.name)).toEqual(['get_task_status']);
+    }
   });
 });

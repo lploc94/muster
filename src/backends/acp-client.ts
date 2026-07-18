@@ -655,8 +655,14 @@ export class AcpClient {
     await this.request('session/set_model', { sessionId, modelId }, timeoutMs);
   }
 
-  /** Best-effort `session/close` — used to release a transient enumeration session. */
+  /**
+   * Best-effort `session/close` — used to release a transient enumeration
+   * session or a failed pre-dispatch MCP setup attempt (M017-S06). Clears local
+   * session sinks for this id only; never tears down the shared ACP process or
+   * sibling sessions.
+   */
   async closeSession(sessionId: string): Promise<void> {
+    this.sessionSinks.delete(sessionId);
     try {
       await this.request('session/close', { sessionId });
     } catch {

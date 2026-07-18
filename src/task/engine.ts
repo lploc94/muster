@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import type { Answers, AskRef } from '../bridge/ask-bridge';
 import { AskBridge } from '../bridge/ask-bridge';
 import { CredentialRegistry } from '../bridge/credentials';
+import type { McpReadinessSupervisor } from '../bridge/mcp-readiness';
 import { runTurn as defaultRunTurn } from '../runner';
 import type { Backend, NormalizedEvent, RunOptions } from '../types';
 import type { TurnTrigger } from './types';
@@ -41,9 +42,11 @@ import {
   processCancelRequests,
   pruneLedgerForTurn,
   projectChildResults,
+  remintTurnMcpForAttempt,
   tryPromoteTurn,
   type GraphEngineDeps,
 } from './engine-graph';
+import { buildFreshSessionRecoveryPromptOrThrow } from './fresh-session-recovery-prompt';
 import {
   decideVerdictRetry,
   failureSignature,
@@ -68,6 +71,7 @@ import {
 import { TASK_ERROR_MAX_BYTES, TASK_RESULT_MAX_BYTES } from './content-limits';
 import { selectCommittedSessionId } from './session-select';
 import { TaskStore } from './store';
+import { createJsonTurnStreamBuffer } from './turn-stream-persistence';
 import {
   applyDependencyTerminal,
   applyFailedTurn,
@@ -132,6 +136,14 @@ export interface TaskEngineConfig {
   askBridge?: AskBridge;
   credentialRegistry?: CredentialRegistry;
   bridgePort?: number;
+  /**
+   * M017-S04 / D037: optional MCP readiness supervisor. When present with
+   * bridgePort>0 + credentialRegistry, onBeforePrompt refuses to mark
+   * prompt_outstanding until evaluate() is ready for the live turnId+attemptId.
+   */
+  mcpReadiness?: McpReadinessSupervisor;
+  /** Current MusterBridgeServer generation (for readiness evaluate). */
+  getBridgeGeneration?: () => number;
   resourceLimits?: ResourceLimits;
   /** Live host ceiling, read only when a queued turn is durably promoted. */
   getRunLimitMs?: () => number;
@@ -618,6 +630,8 @@ export class TaskEngine {
   private readonly askBridge: AskBridge;
   private readonly credentialRegistry?: CredentialRegistry;
   private readonly bridgePort: number;
+  private readonly mcpReadiness?: McpReadinessSupervisor;
+  private readonly getBridgeGeneration?: () => number;
   private readonly resourceLimits: ResourceLimits;
   private readonly getRunLimitMs: () => number;
   private readonly emit?: (e: EngineEvent) => void;
@@ -682,6 +696,8 @@ export class TaskEngine {
     this.askBridge = config.askBridge ?? new AskBridge();
     this.credentialRegistry = config.credentialRegistry;
     this.bridgePort = config.bridgePort ?? 0;
+    this.mcpReadiness = config.mcpReadiness;
+    this.getBridgeGeneration = config.getBridgeGeneration;
     this.resourceLimits = config.resourceLimits ?? DEFAULT_RESOURCE_LIMITS;
     this.getRunLimitMs = config.getRunLimitMs ?? (() => DEFAULT_RUN_LIMIT_MS);
     this.emit = config.emit;
@@ -2412,31 +2428,12 @@ export class TaskEngine {
         if (task?.attention?.code !== 'awaiting_parent_answer') {
           holdQueuedFollowUpsOnFailure(draft, draftTurn.taskId);
         }
-        // Reconstruct missing disposition-repair turns after reload.
-        if (task?.attention?.code === 'disposition_repair_pending' && task.lifecycle === 'open') {
-          const repairId = `${turn.id}-disposition-repair`;
-          if (!draft.turns[repairId]) {
-            // Mark for post-commit enqueue (cannot schedule inside commit).
-            draft.tasks[draftTurn.taskId] = {
-              ...task,
-              attention: {
-                ...task.attention,
-                message: `${task.attention.message}; reload will requeue repair`,
-              },
-            };
-          }
-        }
         return { ok: true };
       });
       this.acceptedOpIds.delete(turn.id);
       this.askBridge.cancelForTurn(turn.id, 'reload interrupt');
       this.dropElicitationWaits(turn.id);
       this.credentialRegistry?.revoke(turn.id);
-      // Re-queue disposition repair for interrupted turns that still need it.
-      const taskAfter = this.store.getFile().tasks[turn.taskId];
-      if (taskAfter?.attention?.code === 'disposition_repair_pending') {
-        this.enqueueDispositionRepair(turn.taskId, turn.id);
-      }
     }
 
     this.reconcileChildWaits({ schedule: false });
@@ -3813,6 +3810,48 @@ export class TaskEngine {
       if (liveHandle) liveHandle.nextOrder = nextOrder;
     }
     let currentAssistantSegment: { storeId: string; sourceMessageId: string } | undefined;
+    // D035/D041: temporary JsonTurnStreamBuffer (dated post-M017 DELETION_GATE);
+    // flush before terminal settle (invariant 9). No legacy repair side path.
+    const streamBuffer = createJsonTurnStreamBuffer(this.store);
+    /** Tool compositeIds seen this turn (buffer + store) so order is allocated once. */
+    const seenToolCalls = new Set<string>();
+    const ensureToolOrder = (compositeId: string): number => {
+      if (seenToolCalls.has(compositeId)) {
+        return this.store.getFile().toolCalls?.[compositeId]?.order ?? 0;
+      }
+      const existing = this.store.getFile().toolCalls?.[compositeId];
+      if (existing) {
+        seenToolCalls.add(compositeId);
+        return existing.order;
+      }
+      const order = nextOrder();
+      seenToolCalls.add(compositeId);
+      return order;
+    };
+    /**
+     * Flush pending stream ops before any terminal settle path.
+     * On failure, settles the turn failed and returns true (terminalSettled).
+     */
+    const flushStreamBeforeTerminal = async (
+      failLabel: string,
+    ): Promise<{ ok: true } | { ok: false; settled: boolean; message: string }> => {
+      const flushed = streamBuffer.flush();
+      if (flushed.ok) {
+        return { ok: true };
+      }
+      const message = flushed.detail ?? failLabel;
+      const settled = await this.settleFailed(
+        turnId,
+        message,
+        observedSessionId,
+        rawOutput,
+        backend,
+      );
+      if (settled) {
+        this.safeEmit({ type: 'turnError', taskId: startedTurn.taskId, turnId, message });
+      }
+      return { ok: false, settled, message };
+    };
     let mcpConfigPath: string | undefined;
 
     try {
@@ -3852,50 +3891,165 @@ export class TaskEngine {
         trigger: currentTurn?.trigger ?? null,
         promptChars: prompt.length,
       });
-      const built = this.bridgePort > 0 && this.credentialRegistry
-        ? buildRunOptionsForTurn(this.graphDeps(), turnId, {
-            prompt,
-            resumeId: taskForDispatch.committedSessionId,
-            signal: abort.signal,
-            // Run the agent in the task's workspace directory so ACP adapters
-            // pass it as session/new|load { cwd } instead of falling back to
-            // process.cwd() (wrong dir in a packaged extension).
-            cwd: taskForDispatch.cwd,
-            model: taskForDispatch.model,
-          })
-        : {
-            options: {
-              prompt,
-              resumeId: taskForDispatch.committedSessionId,
-              signal: abort.signal,
-              cwd: taskForDispatch.cwd,
-              model: taskForDispatch.model,
-            },
-          };
+      // MCP-enabled turns: optional readiness supervisor + multi-attempt mcpSetup
+      // (M017-S06 / D037). prepareAttempt allocates attemptId + remints credentials;
+      // awaitReady polls tools/list evidence before onBeforePrompt / prompt.
+      const mcpEnabled = this.bridgePort > 0 && !!this.credentialRegistry;
+      let attemptId: string | undefined;
+      const baseRun = {
+        prompt,
+        resumeId: taskForDispatch.committedSessionId,
+        signal: abort.signal,
+        // Run the agent in the task's workspace directory so ACP adapters
+        // pass it as session/new|load { cwd } instead of falling back to
+        // process.cwd() (wrong dir in a packaged extension).
+        cwd: taskForDispatch.cwd,
+        model: taskForDispatch.model,
+      };
+      // Provisional attempt mint so mcpServers array exists for in-place remint.
+      if (mcpEnabled) {
+        attemptId = randomBytes(8).toString('hex');
+      }
+      const built = mcpEnabled
+        ? buildRunOptionsForTurn(this.graphDeps(), turnId, baseRun, attemptId!)
+        : { options: { ...baseRun } };
       mcpConfigPath = built.mcpConfigPath;
+      // Ensure mutable shared mcpServers array for prepareAttempt remints.
+      if (mcpEnabled && !built.options.mcpServers) {
+        built.options.mcpServers = [];
+      }
+
+      if (mcpEnabled && this.mcpReadiness) {
+        const readiness = this.mcpReadiness;
+        const expectedTools = capabilitiesFor(taskForDispatch);
+        const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+        built.options.mcpSetup = {
+          maxAttempts: 2,
+          prepareAttempt: async () => {
+            attemptId = randomBytes(8).toString('hex');
+            const generation = this.getBridgeGeneration?.() ?? 1;
+            readiness.beginAttempt({
+              turnId,
+              attemptId,
+              expectedToolNames: expectedTools,
+              bridgeGeneration: generation,
+            });
+            const reminted = remintTurnMcpForAttempt(
+              this.graphDeps(),
+              turnId,
+              attemptId,
+              built.options,
+              mcpConfigPath,
+            );
+            mcpConfigPath = reminted.mcpConfigPath;
+            return {};
+          },
+          awaitReady: async (ctx) => {
+            if (!attemptId) {
+              return {
+                ok: false,
+                code: 'missing_evidence',
+                message: 'no attemptId for awaitReady',
+                retriable: true,
+              };
+            }
+            const generation = this.getBridgeGeneration?.() ?? 1;
+            // Cap per-attempt wait so attempt 2 retains setup budget for
+            // session/new|load + awaitReady (setupDeadlineAt is absolute in runAcpTurn).
+            const totalSetupMs = built.options.setupTimeoutMs ?? 5_000;
+            const budgetMs = Math.max(
+              100,
+              Math.min(Math.floor(totalSetupMs / 3), 5_000),
+            );
+            const deadline = Date.now() + budgetMs;
+            let last = readiness.evaluate(turnId, attemptId, generation);
+            while (!last.ok && Date.now() < deadline) {
+              if (abort.signal.aborted) {
+                return {
+                  ok: false,
+                  code: 'setup_timeout',
+                  message: 'awaitReady aborted',
+                  retriable: false,
+                };
+              }
+              await sleep(25);
+              last = readiness.evaluate(turnId, attemptId, generation);
+              if (last.ok) break;
+            }
+            if (last.ok) return { ok: true };
+            return {
+              ok: false,
+              code: last.code,
+              message: last.message,
+              retriable: true,
+              sticky: ctx.recoveryMode === 'load',
+            };
+          },
+          disposeAttempt: async () => {
+            if (attemptId && this.credentialRegistry) {
+              this.credentialRegistry.revokeAttempt(turnId, attemptId);
+            }
+          },
+          buildFreshSessionPrompt: async (ctx) => {
+            const fileNow = this.store.getFile();
+            const taskNow = fileNow.tasks[taskForDispatch.id];
+            const priorOutcomes: string[] = [];
+            for (const tr of Object.values(fileNow.turns)) {
+              if (tr.taskId !== taskForDispatch.id) continue;
+              if (tr.status === 'succeeded' && tr.disposition?.kind === 'complete') {
+                priorOutcomes.push(String(tr.disposition.result ?? ''));
+              } else if (typeof tr.error === 'string' && tr.error.trim()) {
+                priorOutcomes.push(tr.error);
+              }
+            }
+            return buildFreshSessionRecoveryPromptOrThrow({
+              goal: taskNow?.goal ?? taskForDispatch.goal,
+              brief: taskNow?.brief ?? taskForDispatch.brief,
+              priorOutcomes,
+              originalPrompt: prompt,
+              recoveryReason: ctx.previousFailure?.code ?? 'session_registry_sticky',
+            });
+          },
+        };
+      }
+
       // Phase C: mark prompt_outstanding immediately before side-effecting prompt.
       // Abort the ACP boundary if the durable marker cannot be written.
       built.options = {
         ...built.options,
         onBeforePrompt: async () => {
+          // D037 readiness gate: refuse prompt_outstanding when MCP is not ready.
+          if (this.mcpReadiness && mcpEnabled && attemptId) {
+            const generation = this.getBridgeGeneration?.() ?? 1;
+            const readinessEval = this.mcpReadiness.evaluate(turnId, attemptId, generation);
+            if (!readinessEval.ok) {
+              throw new Error(
+                'mcp readiness not ready: ' + readinessEval.code + ': ' + readinessEval.message,
+              );
+            }
+          }
           const commit = this.store.commit((draft) => {
-            const t = draft.turns[turnId];
-            const currentTask = t ? draft.tasks[t.taskId] : undefined;
-            if (!t || (t.status !== 'running' && t.status !== 'waiting_user')) {
+            const liveTurn = draft.turns[turnId];
+            const currentTask = liveTurn ? draft.tasks[liveTurn.taskId] : undefined;
+            if (!liveTurn || (liveTurn.status !== 'running' && liveTurn.status !== 'waiting_user')) {
               return { ok: false, reason: 'turn is not live for prompt dispatch marker' };
             }
-            if (!currentTask || (t.runtimeEpoch ?? 1) !== (currentTask.runtimeEpoch ?? 1)) {
+            if (!currentTask || (liveTurn.runtimeEpoch ?? 1) !== (currentTask.runtimeEpoch ?? 1)) {
               return { ok: false, reason: 'runtime binding was superseded before prompt dispatch' };
             }
-            if (t.dispatchPhase === 'prompt_outstanding' || t.dispatchPhase === 'terminal_received') {
+            if (
+              liveTurn.dispatchPhase === 'prompt_outstanding' ||
+              liveTurn.dispatchPhase === 'terminal_received'
+            ) {
               return { ok: true };
             }
-            draft.turns[turnId] = { ...t, dispatchPhase: 'prompt_outstanding' };
+            draft.turns[turnId] = { ...liveTurn, dispatchPhase: 'prompt_outstanding' };
             return { ok: true };
           });
           if (!commit.ok) {
             throw new Error(
-              `failed to persist prompt_outstanding dispatch marker: ${commit.detail ?? commit.reason}`,
+              'failed to persist prompt_outstanding dispatch marker: ' +
+                (commit.detail ?? commit.reason),
             );
           }
         },
@@ -3968,45 +4122,16 @@ export class TaskEngine {
             } else {
               segmentId = currentAssistantSegment!.storeId;
             }
-            const commit = this.store.commit((draft) => {
-              const draftTurn = draft.turns[turnId];
-              if (!draftTurn) {
-                return { ok: false, reason: 'turn not found' };
-              }
-              const existing = draft.messages[segmentId];
-              if (!existing) {
-                draft.messages[segmentId] = {
-                  id: segmentId,
-                  taskId: draftTurn.taskId,
-                  role: 'assistant',
-                  content: event.content,
-                  state: 'partial',
-                  createdAt: nowIso(this.clock),
-                  turnId,
-                  order: segmentOrder,
-                };
-              } else {
-                draft.messages[segmentId] = {
-                  ...existing,
-                  content: existing.content + event.content,
-                };
-              }
-              return { ok: true };
+            // Buffer only — durable write happens at flush-before-terminal.
+            streamBuffer.apply({
+              type: 'assistantDelta',
+              turnId,
+              taskId: eventTurn.taskId,
+              segmentId,
+              content: event.content,
+              order: segmentOrder,
+              createdAt: nowIso(this.clock),
             });
-            if (!commit.ok) {
-              const failMessage = commit.detail ?? 'assistant persistence failed';
-              terminalSettled = await this.settleFailed(
-                turnId,
-                failMessage,
-                observedSessionId,
-                rawOutput,
-                backend,
-              );
-              if (terminalSettled) {
-                this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message: failMessage });
-              }
-              break;
-            }
             // Forward a rewritten delta carrying the deterministic segment id.
             this.safeEmit({
               type: 'event',
@@ -4017,187 +4142,75 @@ export class TaskEngine {
             break;
           }
           case 'reasoningDelta': {
-            const commit = this.store.commit((draft) => {
-              const draftTurn = draft.turns[turnId];
-              if (!draftTurn) {
-                return { ok: false, reason: 'turn not found' };
-              }
-              draft.reasoning = draft.reasoning ?? {};
-              const now = nowIso(this.clock);
-              const existing = draft.reasoning[turnId];
-              draft.reasoning[turnId] = existing
-                ? { ...existing, content: existing.content + event.content, updatedAt: now }
-                : {
-                    id: turnId,
-                    taskId: draftTurn.taskId,
-                    turnId,
-                    content: event.content,
-                    createdAt: now,
-                    updatedAt: now,
-                  };
-              return { ok: true };
+            streamBuffer.apply({
+              type: 'reasoningDelta',
+              turnId,
+              taskId: eventTurn.taskId,
+              content: event.content,
+              now: nowIso(this.clock),
             });
-            if (!commit.ok) {
-              const failMessage = commit.detail ?? 'reasoning persistence failed';
-              terminalSettled = await this.settleFailed(
-                turnId,
-                failMessage,
-                observedSessionId,
-                rawOutput,
-                backend,
-              );
-              if (terminalSettled) {
-                this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message: failMessage });
-              }
-              break;
-            }
             break;
           }
           case 'toolStarted': {
             // A tool closes the current assistant segment (matches live commitStreaming).
             currentAssistantSegment = undefined;
             const compositeId = `${turnId}:${event.toolCallId}`;
-            const commit = this.store.commit((draft) => {
-              const draftTurn = draft.turns[turnId];
-              if (!draftTurn) {
-                return { ok: false, reason: 'turn not found' };
-              }
-              draft.toolCalls = draft.toolCalls ?? {};
-              if (!draft.toolCalls[compositeId]) {
-                const now = nowIso(this.clock);
-                draft.toolCalls[compositeId] = {
-                  id: compositeId,
-                  taskId: draftTurn.taskId,
-                  turnId,
-                  toolCallId: event.toolCallId,
-                  order: nextOrder(),
-                  name: event.name,
-                  kind: event.kind,
-                  status: 'running',
-                  input: event.input,
-                  createdAt: now,
-                  updatedAt: now,
-                };
-              }
-              return { ok: true };
+            const order = ensureToolOrder(compositeId);
+            streamBuffer.apply({
+              type: 'toolStarted',
+              turnId,
+              taskId: eventTurn.taskId,
+              compositeId,
+              toolCallId: event.toolCallId,
+              order,
+              name: event.name,
+              kind: event.kind,
+              input: event.input,
+              createdAt: nowIso(this.clock),
             });
-            if (!commit.ok) {
-              const failMessage = commit.detail ?? 'tool persistence failed';
-              terminalSettled = await this.settleFailed(
-                turnId,
-                failMessage,
-                observedSessionId,
-                rawOutput,
-                backend,
-              );
-              if (terminalSettled) {
-                this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message: failMessage });
-              }
-              break;
-            }
             break;
           }
           case 'toolUpdated': {
             const compositeId = `${turnId}:${event.toolCallId}`;
-            const commit = this.store.commit((draft) => {
-              const draftTurn = draft.turns[turnId];
-              if (!draftTurn) {
-                return { ok: false, reason: 'turn not found' };
-              }
-              draft.toolCalls = draft.toolCalls ?? {};
-              const now = nowIso(this.clock);
-              const existing = draft.toolCalls[compositeId];
-              draft.toolCalls[compositeId] = existing
-                ? {
-                    ...existing,
-                    // Adapter `toolUpdated.input` is a full snapshot — replace, not merge.
-                    input: event.input !== undefined ? event.input : existing.input,
-                    updatedAt: now,
-                  }
-                : {
-                    id: compositeId,
-                    taskId: draftTurn.taskId,
-                    turnId,
-                    toolCallId: event.toolCallId,
-                    order: nextOrder(),
-                    name: 'tool',
-                    status: 'running',
-                    input: event.input,
-                    createdAt: now,
-                    updatedAt: now,
-                  };
-              return { ok: true };
+            const order = ensureToolOrder(compositeId);
+            streamBuffer.apply({
+              type: 'toolUpdated',
+              turnId,
+              taskId: eventTurn.taskId,
+              compositeId,
+              toolCallId: event.toolCallId,
+              order,
+              input: event.input,
+              now: nowIso(this.clock),
             });
-            if (!commit.ok) {
-              const failMessage = commit.detail ?? 'tool persistence failed';
-              terminalSettled = await this.settleFailed(
-                turnId,
-                failMessage,
-                observedSessionId,
-                rawOutput,
-                backend,
-              );
-              if (terminalSettled) {
-                this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message: failMessage });
-              }
-              break;
-            }
             break;
           }
           case 'toolCompleted': {
             const compositeId = `${turnId}:${event.toolCallId}`;
-            const outcome = event.outcome;
-            const commit = this.store.commit((draft) => {
-              const draftTurn = draft.turns[turnId];
-              if (!draftTurn) {
-                return { ok: false, reason: 'turn not found' };
-              }
-              draft.toolCalls = draft.toolCalls ?? {};
-              const now = nowIso(this.clock);
-              const existing = draft.toolCalls[compositeId];
-              const base =
-                existing ??
-                {
-                  id: compositeId,
-                  taskId: draftTurn.taskId,
-                  turnId,
-                  toolCallId: event.toolCallId,
-                  order: nextOrder(),
-                  name: 'tool',
-                  status: 'running' as const,
-                  createdAt: now,
-                  updatedAt: now,
-                };
-              draft.toolCalls[compositeId] = {
-                ...base,
-                status: outcome === 'error' ? 'error' : 'success',
-                updatedAt: now,
-                ...(outcome === 'error'
-                  ? { error: event.error, output: undefined }
-                  : { output: event.output, error: undefined }),
-              };
-              return { ok: true };
+            const order = ensureToolOrder(compositeId);
+            streamBuffer.apply({
+              type: 'toolCompleted',
+              turnId,
+              taskId: eventTurn.taskId,
+              compositeId,
+              toolCallId: event.toolCallId,
+              order,
+              outcome: event.outcome,
+              output: event.output,
+              error: event.error,
+              now: nowIso(this.clock),
             });
-            if (!commit.ok) {
-              const failMessage = commit.detail ?? 'tool persistence failed';
-              terminalSettled = await this.settleFailed(
-                turnId,
-                failMessage,
-                observedSessionId,
-                rawOutput,
-                backend,
-              );
-              if (terminalSettled) {
-                this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message: failMessage });
-              }
-              break;
-            }
             break;
           }
           case 'raw':
             rawOutput += `${event.line}\n`;
             break;
           case 'turnCompleted': {
+            const preFlush = await flushStreamBeforeTerminal('stream flush failed before settle');
+            if (!preFlush.ok) {
+              terminalSettled = preFlush.settled;
+              break;
+            }
             const successOutcome = await this.settleSuccess(
               turnId,
               observedSessionId,
@@ -4247,6 +4260,11 @@ export class TaskEngine {
                 : armed && !adapterForced
                   ? 'confirmed'
                   : 'forced';
+              const preFlush = await flushStreamBeforeTerminal('stream flush failed before interrupt settle');
+              if (!preFlush.ok) {
+                terminalSettled = preFlush.settled;
+                break;
+              }
               terminalSettled = await this.settleInterrupted(
                 turnId,
                 observedSessionId,
@@ -4259,22 +4277,33 @@ export class TaskEngine {
               }
             } else {
               const terminalReceived = event.meta?.failureClass === 'terminal_received';
+              const mcpSetupExhausted = event.meta?.mcpSetupCode === 'attempts_exhausted';
               const livePhase = this.store.getFile().turns[turnId]?.dispatchPhase;
               const failureClass =
                 terminalReceived
                   ? 'terminal_received'
                   : livePhase === 'prompt_outstanding'
                     ? 'uncertain'
-                    : livePhase === 'pre_dispatch' || livePhase === undefined
+                    : livePhase === 'pre_dispatch' || livePhase === undefined || mcpSetupExhausted
                       ? 'safe_to_retry'
                       : 'unclassified';
+              const preFlush = await flushStreamBeforeTerminal('stream flush failed before error settle');
+              if (!preFlush.ok) {
+                terminalSettled = preFlush.settled;
+                break;
+              }
               terminalSettled = await this.settleFailed(
                 turnId,
                 event.message,
                 observedSessionId,
                 rawOutput,
                 backend,
-                { terminalReceived, failureClass },
+                {
+                  terminalReceived,
+                  failureClass,
+                  suppressAutoRetry: mcpSetupExhausted,
+                  mcpSetupExhausted,
+                },
               );
               if (terminalSettled) {
                 this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message: event.message });
@@ -4304,34 +4333,49 @@ export class TaskEngine {
       }
 
       if (!terminalSettled) {
-        const runTimedOut = this.store.getFile().turns[turnId]?.termination?.kind === 'run_timeout';
-        terminalSettled = runTimedOut
-          ? await this.settleInterrupted(turnId, observedSessionId, rawOutput, backend, 'run_timeout')
-          : await this.settleFailed(
+        const preFlush = await flushStreamBeforeTerminal(
+          'stream flush failed before missing-terminal settle',
+        );
+        if (!preFlush.ok) {
+          terminalSettled = preFlush.settled;
+        } else {
+          const runTimedOut = this.store.getFile().turns[turnId]?.termination?.kind === 'run_timeout';
+          terminalSettled = runTimedOut
+            ? await this.settleInterrupted(turnId, observedSessionId, rawOutput, backend, 'run_timeout')
+            : await this.settleFailed(
+                turnId,
+                'turn ended without terminal event',
+                observedSessionId,
+                rawOutput,
+                backend,
+              );
+          if (terminalSettled) {
+            this.safeEmit({
+              type: 'turnError',
+              taskId: turn.taskId,
               turnId,
-              'turn ended without terminal event',
-              observedSessionId,
-              rawOutput,
-              backend,
-            );
-        if (terminalSettled) {
-          this.safeEmit({
-            type: 'turnError',
-            taskId: turn.taskId,
-            turnId,
-            message: 'turn ended without terminal event',
-          });
+              message: 'turn ended without terminal event',
+            });
+          }
         }
       }
     } catch (error) {
       if (!terminalSettled) {
-        const message = error instanceof Error ? error.message : String(error);
-        const runTimedOut = this.store.getFile().turns[turnId]?.termination?.kind === 'run_timeout';
-        terminalSettled = runTimedOut
-          ? await this.settleInterrupted(turnId, observedSessionId, rawOutput, backend, 'run_timeout')
-          : await this.settleFailed(turnId, message, observedSessionId, rawOutput, backend);
-        if (terminalSettled) {
-          this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message });
+        // Best-effort flush so partial stream transcript is durable before settle.
+        const preFlush = await flushStreamBeforeTerminal(
+          'stream flush failed before exception settle',
+        );
+        if (!preFlush.ok) {
+          terminalSettled = preFlush.settled;
+        } else {
+          const message = error instanceof Error ? error.message : String(error);
+          const runTimedOut = this.store.getFile().turns[turnId]?.termination?.kind === 'run_timeout';
+          terminalSettled = runTimedOut
+            ? await this.settleInterrupted(turnId, observedSessionId, rawOutput, backend, 'run_timeout')
+            : await this.settleFailed(turnId, message, observedSessionId, rawOutput, backend);
+          if (terminalSettled) {
+            this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message });
+          }
         }
       }
     } finally {
@@ -4484,18 +4528,13 @@ export class TaskEngine {
           lifecycle: task?.lifecycle,
           disposition: turn?.disposition?.kind ?? null,
           sealedBy: task?.sealedBy ?? null,
+          attention: task?.attention?.code ?? null,
+          hasCompletionCandidate: Boolean(task?.completionCandidate),
           resultChars:
             typeof task?.result === 'string'
               ? task.result.length
               : task?.taskResult?.summary?.length ?? 0,
         });
-        if (
-          task?.attention?.code === 'disposition_repair_pending' &&
-          task.lifecycle === 'open' &&
-          !task.pendingParentQuestion
-        ) {
-          this.enqueueDispositionRepair(task.id, turnId);
-        }
         return 'ok';
       }
       if (missingSession) {
@@ -4510,99 +4549,6 @@ export class TaskEngine {
     } finally {
       this.settling.delete(turnId);
     }
-  }
-
-  /**
-   * P0.5: at most one disposition-repair turn after CLI success without complete/fail.
-   * Id derived from settled turn for reload idempotency. Never seals lifecycle.
-   */
-  private enqueueDispositionRepair(taskId: string, settledTurnId: string): void {
-    const repairTurnId = `${settledTurnId}-disposition-repair`;
-    const now = nowIso(this.clock);
-    const commit = this.store.commit((draft) => {
-      if (draft.turns[repairTurnId]) {
-        return { ok: true };
-      }
-      const task = draft.tasks[taskId];
-      if (!task || task.lifecycle !== 'open') {
-        return { ok: true };
-      }
-      if (task.attention?.code !== 'disposition_repair_pending') {
-        return { ok: true };
-      }
-      // Only auto-repair under parent_may_seal_direct (default) for non-root workers.
-      if (task.parentId === null) {
-        return { ok: true };
-      }
-      let rootId = task.id;
-      let walk: string | null = task.parentId;
-      const seen = new Set<string>();
-      while (walk && !seen.has(walk)) {
-        seen.add(walk);
-        rootId = walk;
-        walk = draft.tasks[walk]?.parentId ?? null;
-      }
-      const rootPolicy = draft.tasks[rootId]?.childOrchestrationSeal;
-      if (rootPolicy === 'propose_only') {
-        return { ok: true };
-      }
-      const turnCap = canCreateTurn(draft, taskId, this.resourceLimits);
-      if (!turnCap.ok) {
-        // Cannot repair: escalate to wakeable missing_disposition for parent.
-        draft.tasks[taskId] = {
-          ...task,
-          attention: {
-            code: 'missing_disposition',
-            message: 'disposition repair could not be scheduled',
-            at: now,
-            sourceTurnId: settledTurnId,
-          },
-          revision: task.revision + 1,
-          updatedAt: now,
-        };
-        return { ok: true };
-      }
-      const messageId = randomUUID();
-      const content =
-        'Muster host: previous turn finished without complete_task/fail_task. ' +
-        'Inspect your prior work in this session and stage complete_task (with a short summary) ' +
-        'or fail_task. Do not invent success; do not start new work.';
-      draft.messages[messageId] = {
-        id: messageId,
-        taskId,
-        role: 'user',
-        content,
-        state: 'assigned',
-        createdAt: now,
-        turnId: repairTurnId,
-      };
-      const continued = transitionContinueTask(task, turnsForTask(draft, taskId), {
-        turnId: repairTurnId,
-        now,
-        inputs: [{ kind: 'message', messageId }],
-        trigger: 'engine',
-      });
-      if (!continued.ok) {
-        draft.tasks[taskId] = {
-          ...task,
-          attention: {
-            code: 'missing_disposition',
-            message: 'disposition repair failed to create turn',
-            at: now,
-            sourceTurnId: settledTurnId,
-          },
-          revision: task.revision + 1,
-          updatedAt: now,
-        };
-        return { ok: true };
-      }
-      draft.turns[repairTurnId] = continued.next;
-      return { ok: true };
-    });
-    if (commit.ok && this.store.getFile().turns[repairTurnId]?.status === 'queued') {
-      void this.scheduleTurn(repairTurnId);
-    }
-    this.reconcileChildWaits();
   }
 
   private async settleInterrupted(
@@ -4714,6 +4660,8 @@ export class TaskEngine {
     opts?: {
       terminalReceived?: boolean;
       failureClass?: import('./types').TurnFailureClass;
+      suppressAutoRetry?: boolean;
+      mcpSetupExhausted?: boolean;
     },
   ): Promise<boolean> {
     if (this.settling.has(turnId)) {
@@ -4746,6 +4694,7 @@ export class TaskEngine {
           onExhausted: 'recover',
           now,
           failureClass,
+          suppressAutoRetry: opts?.suppressAutoRetry === true || opts?.mcpSetupExhausted === true,
         });
         if (!result.ok) {
           return result;
@@ -4766,6 +4715,17 @@ export class TaskEngine {
         // Phase B: bind only terminal_received + nonblank observed session id
         // (never speculative candidate from raw output).
         let nextTask = result.next.task;
+        if (opts?.mcpSetupExhausted) {
+          nextTask = {
+            ...nextTask,
+            attention: {
+              code: 'mcp_unavailable',
+              message: errorMessage,
+              at: now,
+              sourceTurnId: turnId,
+            },
+          };
+        }
         if (
           opts?.terminalReceived &&
           !nextTask.committedSessionId &&
@@ -4788,21 +4748,6 @@ export class TaskEngine {
             handoff: {
               ...nextTask.handoff,
               continuation: { status: 'pending' },
-            },
-          };
-        }
-        // Repair turn failure: escalate to wakeable missing_disposition.
-        if (
-          turnId.endsWith('-disposition-repair') &&
-          nextTask.attention?.code === 'disposition_repair_pending'
-        ) {
-          nextTask = {
-            ...nextTask,
-            attention: {
-              code: 'missing_disposition',
-              message: 'disposition repair turn failed',
-              at: now,
-              sourceTurnId: turnId,
             },
           };
         }

@@ -153,9 +153,13 @@ export interface ResolvedInputPin {
 
 export type TaskAttentionCode =
   | 'missing_disposition'
-  /** Non-wakeable: disposition repair in progress (excluded from parent wait needs_attention). */
-  | 'disposition_repair_pending'
-  /** Child is waiting for parent answers (wakeable for parent; exempt from disposition repair). */
+  /**
+   * Child turn settled without complete/fail; parent must seal or continue.
+   * Wakeable via needs_attention. Legacy pre-M017 repair-pending attention is
+   * rewritten here by store schema v7 and is never set by new settle paths.
+   */
+  | 'awaiting_parent_seal'
+  /** Child is waiting for parent answers (wakeable for parent). */
   | 'awaiting_parent_answer'
   /** Parent has a durable child question to answer. */
   | 'child_question'
@@ -167,7 +171,28 @@ export type TaskAttentionCode =
   | 'verdict_missing'
   /** A declared brief skill is known-absent on the task's backend (non-fatal). */
   | 'skill_unavailable'
+  | 'mcp_unavailable'
   | string;
+
+/** Why a completionCandidate was recorded without sealing lifecycle. */
+export type TaskCompletionCandidateReason = 'missing_disposition' | 'mcp_unavailable';
+
+/**
+ * Durable seal request when a child turn ends without complete_task/fail_task.
+ * Never written into taskResult and never auto-seals lifecycle (end_turn ≠ success).
+ */
+export interface TaskCompletionCandidateV1 {
+  version: 1;
+  sourceTurnId: string;
+  observedAt: string;
+  /** Final completed assistant summary when known; else a short structured fallback. */
+  summary: string;
+  reason: TaskCompletionCandidateReason;
+  mcpFailure?: {
+    code: string;
+    attemptCount: number;
+  };
+}
 
 /** Durable child→parent question (P0.5 ask_parent). */
 export interface PendingParentQuestion {
@@ -321,6 +346,11 @@ export interface MusterTask {
   finishedAt?: string;
   /** Non-terminal orchestration attention (schema ≥ 5). Never a lifecycle seal. */
   attention?: TaskAttention;
+  /**
+   * Child seal request after a successful turn omitted complete/fail (M017).
+   * Inspectable durable state for parent orchestration; not a lifecycle seal.
+   */
+  completionCandidate?: TaskCompletionCandidateV1;
   /** Child: durable ask_parent state (schema-compatible optional). */
   pendingParentQuestion?: PendingParentQuestion;
   /**
