@@ -263,7 +263,17 @@ export interface GraphEngineDeps {
   credentials: CredentialRegistry;
   askBridge: AskBridge;
   bridgePort: number;
+  /**
+   * Static ResourceLimits snapshot (tests / backward compat). Prefer
+   * `getResourceLimits` when the host can change caps between tool calls.
+   */
   resourceLimits?: ResourceLimits;
+  /**
+   * M016-S01: live ResourceLimits reader. When present, executeToolCommand
+   * takes one snapshot at the top of the call so all create/promote gates in
+   * that pass share consistent caps, while the next tool call re-reads live.
+   */
+  getResourceLimits?: () => ResourceLimits;
   getRunLimitMs?: () => number;
   /** Bounds used to clamp agent-supplied execution policies. Defaults to DEFAULT_EXECUTION_POLICY_BOUNDS. */
   executionPolicyBounds?: ExecutionPolicyBounds;
@@ -498,7 +508,9 @@ export async function executeToolCommand(
   ctx: { callerTaskId: string; turnId: string; rootId: string; allowedActions?: ReadonlySet<string> },
   command: ToolCommand,
 ): Promise<{ ok: true; result: unknown } | { ok: false; error: string }> {
-  const limits = deps.resourceLimits ?? DEFAULT_RESOURCE_LIMITS;
+  // One ResourceLimits snapshot for this tool-command scheduling pass.
+  const limits =
+    deps.getResourceLimits?.() ?? deps.resourceLimits ?? DEFAULT_RESOURCE_LIMITS;
   const now = nowIso(deps.clock);
   const fingerprint = fingerprintCommand(command);
 

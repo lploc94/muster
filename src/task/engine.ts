@@ -145,6 +145,13 @@ export interface TaskEngineConfig {
   /** Current MusterBridgeServer generation (for readiness evaluate). */
   getBridgeGeneration?: () => number;
   resourceLimits?: ResourceLimits;
+  /**
+   * M016-S01 / D037: live ResourceLimits reader. When provided, every scheduling
+   * decision (promote / create-turn / rescan) re-reads caps so a host setting
+   * change takes effect on the next pass. Falls back to static `resourceLimits`
+   * then DEFAULT_RESOURCE_LIMITS when omitted (backward compatible).
+   */
+  getResourceLimits?: () => ResourceLimits;
   /** Live host ceiling, read only when a queued turn is durably promoted. */
   getRunLimitMs?: () => number;
   emit?: (e: EngineEvent) => void;
@@ -632,7 +639,11 @@ export class TaskEngine {
   private readonly bridgePort: number;
   private readonly mcpReadiness?: McpReadinessSupervisor;
   private readonly getBridgeGeneration?: () => number;
-  private readonly resourceLimits: ResourceLimits;
+  /**
+   * Live ResourceLimits getter (M016-S01). Always a function so scheduling
+   * decision points can re-read host ceilings without reloading the engine.
+   */
+  private readonly getResourceLimits: () => ResourceLimits;
   private readonly getRunLimitMs: () => number;
   private readonly emit?: (e: EngineEvent) => void;
   private readonly isWorkspaceTrusted: () => boolean;
@@ -698,8 +709,23 @@ export class TaskEngine {
     this.bridgePort = config.bridgePort ?? 0;
     this.mcpReadiness = config.mcpReadiness;
     this.getBridgeGeneration = config.getBridgeGeneration;
-    this.getResourceLimits() = config.resourceLimits ?? DEFAULT_RESOURCE_LIMITS;
+    this.getResourceLimits =
+      config.getResourceLimits ??
+      (() => config.resourceLimits ?? DEFAULT_RESOURCE_LIMITS);
     this.getRunLimitMs = config.getRunLimitMs ?? (() => DEFAULT_RUN_LIMIT_MS);
+    // Log effective caps once at engine load for diagnosis (slice verification).
+    const bootLimits = this.getResourceLimits();
+    console.info('[muster][task-orch] resource.limits', {
+      maxConcurrentTurns: bootLimits.maxConcurrentTurns,
+      maxConcurrentPerRoot: bootLimits.maxConcurrentPerRoot,
+      maxConcurrentPerBackend: bootLimits.maxConcurrentPerBackend,
+      maxTurnsPerTask: bootLimits.maxTurnsPerTask,
+      source: config.getResourceLimits
+        ? 'getResourceLimits'
+        : config.resourceLimits
+          ? 'resourceLimits'
+          : 'DEFAULT_RESOURCE_LIMITS',
+    });
     this.emit = config.emit;
     this.isWorkspaceTrusted = config.isWorkspaceTrusted ?? (() => true);
     this.prepareHostEnvironment = config.prepareHostEnvironment;
@@ -796,7 +822,8 @@ export class TaskEngine {
       credentials,
       askBridge: this.askBridge,
       bridgePort: this.bridgePort,
-      resourceLimits: this.getResourceLimits(),
+      // Live passthrough so each tool-command pass re-snapshots caps (M016-S01).
+      getResourceLimits: () => this.getResourceLimits(),
       getRunLimitMs: this.getRunLimitMs,
       clock: this.clock,
       liveRuns: this.liveRuns,
@@ -3449,7 +3476,7 @@ export class TaskEngine {
     const now = nowIso(this.clock);
     // One consistent ResourceLimits snapshot for this execute/promote pass
     // (canPromoteTurn, maxResultBytes projection, later canCreateTurn).
-    const limits = limits;
+    const limits = this.getResourceLimits();
 
     // Every fresh backend session gets the same host/runtime/task bootstrap.
     // After a switch, the first real target turn is also a fresh-session boundary.

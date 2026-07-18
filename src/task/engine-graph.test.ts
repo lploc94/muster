@@ -334,7 +334,10 @@ describe('engine graph orchestration', () => {
     expect(turnsA).toHaveLength(1);
     expect(turnsB).toHaveLength(1);
     expect(turnsA[0]?.trigger).toBe('engine');
-    expect(turnsA[0]?.status).toBe('queued');
+    // Release creates first-turns as queued; fire-and-forget scheduleTurn may
+    // already promote them to running before this assertion (microtask drain
+    // after await handleToolCall). Both prove the first-turn was staged.
+    expect(['queued', 'running']).toContain(turnsA[0]?.status);
 
     // Idempotent same opId.
     const again = await engine.handleToolCall(ctx, 'release_tasks', {
