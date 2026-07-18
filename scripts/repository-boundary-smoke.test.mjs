@@ -239,3 +239,101 @@ test('fails when host module calls node:sqlite.backup', async () => {
     );
   }, /must not call node:sqlite\.backup on the host thread/i);
 });
+
+test('fails when extension introduces telemetry sink for SQLite path', async () => {
+  await withMutatedTree((dir) => {
+    const file = path.join(dir, 'src/extension.ts');
+    const text = readFileSync(path.join(ROOT, 'src/extension.ts'), 'utf8');
+    writeFileSync(file, `${text}\nvoid sendTelemetryEvent('sqlite.open', { path: dbPath });\n`);
+  }, /telemetry\/content sink/i);
+});
+
+test('fails when extension reintroduces legacy JSON store path', async () => {
+  await withMutatedTree((dir) => {
+    const file = path.join(dir, 'src/extension.ts');
+    const text = readFileSync(path.join(ROOT, 'src/extension.ts'), 'utf8');
+    writeFileSync(file, `${text}\nconst legacy = '.muster-tasks.json';\nvoid legacy;\n`);
+  }, /legacy JSON store/i);
+});
+
+test('fails when sqlite debugMuster logs raw error.message without redaction', async () => {
+  await withMutatedTree((dir) => {
+    const file = path.join(dir, 'src/extension.ts');
+    writeFileSync(
+      file,
+      `
+import { DbClient, resolveWorkerPath } from './task/sqlite/client';
+function debugMuster(event, details) {}
+function handleOpen(error) {
+  debugMuster('sqlite.activation.fail_closed', { message: error.message, stack: error.stack });
+}
+const candidate = new DbClient({
+  workerPath: resolveWorkerPath(),
+  onTerminalStorageError: () => undefined,
+});
+void candidate;
+void handleOpen;
+export async function activate() {
+  // Reveal Storage recovery action required by other rules
+  void 'Reveal Storage';
+}
+`,
+    );
+  }, /raw error\.message\/stack into sqlite debugMuster/i);
+});
+
+test('fails when sqlite debugMuster spreads redacted fields plus dbPath', async () => {
+  await withMutatedTree((dir) => {
+    const file = path.join(dir, 'src/extension.ts');
+    const text = readFileSync(path.join(ROOT, 'src/extension.ts'), 'utf8');
+    writeFileSync(
+      file,
+      text.replace(
+        /debugMuster\(\s*'sqlite\.activation\.fail_closed'\s*,\s*redactedDiagnosticLogFields\(diagnostic\)\s*\)/,
+        "debugMuster('sqlite.activation.fail_closed', { ...redactedDiagnosticLogFields(diagnostic), dbPath })",
+      ),
+    );
+  }, /must not log path\/SQL\/params\/workspaceId/i);
+});
+
+test('fails when sqlite debugMuster logs content field', async () => {
+  await withMutatedTree((dir) => {
+    const file = path.join(dir, 'src/extension.ts');
+    const text = readFileSync(path.join(ROOT, 'src/extension.ts'), 'utf8');
+    writeFileSync(
+      file,
+      text.replace(
+        /debugMuster\(\s*'sqlite\.activation\.fail_closed'\s*,\s*redactedDiagnosticLogFields\(diagnostic\)\s*\)/,
+        "debugMuster('sqlite.activation.fail_closed', { content: diagnostic.message })",
+      ),
+    );
+  }, /must not log path\/SQL\/params\/workspaceId.*content/i);
+});
+
+test('fails when appendLine receives raw sql identifier', async () => {
+  await withMutatedTree((dir) => {
+    const file = path.join(dir, 'src/extension.ts');
+    const text = readFileSync(path.join(ROOT, 'src/extension.ts'), 'utf8');
+    writeFileSync(file, `${text}\nensureMusterDebugChannel().appendLine(sql);\n`);
+  }, /appendLine must not emit raw SQLite/i);
+});
+
+test('fails when maintenance commands show fsPath in notifications', async () => {
+  await withMutatedTree((dir) => {
+    const file = path.join(dir, 'src/host/sqlite-maintenance-commands.ts');
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(
+      file,
+      `
+export async function handleBackupDatabaseCommand(deps) {
+  const destination = await deps.showSaveDialog({ defaultFileName: 'x' });
+  await deps.showInformationMessage('saved to ' + destination.fsPath);
+  return { kind: 'success', fileName: 'x', meta: {}, path: destination.fsPath };
+}
+export async function handleDeveloperResetCommand() {}
+export const MUSTER_BACKUP_DATABASE_COMMAND = 'muster.backupDatabase';
+export const MUSTER_DEVELOPER_RESET_COMMAND = 'muster.developerResetGlobalDatabase';
+`,
+    );
+  }, /must not show fsPath|must not include filesystem paths/i);
+});

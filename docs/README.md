@@ -24,6 +24,7 @@ Read in this order when onboarding:
 | [WEBVIEW.md](WEBVIEW.md) | Chat UI, workspace file-drop mention contract, read-only presentation review, queued follow-ups and interrupt & send, task Markdown export, lifecycle, and diagnostics |
 | [SETTINGS.md](SETTINGS.md) | Host-backed Settings domain shell: 4-domain IA (Agents, Execution, Connections, Data) with three actionable tabs rendered (Agents / Execution / Data) and Connections reserved |
 | [SETTINGS-DESIGN.md](SETTINGS-DESIGN.md) | Adopted Settings information architecture, naming, responsive layout, and migration guidance |
+| [SQLITE-STORAGE.md](SQLITE-STORAGE.md) | SQLite global storage: location/scope, WAL, backup vs export, manual restore, developer reset, recovery, privacy |
 
 Operational evidence:
 

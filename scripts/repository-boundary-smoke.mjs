@@ -477,6 +477,119 @@ export async function runRepositoryBoundarySmoke(rootDir = ROOT) {
   } catch (error) {
     failures.push(`Cannot read package.json for fault-control audit: ${error.message}`);
   }
+
+  // P5-W6: privacy sinks — no telemetry/content, no legacy JSON store, no raw SQLite
+  // path/SQL/params/identity in debugMuster/appendLine, maintenance UI, or evidence builders.
+  const privacyScanRels = [
+    'src/extension.ts',
+    'src/host/sqlite-maintenance-commands.ts',
+    'src/host/terminal-storage-lifecycle.ts',
+    'src/task/sqlite/diagnostics.ts',
+    'src/task/sqlite/client.ts',
+    'src/task/sqlite/rpc.ts',
+    'src/task/sqlite/errors.ts',
+  ];
+  const FORBIDDEN_SINK_FIELD =
+    /\b(?:dbPath|globalStorageUri|fsPath|workspaceId|taskId|sessionId|params|sql|stack|error\.message|error\.stack|content|prompt|toolOutput|uri|path)\b/;
+  const RAW_ERROR_SPREAD = /\.\.\.\s*(?:error|err|rawError|exception)\b/;
+  for (const rel of privacyScanRels) {
+    const raw = texts.get(rel);
+    if (raw === undefined) continue;
+    const code = stripComments(raw);
+    if (/\b(?:sendTelemetryEvent|telemetry\.|reportTelemetry|trackEvent)\b/.test(code)) {
+      failures.push(`${rel} must not introduce a telemetry/content sink for SQLite data.`);
+    }
+    if (/\.muster-tasks\.json\b/.test(code) || /\bJsonTaskRepository\b/.test(code) || /\breadEnvelopeForMigration\b/.test(code)) {
+      failures.push(`${rel} must not reintroduce legacy JSON store / importer paths.`);
+    }
+  }
+  const extensionPrivacy = texts.get('src/extension.ts') ?? '';
+  if (extensionPrivacy) {
+    const extCode = stripComments(extensionPrivacy);
+    // Scan each debugMuster('sqlite.…', …) call with a depth-aware paren match so
+    // nested redactedDiagnosticLogFields(...) does not truncate before dbPath/etc.
+    const sqliteDebugCalls = [];
+    const debugRe = /debugMuster\(\s*['"]sqlite\.[^'"]+['"]\s*,/g;
+    let dm;
+    while ((dm = debugRe.exec(extCode)) !== null) {
+      let depth = 1;
+      let i = dm.index + dm[0].length;
+      for (; i < extCode.length && depth > 0; i += 1) {
+        const ch = extCode[i];
+        if (ch === '(') depth += 1;
+        else if (ch === ')') depth -= 1;
+      }
+      sqliteDebugCalls.push(extCode.slice(dm.index, i));
+    }
+    for (const call of sqliteDebugCalls) {
+      if (/\berror\.message\b|\berror\.stack\b/.test(call)) {
+        failures.push('src/extension.ts must not pass raw error.message/stack into sqlite debugMuster calls.');
+      }
+      if (RAW_ERROR_SPREAD.test(call)) {
+        failures.push('src/extension.ts must not spread raw error objects into sqlite debugMuster calls.');
+      }
+      if (FORBIDDEN_SINK_FIELD.test(call)) {
+        failures.push(
+          'src/extension.ts sqlite debugMuster calls must not log path/SQL/params/workspaceId/taskId/sessionId/stack/content fields.',
+        );
+      }
+    }
+    // appendLine arguments that directly reference sensitive identifiers (any channel).
+    const appendCalls = extCode.match(/appendLine\(\s*[^)]+\)/g) ?? [];
+    for (const call of appendCalls) {
+      if (FORBIDDEN_SINK_FIELD.test(call) || RAW_ERROR_SPREAD.test(call)) {
+        // Allow the debugMuster helper that stringifies already-built `line` variables.
+        if (/appendLine\(\s*line\s*\)/.test(call)) continue;
+        failures.push(
+          'src/extension.ts appendLine must not emit raw SQLite path/SQL/params/identity/content fields.',
+        );
+      }
+    }
+  }
+  const maintenanceCmd = texts.get('src/host/sqlite-maintenance-commands.ts') ?? '';
+  if (maintenanceCmd) {
+    const cmdCode = stripComments(maintenanceCmd);
+    // Success UI may show basename only — reject string-building notifications from fsPath.
+    if (
+      /showInformationMessage\(\s*[^)]*fsPath/.test(cmdCode) ||
+      /showErrorMessage\(\s*[^)]*fsPath/.test(cmdCode) ||
+      /showInformationMessage\([^)]*\+\s*[^)]*fsPath/.test(cmdCode) ||
+      /['"`][^'"`]*\$\{[^}]*fsPath/.test(cmdCode)
+    ) {
+      failures.push('src/host/sqlite-maintenance-commands.ts must not show fsPath in notification messages.');
+    }
+    // Success result objects must use fileName, not path.
+    if (/kind:\s*'success'[\s\S]{0,120}\bpath\s*:/.test(cmdCode)) {
+      failures.push('src/host/sqlite-maintenance-commands.ts success results must not include filesystem paths.');
+    }
+  }
+  // Diagnostics helper must stay path/SQL free by construction.
+  const diagText = texts.get('src/task/sqlite/diagnostics.ts') ?? '';
+  if (diagText && !diagText.includes('redactedDiagnosticLogFields')) {
+    failures.push('src/task/sqlite/diagnostics.ts must export redactedDiagnosticLogFields.');
+  }
+  if (diagText && /error\.stack|error\.message/.test(stripComments(diagText)) && !diagText.includes('safeMessageForCode')) {
+    failures.push('src/task/sqlite/diagnostics.ts must not forward raw error.message/stack.');
+  }
+  // Evidence builders (packaged UAT) must declare redaction flags and not assign
+  // raw content/path properties into the published object.
+  try {
+    const twoWindow = await readFile(path.join(rootDir, 'scripts/run-sqlite-two-window-live-uat.mjs'), 'utf8');
+    const evidenceFn = twoWindow.match(/function buildEvidence[\s\S]*?^}/m)?.[0] ?? twoWindow;
+    if (!evidenceFn.includes('contentSafety') || !evidenceFn.includes('absolutePathsStoredInEvidence')) {
+      failures.push('scripts/run-sqlite-two-window-live-uat.mjs buildEvidence must declare contentSafety redaction flags.');
+    }
+    // Property assignments that would publish secrets (not the boolean safety flags).
+    if (/\b(?:messageBody|prompt|toolOutput|stackTrace)\s*:/.test(evidenceFn)) {
+      failures.push('scripts/run-sqlite-two-window-live-uat.mjs buildEvidence must not store content/stack fields.');
+    }
+    if (/\bfsPath\s*:/.test(evidenceFn) || /\babsolutePath\s*:/.test(evidenceFn)) {
+      failures.push('scripts/run-sqlite-two-window-live-uat.mjs buildEvidence must not store path fields.');
+    }
+  } catch {
+    // optional in mutated fixture trees
+  }
+
   } catch (error) {
     failures.push(`Missing entity matrix: docs/plans/sqlite-entity-matrix.vi.md (${error.message})`);
   }

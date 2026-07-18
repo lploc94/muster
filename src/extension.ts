@@ -3067,7 +3067,7 @@ export async function activate(context: vscode.ExtensionContext) {
     sqliteClient = candidate;
     sqliteWorkspaceId = workspace.id;
     terminalLifecycle.markActivationReady();
-    debugMuster('sqlite.registry.ready', { workspaceId: workspace.id });
+    debugMuster('sqlite.registry.ready', { ok: true });
     context.subscriptions.push({
       dispose: () => {
         const current = sqliteClient;

@@ -1055,7 +1055,16 @@ commit — never unlink trio). Peer revision regression → one-shot hard-quiesc
 success, injected failure và two-client/process contention tests xanh; không split-brain;
 hai commit W4/W5 riêng; full gates xanh và worktree sạch.
 
-#### P5-W6 — Privacy/redaction và recovery documentation
+#### P5-W6 — Privacy/redaction và recovery documentation ✅
+
+**Hoàn tất (2026-07-18):** secret-canary audit (`src/task/sqlite/privacy-redaction.test.ts`)
+chứng minh canary chỉ có trong durable conversation content + user backup; vắng mặt trong
+RPC/error/diagnostic/command/change-feed/identity serializers. `docs/SQLITE-STORAGE.md` +
+`scripts/verify-sqlite-storage-docs.test.mjs` khóa location/scope/WAL, command IDs, backup vs
+export, manual restore (all windows closed), reset/recovery, SecretStorage, và “does not
+encrypt SQLite at rest”. Source-boundary mở rộng chặn telemetry sink, legacy JSON path, raw
+debugMuster error/path/id, và fsPath trong maintenance notifications. Production fix: bỏ
+`workspaceId` khỏi `sqlite.registry.ready` debug log.
 
 - Audit toàn bộ SQLite error, backup/reset, command notification, output channel, UAT và
   evidence path theo contract W1. Secret canary chỉ được tồn tại trong durable conversation
