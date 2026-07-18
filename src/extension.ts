@@ -120,6 +120,26 @@ import type { TaskReadPort } from './task/store-port';
 import { SqliteTaskRepository, type TaskRepository } from './task/repository';
 import { DbClient, resolveWorkerPath } from './task/sqlite/client';
 import { probeNodeSqlite } from './task/sqlite/probe';
+import type { SqliteErrorCode } from './task/sqlite/errors';
+import {
+  diagnoseSqliteError,
+  redactedDiagnosticLogFields,
+  recoveryGuidanceFor,
+} from './task/sqlite/diagnostics';
+import { applyTerminalStorageQuiesce } from './host/terminal-storage-coordinator';
+import { createTerminalStorageLifecycle } from './host/terminal-storage-lifecycle';
+
+
+/** Activation fail-closed error: safe message only, no path/SQL/content. */
+class MusterSqliteActivationError extends Error {
+  constructor(
+    readonly code: SqliteErrorCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'MusterSqliteActivationError';
+  }
+}
 import { WorkspaceRegistry } from './task/sqlite/workspace-registry';
 import { resolveWorkspaceIdentity, type WorkspaceContext } from './task/sqlite/workspace-identity';
 import { isTerminalLifecycle } from './task/transitions';
@@ -147,6 +167,8 @@ let workspaceRoot: string | undefined;
 /** SQLite is the only task storage source. */
 let sqliteClient: DbClient | undefined;
 let sqliteWorkspaceId: string | undefined;
+/** Production chat provider (always tracked; UAT may also alias it). */
+let chatProvider: MusterChatProvider | undefined;
 /** Live UAT host surface (non-production Extension Host + MUSTER_UAT_MODE=1). */
 let uatChatProvider: MusterChatProvider | undefined;
 
@@ -1928,33 +1950,37 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       return;
     }
     // Durable outbox before processing so crash/reload can restore the draft.
+    // Full control-flow for queue-only failure path uses durableQueueSend via
+    // runDurableHostSend when we need schedule/ACK isolation; for the main
+    // handleSend we still put outbox first then continue into engine below.
     if (clientRequestId && taskRepository) {
       const now = new Date().toISOString();
+      const entry = {
+        clientRequestId,
+        status: 'pending' as const,
+        ...(data.taskId ? { taskId: data.taskId } : {}),
+        payload: {
+          version: 1 as const,
+          text,
+          ...(typeof data.llmText === 'string' && data.llmText.trim()
+            ? { llmText: data.llmText.trim() }
+            : {}),
+          ...(Array.isArray(data.mentionBindings) ? { mentionBindings: data.mentionBindings } : {}),
+          ...(Array.isArray(data.skills) ? { skills: data.skills } : {}),
+          ...(typeof data.backend === 'string' ? { backend: data.backend } : {}),
+          ...(typeof data.model === 'string' ? { model: data.model } : {}),
+          ...(typeof data.continuationOf === 'string'
+            ? { continuationOf: data.continuationOf }
+            : {}),
+        },
+        createdAt: now,
+        updatedAt: now,
+      };
       try {
         await taskRepository.execute({
           kind: 'putSendOutbox',
           workspaceId: repositoryWorkspaceId(),
-          entry: {
-            clientRequestId,
-            status: 'pending',
-            ...(data.taskId ? { taskId: data.taskId } : {}),
-            payload: {
-              version: 1,
-              text,
-              ...(typeof data.llmText === 'string' && data.llmText.trim()
-                ? { llmText: data.llmText.trim() }
-                : {}),
-              ...(Array.isArray(data.mentionBindings) ? { mentionBindings: data.mentionBindings } : {}),
-              ...(Array.isArray(data.skills) ? { skills: data.skills } : {}),
-              ...(typeof data.backend === 'string' ? { backend: data.backend } : {}),
-              ...(typeof data.model === 'string' ? { model: data.model } : {}),
-              ...(typeof data.continuationOf === 'string'
-                ? { continuationOf: data.continuationOf }
-                : {}),
-            },
-            createdAt: now,
-            updatedAt: now,
-          },
+          entry,
         });
       } catch {
         this.post({
@@ -3021,7 +3047,50 @@ export async function activate(context: vscode.ExtensionContext) {
 
   const wsFolder = vscode.workspace.workspaceFolders?.[0];
   workspaceRoot = wsFolder?.uri.fsPath;
-  const candidate = new DbClient({ workerPath: resolveWorkerPath() });
+  const terminalLifecycle = createTerminalStorageLifecycle({
+    diagnose: diagnoseSqliteError,
+    redactedLogFields: redactedDiagnosticLogFields,
+    log: debugMuster,
+    quiesce: () => {
+      applyTerminalStorageQuiesce({
+        productionProvider: chatProvider,
+        uatProvider: uatChatProvider,
+        engine: taskEngine,
+        clearHostRefs: () => {
+          taskEngine = undefined;
+          taskStore = undefined;
+          taskRepository = undefined;
+          sqliteClient = undefined;
+          sqliteWorkspaceId = undefined;
+        },
+      });
+    },
+    closeDoomed: async (doomed) => {
+      await (doomed as DbClient | undefined)?.close();
+    },
+    showError: async (message, action) => {
+      if (action) {
+        return vscode.window.showErrorMessage(message, action);
+      }
+      void vscode.window.showErrorMessage(message);
+      return undefined;
+    },
+    revealStorage: async () => {
+      await vscode.commands.executeCommand('revealFileInOS', context.globalStorageUri);
+    },
+    guidanceFor: recoveryGuidanceFor,
+  });
+
+  const candidate = new DbClient({
+    workerPath: resolveWorkerPath(),
+    onTerminalStorageError: (err) => {
+      // Capture before synchronous quiesce clears sqliteClient. During open the
+      // activation catch closes `candidate`; at runtime the captured client is
+      // closed by the shared exactly-once report.
+      const doomed = sqliteClient;
+      void terminalLifecycle.handleTerminalSignal(err, doomed);
+    },
+  });
   try {
     fs.mkdirSync(context.globalStorageUri.fsPath, { recursive: true });
     await candidate.open(path.join(context.globalStorageUri.fsPath, 'muster.sqlite3'));
@@ -3031,6 +3100,7 @@ export async function activate(context: vscode.ExtensionContext) {
     );
     sqliteClient = candidate;
     sqliteWorkspaceId = workspace.id;
+    terminalLifecycle.markActivationReady();
     debugMuster('sqlite.registry.ready', { workspaceId: workspace.id });
     context.subscriptions.push({
       dispose: () => {
@@ -3041,15 +3111,20 @@ export async function activate(context: vscode.ExtensionContext) {
       },
     });
   } catch (error) {
-    await candidate.close();
-    const reason = error instanceof Error ? error.message : String(error);
-    debugMuster('sqlite.registry.unavailable', { reason });
-    const message = `Muster could not open its SQLite database: ${reason}`;
-    void vscode.window.showErrorMessage(message);
-    throw new Error(message);
+    // Single activation report: callback may have stored a terminal error first.
+    const reportError = terminalLifecycle.takePendingActivationError() ?? error;
+    await terminalLifecycle.reportOnce(reportError, {
+      operation: 'open',
+      doomed: candidate,
+      showUi: true,
+    });
+    const diagnostic = diagnoseSqliteError(reportError, 'open');
+    // Fail closed: do not start engine/scheduler/poller/writer on partial state.
+    throw new MusterSqliteActivationError(diagnostic.code, diagnostic.message);
   }
 
   const provider = new MusterChatProvider(context.extensionUri);
+  chatProvider = provider;
   if (liveUatEnabled) {
     uatChatProvider = provider;
   }
@@ -3849,6 +3924,12 @@ export async function deactivate(): Promise<void> {
   // provider is module-scoped only via registration; poller is stopped via
   // subscriptions. Clear repository so any late poll exits cleanly.
   taskRepository = undefined;
+  try {
+    chatProvider?.disposeRevisionPoller();
+  } catch {
+    // best-effort
+  }
+  chatProvider = undefined;
   uatChatProvider = undefined;
   presentationManager?.dispose();
   presentationManager = undefined;

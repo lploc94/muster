@@ -33,7 +33,9 @@ function startUncommittedWriter(dbPath: string): { worker: Worker; written: Prom
       try {
         const db = new DatabaseSync(workerData.dbPath);
         db.exec('BEGIN IMMEDIATE TRANSACTION');
-        db.prepare('INSERT INTO crash_probe (id, value) VALUES (?, ?)').run('uncommitted', 'must rollback');
+        db.prepare(
+          'INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at) VALUES (?,?,?,?,?)',
+        ).run('uncommitted', 'uncommitted-key', 'must rollback', 'now', 'now');
         parentPort.postMessage({ kind: 'written' });
         setInterval(() => {}, 60_000);
       } catch (error) {
@@ -80,7 +82,12 @@ describe('SQLite worker/process crash recovery', () => {
     const dbPath = tempDbPath('muster-crash-recovery-');
     const setup = makeClient();
     await setup.open(dbPath);
-    await setup.run('CREATE TABLE crash_probe (id TEXT PRIMARY KEY, value TEXT NOT NULL)');
+    // Use a schema table — extra tables fail fingerprint on reopen (P5-W2).
+    await setup.run(
+      `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
+       VALUES (?,?,?,?,?)`,
+      ['ws-base', 'base', 'Base', 'now', 'now'],
+    );
     await setup.close();
 
     const crash = startUncommittedWriter(dbPath);
@@ -89,7 +96,9 @@ describe('SQLite worker/process crash recovery', () => {
 
     const reopened = makeClient();
     await reopened.open(dbPath);
-    await expect(reopened.get<{ n: number }>('SELECT COUNT(*) AS n FROM crash_probe')).resolves.toEqual({ n: 0 });
+    await expect(
+      reopened.get<{ n: number }>("SELECT COUNT(*) AS n FROM workspaces WHERE id = 'uncommitted'"),
+    ).resolves.toEqual({ n: 0 });
     await expect(reopened.get<{ integrity_check: string }>('PRAGMA integrity_check')).resolves.toEqual({ integrity_check: 'ok' });
     await expect(reopened.get<{ journal_mode: string }>('PRAGMA journal_mode')).resolves.toEqual({ journal_mode: 'wal' });
     expect(await reopened.pragma('user_version')).toBe(SQLITE_SCHEMA_VERSION);

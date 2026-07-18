@@ -17,6 +17,36 @@ export const MUSTER_APPLICATION_ID = 0x4d555354; // 'MUST'
 export const SQLITE_SCHEMA_VERSION = 7;
 
 /**
+ * Required user schema objects for an owned current database (P5-W2).
+ * Bounded preflight checks these names only — not full integrity_check.
+ */
+export const REQUIRED_SCHEMA_TABLES = [
+  'workspaces',
+  'workspace_locations',
+  'tasks',
+  'task_dependencies',
+  'turns',
+  'messages',
+  'reasoning_segments',
+  'tool_calls',
+  'operations',
+  'send_receipts',
+  'workspace_revisions',
+  'change_log',
+  'change_feed_watermarks',
+  'turn_inputs',
+  'session_claims',
+  'resource_claims',
+  'turn_cancel_requests',
+  'runtime_claims',
+  'send_outbox',
+  'presentations',
+  'presentation_operations',
+] as const;
+
+export const REQUIRED_SCHEMA_TRIGGERS = ['trg_send_outbox_capacity'] as const;
+
+/**
  * Production change-feed retention bound (revisions kept after the low watermark).
  * Tests may inject a smaller bound via repository options; production does not
  * depend on test-only global state.

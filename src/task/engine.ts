@@ -78,6 +78,7 @@ import {
   type StreamBatchPayload,
   type StreamFlushResult,
 } from './transcript-stream-batcher';
+import { createTranscriptStreamPersist } from './transcript-stream-persist';
 import {
   applyDependencyTerminal,
   applyFailedTurn,
@@ -469,6 +470,10 @@ export class TaskEngine {
        * confirmed interrupt-and-send settlement (bind + promote).
        */
       interruptArmed?: boolean;
+      /** Cancel-request poll interval — cleared synchronously on terminal quiesce. */
+      cancelPoll?: ReturnType<typeof setInterval>;
+      /** Run-deadline watchdog — cleared synchronously on terminal quiesce. */
+      turnTimer?: ReturnType<typeof setTimeout>;
     }
   >();
   /** Queued turns preserved on reload — start only via resumeQueuedTurn. */
@@ -476,6 +481,8 @@ export class TaskEngine {
   private readonly acceptedOpIds = new Map<string, string>();
   private readonly turnPromises = new Map<string, Promise<void>>();
   private shuttingDown = false;
+  /** Terminal storage latch: zero repository writes after this (distinct from graceful shutdown). */
+  private storageTerminal = false;
   private readonly pendingAskPromises = new Map<string, { promise: Promise<Answers>; fingerprint: string }>();
   private settling = new Set<string>();
   /** Live executeTurn closures used to settle unobserved timer flush failures. */
@@ -527,16 +534,11 @@ export class TaskEngine {
           computeRevision: (c) => this.computeSourceRevision(c),
       }));
     this.streamBatcher = new TranscriptStreamBatcher({
-      persist: async (payload: StreamBatchPayload) => {
-        const result = await this.repository.execute({
-          kind: 'appendTranscriptBatch',
-          workspaceId: this.workspaceId,
-          taskId: payload.taskId,
-          ...(payload.messages ? { messages: payload.messages } : {}),
-          ...(payload.reasoning ? { reasoning: payload.reasoning } : {}),
-        });
-        return { changed: result.changed === true, reason: result.reason };
-      },
+      persist: createTranscriptStreamPersist({
+        repository: this.repository,
+        workspaceId: this.workspaceId,
+        isStorageTerminal: () => this.storageTerminal,
+      }),
       onTimerFlushError: (turnId, message) =>
         this.reportStreamFlushFailure(turnId, message),
     });
@@ -558,6 +560,10 @@ export class TaskEngine {
    * the first barrier.
    */
   async shutdown(): Promise<void> {
+    if (this.storageTerminal) {
+      // Already hard-quiesced for terminal storage — do not flush/settle.
+      return;
+    }
     if (this.shuttingDown) return;
     this.shuttingDown = true;
     let flushError: unknown;
@@ -587,7 +593,65 @@ export class TaskEngine {
     if (flushError) throw flushError;
   }
 
+  /**
+   * Hard quiesce after terminal storage (corrupt / not_a_database / protocol).
+   * Aborts adapters, cancels asks/elicitation, clears timers and stream buffers,
+   * and performs ZERO repository flush/settlement/release/afterTurnSettled writes.
+   * Distinct from {@link shutdown} which is graceful and may write.
+   */
+  quiesceForTerminalStorage(): void {
+    if (this.storageTerminal) return;
+    // Latch first so every subsequent path sees terminal immediately.
+    this.storageTerminal = true;
+    this.shuttingDown = true;
+    for (const handle of this.liveRuns.values()) {
+      if (handle.cancelPoll !== undefined) {
+        clearInterval(handle.cancelPoll);
+        handle.cancelPoll = undefined;
+      }
+      if (handle.turnTimer !== undefined) {
+        clearTimeout(handle.turnTimer);
+        handle.turnTimer = undefined;
+      }
+      try {
+        handle.controller.abort();
+      } catch {
+        // best-effort
+      }
+    }
+    this.liveRuns.clear();
+    this.streamFailureHandlers.clear();
+    this.acceptedOpIds.clear();
+    this.deferredQueuedTurns.clear();
+    this.settling.clear();
+    try {
+      this.streamBatcher.disposeAll();
+    } catch {
+      // best-effort
+    }
+    for (const turnId of [...this.turnPromises.keys()]) {
+      try {
+        this.askBridge.cancelForTurn(turnId, 'storage terminal');
+      } catch {
+        // best-effort
+      }
+      try {
+        this.dropElicitationWaits(turnId);
+      } catch {
+        // best-effort
+      }
+    }
+    this.pendingAskPromises.clear();
+    this.turnPromises.clear();
+  }
+
+  /** True after {@link quiesceForTerminalStorage}. Live paths must skip repository writes. */
+  isStorageTerminal(): boolean {
+    return this.storageTerminal;
+  }
+
   private async reportStreamFlushFailure(turnId: string, message: string): Promise<void> {
+    if (this.storageTerminal) return;
     await this.streamFailureHandlers.get(turnId)?.(message);
   }
 
@@ -618,24 +682,29 @@ export class TaskEngine {
    * instead of leaving a queued turn silent (P5-W1 finding 5).
    */
   private async claimRuntimeTurn(turnId: string, expiresAt: string): Promise<boolean> {
+    if (this.storageTerminal) return false;
     const now = nowIso(this.clock);
     const result = await this.repository.execute({
       kind: 'claimRuntime', workspaceId: this.workspaceId, turnId,
       ownerId: this.runtimeOwnerId, claimedAt: now, heartbeatAt: now, expiresAt,
     });
+    if (this.storageTerminal) return false;
     return result.changed === true;
   }
 
   private async heartbeatRuntimeTurn(turnId: string, expiresAt: string): Promise<boolean> {
+    if (this.storageTerminal) return false;
     const now = nowIso(this.clock);
     const result = await this.repository.execute({
       kind: 'heartbeatRuntime', workspaceId: this.workspaceId, turnId,
       ownerId: this.runtimeOwnerId, heartbeatAt: now, expiresAt,
     });
+    if (this.storageTerminal) return false;
     return result.changed === true;
   }
 
   private async releaseRuntimeTurn(turnId: string): Promise<void> {
+    if (this.storageTerminal) return;
     try {
       await this.repository.execute({
         kind: 'releaseRuntime', workspaceId: this.workspaceId, turnId,
@@ -1091,6 +1160,9 @@ export class TaskEngine {
     /** Phase C idempotent send key. */
     clientRequestId?: string;
   }): Promise<EngineResult<{ taskId: string; messageId: string; turnId: string; clientRequestId?: string }>> {
+    if (this.storageTerminal) {
+      return { ok: false, reason: 'storage terminal' };
+    }
     const trust = this.requireWorkspaceTrusted();
     if (!trust.ok) return trust;
     const backend = this.makeBackend(params.backend);
@@ -1500,6 +1572,9 @@ export class TaskEngine {
     content: string,
     options?: { agentContent?: string; clientRequestId?: string },
   ): Promise<EngineResult<{ messageId: string; turnId?: string; clientRequestId?: string }>> {
+    if (this.storageTerminal) {
+      return { ok: false, reason: 'storage terminal' };
+    }
     const clientRequestId =
       typeof options?.clientRequestId === 'string' && options.clientRequestId.trim()
         ? options.clientRequestId.trim()
@@ -2280,6 +2355,7 @@ export class TaskEngine {
    * `onUnsatisfied: block` remains open + blocked; publish wakeable attention (P0 ISSUE-6).
    */
   private async applyDependencyTerminals(): Promise<void> {
+    if (this.storageTerminal) return;
     const now = nowIso(this.clock);
     const before = this.store.getFile();
     const draft = cloneTaskStoreFile(before);
@@ -2887,14 +2963,27 @@ export class TaskEngine {
   }
 
   private async afterTurnSettled(turnId: string): Promise<void> {
+    if (this.storageTerminal) return;
     await this.repository.execute({
       kind: 'deleteOperationsForTurn', workspaceId: this.workspaceId, turnId,
     });
+    if (this.storageTerminal) return;
     // Apply dependency terminals before child waits so block-policy sinks get
     // attention and parents wake without waiting for an unrelated rescan.
     await this.applyDependencyTerminals();
+    if (this.storageTerminal) return;
     await this.reconcileChildWaits();
+    if (this.storageTerminal) return;
     await this.drainPendingSendsAfterSettlement(turnId);
+  }
+
+  /**
+   * Best-effort claim release that must not initiate repository I/O after
+   * terminal storage latch (finally may race with quiesce).
+   */
+  private safeReleaseClaim(release: () => void): void {
+    if (this.storageTerminal) return;
+    release();
   }
 
   private async drainPendingSendsAfterSettlement(settledTurnId: string): Promise<void> {
@@ -2972,7 +3061,7 @@ export class TaskEngine {
    * (release, lifecycle seal, dependency terminal, settle, trust grant).
    */
   private rescanSchedulableTurns(affectedTaskIds?: readonly string[]): void {
-    if (this.shuttingDown) return;
+    if (this.shuttingDown || this.storageTerminal) return;
     const file = this.store.getFile();
     const queued = Object.values(file.turns)
       .filter((t) => t.status === 'queued')
@@ -2993,7 +3082,7 @@ export class TaskEngine {
   }
 
   private scheduleTurn(turnId: string): Promise<void> {
-    if (this.shuttingDown) return Promise.resolve();
+    if (this.shuttingDown || this.storageTerminal) return Promise.resolve();
     const existing = this.turnPromises.get(turnId);
     if (existing) return existing;
     // Register before the first await so callers of whenIdle cannot observe a
@@ -3002,6 +3091,8 @@ export class TaskEngine {
     this.turnPromises.set(turnId, promise);
     void promise.finally(async () => {
       this.turnPromises.delete(turnId);
+      // Terminal storage: zero repository / reschedule after latch.
+      if (this.storageTerminal || this.shuttingDown) return;
       const file = this.store.getFile();
       const settled = file.turns[turnId];
       const confirmedInterrupt = settled?.status === 'interrupted' && settled.interruptConfidence === 'confirmed';
@@ -3011,7 +3102,9 @@ export class TaskEngine {
       const queued = Object.values(afterFlush.turns)
         .filter((turn) => turn.status === 'queued')
         .sort((a, b) => a.sequence - b.sequence || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+      if (this.storageTerminal) return;
       await this.applyDependencyTerminals();
+      if (this.storageTerminal) return;
       for (const queuedTurn of queued) {
         if (this.deferredQueuedTurns.has(queuedTurn.id)) continue;
         if (settledTaskId && queuedTurn.taskId === settledTaskId) {
@@ -3026,12 +3119,17 @@ export class TaskEngine {
   }
 
   private async runScheduledTurn(turnId: string): Promise<void> {
+    if (this.storageTerminal) return;
     // Phase C: downgrade stale host verdicts (git-guarded, no-op without host
     // verdicts) BEFORE sealing so a re-blocked fail/skip dependent seals this tick.
     await this.revalidateVerdicts();
+    if (this.storageTerminal) return;
     await this.applyDependencyTerminals();
+    if (this.storageTerminal) return;
     await this.applyVerdictRemediation();
+    if (this.storageTerminal) return;
     await processCancelRequests(this.graphDeps());
+    if (this.storageTerminal) return;
     if (!this.isWorkspaceTrusted()) {
       return;
     }
@@ -3366,16 +3464,28 @@ export class TaskEngine {
     turnId: string,
     update: (turn: TaskTurn) => TaskTurn,
   ): Promise<EngineResult<TaskTurn>> {
+    if (this.storageTerminal) {
+      return { ok: false, reason: 'storage terminal' };
+    }
     const current = await this.repository.getTurn(turnId);
+    if (this.storageTerminal) {
+      return { ok: false, reason: 'storage terminal' };
+    }
     if (!current || (current.status !== 'running' && current.status !== 'waiting_user')) {
       return { ok: false, reason: 'turn is no longer live' };
     }
     const task = await this.repository.getTask(current.taskId);
+    if (this.storageTerminal) {
+      return { ok: false, reason: 'storage terminal' };
+    }
     const epoch = current.runtimeEpoch ?? 1;
     if (!task || (task.runtimeEpoch ?? 1) !== epoch) {
       return { ok: false, reason: 'runtime binding was superseded' };
     }
     const next = update(current);
+    if (this.storageTerminal) {
+      return { ok: false, reason: 'storage terminal' };
+    }
     const write = await this.repository.execute({
       kind: 'replaceLiveTurn',
       workspaceId: this.workspaceId,
@@ -3558,21 +3668,26 @@ export class TaskEngine {
         Number.isFinite(engineNowMs) ? engineNowMs : Date.now(),
       ) ?? DEFAULT_RUN_LIMIT_MS;
     const cancelPoll = setInterval(() => {
+      if (this.storageTerminal || this.shuttingDown) return;
       void processCancelRequests(this.graphDeps());
     }, 250);
     // A recovered/frozen deadline may already be expired. Arm a zero-delay
     // watchdog instead of treating 0 as "no timeout" and running forever.
     const turnTimer = setTimeout(() => {
       void (async () => {
+        if (this.storageTerminal || this.shuttingDown) return;
         const flushed = await this.flushTurnBoundary(turnId);
+        if (this.storageTerminal || this.shuttingDown) return;
         if (!flushed.ok) return;
         const live = await this.repository.getTurn(turnId);
+        if (this.storageTerminal || this.shuttingDown) return;
         const limitMs = live?.effectiveRunLimitMs ?? remainingRunMs;
         const deadlineAt = live?.runDeadlineAt ?? new Date().toISOString();
         await this.replaceLiveTurn(turnId, (current) => ({
           ...current,
           termination: { kind: 'run_timeout', limitMs, deadlineAt },
         })).catch(() => undefined);
+        if (this.storageTerminal || this.shuttingDown) return;
         console.info('[muster][task-orch] turn.settle.timeout', {
           taskId: taskForDispatch.id,
           turnId,
@@ -3583,6 +3698,13 @@ export class TaskEngine {
         abort.abort();
       })();
     }, Math.max(0, remainingRunMs));
+    {
+      const liveHandle = this.liveRuns.get(turnId);
+      if (liveHandle) {
+        liveHandle.cancelPoll = cancelPoll;
+        liveHandle.turnTimer = turnTimer;
+      }
+    }
 
     let rawOutput = '';
     let observedSessionId: string | undefined;
@@ -3590,61 +3712,63 @@ export class TaskEngine {
     let streamFailureStarted = false;
     let streamFailureMessage: string | undefined;
     let streamFailurePromise: Promise<void> | undefined;
-    const settleStreamPersistenceFailure = (message: string): Promise<void> => {
+    /** Timer path only: report once, abort backend, keep dirty buffer; no settle yet. */
+    const markStreamPersistenceFailure = (message: string): Promise<void> => {
       if (streamFailurePromise) return streamFailurePromise;
       streamFailureStarted = true;
       streamFailureMessage = message;
       streamFailurePromise = (async () => {
         try {
-          if (!terminalSettled) {
-            terminalSettled = await this.settleFailed(
-              turnId,
-              message,
-              observedSessionId,
-              rawOutput,
-              backend,
-            );
-            if (terminalSettled) {
-              this.safeEmit({
-                type: 'turnError',
-                taskId: startedTurn.taskId,
-                turnId,
-                message,
-              });
-            }
-          }
-        } catch {
-          // The regular executeTurn catch/finally path remains the final
-          // settlement fallback; timer callbacks must never reject globally.
-        } finally {
+          if (this.storageTerminal) return;
+          // Abort backend; durable settle + one bounded flush retry happen at
+          // the explicit lifecycle boundary (finishStreamPersistenceFailure).
           abort.abort();
+        } catch {
+          // timer callbacks must never reject globally
         }
       })();
       return streamFailurePromise;
     };
+    /**
+     * Explicit lifecycle boundary: one bounded flushTurn retry, then settle
+     * failed only if the segment is durable (or retry also failed — keep dirty,
+     * no false success/ACK). Dispose only after successful flush + settle.
+     */
     const finishStreamPersistenceFailure = async (): Promise<boolean> => {
       if (!streamFailureStarted) return false;
       if (streamFailurePromise) await streamFailurePromise;
-      if (!terminalSettled && streamFailureMessage) {
-        terminalSettled = await this.settleFailed(
-          turnId,
-          streamFailureMessage,
-          observedSessionId,
-          rawOutput,
-          backend,
-        );
-        if (terminalSettled) {
-          this.safeEmit({
-            type: 'turnError',
-            taskId: startedTurn.taskId,
-            turnId,
-            message: streamFailureMessage,
-          });
-        }
+      if (this.storageTerminal) return true;
+      if (terminalSettled) return true;
+      const message = streamFailureMessage ?? 'stream batch persistence failed';
+      // Exactly one bounded retry at the deterministic boundary.
+      let segmentDurable = !this.streamBatcher.hasPending(turnId);
+      if (!segmentDurable) {
+        const retry = await this.streamBatcher.flushTurn(turnId);
+        if (this.storageTerminal) return true;
+        segmentDurable = retry.ok;
       }
+      // Always durably fail the turn after the bounded attempt. When retry
+      // fails, keep the dirty buffer (disposeTurn skipped below) so content is
+      // not silently discarded — but never emit success/ACK/patch for it.
+      terminalSettled = await this.settleFailed(
+        turnId,
+        message,
+        observedSessionId,
+        rawOutput,
+        backend,
+      );
+      if (terminalSettled) {
+        this.safeEmit({
+          type: 'turnError',
+          taskId: startedTurn.taskId,
+          turnId,
+          message,
+        });
+      }
+      void segmentDurable;
       return true;
     };
-    this.streamFailureHandlers.set(turnId, settleStreamPersistenceFailure);
+    this.streamFailureHandlers.set(turnId, markStreamPersistenceFailure);
     // Per-turn render ordering + assistant segmentation (see WEBVIEW-IMPROVEMENT-PLAN §5.1.1).
     // `order` is a per-turn monotonic counter shared by assistant segments, tools,
     // and mid-turn user messages; `(turn.sequence, order)` reconstructs
@@ -3729,12 +3853,18 @@ export class TaskEngine {
       built.options = {
         ...built.options,
         onBeforePrompt: async () => {
+          if (this.storageTerminal) {
+            throw new Error('storage terminal');
+          }
           const commit = await this.replaceLiveTurn(turnId, (current) => {
             if (current.dispatchPhase === 'prompt_outstanding' || current.dispatchPhase === 'terminal_received') {
               return current;
             }
             return { ...current, dispatchPhase: 'prompt_outstanding' };
           });
+          if (this.storageTerminal) {
+            throw new Error('storage terminal');
+          }
           if (!commit.ok) {
             throw new Error(
               `failed to persist prompt_outstanding dispatch marker: ${commit.reason}`,
@@ -3744,8 +3874,11 @@ export class TaskEngine {
       };
 
       for await (const event of this.runTurnFn(backend, built.options)) {
+        if (this.storageTerminal || terminalSettled || streamFailureStarted || this.shuttingDown) {
+          break;
+        }
         await processCancelRequests(this.graphDeps());
-        if (terminalSettled || streamFailureStarted || this.shuttingDown) {
+        if (this.storageTerminal || terminalSettled || streamFailureStarted || this.shuttingDown) {
           break;
         }
         const eventFile = this.store.getFile();
@@ -3790,7 +3923,7 @@ export class TaskEngine {
               if (currentAssistantSegment) {
                 const flushed = await this.streamBatcher.flushTurn(turnId);
                 if (!flushed.ok) {
-                  await settleStreamPersistenceFailure(flushed.message);
+                  await markStreamPersistenceFailure(flushed.message);
                   break;
                 }
               }
@@ -3835,7 +3968,7 @@ export class TaskEngine {
             // Flush assistant/reasoning before tool boundary (ordering).
             const preTool = await this.streamBatcher.flushTurn(turnId);
             if (!preTool.ok) {
-              await settleStreamPersistenceFailure(preTool.message);
+              await markStreamPersistenceFailure(preTool.message);
               break;
             }
             // A tool closes the current assistant segment (matches live commitStreaming).
@@ -3868,7 +4001,7 @@ export class TaskEngine {
               failMessage = error instanceof Error ? error.message : String(error);
             }
             if (failMessage) {
-              await settleStreamPersistenceFailure(failMessage);
+              await markStreamPersistenceFailure(failMessage);
               break;
             }
             this.safeEmit({ type: 'event', taskId: turn.taskId, turnId, event });
@@ -3877,7 +4010,7 @@ export class TaskEngine {
           case 'toolUpdated': {
             const preTool = await this.streamBatcher.flushTurn(turnId);
             if (!preTool.ok) {
-              await settleStreamPersistenceFailure(preTool.message);
+              await markStreamPersistenceFailure(preTool.message);
               break;
             }
             const compositeId = `${turnId}:${event.toolCallId}`;
@@ -3906,7 +4039,7 @@ export class TaskEngine {
               failMessage = error instanceof Error ? error.message : String(error);
             }
             if (failMessage) {
-              await settleStreamPersistenceFailure(failMessage);
+              await markStreamPersistenceFailure(failMessage);
               break;
             }
             this.safeEmit({ type: 'event', taskId: turn.taskId, turnId, event });
@@ -3915,7 +4048,7 @@ export class TaskEngine {
           case 'toolCompleted': {
             const preTool = await this.streamBatcher.flushTurn(turnId);
             if (!preTool.ok) {
-              await settleStreamPersistenceFailure(preTool.message);
+              await markStreamPersistenceFailure(preTool.message);
               break;
             }
             const compositeId = `${turnId}:${event.toolCallId}`;
@@ -3952,7 +4085,7 @@ export class TaskEngine {
               failMessage = error instanceof Error ? error.message : String(error);
             }
             if (failMessage) {
-              await settleStreamPersistenceFailure(failMessage);
+              await markStreamPersistenceFailure(failMessage);
               break;
             }
             this.safeEmit({ type: 'event', taskId: turn.taskId, turnId, event });
@@ -3964,7 +4097,7 @@ export class TaskEngine {
           case 'turnCompleted': {
             const preDone = await this.streamBatcher.flushTurn(turnId);
             if (!preDone.ok) {
-              await settleStreamPersistenceFailure(preDone.message);
+              await markStreamPersistenceFailure(preDone.message);
               break;
             }
             const successOutcome = await this.settleSuccess(
@@ -4005,7 +4138,7 @@ export class TaskEngine {
           case 'error': {
             const preError = await this.streamBatcher.flushTurn(turnId);
             if (!preError.ok) {
-              await settleStreamPersistenceFailure(preError.message);
+              await markStreamPersistenceFailure(preError.message);
               break;
             }
             if (event.isCancellation) {
@@ -4078,71 +4211,115 @@ export class TaskEngine {
         }
       }
 
-      const streamFailureHandled = await finishStreamPersistenceFailure();
-      if (!terminalSettled && !streamFailureHandled) {
-        // Flush any coalesced assistant/reasoning before abnormal settlement.
-        const preAbnormal = await this.streamBatcher.flushTurn(turnId);
-        if (!preAbnormal.ok) {
-          await settleStreamPersistenceFailure(preAbnormal.message);
-        } else {
-          const runTimedOut = this.store.getFile().turns[turnId]?.termination?.kind === 'run_timeout';
-          terminalSettled = runTimedOut
-            ? await this.settleInterrupted(turnId, observedSessionId, rawOutput, backend, 'run_timeout')
-            : this.shuttingDown
-              ? await this.settleInterrupted(turnId, observedSessionId, rawOutput, backend, 'forced')
-              : await this.settleFailed(
-                  turnId,
-                  'turn ended without terminal event',
-                  observedSessionId,
-                  rawOutput,
-                  backend,
-                );
-          if (terminalSettled) {
-            this.safeEmit({
-              type: 'turnError',
-              taskId: turn.taskId,
-              turnId,
-              message: 'turn ended without terminal event',
-            });
+      if (!this.storageTerminal) {
+        const streamFailureHandled = await finishStreamPersistenceFailure();
+        if (!terminalSettled && !streamFailureHandled) {
+          // Flush any coalesced assistant/reasoning before abnormal settlement.
+          const preAbnormal = await this.streamBatcher.flushTurn(turnId);
+          if (!preAbnormal.ok) {
+            await markStreamPersistenceFailure(preAbnormal.message);
+          } else {
+            const runTimedOut = this.store.getFile().turns[turnId]?.termination?.kind === 'run_timeout';
+            // Terminal storage must not settleInterrupted (graceful shutdown may).
+            if (this.storageTerminal) {
+              // skip durable settlement
+            } else if (runTimedOut) {
+              terminalSettled = await this.settleInterrupted(
+                turnId, observedSessionId, rawOutput, backend, 'run_timeout',
+              );
+            } else if (this.shuttingDown) {
+              terminalSettled = await this.settleInterrupted(
+                turnId, observedSessionId, rawOutput, backend, 'forced',
+              );
+            } else {
+              terminalSettled = await this.settleFailed(
+                turnId,
+                'turn ended without terminal event',
+                observedSessionId,
+                rawOutput,
+                backend,
+              );
+            }
+            if (terminalSettled) {
+              this.safeEmit({
+                type: 'turnError',
+                taskId: turn.taskId,
+                turnId,
+                message: 'turn ended without terminal event',
+              });
+            }
           }
         }
       }
     } catch (error) {
-      const streamFailureHandled = await finishStreamPersistenceFailure();
-      if (!terminalSettled && !streamFailureHandled) {
-        // Best-effort flush before dispose so the last window is not dropped.
-        const preCatch = await this.streamBatcher.flushTurn(turnId);
-        if (!preCatch.ok) {
-          await settleStreamPersistenceFailure(preCatch.message);
-        } else {
-          const message = error instanceof Error ? error.message : String(error);
-          const runTimedOut = this.store.getFile().turns[turnId]?.termination?.kind === 'run_timeout';
-          terminalSettled = runTimedOut
-            ? await this.settleInterrupted(turnId, observedSessionId, rawOutput, backend, 'run_timeout')
-            : this.shuttingDown
-              ? await this.settleInterrupted(turnId, observedSessionId, rawOutput, backend, 'forced')
-              : await this.settleFailed(turnId, message, observedSessionId, rawOutput, backend);
-          if (terminalSettled) {
-            this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message });
+      if (!this.storageTerminal) {
+        const streamFailureHandled = await finishStreamPersistenceFailure();
+        if (!terminalSettled && !streamFailureHandled) {
+          // Best-effort flush before dispose so the last window is not dropped.
+          const preCatch = await this.streamBatcher.flushTurn(turnId);
+          if (!preCatch.ok) {
+            await markStreamPersistenceFailure(preCatch.message);
+          } else {
+            const message = error instanceof Error ? error.message : String(error);
+            const runTimedOut = this.store.getFile().turns[turnId]?.termination?.kind === 'run_timeout';
+            if (this.storageTerminal) {
+              // skip durable settlement after terminal latch
+            } else if (runTimedOut) {
+              terminalSettled = await this.settleInterrupted(
+                turnId, observedSessionId, rawOutput, backend, 'run_timeout',
+              );
+            } else if (this.shuttingDown) {
+              terminalSettled = await this.settleInterrupted(
+                turnId, observedSessionId, rawOutput, backend, 'forced',
+              );
+            } else {
+              terminalSettled = await this.settleFailed(
+                turnId, message, observedSessionId, rawOutput, backend,
+              );
+            }
+            if (terminalSettled) {
+              this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message });
+            }
           }
         }
       }
     } finally {
+      {
+        const liveHandle = this.liveRuns.get(turnId);
+        if (liveHandle) {
+          if (liveHandle.cancelPoll !== undefined) {
+            clearInterval(liveHandle.cancelPoll);
+            liveHandle.cancelPoll = undefined;
+          }
+          if (liveHandle.turnTimer !== undefined) {
+            clearTimeout(liveHandle.turnTimer);
+            liveHandle.turnTimer = undefined;
+          }
+        }
+      }
       clearInterval(cancelPoll);
       clearTimeout(turnTimer);
-      if (streamFailurePromise) await streamFailurePromise;
+      if (streamFailurePromise && !this.storageTerminal) await streamFailurePromise;
       this.streamFailureHandlers.delete(turnId);
       // Hard clear elicitation wait tokens — do not soft-resume a settling turn.
       this.dropElicitationWaits(turnId);
-      // Drop only after terminal paths have flushed (or failed explicitly).
-      this.streamBatcher.disposeTurn(turnId);
+      // Drop buffer only when not terminal and no retained dirty stream state.
+      // After a failed bounded retry the dirty buffer must remain for recovery.
+      if (
+        !this.storageTerminal &&
+        !(streamFailureStarted && this.streamBatcher.hasPending(turnId))
+      ) {
+        this.streamBatcher.disposeTurn(turnId);
+      }
       this.liveRuns.delete(turnId);
       this.acceptedOpIds.delete(turnId);
       if (this.credentialRegistry) {
         cleanupTurnResources(this.graphDeps(), turnId, mcpConfigPath);
       }
-      await this.afterTurnSettled(turnId);
-      releaseClaim();
+      if (!this.storageTerminal) {
+        await this.afterTurnSettled(turnId);
+        this.safeReleaseClaim(releaseClaim);
+      }
     }
   }
 
@@ -4157,6 +4334,7 @@ export class TaskEngine {
     rawOutput: string,
     backend: Backend,
   ): Promise<'ok' | 'missing_session' | false> {
+    if (this.storageTerminal) return false;
     if (this.settling.has(turnId)) {
       return false;
     }
@@ -4381,6 +4559,7 @@ export class TaskEngine {
     backend: Backend,
     interruptConfidence: 'confirmed' | 'forced' | 'run_timeout' = 'confirmed',
   ): Promise<boolean> {
+    if (this.storageTerminal) return false;
     if (this.settling.has(turnId)) {
       return false;
     }
@@ -4492,6 +4671,7 @@ export class TaskEngine {
       failureClass?: import('./types').TurnFailureClass;
     },
   ): Promise<boolean> {
+    if (this.storageTerminal) return false;
     if (this.settling.has(turnId)) {
       return false;
     }

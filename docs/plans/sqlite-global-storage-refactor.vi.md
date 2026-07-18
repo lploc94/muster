@@ -954,7 +954,7 @@ hydration hoặc raw-copy file main trong lúc WAL hoạt động. Các test Pha
 closed; production build không expose fault control; source boundary cấm raw SQLite error
 hoặc params vượt khỏi DB boundary.
 
-#### P5-W2 — Corrupt database fail-closed và recovery diagnostics
+#### P5-W2 — Corrupt database fail-closed và recovery diagnostics ✅
 
 - Open/read path nhận diện corrupt/not-a-database và owned-but-incompatible state trước mọi
   durable mutation. Không tự rename, delete, stamp, reset, bootstrap đè hoặc fallback sang

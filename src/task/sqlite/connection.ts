@@ -24,7 +24,8 @@ import {
   MUSTER_APPLICATION_ID,
   SQLITE_SCHEMA_VERSION,
 } from './schema';
-import { MusterSqliteError } from './errors';
+import { MusterSqliteError, mapToMusterSqliteError } from './errors';
+import { findSchemaFingerprintFailure } from './schema-fingerprint';
 
 export interface OpenOptions {
   /** Filesystem path to `muster.sqlite3` (or ':memory:' in tests). */
@@ -113,6 +114,23 @@ function hasUserSchemaObjects(db: DatabaseSync): boolean {
 }
 
 /**
+ * Bounded current-schema fingerprint: required tables/indexes/triggers AND
+ * critical column structure before WAL (P5-W2). Read-only; no integrity_check.
+ */
+function assertCurrentSchemaComplete(db: DatabaseSync): void {
+  try {
+    const failure = findSchemaFingerprintFailure(db);
+    if (failure) {
+      throw new IncompatibleSchemaError(readScalar(db, 'user_version'));
+    }
+  } catch (error) {
+    if (error instanceof IncompatibleSchemaError) throw error;
+    // Unterminated quotes / fingerprint scanner failures fail closed.
+    throw new IncompatibleSchemaError(readScalar(db, 'user_version'));
+  }
+}
+
+/**
  * Connection-local wait policy only. Safe during preflight because busy_timeout is
  * not a durable file mutation (unlike journal_mode / application_id / user_version).
  */
@@ -131,46 +149,28 @@ function applyRuntimePragmas(db: DatabaseSync, busyTimeoutMs: number): void {
   db.exec('PRAGMA synchronous = NORMAL');
 }
 
-type PreflightState = { kind: 'current' } | { kind: 'blank' };
+type ExclusiveOpenDecision = { kind: 'current' } | { kind: 'blank_claimed' };
 
 /**
- * Read-only ownership/schema preflight. Never stamps application_id, never changes
- * journal mode, and never writes schema.
+ * Private signal: state changed under concurrent first-open (peer bootstrap).
+ * Caller closes and reopens a fresh connection — not a permanent ownership error.
  */
-function preflightDatabase(db: DatabaseSync): PreflightState {
-  const applicationId = readScalar(db, 'application_id');
-  const userVersion = readScalar(db, 'user_version');
-
-  if (applicationId !== 0 && applicationId !== MUSTER_APPLICATION_ID) {
-    throw new ForeignDatabaseError(applicationId);
+class ConcurrentOpenStateChanged extends Error {
+  constructor() {
+    super('concurrent open state changed after blank preflight');
+    this.name = 'ConcurrentOpenStateChanged';
   }
-
-  if (applicationId === MUSTER_APPLICATION_ID) {
-    // Owned file must already be fully current. Incomplete owned DBs
-    // (including user_version=0) fail closed with reset guidance — they are not
-    // "bootstrap in progress", because exclusive claim commits atomically.
-    if (userVersion === SQLITE_SCHEMA_VERSION) {
-      return { kind: 'current' };
-    }
-    throw new IncompatibleSchemaError(userVersion);
-  }
-
-  // application_id === 0
-  if (userVersion !== 0) {
-    throw new IncompatibleSchemaError(userVersion);
-  }
-  if (hasUserSchemaObjects(db)) {
-    throw new NonEmptyUnclaimedDatabaseError();
-  }
-  return { kind: 'blank' };
 }
 
 /**
- * Claim a blank DB under exclusive lock: create current schema, stamp application_id
- * and user_version. Concurrent first-open losers block on the exclusive lock, then
- * re-read post-commit markers and accept a completed bootstrap without rewriting DDL.
+ * Authoritative ownership decision under BEGIN EXCLUSIVE.
+ * Concurrent first-open losers block on the lock, then re-read post-commit
+ * markers in the same exclusive critical section — never misclassify a peer
+ * bootstrap as nonempty_unclaimed from a stale pre-claim snapshot.
+ * Rejected foreign/incompatible/nonempty paths roll back with zero durable
+ * schema/marker mutation.
  */
-function claimAndBootstrapBlankDatabase(db: DatabaseSync): void {
+function exclusiveOpenDecision(db: DatabaseSync): ExclusiveOpenDecision {
   db.exec('BEGIN EXCLUSIVE TRANSACTION');
   try {
     const applicationId = readScalar(db, 'application_id');
@@ -179,37 +179,98 @@ function claimAndBootstrapBlankDatabase(db: DatabaseSync): void {
     if (applicationId !== 0 && applicationId !== MUSTER_APPLICATION_ID) {
       throw new ForeignDatabaseError(applicationId);
     }
+
     if (applicationId === MUSTER_APPLICATION_ID) {
       if (userVersion === SQLITE_SCHEMA_VERSION) {
+        assertCurrentSchemaComplete(db);
         db.exec('COMMIT');
-        return;
+        return { kind: 'current' };
       }
       throw new IncompatibleSchemaError(userVersion);
     }
+
+    // application_id === 0
     if (userVersion !== 0) {
       throw new IncompatibleSchemaError(userVersion);
     }
     if (hasUserSchemaObjects(db)) {
-      throw new NonEmptyUnclaimedDatabaseError();
+      // Blank preflight saw no objects; exclusive sees objects without Muster
+      // markers — peer commit race / header visibility. Reopen fresh.
+      db.exec('ROLLBACK');
+      throw new ConcurrentOpenStateChanged();
     }
 
     for (const statement of CURRENT_SCHEMA_STATEMENTS) db.exec(statement);
     db.exec(`PRAGMA application_id = ${MUSTER_APPLICATION_ID}`);
     db.exec(`PRAGMA user_version = ${SQLITE_SCHEMA_VERSION}`);
+    assertCurrentSchemaComplete(db);
     db.exec('COMMIT');
+    return { kind: 'blank_claimed' };
   } catch (error) {
-    try {
-      db.exec('ROLLBACK');
-    } catch {
-      // ignore rollback failure — original error is the real signal
+    if (!(error instanceof ConcurrentOpenStateChanged)) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        // ignore rollback failure — original error is the real signal
+      }
     }
     throw error;
   }
 }
 
 /**
+ * Read-only ownership probe. Never stamps markers or creates schema.
+ * - current Muster → true (skip exclusive claim)
+ * - blank → false (claim under exclusive)
+ * - concurrent schema-without-markers after a blank was observed → ConcurrentOpenStateChanged
+ * - genuine non-empty unclaimed on first probe → NonEmptyUnclaimedDatabaseError
+ */
+function tryOpenExistingCurrent(
+  db: DatabaseSync,
+  opts: { allowConcurrentNonemptyRetry: boolean },
+): boolean {
+  const applicationId = readScalar(db, 'application_id');
+  const userVersion = readScalar(db, 'user_version');
+  if (applicationId !== 0 && applicationId !== MUSTER_APPLICATION_ID) {
+    throw new ForeignDatabaseError(applicationId);
+  }
+  if (applicationId === MUSTER_APPLICATION_ID) {
+    if (userVersion === SQLITE_SCHEMA_VERSION) {
+      assertCurrentSchemaComplete(db);
+      return true;
+    }
+    throw new IncompatibleSchemaError(userVersion);
+  }
+  if (userVersion !== 0) {
+    throw new IncompatibleSchemaError(userVersion);
+  }
+  if (hasUserSchemaObjects(db)) {
+    // Re-read markers once — peer commit can expose schema before header markers.
+    const appAgain = readScalar(db, 'application_id');
+    const verAgain = readScalar(db, 'user_version');
+    if (appAgain === MUSTER_APPLICATION_ID && verAgain === SQLITE_SCHEMA_VERSION) {
+      assertCurrentSchemaComplete(db);
+      return true;
+    }
+    if (opts.allowConcurrentNonemptyRetry && appAgain === 0 && verAgain === 0) {
+      throw new ConcurrentOpenStateChanged();
+    }
+    if (appAgain !== 0 && appAgain !== MUSTER_APPLICATION_ID) {
+      throw new ForeignDatabaseError(appAgain);
+    }
+    if (appAgain === MUSTER_APPLICATION_ID) {
+      throw new IncompatibleSchemaError(verAgain);
+    }
+    throw new NonEmptyUnclaimedDatabaseError();
+  }
+  return false; // blank — claim under exclusive
+}
+
+/**
  * Open the store DB with validation-before-mutation:
- * preflight → claim/bootstrap blank only → runtime pragmas (incl. WAL).
+ * 1. Read-only path for already-owned current DBs (no exclusive).
+ * 2. Blank DBs claim under BEGIN EXCLUSIVE (concurrent first-open safe).
+ * 3. Runtime pragmas (incl. WAL) only after ownership is confirmed.
  * Rejected databases are closed without durable side effects.
  * Retry is limited to SQLite BUSY/LOCKED contention.
  */
@@ -219,27 +280,75 @@ export function openStoreDatabase(opts: OpenOptions): DatabaseSync {
   // only for real lock errors; permanent ownership/schema failures fail immediately.
   const retryDeadline = Date.now() + Math.max(1_000, busyTimeoutMs * 2);
   let attempt = 0;
+  /** After a blank preflight, concurrent schema-without-markers may retry. */
+  let sawBlankPreflight = false;
+  /** Bounded fingerprint retries for concurrent current-marker visibility. */
+  let fingerprintRetries = 0;
+  const MAX_FINGERPRINT_RETRIES = 6;
 
   for (;;) {
-    const db = new DatabaseSync(opts.path);
+    let db: DatabaseSync | undefined;
     try {
+      db = new DatabaseSync(opts.path);
       // Connection-local only — does not mutate durable journal/application markers.
       applyConnectionBusyTimeout(db, busyTimeoutMs);
-      const preflight = preflightDatabase(db);
-      if (preflight.kind === 'blank') {
-        claimAndBootstrapBlankDatabase(db);
+      const alreadyCurrent = tryOpenExistingCurrent(db, {
+        allowConcurrentNonemptyRetry: sawBlankPreflight,
+      });
+      if (!alreadyCurrent) {
+        sawBlankPreflight = true;
+        // Fresh connection for exclusive claim so page cache cannot retain a
+        // pre-peer-commit blank snapshot across BEGIN EXCLUSIVE.
+        try {
+          db.close();
+        } catch {
+          // continue with a new connection regardless
+        }
+        db = new DatabaseSync(opts.path);
+        applyConnectionBusyTimeout(db, busyTimeoutMs);
+        exclusiveOpenDecision(db);
       }
       // WAL / foreign_keys / synchronous only after ownership is confirmed.
       applyRuntimePragmas(db, busyTimeoutMs);
       return db;
     } catch (error) {
-      try {
-        db.close();
-      } catch {
-        // The original initialization error is the actionable failure.
+      if (db) {
+        try {
+          db.close();
+        } catch {
+          // The original initialization error is the actionable failure.
+        }
+      }
+      if (error instanceof ConcurrentOpenStateChanged) {
+        if (Date.now() >= retryDeadline) {
+          // Stable non-empty without Muster markers after bounded retries.
+          throw new NonEmptyUnclaimedDatabaseError();
+        }
+        waitBeforeOpenRetry(attempt);
+        attempt += 1;
+        continue;
+      }
+      // Concurrent first-open can briefly fail fingerprint while a peer finishes
+      // bootstrap/WAL. Cap retries so permanently incompatible current-marker
+      // DBs still fail closed quickly.
+      if (
+        error instanceof IncompatibleSchemaError &&
+        error.observedVersion === SQLITE_SCHEMA_VERSION &&
+        fingerprintRetries < MAX_FINGERPRINT_RETRIES &&
+        Date.now() < retryDeadline
+      ) {
+        fingerprintRetries += 1;
+        waitBeforeOpenRetry(attempt);
+        attempt += 1;
+        continue;
+      }
+      // Ownership errors already carry the safe taxonomy; map physical open failures
+      // (garbage/not-a-database/corrupt) without retrying permanent conditions.
+      if (error instanceof MusterSqliteError) {
+        throw error;
       }
       if (!isRetryableOpenLock(error) || Date.now() >= retryDeadline) {
-        throw error;
+        throw mapToMusterSqliteError(error, 'open');
       }
       waitBeforeOpenRetry(attempt);
       attempt += 1;
