@@ -1023,7 +1023,14 @@ reject destination alias của live main/WAL/SHM; cancellation qua request-scope
 DB path; backup mở và đọc được consistent revision; source bytes/data không bị reset hay
 mất row.
 
-#### P5-W5 — Backup command và explicit developer reset
+#### P5-W5 — Backup command và explicit developer reset ✅
+
+**Hoàn tất (2026-07-18):** commands `muster.backupDatabase` / `muster.developerResetGlobalDatabase`
+registered before storage open (available on fail-closed activation). Backup = Save dialog +
+W4 primitive. Reset modal states profile+authority-wide scope; backup-before-reset aborts on
+cancel/fail without quiesce; successful path quiesces engine/pollers/client then exclusive
+in-place `resetOpenDatabase` (BEGIN EXCLUSIVE, drop user objects, current schema, verify,
+commit — never unlink trio). Peer revision regression → one-shot hard-quiesce + Reload Window.
 
 - Contribute hai command rõ nghĩa: backup database và **developer reset global database**.
   Backup dùng Save dialog và primitive W4; UI được phép hiện user-selected path nhưng path

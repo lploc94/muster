@@ -39,6 +39,14 @@
       {
         "command": "muster.openChat",
         "title": "Muster: Open Chat"
+      },
+      {
+        "command": "muster.backupDatabase",
+        "title": "Muster: Back Up Global Database"
+      },
+      {
+        "command": "muster.developerResetGlobalDatabase",
+        "title": "Muster: Developer Reset Global Database"
       }
     ],
     "configuration": {

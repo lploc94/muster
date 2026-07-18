@@ -47,6 +47,11 @@ export type BackupResultMeta = {
   byteSize: number;
 };
 
+/** Safe reset result metadata only (P5-W5). */
+export type ResetResultMeta = {
+  schemaVersion: number;
+};
+
 export type DbRequest =
   | { kind: 'open'; requestId: number; path: string; busyTimeoutMs?: number }
   | { kind: 'all'; requestId: number; sql: string; params?: SqlValue[] }
@@ -97,6 +102,20 @@ export type DbRequest =
       /** Test-only progress barrier flag (fault capability). */
       progressFlag?: SharedArrayBuffer;
     }
+  | {
+      /**
+       * In-place exclusive developer reset (P5-W5). Never unlinks live trio.
+       * When the worker already has an open DB, that connection is reset.
+       * When closed, `path` opens via reset-specific ownership checks (accepts
+       * incompatible Muster-owned schemas; rejects foreign/corrupt/unclaimed).
+       */
+      kind: 'reset';
+      requestId: number;
+      /** Required when the worker has no open connection (recovery reset). */
+      path?: string;
+      /** Test-only fail before COMMIT (fault capability). */
+      failBeforeCommit?: boolean;
+    }
   | { kind: 'close'; requestId: number };
 
 export interface RunResult {
@@ -115,6 +134,7 @@ export type DbResponse =
   | { kind: 'transaction'; requestId: number; results: RunResult[] }
   | { kind: 'scalar'; requestId: number; value: number }
   | { kind: 'backup'; requestId: number; result: BackupResultMeta }
+  | { kind: 'reset'; requestId: number; result: ResetResultMeta }
   | {
       kind: 'error';
       requestId: number;

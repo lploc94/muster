@@ -159,6 +159,29 @@ describe('WorkspaceRevisionPoller', () => {
     poller.dispose();
   });
 
+  it('signals reset on revision regression (external developer reset)', async () => {
+    const clock = createFakeTimers();
+    const onRecovery = vi.fn(async () => undefined);
+    const poller = new WorkspaceRevisionPoller({
+      getStorageDataVersion: async () => 2,
+      getWorkspaceRevision: async () => 0,
+      getAppliedRevision: () => 7,
+      isActive: () => true,
+      onExternalRevisions: async () => {
+        throw new Error('must not apply after reset');
+      },
+      onRecovery,
+      schedule: clock.schedule,
+      clearSchedule: clock.clearSchedule,
+    });
+    poller.start();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(onRecovery).toHaveBeenCalledWith('reset');
+    expect(onRecovery).toHaveBeenCalledTimes(1);
+    poller.dispose();
+  });
+
   it('backs off on error without advancing applied revision', async () => {
     const clock = createFakeTimers();
     let applied = 2;

@@ -13,6 +13,7 @@ import { parentPort, workerData } from 'node:worker_threads';
 import type { DatabaseSync } from 'node:sqlite';
 import { openStoreDatabase } from './connection';
 import { backupOpenDatabase } from './backup';
+import { openDatabaseForReset, resetOpenDatabase } from './reset';
 import type { DbRequest, DbResponse, RunResult, SqlValue } from './rpc';
 import { isAllowedReadPragma, serializeError } from './rpc';
 import type { SqliteOperationClass, SqliteWorkerData } from './errors';
@@ -69,6 +70,8 @@ function operationFor(req: DbRequest): SqliteOperationClass {
       return 'transaction';
     case 'backup':
       return 'backup';
+    case 'reset':
+      return 'write';
     default: {
       const _exhaustive: never = req;
       return _exhaustive;
@@ -264,6 +267,35 @@ async function handle(req: DbRequest): Promise<DbResponse> {
         ...testOpts,
       });
       return { kind: 'backup', requestId: req.requestId, result };
+    }
+    case 'reset': {
+      if (!Number.isSafeInteger(req.requestId) || req.requestId < 1) {
+        throw new MusterInvariantError('protocol', 'write');
+      }
+      const testOpts =
+        isFaultCapabilityEnabled() && req.failBeforeCommit === true
+          ? { failBeforeCommit: true as const }
+          : {};
+      if (db) {
+        const result = resetOpenDatabase(db, testOpts);
+        return { kind: 'reset', requestId: req.requestId, result };
+      }
+      // Recovery path: open without current-schema validation so incompatible
+      // Muster-owned DBs can be rebuilt (P5-W5).
+      if (typeof req.path !== 'string' || req.path.trim() === '') {
+        throw new MusterInvariantError('protocol', 'write');
+      }
+      const recovery = openDatabaseForReset(req.path);
+      try {
+        const result = resetOpenDatabase(recovery, testOpts);
+        return { kind: 'reset', requestId: req.requestId, result };
+      } finally {
+        try {
+          recovery.close();
+        } catch {
+          // best-effort
+        }
+      }
     }
     case 'close': {
       if (db) {

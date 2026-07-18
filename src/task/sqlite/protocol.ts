@@ -15,7 +15,7 @@ import {
   type SqliteErrorCode,
   type SqliteOperationClass,
 } from './errors';
-import type { BackupResultMeta, DbResponse, RunResult } from './rpc';
+import type { BackupResultMeta, DbResponse, ResetResultMeta, RunResult } from './rpc';
 
 export function makeProtocolError(
   operation: SqliteOperationClass = 'unknown',
@@ -183,9 +183,27 @@ export function parseWireSuccessResponse(input: unknown): {
       if (!result) return { ok: false, payload: makeProtocolError() };
       return { ok: true, response: { kind: 'backup', requestId, result } };
     }
+    case 'reset': {
+      if (!exactKeys(obj, ['kind', 'requestId', 'result'])) {
+        return { ok: false, payload: makeProtocolError() };
+      }
+      const result = parseResetResult(obj.result);
+      if (!result) return { ok: false, payload: makeProtocolError() };
+      return { ok: true, response: { kind: 'reset', requestId, result } };
+    }
     default:
       return { ok: false, payload: makeProtocolError() };
   }
+}
+
+function parseResetResult(value: unknown): ResetResultMeta | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const obj = value as Record<string, unknown>;
+  if (!exactKeys(obj, ['schemaVersion'])) return undefined;
+  if (!Number.isSafeInteger(obj.schemaVersion) || (obj.schemaVersion as number) < 1) {
+    return undefined;
+  }
+  return { schemaVersion: obj.schemaVersion as number };
 }
 
 function parseBackupResult(value: unknown): BackupResultMeta | undefined {

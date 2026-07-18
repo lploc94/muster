@@ -104,7 +104,7 @@ Deliver P5-W4 and P5-W5 as two resumable commits: a verified SQLite-aware live-b
 - Commit: `feat: add sqlite-aware live backup`
 
 ## Phase 2: P5-W5 backup command and explicit developer reset
-- Status: pending
+- Status: complete
 - Depends on: Phase 1
 - Goal: Expose safe Command Palette workflows for backup and explicit global reset, including optional verified backup, complete local quiesce, transactional cross-process coordination, and bounded empty restart.
 - Current behavior: `package.json` contributes only `muster.openChat`; `src/extension.ts:activate` opens SQLite before registering commands and throws on open failure. Existing terminal recovery can only reveal storage. No code can reset global data or restart an empty runtime.
@@ -137,14 +137,14 @@ Deliver P5-W4 and P5-W5 as two resumable commits: a verified SQLite-aware live-b
   - After reset verification, request window reload and rely on existing `WorkspaceRegistry.getOrCreate -> TaskEngine.loadAsync -> bounded snapshot` activation flow. Add a source-boundary rule preventing automatic reset calls from activation/open/write error handlers.
   - Mark P5-W5 and Batch B complete in `docs/plans/sqlite-global-storage-refactor.vi.md`, update this plan's phase/progress state in the same commit, and do not begin or mark P5-W6/P5-W7.
 - Acceptance criteria:
-  - [ ] AC-1: Both exact commands are contributed and registered even after storage-open failure, while engine/scheduler/poller remain absent - proven by manifest/activation command tests.
-  - [ ] AC-2: Backup command cancel is a no-op and success/failure is reported only after Phase 1 verification/publication with no raw diagnostic leakage - proven by `sqlite-maintenance-commands.test.ts`.
-  - [ ] AC-3: Reset modal states profile+authority-wide/all-workspace scope; cancel and failed/cancelled backup-before-reset perform zero reset/quiesce/reload work - proven by command route call-order assertions.
-  - [ ] AC-4: Successful reset removes data from multiple workspaces and all durable surfaces, leaves a complete current Muster schema, reloads, and permits a new bounded empty runtime - proven by `reset.test.ts` and activation restart tests.
-  - [ ] AC-5: A concurrent writer causes atomic busy failure with original state intact; an idle peer remains on the same database identity and cannot observe or create split-brain/partial state - proven by two-client/worker reset contention cases.
-  - [ ] AC-6: Foreign/corrupt reset attempts fail closed without mutation, incompatible owned reset is all-or-nothing, and no code individually manipulates the live main/WAL/SHM files - proven by reset fixtures and source-boundary audit.
-  - [ ] AC-7: All Batch B global gates pass and git history contains separate P5-W4 and P5-W5 commits without P5-W6/W7 work - proven by commands below plus `git log --oneline -2` inspection.
-  - [ ] AC-8: A stale peer that observes revision regression hard-quiesces once, rejects later writes, stops polling, and offers reload without a repeated recovery loop - proven by poller/provider/terminal reset-regression tests.
+  - [x] AC-1: Both exact commands are contributed and registered even after storage-open failure, while engine/scheduler/poller remain absent - proven by manifest/activation command tests.
+  - [x] AC-2: Backup command cancel is a no-op and success/failure is reported only after Phase 1 verification/publication with no raw diagnostic leakage - proven by `sqlite-maintenance-commands.test.ts`.
+  - [x] AC-3: Reset modal states profile+authority-wide/all-workspace scope; cancel and failed/cancelled backup-before-reset perform zero reset/quiesce/reload work - proven by command route call-order assertions.
+  - [x] AC-4: Successful reset removes data from multiple workspaces and all durable surfaces, leaves a complete current Muster schema, reloads, and permits a new bounded empty runtime - proven by `reset.test.ts` and activation restart tests.
+  - [x] AC-5: A concurrent writer causes atomic busy failure with original state intact; an idle peer remains on the same database identity and cannot observe or create split-brain/partial state - proven by two-client/worker reset contention cases.
+  - [x] AC-6: Foreign/corrupt reset attempts fail closed without mutation, incompatible owned reset is all-or-nothing, and no code individually manipulates the live main/WAL/SHM files - proven by reset fixtures and source-boundary audit.
+  - [x] AC-7: All Batch B global gates pass and git history contains separate P5-W4 and P5-W5 commits without P5-W6/W7 work - proven by commands below plus `git log --oneline -2` inspection.
+  - [x] AC-8: A stale peer that observes revision regression hard-quiesces once, rejects later writes, stops polling, and offers reload without a repeated recovery loop - proven by poller/provider/terminal reset-regression tests.
 - Focused verification:
   - `npx vitest run src/host/sqlite-maintenance-commands.test.ts src/task/sqlite/reset.test.ts src/task/sqlite/backup.test.ts src/host/terminal-storage-coordinator.test.ts src/task/engine-terminal-quiesce.test.ts src/task/sqlite/connection.test.ts`
 - Phase gates:
@@ -153,14 +153,14 @@ Deliver P5-W4 and P5-W5 as two resumable commits: a verified SQLite-aware live-b
 - Commit: `feat: add sqlite backup and developer reset commands`
 
 ## Completion Criteria
-- [ ] Every phase is complete and committed exactly once.
-- [ ] Every acceptance criterion is checked.
-- [ ] All global gates pass on final HEAD.
-- [ ] Final `codex-impl-review` verdict is APPROVE for the complete plan range.
-- [ ] Worktree is clean apart from pre-existing unrelated changes.
+- [x] Every phase is complete and committed exactly once.
+- [x] Every acceptance criterion is checked.
+- [x] All global gates pass on final HEAD.
+- [x] Final `codex-impl-review` verdict is APPROVE for the complete plan range.
+- [x] Worktree is clean apart from pre-existing unrelated changes.
 
 ## Progress Log
 | Phase | Status | Commit | Verification | Review |
 |---|---|---|---|---|
-| 1 | complete | pending | focused tests + compile + boundaries + EH 1.101(vacuum)/stable(api) green | APPROVE |
-| 2 | pending | N/A | pending | pending |
+| 1 | complete | a897014 | focused tests + compile + boundaries + EH 1.101(vacuum)/stable(api) green | APPROVE |
+| 2 | complete | pending | focused + full suite green; EH smokes green | APPROVE |

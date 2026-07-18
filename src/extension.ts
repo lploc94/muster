@@ -127,6 +127,13 @@ import {
   recoveryGuidanceFor,
 } from './task/sqlite/diagnostics';
 import { applyTerminalStorageQuiesce } from './host/terminal-storage-coordinator';
+import { quiesceForMaintenance } from './host/sqlite-maintenance-coordinator';
+import {
+  handleBackupDatabaseCommand,
+  handleDeveloperResetCommand,
+  MUSTER_BACKUP_DATABASE_COMMAND,
+  MUSTER_DEVELOPER_RESET_COMMAND,
+} from './host/sqlite-maintenance-commands';
 import { createTerminalStorageLifecycle } from './host/terminal-storage-lifecycle';
 import { runDurableHostSend } from './host/durable-send-coordinator';
 
@@ -172,6 +179,10 @@ let sqliteWorkspaceId: string | undefined;
 let chatProvider: MusterChatProvider | undefined;
 /** Live UAT host surface (non-production Extension Host + MUSTER_UAT_MODE=1). */
 let uatChatProvider: MusterChatProvider | undefined;
+/** Single-flight maintenance (backup/reset commands). */
+let maintenanceActive = false;
+/** One-shot peer reset after external developer reset (P5-W5). */
+let peerResetHandled = false;
 
 /** Shared host-env cache for first-turn inject + get_host_context (W1). */
 let hostEnvCache: HostEnvironmentSnapshot | undefined;
@@ -1567,7 +1578,11 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       onExternalRevisions: async ({ afterRevision, currentRevision }) => {
         await this.reconcileExternalRevisions(afterRevision, currentRevision);
       },
-      onRecovery: async () => {
+      onRecovery: async (reason) => {
+        if (reason === 'reset') {
+          await handlePeerExternalReset();
+          return;
+        }
         await this.postSnapshotAsync(this.focusedTaskId);
       },
     });
@@ -2977,6 +2992,11 @@ export async function activate(context: vscode.ExtensionContext) {
     throw new Error(message);
   }
 
+  const dbPath = path.join(context.globalStorageUri.fsPath, 'muster.sqlite3');
+
+  // Maintenance commands remain available even when storage open fails (P5-W5).
+  registerSqliteMaintenanceCommands(context, dbPath);
+
   const wsFolder = vscode.workspace.workspaceFolders?.[0];
   workspaceRoot = wsFolder?.uri.fsPath;
   const terminalLifecycle = createTerminalStorageLifecycle({
@@ -3025,7 +3045,7 @@ export async function activate(context: vscode.ExtensionContext) {
   });
   try {
     fs.mkdirSync(context.globalStorageUri.fsPath, { recursive: true });
-    await candidate.open(path.join(context.globalStorageUri.fsPath, 'muster.sqlite3'));
+    await candidate.open(dbPath);
     const workspace = await new WorkspaceRegistry(candidate).getOrCreate(
       resolveCurrentWorkspaceIdentity(context),
       new Date().toISOString(),
@@ -3052,7 +3072,9 @@ export async function activate(context: vscode.ExtensionContext) {
     });
     const diagnostic = diagnoseSqliteError(reportError, 'open');
     // Fail closed: do not start engine/scheduler/poller/writer on partial state.
-    throw new MusterSqliteActivationError(diagnostic.code, diagnostic.message);
+    // Maintenance commands remain registered above for explicit recovery.
+    debugMuster('sqlite.activation.fail_closed', redactedDiagnosticLogFields(diagnostic));
+    return;
   }
 
   const provider = new MusterChatProvider(context.extensionUri);
@@ -3716,6 +3738,162 @@ export async function activate(context: vscode.ExtensionContext) {
     const message = error instanceof Error ? error.message : String(error);
     void vscode.window.showErrorMessage(`Muster task engine disabled: ${message}`);
   }
+}
+
+/**
+ * One-shot peer response to external developer reset (revision regression).
+ * Hard-quiesce with zero repository writes, close the abandoned client, and
+ * offer Reload Window once.
+ */
+async function handlePeerExternalReset(): Promise<void> {
+  if (peerResetHandled) return;
+  peerResetHandled = true;
+  const doomed = sqliteClient;
+  applyTerminalStorageQuiesce({
+    productionProvider: chatProvider,
+    uatProvider: uatChatProvider,
+    engine: taskEngine,
+    clearHostRefs: () => {
+      taskEngine = undefined;
+      taskStore = undefined;
+      taskRepository = undefined;
+      sqliteClient = undefined;
+      sqliteWorkspaceId = undefined;
+    },
+  });
+  try {
+    await doomed?.close();
+  } catch {
+    // best-effort
+  }
+  const choice = await vscode.window.showErrorMessage(
+    'Muster global database was reset in another window. Reload this window to continue.',
+    'Reload Window',
+  );
+  if (choice === 'Reload Window') {
+    try {
+      await vscode.commands.executeCommand('workbench.action.reloadWindow');
+    } catch {
+      // best-effort
+    }
+  }
+}
+
+/**
+ * Register backup + developer reset commands (available even when storage open fails).
+ */
+function registerSqliteMaintenanceCommands(
+  context: vscode.ExtensionContext,
+  dbPath: string,
+): void {
+  const backupDepsBase = {
+    showSaveDialog: async ({ defaultFileName }: { defaultFileName: string }) => {
+      const uri = await vscode.window.showSaveDialog({
+        defaultUri: vscode.Uri.file(path.join(os.homedir(), defaultFileName)),
+        filters: { SQLite: ['sqlite3', 'db'] },
+      });
+      return uri ? { fsPath: uri.fsPath } : undefined;
+    },
+    destinationExists: (uri: { fsPath: string }) => fs.existsSync(uri.fsPath),
+    backup: async (destinationPath: string, options: { overwrite: boolean }) => {
+      const client = sqliteClient;
+      if (!client) {
+        const temp = new DbClient({ workerPath: resolveWorkerPath() });
+        try {
+          await temp.open(dbPath);
+          return await temp.backup(destinationPath, options);
+        } finally {
+          await temp.close().catch(() => undefined);
+        }
+      }
+      return client.backup(destinationPath, options);
+    },
+    showInformationMessage: (message: string) => {
+      void vscode.window.showInformationMessage(message);
+    },
+    showErrorMessage: (message: string) => {
+      void vscode.window.showErrorMessage(message);
+    },
+    isMaintenanceActive: () => maintenanceActive,
+    setMaintenanceActive: (active: boolean) => {
+      maintenanceActive = active;
+    },
+  };
+
+  const runBackupStandalone = () =>
+    handleBackupDatabaseCommand({
+      ...backupDepsBase,
+      skipMaintenanceGuard: false,
+    });
+
+  /** Internal backup-before-reset already owns the maintenance flag. */
+  const runBackupNested = () =>
+    handleBackupDatabaseCommand({
+      ...backupDepsBase,
+      skipMaintenanceGuard: true,
+    });
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(MUSTER_BACKUP_DATABASE_COMMAND, () =>
+      runBackupStandalone(),
+    ),
+    vscode.commands.registerCommand(MUSTER_DEVELOPER_RESET_COMMAND, () =>
+      handleDeveloperResetCommand({
+        showWarningMessage: async (message, ...items) =>
+          vscode.window.showWarningMessage(message, { modal: true }, ...items),
+        runBackupFlow: () => runBackupNested(),
+        isMaintenanceActive: () => maintenanceActive,
+        setMaintenanceActive: (active) => {
+          maintenanceActive = active;
+        },
+        quiesceForMaintenance: async () => {
+          await quiesceForMaintenance({
+            productionProvider: chatProvider,
+            uatProvider: uatChatProvider,
+            engine: taskEngine,
+            client: sqliteClient,
+            stopWriters: async () => {
+              try {
+                askBridge?.cancelAll('maintenance reset');
+              } catch {
+                // best-effort
+              }
+              try {
+                permissionBridge?.cancelAll();
+              } catch {
+                // best-effort
+              }
+            },
+            clearHostRefs: () => {
+              taskEngine = undefined;
+              taskStore = undefined;
+              taskRepository = undefined;
+              sqliteClient = undefined;
+              sqliteWorkspaceId = undefined;
+            },
+          });
+        },
+        resetDatabase: async () => {
+          // Recovery open: accepts incompatible Muster-owned DBs (no normal open).
+          const client = new DbClient({ workerPath: resolveWorkerPath() });
+          try {
+            return await client.reset({ path: dbPath });
+          } finally {
+            await client.close().catch(() => undefined);
+          }
+        },
+        reloadWindow: async () => {
+          await vscode.commands.executeCommand('workbench.action.reloadWindow');
+        },
+        showErrorMessage: (message) => {
+          void vscode.window.showErrorMessage(message);
+        },
+        showInformationMessage: (message) => {
+          void vscode.window.showInformationMessage(message);
+        },
+      }),
+    ),
+  );
 }
 
 /**

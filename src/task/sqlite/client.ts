@@ -12,6 +12,7 @@ import type {
   BackupResultMeta,
   DbRequest,
   DbResponse,
+  ResetResultMeta,
   RunResult,
   SqlStatement,
   SqlValue,
@@ -353,6 +354,32 @@ export class DbClient {
         : {}),
     });
     if (res.kind !== 'backup') {
+      throw new DbWorkerError(makeProtocolError());
+    }
+    return res.result;
+  }
+
+  /**
+   * In-place exclusive developer reset (P5-W5). Never unlinks the live trio.
+   * Caller must quiesce writers and own exclusive coordination with peers.
+   * When this client is not open, pass `path` for recovery open (incompatible OK).
+   */
+  async reset(
+    options: {
+      /** Filesystem path when the worker has no open connection (recovery). */
+      path?: string;
+      /** Test/UAT only — ignored without faultCapability. */
+      failBeforeCommit?: boolean;
+    } = {},
+  ): Promise<ResetResultMeta> {
+    const res = await this.send({
+      kind: 'reset',
+      ...(options.path ? { path: options.path } : {}),
+      ...(this.faultCapability && options.failBeforeCommit
+        ? { failBeforeCommit: true }
+        : {}),
+    });
+    if (res.kind !== 'reset') {
       throw new DbWorkerError(makeProtocolError());
     }
     return res.result;

@@ -22,8 +22,11 @@ export type WorkspaceRevisionPollerOptions = {
     afterRevision: number;
     currentRevision: number;
   }) => Promise<void>;
-  /** Gap / invariant / unrecoverable poll failure. */
-  onRecovery: (reason: 'gap' | 'invariant' | 'error') => void | Promise<void>;
+  /**
+   * Gap / invariant / unrecoverable poll failure.
+   * `reset` is revision regression after an external developer reset (P5-W5).
+   */
+  onRecovery: (reason: 'gap' | 'invariant' | 'error' | 'reset') => void | Promise<void>;
   /** Whether polling is allowed (view visible + window focused + not disposed). */
   isActive: () => boolean;
   /** Last revision this host has already published or recovered to. */
@@ -164,7 +167,10 @@ export class WorkspaceRevisionPoller {
         this.observedRevision = currentRevision;
         const applied = this.getAppliedRevision();
         if (currentRevision < applied) {
-          await this.onRecovery('invariant');
+          // External developer reset (or other identity-preserving wipe) lowers
+          // the workspace revision. Treat as a one-shot reset signal — not an
+          // ordinary recoverable invariant loop.
+          await this.onRecovery('reset');
           this.intervalMs = this.activeIntervalMs;
           // Do not commit lastDataVersion — recovery must re-run if it failed.
           return;

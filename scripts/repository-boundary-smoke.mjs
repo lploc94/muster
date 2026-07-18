@@ -248,6 +248,34 @@ export async function runRepositoryBoundarySmoke(rootDir = ROOT) {
   if (!workerText.includes('parseBackupRequest')) {
     failures.push('src/task/sqlite/worker.ts must exact-guard backup requests via parseBackupRequest.');
   }
+  // P5-W5: reset is worker-owned and never auto-invoked from activation open/write errors.
+  if (!workerText.includes("case 'reset'") || !workerText.includes('resetOpenDatabase')) {
+    failures.push('src/task/sqlite/worker.ts must dispatch reset via resetOpenDatabase.');
+  }
+  const resetText = texts.get('src/task/sqlite/reset.ts') ?? '';
+  if (resetText) {
+    if (!resetText.includes('BEGIN EXCLUSIVE') || !resetText.includes('CURRENT_SCHEMA_STATEMENTS')) {
+      failures.push('src/task/sqlite/reset.ts must rebuild under BEGIN EXCLUSIVE with current schema.');
+    }
+    if (/\b(?:unlinkSync|rmSync|renameSync|copyFileSync)\s*\(/.test(stripComments(resetText))) {
+      failures.push('src/task/sqlite/reset.ts must not unlink/rename/copy the live database trio.');
+    }
+  } else {
+    failures.push('src/task/sqlite/reset.ts must exist for P5-W5 developer reset.');
+  }
+  const extensionForReset = texts.get('src/extension.ts') ?? '';
+  if (extensionForReset) {
+    // Activation open/write catch must not auto-call reset.
+    const activateOpenCatch = extensionForReset.match(
+      /catch \(error\) \{[\s\S]*?MusterSqliteActivationError|activation\.fail_closed[\s\S]*?\n  \}/,
+    );
+    if (activateOpenCatch && /\.reset\s*\(/.test(activateOpenCatch[0])) {
+      failures.push('src/extension.ts must not auto-reset on activation/open failure.');
+    }
+    if (!extensionForReset.includes('registerSqliteMaintenanceCommands')) {
+      failures.push('src/extension.ts must register maintenance commands for backup/reset.');
+    }
+  }
   const backupText = texts.get('src/task/sqlite/backup.ts') ?? '';
   if (backupText) {
     if (!backupText.includes('VACUUM INTO') || !backupText.includes('preferredBackupMechanism')) {
