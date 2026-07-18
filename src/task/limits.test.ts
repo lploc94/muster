@@ -18,6 +18,18 @@ const BASE: TaskExecutionPolicy = {
   taskTimeoutMs: 1_800_000,
 };
 
+describe('DEFAULT_RESOURCE_LIMITS concurrency caps', () => {
+  it('exposes the raised M016 per-backend / global / per-root defaults', () => {
+    expect(DEFAULT_RESOURCE_LIMITS.maxConcurrentPerBackend).toBe(15);
+    expect(DEFAULT_RESOURCE_LIMITS.maxConcurrentTurns).toBe(30);
+    expect(DEFAULT_RESOURCE_LIMITS.maxConcurrentPerRoot).toBe(20);
+    // Unchanged structural bounds from pre-M016.
+    expect(DEFAULT_RESOURCE_LIMITS.maxChildrenPerTask).toBe(32);
+    expect(DEFAULT_RESOURCE_LIMITS.maxChildrenPerRoot).toBe(64);
+    expect(DEFAULT_RESOURCE_LIMITS.maxDepth).toBe(8);
+  });
+});
+
 describe('clampExecutionPolicy', () => {
   it('passes normal in-bounds values through unchanged', () => {
     const requested: Partial<TaskExecutionPolicy> = {

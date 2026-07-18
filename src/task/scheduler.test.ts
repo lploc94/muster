@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { canPromoteTurn, dependenciesBlockTask, dependencyTerminalOutcome } from './scheduler';
-import { DEFAULT_RESOURCE_LIMITS } from './limits';
-import type { MusterTask, TaskDependency, TaskStoreFile, TaskVerdict } from './types';
+import { DEFAULT_RESOURCE_LIMITS, type ResourceLimits } from './limits';
+import type { MusterTask, TaskDependency, TaskStoreFile, TaskTurn, TaskVerdict } from './types';
 
 function baseFile(): TaskStoreFile {
   return {
@@ -137,6 +137,95 @@ describe('scheduler', () => {
     expect(canPromoteTurn(file, 't1', DEFAULT_RESOURCE_LIMITS)).toEqual({
       ok: false,
       reason: 'dependencies not satisfied',
+    });
+  });
+
+  // Explicit small caps (not DEFAULT_RESOURCE_LIMITS) so raising M016 defaults
+  // cannot silently leave gate behavior untested at a convenient fixture size.
+  const SMALL_CAPS: ResourceLimits = {
+    ...DEFAULT_RESOURCE_LIMITS,
+    maxConcurrentTurns: 2,
+    maxConcurrentPerRoot: 2,
+    maxConcurrentPerBackend: 1,
+  };
+
+  function siblingWorker(
+    file: TaskStoreFile,
+    id: string,
+    backend: string,
+    parentId: string | null = 'root',
+  ): void {
+    file.tasks[id] = {
+      id,
+      role: 'worker',
+      lifecycle: 'open',
+      goal: id,
+      parentId,
+      dependencies: [],
+      backend,
+      capabilities: [],
+      executionPolicy: file.tasks.root!.executionPolicy,
+      revision: 0,
+      createdAt: 't',
+      updatedAt: 't',
+    };
+  }
+
+  function runningTurn(taskId: string, id: string): TaskTurn {
+    return {
+      id,
+      taskId,
+      sequence: 1,
+      trigger: 'engine',
+      status: 'running',
+      inputs: [],
+      createdAt: 't',
+      startedAt: 't',
+    };
+  }
+
+  it('blocks on global concurrency limit with an explicit small cap', () => {
+    const file = baseFile();
+    siblingWorker(file, 'w1', 'other');
+    siblingWorker(file, 'w2', 'other');
+    // Two live turns already occupy the global cap of 2.
+    file.turns.r1 = runningTurn('w1', 'r1');
+    file.turns.r2 = runningTurn('w2', 'r2');
+    expect(canPromoteTurn(file, 't1', SMALL_CAPS)).toEqual({
+      ok: false,
+      reason: 'global concurrency limit',
+    });
+  });
+
+  it('blocks on root concurrency limit with an explicit small cap', () => {
+    const file = baseFile();
+    siblingWorker(file, 'w1', 'other');
+    siblingWorker(file, 'w2', 'other');
+    // Two children of root already occupy maxConcurrentPerRoot=2; root's t1 waits.
+    file.turns.r1 = runningTurn('w1', 'r1');
+    file.turns.r2 = runningTurn('w2', 'r2');
+    // Raise global so root gate is the one that fires.
+    const limits: ResourceLimits = { ...SMALL_CAPS, maxConcurrentTurns: 10 };
+    expect(canPromoteTurn(file, 't1', limits)).toEqual({
+      ok: false,
+      reason: 'root concurrency limit',
+    });
+  });
+
+  it('blocks on backend concurrency limit with an explicit small cap', () => {
+    const file = baseFile();
+    siblingWorker(file, 'w1', 'grok'); // same backend as root
+    file.turns.r1 = runningTurn('w1', 'r1');
+    // Raise global/root so backend gate is the one that fires.
+    const limits: ResourceLimits = {
+      ...SMALL_CAPS,
+      maxConcurrentTurns: 10,
+      maxConcurrentPerRoot: 10,
+      maxConcurrentPerBackend: 1,
+    };
+    expect(canPromoteTurn(file, 't1', limits)).toEqual({
+      ok: false,
+      reason: 'backend concurrency limit',
     });
   });
 });
