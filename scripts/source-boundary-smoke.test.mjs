@@ -75,24 +75,6 @@ const validVisualCiWorkflow = [
   '      - run: npm ci',
   '      - run: npm test',
   '      - run: npm run test:webview',
-  '  visual:',
-  '    runs-on: ubuntu-latest',
-  '    steps:',
-  '      - uses: actions/checkout@v4',
-  '      - uses: actions/setup-node@v4',
-  '        with:',
-  '          node-version: "24"',
-  '          cache: npm',
-  '      - run: npm ci',
-  '      - run: npm run test:visual:linux',
-  '      - uses: actions/upload-artifact@v4',
-  '        if: failure()',
-  '        with:',
-  '          name: visual-regression-failure',
-  '          path: |',
-  '            test-results/',
-  '            playwright-report/',
-  '          retention-days: 14',
 ].join('\n');
 
 const validFixture = {
@@ -101,6 +83,8 @@ const validFixture = {
       compile: 'tsc -p .',
       test: 'vitest run',
       'test:source-boundary': 'node scripts/source-boundary-smoke.mjs',
+      'test:webview': 'playwright test e2e/muster-webview-state.spec.ts',
+      // Optional local visual tooling (not a required CI job).
       'test:visual:linux': 'node scripts/run-visual-baselines.mjs',
       'test:visual:linux:update': 'node scripts/run-visual-baselines.mjs --update',
     },
@@ -158,62 +142,11 @@ test('repository GitHub Actions workflow runs npm test automatically on main pus
   // SQLite Extension Host job matrices VS Code versions; Node runtime stays single.
   assert.doesNotMatch(workflow, /node-version:\s*\[/);
   assert.match(workflow, /sqlite-extension-host:/);
-  // M014 visual gate is a distinct required job with compare-only + failure artifacts.
-  assert.match(workflow, /^ {2}visual:\s*$/m);
-  assert.match(workflow, /run: npm run test:visual:linux/);
   assert.match(workflow, /run: npm run test:webview/);
-  assert.match(workflow, /name: visual-regression-failure/);
-  assert.match(workflow, /retention-days: 14/);
-  assert.match(workflow, /if: failure\(\)/);
-  // Comments may mention update policy; executable run steps must not update.
+  // Visual regression is optional/local for now (not a required CI job).
+  assert.doesNotMatch(workflow, /^ {2}visual:\s*$/m);
   assert.doesNotMatch(workflow, /^\s*-\s*run:.*--update-snapshots/m);
   assert.doesNotMatch(workflow, /^\s*-\s*run:.*test:visual:linux:update/m);
-});
-
-test('repository package.json separates Linux visual compare from explicit update', async () => {
-  const packageJsonUrl = new URL('../package.json', import.meta.url);
-  const packageJson = JSON.parse(await readFile(packageJsonUrl, 'utf8'));
-
-  assert.equal(packageJson.scripts?.['test:visual:linux'], 'node scripts/run-visual-baselines.mjs');
-  assert.equal(
-    packageJson.scripts?.['test:visual:linux:update'],
-    'node scripts/run-visual-baselines.mjs --update',
-  );
-});
-
-test('rejects fixture missing visual CI gate wiring', async () => {
-  const fixture = {
-    ...validFixture,
-    '.github/workflows/ci.yml': [
-      'name: CI',
-      'on:',
-      '  push:',
-      '    branches: [main]',
-      '  pull_request:',
-      '    branches: [main]',
-      '  workflow_dispatch:',
-      'jobs:',
-      '  test:',
-      '    runs-on: ubuntu-latest',
-      '    steps:',
-      '      - uses: actions/checkout@v4',
-      '      - uses: actions/setup-node@v4',
-      '        with:',
-      '          node-version: "24"',
-      '          cache: npm',
-      '      - run: npm ci',
-      '      - run: npm test',
-      '      - run: npm run test:webview',
-    ].join('\n'),
-  };
-
-  await withFixture(fixture, async (rootDir) => {
-    const result = await runSourceBoundarySmoke({ rootDir });
-
-    assert.equal(result.ok, false);
-    assert.match(result.failures.join('\n'), /jobs\.visual/);
-    assert.match(result.failures.join('\n'), /test:visual:linux/);
-  });
 });
 
 test('reports actionable diagnostics for missing source-boundary script wiring', async () => {

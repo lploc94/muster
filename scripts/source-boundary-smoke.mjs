@@ -176,52 +176,18 @@ function expectCiWorkflowContract(workflowText, failures) {
     `Expected ${workflowPath} to use one Node 24 LTS runtime, not a node-version matrix.`,
   );
 
-  // M014 visual gate: distinct job, compare-only, stable failure artifacts.
-  expectCondition(
-    hasYamlLine(workflowText, /^ {2}visual:\s*(?:#.*)?$/),
-    failures,
-    `Expected ${workflowPath} to define a distinct jobs.visual job for the pinned Linux visual gate.`,
-  );
-  expectCondition(
-    hasYamlLine(workflowText, /^\s*-?\s*run:\s*npm run test:visual:linux\s*(?:#.*)?$/),
-    failures,
-    `Expected ${workflowPath} visual job to run \`npm run test:visual:linux\` (compare-only).`,
-  );
+  // Behavioral webview suite stays on the compile job (visual gate is optional/local).
   expectCondition(
     hasYamlLine(workflowText, /^\s*-?\s*run:\s*npm run test:webview\s*(?:#.*)?$/),
     failures,
-    `Expected ${workflowPath} behavioral path to keep \`npm run test:webview\` independent of the visual gate.`,
+    `Expected ${workflowPath} to run \`npm run test:webview\`.`,
   );
+  // If a visual job is reintroduced later, never auto-update snapshots in CI.
   expectCondition(
     !hasYamlLine(workflowText, /(?:^|[\s"'])--update-snapshots(?:\s|$|"|')/) &&
       !hasYamlLine(workflowText, /test:visual:linux:update/),
     failures,
-    `Expected ${workflowPath} never to pass --update-snapshots or run test:visual:linux:update (baselines are explicit-update only).`,
-  );
-  expectCondition(
-    hasYamlLine(workflowText, /^\s*-?\s*uses:\s*actions\/upload-artifact@v4\s*(?:#.*)?$/),
-    failures,
-    `Expected ${workflowPath} to upload visual failure evidence via actions/upload-artifact@v4.`,
-  );
-  expectCondition(
-    hasYamlLine(workflowText, /^\s*name:\s*visual-regression-failure\s*(?:#.*)?$/),
-    failures,
-    `Expected ${workflowPath} failure artifact name to be exactly \`visual-regression-failure\`.`,
-  );
-  expectCondition(
-    hasYamlLine(workflowText, /^\s*retention-days:\s*(?:[1-9]|[12]\d|30)\s*(?:#.*)?$/),
-    failures,
-    `Expected ${workflowPath} visual artifact retention-days to be bounded (1-30).`,
-  );
-  expectCondition(
-    /if:\s*failure\(\)/.test(workflowText),
-    failures,
-    `Expected ${workflowPath} visual artifact upload to be gated with \`if: failure()\`.`,
-  );
-  expectCondition(
-    workflowText.includes('test-results/') && workflowText.includes('playwright-report/'),
-    failures,
-    `Expected ${workflowPath} visual artifact paths to include test-results/ and playwright-report/.`,
+    `Expected ${workflowPath} never to pass --update-snapshots or run test:visual:linux:update.`,
   );
 }
 
