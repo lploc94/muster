@@ -1,6 +1,7 @@
 # Plan: Coordinator delegate / child-task UX improve
 
 **Status:** PARTIAL (2026-07-15) — P0–P2 on `main`; C5 cancel/dep residuals under cleanup-legacy-debt.  
+**SUPERSEDED (M017-S07, 2026-07-18):** The **disposition_repair** feature surface described in P0.5 (durable `disposition_repair_pending`, deterministic `disposition_repair` model turns, repair-loop acceptance criteria) is **removed from production**. M017 invariant 7 and store v7 migration treat missing disposition as attention-only; legacy on-disk repair tokens migrate away and no live repair turn is enqueued. Sections below that still prescribe repair turns are **historical plan prose** and must not be re-implemented. See `docs/VERIFICATION-EVIDENCE.md` (M017-S07 D036 BLOCKED gates) and the M017 debt-ledger closeout.
 **Goal:** Coordinator spawns and finishes children in few tool steps; engine owns most child lifecycle; user only talks goals with the coordinator.
 
 **Sessions:**
@@ -107,27 +108,29 @@ Playbook: when waiting only on sinks, document that upstream failure either fail
 
 ---
 
-### P0.5 — Missing disposition repair (engine)
+### P0.5 — Missing disposition repair (engine) — SUPERSEDED by M017-S07
 
-When a **direct child** turn succeeds **without** staged disposition:
+> **SUPERSEDED (M017-S07):** Do **not** implement `disposition_repair` / `disposition_repair_pending` as a live feature. Production path: missing disposition → attention / supervised fallback only; **no** model repair turn. Schema v7 migrates legacy on-disk repair attention/turn suffixes. Historical steps retained below for archaeology only.
+
+When a **direct child** turn succeeds **without** staged disposition (historical design):
 
 1. **Exempt** turns that settled as `awaiting_parent_answer` (or other non-terminal orchestration settlements) — never treat those as missing disposition (ISSUE-9).
 2. **Do not** publish wakeable `attention: missing_disposition` to parent waits yet (ISSUE-4).
-3. Enter durable child state `disposition_repair_pending` (or equivalent attention kind **excluded** from wait `needs_attention` wake set).
-4. Enqueue **at most one** deterministic `disposition_repair` turn on **same child/session**.
-5. Turn id derived from settled turn; **persist before schedule** (reload-safe).
-6. Prompt: only ask child to stage `complete_task` / `fail_task` from prior work — **never invent summary**, never treat process success as lifecycle success.
-7. Default **ON** for workers under root `parent_may_seal_direct`; override off via `executionPolicy` / task type.
-8. **Only after** repair turn settles without disposition (or repair fails / is cancelled): publish wakeable `missing_disposition` attention and wake waiting parent; `set_task_lifecycle` remains supervised fallback.
-9. If repair stages disposition successfully → auto-seal as today → parent wait resolves normally (no premature parent turn).
+3. ~~Enter durable child state `disposition_repair_pending`~~ — **SUPERSEDED**; no live repair pending state.
+4. ~~Enqueue **at most one** deterministic `disposition_repair` turn~~ — **SUPERSEDED**; zero repair turns.
+5. ~~Turn id derived from settled turn; **persist before schedule**~~ — **SUPERSEDED**.
+6. Prompt: only ask child to stage `complete_task` / `fail_task` from prior work — **never invent summary**, never treat process success as lifecycle success. *(Still true for any supervised human/coordinator recovery — not auto repair.)*
+7. Default repair **OFF** / removed; override surface deleted.
+8. Publish wakeable `missing_disposition` attention and wake waiting parent when disposition is missing; `set_task_lifecycle` remains supervised fallback (**current**).
+9. ~~If repair stages disposition successfully~~ — **SUPERSEDED**; no auto repair path.
 
-**Acceptance**
+**Acceptance (current / post-M017)**
 
-- [ ] At most one repair turn per missing disposition
-- [ ] Never seals from adapter exit
-- [ ] **Parent does not continue on first omission** while repair is pending
-- [ ] Repair failure / second omission wakes parent without synthesized outcome
-- [ ] Reload does not duplicate repair
+- [x] Zero live `disposition_repair` feature surface in production source (migration-only split tokens OK)
+- [x] Never seals from adapter exit
+- [x] No model repair turn enqueued for missing disposition
+- [ ] Parent attention path for missing disposition remains supervised (product follow-up)
+- [x] Reload does not resurrect repair turns (v7 migration)
 
 ---
 
@@ -275,14 +278,17 @@ Engine: schedule by deps → seals or dep-policy terminals → barrier → conti
   (upstream fail does not silent-hang sinks)
 ```
 
-### Child forgot disposition
+### Child forgot disposition — SUPERSEDED (M017-S07)
 
 ```text
 Child turn OK without complete_task
-Engine: disposition_repair_pending (not parent-wakeable)
-       → one disposition_repair turn
-  → complete_task → seal → parent continues
-  OR repair fails → wakeable missing_disposition → parent + set_task_lifecycle
+Engine (current): wakeable missing_disposition attention → parent + set_task_lifecycle
+  (no disposition_repair_pending / no disposition_repair model turn)
+```
+
+Historical (do not re-implement):
+```text
+Engine: disposition_repair_pending → one disposition_repair turn → …
 ```
 
 ### Child asks parent
@@ -321,8 +327,8 @@ Child: resume with answers → complete_task
 - [ ] Crash/reload between persist and spawn
 - [ ] Explicit wait excludes unlisted children
 - [ ] Upstream fail + wait only on sinks: barrier resolves or parent attention (no hang)
-- [ ] Missing disposition → exactly one repair; parent **not** woken on first omission
-- [ ] Repair failure wakes parent without invented outcome; never seal from CLI exit
+- [x] Missing disposition → **no** repair turn (M017-S07 SUPERSEDED); attention / supervised fallback only
+- [x] Never seal from CLI exit; no invented repair outcome
 - [ ] Elicitation deny: MCP, ACP, native, extension each tested for workers
 - [ ] `ask_parent` full round-trip; N asking children at concurrency limit still allow parent turn
 - [ ] No disposition_repair / recovery hold while `awaiting_parent_answer`
@@ -339,7 +345,7 @@ Child: resume with answers → complete_task
 ## Suggested ship order
 
 1. **P0** compound wait fields + playbook + DAG unsatisfied rule (highest ROI)
-2. **P0.5** disposition repair with non-wakeable pending state
+2. **P0.5** disposition repair — **SUPERSEDED by M017-S07** (do not ship)
 3. **P0.5** multi-ingress gate + `ask_parent` answer protocol (+ terminal-parent rules)
 4. **P1** `continue_child` (reject-if-live only) + `cancel_tasks`
 5. **P2** UI aggregation

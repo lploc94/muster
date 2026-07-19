@@ -1,7 +1,8 @@
-import { randomUUID } from 'crypto';
+import { randomBytes, randomUUID } from 'crypto';
 import type { Answers, AskRef } from '../bridge/ask-bridge';
 import { AskBridge } from '../bridge/ask-bridge';
 import { CredentialRegistry } from '../bridge/credentials';
+import type { McpReadinessSupervisor } from '../bridge/mcp-readiness';
 import { runTurn as defaultRunTurn } from '../runner';
 import type { Backend, NormalizedEvent, RunOptions } from '../types';
 import type { TurnTrigger } from './types';
@@ -38,8 +39,10 @@ import {
   executeToolCommand,
   processCancelRequests,
   projectChildResults,
+  remintTurnMcpForAttempt,
   type GraphEngineDeps,
 } from './engine-graph';
+import { buildFreshSessionRecoveryPromptOrThrow } from './fresh-session-recovery-prompt';
 import {
   decideVerdictRetry,
   failureSignature,
@@ -149,7 +152,22 @@ export interface TaskEngineConfig {
   askBridge?: AskBridge;
   credentialRegistry?: CredentialRegistry;
   bridgePort?: number;
+  /**
+   * M017-S04 / D037: optional MCP readiness supervisor. When present with
+   * bridgePort>0 + credentialRegistry, onBeforePrompt refuses to mark
+   * prompt_outstanding until evaluate() is ready for the live turnId+attemptId.
+   */
+  mcpReadiness?: McpReadinessSupervisor;
+  /** Current MusterBridgeServer generation (for readiness evaluate). */
+  getBridgeGeneration?: () => number;
   resourceLimits?: ResourceLimits;
+  /**
+   * M016-S01 / D037: live ResourceLimits reader. When provided, every scheduling
+   * decision (promote / create-turn / rescan) re-reads caps so a host setting
+   * change takes effect on the next pass. Falls back to static `resourceLimits`
+   * then DEFAULT_RESOURCE_LIMITS when omitted (backward compatible).
+   */
+  getResourceLimits?: () => ResourceLimits;
   /** Live host ceiling, read only when a queued turn is durably promoted. */
   getRunLimitMs?: () => number;
   emit?: (e: EngineEvent) => void;
@@ -425,7 +443,13 @@ export class TaskEngine {
   private readonly askBridge: AskBridge;
   private readonly credentialRegistry?: CredentialRegistry;
   private readonly bridgePort: number;
-  private readonly resourceLimits: ResourceLimits;
+  private readonly mcpReadiness?: McpReadinessSupervisor;
+  private readonly getBridgeGeneration?: () => number;
+  /**
+   * Live ResourceLimits getter (M016-S01). Always a function so scheduling
+   * decision points can re-read host ceilings without reloading the engine.
+   */
+  private readonly getResourceLimits: () => ResourceLimits;
   private readonly getRunLimitMs: () => number;
   private readonly emit?: (e: EngineEvent) => void;
   private readonly isWorkspaceTrusted: () => boolean;
@@ -514,8 +538,25 @@ export class TaskEngine {
     this.askBridge = config.askBridge ?? new AskBridge();
     this.credentialRegistry = config.credentialRegistry;
     this.bridgePort = config.bridgePort ?? 0;
-    this.resourceLimits = config.resourceLimits ?? DEFAULT_RESOURCE_LIMITS;
+    this.mcpReadiness = config.mcpReadiness;
+    this.getBridgeGeneration = config.getBridgeGeneration;
+    this.getResourceLimits =
+      config.getResourceLimits ??
+      (() => config.resourceLimits ?? DEFAULT_RESOURCE_LIMITS);
     this.getRunLimitMs = config.getRunLimitMs ?? (() => DEFAULT_RUN_LIMIT_MS);
+    // Log effective caps once at engine load for diagnosis (slice verification).
+    const bootLimits = this.getResourceLimits();
+    console.info('[muster][task-orch] resource.limits', {
+      maxConcurrentTurns: bootLimits.maxConcurrentTurns,
+      maxConcurrentPerRoot: bootLimits.maxConcurrentPerRoot,
+      maxConcurrentPerBackend: bootLimits.maxConcurrentPerBackend,
+      maxTurnsPerTask: bootLimits.maxTurnsPerTask,
+      source: config.getResourceLimits
+        ? 'getResourceLimits'
+        : config.resourceLimits
+          ? 'resourceLimits'
+          : 'DEFAULT_RESOURCE_LIMITS',
+    });
     this.emit = config.emit;
     this.isWorkspaceTrusted = config.isWorkspaceTrusted ?? (() => true);
     this.prepareHostEnvironment = config.prepareHostEnvironment;
@@ -829,7 +870,8 @@ export class TaskEngine {
       credentials,
       askBridge: this.askBridge,
       bridgePort: this.bridgePort,
-      resourceLimits: this.resourceLimits,
+      // Live passthrough so each tool-command pass re-snapshots caps (M016-S01).
+      getResourceLimits: () => this.getResourceLimits(),
       getRunLimitMs: this.getRunLimitMs,
       clock: this.clock,
       liveRuns: this.liveRuns,
@@ -1408,6 +1450,65 @@ export class TaskEngine {
     };
   }
 
+  /** Durable queue row only — does not schedule or interrupt. */
+  private async reserveQueuedFollowUp(
+    taskId: string,
+    instruction: string,
+  ): Promise<EngineResult<{ messageId: string; turnId: string }>> {
+    const messageId = randomUUID();
+    const turnId = randomUUID();
+    const now = nowIso(this.clock);
+
+    const task = await this.repository.getTask(taskId);
+    if (!task) {
+      return { ok: false, reason: 'task not found' };
+    }
+    if (isTerminalLifecycle(task.lifecycle)) {
+      return { ok: false, reason: 'task is terminal' };
+    }
+
+    const existingTurns = await this.repository.listTurns(taskId);
+    const epoch = task.executionEpoch ?? 1;
+    const slotsUsed = existingTurns.filter(
+      (turn) => (turn.executionEpoch ?? 1) === epoch,
+    ).length;
+    if (slotsUsed >= effectiveTurnCap(task, this.getResourceLimits())) {
+      return { ok: false, reason: 'max turns per task exceeded' };
+    }
+
+    const message: TaskMessage = {
+      id: messageId,
+      taskId,
+      role: 'user',
+      content: instruction,
+      state: 'pending',
+      createdAt: now,
+    };
+
+    const queued = transitionContinueTask(task, existingTurns, {
+      turnId,
+      now,
+      inputs: [{ kind: 'message', messageId }],
+    });
+    if (!queued.ok) {
+      return queued;
+    }
+    // Handoff barrier is canPromoteTurn (active handoff phase), not holdAutoPromote.
+    const write = await this.repository.execute({
+      kind: 'enqueueMessageTurn',
+      workspaceId: this.workspaceId,
+      expectedTaskRevision: task.revision,
+      maxTurnsPerTask: this.getResourceLimits().maxTurnsPerTask,
+      task,
+      message,
+      turn: queued.next,
+    });
+    if (!write.changed) {
+      return { ok: false, reason: write.reason ?? 'task changed; retry' };
+    }
+    return { ok: true, value: { messageId, turnId } };
+  }
+
   async resumeQueuedTurnAsync(taskId: string, turnId: string): Promise<EngineResult<void>> {
     const turn = (await this.repository.listTurns(taskId)).find((candidate) => candidate.id === turnId);
     if (!turn) return { ok: false, reason: 'turn not found' };
@@ -1654,7 +1755,7 @@ export class TaskEngine {
     const slotsUsed = existingTurns.filter(
       (turn) => (turn.executionEpoch ?? 1) === epoch,
     ).length;
-    if (slotsUsed >= effectiveTurnCap(nextTask, this.resourceLimits)) {
+    if (slotsUsed >= effectiveTurnCap(nextTask, this.getResourceLimits())) {
       return { ok: false, reason: 'max turns per task exceeded' };
     }
 
@@ -1683,7 +1784,7 @@ export class TaskEngine {
         kind: 'enqueueMessageTurn',
         workspaceId: this.workspaceId,
         expectedTaskRevision: current.revision,
-        maxTurnsPerTask: this.resourceLimits.maxTurnsPerTask,
+        maxTurnsPerTask: this.getResourceLimits().maxTurnsPerTask,
         task: nextTask,
         message,
         turn: queue.next,
@@ -1781,7 +1882,7 @@ export class TaskEngine {
     const write = await this.repository.execute({
       kind: 'queueTaskTurn', workspaceId: this.workspaceId,
       expectedTaskRevision: task.revision,
-      maxTurnsPerTask: this.resourceLimits.maxTurnsPerTask,
+      maxTurnsPerTask: this.getResourceLimits().maxTurnsPerTask,
       task: nextTask, turn: result.next,
     });
     if (!write.changed) return { ok: false, reason: write.reason ?? 'task changed; retry' };
@@ -1798,7 +1899,7 @@ export class TaskEngine {
     if (!task) return { ok: false, reason: 'task not found' };
     if (isTerminalLifecycle(task.lifecycle)) return { ok: false, reason: 'task is terminal' };
     const turns = await this.repository.listTurns(taskId);
-    const cap = effectiveTurnCap(task, this.resourceLimits);
+    const cap = effectiveTurnCap(task, this.getResourceLimits());
     const epoch = task.executionEpoch ?? 1;
     if (turns.filter((turn) => (turn.executionEpoch ?? 1) === epoch).length >= cap) {
       return { ok: false, reason: 'max turns per task exceeded' };
@@ -1810,7 +1911,7 @@ export class TaskEngine {
     const write = await this.repository.execute({
       kind: 'queueTaskTurn', workspaceId: this.workspaceId,
       expectedTaskRevision: task.revision,
-      maxTurnsPerTask: this.resourceLimits.maxTurnsPerTask,
+      maxTurnsPerTask: this.getResourceLimits().maxTurnsPerTask,
       task, turn: result.next,
     });
     if (!write.changed) return { ok: false, reason: write.reason ?? 'task changed; retry' };
@@ -1928,7 +2029,7 @@ export class TaskEngine {
     }
     const write = await this.repository.execute({
       kind: 'retryTurn', workspaceId: this.workspaceId, expectedTaskRevision: task.revision,
-      maxTurnsPerTask: this.resourceLimits.maxTurnsPerTask, task: nextTask, turn: retry.next,
+      maxTurnsPerTask: this.getResourceLimits().maxTurnsPerTask, task: nextTask, turn: retry.next,
     });
     if (!write.changed) return { ok: false, reason: write.reason ?? 'task changed; retry' };
     void this.scheduleTurn(newTurnId);
@@ -2302,7 +2403,7 @@ export class TaskEngine {
         this.repository.countTurnsForTaskEpoch(task.id, executionEpoch),
         this.repository.getMaxTurnSequence(task.id),
       ]);
-      const cap = Math.min(this.resourceLimits.maxTurnsPerTask, task.executionPolicy.maxTurns);
+      const cap = Math.min(this.getResourceLimits().maxTurnsPerTask, task.executionPolicy.maxTurns);
       if (slotsUsed >= cap) continue;
       // Already-queued continuation (exact id) short-circuits wait clearing.
       if (await this.repository.getTurn(continuationTurnId)) {
@@ -2577,7 +2678,7 @@ export class TaskEngine {
           return;
         }
         draft.tasks[remediationId] = { ...created.next, releasedAt: now };
-        const turnCheck = canCreateTurn(draft, remediationId, this.resourceLimits);
+        const turnCheck = canCreateTurn(draft, remediationId, this.getResourceLimits());
         if (!turnCheck.ok) {
           // ISSUE 11 — roll back the partially-staged task in the SAME commit, then seal
           // (guarantees termination; never a silent delete-and-return hang).
@@ -3027,7 +3128,7 @@ export class TaskEngine {
         schemaVersion: 6, revision: 0,
         tasks: Object.fromEntries([workingTask].map((entry) => [entry.id, entry])),
         turns: Object.fromEntries(workingTurns.map((entry) => [entry.id, entry])), messages: {},
-      }, task.id, this.resourceLimits);
+      }, task.id, this.getResourceLimits());
       if (!cap.ok) break;
       const queued = transitionContinueTask(workingTask, workingTurns, {
         turnId: randomUUID(), now, inputs: [{ kind: 'message', messageId: message.id }], trigger: 'engine',
@@ -3040,7 +3141,7 @@ export class TaskEngine {
     const nextTask = { ...workingTask, revision: workingTask.revision + 1, updatedAt: now };
     const write = await this.repository.execute({
       kind: 'drainPendingSends', workspaceId: this.workspaceId,
-      expectedTaskRevision: task.revision, maxTurnsPerTask: this.resourceLimits.maxTurnsPerTask,
+      expectedTaskRevision: task.revision, maxTurnsPerTask: this.getResourceLimits().maxTurnsPerTask,
       task: nextTask, turns: continuationTurns,
       messages: pending.map((message) => ({ ...message, state: 'assigned' as const, turnId: continuationTurns.find((turn) => turn.inputs.some((input) => input.kind === 'message' && input.messageId === message.id))?.id })),
     });
@@ -3061,7 +3162,7 @@ export class TaskEngine {
     const task = this.store.getTask(taskId);
     if (!task) return true;
     const executionEpoch = task.executionEpoch ?? 1;
-    const cap = Math.min(this.resourceLimits.maxTurnsPerTask, task.executionPolicy.maxTurns);
+    const cap = Math.min(this.getResourceLimits().maxTurnsPerTask, task.executionPolicy.maxTurns);
     // Non-queued turns are committed slots; count them durably. The candidate
     // (still queued) consumes one more slot when it promotes.
     const nonQueued = await this.repository.countTurnsForTaskEpoch(taskId, executionEpoch, [
@@ -3132,7 +3233,7 @@ export class TaskEngine {
         } else if (isQueuedTurnAutoPromoteFrozen(afterFlush, queuedTurn.taskId, queuedTurn.id)) {
           continue;
         }
-        if (canPromoteTurn(this.store.getFile(), queuedTurn.id, this.resourceLimits).ok) void this.scheduleTurn(queuedTurn.id);
+        if (canPromoteTurn(this.store.getFile(), queuedTurn.id, this.getResourceLimits()).ok) void this.scheduleTurn(queuedTurn.id);
       }
     });
     return promise;
@@ -3157,7 +3258,7 @@ export class TaskEngine {
     if (turn && (await this.exceedsTurnLimit(turn.taskId, turnId))) {
       return;
     }
-    if (!canPromoteTurn(this.store.getFile(), turnId, this.resourceLimits).ok) {
+    if (!canPromoteTurn(this.store.getFile(), turnId, this.getResourceLimits()).ok) {
       // Persist missing_input attention when readiness blocks pin (W1/W5).
       const file = this.store.getFile();
       const t = file.turns[turnId];
@@ -3211,7 +3312,7 @@ export class TaskEngine {
     if (!draftTurn || draftTurn.status !== 'queued' || !draftTask) {
       return { ok: false, reason: 'turn is no longer schedulable' };
     }
-    const promote = canPromoteTurn(draft, turnId, this.resourceLimits);
+    const promote = canPromoteTurn(draft, turnId, this.getResourceLimits());
     if (!promote.ok) return { ok: false, reason: promote.reason };
     if (isTerminalLifecycle(draftTask.lifecycle)) return { ok: false, reason: 'task is terminal' };
     if ((draftTurn.runtimeEpoch ?? 1) !== (draftTask.runtimeEpoch ?? 1)) {
@@ -3463,9 +3564,9 @@ export class TaskEngine {
         messages,
         startedAt: now,
         rootTaskId,
-        maxConcurrentTurns: this.resourceLimits.maxConcurrentTurns,
-        maxConcurrentPerRoot: this.resourceLimits.maxConcurrentPerRoot,
-        maxConcurrentPerBackend: this.resourceLimits.maxConcurrentPerBackend,
+        maxConcurrentTurns: this.getResourceLimits().maxConcurrentTurns,
+        maxConcurrentPerRoot: this.getResourceLimits().maxConcurrentPerRoot,
+        maxConcurrentPerBackend: this.getResourceLimits().maxConcurrentPerBackend,
         ...(task.committedSessionId ? { sessionId: task.committedSessionId } : {}),
         resourceKeys: deriveResourceClaimKeys(task),
       });
@@ -3872,7 +3973,7 @@ export class TaskEngine {
       const current = this.store.getFile();
       const currentTurn = current.turns[turnId];
       const messages = messageMapFromFile(current);
-      const prompt = projectPrompt(currentTurn, messages, current, this.resourceLimits.maxResultBytes);
+      const prompt = projectPrompt(currentTurn, messages, current, this.getResourceLimits().maxResultBytes);
       console.info('[muster][task-orch] turn.run', {
         taskId: taskForDispatch.id,
         turnId,
@@ -3884,32 +3985,143 @@ export class TaskEngine {
         trigger: currentTurn?.trigger ?? null,
         promptChars: prompt.length,
       });
-      const built = this.bridgePort > 0 && this.credentialRegistry
-        ? buildRunOptionsForTurn(this.graphDeps(), turnId, {
-            prompt,
-            resumeId: taskForDispatch.committedSessionId,
-            signal: abort.signal,
-            // Run the agent in the task's workspace directory so ACP adapters
-            // pass it as session/new|load { cwd } instead of falling back to
-            // process.cwd() (wrong dir in a packaged extension).
-            cwd: taskForDispatch.cwd,
-            model: taskForDispatch.model,
-          })
-        : {
-            options: {
-              prompt,
-              resumeId: taskForDispatch.committedSessionId,
-              signal: abort.signal,
-              cwd: taskForDispatch.cwd,
-              model: taskForDispatch.model,
-            },
-          };
+      // MCP-enabled turns: optional readiness supervisor + multi-attempt mcpSetup
+      // (M017-S06 / D037). prepareAttempt allocates attemptId + remints credentials;
+      // awaitReady polls tools/list evidence before onBeforePrompt / prompt.
+      const mcpEnabled = this.bridgePort > 0 && !!this.credentialRegistry;
+      let attemptId: string | undefined;
+      const baseRun = {
+        prompt,
+        resumeId: taskForDispatch.committedSessionId,
+        signal: abort.signal,
+        // Run the agent in the task's workspace directory so ACP adapters
+        // pass it as session/new|load { cwd } instead of falling back to
+        // process.cwd() (wrong dir in a packaged extension).
+        cwd: taskForDispatch.cwd,
+        model: taskForDispatch.model,
+      };
+      // Provisional attempt mint so mcpServers array exists for in-place remint.
+      if (mcpEnabled) {
+        attemptId = randomBytes(8).toString('hex');
+      }
+      const built = mcpEnabled
+        ? buildRunOptionsForTurn(this.graphDeps(), turnId, baseRun, attemptId!)
+        : { options: { ...baseRun } };
       mcpConfigPath = built.mcpConfigPath;
+      // Ensure mutable shared mcpServers array for prepareAttempt remints.
+      if (mcpEnabled && !built.options.mcpServers) {
+        built.options.mcpServers = [];
+      }
+
+      if (mcpEnabled && this.mcpReadiness) {
+        const readiness = this.mcpReadiness;
+        const expectedTools = capabilitiesFor(taskForDispatch);
+        const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+        built.options.mcpSetup = {
+          maxAttempts: 2,
+          prepareAttempt: async () => {
+            attemptId = randomBytes(8).toString('hex');
+            const generation = this.getBridgeGeneration?.() ?? 1;
+            readiness.beginAttempt({
+              turnId,
+              attemptId,
+              expectedToolNames: expectedTools,
+              bridgeGeneration: generation,
+            });
+            const reminted = remintTurnMcpForAttempt(
+              this.graphDeps(),
+              turnId,
+              attemptId,
+              built.options,
+              mcpConfigPath,
+            );
+            mcpConfigPath = reminted.mcpConfigPath;
+            return {};
+          },
+          awaitReady: async (ctx) => {
+            if (!attemptId) {
+              return {
+                ok: false,
+                code: 'missing_evidence',
+                message: 'no attemptId for awaitReady',
+                retriable: true,
+              };
+            }
+            const generation = this.getBridgeGeneration?.() ?? 1;
+            // Cap per-attempt wait so attempt 2 retains setup budget for
+            // session/new|load + awaitReady (setupDeadlineAt is absolute in runAcpTurn).
+            const totalSetupMs = built.options.setupTimeoutMs ?? 5_000;
+            const budgetMs = Math.max(
+              100,
+              Math.min(Math.floor(totalSetupMs / 3), 5_000),
+            );
+            const deadline = Date.now() + budgetMs;
+            let last = readiness.evaluate(turnId, attemptId, generation);
+            while (!last.ok && Date.now() < deadline) {
+              if (abort.signal.aborted) {
+                return {
+                  ok: false,
+                  code: 'setup_timeout',
+                  message: 'awaitReady aborted',
+                  retriable: false,
+                };
+              }
+              await sleep(25);
+              last = readiness.evaluate(turnId, attemptId, generation);
+              if (last.ok) break;
+            }
+            if (last.ok) return { ok: true };
+            return {
+              ok: false,
+              code: last.code,
+              message: last.message,
+              retriable: true,
+              sticky: ctx.recoveryMode === 'load',
+            };
+          },
+          disposeAttempt: async () => {
+            if (attemptId && this.credentialRegistry) {
+              this.credentialRegistry.revokeAttempt(turnId, attemptId);
+            }
+          },
+          buildFreshSessionPrompt: async (ctx) => {
+            const fileNow = this.store.getFile();
+            const taskNow = fileNow.tasks[taskForDispatch.id];
+            const priorOutcomes: string[] = [];
+            for (const tr of Object.values(fileNow.turns)) {
+              if (tr.taskId !== taskForDispatch.id) continue;
+              if (tr.status === 'succeeded' && tr.disposition?.kind === 'complete') {
+                priorOutcomes.push(String(tr.disposition.result ?? ''));
+              } else if (typeof tr.error === 'string' && tr.error.trim()) {
+                priorOutcomes.push(tr.error);
+              }
+            }
+            return buildFreshSessionRecoveryPromptOrThrow({
+              goal: taskNow?.goal ?? taskForDispatch.goal,
+              brief: taskNow?.brief ?? taskForDispatch.brief,
+              priorOutcomes,
+              originalPrompt: prompt,
+              recoveryReason: ctx.previousFailure?.code ?? 'session_registry_sticky',
+            });
+          },
+        };
+      }
+
       // Phase C: mark prompt_outstanding immediately before side-effecting prompt.
       // Abort the ACP boundary if the durable marker cannot be written.
       built.options = {
         ...built.options,
         onBeforePrompt: async () => {
+          // D037 readiness gate: refuse prompt_outstanding when MCP is not ready.
+          if (this.mcpReadiness && mcpEnabled && attemptId) {
+            const generation = this.getBridgeGeneration?.() ?? 1;
+            const readinessEval = this.mcpReadiness.evaluate(turnId, attemptId, generation);
+            if (!readinessEval.ok) {
+              throw new Error(
+                'mcp readiness not ready: ' + readinessEval.code + ': ' + readinessEval.message,
+              );
+            }
+          }
           if (this.storageTerminal) {
             throw new Error('storage terminal');
           }
@@ -4211,6 +4423,11 @@ export class TaskEngine {
                 : armed && !adapterForced
                   ? 'confirmed'
                   : 'forced';
+              const preFlush = await this.streamBatcher.flushTurn(turnId);
+              if (!preFlush.ok) {
+                await markStreamPersistenceFailure(preFlush.message);
+                break;
+              }
               terminalSettled = await this.settleInterrupted(
                 turnId,
                 observedSessionId,
@@ -4223,22 +4440,33 @@ export class TaskEngine {
               }
             } else {
               const terminalReceived = event.meta?.failureClass === 'terminal_received';
+              const mcpSetupExhausted = event.meta?.mcpSetupCode === 'attempts_exhausted';
               const livePhase = this.store.getFile().turns[turnId]?.dispatchPhase;
               const failureClass =
                 terminalReceived
                   ? 'terminal_received'
                   : livePhase === 'prompt_outstanding'
                     ? 'uncertain'
-                    : livePhase === 'pre_dispatch' || livePhase === undefined
+                    : livePhase === 'pre_dispatch' || livePhase === undefined || mcpSetupExhausted
                       ? 'safe_to_retry'
                       : 'unclassified';
+              const preFlush = await this.streamBatcher.flushTurn(turnId);
+              if (!preFlush.ok) {
+                await markStreamPersistenceFailure(preFlush.message);
+                break;
+              }
               terminalSettled = await this.settleFailed(
                 turnId,
                 event.message,
                 observedSessionId,
                 rawOutput,
                 backend,
-                { terminalReceived, failureClass },
+                {
+                  terminalReceived,
+                  failureClass,
+                  suppressAutoRetry: mcpSetupExhausted,
+                  mcpSetupExhausted,
+                },
               );
               if (terminalSettled) {
                 this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message: event.message });
@@ -4520,6 +4748,8 @@ export class TaskEngine {
           lifecycle: task?.lifecycle,
           disposition: turn?.disposition?.kind ?? null,
           sealedBy: task?.sealedBy ?? null,
+          attention: task?.attention?.code ?? null,
+          hasCompletionCandidate: Boolean(task?.completionCandidate),
           resultChars: task?.taskResult?.summary?.length ?? 0,
         });
         if (
@@ -4568,7 +4798,7 @@ export class TaskEngine {
       tasks: Object.fromEntries([task].map((entry) => [entry.id, entry])),
       turns: Object.fromEntries(turns.map((entry) => [entry.id, entry])), messages: {},
     };
-    const turnCap = canCreateTurn(aggregate, taskId, this.resourceLimits);
+    const turnCap = canCreateTurn(aggregate, taskId, this.getResourceLimits());
     if (!turnCap.ok) {
       const write = await this.repository.execute({
         kind: 'setTaskAttention', workspaceId: this.workspaceId,
@@ -4599,7 +4829,7 @@ export class TaskEngine {
     }
     const write = await this.repository.execute({
       kind: 'enqueueDispositionRepair', workspaceId: this.workspaceId,
-      expectedTaskRevision: task.revision, maxTurnsPerTask: this.resourceLimits.maxTurnsPerTask,
+      expectedTaskRevision: task.revision, maxTurnsPerTask: this.getResourceLimits().maxTurnsPerTask,
       task: { ...task, revision: task.revision + 1, updatedAt: now }, turn: continued.next, message,
     });
     if (write.changed) void this.scheduleTurn(repairTurnId);
@@ -4723,6 +4953,8 @@ export class TaskEngine {
     opts?: {
       terminalReceived?: boolean;
       failureClass?: import('./types').TurnFailureClass;
+      suppressAutoRetry?: boolean;
+      mcpSetupExhausted?: boolean;
     },
   ): Promise<boolean> {
     if (this.storageTerminal) return false;
@@ -4760,6 +4992,7 @@ export class TaskEngine {
           onExhausted: 'recover',
           now,
           failureClass,
+          suppressAutoRetry: opts?.suppressAutoRetry === true || opts?.mcpSetupExhausted === true,
         });
         if (!result.ok) {
           return result;
@@ -4780,6 +5013,17 @@ export class TaskEngine {
         // Phase B: bind only terminal_received + nonblank observed session id
         // (never speculative candidate from raw output).
         let nextTask = result.next.task;
+        if (opts?.mcpSetupExhausted) {
+          nextTask = {
+            ...nextTask,
+            attention: {
+              code: 'mcp_unavailable',
+              message: errorMessage,
+              at: now,
+              sourceTurnId: turnId,
+            },
+          };
+        }
         if (
           opts?.terminalReceived &&
           !nextTask.committedSessionId &&
@@ -4805,21 +5049,6 @@ export class TaskEngine {
             },
           };
         }
-        // Repair turn failure: escalate to wakeable missing_disposition.
-        if (
-          turnId.endsWith('-disposition-repair') &&
-          nextTask.attention?.code === 'disposition_repair_pending'
-        ) {
-          nextTask = {
-            ...nextTask,
-            attention: {
-              code: 'missing_disposition',
-              message: 'disposition repair turn failed',
-              at: now,
-              sourceTurnId: turnId,
-            },
-          };
-        }
         draft.tasks[task.id] = nextTask;
         // Do not hold follow-ups when awaiting parent answer (answer continuation must promote).
         if (nextTask.attention?.code !== 'awaiting_parent_answer') {
@@ -4828,7 +5057,7 @@ export class TaskEngine {
 
         for (const effect of result.effects) {
           if (effect.kind === 'enqueueRetry') {
-            const turnCap = canCreateTurn(draft, task.id, this.resourceLimits);
+            const turnCap = canCreateTurn(draft, task.id, this.getResourceLimits());
             if (!turnCap.ok) {
               continue;
             }

@@ -1,5 +1,12 @@
 import { randomUUID } from 'crypto';
-import { BackendCapabilities, NormalizedEvent, RunOptions } from '../types';
+import {
+  BackendCapabilities,
+  McpSetupAttemptContext,
+  McpSetupPrepareResult,
+  McpSetupRecoveryMode,
+  NormalizedEvent,
+  RunOptions,
+} from '../types';
 import {
   AcpAgentConfig,
   type AcpModelConfig,
@@ -7,6 +14,14 @@ import {
   SessionUpdate,
   getSharedAcpClient,
 } from './acp-client';
+
+/** Strip secrets from setup failure messages (never leak bearer tokens). */
+function redactSetupMessage(message: string): string {
+  return message
+    .replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED]')
+    .replace(/MUSTER_BRIDGE_TOKEN[=:]\S*/gi, 'MUSTER_BRIDGE_TOKEN=[REDACTED]')
+    .replace(/Authorization:\s*\S+/gi, 'Authorization: [REDACTED]');
+}
 
 /**
  * Shared ACP turn runner.
@@ -325,63 +340,22 @@ export async function* runAcpTurn(
       return;
     }
 
-    if (options.resumeId) {
-      if (!client.loadSessionSupported) {
-        yield { type: 'error', message: `${spec.label} agent does not support session resume` };
-        return;
-      }
-      const setupMs = remainingSetupMs();
-      const loaded = await raceSetup(
-        setupMs === undefined
-          ? client.loadSession(options.resumeId, cwd, mcpServers)
-          : client.loadSession(options.resumeId, cwd, mcpServers, setupMs),
-      );
-      activeSessionId = loaded.sessionId;
-      if (isAborted()) {
-        yield cancellationTerminal();
-        return;
-      }
-      yield { type: 'sessionStarted', sessionId: activeSessionId };
-      unregister = client.registerSessionSink(activeSessionId, bufferUpdate);
-    } else {
-      const setupMs = remainingSetupMs();
-      const created = await raceSetup(
-        setupMs === undefined
-          ? client.newSession(cwd, mcpServers)
-          : client.newSession(cwd, mcpServers, setupMs),
-      );
-      activeSessionId = created.sessionId;
-      modelConfig = created.modelConfig;
-      if (isAborted()) {
-        yield cancellationTerminal();
-        return;
-      }
-      yield { type: 'sessionStarted', sessionId: activeSessionId };
-      unregister = client.registerSessionSink(activeSessionId, bufferUpdate);
-    }
-
-    if (isAborted()) {
-      yield cancellationTerminal();
-      return;
-    }
-
-    // Apply the selected model before prompting. Best-effort only for genuine
-    // model-selection failures; deadline/cancel must not proceed to onBeforePrompt.
-    if (options.model) {
+    const applyModel = async (sessionId: string): Promise<'ok' | 'cancel'> => {
+      if (!options.model) return 'ok';
       try {
         const setupMs = remainingSetupMs();
         if (modelConfig?.applyVia === 'session_set_model') {
           await raceSetup(
             setupMs === undefined
-              ? client.setSessionModel(activeSessionId, options.model)
-              : client.setSessionModel(activeSessionId, options.model, setupMs),
+              ? client.setSessionModel(sessionId, options.model)
+              : client.setSessionModel(sessionId, options.model, setupMs),
           );
         } else {
           const configId = modelConfig?.id ?? spec.modelConfigId ?? 'model';
           await raceSetup(
             setupMs === undefined
-              ? client.setConfigOption(activeSessionId, configId, options.model)
-              : client.setConfigOption(activeSessionId, configId, options.model, setupMs),
+              ? client.setConfigOption(sessionId, configId, options.model)
+              : client.setConfigOption(sessionId, configId, options.model, setupMs),
           );
         }
       } catch (err) {
@@ -391,53 +365,339 @@ export async function* runAcpTurn(
           message === 'ACP setup timed out before run deadline' ||
           isAborted()
         ) {
-          yield cancellationTerminal();
-          return;
+          return 'cancel';
         }
         // Non-fatal model option failure — continue with agent default.
       }
-    }
+      return 'ok';
+    };
 
-    if (isAborted()) {
-      yield cancellationTerminal();
-      return;
-    }
-    if (options.onBeforePrompt) {
-      await options.onBeforePrompt();
-    }
-    if (isAborted()) {
-      yield cancellationTerminal();
-      return;
-    }
+    const openSession = async (
+      resumeTarget: string | undefined,
+    ): Promise<{ sessionId: string } | { error: NormalizedEvent }> => {
+      if (resumeTarget) {
+        if (!client.loadSessionSupported) {
+          return {
+            error: {
+              type: 'error',
+              message: `${spec.label} agent does not support session resume`,
+            },
+          };
+        }
+        const setupMs = remainingSetupMs();
+        const loaded = await raceSetup(
+          setupMs === undefined
+            ? client.loadSession(resumeTarget, cwd, mcpServers)
+            : client.loadSession(resumeTarget, cwd, mcpServers, setupMs),
+        );
+        return { sessionId: loaded.sessionId };
+      }
+      const setupMs = remainingSetupMs();
+      const created = await raceSetup(
+        setupMs === undefined
+          ? client.newSession(cwd, mcpServers)
+          : client.newSession(cwd, mcpServers, setupMs),
+      );
+      modelConfig = created.modelConfig;
+      return { sessionId: created.sessionId };
+    };
 
-    const promptPromise = client.prompt(
-      activeSessionId,
-      options.prompt,
-      options.signal,
-      options.promptTimeoutMs,
-    );
-
-    while (true) {
-      while (pendingUpdates.length > 0) {
-        yield pendingUpdates.shift()!;
+    const drainPrompt = async function* (
+      sessionId: string,
+      promptText: string,
+    ): AsyncGenerator<NormalizedEvent, void, unknown> {
+      if (options.onBeforePrompt) {
+        await options.onBeforePrompt();
+      }
+      if (isAborted()) {
+        yield cancellationTerminal();
+        return;
       }
 
-      const race = await Promise.race([
-        promptPromise.then((r) => ({ kind: 'done' as const, result: r })),
-        new Promise<{ kind: 'tick' }>((resolve) => setTimeout(() => resolve({ kind: 'tick' }), 50)),
-      ]);
+      const promptPromise = client.prompt(
+        sessionId,
+        promptText,
+        options.signal,
+        options.promptTimeoutMs,
+      );
 
-      if (race.kind === 'tick') continue;
+      while (true) {
+        while (pendingUpdates.length > 0) {
+          yield pendingUpdates.shift()!;
+        }
 
-      while (pendingUpdates.length > 0) {
-        yield pendingUpdates.shift()!;
+        const race = await Promise.race([
+          promptPromise.then((r) => ({ kind: 'done' as const, result: r })),
+          new Promise<{ kind: 'tick' }>((resolve) => setTimeout(() => resolve({ kind: 'tick' }), 50)),
+        ]);
+
+        if (race.kind === 'tick') continue;
+
+        while (pendingUpdates.length > 0) {
+          yield pendingUpdates.shift()!;
+        }
+
+        const usageEvent = usageFromResult(race.result, spec);
+        if (usageEvent) yield usageEvent;
+        yield terminalFromPrompt(race.result, isAborted(), spec);
+        return;
+      }
+    };
+
+    // ── Legacy path (no mcpSetup): session → onBeforePrompt → prompt ─────────
+    if (!options.mcpSetup) {
+      const opened = await openSession(options.resumeId);
+      if ('error' in opened) {
+        yield opened.error;
+        return;
+      }
+      activeSessionId = opened.sessionId;
+      if (isAborted()) {
+        yield cancellationTerminal();
+        return;
+      }
+      yield { type: 'sessionStarted', sessionId: activeSessionId };
+      unregister = client.registerSessionSink(activeSessionId, bufferUpdate);
+
+      if (isAborted()) {
+        yield cancellationTerminal();
+        return;
       }
 
-      const usageEvent = usageFromResult(race.result, spec);
-      if (usageEvent) yield usageEvent;
-      yield terminalFromPrompt(race.result, isAborted(), spec);
+      // Only await model selection when a model is requested — a no-op await
+      // introduces a microtask that races mid-turn abort characterization tests.
+      if (options.model) {
+        const modelResult = await applyModel(activeSessionId);
+        if (modelResult === 'cancel') {
+          yield cancellationTerminal();
+          return;
+        }
+      }
+
+      if (isAborted()) {
+        yield cancellationTerminal();
+        return;
+      }
+
+      yield* drainPrompt(activeSessionId, options.prompt);
       return;
     }
+
+    // ── M017-S06: bounded pre-dispatch MCP setup loop (max 2 attempts) ───────
+    const mcpSetup = options.mcpSetup;
+    const maxAttempts = Math.max(1, Math.min(2, mcpSetup.maxAttempts ?? 2));
+    let forceFreshSession = false;
+    let previousFailure: { code: string; message: string } | undefined;
+    let activePrompt = options.prompt;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (isAborted()) {
+        yield cancellationTerminal();
+        return;
+      }
+
+      const recoveryMode: McpSetupRecoveryMode = forceFreshSession
+        ? 'fresh_after_sticky'
+        : options.resumeId && !forceFreshSession
+          ? 'load'
+          : 'new';
+      // Refine recoveryMode after prepareAttempt may override resume.
+      let ctx: McpSetupAttemptContext = {
+        attempt,
+        maxAttempts,
+        recoveryMode,
+        forceFreshSession,
+        previousFailure,
+      };
+
+      const preparedRaw = await mcpSetup.prepareAttempt(ctx);
+      const prepared: McpSetupPrepareResult =
+        preparedRaw && typeof preparedRaw === 'object' ? preparedRaw : {};
+
+      if (typeof prepared.prompt === 'string') {
+        activePrompt = prepared.prompt;
+      }
+
+      let resumeTarget: string | undefined;
+      if (forceFreshSession || prepared.resumeId === null) {
+        resumeTarget = undefined;
+        ctx = { ...ctx, recoveryMode: forceFreshSession ? 'fresh_after_sticky' : 'new' };
+      } else if (typeof prepared.resumeId === 'string') {
+        resumeTarget = prepared.resumeId;
+        ctx = { ...ctx, recoveryMode: 'load' };
+      } else if (options.resumeId && !forceFreshSession) {
+        resumeTarget = options.resumeId;
+        ctx = { ...ctx, recoveryMode: 'load' };
+      } else {
+        resumeTarget = undefined;
+        ctx = { ...ctx, recoveryMode: forceFreshSession ? 'fresh_after_sticky' : 'new' };
+      }
+
+      // Drop any prior attempt's sink before opening a replacement session.
+      unregister?.();
+      unregister = undefined;
+      activeSessionId = undefined;
+
+      let sessionId: string;
+      try {
+        const opened = await openSession(resumeTarget);
+        if ('error' in opened) {
+          // Non-retriable capability error (e.g. load unsupported).
+          yield opened.error;
+          return;
+        }
+        sessionId = opened.sessionId;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (message === 'Turn cancelled' || isAborted()) {
+          yield cancellationTerminal();
+          return;
+        }
+        const code =
+          message === 'ACP setup timed out before run deadline' ? 'setup_timeout' : 'missing_evidence';
+        const failure = { code, message: redactSetupMessage(message) };
+        previousFailure = failure;
+        await mcpSetup.disposeAttempt?.({ ...ctx, failure });
+        if (attempt >= maxAttempts || code === 'setup_timeout') {
+          yield {
+            type: 'error',
+            message: `mcp setup exhausted (attempts_exhausted): ${code} after ${attempt} attempts`,
+            meta: {
+              mcpSetupCode: 'attempts_exhausted',
+              readinessCode: code,
+              attemptCount: attempt,
+            },
+          };
+          return;
+        }
+        continue;
+      }
+
+      activeSessionId = sessionId;
+      if (isAborted()) {
+        yield cancellationTerminal();
+        return;
+      }
+      yield { type: 'sessionStarted', sessionId };
+      unregister = client.registerSessionSink(sessionId, bufferUpdate);
+
+      if (options.model) {
+        const modelResult = await applyModel(sessionId);
+        if (modelResult === 'cancel') {
+          yield cancellationTerminal();
+          return;
+        }
+      }
+      if (isAborted()) {
+        yield cancellationTerminal();
+        return;
+      }
+
+      const ready = await mcpSetup.awaitReady({ ...ctx, sessionId });
+      if (ready.ok) {
+        // Ready: at-most-once dispatch for this turn.
+        yield* drainPrompt(sessionId, activePrompt);
+        return;
+      }
+
+      const failure = {
+        code: String(ready.code),
+        message: redactSetupMessage(ready.message),
+      };
+      previousFailure = failure;
+
+      // Close only the failed session — never the shared process.
+      unregister?.();
+      unregister = undefined;
+      try {
+        await client.closeSession(sessionId);
+      } catch {
+        // Best-effort session/close.
+      }
+      activeSessionId = undefined;
+
+      await mcpSetup.disposeAttempt?.({
+        ...ctx,
+        sessionId,
+        failure,
+      });
+
+      const sticky =
+        ready.sticky === true ||
+        ready.code === 'session_registry_sticky';
+      const retriable = ready.retriable !== false && attempt < maxAttempts;
+
+      if (sticky) {
+        forceFreshSession = true;
+        if (mcpSetup.buildFreshSessionPrompt) {
+          try {
+            const recoveryPrompt = await mcpSetup.buildFreshSessionPrompt({
+              ...ctx,
+              forceFreshSession: true,
+              recoveryMode: 'fresh_after_sticky',
+              sessionId,
+              previousFailure: failure,
+            });
+            // Reject empty/whitespace recovery prompts — never dispatch a
+            // context-less prompt after sticky load failure (Design §9.3).
+            if (typeof recoveryPrompt !== 'string' || recoveryPrompt.trim().length === 0) {
+              yield {
+                type: 'error',
+                message: 'recovery prompt empty after sticky session failure',
+                meta: {
+                  mcpSetupCode: 'session_registry_sticky',
+                  readinessCode: failure.code,
+                  attemptCount: attempt,
+                },
+              };
+              return;
+            }
+            activePrompt = recoveryPrompt;
+          } catch (budgetErr) {
+            const budgetMessage =
+              budgetErr instanceof Error ? budgetErr.message : String(budgetErr);
+            yield {
+              type: 'error',
+              message: redactSetupMessage(
+                budgetMessage.includes('budget') || /recovery prompt/i.test(budgetMessage)
+                  ? budgetMessage
+                  : `recovery prompt failed: ${budgetMessage}`,
+              ),
+              meta: {
+                mcpSetupCode: 'session_registry_sticky',
+                readinessCode: failure.code,
+                attemptCount: attempt,
+              },
+            };
+            return;
+          }
+        }
+      }
+
+      if (!retriable) {
+        yield {
+          type: 'error',
+          message: `mcp setup exhausted (attempts_exhausted): ${failure.code} after ${attempt} attempts`,
+          meta: {
+            mcpSetupCode: 'attempts_exhausted',
+            readinessCode: failure.code,
+            attemptCount: attempt,
+          },
+        };
+        return;
+      }
+    }
+
+    // Loop completed without ready — should only happen if maxAttempts exhausted.
+    yield {
+      type: 'error',
+      message: `mcp setup exhausted (attempts_exhausted): ${previousFailure?.code ?? 'unknown'} after ${maxAttempts} attempts`,
+      meta: {
+        mcpSetupCode: 'attempts_exhausted',
+        readinessCode: previousFailure?.code ?? 'attempts_exhausted',
+        attemptCount: maxAttempts,
+      },
+    };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     if (isAborted()) {

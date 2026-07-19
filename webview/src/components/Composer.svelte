@@ -1834,7 +1834,6 @@
         <button
           type="button"
           class="icon-btn"
-          style="width: 28px; height: 28px;"
           onclick={cancel}
           aria-label="Stop this turn"
           use:tip={'Stop this turn'}
@@ -1847,7 +1846,6 @@
           <button
             type="button"
             class="icon-btn"
-            style="width: 28px; height: 28px;"
             onclick={send}
             aria-label="Send"
             use:tip={
@@ -1865,7 +1863,6 @@
           <button
             type="button"
             class="icon-btn"
-            style="width: 28px; height: 28px;"
             onclick={sendLiveInput}
             aria-label="Interrupt and send"
             use:tip={'Ctrl+Enter: interrupt & send (cut & continue)'}
@@ -1878,7 +1875,6 @@
         <button
           type="button"
           class="icon-btn"
-          style="width: 28px; height: 28px;"
           disabled
           aria-label="Running…"
           use:tip={'Running…'}

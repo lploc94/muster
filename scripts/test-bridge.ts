@@ -54,15 +54,33 @@ async function main(): Promise<void> {
     capabilities: MCP_CAPS,
     async *run(options: RunOptions): AsyncIterable<NormalizedEvent> {
       const bridgeEntry = options.mcpServers?.find((s) => s.name === 'muster_bridge');
-      if (bridgeEntry?.type === 'http') {
+      // ACP injection is stdio-only (M017-S07): secrets travel only via env.
+      let bridgeUrl: string | undefined;
+      let token: string | undefined;
+      if (bridgeEntry?.type === 'stdio') {
+        const envPairs = bridgeEntry.env ?? [];
+        bridgeUrl = envPairs.find((e) => e.name === 'MUSTER_BRIDGE_URL')?.value;
+        token = envPairs.find((e) => e.name === 'MUSTER_BRIDGE_TOKEN')?.value;
+        // Invariant 10: argv of the emitted spawn must not carry the token.
+        if (token && JSON.stringify(bridgeEntry.args ?? []).includes(token)) {
+          throw new Error('stdio muster_bridge argv leaked MUSTER_BRIDGE_TOKEN');
+        }
+      } else if (bridgeEntry) {
+        throw new Error(
+          `expected stdio muster_bridge after M017-S07, got type=${bridgeEntry.type}`,
+        );
+      }
+
+      if (bridgeUrl && token) {
         injectedMcp = true;
-        const auth = bridgeEntry.headers?.find((h) => h.name === 'Authorization')?.value ?? '';
-        const token = auth.startsWith('Bearer ') ? auth.slice('Bearer '.length) : auth;
         const isChild = options.prompt.includes('child work');
         const isContinuation = options.prompt.includes('[child_results]');
+        // Smoke fixture talks HTTP to the bridge with the same env the stdio
+        // proxy would receive; full proxy-process spawn is covered by the D037
+        // provider contract suite (mcp-provider-contract.test.ts).
         if (isChild) {
           await runBridgeToolAgent(
-            bridgeEntry.url,
+            bridgeUrl,
             token,
             JSON.stringify([
               { tool: 'complete_task', args: { opId: 'c1', result: 'child done' } },
@@ -70,10 +88,10 @@ async function main(): Promise<void> {
           );
           childAgentRan = true;
         } else if (isContinuation) {
-          await runBridgeToolAgent(bridgeEntry.url, token, 'coord-continuation');
+          await runBridgeToolAgent(bridgeUrl, token, 'coord-continuation');
           coordContinuationRan = true;
         } else {
-          await runBridgeToolAgent(bridgeEntry.url, token, 'coord-initial');
+          await runBridgeToolAgent(bridgeUrl, token, 'coord-initial');
           coordInitialRan = true;
         }
       }

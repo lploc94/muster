@@ -17,16 +17,53 @@ export interface TurnMcpResult {
   mcpConfigPath?: string;
 }
 
+/** Env key for the internal HTTP bridge base URL consumed by the stdio proxy. */
+export const MUSTER_BRIDGE_URL_ENV = 'MUSTER_BRIDGE_URL';
+/** Env key for the per-turn bearer token; never place this value in argv/logs. */
+export const MUSTER_BRIDGE_TOKEN_ENV = 'MUSTER_BRIDGE_TOKEN';
+
 function bridgeUrl(port: number): string {
   return `http://127.0.0.1:${port}/mcp`;
 }
 
-function bridgeAcpEntry(port: number, token: string): McpServerConfig {
+/**
+ * Resolve the Muster-owned stdio MCP proxy entry the same way ACP agent bundles
+ * are resolved (compiled dist layout, then source layout). Returns an absolute
+ * path so ACP agents spawn a stable local process.
+ */
+export function resolveMusterStdioProxyEntry(): string {
+  const candidates = [
+    // Compiled layout: dist/src/bridge/mcp-config.js -> sibling proxy
+    path.join(__dirname, 'mcp-stdio-proxy.js'),
+    // tsx / source layout: src/bridge/mcp-config.ts -> sibling .ts entry
+    path.join(__dirname, 'mcp-stdio-proxy.ts'),
+    // Source running against a built dist tree
+    path.join(__dirname, '..', '..', 'dist', 'src', 'bridge', 'mcp-stdio-proxy.js'),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      return path.resolve(candidate);
+    }
+  }
+  // Primary expected path; spawn will surface a clear ENOENT if packaging is wrong.
+  return path.resolve(candidates[0]);
+}
+
+/**
+ * ACP muster_bridge is always the Muster-owned stdio proxy (M017-S07).
+ * Built-in direct-HTTP ACP injection and the prior transport-env fallback are gone.
+ * Token travels only via env (invariant 10) — never argv.
+ */
+function bridgeAcpStdioEntry(port: number, token: string): McpServerConfig {
   return {
-    type: 'http',
+    type: 'stdio',
     name: 'muster_bridge',
-    url: bridgeUrl(port),
-    headers: [{ name: 'Authorization', value: `Bearer ${token}` }],
+    command: 'node',
+    args: [resolveMusterStdioProxyEntry()],
+    env: [
+      { name: MUSTER_BRIDGE_URL_ENV, value: bridgeUrl(port) },
+      { name: MUSTER_BRIDGE_TOKEN_ENV, value: token },
+    ],
   };
 }
 
@@ -46,7 +83,7 @@ export function buildTurnMcp(
   credentialToken: string,
   contextEngine?: McpServerConfig,
 ): TurnMcpResult {
-  const bridgeEntry = bridgeAcpEntry(bridge.port, credentialToken);
+  const bridgeEntry = bridgeAcpStdioEntry(bridge.port, credentialToken);
   const servers: McpServerConfig[] = contextEngine ? [contextEngine, bridgeEntry] : [bridgeEntry];
 
   if (isAcpBackend(backend)) {
@@ -60,13 +97,16 @@ export function buildTurnMcp(
         url: bridgeUrl(bridge.port),
         headers: { Authorization: `Bearer ${credentialToken}` },
       },
-      ...(contextEngine
+      ...(contextEngine && contextEngine.type !== 'stdio'
         ? {
             context_engine: {
               type: contextEngine.type,
               url: contextEngine.url,
               headers: Object.fromEntries(
-                (contextEngine.headers ?? []).map((h) => [h.name, h.value]),
+                (contextEngine.headers ?? []).map((h: { name: string; value: string }) => [
+                  h.name,
+                  h.value,
+                ]),
               ),
             },
           }

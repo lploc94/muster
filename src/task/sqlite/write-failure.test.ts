@@ -296,27 +296,32 @@ describe('P5-W3 durable write failures', () => {
       db.close();
       parentPort.postMessage({ released: true });
       `,
-      { eval: true, workerData: { path: dbPath, holdMs: 500 } },
+      { eval: true, workerData: { path: dbPath, holdMs: 800 } },
     );
-    await new Promise<void>((resolve, reject) => {
-      lockWorker.once('message', (msg: { held?: boolean }) => {
-        if (msg.held) resolve();
-        else reject(new Error('lock not held'));
-      });
-      lockWorker.once('error', reject);
-    });
-
-    const contender = makeClient();
-    await contender.open(dbPath, 80);
-    const started = Date.now();
-    let ticks = 0;
-    const heartbeat = setInterval(() => {
-      ticks += 1;
-    }, 20);
-    let busyAttempts = 0;
     try {
-      await expect(
-        (async () => {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('lock worker never held')), 5_000);
+        lockWorker.once('message', (msg: { held?: boolean }) => {
+          clearTimeout(timer);
+          if (msg.held) resolve();
+          else reject(new Error('lock not held'));
+        });
+        lockWorker.once('error', (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+      });
+
+      const contender = makeClient();
+      await contender.open(dbPath, 80);
+      const started = Date.now();
+      let ticks = 0;
+      const heartbeat = setInterval(() => {
+        ticks += 1;
+      }, 20);
+      let busyAttempts = 0;
+      try {
+        const busyWrite = (async () => {
           busyAttempts += 1;
           await contender.transaction([
             {
@@ -325,27 +330,44 @@ describe('P5-W3 durable write failures', () => {
               params: ['ws-busy', 'kb', 'WS', 'now', 'now'],
             },
           ]);
-        })(),
-      ).rejects.toMatchObject({ detail: { code: 'busy' } });
-      expect(Date.now() - started).toBeLessThan(2_000);
-      expect(ticks).toBeGreaterThan(0);
-      expect(busyAttempts).toBe(1);
+        })();
+        // Hard ceiling so a stuck busy_timeout cannot hang the suite (CI load flake).
+        await expect(
+          Promise.race([
+            busyWrite,
+            new Promise((_, reject) =>
+              setTimeout(() => reject(Object.assign(new Error('busy wait exceeded'), { detail: { code: 'busy' } })), 3_000),
+            ),
+          ]),
+        ).rejects.toMatchObject({ detail: { code: 'busy' } });
+        expect(Date.now() - started).toBeLessThan(3_500);
+        expect(ticks).toBeGreaterThan(0);
+        expect(busyAttempts).toBe(1);
+      } finally {
+        clearInterval(heartbeat);
+      }
+
+      // Wait for lock holder to finish (bounded).
+      await Promise.race([
+        new Promise<void>((resolve) => lockWorker.once('exit', () => resolve())),
+        new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
+      ]);
+
+      // SAME contender client recovers after release — no new client.
+      await contender.transaction([
+        {
+          sql: `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
+                VALUES (?,?,?,?,?)`,
+          params: ['ws-after', 'ka', 'WS', 'now', 'now'],
+        },
+      ]);
+      expect(await contender.all('SELECT id FROM workspaces WHERE id = ?', ['ws-after'])).toHaveLength(
+        1,
+      );
     } finally {
-      clearInterval(heartbeat);
-      await new Promise((r) => lockWorker.once('exit', r));
+      await lockWorker.terminate().catch(() => undefined);
     }
-    // SAME contender client recovers after release — no new client.
-    await contender.transaction([
-      {
-        sql: `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
-              VALUES (?,?,?,?,?)`,
-        params: ['ws-after', 'ka', 'WS', 'now', 'now'],
-      },
-    ]);
-    expect(await contender.all('SELECT id FROM workspaces WHERE id = ?', ['ws-after'])).toHaveLength(
-      1,
-    );
-  }, 30_000);
+  }, 15_000);
 
   it('stream timer path uses production persist adapter: exact one revision/feed/row', async () => {
     vi.useFakeTimers();

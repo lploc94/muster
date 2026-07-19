@@ -92,7 +92,7 @@ export interface TaskSummary {
     running: number;
     open: number;
     terminal: number;
-    repairPending: number;
+    awaitingParentSeal: number;
     needsParentInput: number;
     label: string;
   };
@@ -1150,7 +1150,7 @@ function isTaskSummary(v: unknown): v is TaskSummary {
           'running',
           'open',
           'terminal',
-          'repairPending',
+          'awaitingParentSeal',
           'needsParentInput',
           'label',
         ]) &&
@@ -1158,7 +1158,7 @@ function isTaskSummary(v: unknown): v is TaskSummary {
         isNonNegativeSafeInteger(v.childOrchestration.running) &&
         isNonNegativeSafeInteger(v.childOrchestration.open) &&
         isNonNegativeSafeInteger(v.childOrchestration.terminal) &&
-        isNonNegativeSafeInteger(v.childOrchestration.repairPending) &&
+        isNonNegativeSafeInteger(v.childOrchestration.awaitingParentSeal) &&
         isNonNegativeSafeInteger(v.childOrchestration.needsParentInput) &&
         isString(v.childOrchestration.label)))
   );

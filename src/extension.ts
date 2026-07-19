@@ -4,6 +4,7 @@ import type { Question } from './bridge/ask-bridge';
 import { PermissionBridge } from './bridge/permission-bridge';
 import type { PermissionRequest } from './bridge/permission-bridge';
 import { CredentialRegistry } from './bridge/credentials';
+import { McpReadinessSupervisor } from './bridge/mcp-readiness';
 import { MusterBridgeServer } from './bridge/server';
 import { makeBackend } from './backends/index';
 import {
@@ -154,6 +155,7 @@ import { isTerminalLifecycle } from './task/transitions';
 import { resolveWorkspaceCwd } from './task/workspace-cwd';
 import type { TaskStoreFile } from './task/types';
 import { runLimitMs } from './task/execution-policy';
+import { resourceLimitsFromSettings } from './task/limits';
 import { USER_INTERACTION_TIMEOUT_MS } from './host/interaction-timeouts';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -167,6 +169,7 @@ let elicitationDebugChannel: vscode.OutputChannel | undefined;
 /** Visible Output channel for picker/handoff diagnostics (View → Output → Muster Debug). */
 let musterDebugChannel: vscode.OutputChannel | undefined;
 let credentialRegistry: CredentialRegistry | undefined;
+let mcpReadiness: McpReadinessSupervisor | undefined;
 let bridgeServer: MusterBridgeServer | undefined;
 let taskEngine: TaskEngine | undefined;
 let taskStore: TaskReadPort | undefined;
@@ -3580,6 +3583,7 @@ export async function activate(context: vscode.ExtensionContext) {
     setElicitationController(elicitationController);
 
     credentialRegistry = new CredentialRegistry();
+    mcpReadiness = new McpReadinessSupervisor();
     const engineToolHandler = {
       handleToolCall: async (
         ctx: import('./bridge/credentials').CredentialContext,
@@ -3613,8 +3617,12 @@ export async function activate(context: vscode.ExtensionContext) {
     bridgeServer = new MusterBridgeServer({
       credentials: credentialRegistry,
       toolHandler: gatedToolHandler,
+      onMcpObservation: (obs) => {
+        mcpReadiness?.recordObservation(obs);
+      },
     });
     const { port } = await bridgeServer.listen();
+    mcpReadiness.noteBridgeGeneration(bridgeServer.getGeneration());
 
     const sqliteRepository = new SqliteTaskRepository(candidate, repositoryWorkspaceId());
     taskEngine = await TaskEngine.loadAsync({
@@ -3624,8 +3632,21 @@ export async function activate(context: vscode.ExtensionContext) {
       askBridge,
       credentialRegistry,
       bridgePort: port,
+      mcpReadiness,
+      getBridgeGeneration: () => bridgeServer?.getGeneration() ?? 1,
       getRunLimitMs: () =>
         runLimitMs(vscode.workspace.getConfiguration('muster.execution').get('runLimit')),
+      // M016: concurrency caps are read LIVE per scheduling pass (no cache),
+      // mirroring getRunLimitMs. Invalid/out-of-range values clamp to package
+      // bounds; structural caps stay on DEFAULT_RESOURCE_LIMITS.
+      getResourceLimits: () => {
+        const cfg = vscode.workspace.getConfiguration('muster.execution');
+        return resourceLimitsFromSettings({
+          maxConcurrentPerBackend: cfg.get('maxConcurrentPerBackend'),
+          maxConcurrentTurns: cfg.get('maxConcurrentTurns'),
+          maxConcurrentPerRoot: cfg.get('maxConcurrentPerRoot'),
+        });
+      },
       isWorkspaceTrusted: () => vscode.workspace.isTrusted,
       // Host execution of a task's verification commands is OFF unless the USER
       // explicitly enables it — commands become host-authorized, not agent-triggerable.

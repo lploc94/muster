@@ -919,9 +919,16 @@ describe('host task snapshot projection', () => {
           role: 'worker',
           lifecycle: 'open',
           attention: {
-            code: 'disposition_repair_pending',
-            message: 'repair',
+            code: 'awaiting_parent_seal',
+            message: 'awaiting parent seal',
             at: '2026-07-06T00:00:00.000Z',
+          },
+          completionCandidate: {
+            version: 1,
+            sourceTurnId: 't1',
+            observedAt: '2026-07-06T00:00:00.000Z',
+            summary: 'Turn completed without complete_task/fail_task disposition.',
+            reason: 'missing_disposition',
           },
         }),
         c2: task('c2', {
@@ -946,9 +953,12 @@ describe('host task snapshot projection', () => {
       running: 1,
       open: 1,
       terminal: 1,
-      repairPending: 1,
+      awaitingParentSeal: 1,
     });
+    expect(summary?.childOrchestration).not.toHaveProperty('repairPending');
     expect(summary?.childOrchestration?.label).toContain('running');
+    expect(summary?.childOrchestration?.label).toContain('awaiting parent seal');
+    expect(summary?.childOrchestration?.label).not.toContain('disposition retry');
     expect(projectTaskSummary(file, 'c1')).not.toHaveProperty('childOrchestration');
   });
 

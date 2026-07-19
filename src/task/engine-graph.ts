@@ -267,7 +267,17 @@ export interface GraphEngineDeps {
   credentials: CredentialRegistry;
   askBridge: AskBridge;
   bridgePort: number;
+  /**
+   * Static ResourceLimits snapshot (tests / backward compat). Prefer
+   * `getResourceLimits` when the host can change caps between tool calls.
+   */
   resourceLimits?: ResourceLimits;
+  /**
+   * M016-S01: live ResourceLimits reader. When present, executeToolCommand
+   * takes one snapshot at the top of the call so all create/promote gates in
+   * that pass share consistent caps, while the next tool call re-reads live.
+   */
+  getResourceLimits?: () => ResourceLimits;
   getRunLimitMs?: () => number;
   /** Bounds used to clamp agent-supplied execution policies. Defaults to DEFAULT_EXECUTION_POLICY_BOUNDS. */
   executionPolicyBounds?: ExecutionPolicyBounds;
@@ -503,6 +513,7 @@ export function pruneLedgerForTurn(draft: TaskStoreFile, turnId: string): void {
 export function issueTurnCredential(
   deps: GraphEngineDeps,
   turnId: string,
+  attemptId: string,
 ): string | undefined {
   const file = deps.store.getFile();
   const turn = file.turns[turnId];
@@ -520,6 +531,7 @@ export function issueTurnCredential(
     rootId,
     callerTaskId: task.id,
     turnId,
+    attemptId,
     allowedActions: actions,
     // Independent hard cap: even a large (clamped) turn timeout must not mint a
     // token that outlives MAX_BRIDGE_TOKEN_TTL_MS.
@@ -534,6 +546,8 @@ export function buildRunOptionsForTurn(
   deps: GraphEngineDeps,
   turnId: string,
   base: { prompt: string; resumeId?: string; signal?: AbortSignal; cwd?: string; model?: string },
+  /** Opaque engine-allocated attempt id (TaskEngine allocates per MCP-enabled turn). Defaults to 'a0' for non-engine call sites/tests. */
+  attemptId: string = 'a0',
 ): { options: import('../types').RunOptions; mcpConfigPath?: string } {
   const file = deps.store.getFile();
   const turn = file.turns[turnId];
@@ -542,7 +556,7 @@ export function buildRunOptionsForTurn(
     return { options: base };
   }
   const backend = deps.makeBackend(task.backend);
-  const token = issueTurnCredential(deps, turnId) ?? '';
+  const token = issueTurnCredential(deps, turnId, attemptId) ?? '';
   const turnMcp = buildTurnMcp(backend, { port: deps.bridgePort }, token);
   const remainingMs = remainingRunTimeMs(turn);
   return {
@@ -560,6 +574,48 @@ export function buildRunOptionsForTurn(
     },
     mcpConfigPath: turnMcp.mcpConfigPath,
   };
+}
+
+/**
+ * M017-S06: remint turn MCP for a new attemptId, mutating the live RunOptions
+ * mcpServers array in place so runAcpTurn's captured reference sees the new
+ * credential token on the next session/new|load.
+ */
+export function remintTurnMcpForAttempt(
+  deps: GraphEngineDeps,
+  turnId: string,
+  attemptId: string,
+  options: import('../types').RunOptions,
+  previousMcpConfigPath?: string,
+): { mcpConfigPath?: string } {
+  const file = deps.store.getFile();
+  const turn = file.turns[turnId];
+  const task = turn ? file.tasks[turn.taskId] : undefined;
+  if (!turn || !task) {
+    return { mcpConfigPath: previousMcpConfigPath };
+  }
+  const backend = deps.makeBackend(task.backend);
+  const token = issueTurnCredential(deps, turnId, attemptId) ?? '';
+  const turnMcp = buildTurnMcp(backend, { port: deps.bridgePort }, token);
+  if (turnMcp.mcpServers) {
+    if (!options.mcpServers) {
+      options.mcpServers = [...turnMcp.mcpServers];
+    } else {
+      options.mcpServers.splice(0, options.mcpServers.length, ...turnMcp.mcpServers);
+    }
+  }
+  if (previousMcpConfigPath && previousMcpConfigPath !== turnMcp.mcpConfigPath) {
+    deleteMcpConfigFile(previousMcpConfigPath);
+  }
+  if (turnMcp.mcpConfigPath) {
+    options.mcpConfigPath = turnMcp.mcpConfigPath;
+  }
+  const remainingMs = remainingRunTimeMs(turn);
+  if (remainingMs !== undefined) {
+    options.setupTimeoutMs = Math.max(1, remainingMs);
+    options.promptTimeoutMs = Math.max(1, remainingMs) + ACP_DEADLINE_BUFFER_MS;
+  }
+  return { mcpConfigPath: turnMcp.mcpConfigPath };
 }
 
 export function cleanupTurnResources(
@@ -613,7 +669,9 @@ export async function executeToolCommand(
   ctx: { callerTaskId: string; turnId: string; rootId: string; allowedActions?: ReadonlySet<string> },
   command: ToolCommand,
 ): Promise<{ ok: true; result: unknown } | { ok: false; error: string }> {
-  const limits = deps.resourceLimits ?? DEFAULT_RESOURCE_LIMITS;
+  // One ResourceLimits snapshot for this tool-command scheduling pass.
+  const limits =
+    deps.getResourceLimits?.() ?? deps.resourceLimits ?? DEFAULT_RESOURCE_LIMITS;
   const now = nowIso(deps.clock);
   const fingerprint = fingerprintCommand(command);
 

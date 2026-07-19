@@ -96,6 +96,11 @@ const requiredSettingsConcepts = [
       /muster\.permissions\.mode[\s\S]*(?:ask|allow|readonly)[\s\S]*pending[\s\S]*(?:stay|remain|isolation)/i,
   },
   {
+    name: 'execution concurrency caps contract',
+    pattern:
+      /muster\.execution\.maxConcurrentPerBackend[\s\S]*maxConcurrentTurns[\s\S]*maxConcurrentPerRoot[\s\S]*(?:1[-–]32|min 1[\s\S]*max 32)[\s\S]*(?:default 15|15)[\s\S]*(?:live|each scheduling pass)[\s\S]*(?:ACP process capacity|shared ACP)/i,
+  },
+  {
     name: 'Task Types ship defaults include breakdown',
     pattern:
       /breakdown[\s\S]*(?:coordinate|plan|implement|verify|research)|coordinate[\s\S]*plan[\s\S]*breakdown[\s\S]*implement[\s\S]*verify[\s\S]*research/i,

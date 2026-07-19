@@ -42,9 +42,32 @@ export interface ToolCallHandler {
   ): Promise<{ ok: true; result: unknown } | { ok: false; error: string }>;
 }
 
+/** MCP observation surface for readiness supervisors (no bearer tokens). */
+export type BridgeMcpObservationPhase = 'initialize' | 'list_tools';
+
+export interface BridgeMcpObservation {
+  phase: BridgeMcpObservationPhase;
+  toolNames?: string[];
+  credentialId: string;
+  turnId: string;
+  attemptId: string;
+  generation: number;
+  timestamp: number;
+}
+
 export interface MusterBridgeServerOptions {
   credentials: CredentialRegistry;
   toolHandler: ToolCallHandler;
+  /** Optional observer for ListTools/initialize catalogs (T02 readiness surface). */
+  onMcpObservation?: (obs: BridgeMcpObservation) => void;
+}
+
+export type BridgeHealthStatus = 'ok' | 'stopping';
+
+export interface BridgeHealthResponse {
+  status: BridgeHealthStatus;
+  generation: number;
+  port?: number;
 }
 
 const ALL_TOOLS: ToolAction[] = [
@@ -502,10 +525,15 @@ function isLoopbackOrigin(origin: string | undefined): boolean {
   }
 }
 
-function createMcpServer(
-  credentials: CredentialRegistry,
-  toolHandler: ToolCallHandler,
-): McpServer {
+interface CreateMcpServerOptions {
+  credentials: CredentialRegistry;
+  toolHandler: ToolCallHandler;
+  getGeneration: () => number;
+  onMcpObservation?: (obs: BridgeMcpObservation) => void;
+}
+
+function createMcpServer(options: CreateMcpServerOptions): McpServer {
+  const { credentials, toolHandler, getGeneration, onMcpObservation } = options;
   const server = new Server({ name: 'muster_bridge', version: '0.1.0' }, { capabilities: { tools: {} } });
 
   server.setRequestHandler(ListToolsRequestSchema, async (request, extra) => {
@@ -514,34 +542,45 @@ function createMcpServer(
     if (!verification.ok) logCredentialRejection(verification);
     const ctx = verification.ok ? verification.context : null;
     const allowed = ctx?.allowedActions ?? new Set<ToolAction>();
-    return {
-      tools: ALL_TOOLS.filter((name) => allowed.has(name)).map((name) => ({
-        name,
-        description:
-          name === 'get_host_context'
-            ? 'Refresh trusted host env, self ids, task-type registry summary, and role rules (same data as first-turn host block).'
-            : name === 'list_task_types'
-              ? 'Refresh configured muster.taskTypes (first-turn host context already lists them). Prefer taskType from host snapshot; omit backend/model unless the user named an override.'
-              : name === 'delegate_task'
-                ? 'Create a released child by taskType and queue first turn. Prefer waitForCompletion:true for one-shot spawn+wait. A successful compound wait is already armed: end the turn and do not poll. Omit wait fields for fire-and-forget.'
-                : name === 'create_task'
-                  ? 'Create a draft child by taskType (not scheduled until release_tasks). Prefer rich brief.'
-                  : name === 'delegate_tasks'
-                    ? 'Batch create+release up to 16 children. Optional waitForLocalIds arms the barrier; on success end the turn and do not poll.'
-                    : name === 'create_tasks'
-                      ? 'Batch create draft children (up to 16). Release later with release_tasks({ waitForTaskIds }). Intra-batch dependsOn → succeeded/fail.'
-                      : name === 'release_tasks'
-                        ? 'Atomically release drafts and queue first turns. Optional waitForTaskIds arms the barrier; on success end the turn and do not poll. No start_task.'
-                        : name === 'wait_for_tasks'
-                          ? 'Advanced: monotonically add children to the current wait barrier. Redundant calls succeed. After success end the current turn; do not poll get_task_status.'
-                          : name === 'set_task_lifecycle'
-                            ? "Parent-seal a direct child's lifecycle (succeeded/failed/…). Use when child did not complete_task."
-                            : name === 'upsert_presentation'
-                              ? 'Open or refresh a read-only IDE tab with Markdown (```mermaid``` fences supported). REQUIRED when the user asks to plan/spec for review or when a plan is ready: pass the full plan as markdown — do not only paste it in chat. Args: presentationId (stable, e.g. plan-<taskId>), ownerTaskId (must equal self.taskId), opId (unique per call), revision (1 then ++), title, markdown, optional kind (plan|spec|document), optional summary. Never send sourcePath, sourceFolderUri, updatedAt, or rootId (host-owned).'
-                            : `Muster coordinator tool: ${name}`,
-        inputSchema: TOOL_INPUT_SCHEMAS[name],
-      })),
-    };
+    const tools = ALL_TOOLS.filter((name) => allowed.has(name)).map((name) => ({
+      name,
+      description:
+        name === 'get_host_context'
+          ? 'Refresh trusted host env, self ids, task-type registry summary, and role rules (same data as first-turn host block).'
+          : name === 'list_task_types'
+            ? 'Refresh configured muster.taskTypes (first-turn host context already lists them). Prefer taskType from host snapshot; omit backend/model unless the user named an override.'
+            : name === 'delegate_task'
+              ? 'Create a released child by taskType and queue first turn. Prefer waitForCompletion:true for one-shot spawn+wait. A successful compound wait is already armed: end the turn and do not poll. Omit wait fields for fire-and-forget.'
+              : name === 'create_task'
+                ? 'Create a draft child by taskType (not scheduled until release_tasks). Prefer rich brief.'
+                : name === 'delegate_tasks'
+                  ? 'Batch create+release up to 16 children. Optional waitForLocalIds arms the barrier; on success end the turn and do not poll.'
+                  : name === 'create_tasks'
+                    ? 'Batch create draft children (up to 16). Release later with release_tasks({ waitForTaskIds }). Intra-batch dependsOn → succeeded/fail.'
+                    : name === 'release_tasks'
+                      ? 'Atomically release drafts and queue first turns. Optional waitForTaskIds arms the barrier; on success end the turn and do not poll. No start_task.'
+                      : name === 'wait_for_tasks'
+                        ? 'Advanced: monotonically add children to the current wait barrier. Redundant calls succeed. After success end the current turn; do not poll get_task_status.'
+                        : name === 'set_task_lifecycle'
+                          ? "Parent-seal a direct child's lifecycle (succeeded/failed/…). Use when child did not complete_task."
+                          : name === 'upsert_presentation'
+                            ? 'Open or refresh a read-only IDE tab with Markdown (```mermaid``` fences supported). REQUIRED when the user asks to plan/spec for review or when a plan is ready: pass the full plan as markdown — do not only paste it in chat. Args: presentationId (stable, e.g. plan-<taskId>), ownerTaskId (must equal self.taskId), opId (unique per call), revision (1 then ++), title, markdown, optional kind (plan|spec|document), optional summary. Never send sourcePath, sourceFolderUri, updatedAt, or rootId (host-owned).'
+                          : `Muster coordinator tool: ${name}`,
+      inputSchema: TOOL_INPUT_SCHEMAS[name],
+    }));
+    if (ctx && onMcpObservation) {
+      // Exact filtered catalog returned to the client — never include the bearer token.
+      onMcpObservation({
+        phase: 'list_tools',
+        toolNames: tools.map((t) => t.name),
+        credentialId: ctx.credentialId,
+        turnId: ctx.turnId,
+        attemptId: ctx.attemptId,
+        generation: getGeneration(),
+        timestamp: Date.now(),
+      });
+    }
+    return { tools };
   });
 
   server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
@@ -574,13 +613,56 @@ function createMcpServer(
 export class MusterBridgeServer {
   private readonly credentials: CredentialRegistry;
   private readonly toolHandler: ToolCallHandler;
+  private readonly onMcpObservation?: (obs: BridgeMcpObservation) => void;
   private httpServer?: http.Server;
   private port = 0;
+  /** Monotonic bind generation. Starts at 1; bumps on every re-listen after a prior bind. */
+  private generation = 1;
+  private hasBoundOnce = false;
+  private healthStatus: BridgeHealthStatus = 'ok';
   private readonly transports = new Map<string, McpStreamableHttpTransport>();
+  /**
+   * Bridge-local setup semaphore (async mutex/queue) for concurrent MCP session
+   * transport create+connect. Not TaskStore locking — only serializes first-touch
+   * initialize on this process so the session map stays coherent.
+   */
+  private setupTail: Promise<void> = Promise.resolve();
 
   constructor(options: MusterBridgeServerOptions) {
     this.credentials = options.credentials;
     this.toolHandler = options.toolHandler;
+    this.onMcpObservation = options.onMcpObservation;
+  }
+
+  getGeneration(): number {
+    return this.generation;
+  }
+
+  /**
+   * Run `fn` under the bridge-local setup semaphore. Concurrent initialize
+   * setups queue here; list/call on existing sessions only await if a setup is
+   * already in the critical section (they do not enter the lock themselves).
+   */
+  private async withSetupLock<T>(fn: () => Promise<T>): Promise<T> {
+    const prev = this.setupTail;
+    let release!: () => void;
+    this.setupTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  private emitObservation(obs: BridgeMcpObservation): void {
+    try {
+      this.onMcpObservation?.(obs);
+    } catch {
+      // Observer failures must not break MCP request handling.
+    }
   }
 
   async listen(): Promise<{ port: number }> {
@@ -588,7 +670,28 @@ export class MusterBridgeServer {
       return { port: this.port };
     }
 
+    this.healthStatus = 'ok';
     const app = createMcpExpressApp({ host: '127.0.0.1' });
+
+    // Unauthenticated loopback health — no TaskStore I/O, no credential required.
+    app.get(
+      '/health',
+      (
+        _req: http.IncomingMessage,
+        res: http.ServerResponse & {
+          status: (code: number) => { json: (body: unknown) => void };
+        },
+      ) => {
+        const body: BridgeHealthResponse = {
+          status: this.healthStatus,
+          generation: this.generation,
+        };
+        if (this.port > 0) {
+          body.port = this.port;
+        }
+        res.status(200).json(body);
+      },
+    );
 
     app.all('/mcp', async (req: http.IncomingMessage & { body?: unknown }, res: http.ServerResponse & { status: (code: number) => { json: (body: unknown) => void } }) => {
       const token = parseBearer(req.headers.authorization);
@@ -615,22 +718,41 @@ export class MusterBridgeServer {
         if (sessionId && this.transports.has(sessionId)) {
           transport = this.transports.get(sessionId);
         } else if (!sessionId && req.method === 'POST' && isInitializeRequest(body)) {
-          transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => randomUUID(),
-            onsessioninitialized: (sid) => {
-              if (transport) {
-                this.transports.set(sid, transport);
+          // Serialize concurrent first-touch MCP session setup (bridge-local only).
+          transport = await this.withSetupLock(async () => {
+            const newTransport = new StreamableHTTPServerTransport({
+              sessionIdGenerator: () => randomUUID(),
+              onsessioninitialized: (sid) => {
+                this.transports.set(sid, newTransport);
+              },
+            });
+            newTransport.onclose = () => {
+              const sid = newTransport.sessionId;
+              if (sid) {
+                this.transports.delete(sid);
               }
-            },
+            };
+            const mcpServer = createMcpServer({
+              credentials: this.credentials,
+              toolHandler: this.toolHandler,
+              getGeneration: () => this.generation,
+              onMcpObservation: this.onMcpObservation
+                ? (obs) => this.emitObservation(obs)
+                : undefined,
+            });
+            await mcpServer.connect(newTransport);
+            // Initialize is observable at session creation (credential already verified).
+            const ctx = verification.context;
+            this.emitObservation({
+              phase: 'initialize',
+              credentialId: ctx.credentialId,
+              turnId: ctx.turnId,
+              attemptId: ctx.attemptId,
+              generation: this.generation,
+              timestamp: Date.now(),
+            });
+            return newTransport;
           });
-          transport.onclose = () => {
-            const sid = transport?.sessionId;
-            if (sid) {
-              this.transports.delete(sid);
-            }
-          };
-          const mcpServer = createMcpServer(this.credentials, this.toolHandler);
-          await mcpServer.connect(transport);
         } else {
           res.status(400).json({ error: 'invalid session' });
           return;
@@ -651,6 +773,11 @@ export class MusterBridgeServer {
         if (typeof addr === 'object' && addr) {
           this.port = addr.port;
           this.httpServer = server;
+          // First bind keeps generation at 1; every re-listen after close bumps.
+          if (this.hasBoundOnce) {
+            this.generation += 1;
+          }
+          this.hasBoundOnce = true;
           resolve();
         } else {
           reject(new Error('failed to bind bridge server'));
@@ -667,6 +794,7 @@ export class MusterBridgeServer {
   }
 
   async close(): Promise<void> {
+    this.healthStatus = 'stopping';
     for (const transport of this.transports.values()) {
       await transport.close();
     }

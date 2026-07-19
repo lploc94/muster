@@ -1,10 +1,11 @@
 import { synthesizeBriefFromGoal } from './brief';
-import { buildTaskResultFromSummary } from './dataflow';
+import { buildTaskResultFromSummary, clampSummary } from './dataflow';
 import { validateDependencies, type DepGraph } from './deps';
 import type {
   MusterTask,
   TaskBriefV1,
   TaskCapability,
+  TaskCompletionCandidateV1,
   TaskDependency,
   TaskExecutionPolicy,
   TaskInputBinding,
@@ -22,6 +23,10 @@ import type {
   TurnTrigger,
 } from './types';
 import { truncateUtf8Bytes } from './content-limits';
+
+/** Fallback when a child omits disposition and no assistant summary is available. */
+export const MISSING_DISPOSITION_CANDIDATE_SUMMARY =
+  'Turn completed without complete_task/fail_task disposition.';
 
 /** Named parent-orchestration policy for child auto-seal (W4). */
 export type ChildOrchestrationSealMode = 'parent_may_seal_direct' | 'propose_only';
@@ -395,6 +400,11 @@ export function applySuccessfulTurn(
     sealedBy?: TaskSealedBy;
     /** Root's childOrchestrationSeal policy (required for correct propose_only). */
     rootChildOrchestrationSeal?: ChildOrchestrationSealMode;
+    /**
+     * Optional final assistant summary for a missing-disposition completionCandidate.
+     * Prefer the completed assistant message; transitions clamp and fall back if absent.
+     */
+    candidateSummary?: string;
   },
 ): TransitionResult<{ task: MusterTask; turn: TaskTurn }> {
   if (isTerminalLifecycle(task.lifecycle)) {
@@ -455,23 +465,38 @@ export function applySuccessfulTurn(
         effects,
       };
     }
-    // CLI success without disposition: no seal.
-    // First omission on a normal turn → non-wakeable repair_pending (P0.5).
-    // Repair turn still omitting → wakeable missing_disposition for parent.
-    const isRepairTurn = turn.id.endsWith('-disposition-repair');
-    const attentionCode = isRepairTurn ? 'missing_disposition' : 'disposition_repair_pending';
+    // Successful terminal without complete/fail: settle once, never seal from end_turn.
+    // Root chat is allowed to end without a terminal tool — leave open/idle, no fake attention.
+    // Non-root child: store a completionCandidate and wake parent via awaiting_parent_seal.
+    if (task.parentId === null) {
+      return {
+        ok: true,
+        next: { task, turn: succeededTurn },
+        effects,
+      };
+    }
+
+    const summary = clampSummary(
+      options.candidateSummary?.trim() || MISSING_DISPOSITION_CANDIDATE_SUMMARY,
+    );
+    const completionCandidate: TaskCompletionCandidateV1 = {
+      version: 1,
+      sourceTurnId: turn.id,
+      observedAt: options.now,
+      summary,
+      reason: 'missing_disposition',
+    };
     return {
       ok: true,
       next: {
         task: bumpTask(task, options.now, {
           attention: {
-            code: attentionCode,
-            message: isRepairTurn
-              ? 'disposition repair turn still omitted complete/fail'
-              : 'turn succeeded without complete/fail disposition; repair pending',
+            code: 'awaiting_parent_seal',
+            message: 'turn completed without complete/fail; awaiting parent seal',
             at: options.now,
             sourceTurnId: turn.id,
           },
+          completionCandidate,
         }),
         turn: succeededTurn,
       },
@@ -610,6 +635,12 @@ export function applyFailedTurn(
      * and enqueues a silent retry. Other classes never auto-retry.
      */
     failureClass?: TurnFailureClass;
+    /**
+     * M017-S06: when true, do not enqueue generic automatic model retry even if
+     * failureClass is safe_to_retry (mcp setup exhaustion already ran its own
+     * bounded pre-dispatch recovery loop).
+     */
+    suppressAutoRetry?: boolean;
   },
 ): TransitionResult<{ task: MusterTask; turn: TaskTurn }> {
   if (isTerminalLifecycle(task.lifecycle)) {
@@ -635,8 +666,11 @@ export function applyFailedTurn(
   };
 
   // Silent auto-retry only for durable pre-dispatch safety (Phase C).
+  // M017-S06: mcp setup exhaustion already exhausted its own max-2 loop — do not
+  // enqueue a generic automatic model retry for the same setup failure.
   if (
     failureClass === 'safe_to_retry' &&
+    !options.suppressAutoRetry &&
     options.retryCount < options.policy.maxAutomaticRetries
   ) {
     return {
@@ -1168,9 +1202,8 @@ export function resolveChildWait(
     options.childAttention
   ) {
     const attentionChild = wait.taskIds.find((id) => {
-      const att = options.childAttention?.get(id);
-      // disposition_repair_pending must not wake the parent (P0.5).
-      return att !== undefined && att.code !== 'disposition_repair_pending';
+      // Any child attention (including awaiting_parent_seal) wakes the parent.
+      return options.childAttention?.get(id) !== undefined;
     });
     if (attentionChild && !wait.attentionContinuationTurnId) {
       const attentionTurnId = `${wait.registeredByTurnId}-attention`;

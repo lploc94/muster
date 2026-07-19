@@ -4,6 +4,8 @@ This document is the **authoritative design** for the extension-owned MCP server
 
 **Status note (2026-07-15 cleanup):** MCP tool **`ask_user` is removed** from the catalog. Root agents use **ACP RFD `elicitation/create`** (form/url). Non-root workers use **`ask_parent`**. Grok’s vendor `x.ai/ask_user_question` still maps through **AskBridge** → AskCard (not MCP `ask_user`). Historical sections below that describe MCP `ask_user` as the product path are **superseded** by that policy.
 
+**Status note (M017-S07, 2026-07-18):** ACP agents receive `muster_bridge` **only** via the Muster-owned **stdio** MCP proxy (`buildTurnMcp` → `type: "stdio"`). Direct-HTTP ACP injection and the `MUSTER_ACP_MCP_TRANSPORT` fallback are **SUPERSEDED / removed**. The extension still hosts the HTTP bridge on `127.0.0.1`; the stdio proxy is the sole ACP-facing transport and connects upstream with env-only credentials. See `docs/MCP-INJECTION.md`. Live VSIX/Remote packaging and OpenCode multi-session rollout metrics remain **BLOCKED** per **D036** (`docs/uat/m017-s07-blocked-gates.md`).
+
 **Related docs:**
 - `docs/DESIGN.md` — high-level architecture (§2.5, §5, §8)
 - `docs/MCP-INJECTION.md` — how `muster_bridge` is merged into per-backend MCP config alongside `context_engine`
@@ -25,8 +27,8 @@ We still want the agent to **call a tool**, **wait for the human**, then **conti
 | Mechanism | **MCP only** — tools on server `muster_bridge` (see §4). No JSON-in-response fallback. |
 | Who answers | **Webview → Extension host → AskBridge**. Webview never speaks MCP directly. |
 | Answer transport | **In-memory Promise** in extension (`AskBridge`). No answer JSON files in production. |
-| MCP server placement | **HTTP MCP URL** served by extension (preferred). stdio MCP + localhost callback as fallback. |
-| Turn model | Still **one CLI process per user message**. Turn may **pause** until `ask_user` resolves; process stays alive. |
+| MCP server placement | **Extension hosts HTTP MCP** on `127.0.0.1` (authoritative tool catalog). **ACP injection is stdio-only** (M017-S07): agents spawn the Muster stdio proxy which dials that HTTP bridge. No built-in direct-HTTP ACP `muster_bridge` entry. |
+| Turn model | Still **one CLI process per user message**. Turn may **pause** until human-in-the-loop resolves; process stays alive. |
 | Backend order | **All five ACP backends done** (Grok, Kiro, OpenCode, Claude, Codex); agy when its ACP entry exists. |
 
 ## 3. Architecture
@@ -35,12 +37,12 @@ We still want the agent to **call a tool**, **wait for the human**, then **conti
 ┌──────────────┐  postMessage   ┌─────────────────────────────────────┐
 │   Webview    │ ─────────────► │ Extension host                      │
 │ question card│ ◄───────────── │  AskBridge (pending Map<id, …>)     │
-└──────────────┘  showQuestion  │  MusterMcpHttpServer (local)   │
+└──────────────┘  showQuestion  │  MusterBridgeServer (HTTP, loopback)│
                                 └──────────────────┬──────────────────┘
-                                                   │ register / resolve
-┌──────────────┐  MCP HTTP or socket              │
-│ CLI process  │ ─────────────────────────────────┘
-│ (claude, …)  │
+                                                   │ HTTP tools + auth
+┌──────────────┐  ACP mcpServers: stdio proxy      │
+│ CLI process  │ ──► muster stdio proxy ───────────┘
+│ (claude, …)  │     (env: URL + bearer token)
 └──────────────┘
 ```
 
@@ -210,45 +212,48 @@ Aligns with DESIGN.md “permission cards” — currently **out of scope**, but
 
 ## 5. MCP server deployment
 
-### 5.1 Preferred: HTTP MCP (extension-owned)
+> **M017-S07 SUPERSEDED note:** Sections that previously preferred direct-HTTP
+> ACP injection for `muster_bridge` are historical. Production ACP path is
+> **stdio proxy only** (see `docs/MCP-INJECTION.md`). The extension still owns
+> the HTTP server; ACP agents never receive a direct `type: "http"` bridge entry.
+
+### 5.1 Extension-owned HTTP bridge (upstream of the proxy)
 
 On extension `activate`:
-1. Start `MusterMcpHttpServer` on `127.0.0.1:<port>` (port from config or ephemeral).
+1. Start `MusterBridgeServer` on `127.0.0.1:<port>` (port from config or ephemeral).
 2. Expose MCP Streamable HTTP (or SSE) endpoint per MCP spec.
-3. `ask_user` handler calls `AskBridge.register()` directly (same process — no file IPC).
+3. Tool handlers run in-process (same process — no file IPC for production tools).
 
-**Startup ordering:** with an ephemeral port, the server must be **listening and its actual port resolved before** the per-turn MCP config is built — the URL (`http://127.0.0.1:<port>/mcp`) embeds that port. Start the server once on `activate`, cache `{ port, token }` (see §10), and reuse it for every turn. If the server is not yet ready when a turn spawns, await it rather than writing a placeholder port.
+**Startup ordering:** with an ephemeral port, the server must be **listening and its actual port resolved before** the per-turn MCP config is built — the URL (`http://127.0.0.1:<port>/mcp`) embeds that port. Start the server once on `activate`, cache `{ port }` (see §10), and reuse it for every turn. If the server is not yet ready when a turn spawns, await it rather than writing a placeholder port.
 
-Per-turn MCP merge (`context_engine` + `muster_bridge`):
-```json
-{
-  "mcpServers": {
-    "context_engine": { "command": "node", "args": ["…"] },
-    "muster_bridge": { "url": "http://127.0.0.1:<port>/mcp" }
-  }
-}
-```
+### 5.2 ACP injection: Muster-owned stdio proxy (current)
 
-- **agy** supports `"url"` in `mcp_config.json` (≥ 1.0.5).
-- **Claude** — verify `url` in `--mcp-config`; fall back to §5.2 if needed.
-
-### 5.2 Fallback: stdio MCP + localhost callback
-
-When a CLI only supports `command`/`args` MCP:
+`buildTurnMcp` always emits a stdio `muster_bridge` entry for the five ACP backends:
 
 ```json
 {
-  "muster_bridge": {
-    "command": "node",
-    "args": ["…/muster-ask-server.mjs"],
-    "env": { "MUSTER_BRIDGE_URL": "http://127.0.0.1:<port>" }
-  }
+  "type": "stdio",
+  "name": "muster_bridge",
+  "command": "node",
+  "args": ["<absolute-path-to-mcp-stdio-proxy>"],
+  "env": [
+    { "name": "MUSTER_BRIDGE_URL", "value": "http://127.0.0.1:<port>/mcp" },
+    { "name": "MUSTER_BRIDGE_TOKEN", "value": "<per-turn-bearer>" }
+  ]
 }
 ```
 
-Stdio subprocess forwards `register` / `wait` to extension HTTP API. Still **no answer files** — bridge holds the Promise; stdio server only proxies.
+The stdio proxy owns reconnect / readiness against the extension HTTP bridge.
+Token travels **only** via env (invariant 10) — never argv.
 
-> `mcp/muster-ask-server.mjs` in this repo is a **spike** using file IPC for agy testing. Replace with HTTP callback before production.
+### 5.3 Historical: direct-HTTP ACP entry (REMOVED)
+
+Earlier drafts injected `muster_bridge` as `{ "type": "http", "url": "…" }` on ACP
+`session/new` / `session/load`, optionally gated by `MUSTER_ACP_MCP_TRANSPORT`.
+That path is **removed** in M017-S07. Do not reintroduce it.
+
+> `mcp/muster-ask-server.mjs` in this repo remains a **spike** using file IPC for
+> agy testing — not the ACP production path.
 
 ## 6. UI / webview
 
@@ -306,10 +311,10 @@ Revisit when agy ships streaming tool events or documented HTTP MCP ergonomics i
 
 Every turn merges two servers (see `MCP-INJECTION.md`):
 
-1. `context_engine` — semantic search / codebase tools (user-provided path).
-2. `muster_bridge` — IDE bridge tools (§4; MVP = `ask_user` only).
+1. `context_engine` — semantic search / codebase tools (user-provided path; may be http/sse).
+2. `muster_bridge` — always the Muster-owned **stdio** proxy for ACP backends (M017-S07); IDE/task tools behind the loopback HTTP bridge (§4 / task catalog).
 
-Use `--strict-mcp-config` on Claude where supported.
+Use `--strict-mcp-config` on Claude where supported for non-ACP / headless experiments only — ACP turns use `mcpServers` on `session/new` / `session/load`.
 
 ## 10. Security notes
 

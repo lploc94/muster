@@ -7,6 +7,8 @@ import {
   DEFAULT_RESOURCE_LIMITS,
   HARD_BRIDGE_TOKEN_TTL_MS,
   MAX_BRIDGE_TOKEN_TTL_MS,
+  RESOURCE_CONCURRENCY_BOUNDS,
+  resourceLimitsFromSettings,
   type ExecutionPolicyBounds,
 } from './limits';
 import type { TaskExecutionPolicy, TaskStoreFile } from './types';
@@ -16,6 +18,79 @@ const BASE: TaskExecutionPolicy = {
   maxAutomaticRetries: 2,
   runTimeoutOverrideMs: 300_000,
 };
+
+describe('DEFAULT_RESOURCE_LIMITS concurrency caps', () => {
+  it('exposes the raised M016 per-backend / global / per-root defaults', () => {
+    expect(DEFAULT_RESOURCE_LIMITS.maxConcurrentPerBackend).toBe(15);
+    expect(DEFAULT_RESOURCE_LIMITS.maxConcurrentTurns).toBe(30);
+    expect(DEFAULT_RESOURCE_LIMITS.maxConcurrentPerRoot).toBe(20);
+    // Unchanged structural bounds from pre-M016.
+    expect(DEFAULT_RESOURCE_LIMITS.maxChildrenPerTask).toBe(32);
+    expect(DEFAULT_RESOURCE_LIMITS.maxChildrenPerRoot).toBe(64);
+    expect(DEFAULT_RESOURCE_LIMITS.maxDepth).toBe(8);
+  });
+});
+
+describe('resourceLimitsFromSettings', () => {
+  it('passes in-bounds values and keeps structural defaults from DEFAULT_RESOURCE_LIMITS', () => {
+    const limits = resourceLimitsFromSettings({
+      maxConcurrentPerBackend: 8,
+      maxConcurrentTurns: 12,
+      maxConcurrentPerRoot: 6,
+    });
+    expect(limits.maxConcurrentPerBackend).toBe(8);
+    expect(limits.maxConcurrentTurns).toBe(12);
+    expect(limits.maxConcurrentPerRoot).toBe(6);
+    expect(limits.maxDepth).toBe(DEFAULT_RESOURCE_LIMITS.maxDepth);
+    expect(limits.maxChildrenPerTask).toBe(DEFAULT_RESOURCE_LIMITS.maxChildrenPerTask);
+    expect(limits.maxChildrenPerRoot).toBe(DEFAULT_RESOURCE_LIMITS.maxChildrenPerRoot);
+    expect(limits.maxTurnsPerTask).toBe(DEFAULT_RESOURCE_LIMITS.maxTurnsPerTask);
+    expect(limits.maxResultBytes).toBe(DEFAULT_RESOURCE_LIMITS.maxResultBytes);
+    expect(limits.maxErrorBytes).toBe(DEFAULT_RESOURCE_LIMITS.maxErrorBytes);
+  });
+
+  it('falls back to DEFAULT_RESOURCE_LIMITS for missing or non-number values', () => {
+    expect(resourceLimitsFromSettings({})).toEqual(DEFAULT_RESOURCE_LIMITS);
+    expect(
+      resourceLimitsFromSettings({
+        maxConcurrentPerBackend: 'nope',
+        maxConcurrentTurns: null,
+        maxConcurrentPerRoot: Number.NaN,
+      }),
+    ).toEqual(DEFAULT_RESOURCE_LIMITS);
+  });
+
+  it('clamps out-of-range values to package.json min/max bounds', () => {
+    const over = resourceLimitsFromSettings({
+      maxConcurrentPerBackend: 999,
+      maxConcurrentTurns: 999,
+      maxConcurrentPerRoot: 999,
+    });
+    expect(over.maxConcurrentPerBackend).toBe(RESOURCE_CONCURRENCY_BOUNDS.maxConcurrentPerBackend.max);
+    expect(over.maxConcurrentTurns).toBe(RESOURCE_CONCURRENCY_BOUNDS.maxConcurrentTurns.max);
+    expect(over.maxConcurrentPerRoot).toBe(RESOURCE_CONCURRENCY_BOUNDS.maxConcurrentPerRoot.max);
+
+    const under = resourceLimitsFromSettings({
+      maxConcurrentPerBackend: 0,
+      maxConcurrentTurns: -3,
+      maxConcurrentPerRoot: 0.4,
+    });
+    expect(under.maxConcurrentPerBackend).toBe(RESOURCE_CONCURRENCY_BOUNDS.maxConcurrentPerBackend.min);
+    expect(under.maxConcurrentTurns).toBe(RESOURCE_CONCURRENCY_BOUNDS.maxConcurrentTurns.min);
+    expect(under.maxConcurrentPerRoot).toBe(RESOURCE_CONCURRENCY_BOUNDS.maxConcurrentPerRoot.min);
+  });
+
+  it('floors fractional numbers before clamping', () => {
+    const limits = resourceLimitsFromSettings({
+      maxConcurrentPerBackend: 7.9,
+      maxConcurrentTurns: 11.1,
+      maxConcurrentPerRoot: 3.2,
+    });
+    expect(limits.maxConcurrentPerBackend).toBe(7);
+    expect(limits.maxConcurrentTurns).toBe(11);
+    expect(limits.maxConcurrentPerRoot).toBe(3);
+  });
+});
 
 describe('clampExecutionPolicy', () => {
   it('passes normal in-bounds values through unchanged', () => {

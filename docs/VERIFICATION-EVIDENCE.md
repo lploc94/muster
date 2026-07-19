@@ -89,6 +89,17 @@ This ledger makes the following limitations explicit:
 - It does not expose local secrets or require environment credentials.
 - It does not verify live VS Code activation, live provider subprocess execution, live MCP transport behavior, package publishing, marketplace readiness, or remote workflow execution.
 
+## M017-S07 D036 BLOCKED Rollout Gates
+
+M017 closeout keeps live host gates honest. Per **D036**, the following rollout gates are recorded **BLOCKED** with environment reason and are **never** mock-substituted as live proof. Detailed scenario ledger: `docs/uat/m017-s07-blocked-gates.md`.
+
+| Gate ID | Gate | Verdict | Environment reason |
+|---|---|---|---|
+| `M017-S07-GATE-VSIX` | Live VSIX / Remote packaging smoke | **BLOCKED** (D036) | This Windows host has no controllable `code`/`codium` Extension Development Host or Remote packaging surface for direct observation in this agent session. |
+| `M017-S07-GATE-OPENCODE-SESSIONS` | OpenCode 8–12 concurrent-session rollout metrics | **BLOCKED** (D036) | No live OpenCode multi-session harness or production metrics endpoint on this host; no new production metrics endpoint is introduced in M017-S07. |
+
+Local contract proof for M017-S07 remains vitest (stdio-only ACP injection, debt ledger, provider contract) plus `npm test` / `npm run compile` / `npm run check:svelte` / `npm run test:source-boundary`. Those commands prove in-repo wiring only — they do not upgrade the BLOCKED rows above.
+
 ## Redaction Rules
 
 - Record only tracked file paths, local command names, high-level evidence IDs, and bounded proof statements.
