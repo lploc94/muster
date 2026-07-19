@@ -128,7 +128,7 @@ function verifyResetResult(db: DatabaseSync): void {
   if (readScalar(db, 'user_version') !== SQLITE_SCHEMA_VERSION) {
     throw new MusterSqliteError('incompatible_schema', 'write');
   }
-  // Rebuild always targets compiled current schema (still v7 until migration lands).
+  // Rebuild always targets the compiled current schema (v8+).
   const fingerprint = findSchemaFingerprintFailure(db, SQLITE_SCHEMA_VERSION);
   if (fingerprint) {
     throw new MusterSqliteError('incompatible_schema', 'write');

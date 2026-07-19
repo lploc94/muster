@@ -8,6 +8,7 @@ import {
   IncompatibleSchemaError,
   NonEmptyUnclaimedDatabaseError,
   openStoreDatabase,
+  registerWriterVersionUdf,
 } from './connection';
 import { MusterSqliteError } from './errors';
 import { diagnoseSqliteError } from './diagnostics';
@@ -75,6 +76,17 @@ describe('openStoreDatabase', () => {
       expect(tables).toContain('session_claims');
       expect(tables).toContain('resource_claims');
       expect(tables).toContain('turn_cancel_requests');
+      // Schema v8 blank claim includes workflow tables + writer-guard triggers.
+      expect(tables).toContain('workflow_definitions');
+      expect(tables).toContain('workflow_runs');
+      expect(tables).toContain('workflow_nodes');
+      const writerGuard = db
+        .prepare(
+          `SELECT name FROM sqlite_schema
+            WHERE type = 'trigger' AND name = 'trg_wg_workspaces_insert'`,
+        )
+        .get() as { name?: string } | undefined;
+      expect(writerGuard?.name).toBe('trg_wg_workspaces_insert');
     } finally {
       db.close();
     }
@@ -515,9 +527,12 @@ describe('openStoreDatabase', () => {
       rewrite.close();
     }
     // Malformed CHECK rejects normal lowercase insert.
+    // Writer-guard triggers remain on workspaces after the tasks rewrite; register UDF so the
+    // probe measures CHECK failure rather than missing-function / schema_changed.
     {
       const probe = new DatabaseSync(dbPath);
       probe.exec('PRAGMA foreign_keys = ON');
+      registerWriterVersionUdf(probe);
       probe
         .prepare(
           `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)

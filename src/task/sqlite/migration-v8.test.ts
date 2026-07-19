@@ -36,10 +36,33 @@ import {
 
 const tempDirs: string[] = [];
 
+/** Windows can briefly retain SQLite WAL/SHM handles after close(); retry cleanup. */
+function rmTempDir(dir: string): void {
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'EPERM' && code !== 'EBUSY' && code !== 'ENOTEMPTY') {
+        throw error;
+      }
+      // Synchronous backoff — tests run in-process; keep total wait bounded.
+      const delayMs = 25 * (attempt + 1);
+      const end = Date.now() + delayMs;
+      while (Date.now() < end) {
+        /* spin */
+      }
+    }
+  }
+  // Best-effort: residual Windows file locks must not fail migration proofs.
+  // Temp dirs under os.tmpdir() are reclaimed by the OS.
+}
+
 afterEach(() => {
   while (tempDirs.length > 0) {
     const dir = tempDirs.pop();
-    if (dir) fs.rmSync(dir, { recursive: true, force: true });
+    if (dir) rmTempDir(dir);
   }
 });
 
@@ -224,15 +247,17 @@ describe('atomic schema-v7 → v8 migration (M018 S01 T02)', () => {
     bootstrapFaultCapability({ faultCapability: true });
     setFaultPlanForTests({ code: 'full', operation: 'migrate', remaining: 1 });
 
-    expect(() => openStoreDatabase({ path: dbPath })).toThrow(MusterSqliteError);
+    // Single open only — remaining:1 is consumed by the commit-boundary seam.
+    let migrateError: unknown;
     try {
       openStoreDatabase({ path: dbPath });
-      expect.unreachable('open should have thrown');
+      expect.unreachable('open should have thrown on migrate fault');
     } catch (error) {
-      expect(error).toBeInstanceOf(MusterSqliteError);
-      expect((error as MusterSqliteError).code).toBe('full');
-      expect((error as MusterSqliteError).operation).toBe('migrate');
+      migrateError = error;
     }
+    expect(migrateError).toBeInstanceOf(MusterSqliteError);
+    expect((migrateError as MusterSqliteError).code).toBe('full');
+    expect((migrateError as MusterSqliteError).operation).toBe('migrate');
 
     // Disarm so the verification reopen does not re-inject.
     setFaultPlanForTests(undefined);

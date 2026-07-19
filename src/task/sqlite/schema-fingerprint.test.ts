@@ -13,8 +13,11 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   CURRENT_SCHEMA_STATEMENTS,
   MUSTER_APPLICATION_ID,
+  REQUIRED_SCHEMA_V8_WORKFLOW_TABLES,
   SCHEMA_V7,
   SCHEMA_V7_STATEMENTS,
+  SCHEMA_V8,
+  SCHEMA_V8_STATEMENTS,
   SQLITE_SCHEMA_VERSION,
   schemaStatementsForVersion,
 } from './schema';
@@ -51,27 +54,43 @@ function claimVersion(db: DatabaseSync, version: number): void {
 }
 
 describe('versioned schema manifests (M018 S01 T01)', () => {
-  it('freezes an independent SCHEMA_V7_STATEMENTS array that is not aliased only by comment', () => {
+  it('freezes independent SCHEMA_V7_STATEMENTS while compiled current is v8', () => {
     expect(SCHEMA_V7).toBe(7);
+    expect(SCHEMA_V8).toBe(8);
     expect(Array.isArray(SCHEMA_V7_STATEMENTS)).toBe(true);
     expect(SCHEMA_V7_STATEMENTS.length).toBeGreaterThan(10);
     expect(schemaStatementsForVersion(SCHEMA_V7)).toBe(SCHEMA_V7_STATEMENTS);
-    // Current compiled schema is still v7 until the migration branch lands.
-    expect(SQLITE_SCHEMA_VERSION).toBe(SCHEMA_V7);
-    expect(CURRENT_SCHEMA_STATEMENTS).toEqual(SCHEMA_V7_STATEMENTS);
+    expect(schemaStatementsForVersion(SCHEMA_V8)).toBe(SCHEMA_V8_STATEMENTS);
+    // Compiled current advanced to v8; v7 remains an independent frozen input manifest.
+    expect(SQLITE_SCHEMA_VERSION).toBe(SCHEMA_V8);
+    expect(CURRENT_SCHEMA_STATEMENTS).toEqual(SCHEMA_V8_STATEMENTS);
+    expect(CURRENT_SCHEMA_STATEMENTS).not.toEqual(SCHEMA_V7_STATEMENTS);
   });
 
-  it('builds matching golden manifests for v7 and current from their statement sources', () => {
+  it('builds distinct golden manifests for v7 input and v8 current', () => {
     const v7 = expectedSchemaManifestForVersion(SCHEMA_V7);
+    const v8 = expectedSchemaManifestForVersion(SCHEMA_V8);
     const current = expectedSchemaManifest();
-    expect(v7.tables.map((t) => t.name)).toEqual(current.tables.map((t) => t.name));
-    expect(v7.indexes.map((i) => i.name)).toEqual(current.indexes.map((i) => i.name));
-    expect(v7.triggers.map((t) => t.name)).toEqual(current.triggers.map((t) => t.name));
+    expect(current.tables.map((t) => t.name)).toEqual(v8.tables.map((t) => t.name));
+    expect(current.indexes.map((i) => i.name)).toEqual(v8.indexes.map((i) => i.name));
+    expect(current.triggers.map((t) => t.name)).toEqual(v8.triggers.map((t) => t.name));
+
+    const v7Names = new Set(v7.tables.map((t) => t.name));
+    for (const table of REQUIRED_SCHEMA_V8_WORKFLOW_TABLES) {
+      expect(v7Names.has(table)).toBe(false);
+      expect(v8.tables.some((t) => t.name === table)).toBe(true);
+    }
+    expect(v8.tables.length).toBeGreaterThan(v7.tables.length);
+    expect(v8.triggers.length).toBeGreaterThan(v7.triggers.length);
+
     const v7Db = applyInMemory(SCHEMA_V7_STATEMENTS);
     const currentDb = applyInMemory(CURRENT_SCHEMA_STATEMENTS);
     try {
       expect(findSchemaFingerprintFailure(v7Db, SCHEMA_V7)).toBeUndefined();
+      // A pure v7 store must not match the compiled current (v8) golden.
+      expect(findSchemaFingerprintFailure(v7Db)).toBeDefined();
       expect(findSchemaFingerprintFailure(currentDb)).toBeUndefined();
+      expect(findSchemaFingerprintFailure(currentDb, SCHEMA_V8)).toBeUndefined();
     } finally {
       v7Db.close();
       currentDb.close();

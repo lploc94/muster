@@ -101,7 +101,8 @@ void SQLITE_SCHEMA_VERSION;
  * Stale connections without this UDF (or with a different compiled version) fail closed.
  */
 export function registerWriterVersionUdf(db: DatabaseSync): void {
-  db.function(MUSTER_WRITER_VERSION_UDF, () => SQLITE_SCHEMA_VERSION);
+  // deterministic: safe for WHEN-clause evaluation; Number() keeps a stable SQLite numeric.
+  db.function(MUSTER_WRITER_VERSION_UDF, { deterministic: true }, () => Number(SQLITE_SCHEMA_VERSION));
 }
 
 function readScalar(db: DatabaseSync, pragma: string): number {
