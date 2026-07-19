@@ -1,8 +1,10 @@
 /**
  * Workflow domain boundary for M018 S01.
- * Owns topology validation and define result shaping; repository owns CAS writes.
+ * Owns topology validation, define/start result shaping, and identity derivation;
+ * repository owns CAS writes.
  */
 
+import { createHash } from 'node:crypto';
 import {
   decodeDefineWorkflowInput,
   encodeTopologyJson,
@@ -11,6 +13,9 @@ import {
 import type {
   DefineWorkflowInput,
   DefineWorkflowResult,
+  StartWorkflowIdentities,
+  StartWorkflowInput,
+  StartWorkflowResult,
   WorkflowDefinitionV1,
 } from './workflow-types';
 
@@ -25,6 +30,9 @@ export type {
   DefineWorkflowInput,
   DefineWorkflowResult,
   OneNodeTopologyV1,
+  StartWorkflowIdentities,
+  StartWorkflowInput,
+  StartWorkflowResult,
   WorkflowDefinitionV1,
   WorkflowNodeSpecV1,
 } from './workflow-types';
@@ -130,4 +138,204 @@ export function makeOneNodeDefinition(overrides?: {
 /** Fingerprint helper re-export for callers that already hold a definition. */
 export function fingerprintDefinition(definition: WorkflowDefinitionV1): string {
   return fingerprintWorkflowDefinition(definition);
+}
+
+const MAX_START_KEY_LEN = 256;
+const MAX_GOAL_LEN = 512;
+const MAX_BACKEND_LEN = 64;
+
+function isNonEmptyBounded(value: unknown, max: number): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= max;
+}
+
+/** Operations ledger key for an idempotent start claim. */
+export function startWorkflowLedgerKey(startIdempotencyKey: string): string {
+  return `start_workflow:${startIdempotencyKey}`;
+}
+
+/** Stable short id derived from start material (never a raw user path/SQL). */
+function stableId(prefix: string, material: string): string {
+  const digest = createHash('sha256').update(material, 'utf8').digest('hex').slice(0, 24);
+  return `${prefix}_${digest}`;
+}
+
+/**
+ * Derive immutable run/task/turn/gate/message/artifact ids from the start key.
+ * Same key + definition always yields the same activation identities.
+ */
+export function deriveStartIdentities(input: {
+  definitionId: string;
+  version: number;
+  startIdempotencyKey: string;
+  entryNodeId: string;
+}): StartWorkflowIdentities {
+  const base = [
+    input.definitionId,
+    String(input.version),
+    input.startIdempotencyKey,
+    input.entryNodeId,
+  ].join('\0');
+  return {
+    runId: stableId('wfr', base),
+    entryTaskId: stableId('wft', `${base}\0task`),
+    activationTurnId: stableId('wftn', `${base}\0turn`),
+    entryMessageId: stableId('wfm', `${base}\0message`),
+    entryGateId: stableId('wfg', `${base}\0gate`),
+    startArtifactId: stableId('wfa', `${base}\0artifact`),
+  };
+}
+
+/** Start fingerprint (no prompt/message/artifact bodies). */
+export function fingerprintStartWorkflow(input: {
+  definitionId: string;
+  version: number;
+  startIdempotencyKey: string;
+  entryNodeId: string;
+  goal: string;
+  backend: string;
+}): string {
+  const payload = JSON.stringify({
+    definitionId: input.definitionId,
+    version: input.version,
+    startIdempotencyKey: input.startIdempotencyKey,
+    entryNodeId: input.entryNodeId,
+    goal: input.goal,
+    backend: input.backend,
+  });
+  return createHash('sha256').update(payload, 'utf8').digest('hex');
+}
+
+/**
+ * Validate start input without persistence.
+ * entryNodeId must be provided by the repository after loading the definition.
+ */
+export function validateStartWorkflow(
+  input: StartWorkflowInput,
+):
+  | {
+      ok: true;
+      definitionId: string;
+      version: number;
+      startIdempotencyKey: string;
+      entryNodeId: string;
+      createdAt: string;
+      goal: string;
+      backend: string;
+      identities: StartWorkflowIdentities;
+      fingerprint: string;
+    }
+  | { ok: false; reason: string } {
+  if (!isNonEmptyBounded(input.definitionId, 128)) {
+    return { ok: false, reason: 'invalid definitionId' };
+  }
+  if (!Number.isInteger(input.version) || input.version < 1) {
+    return { ok: false, reason: 'invalid version' };
+  }
+  if (!isNonEmptyBounded(input.startIdempotencyKey, MAX_START_KEY_LEN)) {
+    return { ok: false, reason: 'invalid startIdempotencyKey' };
+  }
+  if (!isNonEmptyBounded(input.createdAt, 64)) {
+    return { ok: false, reason: 'invalid createdAt' };
+  }
+  if (!isNonEmptyBounded(input.entryNodeId, 128)) {
+    return { ok: false, reason: 'invalid entryNodeId' };
+  }
+  if (input.goal !== undefined && !isNonEmptyBounded(input.goal, MAX_GOAL_LEN)) {
+    return { ok: false, reason: 'invalid goal' };
+  }
+  if (input.backend !== undefined && !isNonEmptyBounded(input.backend, MAX_BACKEND_LEN)) {
+    return { ok: false, reason: 'invalid backend' };
+  }
+  const goal = input.goal ?? input.definitionId;
+  const backend = input.backend ?? 'grok';
+  const identities = deriveStartIdentities({
+    definitionId: input.definitionId,
+    version: input.version,
+    startIdempotencyKey: input.startIdempotencyKey,
+    entryNodeId: input.entryNodeId,
+  });
+  const fingerprint = fingerprintStartWorkflow({
+    definitionId: input.definitionId,
+    version: input.version,
+    startIdempotencyKey: input.startIdempotencyKey,
+    entryNodeId: input.entryNodeId,
+    goal,
+    backend,
+  });
+  return {
+    ok: true,
+    definitionId: input.definitionId,
+    version: input.version,
+    startIdempotencyKey: input.startIdempotencyKey,
+    entryNodeId: input.entryNodeId,
+    createdAt: input.createdAt,
+    goal,
+    backend,
+    identities,
+    fingerprint,
+  };
+}
+
+/** Shape a successful first-write start result. */
+export function startWorkflowCreated(
+  validated: Extract<ReturnType<typeof validateStartWorkflow>, { ok: true }>,
+): StartWorkflowResult {
+  const { identities } = validated;
+  return {
+    ok: true,
+    changed: true,
+    definitionId: validated.definitionId,
+    version: validated.version,
+    entryNodeId: validated.entryNodeId,
+    runId: identities.runId,
+    entryTaskId: identities.entryTaskId,
+    entryGateId: identities.entryGateId,
+    entryGateStatus: 'satisfied',
+    activationTurnId: identities.activationTurnId,
+    entryMessageId: identities.entryMessageId,
+    startArtifactId: identities.startArtifactId,
+    fingerprint: validated.fingerprint,
+  };
+}
+
+/** Shape a same-fingerprint start replay. */
+export function startWorkflowReplay(
+  validated: Extract<ReturnType<typeof validateStartWorkflow>, { ok: true }>,
+): StartWorkflowResult {
+  const created = startWorkflowCreated(validated);
+  if (!created.ok) return created;
+  return {
+    ...created,
+    changed: false,
+    replay: true,
+  };
+}
+
+/** Shape a start conflict (same key, different fingerprint). */
+export function startWorkflowConflict(
+  definitionId?: string,
+  version?: number,
+): StartWorkflowResult {
+  return {
+    ok: false,
+    conflict: true,
+    reason: 'start fingerprint conflict',
+    definitionId,
+    version,
+  };
+}
+
+/** Shape a start validation / missing-definition failure. */
+export function startWorkflowInvalid(
+  reason: 'definition not found' | 'invalid start' | 'invalid identity',
+  definitionId?: string,
+  version?: number,
+): StartWorkflowResult {
+  return {
+    ok: false,
+    conflict: true,
+    reason,
+    definitionId,
+    version,
+  };
 }

@@ -14,13 +14,21 @@ import type {
   TurnStatus,
 } from './types';
 import {
+  decodeStoredTopologyJson,
   defineWorkflowConflict,
   defineWorkflowCreated,
   defineWorkflowInvalid,
   defineWorkflowLedgerKey,
   defineWorkflowReplay,
+  startWorkflowConflict,
+  startWorkflowCreated,
+  startWorkflowInvalid,
+  startWorkflowLedgerKey,
+  startWorkflowReplay,
   validateDefineWorkflow,
+  validateStartWorkflow,
   type DefineWorkflowResult,
+  type StartWorkflowResult,
 } from './workflow';
 import { isMutatingTask, normalizedWritePaths } from './resources';
 import { canPromoteTurn } from './scheduler';
@@ -359,6 +367,21 @@ export type RepositoryCommand =
       name: string;
       topology: unknown;
       createdAt: string;
+    }
+  | {
+      /**
+       * Idempotent compound start for a frozen one-node definition (M018 S01).
+       * Claims startIdempotencyKey, then inserts run/node/gate/artifact/task/
+       * aggregate message + exactly one queued entry turn in one transaction.
+       */
+      kind: 'startWorkflowRun';
+      workspaceId: string;
+      definitionId: string;
+      version: number;
+      startIdempotencyKey: string;
+      createdAt: string;
+      goal?: string;
+      backend?: string;
     }
   | {
       /** Atomic durable coordinator idempotency claim + presentation commit. */
@@ -2235,6 +2258,8 @@ export class SqliteTaskRepository implements TaskRepository {
       }
       case 'defineWorkflowVersion':
         return this.defineWorkflowVersion(command);
+      case 'startWorkflowRun':
+        return this.startWorkflowRun(command);
       case 'claimOperation':
         return this.claimOperation(command);
       case 'deleteOperationsForTurn': {
@@ -3044,6 +3069,324 @@ export class SqliteTaskRepository implements TaskRepository {
     };
   }
 
+  /**
+   * Atomically start a frozen one-node workflow run.
+   * First statement claims startIdempotencyKey on the operations ledger;
+   * rest inserts run, node, satisfied entry gate, engine start artifact, entry
+   * task, aggregate message, and exactly one queued activation turn.
+   */
+  private async startWorkflowRun(
+    command: Extract<RepositoryCommand, { kind: 'startWorkflowRun' }>,
+  ): Promise<RepositoryCommandResult> {
+    if (command.workspaceId !== this.workspaceId) {
+      throw new Error('workspace mismatch');
+    }
+
+    // Load definition first so missing/corrupt definitions fail closed with no rows.
+    const defRow = await this.db.get(
+      `SELECT definition_id, version, name, entry_node_id, topology_json
+         FROM workflow_definitions
+        WHERE workspace_id = ? AND definition_id = ? AND version = ?`,
+      [this.workspaceId, command.definitionId, command.version],
+    ) as {
+      definition_id?: string;
+      version?: number;
+      name?: string;
+      entry_node_id?: string;
+      topology_json?: string;
+    } | null;
+
+    if (!defRow || typeof defRow.topology_json !== 'string' || typeof defRow.entry_node_id !== 'string') {
+      const shaped = startWorkflowInvalid(
+        'definition not found',
+        command.definitionId,
+        command.version,
+      );
+      return {
+        ok: false,
+        changed: false,
+        conflict: true,
+        reason: shaped.reason,
+        operation: {
+          fingerprint: '',
+          result: { ok: false, error: shaped.reason },
+        },
+      } as RepositoryCommandResult;
+    }
+
+    const topology = decodeStoredTopologyJson(defRow.topology_json);
+    if (!topology.ok || topology.topology.entryNodeId !== defRow.entry_node_id) {
+      const shaped = startWorkflowInvalid(
+        'invalid start',
+        command.definitionId,
+        command.version,
+      );
+      return {
+        ok: false,
+        changed: false,
+        conflict: true,
+        reason: shaped.reason,
+        operation: {
+          fingerprint: '',
+          result: { ok: false, error: shaped.reason },
+        },
+      } as RepositoryCommandResult;
+    }
+
+    const goal = command.goal ?? (typeof defRow.name === 'string' ? defRow.name : command.definitionId);
+    const validated = validateStartWorkflow({
+      definitionId: command.definitionId,
+      version: command.version,
+      startIdempotencyKey: command.startIdempotencyKey,
+      createdAt: command.createdAt,
+      entryNodeId: defRow.entry_node_id,
+      goal,
+      backend: command.backend,
+    });
+    if (!validated.ok) {
+      const shaped = startWorkflowInvalid(
+        validated.reason.includes('definitionId') ||
+          validated.reason.includes('version') ||
+          validated.reason.includes('startIdempotencyKey') ||
+          validated.reason.includes('createdAt')
+          ? 'invalid identity'
+          : 'invalid start',
+        command.definitionId,
+        command.version,
+      );
+      return {
+        ok: false,
+        changed: false,
+        conflict: true,
+        reason: shaped.reason,
+        operation: {
+          fingerprint: '',
+          result: { ok: false, error: shaped.reason },
+        },
+      } as RepositoryCommandResult;
+    }
+
+    const { identities, fingerprint } = validated;
+    const resultPayload = startWorkflowCreated(validated);
+    const ledgerKey = startWorkflowLedgerKey(validated.startIdempotencyKey);
+
+    const task: MusterTask = {
+      id: identities.entryTaskId,
+      role: topology.topology.nodes[0]?.role ?? 'worker',
+      lifecycle: 'open',
+      releaseState: 'released',
+      goal: validated.goal,
+      parentId: null,
+      dependencies: [],
+      backend: validated.backend,
+      capabilities: [],
+      executionPolicy: { maxTurns: 10, maxAutomaticRetries: 1 },
+      revision: 0,
+      createdAt: validated.createdAt,
+      updatedAt: validated.createdAt,
+      releasedAt: validated.createdAt,
+    };
+    const message: TaskMessage = {
+      id: identities.entryMessageId,
+      taskId: identities.entryTaskId,
+      role: 'system',
+      // Engine-authored activation marker only — never coordinator prompt text.
+      content: '[workflow-entry]',
+      state: 'assigned',
+      turnId: identities.activationTurnId,
+      createdAt: validated.createdAt,
+    };
+    const turn: TaskTurn = {
+      id: identities.activationTurnId,
+      taskId: identities.entryTaskId,
+      sequence: 1,
+      status: 'queued',
+      trigger: 'engine',
+      inputs: [{ kind: 'message', messageId: identities.entryMessageId }],
+      createdAt: validated.createdAt,
+    };
+
+    // Engine start artifact: kind/revision only — no prompt/body content.
+    const artifactPayload = encodePayload({
+      kind: 'engine_start',
+      schema: 1,
+      entryNodeId: validated.entryNodeId,
+    });
+
+    const claimSql: SqlStatement = {
+      sql: `INSERT INTO operations (workspace_id, ledger_key, fingerprint, result_json, created_at)
+            VALUES (?,?,?,?,?) ON CONFLICT(workspace_id, ledger_key) DO NOTHING`,
+      params: [
+        this.workspaceId,
+        ledgerKey,
+        fingerprint,
+        encodePayload({ result: { ok: true, data: resultPayload } }),
+        validated.createdAt,
+      ],
+    };
+
+    const rest: SqlStatement[] = [
+      {
+        sql: `INSERT INTO workflow_runs (
+                workspace_id, run_id, definition_id, definition_version, status, origin,
+                parent_run_id, created_at, updated_at
+              ) VALUES (?,?,?,?,?,?,?,?,?)
+              ON CONFLICT(workspace_id, run_id) DO NOTHING`,
+        params: [
+          this.workspaceId,
+          identities.runId,
+          validated.definitionId,
+          validated.version,
+          'running',
+          'top_level',
+          null,
+          validated.createdAt,
+          validated.createdAt,
+        ],
+      },
+      taskStatement(this.workspaceId, task, false),
+      {
+        sql: `INSERT INTO workflow_nodes (
+                workspace_id, run_id, node_id, task_id, status
+              ) VALUES (?,?,?,?,?)
+              ON CONFLICT(workspace_id, run_id, node_id) DO NOTHING`,
+        params: [
+          this.workspaceId,
+          identities.runId,
+          validated.entryNodeId,
+          identities.entryTaskId,
+          'active',
+        ],
+      },
+      {
+        sql: `INSERT INTO workflow_dependency_gates (
+                workspace_id, run_id, gate_id, consumer_node_id, status
+              ) VALUES (?,?,?,?,?)
+              ON CONFLICT(workspace_id, run_id, gate_id) DO NOTHING`,
+        params: [
+          this.workspaceId,
+          identities.runId,
+          identities.entryGateId,
+          validated.entryNodeId,
+          'satisfied',
+        ],
+      },
+      {
+        sql: `INSERT INTO workflow_gate_bindings (
+                workspace_id, run_id, gate_id, input_ref, producer_node_id, required_kind
+              ) VALUES (?,?,?,?,?,?)
+              ON CONFLICT(workspace_id, run_id, gate_id, input_ref) DO NOTHING`,
+        params: [
+          this.workspaceId,
+          identities.runId,
+          identities.entryGateId,
+          'engine_start',
+          validated.entryNodeId,
+          'engine_start',
+        ],
+      },
+      {
+        sql: `INSERT INTO workflow_artifacts (
+                workspace_id, run_id, artifact_id, producer_node_id, logical_name,
+                revision, kind, payload_json, created_at
+              ) VALUES (?,?,?,?,?,?,?,?,?)
+              ON CONFLICT(workspace_id, run_id, artifact_id, revision) DO NOTHING`,
+        params: [
+          this.workspaceId,
+          identities.runId,
+          identities.startArtifactId,
+          validated.entryNodeId,
+          'engine_start',
+          1,
+          'engine_start',
+          artifactPayload,
+          validated.createdAt,
+        ],
+      },
+      {
+        sql: `INSERT INTO workflow_gate_fills (
+                workspace_id, run_id, gate_id, input_ref, artifact_id, artifact_revision, filled_at
+              ) VALUES (?,?,?,?,?,?,?)
+              ON CONFLICT(workspace_id, run_id, gate_id, input_ref, artifact_id, artifact_revision)
+              DO NOTHING`,
+        params: [
+          this.workspaceId,
+          identities.runId,
+          identities.entryGateId,
+          'engine_start',
+          identities.startArtifactId,
+          1,
+          validated.createdAt,
+        ],
+      },
+      turnStatement(this.workspaceId, turn, false),
+      messageStatement(this.workspaceId, message, false),
+      turnInputStatement(
+        this.workspaceId,
+        turn.id,
+        0,
+        { kind: 'message', messageId: identities.entryMessageId },
+      ),
+    ];
+
+    await this.db.run(
+      `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
+       VALUES (?,?,?,?,?)
+       ON CONFLICT(id) DO NOTHING`,
+      [this.workspaceId, this.workspaceId, this.workspaceId, validated.createdAt, validated.createdAt],
+    );
+    await this.db.run(
+      `INSERT INTO workspace_revisions (workspace_id, revision)
+       VALUES (?, 0) ON CONFLICT(workspace_id) DO NOTHING`,
+      [this.workspaceId],
+    );
+
+    const tx = await this.db.transaction([claimSql, ...rest], {
+      abortIfFirstUnchanged: false,
+    });
+    const claimChanges = tx[0]?.changes ?? 0;
+    if (claimChanges > 0) {
+      return {
+        ok: true,
+        changed: true,
+        operation: {
+          fingerprint,
+          result: { ok: true, data: resultPayload },
+        },
+      };
+    }
+
+    const existing = await this.db.get(
+      `SELECT fingerprint, result_json FROM operations
+        WHERE workspace_id = ? AND ledger_key = ?`,
+      [this.workspaceId, ledgerKey],
+    ) as { fingerprint?: string; result_json?: string } | null;
+    if (!existing || typeof existing.fingerprint !== 'string') {
+      throw new Error('start_workflow claim missing after conflict');
+    }
+    if (existing.fingerprint === fingerprint) {
+      const replay = startWorkflowReplay(validated);
+      return {
+        ok: true,
+        changed: false,
+        operation: {
+          fingerprint,
+          result: { ok: true, data: replay },
+        },
+      };
+    }
+    const conflict = startWorkflowConflict(validated.definitionId, validated.version);
+    return {
+      ok: false,
+      changed: false,
+      conflict: true,
+      reason: conflict.reason,
+      operation: {
+        fingerprint: existing.fingerprint,
+        result: { ok: false, error: conflict.reason },
+      },
+    } as RepositoryCommandResult;
+  }
 
   private async claimOperation(
     command: Extract<RepositoryCommand, { kind: 'claimOperation' }>,

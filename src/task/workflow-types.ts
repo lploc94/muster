@@ -70,3 +70,75 @@ export interface DefineWorkflowInput {
   topology: unknown;
   createdAt: string;
 }
+
+/**
+ * Input for startWorkflowRun. Agents never supply writable run/task/turn/gate IDs;
+ * those are derived deterministically from the start idempotency key + definition.
+ */
+export interface StartWorkflowInput {
+  definitionId: string;
+  version: number;
+  startIdempotencyKey: string;
+  createdAt: string;
+  /** Entry node id from the frozen definition (validated against stored topology). */
+  entryNodeId: string;
+  /** Optional task goal; defaults to definition name at the repository boundary. */
+  goal?: string;
+  /** Optional backend id for the entry task; defaults at the repository boundary. */
+  backend?: string;
+}
+
+/** Engine-derived durable identities for a one-node start (no SQL/paths/bodies). */
+export interface StartWorkflowIdentities {
+  runId: string;
+  entryTaskId: string;
+  activationTurnId: string;
+  entryMessageId: string;
+  entryGateId: string;
+  startArtifactId: string;
+}
+
+/** Bounded result of startWorkflowRun. */
+export type StartWorkflowResult =
+  | {
+      ok: true;
+      changed: true;
+      definitionId: string;
+      version: number;
+      entryNodeId: string;
+      runId: string;
+      entryTaskId: string;
+      entryGateId: string;
+      entryGateStatus: 'satisfied';
+      activationTurnId: string;
+      entryMessageId: string;
+      startArtifactId: string;
+      fingerprint: string;
+    }
+  | {
+      ok: true;
+      changed: false;
+      replay: true;
+      definitionId: string;
+      version: number;
+      entryNodeId: string;
+      runId: string;
+      entryTaskId: string;
+      entryGateId: string;
+      entryGateStatus: 'satisfied';
+      activationTurnId: string;
+      entryMessageId: string;
+      startArtifactId: string;
+      fingerprint: string;
+    }
+  | {
+      ok: false;
+      conflict: true;
+      reason:
+        | 'definition not found'
+        | 'invalid start'
+        | 'start fingerprint conflict'
+        | 'invalid identity';
+      definitionId?: string;
+      version?: number;
+    };

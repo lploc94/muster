@@ -1098,6 +1098,65 @@ describe('SqliteTaskRepository', () => {
   }, 20_000);
 
 
+
+  it('starts a one-node workflow run with one queued entry turn and idempotent replay', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-start-wf-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const repository = new SqliteTaskRepository(client, 'ws');
+      const topology = {
+        kind: 'one_node_v1' as const,
+        nodes: [{ nodeId: 'entry' }],
+        entryNodeId: 'entry',
+      };
+      const createdAt = '2026-07-19T00:00:00.000Z';
+      await repository.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-one',
+        version: 1,
+        name: 'one-node',
+        topology,
+        createdAt,
+      });
+      const start = await repository.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: 'ws',
+        definitionId: 'wf-one',
+        version: 1,
+        startIdempotencyKey: 'repo-start-1',
+        createdAt,
+        goal: 'entry goal',
+        backend: 'grok',
+      });
+      expect(start.ok).toBe(true);
+      expect(start.changed).toBe(true);
+      const data = start.operation?.result?.data as { activationTurnId: string; entryTaskId: string; runId: string };
+      expect(data.activationTurnId).toEqual(expect.any(String));
+      const turns = await repository.listQueuedTurns(data.entryTaskId);
+      expect(turns).toHaveLength(1);
+      expect(turns[0]?.id).toBe(data.activationTurnId);
+      const replay = await repository.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: 'ws',
+        definitionId: 'wf-one',
+        version: 1,
+        startIdempotencyKey: 'repo-start-1',
+        createdAt,
+        goal: 'entry goal',
+        backend: 'grok',
+      });
+      expect(replay.ok).toBe(true);
+      expect(replay.changed).toBe(false);
+      expect(await repository.listTurns(data.entryTaskId)).toHaveLength(1);
+      expect(await client.all('SELECT run_id FROM workflow_runs WHERE workspace_id = ?', ['ws'])).toHaveLength(1);
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it('defines an immutable one-node workflow with replay and fingerprint conflict', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-define-wf-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
