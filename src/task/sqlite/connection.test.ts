@@ -413,7 +413,14 @@ describe('openStoreDatabase', () => {
     }
     const before = fs.readFileSync(dbPath);
     expect(() => openStoreDatabase({ path: dbPath })).toThrow(IncompatibleSchemaError);
-    expect(journalMode(reopenReadonly(dbPath))).toBe('delete');
+    {
+      const after = reopenReadonly(dbPath);
+      try {
+        expect(journalMode(after)).toBe('delete');
+      } finally {
+        after.close();
+      }
+    }
     expect(Buffer.compare(fs.readFileSync(dbPath), before)).toBe(0);
 
     const triggerPath = tempDbPath();
@@ -556,7 +563,14 @@ describe('openStoreDatabase', () => {
     }
     const before = fs.readFileSync(dbPath);
     expect(() => openStoreDatabase({ path: dbPath })).toThrow(IncompatibleSchemaError);
-    expect(journalMode(reopenReadonly(dbPath))).toBe('delete');
+    {
+      const after = reopenReadonly(dbPath);
+      try {
+        expect(journalMode(after)).toBe('delete');
+      } finally {
+        after.close();
+      }
+    }
     expect(Buffer.compare(fs.readFileSync(dbPath), before)).toBe(0);
   });
 
@@ -573,7 +587,14 @@ describe('openStoreDatabase', () => {
     }
     const before = fs.readFileSync(dbPath);
     expect(() => openStoreDatabase({ path: dbPath })).toThrow(IncompatibleSchemaError);
-    expect(journalMode(reopenReadonly(dbPath))).toBe('delete');
+    {
+      const after = reopenReadonly(dbPath);
+      try {
+        expect(journalMode(after)).toBe('delete');
+      } finally {
+        after.close();
+      }
+    }
     expect(Buffer.compare(fs.readFileSync(dbPath), before)).toBe(0);
   });
 

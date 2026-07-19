@@ -1,14 +1,20 @@
 /**
- * Bounded current-schema fingerprint (P5-W2).
+ * Bounded schema fingerprint (P5-W2 / M018 S01).
  *
- * Golden manifest from CURRENT_SCHEMA_STATEMENTS. Validates ordered columns,
- * FKs, explicit indexes (index_xinfo + normalized SQL), triggers, and rejects
- * extra user tables/views/indexes/triggers. SQL normalization preserves quoted
- * literal contents (CHECK 'draft' ≠ 'DRAFT'). Read-only; before WAL.
+ * Golden manifests are versioned: migration validates owned v7 input against the
+ * frozen v7 manifest, while open/reset/backup validate the compiled current
+ * schema. Validates ordered columns, FKs, explicit indexes (index_xinfo +
+ * normalized SQL), triggers, and rejects extra user tables/views/indexes/triggers.
+ * SQL normalization preserves quoted literal contents (CHECK 'draft' ≠ 'DRAFT').
+ * Read-only; before WAL.
  */
 
 import { DatabaseSync } from 'node:sqlite';
-import { CURRENT_SCHEMA_STATEMENTS } from './schema';
+import {
+  CURRENT_SCHEMA_STATEMENTS,
+  SQLITE_SCHEMA_VERSION,
+  schemaStatementsForVersion,
+} from './schema';
 
 export type SchemaFingerprintFailure = {
   reason:
@@ -397,22 +403,36 @@ export function captureSchemaManifest(db: DatabaseSync): SchemaManifest {
   };
 }
 
-let cachedExpected: SchemaManifest | undefined;
+const cachedExpectedByVersion = new Map<number, SchemaManifest>();
 
-/** Golden manifest from CURRENT_SCHEMA_STATEMENTS (lazy, once). */
-export function expectedSchemaManifest(): SchemaManifest {
-  if (cachedExpected) return cachedExpected;
+/**
+ * Golden manifest for a supported schema version (lazy, per version).
+ * Migration input uses version 7; open/reset/backup use the compiled current version.
+ */
+export function expectedSchemaManifestForVersion(version: number): SchemaManifest {
+  const cached = cachedExpectedByVersion.get(version);
+  if (cached) return cached;
+  const statements = schemaStatementsForVersion(version);
   const db = new DatabaseSync(':memory:');
   try {
-    for (const statement of CURRENT_SCHEMA_STATEMENTS) {
+    for (const statement of statements) {
       db.exec(statement);
     }
-    cachedExpected = captureSchemaManifest(db);
-    return cachedExpected;
+    const manifest = captureSchemaManifest(db);
+    cachedExpectedByVersion.set(version, manifest);
+    return manifest;
   } finally {
     db.close();
   }
 }
+
+/** Golden manifest from CURRENT_SCHEMA_STATEMENTS (lazy, once per process). */
+export function expectedSchemaManifest(): SchemaManifest {
+  return expectedSchemaManifestForVersion(SQLITE_SCHEMA_VERSION);
+}
+
+// Keep a direct reference so tree-shaking / dead-code reviews still see current DDL usage.
+void CURRENT_SCHEMA_STATEMENTS;
 
 function sameColumns(a: readonly ColumnSpec[], b: readonly ColumnSpec[]): boolean {
   if (a.length !== b.length) return false;
@@ -469,16 +489,25 @@ function sameIndexColumns(a: readonly IndexColumnSpec[], b: readonly IndexColumn
 }
 
 /**
- * Returns the first fingerprint failure, or undefined when the owned current DB
- * matches the required structure. Read-only; no journal/application mutations.
+ * Returns the first fingerprint failure, or undefined when the DB matches the
+ * expected structure. Read-only; no journal/application mutations.
+ *
+ * @param expected Optional explicit golden: a SchemaManifest, or a supported
+ *   schema version number. Defaults to the compiled current schema.
  */
 export function findSchemaFingerprintFailure(
   db: DatabaseSync,
+  expected?: SchemaManifest | number,
 ): SchemaFingerprintFailure | undefined {
-  const expected = expectedSchemaManifest();
+  const golden =
+    expected === undefined
+      ? expectedSchemaManifest()
+      : typeof expected === 'number'
+        ? expectedSchemaManifestForVersion(expected)
+        : expected;
   const actual = captureSchemaManifest(db);
 
-  const expectedTables = new Map(expected.tables.map((t) => [t.name, t]));
+  const expectedTables = new Map(golden.tables.map((t) => [t.name, t]));
   const actualTables = new Map(actual.tables.map((t) => [t.name, t]));
 
   for (const name of expectedTables.keys()) {
@@ -508,7 +537,7 @@ export function findSchemaFingerprintFailure(
     }
   }
 
-  const expectedIndexes = new Map(expected.indexes.map((i) => [i.name, i]));
+  const expectedIndexes = new Map(golden.indexes.map((i) => [i.name, i]));
   const actualIndexes = new Map(actual.indexes.map((i) => [i.name, i]));
   for (const [name, exp] of expectedIndexes) {
     const act = actualIndexes.get(name);
@@ -529,7 +558,7 @@ export function findSchemaFingerprintFailure(
     }
   }
 
-  const expectedTriggers = new Map(expected.triggers.map((t) => [t.name, t]));
+  const expectedTriggers = new Map(golden.triggers.map((t) => [t.name, t]));
   const actualTriggers = new Map(actual.triggers.map((t) => [t.name, t]));
   for (const [name, exp] of expectedTriggers) {
     const act = actualTriggers.get(name);

@@ -243,7 +243,8 @@ export function verifyBackupArtifact(artifactPath: string): {
     if (schemaVersion !== SQLITE_SCHEMA_VERSION) {
       throw new MusterSqliteError('incompatible_schema', 'backup');
     }
-    const fingerprint = findSchemaFingerprintFailure(db);
+    // Explicit current version: after v8 ships, backups must match compiled schema, not frozen v7.
+    const fingerprint = findSchemaFingerprintFailure(db, SQLITE_SCHEMA_VERSION);
     if (fingerprint) {
       throw new MusterSqliteError('incompatible_schema', 'backup');
     }

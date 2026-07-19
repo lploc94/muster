@@ -13,8 +13,14 @@
 /** Muster's private SQLite `application_id` (verified before reading schema, plan §3.4). */
 export const MUSTER_APPLICATION_ID = 0x4d555354; // 'MUST'
 
+/**
+ * Frozen schema v7 identity. Migration input validation depends on this remaining
+ * stable after the compiled current schema advances to v8.
+ */
+export const SCHEMA_V7 = 7 as const;
+
 /** Current schema version, tracked via `PRAGMA user_version`. */
-export const SQLITE_SCHEMA_VERSION = 7;
+export const SQLITE_SCHEMA_VERSION = SCHEMA_V7;
 
 /**
  * Required user schema objects for an owned current database (P5-W2).
@@ -54,11 +60,11 @@ export const REQUIRED_SCHEMA_TRIGGERS = ['trg_send_outbox_capacity'] as const;
 export const CHANGE_FEED_RETAIN_REVISIONS = 4096;
 
 /**
- * Current DDL applied only to a fresh database inside one exclusive transaction.
- * Existing databases with another user_version are rejected and must be reset;
- * Muster does not carry data-upgrade migrations during development.
+ * Frozen schema-v7 DDL. Immutable after freeze — a compiled v8 binary validates
+ * migration candidates against this exact statement set / fingerprint, not against
+ * whatever CURRENT_SCHEMA_STATEMENTS has become.
  */
-export const CURRENT_SCHEMA_STATEMENTS: readonly string[] = [
+export const SCHEMA_V7_STATEMENTS: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS workspaces (
     id TEXT PRIMARY KEY,
     identity_key TEXT NOT NULL UNIQUE,
@@ -364,3 +370,24 @@ export const CURRENT_SCHEMA_STATEMENTS: readonly string[] = [
   `CREATE INDEX IF NOT EXISTS idx_presentation_operations_document
      ON presentation_operations(workspace_id, root_id, presentation_id)`,
 ];
+
+/**
+ * Current compiled DDL applied to fresh databases.
+ * Still aliases frozen v7 until the v8 migration branch lands (M018 S01 T02+).
+ * New objects must land in a version-specific array, not by mutating SCHEMA_V7_STATEMENTS.
+ */
+export const CURRENT_SCHEMA_STATEMENTS: readonly string[] = SCHEMA_V7_STATEMENTS;
+
+/**
+ * Resolve the immutable statement set for a supported schema version.
+ * Unknown versions fail closed so migration cannot invent a golden manifest.
+ */
+export function schemaStatementsForVersion(version: number): readonly string[] {
+  if (version === SCHEMA_V7) {
+    return SCHEMA_V7_STATEMENTS;
+  }
+  if (version === SQLITE_SCHEMA_VERSION) {
+    return CURRENT_SCHEMA_STATEMENTS;
+  }
+  throw new Error(`unsupported schema version ${version}`);
+}
