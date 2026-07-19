@@ -2984,22 +2984,22 @@ export class SqliteTaskRepository implements TaskRepository {
       ],
     };
     // Ensure workspace row exists for FK (same pattern as other creates).
-    await this.client.run(
+    await this.db.run(
       `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
        VALUES (?,?,?,?,?)
        ON CONFLICT(id) DO NOTHING`,
       [this.workspaceId, this.workspaceId, this.workspaceId, definition.createdAt, definition.createdAt],
     );
-    await this.client.run(
+    await this.db.run(
       `INSERT INTO workspace_revisions (workspace_id, revision)
        VALUES (?, 0) ON CONFLICT(workspace_id) DO NOTHING`,
       [this.workspaceId],
     );
 
-    const tx = await this.client.transaction([claimSql, defSql], {
+    const tx = await this.db.transaction([claimSql, defSql], {
       abortIfFirstUnchanged: false,
     });
-    const claimChanges = tx.results[0]?.changes ?? 0;
+    const claimChanges = tx[0]?.changes ?? 0;
     if (claimChanges > 0) {
       // Fresh claim — definition insert should have landed (or already matched).
       return {
@@ -3012,7 +3012,7 @@ export class SqliteTaskRepository implements TaskRepository {
       };
     }
     // Replay or conflict: read existing operation fingerprint.
-    const existing = await this.client.get(
+    const existing = await this.db.get(
       `SELECT fingerprint, result_json FROM operations
         WHERE workspace_id = ? AND ledger_key = ?`,
       [this.workspaceId, ledgerKey],
