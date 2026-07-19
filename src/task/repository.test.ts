@@ -1096,4 +1096,101 @@ describe('SqliteTaskRepository', () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   }, 20_000);
+
+
+  it('defines an immutable one-node workflow with replay and fingerprint conflict', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-define-wf-'));
+    const client = new SqliteClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const repository = new SqliteTaskRepository(client, 'ws');
+      const topology = {
+        kind: 'one_node_v1' as const,
+        nodes: [{ nodeId: 'entry' }],
+        entryNodeId: 'entry',
+      };
+      const createdAt = '2026-07-19T00:00:00.000Z';
+      const first = await repository.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-one',
+        version: 1,
+        name: 'one-node',
+        topology,
+        createdAt,
+      });
+      expect(first.ok).toBe(true);
+      expect(first.changed).toBe(true);
+      expect(first.operation?.fingerprint).toEqual(expect.any(String));
+
+      const rows = await client.all(
+        'SELECT definition_id, version, name, entry_node_id, topology_json FROM workflow_definitions WHERE workspace_id = ?',
+        ['ws'],
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({
+        definition_id: 'wf-one',
+        version: 1,
+        name: 'one-node',
+        entry_node_id: 'entry',
+      });
+
+      // Same key + same fingerprint → replay (no second row)
+      const replay = await repository.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-one',
+        version: 1,
+        name: 'one-node',
+        topology,
+        createdAt: '2099-01-01T00:00:00.000Z',
+      });
+      expect(replay.ok).toBe(true);
+      expect(replay.changed).toBe(false);
+      expect(await client.all(
+        'SELECT definition_id FROM workflow_definitions WHERE workspace_id = ?',
+        ['ws'],
+      )).toHaveLength(1);
+
+      // Same key + different topology → conflict, no partial overwrite
+      const conflict = await repository.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-one',
+        version: 1,
+        name: 'one-node-renamed',
+        topology,
+        createdAt,
+      });
+      expect(conflict.ok).toBe(false);
+      expect(conflict.conflict).toBe(true);
+      expect(conflict.reason).toMatch(/fingerprint conflict|definition fingerprint conflict/);
+      const afterConflict = await client.all(
+        'SELECT name, topology_json FROM workflow_definitions WHERE workspace_id = ?',
+        ['ws'],
+      );
+      expect(afterConflict).toHaveLength(1);
+      expect(afterConflict[0]).toMatchObject({ name: 'one-node' });
+
+      // Invalid topology fails closed without rows
+      const invalid = await repository.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-bad',
+        version: 1,
+        name: 'bad',
+        topology: { kind: 'one_node_v1', nodes: [{ nodeId: 'a' }, { nodeId: 'b' }], entryNodeId: 'a' },
+        createdAt,
+      });
+      expect(invalid.ok).toBe(false);
+      expect(await client.all(
+        'SELECT definition_id FROM workflow_definitions WHERE workspace_id = ? AND definition_id = ?',
+        ['ws', 'wf-bad'],
+      )).toHaveLength(0);
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
 });

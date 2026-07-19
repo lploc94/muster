@@ -13,6 +13,15 @@ import type {
   TurnDisposition,
   TurnStatus,
 } from './types';
+import {
+  defineWorkflowConflict,
+  defineWorkflowCreated,
+  defineWorkflowInvalid,
+  defineWorkflowLedgerKey,
+  defineWorkflowReplay,
+  validateDefineWorkflow,
+  type DefineWorkflowResult,
+} from './workflow';
 import { isMutatingTask, normalizedWritePaths } from './resources';
 import { canPromoteTurn } from './scheduler';
 import { DEFAULT_RESOURCE_LIMITS } from './limits';
@@ -340,6 +349,16 @@ export type RepositoryCommand =
       kind: 'putPresentation';
       workspaceId: string;
       document: PresentationRecord;
+    }
+  | {
+      /** Immutable one-node workflow definition claim + insert (M018 S01). */
+      kind: 'defineWorkflowVersion';
+      workspaceId: string;
+      definitionId: string;
+      version: number;
+      name: string;
+      topology: unknown;
+      createdAt: string;
     }
   | {
       /** Atomic durable coordinator idempotency claim + presentation commit. */
@@ -2214,6 +2233,8 @@ export class SqliteTaskRepository implements TaskRepository {
         await this.write([operationStatement(this.workspaceId, command)], [{ kind: 'operation', id: command.ledgerKey, change: 'upsert' }], command.createdAt);
         return { ok: true, changed: true };
       }
+      case 'defineWorkflowVersion':
+        return this.defineWorkflowVersion(command);
       case 'claimOperation':
         return this.claimOperation(command);
       case 'deleteOperationsForTurn': {
@@ -2893,6 +2914,136 @@ export class SqliteTaskRepository implements TaskRepository {
     );
     return { ok: true, changed: (results[0]?.changes ?? 0) > 0, ...((results[0]?.changes ?? 0) === 0 ? { reason: 'task changed; retry' } : {}) };
   }
+
+  /**
+   * Persist an immutable one-node workflow definition.
+   * First statement claims (definitionId,version)/fingerprint on the operations ledger;
+   * rest inserts workflow_definitions. Same fingerprint replays; conflict fails closed.
+   */
+  private async defineWorkflowVersion(
+    command: Extract<RepositoryCommand, { kind: 'defineWorkflowVersion' }>,
+  ): Promise<RepositoryCommandResult> {
+    if (command.workspaceId !== this.workspaceId) {
+      throw new Error('workspace mismatch');
+    }
+    const validated = validateDefineWorkflow({
+      definitionId: command.definitionId,
+      version: command.version,
+      name: command.name,
+      topology: command.topology,
+      createdAt: command.createdAt,
+    });
+    if (!validated.ok) {
+      const reason =
+        validated.reason.includes('definitionId') ||
+        validated.reason.includes('version') ||
+        validated.reason.includes('name') ||
+        validated.reason.includes('createdAt')
+          ? 'invalid identity'
+          : 'invalid topology';
+      const shaped = defineWorkflowInvalid(reason);
+      return {
+        ok: false,
+        changed: false,
+        conflict: true,
+        reason: shaped.reason,
+        operation: {
+          fingerprint: '',
+          result: { ok: false, error: shaped.reason },
+        },
+      };
+    }
+    const { definition, fingerprint, topologyJson } = validated;
+    const ledgerKey = defineWorkflowLedgerKey(definition.definitionId, definition.version);
+    const resultPayload = defineWorkflowCreated(definition, fingerprint);
+    // Claim first: INSERT OR IGNORE into operations. Zero changes → inspect existing fingerprint.
+    const claimSql = {
+      sql: `INSERT INTO operations (workspace_id, ledger_key, fingerprint, result_json, created_at)
+            VALUES (?,?,?,?,?) ON CONFLICT(workspace_id, ledger_key) DO NOTHING`,
+      params: [
+        this.workspaceId,
+        ledgerKey,
+        fingerprint,
+        encodePayload({ result: { ok: true, data: resultPayload } }),
+        definition.createdAt,
+      ],
+    };
+    const defSql = {
+      sql: `INSERT INTO workflow_definitions (
+              workspace_id, definition_id, version, name, entry_node_id, topology_json, created_at
+            ) VALUES (?,?,?,?,?,?,?)
+            ON CONFLICT(workspace_id, definition_id, version) DO NOTHING`,
+      params: [
+        this.workspaceId,
+        definition.definitionId,
+        definition.version,
+        definition.name,
+        definition.topology.entryNodeId,
+        topologyJson,
+        definition.createdAt,
+      ],
+    };
+    // Ensure workspace row exists for FK (same pattern as other creates).
+    await this.client.run(
+      `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
+       VALUES (?,?,?,?,?)
+       ON CONFLICT(id) DO NOTHING`,
+      [this.workspaceId, this.workspaceId, this.workspaceId, definition.createdAt, definition.createdAt],
+    );
+    await this.client.run(
+      `INSERT INTO workspace_revisions (workspace_id, revision)
+       VALUES (?, 0) ON CONFLICT(workspace_id) DO NOTHING`,
+      [this.workspaceId],
+    );
+
+    const tx = await this.client.transaction([claimSql, defSql], {
+      abortIfFirstUnchanged: false,
+    });
+    const claimChanges = tx.results[0]?.changes ?? 0;
+    if (claimChanges > 0) {
+      // Fresh claim — definition insert should have landed (or already matched).
+      return {
+        ok: true,
+        changed: true,
+        operation: {
+          fingerprint,
+          result: { ok: true, data: resultPayload },
+        },
+      };
+    }
+    // Replay or conflict: read existing operation fingerprint.
+    const existing = await this.client.get(
+      `SELECT fingerprint, result_json FROM operations
+        WHERE workspace_id = ? AND ledger_key = ?`,
+      [this.workspaceId, ledgerKey],
+    ) as { fingerprint?: string; result_json?: string } | null;
+    if (!existing || typeof existing.fingerprint !== 'string') {
+      throw new Error('define_workflow claim missing after conflict');
+    }
+    if (existing.fingerprint === fingerprint) {
+      const replay = defineWorkflowReplay(definition, fingerprint);
+      return {
+        ok: true,
+        changed: false,
+        operation: {
+          fingerprint,
+          result: { ok: true, data: replay },
+        },
+      };
+    }
+    const conflict = defineWorkflowConflict(definition.definitionId, definition.version);
+    return {
+      ok: false,
+      changed: false,
+      conflict: true,
+      reason: conflict.reason,
+      operation: {
+        fingerprint: existing.fingerprint,
+        result: { ok: false, error: conflict.reason },
+      },
+    };
+  }
+
 
   private async claimOperation(
     command: Extract<RepositoryCommand, { kind: 'claimOperation' }>,
