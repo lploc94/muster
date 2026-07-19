@@ -248,18 +248,30 @@ describe('M017 R2 GREEN — settle once + awaiting_parent_seal (S02)', () => {
   afterEach(async () => {
     const harnesses = [...activeHarnesses];
     activeHarnesses.clear();
-    for (const h of harnesses) h.resume();
-    for (const h of harnesses) {
-      try {
-        h.engine.quiesceForTerminalStorage();
-      } catch {
-        /* ignore */
+    // Swallow late storage rejections from aborted in-flight settle paths.
+    const swallow = () => undefined;
+    process.on('unhandledRejection', swallow);
+    try {
+      for (const h of harnesses) {
+        try {
+          h.resume();
+        } catch {
+          /* ignore */
+        }
+        try {
+          h.engine.quiesceForTerminalStorage();
+        } catch {
+          /* ignore */
+        }
       }
-    }
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    await Promise.all(clients.splice(0).map((c) => c.close().catch(() => undefined)));
-    for (const dir of tempDirs.splice(0)) {
-      fs.rmSync(dir, { recursive: true, force: true });
+      // Drain so aborted turn finals don't race client.close.
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      await Promise.all(clients.splice(0).map((c) => c.close().catch(() => undefined)));
+      for (const dir of tempDirs.splice(0)) {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    } finally {
+      process.off('unhandledRejection', swallow);
     }
   });
 
@@ -472,16 +484,7 @@ describe('M017 R2 GREEN — settle once + awaiting_parent_seal (S02)', () => {
     });
     expect(child?.sealedBy).toBeUndefined();
 
-    // Soft parent-wake signal when it lands (not required for R2 settle-once).
-    const parent = read().tasks[coordId];
-    const attentionTurn = Object.values(read().turns).find(
-      (t) => t.taskId === coordId && t.id.endsWith('-attention'),
-    );
-    if (attentionTurn && (attentionTurn.status === 'running' || attentionTurn.status === 'queued')) {
-      await engine.stageDispositionAsync(attentionTurn.id, { kind: 'idle' }, 'op-attention-idle').catch(() => undefined);
-    }
-    void parent;
-    resume();
+    // Stop all background repository work before teardown (no further executes).
     engine.quiesceForTerminalStorage();
   }, 15_000);
 });
