@@ -3341,8 +3341,11 @@ export class SqliteTaskRepository implements TaskRepository {
       [this.workspaceId],
     );
 
+    // Claim first: if the start key is already taken, abort the compound write so a
+    // different definition under the same key cannot insert a second run/task/turn.
+    // Same-fingerprint replay also lands here (0 claim changes) and returns no-op.
     const tx = await this.db.transaction([claimSql, ...rest], {
-      abortIfFirstUnchanged: false,
+      abortIfFirstUnchanged: true,
     });
     const claimChanges = tx[0]?.changes ?? 0;
     if (claimChanges > 0) {
