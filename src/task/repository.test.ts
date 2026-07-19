@@ -1100,7 +1100,7 @@ describe('SqliteTaskRepository', () => {
 
   it('defines an immutable one-node workflow with replay and fingerprint conflict', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-define-wf-'));
-    const client = new SqliteClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
     try {
       await client.open(path.join(dir, 'muster.sqlite3'));
       const repository = new SqliteTaskRepository(client, 'ws');
