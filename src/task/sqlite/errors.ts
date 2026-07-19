@@ -52,6 +52,7 @@ export const SQLITE_OPERATION_CLASSES = [
   'pragma',
   'close',
   'backup',
+  'migrate',
   'unknown',
 ] as const;
 

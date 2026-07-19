@@ -22,9 +22,13 @@ import { DatabaseSync } from 'node:sqlite';
 import {
   CURRENT_SCHEMA_STATEMENTS,
   MUSTER_APPLICATION_ID,
+  MUSTER_WRITER_VERSION_UDF,
+  SCHEMA_V7,
+  SCHEMA_V8_MIGRATION_STATEMENTS,
   SQLITE_SCHEMA_VERSION,
 } from './schema';
 import { MusterSqliteError, mapToMusterSqliteError } from './errors';
+import { maybeInjectFault } from './fault-inject';
 import { findSchemaFingerprintFailure } from './schema-fingerprint';
 
 export interface OpenOptions {
@@ -92,6 +96,14 @@ export class NonEmptyUnclaimedDatabaseError extends MusterSqliteError {
 // Schema version remains the ownership gate; it is not serialized on the RPC wire.
 void SQLITE_SCHEMA_VERSION;
 
+/**
+ * Register the connection-local writer-version UDF required by v8 write-guard triggers.
+ * Stale connections without this UDF (or with a different compiled version) fail closed.
+ */
+export function registerWriterVersionUdf(db: DatabaseSync): void {
+  db.function(MUSTER_WRITER_VERSION_UDF, () => SQLITE_SCHEMA_VERSION);
+}
+
 function readScalar(db: DatabaseSync, pragma: string): number {
   const row = db.prepare(`PRAGMA ${pragma}`).get() as Record<string, number> | undefined;
   if (!row) {
@@ -130,6 +142,59 @@ function assertCurrentSchemaComplete(db: DatabaseSync): void {
   }
 }
 
+function assertOwnedV7SchemaComplete(db: DatabaseSync): void {
+  try {
+    const failure = findSchemaFingerprintFailure(db, SCHEMA_V7);
+    if (failure) {
+      throw new IncompatibleSchemaError(SCHEMA_V7);
+    }
+  } catch (error) {
+    if (error instanceof IncompatibleSchemaError) throw error;
+    throw new IncompatibleSchemaError(SCHEMA_V7);
+  }
+}
+
+/**
+ * Atomically upgrade an owned complete schema-v7 store to the compiled current
+ * schema under BEGIN EXCLUSIVE. Any failure before COMMIT rolls back so the
+ * original v7 store remains readable and unchanged.
+ */
+export function migrateOwnedV7ToCurrent(db: DatabaseSync): void {
+  db.exec('BEGIN EXCLUSIVE TRANSACTION');
+  try {
+    const applicationId = readScalar(db, 'application_id');
+    const userVersion = readScalar(db, 'user_version');
+
+    // Peer already finished migration while we waited on the exclusive lock.
+    if (applicationId === MUSTER_APPLICATION_ID && userVersion === SQLITE_SCHEMA_VERSION) {
+      assertCurrentSchemaComplete(db);
+      db.exec('COMMIT');
+      return;
+    }
+
+    if (applicationId !== MUSTER_APPLICATION_ID || userVersion !== SCHEMA_V7) {
+      throw new IncompatibleSchemaError(userVersion);
+    }
+    assertOwnedV7SchemaComplete(db);
+
+    for (const statement of SCHEMA_V8_MIGRATION_STATEMENTS) {
+      db.exec(statement);
+    }
+    db.exec(`PRAGMA user_version = ${SQLITE_SCHEMA_VERSION}`);
+    assertCurrentSchemaComplete(db);
+    // Deterministic commit-boundary seam for UAT/tests (no-op without capability).
+    maybeInjectFault('migrate');
+    db.exec('COMMIT');
+  } catch (error) {
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      // Prefer the original migration failure over a secondary rollback error.
+    }
+    throw error;
+  }
+}
+
 /**
  * Connection-local wait policy only. Safe during preflight because busy_timeout is
  * not a durable file mutation (unlike journal_mode / application_id / user_version).
@@ -150,6 +215,7 @@ function applyRuntimePragmas(db: DatabaseSync, busyTimeoutMs: number): void {
 }
 
 type ExclusiveOpenDecision = { kind: 'current' } | { kind: 'blank_claimed' };
+type ExistingOpenResult = 'current' | 'migrate_v7' | false;
 
 /**
  * Private signal: state changed under concurrent first-open (peer bootstrap).
@@ -220,7 +286,8 @@ function exclusiveOpenDecision(db: DatabaseSync): ExclusiveOpenDecision {
 
 /**
  * Read-only ownership probe. Never stamps markers or creates schema.
- * - current Muster → true (skip exclusive claim)
+ * - current Muster → 'current'
+ * - owned complete v7 → 'migrate_v7' (upgrade under exclusive)
  * - blank → false (claim under exclusive)
  * - concurrent schema-without-markers after a blank was observed → ConcurrentOpenStateChanged
  * - genuine non-empty unclaimed on first probe → NonEmptyUnclaimedDatabaseError
@@ -228,7 +295,7 @@ function exclusiveOpenDecision(db: DatabaseSync): ExclusiveOpenDecision {
 function tryOpenExistingCurrent(
   db: DatabaseSync,
   opts: { allowConcurrentNonemptyRetry: boolean },
-): boolean {
+): ExistingOpenResult {
   const applicationId = readScalar(db, 'application_id');
   const userVersion = readScalar(db, 'user_version');
   if (applicationId !== 0 && applicationId !== MUSTER_APPLICATION_ID) {
@@ -237,7 +304,11 @@ function tryOpenExistingCurrent(
   if (applicationId === MUSTER_APPLICATION_ID) {
     if (userVersion === SQLITE_SCHEMA_VERSION) {
       assertCurrentSchemaComplete(db);
-      return true;
+      return 'current';
+    }
+    if (userVersion === SCHEMA_V7 && SCHEMA_V7 !== SQLITE_SCHEMA_VERSION) {
+      assertOwnedV7SchemaComplete(db);
+      return 'migrate_v7';
     }
     throw new IncompatibleSchemaError(userVersion);
   }
@@ -250,7 +321,15 @@ function tryOpenExistingCurrent(
     const verAgain = readScalar(db, 'user_version');
     if (appAgain === MUSTER_APPLICATION_ID && verAgain === SQLITE_SCHEMA_VERSION) {
       assertCurrentSchemaComplete(db);
-      return true;
+      return 'current';
+    }
+    if (
+      appAgain === MUSTER_APPLICATION_ID &&
+      verAgain === SCHEMA_V7 &&
+      SCHEMA_V7 !== SQLITE_SCHEMA_VERSION
+    ) {
+      assertOwnedV7SchemaComplete(db);
+      return 'migrate_v7';
     }
     if (opts.allowConcurrentNonemptyRetry && appAgain === 0 && verAgain === 0) {
       throw new ConcurrentOpenStateChanged();
@@ -292,10 +371,12 @@ export function openStoreDatabase(opts: OpenOptions): DatabaseSync {
       db = new DatabaseSync(opts.path);
       // Connection-local only — does not mutate durable journal/application markers.
       applyConnectionBusyTimeout(db, busyTimeoutMs);
-      const alreadyCurrent = tryOpenExistingCurrent(db, {
+      const existing = tryOpenExistingCurrent(db, {
         allowConcurrentNonemptyRetry: sawBlankPreflight,
       });
-      if (!alreadyCurrent) {
+      if (existing === 'migrate_v7') {
+        migrateOwnedV7ToCurrent(db);
+      } else if (!existing) {
         sawBlankPreflight = true;
         // Fresh connection for exclusive claim so page cache cannot retain a
         // pre-peer-commit blank snapshot across BEGIN EXCLUSIVE.
@@ -308,6 +389,8 @@ export function openStoreDatabase(opts: OpenOptions): DatabaseSync {
         applyConnectionBusyTimeout(db, busyTimeoutMs);
         exclusiveOpenDecision(db);
       }
+      // Writer UDF must be registered before any guarded write on this connection.
+      registerWriterVersionUdf(db);
       // WAL / foreign_keys / synchronous only after ownership is confirmed.
       applyRuntimePragmas(db, busyTimeoutMs);
       return db;

@@ -19,14 +19,17 @@ export const MUSTER_APPLICATION_ID = 0x4d555354; // 'MUST'
  */
 export const SCHEMA_V7 = 7 as const;
 
+/** Schema v8 identity (workflow tables + writer-version fence). */
+export const SCHEMA_V8 = 8 as const;
+
 /** Current schema version, tracked via `PRAGMA user_version`. */
-export const SQLITE_SCHEMA_VERSION = SCHEMA_V7;
+export const SQLITE_SCHEMA_VERSION = SCHEMA_V8;
 
 /**
- * Required user schema objects for an owned current database (P5-W2).
- * Bounded preflight checks these names only — not full integrity_check.
+ * Frozen v7 required tables (migration-input / populated fixture counts).
+ * Immutable after freeze — do not append workflow tables here.
  */
-export const REQUIRED_SCHEMA_TABLES = [
+export const REQUIRED_SCHEMA_V7_TABLES = [
   'workspaces',
   'workspace_locations',
   'tasks',
@@ -50,7 +53,36 @@ export const REQUIRED_SCHEMA_TABLES = [
   'presentation_operations',
 ] as const;
 
+/**
+ * Workflow tables introduced by schema v8 (additive; never rewrite v7 history).
+ */
+export const REQUIRED_SCHEMA_V8_WORKFLOW_TABLES = [
+  'workflow_definitions',
+  'workflow_runs',
+  'workflow_nodes',
+  'workflow_dependency_gates',
+  'workflow_gate_bindings',
+  'workflow_artifacts',
+  'workflow_gate_fills',
+  'workflow_feedback_rounds',
+  'workflow_feedback_targets',
+  'workflow_routed_messages',
+  'workflow_continuations',
+] as const;
+
+/**
+ * Required user schema objects for an owned current database (P5-W2).
+ * Bounded preflight checks these names only — not full integrity_check.
+ */
+export const REQUIRED_SCHEMA_TABLES = [
+  ...REQUIRED_SCHEMA_V7_TABLES,
+  ...REQUIRED_SCHEMA_V8_WORKFLOW_TABLES,
+] as const;
+
 export const REQUIRED_SCHEMA_TRIGGERS = ['trg_send_outbox_capacity'] as const;
+
+/** Connection-local UDF name used by v8 writer-guard triggers. */
+export const MUSTER_WRITER_VERSION_UDF = 'muster_writer_version';
 
 /**
  * Production change-feed retention bound (revisions kept after the low watermark).
@@ -372,11 +404,214 @@ export const SCHEMA_V7_STATEMENTS: readonly string[] = [
 ];
 
 /**
+ * Closed mutable-table allowlist for v8 writer-guard triggers.
+ * Generated deterministically so migration output fingerprints match blank claim.
+ */
+export const SCHEMA_V8_WRITER_GUARD_TABLES: readonly string[] = REQUIRED_SCHEMA_TABLES;
+
+function writerGuardTriggerStatements(
+  tables: readonly string[],
+  writerVersion: number,
+): string[] {
+  const events = ['INSERT', 'UPDATE', 'DELETE'] as const;
+  const statements: string[] = [];
+  for (const table of tables) {
+    for (const event of events) {
+      const name = `trg_wg_${table}_${event.toLowerCase()}`;
+      statements.push(
+        `CREATE TRIGGER IF NOT EXISTS ${name}
+BEFORE ${event} ON ${table}
+WHEN ${MUSTER_WRITER_VERSION_UDF}() IS NULL OR ${MUSTER_WRITER_VERSION_UDF}() <> ${writerVersion}
+BEGIN
+  SELECT RAISE(ABORT, 'schema_changed');
+END`,
+      );
+    }
+  }
+  return statements;
+}
+
+/**
+ * Additive schema-v8 DDL only (workflow tables/indexes + writer-guard triggers).
+ * Applied under BEGIN EXCLUSIVE during v7→v8 migration; never rewrites v7 rows.
+ */
+export const SCHEMA_V8_MIGRATION_STATEMENTS: readonly string[] = [
+  `CREATE TABLE IF NOT EXISTS workflow_definitions (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    definition_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    entry_node_id TEXT NOT NULL,
+    topology_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, definition_id, version)
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS workflow_runs (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    definition_id TEXT NOT NULL,
+    definition_version INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    origin TEXT NOT NULL,
+    parent_run_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, run_id),
+    FOREIGN KEY (workspace_id, definition_id, definition_version)
+      REFERENCES workflow_definitions(workspace_id, definition_id, version)
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS workflow_nodes (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    task_id TEXT,
+    status TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, run_id, node_id),
+    FOREIGN KEY (workspace_id, run_id)
+      REFERENCES workflow_runs(workspace_id, run_id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, task_id)
+      REFERENCES tasks(workspace_id, id) ON DELETE SET NULL
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS workflow_dependency_gates (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    gate_id TEXT NOT NULL,
+    consumer_node_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, run_id, gate_id),
+    FOREIGN KEY (workspace_id, run_id)
+      REFERENCES workflow_runs(workspace_id, run_id) ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS workflow_gate_bindings (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    gate_id TEXT NOT NULL,
+    input_ref TEXT NOT NULL,
+    producer_node_id TEXT NOT NULL,
+    required_kind TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, run_id, gate_id, input_ref),
+    FOREIGN KEY (workspace_id, run_id, gate_id)
+      REFERENCES workflow_dependency_gates(workspace_id, run_id, gate_id)
+      ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS workflow_artifacts (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    producer_node_id TEXT NOT NULL,
+    logical_name TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, run_id, artifact_id, revision),
+    FOREIGN KEY (workspace_id, run_id)
+      REFERENCES workflow_runs(workspace_id, run_id) ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS workflow_gate_fills (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    gate_id TEXT NOT NULL,
+    input_ref TEXT NOT NULL,
+    artifact_id TEXT NOT NULL,
+    artifact_revision INTEGER NOT NULL,
+    filled_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, run_id, gate_id, input_ref, artifact_id, artifact_revision),
+    FOREIGN KEY (workspace_id, run_id, gate_id)
+      REFERENCES workflow_dependency_gates(workspace_id, run_id, gate_id)
+      ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS workflow_feedback_rounds (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    round_id TEXT NOT NULL,
+    requester_node_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    join_mode TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, run_id, round_id),
+    FOREIGN KEY (workspace_id, run_id)
+      REFERENCES workflow_runs(workspace_id, run_id) ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS workflow_feedback_targets (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    round_id TEXT NOT NULL,
+    target_node_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, run_id, round_id, target_node_id),
+    FOREIGN KEY (workspace_id, run_id, round_id)
+      REFERENCES workflow_feedback_rounds(workspace_id, run_id, round_id)
+      ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS workflow_routed_messages (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    source_node_id TEXT NOT NULL,
+    destination_node_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    body_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, run_id, message_id),
+    FOREIGN KEY (workspace_id, run_id)
+      REFERENCES workflow_runs(workspace_id, run_id) ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS workflow_continuations (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    continuation_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, run_id, continuation_id),
+    FOREIGN KEY (workspace_id, run_id)
+      REFERENCES workflow_runs(workspace_id, run_id) ON DELETE CASCADE
+  )`,
+
+  `CREATE INDEX IF NOT EXISTS idx_workflow_runs_definition
+     ON workflow_runs(workspace_id, definition_id, definition_version)`,
+  `CREATE INDEX IF NOT EXISTS idx_workflow_runs_status
+     ON workflow_runs(workspace_id, status, updated_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_workflow_nodes_task
+     ON workflow_nodes(workspace_id, task_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_workflow_gates_status
+     ON workflow_dependency_gates(workspace_id, run_id, status)`,
+  `CREATE INDEX IF NOT EXISTS idx_workflow_artifacts_logical
+     ON workflow_artifacts(workspace_id, run_id, logical_name, revision)`,
+  `CREATE INDEX IF NOT EXISTS idx_workflow_feedback_rounds_status
+     ON workflow_feedback_rounds(workspace_id, run_id, status)`,
+  `CREATE INDEX IF NOT EXISTS idx_workflow_continuations_status
+     ON workflow_continuations(workspace_id, run_id, status)`,
+
+  ...writerGuardTriggerStatements(SCHEMA_V8_WRITER_GUARD_TABLES, SCHEMA_V8),
+];
+
+/**
+ * Full schema-v8 statement set (frozen v7 + additive v8 objects).
+ * Blank claim and golden fingerprint for version 8 use this exact array.
+ */
+export const SCHEMA_V8_STATEMENTS: readonly string[] = [
+  ...SCHEMA_V7_STATEMENTS,
+  ...SCHEMA_V8_MIGRATION_STATEMENTS,
+];
+
+/**
  * Current compiled DDL applied to fresh databases.
- * Still aliases frozen v7 until the v8 migration branch lands (M018 S01 T02+).
  * New objects must land in a version-specific array, not by mutating SCHEMA_V7_STATEMENTS.
  */
-export const CURRENT_SCHEMA_STATEMENTS: readonly string[] = SCHEMA_V7_STATEMENTS;
+export const CURRENT_SCHEMA_STATEMENTS: readonly string[] = SCHEMA_V8_STATEMENTS;
 
 /**
  * Resolve the immutable statement set for a supported schema version.
@@ -386,8 +621,8 @@ export function schemaStatementsForVersion(version: number): readonly string[] {
   if (version === SCHEMA_V7) {
     return SCHEMA_V7_STATEMENTS;
   }
-  if (version === SQLITE_SCHEMA_VERSION) {
-    return CURRENT_SCHEMA_STATEMENTS;
+  if (version === SCHEMA_V8) {
+    return SCHEMA_V8_STATEMENTS;
   }
   throw new Error(`unsupported schema version ${version}`);
 }

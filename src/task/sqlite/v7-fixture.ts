@@ -8,7 +8,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import {
   MUSTER_APPLICATION_ID,
-  REQUIRED_SCHEMA_TABLES,
+  REQUIRED_SCHEMA_V7_TABLES,
   SCHEMA_V7,
   SCHEMA_V7_STATEMENTS,
 } from './schema';
@@ -39,7 +39,7 @@ function quoteIdent(name: string): string {
 /** Count every required v7 user table (0 when empty). */
 export function countPopulatedV7FixtureRows(db: DatabaseSync): Record<string, number> {
   const counts: Record<string, number> = {};
-  for (const table of REQUIRED_SCHEMA_TABLES) {
+  for (const table of REQUIRED_SCHEMA_V7_TABLES) {
     const row = db.prepare(`SELECT COUNT(*) AS n FROM ${quoteIdent(table)}`).get() as
       | { n: number }
       | undefined;
