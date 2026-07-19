@@ -23,14 +23,6 @@
   import type { PendingAsk, TaskSummary, TaskViewStatus } from '../lib/protocol';
   import { effectiveRuntimeActivity } from '../lib/protocol';
   import { BACKENDS, backendShortLabel, backendModelLabel } from '../lib/backends';
-  import {
-    dismissHandoffTerminalToast,
-    formatHandoffProgressLabel,
-    initialHandoffChromeVisibilityState,
-    isHandoffProgressInFlight,
-    reduceHandoffChromeVisibility,
-    shouldShowHandoffChrome,
-  } from '../lib/handoff-progress';
   import { tip } from '../lib/tooltip';
   import {
     extractFileDropCandidatesFromDataTransfer,
@@ -539,54 +531,6 @@
     mode === 'draft' ? tasks.selectedBackend : (tasks.focusedTask?.backend ?? tasks.selectedBackend),
   );
 
-  /** Task-mode picker is always interactive; chrome only reflects in-flight handoff. */
-  const handoffProgress = $derived(
-    mode === 'task' ? (task?.handoffProgress ?? tasks.focusedTask?.handoffProgress) : undefined,
-  );
-  const handoffInFlight = $derived(
-    mode === 'task' && isHandoffProgressInFlight(handoffProgress),
-  );
-  let handoffChromeState = $state(initialHandoffChromeVisibilityState());
-  $effect(() => {
-    const next = reduceHandoffChromeVisibility(
-      handoffChromeState,
-      mode === 'task' ? (task?.id ?? taskId ?? null) : null,
-      handoffProgress,
-    );
-    if (next !== handoffChromeState) handoffChromeState = next;
-  });
-  const showHandoffChrome = $derived(
-    shouldShowHandoffChrome(
-      handoffChromeState,
-      mode === 'task' ? (task?.id ?? taskId ?? null) : null,
-      handoffProgress,
-    ),
-  );
-  const handoffChromeLabel = $derived(
-    handoffProgress ? formatHandoffProgressLabel(handoffProgress) : '',
-  );
-  const handoffChromeTone = $derived.by(() => {
-    if (!handoffProgress) return 'muted';
-    if (handoffProgress.phase === 'failed') return 'danger';
-    if (handoffProgress.phase === 'completed') return 'success';
-    if (handoffProgress.phase === 'cancelled') return 'muted';
-    return 'attention';
-  });
-
-  // Terminal results are brief one-shot feedback. Persisted completed/failed
-  // metadata cannot restart this timer because only an observed in-flight op
-  // receives terminalToastOperationId.
-  $effect(() => {
-    const operationId = handoffChromeState.terminalToastOperationId;
-    const phase = handoffProgress?.phase;
-    if (!operationId || !phase) return;
-    const delay = phase === 'failed' ? 8000 : 2800;
-    const timer = setTimeout(() => {
-      handoffChromeState = dismissHandoffTerminalToast(handoffChromeState, operationId);
-    }, delay);
-    return () => clearTimeout(timer);
-  });
-
   // Register select so resolveBackendForSend can read it for draft sends.
   $effect(() => {
     registerBackendSelect(backendSelect);
@@ -801,6 +745,7 @@
         model?: string;
         continuationOf?: string;
         skills?: string[];
+        mentionBindings?: Array<[string, string]>;
         clientRequestId: string;
       } = { type: 'send', text: displayText, backend, clientRequestId };
       if (llmText !== displayText) payload.llmText = llmText;
@@ -809,6 +754,9 @@
       // Skill chips inject only into a NEW task's first turn — never a continuation.
       if (selectedSkills.length > 0 && !tasks.continuationOf) {
         payload.skills = [...selectedSkills];
+      }
+      if (mentionBindings.size > 0) {
+        payload.mentionBindings = Array.from(mentionBindings.entries());
       }
       outboxAdd(vscode, {
         clientRequestId,
@@ -823,15 +771,6 @@
         skills: selectedSkills.length > 0 ? [...selectedSkills] : undefined,
         createdAt: Date.now(),
         status: 'pending',
-      });
-      // DEBUG: temporary — remove after diagnosing grok→claude draft send.
-      console.info('[muster][draft-send]', {
-        selectValue: raw,
-        fromDom,
-        preferredBackend: tasks.preferredBackend,
-        preferredModel: tasks.preferredModel,
-        payloadBackend: payload.backend,
-        payloadModel: payload.model ?? null,
       });
       threadStore.current.appendTranscript({
         id: `local-${Date.now()}`,
@@ -876,6 +815,8 @@
       taskId,
       text: displayText,
       llmText,
+      mentionBindings:
+        mentionBindings.size > 0 ? Array.from(mentionBindings.entries()) : undefined,
       ...(pickerBackend ? { backend: pickerBackend } : {}),
       ...(pickerModel ? { model: pickerModel } : {}),
     });
@@ -1828,11 +1769,9 @@
                 ? modelsLoaded
                   ? 'Select backend + model for the new task'
                   : 'Loading models from installed CLIs… (shows backends first)'
-                : handoffInFlight
-                  ? 'Model switch in progress… (picker stays available)'
-                  : modelsLoaded
-                    ? 'Switch backend + model for this task (handoff)'
-                    : 'Loading models from installed CLIs…'
+                : modelsLoaded
+                  ? 'Switch backend + model for this task'
+                  : 'Loading models from installed CLIs…'
             }
             disabled={mode === 'draft' ? thread.running : false}
             position="above"
@@ -1848,21 +1787,6 @@
             {/each}
           </vscode-single-select>
         {/key}
-      {/if}
-
-      {#if mode === 'task' && showHandoffChrome && handoffProgress}
-        <div
-          class={`turn-activity-bar turn-activity-bar--${handoffChromeTone} handoff-progress-bar`}
-          data-testid="handoff-progress"
-          data-handoff-phase={handoffProgress.phase}
-          data-handoff-placement="model-picker"
-          role="status"
-          aria-live="polite"
-          use:tip={handoffChromeLabel}
-        >
-          <span class="turn-live-dot" aria-hidden="true"></span>
-          <span class="turn-activity-bar__label">{handoffChromeLabel}</span>
-        </div>
       {/if}
 
       <div bind:this={addContextMenuRegion} class="add-context">

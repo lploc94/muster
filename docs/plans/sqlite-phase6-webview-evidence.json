@@ -1,0 +1,82 @@
+{
+  "ok": true,
+  "kind": "sqlite-phase6-webview",
+  "schemaVersion": 1,
+  "baselineCommit": "a5864fc4262df8180b665acf7a54aca2ee90d916",
+  "w1Commit": "f4c62bcf1b9351d97385b8b2df20012e626f080a",
+  "w2Commit": "3558914f855d2f50b0ae2fbd9eb7857ab526e743",
+  "runtime": {
+    "node": "26.0.0",
+    "platform": "darwin",
+    "browser": "chromium"
+  },
+  "viewport": {
+    "width": 1280,
+    "height": 720
+  },
+  "fixture": {
+    "transcriptItems": 2000,
+    "treeVisibleRows": 5000,
+    "contentClasses": [
+      "user",
+      "assistant",
+      "tool",
+      "reasoning",
+      "tall-markdown",
+      "wide-tree"
+    ]
+  },
+  "thresholds": {
+    "maxMountedRows": 80,
+    "maxTreeMountedRows": 100,
+    "maxRetainedDeltaBytes": 16777216,
+    "heapRatio": 1.5,
+    "maxDomPeakDelta": 2500,
+    "maxDomFinalDelta": 250
+  },
+  "metrics": {
+    "chat": {
+      "baselineUsedBytes": 8400952,
+      "finalUsedBytes": 8644920,
+      "retainedDeltaBytes": 243968,
+      "baselineDomNodes": 1339,
+      "peakDomNodes": 1355,
+      "finalDomNodes": 1355,
+      "peakMountedRows": 14
+    },
+    "tree": {
+      "baselineUsedBytes": 14208852,
+      "finalUsedBytes": 14258444,
+      "retainedDeltaBytes": 49592,
+      "baselineDomNodes": 1286,
+      "peakDomNodes": 1551,
+      "finalDomNodes": 1291,
+      "peakMountedRows": 33,
+      "logicalRows": 5000
+    }
+  },
+  "contentSafety": {
+    "absolutePathsStoredInEvidence": false,
+    "messageBodiesStoredInEvidence": false,
+    "sessionIdsStoredInEvidence": false,
+    "canaryStoredInEvidence": false
+  },
+  "generatedAt": "2026-07-18T15:14:14Z",
+  "durationMs": 3401,
+  "commands": [
+    "npm run bench:phase6-webview",
+    "npm run test:phase6-webview",
+    "npm run compile",
+    "npm run check:svelte",
+    "npm test",
+    "npm run test:webview",
+    "npm run test:sqlite-storage-docs",
+    "npm run test:task-export-docs",
+    "npm run test:source-boundary",
+    "npm run test:sqlite-phase5-evidence",
+    "npm run test:sqlite-phase6-evidence",
+    "npm run bench:phase4-release:assert",
+    "schema-freeze"
+  ],
+  "verdict": "PASS"
+}

@@ -1,0 +1,206 @@
+{
+  "ok": true,
+  "kind": "sqlite-phase5-packaged-fault-uat",
+  "schemaVersion": 7,
+  "runtimes": [
+    {
+      "runtimeClass": "1.101.0",
+      "vscodeVersion": "1.101.0",
+      "nodeVersion": "22.15.1",
+      "scenarios": [
+        {
+          "scenarioId": "corrupt_open",
+          "resultCode": "corrupt",
+          "verdict": "PASS",
+          "durationMs": 69,
+          "byteSize": 120,
+          "hash": "1421f8264ab235ab"
+        },
+        {
+          "scenarioId": "not_a_database_open",
+          "resultCode": "not_a_database",
+          "verdict": "PASS",
+          "durationMs": 28
+        },
+        {
+          "scenarioId": "foreign_reject",
+          "resultCode": "foreign_database",
+          "verdict": "PASS",
+          "durationMs": 29
+        },
+        {
+          "scenarioId": "incompatible_reject",
+          "resultCode": "incompatible_schema",
+          "verdict": "PASS",
+          "durationMs": 30,
+          "schemaVersion": 7
+        },
+        {
+          "scenarioId": "write_full_rollback",
+          "resultCode": "full",
+          "verdict": "PASS",
+          "durationMs": 136,
+          "count": 1
+        },
+        {
+          "scenarioId": "write_readonly_rollback",
+          "resultCode": "readonly",
+          "verdict": "PASS",
+          "durationMs": 131,
+          "count": 1
+        },
+        {
+          "scenarioId": "busy_responsiveness",
+          "resultCode": "busy",
+          "verdict": "PASS",
+          "durationMs": 561,
+          "count": 5
+        },
+        {
+          "scenarioId": "backup_wal_writer",
+          "resultCode": "ok",
+          "verdict": "PASS",
+          "durationMs": 4,
+          "byteSize": 282624,
+          "mechanism": "vacuum",
+          "schemaVersion": 7
+        },
+        {
+          "scenarioId": "backup_reopen_consistency",
+          "resultCode": "ok",
+          "verdict": "PASS",
+          "durationMs": 1,
+          "byteSize": 282624,
+          "hash": "912429dd0d05890a",
+          "schemaVersion": 7
+        },
+        {
+          "scenarioId": "reset_cancel",
+          "resultCode": "cancel",
+          "verdict": "PASS",
+          "durationMs": 0,
+          "count": 0
+        },
+        {
+          "scenarioId": "reset_success",
+          "resultCode": "ok",
+          "verdict": "PASS",
+          "durationMs": 107,
+          "count": 5,
+          "schemaVersion": 7
+        },
+        {
+          "scenarioId": "cross_window_reset_contention",
+          "resultCode": "ok",
+          "verdict": "PASS",
+          "durationMs": 899,
+          "hash": "24465d44262686d6",
+          "schemaVersion": 7
+        }
+      ]
+    },
+    {
+      "runtimeClass": "stable",
+      "vscodeVersion": "1.129.1",
+      "nodeVersion": "24.18.0",
+      "scenarios": [
+        {
+          "scenarioId": "corrupt_open",
+          "resultCode": "corrupt",
+          "verdict": "PASS",
+          "durationMs": 35,
+          "byteSize": 120,
+          "hash": "05714220e4bc3d23"
+        },
+        {
+          "scenarioId": "not_a_database_open",
+          "resultCode": "not_a_database",
+          "verdict": "PASS",
+          "durationMs": 14
+        },
+        {
+          "scenarioId": "foreign_reject",
+          "resultCode": "foreign_database",
+          "verdict": "PASS",
+          "durationMs": 15
+        },
+        {
+          "scenarioId": "incompatible_reject",
+          "resultCode": "incompatible_schema",
+          "verdict": "PASS",
+          "durationMs": 13,
+          "schemaVersion": 7
+        },
+        {
+          "scenarioId": "write_full_rollback",
+          "resultCode": "full",
+          "verdict": "PASS",
+          "durationMs": 72,
+          "count": 1
+        },
+        {
+          "scenarioId": "write_readonly_rollback",
+          "resultCode": "readonly",
+          "verdict": "PASS",
+          "durationMs": 70,
+          "count": 1
+        },
+        {
+          "scenarioId": "busy_responsiveness",
+          "resultCode": "busy",
+          "verdict": "PASS",
+          "durationMs": 530,
+          "count": 5
+        },
+        {
+          "scenarioId": "backup_wal_writer",
+          "resultCode": "ok",
+          "verdict": "PASS",
+          "durationMs": 3,
+          "byteSize": 282624,
+          "mechanism": "api",
+          "schemaVersion": 7
+        },
+        {
+          "scenarioId": "backup_reopen_consistency",
+          "resultCode": "ok",
+          "verdict": "PASS",
+          "durationMs": 1,
+          "byteSize": 282624,
+          "hash": "f9f4fd2b99af37b1",
+          "schemaVersion": 7
+        },
+        {
+          "scenarioId": "reset_cancel",
+          "resultCode": "cancel",
+          "verdict": "PASS",
+          "durationMs": 1,
+          "count": 0
+        },
+        {
+          "scenarioId": "reset_success",
+          "resultCode": "ok",
+          "verdict": "PASS",
+          "durationMs": 61,
+          "count": 5,
+          "schemaVersion": 7
+        },
+        {
+          "scenarioId": "cross_window_reset_contention",
+          "resultCode": "ok",
+          "verdict": "PASS",
+          "durationMs": 852,
+          "hash": "3ad01bc20ca4c6a9",
+          "schemaVersion": 7
+        }
+      ]
+    }
+  ],
+  "contentSafety": {
+    "absolutePathsStoredInEvidence": false,
+    "messageBodiesStoredInEvidence": false,
+    "sessionIdsStoredInEvidence": false,
+    "canaryStoredInEvidence": false
+  },
+  "generatedAt": "2026-07-18T11:46:53.097Z"
+}

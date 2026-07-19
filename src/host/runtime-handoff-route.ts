@@ -1,5 +1,5 @@
 import { MAX_TASK_MARKDOWN_EXPORT_ID_CHARS } from './task-markdown-export';
-import { sanitizeHandoffFailureMessage } from '../task/store';
+import { sanitizeHandoffFailureMessage } from '../task/sanitization';
 
 /** Cap for sanitized refusal text posted to the webview (no raw stack dumps). */
 export const MAX_RUNTIME_HANDOFF_ERROR_CHARS = 400;
@@ -367,4 +367,3 @@ export async function routeRuntimeHandoff(
     messages: [],
   };
 }
-

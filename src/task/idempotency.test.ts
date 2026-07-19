@@ -144,13 +144,13 @@ describe('stageDisposition idempotency', () => {
 
 describe('resolveChildWait idempotency', () => {
   const task = baseTask({
-    wait: { kind: 'children', taskIds: ['child-1'], registeredByTurnId: 't1' },
+    wait: { kind: 'children', taskIds: ['child-1'], registeredByTurnId: 't1', wakeOn: ['terminal', 'needs_attention'] },
   });
   const lifecycles = new Map<string, TaskLifecycleState>([['child-1', 'succeeded']]);
 
   it('does not treat an older continuation as satisfying a later wait', () => {
     const firstWait = baseTask({
-      wait: { kind: 'children', taskIds: ['child-1'], registeredByTurnId: 't1' },
+      wait: { kind: 'children', taskIds: ['child-1'], registeredByTurnId: 't1', wakeOn: ['terminal', 'needs_attention'] },
     });
     const turns: TaskTurn[] = [
       turn({ id: 't1', status: 'succeeded', sequence: 1 }),
@@ -162,7 +162,7 @@ describe('resolveChildWait idempotency', () => {
       turn({ id: 't8', status: 'succeeded', sequence: 8 }),
     ];
     const secondWait = baseTask({
-      wait: { kind: 'children', taskIds: ['child-1'], registeredByTurnId: 't8' },
+      wait: { kind: 'children', taskIds: ['child-1'], registeredByTurnId: 't8', wakeOn: ['terminal', 'needs_attention'] },
     });
 
     const result = resolveChildWait(

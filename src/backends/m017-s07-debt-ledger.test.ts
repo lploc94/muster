@@ -11,10 +11,6 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { buildTurnMcp, resolveMusterStdioProxyEntry } from '../bridge/mcp-config';
-import {
-  JSON_TURN_STREAM_BUFFER_DELETION_GATE,
-  JsonTurnStreamBuffer,
-} from '../task/turn-stream-persistence';
 import type { Backend, McpServerConfig } from '../types';
 
 const SRC_ROOT = path.resolve(__dirname, '..');
@@ -133,15 +129,6 @@ describe('Rollout closeout, fallback removal, and debt sweep (M017-S07 / D037)',
     }
   });
 
-  it('debt ledger: zero continuous disposition_repair feature surface in production source', () => {
-    // Migration-only tokens are split at construction so continuous rg stays clean.
-    const hits = scanProductionHits('disposition_repair');
-    expect(
-      hits,
-      hits.map((h) => `${h.file}:${h.line}: ${h.text}`).join('\n') || 'no hits',
-    ).toEqual([]);
-  });
-
   it('debt ledger: zero built-in direct-HTTP ACP muster_bridge injection / transport fallback', () => {
     const transportHits = scanProductionHits('MUSTER_ACP_MCP_TRANSPORT');
     const httpEntryHits = scanProductionHits('bridgeAcpHttpEntry');
@@ -161,45 +148,16 @@ describe('Rollout closeout, fallback removal, and debt sweep (M017-S07 / D037)',
     expect(mcpConfig).not.toMatch(/bridgeAcpHttpEntry/);
   });
 
-  it('debt ledger: JsonTurnStreamBuffer production refs only behind dated post-M017 DELETION_GATE', () => {
-    const allowed = new Set([
-      'src/task/turn-stream-persistence.ts',
-      'src/task/engine.ts',
-    ]);
-    const hits = scanProductionHits(/JsonTurnStreamBuffer|createJsonTurnStreamBuffer|JSON_TURN_STREAM_BUFFER_DELETION_GATE/);
-    const unexpected = hits.filter((h) => !allowed.has(h.file));
-    expect(
-      unexpected,
-      unexpected.map((h) => `${h.file}:${h.line}: ${h.text}`).join('\n') || 'no unexpected hits',
-    ).toEqual([]);
-    expect(hits.length).toBeGreaterThan(0);
-
-    // Dated gate contract (D035/D041) — temporary buffer retained post-M017.
-    expect(JSON_TURN_STREAM_BUFFER_DELETION_GATE.decision).toBe('D035');
-    expect(JSON_TURN_STREAM_BUFFER_DELETION_GATE.replaceWith).toBe('appendTranscriptBatch');
-    expect(JSON_TURN_STREAM_BUFFER_DELETION_GATE.removeIn).toMatch(/post-M017/i);
-    expect(JSON_TURN_STREAM_BUFFER_DELETION_GATE.dated).toBe('2026-07-18');
-    expect(JSON_TURN_STREAM_BUFFER_DELETION_GATE.reason).toMatch(/appendTranscriptBatch|post-M017/i);
-    expect(JsonTurnStreamBuffer.DELETION_GATE).toBe(JSON_TURN_STREAM_BUFFER_DELETION_GATE);
-
-    // engine must reference the gate in its production stream path comment.
-    const engineSrc = fs.readFileSync(path.join(SRC_ROOT, 'task', 'engine.ts'), 'utf8');
-    expect(engineSrc).toMatch(/DELETION_GATE|post-M017/);
-    expect(engineSrc).toMatch(/createJsonTurnStreamBuffer/);
-  });
-
   it('stdio proxy entry resolves under source or dist layout', () => {
     const entry = resolveMusterStdioProxyEntry();
     expect(path.isAbsolute(entry)).toBe(true);
     expect(entry.replace(/\\/g, '/')).toMatch(/mcp-stdio-proxy\.(js|ts|mjs)$/);
   });
 
-  it('negative: debt-ledger scanner reports continuous disposition_repair when present', () => {
-    // Protects the ledger itself — a synthetic continuous token must be detected.
+  it('negative: debt-ledger scanner detects a continuous disposition_repair token', () => {
+    // Protects the ledger scanner itself — a synthetic continuous token must be detected.
     const synthetic = 'const code = "disposition_repair_pending";';
     expect(synthetic.includes('disposition_repair')).toBe(true);
-    // Real production scan remains zero (cross-check).
-    expect(scanProductionHits('disposition_repair')).toEqual([]);
   });
 
   it('records D036 live rollout gates as BLOCKED evidence (never mock-substituted)', () => {

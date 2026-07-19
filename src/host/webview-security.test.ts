@@ -8,7 +8,7 @@ import {
 import { routeDeleteQueuedTurn, routeEditQueuedTurn } from './queued-turn-mutations';
 
 describe('presentation webview security', () => {
-  it('defines the canonical assembled presentation integration gate', () => {
+  it('defines the canonical assembled presentation integration gate', async () => {
     const packageJson = JSON.parse(readFileSync(resolve(process.cwd(), 'package.json'), 'utf8')) as {
       scripts?: Record<string, string>;
       activationEvents?: string[];
@@ -20,7 +20,7 @@ describe('presentation webview security', () => {
     expect(packageJson.activationEvents).toContain('onWebviewPanel:muster.presentation');
   });
 
-  it('keeps Mermaid SVG security isolated from the shared Markdown sanitizer', () => {
+  it('keeps Mermaid SVG security isolated from the shared Markdown sanitizer', async () => {
     const markdownSource = readFileSync(resolve(process.cwd(), 'webview/src/lib/markdown.ts'), 'utf8');
     const mermaidSource = readFileSync(resolve(process.cwd(), 'webview/src/lib/mermaid-renderer.ts'), 'utf8');
     const presentationSource = readFileSync(resolve(process.cwd(), 'webview/src/Presentation.svelte'), 'utf8');
@@ -41,7 +41,7 @@ describe('presentation webview security', () => {
     expect(directInsertions).toEqual(['outcome.svg']);
   });
 
-  it('builds a static bootstrap with an explicit restrictive CSP', () => {
+  it('builds a static bootstrap with an explicit restrictive CSP', async () => {
     const html = buildPresentationWebviewHtml({
       cspSource: 'vscode-webview://presentation',
       scriptUri: 'vscode-webview://presentation/assets/presentation.js',
@@ -86,7 +86,7 @@ describe('presentation webview security', () => {
 });
 
 describe('host interrupt-and-send routing contract', () => {
-  it('wires sendLiveInput as interruptAndSend (reserve-then-interrupt), not concurrent inject', () => {
+  it('wires sendLiveInput as interruptAndSend (reserve-then-interrupt), not concurrent inject', async () => {
     const extensionSource = readFileSync(resolve(process.cwd(), 'src/extension.ts'), 'utf8');
     expect(extensionSource).toContain("case 'sendLiveInput'");
     const liveCase = extensionSource.match(
@@ -94,7 +94,8 @@ describe('host interrupt-and-send routing contract', () => {
     )?.[0];
     expect(liveCase).toBeDefined();
     expect(liveCase).toContain('interruptAndSend');
-    expect(liveCase).toContain('postSnapshot');
+    // P4-W7: ordinary mutations publish via onAfterCommit patches, not postSnapshot.
+    expect(liveCase).not.toContain('postSnapshot');
     // Must not use concurrent inject path for composer direct messages.
     expect(liveCase).not.toContain('routeSendLiveInput');
     expect(liveCase).not.toContain('engine.sendLiveInput');
@@ -104,7 +105,7 @@ describe('host interrupt-and-send routing contract', () => {
 });
 
 describe('host queued-turn mutation routing contract', () => {
-  it('wires edit/delete through route helpers without continueTask fallthrough', () => {
+  it('wires edit/delete through route helpers without continueTask fallthrough', async () => {
     const extensionSource = readFileSync(resolve(process.cwd(), 'src/extension.ts'), 'utf8');
     expect(extensionSource).toContain("case 'editQueuedTurn'");
     expect(extensionSource).toContain("case 'deleteQueuedTurn'");
@@ -128,9 +129,9 @@ describe('host queued-turn mutation routing contract', () => {
     expect(deleteCase).not.toContain('cancelProcess(');
   });
 
-  it('rejects malformed edit payloads before engine mutation', () => {
+  it('rejects malformed edit payloads before engine mutation', async () => {
     const editQueuedTurn = vi.fn();
-    const outcome = routeEditQueuedTurn(
+    const outcome = await routeEditQueuedTurn(
       { type: 'editQueuedTurn', taskId: 'task-1', turnId: 'turn-q', content: '' },
       { engineReady: true, editQueuedTurn },
     );
@@ -138,12 +139,12 @@ describe('host queued-turn mutation routing contract', () => {
     expect(outcome.kind).toBe('error');
   });
 
-  it('surfaces stale delete refusal as sanitized command-error shape', () => {
+  it('surfaces stale delete refusal as sanitized command-error shape', async () => {
     const deleteQueuedTurn = vi.fn(() => ({
       ok: false as const,
       reason: 'turn is not queued\n    at TaskEngine.deleteQueuedTurn (engine.ts:1:1)',
     }));
-    const outcome = routeDeleteQueuedTurn(
+    const outcome = await routeDeleteQueuedTurn(
       { type: 'deleteQueuedTurn', taskId: 'task-1', turnId: 'turn-q' },
       { engineReady: true, deleteQueuedTurn },
     );
@@ -162,7 +163,7 @@ describe('permission settings host routing contract', () => {
   const protocolSource = readFileSync(resolve(process.cwd(), 'webview/src/lib/protocol.ts'), 'utf8');
   const appSource = readFileSync(resolve(process.cwd(), 'webview/src/App.svelte'), 'utf8');
 
-  it('wires requestPermissionSettings and updatePermissionSettings through the T01 helper with Workspace target', () => {
+  it('wires requestPermissionSettings and updatePermissionSettings through the T01 helper with Workspace target', async () => {
     expect(extensionSource).toContain("from './host/permission-settings'");
     expect(extensionSource).toContain('buildPermissionSettingsSnapshot');
     expect(extensionSource).toContain('handlePermissionSettingsUpdateAction');
@@ -196,7 +197,7 @@ describe('permission settings host routing contract', () => {
     expect(updateMethod).not.toContain('ConfigurationTarget.WorkspaceFolder');
   });
 
-  it('opens Settings requesting the permission snapshot alongside Task Types and Retention', () => {
+  it('opens Settings requesting the permission snapshot alongside Task Types and Retention', async () => {
     const openSettings = appSource.match(/function openSettings\(\)[\s\S]*?\n  \}/)?.[0];
     expect(openSettings).toBeDefined();
     expect(openSettings).toContain("type: 'requestSettings'");
@@ -212,7 +213,7 @@ describe('permission settings host routing contract', () => {
     expect(requestSettingsCase).toContain('postPermissionSettingsSnapshot');
   });
 
-  it('keeps runtime permission prompt routes distinct from configuration messages', () => {
+  it('keeps runtime permission prompt routes distinct from configuration messages', async () => {
     expect(extensionSource).toContain("case 'submitPermission'");
     expect(extensionSource).toContain("case 'cancelPermission'");
     expect(protocolSource).toContain("type: 'permissionPending'");

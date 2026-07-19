@@ -1,12 +1,17 @@
 import type { Question } from '../bridge/ask-bridge';
 import { deriveRuntimeActivity, deriveViewStatus } from '../task/derived-status';
 import { dependenciesBlockTask } from '../task/scheduler';
-import { sanitizeHandoffFailureMessage } from '../task/store';
-import type { TaskStore } from '../task/store';
+import {
+  ASSISTANT_ORDERING_FALLBACK,
+  KIND_RANK,
+  REASONING_ORDERING,
+  UNBOUND_TURN_SEQUENCE,
+  USER_ORDERING_FALLBACK,
+  compareTranscriptKeys,
+  type TranscriptSortKey,
+} from '../task/transcript-order';
 import type {
   MusterTask,
-  TaskHandoffPhase,
-  TaskHandoffState,
   TaskLifecycleState,
   TaskMessageState,
   TaskRole,
@@ -38,33 +43,6 @@ export type TurnActivity =
   | { state: 'uncertain'; turnId: string; requiresConfirmation: true }
   | null;
 
-/**
- * Sanitized, task-scoped handoff chrome for the webview.
- * Never includes digests, summary/bootstrap bodies, session ids, or credentials.
- */
-export interface HandoffProgressBinding {
-  backend: string;
-  model?: string;
-}
-
-export interface HandoffProgressFailure {
-  code: string;
-  message: string;
-  at: string;
-}
-
-export interface HandoffProgress {
-  operationId: string;
-  phase: TaskHandoffPhase;
-  source: HandoffProgressBinding;
-  target: HandoffProgressBinding;
-  createdAt: string;
-  updatedAt: string;
-  startedAt?: string;
-  finishedAt?: string;
-  failure?: HandoffProgressFailure;
-}
-
 export interface TaskSummary {
   id: string;
   parentId: string | null;
@@ -93,12 +71,6 @@ export interface TaskSummary {
   /** Optional model id selected for this task (ACP session config option value). */
   model?: string;
   continuationOf?: string;
-  /**
-   * Optional sanitized handoff progress for model-switch chrome (D018 / §19).
-   * Omitted when the task has no handoff. Never carries digests, session ids,
-   * or summary/bootstrap bodies — those stay off TaskSummary and chat.
-   */
-  handoffProgress?: HandoffProgress;
   /**
    * Aggregate direct-child orchestration chrome for coordinators (P2).
    * Omitted when there are no children.
@@ -155,11 +127,28 @@ export interface QueuedTurnProjection {
   previewText?: string;
 }
 
+/**
+ * Current-only transcript page metadata for the focused task. Sourced directly
+ * from the same repository.getTranscriptPage() result that produced the
+ * transcript, so the workspace revision is consistent with the page rows. W5
+ * will use beforeCursor/hasMoreBefore to load older pages; W4 only transports
+ * and stores the metadata.
+ */
+export interface TranscriptPageState {
+  /** Keyset cursor for the oldest row in the page; present only when hasMoreBefore. */
+  beforeCursor?: string;
+  hasMoreBefore: boolean;
+  /** Workspace revision of the page snapshot (not a separate query). */
+  workspaceRevision: number;
+}
+
 export interface TaskSnapshot {
   rootTasks: TaskSummary[];
   focusedTaskId?: string;
   subtree?: TaskSummary[];
   transcript?: TranscriptItem[];
+  /** Present iff a task is focused; current-page metadata for the transcript. */
+  transcriptPage?: TranscriptPageState;
   /**
    * Currently live (running/waiting_user) turn, or the sole queued turn when
    * nothing is live, or the latest retryable turn under needs_recovery.
@@ -179,10 +168,28 @@ export interface PendingAskOverlay {
   questions: Question[];
 }
 
+export interface TaskSnapshotReader {
+  getFile(): Readonly<TaskStoreFile>;
+}
+
 function turnsForTask(file: TaskStoreFile, taskId: string): TaskTurn[] {
   return Object.values(file.turns)
     .filter((turn) => turn.taskId === taskId)
     .sort((a, b) => a.sequence - b.sequence);
+}
+
+/**
+ * A newly-created task briefly has one queued turn before the scheduler starts it.
+ * Present that opening prompt as chat immediately; the queue panel is reserved for
+ * follow-ups waiting behind an existing turn.
+ */
+function isOpeningQueuedTurn(turn: TaskTurn, taskTurns: readonly TaskTurn[]): boolean {
+  return (
+    turn.status === 'queued' &&
+    taskTurns.length === 1 &&
+    turn.trigger === 'user' &&
+    turn.inputs.some((input) => input.kind === 'message')
+  );
 }
 
 function depLifecyclesForTask(file: TaskStoreFile, task: MusterTask): Map<string, TaskLifecycleState> {
@@ -333,25 +340,6 @@ export function projectCurrentTurnActivity(file: TaskStoreFile, taskId: string):
   return { state: 'failed_turn', turnId: latest.id, retryable: true };
 }
 
-function projectHandoffBinding(binding: {
-  backend: string;
-  model?: string;
-}): HandoffProgressBinding {
-  return binding.model
-    ? { backend: binding.backend, model: binding.model }
-    : { backend: binding.backend };
-}
-
-/**
- * v2 switches are local and instantaneous — no multi-phase progress chrome.
- * Legacy v1 phase records are stripped on store load, so this always omits.
- */
-export function projectHandoffProgress(
-  _handoff: TaskHandoffState | undefined,
-): HandoffProgress | undefined {
-  return undefined;
-}
-
 function projectChildOrchestration(
   file: TaskStoreFile,
   parentId: string,
@@ -411,9 +399,6 @@ export function projectTaskSummary(file: TaskStoreFile, taskId: string): TaskSum
   }
   const turns = turnsForTask(file, taskId);
   const deps = depLifecyclesForTask(file, task);
-  const handoffProgress = projectHandoffProgress(
-    task.handoff?.version === 1 ? task.handoff : undefined,
-  );
   const childOrchestration =
     task.role === 'coordinator' ? projectChildOrchestration(file, taskId) : undefined;
   // Only the latest settled/live turn may present a run-timeout reason. Historical
@@ -443,7 +428,6 @@ export function projectTaskSummary(file: TaskStoreFile, taskId: string): TaskSum
     backend: task.backend,
     model: task.model,
     continuationOf: task.continuationOf,
-    ...(handoffProgress ? { handoffProgress } : {}),
     ...(childOrchestration ? { childOrchestration } : {}),
   };
 }
@@ -466,10 +450,7 @@ export function buildTranscript(file: TaskStoreFile, taskId: string): Transcript
 
   interface Entry {
     item: TranscriptItem;
-    seq: number;
-    order: number;
-    createdAt: string;
-    id: string;
+    key: TranscriptSortKey;
   }
   const entries: Entry[] = [];
 
@@ -481,23 +462,24 @@ export function buildTranscript(file: TaskStoreFile, taskId: string): Transcript
       continue;
     }
     const turnId = message.role === 'assistant' ? message.turnId : (message.turnId ?? msgTurn.get(message.id));
-    // FIFO follow-ups stay in the queue panel only until their turn starts.
-    // Do not project user messages bound to still-queued turns into chat.
+    // FIFO follow-ups stay in the queue panel only until their turn starts. The
+    // opening prompt is the exception: scheduler latency should not make the first
+    // chat bubble flash in the queue panel before appearing in the transcript.
     if (message.role === 'user' && turnId) {
       const boundTurn = file.turns[turnId];
-      if (boundTurn?.status === 'queued') {
+      if (boundTurn?.status === 'queued' && !isOpeningQueuedTurn(boundTurn, turns)) {
         continue;
       }
     }
-    const seq = turnId !== undefined && seqOf.has(turnId) ? seqOf.get(turnId)! : -1;
-    // Opening user prompts use order -2 (before reasoning -1 / assistant >=0).
-    // Explicit message.order (if present) is respected for ordered segments.
-    const order =
+    const seq = turnId !== undefined && seqOf.has(turnId) ? seqOf.get(turnId)! : UNBOUND_TURN_SEQUENCE;
+    // Canonical contract (src/task/transcript-order.ts): user prompts rank ahead
+    // of reasoning ahead of the assistant/tool stream within a turn. Explicit
+    // message.order (if present) is respected for ordered segments.
+    const kindRank = KIND_RANK[message.role];
+    const ordering =
       message.role === 'assistant'
-        ? (message.order ?? 0)
-        : message.order !== undefined
-          ? message.order
-          : -2;
+        ? (message.order ?? ASSISTANT_ORDERING_FALLBACK)
+        : (message.order ?? USER_ORDERING_FALLBACK);
     entries.push({
       item: {
         id: message.id,
@@ -507,10 +489,7 @@ export function buildTranscript(file: TaskStoreFile, taskId: string): Transcript
         order: message.order,
         state: message.state,
       },
-      seq,
-      order,
-      createdAt: message.createdAt,
-      id: message.id,
+      key: { turnSequence: seq, kindRank, ordering, createdAt: message.createdAt, entityId: message.id },
     });
   }
 
@@ -518,7 +497,7 @@ export function buildTranscript(file: TaskStoreFile, taskId: string): Transcript
     if (tc.taskId !== taskId) {
       continue;
     }
-    const seq = seqOf.has(tc.turnId) ? seqOf.get(tc.turnId)! : -1;
+    const seq = seqOf.has(tc.turnId) ? seqOf.get(tc.turnId)! : UNBOUND_TURN_SEQUENCE;
     entries.push({
       item: {
         id: tc.id,
@@ -535,10 +514,7 @@ export function buildTranscript(file: TaskStoreFile, taskId: string): Transcript
           error: tc.error,
         },
       },
-      seq,
-      order: tc.order,
-      createdAt: tc.createdAt,
-      id: tc.id,
+      key: { turnSequence: seq, kindRank: KIND_RANK.tool, ordering: tc.order, createdAt: tc.createdAt, entityId: tc.id },
     });
   }
 
@@ -546,23 +522,14 @@ export function buildTranscript(file: TaskStoreFile, taskId: string): Transcript
     if (r.taskId !== taskId) {
       continue;
     }
-    const seq = seqOf.has(r.turnId) ? seqOf.get(r.turnId)! : -1;
+    const seq = seqOf.has(r.turnId) ? seqOf.get(r.turnId)! : UNBOUND_TURN_SEQUENCE;
     entries.push({
       item: { id: r.id, kind: 'reasoning', turnId: r.turnId, content: r.content },
-      seq,
-      order: -1,
-      createdAt: r.createdAt,
-      id: r.id,
+      key: { turnSequence: seq, kindRank: KIND_RANK.reasoning, ordering: REASONING_ORDERING, createdAt: r.createdAt, entityId: r.id },
     });
   }
 
-  entries.sort(
-    (a, b) =>
-      a.seq - b.seq ||
-      a.order - b.order ||
-      a.createdAt.localeCompare(b.createdAt) ||
-      a.id.localeCompare(b.id),
-  );
+  entries.sort((a, b) => compareTranscriptKeys(a.key, b.key));
   return entries.map((entry) => entry.item);
 }
 
@@ -605,8 +572,9 @@ export function previewTextForQueuedTurn(file: TaskStoreFile, turn: TaskTurn): s
 }
 
 export function projectQueuedTurns(file: TaskStoreFile, taskId: string): QueuedTurnProjection[] {
-  return turnsForTask(file, taskId)
-    .filter((turn) => turn.status === 'queued')
+  const taskTurns = turnsForTask(file, taskId);
+  return taskTurns
+    .filter((turn) => turn.status === 'queued' && !isOpeningQueuedTurn(turn, taskTurns))
     .sort(
       (a, b) =>
         a.sequence - b.sequence ||
@@ -666,9 +634,19 @@ export function activeTurnIdForTask(file: TaskStoreFile, taskId: string): string
 }
 
 export function buildSnapshot(
-  store: TaskStore,
+  store: TaskSnapshotReader,
   focusedTaskId?: string,
   activePendingAsks?: ReadonlyMap<string, PendingAskOverlay>,
+  options?: {
+    /**
+     * Bounded transcript page for the focused task, sourced from
+     * repository.getTranscriptPage(). Required together with transcriptPage
+     * whenever a task is focused (protocol v6 current-only contract). Never
+     * rebuilds transcript from a fully-hydrated observation.
+     */
+    transcript?: TranscriptItem[];
+    transcriptPage?: TranscriptPageState;
+  },
 ): TaskSnapshot {
   const file = store.getFile();
   const rootTasks = Object.values(file.tasks)
@@ -677,28 +655,38 @@ export function buildSnapshot(
     .filter((summary): summary is TaskSummary => summary !== undefined)
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.id.localeCompare(b.id));
 
+  // Focused current-only invariant: both transcript + transcriptPage must be
+  // supplied together. Missing/partial options normalize to no-focus so a
+  // stale caller cannot emit an invalid protocol v6 message.
+  const hasFocusedPage =
+    focusedTaskId !== undefined &&
+    options?.transcript !== undefined &&
+    options?.transcriptPage !== undefined;
+  const effectiveFocusId = hasFocusedPage ? focusedTaskId : undefined;
+
   const snapshot: TaskSnapshot = {
     rootTasks,
-    focusedTaskId,
+    ...(effectiveFocusId !== undefined ? { focusedTaskId: effectiveFocusId } : {}),
     storeRevision: file.revision,
   };
 
-  if (!focusedTaskId) {
+  if (!effectiveFocusId || !options?.transcript || !options?.transcriptPage) {
     return snapshot;
   }
 
   // Project the full owning-root tree so parent/sibling navigation remains
   // available while focused on a descendant (transcript stays focus-scoped).
-  const owningRootId = findOwningRoot(file, focusedTaskId) ?? focusedTaskId;
+  const owningRootId = findOwningRoot(file, effectiveFocusId) ?? effectiveFocusId;
   const subtreeIds = collectSubtreeIds(file, owningRootId);
   snapshot.subtree = subtreeIds
     .map((taskId) => projectTaskSummary(file, taskId))
     .filter((summary): summary is TaskSummary => summary !== undefined);
-  snapshot.transcript = buildTranscript(file, focusedTaskId);
-  snapshot.activeTurnId = activeTurnIdForTask(file, focusedTaskId);
-  snapshot.queuedTurns = projectQueuedTurns(file, focusedTaskId);
+  snapshot.transcript = options.transcript;
+  snapshot.transcriptPage = options.transcriptPage;
+  snapshot.activeTurnId = activeTurnIdForTask(file, effectiveFocusId);
+  snapshot.queuedTurns = projectQueuedTurns(file, effectiveFocusId);
 
-  const pending = activePendingAsks?.get(focusedTaskId);
+  const pending = activePendingAsks?.get(effectiveFocusId);
   if (pending) {
     snapshot.pendingAsk = {
       turnId: pending.turnId,

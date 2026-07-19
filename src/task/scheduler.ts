@@ -1,5 +1,4 @@
 import { evaluateDependency } from './deps';
-import { isActiveHandoffPhase } from './engine-handoff';
 import type { ResourceLimits } from './limits';
 import { evaluateTaskReadiness, readinessToPromoteReason } from './readiness';
 import { hasResourceConflict } from './resources';
@@ -177,10 +176,6 @@ export function canPromoteTurn(
   if (task.wait?.kind === 'external') {
     return { ok: false, reason: 'waiting on external blocker' };
   }
-  if (task.handoff?.version === 1 && isActiveHandoffPhase(task.handoff.phase)) {
-    return { ok: false, reason: 'runtime handoff in progress' };
-  }
-
   if (countRunningTurns(file) >= limits.maxConcurrentTurns) {
     return { ok: false, reason: 'global concurrency limit' };
   }

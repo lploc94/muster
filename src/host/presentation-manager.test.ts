@@ -19,8 +19,7 @@ class FakePanel implements PresentationPanel {
 
   async update(
     document: PresentationDocument,
-    _rootId?: string,
-    _options?: { restore?: boolean },
+    _rootId: string,
   ): Promise<boolean> {
     this.updates.push(document);
     if (this.disposeDuringUpdate) this.dispose();
@@ -89,10 +88,40 @@ function withoutHostStamps<T extends { updatedAt?: string }>(doc: T): Omit<T, 'u
   return rest;
 }
 
+function wireMemoryStore(manager: PresentationManager): Map<string, PresentationDocument> {
+  const docs = new Map<string, PresentationDocument>();
+  const rootDocs = new Map<string, PresentationDocument>();
+  const operations = new Map<string, string>();
+  const key = (rootId: string, presentationId: string) => `${rootId}:${presentationId}`;
+  manager.setDocumentStore({
+    getPresentation: async (rootId, id) => rootDocs.get(key(rootId, id)),
+    putPresentation: async (doc) => {
+      docs.set(doc.presentationId, doc);
+      rootDocs.set(key(doc.rootId, doc.presentationId), doc);
+      return true;
+    },
+    commitPresentationOperation: async ({ operationKey, fingerprint, document }) => {
+      const prior = operations.get(operationKey);
+      if (prior !== undefined) return prior === fingerprint ? 'idempotent' : 'op_conflict';
+      const existing = rootDocs.get(key(document.rootId, document.presentationId));
+      if (existing?.ownerTaskId !== undefined && existing.ownerTaskId !== document.ownerTaskId) {
+        return 'owner_mismatch';
+      }
+      if (existing && document.revision <= existing.revision) return 'stale_revision';
+      docs.set(document.presentationId, document);
+      rootDocs.set(key(document.rootId, document.presentationId), document);
+      operations.set(operationKey, fingerprint);
+      return 'committed';
+    },
+  });
+  return docs;
+}
+
 describe('PresentationManager.openWorkspaceDocument', () => {
   it('opens a new panel for a workspace markdown document', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
     const result = await manager.openWorkspaceDocument('root-1', {
       presentationId: 'md:docs-plan.md',
       ownerTaskId: 'root-1',
@@ -111,6 +140,7 @@ describe('PresentationManager.openWorkspaceDocument', () => {
   it('reveals without bumping when content is unchanged', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
     await manager.openWorkspaceDocument('root-1', {
       presentationId: 'md:docs-plan.md',
       ownerTaskId: 'root-1',
@@ -132,6 +162,7 @@ describe('PresentationManager.openWorkspaceDocument', () => {
   it('bumps revision when file content changed', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    const docs = wireMemoryStore(manager);
     await manager.openWorkspaceDocument('root-1', {
       presentationId: 'md:docs-plan.md',
       ownerTaskId: 'root-1',
@@ -147,6 +178,51 @@ describe('PresentationManager.openWorkspaceDocument', () => {
     expect(result).toEqual({ ok: true, code: 'opened' });
     expect(factory.panels[0].updates.at(-1)?.revision).toBe(2);
     expect(factory.panels[0].updates.at(-1)?.markdown).toBe('# v2');
+    expect(docs.get('md:docs-plan.md')?.markdown).toBe('# v2');
+  });
+
+  it('continues from the durable revision after a manager restart', async () => {
+    const factory = new FakeFactory();
+    const manager = new PresentationManager(factory);
+    let stored: PresentationDocument & { rootId: string } = {
+      presentationId: 'md:docs-plan.md',
+      ownerTaskId: 'root-1',
+      rootId: 'root-1',
+      revision: 7,
+      title: 'plan',
+      markdown: '# Before restart',
+      updatedAt: '2026-07-17T00:00:00.000Z',
+    };
+    manager.setDocumentStore({
+      getPresentation: async () => stored,
+      putPresentation: async (document) => {
+        stored = document;
+        return true;
+      },
+      commitPresentationOperation: async () => 'committed',
+    });
+
+    await expect(manager.openWorkspaceDocument('root-1', {
+      presentationId: 'md:docs-plan.md',
+      ownerTaskId: 'root-1',
+      title: 'plan',
+      markdown: '# After restart',
+    })).resolves.toEqual({ ok: true, code: 'opened' });
+    expect(stored.revision).toBe(8);
+    expect(factory.panels[0]?.updates[0]?.revision).toBe(8);
+  });
+
+  it('fails closed when document store is not wired', async () => {
+    const factory = new FakeFactory();
+    const manager = new PresentationManager(factory);
+    const result = await manager.openWorkspaceDocument('root-1', {
+      presentationId: 'md:docs-plan.md',
+      ownerTaskId: 'root-1',
+      title: 'plan',
+      markdown: '# From file',
+    });
+    expect(result).toEqual({ ok: false, code: 'host_delivery_failed' });
+    expect(factory.created).toHaveLength(0);
   });
 });
 
@@ -170,6 +246,7 @@ describe('PresentationManager', () => {
   it('opens a panel and posts the requested document through the panel boundary', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
 
     const result = await manager.upsert(context, request);
 
@@ -189,6 +266,7 @@ describe('PresentationManager', () => {
   it('rejects an owner mismatch before creating panel state', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
 
     const result = await manager.upsert(context, { ...request, ownerTaskId: 'other-task' });
 
@@ -199,6 +277,7 @@ describe('PresentationManager', () => {
   it('makes exact same-turn operation retries idempotent and rejects conflicting reuse', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
 
     expect(await manager.upsert(context, request)).toEqual({ ok: true, code: 'opened' });
     expect(await manager.upsert(context, { ...request })).toEqual({ ok: true, code: 'idempotent' });
@@ -213,6 +292,7 @@ describe('PresentationManager', () => {
   it('rejects malformed and oversized requests before calling the panel factory', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
 
     await expect(manager.upsert(context, { ...request, revision: 0 })).resolves.toEqual({
       ok: false,
@@ -221,6 +301,10 @@ describe('PresentationManager', () => {
     await expect(manager.upsert(context, { ...request, markdown: 'x'.repeat(100_001) })).resolves.toEqual({
       ok: false,
       code: 'payload_too_large',
+    });
+    await expect(manager.upsert(context, { ...request, markdown: '# bad\0document' })).resolves.toEqual({
+      ok: false,
+      code: 'invalid_arguments',
     });
     await expect(
       manager.upsert(context, { ...request, unexpected: true } as typeof request),
@@ -231,6 +315,7 @@ describe('PresentationManager', () => {
   it('rejects stale and equal same-ID revisions without mutating or revealing the panel', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
     await manager.upsert(context, { ...request, revision: 2 });
 
     expect(
@@ -246,6 +331,7 @@ describe('PresentationManager', () => {
   it('keeps the registered owner immutable across authenticated callers', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
     await manager.upsert(context, request);
 
     expect(
@@ -260,6 +346,7 @@ describe('PresentationManager', () => {
   it('returns a stable host delivery failure when an existing panel rejects an update', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
     await manager.upsert(context, request);
     factory.panels[0].updateResult = new Error(`delivery leaked ${request.markdown}`);
 
@@ -272,6 +359,7 @@ describe('PresentationManager', () => {
   it('posts a newer revision to the existing panel and reveals it', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
     await manager.upsert(context, request);
 
     const result = await manager.upsert(context, {
@@ -291,6 +379,7 @@ describe('PresentationManager', () => {
   it('keeps an accepted existing-panel update successful when reveal fails', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
     await manager.upsert(context, request);
     factory.panels[0].revealError = new Error(`reveal leaked ${request.markdown}`);
 
@@ -306,6 +395,7 @@ describe('PresentationManager', () => {
   it('sanitizes panel factory and initial update failures and disposes partial panels', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
     factory.createError = new Error(`factory leaked ${request.markdown}`);
 
     await expect(manager.upsert(context, request)).resolves.toEqual({
@@ -332,19 +422,21 @@ describe('PresentationManager', () => {
   it('does not acknowledge or ledger a panel disposed during its initial update', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
     factory.nextDisposeDuringUpdate = true;
 
     expect(await manager.upsert(context, request)).toEqual({
       ok: false,
       code: 'panel_open_failed',
     });
-    expect(await manager.upsert(context, request)).toEqual({ ok: true, code: 'opened' });
+    expect(await manager.upsert(context, request)).toEqual({ ok: true, code: 'idempotent' });
     expect(factory.panels).toHaveLength(2);
   });
 
   it('recreates disposed panels and ignores stale callbacks from their predecessors', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
     await manager.upsert(context, request);
     const disposedPanel = factory.panels[0];
     disposedPanel.dispose();
@@ -360,6 +452,7 @@ describe('PresentationManager', () => {
   it('keeps distinct presentation IDs under one authenticated root isolated', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
     await manager.upsert(context, request);
     await manager.upsert(context, {
       ...request,
@@ -383,19 +476,31 @@ describe('PresentationManager', () => {
     expect(factory.panels[1].disposeCount).toBe(0);
   });
 
-  it('restores an exact persisted document by binding the supplied panel', async () => {
+  it('restores via opaque IDs and SQLite document store', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    const docs = new Map<string, import('./presentation-manager').PresentationDocument>();
+    docs.set(request.presentationId, {
+      presentationId: request.presentationId,
+      ownerTaskId: request.ownerTaskId,
+      revision: request.revision,
+      title: request.title,
+      markdown: request.markdown,
+    });
+    manager.setDocumentStore({
+      getPresentation: async (_rootId, id) => docs.get(id),
+      putPresentation: async (doc) => {
+        docs.set(doc.presentationId, doc);
+        return true;
+      },
+      commitPresentationOperation: async () => 'committed',
+    });
     const panel = new FakePanel();
 
     expect(
       await manager.restore(panel, {
         rootId: context.rootId,
         presentationId: request.presentationId,
-        ownerTaskId: request.ownerTaskId,
-        revision: request.revision,
-        title: request.title,
-        markdown: request.markdown,
       }),
     ).toEqual({ ok: true, code: 'restored' });
     expect(panel.updates).toHaveLength(1);
@@ -409,32 +514,45 @@ describe('PresentationManager', () => {
     expect(factory.created).toEqual([]);
   });
 
-  it('migrates legacy child owner to root when resolver is set, rejects unresolved owners', async () => {
+  it('validates child ownership against the persisted root without rewriting identity', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    const docs = new Map<string, import('./presentation-manager').PresentationDocument>([
+      [request.presentationId, {
+        presentationId: request.presentationId,
+        ownerTaskId: 'child-1',
+        revision: 1,
+        title: request.title,
+        markdown: request.markdown,
+      }],
+      ['other-plan', {
+        presentationId: 'other-plan',
+        ownerTaskId: 'missing',
+        revision: 1,
+        title: request.title,
+        markdown: request.markdown,
+      }],
+    ]);
+    manager.setDocumentStore({
+      getPresentation: async (_rootId, id) => docs.get(id),
+      putPresentation: async () => true,
+      commitPresentationOperation: async () => 'committed',
+    });
     manager.setOwnerResolver((ownerId) => (ownerId === 'child-1' || ownerId === 'root-1' ? 'root-1' : undefined));
     const panel = new FakePanel();
     expect(
       await manager.restore(panel, {
         rootId: 'root-1',
         presentationId: request.presentationId,
-        ownerTaskId: 'child-1',
-        revision: 1,
-        title: request.title,
-        markdown: request.markdown,
       }),
     ).toEqual({ ok: true, code: 'restored' });
-    expect(panel.updates[0]?.ownerTaskId).toBe('root-1');
+    expect(panel.updates[0]?.ownerTaskId).toBe('child-1');
 
     const bad = new FakePanel();
     expect(
       await manager.restore(bad, {
         rootId: 'root-1',
         presentationId: 'other-plan',
-        ownerTaskId: 'missing',
-        revision: 1,
-        title: request.title,
-        markdown: request.markdown,
       }),
     ).toEqual({ ok: false, code: 'restore_rejected' });
   });
@@ -442,17 +560,31 @@ describe('PresentationManager', () => {
   it('rejects malformed, conflicting, and failed restores with stable content-free codes', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    const docs = new Map<string, import('./presentation-manager').PresentationDocument>([
+      [request.presentationId, {
+        presentationId: request.presentationId,
+        ownerTaskId: request.ownerTaskId,
+        revision: request.revision,
+        title: request.title,
+        markdown: request.markdown,
+      }],
+    ]);
+    manager.setDocumentStore({
+      getPresentation: async (_rootId, id) => docs.get(id),
+      putPresentation: async () => true,
+      commitPresentationOperation: async () => 'committed',
+    });
     const persisted = {
       rootId: context.rootId,
       presentationId: request.presentationId,
-      ownerTaskId: request.ownerTaskId,
-      revision: request.revision,
-      title: request.title,
-      markdown: request.markdown,
     };
 
     const malformedPanel = new FakePanel();
-    expect(await manager.restore(malformedPanel, { ...persisted, unexpected: request.markdown })).toEqual({
+    expect(await manager.restore(malformedPanel, { document: { markdown: 'x' } })).toEqual({
+      ok: false,
+      code: 'restore_rejected',
+    });
+    expect(await manager.restore(new FakePanel(), { ...persisted, extra: true })).toEqual({
       ok: false,
       code: 'restore_rejected',
     });
@@ -461,7 +593,7 @@ describe('PresentationManager', () => {
     const livePanel = new FakePanel();
     expect(await manager.restore(livePanel, persisted)).toEqual({ ok: true, code: 'restored' });
     const conflictPanel = new FakePanel();
-    expect(await manager.restore(conflictPanel, { ...persisted, revision: 2 })).toEqual({
+    expect(await manager.restore(conflictPanel, persisted)).toEqual({
       ok: false,
       code: 'restore_conflict',
     });
@@ -484,9 +616,75 @@ describe('PresentationManager', () => {
     expect(await manager.restore(new FakePanel(), persisted)).toEqual({ ok: true, code: 'restored' });
   });
 
+  it('settles queued restores on store failure and extension disposal', async () => {
+    const failedManager = new PresentationManager(new FakeFactory());
+    const failedPanel = new FakePanel();
+    const failedRestore = failedManager.restore(failedPanel, {
+      rootId: context.rootId,
+      presentationId: request.presentationId,
+    });
+    failedManager.setDocumentStore({
+      getPresentation: async () => {
+        throw new Error(`sqlite leaked ${request.markdown}`);
+      },
+      putPresentation: async () => true,
+      commitPresentationOperation: async () => 'committed',
+    });
+    await expect(failedRestore).resolves.toEqual({ ok: false, code: 'restore_rejected' });
+
+    const disposedManager = new PresentationManager(new FakeFactory());
+    const disposedPanel = new FakePanel();
+    const disposedRestore = disposedManager.restore(disposedPanel, {
+      rootId: context.rootId,
+      presentationId: request.presentationId,
+    });
+    disposedManager.dispose();
+    await expect(disposedRestore).resolves.toEqual({ ok: false, code: 'restore_rejected' });
+    expect(disposedPanel.disposeCount).toBe(1);
+    await expect(disposedManager.restore(new FakePanel(), {
+      rootId: context.rootId,
+      presentationId: request.presentationId,
+    })).resolves.toEqual({ ok: false, code: 'restore_rejected' });
+  });
+
+  it('cancels a queued restore already waiting inside SQLite when disposed', async () => {
+    const manager = new PresentationManager(new FakeFactory());
+    const panel = new FakePanel();
+    let release!: (document: import('./presentation-manager').PresentationDocument) => void;
+    const durableRead = new Promise<import('./presentation-manager').PresentationDocument>((resolve) => {
+      release = resolve;
+    });
+    const restoring = manager.restore(panel, {
+      rootId: context.rootId,
+      presentationId: request.presentationId,
+    });
+    manager.setDocumentStore({
+      getPresentation: async () => durableRead,
+      putPresentation: async () => true,
+      commitPresentationOperation: async () => 'committed',
+    });
+
+    manager.dispose();
+    await expect(restoring).resolves.toEqual({ ok: false, code: 'restore_rejected' });
+    expect(panel.disposeCount).toBe(1);
+
+    release({
+      presentationId: request.presentationId,
+      ownerTaskId: request.ownerTaskId,
+      revision: 1,
+      title: request.title,
+      markdown: request.markdown,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(panel.updates).toEqual([]);
+    expect(panel.disposeCount).toBe(1);
+  });
+
   it('isolates identical presentation IDs by authenticated root and disposes all live panels', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
+    wireMemoryStore(manager);
     await manager.upsert(context, request);
     await manager.upsert(
       { ...context, rootId: 'root-2', turnId: 'turn-2' },

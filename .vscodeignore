@@ -1,16 +1,27 @@
 # Source & dev (compiled output is in dist/)
 src/**
 scripts/**
+dist/scripts/**
 mcp/**
 study/**
+webview/**
+e2e/**
 
 # Docs (not needed in VSIX; keep in git repo)
 docs/**
 
 # Tooling
-node_modules/**
 .git/**
 .github/**
+.gitignore
+.claude/**
+.codex-review/**
+.vscode/**
+.vscode-test/**
+test-results/**
+playwright-report/**
+playwright.config.ts
+vitest.config.ts
 *.vsix
 tsconfig.json
 

@@ -170,6 +170,23 @@ describe('buildTaskComposerMessage', () => {
     );
   });
 
+  it('carries mention bindings on durable task sends', () => {
+    expect(
+      buildTaskComposerMessage(
+        { kind: 'send' },
+        {
+          taskId: 'task-1',
+          text: '@plan',
+          llmText: '/workspace/docs/plan.md',
+          mentionBindings: [['@plan', '/workspace/docs/plan.md']],
+        },
+      ),
+    ).toEqual(expect.objectContaining({
+      type: 'send',
+      mentionBindings: [['@plan', '/workspace/docs/plan.md']],
+    }));
+  });
+
   it('refuses empty / whitespace-only payloads for both intents', () => {
     expect(buildTaskComposerMessage({ kind: 'send' }, { taskId: 'task-1', text: '   ' })).toBeNull();
     expect(buildTaskComposerMessage({ kind: 'sendLiveInput' }, { taskId: 'task-1', text: '' })).toBeNull();

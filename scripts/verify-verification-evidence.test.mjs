@@ -43,7 +43,7 @@ const requiredFileReferences = [
   'src/extension.ts',
   'src/backends/claude.ts',
   'src/runner.ts',
-  'src/task/store.ts',
+  'src/task/repository.ts',
   'src/types.ts',
   'mcp/muster-ask-server.mjs',
 ];

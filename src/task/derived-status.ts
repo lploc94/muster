@@ -132,7 +132,7 @@ export function deriveRuntimeActivity(
 }
 
 /**
- * Compact single-axis status (backward compatible).
+ * Compact single-axis status used by current list indexes.
  * Prefer `task.lifecycle` + `deriveRuntimeActivity` for UI.
  */
 export function deriveViewStatus(

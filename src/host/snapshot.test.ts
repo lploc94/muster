@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   activeTurnIdForTask,
   buildSnapshot,
+  buildTranscript,
   collectAncestorIds,
   collectSubtreeIds,
   findOwningRoot,
@@ -10,9 +11,26 @@ import {
   projectQueuedTurns,
   projectTaskSummary,
   type PendingAskOverlay,
+  type TranscriptItem,
+  type TranscriptPageState,
 } from './snapshot';
-import type { TaskStore } from '../task/store';
+import type { TaskReadPort } from '../task/store-port';
 import type { MusterTask, TaskMessage, TaskStoreFile, TaskTurn } from '../task/types';
+
+/** Focused v6 page fixture — production supplies this from getTranscriptPage. */
+function pageOpts(
+  transcript: TranscriptItem[],
+  page: Partial<TranscriptPageState> = {},
+): { transcript: TranscriptItem[]; transcriptPage: TranscriptPageState } {
+  return {
+    transcript,
+    transcriptPage: {
+      hasMoreBefore: false,
+      workspaceRevision: 0,
+      ...page,
+    },
+  };
+}
 
 const POLICY = {
   maxTurns: 10,
@@ -56,10 +74,10 @@ function message(overrides: Partial<TaskMessage> & Pick<TaskMessage, 'id' | 'tas
   };
 }
 
-function storeFrom(file: TaskStoreFile): TaskStore {
+function storeFrom(file: TaskStoreFile): TaskReadPort {
   return {
     getFile: () => file,
-  } as TaskStore;
+  } as TaskReadPort;
 }
 
 describe('host task snapshot projection', () => {
@@ -207,10 +225,17 @@ describe('host task snapshot projection', () => {
       taskId: 'root-active',
       turnId: 'root-active-running',
       askId: 'ask-1',
-      questions: [{ name: 'direction', question: 'Continue?', type: 'text' }],
+      questions: [{ prompt: 'Continue?' }],
     };
+    // W4: focused transcript is a bounded page option, not rebuilt from messages.
+    const focusedTranscript = buildTranscript(file, 'root-active');
 
-    const snapshot = buildSnapshot(storeFrom(file), 'root-active', new Map([['root-active', pendingAsk]]));
+    const snapshot = buildSnapshot(
+      storeFrom(file),
+      'root-active',
+      new Map([['root-active', pendingAsk]]),
+      pageOpts(focusedTranscript, { workspaceRevision: 7 }),
+    );
 
     expect(snapshot.storeRevision).toBe(7);
     expect(snapshot.rootTasks.map((summary) => summary.id)).toEqual(['root-active', 'root-old']);
@@ -230,24 +255,11 @@ describe('host task snapshot projection', () => {
       ['grandchild', 'open', 'idle', 'idle'],
       ['child-b', 'open', 'idle', 'idle'],
     ]);
-    expect(snapshot.transcript).toEqual([
-      {
-        id: 'user',
-        kind: 'user',
-        content: 'user request',
-        turnId: undefined,
-        order: undefined,
-        state: 'complete',
-      },
-      {
-        id: 'assistant',
-        kind: 'assistant',
-        content: 'assistant answer',
-        turnId: undefined,
-        order: undefined,
-        state: 'complete',
-      },
-    ]);
+    expect(snapshot.transcript).toEqual(focusedTranscript);
+    expect(snapshot.transcriptPage).toEqual({
+      hasMoreBefore: false,
+      workspaceRevision: 7,
+    });
     // Live turn wins over higher-sequence queued follow-ups (R012 multi-queue).
     expect(snapshot.activeTurnId).toBe('root-active-running');
     expect(snapshot.queuedTurns).toEqual([
@@ -262,7 +274,7 @@ describe('host task snapshot projection', () => {
     expect(snapshot.pendingAsk).toEqual({
       turnId: 'root-active-running',
       askId: 'ask-1',
-      questions: [{ name: 'direction', question: 'Continue?', type: 'text' }],
+      questions: [{ prompt: 'Continue?' }],
     });
   });
 
@@ -349,7 +361,12 @@ describe('host task snapshot projection', () => {
       },
     ]);
 
-    const snapshot = buildSnapshot(storeFrom(file), 'multi');
+    const snapshot = buildSnapshot(
+      storeFrom(file),
+      'multi',
+      undefined,
+      pageOpts(buildTranscript(file, 'multi'), { workspaceRevision: 3 }),
+    );
     expect(snapshot.activeTurnId).toBe('turn-live');
     expect(snapshot.queuedTurns).toEqual([
       {
@@ -429,7 +446,9 @@ describe('host task snapshot projection', () => {
         previewText: 'queued follow-up',
       },
     ]);
-    expect(buildSnapshot(storeFrom(file), 'ask').activeTurnId).toBe('live');
+    expect(
+      buildSnapshot(storeFrom(file), 'ask', undefined, pageOpts([])).activeTurnId,
+    ).toBe('live');
   });
 
   it('returns empty queuedTurns when only a live turn exists', () => {
@@ -445,7 +464,9 @@ describe('host task snapshot projection', () => {
       cancelRequests: {},
     };
     expect(projectQueuedTurns(file, 'only')).toEqual([]);
-    expect(buildSnapshot(storeFrom(file), 'only').queuedTurns).toEqual([]);
+    expect(
+      buildSnapshot(storeFrom(file), 'only', undefined, pageOpts([])).queuedTurns,
+    ).toEqual([]);
   });
 
   it('selects the latest retryable turn only for recovery state', () => {
@@ -734,7 +755,10 @@ describe('host task snapshot projection', () => {
       cancelRequests: {},
     };
     const store = storeFrom(file);
-    const snapshot = buildSnapshot(store, 't');
+    // Bounded page carries only chat-visible items (live prompt); queue panel
+    // is projected separately from observation messages.
+    const chatTranscript = buildTranscript(file, 't');
+    const snapshot = buildSnapshot(store, 't', undefined, pageOpts(chatTranscript));
     const userContents = (snapshot.transcript ?? [])
       .filter((item) => item.kind === 'user')
       .map((item) => item.content);
@@ -752,119 +776,49 @@ describe('host task snapshot projection', () => {
     ]);
   });
 
-  it('does not project TaskHandoff state into the webview transcript', () => {
-    const handoffCanaries = {
-      operationId: 'hop-secret-op',
-      contentDigest: 'handoff-digest-SECRET',
-      summaryReason: 'SOURCE_SUMMARY_BODY_MUST_NOT_APPEAR',
-      boundSessionId: 'handoff-bound-session-SECRET',
-      sourceSessionId: 'src-sess-SECRET',
-    };
+  it('shows the opening queued prompt in chat immediately without a queue-panel flash', () => {
     const file: TaskStoreFile = {
       schemaVersion: 2,
-      revision: 4,
+      revision: 1,
       tasks: {
-        handoff: task('handoff', {
-          role: 'coordinator',
-          goal: 'Cross-runtime handoff task',
-          handoff: {
-            version: 1,
-            operationId: handoffCanaries.operationId,
-            phase: 'completed',
-            source: {
-              backend: 'claude-cli',
-              model: 'sonnet',
-              sessionId: handoffCanaries.sourceSessionId,
-            },
-            target: { backend: 'codex', model: 'gpt-5' },
-            conversationContext: {
-              status: 'ready',
-              messageCount: 2,
-              contentDigest: handoffCanaries.contentDigest,
-              exportedAt: '2026-07-06T00:10:00.000Z',
-            },
-            sourceSummary: {
-              status: 'skipped',
-              reason: handoffCanaries.summaryReason,
-            },
-            createdAt: '2026-07-06T00:00:00.000Z',
-            updatedAt: '2026-07-06T00:11:00.000Z',
-            startedAt: '2026-07-06T00:00:01.000Z',
-            finishedAt: '2026-07-06T00:11:00.000Z',
-            completion: {
-              completedAt: '2026-07-06T00:11:00.000Z',
-              boundBackend: 'codex',
-              boundSessionId: handoffCanaries.boundSessionId,
-            },
-          },
-        }),
+        t: task('t', { role: 'coordinator', goal: 'Fresh chat' }),
       },
       turns: {
-        t1: turn({
-          id: 't1',
-          taskId: 'handoff',
-          status: 'succeeded',
+        opening: turn({
+          id: 'opening',
+          taskId: 't',
           sequence: 1,
-          inputs: [{ kind: 'message', messageId: 'u1' }],
-          finishedAt: '2026-07-06T00:05:00.000Z',
+          status: 'queued',
+          inputs: [{ kind: 'message', messageId: 'msg-opening' }],
         }),
       },
       messages: {
-        u1: message({
-          id: 'u1',
-          taskId: 'handoff',
+        'msg-opening': message({
+          id: 'msg-opening',
+          taskId: 't',
           role: 'user',
-          content: 'visible chat only',
-          createdAt: '2026-07-06T00:04:00.000Z',
-          turnId: 't1',
-        }),
-        a1: message({
-          id: 'a1',
-          taskId: 'handoff',
-          role: 'assistant',
-          content: 'visible assistant reply',
-          createdAt: '2026-07-06T00:04:30.000Z',
-          turnId: 't1',
-          order: 0,
+          content: 'Start immediately',
+          state: 'pending',
         }),
       },
       operations: {},
       cancelRequests: {},
     };
 
-    const snapshot = buildSnapshot(storeFrom(file), 'handoff');
+    // Opening prompt is chat-visible (buildTranscript keeps sole queued user turn).
+    const openingTranscript = buildTranscript(file, 't');
+    const snapshot = buildSnapshot(storeFrom(file), 't', undefined, pageOpts(openingTranscript));
     expect(snapshot.transcript).toEqual([
       {
-        id: 'u1',
+        id: 'msg-opening',
         kind: 'user',
-        content: 'visible chat only',
-        turnId: 't1',
+        content: 'Start immediately',
+        turnId: 'opening',
         order: undefined,
-        state: 'complete',
-      },
-      {
-        id: 'a1',
-        kind: 'assistant',
-        content: 'visible assistant reply',
-        turnId: 't1',
-        order: 0,
-        state: 'complete',
+        state: 'pending',
       },
     ]);
-
-    const transcriptJson = JSON.stringify(snapshot.transcript);
-    for (const needle of Object.values(handoffCanaries)) {
-      expect(transcriptJson, `transcript must not contain ${needle}`).not.toContain(needle);
-    }
-    // Task summaries also must not surface handoff digests/session ids as chat.
-    const summaryJson = JSON.stringify({
-      roots: snapshot.rootTasks,
-      subtree: snapshot.subtree,
-    });
-    expect(summaryJson).not.toContain(handoffCanaries.contentDigest);
-    expect(summaryJson).not.toContain(handoffCanaries.summaryReason);
-    expect(summaryJson).not.toContain(handoffCanaries.boundSessionId);
-    expect(summaryJson).not.toContain(handoffCanaries.sourceSessionId);
+    expect(snapshot.queuedTurns).toEqual([]);
   });
 
   it('omits multi-phase handoffProgress (v2 switch has no progress chrome)', () => {
@@ -930,10 +884,11 @@ describe('host task snapshot projection', () => {
     expect(summary).not.toHaveProperty('handoff');
     expect(projectTaskSummary(file, 'idle')).not.toHaveProperty('handoffProgress');
 
-    const snapshot = buildSnapshot(storeFrom(file), 'hop');
+    const snapshot = buildSnapshot(storeFrom(file), 'hop', undefined, pageOpts([]));
     const hopRoot = snapshot.rootTasks.find((t) => t.id === 'hop');
     const hopSubtree = snapshot.subtree?.find((t) => t.id === 'hop');
     expect(hopRoot).not.toHaveProperty('handoffProgress');
+    expect(hopSubtree).toBeDefined();
     expect(hopSubtree).not.toHaveProperty('handoffProgress');
 
     const projectedJson = JSON.stringify({
@@ -951,59 +906,6 @@ describe('host task snapshot projection', () => {
     expect(projectedJson).not.toContain('sessionId');
     expect(projectedJson).not.toContain('boundSessionId');
     expect(projectedJson).not.toContain('preparing_receiver');
-  });
-
-  it('does not project legacy failed handoff phase chrome or secrets', () => {
-    const rawFailure =
-      'Receiver init failed at C:\\Users\\secret\\repo\\handoff with sk-live-SECRETTOKEN12345 dump';
-    const file: TaskStoreFile = {
-      schemaVersion: 2,
-      revision: 6,
-      tasks: {
-        fail: task('fail', {
-          handoff: {
-            version: 1,
-            operationId: 'hop-fail-1',
-            phase: 'failed',
-            source: { backend: 'claude-cli', model: 'sonnet', sessionId: 'src-sess-SECRET' },
-            target: { backend: 'codex', model: 'gpt-5' },
-            conversationContext: {
-              status: 'ready',
-              messageCount: 1,
-              contentDigest: 'handoff-digest-SECRET',
-              exportedAt: '2026-07-06T00:01:00.000Z',
-            },
-            sourceSummary: {
-              status: 'skipped',
-              reason: 'SOURCE_SUMMARY_BODY_MUST_NOT_APPEAR',
-            },
-            createdAt: '2026-07-06T00:00:00.000Z',
-            updatedAt: '2026-07-06T00:02:00.000Z',
-            startedAt: '2026-07-06T00:00:01.000Z',
-            finishedAt: '2026-07-06T00:02:00.000Z',
-            failure: {
-              code: 'receiver_init_failed',
-              message: rawFailure,
-              at: '2026-07-06T00:02:00.000Z',
-            },
-          },
-        }),
-      },
-      turns: {},
-      messages: {},
-      operations: {},
-      cancelRequests: {},
-    };
-
-    const summary = projectTaskSummary(file, 'fail');
-    expect(summary).not.toHaveProperty('handoffProgress');
-    const progressJson = JSON.stringify(summary);
-    expect(progressJson).not.toContain('src-sess-SECRET');
-    expect(progressJson).not.toContain('handoff-digest-SECRET');
-    expect(progressJson).not.toContain('SOURCE_SUMMARY_BODY_MUST_NOT_APPEAR');
-    expect(progressJson).not.toContain('sk-live-SECRETTOKEN12345');
-    expect(progressJson).not.toContain('contentDigest');
-    expect(progressJson).not.toContain('sessionId');
   });
 
   it('P2: coordinator TaskSummary includes childOrchestration aggregate', () => {
@@ -1091,10 +993,30 @@ describe('host task snapshot projection', () => {
     expect(collectAncestorIds(file, 'nested')).toEqual(['a', 'root']);
     expect(collectSubtreeIds(file, 'root')).toEqual(['root', 'a', 'nested', 'b']);
 
-    const snapshot = buildSnapshot(storeFrom(file), 'nested');
+    const nestedTranscript = buildTranscript(file, 'nested');
+    const snapshot = buildSnapshot(
+      storeFrom(file),
+      'nested',
+      undefined,
+      pageOpts(nestedTranscript),
+    );
     expect(snapshot.focusedTaskId).toBe('nested');
     expect(snapshot.subtree?.map((s) => s.id)).toEqual(['root', 'a', 'nested', 'b']);
     expect(snapshot.transcript?.map((item) => item.id)).toEqual(['nestedUser']);
+  });
+
+  it('normalizes focused snapshot without page options to no-focus (v6 invariant)', () => {
+    const file: TaskStoreFile = {
+      schemaVersion: 6,
+      revision: 1,
+      tasks: { t: task('t') },
+      turns: {},
+      messages: {},
+    };
+    const snapshot = buildSnapshot(storeFrom(file), 't');
+    expect(snapshot.focusedTaskId).toBeUndefined();
+    expect(snapshot.transcript).toBeUndefined();
+    expect(snapshot.transcriptPage).toBeUndefined();
   });
 
   it('detects owning-root membership changes for sibling create', () => {

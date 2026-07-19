@@ -3,6 +3,7 @@ import { isHardTerminalLifecycle, post } from './protocol';
 import { sortQueuedTurns } from './queued-turns';
 import { parseBackendId, parseModelFromSelectValue } from './backend-resolve';
 import { vscode } from './vscode';
+import type { WorkspacePatchViewState } from './workspace-patch-reducer';
 
 export interface CommandErrorState {
   taskId: string | null;
@@ -30,13 +31,16 @@ class TasksState {
   subtree = $state<TaskSummary[]>([]);
   storeRevision = $state(0);
 
-  /** Per-task watermark for stale taskUpdated guard (ISSUE-13). */
-  private revisionWatermarks = $state<Map<string, number>>(new Map());
+  /**
+   * Protocol v8 revision gap/invariant recovery. While true, live patches are
+   * ignored until the next authoritative snapshot hydrate.
+   */
+  needsRecovery = $state(false);
 
   /** Unpersisted composer — first send has no taskId. */
   draftMode = $state(false);
 
-  /** Optional link when creating a draft after another task (legacy protocol field). */
+  /** Optional link when creating a draft after another task. */
   continuationOf = $state<string | null>(null);
 
   /**
@@ -111,22 +115,8 @@ class TasksState {
   private prefillNonceSeq = 0;
 
   constructor() {
-    // Restore the last-used backend/model from webview state (persists across reloads).
-    // Host globalState may overwrite this shortly via applyHostComposerSelection.
-    try {
-      const saved = vscode.getState() as { selectedBackend?: unknown; selectedModel?: unknown } | undefined;
-      const be = saved?.selectedBackend;
-      if (be === 'claude' || be === 'grok' || be === 'kiro' || be === 'codex' || be === 'opencode') {
-        this.preferredBackend = be;
-        this.selectedBackend = be;
-      }
-      if (typeof saved?.selectedModel === 'string') {
-        this.preferredModel = saved.selectedModel;
-        this.selectedModel = saved.selectedModel;
-      }
-    } catch {
-      // best-effort — fall back to defaults
-    }
+    // Selection is durable only via host VS Code Settings (composerSelection).
+    // Webview setState must not persist backend/model.
   }
 
   get rootTasks(): TaskSummary[] {
@@ -200,7 +190,6 @@ class TasksState {
     this.preferredBackend = backend;
     this.preferredModel = typeof model === 'string' && model.length > 0 ? model : null;
     this.syncDisplaySelection();
-    this.persistLocalSelection();
   }
 
   /**
@@ -227,26 +216,12 @@ class TasksState {
   }
 
   private persistSelection(): void {
-    this.persistLocalSelection();
-    // Durable copy on the host — webview setState alone is lost on full restart.
+    // Durable Settings only — never webview setState for backend/model.
     try {
       vscode.postMessage({
         type: 'setComposerSelection',
         backend: this.preferredBackend,
         model: this.preferredModel,
-      });
-    } catch {
-      // best-effort
-    }
-  }
-
-  private persistLocalSelection(): void {
-    try {
-      const prev = (vscode.getState() as Record<string, unknown> | undefined) ?? {};
-      vscode.setState({
-        ...prev,
-        selectedBackend: this.preferredBackend,
-        selectedModel: this.preferredModel,
       });
     } catch {
       // best-effort
@@ -296,16 +271,15 @@ class TasksState {
 
   applySnapshot(snapshot: SnapshotMessage): void {
     this.storeRevision = snapshot.storeRevision;
+    this.needsRecovery = false;
 
     const next = new Map<string, TaskSummary>();
     for (const task of snapshot.rootTasks) {
       next.set(task.id, task);
-      this.seedWatermark(task.id, snapshot.storeRevision);
     }
     if (snapshot.subtree) {
       for (const task of snapshot.subtree) {
         next.set(task.id, task);
-        this.seedWatermark(task.id, snapshot.storeRevision);
       }
     }
     this.tasks = next;
@@ -324,44 +298,42 @@ class TasksState {
       this.continuationOf = null;
       this.queuedTurns = sortQueuedTurns(snapshot.queuedTurns ?? []);
       this.reconcilePendingHandoffTarget(snapshot.focusedTaskId);
-    } else if (!this.draftMode) {
+    } else {
+      // Authoritative unfocused snapshot clears chat focus unless the user is
+      // intentionally composing a new draft task.
+      if (!this.draftMode) {
+        this.focusedTaskId = null;
+        this.pendingFocusTaskId = null;
+        this.queuedTurns = [];
+      } else {
+        this.queuedTurns = [];
+      }
+    }
+  }
+
+  /**
+   * Sync task chrome from a pure workspace-patch reducer result (protocol v9).
+   * Does not touch draftMode/pending focus beyond focusedTaskId when removed.
+   */
+  applyPatchView(state: WorkspacePatchViewState): void {
+    this.storeRevision = state.revision;
+    this.needsRecovery = state.needsRecovery;
+    this.tasks = new Map(state.tasks);
+    this.subtree = [...state.subtree];
+    if (state.focusedTaskId) {
+      this.focusedTaskId = state.focusedTaskId;
+      this.queuedTurns = sortQueuedTurns(state.queuedTurns);
+      this.reconcilePendingHandoffTarget(state.focusedTaskId);
+    } else {
+      if (this.focusedTaskId && !state.tasks.has(this.focusedTaskId)) {
+        this.focusedTaskId = null;
+      }
       this.queuedTurns = [];
     }
   }
 
-  applyTaskUpdated(taskId: string, storeRevision: number, patch: Partial<TaskSummary>): void {
-    const watermark = this.revisionWatermarks.get(taskId) ?? 0;
-    if (storeRevision <= watermark) return;
-
-    const existing = this.tasks.get(taskId);
-    const merged: TaskSummary = {
-      ...(existing ?? {
-        id: taskId,
-        parentId: null,
-        goal: '',
-        role: 'coordinator',
-        lifecycle: 'open',
-        runtimeActivity: 'idle',
-        viewStatus: 'idle',
-        currentTurnActivity: null,
-        updatedAt: new Date(0).toISOString(),
-        backend: '',
-      }),
-      ...patch,
-      id: taskId,
-    };
-    // Reassign Map so $state consumers (root list / focusedTask) refresh.
-    const nextTasks = new Map(this.tasks);
-    nextTasks.set(taskId, merged);
-    this.tasks = nextTasks;
-    this.revisionWatermarks.set(taskId, storeRevision);
-    this.storeRevision = Math.max(this.storeRevision, storeRevision);
-
-    // Update existing subtree members only (including root) — never invent membership.
-    if (this.subtree.some((t) => t.id === taskId)) {
-      this.subtree = this.subtree.map((t) => (t.id === taskId ? merged : t));
-    }
-    this.reconcilePendingHandoffTarget(taskId);
+  markNeedsRecovery(): void {
+    this.needsRecovery = true;
   }
 
   setCommandError(message: string | null, taskId: string | null = null): void {
@@ -385,10 +357,6 @@ class TasksState {
     if (task.backend === pending.backend && taskModel === pendingModel) {
       this.pendingHandoffTarget = null;
       return;
-    }
-    // Terminal failed handoff: stop optimistic target.
-    if (task.handoffProgress?.phase === 'failed' || task.handoffProgress?.phase === 'cancelled') {
-      this.pendingHandoffTarget = null;
     }
   }
 
@@ -428,9 +396,8 @@ class TasksState {
 
   /**
    * Request a host-orchestrated runtime handoff (model/backend switch) on an
-   * existing task. Progress arrives via TaskSummary.handoffProgress on
-   * snapshot/taskUpdated — never as chat. Refusals use setCommandError via
-   * commandError inbound messages.
+   * existing task. The host returns the durable binding through snapshot/workspacePatchBatch;
+   * refusals use setCommandError via commandError inbound messages.
    */
   requestRuntimeHandoff(
     taskId: string,
@@ -468,10 +435,6 @@ class TasksState {
     this.pendingHandoffTarget = null;
   }
 
-  private seedWatermark(taskId: string, revision: number): void {
-    const prev = this.revisionWatermarks.get(taskId) ?? 0;
-    if (revision > prev) this.revisionWatermarks.set(taskId, revision);
-  }
 }
 
 export const tasks = new TasksState();

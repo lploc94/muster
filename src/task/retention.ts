@@ -1,4 +1,4 @@
-import { isTerminalLifecycle } from './transitions';
+import { isTerminalLifecycle, isTerminalTurn } from './transitions';
 import type { TaskStoreFile, TaskTurn } from './types';
 
 export const TRUNCATION_MARKER = '\n\n[output truncated by retention policy]';
@@ -121,11 +121,18 @@ function pruneTerminalTaskTurns(file: TaskStoreFile, taskId: string, maxTurnsPer
 }
 
 function truncateOpenTaskOutput(file: TaskStoreFile, taskId: string, maxStoredOutputChars: number): void {
+  const settledTurnIds = new Set(
+    turnsForTask(file, taskId)
+      .filter((turn) => isTerminalTurn(turn.status))
+      .map((turn) => turn.id),
+  );
   for (const message of Object.values(file.messages)) {
     if (
       message.taskId === taskId &&
       message.role === 'assistant' &&
       message.state === 'complete' &&
+      message.turnId !== undefined &&
+      settledTurnIds.has(message.turnId) &&
       message.content.length > maxStoredOutputChars
     ) {
       file.messages[message.id] = {
@@ -140,6 +147,7 @@ function truncateOpenTaskOutput(file: TaskStoreFile, taskId: string, maxStoredOu
       const tc = file.toolCalls[key];
       if (
         tc.taskId === taskId &&
+        settledTurnIds.has(tc.turnId) &&
         typeof tc.output === 'string' &&
         tc.output.length > maxStoredOutputChars
       ) {
@@ -153,7 +161,7 @@ function truncateOpenTaskOutput(file: TaskStoreFile, taskId: string, maxStoredOu
   if (file.reasoning) {
     for (const key of Object.keys(file.reasoning)) {
       const r = file.reasoning[key];
-      if (r.taskId === taskId && r.content.length > maxStoredOutputChars) {
+      if (r.taskId === taskId && settledTurnIds.has(r.turnId) && r.content.length > maxStoredOutputChars) {
         file.reasoning[key] = {
           ...r,
           content: truncateAssistantOutput(r.content, maxStoredOutputChars),

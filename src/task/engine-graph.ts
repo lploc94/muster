@@ -46,7 +46,8 @@ export const CREDENTIAL_DEADLINE_BUFFER_MS = 5 * 60_000;
 export const ACP_DEADLINE_BUFFER_MS = 90_000;
 import { evaluateTaskReadiness } from './readiness';
 import { canPromoteTurn } from './scheduler';
-import type { TaskStore } from './store';
+import type { GraphCommandKind, RepositoryCommand, TaskRepository } from './repository';
+import type { TaskReadPort } from './store-port';
 import {
   createTask,
   cancelPendingTurn,
@@ -258,7 +259,10 @@ const DEFAULT_COORDINATOR_CHILD_CAPS: TaskCapability[] = [
   'interrupt_child',
 ];
 export interface GraphEngineDeps {
-  store: TaskStore;
+  store: TaskReadPort;
+  /** Writable domain boundary; graph mutations never call store.commit(). */
+  repository: TaskRepository;
+  workspaceId: string;
   makeBackend: (name: string) => Backend;
   credentials: CredentialRegistry;
   askBridge: AskBridge;
@@ -282,6 +286,13 @@ export interface GraphEngineDeps {
   clock?: () => string;
   /** Active in-process runs keyed by turnId. Handles expose abort controllers. */
   liveRuns: Map<string, { controller: AbortController }>;
+  /**
+   * Durable stream barrier supplied by TaskEngine. Graph transitions that
+   * mutate a locally-live turn must cross it before their own transaction.
+   */
+  flushPendingTranscript?: (
+    turnId: string,
+  ) => Promise<{ ok: true } | { ok: false; message: string }>;
   pendingAskPromises: Map<string, { promise: Promise<Answers>; fingerprint: string }>;
   onScheduleTurn: (turnId: string) => void;
   /** W5: rescan queued released turns after lifecycle/resource changes. */
@@ -298,6 +309,8 @@ export interface GraphEngineDeps {
   getTaskTypeRegistry?: (cwd?: string) => TaskTypeRegistryResult;
   leaseOwnerAlive: (turnId: string) => boolean;
   ownsLease: (turnId: string) => boolean;
+  /** Stable owner id used by the cancel consumer's claim fence. */
+  runtimeOwnerId?: string;
   writeCancelRequest: (
     turnId: string,
     kind: 'interrupt' | 'cancel',
@@ -336,6 +349,155 @@ function writeLedger(
   draft.operations![opLedgerKey(turnId, opId)] = { fingerprint, result };
 }
 
+type GraphApplyResult =
+  | { ok: true; [key: string]: unknown }
+  | { ok: false; reason: string };
+
+function equalGraphValue(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/**
+ * Run a graph transition against an isolated projection and publish only the
+ * rows that changed through the named repository command.  This keeps the
+ * existing transition helpers synchronous/pure while making the durable write
+ * atomic for both JSON compatibility and SQLite production adapters.
+ */
+async function executeGraphCommand(
+  deps: GraphEngineDeps,
+  kind: GraphCommandKind,
+  mutate: (draft: TaskStoreFile) => GraphApplyResult,
+  fences: {
+    expectedTasks?: readonly { id: string; revision: number }[];
+    expectedTurns?: readonly { id: string; status: import('./types').TurnStatus; runtimeEpoch?: number }[];
+    expectedRuntimeClaims?: readonly { turnId: string; ownerId: string }[];
+    expectedCancelRequests?: readonly { turnId: string; kind: import('./types').CancelRequest['kind']; opId: string }[];
+    deleteSessionClaimTurnIds?: readonly string[];
+    deleteResourceClaimTurnIds?: readonly string[];
+    /**
+     * Task ids whose FULL turn history must be present in the draft for correct
+     * turn-cap counting / sequence numbering. The bounded runtime projection
+     * only retains the latest terminal turn per task, so any handler that
+     * enforces maxTurns on an existing task (continue/answer/ask on a task with
+     * history) must hydrate it here. Rows are loaded ephemerally into both
+     * `before` and `draft`, so identical rows never produce spurious writes and
+     * nothing is cached back into the global projection.
+     */
+    hydrateFullTurnsForTaskIds?: readonly string[];
+  } = {},
+): Promise<{ ok: true; result?: GraphApplyResult } | { ok: false; error: string }> {
+  const before = structuredClone(deps.store.getFile()) as TaskStoreFile;
+  for (const taskId of fences.hydrateFullTurnsForTaskIds ?? []) {
+    const fullTurns = await deps.repository.listTurns(taskId);
+    for (const turn of fullTurns) before.turns[turn.id] = turn;
+  }
+  const draft = structuredClone(before) as TaskStoreFile;
+  const applied = mutate(draft);
+  if (!applied.ok) return { ok: false, error: applied.reason };
+
+  const changedTasks = Object.values(draft.tasks).filter((task) => !equalGraphValue(task, before.tasks[task.id]));
+  const changedTurns = Object.values(draft.turns).filter((turn) => !equalGraphValue(turn, before.turns[turn.id]));
+  const changedMessages = Object.values(draft.messages).filter((message) => !equalGraphValue(message, before.messages[message.id]));
+  const deletedTaskIds = Object.keys(before.tasks).filter((id) => !draft.tasks[id]);
+  const deletedTurnIds = Object.keys(before.turns).filter((id) => !draft.turns[id]);
+  const deletedMessageIds = Object.keys(before.messages).filter((id) => !draft.messages[id]);
+  const changedCancelRequests = Object.entries(draft.cancelRequests ?? {})
+    .filter(([id, request]) => !equalGraphValue(request, before.cancelRequests?.[id]))
+    .map(([turnId, request]) => ({ turnId, request }));
+  const deletedCancelRequestTurnIds = Object.keys(before.cancelRequests ?? {})
+    .filter((id) => !draft.cancelRequests?.[id]);
+  const deletedRuntimeClaimTurnIds = Object.keys(before.runtimeClaims ?? {})
+    .filter((id) => !draft.runtimeClaims?.[id]);
+  const changedOperations = Object.entries(draft.operations ?? {})
+    .filter(([key, entry]) => !equalGraphValue(entry, before.operations?.[key]));
+  const deletedOperationKeys = Object.keys(before.operations ?? {})
+    .filter((key) => !draft.operations?.[key]);
+
+  // A graph operation writes at most one ledger entry. More than one indicates
+  // a transition bug; fail closed rather than silently dropping a result.
+  if (changedOperations.length > 1) {
+    return { ok: false, error: 'graph mutation produced an unsupported operation delta' };
+  }
+  const operation = changedOperations[0]
+    ? { ledgerKey: changedOperations[0][0], entry: changedOperations[0][1], createdAt: nowIso(deps.clock) }
+    : undefined;
+  const expectedTasks = fences.expectedTasks ?? changedTasks
+    .filter((task) => before.tasks[task.id] !== undefined)
+    .map((task) => ({ id: task.id, revision: before.tasks[task.id]!.revision }));
+  const expectedTurns = fences.expectedTurns ?? changedTurns
+    .filter((turn) => before.turns[turn.id] !== undefined)
+    .map((turn) => ({ id: turn.id, status: before.turns[turn.id]!.status, runtimeEpoch: before.turns[turn.id]!.runtimeEpoch }));
+  const command: RepositoryCommand = {
+    kind,
+    workspaceId: deps.workspaceId,
+    expectedTasks,
+    ...(expectedTurns.length > 0 ? { expectedTurns } : {}),
+    insertTaskIds: changedTasks.filter((task) => before.tasks[task.id] === undefined).map((task) => task.id),
+    tasks: changedTasks,
+    insertTurnIds: changedTurns.filter((turn) => before.turns[turn.id] === undefined).map((turn) => turn.id),
+    turns: changedTurns,
+    insertMessageIds: changedMessages.filter((message) => before.messages[message.id] === undefined).map((message) => message.id),
+    messages: changedMessages,
+    ...(deletedTaskIds.length > 0 ? { deleteTaskIds: deletedTaskIds } : {}),
+    ...(deletedTurnIds.length > 0 ? { deleteTurnIds: deletedTurnIds } : {}),
+    ...(deletedMessageIds.length > 0 ? { deleteMessageIds: deletedMessageIds } : {}),
+    ...(operation ? { operation } : {}),
+    ...(deletedOperationKeys.length > 0 ? { deleteOperationKeys: deletedOperationKeys } : {}),
+    ...(changedCancelRequests.length > 0 ? { cancelRequests: changedCancelRequests } : {}),
+    ...(deletedCancelRequestTurnIds.length > 0 ? { deleteCancelRequestTurnIds: deletedCancelRequestTurnIds } : {}),
+    ...(deletedRuntimeClaimTurnIds.length > 0 ? { deleteRuntimeClaimTurnIds: deletedRuntimeClaimTurnIds } : {}),
+    ...(fences.expectedRuntimeClaims && fences.expectedRuntimeClaims.length > 0
+      ? { expectedRuntimeClaims: fences.expectedRuntimeClaims }
+      : {}),
+    ...(fences.expectedCancelRequests && fences.expectedCancelRequests.length > 0
+      ? { expectedCancelRequests: fences.expectedCancelRequests }
+      : {}),
+    ...(fences.deleteSessionClaimTurnIds && fences.deleteSessionClaimTurnIds.length > 0
+      ? { deleteSessionClaimTurnIds: fences.deleteSessionClaimTurnIds }
+      : {}),
+    ...(fences.deleteResourceClaimTurnIds && fences.deleteResourceClaimTurnIds.length > 0
+      ? { deleteResourceClaimTurnIds: fences.deleteResourceClaimTurnIds }
+      : {}),
+  };
+
+  // A graph tool can settle/cancel a sibling, consume a remote cancel request,
+  // or stage an idle disposition on its own live turn (ask_parent). Persist the
+  // last coalescing window before that durable transition and before any later
+  // physical abort. Remote-owned turns have no local buffer in this process.
+  const localLiveTurnIds = new Set<string>();
+  for (const turn of changedTurns) {
+    const prior = before.turns[turn.id];
+    if (
+      prior &&
+      (prior.status === 'running' || prior.status === 'waiting_user') &&
+      deps.liveRuns.has(turn.id)
+    ) {
+      localLiveTurnIds.add(turn.id);
+    }
+  }
+  for (const turnId of deletedTurnIds) {
+    const prior = before.turns[turnId];
+    if (
+      prior &&
+      (prior.status === 'running' || prior.status === 'waiting_user') &&
+      deps.liveRuns.has(turnId)
+    ) {
+      localLiveTurnIds.add(turnId);
+    }
+  }
+  for (const turnId of localLiveTurnIds) {
+    const flushed = await deps.flushPendingTranscript?.(turnId);
+    if (flushed && !flushed.ok) {
+      return { ok: false, error: `transcript persistence failed: ${flushed.message}` };
+    }
+  }
+
+  const persisted = await deps.repository.execute(command);
+  if (persisted.conflict) return { ok: false, error: persisted.reason ?? 'opId conflict: different arguments' };
+  if (persisted.changed === false && persisted.reason) return { ok: false, error: persisted.reason };
+  return { ok: true, result: applied };
+}
+
 export function pruneLedgerForTurn(draft: TaskStoreFile, turnId: string): void {
   if (!draft.operations) return;
   for (const key of Object.keys(draft.operations)) {
@@ -364,7 +526,6 @@ export function issueTurnCredential(
     ? Math.max(1, deadlineMs - Date.now())
     : turn.effectiveRunLimitMs ??
       task.executionPolicy.runTimeoutOverrideMs ??
-      task.executionPolicy.turnTimeoutMs ??
       DEFAULT_RUN_LIMIT_MS;
   return deps.credentials.issue({
     rootId,
@@ -540,7 +701,8 @@ export async function executeToolCommand(
     command.kind !== 'get_host_context' &&
     command.kind !== 'list_task_types'
   ) {
-    const existing = deps.store.getFile().operations?.[opLedgerKey(ctx.turnId, command.opId)];
+    const key = opLedgerKey(ctx.turnId, command.opId);
+    const existing = deps.store.getFile().operations?.[key] ?? await deps.repository.getOperation(key);
     if (existing) {
       if (existing.fingerprint !== fingerprint) {
         return { ok: false, error: 'opId conflict: different arguments' };
@@ -635,7 +797,10 @@ export async function executeToolCommand(
       const resolvedTaskType = resolved.resolved.taskType;
       const resolvedBriefKind = resolved.resolved.briefKind;
 
-      const commit = deps.store.commit((draft) => {
+      const commit = await executeGraphCommand(
+        deps,
+        command.kind === 'delegate_task' ? 'delegateChildTask' : 'createChildTask',
+        (draft) => {
         ensureCoordinationMaps(draft);
         const caller = draft.tasks[ctx.callerTaskId];
         if (!caller || caller.lifecycle !== 'open') {
@@ -765,6 +930,15 @@ export async function executeToolCommand(
           waitMetadata = waitStaged;
         }
 
+        // Child creation is also an ownership/limit fence. Bump the caller
+        // revision in the same graph transaction so concurrent coordinators
+        // cannot both pass the child-count check from one stale snapshot.
+        draft.tasks[ctx.callerTaskId] = {
+          ...draft.tasks[ctx.callerTaskId]!,
+          revision: draft.tasks[ctx.callerTaskId]!.revision + 1,
+          updatedAt: now,
+        };
+
         const childPolicy = draft.tasks[childId]!.executionPolicy;
         const result: OpResult = {
           ok: true,
@@ -800,10 +974,11 @@ export async function executeToolCommand(
         };
         writeLedger(draft, ctx.turnId, command.opId, fingerprint, result);
         return { ok: true };
-      });
+        },
+      );
 
       if (!commit.ok) {
-        return { ok: false, error: commit.detail ?? commit.reason };
+        return { ok: false, error: commit.error };
       }
 
       if (command.kind === 'delegate_task') {
@@ -876,7 +1051,10 @@ export async function executeToolCommand(
       const orderedTaskIds = command.specs.map((s) => idByLocal.get(s.localId)!);
       const orderedTurnIds = command.specs.map((s) => turnIdByLocal.get(s.localId)!);
 
-      const commit = deps.store.commit((draft) => {
+      const commit = await executeGraphCommand(
+        deps,
+        isDelegate ? 'delegateChildTaskBatch' : 'createChildTaskBatch',
+        (draft) => {
         ensureCoordinationMaps(draft);
         // Idempotent replay: a cached ledger for this (turn, opId) short-circuits
         // before any caller/config check or write. Compare the fingerprint so a reused
@@ -1137,6 +1315,14 @@ export async function executeToolCommand(
           waitMetadata = waitStaged;
         }
 
+        // Serialize ownership and per-parent/root limits with the caller task
+        // revision; this is part of the same mutation as every child row.
+        draft.tasks[ctx.callerTaskId] = {
+          ...draft.tasks[ctx.callerTaskId]!,
+          revision: draft.tasks[ctx.callerTaskId]!.revision + 1,
+          updatedAt: now,
+        };
+
         const hostRunLimitMs = deps.getRunLimitMs?.() ?? DEFAULT_RUN_LIMIT_MS;
         const result: OpResult = {
           ok: true,
@@ -1169,10 +1355,11 @@ export async function executeToolCommand(
         };
         writeLedger(draft, ctx.turnId, command.opId, fingerprint, result);
         return { ok: true };
-      });
+        },
+      );
 
       if (!commit.ok) {
-        return { ok: false, error: commit.detail ?? commit.reason };
+        return { ok: false, error: commit.error };
       }
 
       const batchLedger = deps.store.getFile().operations?.[opLedgerKey(ctx.turnId, command.opId)];
@@ -1202,7 +1389,7 @@ export async function executeToolCommand(
         };
       }
       const scheduledTurnIds: string[] = [];
-      const commit = deps.store.commit((draft) => {
+      const commit = await executeGraphCommand(deps, 'releaseChildTasks', (draft) => {
         ensureCoordinationMaps(draft);
         const caller = draft.tasks[ctx.callerTaskId];
         if (!caller || caller.lifecycle !== 'open') {
@@ -1252,7 +1439,7 @@ export async function executeToolCommand(
             });
             continue;
           }
-          const releaseState = task.releaseState ?? 'draft';
+          const releaseState = task.releaseState;
           if (releaseState === 'released') {
             // Idempotent only when same releaseAttemptId.
             if (task.releaseAttemptId !== command.opId) {
@@ -1307,7 +1494,7 @@ export async function executeToolCommand(
         const turnIds: string[] = [];
         for (const taskId of members) {
           const task = draft.tasks[taskId]!;
-          if ((task.releaseState ?? 'draft') === 'released' && task.releaseAttemptId === command.opId) {
+          if (task.releaseState === 'released' && task.releaseAttemptId === command.opId) {
             // Already released under this attempt — leave existing first-turn.
             const existing = turnsForTask(draft, taskId).find((t) => t.sequence === 1);
             if (existing) turnIds.push(existing.id);
@@ -1373,7 +1560,7 @@ export async function executeToolCommand(
               };
             }
             const inRelease = resolved.has(waitId);
-            const alreadyReleased = (task.releaseState ?? 'draft') === 'released';
+            const alreadyReleased = task.releaseState === 'released';
             if (!inRelease && !alreadyReleased) {
               return {
                 ok: false,
@@ -1413,8 +1600,7 @@ export async function executeToolCommand(
 
       if (!commit.ok) {
         // Prefer structured JSON error when present.
-        const detail = commit.detail ?? commit.reason;
-        return { ok: false, error: detail };
+        return { ok: false, error: commit.error };
       }
       for (const turnId of scheduledTurnIds) {
         deps.onScheduleTurn(turnId);
@@ -1435,7 +1621,7 @@ export async function executeToolCommand(
         };
       }
       const scheduleIds: string[] = [];
-      const commit = deps.store.commit((draft) => {
+      const commit = await executeGraphCommand(deps, 'continueChildTask', (draft) => {
         ensureCoordinationMaps(draft);
         const prior = readLedger(draft, ctx.turnId, command.opId);
         if (prior) {
@@ -1530,9 +1716,9 @@ export async function executeToolCommand(
           },
         });
         return { ok: true };
-      });
+      }, { hydrateFullTurnsForTaskIds: [command.childId] });
       if (!commit.ok) {
-        return { ok: false, error: commit.detail ?? commit.reason };
+        return { ok: false, error: commit.error };
       }
       for (const id of scheduleIds) {
         deps.onScheduleTurn(id);
@@ -1542,7 +1728,9 @@ export async function executeToolCommand(
     }
 
     case 'cancel_tasks': {
-      // All-or-nothing ownership validation, then cancel each via singular path semantics.
+      // All-or-nothing ownership validation. The complete descendant set,
+      // remote cancel requests, terminal state and parent ledger are published
+      // by one repository transaction.
       const file = deps.store.getFile();
       for (const childId of command.childIds) {
         const child = file.tasks[childId];
@@ -1556,25 +1744,57 @@ export async function executeToolCommand(
           };
         }
       }
-      const cancelled: string[] = [];
-      for (const childId of command.childIds) {
-        const sub = await executeToolCommand(deps, ctx, {
-          kind: 'cancel_task',
-          opId: `${command.opId}:${childId}`,
-          childId,
-        });
-        if (!sub.ok) {
-          return { ok: false, error: sub.error };
+      const cancelled = [...command.childIds];
+      const localLiveIds: string[] = [];
+      const mutation = await executeGraphCommand(deps, 'cancelChildTasks', (draft) => {
+        const coordinatorSeal = {
+          kind: 'coordinator' as const,
+          taskId: ctx.callerTaskId,
+          turnId: ctx.turnId,
+          mode: 'cancel_task',
+        };
+        const ids = [...new Set(command.childIds.flatMap((id) => [id, ...descendantIds(draft, id)]))].reverse();
+        for (const taskId of ids) {
+          const task = draft.tasks[taskId];
+          if (!task || isTerminalLifecycle(task.lifecycle)) continue;
+          const currentPending = turnsForTask(draft, taskId).filter(
+            (turn) => turn.status === 'queued' || turn.status === 'running' || turn.status === 'waiting_user',
+          );
+          const currentLive = currentPending.find(
+            (turn) => turn.status === 'running' || turn.status === 'waiting_user',
+          );
+          const remoteOwned = !!currentLive && deps.leaseOwnerAlive(currentLive.id) && !deps.ownsLease(currentLive.id);
+          if (currentLive && remoteOwned) {
+            draft.cancelRequests = draft.cancelRequests ?? {};
+            draft.cancelRequests[currentLive.id] = {
+              kind: 'cancel', by: ctx.callerTaskId, opId: command.opId, at: now,
+              sealedBy: coordinatorSeal,
+            };
+            continue;
+          }
+          if (currentLive) localLiveIds.push(currentLive.id);
+          const next = transitionCancelTask(task, { liveTurn: currentLive, now, sealedBy: coordinatorSeal });
+          if (!next.ok) return next;
+          draft.tasks[taskId] = clearPendingParentQuestionOnCancel(draft, next.next.task, now);
+          if (next.next.turn) draft.turns[next.next.turn.id] = next.next.turn;
+          for (const pending of currentPending) {
+            if (pending.id === currentLive?.id) continue;
+            const settled = cancelPendingTurn(pending, { now });
+            if (!settled.ok) return settled;
+            draft.turns[pending.id] = settled.next;
+          }
         }
-        cancelled.push(childId);
-      }
-      deps.store.commit((draft) => {
         writeLedger(draft, ctx.turnId, command.opId, fingerprint, {
           ok: true,
           data: { cancelled },
         });
         return { ok: true };
       });
+      if (!mutation.ok) return { ok: false, error: mutation.error };
+      for (const turnId of localLiveIds) {
+        deps.liveRuns.get(turnId)?.controller.abort();
+        cleanupTurnResources(deps, turnId);
+      }
       deps.onRescanSchedulableTurns?.();
       return { ok: true, result: { cancelled } };
     }
@@ -1596,18 +1816,19 @@ export async function executeToolCommand(
       // interrupt only: remote early-return (no subtree). cancel always cascades.
       if (command.kind === 'interrupt_task') {
         if (remoteLeased) {
-          deps.writeCancelRequest(liveTurn!.id, 'interrupt', ctx.callerTaskId, command.opId);
           const result: OpResult = { ok: true, data: { requested: true } };
-          deps.store.commit((draft) => {
+          const requested = await executeGraphCommand(deps, 'interruptChildTask', (draft) => {
+            draft.cancelRequests = draft.cancelRequests ?? {};
+            draft.cancelRequests[liveTurn!.id] = {
+              kind: 'interrupt', by: ctx.callerTaskId, opId: command.opId, at: now,
+            };
             writeLedger(draft, ctx.turnId, command.opId, fingerprint, result);
             return { ok: true };
           });
+          if (!requested.ok) return { ok: false, error: requested.error };
           return { ok: true, result: result.data };
         }
-        if (liveTurn && deps.ownsLease(liveTurn.id)) {
-          deps.liveRuns.get(liveTurn.id)?.controller.abort();
-        }
-        const commit = deps.store.commit((draft) => {
+        const interrupted = await executeGraphCommand(deps, 'interruptChildTask', (draft) => {
           const turn = liveTurn ? draft.turns[liveTurn.id] : undefined;
           if (turn) {
             const interrupted = interruptTurn(turn, { now });
@@ -1621,8 +1842,11 @@ export async function executeToolCommand(
           });
           return { ok: true };
         });
-        if (!commit.ok) return { ok: false, error: commit.detail ?? commit.reason };
-        if (liveTurn) cleanupTurnResources(deps, liveTurn.id);
+        if (!interrupted.ok) return { ok: false, error: interrupted.error };
+        if (liveTurn) {
+          deps.liveRuns.get(liveTurn.id)?.controller.abort();
+          cleanupTurnResources(deps, liveTurn.id);
+        }
         return { ok: true, result: { interrupted: true } };
       }
 
@@ -1632,29 +1856,29 @@ export async function executeToolCommand(
         turnId: ctx.turnId,
         mode: 'cancel_task',
       };
-      const ids = [command.childId, ...descendantIds(deps.store.getFile(), command.childId)].reverse();
-      for (const taskId of ids) {
-        const pendingTurns = turnsForTask(deps.store.getFile(), taskId).filter(
-          (t) => t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user',
-        );
-        const lt = pendingTurns.find(
-          (t) => t.status === 'running' || t.status === 'waiting_user',
-        );
-        if (lt && deps.leaseOwnerAlive(lt.id) && !deps.ownsLease(lt.id)) {
-          // Remote owner will seal task + settle turns atomically via processCancelRequests.
-          deps.writeCancelRequest(lt.id, 'cancel', ctx.callerTaskId, command.opId, coordinatorSeal);
-          continue;
-        }
-        if (lt && deps.ownsLease(lt.id)) deps.liveRuns.get(lt.id)?.controller.abort();
-        deps.store.commit((draft) => {
+      const localLiveIds: string[] = [];
+      const mutation = await executeGraphCommand(deps, 'cancelChildTask', (draft) => {
+        const ids = [command.childId, ...descendantIds(draft, command.childId)].reverse();
+        for (const taskId of ids) {
           const task = draft.tasks[taskId];
-          if (!task || isTerminalLifecycle(task.lifecycle)) return { ok: true };
+          if (!task || isTerminalLifecycle(task.lifecycle)) continue;
           const currentPending = turnsForTask(draft, taskId).filter(
-            (t) => t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user',
+            (turn) => turn.status === 'queued' || turn.status === 'running' || turn.status === 'waiting_user',
           );
           const currentLive = currentPending.find(
-            (t) => t.status === 'running' || t.status === 'waiting_user',
+            (turn) => turn.status === 'running' || turn.status === 'waiting_user',
           );
+          if (currentLive && deps.leaseOwnerAlive(currentLive.id) && !deps.ownsLease(currentLive.id)) {
+            // Remote owner will seal task + settle turns atomically via the
+            // cancel consumer. The request itself is part of this transaction.
+            draft.cancelRequests = draft.cancelRequests ?? {};
+            draft.cancelRequests[currentLive.id] = {
+              kind: 'cancel', by: ctx.callerTaskId, opId: command.opId, at: now,
+              sealedBy: coordinatorSeal,
+            };
+            continue;
+          }
+          if (currentLive) localLiveIds.push(currentLive.id);
           const cancelled = transitionCancelTask(task, {
             liveTurn: currentLive,
             now,
@@ -1673,17 +1897,18 @@ export async function executeToolCommand(
             if (!settled.ok) return settled;
             draft.turns[pending.id] = settled.next;
           }
-          return { ok: true };
-        });
-        if (lt) cleanupTurnResources(deps, lt.id);
-      }
-      deps.store.commit((draft) => {
+        }
         writeLedger(draft, ctx.turnId, command.opId, fingerprint, {
           ok: true,
           data: { cancelled: command.childId },
         });
         return { ok: true };
       });
+      if (!mutation.ok) return { ok: false, error: mutation.error };
+      for (const turnId of localLiveIds) {
+        deps.liveRuns.get(turnId)?.controller.abort();
+        cleanupTurnResources(deps, turnId);
+      }
       // Full rescan: dependents outside the cancelled subtree may now be ready.
       deps.onRescanSchedulableTurns?.();
       return { ok: true, result: { cancelled: command.childId } };
@@ -1720,7 +1945,7 @@ export async function executeToolCommand(
         const ids = [command.taskId, ...descendantIds(file, command.taskId)].reverse();
         const liveToCleanup: string[] = [];
         let noop = false;
-        const cascade = deps.store.commit((draft) => {
+        const cascade = await executeGraphCommand(deps, 'setChildTaskLifecycle', (draft) => {
           const direct = draft.tasks[command.taskId];
           if (!direct) return { ok: false, reason: 'task not found' };
           const probe = transitionSetTaskLifecycle(direct, command.lifecycle, {
@@ -1826,7 +2051,7 @@ export async function executeToolCommand(
           return { ok: true };
         });
         if (!cascade.ok) {
-          return { ok: false, error: cascade.detail ?? cascade.reason };
+          return { ok: false, error: cascade.error };
         }
         if (!noop) {
           for (const turnId of liveToCleanup) {
@@ -1848,7 +2073,7 @@ export async function executeToolCommand(
       // succeeded | failed — seal target only (no grandchild cascade)
       let sealChanged = false;
       let liveIdToCleanup: string | undefined;
-      const commit = deps.store.commit((draft) => {
+      const commit = await executeGraphCommand(deps, 'setChildTaskLifecycle', (draft) => {
         const task = draft.tasks[command.taskId];
         if (!task) return { ok: false, reason: 'task not found' };
         const sealed = transitionSetTaskLifecycle(task, command.lifecycle, {
@@ -1903,7 +2128,7 @@ export async function executeToolCommand(
         return { ok: true };
       });
       if (!commit.ok) {
-        return { ok: false, error: commit.detail ?? commit.reason };
+        return { ok: false, error: commit.error };
       }
       if (sealChanged && liveIdToCleanup) {
         deps.liveRuns.get(liveIdToCleanup)?.controller.abort();
@@ -1923,7 +2148,7 @@ export async function executeToolCommand(
     case 'wait_for_tasks': {
       const owned = command.taskIds.every((id) => draftChildOwned(deps.store.getFile(), ctx.callerTaskId, id));
       if (!owned) return { ok: false, error: 'taskIds must be owned direct children' };
-      const staged = deps.store.commit((draft) => {
+      const staged = await executeGraphCommand(deps, 'waitForChildTasks', (draft) => {
         const turn = draft.turns[ctx.turnId];
         if (!turn) return { ok: false, reason: 'turn not found' };
         const result = mergeWaitDisposition(turn, command.taskIds);
@@ -1942,7 +2167,7 @@ export async function executeToolCommand(
         });
         return { ok: true };
       });
-      if (!staged.ok) return { ok: false, error: staged.detail ?? staged.reason };
+      if (!staged.ok) return { ok: false, error: staged.error };
       const ledger = deps.store.getFile().operations?.[opLedgerKey(ctx.turnId, command.opId)];
       return { ok: true, result: ledger?.result.data };
     }
@@ -1952,7 +2177,7 @@ export async function executeToolCommand(
       // `verdict.at` is deterministic per staging and the command fingerprint (parsed
       // upstream, timeless) stays stable across idempotent retries. Absent → no verdict.
       const verdict = normalizeVerdict(command.verdict, { at: now, source: 'worker' });
-      const staged = deps.store.commit((draft) => {
+      const staged = await executeGraphCommand(deps, 'completeGraphTask', (draft) => {
         const turn = draft.turns[ctx.turnId];
         if (!turn) return { ok: false, reason: 'turn not found' };
         const result = stageDisposition(
@@ -1968,12 +2193,12 @@ export async function executeToolCommand(
         writeLedger(draft, ctx.turnId, command.opId, fingerprint, { ok: true, data: { staged: true } });
         return { ok: true };
       });
-      if (!staged.ok) return { ok: false, error: staged.detail ?? staged.reason };
+      if (!staged.ok) return { ok: false, error: staged.error };
       return { ok: true, result: { staged: true } };
     }
 
     case 'fail_task': {
-      const staged = deps.store.commit((draft) => {
+      const staged = await executeGraphCommand(deps, 'failGraphTask', (draft) => {
         const turn = draft.turns[ctx.turnId];
         if (!turn) return { ok: false, reason: 'turn not found' };
         const result = stageDisposition(turn, { kind: 'fail', error: command.error }, command.opId, {
@@ -1984,7 +2209,7 @@ export async function executeToolCommand(
         writeLedger(draft, ctx.turnId, command.opId, fingerprint, { ok: true, data: { staged: true } });
         return { ok: true };
       });
-      if (!staged.ok) return { ok: false, error: staged.detail ?? staged.reason };
+      if (!staged.ok) return { ok: false, error: staged.error };
       return { ok: true, result: { staged: true } };
     }
 
@@ -2006,11 +2231,11 @@ export async function executeToolCommand(
         return {
           id: t.id,
           lifecycle: t.lifecycle,
-          releaseState: t.releaseState ?? 'draft',
+          releaseState: t.releaseState,
           goal: t.goal.slice(0, 128),
           parentId: t.parentId,
           attention: t.attention,
-          resultSummary: t.taskResult?.summary ?? t.result,
+          resultSummary: t.taskResult?.summary,
           readiness: {
             code: readiness.code,
             schedulable: readiness.schedulable,
@@ -2151,7 +2376,21 @@ export async function executeToolCommand(
         return { ok: false, error: 'questions required' };
       }
       const questionId = deriveEntityId(ctx.turnId, command.opId, 'q');
-      const commit = deps.store.commit((draft) => {
+      // The parent-Q turn lands on the parent or the nearest open ancestor
+      // coordinator; hydrate the whole ancestor chain so canCreateTurn counts
+      // that task's full (possibly terminal) history, not the bounded subset.
+      const askParentChain: string[] = [];
+      {
+        const seen = new Set<string>();
+        let walk: string | null | undefined = caller.parentId;
+        const tasks = deps.store.getFile().tasks;
+        while (walk && !seen.has(walk)) {
+          seen.add(walk);
+          askParentChain.push(walk);
+          walk = tasks[walk]?.parentId;
+        }
+      }
+      const commit = await executeGraphCommand(deps, 'askParent', (draft) => {
         ensureCoordinationMaps(draft);
         const child = draft.tasks[ctx.callerTaskId];
         const parentId = child?.parentId;
@@ -2303,9 +2542,9 @@ export async function executeToolCommand(
           data: { questionId, parentTaskId: parentId },
         });
         return { ok: true };
-      });
+      }, { hydrateFullTurnsForTaskIds: askParentChain });
       if (!commit.ok) {
-        return { ok: false, error: commit.detail ?? commit.reason };
+        return { ok: false, error: commit.error };
       }
       // Abort child live process to free concurrency (scheduler-safe).
       const childLive = turnsForTask(deps.store.getFile(), ctx.callerTaskId).find(
@@ -2325,7 +2564,12 @@ export async function executeToolCommand(
 
     case 'answer_child_question': {
       const scheduleIds: string[] = [];
-      const commit = deps.store.commit((draft) => {
+      // The continuation turn lands on the child that asked; hydrate its full
+      // turn history so canCreateTurn counts real slots, not the bounded subset.
+      const answerChildId =
+        deps.store.getFile().tasks[ctx.callerTaskId]?.pendingChildQuestions?.[command.questionId]
+          ?.fromChildId;
+      const commit = await executeGraphCommand(deps, 'answerChildQuestion', (draft) => {
         ensureCoordinationMaps(draft);
         const parent = draft.tasks[ctx.callerTaskId];
         if (!parent || parent.lifecycle !== 'open') {
@@ -2445,9 +2689,9 @@ export async function executeToolCommand(
           data: { questionId: command.questionId, continuationTurnId },
         });
         return { ok: true };
-      });
+      }, answerChildId ? { hydrateFullTurnsForTaskIds: [answerChildId] } : {});
       if (!commit.ok) {
-        return { ok: false, error: commit.detail ?? commit.reason };
+        return { ok: false, error: commit.error };
       }
       for (const id of scheduleIds) {
         deps.onScheduleTurn(id);
@@ -2470,7 +2714,7 @@ function draftChildOwned(file: TaskStoreFile, parentId: string, childId: string)
 }
 
 export function tryPromoteTurn(
-  store: TaskStore,
+  store: TaskReadPort,
   turnId: string,
   limits: ResourceLimits,
 ): boolean {
@@ -2479,69 +2723,87 @@ export function tryPromoteTurn(
   return check.ok;
 }
 
-export function processCancelRequests(deps: GraphEngineDeps): void {
-  const file = deps.store.getFile();
-  const requests = file.cancelRequests ?? {};
+export async function processCancelRequests(deps: GraphEngineDeps): Promise<void> {
+  const requests = Object.entries(deps.store.getFile().cancelRequests ?? {});
   const now = nowIso(deps.clock);
 
-  for (const [turnId, request] of Object.entries(requests)) {
-    if (!deps.ownsLease(turnId)) {
-      continue;
-    }
-    deps.liveRuns.get(turnId)?.controller.abort();
-    deps.store.commit((draft) => {
-      const turn = draft.turns[turnId];
-      if (!turn) {
-        delete draft.cancelRequests?.[turnId];
-        return { ok: true };
-      }
-      if (request.kind === 'interrupt') {
-        const interrupted = interruptTurn(turn, { now });
-        if (interrupted.ok) {
-          draft.turns[turnId] = interrupted.next;
-          holdQueuedFollowUpsOnFailure(draft, turn.taskId);
-        }
-      } else {
-        const task = draft.tasks[turn.taskId];
-        if (task) {
-          const pendingTurns = turnsForTask(draft, task.id).filter(
-            (t) => t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user',
-          );
-          const cancelled = transitionCancelTask(task, {
-            liveTurn: turn,
-            now,
-            sealedBy:
-              request.sealedBy ??
-              (request.by === 'engine' || request.by === 'user'
-                ? { kind: 'user' }
-                : {
-                    kind: 'coordinator',
-                    taskId: request.by,
-                    mode: 'cancel_task',
-                  }),
-          });
-          if (cancelled.ok) {
-            // parent_seal always applies reason (including undefined to clear stale).
-            const isParentSeal =
-              request.sealedBy?.kind === 'coordinator' &&
-              request.sealedBy.mode === 'parent_seal';
-            const sealedTask = isParentSeal
-              ? { ...cancelled.next.task, reason: request.reason }
-              : cancelled.next.task;
-            draft.tasks[task.id] = clearPendingParentQuestionOnCancel(draft, sealedTask, now);
-            if (cancelled.next.turn) draft.turns[cancelled.next.turn.id] = cancelled.next.turn;
-            for (const pending of pendingTurns) {
-              if (pending.id === turn.id) continue;
-              const settled = cancelPendingTurn(pending, { now });
-              if (settled.ok) draft.turns[pending.id] = settled.next;
+  for (const [turnId, request] of requests) {
+    const claim = deps.store.getFile().runtimeClaims?.[turnId];
+    const ownerId = deps.runtimeOwnerId ?? claim?.ownerId;
+    // Only the current runtime owner may consume a request. The owner fence is
+    // re-checked inside the same IMMEDIATE transaction as settlement/deletion.
+    if (!ownerId || !deps.ownsLease(turnId) || claim?.ownerId !== ownerId) continue;
+    const localTurn = deps.store.getFile().turns[turnId];
+    const expectedTasks = localTurn
+      ? [{ id: localTurn.taskId, revision: deps.store.getFile().tasks[localTurn.taskId]?.revision ?? 0 }]
+      : [];
+    const expectedTurns = localTurn
+      ? [{ id: turnId, status: localTurn.status, runtimeEpoch: localTurn.runtimeEpoch }]
+      : [];
+    const consumed = await executeGraphCommand(
+      deps,
+      'consumeCancelRequest',
+      (draft) => {
+        const currentRequest = draft.cancelRequests?.[turnId];
+        const currentClaim = draft.runtimeClaims?.[turnId];
+        if (!currentRequest || !currentClaim || currentClaim.ownerId !== ownerId) return { ok: true };
+        const turn = draft.turns[turnId];
+        if (turn) {
+          if (currentRequest.kind === 'interrupt') {
+            const interrupted = interruptTurn(turn, { now });
+            if (interrupted.ok) {
+              draft.turns[turnId] = interrupted.next;
+              holdQueuedFollowUpsOnFailure(draft, turn.taskId);
+            }
+          } else {
+            const task = draft.tasks[turn.taskId];
+            if (task) {
+              const pendingTurns = turnsForTask(draft, task.id).filter(
+                (candidate) => candidate.status === 'queued' || candidate.status === 'running' || candidate.status === 'waiting_user',
+              );
+              const cancelled = transitionCancelTask(task, {
+                liveTurn: turn,
+                now,
+                sealedBy:
+                  currentRequest.sealedBy ??
+                  (currentRequest.by === 'engine' || currentRequest.by === 'user'
+                    ? { kind: 'user' }
+                    : { kind: 'coordinator', taskId: currentRequest.by, mode: 'cancel_task' }),
+              });
+              if (cancelled.ok) {
+                const isParentSeal = currentRequest.sealedBy?.kind === 'coordinator' && currentRequest.sealedBy.mode === 'parent_seal';
+                const sealedTask = isParentSeal
+                  ? { ...cancelled.next.task, reason: currentRequest.reason }
+                  : cancelled.next.task;
+                draft.tasks[task.id] = clearPendingParentQuestionOnCancel(draft, sealedTask, now);
+                if (cancelled.next.turn) draft.turns[cancelled.next.turn.id] = cancelled.next.turn;
+                for (const pending of pendingTurns) {
+                  if (pending.id === turn.id) continue;
+                  const settled = cancelPendingTurn(pending, { now });
+                  if (settled.ok) draft.turns[pending.id] = settled.next;
+                }
+              }
             }
           }
         }
-      }
-      delete draft.cancelRequests?.[turnId];
-      pruneLedgerForTurn(draft, turnId);
-      return { ok: true };
-    });
+        delete draft.cancelRequests![turnId];
+        pruneLedgerForTurn(draft, turnId);
+        delete draft.runtimeClaims![turnId];
+        return { ok: true };
+      },
+      {
+        expectedTasks,
+        expectedTurns,
+        expectedRuntimeClaims: [{ turnId, ownerId }],
+        expectedCancelRequests: [{ turnId, kind: request.kind, opId: request.opId }],
+        deleteSessionClaimTurnIds: [turnId],
+        deleteResourceClaimTurnIds: [turnId],
+      },
+    );
+    if (!consumed.ok) continue;
+    // Abort only after the durable consumer transaction wins its owner/request
+    // fences; a remote replacement can therefore never be killed by a stale host.
+    deps.liveRuns.get(turnId)?.controller.abort();
     cleanupTurnResources(deps, turnId);
   }
 }
@@ -2569,7 +2831,7 @@ export function projectChildResults(
     const entry = {
       id: task.id,
       lifecycle: task.lifecycle,
-      result: task.result?.slice(0, 512),
+      result: task.taskResult?.summary.slice(0, 512),
       error: task.error?.slice(0, 256),
       attention: task.attention?.code,
       ...(pendingQ ? { pendingParentQuestion: pendingQ } : {}),

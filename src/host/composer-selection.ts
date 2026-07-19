@@ -9,8 +9,11 @@ export interface ComposerSelection {
   model: string | null;
 }
 
-/** `globalState` key for the last-used composer backend/model preference. */
-export const COMPOSER_SELECTION_STATE_KEY = 'muster.composerSelection';
+/**
+ * VS Code configuration key for the durable composer backend/model preference.
+ * Stored as one validated object (not separate keys) so updates stay atomic.
+ */
+export const COMPOSER_SELECTION_CONFIG_KEY = 'muster.composerSelection';
 
 export function isComposerBackendId(value: unknown): value is ComposerBackendId {
   return (
@@ -23,7 +26,7 @@ export function isComposerBackendId(value: unknown): value is ComposerBackendId 
 }
 
 /**
- * Normalize a raw globalState / inbound payload into a composer selection.
+ * Normalize a raw Settings / inbound payload into a composer selection.
  * Returns null when the payload is missing or not a known backend.
  */
 export function parseComposerSelection(raw: unknown): ComposerSelection | null {
@@ -35,30 +38,39 @@ export function parseComposerSelection(raw: unknown): ComposerSelection | null {
   return { backend: record.backend, model };
 }
 
-export interface ComposerSelectionStore {
-  get(key: string): unknown;
-  update(key: string, value: ComposerSelection): Thenable<void> | PromiseLike<void> | void;
+export interface ComposerSelectionConfig {
+  get(section: string): unknown;
+  update(
+    section: string,
+    value: ComposerSelection,
+    target: unknown,
+  ): Thenable<void> | PromiseLike<void> | void;
 }
 
-/** Read the last-used composer selection from host globalState (best-effort). */
-export function readComposerSelection(store: ComposerSelectionStore): ComposerSelection | null {
+/** Read durable composer selection from VS Code Settings (best-effort). */
+export function readComposerSelection(config: ComposerSelectionConfig): ComposerSelection | null {
   try {
-    return parseComposerSelection(store.get(COMPOSER_SELECTION_STATE_KEY));
+    return parseComposerSelection(config.get(COMPOSER_SELECTION_CONFIG_KEY));
   } catch {
     return null;
   }
 }
 
-/** Persist the last-used composer selection to host globalState (best-effort). */
+/** Persist composer selection to ConfigurationTarget.Global (best-effort). */
 export async function writeComposerSelection(
-  store: ComposerSelectionStore,
+  config: ComposerSelectionConfig,
   selection: ComposerSelection,
+  globalTarget: unknown,
 ): Promise<void> {
   try {
-    await store.update(COMPOSER_SELECTION_STATE_KEY, {
-      backend: selection.backend,
-      model: selection.model,
-    });
+    await config.update(
+      COMPOSER_SELECTION_CONFIG_KEY,
+      {
+        backend: selection.backend,
+        model: selection.model,
+      },
+      globalTarget,
+    );
   } catch {
     // best-effort — preference is UX only
   }

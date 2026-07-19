@@ -26,20 +26,41 @@ import { discoverSkillNames } from './host/skill-discovery';
 import { ElicitationBridge } from './bridge/elicitation-bridge';
 import type { PermissionAuditEntry, PermissionMode } from './backends/permission-policy';
 import {
-  buildSnapshot,
-  collectAncestorIds,
-  owningRootMembershipChanged,
-  projectTaskSummary,
   type PendingAskOverlay,
-  type TaskSnapshot,
   type TranscriptItem,
 } from './host/snapshot';
+import { buildRepositorySnapshot } from './host/repository-snapshot';
+import {
+  buildWorkspacePatchBatch,
+  localCommitNeedsTranscriptRecovery,
+  projectWorkspacePatches,
+} from './host/workspace-patch';
+import { WorkspaceRevisionPoller } from './host/workspace-revision-poller';
+import {
+  reconcileExternalWorkspaceChanges,
+  reconcileInterleavedLocalCommit,
+} from './host/external-workspace-reconciler';
+import {
+  UAT_COMMANDS,
+  appendMessage,
+  createTaskWithMessage,
+  deleteMessage,
+  enqueueFollowUp,
+  isUatModeEnabled,
+  markSendOutboxRejected,
+  promoteFollowUp,
+  putPresentation,
+  putSendOutbox,
+  readDurableSurfaces,
+  readRedactedDbIdentity,
+  type UatHostState,
+} from './host/uat-commands';
+import type { RepositoryCommitContext } from './task/repository-projection';
 import {
   buildRetentionSettingsSnapshot,
   handleRetentionSettingUpdateAction,
   type RuntimeStorageSettingsSnapshot,
   type RuntimeStorageSettingId,
-  selectRetainedTurnsValue,
 } from './host/retention-settings';
 import {
   TASK_TYPES_CONFIG_KEY,
@@ -61,14 +82,19 @@ import {
 } from './host/composer-selection';
 import { pickWorkspaceFileMentionPath } from './host/workspace-files';
 import { resolveDroppedFileMention } from './host/file-mentions';
+import { parseHostSendRequest, type HostSendRequest } from './host/send-request';
 import {
   isFileMentionDirectorySymlink,
   listFileMentionSuggestions,
   type FileMentionSuggestionsRequest,
 } from './host/file-mention-suggestions';
-import { routeDeleteQueuedTurn, routeEditQueuedTurn } from './host/queued-turn-mutations';
+import {
+  routeDeleteQueuedTurn,
+  routeEditQueuedTurn,
+} from './host/queued-turn-mutations';
 import { routeExportTask } from './host/task-export-route';
 import { routeRuntimeHandoff } from './host/runtime-handoff-route';
+import { routeLoadTranscriptPage } from './host/transcript-page-route';
 import { importDroppedFileBytes } from './host/import-dropped-file';
 import { PresentationManager } from './host/presentation-manager';
 import {
@@ -88,11 +114,43 @@ import {
   titleFromMarkdownPath,
 } from './host/markdown-file-presentation';
 import { enumerateModels, type BackendModels } from './backends/model-catalog';
-import { SESSION_MIGRATION_MARKER, migrateLegacySessions } from './task/migration-sessions';
-import { applyRetention, retentionChanged, type RetentionConfig } from './task/retention';
-import { TaskEngine, type EngineEvent, viewStatusFromDraft } from './task/engine';
+import { type RetentionConfig } from './task/retention';
+import { TaskEngine, type EngineEvent } from './task/engine';
 import type { HostEnvironmentSnapshot } from './task/host-context';
-import { TaskStore, computeAffectedTaskIds, type CommitResult } from './task/store';
+import type { TaskReadPort } from './task/store-port';
+import { SqliteTaskRepository, type TaskRepository } from './task/repository';
+import { DbClient, resolveWorkerPath } from './task/sqlite/client';
+import { probeNodeSqlite } from './task/sqlite/probe';
+import type { SqliteErrorCode } from './task/sqlite/errors';
+import {
+  diagnoseSqliteError,
+  redactedDiagnosticLogFields,
+  recoveryGuidanceFor,
+} from './task/sqlite/diagnostics';
+import { applyTerminalStorageQuiesce } from './host/terminal-storage-coordinator';
+import { quiesceForMaintenance } from './host/sqlite-maintenance-coordinator';
+import {
+  handleBackupDatabaseCommand,
+  handleDeveloperResetCommand,
+  MUSTER_BACKUP_DATABASE_COMMAND,
+  MUSTER_DEVELOPER_RESET_COMMAND,
+} from './host/sqlite-maintenance-commands';
+import { createTerminalStorageLifecycle } from './host/terminal-storage-lifecycle';
+import { runDurableHostSend } from './host/durable-send-coordinator';
+
+
+/** Activation fail-closed error: safe message only, no path/SQL/content. */
+class MusterSqliteActivationError extends Error {
+  constructor(
+    readonly code: SqliteErrorCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'MusterSqliteActivationError';
+  }
+}
+import { WorkspaceRegistry } from './task/sqlite/workspace-registry';
+import { resolveWorkspaceIdentity, type WorkspaceContext } from './task/sqlite/workspace-identity';
 import { isTerminalLifecycle } from './task/transitions';
 import { resolveWorkspaceCwd } from './task/workspace-cwd';
 import type { TaskStoreFile } from './task/types';
@@ -114,9 +172,20 @@ let credentialRegistry: CredentialRegistry | undefined;
 let mcpReadiness: McpReadinessSupervisor | undefined;
 let bridgeServer: MusterBridgeServer | undefined;
 let taskEngine: TaskEngine | undefined;
-let taskStore: TaskStore | undefined;
-let storePath: string | undefined;
+let taskStore: TaskReadPort | undefined;
+let taskRepository: TaskRepository | undefined;
 let workspaceRoot: string | undefined;
+/** SQLite is the only task storage source. */
+let sqliteClient: DbClient | undefined;
+let sqliteWorkspaceId: string | undefined;
+/** Production chat provider (always tracked; UAT may also alias it). */
+let chatProvider: MusterChatProvider | undefined;
+/** Live UAT host surface (non-production Extension Host + MUSTER_UAT_MODE=1). */
+let uatChatProvider: MusterChatProvider | undefined;
+/** Single-flight maintenance (backup/reset commands). */
+let maintenanceActive = false;
+/** One-shot peer reset after external developer reset (P5-W5). */
+let peerResetHandled = false;
 
 /** Shared host-env cache for first-turn inject + get_host_context (W1). */
 let hostEnvCache: HostEnvironmentSnapshot | undefined;
@@ -188,8 +257,6 @@ function getTaskTypeRegistry(cwd?: string) {
   return loadTaskTypeRegistry((folderCwd) => readExplicitTaskTypesRaw(folderCwd), cwd);
 }
 let presentationManager: PresentationManager | undefined;
-let lastObservedRevision = 0;
-let lastObservedFile: TaskStoreFile | undefined;
 const activePendingAsks = new Map<string, PendingAskOverlay>();
 
 function ensureMusterDebugChannel(): vscode.OutputChannel {
@@ -232,7 +299,7 @@ function debugElicitation(event: string, details: Record<string, unknown> = {}):
  * version is stamped on the bootstrap `snapshot` message, and a mismatch is
  * surfaced in the webview as a visible "reload the window" banner.
  */
-const PROTOCOL_VERSION = 5;
+const PROTOCOL_VERSION = 9;
 
 /** How long a permission prompt waits for a webview decision before safe-denying. */
 const PERMISSION_PROMPT_TIMEOUT_MS = USER_INTERACTION_TIMEOUT_MS;
@@ -304,9 +371,8 @@ function explicitConfigurationValue<T>(
 
 function readRetainedTurnsValue(): unknown {
   const config = vscode.workspace.getConfiguration('muster.retention');
-  const next = explicitConfigurationValue<number>(config.inspect('maxRetainedTurnsPerTask'));
-  const legacy = explicitConfigurationValue<number>(config.inspect('maxTurnsPerTask'));
-  return selectRetainedTurnsValue(next, legacy, config.get('maxRetainedTurnsPerTask'));
+  return explicitConfigurationValue<number>(config.inspect('maxRetainedTurnsPerTask')) ??
+    config.get('maxRetainedTurnsPerTask');
 }
 
 function runtimeStorageConfiguration() {
@@ -327,24 +393,6 @@ function runtimeStorageConfiguration() {
   };
 }
 
-async function migrateLegacyRetentionSetting(): Promise<void> {
-  const config = vscode.workspace.getConfiguration('muster.retention');
-  if (explicitConfigurationValue(config.inspect('maxRetainedTurnsPerTask')) !== undefined) return;
-  const legacyInspect = config.inspect<number>('maxTurnsPerTask');
-  const candidates: Array<[number | undefined, vscode.ConfigurationTarget]> = [
-    [legacyInspect?.workspaceFolderValue, vscode.ConfigurationTarget.WorkspaceFolder],
-    [legacyInspect?.workspaceValue, vscode.ConfigurationTarget.Workspace],
-    [legacyInspect?.globalValue, vscode.ConfigurationTarget.Global],
-  ];
-  const explicit = candidates.find(([value]) => value !== undefined);
-  if (!explicit) return;
-  try {
-    await config.update('maxRetainedTurnsPerTask', explicit[0], explicit[1]);
-  } catch {
-    // One-release read fallback above preserves the old value if migration cannot write.
-  }
-}
-
 function getRetentionConfig(): RetentionConfig {
   const snapshot = readRetentionSettingsSnapshot();
   return {
@@ -355,72 +403,40 @@ function getRetentionConfig(): RetentionConfig {
   };
 }
 
-function runSessionMigration(context: vscode.ExtensionContext, wsRoot?: string): void {
-  if (!wsRoot) {
-    return;
+let retentionInFlight: Promise<void> | undefined;
+
+function repositoryWorkspaceId(): string {
+  if (!sqliteWorkspaceId) {
+    throw new Error('SQLite workspace is not ready');
   }
-  const result = migrateLegacySessions(wsRoot);
-  if (result.action !== 'none') {
-    void context.workspaceState.update(SESSION_MIGRATION_MARKER, true);
-    if (result.message) {
-      void vscode.window.showInformationMessage(result.message);
-    }
-  }
+  return sqliteWorkspaceId;
 }
 
-function applyRetentionToStore(store: TaskStore): void {
+/** Apply retention through named repository commands; never rewrite the host envelope. */
+async function applyRetentionToRepository(repository: TaskRepository): Promise<void> {
   const config = getRetentionConfig();
-  const before = store.getFile();
-  const pruned = applyRetention(before, config);
-  if (!retentionChanged(before, pruned)) {
-    return;
+  const tasks = await repository.listTasks(repositoryWorkspaceId());
+  for (const task of tasks) {
+    await repository.execute({
+      kind: 'applyRetentionPolicy',
+      workspaceId: repositoryWorkspaceId(),
+      taskId: task.id,
+      keepLatestTurns: config.maxTurnsPerTask,
+      maxStoredOutputChars: config.maxStoredOutputChars,
+    });
   }
-  store.commit((draft) => {
-    draft.tasks = pruned.tasks;
-    draft.turns = pruned.turns;
-    draft.messages = pruned.messages;
-    draft.operations = pruned.operations;
-    draft.cancelRequests = pruned.cancelRequests;
-    draft.toolCalls = pruned.toolCalls ?? {};
-    draft.reasoning = pruned.reasoning ?? {};
-    return { ok: true };
-  });
 }
 
-/**
- * True when any record belonging to `taskId` differs between `previous` and `file`,
- * including additions AND deletions (a record present in one snapshot but absent in
- * the other). Used to decide whether a focused snapshot must be re-posted.
- */
-function taskRecordsChanged(
-  previous: TaskStoreFile,
-  file: TaskStoreFile,
-  taskId: string,
-): boolean {
-  const differs = <T extends { taskId: string }>(
-    prevMap: Record<string, T> | undefined,
-    nextMap: Record<string, T> | undefined,
-  ): boolean => {
-    const prev = prevMap ?? {};
-    const next = nextMap ?? {};
-    for (const key of new Set([...Object.keys(prev), ...Object.keys(next)])) {
-      const p = prev[key];
-      const n = next[key];
-      if (p?.taskId !== taskId && n?.taskId !== taskId) {
-        continue;
-      }
-      if (JSON.stringify(p) !== JSON.stringify(n)) {
-        return true;
-      }
-    }
-    return false;
-  };
-  return (
-    differs(previous.messages, file.messages) ||
-    differs(previous.toolCalls, file.toolCalls) ||
-    differs(previous.reasoning, file.reasoning) ||
-    differs(previous.turns, file.turns)
-  );
+function scheduleRetention(): void {
+  const repository = taskRepository;
+  if (!repository || retentionInFlight) return;
+  retentionInFlight = applyRetentionToRepository(repository)
+    .catch(() => {
+      // Retention is maintenance; a failed pass must not interrupt a user turn.
+    })
+    .finally(() => {
+      retentionInFlight = undefined;
+    });
 }
 
 class MusterChatProvider implements vscode.WebviewViewProvider {
@@ -430,11 +446,31 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   private availableBackendsPromise?: Promise<string[]>;
   /** In-flight/cached per-backend model enumeration (computed once). */
   private availableModelsPromise?: Promise<Record<string, BackendModels>>;
+  /** Discards stale async repository snapshots when focus/commits race. */
+  private snapshotGeneration = 0;
   focusedTaskId?: string;
+  /**
+   * Host mirror of focused transcript entity IDs (bootstrap page + older pages +
+   * published patches). Used to choose transcriptItemsAppended vs transcriptItemPatched.
+   */
+  private knownTranscriptIds = new Set<string>();
+  /**
+   * Highest workspace revision this host has published (local patches) or
+   * recovered to (snapshot). Poller never re-applies at or below this cursor.
+   */
+  private appliedWorkspaceRevision = 0;
+  private revisionPoller: WorkspaceRevisionPoller | undefined;
+  private windowFocused = true;
+  /** Headless live-UAT override; never enabled in production Extension Hosts. */
+  private uatFocusGateOverridden = false;
+  /** Count of external-feed gap/delete recoveries, exposed only by the UAT gate. */
+  private externalRecoveryCount = 0;
+  /** Polling starts only after the current view/focus has an authoritative snapshot. */
+  private pollingReady = false;
+  private windowStateSub: vscode.Disposable | undefined;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
-    private readonly _globalState: vscode.Memento,
   ) {}
 
   private post(message: unknown): void {
@@ -442,6 +478,102 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       this._view?.webview.postMessage(message);
     } catch {
       // best-effort
+    }
+  }
+
+  /**
+   * Central post-commit publisher: one workspacePatchBatch per changed revision
+   * after SQLite commit + projection refresh. Empty patches still advance revision.
+   */
+  async publishAfterCommit(ctx: RepositoryCommitContext): Promise<void> {
+    const after = ctx.projection.getFile();
+    if (!this._view?.visible || !this.pollingReady) {
+      // This revision is durable but was not published. Do not advance the wire
+      // cursor: visibility/focus hydration must successfully deliver an
+      // authoritative bounded snapshot before the UI is considered caught up.
+      return;
+    }
+    const trackPatches = (patches: ReturnType<typeof projectWorkspacePatches>): void => {
+      for (const patch of patches) {
+        if (patch.type === 'transcriptItemsAppended') {
+          for (const item of patch.items) this.knownTranscriptIds.add(item.id);
+        } else if (patch.type === 'transcriptItemPatched') {
+          this.knownTranscriptIds.add(patch.item.id);
+        } else if (patch.type === 'transcriptItemsRemoved') {
+          for (const itemId of patch.itemIds) this.knownTranscriptIds.delete(itemId);
+        } else if (patch.type === 'taskRemoved' && patch.taskId === this.focusedTaskId) {
+          this.knownTranscriptIds.clear();
+        }
+      }
+    };
+
+    // A peer can commit immediately before this local transaction. The local
+    // bounded refresh then observes the final workspace revision while touching
+    // only its own aggregate. Drain the missing feed range before publishing so
+    // the projection/cursor cannot skip the peer task forever.
+    const interleavedResult = taskRepository
+      ? await reconcileInterleavedLocalCommit({
+        repository: taskRepository,
+        projection: ctx.projection,
+        afterRevision: ctx.previousRevision,
+        previousRevision: ctx.previousRevision,
+        focusedTaskId: this.focusedTaskId,
+        knownTranscriptIds: this.knownTranscriptIds,
+        beforeProjection: ctx.beforeFile,
+      })
+      : undefined;
+    if (interleavedResult) {
+      if (interleavedResult.kind === 'batches') {
+        for (const batch of interleavedResult.batches) {
+          if (batch.revision <= this.appliedWorkspaceRevision) continue;
+          trackPatches(batch.patches);
+          this.post(batch);
+          this.appliedWorkspaceRevision = batch.revision;
+        }
+      } else {
+        this.externalRecoveryCount += 1;
+        await this.postSnapshotAsync(this.focusedTaskId);
+      }
+    } else if (localCommitNeedsTranscriptRecovery({
+      command: ctx.command,
+      result: ctx.result,
+      focusedTaskId: this.focusedTaskId,
+      knownTranscriptIds: this.knownTranscriptIds,
+    })) {
+      await this.postSnapshotAsync(this.focusedTaskId);
+    } else {
+      const patches = projectWorkspacePatches({
+        command: ctx.command,
+        result: ctx.result,
+        before: ctx.beforeFile as TaskStoreFile,
+        after,
+        focusedTaskId: this.focusedTaskId,
+        knownTranscriptIds: this.knownTranscriptIds,
+      });
+      trackPatches(patches);
+      this.post(buildWorkspacePatchBatch(after.revision, patches));
+      if (after.revision > this.appliedWorkspaceRevision) {
+        this.appliedWorkspaceRevision = after.revision;
+      }
+    }
+
+    // Ask-clear side channel when a waiting_user turn leaves that state.
+    const previous = ctx.beforeFile;
+    for (const turnId of Object.keys(after.turns)) {
+      const prevTurn = previous.turns[turnId];
+      const nextTurn = after.turns[turnId];
+      if (prevTurn?.status === 'waiting_user' && nextTurn && nextTurn.status !== 'waiting_user') {
+        const overlay = [...activePendingAsks.values()].find((entry) => entry.turnId === turnId);
+        if (overlay) {
+          activePendingAsks.delete(overlay.taskId);
+          this.post({
+            type: 'askCleared',
+            taskId: overlay.taskId,
+            turnId: overlay.turnId,
+            askId: overlay.askId,
+          });
+        }
+      }
     }
   }
 
@@ -862,9 +994,13 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     this.post({ type: 'skillsAvailable', backend, prefix, skills });
   }
 
-  /** Push host-persisted last-used backend/model so the picker survives restarts. */
-  private postComposerSelection(): void {
-    const selection = readComposerSelection(this._globalState);
+  /** Push Settings-backed last-used backend/model so the picker survives restarts. */
+  postComposerSelection(): void {
+    const selection = readComposerSelection({
+      get: (key) => vscode.workspace.getConfiguration().get(key),
+      update: (key, value, target) =>
+        vscode.workspace.getConfiguration().update(key, value, target as vscode.ConfigurationTarget),
+    });
     if (!selection) return;
     this.post({
       type: 'composerSelection',
@@ -879,7 +1015,17 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       model: data.model === undefined ? null : data.model,
     });
     if (!selection) return;
-    void writeComposerSelection(this._globalState, selection);
+    void writeComposerSelection(
+      {
+        get: (key) => vscode.workspace.getConfiguration().get(key),
+        update: (key, value, target) =>
+          vscode.workspace
+            .getConfiguration()
+            .update(key, value, target as vscode.ConfigurationTarget),
+      },
+      selection,
+      vscode.ConfigurationTarget.Global,
+    );
   }
 
   /**
@@ -940,24 +1086,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           turnId: event.turnId,
           trigger: event.trigger,
         });
-        // Turn left the FIFO queue — project its user message(s) into chat now.
-        // Snapshot rebuild also includes them; append is idempotent by message id.
-        if (event.taskId === this.focusedTaskId && taskStore) {
-          const turn = taskStore.getFile().turns[event.turnId];
-          if (turn) {
-            for (const input of turn.inputs) {
-              if (input.kind !== 'message') continue;
-              const item = this.transcriptItemFromMessage(input.messageId);
-              if (item) {
-                this.post({
-                  type: 'transcriptAppend',
-                  taskId: event.taskId,
-                  item: { ...item, turnId: event.turnId },
-                });
-              }
-            }
-          }
-        }
+        // Durable promote of queued user messages is published via workspace
+        // patches from prepareDispatch/replaceLiveTurn post-commit.
         break;
       case 'event':
         this.post({
@@ -985,121 +1115,121 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private seedObservation(file: TaskStoreFile): void {
-    lastObservedRevision = file.revision;
-    lastObservedFile = JSON.parse(JSON.stringify(file)) as TaskStoreFile;
-  }
-
-  reprojectChanged(file: TaskStoreFile, affectedTaskIds: string[], before?: TaskStoreFile): void {
-    const previous = before ?? lastObservedFile;
-    if (!previous) {
-      this.seedObservation(file);
-      return;
-    }
-
-    // Reproject ancestors so childOrchestration / derived aggregates stay fresh.
-    const expanded = new Set<string>(affectedTaskIds);
-    for (const taskId of affectedTaskIds) {
-      for (const ancestorId of collectAncestorIds(file, taskId)) {
-        expanded.add(ancestorId);
-      }
-      // Also walk previous file in case of reparent/delete.
-      for (const ancestorId of collectAncestorIds(previous, taskId)) {
-        expanded.add(ancestorId);
-      }
-    }
-
-    for (const taskId of expanded) {
-      const patch = projectTaskSummary(file, taskId);
-      if (!patch) {
-        continue;
-      }
-      this.post({
-        type: 'taskUpdated',
-        taskId,
-        storeRevision: file.revision,
-        patch,
-      });
-    }
-
-    for (const turnId of Object.keys(file.turns)) {
-      const prevTurn = previous.turns[turnId];
-      const nextTurn = file.turns[turnId];
-      if (prevTurn?.status === 'waiting_user' && nextTurn && nextTurn.status !== 'waiting_user') {
-        const overlay = [...activePendingAsks.values()].find((entry) => entry.turnId === turnId);
-        if (overlay) {
-          activePendingAsks.delete(overlay.taskId);
-          this.post({
-            type: 'askCleared',
-            taskId: overlay.taskId,
-            turnId: overlay.turnId,
-            askId: overlay.askId,
-          });
-        }
-      }
-    }
-
-    lastObservedRevision = file.revision;
-    lastObservedFile = JSON.parse(JSON.stringify(file)) as TaskStoreFile;
-
-    if (!this._view?.visible || !this.focusedTaskId) {
-      return;
-    }
-
-    // Membership under owning root (new/removed sibling) requires full subtree snapshot.
-    if (owningRootMembershipChanged(previous, file, this.focusedTaskId)) {
-      this.postSnapshot();
-      return;
-    }
-
-    if (
-      expanded.has(this.focusedTaskId) &&
-      taskRecordsChanged(previous, file, this.focusedTaskId)
-    ) {
-      this.postSnapshot();
-    }
-  }
-
-  handleExternalStoreChange(): void {
-    if (!taskStore) {
-      return;
-    }
-    taskStore.reload();
-    const file = taskStore.getFile();
-    if (file.revision <= lastObservedRevision) {
-      return;
-    }
-    const previous = lastObservedFile;
-    if (!previous) {
-      this.seedObservation(file);
-      return;
-    }
-    // Union-key diff (deletion-aware): a task is affected when any of its
-    // tasks/turns/messages/toolCalls/reasoning records was added, changed, OR removed.
-    const affected = computeAffectedTaskIds(previous, file);
-    this.reprojectChanged(file, affected, previous);
-  }
-
   focusTask(taskId: string): void {
-    this.focusedTaskId = taskId;
-    this.postSnapshot(taskId);
+    void this.transitionFocus(taskId);
   }
 
-  postSnapshot(focusedTaskId?: string): void {
-    if (!taskStore) {
-      return;
+  /**
+   * Flush the previous focused stream (if any), then swap focus/known ids and
+   * post a bounded snapshot. Shared by protocol handlers and presentation links.
+   */
+  private async transitionFocus(nextFocus: string | undefined): Promise<void> {
+    const previous = this.focusedTaskId;
+    if (previous && previous !== nextFocus && taskEngine) {
+      try {
+        await taskEngine.flushPendingTranscriptForTask(previous);
+      } catch {
+        // Best-effort durable flush before handoff.
+      }
     }
+    this.focusedTaskId = nextFocus;
+    this.knownTranscriptIds.clear();
+    await this.hydrateSnapshotAndResumePolling(nextFocus);
+  }
+
+  postSnapshot(focusedTaskId?: string, retryAttempt = 0): void {
+    void this.hydrateSnapshotAndResumePolling(focusedTaskId, retryAttempt);
+  }
+
+  /**
+   * Stop peer patches while a focus/visibility snapshot is in flight. This keeps
+   * first activation and focus transitions from receiving revision batches
+   * against an unhydrated or previous-task reducer state.
+   */
+  private async hydrateSnapshotAndResumePolling(
+    focusedTaskId?: string,
+    retryAttempt = 0,
+  ): Promise<boolean> {
+    this.pollingReady = false;
+    this.revisionPoller?.stop();
+    const hydrated = await this.postSnapshotAsync(focusedTaskId, retryAttempt);
+    if (!hydrated) return false;
+    this.pollingReady = true;
+    if (this._view?.visible && this.windowFocused) {
+      this.revisionPoller?.start();
+    }
+    return true;
+  }
+
+  /**
+   * Awaitable snapshot for poller recovery paths. Resolves after the snapshot is
+   * posted (or retries are exhausted) so lastDataVersion is not committed early.
+   */
+  private postSnapshotAsync(focusedTaskId?: string, retryAttempt = 0): Promise<boolean> {
+    if (!taskRepository) {
+      return Promise.resolve(false);
+    }
+    // Caller is responsible for flushing the previous focus when switching.
+    // Prefer explicit arg; fall back to current host focus (after transitionFocus).
     const focus = focusedTaskId ?? this.focusedTaskId;
-    const snapshot: TaskSnapshot = buildSnapshot(taskStore, focus, activePendingAsks);
-    // Stamp the wire version on the bootstrap message so the webview can detect
-    // host<->webview drift once (and show a reload banner) instead of silently
-    // dropping mismatched messages.
-    this.post({ type: 'snapshot', protocolVersion: PROTOCOL_VERSION, ...snapshot });
-    this.replayPendingElicitations();
-    if (focus) {
-      this.focusedTaskId = focus;
-    }
-    this.seedObservation(taskStore.getFile());
+    const generation = ++this.snapshotGeneration;
+    return buildRepositorySnapshot(taskRepository, repositoryWorkspaceId(), focus, activePendingAsks).then(async (projection) => {
+      if (generation !== this.snapshotGeneration) return false;
+      // A local commit may have completed after the snapshot's final read but
+      // before this continuation ran. Never post an older snapshot after its
+      // patch; rebuild in write order so the webview revision cannot regress.
+      const projectedRevision = taskStore?.getFile().revision;
+      if (
+        projectedRevision !== undefined &&
+        projection.snapshot.storeRevision < projectedRevision
+      ) {
+        // First treat as ordinary race (local commit during snapshot). After
+        // bounded retries, a still-lower repository revision is external reset.
+        if (retryAttempt < 3) {
+          return this.postSnapshotAsync(focus, retryAttempt + 1);
+        }
+        const highWater = Math.max(
+          this.appliedWorkspaceRevision,
+          projectedRevision,
+        );
+        if (projection.snapshot.storeRevision < highWater) {
+          await handlePeerExternalReset();
+          return false;
+        }
+        this.postCommandError('Unable to load task snapshot.');
+        return false;
+      }
+      // Stamp the wire version on the bootstrap message so the webview can detect
+      // host<->webview drift once (and show a reload banner) instead of silently
+      // dropping mismatched messages.
+      this.post({ type: 'snapshot', protocolVersion: PROTOCOL_VERSION, ...projection.snapshot });
+      this.replayPendingElicitations();
+      // The repository normalizes a deleted/stale requested focus to no-focus.
+      // Mirror the accepted snapshot, never the stale request argument.
+      this.focusedTaskId = projection.snapshot.focusedTaskId;
+      // Seed known transcript ids from the bounded focus page only.
+      this.knownTranscriptIds = new Set(
+        (projection.snapshot.transcript ?? []).map((item) => item.id),
+      );
+      // Recovery/bootstrap cursor: poller continues from the accepted snapshot.
+      if (projection.snapshot.storeRevision > this.appliedWorkspaceRevision) {
+        this.appliedWorkspaceRevision = projection.snapshot.storeRevision;
+      }
+      return true;
+    }).catch(async () => {
+      if (generation !== this.snapshotGeneration) return false;
+      if (retryAttempt < 3) {
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 25 * (retryAttempt + 1));
+        });
+        if (generation === this.snapshotGeneration) {
+          return this.postSnapshotAsync(focus, retryAttempt + 1);
+        }
+        return false;
+      }
+      this.postCommandError('Unable to load task snapshot.');
+      return false;
+    });
   }
 
   /** Replay durable elicitation prompts after snapshot / webview resolve. */
@@ -1280,159 +1410,87 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     return true;
   }
 
-  /**
-   * A task is removable only if it is idle or terminal (not actively working)
-   * and it is not the currently focused task. Removability is derived from the
-   * fresh `draft` (via viewStatusFromDraft) so the check is consistent with the
-   * exact bytes a commit is about to write — see the guard-inside-commit note on
-   * handleDeleteTask/handleClearHistory.
-   */
-  private isDraftTaskRemovable(draft: TaskStoreFile, id: string, focus: string | undefined): boolean {
-    if (id === focus) return false;
-    const viewStatus = viewStatusFromDraft(draft, id);
-    return (
-      viewStatus === 'idle' ||
-      viewStatus === 'succeeded' ||
-      viewStatus === 'failed' ||
-      viewStatus === 'cancelled' ||
-      viewStatus === 'skipped'
-    );
-  }
-
-  /** Index children by parent id so whole subtrees can be inspected. */
-  private buildChildrenIndex(tasks: TaskStoreFile['tasks']): Map<string, string[]> {
-    const childrenOf = new Map<string, string[]>();
-    for (const t of Object.values(tasks)) {
-      if (t.parentId) {
-        const list = childrenOf.get(t.parentId);
-        if (list) list.push(t.id);
-        else childrenOf.set(t.parentId, [t.id]);
-      }
-    }
-    return childrenOf;
-  }
-
-  /**
-   * Return every task id in the subtree rooted at `rootId` IF every task in it
-   * is removable; otherwise null. A root can be idle/terminal while a delegated
-   * child is still queued/running, and deleting the subtree would otherwise nuke
-   * that in-flight work — so the whole subtree must be clear before removal.
-   */
-  private removableSubtree(
-    draft: TaskStoreFile,
-    rootId: string,
-    childrenOf: Map<string, string[]>,
-    focus: string | undefined,
-  ): string[] | null {
-    const subtree: string[] = [];
-    const stack: string[] = [rootId];
-    while (stack.length > 0) {
-      const id = stack.pop()!;
-      subtree.push(id);
-      if (!this.isDraftTaskRemovable(draft, id, focus)) return null;
-      for (const child of childrenOf.get(id) ?? []) stack.push(child);
-    }
-    return subtree;
-  }
-
-  /**
-   * Mutate `draft` in place: delete the given task ids and their
-   * turns/messages/toolCalls/reasoning. Called from inside a `commit` callback
-   * (operations/cancelRequests are turn-keyed or ledger; safe to leave).
-   */
-  private applyTaskDeletion(draft: TaskStoreFile, ids: Iterable<string>): void {
-    const idSet = ids instanceof Set ? (ids as Set<string>) : new Set(ids);
-    for (const id of idSet) {
-      delete draft.tasks[id];
-      for (const turnId of Object.keys(draft.turns)) {
-        if (draft.turns[turnId].taskId === id) delete draft.turns[turnId];
-      }
-      for (const msgId of Object.keys(draft.messages)) {
-        if (draft.messages[msgId].taskId === id) delete draft.messages[msgId];
-      }
-      if (draft.toolCalls) {
-        for (const key of Object.keys(draft.toolCalls)) {
-          if (draft.toolCalls[key].taskId === id) delete draft.toolCalls[key];
-        }
-      }
-      if (draft.reasoning) {
-        for (const key of Object.keys(draft.reasoning)) {
-          if (draft.reasoning[key].taskId === id) delete draft.reasoning[key];
-        }
-      }
-    }
-    // ensure optionals exist
-    draft.operations = draft.operations ?? {};
-    draft.cancelRequests = draft.cancelRequests ?? {};
-  }
-
-  /** Surface a failed commit as a command error. Returns true when it failed. */
-  private reportCommitFailure(result: CommitResult): boolean {
-    if (result.ok) return false;
-    this.postCommandError(result.detail ?? `store ${result.reason}`);
-    return true;
-  }
-
-  private handleClearHistory(): void {
-    if (!taskStore) {
+  private async handleClearHistory(): Promise<void> {
+    const repository = taskRepository;
+    if (!repository) {
       this.postCommandError('task store not ready');
       return;
     }
     const focus = this.focusedTaskId;
-    let focusRemoved = false;
-    // Compute removable subtrees INSIDE the commit against the fresh `draft` that
-    // commit re-reads under the store lock. Deciding on the pre-commit snapshot
-    // would be TOCTOU-unsafe: another window could add a delegated descendant or
-    // flip a task to running between the check and the write, orphaning the child
-    // or deleting active work.
-    const result = taskStore.commit((draft) => {
-      const childrenOf = this.buildChildrenIndex(draft.tasks);
-      const toRemove = new Set<string>();
-      for (const task of Object.values(draft.tasks)) {
-        if (task.parentId !== null) continue;
-        const subtree = this.removableSubtree(draft, task.id, childrenOf, focus);
-        if (subtree) for (const id of subtree) toRemove.add(id);
+    let preserveRootTaskId: string | undefined;
+    if (focus) {
+      const tasks = await repository.listTasks(repositoryWorkspaceId());
+      const byId = new Map(tasks.map((task) => [task.id, task]));
+      let current = byId.get(focus);
+      const seen = new Set<string>();
+      while (current?.parentId && !seen.has(current.id)) {
+        seen.add(current.id);
+        current = byId.get(current.parentId);
       }
-      if (toRemove.size === 0) return { ok: true }; // nothing removable — no-op
-      this.applyTaskDeletion(draft, toRemove);
-      if (focus && toRemove.has(focus)) focusRemoved = true;
-      return { ok: true };
+      preserveRootTaskId = current?.id;
+    }
+    const result = await repository.execute({
+      kind: 'clearHistory',
+      workspaceId: repositoryWorkspaceId(),
+      ...(preserveRootTaskId ? { preserveRootTaskId } : {}),
     });
-    if (this.reportCommitFailure(result)) return;
-    if (focusRemoved) this.focusedTaskId = undefined;
-    this.postSnapshot(this.focusedTaskId);
+    if (result.reason && !result.changed) {
+      this.postCommandError(result.reason);
+      return;
+    }
+    if (focus && !(await repository.getTask(focus))) {
+      this.focusedTaskId = undefined;
+      this.knownTranscriptIds.clear();
+      // Focus invalidation after destructive clear — bounded no-focus snapshot.
+      this.postSnapshot(undefined);
+      return;
+    }
+    // Ordinary clearHistory results publish via onAfterCommit patches.
   }
 
-  /** Delete a single top-level task (and its whole subtree) from history. */
-  private handleDeleteTask(taskId: string): void {
-    if (!taskStore) {
+  /** Delete a single top-level task (and its whole subtree) through the repository. */
+  private async handleDeleteTask(taskId: string): Promise<void> {
+    const repository = taskRepository;
+    if (!repository) {
       this.postCommandError('task store not ready');
       return;
     }
     const focus = this.focusedTaskId;
-    let focusRemoved = false;
-    // Validate + delete atomically against the fresh `draft` (see handleClearHistory).
-    const result = taskStore.commit((draft) => {
-      const task = draft.tasks[taskId];
-      if (!task) return { ok: true }; // already gone — no-op
-      if (task.parentId !== null) return { ok: false, reason: 'Only top-level tasks can be deleted.' };
-      const childrenOf = this.buildChildrenIndex(draft.tasks);
-      const subtree = this.removableSubtree(draft, taskId, childrenOf, focus);
-      if (!subtree) {
-        return { ok: false, reason: 'Cannot delete a task while it or a subtask is still running.' };
+    let preserveRootTaskId: string | undefined;
+    if (focus) {
+      const tasks = await repository.listTasks(repositoryWorkspaceId());
+      const byId = new Map(tasks.map((task) => [task.id, task]));
+      let current = byId.get(focus);
+      const seen = new Set<string>();
+      while (current?.parentId && !seen.has(current.id)) {
+        seen.add(current.id);
+        current = byId.get(current.parentId);
       }
-      this.applyTaskDeletion(draft, subtree);
-      if (focus && subtree.includes(focus)) focusRemoved = true;
-      return { ok: true };
+      preserveRootTaskId = current?.id;
+    }
+    const result = await repository.execute({
+      kind: 'deleteTaskSubtreeIfIdle',
+      workspaceId: repositoryWorkspaceId(),
+      rootTaskId: taskId,
+      ...(preserveRootTaskId ? { preserveRootTaskId } : {}),
     });
-    if (this.reportCommitFailure(result)) return;
-    if (focusRemoved) this.focusedTaskId = undefined;
-    this.postSnapshot(this.focusedTaskId);
+    if (result.reason && !result.changed) {
+      this.postCommandError(result.reason, taskId);
+      return;
+    }
+    if (focus && !(await repository.getTask(focus))) {
+      this.focusedTaskId = undefined;
+      this.knownTranscriptIds.clear();
+      this.postSnapshot(undefined);
+      return;
+    }
+    // Ordinary delete results publish via onAfterCommit patches.
   }
 
   /** Rename a task by replacing its goal (the display label). */
-  private handleRenameTask(taskId: string, goal: string): void {
-    if (!taskStore) {
+  private async handleRenameTask(taskId: string, goal: string): Promise<void> {
+    const repository = taskRepository;
+    if (!repository) {
       this.postCommandError('task store not ready');
       return;
     }
@@ -1442,14 +1500,21 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       return;
     }
     const capped = trimmed.length > MAX_MESSAGE_CHARS ? trimmed.slice(0, MAX_MESSAGE_CHARS) : trimmed;
-    const result = taskStore.commit((draft) => {
-      const t = draft.tasks[taskId];
-      if (!t) return { ok: true }; // gone — no-op
-      t.goal = capped;
-      return { ok: true };
+    const current = await repository.getTask(taskId);
+    if (!current) return;
+    const result = await repository.execute({
+      kind: 'renameTask',
+      workspaceId: repositoryWorkspaceId(),
+      taskId,
+      goal: capped,
+      expectedTaskRevision: current.revision,
+      updatedAt: new Date().toISOString(),
     });
-    if (this.reportCommitFailure(result)) return;
-    this.postSnapshot(this.focusedTaskId);
+    if (result.reason && !result.changed) {
+      this.postCommandError(result.reason, taskId);
+      return;
+    }
+    // Rename publishes taskUpserted via onAfterCommit.
   }
 
   /**
@@ -1503,8 +1568,299 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     for (const message of outcome.messages) {
       this.post(message);
     }
-    if (outcome.refreshSnapshot) {
-      this.postSnapshot(outcome.taskId ?? this.focusedTaskId);
+    // Handoff binding updates publish via onAfterCommit patches (no full snapshot).
+  }
+
+  /**
+   * Create the multi-window revision poller once. Polling runs only while the
+   * webview is visible and the VS Code window is focused.
+   */
+  private ensureRevisionPoller(): void {
+    if (this.revisionPoller) return;
+    this.revisionPoller = new WorkspaceRevisionPoller({
+      getStorageDataVersion: async () => {
+        if (!taskRepository) throw new Error('repository unavailable');
+        return taskRepository.getStorageDataVersion();
+      },
+      getWorkspaceRevision: async () => {
+        if (!taskRepository) throw new Error('repository unavailable');
+        return taskRepository.getWorkspaceRevision();
+      },
+      getAppliedRevision: () => this.appliedWorkspaceRevision,
+      isActive: () => Boolean(this._view?.visible) && this.windowFocused && this.pollingReady,
+      onExternalRevisions: async ({ afterRevision, currentRevision }) => {
+        await this.reconcileExternalRevisions(afterRevision, currentRevision);
+      },
+      onRecovery: async (reason) => {
+        if (reason === 'reset') {
+          await handlePeerExternalReset();
+          return;
+        }
+        await this.postSnapshotAsync(this.focusedTaskId);
+      },
+    });
+  }
+
+  /**
+   * Apply peer revisions through the change feed under the same write-order
+   * barrier as local execute→publish so patches cannot interleave mid-batch.
+   */
+  private async reconcileExternalRevisions(
+    afterRevision: number,
+    _currentRevision: number,
+  ): Promise<void> {
+    if (!taskRepository || !taskEngine) return;
+    if (afterRevision < this.appliedWorkspaceRevision) {
+      afterRevision = this.appliedWorkspaceRevision;
+    }
+    const projection = taskEngine.getProjection();
+    if (!projection) {
+      await this.postSnapshotAsync(this.focusedTaskId);
+      return;
+    }
+    const run = async (): Promise<void> => {
+      const result = await reconcileExternalWorkspaceChanges({
+        repository: taskRepository!,
+        projection,
+        afterRevision,
+        focusedTaskId: this.focusedTaskId,
+        knownTranscriptIds: this.knownTranscriptIds,
+      });
+      if (result.kind === 'gap' || result.kind === 'recovery') {
+        this.externalRecoveryCount += 1;
+        await this.postSnapshotAsync(this.focusedTaskId);
+        return;
+      }
+      if (!this._view?.visible || !this.pollingReady) {
+        // No patch was delivered. Visibility recovery owns cursor advancement.
+        return;
+      }
+      for (const batch of result.batches) {
+        if (batch.revision <= this.appliedWorkspaceRevision) continue;
+        for (const patch of batch.patches) {
+          if (patch.type === 'transcriptItemsAppended') {
+            for (const item of patch.items) this.knownTranscriptIds.add(item.id);
+          } else if (patch.type === 'transcriptItemPatched') {
+            this.knownTranscriptIds.add(patch.item.id);
+          } else if (patch.type === 'transcriptItemsRemoved') {
+            for (const itemId of patch.itemIds) this.knownTranscriptIds.delete(itemId);
+          } else if (patch.type === 'taskRemoved' && patch.taskId === this.focusedTaskId) {
+            this.knownTranscriptIds.clear();
+          }
+        }
+        this.post(batch);
+        this.appliedWorkspaceRevision = batch.revision;
+      }
+      if (result.appliedRevision > this.appliedWorkspaceRevision) {
+        this.appliedWorkspaceRevision = result.appliedRevision;
+      }
+    };
+    if (typeof taskRepository.runConsistentRead === 'function') {
+      await taskRepository.runConsistentRead(run);
+    } else {
+      await run();
+    }
+  }
+
+  disposeRevisionPoller(): void {
+    this.revisionPoller?.dispose();
+    this.revisionPoller = undefined;
+    this.pollingReady = false;
+    this.windowStateSub?.dispose();
+    this.windowStateSub = undefined;
+  }
+
+  /** Keep both independent Electron processes polling while CI cannot focus both. */
+  forcePollingActiveForUat(): UatHostState {
+    this.uatFocusGateOverridden = true;
+    this.windowFocused = true;
+    if (this._view?.visible && this.pollingReady) {
+      this.revisionPoller?.start();
+    }
+    return this.hostStateForUat();
+  }
+
+  /** Read only the real engine projection/poller state; never query SQLite here. */
+  hostStateForUat(): UatHostState {
+    const file = taskEngine?.getProjection()?.getFile();
+    const taskIds = Object.keys(file?.tasks ?? {}).sort();
+    const messageIdsByTask: Record<string, string[]> = Object.fromEntries(
+      taskIds.map((taskId) => [taskId, []]),
+    );
+    const queuedTurnIdsByTask: Record<string, string[]> = Object.fromEntries(
+      taskIds.map((taskId) => [taskId, []]),
+    );
+    for (const message of Object.values(file?.messages ?? {})) {
+      (messageIdsByTask[message.taskId] ??= []).push(message.id);
+    }
+    for (const turn of Object.values(file?.turns ?? {})) {
+      if (turn.status === 'queued') {
+        (queuedTurnIdsByTask[turn.taskId] ??= []).push(turn.id);
+      }
+    }
+    for (const ids of Object.values(messageIdsByTask)) ids.sort();
+    for (const ids of Object.values(queuedTurnIdsByTask)) ids.sort();
+    return {
+      projectionRevision: file?.revision ?? 0,
+      appliedWorkspaceRevision: this.appliedWorkspaceRevision,
+      taskIds,
+      messageIdsByTask,
+      queuedTurnIdsByTask,
+      knownTranscriptIds: [...this.knownTranscriptIds].sort(),
+      ...(this.focusedTaskId ? { focusedTaskId: this.focusedTaskId } : {}),
+      viewResolved: Boolean(this._view),
+      viewVisible: Boolean(this._view?.visible),
+      pollingReady: this.pollingReady,
+      pollCount: this.revisionPoller?.getPollCount() ?? 0,
+      externalRecoveryCount: this.externalRecoveryCount,
+      focusGateOverridden: this.uatFocusGateOverridden,
+    };
+  }
+
+  async focusTaskForUat(taskId: string | undefined): Promise<UatHostState> {
+    await this.transitionFocus(taskId);
+    return this.hostStateForUat();
+  }
+
+  /** Exercise the production loadTranscriptPage route against a real focused view. */
+  async loadOlderTranscriptForUat(taskId: string, limit = 2): Promise<{
+    latestIds: string[];
+    olderIds: string[];
+    hasMoreBeforeLatest: boolean;
+    hasMoreBeforeOlder: boolean;
+    workspaceRevision: number;
+  }> {
+    if (!taskRepository) throw new Error('UAT repository unavailable');
+    const latest = await taskRepository.getTranscriptPage(taskId, undefined, limit);
+    if (!latest.beforeCursor) {
+      return {
+        latestIds: latest.items.map((item) => item.id),
+        olderIds: [],
+        hasMoreBeforeLatest: latest.hasMoreBefore,
+        hasMoreBeforeOlder: false,
+        workspaceRevision: latest.workspaceRevision,
+      };
+    }
+    const repository = taskRepository;
+    const outcome = await routeLoadTranscriptPage(
+      {
+        type: 'loadTranscriptPage',
+        requestId: 'uat-live-older-page',
+        taskId,
+        beforeCursor: latest.beforeCursor,
+      },
+      {
+        getFocused: () => ({
+          taskId: this.focusedTaskId,
+          generation: this.snapshotGeneration,
+        }),
+        getTask: (id) => repository.getTask(id),
+        getTranscriptPage: (id, beforeCursor, pageLimit) =>
+          repository.getTranscriptPage(id, beforeCursor, pageLimit),
+      },
+    );
+    if (outcome.kind !== 'message') {
+      throw new Error('UAT transcript route failed: silent');
+    }
+    if (!outcome.message.ok) {
+      throw new Error(`UAT transcript route failed: ${outcome.message.code}`);
+    }
+    this.post(outcome.message);
+    for (const item of outcome.message.items) this.knownTranscriptIds.add(item.id);
+    return {
+      latestIds: latest.items.map((item) => item.id),
+      olderIds: outcome.message.items.map((item) => item.id),
+      hasMoreBeforeLatest: latest.hasMoreBefore,
+      hasMoreBeforeOlder: outcome.message.transcriptPage.hasMoreBefore,
+      workspaceRevision: outcome.message.transcriptPage.workspaceRevision,
+    };
+  }
+
+  /**
+   * Protocol v8 recovery: webview observed a revision gap/invariant failure.
+   * Validate exact keys and return a bounded snapshot. Protocol mismatch still
+   * requires Reload Window and is not handled here.
+   */
+  private handleRequestWorkspaceRecovery(data: unknown): void {
+    if (!data || typeof data !== 'object') return;
+    const msg = data as Record<string, unknown>;
+    if (msg.type !== 'requestWorkspaceRecovery') return;
+    const keys = Object.keys(msg);
+    const allowed = new Set(['type', 'taskId', 'currentRevision', 'observedRevision']);
+    if (keys.some((k) => !allowed.has(k))) return;
+    if (
+      typeof msg.currentRevision !== 'number' ||
+      !Number.isFinite(msg.currentRevision) ||
+      !Number.isSafeInteger(msg.currentRevision) ||
+      msg.currentRevision < 0
+    ) {
+      return;
+    }
+    if (
+      typeof msg.observedRevision !== 'number' ||
+      !Number.isFinite(msg.observedRevision) ||
+      !Number.isSafeInteger(msg.observedRevision) ||
+      msg.observedRevision < 0
+    ) {
+      return;
+    }
+    if (msg.taskId !== undefined) {
+      if (typeof msg.taskId !== 'string' || msg.taskId.length === 0 || msg.taskId.length > 512) {
+        return;
+      }
+      if (msg.taskId.includes('\0')) return;
+    }
+    const focus =
+      typeof msg.taskId === 'string' && msg.taskId.length > 0
+        ? msg.taskId
+        : this.focusedTaskId;
+    this.postSnapshot(focus);
+  }
+
+  /**
+   * Load one bounded older transcript page for the focused task (protocol v7).
+   * Valid failures post transcriptPageResult with fixed codes — never commandError.
+   */
+  private async handleLoadTranscriptPage(data: unknown): Promise<void> {
+    if (!taskRepository) {
+      // Repository not ready is unavailable (not taskNotFound). getTask throws so
+      // the pure route maps the failure after safe correlation validation.
+      const outcome = await routeLoadTranscriptPage(data, {
+        getFocused: () => ({
+          taskId: this.focusedTaskId,
+          generation: this.snapshotGeneration,
+        }),
+        getTask: async () => {
+          throw new Error('task repository not ready');
+        },
+        getTranscriptPage: async () => {
+          throw new Error('task repository not ready');
+        },
+      });
+      if (outcome.kind === 'message') this.post(outcome.message);
+      return;
+    }
+    const repository = taskRepository;
+    const outcome = await routeLoadTranscriptPage(data, {
+      getFocused: () => ({
+        taskId: this.focusedTaskId,
+        generation: this.snapshotGeneration,
+      }),
+      getTask: (taskId: string) => repository.getTask(taskId),
+      getTranscriptPage: (taskId: string, beforeCursor: string, limit: number) =>
+        repository.getTranscriptPage(taskId, beforeCursor, limit),
+    });
+    if (outcome.kind === 'message') {
+      this.post(outcome.message);
+      if (
+        outcome.message.type === 'transcriptPageResult' &&
+        outcome.message.ok === true &&
+        outcome.message.taskId === this.focusedTaskId
+      ) {
+        for (const item of outcome.message.items) {
+          this.knownTranscriptIds.add(item.id);
+        }
+      }
     }
   }
 
@@ -1513,13 +1869,12 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
    * never mutates task-store state. Cancel is intentionally silent.
    */
   private async handleExportTask(data: unknown): Promise<void> {
-    if (!taskStore) {
+    if (!taskRepository) {
       this.postCommandError('task store not ready');
       return;
     }
-    const store = taskStore;
     const outcome = await routeExportTask(data, {
-      getStoreFile: () => store.getFile(),
+      getRepository: () => taskRepository!,
       showSaveDialog: async ({ defaultFileName }) => {
         const defaultUri = workspaceRoot
           ? vscode.Uri.file(path.join(workspaceRoot, defaultFileName))
@@ -1574,183 +1929,161 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     return undefined;
   }
 
-  private async handleSend(data: {
-    taskId?: string;
-    text: string;
-    /** Expanded mention paths for the agent; defaults to `text`. */
-    llmText?: string;
-    backend?: string;
-    model?: string;
-    continuationOf?: string;
-    /** Structured skill chips for a NEW task's first-turn injection. */
-    skills?: string[];
-    clientRequestId?: string;
-  }): Promise<void> {
-    const clientRequestId =
-      typeof data.clientRequestId === 'string' && data.clientRequestId.trim()
-        ? data.clientRequestId.trim()
-        : undefined;
-    if (!taskEngine || !taskStore) {
-      if (clientRequestId) {
-        this.post({
-          type: 'sendRejected',
-          clientRequestId,
-          taskId: data.taskId,
-          reason: 'task engine not ready',
-          code: 'store',
-        });
-      } else {
-        this.postCommandError('task engine not ready');
-      }
+  private async handleSend(data: HostSendRequest): Promise<void> {
+    // Strict parser requires clientRequestId — always durable path.
+    const clientRequestId = data.clientRequestId.trim();
+    if (!taskEngine || !taskStore || !taskRepository) {
+      this.post({
+        type: 'sendRejected',
+        clientRequestId,
+        taskId: data.taskId,
+        reason: 'task engine not ready',
+        code: 'store',
+      });
       return;
     }
     if (data.backend !== undefined && !WEBVIEW_BACKENDS.has(data.backend)) {
-      if (clientRequestId) {
-        this.post({
-          type: 'sendRejected',
-          clientRequestId,
-          taskId: data.taskId,
-          reason: 'unknown backend',
-          code: 'validation',
-        });
-      } else {
-        this.postCommandError('unknown backend', data.taskId);
-      }
+      this.post({
+        type: 'sendRejected',
+        clientRequestId,
+        taskId: data.taskId,
+        reason: 'unknown backend',
+        code: 'validation',
+      });
       return;
     }
     // `text` = user-visible (display-name chips). `llmText` = agent payload when expanded.
     const text = data.text?.trim();
     if (!text) {
-      if (clientRequestId) {
-        this.post({
-          type: 'sendRejected',
-          clientRequestId,
-          taskId: data.taskId,
-          reason: 'message cannot be empty',
-          code: 'validation',
-        });
-      } else {
-        this.postCommandError('message cannot be empty', data.taskId);
-      }
+      this.post({
+        type: 'sendRejected',
+        clientRequestId,
+        taskId: data.taskId,
+        reason: 'message cannot be empty',
+        code: 'validation',
+      });
       return;
     }
-    if (text.length > MAX_MESSAGE_CHARS) {
-      if (clientRequestId) {
-        this.post({
-          type: 'sendRejected',
-          clientRequestId,
-          taskId: data.taskId,
-          reason: 'message too long',
-          code: 'validation',
-        });
-      } else {
-        this.postCommandError('message too long', data.taskId);
-      }
-      return;
-    }
+
     const llmText =
       typeof data.llmText === 'string' && data.llmText.trim() ? data.llmText.trim() : text;
-    if (llmText.length > MAX_MESSAGE_CHARS) {
-      if (clientRequestId) {
-        this.post({
-          type: 'sendRejected',
-          clientRequestId,
-          taskId: data.taskId,
-          reason: 'message too long',
-          code: 'validation',
-        });
-      } else {
-        this.postCommandError('message too long', data.taskId);
+
+    const now = new Date().toISOString();
+    const entry = {
+      clientRequestId,
+      status: 'pending' as const,
+      ...(data.taskId ? { taskId: data.taskId } : {}),
+      payload: {
+        version: 1 as const,
+        text,
+        ...(typeof data.llmText === 'string' && data.llmText.trim()
+          ? { llmText: data.llmText.trim() }
+          : {}),
+        ...(Array.isArray(data.mentionBindings) ? { mentionBindings: data.mentionBindings } : {}),
+        ...(Array.isArray(data.skills) ? { skills: data.skills } : {}),
+        ...(typeof data.backend === 'string' ? { backend: data.backend } : {}),
+        ...(typeof data.model === 'string' ? { model: data.model } : {}),
+        ...(typeof data.continuationOf === 'string'
+          ? { continuationOf: data.continuationOf }
+          : {}),
+      },
+      createdAt: now,
+      updatedAt: now,
+    };
+    await runDurableHostSend(
+      {
+        repository: taskRepository,
+        workspaceId: repositoryWorkspaceId(),
+        postMessage: (msg) => this.post(msg),
+        clearOutbox: (id) => this.clearDurableOutbox(id),
+        rejectOutbox: (id) => this.rejectDurableOutbox(id),
+        publishProjection: (taskId) => {
+          this.postSnapshot(taskId);
+        },
+        performSend: async () => this.performDurableSend(data, text, llmText, clientRequestId),
+      },
+      {
+        clientRequestId,
+        ...(data.taskId ? { taskId: data.taskId } : {}),
+        text,
+        entry,
+      },
+    );
+  }
+
+  /**
+   * Engine send after durable outbox commit.
+   * Must not post sendAccepted/sendRejected — coordinator owns ACK control flow.
+   * New-task success sets snapshotTaskId for one initial snapshot; existing-task
+   * relies on post-commit workspace patches (no extra snapshot).
+   */
+  private async performDurableSend(
+    data: HostSendRequest,
+    text: string,
+    llmText: string,
+    clientRequestId: string,
+  ): Promise<
+    | {
+        ok: true;
+        value: {
+          taskId: string;
+          messageId: string;
+          turnId?: string;
+          snapshotTaskId?: string;
+        };
       }
-      return;
+    | { ok: false; reason: string; code?: 'store' | 'validation' | 'conflict' | 'capacity' | 'unknown' }
+  > {
+    if (!taskEngine || !taskStore) {
+      return { ok: false, reason: 'task engine not ready', code: 'store' };
+    }
+    if (text.length > MAX_MESSAGE_CHARS || llmText.length > MAX_MESSAGE_CHARS) {
+      return { ok: false, reason: 'message too long', code: 'validation' };
     }
 
     if (!data.taskId) {
       if (data.continuationOf) {
         const continuationError = this.validateContinuationOf(data.continuationOf);
         if (continuationError) {
-          if (clientRequestId) {
-            this.post({
-              type: 'sendRejected',
-              clientRequestId,
-              reason: continuationError,
-              code: 'validation',
-            });
-          } else {
-            this.postCommandError(continuationError);
-          }
-          return;
+          return { ok: false, reason: continuationError, code: 'validation' };
         }
       }
 
-      // Goal from display text so task titles stay short (not absolute temp paths).
       const shortGoal = text.length <= 30 ? text : text.slice(0, 30).trim() + '…';
       const resolvedBackend = data.backend ?? 'claude';
       const resolvedModel =
         typeof data.model === 'string' && data.model ? data.model : undefined;
-      // DEBUG: temporary — remove after diagnosing grok→claude draft send.
-      console.info('[muster][host-send]', {
-        inboundBackend: data.backend,
-        inboundModel: data.model,
-        resolvedBackend,
-        resolvedModel: resolvedModel ?? null,
-        usedDefaultBackend: data.backend === undefined,
-      });
-
-      const result = taskEngine.startNewTask({
+      const result = await taskEngine.startNewTask({
         goal: shortGoal,
         message: text,
         agentMessage: llmText !== text ? llmText : undefined,
         backend: resolvedBackend,
         model: resolvedModel,
         continuationOf: data.continuationOf,
-        // Skills are first-turn-only; startNewTask ignores them for continuations.
         ...(Array.isArray(data.skills) && data.skills.length ? { skills: data.skills } : {}),
-        // Capture the workspace cwd at task-creation time so every turn (and any
-        // delegated child) runs in the right directory instead of process.cwd().
         cwd: resolveTaskCwd(),
         clientRequestId,
       });
       if (!result.ok) {
-        if (clientRequestId) {
-          const code = /conflict/i.test(result.reason)
-            ? 'conflict'
-            : /capacity|maxTurns|turn cap/i.test(result.reason)
-              ? 'capacity'
-              : 'unknown';
-          this.post({
-            type: 'sendRejected',
-            clientRequestId,
-            reason: result.reason,
-            code,
-          });
-        } else {
-          this.postCommandError(result.reason);
-        }
-        return;
+        const code = /conflict/i.test(result.reason)
+          ? 'conflict'
+          : /capacity|maxTurns|turn cap/i.test(result.reason)
+            ? 'capacity'
+            : 'unknown';
+        return { ok: false, reason: result.reason, code };
       }
-      console.info('[muster][host-send] task created', {
-        taskId: result.value.taskId,
-        backend: resolvedBackend,
-        model: resolvedModel ?? null,
-      });
       this.focusedTaskId = result.value.taskId;
-      if (clientRequestId) {
-        this.post({
-          type: 'sendAccepted',
-          clientRequestId,
+      return {
+        ok: true,
+        value: {
           taskId: result.value.taskId,
           messageId: result.value.messageId,
           turnId: result.value.turnId,
-        });
-      }
-      this.postSnapshot(result.value.taskId);
-      return;
+          snapshotTaskId: result.value.taskId,
+        },
+      };
     }
 
-    // Existing task: if the composer picker asked for a different backend/model,
-    // atomically switch first, then send on the rebound binding. This covers
-    // cases where picker change did not fire requestRuntimeHandoff beforehand.
     const existing = taskStore.getTask(data.taskId);
     if (existing && data.backend && WEBVIEW_BACKENDS.has(data.backend)) {
       const targetModel =
@@ -1762,11 +2095,6 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       const bindingDiffers =
         existing.backend !== data.backend || currentModel !== targetModel;
       if (bindingDiffers) {
-        console.info('[muster][host-send] handoff-before-send', {
-          taskId: data.taskId,
-          from: { backend: existing.backend, model: currentModel ?? null },
-          to: { backend: data.backend, model: targetModel ?? null },
-        });
         await this.handleRequestRuntimeHandoff({
           type: 'requestRuntimeHandoff',
           taskId: data.taskId,
@@ -1779,80 +2107,95 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             ? after.model.trim()
             : undefined;
         if (!after || after.backend !== data.backend || afterModel !== targetModel) {
-          const reason =
-            'Model switch did not commit; message was not sent on the previous backend.';
-          if (clientRequestId) {
-            this.post({
-              type: 'sendRejected',
-              clientRequestId,
-              taskId: data.taskId,
-              reason,
-              code: 'unknown',
-            });
-          } else {
-            this.postCommandError(reason, data.taskId);
-          }
-          return;
+          return {
+            ok: false,
+            reason:
+              'Model switch did not commit; message was not sent on the previous backend.',
+            code: 'unknown',
+          };
         }
       }
     }
 
-    const result = taskEngine.send(data.taskId, text, {
+    const result = await taskEngine.sendAsync(data.taskId, text, {
       agentContent: llmText !== text ? llmText : undefined,
       clientRequestId,
     });
     if (!result.ok) {
-      if (clientRequestId) {
-        const code = /conflict/i.test(result.reason)
-          ? 'conflict'
-          : /capacity|maxTurns|turn cap/i.test(result.reason)
-            ? 'capacity'
-            : 'unknown';
-        this.post({
-          type: 'sendRejected',
-          clientRequestId,
-          taskId: data.taskId,
-          reason: result.reason,
-          code,
-        });
-      } else {
-        this.postCommandError(result.reason, data.taskId);
-      }
-      return;
+      const code = /conflict/i.test(result.reason)
+        ? 'conflict'
+        : /capacity|maxTurns|turn cap/i.test(result.reason)
+          ? 'capacity'
+          : 'unknown';
+      return { ok: false, reason: result.reason, code };
     }
-    if (clientRequestId && result.value.messageId) {
-      this.post({
-        type: 'sendAccepted',
-        clientRequestId,
+    if (!result.value.messageId) {
+      return { ok: false, reason: 'send completed without message id', code: 'store' };
+    }
+    // Existing task: no snapshotTaskId — workspace patches already update UI.
+    return {
+      ok: true,
+      value: {
         taskId: data.taskId,
         messageId: result.value.messageId,
         turnId: result.value.turnId,
-      });
-    }
-    // Only project into chat when the turn is not a FIFO follow-up still sitting
-    // in the queue. Queued messages appear in the queue panel only; they enter
-    // chat when the turn promotes to running (snapshot rebuild).
-    if (data.taskId === this.focusedTaskId && this.shouldAppendSendToTranscript(result.value.turnId)) {
-      const item = this.transcriptItemFromMessage(result.value.messageId);
-      if (item) {
-        this.post({ type: 'transcriptAppend', taskId: data.taskId, item });
-      }
-    }
-    // Always refresh so queue panel / turn activity / binding labels update.
-    this.postSnapshot(data.taskId ?? this.focusedTaskId);
+      },
+    };
   }
 
-  /**
-   * True when a newly created turn should appear in chat immediately.
-   * Queued FIFO follow-ups stay out of chat (queue panel + snapshot.previewText only)
-   * until the turn promotes to running (turnStart / snapshot rebuild).
-   */
-  private shouldAppendSendToTranscript(turnId: string | undefined): boolean {
-    if (!turnId || !taskStore) {
-      return false;
+  /** Mark durable outbox rejected after put — every reject path after durable put. */
+  private async rejectDurableOutbox(clientRequestId: string): Promise<void> {
+    if (!taskRepository) return;
+    try {
+      await taskRepository.execute({
+        kind: 'markSendOutboxRejected',
+        workspaceId: repositoryWorkspaceId(),
+        clientRequestId,
+        updatedAt: new Date().toISOString(),
+      });
+    } catch {
+      // still surface rejection to webview
     }
-    const turn = taskStore.getFile().turns[turnId];
-    return Boolean(turn && turn.status !== 'queued');
+  }
+
+  /** Delete durable outbox after successful send (new-task and existing-task). */
+  private async clearDurableOutbox(clientRequestId: string): Promise<void> {
+    if (!taskRepository) return;
+    try {
+      await taskRepository.execute({
+        kind: 'deleteSendOutbox',
+        workspaceId: repositoryWorkspaceId(),
+        clientRequestId,
+      });
+    } catch {
+      // Keep outbox so reload can de-dupe via send receipt + clientRequestId.
+    }
+  }
+
+  /** Push durable SQLite outbox entries so webview can restore drafts after reload. */
+  private async postSendOutboxSnapshot(): Promise<void> {
+    if (!taskRepository) return;
+    try {
+      const entries = await taskRepository.listSendOutbox();
+      this.post({
+        type: 'sendOutboxSnapshot',
+        entries: entries.map((entry) => ({
+          clientRequestId: entry.clientRequestId,
+          status: entry.status,
+          taskId: entry.taskId,
+          text: entry.payload.text,
+          llmText: entry.payload.llmText,
+          mentionBindings: entry.payload.mentionBindings,
+          skills: entry.payload.skills,
+          backend: entry.payload.backend,
+          model: entry.payload.model,
+          continuationOf: entry.payload.continuationOf,
+          createdAt: Date.parse(entry.createdAt) || Date.now(),
+        })),
+      });
+    } catch {
+      // best-effort restore
+    }
   }
 
   /**
@@ -1873,7 +2216,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           return !!turn && turn.status !== 'queued';
         })());
     if (stale) {
-      this.postSnapshot(taskId ?? this.focusedTaskId);
+      // Race with drain: durable state already published via patches if changed.
       return;
     }
     this.postCommandError(message, taskId);
@@ -1885,6 +2228,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     _token: vscode.CancellationToken,
   ) {
     this._view = webviewView;
+    this.windowFocused = vscode.window.state.focused;
+    this.pollingReady = false;
 
     webviewView.webview.options = {
       enableScripts: true,
@@ -1893,13 +2238,34 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
 
     webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
 
+    this.ensureRevisionPoller();
+    this.windowStateSub?.dispose();
+    this.windowStateSub = vscode.window.onDidChangeWindowState((state) => {
+      this.windowFocused = this.uatFocusGateOverridden || state.focused;
+      if (this.windowFocused && webviewView.visible && this.pollingReady) {
+        this.revisionPoller?.start();
+      } else if (!this.windowFocused) {
+        this.revisionPoller?.stop();
+      }
+    });
+
     webviewView.onDidChangeVisibility(() => {
       if (webviewView.visible) {
-        this.postSnapshot(this.focusedTaskId);
+        // Snapshot delivery establishes the cursor for every local/external
+        // revision missed while hidden. Start polling only after that recovery
+        // completes so patches cannot race ahead of the authoritative hydrate.
+        void this.hydrateSnapshotAndResumePolling(this.focusedTaskId);
+      } else {
+        this.pollingReady = false;
+        this.revisionPoller?.stop();
       }
     });
 
     webviewView.webview.onDidReceiveMessage(async (data) => {
+      if (maintenanceActive && data?.type !== 'debugLog' && data?.type !== 'ready') {
+        this.postCommandError('Muster storage maintenance is in progress. Try again after reload.');
+        return;
+      }
       if (data?.type === 'debugLog') {
         debugMuster(
           typeof data.event === 'string' ? data.event : 'webview.debug',
@@ -1938,23 +2304,36 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         });
       }
       switch (data?.type) {
-        case 'send':
-          await this.handleSend(data);
+        case 'send': {
+          const parsed = parseHostSendRequest(data);
+          if (!parsed.ok) {
+            if (parsed.clientRequestId) {
+              this.post({
+                type: 'sendRejected',
+                clientRequestId: parsed.clientRequestId,
+                ...(parsed.taskId ? { taskId: parsed.taskId } : {}),
+                reason: 'invalid send request',
+                code: 'validation',
+              });
+            } else {
+              this.postCommandError('invalid send request');
+            }
+            break;
+          }
+          await this.handleSend(parsed.value);
           break;
+        }
         case 'newTask':
-          this.focusedTaskId = undefined;
-          this.postSnapshot(undefined);
+          await this.transitionFocus(undefined);
           break;
         case 'focusTask':
           if (typeof data.taskId === 'string') {
-            this.focusedTaskId = data.taskId;
-            this.postSnapshot(data.taskId);
+            await this.transitionFocus(data.taskId);
           }
           break;
         case 'hydrateSubtree':
           if (typeof data.taskId === 'string') {
-            this.focusedTaskId = data.taskId;
-            this.postSnapshot(data.taskId);
+            await this.transitionFocus(data.taskId);
           }
           break;
         case 'cancelTurn':
@@ -1973,7 +2352,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
               break;
             }
             const sessionId = turn.observedSessionId;
-            const result = taskEngine.interruptTurn(data.turnId);
+            const result = await taskEngine.interruptTurnAsync(data.turnId);
             if (!result.ok) {
               this.postCommandError(result.reason, data.taskId);
             } else if (sessionId) {
@@ -1982,7 +2361,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           }
           break;
         case 'retryTurn':
-          if (!taskEngine || !taskStore) {
+          if (!taskEngine) {
             this.postCommandError('task engine not ready');
             break;
           }
@@ -2004,12 +2383,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
               this.postCommandError('instruction too long', data.taskId);
               break;
             }
-            const turn = taskStore.getFile().turns[data.turnId];
-            if (!turn || turn.taskId !== data.taskId) {
-              this.postCommandError('turn does not belong to task', data.taskId);
-              break;
-            }
-            const result = taskEngine.retryTurn(data.turnId, effectiveInstruction, {
+            const result = await taskEngine.retryTurnAsync(data.taskId, data.turnId, effectiveInstruction, {
               reuseOriginalInputs,
             });
             if (!result.ok) {
@@ -2036,20 +2410,12 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
               this.postCommandError('instruction too long', data.taskId);
               break;
             }
-            const result = taskEngine.continueTaskWithMessage(data.taskId, instruction);
+            const result = await taskEngine.sendAsync(data.taskId, instruction);
             if (!result.ok) {
               this.postCommandError(result.reason, data.taskId);
               break;
             }
-            if (
-              data.taskId === this.focusedTaskId &&
-              this.shouldAppendSendToTranscript(result.value.turnId)
-            ) {
-              const item = this.transcriptItemFromMessage(result.value.messageId);
-              if (item) {
-                this.post({ type: 'transcriptAppend', taskId: data.taskId, item });
-              }
-            }
+            // Transcript/queue publish via onAfterCommit workspacePatchBatch.
           }
           break;
         case 'sendLiveInput': {
@@ -2076,57 +2442,54 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             this.postCommandError('instruction too long', taskId);
             break;
           }
-          const result = engine.interruptAndSend(taskId, instruction);
+          const result = await engine.interruptAndSendAsync(taskId, instruction);
           if (!result.ok) {
             this.postCommandError(result.reason, taskId);
             break;
           }
-          this.postSnapshot(taskId);
+          // Queue/activity publish via onAfterCommit.
           break;
         }
         case 'editQueuedTurn': {
           // R013: edit undispatched queued follow-up by turn identity.
           // Validate + engine.editQueuedTurn only; never continueTask fallthrough.
           const engine = taskEngine;
-          const outcome = routeEditQueuedTurn(data, {
+          const outcome = await routeEditQueuedTurn(data, {
             engineReady: Boolean(engine),
-            editQueuedTurn: (taskId, turnId, content) => {
+            editQueuedTurn: async (taskId, turnId, content) => {
               if (!engine) {
                 return { ok: false, reason: 'task engine not ready' };
               }
-              return engine.editQueuedTurn(taskId, turnId, content);
+              return engine.editQueuedTurnAsync(taskId, turnId, content);
             },
           });
           if (outcome.kind === 'error') {
             this.handleQueuedMutationOutcome(outcome.message, outcome.taskId, data?.turnId);
-          } else {
-            // Always reproject so queue panel / previewText stay authoritative.
-            this.postSnapshot(outcome.taskId ?? this.focusedTaskId);
           }
+          // Success: queuedTurnsChanged via onAfterCommit.
           break;
         }
         case 'deleteQueuedTurn': {
           // R013: remove undispatched queued follow-up by turn identity.
           // Validate + engine.deleteQueuedTurn only; never cancelProcess.
           const engine = taskEngine;
-          const outcome = routeDeleteQueuedTurn(data, {
+          const outcome = await routeDeleteQueuedTurn(data, {
             engineReady: Boolean(engine),
-            deleteQueuedTurn: (taskId, turnId) => {
+            deleteQueuedTurn: async (taskId, turnId) => {
               if (!engine) {
                 return { ok: false, reason: 'task engine not ready' };
               }
-              return engine.deleteQueuedTurn(taskId, turnId);
+              return engine.deleteQueuedTurnAsync(taskId, turnId);
             },
           });
           if (outcome.kind === 'error') {
             this.handleQueuedMutationOutcome(outcome.message, outcome.taskId, data?.turnId);
-          } else {
-            this.postSnapshot(outcome.taskId ?? this.focusedTaskId);
           }
+          // Success: queuedTurnsChanged via onAfterCommit.
           break;
         }
         case 'resumeQueuedTurn':
-          if (!taskEngine || !taskStore) {
+          if (!taskEngine) {
             this.postCommandError('task engine not ready');
             break;
           }
@@ -2135,12 +2498,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             break;
           }
           {
-            const turn = taskStore.getFile().turns[data.turnId];
-            if (!turn || turn.taskId !== data.taskId) {
-              this.postCommandError('turn does not belong to task', data.taskId);
-              break;
-            }
-            const result = taskEngine.resumeQueuedTurn(data.turnId);
+            const result = await taskEngine.resumeQueuedTurnAsync(data.taskId, data.turnId);
             if (!result.ok) {
               this.postCommandError(result.reason, data.taskId);
             }
@@ -2170,8 +2528,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           // setTaskLifecycle routes 'skipped' → skipTask and 'cancelled' is handled here.
           const result =
             lifecycle === 'cancelled'
-              ? taskEngine.cancelTask(data.taskId)
-              : taskEngine.setTaskLifecycle(data.taskId, lifecycle, {
+              ? await taskEngine.cancelTaskAsync(data.taskId)
+              : await taskEngine.setTaskLifecycleAsync(data.taskId, lifecycle, {
                   result: typeof data.result === 'string' ? data.result : undefined,
                   error: typeof data.error === 'string' ? data.error : undefined,
                 });
@@ -2186,7 +2544,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             );
             const sessionId = live?.observedSessionId;
             if (sessionId) elicitationBridge?.cancelForSession(sessionId);
-            this.postSnapshot(this.focusedTaskId ?? data.taskId);
+            // Lifecycle patches publish via onAfterCommit.
           }
           break;
         }
@@ -2211,10 +2569,10 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
               });
               break;
             }
-            const result = taskEngine?.submitAskAnswer(
+            const result = taskEngine ? await taskEngine.submitAskAnswer(
               { taskId: data.taskId, turnId: data.turnId, askId: data.askId },
               data.answers,
-            );
+            ) : undefined;
             if (!result || !result.ok) {
               const message = result?.reason ?? 'task engine unavailable';
               debugElicitation('host.ask_submit_rejected', {
@@ -2358,11 +2716,11 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             typeof data.turnId === 'string' &&
             typeof data.askId === 'string'
           ) {
-            const result = taskEngine?.cancelAskTurn({
+            const result = taskEngine ? await taskEngine.cancelAskTurn({
               taskId: data.taskId,
               turnId: data.turnId,
               askId: data.askId,
-            });
+            }) : undefined;
             if (!result || !result.ok) {
               const message = result?.reason ?? 'task engine unavailable';
               this.postCommandError(message, data.taskId);
@@ -2441,29 +2799,45 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           this.handleOpenLink(data.url);
           break;
         case 'clearHistory':
-          this.handleClearHistory();
+          await this.handleClearHistory();
           break;
         case 'deleteTask':
           if (typeof data.taskId === 'string') {
-            this.handleDeleteTask(data.taskId);
+            await this.handleDeleteTask(data.taskId);
           }
           break;
         case 'renameTask':
           if (typeof data.taskId === 'string' && typeof data.goal === 'string') {
-            this.handleRenameTask(data.taskId, data.goal);
+            await this.handleRenameTask(data.taskId, data.goal);
           }
           break;
         case 'exportTask':
           await this.handleExportTask(data);
           break;
+        case 'loadTranscriptPage':
+          await this.handleLoadTranscriptPage(data);
+          break;
+        case 'requestWorkspaceRecovery':
+          this.handleRequestWorkspaceRecovery(data);
+          break;
         case 'requestRuntimeHandoff':
           await this.handleRequestRuntimeHandoff(data);
           break;
-        case 'blurTask':
-          // Webview returned to the task list; drop the host-side focus so a
+        case 'blurTask': {
+          // Webview returned to the task list; flush then drop host-side focus so a
           // later snapshot (e.g. after Clear history) doesn't re-open a stale chat.
+          const previous = this.focusedTaskId;
+          if (previous && taskEngine) {
+            try {
+              await taskEngine.flushPendingTranscriptForTask(previous);
+            } catch {
+              // best-effort
+            }
+          }
           this.focusedTaskId = undefined;
+          this.knownTranscriptIds.clear();
           break;
+        }
         case 'requestSettings':
           this.postSettingsSnapshot();
           this.postTaskTypesSettingsSnapshot();
@@ -2496,6 +2870,30 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         case 'setComposerSelection':
           this.handleSetComposerSelection(data);
           break;
+        case 'ackSendOutbox': {
+          const keys =
+            typeof data === 'object' && data !== null && !Array.isArray(data)
+              ? Object.keys(data as Record<string, unknown>)
+              : [];
+          const rawId = (data as { clientRequestId?: unknown })?.clientRequestId;
+          const id =
+            keys.length === 2 &&
+            keys.includes('type') &&
+            keys.includes('clientRequestId') &&
+            typeof rawId === 'string' &&
+            rawId.length <= MAX_ID_CHARS &&
+            /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(rawId)
+              ? rawId
+              : '';
+          if (id && taskRepository) {
+            void taskRepository.execute({
+              kind: 'deleteSendOutbox',
+              workspaceId: repositoryWorkspaceId(),
+              clientRequestId: id,
+            });
+          }
+          break;
+        }
         default:
           // Unknown inbound type: log instead of silently ignoring. This surfaces
           // host<->webview protocol drift (e.g. a newer webview sending a message
@@ -2506,15 +2904,17 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
 
     // Do not auto-focus on open — entry UI shows previous tasks list (per redesign)
     // User selects from list or New task to enter chat.
-    this.postSnapshot(this.focusedTaskId);
+    // Outbox must hydrate before snapshot so pending replay after snapshot sees rows.
+    void (async () => {
+      await this.postSendOutboxSnapshot();
+      await this.hydrateSnapshotAndResumePolling(this.focusedTaskId);
+    })();
     // Tell the webview which backends are actually installed so its picker only
     // offers callable ones (the webview also requests this on mount).
     void this.postAvailableBackends();
     // Prefetch model catalog so New task can show [Backend] Model options promptly.
     void this.postAvailableModels();
-    // Restore last-used backend/model from globalState (survives full restarts).
-    // Posted after availability so the webview can re-apply preference once the
-    // picker list is known; applyHostComposerSelection does not require it.
+    // Restore last-used backend/model from VS Code Settings (survives restarts).
     this.postComposerSelection();
   }
 
@@ -2568,27 +2968,147 @@ function resolveTaskCwd(): string {
   return resolveWorkspaceCwd(folders, activeFile) ?? process.cwd();
 }
 
+/** Adapt VS Code's workspace shape to the pure registry identity contract. */
+function resolveCurrentWorkspaceIdentity(context: vscode.ExtensionContext) {
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  const workspaceFileUri = vscode.workspace.workspaceFile?.toString();
+  const workspaceContext: WorkspaceContext =
+    folders.length === 0
+      ? {
+          kind: 'empty',
+          // VS Code does not expose a stable profile UUID here. globalStorageUri
+          // is profile+extension-host scoped by contract, and its URI is stable
+          // across empty-window activations in that scope.
+          profileAuthority: `${vscode.env.remoteName ?? 'local'}:${context.globalStorageUri.toString()}`,
+        }
+      : folders.length === 1 && !workspaceFileUri
+        ? { kind: 'single-root', folderUri: folders[0]!.uri.toString() }
+        : {
+            kind: 'multi-root',
+            ...(workspaceFileUri ? { workspaceFileUri } : {}),
+            folderUris: folders.map((folder) => folder.uri.toString()),
+          };
+  return resolveWorkspaceIdentity(workspaceContext);
+}
+
 export async function activate(context: vscode.ExtensionContext) {
-  await migrateLegacyRetentionSetting();
+  const liveUatEnabled = isUatModeEnabled(
+    context.extensionMode === vscode.ExtensionMode.Production,
+  );
   // Patch PATH from the login shell BEFORE anything spawns a backend CLI, so a
   // GUI-launched editor (minimal PATH) can both detect and actually run the CLIs.
   await installAugmentedPath();
 
+  // SQLite is the only writable source. A host that advertises our minimum VS Code
+  // version but omits node:sqlite cannot safely activate the task engine.
+  const sqliteProbe = probeNodeSqlite();
+  if (!sqliteProbe.available) {
+    debugMuster('sqlite.probe.unavailable', { reason: sqliteProbe.reason });
+    const message = `Muster requires node:sqlite in the VS Code extension host: ${sqliteProbe.reason}`;
+    void vscode.window.showErrorMessage(message);
+    throw new Error(message);
+  }
+
+  const dbPath = path.join(context.globalStorageUri.fsPath, 'muster.sqlite3');
+
+  // Maintenance commands remain available even when storage open fails (P5-W5).
+  registerSqliteMaintenanceCommands(context, dbPath);
+
   const wsFolder = vscode.workspace.workspaceFolders?.[0];
   workspaceRoot = wsFolder?.uri.fsPath;
-  storePath = wsFolder
-    ? path.join(wsFolder.uri.fsPath, '.muster-tasks.json')
-    : path.join(context.globalStorageUri.fsPath, '.muster-tasks.json');
+  const terminalLifecycle = createTerminalStorageLifecycle({
+    diagnose: diagnoseSqliteError,
+    redactedLogFields: redactedDiagnosticLogFields,
+    log: debugMuster,
+    quiesce: () => {
+      applyTerminalStorageQuiesce({
+        productionProvider: chatProvider,
+        uatProvider: uatChatProvider,
+        engine: taskEngine,
+        clearHostRefs: () => {
+          taskEngine = undefined;
+          taskStore = undefined;
+          taskRepository = undefined;
+          sqliteClient = undefined;
+          sqliteWorkspaceId = undefined;
+        },
+      });
+    },
+    closeDoomed: async (doomed) => {
+      await (doomed as DbClient | undefined)?.close();
+    },
+    showError: async (message, action) => {
+      if (action) {
+        return vscode.window.showErrorMessage(message, action);
+      }
+      void vscode.window.showErrorMessage(message);
+      return undefined;
+    },
+    revealStorage: async () => {
+      await vscode.commands.executeCommand('revealFileInOS', context.globalStorageUri);
+    },
+    guidanceFor: recoveryGuidanceFor,
+  });
 
-  // Ensure the store's parent directory exists before any store/lock IO. Without
-  // a workspace folder the path falls back to globalStorage, which VS Code does not
-  // create eagerly — otherwise lock creation fails with ENOENT and surfaces as the
-  // misleading "could not acquire store lock".
-  fs.mkdirSync(path.dirname(storePath), { recursive: true });
+  const candidate = new DbClient({
+    workerPath: resolveWorkerPath(),
+    onTerminalStorageError: (err) => {
+      // Capture before synchronous quiesce clears sqliteClient. During open the
+      // activation catch closes `candidate`; at runtime the captured client is
+      // closed by the shared exactly-once report.
+      const doomed = sqliteClient;
+      void terminalLifecycle.handleTerminalSignal(err, doomed);
+    },
+  });
+  try {
+    fs.mkdirSync(context.globalStorageUri.fsPath, { recursive: true });
+    await candidate.open(dbPath);
+    const workspace = await new WorkspaceRegistry(candidate).getOrCreate(
+      resolveCurrentWorkspaceIdentity(context),
+      new Date().toISOString(),
+    );
+    sqliteClient = candidate;
+    sqliteWorkspaceId = workspace.id;
+    terminalLifecycle.markActivationReady();
+    debugMuster('sqlite.registry.ready', { ok: true });
+    context.subscriptions.push({
+      dispose: () => {
+        const current = sqliteClient;
+        sqliteClient = undefined;
+        sqliteWorkspaceId = undefined;
+        void current?.close();
+      },
+    });
+  } catch (error) {
+    // Single activation report: callback may have stored a terminal error first.
+    const reportError = terminalLifecycle.takePendingActivationError() ?? error;
+    await terminalLifecycle.reportOnce(reportError, {
+      operation: 'open',
+      doomed: candidate,
+      showUi: true,
+    });
+    const diagnostic = diagnoseSqliteError(reportError, 'open');
+    // Fail closed: do not start engine/scheduler/poller/writer on partial state.
+    // Maintenance commands remain registered above for explicit recovery.
+    debugMuster('sqlite.activation.fail_closed', redactedDiagnosticLogFields(diagnostic));
+    return;
+  }
 
-  runSessionMigration(context, workspaceRoot);
-
-  const provider = new MusterChatProvider(context.extensionUri, context.globalState);
+  const provider = new MusterChatProvider(context.extensionUri);
+  chatProvider = provider;
+  if (liveUatEnabled) {
+    uatChatProvider = provider;
+  }
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      if (event.affectsConfiguration('muster.composerSelection')) {
+        provider.postComposerSelection();
+      }
+    }),
+  );
+  context.subscriptions.push({
+    dispose: () => provider.disposeRevisionPoller(),
+  });
   const revealLinkedChat = async (ownerTaskId: string): Promise<boolean> => {
     if (!taskStore) return false;
     const reveal = createPresentationChatLink(
@@ -2788,6 +3308,7 @@ export async function activate(context: vscode.ExtensionContext) {
     if (cur.role === 'coordinator' && cur.parentId === null) return cur.id;
     return undefined;
   });
+  // Wire SQLite document store after engine load (below); provisional no-op until then.
   context.subscriptions.push(
     vscode.window.registerWebviewPanelSerializer(
       'muster.presentation',
@@ -2817,6 +3338,10 @@ export async function activate(context: vscode.ExtensionContext) {
       vscode.commands.executeCommand('workbench.view.extension.muster'),
     ),
   );
+
+  if (liveUatEnabled) {
+    registerLiveUatCommands(context);
+  }
 
   try {
     elicitationDebugChannel = vscode.window.createOutputChannel('Muster Elicitation Debug');
@@ -2916,7 +3441,7 @@ export async function activate(context: vscode.ExtensionContext) {
           debugElicitation('host.grok_prompt_cancelled', { reason: 'task engine unavailable' });
           return { outcome: 'cancelled' };
         }
-        const registered = engine.registerAgentAsk(
+        const registered = await engine.registerAgentAsk(
           req.sessionId,
           req.questions,
           USER_INTERACTION_TIMEOUT_MS,
@@ -3018,7 +3543,7 @@ export async function activate(context: vscode.ExtensionContext) {
         });
         let waitTurnId: string | undefined;
         if (form.sessionId && taskEngine) {
-          waitTurnId = taskEngine.beginElicitationWait(form.sessionId, promptId)?.turnId;
+          waitTurnId = (await taskEngine.beginElicitationWait(form.sessionId, promptId))?.turnId;
         }
         try {
           const result = await promise;
@@ -3029,12 +3554,12 @@ export async function activate(context: vscode.ExtensionContext) {
           });
           // Soft resume only if engine still owns this wait (hard clear drops tokens first).
           if (waitTurnId && taskEngine) {
-            taskEngine.endElicitationWait(waitTurnId, promptId);
+            await taskEngine.endElicitationWait(waitTurnId, promptId);
           }
           return result;
         } catch {
           if (waitTurnId && taskEngine) {
-            taskEngine.endElicitationWait(waitTurnId, promptId);
+            await taskEngine.endElicitationWait(waitTurnId, promptId);
           }
           return { action: 'cancel' as const };
         }
@@ -3071,9 +3596,27 @@ export async function activate(context: vscode.ExtensionContext) {
         return taskEngine.handleToolCall(ctx, tool, command);
       },
     };
+    const presentationRouter = new PresentationToolRouter(
+      engineToolHandler,
+      presentationManager!,
+    );
+    // Guard before PresentationToolRouter so upsert_presentation cannot bypass
+    // the engine maintenance hold during backup-before-reset.
+    const gatedToolHandler = {
+      handleToolCall: async (
+        ctx: import('./bridge/credentials').CredentialContext,
+        tool: string,
+        command: import('./task/coordinator-tools').ToolCommand,
+      ) => {
+        if (maintenanceActive) {
+          return { ok: false as const, error: 'storage maintenance in progress' };
+        }
+        return presentationRouter.handleToolCall(ctx, tool, command);
+      },
+    };
     bridgeServer = new MusterBridgeServer({
       credentials: credentialRegistry,
-      toolHandler: new PresentationToolRouter(engineToolHandler, presentationManager),
+      toolHandler: gatedToolHandler,
       onMcpObservation: (obs) => {
         mcpReadiness?.recordObservation(obs);
       },
@@ -3081,34 +3624,10 @@ export async function activate(context: vscode.ExtensionContext) {
     const { port } = await bridgeServer.listen();
     mcpReadiness.noteBridgeGeneration(bridgeServer.getGeneration());
 
-    taskStore = TaskStore.load({
-      filePath: storePath,
-      onCommit: (file, affectedTaskIds) => {
-        try {
-          provider.reprojectChanged(file, affectedTaskIds);
-          applyRetentionToStore(taskStore!);
-        } catch {
-          // best-effort projection
-        }
-      },
-    });
-    applyRetentionToStore(taskStore);
-    lastObservedFile = JSON.parse(JSON.stringify(taskStore.getFile())) as TaskStoreFile;
-    lastObservedRevision = taskStore.getFile().revision;
-
-    if (taskStore.isCorrupt()) {
-      // The store could not be read (corrupt or written by a newer version). It is
-      // preserved and never overwritten; run in recovery mode instead of bricking.
-      const info = taskStore.getRecoveryInfo();
-      void vscode.window.showWarningMessage(
-        `Muster: the task store could not be read. Your data is preserved at ${
-          info?.backupPath ?? 'a .corrupt backup'
-        }. Muster is in recovery mode and will not overwrite it — remove or repair the file to resume.`,
-      );
-    }
-
-    taskEngine = TaskEngine.load({
-      store: taskStore,
+    const sqliteRepository = new SqliteTaskRepository(candidate, repositoryWorkspaceId());
+    taskEngine = await TaskEngine.loadAsync({
+      repository: sqliteRepository,
+      workspaceId: repositoryWorkspaceId(),
       makeBackend,
       askBridge,
       credentialRegistry,
@@ -3148,6 +3667,7 @@ export async function activate(context: vscode.ExtensionContext) {
       // Per-backend skill invocation prefix (`/` default, `$` for Codex). Kept in
       // backends/ so task/ never imports it; supplied to the engine via DI.
       getSkillPrefix: (backend: string) => skillPrefixForBackend(backend),
+      onAfterCommit: (ctx) => provider.publishAfterCommit(ctx),
       emit: (event) => {
         try {
           provider.forwardTurnEvent(event);
@@ -3156,7 +3676,77 @@ export async function activate(context: vscode.ExtensionContext) {
         }
       },
     });
-
+    // Share the engine's write-through projection wrapper with host commands so
+    // every successful repository mutation is visible to synchronous UI selectors.
+    taskStore = taskEngine.getReadModel();
+    taskRepository = taskEngine.getRepository();
+    presentationManager?.setDocumentStore({
+      getPresentation: async (rootId, presentationId) => {
+        const row = await taskRepository!.getPresentation(rootId, presentationId);
+        if (!row) return undefined;
+        return {
+          presentationId: row.presentationId,
+          ownerTaskId: row.ownerTaskId,
+          revision: row.revision,
+          title: row.title,
+          markdown: row.markdown,
+          ...(row.kind ? { kind: row.kind as 'plan' | 'spec' | 'document' } : {}),
+          ...(row.summary ? { summary: row.summary } : {}),
+          ...(row.changeSummary ? { changeSummary: row.changeSummary } : {}),
+          ...(row.sourcePath ? { sourcePath: row.sourcePath } : {}),
+          ...(row.sourceFolderUri ? { sourceFolderUri: row.sourceFolderUri } : {}),
+          ...(row.updatedAt ? { updatedAt: row.updatedAt } : {}),
+        };
+      },
+      putPresentation: async (document) => {
+        const result = await taskRepository!.execute({
+          kind: 'putPresentation',
+          workspaceId: repositoryWorkspaceId(),
+          document: {
+            presentationId: document.presentationId,
+            ownerTaskId: document.ownerTaskId,
+            rootId: document.rootId,
+            revision: document.revision,
+            title: document.title,
+            markdown: document.markdown,
+            updatedAt: document.updatedAt,
+            ...(document.summary ? { summary: document.summary } : {}),
+            ...(document.changeSummary ? { changeSummary: document.changeSummary } : {}),
+            ...(document.kind ? { kind: document.kind } : {}),
+            ...(document.sourcePath ? { sourcePath: document.sourcePath } : {}),
+            ...(document.sourceFolderUri ? { sourceFolderUri: document.sourceFolderUri } : {}),
+          },
+        });
+        return result.changed === true;
+      },
+      commitPresentationOperation: async ({ operationKey, fingerprint, document }) => {
+        const result = await taskRepository!.execute({
+          kind: 'commitPresentationOperation',
+          workspaceId: repositoryWorkspaceId(),
+          operationKey,
+          fingerprint,
+          document: {
+            presentationId: document.presentationId,
+            ownerTaskId: document.ownerTaskId,
+            rootId: document.rootId,
+            revision: document.revision,
+            title: document.title,
+            markdown: document.markdown,
+            updatedAt: document.updatedAt,
+            ...(document.summary ? { summary: document.summary } : {}),
+            ...(document.changeSummary ? { changeSummary: document.changeSummary } : {}),
+            ...(document.kind ? { kind: document.kind } : {}),
+            ...(document.sourcePath ? { sourcePath: document.sourcePath } : {}),
+            ...(document.sourceFolderUri ? { sourceFolderUri: document.sourceFolderUri } : {}),
+          },
+        });
+        if (!result.presentationStatus) {
+          throw new Error('presentation commit returned no status');
+        }
+        return result.presentationStatus;
+      },
+    });
+    scheduleRetention();
     context.subscriptions.push(
       vscode.workspace.onDidGrantWorkspaceTrust(() => {
         try {
@@ -3166,18 +3756,6 @@ export async function activate(context: vscode.ExtensionContext) {
         }
       }),
     );
-
-    if (storePath) {
-      const storeDir = path.dirname(storePath);
-      const storeFileName = path.basename(storePath);
-      const watcher = vscode.workspace.createFileSystemWatcher(
-        new vscode.RelativePattern(storeDir, storeFileName),
-      );
-      const onStoreChange = () => provider.handleExternalStoreChange();
-      watcher.onDidChange(onStoreChange);
-      watcher.onDidCreate(onStoreChange);
-      context.subscriptions.push(watcher);
-    }
 
     context.subscriptions.push({
       dispose: () => {
@@ -3209,12 +3787,351 @@ export async function activate(context: vscode.ExtensionContext) {
     credentialRegistry = undefined;
     taskEngine = undefined;
     taskStore = undefined;
+    taskRepository = undefined;
     const message = error instanceof Error ? error.message : String(error);
     void vscode.window.showErrorMessage(`Muster task engine disabled: ${message}`);
   }
 }
 
-export function deactivate() {
+/**
+ * One-shot peer response to external developer reset (revision regression).
+ * Hard-quiesce with zero repository writes, close the abandoned client, and
+ * offer Reload Window once.
+ */
+async function handlePeerExternalReset(): Promise<void> {
+  if (peerResetHandled) return;
+  peerResetHandled = true;
+  const doomed = sqliteClient;
+  applyTerminalStorageQuiesce({
+    productionProvider: chatProvider,
+    uatProvider: uatChatProvider,
+    engine: taskEngine,
+    clearHostRefs: () => {
+      taskEngine = undefined;
+      taskStore = undefined;
+      taskRepository = undefined;
+      sqliteClient = undefined;
+      sqliteWorkspaceId = undefined;
+    },
+  });
+  try {
+    await doomed?.close();
+  } catch {
+    // best-effort
+  }
+  const choice = await vscode.window.showErrorMessage(
+    'Muster global database was reset in another window. Reload this window to continue.',
+    'Reload Window',
+  );
+  if (choice === 'Reload Window') {
+    try {
+      await vscode.commands.executeCommand('workbench.action.reloadWindow');
+    } catch {
+      // best-effort
+    }
+  }
+}
+
+/**
+ * Register backup + developer reset commands (available even when storage open fails).
+ */
+function registerSqliteMaintenanceCommands(
+  context: vscode.ExtensionContext,
+  dbPath: string,
+): void {
+  const backupDepsBase = {
+    showSaveDialog: async ({ defaultFileName }: { defaultFileName: string }) => {
+      const uri = await vscode.window.showSaveDialog({
+        defaultUri: vscode.Uri.file(path.join(os.homedir(), defaultFileName)),
+        filters: { SQLite: ['sqlite3', 'db'] },
+      });
+      return uri ? { fsPath: uri.fsPath } : undefined;
+    },
+    destinationExists: (uri: { fsPath: string }) => fs.existsSync(uri.fsPath),
+    backup: async (destinationPath: string, options: { overwrite: boolean }) => {
+      const client = sqliteClient;
+      if (!client) {
+        const temp = new DbClient({ workerPath: resolveWorkerPath() });
+        try {
+          await temp.open(dbPath);
+          return await temp.backup(destinationPath, options);
+        } finally {
+          await temp.close().catch(() => undefined);
+        }
+      }
+      return client.backup(destinationPath, options);
+    },
+    showInformationMessage: (message: string) => {
+      void vscode.window.showInformationMessage(message);
+    },
+    showErrorMessage: (message: string) => {
+      void vscode.window.showErrorMessage(message);
+    },
+    isMaintenanceActive: () => maintenanceActive,
+    setMaintenanceActive: (active: boolean) => {
+      maintenanceActive = active;
+    },
+  };
+
+  const runBackupStandalone = () =>
+    handleBackupDatabaseCommand({
+      ...backupDepsBase,
+      skipMaintenanceGuard: false,
+    });
+
+  /** Internal backup-before-reset already owns the maintenance flag. */
+  const runBackupNested = () =>
+    handleBackupDatabaseCommand({
+      ...backupDepsBase,
+      skipMaintenanceGuard: true,
+    });
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(MUSTER_BACKUP_DATABASE_COMMAND, () =>
+      runBackupStandalone(),
+    ),
+    vscode.commands.registerCommand(MUSTER_DEVELOPER_RESET_COMMAND, () =>
+      handleDeveloperResetCommand({
+        showWarningMessage: async (message, ...items) =>
+          vscode.window.showWarningMessage(message, { modal: true }, ...items),
+        runBackupFlow: () => runBackupNested(),
+        isMaintenanceActive: () => maintenanceActive,
+        setMaintenanceActive: (active) => {
+          maintenanceActive = active;
+          try {
+            if (active) {
+              taskEngine?.beginMaintenanceHold();
+            } else {
+              // Release only when the engine is still attached (pre-quiesce cancel/fail).
+              taskEngine?.endMaintenanceHold();
+            }
+          } catch {
+            // best-effort
+          }
+        },
+        quiesceForMaintenance: async () => {
+          await quiesceForMaintenance({
+            productionProvider: chatProvider,
+            uatProvider: uatChatProvider,
+            engine: taskEngine,
+            client: sqliteClient,
+            stopWriters: async () => {
+              try {
+                askBridge?.cancelAll('maintenance reset');
+              } catch {
+                // best-effort
+              }
+              try {
+                elicitationBridge?.cancelAll();
+              } catch {
+                // best-effort
+              }
+              try {
+                permissionBridge?.cancelAll();
+              } catch {
+                // best-effort
+              }
+              try {
+                setPermissionController(null);
+                setQuestionController(null);
+                setElicitationController(null);
+              } catch {
+                // best-effort
+              }
+              try {
+                credentialRegistry?.revokeAll();
+              } catch {
+                // best-effort
+              }
+              try {
+                presentationManager?.setDocumentStore(undefined);
+              } catch {
+                // best-effort
+              }
+              try {
+                await bridgeServer?.close();
+              } catch {
+                // best-effort
+              }
+              bridgeServer = undefined;
+            },
+            clearHostRefs: () => {
+              taskEngine = undefined;
+              taskStore = undefined;
+              taskRepository = undefined;
+              sqliteClient = undefined;
+              sqliteWorkspaceId = undefined;
+            },
+          });
+        },
+        resetDatabase: async () => {
+          // Recovery open: accepts incompatible Muster-owned DBs (no normal open).
+          const client = new DbClient({ workerPath: resolveWorkerPath() });
+          try {
+            return await client.reset({ path: dbPath });
+          } finally {
+            await client.close().catch(() => undefined);
+          }
+        },
+        reloadWindow: async () => {
+          await vscode.commands.executeCommand('workbench.action.reloadWindow');
+        },
+        showErrorMessage: (message) => {
+          void vscode.window.showErrorMessage(message);
+        },
+        showInformationMessage: (message) => {
+          void vscode.window.showInformationMessage(message);
+        },
+      }),
+    ),
+  );
+}
+
+/**
+ * Live two-window UAT command surface. activate() calls this only for a
+ * non-production Extension Host with MUSTER_UAT_MODE=1.
+ */
+function registerLiveUatCommands(context: vscode.ExtensionContext): void {
+  const requireRepo = (): { repository: TaskRepository; workspaceId: string } => {
+    if (!taskRepository || !sqliteWorkspaceId) {
+      throw new Error('UAT repository unavailable');
+    }
+    return { repository: taskRepository, workspaceId: sqliteWorkspaceId };
+  };
+
+  const requireClient = (): DbClient => {
+    if (!sqliteClient) {
+      throw new Error('UAT sqlite client unavailable');
+    }
+    return sqliteClient;
+  };
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand(UAT_COMMANDS.ping, async () => {
+      const extension = vscode.extensions.getExtension('tlelabs.muster');
+      return {
+        ok: true,
+        role: process.env.MUSTER_UAT_ROLE ?? 'unknown',
+        vscodeVersion: vscode.version,
+        nodeVersion: process.versions.node,
+        extensionActive: Boolean(extension?.isActive),
+        sessionId: vscode.env.sessionId,
+        remoteName: vscode.env.remoteName ?? 'desktop',
+        workspaceFolderCount: vscode.workspace.workspaceFolders?.length ?? 0,
+      };
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.identity, async () => {
+      const { repository } = requireRepo();
+      const client = requireClient();
+      const dbPath = path.join(context.globalStorageUri.fsPath, 'muster.sqlite3');
+      const { createHash } = await import('node:crypto');
+      return readRedactedDbIdentity(
+        repository,
+        dbPath,
+        (p) => {
+          const stat = fs.statSync(p);
+          return {
+            size: stat.size,
+            physicalIdentity: `${fs.realpathSync(p)}|${stat.dev}|${stat.ino}`,
+          };
+        },
+        (input) => createHash('sha256').update(input).digest('hex').slice(0, 16),
+        {
+          pragma: (name) => client.pragma(name),
+          get: <T>(sql: string, params?: unknown[]) =>
+            client.get<T>(sql, params as never),
+        },
+      );
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.createTaskWithMessage, async (args) => {
+      const { repository, workspaceId } = requireRepo();
+      return createTaskWithMessage(repository, workspaceId, args);
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.appendMessage, async (args) => {
+      const { repository, workspaceId } = requireRepo();
+      return appendMessage(repository, workspaceId, args);
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.enqueueFollowUp, async (args) => {
+      const { repository, workspaceId } = requireRepo();
+      return enqueueFollowUp(repository, workspaceId, args);
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.promoteFollowUp, async (args) => {
+      const { repository, workspaceId } = requireRepo();
+      return promoteFollowUp(repository, workspaceId, String(args.turnId));
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.deleteMessage, async (args) => {
+      const { repository, workspaceId } = requireRepo();
+      return deleteMessage(repository, workspaceId, String(args.messageId));
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.putSendOutbox, async (args) => {
+      const { repository, workspaceId } = requireRepo();
+      return putSendOutbox(repository, workspaceId, args);
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.markSendOutboxRejected, async (args) => {
+      const { repository, workspaceId } = requireRepo();
+      return markSendOutboxRejected(repository, workspaceId, String(args.clientRequestId));
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.putPresentation, async (args) => {
+      const { repository, workspaceId } = requireRepo();
+      return putPresentation(repository, workspaceId, args);
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.hostState, async () => {
+      if (!uatChatProvider) {
+        throw new Error('UAT chat provider unavailable');
+      }
+      return uatChatProvider.hostStateForUat();
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.forcePollingActive, async () => {
+      if (!uatChatProvider) {
+        throw new Error('UAT chat provider unavailable');
+      }
+      return uatChatProvider.forcePollingActiveForUat();
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.loadOlderTranscript, async (args) => {
+      if (!uatChatProvider) {
+        throw new Error('UAT chat provider unavailable');
+      }
+      return uatChatProvider.loadOlderTranscriptForUat(
+        String(args.taskId),
+        typeof args?.limit === 'number' ? args.limit : 2,
+      );
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.focusTask, async (args) => {
+      if (!uatChatProvider) {
+        throw new Error('UAT chat provider unavailable');
+      }
+      const taskId =
+        args?.taskId === null || args?.taskId === undefined
+          ? undefined
+          : String(args.taskId);
+      return uatChatProvider.focusTaskForUat(taskId);
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.readDurableSurfaces, async (args) => {
+      const { repository } = requireRepo();
+      return readDurableSurfaces(repository, {
+        rootId: String(args.rootId),
+        presentationId: String(args.presentationId),
+      });
+    }),
+  );
+}
+
+export async function deactivate(): Promise<void> {
+  try {
+    await taskEngine?.shutdown();
+  } catch {
+    // Stream failures are already routed through durable turn settlement.
+  }
+  // provider is module-scoped only via registration; poller is stopped via
+  // subscriptions. Clear repository so any late poll exits cleanly.
+  taskRepository = undefined;
+  try {
+    chatProvider?.disposeRevisionPoller();
+  } catch {
+    // best-effort
+  }
+  chatProvider = undefined;
+  uatChatProvider = undefined;
   presentationManager?.dispose();
   presentationManager = undefined;
   askBridge?.cancelAll('deactivate');

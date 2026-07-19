@@ -143,15 +143,11 @@ export function queuedMutationRefusalMessage(reason: string): string {
 
 export interface EditQueuedTurnRouteDeps {
   engineReady: boolean;
-  /**
-   * Engine entrypoint. Tests assert this is called at most once and only after
-   * payload validation succeeds — never continueTask / queue creation.
-   */
   editQueuedTurn: (
     taskId: string,
     turnId: string,
     content: string,
-  ) => EngineResult<{ turnId: string; messageId: string }>;
+  ) => Promise<EngineResult<{ turnId: string; messageId: string }>>;
 }
 
 export interface DeleteQueuedTurnRouteDeps {
@@ -159,68 +155,36 @@ export interface DeleteQueuedTurnRouteDeps {
   deleteQueuedTurn: (
     taskId: string,
     turnId: string,
-  ) => EngineResult<{ turnId: string; deletedMessageIds: string[] }>;
+  ) => Promise<EngineResult<{ turnId: string; deletedMessageIds: string[] }>>;
 }
 
-/**
- * Host routing for editQueuedTurn: validate, delegate once to the engine, and
- * return either a success ack or a sanitized command-error payload. Never falls
- * through to continueTask or any other queue creation path.
- */
-export function routeEditQueuedTurn(
+/** Validate and route a queued edit through the async repository-backed engine. */
+export async function routeEditQueuedTurn(
   data: unknown,
   deps: EditQueuedTurnRouteDeps,
-): QueuedMutationHostOutcome {
-  if (!deps.engineReady) {
-    return { kind: 'error', message: 'task engine not ready' };
-  }
+): Promise<QueuedMutationHostOutcome> {
+  if (!deps.engineReady) return { kind: 'error', message: 'task engine not ready' };
   const parsed = parseEditQueuedTurnMessage(data);
-  if (!parsed.ok) {
-    return { kind: 'error', taskId: parsed.taskId, message: parsed.message };
-  }
-  const result = deps.editQueuedTurn(parsed.taskId, parsed.turnId, parsed.content);
-  if (result.ok) {
-    return {
-      kind: 'ack',
-      taskId: parsed.taskId,
-      turnId: result.value.turnId,
-      messageId: result.value.messageId,
-    };
-  }
-  return {
-    kind: 'error',
-    taskId: parsed.taskId,
-    message: queuedMutationRefusalMessage(result.reason),
-  };
+  if (!parsed.ok) return { kind: 'error', taskId: parsed.taskId, message: parsed.message };
+  const result = await deps.editQueuedTurn(parsed.taskId, parsed.turnId, parsed.content);
+  return result.ok
+    ? { kind: 'ack', taskId: parsed.taskId, turnId: result.value.turnId, messageId: result.value.messageId }
+    : { kind: 'error', taskId: parsed.taskId, message: queuedMutationRefusalMessage(result.reason) };
 }
 
-/**
- * Host routing for deleteQueuedTurn: validate, delegate once to the engine, and
- * return either a success ack or a sanitized command-error payload.
- */
-export function routeDeleteQueuedTurn(
+/** Validate and route a queued delete through the async repository-backed engine. */
+export async function routeDeleteQueuedTurn(
   data: unknown,
   deps: DeleteQueuedTurnRouteDeps,
-): QueuedMutationHostOutcome {
-  if (!deps.engineReady) {
-    return { kind: 'error', message: 'task engine not ready' };
-  }
+): Promise<QueuedMutationHostOutcome> {
+  if (!deps.engineReady) return { kind: 'error', message: 'task engine not ready' };
   const parsed = parseDeleteQueuedTurnMessage(data);
-  if (!parsed.ok) {
-    return { kind: 'error', taskId: parsed.taskId, message: parsed.message };
-  }
-  const result = deps.deleteQueuedTurn(parsed.taskId, parsed.turnId);
-  if (result.ok) {
-    return {
-      kind: 'ack',
-      taskId: parsed.taskId,
-      turnId: result.value.turnId,
-      deletedMessageIds: result.value.deletedMessageIds,
-    };
-  }
-  return {
-    kind: 'error',
-    taskId: parsed.taskId,
-    message: queuedMutationRefusalMessage(result.reason),
-  };
+  if (!parsed.ok) return { kind: 'error', taskId: parsed.taskId, message: parsed.message };
+  const result = await deps.deleteQueuedTurn(parsed.taskId, parsed.turnId);
+  return result.ok
+    ? {
+        kind: 'ack', taskId: parsed.taskId, turnId: result.value.turnId,
+        deletedMessageIds: result.value.deletedMessageIds,
+      }
+    : { kind: 'error', taskId: parsed.taskId, message: queuedMutationRefusalMessage(result.reason) };
 }

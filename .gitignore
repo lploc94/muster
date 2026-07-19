@@ -85,6 +85,7 @@ vendor/
 Python/
 test-results/
 playwright-report/
+.vscode-test/
 
 # ── GSD baseline (auto-generated) ──
 .vscode/

@@ -63,6 +63,7 @@ const baseTaskSummary = {
   goal: 'Goal',
   role: 'worker',
   lifecycle: 'open',
+  runtimeActivity: 'idle',
   viewStatus: 'idle',
   currentTurnActivity: null,
   updatedAt: '2026-07-06T00:00:00.000Z',
@@ -70,27 +71,18 @@ const baseTaskSummary = {
   model: 'sonnet',
 };
 
-const sanitizedHandoffProgress = {
-  operationId: 'hop-op-1',
-  phase: 'preparing_receiver',
-  source: { backend: 'claude-cli', model: 'sonnet' },
-  target: { backend: 'codex', model: 'gpt-5' },
-  createdAt: '2026-07-06T00:00:00.000Z',
-  updatedAt: '2026-07-06T00:10:00.000Z',
-  startedAt: '2026-07-06T00:00:01.000Z',
-};
-
 describe('isExtMessage snapshot version tolerance', () => {
-  const baseSnapshot = { type: 'snapshot', rootTasks: [], storeRevision: 0 };
+  const baseSnapshot = {
+    type: 'snapshot', rootTasks: [], storeRevision: 0, protocolVersion: PROTOCOL_VERSION,
+  };
 
   it('accepts a snapshot stamped with the current protocolVersion', () => {
     expect(isExtMessage({ ...baseSnapshot, protocolVersion: PROTOCOL_VERSION })).toBe(true);
   });
 
-  it('accepts a snapshot without a protocolVersion (backward-tolerant shape)', () => {
-    // The compatibility decision lives in isProtocolCompatible; the shape guard
-    // itself stays tolerant so an unstamped snapshot is still recognized as one.
-    expect(isExtMessage(baseSnapshot)).toBe(true);
+  it('rejects a snapshot without a protocolVersion', () => {
+    const { protocolVersion: _protocolVersion, ...unstamped } = baseSnapshot;
+    expect(isExtMessage(unstamped)).toBe(false);
   });
 
   it('rejects a snapshot whose protocolVersion is not a number', () => {
@@ -159,111 +151,107 @@ describe('isExtMessage snapshot version tolerance', () => {
       expect(isExtMessage(message), JSON.stringify(message)).toBe(false);
     }
   });
+});
 
-  it('accepts optional sanitized handoffProgress on TaskSummary', () => {
+describe('protocol v7 focused transcriptPage contract', () => {
+  const baseSnapshot = {
+    type: 'snapshot',
+    rootTasks: [baseTaskSummary],
+    storeRevision: 1,
+    protocolVersion: PROTOCOL_VERSION,
+  };
+  const validPage = {
+    hasMoreBefore: false,
+    workspaceRevision: 1,
+  };
+  const focusedBase = {
+    ...baseSnapshot,
+    focusedTaskId: 'task-1',
+    transcript: [],
+    transcriptPage: validPage,
+  };
+
+  it('is exactly version 8', () => {
+    expect(PROTOCOL_VERSION).toBe(9);
+  });
+
+  it('accepts focused snapshot with transcript + transcriptPage', () => {
+    expect(isExtMessage(focusedBase)).toBe(true);
+  });
+
+  it('rejects focused snapshot missing transcript', () => {
+    const { transcript: _t, ...rest } = focusedBase;
+    expect(isExtMessage(rest)).toBe(false);
+  });
+
+  it('rejects focused snapshot missing transcriptPage', () => {
+    const { transcriptPage: _p, ...rest } = focusedBase;
+    expect(isExtMessage(rest)).toBe(false);
+  });
+
+  it('rejects no-focus snapshot that carries transcript', () => {
+    expect(isExtMessage({ ...baseSnapshot, transcript: [] })).toBe(false);
+  });
+
+  it('rejects no-focus snapshot that carries transcriptPage', () => {
+    expect(isExtMessage({ ...baseSnapshot, transcriptPage: validPage })).toBe(false);
+  });
+
+  it('requires beforeCursor when hasMoreBefore is true', () => {
     expect(
       isExtMessage({
-        ...baseSnapshot,
-        rootTasks: [{ ...baseTaskSummary, handoffProgress: sanitizedHandoffProgress }],
+        ...focusedBase,
+        transcriptPage: { hasMoreBefore: true, workspaceRevision: 1 },
       }),
-    ).toBe(true);
-
+    ).toBe(false);
     expect(
       isExtMessage({
-        ...baseSnapshot,
-        rootTasks: [
-          {
-            ...baseTaskSummary,
-            handoffProgress: {
-              ...sanitizedHandoffProgress,
-              phase: 'failed',
-              finishedAt: '2026-07-06T00:02:00.000Z',
-              failure: {
-                code: 'receiver_init_failed',
-                message: 'Receiver init failed',
-                at: '2026-07-06T00:02:00.000Z',
-              },
-            },
-          },
-        ],
+        ...focusedBase,
+        transcriptPage: {
+          hasMoreBefore: true,
+          beforeCursor: 'v2.abc',
+          workspaceRevision: 1,
+        },
       }),
     ).toBe(true);
   });
 
-  it('rejects handoffProgress that carries session ids, digests, or extra secret fields', () => {
-    const secretful = [
-      {
-        ...baseSnapshot,
-        rootTasks: [
-          {
-            ...baseTaskSummary,
-            handoffProgress: {
-              ...sanitizedHandoffProgress,
-              source: {
-                backend: 'claude-cli',
-                model: 'sonnet',
-                sessionId: 'src-sess-SECRET',
-              },
-            },
-          },
-        ],
-      },
-      {
-        ...baseSnapshot,
-        rootTasks: [
-          {
-            ...baseTaskSummary,
-            handoffProgress: {
-              ...sanitizedHandoffProgress,
-              contentDigest: 'handoff-digest-SECRET',
-            },
-          },
-        ],
-      },
-      {
-        ...baseSnapshot,
-        rootTasks: [
-          {
-            ...baseTaskSummary,
-            handoffProgress: {
-              ...sanitizedHandoffProgress,
-              sourceSummary: { status: 'ready', contentDigest: 'x' },
-            },
-          },
-        ],
-      },
-      {
-        ...baseSnapshot,
-        rootTasks: [
-          {
-            ...baseTaskSummary,
-            handoffProgress: {
-              ...sanitizedHandoffProgress,
-              phase: 'not-a-phase',
-            },
-          },
-        ],
-      },
-      {
-        ...baseSnapshot,
-        rootTasks: [
-          {
-            ...baseTaskSummary,
-            handoffProgress: {
-              ...sanitizedHandoffProgress,
-              failure: {
-                code: 'receiver_init_failed',
-                message: 'x',
-                at: '2026-07-06T00:02:00.000Z',
-                boundSessionId: 'handoff-bound-session-SECRET',
-              },
-            },
-          },
-        ],
-      },
-    ];
-    for (const message of secretful) {
-      expect(isExtMessage(message), JSON.stringify(message)).toBe(false);
+  it('forbids beforeCursor when hasMoreBefore is false', () => {
+    expect(
+      isExtMessage({
+        ...focusedBase,
+        transcriptPage: {
+          hasMoreBefore: false,
+          beforeCursor: 'v2.abc',
+          workspaceRevision: 1,
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it('rejects non-finite / negative / non-integer workspaceRevision', () => {
+    for (const workspaceRevision of [NaN, Infinity, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(
+        isExtMessage({
+          ...focusedBase,
+          transcriptPage: { hasMoreBefore: false, workspaceRevision },
+        }),
+        String(workspaceRevision),
+      ).toBe(false);
+    }
+  });
+
+  it('rejects malformed page metadata shapes', () => {
+    for (const transcriptPage of [
+      null,
+      'page',
+      { hasMoreBefore: 'yes', workspaceRevision: 1 },
+      { hasMoreBefore: false },
+      { workspaceRevision: 1 },
+    ]) {
+      expect(isExtMessage({ ...focusedBase, transcriptPage }), JSON.stringify(transcriptPage)).toBe(
+        false,
+      );
     }
   });
 });
@@ -843,6 +831,49 @@ describe('composer selection protocol', () => {
     ).toBe(false);
   });
 
+  it('strictly validates bounded SQLite send-outbox snapshots', () => {
+    const entry = {
+      clientRequestId: 'request-1',
+      status: 'rejected',
+      taskId: 'task-1',
+      text: '@plan',
+      llmText: '/workspace/docs/plan.md',
+      mentionBindings: [['@plan', '/workspace/docs/plan.md']],
+      skills: ['review'],
+      backend: 'grok',
+      model: 'grok-4',
+      createdAt: 1,
+    };
+    expect(isExtMessage({ type: 'sendOutboxSnapshot', entries: [entry] })).toBe(true);
+    expect(isExtMessage({
+      type: 'sendOutboxSnapshot',
+      entries: [{ ...entry, unexpected: true }],
+    })).toBe(false);
+    expect(isExtMessage({
+      type: 'sendOutboxSnapshot',
+      entries: [{ ...entry, mentionBindings: [['broken']] }],
+    })).toBe(false);
+    expect(isExtMessage({
+      type: 'sendOutboxSnapshot',
+      entries: [{ ...entry, skills: ['bad skill'] }],
+    })).toBe(false);
+    expect(isExtMessage({
+      type: 'sendOutboxSnapshot',
+      entries: [{ ...entry, skills: ['review', 'review'] }],
+    })).toBe(false);
+    expect(isExtMessage({
+      type: 'sendOutboxSnapshot',
+      entries: [{
+        ...entry,
+        mentionBindings: [['@plan', '/a'], ['@plan', '/b']],
+      }],
+    })).toBe(false);
+    expect(isExtMessage({
+      type: 'sendOutboxSnapshot',
+      entries: [entry, entry],
+    })).toBe(false);
+  });
+
   it('posts setComposerSelection to the host', () => {
     vi.mocked(vscode.postMessage).mockClear();
     const message: OutMessage = { type: 'setComposerSelection', backend: 'grok', model: 'm1' };
@@ -887,10 +918,17 @@ describe('skills protocol', () => {
 
   it('send OutMessage carries structured skills', () => {
     vi.mocked(vscode.postMessage).mockClear();
-    const message: OutMessage = { type: 'send', text: 'hi', skills: ['plan', 'review'] };
+    const message: OutMessage = {
+      type: 'send',
+      text: 'hi',
+      skills: ['plan', 'review'],
+      clientRequestId: 'request-1',
+    };
     post(message);
     expect(vscode.postMessage).toHaveBeenCalledWith(
-      expect.objectContaining({ type: 'send', text: 'hi', skills: ['plan', 'review'] }),
+      expect.objectContaining({
+        type: 'send', text: 'hi', skills: ['plan', 'review'], clientRequestId: 'request-1',
+      }),
     );
   });
 });
@@ -1336,5 +1374,441 @@ describe('file mention suggestion protocol', () => {
     for (const message of bad) {
       expect(isExtMessage(message), JSON.stringify(message)).toBe(false);
     }
+  });
+});
+
+describe('protocol v7 loadTranscriptPage / transcriptPageResult', () => {
+  const validSuccess = {
+    type: 'transcriptPageResult',
+    requestId: 'req-1',
+    taskId: 'task-1',
+    ok: true as const,
+    items: [{ id: 'u1', kind: 'user' as const, content: 'older' }],
+    transcriptPage: {
+      hasMoreBefore: true,
+      beforeCursor: 'v2.next',
+      workspaceRevision: 3,
+    },
+  };
+
+  it('accepts valid success with <=100 items and page metadata', () => {
+    expect(isExtMessage(validSuccess)).toBe(true);
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: Array.from({ length: 100 }, (_, i) => ({
+          id: `u${i}`,
+          kind: 'user',
+          content: `m${i}`,
+        })),
+      }),
+    ).toBe(true);
+  });
+
+  it('accepts each fixed failure code', () => {
+    for (const code of [
+      'invalidRequest',
+      'staleFocus',
+      'taskNotFound',
+      'invalidCursor',
+      'unavailable',
+    ] as const) {
+      expect(
+        isExtMessage({
+          type: 'transcriptPageResult',
+          requestId: 'req-1',
+          taskId: 'task-1',
+          ok: false,
+          code,
+        }),
+        code,
+      ).toBe(true);
+    }
+  });
+
+  it('rejects oversized/missing requestId and malformed taskId', () => {
+    expect(isExtMessage({ ...validSuccess, requestId: '' })).toBe(false);
+    expect(isExtMessage({ ...validSuccess, requestId: 'x'.repeat(129) })).toBe(false);
+    expect(isExtMessage({ ...validSuccess, taskId: '' })).toBe(false);
+    expect(isExtMessage({ ...validSuccess, taskId: 't'.repeat(513) })).toBe(false);
+  });
+
+  it('rejects more than 100 items and malformed page metadata', () => {
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: Array.from({ length: 101 }, (_, i) => ({
+          id: `u${i}`,
+          kind: 'user',
+          content: `m${i}`,
+        })),
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        transcriptPage: { hasMoreBefore: true, workspaceRevision: 1 },
+      }),
+    ).toBe(false);
+  });
+
+  it('rejects success missing items/page and error with free-form message/unknown code', () => {
+    const { items: _i, ...noItems } = validSuccess;
+    expect(isExtMessage(noItems)).toBe(false);
+    const { transcriptPage: _p, ...noPage } = validSuccess;
+    expect(isExtMessage(noPage)).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'transcriptPageResult',
+        requestId: 'req-1',
+        taskId: 'task-1',
+        ok: false,
+        code: 'unavailable',
+        message: 'boom',
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'transcriptPageResult',
+        requestId: 'req-1',
+        taskId: 'task-1',
+        ok: false,
+        code: 'ENOENT',
+      }),
+    ).toBe(false);
+  });
+
+  it('posts loadTranscriptPage outbound shape without history aliases', () => {
+    vi.mocked(vscode.postMessage).mockClear();
+    const message: OutMessage = {
+      type: 'loadTranscriptPage',
+      requestId: 'req-1',
+      taskId: 'task-1',
+      beforeCursor: 'v2.cursor',
+    };
+    post(message);
+    expect(vscode.postMessage).toHaveBeenCalledWith(message);
+    expect(message).not.toHaveProperty('type', 'loadHistory');
+    expect(JSON.stringify(message)).not.toContain('historyChunk');
+  });
+
+  it('rejects user items with wrong optional types or extra fields', () => {
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [{ id: 'u1', kind: 'user', content: 'ok', turnId: 123 }],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [{ id: 'u1', kind: 'user', content: 'ok', order: 'bad' }],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [{ id: 'u1', kind: 'user', content: 'ok', extra: true }],
+      }),
+    ).toBe(false);
+  });
+
+  it('rejects host error transcript items and transcriptPage extra fields', () => {
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [{ id: 'e1', kind: 'error', content: { message: 'x' } }],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        transcriptPage: {
+          hasMoreBefore: false,
+          workspaceRevision: 1,
+          leaked: true,
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it('rejects invalid tool status/toolKind and nested extra fields', () => {
+    const baseTool = {
+      id: 'tool-1',
+      kind: 'tool' as const,
+      turnId: 't1',
+      order: 1,
+      content: {
+        toolCallId: 'c1',
+        name: 'bash',
+        status: 'success' as const,
+      },
+    };
+    expect(isExtMessage({ ...validSuccess, items: [baseTool] })).toBe(true);
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [{ ...baseTool, content: { ...baseTool.content, status: 'pending' } }],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [{ ...baseTool, content: { ...baseTool.content, toolKind: 'shell' } }],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [{ ...baseTool, content: { ...baseTool.content, nestedExtra: 1 } }],
+      }),
+    ).toBe(false);
+  });
+});
+
+describe('protocol v9 workspacePatchBatch', () => {
+  const summary = {
+    id: 'task-1',
+    parentId: null,
+    goal: 'Goal',
+    role: 'worker',
+    lifecycle: 'open',
+    runtimeActivity: 'idle',
+    viewStatus: 'idle',
+    currentTurnActivity: null,
+    updatedAt: '2026-07-06T00:00:00.000Z',
+    backend: 'claude-cli',
+  };
+
+  const summary2 = { ...summary, id: 'task-2', goal: 'Other' };
+  const validBatch = {
+    type: 'workspacePatchBatch',
+    revision: 2,
+    patches: [
+      { type: 'taskUpserted', task: summary },
+      { type: 'turnActivityChanged', task: summary2 },
+      {
+        type: 'transcriptItemsAppended',
+        taskId: 'task-1',
+        items: [{ id: 'u1', kind: 'user', content: 'hi', turnId: 't1', order: 0 }],
+      },
+      {
+        type: 'transcriptItemPatched',
+        taskId: 'task-1',
+        item: { id: 'a1', kind: 'assistant', content: 'yo', turnId: 't1', order: 1 },
+      },
+      {
+        type: 'transcriptItemsRemoved',
+        taskId: 'task-1',
+        itemIds: ['old-1'],
+      },
+      {
+        type: 'queuedTurnsChanged',
+        taskId: 'task-1',
+        queuedTurns: [
+          {
+            turnId: 'q1',
+            sequence: 1,
+            status: 'queued',
+            messageIds: ['m1'],
+            createdAt: '2026-07-06T00:00:00.000Z',
+          },
+        ],
+      },
+      { type: 'taskRemoved', taskId: 'task-3' },
+    ],
+  };
+
+  it('is exactly version 9', () => {
+    expect(PROTOCOL_VERSION).toBe(9);
+  });
+
+  it('accepts a multi-kind batch and empty patches', () => {
+    expect(isExtMessage(validBatch)).toBe(true);
+    expect(isExtMessage({ type: 'workspacePatchBatch', revision: 0, patches: [] })).toBe(true);
+  });
+
+  it('rejects extra fields, bad revision, and malformed nested payloads', () => {
+    expect(isExtMessage({ ...validBatch, extra: 1 })).toBe(false);
+    expect(isExtMessage({ type: 'workspacePatchBatch', revision: -1, patches: [] })).toBe(false);
+    expect(isExtMessage({ type: 'workspacePatchBatch', revision: 1.5, patches: [] })).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [{ type: 'taskUpserted', task: summary, extra: true }],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [{ type: 'transcriptItemsRemoved', taskId: 'task-1', itemIds: [] }],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [{
+          type: 'transcriptItemsRemoved',
+          taskId: 'task-1',
+          itemIds: ['old-1', 'old-1'],
+        }],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [{ type: 'taskRemoved' }],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [
+          {
+            type: 'transcriptItemsAppended',
+            taskId: 'task-1',
+            items: [{ id: 'u1', kind: 'user', content: 'a' }],
+          },
+          {
+            type: 'transcriptItemsRemoved',
+            taskId: 'task-1',
+            itemIds: ['u1'],
+          },
+        ],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [
+          {
+            type: 'transcriptItemsAppended',
+            taskId: 'task-1',
+            items: [{ id: 'e1', kind: 'error', content: 'x' }],
+          },
+        ],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [{ type: 'taskUpserted', task: { ...summary, nestedExtra: true } }],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [{ type: 'taskUpserted', task: { ...summary, runtimeActivity: undefined } }],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [
+          {
+            type: 'queuedTurnsChanged',
+            taskId: 'task-1',
+            queuedTurns: [
+              {
+                turnId: 'q1',
+                sequence: 1.5,
+                status: 'queued',
+                messageIds: ['m1'],
+                createdAt: '2026-07-06T00:00:00.000Z',
+                nestedExtra: true,
+              },
+            ],
+          },
+        ],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [
+          {
+            type: 'transcriptItemsAppended',
+            taskId: 'task-1',
+            items: [{ id: 'bad\0id', kind: 'user', content: 'x' }],
+          },
+        ],
+      }),
+    ).toBe(false);
+  });
+
+  it('rejects duplicate stable identities in one batch', () => {
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [
+          { type: 'taskUpserted', task: summary },
+          { type: 'turnActivityChanged', task: summary },
+        ],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [
+          {
+            type: 'transcriptItemsAppended',
+            taskId: 'task-1',
+            items: [
+              { id: 'u1', kind: 'user', content: 'a' },
+              { id: 'u1', kind: 'user', content: 'b' },
+            ],
+          },
+        ],
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [
+          {
+            type: 'transcriptItemsAppended',
+            taskId: 'task-1',
+            items: [{ id: 'u1', kind: 'user', content: 'a' }],
+          },
+          {
+            type: 'transcriptItemPatched',
+            taskId: 'task-1',
+            item: { id: 'u1', kind: 'user', content: 'b' },
+          },
+        ],
+      }),
+    ).toBe(false);
+  });
+
+  it('bounds transcript entities across the whole patch envelope', () => {
+    const makeItems = (prefix: string) =>
+      Array.from({ length: 251 }, (_, index) => ({
+        id: `${prefix}-${index}`,
+        kind: 'assistant' as const,
+        content: 'x',
+      }));
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 1,
+        patches: [
+          { type: 'transcriptItemsAppended', taskId: 'task-1', items: makeItems('a') },
+          { type: 'transcriptItemsAppended', taskId: 'task-2', items: makeItems('b') },
+        ],
+      }),
+    ).toBe(false);
   });
 });

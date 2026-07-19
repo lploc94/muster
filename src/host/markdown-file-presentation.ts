@@ -82,33 +82,10 @@ export function presentationIdFromFolderAndRelativePath(
   return id;
 }
 
-/**
- * @deprecated Prefer presentationIdFromFolderAndRelativePath — slug collides for a-b vs a/b.
- * Kept for tests that assert legacy behavior during migration windows.
- */
-export function presentationIdFromRelativePath(relativePath: string): string {
-  const posix = stripQueryHash(relativePath).replace(/\\/g, '/').replace(/^\/+/, '');
-  const cleaned = posix
-    .replace(/[^A-Za-z0-9._:-]+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-+|-+$/g, '');
-  let id = `md:${cleaned || 'file'}`;
-  if (id.length > PRESENTATION_ID_MAX_LENGTH) {
-    id = id.slice(0, PRESENTATION_ID_MAX_LENGTH);
-  }
-  if (!STABLE_ID_PATTERN.test(id)) {
-    id = 'md:file';
-  }
-  return id;
-}
-
-/**
- * Resolve a raw webview href to an absolute path under one of `workspaceRoots`.
- * `workspaceRoots` may be plain fs paths (legacy) or `{ fsPath, uri }` for multi-root identity.
- */
+/** Resolve a raw webview href to an absolute path under a current workspace root. */
 export function resolveWorkspaceMarkdownPath(
   raw: string,
-  workspaceRoots: readonly (string | WorkspaceFolderRoot)[],
+  workspaceRoots: readonly WorkspaceFolderRoot[],
 ): MarkdownFileOpenTarget | undefined {
   if (!isWorkspaceMarkdownHref(raw) || workspaceRoots.length === 0) return undefined;
 
@@ -122,8 +99,7 @@ export function resolveWorkspaceMarkdownPath(
 
   for (const root of workspaceRoots) {
     if (!root) continue;
-    const fsPath = typeof root === 'string' ? root : root.fsPath;
-    const folderUri = typeof root === 'string' ? `file://${normalizeFsPath(root)}` : root.uri;
+    const { fsPath, uri: folderUri } = root;
     if (!fsPath) continue;
     const rootNorm = normalizeFsPath(fsPath);
     const candidate = isAbs

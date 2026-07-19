@@ -11,12 +11,11 @@ import type { NormalizedEvent, Question } from './types';
  * breaking change to the ExtMessage/OutMessage shapes below (and mirror it in
  * src/extension.ts).
  */
-export const PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 9;
 
 /**
- * Decide whether a peer's advertised protocol version is compatible with ours.
- * Same integer => compatible. A different version OR an absent/non-numeric one
- * (an old peer that predates version stamping) => incompatible, so the caller
+ * Require an exact peer protocol version. A different or malformed version
+ * is rejected so the caller
  * can surface a visible "reload the window" diagnostic instead of silently
  * proceeding against a drifted peer. Pure and side-effect free (unit-tested).
  */
@@ -42,7 +41,7 @@ export type TaskRuntimeActivity =
   | 'awaiting_outcome';
 
 /**
- * Compact single-axis status (host still sends for compatibility).
+ * Compact single-axis status used by the current summary contract.
  * Prefer lifecycle + runtimeActivity for UI.
  */
 export type TaskViewStatus = TaskLifecycleState | TaskRuntimeActivity;
@@ -53,8 +52,7 @@ export type TurnActivityWaitReason =
   | 'children'
   | 'external'
   | 'held_after_failure'
-  | 'live_turn_ahead'
-  | string;
+  | 'live_turn_ahead';
 
 export type TurnActivity =
   | {
@@ -69,54 +67,14 @@ export type TurnActivity =
   | { state: 'uncertain'; turnId: string; requiresConfirmation: true }
   | null;
 
-/** Explicit handoff progress phases (mirrors host TaskHandoffPhase). */
-export type TaskHandoffPhase =
-  | 'requested'
-  | 'exporting_context'
-  | 'summarizing_source'
-  | 'preparing_receiver'
-  | 'transferring'
-  | 'completed'
-  | 'failed'
-  | 'cancelled';
-
-/** Sanitized source/target labels only — never session ids. */
-export interface HandoffProgressBinding {
-  backend: string;
-  model?: string;
-}
-
-/** Bounded failure chrome for a failed/cancelled handoff. */
-export interface HandoffProgressFailure {
-  code: string;
-  message: string;
-  at: string;
-}
-
-/**
- * Task-scoped handoff chrome projected by the host (D018 / §19).
- * Never includes digests, summary/bootstrap bodies, session ids, or credentials.
- */
-export interface HandoffProgress {
-  operationId: string;
-  phase: TaskHandoffPhase;
-  source: HandoffProgressBinding;
-  target: HandoffProgressBinding;
-  createdAt: string;
-  updatedAt: string;
-  startedAt?: string;
-  finishedAt?: string;
-  failure?: HandoffProgressFailure;
-}
-
 export interface TaskSummary {
   id: string;
   parentId: string | null;
   goal: string;
-  role: string;
-  lifecycle: TaskLifecycleState | string;
+  role: 'coordinator' | 'worker';
+  lifecycle: TaskLifecycleState;
   /** Present when host supports dual-axis status; null when lifecycle is terminal. */
-  runtimeActivity?: TaskRuntimeActivity | null;
+  runtimeActivity: TaskRuntimeActivity | null;
   viewStatus: TaskViewStatus;
   /** Host-authoritative turn activity for composer/list chrome (required protocol v3+). */
   currentTurnActivity: TurnActivity;
@@ -128,12 +86,6 @@ export interface TaskSummary {
   /** Optional model id selected for this task (ACP session config option value). */
   model?: string;
   continuationOf?: string;
-  /**
-   * Optional sanitized handoff progress for model-switch chrome.
-   * Omitted when the task has no handoff. Never carries digests, session ids,
-   * or summary/bootstrap bodies — those stay off TaskSummary and chat.
-   */
-  handoffProgress?: HandoffProgress;
   /** Aggregate direct-child orchestration chrome for coordinators. */
   childOrchestration?: {
     total: number;
@@ -191,18 +143,73 @@ export interface QueuedTurnProjection {
   previewText?: string;
 }
 
+/**
+ * Current-only transcript page metadata (protocol v6+). Present iff a task is
+ * focused; carries the keyset cursor/hasMore flags and the page's workspace
+ * revision so the webview can request older pages (W5).
+ */
+export interface TranscriptPageState {
+  beforeCursor?: string;
+  hasMoreBefore: boolean;
+  workspaceRevision: number;
+}
+
+/** Bounds for loadTranscriptPage request correlation/payload fields (protocol v7). */
+export const TRANSCRIPT_PAGE_REQUEST_ID_MAX = 128;
+export const TRANSCRIPT_PAGE_TASK_ID_MAX = 512;
+export const TRANSCRIPT_PAGE_CURSOR_MAX = 4096;
+export const TRANSCRIPT_PAGE_MAX_ITEMS = 100;
+
+/** Bounds for workspacePatchBatch (protocol v9). */
+export const WORKSPACE_PATCH_MAX_PATCHES = 10_000;
+export const WORKSPACE_PATCH_MAX_ITEMS = 500;
+export const WORKSPACE_PATCH_MAX_QUEUED = 500;
+export const WORKSPACE_PATCH_ID_MAX = 512;
+
+/** Fixed failure codes for transcriptPageResult (no free-form message). */
+export type TranscriptPageErrorCode =
+  | 'invalidRequest'
+  | 'staleFocus'
+  | 'taskNotFound'
+  | 'invalidCursor'
+  | 'unavailable';
+
+export const TRANSCRIPT_PAGE_ERROR_CODES: readonly TranscriptPageErrorCode[] = [
+  'invalidRequest',
+  'staleFocus',
+  'taskNotFound',
+  'invalidCursor',
+  'unavailable',
+] as const;
+
+/** Host → webview older-page response (protocol v7). */
+export type TranscriptPageResultMessage =
+  | {
+      type: 'transcriptPageResult';
+      requestId: string;
+      taskId: string;
+      ok: true;
+      items: TranscriptItem[];
+      transcriptPage: TranscriptPageState;
+    }
+  | {
+      type: 'transcriptPageResult';
+      requestId: string;
+      taskId: string;
+      ok: false;
+      code: TranscriptPageErrorCode;
+    };
+
 export interface SnapshotMessage {
   type: 'snapshot';
-  /**
-   * Wire protocol version stamped by the host on this bootstrap message; see
-   * PROTOCOL_VERSION. Optional so an older host that predates version stamping
-   * still type-checks — its absence is treated as an (incompatible) mismatch.
-   */
-  protocolVersion?: number;
+  /** Exact wire protocol version stamped by the host. */
+  protocolVersion: number;
   rootTasks: TaskSummary[];
   focusedTaskId?: string;
   subtree?: TaskSummary[];
   transcript?: TranscriptItem[];
+  /** Present iff focusedTaskId is set (protocol v6, current-only). */
+  transcriptPage?: TranscriptPageState;
   activeTurnId?: string;
   /** Authoritative multi-queue projection (R012); optional for older hosts. */
   queuedTurns?: QueuedTurnProjection[];
@@ -239,13 +246,6 @@ export type RuntimeStorageSettingValue =
 export interface RuntimeStorageSettingsSnapshot {
   settings: RuntimeStorageSettingValue[];
 }
-
-/** @deprecated Compatibility aliases for extensions built against protocol v4 names. */
-export type RetentionSettingId = RuntimeStorageSettingId;
-/** @deprecated Use RuntimeStorageSettingValue. */
-export type RetentionSettingValue = RuntimeStorageSettingValue;
-/** @deprecated Use RuntimeStorageSettingsSnapshot. */
-export type RetentionSettingSnapshot = RuntimeStorageSettingsSnapshot;
 
 export interface SettingsSnapshotMessage {
   type: 'settingsSnapshot';
@@ -362,6 +362,42 @@ export interface BackendModels {
   options: BackendModelOption[];
 }
 
+/**
+ * Atomic workspace revision envelope (protocol v9).
+ * One SQLite transaction maps to one envelope with a single effective revision.
+ * Empty `patches: []` still advances the revision for invisible commits.
+ */
+export type WorkspacePatch =
+  | { type: 'taskUpserted'; task: TaskSummary }
+  | { type: 'turnActivityChanged'; task: TaskSummary }
+  | {
+      type: 'transcriptItemsAppended';
+      taskId: string;
+      items: TranscriptItem[];
+    }
+  | {
+      type: 'transcriptItemPatched';
+      taskId: string;
+      item: TranscriptItem;
+    }
+  | {
+      type: 'transcriptItemsRemoved';
+      taskId: string;
+      itemIds: string[];
+    }
+  | {
+      type: 'queuedTurnsChanged';
+      taskId: string;
+      queuedTurns: QueuedTurnProjection[];
+    }
+  | { type: 'taskRemoved'; taskId: string };
+
+export type WorkspacePatchBatchMessage = {
+  type: 'workspacePatchBatch';
+  revision: number;
+  patches: WorkspacePatch[];
+};
+
 // Extension host -> webview (protocol v2, TASK-MODEL-PHASE-D-PLAN §4.1)
 export type ExtMessage =
   | SnapshotMessage
@@ -371,12 +407,11 @@ export type ExtMessage =
   | TaskTypesSettingsUpdateResultMessage
   | PermissionSettingsSnapshotMessage
   | PermissionSettingsUpdateResultMessage
-  | { type: 'taskUpdated'; taskId: string; storeRevision: number; patch: Partial<TaskSummary> }
+  | WorkspacePatchBatchMessage
   | { type: 'turnStart'; taskId: string; turnId: string; trigger: TurnTrigger }
   | { type: 'event'; taskId: string; turnId: string; event: NormalizedEvent }
   | { type: 'turnDone'; taskId: string; turnId: string }
   | { type: 'turnError'; taskId: string; turnId: string; message: string }
-  | { type: 'transcriptAppend'; taskId: string; item: TranscriptItem }
   | { type: 'askPending'; taskId: string; turnId: string; askId: string; questions: Question[] }
   | { type: 'askCleared'; taskId: string; turnId: string; askId: string }
   | {
@@ -445,11 +480,31 @@ export type ExtMessage =
   | { type: 'skillsAvailable'; backend: string; prefix: string; skills: string[] }
   | { type: 'modelsAvailable'; models: Record<string, BackendModels> }
   /**
-   * Host-persisted last-used composer backend/model (globalState). Sent on
-   * webview mount so the picker survives restarts — webview `setState` alone
-   * is not durable enough when the view is recreated.
+   * Host-persisted last-used composer backend/model (VS Code Settings). Sent on
+   * webview mount so the picker survives restarts — webview `setState` must not
+   * store backend/model.
    */
   | { type: 'composerSelection'; backend: string; model: string | null }
+  /**
+   * Durable SQLite send-outbox snapshot for reload restore. Webview keeps these
+   * in memory only; setState must never hold message text.
+   */
+  | {
+      type: 'sendOutboxSnapshot';
+      entries: Array<{
+        clientRequestId: string;
+        status: 'pending' | 'rejected';
+        taskId?: string;
+        text: string;
+        llmText?: string;
+        mentionBindings?: Array<[string, string]>;
+        skills?: string[];
+        backend?: string;
+        model?: string;
+        continuationOf?: string;
+        createdAt: number;
+      }>;
+    }
   /**
    * Task Markdown export succeeded. `fileName` is basename only — never an
    * absolute path. Failures use `commandError`; cancel is intentionally silent.
@@ -461,6 +516,11 @@ export type ExtMessage =
       sourceRevision: number;
       exportedAt: string;
     }
+  /**
+   * Older transcript page response (protocol v7). Success carries ≤100 items +
+   * page metadata; failures use fixed codes only (no free-form message/stack).
+   */
+  | TranscriptPageResultMessage
   /**
    * Host response to `requestFileMentionSuggestions`.
    * Success returns relative suggestion items only (never absolute paths, cwd,
@@ -525,11 +585,35 @@ export type OutMessage =
       continuationOf?: string;
       /** Structured skill chips; injected into a NEW task's first turn only. */
       skills?: string[];
-      /** Phase C idempotent send key (stable across resend). */
-      clientRequestId?: string;
+      /** Display mention → resolved path pairs needed to restore rejected drafts. */
+      mentionBindings?: Array<[string, string]>;
+      /** Durable idempotent send key (stable across resend). */
+      clientRequestId: string;
     }
   | { type: 'focusTask'; taskId: string }
   | { type: 'hydrateSubtree'; taskId: string }
+  /**
+   * Request one bounded older transcript page for the focused task (introduced in v7).
+   * Host replies with `transcriptPageResult` (typed success or fixed error code).
+   * No loadHistory/historyChunk aliases.
+   */
+  | {
+      type: 'loadTranscriptPage';
+      requestId: string;
+      taskId: string;
+      beforeCursor: string;
+    }
+  /**
+   * Request a bounded workspace snapshot after a revision gap/invariant failure
+   * (protocol v9). Host replies with a normal `snapshot`. Single-flight on the
+   * webview; not used for protocol mismatch (that still requires Reload Window).
+   */
+  | {
+      type: 'requestWorkspaceRecovery';
+      taskId?: string;
+      currentRevision: number;
+      observedRevision: number;
+    }
   | { type: 'newTask' }
   | { type: 'cancelTurn'; taskId: string; turnId: string }
   | { type: 'submitAsk'; taskId: string; turnId: string; askId: string; answers: Record<string, AskAnswer> }
@@ -604,9 +688,8 @@ export type OutMessage =
   /**
    * Request a runtime model/backend handoff on an existing idle task.
    * Host validates, chains requestRuntimeHandoff → completeRuntimeHandoff,
-   * and projects progress via snapshot/taskUpdated. Refusals use task-scoped
-   * `commandError`. Success is observed via updated TaskSummary.backend/model
-   * + handoffProgress (no chat turns, no session ids).
+   * and atomically returns the new binding via snapshot/workspacePatchBatch. Refusals use
+   * task-scoped `commandError`; no synthetic chat turn is created.
    */
   | {
       type: 'requestRuntimeHandoff';
@@ -628,10 +711,12 @@ export type OutMessage =
   /** Webview → host debug line for Output channel "Muster Debug". */
   | { type: 'debugLog'; event: string; details?: Record<string, unknown> }
   /**
-   * Persist the composer's last-used backend/model on the host (globalState)
+   * Persist the composer's last-used backend/model in VS Code Settings
    * so the preference survives full restarts and webview recreation.
    */
   | { type: 'setComposerSelection'; backend: string; model?: string | null }
+  /** Prefill-applied: delete durable rejected outbox entry in SQLite. */
+  | { type: 'ackSendOutbox'; clientRequestId: string }
   /** User sets task lifecycle (not CLI-driven). */
   | {
       type: 'setTaskLifecycle';
@@ -679,6 +764,76 @@ function hasOnlyKeys(v: Record<string, unknown>, allowedKeys: readonly string[])
 
 function isInteger(v: unknown): v is number {
   return isNumber(v) && Number.isInteger(v);
+}
+
+const SEND_OUTBOX_ENTRY_KEYS = [
+  'clientRequestId', 'status', 'taskId', 'text', 'llmText', 'mentionBindings',
+  'skills', 'backend', 'model', 'continuationOf', 'createdAt',
+] as const;
+
+function isBoundedOutboxString(value: unknown, max: number): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= max && !value.includes('\0');
+}
+
+function isSendOutboxSnapshotEntry(value: unknown): boolean {
+  if (!isRecord(value) || Array.isArray(value) || !hasOnlyKeys(value, SEND_OUTBOX_ENTRY_KEYS)) {
+    return false;
+  }
+  if (
+    !isBoundedOutboxString(value.clientRequestId, 256) ||
+    (value.status !== 'pending' && value.status !== 'rejected') ||
+    !isBoundedOutboxString(value.text, 100_000) ||
+    !Number.isSafeInteger(value.createdAt) ||
+    (value.createdAt as number) < 0
+  ) {
+    return false;
+  }
+  for (const [key, max] of [
+    ['taskId', 256],
+    ['llmText', 100_000],
+    ['backend', 32],
+    ['model', 512],
+    ['continuationOf', 256],
+  ] as const) {
+    if (value[key] !== undefined && !isBoundedOutboxString(value[key], max)) return false;
+  }
+  if (value.skills !== undefined) {
+    const seenSkills = new Set<string>();
+    if (
+      !Array.isArray(value.skills) ||
+      value.skills.length > 8 ||
+      !value.skills.every((skill) =>
+        typeof skill === 'string' &&
+        skill.length > 0 &&
+        skill.length <= 128 &&
+        /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(skill) &&
+        !seenSkills.has(skill) &&
+        Boolean(seenSkills.add(skill))
+      )
+    ) {
+      return false;
+    }
+  }
+  if (value.mentionBindings !== undefined) {
+    const seenLabels = new Set<string>();
+    if (
+      !Array.isArray(value.mentionBindings) ||
+      value.mentionBindings.length > 64 ||
+      !value.mentionBindings.every((binding) =>
+        Array.isArray(binding) &&
+        binding.length === 2 &&
+        isBoundedOutboxString(binding[0], 512) &&
+        !/[\r\n]/.test(binding[0]) &&
+        isBoundedOutboxString(binding[1], 4096) &&
+        !/[\r\n]/.test(binding[1]) &&
+        !seenLabels.has(binding[0]) &&
+        Boolean(seenLabels.add(binding[0]))
+      )
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /** Basename-only export file names — never path segments or drive prefixes. */
@@ -882,98 +1037,105 @@ function isSettingsUpdateResult(v: unknown): v is SettingsUpdateResult {
 function isTurnActivity(v: unknown): v is TurnActivity {
   if (v === null) return true;
   if (!isRecord(v) || !isString(v.state) || !isString(v.turnId)) return false;
+  if (!isBoundedId(v.turnId, WORKSPACE_PATCH_ID_MAX)) return false;
   switch (v.state) {
     case 'queued':
       return (
-        (v.position === undefined || isNumber(v.position)) &&
-        (v.waitReason === undefined || isString(v.waitReason))
+        hasOnlyKeys(v, ['state', 'turnId', 'position', 'waitReason']) &&
+        (v.position === undefined || (isNonNegativeSafeInteger(v.position) && v.position > 0)) &&
+        (v.waitReason === undefined ||
+          v.waitReason === 'dependencies' ||
+          v.waitReason === 'children' ||
+          v.waitReason === 'external' ||
+          v.waitReason === 'held_after_failure' ||
+          v.waitReason === 'live_turn_ahead')
       );
     case 'executing':
       return (
-        v.phase === undefined ||
-        v.phase === 'starting' ||
-        v.phase === 'streaming' ||
-        v.phase === 'tool' ||
-        v.phase === 'retrying'
+        hasOnlyKeys(v, ['state', 'turnId', 'phase']) &&
+        (v.phase === undefined ||
+          v.phase === 'starting' ||
+          v.phase === 'streaming' ||
+          v.phase === 'tool' ||
+          v.phase === 'retrying')
       );
     case 'waiting_you':
-      return v.requestId === undefined || isString(v.requestId);
+      return (
+        hasOnlyKeys(v, ['state', 'turnId', 'requestId']) &&
+        (v.requestId === undefined || isBoundedId(v.requestId, WORKSPACE_PATCH_ID_MAX))
+      );
     case 'failed_turn':
-      return typeof v.retryable === 'boolean';
+      return hasOnlyKeys(v, ['state', 'turnId', 'retryable']) && typeof v.retryable === 'boolean';
     case 'uncertain':
-      return v.requiresConfirmation === true;
+      return hasOnlyKeys(v, ['state', 'turnId', 'requiresConfirmation']) && v.requiresConfirmation === true;
     default:
       return false;
   }
 }
 
-const TASK_HANDOFF_PHASES = new Set<TaskHandoffPhase>([
-  'requested',
-  'exporting_context',
-  'summarizing_source',
-  'preparing_receiver',
-  'transferring',
-  'completed',
-  'failed',
-  'cancelled',
-]);
-
-function isTaskHandoffPhase(v: unknown): v is TaskHandoffPhase {
-  return isString(v) && TASK_HANDOFF_PHASES.has(v as TaskHandoffPhase);
-}
-
-function isHandoffProgressBinding(v: unknown): v is HandoffProgressBinding {
-  if (!isRecord(v) || !isString(v.backend)) return false;
-  // Labels only — reject session ids or other secret-bearing keys at the wire guard.
-  if (!hasOnlyKeys(v, ['backend', 'model'])) return false;
-  return v.model === undefined || isString(v.model);
-}
-
-function isHandoffProgressFailure(v: unknown): v is HandoffProgressFailure {
-  if (!isRecord(v)) return false;
-  if (!hasOnlyKeys(v, ['code', 'message', 'at'])) return false;
-  return isString(v.code) && isString(v.message) && isString(v.at);
-}
-
-function isHandoffProgress(v: unknown): v is HandoffProgress {
+function isTaskSummary(v: unknown): v is TaskSummary {
   if (!isRecord(v)) return false;
   if (
     !hasOnlyKeys(v, [
-      'operationId',
-      'phase',
-      'source',
-      'target',
-      'createdAt',
+      'id',
+      'parentId',
+      'goal',
+      'role',
+      'lifecycle',
+      'runtimeActivity',
+      'viewStatus',
+      'currentTurnActivity',
+      'hasOutcomeProposal',
+      'runTimeoutMessage',
       'updatedAt',
-      'startedAt',
-      'finishedAt',
-      'failure',
+      'backend',
+      'model',
+      'continuationOf',
+      'childOrchestration',
     ])
   ) {
     return false;
   }
+  const lifecycle =
+    v.lifecycle === 'open' ||
+    v.lifecycle === 'succeeded' ||
+    v.lifecycle === 'failed' ||
+    v.lifecycle === 'cancelled' ||
+    v.lifecycle === 'skipped';
+  const runtimeActivity =
+    v.runtimeActivity === null ||
+    v.runtimeActivity === 'waiting_dependencies' ||
+    v.runtimeActivity === 'queued' ||
+    v.runtimeActivity === 'running' ||
+    v.runtimeActivity === 'waiting_user' ||
+    v.runtimeActivity === 'waiting_children' ||
+    v.runtimeActivity === 'blocked' ||
+    v.runtimeActivity === 'needs_recovery' ||
+    v.runtimeActivity === 'idle' ||
+    v.runtimeActivity === 'awaiting_outcome';
+  const viewStatus =
+    v.viewStatus === 'open' ||
+    v.viewStatus === 'succeeded' ||
+    v.viewStatus === 'failed' ||
+    v.viewStatus === 'cancelled' ||
+    v.viewStatus === 'skipped' ||
+    v.viewStatus === 'waiting_dependencies' ||
+    v.viewStatus === 'queued' ||
+    v.viewStatus === 'running' ||
+    v.viewStatus === 'waiting_user' ||
+    v.viewStatus === 'waiting_children' ||
+    v.viewStatus === 'blocked' ||
+    v.viewStatus === 'needs_recovery' ||
+    v.viewStatus === 'idle' ||
+    v.viewStatus === 'awaiting_outcome';
   return (
-    isString(v.operationId) &&
-    isTaskHandoffPhase(v.phase) &&
-    isHandoffProgressBinding(v.source) &&
-    isHandoffProgressBinding(v.target) &&
-    isString(v.createdAt) &&
-    isString(v.updatedAt) &&
-    (v.startedAt === undefined || isString(v.startedAt)) &&
-    (v.finishedAt === undefined || isString(v.finishedAt)) &&
-    (v.failure === undefined || isHandoffProgressFailure(v.failure))
-  );
-}
-
-function isTaskSummary(v: unknown): v is TaskSummary {
-  if (!isRecord(v)) return false;
-  return (
-    isString(v.id) &&
-    (v.parentId === null || isString(v.parentId)) &&
+    isBoundedId(v.id, WORKSPACE_PATCH_ID_MAX) &&
+    (v.parentId === null || isBoundedId(v.parentId, WORKSPACE_PATCH_ID_MAX)) &&
     isString(v.goal) &&
-    isString(v.role) &&
-    isString(v.lifecycle) &&
-    isString(v.viewStatus) &&
+    (v.role === 'coordinator' || v.role === 'worker') &&
+    lifecycle &&
+    runtimeActivity &&
+    viewStatus &&
     isTurnActivity(v.currentTurnActivity) &&
     isString(v.updatedAt) &&
     isString(v.backend) &&
@@ -981,56 +1143,315 @@ function isTaskSummary(v: unknown): v is TaskSummary {
     (v.continuationOf === undefined || isString(v.continuationOf)) &&
     (v.hasOutcomeProposal === undefined || typeof v.hasOutcomeProposal === 'boolean') &&
     (v.runTimeoutMessage === undefined || isString(v.runTimeoutMessage)) &&
-    (v.runtimeActivity === undefined ||
-      v.runtimeActivity === null ||
-      isString(v.runtimeActivity)) &&
-    (v.handoffProgress === undefined || isHandoffProgress(v.handoffProgress)) &&
     (v.childOrchestration === undefined ||
       (isRecord(v.childOrchestration) &&
-        typeof v.childOrchestration.total === 'number' &&
-        typeof v.childOrchestration.running === 'number' &&
-        typeof v.childOrchestration.open === 'number' &&
-        typeof v.childOrchestration.terminal === 'number' &&
-        typeof v.childOrchestration.awaitingParentSeal === 'number' &&
-        typeof v.childOrchestration.needsParentInput === 'number' &&
+        hasOnlyKeys(v.childOrchestration, [
+          'total',
+          'running',
+          'open',
+          'terminal',
+          'awaitingParentSeal',
+          'needsParentInput',
+          'label',
+        ]) &&
+        isNonNegativeSafeInteger(v.childOrchestration.total) &&
+        isNonNegativeSafeInteger(v.childOrchestration.running) &&
+        isNonNegativeSafeInteger(v.childOrchestration.open) &&
+        isNonNegativeSafeInteger(v.childOrchestration.terminal) &&
+        isNonNegativeSafeInteger(v.childOrchestration.awaitingParentSeal) &&
+        isNonNegativeSafeInteger(v.childOrchestration.needsParentInput) &&
         isString(v.childOrchestration.label)))
   );
 }
 
 function isTranscriptItem(v: unknown): v is TranscriptItem {
-  if (!isRecord(v) || !isString(v.id)) return false;
+  if (!isRecord(v) || !isBoundedId(v.id, WORKSPACE_PATCH_ID_MAX)) return false;
   switch (v.kind) {
     case 'user':
-    case 'assistant':
-      return isString(v.content);
-    case 'reasoning':
-      // Turn-scoped, string content, no order.
-      return isString(v.turnId) && isString(v.content);
+    case 'assistant': {
+      // Exact allowed keys; content is string; optional turnId/order/state typed.
+      if (!hasOnlyKeys(v, ['id', 'kind', 'content', 'turnId', 'order', 'state'])) return false;
+      if (!isString(v.content)) return false;
+      if (v.turnId !== undefined && !isBoundedId(v.turnId, WORKSPACE_PATCH_ID_MAX)) return false;
+      if (v.order !== undefined && !isNonNegativeSafeInteger(v.order)) return false;
+      if (
+        v.state !== undefined &&
+        v.state !== 'pending' &&
+        v.state !== 'assigned' &&
+        v.state !== 'complete' &&
+        v.state !== 'partial'
+      ) {
+        return false;
+      }
+      return true;
+    }
+    case 'reasoning': {
+      // Exact keys; non-empty turnId; string content. Host never sends order/state.
+      if (!hasOnlyKeys(v, ['id', 'kind', 'turnId', 'content'])) return false;
+      return isBoundedId(v.turnId, WORKSPACE_PATCH_ID_MAX) && isString(v.content);
+    }
     case 'tool': {
-      // Requires turnId + numeric order + structured tool content.
-      if (!isString(v.turnId) || !isNumber(v.order) || !isRecord(v.content)) return false;
+      // Exact top-level keys; structured tool content with fixed status/toolKind.
+      if (!hasOnlyKeys(v, ['id', 'kind', 'turnId', 'order', 'content'])) return false;
+      if (
+        !isBoundedId(v.turnId, WORKSPACE_PATCH_ID_MAX) ||
+        !isNonNegativeSafeInteger(v.order) ||
+        !isRecord(v.content)
+      ) return false;
       const c = v.content;
-      return isString(c.toolCallId) && isString(c.name) && isString(c.status);
+      if (
+        !hasOnlyKeys(c, [
+          'toolCallId',
+          'name',
+          'toolKind',
+          'status',
+          'input',
+          'output',
+          'error',
+        ])
+      ) {
+        return false;
+      }
+      if (!isBoundedId(c.toolCallId, WORKSPACE_PATCH_ID_MAX) || !isString(c.name)) return false;
+      if (c.status !== 'running' && c.status !== 'success' && c.status !== 'error') return false;
+      if (
+        c.toolKind !== undefined &&
+        c.toolKind !== 'mcp' &&
+        c.toolKind !== 'builtin' &&
+        c.toolKind !== 'other'
+      ) {
+        return false;
+      }
+      if (c.error !== undefined && !isString(c.error)) return false;
+      // input/output remain unknown payloads when present.
+      return true;
     }
     case 'error':
-      // Locally-synthesized only; the host never sends error transcript items.
-      return true;
+      // Locally-synthesized only; host isExtMessage must reject error items.
+      return false;
     default:
       return false;
   }
 }
 
+function isTranscriptPageState(v: unknown): v is TranscriptPageState {
+  if (!isRecord(v)) return false;
+  // Exact keys: hasMoreBefore + workspaceRevision + optional beforeCursor.
+  if (!hasOnlyKeys(v, ['hasMoreBefore', 'workspaceRevision', 'beforeCursor'])) return false;
+  if (typeof v.hasMoreBefore !== 'boolean') return false;
+  // workspaceRevision: finite, non-negative safe integer.
+  if (
+    typeof v.workspaceRevision !== 'number' ||
+    !Number.isFinite(v.workspaceRevision) ||
+    !Number.isSafeInteger(v.workspaceRevision) ||
+    v.workspaceRevision < 0
+  ) {
+    return false;
+  }
+  // beforeCursor is present only when there is an older page to fetch.
+  if (v.hasMoreBefore) {
+    if (!isString(v.beforeCursor) || v.beforeCursor.length === 0 || v.beforeCursor.length > TRANSCRIPT_PAGE_CURSOR_MAX) {
+      return false;
+    }
+  } else if (v.beforeCursor !== undefined) {
+    return false;
+  }
+  return true;
+}
+
+function isBoundedId(v: unknown, max: number): v is string {
+  return isString(v) && v.length > 0 && v.length <= max && !v.includes('\0');
+}
+
+function isTranscriptPageErrorCode(v: unknown): v is TranscriptPageErrorCode {
+  return (
+    v === 'invalidRequest' ||
+    v === 'staleFocus' ||
+    v === 'taskNotFound' ||
+    v === 'invalidCursor' ||
+    v === 'unavailable'
+  );
+}
+
+function isTranscriptPageResultMessage(data: Record<string, unknown>): boolean {
+  if (data.type !== 'transcriptPageResult') return false;
+  if (!isBoundedId(data.requestId, TRANSCRIPT_PAGE_REQUEST_ID_MAX)) return false;
+  if (!isBoundedId(data.taskId, TRANSCRIPT_PAGE_TASK_ID_MAX)) return false;
+  if (data.ok === true) {
+    if (
+      !hasOnlyKeys(data, ['type', 'requestId', 'taskId', 'ok', 'items', 'transcriptPage'])
+    ) {
+      return false;
+    }
+    if (!Array.isArray(data.items) || data.items.length > TRANSCRIPT_PAGE_MAX_ITEMS) return false;
+    if (!data.items.every(isTranscriptItem)) return false;
+    return isTranscriptPageState(data.transcriptPage);
+  }
+  if (data.ok === false) {
+    if (!hasOnlyKeys(data, ['type', 'requestId', 'taskId', 'ok', 'code'])) return false;
+    return isTranscriptPageErrorCode(data.code);
+  }
+  return false;
+}
+
 function isQueuedTurnProjection(v: unknown): v is QueuedTurnProjection {
   if (!isRecord(v)) return false;
+  if (!hasOnlyKeys(v, ['turnId', 'sequence', 'status', 'messageIds', 'createdAt', 'previewText'])) {
+    return false;
+  }
+  if (!Array.isArray(v.messageIds) || v.messageIds.length > WORKSPACE_PATCH_MAX_ITEMS) return false;
+  const seenMessageIds = new Set<string>();
+  for (const messageId of v.messageIds) {
+    if (!isWorkspacePatchIdentity(messageId) || seenMessageIds.has(messageId)) return false;
+    seenMessageIds.add(messageId);
+  }
   return (
-    isString(v.turnId) &&
-    isNumber(v.sequence) &&
+    isWorkspacePatchIdentity(v.turnId) &&
+    isNonNegativeSafeInteger(v.sequence) &&
+    v.sequence > 0 &&
     v.status === 'queued' &&
-    Array.isArray(v.messageIds) &&
-    v.messageIds.every(isString) &&
     isString(v.createdAt) &&
     (v.previewText === undefined || isString(v.previewText))
   );
+}
+
+function isNonNegativeSafeInteger(v: unknown): v is number {
+  return (
+    typeof v === 'number' &&
+    Number.isFinite(v) &&
+    Number.isSafeInteger(v) &&
+    v >= 0
+  );
+}
+
+function isWorkspacePatchIdentity(v: unknown): v is string {
+  return isBoundedId(v, WORKSPACE_PATCH_ID_MAX);
+}
+
+function isWorkspacePatch(v: unknown): v is WorkspacePatch {
+  if (!isRecord(v) || !isString(v.type)) return false;
+  switch (v.type) {
+    case 'taskUpserted':
+      return hasOnlyKeys(v, ['type', 'task']) && isTaskSummary(v.task) && isWorkspacePatchIdentity(v.task.id);
+    case 'turnActivityChanged':
+      return hasOnlyKeys(v, ['type', 'task']) && isTaskSummary(v.task) && isWorkspacePatchIdentity(v.task.id);
+    case 'transcriptItemsAppended': {
+      if (!hasOnlyKeys(v, ['type', 'taskId', 'items'])) return false;
+      if (!isWorkspacePatchIdentity(v.taskId)) return false;
+      if (!Array.isArray(v.items) || v.items.length === 0 || v.items.length > WORKSPACE_PATCH_MAX_ITEMS) {
+        return false;
+      }
+      if (!v.items.every(isTranscriptItem)) return false;
+      const seen = new Set<string>();
+      for (const item of v.items) {
+        if (!isWorkspacePatchIdentity(item.id) || seen.has(item.id)) return false;
+        seen.add(item.id);
+      }
+      return true;
+    }
+    case 'transcriptItemPatched':
+      return (
+        hasOnlyKeys(v, ['type', 'taskId', 'item']) &&
+        isWorkspacePatchIdentity(v.taskId) &&
+        isTranscriptItem(v.item) &&
+        isWorkspacePatchIdentity(v.item.id)
+      );
+    case 'transcriptItemsRemoved': {
+      if (!hasOnlyKeys(v, ['type', 'taskId', 'itemIds'])) return false;
+      if (!isWorkspacePatchIdentity(v.taskId)) return false;
+      if (!Array.isArray(v.itemIds) || v.itemIds.length === 0 || v.itemIds.length > WORKSPACE_PATCH_MAX_ITEMS) {
+        return false;
+      }
+      const seen = new Set<string>();
+      for (const itemId of v.itemIds) {
+        if (!isWorkspacePatchIdentity(itemId) || seen.has(itemId)) return false;
+        seen.add(itemId);
+      }
+      return true;
+    }
+    case 'queuedTurnsChanged': {
+      if (!hasOnlyKeys(v, ['type', 'taskId', 'queuedTurns'])) return false;
+      if (!isWorkspacePatchIdentity(v.taskId)) return false;
+      if (!Array.isArray(v.queuedTurns) || v.queuedTurns.length > WORKSPACE_PATCH_MAX_QUEUED) return false;
+      if (!v.queuedTurns.every(isQueuedTurnProjection)) return false;
+      const seen = new Set<string>();
+      for (const turn of v.queuedTurns) {
+        if (!isWorkspacePatchIdentity(turn.turnId) || seen.has(turn.turnId)) return false;
+        seen.add(turn.turnId);
+      }
+      return true;
+    }
+    case 'taskRemoved':
+      return hasOnlyKeys(v, ['type', 'taskId']) && isWorkspacePatchIdentity(v.taskId);
+    default:
+      return false;
+  }
+}
+
+function isWorkspacePatchBatchMessage(data: Record<string, unknown>): boolean {
+  if (data.type !== 'workspacePatchBatch') return false;
+  if (!hasOnlyKeys(data, ['type', 'revision', 'patches'])) return false;
+  if (!isNonNegativeSafeInteger(data.revision)) return false;
+  if (!Array.isArray(data.patches) || data.patches.length > WORKSPACE_PATCH_MAX_PATCHES) return false;
+  if (!data.patches.every(isWorkspacePatch)) return false;
+
+  // Reject duplicate stable identities within the same atomic batch.
+  const taskIds = new Set<string>();
+  const transcriptKeys = new Set<string>();
+  const queueTaskIds = new Set<string>();
+  let totalTranscriptItems = 0;
+  let totalQueuedTurns = 0;
+  for (const patch of data.patches as WorkspacePatch[]) {
+    switch (patch.type) {
+      case 'taskUpserted':
+      case 'turnActivityChanged': {
+        if (taskIds.has(patch.task.id)) return false;
+        taskIds.add(patch.task.id);
+        break;
+      }
+      case 'taskRemoved': {
+        if (taskIds.has(patch.taskId)) return false;
+        taskIds.add(patch.taskId);
+        break;
+      }
+      case 'transcriptItemsAppended': {
+        totalTranscriptItems += patch.items.length;
+        if (totalTranscriptItems > WORKSPACE_PATCH_MAX_ITEMS) return false;
+        for (const item of patch.items) {
+          const key = `${patch.taskId}\0${item.id}`;
+          if (transcriptKeys.has(key)) return false;
+          transcriptKeys.add(key);
+        }
+        break;
+      }
+      case 'transcriptItemPatched': {
+        totalTranscriptItems += 1;
+        if (totalTranscriptItems > WORKSPACE_PATCH_MAX_ITEMS) return false;
+        const key = `${patch.taskId}\0${patch.item.id}`;
+        if (transcriptKeys.has(key)) return false;
+        transcriptKeys.add(key);
+        break;
+      }
+      case 'transcriptItemsRemoved': {
+        totalTranscriptItems += patch.itemIds.length;
+        if (totalTranscriptItems > WORKSPACE_PATCH_MAX_ITEMS) return false;
+        for (const itemId of patch.itemIds) {
+          const key = `${patch.taskId}\0${itemId}`;
+          if (transcriptKeys.has(key)) return false;
+          transcriptKeys.add(key);
+        }
+        break;
+      }
+      case 'queuedTurnsChanged': {
+        totalQueuedTurns += patch.queuedTurns.length;
+        if (totalQueuedTurns > WORKSPACE_PATCH_MAX_QUEUED) return false;
+        if (queueTaskIds.has(patch.taskId)) return false;
+        queueTaskIds.add(patch.taskId);
+        break;
+      }
+    }
+  }
+  return true;
 }
 
 /** Discriminated runtime guard for a NormalizedEvent arriving from the host. */
@@ -1092,25 +1513,54 @@ export function isExtMessage(data: unknown): data is ExtMessage {
   }
 
   switch (t) {
-    case 'snapshot':
-      return (
-        (data.protocolVersion === undefined || isNumber(data.protocolVersion)) &&
-        Array.isArray(data.rootTasks) &&
-        data.rootTasks.every(isTaskSummary) &&
-        isNumber(data.storeRevision) &&
-        (data.focusedTaskId === undefined || isString(data.focusedTaskId)) &&
-        (data.subtree === undefined || (Array.isArray(data.subtree) && data.subtree.every(isTaskSummary))) &&
-        (data.transcript === undefined || (Array.isArray(data.transcript) && data.transcript.every(isTranscriptItem))) &&
-        (data.activeTurnId === undefined || isString(data.activeTurnId)) &&
-        (data.queuedTurns === undefined ||
-          (Array.isArray(data.queuedTurns) && data.queuedTurns.every(isQueuedTurnProjection))) &&
-        (data.pendingAsk === undefined ||
-          (isRecord(data.pendingAsk) &&
-            isString(data.pendingAsk.turnId) &&
-            isString(data.pendingAsk.askId) &&
-            Array.isArray(data.pendingAsk.questions) &&
-            data.pendingAsk.questions.every(isQuestion)))
-      );
+    case 'snapshot': {
+      if (
+        !(
+          hasOnlyKeys(data, [
+            'type',
+            'protocolVersion',
+            'rootTasks',
+            'focusedTaskId',
+            'subtree',
+            'transcript',
+            'transcriptPage',
+            'activeTurnId',
+            'queuedTurns',
+            'pendingAsk',
+            'storeRevision',
+          ]) &&
+          isNumber(data.protocolVersion) &&
+          Array.isArray(data.rootTasks) &&
+          data.rootTasks.every(isTaskSummary) &&
+          isNumber(data.storeRevision) &&
+          (data.focusedTaskId === undefined || isString(data.focusedTaskId)) &&
+          (data.subtree === undefined || (Array.isArray(data.subtree) && data.subtree.every(isTaskSummary))) &&
+          (data.transcript === undefined || (Array.isArray(data.transcript) && data.transcript.every(isTranscriptItem))) &&
+          (data.activeTurnId === undefined || isString(data.activeTurnId)) &&
+          (data.queuedTurns === undefined ||
+            (Array.isArray(data.queuedTurns) && data.queuedTurns.every(isQueuedTurnProjection))) &&
+          (data.pendingAsk === undefined ||
+            (isRecord(data.pendingAsk) &&
+              isString(data.pendingAsk.turnId) &&
+              isString(data.pendingAsk.askId) &&
+              Array.isArray(data.pendingAsk.questions) &&
+              data.pendingAsk.questions.every(isQuestion)))
+        )
+      ) {
+        return false;
+      }
+      // Protocol v6 current-only contract: a focused snapshot always carries a
+      // transcript array AND transcriptPage metadata; a no-focus snapshot has
+      // neither. No optional-fallback tolerance for the old (pre-v6) shape.
+      if (isString(data.focusedTaskId)) {
+        return (
+          Array.isArray(data.transcript) &&
+          data.transcript.every(isTranscriptItem) &&
+          isTranscriptPageState(data.transcriptPage)
+        );
+      }
+      return data.transcript === undefined && data.transcriptPage === undefined;
+    }
 
     case 'settingsSnapshot':
       return hasOnlyKeys(data, ['type', 'snapshot']) && isRuntimeStorageSettingsSnapshot(data.snapshot);
@@ -1130,8 +1580,8 @@ export function isExtMessage(data: unknown): data is ExtMessage {
     case 'permissionSettingsUpdateResult':
       return hasOnlyKeys(data, ['type', 'result']) && isPermissionSettingsUpdateResult(data.result);
 
-    case 'taskUpdated':
-      return isString(data.taskId) && isNumber(data.storeRevision) && isRecord(data.patch);
+    case 'workspacePatchBatch':
+      return isWorkspacePatchBatchMessage(data);
 
     case 'turnStart':
       return isString(data.trigger);
@@ -1145,8 +1595,8 @@ export function isExtMessage(data: unknown): data is ExtMessage {
     case 'turnError':
       return isString(data.message);
 
-    case 'transcriptAppend':
-      return isString(data.taskId) && isTranscriptItem(data.item);
+    case 'transcriptPageResult':
+      return isTranscriptPageResultMessage(data);
 
     case 'askPending':
       return isString(data.askId) && Array.isArray(data.questions) && data.questions.every(isQuestion);
@@ -1251,6 +1701,16 @@ export function isExtMessage(data: unknown): data is ExtMessage {
         hasOnlyKeys(data, ['type', 'backend', 'model']) &&
         isString(data.backend) &&
         (data.model === null || isString(data.model))
+      );
+
+    case 'sendOutboxSnapshot':
+      return (
+        hasOnlyKeys(data, ['type', 'entries']) &&
+        Array.isArray(data.entries) &&
+        data.entries.length <= 32 &&
+        data.entries.every(isSendOutboxSnapshotEntry) &&
+        new Set(data.entries.map((entry) => (entry as { clientRequestId: string }).clientRequestId)).size ===
+          data.entries.length
       );
 
     case 'exportResult':

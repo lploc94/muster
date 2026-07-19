@@ -4,7 +4,6 @@ import {
   isCanonicalInsideRoot,
   isWorkspaceMarkdownHref,
   presentationIdFromFolderAndRelativePath,
-  presentationIdFromRelativePath,
   resolveUnderSource,
   resolveWorkspaceMarkdownPath,
   splitMarkdownHref,
@@ -31,9 +30,10 @@ describe('isWorkspaceMarkdownHref', () => {
 describe('resolveWorkspaceMarkdownPath', () => {
   const root = '/Users/me/proj';
   const folderUri = 'file:///Users/me/proj';
+  const folder = { fsPath: root, uri: folderUri };
 
   it('resolves relative path under workspace', () => {
-    const t = resolveWorkspaceMarkdownPath('docs/plan.md', [root]);
+    const t = resolveWorkspaceMarkdownPath('docs/plan.md', [folder]);
     expect(t).toEqual({
       absolutePath: '/Users/me/proj/docs/plan.md',
       presentationId: presentationIdFromFolderAndRelativePath(folderUri, 'docs/plan.md'),
@@ -44,20 +44,20 @@ describe('resolveWorkspaceMarkdownPath', () => {
   });
 
   it('rejects path outside workspace', () => {
-    expect(resolveWorkspaceMarkdownPath('/etc/passwd.md', [root])).toBeUndefined();
-    expect(resolveWorkspaceMarkdownPath('../outside.md', [root])).toBeUndefined();
+    expect(resolveWorkspaceMarkdownPath('/etc/passwd.md', [folder])).toBeUndefined();
+    expect(resolveWorkspaceMarkdownPath('../outside.md', [folder])).toBeUndefined();
   });
 
   it('accepts absolute path inside workspace', () => {
-    const t = resolveWorkspaceMarkdownPath('/Users/me/proj/docs/x.md', [root]);
+    const t = resolveWorkspaceMarkdownPath('/Users/me/proj/docs/x.md', [folder]);
     expect(t?.absolutePath).toBe('/Users/me/proj/docs/x.md');
     expect(t?.title).toBe('x');
     expect(t?.sourcePath).toBe('docs/x.md');
   });
 
   it('gives distinct ids for a-b vs a/b and multi-root same relative path', () => {
-    const a = resolveWorkspaceMarkdownPath('docs/a-b.md', [root]);
-    const b = resolveWorkspaceMarkdownPath('docs/a/b.md', [root]);
+    const a = resolveWorkspaceMarkdownPath('docs/a-b.md', [folder]);
+    const b = resolveWorkspaceMarkdownPath('docs/a/b.md', [folder]);
     expect(a?.presentationId).not.toBe(b?.presentationId);
     const r1 = resolveWorkspaceMarkdownPath('notes/plan.md', [
       { fsPath: '/ws/one', uri: 'file:///ws/one' },
@@ -68,12 +68,6 @@ describe('resolveWorkspaceMarkdownPath', () => {
     expect(r1?.presentationId).not.toBe(r2?.presentationId);
     expect(r1?.sourceFolderUri).toBe('file:///ws/one');
     expect(r2?.sourceFolderUri).toBe('file:///ws/two');
-  });
-});
-
-describe('presentationIdFromRelativePath', () => {
-  it('produces legacy slug ids', () => {
-    expect(presentationIdFromRelativePath('docs/plans/foo.md')).toBe('md:docs-plans-foo.md');
   });
 });
 

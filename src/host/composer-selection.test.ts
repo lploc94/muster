@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
-  COMPOSER_SELECTION_STATE_KEY,
+  COMPOSER_SELECTION_CONFIG_KEY,
   parseComposerSelection,
   readComposerSelection,
   writeComposerSelection,
@@ -54,27 +54,32 @@ describe('parseComposerSelection', () => {
 });
 
 describe('readComposerSelection / writeComposerSelection', () => {
-  it('reads a stored selection', () => {
-    const store = {
+  it('reads a stored selection from Settings', () => {
+    const config = {
       get: vi.fn().mockReturnValue({ backend: 'grok', model: 'm1' }),
       update: vi.fn(),
     };
-    expect(readComposerSelection(store)).toEqual({ backend: 'grok', model: 'm1' });
-    expect(store.get).toHaveBeenCalledWith(COMPOSER_SELECTION_STATE_KEY);
+    expect(readComposerSelection(config)).toEqual({ backend: 'grok', model: 'm1' });
+    expect(config.get).toHaveBeenCalledWith(COMPOSER_SELECTION_CONFIG_KEY);
   });
 
-  it('returns null when store is empty or invalid', () => {
+  it('returns null when setting is empty or invalid', () => {
     expect(readComposerSelection({ get: () => undefined, update: () => undefined })).toBeNull();
     expect(readComposerSelection({ get: () => ({ backend: 'x' }), update: () => undefined })).toBeNull();
   });
 
-  it('writes a normalized selection', async () => {
+  it('writes a normalized selection to Global target', async () => {
     const update = vi.fn().mockResolvedValue(undefined);
-    await writeComposerSelection({ get: () => undefined, update }, { backend: 'opencode', model: null });
-    expect(update).toHaveBeenCalledWith(COMPOSER_SELECTION_STATE_KEY, {
-      backend: 'opencode',
-      model: null,
-    });
+    await writeComposerSelection(
+      { get: () => undefined, update },
+      { backend: 'opencode', model: null },
+      1,
+    );
+    expect(update).toHaveBeenCalledWith(
+      COMPOSER_SELECTION_CONFIG_KEY,
+      { backend: 'opencode', model: null },
+      1,
+    );
   });
 
   it('swallows write failures', async () => {
@@ -87,6 +92,7 @@ describe('readComposerSelection / writeComposerSelection', () => {
           },
         },
         { backend: 'claude', model: null },
+        1,
       ),
     ).resolves.toBeUndefined();
   });

@@ -4,28 +4,21 @@
   import { renderPresentationMarkdown } from './lib/presentation-markdown';
   import {
     applyPresentationUpdate,
-    buildPersistedState,
     kindLabel,
-    parsePersistedPresentation,
-    parsePersistedPresentationState,
     parsePresentationRevealResult,
     parsePresentationUpdate,
     type PresentationDocument,
   } from './lib/presentation-protocol';
   import { vscode } from './lib/vscode';
 
-  function initialDocument(): PresentationDocument | undefined {
-    const state = vscode.getState();
-    const envelope = parsePersistedPresentationState(state);
-    if (envelope) return envelope.document;
-    return parsePersistedPresentation(state);
-  }
-
+  // Opaque restore handle only — never persist markdown/title/document in setState.
+  // Host serializer + SQLite are the durable source of truth.
   function initialRootId(): string | undefined {
-    return parsePersistedPresentationState(vscode.getState())?.rootId;
+    const raw = vscode.getState() as { rootId?: unknown; presentationId?: unknown } | undefined;
+    return typeof raw?.rootId === 'string' ? raw.rootId : undefined;
   }
 
-  let document = $state<PresentationDocument | undefined>(initialDocument());
+  let document = $state<PresentationDocument | undefined>(undefined);
   let rootId = $state<string | undefined>(initialRootId());
   let article = $state<HTMLElement>();
   let renderGeneration = 0;
@@ -71,8 +64,16 @@
   }
 
   function persist(): void {
-    if (!document) return;
-    vscode.setState(buildPersistedState(rootId, document));
+    if (!document || !rootId) return;
+    // Bounded opaque IDs only — no markdown/title/summary/path.
+    try {
+      vscode.setState({
+        rootId,
+        presentationId: document.presentationId,
+      });
+    } catch {
+      // best-effort chrome handle
+    }
   }
 
   function showFallback(element: HTMLElement, reason: string, source: string): void {
@@ -277,8 +278,7 @@
         previous &&
         accepted &&
         previous.presentationId === accepted.presentationId &&
-        accepted.revision > previous.revision &&
-        !parsed.restore
+        accepted.revision > previous.revision
           ? captureScrollAnchor()
           : undefined;
       document = accepted;
@@ -288,8 +288,7 @@
         previous &&
         accepted &&
         previous.presentationId === accepted.presentationId &&
-        accepted.revision > previous.revision &&
-        !parsed.restore
+        accepted.revision > previous.revision
       ) {
         revisionAnnounce = `Updated to revision ${accepted.revision}`;
         if (revisionAnnounceTimer) clearTimeout(revisionAnnounceTimer);

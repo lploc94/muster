@@ -29,9 +29,18 @@
     TaskTypeSettingsRow,
     TaskTypesSettingsSnapshot,
     TaskTypesSettingsUpdateResult,
+    WorkspacePatchBatchMessage,
   } from './lib/protocol';
+  import {
+    applySnapshotToPatchView,
+    applyWorkspacePatchBatch,
+    emptyWorkspacePatchViewState,
+    enterWorkspacePatchRecovery,
+    syncTranscriptPageIntoPatchView,
+    type WorkspacePatchViewState,
+  } from './lib/workspace-patch-reducer';
   import { tip } from './lib/tooltip';
-  import { outboxList, outboxMarkRejected, outboxPending, outboxRejected, outboxRemove } from './lib/send-outbox';
+  import { outboxList, outboxMarkRejected, outboxPending, outboxRejected, outboxRemove, outboxReplaceAll } from './lib/send-outbox';
   import { selectTask as navSelectTask } from './lib/task-nav';
   import {
     DATA_RUNTIME_STORAGE_IDS,
@@ -99,6 +108,49 @@
   // differs from ours (host<->webview drift). Surfaces a visible banner instead
   // of silently dropping the drifted message.
   let protocolMismatch = $state(false);
+
+  /** Pure protocol-v8 revision view mirrored from snapshots/patch batches. */
+  let patchView = $state<WorkspacePatchViewState>(emptyWorkspacePatchViewState());
+  /** Single-flight recovery while needsRecovery is true. */
+  let recoveryInFlight = false;
+
+  function requestWorkspaceRecovery(observedRevision: number): void {
+    if (protocolMismatch || recoveryInFlight) return;
+    recoveryInFlight = true;
+    const payload: {
+      type: 'requestWorkspaceRecovery';
+      taskId?: string;
+      currentRevision: number;
+      observedRevision: number;
+    } = {
+      type: 'requestWorkspaceRecovery',
+      currentRevision: patchView.revision,
+      observedRevision,
+    };
+    if (tasks.focusedTaskId) payload.taskId = tasks.focusedTaskId;
+    post(payload);
+  }
+
+  function applyPatchBatchMessage(msg: WorkspacePatchBatchMessage): void {
+    if (protocolMismatch) return;
+    const result = applyWorkspacePatchBatch(patchView, msg);
+    patchView = result.state;
+    if (result.applied) {
+      tasks.applyPatchView(result.state);
+      threadStore.applyPatchView(result.state);
+      if (tasks.focusedTaskId) {
+        const focused = tasks.tasks.get(tasks.focusedTaskId);
+        if (focused) {
+          threadStore.updateReadOnly(focused.lifecycle);
+          threadStore.updateRuntimeFlags(effectiveRuntimeActivity(focused));
+        }
+      }
+    }
+    if (result.enteredRecovery) {
+      tasks.markNeedsRecovery();
+      requestWorkspaceRecovery(result.state.observedRevision ?? msg.revision);
+    }
+  }
 
   // When no focused task and not in draft, we show the previous tasks list as entry
   const inChat = $derived(tasks.draftMode || !!tasks.focusedTaskId);
@@ -449,11 +501,54 @@
         protocolMismatch = false;
       }
 
-      if (!isExtMessage(msg)) return;
+      if (!isExtMessage(msg)) {
+        // A current-host patch envelope with an invalid nested shape or duplicate
+        // identity is a projection invariant failure, not a message to drop
+        // silently. Recover once from a bounded snapshot so a final bad revision
+        // cannot leave the UI stale forever waiting for a future gap.
+        if (
+          !protocolMismatch &&
+          msg &&
+          typeof msg === 'object' &&
+          (msg as { type?: unknown }).type === 'workspacePatchBatch'
+        ) {
+          const rawRevision = (msg as { revision?: unknown }).revision;
+          const observedRevision =
+            typeof rawRevision === 'number' &&
+            Number.isSafeInteger(rawRevision) &&
+            rawRevision >= 0
+              ? rawRevision
+              : patchView.revision + 1;
+          // A malformed replay older than the state already applied cannot
+          // make the current view stale. Ignore it like any other stale batch.
+          if (
+            typeof rawRevision === 'number' &&
+            Number.isSafeInteger(rawRevision) &&
+            rawRevision <= patchView.revision
+          ) {
+            return;
+          }
+          const recovery = enterWorkspacePatchRecovery(patchView, observedRevision);
+          patchView = recovery.state;
+          if (recovery.enteredRecovery) {
+            tasks.markNeedsRecovery();
+            requestWorkspaceRecovery(recovery.state.observedRevision ?? observedRevision);
+          }
+        }
+        return;
+      }
 
       switch (msg.type) {
         case 'snapshot': {
+          const nextPatchView = applySnapshotToPatchView(patchView, msg);
+          if (nextPatchView === patchView && msg.storeRevision < patchView.revision) {
+            // A focus/recovery read that lost a race with an already-applied
+            // patch must not regress either the task store or thread window.
+            break;
+          }
           tasks.applySnapshot(msg);
+          patchView = nextPatchView;
+          recoveryInFlight = false;
           pendingAsk = msg.pendingAsk ?? null;
           askSubmissionError = undefined;
           activeTurnId = msg.activeTurnId ?? null;
@@ -468,9 +563,10 @@
               {
                 lifecycle: focused?.lifecycle,
                 runtimeActivity: focused ? effectiveRuntimeActivity(focused) : null,
+                ...(msg.transcriptPage ? { transcriptPage: msg.transcriptPage } : {}),
               },
             );
-          } else if (tasks.draftMode) {
+          } else if (!tasks.draftMode) {
             threadStore.clearFocus();
           }
           // Phase C: replay pending (not rejected) outbox only after compatible snapshot.
@@ -485,6 +581,8 @@
                 backend: entry.backend,
                 model: entry.model,
                 continuationOf: entry.continuationOf,
+                mentionBindings: entry.mentionBindings,
+                skills: entry.skills,
                 clientRequestId: entry.clientRequestId,
               });
             }
@@ -492,17 +590,8 @@
           break;
         }
 
-        case 'taskUpdated': {
-          tasks.applyTaskUpdated(msg.taskId, msg.storeRevision, msg.patch);
-          if (msg.taskId === tasks.focusedTaskId) {
-            const focused = tasks.tasks.get(msg.taskId);
-            if (focused) {
-              threadStore.updateReadOnly(focused.lifecycle);
-              threadStore.updateRuntimeFlags(effectiveRuntimeActivity(focused));
-            } else if (msg.patch.lifecycle) {
-              threadStore.updateReadOnly(msg.patch.lifecycle);
-            }
-          }
+        case 'workspacePatchBatch': {
+          applyPatchBatchMessage(msg);
           break;
         }
 
@@ -609,9 +698,24 @@
           }
           break;
 
-        case 'transcriptAppend':
-          threadStore.onTranscriptAppend(msg.taskId, msg.item);
+        case 'transcriptPageResult': {
+          // Drop early if the message is not for the currently focused task.
+          if (msg.taskId !== tasks.focusedTaskId) break;
+          if (threadStore.onTranscriptPageResult(msg)) {
+            // Keep pure patch-view ownership in sync with W5 older pages so the
+            // next workspacePatchBatch does not replace the prepended window.
+            const thread = threadStore.current;
+            patchView = syncTranscriptPageIntoPatchView(patchView, {
+              focusedTaskId: tasks.focusedTaskId,
+              transcriptItems: thread.items,
+              reasoningByTurn: thread.reasoningByTurn,
+              reasoningTurnByItemId: thread.getReasoningTurnByItemId(),
+              loadedTranscriptIds: thread.getLoadedTranscriptIds(),
+              transcriptWorkspaceRevision: thread.transcriptWorkspaceRevision,
+            });
+          }
           break;
+        }
 
         case 'askPending': {
           // Never auto-focus another task (owning-root makes siblings known).
@@ -794,6 +898,44 @@
         case 'composerSelection':
           tasks.applyHostComposerSelection(msg.backend, msg.model);
           break;
+
+        case 'sendOutboxSnapshot': {
+          outboxReplaceAll(msg.entries);
+          // Restore rejected drafts for the current scope.
+          for (const entry of outboxRejected()) {
+            const sameScope =
+              (!entry.taskId && tasks.draftMode) ||
+              (!!entry.taskId && entry.taskId === tasks.focusedTaskId);
+            if (sameScope && entry.text) {
+              tasks.prefillComposer(
+                entry.text,
+                entry.clientRequestId,
+                entry.mentionBindings,
+                entry.skills,
+                entry.backend,
+              );
+              break;
+            }
+          }
+          // If snapshot already applied (outbox arrived late), still replay pending.
+          if (outboxReplayed && !protocolMismatch) {
+            for (const entry of outboxPending(vscode)) {
+              post({
+                type: 'send',
+                taskId: entry.taskId,
+                text: entry.text,
+                llmText: entry.llmText,
+                backend: entry.backend,
+                model: entry.model,
+                continuationOf: entry.continuationOf,
+                mentionBindings: entry.mentionBindings,
+                skills: entry.skills,
+                clientRequestId: entry.clientRequestId,
+              });
+            }
+          }
+          break;
+        }
       }
     }
 
@@ -801,6 +943,7 @@
       const id = (e as CustomEvent<{ clientRequestId?: string }>).detail?.clientRequestId;
       if (typeof id === 'string' && id) {
         outboxRemove(vscode, id);
+        post({ type: 'ackSendOutbox', clientRequestId: id });
       }
     }
 

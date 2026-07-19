@@ -188,7 +188,7 @@ Webview never calls MCP or spawns CLIs. All I/O goes through the extension host.
 | `turnDone` | `{ runId: string }` | Adapter iterator finished without host error |
 | `turnError` | `{ runId: string; message: string }` | Uncaught host/adapter failure |
 | `askPending` | `{ id: string; questions: Question[] }` | AskBridge registered (see MUSTER-BRIDGE §6) |
-| `historyChunk` | `{ items: TranscriptItem[]; hasMore: boolean }` | Reply to `loadHistory`: older items to **prepend** (scroll-up), or the latest window on restore |
+| `transcriptPageResult` | `{ requestId; taskId; ok; items?; transcriptPage?; code? }` | Reply to `loadTranscriptPage`: older items to **prepend** (scroll-up), or typed error code |
 | `sessionReset` | `{}` | New session — clear thread state |
 
 `Question` shape (from ACP elicitation / AskBridge / `ask_parent`):
@@ -205,7 +205,7 @@ interface Question {
 
 ```ts
 interface TranscriptItem {
-  id: string;                              // stable; sorts chronologically (cursor for loadHistory)
+  id: string;                              // stable; sorts chronologically (keyset cursor material)
   kind: 'user' | 'assistant' | 'tool' | 'error';
   content: unknown;                        // rendered payload per kind (text / tool snapshot / error)
 }
@@ -217,7 +217,7 @@ interface TranscriptItem {
 |--------|---------|------|
 | `send` | `{ text: string; llmText?: string; continueLast?: boolean }` | User submits composer; optional `llmText` carries expanded file-mention paths |
 | `newSession` | `{}` | Toolbar — clear session ID, reset UI |
-| `loadHistory` | `{ before?: string; limit: number }` | Lazy-load older transcript (scroll-up / on restore). `before` = id of oldest loaded item (cursor); omit for the latest window |
+| `loadTranscriptPage` | `{ requestId; taskId; beforeCursor; limit? }` | Lazy-load older transcript (scroll-up). `beforeCursor` = opaque keyset cursor from `transcriptPage`; one in-flight per focused task |
 | `cancelTurn` | `{}` | User aborts in-flight turn (`AbortSignal`) |
 | `submitAsk` | `{ id: string; answers: Record<string, { selected: string[]; freeText: string \| null }> }` | Ask card submitted |
 | `cancelAsk` | `{ id: string }` | User dismisses ask — may cancel turn |
@@ -398,35 +398,37 @@ Update `ToolCard` in place (`toolStarted` → `toolUpdated` → `toolCompleted`)
 
 Coalesce rapid `assistantDelta` events with `requestAnimationFrame` before flushing to `streamingBuffer` — reduces layout thrashing on fast backends.
 
-### 7.4 Virtual list (Phase 3+ / when lag is observed)
+### 7.4 Virtual list (shipped — Phase 6)
 
-Add virtualization only when profiling shows need (e.g. 100+ settled messages with tool cards). Chat lists are **variable height** — prefer chat-oriented libs over fixed-height virtual lists.
+Chat settled rows and expanded task-tree rows use **`@tanstack/svelte-virtual`** (`Virtualizer` from the package re-exports) so **mounted DOM stays bounded** while the in-memory transcript/tree window can grow via paging.
 
-| Library | Notes |
-|---------|-------|
-| [`@humanspeak/svelte-virtual-chat`](https://github.com/humanspeak/svelte-virtual-chat) | Chat-focused for Svelte |
-| [`@tanstack/svelte-virtual`](https://tanstack.com/virtual) | Flexible; more setup for variable rows |
+| Surface | Behavior |
+|---------|----------|
+| `ChatThread` | Variable-height settled rows; active **streaming bubble outside** the virtual track; load-older chrome outside the scroller |
+| Expanded task tree | Fixed/remeasured rows over `flattenTaskTreeCollapsible`; collapsed chrome stays a single non-virtual row |
 
-**Caveat:** virtual lists complicate stick-to-bottom and “streaming tail” — keep the **active streaming bubble outside** the virtualized window, or use a lib that supports a pinned footer row. Trigger lazy scrollback (§7.5) when the **top** sentinel / overscan enters view: fetch the previous page via `loadHistory` and prepend.
+**Caveat:** stick-to-bottom and prepend anchoring must use virtualizer-aware offsets. Trigger lazy scrollback (§7.5) near the top / overscan: host `loadTranscriptPage` → `transcriptPageResult`.
+
+Repository keyset paging bounds **bootstrap and each query payload** (latest-N / page size). Virtualization bounds **mounted DOM**. Loaded older pages remain **resident in `TaskThread.items`** for the current focus window (they can accumulate as the user scrolls back); SQLite still owns durable full history.
 
 ### 7.5 History window & lazy scrollback
 
-The webview never holds the whole thread. Render a **recent window**; older items are **lazy-loaded on scroll-up** from the host transcript (`loadHistory` → `historyChunk`, §4 + §8) — not kept in memory or DOM.
+Host snapshots bootstrap a **latest-N page** (`transcript` + `transcriptPage`); older items are **lazy-loaded on scroll-up** via `loadTranscriptPage` → `transcriptPageResult` (protocol v7+ / v9 wire). Each payload stays bounded; the in-memory window can grow as pages prepend.
 
-- Initial / after-restore render = latest N items (e.g. 50); scrolling near the top prepends the previous page.
-- **Prepend without jump:** capture `scrollHeight` before insert, then set `scrollTop += (newScrollHeight - oldScrollHeight)` after (or use the virtual list's anchoring). Do not stick-to-bottom during an upward load.
-- Guard against overlapping requests (one in-flight `loadHistory` at a time; stop when `hasMore === false`).
+- Initial / after-restore render = latest N items (bootstrap limit 100); scrolling near the top prepends the previous page.
+- **Prepend without jump:** capture first-visible identity + viewport offset before insert; restore after the page applies (virtualizer total-size delta + identity lock). Do not stick-to-bottom during an upward load.
+- Guard against overlapping requests (one in-flight `loadTranscriptPage` at a time; stop when `hasMoreBefore === false`).
 - Optionally collapse older **turns** in `<vscode-collapsible>` (one block per user prompt + replies).
 - Do not render `raw` events (ADAPTER-SPEC policy).
 
 ### 7.6 Checklist
 
-- [ ] `ChatThread`: `overflow-y-auto` + `min-h-0` + stick-to-bottom helper
-- [ ] Streaming buffer separate from `settledMessages`
-- [ ] Plain-text streaming; defer markdown to turn end
-- [ ] `ToolCard` updates by `toolCallId`, not list splice
-- [ ] Lazy scrollback — render a recent window; `loadHistory` older on scroll-up; host owns transcript (§7.5, §8)
-- [ ] Virtual list — only when measured lag warrants it (§7.4)
+- [x] `ChatThread`: `overflow-y-auto` + `min-h-0` + stick-to-bottom helper
+- [x] Streaming buffer separate from settled list
+- [x] Plain-text streaming; defer markdown to turn end
+- [x] `ToolCard` updates by `toolCallId`, not list splice
+- [x] Lazy scrollback — `loadTranscriptPage` / `transcriptPageResult`; host owns transcript (§7.5)
+- [x] Virtual list — settled chat + expanded task tree (Phase 6)
 
 ---
 
@@ -484,13 +486,12 @@ The webview never holds the whole thread. Render a **recent window**; older item
 
 ### Webview persistence (host-owned transcript + lazy scrollback)
 
-**Decision:** keep **`retainContextWhenHidden: false`** — we do **not** hold the DOM/thread alive when hidden. The **extension host owns the transcript** (a `TranscriptItem[]` per session, §4); the webview is a pure view that renders a recent window and **lazy-loads older items on scroll-up**.
+**Decision:** keep **`retainContextWhenHidden: false`** — we do **not** hold the DOM/thread alive when hidden. The **extension host owns the transcript** in SQLite; the webview is a pure view that renders a **bounded latest page** from `snapshot` / `workspacePatchBatch` and **lazy-loads older items on scroll-up**.
 
-- **On restore** (webview recreated after hide): webview requests the latest window with `loadHistory` (no `before`) → `historyChunk`. The DOM does not need to have survived.
-- **Scroll-up** near the top fires `loadHistory { before: <oldest loaded id> }`; host returns the previous page, webview **prepends** it (anchor scroll — see §7.5). Pairs with virtualization (§7.4).
-- **Live turns still stream via `event`** — `loadHistory` is only for older/settled items. The host appends each settled item to the transcript as events arrive.
-- `vscode.getState()` / `setState()` is only for tiny view state (draft composer text, scroll position) — **not** the transcript; it is not sized for large histories. The host store is the source of truth.
-- **New host responsibility (currently unimplemented):** accumulate settled `TranscriptItem`s per session and serve pages on `loadHistory`. In-memory per session suffices for MVP; persist to `workspaceState`/file only if survival across window reload is wanted.
+- **On restore** (webview recreated after hide): host pushes a focused `snapshot` with latest-N `transcript` + `transcriptPage` metadata. The DOM does not need to have survived.
+- **Scroll-up** near the top fires `loadTranscriptPage { beforeCursor }` (one in-flight); host returns `transcriptPageResult`, webview **prepends** with scroll anchoring (see §7.5). Pairs with virtualization (§7.4).
+- **Live turns still stream via `event` / patches** — `loadTranscriptPage` is only for older/settled pages. The host persists settled items as events arrive.
+- `vscode.getState()` / `setState()` is only for tiny view state (draft composer text, scroll position) — **not** the transcript; it is not sized for large histories. SQLite is the source of truth.
 
 ### Cancellation
 
@@ -544,7 +545,7 @@ The webview never holds the whole thread. Render a **recent window**; older item
 
 ### Post-MVP
 
-- Host-owned transcript + lazy scrollback (`loadHistory`, §7.5 / §8), session list UI, usage footer, `notify_user` toasts — see MUSTER-BRIDGE §4.2+.
+- Host-owned transcript + lazy scrollback (`loadTranscriptPage` / `transcriptPageResult`, §7.5 / §8), session list UI, usage footer, `notify_user` toasts — see MUSTER-BRIDGE §4.2+.
 
 ---
 

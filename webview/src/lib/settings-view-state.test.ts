@@ -157,33 +157,6 @@ describe('parseSettingsViewState — fail closed', () => {
     }
   });
 
-  describe('legacy topic id migration (v1/v2 → v3 domain)', () => {
-    const cases: Array<[string, SettingsViewState['activeTopicId']]> = [
-      ['task-types', 'agents'],
-      ['permissions', 'execution'],
-      ['retention', 'data'],
-      ['models-and-clis', 'agents'],
-      ['context-and-mcp', 'agents'],
-    ];
-
-    for (const version of [1, 2] as const) {
-      for (const [legacy, expected] of cases) {
-        it(`v${version}: ${legacy} → ${expected}`, () => {
-          expect(
-            parseSettingsViewState({ v: version, activeTopicId: legacy })?.activeTopicId,
-          ).toBe(expected);
-        });
-      }
-    }
-
-    it('rejects an unknown legacy id fail-closed (no fallback-and-reject ambiguity)', () => {
-      expect(parseSettingsViewState({ v: 1, activeTopicId: 'appearance' })).toBeNull();
-      expect(parseSettingsViewState({ v: 2, activeTopicId: 'context-engine' })).toBeNull();
-      expect(parseSettingsViewState({ v: 1, activeTopicId: 'agents' })).toBeNull();
-      expect(parseSettingsViewState({ v: 2, activeTopicId: 'data' })).toBeNull();
-    });
-  });
-
   it('accepts unique v3 dirty-field metadata only when retention drafts exist', () => {
     const raw = {
       v: SETTINGS_VIEW_STATE_VERSION,
@@ -210,25 +183,6 @@ describe('parseSettingsViewState — fail closed', () => {
         retentionDirtySettingIds: ['maxRetainedTurnsPerTask', 'maxRetainedTurnsPerTask'],
       }),
     ).toBeNull();
-  });
-
-  it('migrates v1 retention drafts (maxTurnsPerTask → maxRetainedTurnsPerTask) and remaps topic id', () => {
-    expect(parseSettingsViewState({
-      v: 1,
-      activeTopicId: 'retention',
-      retentionDrafts: {
-        maxTurnsPerTask: '25',
-        maxStoredOutputChars: '5000',
-      },
-    })).toEqual({
-      v: SETTINGS_VIEW_STATE_VERSION,
-      activeTopicId: 'data',
-      retentionDrafts: {
-        runLimit: '',
-        maxRetainedTurnsPerTask: '25',
-        maxStoredOutputChars: '5000',
-      },
-    });
   });
 
   it('bounds task type drafts and rejects oversized maps', () => {
@@ -529,20 +483,6 @@ describe('applyRuntimeStorageSnapshotToDrafts (field-by-field hydration)', () =>
     });
   });
 
-  it('hydrates an empty runLimit left by v1 migration from the host', () => {
-    const migrated = {
-      runLimit: '',
-      maxRetainedTurnsPerTask: '25',
-      maxStoredOutputChars: '999',
-    };
-    const incoming = sampleRetentionSnapshot({ maxRetainedTurnsPerTask: 25, maxStoredOutputChars: 5000 });
-    expect(applyRuntimeStorageSnapshotToDrafts(migrated, incoming)).toEqual({
-      runLimit: '2h', // migration-blank enum hydrates once
-      maxRetainedTurnsPerTask: '25', // matches incoming → refreshed (no-op)
-      maxStoredOutputChars: '999', // dirty → preserved
-    });
-  });
-
   it('does not refill a user-cleared Data number draft from incidental snapshots', () => {
     const clearing = {
       runLimit: '2h',
@@ -550,7 +490,12 @@ describe('applyRuntimeStorageSnapshotToDrafts (field-by-field hydration)', () =>
       maxStoredOutputChars: '5000',
     };
     const incoming = sampleRetentionSnapshot({ maxRetainedTurnsPerTask: 25, maxStoredOutputChars: 5000 });
-    expect(applyRuntimeStorageSnapshotToDrafts(clearing, incoming)).toEqual({
+    expect(applyRuntimeStorageSnapshotToDrafts(
+      clearing,
+      incoming,
+      null,
+      ['maxRetainedTurnsPerTask'],
+    )).toEqual({
       runLimit: '2h',
       maxRetainedTurnsPerTask: '', // cleared, dirty → preserved
       maxStoredOutputChars: '5000',

@@ -166,6 +166,28 @@ Optional live check: press **F5**, open a running task, confirm Enter stacks
 queue rows, Ctrl+Enter reserves a follow-up and interrupts the live turn
 via `send` (never a red “unsupported” banner), and queue Edit/Delete update the panel.
 
+## SQLite storage privacy and recovery verification
+
+Durable Muster data lives in profile-scoped SQLite. Before claiming storage/privacy
+work, run:
+
+```bash
+npm run test:sqlite-storage-docs
+npx vitest run src/task/sqlite/privacy-redaction.test.ts
+npm run test:source-boundary && npm run test:source-boundary:fixtures
+```
+
+The docs verifier asserts [`docs/SQLITE-STORAGE.md`](docs/SQLITE-STORAGE.md) matches
+real command IDs, global scope, WAL unit handling, backup-versus-export, the
+all-windows-closed manual restore procedure, reset/recovery guidance, SecretStorage
+boundaries, and the explicit “not encrypted at rest” limitation. The privacy suite
+stores a runtime-generated secret canary in conversation content and proves it appears
+only there and in a user-requested backup—not in RPC errors, diagnostics, logs,
+command results, change-feed metadata, or evidence-shaped serializers.
+
+Never record absolute storage paths, canaries, prompts, or SQL parameters in evidence
+ledgers.
+
 ## What to work on
 
 All five ACP backends (Claude, Grok, Kiro, Codex, OpenCode) are implemented. Good tasks now:

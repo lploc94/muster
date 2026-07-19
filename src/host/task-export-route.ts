@@ -1,3 +1,4 @@
+import type { TaskRepository } from '../task/repository';
 import type { TaskStoreFile } from '../task/types';
 import {
   MAX_TASK_MARKDOWN_EXPORT_ID_CHARS,
@@ -44,8 +45,8 @@ export interface TaskExportSaveDialogOptions {
 }
 
 export interface TaskExportRouteDeps {
-  /** Read-only snapshot accessor. Must not mutate the returned file. */
-  getStoreFile: () => TaskStoreFile;
+  /** Read-only repository accessor. */
+  getRepository: () => TaskRepository;
   /**
    * Injected native Save As seam. Return `undefined` when the user cancels.
    * Tests inject a mock; production wires `vscode.window.showSaveDialog`.
@@ -217,7 +218,7 @@ export async function routeExportTask(
   if (
     !deps ||
     typeof deps !== 'object' ||
-    typeof deps.getStoreFile !== 'function' ||
+    typeof deps.getRepository !== 'function' ||
     typeof deps.showSaveDialog !== 'function' ||
     typeof deps.writeFile !== 'function' ||
     typeof deps.exportedAt !== 'string'
@@ -227,7 +228,31 @@ export async function routeExportTask(
 
   let file: TaskStoreFile;
   try {
-    file = deps.getStoreFile();
+    const repository = deps.getRepository();
+    const [task, turns, messages, sourceRevision] = await Promise.all([
+      repository.getTask(parsed.taskId),
+      repository.listTurns(parsed.taskId),
+      repository.listMessages(parsed.taskId),
+      repository.getWorkspaceRevision(),
+    ]);
+    if (!task) {
+      return commandError('task_not_found', parsed.taskId);
+    }
+    // The Markdown projector still uses the domain aggregate shape, but this
+    // object is task-scoped: export never materializes unrelated workspace rows.
+    file = {
+      schemaVersion: 6,
+      revision: sourceRevision,
+      tasks: { [task.id]: task },
+      turns: Object.fromEntries(turns.map((turn) => [turn.id, turn])),
+      messages: Object.fromEntries(messages.map((message) => [message.id, message])),
+      operations: {},
+      cancelRequests: {},
+      toolCalls: {},
+      reasoning: {},
+      sendReceipts: {},
+      runtimeClaims: {},
+    };
   } catch {
     return commandError('invalid_request', parsed.taskId);
   }

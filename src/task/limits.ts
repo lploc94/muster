@@ -94,28 +94,21 @@ export function resourceLimitsFromSettings(
 /**
  * Hard bounds applied to agent-supplied {@link TaskExecutionPolicy} values before
  * they are persisted. An AI coordinator can request an arbitrary execution policy
- * via the MCP bridge; without clamping it could set a multi-day turn/task timeout
+ * via the MCP bridge; without clamping it could set a multi-day run timeout
  * or an enormous turn budget (resource-exhaustion / DoS). Every field is clamped
  * to `[min, max]` so the raw agent value is never trusted.
  */
 export interface ExecutionPolicyBounds {
   minTurnTimeoutMs: number;
   maxTurnTimeoutMs: number;
-  minTaskTimeoutMs: number;
-  maxTaskTimeoutMs: number;
   maxTurns: number;
   maxAutomaticRetries: number;
 }
 
-/**
- * Schema-v5 compatibility adapter. Values derive from the canonical V2 hard
- * bounds; production task creation resolves through execution-policy.ts.
- */
+/** Bounds shared by coordinator input validation and runtime policy resolution. */
 export const DEFAULT_EXECUTION_POLICY_BOUNDS: ExecutionPolicyBounds = {
   minTurnTimeoutMs: TASK_EXECUTION_HARD_BOUNDS.minRunLimitMs,
   maxTurnTimeoutMs: TASK_EXECUTION_HARD_BOUNDS.maxRunLimitMs,
-  minTaskTimeoutMs: TASK_EXECUTION_HARD_BOUNDS.minRunLimitMs,
-  maxTaskTimeoutMs: TASK_EXECUTION_HARD_BOUNDS.maxRunLimitMs,
   maxTurns: TASK_EXECUTION_HARD_BOUNDS.maxTurns,
   maxAutomaticRetries: TASK_EXECUTION_HARD_BOUNDS.maxAutomaticRetries,
 };
@@ -123,7 +116,7 @@ export const DEFAULT_EXECUTION_POLICY_BOUNDS: ExecutionPolicyBounds = {
 /**
  * Soft default ceiling for bridge bearer tokens when turnTimeout is small.
  * W8: token lifetime must cover the turn budget — bridgeTokenTtlMs uses
- * max(turnTimeoutMs, this floor) then applies a hard safety cap.
+ * max(runTimeoutMs, this floor) then applies a hard safety cap.
  */
 export const MAX_BRIDGE_TOKEN_TTL_MS = 900_000; // 15 minutes
 /** Covers the longest supported 8h run plus cleanup without permitting multi-day tokens. */
@@ -153,31 +146,23 @@ export function clampExecutionPolicy(
   if (override !== undefined) {
     result.runTimeoutOverrideMs = clamp(override, bounds.minTurnTimeoutMs, bounds.maxTurnTimeoutMs);
   }
-  // Preserve schema-v5 values only for compatibility callers. New engine creation
-  // goes through resolveTaskExecutionPolicy and never emits these fields.
-  if (merged.turnTimeoutMs !== undefined) {
-    result.turnTimeoutMs = clamp(merged.turnTimeoutMs, bounds.minTurnTimeoutMs, bounds.maxTurnTimeoutMs);
-  }
-  if (merged.taskTimeoutMs !== undefined) {
-    result.taskTimeoutMs = clamp(merged.taskTimeoutMs, bounds.minTaskTimeoutMs, bounds.maxTaskTimeoutMs);
-  }
   return result;
 }
 
 /**
- * TTL for a bridge bearer token (W8): must cover turnTimeoutMs so complete_task
+ * TTL for a bridge bearer token (W8): must cover runTimeoutMs so complete_task
  * remains authorized for the full turn. Soft default MAX_BRIDGE_TOKEN_TTL_MS when
  * turnTimeout is smaller; hard cap HARD_BRIDGE_TOKEN_TTL_MS (or maxTtlMs override).
  * Negative/NaN inputs collapse to 0.
  */
 export function bridgeTokenTtlMs(
-  turnTimeoutMs: number,
+  runTimeoutMs: number,
   maxTtlMs: number = HARD_BRIDGE_TOKEN_TTL_MS,
 ): number {
-  if (!Number.isFinite(turnTimeoutMs) || turnTimeoutMs <= 0) {
+  if (!Number.isFinite(runTimeoutMs) || runTimeoutMs <= 0) {
     return 0;
   }
-  const requested = turnTimeoutMs;
+  const requested = runTimeoutMs;
   // Cover at least the turn budget; soft floor for short turns (W8).
   const softFloor = Math.min(MAX_BRIDGE_TOKEN_TTL_MS, maxTtlMs);
   return Math.min(Math.max(requested, softFloor), maxTtlMs);
