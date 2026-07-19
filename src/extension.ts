@@ -3047,6 +3047,9 @@ export async function activate(context: vscode.ExtensionContext) {
     revealStorage: async () => {
       await vscode.commands.executeCommand('revealFileInOS', context.globalStorageUri);
     },
+    reloadWindow: async () => {
+      await vscode.commands.executeCommand('workbench.action.reloadWindow');
+    },
     guidanceFor: recoveryGuidanceFor,
   });
 

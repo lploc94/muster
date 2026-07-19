@@ -20,6 +20,8 @@ export type TerminalStorageLifecycleDeps<TDiag extends TerminalStorageLifecycleD
   closeDoomed: (doomed: unknown) => Promise<void>;
   showError: (message: string, action?: string) => Promise<string | undefined>;
   revealStorage: () => Promise<void>;
+  /** Optional: Reload Window action for terminal schema_changed. */
+  reloadWindow?: () => Promise<void> | void;
   guidanceFor: (diagnostic: TDiag) => string | undefined;
 };
 
@@ -90,6 +92,15 @@ export function createTerminalStorageLifecycle<
             await deps.revealStorage();
           } catch {
             // Cancel is a strict no-op (no reset/delete).
+          }
+        }
+      } else if (diagnostic.recoveryAction === 'reload_window') {
+        const choice = await deps.showError(message, 'Reload Window');
+        if (choice === 'Reload Window') {
+          try {
+            await deps.reloadWindow?.();
+          } catch {
+            // best-effort — cancel/failure is a strict no-op (no reset).
           }
         }
       } else {

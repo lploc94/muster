@@ -26,7 +26,12 @@ import {
   registerWriterVersionUdf,
 } from './connection';
 import { bootstrapFaultCapability, setFaultPlanForTests } from './fault-inject';
-import { MusterSqliteError } from './errors';
+import {
+  MusterSqliteError,
+  isTerminalStorageCode,
+  mapToMusterSqliteError,
+  recoveryActionForCode,
+} from './errors';
 import {
   POPULATED_V7_FIXTURE_MARKER,
   countPopulatedV7FixtureRows,
@@ -339,7 +344,7 @@ describe('atomic schema-v7 → v8 migration (M018 S01 T02)', () => {
       after.close();
     }
 
-    // registerWriterVersionUdf is exported for T03 dual-connection fence proofs.
+    // registerWriterVersionUdf is exported for dual-connection fence proofs.
     const probe = new DatabaseSync(':memory:');
     try {
       registerWriterVersionUdf(probe);
@@ -349,4 +354,105 @@ describe('atomic schema-v7 → v8 migration (M018 S01 T02)', () => {
       probe.close();
     }
   });
+
+  it('fences an already-open v7 connection after migration, including pre-migration prepared statements', () => {
+    const dbPath = tempDbPath('stale-writer-fence.sqlite');
+    const fixture = writePopulatedV7Fixture(dbPath);
+
+    // Stale host: open raw v7 connection and prepare a write before peer migrates.
+    const stale = new DatabaseSync(dbPath);
+    applyConnectionBusy(stale);
+    const prePreparedInsert = stale.prepare(
+      `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    );
+    // Prove the statement works pre-migration.
+    prePreparedInsert.run(
+      'ws-pre-migration-write',
+      'identity-pre',
+      'Pre Migration',
+      '2026-07-19T00:00:00.000Z',
+      '2026-07-19T00:00:00.000Z',
+    );
+
+    // Peer host migrates under the v8 binary.
+    const current = openStoreDatabase({ path: dbPath });
+    try {
+      expect(readPragma(current, 'user_version')).toBe(SCHEMA_V8);
+      expect(findSchemaFingerprintFailure(current)).toBeUndefined();
+
+      // V8 peer writes succeed with registered writer UDF.
+      current
+        .prepare(
+          `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
+           VALUES (?, ?, ?, ?, ?)`,
+        )
+        .run(
+          'ws-v8-peer',
+          'identity-v8-peer',
+          'V8 Peer',
+          '2026-07-19T02:00:00.000Z',
+          '2026-07-19T02:00:00.000Z',
+        );
+
+      // Stale newly-prepared write is blocked (missing writer UDF / trigger).
+      let stalePreparedError: unknown;
+      try {
+        stale
+          .prepare(
+            `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
+             VALUES (?, ?, ?, ?, ?)`,
+          )
+          .run(
+            'ws-stale-new',
+            'identity-stale-new',
+            'Stale New',
+            '2026-07-19T03:00:00.000Z',
+            '2026-07-19T03:00:00.000Z',
+          );
+        expect.unreachable('stale write should be fenced');
+      } catch (error) {
+        stalePreparedError = error;
+      }
+      const mappedPrepared = mapToMusterSqliteError(stalePreparedError, 'write');
+      expect(mappedPrepared).toBeInstanceOf(MusterSqliteError);
+      expect(mappedPrepared.code).toBe('schema_changed');
+      expect(isTerminalStorageCode(mappedPrepared.code)).toBe(true);
+      expect(recoveryActionForCode(mappedPrepared.code)).toBe('reload_window');
+
+      // Pre-migration prepared statement is also blocked after migration commit.
+      let stalePrePreparedError: unknown;
+      try {
+        prePreparedInsert.run(
+          'ws-stale-prepared',
+          'identity-stale-prepared',
+          'Stale Prepared',
+          '2026-07-19T03:30:00.000Z',
+          '2026-07-19T03:30:00.000Z',
+        );
+        expect.unreachable('pre-migration prepared write should be fenced');
+      } catch (error) {
+        stalePrePreparedError = error;
+      }
+      const mappedPre = mapToMusterSqliteError(stalePrePreparedError, 'write');
+      expect(mappedPre.code).toBe('schema_changed');
+
+      // Legacy fixture rows remain intact; only the two successful workspace inserts land.
+      const counts = countPopulatedV7FixtureRows(current);
+      expect(counts.workspaces).toBe((fixture.tableRowCounts.workspaces ?? 0) + 2);
+      expect(counts.tasks).toBe(fixture.tableRowCounts.tasks);
+      expect(counts.messages).toBe(fixture.tableRowCounts.messages);
+      const blocked = current
+        .prepare(`SELECT COUNT(*) AS n FROM workspaces WHERE id IN (?, ?)`) 
+        .get('ws-stale-new', 'ws-stale-prepared') as { n: number };
+      expect(blocked.n).toBe(0);
+    } finally {
+      current.close();
+      stale.close();
+    }
+  });
 });
+
+function applyConnectionBusy(db: DatabaseSync): void {
+  db.exec('PRAGMA busy_timeout = 5000');
+}

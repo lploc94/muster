@@ -12,6 +12,7 @@ import {
   MusterSqliteError,
   isSqliteErrorCode,
   isSqliteOperationClass,
+  isTerminalStorageCode,
   recoveryActionForCode,
   safeMessageForCode,
   type SqliteErrorCode,
@@ -29,7 +30,7 @@ export type SqliteDiagnostic = {
   kind: SqliteErrorKind;
   /** True when the host must not start engine/scheduler/poller/writer. */
   failClosed: boolean;
-  /** True when storage is latched terminal (corrupt / not a database). */
+  /** True when storage is latched terminal (corrupt / not a database / schema_changed). */
   terminal: boolean;
 };
 
@@ -49,7 +50,7 @@ export function diagnoseSqliteError(
       recoveryAction: recoveryActionForCode(error.code),
       kind: error.kind,
       failClosed: true,
-      terminal: error.code === 'corrupt' || error.code === 'not_a_database',
+      terminal: isTerminalStorageCode(error.code),
     };
   }
 
@@ -72,7 +73,7 @@ export function diagnoseSqliteError(
       recoveryAction: recoveryActionForCode(code),
       kind,
       failClosed: true,
-      terminal: code === 'corrupt' || code === 'not_a_database',
+      terminal: isTerminalStorageCode(code),
     };
   }
 
@@ -85,7 +86,7 @@ export function diagnoseSqliteError(
       recoveryAction: recoveryActionForCode(code),
       kind: code === 'constraint' || code === 'capacity' ? 'domain' : 'operational',
       failClosed: true,
-      terminal: code === 'corrupt' || code === 'not_a_database',
+      terminal: isTerminalStorageCode(code),
     };
   }
 
@@ -122,6 +123,8 @@ export function recoveryGuidanceFor(diagnostic: SqliteDiagnostic): string {
   switch (diagnostic.recoveryAction) {
     case 'reveal_storage':
       return 'You can reveal the Muster global storage folder to inspect the database. Close every Muster window before any manual handling; do not delete main/-wal/-shm files separately.';
+    case 'reload_window':
+      return 'Reload this window to continue with the upgraded schema.';
     case 'free_disk_space':
       return 'Free disk space and try the operation again.';
     case 'check_permissions':

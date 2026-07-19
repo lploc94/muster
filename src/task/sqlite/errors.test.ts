@@ -5,6 +5,7 @@ import {
   MusterSqliteError,
   SQLITE_ERROR_CODES,
   SQLITE_PRIMARY,
+  isTerminalStorageCode,
   mapToMusterSqliteError,
   recoveryActionForCode,
   safeMessageForCode,
@@ -169,6 +170,41 @@ describe('P5-W1 SQLite error taxonomy', () => {
     expect(recoveryActionForCode('busy')).toBe('retry');
     expect(recoveryActionForCode('corrupt')).toBe('reveal_storage');
     expect(recoveryActionForCode('readonly')).toBe('check_permissions');
+    expect(recoveryActionForCode('schema_changed')).toBe('reload_window');
+  });
+
+  it('classifies writer-guard failures as terminal schema_changed with reload guidance', () => {
+    expect(SQLITE_ERROR_CODES).toContain('schema_changed');
+
+    const abort = mapToMusterSqliteError(
+      {
+        code: 'ERR_SQLITE_ERROR',
+        errcode: 1811, // SQLITE_CONSTRAINT_TRIGGER
+        message: 'schema_changed',
+        errstr: 'constraint failed',
+      },
+      'transaction',
+    );
+    expect(abort).toBeInstanceOf(MusterSqliteError);
+    expect(abort.code).toBe('schema_changed');
+    expect(abort.kind).toBe('operational');
+    expect(abort.message).not.toMatch(/muster_writer_version|SELECT |INSERT /i);
+    expect(abort.message).not.toMatch(/Users/);
+    expect(isTerminalStorageCode('schema_changed')).toBe(true);
+    expect(recoveryActionForCode('schema_changed')).toBe('reload_window');
+
+    const missingUdf = mapToMusterSqliteError(
+      {
+        code: 'ERR_SQLITE_ERROR',
+        errcode: 1,
+        message: 'no such function: muster_writer_version',
+        errstr: 'SQL logic error',
+      },
+      'write',
+    );
+    expect(missingUdf.code).toBe('schema_changed');
+    expect(safeMessageForCode('schema_changed')).toMatch(/reload/i);
+    expect(safeMessageForCode('schema_changed')).not.toMatch(/reset|reveal storage|delete/i);
   });
 });
 
