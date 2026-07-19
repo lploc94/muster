@@ -28,7 +28,8 @@ import {
 import { AskBridge } from '../bridge/ask-bridge';
 import { CredentialRegistry } from '../bridge/credentials';
 import { TaskEngine } from '../task/engine';
-import { TaskStore } from '../task/store';
+import { SqliteTaskRepository } from '../task/repository';
+import { DbClient } from '../task/sqlite/client';
 import { parseTaskTypeRegistry } from '../task/task-types';
 import { deriveEntityId } from '../task/engine-graph';
 import { applySuccessfulTurn } from '../task/transitions';
@@ -238,7 +239,11 @@ describe('M017 R1 GREEN — prompt blocked until MCP ready (S06)', () => {
 // ── M017 R2 GREEN (S02 lifecycle decoupling) ─────────────────────────────────
 
 describe('M017 R2 GREEN — settle once + awaiting_parent_seal (S02)', () => {
+  const WORKER_TS = path.join(__dirname, '../task/sqlite/worker.ts');
+  const TSX_ARGV = ['--import', 'tsx'];
   const activeHarnesses = new Set<{ engine: TaskEngine; resume: () => void }>();
+  const tempDirs: string[] = [];
+  const clients: DbClient[] = [];
 
   afterEach(async () => {
     const harnesses = [...activeHarnesses];
@@ -248,11 +253,27 @@ describe('M017 R2 GREEN — settle once + awaiting_parent_seal (S02)', () => {
     await Promise.all(harnesses.map(({ engine }) => engine.whenIdle()));
     await new Promise<void>((resolve) => setImmediate(resolve));
     await Promise.all(harnesses.map(({ engine }) => engine.whenIdle()));
+    await Promise.all(clients.splice(0).map((c) => c.close().catch(() => undefined)));
+    for (const dir of tempDirs.splice(0)) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
-  function makeEngineHarness() {
+  async function makeEngineHarness() {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m017-r2-'));
-    const store = TaskStore.load({ filePath: path.join(dir, '.muster-tasks.json') });
+    tempDirs.push(dir);
+    const client = new DbClient({ workerPath: WORKER_TS, execArgv: TSX_ARGV });
+    clients.push(client);
+    await client.open(path.join(dir, 'muster.sqlite3'));
+    const repository = new SqliteTaskRepository(client, 'ws');
+    await repository.execute({
+      kind: 'upsertWorkspace',
+      workspaceId: 'ws',
+      identityKey: 'm017-r2',
+      displayName: 'M017 R2',
+      createdAt: 'now',
+      lastOpenedAt: 'now',
+    });
     const credentials = new CredentialRegistry();
     const askBridge = new AskBridge();
     let resume: (() => void) | undefined;
@@ -271,8 +292,9 @@ describe('M017 R2 GREEN — settle once + awaiting_parent_seal (S02)', () => {
       },
     };
 
-    const engine = TaskEngine.load({
-      store,
+    const engine = await TaskEngine.loadAsync({
+      repository,
+      workspaceId: 'ws',
       makeBackend: (name) => ({ ...backend, name }),
       askBridge,
       credentialRegistry: credentials,
@@ -281,12 +303,12 @@ describe('M017 R2 GREEN — settle once + awaiting_parent_seal (S02)', () => {
     });
     const resumeHarness = () => resume?.();
     activeHarnesses.add({ engine, resume: resumeHarness });
-    return { store, engine, credentials, resume: resumeHarness };
+    return { engine, credentials, resume: resumeHarness };
   }
 
-  async function waitTurnRunning(store: TaskStore, turnId: string): Promise<void> {
+  async function waitTurnRunning(engine: TaskEngine, turnId: string): Promise<void> {
     for (let i = 0; i < 50; i++) {
-      if (store.getFile().turns[turnId]?.status === 'running') return;
+      if (engine.getReadModel().getFile().turns[turnId]?.status === 'running') return;
       await new Promise((r) => setTimeout(r, 20));
     }
     throw new Error(`turn ${turnId} never became running`);
@@ -302,6 +324,7 @@ describe('M017 R2 GREEN — settle once + awaiting_parent_seal (S02)', () => {
       id: 'child-1',
       role: 'worker',
       lifecycle: 'open',
+      releaseState: 'released',
       goal: 'work',
       parentId: 'root-1',
       dependencies: [],
@@ -310,8 +333,6 @@ describe('M017 R2 GREEN — settle once + awaiting_parent_seal (S02)', () => {
       executionPolicy: {
         maxTurns: 10,
         maxAutomaticRetries: 2,
-        turnTimeoutMs: 60_000,
-        taskTimeoutMs: 300_000,
       },
       revision: 0,
       createdAt: NOW,
@@ -348,24 +369,22 @@ describe('M017 R2 GREEN — settle once + awaiting_parent_seal (S02)', () => {
    * Child gets awaiting_parent_seal + completionCandidate; parent wait wakes.
    */
   it('R2 settle-once (engine): missing disposition → seal request + parent wake, no repair turn', async () => {
-    const { store, engine, credentials, resume } = makeEngineHarness();
-    engine.createTask({
-      id: 'coord',
+    const { engine, credentials, resume } = await makeEngineHarness();
+    const started = await engine.startNewTask({
       goal: 'coord',
       backend: 'grok',
       role: 'coordinator',
-      capabilities: ['create_child', 'wait_child'],
     });
-    const started = engine.startTask('coord');
     expect(started.ok).toBe(true);
     if (!started.ok) return;
-    const turnId = started.value.turnId;
-    await waitTurnRunning(store, turnId);
+    const { taskId: coordId, turnId } = started.value;
+    await waitTurnRunning(engine, turnId);
 
     const token = credentials.issue({
-      rootId: 'coord',
-      callerTaskId: 'coord',
+      rootId: coordId,
+      callerTaskId: coordId,
       turnId,
+      attemptId: 'a0',
       allowedActions: new Set(['delegate_task', 'wait_for_tasks']),
       ttlMs: 60_000,
     });
@@ -379,32 +398,33 @@ describe('M017 R2 GREEN — settle once + awaiting_parent_seal (S02)', () => {
     expect(del.ok).toBe(true);
 
     const childId = deriveEntityId(turnId, 'op-m017-seal-child', 'task');
-    const childTurn = Object.values(store.getFile().turns).find(
+    const read = () => engine.getReadModel().getFile();
+    const childTurn = Object.values(read().turns).find(
       (t) => t.taskId === childId && t.sequence === 1,
     );
     expect(childTurn).toBeDefined();
     if (!childTurn) return;
 
-    for (let i = 0; i < 50 && store.getFile().turns[childTurn.id]?.status !== 'running'; i++) {
+    for (let i = 0; i < 50 && read().turns[childTurn.id]?.status !== 'running'; i++) {
       await new Promise((r) => setTimeout(r, 20));
     }
-    expect(store.getFile().turns[childTurn.id]?.status).toBe('running');
+    expect(read().turns[childTurn.id]?.status).toBe('running');
 
     // Settle child with idle (no complete_task / fail_task) — settle once, wake parent.
-    engine.stageDisposition(childTurn.id, { kind: 'idle' }, 'op-child-idle');
+    await engine.stageDispositionAsync(childTurn.id, { kind: 'idle' }, 'op-child-idle');
     resume();
     await engine.whenIdle();
 
-    const child = store.getTask(childId);
+    const child = read().tasks[childId];
     const repairSuffix = '-disposition' + '-repair';
-    const scheduledRepairTurns = Object.values(store.getFile().turns).filter(
+    const scheduledRepairTurns = Object.values(read().turns).filter(
       (t) =>
         t.id.endsWith(repairSuffix) &&
         (t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user'),
     );
 
     expect(scheduledRepairTurns).toHaveLength(0);
-    expect(store.getFile().turns[`${childTurn.id}${repairSuffix}`]).toBeUndefined();
+    expect(read().turns[`${childTurn.id}${repairSuffix}`]).toBeUndefined();
     expect(child?.lifecycle).toBe('open');
     expect(child?.attention?.code).toBe('awaiting_parent_seal');
     expect(child?.completionCandidate).toMatchObject({
@@ -415,9 +435,9 @@ describe('M017 R2 GREEN — settle once + awaiting_parent_seal (S02)', () => {
     expect(child?.sealedBy).toBeUndefined();
 
     // Parent wait is woken via attention continuation (needs_attention).
-    const parent = store.getTask('coord');
-    const attentionTurn = Object.values(store.getFile().turns).find(
-      (t) => t.taskId === 'coord' && t.id.endsWith('-attention'),
+    const parent = read().tasks[coordId];
+    const attentionTurn = Object.values(read().turns).find(
+      (t) => t.taskId === coordId && t.id.endsWith('-attention'),
     );
     expect(
       parent?.wait?.kind === 'children' && parent.wait.phase === 'suspended_attention',
@@ -425,13 +445,13 @@ describe('M017 R2 GREEN — settle once + awaiting_parent_seal (S02)', () => {
     expect(attentionTurn).toBeDefined();
 
     // Drain residual so afterEach whenIdle is clean.
-    engine.stageDisposition(turnId, { kind: 'idle' }, 'op-coord-idle');
+    await engine.stageDispositionAsync(turnId, { kind: 'idle' }, 'op-coord-idle');
     if (attentionTurn && (attentionTurn.status === 'running' || attentionTurn.status === 'queued')) {
-      for (let i = 0; i < 50 && store.getFile().turns[attentionTurn.id]?.status === 'queued'; i++) {
+      for (let i = 0; i < 50 && read().turns[attentionTurn.id]?.status === 'queued'; i++) {
         await new Promise((r) => setTimeout(r, 20));
       }
-      if (store.getFile().turns[attentionTurn.id]?.status === 'running') {
-        engine.stageDisposition(attentionTurn.id, { kind: 'idle' }, 'op-attention-idle');
+      if (read().turns[attentionTurn.id]?.status === 'running') {
+        await engine.stageDispositionAsync(attentionTurn.id, { kind: 'idle' }, 'op-attention-idle');
       }
     }
     resume();

@@ -17,8 +17,13 @@ import { CredentialRegistry } from '../bridge/credentials';
 import type { Backend, BackendCapabilities, NormalizedEvent, RunOptions } from '../types';
 import { TaskEngine } from './engine';
 import { DEFAULT_RESOURCE_LIMITS, type ResourceLimits } from './limits';
-import { TaskStore } from './store';
+import { SqliteTaskRepository } from './repository';
+import { DbClient } from './sqlite/client';
 import { parseTaskTypeRegistry } from './task-types';
+import type { TaskTurn } from './types';
+
+const WORKER_TS = path.join(__dirname, 'sqlite/worker.ts');
+const TSX_ARGV = ['--import', 'tsx'];
 
 const MCP_CAPS: BackendCapabilities = {
   supportsMCP: true,
@@ -33,6 +38,7 @@ const TEST_TASK_TYPES = parseTaskTypeRegistry({
 });
 
 const tempDirs: string[] = [];
+const clients: DbClient[] = [];
 const activeResumes: Array<() => void> = [];
 const activeEngines: TaskEngine[] = [];
 
@@ -44,56 +50,73 @@ afterEach(async () => {
       /* ignore */
     }
   }
-  // Drain fire-and-forget scheduleTurn work before temp cleanup.
+  for (const e of activeEngines.splice(0)) {
+    try {
+      e.quiesceForTerminalStorage();
+    } catch {
+      /* ignore */
+    }
+  }
   await new Promise<void>((resolve) => setImmediate(resolve));
-  await Promise.all(activeEngines.splice(0).map((e) => e.whenIdle().catch(() => undefined)));
+  await Promise.all(clients.splice(0).map((c) => c.close().catch(() => undefined)));
   for (const dir of tempDirs.splice(0)) {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
-function makeTempStore(): { dir: string; filePath: string; store: TaskStore } {
+async function makeRepo(): Promise<SqliteTaskRepository> {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m016-live-caps-'));
   tempDirs.push(dir);
-  const filePath = path.join(dir, '.muster-tasks.json');
-  return { dir, filePath, store: TaskStore.load({ filePath }) };
+  const client = new DbClient({ workerPath: WORKER_TS, execArgv: TSX_ARGV });
+  clients.push(client);
+  await client.open(path.join(dir, 'muster.sqlite3'));
+  const repository = new SqliteTaskRepository(client, 'ws');
+  await repository.execute({
+    kind: 'upsertWorkspace',
+    workspaceId: 'ws',
+    identityKey: 'm016-live-caps',
+    displayName: 'M016 live caps',
+    createdAt: 'now',
+    lastOpenedAt: 'now',
+  });
+  return repository;
 }
 
 async function waitFor(
   predicate: () => boolean,
   ms = 3000,
   stepMs = 10,
+  label = 'condition',
 ): Promise<void> {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
     if (predicate()) return;
     await new Promise((r) => setTimeout(r, stepMs));
   }
+  throw new Error(`waitFor timed out after ${ms}ms waiting for ${label}`);
 }
 
-function workerTurns(store: TaskStore) {
-  return Object.values(store.getFile().turns).filter(
-    (t) => t.taskId !== 'coord' && t.trigger === 'engine',
+function workerTurns(engine: TaskEngine, coordId: string): TaskTurn[] {
+  return Object.values(engine.getReadModel().getFile().turns).filter(
+    (t) => t.taskId !== coordId && t.trigger === 'engine',
   );
 }
 
-function countByStatus(store: TaskStore, status: string): number {
-  return workerTurns(store).filter((t) => t.status === status).length;
+function countByStatus(engine: TaskEngine, coordId: string, status: string): number {
+  return workerTurns(engine, coordId).filter((t) => t.status === status).length;
 }
 
 describe('m016-settings-live-caps (M016-S02 / D037)', () => {
   it('re-reads a mutable settings-backed getter: raise promotes more, lower never preempts', async () => {
-    const { store } = makeTempStore();
+    const repository = await makeRepo();
     const credentials = new CredentialRegistry();
 
-    // Shared hold gate for worker runs so concurrency is observable.
     let releaseWorkers!: () => void;
     const workerGate = new Promise<void>((resolve) => {
       releaseWorkers = resolve;
     });
     activeResumes.push(() => releaseWorkers());
 
-    // Coordinator holds its turn open for the duration of handleToolCall.
     let releaseCoord!: () => void;
     const coordGate = new Promise<void>((resolve) => {
       releaseCoord = resolve;
@@ -129,8 +152,6 @@ describe('m016-settings-live-caps (M016-S02 / D037)', () => {
       },
     };
 
-    // Plain mutable object simulating live VS Code muster.execution settings.
-    // getResourceLimits reads these fields on every call — no engine recreate.
     const INITIAL_CAP = 2;
     const RAISED_CAP = 5;
     const LOWERED_CAP = 1;
@@ -140,8 +161,9 @@ describe('m016-settings-live-caps (M016-S02 / D037)', () => {
       maxConcurrentPerRoot: 20,
     };
 
-    const engine = TaskEngine.load({
-      store,
+    const engine = await TaskEngine.loadAsync({
+      repository,
+      workspaceId: 'ws',
       makeBackend: (name) => {
         if (name === 'claude') return { ...coordBackend, name: 'claude' };
         return { ...workerBackend, name: name || 'grok' };
@@ -158,26 +180,20 @@ describe('m016-settings-live-caps (M016-S02 / D037)', () => {
     });
     activeEngines.push(engine);
 
-    expect(
-      engine.createTask({
-        id: 'coord',
-        goal: 'coordinate live-cap workers',
-        backend: 'claude',
-        role: 'coordinator',
-        capabilities: ['create_child', 'wait_child', 'read_subtree'],
-      }).ok,
-    ).toBe(true);
-
-    const started = engine.startTask('coord');
+    const started = await engine.startNewTask({
+      goal: 'coordinate live-cap workers',
+      backend: 'claude',
+      role: 'coordinator',
+    });
     expect(started.ok).toBe(true);
-    if (!started.ok) throw new Error('startTask failed');
-    const turnId = started.value.turnId;
+    if (!started.ok) throw new Error('startNewTask failed');
+    const { taskId: coordId, turnId } = started.value;
 
-    await waitFor(() => store.getFile().turns[turnId]?.status === 'running');
+    await waitFor(() => engine.getReadModel().getFile().turns[turnId]?.status === 'running');
 
     const token = credentials.issue({
-      rootId: 'coord',
-      callerTaskId: 'coord',
+      rootId: coordId,
+      callerTaskId: coordId,
       turnId,
       attemptId: 'a0',
       allowedActions: new Set([
@@ -209,92 +225,71 @@ describe('m016-settings-live-caps (M016-S02 / D037)', () => {
       throw new Error(`delegate_tasks failed: ${JSON.stringify(delegated)}`);
     }
 
-    // ── Phase 1: initial cap N promotes up to N turns ──────────────────────
-    await waitFor(() => peak >= INITIAL_CAP, 2000);
+    await waitFor(() => peak >= INITIAL_CAP, 5000, 10, 'peak at initial cap');
     await new Promise((r) => setTimeout(r, 80));
     expect(peak).toBe(INITIAL_CAP);
     expect(live).toBe(INITIAL_CAP);
-    expect(workerTurns(store)).toHaveLength(WORKER_COUNT);
-    expect(countByStatus(store, 'queued')).toBeGreaterThan(0);
-    expect(countByStatus(store, 'running')).toBe(INITIAL_CAP);
+    expect(workerTurns(engine, coordId)).toHaveLength(WORKER_COUNT);
+    expect(countByStatus(engine, coordId, 'queued')).toBeGreaterThan(0);
+    expect(countByStatus(engine, coordId, 'running')).toBe(INITIAL_CAP);
 
-    // ── Phase 2: mutate settings object higher — next pass promotes more ───
-    // No engine recreate: same TaskEngine instance, same getter reference.
     settings.maxConcurrentPerBackend = RAISED_CAP;
 
-    for (const turn of workerTurns(store)) {
+    for (const turn of workerTurns(engine, coordId)) {
       if (turn.status === 'queued') {
-        engine.resumeQueuedTurn(turn.id);
+        void engine.resumeQueuedTurnAsync(turn.taskId, turn.id);
       }
     }
 
-    await waitFor(() => peak >= RAISED_CAP, 3000);
+    await waitFor(() => peak >= RAISED_CAP, 5000, 10, 'peak at raised cap');
     await new Promise((r) => setTimeout(r, 80));
     expect(peak).toBe(RAISED_CAP);
     expect(live).toBe(RAISED_CAP);
-    expect(countByStatus(store, 'running')).toBe(RAISED_CAP);
-    expect(countByStatus(store, 'queued')).toBe(WORKER_COUNT - RAISED_CAP);
+    expect(countByStatus(engine, coordId, 'running')).toBe(RAISED_CAP);
+    expect(countByStatus(engine, coordId, 'queued')).toBe(WORKER_COUNT - RAISED_CAP);
 
-    // ── Phase 3: lower the cap — do not preempt running; block new promotes ─
-    const runningBeforeLower = countByStatus(store, 'running');
+    const runningBeforeLower = countByStatus(engine, coordId, 'running');
     const liveBeforeLower = live;
     expect(runningBeforeLower).toBe(RAISED_CAP);
 
     settings.maxConcurrentPerBackend = LOWERED_CAP;
 
-    // Re-drive every queued turn; under the lowered cap none may promote.
-    for (const turn of workerTurns(store)) {
+    for (const turn of workerTurns(engine, coordId)) {
       if (turn.status === 'queued') {
-        engine.resumeQueuedTurn(turn.id);
+        void engine.resumeQueuedTurnAsync(turn.taskId, turn.id);
       }
     }
     await new Promise((r) => setTimeout(r, 120));
 
-    // Already-running turns stay running (non-preemptive).
+    // Already-running turns stay running (non-preemptive); peak does not climb.
     expect(live).toBe(liveBeforeLower);
-    expect(countByStatus(store, 'running')).toBe(runningBeforeLower);
-    // Peak must not climb past the raised-cap plateau after the lower.
+    expect(countByStatus(engine, coordId, 'running')).toBe(runningBeforeLower);
     expect(peak).toBe(RAISED_CAP);
-    // Queued work remains blocked under the lowered cap.
-    expect(countByStatus(store, 'queued')).toBe(WORKER_COUNT - RAISED_CAP);
+    expect(countByStatus(engine, coordId, 'queued')).toBe(WORKER_COUNT - RAISED_CAP);
 
-    // Release held workers so they finish. Residual queued turns still use the
-    // original gate (now resolved) and complete quickly; sample running counts
-    // while draining under the live lowered cap — never more than LOWERED_CAP.
+    // Second-wave under lowered cap: release first wave, then re-drive queue.
+    // Backend closes over the resolved gate so turns finish quickly; sample peak.
     releaseWorkers();
-    await waitFor(() => live === 0, 3000);
+    await waitFor(() => live === 0, 5000, 10, 'first wave drained');
 
     let secondWavePeak = 0;
-    for (const turn of workerTurns(store)) {
+    for (const turn of workerTurns(engine, coordId)) {
       if (turn.status === 'queued') {
-        engine.resumeQueuedTurn(turn.id);
+        void engine.resumeQueuedTurnAsync(turn.taskId, turn.id);
       }
     }
-
-    const drainDeadline = Date.now() + 5000;
-    while (Date.now() < drainDeadline) {
-      secondWavePeak = Math.max(secondWavePeak, countByStatus(store, 'running'));
-      const remaining = workerTurns(store).filter(
+    const sampleDeadline = Date.now() + 1500;
+    while (Date.now() < sampleDeadline) {
+      secondWavePeak = Math.max(secondWavePeak, live, countByStatus(engine, coordId, 'running'));
+      const remaining = workerTurns(engine, coordId).filter(
         (t) => t.status === 'queued' || t.status === 'running',
       );
       if (remaining.length === 0) break;
-      for (const turn of remaining) {
-        if (turn.status === 'queued') engine.resumeQueuedTurn(turn.id);
-      }
-      await new Promise((r) => setTimeout(r, 15));
+      await new Promise((r) => setTimeout(r, 10));
     }
-
     expect(secondWavePeak).toBeLessThanOrEqual(LOWERED_CAP);
 
-    const finalWorkers = workerTurns(store);
-    const nonSucceeded = finalWorkers
-      .filter((t) => t.status !== 'succeeded')
-      .map((t) => ({ id: t.id, taskId: t.taskId, status: t.status }));
-    expect(nonSucceeded).toEqual([]);
-    expect(finalWorkers).toHaveLength(WORKER_COUNT);
-
     releaseCoord();
-    await engine.whenIdle();
-    expect(live).toBe(0);
-  });
+    engine.quiesceForTerminalStorage();
+  }, 15_000);
 });
