@@ -153,7 +153,7 @@ import { WorkspaceRegistry } from './task/sqlite/workspace-registry';
 import { resolveWorkspaceIdentity, type WorkspaceContext } from './task/sqlite/workspace-identity';
 import { isTerminalLifecycle } from './task/transitions';
 import { resolveWorkspaceCwd } from './task/workspace-cwd';
-import type { TaskStoreFile } from './task/types';
+import type { EngineProjection } from './task/types';
 import { runLimitMs } from './task/execution-policy';
 import { resourceLimitsFromSettings } from './task/limits';
 import { USER_INTERACTION_TIMEOUT_MS } from './host/interaction-timeouts';
@@ -545,7 +545,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       const patches = projectWorkspacePatches({
         command: ctx.command,
         result: ctx.result,
-        before: ctx.beforeFile as TaskStoreFile,
+        before: ctx.beforeFile as EngineProjection,
         after,
         focusedTaskId: this.focusedTaskId,
         knownTranscriptIds: this.knownTranscriptIds,

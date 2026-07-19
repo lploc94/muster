@@ -119,8 +119,7 @@ Extension
 │   ├── codex.ts    (bundled codex-acp)
 │   ├── opencode.ts
 │   └── antigravity.ts  (planned)
-├── TaskStore + TaskEngine (task graph, turns, orchestration — see `docs/TASK-MANAGEMENT.md`)
-├── Session migration (archive-only `.muster-sessions.json` → `.migrated` on activation)
+├── SqliteTaskRepository + TaskEngine (task graph, turns, orchestration — see `docs/TASK-MANAGEMENT.md` / `docs/SQLITE-STORAGE.md`)
 ├── CommandBuilder / MCPConfig helpers
 ├── Muster Bridge
 │   ├── AskBridge (pending asks, in-memory)
@@ -133,9 +132,9 @@ Extension
 
 ## 6. Session Management
 
-The extension is **engine-only**: there is no flat per-backend session file or
-second persistence path. On activation, a present `.muster-sessions.json` is
-archived (never silently dropped); new work always starts as tasks.
+The extension is **engine-only** and **SQLite-only**: durable task state lives in
+`muster.sqlite3` under VS Code global storage (see `SQLITE-STORAGE.md`). There is
+no JSON task store and no second persistence path; new work always starts as tasks.
 
 In the task-based flow:
 
@@ -171,7 +170,7 @@ At turn start we generate/pass a merged MCP config (or use per-CLI discovery). G
 ## 8. Implementation Roadmap (Suggested)
 
 1. **Design & Types** (this doc + `types.ts`)
-2. **TaskStore + TaskEngine** (versioned task, turn, message, and session-binding state)
+2. **SqliteTaskRepository + TaskEngine** (durable SQLite task/turn/message state + in-memory projection)
 3. **Command builders** for all 4 CLIs (with MCP injection)
 4. **ACP client + event mapper** — Grok first (done), then Claude/Codex/agy on the same path
 5. **Minimal webview** that consumes normalized events

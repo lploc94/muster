@@ -73,7 +73,7 @@ Record only redacted high-level metadata. Acceptable examples include scenario I
 Redaction rules:
 
 - Do not include provider tokens.
-- Do not paste raw `.muster-tasks.json` content.
+- Do not paste raw SQLite DB dumps or task repository internals.
 - Do not include `.gsd/` artifact content.
 - Do not include local absolute paths, raw environment dumps, full prompt transcripts, raw assistant payloads, or user-specific workspace identifiers.
 - Prefer scenario IDs, evidence IDs, action names, lifecycle states, and relative tracked source references.

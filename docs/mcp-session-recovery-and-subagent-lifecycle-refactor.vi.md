@@ -1,3 +1,5 @@
+> **OBSOLETE storage notes:** This document predates SQLite-only storage. Ignore any `TaskStore`, `.muster-tasks.json`, or `JsonTurnStreamBuffer` guidance. Durable state is `SqliteTaskRepository` / `muster.sqlite3` only — see `SQLITE-STORAGE.md`.
+
 # Plan: Refactor MCP recovery và lifecycle của sub-agent
 
 ## Trạng thái

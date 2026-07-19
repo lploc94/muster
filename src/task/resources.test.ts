@@ -4,7 +4,7 @@ import {
   normalizeWorkspacePath,
   pathsOverlap,
 } from './resources';
-import type { MusterTask, TaskStoreFile } from './types';
+import type { MusterTask, EngineProjection } from './types';
 
 function task(partial: Partial<MusterTask> & { id: string }): MusterTask {
   return {
@@ -48,7 +48,7 @@ describe('normalizeWorkspacePath', () => {
 
 describe('hasResourceConflict', () => {
   it('blocks overlapping writePaths concurrent running', () => {
-    const file: TaskStoreFile = {
+    const file: EngineProjection = {
       schemaVersion: 5,
       revision: 1,
       tasks: {
@@ -93,7 +93,7 @@ describe('hasResourceConflict', () => {
   });
 
   it('allows disjoint writePaths', () => {
-    const file: TaskStoreFile = {
+    const file: EngineProjection = {
       schemaVersion: 5,
       revision: 1,
       tasks: {

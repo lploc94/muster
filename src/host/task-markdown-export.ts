@@ -1,4 +1,4 @@
-import type { MusterTask, TaskStoreFile } from '../task/types';
+import type { MusterTask, EngineProjection } from '../task/types';
 import { buildTranscript } from './snapshot';
 
 /** Version marker embedded at the top of every exported document. */
@@ -129,7 +129,7 @@ function renderTaskMetadata(task: MusterTask, sourceRevision: number, exportedAt
   return lines.join('\n');
 }
 
-function renderConversation(file: TaskStoreFile, taskId: string): string {
+function renderConversation(file: EngineProjection, taskId: string): string {
   const items = buildTranscript(file, taskId);
   const blocks: string[] = [];
 
@@ -151,13 +151,13 @@ function renderConversation(file: TaskStoreFile, taskId: string): string {
 }
 
 /**
- * Pure, side-effect-free projector: one TaskStoreFile snapshot + task id →
+ * Pure, side-effect-free projector: one EngineProjection snapshot + task id →
  * bounded Markdown document metadata, or a stable typed error code.
  *
  * Does not mutate `file`, open dialogs, write files, or read the system clock.
  */
 export function renderTaskMarkdownExport(
-  file: TaskStoreFile,
+  file: EngineProjection,
   taskId: string,
   options: TaskMarkdownExportOptions,
 ): TaskMarkdownExportResult {

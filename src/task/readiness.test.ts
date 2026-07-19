@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { evaluateTaskReadiness } from './readiness';
-import type { MusterTask, TaskStoreFile, TaskTurn } from './types';
+import type { MusterTask, EngineProjection, TaskTurn } from './types';
 
 function task(partial: Partial<MusterTask> & { id: string }): MusterTask {
   return {
@@ -25,7 +25,7 @@ function task(partial: Partial<MusterTask> & { id: string }): MusterTask {
   };
 }
 
-function file(tasks: Record<string, MusterTask>, turns: Record<string, TaskTurn> = {}): TaskStoreFile {
+function file(tasks: Record<string, MusterTask>, turns: Record<string, TaskTurn> = {}): EngineProjection {
   return {
     schemaVersion: 5,
     revision: 1,

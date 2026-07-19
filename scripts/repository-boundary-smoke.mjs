@@ -181,7 +181,7 @@ export async function runRepositoryBoundarySmoke(rootDir = ROOT) {
   try {
     const matrix = await readFile(path.join(rootDir, 'docs/plans/sqlite-entity-matrix.vi.md'), 'utf8');
     for (const term of [
-      'TaskStoreFile.schemaVersion', 'workspace_revisions', 'SQLite-only',
+      'EngineProjection.schemaVersion', 'workspace_revisions', 'SQLite-only',
       'runtime_claims', 'expires_at', 'stale', 'taskPayload', 'wait',
       'turn_inputs', 'reasoning_segments', 'change_log', 'change_feed_watermarks',
       'send_outbox', 'presentations', 'presentation_operations',

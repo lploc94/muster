@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { MusterTask, TaskMessage, TaskStoreFile, TaskTurn } from '../task/types';
+import type { MusterTask, TaskMessage, EngineProjection, TaskTurn } from '../task/types';
 import type { TaskRepository } from '../task/repository';
 import {
   DEFAULT_TASK_MARKDOWN_EXPORT_MAX_CHARS,
@@ -66,7 +66,7 @@ function message(
   };
 }
 
-function baseFile(overrides: Partial<TaskStoreFile> = {}): TaskStoreFile {
+function baseFile(overrides: Partial<EngineProjection> = {}): EngineProjection {
   return {
     schemaVersion: 3,
     revision: 11,
@@ -114,7 +114,7 @@ function baseFile(overrides: Partial<TaskStoreFile> = {}): TaskStoreFile {
   };
 }
 
-function repositoryFromFile(file: TaskStoreFile): TaskRepository {
+function repositoryFromFile(file: EngineProjection): TaskRepository {
   return {
     getTask: async (taskId) => file.tasks[taskId],
     listTurns: async (taskId) => Object.values(file.turns).filter((turn) => turn.taskId === taskId),
@@ -124,7 +124,7 @@ function repositoryFromFile(file: TaskStoreFile): TaskRepository {
 }
 
 function makeDeps(
-  file: TaskStoreFile,
+  file: EngineProjection,
   overrides: Partial<TaskExportRouteDeps> = {},
 ): {
   deps: TaskExportRouteDeps;

@@ -2,7 +2,7 @@
  * McpReadinessSupervisor — pure-ish readiness gate for turnId+attemptId.
  *
  * Decides mcp_ready against the credentialed expected tool catalog and current
- * bridge generation (invariants 1 and 12). Free of TaskStore/engine imports so
+ * bridge generation (invariants 1 and 12). Free of repository/engine imports so
  * S05/S06 and unit tests stay dependency-light.
  *
  * Failure taxonomy is stable for S06 recovery consumers.

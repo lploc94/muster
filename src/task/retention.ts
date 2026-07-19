@@ -1,5 +1,5 @@
 import { isTerminalLifecycle, isTerminalTurn } from './transitions';
-import type { TaskStoreFile, TaskTurn } from './types';
+import type { EngineProjection, TaskTurn } from './types';
 
 export const TRUNCATION_MARKER = '\n\n[output truncated by retention policy]';
 
@@ -13,11 +13,11 @@ export const DEFAULT_RETENTION_CONFIG: RetentionConfig = {
   maxStoredOutputChars: 200_000,
 };
 
-function cloneFile(file: TaskStoreFile): TaskStoreFile {
-  return JSON.parse(JSON.stringify(file)) as TaskStoreFile;
+function cloneFile(file: EngineProjection): EngineProjection {
+  return JSON.parse(JSON.stringify(file)) as EngineProjection;
 }
 
-function turnsForTask(file: TaskStoreFile, taskId: string): TaskTurn[] {
+function turnsForTask(file: EngineProjection, taskId: string): TaskTurn[] {
   return Object.values(file.turns)
     .filter((turn) => turn.taskId === taskId)
     .sort((a, b) => a.sequence - b.sequence);
@@ -58,7 +58,7 @@ function turnsToKeep(turns: TaskTurn[], maxKeep: number): Set<string> {
   return keep;
 }
 
-function messageIdsReferencedByTurns(file: TaskStoreFile, turnIds: Iterable<string>): Set<string> {
+function messageIdsReferencedByTurns(file: EngineProjection, turnIds: Iterable<string>): Set<string> {
   const referenced = new Set<string>();
   for (const turnId of turnIds) {
     const turn = file.turns[turnId];
@@ -74,7 +74,7 @@ function messageIdsReferencedByTurns(file: TaskStoreFile, turnIds: Iterable<stri
   return referenced;
 }
 
-function pruneTerminalTaskTurns(file: TaskStoreFile, taskId: string, maxTurnsPerTask: number): void {
+function pruneTerminalTaskTurns(file: EngineProjection, taskId: string, maxTurnsPerTask: number): void {
   const turns = turnsForTask(file, taskId);
   if (turns.length <= maxTurnsPerTask) {
     return;
@@ -120,7 +120,7 @@ function pruneTerminalTaskTurns(file: TaskStoreFile, taskId: string, maxTurnsPer
   }
 }
 
-function truncateOpenTaskOutput(file: TaskStoreFile, taskId: string, maxStoredOutputChars: number): void {
+function truncateOpenTaskOutput(file: EngineProjection, taskId: string, maxStoredOutputChars: number): void {
   const settledTurnIds = new Set(
     turnsForTask(file, taskId)
       .filter((turn) => isTerminalTurn(turn.status))
@@ -172,11 +172,11 @@ function truncateOpenTaskOutput(file: TaskStoreFile, taskId: string, maxStoredOu
 }
 
 /**
- * Pure, idempotent retention transform over a loaded TaskStoreFile.
+ * Pure, idempotent retention transform over an in-memory EngineProjection.
  * Open tasks: truncate oversized settled assistant output only.
  * Terminal tasks: may drop oldest turns beyond maxTurnsPerTask.
  */
-export function applyRetention(file: TaskStoreFile, config: RetentionConfig = DEFAULT_RETENTION_CONFIG): TaskStoreFile {
+export function applyRetention(file: EngineProjection, config: RetentionConfig = DEFAULT_RETENTION_CONFIG): EngineProjection {
   const next = cloneFile(file);
 
   for (const task of Object.values(next.tasks)) {
@@ -190,7 +190,7 @@ export function applyRetention(file: TaskStoreFile, config: RetentionConfig = DE
   return next;
 }
 
-export function retentionChanged(before: TaskStoreFile, after: TaskStoreFile): boolean {
+export function retentionChanged(before: EngineProjection, after: EngineProjection): boolean {
   return JSON.stringify(before) !== JSON.stringify(after);
 }
 

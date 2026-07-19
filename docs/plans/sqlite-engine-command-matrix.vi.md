@@ -23,6 +23,6 @@ suite trên `JsonTaskRepository` lẫn `SqliteTaskRepository`.
 
 Trong giai đoạn chuyển tiếp, JSON adapter có thể dùng state DTO nội bộ để giữ behavior,
 nhưng engine/host chỉ gọi command/query interface async. SQLite adapter không được nhận
-whole `TaskStoreFile`, callback mutation, hay `before/after` envelope diff từ runtime.
+whole `EngineProjection`, callback mutation, hay `before/after` envelope diff từ runtime.
 Các graph command có payload delta chung bên trong adapter để tránh nhân đôi SQL; caller
 vẫn gửi discriminant domain-specific và validator kiểm tra fence/invariant theo command.

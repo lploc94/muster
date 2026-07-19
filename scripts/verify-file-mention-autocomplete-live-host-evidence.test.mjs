@@ -44,7 +44,7 @@ const forbidden = [
   /Bearer\s+[A-Za-z0-9._-]+/i,
   /\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]+/i,
   /(?:[A-Za-z]:[\\/]|\\\\|\bfile:\/\/|\/home\/|\/Users\/|\/tmp\/)/,
-  /raw (?:task[- ]store|transcript|\.muster-tasks\.json|\.muster-sessions\.json)/i,
+  /raw (?:task[- ]store|transcript|muster\.sqlite3|task repository dump|\.muster-sessions\.json)/i,
   /(?:mocked|Playwright|browser) (?:result|test|evidence).{0,40}(?:proves|is) live/i,
 ];
 

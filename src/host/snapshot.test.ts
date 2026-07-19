@@ -15,7 +15,7 @@ import {
   type TranscriptPageState,
 } from './snapshot';
 import type { TaskReadPort } from '../task/store-port';
-import type { MusterTask, TaskMessage, TaskStoreFile, TaskTurn } from '../task/types';
+import type { MusterTask, TaskMessage, EngineProjection, TaskTurn } from '../task/types';
 
 /** Focused v6 page fixture — production supplies this from getTranscriptPage. */
 function pageOpts(
@@ -74,7 +74,7 @@ function message(overrides: Partial<TaskMessage> & Pick<TaskMessage, 'id' | 'tas
   };
 }
 
-function storeFrom(file: TaskStoreFile): TaskReadPort {
+function storeFrom(file: EngineProjection): TaskReadPort {
   return {
     getFile: () => file,
   } as TaskReadPort;
@@ -82,7 +82,7 @@ function storeFrom(file: TaskStoreFile): TaskReadPort {
 
 describe('host task snapshot projection', () => {
   it('renders a human-readable configured run timeout reason', () => {
-    const file: TaskStoreFile = {
+    const file: EngineProjection = {
       schemaVersion: 6,
       revision: 1,
       tasks: { timed: task('timed') },
@@ -109,7 +109,7 @@ describe('host task snapshot projection', () => {
   });
 
   it('does not reuse a historical run-timeout label after a later ordinary failure', () => {
-    const file: TaskStoreFile = {
+    const file: EngineProjection = {
       schemaVersion: 6,
       revision: 1,
       tasks: { timed: task('timed') },
@@ -140,7 +140,7 @@ describe('host task snapshot projection', () => {
   });
 
   it('orders roots by projected activity and projects a focused task contract', () => {
-    const file: TaskStoreFile = {
+    const file: EngineProjection = {
       schemaVersion: 2,
       revision: 7,
       tasks: {
@@ -279,7 +279,7 @@ describe('host task snapshot projection', () => {
   });
 
   it('projects multi-queued follow-ups in FIFO order with one message identity each', () => {
-    const file: TaskStoreFile = {
+    const file: EngineProjection = {
       schemaVersion: 2,
       revision: 3,
       tasks: {
@@ -400,7 +400,7 @@ describe('host task snapshot projection', () => {
   });
 
   it('omits queuedTurns and prefers waiting_user over later queued when live is ask', () => {
-    const file: TaskStoreFile = {
+    const file: EngineProjection = {
       schemaVersion: 2,
       revision: 1,
       tasks: {
@@ -452,7 +452,7 @@ describe('host task snapshot projection', () => {
   });
 
   it('returns empty queuedTurns when only a live turn exists', () => {
-    const file: TaskStoreFile = {
+    const file: EngineProjection = {
       schemaVersion: 2,
       revision: 1,
       tasks: { only: task('only') },
@@ -470,7 +470,7 @@ describe('host task snapshot projection', () => {
   });
 
   it('selects the latest retryable turn only for recovery state', () => {
-    const file: TaskStoreFile = {
+    const file: EngineProjection = {
       schemaVersion: 2,
       revision: 1,
       tasks: {
@@ -498,7 +498,7 @@ describe('host task snapshot projection', () => {
   });
 
   it('projects currentTurnActivity per host precedence including pure stop → null', () => {
-    const runningFile: TaskStoreFile = {
+    const runningFile: EngineProjection = {
       schemaVersion: 2,
       revision: 1,
       tasks: { t: task('t') },
@@ -519,7 +519,7 @@ describe('host task snapshot projection', () => {
     });
     expect(projectTaskSummary(runningFile, 't')).not.toHaveProperty('committedSessionId');
 
-    const waitingFile: TaskStoreFile = {
+    const waitingFile: EngineProjection = {
       ...runningFile,
       turns: {
         live: turn({ id: 'ask', taskId: 't', status: 'waiting_user', sequence: 1 }),
@@ -530,7 +530,7 @@ describe('host task snapshot projection', () => {
       turnId: 'ask',
     });
 
-    const depFile: TaskStoreFile = {
+    const depFile: EngineProjection = {
       schemaVersion: 2,
       revision: 1,
       tasks: {
@@ -555,7 +555,7 @@ describe('host task snapshot projection', () => {
       waitReason: 'dependencies',
     });
 
-    const childrenFile: TaskStoreFile = {
+    const childrenFile: EngineProjection = {
       schemaVersion: 2,
       revision: 1,
       tasks: {
@@ -573,7 +573,7 @@ describe('host task snapshot projection', () => {
       waitReason: 'children',
     });
 
-    const heldFile: TaskStoreFile = {
+    const heldFile: EngineProjection = {
       schemaVersion: 2,
       revision: 1,
       tasks: { t: task('t') },
@@ -595,7 +595,7 @@ describe('host task snapshot projection', () => {
       waitReason: 'held_after_failure',
     });
 
-    const failedFile: TaskStoreFile = {
+    const failedFile: EngineProjection = {
       schemaVersion: 2,
       revision: 1,
       tasks: { t: task('t') },
@@ -612,7 +612,7 @@ describe('host task snapshot projection', () => {
       retryable: true,
     });
 
-    const successAfterFailFile: TaskStoreFile = {
+    const successAfterFailFile: EngineProjection = {
       schemaVersion: 2,
       revision: 1,
       tasks: { t: task('t') },
@@ -626,7 +626,7 @@ describe('host task snapshot projection', () => {
     };
     expect(projectCurrentTurnActivity(successAfterFailFile, 't')).toBeNull();
 
-    const pureStopFile: TaskStoreFile = {
+    const pureStopFile: EngineProjection = {
       schemaVersion: 2,
       revision: 1,
       tasks: { t: task('t') },
@@ -648,7 +648,7 @@ describe('host task snapshot projection', () => {
   });
 
   it('projects wait continuation and recovery previews when no user message', () => {
-    const file: TaskStoreFile = {
+    const file: EngineProjection = {
       schemaVersion: 2,
       revision: 1,
       tasks: { t: task('t', { role: 'coordinator', goal: 'Wait UX' }) },
@@ -707,7 +707,7 @@ describe('host task snapshot projection', () => {
   });
 
   it('excludes queued-turn user messages from transcript but projects queue previewText', () => {
-    const file: TaskStoreFile = {
+    const file: EngineProjection = {
       schemaVersion: 2,
       revision: 1,
       tasks: {
@@ -777,7 +777,7 @@ describe('host task snapshot projection', () => {
   });
 
   it('shows the opening queued prompt in chat immediately without a queue-panel flash', () => {
-    const file: TaskStoreFile = {
+    const file: EngineProjection = {
       schemaVersion: 2,
       revision: 1,
       tasks: {
@@ -830,7 +830,7 @@ describe('host task snapshot projection', () => {
       sourceSessionId: 'src-sess-SECRET',
       targetSessionId: 'tgt-sess-SECRET',
     };
-    const file: TaskStoreFile = {
+    const file: EngineProjection = {
       schemaVersion: 2,
       revision: 5,
       tasks: {
@@ -909,7 +909,7 @@ describe('host task snapshot projection', () => {
   });
 
   it('P2: coordinator TaskSummary includes childOrchestration aggregate', () => {
-    const file: TaskStoreFile = {
+    const file: EngineProjection = {
       schemaVersion: 2,
       revision: 1,
       tasks: {
@@ -963,7 +963,7 @@ describe('host task snapshot projection', () => {
   });
 
   it('projects full owning-root tree when focus is a nested child', () => {
-    const file: TaskStoreFile = {
+    const file: EngineProjection = {
       schemaVersion: 2,
       revision: 1,
       tasks: {
@@ -1006,7 +1006,7 @@ describe('host task snapshot projection', () => {
   });
 
   it('normalizes focused snapshot without page options to no-focus (v6 invariant)', () => {
-    const file: TaskStoreFile = {
+    const file: EngineProjection = {
       schemaVersion: 6,
       revision: 1,
       tasks: { t: task('t') },
@@ -1020,7 +1020,7 @@ describe('host task snapshot projection', () => {
   });
 
   it('detects owning-root membership changes for sibling create', () => {
-    const before: TaskStoreFile = {
+    const before: EngineProjection = {
       schemaVersion: 2,
       revision: 1,
       tasks: {
@@ -1030,7 +1030,7 @@ describe('host task snapshot projection', () => {
       turns: {},
       messages: {},
     };
-    const after: TaskStoreFile = {
+    const after: EngineProjection = {
       ...before,
       revision: 2,
       tasks: {
@@ -1043,7 +1043,7 @@ describe('host task snapshot projection', () => {
   });
 
   it('collectSubtreeIds does not recurse forever on parent cycles', () => {
-    const selfParent: TaskStoreFile = {
+    const selfParent: EngineProjection = {
       schemaVersion: 2,
       revision: 1,
       tasks: {
@@ -1054,7 +1054,7 @@ describe('host task snapshot projection', () => {
     };
     expect(collectSubtreeIds(selfParent, 'loop')).toEqual(['loop']);
 
-    const mutual: TaskStoreFile = {
+    const mutual: EngineProjection = {
       schemaVersion: 2,
       revision: 1,
       tasks: {

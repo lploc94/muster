@@ -379,7 +379,7 @@ trong DB worker.
 Query trả domain DTO immutable. Repository không trả mutable object cache có thể bị code
 ngoài transaction thay đổi mà không persist.
 
-`TaskStoreFile`, filesystem `TaskStore` và JSON repository adapter bị xóa sau SQLite-only
+`EngineProjection`, filesystem `TaskStore` và JSON repository adapter bị xóa sau SQLite-only
 cutover. Test dùng SQLite repository hoặc purpose-built in-memory fixture, không dùng lại
 production JSON storage dưới tên khác.
 
@@ -458,7 +458,7 @@ extension-host heartbeat/UI command.
 
 ### Phase 2 — Repository boundary
 
-- Tách engine/snapshot/export khỏi `TaskStoreFile` mutation API.
+- Tách engine/snapshot/export khỏi `EngineProjection` mutation API.
 - Chuyển call chain liên quan sang async named commands/query API; không bọc sync API bằng
   fire-and-forget.
 - Chạy contract suite trên SQLite repository.
@@ -483,7 +483,7 @@ Phase 1–3.
 
 Mỗi wave là một change set/commit độc lập, có targeted tests và typecheck. Full suite
 chạy ở các milestone được nêu dưới đây. Không dùng command tổng quát kiểu
-`applyGraphMutation(TaskStoreFile)` để giảm số call site giả tạo: mọi mutation phải là
+`applyGraphMutation(EngineProjection)` để giảm số call site giả tạo: mọi mutation phải là
 named command với invariant, revision/epoch fence và worker-owned transaction rõ ràng.
 Các wave được tiếp tục tuần tự; chỉ dừng khi có blocker thực sự. Phase 4 chỉ được bắt đầu
 sau khi Wave 10 qua toàn bộ gate.
@@ -548,7 +548,7 @@ sau khi Wave 10 qua toàn bộ gate.
 
 - Chuyển runtime handoff, verdict revalidation, post-settlement follow-up draining,
   missing-input attention và disposition repair sang named commands.
-- Xóa bridge đang clone full `TaskStoreFile` để chuẩn bị dispatch hoặc
+- Xóa bridge đang clone full `EngineProjection` để chuẩn bị dispatch hoặc
   settlement; chỉ query và persist các aggregate/rows thực sự liên quan.
 - Thay filesystem `.lease.<turnId>` bằng repository-owned runtime claim có owner,
   expiry/heartbeat và stale-claim recovery.
@@ -1168,10 +1168,10 @@ injection fail rõ, redacted, không auto-reset và không mất row âm thầm.
 
 ## 13. Handoff rules cho implementer
 
-- Không bắt đầu bằng việc thay `storePath` rồi giữ nguyên `TaskStoreFile`; đó chỉ chuyển
+- Không bắt đầu bằng việc thay `storePath` rồi giữ nguyên `EngineProjection`; đó chỉ chuyển
   full-envelope JSON vào một SQLite cell và không đạt mục tiêu.
 - Không ship schema minh họa thiếu bảng parity. Trước Phase 3 gate phải có entity matrix:
-  mỗi field của `TaskStoreFile`/domain type map tới column, payload codec hoặc derived-only.
+  mỗi field của `EngineProjection`/domain type map tới column, payload codec hoặc derived-only.
 - Không thay toàn bộ engine trong một commit; đi theo wave/gate ở trên.
 - Không silently reset DB, silently skip malformed rows hoặc swallow `SQLITE_BUSY`.
 - Không log SQL parameters chứa prompt, tool result, path hoặc credential.
