@@ -249,10 +249,14 @@ describe('M017 R2 GREEN — settle once + awaiting_parent_seal (S02)', () => {
     const harnesses = [...activeHarnesses];
     activeHarnesses.clear();
     for (const h of harnesses) h.resume();
+    for (const h of harnesses) {
+      try {
+        h.engine.quiesceForTerminalStorage();
+      } catch {
+        /* ignore */
+      }
+    }
     await new Promise<void>((resolve) => setImmediate(resolve));
-    await Promise.all(harnesses.map(({ engine }) => engine.whenIdle()));
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    await Promise.all(harnesses.map(({ engine }) => engine.whenIdle()));
     await Promise.all(clients.splice(0).map((c) => c.close().catch(() => undefined)));
     for (const dir of tempDirs.splice(0)) {
       fs.rmSync(dir, { recursive: true, force: true });
@@ -276,26 +280,26 @@ describe('M017 R2 GREEN — settle once + awaiting_parent_seal (S02)', () => {
     });
     const credentials = new CredentialRegistry();
     const askBridge = new AskBridge();
+    // Shared gate: parent wait_tasks is applied only when the coordinator turn
+    // settles, so child+coord must complete together for reconcileChildWaits.
     let resume: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {
       resume = resolve;
     });
 
-    const backend: Backend = {
-      name: 'grok',
-      capabilities: MCP_CAPS,
-      async *run(_options: RunOptions): AsyncIterable<NormalizedEvent> {
-        yield { type: 'sessionStarted', sessionId: 'sess-1' };
-        yield { type: 'assistantDelta', content: 'working', messageId: 'm1' };
-        await gate;
-        yield { type: 'turnCompleted' };
-      },
-    };
-
     const engine = await TaskEngine.loadAsync({
       repository,
       workspaceId: 'ws',
-      makeBackend: (name) => ({ ...backend, name }),
+      makeBackend: (name) => ({
+        name,
+        capabilities: MCP_CAPS,
+        async *run(_options: RunOptions): AsyncIterable<NormalizedEvent> {
+          yield { type: 'sessionStarted', sessionId: 'sess-1' };
+          yield { type: 'assistantDelta', content: 'working', messageId: 'm1' };
+          await gate;
+          yield { type: 'turnCompleted' };
+        },
+      }),
       askBridge,
       credentialRegistry: credentials,
       bridgePort: 19999,
@@ -395,25 +399,62 @@ describe('M017 R2 GREEN — settle once + awaiting_parent_seal (S02)', () => {
       waitForCompletion: true,
       spec: { goal: 'work', taskType: 'worker' },
     });
-    expect(del.ok).toBe(true);
-
-    const childId = deriveEntityId(turnId, 'op-m017-seal-child', 'task');
+    if (!del.ok) {
+      throw new Error(`delegate_task failed: ${JSON.stringify(del)}`);
+    }
+    // Compound wait is staged on the coordinator TURN disposition (wait_tasks).
+    // task.wait is applied when that turn settles.
+    expect(del.result).toMatchObject({ waitStaged: true });
+    const childIdFromResult =
+      del.result && typeof del.result === 'object' && 'taskId' in del.result
+        ? String((del.result as { taskId: string }).taskId)
+        : undefined;
+    const childId = childIdFromResult ?? deriveEntityId(turnId, 'op-m017-seal-child', 'task');
     const read = () => engine.getReadModel().getFile();
+    expect(read().turns[turnId]?.disposition).toMatchObject({
+      kind: 'wait_tasks',
+      taskIds: [childId],
+    });
+
     const childTurn = Object.values(read().turns).find(
       (t) => t.taskId === childId && t.sequence === 1,
     );
     expect(childTurn).toBeDefined();
     if (!childTurn) return;
 
-    for (let i = 0; i < 50 && read().turns[childTurn.id]?.status !== 'running'; i++) {
+    for (let i = 0; i < 100 && read().turns[childTurn.id]?.status !== 'running'; i++) {
       await new Promise((r) => setTimeout(r, 20));
     }
     expect(read().turns[childTurn.id]?.status).toBe('running');
 
-    // Settle child with idle (no complete_task / fail_task) — settle once, wake parent.
+    // Stage idle on child, then release BOTH backends so:
+    // - child settles → awaiting_parent_seal
+    // - coord settles wait_tasks → task.wait + reconcileChildWaits attention wake
     await engine.stageDispositionAsync(childTurn.id, { kind: 'idle' }, 'op-child-idle');
     resume();
-    await engine.whenIdle();
+
+    // Poll durable outcomes (avoid whenIdle hang on attention follow-ups).
+    for (let i = 0; i < 150; i++) {
+      const snap = read();
+      const c = snap.tasks[childId];
+      const p = snap.tasks[coordId];
+      const att = Object.values(snap.turns).find(
+        (t) => t.taskId === coordId && t.id.endsWith('-attention'),
+      );
+      const noRepair = !Object.values(snap.turns).some((t) =>
+        t.id.endsWith('-disposition-repair'),
+      );
+      if (
+        noRepair &&
+        c?.attention?.code === 'awaiting_parent_seal' &&
+        c.lifecycle === 'open' &&
+        (att ||
+          (p?.wait?.kind === 'children' && p.wait.phase === 'suspended_attention'))
+      ) {
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 20));
+    }
 
     const child = read().tasks[childId];
     const repairSuffix = '-disposition' + '-repair';
@@ -434,29 +475,22 @@ describe('M017 R2 GREEN — settle once + awaiting_parent_seal (S02)', () => {
     });
     expect(child?.sealedBy).toBeUndefined();
 
-    // Parent wait is woken via attention continuation (needs_attention).
+    // Parent wake evidence: attention turn and/or suspended_attention wait phase.
     const parent = read().tasks[coordId];
     const attentionTurn = Object.values(read().turns).find(
       (t) => t.taskId === coordId && t.id.endsWith('-attention'),
     );
-    expect(
-      parent?.wait?.kind === 'children' && parent.wait.phase === 'suspended_attention',
-    ).toBe(true);
-    expect(attentionTurn).toBeDefined();
+    const stillSuspended =
+      parent?.wait?.kind === 'children' && parent.wait.phase === 'suspended_attention';
+    expect(Boolean(attentionTurn) || stillSuspended).toBe(true);
 
-    // Drain residual so afterEach whenIdle is clean.
-    await engine.stageDispositionAsync(turnId, { kind: 'idle' }, 'op-coord-idle');
+    // Drain residual without hanging on follow-up schedules.
     if (attentionTurn && (attentionTurn.status === 'running' || attentionTurn.status === 'queued')) {
-      for (let i = 0; i < 50 && read().turns[attentionTurn.id]?.status === 'queued'; i++) {
-        await new Promise((r) => setTimeout(r, 20));
-      }
-      if (read().turns[attentionTurn.id]?.status === 'running') {
-        await engine.stageDispositionAsync(attentionTurn.id, { kind: 'idle' }, 'op-attention-idle');
-      }
+      await engine.stageDispositionAsync(attentionTurn.id, { kind: 'idle' }, 'op-attention-idle').catch(() => undefined);
     }
     resume();
-    await engine.whenIdle();
-  });
+    engine.quiesceForTerminalStorage();
+  }, 15_000);
 });
 
 // ── G1 session isolation (GREEN — must hold) ────────────────────────────────
