@@ -14,7 +14,7 @@ import type {
   TaskContinuationHandoffState,
   TaskHandoffContextCutoff,
   TaskMessage,
-  TaskStoreFile,
+  EngineProjection,
   TaskTurn,
 } from './types';
 import { sanitizeHandoffFailureMessage } from './sanitization';
@@ -31,7 +31,7 @@ interface ContextRows {
   throughTurnSequence: number;
 }
 
-function turnMapForTask(file: TaskStoreFile, taskId: string): Map<string, TaskTurn> {
+function turnMapForTask(file: EngineProjection, taskId: string): Map<string, TaskTurn> {
   return new Map(
     Object.values(file.turns)
       .filter((turn) => turn.taskId === taskId)
@@ -40,7 +40,7 @@ function turnMapForTask(file: TaskStoreFile, taskId: string): Map<string, TaskTu
 }
 
 function committedRows(
-  file: TaskStoreFile,
+  file: EngineProjection,
   taskId: string,
   throughTurnSequence = Number.POSITIVE_INFINITY,
 ): ContextRows {
@@ -109,7 +109,7 @@ function digestRows(messages: readonly TaskMessage[], toolCalls: readonly Persis
 
 /** Capture the immutable boundary used by the first real turn after a switch. */
 export function captureContinuationCutoff(
-  file: TaskStoreFile,
+  file: EngineProjection,
   taskId: string,
   capturedAt: string,
 ): TaskHandoffContextCutoff {
@@ -302,7 +302,7 @@ function currentStateLines(task: MusterTask | undefined, turns: readonly TaskTur
  * 3. older history
  */
 export function buildCompactContinuationContext(
-  file: TaskStoreFile,
+  file: EngineProjection,
   taskId: string,
   handoff: TaskContinuationHandoffState,
   maxChars = MAX_CONTINUATION_CHARS,

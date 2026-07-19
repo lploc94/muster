@@ -1098,7 +1098,7 @@ policy, not a task-model invariant.
 ### 12.1 Task repository
 
 The authoritative shipping store is the SQLite-backed `TaskRepository` under
-`globalStorageUri` (see `SQLITE-STORAGE.md`). `.muster-tasks.json` is legacy design
+`globalStorageUri` (see `SQLITE-STORAGE.md`). JSON task files are not used
 history, not an allowed sidecar for new orchestration state. The repository schema
 and every projected snapshot retain explicit schema/store revisions.
 
@@ -1155,7 +1155,7 @@ wait set is sufficient to recover orchestration state.
 - performs reload reconciliation and idempotent continuation scheduling;
 - cascades cancel/skip to descendants.
 
-`TaskStore` persists state but does not decide transitions. Backend adapters execute
+`SqliteTaskRepository` persists state but does not decide transitions. Backend adapters execute
 turns but never seal lifecycle. User and authorized coordinators do.
 
 ---
@@ -1275,7 +1275,7 @@ the webview status menu uses `setTaskLifecycle` only.
 
 ### Phase B — Store and single-task engine
 
-- [ ] Versioned `TaskStore` with atomic and concurrent-writer protection
+- [x] SQLite `SqliteTaskRepository` with transactional writes (see `SQLITE-STORAGE.md`)
 - [ ] `TaskEngine` for one task/session and multiple turns
 - [ ] Successful session commit and interrupted-turn recovery
 - [ ] Explicit completion/failure disposition
@@ -1296,7 +1296,7 @@ the webview status menu uses `setTaskLifecycle` only.
 
 ### Phase E — Migration and cleanup
 
-- [ ] Migrate legacy `.muster-sessions.json` users
+- [x] SQLite-only storage (no JSON task/session migration path)
 - [ ] Make task flow the default
 - [ ] Remove legacy flat session path
 - [ ] Add retention, archival, and recovery UI

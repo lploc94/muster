@@ -1,5 +1,5 @@
 import type { RepositoryCommand, RepositoryCommandResult } from '../task/repository';
-import type { TaskMessage, TaskStoreFile, PersistedToolCall, PersistedReasoning } from '../task/types';
+import type { TaskMessage, EngineProjection, PersistedToolCall, PersistedReasoning } from '../task/types';
 import {
   collectAncestorIds,
   projectQueuedTurns,
@@ -44,8 +44,8 @@ export type WorkspacePatchBatch = {
 export interface ProjectWorkspacePatchesArgs {
   command: RepositoryCommand;
   result: RepositoryCommandResult;
-  before: TaskStoreFile;
-  after: TaskStoreFile;
+  before: EngineProjection;
+  after: EngineProjection;
   focusedTaskId?: string;
   knownTranscriptIds: ReadonlySet<string>;
 }
@@ -91,8 +91,8 @@ function reasoningToTranscriptItem(segment: PersistedReasoning): TranscriptItem 
 
 function collectAffectedTaskIds(
   command: RepositoryCommand,
-  before: TaskStoreFile,
-  after: TaskStoreFile,
+  before: EngineProjection,
+  after: EngineProjection,
 ): Set<string> {
   const ids = new Set<string>();
   if ('taskId' in command && typeof command.taskId === 'string') ids.add(command.taskId);
@@ -201,7 +201,7 @@ function isMetadataMembershipCommand(kind: RepositoryCommand['kind']): boolean {
  */
 function extractPromotedTurnTranscript(
   command: RepositoryCommand,
-  after: TaskStoreFile,
+  after: EngineProjection,
   focusedTaskId: string | undefined,
 ): { taskId: string; items: TranscriptItem[] } | null {
   if (!focusedTaskId) return null;
@@ -286,7 +286,7 @@ function extractCommandTranscriptItems(command: RepositoryCommand): {
  */
 function shouldPublishUserTranscript(
   command: RepositoryCommand,
-  after: TaskStoreFile,
+  after: EngineProjection,
 ): boolean {
   if (command.kind === 'createRootAndInitialTurn') return true;
   if (command.kind === 'enqueueMessageTurn') {

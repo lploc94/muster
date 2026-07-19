@@ -7,7 +7,7 @@ import { InvalidTranscriptCursorError } from './transcript-cursor';
 import { DbClient } from './sqlite/client';
 import type { MusterTask, PersistedReasoning, PersistedToolCall, TaskMessage, TaskTurn } from './types';
 import { buildTranscript } from '../host/snapshot';
-import type { TaskStoreFile } from './types';
+import type { EngineProjection } from './types';
 
 function makeTask(id: string): MusterTask {
   return {
@@ -521,7 +521,7 @@ async function seedTurnWithSegments(repo: SqliteTaskRepository, taskId: string, 
  */
 async function seedMixedTranscript(
   repo: SqliteTaskRepository,
-): Promise<{ task: MusterTask; file: TaskStoreFile; expectedIds: string[] }> {
+): Promise<{ task: MusterTask; file: EngineProjection; expectedIds: string[] }> {
   const task = makeTask('mixed-task');
   await repo.execute({ kind: 'createTask', workspaceId: 'ws', task });
 
@@ -556,11 +556,11 @@ async function seedMixedTranscript(
   return { task, file, expectedIds };
 }
 
-/** Assemble an in-memory TaskStoreFile mirroring what was persisted (for parity). */
+/** Assemble an in-memory EngineProjection mirroring what was persisted (for parity). */
 function toStoreFile(
   task: MusterTask, turns: TaskTurn[], messages: TaskMessage[],
   reasoning: PersistedReasoning[], toolCalls: PersistedToolCall[],
-): TaskStoreFile {
+): EngineProjection {
   return {
     schemaVersion: 1,
     tasks: { [task.id]: task },
@@ -568,7 +568,7 @@ function toStoreFile(
     messages: Object.fromEntries(messages.map((m) => [m.id, m])),
     reasoning: Object.fromEntries(reasoning.map((r) => [r.id, r])),
     toolCalls: Object.fromEntries(toolCalls.map((tc) => [tc.id, tc])),
-  } as unknown as TaskStoreFile;
+  } as unknown as EngineProjection;
 }
 
 /**

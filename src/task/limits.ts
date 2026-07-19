@@ -1,4 +1,4 @@
-import type { TaskExecutionPolicy, TaskStoreFile } from './types';
+import type { TaskExecutionPolicy, EngineProjection } from './types';
 import { TASK_ERROR_MAX_BYTES, TASK_RESULT_MAX_BYTES } from './content-limits';
 import { TASK_EXECUTION_HARD_BOUNDS } from './execution-policy';
 
@@ -177,7 +177,7 @@ export type LimitKind =
   | 'error_size';
 
 export interface LimitContext {
-  file: TaskStoreFile;
+  file: EngineProjection;
   parentId: string | null;
   rootId: string;
   taskId?: string;
@@ -196,7 +196,7 @@ export function effectiveTurnCap(
 }
 
 export function canCreateTurn(
-  file: TaskStoreFile,
+  file: EngineProjection,
   taskId: string,
   limits: ResourceLimits,
 ): { ok: true } | { ok: false; reason: string } {
@@ -218,7 +218,7 @@ export function canCreateTurn(
   return { ok: true };
 }
 
-export function taskDepth(file: TaskStoreFile, taskId: string): number {
+export function taskDepth(file: EngineProjection, taskId: string): number {
   let depth = 0;
   let current = file.tasks[taskId];
   while (current?.parentId) {
@@ -231,11 +231,11 @@ export function taskDepth(file: TaskStoreFile, taskId: string): number {
   return depth;
 }
 
-export function countChildren(file: TaskStoreFile, parentId: string): number {
+export function countChildren(file: EngineProjection, parentId: string): number {
   return Object.values(file.tasks).filter((t) => t.parentId === parentId).length;
 }
 
-export function countRootChildren(file: TaskStoreFile, rootId: string): number {
+export function countRootChildren(file: EngineProjection, rootId: string): number {
   return Object.values(file.tasks).filter((t) => {
     let current = t;
     while (current.parentId) {

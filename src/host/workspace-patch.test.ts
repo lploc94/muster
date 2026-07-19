@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import type { RepositoryCommand } from '../task/repository';
-import type { MusterTask, TaskMessage, TaskStoreFile, TaskTurn } from '../task/types';
+import type { MusterTask, TaskMessage, EngineProjection, TaskTurn } from '../task/types';
 import {
   localCommitNeedsTranscriptRecovery,
   projectWorkspacePatches,
 } from './workspace-patch';
 
-function emptyFile(revision = 0): TaskStoreFile {
+function emptyFile(revision = 0): EngineProjection {
   return {
     schemaVersion: 6,
     revision,

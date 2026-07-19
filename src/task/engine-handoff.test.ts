@@ -4,9 +4,9 @@ import {
   captureContinuationCutoff,
   MAX_CONTINUATION_CHARS,
 } from './engine-handoff';
-import type { TaskContinuationHandoffState, TaskStoreFile } from './types';
+import type { TaskContinuationHandoffState, EngineProjection } from './types';
 
-function file(): TaskStoreFile {
+function file(): EngineProjection {
   return {
     schemaVersion: 5,
     revision: 7,

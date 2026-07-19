@@ -1,6 +1,6 @@
 # SQLite entity matrix (current Phase 4 schema)
 
-Tài liệu này là inventory chính thức giữa `TaskStoreFile`/domain types và
+Tài liệu này là inventory chính thức giữa `EngineProjection`/domain types và
 `muster.sqlite3`. Mỗi field chỉ có một nguồn sự thật: field dùng cho query,
 foreign-key, scheduler hoặc fence nằm ở cột được promote; phần ít truy vấn nằm
 trong `payload_json` với `payloadVersion: 1` và được hydrate qua codec trong
@@ -50,9 +50,9 @@ are deleted/reclaimed transactionally with the owning turn.
 
 | Legacy/global field | SQLite source of truth | Ghi chú |
 |---|---|---|
-| `TaskStoreFile.schemaVersion` | `PRAGMA user_version` | Schema database, không lặp lại trong workspace row. |
-| `TaskStoreFile.revision` | `workspace_revisions(workspace_id, revision)` | Mỗi transaction logical tạo tối đa một workspace revision. |
-| `TaskStoreFile.tasks`, `turns`, `messages`, `toolCalls`, `reasoning`, `operations`, `cancelRequests`, `sendReceipts`, `runtimeClaims` | Các normalized tables liệt kê trong tài liệu này | Chỉ là projection nội bộ theo phạm vi task, không có full-workspace export API. |
+| `EngineProjection.schemaVersion` | `PRAGMA user_version` | Schema database, không lặp lại trong workspace row. |
+| `EngineProjection.revision` | `workspace_revisions(workspace_id, revision)` | Mỗi transaction logical tạo tối đa một workspace revision. |
+| `EngineProjection.tasks`, `turns`, `messages`, `toolCalls`, `reasoning`, `operations`, `cancelRequests`, `sendReceipts`, `runtimeClaims` | Các normalized tables liệt kê trong tài liệu này | Chỉ là projection nội bộ theo phạm vi task, không có full-workspace export API. |
 | Incremental invalidation | `change_log(workspace_id, revision, entity_kind, entity_id, task_id, change_kind, created_at)` | Metadata feed, không chứa prompt/tool payload hay secret. |
 | Change-feed low watermark | `change_feed_watermarks(workspace_id, retained_from_revision)` | Explicit retained-from revision for gap detection (not MIN(change_log) alone). |
 | Durable send outbox | `send_outbox(workspace_id, client_request_id, status, task_id, payload_json, …)` | Pending/rejected user sends; webview setState must not hold text. |

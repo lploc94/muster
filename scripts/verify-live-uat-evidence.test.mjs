@@ -55,7 +55,7 @@ const requiredCommandReferences = [
 const requiredRedactionStatements = [
   'Record only redacted high-level metadata',
   'Do not include provider tokens',
-  'Do not paste raw `.muster-tasks.json` content',
+  'Do not paste raw SQLite DB dumps or task repository internals',
   'Do not include `.gsd/` artifact content',
   'Use relative tracked source and command references only',
 ];
@@ -70,8 +70,8 @@ const unsupportedOrUnsafeMarkers = [
   'unredacted session dump',
   'raw session dump',
   '.muster-sessions.json contents',
-  'raw `.muster-tasks.json` content:',
-  '.muster-tasks.json raw content',
+  'raw SQLite DB dump:',
+  'SQLite DB dump raw content',
   'mocked Playwright evidence proves live Extension Development Host behavior',
   'Playwright mock is live Extension Development Host proof',
 ];
@@ -79,8 +79,8 @@ const unsupportedOrUnsafeMarkers = [
 const forbiddenRuntimeArtifactClaims = [
   'read `.gsd/` for evidence',
   'read .gsd for evidence',
-  'copied `.muster-tasks.json` into this ledger',
-  'copied .muster-tasks.json into this ledger',
+  'copied SQLite DB dump into this ledger',
+  'copied SQLite DB dump into this ledger',
 ];
 
 async function readEvidenceDocument() {
@@ -137,7 +137,7 @@ function completeFixture() {
     '## Session Metadata and Redaction',
     'Record only redacted high-level metadata',
     'Do not include provider tokens',
-    'Do not paste raw `.muster-tasks.json` content',
+    'Do not paste raw SQLite DB dumps or task repository internals',
     'Do not include `.gsd/` artifact content',
     '## Limitations',
     '## Commands',
@@ -183,7 +183,7 @@ test('rejects unsafe raw stores, provider tokens, session dumps, and mocked-live
   assert.throws(() => assertLiveUatEvidence(`${valid}\nANTHROPIC_API_KEY`), /unsafe secret/);
   assert.throws(() => assertLiveUatEvidence(`${valid}\nprovider token: abc123`), /unsafe secret/);
   assert.throws(() => assertLiveUatEvidence(`${valid}\nunredacted session dump`), /unsafe secret/);
-  assert.throws(() => assertLiveUatEvidence(`${valid}\nraw \`.muster-tasks.json\` content:`), /unsafe secret/);
+  assert.throws(() => assertLiveUatEvidence(`${valid}\nraw SQLite DB dump:`), /unsafe secret|unsafe/);
   assert.throws(
     () => assertLiveUatEvidence(`${valid}\nmocked Playwright evidence proves live Extension Development Host behavior`),
     /mocked-live marker/,

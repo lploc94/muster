@@ -1,3 +1,5 @@
+> **OBSOLETE storage notes:** Predates SQLite-only cutover. Do not reintroduce TaskStore / JSON task files. See SQLITE-STORAGE.md.
+
 # Plan: Refactor MCP recovery và lifecycle của sub-agent
 
 ## Trạng thái

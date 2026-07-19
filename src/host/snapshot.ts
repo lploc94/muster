@@ -16,7 +16,7 @@ import type {
   TaskMessageState,
   TaskRole,
   TaskRuntimeActivity,
-  TaskStoreFile,
+  EngineProjection,
   TaskTurn,
   TaskViewStatus,
 } from '../task/types';
@@ -169,10 +169,10 @@ export interface PendingAskOverlay {
 }
 
 export interface TaskSnapshotReader {
-  getFile(): Readonly<TaskStoreFile>;
+  getFile(): Readonly<EngineProjection>;
 }
 
-function turnsForTask(file: TaskStoreFile, taskId: string): TaskTurn[] {
+function turnsForTask(file: EngineProjection, taskId: string): TaskTurn[] {
   return Object.values(file.turns)
     .filter((turn) => turn.taskId === taskId)
     .sort((a, b) => a.sequence - b.sequence);
@@ -192,7 +192,7 @@ function isOpeningQueuedTurn(turn: TaskTurn, taskTurns: readonly TaskTurn[]): bo
   );
 }
 
-function depLifecyclesForTask(file: TaskStoreFile, task: MusterTask): Map<string, TaskLifecycleState> {
+function depLifecyclesForTask(file: EngineProjection, task: MusterTask): Map<string, TaskLifecycleState> {
   const map = new Map<string, TaskLifecycleState>();
   for (const dep of task.dependencies) {
     const depTask = file.tasks[dep.taskId];
@@ -211,7 +211,7 @@ function maxIso(...values: (string | undefined)[]): string {
   return present.reduce((latest, value) => (value.localeCompare(latest) > 0 ? value : latest));
 }
 
-export function projectActivityTime(file: TaskStoreFile, taskId: string): string {
+export function projectActivityTime(file: EngineProjection, taskId: string): string {
   const task = file.tasks[taskId];
   if (!task) {
     return '';
@@ -249,7 +249,7 @@ function queuedTurnsFifo(turns: readonly TaskTurn[]): TaskTurn[] {
     );
 }
 
-function waitReasonForQueuedTurn(file: TaskStoreFile, task: MusterTask, turn: TaskTurn): TurnActivityWaitReason | undefined {
+function waitReasonForQueuedTurn(file: EngineProjection, task: MusterTask, turn: TaskTurn): TurnActivityWaitReason | undefined {
   if (dependenciesBlockTask(file, task.id)) {
     return 'dependencies';
   }
@@ -280,7 +280,7 @@ function isPureUserStop(turn: TaskTurn): boolean {
  * 3. Latest failed needing attention; pure user Stop → null
  * 4. else null
  */
-export function projectCurrentTurnActivity(file: TaskStoreFile, taskId: string): TurnActivity {
+export function projectCurrentTurnActivity(file: EngineProjection, taskId: string): TurnActivity {
   const task = file.tasks[taskId];
   if (!task || task.lifecycle !== 'open') {
     return null;
@@ -341,7 +341,7 @@ export function projectCurrentTurnActivity(file: TaskStoreFile, taskId: string):
 }
 
 function projectChildOrchestration(
-  file: TaskStoreFile,
+  file: EngineProjection,
   parentId: string,
 ): TaskSummary['childOrchestration'] | undefined {
   const children = Object.values(file.tasks).filter((t) => t.parentId === parentId);
@@ -392,7 +392,7 @@ function projectChildOrchestration(
   };
 }
 
-export function projectTaskSummary(file: TaskStoreFile, taskId: string): TaskSummary | undefined {
+export function projectTaskSummary(file: EngineProjection, taskId: string): TaskSummary | undefined {
   const task = file.tasks[taskId];
   if (!task) {
     return undefined;
@@ -432,7 +432,7 @@ export function projectTaskSummary(file: TaskStoreFile, taskId: string): TaskSum
   };
 }
 
-export function buildTranscript(file: TaskStoreFile, taskId: string): TranscriptItem[] {
+export function buildTranscript(file: EngineProjection, taskId: string): TranscriptItem[] {
   const turns = turnsForTask(file, taskId);
   const seqOf = new Map<string, number>();
   for (const turn of turns) {
@@ -548,7 +548,7 @@ export const QUEUED_PREVIEW_RECOVERY = 'Recovery turn';
  * child_results / recovery (or empty), return a stable host label so the UI
  * never shows "(empty queued message)".
  */
-export function previewTextForQueuedTurn(file: TaskStoreFile, turn: TaskTurn): string {
+export function previewTextForQueuedTurn(file: EngineProjection, turn: TaskTurn): string {
   const parts: string[] = [];
   for (const messageId of messageIdsForTurn(turn)) {
     const message = file.messages[messageId];
@@ -571,7 +571,7 @@ export function previewTextForQueuedTurn(file: TaskStoreFile, turn: TaskTurn): s
   return '';
 }
 
-export function projectQueuedTurns(file: TaskStoreFile, taskId: string): QueuedTurnProjection[] {
+export function projectQueuedTurns(file: EngineProjection, taskId: string): QueuedTurnProjection[] {
   const taskTurns = turnsForTask(file, taskId);
   return taskTurns
     .filter((turn) => turn.status === 'queued' && !isOpeningQueuedTurn(turn, taskTurns))
@@ -600,7 +600,7 @@ export function projectQueuedTurns(file: TaskStoreFile, taskId: string): QueuedT
  * 2. Else earliest queued turn by sequence (resume target when nothing is live)
  * 3. Else latest failed/interrupted under needs_recovery
  */
-export function activeTurnIdForTask(file: TaskStoreFile, taskId: string): string | undefined {
+export function activeTurnIdForTask(file: EngineProjection, taskId: string): string | undefined {
   const turns = turnsForTask(file, taskId);
   const live = turns.filter((turn) => turn.status === 'running' || turn.status === 'waiting_user');
   if (live.length > 0) {
@@ -699,7 +699,7 @@ export function buildSnapshot(
 }
 
 /** Walk parentId to the root coordinator; cycle-safe. */
-export function findOwningRoot(file: TaskStoreFile, taskId: string): string | undefined {
+export function findOwningRoot(file: EngineProjection, taskId: string): string | undefined {
   if (!file.tasks[taskId]) {
     return undefined;
   }
@@ -722,7 +722,7 @@ export function findOwningRoot(file: TaskStoreFile, taskId: string): string | un
 }
 
 /** Ancestor chain from task toward root (excludes taskId; root last). */
-export function collectAncestorIds(file: TaskStoreFile, taskId: string): string[] {
+export function collectAncestorIds(file: EngineProjection, taskId: string): string[] {
   const ancestors: string[] = [];
   const visited = new Set<string>();
   let current = file.tasks[taskId]?.parentId;
@@ -737,7 +737,7 @@ export function collectAncestorIds(file: TaskStoreFile, taskId: string): string[
 /**
  * DFS preorder under rootTaskId. Siblings ordered by createdAt asc, then id.
  */
-export function collectSubtreeIds(file: TaskStoreFile, rootTaskId: string): string[] {
+export function collectSubtreeIds(file: EngineProjection, rootTaskId: string): string[] {
   if (!file.tasks[rootTaskId]) {
     return [];
   }
@@ -765,8 +765,8 @@ export function collectSubtreeIds(file: TaskStoreFile, rootTaskId: string): stri
 
 /** True when focused owning-root membership (set of ids) changed between files. */
 export function owningRootMembershipChanged(
-  before: TaskStoreFile,
-  after: TaskStoreFile,
+  before: EngineProjection,
+  after: EngineProjection,
   focusedTaskId: string,
 ): boolean {
   const rootBefore = findOwningRoot(before, focusedTaskId);

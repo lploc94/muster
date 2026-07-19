@@ -1,10 +1,10 @@
-import type { TaskStoreFile } from '../task/types';
+import type { EngineProjection } from '../task/types';
 
 export type PresentationChatLinkResult =
   | { ok: true; code: 'revealed' }
   | { ok: false; code: 'not-found' | 'not-owner' | 'host-failure' };
 
-export interface PresentationTaskReader { getFile(): Pick<TaskStoreFile, 'tasks'> }
+export interface PresentationTaskReader { getFile(): Pick<EngineProjection, 'tasks'> }
 export interface PresentationChatHost { executeCommand(command: string): PromiseLike<unknown> }
 export interface PresentationChatFocus { focusTask(taskId: string): void }
 

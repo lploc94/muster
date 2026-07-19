@@ -1,5 +1,5 @@
 import type { TaskRepository } from '../task/repository';
-import type { TaskStoreFile } from '../task/types';
+import type { EngineProjection } from '../task/types';
 import {
   MAX_TASK_MARKDOWN_EXPORT_ID_CHARS,
   renderTaskMarkdownExport,
@@ -226,7 +226,7 @@ export async function routeExportTask(
     return commandError('invalid_request', parsed.taskId);
   }
 
-  let file: TaskStoreFile;
+  let file: EngineProjection;
   try {
     const repository = deps.getRepository();
     const [task, turns, messages, sourceRevision] = await Promise.all([

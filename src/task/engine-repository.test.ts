@@ -73,7 +73,7 @@ describe('TaskEngine repository-only boundary', () => {
     }
   }, 20_000);
 
-  it('dispatches and settles with SQLite without a TaskStore', async () => {
+  it('dispatches and settles with SQLite repository projection', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-engine-repository-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
     try {
