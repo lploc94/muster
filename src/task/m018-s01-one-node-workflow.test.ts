@@ -1,16 +1,21 @@
 /**
- * M018 S01 named flow (domain + repository boundary):
- * define immutable one-node workflow → start → exactly one ordinary queued entry turn.
- * Does not open MCP bridge (T06); uses real SQLite worker.
+ * M018 S01 named flow:
+ * populated v7 migration → public bridge define/start → one ordinary queued entry turn.
+ * Uses real SQLite worker + authenticated MCP dispatch + existing scheduler readiness.
  */
 import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { CredentialRegistry } from '../bridge/credentials';
+import { dispatch } from './coordinator-tools';
+import { TaskEngine } from './engine';
 import { DEFAULT_RESOURCE_LIMITS } from './limits';
+import { parseTaskTypeRegistry } from './task-types';
 import { SqliteTaskRepository } from './repository';
 import { canPromoteTurn } from './scheduler';
 import { DbClient } from './sqlite/client';
+import { writePopulatedV7Fixture, POPULATED_V7_FIXTURE_MARKER } from './sqlite/v7-fixture';
 import type { TaskStoreFile } from './types';
 import {
   deriveStartIdentities,
@@ -310,4 +315,200 @@ describe('M018 S01 one-node workflow activation', () => {
       await ctx.close();
     }
   }, 30_000);
+
+  it('M018 S01 flow: populated v7 migration to one-node workflow activation', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m018-s01-named-'));
+    const dbPath = path.join(dir, 'muster.sqlite3');
+    const fixture = writePopulatedV7Fixture(dbPath);
+    const client = new DbClient({
+      workerPath: path.join(__dirname, 'sqlite', 'worker.ts'),
+      execArgv: ['--import', 'tsx'],
+    });
+    let engine: TaskEngine | undefined;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    try {
+      await client.open(dbPath);
+      // Migration preserved the fixture marker message on the owned v7 workspace.
+      const markers = await client.all(
+        `SELECT content FROM messages WHERE workspace_id = ? AND content = ?`,
+        [fixture.workspaceId, POPULATED_V7_FIXTURE_MARKER],
+      );
+      expect(markers).toHaveLength(1);
+
+      // Public define/start runs in a fresh workspace on the same migrated DB so
+      // the proof is vertical (v7→v8 store + bridge activation) without coupling
+      // to fixture payload shapes that only exist for migration data survival.
+      const workspaceId = 'ws-m018-s01-bridge';
+      const repository = new SqliteTaskRepository(client, workspaceId);
+      await repository.execute({
+        kind: 'upsertWorkspace',
+        workspaceId,
+        identityKey: 'm018-s01-bridge',
+        displayName: 'M018 S01 bridge',
+        createdAt: '2026-07-19T00:00:00.000Z',
+        lastOpenedAt: '2026-07-19T00:00:00.000Z',
+      });
+      const credentials = new CredentialRegistry();
+      engine = await TaskEngine.loadAsync({
+        repository,
+        workspaceId,
+        credentialRegistry: credentials,
+        makeBackend: (name) => ({
+          name,
+          capabilities: {
+            supportsMCP: true,
+            supportsReasoning: false,
+            supportsDetailedToolEvents: false,
+          },
+          run: async function* () {},
+        }),
+        runTurn: async function* () {
+          await gate;
+          yield { type: 'turnCompleted' };
+        },
+        getTaskTypeRegistry: () =>
+          parseTaskTypeRegistry({
+            worker: { backend: 'grok', role: 'worker', briefKind: 'generic' },
+          }),
+      });
+
+      const started = await engine.startNewTask({
+        goal: 'coordinate workflow define/start',
+        backend: 'grok',
+        role: 'coordinator',
+      });
+      expect(started.ok).toBe(true);
+      if (!started.ok) return;
+      const { taskId, turnId } = started.value;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((await repository.getTurn(turnId))?.status === 'running') break;
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+      await expect(repository.getTurn(turnId)).resolves.toMatchObject({ status: 'running' });
+
+      const token = credentials.issue({
+        rootId: taskId,
+        callerTaskId: taskId,
+        turnId,
+        allowedActions: new Set(['define_workflow', 'start_workflow', 'get_task_status']),
+        ttlMs: 60_000,
+      });
+      const context = credentials.verify(token)!;
+
+      const topology = {
+        kind: 'one_node_v1' as const,
+        nodes: [{ nodeId: 'entry' }],
+        entryNodeId: 'entry',
+      };
+      const defineRouted = dispatch(
+        'define_workflow',
+        {
+          opId: 'bridge-def-1',
+          definitionId: 'wf-public',
+          version: 1,
+          name: 'public-one-node',
+          topology,
+        },
+        context,
+      );
+      expect(defineRouted.ok).toBe(true);
+      if (!defineRouted.ok) return;
+      const defined = await engine.handleToolCall(
+        context,
+        'define_workflow',
+        defineRouted.command,
+      );
+      expect(defined).toMatchObject({ ok: true, result: { changed: true, definitionId: 'wf-public' } });
+
+      const startRouted = dispatch(
+        'start_workflow',
+        {
+          opId: 'bridge-start-1',
+          definitionId: 'wf-public',
+          version: 1,
+          startIdempotencyKey: 'public-start-1',
+          goal: 'activate one-node via bridge',
+          backend: 'grok',
+        },
+        context,
+      );
+      expect(startRouted.ok).toBe(true);
+      if (!startRouted.ok) return;
+      const startedWf = await engine.handleToolCall(
+        context,
+        'start_workflow',
+        startRouted.command,
+      );
+      expect(startedWf.ok).toBe(true);
+      if (!startedWf.ok) return;
+      const payload = startedWf.result as {
+        runId: string;
+        entryTaskId: string;
+        activationTurnId: string;
+        entryGateStatus: string;
+        entryMessageId: string;
+      };
+      expect(payload.entryGateStatus).toBe('satisfied');
+
+      const entryTurn = await repository.getTurn(payload.activationTurnId);
+      expect(entryTurn).toMatchObject({
+        id: payload.activationTurnId,
+        taskId: payload.entryTaskId,
+        status: 'queued',
+        trigger: 'engine',
+      });
+      const entryTask = await repository.getTask(payload.entryTaskId);
+      expect(entryTask).toMatchObject({
+        id: payload.entryTaskId,
+        releaseState: 'released',
+        lifecycle: 'open',
+        backend: 'grok',
+      });
+
+      const file: TaskStoreFile = {
+        schemaVersion: 2,
+        revision: 1,
+        tasks: { [entryTask!.id]: entryTask! },
+        turns: { [entryTurn!.id]: entryTurn! },
+        messages: {},
+      };
+      expect(canPromoteTurn(file, payload.activationTurnId, DEFAULT_RESOURCE_LIMITS)).toEqual({
+        ok: true,
+      });
+
+      // Same start key through public surface is a no-op (no second turn).
+      const replayRouted = dispatch(
+        'start_workflow',
+        {
+          opId: 'bridge-start-replay',
+          definitionId: 'wf-public',
+          version: 1,
+          startIdempotencyKey: 'public-start-1',
+          goal: 'activate one-node via bridge',
+          backend: 'grok',
+        },
+        context,
+      );
+      expect(replayRouted.ok).toBe(true);
+      if (!replayRouted.ok) return;
+      const replayed = await engine.handleToolCall(
+        context,
+        'start_workflow',
+        replayRouted.command,
+      );
+      expect(replayed).toMatchObject({
+        ok: true,
+        result: { changed: false, replay: true, activationTurnId: payload.activationTurnId },
+      });
+      expect(await repository.listTurns(payload.entryTaskId)).toHaveLength(1);
+    } finally {
+      release();
+      await engine?.whenIdle?.().catch(() => undefined);
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 45_000);
 });

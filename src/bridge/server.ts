@@ -91,6 +91,8 @@ const ALL_TOOLS: ToolAction[] = [
   'ask_parent',
   'answer_child_question',
   'upsert_presentation',
+  'define_workflow',
+  'start_workflow',
 ];
 
 const OP_ID = { type: 'string', minLength: 1 };
@@ -469,6 +471,54 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
     },
     additionalProperties: false,
   },
+  define_workflow: {
+    type: 'object',
+    required: ['opId', 'definitionId', 'version', 'name', 'topology'],
+    properties: {
+      opId: OP_ID,
+      definitionId: OP_ID,
+      version: { type: 'integer', minimum: 1 },
+      name: { type: 'string', minLength: 1, maxLength: 200 },
+      topology: {
+        type: 'object',
+        required: ['kind', 'entryNodeId', 'nodes'],
+        properties: {
+          kind: { type: 'string', enum: ['one_node_v1'] },
+          entryNodeId: OP_ID,
+          nodes: {
+            type: 'array',
+            minItems: 1,
+            maxItems: 1,
+            items: {
+              type: 'object',
+              required: ['nodeId'],
+              properties: {
+                nodeId: OP_ID,
+                label: { type: 'string', minLength: 1, maxLength: 200 },
+                role: { type: 'string', enum: ['coordinator', 'worker'] },
+              },
+              additionalProperties: false,
+            },
+          },
+        },
+        additionalProperties: false,
+      },
+    },
+    additionalProperties: false,
+  },
+  start_workflow: {
+    type: 'object',
+    required: ['opId', 'definitionId', 'version', 'startIdempotencyKey'],
+    properties: {
+      opId: OP_ID,
+      definitionId: OP_ID,
+      version: { type: 'integer', minimum: 1 },
+      startIdempotencyKey: OP_ID,
+      goal: { type: 'string', minLength: 1, maxLength: 512 },
+      backend: { type: 'string', minLength: 1, maxLength: 64 },
+    },
+    additionalProperties: false,
+  },
 };
 
 function parseBearer(header: string | undefined): string | undefined {
@@ -565,6 +615,10 @@ function createMcpServer(options: CreateMcpServerOptions): McpServer {
                           ? "Parent-seal a direct child's lifecycle (succeeded/failed/…). Use when child did not complete_task."
                           : name === 'upsert_presentation'
                             ? 'Open or refresh a read-only IDE tab with Markdown (```mermaid``` fences supported). REQUIRED when the user asks to plan/spec for review or when a plan is ready: pass the full plan as markdown — do not only paste it in chat. Args: presentationId (stable, e.g. plan-<taskId>), ownerTaskId (must equal self.taskId), opId (unique per call), revision (1 then ++), title, markdown, optional kind (plan|spec|document), optional summary. Never send sourcePath, sourceFolderUri, updatedAt, or rootId (host-owned).'
+                            : name === 'define_workflow'
+                              ? 'Persist an immutable one-node workflow definition version. Same definitionId+version+fingerprint replays; differing fingerprint fails closed. Topology is frozen one_node_v1 only for S01.'
+                              : name === 'start_workflow'
+                                ? 'Idempotently start a frozen top-level workflow run. Claims startIdempotencyKey and creates exactly one ordinary queued entry turn when the entry gate is satisfied. Agents never supply run/task/turn/gate IDs.'
                           : `Muster coordinator tool: ${name}`,
       inputSchema: TOOL_INPUT_SCHEMAS[name],
     }));

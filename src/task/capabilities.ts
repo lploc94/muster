@@ -15,7 +15,9 @@ export type CoordinatorAction =
   | 'wait_for_tasks'
   | 'get_task_status'
   | 'upsert_presentation'
-  | 'answer_child_question';
+  | 'answer_child_question'
+  | 'define_workflow'
+  | 'start_workflow';
 
 export type AnyTaskAction =
   | 'complete_task'
@@ -39,6 +41,9 @@ const CAPABILITY_TO_ACTIONS: Record<TaskCapability, CoordinatorAction[]> = {
     'list_task_types',
     // Follow-up instruction on a direct child (reopen/queue new turn).
     'continue_child',
+    // M018 S01: immutable one-node workflow define + compound start.
+    'define_workflow',
+    'start_workflow',
   ],
   // start_task is host/recovery only — not granted via coordinator MCP credentials.
   start_child: [],

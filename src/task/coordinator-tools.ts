@@ -166,6 +166,23 @@ export type ToolCommand =
       presentationKind?: 'plan' | 'spec' | 'document';
       summary?: string;
       changeSummary?: string;
+    }
+  | {
+      kind: 'define_workflow';
+      opId: string;
+      definitionId: string;
+      version: number;
+      name: string;
+      topology: unknown;
+    }
+  | {
+      kind: 'start_workflow';
+      opId: string;
+      definitionId: string;
+      version: number;
+      startIdempotencyKey: string;
+      goal?: string;
+      backend?: string;
     };
 
 const MUTATING_TOOLS: ReadonlySet<string> = new Set([
@@ -186,6 +203,8 @@ const MUTATING_TOOLS: ReadonlySet<string> = new Set([
   'ask_parent',
   'answer_child_question',
   'upsert_presentation',
+  'define_workflow',
+  'start_workflow',
 ]);
 
 function toolActionForName(name: string): ToolAction | undefined {
@@ -210,8 +229,27 @@ function toolActionForName(name: string): ToolAction | undefined {
       'ask_parent',
     'answer_child_question',
     'upsert_presentation',
+    'define_workflow',
+    'start_workflow',
   ];
   return actions.find((a) => a === name);
+}
+
+/** Light MCP topology shape check; domain validateDefineWorkflow is authoritative. */
+function parseOneNodeTopology(value: unknown): unknown | undefined {
+  if (!isRecord(value)) return undefined;
+  if (value.kind !== 'one_node_v1') return undefined;
+  if (typeof value.entryNodeId !== 'string' || value.entryNodeId.length === 0) return undefined;
+  if (!Array.isArray(value.nodes) || value.nodes.length !== 1) return undefined;
+  const node = value.nodes[0];
+  if (!isRecord(node) || typeof node.nodeId !== 'string' || node.nodeId.length === 0) {
+    return undefined;
+  }
+  if (node.label !== undefined && typeof node.label !== 'string') return undefined;
+  if (node.role !== undefined && node.role !== 'coordinator' && node.role !== 'worker') {
+    return undefined;
+  }
+  return value;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -975,6 +1013,70 @@ export function dispatch(
             ...(presentationKind !== undefined ? { presentationKind } : {}),
             ...(summary !== undefined ? { summary } : {}),
             ...(changeSummary !== undefined ? { changeSummary } : {}),
+          },
+        };
+      }
+      case 'define_workflow': {
+        const definitionId = requireString(args, 'definitionId');
+        const name = requireString(args, 'name');
+        if (!definitionId || !name) {
+          return { ok: false, toolError: 'invalid define_workflow arguments' };
+        }
+        if (
+          typeof args.version !== 'number' ||
+          !Number.isInteger(args.version) ||
+          args.version < 1
+        ) {
+          return { ok: false, toolError: 'invalid define_workflow arguments' };
+        }
+        const topology = parseOneNodeTopology(args.topology);
+        if (!topology) {
+          return { ok: false, toolError: 'invalid define_workflow arguments' };
+        }
+        return {
+          ok: true,
+          command: {
+            kind: 'define_workflow',
+            opId,
+            definitionId,
+            version: args.version,
+            name,
+            topology,
+          },
+        };
+      }
+      case 'start_workflow': {
+        const definitionId = requireString(args, 'definitionId');
+        const startIdempotencyKey = requireString(args, 'startIdempotencyKey');
+        if (!definitionId || !startIdempotencyKey) {
+          return { ok: false, toolError: 'invalid start_workflow arguments' };
+        }
+        if (
+          typeof args.version !== 'number' ||
+          !Number.isInteger(args.version) ||
+          args.version < 1
+        ) {
+          return { ok: false, toolError: 'invalid start_workflow arguments' };
+        }
+        if ('goal' in args && (typeof args.goal !== 'string' || args.goal.length === 0)) {
+          return { ok: false, toolError: 'invalid start_workflow arguments' };
+        }
+        if (
+          'backend' in args &&
+          (typeof args.backend !== 'string' || args.backend.length === 0)
+        ) {
+          return { ok: false, toolError: 'invalid start_workflow arguments' };
+        }
+        return {
+          ok: true,
+          command: {
+            kind: 'start_workflow',
+            opId,
+            definitionId,
+            version: args.version,
+            startIdempotencyKey,
+            ...(typeof args.goal === 'string' ? { goal: args.goal } : {}),
+            ...(typeof args.backend === 'string' ? { backend: args.backend } : {}),
           },
         };
       }

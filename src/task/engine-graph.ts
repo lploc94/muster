@@ -2352,6 +2352,79 @@ export async function executeToolCommand(
       };
     }
 
+    case 'define_workflow': {
+      const defined = await deps.repository.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: deps.workspaceId,
+        definitionId: command.definitionId,
+        version: command.version,
+        name: command.name,
+        topology: command.topology,
+        createdAt: now,
+      });
+      if (defined.conflict || !defined.operation?.result?.ok) {
+        return {
+          ok: false,
+          error:
+            defined.reason ??
+            (defined.operation?.result && !defined.operation.result.ok
+              ? defined.operation.result.error
+              : 'define_workflow failed'),
+        };
+      }
+      const data = defined.operation.result.data;
+      await deps.repository.execute({
+        kind: 'putOperation',
+        workspaceId: deps.workspaceId,
+        ledgerKey: opLedgerKey(ctx.turnId, command.opId),
+        entry: { fingerprint, result: { ok: true, data } },
+        createdAt: now,
+      });
+      return { ok: true, result: data };
+    }
+
+    case 'start_workflow': {
+      const started = await deps.repository.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: deps.workspaceId,
+        definitionId: command.definitionId,
+        version: command.version,
+        startIdempotencyKey: command.startIdempotencyKey,
+        createdAt: now,
+        ...(command.goal !== undefined ? { goal: command.goal } : {}),
+        ...(command.backend !== undefined ? { backend: command.backend } : {}),
+      });
+      if (started.conflict || !started.operation?.result?.ok) {
+        return {
+          ok: false,
+          error:
+            started.reason ??
+            (started.operation?.result && !started.operation.result.ok
+              ? started.operation.result.error
+              : 'start_workflow failed'),
+        };
+      }
+      const data = started.operation.result.data as {
+        activationTurnId?: string;
+        entryTaskId?: string;
+        [key: string]: unknown;
+      };
+      await deps.repository.execute({
+        kind: 'putOperation',
+        workspaceId: deps.workspaceId,
+        ledgerKey: opLedgerKey(ctx.turnId, command.opId),
+        entry: { fingerprint, result: { ok: true, data } },
+        createdAt: now,
+      });
+      if (typeof data.activationTurnId === 'string' && started.changed) {
+        deps.onScheduleTurn(data.activationTurnId);
+      }
+      if (typeof data.entryTaskId === 'string') {
+        deps.onRescanSchedulableTurns?.([data.entryTaskId]);
+      }
+      return { ok: true, result: data };
+    }
+
     case 'upsert_presentation':
       // Presentation execution is composed by the host router (T04). The pure task
       // graph must remain VS Code-independent and fail closed if called directly.

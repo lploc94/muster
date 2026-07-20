@@ -239,7 +239,7 @@ export class RepositoryProjection {
       await this.refreshAll();
       return;
     }
-    const ids = this.affectedTaskIds(command);
+    const ids = this.affectedTaskIds(command, result);
     await Promise.all([...ids].map((id) => this.refreshTask(id)));
     // Apply coordination rows after aggregate refresh: refreshTask removes the
     // previous turn-bound coordination projection before loading current rows.
@@ -251,8 +251,22 @@ export class RepositoryProjection {
     this.file.revision = await this.source.getWorkspaceRevision();
   }
 
-  private affectedTaskIds(command: RepositoryCommand): Set<string> {
+  private affectedTaskIds(
+    command: RepositoryCommand,
+    result?: RepositoryCommandResult,
+  ): Set<string> {
     const ids = new Set<string>();
+    // M018 S01: start creates a new top-level entry task not present on the command shape.
+    if (
+      command.kind === 'startWorkflowRun' &&
+      result?.operation?.result &&
+      result.operation.result.ok === true
+    ) {
+      const data = result.operation.result.data as { entryTaskId?: unknown };
+      if (typeof data.entryTaskId === 'string' && data.entryTaskId.length > 0) {
+        ids.add(data.entryTaskId);
+      }
+    }
     if ('taskId' in command && typeof command.taskId === 'string') ids.add(command.taskId);
     if ('task' in command && command.task && typeof command.task === 'object' && 'id' in command.task) ids.add(command.task.id);
     if ('tasks' in command && Array.isArray(command.tasks)) for (const task of command.tasks) ids.add(task.id);

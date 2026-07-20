@@ -181,6 +181,69 @@ describe('MusterBridgeServer auth', () => {
     expect(handled).toHaveLength(1);
   });
 
+  it('exposes define_workflow and start_workflow only when allowed and rejects malformed start', async () => {
+    const credentials = new CredentialRegistry();
+    const handled: Array<{ tool: string; command: unknown }> = [];
+    server = new MusterBridgeServer({
+      credentials,
+      toolHandler: {
+        handleToolCall: async (_ctx, tool, command) => {
+          handled.push({ tool, command });
+          return { ok: true, result: { ok: true, changed: true } };
+        },
+      },
+    });
+    const { port } = await server.listen();
+    const token = credentials.issue({
+      rootId: 'root-1',
+      callerTaskId: 'task-1',
+      turnId: 'turn-1',
+      attemptId: 'a0',
+      allowedActions: new Set(['define_workflow', 'start_workflow']),
+      ttlMs: 60_000,
+    });
+    const session = await openMcpSession(port, token);
+    const listed = await session.request('tools/list');
+    const names = (listed.result as { tools: Array<{ name: string }> }).tools.map((t) => t.name);
+    expect(names).toEqual(expect.arrayContaining(['define_workflow', 'start_workflow']));
+
+    const defined = await session.request('tools/call', {
+      name: 'define_workflow',
+      arguments: {
+        opId: 'op-def',
+        definitionId: 'wf-one',
+        version: 1,
+        name: 'one-node',
+        topology: { kind: 'one_node_v1', entryNodeId: 'entry', nodes: [{ nodeId: 'entry' }] },
+      },
+    });
+    expect(defined.result).not.toHaveProperty('isError', true);
+    expect(handled[0]).toMatchObject({ tool: 'define_workflow', command: { kind: 'define_workflow' } });
+
+    const badStart = await session.request('tools/call', {
+      name: 'start_workflow',
+      arguments: { opId: 'op-start', definitionId: 'wf-one', version: 1 },
+    });
+    expect(badStart.result).toMatchObject({ isError: true });
+    expect(handled).toHaveLength(1);
+
+    const workerToken = credentials.issue({
+      rootId: 'root-1',
+      callerTaskId: 'worker-1',
+      turnId: 'turn-worker',
+      attemptId: 'a0',
+      allowedActions: new Set(['complete_task']),
+      ttlMs: 60_000,
+    });
+    const worker = await openMcpSession(port, workerToken);
+    const workerListed = await worker.request('tools/list');
+    const workerNames = (workerListed.result as { tools: Array<{ name: string }> }).tools.map(
+      (t) => t.name,
+    );
+    expect(workerNames).not.toContain('define_workflow');
+    expect(workerNames).not.toContain('start_workflow');
+  });
+
   it('exposes batch tools only to create_child coordinators and rejects malformed batches', async () => {
     const credentials = new CredentialRegistry();
     const handled: Array<{ tool: string; command: unknown }> = [];
