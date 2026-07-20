@@ -13,6 +13,13 @@ import {
   deriveNodeActivationIdentities,
   deriveProducerArtifactId,
   deriveProducerArtifactRevision,
+  deriveFeedbackRoundId,
+  deriveFeedbackRequestMessageId,
+  deriveFeedbackResponseMessageId,
+  deriveFeedbackTargetTurnId,
+  deriveFeedbackTargetMessageId,
+  deriveFeedbackResumeTurnId,
+  deriveFeedbackResumeMessageId,
   deriveStartIdentities,
   entryNodeIds,
   fingerprintDefinition,
@@ -336,6 +343,50 @@ describe('workflow domain (graph_v1 multi-node topology)', () => {
     expect(deriveProducerArtifactRevision('updated')).toBe(
       deriveProducerArtifactRevision('unchanged'),
     );
+  });
+
+  it('derives durable PREV feedback/round/resume identities without leaking bodies', () => {
+    const runId = 'wfr_abc';
+    const requesterNodeId = 'consumer';
+    const requesterTurnId = 'wftn_req_1';
+    const targetNodeId = 'p1';
+
+    const roundA = deriveFeedbackRoundId(runId, requesterNodeId, requesterTurnId);
+    const roundB = deriveFeedbackRoundId(runId, requesterNodeId, requesterTurnId);
+    expect(roundA).toBe(roundB);
+    expect(roundA.startsWith('wfrd_')).toBe(true);
+    expect(roundA).not.toBe(
+      deriveFeedbackRoundId(runId, requesterNodeId, 'wftn_other'),
+    );
+
+    const reqA = deriveFeedbackRequestMessageId(runId, roundA, targetNodeId);
+    const reqB = deriveFeedbackRequestMessageId(runId, roundA, targetNodeId);
+    expect(reqA).toBe(reqB);
+    expect(reqA.startsWith('wfrm_')).toBe(true);
+    expect(reqA).not.toBe(deriveFeedbackRequestMessageId(runId, roundA, 'p2'));
+    expect(reqA).not.toBe(deriveFeedbackResponseMessageId(runId, roundA, targetNodeId));
+
+    const resp = deriveFeedbackResponseMessageId(runId, roundA, targetNodeId);
+    expect(resp.startsWith('wfrm_')).toBe(true);
+    expect(resp).not.toBe(reqA);
+
+    const turnId = deriveFeedbackTargetTurnId(runId, roundA, targetNodeId);
+    const msgId = deriveFeedbackTargetMessageId(runId, roundA, targetNodeId);
+    expect(turnId.startsWith('wftn_')).toBe(true);
+    expect(msgId.startsWith('wfm_')).toBe(true);
+    expect(turnId).not.toBe(msgId);
+
+    const resumeTurn = deriveFeedbackResumeTurnId(runId, roundA);
+    const resumeMsg = deriveFeedbackResumeMessageId(runId, roundA);
+    expect(resumeTurn.startsWith('wftn_')).toBe(true);
+    expect(resumeMsg.startsWith('wfm_')).toBe(true);
+    expect(resumeTurn).toBe(deriveFeedbackResumeTurnId(runId, roundA));
+    expect(resumeTurn).not.toBe(turnId);
+
+    // Namespaces stay distinct from NEXT contribution fences.
+    const next = deriveNextContributionMessageId(runId, 'wfg_gate', 'from_p1', 'p1');
+    expect(reqA).not.toBe(next);
+    expect(resp).not.toBe(next);
   });
 
 });

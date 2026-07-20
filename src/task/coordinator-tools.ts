@@ -153,6 +153,13 @@ export type ToolCommand =
       change: 'updated' | 'unchanged';
       result?: string;
     }
+  /** M018 S04: stage workflow PREV (targets + optional note; engine owns round identities). */
+  | {
+      kind: 'workflow_prev';
+      opId: string;
+      targets: 'all' | string[];
+      note?: string;
+    }
   | { kind: 'report_progress'; opId: string; note: string }
   | { kind: 'ask_user'; opId: string; questions: Question[] }
   | { kind: 'ask_parent'; opId: string; questions: Question[] }
@@ -207,6 +214,7 @@ const MUTATING_TOOLS: ReadonlySet<string> = new Set([
   'complete_task',
   'fail_task',
   'workflow_next',
+  'workflow_prev',
   'report_progress',
   'ask_parent',
   'answer_child_question',
@@ -234,6 +242,7 @@ function toolActionForName(name: string): ToolAction | undefined {
     'complete_task',
     'fail_task',
     'workflow_next',
+    'workflow_prev',
     'report_progress',
       'ask_parent',
     'answer_child_question',
@@ -971,6 +980,46 @@ export function dispatch(
             opId,
             change,
             ...(result !== undefined ? { result } : {}),
+          },
+        };
+      }
+      case 'workflow_prev': {
+        // targets: 'all' | non-empty string[] of inputRefs. Empty arrays rejected at parse time.
+        const rawTargets = args.targets;
+        let targets: 'all' | string[];
+        if (rawTargets === 'all') {
+          targets = 'all';
+        } else if (Array.isArray(rawTargets)) {
+          if (
+            rawTargets.length === 0 ||
+            !rawTargets.every((t) => typeof t === 'string' && t.length > 0)
+          ) {
+            return {
+              ok: false,
+              toolError: 'targets must be "all" or a non-empty string array of inputRefs',
+            };
+          }
+          targets = rawTargets as string[];
+        } else {
+          return {
+            ok: false,
+            toolError: 'targets must be "all" or a non-empty string array of inputRefs',
+          };
+        }
+        let note: string | undefined;
+        if (Object.prototype.hasOwnProperty.call(args, 'note')) {
+          if (typeof args.note !== 'string' || args.note.length === 0) {
+            return { ok: false, toolError: 'note must be a non-empty string when provided' };
+          }
+          note = args.note;
+        }
+        return {
+          ok: true,
+          command: {
+            kind: 'workflow_prev',
+            opId,
+            targets,
+            ...(note !== undefined ? { note } : {}),
           },
         };
       }

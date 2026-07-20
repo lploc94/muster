@@ -980,4 +980,72 @@ describe('workflow_next tool surface', () => {
       ),
     ).toEqual({ ok: false, toolError: 'action not permitted: workflow_next' });
   });
+
+  it('maps workflow_prev with all or non-empty targets and optional note', () => {
+    expect(
+      dispatch(
+        'workflow_prev',
+        { opId: 'op-p', targets: 'all' },
+        ctx(['workflow_prev']),
+      ),
+    ).toEqual({
+      ok: true,
+      command: { kind: 'workflow_prev', opId: 'op-p', targets: 'all' },
+    });
+    expect(
+      dispatch(
+        'workflow_prev',
+        { opId: 'op-p', targets: ['from_p1'], note: 'fix me' },
+        ctx(['workflow_prev']),
+      ),
+    ).toEqual({
+      ok: true,
+      command: {
+        kind: 'workflow_prev',
+        opId: 'op-p',
+        targets: ['from_p1'],
+        note: 'fix me',
+      },
+    });
+  });
+
+  it('rejects empty/invalid workflow_prev targets at parse time', () => {
+    expect(
+      dispatch(
+        'workflow_prev',
+        { opId: 'op-p', targets: [] },
+        ctx(['workflow_prev']),
+      ),
+    ).toEqual({
+      ok: false,
+      toolError: 'targets must be "all" or a non-empty string array of inputRefs',
+    });
+    expect(
+      dispatch(
+        'workflow_prev',
+        { opId: 'op-p', targets: [''] },
+        ctx(['workflow_prev']),
+      ),
+    ).toEqual({
+      ok: false,
+      toolError: 'targets must be "all" or a non-empty string array of inputRefs',
+    });
+    expect(
+      dispatch(
+        'workflow_prev',
+        { opId: 'op-p' },
+        ctx(['workflow_prev']),
+      ),
+    ).toEqual({
+      ok: false,
+      toolError: 'targets must be "all" or a non-empty string array of inputRefs',
+    });
+    expect(
+      dispatch(
+        'workflow_prev',
+        { opId: 'op-p', targets: 'all' },
+        ctx(['complete_task']),
+      ),
+    ).toEqual({ ok: false, toolError: 'action not permitted: workflow_prev' });
+  });
 });

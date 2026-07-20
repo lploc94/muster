@@ -26,7 +26,9 @@ export type AnyTaskAction =
   | 'ask_parent'
   | 'get_host_context'
   /** M018 S02: stage workflow NEXT disposition (does not seal lifecycle). */
-  | 'workflow_next';
+  | 'workflow_next'
+  /** M018 S04: stage workflow PREV disposition (does not seal lifecycle). */
+  | 'workflow_prev';
 
 export type ToolAction = CoordinatorAction | AnyTaskAction;
 
@@ -66,6 +68,7 @@ const ANY_TASK_ACTIONS: AnyTaskAction[] = [
   'report_progress',
   'get_host_context',
   'workflow_next',
+  'workflow_prev',
 ];
 
 export function capabilitiesFor(

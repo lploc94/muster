@@ -1177,6 +1177,81 @@ describe('stageDisposition rejections', () => {
     ).toEqual({ ok: false, reason: 'disposition already staged with a different opId' });
   });
 
+  it('stages workflow_prev idempotently and rejects conflicting replay', () => {
+    const live = turn({ status: 'running' });
+    const first = stageDisposition(
+      live,
+      { kind: 'workflow_prev', targets: 'all', note: 'please fix' },
+      'op-prev-1',
+      { limits: { maxResult: 1024, maxError: 512 } },
+    );
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    expect(first.next.turn.disposition).toEqual({
+      kind: 'workflow_prev',
+      targets: 'all',
+      note: 'please fix',
+    });
+    const replay = stageDisposition(
+      first.next.turn,
+      { kind: 'workflow_prev', targets: 'all', note: 'please fix' },
+      'op-prev-1',
+      {
+        acceptedOpId: 'op-prev-1',
+        limits: { maxResult: 1024, maxError: 512 },
+      },
+    );
+    expect(replay.ok).toBe(true);
+    const conflict = stageDisposition(
+      first.next.turn,
+      { kind: 'workflow_prev', targets: ['from_p1'] },
+      'op-prev-1',
+      {
+        acceptedOpId: 'op-prev-1',
+        limits: { maxResult: 1024, maxError: 512 },
+      },
+    );
+    expect(conflict.ok).toBe(false);
+  });
+
+  it('applySuccessfulTurn keeps workflow_prev without sealing lifecycle', () => {
+    const task = baseTask();
+    const live = turn({
+      status: 'running',
+      disposition: { kind: 'workflow_prev', targets: 'all' },
+    });
+    const settled = applySuccessfulTurn(task, live, { now: NOW });
+    expect(settled.ok).toBe(true);
+    if (!settled.ok) return;
+    expect(settled.next.task.lifecycle).toBe('open');
+    expect(settled.next.turn.status).toBe('succeeded');
+    expect(settled.next.turn.disposition?.kind).toBe('workflow_prev');
+  });
+
+  it('applyFailedTurn and interruptTurn discard staged workflow_prev', () => {
+    const task = baseTask();
+    const live = turn({
+      status: 'running',
+      disposition: { kind: 'workflow_prev', targets: ['from_p1'], note: 'n' },
+    });
+    const failed = applyFailedTurn(task, live, {
+      error: 'boom',
+      retryCount: 0,
+      policy: { maxTurns: 4, maxAutomaticRetries: 0 },
+      onExhausted: 'recover',
+      now: NOW,
+    });
+    expect(failed.ok).toBe(true);
+    if (failed.ok) {
+      expect(failed.next.turn.disposition).toBeUndefined();
+    }
+    const interrupted = interruptTurn(live, { now: NOW });
+    expect(interrupted.ok).toBe(true);
+    if (interrupted.ok) {
+      expect(interrupted.next.disposition).toBeUndefined();
+    }
+  });
+
   it('applyFailedTurn and interruptTurn discard staged workflow_next', () => {
     const live = turn({
       id: 't1',

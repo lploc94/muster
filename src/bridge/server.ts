@@ -88,6 +88,7 @@ const ALL_TOOLS: ToolAction[] = [
   'complete_task',
   'fail_task',
   'workflow_next',
+  'workflow_prev',
   'report_progress',
   'ask_parent',
   'answer_child_question',
@@ -438,6 +439,25 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
     },
     additionalProperties: false,
   },
+  workflow_prev: {
+    type: 'object',
+    required: ['opId', 'targets'],
+    properties: {
+      opId: OP_ID,
+      targets: {
+        oneOf: [
+          { type: 'string', enum: ['all'] },
+          {
+            type: 'array',
+            minItems: 1,
+            items: { type: 'string', minLength: 1, maxLength: 128 },
+          },
+        ],
+      },
+      note: { type: 'string', minLength: 1, maxLength: 512 },
+    },
+    additionalProperties: false,
+  },
   report_progress: {
     type: 'object',
     required: ['opId', 'note'],
@@ -670,6 +690,8 @@ function createMcpServer(options: CreateMcpServerOptions): McpServer {
                             ? 'Open or refresh a read-only IDE tab with Markdown (```mermaid``` fences supported). REQUIRED when the user asks to plan/spec for review or when a plan is ready: pass the full plan as markdown — do not only paste it in chat. Args: presentationId (stable, e.g. plan-<taskId>), ownerTaskId (must equal self.taskId), opId (unique per call), revision (1 then ++), title, markdown, optional kind (plan|spec|document), optional summary. Never send sourcePath, sourceFolderUri, updatedAt, or rootId (host-owned).'
                             : name === 'workflow_next'
                               ? 'Stage a workflow NEXT disposition on the live turn: routes this node result forward without sealing lifecycle. Provide change=updated|unchanged and optional result body. Engine owns gate/artifact identities. Committed only when the adapter settles the turn successfully.'
+                            : name === 'workflow_prev'
+                              ? 'Stage a workflow PREV disposition on the live turn: request correction from one or all direct producers without sealing lifecycle. Provide targets="all" or a non-empty inputRef array and optional note. Engine owns round/target/resume identities. Committed only when the adapter settles the turn successfully.'
                             : name === 'define_workflow'
                               ? 'Persist an immutable workflow definition version (one_node_v1 or graph_v1 fan-in). Same definitionId+version+fingerprint replays; differing fingerprint fails closed. Domain validation is fail-closed for topology shape.'
                               : name === 'start_workflow'

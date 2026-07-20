@@ -370,6 +370,82 @@ export function deriveProducerArtifactRevision(
   return 1;
 }
 
+/**
+ * M018 S04 PREV identities (D044 / D048 / D051).
+ * Deterministic, run-scoped only — never prompt/result bodies, SQL, paths, or credentials.
+ * body_json fences carry these identities only.
+ */
+
+/** One open feedback round per requester PREV settlement. */
+export function deriveFeedbackRoundId(
+  runId: string,
+  requesterNodeId: string,
+  requesterTurnId: string,
+): string {
+  return stableId(
+    'wfrd',
+    `${runId}\0feedback_round\0${requesterNodeId}\0${requesterTurnId}`,
+  );
+}
+
+/** Durable feedback_request fence id for one target in a round. */
+export function deriveFeedbackRequestMessageId(
+  runId: string,
+  roundId: string,
+  targetNodeId: string,
+): string {
+  return stableId(
+    'wfrm',
+    `${runId}\0feedback_request\0${roundId}\0${targetNodeId}`,
+  );
+}
+
+/** Durable feedback_response fence id for one target response. */
+export function deriveFeedbackResponseMessageId(
+  runId: string,
+  roundId: string,
+  targetNodeId: string,
+): string {
+  return stableId(
+    'wfrm',
+    `${runId}\0feedback_response\0${roundId}\0${targetNodeId}`,
+  );
+}
+
+/** Queued feedback turn id on a target task FIFO (R012 append, never preemptive). */
+export function deriveFeedbackTargetTurnId(
+  runId: string,
+  roundId: string,
+  targetNodeId: string,
+): string {
+  return stableId(
+    'wftn',
+    `${runId}\0feedback_turn\0${roundId}\0${targetNodeId}`,
+  );
+}
+
+/** System message id bound to the target feedback turn. */
+export function deriveFeedbackTargetMessageId(
+  runId: string,
+  roundId: string,
+  targetNodeId: string,
+): string {
+  return stableId(
+    'wfm',
+    `${runId}\0feedback_message\0${roundId}\0${targetNodeId}`,
+  );
+}
+
+/** Reserved resume turn id for the ALL-join aggregate when the round becomes satisfied. */
+export function deriveFeedbackResumeTurnId(runId: string, roundId: string): string {
+  return stableId('wftn', `${runId}\0feedback_resume\0${roundId}`);
+}
+
+/** Aggregate resume message id on the requester task. */
+export function deriveFeedbackResumeMessageId(runId: string, roundId: string): string {
+  return stableId('wfm', `${runId}\0feedback_resume_message\0${roundId}`);
+}
+
 /** Single outbound edge for a producer node (graph_v1 forbids fan-out). */
 export function outgoingEdge(
   topology: WorkflowTopologyV1,

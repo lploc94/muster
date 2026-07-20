@@ -3748,6 +3748,10 @@ export class SqliteTaskRepository implements TaskRepository {
    * persist only; the final fill atomically closes the gate and queues one
    * deterministic aggregate activation turn. Never seals producer lifecycle.
    */
+  // M018 S04 T01: PREV identity helpers live in ./workflow
+  // (deriveFeedbackRoundId / deriveFeedbackRequestMessageId / deriveFeedbackResponseMessageId /
+  //  deriveFeedbackTargetTurnId / deriveFeedbackResumeTurnId). T02 wires planWorkflowPrevRequest
+  // + planWorkflowFeedbackResponse on this settle path.
   private async planWorkflowNextContribution(
     command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
   ): Promise<{ statements: SqlStatement[]; changes: ChangeRecord[] }> {

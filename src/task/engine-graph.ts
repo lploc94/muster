@@ -2240,6 +2240,33 @@ export async function executeToolCommand(
       return { ok: true, result: { staged: true } };
     }
 
+    case 'workflow_prev': {
+      // M018 S04: stage workflow_prev disposition. Does not seal lifecycle; feedback
+      // round open is owned by the repository commit path (T02).
+      const staged = await executeGraphCommand(deps, 'workflowPrevGraphTask', (draft) => {
+        const turn = draft.turns[ctx.turnId];
+        if (!turn) return { ok: false, reason: 'turn not found' };
+        const result = stageDisposition(
+          turn,
+          {
+            kind: 'workflow_prev',
+            targets: command.targets,
+            ...(command.note !== undefined ? { note: command.note } : {}),
+          },
+          command.opId,
+          {
+            limits: { maxResult: limits.maxResultBytes, maxError: limits.maxErrorBytes },
+          },
+        );
+        if (!result.ok) return result;
+        draft.turns[ctx.turnId] = result.next.turn;
+        writeLedger(draft, ctx.turnId, command.opId, fingerprint, { ok: true, data: { staged: true } });
+        return { ok: true };
+      });
+      if (!staged.ok) return { ok: false, error: staged.error };
+      return { ok: true, result: { staged: true } };
+    }
+
     case 'report_progress':
       return { ok: true, result: { noted: command.note.slice(0, 512) } };
 

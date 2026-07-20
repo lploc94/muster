@@ -425,7 +425,17 @@ export type TurnDisposition =
    * complete/fail/wait/idle. Staging never seals lifecycle; gate contribution is
    * owned by the repository commit path (T04). Agent supplies only change + optional body.
    */
-  | { kind: 'workflow_next'; change: 'updated' | 'unchanged'; result?: string };
+  | { kind: 'workflow_next'; change: 'updated' | 'unchanged'; result?: string }
+  /**
+   * M018 S04: request correction from one or all direct producers (PREV).
+   * Mutually exclusive with complete/fail/wait/idle/workflow_next. Staging never
+   * seals lifecycle; feedback round open is owned by the repository commit path (T02).
+   */
+  | {
+      kind: 'workflow_prev';
+      targets: 'all' | string[];
+      note?: string;
+    };
 /**
  * Durable ACP boundary phase for a live/settled turn (Phase C).
  * Written before side-effecting `session/prompt`; used for reload classification.
