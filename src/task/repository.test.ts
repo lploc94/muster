@@ -1415,6 +1415,39 @@ describe('SqliteTaskRepository', () => {
       expect((await repository.getTask(p1.taskId))?.lifecycle).toBe('open');
       expect((await repository.getTask(p2.taskId))?.lifecycle).toBe('open');
 
+      // Durable contribution fence: one routed message per producer contribution.
+      const routed = await client.all(
+        `SELECT message_id, kind, source_node_id, destination_node_id, body_json
+           FROM workflow_routed_messages
+          WHERE workspace_id = ? AND run_id = ?
+          ORDER BY source_node_id`,
+        ['ws', data.runId],
+      );
+      expect(routed).toHaveLength(2);
+      expect(routed.every((row) => row.kind === 'next_contribution')).toBe(true);
+      expect(routed.every((row) => row.destination_node_id === 'consumer')).toBe(true);
+      // body_json carries identities only — no result text, paths, SQL, or credentials.
+      for (const row of routed) {
+        const body = String(row.body_json);
+        expect(body).not.toContain('p1-result');
+        expect(body).not.toContain('p2-result');
+        expect(body).not.toMatch(/SELECT |INSERT |DELETE /i);
+        expect(body).toContain('next_contribution');
+        expect(body).toContain('artifactRevision');
+      }
+
+      // Deterministic revision: exactly one artifact row per producer, revision 1.
+      const artifacts = await client.all(
+        `SELECT producer_node_id, revision FROM workflow_artifacts
+          WHERE workspace_id = ? AND run_id = ? AND kind = 'next_result'
+          ORDER BY producer_node_id, revision`,
+        ['ws', data.runId],
+      );
+      expect(artifacts).toEqual([
+        { producer_node_id: 'p1', revision: 1 },
+        { producer_node_id: 'p2', revision: 1 },
+      ]);
+
       // Redelivery of already-settled producer is a no-op (no second activation).
       const redelivery = await repository.execute({
         kind: 'settleTurnAndApplyEffects',
@@ -1438,6 +1471,57 @@ describe('SqliteTaskRepository', () => {
         'SELECT input_ref FROM workflow_gate_fills WHERE workspace_id = ? AND run_id = ? AND gate_id = ?',
         ['ws', data.runId, consumerGate.gateId],
       )).toHaveLength(2);
+
+      // After pruning the source turn's operations ledger, force a re-settlement:
+      // durable fence keeps contribution a no-op (no second artifact/fill/activation).
+      await client.run(
+        `DELETE FROM operations WHERE workspace_id = ? AND ledger_key GLOB ?`,
+        ['ws', `${p2.activationTurnId}:*`],
+      );
+      await client.run(
+        `UPDATE turns SET status = 'running', settled_at = NULL, started_at = ?
+          WHERE workspace_id = ? AND id = ?`,
+        ['2026-07-19T00:03:00.000Z', 'ws', p2.activationTurnId],
+      );
+      const postPrune = await repository.execute({
+        kind: 'settleTurnAndApplyEffects',
+        workspaceId: 'ws',
+        expectedTaskRevision: (await repository.getTask(p2.taskId))!.revision,
+        task: {
+          ...(await repository.getTask(p2.taskId))!,
+          updatedAt: '2026-07-19T00:03:00.000Z',
+        },
+        turn: {
+          ...(await repository.getTurn(p2.activationTurnId))!,
+          status: 'succeeded',
+          finishedAt: '2026-07-19T00:03:00.000Z',
+          disposition: { kind: 'workflow_next', change: 'updated', result: 'p2-result-again' },
+        },
+        expectedStatuses: ['running'],
+        relatedTurns: [],
+        messages: [],
+      });
+      expect(postPrune.ok).toBe(true);
+      // Turn settles again, but contribution fence suppresses workflow side effects.
+      expect(await client.all(
+        `SELECT message_id FROM workflow_routed_messages WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', data.runId],
+      )).toHaveLength(2);
+      expect(await client.all(
+        `SELECT producer_node_id, revision FROM workflow_artifacts
+          WHERE workspace_id = ? AND run_id = ? AND kind = 'next_result'`,
+        ['ws', data.runId],
+      )).toHaveLength(2);
+      expect(await client.all(
+        'SELECT input_ref FROM workflow_gate_fills WHERE workspace_id = ? AND run_id = ? AND gate_id = ?',
+        ['ws', data.runId, consumerGate.gateId],
+      )).toHaveLength(2);
+      expect(await repository.listTurns(consumerTaskId)).toHaveLength(1);
+      const gateAfterPrune = await client.get(
+        'SELECT status FROM workflow_dependency_gates WHERE workspace_id = ? AND run_id = ? AND gate_id = ?',
+        ['ws', data.runId, consumerGate.gateId],
+      );
+      expect(gateAfterPrune).toMatchObject({ status: 'satisfied' });
     } finally {
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });

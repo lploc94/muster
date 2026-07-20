@@ -29,7 +29,9 @@ import {
   validateStartWorkflow,
   entryNodeIds,
   deriveNodeActivationIdentities,
+  deriveNextContributionMessageId,
   deriveProducerArtifactId,
+  deriveProducerArtifactRevision,
   outgoingEdge,
   consumerInputRefsInDefinitionOrder,
   type DefineWorkflowResult,
@@ -3811,52 +3813,91 @@ export class SqliteTaskRepository implements TaskRepository {
     }
 
     const artifactId = deriveProducerArtifactId(producerNode.run_id, producerNode.node_id);
-    const maxRevRow = await this.db.get<{ max_rev: number | null }>(
-      `SELECT MAX(revision) AS max_rev FROM workflow_artifacts
-        WHERE workspace_id = ? AND run_id = ? AND artifact_id = ?`,
-      [this.workspaceId, producerNode.run_id, artifactId],
+    // D050 / R027: contribution-scoped revision is deterministic (not priorMax+1).
+    const revision = deriveProducerArtifactRevision(disposition.change);
+    const contributionMessageId = deriveNextContributionMessageId(
+      producerNode.run_id,
+      gate.gate_id,
+      edge.inputRef,
+      producerNode.node_id,
     );
-    const priorMax = typeof maxRevRow?.max_rev === 'number' ? maxRevRow.max_rev : 0;
-    const publishNew =
-      disposition.change === 'updated' || priorMax === 0;
-    const revision = publishNew ? priorMax + 1 : priorMax;
+    // Durable workflow-run-scoped fence: redelivery after turn-ledger prune is a no-op.
+    const existingRouted = await this.db.get<{ message_id: string }>(
+      `SELECT message_id FROM workflow_routed_messages
+        WHERE workspace_id = ? AND run_id = ? AND message_id = ?`,
+      [this.workspaceId, producerNode.run_id, contributionMessageId],
+    );
+    if (existingRouted) {
+      return empty;
+    }
     const finishedAt = command.turn.finishedAt ?? new Date().toISOString();
 
     const statements: SqlStatement[] = [];
     const changes: ChangeRecord[] = [];
 
-    if (publishNew) {
-      const resultBody =
-        typeof disposition.result === 'string'
-          ? disposition.result.slice(0, 4000)
-          : undefined;
-      const artifactPayload = encodePayload({
-        kind: 'next_result',
-        schema: 1,
-        change: disposition.change,
-        producerNodeId: producerNode.node_id,
-        sourceTurnId: command.turn.id,
-        ...(resultBody !== undefined ? { result: resultBody } : {}),
-      });
-      statements.push({
-        sql: `INSERT INTO workflow_artifacts (
-                workspace_id, run_id, artifact_id, producer_node_id, logical_name,
-                revision, kind, payload_json, created_at
-              ) VALUES (?,?,?,?,?,?,?,?,?)
-              ON CONFLICT(workspace_id, run_id, artifact_id, revision) DO NOTHING`,
-        params: [
-          this.workspaceId,
-          producerNode.run_id,
-          artifactId,
-          producerNode.node_id,
-          'next_result',
-          revision,
-          'next_result',
-          artifactPayload,
-          finishedAt,
-        ],
-      });
-    }
+    // Fence row first in the statement list so a partial apply cannot leave fills
+    // without the durable contribution identity (same transaction either way).
+    const routedBody = encodePayload({
+      kind: 'next_contribution',
+      schema: 1,
+      gateId: gate.gate_id,
+      inputRef: edge.inputRef,
+      producerNodeId: producerNode.node_id,
+      consumerNodeId: edge.toNodeId,
+      artifactId,
+      artifactRevision: revision,
+      change: disposition.change,
+      // Identities only — never prompt/result bodies, paths, SQL, or credentials.
+      sourceTurnId: command.turn.id,
+    });
+    statements.push({
+      sql: `INSERT INTO workflow_routed_messages (
+              workspace_id, run_id, message_id, source_node_id, destination_node_id,
+              kind, body_json, created_at
+            ) VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT(workspace_id, run_id, message_id) DO NOTHING`,
+      params: [
+        this.workspaceId,
+        producerNode.run_id,
+        contributionMessageId,
+        producerNode.node_id,
+        edge.toNodeId,
+        'next_contribution',
+        routedBody,
+        finishedAt,
+      ],
+    });
+
+    const resultBody =
+      typeof disposition.result === 'string'
+        ? disposition.result.slice(0, 4000)
+        : undefined;
+    const artifactPayload = encodePayload({
+      kind: 'next_result',
+      schema: 1,
+      change: disposition.change,
+      producerNodeId: producerNode.node_id,
+      sourceTurnId: command.turn.id,
+      ...(resultBody !== undefined ? { result: resultBody } : {}),
+    });
+    statements.push({
+      sql: `INSERT INTO workflow_artifacts (
+              workspace_id, run_id, artifact_id, producer_node_id, logical_name,
+              revision, kind, payload_json, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(workspace_id, run_id, artifact_id, revision) DO NOTHING`,
+      params: [
+        this.workspaceId,
+        producerNode.run_id,
+        artifactId,
+        producerNode.node_id,
+        'next_result',
+        revision,
+        'next_result',
+        artifactPayload,
+        finishedAt,
+      ],
+    });
 
     statements.push({
       sql: `INSERT INTO workflow_gate_fills (

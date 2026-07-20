@@ -342,6 +342,34 @@ export function deriveProducerArtifactId(runId: string, producerNodeId: string):
   return stableId('wfa', `${runId}\0artifact\0${producerNodeId}`);
 }
 
+/**
+ * Durable workflow-run-scoped contribution fence id for a forward NEXT.
+ * Keyed by frozen (runId, gateId, inputRef, producerNodeId) so redelivery after
+ * source-turn operations-ledger prune is a true no-op (D050 / R027).
+ */
+export function deriveNextContributionMessageId(
+  runId: string,
+  gateId: string,
+  inputRef: string,
+  producerNodeId: string,
+): string {
+  return stableId(
+    'wfrm',
+    `${runId}\0contribution\0${gateId}\0${inputRef}\0${producerNodeId}`,
+  );
+}
+
+/**
+ * Deterministic producer artifact revision for a contribution.
+ * Fixed per contribution (not priorMax+1) so redelivery reuses the same row.
+ * change is accepted for future multi-revision policy but does not affect S03.
+ */
+export function deriveProducerArtifactRevision(
+  _change: 'updated' | 'unchanged',
+): number {
+  return 1;
+}
+
 /** Single outbound edge for a producer node (graph_v1 forbids fan-out). */
 export function outgoingEdge(
   topology: WorkflowTopologyV1,

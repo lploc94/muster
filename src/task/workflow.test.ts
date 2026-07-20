@@ -9,6 +9,10 @@ import {
   defineWorkflowInvalid,
   defineWorkflowLedgerKey,
   defineWorkflowReplay,
+  deriveNextContributionMessageId,
+  deriveNodeActivationIdentities,
+  deriveProducerArtifactId,
+  deriveProducerArtifactRevision,
   deriveStartIdentities,
   entryNodeIds,
   fingerprintDefinition,
@@ -306,6 +310,32 @@ describe('workflow domain (graph_v1 multi-node topology)', () => {
     expect(one.entries).toHaveLength(1);
     expect(one.nodeGates).toHaveLength(1);
     expect(one.entryTaskId).toBe(one.entries[0]!.taskId);
+  });
+
+  it('derives durable NEXT contribution message ids and deterministic artifact revisions', () => {
+    const runId = 'wfr_abc';
+    const gateId = 'wfg_gate';
+    const a = deriveNextContributionMessageId(runId, gateId, 'from_p1', 'p1');
+    const b = deriveNextContributionMessageId(runId, gateId, 'from_p1', 'p1');
+    const otherRef = deriveNextContributionMessageId(runId, gateId, 'from_p2', 'p1');
+    const otherProducer = deriveNextContributionMessageId(runId, gateId, 'from_p1', 'p2');
+    expect(a).toBe(b);
+    expect(a.startsWith('wfrm_')).toBe(true);
+    expect(a).not.toBe(otherRef);
+    expect(a).not.toBe(otherProducer);
+
+    // Distinct from activation / artifact identity namespaces.
+    const activation = deriveNodeActivationIdentities(runId, 'p1');
+    const artifactId = deriveProducerArtifactId(runId, 'p1');
+    expect(a).not.toBe(activation.messageId);
+    expect(a).not.toBe(artifactId);
+
+    // Contribution-scoped revision is fixed (not priorMax+1), so redelivery reuses it.
+    expect(deriveProducerArtifactRevision('updated')).toBe(1);
+    expect(deriveProducerArtifactRevision('unchanged')).toBe(1);
+    expect(deriveProducerArtifactRevision('updated')).toBe(
+      deriveProducerArtifactRevision('unchanged'),
+    );
   });
 
 });
