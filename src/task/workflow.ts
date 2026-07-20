@@ -223,26 +223,97 @@ function stableId(prefix: string, material: string): string {
 /**
  * Derive immutable run/task/turn/gate/message/artifact ids from the start key.
  * Same key + definition always yields the same activation identities.
+ * One-node keeps the S01 material that includes the single entryNodeId.
+ * Multi-node derives a shared runId and per-node gate / per-entry activation ids.
  */
 export function deriveStartIdentities(input: {
   definitionId: string;
   version: number;
   startIdempotencyKey: string;
   entryNodeId: string;
+  entryNodeIds?: readonly string[];
+  allNodeIds?: readonly string[];
 }): StartWorkflowIdentities {
-  const base = [
+  const entriesSorted = [...(input.entryNodeIds ?? [input.entryNodeId])].sort();
+  const allNodesSorted = [...(input.allNodeIds ?? [input.entryNodeId])].sort();
+  if (entriesSorted.length === 0 || allNodesSorted.length === 0) {
+    throw new Error('start identities require at least one node');
+  }
+  if (!entriesSorted.includes(input.entryNodeId)) {
+    throw new Error('primary entryNodeId must be among entryNodeIds');
+  }
+
+  // S01 one-node: preserve exact prior derivation material (includes entryNodeId).
+  const isOneNode =
+    entriesSorted.length === 1 &&
+    allNodesSorted.length === 1 &&
+    entriesSorted[0] === input.entryNodeId;
+
+  if (isOneNode) {
+    const base = [
+      input.definitionId,
+      String(input.version),
+      input.startIdempotencyKey,
+      input.entryNodeId,
+    ].join('\0');
+    const entryTaskId = stableId('wft', `${base}\0task`);
+    const activationTurnId = stableId('wftn', `${base}\0turn`);
+    const entryMessageId = stableId('wfm', `${base}\0message`);
+    const entryGateId = stableId('wfg', `${base}\0gate`);
+    return {
+      runId: stableId('wfr', base),
+      entryTaskId,
+      activationTurnId,
+      entryMessageId,
+      entryGateId,
+      startArtifactId: stableId('wfa', `${base}\0artifact`),
+      nodeGates: [{ nodeId: input.entryNodeId, gateId: entryGateId }],
+      entries: [
+        {
+          nodeId: input.entryNodeId,
+          taskId: entryTaskId,
+          gateId: entryGateId,
+          activationTurnId,
+          messageId: entryMessageId,
+        },
+      ],
+    };
+  }
+
+  // Multi-node: run id shared across nodes; gates/tasks keyed by node id.
+  const runBase = [
     input.definitionId,
     String(input.version),
     input.startIdempotencyKey,
-    input.entryNodeId,
   ].join('\0');
+  const runId = stableId('wfr', runBase);
+  const startArtifactId = stableId('wfa', `${runBase}\0artifact`);
+  const nodeGates = allNodesSorted.map((nodeId) => ({
+    nodeId,
+    gateId: stableId('wfg', `${runBase}\0gate\0${nodeId}`),
+  }));
+  const gateByNode = new Map(nodeGates.map((g) => [g.nodeId, g.gateId]));
+  const entries = entriesSorted.map((nodeId) => {
+    const gateId = gateByNode.get(nodeId)!;
+    return {
+      nodeId,
+      taskId: stableId('wft', `${runBase}\0task\0${nodeId}`),
+      gateId,
+      activationTurnId: stableId('wftn', `${runBase}\0turn\0${nodeId}`),
+      messageId: stableId('wfm', `${runBase}\0message\0${nodeId}`),
+    };
+  });
+  const primary =
+    entries.find((e) => e.nodeId === input.entryNodeId) ?? entries[0]!;
   return {
-    runId: stableId('wfr', base),
-    entryTaskId: stableId('wft', `${base}\0task`),
-    activationTurnId: stableId('wftn', `${base}\0turn`),
-    entryMessageId: stableId('wfm', `${base}\0message`),
-    entryGateId: stableId('wfg', `${base}\0gate`),
-    startArtifactId: stableId('wfa', `${base}\0artifact`),
+    runId,
+    entryTaskId: primary.taskId,
+    activationTurnId: primary.activationTurnId,
+    entryMessageId: primary.messageId,
+    entryGateId: primary.gateId,
+    startArtifactId,
+    nodeGates,
+    entries,
   };
 }
 
@@ -309,12 +380,35 @@ export function validateStartWorkflow(
   }
   const goal = input.goal ?? input.definitionId;
   const backend = input.backend ?? 'grok';
-  const identities = deriveStartIdentities({
-    definitionId: input.definitionId,
-    version: input.version,
-    startIdempotencyKey: input.startIdempotencyKey,
-    entryNodeId: input.entryNodeId,
-  });
+  const entryNodeIds = input.entryNodeIds ?? [input.entryNodeId];
+  const allNodeIds = input.allNodeIds ?? [input.entryNodeId];
+  if (!entryNodeIds.includes(input.entryNodeId)) {
+    return { ok: false, reason: 'invalid entryNodeId' };
+  }
+  if (entryNodeIds.some((id) => !isNonEmptyBounded(id, 128))) {
+    return { ok: false, reason: 'invalid entryNodeIds' };
+  }
+  if (allNodeIds.some((id) => !isNonEmptyBounded(id, 128))) {
+    return { ok: false, reason: 'invalid allNodeIds' };
+  }
+  for (const id of entryNodeIds) {
+    if (!allNodeIds.includes(id)) {
+      return { ok: false, reason: 'entry node missing from allNodeIds' };
+    }
+  }
+  let identities: StartWorkflowIdentities;
+  try {
+    identities = deriveStartIdentities({
+      definitionId: input.definitionId,
+      version: input.version,
+      startIdempotencyKey: input.startIdempotencyKey,
+      entryNodeId: input.entryNodeId,
+      entryNodeIds,
+      allNodeIds,
+    });
+  } catch {
+    return { ok: false, reason: 'invalid start identities' };
+  }
   const fingerprint = fingerprintStartWorkflow({
     definitionId: input.definitionId,
     version: input.version,
@@ -356,6 +450,8 @@ export function startWorkflowCreated(
     entryMessageId: identities.entryMessageId,
     startArtifactId: identities.startArtifactId,
     fingerprint: validated.fingerprint,
+    nodeGates: identities.nodeGates,
+    entries: identities.entries,
   };
 }
 

@@ -105,15 +105,47 @@ export interface StartWorkflowInput {
   version: number;
   startIdempotencyKey: string;
   createdAt: string;
-  /** Entry node id from the frozen definition (validated against stored topology). */
+  /**
+   * Primary entry node id (first entry from the frozen definition).
+   * Used for S01-compatible fingerprinting; multi-entry graphs also pass entryNodeIds.
+   */
   entryNodeId: string;
+  /**
+   * All entry node ids (nodes with no incoming edges). Defaults to [entryNodeId].
+   * Order is not significant; derivation sorts for stable multi-entry identities.
+   */
+  entryNodeIds?: readonly string[];
+  /**
+   * All topology node ids (entry + non-entry). Defaults to [entryNodeId].
+   * Used to allocate one dependency gate per task/node at start.
+   */
+  allNodeIds?: readonly string[];
   /** Optional task goal; defaults to definition name at the repository boundary. */
   goal?: string;
   /** Optional backend id for the entry task; defaults at the repository boundary. */
   backend?: string;
 }
 
-/** Engine-derived durable identities for a one-node start (no SQL/paths/bodies). */
+/** Per-entry activation identities created when an entry gate is satisfied at start. */
+export interface StartEntryActivation {
+  nodeId: string;
+  taskId: string;
+  gateId: string;
+  activationTurnId: string;
+  messageId: string;
+}
+
+/** Per-node dependency gate identity (entry and non-entry). */
+export interface StartNodeGate {
+  nodeId: string;
+  gateId: string;
+}
+
+/**
+ * Engine-derived durable identities for start (no SQL/paths/bodies).
+ * Primary entry* fields mirror the first sorted entry for S01 back-compat;
+ * entries/nodeGates cover multi-node fan-in graphs.
+ */
 export interface StartWorkflowIdentities {
   runId: string;
   entryTaskId: string;
@@ -121,41 +153,40 @@ export interface StartWorkflowIdentities {
   entryMessageId: string;
   entryGateId: string;
   startArtifactId: string;
+  /** One gate per topology node (entry + consumer). */
+  nodeGates: readonly StartNodeGate[];
+  /** Entry activations only (engine_start satisfied + queued turn). */
+  entries: readonly StartEntryActivation[];
+}
+
+/** Shared success fields for start (created or replay). */
+export interface StartWorkflowSuccessFields {
+  definitionId: string;
+  version: number;
+  entryNodeId: string;
+  runId: string;
+  entryTaskId: string;
+  entryGateId: string;
+  entryGateStatus: 'satisfied';
+  activationTurnId: string;
+  entryMessageId: string;
+  startArtifactId: string;
+  fingerprint: string;
+  nodeGates: readonly StartNodeGate[];
+  entries: readonly StartEntryActivation[];
 }
 
 /** Bounded result of startWorkflowRun. */
 export type StartWorkflowResult =
-  | {
+  | ({
       ok: true;
       changed: true;
-      definitionId: string;
-      version: number;
-      entryNodeId: string;
-      runId: string;
-      entryTaskId: string;
-      entryGateId: string;
-      entryGateStatus: 'satisfied';
-      activationTurnId: string;
-      entryMessageId: string;
-      startArtifactId: string;
-      fingerprint: string;
-    }
-  | {
+    } & StartWorkflowSuccessFields)
+  | ({
       ok: true;
       changed: false;
       replay: true;
-      definitionId: string;
-      version: number;
-      entryNodeId: string;
-      runId: string;
-      entryTaskId: string;
-      entryGateId: string;
-      entryGateStatus: 'satisfied';
-      activationTurnId: string;
-      entryMessageId: string;
-      startArtifactId: string;
-      fingerprint: string;
-    }
+    } & StartWorkflowSuccessFields)
   | {
       ok: false;
       conflict: true;

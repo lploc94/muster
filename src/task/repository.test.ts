@@ -1157,6 +1157,122 @@ describe('SqliteTaskRepository', () => {
     }
   }, 20_000);
 
+  it('multi-node fan-in start: per-task gates, entry activation only, consumer stays open', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-start-fan-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const repository = new SqliteTaskRepository(client, 'ws');
+      const topology = {
+        kind: 'graph_v1' as const,
+        nodes: [{ nodeId: 'p1' }, { nodeId: 'p2' }, { nodeId: 'consumer' }],
+        edges: [
+          { fromNodeId: 'p1', toNodeId: 'consumer', inputRef: 'from_p1' },
+          { fromNodeId: 'p2', toNodeId: 'consumer', inputRef: 'from_p2' },
+        ],
+      };
+      const createdAt = '2026-07-19T00:00:00.000Z';
+      await repository.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-fan',
+        version: 1,
+        name: 'fan-in',
+        topology,
+        createdAt,
+      });
+      const start = await repository.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: 'ws',
+        definitionId: 'wf-fan',
+        version: 1,
+        startIdempotencyKey: 'repo-start-fan-1',
+        createdAt,
+        goal: 'fan goal',
+        backend: 'grok',
+      });
+      expect(start.ok).toBe(true);
+      expect(start.changed).toBe(true);
+      const data = start.operation?.result?.data as {
+        runId: string;
+        entries: Array<{ nodeId: string; taskId: string; gateId: string; activationTurnId: string }>;
+        nodeGates: Array<{ nodeId: string; gateId: string }>;
+      };
+      expect(data.entries).toHaveLength(2);
+      expect(data.nodeGates).toHaveLength(3);
+      expect(data.entries.map((e) => e.nodeId).sort()).toEqual(['p1', 'p2']);
+
+      for (const entry of data.entries) {
+        const turns = await repository.listQueuedTurns(entry.taskId);
+        expect(turns).toHaveLength(1);
+        expect(turns[0]?.id).toBe(entry.activationTurnId);
+      }
+      const tasks = await client.all(
+        'SELECT id FROM tasks WHERE workspace_id = ? ORDER BY id',
+        ['ws'],
+      );
+      expect(tasks).toHaveLength(2);
+
+      const nodes = await client.all(
+        'SELECT node_id, task_id, status FROM workflow_nodes WHERE workspace_id = ? AND run_id = ? ORDER BY node_id',
+        ['ws', data.runId],
+      );
+      expect(nodes).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ node_id: 'p1', status: 'active' }),
+          expect.objectContaining({ node_id: 'p2', status: 'active' }),
+          expect.objectContaining({ node_id: 'consumer', task_id: null, status: 'pending' }),
+        ]),
+      );
+
+      const gates = await client.all(
+        'SELECT consumer_node_id, status FROM workflow_dependency_gates WHERE workspace_id = ? AND run_id = ? ORDER BY consumer_node_id',
+        ['ws', data.runId],
+      );
+      expect(gates).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ consumer_node_id: 'p1', status: 'satisfied' }),
+          expect.objectContaining({ consumer_node_id: 'p2', status: 'satisfied' }),
+          expect.objectContaining({ consumer_node_id: 'consumer', status: 'open' }),
+        ]),
+      );
+
+      const consumerGate = data.nodeGates.find((g) => g.nodeId === 'consumer')!;
+      const bindings = await client.all(
+        'SELECT input_ref, producer_node_id, required_kind FROM workflow_gate_bindings WHERE workspace_id = ? AND run_id = ? AND gate_id = ? ORDER BY input_ref',
+        ['ws', data.runId, consumerGate.gateId],
+      );
+      expect(bindings).toEqual([
+        { input_ref: 'from_p1', producer_node_id: 'p1', required_kind: 'artifact' },
+        { input_ref: 'from_p2', producer_node_id: 'p2', required_kind: 'artifact' },
+      ]);
+
+      const fills = await client.all(
+        'SELECT input_ref FROM workflow_gate_fills WHERE workspace_id = ? AND run_id = ? AND gate_id = ?',
+        ['ws', data.runId, consumerGate.gateId],
+      );
+      expect(fills).toHaveLength(0);
+
+      const replay = await repository.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: 'ws',
+        definitionId: 'wf-fan',
+        version: 1,
+        startIdempotencyKey: 'repo-start-fan-1',
+        createdAt,
+        goal: 'fan goal',
+        backend: 'grok',
+      });
+      expect(replay.ok).toBe(true);
+      expect(replay.changed).toBe(false);
+      expect(await client.all('SELECT id FROM tasks WHERE workspace_id = ?', ['ws'])).toHaveLength(2);
+      expect(await client.all('SELECT run_id FROM workflow_runs WHERE workspace_id = ?', ['ws'])).toHaveLength(1);
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it('defines an immutable one-node workflow with replay and fingerprint conflict', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-define-wf-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });

@@ -3116,7 +3116,32 @@ export class SqliteTaskRepository implements TaskRepository {
     }
 
     const topology = decodeStoredTopologyJson(defRow.topology_json);
-    if (!topology.ok || topology.topology.kind !== 'one_node_v1' || topology.topology.entryNodeId !== defRow.entry_node_id) {
+    if (!topology.ok) {
+      const shaped = startWorkflowInvalid(
+        'invalid start',
+        command.definitionId,
+        command.version,
+      );
+      return {
+        ok: false,
+        changed: false,
+        conflict: true,
+        reason: shaped.reason,
+        operation: {
+          fingerprint: '',
+          result: { ok: false, error: shaped.reason },
+        },
+      } as RepositoryCommandResult;
+    }
+    const topo = topology.topology;
+    const startEntryNodeIds = entryNodeIds(topo);
+    const allNodeIds = topo.nodes.map((n) => n.nodeId);
+    // defineWorkflowVersion stores entryNodeIds(topology)[0] as entry_node_id.
+    if (
+      startEntryNodeIds.length === 0 ||
+      !startEntryNodeIds.includes(defRow.entry_node_id) ||
+      (topo.kind === 'one_node_v1' && topo.entryNodeId !== defRow.entry_node_id)
+    ) {
       const shaped = startWorkflowInvalid(
         'invalid start',
         command.definitionId,
@@ -3141,6 +3166,8 @@ export class SqliteTaskRepository implements TaskRepository {
       startIdempotencyKey: command.startIdempotencyKey,
       createdAt: command.createdAt,
       entryNodeId: defRow.entry_node_id,
+      entryNodeIds: startEntryNodeIds,
+      allNodeIds,
       goal,
       backend: command.backend,
     });
@@ -3171,47 +3198,17 @@ export class SqliteTaskRepository implements TaskRepository {
     const resultPayload = startWorkflowCreated(validated);
     const ledgerKey = startWorkflowLedgerKey(validated.startIdempotencyKey);
 
-    const task: MusterTask = {
-      id: identities.entryTaskId,
-      role: topology.topology.nodes[0]?.role ?? 'worker',
-      lifecycle: 'open',
-      releaseState: 'released',
-      goal: validated.goal,
-      parentId: null,
-      dependencies: [],
-      backend: validated.backend,
-      capabilities: [],
-      executionPolicy: { maxTurns: 10, maxAutomaticRetries: 1 },
-      revision: 0,
-      createdAt: validated.createdAt,
-      updatedAt: validated.createdAt,
-      releasedAt: validated.createdAt,
-    };
-    const message: TaskMessage = {
-      id: identities.entryMessageId,
-      taskId: identities.entryTaskId,
-      role: 'system',
-      // Engine-authored activation marker only — never coordinator prompt text.
-      content: '[workflow-entry]',
-      state: 'assigned',
-      turnId: identities.activationTurnId,
-      createdAt: validated.createdAt,
-    };
-    const turn: TaskTurn = {
-      id: identities.activationTurnId,
-      taskId: identities.entryTaskId,
-      sequence: 1,
-      status: 'queued',
-      trigger: 'engine',
-      inputs: [{ kind: 'message', messageId: identities.entryMessageId }],
-      createdAt: validated.createdAt,
-    };
+    const roleByNode = new Map(topo.nodes.map((n) => [n.nodeId, n.role ?? 'worker'] as const));
+    const entryByNode = new Map(identities.entries.map((e) => [e.nodeId, e]));
+    const gateByNode = new Map(identities.nodeGates.map((g) => [g.nodeId, g.gateId]));
+    const entryNodeSet = new Set(identities.entries.map((e) => e.nodeId));
 
     // Engine start artifact: kind/revision only — no prompt/body content.
+    // Shared across all entry gates for multi-entry fan-in starts.
     const artifactPayload = encodePayload({
       kind: 'engine_start',
       schema: 1,
-      entryNodeId: validated.entryNodeId,
+      entryNodeIds: identities.entries.map((e) => e.nodeId),
     });
 
     const claimSql: SqlStatement = {
@@ -3245,47 +3242,6 @@ export class SqliteTaskRepository implements TaskRepository {
           validated.createdAt,
         ],
       },
-      taskStatement(this.workspaceId, task, false),
-      {
-        sql: `INSERT INTO workflow_nodes (
-                workspace_id, run_id, node_id, task_id, status
-              ) VALUES (?,?,?,?,?)
-              ON CONFLICT(workspace_id, run_id, node_id) DO NOTHING`,
-        params: [
-          this.workspaceId,
-          identities.runId,
-          validated.entryNodeId,
-          identities.entryTaskId,
-          'active',
-        ],
-      },
-      {
-        sql: `INSERT INTO workflow_dependency_gates (
-                workspace_id, run_id, gate_id, consumer_node_id, status
-              ) VALUES (?,?,?,?,?)
-              ON CONFLICT(workspace_id, run_id, gate_id) DO NOTHING`,
-        params: [
-          this.workspaceId,
-          identities.runId,
-          identities.entryGateId,
-          validated.entryNodeId,
-          'satisfied',
-        ],
-      },
-      {
-        sql: `INSERT INTO workflow_gate_bindings (
-                workspace_id, run_id, gate_id, input_ref, producer_node_id, required_kind
-              ) VALUES (?,?,?,?,?,?)
-              ON CONFLICT(workspace_id, run_id, gate_id, input_ref) DO NOTHING`,
-        params: [
-          this.workspaceId,
-          identities.runId,
-          identities.entryGateId,
-          'engine_start',
-          validated.entryNodeId,
-          'engine_start',
-        ],
-      },
       {
         sql: `INSERT INTO workflow_artifacts (
                 workspace_id, run_id, artifact_id, producer_node_id, logical_name,
@@ -3304,31 +3260,146 @@ export class SqliteTaskRepository implements TaskRepository {
           validated.createdAt,
         ],
       },
-      {
-        sql: `INSERT INTO workflow_gate_fills (
-                workspace_id, run_id, gate_id, input_ref, artifact_id, artifact_revision, filled_at
-              ) VALUES (?,?,?,?,?,?,?)
-              ON CONFLICT(workspace_id, run_id, gate_id, input_ref, artifact_id, artifact_revision)
-              DO NOTHING`,
+    ];
+
+    // FK order: tasks before workflow_nodes.task_id, gates before bindings/fills.
+    // Entry activations: create MusterTask rows first, then gates/nodes, then fills/turns.
+    for (const entry of identities.entries) {
+      const task: MusterTask = {
+        id: entry.taskId,
+        role: roleByNode.get(entry.nodeId) ?? 'worker',
+        lifecycle: 'open',
+        releaseState: 'released',
+        goal: validated.goal,
+        parentId: null,
+        dependencies: [],
+        backend: validated.backend,
+        capabilities: [],
+        executionPolicy: { maxTurns: 10, maxAutomaticRetries: 1 },
+        revision: 0,
+        createdAt: validated.createdAt,
+        updatedAt: validated.createdAt,
+        releasedAt: validated.createdAt,
+      };
+      rest.push(taskStatement(this.workspaceId, task, false));
+    }
+
+    // One dependency gate + node row per topology node.
+    for (const nodeGate of identities.nodeGates) {
+      const isEntry = entryNodeSet.has(nodeGate.nodeId);
+      const entry = entryByNode.get(nodeGate.nodeId);
+      rest.push({
+        sql: `INSERT INTO workflow_dependency_gates (
+                workspace_id, run_id, gate_id, consumer_node_id, status
+              ) VALUES (?,?,?,?,?)
+              ON CONFLICT(workspace_id, run_id, gate_id) DO NOTHING`,
         params: [
           this.workspaceId,
           identities.runId,
-          identities.entryGateId,
-          'engine_start',
-          identities.startArtifactId,
-          1,
-          validated.createdAt,
+          nodeGate.gateId,
+          nodeGate.nodeId,
+          isEntry ? 'satisfied' : 'open',
         ],
-      },
-      turnStatement(this.workspaceId, turn, false),
-      messageStatement(this.workspaceId, message, false),
-      turnInputStatement(
-        this.workspaceId,
-        turn.id,
-        0,
-        { kind: 'message', messageId: identities.entryMessageId },
-      ),
-    ];
+      });
+      rest.push({
+        sql: `INSERT INTO workflow_nodes (
+                workspace_id, run_id, node_id, task_id, status
+              ) VALUES (?,?,?,?,?)
+              ON CONFLICT(workspace_id, run_id, node_id) DO NOTHING`,
+        params: [
+          this.workspaceId,
+          identities.runId,
+          nodeGate.nodeId,
+          isEntry && entry ? entry.taskId : null,
+          isEntry ? 'active' : 'pending',
+        ],
+      });
+    }
+
+    // Entry gates: engine_start binding/fill + queued activation turn/message.
+    for (const entry of identities.entries) {
+      const message: TaskMessage = {
+        id: entry.messageId,
+        taskId: entry.taskId,
+        role: 'system',
+        // Engine-authored activation marker only — never coordinator prompt text.
+        content: '[workflow-entry]',
+        state: 'assigned',
+        turnId: entry.activationTurnId,
+        createdAt: validated.createdAt,
+      };
+      const turn: TaskTurn = {
+        id: entry.activationTurnId,
+        taskId: entry.taskId,
+        sequence: 1,
+        status: 'queued',
+        trigger: 'engine',
+        inputs: [{ kind: 'message', messageId: entry.messageId }],
+        createdAt: validated.createdAt,
+      };
+      rest.push(
+        {
+          sql: `INSERT INTO workflow_gate_bindings (
+                  workspace_id, run_id, gate_id, input_ref, producer_node_id, required_kind
+                ) VALUES (?,?,?,?,?,?)
+                ON CONFLICT(workspace_id, run_id, gate_id, input_ref) DO NOTHING`,
+          params: [
+            this.workspaceId,
+            identities.runId,
+            entry.gateId,
+            'engine_start',
+            entry.nodeId,
+            'engine_start',
+          ],
+        },
+        {
+          sql: `INSERT INTO workflow_gate_fills (
+                  workspace_id, run_id, gate_id, input_ref, artifact_id, artifact_revision, filled_at
+                ) VALUES (?,?,?,?,?,?,?)
+                ON CONFLICT(workspace_id, run_id, gate_id, input_ref, artifact_id, artifact_revision)
+                DO NOTHING`,
+          params: [
+            this.workspaceId,
+            identities.runId,
+            entry.gateId,
+            'engine_start',
+            identities.startArtifactId,
+            1,
+            validated.createdAt,
+          ],
+        },
+        turnStatement(this.workspaceId, turn, false),
+        messageStatement(this.workspaceId, message, false),
+        turnInputStatement(
+          this.workspaceId,
+          turn.id,
+          0,
+          { kind: 'message', messageId: entry.messageId },
+        ),
+      );
+    }
+
+    // Non-entry consumer gates: freeze edge bindings by destination inputRef; stay open.
+    if (topo.kind === 'graph_v1') {
+      for (const edge of topo.edges) {
+        const gateId = gateByNode.get(edge.toNodeId);
+        if (!gateId) continue;
+        rest.push({
+          sql: `INSERT INTO workflow_gate_bindings (
+                  workspace_id, run_id, gate_id, input_ref, producer_node_id, required_kind
+                ) VALUES (?,?,?,?,?,?)
+                ON CONFLICT(workspace_id, run_id, gate_id, input_ref) DO NOTHING`,
+          params: [
+            this.workspaceId,
+            identities.runId,
+            gateId,
+            edge.inputRef,
+            edge.fromNodeId,
+            'artifact',
+          ],
+        });
+      }
+    }
 
     await this.db.run(
       `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)

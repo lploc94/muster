@@ -9,6 +9,7 @@ import {
   defineWorkflowInvalid,
   defineWorkflowLedgerKey,
   defineWorkflowReplay,
+  deriveStartIdentities,
   entryNodeIds,
   fingerprintDefinition,
   makeGraphFanInDefinition,
@@ -264,4 +265,47 @@ describe('workflow domain (graph_v1 multi-node topology)', () => {
     expect(invalid.ok).toBe(false);
     if (!invalid.ok) expect(invalid.reason).toMatch(/fan-out/i);
   });
+
+
+  it('derives multi-node start identities: one gate per node, entry activations only', () => {
+    const def = makeGraphFanInDefinition();
+    const entries = entryNodeIds(def.topology);
+    const all = def.topology.nodes.map((n) => n.nodeId);
+    const primary = entries[0]!;
+    const a = deriveStartIdentities({
+      definitionId: def.definitionId,
+      version: def.version,
+      startIdempotencyKey: 'start-fan-1',
+      entryNodeId: primary,
+      entryNodeIds: entries,
+      allNodeIds: all,
+    });
+    const b = deriveStartIdentities({
+      definitionId: def.definitionId,
+      version: def.version,
+      startIdempotencyKey: 'start-fan-1',
+      entryNodeId: primary,
+      entryNodeIds: [...entries].reverse(),
+      allNodeIds: [...all].reverse(),
+    });
+    expect(a.runId).toBe(b.runId);
+    expect(a.nodeGates).toHaveLength(3);
+    expect(a.entries).toHaveLength(2);
+    expect(a.entries.map((e) => e.nodeId).sort()).toEqual([...entries].sort());
+    // Consumer has a gate but no entry activation.
+    const consumerGate = a.nodeGates.find((g) => g.nodeId === 'consumer');
+    expect(consumerGate).toBeDefined();
+    expect(a.entries.find((e) => e.nodeId === 'consumer')).toBeUndefined();
+    // One-node still uses S01-stable single-entry material.
+    const one = deriveStartIdentities({
+      definitionId: 'wf-one',
+      version: 1,
+      startIdempotencyKey: 'k',
+      entryNodeId: 'entry',
+    });
+    expect(one.entries).toHaveLength(1);
+    expect(one.nodeGates).toHaveLength(1);
+    expect(one.entryTaskId).toBe(one.entries[0]!.taskId);
+  });
+
 });

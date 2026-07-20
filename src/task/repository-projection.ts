@@ -256,15 +256,32 @@ export class RepositoryProjection {
     result?: RepositoryCommandResult,
   ): Set<string> {
     const ids = new Set<string>();
-    // M018 S01: start creates a new top-level entry task not present on the command shape.
+    // M018 S01/S02: start creates entry task(s) not present on the command shape.
+    // One-node: entryTaskId; multi-node fan-in: every entries[].taskId is activated.
     if (
       command.kind === 'startWorkflowRun' &&
       result?.operation?.result &&
       result.operation.result.ok === true
     ) {
-      const data = result.operation.result.data as { entryTaskId?: unknown };
+      const data = result.operation.result.data as {
+        entryTaskId?: unknown;
+        entries?: unknown;
+      };
       if (typeof data.entryTaskId === 'string' && data.entryTaskId.length > 0) {
         ids.add(data.entryTaskId);
+      }
+      if (Array.isArray(data.entries)) {
+        for (const entry of data.entries) {
+          if (
+            entry &&
+            typeof entry === 'object' &&
+            'taskId' in entry &&
+            typeof (entry as { taskId: unknown }).taskId === 'string' &&
+            (entry as { taskId: string }).taskId.length > 0
+          ) {
+            ids.add((entry as { taskId: string }).taskId);
+          }
+        }
       }
     }
     if ('taskId' in command && typeof command.taskId === 'string') ids.add(command.taskId);
