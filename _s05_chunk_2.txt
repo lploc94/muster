@@ -1,0 +1,21 @@
+?????????????????????[2/7]?
+
+ FAIL  src/task/m018-s05-fail-fast-cancellation-budgets.test.ts > M018 S05 fail-fast cancellation and budgets (named flow) > turn budget exhaustion closes run failed
+DbWorkerError: Muster SQLite storage is temporarily unavailable.
+ ? DbClient.onMessage src/task/sqlite/client.ts:200:19
+    198|       }
+    199|       this.pending.delete(parsed.requestId);
+    200|       const err = new DbWorkerError(parsed.payload);
+       |                   ^
+    201|       // Artifact verification failures on backup must not latch the l?
+    202|       // client (P5-W4): corrupt/not_a_database there refers to the te?
+ ? Worker.<anonymous> src/task/sqlite/client.ts:108:54
+
+????????????????????????[3/7]?
+
+
+ Test Files  1 failed (1)
+      Tests  7 failed (7)
+   Start at  13:10:27
+   Duration  1.67s (transform 223ms, setup 0ms, import 280ms, tests 1.22s, environment 0ms)
+

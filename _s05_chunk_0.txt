@@ -1,0 +1,18 @@
+
+ RUN  v4.1.10 D:/_Dev/muster
+
+ ? src/task/m018-s05-fail-fast-cancellation-budgets.test.ts (7 tests | 7 failed) 1219ms
+     ? workflow_fail closes run once, sets attention, leaves lifecycle open, is idempotent 182ms
+     ? invalid PREV on entry closes run failed with invalid_route attention 187ms
+     ? run_timeout termination closes run failed with run_timeout attention 160ms
+     ? feedback-round budget exhaustion closes run failed 174ms
+     ? turn budget exhaustion closes run failed 159ms
+     ? closure cancels queued turns, interrupts live turns, closes open gates, blocks late NEXT 195ms
+     ? multi-node closure interrupts non-source live turns under existing cancel rules 160ms
+
+??????? Failed Tests 7 ???????
+
+ FAIL  src/task/m018-s05-fail-fast-cancellation-budgets.test.ts > M018 S05 fail-fast cancellation and budgets (named flow) > workflow_fail closes run once, sets attention, leaves lifecycle open, is idempotent
+ FAIL  src/task/m018-s05-fail-fast-cancellation-budgets.test.ts > M018 S05 fail-fast cancellation and budgets (named flow) > run_timeout termination closes run failed with run_timeout attention
+ FAIL  src/task/m018-s05-fail-fast-cancellation-budgets.test.ts > M018 S05 fail-fast cancellation and budgets (named flow) > feedback-round budget exhaustion closes run failed
+ FAIL  src/task/m018-s05-fail-fast-cancellation-budgets.test.ts > M018 S05 fail-fast cancellation and budgets (named flow) > closure cancels queued turns, interrupts live turns, closes open gates

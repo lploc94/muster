@@ -1,0 +1,29 @@
+, blocks late NEXT
+ FAIL  src/task/m018-s05-fail-fast-cancellation-budgets.test.ts > M018 S05 fail-fast cancellation and budgets (named flow) > multi-node closure interrupts non-source live turns under existing cancel rules
+DbWorkerError: Muster rejected the write because a database constraint was violated.
+ ? DbClient.onMessage src/task/sqlite/client.ts:200:19
+    198|       }
+    199|       this.pending.delete(parsed.requestId);
+    200|       const err = new DbWorkerError(parsed.payload);
+       |                   ^
+    201|       // Artifact verification failures on backup must not latch the l?
+    202|       // client (P5-W4): corrupt/not_a_database there refers to the te?
+ ? Worker.<anonymous> src/task/sqlite/client.ts:108:54
+
+????????????????????????[1/7]?
+
+ FAIL  src/task/m018-s05-fail-fast-cancellation-budgets.test.ts > M018 S05 fail-fast cancellation and budgets (named flow) > invalid PREV on entry closes run failed with invalid_route attention
+AssertionError: expected 'running' to be 'failed' // Object.is equality
+
+Expected: "failed"
+Received: "running"
+
+ ? src/task/m018-s05-fail-fast-cancellation-budgets.test.ts:339:58
+    337|       );
+    338|       expect(settle.ok).toBe(true);
+    339|       expect(await runStatus(opened.client, data.runId)).toBe('failed'?
+       |                                                          ^
+    340|       const after = await opened.repository.getTask(data.entryTaskId);
+    341|       expect(after?.lifecycle).toBe('open');
+
+???

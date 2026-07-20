@@ -1,0 +1,122 @@
+private async planWorkflowFailFromSettle(
+    command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
+  ): Promise<{ statements: SqlStatement[]; changes: ChangeRecord[] }> {
+    const empty = { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] };
+    const disposition = command.turn.disposition;
+    const finishedAt = command.turn.finishedAt ?? new Date().toISOString();
+
+    // Explicit workflow_fail disposition on a successful settle.
+    if (
+      disposition
+      && disposition.kind === 'workflow_fail'
+      && command.turn.status === 'succeeded'
+    ) {
+      const node = await this.lookupWorkflowNodeForTask(command.task.id);
+      if (!node) return empty;
+      return this.planWorkflowFailClosure({
+        runId: node.runId,
+        reasonCode: 'agent_fail',
+        reasonText: boundWorkflowFailReason(disposition.reason),
+        at: finishedAt,
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
+    }
+
+    // Run-timeout termination on a non-success settle still closes the workflow run.
+    if (command.turn.termination?.kind === 'run_timeout') {
+      const node = await this.lookupWorkflowNodeForTask(command.task.id);
+      if (!node) return empty;
+      return this.planWorkflowFailClosure({
+        runId: node.runId,
+        reasonCode: 'run_timeout',
+        at: finishedAt,
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
+    }
+
+    return empty;
+  }
+
+  /**
+   * M018 S05: host-clamped feedback/turn budget exhaustion closes the run failed.
+   * Counts existing rows only — no schema column.
+   */
+  private async planWorkflowBudgetExhaustionIfNeeded(
+    command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
+  ): Promise<{ statements: SqlStatement[]; changes: ChangeRecord[] }> {
+    const empty = { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] };
+    const node = await this.lookupWorkflowNodeForTask(command.task.id);
+    if (!node) return empty;
+
+    const run = await this.db.get<{ run_id: string; status: string }>(
+      `SELECT run_id, status FROM workflow_runs
+        WHERE workspace_id = ? AND run_id = ?`,
+      [this.workspaceId, node.runId],
+    );
+    if (!run || run.status !== 'running') return empty;
+
+    const budgets = clampWorkflowRunBudgets();
+    const roundCount = await this.db.get<{ c: number }>(
+      `SELECT COUNT(*) AS c FROM workflow_feedback_rounds
+        WHERE workspace_id = ? AND run_id = ?`,
+      [this.workspaceId, node.runId],
+    );
+    if ((roundCount?.c ?? 0) > budgets.maxFeedbackRoundsPerRun) {
+      return this.planWorkflowFailClosure({
+        runId: node.runId,
+        reasonCode: 'feedback_budget_exhausted',
+        at: command.turn.finishedAt ?? new Date().toISOString(),
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
+    }
+
+    // Count engine-triggered workflow turns across all node tasks for this run.
+    const taskIds = await this.db.all<{ task_id: string }>(
+      `SELECT task_id FROM workflow_nodes
+        WHERE workspace_id = ? AND run_id = ? AND task_id IS NOT NULL`,
+      [this.workspaceId, node.runId],
+    );
+    const ids = taskIds.map((r) => r.task_id).filter((id): id is string => typeof id === 'string' && id.length > 0);
+    if (ids.length === 0) return empty;
+    const placeholders = ids.map(() => '?').join(',');
+    const turnCount = await this.db.get<{ c: number }>(
+      `SELECT COUNT(*) AS c FROM turns
+        WHERE workspace_id = ? AND task_id IN (${placeholders}) AND trigger = 'engine'`,
+      [this.workspaceId, ...ids],
+    );
+    if ((turnCount?.c ?? 0) > budgets.maxWorkflowTurnsPerRun) {
+      return this.planWorkflowFailClosure({
+        runId: node.runId,
+        reasonCode: 'turn_budget_exhausted',
+        at: command.turn.finishedAt ?? new Date().toISOString(),
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
+    }
+    return empty;
+  }
+
+  private async lookupWorkflowNodeForTask(
+    taskId: string,
+  ): Promise<{ runId: string; nodeId: string } | undefined> {
+    const row = await this.db.get<{ run_id: string; node_id: string }>(
+      `SELECT run_id, node_id FROM workflow_nodes
+        WHERE workspace_id = ? AND task_id = ?`,
+      [this.workspaceId, taskId],
+    );
+    if (!row || typeof row.run_id !== 'string' || typeof row.node_id !== 'string') {
+      return undefined;
+    }
+    return { runId: row.run_id, nodeId: row.node_id };
+  }
+
+  /**
+   * M018 S05 / §20.11 / D052: single atomic fail-fast closure primitive.
+   * One terminal run transition, close open gates+rounds, cancel reserved-not-running
+   * turns, interrupt running scope under existing rules, one bounded attention per
+   * still-open node task, never seals task lifecycle. Idempotent on non-running runs.
+   */
+  
