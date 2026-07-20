@@ -4248,8 +4248,19 @@ export class SqliteTaskRepository implements TaskRepository {
       return empty;
     }
     const topologyDecoded = decodeStoredTopologyJson(defRow.topology_json);
-    if (!topologyDecoded.ok || topologyDecoded.topology.kind !== 'graph_v1') {
+    if (!topologyDecoded.ok) {
       return empty;
+    }
+    // M018 S05: non-graph topologies have no direct PREV producers — fail the run
+    // (not silent empty). graph_v1 continues into gate/binding resolution below.
+    if (topologyDecoded.topology.kind !== 'graph_v1') {
+      return this.planWorkflowFailClosure({
+        runId: requesterNode.run_id,
+        reasonCode: 'invalid_route',
+        at: command.turn.finishedAt ?? new Date().toISOString(),
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
     }
     const topology = topologyDecoded.topology;
 
@@ -5195,6 +5206,10 @@ export class SqliteTaskRepository implements TaskRepository {
       ).slice(0, 512);
       for (const task of tasks) {
         if (isTerminalLifecycle(task.lifecycle)) continue;
+        // Source settle already emits change_log (task, settle) for this id at the
+        // same workspace revision. Skip a second change_log task row to avoid the PK
+        // (workspace, revision, entity_kind, entity_id) collision; still upsert attention.
+        const isSourceTask = Boolean(input.sourceTaskId && task.id === input.sourceTaskId);
         const nextTask = {
           ...task,
           attention: {
@@ -5203,10 +5218,12 @@ export class SqliteTaskRepository implements TaskRepository {
             at: input.at,
           },
           updatedAt: input.at,
-          revision: task.revision + 1,
+          revision: isSourceTask ? task.revision : task.revision + 1,
         };
         statements.push(taskStatement(this.workspaceId, nextTask, true));
-        changes.push({ kind: 'task', id: task.id, change: 'effect' });
+        if (!isSourceTask) {
+          changes.push({ kind: 'task', id: task.id, change: 'effect' });
+        }
       }
 
       for (const taskId of taskIds) {
