@@ -634,8 +634,25 @@ export function applySuccessfulTurn(
       };
     }
     case 'workflow_prev': {
-      // M018 S04 / §20.7–20.8: PREV settles the requester turn successfully but
-      // never seals lifecycle. Feedback round open is owned by repository (T02).
+      // M018 S04: PREV settles the requester turn successfully but never seals
+      // lifecycle. Feedback round open is owned by repository (T02).
+      return {
+        ok: true,
+        next: {
+          task: bumpTask(task, options.now, {
+            outcomeProposal: undefined,
+          }),
+          turn: {
+            ...succeededTurn,
+            disposition: turn.disposition,
+          },
+        },
+        effects,
+      };
+    }
+    case 'workflow_fail': {
+      // M018 S05 / D052: FAIL settles the turn successfully but never seals
+      // lifecycle. Run/gate/round closure is owned by repository (T02).
       return {
         ok: true,
         next: {
@@ -1345,6 +1362,11 @@ function dispositionsEqual(a: TurnDisposition, b: TurnDisposition): boolean {
             a.targets.length === b.targets.length &&
             a.targets.every((id, index) => id === b.targets[index]))
       );
+    case 'workflow_fail':
+      return (
+        b.kind === 'workflow_fail' &&
+        (a.reason ?? undefined) === (b.reason ?? undefined)
+      );
     default: {
       const _exhaustive: never = a;
       return _exhaustive;
@@ -1385,6 +1407,13 @@ function boundDisposition(
           ? { note: truncateUtf8Bytes(disposition.note, limits.maxResult).text }
           : {}),
       };
+    case 'workflow_fail':
+      return {
+        kind: 'workflow_fail',
+        ...(disposition.reason !== undefined
+          ? { reason: truncateUtf8Bytes(disposition.reason, limits.maxError).text }
+          : {}),
+      };
     default:
       return disposition;
   }
@@ -1404,13 +1433,14 @@ export function stageDisposition(
     disposition.kind === 'complete' ||
     disposition.kind === 'fail' ||
     disposition.kind === 'workflow_next' ||
-    disposition.kind === 'workflow_prev'
+    disposition.kind === 'workflow_prev' ||
+    disposition.kind === 'workflow_fail'
   ) {
     if (!options.limits) {
       return {
         ok: false,
         reason:
-          'limits are required for complete, fail, workflow_next, or workflow_prev dispositions',
+          'limits are required for complete, fail, workflow_next, workflow_prev, or workflow_fail dispositions',
       };
     }
   }

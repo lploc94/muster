@@ -1128,7 +1128,7 @@ describe('stageDisposition rejections', () => {
       stageDisposition(live, { kind: 'workflow_next', change: 'updated' }, 'op-next', {}),
     ).toEqual({
       ok: false,
-      reason: 'limits are required for complete, fail, or workflow_next dispositions',
+      reason: 'limits are required for complete, fail, workflow_next, workflow_prev, or workflow_fail dispositions',
     });
 
     const first = stageDisposition(
@@ -1233,6 +1233,80 @@ describe('stageDisposition rejections', () => {
     const live = turn({
       status: 'running',
       disposition: { kind: 'workflow_prev', targets: ['from_p1'], note: 'n' },
+    });
+    const failed = applyFailedTurn(task, live, {
+      error: 'boom',
+      retryCount: 0,
+      policy: { maxTurns: 4, maxAutomaticRetries: 0 },
+      onExhausted: 'recover',
+      now: NOW,
+    });
+    expect(failed.ok).toBe(true);
+    if (failed.ok) {
+      expect(failed.next.turn.disposition).toBeUndefined();
+    }
+    const interrupted = interruptTurn(live, { now: NOW });
+    expect(interrupted.ok).toBe(true);
+    if (interrupted.ok) {
+      expect(interrupted.next.disposition).toBeUndefined();
+    }
+  });
+
+  it('stages workflow_fail idempotently and rejects conflicting replay', () => {
+    const live = turn({ status: 'running' });
+    const first = stageDisposition(
+      live,
+      { kind: 'workflow_fail', reason: 'cannot continue' },
+      'op-fail-1',
+      { limits: { maxResult: 1024, maxError: 512 } },
+    );
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    expect(first.next.turn.disposition).toEqual({
+      kind: 'workflow_fail',
+      reason: 'cannot continue',
+    });
+    const replay = stageDisposition(
+      first.next.turn,
+      { kind: 'workflow_fail', reason: 'cannot continue' },
+      'op-fail-1',
+      {
+        acceptedOpId: 'op-fail-1',
+        limits: { maxResult: 1024, maxError: 512 },
+      },
+    );
+    expect(replay.ok).toBe(true);
+    const conflict = stageDisposition(
+      first.next.turn,
+      { kind: 'workflow_fail', reason: 'different' },
+      'op-fail-1',
+      {
+        acceptedOpId: 'op-fail-1',
+        limits: { maxResult: 1024, maxError: 512 },
+      },
+    );
+    expect(conflict.ok).toBe(false);
+  });
+
+  it('applySuccessfulTurn keeps workflow_fail without sealing lifecycle', () => {
+    const task = baseTask();
+    const live = turn({
+      status: 'running',
+      disposition: { kind: 'workflow_fail', reason: 'abort' },
+    });
+    const settled = applySuccessfulTurn(task, live, { now: NOW });
+    expect(settled.ok).toBe(true);
+    if (!settled.ok) return;
+    expect(settled.next.task.lifecycle).toBe('open');
+    expect(settled.next.turn.status).toBe('succeeded');
+    expect(settled.next.turn.disposition?.kind).toBe('workflow_fail');
+  });
+
+  it('applyFailedTurn and interruptTurn discard staged workflow_fail', () => {
+    const task = baseTask();
+    const live = turn({
+      status: 'running',
+      disposition: { kind: 'workflow_fail', reason: 'n' },
     });
     const failed = applyFailedTurn(task, live, {
       error: 'boom',

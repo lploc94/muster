@@ -160,6 +160,12 @@ export type ToolCommand =
       targets: 'all' | string[];
       note?: string;
     }
+  /** M018 S05: stage workflow FAIL (optional reason; engine owns run closure). */
+  | {
+      kind: 'workflow_fail';
+      opId: string;
+      reason?: string;
+    }
   | { kind: 'report_progress'; opId: string; note: string }
   | { kind: 'ask_user'; opId: string; questions: Question[] }
   | { kind: 'ask_parent'; opId: string; questions: Question[] }
@@ -215,6 +221,7 @@ const MUTATING_TOOLS: ReadonlySet<string> = new Set([
   'fail_task',
   'workflow_next',
   'workflow_prev',
+  'workflow_fail',
   'report_progress',
   'ask_parent',
   'answer_child_question',
@@ -243,6 +250,7 @@ function toolActionForName(name: string): ToolAction | undefined {
     'fail_task',
     'workflow_next',
     'workflow_prev',
+    'workflow_fail',
     'report_progress',
       'ask_parent',
     'answer_child_question',
@@ -1020,6 +1028,24 @@ export function dispatch(
             opId,
             targets,
             ...(note !== undefined ? { note } : {}),
+          },
+        };
+      }
+      case 'workflow_fail': {
+        // Optional reason; empty string rejected at parse time. Closure is repository-owned (T02).
+        let reason: string | undefined;
+        if (Object.prototype.hasOwnProperty.call(args, 'reason')) {
+          if (typeof args.reason !== 'string' || args.reason.length === 0) {
+            return { ok: false, toolError: 'reason must be a non-empty string when provided' };
+          }
+          reason = args.reason;
+        }
+        return {
+          ok: true,
+          command: {
+            kind: 'workflow_fail',
+            opId,
+            ...(reason !== undefined ? { reason } : {}),
           },
         };
       }

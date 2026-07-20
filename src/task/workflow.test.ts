@@ -20,6 +20,13 @@ import {
   deriveFeedbackTargetMessageId,
   deriveFeedbackResumeTurnId,
   deriveFeedbackResumeMessageId,
+  deriveRunClosureFenceId,
+  clampWorkflowRunBudgets,
+  WORKFLOW_RUN_BUDGET_BOUNDS,
+  WORKFLOW_FAIL_REASON_CODES,
+  workflowRunAttentionCode,
+  workflowRunTerminalStatusForReason,
+  boundWorkflowFailReason,
   deriveStartIdentities,
   entryNodeIds,
   fingerprintDefinition,
@@ -387,6 +394,59 @@ describe('workflow domain (graph_v1 multi-node topology)', () => {
     const next = deriveNextContributionMessageId(runId, 'wfg_gate', 'from_p1', 'p1');
     expect(reqA).not.toBe(next);
     expect(resp).not.toBe(next);
+  });
+
+
+  it('derives durable fail-fast closure identities, bounds budgets, and maps reason codes', () => {
+    const runId = 'wfr_abc';
+    const fenceFailedA = deriveRunClosureFenceId(runId, 'failed');
+    const fenceFailedB = deriveRunClosureFenceId(runId, 'failed');
+    const fenceCancelled = deriveRunClosureFenceId(runId, 'cancelled');
+    expect(fenceFailedA).toBe(fenceFailedB);
+    expect(fenceFailedA.startsWith('wfc_')).toBe(true);
+    expect(fenceCancelled.startsWith('wfc_')).toBe(true);
+    expect(fenceFailedA).not.toBe(fenceCancelled);
+    expect(fenceFailedA).not.toBe(deriveRunClosureFenceId('wfr_other', 'failed'));
+
+    expect(workflowRunAttentionCode('failed')).toBe('workflow_run_failed');
+    expect(workflowRunAttentionCode('cancelled')).toBe('workflow_run_cancelled');
+
+    expect(workflowRunTerminalStatusForReason('agent_fail')).toBe('failed');
+    expect(workflowRunTerminalStatusForReason('invalid_route')).toBe('failed');
+    expect(workflowRunTerminalStatusForReason('run_timeout')).toBe('failed');
+    expect(workflowRunTerminalStatusForReason('feedback_budget_exhausted')).toBe('failed');
+    expect(workflowRunTerminalStatusForReason('turn_budget_exhausted')).toBe('failed');
+    expect(workflowRunTerminalStatusForReason('required_target_cancelled')).toBe('cancelled');
+
+    expect(WORKFLOW_FAIL_REASON_CODES).toContain('agent_fail');
+    expect(WORKFLOW_FAIL_REASON_CODES).toContain('required_target_cancelled');
+
+    const defaults = clampWorkflowRunBudgets();
+    expect(defaults.maxFeedbackRoundsPerRun).toBe(WORKFLOW_RUN_BUDGET_BOUNDS.defaultMaxFeedbackRoundsPerRun);
+    expect(defaults.maxWorkflowTurnsPerRun).toBe(WORKFLOW_RUN_BUDGET_BOUNDS.defaultMaxWorkflowTurnsPerRun);
+
+    const clampedHigh = clampWorkflowRunBudgets({
+      maxFeedbackRoundsPerRun: 10_000,
+      maxWorkflowTurnsPerRun: 10_000,
+    });
+    expect(clampedHigh.maxFeedbackRoundsPerRun).toBe(WORKFLOW_RUN_BUDGET_BOUNDS.maxFeedbackRoundsPerRun);
+    expect(clampedHigh.maxWorkflowTurnsPerRun).toBe(WORKFLOW_RUN_BUDGET_BOUNDS.maxWorkflowTurnsPerRun);
+
+    const clampedLow = clampWorkflowRunBudgets({
+      maxFeedbackRoundsPerRun: 0,
+      maxWorkflowTurnsPerRun: -1,
+    });
+    expect(clampedLow.maxFeedbackRoundsPerRun).toBe(WORKFLOW_RUN_BUDGET_BOUNDS.minFeedbackRoundsPerRun);
+    expect(clampedLow.maxWorkflowTurnsPerRun).toBe(WORKFLOW_RUN_BUDGET_BOUNDS.minWorkflowTurnsPerRun);
+
+    expect(boundWorkflowFailReason(undefined)).toBeUndefined();
+    expect(boundWorkflowFailReason('  ')).toBeUndefined();
+    const long = 'x'.repeat(2_000);
+    const bounded = boundWorkflowFailReason(long);
+    expect(bounded).toBeDefined();
+    expect(Buffer.byteLength(bounded!, 'utf8')).toBeLessThanOrEqual(
+      WORKFLOW_RUN_BUDGET_BOUNDS.maxFailReasonBytes,
+    );
   });
 
 });

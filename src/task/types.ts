@@ -435,6 +435,15 @@ export type TurnDisposition =
       kind: 'workflow_prev';
       targets: 'all' | string[];
       note?: string;
+    }
+  /**
+   * M018 S05: fail-fast close the current workflow run (FAIL). Mutually exclusive
+   * with complete/fail/wait/idle/workflow_next/workflow_prev. Staging never seals
+   * lifecycle; run/gate/round closure is owned by the repository commit path (T02).
+   */
+  | {
+      kind: 'workflow_fail';
+      reason?: string;
     };
 /**
  * Durable ACP boundary phase for a live/settled turn (Phase C).

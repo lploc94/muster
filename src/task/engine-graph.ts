@@ -2267,6 +2267,32 @@ export async function executeToolCommand(
       return { ok: true, result: { staged: true } };
     }
 
+    case 'workflow_fail': {
+      // M018 S05: stage workflow_fail disposition. Does not seal lifecycle; run
+      // closure is owned by the repository commit path (T02).
+      const staged = await executeGraphCommand(deps, 'workflowFailGraphTask', (draft) => {
+        const turn = draft.turns[ctx.turnId];
+        if (!turn) return { ok: false, reason: 'turn not found' };
+        const result = stageDisposition(
+          turn,
+          {
+            kind: 'workflow_fail',
+            ...(command.reason !== undefined ? { reason: command.reason } : {}),
+          },
+          command.opId,
+          {
+            limits: { maxResult: limits.maxResultBytes, maxError: limits.maxErrorBytes },
+          },
+        );
+        if (!result.ok) return result;
+        draft.turns[ctx.turnId] = result.next.turn;
+        writeLedger(draft, ctx.turnId, command.opId, fingerprint, { ok: true, data: { staged: true } });
+        return { ok: true };
+      });
+      if (!staged.ok) return { ok: false, error: staged.error };
+      return { ok: true, result: { staged: true } };
+    }
+
     case 'report_progress':
       return { ok: true, result: { noted: command.note.slice(0, 512) } };
 

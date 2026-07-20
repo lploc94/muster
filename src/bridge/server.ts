@@ -89,6 +89,7 @@ const ALL_TOOLS: ToolAction[] = [
   'fail_task',
   'workflow_next',
   'workflow_prev',
+  'workflow_fail',
   'report_progress',
   'ask_parent',
   'answer_child_question',
@@ -458,6 +459,15 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
     },
     additionalProperties: false,
   },
+  workflow_fail: {
+    type: 'object',
+    required: ['opId'],
+    properties: {
+      opId: OP_ID,
+      reason: { type: 'string', minLength: 1, maxLength: 512 },
+    },
+    additionalProperties: false,
+  },
   report_progress: {
     type: 'object',
     required: ['opId', 'note'],
@@ -692,6 +702,8 @@ function createMcpServer(options: CreateMcpServerOptions): McpServer {
                               ? 'Stage a workflow NEXT disposition on the live turn: routes this node result forward without sealing lifecycle. Provide change=updated|unchanged and optional result body. Engine owns gate/artifact identities. Committed only when the adapter settles the turn successfully.'
                             : name === 'workflow_prev'
                               ? 'Stage a workflow PREV disposition on the live turn: request correction from one or all direct producers without sealing lifecycle. Provide targets="all" or a non-empty inputRef array and optional note. Engine owns round/target/resume identities. Committed only when the adapter settles the turn successfully.'
+                            : name === 'workflow_fail'
+                              ? 'Stage a workflow FAIL disposition on the live turn: close the current workflow run without sealing task lifecycle. Optional reason is bounded diagnostics only (no prompts/artifacts/paths). Engine owns run/gate/round closure identities. Committed only when the adapter settles the turn successfully.'
                             : name === 'define_workflow'
                               ? 'Persist an immutable workflow definition version (one_node_v1 or graph_v1 fan-in). Same definitionId+version+fingerprint replays; differing fingerprint fails closed. Domain validation is fail-closed for topology shape.'
                               : name === 'start_workflow'

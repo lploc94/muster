@@ -446,6 +446,122 @@ export function deriveFeedbackResumeMessageId(runId: string, roundId: string): s
   return stableId('wfm', `${runId}\0feedback_resume_message\0${roundId}`);
 }
 
+
+/**
+ * M018 S05 fail-fast closure identities / reason codes / host-clamped budgets (D052).
+ * Deterministic, run-scoped only — never prompt/result bodies, SQL, paths, or credentials.
+ * Budgets are derived from existing rows against these host clamps (no schema column).
+ */
+
+/** Bounded reason codes for durable TaskAttention + closure diagnostics. */
+export const WORKFLOW_FAIL_REASON_CODES = [
+  'agent_fail',
+  'invalid_route',
+  'run_timeout',
+  'feedback_budget_exhausted',
+  'turn_budget_exhausted',
+  'required_target_cancelled',
+] as const;
+
+export type WorkflowFailReasonCode = (typeof WORKFLOW_FAIL_REASON_CODES)[number];
+
+/** Terminal workflow_runs.status produced by a reason code. */
+export type WorkflowRunTerminalStatus = 'failed' | 'cancelled';
+
+/**
+ * Host-clamped budget bounds for a workflow run.
+ * Defaults are used when a run has no explicit policy override.
+ */
+export const WORKFLOW_RUN_BUDGET_BOUNDS = {
+  minFeedbackRoundsPerRun: 1,
+  maxFeedbackRoundsPerRun: 32,
+  defaultMaxFeedbackRoundsPerRun: 8,
+  minWorkflowTurnsPerRun: 1,
+  maxWorkflowTurnsPerRun: 256,
+  defaultMaxWorkflowTurnsPerRun: 64,
+  /** Optional agent-supplied reason text on workflow_fail (UTF-8 bytes). */
+  maxFailReasonBytes: 512,
+} as const;
+
+export type WorkflowRunBudgetLimits = {
+  maxFeedbackRoundsPerRun: number;
+  maxWorkflowTurnsPerRun: number;
+};
+
+function clampInt(value: number | undefined, min: number, max: number, fallback: number): number {
+  if (value === undefined || !Number.isFinite(value)) return fallback;
+  const n = Math.trunc(value);
+  if (n < min) return min;
+  if (n > max) return max;
+  return n;
+}
+
+/** Clamp optional host/policy budget inputs into safe WORKFLOW_RUN_BUDGET_BOUNDS. */
+export function clampWorkflowRunBudgets(input?: {
+  maxFeedbackRoundsPerRun?: number;
+  maxWorkflowTurnsPerRun?: number;
+}): WorkflowRunBudgetLimits {
+  return {
+    maxFeedbackRoundsPerRun: clampInt(
+      input?.maxFeedbackRoundsPerRun,
+      WORKFLOW_RUN_BUDGET_BOUNDS.minFeedbackRoundsPerRun,
+      WORKFLOW_RUN_BUDGET_BOUNDS.maxFeedbackRoundsPerRun,
+      WORKFLOW_RUN_BUDGET_BOUNDS.defaultMaxFeedbackRoundsPerRun,
+    ),
+    maxWorkflowTurnsPerRun: clampInt(
+      input?.maxWorkflowTurnsPerRun,
+      WORKFLOW_RUN_BUDGET_BOUNDS.minWorkflowTurnsPerRun,
+      WORKFLOW_RUN_BUDGET_BOUNDS.maxWorkflowTurnsPerRun,
+      WORKFLOW_RUN_BUDGET_BOUNDS.defaultMaxWorkflowTurnsPerRun,
+    ),
+  };
+}
+
+/**
+ * Durable closure fence id for a run terminal transition.
+ * One fence per (runId, terminalStatus) so double-close is a no-op.
+ */
+export function deriveRunClosureFenceId(
+  runId: string,
+  terminalStatus: WorkflowRunTerminalStatus,
+): string {
+  return stableId('wfc', `${runId}\0run_closure\0${terminalStatus}`);
+}
+
+/** Map terminal run status to the durable TaskAttention code. */
+export function workflowRunAttentionCode(
+  terminalStatus: WorkflowRunTerminalStatus,
+): 'workflow_run_failed' | 'workflow_run_cancelled' {
+  return terminalStatus === 'cancelled' ? 'workflow_run_cancelled' : 'workflow_run_failed';
+}
+
+/** Map a bounded fail reason code to the terminal workflow_runs.status. */
+export function workflowRunTerminalStatusForReason(
+  reasonCode: WorkflowFailReasonCode,
+): WorkflowRunTerminalStatus {
+  return reasonCode === 'required_target_cancelled' ? 'cancelled' : 'failed';
+}
+
+/**
+ * Bound optional agent-supplied FAIL reason text (no prompts/artifacts/paths/SQL).
+ * Empty/whitespace becomes undefined; over-limit is truncated by UTF-8 bytes.
+ */
+export function boundWorkflowFailReason(reason: string | undefined): string | undefined {
+  if (reason === undefined) return undefined;
+  const trimmed = reason.trim();
+  if (trimmed.length === 0) return undefined;
+  const max = WORKFLOW_RUN_BUDGET_BOUNDS.maxFailReasonBytes;
+  const buf = Buffer.from(trimmed, 'utf8');
+  if (buf.byteLength <= max) return trimmed;
+  // Truncate on byte boundary without splitting a multi-byte codepoint.
+  let end = max;
+  while (end > 0 && (buf[end] & 0b1100_0000) === 0b1000_0000) {
+    end -= 1;
+  }
+  return buf.subarray(0, end).toString('utf8');
+}
+
+
 /** Single outbound edge for a producer node (graph_v1 forbids fan-out). */
 export function outgoingEdge(
   topology: WorkflowTopologyV1,

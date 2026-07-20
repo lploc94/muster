@@ -1048,4 +1048,47 @@ describe('workflow_next tool surface', () => {
       ),
     ).toEqual({ ok: false, toolError: 'action not permitted: workflow_prev' });
   });
+
+  it('maps workflow_fail with optional reason', () => {
+    expect(
+      dispatch(
+        'workflow_fail',
+        { opId: 'op-f' },
+        ctx(['workflow_fail']),
+      ),
+    ).toEqual({
+      ok: true,
+      command: { kind: 'workflow_fail', opId: 'op-f' },
+    });
+    expect(
+      dispatch(
+        'workflow_fail',
+        { opId: 'op-f', reason: 'cannot continue' },
+        ctx(['workflow_fail']),
+      ),
+    ).toEqual({
+      ok: true,
+      command: { kind: 'workflow_fail', opId: 'op-f', reason: 'cannot continue' },
+    });
+  });
+
+  it('rejects invalid workflow_fail reason at parse time', () => {
+    expect(
+      dispatch(
+        'workflow_fail',
+        { opId: 'op-f', reason: '' },
+        ctx(['workflow_fail']),
+      ),
+    ).toEqual({
+      ok: false,
+      toolError: 'reason must be a non-empty string when provided',
+    });
+    expect(
+      dispatch(
+        'workflow_fail',
+        { opId: 'op-f' },
+        ctx(['complete_task']),
+      ),
+    ).toEqual({ ok: false, toolError: 'action not permitted: workflow_fail' });
+  });
 });
