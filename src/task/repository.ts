@@ -28,6 +28,10 @@ import {
   validateDefineWorkflow,
   validateStartWorkflow,
   entryNodeIds,
+  deriveNodeActivationIdentities,
+  deriveProducerArtifactId,
+  outgoingEdge,
+  consumerInputRefsInDefinitionOrder,
   type DefineWorkflowResult,
   type StartWorkflowResult,
 } from './workflow';
@@ -3694,6 +3698,7 @@ export class SqliteTaskRepository implements TaskRepository {
     if (command.expectedStatuses.length === 0) {
       return { ok: true, changed: false, reason: 'expected live status required' };
     }
+    const nextContribution = await this.planWorkflowNextContribution(command);
     const rest: SqlStatement[] = [
       taskStatement(this.workspaceId, command.task, true),
       ...command.relatedTurns.flatMap((turn) => [
@@ -3706,12 +3711,14 @@ export class SqliteTaskRepository implements TaskRepository {
       { sql: 'DELETE FROM resource_claims WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, command.turn.id] },
       { sql: 'DELETE FROM runtime_claims WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, command.turn.id] },
       { sql: 'DELETE FROM turn_cancel_requests WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, command.turn.id] },
+      ...nextContribution.statements,
     ];
     const changes: ChangeRecord[] = [
       { kind: 'task', id: command.task.id, change: 'settle' },
       { kind: 'turn', id: command.turn.id, taskId: command.task.id, change: 'settle' },
       ...command.relatedTurns.map((turn) => ({ kind: 'turn' as const, id: turn.id, taskId: turn.taskId, change: 'effect' })),
       ...command.messages.map((message) => ({ kind: 'message' as const, id: message.id, taskId: message.taskId, change: 'complete' })),
+      ...nextContribution.changes,
     ];
     const results = await this.writeIfFirstChanged(
       guardedSettleTurnStatement(this.workspaceId, command),
@@ -3725,6 +3732,355 @@ export class SqliteTaskRepository implements TaskRepository {
       ...((results[0]?.changes ?? 0) === 0 ? { reason: 'turn is no longer live' } : {}),
     };
   }
+
+  /**
+   * M018 S02 / §20.5–20.6: when a producer turn settles with staged workflow_next,
+   * commit artifact + gate contribution in the same transaction. Partial fills
+   * persist only; the final fill atomically closes the gate and queues one
+   * deterministic aggregate activation turn. Never seals producer lifecycle.
+   */
+  private async planWorkflowNextContribution(
+    command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
+  ): Promise<{ statements: SqlStatement[]; changes: ChangeRecord[] }> {
+    const empty = { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] };
+    const disposition = command.turn.disposition;
+    if (
+      !disposition ||
+      disposition.kind !== 'workflow_next' ||
+      command.turn.status !== 'succeeded'
+    ) {
+      return empty;
+    }
+
+    const producerNode = await this.db.get<{ run_id: string; node_id: string }>(
+      `SELECT run_id, node_id FROM workflow_nodes
+        WHERE workspace_id = ? AND task_id = ?`,
+      [this.workspaceId, command.task.id],
+    );
+    if (!producerNode || typeof producerNode.run_id !== 'string' || typeof producerNode.node_id !== 'string') {
+      return empty;
+    }
+
+    const run = await this.db.get<{
+      run_id: string;
+      definition_id: string;
+      definition_version: number;
+      status: string;
+    }>(
+      `SELECT run_id, definition_id, definition_version, status FROM workflow_runs
+        WHERE workspace_id = ? AND run_id = ?`,
+      [this.workspaceId, producerNode.run_id],
+    );
+    if (!run || run.status !== 'running' || typeof run.definition_id !== 'string') {
+      return empty;
+    }
+
+    const defRow = await this.db.get<{ topology_json: string }>(
+      `SELECT topology_json FROM workflow_definitions
+        WHERE workspace_id = ? AND definition_id = ? AND version = ?`,
+      [this.workspaceId, run.definition_id, run.definition_version],
+    );
+    if (!defRow || typeof defRow.topology_json !== 'string') {
+      return empty;
+    }
+    const topologyDecoded = decodeStoredTopologyJson(defRow.topology_json);
+    if (!topologyDecoded.ok || topologyDecoded.topology.kind !== 'graph_v1') {
+      return empty;
+    }
+    const topology = topologyDecoded.topology;
+    const edge = outgoingEdge(topology, producerNode.node_id);
+    if (!edge) {
+      // Terminal node NEXT has no forward route in S02.
+      return empty;
+    }
+
+    const gate = await this.db.get<{ gate_id: string; status: string }>(
+      `SELECT gate_id, status FROM workflow_dependency_gates
+        WHERE workspace_id = ? AND run_id = ? AND consumer_node_id = ?`,
+      [this.workspaceId, producerNode.run_id, edge.toNodeId],
+    );
+    if (!gate || typeof gate.gate_id !== 'string') {
+      return empty;
+    }
+
+    const artifactId = deriveProducerArtifactId(producerNode.run_id, producerNode.node_id);
+    const maxRevRow = await this.db.get<{ max_rev: number | null }>(
+      `SELECT MAX(revision) AS max_rev FROM workflow_artifacts
+        WHERE workspace_id = ? AND run_id = ? AND artifact_id = ?`,
+      [this.workspaceId, producerNode.run_id, artifactId],
+    );
+    const priorMax = typeof maxRevRow?.max_rev === 'number' ? maxRevRow.max_rev : 0;
+    const publishNew =
+      disposition.change === 'updated' || priorMax === 0;
+    const revision = publishNew ? priorMax + 1 : priorMax;
+    const finishedAt = command.turn.finishedAt ?? new Date().toISOString();
+
+    const statements: SqlStatement[] = [];
+    const changes: ChangeRecord[] = [];
+
+    if (publishNew) {
+      const resultBody =
+        typeof disposition.result === 'string'
+          ? disposition.result.slice(0, 4000)
+          : undefined;
+      const artifactPayload = encodePayload({
+        kind: 'next_result',
+        schema: 1,
+        change: disposition.change,
+        producerNodeId: producerNode.node_id,
+        sourceTurnId: command.turn.id,
+        ...(resultBody !== undefined ? { result: resultBody } : {}),
+      });
+      statements.push({
+        sql: `INSERT INTO workflow_artifacts (
+                workspace_id, run_id, artifact_id, producer_node_id, logical_name,
+                revision, kind, payload_json, created_at
+              ) VALUES (?,?,?,?,?,?,?,?,?)
+              ON CONFLICT(workspace_id, run_id, artifact_id, revision) DO NOTHING`,
+        params: [
+          this.workspaceId,
+          producerNode.run_id,
+          artifactId,
+          producerNode.node_id,
+          'next_result',
+          revision,
+          'next_result',
+          artifactPayload,
+          finishedAt,
+        ],
+      });
+    }
+
+    statements.push({
+      sql: `INSERT INTO workflow_gate_fills (
+              workspace_id, run_id, gate_id, input_ref, artifact_id, artifact_revision, filled_at
+            ) VALUES (?,?,?,?,?,?,?)
+            ON CONFLICT(workspace_id, run_id, gate_id, input_ref, artifact_id, artifact_revision)
+            DO NOTHING`,
+      params: [
+        this.workspaceId,
+        producerNode.run_id,
+        gate.gate_id,
+        edge.inputRef,
+        artifactId,
+        revision,
+        finishedAt,
+      ],
+    });
+
+    // Atomic open→satisfied only when all required inputRefs are filled (incl. this fill).
+    statements.push({
+      sql: `UPDATE workflow_dependency_gates
+               SET status = 'satisfied'
+             WHERE workspace_id = ? AND run_id = ? AND gate_id = ? AND status = 'open'
+               AND (
+                 SELECT COUNT(DISTINCT input_ref) FROM workflow_gate_fills
+                  WHERE workspace_id = ? AND run_id = ? AND gate_id = ?
+               ) >= (
+                 SELECT COUNT(*) FROM workflow_gate_bindings
+                  WHERE workspace_id = ? AND run_id = ? AND gate_id = ?
+               )`,
+      params: [
+        this.workspaceId,
+        producerNode.run_id,
+        gate.gate_id,
+        this.workspaceId,
+        producerNode.run_id,
+        gate.gate_id,
+        this.workspaceId,
+        producerNode.run_id,
+        gate.gate_id,
+      ],
+    });
+
+    // Pre-read fills for deterministic aggregate message content (definition inputRef order).
+    const existingFills = await this.db.all<{
+      input_ref: string;
+      artifact_id: string;
+      artifact_revision: number;
+    }>(
+      `SELECT input_ref, artifact_id, artifact_revision FROM workflow_gate_fills
+        WHERE workspace_id = ? AND run_id = ? AND gate_id = ?`,
+      [this.workspaceId, producerNode.run_id, gate.gate_id],
+    );
+    const fillByRef = new Map<string, { artifact_id: string; artifact_revision: number }>();
+    for (const fill of existingFills) {
+      fillByRef.set(fill.input_ref, {
+        artifact_id: fill.artifact_id,
+        artifact_revision: fill.artifact_revision,
+      });
+    }
+    fillByRef.set(edge.inputRef, {
+      artifact_id: artifactId,
+      artifact_revision: revision,
+    });
+    const orderedRefs = consumerInputRefsInDefinitionOrder(topology, edge.toNodeId);
+    const orderedPins = orderedRefs.map((ref) => {
+      const pin = fillByRef.get(ref);
+      return pin ? `${ref}=${pin.artifact_id}@${pin.artifact_revision}` : `${ref}=missing`;
+    });
+    const aggregateContent = `[workflow-aggregate] ${orderedPins.join(' ')}`;
+
+    const activation = deriveNodeActivationIdentities(producerNode.run_id, edge.toNodeId);
+    const consumerSpec = topology.nodes.find((n) => n.nodeId === edge.toNodeId);
+    const consumerRole = consumerSpec?.role ?? 'worker';
+    const taskPayloadJson = encodePayload({
+      capabilities: [],
+      executionPolicy: { maxTurns: 10, maxAutomaticRetries: 1 },
+      releasedAt: finishedAt,
+    });
+    const turnPayloadJson = encodePayload({});
+    const messagePayloadJson = encodePayload({});
+
+    // Conditional activation: only when gate is satisfied; reserved ids make redelivery no-op.
+    statements.push({
+      sql: `INSERT INTO tasks (
+              id, workspace_id, parent_id, role, lifecycle, release_state, goal, backend, model,
+              revision, created_at, updated_at, payload_json
+            )
+            SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?
+             WHERE EXISTS (
+               SELECT 1 FROM workflow_dependency_gates
+                WHERE workspace_id = ? AND run_id = ? AND gate_id = ? AND status = 'satisfied'
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM tasks WHERE workspace_id = ? AND id = ?
+             )`,
+      params: [
+        activation.taskId,
+        this.workspaceId,
+        null,
+        consumerRole,
+        'open',
+        'released',
+        command.task.goal,
+        command.task.backend,
+        null,
+        0,
+        finishedAt,
+        finishedAt,
+        taskPayloadJson,
+        this.workspaceId,
+        producerNode.run_id,
+        gate.gate_id,
+        this.workspaceId,
+        activation.taskId,
+      ],
+    });
+    statements.push({
+      sql: `UPDATE workflow_nodes
+               SET task_id = ?, status = 'active'
+             WHERE workspace_id = ? AND run_id = ? AND node_id = ?
+               AND EXISTS (
+                 SELECT 1 FROM workflow_dependency_gates
+                  WHERE workspace_id = ? AND run_id = ? AND gate_id = ? AND status = 'satisfied'
+               )
+               AND (task_id IS NULL OR task_id = ?)`,
+      params: [
+        activation.taskId,
+        this.workspaceId,
+        producerNode.run_id,
+        edge.toNodeId,
+        this.workspaceId,
+        producerNode.run_id,
+        gate.gate_id,
+        activation.taskId,
+      ],
+    });
+    statements.push({
+      sql: `INSERT INTO turns (
+              id, workspace_id, task_id, sequence, status, trigger, created_at, started_at, settled_at, payload_json
+            )
+            SELECT ?,?,?,?,?,?,?,?,?,?
+             WHERE EXISTS (
+               SELECT 1 FROM workflow_dependency_gates
+                WHERE workspace_id = ? AND run_id = ? AND gate_id = ? AND status = 'satisfied'
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM turns WHERE workspace_id = ? AND id = ?
+             )`,
+      params: [
+        activation.activationTurnId,
+        this.workspaceId,
+        activation.taskId,
+        1,
+        'queued',
+        'engine',
+        finishedAt,
+        null,
+        null,
+        turnPayloadJson,
+        this.workspaceId,
+        producerNode.run_id,
+        gate.gate_id,
+        this.workspaceId,
+        activation.activationTurnId,
+      ],
+    });
+    statements.push({
+      sql: `INSERT INTO messages (
+              id, workspace_id, task_id, turn_id, role, state, ordering, content, created_at, updated_at, payload_json
+            )
+            SELECT ?,?,?,?,?,?,?,?,?,?,?
+             WHERE EXISTS (
+               SELECT 1 FROM workflow_dependency_gates
+                WHERE workspace_id = ? AND run_id = ? AND gate_id = ? AND status = 'satisfied'
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM messages WHERE workspace_id = ? AND id = ?
+             )`,
+      params: [
+        activation.messageId,
+        this.workspaceId,
+        activation.taskId,
+        activation.activationTurnId,
+        'system',
+        'assigned',
+        null,
+        aggregateContent,
+        finishedAt,
+        null,
+        messagePayloadJson,
+        this.workspaceId,
+        producerNode.run_id,
+        gate.gate_id,
+        this.workspaceId,
+        activation.messageId,
+      ],
+    });
+    statements.push({
+      sql: `INSERT INTO turn_inputs (workspace_id, turn_id, ordering, kind, payload_json)
+            SELECT ?,?,?,?,?
+             WHERE EXISTS (
+               SELECT 1 FROM workflow_dependency_gates
+                WHERE workspace_id = ? AND run_id = ? AND gate_id = ? AND status = 'satisfied'
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM turn_inputs WHERE workspace_id = ? AND turn_id = ? AND ordering = 0
+             )`,
+      params: [
+        this.workspaceId,
+        activation.activationTurnId,
+        0,
+        'message',
+        encodePayload({ kind: 'message', messageId: activation.messageId }),
+        this.workspaceId,
+        producerNode.run_id,
+        gate.gate_id,
+        this.workspaceId,
+        activation.activationTurnId,
+      ],
+    });
+
+    changes.push(
+      { kind: 'task', id: activation.taskId, change: 'effect' },
+      { kind: 'turn', id: activation.activationTurnId, taskId: activation.taskId, change: 'effect' },
+      { kind: 'message', id: activation.messageId, taskId: activation.taskId, change: 'complete' },
+    );
+
+    return { statements, changes };
+  }
+
 
   private async applyRetention(
     command:

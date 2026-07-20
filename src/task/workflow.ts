@@ -18,6 +18,7 @@ import type {
   StartWorkflowInput,
   StartWorkflowResult,
   WorkflowDefinitionV1,
+  WorkflowDependencyEdgeV1,
   WorkflowTopologyV1,
 } from './workflow-types';
 
@@ -315,6 +316,47 @@ export function deriveStartIdentities(input: {
     nodeGates,
     entries,
   };
+}
+
+/**
+ * Reserved activation identities for a multi-node consumer (or any node) after start.
+ * Material is runId + nodeId so contribution-time derivation does not need the start key.
+ * Entry nodes already used runBase at start; non-entry consumers use this formula only.
+ */
+export function deriveNodeActivationIdentities(
+  runId: string,
+  nodeId: string,
+): { taskId: string; activationTurnId: string; messageId: string } {
+  return {
+    taskId: stableId('wft', `${runId}\0task\0${nodeId}`),
+    activationTurnId: stableId('wftn', `${runId}\0turn\0${nodeId}`),
+    messageId: stableId('wfm', `${runId}\0message\0${nodeId}`),
+  };
+}
+
+/** Producer artifact identity for NEXT contributions (one logical artifact per producer node). */
+export function deriveProducerArtifactId(runId: string, producerNodeId: string): string {
+  return stableId('wfa', `${runId}\0artifact\0${producerNodeId}`);
+}
+
+/** Single outbound edge for a producer node (graph_v1 forbids fan-out). */
+export function outgoingEdge(
+  topology: WorkflowTopologyV1,
+  fromNodeId: string,
+): WorkflowDependencyEdgeV1 | undefined {
+  if (topology.kind !== 'graph_v1') return undefined;
+  return topology.edges.find((edge) => edge.fromNodeId === fromNodeId);
+}
+
+/** Destination inputRefs for a consumer in definition edge order (not arrival order). */
+export function consumerInputRefsInDefinitionOrder(
+  topology: WorkflowTopologyV1,
+  consumerNodeId: string,
+): string[] {
+  if (topology.kind !== 'graph_v1') return [];
+  return topology.edges
+    .filter((edge) => edge.toNodeId === consumerNodeId)
+    .map((edge) => edge.inputRef);
 }
 
 /** Start fingerprint (no prompt/message/artifact bodies). */
