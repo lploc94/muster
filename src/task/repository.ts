@@ -39,6 +39,12 @@ import {
   deriveFeedbackTargetMessageId,
   deriveFeedbackResumeTurnId,
   deriveFeedbackResumeMessageId,
+  deriveRunClosureFenceId,
+  workflowRunAttentionCode,
+  workflowRunTerminalStatusForReason,
+  boundWorkflowFailReason,
+  clampWorkflowRunBudgets,
+  type WorkflowFailReasonCode,
   outgoingEdge,
   consumerInputRefsInDefinitionOrder,
   type DefineWorkflowResult,
@@ -47,7 +53,10 @@ import {
 import { isMutatingTask, normalizedWritePaths } from './resources';
 import { canPromoteTurn } from './scheduler';
 import { DEFAULT_RESOURCE_LIMITS } from './limits';
-import { isTerminalLifecycle, isTerminalTurn } from './transitions';
+import {
+  LIVE_TURN_STATUSES,
+  isTerminalLifecycle, isTerminalTurn
+} from './transitions';
 import { TRUNCATION_MARKER } from './retention';
 import type { DbClient } from './sqlite/client';
 import type { SqlStatement, SqlValue } from './sqlite/rpc';
@@ -3720,26 +3729,47 @@ export class SqliteTaskRepository implements TaskRepository {
     if (command.expectedStatuses.length === 0) {
       return { ok: true, changed: false, reason: 'expected live status required' };
     }
+    // M018 S05: workflow_fail / invalid-route / budget exhaustion close the run first.
     // M018 S04: feedback responses intercept workflow_next on a feedback turn before
     // the forward contribution path. PREV requests open a round; otherwise fall through
     // to the existing NEXT contribution planner.
-    const feedbackResponse = await this.planWorkflowFeedbackResponse(command);
-    const prevRequest = feedbackResponse.statements.length > 0
+    const failClosure = await this.planWorkflowFailFromSettle(command);
+    const feedbackResponse = failClosure.statements.length > 0
+      ? { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] }
+      : await this.planWorkflowFeedbackResponse(command);
+    const prevRequest = (failClosure.statements.length > 0 || feedbackResponse.statements.length > 0)
       ? { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] }
       : await this.planWorkflowPrevRequest(command);
-    const nextContribution = (feedbackResponse.statements.length > 0 || prevRequest.statements.length > 0)
+    const nextContribution = (
+      failClosure.statements.length > 0
+      || feedbackResponse.statements.length > 0
+      || prevRequest.statements.length > 0
+    )
       ? { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] }
       : await this.planWorkflowNextContribution(command);
+    // Budget check after successful non-fail planners: exceeding host-clamped bounds closes the run.
+    const budgetClosure = (
+      failClosure.statements.length > 0
+      || feedbackResponse.statements.length > 0
+      || prevRequest.statements.length > 0
+      || nextContribution.statements.length > 0
+    )
+      ? { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] }
+      : await this.planWorkflowBudgetExhaustionIfNeeded(command);
     const workflowEffects = {
       statements: [
+        ...failClosure.statements,
         ...feedbackResponse.statements,
         ...prevRequest.statements,
         ...nextContribution.statements,
+        ...budgetClosure.statements,
       ],
       changes: [
+        ...failClosure.changes,
         ...feedbackResponse.changes,
         ...prevRequest.changes,
         ...nextContribution.changes,
+        ...budgetClosure.changes,
       ],
     };
     const rest: SqlStatement[] = [
@@ -4229,7 +4259,14 @@ export class SqliteTaskRepository implements TaskRepository {
       [this.workspaceId, requesterNode.run_id, requesterNode.node_id],
     );
     if (!gate || typeof gate.gate_id !== 'string') {
-      return empty;
+      // M018 S05: PREV with no requester gate is an invalid route.
+      return this.planWorkflowFailClosure({
+        runId: requesterNode.run_id,
+        reasonCode: 'invalid_route',
+        at: command.turn.finishedAt ?? new Date().toISOString(),
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
     }
 
     const bindings = await this.db.all<{
@@ -4249,7 +4286,14 @@ export class SqliteTaskRepository implements TaskRepository {
       producerByInputRef.set(binding.input_ref, binding.producer_node_id);
     }
     if (producerByInputRef.size === 0) {
-      return empty;
+      // M018 S05: entry PREV with no direct producer route fails the run (not silent empty).
+      return this.planWorkflowFailClosure({
+        runId: requesterNode.run_id,
+        reasonCode: 'invalid_route',
+        at: command.turn.finishedAt ?? new Date().toISOString(),
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
     }
 
     let resolvedTargetNodeIds: string[] = [];
@@ -4275,8 +4319,14 @@ export class SqliteTaskRepository implements TaskRepository {
       for (const inputRef of disposition.targets) {
         const producer = producerByInputRef.get(inputRef);
         if (!producer) {
-          // Unknown/foreign inputRef rejects the whole PREV without opening a round.
-          return empty;
+          // M018 S05: unknown/foreign inputRef fails the run (not silent empty).
+          return this.planWorkflowFailClosure({
+            runId: requesterNode.run_id,
+            reasonCode: 'invalid_route',
+            at: command.turn.finishedAt ?? new Date().toISOString(),
+            sourceTaskId: command.task.id,
+            sourceTurnId: command.turn.id,
+          });
         }
         if (!seen.has(producer)) {
           seen.add(producer);
@@ -4284,7 +4334,14 @@ export class SqliteTaskRepository implements TaskRepository {
         }
       }
       if (resolvedTargetNodeIds.length === 0) {
-        return empty;
+        // M018 S05: empty targeted PREV set fails the run (not silent empty).
+        return this.planWorkflowFailClosure({
+          runId: requesterNode.run_id,
+          reasonCode: 'invalid_route',
+          at: command.turn.finishedAt ?? new Date().toISOString(),
+          sourceTaskId: command.task.id,
+          sourceTurnId: command.turn.id,
+        });
       }
     }
 
@@ -4297,7 +4354,14 @@ export class SqliteTaskRepository implements TaskRepository {
         [this.workspaceId, requesterNode.run_id, nodeId],
       );
       if (!row || typeof row.task_id !== 'string' || row.task_id.length === 0) {
-        return empty;
+        // M018 S05: required PREV target not activated → fail closure.
+        return this.planWorkflowFailClosure({
+          runId: requesterNode.run_id,
+          reasonCode: 'invalid_route',
+          at: command.turn.finishedAt ?? new Date().toISOString(),
+          sourceTaskId: command.task.id,
+          sourceTurnId: command.turn.id,
+        });
       }
       targetRows.push({ nodeId, taskId: row.task_id });
     }
@@ -4913,6 +4977,274 @@ export class SqliteTaskRepository implements TaskRepository {
 
     return { statements, changes };
   }
+
+  /**
+   * M018 S05 settle entry: workflow_fail disposition, invalid PREV routing, or
+   * run_timeout termination each close the run via planWorkflowFailClosure.
+   */
+  private async planWorkflowFailFromSettle(
+    command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
+  ): Promise<{ statements: SqlStatement[]; changes: ChangeRecord[] }> {
+    const empty = { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] };
+    const disposition = command.turn.disposition;
+    const finishedAt = command.turn.finishedAt ?? new Date().toISOString();
+
+    // Explicit workflow_fail disposition on a successful settle.
+    if (
+      disposition
+      && disposition.kind === 'workflow_fail'
+      && command.turn.status === 'succeeded'
+    ) {
+      const node = await this.lookupWorkflowNodeForTask(command.task.id);
+      if (!node) return empty;
+      return this.planWorkflowFailClosure({
+        runId: node.runId,
+        reasonCode: 'agent_fail',
+        reasonText: boundWorkflowFailReason(disposition.reason),
+        at: finishedAt,
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
+    }
+
+    // Run-timeout termination on a non-success settle still closes the workflow run.
+    if (command.turn.termination?.kind === 'run_timeout') {
+      const node = await this.lookupWorkflowNodeForTask(command.task.id);
+      if (!node) return empty;
+      return this.planWorkflowFailClosure({
+        runId: node.runId,
+        reasonCode: 'run_timeout',
+        at: finishedAt,
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
+    }
+
+    return empty;
+  }
+
+  /**
+   * M018 S05: host-clamped feedback/turn budget exhaustion closes the run failed.
+   * Counts existing rows only — no schema column.
+   */
+  private async planWorkflowBudgetExhaustionIfNeeded(
+    command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
+  ): Promise<{ statements: SqlStatement[]; changes: ChangeRecord[] }> {
+    const empty = { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] };
+    const node = await this.lookupWorkflowNodeForTask(command.task.id);
+    if (!node) return empty;
+
+    const run = await this.db.get<{ run_id: string; status: string }>(
+      `SELECT run_id, status FROM workflow_runs
+        WHERE workspace_id = ? AND run_id = ?`,
+      [this.workspaceId, node.runId],
+    );
+    if (!run || run.status !== 'running') return empty;
+
+    const budgets = clampWorkflowRunBudgets();
+    const roundCount = await this.db.get<{ c: number }>(
+      `SELECT COUNT(*) AS c FROM workflow_feedback_rounds
+        WHERE workspace_id = ? AND run_id = ?`,
+      [this.workspaceId, node.runId],
+    );
+    if ((roundCount?.c ?? 0) > budgets.maxFeedbackRoundsPerRun) {
+      return this.planWorkflowFailClosure({
+        runId: node.runId,
+        reasonCode: 'feedback_budget_exhausted',
+        at: command.turn.finishedAt ?? new Date().toISOString(),
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
+    }
+
+    // Count engine-triggered workflow turns across all node tasks for this run.
+    const taskIds = await this.db.all<{ task_id: string }>(
+      `SELECT task_id FROM workflow_nodes
+        WHERE workspace_id = ? AND run_id = ? AND task_id IS NOT NULL`,
+      [this.workspaceId, node.runId],
+    );
+    const ids = taskIds.map((r) => r.task_id).filter((id): id is string => typeof id === 'string' && id.length > 0);
+    if (ids.length === 0) return empty;
+    const placeholders = ids.map(() => '?').join(',');
+    const turnCount = await this.db.get<{ c: number }>(
+      `SELECT COUNT(*) AS c FROM turns
+        WHERE workspace_id = ? AND task_id IN (${placeholders}) AND trigger = 'engine'`,
+      [this.workspaceId, ...ids],
+    );
+    if ((turnCount?.c ?? 0) > budgets.maxWorkflowTurnsPerRun) {
+      return this.planWorkflowFailClosure({
+        runId: node.runId,
+        reasonCode: 'turn_budget_exhausted',
+        at: command.turn.finishedAt ?? new Date().toISOString(),
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
+    }
+    return empty;
+  }
+
+  private async lookupWorkflowNodeForTask(
+    taskId: string,
+  ): Promise<{ runId: string; nodeId: string } | undefined> {
+    const row = await this.db.get<{ run_id: string; node_id: string }>(
+      `SELECT run_id, node_id FROM workflow_nodes
+        WHERE workspace_id = ? AND task_id = ?`,
+      [this.workspaceId, taskId],
+    );
+    if (!row || typeof row.run_id !== 'string' || typeof row.node_id !== 'string') {
+      return undefined;
+    }
+    return { runId: row.run_id, nodeId: row.node_id };
+  }
+
+  /**
+   * M018 S05 / §20.11 / D052: single atomic fail-fast closure primitive.
+   * One terminal run transition, close open gates+rounds, cancel reserved-not-running
+   * turns, interrupt running scope under existing rules, one bounded attention per
+   * still-open node task, never seals task lifecycle. Idempotent on non-running runs.
+   */
+  private async planWorkflowFailClosure(input: {
+    runId: string;
+    reasonCode: WorkflowFailReasonCode;
+    reasonText?: string;
+    at: string;
+    sourceTaskId?: string;
+    sourceTurnId?: string;
+  }): Promise<{ statements: SqlStatement[]; changes: ChangeRecord[] }> {
+    const empty = { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] };
+    const run = await this.db.get<{ run_id: string; status: string }>(
+      `SELECT run_id, status FROM workflow_runs
+        WHERE workspace_id = ? AND run_id = ?`,
+      [this.workspaceId, input.runId],
+    );
+    if (!run || run.status !== 'running') {
+      return empty;
+    }
+
+    const terminalStatus = workflowRunTerminalStatusForReason(input.reasonCode);
+    const attentionCode = workflowRunAttentionCode(terminalStatus);
+    const fenceId = deriveRunClosureFenceId(input.runId, terminalStatus);
+    const existingFence = await this.db.get<{ message_id: string }>(
+      `SELECT message_id FROM workflow_routed_messages
+        WHERE workspace_id = ? AND run_id = ? AND message_id = ?`,
+      [this.workspaceId, input.runId, fenceId],
+    );
+    if (existingFence) {
+      return empty;
+    }
+
+    const statements: SqlStatement[] = [
+      {
+        sql: `INSERT INTO workflow_routed_messages (
+                workspace_id, run_id, message_id, source_node_id, destination_node_id,
+                kind, body_json, created_at
+              ) VALUES (?,?,?,?,?,?,?,?)
+              ON CONFLICT(workspace_id, run_id, message_id) DO NOTHING`,
+        params: [
+          this.workspaceId,
+          input.runId,
+          fenceId,
+          'engine',
+          'engine',
+          'run_closure',
+          encodePayload({
+            kind: 'run_closure',
+            schema: 1,
+            reasonCode: input.reasonCode,
+            terminalStatus,
+          }),
+          input.at,
+        ],
+      },
+      {
+        sql: `UPDATE workflow_runs
+                SET status = ?
+              WHERE workspace_id = ? AND run_id = ? AND status = 'running'`,
+        params: [terminalStatus, this.workspaceId, input.runId],
+      },
+      {
+        sql: `UPDATE workflow_dependency_gates
+                SET status = ?
+              WHERE workspace_id = ? AND run_id = ? AND status = 'open'`,
+        params: [terminalStatus, this.workspaceId, input.runId],
+      },
+      {
+        sql: `UPDATE workflow_feedback_rounds
+                SET status = ?
+              WHERE workspace_id = ? AND run_id = ? AND status = 'open'`,
+        params: [terminalStatus, this.workspaceId, input.runId],
+      },
+    ];
+    const changes: ChangeRecord[] = [];
+
+    const nodeRows = await this.db.all<{ task_id: string | null }>(
+      `SELECT task_id FROM workflow_nodes
+        WHERE workspace_id = ? AND run_id = ?`,
+      [this.workspaceId, input.runId],
+    );
+    const taskIds = nodeRows
+      .map((r) => r.task_id)
+      .filter((id): id is string => typeof id === 'string' && id.length > 0);
+
+    if (taskIds.length > 0) {
+      const tasks = await this.listTasksByIds(taskIds);
+      const attentionMessage = (
+        input.reasonText
+          ? `${input.reasonCode}: ${input.reasonText}`
+          : input.reasonCode
+      ).slice(0, 512);
+      for (const task of tasks) {
+        if (isTerminalLifecycle(task.lifecycle)) continue;
+        const nextTask = {
+          ...task,
+          attention: {
+            code: attentionCode,
+            message: attentionMessage,
+            at: input.at,
+          },
+          updatedAt: input.at,
+          revision: task.revision + 1,
+        };
+        statements.push(taskStatement(this.workspaceId, nextTask, true));
+        changes.push({ kind: 'task', id: task.id, change: 'effect' });
+      }
+
+      for (const taskId of taskIds) {
+        const turns = await this.listTurns(taskId);
+        for (const turn of turns) {
+          if (input.sourceTurnId && turn.id === input.sourceTurnId) continue;
+          if (turn.status === 'queued') {
+            statements.push({
+              sql: `UPDATE turns
+                      SET status = 'cancelled', settled_at = ?
+                    WHERE workspace_id = ? AND id = ? AND status = 'queued'`,
+              params: [input.at, this.workspaceId, turn.id],
+            });
+            changes.push({ kind: 'turn', id: turn.id, taskId: turn.taskId, change: 'effect' });
+          } else if (LIVE_TURN_STATUSES.has(turn.status)) {
+            statements.push(
+              cancelRequestStatement(this.workspaceId, {
+                kind: 'putCancelRequest',
+                workspaceId: this.workspaceId,
+                turnId: turn.id,
+                request: {
+                  kind: 'interrupt',
+                  by: 'workflow_fail_closure',
+                  opId: fenceId,
+                  at: input.at,
+                  reason: input.reasonCode,
+                },
+              }),
+            );
+            changes.push({ kind: 'cancel_request', id: turn.id, change: 'put' });
+          }
+        }
+      }
+    }
+
+    return { statements, changes };
+  }
+
 
   private async applyRetention(
     command:

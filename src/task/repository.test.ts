@@ -1926,4 +1926,184 @@ describe('SqliteTaskRepository', () => {
     }
   }, 20_000);
 
+
+
+
+
+
+  it('M018 S05 fail-fast closure: workflow_fail closes run once, sets attention, leaves lifecycle open', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-s05-fail-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      await client.run(
+        `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at) VALUES (?,?,?,?,?)`,
+        ['ws', 's05-fail', 'S05 Fail', 'now', 'now'],
+      );
+      const repository = new SqliteTaskRepository(client, 'ws');
+      const createdAt = '2026-07-20T00:00:00.000Z';
+      const topology = {
+        kind: 'one_node_v1' as const,
+        nodes: [{ nodeId: 'entry' }],
+        entryNodeId: 'entry',
+      };
+      const def = await repository.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-s05',
+        version: 1,
+        name: 's05-one',
+        topology,
+        createdAt,
+      });
+      expect(def.ok).toBe(true);
+      const start = await repository.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: 'ws',
+        definitionId: 'wf-s05',
+        version: 1,
+        startIdempotencyKey: 's05-fail-1',
+        createdAt,
+        goal: 's05 fail goal',
+        backend: 'grok',
+      });
+      expect(start.ok).toBe(true);
+      const data = start.operation?.result?.data as {
+        runId: string;
+        entryTaskId: string;
+        activationTurnId: string;
+      };
+      expect(data.runId).toBeTruthy();
+
+      // Promote queued -> running via direct SQL (S04 settleSucceeded pattern).
+      const finishedAt = '2026-07-20T00:00:01.000Z';
+      await client.run(
+        `UPDATE turns SET status = 'running', started_at = ?, settled_at = NULL WHERE workspace_id = ? AND id = ?`,
+        [createdAt, 'ws', data.activationTurnId],
+      );
+      const task = await repository.getTask(data.entryTaskId);
+      const turn = await repository.getTurn(data.activationTurnId);
+      expect(task).toBeTruthy();
+      expect(turn).toBeTruthy();
+
+      const settle = await repository.execute({
+        kind: 'settleTurnAndApplyEffects',
+        workspaceId: 'ws',
+        expectedTaskRevision: task!.revision,
+        task: { ...task!, updatedAt: finishedAt },
+        turn: {
+          ...turn!,
+          status: 'succeeded',
+          finishedAt,
+          disposition: { kind: 'workflow_fail', reason: 'agent gave up' },
+        },
+        expectedStatuses: ['running'],
+        relatedTurns: [],
+        messages: [],
+      });
+      expect(settle.ok).toBe(true);
+      expect(settle.changed).toBe(true);
+
+      const runRows = await client.all<{ status: string }>(
+        'SELECT status FROM workflow_runs WHERE workspace_id = ? AND run_id = ?',
+        ['ws', data.runId],
+      );
+      expect(runRows[0]?.status).toBe('failed');
+
+      const after = await repository.getTask(data.entryTaskId);
+      expect(after?.lifecycle).toBe('open');
+      expect(after?.attention?.code).toBe('workflow_run_failed');
+      expect(String(after?.attention?.message ?? '')).toMatch(/agent_fail/);
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('M018 S05 invalid PREV route closes run failed with workflow_run_failed attention', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-s05-prev-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      await client.run(
+        `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at) VALUES (?,?,?,?,?)`,
+        ['ws', 's05-prev', 'S05 Prev', 'now', 'now'],
+      );
+      const repository = new SqliteTaskRepository(client, 'ws');
+      const createdAt = '2026-07-20T00:00:00.000Z';
+      const topology = {
+        kind: 'one_node_v1' as const,
+        nodes: [{ nodeId: 'entry' }],
+        entryNodeId: 'entry',
+      };
+      const def = await repository.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-s05-prev',
+        version: 1,
+        name: 's05-prev',
+        topology,
+        createdAt,
+      });
+      expect(def.ok).toBe(true);
+      const start = await repository.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: 'ws',
+        definitionId: 'wf-s05-prev',
+        version: 1,
+        startIdempotencyKey: 's05-prev-1',
+        createdAt,
+        goal: 's05 prev invalid',
+        backend: 'grok',
+      });
+      expect(start.ok).toBe(true);
+      const data = start.operation?.result?.data as {
+        runId: string;
+        entryTaskId: string;
+        activationTurnId: string;
+      };
+
+      const finishedAt = '2026-07-20T00:00:01.000Z';
+      await client.run(
+        `UPDATE turns SET status = 'running', started_at = ?, settled_at = NULL WHERE workspace_id = ? AND id = ?`,
+        [createdAt, 'ws', data.activationTurnId],
+      );
+      const task = await repository.getTask(data.entryTaskId);
+      const turn = await repository.getTurn(data.activationTurnId);
+      expect(task).toBeTruthy();
+      expect(turn).toBeTruthy();
+
+      const settle = await repository.execute({
+        kind: 'settleTurnAndApplyEffects',
+        workspaceId: 'ws',
+        expectedTaskRevision: task!.revision,
+        task: { ...task!, updatedAt: finishedAt },
+        turn: {
+          ...turn!,
+          status: 'succeeded',
+          finishedAt,
+          // Entry PREV with no direct producers -> invalid_route fail closure.
+          disposition: { kind: 'workflow_prev', targets: 'all' },
+        },
+        expectedStatuses: ['running'],
+        relatedTurns: [],
+        messages: [],
+      });
+      expect(settle.ok).toBe(true);
+      const runRows = await client.all<{ status: string }>(
+        'SELECT status FROM workflow_runs WHERE workspace_id = ? AND run_id = ?',
+        ['ws', data.runId],
+      );
+      expect(runRows[0]?.status).toBe('failed');
+      const after = await repository.getTask(data.entryTaskId);
+      expect(after?.lifecycle).toBe('open');
+      expect(after?.attention?.code).toBe('workflow_run_failed');
+      expect(String(after?.attention?.message ?? '')).toMatch(/invalid_route/);
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+
 });

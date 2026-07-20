@@ -152,6 +152,8 @@ export type TaskAttentionCode =
    * rewritten here by store schema v7 and is never set by new settle paths.
    */
   | 'awaiting_parent_seal'
+  | 'workflow_run_failed'
+  | 'workflow_run_cancelled'
   /** Child is waiting for parent answers (wakeable for parent). */
   | 'awaiting_parent_answer'
   /** Parent has a durable child question to answer. */

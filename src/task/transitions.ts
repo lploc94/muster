@@ -83,7 +83,7 @@ const SETTLED_TURN_STATUSES: ReadonlySet<TurnStatus> = new Set([
   'cancelled',
 ]);
 
-const LIVE_TURN_STATUSES: ReadonlySet<TurnStatus> = new Set(['running', 'waiting_user']);
+export const LIVE_TURN_STATUSES: ReadonlySet<TurnStatus> = new Set(['running', 'waiting_user']);
 
 export function isTerminalLifecycle(state: TaskLifecycleState): boolean {
   return TERMINAL_LIFECYCLES.has(state);
