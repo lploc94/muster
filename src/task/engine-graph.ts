@@ -2213,6 +2213,33 @@ export async function executeToolCommand(
       return { ok: true, result: { staged: true } };
     }
 
+    case 'workflow_next': {
+      // M018 S02: stage workflow_next disposition. Does not seal lifecycle; gate
+      // contribution is owned by the repository commit path (T04).
+      const staged = await executeGraphCommand(deps, 'workflowNextGraphTask', (draft) => {
+        const turn = draft.turns[ctx.turnId];
+        if (!turn) return { ok: false, reason: 'turn not found' };
+        const result = stageDisposition(
+          turn,
+          {
+            kind: 'workflow_next',
+            change: command.change,
+            ...(command.result !== undefined ? { result: command.result } : {}),
+          },
+          command.opId,
+          {
+            limits: { maxResult: limits.maxResultBytes, maxError: limits.maxErrorBytes },
+          },
+        );
+        if (!result.ok) return result;
+        draft.turns[ctx.turnId] = result.next.turn;
+        writeLedger(draft, ctx.turnId, command.opId, fingerprint, { ok: true, data: { staged: true } });
+        return { ok: true };
+      });
+      if (!staged.ok) return { ok: false, error: staged.error };
+      return { ok: true, result: { staged: true } };
+    }
+
     case 'report_progress':
       return { ok: true, result: { noted: command.note.slice(0, 512) } };
 

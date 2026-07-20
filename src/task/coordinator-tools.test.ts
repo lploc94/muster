@@ -276,6 +276,101 @@ describe('coordinator-tools dispatch', () => {
     expect(result).toEqual({ ok: false, toolError: 'opId is required' });
   });
 
+  it('maps define_workflow and start_workflow to ToolCommands and rejects malformed payloads', () => {
+    const topology = {
+      kind: 'one_node_v1',
+      entryNodeId: 'entry',
+      nodes: [{ nodeId: 'entry' }],
+    };
+    const defined = dispatch(
+      'define_workflow',
+      {
+        opId: 'op-def-1',
+        definitionId: 'wf-one',
+        version: 1,
+        name: 'one-node',
+        topology,
+      },
+      ctx(['define_workflow']),
+    );
+    expect(defined).toEqual({
+      ok: true,
+      command: {
+        kind: 'define_workflow',
+        opId: 'op-def-1',
+        definitionId: 'wf-one',
+        version: 1,
+        name: 'one-node',
+        topology,
+      },
+    });
+
+    const started = dispatch(
+      'start_workflow',
+      {
+        opId: 'op-start-1',
+        definitionId: 'wf-one',
+        version: 1,
+        startIdempotencyKey: 'idem-1',
+        goal: 'run one-node',
+        backend: 'grok',
+      },
+      ctx(['start_workflow']),
+    );
+    expect(started).toEqual({
+      ok: true,
+      command: {
+        kind: 'start_workflow',
+        opId: 'op-start-1',
+        definitionId: 'wf-one',
+        version: 1,
+        startIdempotencyKey: 'idem-1',
+        goal: 'run one-node',
+        backend: 'grok',
+      },
+    });
+
+    const unauthorized = dispatch(
+      'define_workflow',
+      {
+        opId: 'op-def-2',
+        definitionId: 'wf-one',
+        version: 1,
+        name: 'one-node',
+        topology,
+      },
+      ctx(['complete_task']),
+    );
+    expect(unauthorized).toEqual({
+      ok: false,
+      toolError: 'action not permitted: define_workflow',
+    });
+
+    const missingKey = dispatch(
+      'start_workflow',
+      {
+        opId: 'op-start-2',
+        definitionId: 'wf-one',
+        version: 1,
+      },
+      ctx(['start_workflow']),
+    );
+    expect(missingKey.ok).toBe(false);
+
+    const badTopology = dispatch(
+      'define_workflow',
+      {
+        opId: 'op-def-3',
+        definitionId: 'wf-one',
+        version: 1,
+        name: 'one-node',
+        topology: { kind: 'two_node_v1' },
+      },
+      ctx(['define_workflow']),
+    );
+    expect(badTopology.ok).toBe(false);
+  });
+
   it('rejects action outside allowedActions', () => {
     const result = dispatch(
       'create_task',
@@ -837,5 +932,52 @@ describe('parseDependency requiredVerdict', () => {
       ctx(['create_task']),
     );
     expect(result).toEqual({ ok: false, toolError: 'invalid create_task arguments' });
+  });
+});
+
+describe('workflow_next tool surface', () => {
+  it('maps workflow_next with change and optional result', () => {
+    const withBody = dispatch(
+      'workflow_next',
+      { opId: 'op-n1', change: 'updated', result: 'producer body' },
+      ctx(['workflow_next']),
+    );
+    expect(withBody).toEqual({
+      ok: true,
+      command: {
+        kind: 'workflow_next',
+        opId: 'op-n1',
+        change: 'updated',
+        result: 'producer body',
+      },
+    });
+
+    const unchanged = dispatch(
+      'workflow_next',
+      { opId: 'op-n2', change: 'unchanged' },
+      ctx(['workflow_next']),
+    );
+    expect(unchanged).toEqual({
+      ok: true,
+      command: { kind: 'workflow_next', opId: 'op-n2', change: 'unchanged' },
+    });
+  });
+
+  it('rejects missing/invalid change and unauthorized callers', () => {
+    expect(
+      dispatch('workflow_next', { opId: 'op-n', change: 'maybe' }, ctx(['workflow_next'])),
+    ).toEqual({ ok: false, toolError: 'change must be "updated" or "unchanged"' });
+
+    expect(
+      dispatch('workflow_next', { opId: 'op-n' }, ctx(['workflow_next'])),
+    ).toEqual({ ok: false, toolError: 'change is required' });
+
+    expect(
+      dispatch(
+        'workflow_next',
+        { opId: 'op-n', change: 'updated' },
+        ctx(['complete_task']),
+      ),
+    ).toEqual({ ok: false, toolError: 'action not permitted: workflow_next' });
   });
 });

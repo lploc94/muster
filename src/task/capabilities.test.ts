@@ -65,4 +65,39 @@ describe('capabilitiesFor', () => {
     expect(caps.has('set_task_lifecycle')).toBe(true);
     expect(caps.has('answer_child_question')).toBe(true);
   });
+
+  it('grants define_workflow and start_workflow via create_child to coordinators only', () => {
+    const coordinator = capabilitiesFor({
+      role: 'coordinator',
+      capabilities: ['create_child'],
+      parentId: null,
+    });
+    expect(coordinator.has('define_workflow')).toBe(true);
+    expect(coordinator.has('start_workflow')).toBe(true);
+
+    const worker = capabilitiesFor({
+      role: 'worker',
+      capabilities: ['create_child'],
+      parentId: 'root',
+    });
+    expect(worker.has('define_workflow')).toBe(false);
+    expect(worker.has('start_workflow')).toBe(false);
+  });
+
+  it('grants workflow_next to any task role (does not require create_child)', () => {
+    const worker = capabilitiesFor({
+      role: 'worker',
+      capabilities: [],
+      parentId: 'root',
+    });
+    expect(worker.has('workflow_next')).toBe(true);
+    expect(worker.has('complete_task')).toBe(true);
+
+    const coordinator = capabilitiesFor({
+      role: 'coordinator',
+      capabilities: [],
+      parentId: null,
+    });
+    expect(coordinator.has('workflow_next')).toBe(true);
+  });
 });

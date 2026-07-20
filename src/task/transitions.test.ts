@@ -497,6 +497,40 @@ describe('applySuccessfulTurn', () => {
     }
   });
 
+  it('workflow_next settles turn without sealing lifecycle (root or child)', () => {
+    for (const parentId of [null, 'root-1'] as const) {
+      const taskId = parentId === null ? 'task-1' : 'child-1';
+      const staged = {
+        ...running,
+        taskId,
+        disposition: {
+          kind: 'workflow_next' as const,
+          change: 'updated' as const,
+          result: 'producer output',
+        },
+      };
+      const result = applySuccessfulTurn(
+        baseTask({ id: taskId, parentId }),
+        staged,
+        { now: NOW },
+      );
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.next.task.lifecycle).toBe('open');
+      expect(result.next.task.sealedBy).toBeUndefined();
+      expect(result.next.task.taskResult).toBeUndefined();
+      expect(result.next.task.outcomeProposal).toBeUndefined();
+      expect(result.next.turn.status).toBe('succeeded');
+      expect(result.next.turn.finishedAt).toBe(NOW);
+      // Disposition retained for the repository commit path (T04 gate contribution).
+      expect(result.next.turn.disposition).toEqual({
+        kind: 'workflow_next',
+        change: 'updated',
+        result: 'producer output',
+      });
+    }
+  });
+
   it('idle disposition on child sets awaiting_parent_seal with completionCandidate without sealing', () => {
     const result = applySuccessfulTurn(
       baseTask({ id: 'child-1', parentId: 'root-1' }),
@@ -1085,6 +1119,90 @@ describe('stageDisposition rejections', () => {
         {},
       ),
     ).toEqual({ ok: false, reason: 'stageDisposition requires a live turn' });
+  });
+
+  it('stages workflow_next idempotently by opId and requires limits', () => {
+    const live = turn({ id: 't1', status: 'running', sequence: 1 });
+    const limits = { maxResult: 1024, maxError: 1024 };
+    expect(
+      stageDisposition(live, { kind: 'workflow_next', change: 'updated' }, 'op-next', {}),
+    ).toEqual({
+      ok: false,
+      reason: 'limits are required for complete, fail, or workflow_next dispositions',
+    });
+
+    const first = stageDisposition(
+      live,
+      { kind: 'workflow_next', change: 'updated', result: 'body' },
+      'op-next',
+      { limits },
+    );
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    expect(first.next.turn.disposition).toEqual({
+      kind: 'workflow_next',
+      change: 'updated',
+      result: 'body',
+    });
+
+    // Same opId + same disposition is idempotent.
+    const replay = stageDisposition(
+      first.next.turn,
+      { kind: 'workflow_next', change: 'updated', result: 'body' },
+      'op-next',
+      { acceptedOpId: 'op-next', limits },
+    );
+    expect(replay.ok).toBe(true);
+    if (!replay.ok) return;
+    expect(replay.next.turn.disposition).toEqual(first.next.turn.disposition);
+
+    // Same opId + different disposition fails closed.
+    expect(
+      stageDisposition(
+        first.next.turn,
+        { kind: 'workflow_next', change: 'unchanged' },
+        'op-next',
+        { acceptedOpId: 'op-next', limits },
+      ),
+    ).toEqual({ ok: false, reason: 'same opId with different disposition' });
+
+    // Different opId after staging fails closed.
+    expect(
+      stageDisposition(
+        first.next.turn,
+        { kind: 'workflow_next', change: 'updated', result: 'body' },
+        'op-other',
+        { limits },
+      ),
+    ).toEqual({ ok: false, reason: 'disposition already staged with a different opId' });
+  });
+
+  it('applyFailedTurn and interruptTurn discard staged workflow_next', () => {
+    const live = turn({
+      id: 't1',
+      status: 'running',
+      sequence: 1,
+      disposition: { kind: 'workflow_next', change: 'updated', result: 'body' },
+    });
+    const failed = applyFailedTurn(baseTask(), live, {
+      error: 'boom',
+      retryCount: 0,
+      policy: defaultPolicy,
+      onExhausted: 'recover',
+      now: NOW,
+    });
+    expect(failed.ok).toBe(true);
+    if (failed.ok) {
+      expect(failed.next.turn.disposition).toBeUndefined();
+      expect(failed.next.task.lifecycle).toBe('open');
+    }
+
+    const interrupted = interruptTurn(live, { now: NOW });
+    expect(interrupted.ok).toBe(true);
+    if (interrupted.ok) {
+      expect(interrupted.next.disposition).toBeUndefined();
+      expect(interrupted.next.status).toBe('interrupted');
+    }
   });
 });
 

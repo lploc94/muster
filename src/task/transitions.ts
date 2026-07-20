@@ -614,6 +614,25 @@ export function applySuccessfulTurn(
         },
         effects,
       };
+    case 'workflow_next': {
+      // M018 S02 / §20.6: NEXT settles the turn successfully but never seals the
+      // producer lifecycle. Gate contribution / aggregate activation is owned by
+      // the repository commit path (T04). Keep disposition on the settled turn
+      // so the commit path can read change + optional body.
+      return {
+        ok: true,
+        next: {
+          task: bumpTask(task, options.now, {
+            outcomeProposal: undefined,
+          }),
+          turn: {
+            ...succeededTurn,
+            disposition: turn.disposition,
+          },
+        },
+        effects,
+      };
+    }
     default: {
       const _exhaustive: never = disposition;
       return _exhaustive;
@@ -1293,6 +1312,12 @@ function dispositionsEqual(a: TurnDisposition, b: TurnDisposition): boolean {
       );
     case 'idle':
       return b.kind === 'idle';
+    case 'workflow_next':
+      return (
+        b.kind === 'workflow_next' &&
+        a.change === b.change &&
+        (a.result ?? undefined) === (b.result ?? undefined)
+      );
     default: {
       const _exhaustive: never = a;
       return _exhaustive;
@@ -1314,6 +1339,14 @@ function boundDisposition(
       };
     case 'fail':
       return { kind: 'fail', error: truncateUtf8Bytes(disposition.error, limits.maxError).text };
+    case 'workflow_next':
+      return {
+        kind: 'workflow_next',
+        change: disposition.change,
+        ...(disposition.result !== undefined
+          ? { result: truncateUtf8Bytes(disposition.result, limits.maxResult).text }
+          : {}),
+      };
     default:
       return disposition;
   }
@@ -1329,9 +1362,16 @@ export function stageDisposition(
     return { ok: false, reason: 'stageDisposition requires a live turn' };
   }
 
-  if (disposition.kind === 'complete' || disposition.kind === 'fail') {
+  if (
+    disposition.kind === 'complete' ||
+    disposition.kind === 'fail' ||
+    disposition.kind === 'workflow_next'
+  ) {
     if (!options.limits) {
-      return { ok: false, reason: 'limits are required for complete or fail dispositions' };
+      return {
+        ok: false,
+        reason: 'limits are required for complete, fail, or workflow_next dispositions',
+      };
     }
   }
 

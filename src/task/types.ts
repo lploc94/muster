@@ -419,7 +419,13 @@ export type TurnDisposition =
   | { kind: 'complete'; result: string; verdict?: TaskVerdict }
   | { kind: 'fail'; error: string }
   | { kind: 'wait_tasks'; taskIds: string[] }
-  | { kind: 'idle' };
+  | { kind: 'idle' }
+  /**
+   * M018 S02: route a workflow node result forward (NEXT). Mutually exclusive with
+   * complete/fail/wait/idle. Staging never seals lifecycle; gate contribution is
+   * owned by the repository commit path (T04). Agent supplies only change + optional body.
+   */
+  | { kind: 'workflow_next'; change: 'updated' | 'unchanged'; result?: string };
 /**
  * Durable ACP boundary phase for a live/settled turn (Phase C).
  * Written before side-effecting `session/prompt`; used for reload classification.

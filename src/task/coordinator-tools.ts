@@ -146,6 +146,13 @@ export type ToolCommand =
   | { kind: 'list_task_types' }
   | { kind: 'complete_task'; opId: string; result: string; verdict?: VerdictInput }
   | { kind: 'fail_task'; opId: string; error: string }
+  /** M018 S02: stage workflow NEXT (change + optional body; engine owns identities). */
+  | {
+      kind: 'workflow_next';
+      opId: string;
+      change: 'updated' | 'unchanged';
+      result?: string;
+    }
   | { kind: 'report_progress'; opId: string; note: string }
   | { kind: 'ask_user'; opId: string; questions: Question[] }
   | { kind: 'ask_parent'; opId: string; questions: Question[] }
@@ -199,6 +206,7 @@ const MUTATING_TOOLS: ReadonlySet<string> = new Set([
   'wait_for_tasks',
   'complete_task',
   'fail_task',
+  'workflow_next',
   'report_progress',
   'ask_parent',
   'answer_child_question',
@@ -225,6 +233,7 @@ function toolActionForName(name: string): ToolAction | undefined {
     'list_task_types',
     'complete_task',
     'fail_task',
+    'workflow_next',
     'report_progress',
       'ask_parent',
     'answer_child_question',
@@ -909,6 +918,32 @@ export function dispatch(
           return { ok: false, toolError: 'error is required' };
         }
         return { ok: true, command: { kind: 'fail_task', opId, error } };
+      }
+      case 'workflow_next': {
+        const change = requireString(args, 'change');
+        if (!change) {
+          return { ok: false, toolError: 'change is required' };
+        }
+        if (change !== 'updated' && change !== 'unchanged') {
+          return { ok: false, toolError: 'change must be "updated" or "unchanged"' };
+        }
+        let result: string | undefined;
+        if (Object.prototype.hasOwnProperty.call(args, 'result')) {
+          const r = requireString(args, 'result');
+          if (!r) {
+            return { ok: false, toolError: 'result must be a string when provided' };
+          }
+          result = r;
+        }
+        return {
+          ok: true,
+          command: {
+            kind: 'workflow_next',
+            opId,
+            change,
+            ...(result !== undefined ? { result } : {}),
+          },
+        };
       }
       case 'report_progress': {
         const note = requireString(args, 'note');

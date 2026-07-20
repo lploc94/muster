@@ -87,6 +87,7 @@ const ALL_TOOLS: ToolAction[] = [
   'get_host_context',
   'complete_task',
   'fail_task',
+  'workflow_next',
   'report_progress',
   'ask_parent',
   'answer_child_question',
@@ -427,6 +428,16 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
     },
     additionalProperties: false,
   },
+  workflow_next: {
+    type: 'object',
+    required: ['opId', 'change'],
+    properties: {
+      opId: OP_ID,
+      change: { type: 'string', enum: ['updated', 'unchanged'] },
+      result: { type: 'string' },
+    },
+    additionalProperties: false,
+  },
   report_progress: {
     type: 'object',
     required: ['opId', 'note'],
@@ -615,6 +626,8 @@ function createMcpServer(options: CreateMcpServerOptions): McpServer {
                           ? "Parent-seal a direct child's lifecycle (succeeded/failed/…). Use when child did not complete_task."
                           : name === 'upsert_presentation'
                             ? 'Open or refresh a read-only IDE tab with Markdown (```mermaid``` fences supported). REQUIRED when the user asks to plan/spec for review or when a plan is ready: pass the full plan as markdown — do not only paste it in chat. Args: presentationId (stable, e.g. plan-<taskId>), ownerTaskId (must equal self.taskId), opId (unique per call), revision (1 then ++), title, markdown, optional kind (plan|spec|document), optional summary. Never send sourcePath, sourceFolderUri, updatedAt, or rootId (host-owned).'
+                            : name === 'workflow_next'
+                              ? 'Stage a workflow NEXT disposition on the live turn: routes this node result forward without sealing lifecycle. Provide change=updated|unchanged and optional result body. Engine owns gate/artifact identities. Committed only when the adapter settles the turn successfully.'
                             : name === 'define_workflow'
                               ? 'Persist an immutable one-node workflow definition version. Same definitionId+version+fingerprint replays; differing fingerprint fails closed. Topology is frozen one_node_v1 only for S01.'
                               : name === 'start_workflow'
