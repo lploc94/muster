@@ -1,5 +1,5 @@
 /**
- * Workflow domain boundary for M018 S01.
+ * Workflow domain boundary for M018.
  * Owns topology validation, define/start result shaping, and identity derivation;
  * repository owns CAS writes.
  */
@@ -13,28 +13,35 @@ import {
 import type {
   DefineWorkflowInput,
   DefineWorkflowResult,
+  GraphTopologyV1,
   StartWorkflowIdentities,
   StartWorkflowInput,
   StartWorkflowResult,
   WorkflowDefinitionV1,
+  WorkflowTopologyV1,
 } from './workflow-types';
 
 export {
   decodeDefineWorkflowInput,
+  decodeGraphTopology,
   decodeOneNodeTopology,
   decodeStoredTopologyJson,
+  decodeTopology,
   encodeTopologyJson,
   fingerprintWorkflowDefinition,
 } from './workflow-codec';
 export type {
   DefineWorkflowInput,
   DefineWorkflowResult,
+  GraphTopologyV1,
   OneNodeTopologyV1,
   StartWorkflowIdentities,
   StartWorkflowInput,
   StartWorkflowResult,
   WorkflowDefinitionV1,
+  WorkflowDependencyEdgeV1,
   WorkflowNodeSpecV1,
+  WorkflowTopologyV1,
 } from './workflow-types';
 
 /** Operations ledger key for an immutable definition claim. */
@@ -133,6 +140,60 @@ export function makeOneNodeDefinition(overrides?: {
     },
     createdAt: overrides?.createdAt ?? '2026-07-19T00:00:00.000Z',
   };
+}
+
+/** Helper for tests/fixtures: two producers → one consumer fan-in graph_v1. */
+export function makeGraphFanInDefinition(overrides?: {
+  definitionId?: string;
+  version?: number;
+  name?: string;
+  createdAt?: string;
+  producer1?: string;
+  producer2?: string;
+  consumer?: string;
+  inputRef1?: string;
+  inputRef2?: string;
+}): WorkflowDefinitionV1 {
+  const p1 = overrides?.producer1 ?? 'p1';
+  const p2 = overrides?.producer2 ?? 'p2';
+  const consumer = overrides?.consumer ?? 'consumer';
+  const topology: GraphTopologyV1 = {
+    kind: 'graph_v1',
+    nodes: [{ nodeId: p1 }, { nodeId: p2 }, { nodeId: consumer }],
+    edges: [
+      { fromNodeId: p1, toNodeId: consumer, inputRef: overrides?.inputRef1 ?? 'from_p1' },
+      { fromNodeId: p2, toNodeId: consumer, inputRef: overrides?.inputRef2 ?? 'from_p2' },
+    ],
+  };
+  return {
+    definitionId: overrides?.definitionId ?? 'wf-fan',
+    version: overrides?.version ?? 1,
+    name: overrides?.name ?? 'fan-in',
+    topology,
+    createdAt: overrides?.createdAt ?? '2026-07-19T00:00:00.000Z',
+  };
+}
+
+/** Entry node ids: one_node entry, or graph nodes with no incoming edges. */
+export function entryNodeIds(topology: WorkflowTopologyV1): string[] {
+  if (topology.kind === 'one_node_v1') {
+    return [topology.entryNodeId];
+  }
+  const incoming = new Set(topology.edges.map((e) => e.toNodeId));
+  return topology.nodes.map((n) => n.nodeId).filter((id) => !incoming.has(id));
+}
+
+/** Sole terminal node id (out-degree 0). Throws if topology is invalid (should not after decode). */
+export function terminalNodeId(topology: WorkflowTopologyV1): string {
+  if (topology.kind === 'one_node_v1') {
+    return topology.entryNodeId;
+  }
+  const outgoing = new Set(topology.edges.map((e) => e.fromNodeId));
+  const terminals = topology.nodes.map((n) => n.nodeId).filter((id) => !outgoing.has(id));
+  if (terminals.length !== 1) {
+    throw new Error(`expected exactly one terminal, found ${terminals.length}`);
+  }
+  return terminals[0]!;
 }
 
 /** Fingerprint helper re-export for callers that already hold a definition. */

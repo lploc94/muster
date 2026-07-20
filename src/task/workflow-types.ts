@@ -1,13 +1,13 @@
 /**
- * Workflow domain types for M018 S01 one-node definitions.
+ * Workflow domain types for M018 workflow definitions.
  * Topology and identity live here; repository owns durable claim/write.
  * Never carries database paths, SQL, credentials, prompt text, or artifact bodies.
  */
 
-/** S01 supports only the frozen one-node topology shape. */
-export type WorkflowTopologyKind = 'one_node_v1';
+/** Supported frozen topology kinds. */
+export type WorkflowTopologyKind = 'one_node_v1' | 'graph_v1';
 
-/** A single ordinary workflow node (entry + only node for S01). */
+/** A single ordinary workflow node (entry + only node for one_node_v1). */
 export interface WorkflowNodeSpecV1 {
   /** Stable node id within the definition (not a task id). */
   nodeId: string;
@@ -19,20 +19,45 @@ export interface WorkflowNodeSpecV1 {
 
 /**
  * Canonical one-node topology. Exactly one node; entryNodeId must equal that node.
- * No edges, gates, or routes in S01 — those arrive in later slices.
+ * No edges — multi-node routes live on graph_v1.
  */
 export interface OneNodeTopologyV1 {
-  kind: WorkflowTopologyKind;
+  kind: 'one_node_v1';
   nodes: readonly [WorkflowNodeSpecV1];
   entryNodeId: string;
 }
+
+/**
+ * Forward dependency edge: producer → consumer gate fill by destination inputRef.
+ * inputRefs are unique among edges into the same toNodeId (per-consumer).
+ */
+export interface WorkflowDependencyEdgeV1 {
+  fromNodeId: string;
+  toNodeId: string;
+  /** Destination gate input ref frozen on the definition. */
+  inputRef: string;
+}
+
+/**
+ * Multi-node graph topology (S02+).
+ * N >= 2 nodes; each non-terminal has exactly one outgoing edge; exactly one terminal;
+ * acyclic; per-consumer inputRefs unique. Entry nodes are those with no incoming edges.
+ */
+export interface GraphTopologyV1 {
+  kind: 'graph_v1';
+  nodes: readonly WorkflowNodeSpecV1[];
+  edges: readonly WorkflowDependencyEdgeV1[];
+}
+
+/** Union of supported frozen topologies. */
+export type WorkflowTopologyV1 = OneNodeTopologyV1 | GraphTopologyV1;
 
 /** Immutable workflow definition identity + topology. */
 export interface WorkflowDefinitionV1 {
   definitionId: string;
   version: number;
   name: string;
-  topology: OneNodeTopologyV1;
+  topology: WorkflowTopologyV1;
   createdAt: string;
 }
 

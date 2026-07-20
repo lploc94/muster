@@ -27,6 +27,7 @@ import {
   startWorkflowReplay,
   validateDefineWorkflow,
   validateStartWorkflow,
+  entryNodeIds,
   type DefineWorkflowResult,
   type StartWorkflowResult,
 } from './workflow';
@@ -3003,7 +3004,7 @@ export class SqliteTaskRepository implements TaskRepository {
         definition.definitionId,
         definition.version,
         definition.name,
-        definition.topology.entryNodeId,
+        entryNodeIds(definition.topology)[0]!,
         topologyJson,
         definition.createdAt,
       ],
@@ -3115,7 +3116,7 @@ export class SqliteTaskRepository implements TaskRepository {
     }
 
     const topology = decodeStoredTopologyJson(defRow.topology_json);
-    if (!topology.ok || topology.topology.entryNodeId !== defRow.entry_node_id) {
+    if (!topology.ok || topology.topology.kind !== 'one_node_v1' || topology.topology.entryNodeId !== defRow.entry_node_id) {
       const shaped = startWorkflowInvalid(
         'invalid start',
         command.definitionId,

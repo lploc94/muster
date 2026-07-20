@@ -1,14 +1,19 @@
 import { describe, expect, it } from 'vitest';
 import {
+  decodeGraphTopology,
   decodeOneNodeTopology,
   decodeStoredTopologyJson,
+  decodeTopology,
   defineWorkflowConflict,
   defineWorkflowCreated,
   defineWorkflowInvalid,
   defineWorkflowLedgerKey,
   defineWorkflowReplay,
+  entryNodeIds,
   fingerprintDefinition,
+  makeGraphFanInDefinition,
   makeOneNodeDefinition,
+  terminalNodeId,
   validateDefineWorkflow,
 } from './workflow';
 
@@ -24,7 +29,10 @@ describe('workflow domain (one-node define)', () => {
     });
     expect(validated.ok).toBe(true);
     if (!validated.ok) return;
-    expect(validated.definition.topology.entryNodeId).toBe('entry');
+    expect(validated.definition.topology.kind).toBe('one_node_v1');
+    if (validated.definition.topology.kind === 'one_node_v1') {
+      expect(validated.definition.topology.entryNodeId).toBe('entry');
+    }
     expect(validated.fingerprint).toBe(fingerprintDefinition(def));
     expect(validated.topologyJson).toContain('one_node_v1');
     const again = validateDefineWorkflow({
@@ -92,5 +100,168 @@ describe('workflow domain (one-node define)', () => {
       ok: false, conflict: true, reason: 'invalid topology',
     });
     expect(defineWorkflowLedgerKey('wf-one', 1)).toBe('define_workflow:wf-one:1');
+  });
+});
+
+describe('workflow domain (graph_v1 multi-node topology)', () => {
+  it('accepts a two-producer fan-in graph and fingerprints stably', () => {
+    const def = makeGraphFanInDefinition();
+    const validated = validateDefineWorkflow({
+      definitionId: def.definitionId,
+      version: def.version,
+      name: def.name,
+      topology: def.topology,
+      createdAt: def.createdAt,
+    });
+    expect(validated.ok).toBe(true);
+    if (!validated.ok) return;
+    expect(validated.definition.topology.kind).toBe('graph_v1');
+    if (validated.definition.topology.kind !== 'graph_v1') return;
+    expect(validated.definition.topology.nodes).toHaveLength(3);
+    expect(validated.definition.topology.edges).toHaveLength(2);
+    expect(entryNodeIds(validated.definition.topology).sort()).toEqual(['p1', 'p2']);
+    expect(terminalNodeId(validated.definition.topology)).toBe('consumer');
+    expect(validated.fingerprint).toBe(fingerprintDefinition(def));
+    expect(validated.topologyJson).toContain('graph_v1');
+    expect(validated.topologyJson).toContain('inputRef');
+
+    // Fingerprint ignores createdAt and is stable under edge reorder.
+    const reordered = makeGraphFanInDefinition();
+    if (reordered.topology.kind !== 'graph_v1') return;
+    const edges = [...reordered.topology.edges].reverse();
+    const nodes = [...reordered.topology.nodes].reverse();
+    const again = validateDefineWorkflow({
+      definitionId: reordered.definitionId,
+      version: reordered.version,
+      name: reordered.name,
+      topology: { kind: 'graph_v1', nodes, edges },
+      createdAt: '2099-01-01T00:00:00.000Z',
+    });
+    expect(again.ok && again.fingerprint).toBe(validated.fingerprint);
+  });
+
+  it('rejects fan-out, cycles, duplicate inputRef, missing route-to-gate, and terminal count', () => {
+    const baseNodes = [
+      { nodeId: 'p1' },
+      { nodeId: 'p2' },
+      { nodeId: 'consumer' },
+    ];
+
+    // Fan-out: non-terminal with two outgoing routes.
+    const fanOut = decodeGraphTopology({
+      kind: 'graph_v1',
+      nodes: [...baseNodes, { nodeId: 'c2' }],
+      edges: [
+        { fromNodeId: 'p1', toNodeId: 'consumer', inputRef: 'a' },
+        { fromNodeId: 'p1', toNodeId: 'c2', inputRef: 'b' },
+        { fromNodeId: 'p2', toNodeId: 'consumer', inputRef: 'c' },
+      ],
+    });
+    expect(fanOut.ok).toBe(false);
+    if (!fanOut.ok) expect(fanOut.reason).toMatch(/fan-out/i);
+
+    // Cycle.
+    const cycle = decodeGraphTopology({
+      kind: 'graph_v1',
+      nodes: [{ nodeId: 'a' }, { nodeId: 'b' }],
+      edges: [
+        { fromNodeId: 'a', toNodeId: 'b', inputRef: 'in' },
+        { fromNodeId: 'b', toNodeId: 'a', inputRef: 'back' },
+      ],
+    });
+    expect(cycle.ok).toBe(false);
+    if (!cycle.ok) expect(cycle.reason).toMatch(/cycle/i);
+
+    // Duplicate inputRef on the same consumer.
+    const dup = decodeGraphTopology({
+      kind: 'graph_v1',
+      nodes: baseNodes,
+      edges: [
+        { fromNodeId: 'p1', toNodeId: 'consumer', inputRef: 'same' },
+        { fromNodeId: 'p2', toNodeId: 'consumer', inputRef: 'same' },
+      ],
+    });
+    expect(dup.ok).toBe(false);
+    if (!dup.ok) expect(dup.reason).toMatch(/duplicate inputRef/i);
+
+    // Missing route-to-gate: empty inputRef.
+    const missingRoute = decodeGraphTopology({
+      kind: 'graph_v1',
+      nodes: baseNodes,
+      edges: [
+        { fromNodeId: 'p1', toNodeId: 'consumer', inputRef: 'a' },
+        { fromNodeId: 'p2', toNodeId: 'consumer', inputRef: '' },
+      ],
+    });
+    expect(missingRoute.ok).toBe(false);
+    if (!missingRoute.ok) expect(missingRoute.reason).toMatch(/route-to-gate|inputRef/i);
+
+    // Zero terminals: every node has an outgoing edge (implies cycle or multi-component loop).
+    const zeroTerminal = decodeGraphTopology({
+      kind: 'graph_v1',
+      nodes: [{ nodeId: 'a' }, { nodeId: 'b' }],
+      edges: [
+        { fromNodeId: 'a', toNodeId: 'b', inputRef: 'x' },
+        { fromNodeId: 'b', toNodeId: 'a', inputRef: 'y' },
+      ],
+    });
+    expect(zeroTerminal.ok).toBe(false);
+
+    // Multiple terminals: two nodes with no outgoing route.
+    const multiTerminal = decodeGraphTopology({
+      kind: 'graph_v1',
+      nodes: baseNodes,
+      edges: [
+        { fromNodeId: 'p1', toNodeId: 'consumer', inputRef: 'a' },
+        // p2 has no outgoing → second terminal alongside consumer
+      ],
+    });
+    expect(multiTerminal.ok).toBe(false);
+    if (!multiTerminal.ok) expect(multiTerminal.reason).toMatch(/terminal/i);
+
+    // Unknown edge endpoint.
+    const unknown = decodeGraphTopology({
+      kind: 'graph_v1',
+      nodes: baseNodes,
+      edges: [
+        { fromNodeId: 'p1', toNodeId: 'consumer', inputRef: 'a' },
+        { fromNodeId: 'ghost', toNodeId: 'consumer', inputRef: 'b' },
+      ],
+    });
+    expect(unknown.ok).toBe(false);
+
+    // one_node_v1 decoder still rejects graph_v1 shape; union decoder accepts both.
+    expect(decodeOneNodeTopology(makeGraphFanInDefinition().topology).ok).toBe(false);
+    expect(decodeTopology(makeGraphFanInDefinition().topology).ok).toBe(true);
+    expect(decodeTopology(makeOneNodeDefinition().topology).ok).toBe(true);
+    expect(decodeStoredTopologyJson(JSON.stringify(makeGraphFanInDefinition().topology)).ok).toBe(true);
+  });
+
+  it('define path freezes graph_v1 without persisting rows on invalid shapes', () => {
+    const valid = validateDefineWorkflow({
+      definitionId: 'wf-fan',
+      version: 1,
+      name: 'fan-in',
+      topology: makeGraphFanInDefinition().topology,
+      createdAt: '2026-07-19T00:00:00.000Z',
+    });
+    expect(valid.ok).toBe(true);
+
+    const invalid = validateDefineWorkflow({
+      definitionId: 'wf-fan',
+      version: 1,
+      name: 'fan-in',
+      topology: {
+        kind: 'graph_v1',
+        nodes: [{ nodeId: 'a' }, { nodeId: 'b' }, { nodeId: 'c' }],
+        edges: [
+          { fromNodeId: 'a', toNodeId: 'c', inputRef: 'x' },
+          { fromNodeId: 'a', toNodeId: 'b', inputRef: 'y' }, // fan-out
+        ],
+      },
+      createdAt: '2026-07-19T00:00:00.000Z',
+    });
+    expect(invalid.ok).toBe(false);
+    if (!invalid.ok) expect(invalid.reason).toMatch(/fan-out/i);
   });
 });
