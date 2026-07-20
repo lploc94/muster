@@ -307,7 +307,9 @@ function tryOpenExistingCurrent(
       assertCurrentSchemaComplete(db);
       return 'current';
     }
-    if (userVersion === SCHEMA_V7 && SCHEMA_V7 !== SQLITE_SCHEMA_VERSION) {
+    // Compare via Number so the v7 migration branch stays reachable when the
+    // compiled current schema advances past SCHEMA_V7 (literal 7 vs 8).
+    if (userVersion === SCHEMA_V7 && Number(SCHEMA_V7) !== Number(SQLITE_SCHEMA_VERSION)) {
       assertOwnedV7SchemaComplete(db);
       return 'migrate_v7';
     }
@@ -327,7 +329,7 @@ function tryOpenExistingCurrent(
     if (
       appAgain === MUSTER_APPLICATION_ID &&
       verAgain === SCHEMA_V7 &&
-      SCHEMA_V7 !== SQLITE_SCHEMA_VERSION
+      Number(SCHEMA_V7) !== Number(SQLITE_SCHEMA_VERSION)
     ) {
       assertOwnedV7SchemaComplete(db);
       return 'migrate_v7';

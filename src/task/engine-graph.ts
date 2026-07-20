@@ -2390,16 +2390,20 @@ export async function executeToolCommand(
         createdAt: now,
       });
       if (defined.conflict || !defined.operation?.result?.ok) {
+        const opError =
+          defined.operation?.result && !defined.operation.result.ok
+            ? defined.operation.result.error
+            : undefined;
         return {
           ok: false,
-          error:
-            defined.reason ??
-            (defined.operation?.result && !defined.operation.result.ok
-              ? defined.operation.result.error
-              : 'define_workflow failed'),
+          error: defined.reason ?? opError ?? 'define_workflow failed',
         };
       }
-      const data = defined.operation.result.data;
+      const definedOp = defined.operation?.result;
+      if (!definedOp || !definedOp.ok) {
+        return { ok: false, error: defined.reason ?? 'define_workflow failed' };
+      }
+      const data = definedOp.data;
       await deps.repository.execute({
         kind: 'putOperation',
         workspaceId: deps.workspaceId,
@@ -2422,16 +2426,20 @@ export async function executeToolCommand(
         ...(command.backend !== undefined ? { backend: command.backend } : {}),
       });
       if (started.conflict || !started.operation?.result?.ok) {
+        const opError =
+          started.operation?.result && !started.operation.result.ok
+            ? started.operation.result.error
+            : undefined;
         return {
           ok: false,
-          error:
-            started.reason ??
-            (started.operation?.result && !started.operation.result.ok
-              ? started.operation.result.error
-              : 'start_workflow failed'),
+          error: started.reason ?? opError ?? 'start_workflow failed',
         };
       }
-      const data = started.operation.result.data as {
+      const startedOp = started.operation?.result;
+      if (!startedOp || !startedOp.ok) {
+        return { ok: false, error: started.reason ?? 'start_workflow failed' };
+      }
+      const data = startedOp.data as {
         activationTurnId?: string;
         entryTaskId?: string;
         [key: string]: unknown;

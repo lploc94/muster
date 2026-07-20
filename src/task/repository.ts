@@ -127,6 +127,7 @@ export type GraphCommandKind =
   | 'waitForChildTasks'
   | 'completeGraphTask'
   | 'failGraphTask'
+  | 'workflowNextGraphTask'
   | 'askParent'
   | 'answerChildQuestion'
   | 'consumeCancelRequest';
@@ -462,12 +463,17 @@ export function isGraphCommand(command: RepositoryCommand): command is GraphComm
     command.kind === 'cancelChildTasks' || command.kind === 'interruptChildTask' ||
     command.kind === 'cancelChildTask' || command.kind === 'setChildTaskLifecycle' ||
     command.kind === 'waitForChildTasks' || command.kind === 'completeGraphTask' ||
-    command.kind === 'failGraphTask' || command.kind === 'askParent' ||
+    command.kind === 'failGraphTask' || command.kind === 'workflowNextGraphTask' ||
+    command.kind === 'askParent' ||
     command.kind === 'answerChildQuestion' || command.kind === 'consumeCancelRequest';
 }
 
 export interface RepositoryCommandResult {
-  ok: true;
+  /**
+   * True for applied/replayed commands; false for fail-closed domain conflicts
+   * (e.g. define/start workflow fingerprint or validation failures).
+   */
+  ok: boolean;
   changed?: boolean;
   /** A non-secret, UI-safe denial reason for a conditional command. */
   reason?: string;
@@ -2101,6 +2107,7 @@ export class SqliteTaskRepository implements TaskRepository {
       case 'waitForChildTasks':
       case 'completeGraphTask':
       case 'failGraphTask':
+      case 'workflowNextGraphTask':
       case 'askParent':
       case 'answerChildQuestion':
       case 'consumeCancelRequest':

@@ -100,11 +100,14 @@ export function defineWorkflowReplay(
   };
 }
 
+/** Fail branch of DefineWorkflowResult (helpers always return ok:false). */
+type DefineWorkflowFailure = Extract<DefineWorkflowResult, { ok: false }>;
+
 /** Shape a conflict (same key, different fingerprint). */
 export function defineWorkflowConflict(
   definitionId: string,
   version: number,
-): DefineWorkflowResult {
+): DefineWorkflowFailure {
   return {
     ok: false,
     conflict: true,
@@ -117,7 +120,7 @@ export function defineWorkflowConflict(
 /** Shape a validation failure without partial rows. */
 export function defineWorkflowInvalid(
   reason: 'invalid topology' | 'invalid identity',
-): DefineWorkflowResult {
+): DefineWorkflowFailure {
   return { ok: false, conflict: true, reason };
 }
 
@@ -510,11 +513,14 @@ export function startWorkflowReplay(
   };
 }
 
+/** Fail branch of StartWorkflowResult (helpers always return ok:false). */
+type StartWorkflowFailure = Extract<StartWorkflowResult, { ok: false }>;
+
 /** Shape a start conflict (same key, different fingerprint). */
 export function startWorkflowConflict(
   definitionId?: string,
   version?: number,
-): StartWorkflowResult {
+): StartWorkflowFailure {
   return {
     ok: false,
     conflict: true,
@@ -529,7 +535,7 @@ export function startWorkflowInvalid(
   reason: 'definition not found' | 'invalid start' | 'invalid identity',
   definitionId?: string,
   version?: number,
-): StartWorkflowResult {
+): StartWorkflowFailure {
   return {
     ok: false,
     conflict: true,
