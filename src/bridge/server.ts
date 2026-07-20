@@ -491,28 +491,70 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
       version: { type: 'integer', minimum: 1 },
       name: { type: 'string', minLength: 1, maxLength: 200 },
       topology: {
-        type: 'object',
-        required: ['kind', 'entryNodeId', 'nodes'],
-        properties: {
-          kind: { type: 'string', enum: ['one_node_v1'] },
-          entryNodeId: OP_ID,
-          nodes: {
-            type: 'array',
-            minItems: 1,
-            maxItems: 1,
-            items: {
-              type: 'object',
-              required: ['nodeId'],
-              properties: {
-                nodeId: OP_ID,
-                label: { type: 'string', minLength: 1, maxLength: 200 },
-                role: { type: 'string', enum: ['coordinator', 'worker'] },
+        oneOf: [
+          {
+            type: 'object',
+            required: ['kind', 'entryNodeId', 'nodes'],
+            properties: {
+              kind: { type: 'string', enum: ['one_node_v1'] },
+              entryNodeId: OP_ID,
+              nodes: {
+                type: 'array',
+                minItems: 1,
+                maxItems: 1,
+                items: {
+                  type: 'object',
+                  required: ['nodeId'],
+                  properties: {
+                    nodeId: OP_ID,
+                    label: { type: 'string', minLength: 1, maxLength: 200 },
+                    role: { type: 'string', enum: ['coordinator', 'worker'] },
+                  },
+                  additionalProperties: false,
+                },
               },
-              additionalProperties: false,
             },
+            additionalProperties: false,
           },
-        },
-        additionalProperties: false,
+          {
+            type: 'object',
+            required: ['kind', 'nodes', 'edges'],
+            properties: {
+              kind: { type: 'string', enum: ['graph_v1'] },
+              nodes: {
+                type: 'array',
+                minItems: 2,
+                maxItems: 32,
+                items: {
+                  type: 'object',
+                  required: ['nodeId'],
+                  properties: {
+                    nodeId: OP_ID,
+                    label: { type: 'string', minLength: 1, maxLength: 200 },
+                    role: { type: 'string', enum: ['coordinator', 'worker'] },
+                  },
+                  additionalProperties: false,
+                },
+              },
+              edges: {
+                type: 'array',
+                minItems: 1,
+                maxItems: 64,
+                items: {
+                  type: 'object',
+                  required: ['fromNodeId', 'toNodeId', 'inputRef'],
+                  properties: {
+                    fromNodeId: OP_ID,
+                    toNodeId: OP_ID,
+                    inputRef: { type: 'string', minLength: 1, maxLength: 128 },
+                  },
+                  additionalProperties: false,
+                },
+              },
+            },
+            additionalProperties: false,
+          },
+        ],
       },
     },
     additionalProperties: false,
@@ -629,7 +671,7 @@ function createMcpServer(options: CreateMcpServerOptions): McpServer {
                             : name === 'workflow_next'
                               ? 'Stage a workflow NEXT disposition on the live turn: routes this node result forward without sealing lifecycle. Provide change=updated|unchanged and optional result body. Engine owns gate/artifact identities. Committed only when the adapter settles the turn successfully.'
                             : name === 'define_workflow'
-                              ? 'Persist an immutable one-node workflow definition version. Same definitionId+version+fingerprint replays; differing fingerprint fails closed. Topology is frozen one_node_v1 only for S01.'
+                              ? 'Persist an immutable workflow definition version (one_node_v1 or graph_v1 fan-in). Same definitionId+version+fingerprint replays; differing fingerprint fails closed. Domain validation is fail-closed for topology shape.'
                               : name === 'start_workflow'
                                 ? 'Idempotently start a frozen top-level workflow run. Claims startIdempotencyKey and creates exactly one ordinary queued entry turn when the entry gate is satisfied. Agents never supply run/task/turn/gate IDs.'
                           : `Muster coordinator tool: ${name}`,

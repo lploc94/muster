@@ -245,20 +245,49 @@ function toolActionForName(name: string): ToolAction | undefined {
 }
 
 /** Light MCP topology shape check; domain validateDefineWorkflow is authoritative. */
+function parseWorkflowNode(value: unknown): boolean {
+  if (!isRecord(value) || typeof value.nodeId !== 'string' || value.nodeId.length === 0) {
+    return false;
+  }
+  if (value.label !== undefined && typeof value.label !== 'string') return false;
+  if (value.role !== undefined && value.role !== 'coordinator' && value.role !== 'worker') {
+    return false;
+  }
+  return true;
+}
+
 function parseOneNodeTopology(value: unknown): unknown | undefined {
   if (!isRecord(value)) return undefined;
   if (value.kind !== 'one_node_v1') return undefined;
   if (typeof value.entryNodeId !== 'string' || value.entryNodeId.length === 0) return undefined;
   if (!Array.isArray(value.nodes) || value.nodes.length !== 1) return undefined;
-  const node = value.nodes[0];
-  if (!isRecord(node) || typeof node.nodeId !== 'string' || node.nodeId.length === 0) {
-    return undefined;
+  if (!parseWorkflowNode(value.nodes[0])) return undefined;
+  return value;
+}
+
+/** Light MCP graph_v1 shape check; domain validateDefineWorkflow is authoritative. */
+function parseGraphTopology(value: unknown): unknown | undefined {
+  if (!isRecord(value)) return undefined;
+  if (value.kind !== 'graph_v1') return undefined;
+  if (!Array.isArray(value.nodes) || value.nodes.length < 2) return undefined;
+  if (!Array.isArray(value.edges) || value.edges.length === 0) return undefined;
+  for (const node of value.nodes) {
+    if (!parseWorkflowNode(node)) return undefined;
   }
-  if (node.label !== undefined && typeof node.label !== 'string') return undefined;
-  if (node.role !== undefined && node.role !== 'coordinator' && node.role !== 'worker') {
-    return undefined;
+  for (const edge of value.edges) {
+    if (!isRecord(edge)) return undefined;
+    if (typeof edge.fromNodeId !== 'string' || edge.fromNodeId.length === 0) return undefined;
+    if (typeof edge.toNodeId !== 'string' || edge.toNodeId.length === 0) return undefined;
+    if (typeof edge.inputRef !== 'string' || edge.inputRef.length === 0) return undefined;
   }
   return value;
+}
+
+function parseDefineTopology(value: unknown): unknown | undefined {
+  if (!isRecord(value)) return undefined;
+  if (value.kind === 'one_node_v1') return parseOneNodeTopology(value);
+  if (value.kind === 'graph_v1') return parseGraphTopology(value);
+  return undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1064,7 +1093,7 @@ export function dispatch(
         ) {
           return { ok: false, toolError: 'invalid define_workflow arguments' };
         }
-        const topology = parseOneNodeTopology(args.topology);
+        const topology = parseDefineTopology(args.topology);
         if (!topology) {
           return { ok: false, toolError: 'invalid define_workflow arguments' };
         }
