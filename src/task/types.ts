@@ -446,6 +446,25 @@ export type TurnDisposition =
   | {
       kind: 'workflow_fail';
       reason?: string;
+    }
+  /**
+   * M018 S06: invoke a child workflow as the mutually exclusive turn disposition.
+   * Mutually exclusive with complete/fail/wait/idle/workflow_next/workflow_prev/workflow_fail.
+   * Staging never seals lifecycle; child run + continuation are owned by repository settle (T02).
+   * Agent supplies child definition identity, entry bindings, and optional start key only.
+   */
+  | {
+      kind: 'invoke_child_workflow';
+      childDefinitionId: string;
+      childDefinitionVersion: number;
+      /** Map caller-owned artifacts onto frozen child entry-gate inputRefs. */
+      entryBindings: readonly {
+        inputRef: string;
+        /** Caller artifact id (engine-owned; validated at settle against caller run). */
+        artifactId: string;
+      }[];
+      /** Optional start idempotency key; engine may derive when omitted. */
+      childIdempotencyKey?: string;
     };
 /**
  * Durable ACP boundary phase for a live/settled turn (Phase C).

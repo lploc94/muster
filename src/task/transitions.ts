@@ -667,6 +667,23 @@ export function applySuccessfulTurn(
         effects,
       };
     }
+    case 'invoke_child_workflow': {
+      // M018 S06: child invocation settles the turn successfully but never seals
+      // lifecycle. Child run + continuation are owned by repository (T02).
+      return {
+        ok: true,
+        next: {
+          task: bumpTask(task, options.now, {
+            outcomeProposal: undefined,
+          }),
+          turn: {
+            ...succeededTurn,
+            disposition: turn.disposition,
+          },
+        },
+        effects,
+      };
+    }
     default: {
       const _exhaustive: never = disposition;
       return _exhaustive;
@@ -1367,6 +1384,25 @@ function dispositionsEqual(a: TurnDisposition, b: TurnDisposition): boolean {
         b.kind === 'workflow_fail' &&
         (a.reason ?? undefined) === (b.reason ?? undefined)
       );
+    case 'invoke_child_workflow': {
+      if (b.kind !== 'invoke_child_workflow') return false;
+      if (
+        a.childDefinitionId !== b.childDefinitionId ||
+        a.childDefinitionVersion !== b.childDefinitionVersion ||
+        (a.childIdempotencyKey ?? undefined) !== (b.childIdempotencyKey ?? undefined) ||
+        a.entryBindings.length !== b.entryBindings.length
+      ) {
+        return false;
+      }
+      for (let i = 0; i < a.entryBindings.length; i++) {
+        const left = a.entryBindings[i]!;
+        const right = b.entryBindings[i]!;
+        if (left.inputRef !== right.inputRef || left.artifactId !== right.artifactId) {
+          return false;
+        }
+      }
+      return true;
+    }
     default: {
       const _exhaustive: never = a;
       return _exhaustive;
@@ -1414,6 +1450,19 @@ function boundDisposition(
           ? { reason: truncateUtf8Bytes(disposition.reason, limits.maxError).text }
           : {}),
       };
+    case 'invoke_child_workflow':
+      return {
+        kind: 'invoke_child_workflow',
+        childDefinitionId: disposition.childDefinitionId,
+        childDefinitionVersion: disposition.childDefinitionVersion,
+        entryBindings: disposition.entryBindings.map((b) => ({
+          inputRef: b.inputRef,
+          artifactId: b.artifactId,
+        })),
+        ...(disposition.childIdempotencyKey !== undefined
+          ? { childIdempotencyKey: disposition.childIdempotencyKey }
+          : {}),
+      };
     default:
       return disposition;
   }
@@ -1434,13 +1483,14 @@ export function stageDisposition(
     disposition.kind === 'fail' ||
     disposition.kind === 'workflow_next' ||
     disposition.kind === 'workflow_prev' ||
-    disposition.kind === 'workflow_fail'
+    disposition.kind === 'workflow_fail' ||
+    disposition.kind === 'invoke_child_workflow'
   ) {
     if (!options.limits) {
       return {
         ok: false,
         reason:
-          'limits are required for complete, fail, workflow_next, workflow_prev, or workflow_fail dispositions',
+          'limits are required for complete, fail, workflow_next, workflow_prev, workflow_fail, or invoke_child_workflow dispositions',
       };
     }
   }

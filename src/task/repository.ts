@@ -148,6 +148,7 @@ export type GraphCommandKind =
   | 'workflowNextGraphTask'
   | 'workflowPrevGraphTask'
   | 'workflowFailGraphTask'
+  | 'invokeChildGraphTask'
   | 'askParent'
   | 'answerChildQuestion'
   | 'consumeCancelRequest';
@@ -486,6 +487,7 @@ export function isGraphCommand(command: RepositoryCommand): command is GraphComm
     command.kind === 'failGraphTask' || command.kind === 'workflowNextGraphTask' ||
     command.kind === 'workflowPrevGraphTask' ||
     command.kind === 'workflowFailGraphTask' ||
+    command.kind === 'invokeChildGraphTask' ||
     command.kind === 'askParent' ||
     command.kind === 'answerChildQuestion' || command.kind === 'consumeCancelRequest';
 }
@@ -2132,6 +2134,7 @@ export class SqliteTaskRepository implements TaskRepository {
       case 'workflowNextGraphTask':
       case 'workflowPrevGraphTask':
       case 'workflowFailGraphTask':
+      case 'invokeChildGraphTask':
       case 'askParent':
       case 'answerChildQuestion':
       case 'consumeCancelRequest':

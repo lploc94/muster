@@ -198,3 +198,18 @@ export type StartWorkflowResult =
       definitionId?: string;
       version?: number;
     };
+
+
+/** M018 S06: agent-supplied entry binding for invoke_child_workflow (ids only). */
+export interface InvokeChildEntryBinding {
+  inputRef: string;
+  artifactId: string;
+}
+
+/** M018 S06: surface payload for staging invoke_child_workflow (no SQL/paths/bodies). */
+export interface InvokeChildWorkflowInput {
+  childDefinitionId: string;
+  childDefinitionVersion: number;
+  entryBindings: readonly InvokeChildEntryBinding[];
+  childIdempotencyKey?: string;
+}

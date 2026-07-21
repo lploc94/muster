@@ -166,6 +166,15 @@ export type ToolCommand =
       opId: string;
       reason?: string;
     }
+  /** M018 S06: stage child-workflow invocation (engine owns child run/continuation). */
+  | {
+      kind: 'invoke_child_workflow';
+      opId: string;
+      childDefinitionId: string;
+      childDefinitionVersion: number;
+      entryBindings: readonly { inputRef: string; artifactId: string }[];
+      childIdempotencyKey?: string;
+    }
   | { kind: 'report_progress'; opId: string; note: string }
   | { kind: 'ask_user'; opId: string; questions: Question[] }
   | { kind: 'ask_parent'; opId: string; questions: Question[] }
@@ -222,6 +231,7 @@ const MUTATING_TOOLS: ReadonlySet<string> = new Set([
   'workflow_next',
   'workflow_prev',
   'workflow_fail',
+  'invoke_child_workflow',
   'report_progress',
   'ask_parent',
   'answer_child_question',
@@ -251,6 +261,7 @@ function toolActionForName(name: string): ToolAction | undefined {
     'workflow_next',
     'workflow_prev',
     'workflow_fail',
+    'invoke_child_workflow',
     'report_progress',
       'ask_parent',
     'answer_child_question',
@@ -1046,6 +1057,67 @@ export function dispatch(
             kind: 'workflow_fail',
             opId,
             ...(reason !== undefined ? { reason } : {}),
+          },
+        };
+      }
+      case 'invoke_child_workflow': {
+        // Surface-only parse. Child run/continuation commit is repository-owned (T02).
+        const childDefinitionId = requireString(args, 'childDefinitionId');
+        if (!childDefinitionId) {
+          return { ok: false, toolError: 'childDefinitionId is required' };
+        }
+        if (
+          typeof args.childDefinitionVersion !== 'number' ||
+          !Number.isInteger(args.childDefinitionVersion) ||
+          args.childDefinitionVersion < 1
+        ) {
+          return { ok: false, toolError: 'childDefinitionVersion must be a positive integer' };
+        }
+        if (!Array.isArray(args.entryBindings) || args.entryBindings.length === 0) {
+          return { ok: false, toolError: 'entryBindings must be a non-empty array' };
+        }
+        const entryBindings: { inputRef: string; artifactId: string }[] = [];
+        const seenRefs = new Set<string>();
+        for (const entry of args.entryBindings) {
+          if (!isRecord(entry)) {
+            return { ok: false, toolError: 'entryBindings entries must be objects' };
+          }
+          const inputRef = typeof entry.inputRef === 'string' ? entry.inputRef : '';
+          const artifactId = typeof entry.artifactId === 'string' ? entry.artifactId : '';
+          if (!inputRef || !artifactId) {
+            return {
+              ok: false,
+              toolError: 'each entryBinding requires non-empty inputRef and artifactId',
+            };
+          }
+          if (seenRefs.has(inputRef)) {
+            return { ok: false, toolError: `duplicate entryBinding inputRef: ${inputRef}` };
+          }
+          seenRefs.add(inputRef);
+          entryBindings.push({ inputRef, artifactId });
+        }
+        let childIdempotencyKey: string | undefined;
+        if (Object.prototype.hasOwnProperty.call(args, 'childIdempotencyKey')) {
+          if (
+            typeof args.childIdempotencyKey !== 'string' ||
+            args.childIdempotencyKey.length === 0
+          ) {
+            return {
+              ok: false,
+              toolError: 'childIdempotencyKey must be a non-empty string when provided',
+            };
+          }
+          childIdempotencyKey = args.childIdempotencyKey;
+        }
+        return {
+          ok: true,
+          command: {
+            kind: 'invoke_child_workflow',
+            opId,
+            childDefinitionId,
+            childDefinitionVersion: args.childDefinitionVersion,
+            entryBindings,
+            ...(childIdempotencyKey !== undefined ? { childIdempotencyKey } : {}),
           },
         };
       }

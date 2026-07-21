@@ -563,6 +563,92 @@ export function boundWorkflowFailReason(reason: string | undefined): string | un
 
 
 /** Single outbound edge for a producer node (graph_v1 forbids fan-out). */
+
+/**
+ * M018 S06 child-workflow invocation / return identities (surface scaffolding only).
+ * Deterministic, run-scoped only — never prompt/result bodies, SQL, paths, or credentials.
+ * Repository commit of child runs/continuations is T02.
+ */
+
+/** Durable child_invocation fence id (caller turn stages once per child start key). */
+export function deriveChildInvocationFenceId(
+  callerRunId: string,
+  childDefinitionId: string,
+  childDefinitionVersion: number,
+  childIdempotencyKey: string,
+): string {
+  return stableId(
+    'wfrm',
+    `${callerRunId}\0child_invocation\0${childDefinitionId}\0${childDefinitionVersion}\0${childIdempotencyKey}`,
+  );
+}
+
+/** Durable child_return fence id (one resolution per child run). */
+export function deriveChildReturnFenceId(childRunId: string): string {
+  return stableId('wfrm', `${childRunId}\0child_return`);
+}
+
+/** Pending continuation id for a caller waiting on a child run. */
+export function deriveChildContinuationId(callerRunId: string, childRunId: string): string {
+  return stableId('wfcn', `${callerRunId}\0continuation\0${childRunId}`);
+}
+
+/** Caller return-gate id (one-result gate closed by child terminal NEXT). */
+export function deriveCallerReturnGateId(callerRunId: string, childRunId: string): string {
+  return stableId('wfg', `${callerRunId}\0return_gate\0${childRunId}`);
+}
+
+/** Caller resume turn id queued when the child returns. */
+export function deriveCallerResumeTurnId(callerRunId: string, childRunId: string): string {
+  return stableId('wftn', `${callerRunId}\0child_return_turn\0${childRunId}`);
+}
+
+/** Aggregate return message id on the caller task. */
+export function deriveCallerReturnMessageId(callerRunId: string, childRunId: string): string {
+  return stableId('wfm', `${callerRunId}\0child_return_message\0${childRunId}`);
+}
+
+/** Child run start key material (optional agent key or derived from caller turn). */
+export function deriveChildStartIdempotencyKey(input: {
+  callerRunId: string;
+  callerTurnId: string;
+  childDefinitionId: string;
+  childDefinitionVersion: number;
+  childIdempotencyKey?: string;
+}): string {
+  if (input.childIdempotencyKey && input.childIdempotencyKey.length > 0) {
+    return input.childIdempotencyKey;
+  }
+  return stableId(
+    'wfsk',
+    `${input.callerRunId}\0${input.callerTurnId}\0${input.childDefinitionId}\0${input.childDefinitionVersion}`,
+  );
+}
+
+/** Surface validation for invoke_child entry bindings (ids only; settle validates ownership). */
+export function validateInvokeChildEntryBindings(
+  entryBindings: readonly { inputRef: string; artifactId: string }[],
+): { ok: true } | { ok: false; reason: string } {
+  if (!Array.isArray(entryBindings) || entryBindings.length === 0) {
+    return { ok: false, reason: 'entryBindings must be non-empty' };
+  }
+  const seen = new Set<string>();
+  for (const b of entryBindings) {
+    if (!b || typeof b.inputRef !== 'string' || b.inputRef.length === 0) {
+      return { ok: false, reason: 'entryBinding inputRef required' };
+    }
+    if (typeof b.artifactId !== 'string' || b.artifactId.length === 0) {
+      return { ok: false, reason: 'entryBinding artifactId required' };
+    }
+    if (seen.has(b.inputRef)) {
+      return { ok: false, reason: `duplicate entryBinding inputRef: ${b.inputRef}` };
+    }
+    seen.add(b.inputRef);
+  }
+  return { ok: true };
+}
+
+
 export function outgoingEdge(
   topology: WorkflowTopologyV1,
   fromNodeId: string,

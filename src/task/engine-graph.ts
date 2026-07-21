@@ -2293,6 +2293,38 @@ export async function executeToolCommand(
       return { ok: true, result: { staged: true } };
     }
 
+    case 'invoke_child_workflow': {
+      // M018 S06: stage invoke_child_workflow disposition. Does not seal lifecycle;
+      // child run + continuation are owned by repository settle (T02).
+      const staged = await executeGraphCommand(deps, 'invokeChildGraphTask', (draft) => {
+        const turn = draft.turns[ctx.turnId];
+        if (!turn) return { ok: false, reason: 'turn not found' };
+        const result = stageDisposition(
+          turn,
+          {
+            kind: 'invoke_child_workflow',
+            childDefinitionId: command.childDefinitionId,
+            childDefinitionVersion: command.childDefinitionVersion,
+            entryBindings: command.entryBindings,
+            ...(command.childIdempotencyKey !== undefined
+              ? { childIdempotencyKey: command.childIdempotencyKey }
+              : {}),
+          },
+          command.opId,
+          {
+            limits: { maxResult: limits.maxResultBytes, maxError: limits.maxErrorBytes },
+          },
+        );
+        if (!result.ok) return result;
+        draft.turns[ctx.turnId] = result.next.turn;
+        writeLedger(draft, ctx.turnId, command.opId, fingerprint, { ok: true, data: { staged: true } });
+        return { ok: true };
+      });
+      if (!staged.ok) return { ok: false, error: staged.error };
+      return { ok: true, result: { staged: true } };
+    }
+
+
     case 'report_progress':
       return { ok: true, result: { noted: command.note.slice(0, 512) } };
 
