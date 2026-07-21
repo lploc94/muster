@@ -71,6 +71,11 @@ export interface AcpAdapterSpec {
   readonly errorPassthrough: readonly string[];
   /** Config option id used for model selection (default `'model'`); passed as `configId` to `session/set_config_option`. */
   readonly modelConfigId?: string;
+  /**
+   * OpenCode can flush session/update notifications after the session/prompt
+   * response. Wait for a bounded quiet window before emitting the terminal.
+   */
+  readonly lateUpdateDrainMs?: number;
 }
 
 /** Every ACP adapter advertises the same capabilities. */
@@ -274,7 +279,9 @@ export async function* runAcpTurn(
   options.signal?.addEventListener('abort', onAbort);
 
   const pendingUpdates: NormalizedEvent[] = [];
+  let updateVersion = 0;
   const bufferUpdate = (update: SessionUpdate) => {
+    updateVersion += 1;
     const mapped = mapSessionUpdate(update, messageId, spec);
     if (mapped) pendingUpdates.push(mapped);
   };
@@ -432,6 +439,43 @@ export async function* runAcpTurn(
         ]);
 
         if (race.kind === 'tick') continue;
+
+        while (pendingUpdates.length > 0) {
+          yield pendingUpdates.shift()!;
+        }
+
+        // OpenCode 1.2.x can resolve session/prompt before its final
+        // session/update notifications are flushed (upstream #17505). Keep
+        // the session sink registered through a bounded quiet window so late
+        // assistant chunks are not orphaned behind the terminal event.
+        const lateUpdateDrainMs = spec.lateUpdateDrainMs;
+        if (lateUpdateDrainMs !== undefined && lateUpdateDrainMs > 0) {
+          const waitForDrainTick = (): Promise<void> =>
+            new Promise((resolve) => {
+              let settled = false;
+              let timer: ReturnType<typeof setTimeout> | undefined;
+              const finish = () => {
+                if (settled) return;
+                settled = true;
+                if (timer) clearTimeout(timer);
+                options.signal?.removeEventListener('abort', finish);
+                resolve();
+              };
+              timer = setTimeout(finish, lateUpdateDrainMs);
+              if (isAborted()) finish();
+              else options.signal?.addEventListener('abort', finish, { once: true });
+            });
+          const deadline = Date.now() + lateUpdateDrainMs * 5;
+          let quietVersion = updateVersion;
+          while (Date.now() < deadline && !isAborted()) {
+            await waitForDrainTick();
+            if (isAborted() || updateVersion === quietVersion) break;
+            quietVersion = updateVersion;
+            while (pendingUpdates.length > 0) {
+              yield pendingUpdates.shift()!;
+            }
+          }
+        }
 
         while (pendingUpdates.length > 0) {
           yield pendingUpdates.shift()!;

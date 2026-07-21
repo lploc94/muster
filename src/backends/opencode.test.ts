@@ -86,6 +86,43 @@ describe('OpenCodeBackend.run — session + streaming', () => {
     expect(contents(events, 'reasoningDelta')).toEqual(['thinking']);
   });
 
+  it('drains OpenCode message chunks that arrive shortly after end_turn', async () => {
+    const events: NormalizedEvent[] = [];
+    const pump = (async () => {
+      for await (const event of new OpenCodeBackend().run(options())) events.push(event);
+    })();
+
+    await fake.readyP;
+    fake.push({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'M' } });
+    fake.resolve({ stopReason: 'end_turn' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    fake.push({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'USTER_SESSION_08' } });
+    await pump;
+
+    expect(contents(events, 'assistantDelta').join('')).toBe('MUSTER_SESSION_08');
+    expect(events.at(-1)).toEqual({ type: 'turnCompleted', meta: { stopReason: 'end_turn' } });
+  });
+
+  it('wakes the late-update drain immediately when cancellation arrives', async () => {
+    const controller = new AbortController();
+    const events: NormalizedEvent[] = [];
+    const pump = (async () => {
+      for await (const event of new OpenCodeBackend().run(options({ signal: controller.signal }))) {
+        events.push(event);
+      }
+    })();
+
+    await fake.readyP;
+    fake.resolve({ stopReason: 'end_turn' });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const abortedAt = Date.now();
+    controller.abort();
+    await pump;
+
+    expect(Date.now() - abortedAt).toBeLessThan(75);
+    expect(events.at(-1)).toMatchObject({ type: 'error', message: 'Turn cancelled', isCancellation: true });
+  });
+
   it('connects (with extraEnv) before opening a session, then passes cwd/prompt through', async () => {
     const extraEnv = { FOO: 'bar' };
     await runTurn(new OpenCodeBackend(), options({ prompt: 'do it', cwd: '/work', extraEnv }), fake, {});
