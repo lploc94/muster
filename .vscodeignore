@@ -24,6 +24,18 @@ playwright.config.ts
 vitest.config.ts
 *.vsix
 tsconfig.json
+plan.md
+
+# Workspace-local state, caches, and secrets
+.env
+.env.*
+.gsd*
+.gsd*/**
+.bg-shell/**
+Python/**
+NUL
+nul
+nul.*
 
 # Tests & spikes
 **/*.map

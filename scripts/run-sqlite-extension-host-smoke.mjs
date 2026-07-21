@@ -33,6 +33,15 @@ async function main() {
   }
 
   const zip = new AdmZip(vsixPath);
+  const packagedEntries = zip.getEntries().map((entry) => entry.entryName.replaceAll('\\', '/'));
+  const forbiddenPackageEntries = packagedEntries.filter((entry) =>
+    /(?:^|\/)(?:\.env(?:\..*)?|\.gsd(?:[./].*)?|\.bg-shell(?:\/.*)?|Python(?:\/.*)?|NUL)$/i.test(entry),
+  );
+  if (forbiddenPackageEntries.length > 0) {
+    throw new Error(
+      `VSIX contains workspace-local or secret files: ${forbiddenPackageEntries.slice(0, 10).join(', ')}`,
+    );
+  }
   const packagedWorker = 'extension/dist/src/task/sqlite/worker.js';
   const packagedClient = 'extension/dist/src/task/sqlite/client.js';
   const packagedSchema = 'extension/dist/src/task/sqlite/schema.js';
