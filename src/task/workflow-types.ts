@@ -213,3 +213,47 @@ export interface InvokeChildWorkflowInput {
   entryBindings: readonly InvokeChildEntryBinding[];
   childIdempotencyKey?: string;
 }
+
+/** M018 S07: bounded workflow status for get_task_status (no topology/prompts/bodies/paths). */
+export interface WorkflowGateStatusProjection {
+  gateId: string;
+  status: string;
+  /** Distinct filled inputRefs. */
+  satisfied: number;
+  /** Binding count (required inputs). */
+  required: number;
+}
+
+export interface WorkflowActiveFeedbackRoundProjection {
+  roundId: string;
+  status: string;
+  joinMode: string;
+}
+
+export interface WorkflowContinuationStatusProjection {
+  continuationId: string;
+  status: string;
+  kind: string;
+}
+
+/**
+ * Bounded workflow orchestration state for a task bound to a workflow node.
+ * Single-snapshot read: nodes → runs → gates/rounds/continuations.
+ * Strictly excludes topology, prompts, artifact bodies, secrets, and absolute paths.
+ */
+export interface WorkflowTaskStatusProjection {
+  runId: string;
+  definitionId: string;
+  definitionVersion: number;
+  runStatus: string;
+  /** Run origin: top_level | child (not a filesystem path). */
+  origin: string;
+  /** Parent workflow run id when origin is child. */
+  parentRunId?: string;
+  nodeId: string;
+  gates: readonly WorkflowGateStatusProjection[];
+  activeFeedbackRound?: WorkflowActiveFeedbackRoundProjection;
+  /** Active (pending) continuation for this run, if any. */
+  continuation?: WorkflowContinuationStatusProjection;
+}
+

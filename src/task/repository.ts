@@ -59,6 +59,7 @@ import {
   type DefineWorkflowResult,
   type StartWorkflowResult,
 } from './workflow';
+import type { WorkflowTaskStatusProjection } from './workflow-types';
 import { isMutatingTask, normalizedWritePaths } from './resources';
 import { canPromoteTurn } from './scheduler';
 import { DEFAULT_RESOURCE_LIMITS } from './limits';
@@ -632,6 +633,13 @@ export interface TaskRepository {
    * row offset. Returns explicit `gap` when the requested range is pruned.
    */
   getWorkspaceChangesSince(afterRevision: number, limit?: number): Promise<WorkspaceChangeFeedResult>;
+  /**
+   * M018 S07: bounded workflow status for a task bound to a workflow node.
+   * Single-snapshot join of nodes → runs → gates/rounds/continuations.
+   * Returns undefined when the task is not bound to a workflow node.
+   * Never includes topology, prompts, artifact bodies, secrets, or absolute paths.
+   */
+  getWorkflowStatusForTask(taskId: string): Promise<WorkflowTaskStatusProjection | undefined>;
   /**
    * Optional local-host read barrier supplied by the projection wrapper. The
    * callback runs between complete execute→refresh→publish lifecycles, so a
@@ -1662,6 +1670,127 @@ export class SqliteTaskRepository implements TaskRepository {
       revisions,
       hasMore,
     };
+  }
+
+  /**
+   * M018 S07: bounded workflow read projection for get_task_status.
+   * Joins workflow_nodes → workflow_runs → gates/rounds/continuations in one
+   * consistent multi-query snapshot (no topology/prompts/bodies/paths).
+   */
+  async getWorkflowStatusForTask(
+    taskId: string,
+  ): Promise<WorkflowTaskStatusProjection | undefined> {
+    if (typeof taskId !== 'string' || taskId.length === 0) {
+      return undefined;
+    }
+    const node = await this.db.get<{
+      run_id: string;
+      node_id: string;
+    }>(
+      `SELECT run_id, node_id FROM workflow_nodes
+        WHERE workspace_id = ? AND task_id = ?`,
+      [this.workspaceId, taskId],
+    );
+    if (!node || typeof node.run_id !== 'string' || typeof node.node_id !== 'string') {
+      return undefined;
+    }
+    const run = await this.db.get<{
+      run_id: string;
+      definition_id: string;
+      definition_version: number;
+      status: string;
+      origin: string;
+      parent_run_id: string | null;
+    }>(
+      `SELECT run_id, definition_id, definition_version, status, origin, parent_run_id
+         FROM workflow_runs
+        WHERE workspace_id = ? AND run_id = ?`,
+      [this.workspaceId, node.run_id],
+    );
+    if (!run) {
+      return undefined;
+    }
+
+    const gateRows = await this.db.all<{
+      gate_id: string;
+      status: string;
+      required: number;
+      satisfied: number;
+    }>(
+      `SELECT g.gate_id AS gate_id,
+              g.status AS status,
+              (SELECT COUNT(*) FROM workflow_gate_bindings b
+                WHERE b.workspace_id = g.workspace_id
+                  AND b.run_id = g.run_id
+                  AND b.gate_id = g.gate_id) AS required,
+              (SELECT COUNT(DISTINCT f.input_ref) FROM workflow_gate_fills f
+                WHERE f.workspace_id = g.workspace_id
+                  AND f.run_id = g.run_id
+                  AND f.gate_id = g.gate_id) AS satisfied
+         FROM workflow_dependency_gates g
+        WHERE g.workspace_id = ? AND g.run_id = ?
+        ORDER BY g.gate_id`,
+      [this.workspaceId, node.run_id],
+    );
+
+    const openRound = await this.db.get<{
+      round_id: string;
+      status: string;
+      join_mode: string;
+    }>(
+      `SELECT round_id, status, join_mode
+         FROM workflow_feedback_rounds
+        WHERE workspace_id = ? AND run_id = ? AND status = 'open'
+        ORDER BY created_at DESC, round_id
+        LIMIT 1`,
+      [this.workspaceId, node.run_id],
+    );
+
+    const pendingCont = await this.db.get<{
+      continuation_id: string;
+      status: string;
+      kind: string;
+    }>(
+      `SELECT continuation_id, status, kind
+         FROM workflow_continuations
+        WHERE workspace_id = ? AND run_id = ? AND status = 'pending'
+        ORDER BY created_at DESC, continuation_id
+        LIMIT 1`,
+      [this.workspaceId, node.run_id],
+    );
+
+    const projection: WorkflowTaskStatusProjection = {
+      runId: run.run_id,
+      definitionId: run.definition_id,
+      definitionVersion: Number(run.definition_version),
+      runStatus: run.status,
+      origin: run.origin,
+      nodeId: node.node_id,
+      gates: gateRows.map((g) => ({
+        gateId: g.gate_id,
+        status: g.status,
+        required: Number(g.required) || 0,
+        satisfied: Number(g.satisfied) || 0,
+      })),
+    };
+    if (typeof run.parent_run_id === 'string' && run.parent_run_id.length > 0) {
+      projection.parentRunId = run.parent_run_id;
+    }
+    if (openRound) {
+      projection.activeFeedbackRound = {
+        roundId: openRound.round_id,
+        status: openRound.status,
+        joinMode: openRound.join_mode,
+      };
+    }
+    if (pendingCont) {
+      projection.continuation = {
+        continuationId: pendingCont.continuation_id,
+        status: pendingCont.status,
+        kind: pendingCont.kind,
+      };
+    }
+    return projection;
   }
 
   private async write(

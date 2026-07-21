@@ -47,6 +47,7 @@ export const ACP_DEADLINE_BUFFER_MS = 90_000;
 import { evaluateTaskReadiness } from './readiness';
 import { canPromoteTurn } from './scheduler';
 import type { GraphCommandKind, RepositoryCommand, TaskRepository } from './repository';
+import type { WorkflowTaskStatusProjection } from './workflow-types';
 import type { TaskReadPort } from './store-port';
 import {
   createTask,
@@ -2359,11 +2360,18 @@ export async function executeToolCommand(
       const callerWait = callerTurn?.disposition?.kind === 'wait_tasks'
         ? callerTurn.disposition
         : undefined;
+      // M018 S07: bounded workflow orchestration state (run/gate/round/continuation).
+      // Optional method so partial TaskRepository mocks remain valid.
+      let workflow: WorkflowTaskStatusProjection | undefined;
+      if (typeof deps.repository.getWorkflowStatusForTask === 'function') {
+        workflow = await deps.repository.getWorkflowStatusForTask(targetId);
+      }
       return {
         ok: true,
         result: {
           root: targetId,
           tasks: nodes.slice(0, 32),
+          ...(workflow ? { workflow } : {}),
           ...(callerWait
             ? {
                 callerWaitStaged: true,
