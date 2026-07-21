@@ -32,6 +32,11 @@ function startUncommittedWriter(dbPath: string): { worker: Worker; written: Prom
       const { DatabaseSync } = require('node:sqlite');
       try {
         const db = new DatabaseSync(workerData.dbPath);
+        // v8 writer-guard triggers RAISE(ABORT,'schema_changed') unless the
+        // connection registers the writer-version UDF at the current version —
+        // mirror the production worker so this raw writer is a valid same-version
+        // writer and the test exercises WAL rollback, not the stale-writer fence.
+        db.function('muster_writer_version', { deterministic: true }, () => Number(workerData.writerVersion));
         db.exec('BEGIN IMMEDIATE TRANSACTION');
         db.prepare(
           'INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at) VALUES (?,?,?,?,?)',
@@ -42,7 +47,7 @@ function startUncommittedWriter(dbPath: string): { worker: Worker; written: Prom
         parentPort.postMessage({ kind: 'error', message: String(error && error.message || error) });
       }
     `,
-    { eval: true, workerData: { dbPath } },
+    { eval: true, workerData: { dbPath, writerVersion: SQLITE_SCHEMA_VERSION } },
   );
   workers.push(worker);
   const written = new Promise<void>((resolve, reject) => {
