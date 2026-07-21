@@ -9,7 +9,7 @@ Open-source VS Code extension that **coordinates** multiple AI coding CLIs from 
 - [OpenCode](https://opencode.ai)
 - [Antigravity / agy](https://antigravity.google/product/antigravity-cli) (planned)
 
-**Status:** Early MVP — **ACP-only**, **task-model** architecture (`TaskEngine` is the sole host path). Five ACP backends are implemented: **Claude, Grok, Kiro, Codex, OpenCode**. Grok, Kiro, and OpenCode speak ACP natively; Claude and Codex use standard ACP adapters (`claude-agent-acp` / `codex-acp`) that are **bundled into the extension** so no extra install is needed beyond the CLI itself. Legacy flat chat and `.muster-sessions.json` were removed in Phase E (archived on first activation). See [docs/TASK-MANAGEMENT.md](docs/TASK-MANAGEMENT.md).
+**Status:** Early MVP — **ACP-only**, **task-model** architecture (`TaskEngine` + `SqliteTaskRepository` is the sole host path). Five ACP backends are implemented: **Claude, Grok, Kiro, Codex, OpenCode**. Grok, Kiro, and OpenCode speak ACP natively; Claude and Codex use standard ACP adapters (`claude-agent-acp` / `codex-acp`) that are **bundled into the extension** so no extra install is needed beyond the CLI itself. Durable state is SQLite-only (`muster.sqlite3`); there is no JSON task store. See [docs/TASK-MANAGEMENT.md](docs/TASK-MANAGEMENT.md) and [docs/SQLITE-STORAGE.md](docs/SQLITE-STORAGE.md).
 
 ## Features (current & planned)
 
@@ -23,7 +23,7 @@ Open-source VS Code extension that **coordinates** multiple AI coding CLIs from 
 | Codex ACP backend (bundled `@agentclientprotocol/codex-acp`) | ✅ |
 | Antigravity ACP backend | 🔜 (entry TBD) |
 | Session resume (`session/load`) | ✅ |
-| Task model (`TaskStore` + `TaskEngine`) | ✅ |
+| Task model (`SqliteTaskRepository` + `TaskEngine`) | ✅ |
 | Webview task UI (list + workspace, protocol v2) | ✅ |
 | Muster Bridge + coordinator tools | ✅ |
 | MCP via `mcpServers` (context + Bridge) | ✅ |

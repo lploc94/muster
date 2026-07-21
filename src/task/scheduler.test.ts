@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { canPromoteTurn, dependenciesBlockTask, dependencyTerminalOutcome } from './scheduler';
 import { DEFAULT_RESOURCE_LIMITS, type ResourceLimits } from './limits';
-import type { MusterTask, TaskDependency, TaskStoreFile, TaskTurn, TaskVerdict } from './types';
+import type { MusterTask, TaskDependency, EngineProjection, TaskTurn, TaskVerdict } from './types';
 
-function baseFile(): TaskStoreFile {
+function baseFile(): EngineProjection {
   return {
     schemaVersion: 2,
     revision: 1,
@@ -152,7 +152,7 @@ describe('scheduler', () => {
   };
 
   function siblingWorker(
-    file: TaskStoreFile,
+    file: EngineProjection,
     id: string,
     backend: string,
     parentId: string | null = 'root',
@@ -259,7 +259,7 @@ describe('verdict-gated dependencies (verify-gate-loop Phase A)', () => {
     };
   }
 
-  function gatedFile(dep: TaskDependency, producer: Partial<MusterTask>): TaskStoreFile {
+  function gatedFile(dep: TaskDependency, producer: Partial<MusterTask>): EngineProjection {
     return {
       schemaVersion: 2,
       revision: 1,

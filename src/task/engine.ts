@@ -121,7 +121,7 @@ import type {
   TaskLifecycleState,
   TaskMessage,
   TaskRole,
-  TaskStoreFile,
+  EngineProjection,
   TaskTurn,
   TaskVerdict,
   TurnDisposition,
@@ -257,7 +257,7 @@ function nowIso(clock?: () => string): string {
   return clock?.() ?? new Date().toISOString();
 }
 
-function cloneTaskStoreFile(file: TaskStoreFile): TaskStoreFile {
+function cloneEngineProjection(file: EngineProjection): EngineProjection {
   return structuredClone(file);
 }
 
@@ -296,7 +296,7 @@ export function sendFingerprint(input: {
 export function projectPrompt(
   turn: TaskTurn,
   messages: ReadonlyMap<string, TaskMessage>,
-  file?: TaskStoreFile,
+  file?: EngineProjection,
   maxChildResultBytes = TASK_RESULT_MAX_BYTES,
 ): string {
   const parts: string[] = [];
@@ -339,11 +339,11 @@ export function projectPrompt(
   return parts.join('\n\n');
 }
 
-function messageMapFromFile(file: TaskStoreFile): Map<string, TaskMessage> {
+function messageMapFromFile(file: EngineProjection): Map<string, TaskMessage> {
   return new Map(Object.entries(file.messages));
 }
 
-function depGraphFromFile(file: TaskStoreFile): DepGraph {
+function depGraphFromFile(file: EngineProjection): DepGraph {
   return {
     rootOf: (taskId) => {
       const task = file.tasks[taskId];
@@ -365,20 +365,20 @@ function depGraphFromFile(file: TaskStoreFile): DepGraph {
   };
 }
 
-function turnsForTask(file: TaskStoreFile, taskId: string): TaskTurn[] {
+function turnsForTask(file: EngineProjection, taskId: string): TaskTurn[] {
   return Object.values(file.turns)
     .filter((turn) => turn.taskId === taskId)
     .sort((a, b) => a.sequence - b.sequence);
 }
 
-function childIdsOf(file: TaskStoreFile, parentId: string): string[] {
+function childIdsOf(file: EngineProjection, parentId: string): string[] {
   return Object.values(file.tasks)
     .filter((task) => task.parentId === parentId)
     .map((task) => task.id)
     .sort();
 }
 
-function descendantIds(file: TaskStoreFile, rootId: string): string[] {
+function descendantIds(file: EngineProjection, rootId: string): string[] {
   const result: string[] = [];
   const stack = [...childIdsOf(file, rootId)].reverse();
   while (stack.length > 0) {
@@ -389,20 +389,20 @@ function descendantIds(file: TaskStoreFile, rootId: string): string[] {
   return result;
 }
 
-function pendingTurnsForTask(file: TaskStoreFile, taskId: string): TaskTurn[] {
+function pendingTurnsForTask(file: EngineProjection, taskId: string): TaskTurn[] {
   return turnsForTask(file, taskId).filter(
     (turn) => turn.status === 'queued' || turn.status === 'running' || turn.status === 'waiting_user',
   );
 }
 
-function pendingUserMessages(file: TaskStoreFile, taskId: string): TaskMessage[] {
+function pendingUserMessages(file: EngineProjection, taskId: string): TaskMessage[] {
   return Object.values(file.messages)
     .filter((message) => message.taskId === taskId && message.role === 'user' && message.state === 'pending')
     .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
 }
 
 function isQueuedTurnAutoPromoteFrozen(
-  file: TaskStoreFile,
+  file: EngineProjection,
   taskId: string,
   candidateTurnId: string,
 ): boolean {
@@ -417,7 +417,7 @@ function deterministicRetryTurnId(failedTurnId: string, retryIndex: number): str
   return `${failedTurnId}-auto-retry-${retryIndex}`;
 }
 
-export function viewStatusFromDraft(draft: TaskStoreFile, taskId: string) {
+export function viewStatusFromDraft(draft: EngineProjection, taskId: string) {
   const task = draft.tasks[taskId];
   if (!task) {
     return undefined;
@@ -1325,7 +1325,7 @@ export class TaskEngine {
 
     // Root creation has no dependencies, so it never needs a materialized graph
     // snapshot. Keep this intentionally tiny graph contract rather than reaching
-    // into TaskStoreFile for a callback mutation.
+    // into EngineProjection for a callback mutation.
     const created = createTask(input, {
       rootId: taskId,
       graph: { rootOf: () => undefined, dependsOn: () => [] },
@@ -1601,7 +1601,7 @@ export class TaskEngine {
       this.repository.listMessages(params.taskId),
       this.repository.listToolCalls(params.taskId),
     ]);
-    const aggregate: TaskStoreFile = {
+    const aggregate: EngineProjection = {
       schemaVersion: 6,
       revision: await this.repository.getWorkspaceRevision(),
       tasks: { [task.id]: task },
@@ -2095,7 +2095,7 @@ export class TaskEngine {
   private prepareLifecycleCascade(
     taskId: string,
     mode: 'skip' | 'cancel',
-    file: TaskStoreFile,
+    file: EngineProjection,
     now: string,
   ):
     | { ok: true; taskIds: string[]; liveTurnIds: string[]; remoteLiveTurnIds: Set<string>; tasks: MusterTask[]; turns: TaskTurn[]; expectedTasks: { id: string; revision: number }[]; expectedTurns: { id: string; status: TaskTurn['status']; runtimeEpoch?: number }[]; cancelRequests: { turnId: string; request: import('./types').CancelRequest }[] }
@@ -2105,7 +2105,7 @@ export class TaskEngine {
     const liveTurnIds = taskIds.flatMap((id) => pendingTurnsForTask(file, id)
       .filter((turn) => turn.status === 'running' || turn.status === 'waiting_user').map((turn) => turn.id));
     const remoteLiveTurnIds = new Set(liveTurnIds.filter((id) => this.runtimeClaimAlive(id) && !this.ownsRuntimeClaim(id)));
-    const draft = cloneTaskStoreFile(file);
+    const draft = cloneEngineProjection(file);
     const cancelRequests: { turnId: string; request: import('./types').CancelRequest }[] = [];
     for (const id of taskIds) {
       const task = draft.tasks[id];
@@ -2177,7 +2177,7 @@ export class TaskEngine {
     const tasks = await this.repository.listSubtree(taskId);
     if (tasks.length === 0) return { ok: false, reason: 'task not found' };
     const turns = await this.repository.listTurnsForTasks(tasks.map((task) => task.id));
-    const file: TaskStoreFile = {
+    const file: EngineProjection = {
       schemaVersion: 6, revision: await this.repository.getWorkspaceRevision(),
       tasks: Object.fromEntries(tasks.map((task) => [task.id, task])),
       turns: Object.fromEntries(turns.map((turn) => [turn.id, turn])), messages: {},
@@ -2204,7 +2204,7 @@ export class TaskEngine {
     const tasks = await this.repository.listSubtree(taskId);
     if (tasks.length === 0) return { ok: false, reason: 'task not found' };
     const turns = await this.repository.listTurnsForTasks(tasks.map((task) => task.id));
-    const file: TaskStoreFile = {
+    const file: EngineProjection = {
       schemaVersion: 6, revision: await this.repository.getWorkspaceRevision(),
       tasks: Object.fromEntries(tasks.map((task) => [task.id, task])),
       turns: Object.fromEntries(turns.map((turn) => [turn.id, turn])), messages: {},
@@ -2262,7 +2262,7 @@ export class TaskEngine {
 
   /** Interrupt live source turns in the same commit; queued turns are retagged to target epoch. */
   private applyHandoffTurnPreemption(
-    draft: TaskStoreFile,
+    draft: EngineProjection,
     taskId: string,
     now: string,
   ): { ok: true } | { ok: false; reason: string } {
@@ -2479,7 +2479,7 @@ export class TaskEngine {
     if (this.storageTerminal) return;
     const now = nowIso(this.clock);
     const before = this.store.getFile();
-    const draft = cloneTaskStoreFile(before);
+    const draft = cloneEngineProjection(before);
     for (const task of Object.values(before.tasks)) {
       const current = draft.tasks[task.id];
       if (!current || isTerminalLifecycle(current.lifecycle)) continue;
@@ -2554,7 +2554,7 @@ export class TaskEngine {
     const now = nowIso(this.clock);
     const turnsToSchedule: string[] = [];
     const before = this.store.getFile();
-    const draft = cloneTaskStoreFile(before);
+    const draft = cloneEngineProjection(before);
     const mutate = (): void => {
       const graph = depGraphFromFile(draft);
 
@@ -3302,7 +3302,7 @@ export class TaskEngine {
    * avoids holding the SQLite write lock while resolving host configuration.
    */
   private prepareDispatchDraft(
-    draft: TaskStoreFile,
+    draft: EngineProjection,
     turnId: string,
     expectedTaskId: string,
     now: string,
@@ -3482,7 +3482,7 @@ export class TaskEngine {
   /** Load only the aggregate rows needed to prepare/settle one task. Related
    * task DTOs are limited to ancestors, dependencies, input producers and child
    * result references; transcript rows are loaded only for the target task. */
-  private async loadTaskAggregate(taskId: string): Promise<TaskStoreFile | undefined> {
+  private async loadTaskAggregate(taskId: string): Promise<EngineProjection | undefined> {
     const task = await this.repository.getTask(taskId);
     if (!task) return undefined;
     const tasks = new Map<string, MusterTask>([[task.id, task]]);
@@ -3525,7 +3525,7 @@ export class TaskEngine {
     };
   }
 
-  private async loadTurnAggregate(turnId: string): Promise<TaskStoreFile | undefined> {
+  private async loadTurnAggregate(turnId: string): Promise<EngineProjection | undefined> {
     const turn = await this.repository.getTurn(turnId);
     return turn ? this.loadTaskAggregate(turn.taskId) : undefined;
   }
@@ -3538,7 +3538,7 @@ export class TaskEngine {
   ): Promise<{ ok: true } | { ok: false; reason: string }> {
     const source = await this.loadTaskAggregate(expectedTaskId);
     if (!source) return { ok: false, reason: 'task not found' };
-    const before = cloneTaskStoreFile(source);
+    const before = cloneEngineProjection(source);
     const beforeTask = before.tasks[expectedTaskId];
     if (!beforeTask) return { ok: false, reason: 'task not found' };
     const prepared = this.prepareDispatchDraft(before, turnId, expectedTaskId, now);
@@ -3579,7 +3579,7 @@ export class TaskEngine {
   }
 
   /** Persist a small live-turn activity change without materializing or
-   * mutating a TaskStoreFile. The repository re-checks the status and epoch in
+   * mutating a EngineProjection. The repository re-checks the status and epoch in
    * its own transaction, so late stream events cannot revive a superseded run. */
   private async replaceLiveTurn(
     turnId: string,
@@ -3621,10 +3621,10 @@ export class TaskEngine {
 
   /** Persist the compact diff produced by a terminal transition.  The command
    * owns the terminal guard and claim release; this helper never sends a whole
-   * TaskStoreFile across the repository boundary. */
+   * EngineProjection across the repository boundary. */
   private async persistSettlementDraft(
-    before: TaskStoreFile,
-    draft: TaskStoreFile,
+    before: EngineProjection,
+    draft: EngineProjection,
     turnId: string,
   ): Promise<{ ok: true } | { ok: false; reason: string }> {
     const previousTurn = before.turns[turnId];
@@ -4633,8 +4633,8 @@ export class TaskEngine {
       let missingSession = false;
       const source = await this.loadTurnAggregate(turnId);
       if (!source) return false;
-      const before = cloneTaskStoreFile(source);
-      const draft = cloneTaskStoreFile(before);
+      const before = cloneEngineProjection(source);
+      const draft = cloneEngineProjection(before);
       const prepared = (() => {
         const turn = draft.turns[turnId];
         const task = turn ? draft.tasks[turn.taskId] : undefined;
@@ -4793,7 +4793,7 @@ export class TaskEngine {
     }
     if (root.childOrchestrationSeal === 'propose_only') return;
     const turns = [...await this.repository.listTurns(taskId)];
-    const aggregate: TaskStoreFile = {
+    const aggregate: EngineProjection = {
       schemaVersion: 6, revision: 0,
       tasks: Object.fromEntries([task].map((entry) => [entry.id, entry])),
       turns: Object.fromEntries(turns.map((entry) => [entry.id, entry])), messages: {},
@@ -4852,8 +4852,8 @@ export class TaskEngine {
     try {
       const source = await this.loadTurnAggregate(turnId);
       if (!source) return false;
-      const before = cloneTaskStoreFile(source);
-      const draft = cloneTaskStoreFile(before);
+      const before = cloneEngineProjection(source);
+      const draft = cloneEngineProjection(before);
       const prepared = (() => {
         const turn = draft.turns[turnId];
         if (!turn || (turn.status !== 'running' && turn.status !== 'waiting_user')) {
@@ -4966,8 +4966,8 @@ export class TaskEngine {
     try {
       const source = await this.loadTurnAggregate(turnId);
       if (!source) return false;
-      const before = cloneTaskStoreFile(source);
-      const draft = cloneTaskStoreFile(before);
+      const before = cloneEngineProjection(source);
+      const draft = cloneEngineProjection(before);
       const prepared = (() => {
         const turn = draft.turns[turnId];
         const task = turn ? draft.tasks[turn.taskId] : undefined;
@@ -5124,7 +5124,7 @@ export class TaskEngine {
     }
   }
 
-  private applyEffect(draft: TaskStoreFile, effect: Effect, turnId: string, now: string): void {
+  private applyEffect(draft: EngineProjection, effect: Effect, turnId: string, now: string): void {
     switch (effect.kind) {
       case 'markMessagesComplete': {
         for (const messageId of effect.messageIds) {

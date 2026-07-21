@@ -75,7 +75,7 @@ import type {
   TaskDependency,
   TaskExecutionPolicy,
   TaskInputBinding,
-  TaskStoreFile,
+  EngineProjection,
   TaskTurn,
 } from './types';
 
@@ -97,7 +97,7 @@ export function fingerprintCommand(command: ToolCommand): string {
  * Rejects conflicting prior disposition. Idempotent when same opId already staged wait.
  */
 function stageCompoundWait(
-  draft: TaskStoreFile,
+  draft: EngineProjection,
   ctx: { turnId: string; callerTaskId: string },
   _opId: string,
   waitTaskIds: string[],
@@ -127,7 +127,7 @@ function stageCompoundWait(
   };
 }
 
-function depGraphFromFile(file: TaskStoreFile): DepGraph {
+function depGraphFromFile(file: EngineProjection): DepGraph {
   return {
     rootOf: (taskId) => {
       const task = file.tasks[taskId];
@@ -145,7 +145,7 @@ function depGraphFromFile(file: TaskStoreFile): DepGraph {
   };
 }
 
-function turnsForTask(file: TaskStoreFile, taskId: string): TaskTurn[] {
+function turnsForTask(file: EngineProjection, taskId: string): TaskTurn[] {
   return Object.values(file.turns)
     .filter((t) => t.taskId === taskId)
     .sort((a, b) => a.sequence - b.sequence);
@@ -156,7 +156,7 @@ function turnsForTask(file: TaskStoreFile, taskId: string): TaskTurn[] {
  * Required on every cancel path (local graph, deferred processCancelRequests, host cancelTask).
  */
 export function clearPendingParentQuestionOnCancel(
-  draft: TaskStoreFile,
+  draft: EngineProjection,
   task: MusterTask,
   now: string,
 ): MusterTask {
@@ -208,13 +208,13 @@ export function clearPendingParentQuestionOnCancel(
   return nextTask;
 }
 
-function childIdsOf(file: TaskStoreFile, parentId: string): string[] {
+function childIdsOf(file: EngineProjection, parentId: string): string[] {
   return Object.values(file.tasks)
     .filter((t) => t.parentId === parentId)
     .map((t) => t.id);
 }
 
-function findRootId(file: TaskStoreFile, taskId: string): string {
+function findRootId(file: EngineProjection, taskId: string): string {
   const task = file.tasks[taskId];
   if (!task) return taskId;
   let current = task;
@@ -226,7 +226,7 @@ function findRootId(file: TaskStoreFile, taskId: string): string {
   return current.id;
 }
 
-function isDescendantOf(file: TaskStoreFile, ancestorId: string, taskId: string): boolean {
+function isDescendantOf(file: EngineProjection, ancestorId: string, taskId: string): boolean {
   let current = file.tasks[taskId];
   while (current) {
     if (current.id === ancestorId) return true;
@@ -236,7 +236,7 @@ function isDescendantOf(file: TaskStoreFile, ancestorId: string, taskId: string)
   return false;
 }
 
-function descendantIds(file: TaskStoreFile, rootId: string): string[] {
+function descendantIds(file: EngineProjection, rootId: string): string[] {
   const result: string[] = [];
   const stack = [rootId];
   while (stack.length > 0) {
@@ -261,7 +261,7 @@ const DEFAULT_COORDINATOR_CHILD_CAPS: TaskCapability[] = [
 ];
 export interface GraphEngineDeps {
   store: TaskReadPort;
-  /** Writable domain boundary; graph mutations never call store.commit(). */
+  /** Writable domain boundary; graph mutations persist via repository.execute only. */
   repository: TaskRepository;
   workspaceId: string;
   makeBackend: (name: string) => Backend;
@@ -326,13 +326,13 @@ function nowIso(clock?: () => string): string {
   return clock?.() ?? new Date().toISOString();
 }
 
-function ensureCoordinationMaps(draft: TaskStoreFile): void {
+function ensureCoordinationMaps(draft: EngineProjection): void {
   draft.operations = draft.operations ?? {};
   draft.cancelRequests = draft.cancelRequests ?? {};
 }
 
 function readLedger(
-  draft: TaskStoreFile,
+  draft: EngineProjection,
   turnId: string,
   opId: string,
 ): { fingerprint: string; result: OpResult } | undefined {
@@ -340,7 +340,7 @@ function readLedger(
 }
 
 function writeLedger(
-  draft: TaskStoreFile,
+  draft: EngineProjection,
   turnId: string,
   opId: string,
   fingerprint: string,
@@ -367,7 +367,7 @@ function equalGraphValue(a: unknown, b: unknown): boolean {
 async function executeGraphCommand(
   deps: GraphEngineDeps,
   kind: GraphCommandKind,
-  mutate: (draft: TaskStoreFile) => GraphApplyResult,
+  mutate: (draft: EngineProjection) => GraphApplyResult,
   fences: {
     expectedTasks?: readonly { id: string; revision: number }[];
     expectedTurns?: readonly { id: string; status: import('./types').TurnStatus; runtimeEpoch?: number }[];
@@ -387,12 +387,12 @@ async function executeGraphCommand(
     hydrateFullTurnsForTaskIds?: readonly string[];
   } = {},
 ): Promise<{ ok: true; result?: GraphApplyResult } | { ok: false; error: string }> {
-  const before = structuredClone(deps.store.getFile()) as TaskStoreFile;
+  const before = structuredClone(deps.store.getFile()) as EngineProjection;
   for (const taskId of fences.hydrateFullTurnsForTaskIds ?? []) {
     const fullTurns = await deps.repository.listTurns(taskId);
     for (const turn of fullTurns) before.turns[turn.id] = turn;
   }
-  const draft = structuredClone(before) as TaskStoreFile;
+  const draft = structuredClone(before) as EngineProjection;
   const applied = mutate(draft);
   if (!applied.ok) return { ok: false, error: applied.reason };
 
@@ -499,7 +499,7 @@ async function executeGraphCommand(
   return { ok: true, result: applied };
 }
 
-export function pruneLedgerForTurn(draft: TaskStoreFile, turnId: string): void {
+export function pruneLedgerForTurn(draft: EngineProjection, turnId: string): void {
   if (!draft.operations) return;
   for (const key of Object.keys(draft.operations)) {
     if (key.startsWith(`${turnId}:`)) {
@@ -2909,7 +2909,7 @@ export async function executeToolCommand(
   }
 }
 
-function draftChildOwned(file: TaskStoreFile, parentId: string, childId: string): boolean {
+function draftChildOwned(file: EngineProjection, parentId: string, childId: string): boolean {
   const child = file.tasks[childId];
   return child?.parentId === parentId;
 }
@@ -3011,7 +3011,7 @@ export async function processCancelRequests(deps: GraphEngineDeps): Promise<void
 
 export function projectChildResults(
   taskIds: string[],
-  file: TaskStoreFile,
+  file: EngineProjection,
   maxBytes: number = TASK_RESULT_MAX_BYTES,
 ): string {
   const header = '[child_results]';

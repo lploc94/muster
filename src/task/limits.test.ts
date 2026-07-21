@@ -11,7 +11,7 @@ import {
   resourceLimitsFromSettings,
   type ExecutionPolicyBounds,
 } from './limits';
-import type { TaskExecutionPolicy, TaskStoreFile } from './types';
+import type { TaskExecutionPolicy, EngineProjection } from './types';
 
 const BASE: TaskExecutionPolicy = {
   maxTurns: 50,
@@ -177,7 +177,7 @@ describe('bridgeTokenTtlMs', () => {
 
 describe('canCreateTurn queued reservations', () => {
   it('counts queued turns toward the per-task cap', () => {
-    const file: TaskStoreFile = {
+    const file: EngineProjection = {
       schemaVersion: 2,
       revision: 1,
       tasks: {
@@ -233,7 +233,7 @@ describe('canCreateTurn queued reservations', () => {
   });
 
   it('ignores retained turns from a previous execution epoch after reopen', () => {
-    const file: TaskStoreFile = {
+    const file: EngineProjection = {
       schemaVersion: 6,
       revision: 1,
       tasks: {

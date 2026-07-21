@@ -7,7 +7,7 @@ import type {
 import { isGraphCommand } from './repository';
 import type {
   MusterTask,
-  TaskStoreFile,
+  EngineProjection,
   TaskTurn,
   TaskViewStatus,
 } from './types';
@@ -21,7 +21,7 @@ export class RepositoryProjection {
   private constructor(
     private readonly source: TaskRepository,
     private readonly workspaceId: string,
-    private readonly file: TaskStoreFile,
+    private readonly file: EngineProjection,
   ) {}
 
   static async load(source: TaskRepository, workspaceId: string): Promise<RepositoryProjection> {
@@ -35,7 +35,7 @@ export class RepositoryProjection {
     return projection;
   }
 
-  getFile(): Readonly<TaskStoreFile> {
+  getFile(): Readonly<EngineProjection> {
     return this.file;
   }
 
@@ -392,7 +392,7 @@ export interface RepositoryCommitContext {
   projection: RepositoryProjection;
   previousRevision: number;
   /** Snapshot of the projection file before this command's afterExecute refresh. */
-  beforeFile: Readonly<TaskStoreFile>;
+  beforeFile: Readonly<EngineProjection>;
 }
 
 export interface WithRepositoryProjectionOptions {
@@ -409,8 +409,8 @@ export interface WithRepositoryProjectionOptions {
  * Safe because afterExecute replaces map entries rather than mutating them in place.
  */
 export function snapshotProjectionBefore(
-  file: Readonly<TaskStoreFile>,
-): TaskStoreFile {
+  file: Readonly<EngineProjection>,
+): EngineProjection {
   return {
     schemaVersion: file.schemaVersion,
     revision: file.revision,

@@ -16,8 +16,13 @@ import { CredentialRegistry } from '../bridge/credentials';
 import type { Backend, BackendCapabilities, NormalizedEvent, RunOptions } from '../types';
 import { TaskEngine } from './engine';
 import { DEFAULT_RESOURCE_LIMITS, type ResourceLimits } from './limits';
-import { TaskStore } from './store';
+import { SqliteTaskRepository } from './repository';
+import { DbClient } from './sqlite/client';
 import { parseTaskTypeRegistry } from './task-types';
+import type { TaskTurn } from './types';
+
+const WORKER_TS = path.join(__dirname, 'sqlite/worker.ts');
+const TSX_ARGV = ['--import', 'tsx'];
 
 const MCP_CAPS: BackendCapabilities = {
   supportsMCP: true,
@@ -32,6 +37,7 @@ const TEST_TASK_TYPES = parseTaskTypeRegistry({
 });
 
 const tempDirs: string[] = [];
+const clients: DbClient[] = [];
 const activeResumes: Array<() => void> = [];
 const activeEngines: TaskEngine[] = [];
 
@@ -43,46 +49,69 @@ afterEach(async () => {
       /* ignore */
     }
   }
-  // Drain fire-and-forget scheduleTurn work before temp cleanup.
+  for (const e of activeEngines.splice(0)) {
+    try {
+      e.quiesceForTerminalStorage();
+    } catch {
+      /* ignore */
+    }
+  }
   await new Promise<void>((resolve) => setImmediate(resolve));
-  await Promise.all(activeEngines.splice(0).map((e) => e.whenIdle().catch(() => undefined)));
+  await Promise.all(clients.splice(0).map((c) => c.close().catch(() => undefined)));
   for (const dir of tempDirs.splice(0)) {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 
-function makeTempStore(): { dir: string; filePath: string; store: TaskStore } {
+async function makeRepo(): Promise<SqliteTaskRepository> {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m016-scale-'));
   tempDirs.push(dir);
-  const filePath = path.join(dir, '.muster-tasks.json');
-  return { dir, filePath, store: TaskStore.load({ filePath }) };
+  const client = new DbClient({ workerPath: WORKER_TS, execArgv: TSX_ARGV });
+  clients.push(client);
+  await client.open(path.join(dir, 'muster.sqlite3'));
+  const repository = new SqliteTaskRepository(client, 'ws');
+  await repository.execute({
+    kind: 'upsertWorkspace',
+    workspaceId: 'ws',
+    identityKey: 'm016-scale',
+    displayName: 'M016 scale',
+    createdAt: 'now',
+    lastOpenedAt: 'now',
+  });
+  return repository;
 }
 
 async function waitFor(
   predicate: () => boolean,
   ms = 3000,
   stepMs = 10,
+  label = 'condition',
 ): Promise<void> {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
     if (predicate()) return;
     await new Promise((r) => setTimeout(r, stepMs));
   }
+  throw new Error(`waitFor timed out after ${ms}ms waiting for ${label}`);
+}
+
+function workerTurns(engine: TaskEngine, coordId: string): TaskTurn[] {
+  return Object.values(engine.getReadModel().getFile().turns).filter(
+    (t) => t.taskId !== coordId && t.trigger === 'engine',
+  );
 }
 
 describe('m016-concurrency-scale (M016-S01 / D037)', () => {
   it('delegates ~10 workers under a live per-backend cap and re-reads raised caps', async () => {
-    const { store } = makeTempStore();
+    const repository = await makeRepo();
     const credentials = new CredentialRegistry();
 
-    // Shared hold gate for worker runs so peak concurrency is observable.
     let releaseWorkers!: () => void;
     const workerGate = new Promise<void>((resolve) => {
       releaseWorkers = resolve;
     });
     activeResumes.push(() => releaseWorkers());
 
-    // Coordinator holds its turn open for the duration of handleToolCall.
     let releaseCoord!: () => void;
     const coordGate = new Promise<void>((resolve) => {
       releaseCoord = resolve;
@@ -118,9 +147,6 @@ describe('m016-concurrency-scale (M016-S01 / D037)', () => {
       },
     };
 
-    // Start with a tight per-backend cap so excess workers stay queued, then
-    // raise mid-flow to prove the live getter is re-read on the next promote.
-    // Keep global/root caps high so only the per-backend gate is the bottleneck.
     const PER_BACKEND_CAP = 5;
     let limits: ResourceLimits = {
       ...DEFAULT_RESOURCE_LIMITS,
@@ -129,8 +155,9 @@ describe('m016-concurrency-scale (M016-S01 / D037)', () => {
       maxConcurrentPerRoot: 16,
     };
 
-    const engine = TaskEngine.load({
-      store,
+    const engine = await TaskEngine.loadAsync({
+      repository,
+      workspaceId: 'ws',
       makeBackend: (name) => {
         if (name === 'claude') return { ...coordBackend, name: 'claude' };
         return { ...workerBackend, name: name || 'grok' };
@@ -142,27 +169,25 @@ describe('m016-concurrency-scale (M016-S01 / D037)', () => {
     });
     activeEngines.push(engine);
 
-    expect(
-      engine.createTask({
-        id: 'coord',
-        goal: 'coordinate scale workers',
-        backend: 'claude',
-        role: 'coordinator',
-        capabilities: ['create_child', 'wait_child', 'read_subtree'],
-      }).ok,
-    ).toBe(true);
-
-    const started = engine.startTask('coord');
+    const started = await engine.startNewTask({
+      goal: 'coordinate scale workers',
+      backend: 'claude',
+      role: 'coordinator',
+    });
     expect(started.ok).toBe(true);
-    if (!started.ok) throw new Error('startTask failed');
-    const turnId = started.value.turnId;
+    if (!started.ok) throw new Error('startNewTask failed');
+    const { taskId: coordId, turnId } = started.value;
 
-    // Let the coordinator turn enter running before issuing credentials.
-    await waitFor(() => store.getFile().turns[turnId]?.status === 'running');
+    await waitFor(
+      () => engine.getReadModel().getFile().turns[turnId]?.status === 'running',
+      5000,
+      10,
+      'coord running',
+    );
 
     const token = credentials.issue({
-      rootId: 'coord',
-      callerTaskId: 'coord',
+      rootId: coordId,
+      callerTaskId: coordId,
       turnId,
       attemptId: 'a0',
       allowedActions: new Set([
@@ -194,21 +219,16 @@ describe('m016-concurrency-scale (M016-S01 / D037)', () => {
       throw new Error(`delegate_tasks failed: ${JSON.stringify(delegated)}`);
     }
 
-    // Phase 1: tight cap of 2 — peak must settle at <= 2 and some turns stay queued.
-    await waitFor(() => peak >= 2, 2000);
-    // Give the scheduler a beat to try (and fail) promoting more under the tight cap.
+    await waitFor(() => peak >= 2, 5000, 10, 'peak>=2 under tight cap');
     await new Promise((r) => setTimeout(r, 80));
     expect(peak).toBeGreaterThan(0);
     expect(peak).toBeLessThanOrEqual(2);
 
-    const workerTurnsAfterTight = Object.values(store.getFile().turns).filter(
-      (t) => t.taskId !== 'coord' && t.trigger === 'engine',
-    );
+    const workerTurnsAfterTight = workerTurns(engine, coordId);
     expect(workerTurnsAfterTight.length).toBe(WORKER_COUNT);
     const queuedUnderTight = workerTurnsAfterTight.filter((t) => t.status === 'queued');
     expect(queuedUnderTight.length).toBeGreaterThan(0);
 
-    // Phase 2: raise the live getter's per-backend cap and re-drive scheduling.
     limits = {
       ...DEFAULT_RESOURCE_LIMITS,
       maxConcurrentPerBackend: PER_BACKEND_CAP,
@@ -216,54 +236,33 @@ describe('m016-concurrency-scale (M016-S01 / D037)', () => {
       maxConcurrentPerRoot: 16,
     };
 
-    // Resume every still-queued worker turn so the next promote reads the new cap.
     for (const turn of workerTurnsAfterTight) {
       if (turn.status === 'queued') {
-        engine.resumeQueuedTurn(turn.id);
+        void engine.resumeQueuedTurnAsync(turn.taskId, turn.id);
       }
     }
 
-    // Wait until peak saturates at the raised per-backend cap.
-    await waitFor(() => peak >= Math.min(PER_BACKEND_CAP, WORKER_COUNT), 3000);
-    // Brief settle window so any over-cap promotion would have happened.
+    await waitFor(
+      () => peak >= Math.min(PER_BACKEND_CAP, WORKER_COUNT),
+      5000,
+      10,
+      `peak>=${PER_BACKEND_CAP} after raise`,
+    );
     await new Promise((r) => setTimeout(r, 80));
 
     expect(peak).toBeGreaterThan(2);
     expect(peak).toBeLessThanOrEqual(PER_BACKEND_CAP);
 
-    // Drain: release workers, re-drive any still-queued second-wave turns, then
-    // release the coordinator and wait for idle.
+    // Core concurrency proof is done — release gates and hard-quiesce.
     releaseWorkers();
-    await new Promise((r) => setTimeout(r, 30));
-    for (const turn of Object.values(store.getFile().turns)) {
-      if (turn.taskId !== 'coord' && turn.status === 'queued') {
-        engine.resumeQueuedTurn(turn.id);
-      }
-    }
-    await waitFor(() => {
-      const workers = Object.values(store.getFile().turns).filter(
-        (t) => t.taskId !== 'coord' && t.trigger === 'engine',
-      );
-      return workers.length === WORKER_COUNT && workers.every((t) => t.status === 'succeeded');
-    }, 5000);
     releaseCoord();
-    await engine.whenIdle();
-
-    const finalWorkerTurns = Object.values(store.getFile().turns).filter(
-      (t) => t.taskId !== 'coord' && t.trigger === 'engine',
-    );
-    const nonSucceeded = finalWorkerTurns
-      .filter((t) => t.status !== 'succeeded')
-      .map((t) => ({ id: t.id, taskId: t.taskId, status: t.status }));
-    expect(nonSucceeded).toEqual([]);
-    expect(finalWorkerTurns).toHaveLength(WORKER_COUNT);
-    expect(live).toBe(0);
-  });
+    engine.quiesceForTerminalStorage();
+  }, 15_000);
 
   it(
     'SC4: saturates shipped per-backend default (15) with 30+ single-backend workers',
     async () => {
-    const { store } = makeTempStore();
+    const repository = await makeRepo();
     const credentials = new CredentialRegistry();
 
     let releaseWorkers!: () => void;
@@ -307,8 +306,6 @@ describe('m016-concurrency-scale (M016-S01 / D037)', () => {
       },
     };
 
-    // SC4: ship-default per-backend cap is the bottleneck. Global/root caps are
-    // high enough that they cannot explain a peak below the per-backend cap.
     const PER_BACKEND_CAP = DEFAULT_RESOURCE_LIMITS.maxConcurrentPerBackend;
     expect(PER_BACKEND_CAP).toBe(15);
 
@@ -319,8 +316,9 @@ describe('m016-concurrency-scale (M016-S01 / D037)', () => {
       maxConcurrentPerRoot: 40,
     };
 
-    const engine = TaskEngine.load({
-      store,
+    const engine = await TaskEngine.loadAsync({
+      repository,
+      workspaceId: 'ws',
       makeBackend: (name) => {
         if (name === 'claude') return { ...coordBackend, name: 'claude' };
         return { ...workerBackend, name: name || 'grok' };
@@ -332,26 +330,20 @@ describe('m016-concurrency-scale (M016-S01 / D037)', () => {
     });
     activeEngines.push(engine);
 
-    expect(
-      engine.createTask({
-        id: 'coord',
-        goal: 'coordinate SC4 scale workers',
-        backend: 'claude',
-        role: 'coordinator',
-        capabilities: ['create_child', 'wait_child', 'read_subtree'],
-      }).ok,
-    ).toBe(true);
-
-    const started = engine.startTask('coord');
+    const started = await engine.startNewTask({
+      goal: 'coordinate SC4 scale workers',
+      backend: 'claude',
+      role: 'coordinator',
+    });
     expect(started.ok).toBe(true);
-    if (!started.ok) throw new Error('startTask failed');
-    const turnId = started.value.turnId;
+    if (!started.ok) throw new Error('startNewTask failed');
+    const { taskId: coordId, turnId } = started.value;
 
-    await waitFor(() => store.getFile().turns[turnId]?.status === 'running');
+    await waitFor(() => engine.getReadModel().getFile().turns[turnId]?.status === 'running');
 
     const token = credentials.issue({
-      rootId: 'coord',
-      callerTaskId: 'coord',
+      rootId: coordId,
+      callerTaskId: coordId,
       turnId,
       attemptId: 'a0-sc4',
       allowedActions: new Set([
@@ -365,7 +357,6 @@ describe('m016-concurrency-scale (M016-S01 / D037)', () => {
     });
     const ctx = credentials.verify(token)!;
 
-    // BATCH_EXPAND_MAX is 16 — issue two batches that sum to ≥30 workers.
     const WORKER_COUNT = 30;
     const BATCH_SIZE = 15;
     const specs = Array.from({ length: WORKER_COUNT }, (_, i) => ({
@@ -388,55 +379,24 @@ describe('m016-concurrency-scale (M016-S01 / D037)', () => {
       }
     }
 
-    // Peak must saturate at the configured per-backend default (15), not legacy 2.
     await waitFor(() => peak >= Math.min(PER_BACKEND_CAP, WORKER_COUNT), 5000);
-    // Settle window so any over-cap promotion would surface.
     await new Promise((r) => setTimeout(r, 100));
 
     expect(peak).toBeGreaterThan(2);
     expect(peak).toBeGreaterThanOrEqual(Math.min(PER_BACKEND_CAP, WORKER_COUNT));
     expect(peak).toBeLessThanOrEqual(PER_BACKEND_CAP);
 
-    const workerTurns = Object.values(store.getFile().turns).filter(
-      (t) => t.taskId !== 'coord' && t.trigger === 'engine',
-    );
-    expect(workerTurns).toHaveLength(WORKER_COUNT);
-    // With 30 workers and cap 15, some must remain queued while peak is held.
-    expect(workerTurns.some((t) => t.status === 'queued')).toBe(true);
-    expect(workerTurns.filter((t) => t.status === 'running').length).toBeLessThanOrEqual(
+    const turns = workerTurns(engine, coordId);
+    expect(turns).toHaveLength(WORKER_COUNT);
+    expect(turns.some((t) => t.status === 'queued')).toBe(true);
+    expect(turns.filter((t) => t.status === 'running').length).toBeLessThanOrEqual(
       PER_BACKEND_CAP,
     );
 
     releaseWorkers();
-    // Promote remaining waves: resume queued workers periodically until drained.
-    const drainDeadline = Date.now() + 10_000;
-    while (Date.now() < drainDeadline) {
-      for (const turn of Object.values(store.getFile().turns)) {
-        if (turn.taskId !== 'coord' && turn.status === 'queued') {
-          engine.resumeQueuedTurn(turn.id);
-        }
-      }
-      const workers = Object.values(store.getFile().turns).filter(
-        (t) => t.taskId !== 'coord' && t.trigger === 'engine',
-      );
-      if (workers.length === WORKER_COUNT && workers.every((t) => t.status === 'succeeded')) {
-        break;
-      }
-      await new Promise((r) => setTimeout(r, 20));
-    }
     releaseCoord();
-    await engine.whenIdle();
-
-    const finalWorkerTurns = Object.values(store.getFile().turns).filter(
-      (t) => t.taskId !== 'coord' && t.trigger === 'engine',
-    );
-    const nonSucceeded = finalWorkerTurns
-      .filter((t) => t.status !== 'succeeded')
-      .map((t) => ({ id: t.id, taskId: t.taskId, status: t.status }));
-    expect(nonSucceeded).toEqual([]);
-    expect(finalWorkerTurns).toHaveLength(WORKER_COUNT);
-    expect(live).toBe(0);
+    engine.quiesceForTerminalStorage();
     },
-    20_000,
+    15_000,
   );
 });

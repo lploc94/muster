@@ -794,7 +794,7 @@ export class MusterBridgeServer {
   private readonly transports = new Map<string, McpStreamableHttpTransport>();
   /**
    * Bridge-local setup semaphore (async mutex/queue) for concurrent MCP session
-   * transport create+connect. Not TaskStore locking — only serializes first-touch
+   * transport create+connect. Not storage locking — only serializes first-touch
    * initialize on this process so the session map stays coherent.
    */
   private setupTail: Promise<void> = Promise.resolve();
@@ -844,7 +844,7 @@ export class MusterBridgeServer {
     this.healthStatus = 'ok';
     const app = createMcpExpressApp({ host: '127.0.0.1' });
 
-    // Unauthenticated loopback health — no TaskStore I/O, no credential required.
+    // Unauthenticated loopback health — no repository I/O, no credential required.
     app.get(
       '/health',
       (

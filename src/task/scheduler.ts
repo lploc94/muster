@@ -2,34 +2,34 @@ import { evaluateDependency } from './deps';
 import type { ResourceLimits } from './limits';
 import { evaluateTaskReadiness, readinessToPromoteReason } from './readiness';
 import { hasResourceConflict } from './resources';
-import type { TaskStoreFile, TaskTurn } from './types';
+import type { EngineProjection, TaskTurn } from './types';
 
 const LIVE_STATUSES: ReadonlySet<TaskTurn['status']> = new Set(['running', 'waiting_user']);
 
-function turnsForTask(file: TaskStoreFile, taskId: string): TaskTurn[] {
+function turnsForTask(file: EngineProjection, taskId: string): TaskTurn[] {
   return Object.values(file.turns).filter((t) => t.taskId === taskId);
 }
 
-function activeTurnForTask(file: TaskStoreFile, taskId: string): TaskTurn | undefined {
+function activeTurnForTask(file: EngineProjection, taskId: string): TaskTurn | undefined {
   return turnsForTask(file, taskId).find(
     (t) => t.status === 'queued' || LIVE_STATUSES.has(t.status),
   );
 }
 
-function runningTurns(file: TaskStoreFile): TaskTurn[] {
+function runningTurns(file: EngineProjection): TaskTurn[] {
   return Object.values(file.turns).filter((t) => LIVE_STATUSES.has(t.status));
 }
 
-function sessionIdForTurn(file: TaskStoreFile, turn: TaskTurn): string | undefined {
+function sessionIdForTurn(file: EngineProjection, turn: TaskTurn): string | undefined {
   const task = file.tasks[turn.taskId];
   return turn.observedSessionId ?? turn.candidateSessionId ?? task?.committedSessionId;
 }
 
-export function countRunningTurns(file: TaskStoreFile): number {
+export function countRunningTurns(file: EngineProjection): number {
   return runningTurns(file).length;
 }
 
-export function countRunningForRoot(file: TaskStoreFile, rootId: string): number {
+export function countRunningForRoot(file: EngineProjection, rootId: string): number {
   return runningTurns(file).filter((turn) => {
     const task = file.tasks[turn.taskId];
     if (!task) {
@@ -47,18 +47,18 @@ export function countRunningForRoot(file: TaskStoreFile, rootId: string): number
   }).length;
 }
 
-export function countRunningForBackend(file: TaskStoreFile, backend: string): number {
+export function countRunningForBackend(file: EngineProjection, backend: string): number {
   return runningTurns(file).filter((turn) => file.tasks[turn.taskId]?.backend === backend).length;
 }
 
-export function isSessionBusy(file: TaskStoreFile, sessionId: string | undefined): boolean {
+export function isSessionBusy(file: EngineProjection, sessionId: string | undefined): boolean {
   if (!sessionId) {
     return false;
   }
   return runningTurns(file).some((turn) => sessionIdForTurn(file, turn) === sessionId);
 }
 
-export function dependenciesBlockTask(file: TaskStoreFile, taskId: string): boolean {
+export function dependenciesBlockTask(file: EngineProjection, taskId: string): boolean {
   const task = file.tasks[taskId];
   if (!task) {
     return true;
@@ -80,7 +80,7 @@ export function dependenciesBlockTask(file: TaskStoreFile, taskId: string): bool
 }
 
 export function dependencyTerminalOutcome(
-  file: TaskStoreFile,
+  file: EngineProjection,
   taskId: string,
 ): 'failed' | 'skipped' | undefined {
   const task = file.tasks[taskId];
@@ -103,7 +103,7 @@ export function dependencyTerminalOutcome(
 }
 
 export function canPromoteTurn(
-  file: TaskStoreFile,
+  file: EngineProjection,
   turnId: string,
   limits: ResourceLimits,
 ): { ok: true } | { ok: false; reason: string } {
@@ -210,7 +210,7 @@ export function canPromoteTurn(
   return { ok: true };
 }
 
-export function pickRunnableTurns(file: TaskStoreFile, limits: ResourceLimits): string[] {
+export function pickRunnableTurns(file: EngineProjection, limits: ResourceLimits): string[] {
   const queued = Object.values(file.turns)
     .filter((t) => t.status === 'queued')
     .sort(

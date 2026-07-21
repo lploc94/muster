@@ -12,9 +12,10 @@ import type { NormalizedEvent } from '../types';
 import { AskBridge } from '../bridge/ask-bridge';
 import { CredentialRegistry } from '../bridge/credentials';
 import { McpReadinessSupervisor } from '../bridge/mcp-readiness';
-import { TaskEngine } from '../task/engine';
-import { TaskStore } from '../task/store';
 import { capabilitiesFor } from '../task/capabilities';
+import { TaskEngine } from '../task/engine';
+import { SqliteTaskRepository } from '../task/repository';
+import { DbClient } from '../task/sqlite/client';
 import {
   makeFakeAcpFaultClient,
   type FakeAcpFaultHarness,
@@ -29,13 +30,28 @@ vi.mock('./acp-client', () => ({
 
 import { ClaudeBackend } from './claude';
 
-const tempDirs: string[] = [];
+const WORKER_TS = path.join(__dirname, '../task/sqlite/worker.ts');
+const TSX_ARGV = ['--import', 'tsx'];
 
-function makeTempStore(): { dir: string; filePath: string; store: TaskStore } {
+const tempDirs: string[] = [];
+const clients: DbClient[] = [];
+
+async function makeRepo(): Promise<SqliteTaskRepository> {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m017-s06-'));
   tempDirs.push(dir);
-  const filePath = path.join(dir, '.muster-tasks.json');
-  return { dir, filePath, store: TaskStore.load({ filePath }) };
+  const client = new DbClient({ workerPath: WORKER_TS, execArgv: TSX_ARGV });
+  clients.push(client);
+  await client.open(path.join(dir, 'muster.sqlite3'));
+  const repository = new SqliteTaskRepository(client, 'ws');
+  await repository.execute({
+    kind: 'upsertWorkspace',
+    workspaceId: 'ws',
+    identityKey: 'm017-s06',
+    displayName: 'M017 S06',
+    createdAt: 'now',
+    lastOpenedAt: 'now',
+  });
+  return repository;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -43,8 +59,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 function expectedToolNamesForRoot(): string[] {
-  // TaskEngine.createTask defaults role=coordinator and grants the default
-  // capability set when callers omit capabilities.
+  // startNewTask defaults role=coordinator and grants the default capability set.
   return [
     ...capabilitiesFor({
       role: 'coordinator',
@@ -77,18 +92,21 @@ describe('Pre-dispatch ACP session recovery (M017-S06 / D037)', () => {
     activeHarnesses.clear();
     for (const h of harnesses) h.resume?.();
     await Promise.all(harnesses.map(({ engine }) => engine.whenIdle()));
+    await Promise.all(clients.splice(0).map((c) => c.close().catch(() => undefined)));
     for (const dir of tempDirs.splice(0)) {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  function makeEngine(opts: {
+  async function makeEngine(opts: {
     mcpReadiness: McpReadinessSupervisor;
     credentials: CredentialRegistry;
-    store: TaskStore;
-  }): TaskEngine {
-    const engine = TaskEngine.load({
-      store: opts.store,
+    repository: SqliteTaskRepository;
+    runLimitMs?: number;
+  }): Promise<TaskEngine> {
+    const engine = await TaskEngine.loadAsync({
+      repository: opts.repository,
+      workspaceId: 'ws',
       makeBackend: () => new ClaudeBackend(),
       runTurn: (backend, options) => backend.run(options),
       credentialRegistry: opts.credentials,
@@ -96,6 +114,7 @@ describe('Pre-dispatch ACP session recovery (M017-S06 / D037)', () => {
       mcpReadiness: opts.mcpReadiness,
       getBridgeGeneration: () => 1,
       askBridge: new AskBridge(),
+      getRunLimitMs: () => opts.runLimitMs ?? 30_000,
       // Real wall clock so run/setup deadlines advance with awaitReady polls.
       clock: () => new Date().toISOString(),
     });
@@ -103,42 +122,34 @@ describe('Pre-dispatch ACP session recovery (M017-S06 / D037)', () => {
     return engine;
   }
 
-  function releaseAndStart(
+  async function releaseAndStart(
     engine: TaskEngine,
-    store: TaskStore,
-    taskId: string,
-    policy?: { maxAutomaticRetries?: number; turnTimeoutMs?: number },
-  ): void {
-    const created = engine.createTask({
-      id: taskId,
-      goal: 'recover mcp setup',
+    goal: string,
+  ): Promise<string> {
+    const created = await engine.startNewTask({
+      goal,
       backend: 'claude',
-      executionPolicy: {
-        maxTurns: 4,
-        maxAutomaticRetries: policy?.maxAutomaticRetries ?? 2,
-        turnTimeoutMs: policy?.turnTimeoutMs ?? 3_000,
-        taskTimeoutMs: 30_000,
-      },
+      role: 'coordinator',
+      message: 'start recovery',
     });
     expect(created.ok).toBe(true);
-    store.commit((draft) => {
-      draft.tasks[taskId] = {
-        ...draft.tasks[taskId]!,
-        releaseState: 'released',
-      };
-      return { ok: true };
-    });
-    expect(engine.send(taskId, 'start recovery').ok).toBe(true);
+    if (!created.ok) throw new Error('startNewTask failed');
+    return created.value.taskId;
   }
 
   it(
     'first-attempt missing_evidence recovers on attempt 2 and prompts exactly once',
     async () => {
-    const { store } = makeTempStore();
+    const repository = await makeRepo();
     const credentials = new CredentialRegistry();
     const mcpReadiness = new McpReadinessSupervisor();
     mcpReadiness.noteBridgeGeneration(1);
-    const engine = makeEngine({ mcpReadiness, credentials, store });
+    const engine = await makeEngine({
+      mcpReadiness,
+      credentials,
+      repository,
+      runLimitMs: 12_000,
+    });
 
     // Inject list_tools evidence only after the second session is opened (attempt 2).
     const injector = setInterval(() => {
@@ -160,10 +171,7 @@ describe('Pre-dispatch ACP session recovery (M017-S06 / D037)', () => {
     }, 15);
 
     try {
-      releaseAndStart(engine, store, 'recover-once', {
-        maxAutomaticRetries: 2,
-        turnTimeoutMs: 12_000,
-      });
+      const taskId = await releaseAndStart(engine, 'recover mcp setup');
 
       // Wait until prompt is dispatched on the recovered session.
       await fake.waitForPrompt('sess-a2');
@@ -175,13 +183,15 @@ describe('Pre-dispatch ACP session recovery (M017-S06 / D037)', () => {
       fake.resolve('sess-a2', { stopReason: 'end_turn' });
       await engine.whenIdle();
 
-      const turns = Object.values(store.getFile().turns).filter((t) => t.taskId === 'recover-once');
+      const turns = Object.values(engine.getReadModel().getFile().turns).filter(
+        (t) => t.taskId === taskId,
+      );
       const primary = turns.find((t) => !t.id.includes('auto-retry'));
       expect(primary).toBeDefined();
       // Recovered path should have reached prompt_outstanding / terminal.
       expect(
         primary!.dispatchPhase === 'prompt_outstanding' ||
-          primary!.status === 'completed' ||
+          primary!.status === 'succeeded' ||
           primary!.status === 'failed',
       ).toBe(true);
       // No generic auto-retry for a successful recovered dispatch.
@@ -194,34 +204,32 @@ describe('Pre-dispatch ACP session recovery (M017-S06 / D037)', () => {
   );
 
   it('two-attempt setup exhaustion settles safe_to_retry with mcp_unavailable and no auto-retry', async () => {
-    const { store } = makeTempStore();
+    const repository = await makeRepo();
     const credentials = new CredentialRegistry();
     const mcpReadiness = new McpReadinessSupervisor();
     mcpReadiness.noteBridgeGeneration(1);
     // Never inject list_tools evidence — both attempts fail missing_evidence.
-    const engine = makeEngine({
+    const engine = await makeEngine({
       mcpReadiness,
       credentials,
-      store,
+      repository,
+      runLimitMs: 1_500,
     });
 
-    releaseAndStart(engine, store, 'exhaust-setup', {
-      maxAutomaticRetries: 2,
-      turnTimeoutMs: 1_500,
-    });
+    const taskId = await releaseAndStart(engine, 'exhaust setup');
 
     await engine.whenIdle();
     // Allow settle + attention commit to land.
     await sleep(50);
     await engine.whenIdle();
 
-    const file = store.getFile();
-    const task = file.tasks['exhaust-setup'];
+    const file = engine.getReadModel().getFile();
+    const task = file.tasks[taskId];
     expect(task).toBeDefined();
     expect(task!.attention?.code).toBe('mcp_unavailable');
     expect(task!.lifecycle).toBe('open');
 
-    const turns = Object.values(file.turns).filter((t) => t.taskId === 'exhaust-setup');
+    const turns = Object.values(file.turns).filter((t) => t.taskId === taskId);
     expect(turns.length).toBeGreaterThan(0);
     for (const turn of turns) {
       expect(turn.dispatchPhase).not.toBe('prompt_outstanding');

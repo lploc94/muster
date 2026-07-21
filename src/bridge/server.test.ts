@@ -459,7 +459,7 @@ describe('MusterBridgeServer generation, /health, and observers', () => {
       generation: 1,
       port,
     });
-    // Health must not require Authorization and must not touch TaskStore (no import path).
+    // Health must not require Authorization and must not touch the task repository.
     expect(res.headers.get('www-authenticate')).toBeNull();
   });
 

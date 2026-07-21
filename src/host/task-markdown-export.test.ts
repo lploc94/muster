@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { TRUNCATION_MARKER } from '../task/retention';
-import type { MusterTask, TaskMessage, TaskStoreFile, TaskTurn } from '../task/types';
+import type { MusterTask, TaskMessage, EngineProjection, TaskTurn } from '../task/types';
 import {
   DEFAULT_TASK_MARKDOWN_EXPORT_MAX_CHARS,
   TASK_MARKDOWN_EXPORT_FORMAT,
@@ -56,7 +56,7 @@ function message(
   };
 }
 
-function baseFile(overrides: Partial<TaskStoreFile> = {}): TaskStoreFile {
+function baseFile(overrides: Partial<EngineProjection> = {}): EngineProjection {
   return {
     schemaVersion: 3,
     revision: 11,
@@ -142,7 +142,7 @@ describe('renderTaskMarkdownExport', () => {
     expect(a).toEqual(b);
   });
 
-  it('does not mutate the input TaskStoreFile', () => {
+  it('does not mutate the input EngineProjection', () => {
     const file = baseFile();
     const before = JSON.stringify(file);
     renderTaskMarkdownExport(file, 'task-a', { exportedAt: EXPORTED_AT });

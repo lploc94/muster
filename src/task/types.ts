@@ -642,7 +642,11 @@ export interface RuntimeClaim {
   expiresAt: string;
 }
 
-export interface TaskStoreFile {
+/**
+ * In-memory engine/host read projection hydrated from SqliteTaskRepository.
+ * Not a durable file format — durable state is SQLite only (see SQLITE-STORAGE.md).
+ */
+export interface EngineProjection {
   schemaVersion: number;
   revision: number;
   tasks: Record<string, MusterTask>;

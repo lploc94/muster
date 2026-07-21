@@ -3,7 +3,7 @@
  * Path overlap + git mutex for mutating concurrent turns.
  */
 
-import type { MusterTask, TaskBriefV1, TaskStoreFile, TaskTurn } from './types';
+import type { MusterTask, TaskBriefV1, EngineProjection, TaskTurn } from './types';
 
 const LIVE: ReadonlySet<TaskTurn['status']> = new Set(['running', 'waiting_user']);
 
@@ -56,7 +56,7 @@ export function normalizedWritePaths(brief: TaskBriefV1 | undefined): string[] {
  * True if promoting candidate would conflict with an already-running mutator.
  */
 export function hasResourceConflict(
-  file: TaskStoreFile,
+  file: EngineProjection,
   candidateTaskId: string,
 ): { conflict: false } | { conflict: true; reason: string } {
   const candidate = file.tasks[candidateTaskId];

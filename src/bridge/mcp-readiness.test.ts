@@ -399,7 +399,7 @@ describe('MCP readiness supervisor and bridge instrumentation (M017-S04 / D037)'
       expect(['generation_mismatch', 'missing_evidence']).toContain(afterRestart.code);
     }
 
-    // --- GET /health returns status+generation; no TaskStore I/O path ---
+    // --- GET /health returns status+generation; no repository I/O path ---
     const healthRes = await fetch(`http://127.0.0.1:${port2}/health`);
     expect(healthRes.status).toBe(200);
     const health = (await healthRes.json()) as {

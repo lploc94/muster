@@ -1,7 +1,7 @@
 import type { PendingAskOverlay, TaskSnapshot, TranscriptItem, TranscriptPageState } from './snapshot';
 import { buildSnapshot } from './snapshot';
 import type { RepositoryTranscriptItem, TaskRepository } from '../task/repository';
-import type { TaskStoreFile } from '../task/types';
+import type { EngineProjection } from '../task/types';
 
 /** Bounded page size for the focused-task bootstrap transcript (W4). */
 export const BOOTSTRAP_TRANSCRIPT_LIMIT = 100;
@@ -15,7 +15,7 @@ export const BOOTSTRAP_TRANSCRIPT_LIMIT = 100;
 export interface RepositorySnapshotProjection {
   snapshot: TaskSnapshot;
   /** Bounded observation used by the current snapshot projector. */
-  observation: TaskStoreFile;
+  observation: EngineProjection;
 }
 
 /** Map a repository transcript row to the host wire transcript item. */
@@ -130,7 +130,7 @@ async function buildRepositorySnapshotAttempt(
     : undefined;
   const revision = page ? page.workspaceRevision : await repository.getWorkspaceRevision();
 
-  const observation: TaskStoreFile = {
+  const observation: EngineProjection = {
     schemaVersion: 6,
     revision,
     tasks: Object.fromEntries(tasks.map((task) => [task.id, task])),

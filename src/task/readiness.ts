@@ -5,7 +5,7 @@
 
 import { evaluateDependency } from './deps';
 import { effectiveTaskResult } from './dataflow';
-import type { MusterTask, TaskStoreFile, TaskTurn } from './types';
+import type { MusterTask, EngineProjection, TaskTurn } from './types';
 
 export type ReadinessCode =
   | 'ready'
@@ -45,11 +45,11 @@ export interface TaskReadiness {
 
 const LIVE: ReadonlySet<TaskTurn['status']> = new Set(['running', 'waiting_user']);
 
-function turnsForTask(file: TaskStoreFile, taskId: string): TaskTurn[] {
+function turnsForTask(file: EngineProjection, taskId: string): TaskTurn[] {
   return Object.values(file.turns).filter((t) => t.taskId === taskId);
 }
 
-function depBlockReasons(file: TaskStoreFile, task: MusterTask): ReadinessReason[] {
+function depBlockReasons(file: EngineProjection, task: MusterTask): ReadinessReason[] {
   const reasons: ReadinessReason[] = [];
   for (const dep of task.dependencies) {
     const producer = file.tasks[dep.taskId];
@@ -69,7 +69,7 @@ function depBlockReasons(file: TaskStoreFile, task: MusterTask): ReadinessReason
   return reasons;
 }
 
-function missingInputReasons(file: TaskStoreFile, task: MusterTask): ReadinessReason[] {
+function missingInputReasons(file: EngineProjection, task: MusterTask): ReadinessReason[] {
   const bindings = task.inputBindings;
   if (!bindings || bindings.length === 0) return [];
   const reasons: ReadinessReason[] = [];
@@ -91,7 +91,7 @@ function missingInputReasons(file: TaskStoreFile, task: MusterTask): ReadinessRe
  * Evaluate why a task is / is not runnable.
  * Path/git resource conflicts are reserved for W7 (path_conflict / git_mutex).
  */
-export function evaluateTaskReadiness(file: TaskStoreFile, taskId: string): TaskReadiness {
+export function evaluateTaskReadiness(file: EngineProjection, taskId: string): TaskReadiness {
   const task = file.tasks[taskId];
   if (!task) {
     return {

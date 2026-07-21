@@ -9,7 +9,7 @@ import type {
   PersistedReasoning,
   PersistedToolCall,
   TaskMessage,
-  TaskStoreFile,
+  EngineProjection,
 } from '../task/types';
 import {
   projectQueuedTurns,
@@ -40,7 +40,7 @@ export type ExternalReconcileArgs = {
    * projection may already carry the final revision while still missing the
    * peer aggregate. This preserves the real before-state for patch generation.
    */
-  beforeProjection?: Readonly<TaskStoreFile>;
+  beforeProjection?: Readonly<EngineProjection>;
   /**
    * Page size for feed reads. Revisions are never split across pages.
    */
@@ -294,8 +294,8 @@ export async function reconcileExternalWorkspaceChanges(
 }
 
 export function projectExternalWorkspacePatches(args: {
-  before: Readonly<TaskStoreFile>;
-  after: Readonly<TaskStoreFile>;
+  before: Readonly<EngineProjection>;
+  after: Readonly<EngineProjection>;
   affectedTaskIds: ReadonlySet<string>;
   focusedTaskId?: string;
   knownTranscriptIds: ReadonlySet<string>;
@@ -415,7 +415,7 @@ export function projectExternalWorkspacePatches(args: {
  * message.turnId. Resolve the same last-turn-wins mapping as buildTranscript;
  * otherwise an external enqueue would flash a queued follow-up into chat.
  */
-function resolveMessageTurnId(file: TaskStoreFile, message: TaskMessage): string | undefined {
+function resolveMessageTurnId(file: EngineProjection, message: TaskMessage): string | undefined {
   if (message.turnId) return message.turnId;
   if (message.role !== 'user') return undefined;
   let resolved: string | undefined;
@@ -431,7 +431,7 @@ function resolveMessageTurnId(file: TaskStoreFile, message: TaskMessage): string
 }
 
 function isQueuedOnlyFollowUp(
-  file: TaskStoreFile,
+  file: EngineProjection,
   message: TaskMessage,
   turnId: string | undefined,
 ): boolean {

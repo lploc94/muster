@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { retryCountOf } from './transitions';
 import { applyRetention, DEFAULT_RETENTION_CONFIG, TRUNCATION_MARKER } from './retention';
-import type { MusterTask, TaskStoreFile, TaskTurn } from './types';
+import type { MusterTask, EngineProjection, TaskTurn } from './types';
 
 function sampleTask(id: string, lifecycle: MusterTask['lifecycle'] = 'open'): MusterTask {
   return {
@@ -39,7 +39,7 @@ function turn(id: string, taskId: string, sequence: number, status: TaskTurn['st
   };
 }
 
-function emptyFile(): TaskStoreFile {
+function emptyFile(): EngineProjection {
   return {
     schemaVersion: 2,
     revision: 1,
