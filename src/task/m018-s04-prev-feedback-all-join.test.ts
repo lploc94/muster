@@ -506,7 +506,7 @@ describe('M018 S04 PREV feedback ALL-join', () => {
           WHERE workspace_id = ? AND run_id = ? AND round_id = ?`,
         ['ws', data.runId, roundId],
       );
-      expect(roundAfterFinal).toMatchObject({ status: 'satisfied' });
+      expect(roundAfterFinal).toMatchObject({ status: 'consumed' });
       const targetsAfterFinal = await ctx.client.all(
         `SELECT target_node_id, status FROM workflow_feedback_targets
           WHERE workspace_id = ? AND run_id = ? AND round_id = ?
@@ -534,9 +534,8 @@ describe('M018 S04 PREV feedback ALL-join', () => {
       expect(resumeContent.indexOf('from_p1=')).toBeLessThan(resumeContent.indexOf('from_p2='));
       const p1Artifact = deriveProducerArtifactId(data.runId, 'p1');
       const p2Artifact = deriveProducerArtifactId(data.runId, 'p2');
-      // Feedback response pins use revision 2 (latest per producer).
-      expect(resumeContent).toContain(`from_p1=${p1Artifact}@2`);
-      expect(resumeContent).toContain(`from_p2=${p2Artifact}@2`);
+      expect(resumeContent).toContain('from_p1=p1-v2');
+      expect(resumeContent).toContain(`from_p2=[artifact ${p2Artifact}@2]`);
 
       // Response redelivery after ledger prune is a no-op (no second resume).
       await ctx.client.run(
@@ -688,7 +687,7 @@ describe('M018 S04 PREV feedback ALL-join', () => {
           WHERE workspace_id = ? AND run_id = ? AND round_id = ?`,
         ['ws', runId, roundId],
       );
-      expect(roundFinal).toMatchObject({ status: 'satisfied' });
+      expect(roundFinal).toMatchObject({ status: 'consumed' });
 
       const consumerTurns = await reopened.repository.listTurns(consumerTaskId);
       expect(consumerTurns).toHaveLength(2);
@@ -782,7 +781,7 @@ describe('M018 S04 PREV feedback ALL-join', () => {
           WHERE workspace_id = ? AND run_id = ? AND round_id = ?`,
         ['ws', data.runId, roundId],
       );
-      expect(roundFinal).toMatchObject({ status: 'satisfied' });
+      expect(roundFinal).toMatchObject({ status: 'consumed' });
 
       const consumerTurns = await ctx.repository.listTurns(consumerTaskId);
       expect(consumerTurns).toHaveLength(2);

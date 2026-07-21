@@ -1760,7 +1760,7 @@ describe('SqliteTaskRepository', () => {
           WHERE workspace_id = ? AND run_id = ? AND round_id = ?`,
         ['ws', data.runId, roundId],
       );
-      expect(roundAfterFinal).toMatchObject({ status: 'satisfied' });
+      expect(roundAfterFinal).toMatchObject({ status: 'consumed' });
       const targetsAfterFinal = await client.all(
         `SELECT target_node_id, status FROM workflow_feedback_targets
           WHERE workspace_id = ? AND run_id = ? AND round_id = ?

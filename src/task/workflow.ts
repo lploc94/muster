@@ -219,7 +219,7 @@ export function startWorkflowLedgerKey(startIdempotencyKey: string): string {
 }
 
 /** Stable short id derived from start material (never a raw user path/SQL). */
-function stableId(prefix: string, material: string): string {
+export function stableId(prefix: string, material: string): string {
   const digest = createHash('sha256').update(material, 'utf8').digest('hex').slice(0, 24);
   return `${prefix}_${digest}`;
 }

@@ -447,8 +447,7 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
       const childTask = await opened.repository.getTask(childEntry!.task_id);
       expect(childTask?.lifecycle).toBe('open');
       const childRun = await runRow(opened.client, childRunId);
-      // Return path never seals the child run — status stays non-terminal.
-      expect(['open', 'running']).toContain(childRun?.status);
+      expect(childRun?.status).toBe('succeeded');
 
       // Duplicate terminal delivery on a second turn: no second resume / return fence.
       const redTurnId = `${childTurnId}-redeliver`;
