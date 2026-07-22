@@ -1,5 +1,5 @@
 /**
- * Schema v7→v8 migration proofs (M018 S01).
+ * Schema v7 migration-input and explicit v7→v8→current proofs (M018 S01).
  *
  * T01 freezes the populated v7 proof fixture and versioned-manifest gate.
  * Later tasks extend this file with atomic migration, rollback, and writer fence.
@@ -12,9 +12,10 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   MUSTER_APPLICATION_ID,
   REQUIRED_SCHEMA_V8_WORKFLOW_TABLES,
+  REQUIRED_SCHEMA_V9_WORKFLOW_TABLES,
   SCHEMA_V7,
   SCHEMA_V7_STATEMENTS,
-  SCHEMA_V8,
+  SCHEMA_V9,
   SQLITE_SCHEMA_VERSION,
 } from './schema';
 import {
@@ -101,7 +102,7 @@ describe('populated schema-v7 proof fixture (M018 S01 T01)', () => {
     try {
       expect(readPragma(db, 'application_id')).toBe(MUSTER_APPLICATION_ID);
       expect(readPragma(db, 'user_version')).toBe(SCHEMA_V7);
-      // Fixture remains frozen at v7; compiled current is v8 after T02.
+      // Fixture remains frozen at v7 after the compiled current advances.
       expect(SCHEMA_V7).not.toBe(SQLITE_SCHEMA_VERSION);
       expect(findSchemaFingerprintFailure(db, SCHEMA_V7)).toBeUndefined();
       expect(findSchemaFingerprintFailure(db, expectedSchemaManifestForVersion(SCHEMA_V7))).toBeUndefined();
@@ -183,13 +184,13 @@ describe('populated schema-v7 proof fixture (M018 S01 T01)', () => {
   });
 });
 
-describe('atomic schema-v7 → v8 migration (M018 S01 T02)', () => {
+describe('atomic schema-v7 → v8 → current migration (M018 S01 T02)', () => {
   afterEach(() => {
     // Disarm fault capability so later suites never inherit a migrate fault.
     bootstrapFaultCapability(undefined);
   });
 
-  it('migrates a populated owned v7 store to v8 with every legacy row intact', () => {
+  it('migrates a populated owned v7 store through v8 to v9 with every legacy row intact', () => {
     const dbPath = tempDbPath('migrate-preserve.sqlite');
     const written = writePopulatedV7Fixture(dbPath);
     const preCounts = (() => {
@@ -204,10 +205,10 @@ describe('atomic schema-v7 → v8 migration (M018 S01 T02)', () => {
     const db = openStoreDatabase({ path: dbPath });
     try {
       expect(readPragma(db, 'application_id')).toBe(MUSTER_APPLICATION_ID);
-      expect(readPragma(db, 'user_version')).toBe(SCHEMA_V8);
+      expect(readPragma(db, 'user_version')).toBe(SCHEMA_V9);
       expect(readPragma(db, 'user_version')).toBe(SQLITE_SCHEMA_VERSION);
       expect(findSchemaFingerprintFailure(db)).toBeUndefined();
-      expect(findSchemaFingerprintFailure(db, SCHEMA_V8)).toBeUndefined();
+      expect(findSchemaFingerprintFailure(db, SCHEMA_V9)).toBeUndefined();
 
       const markerRow = db
         .prepare(`SELECT content FROM messages WHERE id = ?`)
@@ -218,6 +219,10 @@ describe('atomic schema-v7 → v8 migration (M018 S01 T02)', () => {
       expect(postCounts).toEqual(preCounts);
 
       for (const table of REQUIRED_SCHEMA_V8_WORKFLOW_TABLES) {
+        const row = db.prepare(`SELECT COUNT(*) AS n FROM "${table}"`).get() as { n: number };
+        expect(row.n).toBe(0);
+      }
+      for (const table of REQUIRED_SCHEMA_V9_WORKFLOW_TABLES) {
         const row = db.prepare(`SELECT COUNT(*) AS n FROM "${table}"`).get() as { n: number };
         expect(row.n).toBe(0);
       }
@@ -234,7 +239,7 @@ describe('atomic schema-v7 → v8 migration (M018 S01 T02)', () => {
     // Reopen proves durable migration (not just connection-local state).
     const reopened = openStoreDatabase({ path: dbPath });
     try {
-      expect(readPragma(reopened, 'user_version')).toBe(SCHEMA_V8);
+      expect(readPragma(reopened, 'user_version')).toBe(SCHEMA_V9);
       expect(findSchemaFingerprintFailure(reopened)).toBeUndefined();
       const marker = reopened
         .prepare(`SELECT content FROM messages WHERE id = ?`)
@@ -298,7 +303,7 @@ describe('atomic schema-v7 → v8 migration (M018 S01 T02)', () => {
     // After fault is cleared, migration succeeds and preserves rows.
     const migrated = openStoreDatabase({ path: dbPath });
     try {
-      expect(readPragma(migrated, 'user_version')).toBe(SCHEMA_V8);
+      expect(readPragma(migrated, 'user_version')).toBe(SCHEMA_V9);
       const marker = migrated
         .prepare(`SELECT content FROM messages WHERE id = ?`)
         .get(written.messageId) as { content?: string } | undefined;
@@ -308,11 +313,11 @@ describe('atomic schema-v7 → v8 migration (M018 S01 T02)', () => {
     }
   });
 
-  it('blank claim creates schema v8 and rejects incomplete v7 without mutation', () => {
-    const blankPath = tempDbPath('blank-v8.sqlite');
+  it('blank claim creates schema v9 and rejects incomplete v7 without mutation', () => {
+    const blankPath = tempDbPath('blank-v9.sqlite');
     const blank = openStoreDatabase({ path: blankPath });
     try {
-      expect(readPragma(blank, 'user_version')).toBe(SCHEMA_V8);
+      expect(readPragma(blank, 'user_version')).toBe(SCHEMA_V9);
       expect(findSchemaFingerprintFailure(blank)).toBeUndefined();
     } finally {
       blank.close();
@@ -349,7 +354,7 @@ describe('atomic schema-v7 → v8 migration (M018 S01 T02)', () => {
     try {
       registerWriterVersionUdf(probe);
       const row = probe.prepare(`SELECT ${'muster_writer_version'}() AS v`).get() as { v: number };
-      expect(row.v).toBe(SCHEMA_V8);
+      expect(row.v).toBe(SCHEMA_V9);
     } finally {
       probe.close();
     }
@@ -375,22 +380,22 @@ describe('atomic schema-v7 → v8 migration (M018 S01 T02)', () => {
       '2026-07-19T00:00:00.000Z',
     );
 
-    // Peer host migrates under the v8 binary.
+    // Peer host migrates under the current binary.
     const current = openStoreDatabase({ path: dbPath });
     try {
-      expect(readPragma(current, 'user_version')).toBe(SCHEMA_V8);
+      expect(readPragma(current, 'user_version')).toBe(SCHEMA_V9);
       expect(findSchemaFingerprintFailure(current)).toBeUndefined();
 
-      // V8 peer writes succeed with registered writer UDF.
+      // Current peer writes succeed with registered writer UDF.
       current
         .prepare(
           `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
            VALUES (?, ?, ?, ?, ?)`,
         )
         .run(
-          'ws-v8-peer',
-          'identity-v8-peer',
-          'V8 Peer',
+          'ws-current-peer',
+          'identity-current-peer',
+          'Current Peer',
           '2026-07-19T02:00:00.000Z',
           '2026-07-19T02:00:00.000Z',
         );

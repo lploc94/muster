@@ -280,6 +280,139 @@ describe('M018 S02 fan-in NEXT activation', () => {
     }
   }, 45_000);
 
+  it('three-producer fan-in concurrent final fills', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m018-s02-concurrent-'));
+    const dbPath = path.join(dir, 'muster.sqlite3');
+    const firstClient = new DbClient({
+      workerPath: path.join(__dirname, 'sqlite', 'worker.ts'),
+      execArgv: ['--import', 'tsx'],
+    });
+    const secondClient = new DbClient({
+      workerPath: path.join(__dirname, 'sqlite', 'worker.ts'),
+      execArgv: ['--import', 'tsx'],
+    });
+    try {
+      await firstClient.open(dbPath);
+      await secondClient.open(dbPath);
+      const first = new SqliteTaskRepository(firstClient, 'ws');
+      const second = new SqliteTaskRepository(secondClient, 'ws');
+      const topology = {
+        kind: 'graph_v1' as const,
+        nodes: [
+          { nodeId: 'p1' },
+          { nodeId: 'p2' },
+          { nodeId: 'p3' },
+          { nodeId: 'consumer' },
+        ],
+        edges: [
+          { fromNodeId: 'p1', toNodeId: 'consumer', inputRef: 'from_p1' },
+          { fromNodeId: 'p2', toNodeId: 'consumer', inputRef: 'from_p2' },
+          { fromNodeId: 'p3', toNodeId: 'consumer', inputRef: 'from_p3' },
+        ],
+      };
+      const createdAt = '2026-07-22T05:00:00.000Z';
+      await first.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-three',
+        version: 1,
+        name: 'three',
+        topology,
+        createdAt,
+      });
+      const started = await first.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: 'ws',
+        definitionId: 'wf-three',
+        version: 1,
+        startIdempotencyKey: 'three-start',
+        createdAt,
+        goal: 'three producer fan-in',
+        backend: 'grok',
+      });
+      const data = started.operation?.result.data as {
+        runId: string;
+        entries: Array<{ nodeId: string; taskId: string; activationTurnId: string }>;
+        nodeGates: Array<{ nodeId: string; gateId: string }>;
+      };
+      const entries = new Map(data.entries.map((entry) => [entry.nodeId, entry]));
+      const gateId = data.nodeGates.find((gate) => gate.nodeId === 'consumer')!.gateId;
+
+      const commandFor = async (
+        repository: SqliteTaskRepository,
+        nodeId: string,
+        result: string,
+        finishedAt: string,
+      ) => {
+        const entry = entries.get(nodeId)!;
+        await firstClient.run(
+          `UPDATE turns SET status = 'running', started_at = ?
+            WHERE workspace_id = 'ws' AND id = ?`,
+          [createdAt, entry.activationTurnId],
+        );
+        const task = await repository.getTask(entry.taskId);
+        const turn = await repository.getTurn(entry.activationTurnId);
+        return {
+          kind: 'settleTurnAndApplyEffects' as const,
+          workspaceId: 'ws',
+          expectedTaskRevision: task!.revision,
+          task: { ...task!, updatedAt: finishedAt },
+          turn: {
+            ...turn!,
+            status: 'succeeded' as const,
+            finishedAt,
+            disposition: { kind: 'workflow_next' as const, change: 'updated' as const, result },
+          },
+          expectedStatuses: ['running' as const],
+          relatedTurns: [],
+          messages: [],
+        };
+      };
+
+      await first.execute(await commandFor(first, 'p1', 'value-one', '2026-07-22T05:01:00.000Z'));
+      const p2 = await commandFor(first, 'p2', 'value-two', '2026-07-22T05:02:00.000Z');
+      const p3 = await commandFor(second, 'p3', 'value-three', '2026-07-22T05:02:00.000Z');
+      const finalResults = await Promise.all([first.execute(p2), second.execute(p3)]);
+      expect(finalResults.every((result) => result.changed === true)).toBe(true);
+
+      const gate = await firstClient.get<{ status: string }>(
+        `SELECT status FROM workflow_dependency_gates
+          WHERE workspace_id = 'ws' AND run_id = ? AND gate_id = ?`,
+        [data.runId, gateId],
+      );
+      expect(gate?.status).toBe('satisfied');
+      const consumer = await firstClient.get<{ task_id: string }>(
+        `SELECT task_id FROM workflow_nodes
+          WHERE workspace_id = 'ws' AND run_id = ? AND node_id = 'consumer'`,
+        [data.runId],
+      );
+      const turns = await first.listTurns(consumer!.task_id);
+      expect(turns).toHaveLength(1);
+      const messageId = turns[0]!.inputs.find((input) => input.kind === 'message')?.messageId;
+      const message = await firstClient.get<{ content: string }>(
+        `SELECT content FROM messages WHERE workspace_id = 'ws' AND id = ?`,
+        [messageId!],
+      );
+      expect(message?.content).toBe(
+        '[workflow-aggregate] from_p1=value-one from_p2=value-two from_p3=value-three',
+      );
+      expect(message?.content).not.toMatch(/missing|\[artifact /);
+      expect(
+        await firstClient.all(
+          `SELECT activation_id FROM workflow_activations
+            WHERE workspace_id = 'ws' AND run_id = ? AND source_gate_id = ?`,
+          [data.runId, gateId],
+        ),
+      ).toHaveLength(1);
+    } finally {
+      await Promise.all([
+        firstClient.close().catch(() => undefined),
+        secondClient.close().catch(() => undefined),
+      ]);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 45_000);
+
   it('M018 S02 flow: public define graph_v1 + start activates only entry producers', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m018-s02-named-'));
     const dbPath = path.join(dir, 'muster.sqlite3');

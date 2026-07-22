@@ -231,7 +231,7 @@ export async function run(): Promise<void> {
   await extension.activate();
 
   const { clientMod, schema, workerPath, maintenance } = loadPackaged(extension.extensionPath);
-  assert.equal(schema.SQLITE_SCHEMA_VERSION, 8);
+  assert.equal(schema.SQLITE_SCHEMA_VERSION, 9);
   const runtimeClass = process.env.MUSTER_PHASE5_RUNTIME_CLASS || 'stable';
   const outPath = process.env.MUSTER_PHASE5_SCENARIO_OUT;
   assert.ok(outPath, 'MUSTER_PHASE5_SCENARIO_OUT required');

@@ -82,7 +82,7 @@ describe('stageDisposition idempotency', () => {
     expect(second).toEqual({ ok: false, reason: 'same opId with different disposition' });
   });
 
-  it('rejects a different opId once staged', () => {
+  it('replays the same canonical disposition under a different opId', () => {
     const first = stageDisposition(live, { kind: 'idle' }, 'op-1', {});
     expect(first.ok).toBe(true);
     if (!first.ok) {
@@ -90,10 +90,7 @@ describe('stageDisposition idempotency', () => {
     }
 
     const second = stageDisposition(first.next.turn, { kind: 'idle' }, 'op-2', {});
-    expect(second).toEqual({
-      ok: false,
-      reason: 'disposition already staged with a different opId',
-    });
+    expect(second.ok).toBe(true);
   });
 
   it('clamps over-long complete/fail payloads', () => {

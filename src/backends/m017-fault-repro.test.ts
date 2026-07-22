@@ -298,6 +298,7 @@ describe('M017 R2 GREEN — settle once + awaiting_parent_seal (S02)', () => {
     const gate = new Promise<void>((resolve) => {
       resume = resolve;
     });
+    let sessionSequence = 0;
 
     const engine = await TaskEngine.loadAsync({
       repository,
@@ -305,8 +306,9 @@ describe('M017 R2 GREEN — settle once + awaiting_parent_seal (S02)', () => {
       makeBackend: (name) => ({
         name,
         capabilities: MCP_CAPS,
-        async *run(_options: RunOptions): AsyncIterable<NormalizedEvent> {
-          yield { type: 'sessionStarted', sessionId: 'sess-1' };
+        async *run(options: RunOptions): AsyncIterable<NormalizedEvent> {
+          const sessionId = options.resumeId ?? `sess-${++sessionSequence}`;
+          yield { type: 'sessionStarted', sessionId };
           yield { type: 'assistantDelta', content: 'working', messageId: 'm1' };
           await gate;
           yield { type: 'turnCompleted' };

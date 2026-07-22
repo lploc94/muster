@@ -102,7 +102,7 @@ describe('M018 S01 one-node workflow activation', () => {
     ).toBe(false);
   });
 
-  it('define + start produces exactly one durable satisfied entry activation turn', async () => {
+  it('one-node top-level updated success and replay', async () => {
     const ctx = await openRepo('start');
     try {
       const createdAt = '2026-07-19T00:00:00.000Z';
@@ -237,6 +237,65 @@ describe('M018 S01 one-node workflow activation', () => {
         await ctx.client.all('SELECT run_id FROM workflow_runs WHERE workspace_id = ?', ['ws']),
       ).toHaveLength(1);
       expect(await ctx.repository.listTurns(payload.entryTaskId)).toHaveLength(1);
+
+      await ctx.client.run(
+        `UPDATE turns SET status = 'running', started_at = ?
+          WHERE workspace_id = ? AND id = ?`,
+        ['2026-07-19T00:00:01.000Z', 'ws', payload.activationTurnId],
+      );
+      const runningTurn = await ctx.repository.getTurn(payload.activationTurnId);
+      const currentTask = await ctx.repository.getTask(payload.entryTaskId);
+      expect(runningTurn).toBeTruthy();
+      expect(currentTask).toBeTruthy();
+      const settleCommand = {
+        kind: 'settleTurnAndApplyEffects' as const,
+        workspaceId: 'ws',
+        expectedTaskRevision: currentTask!.revision,
+        task: {
+          ...currentTask!,
+          updatedAt: '2026-07-19T00:00:02.000Z',
+        },
+        turn: {
+          ...runningTurn!,
+          status: 'succeeded' as const,
+          finishedAt: '2026-07-19T00:00:02.000Z',
+          disposition: {
+            kind: 'workflow_next' as const,
+            change: 'updated' as const,
+            result: 'terminal result',
+          },
+        },
+        expectedStatuses: ['running' as const],
+        relatedTurns: [],
+        messages: [],
+      };
+      await expect(ctx.repository.execute(settleCommand)).resolves.toMatchObject({ changed: true });
+      await expect(ctx.repository.execute(settleCommand)).resolves.toMatchObject({ changed: false });
+      expect(
+        await ctx.client.get(
+          `SELECT status FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
+          ['ws', payload.runId],
+        ),
+      ).toMatchObject({ status: 'succeeded' });
+      expect(
+        await ctx.client.get(
+          `SELECT status FROM workflow_dependency_gates WHERE workspace_id = ? AND run_id = ?`,
+          ['ws', payload.runId],
+        ),
+      ).toMatchObject({ status: 'consumed' });
+      expect(
+        await ctx.client.all(
+          `SELECT kind, payload_json FROM workflow_artifacts
+            WHERE workspace_id = ? AND run_id = ? AND kind = 'next_result'`,
+          ['ws', payload.runId],
+        ),
+      ).toEqual([
+        expect.objectContaining({
+          kind: 'next_result',
+          payload_json: expect.stringContaining('terminal result'),
+        }),
+      ]);
+      await expect(ctx.repository.getTask(payload.entryTaskId)).resolves.toMatchObject({ lifecycle: 'open' });
     } finally {
       await ctx.close();
     }

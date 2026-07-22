@@ -502,7 +502,6 @@ export class TaskEngine {
   >();
   /** Queued turns preserved on reload — start only via resumeQueuedTurn. */
   private readonly deferredQueuedTurns = new Set<string>();
-  private readonly acceptedOpIds = new Map<string, string>();
   private readonly turnPromises = new Map<string, Promise<void>>();
   private shuttingDown = false;
   /** Terminal storage latch: zero repository writes after this (distinct from graceful shutdown). */
@@ -667,7 +666,6 @@ export class TaskEngine {
     }
     this.liveRuns.clear();
     this.streamFailureHandlers.clear();
-    this.acceptedOpIds.clear();
     this.deferredQueuedTurns.clear();
     this.settling.clear();
     try {
@@ -1671,7 +1669,6 @@ export class TaskEngine {
       if (handle.taskId !== params.taskId) continue;
       handle.interruptArmed = true;
       handle.controller.abort();
-      this.acceptedOpIds.delete(turnId);
       this.askBridge.cancelForTurn(turnId, 'runtime switch');
       this.dropElicitationWaits(turnId);
       this.credentialRegistry?.revoke(turnId);
@@ -1929,7 +1926,7 @@ export class TaskEngine {
     const task = await this.repository.getTask(turn.taskId);
     if (!task) return { ok: false, reason: 'task not found' };
     const result = stageDisposition(turn, disposition, opId, {
-      acceptedOpId: this.acceptedOpIds.get(turnId), limits: this.limits,
+      limits: this.limits,
     });
     if (!result.ok) return result;
     const write = await this.repository.execute({
@@ -1941,7 +1938,6 @@ export class TaskEngine {
     if (!write.changed && JSON.stringify(result.next.turn) !== JSON.stringify(turn)) {
       return { ok: false, reason: write.reason ?? 'turn changed; retry' };
     }
-    this.acceptedOpIds.set(turnId, opId);
     return { ok: true, value: undefined };
   }
 
@@ -2194,7 +2190,7 @@ export class TaskEngine {
     for (const turnId of prepared.liveTurnIds) {
       if (prepared.remoteLiveTurnIds.has(turnId)) continue;
       this.liveRuns.get(turnId)?.controller.abort();
-      this.acceptedOpIds.delete(turnId); this.askBridge.cancelForTurn(turnId, 'task skipped'); this.dropElicitationWaits(turnId); this.credentialRegistry?.revoke(turnId);
+      this.askBridge.cancelForTurn(turnId, 'task skipped'); this.dropElicitationWaits(turnId); this.credentialRegistry?.revoke(turnId);
     }
     this.rescanSchedulableTurns();
     return { ok: true, value: undefined };
@@ -2221,7 +2217,7 @@ export class TaskEngine {
     for (const turnId of prepared.liveTurnIds) {
       if (prepared.remoteLiveTurnIds.has(turnId)) continue;
       this.liveRuns.get(turnId)?.controller.abort();
-      this.acceptedOpIds.delete(turnId); this.askBridge.cancelForTurn(turnId, 'task cancelled'); this.dropElicitationWaits(turnId); this.credentialRegistry?.revoke(turnId);
+      this.askBridge.cancelForTurn(turnId, 'task cancelled'); this.dropElicitationWaits(turnId); this.credentialRegistry?.revoke(turnId);
     }
     this.rescanSchedulableTurns();
     return { ok: true, value: undefined };
@@ -4584,7 +4580,6 @@ export class TaskEngine {
         this.streamBatcher.disposeTurn(turnId);
       }
       this.liveRuns.delete(turnId);
-      this.acceptedOpIds.delete(turnId);
       if (this.credentialRegistry) {
         cleanupTurnResources(this.graphDeps(), turnId, mcpConfigPath);
       }

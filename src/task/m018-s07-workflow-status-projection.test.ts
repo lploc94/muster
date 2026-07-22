@@ -292,22 +292,29 @@ describe('M018 S07 bounded workflow status projection', () => {
           createdAt,
         ],
       );
-      // Attach one of the parent entry tasks to the child run for projection lookup.
+      // Use a distinct child task; schema v9 forbids one task belonging to two runs.
       const p2 = parentStart.entries.find((e) => e.nodeId === 'p2')!;
-      await ctx.client.run(
-        `UPDATE workflow_nodes SET run_id = ?, node_id = 'entry'
-          WHERE workspace_id = ? AND task_id = ?`,
-        [childRunId, 'ws', p2.taskId],
-      );
-      // Ensure a node row exists under the child run (UPDATE may leave original if no match path)
+      const parentTask = await ctx.repository.getTask(p2.taskId);
+      const childTaskId = 's07-child-projection-task';
+      await ctx.repository.execute({
+        kind: 'createTask',
+        workspaceId: 'ws',
+        task: {
+          ...parentTask!,
+          id: childTaskId,
+          parentId: p2.taskId,
+          revision: 0,
+          createdAt,
+          updatedAt: createdAt,
+        },
+      });
       await ctx.client.run(
         `INSERT INTO workflow_nodes (workspace_id, run_id, node_id, task_id, status)
-         VALUES (?,?,?,?,?)
-         ON CONFLICT(workspace_id, run_id, node_id) DO UPDATE SET task_id = excluded.task_id`,
-        ['ws', childRunId, 'entry', p2.taskId, 'open'],
+         VALUES (?,?,?,?,?)`,
+        ['ws', childRunId, 'entry', childTaskId, 'open'],
       );
 
-      const childProj = await ctx.repository.getWorkflowStatusForTask(p2.taskId);
+      const childProj = await ctx.repository.getWorkflowStatusForTask(childTaskId);
       expect(childProj).toBeTruthy();
       assertBoundedProjection(childProj!);
       expect(childProj!.runId).toBe(childRunId);

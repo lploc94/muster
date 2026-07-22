@@ -506,7 +506,7 @@ describe('M018 S04 PREV feedback ALL-join', () => {
           WHERE workspace_id = ? AND run_id = ? AND round_id = ?`,
         ['ws', data.runId, roundId],
       );
-      expect(roundAfterFinal).toMatchObject({ status: 'consumed' });
+      expect(roundAfterFinal).toMatchObject({ status: 'satisfied' });
       const targetsAfterFinal = await ctx.client.all(
         `SELECT target_node_id, status FROM workflow_feedback_targets
           WHERE workspace_id = ? AND run_id = ? AND round_id = ?
@@ -533,9 +533,8 @@ describe('M018 S04 PREV feedback ALL-join', () => {
       // Frozen dependency declaration order: from_p1 then from_p2 (not arrival order).
       expect(resumeContent.indexOf('from_p1=')).toBeLessThan(resumeContent.indexOf('from_p2='));
       const p1Artifact = deriveProducerArtifactId(data.runId, 'p1');
-      const p2Artifact = deriveProducerArtifactId(data.runId, 'p2');
       expect(resumeContent).toContain('from_p1=p1-v2');
-      expect(resumeContent).toContain(`from_p2=[artifact ${p2Artifact}@2]`);
+      expect(resumeContent).toContain('from_p2=p2-v2');
 
       // Response redelivery after ledger prune is a no-op (no second resume).
       await ctx.client.run(
@@ -576,6 +575,13 @@ describe('M018 S04 PREV feedback ALL-join', () => {
       );
       expect(invalidPrev.ok).toBe(true);
       expect(
+        await ctx.client.get(
+          `SELECT status FROM workflow_feedback_rounds
+            WHERE workspace_id = ? AND run_id = ? AND round_id = ?`,
+          ['ws', data.runId, roundId],
+        ),
+      ).toMatchObject({ status: 'consumed' });
+      expect(
         await ctx.client.all(
           `SELECT round_id FROM workflow_feedback_rounds WHERE workspace_id = ? AND run_id = ?`,
           ['ws', data.runId],
@@ -583,6 +589,90 @@ describe('M018 S04 PREV feedback ALL-join', () => {
       ).toHaveLength(1);
     } finally {
       await ctx.close();
+    }
+  }, 30_000);
+
+  it('concurrent final feedback responses build one exact aggregate', async () => {
+    const first = await openRepo('prev-concurrent-final');
+    const secondClient = new DbClient({
+      workerPath: path.join(__dirname, 'sqlite', 'worker.ts'),
+      execArgv: ['--import', 'tsx'],
+    });
+    try {
+      await secondClient.open(first.dbPath);
+      const second = new SqliteTaskRepository(secondClient, 'ws');
+      const createdAt = '2026-07-22T06:00:00.000Z';
+      const data = await defineAndStartFanIn(first.repository, createdAt, 's04-concurrent-final');
+      const { p1, p2, consumerTaskId, consumerActivationTurnId } = await activateConsumer(
+        first.repository,
+        first.client,
+        data,
+      );
+      await settleSucceeded(
+        first.repository,
+        first.client,
+        consumerTaskId,
+        consumerActivationTurnId,
+        { kind: 'workflow_prev', targets: 'all', note: 'concurrent' },
+        '2026-07-22T06:01:00.000Z',
+      );
+      const p1Feedback = (await first.repository.listTurns(p1.taskId)).find(
+        (turn) => turn.id !== p1.activationTurnId && turn.status === 'queued',
+      );
+      const p2Feedback = (await first.repository.listTurns(p2.taskId)).find(
+        (turn) => turn.id !== p2.activationTurnId && turn.status === 'queued',
+      );
+      expect(p1Feedback).toBeTruthy();
+      expect(p2Feedback).toBeTruthy();
+
+      const results = await Promise.all([
+        settleSucceeded(
+          first.repository,
+          first.client,
+          p1.taskId,
+          p1Feedback!.id,
+          { kind: 'workflow_next', change: 'updated', result: 'p1-concurrent' },
+          '2026-07-22T06:02:00.000Z',
+        ),
+        settleSucceeded(
+          second,
+          secondClient,
+          p2.taskId,
+          p2Feedback!.id,
+          { kind: 'workflow_next', change: 'updated', result: 'p2-concurrent' },
+          '2026-07-22T06:02:00.000Z',
+        ),
+      ]);
+      expect(results.every((result) => result.changed === true)).toBe(true);
+
+      const round = await first.client.get<{ round_id: string; status: string }>(
+        `SELECT round_id, status FROM workflow_feedback_rounds
+          WHERE workspace_id = 'ws' AND run_id = ?`,
+        [data.runId],
+      );
+      expect(round?.status).toBe('satisfied');
+      const resumes = (await first.repository.listTurns(consumerTaskId)).filter(
+        (turn) => turn.id !== consumerActivationTurnId,
+      );
+      expect(resumes).toHaveLength(1);
+      const messages = (await first.repository.listMessages(consumerTaskId)).filter(
+        (message) => message.turnId === resumes[0]!.id,
+      );
+      expect(messages).toHaveLength(1);
+      expect(messages[0]!.content).toBe(
+        '[workflow-feedback-resume] from_p1=p1-concurrent from_p2=p2-concurrent',
+      );
+      expect(messages[0]!.content).not.toMatch(/missing|\[artifact /);
+      expect(
+        await first.client.all(
+          `SELECT activation_id FROM workflow_activations
+            WHERE workspace_id = 'ws' AND run_id = ? AND feedback_round_id = ?`,
+          [data.runId, round!.round_id],
+        ),
+      ).toHaveLength(1);
+    } finally {
+      await secondClient.close().catch(() => undefined);
+      await first.close();
     }
   }, 30_000);
 
@@ -687,7 +777,7 @@ describe('M018 S04 PREV feedback ALL-join', () => {
           WHERE workspace_id = ? AND run_id = ? AND round_id = ?`,
         ['ws', runId, roundId],
       );
-      expect(roundFinal).toMatchObject({ status: 'consumed' });
+      expect(roundFinal).toMatchObject({ status: 'satisfied' });
 
       const consumerTurns = await reopened.repository.listTurns(consumerTaskId);
       expect(consumerTurns).toHaveLength(2);
@@ -781,7 +871,7 @@ describe('M018 S04 PREV feedback ALL-join', () => {
           WHERE workspace_id = ? AND run_id = ? AND round_id = ?`,
         ['ws', data.runId, roundId],
       );
-      expect(roundFinal).toMatchObject({ status: 'consumed' });
+      expect(roundFinal).toMatchObject({ status: 'satisfied' });
 
       const consumerTurns = await ctx.repository.listTurns(consumerTaskId);
       expect(consumerTurns).toHaveLength(2);

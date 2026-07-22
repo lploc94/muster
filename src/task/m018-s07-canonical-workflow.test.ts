@@ -777,7 +777,7 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
           WHERE workspace_id = ? AND run_id = ? AND round_id = ?`,
         ['ws', childRunId!, roundId],
       );
-      expect(roundAfter).toMatchObject({ status: 'consumed' });
+      expect(roundAfter).toMatchObject({ status: 'satisfied' });
 
       // Verifier receives exactly one resume turn with correction.
       const verifierTurnsAfter = await opened.repository.listTurns(verifierTaskId);

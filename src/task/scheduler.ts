@@ -116,6 +116,13 @@ export function canPromoteTurn(
   if (!task) {
     return { ok: false, reason: 'task not found' };
   }
+  if (
+    turn.workflowActivation &&
+    (turn.workflowActivation.runStatus !== 'running' ||
+      turn.workflowActivation.activationStatus !== 'queued')
+  ) {
+    return { ok: false, reason: 'workflow activation is no longer eligible' };
+  }
 
   const otherLive = turnsForTask(file, turn.taskId).find(
     (t) => t.id !== turnId && LIVE_STATUSES.has(t.status),

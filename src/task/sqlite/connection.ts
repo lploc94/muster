@@ -24,7 +24,11 @@ import {
   MUSTER_APPLICATION_ID,
   MUSTER_WRITER_VERSION_UDF,
   SCHEMA_V7,
+  SCHEMA_V8,
   SCHEMA_V8_MIGRATION_STATEMENTS,
+  SCHEMA_V8_WRITER_GUARD_TRIGGER_NAMES,
+  SCHEMA_V9_MIGRATION_STATEMENTS,
+  SCHEMA_V9_WRITER_GUARD_STATEMENTS,
   SQLITE_SCHEMA_VERSION,
 } from './schema';
 import { MusterSqliteError, mapToMusterSqliteError } from './errors';
@@ -155,20 +159,38 @@ function assertOwnedV7SchemaComplete(db: DatabaseSync): void {
   }
 }
 
+function assertOwnedV8SchemaComplete(db: DatabaseSync): void {
+  try {
+    const failure = findSchemaFingerprintFailure(db, SCHEMA_V8);
+    if (failure) {
+      throw new IncompatibleSchemaError(SCHEMA_V8);
+    }
+  } catch (error) {
+    if (error instanceof IncompatibleSchemaError) throw error;
+    throw new IncompatibleSchemaError(SCHEMA_V8);
+  }
+}
+
 /**
  * Atomically upgrade an owned complete schema-v7 store to the compiled current
  * schema under BEGIN EXCLUSIVE. Any failure before COMMIT rolls back so the
  * original v7 store remains readable and unchanged.
  */
-export function migrateOwnedV7ToCurrent(db: DatabaseSync): void {
+function migrateOwnedV7ToV8(db: DatabaseSync): void {
   db.exec('BEGIN EXCLUSIVE TRANSACTION');
   try {
     const applicationId = readScalar(db, 'application_id');
     const userVersion = readScalar(db, 'user_version');
 
     // Peer already finished migration while we waited on the exclusive lock.
-    if (applicationId === MUSTER_APPLICATION_ID && userVersion === SQLITE_SCHEMA_VERSION) {
-      assertCurrentSchemaComplete(db);
+    if (applicationId === MUSTER_APPLICATION_ID && userVersion >= SCHEMA_V8) {
+      if (userVersion === SCHEMA_V8) {
+        assertOwnedV8SchemaComplete(db);
+      } else if (userVersion === SQLITE_SCHEMA_VERSION) {
+        assertCurrentSchemaComplete(db);
+      } else {
+        throw new IncompatibleSchemaError(userVersion);
+      }
       db.exec('COMMIT');
       return;
     }
@@ -181,8 +203,8 @@ export function migrateOwnedV7ToCurrent(db: DatabaseSync): void {
     for (const statement of SCHEMA_V8_MIGRATION_STATEMENTS) {
       db.exec(statement);
     }
-    db.exec(`PRAGMA user_version = ${SQLITE_SCHEMA_VERSION}`);
-    assertCurrentSchemaComplete(db);
+    db.exec(`PRAGMA user_version = ${SCHEMA_V8}`);
+    assertOwnedV8SchemaComplete(db);
     // Deterministic commit-boundary seam for UAT/tests (no-op without capability).
     maybeInjectFault('migrate');
     db.exec('COMMIT');
@@ -194,6 +216,93 @@ export function migrateOwnedV7ToCurrent(db: DatabaseSync): void {
     }
     throw error;
   }
+}
+
+export function migrateOwnedV8ToCurrent(db: DatabaseSync): void {
+  db.exec('BEGIN EXCLUSIVE TRANSACTION');
+  try {
+    const applicationId = readScalar(db, 'application_id');
+    const userVersion = readScalar(db, 'user_version');
+
+    if (applicationId === MUSTER_APPLICATION_ID && userVersion === SQLITE_SCHEMA_VERSION) {
+      assertCurrentSchemaComplete(db);
+      db.exec('COMMIT');
+      return;
+    }
+    if (applicationId !== MUSTER_APPLICATION_ID || userVersion !== SCHEMA_V8) {
+      throw new IncompatibleSchemaError(userVersion);
+    }
+    assertOwnedV8SchemaComplete(db);
+
+    for (const triggerName of SCHEMA_V8_WRITER_GUARD_TRIGGER_NAMES) {
+      db.exec(`DROP TRIGGER IF EXISTS ${triggerName}`);
+    }
+    for (const statement of SCHEMA_V9_MIGRATION_STATEMENTS) {
+      db.exec(statement);
+    }
+    db.exec(
+      `INSERT INTO session_owners
+       (workspace_id, backend, session_id, task_id, first_bound_at)
+       SELECT task.workspace_id,
+              task.backend,
+              json_extract(task.payload_json, '$.committedSessionId'),
+              task.id,
+              task.updated_at
+         FROM tasks task
+        WHERE typeof(json_extract(task.payload_json, '$.committedSessionId')) = 'text'
+          AND json_extract(task.payload_json, '$.committedSessionId') <> ''
+          AND NOT EXISTS (
+            SELECT 1
+              FROM tasks conflicting
+             WHERE conflicting.workspace_id = task.workspace_id
+               AND conflicting.backend = task.backend
+               AND json_extract(conflicting.payload_json, '$.committedSessionId') =
+                   json_extract(task.payload_json, '$.committedSessionId')
+               AND conflicting.id <> task.id
+          )`,
+    );
+    db.exec(
+      `INSERT INTO task_session_bindings
+       (workspace_id, task_id, runtime_epoch, backend, session_id, active, bound_at, cleared_at)
+       SELECT task.workspace_id,
+              task.id,
+              COALESCE(json_extract(task.payload_json, '$.runtimeEpoch'), 1),
+              task.backend,
+              json_extract(task.payload_json, '$.committedSessionId'),
+              1,
+              task.updated_at,
+              NULL
+         FROM tasks task
+         JOIN session_owners owner
+           ON owner.workspace_id = task.workspace_id
+          AND owner.backend = task.backend
+          AND owner.session_id = json_extract(task.payload_json, '$.committedSessionId')
+          AND owner.task_id = task.id`,
+    );
+    for (const statement of SCHEMA_V9_WRITER_GUARD_STATEMENTS) {
+      db.exec(statement);
+    }
+    const foreignKeyFailures = db.prepare('PRAGMA foreign_key_check').all();
+    if (foreignKeyFailures.length > 0) {
+      throw new IncompatibleSchemaError(SCHEMA_V8);
+    }
+    db.exec(`PRAGMA user_version = ${SQLITE_SCHEMA_VERSION}`);
+    assertCurrentSchemaComplete(db);
+    maybeInjectFault('migrate');
+    db.exec('COMMIT');
+  } catch (error) {
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      // Prefer the original migration failure over a secondary rollback error.
+    }
+    throw error;
+  }
+}
+
+export function migrateOwnedV7ToCurrent(db: DatabaseSync): void {
+  migrateOwnedV7ToV8(db);
+  migrateOwnedV8ToCurrent(db);
 }
 
 /**
@@ -216,7 +325,7 @@ function applyRuntimePragmas(db: DatabaseSync, busyTimeoutMs: number): void {
 }
 
 type ExclusiveOpenDecision = { kind: 'current' } | { kind: 'blank_claimed' };
-type ExistingOpenResult = 'current' | 'migrate_v7' | false;
+type ExistingOpenResult = 'current' | 'migrate_v7' | 'migrate_v8' | false;
 
 /**
  * Private signal: state changed under concurrent first-open (peer bootstrap).
@@ -313,6 +422,10 @@ function tryOpenExistingCurrent(
       assertOwnedV7SchemaComplete(db);
       return 'migrate_v7';
     }
+    if (userVersion === SCHEMA_V8 && Number(SCHEMA_V8) !== Number(SQLITE_SCHEMA_VERSION)) {
+      assertOwnedV8SchemaComplete(db);
+      return 'migrate_v8';
+    }
     throw new IncompatibleSchemaError(userVersion);
   }
   if (userVersion !== 0) {
@@ -333,6 +446,14 @@ function tryOpenExistingCurrent(
     ) {
       assertOwnedV7SchemaComplete(db);
       return 'migrate_v7';
+    }
+    if (
+      appAgain === MUSTER_APPLICATION_ID &&
+      verAgain === SCHEMA_V8 &&
+      Number(SCHEMA_V8) !== Number(SQLITE_SCHEMA_VERSION)
+    ) {
+      assertOwnedV8SchemaComplete(db);
+      return 'migrate_v8';
     }
     if (opts.allowConcurrentNonemptyRetry && appAgain === 0 && verAgain === 0) {
       throw new ConcurrentOpenStateChanged();
@@ -379,6 +500,8 @@ export function openStoreDatabase(opts: OpenOptions): DatabaseSync {
       });
       if (existing === 'migrate_v7') {
         migrateOwnedV7ToCurrent(db);
+      } else if (existing === 'migrate_v8') {
+        migrateOwnedV8ToCurrent(db);
       } else if (!existing) {
         sawBlankPreflight = true;
         // Fresh connection for exclusive claim so page cache cannot retain a

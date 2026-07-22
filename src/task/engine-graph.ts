@@ -47,6 +47,7 @@ export const ACP_DEADLINE_BUFFER_MS = 90_000;
 import { evaluateTaskReadiness } from './readiness';
 import { canPromoteTurn } from './scheduler';
 import type { GraphCommandKind, RepositoryCommand, TaskRepository } from './repository';
+import { durableDispositionClaim } from './disposition-claim';
 import type { WorkflowTaskStatusProjection } from './workflow-types';
 import type { TaskReadPort } from './store-port';
 import {
@@ -422,6 +423,28 @@ async function executeGraphCommand(
   const operation = changedOperations[0]
     ? { ledgerKey: changedOperations[0][0], entry: changedOperations[0][1], createdAt: nowIso(deps.clock) }
     : undefined;
+  const dispositionTurns = changedTurns.filter((turn) => {
+    const beforeDisposition = before.turns[turn.id]?.disposition;
+    return turn.disposition !== undefined && !equalGraphValue(turn.disposition, beforeDisposition);
+  });
+  if (dispositionTurns.length > 1) {
+    return { ok: false, error: 'graph mutation produced multiple disposition claims' };
+  }
+  let dispositionClaim: ReturnType<typeof durableDispositionClaim> | undefined;
+  if (operation && dispositionTurns[0]) {
+    const turn = dispositionTurns[0];
+    const prefix = `${turn.id}:`;
+    if (!operation.ledgerKey.startsWith(prefix)) {
+      return { ok: false, error: 'graph disposition operation is not turn scoped' };
+    }
+    dispositionClaim = durableDispositionClaim({
+      turnId: turn.id,
+      taskId: turn.taskId,
+      runtimeEpoch: turn.runtimeEpoch,
+      opId: operation.ledgerKey.slice(prefix.length),
+      disposition: turn.disposition!,
+    });
+  }
   const expectedTasks = fences.expectedTasks ?? changedTasks
     .filter((task) => before.tasks[task.id] !== undefined)
     .map((task) => ({ id: task.id, revision: before.tasks[task.id]!.revision }));
@@ -443,6 +466,7 @@ async function executeGraphCommand(
     ...(deletedTurnIds.length > 0 ? { deleteTurnIds: deletedTurnIds } : {}),
     ...(deletedMessageIds.length > 0 ? { deleteMessageIds: deletedMessageIds } : {}),
     ...(operation ? { operation } : {}),
+    ...(dispositionClaim ? { dispositionClaim } : {}),
     ...(deletedOperationKeys.length > 0 ? { deleteOperationKeys: deletedOperationKeys } : {}),
     ...(changedCancelRequests.length > 0 ? { cancelRequests: changedCancelRequests } : {}),
     ...(deletedCancelRequestTurnIds.length > 0 ? { deleteCancelRequestTurnIds: deletedCancelRequestTurnIds } : {}),

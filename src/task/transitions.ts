@@ -1505,14 +1505,15 @@ export function stageDisposition(
     };
   }
 
+  if (dispositionsEqual(turn.disposition, bounded)) {
+    return {
+      ok: true,
+      next: { turn, acceptedOpId: options.acceptedOpId ?? opId },
+      effects: [],
+    };
+  }
+
   if (options.acceptedOpId === opId) {
-    if (dispositionsEqual(turn.disposition, bounded)) {
-      return {
-        ok: true,
-        next: { turn, acceptedOpId: opId },
-        effects: [],
-      };
-    }
     return { ok: false, reason: 'same opId with different disposition' };
   }
 

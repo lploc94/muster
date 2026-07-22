@@ -504,6 +504,12 @@ export interface TaskTurn {
   };
   /** Runtime generation captured when the turn is queued. */
   runtimeEpoch?: number;
+  workflowActivation?: {
+    runId: string;
+    activationId: string;
+    runStatus: 'running' | 'succeeded' | 'failed' | 'cancelled';
+    activationStatus: 'queued' | 'running' | 'failed' | 'interrupted' | 'consumed' | 'cancelled';
+  };
   inputs: TurnInput[];
   candidateSessionId?: string;
   observedSessionId?: string;

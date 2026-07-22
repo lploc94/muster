@@ -1166,15 +1166,15 @@ describe('stageDisposition rejections', () => {
       ),
     ).toEqual({ ok: false, reason: 'same opId with different disposition' });
 
-    // Different opId after staging fails closed.
+    // Different opId with the same canonical disposition is an idempotent replay.
     expect(
       stageDisposition(
         first.next.turn,
         { kind: 'workflow_next', change: 'updated', result: 'body' },
         'op-other',
         { limits },
-      ),
-    ).toEqual({ ok: false, reason: 'disposition already staged with a different opId' });
+      ).ok,
+    ).toBe(true);
   });
 
   it('stages workflow_prev idempotently and rejects conflicting replay', () => {
