@@ -4,7 +4,7 @@ import * as path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
 import { openStoreDatabase } from './connection';
-import { verifyBackupArtifact } from './backup';
+import { migrationBackupArtifactPath, verifyBackupArtifact } from './backup';
 import { MusterSqliteError } from './errors';
 import { bootstrapFaultCapability, setFaultPlanForTests } from './fault-inject';
 import { findSchemaFingerprintFailure } from './schema-fingerprint';
@@ -93,6 +93,16 @@ function createPopulatedV8(dbPath: string): void {
        (workspace_id, run_id, gate_id, input_ref, artifact_id, artifact_revision, filled_at)
        VALUES ('ws', 'run', 'gate-a', 'input', 'artifact-a', 1, 'now')`,
     ).run();
+  } finally {
+    db.close();
+  }
+}
+
+function mutateV8(dbPath: string, mutation: (db: DatabaseSync) => void): void {
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.function(MUSTER_WRITER_VERSION_UDF, { deterministic: true }, () => SCHEMA_V8);
+    mutation(db);
   } finally {
     db.close();
   }
@@ -189,6 +199,34 @@ describe('schema v8 to v9 migration', () => {
     } finally {
       db.close();
     }
+
+    const backupPath = migrationBackupArtifactPath(dbPath, SCHEMA_V8, SCHEMA_V9);
+    expect(verifyBackupArtifact(backupPath, SCHEMA_V8)).toMatchObject({
+      schemaVersion: SCHEMA_V8,
+      byteSize: expect.any(Number),
+    });
+  });
+
+  it('requires a verified backup receipt before mutation and preserves v8 bytes on backup failure', () => {
+    const dbPath = tempDbPath('backup-failure-v8.sqlite');
+    createPopulatedV8(dbPath);
+    const before = fs.readFileSync(dbPath);
+    bootstrapFaultCapability({ faultCapability: true });
+    setFaultPlanForTests({ code: 'full', operation: 'backup', remaining: 1 });
+
+    expect(() => openStoreDatabase({ path: dbPath })).toThrow(MusterSqliteError);
+    expect(fs.readFileSync(dbPath)).toEqual(before);
+    expect(fs.existsSync(migrationBackupArtifactPath(dbPath, SCHEMA_V8, SCHEMA_V9))).toBe(false);
+
+    setFaultPlanForTests(undefined);
+    bootstrapFaultCapability(undefined);
+    const source = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      expect(scalar(source, 'user_version')).toBe(SCHEMA_V8);
+      expect(findSchemaFingerprintFailure(source, SCHEMA_V8)).toBeUndefined();
+    } finally {
+      source.close();
+    }
   });
 
   it('rolls back to an exact readable v8 manifest on a migration commit fault', () => {
@@ -208,6 +246,358 @@ describe('schema v8 to v9 migration', () => {
       expect(
         db.prepare(`SELECT COUNT(*) AS n FROM sqlite_schema WHERE type = 'table' AND name = 'workflow_activations'`).get(),
       ).toMatchObject({ n: 0 });
+    } finally {
+      db.close();
+    }
+  });
+
+  it.each([
+    {
+      name: 'duplicate fills',
+      reason: 'duplicate_gate_input_fill',
+      mutate: (db: DatabaseSync) => {
+        db.prepare(
+          `INSERT INTO workflow_artifacts
+           (workspace_id, run_id, artifact_id, producer_node_id, logical_name, revision, kind, payload_json, created_at)
+           VALUES ('ws', 'run', 'artifact-b', 'node-a', 'result', 1, 'next_result', '{}', 'now')`,
+        ).run();
+        db.prepare(
+          `INSERT INTO workflow_gate_fills
+           (workspace_id, run_id, gate_id, input_ref, artifact_id, artifact_revision, filled_at)
+           VALUES ('ws', 'run', 'gate-a', 'input', 'artifact-b', 1, 'now')`,
+        ).run();
+      },
+    },
+    {
+      name: 'missing artifact rows',
+      reason: 'invalid_gate_artifact_reference',
+      mutate: (db: DatabaseSync) => {
+        db.prepare(
+          `UPDATE workflow_gate_fills SET artifact_id = 'missing-artifact'
+            WHERE workspace_id = 'ws' AND run_id = 'run'`,
+        ).run();
+      },
+    },
+    {
+      name: 'orphan relational identities',
+      reason: 'unprovable_relational_identity',
+      mutate: (db: DatabaseSync) => {
+        db.prepare(
+          `UPDATE workflow_gate_bindings SET producer_node_id = 'missing-node'
+            WHERE workspace_id = 'ws' AND run_id = 'run'`,
+        ).run();
+        db.prepare(
+          `UPDATE workflow_artifacts SET producer_node_id = 'missing-node'
+            WHERE workspace_id = 'ws' AND run_id = 'run'`,
+        ).run();
+      },
+    },
+    {
+      name: 'malformed task payload JSON',
+      reason: 'malformed_task_payload',
+      mutate: (db: DatabaseSync) => {
+        db.prepare(
+          `UPDATE tasks SET payload_json = '{'
+            WHERE workspace_id = 'ws' AND id = 'task-a'`,
+        ).run();
+      },
+    },
+    {
+      name: 'duplicate session ownership',
+      reason: 'duplicate_session_ownership',
+      mutate: (db: DatabaseSync) => {
+        db.prepare(
+          `INSERT INTO tasks
+           (id, workspace_id, role, lifecycle, release_state, goal, backend, revision, created_at, updated_at, payload_json)
+           VALUES ('task-b', 'ws', 'worker', 'open', 'released', 'goal', 'grok', 1, 'now', 'now',
+                   '{"committedSessionId":"legacy-session","runtimeEpoch":1}')`,
+        ).run();
+        db.prepare(
+          `INSERT INTO workflow_nodes (workspace_id, run_id, node_id, task_id, status)
+           VALUES ('ws', 'run', 'node-b', 'task-b', 'pending')`,
+        ).run();
+      },
+    },
+    {
+      name: 'invalid session runtime epoch',
+      reason: 'invalid_session_runtime_epoch',
+      mutate: (db: DatabaseSync) => {
+        db.prepare(
+          `UPDATE tasks
+              SET payload_json = '{"committedSessionId":"legacy-session","runtimeEpoch":-1}'
+            WHERE workspace_id = 'ws' AND id = 'task-a'`,
+        ).run();
+      },
+    },
+    {
+      name: 'contradictory feedback identities',
+      reason: 'contradictory_feedback_identity',
+      mutate: (db: DatabaseSync) => {
+        db.prepare(
+          `INSERT INTO workflow_feedback_rounds
+           (workspace_id, run_id, round_id, requester_node_id, status, join_mode, created_at)
+           VALUES ('ws', 'run', 'round-a', 'node-a', 'open', 'ALL', 'now')`,
+        ).run();
+        db.prepare(
+          `INSERT INTO workflow_feedback_targets
+           (workspace_id, run_id, round_id, target_node_id, status)
+           VALUES ('ws', 'run', 'round-a', 'node-a', 'pending')`,
+        ).run();
+        db.prepare(
+          `INSERT INTO workflow_routed_messages
+           (workspace_id, run_id, message_id, source_node_id, destination_node_id, kind, body_json, created_at)
+           VALUES ('ws', 'run', 'feedback-a', 'node-a', 'node-a', 'feedback_request',
+                   '{"roundId":"round-a","requesterNodeId":"node-a","targetNodeId":"wrong-node","feedbackTurnId":"turn-a","baseArtifactId":"artifact-a","baseArtifactRevision":1}',
+                   'now')`,
+        ).run();
+      },
+    },
+    {
+      name: 'malformed feedback JSON',
+      reason: 'contradictory_feedback_identity',
+      mutate: (db: DatabaseSync) => {
+        db.prepare(
+          `INSERT INTO workflow_routed_messages
+           (workspace_id, run_id, message_id, source_node_id, destination_node_id, kind, body_json, created_at)
+           VALUES ('ws', 'run', 'feedback-malformed', 'node-a', 'node-a', 'feedback_request', '{', 'now')`,
+        ).run();
+      },
+    },
+    {
+      name: 'partial child continuations',
+      reason: 'partial_child_continuation',
+      mutate: (db: DatabaseSync) => {
+        db.prepare(
+          `INSERT INTO workflow_continuations
+           (workspace_id, run_id, continuation_id, kind, status, payload_json, created_at)
+           VALUES ('ws', 'run', 'continuation-a', 'child_wait', 'pending', '{}', 'now')`,
+        ).run();
+      },
+    },
+    {
+      name: 'malformed continuation JSON',
+      reason: 'partial_child_continuation',
+      mutate: (db: DatabaseSync) => {
+        db.prepare(
+          `INSERT INTO workflow_continuations
+           (workspace_id, run_id, continuation_id, kind, status, payload_json, created_at)
+           VALUES ('ws', 'run', 'continuation-malformed', 'child_wait', 'pending', '{', 'now')`,
+        ).run();
+      },
+    },
+    {
+      name: 'terminal runs with queued work',
+      reason: 'terminal_run_queued_work',
+      mutate: (db: DatabaseSync) => {
+        db.prepare(
+          `UPDATE workflow_runs SET status = 'succeeded'
+            WHERE workspace_id = 'ws' AND run_id = 'run'`,
+        ).run();
+      },
+    },
+  ])('quarantines $name without preventing open', ({ name: _name, reason, mutate }) => {
+    const dbPath = tempDbPath(`quarantine-${reason}.sqlite`);
+    createPopulatedV8(dbPath);
+    mutateV8(dbPath, mutate);
+
+    const db = openStoreDatabase({ path: dbPath });
+    try {
+      expect(scalar(db, 'user_version')).toBe(SCHEMA_V9);
+      expect(
+        db.prepare(
+          `SELECT reason_code, original_status, row_counts_json
+             FROM workflow_migration_quarantine
+            WHERE workspace_id = 'ws' AND legacy_run_id = 'run'`,
+        ).get(),
+      ).toMatchObject({
+        reason_code: reason,
+        original_status: reason === 'terminal_run_queued_work' ? 'succeeded' : 'running',
+        row_counts_json: expect.any(String),
+      });
+      expect(
+        db.prepare(`SELECT COUNT(*) AS n FROM workflow_runs WHERE workspace_id = 'ws'`).get(),
+      ).toMatchObject({ n: 0 });
+      expect(
+        db.prepare(`SELECT status FROM turns WHERE workspace_id = 'ws' AND id = 'turn-a'`).get(),
+      ).toMatchObject({ status: 'cancelled' });
+      expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('quarantines every run with duplicate task ownership', () => {
+    const dbPath = tempDbPath('quarantine-duplicate-owner.sqlite');
+    createPopulatedV8(dbPath);
+    mutateV8(dbPath, (db) => {
+      db.prepare(
+        `INSERT INTO workflow_runs
+         (workspace_id, run_id, definition_id, definition_version, status, origin, created_at, updated_at)
+         VALUES ('ws', 'run-b', 'def', 1, 'running', 'top_level', 'now', 'now')`,
+      ).run();
+      db.prepare(
+        `INSERT INTO workflow_nodes (workspace_id, run_id, node_id, task_id, status)
+         VALUES ('ws', 'run-b', 'node-b', 'task-a', 'active')`,
+      ).run();
+    });
+
+    const db = openStoreDatabase({ path: dbPath });
+    try {
+      expect(
+        db.prepare(
+          `SELECT COUNT(*) AS n FROM workflow_migration_quarantine
+            WHERE workspace_id = 'ws' AND reason_code = 'duplicate_task_ownership'`,
+        ).get(),
+      ).toMatchObject({ n: 2 });
+      expect(
+        db.prepare(`SELECT COUNT(*) AS n FROM workflow_runs WHERE workspace_id = 'ws'`).get(),
+      ).toMatchObject({ n: 0 });
+      expect(
+        db.prepare(`SELECT status FROM turns WHERE workspace_id = 'ws' AND id = 'turn-a'`).get(),
+      ).toMatchObject({ status: 'cancelled' });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('preserves valid runs while quarantining an invalid run in the same v8 store', () => {
+    const dbPath = tempDbPath('quarantine-all-or-nothing.sqlite');
+    createPopulatedV8(dbPath);
+    mutateV8(dbPath, (db) => {
+      db.prepare(
+        `INSERT INTO tasks
+         (id, workspace_id, role, lifecycle, release_state, goal, backend, revision, created_at, updated_at, payload_json)
+         VALUES ('task-b', 'ws', 'worker', 'open', 'released', 'goal', 'grok', 1, 'now', 'now', '{}')`,
+      ).run();
+      db.prepare(
+        `INSERT INTO turns
+         (id, workspace_id, task_id, sequence, status, trigger, created_at, payload_json)
+         VALUES ('turn-b', 'ws', 'task-b', 1, 'queued', 'workflow', 'now', '{}')`,
+      ).run();
+      db.prepare(
+        `INSERT INTO workflow_runs
+         (workspace_id, run_id, definition_id, definition_version, status, origin, created_at, updated_at)
+         VALUES ('ws', 'run-b', 'def', 1, 'running', 'top_level', 'now', 'now')`,
+      ).run();
+      db.prepare(
+        `INSERT INTO workflow_nodes (workspace_id, run_id, node_id, task_id, status)
+         VALUES ('ws', 'run-b', 'node-b', 'task-b', 'active')`,
+      ).run();
+      db.prepare(
+        `INSERT INTO workflow_dependency_gates
+         (workspace_id, run_id, gate_id, consumer_node_id, status)
+         VALUES ('ws', 'run-b', 'gate-b', 'node-b', 'satisfied')`,
+      ).run();
+      db.prepare(
+        `INSERT INTO workflow_gate_bindings
+         (workspace_id, run_id, gate_id, input_ref, producer_node_id, required_kind)
+         VALUES ('ws', 'run-b', 'gate-b', 'input', 'node-b', 'artifact')`,
+      ).run();
+      db.prepare(
+        `INSERT INTO workflow_gate_fills
+         (workspace_id, run_id, gate_id, input_ref, artifact_id, artifact_revision, filled_at)
+         VALUES ('ws', 'run-b', 'gate-b', 'input', 'missing-artifact', 1, 'now')`,
+      ).run();
+    });
+
+    const db = openStoreDatabase({ path: dbPath });
+    try {
+      expect(
+        db.prepare(`SELECT run_id FROM workflow_runs WHERE workspace_id = 'ws'`).all(),
+      ).toEqual([{ run_id: 'run' }]);
+      expect(
+        db.prepare(
+          `SELECT reason_code FROM workflow_migration_quarantine
+            WHERE workspace_id = 'ws' AND legacy_run_id = 'run-b'`,
+        ).get(),
+      ).toMatchObject({ reason_code: 'invalid_gate_artifact_reference' });
+      expect(
+        db.prepare(`SELECT status FROM turns WHERE workspace_id = 'ws' AND id = 'turn-a'`).get(),
+      ).toMatchObject({ status: 'queued' });
+      expect(
+        db.prepare(`SELECT status FROM turns WHERE workspace_id = 'ws' AND id = 'turn-b'`).get(),
+      ).toMatchObject({ status: 'cancelled' });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('quarantines child inputs whose exact caller-turn authorization is absent from v8', () => {
+    const dbPath = tempDbPath('valid-child-cross-run-provenance.sqlite');
+    createPopulatedV8(dbPath);
+    mutateV8(dbPath, (db) => {
+      db.prepare(
+        `INSERT INTO tasks
+         (id, workspace_id, role, lifecycle, release_state, goal, backend, revision, created_at, updated_at, payload_json)
+         VALUES ('task-child', 'ws', 'worker', 'open', 'released', 'goal', 'grok', 1, 'now', 'now', '{}')`,
+      ).run();
+      db.prepare(
+        `INSERT INTO turns
+         (id, workspace_id, task_id, sequence, status, trigger, created_at, settled_at, payload_json)
+         VALUES ('turn-child', 'ws', 'task-child', 1, 'succeeded', 'workflow', 'now', 'now', '{}')`,
+      ).run();
+      db.prepare(
+        `INSERT INTO workflow_runs
+         (workspace_id, run_id, definition_id, definition_version, status, origin, parent_run_id, created_at, updated_at)
+         VALUES ('ws', 'run-child', 'def', 1, 'succeeded', 'child', 'run', 'now', 'now')`,
+      ).run();
+      db.prepare(
+        `INSERT INTO workflow_nodes (workspace_id, run_id, node_id, task_id, status)
+         VALUES ('ws', 'run-child', 'child-node', 'task-child', 'completed')`,
+      ).run();
+      db.prepare(
+        `INSERT INTO workflow_dependency_gates
+         (workspace_id, run_id, gate_id, consumer_node_id, status)
+         VALUES ('ws', 'run-child', 'child-gate', 'child-node', 'consumed')`,
+      ).run();
+      db.prepare(
+        `INSERT INTO workflow_artifacts
+         (workspace_id, run_id, artifact_id, producer_node_id, logical_name, revision, kind, payload_json, created_at)
+         SELECT workspace_id, 'run-child', artifact_id, producer_node_id, logical_name, revision, kind, payload_json, created_at
+           FROM workflow_artifacts
+          WHERE workspace_id = 'ws' AND run_id = 'run' AND artifact_id = 'artifact-a'`,
+      ).run();
+      db.prepare(
+        `INSERT INTO workflow_gate_fills
+         (workspace_id, run_id, gate_id, input_ref, artifact_id, artifact_revision, filled_at)
+         VALUES ('ws', 'run-child', 'child-gate', 'input', 'artifact-a', 1, 'now')`,
+      ).run();
+      db.prepare(
+        `INSERT INTO workflow_dependency_gates
+         (workspace_id, run_id, gate_id, consumer_node_id, status)
+         VALUES ('ws', 'run', 'return-gate', 'node-a', 'satisfied')`,
+      ).run();
+      db.prepare(
+        `INSERT INTO workflow_continuations
+         (workspace_id, run_id, continuation_id, kind, status, payload_json, created_at)
+         VALUES ('ws', 'run', 'continuation-child', 'child_wait', 'resolved',
+                 '{"childRunId":"run-child","returnGateId":"return-gate","callerNodeId":"node-a","callerTaskId":"task-a"}',
+                 'now')`,
+      ).run();
+      db.prepare(
+        `INSERT INTO workflow_routed_messages
+         (workspace_id, run_id, message_id, source_node_id, destination_node_id, kind, body_json, created_at)
+         VALUES ('ws', 'run', 'child-return', 'child-node', 'node-a', 'child_return',
+                 '{"kind":"child_return","childRunId":"run-child","parentRunId":"run","continuationId":"continuation-child","returnGateId":"return-gate","sourceTurnId":"turn-child"}',
+                 'now')`,
+      ).run();
+    });
+
+    const db = openStoreDatabase({ path: dbPath });
+    try {
+      expect(
+        db.prepare(`SELECT COUNT(*) AS n FROM workflow_runs WHERE workspace_id = 'ws'`).get(),
+      ).toMatchObject({ n: 0 });
+      expect(
+        db.prepare(`SELECT COUNT(*) AS n FROM workflow_migration_quarantine WHERE workspace_id = 'ws'`).get(),
+      ).toMatchObject({ n: 2 });
+      expect(
+        db.prepare(
+          `SELECT reason_code FROM workflow_migration_quarantine
+            WHERE workspace_id = 'ws' AND legacy_run_id = 'run-child'`,
+        ).get(),
+      ).toMatchObject({ reason_code: 'unprovable_relational_identity' });
+      expect(db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
     } finally {
       db.close();
     }
