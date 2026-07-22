@@ -128,7 +128,7 @@ export function safeMessageForCode(code: SqliteErrorCode): string {
     case 'foreign_database':
       return 'Muster refused to open a database owned by another application.';
     case 'incompatible_schema':
-      return 'Muster development database schema is incompatible or incomplete. Close all Muster windows, then use the coordinated reset when available; do not manually delete main/-wal/-shm files separately.';
+      return 'Muster development database schema is incompatible or incomplete.';
     case 'nonempty_unclaimed':
       return 'Muster refused to claim a non-empty unclaimed SQLite file; reset or remove it.';
     case 'schema_changed':

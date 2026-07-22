@@ -65,4 +65,11 @@ describe('P5-W2 SQLite diagnostics', () => {
     expect(recoveryGuidanceFor(diagnostic)).not.toMatch(/reveal|reset|delete/i);
     expect(diagnostic.message).not.toMatch(/muster_writer_version|SELECT |\/Users\//i);
   });
+
+  it('gives incompatible development schemas coordinated destructive-reset guidance', () => {
+    const diagnostic = diagnoseSqliteError(new IncompatibleSchemaError(2), 'open');
+    expect(recoveryGuidanceFor(diagnostic)).toMatch(/Reset Muster Data/i);
+    expect(recoveryGuidanceFor(diagnostic)).toMatch(/permanently deletes/i);
+    expect(recoveryGuidanceFor(diagnostic)).toMatch(/main\/-wal\/-shm/i);
+  });
 });

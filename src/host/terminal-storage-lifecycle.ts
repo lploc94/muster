@@ -12,14 +12,18 @@ export type TerminalStorageLifecycleDiagnostic = {
   [key: string]: unknown;
 };
 
+export const RESET_MUSTER_DATA_ACTION = 'Reset Muster Data';
+export const REVEAL_STORAGE_FOLDER_ACTION = 'Reveal Storage Folder';
+
 export type TerminalStorageLifecycleDeps<TDiag extends TerminalStorageLifecycleDiagnostic = TerminalStorageLifecycleDiagnostic> = {
   diagnose: (error: unknown, operation: 'open' | 'unknown') => TDiag;
   redactedLogFields: (diagnostic: TDiag) => Record<string, unknown>;
   log: (channel: string, fields: Record<string, unknown>) => void;
   quiesce: () => void;
   closeDoomed: (doomed: unknown) => Promise<void>;
-  showError: (message: string, action?: string) => Promise<string | undefined>;
+  showError: (message: string, ...actions: string[]) => Promise<string | undefined>;
   revealStorage: () => Promise<void>;
+  resetStorage?: () => Promise<void> | void;
   /** Optional: Reload Window action for terminal schema_changed. */
   reloadWindow?: () => Promise<void> | void;
   guidanceFor: (diagnostic: TDiag) => string | undefined;
@@ -86,8 +90,19 @@ export function createTerminalStorageLifecycle<
       const guidance = deps.guidanceFor(diagnostic);
       const message = [diagnostic.message, guidance].filter(Boolean).join(' ');
       if (diagnostic.recoveryAction === 'reveal_storage') {
-        const choice = await deps.showError(message, 'Reveal Storage Folder');
-        if (choice === 'Reveal Storage Folder') {
+        const canReset = diagnostic.code === 'incompatible_schema' && deps.resetStorage;
+        const choice = await deps.showError(
+          message,
+          ...(canReset ? [RESET_MUSTER_DATA_ACTION] : []),
+          REVEAL_STORAGE_FOLDER_ACTION,
+        );
+        if (choice === RESET_MUSTER_DATA_ACTION && canReset) {
+          try {
+            await deps.resetStorage?.();
+          } catch {
+            // The coordinated reset command reports its own bounded error.
+          }
+        } else if (choice === REVEAL_STORAGE_FOLDER_ACTION) {
           try {
             await deps.revealStorage();
           } catch {

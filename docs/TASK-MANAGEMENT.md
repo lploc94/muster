@@ -842,7 +842,7 @@ Human-in-the-loop: root tasks use **ACP RFD elicitation**; non-root children use
 | `define_workflow` | Coordinator (`create_child`) | Persist an immutable one-node workflow definition version (`definitionId`+`version`). Same fingerprint replays; conflict fails closed. Topology is frozen `one_node_v1` in S01 |
 | `start_workflow` | Coordinator (`create_child`) | Idempotent compound start (`startIdempotencyKey`) for a frozen definition; creates exactly one ordinary queued entry turn when the entry gate is satisfied. Agents never supply run/task/turn/gate IDs |
 
-**Task types (v1):** Config SoT is resource-scoped VS Code setting `muster.taskTypes` (id → `{ backend, model?, role?, briefKind?, description? }`). Empty registry → create/delegate fail with `task_types_not_configured` (zero mutations). Malformed → `invalid_task_type_config`. Unknown type → `unknown_task_type` even if `backend` override is present. Typo backend id → `backend_unsupported`. No built-in product default types.
+**Task types (v1):** Config SoT is resource-scoped VS Code setting `muster.taskTypes` (id → `{ backend, model?, role?, briefKind?, description? }`). Empty registry → create/delegate fail with `task_types_not_configured` (zero mutations). Malformed → `invalid_task_type_config`. Unknown type → `unknown_task_type` even if `backend` override is present. Typo backend id → `backend_unsupported`. Shipped defaults provide `coordinate`, `plan`, `breakdown`, `explore`, `implement`, `verify`, and `research`; explicit workspace maps remain authoritative and are not silently merged with defaults.
 
 **Happy paths (prefer compound wait fields):**  
 - Simple: `delegate_task({ waitForCompletion: true })`  

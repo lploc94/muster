@@ -3037,15 +3037,20 @@ export async function activate(context: vscode.ExtensionContext) {
     closeDoomed: async (doomed) => {
       await (doomed as DbClient | undefined)?.close();
     },
-    showError: async (message, action) => {
-      if (action) {
-        return vscode.window.showErrorMessage(message, action);
+    showError: async (message, ...actions) => {
+      if (actions.length > 0) {
+        return vscode.window.showErrorMessage(message, ...actions);
       }
       void vscode.window.showErrorMessage(message);
       return undefined;
     },
     revealStorage: async () => {
       await vscode.commands.executeCommand('revealFileInOS', context.globalStorageUri);
+    },
+    resetStorage: async () => {
+      await vscode.commands.executeCommand(MUSTER_DEVELOPER_RESET_COMMAND, {
+        withoutBackupOnly: true,
+      });
     },
     reloadWindow: async () => {
       await vscode.commands.executeCommand('workbench.action.reloadWindow');
@@ -3893,7 +3898,9 @@ function registerSqliteMaintenanceCommands(
     vscode.commands.registerCommand(MUSTER_BACKUP_DATABASE_COMMAND, () =>
       runBackupStandalone(),
     ),
-    vscode.commands.registerCommand(MUSTER_DEVELOPER_RESET_COMMAND, () =>
+    vscode.commands.registerCommand(MUSTER_DEVELOPER_RESET_COMMAND, (
+      options?: { withoutBackupOnly?: boolean },
+    ) =>
       handleDeveloperResetCommand({
         showWarningMessage: async (message, ...items) =>
           vscode.window.showWarningMessage(message, { modal: true }, ...items),
@@ -3985,7 +3992,7 @@ function registerSqliteMaintenanceCommands(
         showInformationMessage: (message) => {
           void vscode.window.showInformationMessage(message);
         },
-      }),
+      }, options),
     ),
   );
 }

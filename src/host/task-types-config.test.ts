@@ -30,9 +30,15 @@ describe('task-types host config', () => {
     expect(entry.default.plan?.backend).toBe('codex');
     expect(entry.default.implement?.backend).toBe('grok');
     expect(entry.default.coordinate?.backend).toBe('opencode');
+    expect(entry.default.explore).toMatchObject({
+      backend: 'opencode',
+      briefKind: 'research',
+    });
     // Ship defaults omit model pins
     expect((entry.default.plan as { model?: string }).model).toBeUndefined();
+    expect((entry.default.explore as { model?: string }).model).toBeUndefined();
     expect(MUSTER_DEFAULT_TASK_TYPES.plan?.backend).toBe('codex');
+    expect(MUSTER_DEFAULT_TASK_TYPES.explore?.backend).toBe('opencode');
   });
 
   it('round-trips a valid map via mock reader', () => {

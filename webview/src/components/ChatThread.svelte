@@ -21,6 +21,7 @@
     capturePrependAnchor,
     decidePrependRestore,
     isNearBottom as isNearBottomMetrics,
+    pinnedAfterScroll,
     pinnedAfterUnlock,
     shouldAutoScrollToBottom,
     type PrependRestoreAttempt,
@@ -65,6 +66,7 @@
   let requestSeq = 0;
   let headerHeight = $state(0);
   let footerHeight = $state(0);
+  let previousScrollTop = 0;
 
   // Non-reactive virtualizer owner (avoids $effect ↔ store feedback loops).
   let virtualizer: Virtualizer<HTMLDivElement, HTMLElement> | null = null;
@@ -372,13 +374,29 @@
     });
   }
 
+  function onWheel(event: WheelEvent): void {
+    if (!scrollLocked && event.deltaY < 0) {
+      pinned = false;
+      if (scrollEl) previousScrollTop = scrollEl.scrollTop;
+    }
+  }
+
   function onScroll() {
     if (!scrollEl) return;
     if (scrollLocked) {
       if (frozenScrollTop !== null) scrollEl.scrollTop = frozenScrollTop;
+      previousScrollTop = scrollEl.scrollTop;
       return;
     }
-    pinned = isNearBottom(scrollEl);
+    const scrollTop = scrollEl.scrollTop;
+    pinned = pinnedAfterScroll(
+      pinned,
+      previousScrollTop,
+      scrollTop,
+      scrollEl.scrollHeight,
+      scrollEl.clientHeight,
+    );
+    previousScrollTop = scrollTop;
     const nearTop = scrollEl.scrollTop <= CHAT_SCROLL_TOP_THRESHOLD_PX;
     if (nearTop && !wasNearTop) {
       requestOlder(false);
@@ -483,8 +501,8 @@
     void thread.items.length;
     void thread.streaming?.text;
     void thread.revision;
-    if (scrollEl && !scrollLocked && !restoringPrependAnchor) {
-      pinned = isNearBottom(scrollEl);
+    if (scrollEl && !scrollLocked && !restoringPrependAnchor && pinned && !isNearBottom(scrollEl)) {
+      pinned = false;
     }
   });
 
@@ -864,6 +882,7 @@
   <div
     bind:this={scrollEl}
     onscroll={onScroll}
+    onwheel={onWheel}
     class="relative flex-1 min-h-0 overflow-y-auto overscroll-contain"
     data-testid="chat-thread-scroll"
   >

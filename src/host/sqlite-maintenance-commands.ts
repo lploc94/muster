@@ -18,7 +18,7 @@ export const RESET_MODAL_MESSAGE =
   'This permanently deletes every Muster conversation, task, and durable datum for every workspace in the current VS Code profile and extension-host authority. Settings and secrets are not deleted. This cannot be undone.';
 
 export const RESET_CHOICE_BACKUP = 'Back Up and Reset';
-export const RESET_CHOICE_WITHOUT_BACKUP = 'Reset Without Backup';
+export const RESET_CHOICE_WITHOUT_BACKUP = 'Delete All Muster Data';
 
 export type MaintenanceUri = { fsPath: string; scheme?: string };
 
@@ -31,6 +31,10 @@ export type ResetCommandResult =
   | { kind: 'cancel' }
   | { kind: 'success' }
   | { kind: 'error'; code: string; message: string; recoveryAction?: string };
+
+export type DeveloperResetCommandOptions = {
+  withoutBackupOnly?: boolean;
+};
 
 export type BackupCommandDeps = {
   showSaveDialog: (opts: {
@@ -149,6 +153,7 @@ export async function handleBackupDatabaseCommand(
  */
 export async function handleDeveloperResetCommand(
   deps: ResetCommandDeps,
+  options: DeveloperResetCommandOptions = {},
 ): Promise<ResetCommandResult> {
   if (deps.isMaintenanceActive()) {
     const message = safeMessageForCode('busy');
@@ -163,14 +168,17 @@ export async function handleDeveloperResetCommand(
     try {
       choice = await deps.showWarningMessage(
         RESET_MODAL_MESSAGE,
-        RESET_CHOICE_BACKUP,
+        ...(options.withoutBackupOnly ? [] : [RESET_CHOICE_BACKUP]),
         RESET_CHOICE_WITHOUT_BACKUP,
       );
     } catch {
       return { kind: 'cancel' };
     }
 
-    if (choice !== RESET_CHOICE_BACKUP && choice !== RESET_CHOICE_WITHOUT_BACKUP) {
+    if (
+      choice !== RESET_CHOICE_WITHOUT_BACKUP
+      && (!options.withoutBackupOnly && choice !== RESET_CHOICE_BACKUP)
+    ) {
       return { kind: 'cancel' };
     }
 

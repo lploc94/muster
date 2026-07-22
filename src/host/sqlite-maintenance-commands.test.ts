@@ -249,7 +249,11 @@ describe('sqlite maintenance commands (P5-W5)', () => {
     const order: string[] = [];
     const backup = vi.fn();
     await handleDeveloperResetCommand({
-      showWarningMessage: async () => RESET_CHOICE_WITHOUT_BACKUP,
+      showWarningMessage: async (message, ...items) => {
+        expect(message).toBe(RESET_MODAL_MESSAGE);
+        expect(items).toEqual([RESET_CHOICE_WITHOUT_BACKUP]);
+        return RESET_CHOICE_WITHOUT_BACKUP;
+      },
       runBackupFlow: backup,
       quiesceForMaintenance: async () => {
         order.push('quiesce');
@@ -265,7 +269,7 @@ describe('sqlite maintenance commands (P5-W5)', () => {
       showInformationMessage: vi.fn(),
       isMaintenanceActive: () => false,
       setMaintenanceActive: vi.fn(),
-    });
+    }, { withoutBackupOnly: true });
     expect(backup).not.toHaveBeenCalled();
     expect(order).toEqual(['quiesce', 'reset', 'reload']);
   });

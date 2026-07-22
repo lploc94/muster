@@ -5,6 +5,7 @@ import {
   firstVisibleTranscriptId,
   isNearBottom,
   isNearTop,
+  pinnedAfterScroll,
   pinnedAfterUnlock,
   resolveLockedScrollTop,
   restorePrependScrollTop,
@@ -24,6 +25,12 @@ describe('chat-scroll continuity', () => {
     expect(isNearTop(0)).toBe(true);
     expect(isNearTop(40)).toBe(true);
     expect(isNearTop(120)).toBe(false);
+  });
+
+  it('unpins on any upward scroll, even within the bottom threshold', () => {
+    expect(pinnedAfterScroll(true, 920, 900, 1000, 100)).toBe(false);
+    expect(pinnedAfterScroll(false, 900, 920, 1000, 100)).toBe(true);
+    expect(pinnedAfterScroll(false, 920, 920, 1000, 100)).toBe(false);
   });
 
   it('freezes scrollTop while locked', () => {

@@ -122,6 +122,9 @@ export function redactedDiagnosticLogFields(
 export function recoveryGuidanceFor(diagnostic: SqliteDiagnostic): string {
   switch (diagnostic.recoveryAction) {
     case 'reveal_storage':
+      if (diagnostic.code === 'incompatible_schema') {
+        return 'Choose Reset Muster Data to rebuild an empty current database. This permanently deletes all Muster conversations and tasks in this VS Code profile. Close other Muster windows first; do not manually delete main/-wal/-shm files separately.';
+      }
       return 'You can reveal the Muster global storage folder to inspect the database. Close every Muster window before any manual handling; do not delete main/-wal/-shm files separately.';
     case 'reload_window':
       return 'Reload this window to continue with the upgraded schema.';
