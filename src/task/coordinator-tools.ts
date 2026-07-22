@@ -146,7 +146,7 @@ export type ToolCommand =
       reason?: string;
     }
   | { kind: 'wait_for_tasks'; opId: string; taskIds: string[] }
-  | { kind: 'get_task_status'; taskId?: string }
+  | { kind: 'inspect_workflow_run'; runId: string }
   | { kind: 'get_host_context' }
   | { kind: 'list_task_types' }
   | { kind: 'complete_task'; opId: string; result: string; verdict?: VerdictInput }
@@ -185,8 +185,6 @@ export type ToolCommand =
       }[];
       childIdempotencyKey?: string;
     }
-  | { kind: 'report_progress'; opId: string; note: string }
-  | { kind: 'ask_user'; opId: string; questions: Question[] }
   | { kind: 'ask_parent'; opId: string; questions: Question[] }
   | {
       kind: 'answer_child_question';
@@ -245,7 +243,6 @@ const MUTATING_TOOLS: ReadonlySet<string> = new Set([
   'workflow_prev',
   'workflow_fail',
   'invoke_child_workflow',
-  'report_progress',
   'ask_parent',
   'answer_child_question',
   'upsert_presentation',
@@ -266,7 +263,7 @@ function toolActionForName(name: string): ToolAction | undefined {
     'continue_child',
     'set_task_lifecycle',
     'wait_for_tasks',
-    'get_task_status',
+    'inspect_workflow_run',
     'get_host_context',
     'list_task_types',
     'complete_task',
@@ -275,7 +272,6 @@ function toolActionForName(name: string): ToolAction | undefined {
     'workflow_prev',
     'workflow_fail',
     'invoke_child_workflow',
-    'report_progress',
       'ask_parent',
     'answer_child_question',
     'upsert_presentation',
@@ -1211,13 +1207,6 @@ export function dispatch(
           },
         };
       }
-      case 'report_progress': {
-        const note = requireString(args, 'note');
-        if (!note) {
-          return { ok: false, toolError: 'note is required' };
-        }
-        return { ok: true, command: { kind: 'report_progress', opId, note } };
-      }
       case 'ask_parent': {
         const questions = parseQuestions(args.questions);
         if (!questions) {
@@ -1246,16 +1235,6 @@ export function dispatch(
             questionId,
             answers: rawAnswers as string[],
           },
-        };
-      }
-      case 'ask_user': {
-        const questions = parseQuestions(args.questions);
-        if (!questions) {
-          return { ok: false, toolError: 'invalid questions array' };
-        }
-        return {
-          ok: true,
-          command: { kind: 'ask_user', opId, questions },
         };
       }
       case 'upsert_presentation': {
@@ -1395,9 +1374,15 @@ export function dispatch(
     }
   }
 
-  if (tool === 'get_task_status') {
-    const taskId = typeof args.taskId === 'string' ? args.taskId : undefined;
-    return { ok: true, command: { kind: 'get_task_status', taskId } };
+  if (tool === 'inspect_workflow_run') {
+    if (Object.keys(args).some((key) => key !== 'runId')) {
+      return { ok: false, toolError: 'inspect_workflow_run accepts only runId' };
+    }
+    const runId = requireString(args, 'runId');
+    if (!runId) {
+      return { ok: false, toolError: 'runId is required' };
+    }
+    return { ok: true, command: { kind: 'inspect_workflow_run', runId } };
   }
 
   if (tool === 'get_host_context') {

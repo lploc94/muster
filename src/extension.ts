@@ -116,6 +116,7 @@ import {
 import { enumerateModels, type BackendModels } from './backends/model-catalog';
 import { type RetentionConfig } from './task/retention';
 import { TaskEngine, type EngineEvent } from './task/engine';
+import { parseRuntimeFallbackChain } from './task/task-types';
 import type { HostEnvironmentSnapshot } from './task/host-context';
 import type { TaskReadPort } from './task/store-port';
 import { SqliteTaskRepository, type TaskRepository } from './task/repository';
@@ -153,7 +154,7 @@ import { WorkspaceRegistry } from './task/sqlite/workspace-registry';
 import { resolveWorkspaceIdentity, type WorkspaceContext } from './task/sqlite/workspace-identity';
 import { isTerminalLifecycle } from './task/transitions';
 import { resolveWorkspaceCwd } from './task/workspace-cwd';
-import type { EngineProjection } from './task/types';
+import type { EngineProjection, MusterTask } from './task/types';
 import { runLimitMs } from './task/execution-policy';
 import { resourceLimitsFromSettings } from './task/limits';
 import { USER_INTERACTION_TIMEOUT_MS } from './host/interaction-timeouts';
@@ -255,6 +256,19 @@ function readExplicitTaskTypesRaw(cwd?: string): unknown {
 /** Live resource-scoped muster.taskTypes for caller cwd (or workspace default). */
 function getTaskTypeRegistry(cwd?: string) {
   return loadTaskTypeRegistry((folderCwd) => readExplicitTaskTypesRaw(folderCwd), cwd);
+}
+
+function getRuntimeFallbacks(task: MusterTask) {
+  const registry = getTaskTypeRegistry(task.cwd);
+  const taskTypeFallbacks = task.taskType && registry.status === 'ok'
+    ? registry.registry.get(task.taskType)?.fallbacks
+    : undefined;
+  if (taskTypeFallbacks !== undefined) return taskTypeFallbacks;
+  const resource = task.cwd ? vscode.Uri.file(task.cwd) : undefined;
+  const raw = vscode.workspace
+    .getConfiguration('muster.execution', resource)
+    .get('fallbacks');
+  return parseRuntimeFallbackChain(raw);
 }
 let presentationManager: PresentationManager | undefined;
 const activePendingAsks = new Map<string, PendingAskOverlay>();
@@ -3668,6 +3682,7 @@ export async function activate(context: vscode.ExtensionContext) {
       getHostEnvironment,
       workspaceFolder: resolveTaskCwd(),
       getTaskTypeRegistry,
+      getRuntimeFallbacks,
       // ACP skill invocation: read-only peek at the shared client's advertised
       // command set (keyed by backend id == AcpAgentConfig.key). Never spawns.
       getAdvertisedCommands: (backend: string) =>

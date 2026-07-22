@@ -6,6 +6,7 @@ import {
   HOST_RULES_COORDINATOR,
   HOST_RULES_TASK_TYPES,
   HOST_RULES_WORKER,
+  HOST_RULE_WORKFLOW_DISPOSITION,
   buildHostContext,
   formatHostContextMarkdown,
   minimalHostSnapshot,
@@ -42,13 +43,13 @@ describe('buildHostContext', () => {
         model: 'deepseek-v4-flash',
         goal: 'Ship feature',
       },
-      tools: ['create_task', 'wait_for_tasks', 'set_task_lifecycle'],
+      tools: ['define_workflow', 'start_workflow', 'inspect_workflow_run'],
     });
     expect(ctx.version).toBe(1);
     expect(ctx.workspace).toEqual({ cwd: '/workspace', trusted: true });
     expect(ctx.availableBackends).toEqual(['opencode', 'codex']);
     expect(ctx.models?.opencode?.current).toBe('deepseek-v4-flash');
-    expect(ctx.tools).toContain('set_task_lifecycle');
+    expect(ctx.tools).toContain('define_workflow');
     expect(ctx.scope).toBeUndefined();
     expect(ctx.rules).toEqual([...HOST_RULES_BASE, ...HOST_RULES_COORDINATOR]);
   });
@@ -62,17 +63,52 @@ describe('buildHostContext', () => {
         backend: 'opencode',
         parentTaskId: 'root',
       },
-      tools: ['create_task'],
+      tools: ['get_host_context'],
     });
     expect(ctx.availableBackends).toBeUndefined();
     expect(ctx.models).toBeUndefined();
     expect(ctx.tools).toBeUndefined();
     expect(ctx.scope).toEqual({
       singleTask: true,
-      completeVia: 'complete_task',
       doNot: expect.arrayContaining(['create siblings or pick next work']),
     });
     expect(ctx.rules).toEqual([...HOST_RULES_BASE, ...HOST_RULES_WORKER]);
+  });
+
+  it('gives workflow workers only workflow disposition guidance', () => {
+    const ctx = buildHostContext({
+      snapshot: baseSnapshot(),
+      self: {
+        taskId: 'workflow-worker',
+        role: 'worker',
+        backend: 'opencode',
+        parentTaskId: 'root',
+      },
+      tools: ['get_host_context', 'workflow_next', 'workflow_prev', 'workflow_fail'],
+    });
+
+    expect(ctx.scope).toEqual({
+      singleTask: true,
+      workflowVia: ['workflow_next', 'workflow_prev', 'workflow_fail'],
+      doNot: expect.arrayContaining(['create siblings or pick next work']),
+    });
+    expect(ctx.rules).toContain(HOST_RULE_WORKFLOW_DISPOSITION);
+    expect(ctx.rules).not.toContain(HOST_RULES_WORKER[1]);
+    expect(formatHostContextMarkdown(ctx)).toContain(
+      'explicit workflow route or host fallback to final-message NEXT',
+    );
+  });
+
+  it('keeps workflow disposition guidance in the capped coordinator rules', () => {
+    const ctx = buildHostContext({
+      snapshot: baseSnapshot(),
+      self: { taskId: 'workflow-coordinator', role: 'coordinator', backend: 'opencode' },
+      tools: ['workflow_next', 'workflow_fail'],
+      taskTypes: [],
+    });
+
+    expect(ctx.rules).toContain(HOST_RULE_WORKFLOW_DISPOSITION);
+    expect(ctx.rules).toHaveLength(10);
   });
 
   it('taskCwd overrides snapshot.cwd', () => {
@@ -119,7 +155,7 @@ describe('buildHostContext', () => {
     const ctx = buildHostContext({
       snapshot: baseSnapshot(),
       self: { taskId: 'root', role: 'coordinator', backend: 'opencode' },
-      tools: ['create_task', 'list_task_types'],
+      tools: ['define_workflow', 'list_task_types'],
       taskTypes: types,
       suppressBackendCatalog: true,
     });
@@ -130,8 +166,7 @@ describe('buildHostContext', () => {
       expect(ctx.rules).toContain(rule);
     }
     expect(ctx.rules).toContain(HOST_RULES_COORDINATOR[3]);
-    expect(ctx.rules).toContain(HOST_RULES_COORDINATOR[7]);
-    expect(ctx.rules).toHaveLength(13);
+    expect(ctx.rules).toHaveLength(12);
     const md = formatHostContextMarkdown(ctx);
     expect(md).toContain('## Task types');
     expect(md).toContain('`plan`');
@@ -231,7 +266,7 @@ describe('formatHostContextMarkdown', () => {
         backend: 'opencode',
         model: 'deepseek-v4-flash',
       },
-      tools: ['create_task', 'release_tasks'],
+      tools: ['define_workflow', 'start_workflow'],
     });
     const md = formatHostContextMarkdown(ctx);
     expect(md.startsWith('# Muster host context')).toBe(true);
@@ -241,7 +276,7 @@ describe('formatHostContextMarkdown', () => {
     expect(md).toContain('## Available backends');
     expect(md).toContain('## Models');
     expect(md).toContain('## Tools');
-    expect(md).toContain('`create_task`');
+    expect(md).toContain('`define_workflow`');
     expect(md).not.toContain('## Scope');
     // Exact base rule bullets present
     for (const rule of HOST_RULES_BASE) {

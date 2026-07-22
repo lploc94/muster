@@ -9,7 +9,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { CredentialRegistry } from '../bridge/credentials';
 import { dispatch } from './coordinator-tools';
-import { TaskEngine } from './engine';
+import { TaskEngine, type EngineEvent } from './engine';
 import { DEFAULT_RESOURCE_LIMITS } from './limits';
 import { parseTaskTypeRegistry } from './task-types';
 import { SqliteTaskRepository } from './repository';
@@ -319,8 +319,306 @@ describe('M018 S01 one-node workflow activation', () => {
           payload_json: expect.stringContaining('terminal result'),
         }),
       ]);
-      await expect(ctx.repository.getTask(payload.entryTaskId)).resolves.toMatchObject({ lifecycle: 'open' });
+      await expect(ctx.repository.getTask(payload.entryTaskId)).resolves.toMatchObject({
+        lifecycle: 'succeeded',
+        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+      });
     } finally {
+      await ctx.close();
+    }
+  }, 30_000);
+
+  it('implicitly routes the final assistant message as NEXT when the model omits a disposition', async () => {
+    const ctx = await openRepo('implicit-next');
+    let engine: TaskEngine | undefined;
+    try {
+      const createdAt = new Date().toISOString();
+      await ctx.repository.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-implicit-next',
+        version: 1,
+        name: 'implicit-next',
+        topology: TOPOLOGY,
+        createdAt,
+      });
+      const started = await ctx.repository.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: 'ws',
+        definitionId: 'wf-implicit-next',
+        version: 1,
+        startIdempotencyKey: 'implicit-next-1',
+        createdAt,
+        goal: 'fallback route',
+        backend: 'grok',
+      });
+      expect(started).toMatchObject({ ok: true, changed: true });
+      const payload = started.operation!.result.data as { runId: string; entryTaskId: string; activationTurnId: string };
+
+      engine = await TaskEngine.loadAsync({
+        repository: ctx.repository,
+        workspaceId: 'ws',
+        credentialRegistry: new CredentialRegistry(),
+        makeBackend: (name) => ({
+          name,
+          capabilities: {
+            supportsMCP: true,
+            supportsReasoning: false,
+            supportsDetailedToolEvents: false,
+          },
+          run: async function* () {},
+        }),
+        runTurn: async function* () {
+          yield { type: 'assistantDelta', messageId: 'implicit-draft', content: 'intermediate answer' };
+          yield { type: 'assistantDelta', messageId: 'implicit-final', content: 'final workflow answer' };
+          yield { type: 'turnCompleted' };
+        },
+      });
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        await engine.whenIdle();
+        const current = await ctx.repository.getTurn(payload.activationTurnId);
+        if (current?.status === 'succeeded' || current?.status === 'failed' || current?.status === 'cancelled') {
+          break;
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+
+      await expect(ctx.repository.getTurn(payload.activationTurnId)).resolves.toMatchObject({
+        status: 'succeeded',
+        disposition: {
+          kind: 'workflow_next',
+          change: 'updated',
+          result: 'final workflow answer',
+        },
+      });
+      await expect(ctx.client.get(
+        `SELECT status FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', payload.runId],
+      )).resolves.toMatchObject({ status: 'succeeded' });
+      await expect(ctx.client.all(
+        `SELECT kind, payload_json FROM workflow_artifacts
+           WHERE workspace_id = ? AND run_id = ? AND kind = 'next_result'`,
+        ['ws', payload.runId],
+      )).resolves.toEqual([
+        expect.objectContaining({
+          kind: 'next_result',
+          payload_json: expect.stringContaining('final workflow answer'),
+        }),
+      ]);
+      await expect(ctx.repository.listTurns(payload.entryTaskId)).resolves.toHaveLength(1);
+      await expect(ctx.client.get(
+        `SELECT status FROM turn_disposition_claims WHERE workspace_id = ? AND turn_id = ?`,
+        ['ws', payload.activationTurnId],
+      )).resolves.toMatchObject({ status: 'consumed' });
+    } finally {
+      await engine?.shutdown().catch(() => undefined);
+      await ctx.close();
+    }
+  }, 30_000);
+
+  it('walks configured workflow fallbacks without retrying attempted bindings', async () => {
+    const ctx = await openRepo('runtime-fallback');
+    let engine: TaskEngine | undefined;
+    try {
+      const createdAt = new Date().toISOString();
+      await ctx.repository.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-runtime-fallback',
+        version: 1,
+        name: 'runtime-fallback',
+        topology: TOPOLOGY,
+        createdAt,
+      });
+      const started = await ctx.repository.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: 'ws',
+        definitionId: 'wf-runtime-fallback',
+        version: 1,
+        startIdempotencyKey: 'runtime-fallback-1',
+        createdAt,
+        goal: 'recover this workflow activation',
+        backend: 'grok',
+      });
+      const payload = started.operation!.result.data as {
+        runId: string;
+        entryTaskId: string;
+        activationTurnId: string;
+      };
+      const calls: Array<{ backend: string; resumeId?: string; prompt: string }> = [];
+      engine = await TaskEngine.loadAsync({
+        repository: ctx.repository,
+        workspaceId: 'ws',
+        credentialRegistry: new CredentialRegistry(),
+        makeBackend: (name) => ({
+          name,
+          capabilities: {
+            supportsMCP: true,
+            supportsReasoning: false,
+            supportsDetailedToolEvents: false,
+          },
+          run: async function* () {},
+        }),
+        getRuntimeFallbacks: () => [
+          { backend: 'grok' },
+          { backend: 'codex', model: 'gpt-fallback' },
+          { backend: 'grok' },
+          { backend: 'opencode' },
+        ],
+        getHostEnvironment: () => ({
+          cwd: process.cwd(),
+          trusted: true,
+          availableBackends: ['grok', 'codex', 'opencode'],
+          models: {
+            codex: { options: [{ value: 'gpt-fallback', name: 'Fallback' }] },
+          },
+        }),
+        runTurn: async function* (backend, options) {
+          calls.push({ backend: backend.name, resumeId: options.resumeId, prompt: options.prompt });
+          await options.onBeforePrompt?.();
+          if (backend.name !== 'opencode') {
+            yield { type: 'sessionStarted', sessionId: `${backend.name}-failed-session` };
+            yield { type: 'error', message: 'provider unavailable' };
+            return;
+          }
+          yield { type: 'sessionStarted', sessionId: 'opencode-target-session' };
+          yield { type: 'assistantDelta', messageId: 'fallback-result', content: 'recovered result' };
+          yield { type: 'turnCompleted' };
+        },
+      });
+
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        await engine.whenIdle();
+        const run = await ctx.client.get<{ status: string }>(
+          `SELECT status FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
+          ['ws', payload.runId],
+        );
+        if (run?.status === 'succeeded') break;
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+
+      expect(calls.map((call) => call.backend)).toEqual(['grok', 'codex', 'opencode']);
+      expect(calls[1]?.resumeId).toBeUndefined();
+      expect(calls[1]?.prompt).toContain('[runtime-fallback-recovery]');
+      expect(calls[2]?.resumeId).toBeUndefined();
+      expect(calls[2]?.prompt).toContain('[runtime-fallback-recovery]');
+      const turns = await ctx.repository.listTurns(payload.entryTaskId);
+      expect(turns).toHaveLength(3);
+      expect(turns[0]).toMatchObject({ id: payload.activationTurnId, status: 'failed' });
+      expect(turns[1]).toMatchObject({
+        status: 'failed',
+        trigger: 'retry',
+        retryOf: payload.activationTurnId,
+        runtimeEpoch: 2,
+      });
+      expect(turns[2]).toMatchObject({
+        status: 'succeeded',
+        trigger: 'retry',
+        retryOf: turns[1]!.id,
+        runtimeEpoch: 3,
+      });
+      expect(turns[1]?.inputs.some((input) => input.kind === 'recovery')).toBe(true);
+      expect(turns[2]?.inputs.some((input) => input.kind === 'recovery')).toBe(true);
+      await expect(ctx.repository.getTask(payload.entryTaskId)).resolves.toMatchObject({
+        lifecycle: 'succeeded',
+        backend: 'opencode',
+        runtimeEpoch: 3,
+        handoff: {
+          source: { backend: 'codex', model: 'gpt-fallback', runtimeEpoch: 2 },
+          target: { backend: 'opencode', runtimeEpoch: 3 },
+          continuation: { status: 'consumed', turnId: turns[2]!.id },
+        },
+      });
+      expect((await ctx.repository.getTask(payload.entryTaskId))?.runtimeRecovery).toBeUndefined();
+      await expect(ctx.client.get(
+        `SELECT status, execution_turn_id FROM workflow_activations
+          WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', payload.runId],
+      )).resolves.toMatchObject({ status: 'consumed', execution_turn_id: turns[2]!.id });
+    } finally {
+      await engine?.shutdown().catch(() => undefined);
+      await ctx.close();
+    }
+  }, 30_000);
+
+  it('commits a staged NEXT when the provider errors after the disposition', async () => {
+    const ctx = await openRepo('staged-next-wins');
+    let engine: TaskEngine | undefined;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let promptStarted!: () => void;
+    const startedPrompt = new Promise<void>((resolve) => { promptStarted = resolve; });
+    try {
+      const createdAt = new Date().toISOString();
+      await ctx.repository.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-staged-next-wins',
+        version: 1,
+        name: 'staged-next-wins',
+        topology: TOPOLOGY,
+        createdAt,
+      });
+      const started = await ctx.repository.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: 'ws',
+        definitionId: 'wf-staged-next-wins',
+        version: 1,
+        startIdempotencyKey: 'staged-next-wins-1',
+        createdAt,
+        backend: 'grok',
+      });
+      const payload = started.operation!.result.data as {
+        runId: string;
+        entryTaskId: string;
+        activationTurnId: string;
+      };
+      const events: EngineEvent[] = [];
+      engine = await TaskEngine.loadAsync({
+        repository: ctx.repository,
+        workspaceId: 'ws',
+        credentialRegistry: new CredentialRegistry(),
+        makeBackend: (name) => ({
+          name,
+          capabilities: {
+            supportsMCP: true,
+            supportsReasoning: false,
+            supportsDetailedToolEvents: false,
+          },
+          run: async function* () {},
+        }),
+        runTurn: async function* (_backend, options) {
+          await options.onBeforePrompt?.();
+          yield { type: 'sessionStarted', sessionId: 'staged-next-session' };
+          promptStarted();
+          await gate;
+          yield { type: 'error', message: 'late provider disconnect' };
+        },
+        emit: (event) => events.push(event),
+      });
+
+      await startedPrompt;
+      await expect(engine.stageDispositionAsync(
+        payload.activationTurnId,
+        { kind: 'workflow_next', change: 'updated', result: 'durable result' },
+        'staged-next-before-error',
+      )).resolves.toEqual({ ok: true, value: undefined });
+      release();
+      await engine.whenIdle();
+
+      await expect(ctx.repository.getTurn(payload.activationTurnId)).resolves.toMatchObject({
+        status: 'succeeded',
+        disposition: { kind: 'workflow_next', result: 'durable result' },
+      });
+      await expect(ctx.client.get(
+        `SELECT status FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', payload.runId],
+      )).resolves.toMatchObject({ status: 'succeeded' });
+      expect(events.some((event) => event.type === 'turnDone')).toBe(true);
+      expect(events.some((event) => event.type === 'turnError')).toBe(false);
+    } finally {
+      release();
+      await engine?.shutdown().catch(() => undefined);
       await ctx.close();
     }
   }, 30_000);
@@ -511,6 +809,7 @@ describe('M018 S01 one-node workflow activation', () => {
         lastOpenedAt: '2026-07-19T00:00:00.000Z',
       });
       const credentials = new CredentialRegistry();
+      let adapterRun = 0;
       engine = await TaskEngine.loadAsync({
         repository,
         workspaceId,
@@ -525,7 +824,12 @@ describe('M018 S01 one-node workflow activation', () => {
           run: async function* () {},
         }),
         runTurn: async function* () {
-          await gate;
+          adapterRun += 1;
+          if (adapterRun === 1) {
+            await gate;
+          } else {
+            yield { type: 'assistantDelta', messageId: 'workflow-result', content: 'workflow complete' };
+          }
           yield { type: 'turnCompleted' };
         },
         getTaskTypeRegistry: () =>
@@ -552,7 +856,7 @@ describe('M018 S01 one-node workflow activation', () => {
         rootId: taskId,
         callerTaskId: taskId,
         turnId,
-        allowedActions: new Set(['define_workflow', 'start_workflow', 'get_task_status']),
+        allowedActions: new Set(['define_workflow', 'start_workflow', 'inspect_workflow_run']),
         attemptId: 'att-s01',
         ttlMs: 60_000,
       });
@@ -617,14 +921,23 @@ describe('M018 S01 one-node workflow activation', () => {
         activationTurnId: string;
         entryGateStatus: string;
         entryMessageId: string;
+        runStatus: string;
+        workflowNext?: { change: string; result?: string };
+        terminalResult?: { runId: string; artifactId: string; artifactRevision: number };
       };
       expect(payload.entryGateStatus).toBe('satisfied');
+      expect(payload.runStatus).toBe('succeeded');
+      expect(payload.workflowNext).toEqual({ change: 'updated', result: 'workflow complete' });
+      expect(payload.terminalResult).toMatchObject({
+        runId: payload.runId,
+        artifactRevision: 1,
+      });
 
       const entryTurn = await repository.getTurn(payload.activationTurnId);
       expect(entryTurn).toMatchObject({
         id: payload.activationTurnId,
         taskId: payload.entryTaskId,
-        status: 'queued',
+        status: 'succeeded',
         trigger: 'engine',
       });
       const entryTask = await repository.getTask(payload.entryTaskId);
@@ -632,9 +945,11 @@ describe('M018 S01 one-node workflow activation', () => {
         id: payload.entryTaskId,
         parentId: taskId,
         releaseState: 'released',
-        lifecycle: 'open',
+        lifecycle: 'succeeded',
         backend: 'grok',
+        sealedBy: { kind: 'coordinator', taskId, mode: 'workflow_run' },
       });
+      expect((await repository.getTask(taskId))?.lifecycle).toBe('open');
       expect(
         await client.get(
           `SELECT owner_root_task_id, caller_task_id, caller_turn_id, policy_json,
@@ -665,7 +980,7 @@ describe('M018 S01 one-node workflow activation', () => {
               AND source.run_id = artifact.run_id
               AND source.artifact_id = artifact.artifact_id
               AND source.artifact_revision = artifact.revision
-            WHERE artifact.workspace_id = ? AND artifact.run_id = ?`,
+             WHERE artifact.workspace_id = ? AND artifact.run_id = ? AND artifact.kind = 'text'`,
           [workspaceId, payload.runId],
         ),
       ).toMatchObject({
@@ -697,17 +1012,6 @@ describe('M018 S01 one-node workflow activation', () => {
         run_id: payload.runId,
       });
 
-      const file: TaskStoreFile = {
-        schemaVersion: 2,
-        revision: 1,
-        tasks: { [entryTask!.id]: entryTask! },
-        turns: { [entryTurn!.id]: entryTurn! },
-        messages: {},
-      };
-      expect(canPromoteTurn(file, payload.activationTurnId, DEFAULT_RESOURCE_LIMITS)).toEqual({
-        ok: true,
-      });
-
       // Same start key through public surface is a no-op (no second turn).
       const replayRouted = dispatch(
         'start_workflow',
@@ -733,7 +1037,13 @@ describe('M018 S01 one-node workflow activation', () => {
       );
       expect(replayed).toMatchObject({
         ok: true,
-        result: { changed: false, replay: true, activationTurnId: payload.activationTurnId },
+        result: {
+          changed: false,
+          replay: true,
+          activationTurnId: payload.activationTurnId,
+          runStatus: 'succeeded',
+          workflowNext: { change: 'updated', result: 'workflow complete' },
+        },
       });
       expect(await repository.listTurns(payload.entryTaskId)).toHaveLength(1);
     } finally {

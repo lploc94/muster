@@ -26,7 +26,7 @@ import { truncateUtf8Bytes } from './content-limits';
 
 /** Fallback when a child omits disposition and no assistant summary is available. */
 export const MISSING_DISPOSITION_CANDIDATE_SUMMARY =
-  'Turn completed without complete_task/fail_task disposition.';
+  'Turn completed without a required disposition.';
 
 /** Named parent-orchestration policy for child auto-seal (W4). */
 export type ChildOrchestrationSealMode = 'parent_may_seal_direct' | 'propose_only';
@@ -492,7 +492,7 @@ export function applySuccessfulTurn(
         task: bumpTask(task, options.now, {
           attention: {
             code: 'awaiting_parent_seal',
-            message: 'turn completed without complete/fail; awaiting parent seal',
+            message: 'turn completed without a required disposition; awaiting host review',
             at: options.now,
             sourceTurnId: turn.id,
           },
@@ -899,6 +899,8 @@ export function retryTurn(
      * prompt equals the original turn (no diagnostic-only recovery text).
      */
     reuseOriginalInputs?: boolean;
+    /** Append bounded recovery guidance after reused inputs (runtime fallback). */
+    recoveryInstruction?: string;
   },
 ): TransitionResult<TaskTurn> {
   if (isTerminalLifecycle(task.lifecycle)) {
@@ -926,7 +928,16 @@ export function retryTurn(
   }
 
   const inputs = options.reuseOriginalInputs
-    ? [...oldTurn.inputs]
+    ? [
+        ...oldTurn.inputs,
+        ...(options.recoveryInstruction
+          ? [{
+              kind: 'recovery' as const,
+              interruptedTurnId: oldTurn.id,
+              instruction: options.recoveryInstruction,
+            }]
+          : []),
+      ]
     : [
         {
           kind: 'recovery' as const,

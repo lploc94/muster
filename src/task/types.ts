@@ -369,6 +369,8 @@ export interface MusterTask {
   childOrchestrationSeal?: 'parent_may_seal_direct' | 'propose_only';
   /** Durable metadata for the current runtime-switch continuation contract. */
   handoff?: TaskContinuationHandoffState;
+  /** Durable provider/model fallback attempts for the current failed-turn chain. */
+  runtimeRecovery?: TaskRuntimeRecoveryState;
 }
 
 // ---------------------------------------------------------------------------
@@ -407,6 +409,15 @@ export interface TaskContinuationHandoffState {
   contextCutoff: TaskHandoffContextCutoff;
   continuation: TaskHandoffContinuation;
   switchedAt: string;
+}
+
+/** Bounded execution-fallback chain state. Cleared after the next successful turn. */
+export interface TaskRuntimeRecoveryState {
+  version: 1;
+  startedAt: string;
+  lastFailureAt: string;
+  lastFailedTurnId: string;
+  attempted: TaskHandoffRuntimeLabel[];
 }
 
 // Turns (§4.2)

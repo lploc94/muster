@@ -35,7 +35,7 @@ Completed across the current conformance slices:
 - Added a durable workflow deadline reaper that runs before engine projection/reload recovery and periodically thereafter; expired waiting runs use the same recursive `run_timeout` closure without requiring or starting an adapter process, and repeated scans are idempotent.
 - Added authorized explicit activation recovery with a transaction-first operation claim: failed/interrupted logical activations retain their primary turn, aggregate message, and activation ID while receiving one linked execution turn with the original pinned inputs; reload, two-client contention, same-key replay, changed fingerprints, deadlines, and terminal runs fail deterministically.
 - Added terminal workflow-history pruning at the SQLite turn-delete boundary: active or corrupt references remain pinned, while a fully terminal leaf run with terminal node tasks and no live gate, round, activation, continuation, or return gate is removed with its bounded relational history before transcript retention deletes referenced turns.
-- Expanded `get_task_status` workflow diagnostics with frozen run limits, deadline/terminal reason, exact recoverable activation and active gate identity, all relevant active/satisfied rounds with progress, all continuation states, and bounded integrity codes; it never selects one arbitrary historical round/continuation or returns artifact/prompt bodies.
+- Replaced the generic `get_task_status` surface with root-authorized `inspect_workflow_run`, returning frozen run limits, deadline/terminal reason, bounded nodes/gates/recoverable activations, active feedback rounds, continuations, terminal artifact references, and integrity codes without task trees, topology, prompts, artifact bodies, paths, or secrets; removed the non-persistent `report_progress` no-op.
 - Moved every correctness-critical workflow planner behind the SQLite write lock through the named `workflowMutation` worker RPC; definition, start, staging, lifecycle, settlement, recovery, reaping, and graph mutations now derive and commit their effects inside one `BEGIN IMMEDIATE` transaction.
 - Added deterministic two-client proof that terminal closure winning immediately before settlement lock acquisition commits no stale route, artifact, fill, activation, or turn.
 - Made scheduler claim authority relational and terminal-run aware, blocked unrelated claims while a workflow task is durably waiting, and rejected backend/model/runtime-epoch handoff while its workflow run remains active.
@@ -626,8 +626,8 @@ Required work:
 - Produce one bounded terminal reason/result and one owner/root attention at the outer boundary.
 - At every child boundary, persist exactly one typed continuation result before recursively closing the caller: failed result for failure/timeout/exhaustion, cancelled result for cancellation, and no success artifact on either terminal error outcome.
 - Split closure entry semantics explicitly:
-  - Workflow-originated FAIL, invalid route, timeout, budget/aggregate exhaustion, and required-target failure close orchestration and attention only; they do not change task lifecycle.
-  - Authorized task lifecycle cancellation first applies the existing task/descendant lifecycle cascade, then atomically closes every affected workflow run/continuation without independently changing additional task lifecycles.
+  - Workflow-originated FAIL, invalid route, timeout, budget/aggregate exhaustion, and required-target failure close orchestration and seal every task owned by the closed runs to the matching terminal lifecycle.
+  - Authorized task lifecycle cancellation first applies the existing task/descendant lifecycle cascade, then atomically closes every affected workflow run/continuation and seals any remaining workflow-owned tasks cancelled.
 - Integrate authorized lifecycle seals deterministically: while a workflow run is non-terminal, `cancelled` closes it cancelled; `failed`, `skipped`, or premature `succeeded` makes the session unavailable for future feedback and closes the run failed with bounded `required_target_unavailable`. The authorized lifecycle mutation still commits under existing authority rules.
 
 Mandatory pass conditions:
@@ -639,9 +639,9 @@ Mandatory pass conditions:
 - No terminal run has status `open` or `satisfied` gates/rounds unless a documented immutable historical state is stored separately from active status.
 - Exactly one outer owner attention is created; duplicate closure is read-only.
 - A prematurely sealed `succeeded`, `failed`, or `skipped` workflow task closes a still-running workflow as `required_target_unavailable` before any future PREV can strand it.
-- Workflow-originated timeout/failure leaves task lifecycles open.
-- Authorized user/coordinator cancellation preserves the existing cancelled lifecycle cascade while workflow closure adds no extra lifecycle authority.
-- Cancelling a caller subtree closes affected workflow runs and descendants; timing out the same workflow closes orchestration while leaving those task lifecycles open.
+- Workflow-originated timeout/failure seals workflow-owned task lifecycles failed while caller/root tasks outside `workflow_nodes` remain open.
+- Authorized user/coordinator cancellation preserves the existing cancelled lifecycle cascade while workflow closure seals any remaining tasks owned by the cancelled runs.
+- Cancelling a caller subtree closes affected workflow runs and descendants; timing out the same workflow closes orchestration and seals its owned task lifecycles failed.
 
 Forbidden shortcuts:
 

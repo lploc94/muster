@@ -157,6 +157,21 @@ function parseTaskTypeRow(raw: unknown): TaskTypeSettingsRow | null {
     SETTINGS_TASK_TYPE_DESCRIPTION_MAX,
   );
   if (description === null) return null;
+  let fallbacks: Array<{ backend: string; model?: string }> | undefined;
+  if (raw.fallbacks !== undefined) {
+    if (!Array.isArray(raw.fallbacks) || raw.fallbacks.length > 8) return null;
+    fallbacks = [];
+    for (const value of raw.fallbacks) {
+      if (!isRecord(value)) return null;
+      const backend = normalizeOptionalString(value.backend, SETTINGS_TASK_TYPE_STRING_MAX);
+      const fallbackModel = normalizeOptionalString(value.model, SETTINGS_TASK_TYPE_STRING_MAX);
+      if (!backend || fallbackModel === null) return null;
+      fallbacks.push({
+        backend,
+        ...(fallbackModel ? { model: fallbackModel } : {}),
+      });
+    }
+  }
 
   const row: TaskTypeSettingsRow = {
     id: raw.id,
@@ -165,6 +180,7 @@ function parseTaskTypeRow(raw: unknown): TaskTypeSettingsRow | null {
     briefKind: raw.briefKind,
   };
   if (model !== undefined && model.length > 0) row.model = model;
+  if (fallbacks !== undefined) row.fallbacks = fallbacks;
   if (description !== undefined && description.length > 0) row.description = description;
   return row;
 }
@@ -239,6 +255,7 @@ export function cloneTaskTypeDrafts(rows: readonly TaskTypeSettingsRow[]): TaskT
       briefKind: row.briefKind,
     };
     if (row.model !== undefined) next.model = row.model;
+    if (row.fallbacks !== undefined) next.fallbacks = row.fallbacks.map((binding) => ({ ...binding }));
     if (row.description !== undefined) next.description = row.description;
     return next;
   });
@@ -359,6 +376,10 @@ function normalizeTaskTypeRowForCompare(row: TaskTypeSettingsRow): string {
     id: row.id.trim(),
     backend: row.backend.trim(),
     model: normalizeOptionalField(row.model),
+    fallbacks: row.fallbacks?.map((binding) => ({
+      backend: binding.backend.trim(),
+      model: normalizeOptionalField(binding.model),
+    })) ?? null,
     role: row.role,
     briefKind: row.briefKind,
     description: normalizeOptionalField(row.description),

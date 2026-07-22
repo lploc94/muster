@@ -2,11 +2,11 @@
  * M018 S07 T02: canonical research fan-in → planner → verifier assembled flow.
  *
  * Proves the complete user-visible protocol through:
- *   - MCP-shaped define/start/workflow_next/workflow_prev/get_task_status surfaces
+ *   - MCP-shaped define/start/workflow_next/workflow_prev/inspect_workflow_run surfaces
  *   - engine settlement (settleTurnAndApplyEffects)
  *   - real SQLite transactions
  *   - scheduler activation (pickRunnableTurns over queued turns)
- *   - bounded get_task_status / getWorkflowStatusForTask read projection
+ *   - bounded run inspection / task-bound repository projection
  *
  * Protocol under test:
  *   1. Parent one-node caller invokes a child graph_v1:
@@ -48,6 +48,7 @@ import {
 } from './workflow';
 import type {
   GraphTopologyV1,
+  WorkflowRunInspectionProjection,
   WorkflowTaskStatusProjection,
 } from './workflow-types';
 
@@ -382,7 +383,7 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
         'start_workflow',
         'workflow_next',
         'workflow_prev',
-        'get_task_status',
+        'inspect_workflow_run',
         'invoke_child_workflow',
       ]),
       ttlMs: 60_000,
@@ -449,6 +450,18 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
         'wf-caller',
         's07-canonical-caller',
         'caller goal',
+      );
+      await opened.client.run(
+        `UPDATE workflow_runs
+            SET owner_root_task_id = ?, caller_task_id = ?, caller_turn_id = ?
+          WHERE workspace_id = ? AND run_id = ?`,
+        [
+          caller.entryTaskId,
+          caller.entryTaskId,
+          caller.activationTurnId,
+          'ws',
+          caller.runId,
+        ],
       );
 
       // Invoke child canonical graph from the parent entry turn.
@@ -637,7 +650,7 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
       expect(plannerGate!.status).toBe('satisfied');
       expect(plannerStatus!.feedbackRounds).toEqual([]);
 
-      // get_task_status tool surface includes bounded workflow section.
+      // Public inspection is run-scoped and excludes the generic task tree.
       const plannerTask = await opened.repository.getTask(plannerTaskId);
       const plannerTurn = await opened.repository.getTurn(plannerActivationTurnId);
       const toolFile: TaskStoreFile = {
@@ -652,23 +665,28 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
         cancelRequests: {},
       };
       const deps = makeMinimalDeps(toolFile, opened.repository);
-      const statusTool = await executeToolCommand(
+      const inspectionTool = await executeToolCommand(
         deps,
         {
           callerTaskId: plannerTask!.id,
           turnId: plannerTurn!.id,
-          rootId: plannerTask!.id,
-          allowedActions: new Set(['read_subtree', 'get_task_status']),
+          rootId: caller.entryTaskId,
+          allowedActions: new Set(['read_subtree', 'inspect_workflow_run']),
         },
-        { kind: 'get_task_status' },
+        { kind: 'inspect_workflow_run', runId: childRunId! },
       );
-      expect(statusTool.ok).toBe(true);
-      if (statusTool.ok) {
-        const payload = statusTool.result as { workflow?: WorkflowTaskStatusProjection };
-        expect(payload.workflow).toBeTruthy();
-        assertBoundedProjection(payload.workflow!);
-        expect(payload.workflow!.nodeId).toBe('planner');
-        expect(forbiddenLeak(payload)).toEqual([]);
+      expect(inspectionTool.ok).toBe(true);
+      if (inspectionTool.ok) {
+        const inspection = inspectionTool.result as WorkflowRunInspectionProjection;
+        expect(inspection.runId).toBe(childRunId);
+        expect(inspection.nodes.map((node) => node.nodeId)).toEqual([
+          'planner',
+          'r1',
+          'r2',
+          'verifier',
+        ]);
+        expect(inspection).not.toHaveProperty('tasks');
+        expect(forbiddenLeak(inspection)).toEqual([]);
       }
 
       // --- Phase: planner NEXT → verifier activates ---
@@ -870,10 +888,10 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
         expect((await opened.repository.getTask(caller.entryTaskId))?.lifecycle).toBe('open');
       }
 
-      // Lifecycles stay open (workflow protocol never seals node tasks via NEXT/PREV).
-      expect((await opened.repository.getTask(r1TaskId!))?.lifecycle).toBe('open');
-      expect((await opened.repository.getTask(plannerTaskId))?.lifecycle).toBe('open');
-      expect((await opened.repository.getTask(verifierTaskId))?.lifecycle).toBe('open');
+      // PREV leaves tasks open while routing; terminal NEXT seals every task owned by the run.
+      expect((await opened.repository.getTask(r1TaskId!))?.lifecycle).toBe('succeeded');
+      expect((await opened.repository.getTask(plannerTaskId))?.lifecycle).toBe('succeeded');
+      expect((await opened.repository.getTask(verifierTaskId))?.lifecycle).toBe('succeeded');
 
       // Final projection still bounded (no topology/prompt/body/path leakage).
       const finalProj = await opened.repository.getWorkflowStatusForTask(verifierTaskId);

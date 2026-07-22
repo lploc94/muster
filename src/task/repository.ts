@@ -67,7 +67,11 @@ import {
   type WorkflowDefinitionV1,
   type WorkflowPolicyV1,
 } from './workflow';
-import type { WorkflowTaskStatusProjection } from './workflow-types';
+import type {
+  WorkflowRunCompletionProjection,
+  WorkflowRunInspectionProjection,
+  WorkflowTaskStatusProjection,
+} from './workflow-types';
 import { durableDispositionClaim, type DurableDispositionClaim } from './disposition-claim';
 import { isMutatingTask, normalizedWritePaths } from './resources';
 import { canPromoteTurn } from './scheduler';
@@ -262,6 +266,17 @@ export type RepositoryCommand =
       expectedTaskRevision: number; task: MusterTask; turns: readonly TaskTurn[];
       expectedTurns: readonly { id: string; status: TurnStatus; runtimeEpoch?: number }[];
       cancelRequests?: readonly { turnId: string; request: CancelRequest }[];
+      recovery?: {
+        failedTurnId: string;
+        expectedFailedStatus: 'failed' | 'interrupted';
+        turn: TaskTurn;
+        maxTurnsPerTask: number;
+        workflow?: {
+          runId: string;
+          activationId: string;
+          expectedActivationStatus: 'failed' | 'interrupted';
+        };
+      };
     }
   | {
       /** Stage one disposition on a live turn behind a status/runtime fence. */
@@ -746,6 +761,16 @@ export interface TaskRepository {
    * Never includes topology, prompts, artifact bodies, secrets, or absolute paths.
    */
   getWorkflowStatusForTask(taskId: string): Promise<WorkflowTaskStatusProjection | undefined>;
+  /** Bounded public diagnostic projection for a workflow run owned by the caller root. */
+  inspectWorkflowRun(
+    runId: string,
+    ownerRootTaskId: string,
+  ): Promise<WorkflowRunInspectionProjection | undefined>;
+  /** Authorized completion state and terminal NEXT body for a waiting workflow start. */
+  getWorkflowRunCompletion(
+    runId: string,
+    ownerRootTaskId: string,
+  ): Promise<WorkflowRunCompletionProjection | undefined>;
   /** Load and revalidate one frozen workflow definition for host-policy checks. */
   getWorkflowDefinition(
     definitionId: string,
@@ -2065,7 +2090,7 @@ export class SqliteTaskRepository implements TaskRepository {
   }
 
   /**
-   * M018 S07: bounded workflow read projection for get_task_status.
+   * M018 S07: bounded internal workflow projection for a task-bound node.
    * Reads relational run, gate, activation, round, continuation, and integrity
    * state without topology, prompts, artifact bodies, or paths.
    */
@@ -2355,6 +2380,371 @@ export class SqliteTaskRepository implements TaskRepository {
         ...(activationRow.continuation_id ? { continuationId: activationRow.continuation_id } : {}),
         ...(activationRow.return_gate_id ? { returnGateId: activationRow.return_gate_id } : {}),
       };
+    }
+    return projection;
+  }
+
+  async inspectWorkflowRun(
+    runId: string,
+    ownerRootTaskId: string,
+  ): Promise<WorkflowRunInspectionProjection | undefined> {
+    if (
+      typeof runId !== 'string' || runId.length === 0 ||
+      typeof ownerRootTaskId !== 'string' || ownerRootTaskId.length === 0
+    ) {
+      return undefined;
+    }
+
+    const run = await this.db.get<{
+      run_id: string;
+      definition_id: string;
+      definition_version: number;
+      status: string;
+      origin: string;
+      parent_run_id: string | null;
+      max_feedback_rounds: number;
+      max_turns_per_task: number;
+      max_workflow_turns: number;
+      max_children: number;
+      max_depth: number;
+      max_concurrency: number;
+      max_aggregate_bytes: number;
+      started_at: string | null;
+      deadline_at: string | null;
+      terminal_reason_code: string | null;
+      terminal_result_run_id: string | null;
+      terminal_result_artifact_id: string | null;
+      terminal_result_artifact_revision: number | null;
+    }>(
+      `SELECT run_id, definition_id, definition_version, status, origin, parent_run_id,
+              max_feedback_rounds, max_turns_per_task, max_workflow_turns,
+              max_children, max_depth, max_concurrency, max_aggregate_bytes,
+              started_at, deadline_at, terminal_reason_code,
+              terminal_result_run_id, terminal_result_artifact_id,
+              terminal_result_artifact_revision
+         FROM workflow_runs
+        WHERE workspace_id = ? AND run_id = ? AND owner_root_task_id = ?`,
+      [this.workspaceId, runId, ownerRootTaskId],
+    );
+    if (!run) return undefined;
+
+    const nodeRows = await this.db.all<{
+      node_id: string;
+      status: string;
+    }>(
+      `SELECT node_id, status
+         FROM workflow_nodes
+        WHERE workspace_id = ? AND run_id = ?
+        ORDER BY node_id
+        LIMIT 65`,
+      [this.workspaceId, runId],
+    );
+    const gateRows = await this.db.all<{
+      gate_id: string;
+      status: string;
+      required: number;
+      satisfied: number;
+    }>(
+      `SELECT g.gate_id AS gate_id,
+              g.status AS status,
+              (SELECT COUNT(*) FROM workflow_gate_bindings binding
+                WHERE binding.workspace_id = g.workspace_id
+                  AND binding.run_id = g.run_id
+                  AND binding.gate_id = g.gate_id) AS required,
+              (SELECT COUNT(DISTINCT fill.input_ref) FROM workflow_gate_fills fill
+                WHERE fill.workspace_id = g.workspace_id
+                  AND fill.run_id = g.run_id
+                  AND fill.gate_id = g.gate_id) AS satisfied
+         FROM workflow_dependency_gates g
+        WHERE g.workspace_id = ? AND g.run_id = ?
+        ORDER BY g.gate_id
+        LIMIT 65`,
+      [this.workspaceId, runId],
+    );
+    const activationRows = await this.db.all<{
+      node_id: string;
+      activation_id: string;
+      kind: string;
+      status: string;
+      primary_turn_id: string;
+      execution_turn_id: string;
+      source_gate_id: string | null;
+      feedback_round_id: string | null;
+      feedback_target_node_id: string | null;
+      continuation_id: string | null;
+      return_gate_id: string | null;
+    }>(
+      `SELECT node_id, activation_id, kind, status, primary_turn_id, execution_turn_id,
+              source_gate_id, feedback_round_id, feedback_target_node_id,
+              continuation_id, return_gate_id
+         FROM workflow_activations
+        WHERE workspace_id = ? AND run_id = ?
+          AND status IN ('queued', 'running', 'failed', 'interrupted')
+        ORDER BY CASE status
+                   WHEN 'running' THEN 0
+                   WHEN 'queued' THEN 1
+                   WHEN 'interrupted' THEN 2
+                   ELSE 3
+                 END,
+                 updated_at DESC, activation_id
+        LIMIT 65`,
+      [this.workspaceId, runId],
+    );
+    const roundRows = await this.db.all<{
+      round_id: string;
+      requester_node_id: string;
+      status: string;
+      join_mode: string;
+      required: number;
+      responded: number;
+    }>(
+      `SELECT round_row.round_id,
+              round_row.requester_node_id,
+              round_row.status,
+              round_row.join_mode,
+              (SELECT COUNT(*) FROM workflow_feedback_targets target
+                WHERE target.workspace_id = round_row.workspace_id
+                  AND target.run_id = round_row.run_id
+                  AND target.round_id = round_row.round_id) AS required,
+              (SELECT COUNT(*) FROM workflow_feedback_targets target
+                WHERE target.workspace_id = round_row.workspace_id
+                  AND target.run_id = round_row.run_id
+                  AND target.round_id = round_row.round_id
+                  AND target.status = 'responded') AS responded
+         FROM workflow_feedback_rounds round_row
+        WHERE round_row.workspace_id = ? AND round_row.run_id = ?
+          AND round_row.status IN ('open', 'satisfied')
+        ORDER BY round_row.created_at, round_row.round_id
+        LIMIT 33`,
+      [this.workspaceId, runId],
+    );
+    const continuationRows = await this.db.all<{
+      continuation_id: string;
+      status: string;
+      kind: string;
+      child_run_id: string | null;
+      outcome: string | null;
+      reason_code: string | null;
+    }>(
+      `SELECT continuation_id, status, kind, child_run_id, outcome, reason_code
+         FROM workflow_continuations
+        WHERE workspace_id = ? AND (run_id = ? OR child_run_id = ? OR caller_run_id = ?)
+        ORDER BY created_at, continuation_id
+        LIMIT 65`,
+      [this.workspaceId, runId, runId, runId],
+    );
+    const liveState = await this.db.get<{
+      live_gate: number;
+      live_round: number;
+      live_activation: number;
+      live_continuation: number;
+      live_return_gate: number;
+    }>(
+      `SELECT
+         EXISTS (SELECT 1 FROM workflow_dependency_gates
+                  WHERE workspace_id = ? AND run_id = ? AND status IN ('open', 'satisfied')) AS live_gate,
+         EXISTS (SELECT 1 FROM workflow_feedback_rounds
+                  WHERE workspace_id = ? AND run_id = ? AND status IN ('open', 'satisfied')) AS live_round,
+         EXISTS (SELECT 1 FROM workflow_activations
+                  WHERE workspace_id = ? AND run_id = ? AND status IN ('queued', 'running')) AS live_activation,
+         EXISTS (SELECT 1 FROM workflow_continuations
+                  WHERE workspace_id = ? AND (run_id = ? OR child_run_id = ? OR caller_run_id = ?)
+                    AND status IN ('pending', 'resolved')) AS live_continuation,
+         EXISTS (SELECT 1 FROM workflow_return_gates
+                  WHERE workspace_id = ? AND (continuation_run_id = ? OR child_run_id = ?)
+                    AND status IN ('open', 'satisfied')) AS live_return_gate`,
+      [
+        this.workspaceId, runId,
+        this.workspaceId, runId,
+        this.workspaceId, runId,
+        this.workspaceId, runId, runId, runId,
+        this.workspaceId, runId, runId,
+      ],
+    );
+
+    const diagnostics: Array<{ code: string }> = [];
+    if (nodeRows.length > 64) diagnostics.push({ code: 'workflow_nodes_truncated' });
+    if (gateRows.length > 64) diagnostics.push({ code: 'workflow_gates_truncated' });
+    if (activationRows.length > 64) diagnostics.push({ code: 'workflow_activations_truncated' });
+    if (roundRows.length > 32) diagnostics.push({ code: 'workflow_feedback_rounds_truncated' });
+    if (continuationRows.length > 64) diagnostics.push({ code: 'workflow_continuations_truncated' });
+    const terminal = run.status === 'succeeded' || run.status === 'failed' || run.status === 'cancelled';
+    if (terminal && liveState?.live_gate === 1) diagnostics.push({ code: 'terminal_run_has_live_gate' });
+    if (terminal && liveState?.live_round === 1) diagnostics.push({ code: 'terminal_run_has_live_round' });
+    if (terminal && liveState?.live_activation === 1) diagnostics.push({ code: 'terminal_run_has_live_activation' });
+    if (terminal && liveState?.live_continuation === 1) diagnostics.push({ code: 'terminal_run_has_live_continuation' });
+    if (terminal && liveState?.live_return_gate === 1) diagnostics.push({ code: 'terminal_run_has_live_return_gate' });
+    const terminalReason = run.terminal_reason_code;
+    if (terminalReason !== null && !/^[a-z0-9_]{1,64}$/.test(terminalReason)) {
+      diagnostics.push({ code: 'invalid_terminal_reason' });
+    }
+
+    const terminalResultValid =
+      typeof run.terminal_result_run_id === 'string' && run.terminal_result_run_id.length > 0 &&
+      typeof run.terminal_result_artifact_id === 'string' && run.terminal_result_artifact_id.length > 0 &&
+      Number.isInteger(run.terminal_result_artifact_revision) &&
+      Number(run.terminal_result_artifact_revision) > 0;
+    const hasTerminalResultValue =
+      run.terminal_result_run_id !== null ||
+      run.terminal_result_artifact_id !== null ||
+      run.terminal_result_artifact_revision !== null;
+    if (hasTerminalResultValue && !terminalResultValid) {
+      diagnostics.push({ code: 'invalid_terminal_result_reference' });
+    }
+    if (!terminal && terminalResultValid) {
+      diagnostics.push({ code: 'nonterminal_run_has_terminal_result' });
+    }
+
+    const projection: WorkflowRunInspectionProjection = {
+      runId: run.run_id,
+      definitionId: run.definition_id,
+      definitionVersion: Number(run.definition_version),
+      runStatus: run.status,
+      policy: {
+        maxFeedbackRounds: Number(run.max_feedback_rounds) || 0,
+        maxTurnsPerTask: Number(run.max_turns_per_task) || 0,
+        maxWorkflowTurns: Number(run.max_workflow_turns) || 0,
+        maxChildren: Number(run.max_children) || 0,
+        maxDepth: Number(run.max_depth) || 0,
+        maxConcurrency: Number(run.max_concurrency) || 0,
+        maxAggregateBytes: Number(run.max_aggregate_bytes) || 0,
+      },
+      origin: run.origin,
+      nodes: nodeRows.slice(0, 64).map((node) => ({
+        nodeId: node.node_id,
+        status: node.status,
+      })),
+      gates: gateRows.slice(0, 64).map((gate) => ({
+        gateId: gate.gate_id,
+        status: gate.status,
+        required: Number(gate.required) || 0,
+        satisfied: Number(gate.satisfied) || 0,
+      })),
+      activations: activationRows.slice(0, 64).map((activation) => ({
+        nodeId: activation.node_id,
+        activationId: activation.activation_id,
+        kind: activation.kind,
+        status: activation.status,
+        primaryTurnId: activation.primary_turn_id,
+        executionTurnId: activation.execution_turn_id,
+        ...(activation.source_gate_id ? { sourceGateId: activation.source_gate_id } : {}),
+        ...(activation.feedback_round_id ? { feedbackRoundId: activation.feedback_round_id } : {}),
+        ...(activation.feedback_target_node_id
+          ? { feedbackTargetNodeId: activation.feedback_target_node_id }
+          : {}),
+        ...(activation.continuation_id ? { continuationId: activation.continuation_id } : {}),
+        ...(activation.return_gate_id ? { returnGateId: activation.return_gate_id } : {}),
+      })),
+      feedbackRounds: roundRows.slice(0, 32).map((round) => ({
+        roundId: round.round_id,
+        requesterNodeId: round.requester_node_id,
+        status: round.status,
+        joinMode: round.join_mode,
+        required: Number(round.required) || 0,
+        responded: Number(round.responded) || 0,
+      })),
+      continuations: continuationRows.slice(0, 64).map((continuation) => ({
+        continuationId: continuation.continuation_id,
+        status: continuation.status,
+        kind: continuation.kind,
+        ...(continuation.child_run_id ? { childRunId: continuation.child_run_id } : {}),
+        ...(continuation.outcome ? { outcome: continuation.outcome } : {}),
+        ...(continuation.reason_code ? { reasonCode: continuation.reason_code } : {}),
+      })),
+      diagnostics: diagnostics.slice(0, 8),
+    };
+    if (run.started_at) projection.startedAt = run.started_at;
+    if (run.deadline_at) projection.deadlineAt = run.deadline_at;
+    if (terminalReason && /^[a-z0-9_]{1,64}$/.test(terminalReason)) {
+      projection.terminalReason = terminalReason;
+    }
+    if (typeof run.parent_run_id === 'string' && run.parent_run_id.length > 0) {
+      projection.parentRunId = run.parent_run_id;
+    }
+    if (terminalResultValid) {
+      projection.terminalResult = {
+        runId: run.terminal_result_run_id!,
+        artifactId: run.terminal_result_artifact_id!,
+        artifactRevision: Number(run.terminal_result_artifact_revision),
+      };
+    }
+    return projection;
+  }
+
+  async getWorkflowRunCompletion(
+    runId: string,
+    ownerRootTaskId: string,
+  ): Promise<WorkflowRunCompletionProjection | undefined> {
+    if (
+      typeof runId !== 'string' || runId.length === 0 ||
+      typeof ownerRootTaskId !== 'string' || ownerRootTaskId.length === 0
+    ) {
+      return undefined;
+    }
+    const row = await this.db.get<{
+      run_id: string;
+      status: string;
+      terminal_reason_code: string | null;
+      terminal_result_run_id: string | null;
+      terminal_result_artifact_id: string | null;
+      terminal_result_artifact_revision: number | null;
+      artifact_kind: string | null;
+      artifact_payload_json: string | null;
+    }>(
+      `SELECT run.run_id, run.status, run.terminal_reason_code,
+              run.terminal_result_run_id, run.terminal_result_artifact_id,
+              run.terminal_result_artifact_revision,
+              artifact.kind AS artifact_kind, artifact.payload_json AS artifact_payload_json
+         FROM workflow_runs run
+         LEFT JOIN workflow_artifacts artifact
+           ON artifact.workspace_id = run.workspace_id
+          AND artifact.run_id = run.terminal_result_run_id
+          AND artifact.artifact_id = run.terminal_result_artifact_id
+          AND artifact.revision = run.terminal_result_artifact_revision
+        WHERE run.workspace_id = ? AND run.run_id = ? AND run.owner_root_task_id = ?`,
+      [this.workspaceId, runId, ownerRootTaskId],
+    );
+    if (
+      !row ||
+      (row.status !== 'running' && row.status !== 'succeeded' &&
+        row.status !== 'failed' && row.status !== 'cancelled')
+    ) {
+      return undefined;
+    }
+    const projection: WorkflowRunCompletionProjection = {
+      runId: row.run_id,
+      runStatus: row.status,
+    };
+    if (row.terminal_reason_code && /^[a-z0-9_]{1,64}$/.test(row.terminal_reason_code)) {
+      projection.terminalReason = row.terminal_reason_code;
+    }
+    if (
+      row.terminal_result_run_id &&
+      row.terminal_result_artifact_id &&
+      Number.isInteger(row.terminal_result_artifact_revision) &&
+      Number(row.terminal_result_artifact_revision) > 0
+    ) {
+      projection.terminalResult = {
+        runId: row.terminal_result_run_id,
+        artifactId: row.terminal_result_artifact_id,
+        artifactRevision: Number(row.terminal_result_artifact_revision),
+      };
+    }
+    if (row.artifact_kind === 'next_result' && row.artifact_payload_json) {
+      try {
+        const payload = JSON.parse(row.artifact_payload_json) as Record<string, unknown>;
+        if (
+          payload.kind === 'next_result' &&
+          (payload.change === 'updated' || payload.change === 'unchanged')
+        ) {
+          projection.workflowNext = {
+            change: payload.change,
+            ...(typeof payload.result === 'string' ? { result: payload.result } : {}),
+          };
+        }
+      } catch {
+        return projection;
+      }
     }
     return projection;
   }
@@ -3562,10 +3952,43 @@ export class SqliteTaskRepository implements TaskRepository {
   private async requestRuntimeHandoff(
     command: Extract<RepositoryCommand, { kind: 'requestRuntimeHandoff' }>,
   ): Promise<RepositoryCommandResult> {
-    const fence = appendTurnFence(
-      `UPDATE tasks SET updated_at = updated_at
-        WHERE workspace_id = ? AND id = ? AND revision = ?
-          AND NOT EXISTS (
+    const recovery = command.recovery;
+    if (
+      recovery
+      && (
+        recovery.turn.taskId !== command.taskId
+        || recovery.turn.status !== 'queued'
+        || recovery.turn.retryOf !== recovery.failedTurnId
+        || (recovery.turn.runtimeEpoch ?? 1) !== (command.task.runtimeEpoch ?? 1)
+      )
+    ) {
+      return { ok: true, changed: false, reason: 'invalid runtime recovery turn' };
+    }
+    const workflowGuard = recovery?.workflow
+      ? `EXISTS (
+            SELECT 1
+              FROM workflow_activations activation
+              JOIN workflow_runs run
+                ON run.workspace_id = activation.workspace_id
+               AND run.run_id = activation.run_id
+              JOIN workflow_nodes node
+                ON node.workspace_id = activation.workspace_id
+               AND node.run_id = activation.run_id
+               AND node.node_id = activation.node_id
+             WHERE activation.workspace_id = tasks.workspace_id
+               AND activation.run_id = ?
+               AND activation.activation_id = ?
+               AND activation.execution_turn_id = ?
+               AND activation.status = ?
+               AND node.task_id = tasks.id
+               AND run.status = 'running'
+               AND (run.deadline_at IS NULL OR run.deadline_at > ?)
+               AND run.workflow_turns_reserved < run.max_workflow_turns
+               AND (SELECT COUNT(*) FROM turns task_turn
+                      WHERE task_turn.workspace_id = tasks.workspace_id
+                        AND task_turn.task_id = tasks.id) < run.max_turns_per_task
+          )`
+      : `NOT EXISTS (
             SELECT 1
               FROM workflow_nodes node
               JOIN workflow_runs run
@@ -3574,8 +3997,48 @@ export class SqliteTaskRepository implements TaskRepository {
              WHERE node.workspace_id = tasks.workspace_id
                AND node.task_id = tasks.id
                AND run.status = 'running'
-          )`,
-      [this.workspaceId, command.taskId, command.expectedTaskRevision],
+          )`;
+    const workflowGuardParams: SqlValue[] = recovery?.workflow
+      ? [
+          recovery.workflow.runId,
+          recovery.workflow.activationId,
+          recovery.failedTurnId,
+          recovery.workflow.expectedActivationStatus,
+          command.task.updatedAt,
+        ]
+      : [];
+    const recoveryGuard = recovery
+      ? `AND EXISTS (
+             SELECT 1 FROM turns failed_turn
+              WHERE failed_turn.workspace_id = tasks.workspace_id
+                AND failed_turn.task_id = tasks.id
+                AND failed_turn.id = ? AND failed_turn.status = ?
+           )
+         AND NOT EXISTS (
+             SELECT 1 FROM turns live_turn
+              WHERE live_turn.workspace_id = tasks.workspace_id
+                AND live_turn.task_id = tasks.id
+                AND live_turn.status IN ('queued', 'running', 'waiting_user')
+           )
+         AND (SELECT COUNT(*) FROM turns task_turn
+                WHERE task_turn.workspace_id = tasks.workspace_id
+                  AND task_turn.task_id = tasks.id) < ?`
+      : '';
+    const recoveryGuardParams: SqlValue[] = recovery
+      ? [recovery.failedTurnId, recovery.expectedFailedStatus, recovery.maxTurnsPerTask]
+      : [];
+    const fence = appendTurnFence(
+      `UPDATE tasks SET updated_at = updated_at
+        WHERE workspace_id = ? AND id = ? AND revision = ?
+          AND ${workflowGuard}
+          ${recoveryGuard}`,
+      [
+        this.workspaceId,
+        command.taskId,
+        command.expectedTaskRevision,
+        ...workflowGuardParams,
+        ...recoveryGuardParams,
+      ],
       this.workspaceId,
       command.expectedTurns,
     );
@@ -3591,11 +4054,48 @@ export class SqliteTaskRepository implements TaskRepository {
       ...(command.cancelRequests ?? []).map((entry) => cancelRequestStatement(this.workspaceId, {
         kind: 'putCancelRequest', workspaceId: this.workspaceId, turnId: entry.turnId, request: entry.request,
       })),
+      ...(recovery?.workflow
+        ? [{
+            sql: `UPDATE workflow_runs
+                     SET workflow_turns_reserved = workflow_turns_reserved + 1,
+                         updated_at = ?
+                   WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                     AND workflow_turns_reserved < max_workflow_turns`,
+            params: [command.task.updatedAt, this.workspaceId, recovery.workflow.runId],
+          }]
+        : []),
+      ...(recovery
+        ? [
+            turnStatement(this.workspaceId, recovery.turn, false),
+            ...recovery.turn.inputs.map((input, ordering) =>
+              turnInputStatement(this.workspaceId, recovery.turn.id, ordering, input)),
+          ]
+        : []),
+      ...(recovery?.workflow
+        ? [{
+            sql: `UPDATE workflow_activations
+                     SET status = 'queued', execution_turn_id = ?, updated_at = ?
+                   WHERE workspace_id = ? AND run_id = ? AND activation_id = ?
+                     AND execution_turn_id = ? AND status = ?`,
+            params: [
+              recovery.turn.id,
+              command.task.updatedAt,
+              this.workspaceId,
+              recovery.workflow.runId,
+              recovery.workflow.activationId,
+              recovery.failedTurnId,
+              recovery.workflow.expectedActivationStatus,
+            ],
+          }]
+        : []),
     ];
     const changes: ChangeRecord[] = [
       { kind: 'task', id: command.taskId, change: 'runtime_handoff' },
       ...command.turns.map((turn) => ({ kind: 'turn' as const, id: turn.id, taskId: turn.taskId, change: 'runtime_handoff' })),
       ...(command.cancelRequests ?? []).map((entry) => ({ kind: 'cancel_request' as const, id: entry.turnId, change: 'runtime_handoff' })),
+      ...(recovery
+        ? [{ kind: 'turn' as const, id: recovery.turn.id, taskId: recovery.turn.taskId, change: 'insert' }]
+        : []),
     ];
     const results = await this.writeIfFirstChanged(
       { sql: fence.sql, params: fence.params }, rest, changes, command.task.updatedAt,
@@ -5397,6 +5897,11 @@ export class SqliteTaskRepository implements TaskRepository {
       const finishedAt = command.turn.finishedAt ?? new Date().toISOString();
       const resultBody = typeof disposition.result === 'string' ? disposition.result : undefined;
       const fenceId = stableId('wfc', `${producerNode.run_id}\0terminal_next\0${command.turn.id}`);
+      const taskClosure = await this.planWorkflowTaskLifecycleClosure({
+        runIds: [producerNode.run_id],
+        lifecycle: 'succeeded',
+        at: finishedAt,
+      });
       return {
         statements: [
           {
@@ -5451,12 +5956,23 @@ export class SqliteTaskRepository implements TaskRepository {
             turnId: command.turn.id,
           }),
           {
-            sql: `UPDATE workflow_runs SET status = 'succeeded', updated_at = ?
-                  WHERE workspace_id = ? AND run_id = ? AND status = 'running'`,
-            params: [finishedAt, this.workspaceId, producerNode.run_id],
+            sql: `UPDATE workflow_runs
+                     SET status = 'succeeded',
+                         terminal_result_run_id = ?, terminal_result_artifact_id = ?,
+                         terminal_result_artifact_revision = ?, updated_at = ?
+                   WHERE workspace_id = ? AND run_id = ? AND status = 'running'`,
+            params: [
+              producerNode.run_id,
+              artifactId,
+              revision,
+              finishedAt,
+              this.workspaceId,
+              producerNode.run_id,
+            ],
           },
+          ...taskClosure.statements,
         ],
-        changes: [{ kind: 'task', id: command.task.id, change: 'effect' }],
+        changes: taskClosure.changes,
       };
     }
     if (topology.kind !== 'graph_v1') return empty;
@@ -8048,9 +8564,17 @@ export class SqliteTaskRepository implements TaskRepository {
     });
     statements.push({
       sql: `UPDATE workflow_runs
-               SET status = 'succeeded', updated_at = ?
+               SET status = 'succeeded',
+                   terminal_result_run_id = ?, terminal_result_artifact_id = ?,
+                   terminal_result_artifact_revision = 1, updated_at = ?
              WHERE workspace_id = ? AND run_id = ? AND status = 'running'`,
-      params: [finishedAt, this.workspaceId, childNode.runId],
+      params: [
+        childNode.runId,
+        stableChildReturnArtifactId(callerScopeId, childNode.runId),
+        finishedAt,
+        this.workspaceId,
+        childNode.runId,
+      ],
     });
 
     const fenceBody = JSON.stringify({
@@ -8207,6 +8731,13 @@ export class SqliteTaskRepository implements TaskRepository {
       { kind: 'message', id: resumeMessageId, taskId: callerTaskId, change: 'complete' },
       { kind: 'task', id: callerTaskId, change: 'effect' },
     );
+    const taskClosure = await this.planWorkflowTaskLifecycleClosure({
+      runIds: [childNode.runId],
+      lifecycle: 'succeeded',
+      at: finishedAt,
+    });
+    statements.push(...taskClosure.statements);
+    changes.push(...taskClosure.changes);
 
     return {
       statements,
@@ -8614,6 +9145,96 @@ export class SqliteTaskRepository implements TaskRepository {
     });
   }
 
+  private async planWorkflowTaskLifecycleClosure(input: {
+    runIds: readonly string[];
+    lifecycle: 'succeeded' | 'failed' | 'cancelled';
+    at: string;
+    reasonCode?: WorkflowFailReasonCode;
+  }): Promise<{ statements: SqlStatement[]; changes: ChangeRecord[] }> {
+    const runIds = [...new Set(input.runIds)].filter((runId) => runId.length > 0).sort();
+    if (runIds.length === 0) return { statements: [], changes: [] };
+    const runPlaceholders = runIds.map(() => '?').join(',');
+    const rows = await this.db.all<{ task_id: string }>(
+      `SELECT DISTINCT task.id AS task_id
+         FROM tasks task
+         JOIN workflow_nodes node
+           ON node.workspace_id = task.workspace_id AND node.task_id = task.id
+        WHERE task.workspace_id = ? AND node.run_id IN (${runPlaceholders})
+          AND task.lifecycle = 'open'`,
+      [this.workspaceId, ...runIds],
+    );
+    if (rows.length === 0) return { statements: [], changes: [] };
+
+    const terminalPath = input.lifecycle === 'failed' ? '$.error' : '$.reason';
+    const reasonMutation = input.lifecycle === 'succeeded'
+      ? ''
+      : `, '${terminalPath}', ?`;
+    const reasonParams = input.lifecycle === 'succeeded'
+      ? []
+      : [input.reasonCode ?? input.lifecycle];
+    return {
+      statements: [{
+        sql: `UPDATE tasks
+                 SET lifecycle = ?, updated_at = ?, revision = revision + 1,
+                     payload_json = json_set(
+                       json_remove(
+                         payload_json,
+                         '$.attention', '$.completionCandidate', '$.outcomeProposal',
+                         '$.error', '$.reason'
+                       ),
+                       '$.finishedAt', ?,
+                       '$.sealedBy', json_object(
+                         'kind', 'coordinator',
+                         'taskId', COALESCE((
+                           SELECT run.owner_root_task_id
+                             FROM workflow_nodes owner_node
+                             JOIN workflow_runs run
+                               ON run.workspace_id = owner_node.workspace_id
+                              AND run.run_id = owner_node.run_id
+                            WHERE owner_node.workspace_id = tasks.workspace_id
+                              AND owner_node.task_id = tasks.id
+                              AND owner_node.run_id IN (${runPlaceholders})
+                            LIMIT 1
+                         ), (
+                           SELECT run.caller_task_id
+                             FROM workflow_nodes caller_node
+                             JOIN workflow_runs run
+                               ON run.workspace_id = caller_node.workspace_id
+                              AND run.run_id = caller_node.run_id
+                            WHERE caller_node.workspace_id = tasks.workspace_id
+                              AND caller_node.task_id = tasks.id
+                              AND caller_node.run_id IN (${runPlaceholders})
+                            LIMIT 1
+                         ), tasks.id),
+                         'mode', 'workflow_run'
+                       )${reasonMutation}
+                     )
+               WHERE workspace_id = ? AND lifecycle = 'open'
+                 AND id IN (
+                   SELECT task_id FROM workflow_nodes
+                    WHERE workspace_id = ? AND run_id IN (${runPlaceholders})
+                      AND task_id IS NOT NULL
+                 )`,
+        params: [
+          input.lifecycle,
+          input.at,
+          input.at,
+          ...runIds,
+          ...runIds,
+          ...reasonParams,
+          this.workspaceId,
+          this.workspaceId,
+          ...runIds,
+        ],
+      }],
+      changes: rows.map((row) => ({
+        kind: 'task' as const,
+        id: row.task_id,
+        change: 'effect',
+      })),
+    };
+  }
+
   /**
    * M018 §20.11: one transaction plan closes the complete caller/child run component,
    * its waits and activations, and every continuation boundary exactly once.
@@ -8790,6 +9411,15 @@ export class SqliteTaskRepository implements TaskRepository {
         ],
       });
     }
+
+    const taskClosure = await this.planWorkflowTaskLifecycleClosure({
+      runIds,
+      lifecycle: terminalStatus,
+      at: input.at,
+      reasonCode: input.reasonCode,
+    });
+    statements.push(...taskClosure.statements);
+    changes.push(...taskClosure.changes);
 
     const turns = await this.db.all<{ id: string; task_id: string; status: string }>(
       `SELECT turn.id, turn.task_id, turn.status

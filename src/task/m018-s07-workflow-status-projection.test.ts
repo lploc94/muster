@@ -1,11 +1,10 @@
 /**
- * M018 S07 T01: bounded workflow status projection on get_task_status.
+ * M018 S07 T01: bounded workflow inspection projections.
  *
  * Contract:
  * - repository getWorkflowStatusForTask joins nodes → runs → gates/rounds/continuations
- * - get_task_status surfaces a bounded `workflow` section (runId, definitionId+version,
- *   run policy/status/reason, per-gate satisfied/required, exact activation,
- *   active feedback rounds, all continuation states, diagnostics, parent linkage / origin)
+ * - inspect_workflow_run surfaces bounded run policy/status/reason, nodes, gates,
+ *   recoverable activations, active feedback rounds, continuations, and diagnostics
  * - never leaks topology, prompts, artifact bodies, secrets, or absolute paths
  *
  * Uses real SQLite worker + repository; graph tool surface via executeToolCommand.
@@ -21,7 +20,10 @@ import { SqliteTaskRepository } from './repository';
 import { DbClient } from './sqlite/client';
 import type { TaskStoreFile } from './types';
 import { makeGraphFanInDefinition, entryNodeIds } from './workflow';
-import type { WorkflowTaskStatusProjection } from './workflow-types';
+import type {
+  WorkflowRunInspectionProjection,
+  WorkflowTaskStatusProjection,
+} from './workflow-types';
 
 const WORKER_TS = path.join(__dirname, 'sqlite', 'worker.ts');
 const TSX_ARGV = ['--import', 'tsx'];
@@ -140,6 +142,25 @@ function assertBoundedProjection(w: WorkflowTaskStatusProjection): void {
   expect(forbiddenLeak(w)).toEqual([]);
 }
 
+function assertBoundedRunInspection(run: WorkflowRunInspectionProjection): void {
+  expect(run.runId).toMatch(/^wfr_/);
+  expect(typeof run.definitionId).toBe('string');
+  expect(Number.isInteger(run.definitionVersion)).toBe(true);
+  expect(typeof run.runStatus).toBe('string');
+  expect(Array.isArray(run.nodes)).toBe(true);
+  expect(Array.isArray(run.gates)).toBe(true);
+  expect(Array.isArray(run.activations)).toBe(true);
+  expect(Array.isArray(run.feedbackRounds)).toBe(true);
+  expect(Array.isArray(run.continuations)).toBe(true);
+  expect(Array.isArray(run.diagnostics)).toBe(true);
+  expect(run).not.toHaveProperty('tasks');
+  expect(run).not.toHaveProperty('topology');
+  expect(run).not.toHaveProperty('payload_json');
+  expect(run).not.toHaveProperty('body_json');
+  expect(run).not.toHaveProperty('prompt');
+  expect(forbiddenLeak(run)).toEqual([]);
+}
+
 function makeStore(file: TaskStoreFile) {
   return {
     getFile: () => file,
@@ -185,6 +206,12 @@ describe('M018 S07 bounded workflow status projection', () => {
       const data = await defineAndStartFanIn(ctx.repository, createdAt, 's07-status-1');
       const byNode = new Map(data.entries.map((e) => [e.nodeId, e]));
       const p1 = byNode.get('p1')!;
+      await ctx.client.run(
+        `UPDATE workflow_runs
+            SET owner_root_task_id = ?, caller_task_id = ?, caller_turn_id = ?
+          WHERE workspace_id = ? AND run_id = ?`,
+        [p1.taskId, p1.taskId, p1.activationTurnId, 'ws', data.runId],
+      );
       expect(p1).toBeTruthy();
 
       const projection = await ctx.repository.getWorkflowStatusForTask(p1.taskId);
@@ -213,17 +240,32 @@ describe('M018 S07 bounded workflow status projection', () => {
       expect(projection!.feedbackRounds).toEqual([]);
       expect(projection!.continuations).toEqual([]);
       expect(projection!.diagnostics).toEqual([]);
+
+      const inspection = await ctx.repository.inspectWorkflowRun(data.runId, p1.taskId);
+      expect(inspection).toBeTruthy();
+      assertBoundedRunInspection(inspection!);
+      expect(inspection!.nodes.map((node) => node.nodeId).sort()).toEqual(['consumer', 'p1', 'p2']);
+      expect(inspection!.activations.map((activation) => activation.nodeId).sort()).toEqual(['p1', 'p2']);
+      await expect(
+        ctx.repository.inspectWorkflowRun(data.runId, 'different-root'),
+      ).resolves.toBeUndefined();
     } finally {
       await ctx.close();
     }
   }, 30_000);
 
-  it('get_task_status surfaces bounded workflow section without topology/prompt/body/path leakage', async () => {
+  it('inspect_workflow_run returns only owned bounded run diagnostics', async () => {
     const ctx = await openRepo('status-tool');
     try {
       const createdAt = '2026-07-21T00:10:00.000Z';
       const data = await defineAndStartFanIn(ctx.repository, createdAt, 's07-status-tool-1');
       const p1 = data.entries.find((e) => e.nodeId === 'p1')!;
+      await ctx.client.run(
+        `UPDATE workflow_runs
+            SET owner_root_task_id = ?, caller_task_id = ?, caller_turn_id = ?
+          WHERE workspace_id = ? AND run_id = ?`,
+        [p1.taskId, p1.taskId, p1.activationTurnId, 'ws', data.runId],
+      );
       const task = await ctx.repository.getTask(p1.taskId);
       const turn = await ctx.repository.getTurn(p1.activationTurnId);
       expect(task).toBeTruthy();
@@ -247,27 +289,30 @@ describe('M018 S07 bounded workflow status projection', () => {
         {
           callerTaskId: task!.id,
           turnId: turn!.id,
-          rootId: task!.id,
-          allowedActions: new Set(['read_subtree', 'get_task_status']),
+          rootId: p1.taskId,
+          allowedActions: new Set(['read_subtree', 'inspect_workflow_run']),
         },
-        { kind: 'get_task_status' },
+        { kind: 'inspect_workflow_run', runId: data.runId },
       );
       expect(result.ok).toBe(true);
       if (!result.ok) return;
-      const payload = result.result as {
-        root: string;
-        tasks: unknown[];
-        workflow?: WorkflowTaskStatusProjection;
-      };
-      expect(payload.root).toBe(task!.id);
-      expect(payload.workflow).toBeTruthy();
-      assertBoundedProjection(payload.workflow!);
-      expect(payload.workflow!.runId).toBe(data.runId);
-      expect(payload.workflow!.nodeId).toBe('p1');
-      // Full tool result must stay free of forbidden leakage classes.
-      expect(forbiddenLeak(payload)).toEqual([]);
-      expect(JSON.stringify(payload)).not.toContain('topology');
-      expect(JSON.stringify(payload)).not.toContain('payload_json');
+      const inspection = result.result as WorkflowRunInspectionProjection;
+      assertBoundedRunInspection(inspection);
+      expect(inspection.runId).toBe(data.runId);
+      expect(inspection.nodes.map((node) => node.nodeId).sort()).toEqual(['consumer', 'p1', 'p2']);
+      expect(JSON.stringify(inspection)).not.toContain('topology');
+      expect(JSON.stringify(inspection)).not.toContain('payload_json');
+
+      await expect(executeToolCommand(
+        deps,
+        {
+          callerTaskId: task!.id,
+          turnId: turn!.id,
+          rootId: 'different-root',
+          allowedActions: new Set(['inspect_workflow_run']),
+        },
+        { kind: 'inspect_workflow_run', runId: data.runId },
+      )).resolves.toEqual({ ok: false, error: 'workflow run not found' });
     } finally {
       await ctx.close();
     }
@@ -407,11 +452,24 @@ describe('M018 S07 bounded workflow status projection', () => {
                  WHERE workspace_id = ? AND run_id = ?`,
           params: ['ws', data.runId],
         },
-        {
-          sql: `UPDATE workflow_runs
-                   SET status = 'failed', terminal_reason_code = 'agent_fail', updated_at = ?
-                 WHERE workspace_id = ? AND run_id = ?`,
-          params: ['2026-07-21T00:31:00.000Z', 'ws', data.runId],
+         {
+           sql: `UPDATE workflow_runs
+                    SET status = 'failed', terminal_reason_code = 'agent_fail',
+                        terminal_result_run_id = ?, terminal_result_artifact_id = ?,
+                        terminal_result_artifact_revision = 1,
+                        owner_root_task_id = ?, caller_task_id = ?, caller_turn_id = ?,
+                        updated_at = ?
+                  WHERE workspace_id = ? AND run_id = ?`,
+          params: [
+            data.runId,
+            artifactId,
+            p1.taskId,
+            p1.taskId,
+            p1.activationTurnId,
+            '2026-07-21T00:31:00.000Z',
+            'ws',
+            data.runId,
+          ],
         },
       ]);
 
@@ -447,6 +505,14 @@ describe('M018 S07 bounded workflow status projection', () => {
       expect(corrupt?.terminalReason).toBe('agent_fail');
       expect(corrupt?.diagnostics).toContainEqual({ code: 'terminal_run_has_live_gate' });
       expect(forbiddenLeak(corrupt)).toEqual([]);
+      const runInspection = await ctx.repository.inspectWorkflowRun(data.runId, p1.taskId);
+      expect(runInspection?.terminalResult).toEqual({
+        runId: data.runId,
+        artifactId,
+        artifactRevision: 1,
+      });
+      expect(runInspection?.diagnostics).toContainEqual({ code: 'terminal_run_has_live_gate' });
+      expect(forbiddenLeak(runInspection)).toEqual([]);
       await expect(ctx.repository.execute({
         kind: 'applyRetention',
         workspaceId: 'ws',

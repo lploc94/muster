@@ -6,13 +6,18 @@ import type * as McpExpressModule from '@modelcontextprotocol/sdk/server/express
 import type * as McpStreamableHttpModule from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type * as McpTypesModule from '@modelcontextprotocol/sdk/types.js';
 import type { CredentialRegistry, CredentialVerification } from './credentials';
-import type { ToolAction } from '../task/capabilities';
+import {
+  isPublicMcpToolAction,
+  PUBLIC_MCP_TOOL_ACTIONS,
+  type PublicMcpToolAction,
+} from '../task/capabilities';
 import {
   dispatch,
   PRESENTATION_ID_MAX_LENGTH,
   PRESENTATION_MARKDOWN_MAX_LENGTH,
   PRESENTATION_TITLE_MAX_LENGTH,
 } from '../task/coordinator-tools';
+import { DEFAULT_WORKFLOW_POLICY } from '../task/workflow-codec';
 
 // VS Code's Extension Host resolver does not consistently honor this package's
 // wildcard exports (for example `./server/index.js`) in a packaged VSIX. Resolve
@@ -70,34 +75,7 @@ export interface BridgeHealthResponse {
   port?: number;
 }
 
-const ALL_TOOLS: ToolAction[] = [
-  'create_task',
-  'delegate_task',
-  'create_tasks',
-  'delegate_tasks',
-  'release_tasks',
-  'list_task_types',
-  'interrupt_task',
-  'cancel_task',
-  'cancel_tasks',
-  'continue_child',
-  'set_task_lifecycle',
-  'wait_for_tasks',
-  'get_task_status',
-  'get_host_context',
-  'complete_task',
-  'fail_task',
-  'workflow_next',
-  'workflow_prev',
-  'workflow_fail',
-  'invoke_child_workflow',
-  'report_progress',
-  'ask_parent',
-  'answer_child_question',
-  'upsert_presentation',
-  'define_workflow',
-  'start_workflow',
-];
+const ALL_TOOLS: readonly PublicMcpToolAction[] = PUBLIC_MCP_TOOL_ACTIONS;
 
 const OP_ID = { type: 'string', minLength: 1 };
 const PRESENTATION_ID = {
@@ -107,328 +85,23 @@ const PRESENTATION_ID = {
   pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]*$',
 };
 
-const DEPENDENCY_SCHEMA = {
-  type: 'object',
-  required: ['taskId', 'requiredOutcome', 'onUnsatisfied'],
-  properties: {
-    taskId: OP_ID,
-    requiredOutcome: { enum: ['succeeded', 'settled'] },
-    onUnsatisfied: { enum: ['block', 'fail', 'skip'] },
-    // Opt-in verify gate: satisfied only when the producer verdict is `pass`.
-    requiredVerdict: { enum: ['pass'] },
-  },
-  additionalProperties: false,
-};
-
-const VERDICT_SCHEMA = {
-  type: 'object',
-  required: ['status'],
-  properties: {
-    status: { enum: ['pass', 'fail', 'inconclusive'] },
-    rationale: { type: 'string' },
-    criteria: {
-      type: 'array',
-      items: {
-        type: 'object',
-        required: ['label', 'status'],
-        properties: {
-          label: { type: 'string' },
-          status: { enum: ['pass', 'fail', 'inconclusive'] },
-          detail: { type: 'string' },
-        },
-        additionalProperties: false,
-      },
-    },
-  },
-  additionalProperties: false,
-};
-
-const EXECUTION_POLICY_SCHEMA = {
-  type: 'object',
-  properties: {
-    maxTurns: { type: 'integer', minimum: 1 },
-    maxAutomaticRetries: { type: 'integer', minimum: 0 },
-    runTimeoutOverrideMs: {
-      type: 'integer',
-      minimum: 1,
-      description: 'Optional shorter run budget. The user-configured host limit is always the ceiling.',
-    },
-  },
-  additionalProperties: false,
-};
-
-const BRIEF_SCHEMA = {
-  type: 'object',
-  properties: {
-    kind: {
-      enum: ['coordinate', 'plan', 'breakdown', 'implement', 'test', 'verify', 'research', 'generic'],
-    },
-    title: { type: 'string' },
-    objective: { type: 'string' },
-    context: { type: 'string' },
-    nonGoals: { type: 'array', items: { type: 'string' } },
-    constraints: { type: 'array', items: { type: 'string' } },
-    acceptanceCriteria: { type: 'array', items: { type: 'string' } },
-    definitionOfDone: { type: 'array', items: { type: 'string' } },
-    readPaths: { type: 'array', items: { type: 'string' } },
-    writePaths: { type: 'array', items: { type: 'string' } },
-    verification: {
-      type: 'object',
-      properties: {
-        commands: { type: 'array', items: { type: 'string' } },
-        manualChecks: { type: 'array', items: { type: 'string' } },
-      },
-      additionalProperties: false,
-    },
-    skills: { type: 'array', items: { type: 'string' }, maxItems: 8 },
-  },
-  additionalProperties: false,
-};
-
-const INPUT_BINDING_SCHEMA = {
-  type: 'object',
-  required: ['fromTaskId', 'output', 'as'],
-  properties: {
-    fromTaskId: OP_ID,
-    output: { enum: ['summary'] },
-    as: { type: 'string', minLength: 1 },
-    required: { type: 'boolean' },
-  },
-  additionalProperties: false,
-};
-
-const CREATE_SPEC_PROPERTIES = {
-  opId: OP_ID,
-  goal: { type: 'string', minLength: 1 },
-  /** Required: id from muster.taskTypes (not enum'd — registry changes independently). */
-  taskType: { type: 'string', minLength: 1 },
-  /** Optional user override only when the user named a backend. */
-  backend: { type: 'string', minLength: 1, maxLength: 200 },
-  /** ACP model id (config option value or session/set_model id). Optional override. */
-  model: { type: 'string', minLength: 1, maxLength: 200 },
-  role: { enum: ['coordinator', 'worker'] },
-  dependencies: { type: 'array', items: DEPENDENCY_SCHEMA },
-  executionPolicy: EXECUTION_POLICY_SCHEMA,
-  description: { type: 'string' },
-  brief: BRIEF_SCHEMA,
-  inputBindings: { type: 'array', items: INPUT_BINDING_SCHEMA },
-  claimsGit: { type: 'boolean' },
-  writePaths: { type: 'array', items: { type: 'string' } },
-  readPaths: { type: 'array', items: { type: 'string' } },
-};
-
-const BATCH_INPUT_BINDING_SCHEMA = {
-  type: 'object',
-  required: ['output', 'as'],
-  properties: {
-    /** Sibling localId producing the summary (XOR fromTaskId). */
-    fromLocalId: { type: 'string', minLength: 1 },
-    /** Pre-existing producer task id (XOR fromLocalId). */
-    fromTaskId: OP_ID,
-    output: { enum: ['summary'] },
-    as: { type: 'string', minLength: 1 },
-    required: { type: 'boolean' },
-  },
-  additionalProperties: false,
-};
-
-const BATCH_CHILD_SCHEMA = {
-  type: 'object',
-  required: ['localId', 'goal', 'taskType'],
-  properties: {
-    /** Unique-within-batch handle (same grammar as task type ids). */
-    localId: { type: 'string', minLength: 1, maxLength: 64, pattern: '^[a-z][a-z0-9_-]{0,63}$' },
-    goal: { type: 'string', minLength: 1 },
-    taskType: { type: 'string', minLength: 1 },
-    backend: { type: 'string', minLength: 1, maxLength: 200 },
-    model: { type: 'string', minLength: 1, maxLength: 200 },
-    role: { enum: ['coordinator', 'worker'] },
-    /** Sibling localIds this item waits for (→ succeeded/fail dependency). */
-    dependsOn: { type: 'array', items: { type: 'string', minLength: 1 } },
-    /** Ordering edges onto pre-existing tasks in the same root. */
-    dependencies: { type: 'array', items: DEPENDENCY_SCHEMA },
-    executionPolicy: EXECUTION_POLICY_SCHEMA,
-    description: { type: 'string' },
-    brief: BRIEF_SCHEMA,
-    inputBindings: { type: 'array', items: BATCH_INPUT_BINDING_SCHEMA },
-    claimsGit: { type: 'boolean' },
-    writePaths: { type: 'array', items: { type: 'string' } },
-    readPaths: { type: 'array', items: { type: 'string' } },
-  },
-  additionalProperties: false,
-};
-
-const QUESTION_SCHEMA = {
-  type: 'object',
-  required: ['prompt'],
-  properties: {
-    prompt: { type: 'string', minLength: 1 },
-    options: { type: 'array', items: { type: 'string' } },
-    allowFreeText: { type: 'boolean' },
-  },
-  additionalProperties: false,
-};
-
-const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
-  create_task: {
-    type: 'object',
-    required: ['opId', 'goal', 'taskType'],
-    properties: CREATE_SPEC_PROPERTIES,
-    additionalProperties: false,
-  },
-  delegate_task: {
-    type: 'object',
-    required: ['opId', 'goal', 'taskType'],
-    properties: {
-      ...CREATE_SPEC_PROPERTIES,
-      waitForCompletion: {
-        type: 'boolean',
-        description:
-          'When true, stage wait on this child in the same call. On success the barrier is armed: end the current turn; do not wait or poll again.',
-      },
-    },
-    additionalProperties: false,
-  },
-  create_tasks: {
-    type: 'object',
-    required: ['opId', 'tasks'],
-    properties: {
-      opId: OP_ID,
-      tasks: { type: 'array', minItems: 1, maxItems: 16, items: BATCH_CHILD_SCHEMA },
-    },
-    additionalProperties: false,
-  },
-  delegate_tasks: {
-    type: 'object',
-    required: ['opId', 'tasks'],
-    properties: {
-      opId: OP_ID,
-      tasks: { type: 'array', minItems: 1, maxItems: 16, items: BATCH_CHILD_SCHEMA },
-      waitForLocalIds: {
-        type: 'array',
-        items: { type: 'string', minLength: 1 },
-        minItems: 1,
-        description: 'Exact batch-local ids to wait on. On success end the current turn; do not wait or poll again.',
-      },
-    },
-    additionalProperties: false,
-  },
+const TOOL_INPUT_SCHEMAS: Record<PublicMcpToolAction, Record<string, unknown>> = {
   list_task_types: {
     type: 'object',
     properties: {},
     additionalProperties: false,
   },
-  release_tasks: {
+  inspect_workflow_run: {
     type: 'object',
-    required: ['opId', 'taskIds'],
+    required: ['runId'],
     properties: {
-      opId: OP_ID,
-      taskIds: { type: 'array', items: OP_ID, minItems: 1 },
-      includeDependencies: { type: 'boolean' },
-      waitForTaskIds: {
-        type: 'array',
-        items: OP_ID,
-        minItems: 1,
-        description:
-          'Exact direct-child ids to wait on after release. On success end the current turn; do not wait or poll again.',
-      },
-    },
-    additionalProperties: false,
-  },
-  interrupt_task: {
-    type: 'object',
-    required: ['opId', 'childId'],
-    properties: {
-      opId: OP_ID,
-      childId: OP_ID,
-      taskId: OP_ID,
-    },
-    additionalProperties: false,
-  },
-  cancel_task: {
-    type: 'object',
-    required: ['opId', 'childId'],
-    properties: {
-      opId: OP_ID,
-      childId: OP_ID,
-      taskId: OP_ID,
-    },
-    additionalProperties: false,
-  },
-  cancel_tasks: {
-    type: 'object',
-    required: ['opId', 'childIds'],
-    properties: {
-      opId: OP_ID,
-      childIds: { type: 'array', items: OP_ID, minItems: 1 },
-      reason: { type: 'string' },
-    },
-    additionalProperties: false,
-  },
-  continue_child: {
-    type: 'object',
-    required: ['opId', 'childId', 'instruction'],
-    properties: {
-      opId: OP_ID,
-      childId: OP_ID,
-      taskId: OP_ID,
-      instruction: { type: 'string', minLength: 1 },
-      waitForCompletion: { type: 'boolean' },
-    },
-    additionalProperties: false,
-  },
-  set_task_lifecycle: {
-    type: 'object',
-    required: ['opId', 'taskId', 'lifecycle'],
-    properties: {
-      opId: OP_ID,
-      taskId: OP_ID,
-      lifecycle: { enum: ['succeeded', 'failed', 'cancelled', 'skipped'] },
-      result: { type: 'string', minLength: 1 },
-      error: { type: 'string', minLength: 1 },
-      reason: { type: 'string' },
-    },
-    additionalProperties: false,
-  },
-  wait_for_tasks: {
-    type: 'object',
-    required: ['opId', 'taskIds'],
-    properties: {
-      opId: OP_ID,
-      taskIds: { type: 'array', items: OP_ID, minItems: 1 },
-    },
-    additionalProperties: false,
-  },
-  get_task_status: {
-    type: 'object',
-    properties: {
-      taskId: OP_ID,
+      runId: OP_ID,
     },
     additionalProperties: false,
   },
   get_host_context: {
     type: 'object',
     properties: {},
-    additionalProperties: false,
-  },
-  complete_task: {
-    type: 'object',
-    required: ['opId', 'result'],
-    properties: {
-      opId: OP_ID,
-      result: { type: 'string', minLength: 1 },
-      // Optional structured verify verdict (verify tasks). Absent = no verdict.
-      verdict: VERDICT_SCHEMA,
-    },
-    additionalProperties: false,
-  },
-  fail_task: {
-    type: 'object',
-    required: ['opId', 'error'],
-    properties: {
-      opId: OP_ID,
-      error: { type: 'string', minLength: 1 },
-    },
     additionalProperties: false,
   },
   workflow_next: {
@@ -493,34 +166,6 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
         },
       },
       childIdempotencyKey: OP_ID,
-    },
-    additionalProperties: false,
-  },
-  report_progress: {
-    type: 'object',
-    required: ['opId', 'note'],
-    properties: {
-      opId: OP_ID,
-      note: { type: 'string', minLength: 1 },
-    },
-    additionalProperties: false,
-  },
-  ask_parent: {
-    type: 'object',
-    required: ['opId', 'questions'],
-    properties: {
-      opId: OP_ID,
-      questions: { type: 'array', items: QUESTION_SCHEMA, minItems: 1 },
-    },
-    additionalProperties: false,
-  },
-  answer_child_question: {
-    type: 'object',
-    required: ['opId', 'questionId', 'answers'],
-    properties: {
-      opId: OP_ID,
-      questionId: OP_ID,
-      answers: { type: 'array', items: { type: 'string' }, minItems: 1 },
     },
     additionalProperties: false,
   },
@@ -661,17 +306,51 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
           'maxInputsPerGate', 'maxArtifactBytes', 'maxAggregateBytes', 'failWorkflow',
         ],
         properties: {
-          maxFeedbackRoundsPerRun: { type: 'integer', minimum: 1, maximum: 32 },
-          maxTurnsPerTask: { type: 'integer', minimum: 1, maximum: 500 },
-          maxWorkflowTurnsPerRun: { type: 'integer', minimum: 1, maximum: 256 },
-          runTimeoutMs: { type: 'integer', minimum: 1000, maximum: 28800000 },
-          maxDepth: { type: 'integer', minimum: 1, maximum: 8 },
-          maxTaskCount: { type: 'integer', minimum: 1, maximum: 64 },
-          maxConcurrency: { type: 'integer', minimum: 1, maximum: 64 },
-          maxInputsPerGate: { type: 'integer', minimum: 1, maximum: 64 },
-          maxArtifactBytes: { type: 'integer', minimum: 1, maximum: 262144 },
-          maxAggregateBytes: { type: 'integer', minimum: 1, maximum: 1048576 },
-          failWorkflow: { type: 'boolean' },
+          maxFeedbackRoundsPerRun: {
+            type: 'integer', minimum: 1, maximum: 32,
+            default: DEFAULT_WORKFLOW_POLICY.maxFeedbackRoundsPerRun,
+            description: 'Feedback/PREV round budget. Minimum 1; use the default even when no PREV is planned.',
+          },
+          maxTurnsPerTask: {
+            type: 'integer', minimum: 1, maximum: 500,
+            default: DEFAULT_WORKFLOW_POLICY.maxTurnsPerTask,
+          },
+          maxWorkflowTurnsPerRun: {
+            type: 'integer', minimum: 1, maximum: 256,
+            default: DEFAULT_WORKFLOW_POLICY.maxWorkflowTurnsPerRun,
+          },
+          runTimeoutMs: {
+            type: 'integer', minimum: 1000, maximum: 28800000,
+            default: DEFAULT_WORKFLOW_POLICY.runTimeoutMs,
+          },
+          maxDepth: {
+            type: 'integer', minimum: 1, maximum: 8,
+            default: DEFAULT_WORKFLOW_POLICY.maxDepth,
+          },
+          maxTaskCount: {
+            type: 'integer', minimum: 1, maximum: 64,
+            default: DEFAULT_WORKFLOW_POLICY.maxTaskCount,
+          },
+          maxConcurrency: {
+            type: 'integer', minimum: 1, maximum: 64,
+            default: DEFAULT_WORKFLOW_POLICY.maxConcurrency,
+            description: 'Must not exceed maxTaskCount.',
+          },
+          maxInputsPerGate: {
+            type: 'integer', minimum: 1, maximum: 64,
+            default: DEFAULT_WORKFLOW_POLICY.maxInputsPerGate,
+          },
+          maxArtifactBytes: {
+            type: 'integer', minimum: 1, maximum: 262144,
+            default: DEFAULT_WORKFLOW_POLICY.maxArtifactBytes,
+            description: 'Maximum UTF-8 bytes in one routed artifact.',
+          },
+          maxAggregateBytes: {
+            type: 'integer', minimum: 1, maximum: 1048576,
+            default: DEFAULT_WORKFLOW_POLICY.maxAggregateBytes,
+            description: 'Maximum framed gate aggregate. Must cover every maximum-size input plus framing; do not set equal to maxArtifactBytes when an entry has inputs.',
+          },
+          failWorkflow: { type: 'boolean', default: DEFAULT_WORKFLOW_POLICY.failWorkflow },
         },
         additionalProperties: false,
       },
@@ -778,29 +457,17 @@ function createMcpServer(options: CreateMcpServerOptions): McpServer {
     const verification = credentials.verifyDetailed(authHeader ?? '');
     if (!verification.ok) logCredentialRejection(verification);
     const ctx = verification.ok ? verification.context : null;
-    const allowed = ctx?.allowedActions ?? new Set<ToolAction>();
+    const allowed = ctx?.allowedActions ?? new Set<PublicMcpToolAction>();
     const tools = ALL_TOOLS.filter((name) => allowed.has(name)).map((name) => ({
       name,
       description:
-        name === 'get_host_context'
+         name === 'get_host_context'
           ? 'Refresh trusted host env, self ids, task-type registry summary, and role rules (same data as first-turn host block).'
           : name === 'list_task_types'
             ? 'Refresh configured muster.taskTypes (first-turn host context already lists them). Prefer taskType from host snapshot; omit backend/model unless the user named an override.'
-            : name === 'delegate_task'
-              ? 'Create a released child by taskType and queue first turn. Prefer waitForCompletion:true for one-shot spawn+wait. A successful compound wait is already armed: end the turn and do not poll. Omit wait fields for fire-and-forget.'
-              : name === 'create_task'
-                ? 'Create a draft child by taskType (not scheduled until release_tasks). Prefer rich brief.'
-                : name === 'delegate_tasks'
-                  ? 'Batch create+release up to 16 children. Optional waitForLocalIds arms the barrier; on success end the turn and do not poll.'
-                  : name === 'create_tasks'
-                    ? 'Batch create draft children (up to 16). Release later with release_tasks({ waitForTaskIds }). Intra-batch dependsOn → succeeded/fail.'
-                    : name === 'release_tasks'
-                      ? 'Atomically release drafts and queue first turns. Optional waitForTaskIds arms the barrier; on success end the turn and do not poll. No start_task.'
-                      : name === 'wait_for_tasks'
-                        ? 'Advanced: monotonically add children to the current wait barrier. Redundant calls succeed. After success end the current turn; do not poll get_task_status.'
-                        : name === 'set_task_lifecycle'
-                          ? "Parent-seal a direct child's lifecycle (succeeded/failed/…). Use when child did not complete_task."
-                          : name === 'upsert_presentation'
+            : name === 'inspect_workflow_run'
+              ? 'Inspect bounded durable state for an owned workflow run by runId. Returns run/gate/activation/feedback/continuation diagnostics and committed terminal artifact references; never topology, prompts, artifact bodies, paths, or secrets. Use for recovery and diagnosis, not polling.'
+            : name === 'upsert_presentation'
                             ? 'Open or refresh a read-only IDE tab with Markdown (```mermaid``` fences supported). REQUIRED when the user asks to plan/spec for review or when a plan is ready: pass the full plan as markdown — do not only paste it in chat. Args: presentationId (stable, e.g. plan-<taskId>), ownerTaskId (must equal self.taskId), opId (unique per call), revision (1 then ++), title, markdown, optional kind (plan|spec|document), optional summary. Never send sourcePath, sourceFolderUri, updatedAt, or rootId (host-owned).'
                             : name === 'workflow_next'
                               ? 'Stage a workflow NEXT disposition on the live turn: routes this node result forward without sealing lifecycle. Provide change=updated|unchanged and optional result body. Engine owns gate/artifact identities. Committed only when the adapter settles the turn successfully.'
@@ -810,8 +477,8 @@ function createMcpServer(options: CreateMcpServerOptions): McpServer {
                               ? 'Stage a workflow FAIL disposition on the live turn: close the current workflow run without sealing task lifecycle. Optional reason is bounded diagnostics only (no prompts/artifacts/paths). Engine owns run/gate/round closure identities. Committed only when the adapter settles the turn successfully.'
                             : name === 'invoke_child_workflow'
                               ? 'Stage a child-workflow NEXT route on the live turn without sealing caller lifecycle. Provide childDefinitionId, childDefinitionVersion, and exact entryBindings (childEntryNodeId, inputRef, artifactId, artifactRevision), plus an optional childIdempotencyKey. Engine owns child run/continuation/return-gate identities. Committed only when the adapter settles the turn successfully.'
-                            : name === 'define_workflow'
-                              ? 'Persist an immutable workflow definition version (one_node_v1 or graph_v1 fan-in). Same definitionId+version+fingerprint replays; differing fingerprint fails closed. Domain validation is fail-closed for topology shape.'
+                             : name === 'define_workflow'
+                               ? 'Persist an immutable workflow definition version (one_node_v1 or graph_v1 fan-in). Start from the advertised policy defaults unless the user requires tighter limits. maxFeedbackRoundsPerRun is at least 1. maxAggregateBytes includes framing plus all maximum-size gate inputs, so it normally must be greater than maxArtifactBytes. Same definitionId+version+fingerprint replays; differing fingerprint fails closed.'
                               : name === 'start_workflow'
                                 ? 'Idempotently start a frozen top-level workflow run. Claims startIdempotencyKey and creates exactly one ordinary queued entry turn when the entry gate is satisfied. Agents never supply run/task/turn/gate IDs.'
                           : `Muster coordinator tool: ${name}`,
@@ -843,6 +510,9 @@ function createMcpServer(options: CreateMcpServerOptions): McpServer {
     const ctx = verification.context;
 
     const name = request.params.name;
+    if (!isPublicMcpToolAction(name)) {
+      return { content: [{ type: 'text', text: `unknown tool: ${name}` }], isError: true };
+    }
     const args = request.params.arguments ?? {};
     const routed = dispatch(name, args, ctx);
     if (!routed.ok) {

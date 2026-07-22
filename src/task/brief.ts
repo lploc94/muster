@@ -102,7 +102,7 @@ export type TaskBriefOverlay = {
  * opts in via `verification.hostRun` or `verification.emitVerdict`.
  */
 const VERDICT_INSTRUCTION_SECTION =
-  "# Verdict\nWhen you finish, call complete_task with a structured verdict {status:'pass'|'fail'|'inconclusive', rationale, criteria[]}. Missing checks or missing evidence => 'inconclusive', never a default 'pass'.";
+  "# Verdict\nWhen you finish a workflow activation, you may call workflow_next with a result string that reports a structured verdict: status ('pass', 'fail', or 'inconclusive'), rationale, and checked criteria. Missing checks or missing evidence => 'inconclusive', never a default 'pass'. Use workflow_prev when a producer must revise; use workflow_fail only when the required workflow result cannot be produced. If you do not call a workflow disposition, the host forwards your final assistant message as an updated NEXT result.";
 
 function clampStringList(items: readonly string[] | undefined, itemMax = 500): string[] | undefined {
   if (!items) return undefined;

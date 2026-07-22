@@ -614,7 +614,7 @@ describe('M018 S02 fan-in NEXT activation', () => {
         callerTaskId: taskId,
         turnId,
         attemptId: 'att-s02',
-        allowedActions: new Set(['define_workflow', 'start_workflow', 'get_task_status']),
+        allowedActions: new Set(['define_workflow', 'start_workflow', 'inspect_workflow_run']),
         ttlMs: 60_000,
       });
       const context = credentials.verify(token)!;
@@ -659,19 +659,47 @@ describe('M018 S02 fan-in NEXT activation', () => {
       );
       expect(startRouted.ok).toBe(true);
       if (!startRouted.ok) return;
-      const startedWf = await engine.handleToolCall(
+      let startResolved = false;
+      const startPromise = engine.handleToolCall(
         context,
         'start_workflow',
         startRouted.command,
       );
+      void startPromise.then(() => {
+        startResolved = true;
+      });
+      let durableRunId: string | undefined;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const run = await client.get<{ run_id: string }>(
+          'SELECT run_id FROM workflow_runs WHERE workspace_id = ? AND definition_id = ?',
+          [workspaceId, 'wf-public-fan'],
+        );
+        durableRunId = run?.run_id;
+        if (durableRunId) break;
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+      expect(durableRunId).toBeTruthy();
+      expect(startResolved).toBe(false);
+      await engine.getRepository().execute({
+        kind: 'reapWorkflowTimeouts',
+        workspaceId,
+        now: '2126-07-22T00:00:00.000Z',
+      });
+      const startedWf = await startPromise;
       expect(startedWf.ok).toBe(true);
       if (!startedWf.ok) return;
       const payload = startedWf.result as {
         runId: string;
         entries?: Array<{ nodeId: string; taskId: string; activationTurnId: string }>;
         nodeGates?: Array<{ nodeId: string; gateId: string }>;
+        runStatus: string;
+        terminalReason?: string;
+        workflowNext?: { change: string; result?: string };
       };
       expect(payload.runId).toBeTruthy();
+      expect(payload.runStatus).toBe('failed');
+      expect(payload).toMatchObject({ terminalReason: 'run_timeout' });
+      expect(payload.workflowNext).toBeUndefined();
       expect(payload.entries?.map((e) => e.nodeId).sort()).toEqual(['p1', 'p2']);
 
       const nodes = await client.all(
@@ -692,20 +720,126 @@ describe('M018 S02 fan-in NEXT activation', () => {
         'SELECT status FROM workflow_dependency_gates WHERE workspace_id = ? AND run_id = ? AND gate_id = ?',
         [workspaceId, payload.runId, consumerGate!.gateId],
       );
-      expect(gateRow).toMatchObject({ status: 'open' });
+      expect(gateRow).toMatchObject({ status: 'failed' });
 
       for (const entry of payload.entries ?? []) {
         const turn = await repository.getTurn(entry.activationTurnId);
         expect(turn).toMatchObject({
           id: entry.activationTurnId,
           taskId: entry.taskId,
-          status: 'queued',
+          status: 'cancelled',
           trigger: 'engine',
         });
       }
+
+      const cancelRouted = dispatch(
+        'start_workflow',
+        {
+          opId: 'bridge-start-fan-cancel',
+          definitionId: 'wf-public-fan',
+          version: 1,
+          startIdempotencyKey: 'public-fan-start-cancel',
+          goal: 'cancel fan-in via bridge',
+          backend: 'grok',
+          entryInputs: [],
+        },
+        context,
+      );
+      expect(cancelRouted.ok).toBe(true);
+      if (!cancelRouted.ok) return;
+      const cancelPromise = engine.handleToolCall(
+        context,
+        'start_workflow',
+        cancelRouted.command,
+      );
+      let cancelTarget: { task_id: string; execution_turn_id: string } | undefined;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        cancelTarget = await client.get<{ task_id: string; execution_turn_id: string }>(
+          `SELECT node.task_id, activation.execution_turn_id
+             FROM workflow_runs run
+             JOIN workflow_nodes node
+               ON node.workspace_id = run.workspace_id AND node.run_id = run.run_id
+             JOIN workflow_activations activation
+               ON activation.workspace_id = node.workspace_id
+              AND activation.run_id = node.run_id AND activation.node_id = node.node_id
+            WHERE run.workspace_id = ? AND run.definition_id = ? AND run.status = 'running'
+            ORDER BY node.node_id LIMIT 1`,
+          [workspaceId, 'wf-public-fan'],
+        );
+        if (cancelTarget) break;
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+      expect(cancelTarget).toBeTruthy();
+      const cancelTask = await repository.getTask(cancelTarget!.task_id);
+      const cancelTurn = await repository.getTurn(cancelTarget!.execution_turn_id);
+      expect(cancelTask).toBeTruthy();
+      expect(cancelTurn).toBeTruthy();
+      const cancelledAt = '2126-07-22T00:01:00.000Z';
+      await expect(engine.getRepository().execute({
+        kind: 'applyTaskLifecycle',
+        workspaceId,
+        taskId: cancelTask!.id,
+        expectedTaskRevision: cancelTask!.revision,
+        task: {
+          ...cancelTask!,
+          lifecycle: 'cancelled',
+          revision: cancelTask!.revision + 1,
+          updatedAt: cancelledAt,
+        },
+        turns: [{ ...cancelTurn!, status: 'cancelled', finishedAt: cancelledAt }],
+        expectedTurns: [{
+          id: cancelTurn!.id,
+          status: cancelTurn!.status as 'queued' | 'running' | 'waiting_user',
+          runtimeEpoch: cancelTurn!.runtimeEpoch,
+        }],
+      })).resolves.toMatchObject({ ok: true, changed: true });
+      await expect(cancelPromise).resolves.toMatchObject({
+        ok: true,
+        result: {
+          runStatus: 'cancelled',
+          terminalReason: 'required_target_cancelled',
+        },
+      });
+
+      const interruptedRouted = dispatch(
+        'start_workflow',
+        {
+          opId: 'bridge-start-fan-interrupted',
+          definitionId: 'wf-public-fan',
+          version: 1,
+          startIdempotencyKey: 'public-fan-start-interrupted',
+          goal: 'interrupt fan-in wait',
+          backend: 'grok',
+          entryInputs: [],
+        },
+        context,
+      );
+      expect(interruptedRouted.ok).toBe(true);
+      if (!interruptedRouted.ok) return;
+      const interruptedPromise = engine.handleToolCall(
+        context,
+        'start_workflow',
+        interruptedRouted.command,
+      );
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const running = await client.get<{ count: number }>(
+          `SELECT COUNT(*) AS count FROM workflow_runs
+            WHERE workspace_id = ? AND definition_id = ? AND status = 'running'`,
+          [workspaceId, 'wf-public-fan'],
+        );
+        if ((running?.count ?? 0) > 0) break;
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+      const shutdownPromise = engine.shutdown();
+      await expect(interruptedPromise).resolves.toEqual({
+        ok: false,
+        error: 'start_workflow interrupted: engine shutting down',
+      });
+      release();
+      await shutdownPromise;
     } finally {
       release();
-      await engine?.whenIdle?.().catch(() => undefined);
+      await engine?.shutdown().catch(() => undefined);
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });
     }

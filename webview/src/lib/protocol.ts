@@ -276,6 +276,7 @@ export interface TaskTypeSettingsRow {
   id: string;
   backend: string;
   model?: string;
+  fallbacks?: Array<{ backend: string; model?: string }>;
   role: 'coordinator' | 'worker';
   briefKind: string;
   description?: string;
@@ -904,6 +905,13 @@ function isTaskTypeSettingsRow(v: unknown): v is TaskTypeSettingsRow {
   if (v.role !== 'coordinator' && v.role !== 'worker') return false;
   if (!isString(v.briefKind)) return false;
   if (v.model !== undefined && !isString(v.model)) return false;
+  if (
+    v.fallbacks !== undefined
+    && (!Array.isArray(v.fallbacks) || v.fallbacks.length > 8 || !v.fallbacks.every((binding) =>
+      isRecord(binding)
+      && isString(binding.backend)
+      && (binding.model === undefined || isString(binding.model))))
+  ) return false;
   if (v.description !== undefined && !isString(v.description)) return false;
   return true;
 }

@@ -1073,9 +1073,10 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
       expect(resumeTurns).toHaveLength(1);
       const resumeTurnId = resumeTurns[0]!.id;
 
-      // Child lifecycle remains open (return never seals child).
+      // The child run owns and seals its node task; the caller remains runnable.
       const childTask = await opened.repository.getTask(childEntry!.task_id);
-      expect(childTask?.lifecycle).toBe('open');
+      expect(childTask?.lifecycle).toBe('succeeded');
+      expect((await opened.repository.getTask(caller.entryTaskId))?.lifecycle).toBe('open');
       const childRun = await runRow(opened.client, childRunId);
       expect(childRun?.status).toBe('succeeded');
 
@@ -1440,11 +1441,8 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
       expect(failedCont).toBeTruthy();
 
       const callerTask = await opened.repository.getTask(caller.entryTaskId);
-      expect(callerTask?.lifecycle).toBe('open');
-      expect(callerTask?.attention?.code).toBe('workflow_run_failed');
-      expect(String(callerTask?.attention?.message ?? '')).toMatch(
-        /agent_fail|child|failed/,
-      );
+      expect(callerTask).toMatchObject({ lifecycle: 'failed', error: 'agent_fail' });
+      expect(callerTask?.attention).toBeUndefined();
 
       // Double-close child fail is a no-op for continuation status.
       const fail2Turn = `${failQueued[0]!.id}-again`;
@@ -1545,9 +1543,12 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
             AND json_extract(payload_json, '$.attention.code') = 'workflow_run_failed'`,
         ['ws', ...chain.taskIds],
       );
-      expect(attention).toEqual([{ id: chain.taskIds[0] }]);
+      expect(attention).toEqual([]);
       for (const taskId of chain.taskIds) {
-        await expect(opened.repository.getTask(taskId)).resolves.toMatchObject({ lifecycle: 'open' });
+        await expect(opened.repository.getTask(taskId)).resolves.toMatchObject({
+          lifecycle: 'failed',
+          error: 'agent_fail',
+        });
       }
 
       const reloaded = new SqliteTaskRepository(opened.client, 'ws');
@@ -1634,8 +1635,8 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
       );
       expect(returnGates).toHaveLength(2);
       expect(returnGates.every((gate) => gate.status === 'cancelled')).toBe(true);
-      await expect(opened.repository.getTask(chain.taskIds[0])).resolves.toMatchObject({ lifecycle: 'open' });
-      await expect(opened.repository.getTask(chain.taskIds[1])).resolves.toMatchObject({ lifecycle: 'open' });
+      await expect(opened.repository.getTask(chain.taskIds[0])).resolves.toMatchObject({ lifecycle: 'cancelled' });
+      await expect(opened.repository.getTask(chain.taskIds[1])).resolves.toMatchObject({ lifecycle: 'cancelled' });
       await expect(opened.repository.getTask(chain.taskIds[2])).resolves.toMatchObject({ lifecycle: 'cancelled' });
 
       const reloaded = new SqliteTaskRepository(opened.client, 'ws');

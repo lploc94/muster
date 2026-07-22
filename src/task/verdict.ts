@@ -1,7 +1,7 @@
 /**
  * Verify verdict helpers (verify-gate-loop Phase A). Pure — no engine/store I/O.
  *
- * A verdict is produced by a worker via `complete_task` and carried on
+ * A verdict is produced by a worker and carried on
  * `TaskResultV1.verdict`. All normalization is fail-closed: an absent/malformed
  * status coerces to `'inconclusive'` so a gate never treats garbage as `pass`.
  */
@@ -25,7 +25,7 @@ const VERDICT_STATUSES: ReadonlySet<VerdictStatus> = new Set([
 
 /**
  * Untrusted verdict payload as extracted at the tool boundary (worker-supplied).
- * Timeless by construction so the `complete_task` command fingerprint stays stable
+ * Timeless by construction so the disposition command fingerprint stays stable
  * across idempotent retries — the `at`/`source` stamps are applied at normalize time.
  */
 export interface VerdictCriterionInput {

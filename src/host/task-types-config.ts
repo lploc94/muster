@@ -9,6 +9,8 @@ import {
   TASK_TYPE_DESCRIPTION_MAX,
   TASK_TYPE_ID_RE,
   TASK_TYPE_MAX,
+  RUNTIME_FALLBACK_MAX,
+  type RuntimeFallbackBinding,
   type TaskTypeDefinition,
   type TaskTypeDiagnostic,
   type TaskTypeRegistryResult,
@@ -33,6 +35,7 @@ export interface TaskTypeSettingsRow {
   id: string;
   backend: string;
   model?: string;
+  fallbacks?: RuntimeFallbackBinding[];
   role: TaskRole;
   briefKind: TaskBriefKind;
   description?: string;
@@ -79,6 +82,7 @@ function definitionToRow(id: string, def: TaskTypeDefinition): TaskTypeSettingsR
     briefKind: def.briefKind ?? 'generic',
   };
   if (def.model !== undefined) row.model = def.model;
+  if (def.fallbacks !== undefined) row.fallbacks = def.fallbacks.map((binding) => ({ ...binding }));
   if (def.description !== undefined) row.description = def.description;
   return row;
 }
@@ -192,6 +196,12 @@ export function rowsToTaskTypesMap(
     if (row.model !== undefined && row.model.trim().length > 0) {
       def.model = row.model.trim();
     }
+    if (row.fallbacks !== undefined) {
+      def.fallbacks = row.fallbacks.map((binding) => ({
+        backend: binding.backend.trim(),
+        ...(binding.model?.trim() ? { model: binding.model.trim() } : {}),
+      }));
+    }
     if (row.description !== undefined && row.description.trim().length > 0) {
       def.description = row.description.trim();
     }
@@ -252,6 +262,23 @@ export function validateTaskTypesUpdate(input: unknown): TaskTypesSettingsUpdate
       if ('model' in r && r.model !== undefined && typeof r.model !== 'string') {
         return invalidConfig(`Task type "${r.id}" model must be a string`);
       }
+      if ('fallbacks' in r && r.fallbacks !== undefined) {
+        if (!Array.isArray(r.fallbacks) || r.fallbacks.length > RUNTIME_FALLBACK_MAX) {
+          return invalidConfig(`Task type "${r.id}" fallbacks must have at most ${RUNTIME_FALLBACK_MAX} entries`);
+        }
+        for (const fallback of r.fallbacks) {
+          if (typeof fallback !== 'object' || fallback === null || Array.isArray(fallback)) {
+            return invalidConfig(`Task type "${r.id}" fallback must be an object`);
+          }
+          const binding = fallback as Record<string, unknown>;
+          if (typeof binding.backend !== 'string' || binding.backend.trim().length === 0) {
+            return invalidConfig(`Task type "${r.id}" fallback needs a non-empty backend`);
+          }
+          if (binding.model !== undefined && typeof binding.model !== 'string') {
+            return invalidConfig(`Task type "${r.id}" fallback model must be a string`);
+          }
+        }
+      }
       if ('description' in r && r.description !== undefined && typeof r.description !== 'string') {
         return invalidConfig(`Task type "${r.id}" description must be a string`);
       }
@@ -267,6 +294,15 @@ export function validateTaskTypesUpdate(input: unknown): TaskTypesSettingsUpdate
         briefKind: r.briefKind as TaskBriefKind,
       };
       if (typeof r.model === 'string' && r.model.length > 0) row.model = r.model;
+      if (Array.isArray(r.fallbacks)) {
+        row.fallbacks = r.fallbacks.map((fallback) => {
+          const binding = fallback as Record<string, string | undefined>;
+          return {
+            backend: binding.backend!,
+            ...(binding.model ? { model: binding.model } : {}),
+          };
+        });
+      }
       if (typeof r.description === 'string' && r.description.length > 0) {
         row.description = r.description;
       }

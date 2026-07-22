@@ -164,7 +164,7 @@ export function canPromoteTurn(
     turn.trigger === 'engine' &&
     (turn.id.includes('parent-q-') || turn.id.endsWith('-attention'));
 
-  // W5: same readiness evaluator as get_task_status / UI (draft, deps, inputs, wait, handoff, holds).
+  // W5: same readiness evaluator as the host UI (draft, deps, inputs, wait, handoff, holds).
   const readiness = evaluateTaskReadiness(file, turn.taskId);
   if (!readiness.schedulable) {
     const onlyWaitingChildren =

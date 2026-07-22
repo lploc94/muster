@@ -128,12 +128,13 @@ describe('task-types host config', () => {
     expect(r.code).toBe('invalid_task_type_config');
   });
 
-  it('rowsToTaskTypesMap round-trips model pins', () => {
+  it('rowsToTaskTypesMap round-trips model pins and fallback chains', () => {
     const map = rowsToTaskTypesMap([
       {
         id: 'plan',
         backend: 'codex',
         model: 'gpt-5.5',
+        fallbacks: [{ backend: 'opencode' }, { backend: 'grok', model: 'grok-4' }],
         role: 'worker',
         briefKind: 'plan',
       },
@@ -141,6 +142,7 @@ describe('task-types host config', () => {
     expect(map.plan).toMatchObject({
       backend: 'codex',
       model: 'gpt-5.5',
+      fallbacks: [{ backend: 'opencode' }, { backend: 'grok', model: 'grok-4' }],
       role: 'worker',
       briefKind: 'plan',
     });

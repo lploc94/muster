@@ -89,13 +89,14 @@ function cancellationTerminal(): NormalizedEvent {
   return { type: 'error', message: 'Turn cancelled', isCancellation: true };
 }
 
-/** Pull the first text block out of an ACP `tool_call_update` `content` array. */
-function extractToolOutput(content: unknown): string | undefined {
-  if (!Array.isArray(content)) return undefined;
+/** Pull displayable output from an ACP `tool_call_update`. */
+function extractToolOutput(update: SessionUpdate): unknown {
+  const content = update.content;
+  if (!Array.isArray(content)) return update.rawOutput;
   const textBlock = content.find((c) => (c as { type?: string }).type === 'content') as
     | { content?: { type?: string; text?: string } }
     | undefined;
-  return textBlock?.content?.text;
+  return textBlock?.content?.text ?? update.rawOutput;
 }
 
 /** Map an `agent_message_chunk` / `agent_thought_chunk` to its delta (or raw / dropped). */
@@ -170,11 +171,16 @@ function mapSessionUpdate(
           : (meta?.updateParams as { status?: string } | undefined)?.status;
       const status = statusRaw?.toLowerCase();
       if (status === 'completed' || status === 'failed') {
-        const outputText = extractToolOutput(update.content);
+        const output = extractToolOutput(update);
         if (status === 'failed') {
-          return { type: 'toolCompleted', toolCallId, outcome: 'error', error: outputText ?? 'Tool failed', meta };
+          const error = typeof output === 'string'
+            ? output
+            : output === undefined
+              ? 'Tool failed'
+              : JSON.stringify(output);
+          return { type: 'toolCompleted', toolCallId, outcome: 'error', error, meta };
         }
-        return { type: 'toolCompleted', toolCallId, outcome: 'success', output: outputText, meta };
+        return { type: 'toolCompleted', toolCallId, outcome: 'success', output, meta };
       }
       return { type: 'toolUpdated', toolCallId, input: update.rawInput, meta };
     }

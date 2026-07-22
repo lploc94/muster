@@ -13,6 +13,7 @@ export const TASK_TYPE_STRING_MAX = 200;
 /** Cap diagnostic count and message length (bounded MCP errors). */
 export const TASK_TYPE_DIAGNOSTIC_MAX = 16;
 export const TASK_TYPE_DIAGNOSTIC_MESSAGE_MAX = 240;
+export const RUNTIME_FALLBACK_MAX = 8;
 
 /** Type id: lowercase letter, then alnum/_/- up to 63 more chars. */
 export const TASK_TYPE_ID_RE = /^[a-z][a-z0-9_-]{0,63}$/;
@@ -27,9 +28,15 @@ export type TaskTypeErrorCode =
 export interface TaskTypeDefinition {
   backend: string;
   model?: string;
+  fallbacks?: RuntimeFallbackBinding[];
   role?: TaskRole;
   briefKind?: TaskBriefKind;
   description?: string;
+}
+
+export interface RuntimeFallbackBinding {
+  backend: string;
+  model?: string;
 }
 
 export interface TaskTypeDiagnostic {
@@ -132,7 +139,64 @@ function parseBriefKind(
   return undefined;
 }
 
-const ALLOWED_ENTRY_KEYS = new Set(['backend', 'model', 'role', 'briefKind', 'description']);
+const ALLOWED_ENTRY_KEYS = new Set(['backend', 'model', 'fallbacks', 'role', 'briefKind', 'description']);
+const ALLOWED_FALLBACK_KEYS = new Set(['backend', 'model']);
+
+function parseRuntimeFallbackChainInto(
+  value: unknown,
+  field: string,
+  diagnostics: TaskTypeDiagnostic[],
+): RuntimeFallbackBinding[] | undefined {
+  if (!Array.isArray(value)) {
+    pushDiag(diagnostics, 'invalid_field', `${field} must be an array`);
+    return undefined;
+  }
+  if (value.length > RUNTIME_FALLBACK_MAX) {
+    pushDiag(diagnostics, 'invalid_field', `${field} exceeds ${RUNTIME_FALLBACK_MAX} entries`);
+    return undefined;
+  }
+  const bindings: RuntimeFallbackBinding[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const entry = value[index];
+    const entryField = `${field}[${index}]`;
+    if (!isPlainObject(entry)) {
+      pushDiag(diagnostics, 'invalid_field', `${entryField} must be an object`);
+      return undefined;
+    }
+    for (const key of Object.keys(entry)) {
+      if (!ALLOWED_FALLBACK_KEYS.has(key)) {
+        pushDiag(diagnostics, 'unknown_key', `${entryField} has unknown key "${boundIdent(key, 40)}"`);
+      }
+    }
+    const backend = clampOrRejectString(
+      entry.backend,
+      `${entryField}.backend`,
+      TASK_TYPE_STRING_MAX,
+      diagnostics,
+    );
+    if (backend === undefined) return undefined;
+    const binding: RuntimeFallbackBinding = { backend };
+    if (entry.model !== undefined) {
+      const model = clampOrRejectString(
+        entry.model,
+        `${entryField}.model`,
+        TASK_TYPE_STRING_MAX,
+        diagnostics,
+      );
+      if (model === undefined) return undefined;
+      binding.model = model;
+    }
+    bindings.push(binding);
+  }
+  return bindings;
+}
+
+/** Parse the global execution fallback setting. Invalid input fails closed. */
+export function parseRuntimeFallbackChain(raw: unknown): readonly RuntimeFallbackBinding[] {
+  const diagnostics: TaskTypeDiagnostic[] = [];
+  const parsed = parseRuntimeFallbackChainInto(raw, 'muster.execution.fallbacks', diagnostics);
+  return diagnostics.length === 0 ? (parsed ?? []) : [];
+}
 
 /**
  * Parse raw VS Code / JSON setting value into a registry result.
@@ -216,6 +280,16 @@ export function parseTaskTypeRegistry(raw: unknown): TaskTypeRegistryResult {
       if (model === undefined) continue;
     }
 
+    let fallbacks: RuntimeFallbackBinding[] | undefined;
+    if (entry.fallbacks !== undefined) {
+      fallbacks = parseRuntimeFallbackChainInto(
+        entry.fallbacks,
+        `task type "${idLabel}".fallbacks`,
+        diagnostics,
+      );
+      if (fallbacks === undefined) continue;
+    }
+
     const role = parseRole(entry.role, `task type "${idLabel}".role`, diagnostics);
     if (entry.role !== undefined && role === undefined) continue;
 
@@ -239,6 +313,7 @@ export function parseTaskTypeRegistry(raw: unknown): TaskTypeRegistryResult {
 
     const def: TaskTypeDefinition = { backend };
     if (model !== undefined) def.model = model;
+    if (fallbacks !== undefined) def.fallbacks = fallbacks;
     if (role !== undefined) def.role = role;
     if (briefKind !== undefined) def.briefKind = briefKind;
     if (description !== undefined) def.description = description;

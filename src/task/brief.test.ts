@@ -240,7 +240,7 @@ describe('assembleFirstTurnPrompt', () => {
         backend: 'opencode',
         model: 'm1',
       },
-      tools: ['create_task', 'set_task_lifecycle'],
+      tools: ['define_workflow', 'start_workflow'],
       brief,
       resolvedInputs: [
         {
@@ -268,7 +268,7 @@ describe('assembleFirstTurnPrompt', () => {
     expect(iAc).toBeGreaterThan(iCtx);
     expect(iPin).toBeGreaterThan(iAc);
     expect(prompt).toContain('## Available backends');
-    expect(prompt).toContain('set_task_lifecycle');
+    expect(prompt).toContain('define_workflow');
     for (const r of HOST_RULES_BASE) expect(prompt).toContain(r);
     for (const r of HOST_RULES_COORDINATOR) expect(prompt).toContain(r);
     expect(prompt).toContain('<untrusted-input name="plan"');
@@ -329,7 +329,7 @@ describe('assembleFirstTurnPrompt', () => {
     const result = assembleFirstTurnPrompt({
       snapshot: hostSnap(),
       self: { taskId: 't', role: 'coordinator', backend: 'opencode' },
-      tools: ['create_task'],
+      tools: ['define_workflow'],
       brief,
       resolvedInputs: [
         {

@@ -300,7 +300,10 @@ describe('workflow domain (graph_v1 multi-node topology)', () => {
       entryContracts,
       policy: { ...definition.policy, maxArtifactBytes, maxAggregateBytes: exactAggregateBytes - 1 },
     });
-    expect(overflow).toEqual({ ok: false, reason: 'entry contract aggregate exceeds policy' });
+    expect(overflow).toEqual({
+      ok: false,
+      reason: `entry contract aggregate exceeds policy: maxAggregateBytes must be at least ${exactAggregateBytes} for entry "entry" when maxArtifactBytes is ${maxArtifactBytes}`,
+    });
 
     const engineStartBytes = maximumWorkflowEntryAggregateBytes([], maxArtifactBytes);
     const emptyEntryOverflow = validateDefineWorkflow({
@@ -309,7 +312,19 @@ describe('workflow domain (graph_v1 multi-node topology)', () => {
     });
     expect(emptyEntryOverflow).toEqual({
       ok: false,
-      reason: 'entry contract aggregate exceeds policy',
+      reason: `entry contract aggregate exceeds policy: maxAggregateBytes must be at least ${engineStartBytes} for entry "entry" when maxArtifactBytes is ${maxArtifactBytes}`,
+    });
+  });
+
+  it('reports the accepted policy range for an invalid feedback budget', () => {
+    const definition = makeOneNodeDefinition();
+    const invalid = validateDefineWorkflow({
+      ...definition,
+      policy: { ...definition.policy, maxFeedbackRoundsPerRun: 0 },
+    });
+    expect(invalid).toEqual({
+      ok: false,
+      reason: 'invalid policy maxFeedbackRoundsPerRun: expected an integer from 1 to 32',
     });
   });
 

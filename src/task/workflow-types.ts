@@ -284,7 +284,7 @@ export interface InvokeChildWorkflowInput {
   childIdempotencyKey?: string;
 }
 
-/** M018 S07: bounded workflow status for get_task_status (no topology/prompts/bodies/paths). */
+/** Bounded workflow gate state (no topology, prompts, artifact bodies, or paths). */
 export interface WorkflowGateStatusProjection {
   gateId: string;
   status: string;
@@ -363,5 +363,69 @@ export interface WorkflowTaskStatusProjection {
   activation?: WorkflowActivationStatusProjection;
   feedbackRounds: readonly WorkflowFeedbackRoundProjection[];
   continuations: readonly WorkflowContinuationStatusProjection[];
+  diagnostics: readonly WorkflowIntegrityDiagnosticProjection[];
+}
+
+export interface WorkflowRunNodeInspectionProjection {
+  nodeId: string;
+  status: string;
+}
+
+export interface WorkflowRunActivationInspectionProjection
+  extends WorkflowActivationStatusProjection {
+  nodeId: string;
+}
+
+export interface WorkflowRunFeedbackRoundInspectionProjection {
+  roundId: string;
+  requesterNodeId: string;
+  status: string;
+  joinMode: string;
+  required: number;
+  responded: number;
+}
+
+export interface WorkflowArtifactReferenceProjection {
+  runId: string;
+  artifactId: string;
+  artifactRevision: number;
+}
+
+export interface WorkflowNextResultProjection {
+  change: 'updated' | 'unchanged';
+  result?: string;
+}
+
+/** Authorized terminal state returned to the caller waiting in start_workflow. */
+export interface WorkflowRunCompletionProjection {
+  runId: string;
+  runStatus: 'running' | 'succeeded' | 'failed' | 'cancelled';
+  terminalReason?: string;
+  terminalResult?: WorkflowArtifactReferenceProjection;
+  workflowNext?: WorkflowNextResultProjection;
+}
+
+/**
+ * Bounded run-level diagnostic projection for inspect_workflow_run.
+ * Strictly excludes task trees, topology, prompts, artifact bodies, secrets,
+ * and absolute paths.
+ */
+export interface WorkflowRunInspectionProjection {
+  runId: string;
+  definitionId: string;
+  definitionVersion: number;
+  runStatus: string;
+  policy: WorkflowRunPolicyProjection;
+  startedAt?: string;
+  deadlineAt?: string;
+  terminalReason?: string;
+  origin: string;
+  parentRunId?: string;
+  nodes: readonly WorkflowRunNodeInspectionProjection[];
+  gates: readonly WorkflowGateStatusProjection[];
+  activations: readonly WorkflowRunActivationInspectionProjection[];
+  feedbackRounds: readonly WorkflowRunFeedbackRoundInspectionProjection[];
+  continuations: readonly WorkflowContinuationStatusProjection[];
+  terminalResult?: WorkflowArtifactReferenceProjection;
   diagnostics: readonly WorkflowIntegrityDiagnosticProjection[];
 }

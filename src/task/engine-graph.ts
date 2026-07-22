@@ -44,14 +44,13 @@ import {
 
 export const CREDENTIAL_DEADLINE_BUFFER_MS = 5 * 60_000;
 export const ACP_DEADLINE_BUFFER_MS = 90_000;
-import { evaluateTaskReadiness } from './readiness';
 import { canPromoteTurn } from './scheduler';
 import type { GraphCommandKind, RepositoryCommand, TaskRepository } from './repository';
 import { durableDispositionClaim } from './disposition-claim';
 import type {
   WorkflowDefinitionV1,
   WorkflowPolicyV1,
-  WorkflowTaskStatusProjection,
+  WorkflowRunCompletionProjection,
 } from './workflow-types';
 import { validateDefineWorkflow } from './workflow';
 import type { TaskReadPort } from './store-port';
@@ -232,16 +231,6 @@ function findRootId(file: EngineProjection, taskId: string): string {
   return current.id;
 }
 
-function isDescendantOf(file: EngineProjection, ancestorId: string, taskId: string): boolean {
-  let current = file.tasks[taskId];
-  while (current) {
-    if (current.id === ancestorId) return true;
-    if (!current.parentId) return false;
-    current = file.tasks[current.parentId];
-  }
-  return false;
-}
-
 function descendantIds(file: EngineProjection, rootId: string): string[] {
   const result: string[] = [];
   const stack = [rootId];
@@ -326,6 +315,14 @@ export interface GraphEngineDeps {
     sealedBy?: import('./types').TaskSealedBy,
   ) => void;
   onTurnSettled?: (turnId: string) => void;
+  waitForWorkflowRun?: (input: {
+    runId: string;
+    ownerRootTaskId: string;
+    callerTurnId: string;
+  }) => Promise<
+    | { ok: true; completion: WorkflowRunCompletionProjection }
+    | { ok: false; error: string }
+  >;
 }
 
 function nowIso(clock?: () => string): string {
@@ -902,6 +899,15 @@ export async function executeToolCommand(
   if (ctx.allowedActions && !ctx.allowedActions.has(actionForCommand(command))) {
     return { ok: false, error: `action not permitted: ${actionForCommand(command)}` };
   }
+  const wantsCompoundWait =
+    (command.kind === 'delegate_task' && command.waitForCompletion === true) ||
+    (command.kind === 'delegate_tasks' &&
+      command.waitForLocalIds !== undefined &&
+      command.waitForLocalIds.length > 0) ||
+    (command.kind === 'release_tasks' &&
+      command.waitForTaskIds !== undefined &&
+      command.waitForTaskIds.length > 0) ||
+    (command.kind === 'continue_child' && command.waitForCompletion === true);
   if (
     command.kind === 'workflow_next' ||
     command.kind === 'workflow_prev' ||
@@ -935,15 +941,6 @@ export async function executeToolCommand(
     }
   }
   // Compound wait fields require wait_for_tasks / wait_child in addition to create_child tools.
-  const wantsCompoundWait =
-    (command.kind === 'delegate_task' && command.waitForCompletion === true) ||
-    (command.kind === 'delegate_tasks' &&
-      command.waitForLocalIds !== undefined &&
-      command.waitForLocalIds.length > 0) ||
-    (command.kind === 'release_tasks' &&
-      command.waitForTaskIds !== undefined &&
-      command.waitForTaskIds.length > 0) ||
-    (command.kind === 'continue_child' && command.waitForCompletion === true);
   if (wantsCompoundWait && ctx.allowedActions && !ctx.allowedActions.has('wait_for_tasks')) {
     return {
       ok: false,
@@ -952,8 +949,8 @@ export async function executeToolCommand(
   }
 
   if (
-    command.kind !== 'get_task_status' &&
-    command.kind !== 'report_progress' &&
+    command.kind !== 'inspect_workflow_run' &&
+    command.kind !== 'start_workflow' &&
     command.kind !== 'get_host_context' &&
     command.kind !== 'list_task_types'
   ) {
@@ -2597,62 +2594,10 @@ export async function executeToolCommand(
     }
 
 
-    case 'report_progress':
-      return { ok: true, result: { noted: command.note.slice(0, 512) } };
-
-    case 'get_task_status': {
-      const targetId = command.taskId ?? ctx.callerTaskId;
-      const file = deps.store.getFile();
-      const task = file.tasks[targetId];
-      if (!task) return { ok: false, error: 'task not found' };
-      if (targetId !== ctx.callerTaskId && !isDescendantOf(file, ctx.callerTaskId, targetId)) {
-        return { ok: false, error: 'unauthorized subtree' };
-      }
-      const nodes = [targetId, ...descendantIds(file, targetId)].map((id) => {
-        const t = file.tasks[id];
-        if (!t) return undefined;
-        const readiness = evaluateTaskReadiness(file, id);
-        return {
-          id: t.id,
-          lifecycle: t.lifecycle,
-          releaseState: t.releaseState,
-          goal: t.goal.slice(0, 128),
-          parentId: t.parentId,
-          attention: t.attention,
-          resultSummary: t.taskResult?.summary,
-          readiness: {
-            code: readiness.code,
-            schedulable: readiness.schedulable,
-            reasons: readiness.reasons,
-          },
-        };
-      }).filter((n): n is NonNullable<typeof n> => n !== undefined);
-      const callerTurn = file.turns[ctx.turnId];
-      const callerWait = callerTurn?.disposition?.kind === 'wait_tasks'
-        ? callerTurn.disposition
-        : undefined;
-      // M018 S07: bounded workflow orchestration state and integrity diagnostics.
-      // Optional method so partial TaskRepository mocks remain valid.
-      let workflow: WorkflowTaskStatusProjection | undefined;
-      if (typeof deps.repository.getWorkflowStatusForTask === 'function') {
-        workflow = await deps.repository.getWorkflowStatusForTask(targetId);
-      }
-      return {
-        ok: true,
-        result: {
-          root: targetId,
-          tasks: nodes.slice(0, 32),
-          ...(workflow ? { workflow } : {}),
-          ...(callerWait
-            ? {
-                callerWaitStaged: true,
-                waitTaskIds: callerWait.taskIds,
-                nextAction: 'end_current_turn',
-                doNotPoll: true,
-              }
-            : {}),
-        },
-      };
+    case 'inspect_workflow_run': {
+      const inspection = await deps.repository.inspectWorkflowRun(command.runId, ctx.rootId);
+      if (!inspection) return { ok: false, error: 'workflow run not found' };
+      return { ok: true, result: inspection };
     }
 
     case 'get_host_context': {
@@ -2882,23 +2827,22 @@ export async function executeToolCommand(
       } else if (typeof data.entryTaskId === 'string') {
         deps.onRescanSchedulableTurns?.([data.entryTaskId]);
       }
-      return { ok: true, result: data };
+      if (!deps.waitForWorkflowRun || typeof data.runId !== 'string') {
+        return { ok: true, result: data };
+      }
+      const waited = await deps.waitForWorkflowRun({
+        runId: data.runId,
+        ownerRootTaskId: ctx.rootId,
+        callerTurnId: ctx.turnId,
+      });
+      if (!waited.ok) return waited;
+      return { ok: true, result: { ...data, ...waited.completion } };
     }
 
     case 'upsert_presentation':
       // Presentation execution is composed by the host router (T04). The pure task
       // graph must remain VS Code-independent and fail closed if called directly.
       return { ok: false, error: 'panel_open_failed' };
-
-    case 'ask_user':
-      // Temporarily ignored: structured user questions go through ACP RFD
-      // elicitation (and vendor extensions like Grok x.ai/ask_user_question).
-      // Non-root must use ask_parent.
-      return {
-        ok: false,
-        error:
-          'ask_user MCP tool is disabled; use ACP elicitation/create (or ask_parent for children)',
-      };
 
     case 'ask_parent': {
       const caller = deps.store.getFile().tasks[ctx.callerTaskId];
@@ -3162,7 +3106,7 @@ export async function executeToolCommand(
           id: messageId,
           taskId: child.id,
           role: 'user',
-          content: `Parent answers for question ${command.questionId}:\n${qText}\n${aText}\nContinue the task and stage complete_task or fail_task.`,
+          content: `Parent answers for question ${command.questionId}:\n${qText}\n${aText}\nContinue the task and follow the current workflow routing contract.`,
           state: 'assigned',
           createdAt: now,
           turnId: continuationTurnId,

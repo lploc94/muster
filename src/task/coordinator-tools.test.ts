@@ -569,6 +569,31 @@ describe('coordinator-tools dispatch', () => {
     expect(result.ok).toBe(false);
   });
 
+  it('maps inspect_workflow_run with one required runId and no opId', () => {
+    const result = dispatch(
+      'inspect_workflow_run',
+      { runId: 'wfr-1' },
+      ctx(['inspect_workflow_run']),
+    );
+    expect(result).toEqual({
+      ok: true,
+      command: { kind: 'inspect_workflow_run', runId: 'wfr-1' },
+    });
+  });
+
+  it('rejects inspect_workflow_run without runId or with extra arguments', () => {
+    expect(dispatch(
+      'inspect_workflow_run',
+      {},
+      ctx(['inspect_workflow_run']),
+    )).toEqual({ ok: false, toolError: 'runId is required' });
+    expect(dispatch(
+      'inspect_workflow_run',
+      { runId: 'wfr-1', taskId: 'legacy-task' },
+      ctx(['inspect_workflow_run']),
+    )).toEqual({ ok: false, toolError: 'inspect_workflow_run accepts only runId' });
+  });
+
   it('rejects public create without taskType', () => {
     const result = dispatch(
       'create_task',

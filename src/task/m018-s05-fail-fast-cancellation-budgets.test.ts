@@ -9,8 +9,7 @@
  *   - turn budget exhaustion closes the run failed
  *   - open gates + feedback rounds flip to the terminal status
  *   - reserved-not-running turns cancel; live turns get interrupt cancelRequests
- *   - one durable workflow_run_failed attention at the outer workflow boundary
- *   - task lifecycle stays open (unsealed)
+ *   - matching terminal lifecycle closure for every workflow-owned task
  *   - double-close is a true no-op (fence on run status + routed message)
  *   - late NEXT after close neither reopens gates nor creates activations
  *
@@ -348,7 +347,7 @@ async function nextTurnSequence(client: DbClient, taskId: string): Promise<numbe
 }
 
 describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
-  it('workflow_fail closes run once, sets attention, leaves lifecycle open, is idempotent', async () => {
+  it('workflow_fail closes the run and owned task once and is idempotent', async () => {
     const opened = await openRepo('fail');
     try {
       const createdAt = '2026-07-20T00:00:00.000Z';
@@ -368,11 +367,15 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
       expect(await runStatus(opened.client, data.runId)).toBe('failed');
 
       const after = await opened.repository.getTask(data.entryTaskId);
-      expect(after?.lifecycle).toBe('open');
-      expect(after?.attention?.code).toBe('workflow_run_failed');
-      expect(String(after?.attention?.message ?? '')).toMatch(/agent_fail/);
+      expect(after).toMatchObject({
+        lifecycle: 'failed',
+        finishedAt,
+        error: 'agent_fail',
+        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+      });
+      expect(after?.attention).toBeUndefined();
 
-      // Double-close via a second turn on the same open task is a no-op for run status.
+      // Double-close via a second turn on the same task is a no-op for run/task status.
       const secondTurnId = `${data.activationTurnId}-2`;
       const secondSeq = await nextTurnSequence(opened.client, data.entryTaskId);
       await insertEngineTurn(
@@ -394,14 +397,18 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
       expect(second.ok).toBe(true);
       expect(await runStatus(opened.client, data.runId)).toBe('failed');
       const after2 = await opened.repository.getTask(data.entryTaskId);
-      expect(after2?.lifecycle).toBe('open');
-      expect(after2?.attention?.code).toBe('workflow_run_failed');
+      expect(after2).toMatchObject({
+        lifecycle: 'failed',
+        finishedAt,
+        error: 'agent_fail',
+        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+      });
     } finally {
       await opened.close();
     }
   }, 30_000);
 
-  it('invalid PREV on entry closes run failed with invalid_route attention', async () => {
+  it('invalid PREV on entry closes the run and owned task with invalid_route', async () => {
     const opened = await openRepo('prev');
     try {
       const createdAt = '2026-07-20T00:00:00.000Z';
@@ -422,15 +429,18 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
       expect(settle.ok).toBe(true);
       expect(await runStatus(opened.client, data.runId)).toBe('failed');
       const after = await opened.repository.getTask(data.entryTaskId);
-      expect(after?.lifecycle).toBe('open');
-      expect(after?.attention?.code).toBe('workflow_run_failed');
-      expect(String(after?.attention?.message ?? '')).toMatch(/invalid_route/);
+      expect(after).toMatchObject({
+        lifecycle: 'failed',
+        error: 'invalid_route',
+        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+      });
+      expect(after?.attention).toBeUndefined();
     } finally {
       await opened.close();
     }
   }, 30_000);
 
-  it('run_timeout termination closes run failed with run_timeout attention', async () => {
+  it('run_timeout termination closes the run and owned task', async () => {
     const opened = await openRepo('timeout');
     try {
       const createdAt = '2026-07-20T00:00:00.000Z';
@@ -450,9 +460,12 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
       expect(settle.ok).toBe(true);
       expect(await runStatus(opened.client, data.runId)).toBe('failed');
       const after = await opened.repository.getTask(data.entryTaskId);
-      expect(after?.lifecycle).toBe('open');
-      expect(after?.attention?.code).toBe('workflow_run_failed');
-      expect(String(after?.attention?.message ?? '')).toMatch(/run_timeout/);
+      expect(after).toMatchObject({
+        lifecycle: 'failed',
+        error: 'run_timeout',
+        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+      });
+      expect(after?.attention).toBeUndefined();
     } finally {
       await opened.close();
     }
@@ -503,9 +516,11 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
 
       expect(await runStatus(opened.client, data.runId)).toBe('failed');
       const after = await opened.repository.getTask(active.consumerTaskId);
-      expect(after?.lifecycle).toBe('open');
-      expect(after?.attention?.code).toBe('workflow_run_failed');
-      expect(String(after?.attention?.message ?? '')).toMatch(/feedback_budget_exhausted/);
+      expect(after).toMatchObject({
+        lifecycle: 'failed',
+        error: 'feedback_budget_exhausted',
+        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+      });
       const rounds = await roundStatuses(opened.client, data.runId);
       expect(rounds).toHaveLength(1);
       expect(rounds.every((status) => status !== 'open' && status !== 'satisfied')).toBe(true);
@@ -537,9 +552,11 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
       )).resolves.toMatchObject({ changed: true });
       expect(await runStatus(opened.client, data.runId)).toBe('failed');
       const after = await opened.repository.getTask(active.consumerTaskId);
-      expect(after?.lifecycle).toBe('open');
-      expect(after?.attention?.code).toBe('workflow_run_failed');
-      expect(String(after?.attention?.message ?? '')).toMatch(/turn_budget_exhausted/);
+      expect(after).toMatchObject({
+        lifecycle: 'failed',
+        error: 'turn_budget_exhausted',
+        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+      });
       await expect(opened.client.get(
         `SELECT workflow_turns_reserved, feedback_rounds_reserved FROM workflow_runs
           WHERE workspace_id = 'ws' AND run_id = ?`,
@@ -694,13 +711,20 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
         expect(c.kind).toBe('interrupt');
       }
 
-      // Exactly one outer-boundary task carries attention; workflow closure seals none.
+      // Every task owned by the failed run is sealed and stale attention is cleared.
       const p1Task = await opened.repository.getTask(p1.taskId);
       const p2Task = await opened.repository.getTask(p2.taskId);
-      expect(p1Task?.lifecycle).toBe('open');
-      expect(p2Task?.lifecycle).toBe('open');
-      expect(p1Task?.attention?.code).toBe('workflow_run_failed');
-      expect(String(p1Task?.attention?.message ?? '')).toMatch(/agent_fail/);
+      expect(p1Task).toMatchObject({
+        lifecycle: 'failed',
+        error: 'agent_fail',
+        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+      });
+      expect(p2Task).toMatchObject({
+        lifecycle: 'failed',
+        error: 'agent_fail',
+        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+      });
+      expect(p1Task?.attention).toBeUndefined();
       expect(p2Task?.attention).toBeUndefined();
 
       // Late NEXT on p2 after close must not reopen the run or create new activations.
@@ -772,9 +796,17 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
 
       const p1Task = await opened.repository.getTask(p1.taskId);
       const p2Task = await opened.repository.getTask(p2.taskId);
-      expect(p1Task?.lifecycle).toBe('open');
-      expect(p2Task?.lifecycle).toBe('open');
-      expect(p1Task?.attention?.code).toBe('workflow_run_failed');
+      expect(p1Task).toMatchObject({
+        lifecycle: 'failed',
+        error: 'agent_fail',
+        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+      });
+      expect(p2Task).toMatchObject({
+        lifecycle: 'failed',
+        error: 'agent_fail',
+        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+      });
+      expect(p1Task?.attention).toBeUndefined();
       expect(p2Task?.attention).toBeUndefined();
     } finally {
       await opened.close();
@@ -873,8 +905,9 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
         status: 'cancelled',
       });
       await expect(opened.repository.getTask(data.entryTaskId)).resolves.toMatchObject({
-        lifecycle: 'open',
-        attention: { code: 'workflow_run_failed', message: 'run_timeout' },
+        lifecycle: 'failed',
+        error: 'run_timeout',
+        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
       });
       expect(adapterStarts).toBe(0);
 

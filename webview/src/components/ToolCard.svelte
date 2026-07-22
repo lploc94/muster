@@ -23,7 +23,7 @@
   const hasDetails = $derived(tool.input !== undefined || tool.output !== undefined || !!tool.error);
 </script>
 
-<div class="rounded px-2 py-1 text-xs border" style="border-color: var(--vscode-panel-border);">
+<div class="tool-card rounded px-2 py-1 text-xs border" style="border-color: var(--vscode-panel-border);">
   <button
     type="button"
     class="flex items-center gap-2 w-full text-left"
@@ -47,16 +47,16 @@
 
   {#if expanded && hasDetails}
     {#if tool.input !== undefined}
-      <div class="mt-1.5">
+      <div class="tool-card__details mt-1.5">
         <div class="text-[10px] opacity-70 mb-0.5">params:</div>
-        <pre class="text-[10px] bg-[var(--vscode-textCodeBlock-background)] p-1 rounded overflow-auto max-h-40 whitespace-pre">{typeof tool.input === 'string' ? tool.input : JSON.stringify(tool.input, null, 2)}</pre>
+        <pre class="tool-card__payload text-[10px] bg-[var(--vscode-textCodeBlock-background)] p-1 rounded max-h-40 whitespace-pre">{typeof tool.input === 'string' ? tool.input : JSON.stringify(tool.input, null, 2)}</pre>
       </div>
     {/if}
 
     {#if tool.output !== undefined}
-      <div class="mt-1.5">
+      <div class="tool-card__details mt-1.5">
         <div class="text-[10px] opacity-70 mb-0.5">result:</div>
-        <pre class="text-[10px] bg-[var(--vscode-textCodeBlock-background)] p-1 rounded overflow-auto max-h-40 whitespace-pre">{typeof tool.output === 'string' ? tool.output : JSON.stringify(tool.output, null, 2)}</pre>
+        <pre class="tool-card__payload text-[10px] bg-[var(--vscode-textCodeBlock-background)] p-1 rounded max-h-40 whitespace-pre">{typeof tool.output === 'string' ? tool.output : JSON.stringify(tool.output, null, 2)}</pre>
       </div>
     {/if}
 
@@ -65,3 +65,23 @@
     {/if}
   {/if}
 </div>
+
+<style>
+  .tool-card,
+  .tool-card__details {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .tool-card {
+    overflow: hidden;
+  }
+
+  .tool-card__payload {
+    box-sizing: border-box;
+    width: 100%;
+    max-width: 100%;
+    margin: 0;
+    overflow: auto;
+  }
+</style>

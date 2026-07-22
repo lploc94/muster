@@ -171,6 +171,30 @@ describe('CodexBackend.run — tool events', () => {
     });
   });
 
+  it('uses structured rawOutput when a completed tool update has no content blocks', async () => {
+    const rawOutput = {
+      result: { content: [{ type: 'text', text: '{"runId":"run-1"}' }] },
+      error: null,
+    };
+    const events = await runTurn(new CodexBackend(), options(), fake, {
+      updates: [
+        {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'abc',
+          status: 'completed',
+          rawOutput,
+        },
+      ],
+    });
+    expect(events).toContainEqual({
+      type: 'toolCompleted',
+      toolCallId: 'codex:abc',
+      outcome: 'success',
+      output: rawOutput,
+      meta: undefined,
+    });
+  });
+
   it('maps a failed tool_call_update to toolCompleted error, defaulting the message when no text', async () => {
     const events = await runTurn(new CodexBackend(), options(), fake, {
       updates: [{ sessionUpdate: 'tool_call_update', toolCallId: 'abc', status: 'failed' }],

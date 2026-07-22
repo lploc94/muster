@@ -19,7 +19,7 @@ Build a VS Code extension that acts as a **coordinator** for multiple AI coding 
   - Tool calls (start + result)
   - Final messages
 - Allow the agent to use a custom **MCP "context engine"** tool during execution (semantic codebase search, etc.).
-- Let the agent **ask the user** mid-turn via **ACP RFD elicitation** (root) or **`ask_parent`** (children). See `docs/MUSTER-BRIDGE.md`.
+- Let a root agent **ask the user** mid-turn via **ACP RFD elicitation**; workflow nodes route correction through `workflow_prev`. See `docs/MUSTER-BRIDGE.md`.
 
 ### Explicitly Out of Scope (for now)
 - Rich permission system / approval cards
@@ -58,9 +58,9 @@ Build a VS Code extension that acts as a **coordinator** for multiple AI coding 
 - Updates are mapped into a small set of **normalized events**.
 - The UI only deals with the normalized model (makes it easy to add new backends later).
 
-### 2.5 Human-in-the-Loop (ACP elicitation + ask_parent)
+### 2.5 Human-in-the-Loop (ACP elicitation + workflow feedback)
 - **Root agents** request structured input via ACP RFD `elicitation/create` (form/url). Grok vendor `x.ai/ask_user_question` maps through AskBridge → AskCard.
-- **Non-root workers** use MCP **`ask_parent`** (parent answers with `answer_child_question`). MCP **`ask_user` is removed**.
+- **Workflow nodes** request producer correction through MCP **`workflow_prev`**. Legacy MCP `ask_user`, `ask_parent`, and `answer_child_question` are removed.
 - The **extension host** owns elicitation/Ask bridges. The **webview** submits answers via `postMessage`; it does not call MCP directly.
 - A turn remains **one ACP session per user message**, but the session may **pause** until the user answers (not a session pool).
 - **All five ACP backends implemented** (Grok, Kiro, OpenCode, Claude, Codex) on the shared `acp-client.ts`; agy follows the same client when its ACP entry exists.
@@ -163,7 +163,7 @@ behavior.
 Each turn merges **two** MCP servers (details in `MCP-INJECTION.md`):
 
 1. **`context_engine`** — user-provided semantic search / codebase tools (stdio).
-2. **`muster_bridge`** — extension-owned coordinator tools (task graph, status, disposition). Human ask is **not** MCP `ask_user` — use ACP elicitation / `ask_parent` (`MUSTER-BRIDGE.md`).
+2. **`muster_bridge`** — extension-owned workflow definition, routing, bounded run inspection, context, and presentation tools. Human ask is not an MCP bridge tool (`MUSTER-BRIDGE.md`).
 
 At turn start we generate/pass a merged MCP config (or use per-CLI discovery). Goal: agents can search context and manage tasks without leaving the turn.
 

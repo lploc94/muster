@@ -2003,7 +2003,7 @@ describe('SqliteTaskRepository', () => {
 
 
 
-  it('M018 S05 fail-fast closure: workflow_fail closes run once, sets attention, leaves lifecycle open', async () => {
+  it('M018 S05 fail-fast closure: workflow_fail closes the run and owned task once', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-s05-fail-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
     try {
@@ -2085,16 +2085,20 @@ describe('SqliteTaskRepository', () => {
       expect(runRows[0]?.status).toBe('failed');
 
       const after = await repository.getTask(data.entryTaskId);
-      expect(after?.lifecycle).toBe('open');
-      expect(after?.attention?.code).toBe('workflow_run_failed');
-      expect(String(after?.attention?.message ?? '')).toMatch(/agent_fail/);
+      expect(after).toMatchObject({
+        lifecycle: 'failed',
+        finishedAt,
+        error: 'agent_fail',
+        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+      });
+      expect(after?.attention).toBeUndefined();
     } finally {
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });
     }
   }, 20_000);
 
-  it('M018 S05 invalid PREV route closes run failed with workflow_run_failed attention', async () => {
+  it('M018 S05 invalid PREV route closes the failed run and owned task', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-s05-prev-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
     try {
@@ -2172,9 +2176,13 @@ describe('SqliteTaskRepository', () => {
       );
       expect(runRows[0]?.status).toBe('failed');
       const after = await repository.getTask(data.entryTaskId);
-      expect(after?.lifecycle).toBe('open');
-      expect(after?.attention?.code).toBe('workflow_run_failed');
-      expect(String(after?.attention?.message ?? '')).toMatch(/invalid_route/);
+      expect(after).toMatchObject({
+        lifecycle: 'failed',
+        finishedAt,
+        error: 'invalid_route',
+        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+      });
+      expect(after?.attention).toBeUndefined();
     } finally {
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });

@@ -123,6 +123,30 @@
           "scope": "resource",
           "description": "Maximum concurrent agent turns under a single root task tree. Applies on each scheduling pass; already-running turns are not preempted when lowered."
         },
+        "muster.execution.fallbacks": {
+          "type": "array",
+          "default": [],
+          "maxItems": 8,
+          "scope": "resource",
+          "description": "Ordered backend/model fallbacks used after safe same-backend retries are exhausted. Each binding is attempted at most once per recovery chain.",
+          "items": {
+            "type": "object",
+            "required": [
+              "backend"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "backend": {
+                "type": "string",
+                "description": "ACP backend id."
+              },
+              "model": {
+                "type": "string",
+                "description": "Optional model id; omit to use the backend default."
+              }
+            }
+          }
+        },
         "muster.retention.maxRetainedTurnsPerTask": {
           "type": "number",
           "default": 200,
@@ -210,6 +234,26 @@
               "model": {
                 "type": "string",
                 "description": "Optional ACP model id for this type."
+              },
+              "fallbacks": {
+                "type": "array",
+                "maxItems": 8,
+                "description": "Task-type-specific ordered fallback chain. An explicit empty array disables global fallbacks for this type.",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "backend"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "backend": {
+                      "type": "string"
+                    },
+                    "model": {
+                      "type": "string"
+                    }
+                  }
+                }
               },
               "role": {
                 "type": "string",

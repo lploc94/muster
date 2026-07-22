@@ -15,7 +15,7 @@ import {
   synthesizeBriefFromGoal,
 } from './brief';
 import { capabilitiesFor } from './capabilities';
-import { summarizeTaskTypes } from './task-types';
+import { summarizeTaskTypes, type RuntimeFallbackBinding } from './task-types';
 import {
   formatPinnedInputsForPrompt,
   pinResolvedInputs,
@@ -64,11 +64,17 @@ import {
   resolveTurnRunDeadline,
   remainingRunTimeMs,
 } from './execution-policy';
-import { TASK_ERROR_MAX_BYTES, TASK_RESULT_MAX_BYTES } from './content-limits';
+import {
+  TASK_ERROR_MAX_BYTES,
+  TASK_RESULT_MAX_BYTES,
+  truncateUtf8Bytes,
+} from './content-limits';
 import { selectCommittedSessionId } from './session-select';
+import { sanitizeHandoffFailureMessage } from './sanitization';
 import type { TaskReadPort } from './store-port';
 import {
   deriveResourceClaimKeys,
+  isWorkflowTransactionalCommand,
   type TaskRepository,
 } from './repository';
 import {
@@ -127,6 +133,7 @@ import type {
   TurnDisposition,
   TurnInput,
 } from './types';
+import type { WorkflowRunCompletionProjection } from './workflow-types';
 
 /** Extra lifetime after the frozen run deadline before a runtime claim is reclaimable. */
 export const LEASE_CLEANUP_BUFFER_MS = 60_000;
@@ -194,6 +201,8 @@ export interface TaskEngineConfig {
    * Passed through to GraphEngineDeps for create/list.
    */
   getTaskTypeRegistry?: (cwd?: string) => import('./task-types').TaskTypeRegistryResult;
+  /** Live ordered execution fallback chain, already scoped by task type when configured. */
+  getRuntimeFallbacks?: (task: MusterTask) => readonly RuntimeFallbackBinding[];
   /**
    * Host-authorization master switch for the Phase C host gate (default false). When
    * NOT explicitly true, the engine NEVER executes a task's verification commands and
@@ -240,6 +249,17 @@ export interface TaskEngineConfig {
 export type EngineResult<T> =
   | { ok: true; value: T }
   | { ok: false; reason: string };
+
+interface RuntimeFallbackRecoveryRequest {
+  failedTurn: TaskTurn;
+  instruction: string;
+  state: NonNullable<MusterTask['runtimeRecovery']>;
+  workflow?: {
+    runId: string;
+    activationId: string;
+    expectedActivationStatus: 'failed' | 'interrupted';
+  };
+}
 
 /**
  * Attention message set when auto-remediation pauses on an identical recurring verify
@@ -459,6 +479,9 @@ export class TaskEngine {
   private readonly getTaskTypeRegistry?: (
     cwd?: string,
   ) => import('./task-types').TaskTypeRegistryResult;
+  private readonly getRuntimeFallbacks?: (
+    task: MusterTask,
+  ) => readonly RuntimeFallbackBinding[];
   private readonly getAdvertisedCommands?: (
     backend: string,
   ) => ReadonlySet<string> | undefined;
@@ -505,6 +528,7 @@ export class TaskEngine {
   private readonly turnPromises = new Map<string, Promise<void>>();
   private workflowDeadlineTimer?: ReturnType<typeof setInterval>;
   private workflowDeadlineReapRunning = false;
+  private readonly workflowRunWaiters = new Set<() => void>();
   private shuttingDown = false;
   /** Terminal storage latch: zero repository writes after this (distinct from graceful shutdown). */
   private storageTerminal = false;
@@ -515,6 +539,8 @@ export class TaskEngine {
   private maintenanceHold = false;
   private readonly pendingAskPromises = new Map<string, { promise: Promise<Answers>; fingerprint: string }>();
   private settling = new Set<string>();
+  /** Provider error arrived after a durable workflow NEXT; emit completion, not error. */
+  private readonly semanticSuccessSettlements = new Set<string>();
   /** Live executeTurn closures used to settle unobserved timer flush failures. */
   private readonly streamFailureHandlers = new Map<
     string,
@@ -564,6 +590,7 @@ export class TaskEngine {
     this.getHostEnvironment = config.getHostEnvironment;
     this.workspaceFolder = config.workspaceFolder;
     this.getTaskTypeRegistry = config.getTaskTypeRegistry;
+    this.getRuntimeFallbacks = config.getRuntimeFallbacks;
     this.getAdvertisedCommands = config.getAdvertisedCommands;
     this.getSkillPrefix = config.getSkillPrefix;
     // Preserve the raw value (boolean or resolver); resolveAllowHostVerification()
@@ -613,6 +640,7 @@ export class TaskEngine {
     }
     if (this.shuttingDown) return;
     this.shuttingDown = true;
+    this.wakeWorkflowRunWaiters();
     if (this.workflowDeadlineTimer !== undefined) {
       clearInterval(this.workflowDeadlineTimer);
       this.workflowDeadlineTimer = undefined;
@@ -655,6 +683,7 @@ export class TaskEngine {
     // Latch first so every subsequent path sees terminal immediately.
     this.storageTerminal = true;
     this.shuttingDown = true;
+    this.wakeWorkflowRunWaiters();
     if (this.workflowDeadlineTimer !== undefined) {
       clearInterval(this.workflowDeadlineTimer);
       this.workflowDeadlineTimer = undefined;
@@ -868,6 +897,14 @@ export class TaskEngine {
     }
   }
 
+  private emitFailureSettlement(taskId: string, turnId: string, message: string): void {
+    if (this.semanticSuccessSettlements.delete(turnId)) {
+      this.safeEmit({ type: 'turnDone', taskId, turnId });
+      return;
+    }
+    this.safeEmit({ type: 'turnError', taskId, turnId, message });
+  }
+
   private graphDeps(): GraphEngineDeps {
     const credentials = this.credentialRegistry ?? new CredentialRegistry();
     return {
@@ -915,7 +952,57 @@ export class TaskEngine {
           },
         }).catch(() => undefined);
       },
+      waitForWorkflowRun: (input) => this.waitForWorkflowRun(input),
     };
+  }
+
+  private wakeWorkflowRunWaiters(): void {
+    const waiters = [...this.workflowRunWaiters];
+    this.workflowRunWaiters.clear();
+    for (const wake of waiters) wake();
+  }
+
+  private onRepositoryCommit(ctx: RepositoryCommitContext): void {
+    if (isWorkflowTransactionalCommand(ctx.command)) this.wakeWorkflowRunWaiters();
+  }
+
+  private async waitForWorkflowRun(input: {
+    runId: string;
+    ownerRootTaskId: string;
+    callerTurnId: string;
+  }): Promise<
+    | { ok: true; completion: WorkflowRunCompletionProjection }
+    | { ok: false; error: string }
+  > {
+    while (true) {
+      let wake!: () => void;
+      const notified = new Promise<void>((resolve) => {
+        wake = resolve;
+      });
+      this.workflowRunWaiters.add(wake);
+      try {
+        const completion = await this.repository.getWorkflowRunCompletion(
+          input.runId,
+          input.ownerRootTaskId,
+        );
+        if (!completion) return { ok: false, error: 'workflow run not found' };
+        if (completion.runStatus !== 'running') return { ok: true, completion };
+        const callerTurn = await this.repository.getTurn(input.callerTurnId);
+        if (
+          !callerTurn ||
+          (callerTurn.status !== 'running' && callerTurn.status !== 'waiting_user')
+        ) {
+          return { ok: false, error: 'start_workflow interrupted: caller turn is no longer live' };
+        }
+        if (this.storageTerminal) return { ok: false, error: 'storage terminal' };
+        if (this.shuttingDown) {
+          return { ok: false, error: 'start_workflow interrupted: engine shutting down' };
+        }
+        await notified;
+      } finally {
+        this.workflowRunWaiters.delete(wake);
+      }
+    }
   }
 
   /** Per-turn elicitation wait tokens (RFD form); resume only when empty. */
@@ -1043,12 +1130,12 @@ export class TaskEngine {
     if (questions.length === 0) {
       return { ok: false, reason: 'questions required' };
     }
-    // Non-root tasks must not reach the user by default (ask_parent path).
+    // Non-root tasks must not reach the user directly; workflow routing owns escalation.
     const liveTask = await this.repository.getTask(live.taskId);
     if (liveTask?.parentId) {
       return {
         ok: false,
-        reason: 'direct user elicitation denied for non-root task; use ask_parent',
+        reason: 'direct user elicitation denied for non-root task; use workflow_prev or workflow_fail',
       };
     }
     const askId = this.askBridge.generateAskId();
@@ -1202,10 +1289,14 @@ export class TaskEngine {
       now: nowIso(config.clock),
     });
     const projection = await RepositoryProjection.load(config.repository, config.workspaceId);
+    let engine: TaskEngine | undefined;
     const repository = withRepositoryProjection(config.repository, projection, {
-      onAfterCommit: config.onAfterCommit,
+      onAfterCommit: async (ctx) => {
+        engine?.onRepositoryCommit(ctx);
+        await config.onAfterCommit?.(ctx);
+      },
     });
-    const engine = new TaskEngine(config, projection, repository);
+    engine = new TaskEngine(config, projection, repository);
     await engine.reconcileReloadFromRepository();
     engine.startWorkflowDeadlineReaper();
     return engine;
@@ -1583,7 +1674,15 @@ export class TaskEngine {
     taskId: string;
     targetBackend: string;
     targetModel?: string;
-  }): Promise<
+  }) {
+    return this.requestRuntimeHandoffInternal(params);
+  }
+
+  private async requestRuntimeHandoffInternal(params: {
+    taskId: string;
+    targetBackend: string;
+    targetModel?: string;
+  }, recovery?: RuntimeFallbackRecoveryRequest): Promise<
     EngineResult<{
       operationId: string;
       boundBackend: string;
@@ -1665,6 +1764,7 @@ export class TaskEngine {
           continuation: { status: 'pending' },
           switchedAt: now,
         },
+        ...(recovery ? { runtimeRecovery: recovery.state } : {}),
         revision: task.revision + 1,
         updatedAt: now,
       };
@@ -1690,10 +1790,46 @@ export class TaskEngine {
       if (!interrupted.ok) return interrupted;
       changedTurns.push({ ...interrupted.next, isCancellation: true, interruptConfidence: 'confirmed' });
     }
+    let recoveryTurn: TaskTurn | undefined;
+    if (recovery) {
+      const failedTurn = turns.find((turn) => turn.id === recovery.failedTurn.id);
+      if (
+        !failedTurn
+        || failedTurn.taskId !== task.id
+        || (failedTurn.status !== 'failed' && failedTurn.status !== 'interrupted')
+      ) {
+        return { ok: false, reason: 'failed turn is no longer recoverable' };
+      }
+      const retry = retryTurn(nextTask, turns, failedTurn, {
+        turnId: `${failedTurn.id}-fallback-${targetEpoch}`,
+        instruction: '',
+        recoveryInstruction: recovery.instruction,
+        now,
+        reuseOriginalInputs: true,
+      });
+      if (!retry.ok) return retry;
+      recoveryTurn = retry.next;
+      expectedTurns.push({
+        id: failedTurn.id,
+        status: failedTurn.status,
+        runtimeEpoch: failedTurn.runtimeEpoch,
+      });
+    }
     const commit = await this.repository.execute({
       kind: 'requestRuntimeHandoff', workspaceId: this.workspaceId, taskId: params.taskId,
       expectedTaskRevision: task.revision, task: nextTask, turns: changedTurns,
       expectedTurns, cancelRequests,
+      ...(recovery && recoveryTurn
+        ? {
+            recovery: {
+              failedTurnId: recovery.failedTurn.id,
+              expectedFailedStatus: recovery.failedTurn.status as 'failed' | 'interrupted',
+              turn: recoveryTurn,
+              maxTurnsPerTask: this.getResourceLimits().maxTurnsPerTask,
+              ...(recovery.workflow ? { workflow: recovery.workflow } : {}),
+            },
+          }
+        : {}),
     });
     if (!commit.changed) return { ok: false, reason: commit.reason ?? 'task or turn changed; retry' };
 
@@ -1717,6 +1853,122 @@ export class TaskEngine {
         switchedAt: now,
       },
     };
+  }
+
+  private configuredRuntimeFallbacks(task: MusterTask): RuntimeFallbackBinding[] {
+    let configured: readonly RuntimeFallbackBinding[] = [];
+    try {
+      configured = this.getRuntimeFallbacks?.(task) ?? [];
+    } catch {
+      return [];
+    }
+    const unique = new Map<string, RuntimeFallbackBinding>();
+    for (const entry of configured.slice(0, 8)) {
+      const backend = normalizeRuntimeLabel(entry.backend, 128);
+      const model = entry.model === undefined
+        ? undefined
+        : normalizeRuntimeLabel(entry.model, 256);
+      if (!backend || (entry.model !== undefined && !model)) continue;
+      const key = `${backend}\0${model ?? ''}`;
+      if (!unique.has(key)) unique.set(key, { backend, ...(model ? { model } : {}) });
+    }
+    return [...unique.values()];
+  }
+
+  private fallbackIsAdvertised(task: MusterTask, binding: RuntimeFallbackBinding): boolean {
+    const snapshot = this.getHostEnvironment?.();
+    if (snapshot?.availableBackends.length && !snapshot.availableBackends.includes(binding.backend)) {
+      return false;
+    }
+    if (binding.model) {
+      const models = snapshot?.models[binding.backend];
+      if (models?.options.length && !models.options.some((model) => model.value === binding.model)) {
+        return false;
+      }
+    }
+    void task;
+    return true;
+  }
+
+  private async attemptConfiguredRuntimeFallback(input: {
+    task: MusterTask;
+    failedTurn: TaskTurn;
+    errorMessage: string;
+    failureClass: import('./types').TurnFailureClass;
+  }): Promise<boolean> {
+    const candidates = this.configuredRuntimeFallbacks(input.task);
+    if (candidates.length === 0) return false;
+    const currentEpoch = input.task.runtimeEpoch ?? 1;
+    const attempted = input.task.runtimeRecovery?.attempted ?? [{
+      backend: input.task.backend,
+      ...(input.task.model ? { model: input.task.model } : {}),
+      runtimeEpoch: currentEpoch,
+    }];
+    const attemptedKeys = new Set(
+      attempted.map((binding) => `${binding.backend}\0${binding.model ?? ''}`),
+    );
+    const workflowActivation = input.failedTurn.workflowActivation;
+    const now = nowIso(this.clock);
+    const diagnostic = sanitizeHandoffFailureMessage(input.errorMessage);
+    const instruction = [
+      '[runtime-fallback-recovery]',
+      `The previous ${input.task.backend} turn failed (${input.failureClass}): ${diagnostic}`,
+      'Continue from the normalized transcript and current workspace state.',
+      'Do not repeat confirmed side effects; inspect existing results before acting.',
+    ].join('\n');
+
+    for (const candidate of candidates) {
+      const key = `${candidate.backend}\0${candidate.model ?? ''}`;
+      if (attemptedKeys.has(key) || !this.fallbackIsAdvertised(input.task, candidate)) continue;
+      const targetEpoch = currentEpoch + 1;
+      const state: NonNullable<MusterTask['runtimeRecovery']> = {
+        version: 1,
+        startedAt: input.task.runtimeRecovery?.startedAt ?? now,
+        lastFailureAt: now,
+        lastFailedTurnId: input.failedTurn.id,
+        attempted: [
+          ...attempted,
+          {
+            backend: candidate.backend,
+            ...(candidate.model ? { model: candidate.model } : {}),
+            runtimeEpoch: targetEpoch,
+          },
+        ].slice(-9),
+      };
+      const switched = await this.requestRuntimeHandoffInternal({
+        taskId: input.task.id,
+        targetBackend: candidate.backend,
+        ...(candidate.model ? { targetModel: candidate.model } : {}),
+      }, {
+        failedTurn: input.failedTurn,
+        instruction,
+        state,
+        ...(workflowActivation
+          ? {
+              workflow: {
+                runId: workflowActivation.runId,
+                activationId: workflowActivation.activationId,
+                expectedActivationStatus: input.failedTurn.status as 'failed' | 'interrupted',
+              },
+            }
+          : {}),
+      });
+      if (switched.ok) {
+        console.info('[muster][task-orch] runtime.fallback', {
+          taskId: input.task.id,
+          failedTurnId: input.failedTurn.id,
+          sourceBackend: input.task.backend,
+          targetBackend: candidate.backend,
+          targetModel: candidate.model ?? null,
+          workflowRunId: workflowActivation?.runId ?? null,
+        });
+        return true;
+      }
+      if (switched.reason.includes('changed') || switched.reason.includes('no longer recoverable')) {
+        return false;
+      }
+    }
+    return false;
   }
 
   /** Repository-backed host send path; task/message/turn/receipt are one transaction. */
@@ -3954,6 +4206,7 @@ export class TaskEngine {
             observedSessionId,
             rawOutput,
             backend,
+            { suppressRuntimeFallback: true },
           );
         } catch (error) {
           const { diagnoseSqliteError } = await import('./sqlite/diagnostics');
@@ -3970,12 +4223,7 @@ export class TaskEngine {
           return true;
         }
         if (terminalSettled) {
-          this.safeEmit({
-            type: 'turnError',
-            taskId: startedTurn.taskId,
-            turnId,
-            message,
-          });
+          this.emitFailureSettlement(startedTurn.taskId, turnId, message);
         }
         return true;
       })();
@@ -4033,12 +4281,11 @@ export class TaskEngine {
           backend,
         );
         if (terminalSettled) {
-          this.safeEmit({
-            type: 'turnError',
-            taskId: startedTurn.taskId,
+          this.emitFailureSettlement(
+            startedTurn.taskId,
             turnId,
-            message: `backend factory failed: ${message}`,
-          });
+            `backend factory failed: ${message}`,
+          );
         }
         return;
       }
@@ -4469,12 +4716,7 @@ export class TaskEngine {
                   : undefined,
               );
               if (terminalSettled) {
-                this.safeEmit({
-                  type: 'turnError',
-                  taskId: turn.taskId,
-                  turnId,
-                  message: failMessage,
-                });
+                this.emitFailureSettlement(turn.taskId, turnId, failMessage);
               }
             }
             break;
@@ -4544,7 +4786,7 @@ export class TaskEngine {
                 },
               );
               if (terminalSettled) {
-                this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message: event.message });
+                this.emitFailureSettlement(turn.taskId, turnId, event.message);
               }
             }
             if (!terminalSettled) {
@@ -4556,12 +4798,7 @@ export class TaskEngine {
                 backend,
               );
               if (terminalSettled) {
-                this.safeEmit({
-                  type: 'turnError',
-                  taskId: turn.taskId,
-                  turnId,
-                  message: 'failed to settle error turn',
-                });
+                this.emitFailureSettlement(turn.taskId, turnId, 'failed to settle error turn');
               }
             }
             break;
@@ -4596,12 +4833,7 @@ export class TaskEngine {
             );
           }
           if (terminalSettled) {
-            this.safeEmit({
-              type: 'turnError',
-              taskId: turn.taskId,
-              turnId,
-              message: 'turn ended without terminal event',
-            });
+            this.emitFailureSettlement(turn.taskId, turnId, 'turn ended without terminal event');
           }
         }
       }
@@ -4627,7 +4859,7 @@ export class TaskEngine {
             );
           }
           if (terminalSettled) {
-            this.safeEmit({ type: 'turnError', taskId: turn.taskId, turnId, message });
+            this.emitFailureSettlement(turn.taskId, turnId, message);
           }
         }
       }
@@ -4705,8 +4937,58 @@ export class TaskEngine {
       // store lock is never held across the subprocess.
       const hostVerdict = this.computeHostVerdictForSettle(turnId);
       let missingSession = false;
-      const source = await this.loadTurnAggregate(turnId);
+      let source = await this.loadTurnAggregate(turnId);
       if (!source) return false;
+      const liveTurn = source.turns[turnId];
+      if (liveTurn?.workflowActivation && !liveTurn.disposition) {
+        const finalAssistantMessage = Object.values(source.messages)
+          .filter((message) =>
+            message.turnId === turnId &&
+            message.role === 'assistant' &&
+            message.content.trim().length > 0,
+          )
+          .sort((a, b) =>
+            (a.order ?? Number.MIN_SAFE_INTEGER) - (b.order ?? Number.MIN_SAFE_INTEGER) ||
+            a.createdAt.localeCompare(b.createdAt) ||
+            a.id.localeCompare(b.id),
+          )
+          .at(-1)
+          ?.content.trim();
+        const result = finalAssistantMessage
+          ? truncateUtf8Bytes(finalAssistantMessage, this.getResourceLimits().maxResultBytes).text
+          : undefined;
+        let rootId = liveTurn.taskId;
+        const seen = new Set<string>();
+        while (source.tasks[rootId]?.parentId && !seen.has(rootId)) {
+          seen.add(rootId);
+          rootId = source.tasks[rootId]!.parentId!;
+        }
+        const implicitNext = await executeToolCommand(
+          this.graphDeps(),
+          {
+            callerTaskId: liveTurn.taskId,
+            turnId,
+            rootId,
+            allowedActions: new Set(['workflow_next']),
+          },
+          {
+            kind: 'workflow_next',
+            opId: 'engine-implicit-workflow-next',
+            change: 'updated',
+            ...(result !== undefined ? { result } : {}),
+          },
+        );
+        source = await this.loadTurnAggregate(turnId);
+        if (!source) return false;
+        if (!implicitNext.ok && !source.turns[turnId]?.disposition) {
+          console.info('[muster][task-orch] workflow.implicit_next_failed', {
+            taskId: liveTurn.taskId,
+            turnId,
+            error: implicitNext.error,
+          });
+          return false;
+        }
+      }
       const before = cloneEngineProjection(source);
       const draft = cloneEngineProjection(before);
       const prepared = (() => {
@@ -4793,6 +5075,10 @@ export class TaskEngine {
             },
           };
         }
+        if (nextTask.runtimeRecovery) {
+          nextTask = { ...nextTask };
+          delete nextTask.runtimeRecovery;
+        }
         draft.tasks[task.id] = nextTask;
 
         for (const effect of result.effects) {
@@ -4826,13 +5112,6 @@ export class TaskEngine {
           hasCompletionCandidate: Boolean(task?.completionCandidate),
           resultChars: task?.taskResult?.summary?.length ?? 0,
         });
-        if (
-          task?.attention?.code === 'disposition_repair_pending' &&
-          task.lifecycle === 'open' &&
-          !task.pendingParentQuestion
-        ) {
-          await this.enqueueDispositionRepair(task.id, turnId);
-        }
         return 'ok';
       }
       if (missingSession) {
@@ -4847,67 +5126,6 @@ export class TaskEngine {
     } finally {
       this.settling.delete(turnId);
     }
-  }
-
-  /**
-   * P0.5: at most one disposition-repair turn after CLI success without complete/fail.
-   * Id derived from settled turn for reload idempotency. Never seals lifecycle.
-   */
-  private async enqueueDispositionRepair(taskId: string, settledTurnId: string): Promise<void> {
-    const repairTurnId = `${settledTurnId}-disposition-repair`;
-    const now = nowIso(this.clock);
-    if (await this.repository.getTurn(repairTurnId)) return;
-    const task = await this.repository.getTask(taskId);
-    if (!task || task.lifecycle !== 'open' || task.attention?.code !== 'disposition_repair_pending' || task.parentId === null) return;
-    let root = task;
-    while (root.parentId) {
-      const parent = await this.repository.getTask(root.parentId);
-      if (!parent) break;
-      root = parent;
-    }
-    if (root.childOrchestrationSeal === 'propose_only') return;
-    const turns = [...await this.repository.listTurns(taskId)];
-    const aggregate: EngineProjection = {
-      schemaVersion: 6, revision: 0,
-      tasks: Object.fromEntries([task].map((entry) => [entry.id, entry])),
-      turns: Object.fromEntries(turns.map((entry) => [entry.id, entry])), messages: {},
-    };
-    const turnCap = canCreateTurn(aggregate, taskId, this.getResourceLimits());
-    if (!turnCap.ok) {
-      const write = await this.repository.execute({
-        kind: 'setTaskAttention', workspaceId: this.workspaceId,
-        expectedTaskRevision: task.revision,
-        task: { ...task, revision: task.revision + 1, updatedAt: now,
-          attention: { code: 'missing_disposition', message: 'disposition repair could not be scheduled', at: now, sourceTurnId: settledTurnId } },
-      });
-      void write;
-      return;
-    }
-    const messageId = randomUUID();
-    const content =
-      'Muster host: previous turn finished without complete_task/fail_task. ' +
-      'Inspect your prior work in this session and stage complete_task (with a short summary) ' +
-      'or fail_task. Do not invent success; do not start new work.';
-    const message: TaskMessage = { id: messageId, taskId, role: 'user', content, state: 'assigned', createdAt: now, turnId: repairTurnId };
-    const continued = transitionContinueTask(task, turns, {
-      turnId: repairTurnId, now, inputs: [{ kind: 'message', messageId }], trigger: 'engine',
-    });
-    if (!continued.ok) {
-      await this.repository.execute({
-        kind: 'setTaskAttention', workspaceId: this.workspaceId,
-        expectedTaskRevision: task.revision,
-        task: { ...task, revision: task.revision + 1, updatedAt: now,
-          attention: { code: 'missing_disposition', message: 'disposition repair failed to create turn', at: now, sourceTurnId: settledTurnId } },
-      });
-      return;
-    }
-    const write = await this.repository.execute({
-      kind: 'enqueueDispositionRepair', workspaceId: this.workspaceId,
-      expectedTaskRevision: task.revision, maxTurnsPerTask: this.getResourceLimits().maxTurnsPerTask,
-      task: { ...task, revision: task.revision + 1, updatedAt: now }, turn: continued.next, message,
-    });
-    if (write.changed) void this.scheduleTurn(repairTurnId);
-    await this.reconcileChildWaits();
   }
 
   private async settleInterrupted(
@@ -5023,23 +5241,42 @@ export class TaskEngine {
     errorMessage: string,
     observedSessionId: string | undefined,
     rawOutput: string,
-    backend: Backend,
+    backend: Backend | undefined,
     opts?: {
       terminalReceived?: boolean;
       failureClass?: import('./types').TurnFailureClass;
       suppressAutoRetry?: boolean;
       mcpSetupExhausted?: boolean;
+      suppressRuntimeFallback?: boolean;
     },
   ): Promise<boolean> {
     if (this.storageTerminal) return false;
     if (this.settling.has(turnId)) {
       return false;
     }
+    const staged = await this.loadTurnAggregate(turnId);
+    const stagedTurn = staged?.turns[turnId];
+    if (
+      !opts?.suppressRuntimeFallback
+      && stagedTurn?.status === 'running'
+      && stagedTurn.disposition?.kind === 'workflow_next'
+      && backend
+    ) {
+      const semanticSuccess = (await this.settleSuccess(
+        turnId,
+        observedSessionId,
+        rawOutput,
+        backend,
+      )) === 'ok';
+      if (semanticSuccess) this.semanticSuccessSettlements.add(turnId);
+      return semanticSuccess;
+    }
     this.settling.add(turnId);
     const now = nowIso(this.clock);
     try {
       const source = await this.loadTurnAggregate(turnId);
       if (!source) return false;
+      let settledFailureClass: import('./types').TurnFailureClass = 'unclassified';
       const before = cloneEngineProjection(source);
       const draft = cloneEngineProjection(before);
       const prepared = (() => {
@@ -5059,6 +5296,7 @@ export class TaskEngine {
               : turn.dispatchPhase === 'prompt_outstanding'
                 ? 'uncertain'
                 : 'unclassified');
+        settledFailureClass = failureClass;
         const result = applyFailedTurn(task, turn, {
           error: errorMessage,
           retryCount: retryCountOf(turns, turn.id),
@@ -5073,12 +5311,14 @@ export class TaskEngine {
         }
 
         const observed = observedSessionId ?? turn.observedSessionId;
-        const candidate = selectCommittedSessionId(
-          backend,
-          { observedSessionId: observed },
-          rawOutput,
-          undefined,
-        );
+        const candidate = backend
+          ? selectCommittedSessionId(
+              backend,
+              { observedSessionId: observed },
+              rawOutput,
+              undefined,
+            )
+          : undefined;
         draft.turns[turnId] = {
           ...result.next.turn,
           observedSessionId: observed,
@@ -5176,7 +5416,7 @@ export class TaskEngine {
           failureClass: opts?.failureClass ?? null,
         });
         const retryTurnEntry = Object.values(this.store.getFile().turns).find(
-          (turn) => turn.retryOf === turnId && turn.status === 'queued',
+          (turn) => turn.retryOf === turnId && turn.status === 'queued' && turn.id.includes('-auto-retry-'),
         );
         if (retryTurnEntry) {
           // Bounded exponential backoff + jitter for safe auto-retries (Phase C).
@@ -5189,6 +5429,18 @@ export class TaskEngine {
           setTimeout(() => {
             void this.scheduleTurn(retryTurnEntry.id);
           }, delayMs);
+        } else if (!opts?.suppressRuntimeFallback) {
+          const settledFile = this.store.getFile();
+          const failedTurn = settledFile.turns[turnId];
+          const failedTask = failedTurn ? settledFile.tasks[failedTurn.taskId] : undefined;
+          if (failedTurn?.status === 'failed' && failedTask?.lifecycle === 'open') {
+            await this.attemptConfiguredRuntimeFallback({
+              task: failedTask,
+              failedTurn,
+              errorMessage,
+              failureClass: settledFailureClass,
+            });
+          }
         }
         return true;
       }

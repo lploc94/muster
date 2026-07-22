@@ -487,13 +487,15 @@ function decodeEntryContracts(
     });
   }
   for (const entryNodeId of entryIds) {
-    if (
-      maximumWorkflowEntryAggregateBytes(
-        contracts.filter((contract) => contract.entryNodeId === entryNodeId),
-        policy.maxArtifactBytes,
-      ) > policy.maxAggregateBytes
-    ) {
-      return { ok: false, reason: 'entry contract aggregate exceeds policy' };
+    const requiredAggregateBytes = maximumWorkflowEntryAggregateBytes(
+      contracts.filter((contract) => contract.entryNodeId === entryNodeId),
+      policy.maxArtifactBytes,
+    );
+    if (requiredAggregateBytes > policy.maxAggregateBytes) {
+      return {
+        ok: false,
+        reason: `entry contract aggregate exceeds policy: maxAggregateBytes must be at least ${requiredAggregateBytes} for entry ${JSON.stringify(entryNodeId)} when maxArtifactBytes is ${policy.maxArtifactBytes}`,
+      };
     }
   }
   return { ok: true, contracts };
@@ -514,7 +516,10 @@ function decodePolicy(raw: unknown): { ok: true; policy: WorkflowPolicyV1 } | { 
     const value = rec[key];
     const bounds = WORKFLOW_POLICY_BOUNDS[key];
     if (!Number.isSafeInteger(value) || (value as number) < bounds.min || (value as number) > bounds.max) {
-      return { ok: false, reason: `invalid policy ${key}` };
+      return {
+        ok: false,
+        reason: `invalid policy ${key}: expected an integer from ${bounds.min} to ${bounds.max}`,
+      };
     }
     (policy as unknown as Record<string, number>)[key] = value as number;
   }

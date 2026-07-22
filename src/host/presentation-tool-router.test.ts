@@ -62,16 +62,20 @@ describe('PresentationToolRouter', () => {
   });
 
   it('delegates non-presentation commands without changing their result', async () => {
-    const delegatedResult = { ok: true as const, result: { root: 'task-1', tasks: [] } };
+    const delegatedResult = { ok: true as const, result: { runId: 'run-1', runStatus: 'running' } };
     const delegate = { handleToolCall: vi.fn().mockResolvedValue(delegatedResult) };
     const manager = { upsert: vi.fn() };
     const router = new PresentationToolRouter(delegate, manager);
-    const statusCommand: ToolCommand = { kind: 'get_task_status' };
+    const inspectionCommand: ToolCommand = { kind: 'inspect_workflow_run', runId: 'run-1' };
 
-    const result = await router.handleToolCall(context, 'get_task_status', statusCommand);
+    const result = await router.handleToolCall(context, 'inspect_workflow_run', inspectionCommand);
 
     expect(result).toBe(delegatedResult);
-    expect(delegate.handleToolCall).toHaveBeenCalledWith(context, 'get_task_status', statusCommand);
+    expect(delegate.handleToolCall).toHaveBeenCalledWith(
+      context,
+      'inspect_workflow_run',
+      inspectionCommand,
+    );
     expect(manager.upsert).not.toHaveBeenCalled();
   });
 

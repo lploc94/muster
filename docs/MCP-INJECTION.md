@@ -15,7 +15,7 @@
 Each turn injects **two** MCP servers:
 
 1. **`context_engine`** — user's semantic search / codebase tools.
-2. **`muster_bridge`** — extension-owned coordinator tools (task graph, status, disposition). **MCP `ask_user` is removed** — human-in-the-loop uses **ACP RFD elicitation** (root) or **`ask_parent`** (children); Grok vendor ask stays on AskBridge. See **`docs/MUSTER-BRIDGE.md`**.
+2. **`muster_bridge`** — extension-owned, workflow-only orchestration tools. The legacy delegate-task and MCP question tools are removed; root human input uses ACP RFD elicitation, and workflow correction uses `workflow_prev`. Grok vendor ask stays on AskBridge. See **`docs/MUSTER-BRIDGE.md`**.
 
 This doc covers **how** those servers are passed per CLI backend.
 
