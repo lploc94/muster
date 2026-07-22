@@ -1,6 +1,7 @@
 import { describe, expect, it, afterEach } from 'vitest';
 import { CredentialRegistry } from './credentials';
 import { formatToolError, MusterBridgeServer } from './server';
+import { DEFAULT_WORKFLOW_POLICY } from '../task/workflow';
 
 async function readJsonRpc(res: Response): Promise<Record<string, unknown> | undefined> {
   const text = await res.text();
@@ -215,6 +216,8 @@ describe('MusterBridgeServer auth', () => {
         version: 1,
         name: 'one-node',
         topology: { kind: 'one_node_v1', entryNodeId: 'entry', nodes: [{ nodeId: 'entry' }] },
+        entryContracts: [],
+        policy: DEFAULT_WORKFLOW_POLICY,
       },
     });
     expect(defined.result).not.toHaveProperty('isError', true);

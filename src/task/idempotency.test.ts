@@ -122,13 +122,13 @@ describe('stageDisposition idempotency', () => {
       stageDisposition(live, { kind: 'complete', result: 'x' }, 'op-1', {}),
     ).toEqual({
       ok: false,
-      reason: 'limits are required for complete, fail, workflow_next, workflow_prev, workflow_fail, or invoke_child_workflow dispositions',
+      reason: 'limits are required for complete, fail, workflow_next, workflow_prev, or workflow_fail dispositions',
     });
     expect(
       stageDisposition(live, { kind: 'fail', error: 'x' }, 'op-1', {}),
     ).toEqual({
       ok: false,
-      reason: 'limits are required for complete, fail, workflow_next, workflow_prev, workflow_fail, or invoke_child_workflow dispositions',
+      reason: 'limits are required for complete, fail, workflow_next, workflow_prev, or workflow_fail dispositions',
     });
   });
 

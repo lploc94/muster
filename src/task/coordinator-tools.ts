@@ -13,6 +13,11 @@ import type {
   TaskRole,
 } from './types';
 import type { VerdictCriterionInput, VerdictInput } from './verdict';
+import type {
+  StartWorkflowEntryInput,
+  WorkflowEntryContractV1,
+  WorkflowPolicyV1,
+} from './workflow-types';
 
 export interface CreateChildSpec {
   goal: string;
@@ -172,7 +177,12 @@ export type ToolCommand =
       opId: string;
       childDefinitionId: string;
       childDefinitionVersion: number;
-      entryBindings: readonly { inputRef: string; artifactId: string }[];
+      entryBindings: readonly {
+        childEntryNodeId: string;
+        inputRef: string;
+        artifactId: string;
+        artifactRevision: number;
+      }[];
       childIdempotencyKey?: string;
     }
   | { kind: 'report_progress'; opId: string; note: string }
@@ -203,6 +213,8 @@ export type ToolCommand =
       version: number;
       name: string;
       topology: unknown;
+      entryContracts: readonly WorkflowEntryContractV1[];
+      policy: WorkflowPolicyV1;
     }
   | {
       kind: 'start_workflow';
@@ -212,6 +224,7 @@ export type ToolCommand =
       startIdempotencyKey: string;
       goal?: string;
       backend?: string;
+      entryInputs: readonly StartWorkflowEntryInput[];
     };
 
 const MUTATING_TOOLS: ReadonlySet<string> = new Set([
@@ -281,6 +294,17 @@ function parseWorkflowNode(value: unknown): boolean {
   if (value.role !== undefined && value.role !== 'coordinator' && value.role !== 'worker') {
     return false;
   }
+  for (const key of ['taskType', 'backend', 'model'] as const) {
+    if (value[key] !== undefined && (typeof value[key] !== 'string' || value[key].length === 0)) {
+      return false;
+    }
+  }
+  if (
+    value.capabilities !== undefined &&
+    (!Array.isArray(value.capabilities) || value.capabilities.some((capability) => typeof capability !== 'string'))
+  ) {
+    return false;
+  }
   return true;
 }
 
@@ -316,6 +340,53 @@ function parseDefineTopology(value: unknown): unknown | undefined {
   if (value.kind === 'one_node_v1') return parseOneNodeTopology(value);
   if (value.kind === 'graph_v1') return parseGraphTopology(value);
   return undefined;
+}
+
+function parseWorkflowEntryContracts(value: unknown): WorkflowEntryContractV1[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const contracts: WorkflowEntryContractV1[] = [];
+  for (const item of value) {
+    if (!isRecord(item)) return undefined;
+    const entryNodeId = requireString(item, 'entryNodeId');
+    const inputRef = requireString(item, 'inputRef');
+    const expectedArtifactKind = requireString(item, 'expectedArtifactKind');
+    if (!entryNodeId || !inputRef || !expectedArtifactKind) return undefined;
+    contracts.push({ entryNodeId, inputRef, expectedArtifactKind });
+  }
+  return contracts;
+}
+
+function parseWorkflowPolicy(value: unknown): WorkflowPolicyV1 | undefined {
+  if (!isRecord(value)) return undefined;
+  const numericKeys = [
+    'maxFeedbackRoundsPerRun',
+    'maxTurnsPerTask',
+    'maxWorkflowTurnsPerRun',
+    'runTimeoutMs',
+    'maxDepth',
+    'maxTaskCount',
+    'maxConcurrency',
+    'maxInputsPerGate',
+    'maxArtifactBytes',
+    'maxAggregateBytes',
+  ] as const;
+  if (numericKeys.some((key) => !Number.isSafeInteger(value[key]))) return undefined;
+  if (typeof value.failWorkflow !== 'boolean') return undefined;
+  return value as unknown as WorkflowPolicyV1;
+}
+
+function parseWorkflowEntryInputs(value: unknown): StartWorkflowEntryInput[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const inputs: StartWorkflowEntryInput[] = [];
+  for (const item of value) {
+    if (!isRecord(item)) return undefined;
+    const entryNodeId = requireString(item, 'entryNodeId');
+    const inputRef = requireString(item, 'inputRef');
+    const kind = requireString(item, 'kind');
+    if (!entryNodeId || !inputRef || !kind || typeof item.value !== 'string') return undefined;
+    inputs.push({ entryNodeId, inputRef, kind, value: item.value });
+  }
+  return inputs;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -1076,25 +1147,44 @@ export function dispatch(
         if (!Array.isArray(args.entryBindings) || args.entryBindings.length === 0) {
           return { ok: false, toolError: 'entryBindings must be a non-empty array' };
         }
-        const entryBindings: { inputRef: string; artifactId: string }[] = [];
+        const entryBindings: {
+          childEntryNodeId: string;
+          inputRef: string;
+          artifactId: string;
+          artifactRevision: number;
+        }[] = [];
         const seenRefs = new Set<string>();
         for (const entry of args.entryBindings) {
           if (!isRecord(entry)) {
             return { ok: false, toolError: 'entryBindings entries must be objects' };
           }
+          const childEntryNodeId = typeof entry.childEntryNodeId === 'string'
+            ? entry.childEntryNodeId
+            : '';
           const inputRef = typeof entry.inputRef === 'string' ? entry.inputRef : '';
           const artifactId = typeof entry.artifactId === 'string' ? entry.artifactId : '';
-          if (!inputRef || !artifactId) {
+          const artifactRevision = entry.artifactRevision;
+          if (
+            !childEntryNodeId || !inputRef || !artifactId ||
+            typeof artifactRevision !== 'number' ||
+            !Number.isInteger(artifactRevision) ||
+            artifactRevision < 1
+          ) {
             return {
               ok: false,
-              toolError: 'each entryBinding requires non-empty inputRef and artifactId',
+              toolError:
+                'each entryBinding requires childEntryNodeId, inputRef, artifactId, and a positive artifactRevision',
             };
           }
-          if (seenRefs.has(inputRef)) {
-            return { ok: false, toolError: `duplicate entryBinding inputRef: ${inputRef}` };
+          const bindingKey = `${childEntryNodeId}\0${inputRef}`;
+          if (seenRefs.has(bindingKey)) {
+            return {
+              ok: false,
+              toolError: `duplicate entryBinding: ${childEntryNodeId}/${inputRef}`,
+            };
           }
-          seenRefs.add(inputRef);
-          entryBindings.push({ inputRef, artifactId });
+          seenRefs.add(bindingKey);
+          entryBindings.push({ childEntryNodeId, inputRef, artifactId, artifactRevision });
         }
         let childIdempotencyKey: string | undefined;
         if (Object.prototype.hasOwnProperty.call(args, 'childIdempotencyKey')) {
@@ -1241,7 +1331,9 @@ export function dispatch(
           return { ok: false, toolError: 'invalid define_workflow arguments' };
         }
         const topology = parseDefineTopology(args.topology);
-        if (!topology) {
+        const entryContracts = parseWorkflowEntryContracts(args.entryContracts);
+        const policy = parseWorkflowPolicy(args.policy);
+        if (!topology || !entryContracts || !policy) {
           return { ok: false, toolError: 'invalid define_workflow arguments' };
         }
         return {
@@ -1253,6 +1345,8 @@ export function dispatch(
             version: args.version,
             name,
             topology,
+            entryContracts,
+            policy,
           },
         };
       }
@@ -1267,6 +1361,10 @@ export function dispatch(
           !Number.isInteger(args.version) ||
           args.version < 1
         ) {
+          return { ok: false, toolError: 'invalid start_workflow arguments' };
+        }
+        const entryInputs = parseWorkflowEntryInputs(args.entryInputs);
+        if (!entryInputs) {
           return { ok: false, toolError: 'invalid start_workflow arguments' };
         }
         if ('goal' in args && (typeof args.goal !== 'string' || args.goal.length === 0)) {
@@ -1288,6 +1386,7 @@ export function dispatch(
             startIdempotencyKey,
             ...(typeof args.goal === 'string' ? { goal: args.goal } : {}),
             ...(typeof args.backend === 'string' ? { backend: args.backend } : {}),
+            entryInputs,
           },
         };
       }

@@ -30,8 +30,10 @@ import {
   deriveStartIdentities,
   entryNodeIds,
   fingerprintDefinition,
+  formatWorkflowEntryAggregate,
   makeGraphFanInDefinition,
   makeOneNodeDefinition,
+  maximumWorkflowEntryAggregateBytes,
   terminalNodeId,
   validateDefineWorkflow,
 } from './workflow';
@@ -40,11 +42,7 @@ describe('workflow domain (one-node define)', () => {
   it('accepts a valid one-node topology and fingerprints stably', () => {
     const def = makeOneNodeDefinition();
     const validated = validateDefineWorkflow({
-      definitionId: def.definitionId,
-      version: def.version,
-      name: def.name,
-      topology: def.topology,
-      createdAt: def.createdAt,
+      ...def,
     });
     expect(validated.ok).toBe(true);
     if (!validated.ok) return;
@@ -55,10 +53,7 @@ describe('workflow domain (one-node define)', () => {
     expect(validated.fingerprint).toBe(fingerprintDefinition(def));
     expect(validated.topologyJson).toContain('one_node_v1');
     const again = validateDefineWorkflow({
-      definitionId: def.definitionId,
-      version: def.version,
-      name: def.name,
-      topology: def.topology,
+      ...def,
       createdAt: '2099-01-01T00:00:00.000Z',
     });
     expect(again.ok && again.fingerprint).toBe(validated.fingerprint);
@@ -87,18 +82,18 @@ describe('workflow domain (one-node define)', () => {
       entryNodeId: 'a',
     }).ok).toBe(false);
     expect(decodeStoredTopologyJson('{not-json').ok).toBe(false);
+    const definition = makeOneNodeDefinition();
     expect(validateDefineWorkflow({
+      ...definition,
       definitionId: '',
-      version: 1,
       name: 'x',
-      topology: makeOneNodeDefinition().topology,
       createdAt: '2026-07-19T00:00:00.000Z',
     }).ok).toBe(false);
     expect(validateDefineWorkflow({
+      ...definition,
       definitionId: 'wf',
       version: 0,
       name: 'x',
-      topology: makeOneNodeDefinition().topology,
       createdAt: '2026-07-19T00:00:00.000Z',
     }).ok).toBe(false);
   });
@@ -118,7 +113,7 @@ describe('workflow domain (one-node define)', () => {
     expect(defineWorkflowInvalid('invalid topology')).toMatchObject({
       ok: false, conflict: true, reason: 'invalid topology',
     });
-    expect(defineWorkflowLedgerKey('wf-one', 1)).toBe('define_workflow:wf-one:1');
+    expect(defineWorkflowLedgerKey('wf-one', 1)).toBe('define_workflow:workspace:wf-one:1');
   });
 });
 
@@ -126,11 +121,7 @@ describe('workflow domain (graph_v1 multi-node topology)', () => {
   it('accepts a two-producer fan-in graph and fingerprints stably', () => {
     const def = makeGraphFanInDefinition();
     const validated = validateDefineWorkflow({
-      definitionId: def.definitionId,
-      version: def.version,
-      name: def.name,
-      topology: def.topology,
-      createdAt: def.createdAt,
+      ...def,
     });
     expect(validated.ok).toBe(true);
     if (!validated.ok) return;
@@ -144,19 +135,17 @@ describe('workflow domain (graph_v1 multi-node topology)', () => {
     expect(validated.topologyJson).toContain('graph_v1');
     expect(validated.topologyJson).toContain('inputRef');
 
-    // Fingerprint ignores createdAt and is stable under edge reorder.
+    // Fingerprint ignores createdAt but preserves frozen definition ordering.
     const reordered = makeGraphFanInDefinition();
     if (reordered.topology.kind !== 'graph_v1') return;
     const edges = [...reordered.topology.edges].reverse();
     const nodes = [...reordered.topology.nodes].reverse();
     const again = validateDefineWorkflow({
-      definitionId: reordered.definitionId,
-      version: reordered.version,
-      name: reordered.name,
+      ...reordered,
       topology: { kind: 'graph_v1', nodes, edges },
       createdAt: '2099-01-01T00:00:00.000Z',
     });
-    expect(again.ok && again.fingerprint).toBe(validated.fingerprint);
+    expect(again.ok && again.fingerprint).not.toBe(validated.fingerprint);
   });
 
   it('rejects fan-out, cycles, duplicate inputRef, missing route-to-gate, and terminal count', () => {
@@ -257,11 +246,9 @@ describe('workflow domain (graph_v1 multi-node topology)', () => {
   });
 
   it('define path freezes graph_v1 without persisting rows on invalid shapes', () => {
+    const definition = makeGraphFanInDefinition();
     const valid = validateDefineWorkflow({
-      definitionId: 'wf-fan',
-      version: 1,
-      name: 'fan-in',
-      topology: makeGraphFanInDefinition().topology,
+      ...definition,
       createdAt: '2026-07-19T00:00:00.000Z',
     });
     expect(valid.ok).toBe(true);
@@ -270,6 +257,9 @@ describe('workflow domain (graph_v1 multi-node topology)', () => {
       definitionId: 'wf-fan',
       version: 1,
       name: 'fan-in',
+      entryContracts: definition.entryContracts,
+      policy: definition.policy,
+      scope: definition.scope,
       topology: {
         kind: 'graph_v1',
         nodes: [{ nodeId: 'a' }, { nodeId: 'b' }, { nodeId: 'c' }],
@@ -282,6 +272,45 @@ describe('workflow domain (graph_v1 multi-node topology)', () => {
     });
     expect(invalid.ok).toBe(false);
     if (!invalid.ok) expect(invalid.reason).toMatch(/fan-out/i);
+  });
+
+  it('accepts the exact maximum entry aggregate and rejects one byte less', () => {
+    const definition = makeOneNodeDefinition();
+    const entryContracts = [
+      { entryNodeId: 'entry', inputRef: 'request', expectedArtifactKind: 'text' },
+    ];
+    const maxArtifactBytes = 8;
+    const exactAggregateBytes = maximumWorkflowEntryAggregateBytes(
+      entryContracts,
+      maxArtifactBytes,
+    );
+    expect(Buffer.byteLength(formatWorkflowEntryAggregate([
+      { inputRef: 'request', value: 'éééé' },
+    ]), 'utf8')).toBe(exactAggregateBytes);
+
+    const exact = validateDefineWorkflow({
+      ...definition,
+      entryContracts,
+      policy: { ...definition.policy, maxArtifactBytes, maxAggregateBytes: exactAggregateBytes },
+    });
+    expect(exact.ok).toBe(true);
+
+    const overflow = validateDefineWorkflow({
+      ...definition,
+      entryContracts,
+      policy: { ...definition.policy, maxArtifactBytes, maxAggregateBytes: exactAggregateBytes - 1 },
+    });
+    expect(overflow).toEqual({ ok: false, reason: 'entry contract aggregate exceeds policy' });
+
+    const engineStartBytes = maximumWorkflowEntryAggregateBytes([], maxArtifactBytes);
+    const emptyEntryOverflow = validateDefineWorkflow({
+      ...definition,
+      policy: { ...definition.policy, maxArtifactBytes, maxAggregateBytes: engineStartBytes - 1 },
+    });
+    expect(emptyEntryOverflow).toEqual({
+      ok: false,
+      reason: 'entry contract aggregate exceeds policy',
+    });
   });
 
 
@@ -414,6 +443,7 @@ describe('workflow domain (graph_v1 multi-node topology)', () => {
     expect(workflowRunTerminalStatusForReason('agent_fail')).toBe('failed');
     expect(workflowRunTerminalStatusForReason('invalid_route')).toBe('failed');
     expect(workflowRunTerminalStatusForReason('run_timeout')).toBe('failed');
+    expect(workflowRunTerminalStatusForReason('aggregate_too_large')).toBe('failed');
     expect(workflowRunTerminalStatusForReason('feedback_budget_exhausted')).toBe('failed');
     expect(workflowRunTerminalStatusForReason('turn_budget_exhausted')).toBe('failed');
     expect(workflowRunTerminalStatusForReason('required_target_cancelled')).toBe('cancelled');

@@ -9,7 +9,7 @@
  *   - turn budget exhaustion closes the run failed
  *   - open gates + feedback rounds flip to the terminal status
  *   - reserved-not-running turns cancel; live turns get interrupt cancelRequests
- *   - one durable workflow_run_failed attention per still-open node task
+ *   - one durable workflow_run_failed attention at the outer workflow boundary
  *   - task lifecycle stays open (unsealed)
  *   - double-close is a true no-op (fence on run status + routed message)
  *   - late NEXT after close neither reopens gates nor creates activations
@@ -429,13 +429,21 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
         WORKFLOW_RUN_BUDGET_BOUNDS.defaultMaxFeedbackRoundsPerRun,
       );
 
-      // Seed more rounds than the host-clamped default bound (count existing rows only).
+      // Seed more rounds than the host-clamped default bound with only the latest live.
       for (let i = 0; i <= budgets.maxFeedbackRoundsPerRun; i += 1) {
         await opened.client.run(
           `INSERT INTO workflow_feedback_rounds (
              workspace_id, run_id, round_id, requester_node_id, status, join_mode, created_at
            ) VALUES (?,?,?,?,?,?,?)`,
-          ['ws', data.runId, `round-seed-${i}`, 'entry', 'open', 'all', createdAt],
+          [
+            'ws',
+            data.runId,
+            `round-seed-${i}`,
+            'entry',
+            i === budgets.maxFeedbackRoundsPerRun ? 'open' : 'consumed',
+            'all',
+            createdAt,
+          ],
         );
       }
 
@@ -455,7 +463,8 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
       expect(String(after?.attention?.message ?? '')).toMatch(/feedback_budget_exhausted/);
       const rounds = await roundStatuses(opened.client, data.runId);
       expect(rounds.length).toBeGreaterThan(0);
-      expect(rounds.every((s) => s === 'failed' || s === 'open' || s === 'satisfied')).toBe(true);
+      expect(rounds.every((s) =>
+        s === 'failed' || s === 'open' || s === 'satisfied' || s === 'consumed')).toBe(true);
       // All previously open rounds must be closed failed by the atomic closure.
       const openLeft = rounds.filter((s) => s === 'open');
       expect(openLeft).toHaveLength(0);
@@ -573,15 +582,14 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
         expect(c.kind).toBe('interrupt');
       }
 
-      // Still-open node tasks carry one bounded attention and stay unsealed.
-      for (const entry of data.entries) {
-        const task = await opened.repository.getTask(entry.taskId);
-        if (!task) continue;
-        if (task.lifecycle === 'open') {
-          expect(task.attention?.code).toBe('workflow_run_failed');
-          expect(String(task.attention?.message ?? '')).toMatch(/agent_fail/);
-        }
-      }
+      // Exactly one outer-boundary task carries attention; workflow closure seals none.
+      const p1Task = await opened.repository.getTask(p1.taskId);
+      const p2Task = await opened.repository.getTask(p2.taskId);
+      expect(p1Task?.lifecycle).toBe('open');
+      expect(p2Task?.lifecycle).toBe('open');
+      expect(p1Task?.attention?.code).toBe('workflow_run_failed');
+      expect(String(p1Task?.attention?.message ?? '')).toMatch(/agent_fail/);
+      expect(p2Task?.attention).toBeUndefined();
 
       // Late NEXT on p2 after close must not reopen the run or create new activations.
       // Re-queue a turn and settle with workflow_next.
@@ -655,7 +663,55 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
       expect(p1Task?.lifecycle).toBe('open');
       expect(p2Task?.lifecycle).toBe('open');
       expect(p1Task?.attention?.code).toBe('workflow_run_failed');
-      expect(p2Task?.attention?.code).toBe('workflow_run_failed');
+      expect(p2Task?.attention).toBeUndefined();
+    } finally {
+      await opened.close();
+    }
+  }, 45_000);
+
+  it('premature succeeded, failed, and skipped lifecycle seals close the workflow as unavailable', async () => {
+    const opened = await openRepo('lifecycle-unavailable');
+    try {
+      const createdAt = '2026-07-22T12:00:00.000Z';
+      for (const [index, lifecycle] of (['succeeded', 'failed', 'skipped'] as const).entries()) {
+        const data = await defineAndStartOneNode(
+          opened.repository,
+          createdAt,
+          `lifecycle-unavailable-${lifecycle}`,
+          `wf-lifecycle-unavailable-${lifecycle}`,
+        );
+        const task = await opened.repository.getTask(data.entryTaskId);
+        const turn = await opened.repository.getTurn(data.activationTurnId);
+        expect(task).toBeTruthy();
+        expect(turn).toBeTruthy();
+        const at = `2026-07-22T12:0${index + 1}:00.000Z`;
+        await expect(opened.repository.execute({
+          kind: 'applyTaskLifecycle',
+          workspaceId: 'ws',
+          taskId: task!.id,
+          expectedTaskRevision: task!.revision,
+          task: {
+            ...task!,
+            lifecycle,
+            revision: task!.revision + 1,
+            updatedAt: at,
+          },
+          turns: [{ ...turn!, status: 'cancelled', finishedAt: at }],
+          expectedTurns: [{ id: turn!.id, status: 'queued' }],
+        })).resolves.toMatchObject({ ok: true, changed: true });
+        await expect(opened.client.get<{ status: string; terminal_reason_code: string }>(
+          `SELECT status, terminal_reason_code FROM workflow_runs
+            WHERE workspace_id = ? AND run_id = ?`,
+          ['ws', data.runId],
+        )).resolves.toEqual({
+          status: 'failed',
+          terminal_reason_code: 'required_target_unavailable',
+        });
+        await expect(opened.repository.getTask(task!.id)).resolves.toMatchObject({ lifecycle });
+        expect((await gateStatuses(opened.client, data.runId)).every(
+          (status) => status !== 'open' && status !== 'satisfied',
+        )).toBe(true);
+      }
     } finally {
       await opened.close();
     }

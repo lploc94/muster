@@ -32,7 +32,7 @@ afterEach(async () => {
 });
 
 describe('DbClient <-> worker RPC', () => {
-  it('opens a DB, migrates, and round-trips a run/get', async () => {
+  it('opens a DB and round-trips a run/get', async () => {
     const client = makeClient();
     await client.open(tempDbPath());
     expect(await client.pragma('user_version')).toBe(SQLITE_SCHEMA_VERSION);

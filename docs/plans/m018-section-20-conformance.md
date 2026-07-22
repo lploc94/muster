@@ -9,24 +9,39 @@ Executable traceability table: `src/task/m018-section20-traceability.ts`
 
 ### Implementation Progress
 
-Completed in the initial conformance slice:
+Completed across the current conformance slices:
 
 - Added the executable requirement-to-test traceability table and coverage guard.
-- Added a frozen schema-v9 manifest while preserving the v7 and v8 manifests.
-- Added explicit v7-to-v8 and v8-to-v9 dispatch, rollback tests, version-specific backup verification, and relational workflow authority primitives.
+- Added relational workflow authority primitives.
 - Added durable universal disposition claims with cross-family exclusion, replay/conflict behavior, and consumed/discarded settlement state.
-- Added relational backend-session ownership and active task/epoch bindings with migration backfill and fail-closed projection checks.
+- Added relational backend-session ownership and active task/epoch bindings with fail-closed projection checks.
 - Added logical activation rows for entry, dependency-gate, and feedback-resume turns plus scheduler and SQL terminal-run guards.
 - Fixed top-level one-node terminal `NEXT`.
 - Moved dependency and feedback aggregate construction into the SQLite settlement transaction and corrected feedback `satisfied -> consumed` timing.
+- Replaced the internal fourth child-invocation outcome with a `workflow_next` child route while retaining `invoke_child_workflow` only as the public command name.
+- Made workflow mutation capabilities contextual to a live durable activation and added execution-time plus SQLite staging authorization guards.
+- Added root and workflow-node child callers, dedicated relational return gates, typed continuation results, caller-chain failure/cancellation propagation, and reload-safe single resume.
+- Made child bindings name the exact child entry node, input ref, artifact lineage, and artifact revision; staging now rejects missing definitions, foreign scope, stale pins, kind mismatches, and incomplete contract coverage before writing a disposition claim.
+- Routed multi-entry child bindings into their named entry gates and generated one exact per-entry aggregate rather than pinning every input to the primary entry.
+- Added public top-level and child-start checks for workspace trust, frozen root scope, task-type resolution, backend availability/MCP support, models, role/capability requirements, depth/count capacity, and host-clamped effective run limits before any start mutation.
+- Applied host-policy requirement validation to workflow definition persistence before any definition row is written.
+- Added transaction-time retention pins for active workflow tasks, recoverable activations, open/satisfied gates and rounds, pending/resolved continuations, caller/child return evidence, staged dispositions, immutable artifact provenance, and their turn-scoped operation records.
+- Enforced exact UTF-8 aggregate limits for dependency fan-in and feedback joins inside the settlement transaction and for child returns against the frozen caller/child policy; exact-limit aggregates queue once, while one-byte overflow records `aggregate_too_large`, closes the run, and creates no destination activation.
+- Added one canonical length-framed entry aggregate encoder, exact worst-case definition validation for contracted and engine-start entries, and deterministic `aggregate_too_large` caller closure when a child effective policy cannot bound its entry framing.
+- Added deterministic feedback-request and resume activations, stable relational target/base/response pins, inherited outer response authority, and relational aggregate reads; `A -> B -> C` nested PREV now survives reload and returns updated or unchanged authority to the outer requester exactly once.
+- Removed the duplicate dependency-gate representation of child returns; dedicated return gates and continuations now move `satisfied/resolved -> consumed` together when the caller return turn settles.
+- Replaced partial failure and cancellation paths with one recursive run-lineage closure plan that closes caller and descendant runs, gates, rounds, activations, return gates, and continuations in the initiating transaction; every child boundary receives one typed failed/cancelled result, queued turns cancel, live turns receive interrupts, and only the outer boundary receives attention.
+- Integrated lifecycle authority with recursive closure: authorized cancellation retains its existing task cascade while closing orchestration cancelled, and premature `succeeded`, `failed`, or `skipped` seals close the still-running workflow as `required_target_unavailable` without granting workflow code lifecycle authority.
 
-Still required before Phase 1 or the overall plan may be marked complete:
+Still required before the overall plan may be marked complete:
 
-- Verified automatic pre-migration backup receipt before any v8 mutation.
-- All-or-nothing valid-run copy and deterministic invalid-v8 quarantine.
-- Full artifact source-variant hydration and constraints for every runtime write.
-- Remaining definition/run policy, caller, owner, deadline, continuation-result, return-gate, and migration fields.
-- Remaining Phase 0 behavioral tests and Phases 2-13 work.
+- Remove the remaining pre-transaction workflow planning reads by moving all eligibility and aggregate decisions behind the SQLite write lock.
+- Complete timeout/recovery, terminal workflow-history pruning and diagnostics, scheduler/session authority, and adversarial two-client race coverage.
+- Finish the requirement traceability table and Phases 8-13 verification evidence.
+
+Development compatibility decision (2026-07-22): this branch intentionally supports
+only a fresh current schema. Older development stores are rejected with reset guidance;
+there is no schema migration, quarantine, compatibility manifest, or migration backup path.
 
 ## 1. Objective
 
@@ -57,7 +72,7 @@ All conditions below are mandatory.
 7. Every logical task owns exactly one backend conversation and no committed backend session is owned by two tasks.
 8. A three-level child workflow succeeds, fails, cancels, times out, reloads, and redelivers without losing or duplicating a continuation.
 9. Exact budget boundaries are tested; implementations may not pass by seeding counts beyond the limit.
-10. The full test suite, TypeScript compile, webview build, schema migration tests, and new concurrency tests pass from a clean database and an upgraded schema-v8 database.
+10. The full test suite, TypeScript compile, webview build, current-schema tests, and new concurrency tests pass from a clean database.
 
 ## 4. Anti-shortcut Rules
 
@@ -77,7 +92,7 @@ Implementation agents must not use any of the following approaches.
 - Do not make tests pass by weakening assertions to accept artifact placeholders, missing values, open terminal gates, or silently dropped outcomes.
 - Do not retain hard-coded workflow policies such as `maxTurns: 10` when the frozen run policy is authoritative.
 - Do not expose workflow mutation tools to a task solely because the tool is in `ANY_TASK_ACTIONS`.
-- Do not skip migration coverage by editing the frozen schema-v8 definition in place.
+- Do not add migration or backward-compatibility machinery during this development phase.
 
 ## 5. Additional Audit Findings
 
@@ -380,13 +395,12 @@ Forbidden shortcuts:
 - Do not start implementation until test names and requirement mapping are reviewed.
 - Do not replace end-to-end repository/engine tests with only unit tests for ID helpers.
 
-### Phase 1: Schema V9 And Integrity Constraints
+### Phase 1: Current Schema And Integrity Constraints
 
 Required work:
 
-- Add a frozen schema-v9 manifest and migration; do not edit frozen schema-v8 statements or fingerprints.
-- Preserve `SCHEMA_V8_STATEMENTS` as a recognized migration-input fingerprint and add explicit v7-to-v8 and v8-to-v9 dispatch in connection bootstrap rather than retaining a single hard-coded v7-to-current path.
-- Register schema-v9 application/user version, required objects, indexes, writer-guard triggers, and golden fingerprint checks for both fresh creation and upgraded stores.
+- Maintain one current schema manifest for fresh creation only; incompatible development stores require explicit reset.
+- Register the current application/user marker, required objects, indexes, writer-guard triggers, and golden fingerprint checks.
 - Add owner/caller/policy/deadline/terminal-result fields for definitions and runs.
 - Normalize entry contracts and any topology data needed by transactional routing.
 - Add logical activation persistence.
@@ -395,27 +409,19 @@ Required work:
 - Add continuation caller/result/resume fields.
 - Add dedicated relational return gates for callers with or without a caller workflow run.
 - Add durable authoritative session ownership/binding by task, runtime epoch, backend, and session ID.
-- Add durable universal turn-disposition claims and consumption/discard status; migrate/hydrate the existing turn disposition projection without leaving two authoritative stores.
+- Add durable universal turn-disposition claims and consumption/discard status without leaving two authoritative stores.
 - Enforce unique task-to-workflow-node ownership.
 - Enforce one fill per gate/inputRef and valid artifact/binding references.
 - Enforce artifact lineage uniqueness.
 - Add indexes for scheduler terminal-run checks, timeout scans, open round lookup, pending continuation lookup, and recursive parent traversal.
-- Define an all-or-nothing v8 run classification before copying data into stricter v9 tables. A run is migratable only when task ownership, gates/fills, artifacts, feedback identities, child continuation linkage, and required relational provenance are all uniquely provable from v8 rows.
-- For each non-migratable run, copy no active workflow rows into v9. Persist only bounded quarantine metadata `(legacyRunId, originalStatus, reasonCode, rowCounts, quarantinedAt)`, mark associated queued turns non-runnable, and create bounded owner/workspace attention only when ownership is unambiguous. Never deduplicate, choose a first row, synthesize missing identities, or guess artifact provenance.
-- Require a verified pre-migration SQLite backup before v8-to-v9 mutation. Invalid raw v8 evidence remains recoverable from that backup; active v9 stores only bounded quarantine metadata and never forces malformed rows through v9 constraints.
 
 Mandatory pass conditions:
 
-- Fresh schema creation and v8-to-v9 migration both pass golden schema tests.
-- Migration is atomic and rollback-safe under injected failure.
-- V8-to-v9 migration cannot begin without a successfully verified pre-migration backup receipt; backup failure leaves the v8 database byte-for-byte unchanged.
-- Connection preflight recognizes complete owned v7, v8, and v9 stores, dispatches exactly one required migration path, and rechecks the v9 fingerprint before commit.
-- Populated valid v8 workflow fixtures migrate all-or-nothing with stable identities.
-- Fixtures with duplicate fills, duplicate task ownership, missing artifact rows, JSON-only contradictory feedback identities, partial child continuations, and terminal runs with queued work are quarantined deterministically without preventing database open.
-- Existing valid v8 workflow rows migrate deterministically; invalid runs are quarantined and made non-runnable rather than guessed into a valid v9 run.
+- Fresh schema creation passes the golden schema test.
+- Connection preflight rejects any non-current owned schema without mutation and returns reset guidance.
 - Duplicate task ownership, duplicate gate input fills, nonexistent artifact pins, duplicate session ownership, and mismatched feedback target identity fail with bounded repository errors.
 - Artifact source-variant constraints reject rows with zero sources, multiple sources, a caller turn owned by another task, or workflow producer fields inconsistent with the run/node/task/turn.
-- Foreign-key checks pass after migration.
+- Foreign-key checks pass after fresh creation and adversarial protocol tests.
 
 Forbidden shortcuts:
 
@@ -697,7 +703,7 @@ Required work:
 - Allow retention only after the workflow references are consumed or terminal and diagnostics policy permits deletion.
 - Project bounded run policy/status/reason, exact active gate, round progress, activation, and all continuation states needed for recovery.
 - Keep artifact bodies and prompt text out of status projection.
-- Add integrity diagnostics for impossible migrated/corrupt workflow states.
+- Add integrity diagnostics for impossible or corrupt workflow states.
 
 Mandatory pass conditions:
 
@@ -741,7 +747,7 @@ Forbidden shortcuts:
 Required work:
 
 - Run the section-20 traceability suite.
-- Run all M018 named flows plus the full repository, engine, scheduler, schema, migration, retention, capability, and bridge tests.
+- Run all M018 named flows plus the full repository, engine, scheduler, schema, retention, capability, and bridge tests.
 - Run the entire project test suite and compile/build commands.
 - Perform a final code review against the normative text, not only this plan.
 - Produce a workflow mutation inventory covering define, start, staging, settlement variants, recovery, lifecycle closure, timeout reaper, scheduler claim, retention, and projection. For every entry, record its authoritative transaction, relational guard identities, same-key replay test, different-fingerprint conflict test, cancellation race test, and reload test.
@@ -750,7 +756,7 @@ Mandatory pass conditions:
 
 - `npm test` passes.
 - `npm run compile` passes.
-- All schema migration and fault-injection tests pass.
+- All current-schema and fault-injection tests pass.
 - No skipped, focused, quarantined, or timing-dependent workflow test remains.
 - The mutation inventory proves every correctness-critical decision is guarded inside one repository/worker transaction, including a race where a conflicting mutation commits after any preliminary read but before lock acquisition.
 - Supplemental searches find no known old `planWorkflow*` pre-read pattern, separate child-invocation base disposition, hard-coded workflow policy, or detached `parentId: null`; search results are not accepted as the primary proof.
@@ -781,7 +787,7 @@ The final suite must include these named scenarios so coverage cannot be satisfi
 18. `same child key across callers remains isolated`
 19. `stale NEXT racing cancellation is harmless`
 20. `reload at every gate/round/continuation state is idempotent`
-21. `v8 valid migration and invalid-run quarantine fixtures`
+21. `older development schema is rejected with reset guidance`
 22. `root return gate rejects foreign caller and child identities`
 23. `explicit activation recovery replay conflict and cancellation race`
 24. `child entry PREV fails without crossing continuation`
@@ -817,7 +823,7 @@ Every implementation PR or commit series must answer all questions below with co
 
 When implementation is complete, append an evidence section containing:
 
-- Final schema version and migration test names.
+- Current schema and reset-rejection test names.
 - Requirement-to-test traceability link.
 - Full test and compile command outputs.
 - Concurrency/fault test results.

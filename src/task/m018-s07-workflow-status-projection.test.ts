@@ -292,7 +292,7 @@ describe('M018 S07 bounded workflow status projection', () => {
           createdAt,
         ],
       );
-      // Use a distinct child task; schema v9 forbids one task belonging to two runs.
+      // Use a distinct child task; workflow ownership forbids one task belonging to two runs.
       const p2 = parentStart.entries.find((e) => e.nodeId === 'p2')!;
       const parentTask = await ctx.repository.getTask(p2.taskId);
       const childTaskId = 's07-child-projection-task';

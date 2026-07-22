@@ -14,7 +14,7 @@ describe('M018 section 20 requirement traceability', () => {
   it('uses named observable tests or structural proofs for every requirement', () => {
     for (const item of SECTION_20_TRACEABILITY) {
       expect(item.targetTest.trim().length).toBeGreaterThan(8);
-      expect(['behavior', 'constraint', 'migration']).toContain(item.proof);
+      expect(['behavior', 'constraint']).toContain(item.proof);
       expect(['planned', 'implemented']).toContain(item.status);
     }
   });

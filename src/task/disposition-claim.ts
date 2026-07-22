@@ -26,7 +26,6 @@ function dispositionIdentity(disposition: TurnDisposition): Pick<
     case 'idle':
       return { family: 'ordinary', kind: 'idle' };
     case 'workflow_next':
-    case 'invoke_child_workflow':
       return { family: 'workflow', kind: 'next' };
     case 'workflow_prev':
       return { family: 'workflow', kind: 'prev' };

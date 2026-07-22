@@ -1,6 +1,6 @@
 /**
  * M018 S01 named flow:
- * populated v7 migration → public bridge define/start → one ordinary queued entry turn.
+ * fresh store → public bridge define/start → one ordinary queued entry turn.
  * Uses real SQLite worker + authenticated MCP dispatch + existing scheduler readiness.
  */
 import { describe, expect, it } from 'vitest';
@@ -15,9 +15,9 @@ import { parseTaskTypeRegistry } from './task-types';
 import { SqliteTaskRepository } from './repository';
 import { canPromoteTurn } from './scheduler';
 import { DbClient } from './sqlite/client';
-import { writePopulatedV7Fixture, POPULATED_V7_FIXTURE_MARKER } from './sqlite/v7-fixture';
 import type { TaskStoreFile } from './types';
 import {
+  DEFAULT_WORKFLOW_POLICY,
   deriveStartIdentities,
   fingerprintStartWorkflow,
   makeOneNodeDefinition,
@@ -71,7 +71,7 @@ describe('M018 S01 one-node workflow activation', () => {
     expect(ids.runId).toMatch(/^wfr_/);
     expect(ids.activationTurnId).toMatch(/^wftn_/);
     expect(ids.entryTaskId).toMatch(/^wft_/);
-    expect(startWorkflowLedgerKey('start-key-1')).toBe('start_workflow:start-key-1');
+    expect(startWorkflowLedgerKey('start-key-1')).toBe('start_workflow:workspace:start-key-1');
     expect(
       fingerprintStartWorkflow({
         definitionId: def.definitionId,
@@ -375,10 +375,9 @@ describe('M018 S01 one-node workflow activation', () => {
     }
   }, 30_000);
 
-  it('M018 S01 flow: populated v7 migration to one-node workflow activation', async () => {
+  it('M018 S01 flow: public one-node workflow activation on a fresh store', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m018-s01-named-'));
     const dbPath = path.join(dir, 'muster.sqlite3');
-    const fixture = writePopulatedV7Fixture(dbPath);
     const client = new DbClient({
       workerPath: path.join(__dirname, 'sqlite', 'worker.ts'),
       execArgv: ['--import', 'tsx'],
@@ -390,16 +389,6 @@ describe('M018 S01 one-node workflow activation', () => {
     });
     try {
       await client.open(dbPath);
-      // Migration preserved the fixture marker message on the owned v7 workspace.
-      const markers = await client.all(
-        `SELECT content FROM messages WHERE workspace_id = ? AND content = ?`,
-        [fixture.workspaceId, POPULATED_V7_FIXTURE_MARKER],
-      );
-      expect(markers).toHaveLength(1);
-
-      // Public define/start runs in a fresh workspace on the same migrated DB so
-      // the proof is vertical (v7→v8 store + bridge activation) without coupling
-      // to fixture payload shapes that only exist for migration data survival.
       const workspaceId = 'ws-m018-s01-bridge';
       const repository = new SqliteTaskRepository(client, workspaceId);
       await repository.execute({
@@ -453,6 +442,7 @@ describe('M018 S01 one-node workflow activation', () => {
         callerTaskId: taskId,
         turnId,
         allowedActions: new Set(['define_workflow', 'start_workflow', 'get_task_status']),
+        attemptId: 'att-s01',
         ttlMs: 60_000,
       });
       const context = credentials.verify(token)!;
@@ -470,6 +460,10 @@ describe('M018 S01 one-node workflow activation', () => {
           version: 1,
           name: 'public-one-node',
           topology,
+          entryContracts: [
+            { entryNodeId: 'entry', inputRef: 'request', expectedArtifactKind: 'text' },
+          ],
+          policy: DEFAULT_WORKFLOW_POLICY,
         },
         context,
       );
@@ -491,6 +485,9 @@ describe('M018 S01 one-node workflow activation', () => {
           startIdempotencyKey: 'public-start-1',
           goal: 'activate one-node via bridge',
           backend: 'grok',
+          entryInputs: [
+            { entryNodeId: 'entry', inputRef: 'request', kind: 'text', value: 'review this change' },
+          ],
         },
         context,
       );
@@ -522,9 +519,71 @@ describe('M018 S01 one-node workflow activation', () => {
       const entryTask = await repository.getTask(payload.entryTaskId);
       expect(entryTask).toMatchObject({
         id: payload.entryTaskId,
+        parentId: taskId,
         releaseState: 'released',
         lifecycle: 'open',
         backend: 'grok',
+      });
+      expect(
+        await client.get(
+          `SELECT owner_root_task_id, caller_task_id, caller_turn_id, policy_json,
+                  started_at, deadline_at
+             FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
+          [workspaceId, payload.runId],
+        ),
+      ).toMatchObject({
+        owner_root_task_id: taskId,
+        caller_task_id: taskId,
+        caller_turn_id: turnId,
+        policy_json: JSON.stringify({
+          ...DEFAULT_WORKFLOW_POLICY,
+          maxDepth: 7,
+          maxTaskCount: 32,
+          maxConcurrency: 15,
+        }),
+        started_at: expect.any(String),
+        deadline_at: expect.any(String),
+      });
+      expect(
+        await client.get(
+          `SELECT artifact.kind, artifact.payload_json, source.source_kind,
+                  source.caller_task_id, source.caller_turn_id
+             FROM workflow_artifacts artifact
+             JOIN workflow_artifact_sources source
+               ON source.workspace_id = artifact.workspace_id
+              AND source.run_id = artifact.run_id
+              AND source.artifact_id = artifact.artifact_id
+              AND source.artifact_revision = artifact.revision
+            WHERE artifact.workspace_id = ? AND artifact.run_id = ?`,
+          [workspaceId, payload.runId],
+        ),
+      ).toMatchObject({
+        kind: 'text',
+        payload_json: expect.stringContaining('review this change'),
+        source_kind: 'caller_turn',
+        caller_task_id: taskId,
+        caller_turn_id: turnId,
+      });
+      expect(
+        await client.get(
+          `SELECT content FROM messages WHERE workspace_id = ? AND id = ?`,
+          [workspaceId, payload.entryMessageId],
+        ),
+      ).toMatchObject({
+        content: '[workflow-entry]\ninputRef="request" utf8Bytes=18\nreview this change',
+      });
+      expect(
+        await client.get(
+          `SELECT definition_id, definition_version, fingerprint, run_id
+             FROM workflow_start_claims
+            WHERE workspace_id = ? AND owner_task_id = ? AND caller_task_id = ?`,
+          [workspaceId, taskId, taskId],
+        ),
+      ).toMatchObject({
+        definition_id: 'wf-public',
+        definition_version: 1,
+        fingerprint: expect.any(String),
+        run_id: payload.runId,
       });
 
       const file: TaskStoreFile = {
@@ -548,6 +607,9 @@ describe('M018 S01 one-node workflow activation', () => {
           startIdempotencyKey: 'public-start-1',
           goal: 'activate one-node via bridge',
           backend: 'grok',
+          entryInputs: [
+            { entryNodeId: 'entry', inputRef: 'request', kind: 'text', value: 'review this change' },
+          ],
         },
         context,
       );

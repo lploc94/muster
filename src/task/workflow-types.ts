@@ -13,8 +13,16 @@ export interface WorkflowNodeSpecV1 {
   nodeId: string;
   /** Optional human label; never used as identity. */
   label?: string;
-  /** Optional role hint for later slices; S01 ignores routing. */
+  /** Required host role when specified. */
   role?: 'coordinator' | 'worker';
+  /** Optional configured task type requirement resolved before run creation. */
+  taskType?: string;
+  /** Optional exact backend requirement. */
+  backend?: string;
+  /** Optional exact backend model requirement. */
+  model?: string;
+  /** Host-issued task capabilities required by this node. */
+  capabilities?: readonly string[];
 }
 
 /**
@@ -36,6 +44,8 @@ export interface WorkflowDependencyEdgeV1 {
   toNodeId: string;
   /** Destination gate input ref frozen on the definition. */
   inputRef: string;
+  /** Exact v1 artifact kind accepted by the destination binding. */
+  expectedArtifactKind?: string;
 }
 
 /**
@@ -52,12 +62,37 @@ export interface GraphTopologyV1 {
 /** Union of supported frozen topologies. */
 export type WorkflowTopologyV1 = OneNodeTopologyV1 | GraphTopologyV1;
 
+/** Explicit caller-input contract for one workflow entry. */
+export interface WorkflowEntryContractV1 {
+  entryNodeId: string;
+  inputRef: string;
+  expectedArtifactKind: string;
+}
+
+/** Frozen, host-bounded workflow policy. */
+export interface WorkflowPolicyV1 {
+  maxFeedbackRoundsPerRun: number;
+  maxTurnsPerTask: number;
+  maxWorkflowTurnsPerRun: number;
+  runTimeoutMs: number;
+  maxDepth: number;
+  maxTaskCount: number;
+  maxConcurrency: number;
+  maxInputsPerGate: number;
+  maxArtifactBytes: number;
+  maxAggregateBytes: number;
+  failWorkflow: boolean;
+}
+
 /** Immutable workflow definition identity + topology. */
 export interface WorkflowDefinitionV1 {
   definitionId: string;
   version: number;
   name: string;
   topology: WorkflowTopologyV1;
+  entryContracts: readonly WorkflowEntryContractV1[];
+  policy: WorkflowPolicyV1;
+  scope: { kind: 'workspace' } | { kind: 'root'; ownerRootTaskId: string };
   createdAt: string;
 }
 
@@ -93,7 +128,18 @@ export interface DefineWorkflowInput {
   version: number;
   name: string;
   topology: unknown;
+  entryContracts: unknown;
+  policy: unknown;
+  scope?: { kind: 'workspace' } | { kind: 'root'; ownerRootTaskId: string };
   createdAt: string;
+}
+
+/** Caller-authored value bound to one exact entry contract at start. */
+export interface StartWorkflowEntryInput {
+  entryNodeId: string;
+  inputRef: string;
+  kind: string;
+  value: string;
 }
 
 /**
@@ -124,6 +170,16 @@ export interface StartWorkflowInput {
   goal?: string;
   /** Optional backend id for the entry task; defaults at the repository boundary. */
   backend?: string;
+  /** Exact caller values for every declared entry contract. */
+  entryInputs?: readonly StartWorkflowEntryInput[];
+  /** Frozen definition contracts loaded by the repository. */
+  entryContracts?: readonly WorkflowEntryContractV1[];
+  /** Caller/root authority included in fingerprint and identity derivation. */
+  ownerRootTaskId?: string;
+  callerTaskId?: string;
+  callerTurnId?: string;
+  /** Frozen effective policy copied onto the run. */
+  policy?: WorkflowPolicyV1;
 }
 
 /** Per-entry activation identities created when an entry gate is satisfied at start. */
@@ -133,6 +189,7 @@ export interface StartEntryActivation {
   gateId: string;
   activationTurnId: string;
   messageId: string;
+  activationId: string;
 }
 
 /** Per-node dependency gate identity (entry and non-entry). */
@@ -157,6 +214,12 @@ export interface StartWorkflowIdentities {
   nodeGates: readonly StartNodeGate[];
   /** Entry activations only (engine_start satisfied + queued turn). */
   entries: readonly StartEntryActivation[];
+  /** One engine/caller artifact identity per exact entry input. */
+  entryArtifacts: readonly {
+    entryNodeId: string;
+    inputRef: string;
+    artifactId: string;
+  }[];
 }
 
 /** Shared success fields for start (created or replay). */
@@ -174,6 +237,11 @@ export interface StartWorkflowSuccessFields {
   fingerprint: string;
   nodeGates: readonly StartNodeGate[];
   entries: readonly StartEntryActivation[];
+  entryArtifacts: readonly {
+    entryNodeId: string;
+    inputRef: string;
+    artifactId: string;
+  }[];
 }
 
 /** Bounded result of startWorkflowRun. */
@@ -200,13 +268,15 @@ export type StartWorkflowResult =
     };
 
 
-/** M018 S06: agent-supplied entry binding for invoke_child_workflow (ids only). */
+/** M018 S06: agent-supplied exact child entry and artifact revision binding. */
 export interface InvokeChildEntryBinding {
+  childEntryNodeId: string;
   inputRef: string;
   artifactId: string;
+  artifactRevision: number;
 }
 
-/** M018 S06: surface payload for staging invoke_child_workflow (no SQL/paths/bodies). */
+/** M018 S06: public child-route command payload (no SQL/paths/bodies). */
 export interface InvokeChildWorkflowInput {
   childDefinitionId: string;
   childDefinitionVersion: number;
@@ -256,4 +326,3 @@ export interface WorkflowTaskStatusProjection {
   /** Active (pending) continuation for this run, if any. */
   continuation?: WorkflowContinuationStatusProjection;
 }
-

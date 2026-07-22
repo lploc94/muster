@@ -36,6 +36,7 @@ import { pickRunnableTurns } from './scheduler';
 import { DbClient } from './sqlite/client';
 import type { TaskStoreFile, TurnDisposition } from './types';
 import {
+  DEFAULT_WORKFLOW_POLICY,
   deriveFeedbackResumeTurnId,
   deriveFeedbackRoundId,
   deriveFeedbackTargetTurnId,
@@ -263,6 +264,11 @@ async function defineVersion(
   definitionId: string,
   name: string,
   topology: unknown,
+  entryContracts?: readonly {
+    entryNodeId: string;
+    inputRef: string;
+    expectedArtifactKind: string;
+  }[],
 ): Promise<void> {
   const def = await repository.execute({
     kind: 'defineWorkflowVersion',
@@ -271,6 +277,7 @@ async function defineVersion(
     version: 1,
     name,
     topology,
+    ...(entryContracts ? { entryContracts } : {}),
     createdAt,
   });
   expect(def.ok).toBe(true);
@@ -348,6 +355,8 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
       version: 1,
       name: 'canonical',
       topology: CANONICAL_TOPOLOGY,
+      entryContracts: [],
+      policy: DEFAULT_WORKFLOW_POLICY,
       createdAt: '2026-07-21T00:00:00.000Z',
     });
     expect(validated.ok).toBe(true);
@@ -382,6 +391,8 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
         version: 1,
         name: 'canonical-research',
         topology: CANONICAL_TOPOLOGY,
+        entryContracts: [],
+        policy: DEFAULT_WORKFLOW_POLICY,
       },
       ctx,
     );
@@ -421,6 +432,10 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
         'wf-canonical',
         'canonical-research',
         CANONICAL_TOPOLOGY,
+        [
+          { entryNodeId: 'r1', inputRef: 'research_one', expectedArtifactKind: 'engine_start' },
+          { entryNodeId: 'r2', inputRef: 'research_two', expectedArtifactKind: 'engine_start' },
+        ],
       );
       const caller = await startOneNode(
         opened.repository,
@@ -437,13 +452,28 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
         caller.entryTaskId,
         caller.activationTurnId,
         {
-          kind: 'invoke_child_workflow',
-          childDefinitionId: 'wf-canonical',
-          childDefinitionVersion: 1,
-          entryBindings: [
-            { inputRef: 'engine_start', artifactId: caller.startArtifactId },
-          ],
-          childIdempotencyKey: 's07-canonical-child-1',
+          kind: 'workflow_next',
+          change: 'updated',
+          route: {
+            kind: 'child_workflow',
+            childDefinitionId: 'wf-canonical',
+            childDefinitionVersion: 1,
+            entryBindings: [
+              {
+                childEntryNodeId: 'r1',
+                inputRef: 'research_one',
+                artifactId: caller.startArtifactId,
+                artifactRevision: 1,
+              },
+              {
+                childEntryNodeId: 'r2',
+                inputRef: 'research_two',
+                artifactId: caller.startArtifactId,
+                artifactRevision: 1,
+              },
+            ],
+            childIdempotencyKey: 's07-canonical-child-1',
+          },
         },
         '2026-07-21T12:00:01.000Z',
       );
@@ -462,66 +492,56 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
         ['ws', caller.runId],
       );
 
-      // If multi-entry child invoke is unsupported, fall back to top-level canonical
-      // start so the assembled forward/PREV/projection protocol still proves.
-      let childRunId: string;
-      let r1TaskId: string;
-      let r1TurnId: string;
-      let r2TaskId: string;
-      let r2TurnId: string;
-      let usedChildInvoke = false;
+      expect(children).toHaveLength(1);
+      expect(children[0]!.definition_id).toBe('wf-canonical');
+      const childRunId = children[0]!.run_id;
+      expect(children[0]!.origin).toBe('child');
+      expect(children[0]!.parent_run_id).toBe(caller.runId);
 
-      if (children.length === 1 && children[0]!.definition_id === 'wf-canonical') {
-        usedChildInvoke = true;
-        childRunId = children[0]!.run_id;
-        expect(children[0]!.origin).toBe('child');
-        expect(children[0]!.parent_run_id).toBe(caller.runId);
-
-        // Child entries r1/r2 should activate at start (multi-entry).
-        const entryRows = await opened.client.all<{
-          node_id: string;
-          task_id: string | null;
-        }>(
-          `SELECT node_id, task_id FROM workflow_nodes
-            WHERE workspace_id = ? AND run_id = ? AND node_id IN ('r1','r2')
-            ORDER BY node_id`,
-          ['ws', childRunId],
-        );
-
-        // If invoke started the run but did not activate multi-entry nodes, start
-        // a top-level canonical run for the protocol body and keep parent continuation
-        // assertions only when the child path fully activated.
-        const activated = entryRows.filter((r) => r.task_id);
-        if (activated.length < 2) {
-          usedChildInvoke = false;
-        } else {
-          r1TaskId = entryRows.find((r) => r.node_id === 'r1')!.task_id as string;
-          r2TaskId = entryRows.find((r) => r.node_id === 'r2')!.task_id as string;
-          const r1Turns = await opened.repository.listTurns(r1TaskId);
-          const r2Turns = await opened.repository.listTurns(r2TaskId);
-          expect(r1Turns.length).toBeGreaterThanOrEqual(1);
-          expect(r2Turns.length).toBeGreaterThanOrEqual(1);
-          r1TurnId = r1Turns[0]!.id;
-          r2TurnId = r2Turns[0]!.id;
-        }
-      }
-
-      if (!usedChildInvoke) {
-        // Top-level canonical start (same graph protocol; parent return covered by S06).
-        const top = await startCanonicalChildAsTopLevel(
-          opened.repository,
-          '2026-07-21T12:00:02.000Z',
-          's07-canonical-top-1',
-        );
-        childRunId = top.runId;
-        const byNode = new Map(top.entries.map((e) => [e.nodeId, e]));
-        expect(byNode.get('r1')).toBeTruthy();
-        expect(byNode.get('r2')).toBeTruthy();
-        r1TaskId = byNode.get('r1')!.taskId;
-        r1TurnId = byNode.get('r1')!.activationTurnId;
-        r2TaskId = byNode.get('r2')!.taskId;
-        r2TurnId = byNode.get('r2')!.activationTurnId;
-      }
+      const entryRows = await opened.client.all<{
+        node_id: string;
+        task_id: string | null;
+      }>(
+        `SELECT node_id, task_id FROM workflow_nodes
+          WHERE workspace_id = ? AND run_id = ? AND node_id IN ('r1','r2')
+          ORDER BY node_id`,
+        ['ws', childRunId],
+      );
+      expect(entryRows).toHaveLength(2);
+      expect(entryRows.every((row) => row.task_id !== null)).toBe(true);
+      const gateFills = await opened.client.all<{ node_id: string; input_ref: string }>(
+        `SELECT gate.consumer_node_id AS node_id, fill.input_ref
+           FROM workflow_dependency_gates gate
+           JOIN workflow_gate_fills fill
+             ON fill.workspace_id = gate.workspace_id
+            AND fill.run_id = gate.run_id
+            AND fill.gate_id = gate.gate_id
+          WHERE gate.workspace_id = ? AND gate.run_id = ?
+            AND gate.consumer_node_id IN ('r1','r2')
+          ORDER BY gate.consumer_node_id`,
+        ['ws', childRunId],
+      );
+      expect(gateFills).toEqual([
+        { node_id: 'r1', input_ref: 'research_one' },
+        { node_id: 'r2', input_ref: 'research_two' },
+      ]);
+      const r1TaskId = entryRows.find((row) => row.node_id === 'r1')!.task_id as string;
+      const r2TaskId = entryRows.find((row) => row.node_id === 'r2')!.task_id as string;
+      const r1Turns = await opened.repository.listTurns(r1TaskId);
+      const r2Turns = await opened.repository.listTurns(r2TaskId);
+      expect(r1Turns).toHaveLength(1);
+      expect(r2Turns).toHaveLength(1);
+      expect((await opened.repository.listMessages(r1TaskId))[0]?.content).toContain(
+        'inputRef="research_one"',
+      );
+      expect((await opened.repository.listMessages(r1TaskId))[0]?.content).not.toContain(
+        'inputRef="research_two"',
+      );
+      expect((await opened.repository.listMessages(r2TaskId))[0]?.content).toContain(
+        'inputRef="research_two"',
+      );
+      const r1TurnId = r1Turns[0]!.id;
+      const r2TurnId = r2Turns[0]!.id;
 
       // --- Phase: research entries running — bounded projection ---
       const r1Status0 = await opened.repository.getWorkflowStatusForTask(r1TaskId!);
@@ -531,22 +551,15 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
       expect(r1Status0!.nodeId).toBe('r1');
       expect(r1Status0!.definitionId).toBe('wf-canonical');
       expect(r1Status0!.runStatus).toBe('running');
-      if (usedChildInvoke) {
-        expect(r1Status0!.origin).toBe('child');
-        expect(r1Status0!.parentRunId).toBe(caller.runId);
-        expect(r1Status0!.continuation).toBeUndefined(); // continuation lives on parent run
-      } else {
-        expect(r1Status0!.origin).toBe('top_level');
-      }
+      expect(r1Status0!.origin).toBe('child');
+      expect(r1Status0!.parentRunId).toBe(caller.runId);
+      expect(r1Status0!.continuation).toBeUndefined();
 
-      // Parent continuation (when child invoke succeeded fully).
-      if (usedChildInvoke) {
-        const parentProj = await opened.repository.getWorkflowStatusForTask(caller.entryTaskId);
-        expect(parentProj).toBeTruthy();
-        assertBoundedProjection(parentProj!);
-        expect(parentProj!.continuation).toBeTruthy();
-        expect(parentProj!.continuation!.status).toBe('pending');
-      }
+      const parentProj = await opened.repository.getWorkflowStatusForTask(caller.entryTaskId);
+      expect(parentProj).toBeTruthy();
+      assertBoundedProjection(parentProj!);
+      expect(parentProj!.continuation).toBeTruthy();
+      expect(parentProj!.continuation!.status).toBe('pending');
 
       // Scheduler: research activation turns are promotable when queued.
       // (After start they may already be queued; promote check is structural.)
@@ -815,8 +828,7 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
       expect(terminal.ok).toBe(true);
       expect(terminal.changed).toBe(true);
 
-      if (usedChildInvoke) {
-        // Continuation resolved once; single caller resume (child_return).
+      {
         const conts = await opened.client.all<{ status: string; kind: string }>(
           `SELECT status, kind FROM workflow_continuations
             WHERE workspace_id = ? AND run_id = ?`,

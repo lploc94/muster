@@ -482,10 +482,12 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
         maxItems: 32,
         items: {
           type: 'object',
-          required: ['inputRef', 'artifactId'],
+          required: ['childEntryNodeId', 'inputRef', 'artifactId', 'artifactRevision'],
           properties: {
+            childEntryNodeId: OP_ID,
             inputRef: { type: 'string', minLength: 1, maxLength: 128 },
             artifactId: OP_ID,
+            artifactRevision: { type: 'integer', minimum: 1 },
           },
           additionalProperties: false,
         },
@@ -540,7 +542,7 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
   },
   define_workflow: {
     type: 'object',
-    required: ['opId', 'definitionId', 'version', 'name', 'topology'],
+    required: ['opId', 'definitionId', 'version', 'name', 'topology', 'entryContracts', 'policy'],
     properties: {
       opId: OP_ID,
       definitionId: OP_ID,
@@ -565,6 +567,18 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
                     nodeId: OP_ID,
                     label: { type: 'string', minLength: 1, maxLength: 200 },
                     role: { type: 'string', enum: ['coordinator', 'worker'] },
+                    taskType: OP_ID,
+                    backend: { type: 'string', minLength: 1, maxLength: 128 },
+                    model: { type: 'string', minLength: 1, maxLength: 128 },
+                    capabilities: {
+                      type: 'array',
+                      maxItems: 16,
+                      uniqueItems: true,
+                      items: {
+                        type: 'string',
+                        enum: ['create_child', 'start_child', 'wait_child', 'interrupt_child', 'cancel_child', 'read_subtree'],
+                      },
+                    },
                   },
                   additionalProperties: false,
                 },
@@ -588,6 +602,18 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
                     nodeId: OP_ID,
                     label: { type: 'string', minLength: 1, maxLength: 200 },
                     role: { type: 'string', enum: ['coordinator', 'worker'] },
+                    taskType: OP_ID,
+                    backend: { type: 'string', minLength: 1, maxLength: 128 },
+                    model: { type: 'string', minLength: 1, maxLength: 128 },
+                    capabilities: {
+                      type: 'array',
+                      maxItems: 16,
+                      uniqueItems: true,
+                      items: {
+                        type: 'string',
+                        enum: ['create_child', 'start_child', 'wait_child', 'interrupt_child', 'cancel_child', 'read_subtree'],
+                      },
+                    },
                   },
                   additionalProperties: false,
                 },
@@ -598,11 +624,12 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
                 maxItems: 64,
                 items: {
                   type: 'object',
-                  required: ['fromNodeId', 'toNodeId', 'inputRef'],
+                  required: ['fromNodeId', 'toNodeId', 'inputRef', 'expectedArtifactKind'],
                   properties: {
                     fromNodeId: OP_ID,
                     toNodeId: OP_ID,
                     inputRef: { type: 'string', minLength: 1, maxLength: 128 },
+                    expectedArtifactKind: { type: 'string', minLength: 1, maxLength: 128 },
                   },
                   additionalProperties: false,
                 },
@@ -612,12 +639,48 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
           },
         ],
       },
+      entryContracts: {
+        type: 'array',
+        maxItems: 128,
+        items: {
+          type: 'object',
+          required: ['entryNodeId', 'inputRef', 'expectedArtifactKind'],
+          properties: {
+            entryNodeId: OP_ID,
+            inputRef: { type: 'string', minLength: 1, maxLength: 128 },
+            expectedArtifactKind: { type: 'string', minLength: 1, maxLength: 128 },
+          },
+          additionalProperties: false,
+        },
+      },
+      policy: {
+        type: 'object',
+        required: [
+          'maxFeedbackRoundsPerRun', 'maxTurnsPerTask', 'maxWorkflowTurnsPerRun',
+          'runTimeoutMs', 'maxDepth', 'maxTaskCount', 'maxConcurrency',
+          'maxInputsPerGate', 'maxArtifactBytes', 'maxAggregateBytes', 'failWorkflow',
+        ],
+        properties: {
+          maxFeedbackRoundsPerRun: { type: 'integer', minimum: 1, maximum: 32 },
+          maxTurnsPerTask: { type: 'integer', minimum: 1, maximum: 500 },
+          maxWorkflowTurnsPerRun: { type: 'integer', minimum: 1, maximum: 256 },
+          runTimeoutMs: { type: 'integer', minimum: 1000, maximum: 28800000 },
+          maxDepth: { type: 'integer', minimum: 1, maximum: 8 },
+          maxTaskCount: { type: 'integer', minimum: 1, maximum: 64 },
+          maxConcurrency: { type: 'integer', minimum: 1, maximum: 64 },
+          maxInputsPerGate: { type: 'integer', minimum: 1, maximum: 64 },
+          maxArtifactBytes: { type: 'integer', minimum: 1, maximum: 262144 },
+          maxAggregateBytes: { type: 'integer', minimum: 1, maximum: 1048576 },
+          failWorkflow: { type: 'boolean' },
+        },
+        additionalProperties: false,
+      },
     },
     additionalProperties: false,
   },
   start_workflow: {
     type: 'object',
-    required: ['opId', 'definitionId', 'version', 'startIdempotencyKey'],
+    required: ['opId', 'definitionId', 'version', 'startIdempotencyKey', 'entryInputs'],
     properties: {
       opId: OP_ID,
       definitionId: OP_ID,
@@ -625,6 +688,21 @@ const TOOL_INPUT_SCHEMAS: Record<ToolAction, Record<string, unknown>> = {
       startIdempotencyKey: OP_ID,
       goal: { type: 'string', minLength: 1, maxLength: 512 },
       backend: { type: 'string', minLength: 1, maxLength: 64 },
+      entryInputs: {
+        type: 'array',
+        maxItems: 128,
+        items: {
+          type: 'object',
+          required: ['entryNodeId', 'inputRef', 'kind', 'value'],
+          properties: {
+            entryNodeId: OP_ID,
+            inputRef: { type: 'string', minLength: 1, maxLength: 128 },
+            kind: { type: 'string', minLength: 1, maxLength: 128 },
+            value: { type: 'string', maxLength: 262144 },
+          },
+          additionalProperties: false,
+        },
+      },
     },
     additionalProperties: false,
   },
@@ -731,7 +809,7 @@ function createMcpServer(options: CreateMcpServerOptions): McpServer {
                             : name === 'workflow_fail'
                               ? 'Stage a workflow FAIL disposition on the live turn: close the current workflow run without sealing task lifecycle. Optional reason is bounded diagnostics only (no prompts/artifacts/paths). Engine owns run/gate/round closure identities. Committed only when the adapter settles the turn successfully.'
                             : name === 'invoke_child_workflow'
-                              ? 'Stage invoke_child_workflow disposition on the live turn: start a nested child workflow without sealing caller lifecycle. Provide childDefinitionId, childDefinitionVersion, non-empty entryBindings (inputRef+artifactId), optional childIdempotencyKey. Engine owns child run/continuation/return-gate identities. Committed only when the adapter settles the turn successfully.'
+                              ? 'Stage a child-workflow NEXT route on the live turn without sealing caller lifecycle. Provide childDefinitionId, childDefinitionVersion, and exact entryBindings (childEntryNodeId, inputRef, artifactId, artifactRevision), plus an optional childIdempotencyKey. Engine owns child run/continuation/return-gate identities. Committed only when the adapter settles the turn successfully.'
                             : name === 'define_workflow'
                               ? 'Persist an immutable workflow definition version (one_node_v1 or graph_v1 fan-in). Same definitionId+version+fingerprint replays; differing fingerprint fails closed. Domain validation is fail-closed for topology shape.'
                               : name === 'start_workflow'

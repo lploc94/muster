@@ -1128,7 +1128,7 @@ describe('stageDisposition rejections', () => {
       stageDisposition(live, { kind: 'workflow_next', change: 'updated' }, 'op-next', {}),
     ).toEqual({
       ok: false,
-      reason: 'limits are required for complete, fail, workflow_next, workflow_prev, workflow_fail, or invoke_child_workflow dispositions',
+      reason: 'limits are required for complete, fail, workflow_next, workflow_prev, or workflow_fail dispositions',
     });
 
     const first = stageDisposition(

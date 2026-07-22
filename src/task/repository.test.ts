@@ -1017,6 +1017,74 @@ describe('SqliteTaskRepository', () => {
     }
   }, 20_000);
 
+  it('retention preserves open workflow evidence', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-workflow-retention-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const repository = new SqliteTaskRepository(client, 'ws');
+      await repository.execute({ kind: 'upsertWorkspace', workspaceId: 'ws', identityKey: 'workflow-retention', displayName: 'Workflow retention', createdAt: 'now', lastOpenedAt: 'now' });
+      const createdAt = '2026-07-19T00:00:00.000Z';
+      await expect(repository.execute({
+        kind: 'defineWorkflowVersion', workspaceId: 'ws', definitionId: 'wf-retention', version: 1,
+        name: 'retention', topology: {
+          kind: 'one_node_v1', nodes: [{ nodeId: 'entry' }], entryNodeId: 'entry',
+        }, createdAt,
+      })).resolves.toMatchObject({ ok: true, changed: true });
+      const start = await repository.execute({
+        kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: 'wf-retention', version: 1,
+        startIdempotencyKey: 'retention-start', createdAt, goal: 'retain active evidence', backend: 'grok',
+      });
+      const started = start.operation?.result?.data as {
+        runId: string; entryTaskId: string; activationTurnId: string; entryMessageId: string;
+      };
+      expect(started).toMatchObject({
+        runId: expect.any(String), entryTaskId: expect.any(String), activationTurnId: expect.any(String),
+      });
+      const operationKey = `${started.activationTurnId}:retention-proof`;
+      await expect(repository.execute({
+        kind: 'claimOperation', workspaceId: 'ws', ledgerKey: operationKey,
+        entry: { fingerprint: 'retention-proof', result: { ok: true, data: { retained: true } } },
+        createdAt: '2026-07-19T00:00:01.000Z',
+      })).resolves.toMatchObject({ changed: true });
+
+      const workflowTask = await repository.getTask(started.entryTaskId);
+      expect(workflowTask).toBeDefined();
+      await repository.execute({
+        kind: 'upsertTask', workspaceId: 'ws',
+        task: {
+          ...workflowTask!, lifecycle: 'succeeded', finishedAt: '2026-07-19T00:00:02.000Z',
+          updatedAt: '2026-07-19T00:00:02.000Z', revision: workflowTask!.revision + 1,
+        },
+      });
+
+      await expect(repository.execute({
+        kind: 'applyRetention', workspaceId: 'ws', taskId: started.entryTaskId, keepLatestTurns: 0,
+      })).resolves.toMatchObject({ ok: true, changed: false });
+      await expect(repository.getTurn(started.activationTurnId)).resolves.toMatchObject({ status: 'queued' });
+      await expect(repository.listMessages(started.entryTaskId)).resolves.toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: started.entryMessageId }),
+      ]));
+      await expect(repository.getOperation(operationKey)).resolves.toMatchObject({ fingerprint: 'retention-proof' });
+      await expect(client.get(
+        `SELECT status FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', started.runId],
+      )).resolves.toMatchObject({ status: 'running' });
+      await expect(client.get(
+        `SELECT status, execution_turn_id FROM workflow_activations
+          WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', started.runId],
+      )).resolves.toMatchObject({ status: 'queued', execution_turn_id: started.activationTurnId });
+      await expect(client.get(
+        `SELECT status FROM workflow_dependency_gates WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', started.runId],
+      )).resolves.toMatchObject({ status: 'satisfied' });
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it('retains retry ancestors on terminal tasks and truncates only settled output on open tasks', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-retention-policy-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
@@ -1243,8 +1311,8 @@ describe('SqliteTaskRepository', () => {
         ['ws', data.runId, consumerGate.gateId],
       );
       expect(bindings).toEqual([
-        { input_ref: 'from_p1', producer_node_id: 'p1', required_kind: 'artifact' },
-        { input_ref: 'from_p2', producer_node_id: 'p2', required_kind: 'artifact' },
+        { input_ref: 'from_p1', producer_node_id: 'p1', required_kind: 'next_result' },
+        { input_ref: 'from_p2', producer_node_id: 'p2', required_kind: 'next_result' },
       ]);
 
       const fills = await client.all(

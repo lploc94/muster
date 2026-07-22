@@ -65,11 +65,23 @@ describe('M018 terminal workflow activation guards', () => {
       activationStatus: 'queued',
     });
 
-    await client.run(
-      `UPDATE workflow_runs SET status = 'failed', updated_at = ?
-        WHERE workspace_id = 'ws' AND run_id = ?`,
-      ['2026-07-22T04:00:01.000Z', data.runId],
-    );
+    await client.transaction([
+      {
+        sql: `UPDATE turns SET status = 'cancelled', settled_at = ?
+              WHERE workspace_id = 'ws' AND id = ?`,
+        params: ['2026-07-22T04:00:01.000Z', data.activationTurnId],
+      },
+      {
+        sql: `UPDATE workflow_activations SET status = 'failed', updated_at = ?
+              WHERE workspace_id = 'ws' AND execution_turn_id = ?`,
+        params: ['2026-07-22T04:00:01.000Z', data.activationTurnId],
+      },
+      {
+        sql: `UPDATE workflow_runs SET status = 'failed', updated_at = ?
+              WHERE workspace_id = 'ws' AND run_id = ?`,
+        params: ['2026-07-22T04:00:01.000Z', data.runId],
+      },
+    ]);
     const stale = await repository.getTurn(data.activationTurnId);
     const staleProjection: EngineProjection = {
       schemaVersion: 2,
@@ -80,7 +92,7 @@ describe('M018 terminal workflow activation guards', () => {
     };
     expect(canPromoteTurn(staleProjection, stale!.id, DEFAULT_RESOURCE_LIMITS)).toEqual({
       ok: false,
-      reason: 'workflow activation is no longer eligible',
+      reason: 'turn is not queued',
     });
     await expect(repository.execute({
       kind: 'claimTurn',
@@ -94,18 +106,6 @@ describe('M018 terminal workflow activation guards', () => {
       resourceKeys: [],
     })).resolves.toMatchObject({ changed: false, reason: 'turn is no longer eligible' });
 
-    await client.transaction([
-      {
-        sql: `UPDATE turns SET status = 'cancelled', settled_at = ?
-              WHERE workspace_id = 'ws' AND id = ?`,
-        params: ['2026-07-22T04:00:03.000Z', stale!.id],
-      },
-      {
-        sql: `UPDATE workflow_activations SET status = 'failed', updated_at = ?
-              WHERE workspace_id = 'ws' AND execution_turn_id = ?`,
-        params: ['2026-07-22T04:00:03.000Z', stale!.id],
-      },
-    ]);
     const ordinary: TaskTurn = {
       id: 'ordinary-turn',
       taskId: task!.id,

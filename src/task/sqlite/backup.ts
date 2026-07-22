@@ -24,12 +24,6 @@ export type BackupResultMeta = {
   byteSize: number;
 };
 
-export type MigrationBackupReceipt = BackupResultMeta & {
-  artifactPath: string;
-  destinationPath: string;
-  sourceDataVersion: number;
-};
-
 export type BackupRequestOptions = {
   destinationPath: string;
   overwrite: boolean;
@@ -252,7 +246,7 @@ export function verifyBackupArtifact(
     if (schemaVersion !== expectedSchemaVersion) {
       throw new MusterSqliteError('incompatible_schema', 'backup');
     }
-    const fingerprint = findSchemaFingerprintFailure(db, expectedSchemaVersion);
+    const fingerprint = findSchemaFingerprintFailure(db);
     if (fingerprint) {
       throw new MusterSqliteError('incompatible_schema', 'backup');
     }
@@ -289,14 +283,6 @@ function tempSiblingPath(destinationPath: string): string {
   return path.join(dir, `.${base}.muster-bak-tmp-${randomUUID()}`);
 }
 
-export function migrationBackupArtifactPath(
-  sourcePath: string,
-  sourceSchemaVersion: number,
-  targetSchemaVersion: number,
-): string {
-  return `${path.resolve(sourcePath)}.pre-v${sourceSchemaVersion}-to-v${targetSchemaVersion}.sqlite3`;
-}
-
 function unlinkQuiet(filePath: string | undefined): void {
   if (!filePath) return;
   try {
@@ -312,22 +298,6 @@ function cleanupTempArtifact(tempPath: string | undefined): void {
   unlinkQuiet(tempPath);
   unlinkQuiet(`${tempPath}-wal`);
   unlinkQuiet(`${tempPath}-shm`);
-}
-
-function fsyncPath(filePath: string): void {
-  const fd = fs.openSync(filePath, 'r');
-  try {
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
-  }
-}
-
-function makeBackupArtifactCrashDurable(artifactPath: string): void {
-  fsyncPath(artifactPath);
-  if (process.platform !== 'win32') {
-    fsyncPath(path.dirname(path.resolve(artifactPath)));
-  }
 }
 
 /**
@@ -367,76 +337,6 @@ export function publishBackupArtifact(
   // Atomic replace on same filesystem: destination remains if rename fails.
   fs.renameSync(tempPath, dest);
   cleanupTempArtifact(tempPath);
-}
-
-export function createMigrationBackupReceipt(
-  db: DatabaseSync,
-  sourcePath: string,
-  sourceSchemaVersion: number,
-  targetSchemaVersion: number,
-): MigrationBackupReceipt {
-  const artifactPath = migrationBackupArtifactPath(
-    sourcePath,
-    sourceSchemaVersion,
-    targetSchemaVersion,
-  );
-  assertDestinationNotLiveSource(sourcePath, artifactPath);
-  assertDestinationSidecarsAbsent(artifactPath);
-
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    const tempPath = tempSiblingPath(artifactPath);
-    try {
-      const beforeDataVersion = readScalar(db, 'data_version');
-      db.exec(`VACUUM INTO ${quoteSqlitePathLiteral(tempPath)}`);
-      const sourceDataVersion = readScalar(db, 'data_version');
-      if (sourceDataVersion !== beforeDataVersion) {
-        cleanupTempArtifact(tempPath);
-        continue;
-      }
-
-      maybeInjectFault('backup');
-      const verified = verifyBackupArtifact(tempPath, sourceSchemaVersion);
-      fsyncPath(tempPath);
-      return {
-        artifactPath: tempPath,
-        destinationPath: artifactPath,
-        sourceDataVersion,
-        mechanism: 'vacuum',
-        schemaVersion: verified.schemaVersion,
-        workspaceRevision: verified.workspaceRevision,
-        byteSize: verified.byteSize,
-      };
-    } catch (error) {
-      cleanupTempArtifact(tempPath);
-      throw mapToMusterSqliteError(error, 'backup');
-    }
-  }
-
-  throw new MusterSqliteError('busy', 'backup');
-}
-
-export function discardMigrationBackupReceipt(receipt: MigrationBackupReceipt): void {
-  cleanupTempArtifact(receipt.artifactPath);
-}
-
-export function publishMigrationBackupReceipt(receipt: MigrationBackupReceipt): void {
-  const verified = verifyBackupArtifact(receipt.artifactPath, receipt.schemaVersion);
-  if (
-    verified.schemaVersion !== receipt.schemaVersion ||
-    verified.workspaceRevision !== receipt.workspaceRevision ||
-    verified.byteSize !== receipt.byteSize
-  ) {
-    throw new MusterSqliteError('incompatible_schema', 'backup');
-  }
-  publishBackupArtifact(receipt.artifactPath, receipt.destinationPath, true);
-  makeBackupArtifactCrashDurable(receipt.destinationPath);
-  const published = verifyBackupArtifact(receipt.destinationPath, receipt.schemaVersion);
-  if (
-    published.workspaceRevision !== receipt.workspaceRevision ||
-    published.byteSize !== receipt.byteSize
-  ) {
-    throw new MusterSqliteError('incompatible_schema', 'backup');
-  }
 }
 
 async function createSnapshotFile(

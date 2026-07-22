@@ -20,7 +20,12 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { SqliteTaskRepository } from './repository';
 import { DbClient } from './sqlite/client';
-import type { TurnDisposition } from './types';
+import type { MusterTask, TaskTurn, TurnDisposition } from './types';
+import {
+  DEFAULT_WORKFLOW_POLICY,
+  maximumWorkflowEntryAggregateBytes,
+  type WorkflowPolicyV1,
+} from './workflow';
 
 const WORKER_TS = path.join(__dirname, 'sqlite', 'worker.ts');
 const TSX_ARGV = ['--import', 'tsx'];
@@ -77,6 +82,8 @@ async function defineVersion(
   createdAt: string,
   definitionId: string,
   name: string,
+  entryArtifactKind?: string,
+  policy: WorkflowPolicyV1 = DEFAULT_WORKFLOW_POLICY,
 ): Promise<void> {
   const def = await repository.execute({
     kind: 'defineWorkflowVersion',
@@ -85,6 +92,16 @@ async function defineVersion(
     version: 1,
     name,
     topology: ONE_NODE,
+    ...(entryArtifactKind
+      ? {
+          entryContracts: [{
+            entryNodeId: 'entry',
+            inputRef: 'engine_start',
+            expectedArtifactKind: entryArtifactKind,
+          }],
+        }
+      : {}),
+    policy,
     createdAt,
   });
   expect(def.ok).toBe(true);
@@ -283,13 +300,331 @@ async function insertEngineTurn(
   );
 }
 
+async function seedNodeArtifact(
+  client: DbClient,
+  runId: string,
+  taskId: string,
+  turnId: string,
+  artifactId: string,
+  createdAt: string,
+): Promise<void> {
+  const activation = await client.get<{ activation_id: string }>(
+    `SELECT activation_id FROM workflow_activations
+      WHERE workspace_id = ? AND run_id = ? AND execution_turn_id = ?`,
+    ['ws', runId, turnId],
+  );
+  expect(activation?.activation_id).toBeTruthy();
+  await client.transaction([
+    {
+      sql: `INSERT INTO workflow_artifacts (
+              workspace_id, run_id, artifact_id, producer_node_id, logical_name,
+              revision, kind, payload_json, created_at
+            ) VALUES (?,?,?,?,?,1,'next_result',?,?)`,
+      params: ['ws', runId, artifactId, 'entry', 'nested-input', '{"value":"nested input"}', createdAt],
+    },
+    {
+      sql: `INSERT INTO workflow_artifact_sources (
+              workspace_id, run_id, artifact_id, artifact_revision, source_kind,
+              producer_run_id, producer_node_id, producer_task_id,
+              producing_turn_id, producing_activation_id
+            ) VALUES (?,?,?,1,'workflow_node',?,?,?,?,?)`,
+      params: [
+        'ws', runId, artifactId, runId, 'entry', taskId, turnId, activation!.activation_id,
+      ],
+    },
+  ]);
+}
+
+async function startThreeLevelChain(opened: Opened, label: string): Promise<{
+  runIds: [string, string, string];
+  taskIds: [string, string, string];
+  turnIds: [string, string, string];
+}> {
+  const createdAt = '2026-07-22T10:00:00.000Z';
+  const topDefinition = `wf-${label}-top`;
+  const middleDefinition = `wf-${label}-middle`;
+  const leafDefinition = `wf-${label}-leaf`;
+  await defineVersion(opened.repository, createdAt, topDefinition, `${label} top`);
+  await defineVersion(opened.repository, createdAt, middleDefinition, `${label} middle`, 'engine_start');
+  await defineVersion(opened.repository, createdAt, leafDefinition, `${label} leaf`, 'next_result');
+  const top = await startOneNode(
+    opened.repository,
+    createdAt,
+    topDefinition,
+    `${label}-top-start`,
+    `${label} top`,
+  );
+
+  await settleSucceeded(
+    opened.repository,
+    opened.client,
+    top.entryTaskId,
+    top.activationTurnId,
+    {
+      kind: 'workflow_next',
+      change: 'updated',
+      route: {
+        kind: 'child_workflow',
+        childDefinitionId: middleDefinition,
+        childDefinitionVersion: 1,
+        entryBindings: [{
+          childEntryNodeId: 'entry',
+          inputRef: 'engine_start',
+          artifactId: top.startArtifactId,
+          artifactRevision: 1,
+        }],
+        childIdempotencyKey: `${label}-middle-child`,
+      },
+    },
+    '2026-07-22T10:01:00.000Z',
+  );
+  const middleRun = (await childRunsForParent(opened.client, top.runId))[0]!;
+  const middleEntry = (await entryTaskForRun(opened.client, middleRun.run_id))!;
+  const middleTurn = (await queuedTurnsForTask(opened.client, middleEntry.task_id))[0]!;
+  const middleArtifactId = `${label}-middle-artifact`;
+  await seedNodeArtifact(
+    opened.client,
+    middleRun.run_id,
+    middleEntry.task_id,
+    middleTurn.id,
+    middleArtifactId,
+    '2026-07-22T10:01:30.000Z',
+  );
+  await settleSucceeded(
+    opened.repository,
+    opened.client,
+    middleEntry.task_id,
+    middleTurn.id,
+    {
+      kind: 'workflow_next',
+      change: 'updated',
+      route: {
+        kind: 'child_workflow',
+        childDefinitionId: leafDefinition,
+        childDefinitionVersion: 1,
+        entryBindings: [{
+          childEntryNodeId: 'entry',
+          inputRef: 'engine_start',
+          artifactId: middleArtifactId,
+          artifactRevision: 1,
+        }],
+        childIdempotencyKey: `${label}-leaf-child`,
+      },
+    },
+    '2026-07-22T10:02:00.000Z',
+  );
+  const leafRun = (await childRunsForParent(opened.client, middleRun.run_id))[0]!;
+  const leafEntry = (await entryTaskForRun(opened.client, leafRun.run_id))!;
+  const leafTurn = (await queuedTurnsForTask(opened.client, leafEntry.task_id))[0]!;
+  return {
+    runIds: [top.runId, middleRun.run_id, leafRun.run_id],
+    taskIds: [top.entryTaskId, middleEntry.task_id, leafEntry.task_id],
+    turnIds: [top.activationTurnId, middleTurn.id, leafTurn.id],
+  };
+}
+
 describe('M018 S06 child-workflow continuation (named flow)', () => {
+  it('an ordinary root coordinator invokes a child and resumes through its return gate', async () => {
+    const opened = await openRepo('root-caller');
+    try {
+      const createdAt = '2026-07-20T00:00:00.000Z';
+      await defineVersion(opened.repository, createdAt, 'wf-source', 'source');
+      await defineVersion(opened.repository, createdAt, 'wf-child', 'child', 'next_result');
+      const root: MusterTask = {
+        id: 'root-caller',
+        role: 'coordinator',
+        lifecycle: 'open',
+        releaseState: 'released',
+        goal: 'invoke child',
+        parentId: null,
+        dependencies: [],
+        backend: 'grok',
+        capabilities: ['create_child'],
+        executionPolicy: { maxTurns: 20, maxAutomaticRetries: 1 },
+        runtimeEpoch: 1,
+        revision: 0,
+        createdAt,
+        updatedAt: createdAt,
+      };
+      const rootTurn: TaskTurn = {
+        id: 'root-caller-turn',
+        taskId: root.id,
+        sequence: 1,
+        trigger: 'user',
+        status: 'running',
+        runtimeEpoch: 1,
+        inputs: [],
+        createdAt,
+        startedAt: createdAt,
+      };
+      await opened.repository.execute({ kind: 'createTask', workspaceId: 'ws', task: root });
+      await opened.repository.execute({ kind: 'createTurn', workspaceId: 'ws', turn: rootTurn });
+      await opened.client.transaction([
+        {
+          sql: `INSERT INTO workflow_runs (
+                  workspace_id, run_id, definition_id, definition_version, status, origin,
+                  owner_root_task_id, caller_task_id, caller_turn_id, created_at, updated_at
+                ) VALUES ('ws', 'root-source-run', 'wf-source', 1, 'running', 'top_level',
+                          ?, ?, ?, ?, ?)`,
+          params: [root.id, root.id, rootTurn.id, createdAt, createdAt],
+        },
+        {
+          sql: `INSERT INTO workflow_artifacts (
+                  workspace_id, run_id, artifact_id, producer_node_id, logical_name,
+                  revision, kind, payload_json, created_at
+                ) VALUES ('ws', 'root-source-run', 'root-input', NULL, 'input', 1,
+                          'next_result', '{"value":"root input"}', ?)`,
+          params: [createdAt],
+        },
+        {
+          sql: `INSERT INTO workflow_artifact_sources (
+                  workspace_id, run_id, artifact_id, artifact_revision, source_kind,
+                  caller_task_id, caller_turn_id
+                ) VALUES ('ws', 'root-source-run', 'root-input', 1, 'caller_turn', ?, ?)`,
+          params: [root.id, rootTurn.id],
+        },
+      ]);
+
+      const invocation: TurnDisposition = {
+        kind: 'workflow_next',
+        change: 'updated',
+        route: {
+          kind: 'child_workflow',
+          childDefinitionId: 'wf-child',
+          childDefinitionVersion: 1,
+          entryBindings: [{
+            childEntryNodeId: 'entry',
+            inputRef: 'engine_start',
+            artifactId: 'root-input',
+            artifactRevision: 1,
+          }],
+          childIdempotencyKey: 'root-child-1',
+        },
+      };
+      const staleInvocation: TurnDisposition = {
+        ...invocation,
+        route: invocation.kind === 'workflow_next' && invocation.route
+          ? {
+              ...invocation.route,
+              entryBindings: invocation.route.entryBindings.map((binding) => ({
+                ...binding,
+                artifactRevision: 2,
+              })),
+            }
+          : undefined,
+      };
+      await expect(opened.repository.execute({
+        kind: 'stageDisposition',
+        workspaceId: 'ws',
+        turnId: rootTurn.id,
+        opId: 'invoke-root-child-stale',
+        turn: { ...rootTurn, disposition: staleInvocation },
+        expectedStatuses: ['running'],
+        expectedRuntimeEpoch: 1,
+      })).resolves.toMatchObject({
+        changed: false,
+        reason: 'workflow disposition is not authorized for the current route',
+      });
+      await expect(opened.repository.execute({
+        kind: 'stageDisposition',
+        workspaceId: 'ws',
+        turnId: rootTurn.id,
+        opId: 'invoke-root-child',
+        turn: { ...rootTurn, disposition: invocation },
+        expectedStatuses: ['running'],
+        expectedRuntimeEpoch: 1,
+      })).resolves.toMatchObject({ changed: true });
+      await expect(settleSucceeded(
+        opened.repository,
+        opened.client,
+        root.id,
+        rootTurn.id,
+        invocation,
+        '2026-07-20T00:00:01.000Z',
+        createdAt,
+      )).resolves.toMatchObject({ ok: true, changed: true });
+
+      const childRun = await opened.client.get<{ run_id: string }>(
+        `SELECT run_id FROM workflow_runs
+          WHERE workspace_id = 'ws' AND origin = 'child' AND caller_task_id = ?`,
+        [root.id],
+      );
+      expect(childRun?.run_id).toBeTruthy();
+      const childEntry = await entryTaskForRun(opened.client, childRun!.run_id);
+      expect(childEntry?.task_id).toBeTruthy();
+      await expect(opened.repository.getTask(childEntry!.task_id)).resolves.toMatchObject({
+        parentId: root.id,
+      });
+
+      const childTurn = await opened.client.get<{ id: string }>(
+        `SELECT id FROM turns WHERE workspace_id = 'ws' AND task_id = ? AND status = 'queued'`,
+        [childEntry!.task_id],
+      );
+      await expect(settleSucceeded(
+        opened.repository,
+        opened.client,
+        childEntry!.task_id,
+        childTurn!.id,
+        { kind: 'workflow_next', change: 'updated', result: 'child result' },
+        '2026-07-20T00:00:02.000Z',
+      )).resolves.toMatchObject({ ok: true, changed: true });
+
+      await expect(queuedTurnsForTask(opened.client, root.id)).resolves.toHaveLength(1);
+      await expect(opened.client.get<{ status: string }>(
+        `SELECT status FROM workflow_return_gates
+          WHERE workspace_id = 'ws' AND child_run_id = ?`,
+        [childRun!.run_id],
+      )).resolves.toMatchObject({ status: 'satisfied' });
+      await expect(opened.client.get<{ status: string; outcome: string }>(
+        `SELECT status, outcome FROM workflow_continuations
+          WHERE workspace_id = 'ws' AND child_run_id = ?`,
+        [childRun!.run_id],
+      )).resolves.toMatchObject({ status: 'resolved', outcome: 'succeeded' });
+
+      const resumeTurns = await queuedTurnsForTask(opened.client, root.id);
+      expect(resumeTurns).toHaveLength(1);
+      await opened.repository.execute({
+        kind: 'claimOperation', workspaceId: 'ws', ledgerKey: `${rootTurn.id}:retention-proof`,
+        entry: { fingerprint: 'root-retention-proof', result: { ok: true } },
+        createdAt: '2026-07-20T00:00:03.000Z',
+      });
+      const settledRoot = await opened.repository.getTask(root.id);
+      await opened.repository.execute({
+        kind: 'upsertTask', workspaceId: 'ws',
+        task: {
+          ...settledRoot!, lifecycle: 'succeeded', finishedAt: '2026-07-20T00:00:03.000Z',
+          updatedAt: '2026-07-20T00:00:03.000Z', revision: settledRoot!.revision + 1,
+        },
+      });
+      await opened.client.run(
+        `UPDATE workflow_runs SET status = 'succeeded', updated_at = ?
+          WHERE workspace_id = 'ws' AND run_id = 'root-source-run'`,
+        ['2026-07-20T00:00:03.000Z'],
+      );
+      await expect(opened.repository.execute({
+        kind: 'applyRetention', workspaceId: 'ws', taskId: root.id, keepLatestTurns: 0,
+      })).resolves.toMatchObject({ ok: true, changed: false });
+      await expect(opened.repository.getTurn(rootTurn.id)).resolves.toBeDefined();
+      await expect(opened.repository.getTurn(resumeTurns[0]!.id)).resolves.toBeDefined();
+      await expect(opened.repository.getOperation(`${rootTurn.id}:retention-proof`)).resolves.toMatchObject({
+        fingerprint: 'root-retention-proof',
+      });
+      await expect(opened.client.get<{ status: string }>(
+        `SELECT status FROM workflow_return_gates
+          WHERE workspace_id = 'ws' AND child_run_id = ?`,
+        [childRun!.run_id],
+      )).resolves.toMatchObject({ status: 'satisfied' });
+    } finally {
+      await opened.close();
+    }
+  });
+
   it('invoke_child_workflow atomically starts child + pending continuation; foreign binding creates zero child rows', async () => {
     const opened = await openRepo('invoke');
     try {
       const createdAt = '2026-07-20T00:00:00.000Z';
       await defineVersion(opened.repository, createdAt, 'wf-caller', 'caller');
-      await defineVersion(opened.repository, createdAt, 'wf-child', 'child');
+      await defineVersion(opened.repository, createdAt, 'wf-child', 'child', 'engine_start');
       const caller = await startOneNode(
         opened.repository,
         createdAt,
@@ -306,13 +641,22 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
         caller.entryTaskId,
         caller.activationTurnId,
         {
-          kind: 'invoke_child_workflow',
-          childDefinitionId: 'wf-child',
-          childDefinitionVersion: 1,
-          entryBindings: [
-            { inputRef: 'engine_start', artifactId: 'wfa_not_owned_by_caller' },
-          ],
-          childIdempotencyKey: 's06-foreign-1',
+          kind: 'workflow_next',
+          change: 'updated',
+          route: {
+            kind: 'child_workflow',
+            childDefinitionId: 'wf-child',
+            childDefinitionVersion: 1,
+            entryBindings: [
+              {
+                childEntryNodeId: 'entry',
+                inputRef: 'engine_start',
+                artifactId: 'wfa_not_owned_by_caller',
+                artifactRevision: 1,
+              },
+            ],
+            childIdempotencyKey: 's06-foreign-1',
+          },
         },
         '2026-07-20T00:00:01.000Z',
       );
@@ -320,7 +664,42 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
       expect(await childRunsForParent(opened.client, caller.runId)).toHaveLength(0);
       expect(await continuationsForRun(opened.client, caller.runId)).toHaveLength(0);
 
-      // Successful invoke on a fresh turn after foreign reject.
+      const staleTurnId = `${caller.activationTurnId}-stale`;
+      await insertEngineTurn(
+        opened.client,
+        caller.entryTaskId,
+        staleTurnId,
+        'queued',
+        '2026-07-20T00:00:02.000Z',
+        await nextTurnSequence(opened.client, caller.entryTaskId),
+      );
+      await settleSucceeded(
+        opened.repository,
+        opened.client,
+        caller.entryTaskId,
+        staleTurnId,
+        {
+          kind: 'workflow_next',
+          change: 'updated',
+          route: {
+            kind: 'child_workflow',
+            childDefinitionId: 'wf-child',
+            childDefinitionVersion: 1,
+            entryBindings: [{
+              childEntryNodeId: 'entry',
+              inputRef: 'engine_start',
+              artifactId: caller.startArtifactId,
+              artifactRevision: 2,
+            }],
+            childIdempotencyKey: 's06-stale-1',
+          },
+        },
+        '2026-07-20T00:00:02.500Z',
+      );
+      expect(await childRunsForParent(opened.client, caller.runId)).toHaveLength(0);
+      expect(await continuationsForRun(opened.client, caller.runId)).toHaveLength(0);
+
+      // Successful invoke on a fresh turn after foreign and stale rejects.
       const okTurnId = `${caller.activationTurnId}-ok`;
       const okSeq = await nextTurnSequence(opened.client, caller.entryTaskId);
       await insertEngineTurn(
@@ -328,7 +707,7 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
         caller.entryTaskId,
         okTurnId,
         'queued',
-        '2026-07-20T00:00:02.000Z',
+        '2026-07-20T00:00:03.000Z',
         okSeq,
       );
       const ok = await settleSucceeded(
@@ -337,15 +716,24 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
         caller.entryTaskId,
         okTurnId,
         {
-          kind: 'invoke_child_workflow',
-          childDefinitionId: 'wf-child',
-          childDefinitionVersion: 1,
-          entryBindings: [
-            { inputRef: 'engine_start', artifactId: caller.startArtifactId },
-          ],
-          childIdempotencyKey: 's06-child-1',
+          kind: 'workflow_next',
+          change: 'updated',
+          route: {
+            kind: 'child_workflow',
+            childDefinitionId: 'wf-child',
+            childDefinitionVersion: 1,
+            entryBindings: [
+              {
+                childEntryNodeId: 'entry',
+                inputRef: 'engine_start',
+                artifactId: caller.startArtifactId,
+                artifactRevision: 1,
+              },
+            ],
+            childIdempotencyKey: 's06-child-1',
+          },
         },
-        '2026-07-20T00:00:03.000Z',
+        '2026-07-20T00:00:04.000Z',
       );
       expect(ok.ok).toBe(true);
       expect(ok.changed).toBe(true);
@@ -364,6 +752,15 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
 
       const callerKinds = await routedKinds(opened.client, caller.runId);
       expect(callerKinds).toContain('child_invocation');
+      await expect(opened.client.get<{ count: number }>(
+        `SELECT COUNT(*) AS count
+           FROM workflow_dependency_gates dependency_gate
+           JOIN workflow_return_gates return_gate
+             ON return_gate.workspace_id = dependency_gate.workspace_id
+            AND return_gate.return_gate_id = dependency_gate.gate_id
+          WHERE dependency_gate.workspace_id = 'ws' AND dependency_gate.run_id = ?`,
+        [caller.runId],
+      )).resolves.toEqual({ count: 0 });
 
       // Caller lifecycle stays open (no seal on invoke).
       const callerTask = await opened.repository.getTask(caller.entryTaskId);
@@ -379,12 +776,83 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
     }
   }, 45_000);
 
+  it('fails the caller when an effective child policy cannot bound entry framing', async () => {
+    const opened = await openRepo('entry-bound');
+    try {
+      const createdAt = '2026-07-22T08:00:00.000Z';
+      const maxArtifactBytes = 64;
+      const exactAggregateBytes = maximumWorkflowEntryAggregateBytes(
+        [{ inputRef: 'engine_start' }],
+        maxArtifactBytes,
+      );
+      const childPolicy = {
+        ...DEFAULT_WORKFLOW_POLICY,
+        maxArtifactBytes,
+        maxAggregateBytes: exactAggregateBytes,
+      };
+      await defineVersion(opened.repository, createdAt, 'wf-entry-bound-caller', 'caller');
+      await defineVersion(
+        opened.repository,
+        createdAt,
+        'wf-entry-bound-child',
+        'child',
+        'engine_start',
+        childPolicy,
+      );
+      const caller = await startOneNode(
+        opened.repository,
+        createdAt,
+        'wf-entry-bound-caller',
+        'entry-bound-caller',
+        'entry bound',
+      );
+
+      await expect(settleSucceeded(
+        opened.repository,
+        opened.client,
+        caller.entryTaskId,
+        caller.activationTurnId,
+        {
+          kind: 'workflow_next',
+          change: 'updated',
+          route: {
+            kind: 'child_workflow',
+            childDefinitionId: 'wf-entry-bound-child',
+            childDefinitionVersion: 1,
+            entryBindings: [{
+              childEntryNodeId: 'entry',
+              inputRef: 'engine_start',
+              artifactId: caller.startArtifactId,
+              artifactRevision: 1,
+            }],
+            childIdempotencyKey: 'entry-bound-child',
+            effectivePolicy: {
+              ...childPolicy,
+              maxAggregateBytes: exactAggregateBytes - 1,
+            },
+          },
+        },
+        '2026-07-22T08:01:00.000Z',
+      )).resolves.toMatchObject({ changed: true });
+
+      await expect(opened.client.get<{ status: string; terminal_reason_code: string | null }>(
+        `SELECT status, terminal_reason_code FROM workflow_runs
+          WHERE workspace_id = 'ws' AND run_id = ?`,
+        [caller.runId],
+      )).resolves.toEqual({ status: 'failed', terminal_reason_code: 'aggregate_too_large' });
+      expect(await childRunsForParent(opened.client, caller.runId)).toHaveLength(0);
+      expect(await continuationsForRun(opened.client, caller.runId)).toHaveLength(0);
+    } finally {
+      await opened.close();
+    }
+  }, 45_000);
+
   it('child terminal NEXT resolves continuation once and queues exactly one caller resume; redelivery is a no-op', async () => {
     const opened = await openRepo('return');
     try {
       const createdAt = '2026-07-20T00:00:00.000Z';
       await defineVersion(opened.repository, createdAt, 'wf-caller-r', 'caller-r');
-      await defineVersion(opened.repository, createdAt, 'wf-child-r', 'child-r');
+      await defineVersion(opened.repository, createdAt, 'wf-child-r', 'child-r', 'engine_start');
       const caller = await startOneNode(
         opened.repository,
         createdAt,
@@ -399,13 +867,22 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
         caller.entryTaskId,
         caller.activationTurnId,
         {
-          kind: 'invoke_child_workflow',
-          childDefinitionId: 'wf-child-r',
-          childDefinitionVersion: 1,
-          entryBindings: [
-            { inputRef: 'engine_start', artifactId: caller.startArtifactId },
-          ],
-          childIdempotencyKey: 's06-return-child',
+          kind: 'workflow_next',
+          change: 'updated',
+          route: {
+            kind: 'child_workflow',
+            childDefinitionId: 'wf-child-r',
+            childDefinitionVersion: 1,
+            entryBindings: [
+              {
+                childEntryNodeId: 'entry',
+                inputRef: 'engine_start',
+                artifactId: caller.startArtifactId,
+                artifactRevision: 1,
+              },
+            ],
+            childIdempotencyKey: 's06-return-child',
+          },
         },
         '2026-07-20T00:00:01.000Z',
       );
@@ -479,8 +956,128 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
       const resumeTurns2 = await queuedTurnsForTask(opened.client, caller.entryTaskId);
       expect(resumeTurns2).toHaveLength(1);
       expect(resumeTurns2[0]!.id).toBe(resumeTurnId);
+
+      await expect(settleSucceeded(
+        opened.repository,
+        opened.client,
+        caller.entryTaskId,
+        resumeTurnId,
+        { kind: 'workflow_next', change: 'updated', result: 'caller-done' },
+        '2026-07-20T00:00:04.000Z',
+      )).resolves.toMatchObject({ changed: true });
+      await expect(opened.client.get<{ continuation_status: string; return_gate_status: string }>(
+        `SELECT continuation.status AS continuation_status,
+                return_gate.status AS return_gate_status
+           FROM workflow_continuations continuation
+           JOIN workflow_return_gates return_gate
+             ON return_gate.workspace_id = continuation.workspace_id
+            AND return_gate.continuation_run_id = continuation.run_id
+            AND return_gate.continuation_id = continuation.continuation_id
+          WHERE continuation.workspace_id = 'ws' AND continuation.child_run_id = ?`,
+        [childRunId],
+      )).resolves.toEqual({
+        continuation_status: 'consumed',
+        return_gate_status: 'consumed',
+      });
     } finally {
       await opened.close();
+    }
+  }, 45_000);
+
+  it('child return aggregate accepts the exact byte limit and fails one byte over', async () => {
+    const maxAggregateBytes = 262_144;
+    const policy = {
+      ...DEFAULT_WORKFLOW_POLICY,
+      maxArtifactBytes: 131_072,
+      maxAggregateBytes,
+    };
+
+    for (const overflow of [false, true]) {
+      const opened = await openRepo(overflow ? 'return-overflow' : 'return-exact');
+      try {
+        const createdAt = '2026-07-22T09:00:00.000Z';
+        const callerDefinition = overflow ? 'wf-caller-overflow' : 'wf-caller-exact';
+        const childDefinition = overflow ? 'wf-child-overflow' : 'wf-child-exact';
+        await defineVersion(opened.repository, createdAt, callerDefinition, 'caller', undefined, policy);
+        await defineVersion(opened.repository, createdAt, childDefinition, 'child', 'engine_start', policy);
+        const caller = await startOneNode(
+          opened.repository,
+          createdAt,
+          callerDefinition,
+          `return-boundary-caller-${overflow ? 'over' : 'exact'}`,
+          'return boundary',
+        );
+        await expect(settleSucceeded(
+          opened.repository,
+          opened.client,
+          caller.entryTaskId,
+          caller.activationTurnId,
+          {
+            kind: 'workflow_next',
+            change: 'updated',
+            route: {
+              kind: 'child_workflow',
+              childDefinitionId: childDefinition,
+              childDefinitionVersion: 1,
+              entryBindings: [{
+                childEntryNodeId: 'entry',
+                inputRef: 'engine_start',
+                artifactId: caller.startArtifactId,
+                artifactRevision: 1,
+              }],
+              childIdempotencyKey: `return-boundary-child-${overflow ? 'over' : 'exact'}`,
+            },
+          },
+          '2026-07-22T09:01:00.000Z',
+        )).resolves.toMatchObject({ changed: true });
+        const children = await childRunsForParent(opened.client, caller.runId);
+        expect(children).toHaveLength(1);
+        const childRunId = children[0]!.run_id;
+        const childEntry = await entryTaskForRun(opened.client, childRunId);
+        const childTurn = (await queuedTurnsForTask(opened.client, childEntry!.task_id))[0]!;
+        const prefix = `[workflow-child-return] childRunId=${childRunId} change=updated\n`;
+        const result = 'x'.repeat(
+          maxAggregateBytes - Buffer.byteLength(prefix, 'utf8') + (overflow ? 1 : 0),
+        );
+
+        await expect(settleSucceeded(
+          opened.repository,
+          opened.client,
+          childEntry!.task_id,
+          childTurn.id,
+          { kind: 'workflow_next', change: 'updated', result },
+          '2026-07-22T09:02:00.000Z',
+        )).resolves.toMatchObject({ changed: true });
+
+        const childRun = await opened.client.get<{ status: string; terminal_reason_code: string | null }>(
+          `SELECT status, terminal_reason_code FROM workflow_runs
+            WHERE workspace_id = 'ws' AND run_id = ?`,
+          [childRunId],
+        );
+        const continuation = await opened.client.get<{ status: string; reason_code: string | null }>(
+          `SELECT status, reason_code FROM workflow_continuations
+            WHERE workspace_id = 'ws' AND child_run_id = ?`,
+          [childRunId],
+        );
+        const resumes = await queuedTurnsForTask(opened.client, caller.entryTaskId);
+
+        if (overflow) {
+          expect(childRun).toEqual({ status: 'failed', terminal_reason_code: 'aggregate_too_large' });
+          expect(continuation).toEqual({ status: 'failed', reason_code: 'aggregate_too_large' });
+          expect(resumes).toHaveLength(0);
+        } else {
+          expect(childRun).toEqual({ status: 'succeeded', terminal_reason_code: null });
+          expect(continuation?.status).toBe('resolved');
+          expect(resumes).toHaveLength(1);
+          const message = (await opened.repository.listMessages(caller.entryTaskId)).find(
+            (candidate) => candidate.turnId === resumes[0]!.id,
+          );
+          expect(Buffer.byteLength(message!.content, 'utf8')).toBe(maxAggregateBytes);
+          expect(message!.content).toBe(prefix + result);
+        }
+      } finally {
+        await opened.close();
+      }
     }
   }, 45_000);
 
@@ -489,7 +1086,7 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
     try {
       const createdAt = '2026-07-20T00:00:00.000Z';
       await defineVersion(opened.repository, createdAt, 'wf-caller-f', 'caller-f');
-      await defineVersion(opened.repository, createdAt, 'wf-child-f', 'child-f');
+      await defineVersion(opened.repository, createdAt, 'wf-child-f', 'child-f', 'engine_start');
       const caller = await startOneNode(
         opened.repository,
         createdAt,
@@ -505,13 +1102,22 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
         caller.entryTaskId,
         caller.activationTurnId,
         {
-          kind: 'invoke_child_workflow',
-          childDefinitionId: 'wf-child-f',
-          childDefinitionVersion: 1,
-          entryBindings: [
-            { inputRef: 'engine_start', artifactId: caller.startArtifactId },
-          ],
-          childIdempotencyKey: 's06-fail-child-ok',
+          kind: 'workflow_next',
+          change: 'updated',
+          route: {
+            kind: 'child_workflow',
+            childDefinitionId: 'wf-child-f',
+            childDefinitionVersion: 1,
+            entryBindings: [
+              {
+                childEntryNodeId: 'entry',
+                inputRef: 'engine_start',
+                artifactId: caller.startArtifactId,
+                artifactRevision: 1,
+              },
+            ],
+            childIdempotencyKey: 's06-fail-child-ok',
+          },
         },
         '2026-07-20T00:00:01.000Z',
       );
@@ -563,7 +1169,7 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
       ).toEqual(['resolved']);
 
       // --- nested failure path on a second caller invoke ---
-      await defineVersion(opened.repository, createdAt, 'wf-child-f2', 'child-f2');
+      await defineVersion(opened.repository, createdAt, 'wf-child-f2', 'child-f2', 'engine_start');
       // Second caller turn after first resume is still queued; use a new engine turn.
       const failCallerTurn = `${caller.activationTurnId}-fail-invoke`;
       const failSeq = await nextTurnSequence(opened.client, caller.entryTaskId);
@@ -593,13 +1199,22 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
         caller.entryTaskId,
         failCallerTurn,
         {
-          kind: 'invoke_child_workflow',
-          childDefinitionId: 'wf-child-f2',
-          childDefinitionVersion: 1,
-          entryBindings: [
-            { inputRef: 'engine_start', artifactId: caller.startArtifactId },
-          ],
-          childIdempotencyKey: 's06-fail-child-2',
+          kind: 'workflow_next',
+          change: 'updated',
+          route: {
+            kind: 'child_workflow',
+            childDefinitionId: 'wf-child-f2',
+            childDefinitionVersion: 1,
+            entryBindings: [
+              {
+                childEntryNodeId: 'entry',
+                inputRef: 'engine_start',
+                artifactId: caller.startArtifactId,
+                artifactRevision: 1,
+              },
+            ],
+            childIdempotencyKey: 's06-fail-child-2',
+          },
         },
         '2026-07-20T00:00:05.000Z',
       );
@@ -661,6 +1276,193 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
         (c) => c.status === 'failed',
       );
       expect(failedConts).toHaveLength(1);
+    } finally {
+      await opened.close();
+    }
+  }, 60_000);
+
+  it('three-level child failure recursively closes every run and boundary once', async () => {
+    const opened = await openRepo('recursive-fail');
+    try {
+      const chain = await startThreeLevelChain(opened, 'recursive-fail');
+      await expect(settleSucceeded(
+        opened.repository,
+        opened.client,
+        chain.taskIds[2],
+        chain.turnIds[2],
+        { kind: 'workflow_fail', reason: 'deep failure' },
+        '2026-07-22T10:03:00.000Z',
+      )).resolves.toMatchObject({ ok: true, changed: true });
+
+      const runPlaceholders = chain.runIds.map(() => '?').join(',');
+      const runs = await opened.client.all<{ status: string; terminal_reason_code: string }>(
+        `SELECT status, terminal_reason_code FROM workflow_runs
+          WHERE workspace_id = ? AND run_id IN (${runPlaceholders}) ORDER BY run_id`,
+        ['ws', ...chain.runIds],
+      );
+      expect(runs).toHaveLength(3);
+      expect(runs.every((run) => run.status === 'failed' && run.terminal_reason_code === 'agent_fail')).toBe(true);
+
+      const continuations = await opened.client.all<{
+        status: string;
+        outcome: string;
+        reason_code: string;
+        result_artifact_id: string | null;
+      }>(
+        `SELECT status, outcome, reason_code, result_artifact_id
+           FROM workflow_continuations WHERE workspace_id = ? ORDER BY continuation_id`,
+        ['ws'],
+      );
+      expect(continuations).toHaveLength(2);
+      expect(continuations.every((continuation) =>
+        continuation.status === 'failed'
+        && continuation.outcome === 'failed'
+        && continuation.reason_code === 'agent_fail'
+        && continuation.result_artifact_id === null)).toBe(true);
+      const returnGates = await opened.client.all<{ status: string; result_artifact_id: string | null }>(
+        `SELECT status, result_artifact_id FROM workflow_return_gates
+          WHERE workspace_id = ? ORDER BY return_gate_id`,
+        ['ws'],
+      );
+      expect(returnGates).toHaveLength(2);
+      expect(returnGates.every((gate) => gate.status === 'failed' && gate.result_artifact_id === null)).toBe(true);
+
+      const activeWaits = await opened.client.get<{ count: number }>(
+        `SELECT
+           (SELECT COUNT(*) FROM workflow_dependency_gates
+             WHERE workspace_id = ? AND run_id IN (${runPlaceholders}) AND status IN ('open','satisfied'))
+           + (SELECT COUNT(*) FROM workflow_feedback_rounds
+             WHERE workspace_id = ? AND run_id IN (${runPlaceholders}) AND status IN ('open','satisfied'))
+           + (SELECT COUNT(*) FROM workflow_return_gates
+             WHERE workspace_id = ? AND status IN ('open','satisfied')) AS count`,
+        ['ws', ...chain.runIds, 'ws', ...chain.runIds, 'ws'],
+      );
+      expect(activeWaits?.count).toBe(0);
+      const queued = await opened.client.get<{ count: number }>(
+        `SELECT COUNT(*) AS count FROM turns
+          WHERE workspace_id = ? AND task_id IN (?,?,?) AND status = 'queued'`,
+        ['ws', ...chain.taskIds],
+      );
+      expect(queued?.count).toBe(0);
+
+      const attention = await opened.client.all<{ id: string }>(
+        `SELECT id FROM tasks
+          WHERE workspace_id = ? AND id IN (?,?,?)
+            AND json_extract(payload_json, '$.attention.code') = 'workflow_run_failed'`,
+        ['ws', ...chain.taskIds],
+      );
+      expect(attention).toEqual([{ id: chain.taskIds[0] }]);
+      for (const taskId of chain.taskIds) {
+        await expect(opened.repository.getTask(taskId)).resolves.toMatchObject({ lifecycle: 'open' });
+      }
+
+      const reloaded = new SqliteTaskRepository(opened.client, 'ws');
+      const lateTurnId = `${chain.turnIds[2]}-redelivery`;
+      await insertEngineTurn(
+        opened.client,
+        chain.taskIds[2],
+        lateTurnId,
+        'queued',
+        '2026-07-22T10:04:00.000Z',
+        await nextTurnSequence(opened.client, chain.taskIds[2]),
+      );
+      await settleSucceeded(
+        reloaded,
+        opened.client,
+        chain.taskIds[2],
+        lateTurnId,
+        { kind: 'workflow_fail', reason: 'duplicate deep failure' },
+        '2026-07-22T10:04:00.000Z',
+      );
+      const afterReplay = await opened.client.all<{ status: string }>(
+        `SELECT status FROM workflow_continuations WHERE workspace_id = ?`,
+        ['ws'],
+      );
+      expect(afterReplay).toHaveLength(2);
+      expect(afterReplay.every((continuation) => continuation.status === 'failed')).toBe(true);
+    } finally {
+      await opened.close();
+    }
+  }, 60_000);
+
+  it('three-level child cancellation preserves lifecycle authority and typed cancellation', async () => {
+    const opened = await openRepo('recursive-cancel');
+    try {
+      const chain = await startThreeLevelChain(opened, 'recursive-cancel');
+      const at = '2026-07-22T11:03:00.000Z';
+      const leafTask = await opened.repository.getTask(chain.taskIds[2]);
+      const leafTurn = await opened.repository.getTurn(chain.turnIds[2]);
+      expect(leafTask).toBeTruthy();
+      expect(leafTurn).toBeTruthy();
+      await expect(opened.repository.execute({
+        kind: 'applyTaskLifecycle',
+        workspaceId: 'ws',
+        taskId: leafTask!.id,
+        expectedTaskRevision: leafTask!.revision,
+        task: {
+          ...leafTask!,
+          lifecycle: 'cancelled',
+          revision: leafTask!.revision + 1,
+          updatedAt: at,
+        },
+        turns: [{ ...leafTurn!, status: 'cancelled', finishedAt: at }],
+        expectedTurns: [{ id: leafTurn!.id, status: 'queued' }],
+      })).resolves.toMatchObject({ ok: true, changed: true });
+
+      const runPlaceholders = chain.runIds.map(() => '?').join(',');
+      const runs = await opened.client.all<{ status: string; terminal_reason_code: string }>(
+        `SELECT status, terminal_reason_code FROM workflow_runs
+          WHERE workspace_id = ? AND run_id IN (${runPlaceholders})`,
+        ['ws', ...chain.runIds],
+      );
+      expect(runs).toHaveLength(3);
+      expect(runs.every((run) =>
+        run.status === 'cancelled' && run.terminal_reason_code === 'required_target_cancelled')).toBe(true);
+      const continuations = await opened.client.all<{
+        status: string;
+        outcome: string;
+        reason_code: string;
+        result_artifact_id: string | null;
+      }>(
+        `SELECT status, outcome, reason_code, result_artifact_id
+          FROM workflow_continuations WHERE workspace_id = ?`,
+        ['ws'],
+      );
+      expect(continuations).toHaveLength(2);
+      expect(continuations.every((continuation) =>
+        continuation.status === 'cancelled'
+        && continuation.outcome === 'cancelled'
+        && continuation.reason_code === 'required_target_cancelled'
+        && continuation.result_artifact_id === null)).toBe(true);
+      const returnGates = await opened.client.all<{ status: string }>(
+        `SELECT status FROM workflow_return_gates WHERE workspace_id = ?`,
+        ['ws'],
+      );
+      expect(returnGates).toHaveLength(2);
+      expect(returnGates.every((gate) => gate.status === 'cancelled')).toBe(true);
+      await expect(opened.repository.getTask(chain.taskIds[0])).resolves.toMatchObject({ lifecycle: 'open' });
+      await expect(opened.repository.getTask(chain.taskIds[1])).resolves.toMatchObject({ lifecycle: 'open' });
+      await expect(opened.repository.getTask(chain.taskIds[2])).resolves.toMatchObject({ lifecycle: 'cancelled' });
+
+      const reloaded = new SqliteTaskRepository(opened.client, 'ws');
+      await expect(reloaded.execute({
+        kind: 'applyTaskLifecycle',
+        workspaceId: 'ws',
+        taskId: leafTask!.id,
+        expectedTaskRevision: leafTask!.revision,
+        task: {
+          ...leafTask!,
+          lifecycle: 'cancelled',
+          revision: leafTask!.revision + 1,
+          updatedAt: at,
+        },
+        turns: [],
+        expectedTurns: [{ id: leafTurn!.id, status: 'queued' }],
+      })).resolves.toMatchObject({ changed: false });
+      await expect(opened.client.get<{ count: number }>(
+        `SELECT COUNT(*) AS count FROM workflow_continuations WHERE workspace_id = ?`,
+        ['ws'],
+      )).resolves.toMatchObject({ count: 2 });
     } finally {
       await opened.close();
     }

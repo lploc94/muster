@@ -71,6 +71,9 @@ function expectedToolNamesForRoot(): string[] {
         'interrupt_child',
       ],
       parentId: null,
+    }, {
+      turn: { status: 'running' },
+      workspaceTrusted: true,
     }),
   ].sort();
 }

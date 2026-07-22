@@ -7,8 +7,11 @@
 import { createHash } from 'node:crypto';
 import {
   decodeDefineWorkflowInput,
+  DEFAULT_WORKFLOW_POLICY,
   encodeTopologyJson,
+  formatWorkflowEntryAggregate,
   fingerprintWorkflowDefinition,
+  maximumWorkflowEntryAggregateBytes,
 } from './workflow-codec';
 import type {
   DefineWorkflowInput,
@@ -19,17 +22,22 @@ import type {
   StartWorkflowResult,
   WorkflowDefinitionV1,
   WorkflowDependencyEdgeV1,
+  WorkflowEntryContractV1,
+  WorkflowPolicyV1,
   WorkflowTopologyV1,
 } from './workflow-types';
 
 export {
+  DEFAULT_WORKFLOW_POLICY,
   decodeDefineWorkflowInput,
   decodeGraphTopology,
   decodeOneNodeTopology,
   decodeStoredTopologyJson,
   decodeTopology,
   encodeTopologyJson,
+  formatWorkflowEntryAggregate,
   fingerprintWorkflowDefinition,
+  maximumWorkflowEntryAggregateBytes,
 } from './workflow-codec';
 export type {
   DefineWorkflowInput,
@@ -41,13 +49,21 @@ export type {
   StartWorkflowResult,
   WorkflowDefinitionV1,
   WorkflowDependencyEdgeV1,
+  WorkflowEntryContractV1,
   WorkflowNodeSpecV1,
+  WorkflowPolicyV1,
   WorkflowTopologyV1,
 } from './workflow-types';
 
 /** Operations ledger key for an immutable definition claim. */
-export function defineWorkflowLedgerKey(definitionId: string, version: number): string {
-  return `define_workflow:${definitionId}:${version}`;
+export function defineWorkflowLedgerKey(
+  definitionId: string,
+  version: number,
+  ownerRootTaskId?: string,
+): string {
+  return ownerRootTaskId
+    ? `define_workflow:${ownerRootTaskId}:${definitionId}:${version}`
+    : `define_workflow:workspace:${definitionId}:${version}`;
 }
 
 /**
@@ -131,6 +147,8 @@ export function makeOneNodeDefinition(overrides?: {
   name?: string;
   nodeId?: string;
   createdAt?: string;
+  entryContracts?: readonly WorkflowEntryContractV1[];
+  policy?: WorkflowPolicyV1;
 }): WorkflowDefinitionV1 {
   const nodeId = overrides?.nodeId ?? 'entry';
   return {
@@ -142,6 +160,9 @@ export function makeOneNodeDefinition(overrides?: {
       nodes: [{ nodeId }],
       entryNodeId: nodeId,
     },
+    entryContracts: overrides?.entryContracts ?? [],
+    policy: overrides?.policy ?? DEFAULT_WORKFLOW_POLICY,
+    scope: { kind: 'workspace' },
     createdAt: overrides?.createdAt ?? '2026-07-19T00:00:00.000Z',
   };
 }
@@ -157,6 +178,8 @@ export function makeGraphFanInDefinition(overrides?: {
   consumer?: string;
   inputRef1?: string;
   inputRef2?: string;
+  entryContracts?: readonly WorkflowEntryContractV1[];
+  policy?: WorkflowPolicyV1;
 }): WorkflowDefinitionV1 {
   const p1 = overrides?.producer1 ?? 'p1';
   const p2 = overrides?.producer2 ?? 'p2';
@@ -174,6 +197,9 @@ export function makeGraphFanInDefinition(overrides?: {
     version: overrides?.version ?? 1,
     name: overrides?.name ?? 'fan-in',
     topology,
+    entryContracts: overrides?.entryContracts ?? [],
+    policy: overrides?.policy ?? DEFAULT_WORKFLOW_POLICY,
+    scope: { kind: 'workspace' },
     createdAt: overrides?.createdAt ?? '2026-07-19T00:00:00.000Z',
   };
 }
@@ -214,8 +240,18 @@ function isNonEmptyBounded(value: unknown, max: number): value is string {
 }
 
 /** Operations ledger key for an idempotent start claim. */
-export function startWorkflowLedgerKey(startIdempotencyKey: string): string {
-  return `start_workflow:${startIdempotencyKey}`;
+export function startWorkflowLedgerKey(
+  startIdempotencyKey: string,
+  scope?: {
+    ownerRootTaskId: string;
+    callerTaskId: string;
+    definitionId: string;
+    version: number;
+  },
+): string {
+  return scope
+    ? `start_workflow:${scope.ownerRootTaskId}:${scope.callerTaskId}:${scope.definitionId}:${scope.version}:${startIdempotencyKey}`
+    : `start_workflow:workspace:${startIdempotencyKey}`;
 }
 
 /** Stable short id derived from start material (never a raw user path/SQL). */
@@ -237,6 +273,8 @@ export function deriveStartIdentities(input: {
   entryNodeId: string;
   entryNodeIds?: readonly string[];
   allNodeIds?: readonly string[];
+  entryInputRefs?: readonly { entryNodeId: string; inputRef: string }[];
+  identityScope?: string;
 }): StartWorkflowIdentities {
   const entriesSorted = [...(input.entryNodeIds ?? [input.entryNodeId])].sort();
   const allNodesSorted = [...(input.allNodeIds ?? [input.entryNodeId])].sort();
@@ -255,6 +293,7 @@ export function deriveStartIdentities(input: {
 
   if (isOneNode) {
     const base = [
+      input.identityScope ?? 'workspace',
       input.definitionId,
       String(input.version),
       input.startIdempotencyKey,
@@ -264,13 +303,21 @@ export function deriveStartIdentities(input: {
     const activationTurnId = stableId('wftn', `${base}\0turn`);
     const entryMessageId = stableId('wfm', `${base}\0message`);
     const entryGateId = stableId('wfg', `${base}\0gate`);
+    const inputRefs = input.entryInputRefs?.filter((item) => item.entryNodeId === input.entryNodeId) ?? [];
+    const entryArtifacts = (inputRefs.length > 0 ? inputRefs : [{ entryNodeId: input.entryNodeId, inputRef: 'engine_start' }])
+      .map((item) => ({
+        entryNodeId: input.entryNodeId,
+        inputRef: item.inputRef,
+        artifactId: stableId('wfa', `${base}\0artifact\0${item.inputRef}`),
+      }));
+    const activationId = stableId('wfact', `${base}\0entry_start`);
     return {
       runId: stableId('wfr', base),
       entryTaskId,
       activationTurnId,
       entryMessageId,
       entryGateId,
-      startArtifactId: stableId('wfa', `${base}\0artifact`),
+      startArtifactId: entryArtifacts[0]!.artifactId,
       nodeGates: [{ nodeId: input.entryNodeId, gateId: entryGateId }],
       entries: [
         {
@@ -279,19 +326,21 @@ export function deriveStartIdentities(input: {
           gateId: entryGateId,
           activationTurnId,
           messageId: entryMessageId,
+          activationId,
         },
       ],
+      entryArtifacts,
     };
   }
 
   // Multi-node: run id shared across nodes; gates/tasks keyed by node id.
   const runBase = [
+    input.identityScope ?? 'workspace',
     input.definitionId,
     String(input.version),
     input.startIdempotencyKey,
   ].join('\0');
   const runId = stableId('wfr', runBase);
-  const startArtifactId = stableId('wfa', `${runBase}\0artifact`);
   const nodeGates = allNodesSorted.map((nodeId) => ({
     nodeId,
     gateId: stableId('wfg', `${runBase}\0gate\0${nodeId}`),
@@ -305,7 +354,16 @@ export function deriveStartIdentities(input: {
       gateId,
       activationTurnId: stableId('wftn', `${runBase}\0turn\0${nodeId}`),
       messageId: stableId('wfm', `${runBase}\0message\0${nodeId}`),
+      activationId: stableId('wfact', `${runBase}\0entry_start\0${nodeId}`),
     };
+  });
+  const entryArtifacts = entriesSorted.flatMap((entryNodeId) => {
+    const refs = input.entryInputRefs?.filter((item) => item.entryNodeId === entryNodeId) ?? [];
+    return (refs.length > 0 ? refs : [{ entryNodeId, inputRef: 'engine_start' }]).map((item) => ({
+      entryNodeId,
+      inputRef: item.inputRef,
+      artifactId: stableId('wfa', `${runBase}\0artifact\0${entryNodeId}\0${item.inputRef}`),
+    }));
   });
   const primary =
     entries.find((e) => e.nodeId === input.entryNodeId) ?? entries[0]!;
@@ -315,9 +373,10 @@ export function deriveStartIdentities(input: {
     activationTurnId: primary.activationTurnId,
     entryMessageId: primary.messageId,
     entryGateId: primary.gateId,
-    startArtifactId,
+    startArtifactId: entryArtifacts[0]!.artifactId,
     nodeGates,
     entries,
+    entryArtifacts,
   };
 }
 
@@ -400,6 +459,22 @@ export function deriveFeedbackRequestMessageId(
   );
 }
 
+export function deriveFeedbackTargetId(
+  runId: string,
+  roundId: string,
+  targetNodeId: string,
+): string {
+  return stableId('wftg', `${runId}\0feedback_target\0${roundId}\0${targetNodeId}`);
+}
+
+export function deriveFeedbackRequestActivationId(
+  runId: string,
+  roundId: string,
+  targetNodeId: string,
+): string {
+  return stableId('wfact', `${runId}\0feedback_request\0${roundId}\0${targetNodeId}`);
+}
+
 /** Durable feedback_response fence id for one target response. */
 export function deriveFeedbackResponseMessageId(
   runId: string,
@@ -446,6 +521,10 @@ export function deriveFeedbackResumeMessageId(runId: string, roundId: string): s
   return stableId('wfm', `${runId}\0feedback_resume_message\0${roundId}`);
 }
 
+export function deriveFeedbackResumeActivationId(runId: string, roundId: string): string {
+  return stableId('wfact', `${runId}\0feedback_resume\0${roundId}`);
+}
+
 
 /**
  * M018 S05 fail-fast closure identities / reason codes / host-clamped budgets (D052).
@@ -458,9 +537,11 @@ export const WORKFLOW_FAIL_REASON_CODES = [
   'agent_fail',
   'invalid_route',
   'run_timeout',
+  'aggregate_too_large',
   'feedback_budget_exhausted',
   'turn_budget_exhausted',
   'required_target_cancelled',
+  'required_target_unavailable',
 ] as const;
 
 export type WorkflowFailReasonCode = (typeof WORKFLOW_FAIL_REASON_CODES)[number];
@@ -627,23 +708,38 @@ export function deriveChildStartIdempotencyKey(input: {
 
 /** Surface validation for invoke_child entry bindings (ids only; settle validates ownership). */
 export function validateInvokeChildEntryBindings(
-  entryBindings: readonly { inputRef: string; artifactId: string }[],
+  entryBindings: readonly {
+    childEntryNodeId: string;
+    inputRef: string;
+    artifactId: string;
+    artifactRevision: number;
+  }[],
 ): { ok: true } | { ok: false; reason: string } {
   if (!Array.isArray(entryBindings) || entryBindings.length === 0) {
     return { ok: false, reason: 'entryBindings must be non-empty' };
   }
   const seen = new Set<string>();
   for (const b of entryBindings) {
+    if (!b || typeof b.childEntryNodeId !== 'string' || b.childEntryNodeId.length === 0) {
+      return { ok: false, reason: 'entryBinding childEntryNodeId required' };
+    }
     if (!b || typeof b.inputRef !== 'string' || b.inputRef.length === 0) {
       return { ok: false, reason: 'entryBinding inputRef required' };
     }
     if (typeof b.artifactId !== 'string' || b.artifactId.length === 0) {
       return { ok: false, reason: 'entryBinding artifactId required' };
     }
-    if (seen.has(b.inputRef)) {
-      return { ok: false, reason: `duplicate entryBinding inputRef: ${b.inputRef}` };
+    if (!Number.isInteger(b.artifactRevision) || b.artifactRevision < 1) {
+      return { ok: false, reason: 'entryBinding artifactRevision must be positive' };
     }
-    seen.add(b.inputRef);
+    const bindingKey = `${b.childEntryNodeId}\0${b.inputRef}`;
+    if (seen.has(bindingKey)) {
+      return {
+        ok: false,
+        reason: `duplicate entryBinding: ${b.childEntryNodeId}/${b.inputRef}`,
+      };
+    }
+    seen.add(bindingKey);
   }
   return { ok: true };
 }
@@ -676,6 +772,11 @@ export function fingerprintStartWorkflow(input: {
   entryNodeId: string;
   goal: string;
   backend: string;
+  ownerRootTaskId?: string;
+  callerTaskId?: string;
+  callerTurnId?: string;
+  entryInputs?: readonly { entryNodeId: string; inputRef: string; kind: string; value: string }[];
+  policy?: WorkflowPolicyV1;
 }): string {
   const payload = JSON.stringify({
     definitionId: input.definitionId,
@@ -684,6 +785,16 @@ export function fingerprintStartWorkflow(input: {
     entryNodeId: input.entryNodeId,
     goal: input.goal,
     backend: input.backend,
+    ownerRootTaskId: input.ownerRootTaskId,
+    callerTaskId: input.callerTaskId,
+    callerTurnId: input.callerTurnId,
+    entryInputs: (input.entryInputs ?? []).map((entryInput) => ({
+      entryNodeId: entryInput.entryNodeId,
+      inputRef: entryInput.inputRef,
+      kind: entryInput.kind,
+      valueSha256: createHash('sha256').update(entryInput.value, 'utf8').digest('hex'),
+    })),
+    policy: input.policy,
   });
   return createHash('sha256').update(payload, 'utf8').digest('hex');
 }
@@ -704,6 +815,12 @@ export function validateStartWorkflow(
       createdAt: string;
       goal: string;
       backend: string;
+      entryInputs: readonly NonNullable<StartWorkflowInput['entryInputs']>[number][];
+      entryContracts: readonly WorkflowEntryContractV1[];
+      policy: WorkflowPolicyV1;
+      ownerRootTaskId?: string;
+      callerTaskId?: string;
+      callerTurnId?: string;
       identities: StartWorkflowIdentities;
       fingerprint: string;
     }
@@ -717,7 +834,11 @@ export function validateStartWorkflow(
   if (!isNonEmptyBounded(input.startIdempotencyKey, MAX_START_KEY_LEN)) {
     return { ok: false, reason: 'invalid startIdempotencyKey' };
   }
-  if (!isNonEmptyBounded(input.createdAt, 64)) {
+  if (
+    !isNonEmptyBounded(input.createdAt, 64) ||
+    !Number.isFinite(Date.parse(input.createdAt)) ||
+    new Date(input.createdAt).toISOString() !== input.createdAt
+  ) {
     return { ok: false, reason: 'invalid createdAt' };
   }
   if (!isNonEmptyBounded(input.entryNodeId, 128)) {
@@ -729,8 +850,13 @@ export function validateStartWorkflow(
   if (input.backend !== undefined && !isNonEmptyBounded(input.backend, MAX_BACKEND_LEN)) {
     return { ok: false, reason: 'invalid backend' };
   }
+  const authorityValues = [input.ownerRootTaskId, input.callerTaskId, input.callerTurnId];
+  if (authorityValues.some((value) => value !== undefined) && authorityValues.some((value) => value === undefined)) {
+    return { ok: false, reason: 'invalid caller authority' };
+  }
   const goal = input.goal ?? input.definitionId;
   const backend = input.backend ?? 'grok';
+  const policy = input.policy ?? DEFAULT_WORKFLOW_POLICY;
   const entryNodeIds = input.entryNodeIds ?? [input.entryNodeId];
   const allNodeIds = input.allNodeIds ?? [input.entryNodeId];
   if (!entryNodeIds.includes(input.entryNodeId)) {
@@ -747,6 +873,44 @@ export function validateStartWorkflow(
       return { ok: false, reason: 'entry node missing from allNodeIds' };
     }
   }
+  const contracts = input.entryContracts ?? [];
+  const entryInputs = input.entryInputs ?? [];
+  const contractByKey = new Map<string, WorkflowEntryContractV1>(
+    contracts.map((contract) => [`${contract.entryNodeId}\0${contract.inputRef}`, contract] as const),
+  );
+  const inputByKey = new Map<string, (typeof entryInputs)[number]>();
+  for (const entryInput of entryInputs) {
+    if (
+      !isNonEmptyBounded(entryInput.entryNodeId, 128) ||
+      !isNonEmptyBounded(entryInput.inputRef, 128) ||
+      !isNonEmptyBounded(entryInput.kind, 128) ||
+      typeof entryInput.value !== 'string'
+    ) {
+      return { ok: false, reason: 'invalid entry input' };
+    }
+    const key = `${entryInput.entryNodeId}\0${entryInput.inputRef}`;
+    if (inputByKey.has(key)) return { ok: false, reason: 'duplicate entry input' };
+    const contract = contractByKey.get(key);
+    if (!contract || contract.expectedArtifactKind !== entryInput.kind) {
+      return { ok: false, reason: 'entry input contract mismatch' };
+    }
+    if (Buffer.byteLength(entryInput.value, 'utf8') > policy.maxArtifactBytes) {
+      return { ok: false, reason: 'entry artifact too large' };
+    }
+    inputByKey.set(key, entryInput);
+  }
+  if (inputByKey.size !== contractByKey.size) {
+    return { ok: false, reason: 'incomplete entry inputs' };
+  }
+  for (const key of contractByKey.keys()) {
+    if (!inputByKey.has(key)) return { ok: false, reason: 'incomplete entry inputs' };
+  }
+  if (contracts.length > 0 && input.callerTaskId === undefined) {
+    return { ok: false, reason: 'caller authority required for entry inputs' };
+  }
+  const orderedEntryInputs = contracts.map((contract) =>
+    inputByKey.get(`${contract.entryNodeId}\0${contract.inputRef}`)!,
+  );
   let identities: StartWorkflowIdentities;
   try {
     identities = deriveStartIdentities({
@@ -756,6 +920,10 @@ export function validateStartWorkflow(
       entryNodeId: input.entryNodeId,
       entryNodeIds,
       allNodeIds,
+      entryInputRefs: contracts,
+      identityScope: input.ownerRootTaskId && input.callerTaskId
+        ? `${input.ownerRootTaskId}\0${input.callerTaskId}`
+        : 'workspace',
     });
   } catch {
     return { ok: false, reason: 'invalid start identities' };
@@ -767,6 +935,11 @@ export function validateStartWorkflow(
     entryNodeId: input.entryNodeId,
     goal,
     backend,
+    ...(input.ownerRootTaskId !== undefined ? { ownerRootTaskId: input.ownerRootTaskId } : {}),
+    ...(input.callerTaskId !== undefined ? { callerTaskId: input.callerTaskId } : {}),
+    ...(input.callerTurnId !== undefined ? { callerTurnId: input.callerTurnId } : {}),
+    entryInputs: orderedEntryInputs,
+    policy,
   });
   return {
     ok: true,
@@ -777,6 +950,12 @@ export function validateStartWorkflow(
     createdAt: input.createdAt,
     goal,
     backend,
+    entryInputs: orderedEntryInputs,
+    entryContracts: contracts,
+    policy,
+    ...(input.ownerRootTaskId !== undefined ? { ownerRootTaskId: input.ownerRootTaskId } : {}),
+    ...(input.callerTaskId !== undefined ? { callerTaskId: input.callerTaskId } : {}),
+    ...(input.callerTurnId !== undefined ? { callerTurnId: input.callerTurnId } : {}),
     identities,
     fingerprint,
   };
@@ -803,6 +982,7 @@ export function startWorkflowCreated(
     fingerprint: validated.fingerprint,
     nodeGates: identities.nodeGates,
     entries: identities.entries,
+    entryArtifacts: identities.entryArtifacts,
   };
 }
 

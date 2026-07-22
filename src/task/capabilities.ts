@@ -1,4 +1,4 @@
-import type { MusterTask, TaskCapability } from './types';
+import type { MusterTask, TaskCapability, TaskTurn } from './types';
 
 export type CoordinatorAction =
   | 'create_task'
@@ -31,7 +31,7 @@ export type AnyTaskAction =
   | 'workflow_prev'
   /** M018 S05: stage workflow FAIL disposition (does not seal lifecycle). */
   | 'workflow_fail'
-  /** M018 S06: stage child-workflow invocation disposition (does not seal lifecycle). */
+  /** M018 S06: stage the child-workflow NEXT route (does not seal lifecycle). */
   | 'invoke_child_workflow';
 
 export type ToolAction = CoordinatorAction | AnyTaskAction;
@@ -71,14 +71,16 @@ const ANY_TASK_ACTIONS: AnyTaskAction[] = [
   'fail_task',
   'report_progress',
   'get_host_context',
-  'workflow_next',
-  'workflow_prev',
-  'workflow_fail',
-  'invoke_child_workflow',
 ];
+
+export interface CapabilityContext {
+  turn?: Pick<TaskTurn, 'status' | 'workflowActivation'>;
+  workspaceTrusted?: boolean;
+}
 
 export function capabilitiesFor(
   task: Pick<MusterTask, 'role' | 'capabilities' | 'parentId'>,
+  context: CapabilityContext = {},
 ): Set<ToolAction> {
   const granted = new Set<ToolAction>(ANY_TASK_ACTIONS);
   // Non-root uses ask_parent; root uses ACP elicitation (not MCP ask_user).
@@ -93,5 +95,33 @@ export function capabilitiesFor(
       }
     }
   }
+
+  const turn = context.turn;
+  const isLiveTurn = turn?.status === 'queued' || turn?.status === 'running' || turn?.status === 'waiting_user';
+  const activation = turn?.workflowActivation;
+  const isLiveActivation =
+    isLiveTurn &&
+    activation?.runStatus === 'running' &&
+    (activation.activationStatus === 'queued' || activation.activationStatus === 'running');
+  if (isLiveActivation) {
+    granted.add('workflow_next');
+    if (activation.hasDirectDependencies) granted.add('workflow_prev');
+    granted.add('workflow_fail');
+  }
+
+  const canCreateChildWorkflow =
+    isLiveTurn &&
+    context.workspaceTrusted !== false &&
+    task.role === 'coordinator' &&
+    task.capabilities.includes('create_child') &&
+    (
+      activation === undefined
+        ? task.parentId === null || task.parentId === undefined
+        : isLiveActivation &&
+          activation.isTerminalNode &&
+          !activation.hasOpenFeedbackRound &&
+          !activation.hasPendingContinuation
+    );
+  if (canCreateChildWorkflow) granted.add('invoke_child_workflow');
   return granted;
 }

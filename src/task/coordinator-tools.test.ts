@@ -7,6 +7,7 @@ import {
 } from './coordinator-tools';
 import type { CredentialContext } from '../bridge/credentials';
 import { normalizeVerdict } from './verdict';
+import { DEFAULT_WORKFLOW_POLICY } from './workflow';
 
 function ctx(actions: string[]): CredentialContext {
   return {
@@ -14,6 +15,7 @@ function ctx(actions: string[]): CredentialContext {
     rootId: 'root',
     callerTaskId: 'task-1',
     turnId: 'turn-1',
+    attemptId: 'attempt-1',
     allowedActions: new Set(actions as import('./capabilities').ToolAction[]),
     expiry: Date.now() + 60_000,
   };
@@ -290,6 +292,8 @@ describe('coordinator-tools dispatch', () => {
         version: 1,
         name: 'one-node',
         topology,
+        entryContracts: [],
+        policy: DEFAULT_WORKFLOW_POLICY,
       },
       ctx(['define_workflow']),
     );
@@ -302,6 +306,8 @@ describe('coordinator-tools dispatch', () => {
         version: 1,
         name: 'one-node',
         topology,
+        entryContracts: [],
+        policy: DEFAULT_WORKFLOW_POLICY,
       },
     });
 
@@ -314,6 +320,7 @@ describe('coordinator-tools dispatch', () => {
         startIdempotencyKey: 'idem-1',
         goal: 'run one-node',
         backend: 'grok',
+        entryInputs: [],
       },
       ctx(['start_workflow']),
     );
@@ -327,6 +334,7 @@ describe('coordinator-tools dispatch', () => {
         startIdempotencyKey: 'idem-1',
         goal: 'run one-node',
         backend: 'grok',
+        entryInputs: [],
       },
     });
 
@@ -1090,5 +1098,47 @@ describe('workflow_next tool surface', () => {
         ctx(['complete_task']),
       ),
     ).toEqual({ ok: false, toolError: 'action not permitted: workflow_fail' });
+  });
+
+  it('maps child workflow bindings with exact entry and artifact revision identity', () => {
+    const binding = {
+      childEntryNodeId: 'entry-a',
+      inputRef: 'request',
+      artifactId: 'artifact-1',
+      artifactRevision: 3,
+    };
+    expect(dispatch(
+      'invoke_child_workflow',
+      {
+        opId: 'op-child',
+        childDefinitionId: 'wf-child',
+        childDefinitionVersion: 2,
+        entryBindings: [binding],
+      },
+      ctx(['invoke_child_workflow']),
+    )).toEqual({
+      ok: true,
+      command: {
+        kind: 'invoke_child_workflow',
+        opId: 'op-child',
+        childDefinitionId: 'wf-child',
+        childDefinitionVersion: 2,
+        entryBindings: [binding],
+      },
+    });
+    expect(dispatch(
+      'invoke_child_workflow',
+      {
+        opId: 'op-child-invalid',
+        childDefinitionId: 'wf-child',
+        childDefinitionVersion: 2,
+        entryBindings: [{ ...binding, artifactRevision: 0 }],
+      },
+      ctx(['invoke_child_workflow']),
+    )).toEqual({
+      ok: false,
+      toolError:
+        'each entryBinding requires childEntryNodeId, inputRef, artifactId, and a positive artifactRevision',
+    });
   });
 });

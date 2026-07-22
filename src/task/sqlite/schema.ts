@@ -13,26 +13,13 @@
 /** Muster's private SQLite `application_id` (verified before reading schema, plan §3.4). */
 export const MUSTER_APPLICATION_ID = 0x4d555354; // 'MUST'
 
-/**
- * Frozen schema v7 identity. Migration input validation depends on this remaining
- * stable after the compiled current schema advances beyond v8.
- */
-export const SCHEMA_V7 = 7 as const;
-
-/** Schema v8 identity (workflow tables + writer-version fence). */
-export const SCHEMA_V8 = 8 as const;
-
-/** Schema v9 identity (relational workflow authority primitives). */
-export const SCHEMA_V9 = 9 as const;
-
-/** Current schema version, tracked via `PRAGMA user_version`. */
-export const SQLITE_SCHEMA_VERSION = SCHEMA_V9;
+/** Clean-break development schema marker. Older stores require an explicit reset. */
+export const SQLITE_SCHEMA_VERSION = 1 as const;
 
 /**
- * Frozen v7 required tables (migration-input / populated fixture counts).
- * Immutable after freeze — do not append workflow tables here.
+ * Core task-store tables.
  */
-export const REQUIRED_SCHEMA_V7_TABLES = [
+const REQUIRED_CORE_TABLES = [
   'workspaces',
   'workspace_locations',
   'tasks',
@@ -57,9 +44,9 @@ export const REQUIRED_SCHEMA_V7_TABLES = [
 ] as const;
 
 /**
- * Workflow tables introduced by schema v8 (additive; never rewrite v7 history).
+ * Workflow protocol tables.
  */
-export const REQUIRED_SCHEMA_V8_WORKFLOW_TABLES = [
+const REQUIRED_WORKFLOW_TABLES = [
   'workflow_definitions',
   'workflow_runs',
   'workflow_nodes',
@@ -73,7 +60,7 @@ export const REQUIRED_SCHEMA_V8_WORKFLOW_TABLES = [
   'workflow_continuations',
 ] as const;
 
-export const REQUIRED_SCHEMA_V9_WORKFLOW_TABLES = [
+const REQUIRED_WORKFLOW_AUTHORITY_TABLES = [
   'workflow_definition_nodes',
   'workflow_definition_edges',
   'workflow_entry_contracts',
@@ -84,7 +71,6 @@ export const REQUIRED_SCHEMA_V9_WORKFLOW_TABLES = [
   'session_owners',
   'task_session_bindings',
   'turn_disposition_claims',
-  'workflow_migration_quarantine',
 ] as const;
 
 /**
@@ -92,14 +78,14 @@ export const REQUIRED_SCHEMA_V9_WORKFLOW_TABLES = [
  * Bounded preflight checks these names only — not full integrity_check.
  */
 export const REQUIRED_SCHEMA_TABLES = [
-  ...REQUIRED_SCHEMA_V7_TABLES,
-  ...REQUIRED_SCHEMA_V8_WORKFLOW_TABLES,
-  ...REQUIRED_SCHEMA_V9_WORKFLOW_TABLES,
+  ...REQUIRED_CORE_TABLES,
+  ...REQUIRED_WORKFLOW_TABLES,
+  ...REQUIRED_WORKFLOW_AUTHORITY_TABLES,
 ] as const;
 
 export const REQUIRED_SCHEMA_TRIGGERS = ['trg_send_outbox_capacity'] as const;
 
-/** Connection-local UDF name used by v8 writer-guard triggers. */
+/** Connection-local UDF name used by writer-guard triggers. */
 export const MUSTER_WRITER_VERSION_UDF = 'muster_writer_version';
 
 /**
@@ -110,11 +96,9 @@ export const MUSTER_WRITER_VERSION_UDF = 'muster_writer_version';
 export const CHANGE_FEED_RETAIN_REVISIONS = 4096;
 
 /**
- * Frozen schema-v7 DDL. Immutable after freeze — a compiled v8 binary validates
- * migration candidates against this exact statement set / fingerprint, not against
- * whatever CURRENT_SCHEMA_STATEMENTS has become.
+ * Core task-store DDL.
  */
-export const SCHEMA_V7_STATEMENTS: readonly string[] = [
+const CORE_SCHEMA_STATEMENTS: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS workspaces (
     id TEXT PRIMARY KEY,
     identity_key TEXT NOT NULL UNIQUE,
@@ -421,15 +405,6 @@ export const SCHEMA_V7_STATEMENTS: readonly string[] = [
      ON presentation_operations(workspace_id, root_id, presentation_id)`,
 ];
 
-/**
- * Closed mutable-table allowlist for v8 writer-guard triggers.
- * Generated deterministically so migration output fingerprints match blank claim.
- */
-export const SCHEMA_V8_WRITER_GUARD_TABLES: readonly string[] = [
-  ...REQUIRED_SCHEMA_V7_TABLES,
-  ...REQUIRED_SCHEMA_V8_WORKFLOW_TABLES,
-];
-
 function writerGuardTriggerStatements(
   tables: readonly string[],
   writerVersion: number,
@@ -452,24 +427,22 @@ END`,
   return statements;
 }
 
-function writerGuardTriggerNames(tables: readonly string[]): string[] {
-  const events = ['insert', 'update', 'delete'] as const;
-  return tables.flatMap((table) => events.map((event) => `trg_wg_${table}_${event}`));
-}
+const DEFAULT_WORKFLOW_POLICY_JSON = JSON.stringify({
+  maxFeedbackRoundsPerRun: 8,
+  maxTurnsPerTask: 50,
+  maxWorkflowTurnsPerRun: 64,
+  runTimeoutMs: 1_800_000,
+  maxDepth: 8,
+  maxTaskCount: 64,
+  maxConcurrency: 20,
+  maxInputsPerGate: 64,
+  maxArtifactBytes: 65_536,
+  maxAggregateBytes: 262_144,
+  failWorkflow: true,
+});
 
-export const SCHEMA_V8_WRITER_GUARD_TRIGGER_NAMES: readonly string[] =
-  writerGuardTriggerNames(SCHEMA_V8_WRITER_GUARD_TABLES);
-
-const SCHEMA_V8_WRITER_GUARD_STATEMENTS: readonly string[] = writerGuardTriggerStatements(
-  SCHEMA_V8_WRITER_GUARD_TABLES,
-  SCHEMA_V8,
-);
-
-/**
- * Additive schema-v8 DDL only (workflow tables/indexes + writer-guard triggers).
- * Applied under BEGIN EXCLUSIVE during v7→v8 migration; never rewrites v7 rows.
- */
-export const SCHEMA_V8_MIGRATION_STATEMENTS: readonly string[] = [
+/** Workflow topology and runtime DDL. */
+const WORKFLOW_SCHEMA_STATEMENTS: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS workflow_definitions (
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
     definition_id TEXT NOT NULL,
@@ -477,6 +450,11 @@ export const SCHEMA_V8_MIGRATION_STATEMENTS: readonly string[] = [
     name TEXT NOT NULL,
     entry_node_id TEXT NOT NULL,
     topology_json TEXT NOT NULL,
+    scope_kind TEXT NOT NULL DEFAULT 'workspace' CHECK (scope_kind IN ('workspace', 'root')),
+    owner_root_task_id TEXT,
+    fingerprint TEXT NOT NULL DEFAULT '',
+    policy_json TEXT NOT NULL DEFAULT '${DEFAULT_WORKFLOW_POLICY_JSON}'
+      CHECK (json_valid(policy_json) = 1),
     created_at TEXT NOT NULL,
     PRIMARY KEY (workspace_id, definition_id, version)
   )`,
@@ -489,9 +467,39 @@ export const SCHEMA_V8_MIGRATION_STATEMENTS: readonly string[] = [
     status TEXT NOT NULL,
     origin TEXT NOT NULL,
     parent_run_id TEXT,
+    owner_root_task_id TEXT,
+    caller_task_id TEXT,
+    caller_turn_id TEXT,
+    continuation_id TEXT,
+    policy_json TEXT NOT NULL DEFAULT '${DEFAULT_WORKFLOW_POLICY_JSON}'
+      CHECK (json_valid(policy_json) = 1),
+    max_feedback_rounds INTEGER NOT NULL DEFAULT 8 CHECK (max_feedback_rounds BETWEEN 1 AND 32),
+    max_turns_per_task INTEGER NOT NULL DEFAULT 50 CHECK (max_turns_per_task BETWEEN 1 AND 500),
+    max_workflow_turns INTEGER NOT NULL DEFAULT 64 CHECK (max_workflow_turns BETWEEN 1 AND 256),
+    max_children INTEGER NOT NULL DEFAULT 64 CHECK (max_children BETWEEN 1 AND 64),
+    max_depth INTEGER NOT NULL DEFAULT 8 CHECK (max_depth BETWEEN 1 AND 8),
+    max_concurrency INTEGER NOT NULL DEFAULT 20 CHECK (max_concurrency BETWEEN 1 AND 64),
+    max_aggregate_bytes INTEGER NOT NULL DEFAULT 262144
+      CHECK (max_aggregate_bytes BETWEEN 1 AND 1048576),
+    feedback_rounds_reserved INTEGER NOT NULL DEFAULT 0 CHECK (feedback_rounds_reserved >= 0),
+    workflow_turns_reserved INTEGER NOT NULL DEFAULT 0 CHECK (workflow_turns_reserved >= 0),
+    children_reserved INTEGER NOT NULL DEFAULT 0 CHECK (children_reserved >= 0),
+    started_at TEXT,
+    deadline_at TEXT,
+    terminal_reason_code TEXT,
+    terminal_result_run_id TEXT,
+    terminal_result_artifact_id TEXT,
+    terminal_result_artifact_revision INTEGER,
+    closure_id TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (workspace_id, run_id),
+    CHECK ((owner_root_task_id IS NULL) = (caller_task_id IS NULL)),
+    CHECK ((caller_task_id IS NULL) = (caller_turn_id IS NULL)),
+    CHECK (
+      (terminal_result_run_id IS NULL AND terminal_result_artifact_id IS NULL AND terminal_result_artifact_revision IS NULL)
+      OR (terminal_result_run_id IS NOT NULL AND terminal_result_artifact_id IS NOT NULL AND terminal_result_artifact_revision IS NOT NULL)
+    ),
     FOREIGN KEY (workspace_id, definition_id, definition_version)
       REFERENCES workflow_definitions(workspace_id, definition_id, version)
   )`,
@@ -515,6 +523,9 @@ export const SCHEMA_V8_MIGRATION_STATEMENTS: readonly string[] = [
     gate_id TEXT NOT NULL,
     consumer_node_id TEXT NOT NULL,
     status TEXT NOT NULL,
+    activation_id TEXT,
+    reserved_turn_id TEXT,
+    aggregate_message_id TEXT,
     PRIMARY KEY (workspace_id, run_id, gate_id),
     FOREIGN KEY (workspace_id, run_id)
       REFERENCES workflow_runs(workspace_id, run_id) ON DELETE CASCADE
@@ -525,7 +536,7 @@ export const SCHEMA_V8_MIGRATION_STATEMENTS: readonly string[] = [
     run_id TEXT NOT NULL,
     gate_id TEXT NOT NULL,
     input_ref TEXT NOT NULL,
-    producer_node_id TEXT NOT NULL,
+    producer_node_id TEXT,
     required_kind TEXT NOT NULL,
     PRIMARY KEY (workspace_id, run_id, gate_id, input_ref),
     FOREIGN KEY (workspace_id, run_id, gate_id)
@@ -537,7 +548,7 @@ export const SCHEMA_V8_MIGRATION_STATEMENTS: readonly string[] = [
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
     run_id TEXT NOT NULL,
     artifact_id TEXT NOT NULL,
-    producer_node_id TEXT NOT NULL,
+    producer_node_id TEXT,
     logical_name TEXT NOT NULL,
     revision INTEGER NOT NULL,
     kind TEXT NOT NULL,
@@ -553,13 +564,19 @@ export const SCHEMA_V8_MIGRATION_STATEMENTS: readonly string[] = [
     run_id TEXT NOT NULL,
     gate_id TEXT NOT NULL,
     input_ref TEXT NOT NULL,
+    artifact_run_id TEXT,
     artifact_id TEXT NOT NULL,
     artifact_revision INTEGER NOT NULL,
     filled_at TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, run_id, gate_id, input_ref, artifact_id, artifact_revision),
+    PRIMARY KEY (workspace_id, run_id, gate_id, input_ref),
     FOREIGN KEY (workspace_id, run_id, gate_id)
       REFERENCES workflow_dependency_gates(workspace_id, run_id, gate_id)
-      ON DELETE CASCADE
+      ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, run_id, gate_id, input_ref)
+      REFERENCES workflow_gate_bindings(workspace_id, run_id, gate_id, input_ref)
+      ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, artifact_id, artifact_revision)
+      REFERENCES workflow_artifacts(workspace_id, artifact_id, revision)
   )`,
 
   `CREATE TABLE IF NOT EXISTS workflow_feedback_rounds (
@@ -567,10 +584,20 @@ export const SCHEMA_V8_MIGRATION_STATEMENTS: readonly string[] = [
     run_id TEXT NOT NULL,
     round_id TEXT NOT NULL,
     requester_node_id TEXT NOT NULL,
+    requester_task_id TEXT,
+    requester_turn_id TEXT,
+    requester_activation_id TEXT,
+    inherited_round_id TEXT,
+    inherited_target_id TEXT,
+    resume_activation_id TEXT,
+    resume_turn_id TEXT,
     status TEXT NOT NULL,
     join_mode TEXT NOT NULL,
     created_at TEXT NOT NULL,
+    updated_at TEXT,
     PRIMARY KEY (workspace_id, run_id, round_id),
+    CHECK ((inherited_round_id IS NULL AND inherited_target_id IS NULL) OR (inherited_round_id IS NOT NULL AND inherited_target_id IS NOT NULL)),
+    CHECK ((resume_activation_id IS NULL AND resume_turn_id IS NULL) OR (resume_activation_id IS NOT NULL AND resume_turn_id IS NOT NULL)),
     FOREIGN KEY (workspace_id, run_id)
       REFERENCES workflow_runs(workspace_id, run_id) ON DELETE CASCADE
   )`,
@@ -580,6 +607,19 @@ export const SCHEMA_V8_MIGRATION_STATEMENTS: readonly string[] = [
     run_id TEXT NOT NULL,
     round_id TEXT NOT NULL,
     target_node_id TEXT NOT NULL,
+    target_id TEXT,
+    input_ref TEXT,
+    target_task_id TEXT,
+    base_artifact_run_id TEXT,
+    base_artifact_id TEXT,
+    base_artifact_revision INTEGER,
+    request_activation_id TEXT,
+    request_turn_id TEXT,
+    request_message_id TEXT,
+    response_turn_id TEXT,
+    response_artifact_run_id TEXT,
+    response_artifact_id TEXT,
+    response_artifact_revision INTEGER,
     status TEXT NOT NULL,
     PRIMARY KEY (workspace_id, run_id, round_id, target_node_id),
     FOREIGN KEY (workspace_id, run_id, round_id)
@@ -591,8 +631,19 @@ export const SCHEMA_V8_MIGRATION_STATEMENTS: readonly string[] = [
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
     run_id TEXT NOT NULL,
     message_id TEXT NOT NULL,
+    idempotency_key TEXT,
     source_node_id TEXT NOT NULL,
+    source_task_id TEXT,
+    source_turn_id TEXT,
     destination_node_id TEXT NOT NULL,
+    destination_task_id TEXT,
+    gate_id TEXT,
+    feedback_round_id TEXT,
+    feedback_target_id TEXT,
+    continuation_id TEXT,
+    artifact_run_id TEXT,
+    artifact_id TEXT,
+    artifact_revision INTEGER,
     kind TEXT NOT NULL,
     body_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -605,10 +656,26 @@ export const SCHEMA_V8_MIGRATION_STATEMENTS: readonly string[] = [
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
     run_id TEXT NOT NULL,
     continuation_id TEXT NOT NULL,
+    invocation_key TEXT,
+    invocation_fingerprint TEXT,
+    caller_task_id TEXT,
+    caller_turn_id TEXT,
+    caller_run_id TEXT,
+    caller_node_id TEXT,
+    child_run_id TEXT,
+    return_gate_id TEXT,
     kind TEXT NOT NULL,
     status TEXT NOT NULL,
+    outcome TEXT CHECK (outcome IS NULL OR outcome IN ('succeeded', 'failed', 'cancelled')),
+    reason_code TEXT,
+    result_artifact_run_id TEXT,
+    result_artifact_id TEXT,
+    result_artifact_revision INTEGER,
+    producing_turn_id TEXT,
+    resolved_at TEXT,
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
+    updated_at TEXT,
     PRIMARY KEY (workspace_id, run_id, continuation_id),
     FOREIGN KEY (workspace_id, run_id)
       REFERENCES workflow_runs(workspace_id, run_id) ON DELETE CASCADE
@@ -626,27 +693,14 @@ export const SCHEMA_V8_MIGRATION_STATEMENTS: readonly string[] = [
      ON workflow_artifacts(workspace_id, run_id, logical_name, revision)`,
   `CREATE INDEX IF NOT EXISTS idx_workflow_feedback_rounds_status
      ON workflow_feedback_rounds(workspace_id, run_id, status)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_feedback_rounds_live_requester
+     ON workflow_feedback_rounds(workspace_id, run_id, requester_node_id)
+     WHERE status IN ('open', 'satisfied')`,
   `CREATE INDEX IF NOT EXISTS idx_workflow_continuations_status
      ON workflow_continuations(workspace_id, run_id, status)`,
-
-  ...SCHEMA_V8_WRITER_GUARD_STATEMENTS,
 ];
 
-/**
- * Full schema-v8 statement set (frozen v7 + additive v8 objects).
- * Blank claim and golden fingerprint for version 8 use this exact array.
- */
-export const SCHEMA_V8_STATEMENTS: readonly string[] = [
-  ...SCHEMA_V7_STATEMENTS,
-  ...SCHEMA_V8_MIGRATION_STATEMENTS,
-];
-
-const SCHEMA_V8_WORKFLOW_CORE_STATEMENTS = SCHEMA_V8_MIGRATION_STATEMENTS.slice(
-  0,
-  SCHEMA_V8_MIGRATION_STATEMENTS.length - SCHEMA_V8_WRITER_GUARD_STATEMENTS.length,
-);
-
-export const SCHEMA_V9_MIGRATION_STATEMENTS: readonly string[] = [
+const WORKFLOW_AUTHORITY_SCHEMA_STATEMENTS: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS workflow_definition_nodes (
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
     definition_id TEXT NOT NULL,
@@ -706,16 +760,26 @@ export const SCHEMA_V9_MIGRATION_STATEMENTS: readonly string[] = [
     owner_task_id TEXT NOT NULL,
     caller_task_id TEXT NOT NULL,
     caller_turn_id TEXT NOT NULL,
+    definition_id TEXT NOT NULL,
+    definition_version INTEGER NOT NULL,
     idempotency_key TEXT NOT NULL,
     fingerprint TEXT NOT NULL,
     run_id TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, owner_task_id, idempotency_key),
-    UNIQUE (workspace_id, caller_turn_id, idempotency_key),
+    PRIMARY KEY (
+      workspace_id, owner_task_id, caller_task_id,
+      definition_id, definition_version, idempotency_key
+    ),
+    UNIQUE (
+      workspace_id, caller_turn_id, definition_id,
+      definition_version, idempotency_key
+    ),
     FOREIGN KEY (workspace_id, owner_task_id)
       REFERENCES tasks(workspace_id, id) ON DELETE CASCADE,
     FOREIGN KEY (workspace_id, caller_turn_id, caller_task_id)
       REFERENCES turns(workspace_id, id, task_id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, definition_id, definition_version)
+      REFERENCES workflow_definitions(workspace_id, definition_id, version),
     FOREIGN KEY (workspace_id, run_id)
       REFERENCES workflow_runs(workspace_id, run_id) ON DELETE CASCADE
   )`,
@@ -742,6 +806,7 @@ export const SCHEMA_V9_MIGRATION_STATEMENTS: readonly string[] = [
     PRIMARY KEY (workspace_id, run_id, activation_id),
     UNIQUE (workspace_id, primary_turn_id),
     UNIQUE (workspace_id, execution_turn_id),
+    CHECK ((inherited_feedback_round_id IS NULL AND inherited_feedback_target_node_id IS NULL) OR (inherited_feedback_round_id IS NOT NULL AND inherited_feedback_target_node_id IS NOT NULL)),
     CHECK (
       (kind IN ('entry_start', 'dependency_gate') AND source_gate_id IS NOT NULL AND feedback_round_id IS NULL AND continuation_id IS NULL AND return_gate_id IS NULL)
       OR (kind = 'feedback_request' AND source_gate_id IS NULL AND feedback_round_id IS NOT NULL AND feedback_target_node_id IS NOT NULL AND continuation_id IS NULL AND return_gate_id IS NULL)
@@ -836,7 +901,9 @@ export const SCHEMA_V9_MIGRATION_STATEMENTS: readonly string[] = [
     FOREIGN KEY (workspace_id, caller_task_id)
       REFERENCES tasks(workspace_id, id),
     FOREIGN KEY (workspace_id, caller_turn_id, caller_task_id)
-      REFERENCES turns(workspace_id, id, task_id)
+      REFERENCES turns(workspace_id, id, task_id),
+    FOREIGN KEY (workspace_id, engine_start_operation_key)
+      REFERENCES operations(workspace_id, ledger_key)
   )`,
 
   `CREATE TABLE IF NOT EXISTS session_owners (
@@ -898,16 +965,6 @@ export const SCHEMA_V9_MIGRATION_STATEMENTS: readonly string[] = [
       REFERENCES tasks(workspace_id, id) ON DELETE CASCADE
   )`,
 
-  `CREATE TABLE IF NOT EXISTS workflow_migration_quarantine (
-    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-    legacy_run_id TEXT NOT NULL,
-    original_status TEXT NOT NULL,
-    reason_code TEXT NOT NULL,
-    row_counts_json TEXT NOT NULL,
-    quarantined_at TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, legacy_run_id)
-  )`,
-
   `CREATE UNIQUE INDEX IF NOT EXISTS uq_turns_workspace_id_task
      ON turns(workspace_id, id, task_id)`,
   `CREATE UNIQUE INDEX IF NOT EXISTS uq_workflow_nodes_task_owner
@@ -928,41 +985,196 @@ export const SCHEMA_V9_MIGRATION_STATEMENTS: readonly string[] = [
      ON turn_disposition_claims(workspace_id, status, updated_at)`,
   `CREATE INDEX IF NOT EXISTS idx_task_session_bindings_session
      ON task_session_bindings(workspace_id, backend, session_id, active)`,
-  `CREATE INDEX IF NOT EXISTS idx_workflow_quarantine_time
-     ON workflow_migration_quarantine(workspace_id, quarantined_at)`,
-];
-
-export const SCHEMA_V9_WRITER_GUARD_TABLES: readonly string[] = REQUIRED_SCHEMA_TABLES;
-
-export const SCHEMA_V9_WRITER_GUARD_STATEMENTS: readonly string[] =
-  writerGuardTriggerStatements(SCHEMA_V9_WRITER_GUARD_TABLES, SCHEMA_V9);
-
-export const SCHEMA_V9_STATEMENTS: readonly string[] = [
-  ...SCHEMA_V7_STATEMENTS,
-  ...SCHEMA_V8_WORKFLOW_CORE_STATEMENTS,
-  ...SCHEMA_V9_MIGRATION_STATEMENTS,
-  ...SCHEMA_V9_WRITER_GUARD_STATEMENTS,
 ];
 
 /**
- * Current compiled DDL applied to fresh databases.
- * New objects must land in a version-specific array, not by mutating SCHEMA_V7_STATEMENTS.
+ * Section 20 conformance columns and integrity guards.
  */
-export const CURRENT_SCHEMA_STATEMENTS: readonly string[] = SCHEMA_V9_STATEMENTS;
+const WORKFLOW_CONFORMANCE_SCHEMA_STATEMENTS: readonly string[] = [
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_workflow_artifact_lineage
+     ON workflow_artifacts(workspace_id, artifact_id, revision)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_workflow_feedback_target_id
+     ON workflow_feedback_targets(workspace_id, run_id, target_id)
+     WHERE target_id IS NOT NULL`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_workflow_continuation_invocation
+     ON workflow_continuations(workspace_id, caller_task_id, invocation_key)
+     WHERE caller_task_id IS NOT NULL AND invocation_key IS NOT NULL`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_workflow_run_continuation
+     ON workflow_runs(workspace_id, continuation_id)
+     WHERE continuation_id IS NOT NULL`,
+  `CREATE INDEX IF NOT EXISTS idx_workflow_runs_deadline_at
+     ON workflow_runs(workspace_id, status, deadline_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_workflow_runs_parent
+     ON workflow_runs(workspace_id, parent_run_id, status)`,
+  `CREATE INDEX IF NOT EXISTS idx_workflow_feedback_requester
+     ON workflow_feedback_rounds(workspace_id, requester_task_id, status)`,
+  `CREATE INDEX IF NOT EXISTS idx_workflow_continuation_caller
+     ON workflow_continuations(workspace_id, caller_task_id, status)`,
+
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_definition_scope_insert
+     BEFORE INSERT ON workflow_definitions
+     WHEN (NEW.scope_kind = 'root' AND (
+             NEW.owner_root_task_id IS NULL OR NOT EXISTS (
+               SELECT 1 FROM tasks owner
+                WHERE owner.workspace_id = NEW.workspace_id
+                  AND owner.id = NEW.owner_root_task_id
+                  AND owner.parent_id IS NULL
+             )
+           ))
+       OR (NEW.scope_kind = 'workspace' AND NEW.owner_root_task_id IS NOT NULL)
+     BEGIN
+       SELECT RAISE(ABORT, 'workflow_definition_scope_invalid');
+     END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_definition_semantics_immutable
+     BEFORE UPDATE OF scope_kind, owner_root_task_id, fingerprint, policy_json,
+                      topology_json, entry_node_id ON workflow_definitions
+     WHEN OLD.scope_kind <> NEW.scope_kind
+       OR OLD.owner_root_task_id IS NOT NEW.owner_root_task_id
+       OR OLD.fingerprint <> NEW.fingerprint
+       OR OLD.policy_json <> NEW.policy_json
+       OR OLD.topology_json <> NEW.topology_json
+       OR OLD.entry_node_id <> NEW.entry_node_id
+     BEGIN
+       SELECT RAISE(ABORT, 'workflow_definition_immutable');
+     END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_run_authority_insert
+     BEFORE INSERT ON workflow_runs
+     WHEN (NEW.owner_root_task_id IS NULL) <> (NEW.caller_task_id IS NULL)
+       OR (NEW.caller_task_id IS NULL) <> (NEW.caller_turn_id IS NULL)
+       OR (NEW.owner_root_task_id IS NOT NULL AND NOT EXISTS (
+             SELECT 1
+               FROM tasks caller
+               JOIN turns caller_turn
+                 ON caller_turn.workspace_id = caller.workspace_id
+                AND caller_turn.task_id = caller.id
+                AND caller_turn.id = NEW.caller_turn_id
+              WHERE caller.workspace_id = NEW.workspace_id
+                AND caller.id = NEW.caller_task_id
+                AND EXISTS (
+                  WITH RECURSIVE ancestry(id, parent_id) AS (
+                    SELECT id, parent_id FROM tasks
+                     WHERE workspace_id = NEW.workspace_id AND id = caller.id
+                    UNION ALL
+                    SELECT parent.id, parent.parent_id FROM tasks parent
+                    JOIN ancestry child ON child.parent_id = parent.id
+                     WHERE parent.workspace_id = NEW.workspace_id
+                  )
+                  SELECT 1 FROM ancestry
+                   WHERE id = NEW.owner_root_task_id AND parent_id IS NULL
+                )
+           ))
+     BEGIN
+       SELECT RAISE(ABORT, 'workflow_run_authority_invalid');
+     END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_gate_fill_authority
+     BEFORE INSERT ON workflow_gate_fills
+     WHEN NOT EXISTS (
+       SELECT 1
+         FROM workflow_gate_bindings binding
+         JOIN workflow_artifacts artifact
+           ON artifact.workspace_id = binding.workspace_id
+          AND artifact.run_id = COALESCE(NEW.artifact_run_id, NEW.run_id)
+          AND artifact.artifact_id = NEW.artifact_id
+          AND artifact.revision = NEW.artifact_revision
+          AND artifact.kind = binding.required_kind
+         JOIN workflow_artifact_sources source
+           ON source.workspace_id = artifact.workspace_id
+          AND source.run_id = artifact.run_id
+          AND source.artifact_id = artifact.artifact_id
+          AND source.artifact_revision = artifact.revision
+        WHERE binding.workspace_id = NEW.workspace_id
+          AND binding.run_id = NEW.run_id
+          AND binding.gate_id = NEW.gate_id
+          AND binding.input_ref = NEW.input_ref
+          AND (
+            binding.producer_node_id IS NULL
+            OR (
+              source.source_kind = 'workflow_node'
+              AND artifact.producer_node_id = binding.producer_node_id
+              AND source.producer_node_id = binding.producer_node_id
+            )
+          )
+     )
+     BEGIN
+       SELECT RAISE(ABORT, 'workflow_gate_fill_invalid');
+     END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_artifact_source_authority
+     BEFORE INSERT ON workflow_artifact_sources
+     WHEN (
+       NEW.source_kind = 'workflow_node' AND NOT EXISTS (
+         SELECT 1
+           FROM workflow_nodes node
+           JOIN turns producing_turn
+             ON producing_turn.workspace_id = node.workspace_id
+            AND producing_turn.task_id = node.task_id
+            AND producing_turn.id = NEW.producing_turn_id
+           JOIN workflow_activations activation
+             ON activation.workspace_id = node.workspace_id
+            AND activation.run_id = node.run_id
+            AND activation.node_id = node.node_id
+            AND activation.activation_id = NEW.producing_activation_id
+            AND activation.execution_turn_id = producing_turn.id
+          WHERE node.workspace_id = NEW.workspace_id
+            AND node.run_id = NEW.producer_run_id
+            AND node.node_id = NEW.producer_node_id
+            AND node.task_id = NEW.producer_task_id
+       )
+     ) OR (
+       NEW.source_kind = 'caller_turn' AND NOT EXISTS (
+         SELECT 1 FROM workflow_runs run
+          WHERE run.workspace_id = NEW.workspace_id
+            AND run.run_id = NEW.run_id
+            AND run.caller_task_id = NEW.caller_task_id
+            AND run.caller_turn_id = NEW.caller_turn_id
+       )
+     )
+     BEGIN
+       SELECT RAISE(ABORT, 'workflow_artifact_source_invalid');
+     END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_artifact_immutable
+     BEFORE UPDATE ON workflow_artifacts
+     BEGIN
+       SELECT RAISE(ABORT, 'workflow_artifact_immutable');
+     END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_artifact_source_immutable
+     BEFORE UPDATE ON workflow_artifact_sources
+     BEGIN
+       SELECT RAISE(ABORT, 'workflow_artifact_source_immutable');
+     END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_gate_fill_immutable
+     BEFORE UPDATE ON workflow_gate_fills
+     BEGIN
+       SELECT RAISE(ABORT, 'workflow_gate_fill_immutable');
+     END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_terminal_run_no_queued_activation
+     BEFORE UPDATE OF status ON workflow_runs
+     WHEN NEW.status IN ('succeeded', 'failed', 'cancelled')
+      AND EXISTS (
+        SELECT 1 FROM workflow_activations activation
+         JOIN turns turn
+           ON turn.workspace_id = activation.workspace_id
+          AND turn.id = activation.execution_turn_id
+        WHERE activation.workspace_id = NEW.workspace_id
+          AND activation.run_id = NEW.run_id
+          AND activation.status IN ('queued', 'running')
+          AND turn.status IN ('queued', 'running', 'waiting_user')
+      )
+     BEGIN
+       SELECT RAISE(ABORT, 'workflow_terminal_run_has_live_activation');
+     END`,
+];
+
+const CURRENT_SCHEMA_WRITER_GUARD_STATEMENTS: readonly string[] =
+  writerGuardTriggerStatements(REQUIRED_SCHEMA_TABLES, SQLITE_SCHEMA_VERSION);
 
 /**
- * Resolve the immutable statement set for a supported schema version.
- * Unknown versions fail closed so migration cannot invent a golden manifest.
+ * The only supported schema manifest. This branch intentionally has no migration
+ * compatibility: an older development store must be reset explicitly.
  */
-export function schemaStatementsForVersion(version: number): readonly string[] {
-  if (version === SCHEMA_V7) {
-    return SCHEMA_V7_STATEMENTS;
-  }
-  if (version === SCHEMA_V8) {
-    return SCHEMA_V8_STATEMENTS;
-  }
-  if (version === SCHEMA_V9) {
-    return SCHEMA_V9_STATEMENTS;
-  }
-  throw new Error(`unsupported schema version ${version}`);
-}
+export const CURRENT_SCHEMA_STATEMENTS: readonly string[] = [
+  ...CORE_SCHEMA_STATEMENTS,
+  ...WORKFLOW_SCHEMA_STATEMENTS,
+  ...WORKFLOW_AUTHORITY_SCHEMA_STATEMENTS,
+  ...WORKFLOW_CONFORMANCE_SCHEMA_STATEMENTS,
+  ...CURRENT_SCHEMA_WRITER_GUARD_STATEMENTS,
+];

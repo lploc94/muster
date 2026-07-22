@@ -48,7 +48,12 @@ import { evaluateTaskReadiness } from './readiness';
 import { canPromoteTurn } from './scheduler';
 import type { GraphCommandKind, RepositoryCommand, TaskRepository } from './repository';
 import { durableDispositionClaim } from './disposition-claim';
-import type { WorkflowTaskStatusProjection } from './workflow-types';
+import type {
+  WorkflowDefinitionV1,
+  WorkflowPolicyV1,
+  WorkflowTaskStatusProjection,
+} from './workflow-types';
+import { validateDefineWorkflow } from './workflow';
 import type { TaskReadPort } from './store-port';
 import {
   createTask,
@@ -327,6 +332,197 @@ function nowIso(clock?: () => string): string {
   return clock?.() ?? new Date().toISOString();
 }
 
+const WORKFLOW_TASK_CAPABILITIES = new Set<TaskCapability>([
+  'create_child',
+  'start_child',
+  'wait_child',
+  'interrupt_child',
+  'cancel_child',
+  'read_subtree',
+]);
+
+function workflowHostPolicyError(code: string, message: string): {
+  ok: false;
+  error: string;
+} {
+  return { ok: false, error: JSON.stringify({ code, message }) };
+}
+
+function validateWorkflowDefinitionHostRequirements(
+  deps: GraphEngineDeps,
+  caller: MusterTask,
+  definition: WorkflowDefinitionV1,
+  defaultBackend?: string,
+): { ok: true } | { ok: false; error: string } {
+  const cwd = caller.cwd ?? deps.workspaceFolder;
+  const registry = deps.getTaskTypeRegistry
+    ? deps.getTaskTypeRegistry(cwd)
+    : parseTaskTypeRegistry(undefined);
+  const host = deps.getHostEnvironment?.();
+  const availableBackends = host ? new Set(host.availableBackends) : undefined;
+  for (const node of definition.topology.nodes) {
+    const persistedBackend = node.backend ?? defaultBackend;
+    let backend = persistedBackend;
+    const role = node.role ?? 'worker';
+    if (node.taskType) {
+      const resolved = resolveCreateChildSpec({
+        taskType: node.taskType,
+        backend: persistedBackend,
+        model: node.model,
+        role: node.role,
+      }, registry);
+      if (!resolved.ok) return workflowHostPolicyError(resolved.code, resolved.message);
+      backend = resolved.resolved.backend;
+      if (
+        persistedBackend === undefined ||
+        persistedBackend !== resolved.resolved.backend ||
+        role !== resolved.resolved.role ||
+        (node.model ?? undefined) !== (resolved.resolved.model ?? undefined)
+      ) {
+        return workflowHostPolicyError(
+          'workflow_task_type_mismatch',
+          `workflow node ${node.nodeId} does not freeze its resolved task-type routing`,
+        );
+      }
+    }
+    const capabilities = node.capabilities ?? [];
+    if (capabilities.some((capability) => !WORKFLOW_TASK_CAPABILITIES.has(capability as TaskCapability))) {
+      return workflowHostPolicyError(
+        'workflow_capability_unsupported',
+        `workflow node ${node.nodeId} requires an unsupported capability`,
+      );
+    }
+    if (role !== 'coordinator' && capabilities.length > 0) {
+      return workflowHostPolicyError(
+        'workflow_capability_role_mismatch',
+        `worker workflow node ${node.nodeId} cannot receive coordinator capabilities`,
+      );
+    }
+    if (backend === undefined) {
+      if (node.model !== undefined) {
+        return workflowHostPolicyError(
+          'workflow_model_without_backend',
+          `workflow node ${node.nodeId} specifies a model without frozen backend routing`,
+        );
+      }
+      continue;
+    }
+    if (!isKnownBackendId(backend)) {
+      return workflowHostPolicyError('backend_unsupported', `unsupported backend: ${backend}`);
+    }
+    if (availableBackends && !availableBackends.has(backend)) {
+      return workflowHostPolicyError('backend_unavailable', `backend is unavailable: ${backend}`);
+    }
+    let backendInstance: Backend;
+    try {
+      backendInstance = deps.makeBackend(backend);
+    } catch {
+      return workflowHostPolicyError('backend_unsupported', `unsupported backend: ${backend}`);
+    }
+    if (!canBindTaskToBackend(backendInstance.capabilities)) {
+      return workflowHostPolicyError('backend_not_mcp', `backend does not support MCP: ${backend}`);
+    }
+    if (node.model && host?.models[backend]?.options.length) {
+      const models = new Set(host.models[backend]!.options.map((model) => model.value));
+      if (!models.has(node.model)) {
+        return workflowHostPolicyError(
+          'model_unavailable',
+          `model is unavailable for workflow node ${node.nodeId}`,
+        );
+      }
+    }
+  }
+  return { ok: true };
+}
+
+async function prepareWorkflowStart(
+  deps: GraphEngineDeps,
+  ctx: { callerTaskId: string; rootId: string },
+  input: {
+    definitionId: string;
+    version: number;
+    backend?: string;
+    useCallerBackendDefault?: boolean;
+  },
+  limits: ResourceLimits,
+): Promise<
+  | { ok: true; effectivePolicy: WorkflowPolicyV1 }
+  | { ok: false; error: string }
+> {
+  if (deps.isWorkspaceTrusted?.() === false || deps.getHostEnvironment?.()?.trusted === false) {
+    return workflowHostPolicyError(
+      'workspace_untrusted',
+      'workspace is not trusted; cannot start workflows',
+    );
+  }
+  const caller = await deps.repository.getTask(ctx.callerTaskId);
+  if (!caller || caller.lifecycle !== 'open') {
+    return workflowHostPolicyError('caller_not_open', 'caller task is not open');
+  }
+  const definition = await deps.repository.getWorkflowDefinition(input.definitionId, input.version);
+  if (!definition) {
+    return workflowHostPolicyError('definition_not_found', 'workflow definition not found');
+  }
+  if (
+    definition.scope.kind === 'root' &&
+    definition.scope.ownerRootTaskId !== ctx.rootId
+  ) {
+    return workflowHostPolicyError('workflow_scope_denied', 'workflow definition is owned by another root');
+  }
+
+  const file = deps.store.getFile();
+  const parentDepth = taskDepth(file, ctx.callerTaskId);
+  const availableDepth = limits.maxDepth - parentDepth - 1;
+  const remainingForParent = limits.maxChildrenPerTask - countChildren(file, ctx.callerTaskId);
+  const remainingForRoot = limits.maxChildrenPerRoot - countRootChildren(file, ctx.rootId);
+  const availableTaskCount = Math.min(remainingForParent, remainingForRoot);
+  const hostWorkflowTaskLimit = Math.min(
+    limits.maxChildrenPerTask,
+    limits.maxChildrenPerRoot,
+  );
+  if (availableDepth < 1) {
+    return workflowHostPolicyError('max_depth_exceeded', 'workflow start exceeds host depth limit');
+  }
+  if (definition.topology.nodes.length > availableTaskCount) {
+    return workflowHostPolicyError(
+      'max_task_count_exceeded',
+      'workflow start exceeds host task-count limit',
+    );
+  }
+
+  const defaultBackend = input.backend ?? (input.useCallerBackendDefault ? caller.backend : 'grok');
+  const requirements = validateWorkflowDefinitionHostRequirements(
+    deps,
+    caller,
+    definition,
+    defaultBackend,
+  );
+  if (!requirements.ok) return requirements;
+
+  const effectivePolicy: WorkflowPolicyV1 = {
+    ...definition.policy,
+    maxTurnsPerTask: Math.min(definition.policy.maxTurnsPerTask, limits.maxTurnsPerTask),
+    maxDepth: Math.min(definition.policy.maxDepth, availableDepth),
+    maxTaskCount: Math.min(definition.policy.maxTaskCount, hostWorkflowTaskLimit),
+    maxConcurrency: Math.min(
+      definition.policy.maxConcurrency,
+      limits.maxConcurrentTurns,
+      limits.maxConcurrentPerRoot,
+      limits.maxConcurrentPerBackend,
+    ),
+  };
+  if (
+    definition.topology.nodes.length > effectivePolicy.maxTaskCount ||
+    effectivePolicy.maxConcurrency < 1
+  ) {
+    return workflowHostPolicyError(
+      'workflow_policy_exceeds_host',
+      'workflow policy cannot be clamped within current host limits',
+    );
+  }
+  return { ok: true, effectivePolicy };
+}
+
 function ensureCoordinationMaps(draft: EngineProjection): void {
   draft.operations = draft.operations ?? {};
   draft.cancelRequests = draft.cancelRequests ?? {};
@@ -545,7 +741,10 @@ export function issueTurnCredential(
   const task = turn ? file.tasks[turn.taskId] : undefined;
   if (!turn || !task) return undefined;
   const rootId = findRootId(file, task.id);
-  const actions = capabilitiesFor(task);
+  const actions = capabilitiesFor(task, {
+    turn,
+    workspaceTrusted: deps.isWorkspaceTrusted?.() ?? true,
+  });
   const deadlineMs = turn.runDeadlineAt ? Date.parse(turn.runDeadlineAt) : Number.NaN;
   const remainingMs = Number.isFinite(deadlineMs)
     ? Math.max(1, deadlineMs - Date.now())
@@ -702,6 +901,38 @@ export async function executeToolCommand(
 
   if (ctx.allowedActions && !ctx.allowedActions.has(actionForCommand(command))) {
     return { ok: false, error: `action not permitted: ${actionForCommand(command)}` };
+  }
+  if (
+    command.kind === 'workflow_next' ||
+    command.kind === 'workflow_prev' ||
+    command.kind === 'workflow_fail' ||
+    command.kind === 'invoke_child_workflow'
+  ) {
+    const durableTurn = await deps.repository.getTurn(ctx.turnId);
+    if (
+      !durableTurn ||
+      durableTurn.taskId !== ctx.callerTaskId ||
+      (durableTurn.status !== 'running' && durableTurn.status !== 'waiting_user')
+    ) {
+      return { ok: false, error: `${command.kind} requires the caller's live turn` };
+    }
+    const durableTask = await deps.repository.getTask(ctx.callerTaskId);
+    if (!durableTask) return { ok: false, error: 'caller task not found' };
+    const durableActions = capabilitiesFor(durableTask, {
+      turn: durableTurn,
+      workspaceTrusted: deps.isWorkspaceTrusted?.() ?? true,
+    });
+    if (!durableActions.has(command.kind)) {
+      return { ok: false, error: `${command.kind} is not authorized for the current workflow context` };
+    }
+    if (
+      command.kind === 'workflow_next' &&
+      command.change === 'unchanged' &&
+      durableTurn.workflowActivation?.kind !== 'feedback_request' &&
+      !durableTurn.workflowActivation?.hasInheritedFeedbackResponse
+    ) {
+      return { ok: false, error: 'workflow_next unchanged requires a feedback-request activation' };
+    }
   }
   // Compound wait fields require wait_for_tasks / wait_child in addition to create_child tools.
   const wantsCompoundWait =
@@ -2319,21 +2550,37 @@ export async function executeToolCommand(
     }
 
     case 'invoke_child_workflow': {
-      // M018 S06: stage invoke_child_workflow disposition. Does not seal lifecycle;
-      // child run + continuation are owned by repository settle (T02).
+      // M018 S06: map the public invocation command to a child-workflow NEXT route.
+      // Child run + continuation are owned by repository settle (T02).
+      const prepared = await prepareWorkflowStart(
+        deps,
+        ctx,
+        {
+          definitionId: command.childDefinitionId,
+          version: command.childDefinitionVersion,
+          useCallerBackendDefault: true,
+        },
+        limits,
+      );
+      if (!prepared.ok) return prepared;
       const staged = await executeGraphCommand(deps, 'invokeChildGraphTask', (draft) => {
         const turn = draft.turns[ctx.turnId];
         if (!turn) return { ok: false, reason: 'turn not found' };
         const result = stageDisposition(
           turn,
           {
-            kind: 'invoke_child_workflow',
-            childDefinitionId: command.childDefinitionId,
-            childDefinitionVersion: command.childDefinitionVersion,
-            entryBindings: command.entryBindings,
-            ...(command.childIdempotencyKey !== undefined
-              ? { childIdempotencyKey: command.childIdempotencyKey }
-              : {}),
+            kind: 'workflow_next',
+            change: 'updated',
+            route: {
+              kind: 'child_workflow',
+              childDefinitionId: command.childDefinitionId,
+              childDefinitionVersion: command.childDefinitionVersion,
+              entryBindings: command.entryBindings,
+              ...(command.childIdempotencyKey !== undefined
+                ? { childIdempotencyKey: command.childIdempotencyKey }
+                : {}),
+              effectivePolicy: prepared.effectivePolicy,
+            },
           },
           command.opId,
           {
@@ -2423,7 +2670,10 @@ export async function executeToolCommand(
       const snapshot: HostEnvironmentSnapshot = cached
         ? { ...cached, cwd, trusted }
         : minimalHostSnapshot(cwd, trusted);
-      const tools = [...capabilitiesFor(task)].sort();
+      const tools = [...capabilitiesFor(task, {
+        turn: file.turns[ctx.turnId],
+        workspaceTrusted: trusted,
+      })].sort();
       const registryResult: TaskTypeRegistryResult = deps.getTaskTypeRegistry
         ? deps.getTaskTypeRegistry(cwd)
         : parseTaskTypeRegistry(undefined);
@@ -2497,6 +2747,29 @@ export async function executeToolCommand(
     }
 
     case 'define_workflow': {
+      const caller = await deps.repository.getTask(ctx.callerTaskId);
+      if (!caller || caller.lifecycle !== 'open') {
+        return workflowHostPolicyError('caller_not_open', 'caller task is not open');
+      }
+      const validated = validateDefineWorkflow({
+        definitionId: command.definitionId,
+        version: command.version,
+        name: command.name,
+        topology: command.topology,
+        entryContracts: command.entryContracts,
+        policy: command.policy,
+        scope: { kind: 'root', ownerRootTaskId: ctx.rootId },
+        createdAt: now,
+      });
+      if (!validated.ok) {
+        return workflowHostPolicyError('invalid_workflow_definition', validated.reason);
+      }
+      const requirements = validateWorkflowDefinitionHostRequirements(
+        deps,
+        caller,
+        validated.definition,
+      );
+      if (!requirements.ok) return requirements;
       const defined = await deps.repository.execute({
         kind: 'defineWorkflowVersion',
         workspaceId: deps.workspaceId,
@@ -2504,6 +2777,13 @@ export async function executeToolCommand(
         version: command.version,
         name: command.name,
         topology: command.topology,
+        entryContracts: command.entryContracts,
+        policy: command.policy,
+        ownerRootTaskId: ctx.rootId,
+        publicOperation: {
+          ledgerKey: opLedgerKey(ctx.turnId, command.opId),
+          fingerprint,
+        },
         createdAt: now,
       });
       if (defined.conflict || !defined.operation?.result?.ok) {
@@ -2521,17 +2801,30 @@ export async function executeToolCommand(
         return { ok: false, error: defined.reason ?? 'define_workflow failed' };
       }
       const data = definedOp.data;
-      await deps.repository.execute({
-        kind: 'putOperation',
-        workspaceId: deps.workspaceId,
-        ledgerKey: opLedgerKey(ctx.turnId, command.opId),
-        entry: { fingerprint, result: { ok: true, data } },
-        createdAt: now,
-      });
       return { ok: true, result: data };
     }
 
     case 'start_workflow': {
+      const replayPolicy = await deps.repository.getWorkflowStartPolicy({
+        ownerRootTaskId: ctx.rootId,
+        callerTaskId: ctx.callerTaskId,
+        definitionId: command.definitionId,
+        version: command.version,
+        startIdempotencyKey: command.startIdempotencyKey,
+      });
+      const prepared = replayPolicy
+        ? { ok: true as const, effectivePolicy: replayPolicy }
+        : await prepareWorkflowStart(
+            deps,
+            ctx,
+            {
+              definitionId: command.definitionId,
+              version: command.version,
+              ...(command.backend !== undefined ? { backend: command.backend } : {}),
+            },
+            limits,
+          );
+      if (!prepared.ok) return prepared;
       const started = await deps.repository.execute({
         kind: 'startWorkflowRun',
         workspaceId: deps.workspaceId,
@@ -2541,6 +2834,15 @@ export async function executeToolCommand(
         createdAt: now,
         ...(command.goal !== undefined ? { goal: command.goal } : {}),
         ...(command.backend !== undefined ? { backend: command.backend } : {}),
+        entryInputs: command.entryInputs,
+        ownerRootTaskId: ctx.rootId,
+        callerTaskId: ctx.callerTaskId,
+        callerTurnId: ctx.turnId,
+        effectivePolicy: prepared.effectivePolicy,
+        publicOperation: {
+          ledgerKey: opLedgerKey(ctx.turnId, command.opId),
+          fingerprint,
+        },
       });
       if (started.conflict || !started.operation?.result?.ok) {
         const opError =
@@ -2559,19 +2861,25 @@ export async function executeToolCommand(
       const data = startedOp.data as {
         activationTurnId?: string;
         entryTaskId?: string;
+        entries?: Array<{ taskId?: string; activationTurnId?: string }>;
         [key: string]: unknown;
       };
-      await deps.repository.execute({
-        kind: 'putOperation',
-        workspaceId: deps.workspaceId,
-        ledgerKey: opLedgerKey(ctx.turnId, command.opId),
-        entry: { fingerprint, result: { ok: true, data } },
-        createdAt: now,
-      });
-      if (typeof data.activationTurnId === 'string' && started.changed) {
-        deps.onScheduleTurn(data.activationTurnId);
+      if (started.changed && Array.isArray(data.entries)) {
+        for (const entry of data.entries) {
+          if (
+            entry && typeof entry === 'object' &&
+            typeof (entry as { activationTurnId?: unknown }).activationTurnId === 'string'
+          ) {
+            deps.onScheduleTurn((entry as { activationTurnId: string }).activationTurnId);
+          }
+        }
       }
-      if (typeof data.entryTaskId === 'string') {
+      const entryTaskIds = data.entries
+        ?.map((entry) => entry.taskId)
+        .filter((taskId): taskId is string => typeof taskId === 'string') ?? [];
+      if (entryTaskIds.length > 0) {
+        deps.onRescanSchedulableTurns?.(entryTaskIds);
+      } else if (typeof data.entryTaskId === 'string') {
         deps.onRescanSchedulableTurns?.([data.entryTaskId]);
       }
       return { ok: true, result: data };

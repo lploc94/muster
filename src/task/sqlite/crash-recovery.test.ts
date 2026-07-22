@@ -32,7 +32,7 @@ function startUncommittedWriter(dbPath: string): { worker: Worker; written: Prom
       const { DatabaseSync } = require('node:sqlite');
       try {
         const db = new DatabaseSync(workerData.dbPath);
-        // v8 writer-guard triggers RAISE(ABORT,'schema_changed') unless the
+        // Writer-guard triggers RAISE(ABORT,'schema_changed') unless the
         // connection registers the writer-version UDF at the current version —
         // mirror the production worker so this raw writer is a valid same-version
         // writer and the test exercises WAL rollback, not the stale-writer fence.
@@ -109,8 +109,8 @@ describe('SQLite worker/process crash recovery', () => {
     expect(await reopened.pragma('user_version')).toBe(SQLITE_SCHEMA_VERSION);
   }, 20_000);
 
-  it('serializes concurrent first-open schema migration across DB workers', async () => {
-    const dbPath = tempDbPath('muster-concurrent-migrate-');
+  it('serializes concurrent first-open schema creation across DB workers', async () => {
+    const dbPath = tempDbPath('muster-concurrent-create-');
     const contenders = Array.from({ length: 4 }, () => makeClient());
 
     await Promise.all(contenders.map((client) => client.open(dbPath, 10_000)));

@@ -189,7 +189,7 @@ describe('openStoreDatabase', () => {
     }
   });
 
-  it('rejects existing Muster DB with wrong schema version without migration', () => {
+  it('rejects an older owned store with reset guidance', () => {
     const dbPath = tempDbPath();
     {
       const seed = openStoreDatabase({ path: dbPath });

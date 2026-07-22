@@ -84,20 +84,80 @@ describe('capabilitiesFor', () => {
     expect(worker.has('start_workflow')).toBe(false);
   });
 
-  it('grants workflow_next to any task role (does not require create_child)', () => {
+  it('does not grant workflow mutations without a live workflow activation', () => {
     const worker = capabilitiesFor({
       role: 'worker',
       capabilities: [],
       parentId: 'root',
     });
-    expect(worker.has('workflow_next')).toBe(true);
+    expect(worker.has('workflow_next')).toBe(false);
+    expect(worker.has('workflow_prev')).toBe(false);
+    expect(worker.has('workflow_fail')).toBe(false);
+    expect(worker.has('invoke_child_workflow')).toBe(false);
     expect(worker.has('complete_task')).toBe(true);
+  });
 
-    const coordinator = capabilitiesFor({
-      role: 'coordinator',
+  it('derives workflow actions from the live activation route', () => {
+    const worker = capabilitiesFor({
+      role: 'worker',
       capabilities: [],
-      parentId: null,
+      parentId: 'root',
+    }, {
+      turn: {
+        status: 'running',
+        workflowActivation: {
+          runId: 'run',
+          activationId: 'activation',
+          nodeId: 'consumer',
+          kind: 'dependency_gate',
+          runStatus: 'running',
+          activationStatus: 'running',
+          isTerminalNode: false,
+          hasDirectDependencies: true,
+          hasOpenFeedbackRound: false,
+          hasPendingContinuation: false,
+        },
+      },
     });
-    expect(coordinator.has('workflow_next')).toBe(true);
+    expect(worker.has('workflow_next')).toBe(true);
+    expect(worker.has('workflow_prev')).toBe(true);
+    expect(worker.has('workflow_fail')).toBe(true);
+    expect(worker.has('invoke_child_workflow')).toBe(false);
+  });
+
+  it('offers child invocation only to a trusted authorized root or terminal caller', () => {
+    const coordinator = {
+      role: 'coordinator' as const,
+      capabilities: ['create_child' as const],
+      parentId: null,
+    };
+    expect(capabilitiesFor(coordinator, {
+      turn: { status: 'running' },
+      workspaceTrusted: true,
+    }).has('invoke_child_workflow')).toBe(true);
+    expect(capabilitiesFor(coordinator, {
+      turn: { status: 'running' },
+      workspaceTrusted: false,
+    }).has('invoke_child_workflow')).toBe(false);
+
+    const terminal = capabilitiesFor(coordinator, {
+      turn: {
+        status: 'running',
+        workflowActivation: {
+          runId: 'run',
+          activationId: 'activation',
+          nodeId: 'terminal',
+          kind: 'dependency_gate',
+          runStatus: 'running',
+          activationStatus: 'running',
+          isTerminalNode: true,
+          hasDirectDependencies: true,
+          hasOpenFeedbackRound: false,
+          hasPendingContinuation: false,
+        },
+      },
+      workspaceTrusted: true,
+    });
+    expect(terminal.has('invoke_child_workflow')).toBe(true);
   });
 });

@@ -3369,7 +3369,10 @@ export class TaskEngine {
           ...(draftTask.parentId ? { parentTaskId: draftTask.parentId } : {}),
           ...(draftTask.goal ? { goal: draftTask.goal } : {}),
         },
-        tools: [...capabilitiesFor(draftTask)].sort(),
+        tools: [...capabilitiesFor(draftTask, {
+          turn: draftTurn,
+          workspaceTrusted: this.isWorkspaceTrusted(),
+        })].sort(),
         taskCwd: draftTask.cwd,
         brief,
         resolvedInputs: pins,
@@ -4011,7 +4014,10 @@ export class TaskEngine {
 
       if (mcpEnabled && this.mcpReadiness) {
         const readiness = this.mcpReadiness;
-        const expectedTools = capabilitiesFor(taskForDispatch);
+        const expectedTools = capabilitiesFor(taskForDispatch, {
+          turn: currentTurn,
+          workspaceTrusted: this.isWorkspaceTrusted(),
+        });
         const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
         built.options.mcpSetup = {
           maxAttempts: 2,

@@ -18,14 +18,14 @@ import { SqliteTaskRepository } from './repository';
 import { canPromoteTurn } from './scheduler';
 import { DbClient } from './sqlite/client';
 import type { TaskStoreFile } from './types';
-import { entryNodeIds, makeGraphFanInDefinition } from './workflow';
+import { DEFAULT_WORKFLOW_POLICY, entryNodeIds, makeGraphFanInDefinition } from './workflow';
 
 const FAN_IN_TOPOLOGY = {
   kind: 'graph_v1' as const,
   nodes: [{ nodeId: 'p1' }, { nodeId: 'p2' }, { nodeId: 'consumer' }],
   edges: [
-    { fromNodeId: 'p1', toNodeId: 'consumer', inputRef: 'from_p1' },
-    { fromNodeId: 'p2', toNodeId: 'consumer', inputRef: 'from_p2' },
+    { fromNodeId: 'p1', toNodeId: 'consumer', inputRef: 'from_p1', expectedArtifactKind: 'next_result' },
+    { fromNodeId: 'p2', toNodeId: 'consumer', inputRef: 'from_p2', expectedArtifactKind: 'next_result' },
   ],
 };
 
@@ -69,6 +69,8 @@ describe('M018 S02 fan-in NEXT activation', () => {
         version: 1,
         name: 'fan-in',
         topology: FAN_IN_TOPOLOGY,
+        entryContracts: [],
+        policy: DEFAULT_WORKFLOW_POLICY,
       },
       ctx,
     );
@@ -413,6 +415,111 @@ describe('M018 S02 fan-in NEXT activation', () => {
     }
   }, 45_000);
 
+  it('aggregate exact byte limit and one-byte overflow', async () => {
+    const expectedAggregate = '[workflow-aggregate] from_p1=é from_p2=value-two';
+    const exactBytes = Buffer.byteLength(expectedAggregate, 'utf8');
+    expect(exactBytes).toBeGreaterThan(expectedAggregate.length);
+
+    for (const overflow of [false, true]) {
+      const ctx = await openRepo(overflow ? 'aggregate-overflow' : 'aggregate-exact');
+      try {
+        const createdAt = '2026-07-22T07:00:00.000Z';
+        const policy = {
+          ...DEFAULT_WORKFLOW_POLICY,
+          maxArtifactBytes: 16,
+          maxAggregateBytes: exactBytes - (overflow ? 1 : 0),
+        };
+        const definition = makeGraphFanInDefinition({
+          definitionId: overflow ? 'wf-aggregate-overflow' : 'wf-aggregate-exact',
+          createdAt,
+          policy,
+        });
+        await expect(ctx.repository.execute({
+          kind: 'defineWorkflowVersion', workspaceId: 'ws', definitionId: definition.definitionId,
+          version: definition.version, name: definition.name, topology: definition.topology,
+          entryContracts: definition.entryContracts, policy: definition.policy, createdAt,
+        })).resolves.toMatchObject({ ok: true, changed: true });
+        const start = await ctx.repository.execute({
+          kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: definition.definitionId,
+          version: definition.version, startIdempotencyKey: `aggregate-${overflow ? 'over' : 'exact'}`,
+          createdAt, goal: 'aggregate boundary', backend: 'grok',
+        });
+        const data = start.operation?.result.data as {
+          runId: string;
+          entries: Array<{ nodeId: string; taskId: string; activationTurnId: string }>;
+          nodeGates: Array<{ nodeId: string; gateId: string }>;
+        };
+        const entries = new Map(data.entries.map((entry) => [entry.nodeId, entry]));
+        const gateId = data.nodeGates.find((gate) => gate.nodeId === 'consumer')!.gateId;
+        const settle = async (nodeId: 'p1' | 'p2', result: string, finishedAt: string) => {
+          const entry = entries.get(nodeId)!;
+          await ctx.client.run(
+            `UPDATE turns SET status = 'running', started_at = ?
+              WHERE workspace_id = 'ws' AND id = ?`,
+            [createdAt, entry.activationTurnId],
+          );
+          const task = await ctx.repository.getTask(entry.taskId);
+          const turn = await ctx.repository.getTurn(entry.activationTurnId);
+          return ctx.repository.execute({
+            kind: 'settleTurnAndApplyEffects', workspaceId: 'ws', expectedTaskRevision: task!.revision,
+            task: { ...task!, updatedAt: finishedAt },
+            turn: {
+              ...turn!, status: 'succeeded', finishedAt,
+              disposition: { kind: 'workflow_next', change: 'updated', result },
+            },
+            expectedStatuses: ['running'], relatedTurns: [], messages: [],
+          });
+        };
+
+        await expect(settle('p1', 'é', '2026-07-22T07:01:00.000Z')).resolves.toMatchObject({ changed: true });
+        await expect(settle('p2', 'value-two', '2026-07-22T07:02:00.000Z')).resolves.toMatchObject({ changed: true });
+
+        const run = await ctx.client.get<{ status: string; terminal_reason_code: string | null }>(
+          `SELECT status, terminal_reason_code FROM workflow_runs
+            WHERE workspace_id = 'ws' AND run_id = ?`,
+          [data.runId],
+        );
+        const gate = await ctx.client.get<{ status: string }>(
+          `SELECT status FROM workflow_dependency_gates
+            WHERE workspace_id = 'ws' AND run_id = ? AND gate_id = ?`,
+          [data.runId, gateId],
+        );
+        const consumer = await ctx.client.get<{ task_id: string | null }>(
+          `SELECT task_id FROM workflow_nodes
+            WHERE workspace_id = 'ws' AND run_id = ? AND node_id = 'consumer'`,
+          [data.runId],
+        );
+        const activations = await ctx.client.all(
+          `SELECT activation_id FROM workflow_activations
+            WHERE workspace_id = 'ws' AND run_id = ? AND source_gate_id = ?`,
+          [data.runId, gateId],
+        );
+
+        if (overflow) {
+          expect(run).toEqual({ status: 'failed', terminal_reason_code: 'aggregate_too_large' });
+          expect(gate).toEqual({ status: 'failed' });
+          expect(consumer).toEqual({ task_id: null });
+          expect(activations).toHaveLength(0);
+          expect(await ctx.client.all(
+            `SELECT id FROM messages WHERE workspace_id = 'ws' AND content LIKE '[workflow-aggregate]%'`,
+          )).toHaveLength(0);
+        } else {
+          expect(run).toEqual({ status: 'running', terminal_reason_code: null });
+          expect(gate).toEqual({ status: 'satisfied' });
+          expect(consumer?.task_id).toEqual(expect.any(String));
+          expect(activations).toHaveLength(1);
+          const messages = await ctx.repository.listMessages(consumer!.task_id!);
+          expect(messages).toEqual(expect.arrayContaining([
+            expect.objectContaining({ content: expectedAggregate }),
+          ]));
+          expect(Buffer.byteLength(expectedAggregate, 'utf8')).toBe(policy.maxAggregateBytes);
+        }
+      } finally {
+        await ctx.close();
+      }
+    }
+  }, 45_000);
+
   it('M018 S02 flow: public define graph_v1 + start activates only entry producers', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m018-s02-named-'));
     const dbPath = path.join(dir, 'muster.sqlite3');
@@ -493,6 +600,8 @@ describe('M018 S02 fan-in NEXT activation', () => {
           version: 1,
           name: 'public-fan-in',
           topology: FAN_IN_TOPOLOGY,
+          entryContracts: [],
+          policy: DEFAULT_WORKFLOW_POLICY,
         },
         context,
       );
@@ -517,6 +626,7 @@ describe('M018 S02 fan-in NEXT activation', () => {
           startIdempotencyKey: 'public-fan-start-1',
           goal: 'activate fan-in via bridge',
           backend: 'grok',
+          entryInputs: [],
         },
         context,
       );

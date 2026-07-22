@@ -1,20 +1,15 @@
 /**
  * Bounded schema fingerprint (P5-W2 / M018 S01).
  *
- * Golden manifests are versioned: migration validates owned v7 input against the
- * frozen v7 manifest, while open/reset/backup validate the compiled current
- * schema. Validates ordered columns, FKs, explicit indexes (index_xinfo +
+ * The golden manifest describes the only supported development schema. Validates
+ * ordered columns, FKs, explicit indexes (index_xinfo +
  * normalized SQL), triggers, and rejects extra user tables/views/indexes/triggers.
  * SQL normalization preserves quoted literal contents (CHECK 'draft' ≠ 'DRAFT').
  * Read-only; before WAL.
  */
 
 import { DatabaseSync } from 'node:sqlite';
-import {
-  CURRENT_SCHEMA_STATEMENTS,
-  SQLITE_SCHEMA_VERSION,
-  schemaStatementsForVersion,
-} from './schema';
+import { CURRENT_SCHEMA_STATEMENTS } from './schema';
 
 export type SchemaFingerprintFailure = {
   reason:
@@ -403,32 +398,22 @@ export function captureSchemaManifest(db: DatabaseSync): SchemaManifest {
   };
 }
 
-const cachedExpectedByVersion = new Map<number, SchemaManifest>();
+let cachedExpected: SchemaManifest | undefined;
 
-/**
- * Golden manifest for a supported schema version (lazy, per version).
- * Migration input uses version 7; open/reset/backup use the compiled current version.
- */
-export function expectedSchemaManifestForVersion(version: number): SchemaManifest {
-  const cached = cachedExpectedByVersion.get(version);
-  if (cached) return cached;
-  const statements = schemaStatementsForVersion(version);
+/** Golden manifest from CURRENT_SCHEMA_STATEMENTS (lazy, once per process). */
+export function expectedSchemaManifest(): SchemaManifest {
+  if (cachedExpected) return cachedExpected;
   const db = new DatabaseSync(':memory:');
   try {
-    for (const statement of statements) {
+    for (const statement of CURRENT_SCHEMA_STATEMENTS) {
       db.exec(statement);
     }
     const manifest = captureSchemaManifest(db);
-    cachedExpectedByVersion.set(version, manifest);
+    cachedExpected = manifest;
     return manifest;
   } finally {
     db.close();
   }
-}
-
-/** Golden manifest from CURRENT_SCHEMA_STATEMENTS (lazy, once per process). */
-export function expectedSchemaManifest(): SchemaManifest {
-  return expectedSchemaManifestForVersion(SQLITE_SCHEMA_VERSION);
 }
 
 // Keep a direct reference so tree-shaking / dead-code reviews still see current DDL usage.
@@ -492,19 +477,13 @@ function sameIndexColumns(a: readonly IndexColumnSpec[], b: readonly IndexColumn
  * Returns the first fingerprint failure, or undefined when the DB matches the
  * expected structure. Read-only; no journal/application mutations.
  *
- * @param expected Optional explicit golden: a SchemaManifest, or a supported
- *   schema version number. Defaults to the compiled current schema.
+ * @param expected Optional explicit golden manifest. Defaults to current schema.
  */
 export function findSchemaFingerprintFailure(
   db: DatabaseSync,
-  expected?: SchemaManifest | number,
+  expected: SchemaManifest = expectedSchemaManifest(),
 ): SchemaFingerprintFailure | undefined {
-  const golden =
-    expected === undefined
-      ? expectedSchemaManifest()
-      : typeof expected === 'number'
-        ? expectedSchemaManifestForVersion(expected)
-        : expected;
+  const golden = expected;
   const actual = captureSchemaManifest(db);
 
   const expectedTables = new Map(golden.tables.map((t) => [t.name, t]));
