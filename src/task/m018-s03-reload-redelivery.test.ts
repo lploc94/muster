@@ -17,6 +17,7 @@ import { CredentialRegistry } from '../bridge/credentials';
 import { TaskEngine } from './engine';
 import { parseTaskTypeRegistry } from './task-types';
 import { SqliteTaskRepository } from './repository';
+import { stageDispositionForSettlement } from './m018-test-helpers';
 import { DbClient, DbWorkerError } from './sqlite/client';
 import {
   deriveNextContributionMessageId,
@@ -161,6 +162,8 @@ async function settleNext(
   const turn = await repository.getTurn(entry.activationTurnId);
   expect(task).toBeTruthy();
   expect(turn).toBeTruthy();
+  const disposition = { kind: 'workflow_next' as const, change: 'updated' as const, result };
+  await stageDispositionForSettlement(repository, turn!, disposition);
   return repository.execute({
     kind: 'settleTurnAndApplyEffects',
     workspaceId: 'ws',
@@ -173,7 +176,7 @@ async function settleNext(
       ...turn!,
       status: 'succeeded',
       finishedAt,
-      disposition: { kind: 'workflow_next', change: 'updated', result },
+      disposition,
     },
     expectedStatuses: ['running'],
     relatedTurns: [],
@@ -413,6 +416,7 @@ describe('M018 S03 reload and redelivery safety', () => {
       engine = await TaskEngine.loadAsync({
         repository: reloaded.repository,
         workspaceId: 'ws',
+        clock: () => '2026-07-20T02:10:00.000Z',
         credentialRegistry: credentials,
         makeBackend: (name) => ({
           name,

@@ -32,6 +32,7 @@ import { dispatch } from './coordinator-tools';
 import { executeToolCommand, type GraphEngineDeps } from './engine-graph';
 import { DEFAULT_RESOURCE_LIMITS } from './limits';
 import { SqliteTaskRepository } from './repository';
+import { stageDispositionForSettlement } from './m018-test-helpers';
 import { pickRunnableTurns } from './scheduler';
 import { DbClient } from './sqlite/client';
 import type { TaskStoreFile, TurnDisposition } from './types';
@@ -71,7 +72,7 @@ const CANONICAL_TOPOLOGY: GraphTopologyV1 = {
 
 const ONE_NODE = {
   kind: 'one_node_v1' as const,
-  nodes: [{ nodeId: 'entry' }],
+  nodes: [{ nodeId: 'entry', role: 'coordinator' as const, capabilities: ['create_child' as const] }],
   entryNodeId: 'entry',
 };
 
@@ -149,6 +150,7 @@ async function settleSucceeded(
   const turn = await repository.getTurn(turnId);
   expect(task).toBeTruthy();
   expect(turn).toBeTruthy();
+  await stageDispositionForSettlement(repository, turn!, disposition);
   return repository.execute({
     kind: 'settleTurnAndApplyEffects',
     workspaceId: 'ws',
@@ -193,9 +195,13 @@ function assertBoundedProjection(w: WorkflowTaskStatusProjection): void {
   expect(w.definitionId.length).toBeGreaterThan(0);
   expect(Number.isInteger(w.definitionVersion)).toBe(true);
   expect(typeof w.runStatus).toBe('string');
+  expect(typeof w.policy.maxWorkflowTurns).toBe('number');
   expect(typeof w.origin).toBe('string');
   expect(typeof w.nodeId).toBe('string');
   expect(Array.isArray(w.gates)).toBe(true);
+  expect(Array.isArray(w.feedbackRounds)).toBe(true);
+  expect(Array.isArray(w.continuations)).toBe(true);
+  expect(Array.isArray(w.diagnostics)).toBe(true);
   expect(w).not.toHaveProperty('topology');
   expect(w).not.toHaveProperty('payload_json');
   expect(w).not.toHaveProperty('body_json');
@@ -553,13 +559,16 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
       expect(r1Status0!.runStatus).toBe('running');
       expect(r1Status0!.origin).toBe('child');
       expect(r1Status0!.parentRunId).toBe(caller.runId);
-      expect(r1Status0!.continuation).toBeUndefined();
+      expect(r1Status0!.continuations).toEqual([
+        expect.objectContaining({ childRunId: childRunId, status: 'pending' }),
+      ]);
 
       const parentProj = await opened.repository.getWorkflowStatusForTask(caller.entryTaskId);
       expect(parentProj).toBeTruthy();
       assertBoundedProjection(parentProj!);
-      expect(parentProj!.continuation).toBeTruthy();
-      expect(parentProj!.continuation!.status).toBe('pending');
+      expect(parentProj!.continuations).toEqual([
+        expect.objectContaining({ childRunId: childRunId, status: 'pending' }),
+      ]);
 
       // Scheduler: research activation turns are promotable when queued.
       // (After start they may already be queued; promote check is structural.)
@@ -626,7 +635,7 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
       expect(plannerGate).toBeTruthy();
       expect(plannerGate!.satisfied).toBeGreaterThanOrEqual(2);
       expect(plannerGate!.status).toBe('satisfied');
-      expect(plannerStatus!.activeFeedbackRound).toBeUndefined();
+      expect(plannerStatus!.feedbackRounds).toEqual([]);
 
       // get_task_status tool surface includes bounded workflow section.
       const plannerTask = await opened.repository.getTask(plannerTaskId);
@@ -695,7 +704,7 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
       expect(verifierStatus0).toBeTruthy();
       assertBoundedProjection(verifierStatus0!);
       expect(verifierStatus0!.nodeId).toBe('verifier');
-      expect(verifierStatus0!.activeFeedbackRound).toBeUndefined();
+      expect(verifierStatus0!.feedbackRounds).toEqual([]);
 
       // --- Phase: verifier PREV planner once (targeted from_planner) ---
       const prev = await settleSucceeded(
@@ -744,11 +753,14 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
 
       // Projection shows open feedback round on verifier.
       const verifierWithRound = await opened.repository.getWorkflowStatusForTask(verifierTaskId);
-      expect(verifierWithRound?.activeFeedbackRound).toEqual({
-        roundId,
-        status: 'open',
-        joinMode: 'all',
-      });
+      expect(verifierWithRound?.feedbackRounds).toEqual([
+        expect.objectContaining({
+          roundId,
+          status: 'open',
+          joinMode: 'all',
+          role: 'requester',
+        }),
+      ]);
       assertBoundedProjection(verifierWithRound!);
 
       // Planner receives exactly one feedback turn (PREV once).
@@ -801,15 +813,13 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
       expect(resume!.status).toBe('queued');
       expect(resume!.trigger).toBe('engine');
 
-      // Projection: feedback round no longer active (satisfied).
+      // Projection retains the exact satisfied round until its resume is consumed.
       const verifierAfterJoin = await opened.repository.getWorkflowStatusForTask(verifierTaskId);
       expect(verifierAfterJoin).toBeTruthy();
       assertBoundedProjection(verifierAfterJoin!);
-      // Active open round should be cleared once satisfied.
-      expect(
-        verifierAfterJoin!.activeFeedbackRound === undefined ||
-          verifierAfterJoin!.activeFeedbackRound.status !== 'open',
-      ).toBe(true);
+      expect(verifierAfterJoin!.feedbackRounds).toEqual([
+        expect.objectContaining({ roundId, status: 'satisfied', role: 'requester' }),
+      ]);
 
       // Scheduler: resume is runnable.
       const resumeStore = await buildStoreFromRepo(opened.repository, [verifierTaskId]);
@@ -854,10 +864,7 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
         const parentFinal = await opened.repository.getWorkflowStatusForTask(caller.entryTaskId);
         expect(parentFinal).toBeTruthy();
         assertBoundedProjection(parentFinal!);
-        // Continuation no longer pending after resolve.
-        if (parentFinal!.continuation) {
-          expect(parentFinal!.continuation.status).not.toBe('pending');
-        }
+        expect(parentFinal!.continuations.every((continuation) => continuation.status !== 'pending')).toBe(true);
 
         // Caller lifecycle stays open across return.
         expect((await opened.repository.getTask(caller.entryTaskId))?.lifecycle).toBe('open');

@@ -132,6 +132,27 @@ describe('strict RPC wire validation', () => {
     ).toBe(true);
     expect(
       parseWireSuccessResponse({
+        kind: 'workflowMutation',
+        requestId: 1,
+        result: { ok: true, changed: false, reason: 'turn is no longer live' },
+      }).ok,
+    ).toBe(true);
+    expect(
+      parseWireSuccessResponse({
+        kind: 'workflowMutation',
+        requestId: 1,
+        result: { ok: true, changed: true, unexpected: true },
+      }).ok,
+    ).toBe(false);
+    expect(
+      parseWireSuccessResponse({
+        kind: 'workflowMutation',
+        requestId: 1,
+        result: { ok: true, changed: true, operation: { fingerprint: 'fp', result: { ok: true } } },
+      }).ok,
+    ).toBe(true);
+    expect(
+      parseWireSuccessResponse({
         kind: 'backup',
         requestId: 1,
         result: {

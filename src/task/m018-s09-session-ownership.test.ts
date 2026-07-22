@@ -3,6 +3,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { SqliteTaskRepository } from './repository';
+import { stageDispositionForSettlement } from './m018-test-helpers';
 import { DbClient } from './sqlite/client';
 import type { MusterTask, TaskTurn } from './types';
 
@@ -62,6 +63,8 @@ async function settleWithSession(
   const currentTask = await repository.getTask(taskId);
   const currentTurn = await repository.getTurn(`turn-${taskId}`);
   if (!currentTask || !currentTurn) throw new Error('fixture missing');
+  const disposition = { kind: 'complete' as const, result: 'done' };
+  await stageDispositionForSettlement(repository, currentTurn, disposition);
   return repository.execute({
     kind: 'settleTurnAndApplyEffects',
     workspaceId: 'ws',
@@ -75,7 +78,7 @@ async function settleWithSession(
       ...currentTurn,
       status: 'succeeded',
       finishedAt: '2026-07-22T03:00:03.000Z',
-      disposition: { kind: 'complete', result: 'done' },
+      disposition,
     },
     expectedStatuses: ['running'],
     relatedTurns: [],

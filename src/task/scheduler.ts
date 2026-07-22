@@ -123,6 +123,18 @@ export function canPromoteTurn(
   ) {
     return { ok: false, reason: 'workflow activation is no longer eligible' };
   }
+  if (
+    turn.workflowWait?.hasOpenFeedbackRound &&
+    turn.workflowActivation?.kind !== 'feedback_resume'
+  ) {
+    return { ok: false, reason: 'waiting on workflow feedback' };
+  }
+  if (
+    turn.workflowWait?.hasPendingContinuation &&
+    turn.workflowActivation?.kind !== 'child_return'
+  ) {
+    return { ok: false, reason: 'waiting on child workflow' };
+  }
 
   const otherLive = turnsForTask(file, turn.taskId).find(
     (t) => t.id !== turnId && LIVE_STATUSES.has(t.status),

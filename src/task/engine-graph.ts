@@ -2631,7 +2631,7 @@ export async function executeToolCommand(
       const callerWait = callerTurn?.disposition?.kind === 'wait_tasks'
         ? callerTurn.disposition
         : undefined;
-      // M018 S07: bounded workflow orchestration state (run/gate/round/continuation).
+      // M018 S07: bounded workflow orchestration state and integrity diagnostics.
       // Optional method so partial TaskRepository mocks remain valid.
       let workflow: WorkflowTaskStatusProjection | undefined;
       if (typeof deps.repository.getWorkflowStatusForTask === 'function') {

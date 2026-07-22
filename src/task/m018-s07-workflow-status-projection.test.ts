@@ -4,8 +4,8 @@
  * Contract:
  * - repository getWorkflowStatusForTask joins nodes → runs → gates/rounds/continuations
  * - get_task_status surfaces a bounded `workflow` section (runId, definitionId+version,
- *   run status, per-gate satisfied/required, active feedback round, continuation,
- *   parent linkage / origin)
+ *   run policy/status/reason, per-gate satisfied/required, exact activation,
+ *   active feedback rounds, all continuation states, diagnostics, parent linkage / origin)
  * - never leaks topology, prompts, artifact bodies, secrets, or absolute paths
  *
  * Uses real SQLite worker + repository; graph tool surface via executeToolCommand.
@@ -118,9 +118,13 @@ function assertBoundedProjection(w: WorkflowTaskStatusProjection): void {
   expect(w.definitionId.length).toBeGreaterThan(0);
   expect(Number.isInteger(w.definitionVersion)).toBe(true);
   expect(typeof w.runStatus).toBe('string');
+  expect(typeof w.policy.maxWorkflowTurns).toBe('number');
   expect(typeof w.origin).toBe('string');
   expect(typeof w.nodeId).toBe('string');
   expect(Array.isArray(w.gates)).toBe(true);
+  expect(Array.isArray(w.feedbackRounds)).toBe(true);
+  expect(Array.isArray(w.continuations)).toBe(true);
+  expect(Array.isArray(w.diagnostics)).toBe(true);
   for (const g of w.gates) {
     expect(typeof g.gateId).toBe('string');
     expect(typeof g.status).toBe('string');
@@ -200,8 +204,15 @@ describe('M018 S07 bounded workflow status projection', () => {
       expect(p1Gate!.status).toBe('satisfied');
       expect(p1Gate!.required).toBeGreaterThanOrEqual(1);
       expect(p1Gate!.satisfied).toBeGreaterThanOrEqual(1);
-      expect(projection!.activeFeedbackRound).toBeUndefined();
-      expect(projection!.continuation).toBeUndefined();
+      expect(projection!.activeGate).toEqual(p1Gate);
+      expect(projection!.activation).toMatchObject({
+        status: 'queued',
+        sourceGateId: p1.gateId,
+        executionTurnId: p1.activationTurnId,
+      });
+      expect(projection!.feedbackRounds).toEqual([]);
+      expect(projection!.continuations).toEqual([]);
+      expect(projection!.diagnostics).toEqual([]);
     } finally {
       await ctx.close();
     }
@@ -326,17 +337,147 @@ describe('M018 S07 bounded workflow status projection', () => {
       const roundId = 'wfrd_s07_open_round_1';
       await ctx.client.run(
         `INSERT INTO workflow_feedback_rounds (
-           workspace_id, run_id, round_id, requester_node_id, status, join_mode, created_at
-         ) VALUES (?,?,?,?,?,?,?)`,
-        ['ws', parentStart.runId, roundId, 'consumer', 'open', 'all', createdAt],
+           workspace_id, run_id, round_id, requester_node_id, requester_task_id,
+           status, join_mode, created_at
+         ) VALUES (?,?,?,?,?,?,?,?)`,
+        ['ws', parentStart.runId, roundId, 'consumer', p1.taskId, 'open', 'all', createdAt],
       );
       const withRound = await ctx.repository.getWorkflowStatusForTask(p1.taskId);
-      expect(withRound?.activeFeedbackRound).toEqual({
-        roundId,
-        status: 'open',
-        joinMode: 'all',
-      });
+      expect(withRound?.feedbackRounds).toEqual([
+        {
+          roundId,
+          status: 'open',
+          joinMode: 'all',
+          role: 'requester',
+          required: 0,
+          responded: 0,
+        },
+      ]);
       assertBoundedProjection(withRound!);
+    } finally {
+      await ctx.close();
+    }
+  }, 30_000);
+
+  it('reports terminal integrity drift and prunes terminal workflow history with transcript retention', async () => {
+    const ctx = await openRepo('terminal-prune');
+    try {
+      const createdAt = '2026-07-21T00:30:00.000Z';
+      const data = await defineAndStartFanIn(ctx.repository, createdAt, 's07-terminal-prune-1');
+      const p1 = data.entries.find((entry) => entry.nodeId === 'p1')!;
+      const artifactId = 'wfa_s07_terminal_prune';
+      await ctx.client.transaction([
+        {
+          sql: `INSERT INTO workflow_artifacts (
+                  workspace_id, run_id, artifact_id, producer_node_id, logical_name,
+                  revision, kind, payload_json, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?)`,
+          params: ['ws', data.runId, artifactId, 'p1', 'next_result', 1, 'next_result', '{}', createdAt],
+        },
+        {
+          sql: `INSERT INTO workflow_artifact_sources (
+                  workspace_id, run_id, artifact_id, artifact_revision, source_kind,
+                  producer_run_id, producer_node_id, producer_task_id, producing_turn_id,
+                  producing_activation_id, caller_task_id, caller_turn_id,
+                  engine_start_operation_key
+                )
+                SELECT ?, ?, ?, 1, 'workflow_node', ?, ?, ?, ?, activation_id,
+                       NULL, NULL, NULL
+                  FROM workflow_activations
+                 WHERE workspace_id = ? AND run_id = ? AND execution_turn_id = ?`,
+          params: [
+            'ws', data.runId, artifactId, data.runId, 'p1', p1.taskId, p1.activationTurnId,
+            'ws', data.runId, p1.activationTurnId,
+          ],
+        },
+        {
+          sql: `UPDATE turns SET status = 'succeeded', settled_at = ?
+                 WHERE workspace_id = ? AND task_id IN (
+                   SELECT task_id FROM workflow_nodes WHERE workspace_id = ? AND run_id = ?
+                 )`,
+          params: ['2026-07-21T00:31:00.000Z', 'ws', 'ws', data.runId],
+        },
+        {
+          sql: `UPDATE workflow_activations SET status = 'consumed', updated_at = ?
+                 WHERE workspace_id = ? AND run_id = ?`,
+          params: ['2026-07-21T00:31:00.000Z', 'ws', data.runId],
+        },
+        {
+          sql: `UPDATE workflow_dependency_gates SET status = 'failed'
+                 WHERE workspace_id = ? AND run_id = ?`,
+          params: ['ws', data.runId],
+        },
+        {
+          sql: `UPDATE workflow_runs
+                   SET status = 'failed', terminal_reason_code = 'agent_fail', updated_at = ?
+                 WHERE workspace_id = ? AND run_id = ?`,
+          params: ['2026-07-21T00:31:00.000Z', 'ws', data.runId],
+        },
+      ]);
+
+      const nodes = await ctx.client.all<{ task_id: string }>(
+        `SELECT task_id FROM workflow_nodes
+          WHERE workspace_id = ? AND run_id = ? AND task_id IS NOT NULL`,
+        ['ws', data.runId],
+      );
+      for (const node of nodes) {
+        const task = await ctx.repository.getTask(node.task_id);
+        expect(task).toBeTruthy();
+        await ctx.repository.execute({
+          kind: 'upsertTask',
+          workspaceId: 'ws',
+          task: {
+            ...task!,
+            lifecycle: 'succeeded',
+            finishedAt: '2026-07-21T00:32:00.000Z',
+            updatedAt: '2026-07-21T00:32:00.000Z',
+            revision: task!.revision + 1,
+          },
+        });
+      }
+
+      const gateId = data.nodeGates[0]!.gateId;
+      await ctx.client.run(
+        `UPDATE workflow_dependency_gates SET status = 'open'
+          WHERE workspace_id = ? AND run_id = ? AND gate_id = ?`,
+        ['ws', data.runId, gateId],
+      );
+      const corrupt = await ctx.repository.getWorkflowStatusForTask(p1.taskId);
+      expect(corrupt?.runStatus).toBe('failed');
+      expect(corrupt?.terminalReason).toBe('agent_fail');
+      expect(corrupt?.diagnostics).toContainEqual({ code: 'terminal_run_has_live_gate' });
+      expect(forbiddenLeak(corrupt)).toEqual([]);
+      await expect(ctx.repository.execute({
+        kind: 'applyRetention',
+        workspaceId: 'ws',
+        taskId: p1.taskId,
+        keepLatestTurns: 0,
+      })).resolves.toMatchObject({ ok: true, changed: false });
+      await expect(ctx.repository.getTurn(p1.activationTurnId)).resolves.toBeDefined();
+      await ctx.client.run(
+        `UPDATE workflow_dependency_gates SET status = 'failed'
+          WHERE workspace_id = ? AND run_id = ? AND gate_id = ?`,
+        ['ws', data.runId, gateId],
+      );
+
+      await expect(ctx.repository.execute({
+        kind: 'applyRetention',
+        workspaceId: 'ws',
+        taskId: p1.taskId,
+        keepLatestTurns: 0,
+      })).resolves.toMatchObject({ ok: true, changed: true });
+      await expect(ctx.repository.getTurn(p1.activationTurnId)).resolves.toBeUndefined();
+      await expect(ctx.client.get(
+        `SELECT run_id FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', data.runId],
+      )).resolves.toBeUndefined();
+      await expect(ctx.client.get(
+        `SELECT artifact_id FROM workflow_artifact_sources
+          WHERE workspace_id = ? AND artifact_id = ?`,
+        ['ws', artifactId],
+      )).resolves.toBeUndefined();
+      await expect(ctx.repository.getWorkflowStatusForTask(p1.taskId)).resolves.toBeUndefined();
+      await expect(ctx.client.all('PRAGMA foreign_key_check')).resolves.toEqual([]);
     } finally {
       await ctx.close();
     }

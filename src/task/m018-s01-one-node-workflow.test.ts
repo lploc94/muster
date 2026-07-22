@@ -13,6 +13,7 @@ import { TaskEngine } from './engine';
 import { DEFAULT_RESOURCE_LIMITS } from './limits';
 import { parseTaskTypeRegistry } from './task-types';
 import { SqliteTaskRepository } from './repository';
+import { stageDispositionForSettlement } from './m018-test-helpers';
 import { canPromoteTurn } from './scheduler';
 import { DbClient } from './sqlite/client';
 import type { TaskStoreFile } from './types';
@@ -33,14 +34,16 @@ const TOPOLOGY = {
 
 async function openRepo(label: string) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `muster-m018-s01-${label}-`));
+  const dbPath = path.join(dir, 'muster.sqlite3');
   const client = new DbClient({
     workerPath: path.join(__dirname, 'sqlite', 'worker.ts'),
     execArgv: ['--import', 'tsx'],
   });
-  await client.open(path.join(dir, 'muster.sqlite3'));
+  await client.open(dbPath);
   const repository = new SqliteTaskRepository(client, 'ws');
   return {
     dir,
+    dbPath,
     client,
     repository,
     async close() {
@@ -203,6 +206,25 @@ describe('M018 S01 one-node workflow activation', () => {
 
       const queued = await ctx.repository.listQueuedTurns(payload.entryTaskId);
       expect(queued).toHaveLength(1);
+      expect(
+        await ctx.client.get(
+          `SELECT source_kind, producer_run_id, producer_node_id, producer_task_id,
+                  producing_turn_id, caller_task_id, caller_turn_id,
+                  engine_start_operation_key
+             FROM workflow_artifact_sources
+            WHERE workspace_id = ? AND run_id = ?`,
+          ['ws', payload.runId],
+        ),
+      ).toEqual({
+        source_kind: 'engine_start',
+        producer_run_id: null,
+        producer_node_id: null,
+        producer_task_id: null,
+        producing_turn_id: null,
+        caller_task_id: null,
+        caller_turn_id: null,
+        engine_start_operation_key: startWorkflowLedgerKey('idem-entry-1'),
+      });
 
       const file: TaskStoreFile = {
         schemaVersion: 2,
@@ -247,6 +269,12 @@ describe('M018 S01 one-node workflow activation', () => {
       const currentTask = await ctx.repository.getTask(payload.entryTaskId);
       expect(runningTurn).toBeTruthy();
       expect(currentTask).toBeTruthy();
+      const disposition = {
+        kind: 'workflow_next' as const,
+        change: 'updated' as const,
+        result: 'terminal result',
+      };
+      await stageDispositionForSettlement(ctx.repository, runningTurn!, disposition);
       const settleCommand = {
         kind: 'settleTurnAndApplyEffects' as const,
         workspaceId: 'ws',
@@ -259,11 +287,7 @@ describe('M018 S01 one-node workflow activation', () => {
           ...runningTurn!,
           status: 'succeeded' as const,
           finishedAt: '2026-07-19T00:00:02.000Z',
-          disposition: {
-            kind: 'workflow_next' as const,
-            change: 'updated' as const,
-            result: 'terminal result',
-          },
+          disposition,
         },
         expectedStatuses: ['running' as const],
         relatedTurns: [],
@@ -298,6 +322,93 @@ describe('M018 S01 one-node workflow activation', () => {
       await expect(ctx.repository.getTask(payload.entryTaskId)).resolves.toMatchObject({ lifecycle: 'open' });
     } finally {
       await ctx.close();
+    }
+  }, 30_000);
+
+  it('same-operation concurrent define and start converge to one immutable definition and run', async () => {
+    const first = await openRepo('concurrent-define-start');
+    const secondClient = new DbClient({
+      workerPath: path.join(__dirname, 'sqlite', 'worker.ts'),
+      execArgv: ['--import', 'tsx'],
+    });
+    try {
+      await secondClient.open(first.dbPath);
+      const second = new SqliteTaskRepository(secondClient, 'ws');
+      const createdAt = '2026-07-22T12:00:00.000Z';
+      const defineResults = await Promise.all([
+        first.repository.execute({
+          kind: 'defineWorkflowVersion',
+          workspaceId: 'ws',
+          definitionId: 'wf-concurrent',
+          version: 1,
+          name: 'concurrent',
+          topology: TOPOLOGY,
+          createdAt,
+        }),
+        second.execute({
+          kind: 'defineWorkflowVersion',
+          workspaceId: 'ws',
+          definitionId: 'wf-concurrent',
+          version: 1,
+          name: 'concurrent',
+          topology: TOPOLOGY,
+          createdAt,
+        }),
+      ]);
+      expect(defineResults.every((result) => result.ok)).toBe(true);
+      expect(defineResults.map((result) => result.changed).sort()).toEqual([false, true]);
+
+      await expect(second.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-concurrent',
+        version: 1,
+        name: 'conflicting semantics',
+        topology: TOPOLOGY,
+        createdAt,
+      })).resolves.toMatchObject({ ok: false, conflict: true });
+
+      const startResults = await Promise.all([
+        first.repository.execute({
+          kind: 'startWorkflowRun',
+          workspaceId: 'ws',
+          definitionId: 'wf-concurrent',
+          version: 1,
+          startIdempotencyKey: 'same-concurrent-start',
+          createdAt,
+          goal: 'same concurrent start',
+          backend: 'grok',
+        }),
+        second.execute({
+          kind: 'startWorkflowRun',
+          workspaceId: 'ws',
+          definitionId: 'wf-concurrent',
+          version: 1,
+          startIdempotencyKey: 'same-concurrent-start',
+          createdAt,
+          goal: 'same concurrent start',
+          backend: 'grok',
+        }),
+      ]);
+      expect(startResults.every((result) => result.ok)).toBe(true);
+      expect(startResults.map((result) => result.changed).sort()).toEqual([false, true]);
+      const runIds = startResults.map(
+        (result) => (result.operation?.result?.data as { runId: string }).runId,
+      );
+      expect(new Set(runIds).size).toBe(1);
+      await expect(first.client.all(
+        `SELECT definition_id, name FROM workflow_definitions
+          WHERE workspace_id = ? AND definition_id = ?`,
+        ['ws', 'wf-concurrent'],
+      )).resolves.toEqual([{ definition_id: 'wf-concurrent', name: 'concurrent' }]);
+      await expect(first.client.all(
+        `SELECT run_id FROM workflow_runs
+          WHERE workspace_id = ? AND definition_id = ?`,
+        ['ws', 'wf-concurrent'],
+      )).resolves.toHaveLength(1);
+    } finally {
+      await secondClient.close().catch(() => undefined);
+      await first.close();
     }
   }, 30_000);
 

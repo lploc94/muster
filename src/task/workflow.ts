@@ -698,7 +698,10 @@ export function deriveChildStartIdempotencyKey(input: {
   childIdempotencyKey?: string;
 }): string {
   if (input.childIdempotencyKey && input.childIdempotencyKey.length > 0) {
-    return input.childIdempotencyKey;
+    return stableId(
+      'wfsk',
+      `${input.callerRunId}\0${input.childDefinitionId}\0${input.childDefinitionVersion}\0${input.childIdempotencyKey}`,
+    );
   }
   return stableId(
     'wfsk',

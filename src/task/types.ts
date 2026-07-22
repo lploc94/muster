@@ -515,6 +515,11 @@ export interface TaskTurn {
     hasPendingContinuation: boolean;
     hasInheritedFeedbackResponse: boolean;
   };
+  /** Repository-hydrated workflow authority that blocks unrelated queued turns. */
+  workflowWait?: {
+    hasOpenFeedbackRound: boolean;
+    hasPendingContinuation: boolean;
+  };
   inputs: TurnInput[];
   candidateSessionId?: string;
   observedSessionId?: string;

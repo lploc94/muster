@@ -48,7 +48,6 @@ import {
   workflowRunAttentionCode,
   workflowRunTerminalStatusForReason,
   boundWorkflowFailReason,
-  clampWorkflowRunBudgets,
   type WorkflowFailReasonCode,
   outgoingEdge,
   consumerInputRefsInDefinitionOrder,
@@ -78,8 +77,7 @@ import {
   isTerminalLifecycle, isTerminalTurn
 } from './transitions';
 import { TRUNCATION_MARKER } from './retention';
-import type { DbClient } from './sqlite/client';
-import type { SqlStatement, SqlValue } from './sqlite/rpc';
+import type { RunResult, SqlStatement, SqlValue } from './sqlite/rpc';
 import { CHANGE_FEED_RETAIN_REVISIONS } from './sqlite/schema';
 import {
   ASSISTANT_ORDERING_FALLBACK,
@@ -453,6 +451,17 @@ export type RepositoryCommand =
       };
     }
   | {
+      /** Close every running workflow whose frozen absolute deadline has elapsed. */
+      kind: 'reapWorkflowTimeouts'; workspaceId: string; now: string;
+    }
+  | {
+      /** Explicitly queue a new execution for one failed/interrupted logical activation. */
+      kind: 'recoverWorkflowActivation'; workspaceId: string;
+      runId: string; activationId: string; failedTurnId: string;
+      recoveryOperationId: string; fingerprint: string; instruction: string;
+      expectedActivationStatus: 'failed' | 'interrupted'; createdAt: string;
+    }
+  | {
       /** Atomic durable coordinator idempotency claim + presentation commit. */
       kind: 'commitPresentationOperation';
       workspaceId: string;
@@ -556,6 +565,71 @@ export interface RepositoryCommandResult {
     | 'stale_revision'
     | 'owner_mismatch';
 }
+
+export type WorkflowTransactionalCommand = Extract<
+  RepositoryCommand,
+  {
+    kind:
+      | GraphCommand['kind']
+      | 'stageDisposition'
+      | 'applyTaskLifecycle'
+      | 'cascadeTaskLifecycle'
+      | 'defineWorkflowVersion'
+      | 'startWorkflowRun'
+      | 'reapWorkflowTimeouts'
+      | 'recoverWorkflowActivation'
+      | 'settleTurnAndApplyEffects';
+  }
+>;
+
+export function isWorkflowTransactionalCommand(
+  command: RepositoryCommand,
+): command is WorkflowTransactionalCommand {
+  return isGraphCommand(command) || [
+    'stageDisposition',
+    'applyTaskLifecycle',
+    'cascadeTaskLifecycle',
+    'defineWorkflowVersion',
+    'startWorkflowRun',
+    'reapWorkflowTimeouts',
+    'recoverWorkflowActivation',
+    'settleTurnAndApplyEffects',
+  ].includes(command.kind);
+}
+
+export interface RepositoryDatabase {
+  all<T = unknown>(sql: string, params?: SqlValue[]): Promise<T[]>;
+  get<T = unknown>(sql: string, params?: SqlValue[]): Promise<T | undefined>;
+  run(sql: string, params?: SqlValue[]): Promise<RunResult>;
+  transaction(
+    statements: SqlStatement[],
+    options?: { abortIfFirstUnchanged?: boolean; abortIfUnchangedAt?: number[] },
+  ): Promise<RunResult[]>;
+  pragma(pragma: string): Promise<number>;
+  executeWorkflowMutation?(
+    command: WorkflowTransactionalCommand,
+    changeFeedRetainRevisions: number,
+  ): Promise<RepositoryCommandResult>;
+}
+
+type WorkflowTurnReservation = {
+  runId: string;
+  taskId: string;
+  count: number;
+};
+
+type WorkflowRunReservation = {
+  runId: string;
+  count: number;
+};
+
+type WorkflowEffectPlan = {
+  statements: SqlStatement[];
+  changes: ChangeRecord[];
+  feedbackRoundReservations?: WorkflowRunReservation[];
+  turnReservations?: WorkflowTurnReservation[];
+  conflictReason?: string;
+};
 
 /**
  * Read-side boundary for task data.
@@ -667,7 +741,7 @@ export interface TaskRepository {
   getWorkspaceChangesSince(afterRevision: number, limit?: number): Promise<WorkspaceChangeFeedResult>;
   /**
    * M018 S07: bounded workflow status for a task bound to a workflow node.
-   * Single-snapshot join of nodes → runs → gates/rounds/continuations.
+   * Relational read of nodes → runs → gates/activations/rounds/continuations.
    * Returns undefined when the task is not bound to a workflow node.
    * Never includes topology, prompts, artifact bodies, secrets, or absolute paths.
    */
@@ -1037,7 +1111,7 @@ export class SqliteTaskRepository implements TaskRepository {
   private readonly changeFeedRetainRevisions: number;
 
   constructor(
-    private readonly db: DbClient,
+    private readonly db: RepositoryDatabase,
     private readonly workspaceId: string,
     options: SqliteTaskRepositoryOptions = {},
   ) {
@@ -1193,27 +1267,64 @@ export class SqliteTaskRepository implements TaskRepository {
     const activationByTurn = new Map(
       activations.map((activation) => [activation.execution_turn_id, activation]),
     );
+    const authorityWaits = await this.db.all<{
+      turn_id: string;
+      has_open_feedback_round: number;
+      has_pending_continuation: number;
+    }>(
+      `SELECT candidate.id AS turn_id,
+              EXISTS (
+                SELECT 1 FROM workflow_feedback_rounds round_row
+                 WHERE round_row.workspace_id = candidate.workspace_id
+                   AND round_row.requester_task_id = candidate.task_id
+                   AND round_row.status IN ('open', 'satisfied')
+              ) AS has_open_feedback_round,
+              EXISTS (
+                SELECT 1 FROM workflow_continuations continuation
+                 WHERE continuation.workspace_id = candidate.workspace_id
+                   AND continuation.caller_task_id = candidate.task_id
+                   AND continuation.status IN ('pending', 'resolved')
+              ) AS has_pending_continuation
+         FROM turns candidate
+        WHERE candidate.workspace_id = ?
+          AND candidate.id IN (${placeholders(ids.length)})`,
+      [this.workspaceId, ...ids],
+    );
+    const authorityWaitByTurn = new Map(
+      authorityWaits.map((wait) => [wait.turn_id, wait]),
+    );
     return rows.map((row) => {
       const turn = decodeTurn(row, byTurn.get(row.id) ?? []);
       const activation = activationByTurn.get(row.id);
-      return activation
-        ? {
-            ...turn,
-            workflowActivation: {
-              runId: activation.run_id,
-              activationId: activation.activation_id,
-              nodeId: activation.node_id,
+      const wait = authorityWaitByTurn.get(row.id);
+      return {
+        ...turn,
+        ...(activation
+          ? {
+              workflowActivation: {
+                runId: activation.run_id,
+                activationId: activation.activation_id,
+                nodeId: activation.node_id,
               kind: activation.activation_kind,
               runStatus: activation.run_status,
               activationStatus: activation.activation_status,
               isTerminalNode: activation.is_terminal === 1,
               hasDirectDependencies: activation.has_direct_dependencies === 1,
               hasOpenFeedbackRound: activation.has_open_feedback_round === 1,
-              hasPendingContinuation: activation.has_pending_continuation === 1,
-              hasInheritedFeedbackResponse: activation.has_inherited_feedback_response === 1,
-            },
-          }
-        : turn;
+                hasPendingContinuation: activation.has_pending_continuation === 1,
+                hasInheritedFeedbackResponse: activation.has_inherited_feedback_response === 1,
+              },
+            }
+          : {}),
+        ...(wait && (wait.has_open_feedback_round === 1 || wait.has_pending_continuation === 1)
+          ? {
+              workflowWait: {
+                hasOpenFeedbackRound: wait.has_open_feedback_round === 1,
+                hasPendingContinuation: wait.has_pending_continuation === 1,
+              },
+            }
+          : {}),
+      };
     });
   }
 
@@ -1955,8 +2066,8 @@ export class SqliteTaskRepository implements TaskRepository {
 
   /**
    * M018 S07: bounded workflow read projection for get_task_status.
-   * Joins workflow_nodes → workflow_runs → gates/rounds/continuations in one
-   * consistent multi-query snapshot (no topology/prompts/bodies/paths).
+   * Reads relational run, gate, activation, round, continuation, and integrity
+   * state without topology, prompts, artifact bodies, or paths.
    */
   async getWorkflowStatusForTask(
     taskId: string,
@@ -1982,8 +2093,21 @@ export class SqliteTaskRepository implements TaskRepository {
       status: string;
       origin: string;
       parent_run_id: string | null;
+      max_feedback_rounds: number;
+      max_turns_per_task: number;
+      max_workflow_turns: number;
+      max_children: number;
+      max_depth: number;
+      max_concurrency: number;
+      max_aggregate_bytes: number;
+      started_at: string | null;
+      deadline_at: string | null;
+      terminal_reason_code: string | null;
     }>(
-      `SELECT run_id, definition_id, definition_version, status, origin, parent_run_id
+      `SELECT run_id, definition_id, definition_version, status, origin, parent_run_id,
+              max_feedback_rounds, max_turns_per_task, max_workflow_turns,
+              max_children, max_depth, max_concurrency, max_aggregate_bytes,
+              started_at, deadline_at, terminal_reason_code
          FROM workflow_runs
         WHERE workspace_id = ? AND run_id = ?`,
       [this.workspaceId, node.run_id],
@@ -1994,11 +2118,13 @@ export class SqliteTaskRepository implements TaskRepository {
 
     const gateRows = await this.db.all<{
       gate_id: string;
+      consumer_node_id: string;
       status: string;
       required: number;
       satisfied: number;
     }>(
       `SELECT g.gate_id AS gate_id,
+              g.consumer_node_id AS consumer_node_id,
               g.status AS status,
               (SELECT COUNT(*) FROM workflow_gate_bindings b
                 WHERE b.workspace_id = g.workspace_id
@@ -2010,65 +2136,224 @@ export class SqliteTaskRepository implements TaskRepository {
                   AND f.gate_id = g.gate_id) AS satisfied
          FROM workflow_dependency_gates g
         WHERE g.workspace_id = ? AND g.run_id = ?
-        ORDER BY g.gate_id`,
+        ORDER BY g.gate_id
+        LIMIT 65`,
       [this.workspaceId, node.run_id],
     );
 
-    const openRound = await this.db.get<{
+    const activationRows = await this.db.all<{
+      activation_id: string;
+      kind: string;
+      status: string;
+      primary_turn_id: string;
+      execution_turn_id: string;
+      source_gate_id: string | null;
+      feedback_round_id: string | null;
+      feedback_target_node_id: string | null;
+      continuation_id: string | null;
+      return_gate_id: string | null;
+    }>(
+      `SELECT activation_id, kind, status, primary_turn_id, execution_turn_id,
+              source_gate_id, feedback_round_id, feedback_target_node_id,
+              continuation_id, return_gate_id
+         FROM workflow_activations
+        WHERE workspace_id = ? AND run_id = ? AND node_id = ?
+          AND status IN ('queued', 'running', 'failed', 'interrupted')
+        ORDER BY CASE status
+                   WHEN 'running' THEN 0
+                   WHEN 'queued' THEN 1
+                   WHEN 'interrupted' THEN 2
+                   ELSE 3
+                 END,
+                 updated_at DESC, activation_id
+        LIMIT 2`,
+      [this.workspaceId, node.run_id, node.node_id],
+    );
+
+    const roundRows = await this.db.all<{
       round_id: string;
       status: string;
       join_mode: string;
+      role: 'requester' | 'target';
+      required: number;
+      responded: number;
     }>(
-      `SELECT round_id, status, join_mode
-         FROM workflow_feedback_rounds
-        WHERE workspace_id = ? AND run_id = ? AND status = 'open'
-        ORDER BY created_at DESC, round_id
-        LIMIT 1`,
-      [this.workspaceId, node.run_id],
+      `SELECT round_row.round_id,
+              round_row.status,
+              round_row.join_mode,
+              CASE WHEN round_row.requester_task_id = ? THEN 'requester' ELSE 'target' END AS role,
+              (SELECT COUNT(*) FROM workflow_feedback_targets target
+                WHERE target.workspace_id = round_row.workspace_id
+                  AND target.run_id = round_row.run_id
+                  AND target.round_id = round_row.round_id) AS required,
+              (SELECT COUNT(*) FROM workflow_feedback_targets target
+                WHERE target.workspace_id = round_row.workspace_id
+                  AND target.run_id = round_row.run_id
+                  AND target.round_id = round_row.round_id
+                  AND target.status = 'responded') AS responded
+         FROM workflow_feedback_rounds round_row
+        WHERE round_row.workspace_id = ? AND round_row.run_id = ?
+          AND round_row.status IN ('open', 'satisfied')
+          AND (
+            round_row.requester_task_id = ?
+            OR EXISTS (
+              SELECT 1 FROM workflow_activations activation
+               WHERE activation.workspace_id = round_row.workspace_id
+                 AND activation.run_id = round_row.run_id
+                 AND activation.node_id = ?
+                 AND activation.feedback_round_id = round_row.round_id
+                 AND activation.status IN ('queued', 'running', 'failed', 'interrupted')
+            )
+          )
+        ORDER BY round_row.created_at, round_row.round_id
+        LIMIT 33`,
+      [taskId, this.workspaceId, node.run_id, taskId, node.node_id],
     );
 
-    const pendingCont = await this.db.get<{
+    const continuationRows = await this.db.all<{
       continuation_id: string;
       status: string;
       kind: string;
+      child_run_id: string | null;
+      outcome: string | null;
+      reason_code: string | null;
     }>(
-      `SELECT continuation_id, status, kind
+      `SELECT continuation_id, status, kind, child_run_id, outcome, reason_code
          FROM workflow_continuations
-        WHERE workspace_id = ? AND run_id = ? AND status = 'pending'
-        ORDER BY created_at DESC, continuation_id
-        LIMIT 1`,
-      [this.workspaceId, node.run_id],
+        WHERE workspace_id = ?
+          AND (run_id = ? OR child_run_id = ?
+            OR (caller_run_id = ? AND caller_task_id = ?))
+        ORDER BY created_at, continuation_id
+        LIMIT 65`,
+      [this.workspaceId, node.run_id, node.run_id, node.run_id, taskId],
     );
+
+    const liveState = await this.db.get<{
+      live_gate: number;
+      live_round: number;
+      live_activation: number;
+      live_continuation: number;
+      live_return_gate: number;
+    }>(
+      `SELECT
+         EXISTS (SELECT 1 FROM workflow_dependency_gates
+                  WHERE workspace_id = ? AND run_id = ? AND status IN ('open', 'satisfied')) AS live_gate,
+         EXISTS (SELECT 1 FROM workflow_feedback_rounds
+                  WHERE workspace_id = ? AND run_id = ? AND status IN ('open', 'satisfied')) AS live_round,
+         EXISTS (SELECT 1 FROM workflow_activations
+                  WHERE workspace_id = ? AND run_id = ? AND status IN ('queued', 'running')) AS live_activation,
+         EXISTS (SELECT 1 FROM workflow_continuations
+                  WHERE workspace_id = ? AND (run_id = ? OR child_run_id = ?)
+                    AND status IN ('pending', 'resolved')) AS live_continuation,
+         EXISTS (SELECT 1 FROM workflow_return_gates
+                  WHERE workspace_id = ?
+                    AND (continuation_run_id = ? OR child_run_id = ?)
+                    AND status IN ('open', 'satisfied')) AS live_return_gate`,
+      [
+        this.workspaceId, node.run_id,
+        this.workspaceId, node.run_id,
+        this.workspaceId, node.run_id,
+        this.workspaceId, node.run_id, node.run_id,
+        this.workspaceId, node.run_id, node.run_id,
+      ],
+    );
+
+    const diagnostics: Array<{ code: string }> = [];
+    const gatesTruncated = gateRows.length > 64;
+    const roundsTruncated = roundRows.length > 32;
+    const continuationsTruncated = continuationRows.length > 64;
+    if (gatesTruncated) diagnostics.push({ code: 'workflow_gates_truncated' });
+    if (roundsTruncated) diagnostics.push({ code: 'workflow_feedback_rounds_truncated' });
+    if (continuationsTruncated) diagnostics.push({ code: 'workflow_continuations_truncated' });
+    if (activationRows.length > 1) diagnostics.push({ code: 'multiple_recoverable_activations' });
+    const terminal = run.status === 'succeeded' || run.status === 'failed' || run.status === 'cancelled';
+    if (terminal && liveState?.live_gate === 1) diagnostics.push({ code: 'terminal_run_has_live_gate' });
+    if (terminal && liveState?.live_round === 1) diagnostics.push({ code: 'terminal_run_has_live_round' });
+    if (terminal && liveState?.live_activation === 1) diagnostics.push({ code: 'terminal_run_has_live_activation' });
+    if (terminal && liveState?.live_continuation === 1) diagnostics.push({ code: 'terminal_run_has_live_continuation' });
+    if (terminal && liveState?.live_return_gate === 1) diagnostics.push({ code: 'terminal_run_has_live_return_gate' });
+    const terminalReason = run.terminal_reason_code;
+    if (terminalReason !== null && !/^[a-z0-9_]{1,64}$/.test(terminalReason)) {
+      diagnostics.push({ code: 'invalid_terminal_reason' });
+    }
+
+    const gates = gateRows.slice(0, 64).map((g) => ({
+      gateId: g.gate_id,
+      status: g.status,
+      required: Number(g.required) || 0,
+      satisfied: Number(g.satisfied) || 0,
+    }));
+    const activationRow = activationRows.length === 1 ? activationRows[0] : undefined;
+    const activeGateRow = activationRow?.source_gate_id
+      ? gateRows.find((gate) => gate.gate_id === activationRow.source_gate_id)
+      : gateRows.find((gate) =>
+          gate.consumer_node_id === node.node_id && (gate.status === 'open' || gate.status === 'satisfied'));
 
     const projection: WorkflowTaskStatusProjection = {
       runId: run.run_id,
       definitionId: run.definition_id,
       definitionVersion: Number(run.definition_version),
       runStatus: run.status,
+      policy: {
+        maxFeedbackRounds: Number(run.max_feedback_rounds) || 0,
+        maxTurnsPerTask: Number(run.max_turns_per_task) || 0,
+        maxWorkflowTurns: Number(run.max_workflow_turns) || 0,
+        maxChildren: Number(run.max_children) || 0,
+        maxDepth: Number(run.max_depth) || 0,
+        maxConcurrency: Number(run.max_concurrency) || 0,
+        maxAggregateBytes: Number(run.max_aggregate_bytes) || 0,
+      },
       origin: run.origin,
       nodeId: node.node_id,
-      gates: gateRows.map((g) => ({
-        gateId: g.gate_id,
-        status: g.status,
-        required: Number(g.required) || 0,
-        satisfied: Number(g.satisfied) || 0,
+      gates,
+      feedbackRounds: roundRows.slice(0, 32).map((round) => ({
+        roundId: round.round_id,
+        status: round.status,
+        joinMode: round.join_mode,
+        role: round.role,
+        required: Number(round.required) || 0,
+        responded: Number(round.responded) || 0,
       })),
+      continuations: continuationRows.slice(0, 64).map((continuation) => ({
+        continuationId: continuation.continuation_id,
+        status: continuation.status,
+        kind: continuation.kind,
+        ...(continuation.child_run_id ? { childRunId: continuation.child_run_id } : {}),
+        ...(continuation.outcome ? { outcome: continuation.outcome } : {}),
+        ...(continuation.reason_code ? { reasonCode: continuation.reason_code } : {}),
+      })),
+      diagnostics: diagnostics.slice(0, 8),
     };
+    if (run.started_at) projection.startedAt = run.started_at;
+    if (run.deadline_at) projection.deadlineAt = run.deadline_at;
+    if (terminalReason && /^[a-z0-9_]{1,64}$/.test(terminalReason)) {
+      projection.terminalReason = terminalReason;
+    }
     if (typeof run.parent_run_id === 'string' && run.parent_run_id.length > 0) {
       projection.parentRunId = run.parent_run_id;
     }
-    if (openRound) {
-      projection.activeFeedbackRound = {
-        roundId: openRound.round_id,
-        status: openRound.status,
-        joinMode: openRound.join_mode,
+    if (activeGateRow) {
+      projection.activeGate = {
+        gateId: activeGateRow.gate_id,
+        status: activeGateRow.status,
+        required: Number(activeGateRow.required) || 0,
+        satisfied: Number(activeGateRow.satisfied) || 0,
       };
     }
-    if (pendingCont) {
-      projection.continuation = {
-        continuationId: pendingCont.continuation_id,
-        status: pendingCont.status,
-        kind: pendingCont.kind,
+    if (activationRow) {
+      projection.activation = {
+        activationId: activationRow.activation_id,
+        kind: activationRow.kind,
+        status: activationRow.status,
+        primaryTurnId: activationRow.primary_turn_id,
+        executionTurnId: activationRow.execution_turn_id,
+        ...(activationRow.source_gate_id ? { sourceGateId: activationRow.source_gate_id } : {}),
+        ...(activationRow.feedback_round_id ? { feedbackRoundId: activationRow.feedback_round_id } : {}),
+        ...(activationRow.feedback_target_node_id
+          ? { feedbackTargetNodeId: activationRow.feedback_target_node_id }
+          : {}),
+        ...(activationRow.continuation_id ? { continuationId: activationRow.continuation_id } : {}),
+        ...(activationRow.return_gate_id ? { returnGateId: activationRow.return_gate_id } : {}),
       };
     }
     return projection;
@@ -2627,6 +2912,9 @@ export class SqliteTaskRepository implements TaskRepository {
 
   async execute(command: RepositoryCommand): Promise<RepositoryCommandResult> {
     if (command.workspaceId !== this.workspaceId) throw new Error('repository workspace mismatch');
+    if (this.db.executeWorkflowMutation && isWorkflowTransactionalCommand(command)) {
+      return this.db.executeWorkflowMutation(command, this.changeFeedRetainRevisions);
+    }
     switch (command.kind) {
       case 'createChildTask':
       case 'delegateChildTask':
@@ -2809,6 +3097,10 @@ export class SqliteTaskRepository implements TaskRepository {
         return this.defineWorkflowVersion(command);
       case 'startWorkflowRun':
         return this.startWorkflowRun(command);
+      case 'reapWorkflowTimeouts':
+        return this.reapWorkflowTimeouts(command);
+      case 'recoverWorkflowActivation':
+        return this.recoverWorkflowActivation(command);
       case 'claimOperation':
         return this.claimOperation(command);
       case 'deleteOperationsForTurn': {
@@ -3271,7 +3563,18 @@ export class SqliteTaskRepository implements TaskRepository {
     command: Extract<RepositoryCommand, { kind: 'requestRuntimeHandoff' }>,
   ): Promise<RepositoryCommandResult> {
     const fence = appendTurnFence(
-      'UPDATE tasks SET updated_at = updated_at WHERE workspace_id = ? AND id = ? AND revision = ?',
+      `UPDATE tasks SET updated_at = updated_at
+        WHERE workspace_id = ? AND id = ? AND revision = ?
+          AND NOT EXISTS (
+            SELECT 1
+              FROM workflow_nodes node
+              JOIN workflow_runs run
+                ON run.workspace_id = node.workspace_id
+               AND run.run_id = node.run_id
+             WHERE node.workspace_id = tasks.workspace_id
+               AND node.task_id = tasks.id
+               AND run.status = 'running'
+          )`,
       [this.workspaceId, command.taskId, command.expectedTaskRevision],
       this.workspaceId,
       command.expectedTurns,
@@ -4060,6 +4363,9 @@ export class SqliteTaskRepository implements TaskRepository {
     }
 
     const { identities, fingerprint } = validated;
+    if (identities.entries.length > validated.policy.maxWorkflowTurnsPerRun) {
+      return invalidStart('invalid start');
+    }
     const resultPayload = startWorkflowCreated(validated);
     const ledgerKey = startWorkflowLedgerKey(
       validated.startIdempotencyKey,
@@ -4171,9 +4477,10 @@ export class SqliteTaskRepository implements TaskRepository {
                  workspace_id, run_id, definition_id, definition_version, status, origin,
                  parent_run_id, owner_root_task_id, caller_task_id, caller_turn_id,
                  continuation_id, policy_json, max_feedback_rounds, max_turns_per_task,
-                 max_workflow_turns, max_children, max_depth, max_concurrency,
-                 max_aggregate_bytes, started_at, deadline_at, created_at, updated_at
-               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                  max_workflow_turns, max_children, max_depth, max_concurrency,
+                  max_aggregate_bytes, feedback_rounds_reserved, workflow_turns_reserved,
+                  children_reserved, started_at, deadline_at, created_at, updated_at
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(workspace_id, run_id) DO NOTHING`,
         params: [
           this.workspaceId,
@@ -4195,6 +4502,9 @@ export class SqliteTaskRepository implements TaskRepository {
           validated.policy.maxDepth,
           validated.policy.maxConcurrency,
           validated.policy.maxAggregateBytes,
+          0,
+          identities.entries.length,
+          0,
           validated.createdAt,
           deadlineAt,
           validated.createdAt,
@@ -4773,6 +5083,8 @@ export class SqliteTaskRepository implements TaskRepository {
     if (command.expectedStatuses.length === 0) {
       return { ok: true, changed: false, reason: 'expected live status required' };
     }
+    const dispositionClaimConflict = await this.validateSettlementDispositionClaim(command);
+    if (dispositionClaimConflict) return dispositionClaimConflict;
     // M018 S05: workflow_fail / invalid-route / budget exhaustion close the run first.
     // M018 S04: feedback responses intercept workflow_next on a feedback turn before
     // the forward contribution path. PREV requests open a round; otherwise fall through
@@ -4782,6 +5094,14 @@ export class SqliteTaskRepository implements TaskRepository {
     const childInvocation = failClosure.statements.length > 0
       ? { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] }
       : await this.planWorkflowChildInvocation(command);
+    if (childInvocation.conflictReason) {
+      return {
+        ok: true,
+        changed: false,
+        conflict: true,
+        reason: childInvocation.conflictReason,
+      };
+    }
     const feedbackResponse = (
       failClosure.statements.length > 0
       || childInvocation.statements.length > 0
@@ -4813,9 +5133,19 @@ export class SqliteTaskRepository implements TaskRepository {
     )
       ? { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] }
       : await this.planWorkflowNextContribution(command);
-    // Budget check after successful non-fail planners: exceeding host-clamped bounds closes the run.
-    const budgetClosure = await this.planWorkflowBudgetExhaustionIfNeeded(command);
-    const workflowEffects = {
+    const budgetedRoutePlans: WorkflowEffectPlan[] = [
+      feedbackResponse,
+      prevRequest,
+      childReturn,
+      nextContribution,
+    ];
+    const budget = await this.planWorkflowBudgetExhaustionIfNeeded(command, {
+      feedbackRounds: budgetedRoutePlans.flatMap(
+        (plan) => plan.feedbackRoundReservations ?? [],
+      ),
+      workflowTurns: budgetedRoutePlans.flatMap((plan) => plan.turnReservations ?? []),
+    });
+    const routeEffects = {
       statements: [
         ...failClosure.statements,
         ...childInvocation.statements,
@@ -4823,7 +5153,6 @@ export class SqliteTaskRepository implements TaskRepository {
         ...prevRequest.statements,
         ...childReturn.statements,
         ...nextContribution.statements,
-        ...budgetClosure.statements,
       ],
       changes: [
         ...failClosure.changes,
@@ -4832,9 +5161,14 @@ export class SqliteTaskRepository implements TaskRepository {
         ...prevRequest.changes,
         ...childReturn.changes,
         ...nextContribution.changes,
-        ...budgetClosure.changes,
       ],
     };
+    const workflowEffects = budget.exhausted
+      ? { statements: budget.statements, changes: budget.changes }
+      : {
+          statements: [...budget.statements, ...routeEffects.statements],
+          changes: [...budget.changes, ...routeEffects.changes],
+        };
     const rest: SqlStatement[] = [
       taskStatement(this.workspaceId, command.task, true),
       ...sessionBindingStatements(
@@ -4916,6 +5250,70 @@ export class SqliteTaskRepository implements TaskRepository {
     };
   }
 
+  private async validateSettlementDispositionClaim(
+    command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
+  ): Promise<RepositoryCommandResult | undefined> {
+    const row = await this.db.get<{
+      task_id: string;
+      runtime_epoch: number;
+      family: DurableDispositionClaim['family'];
+      kind: DurableDispositionClaim['kind'];
+      fingerprint: string;
+      payload_json: string;
+      status: 'staged' | 'consumed' | 'discarded';
+    }>(
+      `SELECT task_id, runtime_epoch, family, kind, fingerprint, payload_json, status
+         FROM turn_disposition_claims
+        WHERE workspace_id = ? AND turn_id = ?`,
+      [this.workspaceId, command.turn.id],
+    );
+    const disposition = command.turn.disposition;
+    if (!disposition) {
+      if (command.turn.status === 'succeeded' && row?.status === 'staged') {
+        return {
+          ok: true,
+          changed: false,
+          conflict: true,
+          reason: 'successful settlement is missing its staged disposition',
+        };
+      }
+      return undefined;
+    }
+    const expected = durableDispositionClaim({
+      turnId: command.turn.id,
+      taskId: command.turn.taskId,
+      runtimeEpoch: command.turn.runtimeEpoch,
+      opId: '',
+      disposition,
+    });
+    if (!row) {
+      return {
+        ok: true,
+        changed: false,
+        conflict: true,
+        reason: 'settlement requires a durable staged disposition',
+      };
+    }
+    const matches = row.task_id === expected.taskId
+      && row.runtime_epoch === expected.runtimeEpoch
+      && row.family === expected.family
+      && row.kind === expected.kind
+      && row.fingerprint === expected.fingerprint
+      && row.payload_json === expected.payloadJson;
+    if (!matches) {
+      return {
+        ok: true,
+        changed: false,
+        conflict: true,
+        reason: 'settlement disposition does not match the durable claim',
+      };
+    }
+    if (row.status !== 'staged') {
+      return { ok: true, changed: false, reason: `disposition claim is already ${row.status}` };
+    }
+    return undefined;
+  }
+
   /**
    * M018 S02 / §20.5–20.6: when a producer turn settles with staged workflow_next,
    * commit artifact + gate contribution in the same transaction. Partial fills
@@ -4926,7 +5324,7 @@ export class SqliteTaskRepository implements TaskRepository {
   // before planWorkflowNextContribution so feedback responses never take the forward path.
   private async planWorkflowNextContribution(
     command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
-  ): Promise<{ statements: SqlStatement[]; changes: ChangeRecord[] }> {
+  ): Promise<WorkflowEffectPlan> {
     const empty = { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] };
     const disposition = command.turn.disposition;
     if (
@@ -4997,7 +5395,7 @@ export class SqliteTaskRepository implements TaskRepository {
       const artifactId = deriveProducerArtifactId(producerNode.run_id, producerNode.node_id);
       const revision = 1;
       const finishedAt = command.turn.finishedAt ?? new Date().toISOString();
-      const resultBody = typeof disposition.result === 'string' ? disposition.result.slice(0, 4000) : undefined;
+      const resultBody = typeof disposition.result === 'string' ? disposition.result : undefined;
       const fenceId = stableId('wfc', `${producerNode.run_id}\0terminal_next\0${command.turn.id}`);
       return {
         statements: [
@@ -5090,6 +5488,27 @@ export class SqliteTaskRepository implements TaskRepository {
     if (existingRouted) {
       return empty;
     }
+    const gateProgress = await this.db.get<{
+      required: number;
+      filled: number;
+      current_filled: number;
+    }>(
+      `SELECT
+         (SELECT COUNT(*) FROM workflow_gate_bindings
+           WHERE workspace_id = ? AND run_id = ? AND gate_id = ?) AS required,
+         (SELECT COUNT(*) FROM workflow_gate_fills
+           WHERE workspace_id = ? AND run_id = ? AND gate_id = ?) AS filled,
+         (SELECT COUNT(*) FROM workflow_gate_fills
+           WHERE workspace_id = ? AND run_id = ? AND gate_id = ? AND input_ref = ?) AS current_filled`,
+      [
+        this.workspaceId, producerNode.run_id, gate.gate_id,
+        this.workspaceId, producerNode.run_id, gate.gate_id,
+        this.workspaceId, producerNode.run_id, gate.gate_id, edge.inputRef,
+      ],
+    );
+    const willSatisfyGate = gate.status === 'open'
+      && Number(gateProgress?.current_filled) === 0
+      && Number(gateProgress?.filled) + 1 >= Number(gateProgress?.required);
     const finishedAt = command.turn.finishedAt ?? new Date().toISOString();
 
     const statements: SqlStatement[] = [];
@@ -5135,10 +5554,7 @@ export class SqliteTaskRepository implements TaskRepository {
       ],
     });
 
-    const resultBody =
-      typeof disposition.result === 'string'
-        ? disposition.result.slice(0, 4000)
-        : undefined;
+      const resultBody = typeof disposition.result === 'string' ? disposition.result : undefined;
     const artifactPayload = encodePayload({
       kind: 'next_result',
       schema: 1,
@@ -5294,6 +5710,8 @@ export class SqliteTaskRepository implements TaskRepository {
       closureId: aggregateClosureId,
       at: finishedAt,
     }));
+
+    if (!willSatisfyGate) return { statements, changes };
 
     const activation = deriveNodeActivationIdentities(producerNode.run_id, edge.toNodeId);
     const consumerSpec = topology.nodes.find((n) => n.nodeId === edge.toNodeId);
@@ -5531,7 +5949,11 @@ export class SqliteTaskRepository implements TaskRepository {
       { kind: 'message', id: activation.messageId, taskId: activation.taskId, change: 'complete' },
     );
 
-    return { statements, changes };
+    return {
+      statements,
+      changes,
+      turnReservations: [{ runId: producerNode.run_id, taskId: activation.taskId, count: 1 }],
+    };
   }
 
 
@@ -5544,7 +5966,7 @@ export class SqliteTaskRepository implements TaskRepository {
    */
   private async planWorkflowPrevRequest(
     command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
-  ): Promise<{ statements: SqlStatement[]; changes: ChangeRecord[] }> {
+  ): Promise<WorkflowEffectPlan> {
     const empty = { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] };
     const disposition = command.turn.disposition;
     if (
@@ -5835,8 +6257,9 @@ export class SqliteTaskRepository implements TaskRepository {
       `SELECT round_id FROM workflow_feedback_rounds
         WHERE workspace_id = ? AND run_id = ? AND requester_node_id = ?
           AND status IN ('open', 'satisfied')
+          AND NOT (status = 'satisfied' AND resume_turn_id = ?)
         LIMIT 1`,
-      [this.workspaceId, requesterNode.run_id, requesterNode.node_id],
+      [this.workspaceId, requesterNode.run_id, requesterNode.node_id, command.turn.id],
     );
     if (openRound) return empty;
 
@@ -6077,7 +6500,16 @@ export class SqliteTaskRepository implements TaskRepository {
       );
     }
 
-    return { statements, changes };
+    return {
+      statements,
+      changes,
+      feedbackRoundReservations: [{ runId: requesterNode.run_id, count: 1 }],
+      turnReservations: targetRows.map((target) => ({
+        runId: requesterNode.run_id,
+        taskId: target.taskId,
+        count: 1,
+      })),
+    };
   }
 
   /**
@@ -6088,7 +6520,7 @@ export class SqliteTaskRepository implements TaskRepository {
    */
   private async planWorkflowFeedbackResponse(
     command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
-  ): Promise<{ statements: SqlStatement[]; changes: ChangeRecord[] }> {
+  ): Promise<WorkflowEffectPlan> {
     const empty = { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] };
     const disposition = command.turn.disposition;
     if (
@@ -6210,7 +6642,7 @@ export class SqliteTaskRepository implements TaskRepository {
 
     // Matched feedback turn: always suppress the forward NEXT path.
     // Redelivery or non-open rounds still insert the response fence with DO NOTHING.
-    if (!round || round.status !== 'open' || existingResponse) {
+    if (!round || round.status !== 'open' || authority.status !== 'pending' || existingResponse) {
       const finishedAtClosed = command.turn.finishedAt ?? new Date().toISOString();
       return {
         statements: [{
@@ -6244,6 +6676,12 @@ export class SqliteTaskRepository implements TaskRepository {
     const finishedAt = command.turn.finishedAt ?? new Date().toISOString();
     const statements: SqlStatement[] = [];
     const changes: ChangeRecord[] = [];
+    const pendingTargets = await this.db.get<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM workflow_feedback_targets
+        WHERE workspace_id = ? AND run_id = ? AND round_id = ? AND status = 'pending'`,
+      [this.workspaceId, targetNode.run_id, matched.roundId],
+    );
+    const willSatisfyRound = Number(pendingTargets?.count) === 1;
 
     // Response contribution: updated feedback creates a new immutable revision;
     // unchanged feedback points at the latest pinned revision.
@@ -6266,10 +6704,7 @@ export class SqliteTaskRepository implements TaskRepository {
     const revision = disposition.change === 'unchanged'
       ? matched.baseArtifactRevision
       : latestRevision + 1;
-    const resultBody =
-      typeof disposition.result === 'string'
-        ? disposition.result.slice(0, 4000)
-        : undefined;
+      const resultBody = typeof disposition.result === 'string' ? disposition.result : undefined;
     const artifactPayload = encodePayload({
       kind: 'next_result',
       schema: 1,
@@ -6473,6 +6908,8 @@ export class SqliteTaskRepository implements TaskRepository {
       closureId: aggregateClosureId,
       at: finishedAt,
     }));
+
+    if (!willSatisfyRound) return { statements, changes };
 
     const resumeTurnId = deriveFeedbackResumeTurnId(targetNode.run_id, matched.roundId);
     const resumeMessageId = deriveFeedbackResumeMessageId(targetNode.run_id, matched.roundId);
@@ -6700,7 +7137,11 @@ export class SqliteTaskRepository implements TaskRepository {
       { kind: 'message', id: resumeMessageId, taskId: requesterTaskId, change: 'complete' },
     );
 
-    return { statements, changes };
+    return {
+      statements,
+      changes,
+      turnReservations: [{ runId: targetNode.run_id, taskId: requesterTaskId, count: 1 }],
+    };
   }
 
   /**
@@ -6716,7 +7157,7 @@ export class SqliteTaskRepository implements TaskRepository {
    */
   private async planWorkflowChildInvocation(
     command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
-  ): Promise<{ statements: SqlStatement[]; changes: ChangeRecord[] }> {
+  ): Promise<WorkflowEffectPlan> {
     const empty = { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] };
     const staged = command.turn.disposition;
     if (!staged || staged.kind !== 'workflow_next' || staged.route?.kind !== 'child_workflow') {
@@ -6730,8 +7171,12 @@ export class SqliteTaskRepository implements TaskRepository {
       definition_id: string;
       definition_version: number;
       owner_root_task_id: string | null;
+      max_children: number;
+      children_reserved: number;
     }>(
-      `SELECT definition_id, definition_version, owner_root_task_id FROM workflow_runs
+      `SELECT definition_id, definition_version, owner_root_task_id,
+              max_children, children_reserved
+         FROM workflow_runs
         WHERE workspace_id = ? AND run_id = ?`,
       [this.workspaceId, callerNode.runId],
     ) : undefined;
@@ -6764,17 +7209,22 @@ export class SqliteTaskRepository implements TaskRepository {
       return empty;
     }
 
-    const existingContinuation = await this.db.get<{ continuation_id: string }>(
+    const pendingContinuation = await this.db.get<{
+      continuation_id: string;
+      invocation_key: string | null;
+      invocation_fingerprint: string | null;
+    }>(
       callerNode
-        ? `SELECT continuation_id FROM workflow_continuations
+        ? `SELECT continuation_id, invocation_key, invocation_fingerprint
+             FROM workflow_continuations
             WHERE workspace_id = ? AND run_id = ? AND status = 'pending'
             LIMIT 1`
-        : `SELECT continuation_id FROM workflow_continuations
+        : `SELECT continuation_id, invocation_key, invocation_fingerprint
+             FROM workflow_continuations
             WHERE workspace_id = ? AND caller_task_id = ? AND status = 'pending'
             LIMIT 1`,
       [this.workspaceId, callerNode?.runId ?? command.task.id],
     );
-    if (existingContinuation) return empty;
     const callerRunId = callerNode?.runId;
     const callerScopeId = callerRunId ?? stableId('wfcaller', command.task.id);
     const ownerRootTaskId = callerRun?.owner_root_task_id ?? command.task.id;
@@ -7053,6 +7503,26 @@ export class SqliteTaskRepository implements TaskRepository {
     if (!validated.ok) return empty;
 
     const { identities } = validated;
+    if (identities.entries.length > childEffectivePolicy.maxWorkflowTurnsPerRun) {
+      return callerRunId
+        ? this.planWorkflowFailClosure({
+            runId: callerRunId,
+            reasonCode: 'turn_budget_exhausted',
+            at: finishedAt,
+            sourceTaskId: command.task.id,
+            sourceTurnId: command.turn.id,
+          })
+        : empty;
+    }
+    if (callerRun && callerRun.children_reserved >= callerRun.max_children) {
+      return this.planWorkflowFailClosure({
+        runId: callerRunId!,
+        reasonCode: 'turn_budget_exhausted',
+        at: finishedAt,
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
+    }
     const childRunId = identities.runId;
     const continuationId = deriveChildContinuationId(callerScopeId, childRunId);
     const returnGateId = deriveCallerReturnGateId(callerScopeId, childRunId);
@@ -7062,6 +7532,32 @@ export class SqliteTaskRepository implements TaskRepository {
     const childDeadlineAt = new Date(
       childCreatedAtMs + childEffectivePolicy.runTimeoutMs,
     ).toISOString();
+    const invocationFingerprint = childInvocationFingerprint({
+      callerScopeId,
+      childDefinitionId: disposition.childDefinitionId,
+      childDefinitionVersion: disposition.childDefinitionVersion,
+      childIdempotencyKey,
+      entryBindings: pinnedFills,
+      effectivePolicy: childEffectivePolicy,
+    });
+    if (pendingContinuation) {
+      if (pendingContinuation.invocation_key !== childIdempotencyKey) return empty;
+      if (pendingContinuation.invocation_fingerprint !== invocationFingerprint) {
+        return { ...empty, conflictReason: 'child invocation fingerprint conflict' };
+      }
+      return empty;
+    }
+    const existingInvocation = await this.db.get<{ invocation_fingerprint: string | null }>(
+      `SELECT invocation_fingerprint FROM workflow_continuations
+        WHERE workspace_id = ? AND run_id = ? AND continuation_id = ?`,
+      [this.workspaceId, continuationRunId, continuationId],
+    );
+    if (existingInvocation) {
+      if (existingInvocation.invocation_fingerprint !== invocationFingerprint) {
+        return { ...empty, conflictReason: 'child invocation fingerprint conflict' };
+      }
+      return empty;
+    }
     const existingFenceRunId = callerRunId ?? childRunId;
     const existingFence = await this.db.get<{ message_id: string }>(
       `SELECT message_id FROM workflow_routed_messages
@@ -7072,6 +7568,16 @@ export class SqliteTaskRepository implements TaskRepository {
 
     const statements: SqlStatement[] = [];
     const changes: ChangeRecord[] = [];
+
+    if (callerRunId) {
+      statements.push({
+        sql: `UPDATE workflow_runs
+                 SET children_reserved = children_reserved + 1, updated_at = ?
+               WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                 AND children_reserved < max_children`,
+        params: [finishedAt, this.workspaceId, callerRunId],
+      });
+    }
 
     const fenceBody = JSON.stringify({
       kind: 'child_invocation',
@@ -7090,9 +7596,10 @@ export class SqliteTaskRepository implements TaskRepository {
               workspace_id, run_id, definition_id, definition_version, status, origin,
               parent_run_id, owner_root_task_id, caller_task_id, caller_turn_id,
               continuation_id, policy_json, max_feedback_rounds, max_turns_per_task,
-              max_workflow_turns, max_children, max_depth, max_concurrency,
-              max_aggregate_bytes, started_at, deadline_at, created_at, updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               max_workflow_turns, max_children, max_depth, max_concurrency,
+               max_aggregate_bytes, feedback_rounds_reserved, workflow_turns_reserved,
+               children_reserved, started_at, deadline_at, created_at, updated_at
+             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(workspace_id, run_id) DO NOTHING`,
       params: [
         this.workspaceId,
@@ -7114,6 +7621,9 @@ export class SqliteTaskRepository implements TaskRepository {
         childEffectivePolicy.maxDepth,
         childEffectivePolicy.maxConcurrency,
         childEffectivePolicy.maxAggregateBytes,
+        0,
+        identities.entries.length,
+        0,
         finishedAt,
         childDeadlineAt,
         finishedAt,
@@ -7344,7 +7854,7 @@ export class SqliteTaskRepository implements TaskRepository {
         continuationRunId,
         continuationId,
         childIdempotencyKey,
-        fenceId,
+        invocationFingerprint,
         command.task.id,
         command.turn.id,
         callerRunId ?? null,
@@ -7397,7 +7907,7 @@ export class SqliteTaskRepository implements TaskRepository {
    */
   private async planWorkflowChildReturn(
     command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
-  ): Promise<{ statements: SqlStatement[]; changes: ChangeRecord[] }> {
+  ): Promise<WorkflowEffectPlan> {
     const empty = { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] };
     const disposition = command.turn.disposition;
     if (!disposition || disposition.kind !== 'workflow_next' || disposition.route !== undefined) {
@@ -7698,7 +8208,13 @@ export class SqliteTaskRepository implements TaskRepository {
       { kind: 'task', id: callerTaskId, change: 'effect' },
     );
 
-    return { statements, changes };
+    return {
+      statements,
+      changes,
+      ...(callerRunId
+        ? { turnReservations: [{ runId: callerRunId, taskId: callerTaskId, count: 1 }] }
+        : {}),
+    };
   }
 
   private async planWorkflowFailFromSettle(
@@ -7726,6 +8242,36 @@ export class SqliteTaskRepository implements TaskRepository {
       });
     }
 
+    if (
+      disposition?.kind === 'workflow_next'
+      && disposition.change === 'updated'
+      && typeof disposition.result === 'string'
+      && command.turn.status === 'succeeded'
+    ) {
+      const node = await this.lookupWorkflowNodeForTask(command.task.id);
+      if (node) {
+        const run = await this.db.get<{ max_artifact_bytes: number }>(
+          `SELECT CAST(json_extract(policy_json, '$.maxArtifactBytes') AS INTEGER)
+                    AS max_artifact_bytes
+             FROM workflow_runs
+            WHERE workspace_id = ? AND run_id = ? AND status = 'running'`,
+          [this.workspaceId, node.runId],
+        );
+        if (
+          run
+          && Buffer.byteLength(disposition.result, 'utf8') > run.max_artifact_bytes
+        ) {
+          return this.planWorkflowFailClosure({
+            runId: node.runId,
+            reasonCode: 'aggregate_too_large',
+            at: finishedAt,
+            sourceTaskId: command.task.id,
+            sourceTurnId: command.turn.id,
+          });
+        }
+      }
+    }
+
     // Run-timeout termination on a non-success settle still closes the workflow run.
     if (command.turn.termination?.kind === 'run_timeout') {
       const node = await this.lookupWorkflowNodeForTask(command.task.id);
@@ -7743,63 +8289,113 @@ export class SqliteTaskRepository implements TaskRepository {
   }
 
   /**
-   * M018 S05: host-clamped feedback/turn budget exhaustion closes the run failed.
-   * Counts existing rows only — no schema column.
+   * M018 S05: reserve frozen feedback/turn capacity before creating an effect.
+   * The configured maximum permits exactly that many units; the next reservation
+   * closes the run without committing the successful route that requested it.
    */
   private async planWorkflowBudgetExhaustionIfNeeded(
     command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
-  ): Promise<{ statements: SqlStatement[]; changes: ChangeRecord[] }> {
-    const empty = { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] };
-    const node = await this.lookupWorkflowNodeForTask(command.task.id);
-    if (!node) return empty;
-
-    const run = await this.db.get<{ run_id: string; status: string }>(
-      `SELECT run_id, status FROM workflow_runs
-        WHERE workspace_id = ? AND run_id = ?`,
-      [this.workspaceId, node.runId],
+    reservations: {
+      feedbackRounds: WorkflowRunReservation[];
+      workflowTurns: WorkflowTurnReservation[];
+    },
+  ): Promise<{ statements: SqlStatement[]; changes: ChangeRecord[]; exhausted: boolean }> {
+    const empty = {
+      statements: [] as SqlStatement[],
+      changes: [] as ChangeRecord[],
+      exhausted: false,
+    };
+    if (reservations.feedbackRounds.length === 0 && reservations.workflowTurns.length === 0) {
+      return empty;
+    }
+    const feedbackByRun = sumWorkflowRunReservations(reservations.feedbackRounds);
+    const turnsByRun = sumWorkflowRunReservations(
+      reservations.workflowTurns.map(({ runId, count }) => ({ runId, count })),
     );
-    if (!run || run.status !== 'running') return empty;
+    const turnsByTask = sumWorkflowTurnReservations(reservations.workflowTurns);
+    const runIds = [...new Set([...feedbackByRun.keys(), ...turnsByRun.keys()])].sort();
+    const settlingNode = await this.lookupWorkflowNodeForTask(command.task.id);
+    const at = command.turn.finishedAt ?? new Date().toISOString();
+    const statements: SqlStatement[] = [];
 
-    const budgets = clampWorkflowRunBudgets();
-    const roundCount = await this.db.get<{ c: number }>(
-      `SELECT COUNT(*) AS c FROM workflow_feedback_rounds
-        WHERE workspace_id = ? AND run_id = ?`,
-      [this.workspaceId, node.runId],
-    );
-    if ((roundCount?.c ?? 0) >= budgets.maxFeedbackRoundsPerRun) {
-      return this.planWorkflowFailClosure({
-        runId: node.runId,
-        reasonCode: 'feedback_budget_exhausted',
-        at: command.turn.finishedAt ?? new Date().toISOString(),
-        sourceTaskId: command.task.id,
-        sourceTurnId: command.turn.id,
+    for (const runId of runIds) {
+      const run = await this.db.get<{
+        status: string;
+        max_feedback_rounds: number;
+        max_turns_per_task: number;
+        max_workflow_turns: number;
+        feedback_rounds_reserved: number;
+        workflow_turns_reserved: number;
+      }>(
+        `SELECT status, max_feedback_rounds, max_turns_per_task, max_workflow_turns,
+                feedback_rounds_reserved, workflow_turns_reserved
+           FROM workflow_runs
+          WHERE workspace_id = ? AND run_id = ?`,
+        [this.workspaceId, runId],
+      );
+      if (!run || run.status !== 'running') continue;
+      const feedbackRounds = feedbackByRun.get(runId) ?? 0;
+      const workflowTurns = turnsByRun.get(runId) ?? 0;
+      if (run.feedback_rounds_reserved + feedbackRounds > run.max_feedback_rounds) {
+        const closure = await this.planWorkflowFailClosure({
+          runId,
+          reasonCode: 'feedback_budget_exhausted',
+          at,
+          ...(settlingNode?.runId === runId
+            ? { sourceTaskId: command.task.id, sourceTurnId: command.turn.id }
+            : {}),
+        });
+        return { ...closure, exhausted: true };
+      }
+      if (run.workflow_turns_reserved + workflowTurns > run.max_workflow_turns) {
+        const closure = await this.planWorkflowFailClosure({
+          runId,
+          reasonCode: 'turn_budget_exhausted',
+          at,
+          ...(settlingNode?.runId === runId
+            ? { sourceTaskId: command.task.id, sourceTurnId: command.turn.id }
+            : {}),
+        });
+        return { ...closure, exhausted: true };
+      }
+      for (const reservation of turnsByTask.values()) {
+        if (reservation.runId !== runId) continue;
+        const count = await this.db.get<{ count: number }>(
+          `SELECT COUNT(*) AS count FROM turns WHERE workspace_id = ? AND task_id = ?`,
+          [this.workspaceId, reservation.taskId],
+        );
+        if ((count?.count ?? 0) + reservation.count > run.max_turns_per_task) {
+          const closure = await this.planWorkflowFailClosure({
+            runId,
+            reasonCode: 'turn_budget_exhausted',
+            at,
+            ...(settlingNode?.runId === runId
+              ? { sourceTaskId: command.task.id, sourceTurnId: command.turn.id }
+              : {}),
+          });
+          return { ...closure, exhausted: true };
+        }
+      }
+      statements.push({
+        sql: `UPDATE workflow_runs
+                 SET feedback_rounds_reserved = feedback_rounds_reserved + ?,
+                     workflow_turns_reserved = workflow_turns_reserved + ?,
+                     updated_at = ?
+               WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                 AND feedback_rounds_reserved + ? <= max_feedback_rounds
+                 AND workflow_turns_reserved + ? <= max_workflow_turns`,
+        params: [
+          feedbackRounds,
+          workflowTurns,
+          at,
+          this.workspaceId,
+          runId,
+          feedbackRounds,
+          workflowTurns,
+        ],
       });
     }
-
-    // Count engine-triggered workflow turns across all node tasks for this run.
-    const taskIds = await this.db.all<{ task_id: string }>(
-      `SELECT task_id FROM workflow_nodes
-        WHERE workspace_id = ? AND run_id = ? AND task_id IS NOT NULL`,
-      [this.workspaceId, node.runId],
-    );
-    const ids = taskIds.map((r) => r.task_id).filter((id): id is string => typeof id === 'string' && id.length > 0);
-    if (ids.length === 0) return empty;
-    const placeholders = ids.map(() => '?').join(',');
-    const turnCount = await this.db.get<{ c: number }>(
-      `SELECT COUNT(*) AS c FROM turns
-        WHERE workspace_id = ? AND task_id IN (${placeholders}) AND trigger = 'engine'`,
-      [this.workspaceId, ...ids],
-    );
-    if ((turnCount?.c ?? 0) >= budgets.maxWorkflowTurnsPerRun) {
-      return this.planWorkflowFailClosure({
-        runId: node.runId,
-        reasonCode: 'turn_budget_exhausted',
-        at: command.turn.finishedAt ?? new Date().toISOString(),
-        sourceTaskId: command.task.id,
-        sourceTurnId: command.turn.id,
-      });
-    }
-    return empty;
+    return { statements, changes: [], exhausted: false };
   }
 
   private async lookupWorkflowNodeForTask(
@@ -7814,6 +8410,183 @@ export class SqliteTaskRepository implements TaskRepository {
       return undefined;
     }
     return { runId: row.run_id, nodeId: row.node_id };
+  }
+
+  private async reapWorkflowTimeouts(
+    command: Extract<RepositoryCommand, { kind: 'reapWorkflowTimeouts' }>,
+  ): Promise<RepositoryCommandResult> {
+    const expired = await this.db.all<{ run_id: string }>(
+      `SELECT run_id FROM workflow_runs
+        WHERE workspace_id = ? AND status = 'running'
+          AND deadline_at IS NOT NULL AND deadline_at <= ?
+        ORDER BY deadline_at, run_id`,
+      [this.workspaceId, command.now],
+    );
+    if (expired.length === 0) return { ok: true, changed: false };
+    const closure = await this.planWorkflowRecursiveClosure({
+      runIds: expired.map((run) => run.run_id),
+      reasonCode: 'run_timeout',
+      at: command.now,
+    });
+    const [first, ...rest] = closure.statements;
+    if (!first) return { ok: true, changed: false };
+    const changes = [
+      ...new Map(closure.changes.map((entry) => [`${entry.kind}:${entry.id}`, entry])).values(),
+    ];
+    const results = await this.writeIfFirstChanged(first, rest, changes, command.now);
+    return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
+  }
+
+  private async recoverWorkflowActivation(
+    command: Extract<RepositoryCommand, { kind: 'recoverWorkflowActivation' }>,
+  ): Promise<RepositoryCommandResult> {
+    const operationId = command.recoveryOperationId.trim();
+    const instruction = command.instruction.trim();
+    if (
+      !operationId || operationId.length > 256 || /[\u0000-\u001f\u007f]/.test(operationId)
+      || !command.fingerprint || command.fingerprint.length > 4096
+      || !instruction || Buffer.byteLength(instruction, 'utf8') > 4096
+    ) {
+      return { ok: true, changed: false, reason: 'invalid workflow recovery request' };
+    }
+    const oldTurn = await this.getTurn(command.failedTurnId);
+    if (!oldTurn) return { ok: true, changed: false, reason: 'workflow activation is no longer recoverable' };
+    const sequence = (await this.getMaxTurnSequence(oldTurn.taskId)) + 1;
+    const turnId = stableId(
+      'wftn',
+      `${command.runId}\0activation_recovery\0${command.activationId}\0${operationId}`,
+    );
+    const ledgerKey = `${turnId}:workflow-recovery:${operationId}`;
+    const turn: TaskTurn = {
+      id: turnId,
+      taskId: oldTurn.taskId,
+      sequence,
+      status: 'queued',
+      trigger: 'retry',
+      retryOf: oldTurn.id,
+      inputs: [
+        ...oldTurn.inputs,
+        { kind: 'recovery', interruptedTurnId: oldTurn.id, instruction },
+      ],
+      createdAt: command.createdAt,
+    };
+    const result = { ok: true, data: { runId: command.runId, activationId: command.activationId, turnId } };
+    const claim: SqlStatement = {
+      sql: `INSERT INTO operations (workspace_id, ledger_key, fingerprint, result_json, created_at)
+            SELECT ?, ?, ?, ?, ?
+              FROM workflow_activations activation
+              JOIN workflow_runs run
+                ON run.workspace_id = activation.workspace_id AND run.run_id = activation.run_id
+              JOIN workflow_nodes node
+                ON node.workspace_id = activation.workspace_id
+               AND node.run_id = activation.run_id AND node.node_id = activation.node_id
+              JOIN turns source_turn
+                ON source_turn.workspace_id = activation.workspace_id
+               AND source_turn.id = activation.execution_turn_id
+               AND source_turn.task_id = node.task_id
+             WHERE activation.workspace_id = ? AND activation.run_id = ?
+               AND activation.activation_id = ? AND activation.execution_turn_id = ?
+               AND activation.status = ? AND source_turn.status = ?
+               AND run.status = 'running'
+               AND (run.deadline_at IS NULL OR run.deadline_at > ?)
+                AND (SELECT COUNT(*) FROM turns task_turn
+                       WHERE task_turn.workspace_id = source_turn.workspace_id
+                         AND task_turn.task_id = source_turn.task_id) < run.max_turns_per_task
+                AND run.workflow_turns_reserved < run.max_workflow_turns
+               AND NOT EXISTS (
+                 SELECT 1 FROM turns competing
+                  WHERE competing.workspace_id = source_turn.workspace_id
+                    AND competing.task_id = source_turn.task_id
+                    AND competing.status IN ('queued', 'running', 'waiting_user')
+               )
+            ON CONFLICT(workspace_id, ledger_key) DO NOTHING`,
+      params: [
+        this.workspaceId,
+        ledgerKey,
+        command.fingerprint,
+        encodePayload({ result }),
+        command.createdAt,
+        this.workspaceId,
+        command.runId,
+        command.activationId,
+        command.failedTurnId,
+        command.expectedActivationStatus,
+        command.expectedActivationStatus,
+        command.createdAt,
+      ],
+    };
+    let results: readonly import('./sqlite/rpc').RunResult[];
+    try {
+      results = await this.writeIfFirstChanged(
+        claim,
+        [
+          {
+            sql: `UPDATE workflow_runs
+                     SET workflow_turns_reserved = workflow_turns_reserved + 1,
+                         updated_at = ?
+                   WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                     AND workflow_turns_reserved < max_workflow_turns`,
+            params: [command.createdAt, this.workspaceId, command.runId],
+          },
+          turnStatement(this.workspaceId, turn, false),
+          ...turn.inputs.map((input, ordering) =>
+            turnInputStatement(this.workspaceId, turn.id, ordering, input)),
+          {
+            sql: `UPDATE workflow_activations
+                     SET status = 'queued', execution_turn_id = ?, updated_at = ?
+                   WHERE workspace_id = ? AND run_id = ? AND activation_id = ?
+                     AND execution_turn_id = ? AND status = ?`,
+            params: [
+              turn.id,
+              command.createdAt,
+              this.workspaceId,
+              command.runId,
+              command.activationId,
+              command.failedTurnId,
+              command.expectedActivationStatus,
+            ],
+          },
+        ],
+        [
+          { kind: 'operation', id: ledgerKey, change: 'insert' },
+          { kind: 'turn', id: turn.id, taskId: turn.taskId, change: 'insert' },
+        ],
+        command.createdAt,
+      );
+    } catch (error) {
+      const winner = await this.db.get<{ status: string; execution_turn_id: string }>(
+        `SELECT status, execution_turn_id FROM workflow_activations
+          WHERE workspace_id = ? AND run_id = ? AND activation_id = ?`,
+        [this.workspaceId, command.runId, command.activationId],
+      );
+      if (
+        winner?.status === 'queued'
+        && winner.execution_turn_id !== command.failedTurnId
+      ) {
+        return { ok: true, changed: false, reason: 'workflow activation is no longer recoverable' };
+      }
+      throw error;
+    }
+    const inserted = (results[0]?.changes ?? 0) > 0;
+    const row = await this.db.get<OperationRow>(
+      `SELECT ledger_key, fingerprint, result_json FROM operations
+        WHERE workspace_id = ? AND ledger_key = ?`,
+      [this.workspaceId, ledgerKey],
+    );
+    if (!row) {
+      return { ok: true, changed: false, reason: 'workflow activation is no longer recoverable' };
+    }
+    const operation = decodeOperation(row);
+    if (operation.fingerprint !== command.fingerprint) {
+      return {
+        ok: true,
+        changed: false,
+        conflict: true,
+        reason: 'operation fingerprint conflict',
+        operation,
+      };
+    }
+    return { ok: true, changed: inserted, operation };
   }
 
   private async planWorkflowClosureFromTasks(input: {
@@ -8133,6 +8906,59 @@ export class SqliteTaskRepository implements TaskRepository {
       const results = await this.writeIfFirstChanged(
         {
           sql: `WITH retention_scope(workspace_id) AS (VALUES (?)),
+                     prunable_runs(run_id) AS (
+                       SELECT run.run_id
+                         FROM retention_scope scope
+                         JOIN workflow_runs run
+                           ON run.workspace_id = scope.workspace_id
+                        WHERE run.status IN ('succeeded', 'failed', 'cancelled')
+                          AND NOT EXISTS (
+                            SELECT 1 FROM workflow_runs child
+                             WHERE child.workspace_id = run.workspace_id
+                               AND child.parent_run_id = run.run_id
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1
+                              FROM workflow_nodes node
+                              JOIN tasks task
+                                ON task.workspace_id = node.workspace_id
+                               AND task.id = node.task_id
+                             WHERE node.workspace_id = run.workspace_id
+                               AND node.run_id = run.run_id
+                               AND task.lifecycle NOT IN ('succeeded', 'failed', 'cancelled', 'skipped')
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1 FROM workflow_dependency_gates gate_row
+                             WHERE gate_row.workspace_id = run.workspace_id
+                               AND gate_row.run_id = run.run_id
+                               AND gate_row.status IN ('open', 'satisfied')
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1 FROM workflow_feedback_rounds round_row
+                             WHERE round_row.workspace_id = run.workspace_id
+                               AND round_row.run_id = run.run_id
+                               AND round_row.status IN ('open', 'satisfied')
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1 FROM workflow_activations activation
+                             WHERE activation.workspace_id = run.workspace_id
+                               AND activation.run_id = run.run_id
+                               AND activation.status IN ('queued', 'running')
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1 FROM workflow_continuations continuation
+                             WHERE continuation.workspace_id = run.workspace_id
+                               AND (continuation.run_id = run.run_id OR continuation.child_run_id = run.run_id)
+                               AND continuation.status IN ('pending', 'resolved')
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1 FROM workflow_return_gates return_gate
+                             WHERE return_gate.workspace_id = run.workspace_id
+                               AND (return_gate.continuation_run_id = run.run_id
+                                 OR return_gate.child_run_id = run.run_id)
+                               AND return_gate.status IN ('open', 'satisfied')
+                          )
+                     ),
                      pinned_turns(turn_id) AS (
                        SELECT candidate.id
                          FROM retention_scope scope
@@ -8166,12 +8992,14 @@ export class SqliteTaskRepository implements TaskRepository {
                          JOIN workflow_activations activation
                            ON activation.workspace_id = scope.workspace_id
                         WHERE activation.status IN ('queued', 'running', 'failed', 'interrupted')
+                           AND activation.run_id NOT IN (SELECT run_id FROM prunable_runs)
                        UNION ALL
                        SELECT activation.execution_turn_id
                          FROM retention_scope scope
                          JOIN workflow_activations activation
                            ON activation.workspace_id = scope.workspace_id
                         WHERE activation.status IN ('queued', 'running', 'failed', 'interrupted')
+                           AND activation.run_id NOT IN (SELECT run_id FROM prunable_runs)
                        UNION ALL
                        SELECT gate.reserved_turn_id
                          FROM retention_scope scope
@@ -8248,11 +9076,13 @@ export class SqliteTaskRepository implements TaskRepository {
                          FROM retention_scope scope
                          JOIN workflow_artifact_sources source
                            ON source.workspace_id = scope.workspace_id
+                        WHERE source.run_id NOT IN (SELECT run_id FROM prunable_runs)
                        UNION ALL
                        SELECT source.caller_turn_id
                          FROM retention_scope scope
                          JOIN workflow_artifact_sources source
                            ON source.workspace_id = scope.workspace_id
+                        WHERE source.run_id NOT IN (SELECT run_id FROM prunable_runs)
                        UNION ALL
                        SELECT claim.turn_id
                          FROM retention_scope scope
@@ -8695,6 +9525,67 @@ export function activeTurnInputMessagesSql(taskIdCount: number): string {
         ORDER BY m.created_at, m.id`;
 }
 
+function sumWorkflowRunReservations(
+  reservations: readonly WorkflowRunReservation[],
+): Map<string, number> {
+  const totals = new Map<string, number>();
+  for (const reservation of reservations) {
+    totals.set(reservation.runId, (totals.get(reservation.runId) ?? 0) + reservation.count);
+  }
+  return totals;
+}
+
+function sumWorkflowTurnReservations(
+  reservations: readonly WorkflowTurnReservation[],
+): Map<string, WorkflowTurnReservation> {
+  const totals = new Map<string, WorkflowTurnReservation>();
+  for (const reservation of reservations) {
+    const key = `${reservation.runId}\0${reservation.taskId}`;
+    const existing = totals.get(key);
+    totals.set(key, {
+      runId: reservation.runId,
+      taskId: reservation.taskId,
+      count: (existing?.count ?? 0) + reservation.count,
+    });
+  }
+  return totals;
+}
+
+function childInvocationFingerprint(input: {
+  callerScopeId: string;
+  childDefinitionId: string;
+  childDefinitionVersion: number;
+  childIdempotencyKey: string;
+  entryBindings: readonly {
+    childEntryNodeId: string;
+    inputRef: string;
+    artifactRunId: string;
+    artifactId: string;
+    artifactRevision: number;
+  }[];
+  effectivePolicy: WorkflowPolicyV1;
+}): string {
+  const entryBindings = input.entryBindings
+    .map((binding) => ({
+      childEntryNodeId: binding.childEntryNodeId,
+      inputRef: binding.inputRef,
+      artifactRunId: binding.artifactRunId,
+      artifactId: binding.artifactId,
+      artifactRevision: binding.artifactRevision,
+    }))
+    .sort((left, right) =>
+      left.childEntryNodeId.localeCompare(right.childEntryNodeId)
+      || left.inputRef.localeCompare(right.inputRef));
+  return stableId('wfif', JSON.stringify({
+    callerScopeId: input.callerScopeId,
+    childDefinitionId: input.childDefinitionId,
+    childDefinitionVersion: input.childDefinitionVersion,
+    childIdempotencyKey: input.childIdempotencyKey,
+    entryBindings,
+    effectivePolicy: input.effectivePolicy,
+  }));
+}
+
 function encodePayload(value: Record<string, unknown>): string {
   return JSON.stringify({ payloadVersion: 1, ...value });
 }
@@ -8717,11 +9608,12 @@ function turnPayload(turn: TaskTurn): string {
   const {
     id: _id, taskId: _taskId, sequence: _sequence, status: _status, trigger: _trigger,
     createdAt: _createdAt, startedAt: _startedAt, finishedAt: _finishedAt, inputs: _inputs,
-    workflowActivation: _workflowActivation,
+    workflowActivation: _workflowActivation, workflowWait: _workflowWait,
     ...payload
   } = turn;
   void _id; void _taskId; void _sequence; void _status; void _trigger;
-  void _createdAt; void _startedAt; void _finishedAt; void _inputs; void _workflowActivation;
+  void _createdAt; void _startedAt; void _finishedAt; void _inputs;
+  void _workflowActivation; void _workflowWait;
   return encodePayload(payload);
 }
 
@@ -9062,22 +9954,6 @@ function workflowDispositionAuthorizationPredicate(disposition: TurnDisposition)
        )`,
     );
   }
-  if (disposition.kind === 'workflow_prev') {
-    activationConditions.push(
-      `EXISTS (
-         SELECT 1
-           FROM workflow_dependency_gates gate_row
-           JOIN workflow_gate_bindings binding
-             ON binding.workspace_id = gate_row.workspace_id
-            AND binding.run_id = gate_row.run_id
-            AND binding.gate_id = gate_row.gate_id
-          WHERE gate_row.workspace_id = activation.workspace_id
-            AND gate_row.run_id = activation.run_id
-            AND gate_row.consumer_node_id = activation.node_id
-            AND binding.producer_node_id IS NOT NULL
-      )`,
-    );
-  }
   if (isChildWorkflowRoute) {
     activationConditions.push(
       `definition_node.is_terminal = 1`,
@@ -9213,12 +10089,17 @@ function workflowDispositionAuthorizationPredicate(disposition: TurnDisposition)
          ${activationExists}
          OR (
            caller.parent_id IS NULL
-           AND NOT EXISTS (
-             SELECT 1 FROM workflow_activations any_activation
-              WHERE any_activation.workspace_id = turns.workspace_id
-                AND any_activation.execution_turn_id = turns.id
-           )
-           AND NOT EXISTS (
+            AND NOT EXISTS (
+              SELECT 1 FROM workflow_activations any_activation
+               WHERE any_activation.workspace_id = turns.workspace_id
+                 AND any_activation.execution_turn_id = turns.id
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM workflow_nodes caller_node
+               WHERE caller_node.workspace_id = turns.workspace_id
+                 AND caller_node.task_id = turns.task_id
+            )
+            AND NOT EXISTS (
              SELECT 1 FROM workflow_continuations continuation
               WHERE continuation.workspace_id = turns.workspace_id
                 AND continuation.caller_task_id = turns.task_id
@@ -9988,16 +10869,45 @@ function claimTurnStatement(
                                  AND NOT (((dep.required_outcome = 'succeeded' AND producer.lifecycle = 'succeeded') OR
                                    (dep.required_outcome = 'settled' AND producer.lifecycle IN ('succeeded','failed','cancelled','skipped')))
                                    AND (dep.required_verdict IS NULL OR json_extract(producer.payload_json, '$.taskResult.verdict.status') = 'pass')))
-              AND NOT EXISTS (
-                SELECT 1
+               AND NOT EXISTS (
+                 SELECT 1
                   FROM workflow_activations activation
                   JOIN workflow_runs run
                     ON run.workspace_id = activation.workspace_id
                    AND run.run_id = activation.run_id
                  WHERE activation.workspace_id = turns.workspace_id
                    AND activation.execution_turn_id = turns.id
-                   AND (activation.status <> 'queued' OR run.status <> 'running')
-              )
+                    AND (activation.status <> 'queued' OR run.status <> 'running')
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM workflow_feedback_rounds round_row
+                  WHERE round_row.workspace_id = turns.workspace_id
+                    AND round_row.requester_task_id = turns.task_id
+                    AND round_row.status IN ('open', 'satisfied')
+                    AND NOT EXISTS (
+                      SELECT 1 FROM workflow_activations activation
+                       WHERE activation.workspace_id = round_row.workspace_id
+                         AND activation.run_id = round_row.run_id
+                         AND activation.feedback_round_id = round_row.round_id
+                         AND activation.execution_turn_id = turns.id
+                         AND activation.kind = 'feedback_resume'
+                         AND activation.status = 'queued'
+                    )
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM workflow_continuations continuation
+                  WHERE continuation.workspace_id = turns.workspace_id
+                    AND continuation.caller_task_id = turns.task_id
+                    AND continuation.status IN ('pending', 'resolved')
+                    AND NOT EXISTS (
+                      SELECT 1 FROM workflow_activations activation
+                       WHERE activation.workspace_id = continuation.workspace_id
+                         AND activation.continuation_id = continuation.continuation_id
+                         AND activation.execution_turn_id = turns.id
+                         AND activation.kind = 'child_return'
+                         AND activation.status = 'queued'
+                    )
+               )
               AND (SELECT COUNT(*) FROM turns live WHERE live.workspace_id = turns.workspace_id
                     AND live.status IN ('running', 'waiting_user')) < ?
              AND (SELECT COUNT(*) FROM turns live WHERE live.workspace_id = turns.workspace_id

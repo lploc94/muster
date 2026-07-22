@@ -21,13 +21,15 @@ import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { TaskEngine } from './engine';
 import { SqliteTaskRepository } from './repository';
+import { stageDispositionForSettlement } from './m018-test-helpers';
 import { DbClient } from './sqlite/client';
 import {
-  WORKFLOW_RUN_BUDGET_BOUNDS,
-  clampWorkflowRunBudgets,
+  DEFAULT_WORKFLOW_POLICY,
   makeGraphFanInDefinition,
   entryNodeIds,
+  type WorkflowPolicyV1,
 } from './workflow';
 
 const WORKER_TS = path.join(__dirname, 'sqlite', 'worker.ts');
@@ -125,8 +127,9 @@ async function defineAndStartFanIn(
   repository: SqliteTaskRepository,
   createdAt: string,
   startKey: string,
+  policy: WorkflowPolicyV1 = DEFAULT_WORKFLOW_POLICY,
 ): Promise<FanInStart> {
-  const def = makeGraphFanInDefinition({ createdAt });
+  const def = makeGraphFanInDefinition({ createdAt, policy });
   expect(entryNodeIds(def.topology).sort()).toEqual(['p1', 'p2']);
 
   const defined = await repository.execute({
@@ -136,6 +139,8 @@ async function defineAndStartFanIn(
     version: def.version,
     name: def.name,
     topology: def.topology,
+    entryContracts: def.entryContracts,
+    policy: def.policy,
     createdAt,
   });
   expect(defined.ok).toBe(true);
@@ -152,6 +157,44 @@ async function defineAndStartFanIn(
   });
   expect(start.ok).toBe(true);
   return start.operation?.result?.data as FanInStart;
+}
+
+async function activateFanInConsumer(
+  opened: Opened,
+  data: FanInStart,
+  createdAt: string,
+): Promise<{
+  p1: FanInStart['entries'][number];
+  p2: FanInStart['entries'][number];
+  consumerTaskId: string;
+  consumerTurnId: string;
+}> {
+  const byNode = new Map(data.entries.map((entry) => [entry.nodeId, entry]));
+  const p1 = byNode.get('p1')!;
+  const p2 = byNode.get('p2')!;
+  await settleSucceeded(
+    opened.repository, opened.client, p1.taskId, p1.activationTurnId,
+    { kind: 'workflow_next', change: 'updated', result: 'p1-v1' }, createdAt,
+  );
+  await settleSucceeded(
+    opened.repository, opened.client, p2.taskId, p2.activationTurnId,
+    { kind: 'workflow_next', change: 'updated', result: 'p2-v1' }, createdAt,
+  );
+  const consumer = await opened.client.get<{ task_id: string }>(
+    `SELECT task_id FROM workflow_nodes
+      WHERE workspace_id = 'ws' AND run_id = ? AND node_id = 'consumer'`,
+    [data.runId],
+  );
+  if (!consumer?.task_id) {
+    const run = await opened.client.get(
+      `SELECT status, terminal_reason_code, max_workflow_turns, workflow_turns_reserved
+        FROM workflow_runs WHERE workspace_id = 'ws' AND run_id = ?`,
+      [data.runId],
+    );
+    throw new Error(`consumer activation missing: ${JSON.stringify(run)}`);
+  }
+  const consumerTurns = await opened.repository.listTurns(consumer!.task_id);
+  return { p1, p2, consumerTaskId: consumer!.task_id, consumerTurnId: consumerTurns[0]!.id };
 }
 
 async function promoteRunning(
@@ -182,6 +225,7 @@ async function settleSucceeded(
   const turn = await repository.getTurn(turnId);
   expect(task).toBeTruthy();
   expect(turn).toBeTruthy();
+  await stageDispositionForSettlement(repository, turn!, disposition);
   return repository.execute({
     kind: 'settleTurnAndApplyEffects',
     workspaceId: 'ws',
@@ -414,60 +458,57 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
     }
   }, 30_000);
 
-  it('feedback-round budget exhaustion closes run failed', async () => {
+  it('exact feedback and turn budget boundaries', async () => {
     const opened = await openRepo('fb-budget');
     try {
       const createdAt = '2026-07-20T00:00:00.000Z';
-      const data = await defineAndStartOneNode(
-        opened.repository,
-        createdAt,
-        's05-fb-1',
-        'wf-s05-fb',
+      const data = await defineAndStartFanIn(
+        opened.repository, createdAt, 's05-fb-1',
+        { ...DEFAULT_WORKFLOW_POLICY, maxFeedbackRoundsPerRun: 1 },
       );
-      const budgets = clampWorkflowRunBudgets();
-      expect(budgets.maxFeedbackRoundsPerRun).toBe(
-        WORKFLOW_RUN_BUDGET_BOUNDS.defaultMaxFeedbackRoundsPerRun,
+      const active = await activateFanInConsumer(
+        opened, data, '2026-07-20T00:01:00.000Z',
       );
 
-      // Seed more rounds than the host-clamped default bound with only the latest live.
-      for (let i = 0; i <= budgets.maxFeedbackRoundsPerRun; i += 1) {
-        await opened.client.run(
-          `INSERT INTO workflow_feedback_rounds (
-             workspace_id, run_id, round_id, requester_node_id, status, join_mode, created_at
-           ) VALUES (?,?,?,?,?,?,?)`,
-          [
-            'ws',
-            data.runId,
-            `round-seed-${i}`,
-            'entry',
-            i === budgets.maxFeedbackRoundsPerRun ? 'open' : 'consumed',
-            'all',
-            createdAt,
-          ],
-        );
-      }
+      await expect(settleSucceeded(
+        opened.repository, opened.client, active.consumerTaskId, active.consumerTurnId,
+        { kind: 'workflow_prev', targets: 'all' }, '2026-07-20T00:02:00.000Z',
+      )).resolves.toMatchObject({ changed: true });
+      await expect(opened.client.get(
+        `SELECT status, feedback_rounds_reserved FROM workflow_runs
+          WHERE workspace_id = 'ws' AND run_id = ?`,
+        [data.runId],
+      )).resolves.toEqual({ status: 'running', feedback_rounds_reserved: 1 });
 
-      const settle = await settleSucceeded(
-        opened.repository,
-        opened.client,
-        data.entryTaskId,
-        data.activationTurnId,
+      const p1Feedback = (await opened.repository.listTurns(active.p1.taskId))
+        .find((turn) => turn.status === 'queued')!;
+      const p2Feedback = (await opened.repository.listTurns(active.p2.taskId))
+        .find((turn) => turn.status === 'queued')!;
+      await settleSucceeded(
+        opened.repository, opened.client, active.p1.taskId, p1Feedback.id,
+        { kind: 'workflow_next', change: 'updated', result: 'p1-v2' },
+        '2026-07-20T00:03:00.000Z',
+      );
+      await settleSucceeded(
+        opened.repository, opened.client, active.p2.taskId, p2Feedback.id,
         { kind: 'workflow_next', change: 'unchanged' },
-        '2026-07-20T00:00:01.000Z',
+        '2026-07-20T00:04:00.000Z',
       );
-      expect(settle.ok).toBe(true);
+      const requesterResume = (await opened.repository.listTurns(active.consumerTaskId))
+        .find((turn) => turn.status === 'queued')!;
+      await expect(settleSucceeded(
+        opened.repository, opened.client, active.consumerTaskId, requesterResume.id,
+        { kind: 'workflow_prev', targets: 'all' }, '2026-07-20T00:05:00.000Z',
+      )).resolves.toMatchObject({ changed: true });
+
       expect(await runStatus(opened.client, data.runId)).toBe('failed');
-      const after = await opened.repository.getTask(data.entryTaskId);
+      const after = await opened.repository.getTask(active.consumerTaskId);
       expect(after?.lifecycle).toBe('open');
       expect(after?.attention?.code).toBe('workflow_run_failed');
       expect(String(after?.attention?.message ?? '')).toMatch(/feedback_budget_exhausted/);
       const rounds = await roundStatuses(opened.client, data.runId);
-      expect(rounds.length).toBeGreaterThan(0);
-      expect(rounds.every((s) =>
-        s === 'failed' || s === 'open' || s === 'satisfied' || s === 'consumed')).toBe(true);
-      // All previously open rounds must be closed failed by the atomic closure.
-      const openLeft = rounds.filter((s) => s === 'open');
-      expect(openLeft).toHaveLength(0);
+      expect(rounds).toHaveLength(1);
+      expect(rounds.every((status) => status !== 'open' && status !== 'satisfied')).toBe(true);
     } finally {
       await opened.close();
     }
@@ -477,50 +518,121 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
     const opened = await openRepo('turn-budget');
     try {
       const createdAt = '2026-07-20T00:00:00.000Z';
-      const data = await defineAndStartOneNode(
-        opened.repository,
-        createdAt,
-        's05-turn-1',
-        'wf-s05-turn',
+      const data = await defineAndStartFanIn(
+        opened.repository, createdAt, 's05-turn-1',
+        { ...DEFAULT_WORKFLOW_POLICY, maxWorkflowTurnsPerRun: 3 },
       );
-      const budgets = clampWorkflowRunBudgets();
+      const active = await activateFanInConsumer(
+        opened, data, '2026-07-20T00:01:00.000Z',
+      );
+      await expect(opened.client.get(
+        `SELECT status, workflow_turns_reserved FROM workflow_runs
+          WHERE workspace_id = 'ws' AND run_id = ?`,
+        [data.runId],
+      )).resolves.toEqual({ status: 'running', workflow_turns_reserved: 3 });
 
-      // Seed engine-triggered turns past the host-clamped default bound.
-      // Activation turn already exists; add enough to exceed the bound.
-      const existing = await opened.client.get<{ c: number }>(
-        `SELECT COUNT(*) AS c FROM turns
-          WHERE workspace_id = ? AND task_id = ? AND trigger = 'engine'`,
-        ['ws', data.entryTaskId],
-      );
-      const need = budgets.maxWorkflowTurnsPerRun + 1 - (existing?.c ?? 0);
-      let seq = await nextTurnSequence(opened.client, data.entryTaskId);
-      for (let i = 0; i < need; i += 1) {
-        await insertEngineTurn(
-          opened.client,
-          data.entryTaskId,
-          `seed-turn-${i}`,
-          'cancelled',
-          createdAt,
-          seq + i,
-        );
-      }
-
-      const settle = await settleSucceeded(
-        opened.repository,
-        opened.client,
-        data.entryTaskId,
-        data.activationTurnId,
-        { kind: 'workflow_next', change: 'unchanged' },
-        '2026-07-20T00:00:01.000Z',
-      );
-      expect(settle.ok).toBe(true);
+      await expect(settleSucceeded(
+        opened.repository, opened.client, active.consumerTaskId, active.consumerTurnId,
+        { kind: 'workflow_prev', targets: 'all' }, '2026-07-20T00:02:00.000Z',
+      )).resolves.toMatchObject({ changed: true });
       expect(await runStatus(opened.client, data.runId)).toBe('failed');
-      const after = await opened.repository.getTask(data.entryTaskId);
+      const after = await opened.repository.getTask(active.consumerTaskId);
       expect(after?.lifecycle).toBe('open');
       expect(after?.attention?.code).toBe('workflow_run_failed');
       expect(String(after?.attention?.message ?? '')).toMatch(/turn_budget_exhausted/);
+      await expect(opened.client.get(
+        `SELECT workflow_turns_reserved, feedback_rounds_reserved FROM workflow_runs
+          WHERE workspace_id = 'ws' AND run_id = ?`,
+        [data.runId],
+      )).resolves.toEqual({ workflow_turns_reserved: 3, feedback_rounds_reserved: 0 });
+      expect(await roundStatuses(opened.client, data.runId)).toEqual([]);
     } finally {
       await opened.close();
+    }
+  }, 30_000);
+
+  it('per-task turn limits admit exact NEXT and feedback boundaries, then fail the next PREV', async () => {
+    const exact = await openRepo('per-task-next-exact');
+    try {
+      const data = await defineAndStartFanIn(
+        exact.repository,
+        '2026-07-22T15:00:00.000Z',
+        'per-task-next-exact',
+        { ...DEFAULT_WORKFLOW_POLICY, maxTurnsPerTask: 1 },
+      );
+      const active = await activateFanInConsumer(exact, data, '2026-07-22T15:01:00.000Z');
+      expect(await runStatus(exact.client, data.runId)).toBe('running');
+      expect(await exact.repository.listTurns(active.consumerTaskId)).toHaveLength(1);
+    } finally {
+      await exact.close();
+    }
+
+    const feedback = await openRepo('per-task-feedback-boundary');
+    try {
+      const data = await defineAndStartFanIn(
+        feedback.repository,
+        '2026-07-22T16:00:00.000Z',
+        'per-task-feedback-boundary',
+        {
+          ...DEFAULT_WORKFLOW_POLICY,
+          maxFeedbackRoundsPerRun: 2,
+          maxTurnsPerTask: 2,
+        },
+      );
+      const active = await activateFanInConsumer(feedback, data, '2026-07-22T16:01:00.000Z');
+      await expect(settleSucceeded(
+        feedback.repository,
+        feedback.client,
+        active.consumerTaskId,
+        active.consumerTurnId,
+        { kind: 'workflow_prev', targets: 'all' },
+        '2026-07-22T16:02:00.000Z',
+      )).resolves.toMatchObject({ changed: true });
+      const p1Feedback = (await feedback.repository.listTurns(active.p1.taskId))
+        .find((turn) => turn.status === 'queued')!;
+      const p2Feedback = (await feedback.repository.listTurns(active.p2.taskId))
+        .find((turn) => turn.status === 'queued')!;
+      expect(await feedback.repository.listTurns(active.p1.taskId)).toHaveLength(2);
+      expect(await feedback.repository.listTurns(active.p2.taskId)).toHaveLength(2);
+
+      await settleSucceeded(
+        feedback.repository,
+        feedback.client,
+        active.p1.taskId,
+        p1Feedback.id,
+        { kind: 'workflow_next', change: 'updated', result: 'p1-v2' },
+        '2026-07-22T16:03:00.000Z',
+      );
+      await settleSucceeded(
+        feedback.repository,
+        feedback.client,
+        active.p2.taskId,
+        p2Feedback.id,
+        { kind: 'workflow_next', change: 'unchanged' },
+        '2026-07-22T16:04:00.000Z',
+      );
+      const requesterTurns = await feedback.repository.listTurns(active.consumerTaskId);
+      const requesterResume = requesterTurns.find((turn) => turn.status === 'queued')!;
+      expect(requesterTurns).toHaveLength(2);
+
+      await expect(settleSucceeded(
+        feedback.repository,
+        feedback.client,
+        active.consumerTaskId,
+        requesterResume.id,
+        { kind: 'workflow_prev', targets: 'all' },
+        '2026-07-22T16:05:00.000Z',
+      )).resolves.toMatchObject({ changed: true });
+      expect(await runStatus(feedback.client, data.runId)).toBe('failed');
+      await expect(feedback.client.get<{ terminal_reason_code: string | null }>(
+        `SELECT terminal_reason_code FROM workflow_runs WHERE workspace_id = 'ws' AND run_id = ?`,
+        [data.runId],
+      )).resolves.toEqual({ terminal_reason_code: 'turn_budget_exhausted' });
+      expect(await roundStatuses(feedback.client, data.runId)).toHaveLength(1);
+      expect(await feedback.repository.listTurns(active.p1.taskId)).toHaveLength(2);
+      expect(await feedback.repository.listTurns(active.p2.taskId)).toHaveLength(2);
+    } finally {
+      await feedback.close();
     }
   }, 30_000);
 
@@ -712,6 +824,209 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
           (status) => status !== 'open' && status !== 'satisfied',
         )).toBe(true);
       }
+    } finally {
+      await opened.close();
+    }
+  }, 45_000);
+
+  it('engine load reaps an expired waiting workflow without starting an adapter', async () => {
+    const opened = await openRepo('deadline-reload');
+    let engine: TaskEngine | undefined;
+    try {
+      const data = await defineAndStartOneNode(
+        opened.repository,
+        '2026-07-22T13:00:00.000Z',
+        'deadline-reload-start',
+        'wf-deadline-reload',
+      );
+      await opened.client.run(
+        `UPDATE workflow_runs SET deadline_at = ?
+          WHERE workspace_id = ? AND run_id = ?`,
+        ['2026-07-22T13:01:00.000Z', 'ws', data.runId],
+      );
+      let adapterStarts = 0;
+      engine = await TaskEngine.loadAsync({
+        repository: opened.repository,
+        workspaceId: 'ws',
+        clock: () => '2026-07-22T13:02:00.000Z',
+        makeBackend: (name) => ({
+          name,
+          capabilities: {
+            supportsMCP: true,
+            supportsReasoning: false,
+            supportsDetailedToolEvents: false,
+          },
+          run: async function* () {},
+        }),
+        runTurn: async function* () {
+          adapterStarts += 1;
+          yield { type: 'turnCompleted' };
+        },
+      });
+
+      await expect(opened.client.get<{ status: string; terminal_reason_code: string }>(
+        `SELECT status, terminal_reason_code FROM workflow_runs
+          WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', data.runId],
+      )).resolves.toEqual({ status: 'failed', terminal_reason_code: 'run_timeout' });
+      await expect(opened.repository.getTurn(data.activationTurnId)).resolves.toMatchObject({
+        status: 'cancelled',
+      });
+      await expect(opened.repository.getTask(data.entryTaskId)).resolves.toMatchObject({
+        lifecycle: 'open',
+        attention: { code: 'workflow_run_failed', message: 'run_timeout' },
+      });
+      expect(adapterStarts).toBe(0);
+
+      await expect(opened.repository.execute({
+        kind: 'reapWorkflowTimeouts',
+        workspaceId: 'ws',
+        now: '2026-07-22T13:03:00.000Z',
+      })).resolves.toMatchObject({ ok: true, changed: false });
+    } finally {
+      await engine?.shutdown().catch(() => undefined);
+      await opened.close();
+    }
+  }, 45_000);
+
+  it('explicit activation recovery replay conflict and cancellation race', async () => {
+    const opened = await openRepo('activation-recovery');
+    try {
+      const data = await defineAndStartOneNode(
+        opened.repository,
+        '2026-07-22T14:00:00.000Z',
+        'activation-recovery-start',
+        'wf-activation-recovery',
+      );
+      await promoteRunning(opened.client, data.activationTurnId, '2026-07-22T14:01:00.000Z');
+      const task = await opened.repository.getTask(data.entryTaskId);
+      const sourceTurn = await opened.repository.getTurn(data.activationTurnId);
+      expect(task).toBeTruthy();
+      expect(sourceTurn).toBeTruthy();
+      await expect(opened.repository.execute({
+        kind: 'settleTurnAndApplyEffects',
+        workspaceId: 'ws',
+        expectedTaskRevision: task!.revision,
+        task: { ...task!, updatedAt: '2026-07-22T14:02:00.000Z' },
+        turn: {
+          ...sourceTurn!,
+          status: 'interrupted',
+          finishedAt: '2026-07-22T14:02:00.000Z',
+        },
+        expectedStatuses: ['running'],
+        relatedTurns: [],
+        messages: [],
+      })).resolves.toMatchObject({ ok: true, changed: true });
+      const activationBefore = await opened.client.get<{
+        activation_id: string;
+        primary_turn_id: string;
+        message_id: string;
+      }>(
+        `SELECT activation_id, primary_turn_id, message_id FROM workflow_activations
+          WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', data.runId],
+      );
+      expect(activationBefore).toBeTruthy();
+
+      const reloaded = new SqliteTaskRepository(opened.client, 'ws');
+      const recovery = {
+        kind: 'recoverWorkflowActivation' as const,
+        workspaceId: 'ws',
+        runId: data.runId,
+        activationId: activationBefore!.activation_id,
+        failedTurnId: data.activationTurnId,
+        recoveryOperationId: 'recover-once',
+        fingerprint: 'canonical-recovery-v1',
+        instruction: 'Continue from the exact pinned workflow input.',
+        expectedActivationStatus: 'interrupted' as const,
+        createdAt: '2026-07-22T14:03:00.000Z',
+      };
+      const peerClient = new DbClient({ workerPath: WORKER_TS, execArgv: TSX_ARGV });
+      await peerClient.open(opened.dbPath);
+      const peerRepository = new SqliteTaskRepository(peerClient, 'ws');
+      const competingRecovery = {
+        ...recovery,
+        recoveryOperationId: 'recover-competing',
+        fingerprint: 'canonical-recovery-competing',
+      };
+      const concurrent = await Promise.all([
+        reloaded.execute(recovery),
+        peerRepository.execute(competingRecovery),
+      ]).finally(() => peerClient.close());
+      expect(concurrent.filter((result) => result.changed)).toHaveLength(1);
+      expect(concurrent.filter((result) => !result.changed)).toHaveLength(1);
+      const winnerIndex = concurrent.findIndex((result) => result.changed);
+      const winningRecovery = winnerIndex === 0 ? recovery : competingRecovery;
+      const first = concurrent[winnerIndex]!;
+      expect(first).toMatchObject({ ok: true, changed: true });
+      const turnId = (first.operation?.result as { data?: { turnId?: string } })?.data?.turnId;
+      expect(turnId).toBeTruthy();
+      const recoveredTurn = await reloaded.getTurn(turnId!);
+      expect(recoveredTurn).toMatchObject({
+        status: 'queued',
+        trigger: 'retry',
+        retryOf: data.activationTurnId,
+      });
+      expect(recoveredTurn?.inputs).toEqual([
+        ...sourceTurn!.inputs,
+        {
+          kind: 'recovery',
+          interruptedTurnId: data.activationTurnId,
+          instruction: 'Continue from the exact pinned workflow input.',
+        },
+      ]);
+      await expect(opened.client.get<{
+        activation_id: string;
+        primary_turn_id: string;
+        execution_turn_id: string;
+        message_id: string;
+        status: string;
+      }>(
+        `SELECT activation_id, primary_turn_id, execution_turn_id, message_id, status
+          FROM workflow_activations WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', data.runId],
+      )).resolves.toEqual({
+        activation_id: activationBefore!.activation_id,
+        primary_turn_id: activationBefore!.primary_turn_id,
+        execution_turn_id: turnId,
+        message_id: activationBefore!.message_id,
+        status: 'queued',
+      });
+
+      await expect(reloaded.execute(winningRecovery)).resolves.toMatchObject({
+        ok: true,
+        changed: false,
+      });
+      await expect(reloaded.execute({ ...winningRecovery, fingerprint: 'changed-recovery' })).resolves.toMatchObject({
+        ok: true,
+        changed: false,
+        conflict: true,
+        reason: 'operation fingerprint conflict',
+      });
+      await expect(opened.client.all(
+        `SELECT id FROM turns WHERE workspace_id = ? AND task_id = ? AND status = 'queued'`,
+        ['ws', data.entryTaskId],
+      )).resolves.toHaveLength(1);
+
+      await opened.client.run(
+        `UPDATE workflow_runs SET deadline_at = ?
+          WHERE workspace_id = ? AND run_id = ?`,
+        ['2026-07-22T14:04:00.000Z', 'ws', data.runId],
+      );
+      await reloaded.execute({
+        kind: 'reapWorkflowTimeouts',
+        workspaceId: 'ws',
+        now: '2026-07-22T14:05:00.000Z',
+      });
+      await expect(reloaded.execute({
+        ...recovery,
+        recoveryOperationId: 'recover-after-terminal',
+        fingerprint: 'recover-after-terminal',
+      })).resolves.toMatchObject({
+        ok: true,
+        changed: false,
+        reason: 'workflow activation is no longer recoverable',
+      });
     } finally {
       await opened.close();
     }

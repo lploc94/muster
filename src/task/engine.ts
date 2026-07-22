@@ -503,6 +503,8 @@ export class TaskEngine {
   /** Queued turns preserved on reload — start only via resumeQueuedTurn. */
   private readonly deferredQueuedTurns = new Set<string>();
   private readonly turnPromises = new Map<string, Promise<void>>();
+  private workflowDeadlineTimer?: ReturnType<typeof setInterval>;
+  private workflowDeadlineReapRunning = false;
   private shuttingDown = false;
   /** Terminal storage latch: zero repository writes after this (distinct from graceful shutdown). */
   private storageTerminal = false;
@@ -611,6 +613,10 @@ export class TaskEngine {
     }
     if (this.shuttingDown) return;
     this.shuttingDown = true;
+    if (this.workflowDeadlineTimer !== undefined) {
+      clearInterval(this.workflowDeadlineTimer);
+      this.workflowDeadlineTimer = undefined;
+    }
     let flushError: unknown;
     try {
       await this.flushAllPendingTranscript();
@@ -649,6 +655,10 @@ export class TaskEngine {
     // Latch first so every subsequent path sees terminal immediately.
     this.storageTerminal = true;
     this.shuttingDown = true;
+    if (this.workflowDeadlineTimer !== undefined) {
+      clearInterval(this.workflowDeadlineTimer);
+      this.workflowDeadlineTimer = undefined;
+    }
     for (const handle of this.liveRuns.values()) {
       if (handle.cancelPoll !== undefined) {
         clearInterval(handle.cancelPoll);
@@ -1186,13 +1196,37 @@ export class TaskEngine {
 
   /** Repository-only constructor. No JSON file is created or used. */
   static async loadAsync(config: TaskEngineConfig): Promise<TaskEngine> {
+    await config.repository.execute({
+      kind: 'reapWorkflowTimeouts',
+      workspaceId: config.workspaceId,
+      now: nowIso(config.clock),
+    });
     const projection = await RepositoryProjection.load(config.repository, config.workspaceId);
     const repository = withRepositoryProjection(config.repository, projection, {
       onAfterCommit: config.onAfterCommit,
     });
     const engine = new TaskEngine(config, projection, repository);
     await engine.reconcileReloadFromRepository();
+    engine.startWorkflowDeadlineReaper();
     return engine;
+  }
+
+  private startWorkflowDeadlineReaper(): void {
+    const timer = setInterval(() => {
+      if (this.shuttingDown || this.storageTerminal || this.workflowDeadlineReapRunning) return;
+      this.workflowDeadlineReapRunning = true;
+      void this.repository.execute({
+        kind: 'reapWorkflowTimeouts',
+        workspaceId: this.workspaceId,
+        now: nowIso(this.clock),
+      }).catch((error) => {
+        console.error('[muster][task-orch] workflow deadline reaper failed', error);
+      }).finally(() => {
+        this.workflowDeadlineReapRunning = false;
+      });
+    }, 30_000);
+    timer.unref?.();
+    this.workflowDeadlineTimer = timer;
   }
 
   /** Host read model backed by the same projection refreshed after every durable write. */
@@ -2030,6 +2064,45 @@ export class TaskEngine {
     if (!write.changed) return { ok: false, reason: write.reason ?? 'task changed; retry' };
     void this.scheduleTurn(newTurnId);
     return { ok: true, value: { turnId: newTurnId } };
+  }
+
+  async recoverWorkflowActivationAsync(input: {
+    runId: string;
+    activationId: string;
+    failedTurnId: string;
+    recoveryOperationId: string;
+    instruction: string;
+    expectedActivationStatus: 'failed' | 'interrupted';
+  }): Promise<EngineResult<{ turnId: string }>> {
+    const hold = this.rejectIfMaintenanceHold();
+    if (hold) return hold;
+    const trust = this.requireWorkspaceTrusted();
+    if (!trust.ok) return trust;
+    const fingerprint = JSON.stringify({
+      runId: input.runId,
+      activationId: input.activationId,
+      failedTurnId: input.failedTurnId,
+      recoveryOperationId: input.recoveryOperationId,
+      instruction: input.instruction.trim(),
+      expectedActivationStatus: input.expectedActivationStatus,
+    });
+    const write = await this.repository.execute({
+      kind: 'recoverWorkflowActivation',
+      workspaceId: this.workspaceId,
+      ...input,
+      fingerprint,
+      createdAt: nowIso(this.clock),
+    });
+    if (write.conflict) return { ok: false, reason: write.reason ?? 'workflow recovery conflict' };
+    const result = write.operation?.result as
+      | { ok?: boolean; data?: { turnId?: string } }
+      | undefined;
+    const turnId = result?.data?.turnId;
+    if (!turnId) {
+      return { ok: false, reason: write.reason ?? 'workflow activation is no longer recoverable' };
+    }
+    if (write.changed) void this.scheduleTurn(turnId);
+    return { ok: true, value: { turnId } };
   }
 
   async setTaskLifecycleAsync(

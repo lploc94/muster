@@ -1,6 +1,6 @@
 # M018 Section 20 Full-Conformance Remediation Plan
 
-Status: implementation in progress  
+Status: implemented; independent final review APPROVE
 Normative source: `docs/TASK-MANAGEMENT.md` section 20  
 Target branch: `feat/m018-gate-routed-agent-workflows`  
 Scope: workflow definitions, starts, NEXT/PREV/FAIL routing, child workflows, persistence, scheduling, recovery, cancellation, budgets, authorization, and projections
@@ -32,12 +32,23 @@ Completed across the current conformance slices:
 - Removed the duplicate dependency-gate representation of child returns; dedicated return gates and continuations now move `satisfied/resolved -> consumed` together when the caller return turn settles.
 - Replaced partial failure and cancellation paths with one recursive run-lineage closure plan that closes caller and descendant runs, gates, rounds, activations, return gates, and continuations in the initiating transaction; every child boundary receives one typed failed/cancelled result, queued turns cancel, live turns receive interrupts, and only the outer boundary receives attention.
 - Integrated lifecycle authority with recursive closure: authorized cancellation retains its existing task cascade while closing orchestration cancelled, and premature `succeeded`, `failed`, or `skipped` seals close the still-running workflow as `required_target_unavailable` without granting workflow code lifecycle authority.
+- Added a durable workflow deadline reaper that runs before engine projection/reload recovery and periodically thereafter; expired waiting runs use the same recursive `run_timeout` closure without requiring or starting an adapter process, and repeated scans are idempotent.
+- Added authorized explicit activation recovery with a transaction-first operation claim: failed/interrupted logical activations retain their primary turn, aggregate message, and activation ID while receiving one linked execution turn with the original pinned inputs; reload, two-client contention, same-key replay, changed fingerprints, deadlines, and terminal runs fail deterministically.
+- Added terminal workflow-history pruning at the SQLite turn-delete boundary: active or corrupt references remain pinned, while a fully terminal leaf run with terminal node tasks and no live gate, round, activation, continuation, or return gate is removed with its bounded relational history before transcript retention deletes referenced turns.
+- Expanded `get_task_status` workflow diagnostics with frozen run limits, deadline/terminal reason, exact recoverable activation and active gate identity, all relevant active/satisfied rounds with progress, all continuation states, and bounded integrity codes; it never selects one arbitrary historical round/continuation or returns artifact/prompt bodies.
+- Moved every correctness-critical workflow planner behind the SQLite write lock through the named `workflowMutation` worker RPC; definition, start, staging, lifecycle, settlement, recovery, reaping, and graph mutations now derive and commit their effects inside one `BEGIN IMMEDIATE` transaction.
+- Added deterministic two-client proof that terminal closure winning immediately before settlement lock acquisition commits no stale route, artifact, fill, activation, or turn.
+- Made scheduler claim authority relational and terminal-run aware, blocked unrelated claims while a workflow task is durably waiting, and rejected backend/model/runtime-epoch handoff while its workflow run remains active.
+- Added exact durable reservation counters for feedback rounds, workflow turns, and child starts; the Nth reservation succeeds, N+1 closes atomically, partial joins reserve nothing, and sequential PREV rounds consume the prior requester resume before reserving the next round.
+- Scoped explicit child idempotency keys to the authorized caller before deriving child run/task/turn identities, preventing same-key collisions across callers while preserving same-caller replay fencing.
+- Bound child invocation replay to a canonical fingerprint of caller scope, definition version, scoped key, exact artifact pins, and frozen effective policy; changed same-caller bindings now conflict on a real caller-resume activation.
+- Required successful disposition settlement to match one exact durable staged claim in the same worker-owned transaction; missing or mismatched claims conflict, while consumed/discarded claim replay remains a no-op.
+- Enforced frozen `maxTurnsPerTask` for dependency activations, feedback requests/resumes, and caller child-return turns in addition to the run-wide reservation budget.
+- Removed workflow-result truncation and fail-closed oversized UTF-8 results against the frozen artifact limit before any route artifact or continuation is committed.
+- Added adversarial evidence for same-operation concurrent define/start convergence, engine/caller artifact provenance, late prior-round responses, mutable routed-message JSON, no-fan-out validation, and caller-scoped child invocation.
+- Reconciled every section-20 and A01-A14 row to an exact test identifier or explicit schema token; the guard resolves every referenced file/evidence string and no traceability row remains planned.
 
-Still required before the overall plan may be marked complete:
-
-- Remove the remaining pre-transaction workflow planning reads by moving all eligibility and aggregate decisions behind the SQLite write lock.
-- Complete timeout/recovery, terminal workflow-history pruning and diagnostics, scheduler/session authority, and adversarial two-client race coverage.
-- Finish the requirement traceability table and Phases 8-13 verification evidence.
+No known implementation gap remains. The complete project tests, compile/build, supplemental checks, and three-round independent adversarial review have passed.
 
 Development compatibility decision (2026-07-22): this branch intentionally supports
 only a fresh current schema. Older development stores are rejected with reset guidance;
@@ -821,11 +832,12 @@ Every implementation PR or commit series must answer all questions below with co
 
 ## 11. Completion Evidence
 
-When implementation is complete, append an evidence section containing:
-
-- Current schema and reset-rejection test names.
-- Requirement-to-test traceability link.
-- Full test and compile command outputs.
-- Concurrency/fault test results.
-- Independent review verdict.
-- Any intentionally deferred item with proof that it is outside section-20 v1 rather than an unresolved conformance gap.
+- Current schema/reset evidence: `src/task/sqlite/schema.test.ts`, `src/task/sqlite/protocol.test.ts`, and the fresh-schema-only compatibility decision above.
+- Requirement traceability: `src/task/m018-section20-traceability.ts`, enforced by `src/task/m018-section20-traceability.test.ts` against exact test identifiers and schema tokens.
+- Focused M018 gate: `npx vitest run` over 12 M018/traceability files passed 63 tests on 2026-07-22.
+- Full test gate: `npm test` passed 157 files and 2019 tests on 2026-07-22.
+- Compile/build gate: `npm run compile` passed TypeScript compilation and the production webview build on 2026-07-22.
+- Supplemental gates: `npx tsc --noEmit` and `git diff --check` passed on 2026-07-22.
+- Concurrency/fault evidence includes concurrent final fan-in/feedback fills, same-operation define/start, terminal-before-settlement locking, transaction rollback injection, recovery contention, and caller-scoped child-key conflict tests named in the traceability table.
+- Independent review: APPROVE after three rounds. Round one requested six fixes covering claim-bound settlement, child invocation fingerprints, per-task/caller-return turn budgets, result truncation, and traceability evidence. Round two found and round three approved the corrected child invocation fence/fingerprint persistence mapping plus exact replay coverage. No critical/high finding remains unresolved.
+- Intentionally deferred section-20 v1 items: none.

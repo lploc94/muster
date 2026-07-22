@@ -11,6 +11,13 @@
  */
 import { parentPort, workerData } from 'node:worker_threads';
 import type { DatabaseSync } from 'node:sqlite';
+import {
+  isWorkflowTransactionalCommand,
+  SqliteTaskRepository,
+  type RepositoryDatabase,
+  type RepositoryCommandResult,
+  type WorkflowTransactionalCommand,
+} from '../repository';
 import { openStoreDatabase } from './connection';
 import { backupOpenDatabase } from './backup';
 import {
@@ -71,6 +78,7 @@ function operationFor(req: DbRequest): SqliteOperationClass {
     case 'run':
       return 'write';
     case 'transaction':
+    case 'workflowMutation':
       return 'transaction';
     case 'backup':
       return 'backup';
@@ -81,6 +89,143 @@ function operationFor(req: DbRequest): SqliteOperationClass {
       return _exhaustive;
     }
   }
+}
+
+class WorkflowTransactionDatabase implements RepositoryDatabase {
+  private transactionActive = true;
+
+  constructor(private readonly conn: DatabaseSync) {}
+
+  get active(): boolean {
+    return this.transactionActive;
+  }
+
+  async all<T = unknown>(sql: string, params?: SqlValue[]): Promise<T[]> {
+    const stmt = this.conn.prepare(sql);
+    return (params && params.length > 0 ? stmt.all(...params) : stmt.all()) as T[];
+  }
+
+  async get<T = unknown>(sql: string, params?: SqlValue[]): Promise<T | undefined> {
+    const stmt = this.conn.prepare(sql);
+    const row = params && params.length > 0 ? stmt.get(...params) : stmt.get();
+    return row as T | undefined;
+  }
+
+  async run(sql: string, params?: SqlValue[]): Promise<RunResult> {
+    return runStatement(sql, params);
+  }
+
+  async transaction(
+    statements: import('./rpc').SqlStatement[],
+    options: { abortIfFirstUnchanged?: boolean; abortIfUnchangedAt?: number[] } = {},
+  ): Promise<RunResult[]> {
+    if (!this.transactionActive) {
+      throw new MusterInvariantError('invariant', 'transaction');
+    }
+    const results: RunResult[] = [];
+    try {
+      for (const stmt of statements) {
+        results.push(runStatement(stmt.sql, stmt.params));
+        const shouldAbort =
+          (options.abortIfFirstUnchanged && results.length === 1 && results[0]?.changes === 0) ||
+          (options.abortIfUnchangedAt?.includes(results.length - 1) && results.at(-1)?.changes === 0);
+        if (shouldAbort) {
+          this.conn.exec('ROLLBACK');
+          this.transactionActive = false;
+          return results;
+        }
+      }
+      return results;
+    } catch (error) {
+      this.conn.exec('ROLLBACK');
+      this.transactionActive = false;
+      throw error;
+    }
+  }
+
+  async pragma(pragma: string): Promise<number> {
+    if (!isAllowedReadPragma(pragma)) {
+      throw new MusterInvariantError('protocol', 'pragma');
+    }
+    const row = this.conn.prepare(`PRAGMA ${pragma}`).get() as Record<string, number> | undefined;
+    const value = row ? Object.values(row)[0] : 0;
+    return typeof value === 'number' ? value : 0;
+  }
+}
+
+function parseWorkflowMutationRequest(
+  req: Extract<DbRequest, { kind: 'workflowMutation' }>,
+): { command: WorkflowTransactionalCommand; changeFeedRetainRevisions: number } {
+  const allowedRequestKeys = new Set([
+    'kind',
+    'requestId',
+    'command',
+    'changeFeedRetainRevisions',
+  ]);
+  if (!Object.keys(req).every((key) => allowedRequestKeys.has(key))) {
+    throw new MusterInvariantError('protocol', 'transaction');
+  }
+  if (
+    !Number.isSafeInteger(req.requestId) ||
+    req.requestId < 1 ||
+    !Number.isSafeInteger(req.changeFeedRetainRevisions) ||
+    req.changeFeedRetainRevisions < 1 ||
+    !req.command ||
+    typeof req.command !== 'object' ||
+    !isWorkflowTransactionalCommand(req.command) ||
+    typeof req.command.workspaceId !== 'string' ||
+    req.command.workspaceId.length === 0
+  ) {
+    throw new MusterInvariantError('protocol', 'transaction');
+  }
+  try {
+    if (Buffer.byteLength(JSON.stringify(req.command), 'utf8') > 4_194_304) {
+      throw new MusterInvariantError('protocol', 'transaction');
+    }
+  } catch (error) {
+    if (error instanceof MusterInvariantError) throw error;
+    throw new MusterInvariantError('protocol', 'transaction');
+  }
+  return { command: req.command, changeFeedRetainRevisions: req.changeFeedRetainRevisions };
+}
+
+function boundedWorkflowMutationResult(result: RepositoryCommandResult): RepositoryCommandResult {
+  const allowedKeys = new Set([
+    'ok',
+    'changed',
+    'reason',
+    'operation',
+    'conflict',
+    'messageId',
+    'deletedMessageIds',
+    'presentationStatus',
+  ]);
+  if (
+    !Object.keys(result).every((key) => allowedKeys.has(key)) ||
+    typeof result.ok !== 'boolean' ||
+    (result.changed !== undefined && typeof result.changed !== 'boolean') ||
+    (result.conflict !== undefined && typeof result.conflict !== 'boolean') ||
+    (result.reason !== undefined &&
+      (typeof result.reason !== 'string' || result.reason.length === 0 || result.reason.length > 1024)) ||
+    (result.messageId !== undefined &&
+      (typeof result.messageId !== 'string' || result.messageId.length === 0 || result.messageId.length > 512)) ||
+    (result.deletedMessageIds !== undefined && (
+      !Array.isArray(result.deletedMessageIds) ||
+      result.deletedMessageIds.length > 10_000 ||
+      !result.deletedMessageIds.every((id) => typeof id === 'string' && id.length > 0 && id.length <= 512)
+    ))
+  ) {
+    throw new MusterInvariantError('protocol', 'transaction');
+  }
+  try {
+    if (result.operation && Buffer.byteLength(JSON.stringify(result.operation), 'utf8') > 1_048_576) {
+      throw new MusterInvariantError('protocol', 'transaction');
+    }
+  } catch (error) {
+    if (error instanceof MusterInvariantError) throw error;
+    throw new MusterInvariantError('protocol', 'transaction');
+  }
+  return result;
 }
 
 /**
@@ -233,6 +378,34 @@ async function handle(req: DbRequest): Promise<DbResponse> {
           conn.exec('ROLLBACK');
         } catch {
           // ignore rollback failure — the original error is the real signal
+        }
+        throw error;
+      }
+    }
+    case 'workflowMutation': {
+      const parsed = parseWorkflowMutationRequest(req);
+      const conn = requireDb();
+      conn.exec('BEGIN IMMEDIATE TRANSACTION');
+      const transactionDb = new WorkflowTransactionDatabase(conn);
+      try {
+        const repository = new SqliteTaskRepository(
+          transactionDb,
+          parsed.command.workspaceId,
+          { changeFeedRetainRevisions: parsed.changeFeedRetainRevisions },
+        );
+        const result = boundedWorkflowMutationResult(await repository.execute(parsed.command));
+        if (transactionDb.active) {
+          maybeInjectFault('transaction');
+          conn.exec('COMMIT');
+        }
+        return { kind: 'workflowMutation', requestId: req.requestId, result };
+      } catch (error) {
+        if (transactionDb.active) {
+          try {
+            conn.exec('ROLLBACK');
+          } catch {
+            // Preserve the original transaction failure.
+          }
         }
         throw error;
       }

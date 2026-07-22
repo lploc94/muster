@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { SqliteTaskRepository, type TaskRepository } from './repository';
+import { stageDispositionForSettlement } from './m018-test-helpers';
 import type { MusterTask, OperationLedgerEntry } from './types';
 import { DbClient } from './sqlite/client';
 
@@ -1398,6 +1399,8 @@ describe('SqliteTaskRepository', () => {
         const turn = await repository.getTurn(entry.activationTurnId);
         expect(task).toBeTruthy();
         expect(turn).toBeTruthy();
+        const disposition = { kind: 'workflow_next' as const, change: 'updated' as const, result };
+        await stageDispositionForSettlement(repository, turn!, disposition);
         return repository.execute({
           kind: 'settleTurnAndApplyEffects',
           workspaceId: 'ws',
@@ -1410,7 +1413,7 @@ describe('SqliteTaskRepository', () => {
             ...turn!,
             status: 'succeeded',
             finishedAt,
-            disposition: { kind: 'workflow_next', change: 'updated', result },
+            disposition,
           },
           expectedStatuses: ['running'],
           relatedTurns: [],
@@ -1655,6 +1658,7 @@ describe('SqliteTaskRepository', () => {
         const turn = await repository.getTurn(turnId);
         expect(task).toBeTruthy();
         expect(turn).toBeTruthy();
+        await stageDispositionForSettlement(repository, turn!, disposition);
         return repository.execute({
           kind: 'settleTurnAndApplyEffects',
           workspaceId: 'ws',
@@ -2053,6 +2057,8 @@ describe('SqliteTaskRepository', () => {
       const turn = await repository.getTurn(data.activationTurnId);
       expect(task).toBeTruthy();
       expect(turn).toBeTruthy();
+      const disposition = { kind: 'workflow_fail' as const, reason: 'agent gave up' };
+      await stageDispositionForSettlement(repository, turn!, disposition);
 
       const settle = await repository.execute({
         kind: 'settleTurnAndApplyEffects',
@@ -2063,7 +2069,7 @@ describe('SqliteTaskRepository', () => {
           ...turn!,
           status: 'succeeded',
           finishedAt,
-          disposition: { kind: 'workflow_fail', reason: 'agent gave up' },
+          disposition,
         },
         expectedStatuses: ['running'],
         relatedTurns: [],
@@ -2140,6 +2146,8 @@ describe('SqliteTaskRepository', () => {
       const turn = await repository.getTurn(data.activationTurnId);
       expect(task).toBeTruthy();
       expect(turn).toBeTruthy();
+      const disposition = { kind: 'workflow_prev' as const, targets: 'all' as const };
+      await stageDispositionForSettlement(repository, turn!, disposition);
 
       const settle = await repository.execute({
         kind: 'settleTurnAndApplyEffects',
@@ -2151,7 +2159,7 @@ describe('SqliteTaskRepository', () => {
           status: 'succeeded',
           finishedAt,
           // Entry PREV with no direct producers -> invalid_route fail closure.
-          disposition: { kind: 'workflow_prev', targets: 'all' },
+          disposition,
         },
         expectedStatuses: ['running'],
         relatedTurns: [],

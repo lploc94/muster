@@ -294,21 +294,54 @@ export interface WorkflowGateStatusProjection {
   required: number;
 }
 
-export interface WorkflowActiveFeedbackRoundProjection {
+export interface WorkflowRunPolicyProjection {
+  maxFeedbackRounds: number;
+  maxTurnsPerTask: number;
+  maxWorkflowTurns: number;
+  maxChildren: number;
+  maxDepth: number;
+  maxConcurrency: number;
+  maxAggregateBytes: number;
+}
+
+export interface WorkflowActivationStatusProjection {
+  activationId: string;
+  kind: string;
+  status: string;
+  primaryTurnId: string;
+  executionTurnId: string;
+  sourceGateId?: string;
+  feedbackRoundId?: string;
+  feedbackTargetNodeId?: string;
+  continuationId?: string;
+  returnGateId?: string;
+}
+
+export interface WorkflowFeedbackRoundProjection {
   roundId: string;
   status: string;
   joinMode: string;
+  role: 'requester' | 'target';
+  required: number;
+  responded: number;
 }
 
 export interface WorkflowContinuationStatusProjection {
   continuationId: string;
   status: string;
   kind: string;
+  childRunId?: string;
+  outcome?: string;
+  reasonCode?: string;
+}
+
+export interface WorkflowIntegrityDiagnosticProjection {
+  code: string;
 }
 
 /**
  * Bounded workflow orchestration state for a task bound to a workflow node.
- * Single-snapshot read: nodes → runs → gates/rounds/continuations.
+ * Relational read: nodes → runs → gates/activations/rounds/continuations.
  * Strictly excludes topology, prompts, artifact bodies, secrets, and absolute paths.
  */
 export interface WorkflowTaskStatusProjection {
@@ -316,13 +349,19 @@ export interface WorkflowTaskStatusProjection {
   definitionId: string;
   definitionVersion: number;
   runStatus: string;
+  policy: WorkflowRunPolicyProjection;
+  startedAt?: string;
+  deadlineAt?: string;
+  terminalReason?: string;
   /** Run origin: top_level | child (not a filesystem path). */
   origin: string;
   /** Parent workflow run id when origin is child. */
   parentRunId?: string;
   nodeId: string;
   gates: readonly WorkflowGateStatusProjection[];
-  activeFeedbackRound?: WorkflowActiveFeedbackRoundProjection;
-  /** Active (pending) continuation for this run, if any. */
-  continuation?: WorkflowContinuationStatusProjection;
+  activeGate?: WorkflowGateStatusProjection;
+  activation?: WorkflowActivationStatusProjection;
+  feedbackRounds: readonly WorkflowFeedbackRoundProjection[];
+  continuations: readonly WorkflowContinuationStatusProjection[];
+  diagnostics: readonly WorkflowIntegrityDiagnosticProjection[];
 }

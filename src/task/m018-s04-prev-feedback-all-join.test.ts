@@ -20,6 +20,7 @@ import * as path from 'node:path';
 import { CredentialRegistry } from '../bridge/credentials';
 import { dispatch } from './coordinator-tools';
 import { SqliteTaskRepository } from './repository';
+import { stageDispositionForSettlement } from './m018-test-helpers';
 import { DbClient } from './sqlite/client';
 import {
   DEFAULT_WORKFLOW_POLICY,
@@ -129,6 +130,7 @@ async function settleSucceeded(
   const turn = await repository.getTurn(turnId);
   expect(task).toBeTruthy();
   expect(turn).toBeTruthy();
+  await stageDispositionForSettlement(repository, turn!, disposition);
   return repository.execute({
     kind: 'settleTurnAndApplyEffects',
     workspaceId: 'ws',
@@ -403,6 +405,24 @@ describe('M018 S04 PREV feedback ALL-join', () => {
       });
       expect(p1Feedback.sequence).toBeGreaterThan(1);
       expect(p2Feedback.sequence).toBeGreaterThan(1);
+
+      await ctx.client.run(
+        `UPDATE workflow_routed_messages
+            SET body_json = ?
+          WHERE workspace_id = ? AND run_id = ? AND message_id = ?`,
+        [
+          JSON.stringify({
+            kind: 'feedback_request',
+            schema: 1,
+            roundId: 'contradictory-round',
+            requesterNodeId: 'p1',
+            targetNodeId: 'p2',
+          }),
+          'ws',
+          data.runId,
+          deriveFeedbackRequestMessageId(data.runId, roundId, 'p1'),
+        ],
+      );
 
       const p1FeedbackMsg = (await ctx.repository.listMessages(p1.taskId)).find(
         (m) => m.turnId === p1Feedback.id,
@@ -785,6 +805,105 @@ describe('M018 S04 PREV feedback ALL-join', () => {
       await opened.close();
     }
   }, 45_000);
+
+  it('late round-N response cannot satisfy round-N-plus-one', async () => {
+    const opened = await openRepo('late-prior-round');
+    try {
+      const createdAt = '2026-07-22T11:00:00.000Z';
+      const data = await defineAndStartFanIn(
+        opened.repository,
+        createdAt,
+        'late-prior-round-start',
+      );
+      const { p1, p2, consumerTaskId, consumerActivationTurnId } = await activateConsumer(
+        opened.repository,
+        opened.client,
+        data,
+      );
+      await settleSucceeded(
+        opened.repository,
+        opened.client,
+        consumerTaskId,
+        consumerActivationTurnId,
+        { kind: 'workflow_prev', targets: 'all', note: 'round one' },
+        '2026-07-22T11:01:00.000Z',
+      );
+      const firstRound = await opened.client.get<{ round_id: string }>(
+        `SELECT round_id FROM workflow_feedback_rounds
+          WHERE workspace_id = 'ws' AND run_id = ?`,
+        [data.runId],
+      );
+      const p1FirstFeedbackId = deriveFeedbackTargetTurnId(data.runId, firstRound!.round_id, 'p1');
+      const p2FirstFeedbackId = deriveFeedbackTargetTurnId(data.runId, firstRound!.round_id, 'p2');
+      await settleSucceeded(
+        opened.repository,
+        opened.client,
+        p1.taskId,
+        p1FirstFeedbackId,
+        { kind: 'workflow_next', change: 'updated', result: 'p1-round-one' },
+        '2026-07-22T11:02:00.000Z',
+      );
+      await settleSucceeded(
+        opened.repository,
+        opened.client,
+        p2.taskId,
+        p2FirstFeedbackId,
+        { kind: 'workflow_next', change: 'updated', result: 'p2-round-one' },
+        '2026-07-22T11:03:00.000Z',
+      );
+      const firstResumeId = deriveFeedbackResumeTurnId(data.runId, firstRound!.round_id);
+      await settleSucceeded(
+        opened.repository,
+        opened.client,
+        consumerTaskId,
+        firstResumeId,
+        { kind: 'workflow_prev', targets: 'all', note: 'round two' },
+        '2026-07-22T11:04:00.000Z',
+      );
+
+      const rounds = await opened.client.all<{ round_id: string; status: string }>(
+        `SELECT round_id, status FROM workflow_feedback_rounds
+          WHERE workspace_id = 'ws' AND run_id = ? ORDER BY round_id`,
+        [data.runId],
+      );
+      expect(rounds).toHaveLength(2);
+      const secondRound = rounds.find((round) => round.round_id !== firstRound!.round_id)!;
+      expect(secondRound.status).toBe('open');
+
+      await settleSucceeded(
+        opened.repository,
+        opened.client,
+        p1.taskId,
+        p1FirstFeedbackId,
+        { kind: 'workflow_next', change: 'updated', result: 'late-round-one' },
+        '2026-07-22T11:05:00.000Z',
+      );
+
+      await expect(opened.client.all(
+        `SELECT target_node_id, status FROM workflow_feedback_targets
+          WHERE workspace_id = 'ws' AND run_id = ? AND round_id = ?
+          ORDER BY target_node_id`,
+        [data.runId, secondRound.round_id],
+      )).resolves.toEqual([
+        { target_node_id: 'p1', status: 'pending' },
+        { target_node_id: 'p2', status: 'pending' },
+      ]);
+      await expect(opened.client.get(
+        `SELECT status FROM workflow_feedback_rounds
+          WHERE workspace_id = 'ws' AND run_id = ? AND round_id = ?`,
+        [data.runId, secondRound.round_id],
+      )).resolves.toEqual({ status: 'open' });
+      expect(await opened.repository.listTurns(consumerTaskId)).toHaveLength(2);
+      await expect(opened.client.all(
+        `SELECT message_id FROM workflow_routed_messages
+          WHERE workspace_id = 'ws' AND run_id = ? AND feedback_round_id = ?
+            AND kind = 'feedback_response'`,
+        [data.runId, secondRound.round_id],
+      )).resolves.toHaveLength(0);
+    } finally {
+      await opened.close();
+    }
+  }, 30_000);
 
   it('concurrent final feedback responses build one exact aggregate', async () => {
     const first = await openRepo('prev-concurrent-final');

@@ -286,6 +286,74 @@ describe('M018 universal durable disposition claims', () => {
     ).resolves.toMatchObject({ status: 'consumed' });
   });
 
+  it('settlement rejects missing and mismatched durable disposition claims', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m018-s08-settlement-'));
+    tempDirs.push(dir);
+    const client = makeClient();
+    await client.open(path.join(dir, 'muster.sqlite3'));
+    await client.run(
+      `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
+       VALUES ('ws', 'identity', 'Workspace', 'now', 'now')`,
+    );
+    const repository = new SqliteTaskRepository(client, 'ws');
+    const task = makeTask();
+    await repository.execute({ kind: 'createTask', workspaceId: 'ws', task });
+
+    const missingTurn = makeTurn('turn-settle-missing', 1);
+    await repository.execute({ kind: 'createTurn', workspaceId: 'ws', turn: missingTurn });
+    const complete = { kind: 'complete' as const, result: 'done' };
+    await expect(repository.execute({
+      kind: 'settleTurnAndApplyEffects',
+      workspaceId: 'ws',
+      expectedTaskRevision: task.revision,
+      task: { ...task, updatedAt: '2026-07-22T02:00:03.000Z' },
+      turn: {
+        ...missingTurn,
+        status: 'succeeded',
+        finishedAt: '2026-07-22T02:00:03.000Z',
+        disposition: complete,
+      },
+      expectedStatuses: ['running'],
+      relatedTurns: [],
+      messages: [],
+    })).resolves.toMatchObject({
+      changed: false,
+      conflict: true,
+      reason: 'settlement requires a durable staged disposition',
+    });
+    await expect(repository.getTurn(missingTurn.id)).resolves.toMatchObject({ status: 'running' });
+
+    const mismatchTurn = makeTurn('turn-settle-mismatch', 2);
+    await repository.execute({ kind: 'createTurn', workspaceId: 'ws', turn: mismatchTurn });
+    await expect(stage(repository, mismatchTurn, 'op-complete', complete)).resolves.toMatchObject({
+      changed: true,
+    });
+    await expect(repository.execute({
+      kind: 'settleTurnAndApplyEffects',
+      workspaceId: 'ws',
+      expectedTaskRevision: task.revision,
+      task: { ...task, updatedAt: '2026-07-22T02:00:04.000Z' },
+      turn: {
+        ...mismatchTurn,
+        status: 'succeeded',
+        finishedAt: '2026-07-22T02:00:04.000Z',
+        disposition: { kind: 'fail', error: 'changed' },
+      },
+      expectedStatuses: ['running'],
+      relatedTurns: [],
+      messages: [],
+    })).resolves.toMatchObject({
+      changed: false,
+      conflict: true,
+      reason: 'settlement disposition does not match the durable claim',
+    });
+    await expect(repository.getTurn(mismatchTurn.id)).resolves.toMatchObject({ status: 'running' });
+    await expect(client.get<{ status: string }>(
+      `SELECT status FROM turn_disposition_claims WHERE workspace_id = 'ws' AND turn_id = ?`,
+      [mismatchTurn.id],
+    )).resolves.toEqual({ status: 'staged' });
+  });
+
   it('rejects a workflow disposition on a non-workflow turn without a claim', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m018-s08-context-'));
     tempDirs.push(dir);

@@ -501,7 +501,9 @@ const WORKFLOW_SCHEMA_STATEMENTS: readonly string[] = [
       OR (terminal_result_run_id IS NOT NULL AND terminal_result_artifact_id IS NOT NULL AND terminal_result_artifact_revision IS NOT NULL)
     ),
     FOREIGN KEY (workspace_id, definition_id, definition_version)
-      REFERENCES workflow_definitions(workspace_id, definition_id, version)
+      REFERENCES workflow_definitions(workspace_id, definition_id, version),
+    FOREIGN KEY (workspace_id, parent_run_id)
+      REFERENCES workflow_runs(workspace_id, run_id) ON DELETE RESTRICT
   )`,
 
   `CREATE TABLE IF NOT EXISTS workflow_nodes (
@@ -678,6 +680,8 @@ const WORKFLOW_SCHEMA_STATEMENTS: readonly string[] = [
     updated_at TEXT,
     PRIMARY KEY (workspace_id, run_id, continuation_id),
     FOREIGN KEY (workspace_id, run_id)
+      REFERENCES workflow_runs(workspace_id, run_id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, child_run_id)
       REFERENCES workflow_runs(workspace_id, run_id) ON DELETE CASCADE
   )`,
 
@@ -1161,6 +1165,71 @@ const WORKFLOW_CONFORMANCE_SCHEMA_STATEMENTS: readonly string[] = [
       )
      BEGIN
        SELECT RAISE(ABORT, 'workflow_terminal_run_has_live_activation');
+     END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_terminal_workflow_history_prune_before_turn_delete
+     BEFORE DELETE ON turns
+     BEGIN
+       DELETE FROM workflow_runs
+        WHERE workspace_id = OLD.workspace_id
+          AND status IN ('succeeded', 'failed', 'cancelled')
+          AND run_id IN (
+            SELECT node.run_id
+              FROM workflow_nodes node
+             WHERE node.workspace_id = OLD.workspace_id
+               AND node.task_id = OLD.task_id
+            UNION
+            SELECT source.run_id
+              FROM workflow_artifact_sources source
+             WHERE source.workspace_id = OLD.workspace_id
+               AND (source.producing_turn_id = OLD.id OR source.caller_turn_id = OLD.id)
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_runs child
+             WHERE child.workspace_id = workflow_runs.workspace_id
+               AND child.parent_run_id = workflow_runs.run_id
+          )
+          AND NOT EXISTS (
+            SELECT 1
+              FROM workflow_nodes node
+              JOIN tasks task
+                ON task.workspace_id = node.workspace_id
+               AND task.id = node.task_id
+             WHERE node.workspace_id = workflow_runs.workspace_id
+               AND node.run_id = workflow_runs.run_id
+               AND task.lifecycle NOT IN ('succeeded', 'failed', 'cancelled', 'skipped')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_dependency_gates gate_row
+             WHERE gate_row.workspace_id = workflow_runs.workspace_id
+               AND gate_row.run_id = workflow_runs.run_id
+               AND gate_row.status IN ('open', 'satisfied')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_feedback_rounds round_row
+             WHERE round_row.workspace_id = workflow_runs.workspace_id
+               AND round_row.run_id = workflow_runs.run_id
+               AND round_row.status IN ('open', 'satisfied')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_activations activation
+             WHERE activation.workspace_id = workflow_runs.workspace_id
+               AND activation.run_id = workflow_runs.run_id
+               AND activation.status IN ('queued', 'running')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_continuations continuation
+             WHERE continuation.workspace_id = workflow_runs.workspace_id
+               AND (continuation.run_id = workflow_runs.run_id
+                 OR continuation.child_run_id = workflow_runs.run_id)
+               AND continuation.status IN ('pending', 'resolved')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_return_gates return_gate
+             WHERE return_gate.workspace_id = workflow_runs.workspace_id
+               AND (return_gate.continuation_run_id = workflow_runs.run_id
+                 OR return_gate.child_run_id = workflow_runs.run_id)
+               AND return_gate.status IN ('open', 'satisfied')
+          );
      END`,
 ];
 

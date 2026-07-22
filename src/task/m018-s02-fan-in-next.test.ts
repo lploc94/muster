@@ -15,6 +15,7 @@ import { TaskEngine } from './engine';
 import { DEFAULT_RESOURCE_LIMITS } from './limits';
 import { parseTaskTypeRegistry } from './task-types';
 import { SqliteTaskRepository } from './repository';
+import { stageDispositionForSettlement } from './m018-test-helpers';
 import { canPromoteTurn } from './scheduler';
 import { DbClient } from './sqlite/client';
 import type { TaskStoreFile } from './types';
@@ -98,6 +99,26 @@ describe('M018 S02 fan-in NEXT activation', () => {
       ctx,
     );
     expect(bad.ok).toBe(false);
+
+    const fanOut = dispatch(
+      'define_workflow',
+      {
+        opId: 'def-fan-out-bad',
+        definitionId: 'wf-fan-out-bad',
+        version: 1,
+        name: 'fan-out-bad',
+        topology: {
+          kind: 'graph_v1',
+          nodes: [{ nodeId: 'source' }, { nodeId: 'left' }, { nodeId: 'right' }],
+          edges: [
+            { fromNodeId: 'source', toNodeId: 'left', inputRef: 'from_source' },
+            { fromNodeId: 'source', toNodeId: 'right', inputRef: 'from_source' },
+          ],
+        },
+      },
+      ctx,
+    );
+    expect(fanOut.ok).toBe(false);
   });
 
   it('two-producer fan-in NEXT: partial fill leaves consumer absent; final fill queues one aggregate turn without sealing producers', async () => {
@@ -163,6 +184,8 @@ describe('M018 S02 fan-in NEXT activation', () => {
         const turn = await ctx.repository.getTurn(entry.activationTurnId);
         expect(task).toBeTruthy();
         expect(turn).toBeTruthy();
+        const disposition = { kind: 'workflow_next' as const, change: 'updated' as const, result };
+        await stageDispositionForSettlement(ctx.repository, turn!, disposition);
         return ctx.repository.execute({
           kind: 'settleTurnAndApplyEffects',
           workspaceId: 'ws',
@@ -175,7 +198,7 @@ describe('M018 S02 fan-in NEXT activation', () => {
             ...turn!,
             status: 'succeeded',
             finishedAt,
-            disposition: { kind: 'workflow_next', change: 'updated', result },
+            disposition,
           },
           expectedStatuses: ['running'],
           relatedTurns: [],
@@ -354,6 +377,8 @@ describe('M018 S02 fan-in NEXT activation', () => {
         );
         const task = await repository.getTask(entry.taskId);
         const turn = await repository.getTurn(entry.activationTurnId);
+        const disposition = { kind: 'workflow_next' as const, change: 'updated' as const, result };
+        await stageDispositionForSettlement(repository, turn!, disposition);
         return {
           kind: 'settleTurnAndApplyEffects' as const,
           workspaceId: 'ws',
@@ -363,7 +388,7 @@ describe('M018 S02 fan-in NEXT activation', () => {
             ...turn!,
             status: 'succeeded' as const,
             finishedAt,
-            disposition: { kind: 'workflow_next' as const, change: 'updated' as const, result },
+            disposition,
           },
           expectedStatuses: ['running' as const],
           relatedTurns: [],
@@ -460,12 +485,14 @@ describe('M018 S02 fan-in NEXT activation', () => {
           );
           const task = await ctx.repository.getTask(entry.taskId);
           const turn = await ctx.repository.getTurn(entry.activationTurnId);
+          const disposition = { kind: 'workflow_next' as const, change: 'updated' as const, result };
+          await stageDispositionForSettlement(ctx.repository, turn!, disposition);
           return ctx.repository.execute({
             kind: 'settleTurnAndApplyEffects', workspaceId: 'ws', expectedTaskRevision: task!.revision,
             task: { ...task!, updatedAt: finishedAt },
             turn: {
               ...turn!, status: 'succeeded', finishedAt,
-              disposition: { kind: 'workflow_next', change: 'updated', result },
+              disposition,
             },
             expectedStatuses: ['running'], relatedTurns: [], messages: [],
           });
