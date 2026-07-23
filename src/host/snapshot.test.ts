@@ -46,7 +46,7 @@ function task(id: string, overrides: Partial<MusterTask> = {}): MusterTask {
     lifecycle: 'open',
     goal: `Goal for ${id}`,
     parentId: null,
-    dependencies: [],
+    prerequisites: [],
     backend: 'grok',
     capabilities: [],
     executionPolicy: POLICY,
@@ -161,8 +161,8 @@ describe('host task snapshot projection', () => {
         'child-a': task('child-a', {
           goal: 'First child',
           parentId: 'root-active',
-          dependencies: [
-            { taskId: 'root-old', requiredOutcome: 'succeeded', onUnsatisfied: 'block' },
+          prerequisites: [
+            { producerTaskId: 'root-old', requiredLifecycle: 'succeeded', onUnmet: 'block' },
           ],
           updatedAt: '2026-07-06T00:04:00.000Z',
         }),
@@ -251,7 +251,7 @@ describe('host task snapshot projection', () => {
     // DFS preorder under owning root (siblings by createdAt then id).
     expect(snapshot.subtree?.map((summary) => [summary.id, summary.lifecycle, summary.runtimeActivity, summary.viewStatus])).toEqual([
       ['root-active', 'open', 'running', 'running'],
-      ['child-a', 'open', 'waiting_dependencies', 'waiting_dependencies'],
+      ['child-a', 'open', 'waiting_prerequisites', 'waiting_prerequisites'],
       ['grandchild', 'open', 'idle', 'idle'],
       ['child-b', 'open', 'idle', 'idle'],
     ]);
@@ -535,8 +535,8 @@ describe('host task snapshot projection', () => {
       revision: 1,
       tasks: {
         t: task('t', {
-          dependencies: [
-            { taskId: 'dep', requiredOutcome: 'succeeded', onUnsatisfied: 'block' },
+          prerequisites: [
+            { producerTaskId: 'dep', requiredLifecycle: 'succeeded', onUnmet: 'block' },
           ],
         }),
         dep: task('dep', { lifecycle: 'open' }),
@@ -552,7 +552,7 @@ describe('host task snapshot projection', () => {
       state: 'queued',
       turnId: 'q',
       position: 1,
-      waitReason: 'dependencies',
+      waitReason: 'prerequisites',
     });
 
     const childrenFile: EngineProjection = {

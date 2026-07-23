@@ -171,8 +171,8 @@ describe('protocol v7 focused transcriptPage contract', () => {
     transcriptPage: validPage,
   };
 
-  it('is exactly version 8', () => {
-    expect(PROTOCOL_VERSION).toBe(9);
+  it('uses the current protocol version', () => {
+    expect(PROTOCOL_VERSION).toBe(10);
   });
 
   it('accepts focused snapshot with transcript + transcriptPage', () => {
@@ -1513,6 +1513,25 @@ describe('protocol v7 loadTranscriptPage / transcriptPageResult', () => {
     ).toBe(false);
   });
 
+  it('accepts ordered reasoning and rejects missing or invalid order', () => {
+    const reasoning = {
+      id: 'reasoning-1',
+      kind: 'reasoning' as const,
+      turnId: 'turn-1',
+      order: 2,
+      content: 'thinking',
+    };
+    expect(isExtMessage({ ...validSuccess, items: [reasoning] })).toBe(true);
+    const { order: _order, ...missingOrder } = reasoning;
+    expect(isExtMessage({ ...validSuccess, items: [missingOrder] })).toBe(false);
+    expect(
+      isExtMessage({ ...validSuccess, items: [{ ...reasoning, order: -1 }] }),
+    ).toBe(false);
+    expect(
+      isExtMessage({ ...validSuccess, items: [{ ...reasoning, extra: true }] }),
+    ).toBe(false);
+  });
+
   it('rejects host error transcript items and transcriptPage extra fields', () => {
     expect(
       isExtMessage({
@@ -1619,8 +1638,8 @@ describe('protocol v9 workspacePatchBatch', () => {
     ],
   };
 
-  it('is exactly version 9', () => {
-    expect(PROTOCOL_VERSION).toBe(9);
+  it('uses the current protocol version', () => {
+    expect(PROTOCOL_VERSION).toBe(10);
   });
 
   it('accepts a multi-kind batch and empty patches', () => {

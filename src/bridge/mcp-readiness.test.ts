@@ -10,7 +10,7 @@ import { MusterBridgeServer } from './server';
 function obs(partial: Partial<ReadinessObservation> & Pick<ReadinessObservation, 'turnId' | 'attemptId'>): ReadinessObservation {
   return {
     phase: 'list_tools',
-    toolNames: ['create_task', 'complete_task'],
+    toolNames: ['define_workflow', 'workflow_next'],
     credentialId: 'cred-1',
     generation: 1,
     timestamp: Date.now(),
@@ -43,7 +43,7 @@ describe('McpReadinessSupervisor', () => {
     sup.beginAttempt({
       turnId: 't1',
       attemptId: 'a1',
-      expectedToolNames: ['complete_task', 'create_task'],
+      expectedToolNames: ['workflow_next', 'define_workflow'],
       bridgeGeneration: 1,
     });
     sup.recordObservation(
@@ -51,7 +51,7 @@ describe('McpReadinessSupervisor', () => {
         turnId: 't1',
         attemptId: 'a1',
         // reverse order + duplicate should still exact-match unique set
-        toolNames: ['create_task', 'complete_task', 'create_task'],
+        toolNames: ['define_workflow', 'workflow_next', 'define_workflow'],
         generation: 1,
       }),
     );
@@ -60,7 +60,7 @@ describe('McpReadinessSupervisor', () => {
       turnId: 't1',
       attemptId: 'a1',
       generation: 1,
-      toolNames: ['complete_task', 'create_task'],
+      toolNames: ['workflow_next', 'define_workflow'],
     });
   });
 
@@ -69,15 +69,15 @@ describe('McpReadinessSupervisor', () => {
     sup.beginAttempt({
       turnId: 't1',
       attemptId: 'a1',
-      expectedToolNames: new Set(['create_task', 'complete_task']),
+      expectedToolNames: new Set(['define_workflow', 'workflow_next']),
       bridgeGeneration: 1,
     });
-    // missing complete_task, extra fail_task
+    // missing workflow_next, extra workflow_fail
     sup.recordObservation(
       obs({
         turnId: 't1',
         attemptId: 'a1',
-        toolNames: ['create_task', 'fail_task'],
+        toolNames: ['define_workflow', 'workflow_fail'],
         generation: 1,
       }),
     );
@@ -89,14 +89,14 @@ describe('McpReadinessSupervisor', () => {
     sup.beginAttempt({
       turnId: 't1',
       attemptId: 'a1',
-      expectedToolNames: ['create_task'],
+      expectedToolNames: ['define_workflow'],
       bridgeGeneration: 1,
     });
     // supersede with attempt a2
     sup.beginAttempt({
       turnId: 't1',
       attemptId: 'a2',
-      expectedToolNames: ['create_task', 'complete_task'],
+      expectedToolNames: ['define_workflow', 'workflow_next'],
       bridgeGeneration: 1,
     });
     // late report for a1
@@ -104,7 +104,7 @@ describe('McpReadinessSupervisor', () => {
       obs({
         turnId: 't1',
         attemptId: 'a1',
-        toolNames: ['create_task'],
+        toolNames: ['define_workflow'],
         generation: 1,
       }),
     );
@@ -119,14 +119,14 @@ describe('McpReadinessSupervisor', () => {
     sup.beginAttempt({
       turnId: 't1',
       attemptId: 'a1',
-      expectedToolNames: ['create_task'],
+      expectedToolNames: ['define_workflow'],
       bridgeGeneration: 1,
     });
     sup.recordObservation(
       obs({
         turnId: 't1',
         attemptId: 'a1',
-        toolNames: ['create_task'],
+        toolNames: ['define_workflow'],
         generation: 1,
       }),
     );
@@ -134,7 +134,7 @@ describe('McpReadinessSupervisor', () => {
       turnId: 't1',
       attemptId: 'a1',
       generation: 1,
-      toolNames: ['create_task'],
+      toolNames: ['define_workflow'],
     });
 
     // bridge restart
@@ -155,7 +155,7 @@ describe('McpReadinessSupervisor', () => {
     sup.beginAttempt({
       turnId: 't1',
       attemptId: 'a1',
-      expectedToolNames: ['create_task'],
+      expectedToolNames: ['define_workflow'],
       bridgeGeneration: 1,
     });
     expectFail(sup.evaluate('t1', 'a1', 1), 'missing_evidence');
@@ -166,14 +166,14 @@ describe('McpReadinessSupervisor', () => {
     sup.beginAttempt({
       turnId: 't1',
       attemptId: 'a1',
-      expectedToolNames: ['create_task'],
+      expectedToolNames: ['define_workflow'],
       bridgeGeneration: 2,
     });
     sup.recordObservation(
       obs({
         turnId: 't1',
         attemptId: 'a1',
-        toolNames: ['create_task'],
+        toolNames: ['define_workflow'],
         generation: 1, // stale bridge gen
       }),
     );
@@ -190,7 +190,7 @@ describe('McpReadinessSupervisor', () => {
     sup.beginAttempt({
       turnId: 't1',
       attemptId: 'a1',
-      expectedToolNames: ['create_task'],
+      expectedToolNames: ['define_workflow'],
       bridgeGeneration: 1,
     });
     sup.recordObservation({
@@ -209,7 +209,7 @@ describe('McpReadinessSupervisor', () => {
     sup.beginAttempt({
       turnId: 't1',
       attemptId: 'a1',
-      expectedToolNames: ['create_task'],
+      expectedToolNames: ['define_workflow'],
       bridgeGeneration: 1,
     });
     const snap = sup.getDebugSnapshot();
@@ -305,7 +305,7 @@ describe('MCP readiness supervisor and bridge instrumentation (M017-S04 / D037)'
     supervisor.noteBridgeGeneration(server.getGeneration());
 
     // --- ready path: matching expected catalog via authenticated tools/list ---
-    const expectedReady = ['complete_task', 'fail_task'] as const;
+    const expectedReady = ['workflow_next', 'workflow_fail'] as const;
     supervisor.beginAttempt({
       turnId: 'turn-a',
       attemptId: 'attempt-a',
@@ -334,7 +334,7 @@ describe('MCP readiness supervisor and bridge instrumentation (M017-S04 / D037)'
     supervisor.beginAttempt({
       turnId: 'turn-wrong',
       attemptId: 'attempt-wrong',
-      expectedToolNames: ['complete_task', 'fail_task', 'get_task_status'],
+      expectedToolNames: ['workflow_next', 'workflow_fail', 'inspect_workflow_run'],
       bridgeGeneration: server.getGeneration(),
     });
     const tokenWrong = credentials.issue({
@@ -342,8 +342,8 @@ describe('MCP readiness supervisor and bridge instrumentation (M017-S04 / D037)'
       callerTaskId: 'task-wrong',
       turnId: 'turn-wrong',
       attemptId: 'attempt-wrong',
-      // observed catalog will be only complete_task
-      allowedActions: new Set(['complete_task']),
+      // observed catalog will be only workflow_next
+      allowedActions: new Set(['workflow_next']),
       ttlMs: 60_000,
     });
     const sessionWrong = await openMcpSession(port, tokenWrong);
@@ -357,19 +357,19 @@ describe('MCP readiness supervisor and bridge instrumentation (M017-S04 / D037)'
     supervisor.beginAttempt({
       turnId: 'turn-stale',
       attemptId: 'attempt-1',
-      expectedToolNames: ['complete_task'],
+      expectedToolNames: ['workflow_next'],
       bridgeGeneration: server.getGeneration(),
     });
     supervisor.beginAttempt({
       turnId: 'turn-stale',
       attemptId: 'attempt-2',
-      expectedToolNames: ['complete_task', 'fail_task'],
+      expectedToolNames: ['workflow_next', 'workflow_fail'],
       bridgeGeneration: server.getGeneration(),
     });
     // Late observation for superseded attempt-1 (observer injection).
     supervisor.recordObservation({
       phase: 'list_tools',
-      toolNames: ['complete_task'],
+      toolNames: ['workflow_next'],
       credentialId: 'late-cred',
       turnId: 'turn-stale',
       attemptId: 'attempt-1',

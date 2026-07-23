@@ -1,11 +1,19 @@
 import { describe, expect, it, vi } from 'vitest';
-import { createTerminalStorageLifecycle } from './terminal-storage-lifecycle';
+import {
+  createTerminalStorageLifecycle,
+  RESET_MUSTER_DATA_ACTION,
+  REVEAL_STORAGE_FOLDER_ACTION,
+} from './terminal-storage-lifecycle';
 
 function makeLifecycle(overrides?: {
   recoveryAction?: string;
   message?: string;
+  code?: string;
+  guidance?: string;
   onQuiesce?: () => void;
   onCloseDoomed?: (doomed: unknown) => void;
+  onReloadWindow?: () => void;
+  onResetStorage?: () => void;
 }) {
   const counts = {
     quiesce: 0,
@@ -13,6 +21,8 @@ function makeLifecycle(overrides?: {
     close: 0,
     showError: 0,
     reveal: 0,
+    reload: 0,
+    reset: 0,
   };
   const logPayloads: Array<Record<string, unknown>> = [];
   const showChoices: Array<string | undefined> = [];
@@ -20,7 +30,7 @@ function makeLifecycle(overrides?: {
 
   const lifecycle = createTerminalStorageLifecycle({
     diagnose: (_error, operation) => ({
-      code: 'corrupt',
+      code: overrides?.code ?? 'corrupt',
       message: overrides?.message ?? 'Muster storage is corrupt.',
       recoveryAction: overrides?.recoveryAction ?? 'reveal_storage',
       operation,
@@ -41,16 +51,25 @@ function makeLifecycle(overrides?: {
       counts.close += 1;
       overrides?.onCloseDoomed?.(doomed);
     },
-    showError: async (message, action) => {
+    showError: async (message, ...actions) => {
       counts.showError += 1;
-      showChoices.push(action);
+      showChoices.push(...actions);
       void message;
       return showReturn;
     },
     revealStorage: async () => {
       counts.reveal += 1;
     },
-    guidanceFor: () => 'Recover by revealing the storage folder.',
+    reloadWindow: async () => {
+      counts.reload += 1;
+      overrides?.onReloadWindow?.();
+    },
+    resetStorage: async () => {
+      counts.reset += 1;
+      overrides?.onResetStorage?.();
+    },
+    guidanceFor: () =>
+      overrides?.guidance ?? 'Recover by revealing the storage folder.',
   });
 
   return { lifecycle, counts, logPayloads, showChoices, setShowReturn: (v: string | undefined) => { showReturn = v; } };
@@ -125,6 +144,71 @@ describe('createTerminalStorageLifecycle exact-once', () => {
       showUi: true,
     });
     expect(counts.showError).toBe(1);
+    expect(counts.reveal).toBe(0);
+    expect(counts.reset).toBe(0);
+  });
+
+  it('incompatible schema offers coordinated reset and reveal, then runs reset on accept', async () => {
+    const { lifecycle, counts, showChoices, setShowReturn } = makeLifecycle({
+      code: 'incompatible_schema',
+      recoveryAction: 'reveal_storage',
+    });
+    setShowReturn(RESET_MUSTER_DATA_ACTION);
+    lifecycle.markActivationReady();
+
+    await lifecycle.reportOnce(new Error('incompatible_schema'), {
+      operation: 'open',
+      doomed: {},
+      showUi: true,
+    });
+
+    expect(showChoices).toEqual([
+      RESET_MUSTER_DATA_ACTION,
+      REVEAL_STORAGE_FOLDER_ACTION,
+    ]);
+    expect(counts.reset).toBe(1);
+    expect(counts.reveal).toBe(0);
+  });
+
+  it('schema_changed offers Reload Window, reloads on accept, and never reveals storage', async () => {
+    const { lifecycle, counts, showChoices, setShowReturn } = makeLifecycle({
+      code: 'schema_changed',
+      recoveryAction: 'reload_window',
+      message: 'Muster storage schema was upgraded in another window.',
+      guidance: 'Reload this window to continue with the upgraded schema.',
+    });
+    setShowReturn('Reload Window');
+    lifecycle.markActivationReady();
+
+    await lifecycle.reportOnce(new Error('schema_changed'), {
+      operation: 'unknown',
+      doomed: { id: 'stale-worker' },
+      showUi: true,
+    });
+
+    expect(counts.quiesce).toBe(1);
+    expect(counts.close).toBe(1);
+    expect(counts.showError).toBe(1);
+    expect(showChoices).toEqual(['Reload Window']);
+    expect(counts.reload).toBe(1);
+    expect(counts.reveal).toBe(0);
+  });
+
+  it('canceling Reload Window performs no reload or reset', async () => {
+    const { lifecycle, counts, setShowReturn } = makeLifecycle({
+      code: 'schema_changed',
+      recoveryAction: 'reload_window',
+      guidance: 'Reload this window to continue.',
+    });
+    setShowReturn(undefined);
+    lifecycle.markActivationReady();
+    await lifecycle.reportOnce(new Error('schema_changed'), {
+      operation: 'unknown',
+      doomed: {},
+      showUi: true,
+    });
+    expect(counts.showError).toBe(1);
+    expect(counts.reload).toBe(0);
     expect(counts.reveal).toBe(0);
   });
 });

@@ -1,19 +1,19 @@
 import { synthesizeBriefFromGoal } from './brief';
 import { buildTaskResultFromSummary, clampSummary } from './dataflow';
-import { validateDependencies, type DepGraph } from './deps';
+import { validatePrerequisites, type PrerequisiteGraph } from './prerequisites';
 import type {
   MusterTask,
   TaskBriefV1,
   TaskCapability,
   TaskCompletionCandidateV1,
-  TaskDependency,
+  TaskPrerequisite,
   TaskExecutionPolicy,
   TaskInputBinding,
   TaskLifecycleState,
   TaskMessage,
   TaskReleaseState,
   TaskRole,
-  TaskSealedBy,
+  TaskLifecycleAuthority,
   TaskTurn,
   TaskVerdict,
   TurnDisposition,
@@ -22,11 +22,11 @@ import type {
   TurnStatus,
   TurnTrigger,
 } from './types';
-import { truncateUtf8Bytes } from './content-limits';
+import { fitsUtf8Bytes } from './content-limits';
 
 /** Fallback when a child omits disposition and no assistant summary is available. */
 export const MISSING_DISPOSITION_CANDIDATE_SUMMARY =
-  'Turn completed without complete_task/fail_task disposition.';
+  'Turn completed without a required disposition.';
 
 /** Named parent-orchestration policy for child auto-seal (W4). */
 export type ChildOrchestrationSealMode = 'parent_may_seal_direct' | 'propose_only';
@@ -83,7 +83,7 @@ const SETTLED_TURN_STATUSES: ReadonlySet<TurnStatus> = new Set([
   'cancelled',
 ]);
 
-const LIVE_TURN_STATUSES: ReadonlySet<TurnStatus> = new Set(['running', 'waiting_user']);
+export const LIVE_TURN_STATUSES: ReadonlySet<TurnStatus> = new Set(['running', 'waiting_user']);
 
 export function isTerminalLifecycle(state: TaskLifecycleState): boolean {
   return TERMINAL_LIFECYCLES.has(state);
@@ -172,7 +172,7 @@ export interface CreateTaskInput {
   reason?: string;
   continuationOf?: string;
   parentId: string | null;
-  dependencies: TaskDependency[];
+  prerequisites: TaskPrerequisite[];
   backend: string;
   /** Optional model id selected for this task (see MusterTask.model). */
   model?: string;
@@ -192,10 +192,10 @@ export interface CreateTaskInput {
 
 export interface CreateTaskContext {
   rootId: string;
-  graph: DepGraph;
+  graph: PrerequisiteGraph;
   now: string;
   /**
-   * Internal opt-out for the verify-dependency auto-gate (verify-gate-loop default B).
+   * Internal opt-out for the verify-prerequisite auto-gate (verify-gate-loop default B).
    * The Phase B remediation path creates a fix task that DEPENDS on the failed verify
    * task (to run after it) but must NOT require its verdict to pass — otherwise the fix
    * could never run and the loop would not terminate. That single internal path sets
@@ -279,27 +279,29 @@ export function createTask(
   input: CreateTaskInput,
   ctx: CreateTaskContext,
 ): TransitionResult<MusterTask> {
-  const depResult = validateDependencies(
+  const prerequisiteResult = validatePrerequisites(
     { taskId: input.id, rootId: ctx.rootId },
-    input.dependencies,
+    input.prerequisites,
     ctx.graph,
     false,
   );
-  if (!depResult.ok) {
-    return depResult;
+  if (!prerequisiteResult.ok) {
+    return prerequisiteResult;
   }
 
-  // Verify-gate auto-default (verify-gate-loop B): a dependency whose TARGET producer is
+  // Verify-gate auto-default (verify-gate-loop B): a prerequisite whose producer is
   // a verify-kind task defaults to requiring that verification's verdict to PASS. Reuses
-  // the same graph `validateDependencies` just confirmed the targets against (an O(1)
+  // the same graph `validatePrerequisites` just confirmed the targets against (an O(1)
   // briefKindOf lookup — no second scan). An explicit `requiredVerdict` is never
-  // overwritten, and a dependency whose target is not verify-kind is left untouched.
-  const dependencies = input.dependencies.map((dep) => {
-    if (dep.requiredVerdict !== undefined || ctx.skipVerifyAutoGate) return dep;
-    if (ctx.graph.briefKindOf?.(dep.taskId) === 'verify') {
-      return { ...dep, requiredVerdict: 'pass' as const };
+  // overwritten, and a prerequisite whose producer is not verify-kind is unchanged.
+  const prerequisites = input.prerequisites.map((prerequisite) => {
+    if (prerequisite.requiredVerdict !== undefined || ctx.skipVerifyAutoGate) {
+      return prerequisite;
     }
-    return dep;
+    if (ctx.graph.briefKindOf?.(prerequisite.producerTaskId) === 'verify') {
+      return { ...prerequisite, requiredVerdict: 'pass' as const };
+    }
+    return prerequisite;
   });
 
   const task: MusterTask = {
@@ -311,7 +313,7 @@ export function createTask(
     reason: input.reason,
     continuationOf: input.continuationOf,
     parentId: input.parentId,
-    dependencies,
+    prerequisites,
     backend: input.backend,
     model: input.model,
     runtimeEpoch: 1,
@@ -394,10 +396,9 @@ export function applySuccessfulTurn(
   options: {
     now: string;
     /**
-     * Coordinator sealer for eligible direct-child auto-seal.
-     * When omitted, host uses parentId with mode parent_may_seal_direct.
+     * Parent authority for eligible direct-child lifecycle completion.
      */
-    sealedBy?: TaskSealedBy;
+    lifecycleAuthority?: TaskLifecycleAuthority;
     /** Root's childOrchestrationSeal policy (required for correct propose_only). */
     rootChildOrchestrationSeal?: ChildOrchestrationSealMode;
     /**
@@ -492,7 +493,7 @@ export function applySuccessfulTurn(
         task: bumpTask(task, options.now, {
           attention: {
             code: 'awaiting_parent_seal',
-            message: 'turn completed without complete/fail; awaiting parent seal',
+            message: 'turn completed without a required disposition; awaiting host review',
             at: options.now,
             sourceTurnId: turn.id,
           },
@@ -507,14 +508,14 @@ export function applySuccessfulTurn(
   switch (disposition.kind) {
     case 'complete': {
       // Persist structured TaskResultV1 on propose and seal (W1 dataflow).
-      // Attach the optional verify verdict so verdict-aware dependents can gate on it.
+      // Attach the optional verify verdict so verdict-aware consumers can gate on it.
       const taskResult = buildTaskResultFromSummary(
         disposition.result,
         task.taskResult,
         disposition.verdict,
       );
       // Root tasks: human-gated — propose only; lifecycle stays open (TASK-MANAGEMENT §5.3).
-      // Eligible direct children: host parent-orchestration seals with sealedBy.coordinator.
+      // Eligible direct children complete under parent-orchestration authority.
       if (!mayParentSealDirect(task, options.rootChildOrchestrationSeal)) {
         return {
           ok: true,
@@ -533,11 +534,10 @@ export function applySuccessfulTurn(
           effects,
         };
       }
-      const sealedBy: TaskSealedBy = options.sealedBy ?? {
-        kind: 'coordinator',
-        taskId: task.parentId!,
+      const lifecycleAuthority: TaskLifecycleAuthority = options.lifecycleAuthority ?? {
+        kind: 'parent',
+        parentTaskId: task.parentId!,
         turnId: turn.id,
-        mode: 'parent_may_seal_direct',
       };
       return {
         ok: true,
@@ -547,7 +547,7 @@ export function applySuccessfulTurn(
             taskResult,
             finishedAt: options.now,
             outcomeProposal: undefined,
-            sealedBy,
+            lifecycleAuthority,
           }),
           turn: succeededTurn,
         },
@@ -573,11 +573,10 @@ export function applySuccessfulTurn(
         };
       }
       {
-        const sealedBy: TaskSealedBy = options.sealedBy ?? {
-          kind: 'coordinator',
-          taskId: task.parentId!,
+        const lifecycleAuthority: TaskLifecycleAuthority = options.lifecycleAuthority ?? {
+          kind: 'parent',
+          parentTaskId: task.parentId!,
           turnId: turn.id,
-          mode: 'parent_may_seal_direct',
         };
         return {
           ok: true,
@@ -587,7 +586,7 @@ export function applySuccessfulTurn(
               error: disposition.error,
               finishedAt: options.now,
               outcomeProposal: undefined,
-              sealedBy,
+              lifecycleAuthority,
             }),
             turn: succeededTurn,
           },
@@ -614,6 +613,59 @@ export function applySuccessfulTurn(
         },
         effects,
       };
+    case 'workflow_next': {
+      // M018 S02 / §20.6: NEXT settles the turn successfully but never seals the
+      // producer lifecycle. Gate contribution / aggregate activation is owned by
+      // the repository commit path (T04). Keep disposition on the settled turn
+      // so the commit path can read change + optional body.
+      return {
+        ok: true,
+        next: {
+          task: bumpTask(task, options.now, {
+            outcomeProposal: undefined,
+          }),
+          turn: {
+            ...succeededTurn,
+            disposition: turn.disposition,
+          },
+        },
+        effects,
+      };
+    }
+    case 'workflow_prev': {
+      // M018 S04: PREV settles the requester turn successfully but never seals
+      // lifecycle. Feedback round open is owned by repository (T02).
+      return {
+        ok: true,
+        next: {
+          task: bumpTask(task, options.now, {
+            outcomeProposal: undefined,
+          }),
+          turn: {
+            ...succeededTurn,
+            disposition: turn.disposition,
+          },
+        },
+        effects,
+      };
+    }
+    case 'workflow_fail': {
+      // M018 S05 / D052: FAIL settles the turn successfully but never seals
+      // lifecycle. Run/gate/round closure is owned by repository (T02).
+      return {
+        ok: true,
+        next: {
+          task: bumpTask(task, options.now, {
+            outcomeProposal: undefined,
+          }),
+          turn: {
+            ...succeededTurn,
+            disposition: turn.disposition,
+          },
+        },
+        effects,
+      };
+    }
     default: {
       const _exhaustive: never = disposition;
       return _exhaustive;
@@ -712,7 +764,7 @@ function terminalPayloadMatches(
 /**
  * User (or authorized coordinator host path) sets task lifecycle explicitly.
  * Not driven by CLI process status.
- * Idempotent terminal replay = exact payload equality → identity no-op (no sealedBy mutate).
+ * Idempotent terminal replay preserves lifecycle authority, revision, and timestamps.
  */
 export function setTaskLifecycle(
   task: MusterTask,
@@ -722,18 +774,18 @@ export function setTaskLifecycle(
     result?: string;
     error?: string;
     reason?: string;
-    /** Required on every terminal seal (W4). */
-    sealedBy?: TaskSealedBy;
+    /** Required on every terminal lifecycle transition. */
+    lifecycleAuthority?: TaskLifecycleAuthority;
     /** Optional structured verify verdict to persist on the succeeded result. */
     verdict?: TaskVerdict;
   },
 ): TransitionResult<MusterTask> {
-  const sealedBy = options.sealedBy ?? { kind: 'user' as const };
+  const lifecycleAuthority = options.lifecycleAuthority ?? { kind: 'user' as const };
 
   if (task.lifecycle === lifecycle) {
     if (isTerminalLifecycle(lifecycle)) {
       if (terminalPayloadMatches(task, lifecycle, options)) {
-        // Exact replay: preserve sealedBy, revision, timestamps.
+        // Exact replay preserves lifecycle authority, revision, and timestamps.
         return { ok: true, next: task, effects: [] };
       }
       return { ok: false, reason: 'already_terminal' };
@@ -765,7 +817,7 @@ export function setTaskLifecycle(
       lifecycle: 'succeeded',
       finishedAt: options.now,
       outcomeProposal: undefined,
-      sealedBy,
+      lifecycleAuthority,
     };
     // Only write TaskResultV1 when a real summary exists — empty string would
     // incorrectly satisfy required inputBindings (W1 / codex-impl-review).
@@ -790,7 +842,7 @@ export function setTaskLifecycle(
         error: options.error ?? fromProposal ?? task.error,
         finishedAt: options.now,
         outcomeProposal: undefined,
-        sealedBy,
+        lifecycleAuthority,
       }),
       effects: [{ kind: 'emitUpdate' }],
     };
@@ -803,7 +855,7 @@ export function setTaskLifecycle(
         lifecycle,
         finishedAt: options.now,
         outcomeProposal: undefined,
-        sealedBy,
+        lifecycleAuthority,
         // Always set reason (including undefined) so reopened tasks don't keep stale reasons.
         reason: options.reason,
       }),
@@ -846,6 +898,8 @@ export function retryTurn(
      * prompt equals the original turn (no diagnostic-only recovery text).
      */
     reuseOriginalInputs?: boolean;
+    /** Append bounded recovery guidance after reused inputs (runtime fallback). */
+    recoveryInstruction?: string;
   },
 ): TransitionResult<TaskTurn> {
   if (isTerminalLifecycle(task.lifecycle)) {
@@ -873,7 +927,16 @@ export function retryTurn(
   }
 
   const inputs = options.reuseOriginalInputs
-    ? [...oldTurn.inputs]
+    ? [
+        ...oldTurn.inputs,
+        ...(options.recoveryInstruction
+          ? [{
+              kind: 'recovery' as const,
+              interruptedTurnId: oldTurn.id,
+              instruction: options.recoveryInstruction,
+            }]
+          : []),
+      ]
     : [
         {
           kind: 'recovery' as const,
@@ -1012,26 +1075,28 @@ export function prepareDeleteQueuedTurn(
   };
 }
 
-export function applyDependencyTerminal(
+export function applyPrerequisiteTerminal(
   task: MusterTask,
   pendingTurn: TaskTurn | undefined,
   outcome: 'failed' | 'skipped',
-  options: { now: string; error?: string; sealedBy?: TaskSealedBy },
+  options: { now: string; error?: string; lifecycleAuthority?: TaskLifecycleAuthority },
 ): TransitionResult<{ task: MusterTask; turn?: TaskTurn }> {
   if (isTerminalLifecycle(task.lifecycle)) {
     return { ok: false, reason: 'task is already terminal' };
   }
 
-  const sealedBy: TaskSealedBy = options.sealedBy ?? {
-    kind: 'coordinator',
-    taskId: task.parentId ?? task.id,
-    mode: 'dependency_policy',
+  if (!task.parentId && !options.lifecycleAuthority) {
+    return { ok: false, reason: 'root lifecycle requires user authority' };
+  }
+  const lifecycleAuthority: TaskLifecycleAuthority = options.lifecycleAuthority ?? {
+    kind: 'parent',
+    parentTaskId: task.parentId!,
   };
   const terminalTask = bumpTask(task, options.now, {
     lifecycle: outcome,
     finishedAt: options.now,
-    sealedBy,
-    ...(outcome === 'failed' ? { error: options.error ?? 'dependency unsatisfied' } : {}),
+    lifecycleAuthority,
+    ...(outcome === 'failed' ? { error: options.error ?? 'prerequisite unmet' } : {}),
   });
 
   let settledTurn: TaskTurn | undefined;
@@ -1058,7 +1123,7 @@ export function applyDependencyTerminal(
 
 export function cancelTask(
   task: MusterTask,
-  options: { liveTurn?: TaskTurn; now: string; sealedBy?: TaskSealedBy },
+  options: { liveTurn?: TaskTurn; now: string; lifecycleAuthority?: TaskLifecycleAuthority },
 ): TransitionResult<{ task: MusterTask; turn?: TaskTurn }> {
   if (isTerminalLifecycle(task.lifecycle)) {
     return { ok: false, reason: 'task is already terminal' };
@@ -1086,11 +1151,11 @@ export function cancelTask(
     effects.push({ kind: 'cancelProcess' });
   }
 
-  const sealedBy: TaskSealedBy = options.sealedBy ?? { kind: 'user' };
+  const lifecycleAuthority: TaskLifecycleAuthority = options.lifecycleAuthority ?? { kind: 'user' };
   const cancelledTask = bumpTask(task, options.now, {
     lifecycle: 'cancelled',
     finishedAt: options.now,
-    sealedBy,
+    lifecycleAuthority,
   });
 
   return {
@@ -1293,6 +1358,28 @@ function dispositionsEqual(a: TurnDisposition, b: TurnDisposition): boolean {
       );
     case 'idle':
       return b.kind === 'idle';
+    case 'workflow_next':
+      return (
+        b.kind === 'workflow_next' &&
+        a.change === b.change &&
+        (a.result ?? undefined) === (b.result ?? undefined) &&
+        JSON.stringify(a.route ?? null) === JSON.stringify(b.route ?? null)
+      );
+    case 'workflow_prev':
+      return (
+        b.kind === 'workflow_prev' &&
+        (a.note ?? undefined) === (b.note ?? undefined) &&
+        (a.targets === 'all'
+          ? b.targets === 'all'
+          : Array.isArray(b.targets) &&
+            a.targets.length === b.targets.length &&
+            a.targets.every((id, index) => id === b.targets[index]))
+      );
+    case 'workflow_fail':
+      return (
+        b.kind === 'workflow_fail' &&
+        (a.reason ?? undefined) === (b.reason ?? undefined)
+      );
     default: {
       const _exhaustive: never = a;
       return _exhaustive;
@@ -1300,22 +1387,33 @@ function dispositionsEqual(a: TurnDisposition, b: TurnDisposition): boolean {
   }
 }
 
-function boundDisposition(
+function dispositionLimitViolation(
   disposition: TurnDisposition,
   limits: { maxResult: number; maxError: number },
-): TurnDisposition {
+): string | undefined {
   switch (disposition.kind) {
     case 'complete':
-      // Pass the structured verdict through unchanged (already normalized/clamped upstream).
-      return {
-        kind: 'complete',
-        result: truncateUtf8Bytes(disposition.result, limits.maxResult).text,
-        ...(disposition.verdict ? { verdict: disposition.verdict } : {}),
-      };
+      return fitsUtf8Bytes(disposition.result, limits.maxResult)
+        ? undefined
+        : `complete result exceeds ${limits.maxResult} UTF-8 bytes`;
     case 'fail':
-      return { kind: 'fail', error: truncateUtf8Bytes(disposition.error, limits.maxError).text };
+      return fitsUtf8Bytes(disposition.error, limits.maxError)
+        ? undefined
+        : `failure error exceeds ${limits.maxError} UTF-8 bytes`;
+    case 'workflow_next':
+      return disposition.result === undefined || fitsUtf8Bytes(disposition.result, limits.maxResult)
+        ? undefined
+        : `workflow_next result exceeds ${limits.maxResult} UTF-8 bytes`;
+    case 'workflow_prev':
+      return disposition.note === undefined || fitsUtf8Bytes(disposition.note, limits.maxResult)
+        ? undefined
+        : `workflow_prev note exceeds ${limits.maxResult} UTF-8 bytes`;
+    case 'workflow_fail':
+      return disposition.reason === undefined || fitsUtf8Bytes(disposition.reason, limits.maxError)
+        ? undefined
+        : `workflow_fail reason exceeds ${limits.maxError} UTF-8 bytes`;
     default:
-      return disposition;
+      return undefined;
   }
 }
 
@@ -1329,30 +1427,44 @@ export function stageDisposition(
     return { ok: false, reason: 'stageDisposition requires a live turn' };
   }
 
-  if (disposition.kind === 'complete' || disposition.kind === 'fail') {
+  if (
+    disposition.kind === 'complete' ||
+    disposition.kind === 'fail' ||
+    disposition.kind === 'workflow_next' ||
+    disposition.kind === 'workflow_prev' ||
+    disposition.kind === 'workflow_fail'
+  ) {
     if (!options.limits) {
-      return { ok: false, reason: 'limits are required for complete or fail dispositions' };
+      return {
+        ok: false,
+        reason:
+          'limits are required for complete, fail, workflow_next, workflow_prev, or workflow_fail dispositions',
+      };
     }
   }
 
-  const bounded = options.limits ? boundDisposition(disposition, options.limits) : disposition;
+  const limitViolation = options.limits
+    ? dispositionLimitViolation(disposition, options.limits)
+    : undefined;
+  if (limitViolation) return { ok: false, reason: limitViolation };
 
   if (!turn.disposition) {
     return {
       ok: true,
-      next: { turn: { ...turn, disposition: bounded }, acceptedOpId: opId },
+      next: { turn: { ...turn, disposition }, acceptedOpId: opId },
+      effects: [],
+    };
+  }
+
+  if (dispositionsEqual(turn.disposition, disposition)) {
+    return {
+      ok: true,
+      next: { turn, acceptedOpId: options.acceptedOpId ?? opId },
       effects: [],
     };
   }
 
   if (options.acceptedOpId === opId) {
-    if (dispositionsEqual(turn.disposition, bounded)) {
-      return {
-        ok: true,
-        next: { turn, acceptedOpId: opId },
-        effects: [],
-      };
-    }
     return { ok: false, reason: 'same opId with different disposition' };
   }
 

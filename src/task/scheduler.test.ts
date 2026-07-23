@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { canPromoteTurn, dependenciesBlockTask, dependencyTerminalOutcome } from './scheduler';
+import { canPromoteTurn, prerequisitesBlockTask, prerequisiteTerminalLifecycle } from './scheduler';
 import { DEFAULT_RESOURCE_LIMITS, type ResourceLimits } from './limits';
-import type { MusterTask, TaskDependency, EngineProjection, TaskTurn, TaskVerdict } from './types';
+import type { MusterTask, TaskPrerequisite, EngineProjection, TaskTurn, TaskVerdict } from './types';
 
 function baseFile(): EngineProjection {
   return {
@@ -15,7 +15,7 @@ function baseFile(): EngineProjection {
         releaseState: 'released',
         goal: 'root',
         parentId: null,
-        dependencies: [],
+        prerequisites: [],
         backend: 'grok',
         capabilities: [],
         executionPolicy: {
@@ -115,7 +115,29 @@ describe('scheduler', () => {
     });
   });
 
-  it('blocks promotion while dependencies are unsatisfied', () => {
+  it('allows only the start-workflow resume through a continuation wait', () => {
+    const file = baseFile();
+    file.turns.t1 = {
+      ...file.turns.t1!,
+      workflowWait: { hasOpenFeedbackRound: false, hasPendingContinuation: true },
+    };
+    expect(canPromoteTurn(file, 't1', DEFAULT_RESOURCE_LIMITS)).toEqual({
+      ok: false,
+      reason: 'waiting on workflow continuation',
+    });
+
+    file.turns.t1 = {
+      ...file.turns.t1!,
+      workflowResume: {
+        kind: 'start_workflow',
+        runId: 'wfr_1',
+        continuationId: 'wfcn_1',
+      },
+    };
+    expect(canPromoteTurn(file, 't1', DEFAULT_RESOURCE_LIMITS)).toEqual({ ok: true });
+  });
+
+  it('blocks promotion while prerequisites are unmet', () => {
     const file = baseFile();
     file.tasks.dep = {
       id: 'dep',
@@ -124,7 +146,7 @@ describe('scheduler', () => {
       releaseState: 'released',
       goal: 'dep',
       parentId: null,
-      dependencies: [],
+      prerequisites: [],
       backend: 'grok',
       capabilities: [],
       executionPolicy: file.tasks.root!.executionPolicy,
@@ -134,11 +156,11 @@ describe('scheduler', () => {
     };
     file.tasks.root = {
       ...file.tasks.root!,
-      dependencies: [{ taskId: 'dep', requiredOutcome: 'succeeded', onUnsatisfied: 'block' }],
+      prerequisites: [{ producerTaskId: 'dep', requiredLifecycle: 'succeeded', onUnmet: 'block' }],
     };
     expect(canPromoteTurn(file, 't1', DEFAULT_RESOURCE_LIMITS)).toEqual({
       ok: false,
-      reason: 'dependencies not satisfied',
+      reason: 'prerequisites not met',
     });
   });
 
@@ -163,7 +185,7 @@ describe('scheduler', () => {
       lifecycle: 'open',
       goal: id,
       parentId,
-      dependencies: [],
+      prerequisites: [],
       backend,
       capabilities: [],
       executionPolicy: file.tasks.root!.executionPolicy,
@@ -243,7 +265,7 @@ describe('verdict-gated dependencies (verify-gate-loop Phase A)', () => {
       lifecycle: 'open',
       goal: 'g',
       parentId: 'root',
-      dependencies: [],
+      prerequisites: [],
       backend: 'fake',
       capabilities: [],
       executionPolicy: {
@@ -259,13 +281,13 @@ describe('verdict-gated dependencies (verify-gate-loop Phase A)', () => {
     };
   }
 
-  function gatedFile(dep: TaskDependency, producer: Partial<MusterTask>): EngineProjection {
+  function gatedFile(dep: TaskPrerequisite, producer: Partial<MusterTask>): EngineProjection {
     return {
       schemaVersion: 2,
       revision: 1,
       tasks: {
         verify: makeTask({ id: 'verify', ...producer }),
-        impl: makeTask({ id: 'impl', dependencies: [dep] }),
+        impl: makeTask({ id: 'impl', prerequisites: [dep] }),
       },
       turns: {},
       messages: {},
@@ -274,10 +296,10 @@ describe('verdict-gated dependencies (verify-gate-loop Phase A)', () => {
     };
   }
 
-  const failGate: TaskDependency = {
-    taskId: 'verify',
-    requiredOutcome: 'succeeded',
-    onUnsatisfied: 'fail',
+  const failGate: TaskPrerequisite = {
+    producerTaskId: 'verify',
+    requiredLifecycle: 'succeeded',
+    onUnmet: 'fail',
     requiredVerdict: 'pass',
   };
 
@@ -286,8 +308,8 @@ describe('verdict-gated dependencies (verify-gate-loop Phase A)', () => {
       lifecycle: 'succeeded',
       taskResult: { version: 1, revision: 1, summary: 's', verdict: verdict('fail') },
     });
-    expect(dependencyTerminalOutcome(file, 'impl')).toBe('failed');
-    expect(dependenciesBlockTask(file, 'impl')).toBe(true);
+    expect(prerequisiteTerminalLifecycle(file, 'impl')).toBe('failed');
+    expect(prerequisitesBlockTask(file, 'impl')).toBe(true);
   });
 
   it('an absent verdict on a succeeded producer also seals the dependent as failed', () => {
@@ -295,7 +317,7 @@ describe('verdict-gated dependencies (verify-gate-loop Phase A)', () => {
       lifecycle: 'succeeded',
       taskResult: { version: 1, revision: 1, summary: 's' },
     });
-    expect(dependencyTerminalOutcome(file, 'impl')).toBe('failed');
+    expect(prerequisiteTerminalLifecycle(file, 'impl')).toBe('failed');
   });
 
   it('a passing verdict satisfies the gate: no terminal seal and not blocked', () => {
@@ -303,31 +325,31 @@ describe('verdict-gated dependencies (verify-gate-loop Phase A)', () => {
       lifecycle: 'succeeded',
       taskResult: { version: 1, revision: 1, summary: 's', verdict: verdict('pass') },
     });
-    expect(dependencyTerminalOutcome(file, 'impl')).toBeUndefined();
-    expect(dependenciesBlockTask(file, 'impl')).toBe(false);
+    expect(prerequisiteTerminalLifecycle(file, 'impl')).toBeUndefined();
+    expect(prerequisitesBlockTask(file, 'impl')).toBe(false);
   });
 
-  it('onUnsatisfied:block with a failing verdict blocks but does not seal (Phase B remediation)', () => {
-    const blockGate: TaskDependency = { ...failGate, onUnsatisfied: 'block' };
+  it('onUnmet:block with a failing verdict blocks but does not seal (Phase B remediation)', () => {
+    const blockGate: TaskPrerequisite = { ...failGate, onUnmet: 'block' };
     const file = gatedFile(blockGate, {
       lifecycle: 'succeeded',
       taskResult: { version: 1, revision: 1, summary: 's', verdict: verdict('fail') },
     });
-    expect(dependencyTerminalOutcome(file, 'impl')).toBeUndefined();
-    expect(dependenciesBlockTask(file, 'impl')).toBe(true);
+    expect(prerequisiteTerminalLifecycle(file, 'impl')).toBeUndefined();
+    expect(prerequisitesBlockTask(file, 'impl')).toBe(true);
   });
 
   it('without requiredVerdict, a failing verdict is ignored (unchanged behavior)', () => {
-    const plainGate: TaskDependency = {
-      taskId: 'verify',
-      requiredOutcome: 'succeeded',
-      onUnsatisfied: 'fail',
+    const plainGate: TaskPrerequisite = {
+      producerTaskId: 'verify',
+      requiredLifecycle: 'succeeded',
+      onUnmet: 'fail',
     };
     const file = gatedFile(plainGate, {
       lifecycle: 'succeeded',
       taskResult: { version: 1, revision: 1, summary: 's', verdict: verdict('fail') },
     });
-    expect(dependencyTerminalOutcome(file, 'impl')).toBeUndefined();
-    expect(dependenciesBlockTask(file, 'impl')).toBe(false);
+    expect(prerequisiteTerminalLifecycle(file, 'impl')).toBeUndefined();
+    expect(prerequisitesBlockTask(file, 'impl')).toBe(false);
   });
 });

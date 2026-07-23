@@ -20,6 +20,8 @@ export const SQLITE_OPERATIONAL_CODES = [
   'foreign_database',
   'incompatible_schema',
   'nonempty_unclaimed',
+  /** Stale writer blocked by v8 writer-guard triggers / missing writer UDF. */
+  'schema_changed',
   'unknown',
 ] as const;
 
@@ -126,9 +128,11 @@ export function safeMessageForCode(code: SqliteErrorCode): string {
     case 'foreign_database':
       return 'Muster refused to open a database owned by another application.';
     case 'incompatible_schema':
-      return 'Muster development database schema is incompatible or incomplete. Close all Muster windows, then use the coordinated reset when available; do not manually delete main/-wal/-shm files separately.';
+      return 'Muster development database schema is incompatible or incomplete.';
     case 'nonempty_unclaimed':
       return 'Muster refused to claim a non-empty unclaimed SQLite file; reset or remove it.';
+    case 'schema_changed':
+      return 'Muster storage schema was upgraded in another window. Reload this window to continue.';
     case 'constraint':
       return 'Muster rejected the write because a database constraint was violated.';
     case 'capacity':
@@ -149,7 +153,8 @@ export type SqliteRecoveryAction =
   | 'reveal_storage'
   | 'free_disk_space'
   | 'check_permissions'
-  | 'close_other_windows';
+  | 'close_other_windows'
+  | 'reload_window';
 
 export function recoveryActionForCode(code: SqliteErrorCode): SqliteRecoveryAction {
   switch (code) {
@@ -159,6 +164,8 @@ export function recoveryActionForCode(code: SqliteErrorCode): SqliteRecoveryActi
       return 'free_disk_space';
     case 'readonly':
       return 'check_permissions';
+    case 'schema_changed':
+      return 'reload_window';
     case 'corrupt':
     case 'not_a_database':
     case 'incompatible_schema':
@@ -172,7 +179,11 @@ export function recoveryActionForCode(code: SqliteErrorCode): SqliteRecoveryActi
 
 /** True for storage faults that must latch the client terminal (no further writes). */
 export function isTerminalStorageCode(code: SqliteErrorCode): boolean {
-  return code === 'corrupt' || code === 'not_a_database';
+  return (
+    code === 'corrupt' ||
+    code === 'not_a_database' ||
+    code === 'schema_changed'
+  );
 }
 
 export type SafeSerializedDbError = {
@@ -343,6 +354,10 @@ export function mapToMusterSqliteError(
     return new MusterSqliteError('corrupt', operation === 'unknown' ? 'open' : operation);
   }
   if (primary === SQLITE_PRIMARY.CONSTRAINT || code.startsWith('SQLITE_CONSTRAINT')) {
+    // Writer-guard RAISE(ABORT, 'schema_changed') surfaces as CONSTRAINT_TRIGGER.
+    if (/\bschema_changed\b/i.test(combined)) {
+      return new MusterSqliteError('schema_changed', operation);
+    }
     if (/capacity/i.test(combined)) {
       return new MusterDomainError('capacity', operation);
     }
@@ -350,6 +365,13 @@ export function mapToMusterSqliteError(
   }
 
   // Conservative message fallback (secondary only).
+  // Stale v7 connections lack muster_writer_version(); treat as schema_changed fence.
+  if (
+    /\bschema_changed\b/i.test(combined) ||
+    /no such function:\s*muster_writer_version/i.test(combined)
+  ) {
+    return new MusterSqliteError('schema_changed', operation);
+  }
   if (/send outbox capacity reached/i.test(combined)) {
     return new MusterDomainError('capacity', operation);
   }

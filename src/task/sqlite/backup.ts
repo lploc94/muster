@@ -227,7 +227,10 @@ function captureWorkspaceRevision(db: DatabaseSync): number {
 /**
  * Read-only verification — never calls openStoreDatabase (no stamp/WAL/bootstrap).
  */
-export function verifyBackupArtifact(artifactPath: string): {
+export function verifyBackupArtifact(
+  artifactPath: string,
+  expectedSchemaVersion: number = SQLITE_SCHEMA_VERSION,
+): {
   schemaVersion: number;
   workspaceRevision: number;
   byteSize: number;
@@ -240,7 +243,7 @@ export function verifyBackupArtifact(artifactPath: string): {
       throw new MusterSqliteError('foreign_database', 'backup');
     }
     const schemaVersion = readScalar(db, 'user_version');
-    if (schemaVersion !== SQLITE_SCHEMA_VERSION) {
+    if (schemaVersion !== expectedSchemaVersion) {
       throw new MusterSqliteError('incompatible_schema', 'backup');
     }
     const fingerprint = findSchemaFingerprintFailure(db);

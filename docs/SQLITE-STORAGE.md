@@ -152,10 +152,18 @@ actions stay available.
 
 ---
 
-## 8. Verification (contributors)
+## 8. Schema v8 and migration notes
+
+- Current owned schema is **v8**. Opening a populated **v7** store migrates under `BEGIN EXCLUSIVE`
+  with commit-boundary rollback; injected migration failure leaves readable v7 unchanged.
+- v8 adds workflow definition/run/node/gate tables and registers writer-version UDF + write-guard
+  triggers so already-open v7 connections fail closed with terminal `schema_changed` (Reload Window).
+- Diagnostics never expose database paths, SQL/parameters, credentials, prompt text, or artifact bodies.
+
+## 9. Verification (contributors)
 
 ```bash
 npm run test:sqlite-storage-docs
-npx vitest run src/task/sqlite/privacy-redaction.test.ts
+npx vitest run src/task/sqlite/privacy-redaction.test.ts src/task/sqlite/migration-v8.test.ts
 npm run test:source-boundary && npm run test:source-boundary:fixtures
 ```

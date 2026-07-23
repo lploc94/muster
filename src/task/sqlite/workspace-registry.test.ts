@@ -25,8 +25,8 @@ describe('WorkspaceRegistry', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-workspace-registry-'));
     dirs.push(dir);
     const dbPath = path.join(dir, 'muster.sqlite3');
-    // Open/migrate sequentially. The test below is about registry contention;
-    // a fresh-file schema migration race has its own connection test suite.
+    // Open sequentially. The test below is about registry contention;
+    // concurrent fresh-file creation has its own connection test suite.
     const firstClient = await clientFor(dbPath);
     const secondClient = await clientFor(dbPath);
     const identity = {

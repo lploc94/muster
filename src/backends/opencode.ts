@@ -50,6 +50,7 @@ const OPENCODE_SPEC: AcpAdapterSpec = {
   },
   toolKind: (update) => (update.kind === 'mcp' ? 'mcp' : 'builtin'),
   errorPassthrough: ['OpenCode agent exited', 'not running'],
+  lateUpdateDrainMs: 100,
 };
 
 export class OpenCodeBackend implements Backend {

@@ -30,9 +30,15 @@ describe('task-types host config', () => {
     expect(entry.default.plan?.backend).toBe('codex');
     expect(entry.default.implement?.backend).toBe('grok');
     expect(entry.default.coordinate?.backend).toBe('opencode');
+    expect(entry.default.explore).toMatchObject({
+      backend: 'opencode',
+      briefKind: 'research',
+    });
     // Ship defaults omit model pins
     expect((entry.default.plan as { model?: string }).model).toBeUndefined();
+    expect((entry.default.explore as { model?: string }).model).toBeUndefined();
     expect(MUSTER_DEFAULT_TASK_TYPES.plan?.backend).toBe('codex');
+    expect(MUSTER_DEFAULT_TASK_TYPES.explore?.backend).toBe('opencode');
   });
 
   it('round-trips a valid map via mock reader', () => {
@@ -122,12 +128,13 @@ describe('task-types host config', () => {
     expect(r.code).toBe('invalid_task_type_config');
   });
 
-  it('rowsToTaskTypesMap round-trips model pins', () => {
+  it('rowsToTaskTypesMap round-trips model pins and fallback chains', () => {
     const map = rowsToTaskTypesMap([
       {
         id: 'plan',
         backend: 'codex',
         model: 'gpt-5.5',
+        fallbacks: [{ backend: 'opencode' }, { backend: 'grok', model: 'grok-4' }],
         role: 'worker',
         briefKind: 'plan',
       },
@@ -135,6 +142,7 @@ describe('task-types host config', () => {
     expect(map.plan).toMatchObject({
       backend: 'codex',
       model: 'gpt-5.5',
+      fallbacks: [{ backend: 'opencode' }, { backend: 'grok', model: 'grok-4' }],
       role: 'worker',
       briefKind: 'plan',
     });
@@ -221,6 +229,7 @@ describe('task-types host config', () => {
     // manifest). Seed the baked-in defaults instead of an empty/undefined map so the panel
     // stays valid and create/delegate is not blocked.
     expect(pickExplicitTaskTypesValue({})).toEqual(MUSTER_DEFAULT_TASK_TYPES);
+    expect(pickExplicitTaskTypesValue(undefined)).toEqual(MUSTER_DEFAULT_TASK_TYPES);
     expect(
       pickExplicitTaskTypesValue({
         workspaceFolderValue: undefined,

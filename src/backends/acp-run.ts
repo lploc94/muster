@@ -61,6 +61,8 @@ export interface AcpAdapterSpec {
   readonly failureStopReasons: ReadonlySet<string>;
   /** Empty `agent_message_chunk`/`agent_thought_chunk`: `'drop'` skips it, `'raw'` emits a raw event. */
   readonly emptyChunk: EmptyChunkMode;
+  /** Synthetic assistant chunks that represent context compaction rather than model prose. */
+  readonly contextCompactionChunks?: readonly string[];
   /** Whether a `usage_update` session update maps to a usage event (else it falls through to `raw`). */
   readonly mapUsageUpdate: boolean;
   /** Post-turn usage: which result field to read the keys from, and which keys to surface. */
@@ -71,6 +73,11 @@ export interface AcpAdapterSpec {
   readonly errorPassthrough: readonly string[];
   /** Config option id used for model selection (default `'model'`); passed as `configId` to `session/set_config_option`. */
   readonly modelConfigId?: string;
+  /**
+   * OpenCode can flush session/update notifications after the session/prompt
+   * response. Wait for a bounded quiet window before emitting the terminal.
+   */
+  readonly lateUpdateDrainMs?: number;
 }
 
 /** Every ACP adapter advertises the same capabilities. */
@@ -84,13 +91,14 @@ function cancellationTerminal(): NormalizedEvent {
   return { type: 'error', message: 'Turn cancelled', isCancellation: true };
 }
 
-/** Pull the first text block out of an ACP `tool_call_update` `content` array. */
-function extractToolOutput(content: unknown): string | undefined {
-  if (!Array.isArray(content)) return undefined;
+/** Pull displayable output from an ACP `tool_call_update`. */
+function extractToolOutput(update: SessionUpdate): unknown {
+  const content = update.content;
+  if (!Array.isArray(content)) return update.rawOutput;
   const textBlock = content.find((c) => (c as { type?: string }).type === 'content') as
     | { content?: { type?: string; text?: string } }
     | undefined;
-  return textBlock?.content?.text;
+  return textBlock?.content?.text ?? update.rawOutput;
 }
 
 /** Map an `agent_message_chunk` / `agent_thought_chunk` to its delta (or raw / dropped). */
@@ -102,6 +110,12 @@ function chunkEvent(
 ): NormalizedEvent | undefined {
   const text = (update.content as { text?: string } | undefined)?.text;
   if (typeof text === 'string') {
+    if (
+      type === 'assistantDelta' &&
+      spec.contextCompactionChunks?.includes(text.trim())
+    ) {
+      return { type: 'usage', usage: { compacted: true } };
+    }
     if (text.length > 0) return { type, content: text, messageId };
     // Empty string: some adapters drop it, others surface it as raw noise.
     return spec.emptyChunk === 'drop' ? undefined : { type: 'raw', line: JSON.stringify(update) };
@@ -165,11 +179,16 @@ function mapSessionUpdate(
           : (meta?.updateParams as { status?: string } | undefined)?.status;
       const status = statusRaw?.toLowerCase();
       if (status === 'completed' || status === 'failed') {
-        const outputText = extractToolOutput(update.content);
+        const output = extractToolOutput(update);
         if (status === 'failed') {
-          return { type: 'toolCompleted', toolCallId, outcome: 'error', error: outputText ?? 'Tool failed', meta };
+          const error = typeof output === 'string'
+            ? output
+            : output === undefined
+              ? 'Tool failed'
+              : JSON.stringify(output);
+          return { type: 'toolCompleted', toolCallId, outcome: 'error', error, meta };
         }
-        return { type: 'toolCompleted', toolCallId, outcome: 'success', output: outputText, meta };
+        return { type: 'toolCompleted', toolCallId, outcome: 'success', output, meta };
       }
       return { type: 'toolUpdated', toolCallId, input: update.rawInput, meta };
     }
@@ -274,7 +293,9 @@ export async function* runAcpTurn(
   options.signal?.addEventListener('abort', onAbort);
 
   const pendingUpdates: NormalizedEvent[] = [];
+  let updateVersion = 0;
   const bufferUpdate = (update: SessionUpdate) => {
+    updateVersion += 1;
     const mapped = mapSessionUpdate(update, messageId, spec);
     if (mapped) pendingUpdates.push(mapped);
   };
@@ -432,6 +453,43 @@ export async function* runAcpTurn(
         ]);
 
         if (race.kind === 'tick') continue;
+
+        while (pendingUpdates.length > 0) {
+          yield pendingUpdates.shift()!;
+        }
+
+        // OpenCode 1.2.x can resolve session/prompt before its final
+        // session/update notifications are flushed (upstream #17505). Keep
+        // the session sink registered through a bounded quiet window so late
+        // assistant chunks are not orphaned behind the terminal event.
+        const lateUpdateDrainMs = spec.lateUpdateDrainMs;
+        if (lateUpdateDrainMs !== undefined && lateUpdateDrainMs > 0) {
+          const waitForDrainTick = (): Promise<void> =>
+            new Promise((resolve) => {
+              let settled = false;
+              let timer: ReturnType<typeof setTimeout> | undefined;
+              const finish = () => {
+                if (settled) return;
+                settled = true;
+                if (timer) clearTimeout(timer);
+                options.signal?.removeEventListener('abort', finish);
+                resolve();
+              };
+              timer = setTimeout(finish, lateUpdateDrainMs);
+              if (isAborted()) finish();
+              else options.signal?.addEventListener('abort', finish, { once: true });
+            });
+          const deadline = Date.now() + lateUpdateDrainMs * 5;
+          let quietVersion = updateVersion;
+          while (Date.now() < deadline && !isAborted()) {
+            await waitForDrainTick();
+            if (isAborted() || updateVersion === quietVersion) break;
+            quietVersion = updateVersion;
+            while (pendingUpdates.length > 0) {
+              yield pendingUpdates.shift()!;
+            }
+          }
+        }
 
         while (pendingUpdates.length > 0) {
           yield pendingUpdates.shift()!;

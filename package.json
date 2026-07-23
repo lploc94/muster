@@ -123,6 +123,30 @@
           "scope": "resource",
           "description": "Maximum concurrent agent turns under a single root task tree. Applies on each scheduling pass; already-running turns are not preempted when lowered."
         },
+        "muster.execution.fallbacks": {
+          "type": "array",
+          "default": [],
+          "maxItems": 8,
+          "scope": "resource",
+          "description": "Ordered backend/model fallbacks used after safe same-backend retries are exhausted. Each binding is attempted at most once per recovery chain.",
+          "items": {
+            "type": "object",
+            "required": [
+              "backend"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "backend": {
+                "type": "string",
+                "description": "ACP backend id."
+              },
+              "model": {
+                "type": "string",
+                "description": "Optional model id; omit to use the backend default."
+              }
+            }
+          }
+        },
         "muster.retention.maxRetainedTurnsPerTask": {
           "type": "number",
           "default": 200,
@@ -174,6 +198,11 @@
               "backend": "codex",
               "briefKind": "breakdown"
             },
+            "explore": {
+              "description": "Explore the codebase with read/search tools and report findings",
+              "backend": "opencode",
+              "briefKind": "research"
+            },
             "implement": {
               "description": "Apply the plan with minimal correct changes",
               "backend": "grok",
@@ -205,6 +234,26 @@
               "model": {
                 "type": "string",
                 "description": "Optional ACP model id for this type."
+              },
+              "fallbacks": {
+                "type": "array",
+                "maxItems": 8,
+                "description": "Task-type-specific ordered fallback chain. An explicit empty array disables global fallbacks for this type.",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "backend"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "backend": {
+                      "type": "string"
+                    },
+                    "model": {
+                      "type": "string"
+                    }
+                  }
+                }
               },
               "role": {
                 "type": "string",
@@ -268,6 +317,7 @@
     "mvp:codex": "tsx scripts/test-codex.ts",
     "mvp:opencode": "tsx scripts/test-opencode.ts",
     "smoke:child-model-opencode": "npm run compile && node scripts/smoke-child-model-opencode.mjs",
+    "smoke:opencode-multi-session": "npm run compile && node scripts/smoke-opencode-multi-session.mjs",
     "vendor:codex-acp": "node scripts/vendor-codex-acp.mjs",
     "vendor:claude-acp": "node scripts/vendor-claude-acp.mjs",
     "mvp:task": "tsx scripts/test-task.ts",

@@ -19,7 +19,7 @@ import {
 } from '../bridge/mcp-fault-fixture.testkit';
 
 /** Disposition tools that a failed MCP registry is missing. */
-export const MUSTER_DISPOSITION_TOOLS = ['complete_task', 'fail_task'] as const;
+export const MUSTER_DISPOSITION_TOOLS = ['workflow_next', 'workflow_fail'] as const;
 
 export type MusterDispositionTool = (typeof MUSTER_DISPOSITION_TOOLS)[number];
 

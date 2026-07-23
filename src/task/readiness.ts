@@ -3,7 +3,7 @@
  * Pure helpers — no engine/store I/O beyond the file snapshot passed in.
  */
 
-import { evaluateDependency } from './deps';
+import { evaluatePrerequisite } from './prerequisites';
 import { effectiveTaskResult } from './dataflow';
 import type { MusterTask, EngineProjection, TaskTurn } from './types';
 
@@ -14,7 +14,7 @@ export type ReadinessCode =
   | 'waiting_user'
   | 'draft'
   | 'paused_not_released'
-  | 'waiting_dependencies'
+  | 'waiting_prerequisites'
   | 'missing_input_binding'
   | 'waiting_resource'
   | 'path_conflict'
@@ -49,20 +49,20 @@ function turnsForTask(file: EngineProjection, taskId: string): TaskTurn[] {
   return Object.values(file.turns).filter((t) => t.taskId === taskId);
 }
 
-function depBlockReasons(file: EngineProjection, task: MusterTask): ReadinessReason[] {
+function prerequisiteBlockReasons(file: EngineProjection, task: MusterTask): ReadinessReason[] {
   const reasons: ReadinessReason[] = [];
-  for (const dep of task.dependencies) {
-    const producer = file.tasks[dep.taskId];
-    const outcome = evaluateDependency(
-      dep,
+  for (const prerequisite of task.prerequisites) {
+    const producer = file.tasks[prerequisite.producerTaskId];
+    const outcome = evaluatePrerequisite(
+      prerequisite,
       producer?.lifecycle,
       producer?.taskResult?.verdict?.status,
     );
-    if (outcome !== 'satisfied') {
+    if (outcome !== 'met') {
       reasons.push({
-        code: 'waiting_dependencies',
-        message: `dependency ${dep.taskId} not satisfied (${outcome})`,
-        detail: { dependencyTaskId: dep.taskId, outcome },
+        code: 'waiting_prerequisites',
+        message: `prerequisite ${prerequisite.producerTaskId} not met (${outcome})`,
+        detail: { producerTaskId: prerequisite.producerTaskId, outcome },
       });
     }
   }
@@ -159,7 +159,7 @@ export function evaluateTaskReadiness(file: EngineProjection, taskId: string): T
     });
   }
 
-  reasons.push(...depBlockReasons(file, task));
+  reasons.push(...prerequisiteBlockReasons(file, task));
   const inputReasons = missingInputReasons(file, task);
   reasons.push(...inputReasons);
 
@@ -195,7 +195,7 @@ export function evaluateTaskReadiness(file: EngineProjection, taskId: string): T
     reasons.some((r) =>
       (
         [
-          'waiting_dependencies',
+          'waiting_prerequisites',
           'waiting_children',
           'waiting_external',
           'handoff_active',
@@ -244,8 +244,8 @@ export function readinessToPromoteReason(readiness: TaskReadiness): string | und
     case 'draft':
     case 'paused_not_released':
       return 'task not released';
-    case 'waiting_dependencies':
-      return 'dependencies not satisfied';
+    case 'waiting_prerequisites':
+      return 'prerequisites not met';
     case 'missing_input_binding':
       return 'missing required input binding';
     case 'waiting_children':

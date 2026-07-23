@@ -14,15 +14,17 @@ import {
 import type { ResolvedInputPin, TaskBriefKind, TaskBriefV1 } from './types';
 
 /** Max chars for a single compiled prompt section. */
-export const BRIEF_SECTION_MAX = 8_192;
+export const BRIEF_SECTION_MAX = 262_144;
 /** Max chars for the entire compiled first prompt. */
-export const COMPILED_PROMPT_MAX = 48_000;
+export const COMPILED_PROMPT_MAX = 524_288;
 /** Max items in a brief list section. */
 export const BRIEF_LIST_MAX_ITEMS = 32;
+/** Max chars for one free-text item in a brief list. */
+export const BRIEF_LIST_ITEM_MAX = 8_192;
 
 const KIND_PREAMBLES: Readonly<Record<TaskBriefKind, string>> = {
   coordinate:
-    'You are coordinating a multi-task workflow. Create a clear plan graph, wait for children, and seal only via host policy. When the user asks for a plan/spec (or a plan is ready for review), you MUST call MCP `upsert_presentation` with the full plan markdown in that same turn — do not only reply with chat text. Use stable presentationId, ownerTaskId=self.taskId, unique opId, revision starting at 1, kind=`plan` or `spec`, optional short summary. Never set sourcePath/sourceFolderUri/updatedAt (host-owned). When a step must be verified, delegate a verify task that depends on the work and have downstream tasks depend on that verify task; a non-pass verdict then blocks downstream and auto-remediation attempts a bounded fix.',
+    'You are coordinating a multi-task workflow. Create a clear plan graph, wait for children, and seal only via host policy. When the user asks for a plan/spec (or a plan is ready for review), you MUST call MCP `upsert_presentation` with a title and the full plan markdown in that same turn — do not only reply with chat text. The host returns a presentationRef; pass it only when refreshing that same document. Never set identity, owner, operation, revision, sourcePath, sourceFolderUri, or updatedAt fields (host-owned). When a step must be verified, delegate a verify task that depends on the work and have downstream tasks depend on that verify task; a non-pass verdict then blocks downstream and auto-remediation attempts a bounded fix.',
   plan: 'You are a planning agent. Produce a concrete, actionable plan as markdown suitable for implementers and for the parent to present (headings, checklist, optional ```mermaid``` diagram). Put the full plan in your task summary; do not assume you can open IDE tabs.',
   breakdown:
     'You are a work-breakdown agent. Decompose the plan into an ordered checklist of small, independent implementation tasks. For each item give: a one-line goal, its taskType, which earlier items it depends on, which earlier outputs it consumes, and acceptance criteria. Prefer parallelizable, minimal items. Emit the checklist in a strict, compact, machine-readable form. For any item that must be verified, emit a verify step depending on that work and mark its dependents as depending on the verify step so a failing verdict blocks them.',
@@ -102,9 +104,12 @@ export type TaskBriefOverlay = {
  * opts in via `verification.hostRun` or `verification.emitVerdict`.
  */
 const VERDICT_INSTRUCTION_SECTION =
-  "# Verdict\nWhen you finish, call complete_task with a structured verdict {status:'pass'|'fail'|'inconclusive', rationale, criteria[]}. Missing checks or missing evidence => 'inconclusive', never a default 'pass'.";
+  "# Verdict\nWhen you finish a workflow activation, you may call workflow_next with a final message that reports a structured verdict: status ('pass', 'fail', or 'inconclusive'), rationale, and checked criteria. Missing checks or missing evidence => 'inconclusive', never a default 'pass'. Use workflow_prev when a producer must revise; use workflow_fail only when the required workflow result cannot be produced. NEXT/PREV commit that message and end the turn. If you do not call a workflow disposition, the host forwards your final assistant message as an updated NEXT result.";
 
-function clampStringList(items: readonly string[] | undefined, itemMax = 500): string[] | undefined {
+function clampStringList(
+  items: readonly string[] | undefined,
+  itemMax = BRIEF_LIST_ITEM_MAX,
+): string[] | undefined {
   if (!items) return undefined;
   return items
     .slice(0, BRIEF_LIST_MAX_ITEMS)
@@ -267,7 +272,11 @@ export interface CompileTaskPromptMeta {
   goal?: string;
 }
 
-function formatListSection(title: string, items: readonly string[], itemMax = 500): string {
+function formatListSection(
+  title: string,
+  items: readonly string[],
+  itemMax = BRIEF_LIST_ITEM_MAX,
+): string {
   const capped = items.slice(0, BRIEF_LIST_MAX_ITEMS);
   let body = capped.map((g) => `- ${clampSection(g, itemMax)}`).join('\n');
   if (body.length > BRIEF_SECTION_MAX) {
@@ -313,10 +322,10 @@ export function compileBriefBody(
   if (brief.verification?.commands?.length || brief.verification?.manualChecks?.length) {
     const lines: string[] = [];
     for (const cmd of brief.verification.commands ?? []) {
-      lines.push(`- command: ${clampSection(cmd, 500)}`);
+      lines.push(`- command: ${clampSection(cmd, BRIEF_LIST_ITEM_MAX)}`);
     }
     for (const check of brief.verification.manualChecks ?? []) {
-      lines.push(`- check: ${clampSection(check, 500)}`);
+      lines.push(`- check: ${clampSection(check, BRIEF_LIST_ITEM_MAX)}`);
     }
     let body = lines.join('\n');
     if (body.length > BRIEF_SECTION_MAX) body = body.slice(0, BRIEF_SECTION_MAX);
@@ -340,7 +349,7 @@ export function compileBriefBody(
 /**
  * Compile first-turn prompt from brief + durable resolved input pins.
  * Pins are framed as untrusted data (not instructions).
- * Legacy API: still end-slices if over max (prefer assembleFirstTurnPrompt for budgeted assembly).
+ * Legacy API: rejects oversize instead of returning a silently incomplete prompt.
  */
 export function compileTaskPrompt(
   brief: TaskBriefV1,
@@ -355,9 +364,11 @@ export function compileTaskPrompt(
     parts.push(pinned);
   }
 
-  let compiled = parts.join('\n\n');
+  const compiled = parts.join('\n\n');
   if (compiled.length > COMPILED_PROMPT_MAX) {
-    compiled = compiled.slice(0, COMPILED_PROMPT_MAX);
+    throw new Error(
+      `Compiled task prompt exceeds ${COMPILED_PROMPT_MAX} characters (${compiled.length})`,
+    );
   }
   return compiled;
 }

@@ -44,9 +44,18 @@ import {
 
 export const CREDENTIAL_DEADLINE_BUFFER_MS = 5 * 60_000;
 export const ACP_DEADLINE_BUFFER_MS = 90_000;
-import { evaluateTaskReadiness } from './readiness';
 import { canPromoteTurn } from './scheduler';
 import type { GraphCommandKind, RepositoryCommand, TaskRepository } from './repository';
+import { durableDispositionClaim } from './disposition-claim';
+import type {
+  WorkflowDefinitionV1,
+  WorkflowPolicyV1,
+} from './workflow-types';
+import { validateDefineWorkflow } from './workflow';
+import {
+  deriveDefaultWorkflowPolicy,
+  fingerprintWorkflowDefinition,
+} from './workflow-codec';
 import type { TaskReadPort } from './store-port';
 import {
   createTask,
@@ -66,14 +75,15 @@ import {
   setTaskLifecycle as transitionSetTaskLifecycle,
   type CreateTaskInput,
 } from './transitions';
-import type { DepGraph } from './deps';
+import type { PrerequisiteGraph } from './prerequisites';
 import type {
   MusterTask,
   OpResult,
   TaskCapability,
-  TaskDependency,
+  TaskPrerequisite,
   TaskExecutionPolicy,
   TaskInputBinding,
+  TaskLifecycleAuthority,
   EngineProjection,
   TaskTurn,
 } from './types';
@@ -126,7 +136,7 @@ function stageCompoundWait(
   };
 }
 
-function depGraphFromFile(file: EngineProjection): DepGraph {
+function prerequisiteGraphFromFile(file: EngineProjection): PrerequisiteGraph {
   return {
     rootOf: (taskId) => {
       const task = file.tasks[taskId];
@@ -139,7 +149,8 @@ function depGraphFromFile(file: EngineProjection): DepGraph {
       }
       return current.id;
     },
-    dependsOn: (taskId) => file.tasks[taskId]?.dependencies.map((d) => d.taskId) ?? [],
+    prerequisitesOf: (taskId) =>
+      file.tasks[taskId]?.prerequisites.map((prerequisite) => prerequisite.producerTaskId) ?? [],
     briefKindOf: (taskId) => file.tasks[taskId]?.brief?.kind,
   };
 }
@@ -225,16 +236,6 @@ function findRootId(file: EngineProjection, taskId: string): string {
   return current.id;
 }
 
-function isDescendantOf(file: EngineProjection, ancestorId: string, taskId: string): boolean {
-  let current = file.tasks[taskId];
-  while (current) {
-    if (current.id === ancestorId) return true;
-    if (!current.parentId) return false;
-    current = file.tasks[current.parentId];
-  }
-  return false;
-}
-
 function descendantIds(file: EngineProjection, rootId: string): string[] {
   const result: string[] = [];
   const stack = [rootId];
@@ -316,13 +317,231 @@ export interface GraphEngineDeps {
     kind: 'interrupt' | 'cancel',
     by: string,
     opId: string,
-    sealedBy?: import('./types').TaskSealedBy,
+    lifecycleAuthority?: TaskLifecycleAuthority,
   ) => void;
   onTurnSettled?: (turnId: string) => void;
+  onWorkflowStartAccepted?: (input: {
+    runId: string;
+    ownerRootTaskId: string;
+    callerTaskId: string;
+    callerTurnId: string;
+  }) => void;
+  onWorkflowRouteAccepted?: (input: {
+    callerTurnId: string;
+    kind: 'workflow_next' | 'workflow_prev';
+    message: string;
+  }) => void;
 }
 
 function nowIso(clock?: () => string): string {
   return clock?.() ?? new Date().toISOString();
+}
+
+const WORKFLOW_TASK_CAPABILITIES = new Set<TaskCapability>([
+  'create_child',
+  'start_child',
+  'wait_child',
+  'interrupt_child',
+  'cancel_child',
+  'read_subtree',
+]);
+
+function freezeWorkflowDefinitionRouting(
+  deps: GraphEngineDeps,
+  caller: MusterTask,
+  definition: WorkflowDefinitionV1,
+): { ok: true; definition: WorkflowDefinitionV1 } | { ok: false; error: string } {
+  const cwd = caller.cwd ?? deps.workspaceFolder;
+  const registry = deps.getTaskTypeRegistry
+    ? deps.getTaskTypeRegistry(cwd)
+    : parseTaskTypeRegistry(undefined);
+  const nodes = [];
+  for (const node of definition.topology.nodes) {
+    if (!node.taskType) {
+      nodes.push(node);
+      continue;
+    }
+    const resolved = resolveCreateChildSpec({
+      taskType: node.taskType,
+      backend: node.backend,
+      model: node.model,
+      role: node.role,
+    }, registry);
+    if (!resolved.ok) return workflowHostPolicyError(resolved.code, resolved.message);
+    const capabilities = node.capabilities ?? (
+      resolved.resolved.role === 'coordinator' ? [...WORKFLOW_TASK_CAPABILITIES] : []
+    );
+    nodes.push({
+      ...node,
+      role: resolved.resolved.role,
+      backend: resolved.resolved.backend,
+      ...(resolved.resolved.model !== undefined ? { model: resolved.resolved.model } : {}),
+      capabilities,
+    });
+  }
+  const topology = definition.topology.kind === 'one_node_v1'
+    ? { ...definition.topology, nodes: [nodes[0]!] as [typeof nodes[number]] }
+    : { ...definition.topology, nodes };
+  const validated = validateDefineWorkflow({ ...definition, topology });
+  return validated.ok
+    ? { ok: true, definition: validated.definition }
+    : workflowHostPolicyError('invalid_workflow_definition', validated.reason);
+}
+
+function workflowHostPolicyError(code: string, message: string): {
+  ok: false;
+  error: string;
+} {
+  return { ok: false, error: JSON.stringify({ code, message }) };
+}
+
+function validateWorkflowDefinitionHostRequirements(
+  deps: GraphEngineDeps,
+  caller: MusterTask,
+  definition: WorkflowDefinitionV1,
+  defaultBackend?: string,
+): { ok: true } | { ok: false; error: string } {
+  const host = deps.getHostEnvironment?.();
+  const availableBackends = host ? new Set(host.availableBackends) : undefined;
+  for (const node of definition.topology.nodes) {
+    const backend = node.backend ?? defaultBackend;
+    const role = node.role ?? 'worker';
+    const capabilities = node.capabilities ?? [];
+    if (capabilities.some((capability) => !WORKFLOW_TASK_CAPABILITIES.has(capability as TaskCapability))) {
+      return workflowHostPolicyError(
+        'workflow_capability_unsupported',
+        `workflow node ${node.nodeId} requires an unsupported capability`,
+      );
+    }
+    if (role !== 'coordinator' && capabilities.length > 0) {
+      return workflowHostPolicyError(
+        'workflow_capability_role_mismatch',
+        `worker workflow node ${node.nodeId} cannot receive coordinator capabilities`,
+      );
+    }
+    if (backend === undefined) {
+      if (node.model !== undefined) {
+        return workflowHostPolicyError(
+          'workflow_model_without_backend',
+          `workflow node ${node.nodeId} specifies a model without frozen backend routing`,
+        );
+      }
+      continue;
+    }
+    if (!isKnownBackendId(backend)) {
+      return workflowHostPolicyError('backend_unsupported', `unsupported backend: ${backend}`);
+    }
+    if (availableBackends && !availableBackends.has(backend)) {
+      return workflowHostPolicyError('backend_unavailable', `backend is unavailable: ${backend}`);
+    }
+    let backendInstance: Backend;
+    try {
+      backendInstance = deps.makeBackend(backend);
+    } catch {
+      return workflowHostPolicyError('backend_unsupported', `unsupported backend: ${backend}`);
+    }
+    if (!canBindTaskToBackend(backendInstance.capabilities)) {
+      return workflowHostPolicyError('backend_not_mcp', `backend does not support MCP: ${backend}`);
+    }
+    if (node.model && host?.models[backend]?.options.length) {
+      const models = new Set(host.models[backend]!.options.map((model) => model.value));
+      if (!models.has(node.model)) {
+        return workflowHostPolicyError(
+          'model_unavailable',
+          `model is unavailable for workflow node ${node.nodeId}`,
+        );
+      }
+    }
+  }
+  return { ok: true };
+}
+
+async function prepareWorkflowStart(
+  deps: GraphEngineDeps,
+  ctx: { callerTaskId: string; rootId: string },
+  input: {
+    definitionId: string;
+    version: number;
+    backend?: string;
+    useCallerBackendDefault?: boolean;
+  },
+  limits: ResourceLimits,
+): Promise<
+  | { ok: true; effectivePolicy: WorkflowPolicyV1 }
+  | { ok: false; error: string }
+> {
+  if (deps.isWorkspaceTrusted?.() === false || deps.getHostEnvironment?.()?.trusted === false) {
+    return workflowHostPolicyError(
+      'workspace_untrusted',
+      'workspace is not trusted; cannot start workflows',
+    );
+  }
+  const caller = await deps.repository.getTask(ctx.callerTaskId);
+  if (!caller || caller.lifecycle !== 'open') {
+    return workflowHostPolicyError('caller_not_open', 'caller task is not open');
+  }
+  const definition = await deps.repository.getWorkflowDefinition(input.definitionId, input.version);
+  if (!definition) {
+    return workflowHostPolicyError('definition_not_found', 'workflow definition not found');
+  }
+  if (
+    definition.scope.kind === 'root' &&
+    definition.scope.ownerRootTaskId !== ctx.rootId
+  ) {
+    return workflowHostPolicyError('workflow_scope_denied', 'workflow definition is owned by another root');
+  }
+
+  const file = deps.store.getFile();
+  const parentDepth = taskDepth(file, ctx.callerTaskId);
+  const availableDepth = limits.maxDepth - parentDepth - 1;
+  const remainingForParent = limits.maxChildrenPerTask - countChildren(file, ctx.callerTaskId);
+  const remainingForRoot = limits.maxChildrenPerRoot - countRootChildren(file, ctx.rootId);
+  const availableTaskCount = Math.min(remainingForParent, remainingForRoot);
+  const hostWorkflowTaskLimit = Math.min(
+    limits.maxChildrenPerTask,
+    limits.maxChildrenPerRoot,
+  );
+  if (availableDepth < 1) {
+    return workflowHostPolicyError('max_depth_exceeded', 'workflow start exceeds host depth limit');
+  }
+  if (definition.topology.nodes.length > availableTaskCount) {
+    return workflowHostPolicyError(
+      'max_task_count_exceeded',
+      'workflow start exceeds host task-count limit',
+    );
+  }
+
+  const defaultBackend = input.backend ?? (input.useCallerBackendDefault ? caller.backend : 'grok');
+  const requirements = validateWorkflowDefinitionHostRequirements(
+    deps,
+    caller,
+    definition,
+    defaultBackend,
+  );
+  if (!requirements.ok) return requirements;
+
+  const effectivePolicy: WorkflowPolicyV1 = {
+    ...definition.policy,
+    maxTurnsPerTask: Math.min(definition.policy.maxTurnsPerTask, limits.maxTurnsPerTask),
+    maxDepth: Math.min(definition.policy.maxDepth, availableDepth),
+    maxTaskCount: Math.min(definition.policy.maxTaskCount, hostWorkflowTaskLimit),
+    maxConcurrency: Math.min(
+      definition.policy.maxConcurrency,
+      limits.maxConcurrentTurns,
+      limits.maxConcurrentPerRoot,
+      limits.maxConcurrentPerBackend,
+    ),
+  };
+  if (
+    definition.topology.nodes.length > effectivePolicy.maxTaskCount ||
+    effectivePolicy.maxConcurrency < 1
+  ) {
+    return workflowHostPolicyError(
+      'workflow_policy_exceeds_host',
+      'workflow policy cannot be clamped within current host limits',
+    );
+  }
+  return { ok: true, effectivePolicy };
 }
 
 function ensureCoordinationMaps(draft: EngineProjection): void {
@@ -421,6 +640,28 @@ async function executeGraphCommand(
   const operation = changedOperations[0]
     ? { ledgerKey: changedOperations[0][0], entry: changedOperations[0][1], createdAt: nowIso(deps.clock) }
     : undefined;
+  const dispositionTurns = changedTurns.filter((turn) => {
+    const beforeDisposition = before.turns[turn.id]?.disposition;
+    return turn.disposition !== undefined && !equalGraphValue(turn.disposition, beforeDisposition);
+  });
+  if (dispositionTurns.length > 1) {
+    return { ok: false, error: 'graph mutation produced multiple disposition claims' };
+  }
+  let dispositionClaim: ReturnType<typeof durableDispositionClaim> | undefined;
+  if (operation && dispositionTurns[0]) {
+    const turn = dispositionTurns[0];
+    const prefix = `${turn.id}:`;
+    if (!operation.ledgerKey.startsWith(prefix)) {
+      return { ok: false, error: 'graph disposition operation is not turn scoped' };
+    }
+    dispositionClaim = durableDispositionClaim({
+      turnId: turn.id,
+      taskId: turn.taskId,
+      runtimeEpoch: turn.runtimeEpoch,
+      opId: operation.ledgerKey.slice(prefix.length),
+      disposition: turn.disposition!,
+    });
+  }
   const expectedTasks = fences.expectedTasks ?? changedTasks
     .filter((task) => before.tasks[task.id] !== undefined)
     .map((task) => ({ id: task.id, revision: before.tasks[task.id]!.revision }));
@@ -442,6 +683,7 @@ async function executeGraphCommand(
     ...(deletedTurnIds.length > 0 ? { deleteTurnIds: deletedTurnIds } : {}),
     ...(deletedMessageIds.length > 0 ? { deleteMessageIds: deletedMessageIds } : {}),
     ...(operation ? { operation } : {}),
+    ...(dispositionClaim ? { dispositionClaim } : {}),
     ...(deletedOperationKeys.length > 0 ? { deleteOperationKeys: deletedOperationKeys } : {}),
     ...(changedCancelRequests.length > 0 ? { cancelRequests: changedCancelRequests } : {}),
     ...(deletedCancelRequestTurnIds.length > 0 ? { deleteCancelRequestTurnIds: deletedCancelRequestTurnIds } : {}),
@@ -520,7 +762,10 @@ export function issueTurnCredential(
   const task = turn ? file.tasks[turn.taskId] : undefined;
   if (!turn || !task) return undefined;
   const rootId = findRootId(file, task.id);
-  const actions = capabilitiesFor(task);
+  const actions = capabilitiesFor(task, {
+    turn,
+    workspaceTrusted: deps.isWorkspaceTrusted?.() ?? true,
+  });
   const deadlineMs = turn.runDeadlineAt ? Date.parse(turn.runDeadlineAt) : Number.NaN;
   const remainingMs = Number.isFinite(deadlineMs)
     ? Math.max(1, deadlineMs - Date.now())
@@ -635,13 +880,13 @@ function actionForCommand(command: ToolCommand): string {
 
 /**
  * Topologically order batch localIds so every prerequisite precedes its
- * dependents. `prereqs` maps a localId to the set of sibling localIds it waits
- * for (dependsOn ∪ intra-batch inputBinding producers). Returns `undefined` when
+ * consumers. `prerequisites` maps a localId to the sibling localIds it waits
+ * for (prerequisiteLocalIds ∪ intra-batch inputBinding producers). Returns `undefined` when
  * the intra-batch DAG contains a cycle (whole batch is then rejected).
  */
 function topoSortLocalIds(
   localIds: readonly string[],
-  prereqs: ReadonlyMap<string, ReadonlySet<string>>,
+  prerequisites: ReadonlyMap<string, ReadonlySet<string>>,
 ): string[] | undefined {
   const order: string[] = [];
   // 0 = unvisited, 1 = on stack (visiting), 2 = done
@@ -651,7 +896,7 @@ function topoSortLocalIds(
     if (s === 2) return true;
     if (s === 1) return false; // back-edge → cycle
     state.set(id, 1);
-    for (const p of prereqs.get(id) ?? []) {
+    for (const p of prerequisites.get(id) ?? []) {
       if (!visit(p)) return false;
     }
     state.set(id, 2);
@@ -678,7 +923,6 @@ export async function executeToolCommand(
   if (ctx.allowedActions && !ctx.allowedActions.has(actionForCommand(command))) {
     return { ok: false, error: `action not permitted: ${actionForCommand(command)}` };
   }
-  // Compound wait fields require wait_for_tasks / wait_child in addition to create_child tools.
   const wantsCompoundWait =
     (command.kind === 'delegate_task' && command.waitForCompletion === true) ||
     (command.kind === 'delegate_tasks' &&
@@ -688,6 +932,39 @@ export async function executeToolCommand(
       command.waitForTaskIds !== undefined &&
       command.waitForTaskIds.length > 0) ||
     (command.kind === 'continue_child' && command.waitForCompletion === true);
+  if (
+    command.kind === 'workflow_next' ||
+    command.kind === 'workflow_prev' ||
+    command.kind === 'workflow_fail' ||
+    command.kind === 'invoke_child_workflow'
+  ) {
+    const durableTurn = await deps.repository.getTurn(ctx.turnId);
+    if (
+      !durableTurn ||
+      durableTurn.taskId !== ctx.callerTaskId ||
+      (durableTurn.status !== 'running' && durableTurn.status !== 'waiting_user')
+    ) {
+      return { ok: false, error: `${command.kind} requires the caller's live turn` };
+    }
+    const durableTask = await deps.repository.getTask(ctx.callerTaskId);
+    if (!durableTask) return { ok: false, error: 'caller task not found' };
+    const durableActions = capabilitiesFor(durableTask, {
+      turn: durableTurn,
+      workspaceTrusted: deps.isWorkspaceTrusted?.() ?? true,
+    });
+    if (!durableActions.has(command.kind)) {
+      return { ok: false, error: `${command.kind} is not authorized for the current workflow context` };
+    }
+    if (
+      command.kind === 'workflow_next' &&
+      command.change === 'unchanged' &&
+      durableTurn.workflowActivation?.kind !== 'feedback_request' &&
+      !durableTurn.workflowActivation?.hasInheritedFeedbackResponse
+    ) {
+      return { ok: false, error: 'workflow_next unchanged requires a feedback-request activation' };
+    }
+  }
+  // Compound wait fields require wait_for_tasks / wait_child in addition to create_child tools.
   if (wantsCompoundWait && ctx.allowedActions && !ctx.allowedActions.has('wait_for_tasks')) {
     return {
       ok: false,
@@ -696,8 +973,8 @@ export async function executeToolCommand(
   }
 
   if (
-    command.kind !== 'get_task_status' &&
-    command.kind !== 'report_progress' &&
+    command.kind !== 'inspect_workflow_run' &&
+    command.kind !== 'start_workflow' &&
     command.kind !== 'get_host_context' &&
     command.kind !== 'list_task_types'
   ) {
@@ -852,7 +1129,7 @@ export async function executeToolCommand(
           goal: brief.objective || command.spec.goal,
           description: command.spec.description,
           parentId: ctx.callerTaskId,
-          dependencies: command.spec.dependencies ?? [],
+          prerequisites: command.spec.prerequisites ?? [],
           backend: resolvedBackend,
           // Optional ACP model id; omit → agent default for that backend.
           model: resolvedModel,
@@ -884,7 +1161,7 @@ export async function executeToolCommand(
           ...(command.spec.inputBindings ? { inputBindings: command.spec.inputBindings } : {}),
           ...(command.spec.claimsGit !== undefined ? { claimsGit: command.spec.claimsGit } : {}),
         };
-        const graph = depGraphFromFile(draft);
+        const graph = prerequisiteGraphFromFile(draft);
         const created = createTask(input, { rootId, graph, now });
         if (!created.ok) return created;
         draft.tasks[childId] =
@@ -1024,25 +1301,25 @@ export async function executeToolCommand(
         briefKind: import('./types').TaskBriefKind;
       }
 
-      // Build intra-batch prerequisite edges (dependsOn ∪ intra-batch binding producers)
+      // Build intra-batch prerequisite edges (declared local prerequisites ∪ binding producers)
       // and topo-sort so producers are inserted before consumers. Reject cycles.
       const localIds = command.specs.map((s) => s.localId);
-      const prereqs = new Map<string, Set<string>>();
+      const prerequisites = new Map<string, Set<string>>();
       for (const spec of command.specs) {
         const set = new Set<string>();
-        for (const dep of spec.dependsOn ?? []) set.add(dep);
+        for (const prerequisiteLocalId of spec.prerequisiteLocalIds ?? []) set.add(prerequisiteLocalId);
         for (const binding of spec.inputBindings ?? []) {
           if (binding.fromLocalId !== undefined) set.add(binding.fromLocalId);
         }
-        prereqs.set(spec.localId, set);
+        prerequisites.set(spec.localId, set);
       }
-      const order = topoSortLocalIds(localIds, prereqs);
+      const order = topoSortLocalIds(localIds, prerequisites);
       if (!order) {
         return {
           ok: false,
           error: JSON.stringify({
             code: 'batch_cycle',
-            message: 'intra-batch dependency cycle detected',
+            message: 'intra-batch prerequisite cycle detected',
           }),
         };
       }
@@ -1182,25 +1459,29 @@ export async function executeToolCommand(
           return { ok: false, reason: 'max children per root exceeded' };
         }
 
-        // Insert in topo order so depGraphFromFile(draft) sees prerequisite siblings.
+        // Insert in topo order so prerequisiteGraphFromFile(draft) sees prerequisite siblings.
         for (const localId of order) {
           const item = resolvedByLocal.get(localId)!;
           const spec = item.spec;
 
-          // Resolved dependencies: sibling dependsOn (succeeded/block) + pre-existing
-          // dependencies + auto-derived succeeded/block per intra-batch binding (dedup by id).
-          // Caller-supplied dependencies on pre-existing tasks go in first; the
+          // Resolved prerequisites: sibling local prerequisites (succeeded/fail) + pre-existing
+          // prerequisites + auto-derived succeeded/fail per intra-batch binding (dedup by id).
+          // Caller-supplied prerequisites on pre-existing tasks go in first; the
           // intra-batch guarantees below then override unconditionally, so a weaker
-          // explicit dep on a sibling id cannot subvert the required succeeded/block
-          // wait that dependsOn / an intra-batch inputBinding must enforce.
-          const depMap = new Map<string, TaskDependency>();
-          for (const dep of spec.dependencies ?? []) {
-            depMap.set(dep.taskId, dep);
+          // explicit prerequisite on a sibling id cannot subvert the required succeeded/fail
+          // wait that a local prerequisite / intra-batch inputBinding must enforce.
+          const prerequisiteMap = new Map<string, TaskPrerequisite>();
+          for (const prerequisite of spec.prerequisites ?? []) {
+            prerequisiteMap.set(prerequisite.producerTaskId, prerequisite);
           }
-          // Batch dependsOn: fail (not silent block) so sink-only waits resolve on upstream fail.
-          for (const sib of spec.dependsOn ?? []) {
-            const depId = idByLocal.get(sib)!;
-            depMap.set(depId, { taskId: depId, requiredOutcome: 'succeeded', onUnsatisfied: 'fail' });
+          // Batch local prerequisite: fail so sink-only waits resolve on upstream failure.
+          for (const sib of spec.prerequisiteLocalIds ?? []) {
+            const producerTaskId = idByLocal.get(sib)!;
+            prerequisiteMap.set(producerTaskId, {
+              producerTaskId,
+              requiredLifecycle: 'succeeded',
+              onUnmet: 'fail',
+            });
           }
 
           const bindings: TaskInputBinding[] = [];
@@ -1218,14 +1499,14 @@ export async function executeToolCommand(
             // An intra-batch binding producer must be waited for (succeeded/block),
             // overriding any weaker explicit dep the caller set on that sibling.
             if (binding.fromLocalId !== undefined) {
-              depMap.set(fromTaskId, {
-                taskId: fromTaskId,
-                requiredOutcome: 'succeeded',
-                onUnsatisfied: 'fail',
+              prerequisiteMap.set(fromTaskId, {
+                producerTaskId: fromTaskId,
+                requiredLifecycle: 'succeeded',
+                onUnmet: 'fail',
               });
             }
           }
-          const dependencies = [...depMap.values()];
+          const prerequisites = [...prerequisiteMap.values()];
 
           const bindingCheck = validateBindingsForRelease(bindings.length > 0 ? bindings : undefined);
           if (!bindingCheck.ok) {
@@ -1245,7 +1526,7 @@ export async function executeToolCommand(
             goal: brief.objective || spec.goal,
             description: spec.description,
             parentId: ctx.callerTaskId,
-            dependencies,
+            prerequisites,
             backend: item.backend,
             model: item.model,
             taskType: item.taskType,
@@ -1273,7 +1554,7 @@ export async function executeToolCommand(
             ...(spec.claimsGit !== undefined ? { claimsGit: spec.claimsGit } : {}),
           };
           // Live graph: sees already-inserted siblings in this same batch.
-          const graph = depGraphFromFile(draft);
+          const graph = prerequisiteGraphFromFile(draft);
           const created = createTask(input, { rootId, graph, now });
           if (!created.ok) return created;
           draft.tasks[item.childId] = isDelegate
@@ -1396,18 +1677,18 @@ export async function executeToolCommand(
           return { ok: false, reason: 'caller task not open' };
         }
 
-        // Resolve release set (explicit ids + optional dependency closure).
+        // Resolve release set (explicit ids + optional prerequisite closure).
         const resolved = new Set<string>();
         const stack = [...command.taskIds];
         while (stack.length > 0) {
           const id = stack.pop()!;
           if (resolved.has(id)) continue;
           resolved.add(id);
-          if (command.includeDependencies) {
+          if (command.includePrerequisites) {
             const task = draft.tasks[id];
             if (task) {
-              for (const dep of task.dependencies) {
-                stack.push(dep.taskId);
+              for (const prerequisite of task.prerequisites) {
+                stack.push(prerequisite.producerTaskId);
               }
             }
           }
@@ -1747,16 +2028,15 @@ export async function executeToolCommand(
       const cancelled = [...command.childIds];
       const localLiveIds: string[] = [];
       const mutation = await executeGraphCommand(deps, 'cancelChildTasks', (draft) => {
-        const coordinatorSeal = {
-          kind: 'coordinator' as const,
-          taskId: ctx.callerTaskId,
-          turnId: ctx.turnId,
-          mode: 'cancel_task',
-        };
         const ids = [...new Set(command.childIds.flatMap((id) => [id, ...descendantIds(draft, id)]))].reverse();
         for (const taskId of ids) {
           const task = draft.tasks[taskId];
           if (!task || isTerminalLifecycle(task.lifecycle)) continue;
+          const lifecycleAuthority: TaskLifecycleAuthority = {
+            kind: 'parent',
+            parentTaskId: task.parentId ?? ctx.callerTaskId,
+            turnId: ctx.turnId,
+          };
           const currentPending = turnsForTask(draft, taskId).filter(
             (turn) => turn.status === 'queued' || turn.status === 'running' || turn.status === 'waiting_user',
           );
@@ -1768,12 +2048,12 @@ export async function executeToolCommand(
             draft.cancelRequests = draft.cancelRequests ?? {};
             draft.cancelRequests[currentLive.id] = {
               kind: 'cancel', by: ctx.callerTaskId, opId: command.opId, at: now,
-              sealedBy: coordinatorSeal,
+              lifecycleAuthority,
             };
             continue;
           }
           if (currentLive) localLiveIds.push(currentLive.id);
-          const next = transitionCancelTask(task, { liveTurn: currentLive, now, sealedBy: coordinatorSeal });
+          const next = transitionCancelTask(task, { liveTurn: currentLive, now, lifecycleAuthority });
           if (!next.ok) return next;
           draft.tasks[taskId] = clearPendingParentQuestionOnCancel(draft, next.next.task, now);
           if (next.next.turn) draft.turns[next.next.turn.id] = next.next.turn;
@@ -1850,18 +2130,17 @@ export async function executeToolCommand(
         return { ok: true, result: { interrupted: true } };
       }
 
-      const coordinatorSeal = {
-        kind: 'coordinator' as const,
-        taskId: ctx.callerTaskId,
-        turnId: ctx.turnId,
-        mode: 'cancel_task',
-      };
       const localLiveIds: string[] = [];
       const mutation = await executeGraphCommand(deps, 'cancelChildTask', (draft) => {
         const ids = [command.childId, ...descendantIds(draft, command.childId)].reverse();
         for (const taskId of ids) {
           const task = draft.tasks[taskId];
           if (!task || isTerminalLifecycle(task.lifecycle)) continue;
+          const lifecycleAuthority: TaskLifecycleAuthority = {
+            kind: 'parent',
+            parentTaskId: task.parentId ?? ctx.callerTaskId,
+            turnId: ctx.turnId,
+          };
           const currentPending = turnsForTask(draft, taskId).filter(
             (turn) => turn.status === 'queued' || turn.status === 'running' || turn.status === 'waiting_user',
           );
@@ -1874,7 +2153,7 @@ export async function executeToolCommand(
             draft.cancelRequests = draft.cancelRequests ?? {};
             draft.cancelRequests[currentLive.id] = {
               kind: 'cancel', by: ctx.callerTaskId, opId: command.opId, at: now,
-              sealedBy: coordinatorSeal,
+              lifecycleAuthority,
             };
             continue;
           }
@@ -1882,7 +2161,7 @@ export async function executeToolCommand(
           const cancelled = transitionCancelTask(task, {
             liveTurn: currentLive,
             now,
-            sealedBy: coordinatorSeal,
+            lifecycleAuthority,
           });
           if (!cancelled.ok) return cancelled;
           draft.tasks[taskId] = clearPendingParentQuestionOnCancel(
@@ -1909,7 +2188,7 @@ export async function executeToolCommand(
         deps.liveRuns.get(turnId)?.controller.abort();
         cleanupTurnResources(deps, turnId);
       }
-      // Full rescan: dependents outside the cancelled subtree may now be ready.
+      // Full rescan: consumers outside the cancelled subtree may now be ready.
       deps.onRescanSchedulableTurns?.();
       return { ok: true, result: { cancelled: command.childId } };
     }
@@ -1932,11 +2211,10 @@ export async function executeToolCommand(
         };
       }
 
-      const coordinatorSeal = {
-        kind: 'coordinator' as const,
-        taskId: ctx.callerTaskId,
+      const parentAuthority: TaskLifecycleAuthority = {
+        kind: 'parent',
+        parentTaskId: ctx.callerTaskId,
         turnId: ctx.turnId,
-        mode: 'parent_seal',
       };
 
       if (command.lifecycle === 'cancelled' || command.lifecycle === 'skipped') {
@@ -1951,7 +2229,7 @@ export async function executeToolCommand(
           const probe = transitionSetTaskLifecycle(direct, command.lifecycle, {
             now,
             reason: command.reason,
-            sealedBy: coordinatorSeal,
+            lifecycleAuthority: parentAuthority,
           });
           if (!probe.ok) return probe;
           if (probe.next === direct) {
@@ -1966,6 +2244,11 @@ export async function executeToolCommand(
           for (const taskId of ids) {
             const task = draft.tasks[taskId];
             if (!task || isTerminalLifecycle(task.lifecycle)) continue;
+            const lifecycleAuthority: TaskLifecycleAuthority = {
+              kind: 'parent',
+              parentTaskId: task.parentId ?? ctx.callerTaskId,
+              turnId: ctx.turnId,
+            };
             const currentPending = turnsForTask(draft, taskId).filter(
               (t) => t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user',
             );
@@ -1985,7 +2268,7 @@ export async function executeToolCommand(
                 by: ctx.callerTaskId,
                 opId: command.opId,
                 at: now,
-                sealedBy: coordinatorSeal,
+                lifecycleAuthority,
                 reason: command.reason,
               };
               continue;
@@ -1994,7 +2277,7 @@ export async function executeToolCommand(
               const cancelled = transitionCancelTask(task, {
                 liveTurn: currentLive,
                 now,
-                sealedBy: coordinatorSeal,
+                lifecycleAuthority,
               });
               if (!cancelled.ok) return cancelled;
               draft.tasks[taskId] = clearPendingParentQuestionOnCancel(
@@ -2015,7 +2298,7 @@ export async function executeToolCommand(
               const sealed = transitionSetTaskLifecycle(task, 'skipped', {
                 now,
                 reason: command.reason,
-                sealedBy: coordinatorSeal,
+                lifecycleAuthority,
               });
               if (!sealed.ok) return sealed;
               draft.tasks[taskId] = sealed.next;
@@ -2026,7 +2309,7 @@ export async function executeToolCommand(
                   by: ctx.callerTaskId,
                   opId: command.opId,
                   at: now,
-                  sealedBy: coordinatorSeal,
+                  lifecycleAuthority,
                 };
               }
               for (const pending of currentPending) {
@@ -2080,7 +2363,7 @@ export async function executeToolCommand(
           now,
           result: command.result,
           error: command.error,
-          sealedBy: coordinatorSeal,
+          lifecycleAuthority: parentAuthority,
         });
         if (!sealed.ok) return sealed;
         sealChanged = sealed.next !== task;
@@ -2101,7 +2384,7 @@ export async function executeToolCommand(
               by: ctx.callerTaskId,
               opId: command.opId,
               at: now,
-              sealedBy: coordinatorSeal,
+              lifecycleAuthority: parentAuthority,
             };
           } else if (live) {
             liveIdToCleanup = live.id;
@@ -2213,55 +2496,181 @@ export async function executeToolCommand(
       return { ok: true, result: { staged: true } };
     }
 
-    case 'report_progress':
-      return { ok: true, result: { noted: command.note.slice(0, 512) } };
-
-    case 'get_task_status': {
-      const targetId = command.taskId ?? ctx.callerTaskId;
-      const file = deps.store.getFile();
-      const task = file.tasks[targetId];
-      if (!task) return { ok: false, error: 'task not found' };
-      if (targetId !== ctx.callerTaskId && !isDescendantOf(file, ctx.callerTaskId, targetId)) {
-        return { ok: false, error: 'unauthorized subtree' };
-      }
-      const nodes = [targetId, ...descendantIds(file, targetId)].map((id) => {
-        const t = file.tasks[id];
-        if (!t) return undefined;
-        const readiness = evaluateTaskReadiness(file, id);
-        return {
-          id: t.id,
-          lifecycle: t.lifecycle,
-          releaseState: t.releaseState,
-          goal: t.goal.slice(0, 128),
-          parentId: t.parentId,
-          attention: t.attention,
-          resultSummary: t.taskResult?.summary,
-          readiness: {
-            code: readiness.code,
-            schedulable: readiness.schedulable,
-            reasons: readiness.reasons,
+    case 'workflow_next': {
+      // M018 S02: stage workflow_next disposition. Does not seal lifecycle; gate
+      // contribution is owned by the repository commit path (T04).
+      const staged = await executeGraphCommand(deps, 'workflowNextGraphTask', (draft) => {
+        const turn = draft.turns[ctx.turnId];
+        if (!turn) return { ok: false, reason: 'turn not found' };
+        const result = stageDisposition(
+          turn,
+          {
+            kind: 'workflow_next',
+            change: command.change,
+            result: command.message,
           },
-        };
-      }).filter((n): n is NonNullable<typeof n> => n !== undefined);
-      const callerTurn = file.turns[ctx.turnId];
-      const callerWait = callerTurn?.disposition?.kind === 'wait_tasks'
-        ? callerTurn.disposition
-        : undefined;
-      return {
-        ok: true,
-        result: {
-          root: targetId,
-          tasks: nodes.slice(0, 32),
-          ...(callerWait
-            ? {
-                callerWaitStaged: true,
-                waitTaskIds: callerWait.taskIds,
-                nextAction: 'end_current_turn',
-                doNotPoll: true,
-              }
-            : {}),
+          command.opId,
+          {
+            limits: { maxResult: limits.maxResultBytes, maxError: limits.maxErrorBytes },
+          },
+        );
+        if (!result.ok) return result;
+        draft.turns[ctx.turnId] = result.next.turn;
+        writeLedger(draft, ctx.turnId, command.opId, fingerprint, { ok: true, data: { staged: true } });
+        return { ok: true };
+      });
+      if (!staged.ok) return { ok: false, error: staged.error };
+      deps.onWorkflowRouteAccepted?.({
+        callerTurnId: ctx.turnId,
+        kind: 'workflow_next',
+        message: command.message,
+      });
+      return { ok: true, result: { staged: true } };
+    }
+
+    case 'workflow_prev': {
+      // M018 S04: stage workflow_prev disposition. Does not seal lifecycle; feedback
+      // round open is owned by the repository commit path (T02).
+      const staged = await executeGraphCommand(deps, 'workflowPrevGraphTask', (draft) => {
+        const turn = draft.turns[ctx.turnId];
+        if (!turn) return { ok: false, reason: 'turn not found' };
+        const result = stageDisposition(
+          turn,
+          {
+            kind: 'workflow_prev',
+            targets: command.targets,
+            note: command.message,
+          },
+          command.opId,
+          {
+            limits: { maxResult: limits.maxResultBytes, maxError: limits.maxErrorBytes },
+          },
+        );
+        if (!result.ok) return result;
+        draft.turns[ctx.turnId] = result.next.turn;
+        writeLedger(draft, ctx.turnId, command.opId, fingerprint, { ok: true, data: { staged: true } });
+        return { ok: true };
+      });
+      if (!staged.ok) return { ok: false, error: staged.error };
+      deps.onWorkflowRouteAccepted?.({
+        callerTurnId: ctx.turnId,
+        kind: 'workflow_prev',
+        message: command.message,
+      });
+      return { ok: true, result: { staged: true } };
+    }
+
+    case 'workflow_fail': {
+      // M018 S05: stage workflow_fail disposition. Does not seal lifecycle; run
+      // closure is owned by the repository commit path (T02).
+      const staged = await executeGraphCommand(deps, 'workflowFailGraphTask', (draft) => {
+        const turn = draft.turns[ctx.turnId];
+        if (!turn) return { ok: false, reason: 'turn not found' };
+        const result = stageDisposition(
+          turn,
+          {
+            kind: 'workflow_fail',
+            ...(command.reason !== undefined ? { reason: command.reason } : {}),
+          },
+          command.opId,
+          {
+            limits: { maxResult: limits.maxResultBytes, maxError: limits.maxErrorBytes },
+          },
+        );
+        if (!result.ok) return result;
+        draft.turns[ctx.turnId] = result.next.turn;
+        writeLedger(draft, ctx.turnId, command.opId, fingerprint, { ok: true, data: { staged: true } });
+        return { ok: true };
+      });
+      if (!staged.ok) return { ok: false, error: staged.error };
+      return { ok: true, result: { staged: true } };
+    }
+
+    case 'invoke_child_workflow': {
+      // M018 S06: map the public invocation command to a child-workflow NEXT route.
+      // Child run + continuation are owned by repository settle (T02).
+      const childDefinitionVersion = command.childDefinitionVersion ?? (
+        await deps.repository.getLatestWorkflowDefinition(command.childDefinitionId, ctx.rootId)
+      )?.version;
+      if (childDefinitionVersion === undefined) {
+        return workflowHostPolicyError('definition_not_found', 'child workflow definition not found');
+      }
+      let entryBindings = command.entryBindings;
+      if (command.semanticEntryBindings) {
+        const resolved = await deps.repository.resolveWorkflowInputArtifacts(
+          ctx.turnId,
+          ctx.rootId,
+          command.semanticEntryBindings.map((binding) => binding.fromInputRef),
+        );
+        if (!resolved) {
+          return workflowHostPolicyError(
+            'workflow_input_not_found',
+            'one or more child workflow source inputs are unavailable',
+          );
+        }
+        const byInputRef = new Map(resolved.map((binding) => [binding.inputRef, binding]));
+        entryBindings = command.semanticEntryBindings.map((binding) => {
+          const source = byInputRef.get(binding.fromInputRef)!;
+          return {
+            childEntryNodeId: binding.childEntryNodeId,
+            inputRef: binding.inputRef,
+            artifactId: source.artifactId,
+            artifactRevision: source.artifactRevision,
+          };
+        });
+      }
+      if (!entryBindings || entryBindings.length === 0) {
+        return workflowHostPolicyError('invalid_child_bindings', 'child workflow bindings are required');
+      }
+      const prepared = await prepareWorkflowStart(
+        deps,
+        ctx,
+        {
+          definitionId: command.childDefinitionId,
+          version: childDefinitionVersion,
+          useCallerBackendDefault: true,
         },
-      };
+        limits,
+      );
+      if (!prepared.ok) return prepared;
+      const staged = await executeGraphCommand(deps, 'invokeChildGraphTask', (draft) => {
+        const turn = draft.turns[ctx.turnId];
+        if (!turn) return { ok: false, reason: 'turn not found' };
+        const result = stageDisposition(
+          turn,
+          {
+            kind: 'workflow_next',
+            change: 'updated',
+            route: {
+              kind: 'child_workflow',
+              childDefinitionId: command.childDefinitionId,
+              childDefinitionVersion,
+              entryBindings,
+              ...(command.childIdempotencyKey !== undefined
+                ? { childIdempotencyKey: command.childIdempotencyKey }
+                : {}),
+              effectivePolicy: prepared.effectivePolicy,
+            },
+          },
+          command.opId,
+          {
+            limits: { maxResult: limits.maxResultBytes, maxError: limits.maxErrorBytes },
+          },
+        );
+        if (!result.ok) return result;
+        draft.turns[ctx.turnId] = result.next.turn;
+        writeLedger(draft, ctx.turnId, command.opId, fingerprint, { ok: true, data: { staged: true } });
+        return { ok: true };
+      });
+      if (!staged.ok) return { ok: false, error: staged.error };
+      return { ok: true, result: { staged: true } };
+    }
+
+
+    case 'inspect_workflow_run': {
+      const inspection = await deps.repository.inspectWorkflowRun(command.runId, ctx.rootId);
+      if (!inspection) return { ok: false, error: 'workflow run not found' };
+      return { ok: true, result: inspection };
     }
 
     case 'get_host_context': {
@@ -2279,7 +2688,10 @@ export async function executeToolCommand(
       const snapshot: HostEnvironmentSnapshot = cached
         ? { ...cached, cwd, trusted }
         : minimalHostSnapshot(cwd, trusted);
-      const tools = [...capabilitiesFor(task)].sort();
+      const tools = [...capabilitiesFor(task, {
+        turn: file.turns[ctx.turnId],
+        workspaceTrusted: trusted,
+      })].sort();
       const registryResult: TaskTypeRegistryResult = deps.getTaskTypeRegistry
         ? deps.getTaskTypeRegistry(cwd)
         : parseTaskTypeRegistry(undefined);
@@ -2303,8 +2715,7 @@ export async function executeToolCommand(
         tools,
         taskCwd: task.cwd,
         // Coordinators always get taskTypes array (empty = configure guidance).
-        // suppressBackendCatalog omitted → keep diagnostic backends/models.
-        ...(task.role === 'coordinator' ? { taskTypes } : {}),
+        ...(task.role === 'coordinator' ? { taskTypes, suppressBackendCatalog: true } : {}),
       });
       return {
         ok: true,
@@ -2352,20 +2763,214 @@ export async function executeToolCommand(
       };
     }
 
+    case 'define_workflow': {
+      const caller = await deps.repository.getTask(ctx.callerTaskId);
+      if (!caller || caller.lifecycle !== 'open') {
+        return workflowHostPolicyError('caller_not_open', 'caller task is not open');
+      }
+      const latest = command.version === undefined
+        ? await deps.repository.getLatestWorkflowDefinition(command.definitionId, ctx.rootId)
+        : undefined;
+      const initialVersion = command.version ?? latest?.version ?? 1;
+      const validated = validateDefineWorkflow({
+        definitionId: command.definitionId,
+        version: initialVersion,
+        name: command.name,
+        topology: command.topology,
+        entryContracts: command.entryContracts,
+        policy: command.policy ?? deriveDefaultWorkflowPolicy(command.entryContracts),
+        scope: { kind: 'root', ownerRootTaskId: ctx.rootId },
+        createdAt: now,
+      });
+      if (!validated.ok) {
+        return workflowHostPolicyError('invalid_workflow_definition', validated.reason);
+      }
+      const frozen = freezeWorkflowDefinitionRouting(deps, caller, validated.definition);
+      if (!frozen.ok) return frozen;
+      let definition = frozen.definition;
+      if (
+        command.version === undefined && latest &&
+        fingerprintWorkflowDefinition(definition) !== fingerprintWorkflowDefinition(latest)
+      ) {
+        const next = validateDefineWorkflow({ ...definition, version: latest.version + 1 });
+        if (!next.ok) {
+          return workflowHostPolicyError('invalid_workflow_definition', next.reason);
+        }
+        definition = next.definition;
+      }
+      const requirements = validateWorkflowDefinitionHostRequirements(
+        deps,
+        caller,
+        definition,
+      );
+      if (!requirements.ok) return requirements;
+      const defined = await deps.repository.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: deps.workspaceId,
+        definitionId: definition.definitionId,
+        version: definition.version,
+        name: definition.name,
+        topology: definition.topology,
+        entryContracts: definition.entryContracts,
+        policy: definition.policy,
+        ownerRootTaskId: ctx.rootId,
+        publicOperation: {
+          ledgerKey: opLedgerKey(ctx.turnId, command.opId),
+          fingerprint,
+        },
+        createdAt: now,
+      });
+      if (defined.conflict || !defined.operation?.result?.ok) {
+        const opError =
+          defined.operation?.result && !defined.operation.result.ok
+            ? defined.operation.result.error
+            : undefined;
+        return {
+          ok: false,
+          error: defined.reason ?? opError ?? 'define_workflow failed',
+        };
+      }
+      const definedOp = defined.operation?.result;
+      if (!definedOp || !definedOp.ok) {
+        return { ok: false, error: defined.reason ?? 'define_workflow failed' };
+      }
+      const data = definedOp.data;
+      return { ok: true, result: data };
+    }
+
+    case 'start_workflow': {
+      const durableTurn = await deps.repository.getTurn(ctx.turnId);
+      if (
+        !durableTurn ||
+        durableTurn.taskId !== ctx.callerTaskId ||
+        (durableTurn.status !== 'running' && durableTurn.status !== 'waiting_user')
+      ) {
+        return { ok: false, error: "start_workflow requires the caller's live turn" };
+      }
+      if (durableTurn.workflowActivation) {
+        return {
+          ok: false,
+          error: 'start_workflow is unavailable inside a workflow activation; use invoke_child_workflow',
+        };
+      }
+      const durableTask = await deps.repository.getTask(ctx.callerTaskId);
+      if (!durableTask) return { ok: false, error: 'caller task not found' };
+      const durableActions = capabilitiesFor(durableTask, {
+        turn: durableTurn,
+        workspaceTrusted: deps.isWorkspaceTrusted?.() ?? true,
+      });
+      if (!durableActions.has('start_workflow')) {
+        return { ok: false, error: 'start_workflow is not authorized for the current caller' };
+      }
+      const priorResolution = command.version === undefined
+        ? await deps.repository.getWorkflowStartResolution({
+            ownerRootTaskId: ctx.rootId,
+            callerTaskId: ctx.callerTaskId,
+            definitionId: command.definitionId,
+            startIdempotencyKey: command.startIdempotencyKey,
+          })
+        : undefined;
+      const version = command.version ?? priorResolution?.version ?? (
+        await deps.repository.getLatestWorkflowDefinition(command.definitionId, ctx.rootId)
+      )?.version;
+      if (version === undefined) {
+        return workflowHostPolicyError('definition_not_found', 'workflow definition not found');
+      }
+      const replayPolicy = priorResolution?.policy ?? await deps.repository.getWorkflowStartPolicy({
+        ownerRootTaskId: ctx.rootId,
+        callerTaskId: ctx.callerTaskId,
+        definitionId: command.definitionId,
+        version,
+        startIdempotencyKey: command.startIdempotencyKey,
+      });
+      const prepared = replayPolicy
+        ? { ok: true as const, effectivePolicy: replayPolicy }
+        : await prepareWorkflowStart(
+            deps,
+            ctx,
+            {
+              definitionId: command.definitionId,
+              version,
+              ...(command.backend !== undefined ? { backend: command.backend } : {}),
+            },
+            limits,
+          );
+      if (!prepared.ok) return prepared;
+      const suspendCaller =
+        deps.onWorkflowStartAccepted !== undefined && deps.liveRuns.has(ctx.turnId);
+      const started = await deps.repository.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: deps.workspaceId,
+        definitionId: command.definitionId,
+        version,
+        startIdempotencyKey: command.startIdempotencyKey,
+        createdAt: now,
+        ...(command.goal !== undefined ? { goal: command.goal } : {}),
+        ...(command.backend !== undefined ? { backend: command.backend } : {}),
+        entryInputs: command.entryInputs,
+        ownerRootTaskId: ctx.rootId,
+        callerTaskId: ctx.callerTaskId,
+        callerTurnId: ctx.turnId,
+        resumeCallerOnCompletion: suspendCaller,
+        effectivePolicy: prepared.effectivePolicy,
+        publicOperation: {
+          ledgerKey: opLedgerKey(ctx.turnId, command.opId),
+          fingerprint,
+        },
+      });
+      if (started.conflict || !started.operation?.result?.ok) {
+        const opError =
+          started.operation?.result && !started.operation.result.ok
+            ? started.operation.result.error
+            : undefined;
+        return {
+          ok: false,
+          error: started.reason ?? opError ?? 'start_workflow failed',
+        };
+      }
+      const startedOp = started.operation?.result;
+      if (!startedOp || !startedOp.ok) {
+        return { ok: false, error: started.reason ?? 'start_workflow failed' };
+      }
+      const data = startedOp.data as {
+        activationTurnId?: string;
+        entryTaskId?: string;
+        entries?: Array<{ taskId?: string; activationTurnId?: string }>;
+        [key: string]: unknown;
+      };
+      if (started.changed && Array.isArray(data.entries)) {
+        for (const entry of data.entries) {
+          if (
+            entry && typeof entry === 'object' &&
+            typeof (entry as { activationTurnId?: unknown }).activationTurnId === 'string'
+          ) {
+            deps.onScheduleTurn((entry as { activationTurnId: string }).activationTurnId);
+          }
+        }
+      }
+      const entryTaskIds = data.entries
+        ?.map((entry) => entry.taskId)
+        .filter((taskId): taskId is string => typeof taskId === 'string') ?? [];
+      if (entryTaskIds.length > 0) {
+        deps.onRescanSchedulableTurns?.(entryTaskIds);
+      } else if (typeof data.entryTaskId === 'string') {
+        deps.onRescanSchedulableTurns?.([data.entryTaskId]);
+      }
+      if (suspendCaller && typeof data.runId === 'string') {
+        deps.onWorkflowStartAccepted?.({
+          runId: data.runId,
+          ownerRootTaskId: ctx.rootId,
+          callerTaskId: ctx.callerTaskId,
+          callerTurnId: ctx.turnId,
+        });
+      }
+      return { ok: true, result: data };
+    }
+
     case 'upsert_presentation':
       // Presentation execution is composed by the host router (T04). The pure task
       // graph must remain VS Code-independent and fail closed if called directly.
       return { ok: false, error: 'panel_open_failed' };
-
-    case 'ask_user':
-      // Temporarily ignored: structured user questions go through ACP RFD
-      // elicitation (and vendor extensions like Grok x.ai/ask_user_question).
-      // Non-root must use ask_parent.
-      return {
-        ok: false,
-        error:
-          'ask_user MCP tool is disabled; use ACP elicitation/create (or ask_parent for children)',
-      };
 
     case 'ask_parent': {
       const caller = deps.store.getFile().tasks[ctx.callerTaskId];
@@ -2629,7 +3234,7 @@ export async function executeToolCommand(
           id: messageId,
           taskId: child.id,
           role: 'user',
-          content: `Parent answers for question ${command.questionId}:\n${qText}\n${aText}\nContinue the task and stage complete_task or fail_task.`,
+          content: `Parent answers for question ${command.questionId}:\n${qText}\n${aText}\nContinue the task and follow the current workflow routing contract.`,
           state: 'assigned',
           createdAt: now,
           turnId: continuationTurnId,
@@ -2764,15 +3369,15 @@ export async function processCancelRequests(deps: GraphEngineDeps): Promise<void
               const cancelled = transitionCancelTask(task, {
                 liveTurn: turn,
                 now,
-                sealedBy:
-                  currentRequest.sealedBy ??
+                lifecycleAuthority:
+                  currentRequest.lifecycleAuthority ??
                   (currentRequest.by === 'engine' || currentRequest.by === 'user'
                     ? { kind: 'user' }
-                    : { kind: 'coordinator', taskId: currentRequest.by, mode: 'cancel_task' }),
+                    : { kind: 'parent', parentTaskId: currentRequest.by }),
               });
               if (cancelled.ok) {
-                const isParentSeal = currentRequest.sealedBy?.kind === 'coordinator' && currentRequest.sealedBy.mode === 'parent_seal';
-                const sealedTask = isParentSeal
+                const carriesReason = currentRequest.lifecycleAuthority?.kind === 'parent';
+                const sealedTask = carriesReason
                   ? { ...cancelled.next.task, reason: currentRequest.reason }
                   : cancelled.next.task;
                 draft.tasks[task.id] = clearPendingParentQuestionOnCancel(draft, sealedTask, now);
@@ -2824,15 +3429,18 @@ export function projectChildResults(
         ? {
             questionId: task.pendingParentQuestion.questionId,
             questions: task.pendingParentQuestion.questions.slice(0, 8).map((q) => ({
-              prompt: q.prompt.slice(0, 400),
+              prompt: q.prompt,
             })),
+            ...(task.pendingParentQuestion.questions.length > 8
+              ? { omittedQuestionCount: task.pendingParentQuestion.questions.length - 8 }
+              : {}),
           }
         : undefined;
     const entry = {
       id: task.id,
       lifecycle: task.lifecycle,
-      result: task.taskResult?.summary.slice(0, 512),
-      error: task.error?.slice(0, 256),
+      result: task.taskResult?.summary,
+      error: task.error,
       attention: task.attention?.code,
       ...(pendingQ ? { pendingParentQuestion: pendingQ } : {}),
     };

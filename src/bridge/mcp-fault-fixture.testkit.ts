@@ -96,28 +96,18 @@ function connectionMessage(code: ConnectionFaultCode): string {
   }
 }
 
-/** Default Muster coordinator tool names advertised by the real bridge. */
+/** Exact workflow-only tool names advertised by the real bridge. */
 export const DEFAULT_MUSTER_TOOLS: readonly string[] = [
-  'create_task',
-  'delegate_task',
-  'create_tasks',
-  'delegate_tasks',
-  'release_tasks',
   'list_task_types',
-  'interrupt_task',
-  'cancel_task',
-  'cancel_tasks',
-  'continue_child',
-  'set_task_lifecycle',
-  'wait_for_tasks',
-  'get_task_status',
+  'inspect_workflow_run',
   'get_host_context',
-  'complete_task',
-  'fail_task',
-  'report_progress',
-  'ask_parent',
-  'answer_child_question',
   'upsert_presentation',
+  'define_workflow',
+  'start_workflow',
+  'workflow_next',
+  'workflow_prev',
+  'workflow_fail',
+  'invoke_child_workflow',
 ] as const;
 
 export function defaultMusterToolCatalog(): FakeMcpTool[] {

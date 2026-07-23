@@ -346,6 +346,8 @@ MVP uses **native CSS scroll** — no virtual-list dependency until needed.
 
 **Stick-to-bottom** while streaming — only auto-scroll if the user is already near the bottom (do not yank scroll while they read history):
 
+Treat any upward user scroll as an immediate unpin, even inside the bottom threshold. Only a downward user scroll back near the bottom or an explicit “Scroll to latest” action may re-pin; content and revision effects may clear the pin but must never set it.
+
 ```ts
 const BOTTOM_THRESHOLD_PX = 80;
 

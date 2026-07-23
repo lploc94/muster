@@ -5,7 +5,7 @@ import type {
   PersistedReasoning,
   PersistedToolCall,
   SendReceipt,
-  TaskDependency,
+  TaskPrerequisite,
   TaskMessage,
   RuntimeClaim,
   TaskTurn,
@@ -13,18 +13,91 @@ import type {
   TurnDisposition,
   TurnStatus,
 } from './types';
+import {
+  decodeStoredTopologyJson,
+  DEFAULT_WORKFLOW_POLICY,
+  defineWorkflowConflict,
+  defineWorkflowCreated,
+  defineWorkflowInvalid,
+  defineWorkflowLedgerKey,
+  defineWorkflowReplay,
+  formatWorkflowEntryAggregate,
+  startWorkflowConflict,
+  startWorkflowCreated,
+  startWorkflowInvalid,
+  startWorkflowLedgerKey,
+  startWorkflowReplay,
+  validateDefineWorkflow,
+  validateStartWorkflow,
+  entryNodeIds,
+  deriveNodeActivationIdentities,
+  deriveNextContributionMessageId,
+  deriveProducerArtifactId,
+  deriveProducerArtifactRevision,
+  deriveTerminalAggregateArtifactId,
+  deriveFeedbackRoundId,
+  deriveFeedbackRequestMessageId,
+  deriveFeedbackRequestActivationId,
+  deriveFeedbackResponseMessageId,
+  deriveFeedbackTargetId,
+  deriveFeedbackTargetTurnId,
+  deriveFeedbackTargetMessageId,
+  deriveFeedbackResumeTurnId,
+  deriveFeedbackResumeMessageId,
+  deriveFeedbackResumeActivationId,
+  deriveRunClosureFenceId,
+  workflowRunAttentionCode,
+  workflowRunTerminalStatusForReason,
+  boundWorkflowFailReason,
+  type WorkflowFailReasonCode,
+  outgoingEdge,
+  consumerInputRefsInDefinitionOrder,
+  terminalNodeIds,
+  maximumWorkflowEntryAggregateBytes,
+  deriveChildInvocationFenceId,
+  deriveChildReturnFenceId,
+  deriveChildContinuationId,
+  deriveCallerReturnGateId,
+  deriveCallerResumeTurnId,
+  deriveCallerReturnMessageId,
+  deriveWorkflowStartContinuationId,
+  deriveWorkflowStartResumeTurnId,
+  deriveWorkflowStartResumeMessageId,
+  deriveChildStartIdempotencyKey,
+  stableId,
+  validateInvokeChildEntryBindings,
+  workflowNodeTaskGoal,
+  workflowRunGoalFromTask,
+  type DefineWorkflowResult,
+  type StartWorkflowResult,
+  type WorkflowDefinitionV1,
+  type WorkflowPolicyV1,
+} from './workflow';
+import type {
+  WorkflowRunCompletionProjection,
+  WorkflowRunInspectionProjection,
+  WorkflowTaskStatusProjection,
+} from './workflow-types';
+import { durableDispositionClaim, type DurableDispositionClaim } from './disposition-claim';
 import { isMutatingTask, normalizedWritePaths } from './resources';
 import { canPromoteTurn } from './scheduler';
 import { DEFAULT_RESOURCE_LIMITS } from './limits';
-import { isTerminalLifecycle, isTerminalTurn } from './transitions';
+import {
+  LIVE_TURN_STATUSES,
+  isTerminalLifecycle, isTerminalTurn
+} from './transitions';
 import { TRUNCATION_MARKER } from './retention';
-import type { DbClient } from './sqlite/client';
-import type { SqlStatement, SqlValue } from './sqlite/rpc';
+import {
+  PRESENTATION_MARKDOWN_MAX_CHARS,
+  TASK_MESSAGE_MAX_CHARS,
+  TASK_RESULT_MAX_BYTES,
+  truncateUtf8Bytes,
+} from './content-limits';
+import type { RunResult, SqlStatement, SqlValue } from './sqlite/rpc';
 import { CHANGE_FEED_RETAIN_REVISIONS } from './sqlite/schema';
 import {
   ASSISTANT_ORDERING_FALLBACK,
   KIND_RANK,
-  REASONING_ORDERING,
   UNBOUND_TURN_SEQUENCE,
   USER_ORDERING_FALLBACK,
   type TranscriptSortKey,
@@ -50,7 +123,7 @@ export interface RepositoryPage<T> {
 export type RepositoryTranscriptItem =
   | { id: string; kind: 'user' | 'assistant'; content: string; turnId?: string; order?: number; state?: TaskMessage['state']; createdAt?: string }
   | { id: string; kind: 'tool'; turnId: string; order: number; content: Record<string, unknown>; createdAt?: string }
-  | { id: string; kind: 'reasoning'; turnId: string; content: string; createdAt?: string };
+  | { id: string; kind: 'reasoning'; turnId: string; order: number; content: string; createdAt?: string };
 
 export interface TranscriptPage {
   items: readonly RepositoryTranscriptItem[];
@@ -105,6 +178,10 @@ export type GraphCommandKind =
   | 'waitForChildTasks'
   | 'completeGraphTask'
   | 'failGraphTask'
+  | 'workflowNextGraphTask'
+  | 'workflowPrevGraphTask'
+  | 'workflowFailGraphTask'
+  | 'invokeChildGraphTask'
   | 'askParent'
   | 'answerChildQuestion'
   | 'consumeCancelRequest';
@@ -127,6 +204,7 @@ export interface GraphCommandPayload {
   deleteMessageIds?: readonly string[];
   deleteOperationKeys?: readonly string[];
   operation?: { ledgerKey: string; entry: OperationLedgerEntry; createdAt: string };
+  dispositionClaim?: DurableDispositionClaim;
   cancelRequests?: readonly { turnId: string; request: CancelRequest }[];
   deleteCancelRequestTurnIds?: readonly string[];
   deleteRuntimeClaimTurnIds?: readonly string[];
@@ -199,6 +277,17 @@ export type RepositoryCommand =
       expectedTaskRevision: number; task: MusterTask; turns: readonly TaskTurn[];
       expectedTurns: readonly { id: string; status: TurnStatus; runtimeEpoch?: number }[];
       cancelRequests?: readonly { turnId: string; request: CancelRequest }[];
+      recovery?: {
+        failedTurnId: string;
+        expectedFailedStatus: 'failed' | 'interrupted';
+        turn: TaskTurn;
+        maxTurnsPerTask: number;
+        workflow?: {
+          runId: string;
+          activationId: string;
+          expectedActivationStatus: 'failed' | 'interrupted';
+        };
+      };
     }
   | {
       /** Stage one disposition on a live turn behind a status/runtime fence. */
@@ -229,13 +318,13 @@ export type RepositoryCommand =
       expectedTaskRevision: number; task: MusterTask; turn?: TaskTurn;
     }
   | {
-      /** Seal a dependency-policy terminal and its live/queued turn atomically. */
-      kind: 'applyDependencyTerminal'; workspaceId: string; taskId: string;
+      /** Seal a prerequisite-policy terminal and its live/queued turn atomically. */
+      kind: 'applyPrerequisiteTerminal'; workspaceId: string; taskId: string;
       expectedTaskRevision: number; task: MusterTask; turn?: TaskTurn;
     }
   | {
-      /** Propagate dependency terminal outcomes for a batch of affected tasks. */
-      kind: 'applyDependencyTerminals'; workspaceId: string;
+      /** Propagate prerequisite terminal outcomes for a batch of affected tasks. */
+      kind: 'applyPrerequisiteTerminals'; workspaceId: string;
       expectedTasks: readonly { id: string; revision: number }[];
       mutations: readonly { taskId: string; task: MusterTask; turn?: TaskTurn }[];
     }
@@ -256,11 +345,8 @@ export type RepositoryCommand =
   | { kind: 'deleteTask'; workspaceId: string; taskId: string }
   /** Atomically remove every idle/terminal root except the focused root. */
   | { kind: 'clearHistory'; workspaceId: string; preserveRootTaskId?: string }
-  /** Atomically remove one complete root subtree when every member is idle/terminal. */
-  | {
-      kind: 'deleteTaskSubtreeIfIdle'; workspaceId: string; rootTaskId: string;
-      preserveRootTaskId?: string;
-    }
+  /** Atomically remove one selected task and its complete subtree. */
+  | { kind: 'deleteTaskSubtree'; workspaceId: string; rootTaskId: string }
   /** Host rename boundary with an optimistic task-revision fence. */
   | {
       kind: 'renameTask'; workspaceId: string; taskId: string; goal: string;
@@ -342,6 +428,68 @@ export type RepositoryCommand =
       document: PresentationRecord;
     }
   | {
+      /** Immutable one-node workflow definition claim + insert (M018 S01). */
+      kind: 'defineWorkflowVersion';
+      workspaceId: string;
+      definitionId: string;
+      version: number;
+      name: string;
+      topology: unknown;
+      entryContracts?: unknown;
+      policy?: WorkflowPolicyV1;
+      ownerRootTaskId?: string;
+      publicOperation?: {
+        ledgerKey: string;
+        fingerprint: string;
+      };
+      createdAt: string;
+    }
+  | {
+      /**
+       * Idempotent compound start for a frozen one-node definition (M018 S01).
+       * Claims startIdempotencyKey, then inserts run/node/gate/artifact/task/
+       * aggregate message + queued entry turns in one transaction.
+       */
+      kind: 'startWorkflowRun';
+      workspaceId: string;
+      definitionId: string;
+      version: number;
+      startIdempotencyKey: string;
+      createdAt: string;
+      goal?: string;
+      backend?: string;
+      entryInputs?: readonly {
+        entryNodeId: string;
+        inputRef: string;
+        kind: string;
+        value: string;
+      }[];
+      ownerRootTaskId?: string;
+      callerTaskId?: string;
+      callerTurnId?: string;
+      resumeCallerOnCompletion?: boolean;
+      effectivePolicy?: WorkflowPolicyV1;
+      publicOperation?: {
+        ledgerKey: string;
+        fingerprint: string;
+      };
+    }
+  | {
+      /** Close every running workflow whose frozen absolute deadline has elapsed. */
+      kind: 'reapWorkflowTimeouts'; workspaceId: string; now: string;
+    }
+  | {
+      /** Resolve a completed top-level workflow into its deterministic caller resume. */
+      kind: 'resolveWorkflowStartContinuation'; workspaceId: string; now: string;
+    }
+  | {
+      /** Explicitly queue a new execution for one failed/interrupted logical activation. */
+      kind: 'recoverWorkflowActivation'; workspaceId: string;
+      runId: string; activationId: string; failedTurnId: string;
+      recoveryOperationId: string; fingerprint: string; instruction: string;
+      expectedActivationStatus: 'failed' | 'interrupted'; createdAt: string;
+    }
+  | {
       /** Atomic durable coordinator idempotency claim + presentation commit. */
       kind: 'commitPresentationOperation';
       workspaceId: string;
@@ -415,12 +563,20 @@ export function isGraphCommand(command: RepositoryCommand): command is GraphComm
     command.kind === 'cancelChildTasks' || command.kind === 'interruptChildTask' ||
     command.kind === 'cancelChildTask' || command.kind === 'setChildTaskLifecycle' ||
     command.kind === 'waitForChildTasks' || command.kind === 'completeGraphTask' ||
-    command.kind === 'failGraphTask' || command.kind === 'askParent' ||
+    command.kind === 'failGraphTask' || command.kind === 'workflowNextGraphTask' ||
+    command.kind === 'workflowPrevGraphTask' ||
+    command.kind === 'workflowFailGraphTask' ||
+    command.kind === 'invokeChildGraphTask' ||
+    command.kind === 'askParent' ||
     command.kind === 'answerChildQuestion' || command.kind === 'consumeCancelRequest';
 }
 
 export interface RepositoryCommandResult {
-  ok: true;
+  /**
+   * True for applied/replayed commands; false for fail-closed domain conflicts
+   * (e.g. define/start workflow fingerprint or validation failures).
+   */
+  ok: boolean;
   changed?: boolean;
   /** A non-secret, UI-safe denial reason for a conditional command. */
   reason?: string;
@@ -429,7 +585,10 @@ export interface RepositoryCommandResult {
   conflict?: boolean;
   /** Queue mutation result fields; absent for unrelated commands. */
   messageId?: string;
+  turnId?: string;
   deletedMessageIds?: readonly string[];
+  /** Task aggregates changed indirectly by the command, such as a fan-in consumer activation. */
+  affectedTaskIds?: readonly string[];
   presentationStatus?:
     | 'committed'
     | 'idempotent'
@@ -437,6 +596,73 @@ export interface RepositoryCommandResult {
     | 'stale_revision'
     | 'owner_mismatch';
 }
+
+export type WorkflowTransactionalCommand = Extract<
+  RepositoryCommand,
+  {
+    kind:
+      | GraphCommand['kind']
+      | 'stageDisposition'
+      | 'applyTaskLifecycle'
+      | 'cascadeTaskLifecycle'
+      | 'defineWorkflowVersion'
+      | 'startWorkflowRun'
+      | 'reapWorkflowTimeouts'
+      | 'resolveWorkflowStartContinuation'
+      | 'recoverWorkflowActivation'
+      | 'settleTurnAndApplyEffects';
+  }
+>;
+
+export function isWorkflowTransactionalCommand(
+  command: RepositoryCommand,
+): command is WorkflowTransactionalCommand {
+  return isGraphCommand(command) || [
+    'stageDisposition',
+    'applyTaskLifecycle',
+    'cascadeTaskLifecycle',
+    'defineWorkflowVersion',
+    'startWorkflowRun',
+    'reapWorkflowTimeouts',
+    'resolveWorkflowStartContinuation',
+    'recoverWorkflowActivation',
+    'settleTurnAndApplyEffects',
+  ].includes(command.kind);
+}
+
+export interface RepositoryDatabase {
+  all<T = unknown>(sql: string, params?: SqlValue[]): Promise<T[]>;
+  get<T = unknown>(sql: string, params?: SqlValue[]): Promise<T | undefined>;
+  run(sql: string, params?: SqlValue[]): Promise<RunResult>;
+  transaction(
+    statements: SqlStatement[],
+    options?: { abortIfFirstUnchanged?: boolean; abortIfUnchangedAt?: number[] },
+  ): Promise<RunResult[]>;
+  pragma(pragma: string): Promise<number>;
+  executeWorkflowMutation?(
+    command: WorkflowTransactionalCommand,
+    changeFeedRetainRevisions: number,
+  ): Promise<RepositoryCommandResult>;
+}
+
+type WorkflowTurnReservation = {
+  runId: string;
+  taskId: string;
+  count: number;
+};
+
+type WorkflowRunReservation = {
+  runId: string;
+  count: number;
+};
+
+type WorkflowEffectPlan = {
+  statements: SqlStatement[];
+  changes: ChangeRecord[];
+  feedbackRoundReservations?: WorkflowRunReservation[];
+  turnReservations?: WorkflowTurnReservation[];
+  conflictReason?: string;
+};
 
 /**
  * Read-side boundary for task data.
@@ -547,6 +773,58 @@ export interface TaskRepository {
    */
   getWorkspaceChangesSince(afterRevision: number, limit?: number): Promise<WorkspaceChangeFeedResult>;
   /**
+   * M018 S07: bounded workflow status for a task bound to a workflow node.
+   * Relational read of nodes → runs → gates/activations/rounds/continuations.
+   * Returns undefined when the task is not bound to a workflow node.
+   * Never includes topology, prompts, artifact bodies, secrets, or absolute paths.
+   */
+  getWorkflowStatusForTask(taskId: string): Promise<WorkflowTaskStatusProjection | undefined>;
+  /** Bounded public diagnostic projection for a workflow run owned by the caller root. */
+  inspectWorkflowRun(
+    runId: string,
+    ownerRootTaskId: string,
+  ): Promise<WorkflowRunInspectionProjection | undefined>;
+  /** Authorized completion state and terminal NEXT body for a waiting workflow start. */
+  getWorkflowRunCompletion(
+    runId: string,
+    ownerRootTaskId: string,
+  ): Promise<WorkflowRunCompletionProjection | undefined>;
+  /** Load and revalidate one frozen workflow definition for host-policy checks. */
+  getWorkflowDefinition(
+    definitionId: string,
+    version: number,
+  ): Promise<WorkflowDefinitionV1 | undefined>;
+  /** Latest immutable definition revision authorized for this root-scoped caller. */
+  getLatestWorkflowDefinition(
+    definitionId: string,
+    ownerRootTaskId: string,
+  ): Promise<WorkflowDefinitionV1 | undefined>;
+  /** Existing alias-based start claim, used to freeze latest-resolution across retries. */
+  getWorkflowStartResolution(input: {
+    ownerRootTaskId: string;
+    callerTaskId: string;
+    definitionId: string;
+    startIdempotencyKey: string;
+  }): Promise<{ version: number; policy: WorkflowPolicyV1 } | undefined>;
+  /** Resolve semantic current-input names to exact immutable artifact pins. */
+  resolveWorkflowInputArtifacts(
+    turnId: string,
+    ownerRootTaskId: string,
+    inputRefs: readonly string[],
+  ): Promise<readonly {
+    inputRef: string;
+    artifactId: string;
+    artifactRevision: number;
+  }[] | undefined>;
+  /** Frozen effective policy for an already-claimed scoped start replay. */
+  getWorkflowStartPolicy(input: {
+    ownerRootTaskId: string;
+    callerTaskId: string;
+    definitionId: string;
+    version: number;
+    startIdempotencyKey: string;
+  }): Promise<WorkflowPolicyV1 | undefined>;
+  /**
    * Optional local-host read barrier supplied by the projection wrapper. The
    * callback runs between complete execute→refresh→publish lifecycles, so a
    * multi-query bounded snapshot cannot interleave with this host's writes.
@@ -559,7 +837,7 @@ export interface TaskRepository {
 /** Strict versioned send-outbox payload (P4-W11). Bound field sizes; no freeform blobs. */
 export const SEND_OUTBOX_PAYLOAD_VERSION = 1;
 export const SEND_OUTBOX_MAX_ENTRIES = 32;
-export const SEND_OUTBOX_TEXT_MAX = 100_000;
+export const SEND_OUTBOX_TEXT_MAX = TASK_MESSAGE_MAX_CHARS;
 export const SEND_OUTBOX_SKILLS_MAX = 8;
 export const SEND_OUTBOX_MENTION_BINDINGS_MAX = 64;
 export const SEND_OUTBOX_PATH_MAX = 4096;
@@ -793,8 +1071,8 @@ function validateGraphCommand(command: GraphCommand): string | undefined {
       // Existing parents need not be part of the bounded write set; the adapter
       // checks the FK/query fence before applying the row.
     }
-    for (const dependency of task.dependencies) {
-      if (dependency.taskId === task.id) return 'graph task cannot depend on itself';
+    for (const prerequisite of task.prerequisites) {
+      if (prerequisite.producerTaskId === task.id) return 'graph task cannot require itself';
     }
   }
   for (const turn of command.turns) {
@@ -811,6 +1089,26 @@ function validateGraphCommand(command: GraphCommand): string | undefined {
     }
   }
   if (command.operation && command.operation.ledgerKey.length === 0) return 'graph operation key is empty';
+  if (command.dispositionClaim) {
+    const turn = command.turns.find((candidate) => candidate.id === command.dispositionClaim?.turnId);
+    if (!turn?.disposition || turn.taskId !== command.dispositionClaim.taskId) {
+      return 'graph disposition claim does not match turn';
+    }
+    const expected = durableDispositionClaim({
+      turnId: turn.id,
+      taskId: turn.taskId,
+      runtimeEpoch: turn.runtimeEpoch,
+      opId: command.dispositionClaim.opId,
+      disposition: turn.disposition,
+    });
+    if (
+      expected.fingerprint !== command.dispositionClaim.fingerprint ||
+      expected.family !== command.dispositionClaim.family ||
+      expected.kind !== command.dispositionClaim.kind
+    ) {
+      return 'graph disposition claim fingerprint mismatch';
+    }
+  }
   if (command.kind === 'consumeCancelRequest' &&
       ((command.expectedRuntimeClaims?.length ?? 0) === 0 ||
        (command.expectedCancelRequests?.length ?? 0) === 0)) {
@@ -878,7 +1176,7 @@ export class SqliteTaskRepository implements TaskRepository {
   private readonly changeFeedRetainRevisions: number;
 
   constructor(
-    private readonly db: DbClient,
+    private readonly db: RepositoryDatabase,
     private readonly workspaceId: string,
     options: SqliteTaskRepositoryOptions = {},
   ) {
@@ -910,20 +1208,43 @@ export class SqliteTaskRepository implements TaskRepository {
   private async hydrateTasks(rows: readonly TaskRow[]): Promise<MusterTask[]> {
     if (rows.length === 0) return [];
     const ids = rows.map((row) => row.id);
-    const dependencies = await this.db.all<DependencyRow>(
-      `SELECT task_id, dependency_task_id, required_outcome, on_unsatisfied, required_verdict
-         FROM task_dependencies
+    const prerequisites = await this.db.all<PrerequisiteRow>(
+      `SELECT task_id, producer_task_id, required_lifecycle, on_unmet, required_verdict
+         FROM task_prerequisites
         WHERE workspace_id = ? AND task_id IN (${placeholders(ids.length)})
-        ORDER BY task_id, dependency_task_id`,
+        ORDER BY task_id, producer_task_id`,
       [this.workspaceId, ...ids],
     );
-    const byTask = new Map<string, TaskDependency[]>();
-    for (const dependency of dependencies) {
-      const list = byTask.get(dependency.task_id) ?? [];
-      list.push(decodeDependency(dependency));
-      byTask.set(dependency.task_id, list);
+    const byTask = new Map<string, TaskPrerequisite[]>();
+    for (const prerequisite of prerequisites) {
+      const list = byTask.get(prerequisite.task_id) ?? [];
+      list.push(decodePrerequisite(prerequisite));
+      byTask.set(prerequisite.task_id, list);
     }
-    return rows.map((row) => decodeTask(row, byTask.get(row.id) ?? []));
+    const bindings = await this.db.all<SessionBindingRow>(
+      `SELECT task_id, runtime_epoch, backend, session_id
+         FROM task_session_bindings
+        WHERE workspace_id = ? AND active = 1
+          AND task_id IN (${placeholders(ids.length)})`,
+      [this.workspaceId, ...ids],
+    );
+    const bindingByTask = new Map(bindings.map((binding) => [binding.task_id, binding]));
+    return rows.map((row) => {
+      const task = decodeTask(row, byTask.get(row.id) ?? []);
+      const binding = bindingByTask.get(row.id);
+      if (!binding) {
+        if (task.committedSessionId) throw new Error('task session binding missing');
+        return task;
+      }
+      if (
+        binding.backend !== task.backend ||
+        binding.runtime_epoch !== (task.runtimeEpoch ?? 1) ||
+        (task.committedSessionId !== undefined && task.committedSessionId !== binding.session_id)
+      ) {
+        throw new Error('task session binding mismatch');
+      }
+      return { ...task, committedSessionId: binding.session_id };
+    });
   }
 
   private async hydrateTurns(rows: readonly TurnRow[]): Promise<TaskTurn[]> {
@@ -942,7 +1263,135 @@ export class SqliteTaskRepository implements TaskRepository {
       list.push(decodeTurnInput(input));
       byTurn.set(input.turn_id, list);
     }
-    return rows.map((row) => decodeTurn(row, byTurn.get(row.id) ?? []));
+    const activations = await this.db.all<{
+      execution_turn_id: string;
+      run_id: string;
+      activation_id: string;
+      node_id: string;
+      activation_kind: NonNullable<TaskTurn['workflowActivation']>['kind'];
+      activation_status: NonNullable<TaskTurn['workflowActivation']>['activationStatus'];
+      run_status: NonNullable<TaskTurn['workflowActivation']>['runStatus'];
+      is_terminal: number;
+      has_direct_dependencies: number;
+      has_open_feedback_round: number;
+      has_pending_continuation: number;
+      has_inherited_feedback_response: number;
+    }>(
+      `SELECT activation.execution_turn_id,
+              activation.run_id,
+              activation.activation_id,
+              activation.node_id,
+              activation.kind AS activation_kind,
+              activation.status AS activation_status,
+              run.status AS run_status,
+              definition_node.is_terminal,
+              EXISTS (
+                SELECT 1
+                  FROM workflow_dependency_gates gate_row
+                  JOIN workflow_gate_bindings binding
+                    ON binding.workspace_id = gate_row.workspace_id
+                   AND binding.run_id = gate_row.run_id
+                   AND binding.gate_id = gate_row.gate_id
+                 WHERE gate_row.workspace_id = activation.workspace_id
+                   AND gate_row.run_id = activation.run_id
+                   AND gate_row.consumer_node_id = activation.node_id
+                   AND binding.producer_node_id IS NOT NULL
+              ) AS has_direct_dependencies,
+              EXISTS (
+                SELECT 1 FROM workflow_feedback_rounds round_row
+                 WHERE round_row.workspace_id = activation.workspace_id
+                   AND round_row.run_id = activation.run_id
+                   AND round_row.status = 'open'
+              ) AS has_open_feedback_round,
+               EXISTS (
+                SELECT 1 FROM workflow_continuations continuation
+                 WHERE continuation.workspace_id = activation.workspace_id
+                   AND continuation.run_id = activation.run_id
+                   AND continuation.kind = 'child_wait'
+                    AND continuation.status = 'pending'
+               ) AS has_pending_continuation,
+               CASE
+                 WHEN activation.kind = 'feedback_request' THEN 1
+                 WHEN activation.kind = 'feedback_resume'
+                  AND activation.inherited_feedback_round_id IS NOT NULL
+                  AND activation.inherited_feedback_target_node_id IS NOT NULL THEN 1
+                 ELSE 0
+               END AS has_inherited_feedback_response
+         FROM workflow_activations activation
+         JOIN workflow_runs run
+           ON run.workspace_id = activation.workspace_id
+          AND run.run_id = activation.run_id
+         JOIN workflow_definition_nodes definition_node
+           ON definition_node.workspace_id = run.workspace_id
+          AND definition_node.definition_id = run.definition_id
+          AND definition_node.definition_version = run.definition_version
+          AND definition_node.node_id = activation.node_id
+        WHERE activation.workspace_id = ?
+          AND activation.execution_turn_id IN (${placeholders(ids.length)})`,
+      [this.workspaceId, ...ids],
+    );
+    const activationByTurn = new Map(
+      activations.map((activation) => [activation.execution_turn_id, activation]),
+    );
+    const authorityWaits = await this.db.all<{
+      turn_id: string;
+      has_open_feedback_round: number;
+      has_pending_continuation: number;
+    }>(
+      `SELECT candidate.id AS turn_id,
+              EXISTS (
+                SELECT 1 FROM workflow_feedback_rounds round_row
+                 WHERE round_row.workspace_id = candidate.workspace_id
+                   AND round_row.requester_task_id = candidate.task_id
+                   AND round_row.status IN ('open', 'satisfied')
+              ) AS has_open_feedback_round,
+              EXISTS (
+                SELECT 1 FROM workflow_continuations continuation
+                 WHERE continuation.workspace_id = candidate.workspace_id
+                   AND continuation.caller_task_id = candidate.task_id
+                   AND continuation.status IN ('pending', 'resolved')
+              ) AS has_pending_continuation
+         FROM turns candidate
+        WHERE candidate.workspace_id = ?
+          AND candidate.id IN (${placeholders(ids.length)})`,
+      [this.workspaceId, ...ids],
+    );
+    const authorityWaitByTurn = new Map(
+      authorityWaits.map((wait) => [wait.turn_id, wait]),
+    );
+    return rows.map((row) => {
+      const turn = decodeTurn(row, byTurn.get(row.id) ?? []);
+      const activation = activationByTurn.get(row.id);
+      const wait = authorityWaitByTurn.get(row.id);
+      return {
+        ...turn,
+        ...(activation
+          ? {
+              workflowActivation: {
+                runId: activation.run_id,
+                activationId: activation.activation_id,
+                nodeId: activation.node_id,
+              kind: activation.activation_kind,
+              runStatus: activation.run_status,
+              activationStatus: activation.activation_status,
+              isTerminalNode: activation.is_terminal === 1,
+              hasDirectDependencies: activation.has_direct_dependencies === 1,
+              hasOpenFeedbackRound: activation.has_open_feedback_round === 1,
+                hasPendingContinuation: activation.has_pending_continuation === 1,
+                hasInheritedFeedbackResponse: activation.has_inherited_feedback_response === 1,
+              },
+            }
+          : {}),
+        ...(wait && (wait.has_open_feedback_round === 1 || wait.has_pending_continuation === 1)
+          ? {
+              workflowWait: {
+                hasOpenFeedbackRound: wait.has_open_feedback_round === 1,
+                hasPendingContinuation: wait.has_pending_continuation === 1,
+              },
+            }
+          : {}),
+      };
+    });
   }
 
   async getTask(taskId: string): Promise<MusterTask | undefined> {
@@ -1168,8 +1617,8 @@ export class SqliteTaskRepository implements TaskRepository {
 
   async listReasoning(taskId: string): Promise<readonly PersistedReasoning[]> {
     const rows = await this.db.all<ReasoningRow>(
-      `SELECT id, task_id, turn_id, content, created_at, updated_at
-         FROM reasoning_segments WHERE workspace_id = ? AND task_id = ? ORDER BY created_at, id`,
+      `SELECT id, task_id, turn_id, ordering, content, created_at, updated_at
+         FROM reasoning_segments WHERE workspace_id = ? AND task_id = ? ORDER BY turn_id, ordering, id`,
       [this.workspaceId, taskId],
     );
     return rows.map(decodeReasoning);
@@ -1178,10 +1627,10 @@ export class SqliteTaskRepository implements TaskRepository {
   async listReasoningByIds(ids: readonly string[]): Promise<readonly PersistedReasoning[]> {
     if (ids.length === 0) return [];
     const rows = await this.db.all<ReasoningRow>(
-      `SELECT id, task_id, turn_id, content, created_at, updated_at
+      `SELECT id, task_id, turn_id, ordering, content, created_at, updated_at
          FROM reasoning_segments
-        WHERE workspace_id = ? AND id IN (${placeholders(ids.length)})
-        ORDER BY created_at, id`,
+         WHERE workspace_id = ? AND id IN (${placeholders(ids.length)})
+         ORDER BY turn_id, ordering, id`,
       [this.workspaceId, ...ids],
     );
     return rows.map(decodeReasoning);
@@ -1578,6 +2027,904 @@ export class SqliteTaskRepository implements TaskRepository {
     };
   }
 
+  async getWorkflowDefinition(
+    definitionId: string,
+    version: number,
+  ): Promise<WorkflowDefinitionV1 | undefined> {
+    if (!definitionId || !Number.isInteger(version) || version < 1) return undefined;
+    const row = await this.db.get<{
+      name: string;
+      topology_json: string;
+      scope_kind: string;
+      owner_root_task_id: string | null;
+      fingerprint: string;
+      policy_json: string;
+      created_at: string;
+    }>(
+      `SELECT name, topology_json, scope_kind, owner_root_task_id,
+              fingerprint, policy_json, created_at
+         FROM workflow_definitions
+        WHERE workspace_id = ? AND definition_id = ? AND version = ?`,
+      [this.workspaceId, definitionId, version],
+    );
+    if (!row || (row.scope_kind !== 'workspace' && row.scope_kind !== 'root')) {
+      return undefined;
+    }
+    const topology = decodeStoredTopologyJson(row.topology_json);
+    if (!topology.ok) return undefined;
+    const contracts = await this.db.all<{
+      entry_node_id: string;
+      input_ref: string;
+      expected_artifact_kind: string;
+    }>(
+      `SELECT entry_node_id, input_ref, expected_artifact_kind
+         FROM workflow_entry_contracts
+        WHERE workspace_id = ? AND definition_id = ? AND definition_version = ?
+        ORDER BY ordinal`,
+      [this.workspaceId, definitionId, version],
+    );
+    let policy: unknown;
+    try {
+      policy = JSON.parse(row.policy_json);
+    } catch {
+      return undefined;
+    }
+    const validated = validateDefineWorkflow({
+      definitionId,
+      version,
+      name: row.name,
+      topology: topology.topology,
+      entryContracts: contracts.map((contract) => ({
+        entryNodeId: contract.entry_node_id,
+        inputRef: contract.input_ref,
+        expectedArtifactKind: contract.expected_artifact_kind,
+      })),
+      policy,
+      scope: row.scope_kind === 'root'
+        ? { kind: 'root', ownerRootTaskId: row.owner_root_task_id ?? '' }
+        : { kind: 'workspace' },
+      createdAt: row.created_at,
+    });
+    if (!validated.ok || validated.fingerprint !== row.fingerprint) return undefined;
+    return validated.definition;
+  }
+
+  async getLatestWorkflowDefinition(
+    definitionId: string,
+    ownerRootTaskId: string,
+  ): Promise<WorkflowDefinitionV1 | undefined> {
+    if (!definitionId || !ownerRootTaskId) return undefined;
+    const row = await this.db.get<{ version: number }>(
+      `SELECT version
+         FROM workflow_definitions
+        WHERE workspace_id = ?
+          AND definition_id = ?
+          AND (
+            scope_kind = 'workspace'
+            OR (scope_kind = 'root' AND owner_root_task_id = ?)
+          )
+        ORDER BY version DESC
+        LIMIT 1`,
+      [this.workspaceId, definitionId, ownerRootTaskId],
+    );
+    return row ? this.getWorkflowDefinition(definitionId, row.version) : undefined;
+  }
+
+  async getWorkflowStartResolution(input: {
+    ownerRootTaskId: string;
+    callerTaskId: string;
+    definitionId: string;
+    startIdempotencyKey: string;
+  }): Promise<{ version: number; policy: WorkflowPolicyV1 } | undefined> {
+    const row = await this.db.get<{ definition_version: number; policy_json: string }>(
+      `SELECT claim.definition_version, run.policy_json
+         FROM workflow_start_claims claim
+         JOIN workflow_runs run
+           ON run.workspace_id = claim.workspace_id
+          AND run.run_id = claim.run_id
+        WHERE claim.workspace_id = ?
+          AND claim.owner_task_id = ?
+          AND claim.caller_task_id = ?
+          AND claim.definition_id = ?
+          AND claim.idempotency_key = ?
+        ORDER BY claim.created_at, claim.definition_version
+        LIMIT 1`,
+      [
+        this.workspaceId,
+        input.ownerRootTaskId,
+        input.callerTaskId,
+        input.definitionId,
+        input.startIdempotencyKey,
+      ],
+    );
+    if (!row) return undefined;
+    const definition = await this.getWorkflowDefinition(input.definitionId, row.definition_version);
+    if (!definition) return undefined;
+    let policy: unknown;
+    try {
+      policy = JSON.parse(row.policy_json);
+    } catch {
+      return undefined;
+    }
+    const validated = validateDefineWorkflow({ ...definition, policy });
+    return validated.ok
+      ? { version: row.definition_version, policy: validated.definition.policy }
+      : undefined;
+  }
+
+  async resolveWorkflowInputArtifacts(
+    turnId: string,
+    ownerRootTaskId: string,
+    inputRefs: readonly string[],
+  ): Promise<readonly {
+    inputRef: string;
+    artifactId: string;
+    artifactRevision: number;
+  }[] | undefined> {
+    const uniqueRefs = [...new Set(inputRefs)];
+    if (!turnId || !ownerRootTaskId || uniqueRefs.length === 0 || uniqueRefs.length > 32) {
+      return undefined;
+    }
+    const activation = await this.db.get<{
+      run_id: string;
+      source_gate_id: string | null;
+      return_gate_id: string | null;
+      primary_turn_id: string;
+    }>(
+      `SELECT activation.run_id, activation.source_gate_id,
+              activation.return_gate_id, activation.primary_turn_id
+         FROM workflow_activations activation
+         JOIN workflow_runs run
+           ON run.workspace_id = activation.workspace_id
+          AND run.run_id = activation.run_id
+        WHERE activation.workspace_id = ?
+          AND activation.execution_turn_id = ?
+          AND run.owner_root_task_id = ?
+        LIMIT 1`,
+      [this.workspaceId, turnId, ownerRootTaskId],
+    );
+    if (!activation) return undefined;
+    let gateId = activation.source_gate_id ?? activation.return_gate_id;
+    if (!gateId) {
+      const primary = await this.db.get<{ gate_id: string | null }>(
+        `SELECT COALESCE(source_gate_id, return_gate_id) AS gate_id
+           FROM workflow_activations
+          WHERE workspace_id = ?
+            AND run_id = ?
+            AND execution_turn_id = ?
+          LIMIT 1`,
+        [this.workspaceId, activation.run_id, activation.primary_turn_id],
+      );
+      gateId = primary?.gate_id ?? null;
+    }
+    if (!gateId) return undefined;
+    const placeholders = uniqueRefs.map(() => '?').join(', ');
+    const rows = await this.db.all<{
+      input_ref: string;
+      artifact_id: string;
+      artifact_revision: number;
+    }>(
+      `SELECT input_ref, artifact_id, artifact_revision
+         FROM workflow_gate_fills
+        WHERE workspace_id = ?
+          AND run_id = ?
+          AND gate_id = ?
+          AND input_ref IN (${placeholders})`,
+      [this.workspaceId, activation.run_id, gateId, ...uniqueRefs],
+    );
+    if (rows.length !== uniqueRefs.length) return undefined;
+    const byRef = new Map(rows.map((row) => [row.input_ref, row]));
+    return uniqueRefs.map((inputRef) => {
+      const row = byRef.get(inputRef)!;
+      return {
+        inputRef,
+        artifactId: row.artifact_id,
+        artifactRevision: row.artifact_revision,
+      };
+    });
+  }
+
+  async getWorkflowStartPolicy(input: {
+    ownerRootTaskId: string;
+    callerTaskId: string;
+    definitionId: string;
+    version: number;
+    startIdempotencyKey: string;
+  }): Promise<WorkflowPolicyV1 | undefined> {
+    const row = await this.db.get<{ policy_json: string }>(
+      `SELECT run.policy_json
+         FROM workflow_start_claims claim
+         JOIN workflow_runs run
+           ON run.workspace_id = claim.workspace_id
+          AND run.run_id = claim.run_id
+        WHERE claim.workspace_id = ?
+          AND claim.owner_task_id = ?
+          AND claim.caller_task_id = ?
+          AND claim.definition_id = ?
+          AND claim.definition_version = ?
+          AND claim.idempotency_key = ?`,
+      [
+        this.workspaceId,
+        input.ownerRootTaskId,
+        input.callerTaskId,
+        input.definitionId,
+        input.version,
+        input.startIdempotencyKey,
+      ],
+    );
+    if (!row) return undefined;
+    const definition = await this.getWorkflowDefinition(input.definitionId, input.version);
+    if (!definition) return undefined;
+    let policy: unknown;
+    try {
+      policy = JSON.parse(row.policy_json);
+    } catch {
+      return undefined;
+    }
+    const validated = validateDefineWorkflow({ ...definition, policy });
+    return validated.ok ? validated.definition.policy : undefined;
+  }
+
+  /**
+   * M018 S07: bounded internal workflow projection for a task-bound node.
+   * Reads relational run, gate, activation, round, continuation, and integrity
+   * state without topology, prompts, artifact bodies, or paths.
+   */
+  async getWorkflowStatusForTask(
+    taskId: string,
+  ): Promise<WorkflowTaskStatusProjection | undefined> {
+    if (typeof taskId !== 'string' || taskId.length === 0) {
+      return undefined;
+    }
+    const node = await this.db.get<{
+      run_id: string;
+      node_id: string;
+    }>(
+      `SELECT run_id, node_id FROM workflow_nodes
+        WHERE workspace_id = ? AND task_id = ?`,
+      [this.workspaceId, taskId],
+    );
+    if (!node || typeof node.run_id !== 'string' || typeof node.node_id !== 'string') {
+      return undefined;
+    }
+    const run = await this.db.get<{
+      run_id: string;
+      definition_id: string;
+      definition_version: number;
+      status: string;
+      origin: string;
+      parent_run_id: string | null;
+      max_feedback_rounds: number;
+      max_turns_per_task: number;
+      max_workflow_turns: number;
+      max_children: number;
+      max_depth: number;
+      max_concurrency: number;
+      max_aggregate_bytes: number;
+      started_at: string | null;
+      deadline_at: string | null;
+      terminal_reason_code: string | null;
+    }>(
+      `SELECT run_id, definition_id, definition_version, status, origin, parent_run_id,
+              max_feedback_rounds, max_turns_per_task, max_workflow_turns,
+              max_children, max_depth, max_concurrency, max_aggregate_bytes,
+              started_at, deadline_at, terminal_reason_code
+         FROM workflow_runs
+        WHERE workspace_id = ? AND run_id = ?`,
+      [this.workspaceId, node.run_id],
+    );
+    if (!run) {
+      return undefined;
+    }
+
+    const gateRows = await this.db.all<{
+      gate_id: string;
+      consumer_node_id: string;
+      status: string;
+      required: number;
+      satisfied: number;
+    }>(
+      `SELECT g.gate_id AS gate_id,
+              g.consumer_node_id AS consumer_node_id,
+              g.status AS status,
+              (SELECT COUNT(*) FROM workflow_gate_bindings b
+                WHERE b.workspace_id = g.workspace_id
+                  AND b.run_id = g.run_id
+                  AND b.gate_id = g.gate_id) AS required,
+              (SELECT COUNT(DISTINCT f.input_ref) FROM workflow_gate_fills f
+                WHERE f.workspace_id = g.workspace_id
+                  AND f.run_id = g.run_id
+                  AND f.gate_id = g.gate_id) AS satisfied
+         FROM workflow_dependency_gates g
+        WHERE g.workspace_id = ? AND g.run_id = ?
+        ORDER BY g.gate_id
+        LIMIT 65`,
+      [this.workspaceId, node.run_id],
+    );
+
+    const activationRows = await this.db.all<{
+      activation_id: string;
+      kind: string;
+      status: string;
+      primary_turn_id: string;
+      execution_turn_id: string;
+      source_gate_id: string | null;
+      feedback_round_id: string | null;
+      feedback_target_node_id: string | null;
+      continuation_id: string | null;
+      return_gate_id: string | null;
+    }>(
+      `SELECT activation_id, kind, status, primary_turn_id, execution_turn_id,
+              source_gate_id, feedback_round_id, feedback_target_node_id,
+              continuation_id, return_gate_id
+         FROM workflow_activations
+        WHERE workspace_id = ? AND run_id = ? AND node_id = ?
+          AND status IN ('queued', 'running', 'failed', 'interrupted')
+        ORDER BY CASE status
+                   WHEN 'running' THEN 0
+                   WHEN 'queued' THEN 1
+                   WHEN 'interrupted' THEN 2
+                   ELSE 3
+                 END,
+                 updated_at DESC, activation_id
+        LIMIT 2`,
+      [this.workspaceId, node.run_id, node.node_id],
+    );
+
+    const roundRows = await this.db.all<{
+      round_id: string;
+      status: string;
+      join_mode: string;
+      role: 'requester' | 'target';
+      required: number;
+      responded: number;
+    }>(
+      `SELECT round_row.round_id,
+              round_row.status,
+              round_row.join_mode,
+              CASE WHEN round_row.requester_task_id = ? THEN 'requester' ELSE 'target' END AS role,
+              (SELECT COUNT(*) FROM workflow_feedback_targets target
+                WHERE target.workspace_id = round_row.workspace_id
+                  AND target.run_id = round_row.run_id
+                  AND target.round_id = round_row.round_id) AS required,
+              (SELECT COUNT(*) FROM workflow_feedback_targets target
+                WHERE target.workspace_id = round_row.workspace_id
+                  AND target.run_id = round_row.run_id
+                  AND target.round_id = round_row.round_id
+                  AND target.status = 'responded') AS responded
+         FROM workflow_feedback_rounds round_row
+        WHERE round_row.workspace_id = ? AND round_row.run_id = ?
+          AND round_row.status IN ('open', 'satisfied')
+          AND (
+            round_row.requester_task_id = ?
+            OR EXISTS (
+              SELECT 1 FROM workflow_activations activation
+               WHERE activation.workspace_id = round_row.workspace_id
+                 AND activation.run_id = round_row.run_id
+                 AND activation.node_id = ?
+                 AND activation.feedback_round_id = round_row.round_id
+                 AND activation.status IN ('queued', 'running', 'failed', 'interrupted')
+            )
+          )
+        ORDER BY round_row.created_at, round_row.round_id
+        LIMIT 33`,
+      [taskId, this.workspaceId, node.run_id, taskId, node.node_id],
+    );
+
+    const continuationRows = await this.db.all<{
+      continuation_id: string;
+      status: string;
+      kind: string;
+      child_run_id: string | null;
+      outcome: string | null;
+      reason_code: string | null;
+    }>(
+      `SELECT continuation_id, status, kind, child_run_id, outcome, reason_code
+         FROM workflow_continuations
+        WHERE workspace_id = ?
+          AND (run_id = ? OR child_run_id = ?
+            OR (caller_run_id = ? AND caller_task_id = ?))
+        ORDER BY created_at, continuation_id
+        LIMIT 65`,
+      [this.workspaceId, node.run_id, node.run_id, node.run_id, taskId],
+    );
+
+    const liveState = await this.db.get<{
+      live_gate: number;
+      live_round: number;
+      live_activation: number;
+      live_continuation: number;
+      live_return_gate: number;
+    }>(
+      `SELECT
+         EXISTS (SELECT 1 FROM workflow_dependency_gates
+                  WHERE workspace_id = ? AND run_id = ? AND status IN ('open', 'satisfied')) AS live_gate,
+         EXISTS (SELECT 1 FROM workflow_feedback_rounds
+                  WHERE workspace_id = ? AND run_id = ? AND status IN ('open', 'satisfied')) AS live_round,
+         EXISTS (SELECT 1 FROM workflow_activations
+                  WHERE workspace_id = ? AND run_id = ? AND status IN ('queued', 'running')) AS live_activation,
+         EXISTS (SELECT 1 FROM workflow_continuations
+                  WHERE workspace_id = ? AND (run_id = ? OR child_run_id = ?)
+                    AND status IN ('pending', 'resolved')) AS live_continuation,
+         EXISTS (SELECT 1 FROM workflow_return_gates
+                  WHERE workspace_id = ?
+                    AND (continuation_run_id = ? OR child_run_id = ?)
+                    AND status IN ('open', 'satisfied')) AS live_return_gate`,
+      [
+        this.workspaceId, node.run_id,
+        this.workspaceId, node.run_id,
+        this.workspaceId, node.run_id,
+        this.workspaceId, node.run_id, node.run_id,
+        this.workspaceId, node.run_id, node.run_id,
+      ],
+    );
+
+    const diagnostics: Array<{ code: string }> = [];
+    const gatesTruncated = gateRows.length > 64;
+    const roundsTruncated = roundRows.length > 32;
+    const continuationsTruncated = continuationRows.length > 64;
+    if (gatesTruncated) diagnostics.push({ code: 'workflow_gates_truncated' });
+    if (roundsTruncated) diagnostics.push({ code: 'workflow_feedback_rounds_truncated' });
+    if (continuationsTruncated) diagnostics.push({ code: 'workflow_continuations_truncated' });
+    if (activationRows.length > 1) diagnostics.push({ code: 'multiple_recoverable_activations' });
+    const terminal = run.status === 'succeeded' || run.status === 'failed' || run.status === 'cancelled';
+    if (terminal && liveState?.live_gate === 1) diagnostics.push({ code: 'terminal_run_has_live_gate' });
+    if (terminal && liveState?.live_round === 1) diagnostics.push({ code: 'terminal_run_has_live_round' });
+    if (terminal && liveState?.live_activation === 1) diagnostics.push({ code: 'terminal_run_has_live_activation' });
+    if (terminal && liveState?.live_continuation === 1) diagnostics.push({ code: 'terminal_run_has_live_continuation' });
+    if (terminal && liveState?.live_return_gate === 1) diagnostics.push({ code: 'terminal_run_has_live_return_gate' });
+    const terminalReason = run.terminal_reason_code;
+    if (terminalReason !== null && !/^[a-z0-9_]{1,64}$/.test(terminalReason)) {
+      diagnostics.push({ code: 'invalid_terminal_reason' });
+    }
+
+    const gates = gateRows.slice(0, 64).map((g) => ({
+      gateId: g.gate_id,
+      status: g.status,
+      required: Number(g.required) || 0,
+      satisfied: Number(g.satisfied) || 0,
+    }));
+    const activationRow = activationRows.length === 1 ? activationRows[0] : undefined;
+    const activeGateRow = activationRow?.source_gate_id
+      ? gateRows.find((gate) => gate.gate_id === activationRow.source_gate_id)
+      : gateRows.find((gate) =>
+          gate.consumer_node_id === node.node_id && (gate.status === 'open' || gate.status === 'satisfied'));
+
+    const projection: WorkflowTaskStatusProjection = {
+      runId: run.run_id,
+      definitionId: run.definition_id,
+      definitionVersion: Number(run.definition_version),
+      runStatus: run.status,
+      policy: {
+        maxFeedbackRounds: Number(run.max_feedback_rounds) || 0,
+        maxTurnsPerTask: Number(run.max_turns_per_task) || 0,
+        maxWorkflowTurns: Number(run.max_workflow_turns) || 0,
+        maxChildren: Number(run.max_children) || 0,
+        maxDepth: Number(run.max_depth) || 0,
+        maxConcurrency: Number(run.max_concurrency) || 0,
+        maxAggregateBytes: Number(run.max_aggregate_bytes) || 0,
+      },
+      origin: run.origin,
+      nodeId: node.node_id,
+      gates,
+      feedbackRounds: roundRows.slice(0, 32).map((round) => ({
+        roundId: round.round_id,
+        status: round.status,
+        joinMode: round.join_mode,
+        role: round.role,
+        required: Number(round.required) || 0,
+        responded: Number(round.responded) || 0,
+      })),
+      continuations: continuationRows.slice(0, 64).map((continuation) => ({
+        continuationId: continuation.continuation_id,
+        status: continuation.status,
+        kind: continuation.kind,
+        ...(continuation.child_run_id ? { childRunId: continuation.child_run_id } : {}),
+        ...(continuation.outcome ? { outcome: continuation.outcome } : {}),
+        ...(continuation.reason_code ? { reasonCode: continuation.reason_code } : {}),
+      })),
+      diagnostics: diagnostics.slice(0, 8),
+    };
+    if (run.started_at) projection.startedAt = run.started_at;
+    if (run.deadline_at) projection.deadlineAt = run.deadline_at;
+    if (terminalReason && /^[a-z0-9_]{1,64}$/.test(terminalReason)) {
+      projection.terminalReason = terminalReason;
+    }
+    if (typeof run.parent_run_id === 'string' && run.parent_run_id.length > 0) {
+      projection.parentRunId = run.parent_run_id;
+    }
+    if (activeGateRow) {
+      projection.activeGate = {
+        gateId: activeGateRow.gate_id,
+        status: activeGateRow.status,
+        required: Number(activeGateRow.required) || 0,
+        satisfied: Number(activeGateRow.satisfied) || 0,
+      };
+    }
+    if (activationRow) {
+      projection.activation = {
+        activationId: activationRow.activation_id,
+        kind: activationRow.kind,
+        status: activationRow.status,
+        primaryTurnId: activationRow.primary_turn_id,
+        executionTurnId: activationRow.execution_turn_id,
+        ...(activationRow.source_gate_id ? { sourceGateId: activationRow.source_gate_id } : {}),
+        ...(activationRow.feedback_round_id ? { feedbackRoundId: activationRow.feedback_round_id } : {}),
+        ...(activationRow.feedback_target_node_id
+          ? { feedbackTargetNodeId: activationRow.feedback_target_node_id }
+          : {}),
+        ...(activationRow.continuation_id ? { continuationId: activationRow.continuation_id } : {}),
+        ...(activationRow.return_gate_id ? { returnGateId: activationRow.return_gate_id } : {}),
+      };
+    }
+    return projection;
+  }
+
+  async inspectWorkflowRun(
+    runId: string,
+    ownerRootTaskId: string,
+  ): Promise<WorkflowRunInspectionProjection | undefined> {
+    if (
+      typeof runId !== 'string' || runId.length === 0 ||
+      typeof ownerRootTaskId !== 'string' || ownerRootTaskId.length === 0
+    ) {
+      return undefined;
+    }
+
+    const run = await this.db.get<{
+      run_id: string;
+      definition_id: string;
+      definition_version: number;
+      status: string;
+      origin: string;
+      parent_run_id: string | null;
+      max_feedback_rounds: number;
+      max_turns_per_task: number;
+      max_workflow_turns: number;
+      max_children: number;
+      max_depth: number;
+      max_concurrency: number;
+      max_aggregate_bytes: number;
+      started_at: string | null;
+      deadline_at: string | null;
+      terminal_reason_code: string | null;
+      terminal_result_run_id: string | null;
+      terminal_result_artifact_id: string | null;
+      terminal_result_artifact_revision: number | null;
+    }>(
+      `SELECT run_id, definition_id, definition_version, status, origin, parent_run_id,
+              max_feedback_rounds, max_turns_per_task, max_workflow_turns,
+              max_children, max_depth, max_concurrency, max_aggregate_bytes,
+              started_at, deadline_at, terminal_reason_code,
+              terminal_result_run_id, terminal_result_artifact_id,
+              terminal_result_artifact_revision
+         FROM workflow_runs
+        WHERE workspace_id = ? AND run_id = ? AND owner_root_task_id = ?`,
+      [this.workspaceId, runId, ownerRootTaskId],
+    );
+    if (!run) return undefined;
+
+    const nodeRows = await this.db.all<{
+      node_id: string;
+      status: string;
+    }>(
+      `SELECT node_id, status
+         FROM workflow_nodes
+        WHERE workspace_id = ? AND run_id = ?
+        ORDER BY node_id
+        LIMIT 65`,
+      [this.workspaceId, runId],
+    );
+    const gateRows = await this.db.all<{
+      gate_id: string;
+      status: string;
+      required: number;
+      satisfied: number;
+    }>(
+      `SELECT g.gate_id AS gate_id,
+              g.status AS status,
+              (SELECT COUNT(*) FROM workflow_gate_bindings binding
+                WHERE binding.workspace_id = g.workspace_id
+                  AND binding.run_id = g.run_id
+                  AND binding.gate_id = g.gate_id) AS required,
+              (SELECT COUNT(DISTINCT fill.input_ref) FROM workflow_gate_fills fill
+                WHERE fill.workspace_id = g.workspace_id
+                  AND fill.run_id = g.run_id
+                  AND fill.gate_id = g.gate_id) AS satisfied
+         FROM workflow_dependency_gates g
+        WHERE g.workspace_id = ? AND g.run_id = ?
+        ORDER BY g.gate_id
+        LIMIT 65`,
+      [this.workspaceId, runId],
+    );
+    const activationRows = await this.db.all<{
+      node_id: string;
+      activation_id: string;
+      kind: string;
+      status: string;
+      primary_turn_id: string;
+      execution_turn_id: string;
+      source_gate_id: string | null;
+      feedback_round_id: string | null;
+      feedback_target_node_id: string | null;
+      continuation_id: string | null;
+      return_gate_id: string | null;
+    }>(
+      `SELECT node_id, activation_id, kind, status, primary_turn_id, execution_turn_id,
+              source_gate_id, feedback_round_id, feedback_target_node_id,
+              continuation_id, return_gate_id
+         FROM workflow_activations
+        WHERE workspace_id = ? AND run_id = ?
+          AND status IN ('queued', 'running', 'failed', 'interrupted')
+        ORDER BY CASE status
+                   WHEN 'running' THEN 0
+                   WHEN 'queued' THEN 1
+                   WHEN 'interrupted' THEN 2
+                   ELSE 3
+                 END,
+                 updated_at DESC, activation_id
+        LIMIT 65`,
+      [this.workspaceId, runId],
+    );
+    const roundRows = await this.db.all<{
+      round_id: string;
+      requester_node_id: string;
+      status: string;
+      join_mode: string;
+      required: number;
+      responded: number;
+    }>(
+      `SELECT round_row.round_id,
+              round_row.requester_node_id,
+              round_row.status,
+              round_row.join_mode,
+              (SELECT COUNT(*) FROM workflow_feedback_targets target
+                WHERE target.workspace_id = round_row.workspace_id
+                  AND target.run_id = round_row.run_id
+                  AND target.round_id = round_row.round_id) AS required,
+              (SELECT COUNT(*) FROM workflow_feedback_targets target
+                WHERE target.workspace_id = round_row.workspace_id
+                  AND target.run_id = round_row.run_id
+                  AND target.round_id = round_row.round_id
+                  AND target.status = 'responded') AS responded
+         FROM workflow_feedback_rounds round_row
+        WHERE round_row.workspace_id = ? AND round_row.run_id = ?
+          AND round_row.status IN ('open', 'satisfied')
+        ORDER BY round_row.created_at, round_row.round_id
+        LIMIT 33`,
+      [this.workspaceId, runId],
+    );
+    const continuationRows = await this.db.all<{
+      continuation_id: string;
+      status: string;
+      kind: string;
+      child_run_id: string | null;
+      outcome: string | null;
+      reason_code: string | null;
+    }>(
+      `SELECT continuation_id, status, kind, child_run_id, outcome, reason_code
+         FROM workflow_continuations
+        WHERE workspace_id = ? AND (run_id = ? OR child_run_id = ? OR caller_run_id = ?)
+        ORDER BY created_at, continuation_id
+        LIMIT 65`,
+      [this.workspaceId, runId, runId, runId],
+    );
+    const liveState = await this.db.get<{
+      live_gate: number;
+      live_round: number;
+      live_activation: number;
+      live_continuation: number;
+      live_return_gate: number;
+    }>(
+      `SELECT
+         EXISTS (SELECT 1 FROM workflow_dependency_gates
+                  WHERE workspace_id = ? AND run_id = ? AND status IN ('open', 'satisfied')) AS live_gate,
+         EXISTS (SELECT 1 FROM workflow_feedback_rounds
+                  WHERE workspace_id = ? AND run_id = ? AND status IN ('open', 'satisfied')) AS live_round,
+         EXISTS (SELECT 1 FROM workflow_activations
+                  WHERE workspace_id = ? AND run_id = ? AND status IN ('queued', 'running')) AS live_activation,
+         EXISTS (SELECT 1 FROM workflow_continuations
+                  WHERE workspace_id = ? AND (run_id = ? OR child_run_id = ? OR caller_run_id = ?)
+                    AND status IN ('pending', 'resolved')) AS live_continuation,
+         EXISTS (SELECT 1 FROM workflow_return_gates
+                  WHERE workspace_id = ? AND (continuation_run_id = ? OR child_run_id = ?)
+                    AND status IN ('open', 'satisfied')) AS live_return_gate`,
+      [
+        this.workspaceId, runId,
+        this.workspaceId, runId,
+        this.workspaceId, runId,
+        this.workspaceId, runId, runId, runId,
+        this.workspaceId, runId, runId,
+      ],
+    );
+
+    const diagnostics: Array<{ code: string }> = [];
+    if (nodeRows.length > 64) diagnostics.push({ code: 'workflow_nodes_truncated' });
+    if (gateRows.length > 64) diagnostics.push({ code: 'workflow_gates_truncated' });
+    if (activationRows.length > 64) diagnostics.push({ code: 'workflow_activations_truncated' });
+    if (roundRows.length > 32) diagnostics.push({ code: 'workflow_feedback_rounds_truncated' });
+    if (continuationRows.length > 64) diagnostics.push({ code: 'workflow_continuations_truncated' });
+    const terminal = run.status === 'succeeded' || run.status === 'failed' || run.status === 'cancelled';
+    if (terminal && liveState?.live_gate === 1) diagnostics.push({ code: 'terminal_run_has_live_gate' });
+    if (terminal && liveState?.live_round === 1) diagnostics.push({ code: 'terminal_run_has_live_round' });
+    if (terminal && liveState?.live_activation === 1) diagnostics.push({ code: 'terminal_run_has_live_activation' });
+    if (terminal && liveState?.live_continuation === 1) diagnostics.push({ code: 'terminal_run_has_live_continuation' });
+    if (terminal && liveState?.live_return_gate === 1) diagnostics.push({ code: 'terminal_run_has_live_return_gate' });
+    const terminalReason = run.terminal_reason_code;
+    if (terminalReason !== null && !/^[a-z0-9_]{1,64}$/.test(terminalReason)) {
+      diagnostics.push({ code: 'invalid_terminal_reason' });
+    }
+
+    const terminalResultValid =
+      typeof run.terminal_result_run_id === 'string' && run.terminal_result_run_id.length > 0 &&
+      typeof run.terminal_result_artifact_id === 'string' && run.terminal_result_artifact_id.length > 0 &&
+      Number.isInteger(run.terminal_result_artifact_revision) &&
+      Number(run.terminal_result_artifact_revision) > 0;
+    const hasTerminalResultValue =
+      run.terminal_result_run_id !== null ||
+      run.terminal_result_artifact_id !== null ||
+      run.terminal_result_artifact_revision !== null;
+    if (hasTerminalResultValue && !terminalResultValid) {
+      diagnostics.push({ code: 'invalid_terminal_result_reference' });
+    }
+    if (!terminal && terminalResultValid) {
+      diagnostics.push({ code: 'nonterminal_run_has_terminal_result' });
+    }
+
+    const projection: WorkflowRunInspectionProjection = {
+      runId: run.run_id,
+      definitionId: run.definition_id,
+      definitionVersion: Number(run.definition_version),
+      runStatus: run.status,
+      policy: {
+        maxFeedbackRounds: Number(run.max_feedback_rounds) || 0,
+        maxTurnsPerTask: Number(run.max_turns_per_task) || 0,
+        maxWorkflowTurns: Number(run.max_workflow_turns) || 0,
+        maxChildren: Number(run.max_children) || 0,
+        maxDepth: Number(run.max_depth) || 0,
+        maxConcurrency: Number(run.max_concurrency) || 0,
+        maxAggregateBytes: Number(run.max_aggregate_bytes) || 0,
+      },
+      origin: run.origin,
+      nodes: nodeRows.slice(0, 64).map((node) => ({
+        nodeId: node.node_id,
+        status: node.status,
+      })),
+      gates: gateRows.slice(0, 64).map((gate) => ({
+        gateId: gate.gate_id,
+        status: gate.status,
+        required: Number(gate.required) || 0,
+        satisfied: Number(gate.satisfied) || 0,
+      })),
+      activations: activationRows.slice(0, 64).map((activation) => ({
+        nodeId: activation.node_id,
+        activationId: activation.activation_id,
+        kind: activation.kind,
+        status: activation.status,
+        primaryTurnId: activation.primary_turn_id,
+        executionTurnId: activation.execution_turn_id,
+        ...(activation.source_gate_id ? { sourceGateId: activation.source_gate_id } : {}),
+        ...(activation.feedback_round_id ? { feedbackRoundId: activation.feedback_round_id } : {}),
+        ...(activation.feedback_target_node_id
+          ? { feedbackTargetNodeId: activation.feedback_target_node_id }
+          : {}),
+        ...(activation.continuation_id ? { continuationId: activation.continuation_id } : {}),
+        ...(activation.return_gate_id ? { returnGateId: activation.return_gate_id } : {}),
+      })),
+      feedbackRounds: roundRows.slice(0, 32).map((round) => ({
+        roundId: round.round_id,
+        requesterNodeId: round.requester_node_id,
+        status: round.status,
+        joinMode: round.join_mode,
+        required: Number(round.required) || 0,
+        responded: Number(round.responded) || 0,
+      })),
+      continuations: continuationRows.slice(0, 64).map((continuation) => ({
+        continuationId: continuation.continuation_id,
+        status: continuation.status,
+        kind: continuation.kind,
+        ...(continuation.child_run_id ? { childRunId: continuation.child_run_id } : {}),
+        ...(continuation.outcome ? { outcome: continuation.outcome } : {}),
+        ...(continuation.reason_code ? { reasonCode: continuation.reason_code } : {}),
+      })),
+      diagnostics: diagnostics.slice(0, 8),
+    };
+    if (run.started_at) projection.startedAt = run.started_at;
+    if (run.deadline_at) projection.deadlineAt = run.deadline_at;
+    if (terminalReason && /^[a-z0-9_]{1,64}$/.test(terminalReason)) {
+      projection.terminalReason = terminalReason;
+    }
+    if (typeof run.parent_run_id === 'string' && run.parent_run_id.length > 0) {
+      projection.parentRunId = run.parent_run_id;
+    }
+    if (terminalResultValid) {
+      projection.terminalResult = {
+        runId: run.terminal_result_run_id!,
+        artifactId: run.terminal_result_artifact_id!,
+        artifactRevision: Number(run.terminal_result_artifact_revision),
+      };
+    }
+    return projection;
+  }
+
+  async getWorkflowRunCompletion(
+    runId: string,
+    ownerRootTaskId: string,
+  ): Promise<WorkflowRunCompletionProjection | undefined> {
+    if (
+      typeof runId !== 'string' || runId.length === 0 ||
+      typeof ownerRootTaskId !== 'string' || ownerRootTaskId.length === 0
+    ) {
+      return undefined;
+    }
+    const row = await this.db.get<{
+      run_id: string;
+      status: string;
+      terminal_reason_code: string | null;
+      terminal_result_run_id: string | null;
+      terminal_result_artifact_id: string | null;
+      terminal_result_artifact_revision: number | null;
+      artifact_kind: string | null;
+      artifact_payload_json: string | null;
+    }>(
+      `SELECT run.run_id, run.status, run.terminal_reason_code,
+              run.terminal_result_run_id, run.terminal_result_artifact_id,
+              run.terminal_result_artifact_revision,
+              artifact.kind AS artifact_kind, artifact.payload_json AS artifact_payload_json
+         FROM workflow_runs run
+         LEFT JOIN workflow_artifacts artifact
+           ON artifact.workspace_id = run.workspace_id
+          AND artifact.run_id = run.terminal_result_run_id
+          AND artifact.artifact_id = run.terminal_result_artifact_id
+          AND artifact.revision = run.terminal_result_artifact_revision
+        WHERE run.workspace_id = ? AND run.run_id = ? AND run.owner_root_task_id = ?`,
+      [this.workspaceId, runId, ownerRootTaskId],
+    );
+    if (
+      !row ||
+      (row.status !== 'running' && row.status !== 'succeeded' &&
+        row.status !== 'failed' && row.status !== 'cancelled')
+    ) {
+      return undefined;
+    }
+    const projection: WorkflowRunCompletionProjection = {
+      runId: row.run_id,
+      runStatus: row.status,
+    };
+    if (row.terminal_reason_code && /^[a-z0-9_]{1,64}$/.test(row.terminal_reason_code)) {
+      projection.terminalReason = row.terminal_reason_code;
+    }
+    if (
+      row.terminal_result_run_id &&
+      row.terminal_result_artifact_id &&
+      Number.isInteger(row.terminal_result_artifact_revision) &&
+      Number(row.terminal_result_artifact_revision) > 0
+    ) {
+      projection.terminalResult = {
+        runId: row.terminal_result_run_id,
+        artifactId: row.terminal_result_artifact_id,
+        artifactRevision: Number(row.terminal_result_artifact_revision),
+      };
+    }
+    if (row.artifact_kind === 'next_result' && row.artifact_payload_json) {
+      try {
+        const payload = JSON.parse(row.artifact_payload_json) as Record<string, unknown>;
+        if (
+          payload.kind === 'next_result' &&
+          (payload.change === 'updated' || payload.change === 'unchanged')
+        ) {
+          projection.workflowNext = {
+            change: payload.change,
+            ...(typeof payload.result === 'string' ? { result: payload.result } : {}),
+          };
+        }
+      } catch {
+        return projection;
+      }
+    }
+    return projection;
+  }
+
   private async write(
     statements: readonly SqlStatement[],
     changed: readonly ChangeRecord[],
@@ -1711,9 +3058,47 @@ export class SqliteTaskRepository implements TaskRepository {
     const insertTurns = new Set(command.insertTurnIds ?? []);
     const insertMessages = new Set(command.insertMessageIds ?? []);
 
+    if (command.dispositionClaim) {
+      const existing = await this.getDispositionClaim(command.dispositionClaim.turnId);
+      if (existing) {
+        if (existing.fingerprint !== command.dispositionClaim.fingerprint) {
+          return {
+            ok: true,
+            changed: false,
+            reason: 'turn already has a different disposition',
+            conflict: true,
+          };
+        }
+        if (command.operation) {
+          const claimed = await this.claimOperation({
+            kind: 'claimOperation',
+            workspaceId: this.workspaceId,
+            ledgerKey: command.operation.ledgerKey,
+            entry: command.operation.entry,
+            createdAt: command.operation.createdAt,
+          });
+          if (claimed.conflict) return claimed;
+        }
+        return {
+          ok: true,
+          changed: false,
+          ...(command.operation ? { operation: command.operation.entry } : {}),
+        };
+      }
+    }
+
     if (command.operation) {
       statements.push(graphOperationClaimStatement(this.workspaceId, command.operation));
       abortIfUnchangedAt.push(0);
+    }
+    if (command.dispositionClaim) {
+      statements.push(
+        dispositionClaimInsertStatement(
+          this.workspaceId,
+          command.dispositionClaim,
+          command.operation?.createdAt,
+        ),
+      );
     }
     // revision/feed statements are appended after mutation assembly below.
     if (command.expectedTasks.length > 0) {
@@ -1757,6 +3142,9 @@ export class SqliteTaskRepository implements TaskRepository {
       });
       changes.push({ kind: 'turn', id: turnId, change: 'delete' });
     }
+    if (command.deleteTaskIds && command.deleteTaskIds.length > 0) {
+      statements.push(detachWorkflowNodeTasksStatement(this.workspaceId, command.deleteTaskIds));
+    }
     for (const taskId of command.deleteTaskIds ?? []) {
       statements.push({
         sql: 'DELETE FROM tasks WHERE workspace_id = ? AND id = ?',
@@ -1765,17 +3153,42 @@ export class SqliteTaskRepository implements TaskRepository {
       changes.push({ kind: 'task', id: taskId, change: 'delete' });
     }
 
-    // Insert/update task rows first, then dependencies. This allows sibling
-    // dependencies in one batch to reference a task inserted later in the
+    // Insert/update task rows first, then prerequisites. This allows sibling
+    // prerequisites in one batch to reference a task inserted later in the
     // caller's deterministic list.
     for (const task of command.tasks) {
       statements.push(taskStatement(this.workspaceId, task, !insertTasks.has(task.id)));
       changes.push({ kind: 'task', id: task.id, change: insertTasks.has(task.id) ? 'insert' : 'update' });
     }
+    const cancellationAt = command.operation?.createdAt ?? command.tasks[0]?.updatedAt ?? new Date().toISOString();
+    const cancelledWorkflowTasks = command.tasks
+      .filter((task) => task.lifecycle === 'cancelled')
+      .map((task) => task.id);
+    const unavailableWorkflowTasks = command.tasks
+      .filter((task) => task.lifecycle === 'failed' || task.lifecycle === 'skipped' || task.lifecycle === 'succeeded')
+      .map((task) => task.id);
+    if (cancelledWorkflowTasks.length > 0) {
+      const closure = await this.planWorkflowClosureFromTasks({
+        taskIds: cancelledWorkflowTasks,
+        reasonCode: 'required_target_cancelled',
+        at: cancellationAt,
+      });
+      statements.push(...closure.statements);
+      changes.push(...closure.changes);
+    }
+    if (unavailableWorkflowTasks.length > 0) {
+      const closure = await this.planWorkflowClosureFromTasks({
+        taskIds: unavailableWorkflowTasks,
+        reasonCode: 'required_target_unavailable',
+        at: cancellationAt,
+      });
+      statements.push(...closure.statements);
+      changes.push(...closure.changes);
+    }
     for (const task of command.tasks) {
-      statements.push({ sql: 'DELETE FROM task_dependencies WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, task.id] });
-      for (const dependency of task.dependencies) {
-        statements.push(dependencyStatement(this.workspaceId, task.id, dependency));
+      statements.push({ sql: 'DELETE FROM task_prerequisites WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, task.id] });
+      for (const prerequisite of task.prerequisites) {
+        statements.push(prerequisiteStatement(this.workspaceId, task.id, prerequisite));
       }
     }
 
@@ -1854,6 +3267,34 @@ export class SqliteTaskRepository implements TaskRepository {
         message === 'constraint rejected' ||
         /constraint|unique|foreign key/i.test(message)
       ) {
+        if (command.dispositionClaim) {
+          const existing = await this.getDispositionClaim(command.dispositionClaim.turnId);
+          if (existing?.fingerprint === command.dispositionClaim.fingerprint) {
+            if (command.operation) {
+              const claimed = await this.claimOperation({
+                kind: 'claimOperation',
+                workspaceId: this.workspaceId,
+                ledgerKey: command.operation.ledgerKey,
+                entry: command.operation.entry,
+                createdAt: command.operation.createdAt,
+              });
+              if (claimed.conflict) return claimed;
+            }
+            return {
+              ok: true,
+              changed: false,
+              ...(command.operation ? { operation: command.operation.entry } : {}),
+            };
+          }
+          if (existing) {
+            return {
+              ok: true,
+              changed: false,
+              reason: 'turn already has a different disposition',
+              conflict: true,
+            };
+          }
+        }
         return { ok: true, changed: false, reason: 'graph command rejected' };
       }
       throw error;
@@ -1875,7 +3316,7 @@ export class SqliteTaskRepository implements TaskRepository {
         return { ok: true, changed: false, reason: 'graph ownership fence changed; retry' };
       }
     }
-    const guardIndex = command.operation ? 1 : 0;
+    const guardIndex = (command.operation ? 1 : 0) + (command.dispositionClaim ? 1 : 0);
     if (command.expectedTasks.length > 0 && results[guardIndex]?.changes === 0) {
       return { ok: true, changed: false, reason: 'task changed; retry' };
     }
@@ -1886,39 +3327,75 @@ export class SqliteTaskRepository implements TaskRepository {
     };
   }
 
+  /** Delete any selected task and its descendants regardless of runtime state. */
+  private async deleteTaskSubtree(
+    command: Extract<RepositoryCommand, { kind: 'deleteTaskSubtree' }>,
+  ): Promise<RepositoryCommandResult> {
+    const candidateCte = `WITH RECURSIVE candidate(id) AS (
+          SELECT id
+            FROM tasks
+           WHERE workspace_id = ? AND id = ?
+          UNION
+          SELECT child.id
+            FROM tasks child
+            JOIN candidate ON child.parent_id = candidate.id
+           WHERE child.workspace_id = ?
+        )`;
+    const candidateParams: SqlValue[] = [
+      this.workspaceId,
+      command.rootTaskId,
+      this.workspaceId,
+    ];
+    const candidateIds = 'SELECT id FROM candidate';
+    const guard: SqlStatement = {
+      sql: `${candidateCte}
+        UPDATE tasks SET updated_at = updated_at
+         WHERE workspace_id = ?
+           AND id IN (${candidateIds})`,
+      params: [...candidateParams, this.workspaceId],
+    };
+    const deleteWorkflowArtifactSources: SqlStatement = {
+      sql: `${candidateCte}
+        DELETE FROM workflow_artifact_sources
+         WHERE workspace_id = ?
+           AND (producer_task_id IN (${candidateIds}) OR caller_task_id IN (${candidateIds}))`,
+      params: [...candidateParams, this.workspaceId],
+    };
+    const detachWorkflowNodes: SqlStatement = {
+      sql: `${candidateCte}
+        UPDATE workflow_nodes SET task_id = NULL
+         WHERE workspace_id = ?
+           AND task_id IN (${candidateIds})`,
+      params: [...candidateParams, this.workspaceId],
+    };
+    const deleteTasks: SqlStatement = {
+      sql: `${candidateCte}
+        DELETE FROM tasks
+         WHERE workspace_id = ?
+           AND id IN (${candidateIds})`,
+      params: [...candidateParams, this.workspaceId],
+    };
+    const results = await this.writeIfFirstChanged(
+      guard,
+      [deleteWorkflowArtifactSources, detachWorkflowNodes, deleteTasks],
+      { kind: 'task', id: command.rootTaskId, change: 'delete_subtree' },
+      new Date().toISOString(),
+    );
+    return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
+  }
+
   /**
-   * Delete one or all top-level roots only when every task in each candidate
-   * subtree is currently removable. The recursive CTE and the live/queued/
-   * dependency predicates execute inside the same IMMEDIATE transaction as the
-   * DELETE, so a late child or turn cannot be orphaned by a stale host read.
+   * Delete idle/terminal top-level roots except the focused root. The recursive
+   * CTE and active-state predicates share the same transaction as the DELETE.
    */
   private async deleteTaskRootsIfIdle(
-    command:
-      | Extract<RepositoryCommand, { kind: 'clearHistory' }>
-      | Extract<RepositoryCommand, { kind: 'deleteTaskSubtreeIfIdle' }>,
+    command: Extract<RepositoryCommand, { kind: 'clearHistory' }>,
   ): Promise<RepositoryCommandResult> {
-    const isSingle = command.kind === 'deleteTaskSubtreeIfIdle';
-    if (isSingle) {
-      const root = await this.db.get<{ parent_id: string | null }>(
-        'SELECT parent_id FROM tasks WHERE workspace_id = ? AND id = ?',
-        [this.workspaceId, command.rootTaskId],
-      );
-      if (!root) return { ok: true, changed: false };
-      if (root.parent_id !== null) {
-        return { ok: true, changed: false, reason: 'Only top-level tasks can be deleted.' };
-      }
-      if (command.preserveRootTaskId === command.rootTaskId) {
-        return { ok: true, changed: false, reason: 'Cannot delete the focused task.' };
-      }
-    }
-    const rootFilter = isSingle ? 'AND id = ?' : '';
-    const rootParams: SqlValue[] = isSingle ? [command.rootTaskId] : [];
     const preserve = command.preserveRootTaskId ?? null;
-    const sql = `WITH RECURSIVE candidate(id, root_id) AS (
+    const candidateCte = `WITH RECURSIVE candidate(id, root_id) AS (
           SELECT id, id
             FROM tasks
            WHERE workspace_id = ? AND parent_id IS NULL
-             ${rootFilter}
              AND (? IS NULL OR id <> ?)
           UNION
           SELECT child.id, candidate.root_id
@@ -1947,16 +3424,16 @@ export class SqliteTaskRepository implements TaskRepository {
                      OR json_extract(task.payload_json, '$.outcomeProposal') IS NOT NULL
                      OR EXISTS (
                           SELECT 1
-                            FROM task_dependencies dependency
-                            LEFT JOIN tasks producer
-                              ON producer.workspace_id = dependency.workspace_id
-                             AND producer.id = dependency.dependency_task_id
-                           WHERE dependency.workspace_id = task.workspace_id
-                             AND dependency.task_id = task.id
-                             AND NOT (
-                               ((dependency.required_outcome = 'succeeded' AND producer.lifecycle = 'succeeded')
-                                 OR (dependency.required_outcome = 'settled' AND producer.lifecycle IN ('succeeded','failed','cancelled','skipped')))
-                               AND (dependency.required_verdict IS NULL
+                             FROM task_prerequisites prerequisite
+                             LEFT JOIN tasks producer
+                               ON producer.workspace_id = prerequisite.workspace_id
+                              AND producer.id = prerequisite.producer_task_id
+                            WHERE prerequisite.workspace_id = task.workspace_id
+                              AND prerequisite.task_id = task.id
+                              AND NOT (
+                                ((prerequisite.required_lifecycle = 'succeeded' AND producer.lifecycle = 'succeeded')
+                                  OR (prerequisite.required_lifecycle = 'terminal' AND producer.lifecycle IN ('succeeded','failed','cancelled','skipped')))
+                                AND (prerequisite.required_verdict IS NULL
                                  OR json_extract(producer.payload_json, '$.taskResult.verdict.status') = 'pass')
                              )
                         )
@@ -1975,31 +3452,46 @@ export class SqliteTaskRepository implements TaskRepository {
                                 )
                         )
                    )
-                 )
-        )
-        DELETE FROM tasks
-         WHERE workspace_id = ?
-           AND id IN (
-             SELECT candidate.id FROM candidate
-              WHERE candidate.root_id NOT IN (SELECT root_id FROM blocked)
-           )`;
-    const params: SqlValue[] = [
+                  )
+         )`;
+    const candidateParams: SqlValue[] = [
       this.workspaceId,
-      ...rootParams,
       preserve,
       preserve,
-      this.workspaceId,
       this.workspaceId,
       this.workspaceId,
     ];
+    const eligibleCandidateIds = `SELECT candidate.id FROM candidate
+              WHERE candidate.root_id NOT IN (SELECT root_id FROM blocked)`;
+    const guard: SqlStatement = {
+      sql: `${candidateCte}
+        UPDATE tasks SET updated_at = updated_at
+         WHERE workspace_id = ?
+           AND id IN (${eligibleCandidateIds})`,
+      params: [...candidateParams, this.workspaceId],
+    };
+    const detachWorkflowNodes: SqlStatement = {
+      sql: `${candidateCte}
+        UPDATE workflow_nodes SET task_id = NULL
+         WHERE workspace_id = ?
+           AND task_id IN (${eligibleCandidateIds})`,
+      params: [...candidateParams, this.workspaceId],
+    };
+    const deleteTasks: SqlStatement = {
+      sql: `${candidateCte}
+        DELETE FROM tasks
+         WHERE workspace_id = ?
+           AND id IN (${eligibleCandidateIds})`,
+      params: [...candidateParams, this.workspaceId],
+    };
     const change: ChangeRecord = {
       kind: 'task',
-      id: isSingle ? command.rootTaskId : this.workspaceId,
-      change: isSingle ? 'delete_subtree' : 'clear_history',
+      id: this.workspaceId,
+      change: 'clear_history',
     };
     const results = await this.writeIfFirstChanged(
-      { sql, params },
-      [],
+      guard,
+      [detachWorkflowNodes, deleteTasks],
       change,
       new Date().toISOString(),
     );
@@ -2007,9 +3499,6 @@ export class SqliteTaskRepository implements TaskRepository {
     return {
       ok: true,
       changed,
-      ...(!changed && isSingle
-        ? { reason: 'Cannot delete a task while it or a subtask is still active.' }
-        : {}),
     };
   }
 
@@ -2040,6 +3529,9 @@ export class SqliteTaskRepository implements TaskRepository {
 
   async execute(command: RepositoryCommand): Promise<RepositoryCommandResult> {
     if (command.workspaceId !== this.workspaceId) throw new Error('repository workspace mismatch');
+    if (this.db.executeWorkflowMutation && isWorkflowTransactionalCommand(command)) {
+      return this.db.executeWorkflowMutation(command, this.changeFeedRetainRevisions);
+    }
     switch (command.kind) {
       case 'createChildTask':
       case 'delegateChildTask':
@@ -2054,6 +3546,10 @@ export class SqliteTaskRepository implements TaskRepository {
       case 'waitForChildTasks':
       case 'completeGraphTask':
       case 'failGraphTask':
+      case 'workflowNextGraphTask':
+      case 'workflowPrevGraphTask':
+      case 'workflowFailGraphTask':
+      case 'invokeChildGraphTask':
       case 'askParent':
       case 'answerChildQuestion':
       case 'consumeCancelRequest':
@@ -2099,10 +3595,10 @@ export class SqliteTaskRepository implements TaskRepository {
         return this.cascadeTaskLifecycle(command);
       case 'resolveChildWait':
         return this.resolveChildWait(command);
-      case 'applyDependencyTerminal':
-        return this.applyDependencyTerminal(command);
-      case 'applyDependencyTerminals':
-        return this.applyDependencyTerminals(command);
+      case 'applyPrerequisiteTerminal':
+        return this.applyPrerequisiteTerminal(command);
+      case 'applyPrerequisiteTerminals':
+        return this.applyPrerequisiteTerminals(command);
       case 'reconcileOrphanTurn':
         return this.reconcileOrphanTurn(command);
       case 'applyVerdictRemediation':
@@ -2111,13 +3607,20 @@ export class SqliteTaskRepository implements TaskRepository {
         return this.writeTask(command.task, true);
       case 'clearHistory':
         return this.deleteTaskRootsIfIdle(command);
-      case 'deleteTaskSubtreeIfIdle':
-        return this.deleteTaskRootsIfIdle(command);
+      case 'deleteTaskSubtree':
+        return this.deleteTaskSubtree(command);
       case 'renameTask':
         return this.renameTask(command);
       case 'deleteTask': {
         const results = await this.writeIfFirstChanged(
-          { sql: 'DELETE FROM tasks WHERE workspace_id = ? AND id = ?', params: [this.workspaceId, command.taskId] }, [],
+          {
+            sql: 'UPDATE tasks SET updated_at = updated_at WHERE workspace_id = ? AND id = ?',
+            params: [this.workspaceId, command.taskId],
+          },
+          [
+            detachWorkflowNodeTasksStatement(this.workspaceId, [command.taskId]),
+            { sql: 'DELETE FROM tasks WHERE workspace_id = ? AND id = ?', params: [this.workspaceId, command.taskId] },
+          ],
           { kind: 'task', id: command.taskId, change: 'delete' }, new Date().toISOString(),
         );
         return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
@@ -2214,6 +3717,16 @@ export class SqliteTaskRepository implements TaskRepository {
         await this.write([operationStatement(this.workspaceId, command)], [{ kind: 'operation', id: command.ledgerKey, change: 'upsert' }], command.createdAt);
         return { ok: true, changed: true };
       }
+      case 'defineWorkflowVersion':
+        return this.defineWorkflowVersion(command);
+      case 'startWorkflowRun':
+        return this.startWorkflowRun(command);
+      case 'reapWorkflowTimeouts':
+        return this.reapWorkflowTimeouts(command);
+      case 'resolveWorkflowStartContinuation':
+        return this.resolveWorkflowStartContinuation(command);
+      case 'recoverWorkflowActivation':
+        return this.recoverWorkflowActivation(command);
       case 'claimOperation':
         return this.claimOperation(command);
       case 'deleteOperationsForTurn': {
@@ -2354,9 +3867,9 @@ export class SqliteTaskRepository implements TaskRepository {
   private async writeTask(task: MusterTask, upsert: boolean): Promise<RepositoryCommandResult> {
     const statements: SqlStatement[] = [taskStatement(this.workspaceId, task, upsert)];
     if (upsert) {
-      statements.push({ sql: 'DELETE FROM task_dependencies WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, task.id] });
+      statements.push({ sql: 'DELETE FROM task_prerequisites WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, task.id] });
     }
-    for (const dependency of task.dependencies) statements.push(dependencyStatement(this.workspaceId, task.id, dependency));
+    for (const prerequisite of task.prerequisites) statements.push(prerequisiteStatement(this.workspaceId, task.id, prerequisite));
     const results = await this.write(statements, [{ kind: 'task', id: task.id, change: upsert ? 'upsert' : 'insert' }], task.updatedAt);
     return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
   }
@@ -2477,8 +3990,8 @@ export class SqliteTaskRepository implements TaskRepository {
     const invalid = validateRootInitialTurn(command);
     if (invalid) return { ok: true, changed: false, reason: invalid };
     const statements: SqlStatement[] = [taskStatement(this.workspaceId, command.task, false)];
-    for (const dependency of command.task.dependencies) {
-      statements.push(dependencyStatement(this.workspaceId, command.task.id, dependency));
+    for (const prerequisite of command.task.prerequisites) {
+      statements.push(prerequisiteStatement(this.workspaceId, command.task.id, prerequisite));
     }
     statements.push(
       turnStatement(this.workspaceId, command.turn, false),
@@ -2487,7 +4000,6 @@ export class SqliteTaskRepository implements TaskRepository {
     command.turn.inputs.forEach((input, ordering) => {
       statements.push(turnInputStatement(this.workspaceId, command.turn.id, ordering, input));
     });
-    if (command.receipt) statements.push(sendReceiptStatement(this.workspaceId, command.receipt));
     const changes: ChangeRecord[] = [
       { kind: 'task', id: command.task.id, change: 'insert' },
       { kind: 'turn', id: command.turn.id, taskId: command.task.id, change: 'insert' },
@@ -2496,8 +4008,22 @@ export class SqliteTaskRepository implements TaskRepository {
         ? [{ kind: 'send_receipt' as const, id: command.receipt.clientRequestId, taskId: command.task.id, change: 'insert' as const }]
         : []),
     ];
-    const results = await this.write(statements, changes, command.turn.createdAt);
-    return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
+    const results = command.receipt
+      ? await this.db.transaction(
+          [
+            claimSendReceiptStatement(this.workspaceId, command.receipt),
+            ...statements,
+            ...revisionStatements(this.workspaceId, changes, command.turn.createdAt, this.changeFeedRetainRevisions),
+          ],
+          { abortIfFirstUnchanged: true },
+        )
+      : await this.write(statements, changes, command.turn.createdAt);
+    const changed = (results[0]?.changes ?? 0) > 0;
+    return {
+      ok: true,
+      changed,
+      ...(!changed && command.receipt ? { reason: 'clientRequestId already claimed' } : {}),
+    };
   }
 
   private async enqueueMessageTurn(
@@ -2506,18 +4032,19 @@ export class SqliteTaskRepository implements TaskRepository {
     const invalid = validateEnqueueMessageTurn(command);
     if (invalid) return { ok: true, changed: false, reason: invalid };
     const statements: SqlStatement[] = [];
-    // The guarded task write is deliberately first. `writeIfFirstChanged()` asks
-    // the worker to roll back before touching any dependent row on a stale task
-    // revision or a saturated current execution epoch.
+    // The receipt claim is first when present, so one client request cannot reserve
+    // different aggregates across concurrent extension hosts. The task guard remains
+    // immediately before the revision/feed statements and still rolls back the claim
+    // when the task changed or its turn cap is saturated.
     const guard = guardedTaskUpdateStatement(
       this.workspaceId,
       command.task,
       command.expectedTaskRevision,
       command.maxTurnsPerTask,
     );
-    statements.push({ sql: 'DELETE FROM task_dependencies WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, command.task.id] });
-    for (const dependency of command.task.dependencies) {
-      statements.push(dependencyStatement(this.workspaceId, command.task.id, dependency));
+    statements.push({ sql: 'DELETE FROM task_prerequisites WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, command.task.id] });
+    for (const prerequisite of command.task.prerequisites) {
+      statements.push(prerequisiteStatement(this.workspaceId, command.task.id, prerequisite));
     }
     statements.push(
       turnStatement(this.workspaceId, command.turn, false),
@@ -2526,17 +4053,41 @@ export class SqliteTaskRepository implements TaskRepository {
     command.turn.inputs.forEach((input, ordering) => {
       statements.push(turnInputStatement(this.workspaceId, command.turn.id, ordering, input));
     });
-    if (command.receipt) statements.push(sendReceiptStatement(this.workspaceId, command.receipt));
-    const results = await this.writeIfFirstChanged(
-      guard,
-      statements,
-      { kind: 'task', id: command.task.id, change: 'enqueue' },
-      command.turn.createdAt,
-    );
+    const change: ChangeRecord = { kind: 'task', id: command.task.id, change: 'enqueue' };
+    const results = command.receipt
+      ? await this.db.transaction(
+          [
+            claimSendReceiptStatement(this.workspaceId, command.receipt),
+            guard,
+            ...conditionalRevisionStatements(
+              this.workspaceId,
+              change,
+              command.turn.createdAt,
+              this.changeFeedRetainRevisions,
+            ),
+            ...statements,
+          ],
+          { abortIfFirstUnchanged: true, abortIfUnchangedAt: [1] },
+        )
+      : await this.writeIfFirstChanged(
+          guard,
+          statements,
+          change,
+          command.turn.createdAt,
+        );
+    const receiptChanged = command.receipt ? (results[0]?.changes ?? 0) > 0 : true;
+    const guardIndex = command.receipt ? 1 : 0;
+    const changed = (results[guardIndex]?.changes ?? 0) > 0;
     return {
       ok: true,
-      changed: (results[0]?.changes ?? 0) > 0,
-      ...((results[0]?.changes ?? 0) === 0 ? { reason: 'task changed or max turns per task exceeded; retry' } : {}),
+      changed,
+      ...(changed
+        ? {}
+        : {
+            reason: receiptChanged
+              ? 'task changed or max turns per task exceeded; retry'
+              : 'clientRequestId already claimed',
+          }),
     };
   }
 
@@ -2546,8 +4097,8 @@ export class SqliteTaskRepository implements TaskRepository {
     const invalid = validateRetryTurn(command);
     if (invalid) return { ok: true, changed: false, reason: invalid };
     const rest: SqlStatement[] = [
-      { sql: 'DELETE FROM task_dependencies WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, command.task.id] },
-      ...command.task.dependencies.map((dependency) => dependencyStatement(this.workspaceId, command.task.id, dependency)),
+      { sql: 'DELETE FROM task_prerequisites WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, command.task.id] },
+      ...command.task.prerequisites.map((prerequisite) => prerequisiteStatement(this.workspaceId, command.task.id, prerequisite)),
       turnStatement(this.workspaceId, command.turn, false),
       ...command.turn.inputs.map((input, ordering) => turnInputStatement(this.workspaceId, command.turn.id, ordering, input)),
     ];
@@ -2578,8 +4129,8 @@ export class SqliteTaskRepository implements TaskRepository {
     const invalid = validateQueueTaskTurn(command);
     if (invalid) return { ok: true, changed: false, reason: invalid };
     const rest: SqlStatement[] = [
-      { sql: 'DELETE FROM task_dependencies WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, command.task.id] },
-      ...command.task.dependencies.map((dependency) => dependencyStatement(this.workspaceId, command.task.id, dependency)),
+      { sql: 'DELETE FROM task_prerequisites WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, command.task.id] },
+      ...command.task.prerequisites.map((prerequisite) => prerequisiteStatement(this.workspaceId, command.task.id, prerequisite)),
       turnStatement(this.workspaceId, command.turn, false),
       ...command.turn.inputs.map((input, ordering) => turnInputStatement(this.workspaceId, command.turn.id, ordering, input)),
     ];
@@ -2603,8 +4154,8 @@ export class SqliteTaskRepository implements TaskRepository {
       return { ok: true, changed: false, reason: 'continuation turn is invalid' };
     }
     const rest: SqlStatement[] = [
-      { sql: 'DELETE FROM task_dependencies WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, command.task.id] },
-      ...command.task.dependencies.map((dependency) => dependencyStatement(this.workspaceId, command.task.id, dependency)),
+      { sql: 'DELETE FROM task_prerequisites WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, command.task.id] },
+      ...command.task.prerequisites.map((prerequisite) => prerequisiteStatement(this.workspaceId, command.task.id, prerequisite)),
       ...command.turns.flatMap((turn) => [
         turnStatement(this.workspaceId, turn, false),
         ...turn.inputs.map((input, ordering) => turnInputStatement(this.workspaceId, turn.id, ordering, input)),
@@ -2675,23 +4226,150 @@ export class SqliteTaskRepository implements TaskRepository {
   private async requestRuntimeHandoff(
     command: Extract<RepositoryCommand, { kind: 'requestRuntimeHandoff' }>,
   ): Promise<RepositoryCommandResult> {
+    const recovery = command.recovery;
+    if (
+      recovery
+      && (
+        recovery.turn.taskId !== command.taskId
+        || recovery.turn.status !== 'queued'
+        || recovery.turn.retryOf !== recovery.failedTurnId
+        || (recovery.turn.runtimeEpoch ?? 1) !== (command.task.runtimeEpoch ?? 1)
+      )
+    ) {
+      return { ok: true, changed: false, reason: 'invalid runtime recovery turn' };
+    }
+    const workflowGuard = recovery?.workflow
+      ? `EXISTS (
+            SELECT 1
+              FROM workflow_activations activation
+              JOIN workflow_runs run
+                ON run.workspace_id = activation.workspace_id
+               AND run.run_id = activation.run_id
+              JOIN workflow_nodes node
+                ON node.workspace_id = activation.workspace_id
+               AND node.run_id = activation.run_id
+               AND node.node_id = activation.node_id
+             WHERE activation.workspace_id = tasks.workspace_id
+               AND activation.run_id = ?
+               AND activation.activation_id = ?
+               AND activation.execution_turn_id = ?
+               AND activation.status = ?
+               AND node.task_id = tasks.id
+               AND run.status = 'running'
+               AND (run.deadline_at IS NULL OR run.deadline_at > ?)
+               AND run.workflow_turns_reserved < run.max_workflow_turns
+               AND (SELECT COUNT(*) FROM turns task_turn
+                      WHERE task_turn.workspace_id = tasks.workspace_id
+                        AND task_turn.task_id = tasks.id) < run.max_turns_per_task
+          )`
+      : `NOT EXISTS (
+            SELECT 1
+              FROM workflow_nodes node
+              JOIN workflow_runs run
+                ON run.workspace_id = node.workspace_id
+               AND run.run_id = node.run_id
+             WHERE node.workspace_id = tasks.workspace_id
+               AND node.task_id = tasks.id
+               AND run.status = 'running'
+          )`;
+    const workflowGuardParams: SqlValue[] = recovery?.workflow
+      ? [
+          recovery.workflow.runId,
+          recovery.workflow.activationId,
+          recovery.failedTurnId,
+          recovery.workflow.expectedActivationStatus,
+          command.task.updatedAt,
+        ]
+      : [];
+    const recoveryGuard = recovery
+      ? `AND EXISTS (
+             SELECT 1 FROM turns failed_turn
+              WHERE failed_turn.workspace_id = tasks.workspace_id
+                AND failed_turn.task_id = tasks.id
+                AND failed_turn.id = ? AND failed_turn.status = ?
+           )
+         AND NOT EXISTS (
+             SELECT 1 FROM turns live_turn
+              WHERE live_turn.workspace_id = tasks.workspace_id
+                AND live_turn.task_id = tasks.id
+                AND live_turn.status IN ('queued', 'running', 'waiting_user')
+           )
+         AND (SELECT COUNT(*) FROM turns task_turn
+                WHERE task_turn.workspace_id = tasks.workspace_id
+                  AND task_turn.task_id = tasks.id) < ?`
+      : '';
+    const recoveryGuardParams: SqlValue[] = recovery
+      ? [recovery.failedTurnId, recovery.expectedFailedStatus, recovery.maxTurnsPerTask]
+      : [];
     const fence = appendTurnFence(
-      'UPDATE tasks SET updated_at = updated_at WHERE workspace_id = ? AND id = ? AND revision = ?',
-      [this.workspaceId, command.taskId, command.expectedTaskRevision],
+      `UPDATE tasks SET updated_at = updated_at
+        WHERE workspace_id = ? AND id = ? AND revision = ?
+          AND ${workflowGuard}
+          ${recoveryGuard}`,
+      [
+        this.workspaceId,
+        command.taskId,
+        command.expectedTaskRevision,
+        ...workflowGuardParams,
+        ...recoveryGuardParams,
+      ],
       this.workspaceId,
       command.expectedTurns,
     );
     const rest: SqlStatement[] = [
+      {
+        sql: `UPDATE task_session_bindings
+                 SET active = 0, cleared_at = ?
+               WHERE workspace_id = ? AND task_id = ? AND active = 1`,
+        params: [command.task.updatedAt, this.workspaceId, command.taskId],
+      },
       ...taskMutationStatements(this.workspaceId, command.task),
       ...command.turns.flatMap((turn) => turnMutationStatements(this.workspaceId, turn)),
       ...(command.cancelRequests ?? []).map((entry) => cancelRequestStatement(this.workspaceId, {
         kind: 'putCancelRequest', workspaceId: this.workspaceId, turnId: entry.turnId, request: entry.request,
       })),
+      ...(recovery?.workflow
+        ? [{
+            sql: `UPDATE workflow_runs
+                     SET workflow_turns_reserved = workflow_turns_reserved + 1,
+                         updated_at = ?
+                   WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                     AND workflow_turns_reserved < max_workflow_turns`,
+            params: [command.task.updatedAt, this.workspaceId, recovery.workflow.runId],
+          }]
+        : []),
+      ...(recovery
+        ? [
+            turnStatement(this.workspaceId, recovery.turn, false),
+            ...recovery.turn.inputs.map((input, ordering) =>
+              turnInputStatement(this.workspaceId, recovery.turn.id, ordering, input)),
+          ]
+        : []),
+      ...(recovery?.workflow
+        ? [{
+            sql: `UPDATE workflow_activations
+                     SET status = 'queued', execution_turn_id = ?, updated_at = ?
+                   WHERE workspace_id = ? AND run_id = ? AND activation_id = ?
+                     AND execution_turn_id = ? AND status = ?`,
+            params: [
+              recovery.turn.id,
+              command.task.updatedAt,
+              this.workspaceId,
+              recovery.workflow.runId,
+              recovery.workflow.activationId,
+              recovery.failedTurnId,
+              recovery.workflow.expectedActivationStatus,
+            ],
+          }]
+        : []),
     ];
     const changes: ChangeRecord[] = [
       { kind: 'task', id: command.taskId, change: 'runtime_handoff' },
       ...command.turns.map((turn) => ({ kind: 'turn' as const, id: turn.id, taskId: turn.taskId, change: 'runtime_handoff' })),
       ...(command.cancelRequests ?? []).map((entry) => ({ kind: 'cancel_request' as const, id: entry.turnId, change: 'runtime_handoff' })),
+      ...(recovery
+        ? [{ kind: 'turn' as const, id: recovery.turn.id, taskId: recovery.turn.taskId, change: 'insert' }]
+        : []),
     ];
     const results = await this.writeIfFirstChanged(
       { sql: fence.sql, params: fence.params }, rest, changes, command.task.updatedAt,
@@ -2707,17 +4385,82 @@ export class SqliteTaskRepository implements TaskRepository {
     if (command.expectedDisposition !== undefined && JSON.stringify(command.expectedDisposition) !== JSON.stringify(command.turn.disposition)) {
       return { ok: true, changed: false, reason: 'disposition already staged' };
     }
-    const results = await this.writeIfFirstChanged(
-      guardedStageDispositionStatement(this.workspaceId, command),
-      [],
-      { kind: 'turn', id: command.turnId, taskId: command.turn.taskId, change: 'stage_disposition' },
-      command.turn.startedAt ?? command.turn.createdAt,
+    const disposition = command.turn.disposition;
+    if (!disposition) return { ok: true, changed: false, reason: 'disposition is required' };
+    const claim = durableDispositionClaim({
+      turnId: command.turnId,
+      taskId: command.turn.taskId,
+      runtimeEpoch: command.expectedRuntimeEpoch ?? command.turn.runtimeEpoch,
+      opId: command.opId,
+      disposition,
+    });
+    let results: readonly import('./sqlite/rpc').RunResult[];
+    try {
+      results = await this.writeIfFirstChanged(
+        guardedStageDispositionStatement(this.workspaceId, command),
+        [
+          dispositionClaimInsertStatement(
+            this.workspaceId,
+            claim,
+            command.turn.startedAt ?? command.turn.createdAt,
+          ),
+        ],
+        { kind: 'turn', id: command.turnId, taskId: command.turn.taskId, change: 'stage_disposition' },
+        command.turn.startedAt ?? command.turn.createdAt,
+      );
+    } catch (error) {
+      const existing = await this.getDispositionClaim(command.turnId);
+      if (existing?.fingerprint === claim.fingerprint) {
+        return { ok: true, changed: false };
+      }
+      if (existing) {
+        return {
+          ok: true,
+          changed: false,
+          reason: 'turn already has a different disposition',
+          conflict: true,
+        };
+      }
+      throw error;
+    }
+    if ((results[0]?.changes ?? 0) === 0) {
+      const existing = await this.getDispositionClaim(command.turnId);
+      if (existing?.fingerprint === claim.fingerprint) {
+        return { ok: true, changed: false };
+      }
+      if (existing) {
+        return {
+          ok: true,
+          changed: false,
+          reason: 'turn already has a different disposition',
+          conflict: true,
+        };
+      }
+      return {
+        ok: true,
+        changed: false,
+        reason: claim.family === 'workflow'
+          ? 'workflow disposition is not authorized for the current route'
+          : 'turn is no longer live',
+      };
+    }
+    return { ok: true, changed: true };
+  }
+
+  private async getDispositionClaim(turnId: string): Promise<{
+    opId: string;
+    fingerprint: string;
+    status: string;
+  } | undefined> {
+    const row = await this.db.get<{ op_id: string; fingerprint: string; status: string }>(
+      `SELECT op_id, fingerprint, status
+         FROM turn_disposition_claims
+        WHERE workspace_id = ? AND turn_id = ?`,
+      [this.workspaceId, turnId],
     );
-    return {
-      ok: true,
-      changed: (results[0]?.changes ?? 0) > 0,
-      ...((results[0]?.changes ?? 0) === 0 ? { reason: 'turn is no longer live' } : {}),
-    };
+    return row
+      ? { opId: row.op_id, fingerprint: row.fingerprint, status: row.status }
+      : undefined;
   }
 
   private async applyTaskLifecycle(
@@ -2725,17 +4468,28 @@ export class SqliteTaskRepository implements TaskRepository {
   ): Promise<RepositoryCommandResult> {
     const invalid = validateLifecycleTask(command);
     if (invalid || command.task.id !== command.taskId) return { ok: true, changed: false, reason: invalid ?? 'lifecycle task id mismatch' };
+    const workflowClosure = isTerminalLifecycle(command.task.lifecycle)
+      ? await this.planWorkflowClosureFromTasks({
+          taskIds: [command.task.id],
+          reasonCode: command.task.lifecycle === 'cancelled'
+            ? 'required_target_cancelled'
+            : 'required_target_unavailable',
+          at: command.task.updatedAt,
+        })
+      : { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] };
     const rest: SqlStatement[] = [
       ...taskMutationStatements(this.workspaceId, command.task),
       ...command.turns.flatMap((turn) => turnMutationStatements(this.workspaceId, turn)),
       ...(command.cancelRequests ?? []).map((entry) => cancelRequestStatement(this.workspaceId, {
         kind: 'putCancelRequest', workspaceId: this.workspaceId, turnId: entry.turnId, request: entry.request,
       })),
+      ...workflowClosure.statements,
     ];
     const changes: ChangeRecord[] = [
       { kind: 'task', id: command.task.id, change: 'lifecycle' },
       ...command.turns.map((turn) => ({ kind: 'turn' as const, id: turn.id, taskId: turn.taskId, change: 'lifecycle' })),
       ...(command.cancelRequests ?? []).map((entry) => ({ kind: 'cancel_request' as const, id: entry.turnId, change: 'put' })),
+      ...workflowClosure.changes,
     ];
     const lifecycleGuard = appendTurnFence(
       `UPDATE tasks SET updated_at = updated_at
@@ -2747,7 +4501,7 @@ export class SqliteTaskRepository implements TaskRepository {
     const results = await this.writeIfFirstChanged(
       { sql: lifecycleGuard.sql, params: lifecycleGuard.params },
       rest,
-      changes,
+      [...new Map(changes.map((entry) => [`${entry.kind}:${entry.id}`, entry])).values()],
       command.task.updatedAt,
     );
     return { ok: true, changed: (results[0]?.changes ?? 0) > 0, ...((results[0]?.changes ?? 0) === 0 ? { reason: 'task changed; retry' } : {}) };
@@ -2758,24 +4512,35 @@ export class SqliteTaskRepository implements TaskRepository {
   ): Promise<RepositoryCommandResult> {
     const invalid = validateLifecycleTask(command);
     if (invalid) return { ok: true, changed: false, reason: invalid };
+    const workflowClosure = command.mode === 'cancel' || command.mode === 'skip'
+      ? await this.planWorkflowClosureFromTasks({
+          taskIds: command.tasks.map((task) => task.id),
+          reasonCode: command.mode === 'cancel'
+            ? 'required_target_cancelled'
+            : 'required_target_unavailable',
+          at: command.tasks[0]?.updatedAt ?? new Date().toISOString(),
+        })
+      : { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] };
     const rest: SqlStatement[] = [
       ...command.tasks.flatMap((task) => taskMutationStatements(this.workspaceId, task)),
       ...command.turns.flatMap((turn) => turnMutationStatements(this.workspaceId, turn)),
       ...(command.cancelRequests ?? []).map((entry) => cancelRequestStatement(this.workspaceId, {
         kind: 'putCancelRequest', workspaceId: this.workspaceId, turnId: entry.turnId, request: entry.request,
       })),
+      ...workflowClosure.statements,
     ];
     const changes: ChangeRecord[] = [
       ...command.tasks.map((task) => ({ kind: 'task' as const, id: task.id, change: `cascade_${command.mode}` })),
       ...command.turns.map((turn) => ({ kind: 'turn' as const, id: turn.id, taskId: turn.taskId, change: `cascade_${command.mode}` })),
       ...(command.cancelRequests ?? []).map((entry) => ({ kind: 'cancel_request' as const, id: entry.turnId, change: 'put' })),
+      ...workflowClosure.changes,
     ];
     const cascadeGuard = taskRevisionGuardStatement(this.workspaceId, command.expectedTasks);
     const fencedCascade = appendTurnFence(cascadeGuard.sql, cascadeGuard.params ?? [], this.workspaceId, command.expectedTurns);
     const results = await this.writeIfFirstChanged(
       { sql: fencedCascade.sql, params: fencedCascade.params },
       rest,
-      changes,
+      [...new Map(changes.map((entry) => [`${entry.kind}:${entry.id}`, entry])).values()],
       command.tasks[0]?.updatedAt ?? new Date().toISOString(),
     );
     return { ok: true, changed: (results[0]?.changes ?? 0) > 0, ...((results[0]?.changes ?? 0) === 0 ? { reason: 'task changed; retry' } : {}) };
@@ -2787,14 +4552,14 @@ export class SqliteTaskRepository implements TaskRepository {
     return this.applyTaskAndOptionalTurn(command, 'child_wait');
   }
 
-  private async applyDependencyTerminal(
-    command: Extract<RepositoryCommand, { kind: 'applyDependencyTerminal' }>,
+  private async applyPrerequisiteTerminal(
+    command: Extract<RepositoryCommand, { kind: 'applyPrerequisiteTerminal' }>,
   ): Promise<RepositoryCommandResult> {
-    return this.applyTaskAndOptionalTurn(command, 'dependency_terminal');
+    return this.applyTaskAndOptionalTurn(command, 'prerequisite_terminal');
   }
 
-  private async applyDependencyTerminals(
-    command: Extract<RepositoryCommand, { kind: 'applyDependencyTerminals' }>,
+  private async applyPrerequisiteTerminals(
+    command: Extract<RepositoryCommand, { kind: 'applyPrerequisiteTerminals' }>,
   ): Promise<RepositoryCommandResult> {
     if (command.mutations.length === 0 || command.expectedTasks.length === 0) return { ok: true, changed: false };
     const rest: SqlStatement[] = [];
@@ -2803,8 +4568,8 @@ export class SqliteTaskRepository implements TaskRepository {
       if (mutation.turn) rest.push(...turnMutationStatements(this.workspaceId, mutation.turn));
     }
     const changes: ChangeRecord[] = command.mutations.flatMap((mutation) => [
-      { kind: 'task' as const, id: mutation.taskId, change: 'dependency_terminal' },
-      ...(mutation.turn ? [{ kind: 'turn' as const, id: mutation.turn.id, taskId: mutation.turn.taskId, change: 'dependency_terminal' }] : []),
+      { kind: 'task' as const, id: mutation.taskId, change: 'prerequisite_terminal' },
+      ...(mutation.turn ? [{ kind: 'turn' as const, id: mutation.turn.id, taskId: mutation.turn.taskId, change: 'prerequisite_terminal' }] : []),
     ]);
     const results = await this.writeIfFirstChanged(
       taskRevisionGuardStatement(this.workspaceId, command.expectedTasks),
@@ -2818,7 +4583,7 @@ export class SqliteTaskRepository implements TaskRepository {
   private async applyTaskAndOptionalTurn(
     command:
       | Extract<RepositoryCommand, { kind: 'resolveChildWait' }>
-      | Extract<RepositoryCommand, { kind: 'applyDependencyTerminal' }>,
+      | Extract<RepositoryCommand, { kind: 'applyPrerequisiteTerminal' }>,
     change: string,
   ): Promise<RepositoryCommandResult> {
     const rest: SqlStatement[] = [
@@ -2873,6 +4638,9 @@ export class SqliteTaskRepository implements TaskRepository {
       return { ok: true, changed: false, reason: invalid ?? 'remediation revision guard is empty' };
     }
     const rest: SqlStatement[] = [];
+    if (command.deletedTaskIds && command.deletedTaskIds.length > 0) {
+      rest.push(detachWorkflowNodeTasksStatement(this.workspaceId, command.deletedTaskIds));
+    }
     for (const id of command.deletedTaskIds ?? []) {
       rest.push({ sql: 'DELETE FROM tasks WHERE workspace_id = ? AND id = ?', params: [this.workspaceId, id] });
     }
@@ -2892,6 +4660,1085 @@ export class SqliteTaskRepository implements TaskRepository {
       command.tasks[0]?.updatedAt ?? new Date().toISOString(),
     );
     return { ok: true, changed: (results[0]?.changes ?? 0) > 0, ...((results[0]?.changes ?? 0) === 0 ? { reason: 'task changed; retry' } : {}) };
+  }
+
+  /**
+   * Persist an immutable one-node workflow definition.
+   * First statement claims (definitionId,version)/fingerprint on the operations ledger;
+   * rest inserts workflow_definitions. Same fingerprint replays; conflict fails closed.
+   */
+  private async defineWorkflowVersion(
+    command: Extract<RepositoryCommand, { kind: 'defineWorkflowVersion' }>,
+  ): Promise<RepositoryCommandResult> {
+    if (command.workspaceId !== this.workspaceId) {
+      throw new Error('workspace mismatch');
+    }
+    const validated = validateDefineWorkflow({
+      definitionId: command.definitionId,
+      version: command.version,
+      name: command.name,
+      topology: command.topology,
+      entryContracts: command.entryContracts ?? [],
+      policy: command.policy ?? DEFAULT_WORKFLOW_POLICY,
+      scope: command.ownerRootTaskId
+        ? { kind: 'root', ownerRootTaskId: command.ownerRootTaskId }
+        : { kind: 'workspace' },
+      createdAt: command.createdAt,
+    });
+    if (!validated.ok) {
+      const reason =
+        validated.reason.includes('definitionId') ||
+        validated.reason.includes('version') ||
+        validated.reason.includes('name') ||
+        validated.reason.includes('createdAt')
+          ? 'invalid identity'
+          : 'invalid topology';
+      const shaped = defineWorkflowInvalid(reason);
+      return {
+        ok: false,
+        changed: false,
+        conflict: true,
+        reason: shaped.reason,
+        operation: {
+          fingerprint: '',
+          result: { ok: false, error: shaped.reason },
+        },
+      };
+    }
+    const { definition, fingerprint, topologyJson } = validated;
+    const ledgerKey = defineWorkflowLedgerKey(
+      definition.definitionId,
+      definition.version,
+      definition.scope.kind === 'root' ? definition.scope.ownerRootTaskId : undefined,
+    );
+    const resultPayload = defineWorkflowCreated(definition, fingerprint);
+    // Claim first: INSERT OR IGNORE into operations. Zero changes → inspect existing fingerprint.
+    const claimSql: SqlStatement = {
+      sql: `INSERT INTO operations (workspace_id, ledger_key, fingerprint, result_json, created_at)
+            SELECT ?, ?, ?, ?, ?
+             WHERE NOT EXISTS (
+               SELECT 1 FROM workflow_definitions definition
+                WHERE definition.workspace_id = ?
+                  AND definition.definition_id = ?
+                  AND definition.version = ?
+                  AND (
+                    definition.scope_kind <> ?
+                    OR definition.owner_root_task_id IS NOT ?
+                  )
+             )
+            ON CONFLICT(workspace_id, ledger_key) DO NOTHING`,
+      params: [
+        this.workspaceId,
+        ledgerKey,
+        fingerprint,
+        encodePayload({ result: { ok: true, data: resultPayload } }),
+        definition.createdAt,
+        this.workspaceId,
+        definition.definitionId,
+        definition.version,
+        definition.scope.kind,
+        definition.scope.kind === 'root' ? definition.scope.ownerRootTaskId : null,
+      ],
+    };
+    const defSql = {
+      sql: `INSERT INTO workflow_definitions (
+              workspace_id, definition_id, version, name, entry_node_id, topology_json,
+              scope_kind, owner_root_task_id, fingerprint, policy_json, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(workspace_id, definition_id, version) DO NOTHING`,
+      params: [
+        this.workspaceId,
+        definition.definitionId,
+        definition.version,
+        definition.name,
+        entryNodeIds(definition.topology)[0]!,
+        topologyJson,
+        definition.scope.kind,
+        definition.scope.kind === 'root' ? definition.scope.ownerRootTaskId : null,
+        fingerprint,
+        JSON.stringify(definition.policy),
+        definition.createdAt,
+      ],
+    };
+    const terminalIds = new Set(terminalNodeIds(definition.topology));
+    const normalizedTopologyStatements: SqlStatement[] = definition.topology.nodes.map(
+      (node, ordinal) => ({
+        sql: `INSERT INTO workflow_definition_nodes
+              (workspace_id, definition_id, definition_version, node_id, ordinal,
+               is_terminal, role, task_type, backend, model, capabilities_json)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(workspace_id, definition_id, definition_version, node_id) DO NOTHING`,
+        params: [
+          this.workspaceId,
+          definition.definitionId,
+          definition.version,
+          node.nodeId,
+          ordinal,
+          terminalIds.has(node.nodeId) ? 1 : 0,
+          node.role ?? null,
+          node.taskType ?? null,
+          node.backend ?? null,
+          node.model ?? null,
+          JSON.stringify(node.capabilities ?? []),
+        ],
+      }),
+    );
+    if (definition.topology.kind === 'graph_v1') {
+      for (const [ordinal, edge] of definition.topology.edges.entries()) {
+        normalizedTopologyStatements.push({
+          sql: `INSERT INTO workflow_definition_edges
+                (workspace_id, definition_id, definition_version, source_node_id,
+                 destination_node_id, destination_input_ref, ordinal, expected_artifact_kind)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(workspace_id, definition_id, definition_version, source_node_id)
+                DO NOTHING`,
+          params: [
+            this.workspaceId,
+            definition.definitionId,
+            definition.version,
+            edge.fromNodeId,
+            edge.toNodeId,
+            edge.inputRef,
+            ordinal,
+            edge.expectedArtifactKind ?? 'next_result',
+          ],
+        });
+      }
+    }
+    for (const [ordinal, contract] of definition.entryContracts.entries()) {
+      normalizedTopologyStatements.push({
+        sql: `INSERT INTO workflow_entry_contracts
+              (workspace_id, definition_id, definition_version, entry_node_id,
+               input_ref, ordinal, expected_artifact_kind)
+              VALUES (?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(workspace_id, definition_id, definition_version, entry_node_id, input_ref)
+              DO NOTHING`,
+        params: [
+          this.workspaceId,
+          definition.definitionId,
+          definition.version,
+          contract.entryNodeId,
+          contract.inputRef,
+          ordinal,
+          contract.expectedArtifactKind,
+        ],
+      });
+    }
+    // Ensure workspace row exists for FK (same pattern as other creates).
+    await this.db.run(
+      `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
+       VALUES (?,?,?,?,?)
+       ON CONFLICT(id) DO NOTHING`,
+      [this.workspaceId, this.workspaceId, this.workspaceId, definition.createdAt, definition.createdAt],
+    );
+    await this.db.run(
+      `INSERT INTO workspace_revisions (workspace_id, revision)
+       VALUES (?, 0) ON CONFLICT(workspace_id) DO NOTHING`,
+      [this.workspaceId],
+    );
+
+    const publicClaimSql: SqlStatement | undefined = command.publicOperation
+      ? {
+          sql: `INSERT INTO operations (workspace_id, ledger_key, fingerprint, result_json, created_at)
+                SELECT ?, ?, ?, ?, ?
+                 WHERE NOT EXISTS (
+                   SELECT 1 FROM operations
+                    WHERE workspace_id = ? AND ledger_key = ? AND fingerprint <> ?
+                 )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM workflow_definitions definition
+                      WHERE definition.workspace_id = ?
+                        AND definition.definition_id = ?
+                        AND definition.version = ?
+                        AND (
+                          definition.scope_kind <> ?
+                          OR definition.owner_root_task_id IS NOT ?
+                        )
+                   )
+                ON CONFLICT(workspace_id, ledger_key) DO NOTHING`,
+          params: [
+            this.workspaceId,
+            command.publicOperation.ledgerKey,
+            command.publicOperation.fingerprint,
+            encodePayload({ result: { ok: true, data: resultPayload } }),
+            definition.createdAt,
+            this.workspaceId,
+            ledgerKey,
+            fingerprint,
+            this.workspaceId,
+            definition.definitionId,
+            definition.version,
+            definition.scope.kind,
+            definition.scope.kind === 'root' ? definition.scope.ownerRootTaskId : null,
+          ],
+        }
+      : undefined;
+    const statements = [
+      ...(publicClaimSql ? [publicClaimSql] : []),
+      claimSql,
+      defSql,
+      ...normalizedTopologyStatements,
+    ];
+    const tx = await this.db.transaction(statements, {
+      abortIfFirstUnchanged: publicClaimSql !== undefined,
+    });
+    const domainClaimIndex = publicClaimSql ? 1 : 0;
+    if (publicClaimSql && (tx[0]?.changes ?? 0) === 0) {
+      const existingPublic = await this.db.get<OperationRow>(
+        `SELECT ledger_key, fingerprint, result_json FROM operations
+          WHERE workspace_id = ? AND ledger_key = ?`,
+        [this.workspaceId, command.publicOperation!.ledgerKey],
+      );
+      if (existingPublic) {
+        const operation = decodeOperation(existingPublic);
+        if (operation.fingerprint !== command.publicOperation!.fingerprint) {
+          return {
+            ok: false,
+            changed: false,
+            conflict: true,
+            reason: 'operation fingerprint conflict',
+            operation,
+          };
+        }
+        return { ok: true, changed: false, operation };
+      }
+      const conflict = defineWorkflowConflict(definition.definitionId, definition.version);
+      return {
+        ok: false,
+        changed: false,
+        conflict: true,
+        reason: conflict.reason,
+        operation: { fingerprint, result: { ok: false, error: conflict.reason } },
+      };
+    }
+    const claimChanges = tx[domainClaimIndex]?.changes ?? 0;
+    if (claimChanges > 0) {
+      // Fresh claim — definition insert should have landed (or already matched).
+      return {
+        ok: true,
+        changed: true,
+        operation: {
+          fingerprint,
+          result: { ok: true, data: resultPayload },
+        },
+      };
+    }
+    // Replay or conflict: read existing operation fingerprint.
+    const existing = await this.db.get(
+      `SELECT fingerprint, result_json FROM operations
+        WHERE workspace_id = ? AND ledger_key = ?`,
+      [this.workspaceId, ledgerKey],
+    ) as { fingerprint?: string; result_json?: string } | null;
+    if (!existing || typeof existing.fingerprint !== 'string') {
+      const conflict = defineWorkflowConflict(definition.definitionId, definition.version);
+      return {
+        ok: false,
+        changed: false,
+        conflict: true,
+        reason: conflict.reason,
+        operation: { fingerprint, result: { ok: false, error: conflict.reason } },
+      };
+    }
+    if (existing.fingerprint === fingerprint) {
+      const replay = defineWorkflowReplay(definition, fingerprint);
+      return {
+        ok: true,
+        changed: false,
+        operation: {
+          fingerprint,
+          result: { ok: true, data: replay },
+        },
+      };
+    }
+    const conflict = defineWorkflowConflict(definition.definitionId, definition.version);
+    return {
+      ok: false,
+      changed: false,
+      conflict: true,
+      reason: conflict.reason,
+      operation: {
+        fingerprint: existing.fingerprint,
+        result: { ok: false, error: conflict.reason },
+      },
+    };
+  }
+
+  /**
+   * Atomically start a frozen one-node workflow run.
+   * First statement claims startIdempotencyKey on the operations ledger;
+   * rest inserts run, node, satisfied entry gate, engine start artifact, entry
+   * task, aggregate message, and exactly one queued activation turn.
+   */
+  private async startWorkflowRun(
+    command: Extract<RepositoryCommand, { kind: 'startWorkflowRun' }>,
+  ): Promise<RepositoryCommandResult> {
+    if (command.workspaceId !== this.workspaceId) {
+      throw new Error('workspace mismatch');
+    }
+
+    const invalidStart = (
+      reason: 'definition not found' | 'invalid start' | 'invalid identity',
+    ): RepositoryCommandResult => {
+      const shaped = startWorkflowInvalid(reason, command.definitionId, command.version);
+      return {
+        ok: false,
+        changed: false,
+        conflict: true,
+        reason: shaped.reason,
+        operation: { fingerprint: '', result: { ok: false, error: shaped.reason } },
+      };
+    };
+
+    // Load and revalidate the complete immutable definition before allocating runtime rows.
+    const defRow = await this.db.get(
+      `SELECT definition_id, version, name, entry_node_id, topology_json, scope_kind,
+              owner_root_task_id, fingerprint, policy_json, created_at
+         FROM workflow_definitions
+        WHERE workspace_id = ? AND definition_id = ? AND version = ?`,
+      [this.workspaceId, command.definitionId, command.version],
+    ) as {
+      definition_id?: string;
+      version?: number;
+      name?: string;
+      entry_node_id?: string;
+      topology_json?: string;
+      scope_kind?: string;
+      owner_root_task_id?: string | null;
+      fingerprint?: string;
+      policy_json?: string;
+      created_at?: string;
+    } | null;
+
+    if (!defRow || typeof defRow.topology_json !== 'string' || typeof defRow.entry_node_id !== 'string') {
+      return invalidStart('definition not found');
+    }
+
+    const topology = decodeStoredTopologyJson(defRow.topology_json);
+    const contractRows = await this.db.all(
+      `SELECT entry_node_id, input_ref, expected_artifact_kind
+         FROM workflow_entry_contracts
+        WHERE workspace_id = ? AND definition_id = ? AND definition_version = ?
+        ORDER BY ordinal`,
+      [this.workspaceId, command.definitionId, command.version],
+    ) as Array<{
+      entry_node_id?: string;
+      input_ref?: string;
+      expected_artifact_kind?: string;
+    }>;
+    let storedPolicy: unknown;
+    try {
+      storedPolicy = typeof defRow.policy_json === 'string' ? JSON.parse(defRow.policy_json) : undefined;
+    } catch {
+      return invalidStart('invalid start');
+    }
+    if (
+      !topology.ok ||
+      typeof defRow.name !== 'string' ||
+      typeof defRow.created_at !== 'string' ||
+      typeof defRow.fingerprint !== 'string' ||
+      (defRow.scope_kind !== 'workspace' && defRow.scope_kind !== 'root') ||
+      contractRows.some((row) =>
+        typeof row.entry_node_id !== 'string' ||
+        typeof row.input_ref !== 'string' ||
+        typeof row.expected_artifact_kind !== 'string')
+    ) {
+      return invalidStart('invalid start');
+    }
+    const storedDefinition = validateDefineWorkflow({
+      definitionId: command.definitionId,
+      version: command.version,
+      name: defRow.name,
+      topology: topology.topology,
+      entryContracts: contractRows.map((row) => ({
+        entryNodeId: row.entry_node_id!,
+        inputRef: row.input_ref!,
+        expectedArtifactKind: row.expected_artifact_kind!,
+      })),
+      policy: storedPolicy,
+      scope: defRow.scope_kind === 'root'
+        ? { kind: 'root', ownerRootTaskId: defRow.owner_root_task_id ?? '' }
+        : { kind: 'workspace' },
+      createdAt: defRow.created_at,
+    });
+    if (!storedDefinition.ok || storedDefinition.fingerprint !== defRow.fingerprint) {
+      return invalidStart('invalid start');
+    }
+    if (
+      storedDefinition.definition.scope.kind === 'root' &&
+      command.ownerRootTaskId !== storedDefinition.definition.scope.ownerRootTaskId
+    ) {
+      return invalidStart('invalid identity');
+    }
+
+    let effectivePolicy = storedDefinition.definition.policy;
+    if (command.effectivePolicy) {
+      const numericPolicyKeys: Array<Exclude<keyof WorkflowPolicyV1, 'failWorkflow'>> = [
+        'maxFeedbackRoundsPerRun',
+        'maxTurnsPerTask',
+        'maxWorkflowTurnsPerRun',
+        'runTimeoutMs',
+        'maxDepth',
+        'maxTaskCount',
+        'maxConcurrency',
+        'maxInputsPerGate',
+        'maxArtifactBytes',
+        'maxAggregateBytes',
+      ];
+      if (
+        command.effectivePolicy.failWorkflow !== effectivePolicy.failWorkflow ||
+        numericPolicyKeys.some((key) => command.effectivePolicy![key] > effectivePolicy[key])
+      ) {
+        return invalidStart('invalid start');
+      }
+      const effectiveDefinition = validateDefineWorkflow({
+        ...storedDefinition.definition,
+        policy: command.effectivePolicy,
+      });
+      if (!effectiveDefinition.ok) return invalidStart('invalid start');
+      effectivePolicy = effectiveDefinition.definition.policy;
+    }
+
+    const topo = storedDefinition.definition.topology;
+    const startEntryNodeIds = entryNodeIds(topo);
+    const allNodeIds = topo.nodes.map((n) => n.nodeId);
+    if (
+      startEntryNodeIds.length === 0 ||
+      !startEntryNodeIds.includes(defRow.entry_node_id) ||
+      (topo.kind === 'one_node_v1' && topo.entryNodeId !== defRow.entry_node_id)
+    ) {
+      return invalidStart('invalid start');
+    }
+
+    const goal = command.goal ?? defRow.name;
+    const validated = validateStartWorkflow({
+      definitionId: command.definitionId,
+      version: command.version,
+      startIdempotencyKey: command.startIdempotencyKey,
+      createdAt: command.createdAt,
+      entryNodeId: defRow.entry_node_id,
+      entryNodeIds: startEntryNodeIds,
+      allNodeIds,
+      goal,
+      backend: command.backend,
+      entryInputs: command.entryInputs,
+      entryContracts: storedDefinition.definition.entryContracts,
+      policy: effectivePolicy,
+      ownerRootTaskId: command.ownerRootTaskId,
+      callerTaskId: command.callerTaskId,
+      callerTurnId: command.callerTurnId,
+    });
+    if (!validated.ok) {
+      return invalidStart(
+        validated.reason.includes('definitionId') ||
+        validated.reason.includes('version') ||
+        validated.reason.includes('startIdempotencyKey') ||
+        validated.reason.includes('createdAt') ||
+        validated.reason.includes('caller authority')
+          ? 'invalid identity'
+          : 'invalid start',
+      );
+    }
+
+    const { identities, fingerprint } = validated;
+    if (identities.entries.length > validated.policy.maxWorkflowTurnsPerRun) {
+      return invalidStart('invalid start');
+    }
+    const resultPayload = startWorkflowCreated(validated);
+    const ledgerKey = startWorkflowLedgerKey(
+      validated.startIdempotencyKey,
+      validated.ownerRootTaskId && validated.callerTaskId
+        ? {
+            ownerRootTaskId: validated.ownerRootTaskId,
+            callerTaskId: validated.callerTaskId,
+            definitionId: validated.definitionId,
+            version: validated.version,
+          }
+        : undefined,
+    );
+    if (
+      command.resumeCallerOnCompletion &&
+      validated.callerTaskId &&
+      validated.callerTurnId
+    ) {
+      const startContinuationId = deriveWorkflowStartContinuationId(
+        identities.runId,
+        validated.callerTurnId,
+      );
+      const activeContinuation = await this.db.get<{ continuation_id?: string }>(
+        `SELECT continuation_id
+           FROM workflow_continuations
+          WHERE workspace_id = ? AND kind = 'start_wait' AND caller_task_id = ?
+            AND status IN ('pending', 'resolved')
+          ORDER BY created_at, continuation_id
+          LIMIT 1`,
+        [this.workspaceId, validated.callerTaskId],
+      );
+      if (
+        activeContinuation?.continuation_id &&
+        activeContinuation.continuation_id !== startContinuationId
+      ) {
+        return invalidStart('invalid start');
+      }
+    }
+
+    const existingStartOperation = await this.db.get<{
+      fingerprint?: string;
+    }>(
+      `SELECT fingerprint FROM operations
+        WHERE workspace_id = ? AND ledger_key = ?`,
+      [this.workspaceId, ledgerKey],
+    );
+    if (existingStartOperation?.fingerprint) {
+      if (existingStartOperation.fingerprint !== fingerprint) {
+        const conflict = startWorkflowConflict(validated.definitionId, validated.version);
+        return {
+          ok: false,
+          changed: false,
+          conflict: true,
+          reason: conflict.reason,
+          operation: {
+            fingerprint: existingStartOperation.fingerprint,
+            result: { ok: false, error: conflict.reason },
+          },
+        };
+      }
+
+      let continuationChanged = false;
+      if (
+        command.resumeCallerOnCompletion &&
+        validated.callerTaskId &&
+        validated.callerTurnId
+      ) {
+        const continuationId = deriveWorkflowStartContinuationId(
+          identities.runId,
+          validated.callerTurnId,
+        );
+        const results = await this.writeIfFirstChanged(
+          {
+            sql: `INSERT INTO workflow_continuations (
+                    workspace_id, run_id, continuation_id, caller_task_id, caller_turn_id,
+                    kind, status, payload_json, created_at, updated_at
+                  ) VALUES (?,?,?,?,?,'start_wait','pending',?,?,?)
+                  ON CONFLICT(workspace_id, run_id, continuation_id) DO NOTHING`,
+            params: [
+              this.workspaceId,
+              identities.runId,
+              continuationId,
+              validated.callerTaskId,
+              validated.callerTurnId,
+              encodePayload({
+                kind: 'start_wait',
+                runId: identities.runId,
+                callerTaskId: validated.callerTaskId,
+                callerTurnId: validated.callerTurnId,
+              }),
+              validated.createdAt,
+              validated.createdAt,
+            ],
+          },
+          [],
+          {
+            kind: 'task',
+            id: validated.callerTaskId,
+            taskId: validated.callerTaskId,
+            change: 'effect',
+          },
+          validated.createdAt,
+        );
+        continuationChanged = (results[0]?.changes ?? 0) > 0;
+      }
+      return {
+        ok: true,
+        changed: continuationChanged,
+        operation: {
+          fingerprint,
+          result: { ok: true, data: startWorkflowReplay(validated) },
+        },
+      };
+    }
+
+    const nodeById = new Map(topo.nodes.map((node) => [node.nodeId, node] as const));
+    const entryByNode = new Map(identities.entries.map((e) => [e.nodeId, e]));
+    const gateByNode = new Map(identities.nodeGates.map((g) => [g.nodeId, g.gateId]));
+    const entryNodeSet = new Set(identities.entries.map((e) => e.nodeId));
+    const inputByKey = new Map<string, (typeof validated.entryInputs)[number]>(
+      validated.entryInputs.map((input) => [`${input.entryNodeId}\0${input.inputRef}`, input] as const),
+    );
+    const artifactByKey = new Map<string, (typeof identities.entryArtifacts)[number]>(
+      identities.entryArtifacts.map((artifact) => [
+        `${artifact.entryNodeId}\0${artifact.inputRef}`,
+        artifact,
+      ] as const),
+    );
+    const createdAtMs = Date.parse(validated.createdAt);
+    if (!Number.isFinite(createdAtMs)) return invalidStart('invalid identity');
+    const deadlineAt = new Date(createdAtMs + validated.policy.runTimeoutMs).toISOString();
+
+    for (const entry of identities.entries) {
+      const contracts = validated.entryContracts.filter((contract) => contract.entryNodeId === entry.nodeId);
+      const aggregate = formatWorkflowEntryAggregate(contracts.map((contract) => ({
+        inputRef: contract.inputRef,
+        value: inputByKey.get(`${entry.nodeId}\0${contract.inputRef}`)!.value,
+      })));
+      if (Buffer.byteLength(aggregate, 'utf8') > validated.policy.maxAggregateBytes) {
+        return invalidStart('invalid start');
+      }
+    }
+
+    const domainClaim: SqlStatement = command.publicOperation
+      ? {
+          sql: `INSERT INTO operations (workspace_id, ledger_key, fingerprint, result_json, created_at)
+                SELECT ?, ?, ?, ?, ?
+                 WHERE NOT EXISTS (
+                   SELECT 1 FROM operations
+                    WHERE workspace_id = ? AND ledger_key = ? AND fingerprint <> ?
+                 )
+                ON CONFLICT(workspace_id, ledger_key) DO NOTHING`,
+          params: [
+            this.workspaceId,
+            ledgerKey,
+            fingerprint,
+            encodePayload({ result: { ok: true, data: resultPayload } }),
+            validated.createdAt,
+            this.workspaceId,
+            command.publicOperation.ledgerKey,
+            command.publicOperation.fingerprint,
+          ],
+        }
+      : {
+          sql: `INSERT INTO operations (workspace_id, ledger_key, fingerprint, result_json, created_at)
+                VALUES (?,?,?,?,?) ON CONFLICT(workspace_id, ledger_key) DO NOTHING`,
+          params: [
+            this.workspaceId,
+            ledgerKey,
+            fingerprint,
+            encodePayload({ result: { ok: true, data: resultPayload } }),
+            validated.createdAt,
+          ],
+        };
+
+    const claims: SqlStatement[] = command.publicOperation
+      ? [
+          domainClaim,
+          {
+            sql: `INSERT INTO operations (workspace_id, ledger_key, fingerprint, result_json, created_at)
+                  SELECT ?, ?, ?, ?, ?
+                   WHERE NOT EXISTS (
+                     SELECT 1 FROM operations
+                      WHERE workspace_id = ? AND ledger_key = ? AND fingerprint <> ?
+                   )
+                     AND NOT EXISTS (
+                       SELECT 1 FROM operations
+                        WHERE workspace_id = ? AND ledger_key = ? AND fingerprint <> ?
+                     )
+                  ON CONFLICT(workspace_id, ledger_key) DO NOTHING`,
+            params: [
+              this.workspaceId,
+              command.publicOperation.ledgerKey,
+              command.publicOperation.fingerprint,
+              encodePayload({ result: { ok: true, data: resultPayload } }),
+              validated.createdAt,
+              this.workspaceId,
+              command.publicOperation.ledgerKey,
+              command.publicOperation.fingerprint,
+              this.workspaceId,
+              ledgerKey,
+              fingerprint,
+            ],
+          },
+        ]
+      : [domainClaim];
+
+    const rest: SqlStatement[] = [
+      {
+        sql: `INSERT INTO workflow_runs (
+                 workspace_id, run_id, definition_id, definition_version, status, origin,
+                 parent_run_id, owner_root_task_id, caller_task_id, caller_turn_id,
+                 continuation_id, policy_json, max_feedback_rounds, max_turns_per_task,
+                  max_workflow_turns, max_children, max_depth, max_concurrency,
+                  max_aggregate_bytes, feedback_rounds_reserved, workflow_turns_reserved,
+                  children_reserved, started_at, deadline_at, created_at, updated_at
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(workspace_id, run_id) DO NOTHING`,
+        params: [
+          this.workspaceId,
+          identities.runId,
+          validated.definitionId,
+          validated.version,
+          'running',
+          'top_level',
+          null,
+          validated.ownerRootTaskId ?? null,
+          validated.callerTaskId ?? null,
+          validated.callerTurnId ?? null,
+          null,
+          JSON.stringify(validated.policy),
+          validated.policy.maxFeedbackRoundsPerRun,
+          validated.policy.maxTurnsPerTask,
+          validated.policy.maxWorkflowTurnsPerRun,
+          validated.policy.maxTaskCount,
+          validated.policy.maxDepth,
+          validated.policy.maxConcurrency,
+          validated.policy.maxAggregateBytes,
+          0,
+          identities.entries.length,
+          0,
+          validated.createdAt,
+          deadlineAt,
+          validated.createdAt,
+          validated.createdAt,
+        ],
+      },
+    ];
+
+    if (validated.ownerRootTaskId && validated.callerTaskId && validated.callerTurnId) {
+      rest.push({
+        sql: `INSERT INTO workflow_start_claims (
+                workspace_id, owner_task_id, caller_task_id, caller_turn_id,
+                definition_id, definition_version, idempotency_key, fingerprint,
+                run_id, created_at
+              ) VALUES (?,?,?,?,?,?,?,?,?,?)
+              ON CONFLICT DO NOTHING`,
+        params: [
+          this.workspaceId,
+          validated.ownerRootTaskId,
+          validated.callerTaskId,
+          validated.callerTurnId,
+          validated.definitionId,
+          validated.version,
+          validated.startIdempotencyKey,
+          fingerprint,
+          identities.runId,
+          validated.createdAt,
+        ],
+      });
+      if (command.resumeCallerOnCompletion) {
+        const continuationId = deriveWorkflowStartContinuationId(
+          identities.runId,
+          validated.callerTurnId,
+        );
+        rest.push({
+          sql: `INSERT INTO workflow_continuations (
+                  workspace_id, run_id, continuation_id, caller_task_id, caller_turn_id,
+                  kind, status, payload_json, created_at, updated_at
+                ) VALUES (?,?,?,?,?,'start_wait','pending',?,?,?)
+                ON CONFLICT(workspace_id, run_id, continuation_id) DO NOTHING`,
+          params: [
+            this.workspaceId,
+            identities.runId,
+            continuationId,
+            validated.callerTaskId,
+            validated.callerTurnId,
+            encodePayload({
+              kind: 'start_wait',
+              runId: identities.runId,
+              callerTaskId: validated.callerTaskId,
+              callerTurnId: validated.callerTurnId,
+            }),
+            validated.createdAt,
+            validated.createdAt,
+          ],
+        });
+      }
+    }
+
+    for (const entry of identities.entries) {
+      const node = nodeById.get(entry.nodeId)!;
+      const task: MusterTask = {
+        id: entry.taskId,
+        role: node.role ?? 'worker',
+        lifecycle: 'open',
+        releaseState: 'released',
+        goal: workflowNodeTaskGoal(node, validated.goal),
+        parentId: validated.callerTaskId ?? null,
+        prerequisites: [],
+        backend: node.backend ?? validated.backend,
+        ...(node.model !== undefined ? { model: node.model } : {}),
+        ...(node.taskType !== undefined ? { taskType: node.taskType } : {}),
+        capabilities: [...(node.capabilities ?? [])] as MusterTask['capabilities'],
+        executionPolicy: {
+          maxTurns: validated.policy.maxTurnsPerTask,
+          maxAutomaticRetries: 1,
+          runTimeoutOverrideMs: validated.policy.runTimeoutMs,
+        },
+        revision: 0,
+        createdAt: validated.createdAt,
+        updatedAt: validated.createdAt,
+        releasedAt: validated.createdAt,
+      };
+      rest.push(taskStatement(this.workspaceId, task, false));
+    }
+
+    for (const nodeGate of identities.nodeGates) {
+      const isEntry = entryNodeSet.has(nodeGate.nodeId);
+      const entry = entryByNode.get(nodeGate.nodeId);
+      rest.push({
+        sql: `INSERT INTO workflow_dependency_gates (
+                workspace_id, run_id, gate_id, consumer_node_id, status,
+                activation_id, reserved_turn_id, aggregate_message_id
+              ) VALUES (?,?,?,?,?,?,?,?)
+              ON CONFLICT(workspace_id, run_id, gate_id) DO NOTHING`,
+        params: [
+          this.workspaceId,
+          identities.runId,
+          nodeGate.gateId,
+          nodeGate.nodeId,
+          isEntry ? 'satisfied' : 'open',
+          isEntry && entry ? entry.activationId : null,
+          isEntry && entry ? entry.activationTurnId : null,
+          isEntry && entry ? entry.messageId : null,
+        ],
+      });
+      rest.push({
+        sql: `INSERT INTO workflow_nodes (
+                workspace_id, run_id, node_id, task_id, status
+              ) VALUES (?,?,?,?,?)
+              ON CONFLICT(workspace_id, run_id, node_id) DO NOTHING`,
+        params: [
+          this.workspaceId,
+          identities.runId,
+          nodeGate.nodeId,
+          isEntry && entry ? entry.taskId : null,
+          isEntry ? 'active' : 'pending',
+        ],
+      });
+    }
+
+    for (const entry of identities.entries) {
+      const contracts = validated.entryContracts.filter((contract) => contract.entryNodeId === entry.nodeId);
+      const bindings = contracts.length > 0
+        ? contracts
+        : [{ entryNodeId: entry.nodeId, inputRef: 'engine_start', expectedArtifactKind: 'engine_start' }];
+      const aggregateContent = formatWorkflowEntryAggregate(contracts.map((contract) => ({
+        inputRef: contract.inputRef,
+        value: inputByKey.get(`${entry.nodeId}\0${contract.inputRef}`)!.value,
+      })));
+      const message: TaskMessage = {
+        id: entry.messageId,
+        taskId: entry.taskId,
+        role: 'system',
+        content: aggregateContent,
+        state: 'assigned',
+        turnId: entry.activationTurnId,
+        createdAt: validated.createdAt,
+      };
+      const turn: TaskTurn = {
+        id: entry.activationTurnId,
+        taskId: entry.taskId,
+        sequence: 1,
+        status: 'queued',
+        trigger: 'engine',
+        inputs: [{ kind: 'message', messageId: entry.messageId }],
+        createdAt: validated.createdAt,
+      };
+      for (const binding of bindings) {
+        const key = `${entry.nodeId}\0${binding.inputRef}`;
+        const artifact = artifactByKey.get(key)!;
+        const input = inputByKey.get(key);
+        rest.push(
+          {
+            sql: `INSERT INTO workflow_artifacts (
+                    workspace_id, run_id, artifact_id, producer_node_id, logical_name,
+                    revision, kind, payload_json, created_at
+                  ) VALUES (?,?,?,?,?,?,?,?,?)
+                  ON CONFLICT DO NOTHING`,
+            params: [
+              this.workspaceId,
+              identities.runId,
+              artifact.artifactId,
+              null,
+              binding.inputRef,
+              1,
+              binding.expectedArtifactKind,
+              input
+                ? encodePayload({ value: input.value })
+                : encodePayload({ kind: 'engine_start', schema: 1 }),
+              validated.createdAt,
+            ],
+          },
+          {
+            sql: `INSERT INTO workflow_artifact_sources (
+                    workspace_id, run_id, artifact_id, artifact_revision, source_kind,
+                    producer_run_id, producer_node_id, producer_task_id, producing_turn_id,
+                    producing_activation_id, caller_task_id, caller_turn_id,
+                    engine_start_operation_key
+                  ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                  ON CONFLICT(workspace_id, run_id, artifact_id, artifact_revision) DO NOTHING`,
+            params: [
+              this.workspaceId,
+              identities.runId,
+              artifact.artifactId,
+              1,
+              input ? 'caller_turn' : 'engine_start',
+              null,
+              null,
+              null,
+              null,
+              null,
+              input ? validated.callerTaskId ?? null : null,
+              input ? validated.callerTurnId ?? null : null,
+              input ? null : ledgerKey,
+            ],
+          },
+          {
+            sql: `INSERT INTO workflow_gate_bindings (
+                    workspace_id, run_id, gate_id, input_ref, producer_node_id, required_kind
+                  ) VALUES (?,?,?,?,?,?)
+                  ON CONFLICT(workspace_id, run_id, gate_id, input_ref) DO NOTHING`,
+            params: [
+              this.workspaceId,
+              identities.runId,
+              entry.gateId,
+              binding.inputRef,
+              null,
+              binding.expectedArtifactKind,
+            ],
+          },
+          {
+            sql: `INSERT INTO workflow_gate_fills (
+                    workspace_id, run_id, gate_id, input_ref, artifact_id, artifact_revision, filled_at
+                  ) VALUES (?,?,?,?,?,?,?)
+                  ON CONFLICT(workspace_id, run_id, gate_id, input_ref)
+                  DO NOTHING`,
+            params: [
+              this.workspaceId,
+              identities.runId,
+              entry.gateId,
+              binding.inputRef,
+              artifact.artifactId,
+              1,
+              validated.createdAt,
+            ],
+          },
+        );
+      }
+      rest.push(
+        turnStatement(this.workspaceId, turn, false),
+        messageStatement(this.workspaceId, message, false),
+        turnInputStatement(
+          this.workspaceId,
+          turn.id,
+          0,
+          { kind: 'message', messageId: entry.messageId },
+        ),
+        {
+          sql: `INSERT INTO workflow_activations (
+                  workspace_id, run_id, activation_id, node_id, kind, status,
+                  source_gate_id, feedback_round_id, feedback_target_node_id,
+                  continuation_id, return_gate_id, inherited_feedback_round_id,
+                  inherited_feedback_target_node_id, primary_turn_id, message_id,
+                  execution_turn_id, created_at, updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(workspace_id, run_id, activation_id) DO NOTHING`,
+          params: [
+            this.workspaceId,
+            identities.runId,
+            entry.activationId,
+            entry.nodeId,
+            'entry_start',
+            'queued',
+            entry.gateId,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            entry.activationTurnId,
+            entry.messageId,
+            entry.activationTurnId,
+            validated.createdAt,
+            validated.createdAt,
+          ],
+        },
+      );
+    }
+
+    if (topo.kind === 'graph_v1') {
+      for (const edge of topo.edges) {
+        const gateId = gateByNode.get(edge.toNodeId);
+        if (!gateId) continue;
+        rest.push({
+          sql: `INSERT INTO workflow_gate_bindings (
+                  workspace_id, run_id, gate_id, input_ref, producer_node_id, required_kind
+                ) VALUES (?,?,?,?,?,?)
+                ON CONFLICT(workspace_id, run_id, gate_id, input_ref) DO NOTHING`,
+          params: [
+            this.workspaceId,
+            identities.runId,
+            gateId,
+            edge.inputRef,
+            edge.fromNodeId,
+            edge.expectedArtifactKind ?? 'next_result',
+          ],
+        });
+      }
+    }
+
+    await this.db.run(
+      `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
+       VALUES (?,?,?,?,?)
+       ON CONFLICT(id) DO NOTHING`,
+      [this.workspaceId, this.workspaceId, this.workspaceId, validated.createdAt, validated.createdAt],
+    );
+    await this.db.run(
+      `INSERT INTO workspace_revisions (workspace_id, revision)
+       VALUES (?, 0) ON CONFLICT(workspace_id) DO NOTHING`,
+      [this.workspaceId],
+    );
+
+    const tx = await this.db.transaction([...claims, ...rest], {
+      abortIfFirstUnchanged: true,
+    });
+    const claimChanges = tx[0]?.changes ?? 0;
+    if (claimChanges > 0) {
+      return {
+        ok: true,
+        changed: true,
+        operation: {
+          fingerprint,
+          result: { ok: true, data: resultPayload },
+        },
+      };
+    }
+
+    const existing = await this.db.get(
+      `SELECT fingerprint, result_json FROM operations
+        WHERE workspace_id = ? AND ledger_key = ?`,
+      [this.workspaceId, ledgerKey],
+    ) as { fingerprint?: string; result_json?: string } | null;
+    if (!existing || typeof existing.fingerprint !== 'string') {
+      const conflict = startWorkflowConflict(validated.definitionId, validated.version);
+      return {
+        ok: false,
+        changed: false,
+        conflict: true,
+        reason: conflict.reason,
+        operation: { fingerprint, result: { ok: false, error: conflict.reason } },
+      };
+    }
+    if (existing.fingerprint === fingerprint) {
+      const replay = startWorkflowReplay(validated);
+      return {
+        ok: true,
+        changed: false,
+        operation: {
+          fingerprint,
+          result: { ok: true, data: replay },
+        },
+      };
+    }
+    const conflict = startWorkflowConflict(validated.definitionId, validated.version);
+    return {
+      ok: false,
+      changed: false,
+      conflict: true,
+      reason: conflict.reason,
+      operation: {
+        fingerprint: existing.fingerprint,
+        result: { ok: false, error: conflict.reason },
+      },
+    } as RepositoryCommandResult;
   }
 
   private async claimOperation(
@@ -3029,7 +5876,14 @@ export class SqliteTaskRepository implements TaskRepository {
   private async claim(command: Extract<RepositoryCommand, { kind: 'claimTurn' }>): Promise<RepositoryCommandResult> {
     const taskId = await this.lookupTurnTaskId(command.turnId);
     const update = claimTurnStatement(this.workspaceId, command);
-    const rest: SqlStatement[] = [];
+    const rest: SqlStatement[] = [
+      workflowActivationRunningStatement(this.workspaceId, command.turnId, command.startedAt),
+      workflowStartContinuationConsumptionStatement(
+        this.workspaceId,
+        command.turnId,
+        command.startedAt,
+      ),
+    ];
     if (command.sessionId) rest.push(sessionClaimStatement(this.workspaceId, command.turnId, command.sessionId, command.startedAt));
     for (const key of command.resourceKeys) rest.push(resourceClaimStatement(this.workspaceId, command.turnId, key, command.startedAt));
     const results = await this.writeIfFirstChanged(
@@ -3052,8 +5906,19 @@ export class SqliteTaskRepository implements TaskRepository {
       // eligibility or the expected task revision changed after the engine
       // froze its prompt/input snapshot.
       ...(claims ? [taskStatement(this.workspaceId, command.task, true)] : []),
-      { sql: 'DELETE FROM task_dependencies WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, command.task.id] },
-      ...command.task.dependencies.map((dependency) => dependencyStatement(this.workspaceId, command.task.id, dependency)),
+      ...(claims
+        ? [workflowActivationRunningStatement(this.workspaceId, command.turn.id, command.startedAt)]
+        : []),
+      ...(claims && command.turn.workflowResume?.kind === 'start_workflow'
+        ? [workflowStartContinuationConsumptionStatement(
+            this.workspaceId,
+            command.turn.id,
+            command.startedAt,
+            command.turn.workflowResume.continuationId,
+          )]
+        : []),
+      { sql: 'DELETE FROM task_prerequisites WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, command.task.id] },
+      ...command.task.prerequisites.map((prerequisite) => prerequisiteStatement(this.workspaceId, command.task.id, prerequisite)),
       turnStatement(this.workspaceId, command.turn, true),
       { sql: 'DELETE FROM turn_inputs WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, command.turn.id] },
       ...command.turn.inputs.map((input, ordering) => turnInputStatement(this.workspaceId, command.turn.id, ordering, input)),
@@ -3102,6 +5967,18 @@ export class SqliteTaskRepository implements TaskRepository {
       }, [
       { sql: 'DELETE FROM session_claims WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, command.turnId] },
       { sql: 'DELETE FROM resource_claims WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, command.turnId] },
+      workflowActivationSettlementStatement(
+        this.workspaceId,
+        command.turnId,
+        command.status,
+        command.finishedAt,
+      ),
+      dispositionClaimSettlementStatement(
+        this.workspaceId,
+        command.turnId,
+        command.status === 'succeeded' ? 'consumed' : 'discarded',
+        command.finishedAt,
+      ),
     ], {
       kind: 'turn',
       id: command.turnId,
@@ -3125,8 +6002,99 @@ export class SqliteTaskRepository implements TaskRepository {
     if (command.expectedStatuses.length === 0) {
       return { ok: true, changed: false, reason: 'expected live status required' };
     }
+    const dispositionClaimConflict = await this.validateSettlementDispositionClaim(command);
+    if (dispositionClaimConflict) return dispositionClaimConflict;
+    // M018 S05: workflow_fail / invalid-route / budget exhaustion close the run first.
+    // M018 S04: feedback responses intercept workflow_next on a feedback turn before
+    // the forward contribution path. PREV requests open a round; otherwise fall through
+    // to the existing NEXT contribution planner.
+    const failClosure = await this.planWorkflowFailFromSettle(command);
+    // M018 S06: child invocation is mutually exclusive with feedback/next/prev.
+    const childInvocation = failClosure.statements.length > 0
+      ? { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] }
+      : await this.planWorkflowChildInvocation(command);
+    if (childInvocation.conflictReason) {
+      return {
+        ok: true,
+        changed: false,
+        conflict: true,
+        reason: childInvocation.conflictReason,
+      };
+    }
+    const feedbackResponse = (
+      failClosure.statements.length > 0
+      || childInvocation.statements.length > 0
+    )
+      ? { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] }
+      : await this.planWorkflowFeedbackResponse(command);
+    const prevRequest = (
+      failClosure.statements.length > 0
+      || childInvocation.statements.length > 0
+      || feedbackResponse.statements.length > 0
+    )
+      ? { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] }
+      : await this.planWorkflowPrevRequest(command);
+    // M018 S06: terminal child NEXT returns to the caller before ordinary forward NEXT.
+    const childReturn = (
+      failClosure.statements.length > 0
+      || childInvocation.statements.length > 0
+      || feedbackResponse.statements.length > 0
+      || prevRequest.statements.length > 0
+    )
+      ? { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] }
+      : await this.planWorkflowChildReturn(command);
+    const nextContribution = (
+      failClosure.statements.length > 0
+      || childInvocation.statements.length > 0
+      || feedbackResponse.statements.length > 0
+      || prevRequest.statements.length > 0
+      || childReturn.statements.length > 0
+    )
+      ? { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] }
+      : await this.planWorkflowNextContribution(command);
+    const budgetedRoutePlans: WorkflowEffectPlan[] = [
+      feedbackResponse,
+      prevRequest,
+      childReturn,
+      nextContribution,
+    ];
+    const budget = await this.planWorkflowBudgetExhaustionIfNeeded(command, {
+      feedbackRounds: budgetedRoutePlans.flatMap(
+        (plan) => plan.feedbackRoundReservations ?? [],
+      ),
+      workflowTurns: budgetedRoutePlans.flatMap((plan) => plan.turnReservations ?? []),
+    });
+    const routeEffects = {
+      statements: [
+        ...failClosure.statements,
+        ...childInvocation.statements,
+        ...feedbackResponse.statements,
+        ...prevRequest.statements,
+        ...childReturn.statements,
+        ...nextContribution.statements,
+      ],
+      changes: [
+        ...failClosure.changes,
+        ...childInvocation.changes,
+        ...feedbackResponse.changes,
+        ...prevRequest.changes,
+        ...childReturn.changes,
+        ...nextContribution.changes,
+      ],
+    };
+    const workflowEffects = budget.exhausted
+      ? { statements: budget.statements, changes: budget.changes }
+      : {
+          statements: [...budget.statements, ...routeEffects.statements],
+          changes: [...budget.changes, ...routeEffects.changes],
+        };
     const rest: SqlStatement[] = [
       taskStatement(this.workspaceId, command.task, true),
+      ...sessionBindingStatements(
+        this.workspaceId,
+        command.task,
+        command.turn.finishedAt ?? new Date().toISOString(),
+      ),
       ...command.relatedTurns.flatMap((turn) => [
         turnStatement(this.workspaceId, turn, true),
         { sql: 'DELETE FROM turn_inputs WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, turn.id] },
@@ -3137,25 +6105,4172 @@ export class SqliteTaskRepository implements TaskRepository {
       { sql: 'DELETE FROM resource_claims WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, command.turn.id] },
       { sql: 'DELETE FROM runtime_claims WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, command.turn.id] },
       { sql: 'DELETE FROM turn_cancel_requests WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, command.turn.id] },
+      ...(command.turn.status === 'succeeded'
+        ? workflowActivationSourceConsumptionStatements(
+            this.workspaceId,
+            command.turn.id,
+            command.turn.finishedAt ?? new Date().toISOString(),
+          )
+        : []),
+      workflowActivationSettlementStatement(
+        this.workspaceId,
+        command.turn.id,
+        command.turn.status,
+        command.turn.finishedAt ?? new Date().toISOString(),
+      ),
+      dispositionClaimSettlementStatement(
+        this.workspaceId,
+        command.turn.id,
+        command.turn.status === 'succeeded' ? 'consumed' : 'discarded',
+        command.turn.finishedAt ?? new Date().toISOString(),
+      ),
+      ...workflowEffects.statements,
     ];
     const changes: ChangeRecord[] = [
       { kind: 'task', id: command.task.id, change: 'settle' },
       { kind: 'turn', id: command.turn.id, taskId: command.task.id, change: 'settle' },
       ...command.relatedTurns.map((turn) => ({ kind: 'turn' as const, id: turn.id, taskId: turn.taskId, change: 'effect' })),
       ...command.messages.map((message) => ({ kind: 'message' as const, id: message.id, taskId: message.taskId, change: 'complete' })),
+      ...workflowEffects.changes,
     ];
-    const results = await this.writeIfFirstChanged(
-      guardedSettleTurnStatement(this.workspaceId, command),
-      rest,
-      changes,
-      command.turn.finishedAt ?? new Date().toISOString(),
-    );
+    const uniqueChanges = [
+      ...new Map(changes.map((entry) => [`${entry.kind}:${entry.id}`, entry])).values(),
+    ];
+    let results: readonly import('./sqlite/rpc').RunResult[];
+    try {
+      results = await this.writeIfFirstChanged(
+        guardedSettleTurnStatement(this.workspaceId, command),
+        rest,
+        uniqueChanges,
+        command.turn.finishedAt ?? new Date().toISOString(),
+      );
+    } catch (error) {
+      if (command.task.committedSessionId) {
+        const owner = await this.db.get<{ task_id: string }>(
+          `SELECT task_id FROM session_owners
+            WHERE workspace_id = ? AND backend = ? AND session_id = ?`,
+          [this.workspaceId, command.task.backend, command.task.committedSessionId],
+        );
+        if (owner && owner.task_id !== command.task.id) {
+          return {
+            ok: true,
+            changed: false,
+            reason: 'backend session is already owned by another task',
+            conflict: true,
+          };
+        }
+      }
+      throw error;
+    }
     return {
       ok: true,
       changed: (results[0]?.changes ?? 0) > 0,
+      ...((results[0]?.changes ?? 0) > 0
+        ? {
+            affectedTaskIds: [...new Set(uniqueChanges.flatMap((change): string[] => {
+              if (change.kind === 'task') return [change.id];
+              return change.taskId ? [change.taskId] : [];
+            }))].sort(),
+          }
+        : {}),
       ...((results[0]?.changes ?? 0) === 0 ? { reason: 'turn is no longer live' } : {}),
     };
   }
+
+  private async validateSettlementDispositionClaim(
+    command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
+  ): Promise<RepositoryCommandResult | undefined> {
+    const row = await this.db.get<{
+      task_id: string;
+      runtime_epoch: number;
+      family: DurableDispositionClaim['family'];
+      kind: DurableDispositionClaim['kind'];
+      fingerprint: string;
+      payload_json: string;
+      status: 'staged' | 'consumed' | 'discarded';
+    }>(
+      `SELECT task_id, runtime_epoch, family, kind, fingerprint, payload_json, status
+         FROM turn_disposition_claims
+        WHERE workspace_id = ? AND turn_id = ?`,
+      [this.workspaceId, command.turn.id],
+    );
+    const disposition = command.turn.disposition;
+    if (!disposition) {
+      if (command.turn.status === 'succeeded' && row?.status === 'staged') {
+        return {
+          ok: true,
+          changed: false,
+          conflict: true,
+          reason: 'successful settlement is missing its staged disposition',
+        };
+      }
+      return undefined;
+    }
+    const expected = durableDispositionClaim({
+      turnId: command.turn.id,
+      taskId: command.turn.taskId,
+      runtimeEpoch: command.turn.runtimeEpoch,
+      opId: '',
+      disposition,
+    });
+    if (!row) {
+      return {
+        ok: true,
+        changed: false,
+        conflict: true,
+        reason: 'settlement requires a durable staged disposition',
+      };
+    }
+    const matches = row.task_id === expected.taskId
+      && row.runtime_epoch === expected.runtimeEpoch
+      && row.family === expected.family
+      && row.kind === expected.kind
+      && row.fingerprint === expected.fingerprint
+      && row.payload_json === expected.payloadJson;
+    if (!matches) {
+      return {
+        ok: true,
+        changed: false,
+        conflict: true,
+        reason: 'settlement disposition does not match the durable claim',
+      };
+    }
+    if (row.status !== 'staged') {
+      return { ok: true, changed: false, reason: `disposition claim is already ${row.status}` };
+    }
+    return undefined;
+  }
+
+  private async workflowTerminalCompletion(
+    runId: string,
+    terminalIds: readonly string[],
+    currentNodeId: string,
+    currentResult: string | undefined,
+  ): Promise<
+    | { complete: false }
+    | { complete: true; result: string | undefined; missingArtifact: boolean }
+  > {
+    const placeholders = terminalIds.map(() => '?').join(',');
+    const nodeRows = await this.db.all<{ node_id: string; status: string }>(
+      `SELECT node_id, status FROM workflow_nodes
+        WHERE workspace_id = ? AND run_id = ? AND node_id IN (${placeholders})`,
+      [this.workspaceId, runId, ...terminalIds],
+    );
+    const statusByNode = new Map(nodeRows.map((row) => [row.node_id, row.status] as const));
+    const complete = terminalIds.every(
+      (nodeId) => nodeId === currentNodeId || statusByNode.get(nodeId) === 'succeeded',
+    );
+    if (!complete) return { complete: false };
+    if (terminalIds.length === 1) {
+      return { complete: true, result: currentResult, missingArtifact: false };
+    }
+
+    const artifactRows = await this.db.all<{
+      producer_node_id: string | null;
+      revision: number;
+      payload_json: string;
+    }>(
+      `SELECT producer_node_id, revision, payload_json FROM workflow_artifacts
+        WHERE workspace_id = ? AND run_id = ? AND kind = 'next_result'
+          AND producer_node_id IN (${placeholders})
+        ORDER BY revision DESC`,
+      [this.workspaceId, runId, ...terminalIds],
+    );
+    const resultByNode = new Map<string, string>();
+    resultByNode.set(currentNodeId, currentResult ?? '');
+    for (const row of artifactRows) {
+      if (!row.producer_node_id || resultByNode.has(row.producer_node_id)) continue;
+      const result = workflowArtifactResult(row.payload_json);
+      if (result !== undefined) resultByNode.set(row.producer_node_id, result);
+    }
+    const missingArtifact = terminalIds.some((nodeId) => !resultByNode.has(nodeId));
+    return {
+      complete: true,
+      result: missingArtifact ? undefined : combineWorkflowTerminalResults(terminalIds, resultByNode),
+      missingArtifact,
+    };
+  }
+
+  /**
+   * M018 S02 / §20.5–20.6: when a producer turn settles with staged workflow_next,
+   * commit artifact + gate contribution in the same transaction. Partial fills
+   * persist only; the final fill atomically closes the gate and queues one
+   * deterministic aggregate activation turn. Never seals producer lifecycle.
+   */
+  // M018 S04: planWorkflowPrevRequest / planWorkflowFeedbackResponse run on this settle path
+  // before planWorkflowNextContribution so feedback responses never take the forward path.
+  private async planWorkflowNextContribution(
+    command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
+  ): Promise<WorkflowEffectPlan> {
+    const empty = { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] };
+    const disposition = command.turn.disposition;
+    if (
+      !disposition ||
+      disposition.kind !== 'workflow_next' ||
+      disposition.route !== undefined ||
+      command.turn.status !== 'succeeded'
+    ) {
+      return empty;
+    }
+
+    const producerNode = await this.db.get<{ run_id: string; node_id: string }>(
+      `SELECT run_id, node_id FROM workflow_nodes
+        WHERE workspace_id = ? AND task_id = ?`,
+      [this.workspaceId, command.task.id],
+    );
+    if (!producerNode || typeof producerNode.run_id !== 'string' || typeof producerNode.node_id !== 'string') {
+      return empty;
+    }
+
+    const run = await this.db.get<{
+      run_id: string;
+      definition_id: string;
+      definition_version: number;
+      status: string;
+      max_aggregate_bytes: number;
+    }>(
+      `SELECT run_id, definition_id, definition_version, status, max_aggregate_bytes FROM workflow_runs
+        WHERE workspace_id = ? AND run_id = ?`,
+      [this.workspaceId, producerNode.run_id],
+    );
+    if (!run || run.status !== 'running' || typeof run.definition_id !== 'string') {
+      return empty;
+    }
+
+    const defRow = await this.db.get<{ topology_json: string }>(
+      `SELECT topology_json FROM workflow_definitions
+        WHERE workspace_id = ? AND definition_id = ? AND version = ?`,
+      [this.workspaceId, run.definition_id, run.definition_version],
+    );
+    if (!defRow || typeof defRow.topology_json !== 'string') {
+      return empty;
+    }
+    const topologyDecoded = decodeStoredTopologyJson(defRow.topology_json);
+    if (!topologyDecoded.ok) {
+      return empty;
+    }
+    const topology = topologyDecoded.topology;
+    if (
+      topology.kind === 'one_node_v1' &&
+      topology.nodes[0]?.nodeId !== producerNode.node_id
+    ) {
+      return empty;
+    }
+    if (disposition.change === 'unchanged') {
+      return this.planWorkflowFailClosure({
+        runId: producerNode.run_id,
+        reasonCode: 'invalid_route',
+        reasonText: 'unchanged requires an exact feedback base artifact',
+        at: command.turn.finishedAt ?? new Date().toISOString(),
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
+    }
+    const resultBody = workflowResultFromSettlement(command, disposition.result);
+    const edge = topology.kind === 'graph_v1'
+      ? outgoingEdge(topology, producerNode.node_id)
+      : undefined;
+    if (!edge) {
+      const terminalIds = terminalNodeIds(topology);
+      const terminalCompletion = await this.workflowTerminalCompletion(
+        producerNode.run_id,
+        terminalIds,
+        producerNode.node_id,
+        resultBody,
+      );
+      if (terminalCompletion.complete && terminalCompletion.missingArtifact) {
+        return this.planWorkflowFailClosure({
+          runId: producerNode.run_id,
+          reasonCode: 'invalid_route',
+          reasonText: 'terminal result artifact missing',
+          at: command.turn.finishedAt ?? new Date().toISOString(),
+          sourceTaskId: command.task.id,
+          sourceTurnId: command.turn.id,
+        });
+      }
+      if (
+        terminalCompletion.complete &&
+        terminalCompletion.result !== undefined &&
+        Buffer.byteLength(terminalCompletion.result, 'utf8') > run.max_aggregate_bytes
+      ) {
+        return this.planWorkflowFailClosure({
+          runId: producerNode.run_id,
+          reasonCode: 'aggregate_too_large',
+          at: command.turn.finishedAt ?? new Date().toISOString(),
+          sourceTaskId: command.task.id,
+          sourceTurnId: command.turn.id,
+        });
+      }
+      const artifactId = deriveProducerArtifactId(producerNode.run_id, producerNode.node_id);
+      const revision = 1;
+      const finishedAt = command.turn.finishedAt ?? new Date().toISOString();
+      const fenceId = stableId('wfc', `${producerNode.run_id}\0terminal_next\0${command.turn.id}`);
+      const statements: SqlStatement[] = [
+        {
+          sql: `UPDATE workflow_dependency_gates
+                   SET status = 'consumed'
+                 WHERE workspace_id = ? AND run_id = ?
+                   AND consumer_node_id = ? AND status = 'satisfied'`,
+          params: [this.workspaceId, producerNode.run_id, producerNode.node_id],
+        },
+        {
+          sql: `INSERT INTO workflow_routed_messages (
+                  workspace_id, run_id, message_id, source_node_id, destination_node_id,
+                  kind, body_json, created_at
+                ) VALUES (?,?,?,?,?,?,?,?)
+                ON CONFLICT(workspace_id, run_id, message_id) DO NOTHING`,
+          params: [
+            this.workspaceId,
+            producerNode.run_id,
+            fenceId,
+            producerNode.node_id,
+            'engine',
+            'terminal_next',
+            encodePayload({ kind: 'terminal_next', sourceTurnId: command.turn.id, change: disposition.change }),
+            finishedAt,
+          ],
+        },
+        {
+          sql: `INSERT INTO workflow_artifacts (
+                  workspace_id, run_id, artifact_id, producer_node_id, logical_name,
+                  revision, kind, payload_json, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+                ON CONFLICT DO NOTHING`,
+          params: [
+            this.workspaceId,
+            producerNode.run_id,
+            artifactId,
+            producerNode.node_id,
+            'next_result',
+            revision,
+            'next_result',
+            encodePayload({ kind: 'next_result', schema: 1, change: disposition.change, producerNodeId: producerNode.node_id, sourceTurnId: command.turn.id, ...(resultBody !== undefined ? { result: resultBody } : {}) }),
+            finishedAt,
+          ],
+        },
+        workflowNodeArtifactSourceStatement({
+          workspaceId: this.workspaceId,
+          runId: producerNode.run_id,
+          artifactId,
+          artifactRevision: revision,
+          nodeId: producerNode.node_id,
+          taskId: command.task.id,
+          turnId: command.turn.id,
+        }),
+        {
+          sql: `UPDATE workflow_nodes
+                   SET status = 'succeeded'
+                 WHERE workspace_id = ? AND run_id = ? AND node_id = ? AND status = 'active'`,
+          params: [this.workspaceId, producerNode.run_id, producerNode.node_id],
+        },
+      ];
+      if (!terminalCompletion.complete) {
+        return { statements, changes: [] };
+      }
+
+      const terminalArtifactId = terminalIds.length > 1
+        ? deriveTerminalAggregateArtifactId(producerNode.run_id)
+        : artifactId;
+      if (terminalIds.length > 1) {
+        statements.push({
+          sql: `INSERT INTO workflow_artifacts (
+                  workspace_id, run_id, artifact_id, producer_node_id, logical_name,
+                  revision, kind, payload_json, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+                ON CONFLICT DO NOTHING`,
+          params: [
+            this.workspaceId,
+            producerNode.run_id,
+            terminalArtifactId,
+            producerNode.node_id,
+            'terminal_result',
+            1,
+            'next_result',
+            encodePayload({
+              kind: 'next_result',
+              schema: 1,
+              change: disposition.change,
+              producerNodeId: producerNode.node_id,
+              sourceTurnId: command.turn.id,
+              result: terminalCompletion.result,
+            }),
+            finishedAt,
+          ],
+        });
+        statements.push(workflowNodeArtifactSourceStatement({
+          workspaceId: this.workspaceId,
+          runId: producerNode.run_id,
+          artifactId: terminalArtifactId,
+          artifactRevision: 1,
+          nodeId: producerNode.node_id,
+          taskId: command.task.id,
+          turnId: command.turn.id,
+        }));
+      }
+      statements.push({
+        sql: `UPDATE workflow_nodes
+                 SET status = 'succeeded'
+               WHERE workspace_id = ? AND run_id = ? AND status = 'active'`,
+        params: [this.workspaceId, producerNode.run_id],
+      });
+      const taskClosure = await this.planWorkflowTaskLifecycleClosure({
+        runIds: [producerNode.run_id],
+        lifecycle: 'succeeded',
+        at: finishedAt,
+      });
+      statements.push({
+        sql: `UPDATE workflow_runs
+                 SET status = 'succeeded',
+                     terminal_result_run_id = ?, terminal_result_artifact_id = ?,
+                     terminal_result_artifact_revision = ?, updated_at = ?
+               WHERE workspace_id = ? AND run_id = ? AND status = 'running'`,
+        params: [
+          producerNode.run_id,
+          terminalArtifactId,
+          1,
+          finishedAt,
+          this.workspaceId,
+          producerNode.run_id,
+        ],
+      });
+      statements.push(...taskClosure.statements);
+      return {
+        statements,
+        changes: taskClosure.changes,
+      };
+    }
+    if (topology.kind !== 'graph_v1') return empty;
+
+    const gate = await this.db.get<{ gate_id: string; status: string }>(
+      `SELECT gate_id, status FROM workflow_dependency_gates
+        WHERE workspace_id = ? AND run_id = ? AND consumer_node_id = ?`,
+      [this.workspaceId, producerNode.run_id, edge.toNodeId],
+    );
+    if (!gate || typeof gate.gate_id !== 'string') {
+      return empty;
+    }
+
+    const artifactId = deriveProducerArtifactId(producerNode.run_id, producerNode.node_id);
+    // D050 / R027: contribution-scoped revision is deterministic (not priorMax+1).
+    const revision = deriveProducerArtifactRevision(disposition.change);
+    const contributionMessageId = deriveNextContributionMessageId(
+      producerNode.run_id,
+      gate.gate_id,
+      edge.inputRef,
+      producerNode.node_id,
+    );
+    // Durable workflow-run-scoped fence: redelivery after turn-ledger prune is a no-op.
+    const existingRouted = await this.db.get<{ message_id: string }>(
+      `SELECT message_id FROM workflow_routed_messages
+        WHERE workspace_id = ? AND run_id = ? AND message_id = ?`,
+      [this.workspaceId, producerNode.run_id, contributionMessageId],
+    );
+    if (existingRouted) {
+      return empty;
+    }
+    const gateProgress = await this.db.get<{
+      required: number;
+      filled: number;
+      current_filled: number;
+    }>(
+      `SELECT
+         (SELECT COUNT(*) FROM workflow_gate_bindings
+           WHERE workspace_id = ? AND run_id = ? AND gate_id = ?) AS required,
+         (SELECT COUNT(*) FROM workflow_gate_fills
+           WHERE workspace_id = ? AND run_id = ? AND gate_id = ?) AS filled,
+         (SELECT COUNT(*) FROM workflow_gate_fills
+           WHERE workspace_id = ? AND run_id = ? AND gate_id = ? AND input_ref = ?) AS current_filled`,
+      [
+        this.workspaceId, producerNode.run_id, gate.gate_id,
+        this.workspaceId, producerNode.run_id, gate.gate_id,
+        this.workspaceId, producerNode.run_id, gate.gate_id, edge.inputRef,
+      ],
+    );
+    const willSatisfyGate = gate.status === 'open'
+      && Number(gateProgress?.current_filled) === 0
+      && Number(gateProgress?.filled) + 1 >= Number(gateProgress?.required);
+    const finishedAt = command.turn.finishedAt ?? new Date().toISOString();
+
+    const statements: SqlStatement[] = [];
+    const changes: ChangeRecord[] = [];
+    statements.push({
+      sql: `UPDATE workflow_dependency_gates
+               SET status = 'consumed'
+             WHERE workspace_id = ? AND run_id = ?
+               AND consumer_node_id = ? AND status = 'satisfied'`,
+      params: [this.workspaceId, producerNode.run_id, producerNode.node_id],
+    });
+
+    // Fence row first in the statement list so a partial apply cannot leave fills
+    // without the durable contribution identity (same transaction either way).
+    const routedBody = encodePayload({
+      kind: 'next_contribution',
+      schema: 1,
+      gateId: gate.gate_id,
+      inputRef: edge.inputRef,
+      producerNodeId: producerNode.node_id,
+      consumerNodeId: edge.toNodeId,
+      artifactId,
+      artifactRevision: revision,
+      change: disposition.change,
+      // Identities only — never prompt/result bodies, paths, SQL, or credentials.
+      sourceTurnId: command.turn.id,
+    });
+    statements.push({
+      sql: `INSERT INTO workflow_routed_messages (
+              workspace_id, run_id, message_id, source_node_id, destination_node_id,
+              kind, body_json, created_at
+            ) VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT(workspace_id, run_id, message_id) DO NOTHING`,
+      params: [
+        this.workspaceId,
+        producerNode.run_id,
+        contributionMessageId,
+        producerNode.node_id,
+        edge.toNodeId,
+        'next_contribution',
+        routedBody,
+        finishedAt,
+      ],
+    });
+
+    const artifactPayload = encodePayload({
+      kind: 'next_result',
+      schema: 1,
+      change: disposition.change,
+      producerNodeId: producerNode.node_id,
+      sourceTurnId: command.turn.id,
+      ...(resultBody !== undefined ? { result: resultBody } : {}),
+    });
+    statements.push({
+      sql: `INSERT INTO workflow_artifacts (
+              workspace_id, run_id, artifact_id, producer_node_id, logical_name,
+              revision, kind, payload_json, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT DO NOTHING`,
+      params: [
+        this.workspaceId,
+        producerNode.run_id,
+        artifactId,
+        producerNode.node_id,
+        'next_result',
+        revision,
+        'next_result',
+        artifactPayload,
+        finishedAt,
+      ],
+    });
+    statements.push(workflowNodeArtifactSourceStatement({
+      workspaceId: this.workspaceId,
+      runId: producerNode.run_id,
+      artifactId,
+      artifactRevision: revision,
+      nodeId: producerNode.node_id,
+      taskId: command.task.id,
+      turnId: command.turn.id,
+    }));
+
+    statements.push({
+      sql: `INSERT INTO workflow_gate_fills (
+              workspace_id, run_id, gate_id, input_ref, artifact_id, artifact_revision, filled_at
+            ) VALUES (?,?,?,?,?,?,?)
+            ON CONFLICT(workspace_id, run_id, gate_id, input_ref)
+            DO NOTHING`,
+      params: [
+        this.workspaceId,
+        producerNode.run_id,
+        gate.gate_id,
+        edge.inputRef,
+        artifactId,
+        revision,
+        finishedAt,
+      ],
+    });
+
+    const aggregateClosureId = deriveRunClosureFenceId(producerNode.run_id, 'failed');
+    statements.push({
+      sql: `UPDATE workflow_runs
+               SET terminal_reason_code = 'aggregate_too_large', closure_id = ?, updated_at = ?
+             WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+               AND terminal_reason_code IS NULL
+               AND EXISTS (
+                 SELECT 1
+                   FROM workflow_dependency_gates overflow_gate
+                  WHERE overflow_gate.workspace_id = workflow_runs.workspace_id
+                    AND overflow_gate.run_id = workflow_runs.run_id
+                    AND overflow_gate.gate_id = ?
+                    AND overflow_gate.status = 'open'
+                    AND (
+                      SELECT COUNT(DISTINCT input_ref) FROM workflow_gate_fills
+                       WHERE workspace_id = overflow_gate.workspace_id
+                         AND run_id = overflow_gate.run_id
+                         AND gate_id = overflow_gate.gate_id
+                    ) >= (
+                      SELECT COUNT(*) FROM workflow_gate_bindings
+                       WHERE workspace_id = overflow_gate.workspace_id
+                         AND run_id = overflow_gate.run_id
+                         AND gate_id = overflow_gate.gate_id
+                    )
+                    AND length(CAST(
+                      '[workflow-aggregate] ' || COALESCE((
+                        SELECT group_concat(ordered.value, ' ')
+                          FROM (
+                            SELECT binding.input_ref || '=' ||
+                                   COALESCE(
+                                     json_extract(artifact.payload_json, '$.result'),
+                                     '[artifact ' || fill.artifact_id || '@' || fill.artifact_revision || ']'
+                                   ) AS value
+                              FROM workflow_gate_bindings binding
+                              JOIN workflow_gate_fills fill
+                                ON fill.workspace_id = binding.workspace_id
+                               AND fill.run_id = binding.run_id
+                               AND fill.gate_id = binding.gate_id
+                               AND fill.input_ref = binding.input_ref
+                              JOIN workflow_artifacts artifact
+                                ON artifact.workspace_id = fill.workspace_id
+                               AND artifact.run_id = fill.run_id
+                               AND artifact.artifact_id = fill.artifact_id
+                               AND artifact.revision = fill.artifact_revision
+                              JOIN workflow_runs aggregate_run
+                                ON aggregate_run.workspace_id = binding.workspace_id
+                               AND aggregate_run.run_id = binding.run_id
+                              LEFT JOIN workflow_definition_edges definition_edge
+                                ON definition_edge.workspace_id = aggregate_run.workspace_id
+                               AND definition_edge.definition_id = aggregate_run.definition_id
+                               AND definition_edge.definition_version = aggregate_run.definition_version
+                               AND definition_edge.source_node_id = binding.producer_node_id
+                               AND definition_edge.destination_node_id = overflow_gate.consumer_node_id
+                               AND definition_edge.destination_input_ref = binding.input_ref
+                             WHERE binding.workspace_id = overflow_gate.workspace_id
+                               AND binding.run_id = overflow_gate.run_id
+                               AND binding.gate_id = overflow_gate.gate_id
+                             ORDER BY COALESCE(definition_edge.ordinal, 2147483647), binding.input_ref
+                          ) ordered
+                      ), '') AS BLOB
+                    )) > workflow_runs.max_aggregate_bytes
+               )`,
+      params: [aggregateClosureId, finishedAt, this.workspaceId, producerNode.run_id, gate.gate_id],
+    });
+
+    // Atomic open→satisfied only when all required inputRefs are filled (incl. this fill).
+    statements.push({
+      sql: `UPDATE workflow_dependency_gates
+               SET status = 'satisfied'
+             WHERE workspace_id = ? AND run_id = ? AND gate_id = ? AND status = 'open'
+               AND (
+                 SELECT COUNT(DISTINCT input_ref) FROM workflow_gate_fills
+                  WHERE workspace_id = ? AND run_id = ? AND gate_id = ?
+                ) >= (
+                  SELECT COUNT(*) FROM workflow_gate_bindings
+                   WHERE workspace_id = ? AND run_id = ? AND gate_id = ?
+               )
+               AND EXISTS (
+                 SELECT 1 FROM workflow_runs
+                  WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                    AND terminal_reason_code IS NULL
+                )`,
+      params: [
+        this.workspaceId,
+        producerNode.run_id,
+        gate.gate_id,
+        this.workspaceId,
+        producerNode.run_id,
+        gate.gate_id,
+        this.workspaceId,
+        producerNode.run_id,
+        gate.gate_id,
+        this.workspaceId,
+        producerNode.run_id,
+      ],
+    });
+    statements.push(...workflowAggregateOverflowClosureStatements({
+      workspaceId: this.workspaceId,
+      runId: producerNode.run_id,
+      closureId: aggregateClosureId,
+      at: finishedAt,
+    }));
+
+    if (!willSatisfyGate) return { statements, changes };
+
+    const activation = deriveNodeActivationIdentities(producerNode.run_id, edge.toNodeId);
+    const consumerSpec = topology.nodes.find((n) => n.nodeId === edge.toNodeId);
+    const producerSpec = topology.nodes.find((n) => n.nodeId === producerNode.node_id);
+    if (!consumerSpec || !producerSpec) return empty;
+    const consumerRole = consumerSpec?.role ?? 'worker';
+    const consumerGoal = workflowNodeTaskGoal(
+      consumerSpec,
+      workflowRunGoalFromTask(producerSpec, command.task.goal),
+    );
+    const taskPayloadJson = encodePayload({
+      capabilities: [],
+      executionPolicy: { maxTurns: 10, maxAutomaticRetries: 1 },
+      releasedAt: finishedAt,
+    });
+    const turnPayloadJson = encodePayload({});
+    const messagePayloadJson = encodePayload({});
+
+    // Conditional activation: only when gate is satisfied; reserved ids make redelivery no-op.
+    statements.push({
+      sql: `INSERT INTO tasks (
+              id, workspace_id, parent_id, role, lifecycle, release_state, goal, backend, model,
+              revision, created_at, updated_at, payload_json
+            )
+            SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?
+             WHERE EXISTS (
+               SELECT 1 FROM workflow_dependency_gates
+                WHERE workspace_id = ? AND run_id = ? AND gate_id = ? AND status = 'satisfied'
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM tasks WHERE workspace_id = ? AND id = ?
+             )`,
+      params: [
+        activation.taskId,
+        this.workspaceId,
+        command.task.parentId,
+        consumerRole,
+        'open',
+        'released',
+        consumerGoal,
+        command.task.backend,
+        null,
+        0,
+        finishedAt,
+        finishedAt,
+        taskPayloadJson,
+        this.workspaceId,
+        producerNode.run_id,
+        gate.gate_id,
+        this.workspaceId,
+        activation.taskId,
+      ],
+    });
+    statements.push({
+      sql: `UPDATE workflow_nodes
+               SET task_id = ?, status = 'active'
+             WHERE workspace_id = ? AND run_id = ? AND node_id = ?
+               AND EXISTS (
+                 SELECT 1 FROM workflow_dependency_gates
+                  WHERE workspace_id = ? AND run_id = ? AND gate_id = ? AND status = 'satisfied'
+               )
+               AND (task_id IS NULL OR task_id = ?)`,
+      params: [
+        activation.taskId,
+        this.workspaceId,
+        producerNode.run_id,
+        edge.toNodeId,
+        this.workspaceId,
+        producerNode.run_id,
+        gate.gate_id,
+        activation.taskId,
+      ],
+    });
+    statements.push({
+      sql: `INSERT INTO turns (
+              id, workspace_id, task_id, sequence, status, trigger, created_at, started_at, settled_at, payload_json
+            )
+            SELECT ?,?,?,?,?,?,?,?,?,?
+             WHERE EXISTS (
+               SELECT 1 FROM workflow_dependency_gates
+                WHERE workspace_id = ? AND run_id = ? AND gate_id = ? AND status = 'satisfied'
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM turns WHERE workspace_id = ? AND id = ?
+             )`,
+      params: [
+        activation.activationTurnId,
+        this.workspaceId,
+        activation.taskId,
+        1,
+        'queued',
+        'engine',
+        finishedAt,
+        null,
+        null,
+        turnPayloadJson,
+        this.workspaceId,
+        producerNode.run_id,
+        gate.gate_id,
+        this.workspaceId,
+        activation.activationTurnId,
+      ],
+    });
+    statements.push({
+      sql: `INSERT INTO messages (
+              id, workspace_id, task_id, turn_id, role, state, ordering, content, created_at, updated_at, payload_json
+            )
+            SELECT ?,?,?,?,?,?,?,
+                   '[workflow-aggregate] ' || COALESCE((
+                     SELECT group_concat(ordered.value, ' ')
+                       FROM (
+                         SELECT binding.input_ref || '=' ||
+                                COALESCE(
+                                  json_extract(artifact.payload_json, '$.result'),
+                                  '[artifact ' || fill.artifact_id || '@' || fill.artifact_revision || ']'
+                                ) AS value
+                           FROM workflow_gate_bindings binding
+                           JOIN workflow_gate_fills fill
+                             ON fill.workspace_id = binding.workspace_id
+                            AND fill.run_id = binding.run_id
+                            AND fill.gate_id = binding.gate_id
+                            AND fill.input_ref = binding.input_ref
+                           JOIN workflow_artifacts artifact
+                             ON artifact.workspace_id = fill.workspace_id
+                            AND artifact.run_id = fill.run_id
+                            AND artifact.artifact_id = fill.artifact_id
+                            AND artifact.revision = fill.artifact_revision
+                           JOIN workflow_dependency_gates accumulator
+                             ON accumulator.workspace_id = binding.workspace_id
+                            AND accumulator.run_id = binding.run_id
+                            AND accumulator.gate_id = binding.gate_id
+                           JOIN workflow_runs aggregate_run
+                             ON aggregate_run.workspace_id = binding.workspace_id
+                            AND aggregate_run.run_id = binding.run_id
+                           LEFT JOIN workflow_definition_edges definition_edge
+                             ON definition_edge.workspace_id = aggregate_run.workspace_id
+                            AND definition_edge.definition_id = aggregate_run.definition_id
+                            AND definition_edge.definition_version = aggregate_run.definition_version
+                            AND definition_edge.source_node_id = binding.producer_node_id
+                            AND definition_edge.destination_node_id = accumulator.consumer_node_id
+                            AND definition_edge.destination_input_ref = binding.input_ref
+                          WHERE binding.workspace_id = ?
+                            AND binding.run_id = ?
+                            AND binding.gate_id = ?
+                          ORDER BY COALESCE(definition_edge.ordinal, 2147483647), binding.input_ref
+                       ) ordered
+                   ), ''),
+                   ?,?,?
+             WHERE EXISTS (
+               SELECT 1 FROM workflow_dependency_gates
+                WHERE workspace_id = ? AND run_id = ? AND gate_id = ? AND status = 'satisfied'
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM messages WHERE workspace_id = ? AND id = ?
+             )`,
+      params: [
+        activation.messageId,
+        this.workspaceId,
+        activation.taskId,
+        activation.activationTurnId,
+        'system',
+        'assigned',
+        null,
+        this.workspaceId,
+        producerNode.run_id,
+        gate.gate_id,
+        finishedAt,
+        null,
+        messagePayloadJson,
+        this.workspaceId,
+        producerNode.run_id,
+        gate.gate_id,
+        this.workspaceId,
+        activation.messageId,
+      ],
+    });
+    statements.push({
+      sql: `INSERT INTO turn_inputs (workspace_id, turn_id, ordering, kind, payload_json)
+            SELECT ?,?,?,?,?
+             WHERE EXISTS (
+               SELECT 1 FROM workflow_dependency_gates
+                WHERE workspace_id = ? AND run_id = ? AND gate_id = ? AND status = 'satisfied'
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM turn_inputs WHERE workspace_id = ? AND turn_id = ? AND ordering = 0
+             )`,
+      params: [
+        this.workspaceId,
+        activation.activationTurnId,
+        0,
+        'message',
+        encodePayload({ kind: 'message', messageId: activation.messageId }),
+        this.workspaceId,
+        producerNode.run_id,
+        gate.gate_id,
+        this.workspaceId,
+        activation.activationTurnId,
+      ],
+    });
+    statements.push({
+      sql: `INSERT INTO workflow_activations (
+              workspace_id, run_id, activation_id, node_id, kind, status,
+              source_gate_id, feedback_round_id, feedback_target_node_id,
+              continuation_id, return_gate_id, inherited_feedback_round_id,
+              inherited_feedback_target_node_id, primary_turn_id, message_id,
+              execution_turn_id, created_at, updated_at
+            )
+            SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+             WHERE EXISTS (
+               SELECT 1 FROM workflow_dependency_gates
+                WHERE workspace_id = ? AND run_id = ? AND gate_id = ? AND status = 'satisfied'
+             )
+            ON CONFLICT(workspace_id, run_id, activation_id) DO NOTHING`,
+      params: [
+        this.workspaceId,
+        producerNode.run_id,
+        stableId('wfact', `${producerNode.run_id}\0dependency_gate\0${gate.gate_id}`),
+        edge.toNodeId,
+        'dependency_gate',
+        'queued',
+        gate.gate_id,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        activation.activationTurnId,
+        activation.messageId,
+        activation.activationTurnId,
+        finishedAt,
+        finishedAt,
+        this.workspaceId,
+        producerNode.run_id,
+        gate.gate_id,
+      ],
+    });
+    changes.push(
+      { kind: 'task', id: activation.taskId, change: 'effect' },
+      { kind: 'turn', id: activation.activationTurnId, taskId: activation.taskId, change: 'effect' },
+      { kind: 'message', id: activation.messageId, taskId: activation.taskId, change: 'complete' },
+    );
+
+    return {
+      statements,
+      changes,
+      turnReservations: [{ runId: producerNode.run_id, taskId: activation.taskId, count: 1 }],
+    };
+  }
+
+
+  /**
+   * M018 S04 / §20.7–20.8: when a consumer turn settles with staged workflow_prev,
+   * resolve targets from the requester gate's frozen bindings, open one ALL-join
+   * feedback round, append one deterministic feedback turn to each target FIFO,
+   * and write durable feedback_request fences. Invalid/empty targets open nothing.
+   * Never seals requester lifecycle.
+   */
+  private async planWorkflowPrevRequest(
+    command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
+  ): Promise<WorkflowEffectPlan> {
+    const empty = { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] };
+    const disposition = command.turn.disposition;
+    if (
+      !disposition ||
+      disposition.kind !== 'workflow_prev' ||
+      command.turn.status !== 'succeeded'
+    ) {
+      return empty;
+    }
+
+    const requesterNode = await this.db.get<{ run_id: string; node_id: string }>(
+      `SELECT run_id, node_id FROM workflow_nodes
+        WHERE workspace_id = ? AND task_id = ?`,
+      [this.workspaceId, command.task.id],
+    );
+    if (!requesterNode || typeof requesterNode.run_id !== 'string' || typeof requesterNode.node_id !== 'string') {
+      return empty;
+    }
+
+    const run = await this.db.get<{
+      run_id: string;
+      definition_id: string;
+      definition_version: number;
+      status: string;
+    }>(
+      `SELECT run_id, definition_id, definition_version, status FROM workflow_runs
+        WHERE workspace_id = ? AND run_id = ?`,
+      [this.workspaceId, requesterNode.run_id],
+    );
+    if (!run || run.status !== 'running' || typeof run.definition_id !== 'string') {
+      return empty;
+    }
+
+    const defRow = await this.db.get<{ topology_json: string }>(
+      `SELECT topology_json FROM workflow_definitions
+        WHERE workspace_id = ? AND definition_id = ? AND version = ?`,
+      [this.workspaceId, run.definition_id, run.definition_version],
+    );
+    if (!defRow || typeof defRow.topology_json !== 'string') {
+      return empty;
+    }
+    const topologyDecoded = decodeStoredTopologyJson(defRow.topology_json);
+    if (!topologyDecoded.ok) {
+      return empty;
+    }
+    // M018 S05: non-graph topologies have no direct PREV producers — fail the run
+    // (not silent empty). graph_v1 continues into gate/binding resolution below.
+    if (topologyDecoded.topology.kind !== 'graph_v1') {
+      return this.planWorkflowFailClosure({
+        runId: requesterNode.run_id,
+        reasonCode: 'invalid_route',
+        at: command.turn.finishedAt ?? new Date().toISOString(),
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
+    }
+    const topology = topologyDecoded.topology;
+
+    const gate = await this.db.get<{ gate_id: string; status: string }>(
+      `SELECT gate_id, status FROM workflow_dependency_gates
+        WHERE workspace_id = ? AND run_id = ? AND consumer_node_id = ?
+          AND EXISTS (
+            SELECT 1 FROM workflow_gate_bindings binding
+             WHERE binding.workspace_id = workflow_dependency_gates.workspace_id
+               AND binding.run_id = workflow_dependency_gates.run_id
+               AND binding.gate_id = workflow_dependency_gates.gate_id
+               AND binding.producer_node_id IS NOT NULL
+          )
+        ORDER BY gate_id
+        LIMIT 1`,
+      [this.workspaceId, requesterNode.run_id, requesterNode.node_id],
+    );
+    if (!gate || typeof gate.gate_id !== 'string') {
+      // M018 S05: PREV with no requester gate is an invalid route.
+      return this.planWorkflowFailClosure({
+        runId: requesterNode.run_id,
+        reasonCode: 'invalid_route',
+        at: command.turn.finishedAt ?? new Date().toISOString(),
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
+    }
+
+    const bindings = await this.db.all<{
+      input_ref: string;
+      producer_node_id: string;
+      required_kind: string;
+    }>(
+      `SELECT input_ref, producer_node_id, required_kind FROM workflow_gate_bindings
+        WHERE workspace_id = ? AND run_id = ? AND gate_id = ?
+        ORDER BY input_ref`,
+      [this.workspaceId, requesterNode.run_id, gate.gate_id],
+    );
+    // Direct producers only — exclude engine_start entry bindings.
+    const producerByInputRef = new Map<string, string>();
+    for (const binding of bindings) {
+      if (binding.required_kind === 'engine_start' || binding.input_ref === 'engine_start') continue;
+      producerByInputRef.set(binding.input_ref, binding.producer_node_id);
+    }
+    if (producerByInputRef.size === 0) {
+      // M018 S05: entry PREV with no direct producer route fails the run (not silent empty).
+      return this.planWorkflowFailClosure({
+        runId: requesterNode.run_id,
+        reasonCode: 'invalid_route',
+        at: command.turn.finishedAt ?? new Date().toISOString(),
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
+    }
+
+    let resolvedTargets: Array<{ nodeId: string; inputRef: string }> = [];
+    if (disposition.targets === 'all') {
+      // Frozen dependency declaration order (definition edge order), not binding lexical order.
+      const orderedRefs = consumerInputRefsInDefinitionOrder(topology, requesterNode.node_id);
+      const seen = new Set<string>();
+      for (const ref of orderedRefs) {
+        const producer = producerByInputRef.get(ref);
+        if (!producer || seen.has(producer)) continue;
+        seen.add(producer);
+        resolvedTargets.push({ nodeId: producer, inputRef: ref });
+      }
+      // Any binding producer not present in definition edges still participates (stable fallback).
+      for (const [inputRef, producer] of producerByInputRef) {
+        if (!seen.has(producer)) {
+          seen.add(producer);
+          resolvedTargets.push({ nodeId: producer, inputRef });
+        }
+      }
+    } else {
+      const seen = new Set<string>();
+      for (const inputRef of disposition.targets) {
+        const producer = producerByInputRef.get(inputRef);
+        if (!producer) {
+          // M018 S05: unknown/foreign inputRef fails the run (not silent empty).
+          return this.planWorkflowFailClosure({
+            runId: requesterNode.run_id,
+            reasonCode: 'invalid_route',
+            at: command.turn.finishedAt ?? new Date().toISOString(),
+            sourceTaskId: command.task.id,
+            sourceTurnId: command.turn.id,
+          });
+        }
+        if (!seen.has(producer)) {
+          seen.add(producer);
+          resolvedTargets.push({ nodeId: producer, inputRef });
+        }
+      }
+      if (resolvedTargets.length === 0) {
+        // M018 S05: empty targeted PREV set fails the run (not silent empty).
+        return this.planWorkflowFailClosure({
+          runId: requesterNode.run_id,
+          reasonCode: 'invalid_route',
+          at: command.turn.finishedAt ?? new Date().toISOString(),
+          sourceTaskId: command.task.id,
+          sourceTurnId: command.turn.id,
+        });
+      }
+    }
+
+    // Target task must already exist (activated producer); skip missing nodes fail-closed.
+    const targetRows: Array<{ nodeId: string; inputRef: string; taskId: string }> = [];
+    for (const target of resolvedTargets) {
+      const row = await this.db.get<{ task_id: string | null }>(
+        `SELECT task_id FROM workflow_nodes
+          WHERE workspace_id = ? AND run_id = ? AND node_id = ?`,
+        [this.workspaceId, requesterNode.run_id, target.nodeId],
+      );
+      if (!row || typeof row.task_id !== 'string' || row.task_id.length === 0) {
+        // M018 S05: required PREV target not activated → fail closure.
+        return this.planWorkflowFailClosure({
+          runId: requesterNode.run_id,
+          reasonCode: 'invalid_route',
+          at: command.turn.finishedAt ?? new Date().toISOString(),
+          sourceTaskId: command.task.id,
+          sourceTurnId: command.turn.id,
+        });
+      }
+      targetRows.push({ ...target, taskId: row.task_id });
+    }
+
+    const roundId = deriveFeedbackRoundId(
+      requesterNode.run_id,
+      requesterNode.node_id,
+      command.turn.id,
+    );
+
+    // Round-level redelivery fence: first feedback_request message id is enough to
+    // detect that this requester turn already opened the round.
+    const firstRequestId = deriveFeedbackRequestMessageId(
+      requesterNode.run_id,
+      roundId,
+      targetRows[0]!.nodeId,
+    );
+    const existingRoundFence = await this.db.get<{ message_id: string }>(
+      `SELECT message_id FROM workflow_routed_messages
+        WHERE workspace_id = ? AND run_id = ? AND message_id = ?`,
+      [this.workspaceId, requesterNode.run_id, firstRequestId],
+    );
+    if (existingRoundFence) {
+      return empty;
+    }
+
+    const requesterActivation = await this.db.get<{
+      activation_id: string;
+      kind: string;
+      feedback_round_id: string | null;
+      feedback_target_node_id: string | null;
+      inherited_feedback_round_id: string | null;
+      inherited_feedback_target_node_id: string | null;
+    }>(
+      `SELECT activation_id, kind, feedback_round_id, feedback_target_node_id,
+              inherited_feedback_round_id, inherited_feedback_target_node_id
+         FROM workflow_activations
+        WHERE workspace_id = ? AND run_id = ? AND node_id = ?
+          AND execution_turn_id = ? AND status IN ('queued', 'running')`,
+      [this.workspaceId, requesterNode.run_id, requesterNode.node_id, command.turn.id],
+    );
+    if (!requesterActivation) {
+      return this.planWorkflowFailClosure({
+        runId: requesterNode.run_id,
+        reasonCode: 'invalid_route',
+        at: command.turn.finishedAt ?? new Date().toISOString(),
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
+    }
+
+    let inheritedRoundId: string | null = null;
+    let inheritedTargetId: string | null = null;
+    if (
+      requesterActivation.kind === 'feedback_request' &&
+      requesterActivation.feedback_round_id &&
+      requesterActivation.feedback_target_node_id
+    ) {
+      const target = await this.db.get<{ target_id: string | null }>(
+        `SELECT target_id FROM workflow_feedback_targets
+          WHERE workspace_id = ? AND run_id = ? AND round_id = ?
+            AND target_node_id = ? AND request_activation_id = ? AND status = 'pending'`,
+        [
+          this.workspaceId,
+          requesterNode.run_id,
+          requesterActivation.feedback_round_id,
+          requesterActivation.feedback_target_node_id,
+          requesterActivation.activation_id,
+        ],
+      );
+      if (!target?.target_id) {
+        return this.planWorkflowFailClosure({
+          runId: requesterNode.run_id,
+          reasonCode: 'invalid_route',
+          at: command.turn.finishedAt ?? new Date().toISOString(),
+          sourceTaskId: command.task.id,
+          sourceTurnId: command.turn.id,
+        });
+      }
+      inheritedRoundId = requesterActivation.feedback_round_id;
+      inheritedTargetId = target.target_id;
+    } else if (
+      requesterActivation.kind === 'feedback_resume' &&
+      requesterActivation.inherited_feedback_round_id &&
+      requesterActivation.inherited_feedback_target_node_id
+    ) {
+      const target = await this.db.get<{ target_id: string | null }>(
+        `SELECT target_id FROM workflow_feedback_targets
+          WHERE workspace_id = ? AND run_id = ? AND round_id = ?
+            AND target_node_id = ? AND status = 'pending'`,
+        [
+          this.workspaceId,
+          requesterNode.run_id,
+          requesterActivation.inherited_feedback_round_id,
+          requesterActivation.inherited_feedback_target_node_id,
+        ],
+      );
+      if (!target?.target_id) {
+        return this.planWorkflowFailClosure({
+          runId: requesterNode.run_id,
+          reasonCode: 'invalid_route',
+          at: command.turn.finishedAt ?? new Date().toISOString(),
+          sourceTaskId: command.task.id,
+          sourceTurnId: command.turn.id,
+        });
+      }
+      inheritedRoundId = requesterActivation.inherited_feedback_round_id;
+      inheritedTargetId = target.target_id;
+    }
+
+    const openRound = await this.db.get<{ round_id: string }>(
+      `SELECT round_id FROM workflow_feedback_rounds
+        WHERE workspace_id = ? AND run_id = ? AND requester_node_id = ?
+          AND status IN ('open', 'satisfied')
+          AND NOT (status = 'satisfied' AND resume_turn_id = ?)
+        LIMIT 1`,
+      [this.workspaceId, requesterNode.run_id, requesterNode.node_id, command.turn.id],
+    );
+    if (openRound) return empty;
+
+    const finishedAt = command.turn.finishedAt ?? new Date().toISOString();
+    const statements: SqlStatement[] = [];
+    const changes: ChangeRecord[] = [];
+    const turnPayloadJson = encodePayload({});
+    const messagePayloadJson = encodePayload({});
+    const resumeTurnId = deriveFeedbackResumeTurnId(requesterNode.run_id, roundId);
+    const resumeActivationId = deriveFeedbackResumeActivationId(requesterNode.run_id, roundId);
+
+    statements.push({
+      sql: `INSERT INTO workflow_feedback_rounds (
+              workspace_id, run_id, round_id, requester_node_id, requester_task_id,
+              requester_turn_id, requester_activation_id, inherited_round_id,
+              inherited_target_id, resume_activation_id, resume_turn_id,
+              status, join_mode, created_at, updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(workspace_id, run_id, round_id) DO NOTHING`,
+      params: [
+        this.workspaceId,
+        requesterNode.run_id,
+        roundId,
+        requesterNode.node_id,
+        command.task.id,
+        command.turn.id,
+        requesterActivation.activation_id,
+        inheritedRoundId,
+        inheritedTargetId,
+        resumeActivationId,
+        resumeTurnId,
+        'open',
+        'all',
+        finishedAt,
+        finishedAt,
+      ],
+    });
+
+    for (const target of targetRows) {
+      const targetId = deriveFeedbackTargetId(requesterNode.run_id, roundId, target.nodeId);
+      const requestActivationId = deriveFeedbackRequestActivationId(
+        requesterNode.run_id,
+        roundId,
+        target.nodeId,
+      );
+      const requestMessageId = deriveFeedbackRequestMessageId(
+        requesterNode.run_id,
+        roundId,
+        target.nodeId,
+      );
+      const feedbackTurnId = deriveFeedbackTargetTurnId(
+        requesterNode.run_id,
+        roundId,
+        target.nodeId,
+      );
+      const feedbackMessageId = deriveFeedbackTargetMessageId(
+        requesterNode.run_id,
+        roundId,
+        target.nodeId,
+      );
+      const baseArtifactId = deriveProducerArtifactId(requesterNode.run_id, target.nodeId);
+      const baseArtifact = await this.db.get<{ revision: number }>(
+        `SELECT MAX(revision) AS revision FROM workflow_artifacts
+           WHERE workspace_id = ? AND run_id = ? AND artifact_id = ?`,
+        [this.workspaceId, requesterNode.run_id, baseArtifactId],
+      );
+      const baseArtifactRevision = baseArtifact?.revision ?? 1;
+
+      // Pre-read max sequence so FIFO append is deterministic and never preemptive.
+      const maxSeqRow = await this.db.get<{ max_seq: number | null }>(
+        `SELECT MAX(sequence) AS max_seq FROM turns WHERE workspace_id = ? AND task_id = ?`,
+        [this.workspaceId, target.taskId],
+      );
+      const nextSequence = (maxSeqRow?.max_seq ?? 0) + 1;
+
+      const routedBody = encodePayload({
+        kind: 'feedback_request',
+        schema: 1,
+        roundId,
+        requesterNodeId: requesterNode.node_id,
+        targetNodeId: target.nodeId,
+        feedbackTurnId,
+        feedbackMessageId,
+        baseArtifactId,
+        baseArtifactRevision,
+        // Identities only — never note/prompt/result bodies, paths, SQL, or credentials.
+        sourceTurnId: command.turn.id,
+      });
+
+      statements.push({
+        sql: `INSERT INTO workflow_routed_messages (
+                workspace_id, run_id, message_id, source_node_id, source_task_id,
+                source_turn_id, destination_node_id, destination_task_id,
+                feedback_round_id, feedback_target_id, kind, body_json, created_at
+              ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+              ON CONFLICT(workspace_id, run_id, message_id) DO NOTHING`,
+        params: [
+          this.workspaceId,
+          requesterNode.run_id,
+          requestMessageId,
+          requesterNode.node_id,
+          command.task.id,
+          command.turn.id,
+          target.nodeId,
+          target.taskId,
+          roundId,
+          targetId,
+          'feedback_request',
+          routedBody,
+          finishedAt,
+        ],
+      });
+
+      statements.push({
+        sql: `INSERT INTO workflow_feedback_targets (
+                workspace_id, run_id, round_id, target_node_id, target_id, input_ref,
+                target_task_id, base_artifact_run_id, base_artifact_id,
+                base_artifact_revision, request_activation_id, request_turn_id,
+                request_message_id, status
+              ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              ON CONFLICT(workspace_id, run_id, round_id, target_node_id) DO NOTHING`,
+        params: [
+          this.workspaceId,
+          requesterNode.run_id,
+          roundId,
+          target.nodeId,
+          targetId,
+          target.inputRef,
+          target.taskId,
+          requesterNode.run_id,
+          baseArtifactId,
+          baseArtifactRevision,
+          requestActivationId,
+          feedbackTurnId,
+          feedbackMessageId,
+          'pending',
+        ],
+      });
+
+      const feedbackContent = `[workflow-feedback-request] round=${roundId} target=${target.nodeId}${disposition.note ? `\n[feedback]\n${disposition.note}` : ''}`;
+      statements.push({
+        sql: `INSERT INTO turns (
+                id, workspace_id, task_id, sequence, status, trigger, created_at, started_at, settled_at, payload_json
+              )
+              SELECT ?,?,?,?,?,?,?,?,?,?
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM turns WHERE workspace_id = ? AND id = ?
+               )`,
+        params: [
+          feedbackTurnId,
+          this.workspaceId,
+          target.taskId,
+          nextSequence,
+          'queued',
+          'engine',
+          finishedAt,
+          null,
+          null,
+          turnPayloadJson,
+          this.workspaceId,
+          feedbackTurnId,
+        ],
+      });
+      statements.push({
+        sql: `INSERT INTO messages (
+                id, workspace_id, task_id, turn_id, role, state, ordering, content, created_at, updated_at, payload_json
+              )
+              SELECT ?,?,?,?,?,?,?,?,?,?,?
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM messages WHERE workspace_id = ? AND id = ?
+               )`,
+        params: [
+          feedbackMessageId,
+          this.workspaceId,
+          target.taskId,
+          feedbackTurnId,
+          'system',
+          'assigned',
+          null,
+          feedbackContent,
+          finishedAt,
+          null,
+          messagePayloadJson,
+          this.workspaceId,
+          feedbackMessageId,
+        ],
+      });
+      statements.push({
+        sql: `INSERT INTO turn_inputs (workspace_id, turn_id, ordering, kind, payload_json)
+              SELECT ?,?,?,?,?
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM turn_inputs WHERE workspace_id = ? AND turn_id = ? AND ordering = 0
+               )`,
+        params: [
+          this.workspaceId,
+          feedbackTurnId,
+          0,
+          'message',
+          encodePayload({ kind: 'message', messageId: feedbackMessageId }),
+          this.workspaceId,
+          feedbackTurnId,
+        ],
+      });
+      statements.push({
+        sql: `INSERT INTO workflow_activations (
+                workspace_id, run_id, activation_id, node_id, kind, status,
+                source_gate_id, feedback_round_id, feedback_target_node_id,
+                continuation_id, return_gate_id, inherited_feedback_round_id,
+                inherited_feedback_target_node_id, primary_turn_id, message_id,
+                execution_turn_id, created_at, updated_at
+              ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              ON CONFLICT(workspace_id, run_id, activation_id) DO NOTHING`,
+        params: [
+          this.workspaceId,
+          requesterNode.run_id,
+          requestActivationId,
+          target.nodeId,
+          'feedback_request',
+          'queued',
+          null,
+          roundId,
+          target.nodeId,
+          null,
+          null,
+          null,
+          null,
+          feedbackTurnId,
+          feedbackMessageId,
+          feedbackTurnId,
+          finishedAt,
+          finishedAt,
+        ],
+      });
+
+      changes.push(
+        { kind: 'turn', id: feedbackTurnId, taskId: target.taskId, change: 'effect' },
+        { kind: 'message', id: feedbackMessageId, taskId: target.taskId, change: 'complete' },
+      );
+    }
+
+    return {
+      statements,
+      changes,
+      feedbackRoundReservations: [{ runId: requesterNode.run_id, count: 1 }],
+      turnReservations: targetRows.map((target) => ({
+        runId: requesterNode.run_id,
+        taskId: target.taskId,
+        count: 1,
+      })),
+    };
+  }
+
+  /**
+   * M018 S04: when a target settles a feedback turn with workflow_next, record the
+   * response fence, mark the target responded, and on the final ALL-join response
+   * atomically satisfy the round and queue one ordered resume turn on the requester.
+   * Partial responses leave the round open with no resume. Never seals lifecycle.
+   */
+  private async planWorkflowFeedbackResponse(
+    command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
+  ): Promise<WorkflowEffectPlan> {
+    const empty = { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] };
+    const disposition = command.turn.disposition;
+    if (
+      !disposition ||
+      disposition.kind !== 'workflow_next' ||
+      disposition.route !== undefined ||
+      command.turn.status !== 'succeeded'
+    ) {
+      return empty;
+    }
+
+    const targetNode = await this.db.get<{ run_id: string; node_id: string }>(
+      `SELECT run_id, node_id FROM workflow_nodes
+        WHERE workspace_id = ? AND task_id = ?`,
+      [this.workspaceId, command.task.id],
+    );
+    if (!targetNode || typeof targetNode.run_id !== 'string' || typeof targetNode.node_id !== 'string') {
+      return empty;
+    }
+
+    const responseActivation = await this.db.get<{
+      activation_id: string;
+      kind: string;
+      feedback_round_id: string | null;
+      feedback_target_node_id: string | null;
+      inherited_feedback_round_id: string | null;
+      inherited_feedback_target_node_id: string | null;
+      inherited_target_id: string | null;
+    }>(
+      `SELECT activation.activation_id, activation.kind, activation.feedback_round_id,
+              activation.feedback_target_node_id, activation.inherited_feedback_round_id,
+              activation.inherited_feedback_target_node_id, resume_round.inherited_target_id
+         FROM workflow_activations activation
+         LEFT JOIN workflow_feedback_rounds resume_round
+           ON resume_round.workspace_id = activation.workspace_id
+          AND resume_round.run_id = activation.run_id
+          AND resume_round.round_id = activation.feedback_round_id
+        WHERE activation.workspace_id = ? AND activation.run_id = ?
+          AND activation.node_id = ? AND activation.execution_turn_id = ?`,
+      [this.workspaceId, targetNode.run_id, targetNode.node_id, command.turn.id],
+    );
+    if (!responseActivation) return empty;
+
+    const responseRoundId = responseActivation.kind === 'feedback_request'
+      ? responseActivation.feedback_round_id
+      : responseActivation.kind === 'feedback_resume'
+        ? responseActivation.inherited_feedback_round_id
+        : null;
+    const responseTargetNodeId = responseActivation.kind === 'feedback_request'
+      ? responseActivation.feedback_target_node_id
+      : responseActivation.kind === 'feedback_resume'
+        ? responseActivation.inherited_feedback_target_node_id
+        : null;
+    if (!responseRoundId || !responseTargetNodeId) return empty;
+
+    const authority = await this.db.get<{
+      target_id: string | null;
+      request_activation_id: string | null;
+      base_artifact_id: string | null;
+      base_artifact_revision: number | null;
+      status: string;
+      round_status: string;
+      requester_node_id: string;
+      join_mode: string;
+      inherited_round_id: string | null;
+      inherited_target_id: string | null;
+    }>(
+      `SELECT target.target_id, target.request_activation_id, target.base_artifact_id,
+              target.base_artifact_revision, target.status, round_row.status AS round_status,
+              round_row.requester_node_id, round_row.join_mode,
+              round_row.inherited_round_id, round_row.inherited_target_id
+         FROM workflow_feedback_targets target
+         JOIN workflow_feedback_rounds round_row
+           ON round_row.workspace_id = target.workspace_id
+          AND round_row.run_id = target.run_id
+          AND round_row.round_id = target.round_id
+        WHERE target.workspace_id = ? AND target.run_id = ?
+          AND target.round_id = ? AND target.target_node_id = ?`,
+      [this.workspaceId, targetNode.run_id, responseRoundId, responseTargetNodeId],
+    );
+    if (
+      !authority?.target_id ||
+      !authority.base_artifact_id ||
+      authority.base_artifact_revision === null ||
+      (
+        responseActivation.kind === 'feedback_request'
+          ? authority.request_activation_id !== responseActivation.activation_id
+          : authority.target_id !== responseActivation.inherited_target_id
+      )
+    ) return empty;
+
+    const matched = {
+      roundId: responseRoundId,
+      requesterNodeId: authority.requester_node_id,
+      targetNodeId: responseTargetNodeId,
+      targetId: authority.target_id,
+      baseArtifactId: authority.base_artifact_id,
+      baseArtifactRevision: authority.base_artifact_revision,
+    };
+    const round = {
+      round_id: responseRoundId,
+      status: authority.round_status,
+      requester_node_id: authority.requester_node_id,
+      join_mode: authority.join_mode,
+      inherited_round_id: authority.inherited_round_id,
+      inherited_target_id: authority.inherited_target_id,
+    };
+
+    const responseMessageId = deriveFeedbackResponseMessageId(
+      targetNode.run_id,
+      matched.roundId,
+      matched.targetNodeId,
+    );
+    const existingResponse = await this.db.get<{ message_id: string }>(
+      `SELECT message_id FROM workflow_routed_messages
+        WHERE workspace_id = ? AND run_id = ? AND message_id = ?`,
+      [this.workspaceId, targetNode.run_id, responseMessageId],
+    );
+
+    // Matched feedback turn: always suppress the forward NEXT path.
+    // Redelivery or non-open rounds still insert the response fence with DO NOTHING.
+    if (!round || round.status !== 'open' || authority.status !== 'pending' || existingResponse) {
+      const finishedAtClosed = command.turn.finishedAt ?? new Date().toISOString();
+      return {
+        statements: [{
+          sql: `INSERT INTO workflow_routed_messages (
+                  workspace_id, run_id, message_id, source_node_id, destination_node_id,
+                  kind, body_json, created_at
+                ) VALUES (?,?,?,?,?,?,?,?)
+                ON CONFLICT(workspace_id, run_id, message_id) DO NOTHING`,
+          params: [
+            this.workspaceId,
+            targetNode.run_id,
+            responseMessageId,
+            matched.targetNodeId,
+            matched.requesterNodeId,
+            'feedback_response',
+            encodePayload({
+              kind: 'feedback_response',
+              schema: 1,
+              roundId: matched.roundId,
+              targetNodeId: matched.targetNodeId,
+              requesterNodeId: matched.requesterNodeId,
+              sourceTurnId: command.turn.id,
+            }),
+            finishedAtClosed,
+          ],
+        }],
+        changes: [],
+      };
+    }
+
+    const finishedAt = command.turn.finishedAt ?? new Date().toISOString();
+    const statements: SqlStatement[] = [];
+    const changes: ChangeRecord[] = [];
+    const pendingTargets = await this.db.get<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM workflow_feedback_targets
+        WHERE workspace_id = ? AND run_id = ? AND round_id = ? AND status = 'pending'`,
+      [this.workspaceId, targetNode.run_id, matched.roundId],
+    );
+    const willSatisfyRound = Number(pendingTargets?.count) === 1;
+
+    // Response contribution: updated feedback creates a new immutable revision;
+    // unchanged feedback points at the latest pinned revision.
+    const artifactId = deriveProducerArtifactId(targetNode.run_id, matched.targetNodeId);
+    if (disposition.change === 'unchanged' && artifactId !== matched.baseArtifactId) {
+      return this.planWorkflowFailClosure({
+        runId: targetNode.run_id,
+        reasonCode: 'invalid_route',
+        at: command.turn.finishedAt ?? new Date().toISOString(),
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
+    }
+    const latestArtifact = await this.db.get<{ revision: number }>(
+      `SELECT MAX(revision) AS revision FROM workflow_artifacts
+         WHERE workspace_id = ? AND run_id = ? AND artifact_id = ?`,
+      [this.workspaceId, targetNode.run_id, artifactId],
+    );
+    const latestRevision = latestArtifact?.revision ?? 1;
+    const revision = disposition.change === 'unchanged'
+      ? matched.baseArtifactRevision
+      : latestRevision + 1;
+      const resultBody = typeof disposition.result === 'string' ? disposition.result : undefined;
+    const artifactPayload = encodePayload({
+      kind: 'next_result',
+      schema: 1,
+      change: disposition.change,
+      producerNodeId: matched.targetNodeId,
+      sourceTurnId: command.turn.id,
+      feedbackRoundId: matched.roundId,
+      ...(resultBody !== undefined ? { result: resultBody } : {}),
+    });
+
+    statements.push({
+      sql: `INSERT INTO workflow_routed_messages (
+              workspace_id, run_id, message_id, source_node_id, source_task_id,
+              source_turn_id, destination_node_id, feedback_round_id,
+              feedback_target_id, artifact_run_id, artifact_id, artifact_revision,
+              kind, body_json, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(workspace_id, run_id, message_id) DO NOTHING`,
+      params: [
+        this.workspaceId,
+        targetNode.run_id,
+        responseMessageId,
+        matched.targetNodeId,
+        command.task.id,
+        command.turn.id,
+        matched.requesterNodeId,
+        matched.roundId,
+        matched.targetId,
+        targetNode.run_id,
+        artifactId,
+        revision,
+        'feedback_response',
+        encodePayload({
+          kind: 'feedback_response',
+          schema: 1,
+          roundId: matched.roundId,
+          targetNodeId: matched.targetNodeId,
+          requesterNodeId: matched.requesterNodeId,
+          artifactId,
+          artifactRevision: revision,
+          sourceTurnId: command.turn.id,
+        }),
+        finishedAt,
+      ],
+    });
+
+    if (disposition.change === 'updated') {
+      statements.push({
+      sql: `INSERT INTO workflow_artifacts (
+              workspace_id, run_id, artifact_id, producer_node_id, logical_name,
+              revision, kind, payload_json, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT DO NOTHING`,
+      params: [
+        this.workspaceId,
+        targetNode.run_id,
+        artifactId,
+        matched.targetNodeId,
+        'next_result',
+        revision,
+        'next_result',
+        artifactPayload,
+        finishedAt,
+      ],
+      });
+      statements.push(workflowNodeArtifactSourceStatement({
+        workspaceId: this.workspaceId,
+        runId: targetNode.run_id,
+        artifactId,
+        artifactRevision: revision,
+        nodeId: matched.targetNodeId,
+        taskId: command.task.id,
+        turnId: command.turn.id,
+      }));
+    }
+
+    statements.push({
+      sql: `UPDATE workflow_feedback_targets
+               SET status = 'responded', response_turn_id = ?,
+                   response_artifact_run_id = ?, response_artifact_id = ?,
+                   response_artifact_revision = ?
+             WHERE workspace_id = ? AND run_id = ? AND round_id = ? AND target_node_id = ?
+               AND status = 'pending'`,
+      params: [
+        command.turn.id,
+        targetNode.run_id,
+        artifactId,
+        revision,
+        this.workspaceId,
+        targetNode.run_id,
+        matched.roundId,
+        matched.targetNodeId,
+      ],
+    });
+
+    const aggregateClosureId = deriveRunClosureFenceId(targetNode.run_id, 'failed');
+    statements.push({
+      sql: `UPDATE workflow_runs
+               SET terminal_reason_code = 'aggregate_too_large', closure_id = ?, updated_at = ?
+             WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+               AND terminal_reason_code IS NULL
+               AND EXISTS (
+                 SELECT 1
+                   FROM workflow_feedback_rounds overflow_round
+                  WHERE overflow_round.workspace_id = workflow_runs.workspace_id
+                    AND overflow_round.run_id = workflow_runs.run_id
+                    AND overflow_round.round_id = ?
+                    AND overflow_round.status = 'open'
+                    AND NOT EXISTS (
+                      SELECT 1 FROM workflow_feedback_targets
+                       WHERE workspace_id = overflow_round.workspace_id
+                         AND run_id = overflow_round.run_id
+                         AND round_id = overflow_round.round_id
+                         AND status != 'responded'
+                    )
+                    AND length(CAST(
+                      '[workflow-feedback-resume] ' || COALESCE((
+                        SELECT group_concat(ordered.value, ' ')
+                          FROM (
+                            SELECT binding.input_ref || '=' ||
+                                   COALESCE(
+                                     json_extract(artifact.payload_json, '$.result'),
+                                     '[artifact ' || artifact.artifact_id || '@' || artifact.revision || ']'
+                                   ) AS value
+                              FROM workflow_dependency_gates requester_gate
+                              JOIN workflow_gate_bindings binding
+                                ON binding.workspace_id = requester_gate.workspace_id
+                               AND binding.run_id = requester_gate.run_id
+                               AND binding.gate_id = requester_gate.gate_id
+                              JOIN workflow_feedback_targets target
+                                ON target.workspace_id = requester_gate.workspace_id
+                               AND target.run_id = requester_gate.run_id
+                               AND target.round_id = overflow_round.round_id
+                               AND target.target_node_id = binding.producer_node_id
+                               JOIN workflow_artifacts artifact
+                                 ON artifact.workspace_id = target.workspace_id
+                                AND artifact.run_id = target.response_artifact_run_id
+                                AND artifact.artifact_id = target.response_artifact_id
+                                AND artifact.revision = target.response_artifact_revision
+                              JOIN workflow_runs aggregate_run
+                                ON aggregate_run.workspace_id = requester_gate.workspace_id
+                               AND aggregate_run.run_id = requester_gate.run_id
+                              LEFT JOIN workflow_definition_edges definition_edge
+                                ON definition_edge.workspace_id = aggregate_run.workspace_id
+                               AND definition_edge.definition_id = aggregate_run.definition_id
+                               AND definition_edge.definition_version = aggregate_run.definition_version
+                               AND definition_edge.source_node_id = binding.producer_node_id
+                               AND definition_edge.destination_node_id = requester_gate.consumer_node_id
+                               AND definition_edge.destination_input_ref = binding.input_ref
+                             WHERE requester_gate.workspace_id = overflow_round.workspace_id
+                               AND requester_gate.run_id = overflow_round.run_id
+                               AND requester_gate.consumer_node_id = overflow_round.requester_node_id
+                               AND binding.required_kind <> 'engine_start'
+                             ORDER BY COALESCE(definition_edge.ordinal, 2147483647), binding.input_ref
+                          ) ordered
+                      ), '') AS BLOB
+                    )) > workflow_runs.max_aggregate_bytes
+               )`,
+      params: [
+        aggregateClosureId,
+        finishedAt,
+        this.workspaceId,
+        targetNode.run_id,
+        matched.roundId,
+      ],
+    });
+
+    // Atomic open→satisfied only when every target has responded (incl. this one).
+    // Exclude this target from the pending check so the UPDATE does not depend on
+    // statement ordering within the same transaction.
+    statements.push({
+      sql: `UPDATE workflow_feedback_rounds
+               SET status = 'satisfied'
+             WHERE workspace_id = ? AND run_id = ? AND round_id = ? AND status = 'open'
+                AND NOT EXISTS (
+                  SELECT 1 FROM workflow_feedback_targets
+                   WHERE workspace_id = ? AND run_id = ? AND round_id = ?
+                     AND status != 'responded'
+                     AND target_node_id != ?
+               )
+               AND EXISTS (
+                 SELECT 1 FROM workflow_runs
+                  WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                    AND terminal_reason_code IS NULL
+                )`,
+      params: [
+        this.workspaceId,
+        targetNode.run_id,
+        matched.roundId,
+        this.workspaceId,
+        targetNode.run_id,
+        matched.roundId,
+        matched.targetNodeId,
+        this.workspaceId,
+        targetNode.run_id,
+      ],
+    });
+    statements.push(...workflowAggregateOverflowClosureStatements({
+      workspaceId: this.workspaceId,
+      runId: targetNode.run_id,
+      closureId: aggregateClosureId,
+      at: finishedAt,
+    }));
+
+    if (!willSatisfyRound) return { statements, changes };
+
+    const resumeTurnId = deriveFeedbackResumeTurnId(targetNode.run_id, matched.roundId);
+    const resumeMessageId = deriveFeedbackResumeMessageId(targetNode.run_id, matched.roundId);
+    const resumeActivationId = deriveFeedbackResumeActivationId(targetNode.run_id, matched.roundId);
+    let inheritedTargetNodeId: string | null = null;
+    if (round.inherited_round_id || round.inherited_target_id) {
+      if (!round.inherited_round_id || !round.inherited_target_id) {
+        return this.planWorkflowFailClosure({
+          runId: targetNode.run_id,
+          reasonCode: 'invalid_route',
+          at: finishedAt,
+          sourceTaskId: command.task.id,
+          sourceTurnId: command.turn.id,
+        });
+      }
+      const inheritedTarget = await this.db.get<{ target_node_id: string }>(
+        `SELECT target_node_id FROM workflow_feedback_targets
+          WHERE workspace_id = ? AND run_id = ? AND round_id = ? AND target_id = ?
+            AND status = 'pending'`,
+        [
+          this.workspaceId,
+          targetNode.run_id,
+          round.inherited_round_id,
+          round.inherited_target_id,
+        ],
+      );
+      if (!inheritedTarget?.target_node_id) {
+        return this.planWorkflowFailClosure({
+          runId: targetNode.run_id,
+          reasonCode: 'invalid_route',
+          at: finishedAt,
+          sourceTaskId: command.task.id,
+          sourceTurnId: command.turn.id,
+        });
+      }
+      inheritedTargetNodeId = inheritedTarget.target_node_id;
+    }
+
+    const requesterTask = await this.db.get<{ task_id: string | null }>(
+      `SELECT task_id FROM workflow_nodes
+        WHERE workspace_id = ? AND run_id = ? AND node_id = ?`,
+      [this.workspaceId, targetNode.run_id, matched.requesterNodeId],
+    );
+    if (!requesterTask || typeof requesterTask.task_id !== 'string') {
+      return { statements, changes };
+    }
+    const requesterTaskId = requesterTask.task_id;
+    const maxSeqRow = await this.db.get<{ max_seq: number | null }>(
+      `SELECT MAX(sequence) AS max_seq FROM turns WHERE workspace_id = ? AND task_id = ?`,
+      [this.workspaceId, requesterTaskId],
+    );
+    const nextSequence = (maxSeqRow?.max_seq ?? 0) + 1;
+    const turnPayloadJson = encodePayload({});
+    const messagePayloadJson = encodePayload({});
+
+    // Conditional resume: only when round is satisfied; reserved ids make redelivery no-op.
+    statements.push({
+      sql: `INSERT INTO turns (
+              id, workspace_id, task_id, sequence, status, trigger, created_at, started_at, settled_at, payload_json
+            )
+            SELECT ?,?,?,?,?,?,?,?,?,?
+             WHERE EXISTS (
+               SELECT 1 FROM workflow_feedback_rounds
+                WHERE workspace_id = ? AND run_id = ? AND round_id = ? AND status = 'satisfied'
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM turns WHERE workspace_id = ? AND id = ?
+             )`,
+      params: [
+        resumeTurnId,
+        this.workspaceId,
+        requesterTaskId,
+        nextSequence,
+        'queued',
+        'engine',
+        finishedAt,
+        null,
+        null,
+        turnPayloadJson,
+        this.workspaceId,
+        targetNode.run_id,
+        matched.roundId,
+        this.workspaceId,
+        resumeTurnId,
+      ],
+    });
+    statements.push({
+      sql: `INSERT INTO messages (
+              id, workspace_id, task_id, turn_id, role, state, ordering, content, created_at, updated_at, payload_json
+            )
+            SELECT ?,?,?,?,?,?,?,
+                   '[workflow-feedback-resume] ' || COALESCE((
+                     SELECT group_concat(ordered.value, ' ')
+                       FROM (
+                         SELECT binding.input_ref || '=' ||
+                                COALESCE(
+                                  json_extract(artifact.payload_json, '$.result'),
+                                  '[artifact ' || artifact.artifact_id || '@' || artifact.revision || ']'
+                                ) AS value
+                           FROM workflow_dependency_gates requester_gate
+                           JOIN workflow_gate_bindings binding
+                             ON binding.workspace_id = requester_gate.workspace_id
+                            AND binding.run_id = requester_gate.run_id
+                            AND binding.gate_id = requester_gate.gate_id
+                           JOIN workflow_feedback_targets target
+                             ON target.workspace_id = requester_gate.workspace_id
+                            AND target.run_id = requester_gate.run_id
+                            AND target.round_id = ?
+                            AND target.target_node_id = binding.producer_node_id
+                            JOIN workflow_artifacts artifact
+                              ON artifact.workspace_id = target.workspace_id
+                             AND artifact.run_id = target.response_artifact_run_id
+                             AND artifact.artifact_id = target.response_artifact_id
+                             AND artifact.revision = target.response_artifact_revision
+                           JOIN workflow_runs aggregate_run
+                             ON aggregate_run.workspace_id = requester_gate.workspace_id
+                            AND aggregate_run.run_id = requester_gate.run_id
+                           LEFT JOIN workflow_definition_edges definition_edge
+                             ON definition_edge.workspace_id = aggregate_run.workspace_id
+                            AND definition_edge.definition_id = aggregate_run.definition_id
+                            AND definition_edge.definition_version = aggregate_run.definition_version
+                            AND definition_edge.source_node_id = binding.producer_node_id
+                            AND definition_edge.destination_node_id = requester_gate.consumer_node_id
+                            AND definition_edge.destination_input_ref = binding.input_ref
+                          WHERE requester_gate.workspace_id = ?
+                            AND requester_gate.run_id = ?
+                            AND requester_gate.consumer_node_id = ?
+                            AND binding.required_kind <> 'engine_start'
+                          ORDER BY COALESCE(definition_edge.ordinal, 2147483647), binding.input_ref
+                       ) ordered
+                   ), ''),
+                   ?,?,?
+             WHERE EXISTS (
+               SELECT 1 FROM workflow_feedback_rounds
+                WHERE workspace_id = ? AND run_id = ? AND round_id = ? AND status = 'satisfied'
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM messages WHERE workspace_id = ? AND id = ?
+             )`,
+      params: [
+        resumeMessageId,
+        this.workspaceId,
+        requesterTaskId,
+        resumeTurnId,
+        'system',
+        'assigned',
+        null,
+        matched.roundId,
+        this.workspaceId,
+        targetNode.run_id,
+        matched.requesterNodeId,
+        finishedAt,
+        null,
+        messagePayloadJson,
+        this.workspaceId,
+        targetNode.run_id,
+        matched.roundId,
+        this.workspaceId,
+        resumeMessageId,
+      ],
+    });
+    statements.push({
+      sql: `INSERT INTO turn_inputs (workspace_id, turn_id, ordering, kind, payload_json)
+            SELECT ?,?,?,?,?
+             WHERE EXISTS (
+               SELECT 1 FROM workflow_feedback_rounds
+                WHERE workspace_id = ? AND run_id = ? AND round_id = ? AND status = 'satisfied'
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM turn_inputs WHERE workspace_id = ? AND turn_id = ? AND ordering = 0
+             )`,
+      params: [
+        this.workspaceId,
+        resumeTurnId,
+        0,
+        'message',
+        encodePayload({ kind: 'message', messageId: resumeMessageId }),
+        this.workspaceId,
+        targetNode.run_id,
+        matched.roundId,
+        this.workspaceId,
+        resumeTurnId,
+      ],
+    });
+    statements.push({
+      sql: `INSERT INTO workflow_activations (
+              workspace_id, run_id, activation_id, node_id, kind, status,
+              source_gate_id, feedback_round_id, feedback_target_node_id,
+              continuation_id, return_gate_id, inherited_feedback_round_id,
+              inherited_feedback_target_node_id, primary_turn_id, message_id,
+              execution_turn_id, created_at, updated_at
+            )
+            SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+             WHERE EXISTS (
+               SELECT 1 FROM workflow_feedback_rounds
+                WHERE workspace_id = ? AND run_id = ? AND round_id = ? AND status = 'satisfied'
+             )
+            ON CONFLICT(workspace_id, run_id, activation_id) DO NOTHING`,
+      params: [
+        this.workspaceId,
+        targetNode.run_id,
+        resumeActivationId,
+        matched.requesterNodeId,
+        'feedback_resume',
+        'queued',
+        null,
+        matched.roundId,
+        null,
+        null,
+        null,
+        round.inherited_round_id,
+        inheritedTargetNodeId,
+        resumeTurnId,
+        resumeMessageId,
+        resumeTurnId,
+        finishedAt,
+        finishedAt,
+        this.workspaceId,
+        targetNode.run_id,
+        matched.roundId,
+      ],
+    });
+    changes.push(
+      { kind: 'turn', id: resumeTurnId, taskId: requesterTaskId, change: 'effect' },
+      { kind: 'message', id: resumeMessageId, taskId: requesterTaskId, change: 'complete' },
+    );
+
+    return {
+      statements,
+      changes,
+      turnReservations: [{ runId: targetNode.run_id, taskId: requesterTaskId, count: 1 }],
+    };
+  }
+
+  /**
+   * M018 S05 settle entry: workflow_fail disposition, invalid PREV routing, or
+   * run_timeout termination each close the run via planWorkflowFailClosure.
+   */
+
+  /**
+   * M018 S06: on successful settle with a child-workflow NEXT route, atomically start
+   * a child run (origin='child', parent_run_id=caller), pin exact entry bindings,
+   * record one pending continuation + caller return gate, and fence child_invocation.
+   * Invalid/missing/foreign bindings abort with zero child rows.
+   */
+  private async planWorkflowChildInvocation(
+    command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
+  ): Promise<WorkflowEffectPlan> {
+    const empty = { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] };
+    const staged = command.turn.disposition;
+    if (!staged || staged.kind !== 'workflow_next' || staged.route?.kind !== 'child_workflow') {
+      return empty;
+    }
+    const disposition = staged.route;
+
+    const finishedAt = command.turn.finishedAt ?? new Date().toISOString();
+    const callerNode = await this.lookupWorkflowNodeForTask(command.task.id);
+    const callerRun = callerNode ? await this.db.get<{
+      definition_id: string;
+      definition_version: number;
+      owner_root_task_id: string | null;
+      max_children: number;
+      children_reserved: number;
+    }>(
+      `SELECT definition_id, definition_version, owner_root_task_id,
+              max_children, children_reserved
+         FROM workflow_runs
+        WHERE workspace_id = ? AND run_id = ?`,
+      [this.workspaceId, callerNode.runId],
+    ) : undefined;
+    if (callerNode) {
+      if (!callerRun) return empty;
+      const callerAuthority = await this.db.get<{ is_terminal: number }>(
+        `SELECT definition_node.is_terminal
+           FROM workflow_runs run
+           JOIN workflow_definition_nodes definition_node
+             ON definition_node.workspace_id = run.workspace_id
+            AND definition_node.definition_id = run.definition_id
+            AND definition_node.definition_version = run.definition_version
+          WHERE run.workspace_id = ? AND run.run_id = ? AND definition_node.node_id = ?
+            AND run.status = 'running'`,
+        [this.workspaceId, callerNode.runId, callerNode.nodeId],
+      );
+      if (callerAuthority?.is_terminal !== 1) return empty;
+      const openRound = await this.db.get<{ round_id: string }>(
+        `SELECT round_id FROM workflow_feedback_rounds
+          WHERE workspace_id = ? AND run_id = ? AND status = 'open'
+          LIMIT 1`,
+        [this.workspaceId, callerNode.runId],
+      );
+      if (openRound) return empty;
+    } else if (
+      command.task.parentId !== null ||
+      command.task.role !== 'coordinator' ||
+      !command.task.capabilities.includes('create_child')
+    ) {
+      return empty;
+    }
+
+    const pendingContinuation = await this.db.get<{
+      continuation_id: string;
+      invocation_key: string | null;
+      invocation_fingerprint: string | null;
+    }>(
+      callerNode
+        ? `SELECT continuation_id, invocation_key, invocation_fingerprint
+             FROM workflow_continuations
+            WHERE workspace_id = ? AND run_id = ? AND kind = 'child_wait'
+              AND status = 'pending'
+            LIMIT 1`
+        : `SELECT continuation_id, invocation_key, invocation_fingerprint
+             FROM workflow_continuations
+            WHERE workspace_id = ? AND caller_task_id = ? AND status = 'pending'
+            LIMIT 1`,
+      [this.workspaceId, callerNode?.runId ?? command.task.id],
+    );
+    const callerRunId = callerNode?.runId;
+    const callerScopeId = callerRunId ?? stableId('wfcaller', command.task.id);
+    const ownerRootTaskId = callerRun?.owner_root_task_id ?? command.task.id;
+
+    const bindingCheck = validateInvokeChildEntryBindings(disposition.entryBindings);
+    if (!bindingCheck.ok) return empty;
+
+    const childIdempotencyKey = deriveChildStartIdempotencyKey({
+      callerRunId: callerScopeId,
+      callerTurnId: command.turn.id,
+      childDefinitionId: disposition.childDefinitionId,
+      childDefinitionVersion: disposition.childDefinitionVersion,
+      childIdempotencyKey: disposition.childIdempotencyKey,
+    });
+    const fenceId = deriveChildInvocationFenceId(
+      callerScopeId,
+      disposition.childDefinitionId,
+      disposition.childDefinitionVersion,
+      childIdempotencyKey,
+    );
+    const childDef = await this.db.get<{
+      topology_json: string;
+      name: string;
+      entry_node_id: string;
+      scope_kind: 'workspace' | 'root';
+      owner_root_task_id: string | null;
+      policy_json: string;
+      fingerprint: string;
+      created_at: string;
+    }>(
+      `SELECT topology_json, name, entry_node_id, scope_kind, owner_root_task_id,
+              policy_json, fingerprint, created_at
+         FROM workflow_definitions
+        WHERE workspace_id = ? AND definition_id = ? AND version = ?`,
+      [
+        this.workspaceId,
+        disposition.childDefinitionId,
+        disposition.childDefinitionVersion,
+      ],
+    );
+    if (!childDef) return empty;
+
+    const childTopologyDecoded = decodeStoredTopologyJson(childDef.topology_json);
+    if (!childTopologyDecoded.ok) return empty;
+    const childContracts = await this.db.all<{
+      entry_node_id: string;
+      input_ref: string;
+      expected_artifact_kind: string;
+    }>(
+      `SELECT entry_node_id, input_ref, expected_artifact_kind
+         FROM workflow_entry_contracts
+        WHERE workspace_id = ? AND definition_id = ? AND definition_version = ?
+        ORDER BY ordinal`,
+      [this.workspaceId, disposition.childDefinitionId, disposition.childDefinitionVersion],
+    );
+    let childPolicy: unknown;
+    try {
+      childPolicy = JSON.parse(childDef.policy_json);
+    } catch {
+      return empty;
+    }
+    const childDefinition = validateDefineWorkflow({
+      definitionId: disposition.childDefinitionId,
+      version: disposition.childDefinitionVersion,
+      name: childDef.name,
+      topology: childTopologyDecoded.topology,
+      entryContracts: childContracts.map((contract) => ({
+        entryNodeId: contract.entry_node_id,
+        inputRef: contract.input_ref,
+        expectedArtifactKind: contract.expected_artifact_kind,
+      })),
+      policy: childPolicy,
+      scope: childDef.scope_kind === 'root'
+        ? { kind: 'root', ownerRootTaskId: childDef.owner_root_task_id ?? '' }
+        : { kind: 'workspace' },
+      createdAt: childDef.created_at,
+    });
+    if (!childDefinition.ok || childDefinition.fingerprint !== childDef.fingerprint) return empty;
+    if (
+      childDefinition.definition.scope.kind === 'root' &&
+      childDefinition.definition.scope.ownerRootTaskId !== ownerRootTaskId
+    ) return empty;
+    let childEffectivePolicy = childDefinition.definition.policy;
+    if (disposition.effectivePolicy) {
+      const numericPolicyKeys: Array<Exclude<keyof WorkflowPolicyV1, 'failWorkflow'>> = [
+        'maxFeedbackRoundsPerRun',
+        'maxTurnsPerTask',
+        'maxWorkflowTurnsPerRun',
+        'runTimeoutMs',
+        'maxDepth',
+        'maxTaskCount',
+        'maxConcurrency',
+        'maxInputsPerGate',
+        'maxArtifactBytes',
+        'maxAggregateBytes',
+      ];
+      if (
+        disposition.effectivePolicy.failWorkflow !== childEffectivePolicy.failWorkflow ||
+        numericPolicyKeys.some((key) =>
+          disposition.effectivePolicy![key] > childEffectivePolicy[key])
+      ) return empty;
+      const effectiveDefinition = validateDefineWorkflow({
+        ...childDefinition.definition,
+        policy: disposition.effectivePolicy,
+      });
+      if (!effectiveDefinition.ok) {
+        const aggregateBoundExceeded = entryNodeIds(childDefinition.definition.topology).some(
+          (entryNodeId) =>
+            maximumWorkflowEntryAggregateBytes(
+              childDefinition.definition.entryContracts.filter(
+                (contract) => contract.entryNodeId === entryNodeId,
+              ),
+              disposition.effectivePolicy!.maxArtifactBytes,
+            ) > disposition.effectivePolicy!.maxAggregateBytes,
+        );
+        if (aggregateBoundExceeded && callerRunId) {
+          return this.planWorkflowFailClosure({
+            runId: callerRunId,
+            reasonCode: 'aggregate_too_large',
+            at: finishedAt,
+            sourceTaskId: command.task.id,
+            sourceTurnId: command.turn.id,
+          });
+        }
+        return empty;
+      }
+      childEffectivePolicy = effectiveDefinition.definition.policy;
+    }
+    const childTopology = childDefinition.definition.topology;
+
+    const childEntryNodeIds = entryNodeIds(childTopology);
+    const allChildNodeIds = childTopology.nodes.map((n) => n.nodeId);
+    const primaryEntry = childEntryNodeIds[0] ?? childDef.entry_node_id;
+
+    const childContractByKey = new Map(
+      childDefinition.definition.entryContracts.map((contract) => [
+        `${contract.entryNodeId}\0${contract.inputRef}`,
+        contract,
+      ] as const),
+    );
+    if (disposition.entryBindings.length !== childContractByKey.size) return empty;
+
+    const pinnedFills: Array<{
+      childEntryNodeId: string;
+      inputRef: string;
+      artifactRunId: string;
+      artifactId: string;
+      artifactRevision: number;
+      producerNodeId: string;
+      payloadJson: string;
+      kind: string;
+      logicalName: string;
+    }> = [];
+
+    for (const binding of disposition.entryBindings) {
+      const contract = childContractByKey.get(
+        `${binding.childEntryNodeId}\0${binding.inputRef}`,
+      );
+      if (!contract) return empty;
+      const art = await this.db.get<{
+        run_id: string;
+        artifact_id: string;
+        revision: number;
+        producer_node_id: string;
+        payload_json: string;
+        kind: string;
+        logical_name: string;
+      }>(
+        callerRunId
+          ? `SELECT run_id, artifact_id, revision, producer_node_id, payload_json, kind, logical_name
+               FROM workflow_artifacts
+              WHERE workspace_id = ? AND run_id = ? AND artifact_id = ? AND revision = ?`
+          : `SELECT artifact.run_id, artifact.artifact_id, artifact.revision,
+                    artifact.producer_node_id, artifact.payload_json, artifact.kind,
+                    artifact.logical_name
+               FROM workflow_artifacts artifact
+               JOIN workflow_artifact_sources source
+                 ON source.workspace_id = artifact.workspace_id
+                AND source.run_id = artifact.run_id
+                AND source.artifact_id = artifact.artifact_id
+                AND source.artifact_revision = artifact.revision
+              WHERE artifact.workspace_id = ? AND artifact.artifact_id = ?
+                AND artifact.revision = ?
+                AND (
+                  (source.source_kind = 'caller_turn'
+                   AND source.caller_task_id = ? AND source.caller_turn_id = ?)
+                  OR
+                  (source.source_kind = 'workflow_node' AND source.producer_task_id = ?)
+                )
+              LIMIT 1`,
+        callerRunId
+          ? [this.workspaceId, callerRunId, binding.artifactId, binding.artifactRevision]
+          : [
+              this.workspaceId,
+              binding.artifactId,
+              binding.artifactRevision,
+              command.task.id,
+              command.turn.id,
+              command.task.id,
+            ],
+      );
+      if (!art || art.kind !== contract.expectedArtifactKind) return empty;
+      pinnedFills.push({
+        childEntryNodeId: binding.childEntryNodeId,
+        inputRef: binding.inputRef,
+        artifactRunId: art.run_id,
+        artifactId: art.artifact_id,
+        artifactRevision: art.revision,
+        producerNodeId: art.producer_node_id,
+        payloadJson: art.payload_json,
+        kind: art.kind,
+        logicalName: art.logical_name,
+      });
+    }
+
+    const pinnedFillByKey = new Map(
+      pinnedFills.map((pin) => [`${pin.childEntryNodeId}\0${pin.inputRef}`, pin] as const),
+    );
+    const aggregateByEntry = new Map<string, string>();
+    for (const entryNodeId of childEntryNodeIds) {
+      const contracts = childDefinition.definition.entryContracts.filter(
+        (contract) => contract.entryNodeId === entryNodeId,
+      );
+      const values: Array<{ inputRef: string; value: string }> = [];
+      for (const contract of contracts) {
+        const pin = pinnedFillByKey.get(`${entryNodeId}\0${contract.inputRef}`);
+        if (!pin) return empty;
+        let payload: unknown;
+        try {
+          payload = JSON.parse(pin.payloadJson);
+        } catch {
+          return empty;
+        }
+        const value = payload && typeof payload === 'object'
+          ? (payload as Record<string, unknown>).value
+          : undefined;
+        values.push({
+          inputRef: contract.inputRef,
+          value: typeof value === 'string' ? value : pin.payloadJson,
+        });
+      }
+      const aggregate = formatWorkflowEntryAggregate(values);
+      if (
+        values.some((value) =>
+          Buffer.byteLength(value.value, 'utf8') > childEffectivePolicy.maxArtifactBytes)
+        ||
+        Buffer.byteLength(aggregate, 'utf8') >
+        childEffectivePolicy.maxAggregateBytes
+      ) {
+        if (callerRunId) {
+          return this.planWorkflowFailClosure({
+            runId: callerRunId,
+            reasonCode: 'aggregate_too_large',
+            at: finishedAt,
+            sourceTaskId: command.task.id,
+            sourceTurnId: command.turn.id,
+          });
+        }
+        return empty;
+      }
+      aggregateByEntry.set(entryNodeId, aggregate);
+    }
+
+    const validated = validateStartWorkflow({
+      definitionId: disposition.childDefinitionId,
+      version: disposition.childDefinitionVersion,
+      startIdempotencyKey: childIdempotencyKey,
+      createdAt: finishedAt,
+      entryNodeId: primaryEntry,
+      entryNodeIds: childEntryNodeIds,
+      allNodeIds: allChildNodeIds,
+      goal: childDef.name,
+      backend: command.task.backend,
+      policy: childEffectivePolicy,
+    });
+    if (!validated.ok) return empty;
+
+    const { identities } = validated;
+    if (identities.entries.length > childEffectivePolicy.maxWorkflowTurnsPerRun) {
+      return callerRunId
+        ? this.planWorkflowFailClosure({
+            runId: callerRunId,
+            reasonCode: 'turn_budget_exhausted',
+            at: finishedAt,
+            sourceTaskId: command.task.id,
+            sourceTurnId: command.turn.id,
+          })
+        : empty;
+    }
+    if (callerRun && callerRun.children_reserved >= callerRun.max_children) {
+      return this.planWorkflowFailClosure({
+        runId: callerRunId!,
+        reasonCode: 'turn_budget_exhausted',
+        at: finishedAt,
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
+    }
+    const childRunId = identities.runId;
+    const continuationId = deriveChildContinuationId(callerScopeId, childRunId);
+    const returnGateId = deriveCallerReturnGateId(callerScopeId, childRunId);
+    const continuationRunId = callerRunId ?? childRunId;
+    const childCreatedAtMs = Date.parse(finishedAt);
+    if (!Number.isFinite(childCreatedAtMs)) return empty;
+    const childDeadlineAt = new Date(
+      childCreatedAtMs + childEffectivePolicy.runTimeoutMs,
+    ).toISOString();
+    const invocationFingerprint = childInvocationFingerprint({
+      callerScopeId,
+      childDefinitionId: disposition.childDefinitionId,
+      childDefinitionVersion: disposition.childDefinitionVersion,
+      childIdempotencyKey,
+      entryBindings: pinnedFills,
+      effectivePolicy: childEffectivePolicy,
+    });
+    if (pendingContinuation) {
+      if (pendingContinuation.invocation_key !== childIdempotencyKey) return empty;
+      if (pendingContinuation.invocation_fingerprint !== invocationFingerprint) {
+        return { ...empty, conflictReason: 'child invocation fingerprint conflict' };
+      }
+      return empty;
+    }
+    const existingInvocation = await this.db.get<{ invocation_fingerprint: string | null }>(
+      `SELECT invocation_fingerprint FROM workflow_continuations
+        WHERE workspace_id = ? AND run_id = ? AND continuation_id = ?`,
+      [this.workspaceId, continuationRunId, continuationId],
+    );
+    if (existingInvocation) {
+      if (existingInvocation.invocation_fingerprint !== invocationFingerprint) {
+        return { ...empty, conflictReason: 'child invocation fingerprint conflict' };
+      }
+      return empty;
+    }
+    const existingFenceRunId = callerRunId ?? childRunId;
+    const existingFence = await this.db.get<{ message_id: string }>(
+      `SELECT message_id FROM workflow_routed_messages
+        WHERE workspace_id = ? AND run_id = ? AND message_id = ?`,
+      [this.workspaceId, existingFenceRunId, fenceId],
+    );
+    if (existingFence) return empty;
+
+    const statements: SqlStatement[] = [];
+    const changes: ChangeRecord[] = [];
+
+    if (callerRunId) {
+      statements.push({
+        sql: `UPDATE workflow_runs
+                 SET children_reserved = children_reserved + 1, updated_at = ?
+               WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                 AND children_reserved < max_children`,
+        params: [finishedAt, this.workspaceId, callerRunId],
+      });
+    }
+
+    const fenceBody = JSON.stringify({
+      kind: 'child_invocation',
+      callerRunId: callerRunId ?? null,
+      callerNodeId: callerNode?.nodeId ?? null,
+      callerTurnId: command.turn.id,
+      childRunId,
+      childDefinitionId: disposition.childDefinitionId,
+      childDefinitionVersion: disposition.childDefinitionVersion,
+      childIdempotencyKey,
+      continuationId,
+      returnGateId,
+    });
+    statements.push({
+      sql: `INSERT INTO workflow_runs (
+              workspace_id, run_id, definition_id, definition_version, status, origin,
+              parent_run_id, owner_root_task_id, caller_task_id, caller_turn_id,
+              continuation_id, policy_json, max_feedback_rounds, max_turns_per_task,
+               max_workflow_turns, max_children, max_depth, max_concurrency,
+               max_aggregate_bytes, feedback_rounds_reserved, workflow_turns_reserved,
+               children_reserved, started_at, deadline_at, created_at, updated_at
+             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(workspace_id, run_id) DO NOTHING`,
+      params: [
+        this.workspaceId,
+        childRunId,
+        disposition.childDefinitionId,
+        disposition.childDefinitionVersion,
+        'running',
+        'child',
+        callerRunId ?? null,
+        ownerRootTaskId,
+        command.task.id,
+        command.turn.id,
+        continuationId,
+        JSON.stringify(childEffectivePolicy),
+        childEffectivePolicy.maxFeedbackRoundsPerRun,
+        childEffectivePolicy.maxTurnsPerTask,
+        childEffectivePolicy.maxWorkflowTurnsPerRun,
+        childEffectivePolicy.maxTaskCount,
+        childEffectivePolicy.maxDepth,
+        childEffectivePolicy.maxConcurrency,
+        childEffectivePolicy.maxAggregateBytes,
+        0,
+        identities.entries.length,
+        0,
+        finishedAt,
+        childDeadlineAt,
+        finishedAt,
+        finishedAt,
+      ],
+    });
+    statements.push({
+      sql: `INSERT INTO workflow_routed_messages (
+              workspace_id, run_id, message_id, source_node_id, destination_node_id,
+              kind, body_json, created_at
+            ) VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT(workspace_id, run_id, message_id) DO NOTHING`,
+      params: [
+        this.workspaceId,
+        existingFenceRunId,
+        fenceId,
+        callerNode?.nodeId ?? 'caller',
+        callerNode?.nodeId ?? 'caller',
+        'child_invocation',
+        fenceBody,
+        finishedAt,
+      ],
+    });
+
+    const childNodeById = new Map(childTopology.nodes.map((node) => [node.nodeId, node] as const));
+    const childEntryByNode = new Map(identities.entries.map((entry) => [entry.nodeId, entry] as const));
+    for (const nodeGate of identities.nodeGates) {
+      const isEntry = childEntryNodeIds.includes(nodeGate.nodeId);
+      const entry = childEntryByNode.get(nodeGate.nodeId);
+      statements.push({
+        sql: `INSERT INTO workflow_dependency_gates (
+                workspace_id, run_id, gate_id, consumer_node_id, status,
+                activation_id, reserved_turn_id, aggregate_message_id
+              ) VALUES (?,?,?,?,?,?,?,?)
+              ON CONFLICT(workspace_id, run_id, gate_id) DO NOTHING`,
+        params: [
+          this.workspaceId,
+          childRunId,
+          nodeGate.gateId,
+          nodeGate.nodeId,
+          isEntry ? 'satisfied' : 'open',
+          isEntry && entry ? entry.activationId : null,
+          isEntry && entry ? entry.activationTurnId : null,
+          isEntry && entry ? entry.messageId : null,
+        ],
+      });
+    }
+
+    if (childTopology.kind === 'graph_v1') {
+      for (const edge of childTopology.edges) {
+        const consumerGate = identities.nodeGates.find((g) => g.nodeId === edge.toNodeId);
+        if (!consumerGate) continue;
+        statements.push({
+          sql: `INSERT INTO workflow_gate_bindings (
+                  workspace_id, run_id, gate_id, input_ref, producer_node_id, required_kind
+                ) VALUES (?,?,?,?,?,?)
+                ON CONFLICT(workspace_id, run_id, gate_id, input_ref) DO NOTHING`,
+          params: [
+            this.workspaceId,
+            childRunId,
+            consumerGate.gateId,
+            edge.inputRef,
+            edge.fromNodeId,
+            edge.expectedArtifactKind ?? 'next_result',
+          ],
+        });
+      }
+    }
+
+    for (const entry of identities.entries) {
+      const node = childNodeById.get(entry.nodeId);
+      const task = {
+        id: entry.taskId,
+        role: node?.role ?? 'worker',
+        lifecycle: 'open' as const,
+        releaseState: 'released' as const,
+         goal: workflowNodeTaskGoal(node ?? { nodeId: entry.nodeId }, validated.goal),
+        parentId: command.task.id,
+        prerequisites: [],
+        backend: node?.backend ?? validated.backend,
+        ...(node?.model ? { model: node.model } : {}),
+        ...(node?.taskType ? { taskType: node.taskType } : {}),
+        capabilities: (node?.capabilities ?? []) as MusterTask['capabilities'],
+        executionPolicy: {
+          maxTurns: childEffectivePolicy.maxTurnsPerTask,
+          maxAutomaticRetries: 1,
+        },
+        revision: 0,
+        createdAt: finishedAt,
+        updatedAt: finishedAt,
+      };
+      const turn = {
+        id: entry.activationTurnId,
+        taskId: entry.taskId,
+        sequence: 0,
+        trigger: 'engine' as const,
+        status: 'queued' as const,
+        inputs: [{ kind: 'message' as const, messageId: entry.messageId }],
+        createdAt: finishedAt,
+      };
+      const message = {
+        id: entry.messageId,
+        taskId: entry.taskId,
+        role: 'system' as const,
+        content: aggregateByEntry.get(entry.nodeId) ?? '[workflow-entry]',
+        state: 'assigned' as const,
+        turnId: entry.activationTurnId,
+        createdAt: finishedAt,
+      };
+      statements.push(taskStatement(this.workspaceId, task as any, false));
+      statements.push(turnStatement(this.workspaceId, turn as any, false));
+      statements.push(messageStatement(this.workspaceId, message as any, false));
+      statements.push(
+        turnInputStatement(this.workspaceId, turn.id, 0, {
+          kind: 'message',
+          messageId: entry.messageId,
+        }),
+      );
+      statements.push({
+        sql: `INSERT INTO workflow_nodes (
+                workspace_id, run_id, node_id, task_id, status
+              ) VALUES (?,?,?,?,?)
+              ON CONFLICT(workspace_id, run_id, node_id) DO NOTHING`,
+        params: [
+          this.workspaceId,
+          childRunId,
+          entry.nodeId,
+          entry.taskId,
+          'active',
+        ],
+      });
+      statements.push({
+        sql: `INSERT INTO workflow_activations (
+                workspace_id, run_id, activation_id, node_id, kind, status,
+                source_gate_id, feedback_round_id, feedback_target_node_id,
+                continuation_id, return_gate_id, inherited_feedback_round_id,
+                inherited_feedback_target_node_id, primary_turn_id, message_id,
+                execution_turn_id, created_at, updated_at
+              ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              ON CONFLICT(workspace_id, run_id, activation_id) DO NOTHING`,
+        params: [
+          this.workspaceId,
+          childRunId,
+          entry.activationId,
+          entry.nodeId,
+          'entry_start',
+          'queued',
+          entry.gateId,
+          null,
+          null,
+          null,
+          null,
+          null,
+          null,
+          entry.activationTurnId,
+          entry.messageId,
+          entry.activationTurnId,
+          finishedAt,
+          finishedAt,
+        ],
+      });
+      changes.push(
+        { kind: 'task', id: entry.taskId, change: 'insert' },
+        { kind: 'turn', id: entry.activationTurnId, taskId: entry.taskId, change: 'insert' },
+        { kind: 'message', id: entry.messageId, taskId: entry.taskId, change: 'complete' },
+      );
+    }
+
+    for (const nodeGate of identities.nodeGates) {
+      if (childEntryNodeIds.includes(nodeGate.nodeId)) continue;
+      statements.push({
+        sql: `INSERT INTO workflow_nodes (
+                workspace_id, run_id, node_id, task_id, status
+              ) VALUES (?,?,?,?,?)
+              ON CONFLICT(workspace_id, run_id, node_id) DO NOTHING`,
+        params: [this.workspaceId, childRunId, nodeGate.nodeId, null, 'pending'],
+      });
+    }
+
+    for (const pin of pinnedFills) {
+      const entryGate = childEntryByNode.get(pin.childEntryNodeId)?.gateId;
+      if (!entryGate) return empty;
+      const contract = childContractByKey.get(`${pin.childEntryNodeId}\0${pin.inputRef}`);
+      if (!contract) return empty;
+      statements.push({
+        sql: `INSERT INTO workflow_gate_bindings (
+                workspace_id, run_id, gate_id, input_ref, producer_node_id, required_kind
+              ) VALUES (?,?,?,?,?,?)
+              ON CONFLICT(workspace_id, run_id, gate_id, input_ref) DO NOTHING`,
+        params: [
+          this.workspaceId,
+          childRunId,
+          entryGate,
+          pin.inputRef,
+          null,
+          contract.expectedArtifactKind,
+        ],
+      });
+      statements.push({
+        sql: `INSERT INTO workflow_gate_fills (
+                workspace_id, run_id, gate_id, input_ref, artifact_run_id,
+                artifact_id, artifact_revision, filled_at
+              ) VALUES (?,?,?,?,?,?,?,?)
+              ON CONFLICT(workspace_id, run_id, gate_id, input_ref)
+              DO NOTHING`,
+        params: [
+          this.workspaceId,
+          childRunId,
+          entryGate,
+          pin.inputRef,
+          pin.artifactRunId,
+          pin.artifactId,
+          pin.artifactRevision,
+          finishedAt,
+        ],
+      });
+    }
+
+    statements.push({
+      sql: `INSERT INTO workflow_continuations (
+              workspace_id, run_id, continuation_id, invocation_key, invocation_fingerprint,
+              caller_task_id, caller_turn_id, caller_run_id, caller_node_id,
+              child_run_id, return_gate_id, kind, status, payload_json, created_at, updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(workspace_id, run_id, continuation_id) DO NOTHING`,
+      params: [
+        this.workspaceId,
+        continuationRunId,
+        continuationId,
+        childIdempotencyKey,
+        invocationFingerprint,
+        command.task.id,
+        command.turn.id,
+        callerRunId ?? null,
+        callerNode?.nodeId ?? null,
+        childRunId,
+        returnGateId,
+        'child_wait',
+        'pending',
+        JSON.stringify({
+          childRunId,
+          returnGateId,
+          callerNodeId: callerNode?.nodeId,
+          callerTaskId: command.task.id,
+          childDefinitionId: disposition.childDefinitionId,
+          childDefinitionVersion: disposition.childDefinitionVersion,
+        }),
+        finishedAt,
+        finishedAt,
+      ],
+    });
+    statements.push({
+      sql: `INSERT INTO workflow_return_gates (
+              workspace_id, return_gate_id, continuation_run_id, continuation_id,
+              caller_task_id, caller_turn_id, caller_run_id, caller_node_id,
+              child_run_id, status, created_at, updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,'open',?,?)
+            ON CONFLICT(workspace_id, return_gate_id) DO NOTHING`,
+      params: [
+        this.workspaceId,
+        returnGateId,
+        continuationRunId,
+        continuationId,
+        command.task.id,
+        command.turn.id,
+        callerRunId ?? null,
+        callerNode?.nodeId ?? null,
+        childRunId,
+        finishedAt,
+        finishedAt,
+      ],
+    });
+
+    return { statements, changes };
+  }
+
+  /**
+   * M018 S06: terminal child-node NEXT with a pending parent continuation resolves
+   * that continuation once (child_return fence), fills the caller return gate, and
+   * queues exactly one caller resume turn. Never seals child lifecycle.
+   */
+  private async planWorkflowChildReturn(
+    command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
+  ): Promise<WorkflowEffectPlan> {
+    const empty = { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] };
+    const disposition = command.turn.disposition;
+    if (!disposition || disposition.kind !== 'workflow_next' || disposition.route !== undefined) {
+      return empty;
+    }
+
+    const finishedAt = command.turn.finishedAt ?? new Date().toISOString();
+    const childNode = await this.lookupWorkflowNodeForTask(command.task.id);
+    if (!childNode) return empty;
+
+    const childRun = await this.db.get<{
+      origin: string;
+      parent_run_id: string | null;
+      definition_id: string;
+      definition_version: number;
+      status: string;
+      max_aggregate_bytes: number;
+    }>(
+      `SELECT origin, parent_run_id, definition_id, definition_version, status, max_aggregate_bytes
+         FROM workflow_runs
+        WHERE workspace_id = ? AND run_id = ?`,
+      [this.workspaceId, childNode.runId],
+    );
+    if (!childRun || childRun.origin !== 'child') {
+      return empty;
+    }
+    if (childRun.status !== 'running') return empty;
+
+    const def = await this.db.get<{ topology_json: string }>(
+      `SELECT topology_json FROM workflow_definitions
+        WHERE workspace_id = ? AND definition_id = ? AND version = ?`,
+      [this.workspaceId, childRun.definition_id, childRun.definition_version],
+    );
+    if (!def) return empty;
+    const topologyDecoded = decodeStoredTopologyJson(def.topology_json);
+    if (!topologyDecoded.ok) return empty;
+    const topology = topologyDecoded.topology;
+    if (outgoingEdge(topology, childNode.nodeId)) {
+      return empty;
+    }
+    const terminalIds = terminalNodeIds(topology);
+    if (!terminalIds.includes(childNode.nodeId)) return empty;
+
+    const continuation = await this.db.get<{
+      run_id: string;
+      continuation_id: string;
+      status: string;
+      caller_task_id: string | null;
+      caller_run_id: string | null;
+      caller_node_id: string | null;
+      return_gate_id: string | null;
+    }>(
+      `SELECT run_id, continuation_id, status, caller_task_id, caller_run_id,
+              caller_node_id, return_gate_id
+         FROM workflow_continuations
+        WHERE workspace_id = ? AND child_run_id = ? AND status = 'pending'
+        ORDER BY created_at ASC
+        LIMIT 1`,
+      [this.workspaceId, childNode.runId],
+    );
+    if (!continuation) return empty;
+    const callerRunId = continuation.caller_run_id ?? undefined;
+    const callerScopeId = callerRunId ?? stableId('wfcaller', continuation.caller_task_id ?? 'missing');
+    const routeRunId = callerRunId ?? childNode.runId;
+
+    const returnFenceId = deriveChildReturnFenceId(childNode.runId);
+    const existingFence = await this.db.get<{ message_id: string }>(
+      `SELECT message_id FROM workflow_routed_messages
+        WHERE workspace_id = ? AND run_id = ? AND message_id = ?`,
+      [this.workspaceId, routeRunId, returnFenceId],
+    );
+    if (existingFence) return empty;
+
+    const returnGateId =
+      continuation.return_gate_id ?? deriveCallerReturnGateId(callerScopeId, childNode.runId);
+    const resumeTurnId = deriveCallerResumeTurnId(callerScopeId, childNode.runId);
+    const resumeMessageId = deriveCallerReturnMessageId(callerScopeId, childNode.runId);
+    const callerTaskId = continuation.caller_task_id ?? undefined;
+    if (!callerTaskId) return empty;
+    const callerAggregatePolicyRun = callerRunId
+      ? await this.db.get<{ max_aggregate_bytes: number }>(
+          `SELECT max_aggregate_bytes FROM workflow_runs
+            WHERE workspace_id = ? AND run_id = ?`,
+          [this.workspaceId, callerRunId],
+        )
+      : undefined;
+    if (callerRunId && (
+      !callerAggregatePolicyRun ||
+      !Number.isInteger(callerAggregatePolicyRun.max_aggregate_bytes)
+    )) {
+      return empty;
+    }
+    const resultBody = workflowResultFromSettlement(command, disposition.result);
+    const terminalCompletion = await this.workflowTerminalCompletion(
+      childNode.runId,
+      terminalIds,
+      childNode.nodeId,
+      resultBody,
+    );
+    if (!terminalCompletion.complete) return empty;
+    if (terminalCompletion.missingArtifact) {
+      return this.planWorkflowFailClosure({
+        runId: childNode.runId,
+        reasonCode: 'invalid_route',
+        reasonText: 'terminal result artifact missing',
+        at: finishedAt,
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
+    }
+    const returnResult = terminalCompletion.result;
+    if (
+      returnResult !== undefined &&
+      Buffer.byteLength(returnResult, 'utf8') > childRun.max_aggregate_bytes
+    ) {
+      return this.planWorkflowFailClosure({
+        runId: childNode.runId,
+        reasonCode: 'aggregate_too_large',
+        at: finishedAt,
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
+    }
+    const returnContent = `[workflow-child-return] childRunId=${childNode.runId} change=${disposition.change}\n${returnResult ?? ''}`;
+    const returnLimit = callerAggregatePolicyRun?.max_aggregate_bytes ?? childRun.max_aggregate_bytes;
+    if (Buffer.byteLength(returnContent, 'utf8') > returnLimit) {
+      return this.planWorkflowFailClosure({
+        runId: childNode.runId,
+        reasonCode: 'aggregate_too_large',
+        at: finishedAt,
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
+    }
+
+    const statements: SqlStatement[] = [];
+    const changes: ChangeRecord[] = [];
+
+    statements.push({
+      sql: `UPDATE workflow_continuations
+              SET status = 'resolved',
+                  outcome = 'succeeded',
+                  result_artifact_run_id = ?,
+                  result_artifact_id = ?,
+                  result_artifact_revision = 1,
+                  producing_turn_id = ?,
+                  resolved_at = ?,
+                  updated_at = ?,
+                  payload_json = json_set(
+                    COALESCE(payload_json, '{}'),
+                    '$.resolvedAt', ?,
+                    '$.resolvedByTurnId', ?,
+                    '$.resolvedByNodeId', ?
+                  )
+            WHERE workspace_id = ? AND run_id = ? AND continuation_id = ?
+              AND status = 'pending'`,
+      params: [
+        childNode.runId,
+        stableChildReturnArtifactId(callerScopeId, childNode.runId),
+        command.turn.id,
+        finishedAt,
+        finishedAt,
+        finishedAt,
+        command.turn.id,
+        childNode.nodeId,
+        this.workspaceId,
+        continuation.run_id,
+        continuation.continuation_id,
+      ],
+    });
+    statements.push({
+      sql: `UPDATE workflow_nodes
+               SET status = 'succeeded'
+             WHERE workspace_id = ? AND run_id = ? AND status = 'active'`,
+      params: [this.workspaceId, childNode.runId],
+    });
+    statements.push({
+      sql: `UPDATE workflow_runs
+               SET status = 'succeeded',
+                   terminal_result_run_id = ?, terminal_result_artifact_id = ?,
+                   terminal_result_artifact_revision = 1, updated_at = ?
+             WHERE workspace_id = ? AND run_id = ? AND status = 'running'`,
+      params: [
+        childNode.runId,
+        stableChildReturnArtifactId(callerScopeId, childNode.runId),
+        finishedAt,
+        this.workspaceId,
+        childNode.runId,
+      ],
+    });
+
+    const fenceBody = JSON.stringify({
+      kind: 'child_return',
+      childRunId: childNode.runId,
+      parentRunId: callerRunId ?? null,
+      continuationId: continuation.continuation_id,
+      returnGateId,
+      resumeTurnId,
+      resumeMessageId,
+      sourceTurnId: command.turn.id,
+      change: disposition.change,
+    });
+    statements.push({
+      sql: `INSERT INTO workflow_routed_messages (
+              workspace_id, run_id, message_id, source_node_id, destination_node_id,
+              kind, body_json, created_at
+            ) VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT(workspace_id, run_id, message_id) DO NOTHING`,
+      params: [
+        this.workspaceId,
+        routeRunId,
+        returnFenceId,
+        childNode.nodeId,
+        continuation.caller_node_id ?? 'caller',
+        'child_return',
+        fenceBody,
+        finishedAt,
+      ],
+    });
+
+    const returnArtifactId = stableChildReturnArtifactId(callerScopeId, childNode.runId);
+    const returnPayload = JSON.stringify({
+      kind: 'child_return',
+      childRunId: childNode.runId,
+      change: disposition.change,
+      result: returnResult ?? null,
+      sourceTurnId: command.turn.id,
+    });
+    statements.push({
+      sql: `INSERT INTO workflow_artifacts (
+              workspace_id, run_id, artifact_id, producer_node_id, logical_name,
+              revision, kind, payload_json, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT DO NOTHING`,
+      params: [
+        this.workspaceId,
+        childNode.runId,
+        returnArtifactId,
+        childNode.nodeId,
+        'child_return',
+        1,
+        'child_return',
+        returnPayload,
+        finishedAt,
+      ],
+    });
+    statements.push(workflowNodeArtifactSourceStatement({
+      workspaceId: this.workspaceId,
+      runId: childNode.runId,
+      artifactId: returnArtifactId,
+      artifactRevision: 1,
+      nodeId: childNode.nodeId,
+      taskId: command.task.id,
+      turnId: command.turn.id,
+    }));
+    const maxSeq = await this.db.get<{ max_seq: number | null }>(
+      `SELECT MAX(sequence) AS max_seq FROM turns WHERE workspace_id = ? AND task_id = ?`,
+      [this.workspaceId, callerTaskId],
+    );
+    const nextSeq = (maxSeq?.max_seq ?? -1) + 1;
+    const resumeTurn = {
+      id: resumeTurnId,
+      taskId: callerTaskId,
+      sequence: nextSeq,
+      trigger: 'engine' as const,
+      status: 'queued' as const,
+      inputs: [{ kind: 'message' as const, messageId: resumeMessageId }],
+      createdAt: finishedAt,
+    };
+    const resumeMessage = {
+      id: resumeMessageId,
+      taskId: callerTaskId,
+      role: 'system' as const,
+      content: returnContent,
+      state: 'assigned' as const,
+      turnId: resumeTurnId,
+      createdAt: finishedAt,
+    };
+    statements.push(turnStatement(this.workspaceId, resumeTurn as any, false));
+    statements.push(messageStatement(this.workspaceId, resumeMessage as any, false));
+    statements.push(
+      turnInputStatement(this.workspaceId, resumeTurnId, 0, {
+        kind: 'message',
+        messageId: resumeMessageId,
+      }),
+    );
+    const returnActivationId = callerRunId && continuation.caller_node_id
+      ? stableId('wfact', `${continuation.continuation_id}:return`)
+      : undefined;
+    if (returnActivationId && callerRunId && continuation.caller_node_id) {
+      statements.push({
+        sql: `INSERT INTO workflow_activations (
+                workspace_id, run_id, activation_id, node_id, kind, status,
+                source_gate_id, feedback_round_id, feedback_target_node_id,
+                continuation_id, return_gate_id, inherited_feedback_round_id,
+                inherited_feedback_target_node_id, primary_turn_id, message_id,
+                execution_turn_id, created_at, updated_at
+              ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              ON CONFLICT(workspace_id, run_id, activation_id) DO NOTHING`,
+        params: [
+          this.workspaceId,
+          callerRunId,
+          returnActivationId,
+          continuation.caller_node_id,
+          'child_return',
+          'queued',
+          null,
+          null,
+          null,
+          continuation.continuation_id,
+          returnGateId,
+          null,
+          null,
+          resumeTurnId,
+          resumeMessageId,
+          resumeTurnId,
+          finishedAt,
+          finishedAt,
+        ],
+      });
+    }
+    statements.push({
+      sql: `UPDATE workflow_return_gates
+               SET status = 'satisfied', result_run_id = ?, result_artifact_id = ?,
+                   result_artifact_revision = 1, return_activation_run_id = ?,
+                   return_activation_id = ?, return_message_id = ?, execution_turn_id = ?,
+                   updated_at = ?
+             WHERE workspace_id = ? AND return_gate_id = ? AND status = 'open'`,
+      params: [
+        childNode.runId,
+        returnArtifactId,
+        returnActivationId ? callerRunId ?? null : null,
+        returnActivationId ?? null,
+        resumeMessageId,
+        resumeTurnId,
+        finishedAt,
+        this.workspaceId,
+        returnGateId,
+      ],
+    });
+    changes.push(
+      { kind: 'turn', id: resumeTurnId, taskId: callerTaskId, change: 'insert' },
+      { kind: 'message', id: resumeMessageId, taskId: callerTaskId, change: 'complete' },
+      { kind: 'task', id: callerTaskId, change: 'effect' },
+    );
+    const taskClosure = await this.planWorkflowTaskLifecycleClosure({
+      runIds: [childNode.runId],
+      lifecycle: 'succeeded',
+      at: finishedAt,
+    });
+    statements.push(...taskClosure.statements);
+    changes.push(...taskClosure.changes);
+
+    return {
+      statements,
+      changes,
+      ...(callerRunId
+        ? { turnReservations: [{ runId: callerRunId, taskId: callerTaskId, count: 1 }] }
+        : {}),
+    };
+  }
+
+  private async planWorkflowFailFromSettle(
+    command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
+  ): Promise<{ statements: SqlStatement[]; changes: ChangeRecord[] }> {
+    const empty = { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] };
+    const disposition = command.turn.disposition;
+    const finishedAt = command.turn.finishedAt ?? new Date().toISOString();
+
+    // Explicit workflow_fail disposition on a successful settle.
+    if (
+      disposition
+      && disposition.kind === 'workflow_fail'
+      && command.turn.status === 'succeeded'
+    ) {
+      const node = await this.lookupWorkflowNodeForTask(command.task.id);
+      if (!node) return empty;
+      return this.planWorkflowFailClosure({
+        runId: node.runId,
+        reasonCode: 'agent_fail',
+        reasonText: boundWorkflowFailReason(disposition.reason),
+        at: finishedAt,
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
+    }
+
+    if (
+      disposition?.kind === 'workflow_next'
+      && disposition.change === 'updated'
+      && typeof disposition.result === 'string'
+      && command.turn.status === 'succeeded'
+    ) {
+      const node = await this.lookupWorkflowNodeForTask(command.task.id);
+      if (node) {
+        const run = await this.db.get<{ max_artifact_bytes: number }>(
+          `SELECT CAST(json_extract(policy_json, '$.maxArtifactBytes') AS INTEGER)
+                    AS max_artifact_bytes
+             FROM workflow_runs
+            WHERE workspace_id = ? AND run_id = ? AND status = 'running'`,
+          [this.workspaceId, node.runId],
+        );
+        if (
+          run
+          && Buffer.byteLength(disposition.result, 'utf8') > run.max_artifact_bytes
+        ) {
+          return this.planWorkflowFailClosure({
+            runId: node.runId,
+            reasonCode: 'aggregate_too_large',
+            at: finishedAt,
+            sourceTaskId: command.task.id,
+            sourceTurnId: command.turn.id,
+          });
+        }
+      }
+    }
+
+    // Run-timeout termination on a non-success settle still closes the workflow run.
+    if (command.turn.termination?.kind === 'run_timeout') {
+      const node = await this.lookupWorkflowNodeForTask(command.task.id);
+      if (!node) return empty;
+      return this.planWorkflowFailClosure({
+        runId: node.runId,
+        reasonCode: 'run_timeout',
+        at: finishedAt,
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
+    }
+
+    return empty;
+  }
+
+  /**
+   * M018 S05: reserve frozen feedback/turn capacity before creating an effect.
+   * The configured maximum permits exactly that many units; the next reservation
+   * closes the run without committing the successful route that requested it.
+   */
+  private async planWorkflowBudgetExhaustionIfNeeded(
+    command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
+    reservations: {
+      feedbackRounds: WorkflowRunReservation[];
+      workflowTurns: WorkflowTurnReservation[];
+    },
+  ): Promise<{ statements: SqlStatement[]; changes: ChangeRecord[]; exhausted: boolean }> {
+    const empty = {
+      statements: [] as SqlStatement[],
+      changes: [] as ChangeRecord[],
+      exhausted: false,
+    };
+    if (reservations.feedbackRounds.length === 0 && reservations.workflowTurns.length === 0) {
+      return empty;
+    }
+    const feedbackByRun = sumWorkflowRunReservations(reservations.feedbackRounds);
+    const turnsByRun = sumWorkflowRunReservations(
+      reservations.workflowTurns.map(({ runId, count }) => ({ runId, count })),
+    );
+    const turnsByTask = sumWorkflowTurnReservations(reservations.workflowTurns);
+    const runIds = [...new Set([...feedbackByRun.keys(), ...turnsByRun.keys()])].sort();
+    const settlingNode = await this.lookupWorkflowNodeForTask(command.task.id);
+    const at = command.turn.finishedAt ?? new Date().toISOString();
+    const statements: SqlStatement[] = [];
+
+    for (const runId of runIds) {
+      const run = await this.db.get<{
+        status: string;
+        max_feedback_rounds: number;
+        max_turns_per_task: number;
+        max_workflow_turns: number;
+        feedback_rounds_reserved: number;
+        workflow_turns_reserved: number;
+      }>(
+        `SELECT status, max_feedback_rounds, max_turns_per_task, max_workflow_turns,
+                feedback_rounds_reserved, workflow_turns_reserved
+           FROM workflow_runs
+          WHERE workspace_id = ? AND run_id = ?`,
+        [this.workspaceId, runId],
+      );
+      if (!run || run.status !== 'running') continue;
+      const feedbackRounds = feedbackByRun.get(runId) ?? 0;
+      const workflowTurns = turnsByRun.get(runId) ?? 0;
+      if (run.feedback_rounds_reserved + feedbackRounds > run.max_feedback_rounds) {
+        const closure = await this.planWorkflowFailClosure({
+          runId,
+          reasonCode: 'feedback_budget_exhausted',
+          at,
+          ...(settlingNode?.runId === runId
+            ? { sourceTaskId: command.task.id, sourceTurnId: command.turn.id }
+            : {}),
+        });
+        return { ...closure, exhausted: true };
+      }
+      if (run.workflow_turns_reserved + workflowTurns > run.max_workflow_turns) {
+        const closure = await this.planWorkflowFailClosure({
+          runId,
+          reasonCode: 'turn_budget_exhausted',
+          at,
+          ...(settlingNode?.runId === runId
+            ? { sourceTaskId: command.task.id, sourceTurnId: command.turn.id }
+            : {}),
+        });
+        return { ...closure, exhausted: true };
+      }
+      for (const reservation of turnsByTask.values()) {
+        if (reservation.runId !== runId) continue;
+        const count = await this.db.get<{ count: number }>(
+          `SELECT COUNT(*) AS count FROM turns WHERE workspace_id = ? AND task_id = ?`,
+          [this.workspaceId, reservation.taskId],
+        );
+        if ((count?.count ?? 0) + reservation.count > run.max_turns_per_task) {
+          const closure = await this.planWorkflowFailClosure({
+            runId,
+            reasonCode: 'turn_budget_exhausted',
+            at,
+            ...(settlingNode?.runId === runId
+              ? { sourceTaskId: command.task.id, sourceTurnId: command.turn.id }
+              : {}),
+          });
+          return { ...closure, exhausted: true };
+        }
+      }
+      statements.push({
+        sql: `UPDATE workflow_runs
+                 SET feedback_rounds_reserved = feedback_rounds_reserved + ?,
+                     workflow_turns_reserved = workflow_turns_reserved + ?,
+                     updated_at = ?
+               WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                 AND feedback_rounds_reserved + ? <= max_feedback_rounds
+                 AND workflow_turns_reserved + ? <= max_workflow_turns`,
+        params: [
+          feedbackRounds,
+          workflowTurns,
+          at,
+          this.workspaceId,
+          runId,
+          feedbackRounds,
+          workflowTurns,
+        ],
+      });
+    }
+    return { statements, changes: [], exhausted: false };
+  }
+
+  private async lookupWorkflowNodeForTask(
+    taskId: string,
+  ): Promise<{ runId: string; nodeId: string } | undefined> {
+    const row = await this.db.get<{ run_id: string; node_id: string }>(
+      `SELECT run_id, node_id FROM workflow_nodes
+        WHERE workspace_id = ? AND task_id = ?`,
+      [this.workspaceId, taskId],
+    );
+    if (!row || typeof row.run_id !== 'string' || typeof row.node_id !== 'string') {
+      return undefined;
+    }
+    return { runId: row.run_id, nodeId: row.node_id };
+  }
+
+  private async reapWorkflowTimeouts(
+    command: Extract<RepositoryCommand, { kind: 'reapWorkflowTimeouts' }>,
+  ): Promise<RepositoryCommandResult> {
+    const expired = await this.db.all<{ run_id: string }>(
+      `SELECT run_id FROM workflow_runs
+        WHERE workspace_id = ? AND status = 'running'
+          AND deadline_at IS NOT NULL AND deadline_at <= ?
+        ORDER BY deadline_at, run_id`,
+      [this.workspaceId, command.now],
+    );
+    if (expired.length === 0) return { ok: true, changed: false };
+    const closure = await this.planWorkflowRecursiveClosure({
+      runIds: expired.map((run) => run.run_id),
+      reasonCode: 'run_timeout',
+      at: command.now,
+    });
+    const [first, ...rest] = closure.statements;
+    if (!first) return { ok: true, changed: false };
+    const changes = [
+      ...new Map(closure.changes.map((entry) => [`${entry.kind}:${entry.id}`, entry])).values(),
+    ];
+    const results = await this.writeIfFirstChanged(first, rest, changes, command.now);
+    return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
+  }
+
+  private async resolveWorkflowStartContinuation(
+    command: Extract<RepositoryCommand, { kind: 'resolveWorkflowStartContinuation' }>,
+  ): Promise<RepositoryCommandResult> {
+    const row = await this.db.get<{
+      run_id: string;
+      continuation_id: string;
+      caller_task_id: string | null;
+      caller_turn_id: string | null;
+      run_status: 'succeeded' | 'failed' | 'cancelled';
+      terminal_reason_code: string | null;
+      terminal_result_run_id: string | null;
+      terminal_result_artifact_id: string | null;
+      terminal_result_artifact_revision: number | null;
+      artifact_kind: string | null;
+      artifact_payload_json: string | null;
+      caller_lifecycle: string | null;
+    }>(
+      `SELECT continuation.run_id, continuation.continuation_id,
+              continuation.caller_task_id, continuation.caller_turn_id,
+              run.status AS run_status, run.terminal_reason_code,
+              run.terminal_result_run_id, run.terminal_result_artifact_id,
+              run.terminal_result_artifact_revision,
+              artifact.kind AS artifact_kind, artifact.payload_json AS artifact_payload_json,
+              caller.lifecycle AS caller_lifecycle
+         FROM workflow_continuations continuation
+         JOIN workflow_runs run
+           ON run.workspace_id = continuation.workspace_id
+          AND run.run_id = continuation.run_id
+         LEFT JOIN workflow_artifacts artifact
+           ON artifact.workspace_id = run.workspace_id
+          AND artifact.run_id = run.terminal_result_run_id
+          AND artifact.artifact_id = run.terminal_result_artifact_id
+          AND artifact.revision = run.terminal_result_artifact_revision
+         LEFT JOIN tasks caller
+           ON caller.workspace_id = continuation.workspace_id
+          AND caller.id = continuation.caller_task_id
+        WHERE continuation.workspace_id = ?
+          AND continuation.kind = 'start_wait'
+          AND continuation.status = 'pending'
+          AND run.status IN ('succeeded', 'failed', 'cancelled')
+        ORDER BY continuation.created_at, continuation.continuation_id
+        LIMIT 1`,
+      [this.workspaceId],
+    );
+    if (!row) return { ok: true, changed: false };
+
+    if (
+      !row.caller_task_id ||
+      !row.caller_turn_id ||
+      row.caller_lifecycle !== 'open'
+    ) {
+      const results = await this.writeIfFirstChanged(
+        {
+          sql: `UPDATE workflow_continuations
+                   SET status = 'cancelled', outcome = 'cancelled',
+                       reason_code = 'caller_unavailable', resolved_at = ?, updated_at = ?
+                 WHERE workspace_id = ? AND run_id = ? AND continuation_id = ?
+                   AND kind = 'start_wait' AND status = 'pending'`,
+          params: [
+            command.now,
+            command.now,
+            this.workspaceId,
+            row.run_id,
+            row.continuation_id,
+          ],
+        },
+        [],
+        {
+          kind: 'task',
+          id: row.caller_task_id ?? row.run_id,
+          ...(row.caller_task_id ? { taskId: row.caller_task_id } : {}),
+          change: 'effect',
+        },
+        command.now,
+      );
+      return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
+    }
+
+    const resumeTurnId = deriveWorkflowStartResumeTurnId(row.run_id, row.caller_turn_id);
+    const resumeMessageId = deriveWorkflowStartResumeMessageId(row.run_id, row.caller_turn_id);
+    const completion: Record<string, unknown> = {
+      runRef: row.run_id,
+      status: row.run_status,
+    };
+    if (row.terminal_reason_code && /^[a-z0-9_]{1,64}$/.test(row.terminal_reason_code)) {
+      completion.reason = row.terminal_reason_code;
+    }
+    if (row.artifact_kind === 'next_result' && row.artifact_payload_json) {
+      try {
+        const payload = JSON.parse(row.artifact_payload_json) as Record<string, unknown>;
+        if (payload.kind === 'next_result' && typeof payload.result === 'string') {
+          completion.result = payload.result;
+        }
+      } catch {
+        // The terminal status and reason remain sufficient when an artifact is corrupt.
+      }
+    }
+    const content = [
+      '[workflow-run-complete]',
+      'The workflow started in the prior turn is now terminal. Continue the caller task from this result:',
+      JSON.stringify(completion),
+    ].join('\n');
+    const sequence = (await this.getMaxTurnSequence(row.caller_task_id)) + 1;
+    const turn: TaskTurn = {
+      id: resumeTurnId,
+      taskId: row.caller_task_id,
+      sequence,
+      trigger: 'engine',
+      status: 'queued',
+      workflowResume: {
+        kind: 'start_workflow',
+        runId: row.run_id,
+        continuationId: row.continuation_id,
+      },
+      inputs: [{ kind: 'message', messageId: resumeMessageId }],
+      createdAt: command.now,
+    };
+    const message: TaskMessage = {
+      id: resumeMessageId,
+      taskId: row.caller_task_id,
+      role: 'system',
+      content,
+      state: 'assigned',
+      turnId: resumeTurnId,
+      createdAt: command.now,
+    };
+    const terminalResultValid =
+      row.terminal_result_run_id !== null &&
+      row.terminal_result_artifact_id !== null &&
+      Number.isInteger(row.terminal_result_artifact_revision) &&
+      Number(row.terminal_result_artifact_revision) > 0;
+    const results = await this.writeIfFirstChanged(
+      {
+        sql: `UPDATE workflow_continuations
+                 SET status = 'resolved', outcome = ?, reason_code = ?,
+                     result_artifact_run_id = ?, result_artifact_id = ?,
+                     result_artifact_revision = ?, producing_turn_id = ?,
+                     resolved_at = ?, updated_at = ?,
+                     payload_json = json_set(
+                       COALESCE(payload_json, '{}'),
+                       '$.completion', json(?), '$.resumeTurnId', ?, '$.resumeMessageId', ?
+                     )
+               WHERE workspace_id = ? AND run_id = ? AND continuation_id = ?
+                 AND kind = 'start_wait' AND status = 'pending'
+                 AND EXISTS (
+                   SELECT 1 FROM workflow_runs run
+                    WHERE run.workspace_id = workflow_continuations.workspace_id
+                      AND run.run_id = workflow_continuations.run_id
+                      AND run.status = ?
+                 )`,
+        params: [
+          row.run_status,
+          row.terminal_reason_code,
+          terminalResultValid ? row.terminal_result_run_id : null,
+          terminalResultValid ? row.terminal_result_artifact_id : null,
+          terminalResultValid ? row.terminal_result_artifact_revision : null,
+          resumeTurnId,
+          command.now,
+          command.now,
+          JSON.stringify(completion),
+          resumeTurnId,
+          resumeMessageId,
+          this.workspaceId,
+          row.run_id,
+          row.continuation_id,
+          row.run_status,
+        ],
+      },
+      [
+        turnStatement(this.workspaceId, turn, false),
+        messageStatement(this.workspaceId, message, false),
+        turnInputStatement(this.workspaceId, turn.id, 0, turn.inputs[0]!),
+      ],
+      [
+        { kind: 'turn', id: turn.id, taskId: turn.taskId, change: 'insert' },
+        { kind: 'message', id: message.id, taskId: message.taskId, change: 'complete' },
+        { kind: 'task', id: row.caller_task_id, change: 'effect' },
+      ],
+      command.now,
+    );
+    const changed = (results[0]?.changes ?? 0) > 0;
+    return {
+      ok: true,
+      changed,
+      ...(changed ? { turnId: resumeTurnId, messageId: resumeMessageId } : {}),
+    };
+  }
+
+  private async recoverWorkflowActivation(
+    command: Extract<RepositoryCommand, { kind: 'recoverWorkflowActivation' }>,
+  ): Promise<RepositoryCommandResult> {
+    const operationId = command.recoveryOperationId.trim();
+    const instruction = command.instruction.trim();
+    if (
+      !operationId || operationId.length > 256 || /[\u0000-\u001f\u007f]/.test(operationId)
+      || !command.fingerprint || command.fingerprint.length > 4096
+      || !instruction || Buffer.byteLength(instruction, 'utf8') > 4096
+    ) {
+      return { ok: true, changed: false, reason: 'invalid workflow recovery request' };
+    }
+    const oldTurn = await this.getTurn(command.failedTurnId);
+    if (!oldTurn) return { ok: true, changed: false, reason: 'workflow activation is no longer recoverable' };
+    const sequence = (await this.getMaxTurnSequence(oldTurn.taskId)) + 1;
+    const turnId = stableId(
+      'wftn',
+      `${command.runId}\0activation_recovery\0${command.activationId}\0${operationId}`,
+    );
+    const ledgerKey = `${turnId}:workflow-recovery:${operationId}`;
+    const turn: TaskTurn = {
+      id: turnId,
+      taskId: oldTurn.taskId,
+      sequence,
+      status: 'queued',
+      trigger: 'retry',
+      retryOf: oldTurn.id,
+      inputs: [
+        ...oldTurn.inputs,
+        { kind: 'recovery', interruptedTurnId: oldTurn.id, instruction },
+      ],
+      createdAt: command.createdAt,
+    };
+    const result = { ok: true, data: { runId: command.runId, activationId: command.activationId, turnId } };
+    const claim: SqlStatement = {
+      sql: `INSERT INTO operations (workspace_id, ledger_key, fingerprint, result_json, created_at)
+            SELECT ?, ?, ?, ?, ?
+              FROM workflow_activations activation
+              JOIN workflow_runs run
+                ON run.workspace_id = activation.workspace_id AND run.run_id = activation.run_id
+              JOIN workflow_nodes node
+                ON node.workspace_id = activation.workspace_id
+               AND node.run_id = activation.run_id AND node.node_id = activation.node_id
+              JOIN turns source_turn
+                ON source_turn.workspace_id = activation.workspace_id
+               AND source_turn.id = activation.execution_turn_id
+               AND source_turn.task_id = node.task_id
+             WHERE activation.workspace_id = ? AND activation.run_id = ?
+               AND activation.activation_id = ? AND activation.execution_turn_id = ?
+               AND activation.status = ? AND source_turn.status = ?
+               AND run.status = 'running'
+               AND (run.deadline_at IS NULL OR run.deadline_at > ?)
+                AND (SELECT COUNT(*) FROM turns task_turn
+                       WHERE task_turn.workspace_id = source_turn.workspace_id
+                         AND task_turn.task_id = source_turn.task_id) < run.max_turns_per_task
+                AND run.workflow_turns_reserved < run.max_workflow_turns
+               AND NOT EXISTS (
+                 SELECT 1 FROM turns competing
+                  WHERE competing.workspace_id = source_turn.workspace_id
+                    AND competing.task_id = source_turn.task_id
+                    AND competing.status IN ('queued', 'running', 'waiting_user')
+               )
+            ON CONFLICT(workspace_id, ledger_key) DO NOTHING`,
+      params: [
+        this.workspaceId,
+        ledgerKey,
+        command.fingerprint,
+        encodePayload({ result }),
+        command.createdAt,
+        this.workspaceId,
+        command.runId,
+        command.activationId,
+        command.failedTurnId,
+        command.expectedActivationStatus,
+        command.expectedActivationStatus,
+        command.createdAt,
+      ],
+    };
+    let results: readonly import('./sqlite/rpc').RunResult[];
+    try {
+      results = await this.writeIfFirstChanged(
+        claim,
+        [
+          {
+            sql: `UPDATE workflow_runs
+                     SET workflow_turns_reserved = workflow_turns_reserved + 1,
+                         updated_at = ?
+                   WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                     AND workflow_turns_reserved < max_workflow_turns`,
+            params: [command.createdAt, this.workspaceId, command.runId],
+          },
+          turnStatement(this.workspaceId, turn, false),
+          ...turn.inputs.map((input, ordering) =>
+            turnInputStatement(this.workspaceId, turn.id, ordering, input)),
+          {
+            sql: `UPDATE workflow_activations
+                     SET status = 'queued', execution_turn_id = ?, updated_at = ?
+                   WHERE workspace_id = ? AND run_id = ? AND activation_id = ?
+                     AND execution_turn_id = ? AND status = ?`,
+            params: [
+              turn.id,
+              command.createdAt,
+              this.workspaceId,
+              command.runId,
+              command.activationId,
+              command.failedTurnId,
+              command.expectedActivationStatus,
+            ],
+          },
+        ],
+        [
+          { kind: 'operation', id: ledgerKey, change: 'insert' },
+          { kind: 'turn', id: turn.id, taskId: turn.taskId, change: 'insert' },
+        ],
+        command.createdAt,
+      );
+    } catch (error) {
+      const winner = await this.db.get<{ status: string; execution_turn_id: string }>(
+        `SELECT status, execution_turn_id FROM workflow_activations
+          WHERE workspace_id = ? AND run_id = ? AND activation_id = ?`,
+        [this.workspaceId, command.runId, command.activationId],
+      );
+      if (
+        winner?.status === 'queued'
+        && winner.execution_turn_id !== command.failedTurnId
+      ) {
+        return { ok: true, changed: false, reason: 'workflow activation is no longer recoverable' };
+      }
+      throw error;
+    }
+    const inserted = (results[0]?.changes ?? 0) > 0;
+    const row = await this.db.get<OperationRow>(
+      `SELECT ledger_key, fingerprint, result_json FROM operations
+        WHERE workspace_id = ? AND ledger_key = ?`,
+      [this.workspaceId, ledgerKey],
+    );
+    if (!row) {
+      return { ok: true, changed: false, reason: 'workflow activation is no longer recoverable' };
+    }
+    const operation = decodeOperation(row);
+    if (operation.fingerprint !== command.fingerprint) {
+      return {
+        ok: true,
+        changed: false,
+        conflict: true,
+        reason: 'operation fingerprint conflict',
+        operation,
+      };
+    }
+    return { ok: true, changed: inserted, operation };
+  }
+
+  private async planWorkflowClosureFromTasks(input: {
+    taskIds: readonly string[];
+    reasonCode: WorkflowFailReasonCode;
+    at: string;
+  }): Promise<{ statements: SqlStatement[]; changes: ChangeRecord[] }> {
+    if (input.taskIds.length === 0) {
+      return { statements: [], changes: [] };
+    }
+    const taskPlaceholders = input.taskIds.map(() => '?').join(',');
+    const rows = await this.db.all<{ run_id: string }>(
+      `SELECT DISTINCT node.run_id
+         FROM workflow_nodes node
+         JOIN workflow_runs run
+           ON run.workspace_id = node.workspace_id AND run.run_id = node.run_id
+        WHERE node.workspace_id = ? AND node.task_id IN (${taskPlaceholders})
+          AND run.status = 'running'`,
+      [this.workspaceId, ...input.taskIds],
+    );
+    return this.planWorkflowRecursiveClosure({
+      runIds: rows.map((row) => row.run_id),
+      reasonCode: input.reasonCode,
+      at: input.at,
+    });
+  }
+
+  private async planWorkflowTaskLifecycleClosure(input: {
+    runIds: readonly string[];
+    lifecycle: 'succeeded' | 'failed' | 'cancelled';
+    at: string;
+    reasonCode?: WorkflowFailReasonCode;
+  }): Promise<{ statements: SqlStatement[]; changes: ChangeRecord[] }> {
+    const runIds = [...new Set(input.runIds)].filter((runId) => runId.length > 0).sort();
+    if (runIds.length === 0) return { statements: [], changes: [] };
+    const runPlaceholders = runIds.map(() => '?').join(',');
+    const rows = await this.db.all<{ task_id: string }>(
+      `SELECT DISTINCT task.id AS task_id
+         FROM tasks task
+         JOIN workflow_nodes node
+           ON node.workspace_id = task.workspace_id AND node.task_id = task.id
+        WHERE task.workspace_id = ? AND node.run_id IN (${runPlaceholders})
+          AND task.lifecycle = 'open'`,
+      [this.workspaceId, ...runIds],
+    );
+    if (rows.length === 0) return { statements: [], changes: [] };
+
+    const terminalPath = input.lifecycle === 'failed' ? '$.error' : '$.reason';
+    const reasonMutation = input.lifecycle === 'succeeded'
+      ? ''
+      : `, '${terminalPath}', ?`;
+    const reasonParams = input.lifecycle === 'succeeded'
+      ? []
+      : [input.reasonCode ?? input.lifecycle];
+    return {
+      statements: [{
+        sql: `UPDATE tasks
+                 SET lifecycle = ?, updated_at = ?, revision = revision + 1,
+                     payload_json = json_set(
+                       json_remove(
+                         payload_json,
+                         '$.attention', '$.completionCandidate', '$.outcomeProposal',
+                         '$.error', '$.reason'
+                       ),
+                       '$.finishedAt', ?,
+                        '$.lifecycleAuthority', json_object(
+                          'kind', 'workflow',
+                          'runId', (
+                            SELECT node.run_id
+                              FROM workflow_nodes node
+                             WHERE node.workspace_id = tasks.workspace_id
+                               AND node.task_id = tasks.id
+                               AND node.run_id IN (${runPlaceholders})
+                             LIMIT 1
+                          )
+                        )${reasonMutation}
+                     )
+               WHERE workspace_id = ? AND lifecycle = 'open'
+                 AND id IN (
+                   SELECT task_id FROM workflow_nodes
+                    WHERE workspace_id = ? AND run_id IN (${runPlaceholders})
+                      AND task_id IS NOT NULL
+                 )`,
+        params: [
+          input.lifecycle,
+          input.at,
+          input.at,
+          ...runIds,
+          ...reasonParams,
+          this.workspaceId,
+          this.workspaceId,
+          ...runIds,
+        ],
+      }],
+      changes: rows.map((row) => ({
+        kind: 'task' as const,
+        id: row.task_id,
+        change: 'effect',
+      })),
+    };
+  }
+
+  /**
+   * M018 §20.11: one transaction plan closes the complete caller/child run component,
+   * its waits and activations, and every continuation boundary exactly once.
+   */
+  private async planWorkflowFailClosure(input: {
+    runId: string;
+    reasonCode: WorkflowFailReasonCode;
+    reasonText?: string;
+    at: string;
+    sourceTaskId?: string;
+    sourceTurnId?: string;
+  }): Promise<{ statements: SqlStatement[]; changes: ChangeRecord[] }> {
+    return this.planWorkflowRecursiveClosure({
+      runIds: [input.runId],
+      reasonCode: input.reasonCode,
+      reasonText: input.reasonText,
+      at: input.at,
+      sourceTaskId: input.sourceTaskId,
+      sourceTurnId: input.sourceTurnId,
+    });
+  }
+
+  private async planWorkflowRecursiveClosure(input: {
+    runIds: readonly string[];
+    reasonCode: WorkflowFailReasonCode;
+    reasonText?: string;
+    at: string;
+    sourceTaskId?: string;
+    sourceTurnId?: string;
+  }): Promise<{ statements: SqlStatement[]; changes: ChangeRecord[] }> {
+    const empty = { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] };
+    const seedRunIds = [...new Set(input.runIds)].filter((runId) => runId.length > 0).sort();
+    if (seedRunIds.length === 0) return empty;
+    const seedPlaceholders = seedRunIds.map(() => '?').join(',');
+    const runs = await this.db.all<{
+      run_id: string;
+      parent_run_id: string | null;
+      owner_root_task_id: string | null;
+      caller_task_id: string | null;
+    }>(
+      `WITH RECURSIVE
+         ancestors(run_id) AS (
+           SELECT run_id
+             FROM workflow_runs
+            WHERE workspace_id = ? AND run_id IN (${seedPlaceholders}) AND status = 'running'
+           UNION
+           SELECT parent.run_id
+             FROM ancestors current
+             JOIN workflow_runs child
+               ON child.workspace_id = ? AND child.run_id = current.run_id
+             JOIN workflow_runs parent
+               ON parent.workspace_id = child.workspace_id AND parent.run_id = child.parent_run_id
+            WHERE parent.status = 'running'
+         ),
+         related(run_id) AS (
+           SELECT run_id FROM ancestors
+           UNION
+           SELECT child.run_id
+             FROM related current
+             JOIN workflow_runs child
+               ON child.workspace_id = ? AND child.parent_run_id = current.run_id
+            WHERE child.status = 'running'
+         )
+       SELECT run.run_id, run.parent_run_id, run.owner_root_task_id, run.caller_task_id
+         FROM workflow_runs run
+         JOIN related ON related.run_id = run.run_id
+        WHERE run.workspace_id = ? AND run.status = 'running'
+        ORDER BY run.created_at, run.run_id`,
+      [this.workspaceId, ...seedRunIds, this.workspaceId, this.workspaceId, this.workspaceId],
+    );
+    if (runs.length === 0) return empty;
+
+    const terminalStatus = workflowRunTerminalStatusForReason(input.reasonCode);
+    const attentionCode = workflowRunAttentionCode(terminalStatus);
+    const runIds = runs.map((run) => run.run_id);
+    const runIdSet = new Set(runIds);
+    const runPlaceholders = runIds.map(() => '?').join(',');
+    const statements: SqlStatement[] = [];
+    const changes: ChangeRecord[] = [];
+
+    for (const run of runs) {
+      const fenceId = deriveRunClosureFenceId(run.run_id, terminalStatus);
+      statements.push({
+        sql: `INSERT INTO workflow_routed_messages (
+                workspace_id, run_id, message_id, source_node_id, destination_node_id,
+                kind, body_json, created_at
+              ) VALUES (?,?,?,?,?,?,?,?)
+              ON CONFLICT(workspace_id, run_id, message_id) DO NOTHING`,
+        params: [
+          this.workspaceId,
+          run.run_id,
+          fenceId,
+          'engine',
+          'engine',
+          'run_closure',
+          encodePayload({
+            kind: 'run_closure',
+            schema: 1,
+            reasonCode: input.reasonCode,
+            terminalStatus,
+          }),
+          input.at,
+        ],
+      });
+    }
+
+    statements.push(
+      {
+        sql: `UPDATE workflow_dependency_gates SET status = ?
+               WHERE workspace_id = ? AND run_id IN (${runPlaceholders})
+                 AND status IN ('open', 'satisfied')`,
+        params: [terminalStatus, this.workspaceId, ...runIds],
+      },
+      {
+        sql: `UPDATE workflow_feedback_rounds SET status = ?, updated_at = ?
+               WHERE workspace_id = ? AND run_id IN (${runPlaceholders})
+                 AND status IN ('open', 'satisfied')`,
+        params: [terminalStatus, input.at, this.workspaceId, ...runIds],
+      },
+      {
+        sql: `UPDATE workflow_activations SET status = ?, updated_at = ?
+               WHERE workspace_id = ? AND run_id IN (${runPlaceholders})
+                 AND status IN ('queued', 'running', 'failed', 'interrupted')`,
+        params: [terminalStatus, input.at, this.workspaceId, ...runIds],
+      },
+      {
+        sql: `UPDATE workflow_continuations
+                 SET status = ?, outcome = ?, reason_code = ?,
+                     result_artifact_run_id = NULL, result_artifact_id = NULL,
+                     result_artifact_revision = NULL, producing_turn_id = NULL,
+                     resolved_at = ?, updated_at = ?,
+                     payload_json = json_set(
+                       COALESCE(payload_json, '{}'),
+                       '$.failedAt', ?, '$.reasonCode', ?, '$.terminalStatus', ?
+                     )
+               WHERE workspace_id = ? AND status IN ('pending', 'resolved')
+                 AND (child_run_id IN (${runPlaceholders}) OR caller_run_id IN (${runPlaceholders}))`,
+        params: [
+          terminalStatus,
+          terminalStatus,
+          input.reasonCode,
+          input.at,
+          input.at,
+          input.at,
+          input.reasonCode,
+          terminalStatus,
+          this.workspaceId,
+          ...runIds,
+          ...runIds,
+        ],
+      },
+      {
+        sql: `UPDATE workflow_return_gates
+                 SET status = ?, result_run_id = NULL, result_artifact_id = NULL,
+                     result_artifact_revision = NULL, updated_at = ?
+               WHERE workspace_id = ? AND status IN ('open', 'satisfied')
+                 AND (child_run_id IN (${runPlaceholders}) OR caller_run_id IN (${runPlaceholders}))`,
+        params: [terminalStatus, input.at, this.workspaceId, ...runIds, ...runIds],
+      },
+    );
+
+    for (const run of runs) {
+      statements.push({
+        sql: `UPDATE workflow_runs
+                SET status = ?, terminal_reason_code = ?, closure_id = ?, updated_at = ?
+              WHERE workspace_id = ? AND run_id = ? AND status = 'running'`,
+        params: [
+          terminalStatus,
+          input.reasonCode,
+          deriveRunClosureFenceId(run.run_id, terminalStatus),
+          input.at,
+          this.workspaceId,
+          run.run_id,
+        ],
+      });
+    }
+
+    const taskClosure = await this.planWorkflowTaskLifecycleClosure({
+      runIds,
+      lifecycle: terminalStatus,
+      at: input.at,
+      reasonCode: input.reasonCode,
+    });
+    statements.push(...taskClosure.statements);
+    changes.push(...taskClosure.changes);
+
+    const turns = await this.db.all<{ id: string; task_id: string; status: string }>(
+      `SELECT turn.id, turn.task_id, turn.status
+         FROM turns turn
+         JOIN workflow_nodes node
+           ON node.workspace_id = turn.workspace_id AND node.task_id = turn.task_id
+        WHERE turn.workspace_id = ? AND node.run_id IN (${runPlaceholders})
+          AND turn.status IN ('queued', 'running', 'waiting_user')`,
+      [this.workspaceId, ...runIds],
+    );
+    const closureOpId = deriveRunClosureFenceId(runIds[0]!, terminalStatus);
+    for (const turn of turns) {
+      if (input.sourceTurnId && turn.id === input.sourceTurnId) continue;
+      if (turn.status === 'queued') {
+        statements.push({
+          sql: `UPDATE turns SET status = 'cancelled', settled_at = ?
+                 WHERE workspace_id = ? AND id = ? AND status = 'queued'`,
+          params: [input.at, this.workspaceId, turn.id],
+        });
+        changes.push({ kind: 'turn', id: turn.id, taskId: turn.task_id, change: 'effect' });
+      } else {
+        statements.push(cancelRequestStatement(this.workspaceId, {
+          kind: 'putCancelRequest',
+          workspaceId: this.workspaceId,
+          turnId: turn.id,
+          request: {
+            kind: 'interrupt',
+            by: 'workflow_fail_closure',
+            opId: closureOpId,
+            at: input.at,
+            reason: input.reasonCode,
+          },
+        }));
+        changes.push({ kind: 'cancel_request', id: turn.id, change: 'put' });
+      }
+    }
+
+    const outerRun = runs.find((run) => !run.parent_run_id || !runIdSet.has(run.parent_run_id)) ?? runs[0]!;
+    let attentionTaskId = outerRun.owner_root_task_id ?? outerRun.caller_task_id ?? undefined;
+    if (!attentionTaskId) {
+      const node = await this.db.get<{ task_id: string }>(
+        `SELECT task_id FROM workflow_nodes
+          WHERE workspace_id = ? AND run_id = ? AND task_id IS NOT NULL
+          ORDER BY node_id LIMIT 1`,
+        [this.workspaceId, outerRun.run_id],
+      );
+      attentionTaskId = node?.task_id ?? input.sourceTaskId;
+    }
+    if (attentionTaskId) {
+      const attentionMessage = (
+        input.reasonText ? `${input.reasonCode}: ${input.reasonText}` : input.reasonCode
+      ).slice(0, 512);
+      statements.push({
+        sql: `UPDATE tasks
+                 SET payload_json = json_set(payload_json, '$.attention', json(?)),
+                     updated_at = ?, revision = revision + 1
+               WHERE workspace_id = ? AND id = ? AND lifecycle = 'open'`,
+        params: [
+          JSON.stringify({ code: attentionCode, message: attentionMessage, at: input.at }),
+          input.at,
+          this.workspaceId,
+          attentionTaskId,
+        ],
+      });
+      changes.push({ kind: 'task', id: attentionTaskId, change: 'effect' });
+    }
+
+    return { statements, changes };
+  }
+
 
   private async applyRetention(
     command:
@@ -3185,20 +10300,218 @@ export class SqliteTaskRepository implements TaskRepository {
           params: [this.workspaceId, task.id],
         },
         ...drop.map((turnId) => ({
-          sql: 'DELETE FROM operations WHERE workspace_id = ? AND ledger_key GLOB ?',
-          params: [this.workspaceId, `${escapeGlob(turnId)}:*`],
+          sql: `DELETE FROM operations
+                 WHERE workspace_id = ? AND ledger_key GLOB ?
+                   AND NOT EXISTS (
+                     SELECT 1 FROM turns
+                      WHERE workspace_id = operations.workspace_id AND id = ?
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM workflow_artifact_sources source
+                      WHERE source.workspace_id = operations.workspace_id
+                        AND source.engine_start_operation_key = operations.ledger_key
+                   )`,
+          params: [this.workspaceId, `${escapeGlob(turnId)}:*`, turnId],
         })),
       ];
       const results = await this.writeIfFirstChanged(
         {
-          sql: `DELETE FROM turns
+          sql: `WITH retention_scope(workspace_id) AS (VALUES (?)),
+                     prunable_runs(run_id) AS (
+                       SELECT run.run_id
+                         FROM retention_scope scope
+                         JOIN workflow_runs run
+                           ON run.workspace_id = scope.workspace_id
+                        WHERE run.status IN ('succeeded', 'failed', 'cancelled')
+                          AND NOT EXISTS (
+                            SELECT 1 FROM workflow_runs child
+                             WHERE child.workspace_id = run.workspace_id
+                               AND child.parent_run_id = run.run_id
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1
+                              FROM workflow_nodes node
+                              JOIN tasks task
+                                ON task.workspace_id = node.workspace_id
+                               AND task.id = node.task_id
+                             WHERE node.workspace_id = run.workspace_id
+                               AND node.run_id = run.run_id
+                               AND task.lifecycle NOT IN ('succeeded', 'failed', 'cancelled', 'skipped')
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1 FROM workflow_dependency_gates gate_row
+                             WHERE gate_row.workspace_id = run.workspace_id
+                               AND gate_row.run_id = run.run_id
+                               AND gate_row.status IN ('open', 'satisfied')
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1 FROM workflow_feedback_rounds round_row
+                             WHERE round_row.workspace_id = run.workspace_id
+                               AND round_row.run_id = run.run_id
+                               AND round_row.status IN ('open', 'satisfied')
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1 FROM workflow_activations activation
+                             WHERE activation.workspace_id = run.workspace_id
+                               AND activation.run_id = run.run_id
+                               AND activation.status IN ('queued', 'running')
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1 FROM workflow_continuations continuation
+                             WHERE continuation.workspace_id = run.workspace_id
+                               AND (continuation.run_id = run.run_id OR continuation.child_run_id = run.run_id)
+                               AND continuation.status IN ('pending', 'resolved')
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1 FROM workflow_return_gates return_gate
+                             WHERE return_gate.workspace_id = run.workspace_id
+                               AND (return_gate.continuation_run_id = run.run_id
+                                 OR return_gate.child_run_id = run.run_id)
+                               AND return_gate.status IN ('open', 'satisfied')
+                          )
+                     ),
+                     pinned_turns(turn_id) AS (
+                       SELECT candidate.id
+                         FROM retention_scope scope
+                         JOIN workflow_nodes node
+                           ON node.workspace_id = scope.workspace_id
+                         JOIN workflow_runs run
+                           ON run.workspace_id = node.workspace_id
+                          AND run.run_id = node.run_id
+                         JOIN turns candidate
+                           ON candidate.workspace_id = node.workspace_id
+                          AND candidate.task_id = node.task_id
+                        WHERE run.status = 'running'
+                       UNION ALL
+                       SELECT run.caller_turn_id
+                         FROM retention_scope scope
+                         JOIN workflow_runs run
+                           ON run.workspace_id = scope.workspace_id
+                        WHERE run.status = 'running'
+                       UNION ALL
+                       SELECT claim.caller_turn_id
+                         FROM retention_scope scope
+                         JOIN workflow_start_claims claim
+                           ON claim.workspace_id = scope.workspace_id
+                         JOIN workflow_runs run
+                           ON run.workspace_id = claim.workspace_id
+                          AND run.run_id = claim.run_id
+                        WHERE run.status = 'running'
+                       UNION ALL
+                       SELECT activation.primary_turn_id
+                         FROM retention_scope scope
+                         JOIN workflow_activations activation
+                           ON activation.workspace_id = scope.workspace_id
+                        WHERE activation.status IN ('queued', 'running', 'failed', 'interrupted')
+                           AND activation.run_id NOT IN (SELECT run_id FROM prunable_runs)
+                       UNION ALL
+                       SELECT activation.execution_turn_id
+                         FROM retention_scope scope
+                         JOIN workflow_activations activation
+                           ON activation.workspace_id = scope.workspace_id
+                        WHERE activation.status IN ('queued', 'running', 'failed', 'interrupted')
+                           AND activation.run_id NOT IN (SELECT run_id FROM prunable_runs)
+                       UNION ALL
+                       SELECT gate.reserved_turn_id
+                         FROM retention_scope scope
+                         JOIN workflow_dependency_gates gate
+                           ON gate.workspace_id = scope.workspace_id
+                        WHERE gate.status IN ('open', 'satisfied')
+                       UNION ALL
+                       SELECT round_row.requester_turn_id
+                         FROM retention_scope scope
+                         JOIN workflow_feedback_rounds round_row
+                           ON round_row.workspace_id = scope.workspace_id
+                        WHERE round_row.status IN ('open', 'satisfied')
+                       UNION ALL
+                       SELECT round_row.resume_turn_id
+                         FROM retention_scope scope
+                         JOIN workflow_feedback_rounds round_row
+                           ON round_row.workspace_id = scope.workspace_id
+                        WHERE round_row.status IN ('open', 'satisfied')
+                       UNION ALL
+                       SELECT target.request_turn_id
+                         FROM retention_scope scope
+                         JOIN workflow_feedback_rounds round_row
+                           ON round_row.workspace_id = scope.workspace_id
+                         JOIN workflow_feedback_targets target
+                           ON target.workspace_id = round_row.workspace_id
+                          AND target.run_id = round_row.run_id
+                          AND target.round_id = round_row.round_id
+                        WHERE round_row.status IN ('open', 'satisfied')
+                       UNION ALL
+                       SELECT target.response_turn_id
+                         FROM retention_scope scope
+                         JOIN workflow_feedback_rounds round_row
+                           ON round_row.workspace_id = scope.workspace_id
+                         JOIN workflow_feedback_targets target
+                           ON target.workspace_id = round_row.workspace_id
+                          AND target.run_id = round_row.run_id
+                          AND target.round_id = round_row.round_id
+                        WHERE round_row.status IN ('open', 'satisfied')
+                       UNION ALL
+                       SELECT routed.source_turn_id
+                         FROM retention_scope scope
+                         JOIN workflow_routed_messages routed
+                           ON routed.workspace_id = scope.workspace_id
+                         JOIN workflow_runs run
+                           ON run.workspace_id = routed.workspace_id
+                          AND run.run_id = routed.run_id
+                        WHERE run.status = 'running'
+                       UNION ALL
+                       SELECT continuation.caller_turn_id
+                         FROM retention_scope scope
+                         JOIN workflow_continuations continuation
+                           ON continuation.workspace_id = scope.workspace_id
+                        WHERE continuation.status IN ('pending', 'resolved')
+                       UNION ALL
+                       SELECT continuation.producing_turn_id
+                         FROM retention_scope scope
+                         JOIN workflow_continuations continuation
+                           ON continuation.workspace_id = scope.workspace_id
+                        WHERE continuation.status IN ('pending', 'resolved')
+                       UNION ALL
+                       SELECT return_gate.caller_turn_id
+                         FROM retention_scope scope
+                         JOIN workflow_return_gates return_gate
+                           ON return_gate.workspace_id = scope.workspace_id
+                        WHERE return_gate.status IN ('open', 'satisfied')
+                       UNION ALL
+                       SELECT return_gate.execution_turn_id
+                         FROM retention_scope scope
+                         JOIN workflow_return_gates return_gate
+                           ON return_gate.workspace_id = scope.workspace_id
+                        WHERE return_gate.status IN ('open', 'satisfied')
+                       UNION ALL
+                       SELECT source.producing_turn_id
+                         FROM retention_scope scope
+                         JOIN workflow_artifact_sources source
+                           ON source.workspace_id = scope.workspace_id
+                        WHERE source.run_id NOT IN (SELECT run_id FROM prunable_runs)
+                       UNION ALL
+                       SELECT source.caller_turn_id
+                         FROM retention_scope scope
+                         JOIN workflow_artifact_sources source
+                           ON source.workspace_id = scope.workspace_id
+                        WHERE source.run_id NOT IN (SELECT run_id FROM prunable_runs)
+                       UNION ALL
+                       SELECT claim.turn_id
+                         FROM retention_scope scope
+                         JOIN turn_disposition_claims claim
+                           ON claim.workspace_id = scope.workspace_id
+                        WHERE claim.status = 'staged'
+                     )
+                 DELETE FROM turns
                  WHERE workspace_id = ? AND task_id = ? AND id IN (${placeholders(drop.length)})
-                   AND EXISTS (
-                     SELECT 1 FROM tasks
-                      WHERE workspace_id = ? AND id = ?
-                        AND lifecycle IN ('succeeded', 'failed', 'cancelled', 'skipped')
-                   )`,
-          params: [this.workspaceId, task.id, ...drop, this.workspaceId, task.id],
+                   AND NOT EXISTS (
+                     SELECT 1 FROM pinned_turns WHERE turn_id = turns.id
+                   )
+                    AND EXISTS (
+                      SELECT 1 FROM tasks
+                       WHERE workspace_id = ? AND id = ?
+                         AND lifecycle IN ('succeeded', 'failed', 'cancelled', 'skipped')
+                    )`,
+          params: [this.workspaceId, this.workspaceId, task.id, ...drop, this.workspaceId, task.id],
         },
         rest,
         { kind: 'turn', id: task.id, taskId: task.id, change: 'retention' },
@@ -3408,7 +10721,11 @@ function validatePresentationRecord(doc: PresentationRecord): void {
   if (!doc.title || doc.title.length > 512 || doc.title.includes('\0')) {
     throw new Error('presentation title invalid');
   }
-  if (!doc.markdown || doc.markdown.length > 100_000 || doc.markdown.includes('\0')) {
+  if (
+    !doc.markdown ||
+    doc.markdown.length > PRESENTATION_MARKDOWN_MAX_CHARS ||
+    doc.markdown.includes('\0')
+  ) {
     throw new Error('presentation markdown invalid');
   }
   if (doc.kind !== undefined && !['plan', 'spec', 'document'].includes(doc.kind)) {
@@ -3623,6 +10940,67 @@ export function activeTurnInputMessagesSql(taskIdCount: number): string {
         ORDER BY m.created_at, m.id`;
 }
 
+function sumWorkflowRunReservations(
+  reservations: readonly WorkflowRunReservation[],
+): Map<string, number> {
+  const totals = new Map<string, number>();
+  for (const reservation of reservations) {
+    totals.set(reservation.runId, (totals.get(reservation.runId) ?? 0) + reservation.count);
+  }
+  return totals;
+}
+
+function sumWorkflowTurnReservations(
+  reservations: readonly WorkflowTurnReservation[],
+): Map<string, WorkflowTurnReservation> {
+  const totals = new Map<string, WorkflowTurnReservation>();
+  for (const reservation of reservations) {
+    const key = `${reservation.runId}\0${reservation.taskId}`;
+    const existing = totals.get(key);
+    totals.set(key, {
+      runId: reservation.runId,
+      taskId: reservation.taskId,
+      count: (existing?.count ?? 0) + reservation.count,
+    });
+  }
+  return totals;
+}
+
+function childInvocationFingerprint(input: {
+  callerScopeId: string;
+  childDefinitionId: string;
+  childDefinitionVersion: number;
+  childIdempotencyKey: string;
+  entryBindings: readonly {
+    childEntryNodeId: string;
+    inputRef: string;
+    artifactRunId: string;
+    artifactId: string;
+    artifactRevision: number;
+  }[];
+  effectivePolicy: WorkflowPolicyV1;
+}): string {
+  const entryBindings = input.entryBindings
+    .map((binding) => ({
+      childEntryNodeId: binding.childEntryNodeId,
+      inputRef: binding.inputRef,
+      artifactRunId: binding.artifactRunId,
+      artifactId: binding.artifactId,
+      artifactRevision: binding.artifactRevision,
+    }))
+    .sort((left, right) =>
+      left.childEntryNodeId.localeCompare(right.childEntryNodeId)
+      || left.inputRef.localeCompare(right.inputRef));
+  return stableId('wfif', JSON.stringify({
+    callerScopeId: input.callerScopeId,
+    childDefinitionId: input.childDefinitionId,
+    childDefinitionVersion: input.childDefinitionVersion,
+    childIdempotencyKey: input.childIdempotencyKey,
+    entryBindings,
+    effectivePolicy: input.effectivePolicy,
+  }));
+}
+
 function encodePayload(value: Record<string, unknown>): string {
   return JSON.stringify({ payloadVersion: 1, ...value });
 }
@@ -3632,12 +11010,12 @@ function taskPayload(task: MusterTask): string {
     id: _id, parentId: _parentId, role: _role, lifecycle: _lifecycle,
     releaseState: _releaseState, goal: _goal, backend: _backend, model: _model,
     revision: _revision, createdAt: _createdAt, updatedAt: _updatedAt,
-    dependencies: _dependencies,
+    prerequisites: _prerequisites,
     ...payload
   } = task;
   void _id; void _parentId; void _role; void _lifecycle; void _releaseState;
   void _goal; void _backend; void _model; void _revision; void _createdAt;
-  void _updatedAt; void _dependencies;
+  void _updatedAt; void _prerequisites;
   return encodePayload(payload);
 }
 
@@ -3645,10 +11023,12 @@ function turnPayload(turn: TaskTurn): string {
   const {
     id: _id, taskId: _taskId, sequence: _sequence, status: _status, trigger: _trigger,
     createdAt: _createdAt, startedAt: _startedAt, finishedAt: _finishedAt, inputs: _inputs,
+    workflowActivation: _workflowActivation, workflowWait: _workflowWait,
     ...payload
   } = turn;
   void _id; void _taskId; void _sequence; void _status; void _trigger;
   void _createdAt; void _startedAt; void _finishedAt; void _inputs;
+  void _workflowActivation; void _workflowWait;
   return encodePayload(payload);
 }
 
@@ -3673,6 +11053,12 @@ function toolCallPayload(tool: PersistedToolCall): string {
   return encodePayload(payload);
 }
 
+/** M018 S06: deterministic return artifact id on the caller run. */
+function stableChildReturnArtifactId(_parentRunId: string, childRunId: string): string {
+  const fence = deriveChildReturnFenceId(childRunId);
+  return fence.replace(/^wfrm_/, 'wfa_');
+}
+
 function taskStatement(workspaceId: string, task: MusterTask, upsert: boolean): SqlStatement {
   const suffix = upsert
     ? ` ON CONFLICT(workspace_id, id) DO UPDATE SET
@@ -3695,8 +11081,8 @@ function taskStatement(workspaceId: string, task: MusterTask, upsert: boolean): 
 function taskMutationStatements(workspaceId: string, task: MusterTask): SqlStatement[] {
   return [
     taskStatement(workspaceId, task, true),
-    { sql: 'DELETE FROM task_dependencies WHERE workspace_id = ? AND task_id = ?', params: [workspaceId, task.id] },
-    ...task.dependencies.map((dependency) => dependencyStatement(workspaceId, task.id, dependency)),
+    { sql: 'DELETE FROM task_prerequisites WHERE workspace_id = ? AND task_id = ?', params: [workspaceId, task.id] },
+    ...task.prerequisites.map((prerequisite) => prerequisiteStatement(workspaceId, task.id, prerequisite)),
   ];
 }
 
@@ -3706,6 +11092,28 @@ function turnMutationStatements(workspaceId: string, turn: TaskTurn): SqlStateme
     { sql: 'DELETE FROM turn_inputs WHERE workspace_id = ? AND turn_id = ?', params: [workspaceId, turn.id] },
     ...turn.inputs.map((input, ordering) => turnInputStatement(workspaceId, turn.id, ordering, input)),
   ];
+}
+
+function detachWorkflowNodeTasksStatement(
+  workspaceId: string,
+  rootTaskIds: readonly string[],
+): SqlStatement {
+  const roots = rootTaskIds.map(() => '(?)').join(', ');
+  return {
+    sql: `WITH RECURSIVE roots(id) AS (VALUES ${roots}),
+           subtree(id) AS (
+             SELECT id FROM roots
+             UNION
+             SELECT child.id
+               FROM tasks child
+               JOIN subtree parent ON child.parent_id = parent.id
+              WHERE child.workspace_id = ?
+           )
+          UPDATE workflow_nodes SET task_id = NULL
+           WHERE workspace_id = ?
+             AND task_id IN (SELECT id FROM subtree)`,
+    params: [...rootTaskIds, workspaceId, workspaceId],
+  };
 }
 
 function taskRevisionGuardStatement(
@@ -3831,13 +11239,13 @@ function guardedDispatchTaskUpdateStatement(
   };
 }
 
-function dependencyStatement(workspaceId: string, taskId: string, dependency: TaskDependency): SqlStatement {
+function prerequisiteStatement(workspaceId: string, taskId: string, prerequisite: TaskPrerequisite): SqlStatement {
   return {
-    sql: `INSERT INTO task_dependencies
-          (workspace_id, task_id, dependency_task_id, required_outcome, on_unsatisfied, required_verdict)
+    sql: `INSERT INTO task_prerequisites
+          (workspace_id, task_id, producer_task_id, required_lifecycle, on_unmet, required_verdict)
           VALUES (?,?,?,?,?,?)`,
-    params: [workspaceId, taskId, dependency.taskId, dependency.requiredOutcome, dependency.onUnsatisfied,
-      dependency.requiredVerdict ?? null],
+    params: [workspaceId, taskId, prerequisite.producerTaskId, prerequisite.requiredLifecycle, prerequisite.onUnmet,
+      prerequisite.requiredVerdict ?? null],
   };
 }
 
@@ -3899,12 +11307,20 @@ function guardedStageDispositionStatement(
     : ` AND EXISTS (
           SELECT 1 FROM tasks task
            WHERE task.workspace_id = turns.workspace_id AND task.id = turns.task_id
-             AND COALESCE(json_extract(task.payload_json, '$.runtimeEpoch'), 1) = ?
+              AND COALESCE(json_extract(task.payload_json, '$.runtimeEpoch'), 1) = ?
         )`;
+  const workflowAuthorization = command.turn.disposition && (
+    command.turn.disposition.kind === 'workflow_next' ||
+    command.turn.disposition.kind === 'workflow_prev' ||
+    command.turn.disposition.kind === 'workflow_fail'
+  )
+    ? workflowDispositionAuthorizationPredicate(command.turn.disposition)
+    : undefined;
+  const workflowPredicate = workflowAuthorization ? ` AND ${workflowAuthorization.sql}` : '';
   return {
     sql: `UPDATE turns
              SET task_id=?, sequence=?, status=?, trigger=?, created_at=?, started_at=?, settled_at=?, payload_json=?
-           WHERE workspace_id=? AND id=? AND status IN (${placeholders(command.expectedStatuses.length)})${dispositionPredicate}${epochPredicate}`,
+           WHERE workspace_id=? AND id=? AND status IN (${placeholders(command.expectedStatuses.length)})${dispositionPredicate}${epochPredicate}${workflowPredicate}`,
     params: [
       command.turn.taskId, command.turn.sequence, command.turn.status, command.turn.trigger, command.turn.createdAt,
       command.turn.startedAt ?? null, command.turn.finishedAt ?? null, turnPayload(command.turn), workspaceId, command.turnId,
@@ -3912,8 +11328,567 @@ function guardedStageDispositionStatement(
       ...(command.turn.disposition === undefined || command.expectedDisposition !== undefined ? [] : [JSON.stringify(command.turn.disposition)]),
       ...(command.expectedDisposition === undefined ? [] : [JSON.stringify(command.expectedDisposition)]),
       ...(command.expectedRuntimeEpoch === undefined ? [] : [command.expectedRuntimeEpoch]),
+      ...(workflowAuthorization?.params ?? []),
     ],
   };
+}
+
+function workflowDispositionAuthorizationPredicate(disposition: TurnDisposition): {
+  sql: string;
+  params: SqlValue[];
+} {
+  const isChildWorkflowRoute =
+    disposition.kind === 'workflow_next' && disposition.route?.kind === 'child_workflow';
+  const activationConditions = [
+    `activation.workspace_id = turns.workspace_id`,
+    `activation.execution_turn_id = turns.id`,
+    `activation.status IN ('queued', 'running')`,
+    `run.status = 'running'`,
+    `node.task_id = turns.task_id`,
+  ];
+  if (disposition.kind === 'workflow_next' && disposition.change === 'unchanged') {
+    activationConditions.push(
+      `(
+         (
+           activation.kind = 'feedback_request'
+           AND EXISTS (
+             SELECT 1 FROM workflow_feedback_targets target
+              WHERE target.workspace_id = activation.workspace_id
+                AND target.run_id = activation.run_id
+                AND target.round_id = activation.feedback_round_id
+                AND target.target_node_id = activation.feedback_target_node_id
+                AND target.request_activation_id = activation.activation_id
+                AND target.status = 'pending'
+                AND target.base_artifact_run_id IS NOT NULL
+                AND target.base_artifact_id IS NOT NULL
+                AND target.base_artifact_revision IS NOT NULL
+           )
+         )
+         OR
+         (
+           activation.kind = 'feedback_resume'
+           AND activation.inherited_feedback_round_id IS NOT NULL
+           AND activation.inherited_feedback_target_node_id IS NOT NULL
+           AND EXISTS (
+             SELECT 1
+               FROM workflow_feedback_rounds resume_round
+               JOIN workflow_feedback_targets target
+                 ON target.workspace_id = resume_round.workspace_id
+                AND target.run_id = resume_round.run_id
+                AND target.round_id = resume_round.inherited_round_id
+                AND target.target_id = resume_round.inherited_target_id
+              WHERE resume_round.workspace_id = activation.workspace_id
+                AND resume_round.run_id = activation.run_id
+                AND resume_round.round_id = activation.feedback_round_id
+                AND resume_round.resume_activation_id = activation.activation_id
+                AND target.target_node_id = activation.inherited_feedback_target_node_id
+                AND target.status = 'pending'
+                AND target.base_artifact_run_id IS NOT NULL
+                AND target.base_artifact_id IS NOT NULL
+                AND target.base_artifact_revision IS NOT NULL
+           )
+         )
+       )`,
+    );
+  }
+  if (isChildWorkflowRoute) {
+    activationConditions.push(
+      `definition_node.is_terminal = 1`,
+      `NOT EXISTS (
+         SELECT 1 FROM workflow_feedback_rounds round_row
+          WHERE round_row.workspace_id = activation.workspace_id
+            AND round_row.run_id = activation.run_id
+            AND round_row.status = 'open'
+       )`,
+      `NOT EXISTS (
+         SELECT 1 FROM workflow_continuations continuation
+          WHERE continuation.workspace_id = activation.workspace_id
+            AND continuation.run_id = activation.run_id
+            AND continuation.kind = 'child_wait'
+            AND continuation.status = 'pending'
+       )`,
+    );
+  }
+
+  const activationExists = `EXISTS (
+    SELECT 1
+      FROM workflow_activations activation
+      JOIN workflow_runs run
+        ON run.workspace_id = activation.workspace_id
+       AND run.run_id = activation.run_id
+      JOIN workflow_nodes node
+        ON node.workspace_id = activation.workspace_id
+       AND node.run_id = activation.run_id
+       AND node.node_id = activation.node_id
+      JOIN workflow_definition_nodes definition_node
+        ON definition_node.workspace_id = run.workspace_id
+       AND definition_node.definition_id = run.definition_id
+       AND definition_node.definition_version = run.definition_version
+       AND definition_node.node_id = activation.node_id
+     WHERE ${activationConditions.join('\n       AND ')}
+  )`;
+
+  if (!isChildWorkflowRoute) return { sql: activationExists, params: [] };
+
+  const route = disposition.route!;
+  const childDefinitionExists = `EXISTS (
+    SELECT 1 FROM workflow_definitions child_definition
+     WHERE child_definition.workspace_id = turns.workspace_id
+       AND child_definition.definition_id = ?
+       AND child_definition.version = ?
+       AND (
+         child_definition.scope_kind = 'workspace'
+         OR (
+           child_definition.scope_kind = 'root'
+           AND child_definition.owner_root_task_id = COALESCE((
+             SELECT caller_run.owner_root_task_id
+               FROM workflow_activations caller_activation
+               JOIN workflow_runs caller_run
+                 ON caller_run.workspace_id = caller_activation.workspace_id
+                AND caller_run.run_id = caller_activation.run_id
+              WHERE caller_activation.workspace_id = turns.workspace_id
+                AND caller_activation.execution_turn_id = turns.id
+              LIMIT 1
+           ), turns.task_id)
+         )
+       )
+  )`;
+  const exactContractCount = `(
+    SELECT COUNT(*) FROM workflow_entry_contracts child_contract
+     WHERE child_contract.workspace_id = turns.workspace_id
+       AND child_contract.definition_id = ?
+       AND child_contract.definition_version = ?
+  ) = ?`;
+  const bindingPredicates = route.entryBindings.map(() => `EXISTS (
+    SELECT 1
+      FROM workflow_entry_contracts child_contract
+      JOIN workflow_artifacts artifact
+        ON artifact.workspace_id = turns.workspace_id
+       AND artifact.artifact_id = ?
+       AND artifact.revision = ?
+       AND artifact.kind = child_contract.expected_artifact_kind
+      JOIN workflow_artifact_sources source
+        ON source.workspace_id = artifact.workspace_id
+       AND source.run_id = artifact.run_id
+       AND source.artifact_id = artifact.artifact_id
+       AND source.artifact_revision = artifact.revision
+     WHERE child_contract.workspace_id = turns.workspace_id
+       AND child_contract.definition_id = ?
+       AND child_contract.definition_version = ?
+       AND child_contract.entry_node_id = ?
+       AND child_contract.input_ref = ?
+       AND (
+         EXISTS (
+           SELECT 1 FROM workflow_activations caller_activation
+            WHERE caller_activation.workspace_id = turns.workspace_id
+              AND caller_activation.execution_turn_id = turns.id
+              AND caller_activation.run_id = artifact.run_id
+         )
+         OR (
+           source.source_kind = 'caller_turn'
+           AND source.caller_task_id = turns.task_id
+           AND source.caller_turn_id = turns.id
+         )
+         OR (
+           source.source_kind = 'workflow_node'
+           AND source.producer_task_id = turns.task_id
+         )
+       )
+  )`);
+  const childRouteParams: SqlValue[] = [
+    route.childDefinitionId,
+    route.childDefinitionVersion,
+    route.childDefinitionId,
+    route.childDefinitionVersion,
+    route.entryBindings.length,
+  ];
+  for (const binding of route.entryBindings) {
+    childRouteParams.push(
+      binding.artifactId,
+      binding.artifactRevision,
+      route.childDefinitionId,
+      route.childDefinitionVersion,
+      binding.childEntryNodeId,
+      binding.inputRef,
+    );
+  }
+
+  return {
+    sql: `EXISTS (
+    SELECT 1 FROM tasks caller
+     WHERE caller.workspace_id = turns.workspace_id
+       AND caller.id = turns.task_id
+       AND caller.role = 'coordinator'
+       AND EXISTS (
+         SELECT 1 FROM json_each(COALESCE(json_extract(caller.payload_json, '$.capabilities'), '[]')) capability
+          WHERE capability.value = 'create_child'
+       )
+       AND (
+         ${activationExists}
+         OR (
+           caller.parent_id IS NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM workflow_activations any_activation
+               WHERE any_activation.workspace_id = turns.workspace_id
+                 AND any_activation.execution_turn_id = turns.id
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM workflow_nodes caller_node
+               WHERE caller_node.workspace_id = turns.workspace_id
+                 AND caller_node.task_id = turns.task_id
+            )
+            AND NOT EXISTS (
+             SELECT 1 FROM workflow_continuations continuation
+              WHERE continuation.workspace_id = turns.workspace_id
+                AND continuation.caller_task_id = turns.task_id
+                AND continuation.status = 'pending'
+           )
+         )
+       )
+       AND ${childDefinitionExists}
+       AND ${exactContractCount}
+       ${bindingPredicates.map((predicate) => `AND ${predicate}`).join('\n       ')}
+  )`,
+    params: childRouteParams,
+  };
+}
+
+function dispositionClaimInsertStatement(
+  workspaceId: string,
+  claim: DurableDispositionClaim,
+  at = new Date().toISOString(),
+): SqlStatement {
+  return {
+    sql: `INSERT INTO turn_disposition_claims
+          (workspace_id, turn_id, task_id, runtime_epoch, op_id, family, kind,
+           fingerprint, payload_json, status, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'staged', ?, ?)`,
+    params: [
+      workspaceId,
+      claim.turnId,
+      claim.taskId,
+      claim.runtimeEpoch,
+      claim.opId,
+      claim.family,
+      claim.kind,
+      claim.fingerprint,
+      claim.payloadJson,
+      at,
+      at,
+    ],
+  };
+}
+
+function dispositionClaimSettlementStatement(
+  workspaceId: string,
+  turnId: string,
+  status: 'consumed' | 'discarded',
+  at: string,
+): SqlStatement {
+  return {
+    sql: `UPDATE turn_disposition_claims
+             SET status = ?, updated_at = ?
+           WHERE workspace_id = ? AND turn_id = ? AND status = 'staged'`,
+    params: [status, at, workspaceId, turnId],
+  };
+}
+
+function workflowActivationSettlementStatement(
+  workspaceId: string,
+  turnId: string,
+  turnStatus: TurnStatus,
+  at: string,
+): SqlStatement {
+  const status = turnStatus === 'succeeded'
+    ? 'consumed'
+    : turnStatus === 'failed' || turnStatus === 'interrupted' || turnStatus === 'cancelled'
+      ? turnStatus
+      : undefined;
+  if (!status) throw new Error('workflow activation settlement requires a terminal turn');
+  return {
+    sql: `UPDATE workflow_activations
+             SET status = ?, updated_at = ?
+           WHERE workspace_id = ? AND execution_turn_id = ?
+             AND status IN ('queued', 'running', 'failed', 'interrupted')`,
+    params: [status, at, workspaceId, turnId],
+  };
+}
+
+function workflowActivationRunningStatement(
+  workspaceId: string,
+  turnId: string,
+  at: string,
+): SqlStatement {
+  return {
+    sql: `UPDATE workflow_activations
+             SET status = 'running', updated_at = ?
+           WHERE workspace_id = ? AND execution_turn_id = ? AND status = 'queued'`,
+    params: [at, workspaceId, turnId],
+  };
+}
+
+function workflowStartContinuationConsumptionStatement(
+  workspaceId: string,
+  turnId: string,
+  at: string,
+  continuationId?: string,
+): SqlStatement {
+  return {
+    sql: `UPDATE workflow_continuations
+             SET status = 'consumed', updated_at = ?
+           WHERE workspace_id = ? AND kind = 'start_wait' AND status = 'resolved'
+             AND producing_turn_id = ?
+             ${continuationId === undefined ? '' : 'AND continuation_id = ?'}`,
+    params: [at, workspaceId, turnId, ...(continuationId === undefined ? [] : [continuationId])],
+  };
+}
+
+function workflowActivationSourceConsumptionStatements(
+  workspaceId: string,
+  turnId: string,
+  at: string,
+): SqlStatement[] {
+  return [
+    workflowStartContinuationConsumptionStatement(workspaceId, turnId, at),
+    {
+      sql: `UPDATE workflow_feedback_rounds
+               SET status = 'consumed', updated_at = ?
+             WHERE workspace_id = ? AND status = 'satisfied'
+               AND EXISTS (
+                 SELECT 1 FROM workflow_activations activation
+                  WHERE activation.workspace_id = workflow_feedback_rounds.workspace_id
+                    AND activation.run_id = workflow_feedback_rounds.run_id
+                    AND activation.feedback_round_id = workflow_feedback_rounds.round_id
+                    AND activation.kind = 'feedback_resume'
+                    AND activation.execution_turn_id = ?
+                    AND activation.status IN ('queued', 'running')
+               )`,
+      params: [at, workspaceId, turnId],
+    },
+    {
+      sql: `UPDATE workflow_continuations
+               SET status = 'consumed', updated_at = ?
+             WHERE workspace_id = ? AND status = 'resolved'
+               AND EXISTS (
+                 SELECT 1 FROM workflow_return_gates return_gate
+                  WHERE return_gate.workspace_id = workflow_continuations.workspace_id
+                    AND return_gate.continuation_run_id = workflow_continuations.run_id
+                    AND return_gate.continuation_id = workflow_continuations.continuation_id
+                    AND return_gate.execution_turn_id = ?
+                    AND return_gate.status = 'satisfied'
+               )`,
+      params: [at, workspaceId, turnId],
+    },
+    {
+      sql: `UPDATE workflow_return_gates
+               SET status = 'consumed', updated_at = ?
+             WHERE workspace_id = ? AND execution_turn_id = ? AND status = 'satisfied'`,
+      params: [at, workspaceId, turnId],
+    },
+  ];
+}
+
+function workflowNodeArtifactSourceStatement(input: {
+  workspaceId: string;
+  runId: string;
+  artifactId: string;
+  artifactRevision: number;
+  nodeId: string;
+  taskId: string;
+  turnId: string;
+}): SqlStatement {
+  return {
+    sql: `INSERT INTO workflow_artifact_sources (
+            workspace_id, run_id, artifact_id, artifact_revision, source_kind,
+            producer_run_id, producer_node_id, producer_task_id, producing_turn_id,
+            producing_activation_id, caller_task_id, caller_turn_id,
+            engine_start_operation_key
+          )
+          SELECT ?, ?, ?, ?, 'workflow_node', ?, ?, ?, ?, activation_id,
+                 NULL, NULL, NULL
+            FROM workflow_activations
+           WHERE workspace_id = ? AND run_id = ? AND node_id = ?
+             AND execution_turn_id = ?
+          ON CONFLICT(workspace_id, run_id, artifact_id, artifact_revision) DO NOTHING`,
+    params: [
+      input.workspaceId,
+      input.runId,
+      input.artifactId,
+      input.artifactRevision,
+      input.runId,
+      input.nodeId,
+      input.taskId,
+      input.turnId,
+      input.workspaceId,
+      input.runId,
+      input.nodeId,
+      input.turnId,
+    ],
+  };
+}
+
+function workflowAggregateOverflowClosureStatements(input: {
+  workspaceId: string;
+  runId: string;
+  closureId: string;
+  at: string;
+}): SqlStatement[] {
+  const markerParams = [input.workspaceId, input.runId, input.closureId];
+  return [
+    {
+      sql: `UPDATE turns
+               SET status = 'cancelled', settled_at = ?,
+                   payload_json = json_set(payload_json, '$.error', 'aggregate_too_large')
+             WHERE workspace_id = ? AND status = 'queued'
+               AND task_id IN (
+                 SELECT task_id FROM workflow_nodes
+                  WHERE workspace_id = ? AND run_id = ? AND task_id IS NOT NULL
+               )
+               AND EXISTS (
+                 SELECT 1 FROM workflow_runs
+                  WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                    AND terminal_reason_code = 'aggregate_too_large' AND closure_id = ?
+               )`,
+      params: [
+        input.at,
+        input.workspaceId,
+        input.workspaceId,
+        input.runId,
+        ...markerParams,
+      ],
+    },
+    {
+      sql: `INSERT INTO turn_cancel_requests (
+              workspace_id, turn_id, task_id, kind, op_id, requested_by, requested_at, payload_json
+            )
+            SELECT turn.workspace_id, turn.id, turn.task_id, 'interrupt', ?, 'engine', ?,
+                   json_object('kind', 'interrupt', 'by', 'engine', 'opId', ?, 'at', ?,
+                               'reason', 'aggregate_too_large')
+              FROM turns turn
+             WHERE turn.workspace_id = ? AND turn.status IN ('running', 'waiting_user')
+               AND turn.task_id IN (
+                 SELECT task_id FROM workflow_nodes
+                  WHERE workspace_id = ? AND run_id = ? AND task_id IS NOT NULL
+               )
+               AND EXISTS (
+                 SELECT 1 FROM workflow_runs
+                  WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                    AND terminal_reason_code = 'aggregate_too_large' AND closure_id = ?
+               )
+            ON CONFLICT(workspace_id, turn_id) DO NOTHING`,
+      params: [
+        input.closureId,
+        input.at,
+        input.closureId,
+        input.at,
+        input.workspaceId,
+        input.workspaceId,
+        input.runId,
+        ...markerParams,
+      ],
+    },
+    {
+      sql: `UPDATE workflow_dependency_gates
+               SET status = 'failed'
+             WHERE workspace_id = ? AND run_id = ? AND status IN ('open', 'satisfied')
+               AND EXISTS (
+                 SELECT 1 FROM workflow_runs
+                  WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                    AND terminal_reason_code = 'aggregate_too_large' AND closure_id = ?
+               )`,
+      params: [input.workspaceId, input.runId, ...markerParams],
+    },
+    {
+      sql: `UPDATE workflow_feedback_rounds
+               SET status = 'failed', updated_at = ?
+             WHERE workspace_id = ? AND run_id = ? AND status IN ('open', 'satisfied')
+               AND EXISTS (
+                 SELECT 1 FROM workflow_runs
+                  WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                    AND terminal_reason_code = 'aggregate_too_large' AND closure_id = ?
+               )`,
+      params: [input.at, input.workspaceId, input.runId, ...markerParams],
+    },
+    {
+      sql: `UPDATE workflow_return_gates
+               SET status = 'failed', updated_at = ?
+             WHERE workspace_id = ? AND caller_run_id = ? AND status IN ('open', 'satisfied')
+               AND EXISTS (
+                 SELECT 1 FROM workflow_runs
+                  WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                    AND terminal_reason_code = 'aggregate_too_large' AND closure_id = ?
+               )`,
+      params: [input.at, input.workspaceId, input.runId, ...markerParams],
+    },
+    {
+      sql: `UPDATE workflow_continuations
+               SET status = 'failed', outcome = 'failed', reason_code = 'aggregate_too_large',
+                   resolved_at = COALESCE(resolved_at, ?), updated_at = ?
+             WHERE workspace_id = ? AND caller_run_id = ? AND status IN ('pending', 'resolved')
+               AND EXISTS (
+                 SELECT 1 FROM workflow_runs
+                  WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                    AND terminal_reason_code = 'aggregate_too_large' AND closure_id = ?
+               )`,
+      params: [input.at, input.at, input.workspaceId, input.runId, ...markerParams],
+    },
+    {
+      sql: `UPDATE workflow_activations
+               SET status = 'cancelled', updated_at = ?
+             WHERE workspace_id = ? AND run_id = ?
+               AND status IN ('queued', 'running', 'failed', 'interrupted')
+               AND EXISTS (
+                 SELECT 1 FROM workflow_runs
+                  WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                    AND terminal_reason_code = 'aggregate_too_large' AND closure_id = ?
+               )`,
+      params: [input.at, input.workspaceId, input.runId, ...markerParams],
+    },
+    {
+      sql: `UPDATE workflow_runs
+               SET status = 'failed', updated_at = ?
+             WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+               AND terminal_reason_code = 'aggregate_too_large' AND closure_id = ?`,
+      params: [input.at, input.workspaceId, input.runId, input.closureId],
+    },
+  ];
+}
+
+function sessionBindingStatements(
+  workspaceId: string,
+  task: MusterTask,
+  at: string,
+): SqlStatement[] {
+  if (!task.committedSessionId) return [];
+  const runtimeEpoch = task.runtimeEpoch ?? 1;
+  return [
+    {
+      sql: `INSERT INTO session_owners
+            (workspace_id, backend, session_id, task_id, first_bound_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(workspace_id, backend, session_id) DO NOTHING`,
+      params: [workspaceId, task.backend, task.committedSessionId, task.id, at],
+    },
+    {
+      sql: `UPDATE task_session_bindings
+               SET active = 0, cleared_at = ?
+             WHERE workspace_id = ? AND task_id = ? AND active = 1
+               AND (runtime_epoch <> ? OR backend <> ? OR session_id <> ?)`,
+      params: [at, workspaceId, task.id, runtimeEpoch, task.backend, task.committedSessionId],
+    },
+    {
+      sql: `INSERT INTO task_session_bindings
+            (workspace_id, task_id, runtime_epoch, backend, session_id, active, bound_at, cleared_at)
+            VALUES (?, ?, ?, ?, ?, 1, ?, NULL)
+            ON CONFLICT(workspace_id, task_id, runtime_epoch) DO UPDATE SET
+              active = 1,
+              bound_at = excluded.bound_at,
+              cleared_at = NULL,
+              backend = excluded.backend,
+              session_id = excluded.session_id`,
+      params: [workspaceId, task.id, runtimeEpoch, task.backend, task.committedSessionId, at],
+    },
+  ];
 }
 
 /** First statement for the compound settlement command. It writes the terminal
@@ -3990,9 +11965,55 @@ function reasoningStatement(workspaceId: string, reasoning: PersistedReasoning):
           ON CONFLICT(workspace_id, id) DO UPDATE SET task_id=excluded.task_id, turn_id=excluded.turn_id,
             ordering=excluded.ordering, content=excluded.content, created_at=excluded.created_at,
             updated_at=excluded.updated_at`,
-    params: [reasoning.id, workspaceId, reasoning.taskId, reasoning.turnId, 0, reasoning.content,
+    params: [reasoning.id, workspaceId, reasoning.taskId, reasoning.turnId, reasoning.order, reasoning.content,
       reasoning.createdAt, reasoning.updatedAt],
   };
+}
+
+function workflowResultFromSettlement(
+  command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
+  explicitResult: string | undefined,
+): string | undefined {
+  const explicit = explicitResult?.trim();
+  if (explicit) return truncateUtf8Bytes(explicit, TASK_RESULT_MAX_BYTES).text;
+
+  const finalAssistant = command.messages
+    .filter((message) =>
+      message.turnId === command.turn.id &&
+      message.role === 'assistant' &&
+      message.content.trim().length > 0,
+    )
+    .sort((a, b) =>
+      (a.order ?? Number.MIN_SAFE_INTEGER) - (b.order ?? Number.MIN_SAFE_INTEGER) ||
+      a.createdAt.localeCompare(b.createdAt) ||
+      a.id.localeCompare(b.id),
+    )
+    .at(-1)
+    ?.content.trim();
+  if (!finalAssistant) return undefined;
+  return truncateUtf8Bytes(finalAssistant, TASK_RESULT_MAX_BYTES).text;
+}
+
+function workflowArtifactResult(payloadJson: string): string | undefined {
+  try {
+    const payload = JSON.parse(payloadJson) as Record<string, unknown>;
+    return typeof payload.result === 'string' ? payload.result : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function combineWorkflowTerminalResults(
+  terminalIds: readonly string[],
+  resultByNode: ReadonlyMap<string, string>,
+): string | undefined {
+  if (terminalIds.length === 0) return undefined;
+  if (terminalIds.length === 1) return resultByNode.get(terminalIds[0]!);
+  return terminalIds
+    .map((nodeId) =>
+      `[workflow-terminal-result] node=${JSON.stringify(nodeId)}\n${resultByNode.get(nodeId) ?? ''}`,
+    )
+    .join('\n\n');
 }
 
 function workspaceStatement(command: Extract<RepositoryCommand, { kind: 'upsertWorkspace' }>): SqlStatement {
@@ -4103,7 +12124,7 @@ function cancelRequestStatement(workspaceId: string, command: Extract<Repository
           ON CONFLICT(workspace_id, turn_id) DO UPDATE SET kind=excluded.kind, op_id=excluded.op_id,
           requested_by=excluded.requested_by, requested_at=excluded.requested_at, payload_json=excluded.payload_json`,
     params: [workspaceId, request.kind, request.opId, request.by, request.at,
-      encodePayload({ sealedBy: request.sealedBy, reason: request.reason }), workspaceId, command.turnId],
+      encodePayload({ lifecycleAuthority: request.lifecycleAuthority, reason: request.reason }), workspaceId, command.turnId],
   };
 }
 
@@ -4114,6 +12135,16 @@ function sendReceiptStatement(workspaceId: string, receipt: SendReceipt): SqlSta
           VALUES (?,?,?,?,?,?,?) ON CONFLICT(workspace_id, client_request_id) DO UPDATE SET
           fingerprint=excluded.fingerprint, task_id=excluded.task_id, message_id=excluded.message_id,
           turn_id=excluded.turn_id, created_at=excluded.created_at`,
+    params: [workspaceId, receipt.clientRequestId, receipt.fingerprint, receipt.taskId, receipt.messageId,
+      receipt.turnId, receipt.createdAt],
+  };
+}
+
+function claimSendReceiptStatement(workspaceId: string, receipt: SendReceipt): SqlStatement {
+  return {
+    sql: `INSERT INTO send_receipts
+          (workspace_id, client_request_id, fingerprint, task_id, message_id, turn_id, created_at)
+          VALUES (?,?,?,?,?,?,?) ON CONFLICT(workspace_id, client_request_id) DO NOTHING`,
     params: [workspaceId, receipt.clientRequestId, receipt.fingerprint, receipt.taskId, receipt.messageId,
       receipt.turnId, receipt.createdAt],
   };
@@ -4343,13 +12374,60 @@ function claimTurnStatement(
                                 AND COALESCE(json_extract(earlier.payload_json, '$.holdAutoPromote'), 0) <> 1
                                 AND (earlier.sequence < turns.sequence OR (earlier.sequence = turns.sequence AND
                                      (earlier.created_at < turns.created_at OR (earlier.created_at = turns.created_at AND earlier.id < turns.id)))))
-             AND NOT EXISTS (SELECT 1 FROM task_dependencies dep
-                              JOIN tasks producer ON producer.workspace_id = dep.workspace_id AND producer.id = dep.dependency_task_id
-                              WHERE dep.workspace_id = turns.workspace_id AND dep.task_id = turns.task_id
-                                AND NOT (((dep.required_outcome = 'succeeded' AND producer.lifecycle = 'succeeded') OR
-                                  (dep.required_outcome = 'settled' AND producer.lifecycle IN ('succeeded','failed','cancelled','skipped')))
-                                  AND (dep.required_verdict IS NULL OR json_extract(producer.payload_json, '$.taskResult.verdict.status') = 'pass')))
-             AND (SELECT COUNT(*) FROM turns live WHERE live.workspace_id = turns.workspace_id
+               AND NOT EXISTS (SELECT 1 FROM task_prerequisites prerequisite
+                               JOIN tasks producer ON producer.workspace_id = prerequisite.workspace_id AND producer.id = prerequisite.producer_task_id
+                               WHERE prerequisite.workspace_id = turns.workspace_id AND prerequisite.task_id = turns.task_id
+                                 AND NOT (((prerequisite.required_lifecycle = 'succeeded' AND producer.lifecycle = 'succeeded') OR
+                                   (prerequisite.required_lifecycle = 'terminal' AND producer.lifecycle IN ('succeeded','failed','cancelled','skipped')))
+                                   AND (prerequisite.required_verdict IS NULL OR json_extract(producer.payload_json, '$.taskResult.verdict.status') = 'pass')))
+               AND NOT EXISTS (
+                 SELECT 1
+                  FROM workflow_activations activation
+                  JOIN workflow_runs run
+                    ON run.workspace_id = activation.workspace_id
+                   AND run.run_id = activation.run_id
+                 WHERE activation.workspace_id = turns.workspace_id
+                   AND activation.execution_turn_id = turns.id
+                    AND (activation.status <> 'queued' OR run.status <> 'running')
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM workflow_feedback_rounds round_row
+                  WHERE round_row.workspace_id = turns.workspace_id
+                    AND round_row.requester_task_id = turns.task_id
+                    AND round_row.status IN ('open', 'satisfied')
+                    AND NOT EXISTS (
+                      SELECT 1 FROM workflow_activations activation
+                       WHERE activation.workspace_id = round_row.workspace_id
+                         AND activation.run_id = round_row.run_id
+                         AND activation.feedback_round_id = round_row.round_id
+                         AND activation.execution_turn_id = turns.id
+                         AND activation.kind = 'feedback_resume'
+                         AND activation.status = 'queued'
+                    )
+               )
+                AND NOT EXISTS (
+                  SELECT 1 FROM workflow_continuations continuation
+                   WHERE continuation.workspace_id = turns.workspace_id
+                     AND continuation.caller_task_id = turns.task_id
+                     AND continuation.status IN ('pending', 'resolved')
+                     AND NOT (
+                       continuation.kind = 'start_wait'
+                       AND continuation.status = 'resolved'
+                       AND continuation.producing_turn_id = turns.id
+                       AND COALESCE(json_extract(turns.payload_json, '$.workflowResume.kind') = 'start_workflow', 0)
+                       AND COALESCE(json_extract(turns.payload_json, '$.workflowResume.runId') = continuation.run_id, 0)
+                       AND COALESCE(json_extract(turns.payload_json, '$.workflowResume.continuationId') = continuation.continuation_id, 0)
+                     )
+                     AND NOT EXISTS (
+                       SELECT 1 FROM workflow_activations activation
+                        WHERE activation.workspace_id = continuation.workspace_id
+                         AND activation.continuation_id = continuation.continuation_id
+                         AND activation.execution_turn_id = turns.id
+                         AND activation.kind = 'child_return'
+                         AND activation.status = 'queued'
+                    )
+               )
+              AND (SELECT COUNT(*) FROM turns live WHERE live.workspace_id = turns.workspace_id
                     AND live.status IN ('running', 'waiting_user')) < ?
              AND (SELECT COUNT(*) FROM turns live WHERE live.workspace_id = turns.workspace_id
                     AND live.status IN ('running', 'waiting_user') AND live.task_id IN (SELECT id FROM root_tree)) < ?
@@ -4463,11 +12541,11 @@ interface MessageRow {
   payload_json: string;
 }
 
-interface DependencyRow {
+interface PrerequisiteRow {
   task_id: string;
-  dependency_task_id: string;
-  required_outcome: string;
-  on_unsatisfied: string;
+  producer_task_id: string;
+  required_lifecycle: string;
+  on_unmet: string;
   required_verdict: string | null;
 }
 
@@ -4495,6 +12573,7 @@ interface ReasoningRow {
   id: string;
   task_id: string;
   turn_id: string;
+  ordering: number;
   content: string;
   created_at: string;
   updated_at: string;
@@ -4521,6 +12600,13 @@ interface RuntimeClaimRow {
   claimed_at: string;
   heartbeat_at: string;
   expires_at: string;
+}
+
+interface SessionBindingRow {
+  task_id: string;
+  runtime_epoch: number;
+  backend: string;
+  session_id: string;
 }
 
 interface ReceiptRow {
@@ -4662,7 +12748,7 @@ items AS (
   SELECT
     r.id, 'reasoning', r.turn_id,
     rt.sequence,
-    ${KIND_RANK.reasoning}, ${REASONING_ORDERING}, NULL,
+    ${KIND_RANK.reasoning}, r.ordering, r.ordering,
     r.created_at, r.content, NULL,
     NULL, NULL, NULL, NULL
   FROM task_turns rt
@@ -4730,6 +12816,7 @@ function decodeTranscriptRow(row: TranscriptPageRow & { entity_id: string }): Re
       id: row.entity_id,
       kind: 'reasoning',
       turnId: row.turn_id ?? '',
+      order: row.ordering ?? 0,
       content: row.content ?? '',
       ...(createdAt !== undefined ? { createdAt } : {}),
     };
@@ -4816,18 +12903,18 @@ function decodeWorkspaceLocation(row: WorkspaceLocationRow): RepositoryWorkspace
   };
 }
 
-function decodeDependency(row: DependencyRow): TaskDependency {
+function decodePrerequisite(row: PrerequisiteRow): TaskPrerequisite {
   return {
-    taskId: requiredString(row.dependency_task_id, 'dependency_task_id', 'task dependency'),
-    requiredOutcome: oneOf(row.required_outcome, ['succeeded', 'settled'] as const, 'required_outcome', 'task dependency'),
-    onUnsatisfied: oneOf(row.on_unsatisfied, ['block', 'fail', 'skip'] as const, 'on_unsatisfied', 'task dependency'),
+    producerTaskId: requiredString(row.producer_task_id, 'producer_task_id', 'task prerequisite'),
+    requiredLifecycle: oneOf(row.required_lifecycle, ['succeeded', 'terminal'] as const, 'required_lifecycle', 'task prerequisite'),
+    onUnmet: oneOf(row.on_unmet, ['block', 'fail', 'skip'] as const, 'on_unmet', 'task prerequisite'),
     ...(row.required_verdict === null
       ? {}
-      : { requiredVerdict: oneOf(row.required_verdict, ['pass'] as const, 'required_verdict', 'task dependency') }),
+      : { requiredVerdict: oneOf(row.required_verdict, ['pass'] as const, 'required_verdict', 'task prerequisite') }),
   };
 }
 
-function decodeTask(row: TaskRow, dependencies: readonly TaskDependency[]): MusterTask {
+function decodeTask(row: TaskRow, prerequisites: readonly TaskPrerequisite[]): MusterTask {
   const payload = parsePayload(row.payload_json, 'task');
   const task: Record<string, unknown> = {
     ...payload,
@@ -4842,7 +12929,7 @@ function decodeTask(row: TaskRow, dependencies: readonly TaskDependency[]): Must
     updatedAt: requiredString(row.updated_at, 'updated_at', 'task'),
     ...(row.model === null ? { model: undefined } : { model: row.model }),
     releaseState: oneOf(row.release_state, ['draft', 'released'] as const, 'release_state', 'task'),
-    dependencies,
+    prerequisites,
   };
   delete task.payloadVersion;
   if (!Array.isArray(task.capabilities) || !task.executionPolicy || typeof task.executionPolicy !== 'object') {
@@ -4945,6 +13032,7 @@ function decodeReasoning(row: ReasoningRow): PersistedReasoning {
     id: requiredString(row.id, 'id', 'reasoning'),
     taskId: requiredString(row.task_id, 'task_id', 'reasoning'),
     turnId: requiredString(row.turn_id, 'turn_id', 'reasoning'),
+    order: requiredNumber(row.ordering, 'ordering', 'reasoning'),
     content: requiredString(row.content, 'content', 'reasoning'),
     createdAt: requiredString(row.created_at, 'created_at', 'reasoning'),
     updatedAt: requiredString(row.updated_at, 'updated_at', 'reasoning'),
@@ -4978,7 +13066,9 @@ function decodeCancelRequest(row: CancelRow): CancelRequest {
     opId: requiredString(row.op_id, 'op_id', 'cancel request'),
     at: requiredString(row.requested_at, 'requested_at', 'cancel request'),
   };
-  if (payload.sealedBy !== undefined) request.sealedBy = payload.sealedBy as CancelRequest['sealedBy'];
+  if (payload.lifecycleAuthority !== undefined) {
+    request.lifecycleAuthority = payload.lifecycleAuthority as CancelRequest['lifecycleAuthority'];
+  }
   if (payload.reason !== undefined) request.reason = requiredString(payload.reason, 'reason', 'cancel request');
   return request;
 }

@@ -121,7 +121,7 @@ describe('ACP stdio proxy and provider contract matrix (M017-S05 / D037)', () =>
       const bridge = createFakeMcpBridge({
         tools: [
           {
-            name: 'complete_task',
+            name: 'get_host_context',
             description: 'contract tool',
             inputSchema: { type: 'object', properties: {} },
           },
@@ -139,7 +139,7 @@ describe('ACP stdio proxy and provider contract matrix (M017-S05 / D037)', () =>
 
       await proxy.ensureUpstream();
       const listed = await proxy.listTools();
-      expect(listed.tools.map((t) => t.name)).toContain('complete_task');
+      expect(listed.tools.map((t) => t.name)).toContain('get_host_context');
 
       const snap = proxy.getDebugSnapshot();
       expect(snap.phase).toBe('ready');
@@ -158,7 +158,7 @@ describe('ACP stdio proxy and provider contract matrix (M017-S05 / D037)', () =>
       const bridge = createFakeMcpBridge({
         tools: [
           {
-            name: 'complete_task',
+            name: 'get_host_context',
             description: 'contract tool',
             inputSchema: { type: 'object', properties: {} },
           },
@@ -205,7 +205,7 @@ describe('ACP stdio proxy and provider contract matrix (M017-S05 / D037)', () =>
       expect(proxy.getDebugSnapshot().reconnectGeneration).toBe(0);
 
       const listed = await proxy.listTools();
-      expect(listed.tools.map((t) => t.name)).toContain('complete_task');
+      expect(listed.tools.map((t) => t.name)).toContain('get_host_context');
 
       const snap = proxy.getDebugSnapshot();
       expect(snap.phase).toBe('ready');

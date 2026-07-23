@@ -8,7 +8,7 @@ function task(partial: Partial<MusterTask> & { id: string }): MusterTask {
     lifecycle: 'open',
     goal: 'g',
     parentId: null,
-    dependencies: [],
+    prerequisites: [],
     backend: 'fake',
     capabilities: [],
     executionPolicy: {
@@ -45,13 +45,13 @@ describe('evaluateTaskReadiness', () => {
     expect(r.schedulable).toBe(false);
   });
 
-  it('distinguishes waiting_dependencies vs missing_input', () => {
+  it('distinguishes waiting_prerequisites vs missing_input', () => {
     const f = file({
       plan: task({ id: 'plan', lifecycle: 'open', releaseState: 'released' }),
       impl: task({
         id: 'impl',
         releaseState: 'released',
-        dependencies: [{ taskId: 'plan', requiredOutcome: 'succeeded', onUnsatisfied: 'block' }],
+        prerequisites: [{ producerTaskId: 'plan', requiredLifecycle: 'succeeded', onUnmet: 'block' }],
         inputBindings: [{ fromTaskId: 'plan', output: 'summary', as: 'p' }],
       }),
     }, {
@@ -67,7 +67,7 @@ describe('evaluateTaskReadiness', () => {
     });
     const r = evaluateTaskReadiness(f, 'impl');
     expect(r.schedulable).toBe(false);
-    expect(r.reasons.some((x) => x.code === 'waiting_dependencies')).toBe(true);
+    expect(r.reasons.some((x) => x.code === 'waiting_prerequisites')).toBe(true);
   });
 
   it('ready when released, deps satisfied, queued', () => {
@@ -81,7 +81,7 @@ describe('evaluateTaskReadiness', () => {
       impl: task({
         id: 'impl',
         releaseState: 'released',
-        dependencies: [{ taskId: 'plan', requiredOutcome: 'succeeded', onUnsatisfied: 'block' }],
+        prerequisites: [{ producerTaskId: 'plan', requiredLifecycle: 'succeeded', onUnmet: 'block' }],
         inputBindings: [{ fromTaskId: 'plan', output: 'summary', as: 'p' }],
       }),
     }, {
@@ -106,7 +106,7 @@ describe('evaluateTaskReadiness', () => {
       impl: task({
         id: 'impl',
         releaseState: 'released',
-        dependencies: [{ taskId: 'plan', requiredOutcome: 'succeeded', onUnsatisfied: 'block' }],
+        prerequisites: [{ producerTaskId: 'plan', requiredLifecycle: 'succeeded', onUnmet: 'block' }],
         inputBindings: [{ fromTaskId: 'plan', output: 'summary', as: 'p' }],
       }),
     }, {

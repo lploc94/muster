@@ -1,10 +1,11 @@
 /**
- * Bounded current-schema fingerprint (P5-W2).
+ * Bounded schema fingerprint (P5-W2 / M018 S01).
  *
- * Golden manifest from CURRENT_SCHEMA_STATEMENTS. Validates ordered columns,
- * FKs, explicit indexes (index_xinfo + normalized SQL), triggers, and rejects
- * extra user tables/views/indexes/triggers. SQL normalization preserves quoted
- * literal contents (CHECK 'draft' ≠ 'DRAFT'). Read-only; before WAL.
+ * The golden manifest describes the only supported development schema. Validates
+ * ordered columns, FKs, explicit indexes (index_xinfo +
+ * normalized SQL), triggers, and rejects extra user tables/views/indexes/triggers.
+ * SQL normalization preserves quoted literal contents (CHECK 'draft' ≠ 'DRAFT').
+ * Read-only; before WAL.
  */
 
 import { DatabaseSync } from 'node:sqlite';
@@ -399,7 +400,7 @@ export function captureSchemaManifest(db: DatabaseSync): SchemaManifest {
 
 let cachedExpected: SchemaManifest | undefined;
 
-/** Golden manifest from CURRENT_SCHEMA_STATEMENTS (lazy, once). */
+/** Golden manifest from CURRENT_SCHEMA_STATEMENTS (lazy, once per process). */
 export function expectedSchemaManifest(): SchemaManifest {
   if (cachedExpected) return cachedExpected;
   const db = new DatabaseSync(':memory:');
@@ -407,12 +408,16 @@ export function expectedSchemaManifest(): SchemaManifest {
     for (const statement of CURRENT_SCHEMA_STATEMENTS) {
       db.exec(statement);
     }
-    cachedExpected = captureSchemaManifest(db);
-    return cachedExpected;
+    const manifest = captureSchemaManifest(db);
+    cachedExpected = manifest;
+    return manifest;
   } finally {
     db.close();
   }
 }
+
+// Keep a direct reference so tree-shaking / dead-code reviews still see current DDL usage.
+void CURRENT_SCHEMA_STATEMENTS;
 
 function sameColumns(a: readonly ColumnSpec[], b: readonly ColumnSpec[]): boolean {
   if (a.length !== b.length) return false;
@@ -469,16 +474,19 @@ function sameIndexColumns(a: readonly IndexColumnSpec[], b: readonly IndexColumn
 }
 
 /**
- * Returns the first fingerprint failure, or undefined when the owned current DB
- * matches the required structure. Read-only; no journal/application mutations.
+ * Returns the first fingerprint failure, or undefined when the DB matches the
+ * expected structure. Read-only; no journal/application mutations.
+ *
+ * @param expected Optional explicit golden manifest. Defaults to current schema.
  */
 export function findSchemaFingerprintFailure(
   db: DatabaseSync,
+  expected: SchemaManifest = expectedSchemaManifest(),
 ): SchemaFingerprintFailure | undefined {
-  const expected = expectedSchemaManifest();
+  const golden = expected;
   const actual = captureSchemaManifest(db);
 
-  const expectedTables = new Map(expected.tables.map((t) => [t.name, t]));
+  const expectedTables = new Map(golden.tables.map((t) => [t.name, t]));
   const actualTables = new Map(actual.tables.map((t) => [t.name, t]));
 
   for (const name of expectedTables.keys()) {
@@ -508,7 +516,7 @@ export function findSchemaFingerprintFailure(
     }
   }
 
-  const expectedIndexes = new Map(expected.indexes.map((i) => [i.name, i]));
+  const expectedIndexes = new Map(golden.indexes.map((i) => [i.name, i]));
   const actualIndexes = new Map(actual.indexes.map((i) => [i.name, i]));
   for (const [name, exp] of expectedIndexes) {
     const act = actualIndexes.get(name);
@@ -529,7 +537,7 @@ export function findSchemaFingerprintFailure(
     }
   }
 
-  const expectedTriggers = new Map(expected.triggers.map((t) => [t.name, t]));
+  const expectedTriggers = new Map(golden.triggers.map((t) => [t.name, t]));
   const actualTriggers = new Map(actual.triggers.map((t) => [t.name, t]));
   for (const [name, exp] of expectedTriggers) {
     const act = actualTriggers.get(name);

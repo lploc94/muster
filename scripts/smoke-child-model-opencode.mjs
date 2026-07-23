@@ -27,7 +27,7 @@ const dist = (relative) => path.join(root, 'dist', relative);
 const requiredFiles = [
   'src/task/engine.js', 'src/task/repository.js', 'src/task/sqlite/client.js',
   'src/task/sqlite/worker.js', 'src/bridge/credentials.js', 'src/bridge/ask-bridge.js',
-  'src/backends/index.js',
+  'src/backends/index.js', 'src/backends/opencode.js',
 ];
 for (const relative of requiredFiles) {
   if (!fs.existsSync(dist(relative))) {
@@ -42,6 +42,7 @@ const { DbClient } = require(dist('src/task/sqlite/client.js'));
 const { CredentialRegistry } = require(dist('src/bridge/credentials.js'));
 const { AskBridge } = require(dist('src/bridge/ask-bridge.js'));
 const { makeBackend } = require(dist('src/backends/index.js'));
+const { disposeSharedAcpClient } = require(dist('src/backends/opencode.js'));
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-smoke-oc-model-'));
 const client = new DbClient({ workerPath: dist('src/task/sqlite/worker.js') });
@@ -112,6 +113,7 @@ try {
   }
   console.log('PASS: opencode child model smoke');
 } finally {
+  disposeSharedAcpClient();
   await client.close();
-  fs.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
 }

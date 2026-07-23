@@ -4,6 +4,8 @@ import {
   TASK_TYPE_DIAGNOSTIC_MAX,
   TASK_TYPE_DIAGNOSTIC_MESSAGE_MAX,
   TASK_TYPE_MAX,
+  RUNTIME_FALLBACK_MAX,
+  parseRuntimeFallbackChain,
   parseTaskTypeRegistry,
   resolveCreateChildSpec,
   summarizeTaskTypes,
@@ -65,6 +67,35 @@ describe('parseTaskTypeRegistry', () => {
     });
     expect(r.registry.get('implement')?.role).toBeUndefined();
     expect(r.diagnostics).toEqual([]);
+  });
+
+  it('parses bounded task-specific fallback bindings', () => {
+    const r = parseTaskTypeRegistry({
+      implement: {
+        backend: 'grok',
+        fallbacks: [
+          { backend: 'codex', model: 'gpt-5' },
+          { backend: 'opencode' },
+        ],
+      },
+    });
+    expect(r.status).toBe('ok');
+    expect(r.registry.get('implement')?.fallbacks).toEqual([
+      { backend: 'codex', model: 'gpt-5' },
+      { backend: 'opencode' },
+    ]);
+  });
+
+  it('rejects malformed or oversized task-specific fallback bindings', () => {
+    expect(parseTaskTypeRegistry({
+      implement: { backend: 'grok', fallbacks: [{ backend: 'codex', extra: true }] },
+    }).status).toBe('invalid');
+    expect(parseTaskTypeRegistry({
+      implement: {
+        backend: 'grok',
+        fallbacks: Array.from({ length: RUNTIME_FALLBACK_MAX + 1 }, () => ({ backend: 'codex' })),
+      },
+    }).status).toBe('invalid');
   });
 
   it('returns invalid for non-object shape', () => {
@@ -154,6 +185,20 @@ describe('parseTaskTypeRegistry', () => {
     expect(r.diagnostics[0]?.message.length).toBeLessThanOrEqual(
       TASK_TYPE_DIAGNOSTIC_MESSAGE_MAX,
     );
+  });
+});
+
+describe('parseRuntimeFallbackChain', () => {
+  it('accepts optional models and fails closed on invalid input', () => {
+    expect(parseRuntimeFallbackChain([
+      { backend: ' codex ', model: ' gpt-5 ' },
+      { backend: 'opencode' },
+    ])).toEqual([
+      { backend: 'codex', model: 'gpt-5' },
+      { backend: 'opencode' },
+    ]);
+    expect(parseRuntimeFallbackChain([{ backend: 'codex', unexpected: true }])).toEqual([]);
+    expect(parseRuntimeFallbackChain('codex')).toEqual([]);
   });
 });
 

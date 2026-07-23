@@ -35,6 +35,10 @@ function tool(id: string, status: 'running' | 'success' | 'error' = 'success'): 
   };
 }
 
+function reasoning(id: string, text = 'thinking'): ThreadItem {
+  return { kind: 'reasoning', id, text, turnId: 'turn-a', order: 0 };
+}
+
 describe('chat-virtualization range helpers', () => {
   it('expands a core range by overscan and clamps to list bounds', () => {
     expect(
@@ -99,18 +103,18 @@ describe('variable estimates and prepend offset restore', () => {
     expect(estimateTranscriptItemSize(tool('t', 'running'))).toBeGreaterThan(0);
   });
 
-  it('includes block-start header/reasoning in estimates', () => {
+  it('includes block-start headers and sizes reasoning rows', () => {
     const base = estimateTranscriptItemSize(assistant('a', 'hi'));
     const withHeader = estimateTranscriptItemSize(assistant('a', 'hi'), {
       isBlockStart: true,
-      reasoningChars: 200,
     });
     expect(withHeader).toBeGreaterThan(base);
+    expect(estimateTranscriptItemSize(reasoning('r1', 'x'.repeat(300)))).toBeGreaterThan(0);
   });
 
   it('createTranscriptEstimateSize uses full-list block-start', () => {
     const items = [user('u1'), assistant('a1', 'hi', 't1')];
-    const estimate = createTranscriptEstimateSize(items, { t1: 'thinking hard' });
+    const estimate = createTranscriptEstimateSize(items);
     expect(estimate(1)).toBeGreaterThan(estimateTranscriptItemSize(items[1]!));
     expect(estimate(99)).toBeGreaterThan(0);
   });

@@ -12,7 +12,7 @@ function task(partial: Partial<MusterTask> & { id: string }): MusterTask {
     lifecycle: 'open',
     goal: 'g',
     parentId: null,
-    dependencies: [],
+    prerequisites: [],
     backend: 'fake',
     capabilities: [],
     executionPolicy: {

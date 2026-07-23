@@ -66,7 +66,7 @@ const PRESENTATIONS: Record<
 };
 
 const WAIT_REASON_LABELS: Record<string, string> = {
-  dependencies: 'Waiting on dependencies',
+  prerequisites: 'Waiting on prerequisites',
   children: 'Waiting on child tasks',
   external: 'Waiting on external blocker',
   held_after_failure: 'Paused after previous turn',

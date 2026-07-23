@@ -1,6 +1,29 @@
 import { describe, expect, it, afterEach } from 'vitest';
 import { CredentialRegistry } from './credentials';
 import { formatToolError, MusterBridgeServer } from './server';
+import { PUBLIC_MCP_TOOL_ACTIONS } from '../task/capabilities';
+import { PRESENTATION_REF_PATTERN, WORKFLOW_REF_PATTERN } from '../task/coordinator-tools';
+import { WORKFLOW_NODE_LABEL_MAX_LENGTH } from '../task/workflow-types';
+
+const REMOVED_MCP_TOOLS = [
+  'create_task',
+  'delegate_task',
+  'create_tasks',
+  'delegate_tasks',
+  'release_tasks',
+  'interrupt_task',
+  'cancel_task',
+  'cancel_tasks',
+  'continue_child',
+  'set_task_lifecycle',
+  'wait_for_tasks',
+  'complete_task',
+  'fail_task',
+  'get_task_status',
+  'report_progress',
+  'ask_parent',
+  'answer_child_question',
+] as const;
 
 async function readJsonRpc(res: Response): Promise<Record<string, unknown> | undefined> {
   const text = await res.text();
@@ -76,6 +99,40 @@ describe('formatToolError', () => {
       });
     expect(formatToolError('task not found')).toBe('task not found');
   });
+
+  it('adds actionable hints to invalid semantic workflow errors', () => {
+    expect(JSON.parse(formatToolError(JSON.stringify({
+      code: 'invalid_workflow_definition',
+      message: 'invalid entry contract',
+    })))).toEqual({
+      code: 'invalid_workflow_definition',
+      message: 'invalid entry contract',
+      hint: expect.stringContaining('source nodes'),
+    });
+    expect(JSON.parse(formatToolError(JSON.stringify({
+      code: 'invalid_workflow_definition',
+      message: 'fan-out not allowed: node intake',
+    })))).toEqual({
+      code: 'invalid_workflow_definition',
+      message: 'fan-out not allowed: node intake',
+      hint: expect.stringContaining('A -> C and B -> C'),
+    });
+    expect(JSON.parse(formatToolError('incomplete entry inputs'))).toEqual({
+      code: 'invalid_workflow_inputs',
+      message: 'incomplete entry inputs',
+      hint: expect.stringContaining('exact source nodeKey and input name'),
+    });
+    expect(JSON.parse(formatToolError('definition fingerprint conflict'))).toEqual({
+      code: 'workflow_identity_conflict',
+      message: 'definition fingerprint conflict',
+      hint: expect.stringContaining('engine-generated workflow identity'),
+    });
+    expect(JSON.parse(formatToolError('operation fingerprint conflict'))).toEqual({
+      code: 'workflow_definition_retry_conflict',
+      message: 'operation fingerprint conflict',
+      hint: expect.stringContaining('identical name/nodes/edges/inputs'),
+    });
+  });
 });
 
 describe('MusterBridgeServer auth', () => {
@@ -105,7 +162,15 @@ describe('MusterBridgeServer auth', () => {
       toolHandler: {
         handleToolCall: async (_ctx, tool, command) => {
           handled.push({ tool, command });
-          return { ok: true, result: { code: 'opened' } };
+          return {
+            ok: true,
+            result: {
+              code: 'opened',
+              presentationId: command.kind === 'upsert_presentation'
+                ? command.presentationId
+                : 'unexpected',
+            },
+          };
         },
       },
     });
@@ -125,32 +190,37 @@ describe('MusterBridgeServer auth', () => {
     expect(tools.map((tool) => tool.name)).toEqual(['upsert_presentation']);
     expect(tools[0]).toMatchObject({
       name: 'upsert_presentation',
-      description: expect.stringContaining('REQUIRED when the user asks to plan'),
+      description: expect.stringContaining('REQUIRED for user-facing plans'),
     });
     expect(tools[0].inputSchema).toMatchObject({
-      required: ['presentationId', 'ownerTaskId', 'opId', 'revision', 'title', 'markdown'],
+      required: ['title', 'markdown'],
       additionalProperties: false,
     });
+    expect(tools[0].inputSchema.properties).toHaveProperty('presentationRef');
+    expect(tools[0].inputSchema.properties).not.toHaveProperty('documentKey');
 
     const called = await coordinator.request('tools/call', {
       name: 'upsert_presentation',
       arguments: {
-        presentationId: 'release-notes',
-        ownerTaskId: 'task-1',
-        opId: 'op-1',
-        revision: 1,
         title: 'Release notes',
         markdown: '# Ready',
       },
     });
     expect(called.result).toMatchObject({
-      content: [{ type: 'text', text: '{"code":"opened"}' }],
+      content: [{
+        type: 'text',
+        text: expect.stringMatching(/^\{"presentationRef":"presentation-[a-f0-9]{32}","status":"opened"\}$/),
+      }],
     });
     expect(called.result).not.toHaveProperty('isError', true);
     expect(handled).toHaveLength(1);
     expect(handled[0]).toMatchObject({
       tool: 'upsert_presentation',
-      command: { kind: 'upsert_presentation', presentationId: 'release-notes' },
+      command: {
+        kind: 'upsert_presentation',
+        presentationId: expect.stringMatching(/^presentation-/),
+        ownerTaskId: 'task-1',
+      },
     });
 
     const workerToken = credentials.issue({
@@ -158,7 +228,7 @@ describe('MusterBridgeServer auth', () => {
       callerTaskId: 'worker-1',
       turnId: 'turn-worker',
       attemptId: 'a0',
-      allowedActions: new Set(['complete_task']),
+      allowedActions: new Set(['get_host_context']),
       ttlMs: 60_000,
     });
     const worker = await openMcpSession(port, workerToken);
@@ -181,89 +251,201 @@ describe('MusterBridgeServer auth', () => {
     expect(handled).toHaveLength(1);
   });
 
-  it('exposes batch tools only to create_child coordinators and rejects malformed batches', async () => {
+  it('exposes define_workflow and start_workflow only when allowed and rejects malformed start', async () => {
     const credentials = new CredentialRegistry();
     const handled: Array<{ tool: string; command: unknown }> = [];
+    const generatedWorkflowId = `workflow-${'a'.repeat(32)}`;
     server = new MusterBridgeServer({
       credentials,
       toolHandler: {
         handleToolCall: async (_ctx, tool, command) => {
           handled.push({ tool, command });
-          return { ok: true, result: { taskIds: ['task-a'], turnIds: [] } };
+          if (tool === 'define_workflow') {
+            return {
+              ok: true,
+              result: {
+                ok: true,
+                changed: true,
+                definitionId: generatedWorkflowId,
+                version: 3,
+                fingerprint: 'internal-definition-fingerprint',
+              },
+            };
+          }
+          return {
+            ok: true,
+            result: {
+              ok: true,
+              changed: true,
+               definitionId: generatedWorkflowId,
+               version: 3,
+               runId: 'run-secret-coordinates-hidden',
+               entryTaskId: 'task-internal',
+               entryGateId: 'gate-internal',
+             },
+          };
         },
       },
     });
     const { port } = await server.listen();
-    const coordinatorToken = credentials.issue({
+    const token = credentials.issue({
       rootId: 'root-1',
       callerTaskId: 'task-1',
-      turnId: 'turn-coordinator',
+      turnId: 'turn-1',
       attemptId: 'a0',
-      allowedActions: new Set(['create_tasks', 'delegate_tasks']),
+      allowedActions: new Set(['define_workflow', 'start_workflow']),
       ttlMs: 60_000,
     });
-    const coordinator = await openMcpSession(port, coordinatorToken);
-
-    const listed = await coordinator.request('tools/list');
-    const tools = (listed.result as {
-      tools: Array<{ name: string; inputSchema: Record<string, unknown> }>;
+    const session = await openMcpSession(port, token);
+    const listed = await session.request('tools/list');
+    const workflowTools = (listed.result as {
+      tools: Array<{
+        name: string;
+        description?: string;
+        inputSchema: {
+          description?: string;
+          properties?: Record<string, { description?: string; properties?: Record<string, unknown> }>;
+        };
+      }>;
     }).tools;
-    const names = tools.map((tool) => tool.name);
-    expect(names).toContain('create_tasks');
-    expect(names).toContain('delegate_tasks');
-    const batchSchema = tools.find((tool) => tool.name === 'create_tasks')!.inputSchema;
-    expect(batchSchema).toMatchObject({
-      required: ['opId', 'tasks'],
+    const names = workflowTools.map((t) => t.name);
+    expect(names).toEqual(expect.arrayContaining(['define_workflow', 'start_workflow']));
+    const defineTool = workflowTools.find((tool) => tool.name === 'define_workflow');
+    expect(defineTool?.description).toContain('Use only this public shape');
+    expect(defineTool?.description).toContain('CORRECT one-node');
+    expect(defineTool?.description).toContain('CORRECT parallel fan-in');
+    expect(defineTool?.description).toContain('INCORRECT internal parameters');
+    expect(defineTool?.description).toContain('INCORRECT fan-out');
+    expect(defineTool?.description).toContain('INCORRECT downstream input');
+    expect(defineTool?.description).toContain('engine generates a stable workflowRef');
+    expect(defineTool?.description).toContain('Never send internal fields');
+    expect(defineTool?.inputSchema).toMatchObject({
+      required: ['name', 'nodes'],
       additionalProperties: false,
-    });
-    expect((batchSchema.properties as { tasks: { maxItems: number } }).tasks.maxItems).toBe(16);
-
-    // Valid single-item batch reaches the handler.
-    const ok = await coordinator.request('tools/call', {
-      name: 'create_tasks',
-      arguments: {
-        opId: 'op-1',
-        tasks: [{ localId: 'a', goal: 'child', taskType: 'worker' }],
+      properties: {
+        nodes: {
+          items: {
+            properties: {
+              label: { maxLength: WORKFLOW_NODE_LABEL_MAX_LENGTH },
+            },
+          },
+        },
       },
     });
-    expect(ok.result).not.toHaveProperty('isError', true);
-    expect(handled).toHaveLength(1);
-    expect(handled[0]).toMatchObject({ tool: 'create_tasks', command: { kind: 'create_tasks' } });
+    expect(defineTool?.inputSchema.description).toContain('A -> C and B -> C');
+    expect(defineTool?.inputSchema.description).toContain('Required: name, nodes');
+    expect(defineTool?.inputSchema.properties?.edges?.description).toContain('each from node may appear at most once');
+    expect(defineTool?.inputSchema.properties?.inputs?.description).toContain('no value belongs here');
+    expect(defineTool?.inputSchema.properties).not.toHaveProperty('policy');
+    expect(defineTool?.inputSchema.properties).not.toHaveProperty('opId');
+    expect(defineTool?.inputSchema.properties).not.toHaveProperty('workflowKey');
+     const startTool = workflowTools.find((tool) => tool.name === 'start_workflow');
+     expect(startTool?.description).toContain('exactly one value for every input');
+     expect(startTool?.description).toContain('resumes the caller exactly once');
+    expect(startTool?.inputSchema).toMatchObject({
+      properties: { workflow: { pattern: WORKFLOW_REF_PATTERN } },
+    });
+    expect(startTool?.inputSchema.properties?.inputs?.description).toContain('exactly match');
+    expect(startTool?.inputSchema.properties).not.toHaveProperty('instanceKey');
 
-    // Over-cap batch is rejected in dispatch before ever reaching the handler.
-    const overCap = await coordinator.request('tools/call', {
-      name: 'create_tasks',
+    const defined = await session.request('tools/call', {
+      name: 'define_workflow',
       arguments: {
-        opId: 'op-2',
-        tasks: Array.from({ length: 17 }, (_, i) => ({
-          localId: `t${i}`,
-          goal: 'x',
-          taskType: 'worker',
-        })),
+        name: 'one-node',
+        nodes: [{ nodeKey: 'entry', taskType: 'implement' }],
       },
     });
-    expect(overCap.result).toMatchObject({ isError: true });
+    expect(defined.result).not.toHaveProperty('isError', true);
+    expect(defined.result).toMatchObject({
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          workflowRef: `${generatedWorkflowId}@3`,
+          revision: 3,
+          changed: true,
+          replay: false,
+        }),
+      }],
+    });
+    expect(handled[0]).toMatchObject({
+      tool: 'define_workflow',
+      command: {
+        kind: 'define_workflow',
+        definitionId: expect.stringMatching(/^workflow-[a-f0-9]{32}$/),
+      },
+    });
+
+    const internalDefine = await session.request('tools/call', {
+      name: 'define_workflow',
+      arguments: {
+        opId: 'model-op',
+        definitionId: 'model-definition',
+        version: 1,
+        name: 'forged internal definition',
+        topology: { kind: 'one_node_v1', entryNodeId: 'entry', nodes: [{ nodeId: 'entry' }] },
+        entryContracts: [],
+        policy: {},
+      },
+    });
+    expect(internalDefine.result).toMatchObject({ isError: true });
     expect(handled).toHaveLength(1);
 
-    // Workers never see the batch tools.
+    const badStart = await session.request('tools/call', {
+      name: 'start_workflow',
+      arguments: {
+        opId: 'op-start',
+        definitionId: 'wf-one',
+        version: 1,
+        startIdempotencyKey: 'model-start-key',
+        entryInputs: [],
+      },
+    });
+    expect(badStart.result).toMatchObject({ isError: true });
+    expect(handled).toHaveLength(1);
+
+    const bareStart = await session.request('tools/call', {
+      name: 'start_workflow',
+      arguments: { workflow: generatedWorkflowId, inputs: [] },
+    });
+    expect(bareStart.result).toMatchObject({ isError: true });
+    expect(handled).toHaveLength(1);
+
+    const started = await session.request('tools/call', {
+      name: 'start_workflow',
+      arguments: { workflow: `${generatedWorkflowId}@3`, inputs: [] },
+    });
+    expect(started.result).toMatchObject({
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          runRef: 'run-secret-coordinates-hidden',
+           workflowRef: `${generatedWorkflowId}@3`,
+           replay: false,
+           status: 'accepted',
+         }),
+      }],
+    });
+    expect((started.result as { content: Array<{ text: string }> }).content[0]!.text)
+      .not.toContain('entryTaskId');
+
     const workerToken = credentials.issue({
       rootId: 'root-1',
       callerTaskId: 'worker-1',
       turnId: 'turn-worker',
       attemptId: 'a0',
-      allowedActions: new Set(['complete_task']),
+      allowedActions: new Set(['get_host_context']),
       ttlMs: 60_000,
     });
     const worker = await openMcpSession(port, workerToken);
     const workerListed = await worker.request('tools/list');
     const workerNames = (workerListed.result as { tools: Array<{ name: string }> }).tools.map(
-      (tool) => tool.name,
+      (t) => t.name,
     );
-    expect(workerNames).not.toContain('create_tasks');
-    expect(workerNames).not.toContain('delegate_tasks');
+    expect(workerNames).not.toContain('define_workflow');
+    expect(workerNames).not.toContain('start_workflow');
   });
 
-  it('round-trips brief.skills through create_task and create_tasks child specs', async () => {
+  it('exposes the exact workflow catalog and rejects removed delegate-task tools', async () => {
     const credentials = new CredentialRegistry();
     const handled: Array<{ tool: string; command: unknown }> = [];
     server = new MusterBridgeServer({
@@ -271,10 +453,30 @@ describe('MusterBridgeServer auth', () => {
       toolHandler: {
         handleToolCall: async (_ctx, tool, command) => {
           handled.push({ tool, command });
-          return {
-            ok: true,
-            result: { taskId: 'task-a', turnId: 't1', taskIds: ['task-a'], turnIds: [] },
-          };
+          if (tool === 'inspect_workflow_run') {
+            return {
+              ok: true,
+              result: {
+                runId: 'wfr-1',
+                definitionId: 'review-flow',
+                definitionVersion: 2,
+                runStatus: 'running',
+                policy: { maxDepth: 8 },
+                nodes: [{ nodeId: 'review', status: 'running' }],
+                gates: [{ gateId: 'gate-internal', status: 'satisfied' }],
+                activations: [{
+                  activationId: 'activation-internal',
+                  nodeId: 'review',
+                  kind: 'dependency_gate',
+                  status: 'running',
+                }],
+                feedbackRounds: [],
+                continuations: [],
+                diagnostics: [],
+              },
+            };
+          }
+          return { ok: true, result: {} };
         },
       },
     });
@@ -284,49 +486,70 @@ describe('MusterBridgeServer auth', () => {
       callerTaskId: 'task-1',
       turnId: 'turn-coordinator',
       attemptId: 'a0',
-      allowedActions: new Set(['create_task', 'create_tasks']),
+      allowedActions: new Set([...PUBLIC_MCP_TOOL_ACTIONS, 'delegate_task']),
       ttlMs: 60_000,
     });
     const coordinator = await openMcpSession(port, token);
 
-    // Schema advertises `skills` under the brief object.
     const listed = await coordinator.request('tools/list');
     const tools = (listed.result as {
-      tools: Array<{ name: string; inputSchema: Record<string, unknown> }>;
+      tools: Array<{ name: string; description?: string; inputSchema: Record<string, unknown> }>;
     }).tools;
-    const createSchema = tools.find((tool) => tool.name === 'create_task')!.inputSchema;
-    const briefProps = (
-      (createSchema.properties as { brief: { properties: Record<string, unknown> } }).brief
-    ).properties;
-    expect(briefProps).toHaveProperty('skills');
-
-    const created = await coordinator.request('tools/call', {
-      name: 'create_task',
-      arguments: {
-        opId: 'op-1',
-        goal: 'implement',
-        taskType: 'worker',
-        brief: { kind: 'implement', skills: ['plan', 'review'] },
+    const names = tools.map((tool) => tool.name);
+    expect(names).toEqual(PUBLIC_MCP_TOOL_ACTIONS);
+    for (const tool of tools) {
+      expect(tool.description?.length).toBeGreaterThan(40);
+      expect(tool.inputSchema).toHaveProperty('description');
+    }
+    expect(tools.find((tool) => tool.name === 'inspect_workflow_run')).toMatchObject({
+      description: expect.stringContaining('recovery and diagnosis'),
+      inputSchema: {
+        required: ['runRef'],
+        additionalProperties: false,
       },
     });
-    expect(created.result).not.toHaveProperty('isError', true);
-    expect(handled[0]).toMatchObject({
-      tool: 'create_task',
-      command: { kind: 'create_task', spec: { brief: { skills: ['plan', 'review'] } } },
+    expect(tools.find((tool) => tool.name === 'invoke_child_workflow')).toMatchObject({
+      inputSchema: { properties: { workflow: { pattern: WORKFLOW_REF_PATTERN } } },
     });
-
-    const batch = await coordinator.request('tools/call', {
-      name: 'create_tasks',
-      arguments: {
-        opId: 'op-2',
-        tasks: [{ localId: 'a', goal: 'child', taskType: 'worker', brief: { skills: ['plan'] } }],
+    expect(tools.find((tool) => tool.name === 'upsert_presentation')).toMatchObject({
+      inputSchema: { properties: { presentationRef: { pattern: PRESENTATION_REF_PATTERN } } },
+    });
+    const inspected = await coordinator.request('tools/call', {
+      name: 'inspect_workflow_run',
+      arguments: { runRef: 'wfr-1' },
+    });
+    expect(inspected.result).not.toHaveProperty('isError', true);
+    const inspectedText = (inspected.result as { content: Array<{ text: string }> }).content[0]!.text;
+    expect(JSON.parse(inspectedText)).toEqual({
+      runRef: 'wfr-1',
+      workflowRef: 'review-flow@2',
+      status: 'running',
+      nodes: [{ node: 'review', status: 'running' }],
+      activations: [{ node: 'review', kind: 'dependency_gate', status: 'running' }],
+      feedback: [],
+      children: [],
+      diagnostics: [],
+    });
+    expect(inspectedText).not.toContain('gate-internal');
+    expect(inspectedText).not.toContain('maxDepth');
+    expect(handled).toEqual([
+      {
+        tool: 'inspect_workflow_run',
+        command: { kind: 'inspect_workflow_run', runId: 'wfr-1' },
       },
-    });
-    expect(batch.result).not.toHaveProperty('isError', true);
-    expect(handled[1]).toMatchObject({
-      tool: 'create_tasks',
-      command: { kind: 'create_tasks', specs: [{ brief: { skills: ['plan'] } }] },
-    });
+    ]);
+    for (const name of REMOVED_MCP_TOOLS) {
+      expect(names).not.toContain(name);
+      const removed = await coordinator.request('tools/call', {
+        name,
+        arguments: { opId: 'legacy-op', goal: 'legacy child', taskType: 'implement' },
+      });
+      expect(removed.result).toMatchObject({
+        content: [{ type: 'text', text: `unknown tool: ${name}` }],
+        isError: true,
+      });
+    }
+    expect(handled).toHaveLength(1);
   });
 
   it('accepts valid token with loopback host and absent origin on initialize', async () => {
@@ -341,7 +564,7 @@ describe('MusterBridgeServer auth', () => {
       callerTaskId: 't',
       turnId: 'turn-1',
       attemptId: 'a0',
-      allowedActions: new Set(['ask_user']),
+      allowedActions: new Set(['get_host_context']),
       ttlMs: 60_000,
     });
     const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
@@ -363,6 +586,38 @@ describe('MusterBridgeServer auth', () => {
     });
     expect(res.status).not.toBe(401);
     expect(res.status).not.toBe(403);
+  });
+
+  it('accepts a workflow message larger than the default Express 100 KiB parser limit', async () => {
+    const credentials = new CredentialRegistry();
+    const handled: unknown[] = [];
+    server = new MusterBridgeServer({
+      credentials,
+      toolHandler: {
+        handleToolCall: async (_ctx, _tool, command) => {
+          handled.push(command);
+          return { ok: true, result: {} };
+        },
+      },
+    });
+    const { port } = await server.listen();
+    const token = credentials.issue({
+      rootId: 'r',
+      callerTaskId: 't',
+      turnId: 'turn-large',
+      attemptId: 'a0',
+      allowedActions: new Set(['workflow_next']),
+      ttlMs: 60_000,
+    });
+    const session = await openMcpSession(port, token);
+    const message = 'x'.repeat(150_000);
+    const response = await session.request('tools/call', {
+      name: 'workflow_next',
+      arguments: { message },
+    });
+    expect(response.result).not.toMatchObject({ isError: true });
+    expect(handled).toHaveLength(1);
+    expect(handled[0]).toMatchObject({ kind: 'workflow_next', message });
   });
 });
 
@@ -440,7 +695,7 @@ describe('MusterBridgeServer generation, /health, and observers', () => {
       callerTaskId: 'task-1',
       turnId: 'turn-obs',
       attemptId: 'attempt-1',
-      allowedActions: new Set(['complete_task', 'fail_task']),
+      allowedActions: new Set(['workflow_next', 'workflow_fail']),
       ttlMs: 60_000,
     });
     const verified = credentials.verify(token)!;
@@ -448,7 +703,7 @@ describe('MusterBridgeServer generation, /health, and observers', () => {
     const listed = await session.request('tools/list');
     const tools = (listed.result as { tools: Array<{ name: string }> }).tools;
     const names = tools.map((t) => t.name).sort();
-    expect(names).toEqual(['complete_task', 'fail_task']);
+    expect(names).toEqual(['workflow_fail', 'workflow_next']);
 
     const listObs = observations.filter((o) => o.phase === 'list_tools');
     expect(listObs.length).toBeGreaterThanOrEqual(1);
@@ -460,7 +715,7 @@ describe('MusterBridgeServer generation, /health, and observers', () => {
       attemptId: 'attempt-1',
       generation: 1,
     });
-    expect((last.toolNames as string[]).slice().sort()).toEqual(['complete_task', 'fail_task']);
+    expect((last.toolNames as string[]).slice().sort()).toEqual(['workflow_fail', 'workflow_next']);
     // Never leak bearer token into observation.
     const serialized = JSON.stringify(last);
     expect(serialized).not.toContain(token);
@@ -481,13 +736,13 @@ describe('MusterBridgeServer generation, /health, and observers', () => {
         callerTaskId: `task-${turnId}`,
         turnId,
         attemptId: 'a0',
-        allowedActions: new Set(['get_task_status']),
+        allowedActions: new Set(['inspect_workflow_run']),
         ttlMs: 60_000,
       });
       const session = await openMcpSession(port, token);
       const listed = await session.request('tools/list');
       const tools = (listed.result as { tools: Array<{ name: string }> }).tools;
-      expect(tools.map((t) => t.name)).toEqual(['get_task_status']);
+      expect(tools.map((t) => t.name)).toEqual(['inspect_workflow_run']);
       return session;
     };
 
@@ -500,7 +755,7 @@ describe('MusterBridgeServer generation, /health, and observers', () => {
     for (const session of results) {
       const listed = await session.request('tools/list');
       const tools = (listed.result as { tools: Array<{ name: string }> }).tools;
-      expect(tools.map((t) => t.name)).toEqual(['get_task_status']);
+      expect(tools.map((t) => t.name)).toEqual(['inspect_workflow_run']);
     }
   });
 });

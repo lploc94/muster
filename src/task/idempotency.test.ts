@@ -11,7 +11,7 @@ function baseTask(overrides: Partial<MusterTask> = {}): MusterTask {
     lifecycle: 'open',
     goal: 'test',
     parentId: null,
-    dependencies: [],
+    prerequisites: [],
     backend: 'grok',
     capabilities: [],
     executionPolicy: {
@@ -82,7 +82,7 @@ describe('stageDisposition idempotency', () => {
     expect(second).toEqual({ ok: false, reason: 'same opId with different disposition' });
   });
 
-  it('rejects a different opId once staged', () => {
+  it('replays the same canonical disposition under a different opId', () => {
     const first = stageDisposition(live, { kind: 'idle' }, 'op-1', {});
     expect(first.ok).toBe(true);
     if (!first.ok) {
@@ -90,23 +90,20 @@ describe('stageDisposition idempotency', () => {
     }
 
     const second = stageDisposition(first.next.turn, { kind: 'idle' }, 'op-2', {});
-    expect(second).toEqual({
-      ok: false,
-      reason: 'disposition already staged with a different opId',
-    });
+    expect(second.ok).toBe(true);
   });
 
-  it('clamps over-long complete/fail payloads', () => {
+  it('rejects over-long complete/fail payloads without truncating them', () => {
     const complete = stageDisposition(
       live,
       { kind: 'complete', result: '123456789' },
       'op-1',
       { limits: { maxResult: 5, maxError: 5 } },
     );
-    expect(complete.ok).toBe(true);
-    if (complete.ok) {
-      expect(complete.next.turn.disposition).toEqual({ kind: 'complete', result: '12345' });
-    }
+    expect(complete).toEqual({
+      ok: false,
+      reason: 'complete result exceeds 5 UTF-8 bytes',
+    });
 
     const fail = stageDisposition(
       turn({ id: 't2', status: 'waiting_user', sequence: 1 }),
@@ -114,10 +111,10 @@ describe('stageDisposition idempotency', () => {
       'op-2',
       { limits: { maxResult: 5, maxError: 3 } },
     );
-    expect(fail.ok).toBe(true);
-    if (fail.ok) {
-      expect(fail.next.turn.disposition).toEqual({ kind: 'fail', error: 'abc' });
-    }
+    expect(fail).toEqual({
+      ok: false,
+      reason: 'failure error exceeds 3 UTF-8 bytes',
+    });
   });
 
   it('rejects complete/fail without limits', () => {
@@ -125,13 +122,13 @@ describe('stageDisposition idempotency', () => {
       stageDisposition(live, { kind: 'complete', result: 'x' }, 'op-1', {}),
     ).toEqual({
       ok: false,
-      reason: 'limits are required for complete or fail dispositions',
+      reason: 'limits are required for complete, fail, workflow_next, workflow_prev, or workflow_fail dispositions',
     });
     expect(
       stageDisposition(live, { kind: 'fail', error: 'x' }, 'op-1', {}),
     ).toEqual({
       ok: false,
-      reason: 'limits are required for complete or fail dispositions',
+      reason: 'limits are required for complete, fail, workflow_next, workflow_prev, or workflow_fail dispositions',
     });
   });
 

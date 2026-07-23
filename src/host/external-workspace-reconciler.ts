@@ -484,6 +484,7 @@ function reasoningToItem(segment: PersistedReasoning): TranscriptItem {
     id: segment.id,
     kind: 'reasoning',
     turnId: segment.turnId,
+    order: segment.order,
     content: segment.content,
   };
 }

@@ -1,4 +1,5 @@
 import type { EngineResult } from '../task/engine';
+import { TASK_MESSAGE_MAX_CHARS } from '../task/content-limits';
 
 /** Reject oversized inbound task/turn identifiers (defense-in-depth at host boundary). */
 export const MAX_QUEUED_MUTATION_ID_CHARS = 256;
@@ -7,7 +8,7 @@ export const MAX_QUEUED_MUTATION_ID_CHARS = 256;
  * Host-side content bound for editQueuedTurn. Matches TaskEngine.MAX_QUEUED_MESSAGE_CHARS
  * so oversized payloads are refused before they reach the engine store.
  */
-export const MAX_QUEUED_MUTATION_CONTENT_CHARS = 100_000;
+export const MAX_QUEUED_MUTATION_CONTENT_CHARS = TASK_MESSAGE_MAX_CHARS;
 
 /** Cap for sanitized refusal text posted to the webview (no raw stack dumps). */
 export const MAX_QUEUED_MUTATION_ERROR_CHARS = 400;

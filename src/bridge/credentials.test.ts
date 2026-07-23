@@ -9,14 +9,14 @@ describe('CredentialRegistry', () => {
       callerTaskId: 'task-1',
       turnId: 'turn-1',
       attemptId: 'a0',
-      allowedActions: new Set(['ask_user']),
+      allowedActions: new Set(['get_host_context']),
       ttlMs: 60_000,
     });
     const ctx = registry.verify(token);
     expect(ctx?.callerTaskId).toBe('task-1');
     expect(ctx?.turnId).toBe('turn-1');
     expect(ctx?.attemptId).toBe('a0');
-    expect(ctx?.allowedActions.has('ask_user')).toBe(true);
+    expect(ctx?.allowedActions.has('get_host_context')).toBe(true);
   });
 
   it('returns attemptId on verifyDetailed success', () => {
@@ -26,7 +26,7 @@ describe('CredentialRegistry', () => {
       callerTaskId: 'task-1',
       turnId: 'turn-1',
       attemptId: 'attempt-42',
-      allowedActions: new Set(['ask_user']),
+      allowedActions: new Set(['get_host_context']),
       ttlMs: 60_000,
     });
     const detailed = registry.verifyDetailed(token);
@@ -48,7 +48,7 @@ describe('CredentialRegistry', () => {
       callerTaskId: 't',
       turnId: 'turn-2',
       attemptId: 'a0',
-      allowedActions: new Set(['ask_user']),
+      allowedActions: new Set(['get_host_context']),
       ttlMs: 60_000,
     });
     registry.revoke('turn-2');
@@ -70,7 +70,7 @@ describe('CredentialRegistry', () => {
       callerTaskId: 'expired-task',
       turnId: 'expired-turn',
       attemptId: 'a0',
-      allowedActions: new Set(['ask_user']),
+      allowedActions: new Set(['get_host_context']),
       ttlMs: -1,
     });
     const result = registry.verifyDetailed(token);
@@ -91,7 +91,7 @@ describe('CredentialRegistry', () => {
       callerTaskId: 'root',
       turnId: 'parent-turn',
       attemptId: 'a0',
-      allowedActions: new Set(['wait_for_tasks']),
+      allowedActions: new Set(['inspect_workflow_run']),
       ttlMs: 60_000,
     });
     const child = registry.issue({
@@ -99,7 +99,7 @@ describe('CredentialRegistry', () => {
       callerTaskId: 'child',
       turnId: 'child-turn',
       attemptId: 'a0',
-      allowedActions: new Set(['complete_task']),
+      allowedActions: new Set(['workflow_next']),
       ttlMs: 60_000,
     });
     registry.revoke('parent-turn');
@@ -118,7 +118,7 @@ describe('CredentialRegistry', () => {
       callerTaskId: 'task-1',
       turnId: 'turn-x',
       attemptId: 'attempt-1',
-      allowedActions: new Set(['ask_user']),
+      allowedActions: new Set(['get_host_context']),
       ttlMs: 60_000,
     });
     const second = registry.issue({
@@ -126,7 +126,7 @@ describe('CredentialRegistry', () => {
       callerTaskId: 'task-1',
       turnId: 'turn-x',
       attemptId: 'attempt-2',
-      allowedActions: new Set(['ask_user']),
+      allowedActions: new Set(['get_host_context']),
       ttlMs: 60_000,
     });
 
@@ -152,7 +152,7 @@ describe('CredentialRegistry', () => {
       callerTaskId: 'task-1',
       turnId: 'turn-y',
       attemptId: 'attempt-1',
-      allowedActions: new Set(['ask_user']),
+      allowedActions: new Set(['get_host_context']),
       ttlMs: 60_000,
     });
     registry.revokeAttempt('turn-y', 'attempt-1');
@@ -172,7 +172,7 @@ describe('CredentialRegistry', () => {
       callerTaskId: 'task-1',
       turnId: 'turn-settle',
       attemptId: 'attempt-9',
-      allowedActions: new Set(['ask_user']),
+      allowedActions: new Set(['get_host_context']),
       ttlMs: 60_000,
     });
     registry.revoke('turn-settle');

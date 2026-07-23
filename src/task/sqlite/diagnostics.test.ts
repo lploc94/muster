@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { DbWorkerError } from './client';
 import { MusterSqliteError } from './errors';
-import { diagnoseSqliteError, redactedDiagnosticLogFields } from './diagnostics';
+import {
+  diagnoseSqliteError,
+  recoveryGuidanceFor,
+  redactedDiagnosticLogFields,
+} from './diagnostics';
 import {
   ForeignDatabaseError,
   IncompatibleSchemaError,
@@ -46,5 +50,26 @@ describe('P5-W2 SQLite diagnostics', () => {
       terminal: true,
     });
     expect(JSON.stringify(log)).not.toMatch(/\/Users\/|secret|SELECT/i);
+  });
+
+  it('treats schema_changed as terminal with Reload Window guidance, not reveal/reset', () => {
+    const diagnostic = diagnoseSqliteError(
+      new MusterSqliteError('schema_changed', 'transaction'),
+      'transaction',
+    );
+    expect(diagnostic.code).toBe('schema_changed');
+    expect(diagnostic.terminal).toBe(true);
+    expect(diagnostic.failClosed).toBe(true);
+    expect(diagnostic.recoveryAction).toBe('reload_window');
+    expect(recoveryGuidanceFor(diagnostic)).toMatch(/reload/i);
+    expect(recoveryGuidanceFor(diagnostic)).not.toMatch(/reveal|reset|delete/i);
+    expect(diagnostic.message).not.toMatch(/muster_writer_version|SELECT |\/Users\//i);
+  });
+
+  it('gives incompatible development schemas coordinated destructive-reset guidance', () => {
+    const diagnostic = diagnoseSqliteError(new IncompatibleSchemaError(2), 'open');
+    expect(recoveryGuidanceFor(diagnostic)).toMatch(/Reset Muster Data/i);
+    expect(recoveryGuidanceFor(diagnostic)).toMatch(/permanently deletes/i);
+    expect(recoveryGuidanceFor(diagnostic)).toMatch(/main\/-wal\/-shm/i);
   });
 });

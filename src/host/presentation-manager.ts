@@ -14,6 +14,7 @@ const REQUEST_KEYS = new Set([
   'ownerTaskId',
   'opId',
   'revision',
+  'requireExisting',
   'title',
   'markdown',
   'kind',
@@ -33,7 +34,8 @@ export interface PresentationUpsertRequest {
   presentationId: string;
   ownerTaskId: string;
   opId: string;
-  revision: number;
+  revision?: number;
+  requireExisting?: boolean;
   title: string;
   markdown: string;
   kind?: PresentationKind;
@@ -181,8 +183,10 @@ function validateRequest(request: PresentationUpsertRequest): PresentationResult
     !isStableId(request.presentationId) ||
     !isStableId(request.ownerTaskId) ||
     !isStableId(request.opId) ||
-    !Number.isSafeInteger(request.revision) ||
-    request.revision <= 0 ||
+    (request.revision !== undefined && (
+      !Number.isSafeInteger(request.revision) || request.revision <= 0
+    )) ||
+    (request.requireExisting !== undefined && typeof request.requireExisting !== 'boolean') ||
     typeof request.title !== 'string' ||
     request.title.length === 0 ||
     typeof request.markdown !== 'string' ||
@@ -360,10 +364,44 @@ export class PresentationManager {
       return { ok: false, code: 'owner_mismatch' };
     }
 
+    if (!this.documentStore) return { ok: false, code: 'host_delivery_failed' };
+    let revision = request.revision;
+    let stored: PresentationDocument | undefined;
+    if (request.requireExisting === true || revision === undefined) {
+      try {
+        stored = await this.documentStore.getPresentation(context.rootId, request.presentationId);
+      } catch {
+        return { ok: false, code: 'host_delivery_failed' };
+      }
+      if (request.requireExisting === true && !stored) {
+        return { ok: false, code: 'invalid_arguments' };
+      }
+      if (stored?.ownerTaskId !== undefined && stored.ownerTaskId !== request.ownerTaskId) {
+        return { ok: false, code: 'owner_mismatch' };
+      }
+    }
+    if (revision === undefined) {
+      if (
+        stored &&
+        stored.title === request.title &&
+        stored.markdown === request.markdown &&
+        stored.kind === request.kind &&
+        stored.summary === request.summary &&
+        stored.changeSummary === request.changeSummary
+      ) {
+        const key = this.presentationKey(context.rootId, request.presentationId);
+        const delivered = await this.deliverCanonicalDocument(context.rootId, key, stored);
+        return delivered === 'ok'
+          ? { ok: true, code: 'idempotent' }
+          : { ok: false, code: delivered };
+      }
+      revision = (stored?.revision ?? 0) + 1;
+    }
+
     const base: PresentationDocument = {
       presentationId: request.presentationId,
       ownerTaskId: request.ownerTaskId,
-      revision: request.revision,
+      revision,
       title: request.title,
       markdown: request.markdown,
     };
@@ -380,7 +418,6 @@ export class PresentationManager {
         : { ok: false, code: 'op_conflict' };
     }
 
-    if (!this.documentStore) return { ok: false, code: 'host_delivery_failed' };
     const document = stampUpdatedAt(base);
     let status: Awaited<ReturnType<PresentationDocumentStore['commitPresentationOperation']>>;
     try {

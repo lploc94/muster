@@ -5,7 +5,7 @@ import { expect, test, type Page } from '@playwright/test';
  * Protocol-conformant large history: bootstrap <=100, then owned older pages.
  */
 
-const PROTOCOL_VERSION = 9;
+const PROTOCOL_VERSION = 10;
 const BOOTSTRAP = 100;
 const PAGE = 100;
 const TOTAL = 2000;
@@ -77,6 +77,7 @@ function buildHistory(total = TOTAL): TranscriptItem[] {
         kind: 'reasoning',
         turnId,
         content: `Reasoning block ${n}: ${'think '.repeat(20)}`,
+        order: 1,
       });
     } else if (mod === 2) {
       items.push({
@@ -87,7 +88,7 @@ function buildHistory(total = TOTAL): TranscriptItem[] {
             ? `# Tall markdown ${n}\n\n${'paragraph with **bold** and code.\n\n'.repeat(12)}\`\`\`ts\nconst x = ${n};\n\`\`\`\n`
             : `Assistant reply ${n}`,
         turnId,
-        order: 1,
+        order: 2,
         state: 'complete',
       });
     } else if (mod === 3) {
@@ -95,7 +96,7 @@ function buildHistory(total = TOTAL): TranscriptItem[] {
         id: `t-${n}`,
         kind: 'tool',
         turnId,
-        order: 2,
+        order: 3,
         content: {
           toolCallId: `t-${n}`,
           name: 'bash',
@@ -119,7 +120,7 @@ function buildHistory(total = TOTAL): TranscriptItem[] {
         kind: 'assistant',
         content: `Mid ${n}`,
         turnId,
-        order: 1,
+        order: 3,
         state: 'complete',
       });
     } else if (mod === 6) {
@@ -151,9 +152,9 @@ function buildHistory(total = TOTAL): TranscriptItem[] {
   return items;
 }
 
-/** Settled list items exclude reasoning (turn-scoped header). */
+/** Every durable transcript item maps to one settled virtual row. */
 function settledIds(items: TranscriptItem[]): string[] {
-  return items.filter((item) => item.kind !== 'reasoning').map((item) => item.id);
+  return items.map((item) => item.id);
 }
 
 function cursorForIndex(index: number): string {
@@ -734,6 +735,83 @@ test.describe('Phase 6 chat virtualization', () => {
     expect(await mountedTranscriptCount(page)).toBeLessThanOrEqual(MAX_MOUNTED);
   });
 
+  test('small upward scroll unpins both completed and streaming threads', async ({
+    page,
+  }) => {
+    await openWebview(page);
+    const history = buildHistory(150);
+    const bootstrap = history.slice(history.length - BOOTSTRAP);
+    const taskId = 'task-complete-unpin';
+    const settled = settledIds(bootstrap);
+
+    await postFocusedSnapshot(page, {
+      taskId,
+      transcript: bootstrap,
+      storeRevision: 1,
+      hasMoreBefore: false,
+    });
+    await expect(page.locator(`[data-transcript-id="${settled.at(-1)}"]`)).toBeVisible();
+
+    const scroll = page.locator('[data-testid="chat-thread-scroll"]');
+    const scrollToLatest = page.getByRole('button', { name: 'Scroll to latest' });
+    const scrollUpSlightly = async () => {
+      await scroll.evaluate((el) => {
+        const max = Math.max(0, el.scrollHeight - el.clientHeight);
+        el.dispatchEvent(new WheelEvent('wheel', { deltaY: -40, bubbles: true }));
+        el.scrollTop = Math.max(0, max - 40);
+        el.dispatchEvent(new Event('scroll', { bubbles: true }));
+      });
+    };
+    await page.waitForTimeout(80);
+    await scrollUpSlightly();
+    await expect(scrollToLatest).toBeVisible();
+    const scrollBefore = await scroll.evaluate((el) => el.scrollTop);
+
+    await postHost(page, {
+      type: 'workspacePatchBatch',
+      revision: 2,
+      patches: [],
+    });
+    await page.waitForTimeout(80);
+
+    const scrollAfter = await scroll.evaluate((el) => el.scrollTop);
+    expect(Math.abs(scrollAfter - scrollBefore)).toBeLessThanOrEqual(4);
+    await expect(scrollToLatest).toBeVisible();
+
+    await scrollToLatest.click();
+    await expect(scrollToLatest).toBeHidden();
+    await postHost(page, {
+      type: 'turnStart',
+      taskId,
+      turnId: 'turn-live',
+      trigger: 'user',
+    });
+    await postHost(page, {
+      type: 'event',
+      taskId,
+      turnId: 'turn-live',
+      event: { type: 'assistantDelta', messageId: 'stream-small-unpin', content: 'Hello' },
+    });
+    await expect(page.getByText('Hello')).toBeVisible();
+    await page.waitForTimeout(80);
+
+    await scrollUpSlightly();
+    await expect(scrollToLatest).toBeVisible();
+    const streamingScrollBefore = await scroll.evaluate((el) => el.scrollTop);
+    await postHost(page, {
+      type: 'event',
+      taskId,
+      turnId: 'turn-live',
+      event: { type: 'assistantDelta', messageId: 'stream-small-unpin', content: ' world' },
+    });
+    await expect(page.getByText('Hello world')).toBeAttached();
+    await page.waitForTimeout(80);
+
+    const streamingScrollAfter = await scroll.evaluate((el) => el.scrollTop);
+    expect(Math.abs(streamingScrollAfter - streamingScrollBefore)).toBeLessThanOrEqual(4);
+    await expect(scrollToLatest).toBeVisible();
+  });
+
   test('unpinned streaming keeps scroll; offscreen tool patch applies on visit', async ({
     page,
   }) => {
@@ -840,13 +918,14 @@ test.describe('Phase 6 chat virtualization', () => {
         kind: 'reasoning',
         turnId,
         content: `Boundary reasoning ${i}`,
+        order: 1,
       });
       items.push({
         id: `ba-${i}`,
         kind: 'assistant',
         content: i % 5 === 0 ? `# Tall boundary ${i}\n\n${'line\n'.repeat(30)}` : `Assistant ${i}`,
         turnId,
-        order: 1,
+        order: 2,
         state: 'complete',
       });
     }
@@ -858,17 +937,18 @@ test.describe('Phase 6 chat virtualization', () => {
       hasMoreBefore: false,
     });
 
-    // Navigate to a mid assistant that should open a block header after a user row.
-    const targetIndex = 40; // settled index of ba-20 roughly; compute from settled list
+    // Navigate to a mid response block whose reasoning follows a user row.
     const settled = settledIds(items);
+    const reasoningId = 'br-20';
     const assistantId = 'ba-20';
-    const idx = settled.indexOf(assistantId);
+    const idx = settled.indexOf(reasoningId);
     expect(idx).toBeGreaterThan(0);
     await page.evaluate((index) => {
       window.dispatchEvent(new CustomEvent('muster-chat-scroll', { detail: { to: index } }));
     }, idx);
-    const row = page.locator(`[data-transcript-id="${assistantId}"]`);
+    const row = page.locator(`[data-transcript-id="${reasoningId}"]`);
     await expect(row).toBeVisible({ timeout: 8_000 });
+    await expect(page.locator(`[data-transcript-id="${assistantId}"]`)).toBeVisible();
     // Reasoning lives in a collapsed <details>; open it then assert content.
     const thinking = row.locator('details').filter({ hasText: 'Thinking' }).first();
     await expect(thinking).toBeAttached();
@@ -891,11 +971,10 @@ test.describe('Phase 6 chat virtualization', () => {
           const a = rows[idx]!.getBoundingClientRect();
           const b = rows[idx + 1]!.getBoundingClientRect();
           return a.bottom <= b.top + 1;
-        }, assistantId);
+        }, reasoningId);
       }, { timeout: 3_000 })
       .toBe(true);
     expect(await mountedTranscriptCount(page)).toBeLessThanOrEqual(MAX_MOUNTED);
-    void targetIndex;
   });
 });
 

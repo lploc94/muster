@@ -8,6 +8,7 @@
 import { Worker } from 'node:worker_threads';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
+import type { RepositoryCommandResult, WorkflowTransactionalCommand } from '../repository';
 import type {
   BackupResultMeta,
   DbRequest,
@@ -297,6 +298,21 @@ export class DbClient {
       throw new DbWorkerError(makeProtocolError());
     }
     return res.results;
+  }
+
+  async executeWorkflowMutation(
+    command: WorkflowTransactionalCommand,
+    changeFeedRetainRevisions: number,
+  ): Promise<RepositoryCommandResult> {
+    const res = await this.send({
+      kind: 'workflowMutation',
+      command,
+      changeFeedRetainRevisions,
+    });
+    if (res.kind !== 'workflowMutation') {
+      throw new DbWorkerError(makeProtocolError());
+    }
+    return res.result;
   }
 
   async pragma(pragma: string): Promise<number> {

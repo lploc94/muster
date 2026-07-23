@@ -22,6 +22,7 @@ import { DatabaseSync } from 'node:sqlite';
 import {
   CURRENT_SCHEMA_STATEMENTS,
   MUSTER_APPLICATION_ID,
+  MUSTER_WRITER_VERSION_UDF,
   SQLITE_SCHEMA_VERSION,
 } from './schema';
 import { MusterSqliteError, mapToMusterSqliteError } from './errors';
@@ -92,6 +93,15 @@ export class NonEmptyUnclaimedDatabaseError extends MusterSqliteError {
 // Schema version remains the ownership gate; it is not serialized on the RPC wire.
 void SQLITE_SCHEMA_VERSION;
 
+/**
+ * Register the connection-local writer-version UDF required by write-guard triggers.
+ * Stale connections without this UDF (or with a different compiled version) fail closed.
+ */
+export function registerWriterVersionUdf(db: DatabaseSync): void {
+  // deterministic: safe for WHEN-clause evaluation; Number() keeps a stable SQLite numeric.
+  db.function(MUSTER_WRITER_VERSION_UDF, { deterministic: true }, () => Number(SQLITE_SCHEMA_VERSION));
+}
+
 function readScalar(db: DatabaseSync, pragma: string): number {
   const row = db.prepare(`PRAGMA ${pragma}`).get() as Record<string, number> | undefined;
   if (!row) {
@@ -150,6 +160,7 @@ function applyRuntimePragmas(db: DatabaseSync, busyTimeoutMs: number): void {
 }
 
 type ExclusiveOpenDecision = { kind: 'current' } | { kind: 'blank_claimed' };
+type ExistingOpenResult = 'current' | false;
 
 /**
  * Private signal: state changed under concurrent first-open (peer bootstrap).
@@ -220,7 +231,7 @@ function exclusiveOpenDecision(db: DatabaseSync): ExclusiveOpenDecision {
 
 /**
  * Read-only ownership probe. Never stamps markers or creates schema.
- * - current Muster → true (skip exclusive claim)
+ * - current Muster → 'current'
  * - blank → false (claim under exclusive)
  * - concurrent schema-without-markers after a blank was observed → ConcurrentOpenStateChanged
  * - genuine non-empty unclaimed on first probe → NonEmptyUnclaimedDatabaseError
@@ -228,7 +239,7 @@ function exclusiveOpenDecision(db: DatabaseSync): ExclusiveOpenDecision {
 function tryOpenExistingCurrent(
   db: DatabaseSync,
   opts: { allowConcurrentNonemptyRetry: boolean },
-): boolean {
+): ExistingOpenResult {
   const applicationId = readScalar(db, 'application_id');
   const userVersion = readScalar(db, 'user_version');
   if (applicationId !== 0 && applicationId !== MUSTER_APPLICATION_ID) {
@@ -237,7 +248,7 @@ function tryOpenExistingCurrent(
   if (applicationId === MUSTER_APPLICATION_ID) {
     if (userVersion === SQLITE_SCHEMA_VERSION) {
       assertCurrentSchemaComplete(db);
-      return true;
+      return 'current';
     }
     throw new IncompatibleSchemaError(userVersion);
   }
@@ -250,7 +261,7 @@ function tryOpenExistingCurrent(
     const verAgain = readScalar(db, 'user_version');
     if (appAgain === MUSTER_APPLICATION_ID && verAgain === SQLITE_SCHEMA_VERSION) {
       assertCurrentSchemaComplete(db);
-      return true;
+      return 'current';
     }
     if (opts.allowConcurrentNonemptyRetry && appAgain === 0 && verAgain === 0) {
       throw new ConcurrentOpenStateChanged();
@@ -292,10 +303,10 @@ export function openStoreDatabase(opts: OpenOptions): DatabaseSync {
       db = new DatabaseSync(opts.path);
       // Connection-local only — does not mutate durable journal/application markers.
       applyConnectionBusyTimeout(db, busyTimeoutMs);
-      const alreadyCurrent = tryOpenExistingCurrent(db, {
+      const existing = tryOpenExistingCurrent(db, {
         allowConcurrentNonemptyRetry: sawBlankPreflight,
       });
-      if (!alreadyCurrent) {
+      if (!existing) {
         sawBlankPreflight = true;
         // Fresh connection for exclusive claim so page cache cannot retain a
         // pre-peer-commit blank snapshot across BEGIN EXCLUSIVE.
@@ -308,6 +319,8 @@ export function openStoreDatabase(opts: OpenOptions): DatabaseSync {
         applyConnectionBusyTimeout(db, busyTimeoutMs);
         exclusiveOpenDecision(db);
       }
+      // Writer UDF must be registered before any guarded write on this connection.
+      registerWriterVersionUdf(db);
       // WAL / foreign_keys / synchronous only after ownership is confirmed.
       applyRuntimePragmas(db, busyTimeoutMs);
       return db;

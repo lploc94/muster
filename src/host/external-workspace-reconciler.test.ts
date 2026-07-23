@@ -20,7 +20,7 @@ function makeTask(id: string): MusterTask {
     releaseState: 'draft',
     goal: id,
     parentId: null,
-    dependencies: [],
+    prerequisites: [],
     backend: 'grok',
     capabilities: [],
     executionPolicy: { maxTurns: 10, maxAutomaticRetries: 1 },
@@ -105,6 +105,31 @@ describe('external workspace reconciler', () => {
         .sort();
       expect(upserted).toEqual(['local-after', 'peer-between']);
       expect(projectionA.getFile().revision).toBe(4);
+    } finally {
+      await pair.close();
+    }
+  }, 30_000);
+
+  it('keeps a pre-hydrated peer task visible in the reconciled patch', async () => {
+    const pair = await openPair();
+    try {
+      const projection = await RepositoryProjection.load(pair.b, 'ws');
+      await pair.a.execute({ kind: 'createTask', workspaceId: 'ws', task: makeTask('prehydrated-peer') });
+      await projection.refreshTask('prehydrated-peer');
+
+      const result = await reconcileExternalWorkspaceChanges({
+        repository: pair.b,
+        projection,
+        afterRevision: 1,
+        knownTranscriptIds: new Set(),
+      });
+      expect(result.kind).toBe('batches');
+      if (result.kind !== 'batches') return;
+      expect(result.batches).toHaveLength(1);
+      expect(result.batches[0]?.patches).toEqual([
+        expect.objectContaining({ type: 'turnActivityChanged', task: expect.objectContaining({ id: 'prehydrated-peer' }) }),
+      ]);
+      expect(projection.getFile().revision).toBe(2);
     } finally {
       await pair.close();
     }

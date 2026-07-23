@@ -5,7 +5,7 @@ import type { MusterTask } from '../task/types';
 function task(overrides: Partial<MusterTask> = {}): MusterTask {
   return {
     id: 'root', role: 'coordinator', lifecycle: 'open', goal: 'g', parentId: null,
-    dependencies: [], backend: 'claude', capabilities: [],
+    prerequisites: [], backend: 'claude', capabilities: [],
     executionPolicy: { maxTurns: 10, maxAutomaticRetries: 0, turnTimeoutMs: 1, taskTimeoutMs: 1 },
     revision: 1, createdAt: 'now', updatedAt: 'now', ...overrides,
   };

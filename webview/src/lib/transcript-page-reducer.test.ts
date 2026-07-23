@@ -33,8 +33,8 @@ function tool(id: string, status: 'running' | 'success' | 'error' = 'success'): 
   };
 }
 
-function reasoning(id: string, turnId: string, content: string): TranscriptItem {
-  return { id, kind: 'reasoning', turnId, content };
+function reasoning(id: string, turnId: string, content: string, order: number): TranscriptItem {
+  return { id, kind: 'reasoning', turnId, order, content };
 }
 
 function success(
@@ -275,13 +275,14 @@ describe('applyTranscriptPageResult', () => {
     expect(t && t.kind === 'tool' ? t.input : null).toEqual({ cmd: 'live' });
   });
 
-  it('does not overwrite live reasoning when ownership id is the turn id', () => {
-    // Live reasoningDelta owns activeTurnId as the entity id (not backend messageId).
+  it('does not overwrite an existing reasoning segment with an overlapping page row', () => {
     const base: TranscriptPageWindowState = {
       ...seeded(['u1']),
-      reasoningByTurn: { 'turn-live': 'live stream reasoning' },
-      reasoningTurnByItemId: { 'turn-live': 'turn-live' },
-      loadedTranscriptIds: new Set(['u1', 'turn-live']),
+      items: [
+        ...seeded(['u1']).items,
+        { kind: 'reasoning', id: 'r-live', text: 'live stream reasoning', turnId: 'turn-live', order: 1 },
+      ],
+      loadedTranscriptIds: new Set(['u1', 'r-live']),
       beforeCursor: 'v2.seed',
       hasMoreBefore: true,
     };
@@ -291,20 +292,25 @@ describe('applyTranscriptPageResult', () => {
       pending.state,
       success(
         'req-1',
-        [reasoning('turn-live', 'turn-live', 'stale older reasoning'), user('u0', 'older')],
+        [reasoning('r-live', 'turn-live', 'stale older reasoning', 1), user('u0', 'older')],
         { hasMoreBefore: false, workspaceRevision: 2 },
       ),
       'task-1',
     );
-    expect(applied.state.reasoningByTurn['turn-live']).toBe('live stream reasoning');
-    expect(applied.state.items.map((i) => i.id)).toEqual(['u0', 'u1']);
+    expect(applied.state.items.map((i) => i.id)).toEqual(['u0', 'u1', 'r-live']);
+    expect(applied.state.items.find((item) => item.id === 'r-live')).toMatchObject({
+      kind: 'reasoning',
+      text: 'live stream reasoning',
+    });
   });
 
-  it('dedupes reasoning by entity id and never overwrites existing turn reasoning', () => {
+  it('dedupes reasoning by segment id and preserves multiple segments for one turn', () => {
     const base: TranscriptPageWindowState = {
       ...seeded(['u1']),
-      reasoningByTurn: { 'turn-a': 'live reasoning' },
-      reasoningTurnByItemId: { 'r-live': 'turn-a' },
+      items: [
+        { kind: 'reasoning', id: 'r-live', text: 'live reasoning', turnId: 'turn-a', order: 3 },
+        ...seeded(['u1']).items,
+      ],
       loadedTranscriptIds: new Set(['u1', 'r-live']),
       beforeCursor: 'v2.seed',
       hasMoreBefore: true,
@@ -316,18 +322,17 @@ describe('applyTranscriptPageResult', () => {
       success(
         'req-1',
         [
-          reasoning('r-old', 'turn-a', 'older reasoning'),
-          reasoning('r-new-turn', 'turn-b', 'first'),
-          reasoning('r-new-turn-2', 'turn-b', 'second canonical'),
+          reasoning('r-old', 'turn-a', 'older reasoning', 0),
+          reasoning('r-new-turn', 'turn-b', 'first', 0),
+          reasoning('r-new-turn-2', 'turn-b', 'second canonical', 2),
         ],
         { hasMoreBefore: false, workspaceRevision: 3 },
       ),
       'task-1',
     );
-    expect(applied.state.reasoningByTurn['turn-a']).toBe('live reasoning');
-    // Within an older page for a turn with no prior reasoning, last row wins
-    // (hydrate canonical). Existing/live turns are never overwritten.
-    expect(applied.state.reasoningByTurn['turn-b']).toBe('second canonical');
+    expect(applied.state.items.map((item) => item.id)).toEqual([
+      'r-old', 'r-new-turn', 'r-new-turn-2', 'r-live', 'u1',
+    ]);
     expect(applied.state.loadedTranscriptIds.has('r-old')).toBe(true);
     expect(applied.state.loadedTranscriptIds.has('r-new-turn')).toBe(true);
   });
@@ -428,7 +433,7 @@ describe('ownershipFromTranscript', () => {
   it('includes reasoning entity ids', () => {
     const ids = ownershipFromTranscript([
       user('u1', 'a'),
-      reasoning('r1', 'turn-a', 'think'),
+      reasoning('r1', 'turn-a', 'think', 0),
     ]);
     expect([...ids].sort()).toEqual(['r1', 'u1']);
   });

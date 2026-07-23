@@ -10,6 +10,7 @@ import { CredentialRegistry } from '../bridge/credentials';
 import { deriveEntityId } from './engine-graph';
 import { parseTaskTypeRegistry } from './task-types';
 import { RepositoryProjection, withRepositoryProjection } from './repository-projection';
+import { projectCurrentTurnActivity } from '../host/snapshot';
 
 function currentTask(id: string, overrides: Partial<MusterTask> = {}): MusterTask {
   return {
@@ -19,7 +20,7 @@ function currentTask(id: string, overrides: Partial<MusterTask> = {}): MusterTas
     releaseState: 'released',
     goal: id,
     parentId: null,
-    dependencies: [],
+    prerequisites: [],
     backend: 'fake',
     capabilities: [],
     executionPolicy: { maxTurns: 10, maxAutomaticRetries: 0 },
@@ -40,7 +41,7 @@ describe('TaskEngine repository-only boundary', () => {
       await repository.execute({ kind: 'upsertWorkspace', workspaceId: 'ws', identityKey: 'coord-reload', displayName: 'Coord reload', createdAt: 'now', lastOpenedAt: 'now' });
       const task: MusterTask = {
         id: 'reload-task', role: 'coordinator', lifecycle: 'open', goal: 'reload coordination',
-        parentId: null, dependencies: [], backend: 'grok', capabilities: ['create_child'],
+        parentId: null, prerequisites: [], backend: 'grok', capabilities: ['create_child'],
         executionPolicy: { maxTurns: 4, maxAutomaticRetries: 0 }, releaseState: 'released',
         revision: 0, createdAt: '2026-07-16T00:00:00.000Z', updatedAt: '2026-07-16T00:00:00.000Z',
       };
@@ -82,7 +83,7 @@ describe('TaskEngine repository-only boundary', () => {
       await repository.execute({ kind: 'upsertWorkspace', workspaceId: 'ws', identityKey: 'engine-repository', displayName: 'Engine repository', createdAt: 'now', lastOpenedAt: 'now' });
       const task: MusterTask = {
         id: 'repository-task', role: 'worker', lifecycle: 'open', goal: 'run through sqlite',
-        parentId: null, dependencies: [], backend: 'fake', capabilities: [],
+        parentId: null, prerequisites: [], backend: 'fake', capabilities: [],
         executionPolicy: { maxTurns: 4, maxAutomaticRetries: 0 }, releaseState: 'released',
         revision: 0, createdAt: '2026-07-16T00:00:00.000Z', updatedAt: '2026-07-16T00:00:00.000Z',
       };
@@ -101,6 +102,319 @@ describe('TaskEngine repository-only boundary', () => {
       await expect(repository.getTurn('repository-turn')).resolves.toMatchObject({ status: 'succeeded' });
       await expect(repository.getRuntimeClaim('repository-turn')).resolves.toBeUndefined();
     } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('replays a root send when concurrent engines race after preflight', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-engine-root-receipt-race-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    let first: TaskEngine | undefined;
+    let second: TaskEngine | undefined;
+    let releasePreflight!: () => void;
+    const preflightBarrier = new Promise<void>((resolve) => { releasePreflight = resolve; });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const repository = new SqliteTaskRepository(client, 'ws');
+      await repository.execute({
+        kind: 'upsertWorkspace', workspaceId: 'ws', identityKey: 'engine-root-receipt-race',
+        displayName: 'Engine root receipt race', createdAt: 'now', lastOpenedAt: 'now',
+      });
+      const config = {
+        repository,
+        workspaceId: 'ws',
+        makeBackend: () => ({
+          name: 'fake',
+          capabilities: { supportsMCP: true, supportsReasoning: false, supportsDetailedToolEvents: false },
+          run: async function* () {},
+        }),
+        runTurn: async function* () {
+          yield { type: 'turnCompleted' as const };
+        },
+        clock: () => '2026-07-16T00:00:00.000Z',
+      };
+      first = await TaskEngine.loadAsync(config);
+      second = await TaskEngine.loadAsync(config);
+
+      const originalGetSendReceipt = repository.getSendReceipt.bind(repository);
+      let preflightReads = 0;
+      const receiptSpy = vi.spyOn(repository, 'getSendReceipt').mockImplementation(async (clientRequestId) => {
+        if (clientRequestId === 'engine-root-race' && preflightReads < 2) {
+          preflightReads += 1;
+          if (preflightReads === 2) releasePreflight();
+          await preflightBarrier;
+        }
+        return originalGetSendReceipt(clientRequestId);
+      });
+      try {
+        const results = await Promise.all([
+          first.startNewTask({ goal: 'same root goal', backend: 'fake', clientRequestId: 'engine-root-race' }),
+          second.startNewTask({ goal: 'same root goal', backend: 'fake', clientRequestId: 'engine-root-race' }),
+        ]);
+        expect(results[0]).toMatchObject({ ok: true });
+        expect(results[1]).toMatchObject({ ok: true });
+        if (!results[0].ok || !results[1].ok) return;
+        expect(results[1].value).toEqual(results[0].value);
+        await Promise.all([first.whenIdle(), second.whenIdle()]);
+        await expect(repository.listTasks('ws')).resolves.toHaveLength(1);
+        expect(first.getReadModel().getFile().tasks[results[0].value.taskId]).toBeDefined();
+        expect(second.getReadModel().getFile().tasks[results[0].value.taskId]).toBeDefined();
+        expect(first.getReadModel().getFile().turns[results[0].value.turnId]).toBeDefined();
+        expect(second.getReadModel().getFile().turns[results[0].value.turnId]).toBeDefined();
+        await expect(repository.getSendReceipt('engine-root-race')).resolves.toMatchObject({
+          taskId: results[0].value.taskId,
+          messageId: results[0].value.messageId,
+          turnId: results[0].value.turnId,
+        });
+      } finally {
+        receiptSpy.mockRestore();
+      }
+    } finally {
+      releasePreflight();
+      await Promise.all([
+        first?.shutdown().catch(() => undefined),
+        second?.shutdown().catch(() => undefined),
+      ]);
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('rotates a replacement session binding and keeps the root coordinator open', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-engine-session-rotation-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    let engine: TaskEngine | undefined;
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const repository = new SqliteTaskRepository(client, 'ws');
+      await repository.execute({ kind: 'upsertWorkspace', workspaceId: 'ws', identityKey: 'session-rotation', displayName: 'Session rotation', createdAt: 'now', lastOpenedAt: 'now' });
+      const task = currentTask('session-rotation-root', {
+        role: 'coordinator',
+        capabilities: ['create_child'],
+        runtimeEpoch: 1,
+      });
+      await repository.execute({ kind: 'createTask', workspaceId: 'ws', task });
+      await repository.execute({
+        kind: 'createTurn', workspaceId: 'ws', turn: {
+          id: 'session-rotation-first', taskId: task.id, sequence: 1, status: 'queued',
+          trigger: 'user', inputs: [], createdAt: '2026-07-16T00:00:01.000Z', runtimeEpoch: 1,
+        },
+      });
+      let runCount = 0;
+      engine = await TaskEngine.loadAsync({
+        repository,
+        workspaceId: 'ws',
+        makeBackend: () => ({ name: 'fake', run: async function* () {} }),
+        runTurn: async function* () {
+          runCount += 1;
+          yield {
+            type: 'sessionStarted',
+            sessionId: runCount === 1 ? 'session-original' : 'session-recovered',
+          };
+          yield { type: 'turnCompleted' };
+        },
+        clock: () => '2026-07-16T00:00:02.000Z',
+      });
+
+      await expect(engine.resumeQueuedTurnAsync(task.id, 'session-rotation-first'))
+        .resolves.toEqual({ ok: true, value: undefined });
+      await engine.whenIdle();
+      await expect(repository.getTask(task.id)).resolves.toMatchObject({
+        lifecycle: 'open',
+        committedSessionId: 'session-original',
+        runtimeEpoch: 1,
+      });
+
+      const continued = await engine.continueTaskAsync(task.id);
+      expect(continued.ok).toBe(true);
+      if (!continued.ok) return;
+      await engine.whenIdle();
+
+      await expect(repository.getTurn(continued.value.turnId)).resolves.toMatchObject({
+        status: 'succeeded',
+        runtimeEpoch: 1,
+      });
+      await expect(repository.getTask(task.id)).resolves.toMatchObject({
+        lifecycle: 'open',
+        committedSessionId: 'session-recovered',
+        runtimeEpoch: 2,
+      });
+      await expect(client.all(
+        `SELECT session_id, runtime_epoch, active
+           FROM task_session_bindings
+          WHERE workspace_id = 'ws' AND task_id = ?
+          ORDER BY runtime_epoch`,
+        [task.id],
+      )).resolves.toEqual([
+        { session_id: 'session-original', runtime_epoch: 1, active: 0 },
+        { session_id: 'session-recovered', runtime_epoch: 2, active: 1 },
+      ]);
+    } finally {
+      await engine?.shutdown().catch(() => undefined);
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('deletes a running task, aborts its local adapter, and rejects late settlement', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-engine-delete-running-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    let started!: () => void;
+    const running = new Promise<void>((resolve) => { started = resolve; });
+    let abortObserved = false;
+    let engine: TaskEngine | undefined;
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const repository = new SqliteTaskRepository(client, 'ws');
+      await repository.execute({ kind: 'upsertWorkspace', workspaceId: 'ws', identityKey: 'delete-running', displayName: 'Delete running', createdAt: 'now', lastOpenedAt: 'now' });
+      const task = currentTask('delete-running-task');
+      await repository.execute({ kind: 'createTask', workspaceId: 'ws', task });
+      await repository.execute({
+        kind: 'createTurn', workspaceId: 'ws', turn: {
+          id: 'delete-running-turn', taskId: task.id, sequence: 1, status: 'queued',
+          trigger: 'engine', inputs: [], createdAt: '2026-07-16T00:00:01.000Z', runtimeEpoch: 1,
+        },
+      });
+      engine = await TaskEngine.loadAsync({
+        repository,
+        workspaceId: 'ws',
+        makeBackend: () => ({ name: 'fake', run: async function* () {} }),
+        runTurn: async function* (_backend, options) {
+          started();
+          await new Promise<void>((resolve) => {
+            if (options.signal?.aborted) resolve();
+            else options.signal?.addEventListener('abort', () => resolve(), { once: true });
+          });
+          abortObserved = true;
+          yield { type: 'turnCompleted' };
+        },
+        clock: () => '2026-07-16T00:00:02.000Z',
+      });
+
+      const resume = engine.resumeQueuedTurnAsync(task.id, 'delete-running-turn');
+      await running;
+      await expect(engine.deleteTaskSubtreeAsync(task.id)).resolves.toEqual({
+        ok: true,
+        value: undefined,
+      });
+      await resume;
+      await engine.whenIdle();
+
+      expect(abortObserved).toBe(true);
+      await expect(repository.getTask(task.id)).resolves.toBeUndefined();
+      await expect(repository.getTurn('delete-running-turn')).resolves.toBeUndefined();
+      expect(engine.getReadModel().getFile().tasks[task.id]).toBeUndefined();
+      await expect(client.all('PRAGMA foreign_key_check')).resolves.toEqual([]);
+    } finally {
+      await engine?.shutdown().catch(() => undefined);
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('retries an optimistic success-settlement conflict and keeps the root coordinator open', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-engine-success-settle-retry-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const repository = new SqliteTaskRepository(client, 'ws');
+      await repository.execute({ kind: 'upsertWorkspace', workspaceId: 'ws', identityKey: 'success-retry', displayName: 'Success retry', createdAt: 'now', lastOpenedAt: 'now' });
+      const task = currentTask('success-retry-coordinator', {
+        role: 'coordinator',
+        capabilities: ['create_child'],
+      });
+      await repository.execute({ kind: 'createTask', workspaceId: 'ws', task });
+      await repository.execute({
+        kind: 'createTurn', workspaceId: 'ws', turn: {
+          id: 'success-retry-turn', taskId: task.id, sequence: 1, status: 'queued',
+          trigger: 'user', inputs: [], createdAt: '2026-07-16T00:00:01.000Z', runtimeEpoch: 1,
+        },
+      });
+      const execute = repository.execute.bind(repository);
+      let successSettlementAttempts = 0;
+      vi.spyOn(repository, 'execute').mockImplementation(async (command) => {
+        if (command.kind === 'settleTurnAndApplyEffects' && command.turn.status === 'succeeded') {
+          successSettlementAttempts += 1;
+          if (successSettlementAttempts === 1) {
+            return { ok: true, changed: false, reason: 'turn is no longer live' };
+          }
+        }
+        return execute(command);
+      });
+      const engine = await TaskEngine.loadAsync({
+        repository,
+        workspaceId: 'ws',
+        makeBackend: () => ({ name: 'fake', run: async function* () {} }),
+        runTurn: async function* () { yield { type: 'turnCompleted' }; },
+        clock: () => '2026-07-16T00:00:02.000Z',
+      });
+
+      await engine.resumeQueuedTurnAsync(task.id, 'success-retry-turn');
+      await engine.whenIdle();
+
+      expect(successSettlementAttempts).toBe(2);
+      await expect(repository.getTurn('success-retry-turn')).resolves.toMatchObject({ status: 'succeeded' });
+      await expect(repository.getTask(task.id)).resolves.toMatchObject({
+        role: 'coordinator',
+        lifecycle: 'open',
+      });
+      const projection = await RepositoryProjection.load(repository, 'ws');
+      expect(projectCurrentTurnActivity(projection.getFile(), task.id)).toBeNull();
+    } finally {
+      vi.restoreAllMocks();
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('classifies a non-retryable success persistence failure as terminal-received, not uncertain', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-engine-success-settle-failure-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const repository = new SqliteTaskRepository(client, 'ws');
+      await repository.execute({ kind: 'upsertWorkspace', workspaceId: 'ws', identityKey: 'success-failure', displayName: 'Success failure', createdAt: 'now', lastOpenedAt: 'now' });
+      const task = currentTask('success-failure-coordinator', { role: 'coordinator' });
+      await repository.execute({ kind: 'createTask', workspaceId: 'ws', task });
+      await repository.execute({
+        kind: 'createTurn', workspaceId: 'ws', turn: {
+          id: 'success-failure-turn', taskId: task.id, sequence: 1, status: 'queued',
+          trigger: 'user', inputs: [], createdAt: '2026-07-16T00:00:01.000Z', runtimeEpoch: 1,
+        },
+      });
+      const execute = repository.execute.bind(repository);
+      vi.spyOn(repository, 'execute').mockImplementation(async (command) => {
+        if (command.kind === 'settleTurnAndApplyEffects' && command.turn.status === 'succeeded') {
+          return { ok: true, changed: false, reason: 'injected non-retryable settlement conflict' };
+        }
+        return execute(command);
+      });
+      const engine = await TaskEngine.loadAsync({
+        repository,
+        workspaceId: 'ws',
+        makeBackend: () => ({ name: 'fake', run: async function* () {} }),
+        runTurn: async function* () { yield { type: 'turnCompleted' }; },
+        clock: () => '2026-07-16T00:00:02.000Z',
+      });
+
+      await engine.resumeQueuedTurnAsync(task.id, 'success-failure-turn');
+      await engine.whenIdle();
+
+      await expect(repository.getTurn('success-failure-turn')).resolves.toMatchObject({
+        status: 'failed',
+        failureClass: 'terminal_received',
+        error: expect.stringContaining('injected non-retryable settlement conflict'),
+      });
+      await expect(repository.getTask(task.id)).resolves.toMatchObject({ lifecycle: 'open' });
+      const projection = await RepositoryProjection.load(repository, 'ws');
+      expect(projectCurrentTurnActivity(projection.getFile(), task.id)).toEqual({
+        state: 'failed_turn',
+        turnId: 'success-failure-turn',
+        retryable: true,
+      });
+    } finally {
+      vi.restoreAllMocks();
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -489,7 +803,8 @@ describe('TaskEngine repository-only boundary', () => {
         finishedAt: '2026-07-16T00:00:01.000Z',
       });
       const dependent = currentTask('dependent', {
-        dependencies: [{ taskId: producer.id, requiredOutcome: 'succeeded', onUnsatisfied: 'skip' }],
+        parentId: producer.id,
+        prerequisites: [{ producerTaskId: producer.id, requiredLifecycle: 'succeeded', onUnmet: 'skip' }],
       });
       await repository.execute({ kind: 'createTask', workspaceId: 'ws', task: producer });
       await repository.execute({ kind: 'createTask', workspaceId: 'ws', task: dependent });
@@ -518,7 +833,7 @@ describe('TaskEngine repository-only boundary', () => {
       expect(runCalls).toBe(0);
       await expect(repository.getTask(dependent.id)).resolves.toMatchObject({
         lifecycle: 'skipped',
-        sealedBy: { kind: 'coordinator', mode: 'dependency_policy' },
+        lifecycleAuthority: { kind: 'parent', parentTaskId: producer.id },
       });
       await expect(repository.getTurn('dependent-turn')).resolves.toMatchObject({ status: 'cancelled' });
     } finally {

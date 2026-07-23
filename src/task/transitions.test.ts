@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  applyDependencyTerminal,
+  applyPrerequisiteTerminal,
   applyFailedTurn,
   applySuccessfulTurn,
   cancelTask,
@@ -29,8 +29,8 @@ import {
   submitAnswer,
   type CreateTaskContext,
 } from './transitions';
-import type { DepGraph } from './deps';
-import type { MusterTask, TaskBriefKind, TaskDependency, TaskMessage, TaskTurn } from './types';
+import type { PrerequisiteGraph } from './prerequisites';
+import type { MusterTask, TaskBriefKind, TaskPrerequisite, TaskMessage, TaskTurn } from './types';
 
 const NOW = '2026-07-06T00:00:00.000Z';
 
@@ -48,7 +48,7 @@ function baseTask(overrides: Partial<MusterTask> = {}): MusterTask {
     lifecycle: 'open',
     goal: 'test',
     parentId: null,
-    dependencies: [],
+    prerequisites: [],
     backend: 'grok',
     capabilities: [],
     executionPolicy: defaultPolicy,
@@ -70,9 +70,9 @@ function turn(overrides: Partial<TaskTurn> & Pick<TaskTurn, 'id' | 'status'>): T
   };
 }
 
-const emptyGraph: DepGraph = {
+const emptyGraph: PrerequisiteGraph = {
   rootOf: () => 'root',
-  dependsOn: () => [],
+  prerequisitesOf: () => [],
 };
 
 const createCtx: CreateTaskContext = {
@@ -136,7 +136,7 @@ describe('createTask', () => {
         role: 'coordinator',
         goal: 'do work',
         parentId: null,
-        dependencies: [],
+        prerequisites: [],
         backend: 'grok',
         capabilities: [],
         executionPolicy: defaultPolicy,
@@ -153,10 +153,10 @@ describe('createTask', () => {
     }
   });
 
-  it('rejects cyclic dependencies', () => {
-    const graph: DepGraph = {
+  it('rejects cyclic prerequisites', () => {
+    const graph: PrerequisiteGraph = {
       rootOf: (id) => (id === 'dep-1' ? 'root' : undefined),
-      dependsOn: (id) => (id === 'dep-1' ? ['task-1'] : []),
+      prerequisitesOf: (id) => (id === 'dep-1' ? ['task-1'] : []),
     };
     const result = createTask(
       {
@@ -164,8 +164,8 @@ describe('createTask', () => {
         role: 'coordinator',
         goal: 'do work',
         parentId: null,
-        dependencies: [
-          { taskId: 'dep-1', requiredOutcome: 'succeeded', onUnsatisfied: 'block' },
+        prerequisites: [
+          { producerTaskId: 'dep-1', requiredLifecycle: 'succeeded', onUnmet: 'block' },
         ],
         backend: 'grok',
         capabilities: [],
@@ -173,24 +173,24 @@ describe('createTask', () => {
       },
       { ...createCtx, graph },
     );
-    expect(result).toEqual({ ok: false, reason: 'dependency cycle detected' });
+    expect(result).toEqual({ ok: false, reason: 'prerequisite cycle detected' });
   });
 
-  // verify-gate-loop B: depending on a verify-kind producer auto-defaults requiredVerdict.
-  const gateGraph = (kindById: Record<string, TaskBriefKind>): DepGraph => ({
+  // verify-gate-loop B: requiring a verify-kind producer auto-defaults requiredVerdict.
+  const gateGraph = (kindById: Record<string, TaskBriefKind>): PrerequisiteGraph => ({
     rootOf: (id) => (id in kindById ? 'root' : undefined),
-    dependsOn: () => [],
+    prerequisitesOf: () => [],
     briefKindOf: (id) => kindById[id],
   });
 
-  function createWithDep(dep: TaskDependency, graph: DepGraph) {
+  function createWithPrerequisite(prerequisite: TaskPrerequisite, graph: PrerequisiteGraph) {
     return createTask(
       {
         id: 'task-1',
         role: 'worker',
         goal: 'do work',
         parentId: 'root',
-        dependencies: [dep],
+        prerequisites: [prerequisite],
         backend: 'grok',
         capabilities: [],
         executionPolicy: defaultPolicy,
@@ -199,42 +199,42 @@ describe('createTask', () => {
     );
   }
 
-  it('auto-gates a dependency on a verify-kind producer (requiredVerdict defaults to pass)', () => {
-    const result = createWithDep(
-      { taskId: 'vfy', requiredOutcome: 'succeeded', onUnsatisfied: 'block' },
+  it('auto-gates a prerequisite on a verify-kind producer (requiredVerdict defaults to pass)', () => {
+    const result = createWithPrerequisite(
+      { producerTaskId: 'vfy', requiredLifecycle: 'succeeded', onUnmet: 'block' },
       gateGraph({ vfy: 'verify' }),
     );
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.next.dependencies).toEqual([
-        { taskId: 'vfy', requiredOutcome: 'succeeded', onUnsatisfied: 'block', requiredVerdict: 'pass' },
+      expect(result.next.prerequisites).toEqual([
+        { producerTaskId: 'vfy', requiredLifecycle: 'succeeded', onUnmet: 'block', requiredVerdict: 'pass' },
       ]);
     }
   });
 
-  it('does NOT auto-gate a dependency on a non-verify producer', () => {
-    const result = createWithDep(
-      { taskId: 'impl', requiredOutcome: 'succeeded', onUnsatisfied: 'block' },
+  it('does NOT auto-gate a prerequisite on a non-verify producer', () => {
+    const result = createWithPrerequisite(
+      { producerTaskId: 'impl', requiredLifecycle: 'succeeded', onUnmet: 'block' },
       gateGraph({ impl: 'implement' }),
     );
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.next.dependencies).toEqual([
-        { taskId: 'impl', requiredOutcome: 'succeeded', onUnsatisfied: 'block' },
+      expect(result.next.prerequisites).toEqual([
+        { producerTaskId: 'impl', requiredLifecycle: 'succeeded', onUnmet: 'block' },
       ]);
-      expect(result.next.dependencies[0].requiredVerdict).toBeUndefined();
+      expect(result.next.prerequisites[0].requiredVerdict).toBeUndefined();
     }
   });
 
-  it('never overwrites an explicit requiredVerdict on a verify-kind dependency', () => {
-    const result = createWithDep(
-      { taskId: 'vfy', requiredOutcome: 'settled', onUnsatisfied: 'skip', requiredVerdict: 'pass' },
+  it('never overwrites an explicit requiredVerdict on a verify-kind prerequisite', () => {
+    const result = createWithPrerequisite(
+      { producerTaskId: 'vfy', requiredLifecycle: 'terminal', onUnmet: 'skip', requiredVerdict: 'pass' },
       gateGraph({ vfy: 'verify' }),
     );
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.next.dependencies).toEqual([
-        { taskId: 'vfy', requiredOutcome: 'settled', onUnsatisfied: 'skip', requiredVerdict: 'pass' },
+      expect(result.next.prerequisites).toEqual([
+        { producerTaskId: 'vfy', requiredLifecycle: 'terminal', onUnmet: 'skip', requiredVerdict: 'pass' },
       ]);
     }
   });
@@ -246,7 +246,7 @@ describe('createTask', () => {
         role: 'worker',
         goal: 'fix',
         parentId: 'root',
-        dependencies: [{ taskId: 'vfy', requiredOutcome: 'succeeded', onUnsatisfied: 'block' }],
+        prerequisites: [{ producerTaskId: 'vfy', requiredLifecycle: 'succeeded', onUnmet: 'block' }],
         backend: 'grok',
         capabilities: [],
         executionPolicy: defaultPolicy,
@@ -255,7 +255,7 @@ describe('createTask', () => {
     );
     expect(result.ok).toBe(true);
     if (result.ok) {
-      expect(result.next.dependencies[0].requiredVerdict).toBeUndefined();
+      expect(result.next.prerequisites[0].requiredVerdict).toBeUndefined();
     }
   });
 });
@@ -488,11 +488,44 @@ describe('applySuccessfulTurn', () => {
         revision: 1,
         summary: 'done',
       });
-      expect(result.next.task.sealedBy).toEqual({
-        kind: 'coordinator',
-        taskId: 'root-1',
+      expect(result.next.task.lifecycleAuthority).toEqual({
+        kind: 'parent',
+        parentTaskId: 'root-1',
         turnId: 't1',
-        mode: 'parent_may_seal_direct',
+      });
+    }
+  });
+
+  it('workflow_next settles turn without sealing lifecycle (root or child)', () => {
+    for (const parentId of [null, 'root-1'] as const) {
+      const taskId = parentId === null ? 'task-1' : 'child-1';
+      const staged = {
+        ...running,
+        taskId,
+        disposition: {
+          kind: 'workflow_next' as const,
+          change: 'updated' as const,
+          result: 'producer output',
+        },
+      };
+      const result = applySuccessfulTurn(
+        baseTask({ id: taskId, parentId }),
+        staged,
+        { now: NOW },
+      );
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.next.task.lifecycle).toBe('open');
+      expect(result.next.task.lifecycleAuthority).toBeUndefined();
+      expect(result.next.task.taskResult).toBeUndefined();
+      expect(result.next.task.outcomeProposal).toBeUndefined();
+      expect(result.next.turn.status).toBe('succeeded');
+      expect(result.next.turn.finishedAt).toBe(NOW);
+      // Disposition retained for the repository commit path (T04 gate contribution).
+      expect(result.next.turn.disposition).toEqual({
+        kind: 'workflow_next',
+        change: 'updated',
+        result: 'producer output',
       });
     }
   });
@@ -516,7 +549,7 @@ describe('applySuccessfulTurn', () => {
         reason: 'missing_disposition',
       });
       expect(result.next.task.taskResult).toBeUndefined();
-      expect(result.next.task.sealedBy).toBeUndefined();
+      expect(result.next.task.lifecycleAuthority).toBeUndefined();
       expect(result.next.turn.status).toBe('succeeded');
     }
   });
@@ -532,7 +565,7 @@ describe('applySuccessfulTurn', () => {
       expect(result.next.task.lifecycle).toBe('open');
       expect(result.next.task.attention).toBeUndefined();
       expect(result.next.task.completionCandidate).toBeUndefined();
-      expect(result.next.task.sealedBy).toBeUndefined();
+      expect(result.next.task.lifecycleAuthority).toBeUndefined();
       expect(result.next.turn.status).toBe('succeeded');
     }
   });
@@ -634,12 +667,12 @@ describe('applySuccessfulTurn', () => {
     if (result.ok) {
       expect(result.next.task.lifecycle).toBe('open');
       expect(result.next.task.outcomeProposal).toMatchObject({ kind: 'complete', result: 'done' });
-      expect(result.next.task.sealedBy).toBeUndefined();
+      expect(result.next.task.lifecycleAuthority).toBeUndefined();
     }
   });
 
-  it('dependency fail sets sealedBy coordinator dependency_policy', () => {
-    const result = applyDependencyTerminal(
+  it('prerequisite failure records parent lifecycle authority', () => {
+    const result = applyPrerequisiteTerminal(
       baseTask({ id: 'impl', parentId: 'root-1' }),
       undefined,
       'failed',
@@ -648,16 +681,12 @@ describe('applySuccessfulTurn', () => {
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.next.task.lifecycle).toBe('failed');
-      expect(result.next.task.sealedBy).toEqual({
-        kind: 'coordinator',
-        taskId: 'root-1',
-        mode: 'dependency_policy',
-      });
+      expect(result.next.task.lifecycleAuthority).toEqual({ kind: 'parent', parentTaskId: 'root-1' });
     }
   });
 
-  it('dependency skip and cancelTask set sealedBy', () => {
-    const skip = applyDependencyTerminal(
+  it('prerequisite skip and cancelTask set lifecycle authority', () => {
+    const skip = applyPrerequisiteTerminal(
       baseTask({ id: 'impl', parentId: 'root-1' }),
       undefined,
       'skipped',
@@ -666,22 +695,19 @@ describe('applySuccessfulTurn', () => {
     expect(skip.ok).toBe(true);
     if (skip.ok) {
       expect(skip.next.task.lifecycle).toBe('skipped');
-      expect(skip.next.task.sealedBy?.kind).toBe('coordinator');
-      expect(skip.next.task.sealedBy && 'mode' in skip.next.task.sealedBy
-        ? skip.next.task.sealedBy.mode
-        : undefined).toBe('dependency_policy');
+      expect(skip.next.task.lifecycleAuthority).toEqual({ kind: 'parent', parentTaskId: 'root-1' });
     }
     const cancelled = cancelTask(baseTask({ id: 'c1', parentId: 'root-1' }), {
       now: NOW,
-      sealedBy: { kind: 'user' },
+      lifecycleAuthority: { kind: 'user' },
     });
     expect(cancelled.ok).toBe(true);
     if (cancelled.ok) {
-      expect(cancelled.next.task.sealedBy).toEqual({ kind: 'user' });
+      expect(cancelled.next.task.lifecycleAuthority).toEqual({ kind: 'user' });
     }
   });
 
-  it('non-root fail disposition seals with coordinator sealedBy', () => {
+  it('non-root fail disposition seals with parent lifecycle authority', () => {
     const staged = {
       ...running,
       taskId: 'child-1',
@@ -695,10 +721,10 @@ describe('applySuccessfulTurn', () => {
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.next.task.lifecycle).toBe('failed');
-      expect(result.next.task.sealedBy).toMatchObject({
-        kind: 'coordinator',
-        taskId: 'root-1',
-        mode: 'parent_may_seal_direct',
+      expect(result.next.task.lifecycleAuthority).toEqual({
+        kind: 'parent',
+        parentTaskId: 'root-1',
+        turnId: 't1',
       });
     }
   });
@@ -866,7 +892,7 @@ describe('applyFailedTurn', () => {
     const result = setTaskLifecycle(baseTask(), 'succeeded', {
       now: NOW,
       result: 'shipped',
-      sealedBy: { kind: 'user' },
+      lifecycleAuthority: { kind: 'user' },
     });
     expect(result.ok).toBe(true);
     if (result.ok) {
@@ -876,7 +902,7 @@ describe('applyFailedTurn', () => {
         revision: 1,
         summary: 'shipped',
       });
-      expect(result.next.sealedBy).toEqual({ kind: 'user' });
+      expect(result.next.lifecycleAuthority).toEqual({ kind: 'user' });
     }
   });
 
@@ -1085,6 +1111,239 @@ describe('stageDisposition rejections', () => {
         {},
       ),
     ).toEqual({ ok: false, reason: 'stageDisposition requires a live turn' });
+  });
+
+  it('stages workflow_next idempotently by opId and requires limits', () => {
+    const live = turn({ id: 't1', status: 'running', sequence: 1 });
+    const limits = { maxResult: 1024, maxError: 1024 };
+    expect(
+      stageDisposition(live, { kind: 'workflow_next', change: 'updated' }, 'op-next', {}),
+    ).toEqual({
+      ok: false,
+      reason: 'limits are required for complete, fail, workflow_next, workflow_prev, or workflow_fail dispositions',
+    });
+
+    const first = stageDisposition(
+      live,
+      { kind: 'workflow_next', change: 'updated', result: 'body' },
+      'op-next',
+      { limits },
+    );
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    expect(first.next.turn.disposition).toEqual({
+      kind: 'workflow_next',
+      change: 'updated',
+      result: 'body',
+    });
+
+    // Same opId + same disposition is idempotent.
+    const replay = stageDisposition(
+      first.next.turn,
+      { kind: 'workflow_next', change: 'updated', result: 'body' },
+      'op-next',
+      { acceptedOpId: 'op-next', limits },
+    );
+    expect(replay.ok).toBe(true);
+    if (!replay.ok) return;
+    expect(replay.next.turn.disposition).toEqual(first.next.turn.disposition);
+
+    // Same opId + different disposition fails closed.
+    expect(
+      stageDisposition(
+        first.next.turn,
+        { kind: 'workflow_next', change: 'unchanged' },
+        'op-next',
+        { acceptedOpId: 'op-next', limits },
+      ),
+    ).toEqual({ ok: false, reason: 'same opId with different disposition' });
+
+    // Different opId with the same canonical disposition is an idempotent replay.
+    expect(
+      stageDisposition(
+        first.next.turn,
+        { kind: 'workflow_next', change: 'updated', result: 'body' },
+        'op-other',
+        { limits },
+      ).ok,
+    ).toBe(true);
+  });
+
+  it('stages workflow_prev idempotently and rejects conflicting replay', () => {
+    const live = turn({ status: 'running' });
+    const first = stageDisposition(
+      live,
+      { kind: 'workflow_prev', targets: 'all', note: 'please fix' },
+      'op-prev-1',
+      { limits: { maxResult: 1024, maxError: 512 } },
+    );
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    expect(first.next.turn.disposition).toEqual({
+      kind: 'workflow_prev',
+      targets: 'all',
+      note: 'please fix',
+    });
+    const replay = stageDisposition(
+      first.next.turn,
+      { kind: 'workflow_prev', targets: 'all', note: 'please fix' },
+      'op-prev-1',
+      {
+        acceptedOpId: 'op-prev-1',
+        limits: { maxResult: 1024, maxError: 512 },
+      },
+    );
+    expect(replay.ok).toBe(true);
+    const conflict = stageDisposition(
+      first.next.turn,
+      { kind: 'workflow_prev', targets: ['from_p1'] },
+      'op-prev-1',
+      {
+        acceptedOpId: 'op-prev-1',
+        limits: { maxResult: 1024, maxError: 512 },
+      },
+    );
+    expect(conflict.ok).toBe(false);
+  });
+
+  it('applySuccessfulTurn keeps workflow_prev without sealing lifecycle', () => {
+    const task = baseTask();
+    const live = turn({
+      status: 'running',
+      disposition: { kind: 'workflow_prev', targets: 'all' },
+    });
+    const settled = applySuccessfulTurn(task, live, { now: NOW });
+    expect(settled.ok).toBe(true);
+    if (!settled.ok) return;
+    expect(settled.next.task.lifecycle).toBe('open');
+    expect(settled.next.turn.status).toBe('succeeded');
+    expect(settled.next.turn.disposition?.kind).toBe('workflow_prev');
+  });
+
+  it('applyFailedTurn and interruptTurn discard staged workflow_prev', () => {
+    const task = baseTask();
+    const live = turn({
+      status: 'running',
+      disposition: { kind: 'workflow_prev', targets: ['from_p1'], note: 'n' },
+    });
+    const failed = applyFailedTurn(task, live, {
+      error: 'boom',
+      retryCount: 0,
+      policy: { maxTurns: 4, maxAutomaticRetries: 0 },
+      onExhausted: 'recover',
+      now: NOW,
+    });
+    expect(failed.ok).toBe(true);
+    if (failed.ok) {
+      expect(failed.next.turn.disposition).toBeUndefined();
+    }
+    const interrupted = interruptTurn(live, { now: NOW });
+    expect(interrupted.ok).toBe(true);
+    if (interrupted.ok) {
+      expect(interrupted.next.disposition).toBeUndefined();
+    }
+  });
+
+  it('stages workflow_fail idempotently and rejects conflicting replay', () => {
+    const live = turn({ status: 'running' });
+    const first = stageDisposition(
+      live,
+      { kind: 'workflow_fail', reason: 'cannot continue' },
+      'op-fail-1',
+      { limits: { maxResult: 1024, maxError: 512 } },
+    );
+    expect(first.ok).toBe(true);
+    if (!first.ok) return;
+    expect(first.next.turn.disposition).toEqual({
+      kind: 'workflow_fail',
+      reason: 'cannot continue',
+    });
+    const replay = stageDisposition(
+      first.next.turn,
+      { kind: 'workflow_fail', reason: 'cannot continue' },
+      'op-fail-1',
+      {
+        acceptedOpId: 'op-fail-1',
+        limits: { maxResult: 1024, maxError: 512 },
+      },
+    );
+    expect(replay.ok).toBe(true);
+    const conflict = stageDisposition(
+      first.next.turn,
+      { kind: 'workflow_fail', reason: 'different' },
+      'op-fail-1',
+      {
+        acceptedOpId: 'op-fail-1',
+        limits: { maxResult: 1024, maxError: 512 },
+      },
+    );
+    expect(conflict.ok).toBe(false);
+  });
+
+  it('applySuccessfulTurn keeps workflow_fail without sealing lifecycle', () => {
+    const task = baseTask();
+    const live = turn({
+      status: 'running',
+      disposition: { kind: 'workflow_fail', reason: 'abort' },
+    });
+    const settled = applySuccessfulTurn(task, live, { now: NOW });
+    expect(settled.ok).toBe(true);
+    if (!settled.ok) return;
+    expect(settled.next.task.lifecycle).toBe('open');
+    expect(settled.next.turn.status).toBe('succeeded');
+    expect(settled.next.turn.disposition?.kind).toBe('workflow_fail');
+  });
+
+  it('applyFailedTurn and interruptTurn discard staged workflow_fail', () => {
+    const task = baseTask();
+    const live = turn({
+      status: 'running',
+      disposition: { kind: 'workflow_fail', reason: 'n' },
+    });
+    const failed = applyFailedTurn(task, live, {
+      error: 'boom',
+      retryCount: 0,
+      policy: { maxTurns: 4, maxAutomaticRetries: 0 },
+      onExhausted: 'recover',
+      now: NOW,
+    });
+    expect(failed.ok).toBe(true);
+    if (failed.ok) {
+      expect(failed.next.turn.disposition).toBeUndefined();
+    }
+    const interrupted = interruptTurn(live, { now: NOW });
+    expect(interrupted.ok).toBe(true);
+    if (interrupted.ok) {
+      expect(interrupted.next.disposition).toBeUndefined();
+    }
+  });
+
+  it('applyFailedTurn and interruptTurn discard staged workflow_next', () => {
+    const live = turn({
+      id: 't1',
+      status: 'running',
+      sequence: 1,
+      disposition: { kind: 'workflow_next', change: 'updated', result: 'body' },
+    });
+    const failed = applyFailedTurn(baseTask(), live, {
+      error: 'boom',
+      retryCount: 0,
+      policy: defaultPolicy,
+      onExhausted: 'recover',
+      now: NOW,
+    });
+    expect(failed.ok).toBe(true);
+    if (failed.ok) {
+      expect(failed.next.turn.disposition).toBeUndefined();
+      expect(failed.next.task.lifecycle).toBe('open');
+    }
+
+    const interrupted = interruptTurn(live, { now: NOW });
+    expect(interrupted.ok).toBe(true);
+    if (interrupted.ok) {
+      expect(interrupted.next.disposition).toBeUndefined();
+      expect(interrupted.next.status).toBe('interrupted');
+    }
   });
 });
 

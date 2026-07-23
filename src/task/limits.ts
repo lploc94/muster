@@ -150,7 +150,7 @@ export function clampExecutionPolicy(
 }
 
 /**
- * TTL for a bridge bearer token (W8): must cover runTimeoutMs so complete_task
+ * TTL for a bridge bearer token (W8): must cover runTimeoutMs so workflow routing
  * remains authorized for the full turn. Soft default MAX_BRIDGE_TOKEN_TTL_MS when
  * turnTimeout is smaller; hard cap HARD_BRIDGE_TOKEN_TTL_MS (or maxTtlMs override).
  * Negative/NaN inputs collapse to 0.

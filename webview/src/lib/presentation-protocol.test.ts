@@ -143,7 +143,7 @@ describe('presentation browser protocol', () => {
     ['empty title', { title: '' }],
     ['oversized title', { title: 't'.repeat(201) }],
     ['empty Markdown', { markdown: '' }],
-    ['oversized Markdown', { markdown: 'm'.repeat(100_001) }],
+    ['oversized Markdown', { markdown: 'm'.repeat(1_048_577) }],
   ])('rejects %s at the browser trust boundary', (_label, value) => {
     const document = {
       presentationId: 'release-notes',

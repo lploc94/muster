@@ -84,7 +84,11 @@ export async function run(): Promise<void> {
     await client.open(dbPath);
     assert.equal(await client.pragma('application_id'), 0x4d555354);
     assert.equal(await client.pragma('foreign_keys'), 1);
-    assert.equal(schema.SQLITE_SCHEMA_VERSION, 7, 'packaged Phase 4 schema version drifted');
+    assert.equal(
+      schema.SQLITE_SCHEMA_VERSION,
+      8,
+      'packaged schema version drifted from expected current (v8)',
+    );
     assert.equal(await client.pragma('user_version'), schema.SQLITE_SCHEMA_VERSION);
     assert.deepEqual(await client.get<{ journal_mode: string }>('PRAGMA journal_mode'), {
       journal_mode: 'wal',

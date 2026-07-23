@@ -15,7 +15,7 @@ function makeTask(id: string, overrides: Partial<MusterTask> = {}): MusterTask {
     releaseState: 'released',
     goal: id,
     parentId: null,
-    dependencies: [],
+    prerequisites: [],
     backend: 'fake',
     capabilities: [],
     executionPolicy: { maxTurns: 100, maxAutomaticRetries: 0 },

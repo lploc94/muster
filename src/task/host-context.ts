@@ -48,7 +48,7 @@ export interface HostContextV1 {
   taskTypes?: HostTaskTypeRow[];
   scope?: {
     singleTask: true;
-    completeVia: 'complete_task' | 'fail_task';
+    workflowVia?: readonly ['workflow_next', 'workflow_prev', 'workflow_fail'];
     doNot: string[];
   };
 }
@@ -83,18 +83,14 @@ export const HOST_RULES_BASE: readonly string[] = [
 ];
 
 /**
- * Coordinator playbook rules when **no** task types configured.
- * When types are configured: keep core spawn + presentation + root seal; swap mid bullets for HOST_RULES_TASK_TYPES.
+ * Coordinator workflow-authoring rules when no task types are configured.
  */
 export const HOST_RULES_COORDINATOR: readonly string[] = [
-  'Simple spawn: **`delegate_task({ waitForCompletion: true })`** — one call create+run+wait. When the response says `waitStaged`, the barrier is armed: end the current turn; do not call `wait_for_tasks` again or poll `get_task_status`.',
-  'Parallel: **`delegate_tasks({ waitForLocalIds })`**. Planned graph: **`create_tasks` → `release_tasks({ waitForTaskIds })`**.',
-  'Standalone **`wait_for_tasks`** is advanced (re-arm barrier / earlier fire-and-forget). No MCP `start_task`.',
-  'REQUIRED for user-facing plans/specs: call MCP **`upsert_presentation`** with the full markdown (Mermaid fenced blocks allowed). Args: stable `presentationId` (e.g. plan-<taskId>), `ownerTaskId`=`self.taskId`, unique `opId`, `revision` (1 then ++), `title`, `markdown`, optional `kind` (`plan`|`spec`|`document`), optional one-line `summary`, optional `changeSummary` on revision 2+ describing what changed. Never send `sourcePath`, `sourceFolderUri`, `updatedAt`, or `rootId` (host-owned). Do not only paste the plan in chat.',
-  'If a child omits disposition, parent may **`set_task_lifecycle`** on **direct children** only.',
-  'Optional `model` on create/delegate is an ACP model id for that child backend; omit → agent default.',
-  'Prefer rich `brief` on create/delegate so children need not re-derive the job.',
-  'Do not seal the **root** via MCP in v1 (user/host only).',
+  'Build orchestration with **`define_workflow`** and **`start_workflow`**; the legacy delegate-task MCP protocol is unavailable. Workflows are converging DAGs: independent source nodes may run in parallel and fan in, but fan-out/cycles are unsupported; inputs belong only to source nodes and branches may finish at multiple terminal sinks whose reports are combined in topology order.',
+  'Use **`list_task_types`** to refresh semantic task profiles before defining workflow nodes.',
+  'Use **`inspect_workflow_run`** only for bounded recovery diagnostics; do not poll it as a substitute for routing.',
+  'REQUIRED for user-facing plans/specs: call MCP **`upsert_presentation`** with `title` and the full markdown (Mermaid fenced blocks allowed). The host returns a `presentationRef`; pass it only when refreshing that same document. Do not invent identity, ownership, idempotency, or revision fields, and do not only paste the plan in chat.',
+  'A live workflow activation may explicitly stage `workflow_next`, contextual `workflow_prev`, or `workflow_fail`; if the turn ends without one, the host forwards the final assistant message as an updated NEXT result.',
 ];
 
 /**
@@ -102,26 +98,27 @@ export const HOST_RULES_COORDINATOR: readonly string[] = [
  * When types configured: replace mid HOST_RULES_COORDINATOR bullets so type rules + presentation + root seal survive HOST_RULES_MAX.
  */
 export const HOST_RULES_TASK_TYPES: readonly string[] = [
-  'Prefer `taskType` from the list when creating children.',
-  'Omit backend/model to use the type preset.',
-  'Pass backend/model **only** when the current user explicitly named that override.',
-  'Never invent types or silently fall back to parent backend.',
+  'Use `taskType` values from the configured list for workflow nodes.',
+  'Call `list_task_types` when semantic task profiles need to be refreshed.',
+  'Never copy or invent backend, model, role, capability, policy, identity, or revision fields; the engine resolves and freezes them.',
+  'Treat task profiles as workflow-node presets, not permission to create ad-hoc children.',
 ];
 
-/** Core coordinator bullets kept when task types are present (spawn rules). */
+/** Core coordinator bullets kept when task types are present. */
 const HOST_RULES_COORDINATOR_CORE: readonly string[] = HOST_RULES_COORDINATOR.slice(0, 3);
 /** Presentation rule index — kept with task types configured. */
 const HOST_RULES_COORDINATOR_PRESENTATION_INDEX = 3;
-/** Root-seal rule index — kept with task types configured. */
-const HOST_RULES_COORDINATOR_ROOT_SEAL_INDEX = 7;
 
 /** Worker scope rules (appended after base). */
 export const HOST_RULES_WORKER: readonly string[] = [
   'You own **one** task (`self.taskId`); complete it and stop — do not pick siblings or “next” work.',
-  'Stage outcome via **`complete_task`** or **`fail_task`**; parent may seal if you do not.',
+  'When workflow disposition tools are present, prefer an explicit workflow outcome. NEXT/PREV require the final assistant message, commit it, and end the turn. If you finish without one, the host forwards your final assistant message as NEXT.',
   'Do not call coordinator-only graph mutators even if listed by mistake.',
   'Stay within brief write/read paths and constraints when present.',
 ];
+
+export const HOST_RULE_WORKFLOW_DISPOSITION =
+  'This is a live workflow activation: use **`workflow_next`**, **`workflow_prev`** (when available), or **`workflow_fail`** when you need explicit routing. A `workflow_next` message must be self-contained because the receiver cannot see earlier assistant messages. If you simply finish, the host uses your final assistant message as an updated NEXT result.';
 
 export const WORKER_SCOPE_DO_NOT: readonly string[] = [
   'create siblings or pick next work',
@@ -129,9 +126,18 @@ export const WORKER_SCOPE_DO_NOT: readonly string[] = [
   'seal the root task',
 ];
 
-function rulesForRole(role: TaskRole, hasTaskTypes: boolean): string[] {
+function rulesForRole(role: TaskRole, hasTaskTypes: boolean, workflowActivation: boolean): string[] {
   const base = [...HOST_RULES_BASE];
   if (role !== 'coordinator') {
+    if (workflowActivation) {
+      return [
+        ...base,
+        HOST_RULES_WORKER[0]!,
+        HOST_RULE_WORKFLOW_DISPOSITION,
+        HOST_RULES_WORKER[2]!,
+        HOST_RULES_WORKER[3]!,
+      ].slice(0, HOST_RULES_MAX);
+    }
     return [...base, ...HOST_RULES_WORKER].slice(0, HOST_RULES_MAX);
   }
   if (hasTaskTypes) {
@@ -141,10 +147,14 @@ function rulesForRole(role: TaskRole, hasTaskTypes: boolean): string[] {
       ...HOST_RULES_COORDINATOR_CORE,
       HOST_RULES_COORDINATOR[HOST_RULES_COORDINATOR_PRESENTATION_INDEX]!,
       ...HOST_RULES_TASK_TYPES,
-      HOST_RULES_COORDINATOR[HOST_RULES_COORDINATOR_ROOT_SEAL_INDEX]!,
+      ...(workflowActivation ? [HOST_RULE_WORKFLOW_DISPOSITION] : []),
     ].slice(0, HOST_RULES_MAX);
   }
-  return [...base, ...HOST_RULES_COORDINATOR].slice(0, HOST_RULES_MAX);
+  return [
+    ...base,
+    ...HOST_RULES_COORDINATOR,
+    ...(workflowActivation ? [HOST_RULE_WORKFLOW_DISPOSITION] : []),
+  ].slice(0, HOST_RULES_MAX);
 }
 
 function capModels(
@@ -181,7 +191,8 @@ export function buildHostContext(input: BuildHostContextInput): HostContextV1 {
       })
     : undefined;
   const hasConfiguredTypes = typeRows !== undefined && typeRows.length > 0;
-  const rules = rulesForRole(self.role, hasConfiguredTypes);
+  const workflowActivation = tools?.includes('workflow_next') === true;
+  const rules = rulesForRole(self.role, hasConfiguredTypes, workflowActivation);
   // First-turn sets suppressBackendCatalog: true. get_host_context omits or false → keep catalogs.
   const suppressCatalog =
     hasConfiguredTypes && input.suppressBackendCatalog === true;
@@ -219,7 +230,9 @@ export function buildHostContext(input: BuildHostContextInput): HostContextV1 {
     ...base,
     scope: {
       singleTask: true,
-      completeVia: 'complete_task',
+      ...(workflowActivation
+        ? { workflowVia: ['workflow_next', 'workflow_prev', 'workflow_fail'] as const }
+        : {}),
       doNot: [...WORKER_SCOPE_DO_NOT],
     },
   };
@@ -431,7 +444,11 @@ function renderHostMarkdown(ctx: HostContextV1): string {
   }
   if (ctx.scope) {
     lines.push('', '## Scope');
-    lines.push('- single task; complete via complete_task / fail_task');
+    lines.push(
+      ctx.scope.workflowVia
+        ? '- single task; explicit workflow route or host fallback to final-message NEXT'
+        : '- single task; no workflow disposition is active',
+    );
     for (const d of ctx.scope.doNot) {
       lines.push(`- do not: ${d}`);
     }

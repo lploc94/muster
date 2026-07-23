@@ -16,6 +16,8 @@ import {
   type SqliteOperationClass,
 } from './errors';
 import type { BackupResultMeta, DbResponse, ResetResultMeta, RunResult } from './rpc';
+import { SQLITE_WORKFLOW_ENVELOPE_MAX_BYTES } from '../content-limits';
+import type { RepositoryCommandResult } from '../repository';
 
 export function makeProtocolError(
   operation: SqliteOperationClass = 'unknown',
@@ -113,6 +115,100 @@ function parseRunResult(value: unknown): RunResult | undefined {
   return { changes: obj.changes, lastInsertRowid: obj.lastInsertRowid };
 }
 
+function parseWorkflowMutationResult(value: unknown): RepositoryCommandResult | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const obj = value as Record<string, unknown>;
+  const allowed = new Set([
+    'ok',
+    'changed',
+    'reason',
+    'operation',
+    'conflict',
+    'messageId',
+    'turnId',
+    'deletedMessageIds',
+    'affectedTaskIds',
+    'presentationStatus',
+  ]);
+  if (!Object.keys(obj).every((key) => allowed.has(key)) || typeof obj.ok !== 'boolean') {
+    return undefined;
+  }
+  if (obj.changed !== undefined && typeof obj.changed !== 'boolean') return undefined;
+  if (
+    obj.reason !== undefined &&
+    (typeof obj.reason !== 'string' || obj.reason.length === 0 || obj.reason.length > 1024)
+  ) {
+    return undefined;
+  }
+  if (obj.conflict !== undefined && typeof obj.conflict !== 'boolean') return undefined;
+  if (obj.messageId !== undefined &&
+    (typeof obj.messageId !== 'string' || obj.messageId.length === 0 || obj.messageId.length > 512)) {
+    return undefined;
+  }
+  if (obj.turnId !== undefined &&
+    (typeof obj.turnId !== 'string' || obj.turnId.length === 0 || obj.turnId.length > 512)) {
+    return undefined;
+  }
+  if (obj.deletedMessageIds !== undefined && (
+    !Array.isArray(obj.deletedMessageIds) ||
+    obj.deletedMessageIds.length > 10_000 ||
+    !obj.deletedMessageIds.every((id) => typeof id === 'string' && id.length > 0 && id.length <= 512)
+  )) {
+    return undefined;
+  }
+  if (obj.affectedTaskIds !== undefined && (
+    !Array.isArray(obj.affectedTaskIds) ||
+    obj.affectedTaskIds.length > 10_000 ||
+    !obj.affectedTaskIds.every((id) => typeof id === 'string' && id.length > 0 && id.length <= 512)
+  )) {
+    return undefined;
+  }
+  const presentationStatuses = new Set([
+    'committed',
+    'idempotent',
+    'op_conflict',
+    'stale_revision',
+    'owner_mismatch',
+  ]);
+  if (obj.presentationStatus !== undefined &&
+    (typeof obj.presentationStatus !== 'string' || !presentationStatuses.has(obj.presentationStatus))) {
+    return undefined;
+  }
+  if (obj.operation !== undefined) {
+    if (!obj.operation || typeof obj.operation !== 'object' || Array.isArray(obj.operation)) return undefined;
+    try {
+      if (
+        Buffer.byteLength(JSON.stringify(obj.operation), 'utf8') >
+        SQLITE_WORKFLOW_ENVELOPE_MAX_BYTES
+      ) {
+        return undefined;
+      }
+    } catch {
+      return undefined;
+    }
+  }
+  return {
+    ok: obj.ok,
+    ...(typeof obj.changed === 'boolean' ? { changed: obj.changed } : {}),
+    ...(typeof obj.reason === 'string' ? { reason: obj.reason } : {}),
+    ...(obj.operation && typeof obj.operation === 'object'
+      ? { operation: obj.operation as RepositoryCommandResult['operation'] }
+      : {}),
+    ...(typeof obj.conflict === 'boolean' ? { conflict: obj.conflict } : {}),
+    ...(typeof obj.messageId === 'string' ? { messageId: obj.messageId } : {}),
+    ...(typeof obj.turnId === 'string' ? { turnId: obj.turnId } : {}),
+    ...(Array.isArray(obj.deletedMessageIds)
+      ? { deletedMessageIds: obj.deletedMessageIds as string[] }
+      : {}),
+    ...(Array.isArray(obj.affectedTaskIds)
+      ? { affectedTaskIds: obj.affectedTaskIds as string[] }
+      : {}),
+    ...(typeof obj.presentationStatus === 'string'
+      ? { presentationStatus: obj.presentationStatus as NonNullable<RepositoryCommandResult['presentationStatus']> }
+      : {}),
+  };
+}
+
 /**
  * Strict success response validation. Rejects extra keys, NaN, missing nested fields.
  */
@@ -168,6 +264,14 @@ export function parseWireSuccessResponse(input: unknown): {
         results.push(parsed);
       }
       return { ok: true, response: { kind: 'transaction', requestId, results } };
+    }
+    case 'workflowMutation': {
+      if (!exactKeys(obj, ['kind', 'requestId', 'result'])) {
+        return { ok: false, payload: makeProtocolError() };
+      }
+      const result = parseWorkflowMutationResult(obj.result);
+      if (!result) return { ok: false, payload: makeProtocolError() };
+      return { ok: true, response: { kind: 'workflowMutation', requestId, result } };
     }
     case 'scalar': {
       if (!exactKeys(obj, ['kind', 'requestId', 'value']) || !isFiniteNumber(obj.value)) {

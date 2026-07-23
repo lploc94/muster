@@ -265,6 +265,12 @@
           briefKind: row.briefKind,
         };
         if (row.model?.trim()) out.model = row.model.trim();
+        if (row.fallbacks !== undefined) {
+          out.fallbacks = row.fallbacks.map((binding) => ({
+            backend: binding.backend.trim(),
+            ...(binding.model?.trim() ? { model: binding.model.trim() } : {}),
+          }));
+        }
         if (row.description?.trim()) out.description = row.description.trim();
         return out;
       }),

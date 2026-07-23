@@ -84,7 +84,7 @@ describe('plan / coordinate presentation preambles', () => {
     const brief = synthesizeBriefFromGoal('Coordinate work', undefined, 'coordinate');
     const prompt = compileTaskPrompt(brief, [], { taskId: 'c1', goal: 'Coordinate work' });
     expect(prompt).toContain('upsert_presentation');
-    expect(prompt).toContain('ownerTaskId=self.taskId');
+    expect(prompt).toContain('presentationRef');
     expect(prompt).toContain('MUST call MCP');
     expect(prompt).toContain('do not only reply with chat text');
   });
@@ -159,11 +159,19 @@ describe('compileTaskPrompt', () => {
     expect(prompt).toContain('do step one');
   });
 
-  it('truncates oversized compiled prompt', () => {
+  it('rejects an oversized compiled prompt instead of truncating it', () => {
     const brief = synthesizeBriefFromGoal('x'.repeat(BRIEF_SECTION_MAX + 100));
     brief.context = 'y'.repeat(BRIEF_SECTION_MAX + 100);
-    const prompt = compileTaskPrompt(brief, []);
-    expect(prompt.length).toBeLessThanOrEqual(COMPILED_PROMPT_MAX);
+    expect(() => compileTaskPrompt(brief, [])).toThrow(
+      `Compiled task prompt exceeds ${COMPILED_PROMPT_MAX} characters`,
+    );
+  });
+
+  it('preserves a prompt-sized objective below the content budget', () => {
+    const objective = 'x'.repeat(240_000);
+    const brief = synthesizeBriefFromGoal(objective);
+    expect(brief.objective).toBe(objective);
+    expect(compileTaskPrompt(brief)).toContain(objective);
   });
 });
 
@@ -228,6 +236,36 @@ describe('mergeBriefFromCreate', () => {
 });
 
 describe('assembleFirstTurnPrompt', () => {
+  it('injects configured task types into the coordinator first turn', () => {
+    const result = assembleFirstTurnPrompt({
+      snapshot: hostSnap(),
+      self: { taskId: 'root', role: 'coordinator', backend: 'opencode' },
+      tools: ['define_workflow', 'list_task_types'],
+      taskTypes: [
+        {
+          id: 'explore',
+          backend: 'opencode',
+          defaultRole: 'worker',
+          defaultBriefKind: 'research',
+          availability: 'available',
+        },
+        {
+          id: 'research',
+          backend: 'opencode',
+          defaultRole: 'worker',
+          defaultBriefKind: 'research',
+          availability: 'available',
+        },
+      ],
+      brief: synthesizeBriefFromGoal('Inspect scheduling', undefined, 'coordinate'),
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.prompt).toContain('## Task types');
+    expect(result.prompt).toContain('`explore`');
+    expect(result.prompt).toContain('`research`');
+  });
+
   it('orders host → role → brief → pins for coordinator', () => {
     const brief = synthesizeBriefFromGoal('Coordinate work', undefined, 'coordinate');
     brief.acceptanceCriteria = ['children done'];
@@ -240,7 +278,7 @@ describe('assembleFirstTurnPrompt', () => {
         backend: 'opencode',
         model: 'm1',
       },
-      tools: ['create_task', 'set_task_lifecycle'],
+      tools: ['define_workflow', 'start_workflow'],
       brief,
       resolvedInputs: [
         {
@@ -268,7 +306,7 @@ describe('assembleFirstTurnPrompt', () => {
     expect(iAc).toBeGreaterThan(iCtx);
     expect(iPin).toBeGreaterThan(iAc);
     expect(prompt).toContain('## Available backends');
-    expect(prompt).toContain('set_task_lifecycle');
+    expect(prompt).toContain('define_workflow');
     for (const r of HOST_RULES_BASE) expect(prompt).toContain(r);
     for (const r of HOST_RULES_COORDINATOR) expect(prompt).toContain(r);
     expect(prompt).toContain('<untrusted-input name="plan"');
@@ -329,7 +367,7 @@ describe('assembleFirstTurnPrompt', () => {
     const result = assembleFirstTurnPrompt({
       snapshot: hostSnap(),
       self: { taskId: 't', role: 'coordinator', backend: 'opencode' },
-      tools: ['create_task'],
+      tools: ['define_workflow'],
       brief,
       resolvedInputs: [
         {
@@ -536,7 +574,7 @@ describe('assembleFirstTurnPrompt — skill injection', () => {
 
     // A large (SKILL_NAME_RE-valid) skill: prefix + context would blow the budget,
     // so the packing must DROP the context section — but still succeed (not fail).
-    const skillName = 'a'.repeat(41_000);
+    const skillName = 'a'.repeat(BRIEF_SECTION_MAX);
     brief.skills = [skillName];
     const withSkill = assembleFirstTurnPrompt({
       ...baseInput(),

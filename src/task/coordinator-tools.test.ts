@@ -7,6 +7,12 @@ import {
 } from './coordinator-tools';
 import type { CredentialContext } from '../bridge/credentials';
 import { normalizeVerdict } from './verdict';
+import {
+  TASK_ERROR_MAX_BYTES,
+  TASK_RESULT_MAX_BYTES,
+  WORKFLOW_FEEDBACK_MAX_BYTES,
+} from './content-limits';
+import { WORKFLOW_NODE_LABEL_MAX_LENGTH } from './workflow-types';
 
 function ctx(actions: string[]): CredentialContext {
   return {
@@ -14,13 +20,18 @@ function ctx(actions: string[]): CredentialContext {
     rootId: 'root',
     callerTaskId: 'task-1',
     turnId: 'turn-1',
+    attemptId: 'attempt-1',
     allowedActions: new Set(actions as import('./capabilities').ToolAction[]),
     expiry: Date.now() + 60_000,
   };
 }
 
+function generatedWorkflowId(hex: string): string {
+  return `workflow-${hex.repeat(32)}`;
+}
+
 describe('coordinator-tools dispatch', () => {
-  it('maps a valid presentation upsert owned by the caller to ToolCommand', () => {
+  it('rejects model-supplied presentation control fields', () => {
     const result = dispatch(
       'upsert_presentation',
       {
@@ -34,28 +45,59 @@ describe('coordinator-tools dispatch', () => {
       ctx(['upsert_presentation']),
     );
 
-    expect(result).toEqual({
+    expect(result).toEqual({ ok: false, toolError: 'invalid_arguments' });
+  });
+
+  it('derives presentation control fields from authenticated semantic input', () => {
+    const result = dispatch(
+      'upsert_presentation',
+      {
+        title: 'Release notes',
+        markdown: '# Ready',
+      },
+      ctx(['upsert_presentation']),
+    );
+
+    expect(result).toMatchObject({
       ok: true,
       command: {
         kind: 'upsert_presentation',
-        presentationId: 'release-notes',
         ownerTaskId: 'task-1',
-        opId: 'op-present-1',
-        revision: 1,
         title: 'Release notes',
         markdown: '# Ready',
       },
     });
+    if (result.ok && result.command.kind === 'upsert_presentation') {
+      expect(result.command.presentationId).toMatch(/^presentation-[a-f0-9]{32}$/);
+      expect(result.command.opId).toMatch(/^auto-[a-f0-9]{32}$/);
+      expect(result.command.revision).toBeUndefined();
+      expect(result.command.requireExisting).toBeUndefined();
+
+      const refreshed = dispatch(
+        'upsert_presentation',
+        {
+          presentationRef: result.command.presentationId,
+          title: 'Release notes',
+          markdown: '# Updated',
+        },
+        ctx(['upsert_presentation']),
+      );
+      expect(refreshed).toMatchObject({
+        ok: true,
+        command: {
+          kind: 'upsert_presentation',
+          presentationId: result.command.presentationId,
+          requireExisting: true,
+          markdown: '# Updated',
+        },
+      });
+    }
   });
 
   it('returns the stable unauthorized code when presentation capability is absent', () => {
     const result = dispatch(
       'upsert_presentation',
       {
-        presentationId: 'release-notes',
-        ownerTaskId: 'task-1',
-        opId: 'op-present-1',
-        revision: 1,
         title: 'Release notes',
         markdown: '# Ready',
       },
@@ -71,7 +113,7 @@ describe('coordinator-tools dispatch', () => {
     expect(result).toEqual({ ok: false, toolError: 'invalid_arguments' });
   });
 
-  it('rejects a presentation owner that does not match the credential caller', () => {
+  it('rejects a model-supplied presentation owner', () => {
     const result = dispatch(
       'upsert_presentation',
       {
@@ -85,7 +127,7 @@ describe('coordinator-tools dispatch', () => {
       ctx(['upsert_presentation']),
     );
 
-    expect(result).toEqual({ ok: false, toolError: 'owner_mismatch' });
+    expect(result).toEqual({ ok: false, toolError: 'invalid_arguments' });
   });
 
   it.each([
@@ -100,10 +142,6 @@ describe('coordinator-tools dispatch', () => {
     const result = dispatch(
       'upsert_presentation',
       {
-        presentationId: 'release-notes',
-        ownerTaskId: 'task-1',
-        opId: 'op-present-1',
-        revision: 1,
         title: 'Release notes',
         markdown: '# Ready',
         ...override,
@@ -115,19 +153,13 @@ describe('coordinator-tools dispatch', () => {
   });
 
   it.each([
-    ['presentation ID', { presentationId: `p${'x'.repeat(PRESENTATION_ID_MAX_LENGTH)}` }],
-    ['owner task ID', { ownerTaskId: `t${'x'.repeat(PRESENTATION_ID_MAX_LENGTH)}` }],
-    ['operation ID', { opId: `o${'x'.repeat(PRESENTATION_ID_MAX_LENGTH)}` }],
+    ['presentation ref', { presentationRef: `p${'x'.repeat(PRESENTATION_ID_MAX_LENGTH)}` }],
     ['title', { title: 'x'.repeat(PRESENTATION_TITLE_MAX_LENGTH + 1) }],
     ['Markdown', { markdown: 'x'.repeat(PRESENTATION_MARKDOWN_MAX_LENGTH + 1) }],
   ])('rejects an oversized presentation %s without reflecting content', (_label, override) => {
     const result = dispatch(
       'upsert_presentation',
       {
-        presentationId: 'release-notes',
-        ownerTaskId: 'task-1',
-        opId: 'op-present-1',
-        revision: 1,
         title: 'Release notes',
         markdown: '# Ready',
         ...override,
@@ -202,13 +234,13 @@ describe('coordinator-tools dispatch', () => {
   it('maps release_tasks to ToolCommand', () => {
     const result = dispatch(
       'release_tasks',
-      { opId: 'op-rel', taskIds: ['a', 'b'], includeDependencies: true },
+      { opId: 'op-rel', taskIds: ['a', 'b'], includePrerequisites: true },
       ctx(['release_tasks']),
     );
     expect(result.ok).toBe(true);
     if (result.ok && result.command.kind === 'release_tasks') {
       expect(result.command.taskIds).toEqual(['a', 'b']);
-      expect(result.command.includeDependencies).toBe(true);
+      expect(result.command.includePrerequisites).toBe(true);
     }
   });
 
@@ -274,6 +306,326 @@ describe('coordinator-tools dispatch', () => {
   it('rejects missing opId', () => {
     const result = dispatch('complete_task', { summary: 'done' }, ctx(['complete_task']));
     expect(result).toEqual({ ok: false, toolError: 'opId is required' });
+  });
+
+  it('rejects model-supplied workflow control fields', () => {
+    const topology = {
+      kind: 'one_node_v1',
+      entryNodeId: 'entry',
+      nodes: [{ nodeId: 'entry' }],
+    };
+    const defined = dispatch(
+      'define_workflow',
+      {
+        opId: 'op-def-1',
+        definitionId: 'wf-one',
+        version: 1,
+        name: 'one-node',
+        topology,
+        entryContracts: [],
+      },
+      ctx(['define_workflow']),
+    );
+    expect(defined).toEqual({
+      ok: false,
+      toolError: 'invalid define_workflow arguments',
+    });
+
+    const started = dispatch(
+      'start_workflow',
+      {
+        opId: 'op-start-1',
+        definitionId: 'wf-one',
+        version: 1,
+        startIdempotencyKey: 'idem-1',
+        goal: 'run one-node',
+        backend: 'grok',
+        entryInputs: [],
+      },
+      ctx(['start_workflow']),
+    );
+    expect(started).toEqual({
+      ok: false,
+      toolError: 'invalid start_workflow arguments',
+    });
+
+    const unauthorized = dispatch(
+      'define_workflow',
+      {
+        opId: 'op-def-2',
+        definitionId: 'wf-one',
+        version: 1,
+        name: 'one-node',
+        topology,
+      },
+      ctx(['complete_task']),
+    );
+    expect(unauthorized).toEqual({
+      ok: false,
+      toolError: 'action not permitted: define_workflow',
+    });
+
+    const missingKey = dispatch(
+      'start_workflow',
+      {
+        opId: 'op-start-2',
+        definitionId: 'wf-one',
+        version: 1,
+      },
+      ctx(['start_workflow']),
+    );
+    expect(missingKey.ok).toBe(false);
+
+    const badTopology = dispatch(
+      'define_workflow',
+      {
+        opId: 'op-def-3',
+        definitionId: 'wf-one',
+        version: 1,
+        name: 'one-node',
+        topology: { kind: 'two_node_v1' },
+      },
+      ctx(['define_workflow']),
+    );
+    expect(badTopology.ok).toBe(false);
+  });
+
+  it('compiles semantic workflow definitions and starts into internal commands', () => {
+    const defined = dispatch(
+      'define_workflow',
+      {
+        name: 'Review flow',
+        nodes: [
+          { nodeKey: 'research', taskType: 'research' },
+          { nodeKey: 'review', taskType: 'review' },
+        ],
+        edges: [{ from: 'research', to: 'review', as: 'research' }],
+        inputs: [{ to: 'research', name: 'request' }],
+      },
+      ctx(['define_workflow']),
+    );
+    expect(defined).toMatchObject({
+      ok: true,
+      command: {
+        kind: 'define_workflow',
+        definitionId: expect.stringMatching(/^workflow-[a-f0-9]{32}$/),
+        name: 'Review flow',
+        topology: {
+          kind: 'graph_v1',
+          nodes: [
+            { nodeId: 'research', taskType: 'research' },
+            { nodeId: 'review', taskType: 'review' },
+          ],
+          edges: [{
+            fromNodeId: 'research',
+            toNodeId: 'review',
+            inputRef: 'research',
+            expectedArtifactKind: 'next_result',
+          }],
+        },
+        entryContracts: [{
+          entryNodeId: 'research',
+          inputRef: 'request',
+          expectedArtifactKind: 'workflow_input',
+        }],
+      },
+    });
+    if (defined.ok && defined.command.kind === 'define_workflow') {
+      expect(defined.command.version).toBeUndefined();
+      expect(defined.command.policy).toBeUndefined();
+      expect(defined.command.opId).toMatch(/^auto-/);
+    }
+
+    const workflowRef = defined.ok && defined.command.kind === 'define_workflow'
+      ? `${defined.command.definitionId}@3`
+      : 'invalid@3';
+    const started = dispatch(
+      'start_workflow',
+      {
+        workflow: workflowRef,
+        goal: 'Review the subsystem',
+        inputs: [{ node: 'research', input: 'request', value: 'Inspect routing' }],
+      },
+      ctx(['start_workflow']),
+    );
+    expect(started).toMatchObject({
+      ok: true,
+      command: {
+        kind: 'start_workflow',
+        definitionId: defined.ok && defined.command.kind === 'define_workflow'
+          ? defined.command.definitionId
+          : 'invalid',
+        version: 3,
+        goal: 'Review the subsystem',
+        entryInputs: [{
+          entryNodeId: 'research',
+          inputRef: 'request',
+          kind: 'workflow_input',
+          value: 'Inspect routing',
+        }],
+      },
+    });
+  });
+
+  it('generates stable workflow identity from semantic content', () => {
+    const first = dispatch(
+      'define_workflow',
+      {
+        name: 'Review flow',
+        nodes: [{ nodeKey: 'review', taskType: 'verify', label: 'Review the change.' }],
+      },
+      ctx(['define_workflow']),
+    );
+    const reordered = dispatch(
+      'define_workflow',
+      {
+        nodes: [{ label: 'Review the change.', taskType: 'verify', nodeKey: 'review' }],
+        name: 'Review flow',
+      },
+      ctx(['define_workflow']),
+    );
+    const changed = dispatch(
+      'define_workflow',
+      {
+        name: 'Review flow',
+        nodes: [{ nodeKey: 'review', taskType: 'verify', label: 'Review tests too.' }],
+      },
+      ctx(['define_workflow']),
+    );
+
+    expect(first.ok && reordered.ok && changed.ok).toBe(true);
+    if (
+      first.ok && reordered.ok && changed.ok &&
+      first.command.kind === 'define_workflow' &&
+      reordered.command.kind === 'define_workflow' &&
+      changed.command.kind === 'define_workflow'
+    ) {
+      expect(first.command.definitionId).toMatch(/^workflow-[a-f0-9]{32}$/);
+      expect(reordered.command.definitionId).toBe(first.command.definitionId);
+      expect(reordered.command.opId).toBe(first.command.opId);
+      expect(changed.command.definitionId).not.toBe(first.command.definitionId);
+      expect(changed.command.opId).not.toBe(first.command.opId);
+    }
+  });
+
+  it('derives operation slots from semantic call content within one turn', () => {
+    const reviewRef = `${generatedWorkflowId('1')}@1`;
+    const auditRef = `${generatedWorkflowId('2')}@1`;
+    const deepReviewRef = `${generatedWorkflowId('3')}@1`;
+    const quickReviewRef = `${generatedWorkflowId('4')}@1`;
+    const firstStart = dispatch(
+      'start_workflow',
+      { workflow: reviewRef },
+      ctx(['start_workflow']),
+    );
+    const replayedStart = dispatch(
+      'start_workflow',
+      { workflow: reviewRef },
+      ctx(['start_workflow']),
+    );
+    const secondStart = dispatch(
+      'start_workflow',
+      { workflow: reviewRef, goal: 'Second run' },
+      ctx(['start_workflow']),
+    );
+    const otherWorkflowStart = dispatch(
+      'start_workflow',
+      { workflow: auditRef },
+      ctx(['start_workflow']),
+    );
+    const firstChild = dispatch(
+      'invoke_child_workflow',
+      {
+        workflow: deepReviewRef,
+        bindings: [{ toNode: 'entry', input: 'request', fromInput: 'implementation' }],
+      },
+      ctx(['invoke_child_workflow']),
+    );
+    const replayedChild = dispatch(
+      'invoke_child_workflow',
+      {
+        workflow: deepReviewRef,
+        bindings: [{ toNode: 'entry', input: 'request', fromInput: 'implementation' }],
+      },
+      ctx(['invoke_child_workflow']),
+    );
+    const secondChild = dispatch(
+      'invoke_child_workflow',
+      {
+        workflow: deepReviewRef,
+        bindings: [{ toNode: 'entry', input: 'request', fromInput: 'testReport' }],
+      },
+      ctx(['invoke_child_workflow']),
+    );
+    const otherWorkflowChild = dispatch(
+      'invoke_child_workflow',
+      {
+        workflow: quickReviewRef,
+        bindings: [{ toNode: 'entry', input: 'request', fromInput: 'implementation' }],
+      },
+      ctx(['invoke_child_workflow']),
+    );
+
+    expect(firstStart.ok && replayedStart.ok && secondStart.ok && otherWorkflowStart.ok).toBe(true);
+    expect(firstChild.ok && replayedChild.ok && secondChild.ok && otherWorkflowChild.ok).toBe(true);
+    if (
+      firstStart.ok &&
+      replayedStart.ok &&
+      secondStart.ok &&
+      otherWorkflowStart.ok &&
+      firstStart.command.kind === 'start_workflow' &&
+      replayedStart.command.kind === 'start_workflow' &&
+      secondStart.command.kind === 'start_workflow' &&
+      otherWorkflowStart.command.kind === 'start_workflow'
+    ) {
+      expect(firstStart.command.opId).toBe(replayedStart.command.opId);
+      expect(firstStart.command.opId).not.toBe(secondStart.command.opId);
+      expect(firstStart.command.opId).not.toBe(otherWorkflowStart.command.opId);
+    }
+    if (
+      firstChild.ok &&
+      replayedChild.ok &&
+      secondChild.ok &&
+      otherWorkflowChild.ok &&
+      firstChild.command.kind === 'invoke_child_workflow' &&
+      replayedChild.command.kind === 'invoke_child_workflow' &&
+      secondChild.command.kind === 'invoke_child_workflow' &&
+      otherWorkflowChild.command.kind === 'invoke_child_workflow'
+    ) {
+      expect(firstChild.command.opId).toBe(replayedChild.command.opId);
+      expect(firstChild.command.opId).not.toBe(secondChild.command.opId);
+      expect(firstChild.command.opId).not.toBe(otherWorkflowChild.command.opId);
+    }
+  });
+
+  it('requires generated version-pinned workflow references', () => {
+    const definitionId = generatedWorkflowId('a');
+    expect(dispatch(
+      'start_workflow',
+      { workflow: definitionId },
+      ctx(['start_workflow']),
+    )).toEqual({ ok: false, toolError: 'invalid start_workflow arguments' });
+    expect(dispatch(
+      'start_workflow',
+      { workflow: 'caller-chosen@1' },
+      ctx(['start_workflow']),
+    )).toEqual({ ok: false, toolError: 'invalid start_workflow arguments' });
+    expect(dispatch(
+      'invoke_child_workflow',
+      {
+        workflow: definitionId,
+        bindings: [{ toNode: 'entry', input: 'request', fromInput: 'implementation' }],
+      },
+      ctx(['invoke_child_workflow']),
+    )).toEqual({ ok: false, toolError: 'invalid invoke_child_workflow arguments' });
+    expect(dispatch(
+      'invoke_child_workflow',
+      {
+        workflow: 'caller-chosen@1',
+        bindings: [{ toNode: 'entry', input: 'request', fromInput: 'implementation' }],
+      },
+      ctx(['invoke_child_workflow']),
+    )).toEqual({ ok: false, toolError: 'invalid invoke_child_workflow arguments' });
   });
 
   it('rejects action outside allowedActions', () => {
@@ -466,6 +818,31 @@ describe('coordinator-tools dispatch', () => {
     expect(result.ok).toBe(false);
   });
 
+  it('maps inspect_workflow_run with one required runId and no opId', () => {
+    const result = dispatch(
+      'inspect_workflow_run',
+      { runId: 'wfr-1' },
+      ctx(['inspect_workflow_run']),
+    );
+    expect(result).toEqual({
+      ok: true,
+      command: { kind: 'inspect_workflow_run', runId: 'wfr-1' },
+    });
+  });
+
+  it('rejects inspect_workflow_run without runId or with extra arguments', () => {
+    expect(dispatch(
+      'inspect_workflow_run',
+      {},
+      ctx(['inspect_workflow_run']),
+    )).toEqual({ ok: false, toolError: 'runRef is required' });
+    expect(dispatch(
+      'inspect_workflow_run',
+      { runId: 'wfr-1', taskId: 'legacy-task' },
+      ctx(['inspect_workflow_run']),
+    )).toEqual({ ok: false, toolError: 'inspect_workflow_run accepts only runRef' });
+  });
+
   it('rejects public create without taskType', () => {
     const result = dispatch(
       'create_task',
@@ -507,7 +884,7 @@ describe('coordinator-tools batch dispatch', () => {
             localId: 'b',
             goal: 'second',
             taskType: 'implement',
-            dependsOn: ['a'],
+            prerequisiteLocalIds: ['a'],
             inputBindings: [{ fromLocalId: 'a', output: 'summary', as: 'plan' }],
           },
         ],
@@ -518,7 +895,7 @@ describe('coordinator-tools batch dispatch', () => {
     if (result.ok && result.command.kind === 'create_tasks') {
       expect(result.command.specs).toHaveLength(2);
       expect(result.command.specs[1].localId).toBe('b');
-      expect(result.command.specs[1].dependsOn).toEqual(['a']);
+      expect(result.command.specs[1].prerequisiteLocalIds).toEqual(['a']);
       expect(result.command.specs[1].inputBindings).toEqual([
         { fromLocalId: 'a', output: 'summary', as: 'plan' },
       ]);
@@ -535,11 +912,11 @@ describe('coordinator-tools batch dispatch', () => {
             localId: 'ship',
             goal: 'ship it',
             taskType: 'implement',
-            dependencies: [
+            prerequisites: [
               {
-                taskId: 'task-verify',
-                requiredOutcome: 'succeeded',
-                onUnsatisfied: 'block',
+                producerTaskId: 'task-verify',
+                requiredLifecycle: 'succeeded',
+                onUnmet: 'block',
                 requiredVerdict: 'pass',
               },
             ],
@@ -550,11 +927,11 @@ describe('coordinator-tools batch dispatch', () => {
     );
     expect(result.ok).toBe(true);
     if (result.ok && result.command.kind === 'create_tasks') {
-      expect(result.command.specs[0].dependencies).toEqual([
+      expect(result.command.specs[0].prerequisites).toEqual([
         {
-          taskId: 'task-verify',
-          requiredOutcome: 'succeeded',
-          onUnsatisfied: 'block',
+          producerTaskId: 'task-verify',
+          requiredLifecycle: 'succeeded',
+          onUnmet: 'block',
           requiredVerdict: 'pass',
         },
       ]);
@@ -571,11 +948,11 @@ describe('coordinator-tools batch dispatch', () => {
             localId: 'ship',
             goal: 'ship it',
             taskType: 'implement',
-            dependencies: [
+            prerequisites: [
               {
-                taskId: 'task-verify',
-                requiredOutcome: 'succeeded',
-                onUnsatisfied: 'block',
+                producerTaskId: 'task-verify',
+                requiredLifecycle: 'succeeded',
+                onUnmet: 'block',
                 requiredVerdict: 'fail',
               },
             ],
@@ -626,12 +1003,12 @@ describe('coordinator-tools batch dispatch', () => {
     expect(result).toEqual({ ok: false, toolError: 'invalid create_tasks arguments' });
   });
 
-  it('rejects dependsOn referencing an unknown localId', () => {
+  it('rejects prerequisiteLocalIds referencing an unknown localId', () => {
     const result = dispatch(
       'create_tasks',
       {
         opId: 'op-batch',
-        tasks: [{ localId: 'a', goal: 'x', taskType: 'plan', dependsOn: ['ghost'] }],
+        tasks: [{ localId: 'a', goal: 'x', taskType: 'plan', prerequisiteLocalIds: ['ghost'] }],
       },
       ctx(['create_tasks']),
     );
@@ -679,12 +1056,12 @@ describe('coordinator-tools batch dispatch', () => {
     expect(result).toEqual({ ok: false, toolError: 'invalid create_tasks arguments' });
   });
 
-  it('rejects a self dependsOn', () => {
+  it('rejects a self prerequisiteLocalId', () => {
     const result = dispatch(
       'create_tasks',
       {
         opId: 'op-batch',
-        tasks: [{ localId: 'a', goal: 'x', taskType: 'plan', dependsOn: ['a'] }],
+        tasks: [{ localId: 'a', goal: 'x', taskType: 'plan', prerequisiteLocalIds: ['a'] }],
       },
       ctx(['create_tasks']),
     );
@@ -812,15 +1189,15 @@ describe('parseDependency requiredVerdict', () => {
         opId: 'op-d',
         goal: 'gate on verify',
         taskType: 'implement',
-        dependencies: [
-          { taskId: 'verify-1', requiredOutcome: 'succeeded', onUnsatisfied: 'fail', requiredVerdict: 'pass' },
+        prerequisites: [
+          { producerTaskId: 'verify-1', requiredLifecycle: 'succeeded', onUnmet: 'fail', requiredVerdict: 'pass' },
         ],
       },
       ctx(['create_task']),
     );
     expect(result.ok).toBe(true);
     if (!result.ok || result.command.kind !== 'create_task') return;
-    expect(result.command.spec.dependencies?.[0].requiredVerdict).toBe('pass');
+    expect(result.command.spec.prerequisites?.[0].requiredVerdict).toBe('pass');
   });
 
   it('rejects an invalid requiredVerdict value (fail closed)', () => {
@@ -830,12 +1207,306 @@ describe('parseDependency requiredVerdict', () => {
         opId: 'op-d',
         goal: 'g',
         taskType: 'implement',
-        dependencies: [
-          { taskId: 'v', requiredOutcome: 'succeeded', onUnsatisfied: 'fail', requiredVerdict: 'fail' },
+        prerequisites: [
+          { producerTaskId: 'v', requiredLifecycle: 'succeeded', onUnmet: 'fail', requiredVerdict: 'fail' },
         ],
       },
       ctx(['create_task']),
     );
     expect(result).toEqual({ ok: false, toolError: 'invalid create_task arguments' });
+  });
+});
+
+describe('workflow_next tool surface', () => {
+  it('maps workflow_next with change and required final message', () => {
+    const withBody = dispatch(
+      'workflow_next',
+      { opId: 'op-n1', change: 'updated', message: 'producer body' },
+      ctx(['workflow_next']),
+    );
+    expect(withBody).toEqual({
+      ok: true,
+      command: {
+        kind: 'workflow_next',
+        opId: 'op-n1',
+        change: 'updated',
+        message: 'producer body',
+      },
+    });
+
+    const unchanged = dispatch(
+      'workflow_next',
+      { opId: 'op-n2', change: 'unchanged', message: 'no changes needed' },
+      ctx(['workflow_next']),
+    );
+    expect(unchanged).toEqual({
+      ok: true,
+      command: { kind: 'workflow_next', opId: 'op-n2', change: 'unchanged', message: 'no changes needed' },
+    });
+  });
+
+  it('rejects missing/invalid change and unauthorized callers', () => {
+    expect(
+      dispatch('workflow_next', { opId: 'op-n', change: 'maybe', message: 'done' }, ctx(['workflow_next'])),
+    ).toEqual({ ok: false, toolError: 'change must be "updated" or "unchanged"' });
+
+    expect(
+      dispatch('workflow_next', { opId: 'op-n' }, ctx(['workflow_next'])),
+    ).toEqual({ ok: false, toolError: 'message is required' });
+
+    expect(
+      dispatch('workflow_next', { opId: 'op-n', message: 'done' }, ctx(['workflow_next'])),
+    ).toEqual({
+      ok: true,
+      command: { kind: 'workflow_next', opId: 'op-n', change: 'updated', message: 'done' },
+    });
+
+    expect(
+      dispatch(
+        'workflow_next',
+        { opId: 'op-n', change: 'updated', message: 'done' },
+        ctx(['complete_task']),
+      ),
+    ).toEqual({ ok: false, toolError: 'action not permitted: workflow_next' });
+  });
+
+  it('rejects oversized workflow content without silently truncating it', () => {
+    const result = dispatch(
+      'workflow_next',
+      {
+        opId: 'op-n-large',
+        message: 'x'.repeat(TASK_RESULT_MAX_BYTES + 1),
+      },
+      ctx(['workflow_next']),
+    );
+    expect(result).toEqual({
+      ok: false,
+      toolError: `message exceeds ${TASK_RESULT_MAX_BYTES} UTF-8 bytes`,
+    });
+
+    const feedback = dispatch(
+      'workflow_prev',
+      {
+        opId: 'op-p-large',
+        message: 'x'.repeat(WORKFLOW_FEEDBACK_MAX_BYTES + 1),
+      },
+      ctx(['workflow_prev']),
+    );
+    expect(feedback).toEqual({
+      ok: false,
+      toolError: `message exceeds ${WORKFLOW_FEEDBACK_MAX_BYTES} UTF-8 bytes`,
+    });
+
+    const failure = dispatch(
+      'workflow_fail',
+      {
+        opId: 'op-f-large',
+        reason: 'x'.repeat(TASK_ERROR_MAX_BYTES + 1),
+      },
+      ctx(['workflow_fail']),
+    );
+    expect(failure).toEqual({
+      ok: false,
+      toolError: `reason exceeds ${TASK_ERROR_MAX_BYTES} UTF-8 bytes`,
+    });
+  });
+
+  it('accepts a workflow node objective at the expanded content budget', () => {
+    const label = 'x'.repeat(WORKFLOW_NODE_LABEL_MAX_LENGTH);
+    const result = dispatch(
+      'define_workflow',
+      {
+        name: 'Large objective',
+        nodes: [{ nodeKey: 'inspect', taskType: 'explore', label }],
+      },
+      ctx(['define_workflow']),
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok && result.command.kind === 'define_workflow') {
+      expect((result.command.topology as { nodes: Array<{ label: string }> }).nodes[0]?.label)
+        .toBe(label);
+    }
+  });
+
+  it('maps workflow_prev with all or non-empty targets and a required final message', () => {
+    expect(
+      dispatch(
+        'workflow_prev',
+        { opId: 'op-p', targets: 'all', message: 'revise all inputs' },
+        ctx(['workflow_prev']),
+      ),
+    ).toEqual({
+      ok: true,
+      command: { kind: 'workflow_prev', opId: 'op-p', targets: 'all', message: 'revise all inputs' },
+    });
+    expect(
+      dispatch(
+        'workflow_prev',
+        { opId: 'op-p', targets: ['from_p1'], message: 'fix me' },
+        ctx(['workflow_prev']),
+      ),
+    ).toEqual({
+      ok: true,
+      command: {
+        kind: 'workflow_prev',
+        opId: 'op-p',
+        targets: ['from_p1'],
+        message: 'fix me',
+      },
+    });
+  });
+
+  it('rejects empty/invalid workflow_prev targets at parse time', () => {
+    expect(
+      dispatch(
+        'workflow_prev',
+        { opId: 'op-p', targets: [], message: 'revise' },
+        ctx(['workflow_prev']),
+      ),
+    ).toEqual({
+      ok: false,
+      toolError: 'targets must be "all" or a non-empty string array of inputRefs',
+    });
+    expect(
+      dispatch(
+        'workflow_prev',
+        { opId: 'op-p', targets: [''], message: 'revise' },
+        ctx(['workflow_prev']),
+      ),
+    ).toEqual({
+      ok: false,
+      toolError: 'targets must be "all" or a non-empty string array of inputRefs',
+    });
+    expect(
+      dispatch(
+        'workflow_prev',
+        { opId: 'op-p' },
+        ctx(['workflow_prev']),
+      ),
+    ).toEqual({
+      ok: false,
+      toolError: 'message is required',
+    });
+
+    expect(
+      dispatch('workflow_prev', { opId: 'op-p', message: 'revise' }, ctx(['workflow_prev'])),
+    ).toEqual({
+      ok: true,
+      command: { kind: 'workflow_prev', opId: 'op-p', targets: 'all', message: 'revise' },
+    });
+    expect(
+      dispatch(
+        'workflow_prev',
+        { opId: 'op-p', targets: 'all', message: 'revise' },
+        ctx(['complete_task']),
+      ),
+    ).toEqual({ ok: false, toolError: 'action not permitted: workflow_prev' });
+  });
+
+  it('maps workflow_fail with optional reason', () => {
+    expect(
+      dispatch(
+        'workflow_fail',
+        { opId: 'op-f' },
+        ctx(['workflow_fail']),
+      ),
+    ).toEqual({
+      ok: true,
+      command: { kind: 'workflow_fail', opId: 'op-f' },
+    });
+    expect(
+      dispatch(
+        'workflow_fail',
+        { opId: 'op-f', reason: 'cannot continue' },
+        ctx(['workflow_fail']),
+      ),
+    ).toEqual({
+      ok: true,
+      command: { kind: 'workflow_fail', opId: 'op-f', reason: 'cannot continue' },
+    });
+  });
+
+  it('rejects invalid workflow_fail reason at parse time', () => {
+    expect(
+      dispatch(
+        'workflow_fail',
+        { opId: 'op-f', reason: '' },
+        ctx(['workflow_fail']),
+      ),
+    ).toEqual({
+      ok: false,
+      toolError: 'reason must be a non-empty string when provided',
+    });
+    expect(
+      dispatch(
+        'workflow_fail',
+        { opId: 'op-f' },
+        ctx(['complete_task']),
+      ),
+    ).toEqual({ ok: false, toolError: 'action not permitted: workflow_fail' });
+  });
+
+  it('rejects model-supplied child artifact coordinates', () => {
+    const binding = {
+      childEntryNodeId: 'entry-a',
+      inputRef: 'request',
+      artifactId: 'artifact-1',
+      artifactRevision: 3,
+    };
+    expect(dispatch(
+      'invoke_child_workflow',
+      {
+        opId: 'op-child',
+        childDefinitionId: 'wf-child',
+        childDefinitionVersion: 2,
+        entryBindings: [binding],
+      },
+      ctx(['invoke_child_workflow']),
+    )).toEqual({
+      ok: false,
+      toolError: 'invalid invoke_child_workflow arguments',
+    });
+  });
+
+  it('maps semantic child workflow bindings without artifact coordinates', () => {
+    const definitionId = generatedWorkflowId('d');
+    const result = dispatch(
+      'invoke_child_workflow',
+      {
+        workflow: `${definitionId}@2`,
+        bindings: [{ toNode: 'entry', input: 'request', fromInput: 'implementation' }],
+      },
+      ctx(['invoke_child_workflow']),
+    );
+    expect(result).toMatchObject({
+      ok: true,
+      command: {
+        kind: 'invoke_child_workflow',
+        childDefinitionId: definitionId,
+        childDefinitionVersion: 2,
+        semanticEntryBindings: [{
+          childEntryNodeId: 'entry',
+          inputRef: 'request',
+          fromInputRef: 'implementation',
+        }],
+      },
+    });
+    if (result.ok && result.command.kind === 'invoke_child_workflow') {
+      expect(result.command.childDefinitionVersion).toBe(2);
+      expect(result.command.childIdempotencyKey).toMatch(/^turn-/);
+      expect(result.command.opId).toMatch(/^auto-/);
+    }
+    expect(dispatch(
+      'invoke_child_workflow',
+      {
+        workflow: `${definitionId}@2`,
+        bindings: [{ toNode: 'entry', input: 'request', fromInput: 'implementation' }],
+        callKey: 'model-supplied-key',
+      },
+      ctx(['invoke_child_workflow']),
+    )).toEqual({
+      ok: false,
+      toolError: 'invalid invoke_child_workflow arguments',
+    });
   });
 });

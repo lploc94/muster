@@ -72,9 +72,10 @@ describe('TranscriptStreamBatcher', () => {
       turnId: 'turn-1',
     });
     batcher.noteReasoning({
-      id: 'turn-1',
+      id: 'turn-1:1',
       taskId: 'task-1',
       turnId: 'turn-1',
+      order: 1,
       content: 'think',
       createdAt: '2026-07-06T00:00:00.000Z',
       updatedAt: '2026-07-06T00:00:00.000Z',
@@ -84,7 +85,7 @@ describe('TranscriptStreamBatcher', () => {
     const payload = persist.mock.calls[0]?.[0] as unknown as StreamBatchPayload;
     expect(payload.messages).toHaveLength(1);
     expect(payload.reasoning).toHaveLength(1);
-    expect(payload.reasoning?.[0]?.id).toBe('turn-1');
+    expect(payload.reasoning?.[0]?.id).toBe('turn-1:1');
   });
 
   it('delta after window starts a second batch', async () => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  clampPresentationMarkdown,
+  isPresentationMarkdownSizeAllowed,
   isCanonicalInsideRoot,
   isWorkspaceMarkdownHref,
   presentationIdFromFolderAndRelativePath,
@@ -77,10 +77,11 @@ describe('titleFromMarkdownPath', () => {
   });
 });
 
-describe('clampPresentationMarkdown', () => {
-  it('clamps oversized bodies', () => {
+describe('presentation markdown size', () => {
+  it('rejects oversized bodies instead of truncating them', () => {
     const big = 'x'.repeat(PRESENTATION_MARKDOWN_MAX_LENGTH + 10);
-    expect(clampPresentationMarkdown(big).length).toBe(PRESENTATION_MARKDOWN_MAX_LENGTH);
+    expect(isPresentationMarkdownSizeAllowed(big)).toBe(false);
+    expect(isPresentationMarkdownSizeAllowed('# Ready')).toBe(true);
   });
 });
 

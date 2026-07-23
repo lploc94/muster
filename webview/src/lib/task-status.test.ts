@@ -27,7 +27,7 @@ import {
 } from './task-status';
 
 const EXPECTED_RUNTIME = [
-  'waiting_dependencies',
+  'waiting_prerequisites',
   'queued',
   'running',
   'waiting_user',
@@ -120,7 +120,7 @@ describe('task status dual-axis presentation', () => {
   });
 
   it('exposes labels through the presentation lookup', () => {
-    expect(taskStatusLabel('waiting_dependencies')).toBe('Waiting on dependencies');
+    expect(taskStatusLabel('waiting_prerequisites')).toBe('Waiting on prerequisites');
     expect(getTaskStatusPresentation('needs_recovery').workspaceHeadline).toMatch(/could not finish/i);
   });
 
@@ -156,7 +156,7 @@ describe('task status dual-axis presentation', () => {
   it('blocks free-form composer only for waiting_user (Phase B)', () => {
     expect(runtimeBlocksComposer('waiting_user')).toBe(true);
     expect(runtimeBlocksComposer('needs_recovery')).toBe(false);
-    expect(runtimeBlocksComposer('waiting_dependencies')).toBe(false);
+    expect(runtimeBlocksComposer('waiting_prerequisites')).toBe(false);
     expect(runtimeBlocksComposer('waiting_children')).toBe(false);
     expect(runtimeBlocksComposer('blocked')).toBe(false);
   });

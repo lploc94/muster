@@ -64,12 +64,15 @@ export class RepositoryProjection {
   viewStatusOf(taskId: string): TaskViewStatus | undefined {
     const task = this.file.tasks[taskId];
     if (!task) return undefined;
-    const dependencies = new Map(
-      task.dependencies
-        .map((dependency) => [dependency.taskId, this.file.tasks[dependency.taskId]?.lifecycle] as const)
+    const prerequisites = new Map(
+      task.prerequisites
+        .map((prerequisite) => [
+          prerequisite.producerTaskId,
+          this.file.tasks[prerequisite.producerTaskId]?.lifecycle,
+        ] as const)
         .filter((entry): entry is [string, NonNullable<(typeof entry)[1]>] => entry[1] !== undefined),
     );
-    return deriveViewStatus(task, this.getTurnsForTask(taskId), dependencies);
+    return deriveViewStatus(task, this.getTurnsForTask(taskId), prerequisites);
   }
 
   /**
@@ -235,11 +238,17 @@ export class RepositoryProjection {
       await this.refreshRevision();
       return;
     }
-    if (command.kind === 'clearHistory' || command.kind === 'deleteTask' || command.kind === 'deleteTaskSubtreeIfIdle') {
+    if (command.kind === 'clearHistory' || command.kind === 'deleteTask' || command.kind === 'deleteTaskSubtree') {
       await this.refreshAll();
       return;
     }
-    const ids = this.affectedTaskIds(command);
+    if (command.kind === 'resolveWorkflowStartContinuation' && result.turnId) {
+      const turn = await this.source.getTurn(result.turnId);
+      if (turn) await this.refreshTask(turn.taskId);
+      await this.refreshRevision();
+      return;
+    }
+    const ids = this.affectedTaskIds(command, result);
     await Promise.all([...ids].map((id) => this.refreshTask(id)));
     // Apply coordination rows after aggregate refresh: refreshTask removes the
     // previous turn-bound coordination projection before loading current rows.
@@ -251,8 +260,39 @@ export class RepositoryProjection {
     this.file.revision = await this.source.getWorkspaceRevision();
   }
 
-  private affectedTaskIds(command: RepositoryCommand): Set<string> {
-    const ids = new Set<string>();
+  private affectedTaskIds(
+    command: RepositoryCommand,
+    result?: RepositoryCommandResult,
+  ): Set<string> {
+    const ids = new Set(result?.affectedTaskIds ?? []);
+    // M018 S01/S02: start creates entry task(s) not present on the command shape.
+    // One-node: entryTaskId; multi-node fan-in: every entries[].taskId is activated.
+    if (
+      command.kind === 'startWorkflowRun' &&
+      result?.operation?.result &&
+      result.operation.result.ok === true
+    ) {
+      const data = result.operation.result.data as {
+        entryTaskId?: unknown;
+        entries?: unknown;
+      };
+      if (typeof data.entryTaskId === 'string' && data.entryTaskId.length > 0) {
+        ids.add(data.entryTaskId);
+      }
+      if (Array.isArray(data.entries)) {
+        for (const entry of data.entries) {
+          if (
+            entry &&
+            typeof entry === 'object' &&
+            'taskId' in entry &&
+            typeof (entry as { taskId: unknown }).taskId === 'string' &&
+            (entry as { taskId: string }).taskId.length > 0
+          ) {
+            ids.add((entry as { taskId: string }).taskId);
+          }
+        }
+      }
+    }
     if ('taskId' in command && typeof command.taskId === 'string') ids.add(command.taskId);
     if ('task' in command && command.task && typeof command.task === 'object' && 'id' in command.task) ids.add(command.task.id);
     if ('tasks' in command && Array.isArray(command.tasks)) for (const task of command.tasks) ids.add(task.id);
@@ -261,6 +301,7 @@ export class RepositoryProjection {
     if ('message' in command && command.message && typeof command.message === 'object' && 'taskId' in command.message) ids.add(command.message.taskId);
     if ('messages' in command && Array.isArray(command.messages)) for (const message of command.messages) ids.add(message.taskId);
     if ('mutations' in command && Array.isArray(command.mutations)) for (const mutation of command.mutations) ids.add(mutation.taskId);
+    if ('callerTaskId' in command && typeof command.callerTaskId === 'string') ids.add(command.callerTaskId);
     if ('rootTaskId' in command && typeof command.rootTaskId === 'string') ids.add(command.rootTaskId);
     if (isGraphCommand(command)) {
       for (const id of command.deleteTaskIds ?? []) ids.add(id);

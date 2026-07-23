@@ -57,7 +57,7 @@ describe('MusterStdioMcpProxy against FakeMcpBridge', () => {
 
   it('initialize + tools/list succeed and expose ready debug snapshot without token', async () => {
     const bridge = createFakeMcpBridge({
-      tools: [{ name: 'report_progress', description: 'progress' }],
+      tools: [{ name: 'get_host_context', description: 'context' }],
     });
     const logs: string[] = [];
     proxy = new MusterStdioMcpProxy({
@@ -70,7 +70,7 @@ describe('MusterStdioMcpProxy against FakeMcpBridge', () => {
 
     await proxy.ensureUpstream();
     const listed = await proxy.listTools();
-    expect(listed.tools.map((t) => t.name)).toEqual(['report_progress']);
+    expect(listed.tools.map((t) => t.name)).toEqual(['get_host_context']);
 
     const snap = proxy.getDebugSnapshot();
     expect(snap.phase).toBe('ready' satisfies ProxyPhase);
@@ -82,9 +82,9 @@ describe('MusterStdioMcpProxy against FakeMcpBridge', () => {
 
   it('tools/call forwards to upstream and returns MCP content', async () => {
     const bridge = createFakeMcpBridge({
-      tools: [{ name: 'report_progress' }],
+      tools: [{ name: 'get_host_context' }],
     });
-    bridge.setToolResult('report_progress', { ok: true, pct: 50 });
+    bridge.setToolResult('get_host_context', { ok: true, trusted: true });
     proxy = new MusterStdioMcpProxy({
       bridgeUrl: 'http://127.0.0.1:0/mcp',
       token: SECRET,
@@ -93,15 +93,15 @@ describe('MusterStdioMcpProxy against FakeMcpBridge', () => {
     });
 
     await proxy.ensureUpstream();
-    const result = await proxy.callTool({ name: 'report_progress', arguments: { pct: 50 } });
+    const result = await proxy.callTool({ name: 'get_host_context', arguments: {} });
     expect(result.isError).toBeFalsy();
     const text = (result.content as Array<{ text?: string }>)[0]?.text;
-    expect(text).toContain('50');
+    expect(text).toContain('trusted');
   });
 
   it('mid-run connection flap triggers one coalesced reconnect series then retries', async () => {
     const bridge = createFakeMcpBridge({
-      tools: [{ name: 'get_task_status' }],
+      tools: [{ name: 'inspect_workflow_run' }],
     });
     let now = 1_000;
     const basePost = createBridgePostFromFake(bridge);
@@ -135,7 +135,7 @@ describe('MusterStdioMcpProxy against FakeMcpBridge', () => {
     expect(proxy.getDebugSnapshot().reconnectGeneration).toBe(0);
 
     const listed = await proxy.listTools();
-    expect(listed.tools.some((t) => t.name === 'get_task_status')).toBe(true);
+    expect(listed.tools.some((t) => t.name === 'inspect_workflow_run')).toBe(true);
 
     const snap = proxy.getDebugSnapshot();
     expect(snap.phase).toBe('ready');
@@ -252,7 +252,7 @@ describe('MusterStdioMcpProxy against loopback MusterBridgeServer', () => {
       callerTaskId: 't1',
       turnId: 'turn-1',
       attemptId: 'a0',
-      allowedActions: new Set(['report_progress', 'get_task_status']),
+      allowedActions: new Set(['get_host_context', 'inspect_workflow_run']),
       ttlMs: 60_000,
     });
 
@@ -277,7 +277,7 @@ describe('MusterStdioMcpProxy against loopback MusterBridgeServer', () => {
     await proxy.ensureUpstream();
     const first = await proxy.listTools();
     expect(first.tools.map((t) => t.name).sort()).toEqual(
-      ['get_task_status', 'report_progress'].sort(),
+      ['get_host_context', 'inspect_workflow_run'].sort(),
     );
     expect(proxy.getDebugSnapshot().phase).toBe('ready');
     await proxy.close();

@@ -13,6 +13,18 @@ export function isNearBottom(
   return scrollHeight - scrollTop - clientHeight < thresholdPx;
 }
 
+export function pinnedAfterScroll(
+  pinned: boolean,
+  previousScrollTop: number,
+  scrollTop: number,
+  scrollHeight: number,
+  clientHeight: number,
+): boolean {
+  if (scrollTop < previousScrollTop) return false;
+  if (scrollTop === previousScrollTop && !pinned) return false;
+  return isNearBottom(scrollTop, scrollHeight, clientHeight);
+}
+
 export function isNearTop(
   scrollTop: number,
   thresholdPx = CHAT_SCROLL_TOP_THRESHOLD_PX,

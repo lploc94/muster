@@ -16,7 +16,7 @@ function baseTask(overrides: Partial<MusterTask> = {}): MusterTask {
     lifecycle: 'open',
     goal: 'test',
     parentId: null,
-    dependencies: [],
+    prerequisites: [],
     backend: 'grok',
     capabilities: [],
     executionPolicy: {
@@ -82,7 +82,7 @@ describe('deriveViewStatus', () => {
 
   it('live running turn takes precedence over unsatisfied deps', () => {
     const task = baseTask({
-      dependencies: [{ taskId: 'dep-1', requiredOutcome: 'succeeded', onUnsatisfied: 'block' }],
+      prerequisites: [{ producerTaskId: 'dep-1', requiredLifecycle: 'succeeded', onUnmet: 'block' }],
     });
     const turns = [turn({ id: 't1', status: 'running', sequence: 1 })];
     expect(deriveViewStatus(task, turns, new Map())).toBe('running');
@@ -95,24 +95,24 @@ describe('deriveViewStatus', () => {
 
   it('unsatisfied deps take precedence over queued turn', () => {
     const task = baseTask({
-      dependencies: [{ taskId: 'dep-1', requiredOutcome: 'succeeded', onUnsatisfied: 'block' }],
+      prerequisites: [{ producerTaskId: 'dep-1', requiredLifecycle: 'succeeded', onUnmet: 'block' }],
     });
     const turns = [turn({ id: 't1', status: 'queued', sequence: 1 })];
     expect(deriveViewStatus(task, turns, new Map([['dep-1', 'open']]))).toBe(
-      'waiting_dependencies',
+      'waiting_prerequisites',
     );
   });
 
   it('missing dep lifecycle entry is unsatisfied', () => {
     const task = baseTask({
-      dependencies: [{ taskId: 'dep-1', requiredOutcome: 'succeeded', onUnsatisfied: 'block' }],
+      prerequisites: [{ producerTaskId: 'dep-1', requiredLifecycle: 'succeeded', onUnmet: 'block' }],
     });
-    expect(deriveViewStatus(task, [], new Map())).toBe('waiting_dependencies');
+    expect(deriveViewStatus(task, [], new Map())).toBe('waiting_prerequisites');
   });
 
   it('queued turn when deps satisfied', () => {
     const task = baseTask({
-      dependencies: [{ taskId: 'dep-1', requiredOutcome: 'succeeded', onUnsatisfied: 'block' }],
+      prerequisites: [{ producerTaskId: 'dep-1', requiredLifecycle: 'succeeded', onUnmet: 'block' }],
     });
     const turns = [turn({ id: 't1', status: 'queued', sequence: 1 })];
     expect(deriveViewStatus(task, turns, new Map([['dep-1', 'succeeded']]))).toBe('queued');

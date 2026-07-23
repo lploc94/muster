@@ -30,6 +30,7 @@ import {
 import {
   handleBackupDatabaseCommand,
   handleDeveloperResetCommand,
+  RESET_CHOICE_WITHOUT_BACKUP,
 } from '../../host/sqlite-maintenance-commands';
 import { readRedactedDbIdentity } from '../../host/uat-commands';
 import { MUSTER_APPLICATION_ID, SQLITE_SCHEMA_VERSION } from './schema';
@@ -77,7 +78,7 @@ function makeTask(id: string, goal: string): MusterTask {
     releaseState: 'draft',
     goal,
     parentId: null,
-    dependencies: [],
+    prerequisites: [],
     backend: 'grok',
     capabilities: [],
     executionPolicy: { maxTurns: 10, maxAutomaticRetries: 1 },
@@ -498,7 +499,7 @@ describe('P5-W6 privacy canary allowlist', () => {
     // Reset failure with canary-tainted Error.message; host maps via fixed code only.
     const resetErrors2: string[] = [];
     const resetFail = await handleDeveloperResetCommand({
-      showWarningMessage: async (_m, ...items) => items.find((i) => /Without Backup/i.test(i)),
+      showWarningMessage: async () => RESET_CHOICE_WITHOUT_BACKUP,
       runBackupFlow: async () => ({ kind: 'success', fileName: 'x', meta }),
       quiesceForMaintenance: async () => undefined,
       resetDatabase: async () => {

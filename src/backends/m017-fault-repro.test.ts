@@ -78,12 +78,12 @@ describe('FakeMcpBridge smoke (T01 fixture)', () => {
   it('happy path: initialize → tools/list → tools/call returns Muster catalog', async () => {
     const bridge = createFakeMcpBridge();
     const result = await bridge.runHappyPath({
-      name: 'complete_task',
-      arguments: { summary: 'ok' },
+      name: 'workflow_next',
+      arguments: { opId: 'op-smoke', change: 'updated', result: 'ok' },
     });
     expect(result.sessionId).toMatch(/^mcp-fake-/);
-    expect(result.tools.some((t) => t.name === 'complete_task')).toBe(true);
-    expect(result.tools.some((t) => t.name === 'fail_task')).toBe(true);
+    expect(result.tools.some((t) => t.name === 'workflow_next')).toBe(true);
+    expect(result.tools.some((t) => t.name === 'workflow_fail')).toBe(true);
     expect(result.call).toBeDefined();
     expect(getToolCallIsError(result.call!)).toBe(false);
   });
@@ -141,7 +141,7 @@ describe('FakeMcpBridge smoke (T01 fixture)', () => {
         jsonrpc: '2.0',
         id: 10,
         method: 'tools/call',
-        params: { name: 'complete_task', arguments: {} },
+          params: { name: 'workflow_next', arguments: {} },
       },
       { sessionId },
     );
@@ -151,7 +151,7 @@ describe('FakeMcpBridge smoke (T01 fixture)', () => {
         jsonrpc: '2.0',
         id: 11,
         method: 'tools/call',
-        params: { name: 'complete_task', arguments: {} },
+          params: { name: 'workflow_next', arguments: {} },
       },
       { sessionId },
     );
@@ -298,6 +298,7 @@ describe('M017 R2 GREEN — settle once + awaiting_parent_seal (S02)', () => {
     const gate = new Promise<void>((resolve) => {
       resume = resolve;
     });
+    let sessionSequence = 0;
 
     const engine = await TaskEngine.loadAsync({
       repository,
@@ -305,8 +306,9 @@ describe('M017 R2 GREEN — settle once + awaiting_parent_seal (S02)', () => {
       makeBackend: (name) => ({
         name,
         capabilities: MCP_CAPS,
-        async *run(_options: RunOptions): AsyncIterable<NormalizedEvent> {
-          yield { type: 'sessionStarted', sessionId: 'sess-1' };
+        async *run(options: RunOptions): AsyncIterable<NormalizedEvent> {
+          const sessionId = options.resumeId ?? `sess-${++sessionSequence}`;
+          yield { type: 'sessionStarted', sessionId };
           yield { type: 'assistantDelta', content: 'working', messageId: 'm1' };
           await gate;
           yield { type: 'turnCompleted' };
@@ -343,7 +345,7 @@ describe('M017 R2 GREEN — settle once + awaiting_parent_seal (S02)', () => {
       releaseState: 'released',
       goal: 'work',
       parentId: 'root-1',
-      dependencies: [],
+      prerequisites: [],
       backend: 'grok',
       capabilities: [],
       executionPolicy: {
@@ -376,7 +378,7 @@ describe('M017 R2 GREEN — settle once + awaiting_parent_seal (S02)', () => {
       reason: 'missing_disposition',
     });
     expect(result.next.task.lifecycle).toBe('open');
-    expect(result.next.task.sealedBy).toBeUndefined();
+    expect(result.next.task.lifecycleAuthority).toBeUndefined();
     expect(result.next.turn.status).toBe('succeeded');
   });
 
@@ -482,7 +484,7 @@ describe('M017 R2 GREEN — settle once + awaiting_parent_seal (S02)', () => {
       sourceTurnId: childTurn.id,
       reason: 'missing_disposition',
     });
-    expect(child?.sealedBy).toBeUndefined();
+    expect(child?.lifecycleAuthority).toBeUndefined();
 
     // Stop all background repository work before teardown (no further executes).
     engine.quiesceForTerminalStorage();

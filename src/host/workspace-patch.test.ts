@@ -33,7 +33,7 @@ function task(id: string, overrides: Partial<MusterTask> = {}): MusterTask {
     revision: 1,
     createdAt: '2026-07-06T00:00:00.000Z',
     updatedAt: '2026-07-06T00:00:00.000Z',
-    dependencies: [],
+    prerequisites: [],
     capabilities: [],
     executionPolicy: { maxTurns: 100, maxAutomaticRetries: 0 },
     releaseState: 'released',
@@ -225,7 +225,7 @@ describe('projectWorkspacePatches', () => {
     after.tasks['t2'] = task('t2');
     const patches = projectWorkspacePatches({
       command: {
-        kind: 'deleteTaskSubtreeIfIdle',
+        kind: 'deleteTaskSubtree',
         workspaceId: 'ws',
         rootTaskId: 't1',
       },

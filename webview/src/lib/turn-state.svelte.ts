@@ -28,10 +28,17 @@ export interface ToolItem {
   turnId?: string;
   order?: number;
 }
+export interface ReasoningItem {
+  kind: 'reasoning';
+  id: string;
+  text: string;
+  turnId: string;
+  order: number;
+}
 export interface ErrorItem {
   kind: 'error';
   id: string;
   message: string;
   isCancellation?: boolean;
 }
-export type ThreadItem = UserItem | AssistantItem | ToolItem | ErrorItem;
+export type ThreadItem = UserItem | AssistantItem | ToolItem | ReasoningItem | ErrorItem;

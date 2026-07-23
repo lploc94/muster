@@ -25,7 +25,8 @@ export class PresentationToolRouter implements ToolCallHandler {
       presentationId: command.presentationId,
       ownerTaskId: command.ownerTaskId,
       opId: command.opId,
-      revision: command.revision,
+      ...(command.revision !== undefined ? { revision: command.revision } : {}),
+      ...(command.requireExisting === true ? { requireExisting: true } : {}),
       title: command.title,
       markdown: command.markdown,
       ...(command.presentationKind !== undefined ? { kind: command.presentationKind } : {}),
@@ -46,7 +47,7 @@ export class PresentationToolRouter implements ToolCallHandler {
       return { ok: false, error: 'panel_open_failed' };
     }
     return result.ok
-      ? { ok: true, result: { code: result.code } }
+      ? { ok: true, result: { code: result.code, presentationId: command.presentationId } }
       : { ok: false, error: result.code };
   }
 }

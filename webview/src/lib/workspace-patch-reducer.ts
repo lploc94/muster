@@ -31,6 +31,15 @@ function transcriptToThreadItem(item: TranscriptItem): ThreadItem | null {
         turnId: item.turnId,
         order: item.order,
       };
+    case 'reasoning':
+      if (!item.turnId || item.order === undefined) return null;
+      return {
+        kind: 'reasoning',
+        id: item.id,
+        text: asText(item.content),
+        turnId: item.turnId,
+        order: item.order,
+      };
     case 'error': {
       const content = item.content as { message?: string; isCancellation?: boolean } | string;
       const message = typeof content === 'string' ? content : (content?.message ?? 'Error');
@@ -74,9 +83,6 @@ export interface WorkspacePatchViewState {
   focusedTaskId: string | null;
   queuedTurns: QueuedTurnProjection[];
   transcriptItems: ThreadItem[];
-  reasoningByTurn: Record<string, string>;
-  /** Stable reasoning entity id -> rendered turn ownership. */
-  reasoningTurnByItemId: Record<string, string>;
   loadedTranscriptIds: ReadonlySet<string>;
   /** IDs removed by the most recently applied batch (for live-stream teardown). */
   removedTranscriptIds: ReadonlySet<string>;
@@ -110,8 +116,6 @@ export function emptyWorkspacePatchViewState(): WorkspacePatchViewState {
     focusedTaskId: null,
     queuedTurns: [],
     transcriptItems: [],
-    reasoningByTurn: {},
-    reasoningTurnByItemId: {},
     loadedTranscriptIds: new Set(),
     removedTranscriptIds: new Set(),
   };
@@ -137,19 +141,10 @@ export function applySnapshotToPatchView(
   }
 
   const transcriptItems: ThreadItem[] = [];
-  const reasoningByTurn: Record<string, string> = {};
-  const reasoningTurnByItemId: Record<string, string> = {};
   const loaded = new Set<string>();
   if (snapshot.transcript) {
     for (const item of snapshot.transcript) {
       loaded.add(item.id);
-      if (item.kind === 'reasoning') {
-        if (item.turnId) {
-          reasoningByTurn[item.turnId] = asText(item.content);
-          reasoningTurnByItemId[item.id] = item.turnId;
-        }
-        continue;
-      }
       const mapped = transcriptToThreadItem(item);
       if (mapped) transcriptItems.push(mapped);
     }
@@ -163,8 +158,6 @@ export function applySnapshotToPatchView(
     focusedTaskId: snapshot.focusedTaskId ?? null,
     queuedTurns: snapshot.focusedTaskId ? [...(snapshot.queuedTurns ?? [])] : [],
     transcriptItems,
-    reasoningByTurn,
-    reasoningTurnByItemId,
     loadedTranscriptIds: loaded,
     removedTranscriptIds: new Set(),
     transcriptWorkspaceRevision: snapshot.transcriptPage?.workspaceRevision,
@@ -203,8 +196,6 @@ export function syncTranscriptPageIntoPatchView(
   input: {
     focusedTaskId: string | null;
     transcriptItems: readonly ThreadItem[];
-    reasoningByTurn: Readonly<Record<string, string>>;
-    reasoningTurnByItemId: Readonly<Record<string, string>>;
     loadedTranscriptIds: ReadonlySet<string>;
     transcriptWorkspaceRevision?: number;
   },
@@ -221,8 +212,6 @@ export function syncTranscriptPageIntoPatchView(
   return {
     ...state,
     transcriptItems: input.transcriptItems.slice(),
-    reasoningByTurn: { ...input.reasoningByTurn },
-    reasoningTurnByItemId: { ...input.reasoningTurnByItemId },
     loadedTranscriptIds: new Set(input.loadedTranscriptIds),
     transcriptWorkspaceRevision: revision,
   };
@@ -235,8 +224,6 @@ function removeTaskFromView(
     focusedTaskId: string | null;
     queuedTurns: QueuedTurnProjection[];
     transcriptItems: ThreadItem[];
-    reasoningByTurn: Record<string, string>;
-    reasoningTurnByItemId: Record<string, string>;
     loadedTranscriptIds: Set<string>;
   },
   taskId: string,
@@ -247,8 +234,6 @@ function removeTaskFromView(
     draft.focusedTaskId = null;
     draft.queuedTurns = [];
     draft.transcriptItems = [];
-    draft.reasoningByTurn = {};
-    draft.reasoningTurnByItemId = {};
     draft.loadedTranscriptIds = new Set();
   }
 }
@@ -257,8 +242,6 @@ function appendTranscriptItems(
   draft: {
     focusedTaskId: string | null;
     transcriptItems: ThreadItem[];
-    reasoningByTurn: Record<string, string>;
-    reasoningTurnByItemId: Record<string, string>;
     loadedTranscriptIds: Set<string>;
   },
   taskId: string,
@@ -277,13 +260,6 @@ function appendTranscriptItems(
       return 'invariant';
     }
     draft.loadedTranscriptIds.add(item.id);
-    if (item.kind === 'reasoning') {
-      if (item.turnId) {
-        draft.reasoningByTurn[item.turnId] = asText(item.content);
-        draft.reasoningTurnByItemId[item.id] = item.turnId;
-      }
-      continue;
-    }
     const mapped = transcriptToThreadItem(item);
     if (mapped) draft.transcriptItems.push(mapped);
   }
@@ -294,23 +270,12 @@ function patchTranscriptItem(
   draft: {
     focusedTaskId: string | null;
     transcriptItems: ThreadItem[];
-    reasoningByTurn: Record<string, string>;
-    reasoningTurnByItemId: Record<string, string>;
     loadedTranscriptIds: Set<string>;
   },
   taskId: string,
   item: TranscriptItem,
 ): 'ok' | 'invariant' {
   if (draft.focusedTaskId !== taskId) return 'ok';
-
-  if (item.kind === 'reasoning') {
-    if (!item.turnId) return 'invariant';
-    if (!draft.loadedTranscriptIds.has(item.id)) return 'invariant';
-    // Reasoning owns the stable entity id (= turnId typically).
-    draft.reasoningByTurn[item.turnId] = asText(item.content);
-    draft.reasoningTurnByItemId[item.id] = item.turnId;
-    return 'ok';
-  }
 
   if (!draft.loadedTranscriptIds.has(item.id)) {
     // Unknown item patch must not invent ordering — force recovery.
@@ -334,8 +299,6 @@ function removeTranscriptItems(
   draft: {
     focusedTaskId: string | null;
     transcriptItems: ThreadItem[];
-    reasoningByTurn: Record<string, string>;
-    reasoningTurnByItemId: Record<string, string>;
     loadedTranscriptIds: Set<string>;
   },
   taskId: string,
@@ -346,15 +309,6 @@ function removeTranscriptItems(
   draft.transcriptItems = draft.transcriptItems.filter((item) => !removed.has(item.id));
   for (const itemId of itemIds) {
     draft.loadedTranscriptIds.delete(itemId);
-    const turnId = draft.reasoningTurnByItemId[itemId];
-    if (turnId) {
-      delete draft.reasoningTurnByItemId[itemId];
-      // One canonical reasoning row is rendered per turn. Only clear the turn
-      // when the removed stable entity still owns it.
-      if (!Object.values(draft.reasoningTurnByItemId).includes(turnId)) {
-        delete draft.reasoningByTurn[turnId];
-      }
-    }
   }
   return 'ok';
 }
@@ -449,8 +403,6 @@ function applyOnePatch(
     focusedTaskId: string | null;
     queuedTurns: QueuedTurnProjection[];
     transcriptItems: ThreadItem[];
-    reasoningByTurn: Record<string, string>;
-    reasoningTurnByItemId: Record<string, string>;
     loadedTranscriptIds: Set<string>;
   },
   patch: WorkspacePatch,
@@ -545,8 +497,6 @@ export function applyWorkspacePatchBatch(
     focusedTaskId: state.focusedTaskId,
     queuedTurns: [...state.queuedTurns],
     transcriptItems: state.transcriptItems.slice(),
-    reasoningByTurn: { ...state.reasoningByTurn },
-    reasoningTurnByItemId: { ...state.reasoningTurnByItemId },
     loadedTranscriptIds: cloneIds(state.loadedTranscriptIds),
   };
 
@@ -590,8 +540,6 @@ export function applyWorkspacePatchBatch(
       focusedTaskId: draft.focusedTaskId,
       queuedTurns: draft.queuedTurns,
       transcriptItems: draft.transcriptItems,
-      reasoningByTurn: draft.reasoningByTurn,
-      reasoningTurnByItemId: draft.reasoningTurnByItemId,
       loadedTranscriptIds: draft.loadedTranscriptIds,
       removedTranscriptIds,
       transcriptWorkspaceRevision,

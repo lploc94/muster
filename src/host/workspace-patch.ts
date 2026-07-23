@@ -85,6 +85,7 @@ function reasoningToTranscriptItem(segment: PersistedReasoning): TranscriptItem 
     id: segment.id,
     kind: 'reasoning',
     turnId: segment.turnId,
+    order: segment.order,
     content: segment.content,
   };
 }
@@ -152,7 +153,7 @@ function collectAffectedTaskIds(
   if (
     command.kind === 'clearHistory' ||
     command.kind === 'deleteTask' ||
-    command.kind === 'deleteTaskSubtreeIfIdle' ||
+    command.kind === 'deleteTaskSubtree' ||
     ('deleteTaskIds' in command && Array.isArray(command.deleteTaskIds) && command.deleteTaskIds.length > 0)
   ) {
     for (const id of Object.keys(before.tasks)) {
@@ -180,7 +181,7 @@ function isMetadataMembershipCommand(kind: RepositoryCommand['kind']): boolean {
     kind === 'requestRuntimeHandoff' ||
     kind === 'clearHistory' ||
     kind === 'deleteTask' ||
-    kind === 'deleteTaskSubtreeIfIdle' ||
+    kind === 'deleteTaskSubtree' ||
     kind === 'createChildTask' ||
     kind === 'delegateChildTask' ||
     kind === 'createChildTaskBatch' ||
@@ -189,8 +190,8 @@ function isMetadataMembershipCommand(kind: RepositoryCommand['kind']): boolean {
     kind === 'setChildTaskLifecycle' ||
     kind === 'completeGraphTask' ||
     kind === 'failGraphTask' ||
-    kind === 'applyDependencyTerminal' ||
-    kind === 'applyDependencyTerminals' ||
+    kind === 'applyPrerequisiteTerminal' ||
+    kind === 'applyPrerequisiteTerminals' ||
     kind === 'applyVerdictRemediation'
   );
 }

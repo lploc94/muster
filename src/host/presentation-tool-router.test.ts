@@ -8,6 +8,7 @@ const context: CredentialContext = {
   rootId: 'root-1',
   callerTaskId: 'task-1',
   turnId: 'turn-1',
+  attemptId: 'attempt-1',
   allowedActions: new Set(['upsert_presentation']),
   expiry: Date.now() + 60_000,
 };
@@ -18,6 +19,7 @@ const command: ToolCommand = {
   ownerTaskId: 'task-1',
   opId: 'op-1',
   revision: 1,
+  requireExisting: true,
   title: 'Release notes',
   markdown: '# Ready',
 };
@@ -30,7 +32,10 @@ describe('PresentationToolRouter', () => {
 
     const result = await router.handleToolCall(context, 'upsert_presentation', command);
 
-    expect(result).toEqual({ ok: true, result: { code: 'opened' } });
+    expect(result).toEqual({
+      ok: true,
+      result: { code: 'opened', presentationId: 'release-notes' },
+    });
     expect(manager.upsert).toHaveBeenCalledWith(
       { rootId: 'root-1', callerTaskId: 'task-1', turnId: 'turn-1' },
       {
@@ -38,6 +43,7 @@ describe('PresentationToolRouter', () => {
         ownerTaskId: 'task-1',
         opId: 'op-1',
         revision: 1,
+        requireExisting: true,
         title: 'Release notes',
         markdown: '# Ready',
       },
@@ -62,16 +68,20 @@ describe('PresentationToolRouter', () => {
   });
 
   it('delegates non-presentation commands without changing their result', async () => {
-    const delegatedResult = { ok: true as const, result: { root: 'task-1', tasks: [] } };
+    const delegatedResult = { ok: true as const, result: { runId: 'run-1', runStatus: 'running' } };
     const delegate = { handleToolCall: vi.fn().mockResolvedValue(delegatedResult) };
     const manager = { upsert: vi.fn() };
     const router = new PresentationToolRouter(delegate, manager);
-    const statusCommand: ToolCommand = { kind: 'get_task_status' };
+    const inspectionCommand: ToolCommand = { kind: 'inspect_workflow_run', runId: 'run-1' };
 
-    const result = await router.handleToolCall(context, 'get_task_status', statusCommand);
+    const result = await router.handleToolCall(context, 'inspect_workflow_run', inspectionCommand);
 
     expect(result).toBe(delegatedResult);
-    expect(delegate.handleToolCall).toHaveBeenCalledWith(context, 'get_task_status', statusCommand);
+    expect(delegate.handleToolCall).toHaveBeenCalledWith(
+      context,
+      'inspect_workflow_run',
+      inspectionCommand,
+    );
     expect(manager.upsert).not.toHaveBeenCalled();
   });
 

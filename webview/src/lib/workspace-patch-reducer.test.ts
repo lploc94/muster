@@ -48,6 +48,7 @@ const reasoningItem = (turnId: string, text: string): TranscriptItem => ({
   id: turnId,
   kind: 'reasoning',
   turnId,
+  order: 3,
   content: text,
 });
 
@@ -303,8 +304,7 @@ describe('workspace-patch-reducer', () => {
       ]),
     );
     state = append.state;
-    expect(state.transcriptItems.map((i) => i.id)).toEqual(['u1', 'a1', 'turn-1:tc-1']);
-    expect(state.reasoningByTurn['turn-1']).toBe('think');
+    expect(state.transcriptItems.map((i) => i.id)).toEqual(['u1', 'a1', 'turn-1:tc-1', 'turn-1']);
     expect(state.loadedTranscriptIds.has('turn-1')).toBe(true);
 
     const dup = applyWorkspacePatchBatch(
@@ -361,7 +361,10 @@ describe('workspace-patch-reducer', () => {
     expect(patched.state.transcriptItems.find((i) => i.id === 'turn-1:tc-1')).toMatchObject({
       status: 'success',
     });
-    expect(patched.state.reasoningByTurn['turn-1']).toBe('think harder');
+    expect(patched.state.transcriptItems.find((i) => i.id === 'turn-1')).toMatchObject({
+      kind: 'reasoning',
+      text: 'think harder',
+    });
   });
 
   it('unknown reasoning patch is an atomic invariant failure', () => {
@@ -380,7 +383,7 @@ describe('workspace-patch-reducer', () => {
     expect(result.kind).toBe('invariant');
     expect(result.state.revision).toBe(1);
     expect(result.state.tasks.get('task-1')?.goal).toBe('Goal task-1');
-    expect(result.state.reasoningByTurn).toEqual({});
+    expect(result.state.transcriptItems).toEqual([]);
   });
 
   it('removes loaded list and reasoning entities by stable id without recovery', () => {
@@ -390,8 +393,8 @@ describe('workspace-patch-reducer', () => {
         transcript: [
           userItem('u1'),
           assistantItem('a1'),
-          { id: 'reasoning-1', kind: 'reasoning', turnId: 'turn-1', content: 'think' },
-          { id: 'reasoning-2', kind: 'reasoning', turnId: 'turn-2', content: 'keep' },
+          { id: 'reasoning-1', kind: 'reasoning', turnId: 'turn-1', order: 2, content: 'think' },
+          { id: 'reasoning-2', kind: 'reasoning', turnId: 'turn-2', order: 2, content: 'keep' },
         ],
       }),
     );
@@ -405,11 +408,9 @@ describe('workspace-patch-reducer', () => {
     );
     expect(result.kind).toBe('applied');
     expect(result.state.needsRecovery).toBe(false);
-    expect(result.state.transcriptItems.map((item) => item.id)).toEqual(['a1']);
+    expect(result.state.transcriptItems.map((item) => item.id)).toEqual(['a1', 'reasoning-2']);
     expect(result.state.loadedTranscriptIds.has('u1')).toBe(false);
     expect(result.state.loadedTranscriptIds.has('reasoning-1')).toBe(false);
-    expect(result.state.reasoningByTurn).toEqual({ 'turn-2': 'keep' });
-    expect(result.state.reasoningTurnByItemId).toEqual({ 'reasoning-2': 'turn-2' });
     expect([...result.state.removedTranscriptIds]).toEqual(['u1', 'reasoning-1', 'not-loaded']);
     const next = applyWorkspacePatchBatch(result.state, batch(3, []));
     expect(next.state.removedTranscriptIds.size).toBe(0);
@@ -511,8 +512,6 @@ describe('workspace-patch-reducer', () => {
         { kind: 'user', id: 'u-old', text: 'older', turnId: 't0', order: 0 },
         { kind: 'user', id: 'u-live', text: 'hi', turnId: 'turn-1', order: 0 },
       ],
-      reasoningByTurn: {},
-      reasoningTurnByItemId: {},
       loadedTranscriptIds: new Set(['u-old', 'u-live']),
       transcriptWorkspaceRevision: 2,
     });

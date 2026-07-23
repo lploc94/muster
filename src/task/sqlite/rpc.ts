@@ -9,6 +9,8 @@
  * callback is serialized over the RPC boundary.
  */
 
+import type { RepositoryCommandResult, WorkflowTransactionalCommand } from '../repository';
+
 /** Bound parameter value. No content/path is ever interpolated into SQL (plan §3.4). */
 export type SqlValue = string | number | bigint | null | Uint8Array;
 
@@ -77,6 +79,14 @@ export type DbRequest =
        * transaction. Used when an operation claim precedes a revision fence. */
       abortIfUnchangedAt?: number[];
     }
+  | {
+      /** Execute all workflow settlement planning reads and writes under one
+       * worker-owned IMMEDIATE transaction. */
+      kind: 'workflowMutation';
+      requestId: number;
+      command: WorkflowTransactionalCommand;
+      changeFeedRetainRevisions: number;
+    }
   | { kind: 'pragma'; requestId: number; pragma: string }
   | {
       /**
@@ -132,6 +142,7 @@ export type DbResponse =
   | { kind: 'run'; requestId: number; result: RunResult }
   /** Results are in the same order as the submitted transaction statements. */
   | { kind: 'transaction'; requestId: number; results: RunResult[] }
+  | { kind: 'workflowMutation'; requestId: number; result: RepositoryCommandResult }
   | { kind: 'scalar'; requestId: number; value: number }
   | { kind: 'backup'; requestId: number; result: BackupResultMeta }
   | { kind: 'reset'; requestId: number; result: ResetResultMeta }

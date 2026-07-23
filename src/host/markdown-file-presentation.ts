@@ -120,9 +120,8 @@ export function resolveWorkspaceMarkdownPath(
   return undefined;
 }
 
-export function clampPresentationMarkdown(text: string): string {
-  if (text.length <= PRESENTATION_MARKDOWN_MAX_LENGTH) return text;
-  return text.slice(0, PRESENTATION_MARKDOWN_MAX_LENGTH);
+export function isPresentationMarkdownSizeAllowed(text: string): boolean {
+  return text.length <= PRESENTATION_MARKDOWN_MAX_LENGTH;
 }
 
 /** Split href into path + fragment (without #). */

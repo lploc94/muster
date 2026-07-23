@@ -517,9 +517,9 @@ sau khi Wave 10 qua toàn bộ gate.
 ##### Wave 2 — Extension/provider boundary
 
 - Thay bốn direct commits của host bằng named commands:
-  `clearHistory`, `deleteTaskSubtreeIfIdle`, `renameTask`, `applyRetentionPolicy`.
-- Các lệnh clear/delete phải kiểm tra toàn subtree và live-turn safety trong cùng
-  transaction, không quyết định trên snapshot cũ rồi mới delete.
+  `clearHistory`, `deleteTaskSubtree`, `renameTask`, `applyRetentionPolicy`.
+- Lệnh clear phải kiểm tra toàn subtree và live-turn safety trong cùng transaction;
+  delete xóa subtree được chọn vô điều kiện trong một transaction.
 - Dựng snapshot bằng repository queries; `postSnapshot()` không được materialize toàn workspace.
 - Export chỉ đọc qua repository queries; không có full-workspace envelope fallback.
 - Chạy host/snapshot/export contract tests trên SQLite.
