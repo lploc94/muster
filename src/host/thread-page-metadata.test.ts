@@ -53,12 +53,13 @@ describe('TaskThread page metadata source contract (P4-W4/W5)', () => {
     expect(threadSource).toContain('this.loadedTranscriptIds.add(ev.messageId)');
   });
 
-  it('owns activeTurnId on reasoningDelta (not backend messageId)', () => {
+  it('does not invent reasoning identity or order from a raw delta', () => {
     const reasoningCase = threadSource.match(
       /case 'reasoningDelta':\s*\{?([\s\S]*?)break;/,
     )?.[1];
     expect(reasoningCase, 'reasoningDelta case must exist').toBeTruthy();
-    expect(reasoningCase).toContain('this.loadedTranscriptIds.add(this.activeTurnId)');
+    expect(reasoningCase).toContain('Durable transcript patches carry the canonical segment id and order');
+    expect(reasoningCase).not.toContain('this.loadedTranscriptIds.add');
     expect(reasoningCase).not.toContain('ev.messageId');
   });
 });
@@ -105,10 +106,10 @@ const protocolSource = fs.readFileSync(
   'utf8',
 );
 
-describe('protocol v7 host+webview version contract', () => {
-  it('keeps exact version 7 in both host and webview constants', () => {
-    expect(protocolSource).toMatch(/export const PROTOCOL_VERSION = 9;/);
-    expect(extensionSource).toMatch(/const PROTOCOL_VERSION = 9;/);
+describe('host+webview protocol version contract', () => {
+  it('keeps exact version 10 in both host and webview constants', () => {
+    expect(protocolSource).toMatch(/export const PROTOCOL_VERSION = 10;/);
+    expect(extensionSource).toMatch(/const PROTOCOL_VERSION = 10;/);
   });
 
   it('maps missing repository via getTask throw to unavailable', () => {

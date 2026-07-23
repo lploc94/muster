@@ -10,11 +10,11 @@ The public MCP catalog is exactly:
 
 | Tool | Purpose |
 |------|---------|
-| `list_task_types` | Refresh available workflow-node profiles and diagnostics |
-| `inspect_workflow_run` | Inspect bounded durable state for an owned workflow run |
-| `get_host_context` | Refresh trusted host, self, profile, and routing context |
-| `define_workflow` | Persist an immutable validated workflow definition version |
-| `start_workflow` | Idempotently start and await a frozen top-level workflow run |
+| `list_task_types` | Refresh semantic workflow-node profiles and diagnostics |
+| `inspect_workflow_run` | Inspect semantic durable state for an owned workflow run |
+| `get_host_context` | Refresh trusted host, self, profile, and role context |
+| `define_workflow` | Save an engine-versioned workflow from semantic nodes and inputs |
+| `start_workflow` | Idempotently start a workflow, suspend the caller, and resume it with the terminal result |
 | `workflow_next` | Publish the current node result to its forward route |
 | `workflow_prev` | Request correction from one or all direct producers |
 | `workflow_fail` | Fail-fast close the current workflow run |
@@ -26,6 +26,66 @@ state semantics. A live activation settles through one mutually exclusive route:
 explicit `workflow_next`, contextual `workflow_prev`, `workflow_fail`, the
 specialized child-workflow `NEXT` route, or an implicit host-generated `NEXT` from
 the final assistant message when the model ends without a disposition.
+
+The public boundary is semantic. Models provide workflow keys, definition-local node
+keys, configured `taskType` values, dependency aliases, named inputs, values,
+disposition intent, and presentation content. The bridge derives operation slots,
+immutable versions, topology kinds, entry nodes, routing snapshots, capabilities,
+numeric policy, artifact pins, ownership, and revisions.
+
+`define_workflow` accepts:
+
+```json
+{
+  "workflowKey": "review-flow",
+  "name": "Review flow",
+  "nodes": [
+    { "nodeKey": "research", "taskType": "research" },
+    { "nodeKey": "review", "taskType": "review" }
+  ],
+  "edges": [
+    { "from": "research", "to": "review", "as": "research" }
+  ],
+  "inputs": [
+    { "to": "research", "name": "request" }
+  ]
+}
+```
+
+Workflow graphs are converging DAGs. Independent source nodes may run in parallel and
+fan in to a downstream node, but a node cannot fan out to multiple consumers. Cycles
+are rejected, every non-terminal node has exactly one outgoing edge, and all branches
+must converge to exactly one terminal node. Declare workflow `inputs` only on source
+nodes with no incoming edges. For parallel work, use `A -> C` and `B -> C` with the
+shared caller input declared separately on `A` and `B`; do not add an intake node that
+routes to both.
+
+The engine returns an immutable `workflowRef` such as `review-flow@3`. Identical
+normalized content reuses the current revision; changed content allocates the next
+revision. `start_workflow` accepts either that reference or the semantic key. A key
+resolves to the latest authorized immutable revision and freezes that resolution in
+the start claim:
+
+Choose a unique `workflowKey` for each new logical workflow. Reuse a key only for an
+identical replay or an intentional revision owned by the same root task. Idempotent
+retries for one key in the same turn must repeat identical `name`, `nodes`, `edges`,
+and `inputs`; a different workflow should use a new key. Fingerprint conflicts return
+an actionable public hint instead of exposing an unexplained storage conflict.
+
+```json
+{
+  "workflow": "review-flow",
+  "goal": "Review the subsystem",
+  "inputs": [
+    { "node": "research", "input": "request", "value": "Inspect routing" }
+  ],
+  "instanceKey": "primary"
+}
+```
+
+`instanceKey` is optional. Without it the default start slot is scoped to the
+authenticated turn. An explicit key distinguishes intentional repeated starts across
+turns without exposing the durable idempotency key.
 
 ## 2. Removed protocol
 
@@ -56,20 +116,37 @@ actions. `tools/list` intersects that grant with the exact public catalog:
 The engine revalidates durable activation state during execution. Credential claims
 alone cannot authorize a contextual workflow disposition.
 
-`inspect_workflow_run` accepts a `runId` returned by `start_workflow` or another
+`inspect_workflow_run` accepts a `runRef` returned by `start_workflow` or another
 authorized workflow route. The repository requires that run to belong to the
-credential's root task. Its bounded result contains run policy/status, node and gate
-state, recoverable activations, active feedback rounds, continuations, integrity
-diagnostics, and committed terminal artifact references. It never returns a generic
-task tree, topology, prompts, artifact bodies, paths, or secrets and must not be used
-as a polling loop.
+credential's root task. Its bounded result contains workflow status, semantic node
+state, recoverable activation state, feedback progress, child state, and integrity
+diagnostic codes. It never returns policy budgets, gate/activation/round/continuation
+IDs, artifact coordinates, a generic task tree, topology, prompts, artifact bodies,
+paths, or secrets and must not be used as a polling loop.
 
-`start_workflow` remains pending while its run is active. It returns only after the
-run succeeds, fails, or is cancelled, with terminal status/reason and the committed
-terminal `workflow_next` body when one exists. Repository commit notifications wake
-the pending call; coordinators must not poll `inspect_workflow_run` for completion.
-The same terminal transaction seals tasks owned by the run to the matching lifecycle
+`start_workflow` returns a successful `accepted` result only after the run and a
+top-level `start_wait` continuation are durable. After that successful tool result is
+delivered, the host settles the current caller turn without asking the model to wait.
+The transcript shows `Workflow dispatched. Waiting for results...` for this technical
+suspension and suppresses backend cancellation text such as `Conversation interrupted`.
+When the run succeeds, fails, or is cancelled, the repository atomically resolves the
+continuation and queues one deterministic engine turn on the caller with terminal
+status/reason and the committed terminal `workflow_next` body when one exists. Reload
+drains the same resolver, so a terminal result cannot be lost or resumed twice.
+Coordinators must not poll `inspect_workflow_run` for normal completion. Invalid or
+unauthorized starts return ordinary tool errors and do not suspend the caller. A live
+workflow activation must use `invoke_child_workflow` rather than `start_workflow`.
+The terminal transaction seals tasks owned by the run to the matching lifecycle
 (`succeeded`, `failed`, or `cancelled`); the coordinator/caller task remains open.
+
+`invoke_child_workflow` accepts a workflow key/reference and semantic bindings from
+the current activation's named inputs. The repository resolves each source to an
+authorized immutable artifact revision before staging the child route. Artifact IDs
+and revisions are never model inputs.
+
+`upsert_presentation` accepts `documentKey`, `title`, `markdown`, and optional display
+metadata. The host derives the root-scoped presentation ID and owner from credentials,
+allocates revisions, and treats identical content as an idempotent replay.
 
 ## 4. Human input
 
@@ -123,10 +200,12 @@ planes.
 - Scope tokens to root, caller task, turn, attempt, and allowed public actions.
 - Revoke tokens on turn completion, cancellation, timeout, restart, and shutdown.
 - Validate every tool input with a closed JSON schema and domain validation.
-- Derive engine-owned run, activation, gate, round, artifact, and continuation IDs.
-  Agents may pass a returned `runId` only to the read-only inspection tool; mutation
-  tools never accept engine-owned routing identities.
-- Keep presentation ownership and revision checks host-enforced.
+- Derive engine-owned operation, run, activation, gate, round, artifact, continuation,
+  presentation, ownership, and revision identities. Agents may pass a returned
+  `runRef` only to the read-only inspection tool and a returned `workflowRef` to
+  workflow start/child calls; mutation tools never accept routing coordinates.
+- Keep resolved workflow policy and task-type routing frozen in each immutable
+  definition so extension upgrades cannot reinterpret an existing revision.
 
 ## 8. Related documents
 

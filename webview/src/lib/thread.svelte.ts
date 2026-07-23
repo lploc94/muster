@@ -12,7 +12,6 @@ import {
   applyTranscriptPageResult,
   beginLoadOlder,
   ownershipFromTranscript,
-  reasoningOwnershipFromTranscript,
   type TranscriptPageWindowState,
 } from './transcript-page-reducer';
 import type { WorkspacePatchViewState } from './workspace-patch-reducer';
@@ -35,6 +34,15 @@ function transcriptToThreadItem(item: TranscriptItem): ThreadItem | null {
     case 'assistant':
       return {
         kind: 'assistant',
+        id: item.id,
+        text: asText(item.content),
+        turnId: item.turnId,
+        order: item.order,
+      };
+    case 'reasoning':
+      if (!item.turnId || item.order === undefined) return null;
+      return {
+        kind: 'reasoning',
         id: item.id,
         text: asText(item.content),
         turnId: item.turnId,
@@ -69,7 +77,6 @@ function transcriptToThreadItem(item: TranscriptItem): ThreadItem | null {
         order: item.order,
       };
     }
-    // reasoning items are collected separately (turn-scoped header), not as list items
     default:
       return null;
   }
@@ -79,8 +86,7 @@ function transcriptToThreadItem(item: TranscriptItem): ThreadItem | null {
 export class TaskThread {
   items = $state<ThreadItem[]>([]);
   streaming = $state<{ messageId: string; text: string } | null>(null);
-  /** Reasoning is turn-scoped: turnId -> accumulated reasoning text (rendered in header). */
-  reasoningByTurn = $state<Record<string, string>>({});
+  contextUsage = $state<{ used?: number; size?: number; compacted: boolean } | null>(null);
   running = $state(false);
   activeTurnId = $state<string | null>(null);
   readOnly = $state(false);
@@ -100,10 +106,8 @@ export class TaskThread {
   beforeCursor = $state<string | undefined>(undefined);
   hasMoreBefore = $state(false);
   transcriptWorkspaceRevision = $state<number | undefined>(undefined);
-  /** Ownership of transcript entity IDs (list + reasoning) for idempotent prepend. */
+  /** Ownership of transcript entity IDs for idempotent prepend. */
   private loadedTranscriptIds = new Set<string>();
-  /** Stable reasoning entity id -> turn id, needed for precise remove patches. */
-  private reasoningTurnByItemId: Record<string, string> = {};
   olderPageLoading = $state(false);
   pendingRequestId = $state<string | undefined>(undefined);
   pendingTaskId = $state<string | undefined>(undefined);
@@ -114,8 +118,6 @@ export class TaskThread {
   private pageWindowState(): TranscriptPageWindowState {
     return {
       items: this.items,
-      reasoningByTurn: this.reasoningByTurn,
-      reasoningTurnByItemId: this.reasoningTurnByItemId,
       loadedTranscriptIds: this.loadedTranscriptIds,
       beforeCursor: this.beforeCursor,
       hasMoreBefore: this.hasMoreBefore,
@@ -131,8 +133,6 @@ export class TaskThread {
 
   private applyPageWindowState(state: TranscriptPageWindowState): void {
     this.items = state.items;
-    this.reasoningByTurn = state.reasoningByTurn;
-    this.reasoningTurnByItemId = { ...state.reasoningTurnByItemId };
     this.loadedTranscriptIds = new Set(state.loadedTranscriptIds);
     this.beforeCursor = state.beforeCursor;
     this.hasMoreBefore = state.hasMoreBefore;
@@ -167,12 +167,7 @@ export class TaskThread {
       );
 
     const next: ThreadItem[] = [];
-    const reasoning: Record<string, string> = {};
     for (const item of transcript) {
-      if (item.kind === 'reasoning') {
-        if (item.turnId) reasoning[item.turnId] = asText(item.content);
-        continue;
-      }
       if (keepStreaming && item.kind === 'assistant' && item.id === this.streaming!.messageId) {
         continue; // superseded by the live streaming buffer
       }
@@ -181,9 +176,7 @@ export class TaskThread {
     }
 
     this.items = next;
-    this.reasoningByTurn = reasoning;
     this.loadedTranscriptIds = ownershipFromTranscript(transcript);
-    this.reasoningTurnByItemId = reasoningOwnershipFromTranscript(transcript);
     if (!keepStreaming) this.streaming = null;
     this.activeTurnId = activeTurnId ?? null;
     // Replace transcript-page metadata on every hydrate/focus (protocol v6+).
@@ -211,7 +204,7 @@ export class TaskThread {
   reset(): void {
     this.items = [];
     this.streaming = null;
-    this.reasoningByTurn = {};
+    this.contextUsage = null;
     this.running = false;
     this.activeTurnId = null;
     this.readOnly = false;
@@ -220,7 +213,6 @@ export class TaskThread {
     this.hasMoreBefore = false;
     this.transcriptWorkspaceRevision = undefined;
     this.loadedTranscriptIds = new Set();
-    this.reasoningTurnByItemId = {};
     this.olderPageLoading = false;
     this.pendingRequestId = undefined;
     this.pendingTaskId = undefined;
@@ -267,13 +259,6 @@ export class TaskThread {
 
   appendTranscript(item: TranscriptItem): void {
     this.loadedTranscriptIds.add(item.id);
-    if (item.kind === 'reasoning') {
-      if (item.turnId) {
-        this.reasoningByTurn[item.turnId] = asText(item.content);
-        this.reasoningTurnByItemId[item.id] = item.turnId;
-      }
-      return;
-    }
     // Idempotent: turnStart + snapshot hydrate may both project the same user message.
     if (this.items.some((existing) => existing.id === item.id)) {
       return;
@@ -296,8 +281,6 @@ export class TaskThread {
       items = items.filter((item) => item.id !== streamingId);
     }
     this.items = items;
-    this.reasoningByTurn = { ...state.reasoningByTurn };
-    this.reasoningTurnByItemId = { ...state.reasoningTurnByItemId };
     const owned = new Set(state.loadedTranscriptIds);
     for (const item of this.items) owned.add(item.id);
     if (keepStreaming && streamingId) owned.add(streamingId);
@@ -314,10 +297,6 @@ export class TaskThread {
 
   getLoadedTranscriptIds(): ReadonlySet<string> {
     return this.loadedTranscriptIds;
-  }
-
-  getReasoningTurnByItemId(): Readonly<Record<string, string>> {
-    return this.reasoningTurnByItemId;
   }
 
   startTurn(turnId: string): void {
@@ -413,14 +392,7 @@ export class TaskThread {
       }
 
       case 'reasoningDelta':
-        if (this.activeTurnId) {
-          // SQLite reasoning entity id is the turn id (activeTurnId), not the
-          // backend messageId. Own it so older pages cannot overwrite live text.
-          this.loadedTranscriptIds.add(this.activeTurnId);
-          this.reasoningTurnByItemId[this.activeTurnId] = this.activeTurnId;
-          this.reasoningByTurn[this.activeTurnId] =
-            (this.reasoningByTurn[this.activeTurnId] ?? '') + ev.content;
-        }
+        // Durable transcript patches carry the canonical segment id and order.
         break;
 
       case 'toolStarted': {
@@ -502,7 +474,20 @@ export class TaskThread {
         break;
 
       case 'sessionStarted':
-      case 'usage':
+        break;
+      case 'usage': {
+        const used = typeof ev.usage.used === 'number' && Number.isFinite(ev.usage.used)
+          ? ev.usage.used
+          : this.contextUsage?.used;
+        const size = typeof ev.usage.size === 'number' && Number.isFinite(ev.usage.size) && ev.usage.size > 0
+          ? ev.usage.size
+          : this.contextUsage?.size;
+        const compacted = ev.usage.compacted === true || this.contextUsage?.compacted === true;
+        if (used !== undefined || size !== undefined || compacted) {
+          this.contextUsage = { used, size, compacted };
+        }
+        break;
+      }
       case 'raw':
         break;
     }

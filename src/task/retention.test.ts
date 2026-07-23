@@ -10,7 +10,7 @@ function sampleTask(id: string, lifecycle: MusterTask['lifecycle'] = 'open'): Mu
     lifecycle,
     goal: 'test',
     parentId: null,
-    dependencies: [],
+    prerequisites: [],
     backend: 'fake',
     capabilities: [],
     executionPolicy: {

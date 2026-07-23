@@ -16,6 +16,7 @@ import {
   type SqliteOperationClass,
 } from './errors';
 import type { BackupResultMeta, DbResponse, ResetResultMeta, RunResult } from './rpc';
+import { SQLITE_WORKFLOW_ENVELOPE_MAX_BYTES } from '../content-limits';
 import type { RepositoryCommandResult } from '../repository';
 
 export function makeProtocolError(
@@ -124,7 +125,9 @@ function parseWorkflowMutationResult(value: unknown): RepositoryCommandResult | 
     'operation',
     'conflict',
     'messageId',
+    'turnId',
     'deletedMessageIds',
+    'affectedTaskIds',
     'presentationStatus',
   ]);
   if (!Object.keys(obj).every((key) => allowed.has(key)) || typeof obj.ok !== 'boolean') {
@@ -142,10 +145,21 @@ function parseWorkflowMutationResult(value: unknown): RepositoryCommandResult | 
     (typeof obj.messageId !== 'string' || obj.messageId.length === 0 || obj.messageId.length > 512)) {
     return undefined;
   }
+  if (obj.turnId !== undefined &&
+    (typeof obj.turnId !== 'string' || obj.turnId.length === 0 || obj.turnId.length > 512)) {
+    return undefined;
+  }
   if (obj.deletedMessageIds !== undefined && (
     !Array.isArray(obj.deletedMessageIds) ||
     obj.deletedMessageIds.length > 10_000 ||
     !obj.deletedMessageIds.every((id) => typeof id === 'string' && id.length > 0 && id.length <= 512)
+  )) {
+    return undefined;
+  }
+  if (obj.affectedTaskIds !== undefined && (
+    !Array.isArray(obj.affectedTaskIds) ||
+    obj.affectedTaskIds.length > 10_000 ||
+    !obj.affectedTaskIds.every((id) => typeof id === 'string' && id.length > 0 && id.length <= 512)
   )) {
     return undefined;
   }
@@ -163,7 +177,12 @@ function parseWorkflowMutationResult(value: unknown): RepositoryCommandResult | 
   if (obj.operation !== undefined) {
     if (!obj.operation || typeof obj.operation !== 'object' || Array.isArray(obj.operation)) return undefined;
     try {
-      if (Buffer.byteLength(JSON.stringify(obj.operation), 'utf8') > 1_048_576) return undefined;
+      if (
+        Buffer.byteLength(JSON.stringify(obj.operation), 'utf8') >
+        SQLITE_WORKFLOW_ENVELOPE_MAX_BYTES
+      ) {
+        return undefined;
+      }
     } catch {
       return undefined;
     }
@@ -177,8 +196,12 @@ function parseWorkflowMutationResult(value: unknown): RepositoryCommandResult | 
       : {}),
     ...(typeof obj.conflict === 'boolean' ? { conflict: obj.conflict } : {}),
     ...(typeof obj.messageId === 'string' ? { messageId: obj.messageId } : {}),
+    ...(typeof obj.turnId === 'string' ? { turnId: obj.turnId } : {}),
     ...(Array.isArray(obj.deletedMessageIds)
       ? { deletedMessageIds: obj.deletedMessageIds as string[] }
+      : {}),
+    ...(Array.isArray(obj.affectedTaskIds)
+      ? { affectedTaskIds: obj.affectedTaskIds as string[] }
       : {}),
     ...(typeof obj.presentationStatus === 'string'
       ? { presentationStatus: obj.presentationStatus as NonNullable<RepositoryCommandResult['presentationStatus']> }

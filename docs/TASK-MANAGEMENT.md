@@ -39,7 +39,7 @@ Muster coordinates durable units of work while invoking per-turn **ACP sessions*
 
 - a root coordinator for each user request;
 - delegated worker and sub-coordinator tasks;
-- explicit dependencies and child wait sets;
+- explicit prerequisites and child wait sets;
 - multiple turns backed by one CLI conversation per task;
 - **authorized outcome sealing** — user always; coordinator when user delegates
   (default supervised gate; future **yolo** handoff for self-orchestration);
@@ -55,11 +55,11 @@ events, or visual rendering details. Those belong to the related documents.
 
 | Term | Definition | Lifetime |
 |------|------------|----------|
-| **Task** | A unit of work with a goal, dependencies, policy, and user-facing **lifecycle** outcome | Until hard terminal; soft `failed` may reopen |
+| **Task** | A unit of work with a goal, prerequisites, policy, and user-facing **lifecycle** outcome | Until hard terminal; soft `failed` may reopen |
 | **Lifecycle** | Persisted work outcome (`open` / `succeeded` / `failed` / `cancelled` / `skipped`) | Independent of agent process |
 | **Turn activity** | Product chrome for current turn (`executing` / `waiting_you` / `queued` / `failed_turn` / ready) | Ephemeral / derived; not task outcome |
 | **Process status** | Engine-internal: whether an agent process exists and is busy/idle/stopped | Ephemeral; **not** product chrome after Phase A |
-| **Orchestration activity** | Graph/scheduling waits while open (deps, children, recovery, outcome proposal) | Ephemeral / derived |
+| **Orchestration activity** | Graph/scheduling waits while open (prerequisites, children, recovery, outcome proposal) | Ephemeral / derived |
 | **Runtime activity** | Host-derived open-task activity (legacy compact name for orchestration + turn live signals) | Ephemeral / derived |
 | **Outcome proposal** | Request to mark complete/fail; awaits an authorized sealer when not auto-sealed | Cleared on accept/reject/cancel/seal |
 | **Outcome authority mode** | Who may seal lifecycle: user only vs user + delegated coordinator (yolo later) | Per root / workspace setting |
@@ -114,13 +114,13 @@ Implementations must preserve all of the following:
    **seal** outcomes in its scope without a per-decision human click. The user
    always retains override (cancel, skip, reject, reopen soft-fail, change mode).
 4. **Lifecycle and runtime are separate axes.** Persisted `TaskLifecycleState` is
-   the work outcome. Turn status, dependency readiness, child waits, and recovery
+   the work outcome. Turn status, prerequisite readiness, child waits, and recovery
    needs are **runtime / activity** facts. They must not be collapsed into one
    enum that the UI treats as “the task status.”
 5. **Create always yields `open`.** No other lifecycle is written at creation.
 6. **Hard vs soft terminal:**
    - `succeeded`, `cancelled`, and `skipped` are **hard terminal** for
-     dependents/outcome observation (the sealed node stays historically terminal
+     consumers/outcome observation (the sealed node stays historically terminal
      until reopened). A new user **message on the same task id reopens** to
      `open` and may queue a turn; operators may still create a new/continuation
      task instead.
@@ -137,7 +137,7 @@ Implementations must preserve all of the following:
    skip (or cancel live work) on unfinished descendants — see §5.6.
 8. **One task owns one session.** Session IDs are never shared by tasks.
 9. **Identity is stable.** Parent, role, and backend binding do not change after
-   task creation; dependencies do not change after the first turn is queued.
+   task creation; prerequisites do not change after the first turn is queued.
 10. **One active turn per task/session.** Different tasks may run concurrently when
     backend limits allow it.
 11. **Readiness is derived.** Dependency, scheduler, child-wait, and runtime state
@@ -197,10 +197,11 @@ type OutcomeProposal =
       proposedAt: string;
     };
 
-interface TaskDependency {
-  taskId: string;
-  requiredOutcome: 'succeeded' | 'settled';
-  onUnsatisfied: 'block' | 'fail' | 'skip';
+interface TaskPrerequisite {
+  producerTaskId: string;
+  requiredLifecycle: 'succeeded' | 'terminal';
+  onUnmet: 'block' | 'fail' | 'skip';
+  requiredVerdict?: 'pass';
 }
 
 type PersistedWait =
@@ -242,7 +243,7 @@ interface MusterTask {
 
   // Graph
   parentId: string | null;
-  dependencies: TaskDependency[];
+  prerequisites: TaskPrerequisite[];
   wait?: PersistedWait;
 
   // Session binding
@@ -289,71 +290,26 @@ Default graph capabilities are:
 | Root/sub-coordinator | Host-approved subset of all `TaskCapability` values |
 | Worker | None; workflow dispositions do not extend the graph |
 
-#### 4.1.1 Outcome authority (who may seal lifecycle)
+#### 4.1.1 Lifecycle authority
 
-Lifecycle is a **governance** decision, not a process signal. Two classes of
-actor may seal it:
+Lifecycle is a **governance** decision, not a process signal. Authority is
+structural and persisted directly on every terminal task:
 
-| Actor | Always? | What they can do |
-|-------|---------|------------------|
-| **User** | Yes | Accept/reject proposals; cancel; skip; soft-fail reopen; change mode; always overrides the coordinator |
-| **Coordinator task** | Only when mode allows | Seal `succeeded` / `failed` / `skipped` (and cancel children per policy) for tasks in its **authority scope** |
+| Authority | Scope |
+|-----------|-------|
+| **User** | Root tasks and explicit user lifecycle actions |
+| **Parent** | Ordinary child tasks owned by parent orchestration |
+| **Workflow** | Tasks owned by a workflow run; closure is controlled by that run |
 
-**Workers** never gain outcome-seal authority for the graph; they may only
-propose self-completion or act through tools that the host routes to the parent
-coordinator / engine.
-
-##### Outcome authority mode
-
-Host/workspace (or per-root) setting. Default is supervised so accidental YOLO
-is impossible:
-
-```ts
-/**
- * Who may seal task lifecycle without a further human click.
- * User can always seal and always override.
- */
-type OutcomeAuthorityMode =
-  | 'user_confirm'           // default — supervised
-  | 'coordinator_delegate'   // user delegated seal rights to coordinators
-  | 'yolo';                  // future — full handoff / autonomous orchestration
-```
-
-| Mode | Root lifecycle seal | Child lifecycle seal | Intent |
-|------|---------------------|----------------------|--------|
-| **`user_confirm`** (default) | User only (Accept/Reject/Cancel/Skip). Coordinator **proposes** → `outcomeProposal`. | Parent coordinator may seal children for graph progress (orchestration), or also require proposals — product default: **coordinator may seal direct children** so waits can settle without N human clicks. | Safe default; human owns the user request. |
-| **`coordinator_delegate`** | Root coordinator may seal its own root outcome (and descendants) via disposition / tools on turn commit. User still sees activity and may cancel/override. | Same as parent coordinator scope. | User says “you drive; mark done when you believe the goal is met.” |
-| **`yolo`** (future) | Same seal path as `coordinator_delegate`, with **broader** defaults: higher concurrency/depth, fewer prompts, optional auto-continue. Still **not** CLI-exit → lifecycle. | Full subtree under the root coordinator. | User hands the job to the coordinator for self-orchestration (“fire and forget” within policy limits). |
-
-```ts
-// Illustrative placement — exact field may live on root task, workspace
-// settings, or both (task overrides workspace default).
-interface OutcomeAuthorityPolicy {
-  mode: OutcomeAuthorityMode;
-  /** When true, user still gets a non-blocking toast/card after coordinator seals. */
-  notifyOnCoordinatorSeal?: boolean;
-  /** Optional: even in delegate/yolo, require user confirm for root only. */
-  alwaysConfirmRoot?: boolean;
-}
-```
-
-##### Authority scope (coordinator)
-
-When mode is `coordinator_delegate` or `yolo`, a coordinator may seal:
-
-1. **Itself** (including the root coordinator sealing the root task), and
-2. **Descendants** it is allowed to manage (`create_child` / cancel / skip tools),
-
-subject to host capability checks and the same cascade rules as user cancel/skip.
-
-A **sub-coordinator** seals only within its subtree, not sibling branches or the
-root, unless the root mode and capabilities explicitly allow it.
+Workers and provider processes never gain lifecycle authority. A root worker may
+propose complete/fail, but the root remains `open` until the user acts. An ordinary
+child may be sealed by its parent orchestration. A workflow-owned task is sealed
+only as part of workflow-run closure.
 
 ##### What never seals lifecycle
 
 - Adapter `turnCompleted` / process exit / non-zero exit alone  
-- Exhausted automatic retries (leave `open` + `needs_recovery`, or coordinator
-  *may* seal `failed` only if mode + tool path authorize it)  
+- Exhausted automatic retries (leave `open` + `needs_recovery`)
 - Reload / interrupted turns  
 - Worker self-talk without host-validated tools  
 
@@ -362,12 +318,13 @@ root, unless the root mode and capabilities explicitly allow it.
 Every seal records **who** sealed it (for UI and debugging):
 
 ```ts
-type OutcomeSealedBy =
-  | { kind: 'user'; }
-  | { kind: 'coordinator'; taskId: string; turnId?: string; mode: OutcomeAuthorityMode };
+type TaskLifecycleAuthority =
+  | { kind: 'user' }
+  | { kind: 'parent'; parentTaskId: string; turnId?: string }
+  | { kind: 'workflow'; runId: string };
 
 // On MusterTask when lifecycle leaves open:
-// sealedBy?: OutcomeSealedBy;
+// lifecycleAuthority?: TaskLifecycleAuthority;
 ```
 
 ### 4.2 Turns
@@ -442,10 +399,10 @@ not product chrome after Phase A of `docs/plans/task-chat-turn-hide-cli.md`.
 |------|----------|-------------------------|
 | **Task lifecycle** | Is the work open / done / failed / cancelled / skipped? | Task list badge + workspace header |
 | **Turn activity** | Is a turn working / waiting for you / queued / could not finish / ready? | Composer strip (`data-turn-activity`); optional turn-active list dot |
-| **Orchestration activity** | Waiting on deps, children, recovery, outcome proposal? | Secondary line / action panels — not the task badge |
+| **Orchestration activity** | Waiting on prerequisites, children, recovery, outcome proposal? | Secondary line / action panels — not the task badge |
 | **Process / session** (internal) | Agent process and `committedSessionId` | Engine-owned; **not** product chrome; not on webview wire (Phase B+) |
 
-The store persists **lifecycle**, turns, dependencies, waits, and optional
+The store persists **lifecycle**, turns, prerequisites, waits, and optional
 `outcomeProposal`. Turn activity is **host-projected** as `currentTurnActivity`
 (Phase B); orchestration may still appear via `runtimeActivity`.
 
@@ -498,7 +455,7 @@ type TaskRuntimeActivity =
   | 'queued'
   | 'running'              // live turn generating → product turn activity = executing
   | 'waiting_user'         // live elicitation / ask_parent → product turn activity = waiting_you
-  | 'waiting_dependencies'
+  | 'waiting_prerequisites'
   | 'waiting_children'
   | 'blocked'
   | 'needs_recovery'       // → product turn activity = failed_turn (Phase A)
@@ -509,7 +466,7 @@ Evaluation order (only when `lifecycle === 'open'`):
 
 1. Non-null `outcomeProposal` → `awaiting_outcome` (no live turn strip).
 2. Live turn → `running` or `waiting_user`.
-3. Unsatisfied dependencies → `waiting_dependencies`.
+3. Unmet prerequisites → `waiting_prerequisites`.
 4. Schedulable queued turn → `queued`.
 5. `wait.kind === 'children'` → `waiting_children`.
 6. `wait.kind === 'external'` → `blocked`.
@@ -572,7 +529,7 @@ succeeded / cancelled / skipped + explicit new work ─► new task (or continua
 `TaskEngine.createTask(input, callerContext)`:
 
 1. Validates parent ownership and caller capability.
-2. Validates dependency scope and rejects dependency cycles.
+2. Validates prerequisite scope and rejects prerequisite cycles.
 3. Applies host policy; the caller cannot choose arbitrary capabilities or limits.
 4. Persists a task with **`lifecycle: 'open'`** and no `outcomeProposal`, without
    starting a turn (unless a convenience API also queues the first turn).
@@ -589,91 +546,40 @@ queued `TaskTurn`. They do **not** change lifecycle. `startTask` is valid before
 the first turn; `continueTask` is valid after at least one settled turn while the
 task is `open` (including after soft-fail **reopen**).
 
-If dependencies are unresolved, the queued turn records start intent but is not
-spawned. When dependencies resolve, the engine either schedules it or applies the
-dependency's `onUnsatisfied` policy (see §5.6 for `skip`).
+If prerequisites are unresolved, the queued turn records start intent but is not
+spawned. When prerequisites resolve, the engine either schedules it or applies the
+prerequisite's `onUnmet` policy (see §5.6 for `skip`).
 
 There may be at most **one active (running) turn** per task. Operators may stack
 **multiple queued follow-ups** (FIFO); the scheduler promotes one-at-a-time after
 settlement. See §9.1.
 
-### 5.3 Outcome sealing (user and coordinator)
+### 5.3 Outcome sealing
 
-Lifecycle is sealed by **authorized actors** (§4.1.1), never by CLI exit alone.
+Lifecycle is sealed by the task's structural authority (§4.1.1), never by CLI
+exit alone.
 
-For persisted ordinary-task recovery, a host/internal transition may stage a
-complete/fail outcome, then on `turnCompleted` either **propose** or **seal**
-according to mode and role. Public workflow turns instead use §8 dispositions.
+- Root ordinary tasks stage complete/fail as `outcomeProposal`; the user seals them.
+- Ordinary children may seal complete/fail under parent authority.
+- Workflow-owned tasks remain open during routing and are sealed by workflow-run closure.
 
-**Host parent seal:** when a **direct child** stays open without staging a required
-disposition, an authorized host/coordinator transition may seal that child:
+Compatible terminal replay is a no-op and does not rewrite `lifecycleAuthority`
+or revision. An incompatible terminal transition is rejected.
 
-| Lifecycle | Scope | Notes |
-|-----------|--------|--------|
-| `succeeded` / `failed` | **Target child only** | Requires `result` / `error`; `sealedBy: { kind:'coordinator', mode:'parent_seal' }` |
-| `cancelled` / `skipped` | **Subtree cascade** | Same class as host cancel/skip (unfinished descendants) |
-| Compatible terminal replay | No-op | Exact payload equality; does **not** rewrite `sealedBy` / revision |
-| Incompatible terminal | Error `already_terminal` | No overwrite |
-
-Root policy: `mayParentSealDirect` / `childOrchestrationSeal`. Under
-`propose_only`, parent seal is rejected. Under default
-`parent_may_seal_direct`, it is allowed. This internal coordinator path cannot
-seal the **root**; root lifecycle remains user/host-owned.
-
-#### 5.3.1 Supervised path (`user_confirm` — default)
-
-Proposal / approval: the coordinator asserts “I think we’re done”; the **user**
-seals (especially the root).
-
-1. Stage disposition on the live turn.
-2. On `turnCompleted`:
-   - turn status → `succeeded` (CLI OK only);
-   - for root (and any task requiring confirm): copy into `outcomeProposal`;
-     lifecycle stays `open`;
-   - for children under default orchestration policy: parent coordinator may
-     already be allowed to seal the child (graph progress).
-3. Webview shows an **outcome card** when a proposal awaits the user.
-4. User actions:
+For root proposals, the webview exposes these user actions:
 
 | User action | Lifecycle | Side effects |
 |-------------|-----------|--------------|
-| **Accept** complete proposal | `succeeded` | Persist `result`; clear proposal; `finishedAt`; `sealedBy: user` |
+| **Accept** complete proposal | `succeeded` | Persist `result`; clear proposal; `finishedAt`; `lifecycleAuthority: { kind: 'user' }` |
 | **Reject** complete **with reason** | stays `open` | Clear proposal; inject reason; may auto-queue continuation turn |
-| **Reject** complete **without reason** | `failed` | Soft terminal; no automatic further turns; `sealedBy: user` |
-| **Accept** fail proposal | `failed` | Soft terminal; `sealedBy: user` |
+| **Reject** complete **without reason** | `failed` | Soft terminal; no automatic further turns; user authority |
+| **Accept** fail proposal | `failed` | Soft terminal; user authority |
 | **Reject** fail proposal **with reason** | stays `open` | Clear proposal; coordinator may continue |
 | **Reject** fail proposal **without reason** | stays `open` (default) | Clear proposal; user declined the agent’s self-fail |
 
-#### 5.3.2 Delegated path (`coordinator_delegate` and future `yolo`)
-
-User has **turned on** outcome delegation so the coordinator can mark success
-(and other outcomes) without a per-decision click — including sealing the **root**
-when the goal is met. This is the foundation for later **yolo**: hand the job to
-the root coordinator for self-orchestration within host limits.
-
-1. Stage disposition as today (`complete` / `fail` / skip / cancel-child tools).
-2. On `turnCompleted`, if the caller is a coordinator **and** mode + capabilities
-   authorize the target task:
-   - seal lifecycle immediately (`succeeded` / `failed` / …);
-   - set `sealedBy: { kind: 'coordinator', taskId, turnId, mode }`;
-   - **do not** require `outcomeProposal` / Accept card (optional notify toast).
-3. If authorization fails (worker, wrong subtree, mode is `user_confirm` for that
-   target), fall back to proposal or reject the tool.
-
-| Mode | Typical root behavior on an internal complete outcome |
-|------|------------------------------------------|
-| `user_confirm` | Proposal → user Accept/Reject |
-| `coordinator_delegate` | Coordinator seals `succeeded` on the root when it completes its own turn with `complete` |
-| `yolo` | Same seal mechanics as delegate; policy defaults favor autonomy (limits, auto-continue, fewer UI blocks) |
-
-**User override is never removed:** cancel, skip, soft-fail reopen, force-fail,
-and switching mode back to `user_confirm` always work. A coordinator seal does
-not lock the user out of the workspace.
-
-**Yolo (future product):** not a separate state machine — it is
-`OutcomeAuthorityMode = 'yolo'` plus looser execution policy (depth, concurrency,
-timeouts, optional auto-retry). Lifecycle rules stay: only user or authorized
-coordinator seals; CLI never does.
+Parent authority is recorded as
+`{ kind: 'parent', parentTaskId, turnId? }`. Workflow authority is recorded as
+`{ kind: 'workflow', runId }`. There are no free-form coordinator authority modes.
 
 ### 5.4 Interrupting (runtime) vs cancelling (lifecycle)
 
@@ -710,27 +616,27 @@ deliberate “won’t do,” not an error and not an abort of in-flight work.
 
 | Aspect | Rule |
 |--------|------|
-| Who sets it | **User** always; **coordinator** when outcome mode allows (`coordinator_delegate` / `yolo`) for tasks in scope. Dependency policy `onUnsatisfied: 'skip'` may also mark a blocked dependent skipped (host policy, not CLI). Workers do not seal skip on the root without going through coordinator tools + mode checks. |
+| Who sets it | **User** for root/user actions; **parent orchestration** for ordinary children; **workflow closure** for workflow-owned tasks. Prerequisite policy `onUnmet: 'skip'` may mark a blocked consumer skipped under parent authority. |
 | When | Typically while `open`, often **before** meaningful work (no turns, or only idle). If a live turn exists, skip should interrupt/cancel that turn first, then seal `skipped` (or product may require cancel instead when work already started — prefer: skip allowed anytime on `open`, with interrupt of live process). |
 | vs `cancelled` | **Cancel** = stop / abandon work that was accepted as in progress. **Skip** = choose not to do this unit of work (backlog triage, “not now / not this”). |
 | vs `failed` | **Failed** = attempt judged unsuccessful. **Skipped** = never (or no longer) attempting. |
 | Descendants | Default: unfinished descendants are also **skipped** (or cancelled if they had live turns — implementation may map live children → cancel process then skip). Cascade must leave no open orphan work under a skipped parent. |
 | Hard terminal | Composer stays writable; next `send` reopens same id to `open`. New task remains available if preferred. |
-| Wait / deps | Settles wait barriers. Does **not** satisfy `requiredOutcome: 'succeeded'`. Dependents with `onUnsatisfied: 'skip'` may themselves become `skipped`. |
+| Wait / prerequisites | Settles wait barriers. Does **not** meet `requiredLifecycle: 'succeeded'`. Consumers with `onUnmet: 'skip'` may themselves become `skipped`. |
 | CLI | Never maps process exit or missing disposition to `skipped`. |
 
 Host path (implemented): webview posts `setTaskLifecycle { taskId, lifecycle: 'skipped' }`;
 host routes to engine `skipTask` (cascade + interrupt live turns). Optional `reason`
 may be added later for transcript/history only.
 
-### 5.7 Settled outcomes for waits and dependencies
+### 5.7 Terminal outcomes for waits and prerequisites
 
-For child wait barriers and dependencies:
+For child wait barriers and prerequisites:
 
 - `succeeded`, `failed`, `cancelled`, and `skipped` all **settle** a wait set
   (barrier complete).
-- Only `succeeded` satisfies `requiredOutcome: 'succeeded'`.
-- Soft-fail reopen of a dependency after a parent has already continued is an
+- Only `succeeded` meets `requiredLifecycle: 'succeeded'`.
+- Soft-fail reopen of a producer after a parent has already continued is an
   advanced case: parents that already consumed a settled barrier do not re-fire;
   new work uses new turns / new wait sets.
 
@@ -757,13 +663,10 @@ On adapter `turnCompleted`, the engine atomically:
 1. Marks the turn `succeeded` (**turn** status only).
 2. Commits the session ID according to §10.
 3. Applies the staged disposition **without conflating it with CLI success**,
-   using outcome authority (§4.1.1, §5.3):
-   - **`complete` / `fail` + sealer authorized** (user already confirmed offline
-     N/A; **coordinator** under `coordinator_delegate` / `yolo`, or child under
-     orchestration policy) → **seal** lifecycle, set `sealedBy`, clear proposal.
-   - **`complete` / `fail` + sealer not authorized** → stage/refresh
-     `outcomeProposal`; lifecycle stays `open` until user (or later authorized
-     coordinator) seals.
+   using lifecycle authority (§4.1.1, §5.3):
+   - ordinary child `complete` / `fail` → seal under parent authority;
+   - root `complete` / `fail` → stage/refresh `outcomeProposal` and remain `open`;
+   - workflow disposition → route the workflow and let workflow-run closure own lifecycle.
    - `wait_tasks` → task stays `open` and receives a child wait set.
     - `idle` on an ordinary turn → task stays `open` without an automatic next turn
       and without a new outcome proposal;
@@ -771,7 +674,7 @@ On adapter `turnCompleted`, the engine atomically:
       `workflow_next` with `change: 'updated'` and the final assistant message as
       its result before applying the same settlement transaction.
 4. Marks user-message inputs assigned to that turn as `complete`.
-5. Emits task and turn updates (lifecycle + proposal + runtime activity + mode).
+5. Emits task and turn updates (lifecycle + proposal + runtime activity + authority).
 
 A staged disposition is discarded if the adapter turn fails or is interrupted.
 This prevents an MCP call made early in a failed invocation from becoming a
@@ -782,7 +685,7 @@ Workflow agents should stage `workflow_next`, contextual `workflow_prev`, or
 final assistant message as an updated `workflow_next`; explicit dispositions always
 win. Turn/task
 **timeouts** are runtime events: leave `open` + `needs_recovery`, unless an
-authorized coordinator explicitly seals `failed` under delegate/yolo policy.
+an authorized user or parent transition explicitly seals `failed`.
 
 ### 6.2 Applying a failed turn
 
@@ -793,29 +696,29 @@ stays `open`. Execution policy may:
 - leave the task open for user/coordinator recovery (`needs_recovery`).
 
 Do **not** auto-transition lifecycle to `failed` solely because retries are
-exhausted. Sealing `failed` requires an authorized actor (§5.3) — user action or
-coordinator under delegate/yolo — not the CLI. Policy decisions and retry turn
+exhausted. Sealing `failed` requires an authorized actor (§5.3), not the CLI.
+Policy decisions and retry turn
 IDs are persisted so reload cannot duplicate them.
 
 ---
 
-## 7. Dependencies
+## 7. Prerequisites
 
-For every `TaskDependency`:
+For every `TaskPrerequisite`:
 
-- `requiredOutcome: 'settled'` is satisfied by any terminal dependency outcome.
-- `requiredOutcome: 'succeeded'` is satisfied only by `succeeded`.
-- A terminal non-success applies `onUnsatisfied`:
-  - `block`: leave the task open and show the failed dependency;
-  - `fail`: mark the dependent task failed;
-  - `skip`: mark the dependent task skipped.
+- `requiredLifecycle: 'terminal'` is met by any terminal producer lifecycle.
+- `requiredLifecycle: 'succeeded'` is met only by `succeeded`.
+- A terminal non-success applies `onUnmet`:
+  - `block`: leave the task open and show the failed prerequisite;
+  - `fail`: mark the consumer task failed;
+  - `skip`: mark the consumer task skipped.
 
-Dependencies must refer to tasks in the same root task graph unless a future
+Prerequisites must refer to tasks in the same root task graph unless a future
 cross-root policy explicitly allows otherwise. The engine rejects cycles at create
-or during a pre-start dependency update; dependencies become immutable when the
+or during a pre-start prerequisite update; prerequisites become immutable when the
 first turn is queued.
 
-`dependencies` are the source of truth. Do not also persist equivalent task
+`prerequisites` are the source of truth. Do not also persist equivalent task
 blockers.
 
 ---
@@ -835,11 +738,11 @@ cannot be produced. MCP `ask_user` and `ask_parent` are not part of this protoco
 
 | Tool | Context | Purpose |
 |------|---------|---------|
-| `list_task_types` | Coordinator | Refresh workflow-node profile routing and diagnostics |
-| `inspect_workflow_run` | Coordinator with `read_subtree` | Inspect bounded durable state for an owned run |
+| `list_task_types` | Coordinator | Refresh semantic workflow-node profiles and diagnostics |
+| `inspect_workflow_run` | Coordinator with `read_subtree` | Inspect semantic durable state for an owned run |
 | `get_host_context` | Any task | Refresh trusted host, self, rules, and task-profile context |
-| `define_workflow` | Coordinator with `create_child` | Persist an immutable validated workflow definition |
-| `start_workflow` | Coordinator with `create_child` | Idempotently start and await a frozen top-level workflow run |
+| `define_workflow` | Coordinator with `create_child` | Save an engine-versioned definition from semantic nodes and inputs |
+| `start_workflow` | Coordinator with `create_child` | Durably start a workflow, suspend this caller, and resume it at terminal state |
 | `workflow_next` | Live workflow activation | Publish the node result to its forward route |
 | `workflow_prev` | Live activation with direct dependencies | Open targeted producer feedback |
 | `workflow_fail` | Live workflow activation | Fail-fast close the current workflow run |
@@ -851,9 +754,10 @@ manually forged credential contains one. `tools/list`, readiness expectations, f
 turn host context, and `get_host_context` all derive from the same public projection.
 
 **Task profiles:** `muster.taskTypes` remains the source for workflow-node presets.
-Before defining a workflow, coordinators may call `list_task_types` and must freeze
-the resolved task type, backend, role, and optional model into each node exactly.
-Explicit workspace maps remain authoritative.
+Coordinators choose only the semantic `taskType`. At definition commit the engine
+resolves and freezes backend, model, role, capabilities, fallbacks, and bounded policy
+into the immutable revision. Existing revisions never re-resolve against later
+configuration changes.
 
 ### 8.2 Workflow turn protocol
 
@@ -862,24 +766,45 @@ an explicit `workflow_next`, contextual `workflow_prev`, or `workflow_fail`, or 
 implicit host-generated `workflow_next` when the model ends without a disposition.
 Explicit dispositions always win. The route is durable and idempotent; routing
 commits only when the adapter turn settles successfully.
-Agents never supply run, activation, gate, round, artifact-lineage, or continuation
-identities to mutation tools. The read-only `inspect_workflow_run` accepts a `runId`
-previously returned by an authorized workflow start or route.
+Agents never supply operation, numeric definition version, run, activation, gate,
+round, artifact-lineage, continuation, owner, or presentation-revision identities to
+mutation tools. A returned opaque `workflowRef` may pin an immutable definition. The
+read-only `inspect_workflow_run` accepts a `runRef` previously returned by an
+authorized workflow start or route.
 
 `define_workflow`, `start_workflow`, run inspection, context reads, and presentation
 updates are not competing dispositions. Child-workflow invocation is represented as
 a `NEXT` route and remains mutually exclusive with the three base workflow outcomes.
 
 `inspect_workflow_run` is a bounded recovery/diagnostic read, not a routing or polling
-mechanism. It returns run/node/gate/activation/feedback/continuation state, integrity
-codes, and committed terminal artifact references without task trees, topology,
-prompts, artifact bodies, paths, or secrets. Workflow progress shown by the host or UI
-is derived from this durable state; agents do not report percentages.
+mechanism. It returns semantic workflow/node/activation/feedback/child state and
+integrity codes without policy budgets, routing IDs, artifact coordinates, task trees,
+topology, prompts, artifact bodies, paths, or secrets. Workflow progress shown by the
+host or UI is derived from this durable state; agents do not report percentages.
 
-`start_workflow` itself is the completion wait. Its tool request remains pending until
-the run succeeds, fails, or is cancelled, then returns the terminal status/reason and
-the committed terminal `workflow_next` body when present. The host wakes this wait from
-durable repository commits rather than coordinator polling.
+`start_workflow` creates the run and a top-level `start_wait` continuation in one
+transaction, then returns an `accepted` tool result. Only after the adapter reports
+that successful tool boundary does the engine settle and suspend the caller turn.
+The transcript records this as `Workflow dispatched. Waiting for results...`; adapter
+cancellation text is suppressed because this is a technical suspension, not a user or
+failure interrupt.
+Run terminalization atomically resolves the continuation and inserts one deterministic
+engine resume turn whose message contains terminal status/reason and the committed
+terminal `workflow_next` body when present. The same resolver runs after workflow
+commits and during reload, and continuation consumption makes delivery exactly once.
+Invalid or unauthorized calls remain ordinary tool errors and never suspend the turn.
+Only one unresolved top-level start wait is allowed per caller task. Workflow
+activations use `invoke_child_workflow` and retain their separate `child_wait`
+continuation semantics. `inspect_workflow_run` is not a normal completion polling loop.
+
+A successful backend turn is not the same thing as a sealed task lifecycle. Root
+coordinators remain `open` after each normal or workflow-resume response so the user can
+continue chatting; only an explicit user status decision seals that root as `succeeded`.
+Workflow-created tasks are route-controlled: a successful `workflow_next` (explicit or
+host-generated) lets workflow authority advance/seal the node. Ordinary non-root child
+tasks retain parent-orchestration sealing. This policy is derived from task ownership and
+workflow activation state; mutation tools do not expose a model-controlled `autoSuccess`
+flag.
 
 ### 8.3 Authorization and resource policy
 
@@ -934,7 +859,7 @@ both constrain behavior:
 | Lifecycle | Runtime activity (if open) | Behavior |
 |-----------|----------------------------|----------|
 | `open` | `idle` | Queue a user-triggered turn (`send`) |
-| `open` | `waiting_dependencies` / `queued` | `send` creates another distinct FIFO queued turn (or binds per engine policy); inspect / edit / delete via `queuedTurns` |
+| `open` | `waiting_prerequisites` / `queued` | `send` creates another distinct FIFO queued turn (or binds per engine policy); inspect / edit / delete via `queuedTurns` |
 | `open` | `running` | `send` queues a FIFO follow-up (no interrupt); **Ctrl+Enter** `sendLiveInput` → reserve follow-up then interrupt live turn (cut & continue). `submitAsk` remains the path for structured ask answers |
 | `open` | `waiting_user` | Answer the pending ask via `submitAsk`; free-form composer may still queue follow-ups when product policy allows |
 | `open` | `waiting_children` / `blocked` | Persist / queue for the next continuation turn |
@@ -1101,20 +1026,20 @@ wait set is sufficient to recover orchestration state.
 - creates and persists tasks, turns, messages, wait sets, dispositions, and
   outcome proposals;
 - applies **user** accept/reject/cancel/skip/reopen decisions to lifecycle;
-- applies **coordinator** seals when outcome authority mode allows (§4.1.1);
-- enforces outcome mode and capability scope on every seal;
+- applies parent and workflow lifecycle authority (§4.1.1);
+- enforces structural authority and capability scope on every seal;
 - schedules turns through backend adapters;
 - maps adapter events to the correct task and turn (**turn** status only for CLI);
 - commits session identity only after successful turns;
 - routes AskBridge requests by task and turn ID;
-- resolves dependencies and child barriers;
+- resolves prerequisites and child barriers;
 - applies retries and execution policy without CLI-driven lifecycle seals;
-- emits task/turn patches with lifecycle + runtime activity + authority mode;
+- emits task/turn patches with lifecycle + runtime activity + lifecycle authority;
 - performs reload reconciliation and idempotent continuation scheduling;
 - cascades cancel/skip to descendants.
 
 `SqliteTaskRepository` persists state but does not decide transitions. Backend adapters execute
-turns but never seal lifecycle. User and authorized coordinators do.
+turns but never seal lifecycle. User, parent orchestration, and workflow closure do.
 
 ---
 
@@ -1160,7 +1085,7 @@ field and falls back to client derive only if absent.
 The webview ignores late events whose `turnId` is no longer active for that task.
 `submitAsk` must include `taskId`, `turnId`, and `askId`.
 
-Host commands for user seals and mode:
+Host commands for user seals:
 
 ```text
 # Implemented
@@ -1175,10 +1100,9 @@ setTaskLifecycle           { taskId, lifecycle, result?, error? }
 # Planned (outcome card / settings)
 acceptOutcome              { taskId }
 rejectOutcome              { taskId, reason?: string }  // empty reason on complete → failed
-setOutcomeAuthorityMode    { mode }                     // user_confirm | coordinator_delegate | yolo
 ```
 
-Engine also exposes `cancelTask` / `skipTask` directly for host/coordinator paths;
+Engine also exposes `cancelTask` / `skipTask` directly for authorized host paths;
 the webview status menu uses `setTaskLifecycle` only.
 
 ### 14.3 Outcome UX and terminal chrome
@@ -1191,10 +1115,8 @@ the webview status menu uses `setTaskLifecycle` only.
   menu can seal lifecycle; **composer remains writable** and send clears the
   proposal and continues (§9). Do **not** show the task as Succeeded merely
   because `turnDone` arrived.
-- Surface **outcome authority mode** (supervised / delegate / yolo) so users know
-  whether the coordinator may mark success without confirmation.
-- When a coordinator seals under delegate/yolo, show a non-blocking notice
-  (who sealed, when) rather than an Accept card — unless `alwaysConfirmRoot`.
+- Surface persisted lifecycle authority in diagnostics when useful; product chrome
+  should still explain the outcome rather than expose internal orchestration jargon.
 - **Failed** (soft): composer remains available; send reopens to `open`. Status
   menu may also **Reopen** → `setTaskLifecycle` `open`.
 - **Succeeded** / **Cancelled** / **Skipped**: composer remains available; next
@@ -1214,9 +1136,9 @@ the webview status menu uses `setTaskLifecycle` only.
   card (status card **is** the header).
 - Blocking composer solely because `runtimeActivity === 'awaiting_outcome'`.
 - Blocking composer solely because lifecycle is hard-terminal (reopen-on-send is allowed).
-- Auto-sealing root success in **`user_confirm`** mode from an agent disposition.
-- Blocking all coordinator seals in **`coordinator_delegate` / `yolo`** as if
-  every outcome still required a human click (defeats handoff).
+- Auto-sealing root success from an agent disposition.
+- Requiring user confirmation for every ordinary child or workflow-owned task,
+  which would deadlock graph progress.
 - Using **Skip** and **Cancel** as synonyms in the UI copy.
 
 ---
@@ -1225,7 +1147,7 @@ the webview status menu uses `setTaskLifecycle` only.
 
 ### Phase A — Domain types and transition tests
 
-- [ ] `MusterTask`, `TaskTurn`, dependency, disposition, message, and store-envelope types
+- [ ] `MusterTask`, `TaskTurn`, prerequisite, disposition, message, and store-envelope types
 - [ ] Pure derived-status function
 - [ ] Transition table/tests for every task and turn operation
 - [ ] Dependency cycle and failure-policy tests
@@ -1266,7 +1188,7 @@ Plan: [`plans/task-orchestration-auto-run.md`](plans/task-orchestration-auto-run
 - [x] W1 — `TaskResultV1`, `inputBindings`, durable pin before dispatch
 - [x] W2 — `TaskBriefV1`, prompt compiler, schema v5 migrate (`releaseState` + brief)
 - [x] W3 — Draft create, atomic internal release, first-turn intents, direct start lockdown
-- [x] W4 — `sealedBy` on all terminal paths; root `childOrchestrationSeal` policy
+- [x] W4 — `lifecycleAuthority` on all terminal paths; root remains user-owned
 - [x] W5 — Shared readiness evaluator + `rescanSchedulableTurns`
 - [x] W6 — Attention wake on internal child waits (`wakeOn`, suspend phase)
 - [x] W7 — Shared-cwd writePaths / git mutex at promote
@@ -1283,14 +1205,12 @@ Plan: [`plans/task-orchestration-auto-run.md`](plans/task-orchestration-auto-run
 | Main agent | Root coordinator is a normal task with host-issued coordinator policy |
 | Two axes | Persist **lifecycle** (work outcome) separately from **turn/runtime activity** (CLI and waits) |
 | New task | Always `lifecycle: open` |
-| Who seals lifecycle | **User always**; **coordinator** when outcome authority mode allows — never the CLI |
+| Who seals lifecycle | **User** for roots, **parent orchestration** for ordinary children, **workflow closure** for workflow-owned tasks — never the CLI |
 | Status axes | Lifecycle ≠ turn activity ≠ orchestration (§4.3); process/session stay engine-internal |
 | Turn activity (product) | `executing` \| `waiting_you` \| `queued` \| `failed_turn` \| none (ready); Phase A client-derived, Phase B host-owned |
 | Process status | Engine-internal only — not product chrome after Phase A |
 | Placement | Task badge = lifecycle; turn strip near composer (§4.3.4, WEBVIEW) |
-| Default mode | `user_confirm` — coordinator proposes, user Accept → `succeeded` |
-| Delegate mode | `coordinator_delegate` — user enables coordinator to mark success/fail/skip in scope (incl. root) |
-| Yolo (future) | `yolo` — same seal path as delegate + freer execution policy for self-orchestration handoff |
+| Root completion | Agent proposes; user Accept → `succeeded` |
 | Reject complete with reason | Stay `open`; inject reason; coordinator continues |
 | Reject complete without reason | Soft `failed`; no auto turns until user messages |
 | Soft fail reopen | New user message on `failed` reopens same task to `open` |
@@ -1298,11 +1218,11 @@ Plan: [`plans/task-orchestration-auto-run.md`](plans/task-orchestration-auto-run
 | Cancel | Authorized cancel seals `cancelled` and **cascades** descendants; workspace revert is future work |
 | Skip | Created task marked **won’t perform** → `skipped` (hard); user or authorized coordinator |
 | CLI / turn failure | Never seals lifecycle by itself; leave `open` + recovery (unless authorized sealer acts) |
-| Disposition commit | Propose vs seal decided by mode + role on `turnCompleted` (§5.3, §6.1) |
-| Audit | Persist `sealedBy` (user vs coordinator + mode) |
+| Disposition commit | Propose vs seal decided by structural authority on `turnCompleted` (§5.3, §6.1) |
+| Audit | Persist `lifecycleAuthority` (`user`, `parent`, or `workflow`) |
 | Child waiting | Explicit turn-scoped wait set; no implicit per-turn spawn batch |
 | Child failure | Settles the barrier but does not automatically fail the parent root |
-| Dependencies | Declare required outcome and failure policy |
+| Prerequisites | Declare required producer lifecycle and unmet policy |
 | Concurrency | Serialize per task/session, then apply backend and global limits |
 | Interruption | Aborted/reloaded process → interrupted **turn**; lifecycle stays `open` |
 | Reload | Reconcile persisted state; never silently replay a process |
@@ -2187,7 +2107,7 @@ target, or unrecoverable target failure atomically:
 Terminal workflow state also closes every task owned by that run in the same
 transaction: success seals node tasks `succeeded`, failure seals them `failed`, and
 cancellation seals them `cancelled`, with `finishedAt` and
-`sealedBy.mode = 'workflow_run'`. Recursive child-run failure/cancellation uses the
+`lifecycleAuthority: { kind: 'workflow', runId }`. Recursive child-run failure/cancellation uses the
 same rule. `PREV` remains non-terminal and may reactivate an existing node task.
 Caller/root tasks outside `workflow_nodes` remain open for their own lifecycle owner.
 There is no v1 per-edge choice to skip, continue, or guess another target. A future

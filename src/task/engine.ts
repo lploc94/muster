@@ -30,7 +30,7 @@ import {
   captureContinuationCutoff,
 } from './engine-handoff';
 import { deriveViewStatus } from './derived-status';
-import type { DepGraph } from './deps';
+import type { PrerequisiteGraph } from './prerequisites';
 import {
   buildRunOptionsForTurn,
   cleanupTurnResources,
@@ -54,9 +54,9 @@ import {
   NO_GIT_REVISION,
   SOURCE_REVISION_UNAVAILABLE,
 } from './source-revision';
-import { BATCH_EXPAND_MAX, type ToolCommand } from './coordinator-tools';
+import type { ToolCommand } from './coordinator-tools';
 import { evaluateTaskReadiness } from './readiness';
-import { canPromoteTurn, dependencyTerminalOutcome } from './scheduler';
+import { canPromoteTurn, prerequisiteTerminalLifecycle } from './scheduler';
 import { canCreateTurn, DEFAULT_RESOURCE_LIMITS, effectiveTurnCap, type ResourceLimits } from './limits';
 import {
   DEFAULT_RUN_LIMIT_MS,
@@ -66,8 +66,8 @@ import {
 } from './execution-policy';
 import {
   TASK_ERROR_MAX_BYTES,
+  TASK_MESSAGE_MAX_CHARS,
   TASK_RESULT_MAX_BYTES,
-  truncateUtf8Bytes,
 } from './content-limits';
 import { selectCommittedSessionId } from './session-select';
 import { sanitizeHandoffFailureMessage } from './sanitization';
@@ -89,7 +89,7 @@ import {
 } from './transcript-stream-batcher';
 import { createTranscriptStreamPersist } from './transcript-stream-persist';
 import {
-  applyDependencyTerminal,
+  applyPrerequisiteTerminal,
   applyFailedTurn,
   applySuccessfulTurn,
   createTask,
@@ -121,7 +121,6 @@ import type {
   PersistedToolCall,
   TaskAttentionCode,
   TaskCapability,
-  TaskDependency,
   TaskExecutionPolicy,
   TaskInputBinding,
   TaskLifecycleState,
@@ -133,10 +132,15 @@ import type {
   TurnDisposition,
   TurnInput,
 } from './types';
-import type { WorkflowRunCompletionProjection } from './workflow-types';
 
 /** Extra lifetime after the frozen run deadline before a runtime claim is reclaimable. */
 export const LEASE_CLEANUP_BUFFER_MS = 60_000;
+const WORKFLOW_START_WAITING_NOTICE = '*Workflow dispatched. Waiting for results...*';
+
+type SuccessfulTurnSettlement =
+  | { status: 'settled' }
+  | { status: 'missing_session' }
+  | { status: 'failed'; reason: string };
 
 export interface DispositionLimits {
   maxResult: number;
@@ -277,6 +281,16 @@ function nowIso(clock?: () => string): string {
   return clock?.() ?? new Date().toISOString();
 }
 
+function isStartWorkflowToolCall(tool: PersistedToolCall): boolean {
+  const normalizedName = tool.name.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+  if (normalizedName === 'start_workflow' || normalizedName.endsWith('_start_workflow')) {
+    return true;
+  }
+  if (!tool.input || typeof tool.input !== 'object' || Array.isArray(tool.input)) return false;
+  const input = tool.input as Record<string, unknown>;
+  return typeof input.workflow === 'string' && !Array.isArray(input.bindings);
+}
+
 function cloneEngineProjection(file: EngineProjection): EngineProjection {
   return structuredClone(file);
 }
@@ -363,7 +377,7 @@ function messageMapFromFile(file: EngineProjection): Map<string, TaskMessage> {
   return new Map(Object.entries(file.messages));
 }
 
-function depGraphFromFile(file: EngineProjection): DepGraph {
+function prerequisiteGraphFromFile(file: EngineProjection): PrerequisiteGraph {
   return {
     rootOf: (taskId) => {
       const task = file.tasks[taskId];
@@ -380,7 +394,8 @@ function depGraphFromFile(file: EngineProjection): DepGraph {
       }
       return current.id;
     },
-    dependsOn: (taskId) => file.tasks[taskId]?.dependencies.map((dep) => dep.taskId) ?? [],
+    prerequisitesOf: (taskId) =>
+      file.tasks[taskId]?.prerequisites.map((prerequisite) => prerequisite.producerTaskId) ?? [],
     briefKindOf: (taskId) => file.tasks[taskId]?.brief?.kind,
   };
 }
@@ -442,12 +457,15 @@ export function viewStatusFromDraft(draft: EngineProjection, taskId: string) {
   if (!task) {
     return undefined;
   }
-  const depLifecycles = new Map(
-    task.dependencies
-      .map((dep) => [dep.taskId, draft.tasks[dep.taskId]?.lifecycle] as const)
+  const producerLifecycles = new Map(
+    task.prerequisites
+      .map((prerequisite) => [
+        prerequisite.producerTaskId,
+        draft.tasks[prerequisite.producerTaskId]?.lifecycle,
+      ] as const)
       .filter((entry): entry is [string, NonNullable<(typeof entry)[1]>] => entry[1] !== undefined),
   );
-  return deriveViewStatus(task, turnsForTask(draft, taskId), depLifecycles);
+  return deriveViewStatus(task, turnsForTask(draft, taskId), producerLifecycles);
 }
 
 export class TaskEngine {
@@ -521,6 +539,16 @@ export class TaskEngine {
       cancelPoll?: ReturnType<typeof setInterval>;
       /** Run-deadline watchdog — cleared synchronously on terminal quiesce. */
       turnTimer?: ReturnType<typeof setTimeout>;
+      /** Accepted start_workflow awaiting its successful adapter tool boundary. */
+      workflowStartSuspension?: {
+        runId: string;
+        toolCompleted: boolean;
+      };
+      workflowRouteSuspension?: {
+        kind: 'workflow_next' | 'workflow_prev';
+        message: string;
+        toolCompleted: boolean;
+      };
     }
   >();
   /** Queued turns preserved on reload — start only via resumeQueuedTurn. */
@@ -528,7 +556,9 @@ export class TaskEngine {
   private readonly turnPromises = new Map<string, Promise<void>>();
   private workflowDeadlineTimer?: ReturnType<typeof setInterval>;
   private workflowDeadlineReapRunning = false;
-  private readonly workflowRunWaiters = new Set<() => void>();
+  private workflowStartContinuationResolveScheduled = false;
+  private workflowStartContinuationResolveRequested = false;
+  private workflowStartContinuationResolvePromise?: Promise<void>;
   private shuttingDown = false;
   /** Terminal storage latch: zero repository writes after this (distinct from graceful shutdown). */
   private storageTerminal = false;
@@ -571,19 +601,6 @@ export class TaskEngine {
       config.getResourceLimits ??
       (() => config.resourceLimits ?? DEFAULT_RESOURCE_LIMITS);
     this.getRunLimitMs = config.getRunLimitMs ?? (() => DEFAULT_RUN_LIMIT_MS);
-    // Log effective caps once at engine load for diagnosis (slice verification).
-    const bootLimits = this.getResourceLimits();
-    console.info('[muster][task-orch] resource.limits', {
-      maxConcurrentTurns: bootLimits.maxConcurrentTurns,
-      maxConcurrentPerRoot: bootLimits.maxConcurrentPerRoot,
-      maxConcurrentPerBackend: bootLimits.maxConcurrentPerBackend,
-      maxTurnsPerTask: bootLimits.maxTurnsPerTask,
-      source: config.getResourceLimits
-        ? 'getResourceLimits'
-        : config.resourceLimits
-          ? 'resourceLimits'
-          : 'DEFAULT_RESOURCE_LIMITS',
-    });
     this.emit = config.emit;
     this.isWorkspaceTrusted = config.isWorkspaceTrusted ?? (() => true);
     this.prepareHostEnvironment = config.prepareHostEnvironment;
@@ -618,6 +635,21 @@ export class TaskEngine {
     });
   }
 
+  private logLifecycle(
+    event: string,
+    details: Record<string, unknown>,
+    level: 'info' | 'error' = 'info',
+  ): void {
+    const line = `[muster][lifecycle] ${JSON.stringify({
+      event,
+      at: nowIso(this.clock),
+      workspaceId: this.workspaceId,
+      ...details,
+    })}`;
+    if (level === 'error') console.error(line);
+    else console.info(line);
+  }
+
   /** Flush pending assistant/reasoning for one task before focus teardown. */
   async flushPendingTranscriptForTask(taskId: string): Promise<void> {
     await this.requireSuccessfulFlushes(await this.streamBatcher.flushTask(taskId));
@@ -640,7 +672,6 @@ export class TaskEngine {
     }
     if (this.shuttingDown) return;
     this.shuttingDown = true;
-    this.wakeWorkflowRunWaiters();
     if (this.workflowDeadlineTimer !== undefined) {
       clearInterval(this.workflowDeadlineTimer);
       this.workflowDeadlineTimer = undefined;
@@ -662,6 +693,7 @@ export class TaskEngine {
         new Promise<void>((resolve) => setTimeout(resolve, 5_000)),
       ]);
     }
+    await this.workflowStartContinuationResolvePromise?.catch(() => undefined);
     try {
       await this.flushAllPendingTranscript();
     } catch (error) {
@@ -683,7 +715,6 @@ export class TaskEngine {
     // Latch first so every subsequent path sees terminal immediately.
     this.storageTerminal = true;
     this.shuttingDown = true;
-    this.wakeWorkflowRunWaiters();
     if (this.workflowDeadlineTimer !== undefined) {
       clearInterval(this.workflowDeadlineTimer);
       this.workflowDeadlineTimer = undefined;
@@ -938,7 +969,7 @@ export class TaskEngine {
       leaseOwnerAlive: (turnId) => this.runtimeClaimAlive(turnId),
       ownsLease: (turnId) => this.ownsRuntimeClaim(turnId),
       runtimeOwnerId: this.runtimeOwnerId,
-      writeCancelRequest: (turnId, kind, by, opId, sealedBy) => {
+      writeCancelRequest: (turnId, kind, by, opId, lifecycleAuthority) => {
         void this.repository.execute({
           kind: 'putCancelRequest',
           workspaceId: this.workspaceId,
@@ -948,60 +979,106 @@ export class TaskEngine {
             by,
             opId,
             at: nowIso(this.clock),
-            ...(sealedBy ? { sealedBy } : {}),
+            ...(lifecycleAuthority ? { lifecycleAuthority } : {}),
           },
         }).catch(() => undefined);
       },
-      waitForWorkflowRun: (input) => this.waitForWorkflowRun(input),
+      onWorkflowStartAccepted: (input) => {
+        const handle = this.liveRuns.get(input.callerTurnId);
+        if (!handle) return;
+        if (
+          handle.workflowStartSuspension &&
+          handle.workflowStartSuspension.runId !== input.runId
+        ) {
+          return;
+        }
+        handle.workflowStartSuspension = {
+          runId: input.runId,
+          toolCompleted: false,
+        };
+        this.logLifecycle('workflow.start.accepted', {
+          runId: input.runId,
+          callerTaskId: input.callerTaskId,
+          callerTurnId: input.callerTurnId,
+        });
+      },
+      onWorkflowRouteAccepted: (input) => {
+        const handle = this.liveRuns.get(input.callerTurnId);
+        if (!handle) return;
+        const disposition = this.store.getFile().turns[input.callerTurnId]?.disposition;
+        const committedMessage = disposition?.kind === 'workflow_next'
+          ? disposition.result
+          : disposition?.kind === 'workflow_prev'
+            ? disposition.note
+            : undefined;
+        handle.workflowRouteSuspension = {
+          kind: input.kind,
+          message: committedMessage ?? input.message,
+          toolCompleted: false,
+        };
+      },
     };
   }
 
-  private wakeWorkflowRunWaiters(): void {
-    const waiters = [...this.workflowRunWaiters];
-    this.workflowRunWaiters.clear();
-    for (const wake of waiters) wake();
-  }
-
   private onRepositoryCommit(ctx: RepositoryCommitContext): void {
-    if (isWorkflowTransactionalCommand(ctx.command)) this.wakeWorkflowRunWaiters();
+    if (ctx.result.affectedTaskIds?.length) {
+      this.rescanSchedulableTurns(ctx.result.affectedTaskIds);
+    }
+    if (
+      isWorkflowTransactionalCommand(ctx.command) &&
+      ctx.command.kind !== 'resolveWorkflowStartContinuation'
+    ) {
+      this.scheduleWorkflowStartContinuationResolution();
+    }
   }
 
-  private async waitForWorkflowRun(input: {
-    runId: string;
-    ownerRootTaskId: string;
-    callerTurnId: string;
-  }): Promise<
-    | { ok: true; completion: WorkflowRunCompletionProjection }
-    | { ok: false; error: string }
-  > {
-    while (true) {
-      let wake!: () => void;
-      const notified = new Promise<void>((resolve) => {
-        wake = resolve;
+  private scheduleWorkflowStartContinuationResolution(): void {
+    if (this.shuttingDown || this.storageTerminal) return;
+    this.workflowStartContinuationResolveRequested = true;
+    if (this.workflowStartContinuationResolveScheduled || this.workflowStartContinuationResolvePromise) return;
+    this.workflowStartContinuationResolveScheduled = true;
+    queueMicrotask(() => {
+      this.workflowStartContinuationResolveScheduled = false;
+      if (this.shuttingDown || this.storageTerminal) return;
+      this.workflowStartContinuationResolveRequested = false;
+      const pending = this.resolveWorkflowStartContinuations();
+      this.workflowStartContinuationResolvePromise = pending;
+      void pending.finally(() => {
+        if (this.workflowStartContinuationResolvePromise === pending) {
+          this.workflowStartContinuationResolvePromise = undefined;
+        }
+        if (this.workflowStartContinuationResolveRequested) {
+          this.scheduleWorkflowStartContinuationResolution();
+        }
       });
-      this.workflowRunWaiters.add(wake);
-      try {
-        const completion = await this.repository.getWorkflowRunCompletion(
-          input.runId,
-          input.ownerRootTaskId,
-        );
-        if (!completion) return { ok: false, error: 'workflow run not found' };
-        if (completion.runStatus !== 'running') return { ok: true, completion };
-        const callerTurn = await this.repository.getTurn(input.callerTurnId);
-        if (
-          !callerTurn ||
-          (callerTurn.status !== 'running' && callerTurn.status !== 'waiting_user')
-        ) {
-          return { ok: false, error: 'start_workflow interrupted: caller turn is no longer live' };
+    });
+  }
+
+  private async resolveWorkflowStartContinuations(): Promise<void> {
+    if (this.storageTerminal) return;
+    try {
+      for (let index = 0; index < 256; index += 1) {
+        const resolved = await this.repository.execute({
+          kind: 'resolveWorkflowStartContinuation',
+          workspaceId: this.workspaceId,
+          now: nowIso(this.clock),
+        });
+        if (!resolved.changed) return;
+        if (resolved.turnId) {
+          const resume = this.store.getFile().turns[resolved.turnId];
+          this.logLifecycle('workflow.resume.queued', {
+            runId: resume?.workflowResume?.runId ?? null,
+            callerTaskId: resume?.taskId ?? null,
+            resumeTurnId: resolved.turnId,
+          });
+          this.scheduleWorkflowResumeTurn(resolved.turnId);
         }
-        if (this.storageTerminal) return { ok: false, error: 'storage terminal' };
-        if (this.shuttingDown) {
-          return { ok: false, error: 'start_workflow interrupted: engine shutting down' };
-        }
-        await notified;
-      } finally {
-        this.workflowRunWaiters.delete(wake);
       }
+      this.scheduleWorkflowStartContinuationResolution();
+    } catch (error) {
+      this.logLifecycle('workflow.resume.resolve_failed', {
+        error: error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300),
+      }, 'error');
     }
   }
 
@@ -1222,39 +1299,6 @@ export class TaskEngine {
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
     }
     const kind = command.kind;
-    if (
-      kind === 'create_task' ||
-      kind === 'delegate_task' ||
-      kind === 'create_tasks' ||
-      kind === 'delegate_tasks' ||
-      kind === 'release_tasks' ||
-      kind === 'complete_task' ||
-      kind === 'fail_task'
-    ) {
-      console.info('[muster][task-orch] tool.call', {
-        kind,
-        callerTaskId: ctx.callerTaskId,
-        turnId: ctx.turnId,
-        opId: 'opId' in command ? command.opId : undefined,
-        ...(kind === 'create_task' || kind === 'delegate_task'
-          ? {
-              goal: command.spec.goal.slice(0, 120),
-              backend: command.spec.backend,
-              model: command.spec.model ?? null,
-              role: command.spec.role ?? null,
-            }
-          : {}),
-        ...(kind === 'create_tasks' || kind === 'delegate_tasks'
-          ? {
-              count: command.specs.length,
-              localIds: command.specs.map((s) => s.localId).slice(0, BATCH_EXPAND_MAX),
-            }
-          : {}),
-        ...(kind === 'release_tasks'
-          ? { taskIds: command.taskIds, includeDependencies: command.includeDependencies ?? false }
-          : {}),
-      });
-    }
     const result = await executeToolCommand(
       this.graphDeps(),
       {
@@ -1266,17 +1310,20 @@ export class TaskEngine {
       command,
     );
     if (
-      kind === 'create_task' ||
-      kind === 'delegate_task' ||
-      kind === 'release_tasks' ||
-      kind === 'complete_task' ||
-      kind === 'fail_task'
+      kind === 'define_workflow' ||
+      kind === 'start_workflow' ||
+      kind === 'workflow_next' ||
+      kind === 'workflow_prev' ||
+      kind === 'workflow_fail' ||
+      kind === 'invoke_child_workflow'
     ) {
-      if (result.ok) {
-        console.info('[muster][task-orch] tool.ok', { kind, result: result.result });
-      } else {
-        console.info('[muster][task-orch] tool.err', { kind, error: result.error });
-      }
+      this.logLifecycle('workflow.tool.completed', {
+        tool: kind,
+        callerTaskId: ctx.callerTaskId,
+        turnId: ctx.turnId,
+        outcome: result.ok ? 'ok' : 'error',
+        ...(result.ok ? {} : { error: result.error.slice(0, 300) }),
+      }, result.ok ? 'info' : 'error');
     }
     return result;
   }
@@ -1288,6 +1335,14 @@ export class TaskEngine {
       workspaceId: config.workspaceId,
       now: nowIso(config.clock),
     });
+    for (let index = 0; index < 256; index += 1) {
+      const resolved = await config.repository.execute({
+        kind: 'resolveWorkflowStartContinuation',
+        workspaceId: config.workspaceId,
+        now: nowIso(config.clock),
+      });
+      if (!resolved.changed) break;
+    }
     const projection = await RepositoryProjection.load(config.repository, config.workspaceId);
     let engine: TaskEngine | undefined;
     const repository = withRepositoryProjection(config.repository, projection, {
@@ -1311,7 +1366,9 @@ export class TaskEngine {
         workspaceId: this.workspaceId,
         now: nowIso(this.clock),
       }).catch((error) => {
-        console.error('[muster][task-orch] workflow deadline reaper failed', error);
+        this.logLifecycle('workflow.deadline_reaper.failed', {
+          error: error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300),
+        }, 'error');
       }).finally(() => {
         this.workflowDeadlineReapRunning = false;
       });
@@ -1419,7 +1476,7 @@ export class TaskEngine {
       goal: params.goal,
       continuationOf: params.continuationOf,
       parentId: null,
-      dependencies: [],
+      prerequisites: [],
       backend: params.backend,
       model: params.model,
       cwd: params.cwd,
@@ -1446,12 +1503,12 @@ export class TaskEngine {
       },
     };
 
-    // Root creation has no dependencies, so it never needs a materialized graph
+    // Root creation has no prerequisites, so it never needs a materialized graph
     // snapshot. Keep this intentionally tiny graph contract rather than reaching
     // into EngineProjection for a callback mutation.
     const created = createTask(input, {
       rootId: taskId,
-      graph: { rootOf: () => undefined, dependsOn: () => [] },
+      graph: { rootOf: () => undefined, prerequisitesOf: () => [] },
       now,
     });
     if (!created.ok) return created;
@@ -1954,7 +2011,7 @@ export class TaskEngine {
           : {}),
       });
       if (switched.ok) {
-        console.info('[muster][task-orch] runtime.fallback', {
+        this.logLifecycle('turn.runtime_fallback', {
           taskId: input.task.id,
           failedTurnId: input.failedTurn.id,
           sourceBackend: input.task.backend,
@@ -2104,7 +2161,7 @@ export class TaskEngine {
    * Hard upper bound for queued follow-up message content (edit path).
    * Host boundary may apply a tighter limit; this protects the engine store.
    */
-  static readonly MAX_QUEUED_MESSAGE_CHARS = 100_000;
+  static readonly MAX_QUEUED_MESSAGE_CHARS = TASK_MESSAGE_MAX_CHARS;
 
   async editQueuedTurnAsync(
     taskId: string,
@@ -2371,7 +2428,7 @@ export class TaskEngine {
     const remoteOwned = !!liveClaim && liveClaim.ownerId !== this.runtimeOwnerId && Date.parse(liveClaim.expiresAt) > Date.parse(nowIso(this.clock));
     const now = nowIso(this.clock);
     const transitioned = transitionSetTaskLifecycle(task, lifecycle, {
-      now, result: options?.result, error: options?.error, sealedBy: { kind: 'user' },
+      now, result: options?.result, error: options?.error, lifecycleAuthority: { kind: 'user' },
     });
     if (!transitioned.ok) return transitioned;
     const changedTurns: TaskTurn[] = [];
@@ -2437,7 +2494,7 @@ export class TaskEngine {
         if (currentLive && remoteLiveTurnIds.has(currentLive.id)) {
           cancelRequests.push({ turnId: currentLive.id, request: { kind: 'interrupt', by: 'engine', opId: `skip-task-${taskId}`, at: now } });
         }
-        const result = transitionSetTaskLifecycle(task, 'skipped', { now, sealedBy: { kind: 'user' } });
+        const result = transitionSetTaskLifecycle(task, 'skipped', { now, lifecycleAuthority: { kind: 'user' } });
         if (!result.ok) return result;
         draft.tasks[id] = result.next;
         for (const pending of pendingTurns) {
@@ -2452,7 +2509,7 @@ export class TaskEngine {
           draft.tasks[id] = clearPendingParentQuestionOnCancel(draft, task, now);
           continue;
         }
-        const result = transitionCancelTask(task, { liveTurn: currentLive, now, sealedBy: { kind: 'user' } });
+        const result = transitionCancelTask(task, { liveTurn: currentLive, now, lifecycleAuthority: { kind: 'user' } });
         if (!result.ok) return result;
         draft.tasks[id] = clearPendingParentQuestionOnCancel(draft, result.next.task, now);
         if (result.next.turn) draft.turns[result.next.turn.id] = result.next.turn;
@@ -2543,6 +2600,38 @@ export class TaskEngine {
       if (prepared.remoteLiveTurnIds.has(turnId)) continue;
       this.liveRuns.get(turnId)?.controller.abort();
       this.askBridge.cancelForTurn(turnId, 'task cancelled'); this.dropElicitationWaits(turnId); this.credentialRegistry?.revoke(turnId);
+    }
+    this.rescanSchedulableTurns();
+    return { ok: true, value: undefined };
+  }
+
+  async deleteTaskSubtreeAsync(taskId: string): Promise<EngineResult<void>> {
+    const tasks = await this.repository.listSubtree(taskId);
+    if (tasks.length === 0) return { ok: false, reason: 'task not found' };
+    const turns = await this.repository.listTurnsForTasks(tasks.map((task) => task.id));
+    const write = await this.repository.execute({
+      kind: 'deleteTaskSubtree',
+      workspaceId: this.workspaceId,
+      rootTaskId: taskId,
+    });
+    if (!write.changed) return { ok: false, reason: write.reason ?? 'task not found' };
+
+    for (const turn of turns) {
+      this.deferredQueuedTurns.delete(turn.id);
+      const handle = this.liveRuns.get(turn.id);
+      if (handle?.cancelPoll !== undefined) {
+        clearInterval(handle.cancelPoll);
+        handle.cancelPoll = undefined;
+      }
+      if (handle?.turnTimer !== undefined) {
+        clearTimeout(handle.turnTimer);
+        handle.turnTimer = undefined;
+      }
+      handle?.controller.abort();
+      this.askBridge.cancelForTurn(turn.id, 'task deleted');
+      this.dropElicitationWaits(turn.id);
+      this.credentialRegistry?.revoke(turn.id);
+      this.streamBatcher.disposeTurn(turn.id);
     }
     this.rescanSchedulableTurns();
     return { ok: true, value: undefined };
@@ -2792,11 +2881,11 @@ export class TaskEngine {
   }
 
   /**
-   * Host policy for dependency `onUnsatisfied: fail|skip` — not CLI-driven.
-   * Seals dependents when a required dependency finished unsuccessfully.
-   * `onUnsatisfied: block` remains open + blocked; publish wakeable attention (P0 ISSUE-6).
+   * Host policy for prerequisite `onUnmet: fail|skip` — not CLI-driven.
+   * Seals consumers when a required prerequisite finished unsuccessfully.
+   * `onUnmet: block` remains open + blocked; publish wakeable attention (P0 ISSUE-6).
    */
-  private async applyDependencyTerminals(): Promise<void> {
+  private async applyPrerequisiteTerminals(): Promise<void> {
     if (this.storageTerminal) return;
     const now = nowIso(this.clock);
     const before = this.store.getFile();
@@ -2804,19 +2893,19 @@ export class TaskEngine {
     for (const task of Object.values(before.tasks)) {
       const current = draft.tasks[task.id];
       if (!current || isTerminalLifecycle(current.lifecycle)) continue;
-      const outcome = dependencyTerminalOutcome(draft, task.id);
+      const outcome = prerequisiteTerminalLifecycle(draft, task.id);
       if (!outcome) {
         if (
           current.releaseState === 'released' && current.lifecycle === 'open' &&
-          current.dependencies.some((dep) => {
-            if (dep.onUnsatisfied !== 'block') return false;
-            const depTask = draft.tasks[dep.taskId];
-            return !!depTask && isTerminalLifecycle(depTask.lifecycle) && depTask.lifecycle !== 'succeeded';
-          }) && current.attention?.code !== 'dependency_unsatisfied'
+          current.prerequisites.some((prerequisite) => {
+            if (prerequisite.onUnmet !== 'block') return false;
+            const producer = draft.tasks[prerequisite.producerTaskId];
+            return !!producer && isTerminalLifecycle(producer.lifecycle) && producer.lifecycle !== 'succeeded';
+          }) && current.attention?.code !== 'prerequisite_blocked'
         ) {
           draft.tasks[task.id] = {
             ...current,
-            attention: { code: 'dependency_unsatisfied', message: 'required dependency finished unsuccessfully (block policy)', at: now },
+            attention: { code: 'prerequisite_blocked', message: 'required prerequisite finished unsuccessfully (block policy)', at: now },
             revision: current.revision + 1, updatedAt: now,
           };
         }
@@ -2824,9 +2913,10 @@ export class TaskEngine {
       }
       const live = Object.values(draft.turns).find((candidate) => candidate.taskId === task.id &&
         (candidate.status === 'queued' || candidate.status === 'running' || candidate.status === 'waiting_user'));
-      const terminal = applyDependencyTerminal(current, live, outcome, {
-        now, error: outcome === 'failed' ? 'dependency unsatisfied' : undefined,
-        sealedBy: { kind: 'coordinator', taskId: current.parentId ?? current.id, mode: 'dependency_policy' },
+      if (!current.parentId) continue;
+      const terminal = applyPrerequisiteTerminal(current, live, outcome, {
+        now, error: outcome === 'failed' ? 'prerequisite unmet' : undefined,
+        lifecycleAuthority: { kind: 'parent', parentTaskId: current.parentId },
       });
       if (terminal.ok) {
         draft.tasks[task.id] = terminal.next.task;
@@ -2840,23 +2930,23 @@ export class TaskEngine {
     }));
     if (mutations.length > 0) {
       await this.repository.execute({
-        kind: 'applyDependencyTerminals', workspaceId: this.workspaceId,
+        kind: 'applyPrerequisiteTerminals', workspaceId: this.workspaceId,
         expectedTasks: mutations.map((mutation) => ({ id: mutation.taskId, revision: before.tasks[mutation.taskId]!.revision })),
         mutations,
       });
     }
-    // Do not call reconcileChildWaits here: scheduleTurn → applyDependencyTerminals
+    // Do not call reconcileChildWaits here: scheduleTurn → applyPrerequisiteTerminals
     // would recurse. Parents wake on the next settle/afterTurnSettled path.
   }
 
   /**
-   * Bounded verify-remediation (verify-gate-loop Phase B/C) — opt-in, per-dependency.
+   * Bounded verify-remediation (verify-gate-loop Phase B/C) — opt-in, per-prerequisite.
    *
-   * Runs in the same engine tick as {@link applyDependencyTerminals}, inside its own
+   * Runs in the same engine tick as {@link applyPrerequisiteTerminals}, inside its own
    * commit. Two triggers, both bounded by the SAME remediation budget so the loop
    * ALWAYS terminates (never a permanent block):
    *
-   *  1. A `requiredVerdict:'pass'` + `onUnsatisfied:'block'` gate whose producer settled
+   *  1. A `requiredVerdict:'pass'` + `onUnmet:'block'` gate whose producer settled
    *     with a non-pass verdict. If the producer has a PRESENT fail/inconclusive verdict
    *     → create ONE bounded fix task (re-point the gate to the fix, bind the failing
    *     verdict as an untrusted `verify_failure` input). If the producer is terminal with
@@ -2877,7 +2967,7 @@ export class TaskEngine {
     const before = this.store.getFile();
     const draft = cloneEngineProjection(before);
     const mutate = (): void => {
-      const graph = depGraphFromFile(draft);
+      const graph = prerequisiteGraphFromFile(draft);
 
       // Seal a blocked task `failed` — an honest terminal, never a hang — attaching a
       // verdict attention and cancelling any pending turn on it.
@@ -2892,13 +2982,13 @@ export class TaskEngine {
             t.taskId === blocked.id &&
             (t.status === 'queued' || t.status === 'running' || t.status === 'waiting_user'),
         );
-        const sealed = applyDependencyTerminal(blocked, live, 'failed', {
+        if (!blocked.parentId) return;
+        const sealed = applyPrerequisiteTerminal(blocked, live, 'failed', {
           now,
           error,
-          sealedBy: {
-            kind: 'coordinator',
-            taskId: blocked.parentId ?? blocked.id,
-            mode: 'dependency_policy',
+          lifecycleAuthority: {
+            kind: 'parent',
+            parentTaskId: blocked.parentId,
           },
         });
         if (sealed.ok) {
@@ -2956,8 +3046,8 @@ export class TaskEngine {
           brief: { kind: upstream.brief?.kind ?? 'implement' },
           writePaths: upstream.brief?.writePaths,
         });
-        // The verdict binding also implies a succeeded/block dependency on the verify
-        // task (already terminal-succeeded → immediately satisfied), matching the
+        // The verdict binding also implies a succeeded/block prerequisite on the verify
+        // task (already terminal-succeeded → immediately met), matching the
         // create_tasks binding wiring.
         const bindings: TaskInputBinding[] = [
           { fromTaskId: verify.id, output: 'verdict', as: 'verify_failure' },
@@ -2967,8 +3057,8 @@ export class TaskEngine {
           role: 'worker',
           goal,
           parentId: upstream.parentId,
-          dependencies: [
-            { taskId: verify.id, requiredOutcome: 'succeeded', onUnsatisfied: 'block' },
+          prerequisites: [
+            { producerTaskId: verify.id, requiredLifecycle: 'succeeded', onUnmet: 'block' },
           ],
           backend: upstream.backend,
           model: upstream.model,
@@ -2981,7 +3071,7 @@ export class TaskEngine {
           inputBindings: bindings,
           ...(upstream.claimsGit !== undefined ? { claimsGit: upstream.claimsGit } : {}),
         };
-        // skipVerifyAutoGate: the fix DEPENDS on the failed verify task (to run after it)
+        // skipVerifyAutoGate: the fix requires the failed verify task to finish first
         // but must NOT require its verdict to pass — that would deadlock the fix and break
         // the loop-termination invariant. The gate re-point below is a direct mutation
         // (not a createTask), so it is likewise never auto-gated.
@@ -3046,15 +3136,15 @@ export class TaskEngine {
         // task to succeed (drop requiredVerdict). Bump the bounded budget + record the
         // failure signature and fix id so an identical recurrence pauses and a failed
         // fix re-enters the SAME budget (ISSUE 3).
-        const nextDeps = blocked.dependencies.slice();
-        nextDeps[depIndex] = {
-          taskId: remediationId,
-          requiredOutcome: 'succeeded',
-          onUnsatisfied: 'block',
+        const nextPrerequisites = blocked.prerequisites.slice();
+        nextPrerequisites[depIndex] = {
+          producerTaskId: remediationId,
+          requiredLifecycle: 'succeeded',
+          onUnmet: 'block',
         };
         draft.tasks[blocked.id] = {
           ...blocked,
-          dependencies: nextDeps,
+          prerequisites: nextPrerequisites,
           remediation: { uses: uses + 1, lastFailureSig: sig, fixTaskId: remediationId },
           revision: blocked.revision + 1,
           updatedAt: now,
@@ -3066,17 +3156,18 @@ export class TaskEngine {
         if (blocked.lifecycle !== 'open') continue;
 
         // ── ISSUE 3 trigger: a previously-created fix task has ITSELF terminally failed.
-        // The gate (onUnsatisfied:'block' on the failed fix) would hang forever, so
+        // The gate (`onUnmet:'block'` on the failed fix) would hang forever, so
         // re-enter the SAME bounded budget: retry within budget or seal `failed`.
         const fixTaskId = blocked.remediation?.fixTaskId;
         if (fixTaskId) {
           const fix = draft.tasks[fixTaskId];
-          const fixDepIndex = blocked.dependencies.findIndex(
-            (d) => d.taskId === fixTaskId && d.onUnsatisfied === 'block',
+          const fixPrerequisiteIndex = blocked.prerequisites.findIndex(
+            (prerequisite) =>
+              prerequisite.producerTaskId === fixTaskId && prerequisite.onUnmet === 'block',
           );
           if (
             fix &&
-            fixDepIndex >= 0 &&
+            fixPrerequisiteIndex >= 0 &&
             isTerminalLifecycle(fix.lifecycle) &&
             fix.lifecycle !== 'succeeded'
           ) {
@@ -3119,26 +3210,26 @@ export class TaskEngine {
               );
               continue;
             }
-            stageFix(blocked, fix, verify, fixDepIndex, uses, sig);
+            stageFix(blocked, fix, verify, fixPrerequisiteIndex, uses, sig);
             continue;
           }
         }
 
         // ── Phase A opt-in verdict-block gate on a settled, non-pass producer. Every
-        // other dependency shape is left untouched (Phase A already seals fail/skip;
+        // other prerequisite shape is left untouched (Phase A already seals fail/skip;
         // plain blocks wait via the scheduler).
-        const depIndex = blocked.dependencies.findIndex((dep) => {
-          if (dep.requiredVerdict !== 'pass' || dep.onUnsatisfied !== 'block') return false;
-          const producer = draft.tasks[dep.taskId];
+        const prerequisiteIndex = blocked.prerequisites.findIndex((prerequisite) => {
+          if (prerequisite.requiredVerdict !== 'pass' || prerequisite.onUnmet !== 'block') return false;
+          const producer = draft.tasks[prerequisite.producerTaskId];
           if (!producer || !isTerminalLifecycle(producer.lifecycle)) return false;
           return producer.taskResult?.verdict?.status !== 'pass';
         });
-        if (depIndex < 0) continue;
-        const dep = blocked.dependencies[depIndex];
-        const verify = draft.tasks[dep.taskId]!;
+        if (prerequisiteIndex < 0) continue;
+        const prerequisite = blocked.prerequisites[prerequisiteIndex];
+        const verify = draft.tasks[prerequisite.producerTaskId]!;
 
         // ── ISSUE 12: a remediation fix binds the producer's `verdict` output, which
-        // auto-wires a `requiredOutcome:'succeeded'` dependency on that producer. That is
+        // auto-wires a `requiredLifecycle:'succeeded'` prerequisite on that producer. That is
         // only satisfiable when the verify task itself SUCCEEDED. A producer that is
         // terminal but NOT succeeded (failed/cancelled/skipped) would yield an
         // un-promotable fix that could never run, so SEAL the blocked task `failed`
@@ -3215,7 +3306,7 @@ export class TaskEngine {
           continue;
         }
 
-        stageFix(blocked, upstream, verify, depIndex, uses, sig);
+        stageFix(blocked, upstream, verify, prerequisiteIndex, uses, sig);
       }
       return;
     };
@@ -3321,14 +3412,14 @@ export class TaskEngine {
    * Drift invalidation (verify-gate-loop Phase C). A host verdict is bound to the
    * source revision it was produced against; if the working tree has since moved
    * (new commit or dirty edit) the stored `pass` is stale and is downgraded to
-   * `inconclusive`, which re-blocks any `requiredVerdict:'pass'` dependent.
+   * `inconclusive`, which re-blocks any `requiredVerdict:'pass'` consumer.
    *
    * CRITICAL: git is invoked ONCE per cwd, outside the persistence transaction (it blocks for the
    * whole subprocess). Cheap pre-scan first — if no producer carries a `source:'host'`
    * passing verdict, this is a strict no-op and git is NEVER shelled, so a graph with
    * no host verdicts keeps today's behavior and perf. Runs before
-   * {@link applyDependencyTerminals} in the tick so a re-blocked `onUnsatisfied:'fail'`
-   * dependent still seals in the same pass.
+   * {@link applyPrerequisiteTerminals} in the tick so a re-blocked `onUnmet:'fail'`
+   * consumer still seals in the same pass.
    */
   private async revalidateVerdicts(): Promise<void> {
     // ISSUE 2 — never shell git on an untrusted workspace. Skip the drift probe when
@@ -3410,13 +3501,22 @@ export class TaskEngine {
       kind: 'deleteOperationsForTurn', workspaceId: this.workspaceId, turnId,
     });
     if (this.storageTerminal) return;
-    // Apply dependency terminals before child waits so block-policy sinks get
+    // Apply prerequisite terminals before child waits so block-policy sinks get
     // attention and parents wake without waiting for an unrelated rescan.
-    await this.applyDependencyTerminals();
+    await this.applyPrerequisiteTerminals();
     if (this.storageTerminal) return;
     await this.reconcileChildWaits();
     if (this.storageTerminal) return;
     await this.drainPendingSendsAfterSettlement(turnId);
+    if (this.storageTerminal) return;
+    const settledTurn = await this.repository.getTurn(turnId);
+    if (settledTurn?.status !== 'succeeded') return;
+    const queued = await this.repository.listQueuedTurns(settledTurn.taskId);
+    for (const turn of queued) {
+      if (turn.workflowResume?.kind === 'start_workflow') {
+        this.scheduleWorkflowResumeTurn(turn.id);
+      }
+    }
   }
 
   /**
@@ -3500,7 +3600,7 @@ export class TaskEngine {
 
   /**
    * W5: re-evaluate queued released turns after readiness-changing commits
-   * (release, lifecycle seal, dependency terminal, settle, trust grant).
+   * (release, lifecycle seal, prerequisite terminal, settle, trust grant).
    */
   private rescanSchedulableTurns(affectedTaskIds?: readonly string[]): void {
     if (this.shuttingDown || this.storageTerminal) return;
@@ -3545,7 +3645,7 @@ export class TaskEngine {
         .filter((turn) => turn.status === 'queued')
         .sort((a, b) => a.sequence - b.sequence || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
       if (this.storageTerminal) return;
-      await this.applyDependencyTerminals();
+      await this.applyPrerequisiteTerminals();
       if (this.storageTerminal) return;
       for (const queuedTurn of queued) {
         if (this.deferredQueuedTurns.has(queuedTurn.id)) continue;
@@ -3560,13 +3660,31 @@ export class TaskEngine {
     return promise;
   }
 
+  private scheduleWorkflowResumeTurn(turnId: string): void {
+    const existing = this.turnPromises.get(turnId);
+    if (!existing) {
+      void this.scheduleTurn(turnId);
+      return;
+    }
+    const retry = (): void => {
+      if (
+        !this.shuttingDown &&
+        !this.storageTerminal &&
+        this.store.getFile().turns[turnId]?.status === 'queued'
+      ) {
+        void this.scheduleTurn(turnId);
+      }
+    };
+    void existing.then(retry, retry);
+  }
+
   private async runScheduledTurn(turnId: string): Promise<void> {
     if (this.storageTerminal) return;
     // Phase C: downgrade stale host verdicts (git-guarded, no-op without host
-    // verdicts) BEFORE sealing so a re-blocked fail/skip dependent seals this tick.
+    // verdicts) BEFORE sealing so a re-blocked fail/skip consumer seals this tick.
     await this.revalidateVerdicts();
     if (this.storageTerminal) return;
-    await this.applyDependencyTerminals();
+    await this.applyPrerequisiteTerminals();
     if (this.storageTerminal) return;
     await this.applyVerdictRemediation();
     if (this.storageTerminal) return;
@@ -3579,7 +3697,8 @@ export class TaskEngine {
     if (turn && (await this.exceedsTurnLimit(turn.taskId, turnId))) {
       return;
     }
-    if (!canPromoteTurn(this.store.getFile(), turnId, this.getResourceLimits()).ok) {
+    const promotionCheck = canPromoteTurn(this.store.getFile(), turnId, this.getResourceLimits());
+    if (!promotionCheck.ok) {
       // Persist missing_input attention when readiness blocks pin (W1/W5).
       const file = this.store.getFile();
       const t = file.turns[turnId];
@@ -3804,7 +3923,7 @@ export class TaskEngine {
   }
 
   /** Load only the aggregate rows needed to prepare/settle one task. Related
-   * task DTOs are limited to ancestors, dependencies, input producers and child
+   * task DTOs are limited to ancestors, prerequisites, input producers and child
    * result references; transcript rows are loaded only for the target task. */
   private async loadTaskAggregate(taskId: string): Promise<EngineProjection | undefined> {
     const task = await this.repository.getTask(taskId);
@@ -3812,7 +3931,7 @@ export class TaskEngine {
     const tasks = new Map<string, MusterTask>([[task.id, task]]);
     const turns = [...await this.repository.listTurns(task.id)];
     const relatedIds = new Set<string>();
-    for (const dependency of task.dependencies) relatedIds.add(dependency.taskId);
+    for (const prerequisite of task.prerequisites) relatedIds.add(prerequisite.producerTaskId);
     for (const binding of task.inputBindings ?? []) relatedIds.add(binding.fromTaskId);
     for (const turn of turns) {
       for (const input of turn.inputs) {
@@ -3989,7 +4108,8 @@ export class TaskEngine {
     // reclaimed by expiry.
     const initialExpiry = new Date(Date.now() + DEFAULT_RUN_LIMIT_MS + LEASE_CLEANUP_BUFFER_MS).toISOString();
     try {
-      if (!(await this.claimRuntimeTurn(turnId, initialExpiry))) {
+      const claimed = await this.claimRuntimeTurn(turnId, initialExpiry);
+      if (!claimed) {
         // Domain contention: another host owns the claim. Not a storage fault.
         return;
       }
@@ -4133,7 +4253,7 @@ export class TaskEngine {
           termination: { kind: 'run_timeout', limitMs, deadlineAt },
         })).catch(() => undefined);
         if (this.storageTerminal || this.shuttingDown) return;
-        console.info('[muster][task-orch] turn.settle.timeout', {
+        this.logLifecycle('turn.timeout', {
           taskId: taskForDispatch.id,
           turnId,
           backend: taskForDispatch.backend,
@@ -4154,6 +4274,7 @@ export class TaskEngine {
     let rawOutput = '';
     let observedSessionId: string | undefined;
     let terminalSettled = false;
+    let workflowRouteSettled = false;
     let streamFailureStarted = false;
     let streamFailureMessage: string | undefined;
     let streamFailurePromise: Promise<void> | undefined;
@@ -4264,7 +4385,7 @@ export class TaskEngine {
       createdAt: string;
       order: number;
     } | undefined;
-    let currentReasoning: PersistedReasoning | undefined;
+    let currentReasoning: (PersistedReasoning & { sourceMessageId: string }) | undefined;
     const streamedTools = new Map<string, PersistedToolCall>();
     let mcpConfigPath: string | undefined;
 
@@ -4293,16 +4414,18 @@ export class TaskEngine {
       const currentTurn = current.turns[turnId];
       const messages = messageMapFromFile(current);
       const prompt = projectPrompt(currentTurn, messages, current, this.getResourceLimits().maxResultBytes);
-      console.info('[muster][task-orch] turn.run', {
+      this.logLifecycle('turn.started', {
         taskId: taskForDispatch.id,
         turnId,
-        parentId: taskForDispatch.parentId,
+        taskRole: taskForDispatch.role,
+        parentTaskId: taskForDispatch.parentId,
         backend: taskForDispatch.backend,
         model: taskForDispatch.model ?? null,
-        releaseState: taskForDispatch.releaseState,
-        cwd: taskForDispatch.cwd ?? null,
         trigger: currentTurn?.trigger ?? null,
-        promptChars: prompt.length,
+        workflowRunId:
+          currentTurn?.workflowActivation?.runId ?? currentTurn?.workflowResume?.runId ?? null,
+        workflowPhase:
+          currentTurn?.workflowActivation?.kind ?? currentTurn?.workflowResume?.kind ?? null,
       });
       // MCP-enabled turns: optional readiness supervisor + multi-attempt mcpSetup
       // (M017-S06 / D037). prepareAttempt allocates attemptId + remints credentials;
@@ -4505,6 +4628,21 @@ export class TaskEngine {
             }
             break;
           case 'assistantDelta': {
+            const liveHandle = this.liveRuns.get(turnId);
+            if (
+              liveHandle?.workflowStartSuspension?.toolCompleted === true ||
+              liveHandle?.workflowRouteSuspension?.toolCompleted === true
+            ) {
+              break;
+            }
+            if (currentReasoning) {
+              const flushed = await this.streamBatcher.flushTurn(turnId);
+              if (!flushed.ok) {
+                await markStreamPersistenceFailure(flushed.message);
+                break;
+              }
+              currentReasoning = undefined;
+            }
             // Open a new segment when none is current or the backend messageId
             // changed (mirrors the live reducer). Segment store id = `${turnId}:${order}`.
             const openNew =
@@ -4545,13 +4683,41 @@ export class TaskEngine {
             break;
           }
           case 'reasoningDelta': {
+            if (currentAssistantSegment) {
+              const flushed = await this.streamBatcher.flushTurn(turnId);
+              if (!flushed.ok) {
+                await markStreamPersistenceFailure(flushed.message);
+                break;
+              }
+              currentAssistantSegment = undefined;
+            }
             const at = nowIso(this.clock);
-            currentReasoning = currentReasoning
-              ? { ...currentReasoning, content: currentReasoning.content + event.content, updatedAt: at }
-              : {
-                  id: turnId, taskId: eventTurn.taskId, turnId, content: event.content,
-                  createdAt: at, updatedAt: at,
-                };
+            if (!currentReasoning || currentReasoning.sourceMessageId !== event.messageId) {
+              if (currentReasoning) {
+                const flushed = await this.streamBatcher.flushTurn(turnId);
+                if (!flushed.ok) {
+                  await markStreamPersistenceFailure(flushed.message);
+                  break;
+                }
+              }
+              const order = nextOrder();
+              currentReasoning = {
+                id: `${turnId}:${order}`,
+                taskId: eventTurn.taskId,
+                turnId,
+                order,
+                sourceMessageId: event.messageId,
+                content: event.content,
+                createdAt: at,
+                updatedAt: at,
+              };
+            } else {
+              currentReasoning = {
+                ...currentReasoning,
+                content: currentReasoning.content + event.content,
+                updatedAt: at,
+              };
+            }
             this.streamBatcher.noteReasoning(currentReasoning);
             break;
           }
@@ -4564,6 +4730,7 @@ export class TaskEngine {
             }
             // A tool closes the current assistant segment (matches live commitStreaming).
             currentAssistantSegment = undefined;
+            currentReasoning = undefined;
             const compositeId = `${turnId}:${event.toolCallId}`;
             if (!streamedTools.has(compositeId)) {
               const at = nowIso(this.clock);
@@ -4604,6 +4771,8 @@ export class TaskEngine {
               await markStreamPersistenceFailure(preTool.message);
               break;
             }
+            currentAssistantSegment = undefined;
+            currentReasoning = undefined;
             const compositeId = `${turnId}:${event.toolCallId}`;
             const at = nowIso(this.clock);
             const existing = streamedTools.get(compositeId);
@@ -4642,6 +4811,8 @@ export class TaskEngine {
               await markStreamPersistenceFailure(preTool.message);
               break;
             }
+            currentAssistantSegment = undefined;
+            currentReasoning = undefined;
             const compositeId = `${turnId}:${event.toolCallId}`;
             const outcome = event.outcome;
             const at = nowIso(this.clock);
@@ -4680,6 +4851,55 @@ export class TaskEngine {
               break;
             }
             this.safeEmit({ type: 'event', taskId: turn.taskId, turnId, event });
+            const liveHandle = this.liveRuns.get(turnId);
+            if (
+              outcome === 'success' &&
+              liveHandle?.workflowStartSuspension &&
+              !liveHandle.workflowStartSuspension.toolCompleted &&
+              isStartWorkflowToolCall(nextTool)
+            ) {
+              liveHandle.workflowStartSuspension.toolCompleted = true;
+              const order = nextOrder();
+              currentAssistantSegment = {
+                storeId: `${turnId}:${order}`,
+                sourceMessageId: `${event.toolCallId}:workflow-start-wait`,
+                content: WORKFLOW_START_WAITING_NOTICE,
+                createdAt: at,
+                order,
+              };
+              this.streamBatcher.noteAssistant({
+                ...currentAssistantSegment,
+                taskId: eventTurn.taskId,
+                turnId,
+              });
+              liveHandle.controller.abort();
+            }
+            if (
+              outcome === 'success' &&
+              liveHandle?.workflowRouteSuspension &&
+              !liveHandle.workflowRouteSuspension.toolCompleted
+            ) {
+              const order = nextOrder();
+              currentAssistantSegment = {
+                storeId: `${turnId}:${order}`,
+                sourceMessageId: `${event.toolCallId}:workflow-route-message`,
+                content: liveHandle.workflowRouteSuspension.message,
+                createdAt: at,
+                order,
+              };
+              this.streamBatcher.noteAssistant({
+                ...currentAssistantSegment,
+                taskId: eventTurn.taskId,
+                turnId,
+              });
+              const committed = await this.streamBatcher.flushTurn(turnId);
+              if (!committed.ok) {
+                await markStreamPersistenceFailure(committed.message);
+                break;
+              }
+              liveHandle.workflowRouteSuspension.toolCompleted = true;
+              liveHandle.controller.abort();
+            }
             break;
           }
           case 'raw':
@@ -4697,23 +4917,27 @@ export class TaskEngine {
               rawOutput,
               backend,
             );
-            if (successOutcome === 'ok') {
+            if (successOutcome.status === 'settled') {
               terminalSettled = true;
               this.safeEmit({ type: 'turnDone', taskId: turn.taskId, turnId });
             } else {
               const failMessage =
-                successOutcome === 'missing_session'
+                successOutcome.status === 'missing_session'
                   ? 'target session was not observed after runtime switch'
-                  : 'failed to settle successful turn';
+                  : `successful turn settlement failed: ${successOutcome.reason}`;
               terminalSettled = await this.settleFailed(
                 turnId,
                 failMessage,
                 observedSessionId,
                 rawOutput,
                 backend,
-                successOutcome === 'missing_session'
+                successOutcome.status === 'missing_session'
                   ? { failureClass: 'uncertain' }
-                  : undefined,
+                  : {
+                      terminalReceived: true,
+                      failureClass: 'terminal_received',
+                      suppressAutoRetry: true,
+                    },
               );
               if (terminalSettled) {
                 this.emitFailureSettlement(turn.taskId, turnId, failMessage);
@@ -4728,6 +4952,44 @@ export class TaskEngine {
               break;
             }
             if (event.isCancellation) {
+              const workflowStartSuspended =
+                this.liveRuns.get(turnId)?.workflowStartSuspension?.toolCompleted === true;
+              if (workflowStartSuspended) {
+                terminalSettled = await this.settleWorkflowStartSuspended(
+                  turnId,
+                  observedSessionId,
+                  rawOutput,
+                  backend,
+                );
+                if (!terminalSettled) {
+                  terminalSettled = await this.settleInterrupted(
+                    turnId,
+                    observedSessionId,
+                    rawOutput,
+                    backend,
+                    'confirmed',
+                  );
+                }
+                if (terminalSettled) {
+                  this.safeEmit({ type: 'turnDone', taskId: turn.taskId, turnId });
+                }
+                break;
+              }
+              const workflowRouteSuspended =
+                this.liveRuns.get(turnId)?.workflowRouteSuspension?.toolCompleted === true;
+              if (workflowRouteSuspended) {
+                workflowRouteSettled = (await this.settleSuccess(
+                  turnId,
+                  observedSessionId,
+                  rawOutput,
+                  backend,
+                )).status === 'settled';
+                terminalSettled = workflowRouteSettled;
+                if (terminalSettled) {
+                  this.safeEmit({ type: 'turnDone', taskId: turn.taskId, turnId });
+                }
+                break;
+              }
               const runTimedOut =
                 this.store.getFile().turns[turnId]?.termination?.kind === 'run_timeout';
               // Confirmed only if we armed a local interrupt and adapter did not
@@ -4812,9 +5074,37 @@ export class TaskEngine {
         const streamFailureHandled = await flushBoundaryOrFinishStreamFailure();
         if (!terminalSettled && !streamFailureHandled) {
           const runTimedOut = this.store.getFile().turns[turnId]?.termination?.kind === 'run_timeout';
+          const workflowStartSuspended =
+            this.liveRuns.get(turnId)?.workflowStartSuspension?.toolCompleted === true;
+          const workflowRouteSuspended =
+            this.liveRuns.get(turnId)?.workflowRouteSuspension?.toolCompleted === true;
           // Terminal storage must not settleInterrupted (graceful shutdown may).
           if (this.storageTerminal) {
             // skip durable settlement
+          } else if (workflowStartSuspended) {
+            terminalSettled = await this.settleWorkflowStartSuspended(
+              turnId,
+              observedSessionId,
+              rawOutput,
+              backend,
+            );
+            if (!terminalSettled) {
+              terminalSettled = await this.settleInterrupted(
+                turnId,
+                observedSessionId,
+                rawOutput,
+                backend,
+                'confirmed',
+              );
+            }
+          } else if (workflowRouteSuspended) {
+            workflowRouteSettled = (await this.settleSuccess(
+              turnId,
+              observedSessionId,
+              rawOutput,
+              backend,
+            )).status === 'settled';
+            terminalSettled = workflowRouteSettled;
           } else if (runTimedOut) {
             terminalSettled = await this.settleInterrupted(
               turnId, observedSessionId, rawOutput, backend, 'run_timeout',
@@ -4833,7 +5123,11 @@ export class TaskEngine {
             );
           }
           if (terminalSettled) {
-            this.emitFailureSettlement(turn.taskId, turnId, 'turn ended without terminal event');
+            if (workflowRouteSettled) {
+              this.safeEmit({ type: 'turnDone', taskId: turn.taskId, turnId });
+            } else {
+              this.emitFailureSettlement(turn.taskId, turnId, 'turn ended without terminal event');
+            }
           }
         }
       }
@@ -4843,8 +5137,36 @@ export class TaskEngine {
         if (!terminalSettled && !streamFailureHandled) {
           const message = error instanceof Error ? error.message : String(error);
           const runTimedOut = this.store.getFile().turns[turnId]?.termination?.kind === 'run_timeout';
+          const workflowStartSuspended =
+            this.liveRuns.get(turnId)?.workflowStartSuspension?.toolCompleted === true;
+          const workflowRouteSuspended =
+            this.liveRuns.get(turnId)?.workflowRouteSuspension?.toolCompleted === true;
           if (this.storageTerminal) {
             // skip durable settlement after terminal latch
+          } else if (workflowStartSuspended) {
+            terminalSettled = await this.settleWorkflowStartSuspended(
+              turnId,
+              observedSessionId,
+              rawOutput,
+              backend,
+            );
+            if (!terminalSettled) {
+              terminalSettled = await this.settleInterrupted(
+                turnId,
+                observedSessionId,
+                rawOutput,
+                backend,
+                'confirmed',
+              );
+            }
+          } else if (workflowRouteSuspended) {
+            workflowRouteSettled = (await this.settleSuccess(
+              turnId,
+              observedSessionId,
+              rawOutput,
+              backend,
+            )).status === 'settled';
+            terminalSettled = workflowRouteSettled;
           } else if (runTimedOut) {
             terminalSettled = await this.settleInterrupted(
               turnId, observedSessionId, rawOutput, backend, 'run_timeout',
@@ -4859,7 +5181,11 @@ export class TaskEngine {
             );
           }
           if (terminalSettled) {
-            this.emitFailureSettlement(turn.taskId, turnId, message);
+            if (workflowRouteSettled) {
+              this.safeEmit({ type: 'turnDone', taskId: turn.taskId, turnId });
+            } else {
+              this.emitFailureSettlement(turn.taskId, turnId, message);
+            }
           }
         }
       }
@@ -4911,20 +5237,116 @@ export class TaskEngine {
     }
   }
 
+  private async settleWorkflowStartSuspended(
+    turnId: string,
+    observedSessionId: string | undefined,
+    rawOutput: string,
+    backend: Backend,
+  ): Promise<boolean> {
+    if (this.storageTerminal || this.settling.has(turnId)) return false;
+    this.settling.add(turnId);
+    const now = nowIso(this.clock);
+    try {
+      const source = await this.loadTurnAggregate(turnId);
+      if (!source) return false;
+      const before = cloneEngineProjection(source);
+      const draft = cloneEngineProjection(before);
+      const turn = draft.turns[turnId];
+      const task = turn ? draft.tasks[turn.taskId] : undefined;
+      if (
+        !turn ||
+        !task ||
+        turn.status !== 'running' ||
+        turn.workflowActivation ||
+        turn.disposition ||
+        (turn.runtimeEpoch ?? 1) !== (task.runtimeEpoch ?? 1)
+      ) {
+        return false;
+      }
+
+      const observed = observedSessionId ?? turn.observedSessionId;
+      const sessionId = selectCommittedSessionId(
+        backend,
+        { observedSessionId: observed },
+        rawOutput,
+        task.committedSessionId,
+      );
+      draft.turns[turnId] = {
+        ...turn,
+        status: 'succeeded',
+        observedSessionId: observed,
+        finishedAt: now,
+      };
+
+      let nextTask: MusterTask = {
+        ...task,
+        committedSessionId: sessionId ?? task.committedSessionId,
+      };
+      if (
+        sessionId &&
+        nextTask.handoff?.version === 2 &&
+        nextTask.handoff.continuation.status === 'assigned' &&
+        nextTask.handoff.continuation.turnId === turnId
+      ) {
+        nextTask = {
+          ...nextTask,
+          handoff: {
+            ...nextTask.handoff,
+            continuation: { status: 'consumed', turnId, consumedAt: now },
+          },
+        };
+      }
+      if (nextTask.runtimeRecovery) {
+        nextTask = { ...nextTask };
+        delete nextTask.runtimeRecovery;
+      }
+      draft.tasks[task.id] = nextTask;
+
+      const inputMessageIds = new Set(
+        turn.inputs.flatMap((input) => (input.kind === 'message' ? [input.messageId] : [])),
+      );
+      for (const message of Object.values(draft.messages)) {
+        if (
+          (inputMessageIds.has(message.id) && message.state !== 'complete') ||
+          (message.turnId === turnId &&
+            message.role === 'assistant' &&
+            message.state === 'partial')
+        ) {
+          draft.messages[message.id] = { ...message, state: 'complete' };
+        }
+      }
+
+      const commit = await this.persistSettlementDraft(before, draft, turnId);
+      if (!commit.ok) {
+        this.logLifecycle('workflow.start.suspend_failed', {
+          turnId,
+          reason: commit.reason,
+        }, 'error');
+        return false;
+      }
+      this.logLifecycle('workflow.start.waiting', {
+        turnId,
+        runId: this.liveRuns.get(turnId)?.workflowStartSuspension?.runId ?? null,
+      });
+      return true;
+    } finally {
+      this.settling.delete(turnId);
+    }
+  }
+
   /**
-   * @returns `'ok'` on success settlement, `'missing_session'` when an assigned
-   * handoff turn completed without a bindable target session (caller must route
-   * through settleFailed), or `false` when settlement could not run.
+   * Returns a structured outcome so a provider-completed turn is never
+   * misclassified as an uncertain backend execution when only persistence failed.
    */
   private async settleSuccess(
     turnId: string,
     observedSessionId: string | undefined,
     rawOutput: string,
     backend: Backend,
-  ): Promise<'ok' | 'missing_session' | false> {
-    if (this.storageTerminal) return false;
+  ): Promise<SuccessfulTurnSettlement> {
+    if (this.storageTerminal) return { status: 'failed', reason: 'storage terminal' };
     if (this.settling.has(turnId)) {
-      return false;
+      return { status: 'failed', reason: 'settlement already in progress' };
     }
     this.settling.add(turnId);
     const now = nowIso(this.clock);
@@ -4936,9 +5358,10 @@ export class TaskEngine {
       // host gate runs outside the persistence transaction and is threaded into the disposition. The
       // store lock is never held across the subprocess.
       const hostVerdict = this.computeHostVerdictForSettle(turnId);
-      let missingSession = false;
-      let source = await this.loadTurnAggregate(turnId);
-      if (!source) return false;
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        let missingSession = false;
+        let source = await this.loadTurnAggregate(turnId);
+      if (!source) return { status: 'failed', reason: 'turn settlement state not found' };
       const liveTurn = source.turns[turnId];
       if (liveTurn?.workflowActivation && !liveTurn.disposition) {
         const finalAssistantMessage = Object.values(source.messages)
@@ -4954,9 +5377,10 @@ export class TaskEngine {
           )
           .at(-1)
           ?.content.trim();
-        const result = finalAssistantMessage
-          ? truncateUtf8Bytes(finalAssistantMessage, this.getResourceLimits().maxResultBytes).text
-          : undefined;
+        const result = finalAssistantMessage;
+        if (!result) {
+          return { status: 'failed', reason: 'workflow activation ended without a final assistant message' };
+        }
         let rootId = liveTurn.taskId;
         const seen = new Set<string>();
         while (source.tasks[rootId]?.parentId && !seen.has(rootId)) {
@@ -4975,18 +5399,21 @@ export class TaskEngine {
             kind: 'workflow_next',
             opId: 'engine-implicit-workflow-next',
             change: 'updated',
-            ...(result !== undefined ? { result } : {}),
+            message: result,
           },
         );
         source = await this.loadTurnAggregate(turnId);
-        if (!source) return false;
+        if (!source) return { status: 'failed', reason: 'turn settlement state not found' };
         if (!implicitNext.ok && !source.turns[turnId]?.disposition) {
-          console.info('[muster][task-orch] workflow.implicit_next_failed', {
+          this.logLifecycle('workflow.implicit_next.failed', {
             taskId: liveTurn.taskId,
             turnId,
             error: implicitNext.error,
-          });
-          return false;
+          }, 'error');
+          return {
+            status: 'failed',
+            reason: `implicit workflow_next failed: ${implicitNext.error}`,
+          };
         }
       }
       const before = cloneEngineProjection(source);
@@ -5028,6 +5455,14 @@ export class TaskEngine {
           rawOutput,
           task.committedSessionId,
         );
+        const rotatesSessionBinding =
+          sessionId !== undefined &&
+          task.committedSessionId !== undefined &&
+          sessionId !== task.committedSessionId;
+        const sourceRuntimeEpoch = task.runtimeEpoch ?? 1;
+        const targetRuntimeEpoch = rotatesSessionBinding
+          ? sourceRuntimeEpoch + 1
+          : sourceRuntimeEpoch;
         const assignedContinuation =
           task.handoff?.version === 2 &&
           task.handoff.continuation.status === 'assigned' &&
@@ -5042,13 +5477,12 @@ export class TaskEngine {
         const result = applySuccessfulTurn(task, withObserved, {
           now,
           rootChildOrchestrationSeal: rootPolicy,
-          sealedBy:
+          lifecycleAuthority:
             task.parentId !== null
               ? {
-                  kind: 'coordinator',
-                  taskId: task.parentId,
+                  kind: 'parent',
+                  parentTaskId: task.parentId,
                   turnId,
-                  mode: 'parent_may_seal_direct',
                 }
               : undefined,
         });
@@ -5061,6 +5495,27 @@ export class TaskEngine {
           ...result.next.task,
           committedSessionId: sessionId ?? result.next.task.committedSessionId,
         };
+        if (rotatesSessionBinding) {
+          nextTask = {
+            ...nextTask,
+            runtimeEpoch: targetRuntimeEpoch,
+            revision: Math.max(nextTask.revision, task.revision + 1),
+            updatedAt: now,
+          };
+          for (const [relatedTurnId, relatedTurn] of Object.entries(draft.turns)) {
+            if (
+              relatedTurnId !== turnId &&
+              relatedTurn.taskId === task.id &&
+              relatedTurn.status === 'queued' &&
+              (relatedTurn.runtimeEpoch ?? 1) === sourceRuntimeEpoch
+            ) {
+              draft.turns[relatedTurnId] = {
+                ...relatedTurn,
+                runtimeEpoch: targetRuntimeEpoch,
+              };
+            }
+          }
+        }
         if (
           sessionId &&
           nextTask.handoff?.version === 2 &&
@@ -5101,28 +5556,63 @@ export class TaskEngine {
         const file = this.store.getFile();
         const turn = file.turns[turnId];
         const task = turn ? file.tasks[turn.taskId] : undefined;
-        console.info('[muster][task-orch] turn.settle.ok', {
+        this.logLifecycle('turn.settled', {
           taskId: turn?.taskId,
           turnId,
-          parentId: task?.parentId ?? null,
-          lifecycle: task?.lifecycle,
+          taskRole: task?.role ?? null,
+          parentTaskId: task?.parentId ?? null,
+          taskLifecycle: task?.lifecycle,
           disposition: turn?.disposition?.kind ?? null,
-          sealedBy: task?.sealedBy ?? null,
+          lifecycleAuthorityKind: task?.lifecycleAuthority?.kind ?? null,
           attention: task?.attention?.code ?? null,
-          hasCompletionCandidate: Boolean(task?.completionCandidate),
-          resultChars: task?.taskResult?.summary?.length ?? 0,
+          workflowRunId:
+            turn?.workflowActivation?.runId ?? turn?.workflowResume?.runId ?? null,
         });
-        return 'ok';
+        return { status: 'settled' };
       }
       if (missingSession) {
-        console.info('[muster][task-orch] turn.settle.missing_session', { turnId });
-        return 'missing_session';
+        this.logLifecycle('turn.settle.missing_session', { turnId }, 'error');
+        return { status: 'missing_session' };
       }
-      console.info('[muster][task-orch] turn.settle.commit_failed', {
-        turnId,
-        reason: commit.reason,
-      });
-      return false;
+        const reason = commit.reason ?? 'turn settlement commit failed';
+        const durableTurn = await this.repository.getTurn(turnId);
+        if (durableTurn?.status === 'succeeded') {
+          this.logLifecycle('turn.settle.already_committed', { turnId, attempt });
+          return { status: 'settled' };
+        }
+        const durableTask = durableTurn
+          ? await this.repository.getTask(durableTurn.taskId)
+          : undefined;
+        const retryable =
+          attempt < 3 &&
+          reason === 'turn is no longer live' &&
+          durableTurn?.status === 'running' &&
+          durableTask?.lifecycle === 'open' &&
+          (durableTurn.runtimeEpoch ?? 1) === (durableTask.runtimeEpoch ?? 1);
+        if (retryable) {
+          this.logLifecycle('turn.settle.retry', {
+            taskId: durableTask.id,
+            turnId,
+            attempt,
+            reason,
+            expectedTaskRevision: before.tasks[durableTask.id]?.revision ?? null,
+            actualTaskRevision: durableTask.revision,
+          });
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          continue;
+        }
+        this.logLifecycle('turn.settle.success_failed', {
+          taskId: durableTurn?.taskId ?? null,
+          turnId,
+          attempt,
+          reason,
+          durableTurnStatus: durableTurn?.status ?? null,
+          durableTaskLifecycle: durableTask?.lifecycle ?? null,
+          durableTaskRevision: durableTask?.revision ?? null,
+        }, 'error');
+        return { status: 'failed', reason };
+      }
+      return { status: 'failed', reason: 'successful turn settlement retry exhausted' };
     } finally {
       this.settling.delete(turnId);
     }
@@ -5267,7 +5757,7 @@ export class TaskEngine {
         observedSessionId,
         rawOutput,
         backend,
-      )) === 'ok';
+      )).status === 'settled';
       if (semanticSuccess) this.semanticSuccessSettlements.add(turnId);
       return semanticSuccess;
     }
@@ -5407,14 +5897,17 @@ export class TaskEngine {
         const file = this.store.getFile();
         const turn = file.turns[turnId];
         const task = turn ? file.tasks[turn.taskId] : undefined;
-        console.info('[muster][task-orch] turn.settle.failed', {
+        this.logLifecycle('turn.failed', {
           taskId: turn?.taskId,
           turnId,
-          parentId: task?.parentId ?? null,
-          lifecycle: task?.lifecycle,
+          taskRole: task?.role ?? null,
+          parentTaskId: task?.parentId ?? null,
+          taskLifecycle: task?.lifecycle,
           error: errorMessage.slice(0, 300),
-          failureClass: opts?.failureClass ?? null,
-        });
+          failureClass: settledFailureClass,
+          workflowRunId:
+            turn?.workflowActivation?.runId ?? turn?.workflowResume?.runId ?? null,
+        }, 'error');
         const retryTurnEntry = Object.values(this.store.getFile().turns).find(
           (turn) => turn.retryOf === turnId && turn.status === 'queued' && turn.id.includes('-auto-retry-'),
         );

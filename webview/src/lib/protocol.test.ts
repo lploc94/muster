@@ -171,8 +171,8 @@ describe('protocol v7 focused transcriptPage contract', () => {
     transcriptPage: validPage,
   };
 
-  it('is exactly version 8', () => {
-    expect(PROTOCOL_VERSION).toBe(9);
+  it('uses the current protocol version', () => {
+    expect(PROTOCOL_VERSION).toBe(10);
   });
 
   it('accepts focused snapshot with transcript + transcriptPage', () => {
@@ -1619,8 +1619,8 @@ describe('protocol v9 workspacePatchBatch', () => {
     ],
   };
 
-  it('is exactly version 9', () => {
-    expect(PROTOCOL_VERSION).toBe(9);
+  it('uses the current protocol version', () => {
+    expect(PROTOCOL_VERSION).toBe(10);
   });
 
   it('accepts a multi-kind batch and empty patches', () => {

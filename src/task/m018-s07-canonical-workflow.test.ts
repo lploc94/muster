@@ -407,7 +407,7 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
 
     const prev = dispatch(
       'workflow_prev',
-      { opId: 'prev-planner-1', targets: ['from_planner'], note: 'revise plan' },
+      { opId: 'prev-planner-1', targets: ['from_planner'], message: 'revise plan' },
       ctx,
     );
     expect(prev.ok).toBe(true);
@@ -420,7 +420,7 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
 
     const next = dispatch(
       'workflow_next',
-      { opId: 'next-1', change: 'updated', result: 'ok' },
+      { opId: 'next-1', change: 'updated', message: 'ok' },
       ctx,
     );
     expect(next.ok).toBe(true);
@@ -546,6 +546,11 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
       ]);
       const r1TaskId = entryRows.find((row) => row.node_id === 'r1')!.task_id as string;
       const r2TaskId = entryRows.find((row) => row.node_id === 'r2')!.task_id as string;
+      const r1Task = await opened.repository.getTask(r1TaskId);
+      const r2Task = await opened.repository.getTask(r2TaskId);
+      expect(r1Task?.goal).toMatch(/^\[workflow:r1\] /);
+      expect(r2Task?.goal).toMatch(/^\[workflow:r2\] /);
+      expect(r1Task?.goal).not.toBe(r2Task?.goal);
       const r1Turns = await opened.repository.listTurns(r1TaskId);
       const r2Turns = await opened.repository.listTurns(r2TaskId);
       expect(r1Turns).toHaveLength(1);
@@ -652,6 +657,8 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
 
       // Public inspection is run-scoped and excludes the generic task tree.
       const plannerTask = await opened.repository.getTask(plannerTaskId);
+      expect(plannerTask?.goal).toMatch(/^\[workflow:planner\] /);
+      expect(plannerTask?.parentId).toBe(r1Task?.parentId);
       const plannerTurn = await opened.repository.getTurn(plannerActivationTurnId);
       const toolFile: TaskStoreFile = {
         version: 1,

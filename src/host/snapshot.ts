@@ -1,10 +1,9 @@
 import type { Question } from '../bridge/ask-bridge';
 import { deriveRuntimeActivity, deriveViewStatus } from '../task/derived-status';
-import { dependenciesBlockTask } from '../task/scheduler';
+import { prerequisitesBlockTask } from '../task/scheduler';
 import {
   ASSISTANT_ORDERING_FALLBACK,
   KIND_RANK,
-  REASONING_ORDERING,
   UNBOUND_TURN_SEQUENCE,
   USER_ORDERING_FALLBACK,
   compareTranscriptKeys,
@@ -23,7 +22,7 @@ import type {
 
 /** Host-owned turn chrome (product surface). Not process/CLI vocabulary. */
 export type TurnActivityWaitReason =
-  | 'dependencies'
+  | 'prerequisites'
   | 'children'
   | 'external'
   | 'held_after_failure'
@@ -51,7 +50,7 @@ export interface TaskSummary {
   /** User-facing work outcome (open / succeeded / failed / cancelled / skipped). */
   lifecycle: TaskLifecycleState;
   /**
-   * Host-derived deps/wait activity while lifecycle is open; null when terminal.
+    * Host-derived prerequisite/wait activity while lifecycle is open; null when terminal.
    * Prefer currentTurnActivity for turn chrome.
    */
   runtimeActivity: TaskRuntimeActivity | null;
@@ -107,7 +106,7 @@ export type TranscriptItem =
       state?: TaskMessageState;
     }
   | { id: string; kind: 'tool'; turnId: string; order: number; content: ToolTranscriptContent }
-  | { id: string; kind: 'reasoning'; turnId: string; content: string };
+  | { id: string; kind: 'reasoning'; turnId: string; order: number; content: string };
 
 /**
  * Authoritative queued follow-up turn projection for S03 edit/delete and S04
@@ -192,12 +191,12 @@ function isOpeningQueuedTurn(turn: TaskTurn, taskTurns: readonly TaskTurn[]): bo
   );
 }
 
-function depLifecyclesForTask(file: EngineProjection, task: MusterTask): Map<string, TaskLifecycleState> {
+function producerLifecyclesForTask(file: EngineProjection, task: MusterTask): Map<string, TaskLifecycleState> {
   const map = new Map<string, TaskLifecycleState>();
-  for (const dep of task.dependencies) {
-    const depTask = file.tasks[dep.taskId];
-    if (depTask) {
-      map.set(dep.taskId, depTask.lifecycle);
+  for (const prerequisite of task.prerequisites) {
+    const producer = file.tasks[prerequisite.producerTaskId];
+    if (producer) {
+      map.set(prerequisite.producerTaskId, producer.lifecycle);
     }
   }
   return map;
@@ -250,8 +249,8 @@ function queuedTurnsFifo(turns: readonly TaskTurn[]): TaskTurn[] {
 }
 
 function waitReasonForQueuedTurn(file: EngineProjection, task: MusterTask, turn: TaskTurn): TurnActivityWaitReason | undefined {
-  if (dependenciesBlockTask(file, task.id)) {
-    return 'dependencies';
+  if (prerequisitesBlockTask(file, task.id)) {
+    return 'prerequisites';
   }
   if (task.wait?.kind === 'children') {
     return 'children';
@@ -398,7 +397,7 @@ export function projectTaskSummary(file: EngineProjection, taskId: string): Task
     return undefined;
   }
   const turns = turnsForTask(file, taskId);
-  const deps = depLifecyclesForTask(file, task);
+  const producerLifecycles = producerLifecyclesForTask(file, task);
   const childOrchestration =
     task.role === 'coordinator' ? projectChildOrchestration(file, taskId) : undefined;
   // Only the latest settled/live turn may present a run-timeout reason. Historical
@@ -417,8 +416,8 @@ export function projectTaskSummary(file: EngineProjection, taskId: string): Task
     goal: task.goal,
     role: task.role,
     lifecycle: task.lifecycle,
-    runtimeActivity: deriveRuntimeActivity(task, turns, deps),
-    viewStatus: deriveViewStatus(task, turns, deps),
+    runtimeActivity: deriveRuntimeActivity(task, turns, producerLifecycles),
+    viewStatus: deriveViewStatus(task, turns, producerLifecycles),
     currentTurnActivity: projectCurrentTurnActivity(file, taskId),
     hasOutcomeProposal: task.outcomeProposal != null,
     ...(timeoutLabel !== undefined
@@ -473,8 +472,7 @@ export function buildTranscript(file: EngineProjection, taskId: string): Transcr
     }
     const seq = turnId !== undefined && seqOf.has(turnId) ? seqOf.get(turnId)! : UNBOUND_TURN_SEQUENCE;
     // Canonical contract (src/task/transcript-order.ts): user prompts rank ahead
-    // of reasoning ahead of the assistant/tool stream within a turn. Explicit
-    // message.order (if present) is respected for ordered segments.
+    // of the ordered reasoning/assistant/tool response stream within a turn.
     const kindRank = KIND_RANK[message.role];
     const ordering =
       message.role === 'assistant'
@@ -524,8 +522,8 @@ export function buildTranscript(file: EngineProjection, taskId: string): Transcr
     }
     const seq = seqOf.has(r.turnId) ? seqOf.get(r.turnId)! : UNBOUND_TURN_SEQUENCE;
     entries.push({
-      item: { id: r.id, kind: 'reasoning', turnId: r.turnId, content: r.content },
-      key: { turnSequence: seq, kindRank: KIND_RANK.reasoning, ordering: REASONING_ORDERING, createdAt: r.createdAt, entityId: r.id },
+      item: { id: r.id, kind: 'reasoning', turnId: r.turnId, order: r.order, content: r.content },
+      key: { turnSequence: seq, kindRank: KIND_RANK.reasoning, ordering: r.order, createdAt: r.createdAt, entityId: r.id },
     });
   }
 
@@ -622,7 +620,7 @@ export function activeTurnIdForTask(file: EngineProjection, taskId: string): str
   if (!task) {
     return undefined;
   }
-  const viewStatus = deriveViewStatus(task, turns, depLifecyclesForTask(file, task));
+  const viewStatus = deriveViewStatus(task, turns, producerLifecyclesForTask(file, task));
   if (viewStatus !== 'needs_recovery') {
     return undefined;
   }

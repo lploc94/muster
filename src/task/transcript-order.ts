@@ -10,10 +10,9 @@
  *   2. The SQLite keyset query (src/task/repository.ts `getTranscriptPage`).
  *   3. The opaque cursor (src/task/transcript-cursor.ts).
  *
- * `kindRank` is its own axis between `turnSequence` and `ordering` so assistant
- * messages and tool calls (same rank) keep interleaving by their shared per-turn
- * `ordering` counter, while user prompts sort ahead of reasoning ahead of the
- * assistant/tool stream WITHIN a turn regardless of their raw `ordering`.
+ * `kindRank` is its own axis between `turnSequence` and `ordering` so reasoning,
+ * assistant messages, and tool calls (same rank) interleave by their shared
+ * per-turn `ordering` counter, while user prompts sort ahead of the response stream.
  *
  * Every component is non-null after normalization: unbound items use
  * `UNBOUND_TURN_SEQUENCE`, and message `ordering` falls back per role.
@@ -23,9 +22,8 @@
 export const KIND_RANK = {
   user: 0,
   reasoning: 1,
-  /** Assistant messages and tool calls share rank 2 so they interleave by `ordering`. */
-  assistant: 2,
-  tool: 2,
+  assistant: 1,
+  tool: 1,
 } as const;
 
 /**
@@ -37,8 +35,6 @@ export const CANONICAL_KIND_RANKS: ReadonlySet<number> = new Set(Object.values(K
 
 /** `ordering` fallback for a user message with no explicit `order` (opening prompt). */
 export const USER_ORDERING_FALLBACK = -2;
-/** Reasoning has no per-segment order in the transcript; it always sorts here. */
-export const REASONING_ORDERING = -1;
 /** `ordering` fallback for an assistant message with no explicit `order`. */
 export const ASSISTANT_ORDERING_FALLBACK = 0;
 /** `turnSequence` for an item that cannot be bound to a turn. Sorts before all turns. */

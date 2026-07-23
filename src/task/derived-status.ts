@@ -1,4 +1,4 @@
-import { evaluateDependency } from './deps';
+import { evaluatePrerequisite } from './prerequisites';
 import type {
   MusterTask,
   TaskLifecycleState,
@@ -38,13 +38,16 @@ function isLiveTurnStatus(status: TaskTurn['status']): boolean {
   return status === 'running' || status === 'waiting_user';
 }
 
-function hasUnsatisfiedDependency(
+function hasUnmetPrerequisite(
   task: MusterTask,
-  depLifecycles: ReadonlyMap<string, TaskLifecycleState>,
+  producerLifecycles: ReadonlyMap<string, TaskLifecycleState>,
 ): boolean {
-  return task.dependencies.some((dep) => {
-    const outcome = evaluateDependency(dep, depLifecycles.get(dep.taskId));
-    return outcome !== 'satisfied';
+  return task.prerequisites.some((prerequisite) => {
+    const outcome = evaluatePrerequisite(
+      prerequisite,
+      producerLifecycles.get(prerequisite.producerTaskId),
+    );
+    return outcome !== 'met';
   });
 }
 
@@ -85,7 +88,7 @@ function hasOutcomeProposal(task: MusterTask): boolean {
 export function deriveRuntimeActivity(
   task: MusterTask,
   turns: readonly TaskTurn[],
-  depLifecycles: ReadonlyMap<string, TaskLifecycleState>,
+  producerLifecycles: ReadonlyMap<string, TaskLifecycleState>,
 ): TaskRuntimeActivity | null {
   if (task.lifecycle !== 'open') {
     return null;
@@ -102,9 +105,9 @@ export function deriveRuntimeActivity(
     return liveTurn.status === 'waiting_user' ? 'waiting_user' : 'running';
   }
 
-  // 3. Unsatisfied dependencies
-  if (hasUnsatisfiedDependency(task, depLifecycles)) {
-    return 'waiting_dependencies';
+  // 3. Unmet prerequisites
+  if (hasUnmetPrerequisite(task, producerLifecycles)) {
+    return 'waiting_prerequisites';
   }
 
   // 4. Schedulable queued turn

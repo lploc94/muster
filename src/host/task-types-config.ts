@@ -157,7 +157,8 @@ export function pickExplicitTaskTypesValue(inspected: {
   workspaceValue?: unknown;
   globalValue?: unknown;
   defaultValue?: unknown;
-}): unknown {
+} | undefined): unknown {
+  if (!inspected) return MUSTER_DEFAULT_TASK_TYPES;
   if (inspected.workspaceFolderValue !== undefined) return inspected.workspaceFolderValue;
   if (inspected.workspaceValue !== undefined) return inspected.workspaceValue;
   if (inspected.globalValue !== undefined) return inspected.globalValue;

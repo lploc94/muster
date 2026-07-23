@@ -20,6 +20,9 @@ import {
   deriveFeedbackTargetMessageId,
   deriveFeedbackResumeTurnId,
   deriveFeedbackResumeMessageId,
+  deriveWorkflowStartContinuationId,
+  deriveWorkflowStartResumeMessageId,
+  deriveWorkflowStartResumeTurnId,
   deriveRunClosureFenceId,
   clampWorkflowRunBudgets,
   WORKFLOW_RUN_BUDGET_BOUNDS,
@@ -37,8 +40,22 @@ import {
   terminalNodeId,
   validateDefineWorkflow,
 } from './workflow';
+import { WORKFLOW_NODE_LABEL_MAX_LENGTH } from './workflow-types';
 
 describe('workflow domain (one-node define)', () => {
+  it('accepts detailed node instructions up to the public workflow label bound', () => {
+    expect(decodeOneNodeTopology({
+      kind: 'one_node_v1',
+      nodes: [{ nodeId: 'entry', label: 'x'.repeat(300), taskType: 'research' }],
+      entryNodeId: 'entry',
+    }).ok).toBe(true);
+    expect(decodeOneNodeTopology({
+      kind: 'one_node_v1',
+      nodes: [{ nodeId: 'entry', label: 'x'.repeat(WORKFLOW_NODE_LABEL_MAX_LENGTH + 1), taskType: 'research' }],
+      entryNodeId: 'entry',
+    }).ok).toBe(false);
+  });
+
   it('accepts a valid one-node topology and fingerprints stably', () => {
     const def = makeOneNodeDefinition();
     const validated = validateDefineWorkflow({
@@ -438,6 +455,23 @@ describe('workflow domain (graph_v1 multi-node topology)', () => {
     const next = deriveNextContributionMessageId(runId, 'wfg_gate', 'from_p1', 'p1');
     expect(reqA).not.toBe(next);
     expect(resp).not.toBe(next);
+  });
+
+  it('derives distinct deterministic top-level workflow continuation identities', () => {
+    const continuation = deriveWorkflowStartContinuationId('wfr_abc', 'turn_caller');
+    const resumeTurn = deriveWorkflowStartResumeTurnId('wfr_abc', 'turn_caller');
+    const resumeMessage = deriveWorkflowStartResumeMessageId('wfr_abc', 'turn_caller');
+
+    expect(continuation).toBe(deriveWorkflowStartContinuationId('wfr_abc', 'turn_caller'));
+    expect(resumeTurn).toBe(deriveWorkflowStartResumeTurnId('wfr_abc', 'turn_caller'));
+    expect(resumeMessage).toBe(deriveWorkflowStartResumeMessageId('wfr_abc', 'turn_caller'));
+    expect(continuation.startsWith('wfcn_')).toBe(true);
+    expect(resumeTurn.startsWith('wftn_')).toBe(true);
+    expect(resumeMessage.startsWith('wfm_')).toBe(true);
+    expect(new Set([continuation, resumeTurn, resumeMessage]).size).toBe(3);
+    expect(continuation).not.toBe(
+      deriveWorkflowStartContinuationId('wfr_abc', 'turn_other'),
+    );
   });
 
 

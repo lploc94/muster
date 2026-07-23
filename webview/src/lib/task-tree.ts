@@ -30,7 +30,7 @@ function activityOf(
   if (task.runtimeActivity !== undefined) return task.runtimeActivity;
   const vs = task.viewStatus;
   if (
-    vs === 'waiting_dependencies' ||
+    vs === 'waiting_prerequisites' ||
     vs === 'queued' ||
     vs === 'running' ||
     vs === 'waiting_user' ||

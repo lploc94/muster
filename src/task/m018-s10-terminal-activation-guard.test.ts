@@ -386,7 +386,7 @@ describe('M018 terminal workflow activation guards', () => {
     };
     expect(canPromoteTurn(continuationProjection, ordinary.id, DEFAULT_RESOURCE_LIMITS)).toEqual({
       ok: false,
-      reason: 'waiting on child workflow',
+      reason: 'waiting on workflow continuation',
     });
     await expect(repository.execute({
       kind: 'claimTurn', workspaceId: 'ws', turnId: ordinary.id,

@@ -86,10 +86,10 @@ export const HOST_RULES_BASE: readonly string[] = [
  * Coordinator workflow-authoring rules when no task types are configured.
  */
 export const HOST_RULES_COORDINATOR: readonly string[] = [
-  'Build orchestration with **`define_workflow`** and **`start_workflow`**; the legacy delegate-task MCP protocol is unavailable.',
-  'Use **`list_task_types`** to refresh task profiles before freezing workflow node routing.',
+  'Build orchestration with **`define_workflow`** and **`start_workflow`**; the legacy delegate-task MCP protocol is unavailable. Workflows are converging DAGs: independent source nodes may run in parallel and fan in, but fan-out/cycles are unsupported; inputs belong only to source nodes and all branches must converge to one terminal.',
+  'Use **`list_task_types`** to refresh semantic task profiles before defining workflow nodes.',
   'Use **`inspect_workflow_run`** only for bounded recovery diagnostics; do not poll it as a substitute for routing.',
-  'REQUIRED for user-facing plans/specs: call MCP **`upsert_presentation`** with the full markdown (Mermaid fenced blocks allowed). Args: stable `presentationId` (e.g. plan-<taskId>), `ownerTaskId`=`self.taskId`, unique `opId`, `revision` (1 then ++), `title`, `markdown`, optional `kind` (`plan`|`spec`|`document`), optional one-line `summary`, optional `changeSummary` on revision 2+ describing what changed. Never send `sourcePath`, `sourceFolderUri`, `updatedAt`, or `rootId` (host-owned). Do not only paste the plan in chat.',
+  'REQUIRED for user-facing plans/specs: call MCP **`upsert_presentation`** with a semantic `documentKey`, `title`, and the full markdown (Mermaid fenced blocks allowed). The host owns identity, ownership, idempotency, and revisions. Do not only paste the plan in chat.',
   'A live workflow activation may explicitly stage `workflow_next`, contextual `workflow_prev`, or `workflow_fail`; if the turn ends without one, the host forwards the final assistant message as an updated NEXT result.',
 ];
 
@@ -99,8 +99,8 @@ export const HOST_RULES_COORDINATOR: readonly string[] = [
  */
 export const HOST_RULES_TASK_TYPES: readonly string[] = [
   'Use `taskType` values from the configured list for workflow nodes.',
-  'Call `list_task_types` when backend/model routing must be frozen into a definition.',
-  'Freeze the resolved backend, role, and optional model exactly; never invent routing.',
+  'Call `list_task_types` when semantic task profiles need to be refreshed.',
+  'Never copy or invent backend, model, role, capability, policy, identity, or revision fields; the engine resolves and freezes them.',
   'Treat task profiles as workflow-node presets, not permission to create ad-hoc children.',
 ];
 
@@ -112,13 +112,13 @@ const HOST_RULES_COORDINATOR_PRESENTATION_INDEX = 3;
 /** Worker scope rules (appended after base). */
 export const HOST_RULES_WORKER: readonly string[] = [
   'You own **one** task (`self.taskId`); complete it and stop — do not pick siblings or “next” work.',
-  'When workflow disposition tools are present, prefer an explicit workflow outcome; if you finish without one, the host forwards your final assistant message as NEXT.',
+  'When workflow disposition tools are present, prefer an explicit workflow outcome. NEXT/PREV require the final assistant message, commit it, and end the turn. If you finish without one, the host forwards your final assistant message as NEXT.',
   'Do not call coordinator-only graph mutators even if listed by mistake.',
   'Stay within brief write/read paths and constraints when present.',
 ];
 
 export const HOST_RULE_WORKFLOW_DISPOSITION =
-  'This is a live workflow activation: use **`workflow_next`**, **`workflow_prev`** (when available), or **`workflow_fail`** when you need explicit routing. If you simply finish, the host uses your final assistant message as an updated NEXT result.';
+  'This is a live workflow activation: use **`workflow_next`**, **`workflow_prev`** (when available), or **`workflow_fail`** when you need explicit routing. A `workflow_next` message must be self-contained because the receiver cannot see earlier assistant messages. If you simply finish, the host uses your final assistant message as an updated NEXT result.';
 
 export const WORKER_SCOPE_DO_NOT: readonly string[] = [
   'create siblings or pick next work',

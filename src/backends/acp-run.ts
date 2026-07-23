@@ -61,6 +61,8 @@ export interface AcpAdapterSpec {
   readonly failureStopReasons: ReadonlySet<string>;
   /** Empty `agent_message_chunk`/`agent_thought_chunk`: `'drop'` skips it, `'raw'` emits a raw event. */
   readonly emptyChunk: EmptyChunkMode;
+  /** Synthetic assistant chunks that represent context compaction rather than model prose. */
+  readonly contextCompactionChunks?: readonly string[];
   /** Whether a `usage_update` session update maps to a usage event (else it falls through to `raw`). */
   readonly mapUsageUpdate: boolean;
   /** Post-turn usage: which result field to read the keys from, and which keys to surface. */
@@ -108,6 +110,12 @@ function chunkEvent(
 ): NormalizedEvent | undefined {
   const text = (update.content as { text?: string } | undefined)?.text;
   if (typeof text === 'string') {
+    if (
+      type === 'assistantDelta' &&
+      spec.contextCompactionChunks?.includes(text.trim())
+    ) {
+      return { type: 'usage', usage: { compacted: true } };
+    }
     if (text.length > 0) return { type, content: text, messageId };
     // Empty string: some adapters drop it, others surface it as raw noise.
     return spec.emptyChunk === 'drop' ? undefined : { type: 'raw', line: JSON.stringify(update) };

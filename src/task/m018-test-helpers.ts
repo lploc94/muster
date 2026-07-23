@@ -1,8 +1,8 @@
-import type { SqliteTaskRepository } from './repository';
+import type { TaskRepository } from './repository';
 import type { TaskTurn, TurnDisposition } from './types';
 
 export function stageDispositionForSettlement(
-  repository: SqliteTaskRepository,
+  repository: TaskRepository,
   turn: TaskTurn,
   disposition: TurnDisposition,
   opId: string = `settle:${turn.id}`,

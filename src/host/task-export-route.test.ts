@@ -34,7 +34,7 @@ function task(id: string, overrides: Partial<MusterTask> = {}): MusterTask {
     lifecycle: 'open',
     goal: `Goal for ${id}`,
     parentId: null,
-    dependencies: [],
+    prerequisites: [],
     backend: 'grok',
     capabilities: [],
     executionPolicy: POLICY,

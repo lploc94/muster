@@ -345,7 +345,7 @@ describe('M017 R2 GREEN — settle once + awaiting_parent_seal (S02)', () => {
       releaseState: 'released',
       goal: 'work',
       parentId: 'root-1',
-      dependencies: [],
+      prerequisites: [],
       backend: 'grok',
       capabilities: [],
       executionPolicy: {
@@ -378,7 +378,7 @@ describe('M017 R2 GREEN — settle once + awaiting_parent_seal (S02)', () => {
       reason: 'missing_disposition',
     });
     expect(result.next.task.lifecycle).toBe('open');
-    expect(result.next.task.sealedBy).toBeUndefined();
+    expect(result.next.task.lifecycleAuthority).toBeUndefined();
     expect(result.next.turn.status).toBe('succeeded');
   });
 
@@ -484,7 +484,7 @@ describe('M017 R2 GREEN — settle once + awaiting_parent_seal (S02)', () => {
       sourceTurnId: childTurn.id,
       reason: 'missing_disposition',
     });
-    expect(child?.sealedBy).toBeUndefined();
+    expect(child?.lifecycleAuthority).toBeUndefined();
 
     // Stop all background repository work before teardown (no further executes).
     engine.quiesceForTerminalStorage();

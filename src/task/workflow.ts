@@ -5,6 +5,7 @@
  */
 
 import { createHash } from 'node:crypto';
+import { TASK_ERROR_MAX_BYTES } from './content-limits';
 import {
   decodeDefineWorkflowInput,
   DEFAULT_WORKFLOW_POLICY,
@@ -13,6 +14,7 @@ import {
   fingerprintWorkflowDefinition,
   maximumWorkflowEntryAggregateBytes,
 } from './workflow-codec';
+import { WORKFLOW_RUN_GOAL_MAX_LENGTH } from './workflow-types';
 import type {
   DefineWorkflowInput,
   DefineWorkflowResult,
@@ -25,6 +27,7 @@ import type {
   WorkflowEntryContractV1,
   WorkflowPolicyV1,
   WorkflowTopologyV1,
+  WorkflowNodeSpecV1,
 } from './workflow-types';
 
 export {
@@ -232,8 +235,22 @@ export function fingerprintDefinition(definition: WorkflowDefinitionV1): string 
 }
 
 const MAX_START_KEY_LEN = 256;
-const MAX_GOAL_LEN = 512;
 const MAX_BACKEND_LEN = 64;
+
+function workflowNodeGoalPrefix(node: WorkflowNodeSpecV1): string {
+  return node.label
+    ? `[workflow:${node.nodeId}] ${node.label}: `
+    : `[workflow:${node.nodeId}] `;
+}
+
+export function workflowNodeTaskGoal(node: WorkflowNodeSpecV1, runGoal: string): string {
+  return `${workflowNodeGoalPrefix(node)}${runGoal}`;
+}
+
+export function workflowRunGoalFromTask(node: WorkflowNodeSpecV1, taskGoal: string): string {
+  const prefix = workflowNodeGoalPrefix(node);
+  return taskGoal.startsWith(prefix) ? taskGoal.slice(prefix.length) : taskGoal;
+}
 
 function isNonEmptyBounded(value: unknown, max: number): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= max;
@@ -561,7 +578,7 @@ export const WORKFLOW_RUN_BUDGET_BOUNDS = {
   maxWorkflowTurnsPerRun: 256,
   defaultMaxWorkflowTurnsPerRun: 64,
   /** Optional agent-supplied reason text on workflow_fail (UTF-8 bytes). */
-  maxFailReasonBytes: 512,
+  maxFailReasonBytes: TASK_ERROR_MAX_BYTES,
 } as const;
 
 export type WorkflowRunBudgetLimits = {
@@ -689,6 +706,21 @@ export function deriveCallerReturnMessageId(callerRunId: string, childRunId: str
   return stableId('wfm', `${callerRunId}\0child_return_message\0${childRunId}`);
 }
 
+/** Durable continuation created when start_workflow suspends its caller turn. */
+export function deriveWorkflowStartContinuationId(runId: string, callerTurnId: string): string {
+  return stableId('wfcn', `${runId}\0start_wait\0${callerTurnId}`);
+}
+
+/** Caller resume turn queued after a top-level workflow becomes terminal. */
+export function deriveWorkflowStartResumeTurnId(runId: string, callerTurnId: string): string {
+  return stableId('wftn', `${runId}\0start_resume_turn\0${callerTurnId}`);
+}
+
+/** System message that delivers a top-level workflow result to its caller. */
+export function deriveWorkflowStartResumeMessageId(runId: string, callerTurnId: string): string {
+  return stableId('wfm', `${runId}\0start_resume_message\0${callerTurnId}`);
+}
+
 /** Child run start key material (optional agent key or derived from caller turn). */
 export function deriveChildStartIdempotencyKey(input: {
   callerRunId: string;
@@ -790,7 +822,6 @@ export function fingerprintStartWorkflow(input: {
     backend: input.backend,
     ownerRootTaskId: input.ownerRootTaskId,
     callerTaskId: input.callerTaskId,
-    callerTurnId: input.callerTurnId,
     entryInputs: (input.entryInputs ?? []).map((entryInput) => ({
       entryNodeId: entryInput.entryNodeId,
       inputRef: entryInput.inputRef,
@@ -847,7 +878,10 @@ export function validateStartWorkflow(
   if (!isNonEmptyBounded(input.entryNodeId, 128)) {
     return { ok: false, reason: 'invalid entryNodeId' };
   }
-  if (input.goal !== undefined && !isNonEmptyBounded(input.goal, MAX_GOAL_LEN)) {
+  if (
+    input.goal !== undefined &&
+    !isNonEmptyBounded(input.goal, WORKFLOW_RUN_GOAL_MAX_LENGTH)
+  ) {
     return { ok: false, reason: 'invalid goal' };
   }
   if (input.backend !== undefined && !isNonEmptyBounded(input.backend, MAX_BACKEND_LEN)) {

@@ -5,24 +5,24 @@
  */
 
 import { createHash } from 'node:crypto';
-import type {
-  DefineWorkflowInput,
-  GraphTopologyV1,
-  OneNodeTopologyV1,
-  WorkflowDefinitionV1,
-  WorkflowDependencyEdgeV1,
-  WorkflowEntryContractV1,
-  WorkflowNodeSpecV1,
-  WorkflowPolicyV1,
-  WorkflowTopologyV1,
+import {
+  WORKFLOW_GRAPH_MAX_EDGES,
+  WORKFLOW_GRAPH_MAX_NODES,
+  WORKFLOW_INPUT_REF_MAX_LENGTH,
+  WORKFLOW_NODE_LABEL_MAX_LENGTH,
+  type DefineWorkflowInput,
+  type GraphTopologyV1,
+  type OneNodeTopologyV1,
+  type WorkflowDefinitionV1,
+  type WorkflowDependencyEdgeV1,
+  type WorkflowEntryContractV1,
+  type WorkflowNodeSpecV1,
+  type WorkflowPolicyV1,
+  type WorkflowTopologyV1,
 } from './workflow-types';
 
 const MAX_ID_LEN = 128;
 const MAX_NAME_LEN = 256;
-const MAX_LABEL_LEN = 256;
-const MAX_INPUT_REF_LEN = 128;
-const MAX_GRAPH_NODES = 64;
-const MAX_GRAPH_EDGES = 128;
 const MAX_CAPABILITIES = 16;
 const MAX_ARTIFACT_KIND_LEN = 128;
 const TASK_CAPABILITIES = new Set([
@@ -43,8 +43,8 @@ export const DEFAULT_WORKFLOW_POLICY: WorkflowPolicyV1 = {
   maxTaskCount: 64,
   maxConcurrency: 20,
   maxInputsPerGate: 64,
-  maxArtifactBytes: 65_536,
-  maxAggregateBytes: 262_144,
+  maxArtifactBytes: 262_144,
+  maxAggregateBytes: 1_048_576,
   failWorkflow: true,
 };
 
@@ -108,11 +108,47 @@ export function maximumWorkflowEntryAggregateBytes(
   );
 }
 
+export function deriveDefaultWorkflowPolicy(
+  contracts: readonly Pick<WorkflowEntryContractV1, 'entryNodeId' | 'inputRef'>[],
+): WorkflowPolicyV1 {
+  const groups = new Map<string, Array<{ inputRef: string }>>();
+  for (const contract of contracts) {
+    const group = groups.get(contract.entryNodeId) ?? [];
+    group.push({ inputRef: contract.inputRef });
+    groups.set(contract.entryNodeId, group);
+  }
+  const largestGroup = [...groups.values()].sort((left, right) => right.length - left.length)[0] ?? [];
+  let maxArtifactBytes = DEFAULT_WORKFLOW_POLICY.maxArtifactBytes;
+  const aggregateLimit = WORKFLOW_POLICY_BOUNDS.maxAggregateBytes.max;
+  while (
+    maxArtifactBytes > 1 &&
+    maximumWorkflowEntryAggregateBytes(largestGroup, maxArtifactBytes) > aggregateLimit
+  ) {
+    maxArtifactBytes = Math.max(1, Math.floor(maxArtifactBytes / 2));
+  }
+  const requiredAggregateBytes = maximumWorkflowEntryAggregateBytes(largestGroup, maxArtifactBytes);
+  return {
+    ...DEFAULT_WORKFLOW_POLICY,
+    maxInputsPerGate: Math.max(
+      DEFAULT_WORKFLOW_POLICY.maxInputsPerGate,
+      largestGroup.length,
+    ),
+    maxArtifactBytes,
+    maxAggregateBytes: Math.max(
+      DEFAULT_WORKFLOW_POLICY.maxAggregateBytes,
+      requiredAggregateBytes,
+    ),
+  };
+}
+
 function decodeNode(raw: unknown): WorkflowNodeSpecV1 | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const rec = raw as Record<string, unknown>;
   if (!isNonEmptyString(rec.nodeId, MAX_ID_LEN)) return undefined;
-  if (rec.label !== undefined && !isNonEmptyString(rec.label, MAX_LABEL_LEN)) return undefined;
+  if (
+    rec.label !== undefined &&
+    !isNonEmptyString(rec.label, WORKFLOW_NODE_LABEL_MAX_LENGTH)
+  ) return undefined;
   if (rec.role !== undefined && rec.role !== 'coordinator' && rec.role !== 'worker') {
     return undefined;
   }
@@ -208,7 +244,10 @@ function decodeEdge(raw: unknown): WorkflowDependencyEdgeV1 | undefined {
   if (!isNonEmptyString(rec.toNodeId, MAX_ID_LEN)) return undefined;
   // Empty inputRef is a missing route-to-gate; non-string is invalid.
   if (typeof rec.inputRef !== 'string') return undefined;
-  if (rec.inputRef.length === 0 || rec.inputRef.length > MAX_INPUT_REF_LEN) return undefined;
+  if (
+    rec.inputRef.length === 0 ||
+    rec.inputRef.length > WORKFLOW_INPUT_REF_MAX_LENGTH
+  ) return undefined;
   if (
     rec.expectedArtifactKind !== undefined &&
     !isNonEmptyString(rec.expectedArtifactKind, MAX_ARTIFACT_KIND_LEN)
@@ -274,10 +313,14 @@ export function decodeGraphTopology(
       return { ok: false, reason: `unsupported topology field: ${key}` };
     }
   }
-  if (!Array.isArray(rec.nodes) || rec.nodes.length < 2 || rec.nodes.length > MAX_GRAPH_NODES) {
+  if (
+    !Array.isArray(rec.nodes) ||
+    rec.nodes.length < 2 ||
+    rec.nodes.length > WORKFLOW_GRAPH_MAX_NODES
+  ) {
     return { ok: false, reason: 'graph_v1 requires 2..64 nodes' };
   }
-  if (!Array.isArray(rec.edges) || rec.edges.length > MAX_GRAPH_EDGES) {
+  if (!Array.isArray(rec.edges) || rec.edges.length > WORKFLOW_GRAPH_MAX_EDGES) {
     return { ok: false, reason: 'graph_v1 edges must be an array' };
   }
 
@@ -467,7 +510,7 @@ function decodeEntryContracts(
     }
     if (
       !isNonEmptyString(rec.entryNodeId, MAX_ID_LEN) || !entryIds.has(rec.entryNodeId) ||
-      !isNonEmptyString(rec.inputRef, MAX_INPUT_REF_LEN) ||
+      !isNonEmptyString(rec.inputRef, WORKFLOW_INPUT_REF_MAX_LENGTH) ||
       !isNonEmptyString(rec.expectedArtifactKind, MAX_ARTIFACT_KIND_LEN)
     ) {
       return { ok: false, reason: 'invalid entry contract' };

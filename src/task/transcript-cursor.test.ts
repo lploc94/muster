@@ -9,7 +9,7 @@ import type { TranscriptSortKey } from './transcript-order';
 const SCOPE = { workspaceId: 'ws', taskId: 'task-1' };
 const KEY: TranscriptSortKey = {
   turnSequence: 3,
-  kindRank: 2,
+  kindRank: 1,
   ordering: 5,
   createdAt: '2026-07-16T00:00:00.000Z',
   entityId: 'entity-9',

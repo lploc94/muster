@@ -440,7 +440,7 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
         releaseState: 'released',
         goal: 'invoke child',
         parentId: null,
-        dependencies: [],
+        prerequisites: [],
         backend: 'grok',
         capabilities: ['create_child'],
         executionPolicy: { maxTurns: 20, maxAutomaticRetries: 1 },

@@ -5,7 +5,7 @@ import type {
   PersistedReasoning,
   PersistedToolCall,
   SendReceipt,
-  TaskDependency,
+  TaskPrerequisite,
   TaskMessage,
   RuntimeClaim,
   TaskTurn,
@@ -59,9 +59,14 @@ import {
   deriveCallerReturnGateId,
   deriveCallerResumeTurnId,
   deriveCallerReturnMessageId,
+  deriveWorkflowStartContinuationId,
+  deriveWorkflowStartResumeTurnId,
+  deriveWorkflowStartResumeMessageId,
   deriveChildStartIdempotencyKey,
   stableId,
   validateInvokeChildEntryBindings,
+  workflowNodeTaskGoal,
+  workflowRunGoalFromTask,
   type DefineWorkflowResult,
   type StartWorkflowResult,
   type WorkflowDefinitionV1,
@@ -81,12 +86,17 @@ import {
   isTerminalLifecycle, isTerminalTurn
 } from './transitions';
 import { TRUNCATION_MARKER } from './retention';
+import {
+  PRESENTATION_MARKDOWN_MAX_CHARS,
+  TASK_MESSAGE_MAX_CHARS,
+  TASK_RESULT_MAX_BYTES,
+  truncateUtf8Bytes,
+} from './content-limits';
 import type { RunResult, SqlStatement, SqlValue } from './sqlite/rpc';
 import { CHANGE_FEED_RETAIN_REVISIONS } from './sqlite/schema';
 import {
   ASSISTANT_ORDERING_FALLBACK,
   KIND_RANK,
-  REASONING_ORDERING,
   UNBOUND_TURN_SEQUENCE,
   USER_ORDERING_FALLBACK,
   type TranscriptSortKey,
@@ -112,7 +122,7 @@ export interface RepositoryPage<T> {
 export type RepositoryTranscriptItem =
   | { id: string; kind: 'user' | 'assistant'; content: string; turnId?: string; order?: number; state?: TaskMessage['state']; createdAt?: string }
   | { id: string; kind: 'tool'; turnId: string; order: number; content: Record<string, unknown>; createdAt?: string }
-  | { id: string; kind: 'reasoning'; turnId: string; content: string; createdAt?: string };
+  | { id: string; kind: 'reasoning'; turnId: string; order: number; content: string; createdAt?: string };
 
 export interface TranscriptPage {
   items: readonly RepositoryTranscriptItem[];
@@ -307,13 +317,13 @@ export type RepositoryCommand =
       expectedTaskRevision: number; task: MusterTask; turn?: TaskTurn;
     }
   | {
-      /** Seal a dependency-policy terminal and its live/queued turn atomically. */
-      kind: 'applyDependencyTerminal'; workspaceId: string; taskId: string;
+      /** Seal a prerequisite-policy terminal and its live/queued turn atomically. */
+      kind: 'applyPrerequisiteTerminal'; workspaceId: string; taskId: string;
       expectedTaskRevision: number; task: MusterTask; turn?: TaskTurn;
     }
   | {
-      /** Propagate dependency terminal outcomes for a batch of affected tasks. */
-      kind: 'applyDependencyTerminals'; workspaceId: string;
+      /** Propagate prerequisite terminal outcomes for a batch of affected tasks. */
+      kind: 'applyPrerequisiteTerminals'; workspaceId: string;
       expectedTasks: readonly { id: string; revision: number }[];
       mutations: readonly { taskId: string; task: MusterTask; turn?: TaskTurn }[];
     }
@@ -334,11 +344,8 @@ export type RepositoryCommand =
   | { kind: 'deleteTask'; workspaceId: string; taskId: string }
   /** Atomically remove every idle/terminal root except the focused root. */
   | { kind: 'clearHistory'; workspaceId: string; preserveRootTaskId?: string }
-  /** Atomically remove one complete root subtree when every member is idle/terminal. */
-  | {
-      kind: 'deleteTaskSubtreeIfIdle'; workspaceId: string; rootTaskId: string;
-      preserveRootTaskId?: string;
-    }
+  /** Atomically remove one selected task and its complete subtree. */
+  | { kind: 'deleteTaskSubtree'; workspaceId: string; rootTaskId: string }
   /** Host rename boundary with an optimistic task-revision fence. */
   | {
       kind: 'renameTask'; workspaceId: string; taskId: string; goal: string;
@@ -459,6 +466,7 @@ export type RepositoryCommand =
       ownerRootTaskId?: string;
       callerTaskId?: string;
       callerTurnId?: string;
+      resumeCallerOnCompletion?: boolean;
       effectivePolicy?: WorkflowPolicyV1;
       publicOperation?: {
         ledgerKey: string;
@@ -468,6 +476,10 @@ export type RepositoryCommand =
   | {
       /** Close every running workflow whose frozen absolute deadline has elapsed. */
       kind: 'reapWorkflowTimeouts'; workspaceId: string; now: string;
+    }
+  | {
+      /** Resolve one terminal top-level workflow into its deterministic caller resume. */
+      kind: 'resolveWorkflowStartContinuation'; workspaceId: string; now: string;
     }
   | {
       /** Explicitly queue a new execution for one failed/interrupted logical activation. */
@@ -572,7 +584,10 @@ export interface RepositoryCommandResult {
   conflict?: boolean;
   /** Queue mutation result fields; absent for unrelated commands. */
   messageId?: string;
+  turnId?: string;
   deletedMessageIds?: readonly string[];
+  /** Task aggregates changed indirectly by the command, such as a fan-in consumer activation. */
+  affectedTaskIds?: readonly string[];
   presentationStatus?:
     | 'committed'
     | 'idempotent'
@@ -592,6 +607,7 @@ export type WorkflowTransactionalCommand = Extract<
       | 'defineWorkflowVersion'
       | 'startWorkflowRun'
       | 'reapWorkflowTimeouts'
+      | 'resolveWorkflowStartContinuation'
       | 'recoverWorkflowActivation'
       | 'settleTurnAndApplyEffects';
   }
@@ -607,6 +623,7 @@ export function isWorkflowTransactionalCommand(
     'defineWorkflowVersion',
     'startWorkflowRun',
     'reapWorkflowTimeouts',
+    'resolveWorkflowStartContinuation',
     'recoverWorkflowActivation',
     'settleTurnAndApplyEffects',
   ].includes(command.kind);
@@ -776,6 +793,28 @@ export interface TaskRepository {
     definitionId: string,
     version: number,
   ): Promise<WorkflowDefinitionV1 | undefined>;
+  /** Latest immutable definition revision authorized for this root-scoped caller. */
+  getLatestWorkflowDefinition(
+    definitionId: string,
+    ownerRootTaskId: string,
+  ): Promise<WorkflowDefinitionV1 | undefined>;
+  /** Existing alias-based start claim, used to freeze latest-resolution across retries. */
+  getWorkflowStartResolution(input: {
+    ownerRootTaskId: string;
+    callerTaskId: string;
+    definitionId: string;
+    startIdempotencyKey: string;
+  }): Promise<{ version: number; policy: WorkflowPolicyV1 } | undefined>;
+  /** Resolve semantic current-input names to exact immutable artifact pins. */
+  resolveWorkflowInputArtifacts(
+    turnId: string,
+    ownerRootTaskId: string,
+    inputRefs: readonly string[],
+  ): Promise<readonly {
+    inputRef: string;
+    artifactId: string;
+    artifactRevision: number;
+  }[] | undefined>;
   /** Frozen effective policy for an already-claimed scoped start replay. */
   getWorkflowStartPolicy(input: {
     ownerRootTaskId: string;
@@ -797,7 +836,7 @@ export interface TaskRepository {
 /** Strict versioned send-outbox payload (P4-W11). Bound field sizes; no freeform blobs. */
 export const SEND_OUTBOX_PAYLOAD_VERSION = 1;
 export const SEND_OUTBOX_MAX_ENTRIES = 32;
-export const SEND_OUTBOX_TEXT_MAX = 100_000;
+export const SEND_OUTBOX_TEXT_MAX = TASK_MESSAGE_MAX_CHARS;
 export const SEND_OUTBOX_SKILLS_MAX = 8;
 export const SEND_OUTBOX_MENTION_BINDINGS_MAX = 64;
 export const SEND_OUTBOX_PATH_MAX = 4096;
@@ -1031,8 +1070,8 @@ function validateGraphCommand(command: GraphCommand): string | undefined {
       // Existing parents need not be part of the bounded write set; the adapter
       // checks the FK/query fence before applying the row.
     }
-    for (const dependency of task.dependencies) {
-      if (dependency.taskId === task.id) return 'graph task cannot depend on itself';
+    for (const prerequisite of task.prerequisites) {
+      if (prerequisite.producerTaskId === task.id) return 'graph task cannot require itself';
     }
   }
   for (const turn of command.turns) {
@@ -1168,18 +1207,18 @@ export class SqliteTaskRepository implements TaskRepository {
   private async hydrateTasks(rows: readonly TaskRow[]): Promise<MusterTask[]> {
     if (rows.length === 0) return [];
     const ids = rows.map((row) => row.id);
-    const dependencies = await this.db.all<DependencyRow>(
-      `SELECT task_id, dependency_task_id, required_outcome, on_unsatisfied, required_verdict
-         FROM task_dependencies
+    const prerequisites = await this.db.all<PrerequisiteRow>(
+      `SELECT task_id, producer_task_id, required_lifecycle, on_unmet, required_verdict
+         FROM task_prerequisites
         WHERE workspace_id = ? AND task_id IN (${placeholders(ids.length)})
-        ORDER BY task_id, dependency_task_id`,
+        ORDER BY task_id, producer_task_id`,
       [this.workspaceId, ...ids],
     );
-    const byTask = new Map<string, TaskDependency[]>();
-    for (const dependency of dependencies) {
-      const list = byTask.get(dependency.task_id) ?? [];
-      list.push(decodeDependency(dependency));
-      byTask.set(dependency.task_id, list);
+    const byTask = new Map<string, TaskPrerequisite[]>();
+    for (const prerequisite of prerequisites) {
+      const list = byTask.get(prerequisite.task_id) ?? [];
+      list.push(decodePrerequisite(prerequisite));
+      byTask.set(prerequisite.task_id, list);
     }
     const bindings = await this.db.all<SessionBindingRow>(
       `SELECT task_id, runtime_epoch, backend, session_id
@@ -1264,9 +1303,10 @@ export class SqliteTaskRepository implements TaskRepository {
                    AND round_row.status = 'open'
               ) AS has_open_feedback_round,
                EXISTS (
-                 SELECT 1 FROM workflow_continuations continuation
+                SELECT 1 FROM workflow_continuations continuation
                  WHERE continuation.workspace_id = activation.workspace_id
                    AND continuation.run_id = activation.run_id
+                   AND continuation.kind = 'child_wait'
                     AND continuation.status = 'pending'
                ) AS has_pending_continuation,
                CASE
@@ -1576,8 +1616,8 @@ export class SqliteTaskRepository implements TaskRepository {
 
   async listReasoning(taskId: string): Promise<readonly PersistedReasoning[]> {
     const rows = await this.db.all<ReasoningRow>(
-      `SELECT id, task_id, turn_id, content, created_at, updated_at
-         FROM reasoning_segments WHERE workspace_id = ? AND task_id = ? ORDER BY created_at, id`,
+      `SELECT id, task_id, turn_id, ordering, content, created_at, updated_at
+         FROM reasoning_segments WHERE workspace_id = ? AND task_id = ? ORDER BY turn_id, ordering, id`,
       [this.workspaceId, taskId],
     );
     return rows.map(decodeReasoning);
@@ -1586,10 +1626,10 @@ export class SqliteTaskRepository implements TaskRepository {
   async listReasoningByIds(ids: readonly string[]): Promise<readonly PersistedReasoning[]> {
     if (ids.length === 0) return [];
     const rows = await this.db.all<ReasoningRow>(
-      `SELECT id, task_id, turn_id, content, created_at, updated_at
+      `SELECT id, task_id, turn_id, ordering, content, created_at, updated_at
          FROM reasoning_segments
-        WHERE workspace_id = ? AND id IN (${placeholders(ids.length)})
-        ORDER BY created_at, id`,
+         WHERE workspace_id = ? AND id IN (${placeholders(ids.length)})
+         ORDER BY turn_id, ordering, id`,
       [this.workspaceId, ...ids],
     );
     return rows.map(decodeReasoning);
@@ -2046,6 +2086,141 @@ export class SqliteTaskRepository implements TaskRepository {
     });
     if (!validated.ok || validated.fingerprint !== row.fingerprint) return undefined;
     return validated.definition;
+  }
+
+  async getLatestWorkflowDefinition(
+    definitionId: string,
+    ownerRootTaskId: string,
+  ): Promise<WorkflowDefinitionV1 | undefined> {
+    if (!definitionId || !ownerRootTaskId) return undefined;
+    const row = await this.db.get<{ version: number }>(
+      `SELECT version
+         FROM workflow_definitions
+        WHERE workspace_id = ?
+          AND definition_id = ?
+          AND (
+            scope_kind = 'workspace'
+            OR (scope_kind = 'root' AND owner_root_task_id = ?)
+          )
+        ORDER BY version DESC
+        LIMIT 1`,
+      [this.workspaceId, definitionId, ownerRootTaskId],
+    );
+    return row ? this.getWorkflowDefinition(definitionId, row.version) : undefined;
+  }
+
+  async getWorkflowStartResolution(input: {
+    ownerRootTaskId: string;
+    callerTaskId: string;
+    definitionId: string;
+    startIdempotencyKey: string;
+  }): Promise<{ version: number; policy: WorkflowPolicyV1 } | undefined> {
+    const row = await this.db.get<{ definition_version: number; policy_json: string }>(
+      `SELECT claim.definition_version, run.policy_json
+         FROM workflow_start_claims claim
+         JOIN workflow_runs run
+           ON run.workspace_id = claim.workspace_id
+          AND run.run_id = claim.run_id
+        WHERE claim.workspace_id = ?
+          AND claim.owner_task_id = ?
+          AND claim.caller_task_id = ?
+          AND claim.definition_id = ?
+          AND claim.idempotency_key = ?
+        ORDER BY claim.created_at, claim.definition_version
+        LIMIT 1`,
+      [
+        this.workspaceId,
+        input.ownerRootTaskId,
+        input.callerTaskId,
+        input.definitionId,
+        input.startIdempotencyKey,
+      ],
+    );
+    if (!row) return undefined;
+    const definition = await this.getWorkflowDefinition(input.definitionId, row.definition_version);
+    if (!definition) return undefined;
+    let policy: unknown;
+    try {
+      policy = JSON.parse(row.policy_json);
+    } catch {
+      return undefined;
+    }
+    const validated = validateDefineWorkflow({ ...definition, policy });
+    return validated.ok
+      ? { version: row.definition_version, policy: validated.definition.policy }
+      : undefined;
+  }
+
+  async resolveWorkflowInputArtifacts(
+    turnId: string,
+    ownerRootTaskId: string,
+    inputRefs: readonly string[],
+  ): Promise<readonly {
+    inputRef: string;
+    artifactId: string;
+    artifactRevision: number;
+  }[] | undefined> {
+    const uniqueRefs = [...new Set(inputRefs)];
+    if (!turnId || !ownerRootTaskId || uniqueRefs.length === 0 || uniqueRefs.length > 32) {
+      return undefined;
+    }
+    const activation = await this.db.get<{
+      run_id: string;
+      source_gate_id: string | null;
+      return_gate_id: string | null;
+      primary_turn_id: string;
+    }>(
+      `SELECT activation.run_id, activation.source_gate_id,
+              activation.return_gate_id, activation.primary_turn_id
+         FROM workflow_activations activation
+         JOIN workflow_runs run
+           ON run.workspace_id = activation.workspace_id
+          AND run.run_id = activation.run_id
+        WHERE activation.workspace_id = ?
+          AND activation.execution_turn_id = ?
+          AND run.owner_root_task_id = ?
+        LIMIT 1`,
+      [this.workspaceId, turnId, ownerRootTaskId],
+    );
+    if (!activation) return undefined;
+    let gateId = activation.source_gate_id ?? activation.return_gate_id;
+    if (!gateId) {
+      const primary = await this.db.get<{ gate_id: string | null }>(
+        `SELECT COALESCE(source_gate_id, return_gate_id) AS gate_id
+           FROM workflow_activations
+          WHERE workspace_id = ?
+            AND run_id = ?
+            AND execution_turn_id = ?
+          LIMIT 1`,
+        [this.workspaceId, activation.run_id, activation.primary_turn_id],
+      );
+      gateId = primary?.gate_id ?? null;
+    }
+    if (!gateId) return undefined;
+    const placeholders = uniqueRefs.map(() => '?').join(', ');
+    const rows = await this.db.all<{
+      input_ref: string;
+      artifact_id: string;
+      artifact_revision: number;
+    }>(
+      `SELECT input_ref, artifact_id, artifact_revision
+         FROM workflow_gate_fills
+        WHERE workspace_id = ?
+          AND run_id = ?
+          AND gate_id = ?
+          AND input_ref IN (${placeholders})`,
+      [this.workspaceId, activation.run_id, gateId, ...uniqueRefs],
+    );
+    if (rows.length !== uniqueRefs.length) return undefined;
+    const byRef = new Map(rows.map((row) => [row.input_ref, row]));
+    return uniqueRefs.map((inputRef) => {
+      const row = byRef.get(inputRef)!;
+      return {
+        inputRef,
+        artifactId: row.artifact_id,
+        artifactRevision: row.artifact_revision,
+      };
+    });
   }
 
   async getWorkflowStartPolicy(input: {
@@ -2966,6 +3141,9 @@ export class SqliteTaskRepository implements TaskRepository {
       });
       changes.push({ kind: 'turn', id: turnId, change: 'delete' });
     }
+    if (command.deleteTaskIds && command.deleteTaskIds.length > 0) {
+      statements.push(detachWorkflowNodeTasksStatement(this.workspaceId, command.deleteTaskIds));
+    }
     for (const taskId of command.deleteTaskIds ?? []) {
       statements.push({
         sql: 'DELETE FROM tasks WHERE workspace_id = ? AND id = ?',
@@ -2974,8 +3152,8 @@ export class SqliteTaskRepository implements TaskRepository {
       changes.push({ kind: 'task', id: taskId, change: 'delete' });
     }
 
-    // Insert/update task rows first, then dependencies. This allows sibling
-    // dependencies in one batch to reference a task inserted later in the
+    // Insert/update task rows first, then prerequisites. This allows sibling
+    // prerequisites in one batch to reference a task inserted later in the
     // caller's deterministic list.
     for (const task of command.tasks) {
       statements.push(taskStatement(this.workspaceId, task, !insertTasks.has(task.id)));
@@ -3007,9 +3185,9 @@ export class SqliteTaskRepository implements TaskRepository {
       changes.push(...closure.changes);
     }
     for (const task of command.tasks) {
-      statements.push({ sql: 'DELETE FROM task_dependencies WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, task.id] });
-      for (const dependency of task.dependencies) {
-        statements.push(dependencyStatement(this.workspaceId, task.id, dependency));
+      statements.push({ sql: 'DELETE FROM task_prerequisites WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, task.id] });
+      for (const prerequisite of task.prerequisites) {
+        statements.push(prerequisiteStatement(this.workspaceId, task.id, prerequisite));
       }
     }
 
@@ -3148,39 +3326,75 @@ export class SqliteTaskRepository implements TaskRepository {
     };
   }
 
+  /** Delete any selected task and its descendants regardless of runtime state. */
+  private async deleteTaskSubtree(
+    command: Extract<RepositoryCommand, { kind: 'deleteTaskSubtree' }>,
+  ): Promise<RepositoryCommandResult> {
+    const candidateCte = `WITH RECURSIVE candidate(id) AS (
+          SELECT id
+            FROM tasks
+           WHERE workspace_id = ? AND id = ?
+          UNION
+          SELECT child.id
+            FROM tasks child
+            JOIN candidate ON child.parent_id = candidate.id
+           WHERE child.workspace_id = ?
+        )`;
+    const candidateParams: SqlValue[] = [
+      this.workspaceId,
+      command.rootTaskId,
+      this.workspaceId,
+    ];
+    const candidateIds = 'SELECT id FROM candidate';
+    const guard: SqlStatement = {
+      sql: `${candidateCte}
+        UPDATE tasks SET updated_at = updated_at
+         WHERE workspace_id = ?
+           AND id IN (${candidateIds})`,
+      params: [...candidateParams, this.workspaceId],
+    };
+    const deleteWorkflowArtifactSources: SqlStatement = {
+      sql: `${candidateCte}
+        DELETE FROM workflow_artifact_sources
+         WHERE workspace_id = ?
+           AND (producer_task_id IN (${candidateIds}) OR caller_task_id IN (${candidateIds}))`,
+      params: [...candidateParams, this.workspaceId],
+    };
+    const detachWorkflowNodes: SqlStatement = {
+      sql: `${candidateCte}
+        UPDATE workflow_nodes SET task_id = NULL
+         WHERE workspace_id = ?
+           AND task_id IN (${candidateIds})`,
+      params: [...candidateParams, this.workspaceId],
+    };
+    const deleteTasks: SqlStatement = {
+      sql: `${candidateCte}
+        DELETE FROM tasks
+         WHERE workspace_id = ?
+           AND id IN (${candidateIds})`,
+      params: [...candidateParams, this.workspaceId],
+    };
+    const results = await this.writeIfFirstChanged(
+      guard,
+      [deleteWorkflowArtifactSources, detachWorkflowNodes, deleteTasks],
+      { kind: 'task', id: command.rootTaskId, change: 'delete_subtree' },
+      new Date().toISOString(),
+    );
+    return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
+  }
+
   /**
-   * Delete one or all top-level roots only when every task in each candidate
-   * subtree is currently removable. The recursive CTE and the live/queued/
-   * dependency predicates execute inside the same IMMEDIATE transaction as the
-   * DELETE, so a late child or turn cannot be orphaned by a stale host read.
+   * Delete idle/terminal top-level roots except the focused root. The recursive
+   * CTE and active-state predicates share the same transaction as the DELETE.
    */
   private async deleteTaskRootsIfIdle(
-    command:
-      | Extract<RepositoryCommand, { kind: 'clearHistory' }>
-      | Extract<RepositoryCommand, { kind: 'deleteTaskSubtreeIfIdle' }>,
+    command: Extract<RepositoryCommand, { kind: 'clearHistory' }>,
   ): Promise<RepositoryCommandResult> {
-    const isSingle = command.kind === 'deleteTaskSubtreeIfIdle';
-    if (isSingle) {
-      const root = await this.db.get<{ parent_id: string | null }>(
-        'SELECT parent_id FROM tasks WHERE workspace_id = ? AND id = ?',
-        [this.workspaceId, command.rootTaskId],
-      );
-      if (!root) return { ok: true, changed: false };
-      if (root.parent_id !== null) {
-        return { ok: true, changed: false, reason: 'Only top-level tasks can be deleted.' };
-      }
-      if (command.preserveRootTaskId === command.rootTaskId) {
-        return { ok: true, changed: false, reason: 'Cannot delete the focused task.' };
-      }
-    }
-    const rootFilter = isSingle ? 'AND id = ?' : '';
-    const rootParams: SqlValue[] = isSingle ? [command.rootTaskId] : [];
     const preserve = command.preserveRootTaskId ?? null;
-    const sql = `WITH RECURSIVE candidate(id, root_id) AS (
+    const candidateCte = `WITH RECURSIVE candidate(id, root_id) AS (
           SELECT id, id
             FROM tasks
            WHERE workspace_id = ? AND parent_id IS NULL
-             ${rootFilter}
              AND (? IS NULL OR id <> ?)
           UNION
           SELECT child.id, candidate.root_id
@@ -3209,16 +3423,16 @@ export class SqliteTaskRepository implements TaskRepository {
                      OR json_extract(task.payload_json, '$.outcomeProposal') IS NOT NULL
                      OR EXISTS (
                           SELECT 1
-                            FROM task_dependencies dependency
-                            LEFT JOIN tasks producer
-                              ON producer.workspace_id = dependency.workspace_id
-                             AND producer.id = dependency.dependency_task_id
-                           WHERE dependency.workspace_id = task.workspace_id
-                             AND dependency.task_id = task.id
-                             AND NOT (
-                               ((dependency.required_outcome = 'succeeded' AND producer.lifecycle = 'succeeded')
-                                 OR (dependency.required_outcome = 'settled' AND producer.lifecycle IN ('succeeded','failed','cancelled','skipped')))
-                               AND (dependency.required_verdict IS NULL
+                             FROM task_prerequisites prerequisite
+                             LEFT JOIN tasks producer
+                               ON producer.workspace_id = prerequisite.workspace_id
+                              AND producer.id = prerequisite.producer_task_id
+                            WHERE prerequisite.workspace_id = task.workspace_id
+                              AND prerequisite.task_id = task.id
+                              AND NOT (
+                                ((prerequisite.required_lifecycle = 'succeeded' AND producer.lifecycle = 'succeeded')
+                                  OR (prerequisite.required_lifecycle = 'terminal' AND producer.lifecycle IN ('succeeded','failed','cancelled','skipped')))
+                                AND (prerequisite.required_verdict IS NULL
                                  OR json_extract(producer.payload_json, '$.taskResult.verdict.status') = 'pass')
                              )
                         )
@@ -3237,31 +3451,46 @@ export class SqliteTaskRepository implements TaskRepository {
                                 )
                         )
                    )
-                 )
-        )
-        DELETE FROM tasks
-         WHERE workspace_id = ?
-           AND id IN (
-             SELECT candidate.id FROM candidate
-              WHERE candidate.root_id NOT IN (SELECT root_id FROM blocked)
-           )`;
-    const params: SqlValue[] = [
+                  )
+         )`;
+    const candidateParams: SqlValue[] = [
       this.workspaceId,
-      ...rootParams,
       preserve,
       preserve,
-      this.workspaceId,
       this.workspaceId,
       this.workspaceId,
     ];
+    const eligibleCandidateIds = `SELECT candidate.id FROM candidate
+              WHERE candidate.root_id NOT IN (SELECT root_id FROM blocked)`;
+    const guard: SqlStatement = {
+      sql: `${candidateCte}
+        UPDATE tasks SET updated_at = updated_at
+         WHERE workspace_id = ?
+           AND id IN (${eligibleCandidateIds})`,
+      params: [...candidateParams, this.workspaceId],
+    };
+    const detachWorkflowNodes: SqlStatement = {
+      sql: `${candidateCte}
+        UPDATE workflow_nodes SET task_id = NULL
+         WHERE workspace_id = ?
+           AND task_id IN (${eligibleCandidateIds})`,
+      params: [...candidateParams, this.workspaceId],
+    };
+    const deleteTasks: SqlStatement = {
+      sql: `${candidateCte}
+        DELETE FROM tasks
+         WHERE workspace_id = ?
+           AND id IN (${eligibleCandidateIds})`,
+      params: [...candidateParams, this.workspaceId],
+    };
     const change: ChangeRecord = {
       kind: 'task',
-      id: isSingle ? command.rootTaskId : this.workspaceId,
-      change: isSingle ? 'delete_subtree' : 'clear_history',
+      id: this.workspaceId,
+      change: 'clear_history',
     };
     const results = await this.writeIfFirstChanged(
-      { sql, params },
-      [],
+      guard,
+      [detachWorkflowNodes, deleteTasks],
       change,
       new Date().toISOString(),
     );
@@ -3269,9 +3498,6 @@ export class SqliteTaskRepository implements TaskRepository {
     return {
       ok: true,
       changed,
-      ...(!changed && isSingle
-        ? { reason: 'Cannot delete a task while it or a subtask is still active.' }
-        : {}),
     };
   }
 
@@ -3368,10 +3594,10 @@ export class SqliteTaskRepository implements TaskRepository {
         return this.cascadeTaskLifecycle(command);
       case 'resolveChildWait':
         return this.resolveChildWait(command);
-      case 'applyDependencyTerminal':
-        return this.applyDependencyTerminal(command);
-      case 'applyDependencyTerminals':
-        return this.applyDependencyTerminals(command);
+      case 'applyPrerequisiteTerminal':
+        return this.applyPrerequisiteTerminal(command);
+      case 'applyPrerequisiteTerminals':
+        return this.applyPrerequisiteTerminals(command);
       case 'reconcileOrphanTurn':
         return this.reconcileOrphanTurn(command);
       case 'applyVerdictRemediation':
@@ -3380,13 +3606,20 @@ export class SqliteTaskRepository implements TaskRepository {
         return this.writeTask(command.task, true);
       case 'clearHistory':
         return this.deleteTaskRootsIfIdle(command);
-      case 'deleteTaskSubtreeIfIdle':
-        return this.deleteTaskRootsIfIdle(command);
+      case 'deleteTaskSubtree':
+        return this.deleteTaskSubtree(command);
       case 'renameTask':
         return this.renameTask(command);
       case 'deleteTask': {
         const results = await this.writeIfFirstChanged(
-          { sql: 'DELETE FROM tasks WHERE workspace_id = ? AND id = ?', params: [this.workspaceId, command.taskId] }, [],
+          {
+            sql: 'UPDATE tasks SET updated_at = updated_at WHERE workspace_id = ? AND id = ?',
+            params: [this.workspaceId, command.taskId],
+          },
+          [
+            detachWorkflowNodeTasksStatement(this.workspaceId, [command.taskId]),
+            { sql: 'DELETE FROM tasks WHERE workspace_id = ? AND id = ?', params: [this.workspaceId, command.taskId] },
+          ],
           { kind: 'task', id: command.taskId, change: 'delete' }, new Date().toISOString(),
         );
         return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
@@ -3489,6 +3722,8 @@ export class SqliteTaskRepository implements TaskRepository {
         return this.startWorkflowRun(command);
       case 'reapWorkflowTimeouts':
         return this.reapWorkflowTimeouts(command);
+      case 'resolveWorkflowStartContinuation':
+        return this.resolveWorkflowStartContinuation(command);
       case 'recoverWorkflowActivation':
         return this.recoverWorkflowActivation(command);
       case 'claimOperation':
@@ -3631,9 +3866,9 @@ export class SqliteTaskRepository implements TaskRepository {
   private async writeTask(task: MusterTask, upsert: boolean): Promise<RepositoryCommandResult> {
     const statements: SqlStatement[] = [taskStatement(this.workspaceId, task, upsert)];
     if (upsert) {
-      statements.push({ sql: 'DELETE FROM task_dependencies WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, task.id] });
+      statements.push({ sql: 'DELETE FROM task_prerequisites WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, task.id] });
     }
-    for (const dependency of task.dependencies) statements.push(dependencyStatement(this.workspaceId, task.id, dependency));
+    for (const prerequisite of task.prerequisites) statements.push(prerequisiteStatement(this.workspaceId, task.id, prerequisite));
     const results = await this.write(statements, [{ kind: 'task', id: task.id, change: upsert ? 'upsert' : 'insert' }], task.updatedAt);
     return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
   }
@@ -3754,8 +3989,8 @@ export class SqliteTaskRepository implements TaskRepository {
     const invalid = validateRootInitialTurn(command);
     if (invalid) return { ok: true, changed: false, reason: invalid };
     const statements: SqlStatement[] = [taskStatement(this.workspaceId, command.task, false)];
-    for (const dependency of command.task.dependencies) {
-      statements.push(dependencyStatement(this.workspaceId, command.task.id, dependency));
+    for (const prerequisite of command.task.prerequisites) {
+      statements.push(prerequisiteStatement(this.workspaceId, command.task.id, prerequisite));
     }
     statements.push(
       turnStatement(this.workspaceId, command.turn, false),
@@ -3792,9 +4027,9 @@ export class SqliteTaskRepository implements TaskRepository {
       command.expectedTaskRevision,
       command.maxTurnsPerTask,
     );
-    statements.push({ sql: 'DELETE FROM task_dependencies WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, command.task.id] });
-    for (const dependency of command.task.dependencies) {
-      statements.push(dependencyStatement(this.workspaceId, command.task.id, dependency));
+    statements.push({ sql: 'DELETE FROM task_prerequisites WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, command.task.id] });
+    for (const prerequisite of command.task.prerequisites) {
+      statements.push(prerequisiteStatement(this.workspaceId, command.task.id, prerequisite));
     }
     statements.push(
       turnStatement(this.workspaceId, command.turn, false),
@@ -3823,8 +4058,8 @@ export class SqliteTaskRepository implements TaskRepository {
     const invalid = validateRetryTurn(command);
     if (invalid) return { ok: true, changed: false, reason: invalid };
     const rest: SqlStatement[] = [
-      { sql: 'DELETE FROM task_dependencies WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, command.task.id] },
-      ...command.task.dependencies.map((dependency) => dependencyStatement(this.workspaceId, command.task.id, dependency)),
+      { sql: 'DELETE FROM task_prerequisites WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, command.task.id] },
+      ...command.task.prerequisites.map((prerequisite) => prerequisiteStatement(this.workspaceId, command.task.id, prerequisite)),
       turnStatement(this.workspaceId, command.turn, false),
       ...command.turn.inputs.map((input, ordering) => turnInputStatement(this.workspaceId, command.turn.id, ordering, input)),
     ];
@@ -3855,8 +4090,8 @@ export class SqliteTaskRepository implements TaskRepository {
     const invalid = validateQueueTaskTurn(command);
     if (invalid) return { ok: true, changed: false, reason: invalid };
     const rest: SqlStatement[] = [
-      { sql: 'DELETE FROM task_dependencies WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, command.task.id] },
-      ...command.task.dependencies.map((dependency) => dependencyStatement(this.workspaceId, command.task.id, dependency)),
+      { sql: 'DELETE FROM task_prerequisites WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, command.task.id] },
+      ...command.task.prerequisites.map((prerequisite) => prerequisiteStatement(this.workspaceId, command.task.id, prerequisite)),
       turnStatement(this.workspaceId, command.turn, false),
       ...command.turn.inputs.map((input, ordering) => turnInputStatement(this.workspaceId, command.turn.id, ordering, input)),
     ];
@@ -3880,8 +4115,8 @@ export class SqliteTaskRepository implements TaskRepository {
       return { ok: true, changed: false, reason: 'continuation turn is invalid' };
     }
     const rest: SqlStatement[] = [
-      { sql: 'DELETE FROM task_dependencies WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, command.task.id] },
-      ...command.task.dependencies.map((dependency) => dependencyStatement(this.workspaceId, command.task.id, dependency)),
+      { sql: 'DELETE FROM task_prerequisites WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, command.task.id] },
+      ...command.task.prerequisites.map((prerequisite) => prerequisiteStatement(this.workspaceId, command.task.id, prerequisite)),
       ...command.turns.flatMap((turn) => [
         turnStatement(this.workspaceId, turn, false),
         ...turn.inputs.map((input, ordering) => turnInputStatement(this.workspaceId, turn.id, ordering, input)),
@@ -4278,14 +4513,14 @@ export class SqliteTaskRepository implements TaskRepository {
     return this.applyTaskAndOptionalTurn(command, 'child_wait');
   }
 
-  private async applyDependencyTerminal(
-    command: Extract<RepositoryCommand, { kind: 'applyDependencyTerminal' }>,
+  private async applyPrerequisiteTerminal(
+    command: Extract<RepositoryCommand, { kind: 'applyPrerequisiteTerminal' }>,
   ): Promise<RepositoryCommandResult> {
-    return this.applyTaskAndOptionalTurn(command, 'dependency_terminal');
+    return this.applyTaskAndOptionalTurn(command, 'prerequisite_terminal');
   }
 
-  private async applyDependencyTerminals(
-    command: Extract<RepositoryCommand, { kind: 'applyDependencyTerminals' }>,
+  private async applyPrerequisiteTerminals(
+    command: Extract<RepositoryCommand, { kind: 'applyPrerequisiteTerminals' }>,
   ): Promise<RepositoryCommandResult> {
     if (command.mutations.length === 0 || command.expectedTasks.length === 0) return { ok: true, changed: false };
     const rest: SqlStatement[] = [];
@@ -4294,8 +4529,8 @@ export class SqliteTaskRepository implements TaskRepository {
       if (mutation.turn) rest.push(...turnMutationStatements(this.workspaceId, mutation.turn));
     }
     const changes: ChangeRecord[] = command.mutations.flatMap((mutation) => [
-      { kind: 'task' as const, id: mutation.taskId, change: 'dependency_terminal' },
-      ...(mutation.turn ? [{ kind: 'turn' as const, id: mutation.turn.id, taskId: mutation.turn.taskId, change: 'dependency_terminal' }] : []),
+      { kind: 'task' as const, id: mutation.taskId, change: 'prerequisite_terminal' },
+      ...(mutation.turn ? [{ kind: 'turn' as const, id: mutation.turn.id, taskId: mutation.turn.taskId, change: 'prerequisite_terminal' }] : []),
     ]);
     const results = await this.writeIfFirstChanged(
       taskRevisionGuardStatement(this.workspaceId, command.expectedTasks),
@@ -4309,7 +4544,7 @@ export class SqliteTaskRepository implements TaskRepository {
   private async applyTaskAndOptionalTurn(
     command:
       | Extract<RepositoryCommand, { kind: 'resolveChildWait' }>
-      | Extract<RepositoryCommand, { kind: 'applyDependencyTerminal' }>,
+      | Extract<RepositoryCommand, { kind: 'applyPrerequisiteTerminal' }>,
     change: string,
   ): Promise<RepositoryCommandResult> {
     const rest: SqlStatement[] = [
@@ -4364,6 +4599,9 @@ export class SqliteTaskRepository implements TaskRepository {
       return { ok: true, changed: false, reason: invalid ?? 'remediation revision guard is empty' };
     }
     const rest: SqlStatement[] = [];
+    if (command.deletedTaskIds && command.deletedTaskIds.length > 0) {
+      rest.push(detachWorkflowNodeTasksStatement(this.workspaceId, command.deletedTaskIds));
+    }
     for (const id of command.deletedTaskIds ?? []) {
       rest.push({ sql: 'DELETE FROM tasks WHERE workspace_id = ? AND id = ?', params: [this.workspaceId, id] });
     }
@@ -4878,6 +5116,107 @@ export class SqliteTaskRepository implements TaskRepository {
           }
         : undefined,
     );
+    if (
+      command.resumeCallerOnCompletion &&
+      validated.callerTaskId &&
+      validated.callerTurnId
+    ) {
+      const startContinuationId = deriveWorkflowStartContinuationId(
+        identities.runId,
+        validated.callerTurnId,
+      );
+      const activeContinuation = await this.db.get<{ continuation_id?: string }>(
+        `SELECT continuation_id
+           FROM workflow_continuations
+          WHERE workspace_id = ? AND kind = 'start_wait' AND caller_task_id = ?
+            AND status IN ('pending', 'resolved')
+          ORDER BY created_at, continuation_id
+          LIMIT 1`,
+        [this.workspaceId, validated.callerTaskId],
+      );
+      if (
+        activeContinuation?.continuation_id &&
+        activeContinuation.continuation_id !== startContinuationId
+      ) {
+        return invalidStart('invalid start');
+      }
+    }
+
+    const existingStartOperation = await this.db.get<{
+      fingerprint?: string;
+    }>(
+      `SELECT fingerprint FROM operations
+        WHERE workspace_id = ? AND ledger_key = ?`,
+      [this.workspaceId, ledgerKey],
+    );
+    if (existingStartOperation?.fingerprint) {
+      if (existingStartOperation.fingerprint !== fingerprint) {
+        const conflict = startWorkflowConflict(validated.definitionId, validated.version);
+        return {
+          ok: false,
+          changed: false,
+          conflict: true,
+          reason: conflict.reason,
+          operation: {
+            fingerprint: existingStartOperation.fingerprint,
+            result: { ok: false, error: conflict.reason },
+          },
+        };
+      }
+
+      let continuationChanged = false;
+      if (
+        command.resumeCallerOnCompletion &&
+        validated.callerTaskId &&
+        validated.callerTurnId
+      ) {
+        const continuationId = deriveWorkflowStartContinuationId(
+          identities.runId,
+          validated.callerTurnId,
+        );
+        const results = await this.writeIfFirstChanged(
+          {
+            sql: `INSERT INTO workflow_continuations (
+                    workspace_id, run_id, continuation_id, caller_task_id, caller_turn_id,
+                    kind, status, payload_json, created_at, updated_at
+                  ) VALUES (?,?,?,?,?,'start_wait','pending',?,?,?)
+                  ON CONFLICT(workspace_id, run_id, continuation_id) DO NOTHING`,
+            params: [
+              this.workspaceId,
+              identities.runId,
+              continuationId,
+              validated.callerTaskId,
+              validated.callerTurnId,
+              encodePayload({
+                kind: 'start_wait',
+                runId: identities.runId,
+                callerTaskId: validated.callerTaskId,
+                callerTurnId: validated.callerTurnId,
+              }),
+              validated.createdAt,
+              validated.createdAt,
+            ],
+          },
+          [],
+          {
+            kind: 'task',
+            id: validated.callerTaskId,
+            taskId: validated.callerTaskId,
+            change: 'effect',
+          },
+          validated.createdAt,
+        );
+        continuationChanged = (results[0]?.changes ?? 0) > 0;
+      }
+      return {
+        ok: true,
+        changed: continuationChanged,
+        operation: {
+          fingerprint,
+          result: { ok: true, data: startWorkflowReplay(validated) },
+        },
+      };
+    }
 
     const nodeById = new Map(topo.nodes.map((node) => [node.nodeId, node] as const));
     const entryByNode = new Map(identities.entries.map((e) => [e.nodeId, e]));
@@ -5034,6 +5373,34 @@ export class SqliteTaskRepository implements TaskRepository {
           validated.createdAt,
         ],
       });
+      if (command.resumeCallerOnCompletion) {
+        const continuationId = deriveWorkflowStartContinuationId(
+          identities.runId,
+          validated.callerTurnId,
+        );
+        rest.push({
+          sql: `INSERT INTO workflow_continuations (
+                  workspace_id, run_id, continuation_id, caller_task_id, caller_turn_id,
+                  kind, status, payload_json, created_at, updated_at
+                ) VALUES (?,?,?,?,?,'start_wait','pending',?,?,?)
+                ON CONFLICT(workspace_id, run_id, continuation_id) DO NOTHING`,
+          params: [
+            this.workspaceId,
+            identities.runId,
+            continuationId,
+            validated.callerTaskId,
+            validated.callerTurnId,
+            encodePayload({
+              kind: 'start_wait',
+              runId: identities.runId,
+              callerTaskId: validated.callerTaskId,
+              callerTurnId: validated.callerTurnId,
+            }),
+            validated.createdAt,
+            validated.createdAt,
+          ],
+        });
+      }
     }
 
     for (const entry of identities.entries) {
@@ -5043,9 +5410,9 @@ export class SqliteTaskRepository implements TaskRepository {
         role: node.role ?? 'worker',
         lifecycle: 'open',
         releaseState: 'released',
-        goal: validated.goal,
+        goal: workflowNodeTaskGoal(node, validated.goal),
         parentId: validated.callerTaskId ?? null,
-        dependencies: [],
+        prerequisites: [],
         backend: node.backend ?? validated.backend,
         ...(node.model !== undefined ? { model: node.model } : {}),
         ...(node.taskType !== undefined ? { taskType: node.taskType } : {}),
@@ -5472,6 +5839,11 @@ export class SqliteTaskRepository implements TaskRepository {
     const update = claimTurnStatement(this.workspaceId, command);
     const rest: SqlStatement[] = [
       workflowActivationRunningStatement(this.workspaceId, command.turnId, command.startedAt),
+      workflowStartContinuationConsumptionStatement(
+        this.workspaceId,
+        command.turnId,
+        command.startedAt,
+      ),
     ];
     if (command.sessionId) rest.push(sessionClaimStatement(this.workspaceId, command.turnId, command.sessionId, command.startedAt));
     for (const key of command.resourceKeys) rest.push(resourceClaimStatement(this.workspaceId, command.turnId, key, command.startedAt));
@@ -5498,8 +5870,16 @@ export class SqliteTaskRepository implements TaskRepository {
       ...(claims
         ? [workflowActivationRunningStatement(this.workspaceId, command.turn.id, command.startedAt)]
         : []),
-      { sql: 'DELETE FROM task_dependencies WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, command.task.id] },
-      ...command.task.dependencies.map((dependency) => dependencyStatement(this.workspaceId, command.task.id, dependency)),
+      ...(claims && command.turn.workflowResume?.kind === 'start_workflow'
+        ? [workflowStartContinuationConsumptionStatement(
+            this.workspaceId,
+            command.turn.id,
+            command.startedAt,
+            command.turn.workflowResume.continuationId,
+          )]
+        : []),
+      { sql: 'DELETE FROM task_prerequisites WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, command.task.id] },
+      ...command.task.prerequisites.map((prerequisite) => prerequisiteStatement(this.workspaceId, command.task.id, prerequisite)),
       turnStatement(this.workspaceId, command.turn, true),
       { sql: 'DELETE FROM turn_inputs WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, command.turn.id] },
       ...command.turn.inputs.map((input, ordering) => turnInputStatement(this.workspaceId, command.turn.id, ordering, input)),
@@ -5746,6 +6126,14 @@ export class SqliteTaskRepository implements TaskRepository {
     return {
       ok: true,
       changed: (results[0]?.changes ?? 0) > 0,
+      ...((results[0]?.changes ?? 0) > 0
+        ? {
+            affectedTaskIds: [...new Set(uniqueChanges.flatMap((change): string[] => {
+              if (change.kind === 'task') return [change.id];
+              return change.taskId ? [change.taskId] : [];
+            }))].sort(),
+          }
+        : {}),
       ...((results[0]?.changes ?? 0) === 0 ? { reason: 'turn is no longer live' } : {}),
     };
   }
@@ -5888,6 +6276,7 @@ export class SqliteTaskRepository implements TaskRepository {
         sourceTurnId: command.turn.id,
       });
     }
+    const resultBody = workflowResultFromSettlement(command, disposition.result);
     const edge = topology.kind === 'graph_v1'
       ? outgoingEdge(topology, producerNode.node_id)
       : undefined;
@@ -5895,7 +6284,6 @@ export class SqliteTaskRepository implements TaskRepository {
       const artifactId = deriveProducerArtifactId(producerNode.run_id, producerNode.node_id);
       const revision = 1;
       const finishedAt = command.turn.finishedAt ?? new Date().toISOString();
-      const resultBody = typeof disposition.result === 'string' ? disposition.result : undefined;
       const fenceId = stableId('wfc', `${producerNode.run_id}\0terminal_next\0${command.turn.id}`);
       const taskClosure = await this.planWorkflowTaskLifecycleClosure({
         runIds: [producerNode.run_id],
@@ -5955,6 +6343,12 @@ export class SqliteTaskRepository implements TaskRepository {
             taskId: command.task.id,
             turnId: command.turn.id,
           }),
+          {
+            sql: `UPDATE workflow_nodes
+                     SET status = 'succeeded'
+                   WHERE workspace_id = ? AND run_id = ? AND status = 'active'`,
+            params: [this.workspaceId, producerNode.run_id],
+          },
           {
             sql: `UPDATE workflow_runs
                      SET status = 'succeeded',
@@ -6070,7 +6464,6 @@ export class SqliteTaskRepository implements TaskRepository {
       ],
     });
 
-      const resultBody = typeof disposition.result === 'string' ? disposition.result : undefined;
     const artifactPayload = encodePayload({
       kind: 'next_result',
       schema: 1,
@@ -6231,7 +6624,13 @@ export class SqliteTaskRepository implements TaskRepository {
 
     const activation = deriveNodeActivationIdentities(producerNode.run_id, edge.toNodeId);
     const consumerSpec = topology.nodes.find((n) => n.nodeId === edge.toNodeId);
+    const producerSpec = topology.nodes.find((n) => n.nodeId === producerNode.node_id);
+    if (!consumerSpec || !producerSpec) return empty;
     const consumerRole = consumerSpec?.role ?? 'worker';
+    const consumerGoal = workflowNodeTaskGoal(
+      consumerSpec,
+      workflowRunGoalFromTask(producerSpec, command.task.goal),
+    );
     const taskPayloadJson = encodePayload({
       capabilities: [],
       executionPolicy: { maxTurns: 10, maxAutomaticRetries: 1 },
@@ -6257,11 +6656,11 @@ export class SqliteTaskRepository implements TaskRepository {
       params: [
         activation.taskId,
         this.workspaceId,
-        null,
+        command.task.parentId,
         consumerRole,
         'open',
         'released',
-        command.task.goal,
+        consumerGoal,
         command.task.backend,
         null,
         0,
@@ -6915,7 +7314,7 @@ export class SqliteTaskRepository implements TaskRepository {
         ],
       });
 
-      const feedbackContent = `[workflow-feedback-request] round=${roundId} target=${target.nodeId}${disposition.note ? `\n[feedback]\n${disposition.note.slice(0, 4000)}` : ''}`;
+      const feedbackContent = `[workflow-feedback-request] round=${roundId} target=${target.nodeId}${disposition.note ? `\n[feedback]\n${disposition.note}` : ''}`;
       statements.push({
         sql: `INSERT INTO turns (
                 id, workspace_id, task_id, sequence, status, trigger, created_at, started_at, settled_at, payload_json
@@ -7733,7 +8132,8 @@ export class SqliteTaskRepository implements TaskRepository {
       callerNode
         ? `SELECT continuation_id, invocation_key, invocation_fingerprint
              FROM workflow_continuations
-            WHERE workspace_id = ? AND run_id = ? AND status = 'pending'
+            WHERE workspace_id = ? AND run_id = ? AND kind = 'child_wait'
+              AND status = 'pending'
             LIMIT 1`
         : `SELECT continuation_id, invocation_key, invocation_fingerprint
              FROM workflow_continuations
@@ -8216,9 +8616,9 @@ export class SqliteTaskRepository implements TaskRepository {
         role: node?.role ?? 'worker',
         lifecycle: 'open' as const,
         releaseState: 'released' as const,
-        goal: validated.goal,
+         goal: workflowNodeTaskGoal(node ?? { nodeId: entry.nodeId }, validated.goal),
         parentId: command.task.id,
-        dependencies: [],
+        prerequisites: [],
         backend: node?.backend ?? validated.backend,
         ...(node?.model ? { model: node.model } : {}),
         ...(node?.taskType ? { taskType: node.taskType } : {}),
@@ -8516,7 +8916,8 @@ export class SqliteTaskRepository implements TaskRepository {
     if (!aggregatePolicyRun || !Number.isInteger(aggregatePolicyRun.max_aggregate_bytes)) {
       return empty;
     }
-    const returnContent = `[workflow-child-return] childRunId=${childNode.runId} change=${disposition.change}\n${String(disposition.result ?? '')}`;
+    const resultBody = workflowResultFromSettlement(command, disposition.result);
+    const returnContent = `[workflow-child-return] childRunId=${childNode.runId} change=${disposition.change}\n${resultBody ?? ''}`;
     if (Buffer.byteLength(returnContent, 'utf8') > aggregatePolicyRun.max_aggregate_bytes) {
       return this.planWorkflowFailClosure({
         runId: childNode.runId,
@@ -8561,6 +8962,12 @@ export class SqliteTaskRepository implements TaskRepository {
         continuation.run_id,
         continuation.continuation_id,
       ],
+    });
+    statements.push({
+      sql: `UPDATE workflow_nodes
+               SET status = 'succeeded'
+             WHERE workspace_id = ? AND run_id = ? AND status = 'active'`,
+      params: [this.workspaceId, childNode.runId],
     });
     statements.push({
       sql: `UPDATE workflow_runs
@@ -8611,7 +9018,7 @@ export class SqliteTaskRepository implements TaskRepository {
       kind: 'child_return',
       childRunId: childNode.runId,
       change: disposition.change,
-      result: disposition.result ?? null,
+      result: resultBody ?? null,
       sourceTurnId: command.turn.id,
     });
     statements.push({
@@ -8968,6 +9375,194 @@ export class SqliteTaskRepository implements TaskRepository {
     return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
   }
 
+  private async resolveWorkflowStartContinuation(
+    command: Extract<RepositoryCommand, { kind: 'resolveWorkflowStartContinuation' }>,
+  ): Promise<RepositoryCommandResult> {
+    const row = await this.db.get<{
+      run_id: string;
+      continuation_id: string;
+      caller_task_id: string | null;
+      caller_turn_id: string | null;
+      run_status: 'succeeded' | 'failed' | 'cancelled';
+      terminal_reason_code: string | null;
+      terminal_result_run_id: string | null;
+      terminal_result_artifact_id: string | null;
+      terminal_result_artifact_revision: number | null;
+      artifact_kind: string | null;
+      artifact_payload_json: string | null;
+      caller_lifecycle: string | null;
+    }>(
+      `SELECT continuation.run_id, continuation.continuation_id,
+              continuation.caller_task_id, continuation.caller_turn_id,
+              run.status AS run_status, run.terminal_reason_code,
+              run.terminal_result_run_id, run.terminal_result_artifact_id,
+              run.terminal_result_artifact_revision,
+              artifact.kind AS artifact_kind, artifact.payload_json AS artifact_payload_json,
+              caller.lifecycle AS caller_lifecycle
+         FROM workflow_continuations continuation
+         JOIN workflow_runs run
+           ON run.workspace_id = continuation.workspace_id
+          AND run.run_id = continuation.run_id
+         LEFT JOIN workflow_artifacts artifact
+           ON artifact.workspace_id = run.workspace_id
+          AND artifact.run_id = run.terminal_result_run_id
+          AND artifact.artifact_id = run.terminal_result_artifact_id
+          AND artifact.revision = run.terminal_result_artifact_revision
+         LEFT JOIN tasks caller
+           ON caller.workspace_id = continuation.workspace_id
+          AND caller.id = continuation.caller_task_id
+        WHERE continuation.workspace_id = ?
+          AND continuation.kind = 'start_wait'
+          AND continuation.status = 'pending'
+          AND run.status IN ('succeeded', 'failed', 'cancelled')
+        ORDER BY continuation.created_at, continuation.continuation_id
+        LIMIT 1`,
+      [this.workspaceId],
+    );
+    if (!row) return { ok: true, changed: false };
+
+    if (
+      !row.caller_task_id ||
+      !row.caller_turn_id ||
+      row.caller_lifecycle !== 'open'
+    ) {
+      const results = await this.writeIfFirstChanged(
+        {
+          sql: `UPDATE workflow_continuations
+                   SET status = 'cancelled', outcome = 'cancelled',
+                       reason_code = 'caller_unavailable', resolved_at = ?, updated_at = ?
+                 WHERE workspace_id = ? AND run_id = ? AND continuation_id = ?
+                   AND kind = 'start_wait' AND status = 'pending'`,
+          params: [
+            command.now,
+            command.now,
+            this.workspaceId,
+            row.run_id,
+            row.continuation_id,
+          ],
+        },
+        [],
+        {
+          kind: 'task',
+          id: row.caller_task_id ?? row.run_id,
+          ...(row.caller_task_id ? { taskId: row.caller_task_id } : {}),
+          change: 'effect',
+        },
+        command.now,
+      );
+      return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
+    }
+
+    const resumeTurnId = deriveWorkflowStartResumeTurnId(row.run_id, row.caller_turn_id);
+    const resumeMessageId = deriveWorkflowStartResumeMessageId(row.run_id, row.caller_turn_id);
+    const completion: Record<string, unknown> = {
+      runRef: row.run_id,
+      status: row.run_status,
+    };
+    if (row.terminal_reason_code && /^[a-z0-9_]{1,64}$/.test(row.terminal_reason_code)) {
+      completion.reason = row.terminal_reason_code;
+    }
+    if (row.artifact_kind === 'next_result' && row.artifact_payload_json) {
+      try {
+        const payload = JSON.parse(row.artifact_payload_json) as Record<string, unknown>;
+        if (payload.kind === 'next_result' && typeof payload.result === 'string') {
+          completion.result = payload.result;
+        }
+      } catch {
+        // The terminal status and reason remain sufficient when an artifact is corrupt.
+      }
+    }
+    const content = [
+      '[workflow-run-complete]',
+      'The workflow started in the prior turn is now terminal. Continue the caller task from this result:',
+      JSON.stringify(completion),
+    ].join('\n');
+    const sequence = (await this.getMaxTurnSequence(row.caller_task_id)) + 1;
+    const turn: TaskTurn = {
+      id: resumeTurnId,
+      taskId: row.caller_task_id,
+      sequence,
+      trigger: 'engine',
+      status: 'queued',
+      workflowResume: {
+        kind: 'start_workflow',
+        runId: row.run_id,
+        continuationId: row.continuation_id,
+      },
+      inputs: [{ kind: 'message', messageId: resumeMessageId }],
+      createdAt: command.now,
+    };
+    const message: TaskMessage = {
+      id: resumeMessageId,
+      taskId: row.caller_task_id,
+      role: 'system',
+      content,
+      state: 'assigned',
+      turnId: resumeTurnId,
+      createdAt: command.now,
+    };
+    const terminalResultValid =
+      row.terminal_result_run_id !== null &&
+      row.terminal_result_artifact_id !== null &&
+      Number.isInteger(row.terminal_result_artifact_revision) &&
+      Number(row.terminal_result_artifact_revision) > 0;
+    const results = await this.writeIfFirstChanged(
+      {
+        sql: `UPDATE workflow_continuations
+                 SET status = 'resolved', outcome = ?, reason_code = ?,
+                     result_artifact_run_id = ?, result_artifact_id = ?,
+                     result_artifact_revision = ?, producing_turn_id = ?,
+                     resolved_at = ?, updated_at = ?,
+                     payload_json = json_set(
+                       COALESCE(payload_json, '{}'),
+                       '$.completion', json(?), '$.resumeTurnId', ?, '$.resumeMessageId', ?
+                     )
+               WHERE workspace_id = ? AND run_id = ? AND continuation_id = ?
+                 AND kind = 'start_wait' AND status = 'pending'
+                 AND EXISTS (
+                   SELECT 1 FROM workflow_runs run
+                    WHERE run.workspace_id = workflow_continuations.workspace_id
+                      AND run.run_id = workflow_continuations.run_id
+                      AND run.status = ?
+                 )`,
+        params: [
+          row.run_status,
+          row.terminal_reason_code,
+          terminalResultValid ? row.terminal_result_run_id : null,
+          terminalResultValid ? row.terminal_result_artifact_id : null,
+          terminalResultValid ? row.terminal_result_artifact_revision : null,
+          resumeTurnId,
+          command.now,
+          command.now,
+          JSON.stringify(completion),
+          resumeTurnId,
+          resumeMessageId,
+          this.workspaceId,
+          row.run_id,
+          row.continuation_id,
+          row.run_status,
+        ],
+      },
+      [
+        turnStatement(this.workspaceId, turn, false),
+        messageStatement(this.workspaceId, message, false),
+        turnInputStatement(this.workspaceId, turn.id, 0, turn.inputs[0]!),
+      ],
+      [
+        { kind: 'turn', id: turn.id, taskId: turn.taskId, change: 'insert' },
+        { kind: 'message', id: message.id, taskId: message.taskId, change: 'complete' },
+        { kind: 'task', id: row.caller_task_id, change: 'effect' },
+      ],
+      command.now,
+    );
+    const changed = (results[0]?.changes ?? 0) > 0;
+    return {
+      ok: true,
+      changed,
+      ...(changed ? { turnId: resumeTurnId, messageId: resumeMessageId } : {}),
+    };
+  }
+
   private async recoverWorkflowActivation(
     command: Extract<RepositoryCommand, { kind: 'recoverWorkflowActivation' }>,
   ): Promise<RepositoryCommandResult> {
@@ -9183,31 +9778,17 @@ export class SqliteTaskRepository implements TaskRepository {
                          '$.error', '$.reason'
                        ),
                        '$.finishedAt', ?,
-                       '$.sealedBy', json_object(
-                         'kind', 'coordinator',
-                         'taskId', COALESCE((
-                           SELECT run.owner_root_task_id
-                             FROM workflow_nodes owner_node
-                             JOIN workflow_runs run
-                               ON run.workspace_id = owner_node.workspace_id
-                              AND run.run_id = owner_node.run_id
-                            WHERE owner_node.workspace_id = tasks.workspace_id
-                              AND owner_node.task_id = tasks.id
-                              AND owner_node.run_id IN (${runPlaceholders})
-                            LIMIT 1
-                         ), (
-                           SELECT run.caller_task_id
-                             FROM workflow_nodes caller_node
-                             JOIN workflow_runs run
-                               ON run.workspace_id = caller_node.workspace_id
-                              AND run.run_id = caller_node.run_id
-                            WHERE caller_node.workspace_id = tasks.workspace_id
-                              AND caller_node.task_id = tasks.id
-                              AND caller_node.run_id IN (${runPlaceholders})
-                            LIMIT 1
-                         ), tasks.id),
-                         'mode', 'workflow_run'
-                       )${reasonMutation}
+                        '$.lifecycleAuthority', json_object(
+                          'kind', 'workflow',
+                          'runId', (
+                            SELECT node.run_id
+                              FROM workflow_nodes node
+                             WHERE node.workspace_id = tasks.workspace_id
+                               AND node.task_id = tasks.id
+                               AND node.run_id IN (${runPlaceholders})
+                             LIMIT 1
+                          )
+                        )${reasonMutation}
                      )
                WHERE workspace_id = ? AND lifecycle = 'open'
                  AND id IN (
@@ -9219,7 +9800,6 @@ export class SqliteTaskRepository implements TaskRepository {
           input.lifecycle,
           input.at,
           input.at,
-          ...runIds,
           ...runIds,
           ...reasonParams,
           this.workspaceId,
@@ -9940,7 +10520,11 @@ function validatePresentationRecord(doc: PresentationRecord): void {
   if (!doc.title || doc.title.length > 512 || doc.title.includes('\0')) {
     throw new Error('presentation title invalid');
   }
-  if (!doc.markdown || doc.markdown.length > 100_000 || doc.markdown.includes('\0')) {
+  if (
+    !doc.markdown ||
+    doc.markdown.length > PRESENTATION_MARKDOWN_MAX_CHARS ||
+    doc.markdown.includes('\0')
+  ) {
     throw new Error('presentation markdown invalid');
   }
   if (doc.kind !== undefined && !['plan', 'spec', 'document'].includes(doc.kind)) {
@@ -10225,12 +10809,12 @@ function taskPayload(task: MusterTask): string {
     id: _id, parentId: _parentId, role: _role, lifecycle: _lifecycle,
     releaseState: _releaseState, goal: _goal, backend: _backend, model: _model,
     revision: _revision, createdAt: _createdAt, updatedAt: _updatedAt,
-    dependencies: _dependencies,
+    prerequisites: _prerequisites,
     ...payload
   } = task;
   void _id; void _parentId; void _role; void _lifecycle; void _releaseState;
   void _goal; void _backend; void _model; void _revision; void _createdAt;
-  void _updatedAt; void _dependencies;
+  void _updatedAt; void _prerequisites;
   return encodePayload(payload);
 }
 
@@ -10296,8 +10880,8 @@ function taskStatement(workspaceId: string, task: MusterTask, upsert: boolean): 
 function taskMutationStatements(workspaceId: string, task: MusterTask): SqlStatement[] {
   return [
     taskStatement(workspaceId, task, true),
-    { sql: 'DELETE FROM task_dependencies WHERE workspace_id = ? AND task_id = ?', params: [workspaceId, task.id] },
-    ...task.dependencies.map((dependency) => dependencyStatement(workspaceId, task.id, dependency)),
+    { sql: 'DELETE FROM task_prerequisites WHERE workspace_id = ? AND task_id = ?', params: [workspaceId, task.id] },
+    ...task.prerequisites.map((prerequisite) => prerequisiteStatement(workspaceId, task.id, prerequisite)),
   ];
 }
 
@@ -10307,6 +10891,28 @@ function turnMutationStatements(workspaceId: string, turn: TaskTurn): SqlStateme
     { sql: 'DELETE FROM turn_inputs WHERE workspace_id = ? AND turn_id = ?', params: [workspaceId, turn.id] },
     ...turn.inputs.map((input, ordering) => turnInputStatement(workspaceId, turn.id, ordering, input)),
   ];
+}
+
+function detachWorkflowNodeTasksStatement(
+  workspaceId: string,
+  rootTaskIds: readonly string[],
+): SqlStatement {
+  const roots = rootTaskIds.map(() => '(?)').join(', ');
+  return {
+    sql: `WITH RECURSIVE roots(id) AS (VALUES ${roots}),
+           subtree(id) AS (
+             SELECT id FROM roots
+             UNION
+             SELECT child.id
+               FROM tasks child
+               JOIN subtree parent ON child.parent_id = parent.id
+              WHERE child.workspace_id = ?
+           )
+          UPDATE workflow_nodes SET task_id = NULL
+           WHERE workspace_id = ?
+             AND task_id IN (SELECT id FROM subtree)`,
+    params: [...rootTaskIds, workspaceId, workspaceId],
+  };
 }
 
 function taskRevisionGuardStatement(
@@ -10432,13 +11038,13 @@ function guardedDispatchTaskUpdateStatement(
   };
 }
 
-function dependencyStatement(workspaceId: string, taskId: string, dependency: TaskDependency): SqlStatement {
+function prerequisiteStatement(workspaceId: string, taskId: string, prerequisite: TaskPrerequisite): SqlStatement {
   return {
-    sql: `INSERT INTO task_dependencies
-          (workspace_id, task_id, dependency_task_id, required_outcome, on_unsatisfied, required_verdict)
+    sql: `INSERT INTO task_prerequisites
+          (workspace_id, task_id, producer_task_id, required_lifecycle, on_unmet, required_verdict)
           VALUES (?,?,?,?,?,?)`,
-    params: [workspaceId, taskId, dependency.taskId, dependency.requiredOutcome, dependency.onUnsatisfied,
-      dependency.requiredVerdict ?? null],
+    params: [workspaceId, taskId, prerequisite.producerTaskId, prerequisite.requiredLifecycle, prerequisite.onUnmet,
+      prerequisite.requiredVerdict ?? null],
   };
 }
 
@@ -10597,6 +11203,7 @@ function workflowDispositionAuthorizationPredicate(disposition: TurnDisposition)
          SELECT 1 FROM workflow_continuations continuation
           WHERE continuation.workspace_id = activation.workspace_id
             AND continuation.run_id = activation.run_id
+            AND continuation.kind = 'child_wait'
             AND continuation.status = 'pending'
        )`,
     );
@@ -10819,12 +11426,29 @@ function workflowActivationRunningStatement(
   };
 }
 
+function workflowStartContinuationConsumptionStatement(
+  workspaceId: string,
+  turnId: string,
+  at: string,
+  continuationId?: string,
+): SqlStatement {
+  return {
+    sql: `UPDATE workflow_continuations
+             SET status = 'consumed', updated_at = ?
+           WHERE workspace_id = ? AND kind = 'start_wait' AND status = 'resolved'
+             AND producing_turn_id = ?
+             ${continuationId === undefined ? '' : 'AND continuation_id = ?'}`,
+    params: [at, workspaceId, turnId, ...(continuationId === undefined ? [] : [continuationId])],
+  };
+}
+
 function workflowActivationSourceConsumptionStatements(
   workspaceId: string,
   turnId: string,
   at: string,
 ): SqlStatement[] {
   return [
+    workflowStartContinuationConsumptionStatement(workspaceId, turnId, at),
     {
       sql: `UPDATE workflow_feedback_rounds
                SET status = 'consumed', updated_at = ?
@@ -11140,9 +11764,33 @@ function reasoningStatement(workspaceId: string, reasoning: PersistedReasoning):
           ON CONFLICT(workspace_id, id) DO UPDATE SET task_id=excluded.task_id, turn_id=excluded.turn_id,
             ordering=excluded.ordering, content=excluded.content, created_at=excluded.created_at,
             updated_at=excluded.updated_at`,
-    params: [reasoning.id, workspaceId, reasoning.taskId, reasoning.turnId, 0, reasoning.content,
+    params: [reasoning.id, workspaceId, reasoning.taskId, reasoning.turnId, reasoning.order, reasoning.content,
       reasoning.createdAt, reasoning.updatedAt],
   };
+}
+
+function workflowResultFromSettlement(
+  command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
+  explicitResult: string | undefined,
+): string | undefined {
+  const explicit = explicitResult?.trim();
+  if (explicit) return truncateUtf8Bytes(explicit, TASK_RESULT_MAX_BYTES).text;
+
+  const finalAssistant = command.messages
+    .filter((message) =>
+      message.turnId === command.turn.id &&
+      message.role === 'assistant' &&
+      message.content.trim().length > 0,
+    )
+    .sort((a, b) =>
+      (a.order ?? Number.MIN_SAFE_INTEGER) - (b.order ?? Number.MIN_SAFE_INTEGER) ||
+      a.createdAt.localeCompare(b.createdAt) ||
+      a.id.localeCompare(b.id),
+    )
+    .at(-1)
+    ?.content.trim();
+  if (!finalAssistant) return undefined;
+  return truncateUtf8Bytes(finalAssistant, TASK_RESULT_MAX_BYTES).text;
 }
 
 function workspaceStatement(command: Extract<RepositoryCommand, { kind: 'upsertWorkspace' }>): SqlStatement {
@@ -11253,7 +11901,7 @@ function cancelRequestStatement(workspaceId: string, command: Extract<Repository
           ON CONFLICT(workspace_id, turn_id) DO UPDATE SET kind=excluded.kind, op_id=excluded.op_id,
           requested_by=excluded.requested_by, requested_at=excluded.requested_at, payload_json=excluded.payload_json`,
     params: [workspaceId, request.kind, request.opId, request.by, request.at,
-      encodePayload({ sealedBy: request.sealedBy, reason: request.reason }), workspaceId, command.turnId],
+      encodePayload({ lifecycleAuthority: request.lifecycleAuthority, reason: request.reason }), workspaceId, command.turnId],
   };
 }
 
@@ -11493,12 +12141,12 @@ function claimTurnStatement(
                                 AND COALESCE(json_extract(earlier.payload_json, '$.holdAutoPromote'), 0) <> 1
                                 AND (earlier.sequence < turns.sequence OR (earlier.sequence = turns.sequence AND
                                      (earlier.created_at < turns.created_at OR (earlier.created_at = turns.created_at AND earlier.id < turns.id)))))
-              AND NOT EXISTS (SELECT 1 FROM task_dependencies dep
-                               JOIN tasks producer ON producer.workspace_id = dep.workspace_id AND producer.id = dep.dependency_task_id
-                               WHERE dep.workspace_id = turns.workspace_id AND dep.task_id = turns.task_id
-                                 AND NOT (((dep.required_outcome = 'succeeded' AND producer.lifecycle = 'succeeded') OR
-                                   (dep.required_outcome = 'settled' AND producer.lifecycle IN ('succeeded','failed','cancelled','skipped')))
-                                   AND (dep.required_verdict IS NULL OR json_extract(producer.payload_json, '$.taskResult.verdict.status') = 'pass')))
+               AND NOT EXISTS (SELECT 1 FROM task_prerequisites prerequisite
+                               JOIN tasks producer ON producer.workspace_id = prerequisite.workspace_id AND producer.id = prerequisite.producer_task_id
+                               WHERE prerequisite.workspace_id = turns.workspace_id AND prerequisite.task_id = turns.task_id
+                                 AND NOT (((prerequisite.required_lifecycle = 'succeeded' AND producer.lifecycle = 'succeeded') OR
+                                   (prerequisite.required_lifecycle = 'terminal' AND producer.lifecycle IN ('succeeded','failed','cancelled','skipped')))
+                                   AND (prerequisite.required_verdict IS NULL OR json_extract(producer.payload_json, '$.taskResult.verdict.status') = 'pass')))
                AND NOT EXISTS (
                  SELECT 1
                   FROM workflow_activations activation
@@ -11524,14 +12172,22 @@ function claimTurnStatement(
                          AND activation.status = 'queued'
                     )
                )
-               AND NOT EXISTS (
-                 SELECT 1 FROM workflow_continuations continuation
-                  WHERE continuation.workspace_id = turns.workspace_id
-                    AND continuation.caller_task_id = turns.task_id
-                    AND continuation.status IN ('pending', 'resolved')
-                    AND NOT EXISTS (
-                      SELECT 1 FROM workflow_activations activation
-                       WHERE activation.workspace_id = continuation.workspace_id
+                AND NOT EXISTS (
+                  SELECT 1 FROM workflow_continuations continuation
+                   WHERE continuation.workspace_id = turns.workspace_id
+                     AND continuation.caller_task_id = turns.task_id
+                     AND continuation.status IN ('pending', 'resolved')
+                     AND NOT (
+                       continuation.kind = 'start_wait'
+                       AND continuation.status = 'resolved'
+                       AND continuation.producing_turn_id = turns.id
+                       AND COALESCE(json_extract(turns.payload_json, '$.workflowResume.kind') = 'start_workflow', 0)
+                       AND COALESCE(json_extract(turns.payload_json, '$.workflowResume.runId') = continuation.run_id, 0)
+                       AND COALESCE(json_extract(turns.payload_json, '$.workflowResume.continuationId') = continuation.continuation_id, 0)
+                     )
+                     AND NOT EXISTS (
+                       SELECT 1 FROM workflow_activations activation
+                        WHERE activation.workspace_id = continuation.workspace_id
                          AND activation.continuation_id = continuation.continuation_id
                          AND activation.execution_turn_id = turns.id
                          AND activation.kind = 'child_return'
@@ -11652,11 +12308,11 @@ interface MessageRow {
   payload_json: string;
 }
 
-interface DependencyRow {
+interface PrerequisiteRow {
   task_id: string;
-  dependency_task_id: string;
-  required_outcome: string;
-  on_unsatisfied: string;
+  producer_task_id: string;
+  required_lifecycle: string;
+  on_unmet: string;
   required_verdict: string | null;
 }
 
@@ -11684,6 +12340,7 @@ interface ReasoningRow {
   id: string;
   task_id: string;
   turn_id: string;
+  ordering: number;
   content: string;
   created_at: string;
   updated_at: string;
@@ -11858,7 +12515,7 @@ items AS (
   SELECT
     r.id, 'reasoning', r.turn_id,
     rt.sequence,
-    ${KIND_RANK.reasoning}, ${REASONING_ORDERING}, NULL,
+    ${KIND_RANK.reasoning}, r.ordering, r.ordering,
     r.created_at, r.content, NULL,
     NULL, NULL, NULL, NULL
   FROM task_turns rt
@@ -11926,6 +12583,7 @@ function decodeTranscriptRow(row: TranscriptPageRow & { entity_id: string }): Re
       id: row.entity_id,
       kind: 'reasoning',
       turnId: row.turn_id ?? '',
+      order: row.ordering ?? 0,
       content: row.content ?? '',
       ...(createdAt !== undefined ? { createdAt } : {}),
     };
@@ -12012,18 +12670,18 @@ function decodeWorkspaceLocation(row: WorkspaceLocationRow): RepositoryWorkspace
   };
 }
 
-function decodeDependency(row: DependencyRow): TaskDependency {
+function decodePrerequisite(row: PrerequisiteRow): TaskPrerequisite {
   return {
-    taskId: requiredString(row.dependency_task_id, 'dependency_task_id', 'task dependency'),
-    requiredOutcome: oneOf(row.required_outcome, ['succeeded', 'settled'] as const, 'required_outcome', 'task dependency'),
-    onUnsatisfied: oneOf(row.on_unsatisfied, ['block', 'fail', 'skip'] as const, 'on_unsatisfied', 'task dependency'),
+    producerTaskId: requiredString(row.producer_task_id, 'producer_task_id', 'task prerequisite'),
+    requiredLifecycle: oneOf(row.required_lifecycle, ['succeeded', 'terminal'] as const, 'required_lifecycle', 'task prerequisite'),
+    onUnmet: oneOf(row.on_unmet, ['block', 'fail', 'skip'] as const, 'on_unmet', 'task prerequisite'),
     ...(row.required_verdict === null
       ? {}
-      : { requiredVerdict: oneOf(row.required_verdict, ['pass'] as const, 'required_verdict', 'task dependency') }),
+      : { requiredVerdict: oneOf(row.required_verdict, ['pass'] as const, 'required_verdict', 'task prerequisite') }),
   };
 }
 
-function decodeTask(row: TaskRow, dependencies: readonly TaskDependency[]): MusterTask {
+function decodeTask(row: TaskRow, prerequisites: readonly TaskPrerequisite[]): MusterTask {
   const payload = parsePayload(row.payload_json, 'task');
   const task: Record<string, unknown> = {
     ...payload,
@@ -12038,7 +12696,7 @@ function decodeTask(row: TaskRow, dependencies: readonly TaskDependency[]): Must
     updatedAt: requiredString(row.updated_at, 'updated_at', 'task'),
     ...(row.model === null ? { model: undefined } : { model: row.model }),
     releaseState: oneOf(row.release_state, ['draft', 'released'] as const, 'release_state', 'task'),
-    dependencies,
+    prerequisites,
   };
   delete task.payloadVersion;
   if (!Array.isArray(task.capabilities) || !task.executionPolicy || typeof task.executionPolicy !== 'object') {
@@ -12141,6 +12799,7 @@ function decodeReasoning(row: ReasoningRow): PersistedReasoning {
     id: requiredString(row.id, 'id', 'reasoning'),
     taskId: requiredString(row.task_id, 'task_id', 'reasoning'),
     turnId: requiredString(row.turn_id, 'turn_id', 'reasoning'),
+    order: requiredNumber(row.ordering, 'ordering', 'reasoning'),
     content: requiredString(row.content, 'content', 'reasoning'),
     createdAt: requiredString(row.created_at, 'created_at', 'reasoning'),
     updatedAt: requiredString(row.updated_at, 'updated_at', 'reasoning'),
@@ -12174,7 +12833,9 @@ function decodeCancelRequest(row: CancelRow): CancelRequest {
     opId: requiredString(row.op_id, 'op_id', 'cancel request'),
     at: requiredString(row.requested_at, 'requested_at', 'cancel request'),
   };
-  if (payload.sealedBy !== undefined) request.sealedBy = payload.sealedBy as CancelRequest['sealedBy'];
+  if (payload.lifecycleAuthority !== undefined) {
+    request.lifecycleAuthority = payload.lifecycleAuthority as CancelRequest['lifecycleAuthority'];
+  }
   if (payload.reason !== undefined) request.reason = requiredString(payload.reason, 'reason', 'cancel request');
   return request;
 }

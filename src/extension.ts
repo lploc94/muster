@@ -105,7 +105,7 @@ import {
 import { PresentationToolRouter } from './host/presentation-tool-router';
 import { createPresentationChatLink } from './host/presentation-chat-link';
 import {
-  clampPresentationMarkdown,
+  isPresentationMarkdownSizeAllowed,
   isCanonicalInsideRoot,
   presentationIdFromFolderAndRelativePath,
   resolveUnderSource,
@@ -113,6 +113,7 @@ import {
   splitMarkdownHref,
   titleFromMarkdownPath,
 } from './host/markdown-file-presentation';
+import { TASK_MESSAGE_MAX_CHARS } from './task/content-limits';
 import { enumerateModels, type BackendModels } from './backends/model-catalog';
 import { type RetentionConfig } from './task/retention';
 import { TaskEngine, type EngineEvent } from './task/engine';
@@ -249,7 +250,6 @@ function readExplicitTaskTypesRaw(cwd?: string): unknown {
     typeof cwd === 'string' && cwd.length > 0 ? vscode.Uri.file(cwd) : undefined;
   const cfg = vscode.workspace.getConfiguration(TASK_TYPES_CONFIG_SECTION, resource);
   const inspected = cfg.inspect(TASK_TYPES_CONFIG_KEY);
-  if (!inspected) return undefined;
   return pickExplicitTaskTypesValue(inspected);
 }
 
@@ -313,7 +313,7 @@ function debugElicitation(event: string, details: Record<string, unknown> = {}):
  * version is stamped on the bootstrap `snapshot` message, and a mismatch is
  * surfaced in the webview as a visible "reload the window" banner.
  */
-const PROTOCOL_VERSION = 9;
+const PROTOCOL_VERSION = 10;
 
 /** How long a permission prompt waits for a webview decision before safe-denying. */
 const PERMISSION_PROMPT_TIMEOUT_MS = USER_INTERACTION_TIMEOUT_MS;
@@ -328,7 +328,6 @@ function getPermissionMode(): PermissionMode {
 
 /** Backends the webview may request. Mirrors the composer's select options. */
 const WEBVIEW_BACKENDS = new Set(['claude', 'grok', 'kiro', 'codex', 'opencode']);
-const MAX_MESSAGE_CHARS = 100_000;
 const MAX_FREE_TEXT_CHARS = 10_000;
 const MAX_LINK_CHARS = 4096;
 
@@ -1401,7 +1400,10 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       this.postCommandError('Markdown file is empty.');
       return true;
     }
-    markdown = clampPresentationMarkdown(markdown);
+    if (!isPresentationMarkdownSizeAllowed(markdown)) {
+      this.postCommandError('Markdown file is too large to open as a presentation.');
+      return true;
+    }
 
     void presentationManager
       .openWorkspaceDocument(rootId, {
@@ -1462,7 +1464,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     // Ordinary clearHistory results publish via onAfterCommit patches.
   }
 
-  /** Delete a single top-level task (and its whole subtree) through the repository. */
+  /** Delete a selected task and its whole subtree. */
   private async handleDeleteTask(taskId: string): Promise<void> {
     const repository = taskRepository;
     if (!repository) {
@@ -1470,25 +1472,16 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       return;
     }
     const focus = this.focusedTaskId;
-    let preserveRootTaskId: string | undefined;
-    if (focus) {
-      const tasks = await repository.listTasks(repositoryWorkspaceId());
-      const byId = new Map(tasks.map((task) => [task.id, task]));
-      let current = byId.get(focus);
-      const seen = new Set<string>();
-      while (current?.parentId && !seen.has(current.id)) {
-        seen.add(current.id);
-        current = byId.get(current.parentId);
-      }
-      preserveRootTaskId = current?.id;
-    }
-    const result = await repository.execute({
-      kind: 'deleteTaskSubtreeIfIdle',
-      workspaceId: repositoryWorkspaceId(),
-      rootTaskId: taskId,
-      ...(preserveRootTaskId ? { preserveRootTaskId } : {}),
-    });
-    if (result.reason && !result.changed) {
+    const result = taskEngine
+      ? await taskEngine.deleteTaskSubtreeAsync(taskId)
+      : await repository.execute({
+          kind: 'deleteTaskSubtree',
+          workspaceId: repositoryWorkspaceId(),
+          rootTaskId: taskId,
+        }).then((write) => write.changed
+          ? { ok: true as const, value: undefined }
+          : { ok: false as const, reason: write.reason ?? 'task not found' });
+    if (!result.ok) {
       this.postCommandError(result.reason, taskId);
       return;
     }
@@ -1513,14 +1506,17 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       this.postCommandError('Task name cannot be empty.');
       return;
     }
-    const capped = trimmed.length > MAX_MESSAGE_CHARS ? trimmed.slice(0, MAX_MESSAGE_CHARS) : trimmed;
+    if (trimmed.length > TASK_MESSAGE_MAX_CHARS) {
+      this.postCommandError(`Task name exceeds ${TASK_MESSAGE_MAX_CHARS} characters.`);
+      return;
+    }
     const current = await repository.getTask(taskId);
     if (!current) return;
     const result = await repository.execute({
       kind: 'renameTask',
       workspaceId: repositoryWorkspaceId(),
       taskId,
-      goal: capped,
+      goal: trimmed,
       expectedTaskRevision: current.revision,
       updatedAt: new Date().toISOString(),
     });
@@ -2051,7 +2047,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     if (!taskEngine || !taskStore) {
       return { ok: false, reason: 'task engine not ready', code: 'store' };
     }
-    if (text.length > MAX_MESSAGE_CHARS || llmText.length > MAX_MESSAGE_CHARS) {
+    if (text.length > TASK_MESSAGE_MAX_CHARS || llmText.length > TASK_MESSAGE_MAX_CHARS) {
       return { ok: false, reason: 'message too long', code: 'validation' };
     }
 
@@ -2393,7 +2389,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
               this.postCommandError('retryTurn requires a non-empty instruction', data.taskId);
               break;
             }
-            if (effectiveInstruction.length > MAX_MESSAGE_CHARS) {
+            if (effectiveInstruction.length > TASK_MESSAGE_MAX_CHARS) {
               this.postCommandError('instruction too long', data.taskId);
               break;
             }
@@ -2420,7 +2416,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
               this.postCommandError('continueTask requires a non-empty instruction', data.taskId);
               break;
             }
-            if (instruction.length > MAX_MESSAGE_CHARS) {
+            if (instruction.length > TASK_MESSAGE_MAX_CHARS) {
               this.postCommandError('instruction too long', data.taskId);
               break;
             }
@@ -2452,7 +2448,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             this.postCommandError('message cannot be empty', taskId);
             break;
           }
-          if (instruction.length > MAX_MESSAGE_CHARS) {
+          if (instruction.length > TASK_MESSAGE_MAX_CHARS) {
             this.postCommandError('instruction too long', taskId);
             break;
           }
@@ -3280,13 +3276,17 @@ export async function activate(context: vscode.ExtensionContext) {
 
     let markdown: string;
     try {
-      markdown = clampPresentationMarkdown(fs.readFileSync(targetAbs!, 'utf8'));
+      markdown = fs.readFileSync(targetAbs!, 'utf8');
     } catch {
       void vscode.window.showErrorMessage('Could not read markdown file.');
       return;
     }
     if (!markdown.trim()) {
       void vscode.window.showErrorMessage('Markdown file is empty.');
+      return;
+    }
+    if (!isPresentationMarkdownSizeAllowed(markdown)) {
+      void vscode.window.showErrorMessage('Markdown file is too large to open as a presentation.');
       return;
     }
 

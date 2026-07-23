@@ -270,7 +270,7 @@ describe('M018 S04 PREV feedback ALL-join', () => {
 
     const prevAll = dispatch(
       'workflow_prev',
-      { opId: 'prev-all-1', targets: 'all', note: 'revise' },
+      { opId: 'prev-all-1', targets: 'all', message: 'revise' },
       ctx,
     );
     expect(prevAll.ok).toBe(true);
@@ -278,13 +278,13 @@ describe('M018 S04 PREV feedback ALL-join', () => {
       expect(prevAll.command).toMatchObject({
         kind: 'workflow_prev',
         targets: 'all',
-        note: 'revise',
+        message: 'revise',
       });
     }
 
     const prevTargeted = dispatch(
       'workflow_prev',
-      { opId: 'prev-t-1', targets: ['from_p1'] },
+      { opId: 'prev-t-1', targets: ['from_p1'], message: 'revise p1' },
       ctx,
     );
     expect(prevTargeted.ok).toBe(true);
@@ -297,7 +297,7 @@ describe('M018 S04 PREV feedback ALL-join', () => {
 
     const empty = dispatch(
       'workflow_prev',
-      { opId: 'prev-empty', targets: [] },
+      { opId: 'prev-empty', targets: [], message: 'revise' },
       ctx,
     );
     expect(empty.ok).toBe(false);
@@ -431,6 +431,7 @@ describe('M018 S04 PREV feedback ALL-join', () => {
         deriveFeedbackTargetMessageId(data.runId, roundId, 'p1'),
       );
       expect(p1FeedbackMsg?.content).toContain(roundId);
+      expect(p1FeedbackMsg?.content).toContain('[feedback]\nplease revise');
 
       // Requester has no resume while the round is partial.
       expect(await ctx.repository.listTurns(consumerTaskId)).toHaveLength(1);

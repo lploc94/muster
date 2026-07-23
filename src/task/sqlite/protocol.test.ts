@@ -141,6 +141,27 @@ describe('strict RPC wire validation', () => {
       parseWireSuccessResponse({
         kind: 'workflowMutation',
         requestId: 1,
+        result: {
+          ok: true,
+          changed: true,
+          operation: { fingerprint: 'fp', result: { ok: true, data: 'x'.repeat(1_100_000) } },
+        },
+      }).ok,
+    ).toBe(true);
+    expect(
+      parseWireSuccessResponse({
+        kind: 'workflowMutation',
+        requestId: 1,
+        result: { ok: true, changed: true, turnId: 'wftn_resume' },
+      }),
+    ).toMatchObject({
+      ok: true,
+      response: { result: { turnId: 'wftn_resume' } },
+    });
+    expect(
+      parseWireSuccessResponse({
+        kind: 'workflowMutation',
+        requestId: 1,
         result: { ok: true, changed: true, unexpected: true },
       }).ok,
     ).toBe(false);

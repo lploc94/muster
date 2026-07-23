@@ -30,6 +30,7 @@ import { isAllowedReadPragma, serializeError } from './rpc';
 import type { SqliteOperationClass, SqliteWorkerData } from './errors';
 import { MusterInvariantError } from './errors';
 import { bootstrapFaultCapability, isFaultCapabilityEnabled, maybeInjectFault } from './fault-inject';
+import { SQLITE_WORKFLOW_ENVELOPE_MAX_BYTES } from '../content-limits';
 
 if (!parentPort) {
   throw new Error('sqlite worker must be spawned as a worker_thread');
@@ -179,7 +180,10 @@ function parseWorkflowMutationRequest(
     throw new MusterInvariantError('protocol', 'transaction');
   }
   try {
-    if (Buffer.byteLength(JSON.stringify(req.command), 'utf8') > 4_194_304) {
+    if (
+      Buffer.byteLength(JSON.stringify(req.command), 'utf8') >
+      SQLITE_WORKFLOW_ENVELOPE_MAX_BYTES
+    ) {
       throw new MusterInvariantError('protocol', 'transaction');
     }
   } catch (error) {
@@ -197,7 +201,9 @@ function boundedWorkflowMutationResult(result: RepositoryCommandResult): Reposit
     'operation',
     'conflict',
     'messageId',
+    'turnId',
     'deletedMessageIds',
+    'affectedTaskIds',
     'presentationStatus',
   ]);
   if (
@@ -209,16 +215,27 @@ function boundedWorkflowMutationResult(result: RepositoryCommandResult): Reposit
       (typeof result.reason !== 'string' || result.reason.length === 0 || result.reason.length > 1024)) ||
     (result.messageId !== undefined &&
       (typeof result.messageId !== 'string' || result.messageId.length === 0 || result.messageId.length > 512)) ||
+    (result.turnId !== undefined &&
+      (typeof result.turnId !== 'string' || result.turnId.length === 0 || result.turnId.length > 512)) ||
     (result.deletedMessageIds !== undefined && (
       !Array.isArray(result.deletedMessageIds) ||
       result.deletedMessageIds.length > 10_000 ||
       !result.deletedMessageIds.every((id) => typeof id === 'string' && id.length > 0 && id.length <= 512)
+    )) ||
+    (result.affectedTaskIds !== undefined && (
+      !Array.isArray(result.affectedTaskIds) ||
+      result.affectedTaskIds.length > 10_000 ||
+      !result.affectedTaskIds.every((id) => typeof id === 'string' && id.length > 0 && id.length <= 512)
     ))
   ) {
     throw new MusterInvariantError('protocol', 'transaction');
   }
   try {
-    if (result.operation && Buffer.byteLength(JSON.stringify(result.operation), 'utf8') > 1_048_576) {
+    if (
+      result.operation &&
+      Buffer.byteLength(JSON.stringify(result.operation), 'utf8') >
+        SQLITE_WORKFLOW_ENVELOPE_MAX_BYTES
+    ) {
       throw new MusterInvariantError('protocol', 'transaction');
     }
   } catch (error) {

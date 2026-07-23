@@ -25,7 +25,7 @@ export class PresentationToolRouter implements ToolCallHandler {
       presentationId: command.presentationId,
       ownerTaskId: command.ownerTaskId,
       opId: command.opId,
-      revision: command.revision,
+      ...(command.revision !== undefined ? { revision: command.revision } : {}),
       title: command.title,
       markdown: command.markdown,
       ...(command.presentationKind !== undefined ? { kind: command.presentationKind } : {}),

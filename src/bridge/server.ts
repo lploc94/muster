@@ -17,7 +17,20 @@ import {
   PRESENTATION_MARKDOWN_MAX_LENGTH,
   PRESENTATION_TITLE_MAX_LENGTH,
 } from '../task/coordinator-tools';
-import { DEFAULT_WORKFLOW_POLICY } from '../task/workflow-codec';
+import {
+  MCP_JSON_BODY_MAX_BYTES,
+  TASK_ERROR_MAX_BYTES,
+  TASK_RESULT_MAX_BYTES,
+  WORKFLOW_FEEDBACK_MAX_BYTES,
+} from '../task/content-limits';
+import {
+  WORKFLOW_CHILD_BINDINGS_MAX,
+  WORKFLOW_ENTRY_CONTRACTS_MAX,
+  WORKFLOW_GRAPH_MAX_EDGES,
+  WORKFLOW_GRAPH_MAX_NODES,
+  WORKFLOW_NODE_LABEL_MAX_LENGTH,
+  WORKFLOW_RUN_GOAL_MAX_LENGTH,
+} from '../task/workflow-types';
 
 // VS Code's Extension Host resolver does not consistently honor this package's
 // wildcard exports (for example `./server/index.js`) in a packaged VSIX. Resolve
@@ -26,9 +39,6 @@ import { DEFAULT_WORKFLOW_POLICY } from '../task/workflow-codec';
 // The package's `.` require export points to a file absent in SDK 1.29.0.
 const mcpCjsRoot = path.dirname(path.dirname(require.resolve('@modelcontextprotocol/sdk/server')));
 const { Server } = require(path.join(mcpCjsRoot, 'server', 'index.js')) as typeof McpServerModule;
-const { createMcpExpressApp } = require(
-  path.join(mcpCjsRoot, 'server', 'express.js'),
-) as typeof McpExpressModule;
 const { StreamableHTTPServerTransport } = require(
   path.join(mcpCjsRoot, 'server', 'streamableHttp.js'),
 ) as typeof McpStreamableHttpModule;
@@ -38,6 +48,11 @@ const { CallToolRequestSchema, ListToolsRequestSchema, isInitializeRequest } = r
 
 type McpServer = InstanceType<typeof Server>;
 type McpStreamableHttpTransport = InstanceType<typeof StreamableHTTPServerTransport>;
+type McpExpressApp = ReturnType<typeof McpExpressModule.createMcpExpressApp>;
+const expressFactory = require(require.resolve('express', { paths: [mcpCjsRoot] })) as {
+  (): McpExpressApp;
+  json(options: { limit: number }): Parameters<McpExpressApp['use']>[0];
+};
 
 export interface ToolCallHandler {
   handleToolCall(
@@ -85,41 +100,62 @@ const PRESENTATION_ID = {
   pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]*$',
 };
 
+const DEFINE_WORKFLOW_DESCRIPTION = [
+  'Define or revise a reusable immutable workflow after selecting exact taskType ids from list_task_types.',
+  'Use only this public shape: {"workflowKey":"...","name":"...","nodes":[{"nodeKey":"...","taskType":"...","label":"..."}],"edges":[{"from":"...","to":"...","as":"..."}],"inputs":[{"to":"...","name":"..."}]}. Omit edges for a one-node workflow. Omit inputs when the run needs no caller-supplied values. Never send internal fields such as definitionId, version, topology, entryContracts, policy, backend, model, role, capabilities, opId, or task ids.',
+  'workflowKey rules: choose a unique stable key for a new logical workflow. Reuse a key only to replay the exact same definition or intentionally publish a changed revision owned by this same root task. Retries for the same key in one turn must repeat identical name/nodes/edges/inputs. If a key reports a fingerprint conflict, do not keep changing that retry: use a new unique workflowKey for a different workflow.',
+  'Topology rules: one node is valid. Multi-node workflows must be converging DAGs. Parallel source nodes may fan in, but fan-out and cycles are invalid. Every non-terminal node has exactly one outgoing edge and all branches converge to exactly one terminal node. edges use producer-to-consumer direction. Each from node may appear only once. Each as value is the input name seen by the consumer and must be unique for that consumer.',
+  'Input rules: inputs declare runtime values that start_workflow must later supply. Each input has exactly {"to":"source-nodeKey","name":"input-name"}. The to node must have no incoming edge. Do not put objectives or instructions in inputs; put the workflow name in name and each step objective in nodes[].label.',
+  'CORRECT one-node: {"workflowKey":"inspect-scheduling-2026","name":"Inspect scheduling","nodes":[{"nodeKey":"inspect","taskType":"explore","label":"Trace scheduling architecture, persistence, tests, and limitations."}],"inputs":[{"to":"inspect","name":"question"}]}',
+  'CORRECT parallel fan-in: {"workflowKey":"parallel-review-2026","name":"Parallel review","nodes":[{"nodeKey":"code","taskType":"explore","label":"Inspect implementation."},{"nodeKey":"tests","taskType":"verify","label":"Inspect coverage."},{"nodeKey":"synthesize","taskType":"research","label":"Combine findings."}],"edges":[{"from":"code","to":"synthesize","as":"codeFindings"},{"from":"tests","to":"synthesize","as":"testFindings"}],"inputs":[{"to":"code","name":"request"},{"to":"tests","name":"request"}]}',
+  'INCORRECT internal parameters: {"definitionId":"review","version":1,"topology":{...}}. Use workflowKey/name/nodes/edges/inputs instead.',
+  'INCORRECT fan-out: edges [{"from":"intake","to":"code","as":"request"},{"from":"intake","to":"tests","as":"request"}]. Replace intake with independent source nodes that converge downstream.',
+  'INCORRECT downstream input: if research -> review, inputs [{"to":"review","name":"request"}] is invalid because review has an incoming edge; declare the input on research.',
+].join('\n');
+
 const TOOL_INPUT_SCHEMAS: Record<PublicMcpToolAction, Record<string, unknown>> = {
   list_task_types: {
     type: 'object',
+    description: 'No arguments. Returns the current semantic task profiles available for workflow nodes.',
     properties: {},
     additionalProperties: false,
   },
   inspect_workflow_run: {
     type: 'object',
-    required: ['runId'],
+    description: 'Read bounded diagnostic state for one owned workflow run.',
+    required: ['runRef'],
     properties: {
-      runId: OP_ID,
+      runRef: { ...OP_ID, description: 'Opaque runRef returned by start_workflow.' },
     },
     additionalProperties: false,
   },
   get_host_context: {
     type: 'object',
+    description: 'No arguments. Refreshes trusted workspace, caller, rule, tool, and task-type context.',
     properties: {},
     additionalProperties: false,
   },
   workflow_next: {
     type: 'object',
-    required: ['opId', 'change'],
+    description: 'Publish the current activation result forward and end the current turn.',
+    required: ['message'],
     properties: {
-      opId: OP_ID,
-      change: { type: 'string', enum: ['updated', 'unchanged'] },
-      result: { type: 'string' },
+      change: {
+        type: 'string',
+        enum: ['updated', 'unchanged'],
+        description: 'Use updated for new/revised output (default). Use unchanged only for an exact feedback replay.',
+      },
+      message: { type: 'string', minLength: 1, maxLength: TASK_RESULT_MAX_BYTES, description: 'Final assistant message committed before the turn ends.' },
     },
     additionalProperties: false,
   },
   workflow_prev: {
     type: 'object',
-    required: ['opId', 'targets'],
+    description: 'Request correction from direct predecessor inputs and end the current turn.',
+    required: ['message'],
     properties: {
-      opId: OP_ID,
       targets: {
+        description: 'Direct input names to revisit, or all (default). Never use node ids.',
         oneOf: [
           { type: 'string', enum: ['all'] },
           {
@@ -129,262 +165,153 @@ const TOOL_INPUT_SCHEMAS: Record<PublicMcpToolAction, Record<string, unknown>> =
           },
         ],
       },
-      note: { type: 'string', minLength: 1, maxLength: 512 },
+        message: { type: 'string', minLength: 1, maxLength: WORKFLOW_FEEDBACK_MAX_BYTES, description: 'Final assistant message explaining the required correction.' },
     },
     additionalProperties: false,
   },
   workflow_fail: {
     type: 'object',
-    required: ['opId'],
+    description: 'Close the current workflow run as failed when no usable result can be produced.',
     properties: {
-      opId: OP_ID,
-      reason: { type: 'string', minLength: 1, maxLength: 512 },
+      reason: { type: 'string', minLength: 1, maxLength: TASK_ERROR_MAX_BYTES, description: 'Concise diagnostic reason; do not include prompts, paths, or artifact bodies.' },
     },
     additionalProperties: false,
   },
   invoke_child_workflow: {
     type: 'object',
-    required: ['opId', 'childDefinitionId', 'childDefinitionVersion', 'entryBindings'],
+    description: 'Invoke a saved child workflow from the current live activation using semantic input bindings.',
+    required: ['workflow', 'bindings'],
     properties: {
-      opId: OP_ID,
-      childDefinitionId: OP_ID,
-      childDefinitionVersion: { type: 'integer', minimum: 1 },
-      entryBindings: {
+      workflow: { ...OP_ID, description: 'Child workflow key (latest revision) or immutable workflowRef such as review-flow@3.' },
+      bindings: {
         type: 'array',
         minItems: 1,
-        maxItems: 32,
+        maxItems: WORKFLOW_CHILD_BINDINGS_MAX,
+        description: 'Bind every required child source input from a named input currently available on this activation.',
         items: {
           type: 'object',
-          required: ['childEntryNodeId', 'inputRef', 'artifactId', 'artifactRevision'],
+          required: ['toNode', 'input', 'fromInput'],
           properties: {
-            childEntryNodeId: OP_ID,
-            inputRef: { type: 'string', minLength: 1, maxLength: 128 },
-            artifactId: OP_ID,
-            artifactRevision: { type: 'integer', minimum: 1 },
+            toNode: { ...OP_ID, description: 'Child source nodeKey declared by define_workflow.inputs.' },
+            input: { type: 'string', minLength: 1, maxLength: 128, description: 'Declared child input name on toNode.' },
+            fromInput: { type: 'string', minLength: 1, maxLength: 128, description: 'Exact current-activation input name whose artifact should be bound.' },
           },
           additionalProperties: false,
         },
       },
-      childIdempotencyKey: OP_ID,
+      callKey: { ...OP_ID, description: 'Optional stable semantic key for intentionally replaying this child call across turns.' },
     },
     additionalProperties: false,
   },
   upsert_presentation: {
     type: 'object',
-    required: ['presentationId', 'ownerTaskId', 'opId', 'revision', 'title', 'markdown'],
+    description: 'Create or refresh one user-facing Markdown document in the IDE.',
+    required: ['documentKey', 'title', 'markdown'],
     properties: {
-      presentationId: PRESENTATION_ID,
-      ownerTaskId: PRESENTATION_ID,
-      opId: PRESENTATION_ID,
-      revision: { type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
-      title: { type: 'string', minLength: 1, maxLength: PRESENTATION_TITLE_MAX_LENGTH },
-      markdown: { type: 'string', minLength: 1, maxLength: PRESENTATION_MARKDOWN_MAX_LENGTH },
-      kind: { type: 'string', enum: ['plan', 'spec', 'document'] },
-      summary: { type: 'string', minLength: 1, maxLength: 600 },
-      changeSummary: { type: 'string', minLength: 1, maxLength: 1000 },
+      documentKey: { ...PRESENTATION_ID, description: 'Stable semantic key reused when updating the same document.' },
+      title: { type: 'string', minLength: 1, maxLength: PRESENTATION_TITLE_MAX_LENGTH, description: 'Human-readable tab title.' },
+      markdown: { type: 'string', minLength: 1, maxLength: PRESENTATION_MARKDOWN_MAX_LENGTH, description: 'Full document content, not a patch. Mermaid fenced blocks are supported.' },
+      kind: { type: 'string', enum: ['plan', 'spec', 'document'], description: 'Optional document classification.' },
+      summary: { type: 'string', minLength: 1, maxLength: 600, description: 'Optional concise summary for the host.' },
+      changeSummary: { type: 'string', minLength: 1, maxLength: 1000, description: 'Optional concise description of what changed since the prior revision.' },
     },
     additionalProperties: false,
   },
   define_workflow: {
     type: 'object',
-    required: ['opId', 'definitionId', 'version', 'name', 'topology', 'entryContracts', 'policy'],
+    description: 'Exact semantic workflow object. Required: workflowKey, name, nodes. Optional: edges and inputs. One node needs no edges. For parallel work use A -> C and B -> C, with workflow inputs declared on A and B only. Fan-out, cycles, downstream inputs, internal ids, versions, topology objects, policy, backend, model, role, capabilities, and opId are invalid.',
+    required: ['workflowKey', 'name', 'nodes'],
     properties: {
-      opId: OP_ID,
-      definitionId: OP_ID,
-      version: { type: 'integer', minimum: 1 },
-      name: { type: 'string', minLength: 1, maxLength: 200 },
-      topology: {
-        oneOf: [
-          {
-            type: 'object',
-            required: ['kind', 'entryNodeId', 'nodes'],
-            properties: {
-              kind: { type: 'string', enum: ['one_node_v1'] },
-              entryNodeId: OP_ID,
-              nodes: {
-                type: 'array',
-                minItems: 1,
-                maxItems: 1,
-                items: {
-                  type: 'object',
-                  required: ['nodeId'],
-                  properties: {
-                    nodeId: OP_ID,
-                    label: { type: 'string', minLength: 1, maxLength: 200 },
-                    role: { type: 'string', enum: ['coordinator', 'worker'] },
-                    taskType: OP_ID,
-                    backend: { type: 'string', minLength: 1, maxLength: 128 },
-                    model: { type: 'string', minLength: 1, maxLength: 128 },
-                    capabilities: {
-                      type: 'array',
-                      maxItems: 16,
-                      uniqueItems: true,
-                      items: {
-                        type: 'string',
-                        enum: ['create_child', 'start_child', 'wait_child', 'interrupt_child', 'cancel_child', 'read_subtree'],
-                      },
-                    },
-                  },
-                  additionalProperties: false,
-                },
-              },
-            },
-            additionalProperties: false,
-          },
-          {
-            type: 'object',
-            required: ['kind', 'nodes', 'edges'],
-            properties: {
-              kind: { type: 'string', enum: ['graph_v1'] },
-              nodes: {
-                type: 'array',
-                minItems: 2,
-                maxItems: 32,
-                items: {
-                  type: 'object',
-                  required: ['nodeId'],
-                  properties: {
-                    nodeId: OP_ID,
-                    label: { type: 'string', minLength: 1, maxLength: 200 },
-                    role: { type: 'string', enum: ['coordinator', 'worker'] },
-                    taskType: OP_ID,
-                    backend: { type: 'string', minLength: 1, maxLength: 128 },
-                    model: { type: 'string', minLength: 1, maxLength: 128 },
-                    capabilities: {
-                      type: 'array',
-                      maxItems: 16,
-                      uniqueItems: true,
-                      items: {
-                        type: 'string',
-                        enum: ['create_child', 'start_child', 'wait_child', 'interrupt_child', 'cancel_child', 'read_subtree'],
-                      },
-                    },
-                  },
-                  additionalProperties: false,
-                },
-              },
-              edges: {
-                type: 'array',
-                minItems: 1,
-                maxItems: 64,
-                items: {
-                  type: 'object',
-                  required: ['fromNodeId', 'toNodeId', 'inputRef', 'expectedArtifactKind'],
-                  properties: {
-                    fromNodeId: OP_ID,
-                    toNodeId: OP_ID,
-                    inputRef: { type: 'string', minLength: 1, maxLength: 128 },
-                    expectedArtifactKind: { type: 'string', minLength: 1, maxLength: 128 },
-                  },
-                  additionalProperties: false,
-                },
-              },
-            },
-            additionalProperties: false,
-          },
-        ],
-      },
-      entryContracts: {
+      workflowKey: { ...PRESENTATION_ID, description: 'Unique stable identity for this logical workflow. Reuse only for an identical replay or an intentional revision owned by this root. A changed retry in the same turn conflicts; use a new key for a different workflow.' },
+      name: { type: 'string', minLength: 1, maxLength: 200, description: 'Human-readable workflow name.' },
+      nodes: {
         type: 'array',
-        maxItems: 128,
+        minItems: 1,
+        maxItems: WORKFLOW_GRAPH_MAX_NODES,
+        description: 'Unique workflow steps. nodeKey is local identity, taskType is an exact configured id, and label is the step objective. Use independent source nodes for parallel work; do not create a shared node that fans out.',
         items: {
           type: 'object',
-          required: ['entryNodeId', 'inputRef', 'expectedArtifactKind'],
+          required: ['nodeKey', 'taskType'],
           properties: {
-            entryNodeId: OP_ID,
-            inputRef: { type: 'string', minLength: 1, maxLength: 128 },
-            expectedArtifactKind: { type: 'string', minLength: 1, maxLength: 128 },
+            nodeKey: { ...PRESENTATION_ID, description: 'Stable node key unique within this workflow.' },
+            taskType: { ...OP_ID, description: 'Exact task-type id from list_task_types or current host context.' },
+            label: { type: 'string', minLength: 1, maxLength: WORKFLOW_NODE_LABEL_MAX_LENGTH, description: 'Specific objective/instruction for this step. Put work instructions here, not in the inputs declaration.' },
           },
           additionalProperties: false,
         },
       },
-      policy: {
-        type: 'object',
-        required: [
-          'maxFeedbackRoundsPerRun', 'maxTurnsPerTask', 'maxWorkflowTurnsPerRun',
-          'runTimeoutMs', 'maxDepth', 'maxTaskCount', 'maxConcurrency',
-          'maxInputsPerGate', 'maxArtifactBytes', 'maxAggregateBytes', 'failWorkflow',
-        ],
-        properties: {
-          maxFeedbackRoundsPerRun: {
-            type: 'integer', minimum: 1, maximum: 32,
-            default: DEFAULT_WORKFLOW_POLICY.maxFeedbackRoundsPerRun,
-            description: 'Feedback/PREV round budget. Minimum 1; use the default even when no PREV is planned.',
+      edges: {
+        type: 'array',
+        minItems: 1,
+        maxItems: WORKFLOW_GRAPH_MAX_EDGES,
+        description: 'Dependencies in producer-to-consumer direction. Fan-in is allowed; each from node may appear at most once. Omit for a one-node workflow.',
+        items: {
+          type: 'object',
+          required: ['from', 'to', 'as'],
+          properties: {
+            from: { ...PRESENTATION_ID, description: 'Producer nodeKey. A producer may route to only one consumer.' },
+            to: { ...PRESENTATION_ID, description: 'Consumer nodeKey.' },
+            as: { type: 'string', minLength: 1, maxLength: 128, description: 'Input name under which the consumer receives this producer result; unique per consumer.' },
           },
-          maxTurnsPerTask: {
-            type: 'integer', minimum: 1, maximum: 500,
-            default: DEFAULT_WORKFLOW_POLICY.maxTurnsPerTask,
-          },
-          maxWorkflowTurnsPerRun: {
-            type: 'integer', minimum: 1, maximum: 256,
-            default: DEFAULT_WORKFLOW_POLICY.maxWorkflowTurnsPerRun,
-          },
-          runTimeoutMs: {
-            type: 'integer', minimum: 1000, maximum: 28800000,
-            default: DEFAULT_WORKFLOW_POLICY.runTimeoutMs,
-          },
-          maxDepth: {
-            type: 'integer', minimum: 1, maximum: 8,
-            default: DEFAULT_WORKFLOW_POLICY.maxDepth,
-          },
-          maxTaskCount: {
-            type: 'integer', minimum: 1, maximum: 64,
-            default: DEFAULT_WORKFLOW_POLICY.maxTaskCount,
-          },
-          maxConcurrency: {
-            type: 'integer', minimum: 1, maximum: 64,
-            default: DEFAULT_WORKFLOW_POLICY.maxConcurrency,
-            description: 'Must not exceed maxTaskCount.',
-          },
-          maxInputsPerGate: {
-            type: 'integer', minimum: 1, maximum: 64,
-            default: DEFAULT_WORKFLOW_POLICY.maxInputsPerGate,
-          },
-          maxArtifactBytes: {
-            type: 'integer', minimum: 1, maximum: 262144,
-            default: DEFAULT_WORKFLOW_POLICY.maxArtifactBytes,
-            description: 'Maximum UTF-8 bytes in one routed artifact.',
-          },
-          maxAggregateBytes: {
-            type: 'integer', minimum: 1, maximum: 1048576,
-            default: DEFAULT_WORKFLOW_POLICY.maxAggregateBytes,
-            description: 'Maximum framed gate aggregate. Must cover every maximum-size input plus framing; do not set equal to maxArtifactBytes when an entry has inputs.',
-          },
-          failWorkflow: { type: 'boolean', default: DEFAULT_WORKFLOW_POLICY.failWorkflow },
+          additionalProperties: false,
         },
-        additionalProperties: false,
+      },
+      inputs: {
+        type: 'array',
+        maxItems: WORKFLOW_ENTRY_CONTRACTS_MAX,
+        description: 'Names of runtime values that start_workflow must supply. Declare only {to, name}; no value belongs here. to must be a source node with no incoming edge. Omit inputs entirely when no runtime value is required.',
+        items: {
+          type: 'object',
+          required: ['to', 'name'],
+          properties: {
+            to: { ...PRESENTATION_ID, description: 'Source nodeKey with no incoming edge.' },
+            name: { type: 'string', minLength: 1, maxLength: 128, description: 'Input name unique on that source node.' },
+          },
+          additionalProperties: false,
+        },
       },
     },
     additionalProperties: false,
   },
   start_workflow: {
     type: 'object',
-    required: ['opId', 'definitionId', 'version', 'startIdempotencyKey', 'entryInputs'],
+    description: 'Start a saved workflow and suspend this caller after durable acceptance. Supply exactly one value for every input declared by define_workflow, using the same source nodeKey and input name; omit inputs only when the definition declares none.',
+    required: ['workflow'],
     properties: {
-      opId: OP_ID,
-      definitionId: OP_ID,
-      version: { type: 'integer', minimum: 1 },
-      startIdempotencyKey: OP_ID,
-      goal: { type: 'string', minLength: 1, maxLength: 512 },
-      backend: { type: 'string', minLength: 1, maxLength: 64 },
-      entryInputs: {
+      workflow: { ...OP_ID, description: 'Workflow key to resolve the latest authorized revision, or immutable workflowRef such as review-flow@3.' },
+      goal: { type: 'string', minLength: 1, maxLength: WORKFLOW_RUN_GOAL_MAX_LENGTH, description: 'Optional run-specific objective shared with workflow nodes.' },
+      inputs: {
         type: 'array',
-        maxItems: 128,
+        maxItems: WORKFLOW_ENTRY_CONTRACTS_MAX,
+        description: 'Complete values for all declared workflow inputs. Node and input names must exactly match define_workflow.inputs.',
         items: {
           type: 'object',
-          required: ['entryNodeId', 'inputRef', 'kind', 'value'],
+          required: ['node', 'input', 'value'],
           properties: {
-            entryNodeId: OP_ID,
-            inputRef: { type: 'string', minLength: 1, maxLength: 128 },
-            kind: { type: 'string', minLength: 1, maxLength: 128 },
-            value: { type: 'string', maxLength: 262144 },
+            node: { ...PRESENTATION_ID, description: 'Declared source nodeKey.' },
+            input: { type: 'string', minLength: 1, maxLength: 128, description: 'Declared input name on that source node.' },
+            value: { type: 'string', maxLength: TASK_RESULT_MAX_BYTES, description: 'Input value for this run.' },
           },
           additionalProperties: false,
         },
       },
+      instanceKey: { ...OP_ID, description: 'Optional stable key for intentionally replaying the same logical run across turns. Use a different key for a distinct run.' },
     },
     additionalProperties: false,
   },
+};
+
+const TOOL_DESCRIPTIONS: Record<PublicMcpToolAction, string> = {
+  get_host_context: 'Refresh trusted workspace, caller, workflow rules, available tools, and task-type context. Use when the current host block is missing or may be stale. Read-only; takes no arguments.',
+  list_task_types: 'List configured semantic task profiles for workflow nodes. Call before define_workflow when the current task-type list is absent or stale. Select an exact returned id; do not invent backend, model, role, capability, or policy fields.',
+  inspect_workflow_run: 'Inspect bounded durable state for one owned workflow using the opaque runRef returned by start_workflow. Use only for recovery and diagnosis after uncertainty; do not poll for normal routing or pass task/gate/activation ids.',
+  workflow_next: 'Publish the current live workflow activation result to its downstream node or terminal caller. message must be a self-contained final response because the receiver cannot see earlier assistant messages. change defaults to updated; use unchanged only for an exact feedback replay.',
+  workflow_prev: 'Request correction from direct predecessor inputs of the current live activation. targets are semantic input names, not node ids, and default to all. message is the final assistant response committed before the host ends the turn.',
+  workflow_fail: 'Fail the current live workflow run only when this activation cannot produce a usable result or request a valid correction. Provide an optional concise diagnostic reason. This is a terminal disposition for the current turn.',
+  invoke_child_workflow: 'Invoke a saved child workflow from the current live activation. Bind every required child source input to an exact current-activation input name; never provide artifact ids or revisions. Use callKey only to replay the same logical child call across turns.',
+  upsert_presentation: 'Open or refresh a read-only IDE Markdown tab. REQUIRED for user-facing plans/specs. Send a stable documentKey, title, and the full markdown document (not a patch); Mermaid fenced blocks are supported. Reuse documentKey to update the same document; the engine owns identity, ownership, idempotency, and revision.',
+  define_workflow: DEFINE_WORKFLOW_DESCRIPTION,
+  start_workflow: 'Start a saved workflow by key (latest authorized revision) or immutable workflowRef. A successful call returns durable acceptance, then the host suspends this turn and resumes the caller exactly once with the terminal result; do not poll inspect_workflow_run. Supply exactly one value for every input declared by define_workflow. Use instanceKey to replay the same logical run across turns; change it for a distinct run. Inside a workflow activation use invoke_child_workflow instead.',
 };
 
 function parseBearer(header: string | undefined): string | undefined {
@@ -395,15 +322,67 @@ function parseBearer(header: string | undefined): string | undefined {
   return token.length > 0 ? token : undefined;
 }
 
-/** Preserve MCP's text content shape while making disposition conflicts machine-readable. */
+function workflowErrorHint(code: unknown, message: unknown): string | undefined {
+  if (code !== 'invalid_workflow_definition' || typeof message !== 'string') return undefined;
+  if (message === 'invalid entry contract') {
+    return 'Declare workflow inputs only on source nodes with no incoming edges; downstream nodes receive predecessor results through edges.';
+  }
+  if (message.startsWith('fan-out not allowed:')) {
+    return 'Use independent source nodes that converge by fan-in (for example A -> C and B -> C); one producer cannot route to multiple consumers.';
+  }
+  if (message.includes('multiple terminals')) {
+    return 'Converge every branch into one final consumer so the workflow has exactly one terminal node.';
+  }
+  if (message.includes('cycle not allowed')) {
+    return 'Remove the cycle and keep all edges directed forward toward one terminal node.';
+  }
+  return undefined;
+}
+
+/** Preserve MCP text content while adding stable codes and actionable recovery hints. */
 export function formatToolError(error: string): string {
   const conflict = /^disposition conflict: current disposition is ([a-z_]+)$/i.exec(error);
-  if (!conflict) return error;
-  return JSON.stringify({
-    code: 'disposition_conflict',
-    currentDisposition: conflict[1],
-    message: error,
-  });
+  if (conflict) {
+    return JSON.stringify({
+      code: 'disposition_conflict',
+      currentDisposition: conflict[1],
+      message: error,
+    });
+  }
+  if (
+    error === 'incomplete entry inputs' ||
+    error === 'entry input contract mismatch' ||
+    error === 'invalid entry input' ||
+    error === 'invalid start_workflow inputs'
+  ) {
+    return JSON.stringify({
+      code: 'invalid_workflow_inputs',
+      message: error,
+      hint: 'Supply exactly one value for every input declared by define_workflow, using the exact source nodeKey and input name.',
+    });
+  }
+  if (error === 'definition fingerprint conflict') {
+    return JSON.stringify({
+      code: 'workflow_key_conflict',
+      message: error,
+      hint: 'This workflowKey is already claimed by different immutable content or another owner. Do not retry it with changed fields. Replay the exact original definition if intentional, otherwise choose a new unique workflowKey.',
+    });
+  }
+  if (error === 'operation fingerprint conflict') {
+    return JSON.stringify({
+      code: 'workflow_definition_retry_conflict',
+      message: error,
+      hint: 'This turn already used the same workflowKey with different arguments. Retry with identical name/nodes/edges/inputs, or choose a new workflowKey for different content.',
+    });
+  }
+  try {
+    const parsed = JSON.parse(error) as unknown;
+    if (!isObject(parsed)) return error;
+    const hint = workflowErrorHint(parsed.code, parsed.message);
+    return hint ? JSON.stringify({ ...parsed, hint }) : error;
+  } catch {
+    return error;
+  }
 }
 
 function logCredentialRejection(verification: CredentialVerification): void {
@@ -441,6 +420,135 @@ function isLoopbackOrigin(origin: string | undefined): boolean {
   }
 }
 
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function workflowRef(definitionId: unknown, version: unknown): string | undefined {
+  return typeof definitionId === 'string' && Number.isSafeInteger(version)
+    ? `${definitionId}@${version}`
+    : undefined;
+}
+
+function projectPublicToolResult(tool: PublicMcpToolAction, value: unknown): unknown {
+  if (!isObject(value)) return value;
+  if (tool === 'define_workflow') {
+    const ref = workflowRef(value.definitionId, value.version);
+    if (!ref) return value;
+    return {
+      workflowRef: ref,
+      workflowKey: value.definitionId,
+      revision: value.version,
+      changed: value.changed === true,
+      replay: value.replay === true || value.changed === false,
+    };
+  }
+  if (tool === 'start_workflow') {
+    const ref = workflowRef(value.definitionId, value.version);
+    if (typeof value.runId !== 'string' || !ref) return value;
+    return {
+      runRef: value.runId,
+      workflowRef: ref,
+      replay: value.replay === true || value.changed === false,
+      status: 'accepted',
+    };
+  }
+  if (tool === 'inspect_workflow_run') {
+    if (typeof value.runId !== 'string') return value;
+    const ref = workflowRef(value.definitionId, value.definitionVersion);
+    const nodes = Array.isArray(value.nodes)
+      ? value.nodes.filter(isObject).map((node) => ({ node: node.nodeId, status: node.status }))
+      : [];
+    const activations = Array.isArray(value.activations)
+      ? value.activations.filter(isObject).map((activation) => ({
+          node: activation.nodeId,
+          kind: activation.kind,
+          status: activation.status,
+          ...(typeof activation.feedbackTargetNodeId === 'string'
+            ? { feedbackTarget: activation.feedbackTargetNodeId }
+            : {}),
+        }))
+      : [];
+    const feedback = Array.isArray(value.feedbackRounds)
+      ? value.feedbackRounds.filter(isObject).map((round) => ({
+          requester: round.requesterNodeId,
+          status: round.status,
+          required: round.required,
+          responded: round.responded,
+        }))
+      : [];
+    const children = Array.isArray(value.continuations)
+      ? value.continuations.filter(isObject).map((continuation) => ({
+          status: continuation.status,
+          kind: continuation.kind,
+          ...(typeof continuation.outcome === 'string' ? { outcome: continuation.outcome } : {}),
+          ...(typeof continuation.reasonCode === 'string' ? { reason: continuation.reasonCode } : {}),
+        }))
+      : [];
+    return {
+      runRef: value.runId,
+      ...(ref ? { workflowRef: ref } : {}),
+      status: value.runStatus,
+      nodes,
+      activations,
+      feedback,
+      children,
+      ...(typeof value.terminalReason === 'string' ? { reason: value.terminalReason } : {}),
+      diagnostics: Array.isArray(value.diagnostics)
+        ? value.diagnostics.filter(isObject).map((diagnostic) => diagnostic.code)
+        : [],
+    };
+  }
+  if (tool === 'list_task_types') {
+    const rows = Array.isArray(value.taskTypes) ? value.taskTypes.filter(isObject) : [];
+    return {
+      taskTypes: rows.map((row) => ({
+        id: row.id,
+        ...(typeof row.description === 'string' ? { description: row.description } : {}),
+        role: row.defaultRole,
+        briefKind: row.defaultBriefKind,
+        availability: row.availability,
+      })),
+      diagnostics: Array.isArray(value.diagnostics)
+        ? value.diagnostics.filter(isObject).map((diagnostic) => diagnostic.code)
+        : [],
+    };
+  }
+  if (tool === 'get_host_context') {
+    const self = isObject(value.self) ? value.self : undefined;
+    const rows = Array.isArray(value.taskTypes) ? value.taskTypes.filter(isObject) : undefined;
+    return {
+      version: value.version,
+      workspace: value.workspace,
+      ...(self
+        ? {
+            self: {
+              taskId: self.taskId,
+              role: self.role,
+              ...(typeof self.parentTaskId === 'string' ? { parentTaskId: self.parentTaskId } : {}),
+              ...(typeof self.goal === 'string' ? { goal: self.goal } : {}),
+            },
+          }
+        : {}),
+      rules: value.rules,
+      tools: value.tools,
+      ...(rows
+        ? {
+            taskTypes: rows.map((row) => ({
+              id: row.id,
+              ...(typeof row.description === 'string' ? { description: row.description } : {}),
+              role: row.defaultRole,
+              briefKind: row.defaultBriefKind,
+              availability: row.availability,
+            })),
+          }
+        : {}),
+      ...(value.scope !== undefined ? { scope: value.scope } : {}),
+    };
+  }
+  return value;
+}
+
 interface CreateMcpServerOptions {
   credentials: CredentialRegistry;
   toolHandler: ToolCallHandler;
@@ -460,28 +568,7 @@ function createMcpServer(options: CreateMcpServerOptions): McpServer {
     const allowed = ctx?.allowedActions ?? new Set<PublicMcpToolAction>();
     const tools = ALL_TOOLS.filter((name) => allowed.has(name)).map((name) => ({
       name,
-      description:
-         name === 'get_host_context'
-          ? 'Refresh trusted host env, self ids, task-type registry summary, and role rules (same data as first-turn host block).'
-          : name === 'list_task_types'
-            ? 'Refresh configured muster.taskTypes (first-turn host context already lists them). Prefer taskType from host snapshot; omit backend/model unless the user named an override.'
-            : name === 'inspect_workflow_run'
-              ? 'Inspect bounded durable state for an owned workflow run by runId. Returns run/gate/activation/feedback/continuation diagnostics and committed terminal artifact references; never topology, prompts, artifact bodies, paths, or secrets. Use for recovery and diagnosis, not polling.'
-            : name === 'upsert_presentation'
-                            ? 'Open or refresh a read-only IDE tab with Markdown (```mermaid``` fences supported). REQUIRED when the user asks to plan/spec for review or when a plan is ready: pass the full plan as markdown — do not only paste it in chat. Args: presentationId (stable, e.g. plan-<taskId>), ownerTaskId (must equal self.taskId), opId (unique per call), revision (1 then ++), title, markdown, optional kind (plan|spec|document), optional summary. Never send sourcePath, sourceFolderUri, updatedAt, or rootId (host-owned).'
-                            : name === 'workflow_next'
-                              ? 'Stage a workflow NEXT disposition on the live turn: routes this node result forward without sealing lifecycle. Provide change=updated|unchanged and optional result body. Engine owns gate/artifact identities. Committed only when the adapter settles the turn successfully.'
-                            : name === 'workflow_prev'
-                              ? 'Stage a workflow PREV disposition on the live turn: request correction from one or all direct producers without sealing lifecycle. Provide targets="all" or a non-empty inputRef array and optional note. Engine owns round/target/resume identities. Committed only when the adapter settles the turn successfully.'
-                            : name === 'workflow_fail'
-                              ? 'Stage a workflow FAIL disposition on the live turn: close the current workflow run without sealing task lifecycle. Optional reason is bounded diagnostics only (no prompts/artifacts/paths). Engine owns run/gate/round closure identities. Committed only when the adapter settles the turn successfully.'
-                            : name === 'invoke_child_workflow'
-                              ? 'Stage a child-workflow NEXT route on the live turn without sealing caller lifecycle. Provide childDefinitionId, childDefinitionVersion, and exact entryBindings (childEntryNodeId, inputRef, artifactId, artifactRevision), plus an optional childIdempotencyKey. Engine owns child run/continuation/return-gate identities. Committed only when the adapter settles the turn successfully.'
-                             : name === 'define_workflow'
-                               ? 'Persist an immutable workflow definition version (one_node_v1 or graph_v1 fan-in). Start from the advertised policy defaults unless the user requires tighter limits. maxFeedbackRoundsPerRun is at least 1. maxAggregateBytes includes framing plus all maximum-size gate inputs, so it normally must be greater than maxArtifactBytes. Same definitionId+version+fingerprint replays; differing fingerprint fails closed.'
-                              : name === 'start_workflow'
-                                ? 'Idempotently start a frozen top-level workflow run. Claims startIdempotencyKey and creates exactly one ordinary queued entry turn when the entry gate is satisfied. Agents never supply run/task/turn/gate IDs.'
-                          : `Muster coordinator tool: ${name}`,
+      description: TOOL_DESCRIPTIONS[name],
       inputSchema: TOOL_INPUT_SCHEMAS[name],
     }));
     if (ctx && onMcpObservation) {
@@ -516,14 +603,14 @@ function createMcpServer(options: CreateMcpServerOptions): McpServer {
     const args = request.params.arguments ?? {};
     const routed = dispatch(name, args, ctx);
     if (!routed.ok) {
-      return { content: [{ type: 'text', text: routed.toolError }], isError: true };
+      return { content: [{ type: 'text', text: formatToolError(routed.toolError) }], isError: true };
     }
 
     const result = await toolHandler.handleToolCall(ctx, name, routed.command);
     if (!result.ok) {
       return { content: [{ type: 'text', text: formatToolError(result.error) }], isError: true };
     }
-    return { content: [{ type: 'text', text: JSON.stringify(result.result) }] };
+    return { content: [{ type: 'text', text: JSON.stringify(projectPublicToolResult(name, result.result)) }] };
   });
 
   return server;
@@ -590,7 +677,8 @@ export class MusterBridgeServer {
     }
 
     this.healthStatus = 'ok';
-    const app = createMcpExpressApp({ host: '127.0.0.1' });
+    const app = expressFactory();
+    app.use(expressFactory.json({ limit: MCP_JSON_BODY_MAX_BYTES }));
 
     // Unauthenticated loopback health — no repository I/O, no credential required.
     app.get(

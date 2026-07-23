@@ -18,7 +18,7 @@ function task(id: string, parentId: string | null = null): MusterTask {
     releaseState: 'draft',
     goal: id,
     parentId,
-    dependencies: [],
+    prerequisites: [],
     backend: 'grok',
     capabilities: [],
     executionPolicy: { maxTurns: 10, maxAutomaticRetries: 1 },

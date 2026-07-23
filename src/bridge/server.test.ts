@@ -1,8 +1,8 @@
 import { describe, expect, it, afterEach } from 'vitest';
 import { CredentialRegistry } from './credentials';
 import { formatToolError, MusterBridgeServer } from './server';
-import { DEFAULT_WORKFLOW_POLICY } from '../task/workflow';
 import { PUBLIC_MCP_TOOL_ACTIONS } from '../task/capabilities';
+import { WORKFLOW_NODE_LABEL_MAX_LENGTH } from '../task/workflow-types';
 
 const REMOVED_MCP_TOOLS = [
   'create_task',
@@ -98,6 +98,40 @@ describe('formatToolError', () => {
       });
     expect(formatToolError('task not found')).toBe('task not found');
   });
+
+  it('adds actionable hints to invalid semantic workflow errors', () => {
+    expect(JSON.parse(formatToolError(JSON.stringify({
+      code: 'invalid_workflow_definition',
+      message: 'invalid entry contract',
+    })))).toEqual({
+      code: 'invalid_workflow_definition',
+      message: 'invalid entry contract',
+      hint: expect.stringContaining('source nodes'),
+    });
+    expect(JSON.parse(formatToolError(JSON.stringify({
+      code: 'invalid_workflow_definition',
+      message: 'fan-out not allowed: node intake',
+    })))).toEqual({
+      code: 'invalid_workflow_definition',
+      message: 'fan-out not allowed: node intake',
+      hint: expect.stringContaining('A -> C and B -> C'),
+    });
+    expect(JSON.parse(formatToolError('incomplete entry inputs'))).toEqual({
+      code: 'invalid_workflow_inputs',
+      message: 'incomplete entry inputs',
+      hint: expect.stringContaining('exact source nodeKey and input name'),
+    });
+    expect(JSON.parse(formatToolError('definition fingerprint conflict'))).toEqual({
+      code: 'workflow_key_conflict',
+      message: 'definition fingerprint conflict',
+      hint: expect.stringContaining('new unique workflowKey'),
+    });
+    expect(JSON.parse(formatToolError('operation fingerprint conflict'))).toEqual({
+      code: 'workflow_definition_retry_conflict',
+      message: 'operation fingerprint conflict',
+      hint: expect.stringContaining('identical name/nodes/edges/inputs'),
+    });
+  });
 });
 
 describe('MusterBridgeServer auth', () => {
@@ -147,20 +181,17 @@ describe('MusterBridgeServer auth', () => {
     expect(tools.map((tool) => tool.name)).toEqual(['upsert_presentation']);
     expect(tools[0]).toMatchObject({
       name: 'upsert_presentation',
-      description: expect.stringContaining('REQUIRED when the user asks to plan'),
+      description: expect.stringContaining('REQUIRED for user-facing plans'),
     });
     expect(tools[0].inputSchema).toMatchObject({
-      required: ['presentationId', 'ownerTaskId', 'opId', 'revision', 'title', 'markdown'],
+      required: ['documentKey', 'title', 'markdown'],
       additionalProperties: false,
     });
 
     const called = await coordinator.request('tools/call', {
       name: 'upsert_presentation',
       arguments: {
-        presentationId: 'release-notes',
-        ownerTaskId: 'task-1',
-        opId: 'op-1',
-        revision: 1,
+        documentKey: 'release-notes',
         title: 'Release notes',
         markdown: '# Ready',
       },
@@ -172,7 +203,11 @@ describe('MusterBridgeServer auth', () => {
     expect(handled).toHaveLength(1);
     expect(handled[0]).toMatchObject({
       tool: 'upsert_presentation',
-      command: { kind: 'upsert_presentation', presentationId: 'release-notes' },
+      command: {
+        kind: 'upsert_presentation',
+        presentationId: expect.stringMatching(/^presentation-/),
+        ownerTaskId: 'task-1',
+      },
     });
 
     const workerToken = credentials.issue({
@@ -211,7 +246,30 @@ describe('MusterBridgeServer auth', () => {
       toolHandler: {
         handleToolCall: async (_ctx, tool, command) => {
           handled.push({ tool, command });
-          return { ok: true, result: { ok: true, changed: true } };
+          if (tool === 'define_workflow') {
+            return {
+              ok: true,
+              result: {
+                ok: true,
+                changed: true,
+                definitionId: 'wf-one',
+                version: 3,
+                fingerprint: 'internal-definition-fingerprint',
+              },
+            };
+          }
+          return {
+            ok: true,
+            result: {
+              ok: true,
+              changed: true,
+              definitionId: 'wf-one',
+               version: 3,
+               runId: 'run-secret-coordinates-hidden',
+               entryTaskId: 'task-internal',
+               entryGateId: 'gate-internal',
+             },
+          };
         },
       },
     });
@@ -231,43 +289,67 @@ describe('MusterBridgeServer auth', () => {
         name: string;
         description?: string;
         inputSchema: {
-          properties?: Record<string, { properties?: Record<string, unknown> }>;
+          description?: string;
+          properties?: Record<string, { description?: string; properties?: Record<string, unknown> }>;
         };
       }>;
     }).tools;
     const names = workflowTools.map((t) => t.name);
     expect(names).toEqual(expect.arrayContaining(['define_workflow', 'start_workflow']));
     const defineTool = workflowTools.find((tool) => tool.name === 'define_workflow');
-    expect(defineTool?.description).toContain('maxFeedbackRoundsPerRun is at least 1');
-    expect(defineTool?.description).toContain('maxAggregateBytes includes framing');
-    expect(defineTool?.inputSchema.properties?.policy?.properties).toMatchObject({
-      maxFeedbackRoundsPerRun: {
-        minimum: 1,
-        default: DEFAULT_WORKFLOW_POLICY.maxFeedbackRoundsPerRun,
-        description: expect.stringContaining('Minimum 1'),
-      },
-      maxArtifactBytes: {
-        default: DEFAULT_WORKFLOW_POLICY.maxArtifactBytes,
-      },
-      maxAggregateBytes: {
-        default: DEFAULT_WORKFLOW_POLICY.maxAggregateBytes,
-        description: expect.stringContaining('do not set equal'),
+    expect(defineTool?.description).toContain('Use only this public shape');
+    expect(defineTool?.description).toContain('CORRECT one-node');
+    expect(defineTool?.description).toContain('CORRECT parallel fan-in');
+    expect(defineTool?.description).toContain('INCORRECT internal parameters');
+    expect(defineTool?.description).toContain('INCORRECT fan-out');
+    expect(defineTool?.description).toContain('INCORRECT downstream input');
+    expect(defineTool?.description).toContain('Retries for the same key in one turn must repeat identical');
+    expect(defineTool?.description).toContain('Never send internal fields');
+    expect(defineTool?.inputSchema).toMatchObject({
+      required: ['workflowKey', 'name', 'nodes'],
+      additionalProperties: false,
+      properties: {
+        nodes: {
+          items: {
+            properties: {
+              label: { maxLength: WORKFLOW_NODE_LABEL_MAX_LENGTH },
+            },
+          },
+        },
       },
     });
+    expect(defineTool?.inputSchema.description).toContain('A -> C and B -> C');
+    expect(defineTool?.inputSchema.description).toContain('Required: workflowKey, name, nodes');
+    expect(defineTool?.inputSchema.properties?.edges?.description).toContain('each from node may appear at most once');
+    expect(defineTool?.inputSchema.properties?.inputs?.description).toContain('no value belongs here');
+    expect(defineTool?.inputSchema.properties).not.toHaveProperty('policy');
+    expect(defineTool?.inputSchema.properties).not.toHaveProperty('opId');
+     const startTool = workflowTools.find((tool) => tool.name === 'start_workflow');
+     expect(startTool?.description).toContain('exactly one value for every input');
+     expect(startTool?.description).toContain('resumes the caller exactly once');
+    expect(startTool?.inputSchema.properties?.inputs?.description).toContain('exactly match');
 
     const defined = await session.request('tools/call', {
       name: 'define_workflow',
       arguments: {
-        opId: 'op-def',
-        definitionId: 'wf-one',
-        version: 1,
+        workflowKey: 'wf-one',
         name: 'one-node',
-        topology: { kind: 'one_node_v1', entryNodeId: 'entry', nodes: [{ nodeId: 'entry' }] },
-        entryContracts: [],
-        policy: DEFAULT_WORKFLOW_POLICY,
+        nodes: [{ nodeKey: 'entry', taskType: 'implement' }],
       },
     });
     expect(defined.result).not.toHaveProperty('isError', true);
+    expect(defined.result).toMatchObject({
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          workflowRef: 'wf-one@3',
+          workflowKey: 'wf-one',
+          revision: 3,
+          changed: true,
+          replay: false,
+        }),
+      }],
+    });
     expect(handled[0]).toMatchObject({ tool: 'define_workflow', command: { kind: 'define_workflow' } });
 
     const badStart = await session.request('tools/call', {
@@ -276,6 +358,24 @@ describe('MusterBridgeServer auth', () => {
     });
     expect(badStart.result).toMatchObject({ isError: true });
     expect(handled).toHaveLength(1);
+
+    const started = await session.request('tools/call', {
+      name: 'start_workflow',
+      arguments: { workflow: 'wf-one@3', inputs: [] },
+    });
+    expect(started.result).toMatchObject({
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          runRef: 'run-secret-coordinates-hidden',
+           workflowRef: 'wf-one@3',
+           replay: false,
+           status: 'accepted',
+         }),
+      }],
+    });
+    expect((started.result as { content: Array<{ text: string }> }).content[0]!.text)
+      .not.toContain('entryTaskId');
 
     const workerToken = credentials.issue({
       rootId: 'root-1',
@@ -302,6 +402,29 @@ describe('MusterBridgeServer auth', () => {
       toolHandler: {
         handleToolCall: async (_ctx, tool, command) => {
           handled.push({ tool, command });
+          if (tool === 'inspect_workflow_run') {
+            return {
+              ok: true,
+              result: {
+                runId: 'wfr-1',
+                definitionId: 'review-flow',
+                definitionVersion: 2,
+                runStatus: 'running',
+                policy: { maxDepth: 8 },
+                nodes: [{ nodeId: 'review', status: 'running' }],
+                gates: [{ gateId: 'gate-internal', status: 'satisfied' }],
+                activations: [{
+                  activationId: 'activation-internal',
+                  nodeId: 'review',
+                  kind: 'dependency_gate',
+                  status: 'running',
+                }],
+                feedbackRounds: [],
+                continuations: [],
+                diagnostics: [],
+              },
+            };
+          }
           return { ok: true, result: {} };
         },
       },
@@ -319,22 +442,39 @@ describe('MusterBridgeServer auth', () => {
 
     const listed = await coordinator.request('tools/list');
     const tools = (listed.result as {
-      tools: Array<{ name: string; inputSchema: Record<string, unknown> }>;
+      tools: Array<{ name: string; description?: string; inputSchema: Record<string, unknown> }>;
     }).tools;
     const names = tools.map((tool) => tool.name);
     expect(names).toEqual(PUBLIC_MCP_TOOL_ACTIONS);
+    for (const tool of tools) {
+      expect(tool.description?.length).toBeGreaterThan(40);
+      expect(tool.inputSchema).toHaveProperty('description');
+    }
     expect(tools.find((tool) => tool.name === 'inspect_workflow_run')).toMatchObject({
       description: expect.stringContaining('recovery and diagnosis'),
       inputSchema: {
-        required: ['runId'],
+        required: ['runRef'],
         additionalProperties: false,
       },
     });
     const inspected = await coordinator.request('tools/call', {
       name: 'inspect_workflow_run',
-      arguments: { runId: 'wfr-1' },
+      arguments: { runRef: 'wfr-1' },
     });
     expect(inspected.result).not.toHaveProperty('isError', true);
+    const inspectedText = (inspected.result as { content: Array<{ text: string }> }).content[0]!.text;
+    expect(JSON.parse(inspectedText)).toEqual({
+      runRef: 'wfr-1',
+      workflowRef: 'review-flow@2',
+      status: 'running',
+      nodes: [{ node: 'review', status: 'running' }],
+      activations: [{ node: 'review', kind: 'dependency_gate', status: 'running' }],
+      feedback: [],
+      children: [],
+      diagnostics: [],
+    });
+    expect(inspectedText).not.toContain('gate-internal');
+    expect(inspectedText).not.toContain('maxDepth');
     expect(handled).toEqual([
       {
         tool: 'inspect_workflow_run',
@@ -389,6 +529,38 @@ describe('MusterBridgeServer auth', () => {
     });
     expect(res.status).not.toBe(401);
     expect(res.status).not.toBe(403);
+  });
+
+  it('accepts a workflow message larger than the default Express 100 KiB parser limit', async () => {
+    const credentials = new CredentialRegistry();
+    const handled: unknown[] = [];
+    server = new MusterBridgeServer({
+      credentials,
+      toolHandler: {
+        handleToolCall: async (_ctx, _tool, command) => {
+          handled.push(command);
+          return { ok: true, result: {} };
+        },
+      },
+    });
+    const { port } = await server.listen();
+    const token = credentials.issue({
+      rootId: 'r',
+      callerTaskId: 't',
+      turnId: 'turn-large',
+      attemptId: 'a0',
+      allowedActions: new Set(['workflow_next']),
+      ttlMs: 60_000,
+    });
+    const session = await openMcpSession(port, token);
+    const message = 'x'.repeat(150_000);
+    const response = await session.request('tools/call', {
+      name: 'workflow_next',
+      arguments: { message },
+    });
+    expect(response.result).not.toMatchObject({ isError: true });
+    expect(handled).toHaveLength(1);
+    expect(handled[0]).toMatchObject({ kind: 'workflow_next', message });
   });
 });
 

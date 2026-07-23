@@ -6,6 +6,7 @@ import {
   type PresentationPanel,
   type PresentationPanelFactory,
 } from './presentation-manager';
+import { PRESENTATION_MARKDOWN_MAX_LENGTH } from '../task/coordinator-tools';
 
 class FakePanel implements PresentationPanel {
   readonly updates: PresentationDocument[] = [];
@@ -289,6 +290,22 @@ describe('PresentationManager', () => {
     expect(factory.panels[0].updates).toHaveLength(1);
   });
 
+  it('allocates semantic revisions and replays identical content without a caller revision', async () => {
+    const factory = new FakeFactory();
+    const manager = new PresentationManager(factory);
+    const docs = wireMemoryStore(manager);
+    const semantic = { ...request, revision: undefined };
+
+    expect(await manager.upsert(context, semantic)).toEqual({ ok: true, code: 'opened' });
+    expect(docs.get('plan.main')?.revision).toBe(1);
+    expect(await manager.upsert(context, semantic)).toEqual({ ok: true, code: 'idempotent' });
+    expect(await manager.upsert(
+      { ...context, turnId: 'turn-2' },
+      { ...semantic, opId: 'op-2', markdown: '# Revised' },
+    )).toEqual({ ok: true, code: 'opened' });
+    expect(docs.get('plan.main')?.revision).toBe(2);
+  });
+
   it('rejects malformed and oversized requests before calling the panel factory', async () => {
     const factory = new FakeFactory();
     const manager = new PresentationManager(factory);
@@ -298,7 +315,7 @@ describe('PresentationManager', () => {
       ok: false,
       code: 'invalid_arguments',
     });
-    await expect(manager.upsert(context, { ...request, markdown: 'x'.repeat(100_001) })).resolves.toEqual({
+    await expect(manager.upsert(context, { ...request, markdown: 'x'.repeat(PRESENTATION_MARKDOWN_MAX_LENGTH + 1) })).resolves.toEqual({
       ok: false,
       code: 'payload_too_large',
     });

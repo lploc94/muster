@@ -15,7 +15,7 @@ function makeTask(id: string): MusterTask {
     releaseState: 'draft',
     goal: id,
     parentId: null,
-    dependencies: [],
+    prerequisites: [],
     backend: 'grok',
     capabilities: [],
     executionPolicy: { maxTurns: 10, maxAutomaticRetries: 1 },
@@ -62,7 +62,7 @@ describe('SqliteTaskRepository', () => {
         await expect(repository.getTurn(turn.id)).resolves.toMatchObject({ taskId: child.id });
         await expect(repository.execute(command)).resolves.toMatchObject({ changed: false, operation: operation.entry });
         await expect(repository.execute({ ...command, operation: { ...operation, entry: { ...operation.entry, fingerprint: 'different' } } })).resolves.toMatchObject({ conflict: true });
-        const badChild = { ...makeTask(`${root.id}-bad`), parentId: root.id, dependencies: [{ taskId: 'missing', requiredOutcome: 'succeeded' as const, onUnsatisfied: 'fail' as const }] };
+        const badChild = { ...makeTask(`${root.id}-bad`), parentId: root.id, prerequisites: [{ producerTaskId: 'missing', requiredLifecycle: 'succeeded' as const, onUnmet: 'fail' as const }] };
         await expect(repository.execute({ ...command, operation: { ...operation, ledgerKey: `${root.id}:bad`, entry: { ...operation.entry, fingerprint: 'bad' } }, insertTaskIds: [badChild.id], tasks: [badChild], insertTurnIds: [], turns: [], insertMessageIds: [], messages: [] })).resolves.toMatchObject({ changed: false });
         await expect(repository.getTask(badChild.id)).resolves.toBeUndefined();
       }
@@ -157,6 +157,19 @@ describe('SqliteTaskRepository', () => {
           kind: 'renameTask', workspaceId: 'ws', taskId: root.id, goal: 'stale',
           expectedTaskRevision: 0, updatedAt: '2026-07-16T00:00:04.000Z',
         })).resolves.toMatchObject({ changed: false });
+        await repository.execute({
+          kind: 'createTurn', workspaceId: 'ws',
+          turn: {
+            id: `waiting-child-turn-${index}`, taskId: child.id, sequence: 1,
+            status: 'waiting_user', trigger: 'user', inputs: [],
+            createdAt: '2026-07-16T00:00:04.500Z',
+          },
+        });
+        await expect(repository.execute({
+          kind: 'deleteTaskSubtree', workspaceId: 'ws', rootTaskId: child.id,
+        })).resolves.toMatchObject({ changed: true });
+        await expect(repository.getTask(root.id)).resolves.toBeDefined();
+        await expect(repository.getTask(child.id)).resolves.toBeUndefined();
 
         const queuedTask = makeTask(`history-queue-command-${index}`);
         await repository.execute({ kind: 'createTask', workspaceId: 'ws', task: queuedTask });
@@ -173,9 +186,9 @@ describe('SqliteTaskRepository', () => {
         ]);
 
         await expect(repository.execute({
-          kind: 'deleteTaskSubtreeIfIdle', workspaceId: 'ws', rootTaskId: queued.id,
-        })).resolves.toMatchObject({ changed: false });
-        await expect(repository.getTask(queued.id)).resolves.toBeDefined();
+          kind: 'deleteTaskSubtree', workspaceId: 'ws', rootTaskId: queued.id,
+        })).resolves.toMatchObject({ changed: true });
+        await expect(repository.getTask(queued.id)).resolves.toBeUndefined();
 
         await expect(repository.execute({
           kind: 'clearHistory', workspaceId: 'ws', preserveRootTaskId: active.id,
@@ -183,8 +196,97 @@ describe('SqliteTaskRepository', () => {
         await expect(repository.getTask(root.id)).resolves.toBeUndefined();
         await expect(repository.getTask(child.id)).resolves.toBeUndefined();
         await expect(repository.getTask(active.id)).resolves.toBeDefined();
-        await expect(repository.getTask(queued.id)).resolves.toBeDefined();
+        await expect(repository.getTask(queuedTask.id)).resolves.toBeDefined();
       }
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('deletes an active workflow task and its artifact source', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-delete-workflow-task-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      await client.run(
+        `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at) VALUES (?,?,?,?,?)`,
+        ['ws', 'delete-workflow-task', 'Delete workflow task', 'now', 'now'],
+      );
+      const repository = new SqliteTaskRepository(client, 'ws');
+      await repository.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-delete-failed',
+        version: 1,
+        name: 'delete failed workflow task',
+        topology: {
+          kind: 'one_node_v1',
+          nodes: [{ nodeId: 'entry' }],
+          entryNodeId: 'entry',
+        },
+        createdAt: '2026-07-16T00:00:00.000Z',
+      });
+      const started = await repository.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: 'ws',
+        definitionId: 'wf-delete-failed',
+        version: 1,
+        startIdempotencyKey: 'delete-failed',
+        createdAt: '2026-07-16T00:00:01.000Z',
+        goal: 'failed workflow task',
+        backend: 'grok',
+      });
+      const payload = started.operation?.result?.data as {
+        runId: string;
+        entryTaskId: string;
+        activationTurnId: string;
+      };
+      await client.run(
+        `UPDATE turns SET status = 'running', started_at = ? WHERE workspace_id = ? AND id = ?`,
+        ['2026-07-16T00:00:02.000Z', 'ws', payload.activationTurnId],
+      );
+      const activation = await client.get<{ activation_id: string }>(
+        `SELECT activation_id FROM workflow_activations
+          WHERE workspace_id = ? AND run_id = ? AND execution_turn_id = ?`,
+        ['ws', payload.runId, payload.activationTurnId],
+      );
+      await expect(client.run(
+        `INSERT INTO workflow_artifacts (
+           workspace_id, run_id, artifact_id, producer_node_id, logical_name,
+           revision, kind, payload_json, created_at
+         ) VALUES (?,?,?,?,?,?,?,?,?)`,
+        ['ws', payload.runId, 'delete-source-artifact', 'entry', 'result', 1, 'text', '{}', '2026-07-16T00:00:02.000Z'],
+      )).resolves.toMatchObject({ changes: 1 });
+      await expect(client.run(
+        `INSERT INTO workflow_artifact_sources (
+           workspace_id, run_id, artifact_id, artifact_revision, source_kind,
+           producer_run_id, producer_node_id, producer_task_id, producing_turn_id,
+           producing_activation_id
+         ) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+        [
+          'ws', payload.runId, 'delete-source-artifact', 1, 'workflow_node',
+          payload.runId, 'entry', payload.entryTaskId, payload.activationTurnId,
+          activation!.activation_id,
+        ],
+      )).resolves.toMatchObject({ changes: 1 });
+
+      await expect(repository.execute({
+        kind: 'deleteTaskSubtree',
+        workspaceId: 'ws',
+        rootTaskId: payload.entryTaskId,
+      })).resolves.toMatchObject({ ok: true, changed: true });
+      await expect(repository.getTask(payload.entryTaskId)).resolves.toBeUndefined();
+      await expect(client.get(
+        `SELECT task_id FROM workflow_nodes WHERE workspace_id = ? AND run_id = ? AND node_id = 'entry'`,
+        ['ws', payload.runId],
+      )).resolves.toEqual({ task_id: null });
+      await expect(client.get(
+        `SELECT 1 AS present FROM workflow_artifact_sources
+          WHERE workspace_id = ? AND run_id = ? AND artifact_id = ?`,
+        ['ws', payload.runId, 'delete-source-artifact'],
+      )).resolves.toBeUndefined();
+      await expect(client.all('PRAGMA foreign_key_check')).resolves.toEqual([]);
     } finally {
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });
@@ -288,7 +390,7 @@ describe('SqliteTaskRepository', () => {
             createdAt: '2026-07-16T00:00:05.000Z', updatedAt: '2026-07-16T00:00:05.000Z',
           }],
           reasoning: [{
-            id: `${turn.id}:reasoning`, taskId: task.id, turnId: turn.id, content: 'think',
+            id: `${turn.id}:reasoning`, taskId: task.id, turnId: turn.id, order: 2, content: 'think',
             createdAt: '2026-07-16T00:00:05.000Z', updatedAt: '2026-07-16T00:00:05.000Z',
           }],
         });
@@ -597,7 +699,7 @@ describe('SqliteTaskRepository', () => {
             createdAt: '2026-07-16T00:00:03.000Z', updatedAt: '2026-07-16T00:00:04.000Z',
           }],
           reasoning: [{
-            id: turn.id, taskId: task.id, turnId: turn.id, content: oversized,
+            id: `${turn.id}:2`, taskId: task.id, turnId: turn.id, order: 2, content: oversized,
             createdAt: '2026-07-16T00:00:03.000Z', updatedAt: '2026-07-16T00:00:04.000Z',
           }],
         });
@@ -612,7 +714,7 @@ describe('SqliteTaskRepository', () => {
           expect.objectContaining({ id: `${turn.id}:tool`, output: oversized }),
         ]));
         await expect(repository.listReasoning(task.id)).resolves.toEqual(expect.arrayContaining([
-          expect.objectContaining({ id: turn.id, content: oversized }),
+          expect.objectContaining({ id: `${turn.id}:2`, content: oversized }),
         ]));
       }
     } finally {
@@ -759,7 +861,7 @@ describe('SqliteTaskRepository', () => {
       producer.description = 'normalised task payload';
       producer.releaseState = 'released';
       const consumer = makeTask('consumer');
-      consumer.dependencies = [{ taskId: producer.id, requiredOutcome: 'succeeded', onUnsatisfied: 'block' }];
+      consumer.prerequisites = [{ producerTaskId: producer.id, requiredLifecycle: 'succeeded', onUnmet: 'block' }];
       consumer.description = 'consumer payload';
       consumer.wait = { kind: 'external', key: 'approval', message: 'waiting for approval' };
       consumer.releaseState = 'released';
@@ -788,7 +890,7 @@ describe('SqliteTaskRepository', () => {
           createdAt: '2026-07-16T00:00:03.000Z', updatedAt: '2026-07-16T00:00:04.000Z',
         }],
         reasoning: [{
-          id: turn.id, taskId: consumer.id, turnId: turn.id, content: 'reasoning',
+          id: `${turn.id}:2`, taskId: consumer.id, turnId: turn.id, order: 2, content: 'reasoning',
           createdAt: '2026-07-16T00:00:03.000Z', updatedAt: '2026-07-16T00:00:04.000Z',
         }],
       });
@@ -819,7 +921,7 @@ describe('SqliteTaskRepository', () => {
       expect(await client.all('SELECT * FROM turn_inputs WHERE workspace_id = ? AND turn_id = ?', ['ws', turn.id])).toHaveLength(2);
 
       await expect(repository.getTask(consumer.id)).resolves.toMatchObject({
-        dependencies: consumer.dependencies,
+        prerequisites: consumer.prerequisites,
         description: consumer.description,
         wait: consumer.wait,
       });
@@ -828,7 +930,7 @@ describe('SqliteTaskRepository', () => {
         expect.objectContaining({ id: message.id, agentContent: message.agentContent }),
       );
       await expect(repository.listToolCalls(consumer.id)).resolves.toMatchObject([{ id: 'turn-1:tool-1' }]);
-      await expect(repository.listReasoning(consumer.id)).resolves.toMatchObject([{ id: turn.id }]);
+      await expect(repository.listReasoning(consumer.id)).resolves.toMatchObject([{ id: `${turn.id}:2`, order: 2 }]);
       await expect(repository.getOperation('turn-1:op-1')).resolves.toEqual(operation);
       await expect(repository.getCancelRequest(turn.id)).resolves.toMatchObject({ opId: 'cancel-1' });
       await expect(repository.getSendReceipt('request-1')).resolves.toMatchObject({ turnId: turn.id });
@@ -1137,8 +1239,8 @@ describe('SqliteTaskRepository', () => {
           { id: 'live-tool', taskId: open.id, turnId: liveTurn.id, toolCallId: 'live-tool', order: 1, name: 'read', status: 'running', output: oversized, createdAt: liveTurn.createdAt, updatedAt: liveTurn.createdAt },
         ],
         reasoning: [
-          { id: 'open-reasoning', taskId: open.id, turnId: openTurn.id, content: oversized, createdAt: openTurn.createdAt, updatedAt: openTurn.createdAt },
-          { id: 'live-reasoning', taskId: open.id, turnId: liveTurn.id, content: oversized, createdAt: liveTurn.createdAt, updatedAt: liveTurn.createdAt },
+          { id: 'open-reasoning', taskId: open.id, turnId: openTurn.id, order: 2, content: oversized, createdAt: openTurn.createdAt, updatedAt: openTurn.createdAt },
+          { id: 'live-reasoning', taskId: open.id, turnId: liveTurn.id, order: 2, content: oversized, createdAt: liveTurn.createdAt, updatedAt: liveTurn.createdAt },
         ],
       });
       await expect(repository.execute({
@@ -2089,7 +2191,7 @@ describe('SqliteTaskRepository', () => {
         lifecycle: 'failed',
         finishedAt,
         error: 'agent_fail',
-        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+        lifecycleAuthority: { kind: 'workflow', runId: data.runId },
       });
       expect(after?.attention).toBeUndefined();
     } finally {
@@ -2180,7 +2282,7 @@ describe('SqliteTaskRepository', () => {
         lifecycle: 'failed',
         finishedAt,
         error: 'invalid_route',
-        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+        lifecycleAuthority: { kind: 'workflow', runId: data.runId },
       });
       expect(after?.attention).toBeUndefined();
     } finally {

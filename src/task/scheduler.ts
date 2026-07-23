@@ -1,4 +1,4 @@
-import { evaluateDependency } from './deps';
+import { evaluatePrerequisite } from './prerequisites';
 import type { ResourceLimits } from './limits';
 import { evaluateTaskReadiness, readinessToPromoteReason } from './readiness';
 import { hasResourceConflict } from './resources';
@@ -58,28 +58,27 @@ export function isSessionBusy(file: EngineProjection, sessionId: string | undefi
   return runningTurns(file).some((turn) => sessionIdForTurn(file, turn) === sessionId);
 }
 
-export function dependenciesBlockTask(file: EngineProjection, taskId: string): boolean {
+export function prerequisitesBlockTask(file: EngineProjection, taskId: string): boolean {
   const task = file.tasks[taskId];
   if (!task) {
     return true;
   }
-  for (const dep of task.dependencies) {
-    const producer = file.tasks[dep.taskId];
-    const outcome = evaluateDependency(
-      dep,
+  for (const prerequisite of task.prerequisites) {
+    const producer = file.tasks[prerequisite.producerTaskId];
+    const outcome = evaluatePrerequisite(
+      prerequisite,
       producer?.lifecycle,
       producer?.taskResult?.verdict?.status,
     );
-    // Only 'satisfied' allows promotion. pending/block wait; fail/skip are sealed by
-    // host applyDependencyTerminals — still block until sealed/settled.
-    if (outcome !== 'satisfied') {
+    // Only 'met' allows promotion; every other state remains blocked.
+    if (outcome !== 'met') {
       return true;
     }
   }
   return false;
 }
 
-export function dependencyTerminalOutcome(
+export function prerequisiteTerminalLifecycle(
   file: EngineProjection,
   taskId: string,
 ): 'failed' | 'skipped' | undefined {
@@ -87,10 +86,10 @@ export function dependencyTerminalOutcome(
   if (!task) return undefined;
   let failed = false;
   let skipped = false;
-  for (const dep of task.dependencies) {
-    const producer = file.tasks[dep.taskId];
-    const outcome = evaluateDependency(
-      dep,
+  for (const prerequisite of task.prerequisites) {
+    const producer = file.tasks[prerequisite.producerTaskId];
+    const outcome = evaluatePrerequisite(
+      prerequisite,
       producer?.lifecycle,
       producer?.taskResult?.verdict?.status,
     );
@@ -131,9 +130,10 @@ export function canPromoteTurn(
   }
   if (
     turn.workflowWait?.hasPendingContinuation &&
-    turn.workflowActivation?.kind !== 'child_return'
+    turn.workflowActivation?.kind !== 'child_return' &&
+    turn.workflowResume?.kind !== 'start_workflow'
   ) {
-    return { ok: false, reason: 'waiting on child workflow' };
+    return { ok: false, reason: 'waiting on workflow continuation' };
   }
 
   const otherLive = turnsForTask(file, turn.taskId).find(
@@ -186,8 +186,8 @@ export function canPromoteTurn(
     return { ok: false, reason: 'held after previous turn failure' };
   }
   // Keep handoff/deps double-check for defense in depth if readiness drifts.
-  if (dependenciesBlockTask(file, turn.taskId)) {
-    return { ok: false, reason: 'dependencies not satisfied' };
+  if (prerequisitesBlockTask(file, turn.taskId)) {
+    return { ok: false, reason: 'prerequisites not met' };
   }
   if (task.wait?.kind === 'children' && !isOrchestrationWake) {
     return { ok: false, reason: 'waiting on child tasks' };

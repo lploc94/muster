@@ -229,6 +229,7 @@ describe('task-types host config', () => {
     // manifest). Seed the baked-in defaults instead of an empty/undefined map so the panel
     // stays valid and create/delegate is not blocked.
     expect(pickExplicitTaskTypesValue({})).toEqual(MUSTER_DEFAULT_TASK_TYPES);
+    expect(pickExplicitTaskTypesValue(undefined)).toEqual(MUSTER_DEFAULT_TASK_TYPES);
     expect(
       pickExplicitTaskTypesValue({
         workspaceFolderValue: undefined,

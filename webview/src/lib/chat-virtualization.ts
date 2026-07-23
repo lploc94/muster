@@ -20,7 +20,7 @@ export const CHAT_DEFAULT_ESTIMATE_PX = 72;
 /** Minimum estimate for a single-line bubble (px). */
 export const CHAT_MIN_ESTIMATE_PX = 40;
 
-/** Extra height reserved when a block-start header/reasoning may render (px). */
+/** Extra height reserved when a response block header may render (px). */
 export const CHAT_BLOCK_HEADER_ESTIMATE_PX = 36;
 
 /**
@@ -29,7 +29,7 @@ export const CHAT_BLOCK_HEADER_ESTIMATE_PX = 36;
  */
 export function estimateTranscriptItemSize(
   item: ThreadItem,
-  opts?: { isBlockStart?: boolean; reasoningChars?: number },
+  opts?: { isBlockStart?: boolean },
 ): number {
   let body = CHAT_MIN_ESTIMATE_PX;
   switch (item.kind) {
@@ -44,6 +44,11 @@ export function estimateTranscriptItemSize(
     case 'tool':
       body = item.status === 'running' ? 88 : 120;
       break;
+    case 'reasoning': {
+      const lines = Math.max(1, item.text.split('\n').length, Math.ceil(item.text.length / 80));
+      body = Math.min(240, 32 + lines * 16);
+      break;
+    }
     case 'error':
       body = 48;
       break;
@@ -53,9 +58,6 @@ export function estimateTranscriptItemSize(
   let total = body;
   if (opts?.isBlockStart) {
     total += CHAT_BLOCK_HEADER_ESTIMATE_PX;
-    if (opts.reasoningChars && opts.reasoningChars > 0) {
-      total += Math.min(200, 24 + Math.ceil(opts.reasoningChars / 80) * 16);
-    }
   }
   return total;
 }
@@ -70,7 +72,7 @@ export function isBlockStartAtIndex(
 ): boolean {
   if (index < 0 || index >= items.length) return false;
   const item = items[index]!;
-  if (item.kind !== 'assistant' && item.kind !== 'tool') return false;
+  if (item.kind !== 'assistant' && item.kind !== 'tool' && item.kind !== 'reasoning') return false;
   const prev = index > 0 ? items[index - 1] : null;
   return index === 0 || prev?.kind === 'user';
 }
@@ -190,22 +192,17 @@ export function shouldRequestOlderFromVirtualTop(opts: {
 }
 
 /**
- * Build estimateSize(index) using full-list chronology and optional reasoning.
+ * Build estimateSize(index) using full-list chronology.
  */
 export function createTranscriptEstimateSize(
   items: ReadonlyArray<ThreadItem>,
-  reasoningByTurn: Readonly<Record<string, string>>,
 ): (index: number) => number {
   return (index: number) => {
     const item = items[index];
     if (!item) return CHAT_DEFAULT_ESTIMATE_PX;
     const blockStart = isBlockStartAtIndex(items, index);
-    const turnId =
-      item.kind === 'assistant' || item.kind === 'tool' ? item.turnId : undefined;
-    const reasoning = turnId ? reasoningByTurn[turnId] : undefined;
     return estimateTranscriptItemSize(item, {
       isBlockStart: blockStart,
-      reasoningChars: reasoning?.length ?? 0,
     });
   };
 }

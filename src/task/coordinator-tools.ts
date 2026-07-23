@@ -1,22 +1,36 @@
+import { createHash } from 'node:crypto';
 import type { Question } from '../bridge/ask-bridge';
 import type { CredentialContext } from '../bridge/credentials';
 import type { TaskBriefOverlay } from './brief';
 import { BRIEF_SECTION_MAX, clampSection, isTaskBriefKind } from './brief';
 import type { ToolAction } from './capabilities';
+import {
+  fitsUtf8Bytes,
+  PRESENTATION_MARKDOWN_MAX_CHARS,
+  TASK_ERROR_MAX_BYTES,
+  TASK_RESULT_MAX_BYTES,
+  WORKFLOW_FEEDBACK_MAX_BYTES,
+} from './content-limits';
 import { isAllowedBindingOutput } from './dataflow';
 import { TASK_TYPE_ID_RE } from './task-types';
 import type {
-  TaskDependency,
+  TaskPrerequisite,
   TaskExecutionPolicy,
   TaskInputBinding,
   TaskResultOutputKey,
   TaskRole,
 } from './types';
 import type { VerdictCriterionInput, VerdictInput } from './verdict';
-import type {
-  StartWorkflowEntryInput,
-  WorkflowEntryContractV1,
-  WorkflowPolicyV1,
+import {
+  WORKFLOW_CHILD_BINDINGS_MAX,
+  WORKFLOW_ENTRY_CONTRACTS_MAX,
+  WORKFLOW_GRAPH_MAX_EDGES,
+  WORKFLOW_GRAPH_MAX_NODES,
+  WORKFLOW_NODE_LABEL_MAX_LENGTH,
+  WORKFLOW_RUN_GOAL_MAX_LENGTH,
+  type StartWorkflowEntryInput,
+  type WorkflowEntryContractV1,
+  type WorkflowPolicyV1,
 } from './workflow-types';
 
 export interface CreateChildSpec {
@@ -34,7 +48,7 @@ export interface CreateChildSpec {
    */
   model?: string;
   role?: TaskRole;
-  dependencies?: TaskDependency[];
+  prerequisites?: TaskPrerequisite[];
   executionPolicy?: Partial<TaskExecutionPolicy>;
   /** Optional longer description → brief.context when synthesizing. */
   description?: string;
@@ -68,8 +82,8 @@ export interface BatchInputBinding {
 export interface BatchChildSpec extends Omit<CreateChildSpec, 'inputBindings'> {
   /** Unique-within-batch handle (pattern reuses TASK_TYPE_ID_RE). */
   localId: string;
-  /** Sibling localIds this item waits for (→ succeeded/block dependency). */
-  dependsOn?: string[];
+  /** Sibling localIds this item requires before it can run. */
+  prerequisiteLocalIds?: string[];
   /** Batch bindings (sibling localId or pre-existing task id). */
   inputBindings?: BatchInputBinding[];
 }
@@ -83,9 +97,10 @@ export const BATCH_EXPAND_MAX = 16;
 
 export const PRESENTATION_ID_MAX_LENGTH = 128;
 export const PRESENTATION_TITLE_MAX_LENGTH = 200;
-export const PRESENTATION_MARKDOWN_MAX_LENGTH = 100_000;
+export const PRESENTATION_MARKDOWN_MAX_LENGTH = PRESENTATION_MARKDOWN_MAX_CHARS;
 
 const PRESENTATION_KEYS = new Set([
+  'documentKey',
   'presentationId',
   'ownerTaskId',
   'opId',
@@ -122,7 +137,7 @@ export type ToolCommand =
       kind: 'release_tasks';
       opId: string;
       taskIds: string[];
-      includeDependencies?: boolean;
+      includePrerequisites?: boolean;
       /** Wait only this explicit subset of released/owned direct children. */
       waitForTaskIds?: string[];
     }
@@ -151,19 +166,19 @@ export type ToolCommand =
   | { kind: 'list_task_types' }
   | { kind: 'complete_task'; opId: string; result: string; verdict?: VerdictInput }
   | { kind: 'fail_task'; opId: string; error: string }
-  /** M018 S02: stage workflow NEXT (change + optional body; engine owns identities). */
+  /** M018 S02: stage workflow NEXT with the final assistant message. */
   | {
       kind: 'workflow_next';
       opId: string;
       change: 'updated' | 'unchanged';
-      result?: string;
+      message: string;
     }
-  /** M018 S04: stage workflow PREV (targets + optional note; engine owns round identities). */
+  /** M018 S04: stage workflow PREV with the final assistant message. */
   | {
       kind: 'workflow_prev';
       opId: string;
       targets: 'all' | string[];
-      note?: string;
+      message: string;
     }
   /** M018 S05: stage workflow FAIL (optional reason; engine owns run closure). */
   | {
@@ -176,12 +191,17 @@ export type ToolCommand =
       kind: 'invoke_child_workflow';
       opId: string;
       childDefinitionId: string;
-      childDefinitionVersion: number;
-      entryBindings: readonly {
+      childDefinitionVersion?: number;
+      entryBindings?: readonly {
         childEntryNodeId: string;
         inputRef: string;
         artifactId: string;
         artifactRevision: number;
+      }[];
+      semanticEntryBindings?: readonly {
+        childEntryNodeId: string;
+        inputRef: string;
+        fromInputRef: string;
       }[];
       childIdempotencyKey?: string;
     }
@@ -197,7 +217,7 @@ export type ToolCommand =
       presentationId: string;
       ownerTaskId: string;
       opId: string;
-      revision: number;
+      revision?: number;
       title: string;
       markdown: string;
       presentationKind?: 'plan' | 'spec' | 'document';
@@ -208,17 +228,17 @@ export type ToolCommand =
       kind: 'define_workflow';
       opId: string;
       definitionId: string;
-      version: number;
+      version?: number;
       name: string;
       topology: unknown;
       entryContracts: readonly WorkflowEntryContractV1[];
-      policy: WorkflowPolicyV1;
+      policy?: WorkflowPolicyV1;
     }
   | {
       kind: 'start_workflow';
       opId: string;
       definitionId: string;
-      version: number;
+      version?: number;
       startIdempotencyKey: string;
       goal?: string;
       backend?: string;
@@ -245,6 +265,16 @@ const MUTATING_TOOLS: ReadonlySet<string> = new Set([
   'invoke_child_workflow',
   'ask_parent',
   'answer_child_question',
+  'upsert_presentation',
+  'define_workflow',
+  'start_workflow',
+]);
+
+const ENGINE_OPERATION_TOOLS: ReadonlySet<string> = new Set([
+  'workflow_next',
+  'workflow_prev',
+  'workflow_fail',
+  'invoke_child_workflow',
   'upsert_presentation',
   'define_workflow',
   'start_workflow',
@@ -394,25 +424,172 @@ function requireString(obj: Record<string, unknown>, key: string): string | unde
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
-function parseDependency(value: unknown): TaskDependency | undefined {
-  if (!isRecord(value)) return undefined;
-  const taskId = requireString(value, 'taskId');
-  const requiredOutcome = value.requiredOutcome;
-  const onUnsatisfied = value.onUnsatisfied;
+function stableHash(...parts: string[]): string {
+  return createHash('sha256').update(parts.join('\0'), 'utf8').digest('hex').slice(0, 32);
+}
+
+function derivedOperationId(
+  ctx: CredentialContext,
+  slot: string,
+  semanticKey = 'default',
+): string {
+  return `auto-${stableHash(ctx.rootId, ctx.callerTaskId, ctx.turnId, slot, semanticKey)}`;
+}
+
+function parseWorkflowReference(value: unknown): { definitionId: string; version?: number } | undefined {
+  if (typeof value !== 'string' || value.length === 0) return undefined;
+  const match = /^(.*)@([1-9][0-9]*)$/.exec(value);
+  const definitionId = match?.[1] ?? value;
+  if (!isStablePresentationId(definitionId)) return undefined;
+  if (!match) return { definitionId };
+  const version = Number(match[2]);
+  return Number.isSafeInteger(version) ? { definitionId, version } : undefined;
+}
+
+function parseSemanticWorkflowDefinition(args: Record<string, unknown>): {
+  definitionId: string;
+  name: string;
+  topology: unknown;
+  entryContracts: WorkflowEntryContractV1[];
+} | undefined {
+  const allowed = new Set(['workflowKey', 'name', 'nodes', 'edges', 'inputs']);
+  if (Object.keys(args).some((key) => !allowed.has(key))) return undefined;
+  const definitionId = requireString(args, 'workflowKey');
+  const name = requireString(args, 'name');
+  if (!definitionId || !isStablePresentationId(definitionId) || !name) return undefined;
   if (
-    !taskId ||
-    (requiredOutcome !== 'succeeded' && requiredOutcome !== 'settled') ||
-    (onUnsatisfied !== 'block' && onUnsatisfied !== 'fail' && onUnsatisfied !== 'skip')
+    !Array.isArray(args.nodes) ||
+    args.nodes.length === 0 ||
+    args.nodes.length > WORKFLOW_GRAPH_MAX_NODES
   ) {
     return undefined;
   }
-  const dep: TaskDependency = { taskId, requiredOutcome, onUnsatisfied };
+
+  const nodes: Array<{ nodeId: string; taskType: string; label?: string }> = [];
+  const nodeIds = new Set<string>();
+  for (const raw of args.nodes) {
+    if (!isRecord(raw)) return undefined;
+    if (Object.keys(raw).some((key) => !['nodeKey', 'taskType', 'label'].includes(key))) {
+      return undefined;
+    }
+    const nodeId = requireString(raw, 'nodeKey');
+    const taskType = requireString(raw, 'taskType');
+    if (!nodeId || !isStablePresentationId(nodeId) || !taskType || nodeIds.has(nodeId)) {
+      return undefined;
+    }
+    if (
+      raw.label !== undefined &&
+      (
+        typeof raw.label !== 'string' ||
+        raw.label.length === 0 ||
+        raw.label.length > WORKFLOW_NODE_LABEL_MAX_LENGTH
+      )
+    ) {
+      return undefined;
+    }
+    nodeIds.add(nodeId);
+    nodes.push({
+      nodeId,
+      taskType,
+      ...(typeof raw.label === 'string' ? { label: raw.label } : {}),
+    });
+  }
+
+  const edges: Array<{
+    fromNodeId: string;
+    toNodeId: string;
+    inputRef: string;
+    expectedArtifactKind: 'next_result';
+  }> = [];
+  if (args.edges !== undefined) {
+    if (!Array.isArray(args.edges) || args.edges.length > WORKFLOW_GRAPH_MAX_EDGES) {
+      return undefined;
+    }
+    for (const raw of args.edges) {
+      if (!isRecord(raw)) return undefined;
+      if (Object.keys(raw).some((key) => !['from', 'to', 'as'].includes(key))) return undefined;
+      const fromNodeId = requireString(raw, 'from');
+      const toNodeId = requireString(raw, 'to');
+      const inputRef = requireString(raw, 'as');
+      if (
+        !fromNodeId || !toNodeId || !inputRef ||
+        !nodeIds.has(fromNodeId) || !nodeIds.has(toNodeId)
+      ) return undefined;
+      edges.push({ fromNodeId, toNodeId, inputRef, expectedArtifactKind: 'next_result' });
+    }
+  }
+  if ((nodes.length === 1 && edges.length > 0) || (nodes.length > 1 && edges.length === 0)) {
+    return undefined;
+  }
+
+  const entryContracts: WorkflowEntryContractV1[] = [];
+  if (args.inputs !== undefined) {
+    if (
+      !Array.isArray(args.inputs) ||
+      args.inputs.length > WORKFLOW_ENTRY_CONTRACTS_MAX
+    ) return undefined;
+    const seen = new Set<string>();
+    for (const raw of args.inputs) {
+      if (!isRecord(raw)) return undefined;
+      if (Object.keys(raw).some((key) => !['to', 'name'].includes(key))) return undefined;
+      const entryNodeId = requireString(raw, 'to');
+      const inputRef = requireString(raw, 'name');
+      if (!entryNodeId || !nodeIds.has(entryNodeId) || !inputRef) return undefined;
+      const key = `${entryNodeId}\0${inputRef}`;
+      if (seen.has(key)) return undefined;
+      seen.add(key);
+      entryContracts.push({
+        entryNodeId,
+        inputRef,
+        expectedArtifactKind: 'workflow_input',
+      });
+    }
+  }
+
+  const topology = nodes.length === 1
+    ? { kind: 'one_node_v1', entryNodeId: nodes[0]!.nodeId, nodes }
+    : { kind: 'graph_v1', nodes, edges };
+  return { definitionId, name, topology, entryContracts };
+}
+
+function parseSemanticWorkflowInputs(value: unknown): StartWorkflowEntryInput[] | undefined {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > WORKFLOW_ENTRY_CONTRACTS_MAX) return undefined;
+  const inputs: StartWorkflowEntryInput[] = [];
+  const seen = new Set<string>();
+  for (const raw of value) {
+    if (!isRecord(raw)) return undefined;
+    if (Object.keys(raw).some((key) => !['node', 'input', 'value'].includes(key))) return undefined;
+    const entryNodeId = requireString(raw, 'node');
+    const inputRef = requireString(raw, 'input');
+    if (!entryNodeId || !inputRef || typeof raw.value !== 'string') return undefined;
+    const key = `${entryNodeId}\0${inputRef}`;
+    if (seen.has(key)) return undefined;
+    seen.add(key);
+    inputs.push({ entryNodeId, inputRef, kind: 'workflow_input', value: raw.value });
+  }
+  return inputs;
+}
+
+function parsePrerequisite(value: unknown): TaskPrerequisite | undefined {
+  if (!isRecord(value)) return undefined;
+  const producerTaskId = requireString(value, 'producerTaskId');
+  const requiredLifecycle = value.requiredLifecycle;
+  const onUnmet = value.onUnmet;
+  if (
+    !producerTaskId ||
+    (requiredLifecycle !== 'succeeded' && requiredLifecycle !== 'terminal') ||
+    (onUnmet !== 'block' && onUnmet !== 'fail' && onUnmet !== 'skip')
+  ) {
+    return undefined;
+  }
+  const prerequisite: TaskPrerequisite = { producerTaskId, requiredLifecycle, onUnmet };
   // Opt-in verify gate. Present-but-invalid fails closed (rejects the create).
   if (value.requiredVerdict !== undefined) {
     if (value.requiredVerdict !== 'pass') return undefined;
-    dep.requiredVerdict = 'pass';
+    prerequisite.requiredVerdict = 'pass';
   }
-  return dep;
+  return prerequisite;
 }
 
 function positiveInt(value: unknown): number | undefined {
@@ -437,6 +614,7 @@ function isPositiveSafeInt(value: unknown): value is number {
 
 function isPresentationPayloadTooLarge(args: Record<string, unknown>): boolean {
   return (
+    (typeof args.documentKey === 'string' && args.documentKey.length > PRESENTATION_ID_MAX_LENGTH) ||
     (typeof args.presentationId === 'string' && args.presentationId.length > PRESENTATION_ID_MAX_LENGTH) ||
     (typeof args.ownerTaskId === 'string' && args.ownerTaskId.length > PRESENTATION_ID_MAX_LENGTH) ||
     (typeof args.opId === 'string' && args.opId.length > PRESENTATION_ID_MAX_LENGTH) ||
@@ -641,15 +819,15 @@ function parseCreateSpec(args: Record<string, unknown>): CreateChildSpec | undef
     if (args.role !== 'coordinator' && args.role !== 'worker') return undefined;
     spec.role = args.role;
   }
-  if (args.dependencies !== undefined) {
-    if (!Array.isArray(args.dependencies)) return undefined;
-    const deps: TaskDependency[] = [];
-    for (const entry of args.dependencies) {
-      const dep = parseDependency(entry);
-      if (!dep) return undefined;
-      deps.push(dep);
+  if (args.prerequisites !== undefined) {
+    if (!Array.isArray(args.prerequisites)) return undefined;
+    const prerequisites: TaskPrerequisite[] = [];
+    for (const entry of args.prerequisites) {
+      const prerequisite = parsePrerequisite(entry);
+      if (!prerequisite) return undefined;
+      prerequisites.push(prerequisite);
     }
-    spec.dependencies = deps;
+    spec.prerequisites = prerequisites;
   }
   if (args.executionPolicy !== undefined) {
     if (!isRecord(args.executionPolicy)) return undefined;
@@ -723,15 +901,15 @@ function parseBatchChildSpec(entry: unknown): BatchChildSpec | undefined {
   const localId = typeof entry.localId === 'string' ? entry.localId : '';
   if (!localId || !TASK_TYPE_ID_RE.test(localId)) return undefined;
 
-  let dependsOn: string[] | undefined;
-  if (entry.dependsOn !== undefined) {
-    if (!Array.isArray(entry.dependsOn)) return undefined;
+  let prerequisiteLocalIds: string[] | undefined;
+  if (entry.prerequisiteLocalIds !== undefined) {
+    if (!Array.isArray(entry.prerequisiteLocalIds)) return undefined;
     const list: string[] = [];
-    for (const dep of entry.dependsOn) {
-      if (typeof dep !== 'string' || dep.length === 0) return undefined;
-      list.push(dep);
+    for (const localId of entry.prerequisiteLocalIds) {
+      if (typeof localId !== 'string' || localId.length === 0) return undefined;
+      list.push(localId);
     }
-    dependsOn = list;
+    prerequisiteLocalIds = list;
   }
 
   let inputBindings: BatchInputBinding[] | undefined;
@@ -744,13 +922,13 @@ function parseBatchChildSpec(entry: unknown): BatchChildSpec | undefined {
   // (inputBindings has a different shape here) before delegating.
   const baseArgs: Record<string, unknown> = { ...entry };
   delete baseArgs.localId;
-  delete baseArgs.dependsOn;
+  delete baseArgs.prerequisiteLocalIds;
   delete baseArgs.inputBindings;
   const base = parseCreateSpec(baseArgs);
   if (!base) return undefined;
   const { inputBindings: _dropped, ...baseRest } = base;
   const spec: BatchChildSpec = { ...baseRest, localId };
-  if (dependsOn) spec.dependsOn = dependsOn;
+  if (prerequisiteLocalIds) spec.prerequisiteLocalIds = prerequisiteLocalIds;
   if (inputBindings) spec.inputBindings = inputBindings;
   return spec;
 }
@@ -770,8 +948,8 @@ function parseBatchSpecs(value: unknown): BatchChildSpec[] | undefined {
   }
   // Intra-batch references must point at known siblings (and never self).
   for (const spec of specs) {
-    for (const dep of spec.dependsOn ?? []) {
-      if (dep === spec.localId || !seen.has(dep)) return undefined;
+    for (const prerequisiteLocalId of spec.prerequisiteLocalIds ?? []) {
+      if (prerequisiteLocalId === spec.localId || !seen.has(prerequisiteLocalId)) return undefined;
     }
     for (const binding of spec.inputBindings ?? []) {
       if (binding.fromLocalId === undefined) continue;
@@ -806,7 +984,34 @@ export function dispatch(
   }
 
   if (MUTATING_TOOLS.has(tool)) {
-    const opId = requireString(args, 'opId');
+    const suppliedOpId = requireString(args, 'opId');
+    if (Object.prototype.hasOwnProperty.call(args, 'opId') && !suppliedOpId) {
+      return {
+        ok: false,
+        toolError: tool === 'upsert_presentation' ? 'invalid_arguments' : 'opId must be a non-empty string',
+      };
+    }
+    const semanticKey = tool === 'start_workflow'
+      ? `${requireString(args, 'workflow') ?? requireString(args, 'definitionId') ?? 'default'}\0${
+        requireString(args, 'instanceKey') ?? requireString(args, 'startIdempotencyKey') ?? 'default'
+      }`
+      : tool === 'invoke_child_workflow'
+        ? `${requireString(args, 'workflow') ?? requireString(args, 'childDefinitionId') ?? 'default'}\0${
+          requireString(args, 'callKey') ?? requireString(args, 'childIdempotencyKey') ?? 'default'
+        }`
+        : requireString(args, 'documentKey') ??
+          requireString(args, 'presentationId') ??
+          requireString(args, 'workflowKey') ??
+          requireString(args, 'definitionId') ??
+          'default';
+    const slot = tool === 'workflow_next' || tool === 'workflow_prev' || tool === 'workflow_fail'
+      ? 'workflow_disposition'
+      : tool;
+    const opId = suppliedOpId ?? (
+      ENGINE_OPERATION_TOOLS.has(tool)
+        ? derivedOperationId(ctx, slot, semanticKey)
+        : undefined
+    );
     if (!opId) {
       return {
         ok: false,
@@ -881,10 +1086,10 @@ export function dispatch(
         if (!Array.isArray(raw) || raw.length === 0 || !raw.every((id) => typeof id === 'string' && id.length > 0)) {
           return { ok: false, toolError: 'taskIds must be a non-empty string array' };
         }
-        const includeDependencies =
-          args.includeDependencies === undefined ? false : args.includeDependencies === true;
-        if (args.includeDependencies !== undefined && typeof args.includeDependencies !== 'boolean') {
-          return { ok: false, toolError: 'includeDependencies must be a boolean' };
+        const includePrerequisites =
+          args.includePrerequisites === undefined ? false : args.includePrerequisites === true;
+        if (args.includePrerequisites !== undefined && typeof args.includePrerequisites !== 'boolean') {
+          return { ok: false, toolError: 'includePrerequisites must be a boolean' };
         }
         let waitForTaskIds: string[] | undefined;
         if (args.waitForTaskIds !== undefined) {
@@ -903,7 +1108,7 @@ export function dispatch(
             kind: 'release_tasks',
             opId,
             taskIds: raw as string[],
-            includeDependencies,
+            includePrerequisites,
             ...(waitForTaskIds !== undefined ? { waitForTaskIds } : {}),
           },
         };
@@ -1023,6 +1228,9 @@ export function dispatch(
         if (!result) {
           return { ok: false, toolError: 'result is required' };
         }
+        if (!fitsUtf8Bytes(result, TASK_RESULT_MAX_BYTES)) {
+          return { ok: false, toolError: `result exceeds ${TASK_RESULT_MAX_BYTES} UTF-8 bytes` };
+        }
         // Optional structured verdict. A bad verdict never rejects the call — it is
         // normalized fail-closed (malformed status → inconclusive) at seal time.
         const verdict = parseVerdictInput(args.verdict);
@@ -1041,23 +1249,20 @@ export function dispatch(
         if (!error) {
           return { ok: false, toolError: 'error is required' };
         }
+        if (!fitsUtf8Bytes(error, TASK_ERROR_MAX_BYTES)) {
+          return { ok: false, toolError: `error exceeds ${TASK_ERROR_MAX_BYTES} UTF-8 bytes` };
+        }
         return { ok: true, command: { kind: 'fail_task', opId, error } };
       }
       case 'workflow_next': {
-        const change = requireString(args, 'change');
-        if (!change) {
-          return { ok: false, toolError: 'change is required' };
-        }
+        const change = requireString(args, 'change') ?? 'updated';
         if (change !== 'updated' && change !== 'unchanged') {
           return { ok: false, toolError: 'change must be "updated" or "unchanged"' };
         }
-        let result: string | undefined;
-        if (Object.prototype.hasOwnProperty.call(args, 'result')) {
-          const r = requireString(args, 'result');
-          if (!r) {
-            return { ok: false, toolError: 'result must be a string when provided' };
-          }
-          result = r;
+        const message = requireString(args, 'message');
+        if (!message) return { ok: false, toolError: 'message is required' };
+        if (!fitsUtf8Bytes(message, TASK_RESULT_MAX_BYTES)) {
+          return { ok: false, toolError: `message exceeds ${TASK_RESULT_MAX_BYTES} UTF-8 bytes` };
         }
         return {
           ok: true,
@@ -1065,7 +1270,7 @@ export function dispatch(
             kind: 'workflow_next',
             opId,
             change,
-            ...(result !== undefined ? { result } : {}),
+            message,
           },
         };
       }
@@ -1073,7 +1278,7 @@ export function dispatch(
         // targets: 'all' | non-empty string[] of inputRefs. Empty arrays rejected at parse time.
         const rawTargets = args.targets;
         let targets: 'all' | string[];
-        if (rawTargets === 'all') {
+        if (rawTargets === undefined || rawTargets === 'all') {
           targets = 'all';
         } else if (Array.isArray(rawTargets)) {
           if (
@@ -1092,12 +1297,13 @@ export function dispatch(
             toolError: 'targets must be "all" or a non-empty string array of inputRefs',
           };
         }
-        let note: string | undefined;
-        if (Object.prototype.hasOwnProperty.call(args, 'note')) {
-          if (typeof args.note !== 'string' || args.note.length === 0) {
-            return { ok: false, toolError: 'note must be a non-empty string when provided' };
-          }
-          note = args.note;
+        const message = requireString(args, 'message');
+        if (!message) return { ok: false, toolError: 'message is required' };
+        if (!fitsUtf8Bytes(message, WORKFLOW_FEEDBACK_MAX_BYTES)) {
+          return {
+            ok: false,
+            toolError: `message exceeds ${WORKFLOW_FEEDBACK_MAX_BYTES} UTF-8 bytes`,
+          };
         }
         return {
           ok: true,
@@ -1105,7 +1311,7 @@ export function dispatch(
             kind: 'workflow_prev',
             opId,
             targets,
-            ...(note !== undefined ? { note } : {}),
+            message,
           },
         };
       }
@@ -1115,6 +1321,12 @@ export function dispatch(
         if (Object.prototype.hasOwnProperty.call(args, 'reason')) {
           if (typeof args.reason !== 'string' || args.reason.length === 0) {
             return { ok: false, toolError: 'reason must be a non-empty string when provided' };
+          }
+          if (!fitsUtf8Bytes(args.reason, TASK_ERROR_MAX_BYTES)) {
+            return {
+              ok: false,
+              toolError: `reason exceeds ${TASK_ERROR_MAX_BYTES} UTF-8 bytes`,
+            };
           }
           reason = args.reason;
         }
@@ -1128,19 +1340,71 @@ export function dispatch(
         };
       }
       case 'invoke_child_workflow': {
-        // Surface-only parse. Child run/continuation commit is repository-owned (T02).
-        const childDefinitionId = requireString(args, 'childDefinitionId');
-        if (!childDefinitionId) {
-          return { ok: false, toolError: 'childDefinitionId is required' };
-        }
-        if (
-          typeof args.childDefinitionVersion !== 'number' ||
-          !Number.isInteger(args.childDefinitionVersion) ||
-          args.childDefinitionVersion < 1
-        ) {
+        const semanticReference = parseWorkflowReference(args.workflow);
+        const childDefinitionId = semanticReference?.definitionId ?? requireString(args, 'childDefinitionId');
+        const childDefinitionVersion = semanticReference?.version ?? (
+          isPositiveSafeInt(args.childDefinitionVersion) ? args.childDefinitionVersion : undefined
+        );
+        if (!childDefinitionId) return { ok: false, toolError: 'workflow is required' };
+        if (args.workflow === undefined && childDefinitionVersion === undefined) {
           return { ok: false, toolError: 'childDefinitionVersion must be a positive integer' };
         }
-        if (!Array.isArray(args.entryBindings) || args.entryBindings.length === 0) {
+
+        if (Array.isArray(args.bindings)) {
+          if (
+            args.bindings.length === 0 ||
+            args.bindings.length > WORKFLOW_CHILD_BINDINGS_MAX
+          ) {
+            return { ok: false, toolError: 'bindings must be a non-empty array' };
+          }
+          const semanticEntryBindings: Array<{
+            childEntryNodeId: string;
+            inputRef: string;
+            fromInputRef: string;
+          }> = [];
+          const seenRefs = new Set<string>();
+          for (const entry of args.bindings) {
+            if (!isRecord(entry)) return { ok: false, toolError: 'bindings entries must be objects' };
+            if (Object.keys(entry).some((key) => !['toNode', 'input', 'fromInput'].includes(key))) {
+              return { ok: false, toolError: 'invalid child workflow binding' };
+            }
+            const childEntryNodeId = requireString(entry, 'toNode');
+            const inputRef = requireString(entry, 'input');
+            const fromInputRef = requireString(entry, 'fromInput');
+            if (!childEntryNodeId || !inputRef || !fromInputRef) {
+              return { ok: false, toolError: 'invalid child workflow binding' };
+            }
+            const bindingKey = `${childEntryNodeId}\0${inputRef}`;
+            if (seenRefs.has(bindingKey)) {
+              return { ok: false, toolError: `duplicate child workflow binding: ${childEntryNodeId}/${inputRef}` };
+            }
+            seenRefs.add(bindingKey);
+            semanticEntryBindings.push({ childEntryNodeId, inputRef, fromInputRef });
+          }
+          const callKey = args.callKey;
+          if (callKey !== undefined && (typeof callKey !== 'string' || callKey.length === 0)) {
+            return { ok: false, toolError: 'callKey must be a non-empty string when provided' };
+          }
+          return {
+            ok: true,
+            command: {
+              kind: 'invoke_child_workflow',
+              opId,
+              childDefinitionId,
+              ...(childDefinitionVersion !== undefined ? { childDefinitionVersion } : {}),
+              semanticEntryBindings,
+              childIdempotencyKey: typeof callKey === 'string'
+                ? `call-${stableHash(ctx.rootId, ctx.callerTaskId, callKey)}`
+                : `turn-${stableHash(ctx.turnId, 'default-child')}`,
+            },
+          };
+        }
+
+        if (
+          !Array.isArray(args.entryBindings) ||
+          args.entryBindings.length === 0 ||
+          args.entryBindings.length > WORKFLOW_CHILD_BINDINGS_MAX
+        ) {
           return { ok: false, toolError: 'entryBindings must be a non-empty array' };
         }
         const entryBindings: {
@@ -1201,7 +1465,7 @@ export function dispatch(
             kind: 'invoke_child_workflow',
             opId,
             childDefinitionId,
-            childDefinitionVersion: args.childDefinitionVersion,
+            childDefinitionVersion: childDefinitionVersion!,
             entryBindings,
             ...(childIdempotencyKey !== undefined ? { childIdempotencyKey } : {}),
           },
@@ -1241,8 +1505,12 @@ export function dispatch(
         if (isPresentationPayloadTooLarge(args)) {
           return { ok: false, toolError: 'payload_too_large' };
         }
-        const presentationId = requireString(args, 'presentationId');
-        const ownerTaskId = requireString(args, 'ownerTaskId');
+        const documentKey = requireString(args, 'documentKey');
+        const legacyPresentationId = requireString(args, 'presentationId');
+        const presentationId = documentKey
+          ? `presentation-${stableHash(ctx.rootId, ctx.callerTaskId, documentKey)}`
+          : legacyPresentationId;
+        const ownerTaskId = requireString(args, 'ownerTaskId') ?? ctx.callerTaskId;
         const title = requireString(args, 'title');
         const markdown = requireString(args, 'markdown');
         if (
@@ -1250,7 +1518,7 @@ export function dispatch(
           !isStablePresentationId(presentationId) ||
           !isStablePresentationId(ownerTaskId) ||
           !isStablePresentationId(opId) ||
-          !isPositiveSafeInt(args.revision) ||
+          (legacyPresentationId !== undefined && !isPositiveSafeInt(args.revision)) ||
           !title ||
           !markdown
         ) {
@@ -1287,7 +1555,7 @@ export function dispatch(
             presentationId,
             ownerTaskId,
             opId,
-            revision: args.revision as number,
+            ...(isPositiveSafeInt(args.revision) ? { revision: args.revision } : {}),
             title,
             markdown,
             ...(presentationKind !== undefined ? { presentationKind } : {}),
@@ -1297,6 +1565,20 @@ export function dispatch(
         };
       }
       case 'define_workflow': {
+        const semantic = parseSemanticWorkflowDefinition(args);
+        if (semantic) {
+          return {
+            ok: true,
+            command: {
+              kind: 'define_workflow',
+              opId,
+              definitionId: semantic.definitionId,
+              name: semantic.name,
+              topology: semantic.topology,
+              entryContracts: semantic.entryContracts,
+            },
+          };
+        }
         const definitionId = requireString(args, 'definitionId');
         const name = requireString(args, 'name');
         if (!definitionId || !name) {
@@ -1330,6 +1612,42 @@ export function dispatch(
         };
       }
       case 'start_workflow': {
+        const semanticReference = parseWorkflowReference(args.workflow);
+        if (semanticReference) {
+          const entryInputs = parseSemanticWorkflowInputs(args.inputs);
+          if (!entryInputs) return { ok: false, toolError: 'invalid start_workflow inputs' };
+          if (
+            'goal' in args &&
+            (
+              typeof args.goal !== 'string' ||
+              args.goal.length === 0 ||
+              args.goal.length > WORKFLOW_RUN_GOAL_MAX_LENGTH
+            )
+          ) {
+            return { ok: false, toolError: 'invalid start_workflow goal' };
+          }
+          if (
+            'instanceKey' in args &&
+            (typeof args.instanceKey !== 'string' || args.instanceKey.length === 0)
+          ) {
+            return { ok: false, toolError: 'instanceKey must be a non-empty string when provided' };
+          }
+          const startIdempotencyKey = typeof args.instanceKey === 'string'
+            ? `instance-${stableHash(ctx.rootId, ctx.callerTaskId, semanticReference.definitionId, args.instanceKey)}`
+            : `turn-${stableHash(ctx.turnId, semanticReference.definitionId)}`;
+          return {
+            ok: true,
+            command: {
+              kind: 'start_workflow',
+              opId,
+              definitionId: semanticReference.definitionId,
+              ...(semanticReference.version !== undefined ? { version: semanticReference.version } : {}),
+              startIdempotencyKey,
+              ...(typeof args.goal === 'string' ? { goal: args.goal } : {}),
+              entryInputs,
+            },
+          };
+        }
         const definitionId = requireString(args, 'definitionId');
         const startIdempotencyKey = requireString(args, 'startIdempotencyKey');
         if (!definitionId || !startIdempotencyKey) {
@@ -1346,7 +1664,14 @@ export function dispatch(
         if (!entryInputs) {
           return { ok: false, toolError: 'invalid start_workflow arguments' };
         }
-        if ('goal' in args && (typeof args.goal !== 'string' || args.goal.length === 0)) {
+        if (
+          'goal' in args &&
+          (
+            typeof args.goal !== 'string' ||
+            args.goal.length === 0 ||
+            args.goal.length > WORKFLOW_RUN_GOAL_MAX_LENGTH
+          )
+        ) {
           return { ok: false, toolError: 'invalid start_workflow arguments' };
         }
         if (
@@ -1375,12 +1700,12 @@ export function dispatch(
   }
 
   if (tool === 'inspect_workflow_run') {
-    if (Object.keys(args).some((key) => key !== 'runId')) {
-      return { ok: false, toolError: 'inspect_workflow_run accepts only runId' };
+    if (Object.keys(args).some((key) => key !== 'runId' && key !== 'runRef')) {
+      return { ok: false, toolError: 'inspect_workflow_run accepts only runRef' };
     }
-    const runId = requireString(args, 'runId');
+    const runId = requireString(args, 'runRef') ?? requireString(args, 'runId');
     if (!runId) {
-      return { ok: false, toolError: 'runId is required' };
+      return { ok: false, toolError: 'runRef is required' };
     }
     return { ok: true, command: { kind: 'inspect_workflow_run', runId } };
   }

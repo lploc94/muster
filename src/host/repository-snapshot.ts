@@ -41,7 +41,7 @@ export function toHostTranscriptItem(item: RepositoryTranscriptItem): Transcript
     };
   }
   if (item.kind === 'reasoning') {
-    return { id: item.id, kind: 'reasoning', turnId: item.turnId, content: item.content };
+    return { id: item.id, kind: 'reasoning', turnId: item.turnId, order: item.order, content: item.content };
   }
   return {
     id: item.id,

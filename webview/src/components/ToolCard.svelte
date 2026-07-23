@@ -20,6 +20,9 @@
   }
 
   const icon = $derived(toolIcon(tool.name, tool.toolKind));
+  const resultPayload = $derived(
+    tool.status === 'error' && tool.error ? tool.error : tool.output,
+  );
   const hasDetails = $derived(tool.input !== undefined || tool.output !== undefined || !!tool.error);
 </script>
 
@@ -53,15 +56,14 @@
       </div>
     {/if}
 
-    {#if tool.output !== undefined}
+    {#if resultPayload !== undefined}
       <div class="tool-card__details mt-1.5">
         <div class="text-[10px] opacity-70 mb-0.5">result:</div>
-        <pre class="tool-card__payload text-[10px] bg-[var(--vscode-textCodeBlock-background)] p-1 rounded max-h-40 whitespace-pre">{typeof tool.output === 'string' ? tool.output : JSON.stringify(tool.output, null, 2)}</pre>
+        <pre
+          class="tool-card__payload text-[10px] bg-[var(--vscode-textCodeBlock-background)] p-1 rounded max-h-40 whitespace-pre"
+          style:color={tool.status === 'error' ? 'var(--vscode-errorForeground)' : undefined}
+        >{typeof resultPayload === 'string' ? resultPayload : JSON.stringify(resultPayload, null, 2)}</pre>
       </div>
-    {/if}
-
-    {#if tool.status === 'error' && tool.error}
-      <div class="mt-1 whitespace-pre-wrap" style="color: var(--vscode-errorForeground);">{tool.error}</div>
     {/if}
   {/if}
 </div>

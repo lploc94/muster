@@ -27,7 +27,7 @@ function task(id: string): MusterTask {
     releaseState: 'released',
     goal: id,
     parentId: null,
-    dependencies: [],
+    prerequisites: [],
     backend: 'fake',
     capabilities: [],
     executionPolicy: { maxTurns: 10, maxAutomaticRetries: 0 },
@@ -58,6 +58,56 @@ async function seedTurn(repository: SqliteTaskRepository, taskId: string, turnId
 }
 
 describe('TaskEngine immediate stream-boundary persistence (P5-W3 residual A)', () => {
+  it('persists reasoning as ordered segments across assistant and tool boundaries', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-engine-reasoning-order-'));
+    tempDirs.push(dir);
+    const client = new DbClient({ workerPath: WORKER_TS, execArgv: TSX_ARGV });
+    clients.push(client);
+    await client.open(path.join(dir, 'muster.sqlite3'));
+    const repository = new SqliteTaskRepository(client, 'ws');
+    await repository.execute({
+      kind: 'upsertWorkspace',
+      workspaceId: 'ws',
+      identityKey: 'reasoning-order',
+      displayName: 'Reasoning',
+      createdAt: 'now',
+      lastOpenedAt: 'now',
+    });
+    const t = await seedTurn(repository, 'reasoning-task', 'reasoning-turn');
+
+    const engine = await TaskEngine.loadAsync({
+      workspaceId: 'ws',
+      repository,
+      makeBackend: () => ({ name: 'fake', run: async function* () {} }) as never,
+      runTurn: async function* () {
+        yield { type: 'reasoningDelta', messageId: 'thought', content: 'think ' };
+        yield { type: 'reasoningDelta', messageId: 'thought', content: 'one' };
+        yield { type: 'assistantDelta', messageId: 'answer', content: 'answer one' };
+        yield { type: 'toolStarted', toolCallId: 'call-1', name: 'read', kind: 'builtin' };
+        yield { type: 'toolCompleted', toolCallId: 'call-1', outcome: 'success', output: 'ok' };
+        yield { type: 'reasoningDelta', messageId: 'thought', content: 'think two' };
+        yield { type: 'assistantDelta', messageId: 'answer', content: 'answer two' };
+      },
+      clock: () => '2026-07-16T00:00:02.000Z',
+    });
+
+    await engine.resumeQueuedTurnAsync(t.id, 'reasoning-turn');
+    await engine.whenIdle().catch(() => undefined);
+
+    const page = await repository.getTranscriptPage(t.id, undefined, 20);
+    expect(page.items.map((item) => [item.kind, item.id, item.order])).toEqual([
+      ['reasoning', 'reasoning-turn:0', 0],
+      ['assistant', 'reasoning-turn:1', 1],
+      ['tool', 'reasoning-turn:call-1', 2],
+      ['reasoning', 'reasoning-turn:3', 3],
+      ['assistant', 'reasoning-turn:4', 4],
+    ]);
+    expect((await repository.listReasoning(t.id)).map((segment) => segment.content)).toEqual([
+      'think one',
+      'think two',
+    ]);
+  }, 60_000);
+
   it('delta then return <75ms: one-shot fail then retry persists + failed + no claim', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-engine-stream-fast-'));
     tempDirs.push(dir);

@@ -11,7 +11,7 @@ import type { NormalizedEvent, Question } from './types';
  * breaking change to the ExtMessage/OutMessage shapes below (and mirror it in
  * src/extension.ts).
  */
-export const PROTOCOL_VERSION = 9;
+export const PROTOCOL_VERSION = 10;
 
 /**
  * Require an exact peer protocol version. A different or malformed version
@@ -28,9 +28,9 @@ export type TurnTrigger = 'user' | 'engine' | 'retry';
 /** Persisted work outcome — primary task badge. */
 export type TaskLifecycleState = 'open' | 'succeeded' | 'failed' | 'cancelled' | 'skipped';
 
-/** Derived CLI/deps/wait activity while open — secondary chrome. */
+/** Derived prerequisite/process/wait activity while open — secondary chrome. */
 export type TaskRuntimeActivity =
-  | 'waiting_dependencies'
+  | 'waiting_prerequisites'
   | 'queued'
   | 'running'
   | 'waiting_user'
@@ -48,7 +48,7 @@ export type TaskViewStatus = TaskLifecycleState | TaskRuntimeActivity;
 
 /** Host-owned turn chrome (mirrors src/host/snapshot.ts). */
 export type TurnActivityWaitReason =
-  | 'dependencies'
+  | 'prerequisites'
   | 'children'
   | 'external'
   | 'held_after_failure'
@@ -771,6 +771,7 @@ const SEND_OUTBOX_ENTRY_KEYS = [
   'clientRequestId', 'status', 'taskId', 'text', 'llmText', 'mentionBindings',
   'skills', 'backend', 'model', 'continuationOf', 'createdAt',
 ] as const;
+const SEND_OUTBOX_TEXT_MAX_LENGTH = 262_144;
 
 function isBoundedOutboxString(value: unknown, max: number): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= max && !value.includes('\0');
@@ -783,7 +784,7 @@ function isSendOutboxSnapshotEntry(value: unknown): boolean {
   if (
     !isBoundedOutboxString(value.clientRequestId, 256) ||
     (value.status !== 'pending' && value.status !== 'rejected') ||
-    !isBoundedOutboxString(value.text, 100_000) ||
+    !isBoundedOutboxString(value.text, SEND_OUTBOX_TEXT_MAX_LENGTH) ||
     !Number.isSafeInteger(value.createdAt) ||
     (value.createdAt as number) < 0
   ) {
@@ -791,7 +792,7 @@ function isSendOutboxSnapshotEntry(value: unknown): boolean {
   }
   for (const [key, max] of [
     ['taskId', 256],
-    ['llmText', 100_000],
+    ['llmText', SEND_OUTBOX_TEXT_MAX_LENGTH],
     ['backend', 32],
     ['model', 512],
     ['continuationOf', 256],
@@ -1052,7 +1053,7 @@ function isTurnActivity(v: unknown): v is TurnActivity {
         hasOnlyKeys(v, ['state', 'turnId', 'position', 'waitReason']) &&
         (v.position === undefined || (isNonNegativeSafeInteger(v.position) && v.position > 0)) &&
         (v.waitReason === undefined ||
-          v.waitReason === 'dependencies' ||
+          v.waitReason === 'prerequisites' ||
           v.waitReason === 'children' ||
           v.waitReason === 'external' ||
           v.waitReason === 'held_after_failure' ||
@@ -1112,7 +1113,7 @@ function isTaskSummary(v: unknown): v is TaskSummary {
     v.lifecycle === 'skipped';
   const runtimeActivity =
     v.runtimeActivity === null ||
-    v.runtimeActivity === 'waiting_dependencies' ||
+    v.runtimeActivity === 'waiting_prerequisites' ||
     v.runtimeActivity === 'queued' ||
     v.runtimeActivity === 'running' ||
     v.runtimeActivity === 'waiting_user' ||
@@ -1127,7 +1128,7 @@ function isTaskSummary(v: unknown): v is TaskSummary {
     v.viewStatus === 'failed' ||
     v.viewStatus === 'cancelled' ||
     v.viewStatus === 'skipped' ||
-    v.viewStatus === 'waiting_dependencies' ||
+    v.viewStatus === 'waiting_prerequisites' ||
     v.viewStatus === 'queued' ||
     v.viewStatus === 'running' ||
     v.viewStatus === 'waiting_user' ||
@@ -1888,7 +1889,7 @@ export function effectiveRuntimeActivity(
   // Older hosts: viewStatus holds runtime when open.
   const vs = task.viewStatus;
   if (
-    vs === 'waiting_dependencies' ||
+    vs === 'waiting_prerequisites' ||
     vs === 'queued' ||
     vs === 'running' ||
     vs === 'waiting_user' ||

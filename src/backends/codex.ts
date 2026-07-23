@@ -13,6 +13,7 @@ export { disposeSharedAcpClient };
 
 /** stopReasons that represent a failed (non-cancellation) turn. */
 const FAILURE_STOP_REASONS = new Set(['refusal', 'error', 'max_tokens', 'max_turn_requests']);
+const CONTEXT_COMPACTION_CHUNKS = ["*Context compacted to fit the model's context window.*"];
 
 /**
  * Resolve the bundled codex-acp ESM entry (`resources/codex-acp/index.mjs`).
@@ -82,6 +83,7 @@ const CODEX_SPEC: AcpAdapterSpec = {
   makeConfig: codexAgentConfig,
   failureStopReasons: FAILURE_STOP_REASONS,
   emptyChunk: 'drop',
+  contextCompactionChunks: CONTEXT_COMPACTION_CHUNKS,
   mapUsageUpdate: true,
   usage: {
     source: 'result',

@@ -41,7 +41,7 @@ export const TASK_LIFECYCLE_STATES = [
 ] as const satisfies readonly TaskLifecycleState[];
 
 export const TASK_RUNTIME_ACTIVITIES = [
-  'waiting_dependencies',
+  'waiting_prerequisites',
   'queued',
   'running',
   'waiting_user',
@@ -115,14 +115,14 @@ export const LIFECYCLE_PRESENTATIONS = {
 } as const satisfies Record<TaskLifecycleState, StatusAxisPresentation>;
 
 export const RUNTIME_PRESENTATIONS = {
-  waiting_dependencies: {
-    key: 'waiting_dependencies',
-    label: 'Waiting on dependencies',
+  waiting_prerequisites: {
+    key: 'waiting_prerequisites',
+    label: 'Waiting on prerequisites',
     tone: 'muted',
     listCopy: 'Waiting for upstream tasks',
-    workspaceHeadline: 'Waiting on dependencies',
+    workspaceHeadline: 'Waiting on prerequisites',
     workspaceDetail: 'Runtime cannot start until prerequisite tasks settle.',
-    composerGuidance: 'You can review the plan; progress is blocked on dependencies.',
+    composerGuidance: 'You can review the plan; progress is blocked on prerequisites.',
   },
   queued: {
     key: 'queued',

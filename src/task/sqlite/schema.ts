@@ -14,7 +14,7 @@
 export const MUSTER_APPLICATION_ID = 0x4d555354; // 'MUST'
 
 /** Clean-break development schema marker. Older stores require an explicit reset. */
-export const SQLITE_SCHEMA_VERSION = 1 as const;
+export const SQLITE_SCHEMA_VERSION = 2 as const;
 
 /**
  * Core task-store tables.
@@ -23,7 +23,7 @@ const REQUIRED_CORE_TABLES = [
   'workspaces',
   'workspace_locations',
   'tasks',
-  'task_dependencies',
+  'task_prerequisites',
   'turns',
   'messages',
   'reasoning_segments',
@@ -135,17 +135,17 @@ const CORE_SCHEMA_STATEMENTS: readonly string[] = [
       REFERENCES tasks(workspace_id, id) ON DELETE CASCADE
   )`,
 
-  `CREATE TABLE IF NOT EXISTS task_dependencies (
+  `CREATE TABLE IF NOT EXISTS task_prerequisites (
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
     task_id TEXT NOT NULL,
-    dependency_task_id TEXT NOT NULL,
-    required_outcome TEXT NOT NULL,
-    on_unsatisfied TEXT NOT NULL,
+    producer_task_id TEXT NOT NULL,
+    required_lifecycle TEXT NOT NULL,
+    on_unmet TEXT NOT NULL,
     required_verdict TEXT,
-    PRIMARY KEY (workspace_id, task_id, dependency_task_id),
+    PRIMARY KEY (workspace_id, task_id, producer_task_id),
     FOREIGN KEY (workspace_id, task_id)
       REFERENCES tasks(workspace_id, id) ON DELETE CASCADE,
-    FOREIGN KEY (workspace_id, dependency_task_id)
+    FOREIGN KEY (workspace_id, producer_task_id)
       REFERENCES tasks(workspace_id, id) ON DELETE CASCADE
   )`,
 
@@ -436,8 +436,8 @@ const DEFAULT_WORKFLOW_POLICY_JSON = JSON.stringify({
   maxTaskCount: 64,
   maxConcurrency: 20,
   maxInputsPerGate: 64,
-  maxArtifactBytes: 65_536,
-  maxAggregateBytes: 262_144,
+  maxArtifactBytes: 262_144,
+  maxAggregateBytes: 1_048_576,
   failWorkflow: true,
 });
 
@@ -479,7 +479,7 @@ const WORKFLOW_SCHEMA_STATEMENTS: readonly string[] = [
     max_children INTEGER NOT NULL DEFAULT 64 CHECK (max_children BETWEEN 1 AND 64),
     max_depth INTEGER NOT NULL DEFAULT 8 CHECK (max_depth BETWEEN 1 AND 8),
     max_concurrency INTEGER NOT NULL DEFAULT 20 CHECK (max_concurrency BETWEEN 1 AND 64),
-    max_aggregate_bytes INTEGER NOT NULL DEFAULT 262144
+    max_aggregate_bytes INTEGER NOT NULL DEFAULT 1048576
       CHECK (max_aggregate_bytes BETWEEN 1 AND 1048576),
     feedback_rounds_reserved INTEGER NOT NULL DEFAULT 0 CHECK (feedback_rounds_reserved >= 0),
     workflow_turns_reserved INTEGER NOT NULL DEFAULT 0 CHECK (workflow_turns_reserved >= 0),

@@ -367,7 +367,7 @@
     !!focused &&
       focused.lifecycle === 'open' &&
       !!activeTurnId &&
-      (runtime === 'queued' || runtime === 'waiting_dependencies'),
+      (runtime === 'queued' || runtime === 'waiting_prerequisites'),
   );
   const showFailedTurnCard = $derived(
     !!focused &&

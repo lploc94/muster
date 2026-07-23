@@ -291,7 +291,28 @@ describe('M018 S01 one-node workflow activation', () => {
         },
         expectedStatuses: ['running' as const],
         relatedTurns: [],
-        messages: [],
+        messages: [
+          {
+            id: `${payload.activationTurnId}:0`,
+            taskId: payload.entryTaskId,
+            turnId: payload.activationTurnId,
+            role: 'assistant' as const,
+            state: 'complete' as const,
+            order: 0,
+            content: 'Detailed workflow output that the caller must receive.',
+            createdAt: '2026-07-19T00:00:01.500Z',
+          },
+          {
+            id: `${payload.activationTurnId}:1`,
+            taskId: payload.entryTaskId,
+            turnId: payload.activationTurnId,
+            role: 'assistant' as const,
+            state: 'complete' as const,
+            order: 1,
+            content: 'terminal result',
+            createdAt: '2026-07-19T00:00:01.600Z',
+          },
+        ],
       };
       await expect(ctx.repository.execute(settleCommand)).resolves.toMatchObject({ changed: true });
       await expect(ctx.repository.execute(settleCommand)).resolves.toMatchObject({ changed: false });
@@ -303,25 +324,28 @@ describe('M018 S01 one-node workflow activation', () => {
       ).toMatchObject({ status: 'succeeded' });
       expect(
         await ctx.client.get(
+          `SELECT status FROM workflow_nodes WHERE workspace_id = ? AND run_id = ? AND node_id = 'entry'`,
+          ['ws', payload.runId],
+        ),
+      ).toMatchObject({ status: 'succeeded' });
+      expect(
+        await ctx.client.get(
           `SELECT status FROM workflow_dependency_gates WHERE workspace_id = ? AND run_id = ?`,
           ['ws', payload.runId],
         ),
       ).toMatchObject({ status: 'consumed' });
-      expect(
-        await ctx.client.all(
-          `SELECT kind, payload_json FROM workflow_artifacts
-            WHERE workspace_id = ? AND run_id = ? AND kind = 'next_result'`,
-          ['ws', payload.runId],
-        ),
-      ).toEqual([
-        expect.objectContaining({
-          kind: 'next_result',
-          payload_json: expect.stringContaining('terminal result'),
-        }),
-      ]);
+      const nextArtifacts = await ctx.client.all<{ kind: string; payload_json: string }>(
+        `SELECT kind, payload_json FROM workflow_artifacts
+          WHERE workspace_id = ? AND run_id = ? AND kind = 'next_result'`,
+        ['ws', payload.runId],
+      );
+      expect(nextArtifacts).toHaveLength(1);
+      expect(nextArtifacts[0]?.kind).toBe('next_result');
+      expect(nextArtifacts[0]?.payload_json).toContain('terminal result');
+      expect(nextArtifacts[0]?.payload_json).not.toContain('Detailed workflow output that the caller must receive.');
       await expect(ctx.repository.getTask(payload.entryTaskId)).resolves.toMatchObject({
         lifecycle: 'succeeded',
-        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+        lifecycleAuthority: { kind: 'workflow', runId: payload.runId },
       });
     } finally {
       await ctx.close();
@@ -395,22 +419,147 @@ describe('M018 S01 one-node workflow activation', () => {
         `SELECT status FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
         ['ws', payload.runId],
       )).resolves.toMatchObject({ status: 'succeeded' });
-      await expect(ctx.client.all(
+      const artifacts = await ctx.client.all<{ kind: string; payload_json: string }>(
         `SELECT kind, payload_json FROM workflow_artifacts
            WHERE workspace_id = ? AND run_id = ? AND kind = 'next_result'`,
         ['ws', payload.runId],
-      )).resolves.toEqual([
-        expect.objectContaining({
-          kind: 'next_result',
-          payload_json: expect.stringContaining('final workflow answer'),
-        }),
-      ]);
+      );
+      expect(artifacts).toHaveLength(1);
+      expect(artifacts[0]?.kind).toBe('next_result');
+      expect(artifacts[0]?.payload_json).toContain('final workflow answer');
+      expect(artifacts[0]?.payload_json).not.toContain('intermediate answer');
       await expect(ctx.repository.listTurns(payload.entryTaskId)).resolves.toHaveLength(1);
       await expect(ctx.client.get(
         `SELECT status FROM turn_disposition_claims WHERE workspace_id = ? AND turn_id = ?`,
         ['ws', payload.activationTurnId],
       )).resolves.toMatchObject({ status: 'consumed' });
     } finally {
+      await engine?.shutdown().catch(() => undefined);
+      await ctx.close();
+    }
+  }, 30_000);
+
+  it('commits an explicit NEXT message before interrupting the provider turn', async () => {
+    const ctx = await openRepo('explicit-next-interrupt');
+    let engine: TaskEngine | undefined;
+    let releaseToolCompletion!: () => void;
+    const toolCompletionGate = new Promise<void>((resolve) => { releaseToolCompletion = resolve; });
+    let toolStarted!: () => void;
+    const toolStartedGate = new Promise<void>((resolve) => { toolStarted = resolve; });
+    try {
+      const createdAt = new Date().toISOString();
+      await ctx.repository.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-explicit-next',
+        version: 1,
+        name: 'explicit-next',
+        topology: TOPOLOGY,
+        createdAt,
+      });
+      const started = await ctx.repository.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: 'ws',
+        definitionId: 'wf-explicit-next',
+        version: 1,
+        startIdempotencyKey: 'explicit-next-1',
+        createdAt,
+        goal: 'route explicitly',
+        backend: 'grok',
+      });
+      const payload = started.operation!.result.data as {
+        runId: string;
+        entryTaskId: string;
+        activationTurnId: string;
+      };
+      const credentials = new CredentialRegistry();
+      engine = await TaskEngine.loadAsync({
+        repository: ctx.repository,
+        workspaceId: 'ws',
+        credentialRegistry: credentials,
+        makeBackend: (name) => ({
+          name,
+          capabilities: {
+            supportsMCP: true,
+            supportsReasoning: false,
+            supportsDetailedToolEvents: true,
+          },
+          run: async function* () {},
+        }),
+        runTurn: async function* (_backend, options) {
+          await options.onBeforePrompt?.();
+          yield { type: 'sessionStarted', sessionId: 'explicit-next-session' };
+          yield {
+            type: 'toolStarted',
+            toolCallId: 'workflow-next-call',
+            name: 'muster_bridge_workflow_next',
+            kind: 'mcp',
+            input: { message: 'official workflow result' },
+          };
+          toolStarted();
+          await toolCompletionGate;
+          yield {
+            type: 'toolCompleted',
+            toolCallId: 'workflow-next-call',
+            outcome: 'success',
+            output: { staged: true },
+          };
+          if (options.signal?.aborted) {
+            yield {
+              type: 'assistantDelta',
+              messageId: 'provider-interruption',
+              content: '*Conversation interrupted*',
+            };
+            yield { type: 'error', message: 'cancelled', isCancellation: true };
+          }
+        },
+      });
+
+      await toolStartedGate;
+      const token = credentials.issue({
+        rootId: payload.entryTaskId,
+        callerTaskId: payload.entryTaskId,
+        turnId: payload.activationTurnId,
+        attemptId: 'explicit-next-attempt',
+        allowedActions: new Set(['workflow_next']),
+        ttlMs: 60_000,
+      });
+      const credential = credentials.verify(token)!;
+      const routed = dispatch(
+        'workflow_next',
+        { opId: 'explicit-next-op', change: 'updated', message: 'official workflow result' },
+        credential,
+      );
+      expect(routed.ok).toBe(true);
+      if (!routed.ok) return;
+      await expect(engine.handleToolCall(
+        credential,
+        'workflow_next',
+        routed.command,
+      )).resolves.toEqual({ ok: true, result: { staged: true } });
+
+      releaseToolCompletion();
+      await engine.whenIdle();
+
+      await expect(ctx.repository.getTurn(payload.activationTurnId)).resolves.toMatchObject({
+        status: 'succeeded',
+        disposition: {
+          kind: 'workflow_next',
+          change: 'updated',
+          result: 'official workflow result',
+        },
+      });
+      const messages = (await ctx.repository.listMessages(payload.entryTaskId))
+        .filter((message) => message.turnId === payload.activationTurnId)
+        .map((message) => message.content);
+      expect(messages.filter((message) => message === 'official workflow result')).toHaveLength(1);
+      expect(messages).not.toContain('*Conversation interrupted*');
+      await expect(ctx.client.get(
+        `SELECT status FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', payload.runId],
+      )).resolves.toMatchObject({ status: 'succeeded' });
+    } finally {
+      releaseToolCompletion();
       await engine?.shutdown().catch(() => undefined);
       await ctx.close();
     }
@@ -796,6 +945,10 @@ describe('M018 S01 one-node workflow activation', () => {
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
+    let releaseResume!: () => void;
+    const resumeGate = new Promise<void>((resolve) => {
+      releaseResume = resolve;
+    });
     try {
       await client.open(dbPath);
       const workspaceId = 'ws-m018-s01-bridge';
@@ -827,8 +980,11 @@ describe('M018 S01 one-node workflow activation', () => {
           adapterRun += 1;
           if (adapterRun === 1) {
             await gate;
-          } else {
+          } else if (adapterRun === 2) {
+            yield { type: 'assistantDelta', messageId: 'workflow-detail', content: 'Detailed result for the receiving coordinator.' };
             yield { type: 'assistantDelta', messageId: 'workflow-result', content: 'workflow complete' };
+          } else {
+            await resumeGate;
           }
           yield { type: 'turnCompleted' };
         },
@@ -862,23 +1018,13 @@ describe('M018 S01 one-node workflow activation', () => {
       });
       const context = credentials.verify(token)!;
 
-      const topology = {
-        kind: 'one_node_v1' as const,
-        nodes: [{ nodeId: 'entry' }],
-        entryNodeId: 'entry',
-      };
       const defineRouted = dispatch(
         'define_workflow',
         {
-          opId: 'bridge-def-1',
-          definitionId: 'wf-public',
-          version: 1,
+          workflowKey: 'wf-public',
           name: 'public-one-node',
-          topology,
-          entryContracts: [
-            { entryNodeId: 'entry', inputRef: 'request', expectedArtifactKind: 'text' },
-          ],
-          policy: DEFAULT_WORKFLOW_POLICY,
+          nodes: [{ nodeKey: 'entry', taskType: 'worker' }],
+          inputs: [{ to: 'entry', name: 'request' }],
         },
         context,
       );
@@ -891,17 +1037,38 @@ describe('M018 S01 one-node workflow activation', () => {
       );
       expect(defined).toMatchObject({ ok: true, result: { changed: true, definitionId: 'wf-public' } });
 
+      const editContext = { ...context, turnId: `${turnId}-definition-edit` };
+      const revisedRouted = dispatch(
+        'define_workflow',
+        {
+          workflowKey: 'wf-public',
+          name: 'public-one-node-revised',
+          nodes: [{ nodeKey: 'entry', taskType: 'worker' }],
+          inputs: [{ to: 'entry', name: 'request' }],
+        },
+        editContext,
+      );
+      expect(revisedRouted.ok).toBe(true);
+      if (!revisedRouted.ok) return;
+      await expect(engine.handleToolCall(
+        editContext,
+        'define_workflow',
+        revisedRouted.command,
+      )).resolves.toMatchObject({
+        ok: true,
+        result: { changed: true, definitionId: 'wf-public', version: 2 },
+      });
+      await expect(repository.getLatestWorkflowDefinition('wf-public', taskId))
+        .resolves.toMatchObject({ version: 2, name: 'public-one-node-revised' });
+
       const startRouted = dispatch(
         'start_workflow',
         {
-          opId: 'bridge-start-1',
-          definitionId: 'wf-public',
-          version: 1,
-          startIdempotencyKey: 'public-start-1',
+          workflow: 'wf-public',
+          instanceKey: 'public-start-1',
           goal: 'activate one-node via bridge',
-          backend: 'grok',
-          entryInputs: [
-            { entryNodeId: 'entry', inputRef: 'request', kind: 'text', value: 'review this change' },
+          inputs: [
+            { node: 'entry', input: 'request', value: 'review this change' },
           ],
         },
         context,
@@ -921,17 +1088,38 @@ describe('M018 S01 one-node workflow activation', () => {
         activationTurnId: string;
         entryGateStatus: string;
         entryMessageId: string;
-        runStatus: string;
-        workflowNext?: { change: string; result?: string };
-        terminalResult?: { runId: string; artifactId: string; artifactRevision: number };
       };
       expect(payload.entryGateStatus).toBe('satisfied');
-      expect(payload.runStatus).toBe('succeeded');
-      expect(payload.workflowNext).toEqual({ change: 'updated', result: 'workflow complete' });
-      expect(payload.terminalResult).toMatchObject({
-        runId: payload.runId,
-        artifactRevision: 1,
+      let completion = await repository.getWorkflowRunCompletion(payload.runId, taskId);
+      for (
+        let attempt = 0;
+        attempt < 100 && (!completion || completion.runStatus === 'running');
+        attempt += 1
+      ) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        completion = await repository.getWorkflowRunCompletion(payload.runId, taskId);
+      }
+      expect(completion).toMatchObject({
+        runStatus: 'succeeded',
+        workflowNext: {
+          change: 'updated',
+          result: 'workflow complete',
+        },
+        terminalResult: {
+          runId: payload.runId,
+          artifactRevision: 1,
+        },
       });
+      await expect(repository.resolveWorkflowInputArtifacts(
+        payload.activationTurnId,
+        taskId,
+        ['request'],
+      )).resolves.toEqual([
+        expect.objectContaining({
+          inputRef: 'request',
+          artifactRevision: 1,
+        }),
+      ]);
 
       const entryTurn = await repository.getTurn(payload.activationTurnId);
       expect(entryTurn).toMatchObject({
@@ -947,7 +1135,7 @@ describe('M018 S01 one-node workflow activation', () => {
         releaseState: 'released',
         lifecycle: 'succeeded',
         backend: 'grok',
-        sealedBy: { kind: 'coordinator', taskId, mode: 'workflow_run' },
+        lifecycleAuthority: { kind: 'workflow', runId: payload.runId },
       });
       expect((await repository.getTask(taskId))?.lifecycle).toBe('open');
       expect(
@@ -980,11 +1168,11 @@ describe('M018 S01 one-node workflow activation', () => {
               AND source.run_id = artifact.run_id
               AND source.artifact_id = artifact.artifact_id
               AND source.artifact_revision = artifact.revision
-             WHERE artifact.workspace_id = ? AND artifact.run_id = ? AND artifact.kind = 'text'`,
+              WHERE artifact.workspace_id = ? AND artifact.run_id = ? AND artifact.kind = 'workflow_input'`,
           [workspaceId, payload.runId],
         ),
       ).toMatchObject({
-        kind: 'text',
+        kind: 'workflow_input',
         payload_json: expect.stringContaining('review this change'),
         source_kind: 'caller_turn',
         caller_task_id: taskId,
@@ -1007,47 +1195,110 @@ describe('M018 S01 one-node workflow activation', () => {
         ),
       ).toMatchObject({
         definition_id: 'wf-public',
-        definition_version: 1,
+        definition_version: 2,
         fingerprint: expect.any(String),
         run_id: payload.runId,
       });
 
-      // Same start key through public surface is a no-op (no second turn).
+      release();
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((await repository.getTurn(turnId))?.status === 'succeeded') break;
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+      await expect(repository.getTurn(turnId)).resolves.toMatchObject({ status: 'succeeded' });
+
+      let firstResumeTurnId: string | undefined;
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        const row = await client.get<{ resume_turn_id?: string }>(
+          `SELECT json_extract(payload_json, '$.resumeTurnId') AS resume_turn_id
+             FROM workflow_continuations
+            WHERE workspace_id = ? AND run_id = ? AND kind = 'start_wait'
+            ORDER BY created_at, continuation_id
+            LIMIT 1`,
+          [workspaceId, payload.runId],
+        );
+        firstResumeTurnId = row?.resume_turn_id;
+        if (firstResumeTurnId && (await repository.getTurn(firstResumeTurnId))?.status === 'running') {
+          break;
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      }
+      expect(firstResumeTurnId).toEqual(expect.any(String));
+      await expect(repository.getTurn(firstResumeTurnId!)).resolves.toMatchObject({
+        status: 'running',
+        workflowResume: { kind: 'start_workflow', runId: payload.runId },
+      });
+      const resumeMessage = (await repository.listMessages(taskId)).find(
+        (message) => message.turnId === firstResumeTurnId && message.role === 'system',
+      );
+      expect(resumeMessage?.content).toContain('workflow complete');
+      expect(resumeMessage?.content).not.toContain('Detailed result for the receiving coordinator.');
+
+      const replayToken = credentials.issue({
+        rootId: taskId,
+        callerTaskId: taskId,
+        turnId: firstResumeTurnId!,
+        allowedActions: new Set(['start_workflow']),
+        attemptId: 'att-s01-replay',
+        ttlMs: 60_000,
+      });
+      const replayContext = credentials.verify(replayToken)!;
+
+      // The same instanceKey from a later turn reuses the run and creates that
+      // turn's own deterministic terminal continuation.
       const replayRouted = dispatch(
         'start_workflow',
         {
-          opId: 'bridge-start-replay',
-          definitionId: 'wf-public',
-          version: 1,
-          startIdempotencyKey: 'public-start-1',
+          workflow: 'wf-public',
+          instanceKey: 'public-start-1',
           goal: 'activate one-node via bridge',
-          backend: 'grok',
-          entryInputs: [
-            { entryNodeId: 'entry', inputRef: 'request', kind: 'text', value: 'review this change' },
+          inputs: [
+            { node: 'entry', input: 'request', value: 'review this change' },
           ],
         },
-        context,
+        replayContext,
       );
       expect(replayRouted.ok).toBe(true);
       if (!replayRouted.ok) return;
       const replayed = await engine.handleToolCall(
-        context,
+        replayContext,
         'start_workflow',
         replayRouted.command,
       );
       expect(replayed).toMatchObject({
         ok: true,
         result: {
-          changed: false,
-          replay: true,
-          activationTurnId: payload.activationTurnId,
-          runStatus: 'succeeded',
-          workflowNext: { change: 'updated', result: 'workflow complete' },
-        },
+           changed: false,
+           replay: true,
+           activationTurnId: payload.activationTurnId,
+         },
       });
       expect(await repository.listTurns(payload.entryTaskId)).toHaveLength(1);
+      let replayContinuations: Array<{ caller_turn_id: string; status: string }> = [];
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        replayContinuations = await client.all<{ caller_turn_id: string; status: string }>(
+          `SELECT caller_turn_id, status
+             FROM workflow_continuations
+            WHERE workspace_id = ? AND run_id = ? AND kind = 'start_wait'
+            ORDER BY created_at, continuation_id`,
+          [workspaceId, payload.runId],
+        );
+        if (
+          replayContinuations.length === 2 &&
+          replayContinuations.some((row) =>
+            row.caller_turn_id === firstResumeTurnId && row.status === 'resolved')
+        ) {
+          break;
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+      expect(replayContinuations).toEqual(expect.arrayContaining([
+        expect.objectContaining({ caller_turn_id: turnId, status: 'consumed' }),
+        expect.objectContaining({ caller_turn_id: firstResumeTurnId, status: 'resolved' }),
+      ]));
     } finally {
       release();
+      releaseResume();
       await engine?.whenIdle?.().catch(() => undefined);
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });

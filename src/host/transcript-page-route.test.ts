@@ -517,7 +517,7 @@ describe('routeLoadTranscriptPage multi-page integration', () => {
         releaseState: 'released',
         goal: 'multi',
         parentId: null,
-        dependencies: [],
+        prerequisites: [],
         backend: 'grok',
         capabilities: [],
         executionPolicy: { maxTurns: 100, maxAutomaticRetries: 1 },

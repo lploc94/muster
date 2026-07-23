@@ -12,7 +12,7 @@ import type { EngineProjection } from './types';
 function makeTask(id: string): MusterTask {
   return {
     id, role: 'worker', lifecycle: 'open', releaseState: 'released', goal: id,
-    parentId: null, dependencies: [], backend: 'grok', capabilities: [],
+    parentId: null, prerequisites: [], backend: 'grok', capabilities: [],
     executionPolicy: { maxTurns: 100, maxAutomaticRetries: 1 }, revision: 0,
     createdAt: '2026-07-16T00:00:00.000Z', updatedAt: '2026-07-16T00:00:00.000Z',
   };
@@ -420,7 +420,7 @@ describe('getTranscriptPage — query plan is task-scoped (Finding 4)', () => {
       await repo.execute({
         kind: 'appendTranscriptBatch', workspaceId: 'ws', taskId: task.id,
         messages: [msg('x-a1', task.id, 'assistant', 'a', '2026-07-16T00:00:03.000Z', 0, 'X1')],
-        reasoning: [{ id: 'x-r1', taskId: task.id, turnId: 'X1', content: 'r', createdAt: '2026-07-16T00:00:02.500Z', updatedAt: '2026-07-16T00:00:02.500Z' }],
+        reasoning: [{ id: 'x-r1', taskId: task.id, turnId: 'X1', order: 2, content: 'r', createdAt: '2026-07-16T00:00:02.500Z', updatedAt: '2026-07-16T00:00:02.500Z' }],
         toolCalls: [{ id: 'x-tc1', taskId: task.id, turnId: 'X1', toolCallId: 'c', order: 1, name: 'read', status: 'success', output: 'ok', createdAt: '2026-07-16T00:00:03.000Z', updatedAt: '2026-07-16T00:00:03.000Z' }],
       });
       // Seed a SIBLING task so any workspace-wide scan would leak its rows.
@@ -432,7 +432,7 @@ describe('getTranscriptPage — query plan is task-scoped (Finding 4)', () => {
       await repo.execute({
         kind: 'appendTranscriptBatch', workspaceId: 'ws', taskId: sibling.id,
         messages: [msg('s-a1', sibling.id, 'assistant', 'a', '2026-07-16T00:00:03.000Z', 0, 'S1')],
-        reasoning: [{ id: 's-r1', taskId: sibling.id, turnId: 'S1', content: 'r', createdAt: '2026-07-16T00:00:02.500Z', updatedAt: '2026-07-16T00:00:02.500Z' }],
+        reasoning: [{ id: 's-r1', taskId: sibling.id, turnId: 'S1', order: 2, content: 'r', createdAt: '2026-07-16T00:00:02.500Z', updatedAt: '2026-07-16T00:00:02.500Z' }],
         toolCalls: [{ id: 's-tc1', taskId: sibling.id, turnId: 'S1', toolCallId: 'c', order: 1, name: 'read', status: 'success', output: 'ok', createdAt: '2026-07-16T00:00:03.000Z', updatedAt: '2026-07-16T00:00:03.000Z' }],
       });
 
@@ -533,20 +533,20 @@ async function seedMixedTranscript(
 
   const messages: TaskMessage[] = [
     msg('m-open', task.id, 'user', 'opening', '2026-07-16T00:00:02.000Z'),
-    // Turn 1 assistant segments + equal-ordering tie-break by id.
-    msg('m-a1', task.id, 'assistant', 'a1', '2026-07-16T00:00:03.000Z', 0, 'T1'),
-    msg('m-a2', task.id, 'assistant', 'a2', '2026-07-16T00:00:03.000Z', 2, 'T1'),
+    // Turn 1 assistant segments interleaved with reasoning and a tool.
+    msg('m-a1', task.id, 'assistant', 'a1', '2026-07-16T00:00:03.000Z', 1, 'T1'),
+    msg('m-a2', task.id, 'assistant', 'a2', '2026-07-16T00:00:03.000Z', 4, 'T1'),
     // Turn 2 assistant.
-    msg('m-a3', task.id, 'assistant', 'a3', '2026-07-16T00:00:11.000Z', 0, 'T2'),
+    msg('m-a3', task.id, 'assistant', 'a3', '2026-07-16T00:00:11.000Z', 1, 'T2'),
   ];
   const reasoning: PersistedReasoning[] = [
-    { id: 'r-T1', taskId: task.id, turnId: 'T1', content: 'think1', createdAt: '2026-07-16T00:00:02.500Z', updatedAt: '2026-07-16T00:00:02.500Z' },
-    { id: 'r-T2', taskId: task.id, turnId: 'T2', content: 'think2', createdAt: '2026-07-16T00:00:10.500Z', updatedAt: '2026-07-16T00:00:10.500Z' },
+    { id: 'r-T1-0', taskId: task.id, turnId: 'T1', order: 0, content: 'think1', createdAt: '2026-07-16T00:00:02.500Z', updatedAt: '2026-07-16T00:00:02.500Z' },
+    { id: 'r-T1-3', taskId: task.id, turnId: 'T1', order: 3, content: 'think again', createdAt: '2026-07-16T00:00:03.500Z', updatedAt: '2026-07-16T00:00:03.500Z' },
+    { id: 'r-T2-0', taskId: task.id, turnId: 'T2', order: 0, content: 'think2', createdAt: '2026-07-16T00:00:10.500Z', updatedAt: '2026-07-16T00:00:10.500Z' },
   ];
   const toolCalls: PersistedToolCall[] = [
-    // Interleaved between assistant segments in turn 1 (order 1 sits between a1=0 and a2=2).
-    { id: 'tc-T1-1', taskId: task.id, turnId: 'T1', toolCallId: 'call1', order: 1, name: 'read', status: 'success', output: 'ok', createdAt: '2026-07-16T00:00:03.000Z', updatedAt: '2026-07-16T00:00:03.000Z' },
-    { id: 'tc-T2-1', taskId: task.id, turnId: 'T2', toolCallId: 'call2', order: 1, name: 'write', status: 'success', output: 'ok', createdAt: '2026-07-16T00:00:11.000Z', updatedAt: '2026-07-16T00:00:11.000Z' },
+    { id: 'tc-T1-2', taskId: task.id, turnId: 'T1', toolCallId: 'call1', order: 2, name: 'read', status: 'success', output: 'ok', createdAt: '2026-07-16T00:00:03.000Z', updatedAt: '2026-07-16T00:00:03.000Z' },
+    { id: 'tc-T2-2', taskId: task.id, turnId: 'T2', toolCallId: 'call2', order: 2, name: 'write', status: 'success', output: 'ok', createdAt: '2026-07-16T00:00:11.000Z', updatedAt: '2026-07-16T00:00:11.000Z' },
   ];
   await repo.execute({ kind: 'appendMessage', workspaceId: 'ws', message: messages[0]! });
   await repo.execute({ kind: 'appendTranscriptBatch', workspaceId: 'ws', taskId: task.id, messages: messages.slice(1), reasoning, toolCalls });

@@ -15,6 +15,7 @@ import { TaskEngine } from './engine';
 import { DEFAULT_RESOURCE_LIMITS } from './limits';
 import { parseTaskTypeRegistry } from './task-types';
 import { SqliteTaskRepository } from './repository';
+import { RepositoryProjection, withRepositoryProjection } from './repository-projection';
 import { stageDispositionForSettlement } from './m018-test-helpers';
 import { canPromoteTurn } from './scheduler';
 import { DbClient } from './sqlite/client';
@@ -170,6 +171,14 @@ describe('M018 S02 fan-in NEXT activation', () => {
       expect(consumerGate).toBeTruthy();
       const p1 = data.entries.find((e) => e.nodeId === 'p1')!;
       const p2 = data.entries.find((e) => e.nodeId === 'p2')!;
+      await expect(ctx.repository.getTask(p1.taskId)).resolves.toMatchObject({
+        goal: '[workflow:p1] fan-in next',
+      });
+      await expect(ctx.repository.getTask(p2.taskId)).resolves.toMatchObject({
+        goal: '[workflow:p2] fan-in next',
+      });
+      const projection = await RepositoryProjection.load(ctx.repository, 'ws');
+      const projectedRepository = withRepositoryProjection(ctx.repository, projection);
 
       const settleProducer = async (
         entry: { taskId: string; activationTurnId: string },
@@ -185,8 +194,8 @@ describe('M018 S02 fan-in NEXT activation', () => {
         expect(task).toBeTruthy();
         expect(turn).toBeTruthy();
         const disposition = { kind: 'workflow_next' as const, change: 'updated' as const, result };
-        await stageDispositionForSettlement(ctx.repository, turn!, disposition);
-        return ctx.repository.execute({
+        await stageDispositionForSettlement(projectedRepository, turn!, disposition);
+        return projectedRepository.execute({
           kind: 'settleTurnAndApplyEffects',
           workspaceId: 'ws',
           expectedTaskRevision: task!.revision,
@@ -251,12 +260,15 @@ describe('M018 S02 fan-in NEXT activation', () => {
       );
       expect(consumerNode?.task_id).toBeTruthy();
       expect(consumerNode).toMatchObject({ status: 'active' });
+      expect(second.affectedTaskIds).toContain(String(consumerNode!.task_id));
+      expect(projection.getTask(String(consumerNode!.task_id))).toBeTruthy();
 
       const consumerTask = await ctx.repository.getTask(String(consumerNode!.task_id));
       expect(consumerTask).toMatchObject({
         lifecycle: 'open',
         releaseState: 'released',
         backend: 'grok',
+        goal: '[workflow:consumer] fan-in next',
       });
 
       const consumerTurns = await ctx.repository.listTurns(consumerTask!.id);
@@ -266,6 +278,7 @@ describe('M018 S02 fan-in NEXT activation', () => {
         trigger: 'engine',
         sequence: 1,
       });
+      expect(projection.getFile().turns[consumerTurns[0]!.id]).toMatchObject({ status: 'queued' });
 
       const msgId = consumerTurns[0]!.inputs.find((i) => i.kind === 'message')?.messageId;
       expect(msgId).toBeTruthy();
@@ -559,6 +572,15 @@ describe('M018 S02 fan-in NEXT activation', () => {
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
+    let releaseResume!: () => void;
+    const resumeGate = new Promise<void>((resolve) => {
+      releaseResume = resolve;
+    });
+    let releaseWorkflowWorkers!: () => void;
+    const workflowWorkersGate = new Promise<void>((resolve) => {
+      releaseWorkflowWorkers = resolve;
+    });
+    let runInvocation = 0;
     try {
       await client.open(dbPath);
       const workspaceId = 'ws-m018-s02-bridge';
@@ -585,8 +607,38 @@ describe('M018 S02 fan-in NEXT activation', () => {
           },
           run: async function* () {},
         }),
-        runTurn: async function* () {
-          await gate;
+        runTurn: async function* (_backend, options) {
+          runInvocation += 1;
+          if (runInvocation === 1) {
+            await gate;
+            yield {
+              type: 'toolStarted',
+              toolCallId: 'start-workflow-call',
+              name: 'muster_bridge_start_workflow',
+              kind: 'mcp',
+              input: { workflow: 'wf-public-fan@1', inputs: [] },
+            };
+            yield {
+              type: 'toolCompleted',
+              toolCallId: 'start-workflow-call',
+              outcome: 'success',
+              output: { status: 'accepted' },
+            };
+            if (options.signal?.aborted) {
+              yield {
+                type: 'assistantDelta',
+                messageId: 'codex-interruption-notice',
+                content: '*Conversation interrupted*',
+              };
+              yield { type: 'error', message: 'cancelled', isCancellation: true };
+            }
+            return;
+          }
+          if (runInvocation <= 3) {
+            await workflowWorkersGate;
+          } else {
+            await resumeGate;
+          }
           yield { type: 'turnCompleted' };
         },
         getTaskTypeRegistry: () =>
@@ -659,48 +711,45 @@ describe('M018 S02 fan-in NEXT activation', () => {
       );
       expect(startRouted.ok).toBe(true);
       if (!startRouted.ok) return;
-      let startResolved = false;
-      const startPromise = engine.handleToolCall(
+      const startedWf = await engine.handleToolCall(
         context,
         'start_workflow',
         startRouted.command,
       );
-      void startPromise.then(() => {
-        startResolved = true;
-      });
-      let durableRunId: string | undefined;
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        const run = await client.get<{ run_id: string }>(
-          'SELECT run_id FROM workflow_runs WHERE workspace_id = ? AND definition_id = ?',
-          [workspaceId, 'wf-public-fan'],
-        );
-        durableRunId = run?.run_id;
-        if (durableRunId) break;
-        await new Promise<void>((resolve) => setTimeout(resolve, 0));
-      }
-      expect(durableRunId).toBeTruthy();
-      expect(startResolved).toBe(false);
-      await engine.getRepository().execute({
-        kind: 'reapWorkflowTimeouts',
-        workspaceId,
-        now: '2126-07-22T00:00:00.000Z',
-      });
-      const startedWf = await startPromise;
       expect(startedWf.ok).toBe(true);
       if (!startedWf.ok) return;
       const payload = startedWf.result as {
         runId: string;
         entries?: Array<{ nodeId: string; taskId: string; activationTurnId: string }>;
         nodeGates?: Array<{ nodeId: string; gateId: string }>;
-        runStatus: string;
-        terminalReason?: string;
-        workflowNext?: { change: string; result?: string };
+        changed: boolean;
       };
       expect(payload.runId).toBeTruthy();
-      expect(payload.runStatus).toBe('failed');
-      expect(payload).toMatchObject({ terminalReason: 'run_timeout' });
-      expect(payload.workflowNext).toBeUndefined();
+      expect(payload.changed).toBe(true);
       expect(payload.entries?.map((e) => e.nodeId).sort()).toEqual(['p1', 'p2']);
+
+      const pendingContinuation = await client.get<{
+        continuation_id: string;
+        status: string;
+      }>(
+        `SELECT continuation_id, status
+           FROM workflow_continuations
+          WHERE workspace_id = ? AND run_id = ? AND kind = 'start_wait'`,
+        [workspaceId, payload.runId],
+      );
+      expect(pendingContinuation).toMatchObject({ status: 'pending' });
+
+      release();
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((await repository.getTurn(turnId))?.status === 'succeeded') break;
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+      await expect(repository.getTurn(turnId)).resolves.toMatchObject({ status: 'succeeded' });
+      const suspendedTurnMessages = (await repository.listMessages(taskId))
+        .filter((message) => message.turnId === turnId)
+        .map((message) => message.content);
+      expect(suspendedTurnMessages).toContain('*Workflow dispatched. Waiting for results...*');
+      expect(suspendedTurnMessages).not.toContain('*Conversation interrupted*');
 
       const nodes = await client.all(
         'SELECT node_id, task_id, status FROM workflow_nodes WHERE workspace_id = ? AND run_id = ? ORDER BY node_id',
@@ -720,125 +769,67 @@ describe('M018 S02 fan-in NEXT activation', () => {
         'SELECT status FROM workflow_dependency_gates WHERE workspace_id = ? AND run_id = ? AND gate_id = ?',
         [workspaceId, payload.runId, consumerGate!.gateId],
       );
-      expect(gateRow).toMatchObject({ status: 'failed' });
+      expect(gateRow).toMatchObject({ status: 'open' });
 
-      for (const entry of payload.entries ?? []) {
-        const turn = await repository.getTurn(entry.activationTurnId);
-        expect(turn).toMatchObject({
-          id: entry.activationTurnId,
-          taskId: entry.taskId,
-          status: 'cancelled',
-          trigger: 'engine',
-        });
-      }
-
-      const cancelRouted = dispatch(
-        'start_workflow',
-        {
-          opId: 'bridge-start-fan-cancel',
-          definitionId: 'wf-public-fan',
-          version: 1,
-          startIdempotencyKey: 'public-fan-start-cancel',
-          goal: 'cancel fan-in via bridge',
-          backend: 'grok',
-          entryInputs: [],
-        },
-        context,
-      );
-      expect(cancelRouted.ok).toBe(true);
-      if (!cancelRouted.ok) return;
-      const cancelPromise = engine.handleToolCall(
-        context,
-        'start_workflow',
-        cancelRouted.command,
-      );
-      let cancelTarget: { task_id: string; execution_turn_id: string } | undefined;
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        cancelTarget = await client.get<{ task_id: string; execution_turn_id: string }>(
-          `SELECT node.task_id, activation.execution_turn_id
-             FROM workflow_runs run
-             JOIN workflow_nodes node
-               ON node.workspace_id = run.workspace_id AND node.run_id = run.run_id
-             JOIN workflow_activations activation
-               ON activation.workspace_id = node.workspace_id
-              AND activation.run_id = node.run_id AND activation.node_id = node.node_id
-            WHERE run.workspace_id = ? AND run.definition_id = ? AND run.status = 'running'
-            ORDER BY node.node_id LIMIT 1`,
-          [workspaceId, 'wf-public-fan'],
-        );
-        if (cancelTarget) break;
-        await new Promise<void>((resolve) => setTimeout(resolve, 0));
-      }
-      expect(cancelTarget).toBeTruthy();
-      const cancelTask = await repository.getTask(cancelTarget!.task_id);
-      const cancelTurn = await repository.getTurn(cancelTarget!.execution_turn_id);
-      expect(cancelTask).toBeTruthy();
-      expect(cancelTurn).toBeTruthy();
-      const cancelledAt = '2126-07-22T00:01:00.000Z';
-      await expect(engine.getRepository().execute({
-        kind: 'applyTaskLifecycle',
+      await engine.getRepository().execute({
+        kind: 'reapWorkflowTimeouts',
         workspaceId,
-        taskId: cancelTask!.id,
-        expectedTaskRevision: cancelTask!.revision,
-        task: {
-          ...cancelTask!,
-          lifecycle: 'cancelled',
-          revision: cancelTask!.revision + 1,
-          updatedAt: cancelledAt,
-        },
-        turns: [{ ...cancelTurn!, status: 'cancelled', finishedAt: cancelledAt }],
-        expectedTurns: [{
-          id: cancelTurn!.id,
-          status: cancelTurn!.status as 'queued' | 'running' | 'waiting_user',
-          runtimeEpoch: cancelTurn!.runtimeEpoch,
-        }],
-      })).resolves.toMatchObject({ ok: true, changed: true });
-      await expect(cancelPromise).resolves.toMatchObject({
-        ok: true,
-        result: {
-          runStatus: 'cancelled',
-          terminalReason: 'required_target_cancelled',
-        },
+        now: '2126-07-22T00:00:00.000Z',
       });
+      releaseWorkflowWorkers();
 
-      const interruptedRouted = dispatch(
-        'start_workflow',
-        {
-          opId: 'bridge-start-fan-interrupted',
-          definitionId: 'wf-public-fan',
-          version: 1,
-          startIdempotencyKey: 'public-fan-start-interrupted',
-          goal: 'interrupt fan-in wait',
-          backend: 'grok',
-          entryInputs: [],
-        },
-        context,
-      );
-      expect(interruptedRouted.ok).toBe(true);
-      if (!interruptedRouted.ok) return;
-      const interruptedPromise = engine.handleToolCall(
-        context,
-        'start_workflow',
-        interruptedRouted.command,
-      );
+      let resolvedContinuation: {
+        status: string;
+        resume_turn_id: string | null;
+      } | undefined;
       for (let attempt = 0; attempt < 100; attempt += 1) {
-        const running = await client.get<{ count: number }>(
-          `SELECT COUNT(*) AS count FROM workflow_runs
-            WHERE workspace_id = ? AND definition_id = ? AND status = 'running'`,
-          [workspaceId, 'wf-public-fan'],
+        resolvedContinuation = await client.get<{
+          status: string;
+          resume_turn_id: string | null;
+        }>(
+          `SELECT status, json_extract(payload_json, '$.resumeTurnId') AS resume_turn_id
+             FROM workflow_continuations
+            WHERE workspace_id = ? AND continuation_id = ?`,
+          [workspaceId, pendingContinuation!.continuation_id],
         );
-        if ((running?.count ?? 0) > 0) break;
+        if (resolvedContinuation?.status === 'resolved') break;
         await new Promise<void>((resolve) => setTimeout(resolve, 0));
       }
-      const shutdownPromise = engine.shutdown();
-      await expect(interruptedPromise).resolves.toEqual({
-        ok: false,
-        error: 'start_workflow interrupted: engine shutting down',
+      expect(resolvedContinuation).toMatchObject({
+        status: 'resolved',
+        resume_turn_id: expect.any(String),
       });
-      release();
-      await shutdownPromise;
+
+      const completion = await repository.getWorkflowRunCompletion(payload.runId, taskId);
+      expect(completion).toMatchObject({
+        runStatus: 'failed',
+        terminalReason: 'run_timeout',
+      });
+      const resumeTurn = await repository.getTurn(resolvedContinuation!.resume_turn_id!);
+      expect(resumeTurn).toMatchObject({
+        taskId,
+        workflowResume: {
+          kind: 'start_workflow',
+          runId: payload.runId,
+          continuationId: pendingContinuation!.continuation_id,
+        },
+      });
+      expect(['queued', 'running']).toContain(resumeTurn?.status);
+      await expect(engine.getRepository().execute({
+        kind: 'resolveWorkflowStartContinuation',
+        workspaceId,
+        now: '2126-07-22T00:00:01.000Z',
+      })).resolves.toMatchObject({ changed: false });
+      const resumeCount = await client.get<{ count: number }>(
+        'SELECT COUNT(*) AS count FROM turns WHERE workspace_id = ? AND id = ?',
+        [workspaceId, resolvedContinuation!.resume_turn_id!],
+      );
+      expect(resumeCount?.count).toBe(1);
+
     } finally {
       release();
+      releaseWorkflowWorkers();
+      releaseResume();
       await engine?.shutdown().catch(() => undefined);
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });

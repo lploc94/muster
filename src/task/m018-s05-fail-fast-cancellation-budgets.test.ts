@@ -371,7 +371,7 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
         lifecycle: 'failed',
         finishedAt,
         error: 'agent_fail',
-        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+        lifecycleAuthority: { kind: 'workflow', runId: data.runId },
       });
       expect(after?.attention).toBeUndefined();
 
@@ -401,7 +401,7 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
         lifecycle: 'failed',
         finishedAt,
         error: 'agent_fail',
-        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+        lifecycleAuthority: { kind: 'workflow', runId: data.runId },
       });
     } finally {
       await opened.close();
@@ -432,7 +432,7 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
       expect(after).toMatchObject({
         lifecycle: 'failed',
         error: 'invalid_route',
-        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+        lifecycleAuthority: { kind: 'workflow', runId: data.runId },
       });
       expect(after?.attention).toBeUndefined();
     } finally {
@@ -463,7 +463,7 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
       expect(after).toMatchObject({
         lifecycle: 'failed',
         error: 'run_timeout',
-        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+        lifecycleAuthority: { kind: 'workflow', runId: data.runId },
       });
       expect(after?.attention).toBeUndefined();
     } finally {
@@ -519,7 +519,7 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
       expect(after).toMatchObject({
         lifecycle: 'failed',
         error: 'feedback_budget_exhausted',
-        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+        lifecycleAuthority: { kind: 'workflow', runId: data.runId },
       });
       const rounds = await roundStatuses(opened.client, data.runId);
       expect(rounds).toHaveLength(1);
@@ -555,7 +555,7 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
       expect(after).toMatchObject({
         lifecycle: 'failed',
         error: 'turn_budget_exhausted',
-        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+        lifecycleAuthority: { kind: 'workflow', runId: data.runId },
       });
       await expect(opened.client.get(
         `SELECT workflow_turns_reserved, feedback_rounds_reserved FROM workflow_runs
@@ -717,12 +717,12 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
       expect(p1Task).toMatchObject({
         lifecycle: 'failed',
         error: 'agent_fail',
-        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+        lifecycleAuthority: { kind: 'workflow', runId: data.runId },
       });
       expect(p2Task).toMatchObject({
         lifecycle: 'failed',
         error: 'agent_fail',
-        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+        lifecycleAuthority: { kind: 'workflow', runId: data.runId },
       });
       expect(p1Task?.attention).toBeUndefined();
       expect(p2Task?.attention).toBeUndefined();
@@ -799,12 +799,12 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
       expect(p1Task).toMatchObject({
         lifecycle: 'failed',
         error: 'agent_fail',
-        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+        lifecycleAuthority: { kind: 'workflow', runId: data.runId },
       });
       expect(p2Task).toMatchObject({
         lifecycle: 'failed',
         error: 'agent_fail',
-        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+        lifecycleAuthority: { kind: 'workflow', runId: data.runId },
       });
       expect(p1Task?.attention).toBeUndefined();
       expect(p2Task?.attention).toBeUndefined();
@@ -907,7 +907,7 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
       await expect(opened.repository.getTask(data.entryTaskId)).resolves.toMatchObject({
         lifecycle: 'failed',
         error: 'run_timeout',
-        sealedBy: { kind: 'coordinator', mode: 'workflow_run' },
+        lifecycleAuthority: { kind: 'workflow', runId: data.runId },
       });
       expect(adapterStarts).toBe(0);
 

@@ -20,7 +20,7 @@ function makeTask(id: string): MusterTask {
     releaseState: 'draft',
     goal: id,
     parentId: null,
-    dependencies: [],
+    prerequisites: [],
     backend: 'grok',
     capabilities: [],
     executionPolicy: { maxTurns: 10, maxAutomaticRetries: 1 },

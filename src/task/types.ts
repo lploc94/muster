@@ -1,14 +1,14 @@
 // Tasks (§4.1)
 export type TaskRole = 'coordinator' | 'worker';
 export type TaskLifecycleState = 'open' | 'succeeded' | 'failed' | 'cancelled' | 'skipped';
-export interface TaskDependency {
-  taskId: string;
-  requiredOutcome: 'succeeded' | 'settled';
-  onUnsatisfied: 'block' | 'fail' | 'skip';
+export interface TaskPrerequisite {
+  producerTaskId: string;
+  requiredLifecycle: 'succeeded' | 'terminal';
+  onUnmet: 'block' | 'fail' | 'skip';
   /**
-   * Opt-in verify gate (verify-gate-loop Phase A). When `'pass'`, the dependency is
-   * satisfied only if the producer's terminal outcome is met AND its verdict is
-   * `pass`; a fail/inconclusive/absent verdict routes to `onUnsatisfied`. Absent =
+   * Opt-in verify gate (verify-gate-loop Phase A). When `'pass'`, the prerequisite is
+   * met only if the producer's required lifecycle is met AND its verdict is
+   * `pass`; a fail/inconclusive/absent verdict routes to `onUnmet`. Absent =
    * today's behavior (no verdict gate).
    */
   requiredVerdict?: 'pass';
@@ -78,7 +78,7 @@ export interface TaskInputBinding {
 
 // ---------------------------------------------------------------------------
 // Structured verify verdict (verify-gate-loop Phase A). Additive + optional:
-// with no verdict emitted and no dependency requiring one, behavior is unchanged.
+// with no verdict emitted and no prerequisite requiring one, behavior is unchanged.
 // ---------------------------------------------------------------------------
 
 /** Tri-state verify outcome. `inconclusive` is the fail-closed default. */
@@ -123,14 +123,14 @@ export interface TaskVerdict {
 /** Structured task outcome for dataflow. */
 export interface TaskResultV1 {
   version: 1;
-  /** Monotonic per task; captured by dependents at pin time. */
+  /** Monotonic per task; captured by consumers at pin time. */
   revision: number;
   summary: string;
   /** True when summary was clamped to the canonical UTF-8 byte budget. */
   truncated?: boolean;
   /**
    * Optional structured verify verdict (schema stays `version:1`; absent on
-   * legacy/implement tasks). Read by verdict-aware dependencies + verdict bindings.
+   * legacy/implement tasks). Read by verdict-aware prerequisites + verdict bindings.
    */
   verdict?: TaskVerdict;
 }
@@ -159,7 +159,7 @@ export type TaskAttentionCode =
   /** Parent has a durable child question to answer. */
   | 'child_question'
   | 'missing_input'
-  | 'dependency_blocked'
+  | 'prerequisite_blocked'
   | 'recovery_exhausted'
   // verify-gate-loop Phase A: producer verdict failed / never emitted.
   | 'verdict_failed'
@@ -208,9 +208,10 @@ export interface TaskAttention {
   sourceTurnId?: string;
 }
 
-export type TaskSealedBy =
+export type TaskLifecycleAuthority =
   | { kind: 'user' }
-  | { kind: 'coordinator'; taskId: string; turnId?: string; mode: string };
+  | { kind: 'parent'; parentTaskId: string; turnId?: string }
+  | { kind: 'workflow'; runId: string };
 
 /** Host-owned brief kind for prompt preambles (orchestration W2). */
 export type TaskBriefKind =
@@ -274,7 +275,7 @@ export interface MusterTask {
   reason?: string;
   continuationOf?: string;
   parentId: string | null;
-  dependencies: TaskDependency[];
+  prerequisites: TaskPrerequisite[];
   wait?: PersistedWait;
   backend: string;
   /** Optional model id selected for this task (ACP session config option value). */
@@ -309,13 +310,13 @@ export interface MusterTask {
   /** Staged complete/fail for root (human-gated) or display; not a lifecycle seal. */
   outcomeProposal?: OutcomeProposal;
   /**
-   * Structured sealed/proposed outcome for dependency dataflow.
-   * `revision` is captured by dependents at pin time.
+   * Structured sealed/proposed outcome for prerequisite dataflow.
+   * `revision` is captured by consumers at pin time.
    */
   taskResult?: TaskResultV1;
   /**
    * Explicit dataflow edges: which predecessor outputs feed this task's first prompt.
-   * Ordering still requires `dependencies` separately. v1: output key `summary` only.
+   * Ordering still requires `prerequisites` separately. v1: output key `summary` only.
    */
   inputBindings?: TaskInputBinding[];
   /** Draft vs released for auto-run. Required by the current SQLite schema. */
@@ -360,8 +361,8 @@ export interface MusterTask {
    * bounded budget instead of hanging the gate forever. Absent = never remediated.
    */
   remediation?: { uses: number; lastFailureSig?: string; fixTaskId?: string };
-  /** Who sealed lifecycle (user or coordinator). Required on every terminal seal going forward. */
-  sealedBy?: TaskSealedBy;
+  /** Authority that committed the terminal lifecycle. */
+  lifecycleAuthority?: TaskLifecycleAuthority;
   /**
    * Parent-orchestration seal policy (primarily on roots; schema ≥ 5).
    * Default at root creation: parent_may_seal_direct.
@@ -531,6 +532,12 @@ export interface TaskTurn {
     hasOpenFeedbackRound: boolean;
     hasPendingContinuation: boolean;
   };
+  /** Deterministic caller continuation for an accepted top-level workflow start. */
+  workflowResume?: {
+    kind: 'start_workflow';
+    runId: string;
+    continuationId: string;
+  };
   inputs: TurnInput[];
   candidateSessionId?: string;
   observedSessionId?: string;
@@ -615,12 +622,14 @@ export interface PersistedToolCall {
   updatedAt: string;
 }
 
-/** Persisted reasoning, turn-scoped (schema ≥ 3). One record per turn. */
+/** Persisted reasoning segment for transcript reconstruction (schema ≥ 3). */
 export interface PersistedReasoning {
-  /** Equal to turnId. */
+  /** Composite id `${turnId}:${order}` — unique across segments in a turn. */
   id: string;
   taskId: string;
   turnId: string;
+  /** Per-turn monotonic render order shared with assistant and tool segments. */
+  order: number;
   content: string;
   createdAt: string;
   updatedAt: string;
@@ -636,8 +645,8 @@ export interface CancelRequest {
   by: string;
   opId: string;
   at: string;
-  /** Optional durable sealer for remote cancel settlement (W4). */
-  sealedBy?: TaskSealedBy;
+  /** Optional durable lifecycle authority for remote cancel settlement. */
+  lifecycleAuthority?: TaskLifecycleAuthority;
   /** Optional reason for parent-seal cancel (W4 set_task_lifecycle). */
   reason?: string;
 }
@@ -684,7 +693,7 @@ export interface EngineProjection {
   cancelRequests?: Record<string, CancelRequest>;
   /** Persisted tool calls, keyed by `${turnId}:${toolCallId}` (schema ≥ 3). */
   toolCalls?: Record<string, PersistedToolCall>;
-  /** Persisted reasoning, keyed by turnId (schema ≥ 3). */
+  /** Persisted reasoning segments, keyed by segment id (schema ≥ 3). */
   reasoning?: Record<string, PersistedReasoning>;
   /**
    * Webview send outbox receipts (Phase C). Keyed by `clientRequestId`.
@@ -700,7 +709,7 @@ export interface EngineProjection {
  * Independent of CLI success as a task outcome — see docs/TASK-MANAGEMENT.md §4.3.
  */
 export type TaskRuntimeActivity =
-  | 'waiting_dependencies'
+  | 'waiting_prerequisites'
   | 'queued'
   | 'running'
   | 'waiting_user'

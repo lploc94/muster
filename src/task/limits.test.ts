@@ -187,7 +187,7 @@ describe('canCreateTurn queued reservations', () => {
           lifecycle: 'open',
           goal: 'cap',
           parentId: null,
-          dependencies: [],
+          prerequisites: [],
           backend: 'fake',
           capabilities: [],
           executionPolicy: {
@@ -243,7 +243,7 @@ describe('canCreateTurn queued reservations', () => {
           lifecycle: 'open',
           goal: 'reopened',
           parentId: null,
-          dependencies: [],
+          prerequisites: [],
           backend: 'fake',
           capabilities: [],
           executionPolicy: { maxTurns: 1, maxAutomaticRetries: 0 },

@@ -103,7 +103,7 @@ export function makeTask(id: string, goal = id): MusterTask {
     releaseState: 'draft',
     goal,
     parentId: null,
-    dependencies: [],
+    prerequisites: [],
     backend: 'grok',
     capabilities: [],
     executionPolicy: { maxTurns: 10, maxAutomaticRetries: 1 },

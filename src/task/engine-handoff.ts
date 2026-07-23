@@ -21,8 +21,8 @@ import { sanitizeHandoffFailureMessage } from './sanitization';
 
 export const MAX_CONTINUATION_MESSAGES = 160;
 export const MAX_CONTINUATION_TOOL_CALLS = 160;
-export const MAX_CONTINUATION_CHARS = 64_000;
-const MAX_ENTRY_CHARS = 4_000;
+export const MAX_CONTINUATION_CHARS = 262_144;
+const MAX_ENTRY_CHARS = 16_384;
 
 interface ContextRows {
   messages: TaskMessage[];

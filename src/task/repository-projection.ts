@@ -64,12 +64,15 @@ export class RepositoryProjection {
   viewStatusOf(taskId: string): TaskViewStatus | undefined {
     const task = this.file.tasks[taskId];
     if (!task) return undefined;
-    const dependencies = new Map(
-      task.dependencies
-        .map((dependency) => [dependency.taskId, this.file.tasks[dependency.taskId]?.lifecycle] as const)
+    const prerequisites = new Map(
+      task.prerequisites
+        .map((prerequisite) => [
+          prerequisite.producerTaskId,
+          this.file.tasks[prerequisite.producerTaskId]?.lifecycle,
+        ] as const)
         .filter((entry): entry is [string, NonNullable<(typeof entry)[1]>] => entry[1] !== undefined),
     );
-    return deriveViewStatus(task, this.getTurnsForTask(taskId), dependencies);
+    return deriveViewStatus(task, this.getTurnsForTask(taskId), prerequisites);
   }
 
   /**
@@ -235,8 +238,14 @@ export class RepositoryProjection {
       await this.refreshRevision();
       return;
     }
-    if (command.kind === 'clearHistory' || command.kind === 'deleteTask' || command.kind === 'deleteTaskSubtreeIfIdle') {
+    if (command.kind === 'clearHistory' || command.kind === 'deleteTask' || command.kind === 'deleteTaskSubtree') {
       await this.refreshAll();
+      return;
+    }
+    if (command.kind === 'resolveWorkflowStartContinuation' && result.turnId) {
+      const turn = await this.source.getTurn(result.turnId);
+      if (turn) await this.refreshTask(turn.taskId);
+      await this.refreshRevision();
       return;
     }
     const ids = this.affectedTaskIds(command, result);
@@ -255,7 +264,7 @@ export class RepositoryProjection {
     command: RepositoryCommand,
     result?: RepositoryCommandResult,
   ): Set<string> {
-    const ids = new Set<string>();
+    const ids = new Set(result?.affectedTaskIds ?? []);
     // M018 S01/S02: start creates entry task(s) not present on the command shape.
     // One-node: entryTaskId; multi-node fan-in: every entries[].taskId is activated.
     if (
@@ -292,6 +301,7 @@ export class RepositoryProjection {
     if ('message' in command && command.message && typeof command.message === 'object' && 'taskId' in command.message) ids.add(command.message.taskId);
     if ('messages' in command && Array.isArray(command.messages)) for (const message of command.messages) ids.add(message.taskId);
     if ('mutations' in command && Array.isArray(command.mutations)) for (const mutation of command.mutations) ids.add(mutation.taskId);
+    if ('callerTaskId' in command && typeof command.callerTaskId === 'string') ids.add(command.callerTaskId);
     if ('rootTaskId' in command && typeof command.rootTaskId === 'string') ids.add(command.rootTaskId);
     if (isGraphCommand(command)) {
       for (const id of command.deleteTaskIds ?? []) ids.add(id);

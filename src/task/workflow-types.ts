@@ -7,6 +7,14 @@
 /** Supported frozen topology kinds. */
 export type WorkflowTopologyKind = 'one_node_v1' | 'graph_v1';
 
+export const WORKFLOW_NODE_LABEL_MAX_LENGTH = 120_000;
+export const WORKFLOW_RUN_GOAL_MAX_LENGTH = 120_000;
+export const WORKFLOW_INPUT_REF_MAX_LENGTH = 128;
+export const WORKFLOW_GRAPH_MAX_NODES = 64;
+export const WORKFLOW_GRAPH_MAX_EDGES = 128;
+export const WORKFLOW_ENTRY_CONTRACTS_MAX = 128;
+export const WORKFLOW_CHILD_BINDINGS_MAX = 64;
+
 /** A single ordinary workflow node (entry + only node for one_node_v1). */
 export interface WorkflowNodeSpecV1 {
   /** Stable node id within the definition (not a task id). */
@@ -396,7 +404,7 @@ export interface WorkflowNextResultProjection {
   result?: string;
 }
 
-/** Authorized terminal state returned to the caller waiting in start_workflow. */
+/** Authorized terminal state delivered to a resumed start_workflow caller. */
 export interface WorkflowRunCompletionProjection {
   runId: string;
   runStatus: 'running' | 'succeeded' | 'failed' | 'cancelled';

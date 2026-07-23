@@ -34,7 +34,7 @@ function makeTask(): MusterTask {
     releaseState: 'released',
     goal: 'disposition race',
     parentId: null,
-    dependencies: [],
+    prerequisites: [],
     backend: 'grok',
     capabilities: [],
     executionPolicy: { maxTurns: 10, maxAutomaticRetries: 1 },

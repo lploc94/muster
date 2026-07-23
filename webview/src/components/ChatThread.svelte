@@ -188,7 +188,7 @@
       const measured = measuredHeightById.get(item.id);
       if (measured && measured > 0) return measured;
     }
-    return createTranscriptEstimateSize(thread.items, thread.reasoningByTurn)(index);
+    return createTranscriptEstimateSize(thread.items)(index);
   }
 
   function createChatVirtualizer(count: number): void {
@@ -829,11 +829,6 @@
     disposeVirtualizer();
   });
 
-  function reasoningFor(turnId: string | undefined): string {
-    if (!turnId) return '';
-    return thread.reasoningByTurn[turnId] ?? '';
-  }
-
   function measureVirtualRow(node: HTMLElement) {
     virtualizer?.measureElement(node);
     return {
@@ -841,6 +836,16 @@
         virtualizer?.measureElement(node);
       },
     };
+  }
+
+  function contextUsageLabel(): string {
+    const usage = thread.contextUsage;
+    if (!usage) return '';
+    if (usage.used !== undefined && usage.size !== undefined) {
+      const remaining = Math.max(0, usage.size - usage.used);
+      return `Context ${remaining.toLocaleString()} / ${usage.size.toLocaleString()} tokens remaining${usage.compacted ? ' (compacted)' : ''}`;
+    }
+    return usage.compacted ? 'Context compacted by Codex' : '';
   }
 </script>
 
@@ -891,8 +896,6 @@
         {@const item = thread.items[vRow.index]}
         {#if item}
           {@const blockStart = isBlockStartAtIndex(thread.items, vRow.index)}
-          {@const turnId =
-            item.kind === 'assistant' || item.kind === 'tool' ? item.turnId : undefined}
           <div
             data-transcript-id={item.id}
             data-index={vRow.index}
@@ -912,15 +915,6 @@
                   </div>
                   <span class="text-[11px] opacity-70 font-medium">{currentBackendLabel}</span>
                 </div>
-
-                {#if reasoningFor(turnId)}
-                  <details class="mb-1 text-xs opacity-70">
-                    <summary class="cursor-pointer flex items-center gap-1">
-                      <span class="codicon codicon-lightbulb"></span> Thinking
-                    </summary>
-                    <div class="mt-1 pl-5 whitespace-pre-wrap">{reasoningFor(turnId)}</div>
-                  </details>
-                {/if}
               {/if}
 
               {#if item.kind === 'user'}
@@ -933,6 +927,13 @@
                 />
               {:else if item.kind === 'tool'}
                 <ToolCard tool={item} />
+              {:else if item.kind === 'reasoning'}
+                <details class="text-xs opacity-70" open={item.turnId === thread.activeTurnId}>
+                  <summary class="cursor-pointer flex items-center gap-1">
+                    <span class="codicon codicon-lightbulb"></span> Thinking
+                  </summary>
+                  <div class="mt-1 pl-5 whitespace-pre-wrap">{item.text}</div>
+                </details>
               {:else if item.kind === 'error'}
                 <div
                   class="rounded px-2 py-1 text-xs whitespace-pre-wrap"
@@ -963,20 +964,19 @@
             </div>
             <span class="text-[11px] opacity-70 font-medium">{currentBackendLabel}</span>
           </div>
-          {#if thread.activeTurnId && reasoningFor(thread.activeTurnId)}
-            <details class="mb-1 text-xs opacity-70" open>
-              <summary class="cursor-pointer flex items-center gap-1">
-                <span class="codicon codicon-lightbulb"></span> Thinking
-              </summary>
-              <div class="mt-1 pl-5 whitespace-pre-wrap">{reasoningFor(thread.activeTurnId)}</div>
-            </details>
-          {/if}
         {/if}
         <MessageBubble role="assistant" text={thread.streaming.text} streaming />
       {/if}
 
       {#if thread.items.length === 0 && !thread.streaming}
         <div class="text-center mt-4" style="opacity: 0.6;">No messages yet.</div>
+      {/if}
+      {#if contextUsageLabel()}
+        <div
+          class="mt-1 text-right text-[10px] opacity-60"
+          data-testid="context-usage"
+          title="Latest context-window usage reported by the backend"
+        >{contextUsageLabel()}</div>
       {/if}
     </div>
   </div>

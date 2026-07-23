@@ -85,6 +85,19 @@ describe('CodexBackend.run — session + streaming', () => {
     expect(contents(events, 'reasoningDelta')).toEqual(['thinking']);
   });
 
+  it('maps the ACP context-compaction notice to metadata instead of assistant prose', async () => {
+    const events = await runTurn(new CodexBackend(), options(), fake, {
+      updates: [
+        {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: "*Context compacted to fit the model's context window.*\n\n" },
+        },
+      ],
+    });
+    expect(events.some((event) => event.type === 'assistantDelta')).toBe(false);
+    expect(events).toContainEqual({ type: 'usage', usage: { compacted: true } });
+  });
+
   it('connects (with extraEnv) before opening a session, then passes cwd/prompt through', async () => {
     const extraEnv = { FOO: 'bar' };
     await runTurn(new CodexBackend(), options({ prompt: 'do it', cwd: '/work', extraEnv }), fake, {});

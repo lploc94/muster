@@ -56,7 +56,7 @@ describe('deriveTurnActivityState', () => {
   it('returns null strip for idle / wait orchestration / terminal', () => {
     for (const runtime of [
       'idle',
-      'waiting_dependencies',
+      'waiting_prerequisites',
       'waiting_children',
       'blocked',
       'awaiting_outcome',

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { parseHostSendRequest } from './send-request';
+import { SEND_OUTBOX_TEXT_MAX } from '../task/repository';
 
 describe('parseHostSendRequest', () => {
   const valid = {
@@ -30,7 +31,7 @@ describe('parseHostSendRequest', () => {
     expect(parseHostSendRequest({ ...valid, legacy: true }).ok).toBe(false);
     expect(parseHostSendRequest({ ...valid, mentionBindings: [['x']] }).ok).toBe(false);
     expect(parseHostSendRequest({ ...valid, skills: ['bad skill'] }).ok).toBe(false);
-    expect(parseHostSendRequest({ ...valid, text: 'x'.repeat(100_001) }).ok).toBe(false);
+    expect(parseHostSendRequest({ ...valid, text: 'x'.repeat(SEND_OUTBOX_TEXT_MAX + 1) }).ok).toBe(false);
   });
 
   it('returns only a validated correlation on rejection', () => {
