@@ -20,7 +20,12 @@ import { stageDispositionForSettlement } from './m018-test-helpers';
 import { canPromoteTurn } from './scheduler';
 import { DbClient } from './sqlite/client';
 import type { TaskStoreFile } from './types';
-import { DEFAULT_WORKFLOW_POLICY, entryNodeIds, makeGraphFanInDefinition } from './workflow';
+import {
+  DEFAULT_WORKFLOW_POLICY,
+  entryNodeIds,
+  makeGraphFanInDefinition,
+  validateDefineWorkflow,
+} from './workflow';
 
 const FAN_IN_TOPOLOGY = {
   kind: 'graph_v1' as const,
@@ -66,13 +71,16 @@ describe('M018 S02 fan-in NEXT activation', () => {
     const ok = dispatch(
       'define_workflow',
       {
-        opId: 'def-fan-1',
-        definitionId: 'wf-fan',
-        version: 1,
         name: 'fan-in',
-        topology: FAN_IN_TOPOLOGY,
-        entryContracts: [],
-        policy: DEFAULT_WORKFLOW_POLICY,
+        nodes: FAN_IN_TOPOLOGY.nodes.map((node) => ({
+          nodeKey: node.nodeId,
+          taskType: 'worker',
+        })),
+        edges: FAN_IN_TOPOLOGY.edges.map((edge) => ({
+          from: edge.fromNodeId,
+          to: edge.toNodeId,
+          as: edge.inputRef,
+        })),
       },
       ctx,
     );
@@ -80,22 +88,14 @@ describe('M018 S02 fan-in NEXT activation', () => {
     if (!ok.ok) return;
     expect(ok.command).toMatchObject({
       kind: 'define_workflow',
-      definitionId: 'wf-fan',
       topology: FAN_IN_TOPOLOGY,
     });
 
     const bad = dispatch(
       'define_workflow',
       {
-        opId: 'def-fan-bad',
-        definitionId: 'wf-bad',
-        version: 1,
         name: 'bad',
-        topology: {
-          kind: 'graph_v1',
-          nodes: [{ nodeId: 'only' }],
-          edges: [],
-        },
+        nodes: [{ nodeKey: 'only', taskType: 'worker' }, { nodeKey: 'orphan', taskType: 'worker' }],
       },
       ctx,
     );
@@ -104,22 +104,32 @@ describe('M018 S02 fan-in NEXT activation', () => {
     const fanOut = dispatch(
       'define_workflow',
       {
-        opId: 'def-fan-out-bad',
-        definitionId: 'wf-fan-out-bad',
-        version: 1,
         name: 'fan-out-bad',
-        topology: {
-          kind: 'graph_v1',
-          nodes: [{ nodeId: 'source' }, { nodeId: 'left' }, { nodeId: 'right' }],
-          edges: [
-            { fromNodeId: 'source', toNodeId: 'left', inputRef: 'from_source' },
-            { fromNodeId: 'source', toNodeId: 'right', inputRef: 'from_source' },
-          ],
-        },
+        nodes: [
+          { nodeKey: 'source', taskType: 'worker' },
+          { nodeKey: 'left', taskType: 'worker' },
+          { nodeKey: 'right', taskType: 'worker' },
+        ],
+        edges: [
+          { from: 'source', to: 'left', as: 'from_source' },
+          { from: 'source', to: 'right', as: 'from_source' },
+        ],
       },
       ctx,
     );
-    expect(fanOut.ok).toBe(false);
+    expect(fanOut.ok).toBe(true);
+    if (fanOut.ok && fanOut.command.kind === 'define_workflow') {
+      expect(validateDefineWorkflow({
+        definitionId: fanOut.command.definitionId,
+        version: 1,
+        name: fanOut.command.name,
+        topology: fanOut.command.topology,
+        entryContracts: fanOut.command.entryContracts,
+        policy: DEFAULT_WORKFLOW_POLICY,
+        scope: { kind: 'root', ownerRootTaskId: 'root' },
+        createdAt: '2026-07-19T00:00:00.000Z',
+      }).ok).toBe(false);
+    }
   });
 
   it('two-producer fan-in NEXT: partial fill leaves consumer absent; final fill queues one aggregate turn without sealing producers', async () => {
@@ -581,6 +591,7 @@ describe('M018 S02 fan-in NEXT activation', () => {
       releaseWorkflowWorkers = resolve;
     });
     let runInvocation = 0;
+    let workflowRefForTranscript = '';
     try {
       await client.open(dbPath);
       const workspaceId = 'ws-m018-s02-bridge';
@@ -616,7 +627,7 @@ describe('M018 S02 fan-in NEXT activation', () => {
               toolCallId: 'start-workflow-call',
               name: 'muster_bridge_start_workflow',
               kind: 'mcp',
-              input: { workflow: 'wf-public-fan@1', inputs: [] },
+              input: { workflow: workflowRefForTranscript, inputs: [] },
             };
             yield {
               type: 'toolCompleted',
@@ -674,18 +685,24 @@ describe('M018 S02 fan-in NEXT activation', () => {
       const defineRouted = dispatch(
         'define_workflow',
         {
-          opId: 'bridge-def-fan',
-          definitionId: 'wf-public-fan',
-          version: 1,
           name: 'public-fan-in',
-          topology: FAN_IN_TOPOLOGY,
-          entryContracts: [],
-          policy: DEFAULT_WORKFLOW_POLICY,
+          nodes: FAN_IN_TOPOLOGY.nodes.map((node) => ({
+            nodeKey: node.nodeId,
+            taskType: 'worker',
+          })),
+          edges: FAN_IN_TOPOLOGY.edges.map((edge) => ({
+            from: edge.fromNodeId,
+            to: edge.toNodeId,
+            as: edge.inputRef,
+          })),
         },
         context,
       );
       expect(defineRouted.ok).toBe(true);
       if (!defineRouted.ok) return;
+      if (defineRouted.command.kind !== 'define_workflow') return;
+      const definitionId = defineRouted.command.definitionId;
+      workflowRefForTranscript = `${definitionId}@1`;
       const defined = await engine.handleToolCall(
         context,
         'define_workflow',
@@ -693,19 +710,15 @@ describe('M018 S02 fan-in NEXT activation', () => {
       );
       expect(defined).toMatchObject({
         ok: true,
-        result: { changed: true, definitionId: 'wf-public-fan' },
+        result: { changed: true, definitionId },
       });
 
       const startRouted = dispatch(
         'start_workflow',
         {
-          opId: 'bridge-start-fan',
-          definitionId: 'wf-public-fan',
-          version: 1,
-          startIdempotencyKey: 'public-fan-start-1',
+          workflow: workflowRefForTranscript,
           goal: 'activate fan-in via bridge',
-          backend: 'grok',
-          entryInputs: [],
+          inputs: [],
         },
         context,
       );

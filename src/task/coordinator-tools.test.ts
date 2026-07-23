@@ -7,7 +7,6 @@ import {
 } from './coordinator-tools';
 import type { CredentialContext } from '../bridge/credentials';
 import { normalizeVerdict } from './verdict';
-import { DEFAULT_WORKFLOW_POLICY } from './workflow';
 import {
   TASK_ERROR_MAX_BYTES,
   TASK_RESULT_MAX_BYTES,
@@ -27,8 +26,12 @@ function ctx(actions: string[]): CredentialContext {
   };
 }
 
+function generatedWorkflowId(hex: string): string {
+  return `workflow-${hex.repeat(32)}`;
+}
+
 describe('coordinator-tools dispatch', () => {
-  it('maps a valid presentation upsert owned by the caller to ToolCommand', () => {
+  it('rejects model-supplied presentation control fields', () => {
     const result = dispatch(
       'upsert_presentation',
       {
@@ -42,25 +45,13 @@ describe('coordinator-tools dispatch', () => {
       ctx(['upsert_presentation']),
     );
 
-    expect(result).toEqual({
-      ok: true,
-      command: {
-        kind: 'upsert_presentation',
-        presentationId: 'release-notes',
-        ownerTaskId: 'task-1',
-        opId: 'op-present-1',
-        revision: 1,
-        title: 'Release notes',
-        markdown: '# Ready',
-      },
-    });
+    expect(result).toEqual({ ok: false, toolError: 'invalid_arguments' });
   });
 
   it('derives presentation control fields from authenticated semantic input', () => {
     const result = dispatch(
       'upsert_presentation',
       {
-        documentKey: 'release-notes',
         title: 'Release notes',
         markdown: '# Ready',
       },
@@ -80,6 +71,26 @@ describe('coordinator-tools dispatch', () => {
       expect(result.command.presentationId).toMatch(/^presentation-[a-f0-9]{32}$/);
       expect(result.command.opId).toMatch(/^auto-[a-f0-9]{32}$/);
       expect(result.command.revision).toBeUndefined();
+      expect(result.command.requireExisting).toBeUndefined();
+
+      const refreshed = dispatch(
+        'upsert_presentation',
+        {
+          presentationRef: result.command.presentationId,
+          title: 'Release notes',
+          markdown: '# Updated',
+        },
+        ctx(['upsert_presentation']),
+      );
+      expect(refreshed).toMatchObject({
+        ok: true,
+        command: {
+          kind: 'upsert_presentation',
+          presentationId: result.command.presentationId,
+          requireExisting: true,
+          markdown: '# Updated',
+        },
+      });
     }
   });
 
@@ -87,10 +98,6 @@ describe('coordinator-tools dispatch', () => {
     const result = dispatch(
       'upsert_presentation',
       {
-        presentationId: 'release-notes',
-        ownerTaskId: 'task-1',
-        opId: 'op-present-1',
-        revision: 1,
         title: 'Release notes',
         markdown: '# Ready',
       },
@@ -106,7 +113,7 @@ describe('coordinator-tools dispatch', () => {
     expect(result).toEqual({ ok: false, toolError: 'invalid_arguments' });
   });
 
-  it('rejects a presentation owner that does not match the credential caller', () => {
+  it('rejects a model-supplied presentation owner', () => {
     const result = dispatch(
       'upsert_presentation',
       {
@@ -120,7 +127,7 @@ describe('coordinator-tools dispatch', () => {
       ctx(['upsert_presentation']),
     );
 
-    expect(result).toEqual({ ok: false, toolError: 'owner_mismatch' });
+    expect(result).toEqual({ ok: false, toolError: 'invalid_arguments' });
   });
 
   it.each([
@@ -135,10 +142,6 @@ describe('coordinator-tools dispatch', () => {
     const result = dispatch(
       'upsert_presentation',
       {
-        presentationId: 'release-notes',
-        ownerTaskId: 'task-1',
-        opId: 'op-present-1',
-        revision: 1,
         title: 'Release notes',
         markdown: '# Ready',
         ...override,
@@ -150,19 +153,13 @@ describe('coordinator-tools dispatch', () => {
   });
 
   it.each([
-    ['presentation ID', { presentationId: `p${'x'.repeat(PRESENTATION_ID_MAX_LENGTH)}` }],
-    ['owner task ID', { ownerTaskId: `t${'x'.repeat(PRESENTATION_ID_MAX_LENGTH)}` }],
-    ['operation ID', { opId: `o${'x'.repeat(PRESENTATION_ID_MAX_LENGTH)}` }],
+    ['presentation ref', { presentationRef: `p${'x'.repeat(PRESENTATION_ID_MAX_LENGTH)}` }],
     ['title', { title: 'x'.repeat(PRESENTATION_TITLE_MAX_LENGTH + 1) }],
     ['Markdown', { markdown: 'x'.repeat(PRESENTATION_MARKDOWN_MAX_LENGTH + 1) }],
   ])('rejects an oversized presentation %s without reflecting content', (_label, override) => {
     const result = dispatch(
       'upsert_presentation',
       {
-        presentationId: 'release-notes',
-        ownerTaskId: 'task-1',
-        opId: 'op-present-1',
-        revision: 1,
         title: 'Release notes',
         markdown: '# Ready',
         ...override,
@@ -311,7 +308,7 @@ describe('coordinator-tools dispatch', () => {
     expect(result).toEqual({ ok: false, toolError: 'opId is required' });
   });
 
-  it('maps define_workflow and start_workflow to ToolCommands and rejects malformed payloads', () => {
+  it('rejects model-supplied workflow control fields', () => {
     const topology = {
       kind: 'one_node_v1',
       entryNodeId: 'entry',
@@ -326,22 +323,12 @@ describe('coordinator-tools dispatch', () => {
         name: 'one-node',
         topology,
         entryContracts: [],
-        policy: DEFAULT_WORKFLOW_POLICY,
       },
       ctx(['define_workflow']),
     );
     expect(defined).toEqual({
-      ok: true,
-      command: {
-        kind: 'define_workflow',
-        opId: 'op-def-1',
-        definitionId: 'wf-one',
-        version: 1,
-        name: 'one-node',
-        topology,
-        entryContracts: [],
-        policy: DEFAULT_WORKFLOW_POLICY,
-      },
+      ok: false,
+      toolError: 'invalid define_workflow arguments',
     });
 
     const started = dispatch(
@@ -358,17 +345,8 @@ describe('coordinator-tools dispatch', () => {
       ctx(['start_workflow']),
     );
     expect(started).toEqual({
-      ok: true,
-      command: {
-        kind: 'start_workflow',
-        opId: 'op-start-1',
-        definitionId: 'wf-one',
-        version: 1,
-        startIdempotencyKey: 'idem-1',
-        goal: 'run one-node',
-        backend: 'grok',
-        entryInputs: [],
-      },
+      ok: false,
+      toolError: 'invalid start_workflow arguments',
     });
 
     const unauthorized = dispatch(
@@ -416,7 +394,6 @@ describe('coordinator-tools dispatch', () => {
     const defined = dispatch(
       'define_workflow',
       {
-        workflowKey: 'review-flow',
         name: 'Review flow',
         nodes: [
           { nodeKey: 'research', taskType: 'research' },
@@ -431,7 +408,7 @@ describe('coordinator-tools dispatch', () => {
       ok: true,
       command: {
         kind: 'define_workflow',
-        definitionId: 'review-flow',
+        definitionId: expect.stringMatching(/^workflow-[a-f0-9]{32}$/),
         name: 'Review flow',
         topology: {
           kind: 'graph_v1',
@@ -459,13 +436,15 @@ describe('coordinator-tools dispatch', () => {
       expect(defined.command.opId).toMatch(/^auto-/);
     }
 
+    const workflowRef = defined.ok && defined.command.kind === 'define_workflow'
+      ? `${defined.command.definitionId}@3`
+      : 'invalid@3';
     const started = dispatch(
       'start_workflow',
       {
-        workflow: 'review-flow@3',
+        workflow: workflowRef,
         goal: 'Review the subsystem',
         inputs: [{ node: 'research', input: 'request', value: 'Inspect routing' }],
-        instanceKey: 'primary',
       },
       ctx(['start_workflow']),
     );
@@ -473,7 +452,9 @@ describe('coordinator-tools dispatch', () => {
       ok: true,
       command: {
         kind: 'start_workflow',
-        definitionId: 'review-flow',
+        definitionId: defined.ok && defined.command.kind === 'define_workflow'
+          ? defined.command.definitionId
+          : 'invalid',
         version: 3,
         goal: 'Review the subsystem',
         entryInputs: [{
@@ -486,60 +467,101 @@ describe('coordinator-tools dispatch', () => {
     });
   });
 
-  it('uses instance and call keys to separate operation slots within one turn', () => {
+  it('generates stable workflow identity from semantic content', () => {
+    const first = dispatch(
+      'define_workflow',
+      {
+        name: 'Review flow',
+        nodes: [{ nodeKey: 'review', taskType: 'verify', label: 'Review the change.' }],
+      },
+      ctx(['define_workflow']),
+    );
+    const reordered = dispatch(
+      'define_workflow',
+      {
+        nodes: [{ label: 'Review the change.', taskType: 'verify', nodeKey: 'review' }],
+        name: 'Review flow',
+      },
+      ctx(['define_workflow']),
+    );
+    const changed = dispatch(
+      'define_workflow',
+      {
+        name: 'Review flow',
+        nodes: [{ nodeKey: 'review', taskType: 'verify', label: 'Review tests too.' }],
+      },
+      ctx(['define_workflow']),
+    );
+
+    expect(first.ok && reordered.ok && changed.ok).toBe(true);
+    if (
+      first.ok && reordered.ok && changed.ok &&
+      first.command.kind === 'define_workflow' &&
+      reordered.command.kind === 'define_workflow' &&
+      changed.command.kind === 'define_workflow'
+    ) {
+      expect(first.command.definitionId).toMatch(/^workflow-[a-f0-9]{32}$/);
+      expect(reordered.command.definitionId).toBe(first.command.definitionId);
+      expect(reordered.command.opId).toBe(first.command.opId);
+      expect(changed.command.definitionId).not.toBe(first.command.definitionId);
+      expect(changed.command.opId).not.toBe(first.command.opId);
+    }
+  });
+
+  it('derives operation slots from semantic call content within one turn', () => {
+    const reviewRef = `${generatedWorkflowId('1')}@1`;
+    const auditRef = `${generatedWorkflowId('2')}@1`;
+    const deepReviewRef = `${generatedWorkflowId('3')}@1`;
+    const quickReviewRef = `${generatedWorkflowId('4')}@1`;
     const firstStart = dispatch(
       'start_workflow',
-      { workflow: 'review-flow', instanceKey: 'primary' },
+      { workflow: reviewRef },
       ctx(['start_workflow']),
     );
     const replayedStart = dispatch(
       'start_workflow',
-      { workflow: 'review-flow', instanceKey: 'primary' },
+      { workflow: reviewRef },
       ctx(['start_workflow']),
     );
     const secondStart = dispatch(
       'start_workflow',
-      { workflow: 'review-flow', instanceKey: 'secondary' },
+      { workflow: reviewRef, goal: 'Second run' },
       ctx(['start_workflow']),
     );
     const otherWorkflowStart = dispatch(
       'start_workflow',
-      { workflow: 'audit-flow', instanceKey: 'primary' },
+      { workflow: auditRef },
       ctx(['start_workflow']),
     );
     const firstChild = dispatch(
       'invoke_child_workflow',
       {
-        workflow: 'deep-review',
+        workflow: deepReviewRef,
         bindings: [{ toNode: 'entry', input: 'request', fromInput: 'implementation' }],
-        callKey: 'security',
       },
       ctx(['invoke_child_workflow']),
     );
     const replayedChild = dispatch(
       'invoke_child_workflow',
       {
-        workflow: 'deep-review',
+        workflow: deepReviewRef,
         bindings: [{ toNode: 'entry', input: 'request', fromInput: 'implementation' }],
-        callKey: 'security',
       },
       ctx(['invoke_child_workflow']),
     );
     const secondChild = dispatch(
       'invoke_child_workflow',
       {
-        workflow: 'deep-review',
-        bindings: [{ toNode: 'entry', input: 'request', fromInput: 'implementation' }],
-        callKey: 'performance',
+        workflow: deepReviewRef,
+        bindings: [{ toNode: 'entry', input: 'request', fromInput: 'testReport' }],
       },
       ctx(['invoke_child_workflow']),
     );
     const otherWorkflowChild = dispatch(
       'invoke_child_workflow',
       {
-        workflow: 'quick-review',
+        workflow: quickReviewRef,
         bindings: [{ toNode: 'entry', input: 'request', fromInput: 'implementation' }],
-        callKey: 'security',
       },
       ctx(['invoke_child_workflow']),
     );
@@ -574,6 +596,36 @@ describe('coordinator-tools dispatch', () => {
       expect(firstChild.command.opId).not.toBe(secondChild.command.opId);
       expect(firstChild.command.opId).not.toBe(otherWorkflowChild.command.opId);
     }
+  });
+
+  it('requires generated version-pinned workflow references', () => {
+    const definitionId = generatedWorkflowId('a');
+    expect(dispatch(
+      'start_workflow',
+      { workflow: definitionId },
+      ctx(['start_workflow']),
+    )).toEqual({ ok: false, toolError: 'invalid start_workflow arguments' });
+    expect(dispatch(
+      'start_workflow',
+      { workflow: 'caller-chosen@1' },
+      ctx(['start_workflow']),
+    )).toEqual({ ok: false, toolError: 'invalid start_workflow arguments' });
+    expect(dispatch(
+      'invoke_child_workflow',
+      {
+        workflow: definitionId,
+        bindings: [{ toNode: 'entry', input: 'request', fromInput: 'implementation' }],
+      },
+      ctx(['invoke_child_workflow']),
+    )).toEqual({ ok: false, toolError: 'invalid invoke_child_workflow arguments' });
+    expect(dispatch(
+      'invoke_child_workflow',
+      {
+        workflow: 'caller-chosen@1',
+        bindings: [{ toNode: 'entry', input: 'request', fromInput: 'implementation' }],
+      },
+      ctx(['invoke_child_workflow']),
+    )).toEqual({ ok: false, toolError: 'invalid invoke_child_workflow arguments' });
   });
 
   it('rejects action outside allowedActions', () => {
@@ -1264,7 +1316,6 @@ describe('workflow_next tool surface', () => {
     const result = dispatch(
       'define_workflow',
       {
-        workflowKey: 'large-objective',
         name: 'Large objective',
         nodes: [{ nodeKey: 'inspect', taskType: 'explore', label }],
       },
@@ -1395,7 +1446,7 @@ describe('workflow_next tool surface', () => {
     ).toEqual({ ok: false, toolError: 'action not permitted: workflow_fail' });
   });
 
-  it('maps child workflow bindings with exact entry and artifact revision identity', () => {
+  it('rejects model-supplied child artifact coordinates', () => {
     const binding = {
       childEntryNodeId: 'entry-a',
       inputRef: 'request',
@@ -1412,38 +1463,18 @@ describe('workflow_next tool surface', () => {
       },
       ctx(['invoke_child_workflow']),
     )).toEqual({
-      ok: true,
-      command: {
-        kind: 'invoke_child_workflow',
-        opId: 'op-child',
-        childDefinitionId: 'wf-child',
-        childDefinitionVersion: 2,
-        entryBindings: [binding],
-      },
-    });
-    expect(dispatch(
-      'invoke_child_workflow',
-      {
-        opId: 'op-child-invalid',
-        childDefinitionId: 'wf-child',
-        childDefinitionVersion: 2,
-        entryBindings: [{ ...binding, artifactRevision: 0 }],
-      },
-      ctx(['invoke_child_workflow']),
-    )).toEqual({
       ok: false,
-      toolError:
-        'each entryBinding requires childEntryNodeId, inputRef, artifactId, and a positive artifactRevision',
+      toolError: 'invalid invoke_child_workflow arguments',
     });
   });
 
   it('maps semantic child workflow bindings without artifact coordinates', () => {
+    const definitionId = generatedWorkflowId('d');
     const result = dispatch(
       'invoke_child_workflow',
       {
-        workflow: 'deep-review',
+        workflow: `${definitionId}@2`,
         bindings: [{ toNode: 'entry', input: 'request', fromInput: 'implementation' }],
-        callKey: 'security',
       },
       ctx(['invoke_child_workflow']),
     );
@@ -1451,7 +1482,8 @@ describe('workflow_next tool surface', () => {
       ok: true,
       command: {
         kind: 'invoke_child_workflow',
-        childDefinitionId: 'deep-review',
+        childDefinitionId: definitionId,
+        childDefinitionVersion: 2,
         semanticEntryBindings: [{
           childEntryNodeId: 'entry',
           inputRef: 'request',
@@ -1460,9 +1492,21 @@ describe('workflow_next tool surface', () => {
       },
     });
     if (result.ok && result.command.kind === 'invoke_child_workflow') {
-      expect(result.command.childDefinitionVersion).toBeUndefined();
-      expect(result.command.childIdempotencyKey).toMatch(/^call-/);
+      expect(result.command.childDefinitionVersion).toBe(2);
+      expect(result.command.childIdempotencyKey).toMatch(/^turn-/);
       expect(result.command.opId).toMatch(/^auto-/);
     }
+    expect(dispatch(
+      'invoke_child_workflow',
+      {
+        workflow: `${definitionId}@2`,
+        bindings: [{ toNode: 'entry', input: 'request', fromInput: 'implementation' }],
+        callKey: 'model-supplied-key',
+      },
+      ctx(['invoke_child_workflow']),
+    )).toEqual({
+      ok: false,
+      toolError: 'invalid invoke_child_workflow arguments',
+    });
   });
 });

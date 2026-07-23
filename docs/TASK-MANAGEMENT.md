@@ -768,9 +768,12 @@ Explicit dispositions always win. The route is durable and idempotent; routing
 commits only when the adapter turn settles successfully.
 Agents never supply operation, numeric definition version, run, activation, gate,
 round, artifact-lineage, continuation, owner, or presentation-revision identities to
-mutation tools. A returned opaque `workflowRef` may pin an immutable definition. The
-read-only `inspect_workflow_run` accepts a `runRef` previously returned by an
-authorized workflow start or route.
+mutation tools. A returned opaque `workflowRef` always pins an immutable definition
+revision; bare IDs are invalid. The engine derives that ref from normalized semantic
+content; agents do not name workflow storage keys. A returned `presentationRef` may
+refresh only an existing document owned by the authenticated caller. The read-only
+`inspect_workflow_run` accepts a `runRef` previously returned by an authorized workflow
+start or route.
 
 `define_workflow`, `start_workflow`, run inspection, context reads, and presentation
 updates are not competing dispositions. Child-workflow invocation is represented as
@@ -1775,14 +1778,14 @@ The engine validates before release:
 - v1 allows at most one direct dependency/input reference from a given source task
   to a given consumer;
 - every task belongs to exactly one workflow run and has zero or one outgoing routing
-  edge: the unique terminal has none and every non-terminal task has exactly one;
+  edge: every terminal sink has none and every non-terminal task has exactly one;
 - each routing edge maps to exactly one matching destination dependency declaration,
   and every non-entry dependency declaration has exactly one source routing edge;
 - missing, duplicate, conflicting, or ambiguous route-to-gate mappings are rejected;
 - dependency edges are acyclic;
 - routing targets are valid;
-- caller input contracts for every entry are defined and exactly one terminal task
-  exists;
+- caller input contracts for every entry are defined and at least one terminal sink
+  task exists;
 - session ownership, task depth/count, capabilities, and resource bounds hold.
 
 Feedback creates bounded backward control flow over the otherwise acyclic dependency
@@ -2126,10 +2129,12 @@ create and enter one child workflow, then be resumed when that child returns. V1
 workflow graph. General nested graph nodes with their own incoming/outgoing edges are
 a future versioned extension.
 
-Every workflow definition has exactly one terminal task. The caller stages `NEXT` with
-a child-workflow invocation route as its mutually exclusive workflow disposition for
-the current turn. The invocation explicitly maps caller artifacts into child entry
-inputs and creates a one-result return gate for the caller:
+Every workflow definition has one or more terminal sink tasks. A child workflow returns
+only after every terminal sink succeeds; the engine combines their reports in frozen
+topology order and sends that single result through the caller's return gate. The caller
+stages `NEXT` with a child-workflow invocation route as its mutually exclusive workflow
+disposition for the current turn. The invocation explicitly maps caller artifacts into
+child entry inputs and creates a one-result return gate for the caller:
 
 ```ts
 interface ChildWorkflowInvocationV1 {
@@ -2175,9 +2180,9 @@ their own direct dependencies. A child entry task with no dependency that emits 
 fails the child workflow under §20.11. Thus multiple child entry sessions can never
 become competing feedback authorities for the caller session.
 
-- The unique terminal task's committed `NEXT` atomically resolves the continuation,
-  contributes its artifact to the return gate, closes that one-result gate, and inserts
-  one aggregate return message plus one queued caller turn.
+- The final terminal sink's committed `NEXT` atomically resolves the continuation,
+  combines every terminal artifact in topology order, closes that one-result gate, and
+  inserts one aggregate return message plus one queued caller turn.
 - The caller resumes only from that aggregate return message. If it belongs to another
   workflow, it may then emit its own `NEXT` or `PREV` through that workflow normally.
 - Entry-boundary `PREV` never bubbles to the caller in v1; §20.11 fail-fast handling

@@ -14,6 +14,7 @@ const REQUEST_KEYS = new Set([
   'ownerTaskId',
   'opId',
   'revision',
+  'requireExisting',
   'title',
   'markdown',
   'kind',
@@ -34,6 +35,7 @@ export interface PresentationUpsertRequest {
   ownerTaskId: string;
   opId: string;
   revision?: number;
+  requireExisting?: boolean;
   title: string;
   markdown: string;
   kind?: PresentationKind;
@@ -184,6 +186,7 @@ function validateRequest(request: PresentationUpsertRequest): PresentationResult
     (request.revision !== undefined && (
       !Number.isSafeInteger(request.revision) || request.revision <= 0
     )) ||
+    (request.requireExisting !== undefined && typeof request.requireExisting !== 'boolean') ||
     typeof request.title !== 'string' ||
     request.title.length === 0 ||
     typeof request.markdown !== 'string' ||
@@ -363,16 +366,21 @@ export class PresentationManager {
 
     if (!this.documentStore) return { ok: false, code: 'host_delivery_failed' };
     let revision = request.revision;
-    if (revision === undefined) {
-      let stored: PresentationDocument | undefined;
+    let stored: PresentationDocument | undefined;
+    if (request.requireExisting === true || revision === undefined) {
       try {
         stored = await this.documentStore.getPresentation(context.rootId, request.presentationId);
       } catch {
         return { ok: false, code: 'host_delivery_failed' };
       }
+      if (request.requireExisting === true && !stored) {
+        return { ok: false, code: 'invalid_arguments' };
+      }
       if (stored?.ownerTaskId !== undefined && stored.ownerTaskId !== request.ownerTaskId) {
         return { ok: false, code: 'owner_mismatch' };
       }
+    }
+    if (revision === undefined) {
       if (
         stored &&
         stored.title === request.title &&

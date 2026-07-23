@@ -216,13 +216,18 @@ export function entryNodeIds(topology: WorkflowTopologyV1): string[] {
   return topology.nodes.map((n) => n.nodeId).filter((id) => !incoming.has(id));
 }
 
-/** Sole terminal node id (out-degree 0). Throws if topology is invalid (should not after decode). */
-export function terminalNodeId(topology: WorkflowTopologyV1): string {
+/** Terminal sink node ids (out-degree 0), in frozen topology order. */
+export function terminalNodeIds(topology: WorkflowTopologyV1): string[] {
   if (topology.kind === 'one_node_v1') {
-    return topology.entryNodeId;
+    return [topology.entryNodeId];
   }
   const outgoing = new Set(topology.edges.map((e) => e.fromNodeId));
-  const terminals = topology.nodes.map((n) => n.nodeId).filter((id) => !outgoing.has(id));
+  return topology.nodes.map((n) => n.nodeId).filter((id) => !outgoing.has(id));
+}
+
+/** Return the sole terminal for callers that explicitly require a single-sink topology. */
+export function terminalNodeId(topology: WorkflowTopologyV1): string {
+  const terminals = terminalNodeIds(topology);
   if (terminals.length !== 1) {
     throw new Error(`expected exactly one terminal, found ${terminals.length}`);
   }
@@ -416,6 +421,11 @@ export function deriveNodeActivationIdentities(
 /** Producer artifact identity for NEXT contributions (one logical artifact per producer node). */
 export function deriveProducerArtifactId(runId: string, producerNodeId: string): string {
   return stableId('wfa', `${runId}\0artifact\0${producerNodeId}`);
+}
+
+/** Aggregate artifact identity for a run completed by multiple terminal sinks. */
+export function deriveTerminalAggregateArtifactId(runId: string): string {
+  return stableId('wfa', `${runId}\0terminal_aggregate`);
 }
 
 /**

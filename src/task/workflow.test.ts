@@ -37,6 +37,7 @@ import {
   makeGraphFanInDefinition,
   makeOneNodeDefinition,
   maximumWorkflowEntryAggregateBytes,
+  terminalNodeIds,
   terminalNodeId,
   validateDefineWorkflow,
 } from './workflow';
@@ -165,7 +166,7 @@ describe('workflow domain (graph_v1 multi-node topology)', () => {
     expect(again.ok && again.fingerprint).not.toBe(validated.fingerprint);
   });
 
-  it('rejects fan-out, cycles, duplicate inputRef, missing route-to-gate, and terminal count', () => {
+  it('rejects fan-out, cycles, duplicate inputRef, missing route-to-gate, and zero terminals', () => {
     const baseNodes = [
       { nodeId: 'p1' },
       { nodeId: 'p2' },
@@ -232,17 +233,19 @@ describe('workflow domain (graph_v1 multi-node topology)', () => {
     });
     expect(zeroTerminal.ok).toBe(false);
 
-    // Multiple terminals: two nodes with no outgoing route.
+    // Multiple terminals: independent paths may end at separate sink nodes.
     const multiTerminal = decodeGraphTopology({
       kind: 'graph_v1',
-      nodes: baseNodes,
+      nodes: [...baseNodes, { nodeId: 'c2' }],
       edges: [
         { fromNodeId: 'p1', toNodeId: 'consumer', inputRef: 'a' },
-        // p2 has no outgoing → second terminal alongside consumer
+        { fromNodeId: 'p2', toNodeId: 'c2', inputRef: 'b' },
       ],
     });
-    expect(multiTerminal.ok).toBe(false);
-    if (!multiTerminal.ok) expect(multiTerminal.reason).toMatch(/terminal/i);
+    expect(multiTerminal.ok).toBe(true);
+    if (multiTerminal.ok) {
+      expect(terminalNodeIds(multiTerminal.topology)).toEqual(['consumer', 'c2']);
+    }
 
     // Unknown edge endpoint.
     const unknown = decodeGraphTopology({

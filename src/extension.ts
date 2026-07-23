@@ -36,6 +36,7 @@ import {
   projectWorkspacePatches,
 } from './host/workspace-patch';
 import { WorkspaceRevisionPoller } from './host/workspace-revision-poller';
+import { LatestFocusTransition } from './host/focus-transition';
 import {
   reconcileExternalWorkspaceChanges,
   reconcileInterleavedLocalCommit,
@@ -461,6 +462,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   private availableModelsPromise?: Promise<Record<string, BackendModels>>;
   /** Discards stale async repository snapshots when focus/commits race. */
   private snapshotGeneration = 0;
+  private readonly focusTransitions = new LatestFocusTransition();
   focusedTaskId?: string;
   /**
    * Host mirror of focused transcript entity IDs (bootstrap page + older pages +
@@ -1137,17 +1139,23 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
    * post a bounded snapshot. Shared by protocol handlers and presentation links.
    */
   private async transitionFocus(nextFocus: string | undefined): Promise<void> {
+    this.snapshotGeneration += 1;
     const previous = this.focusedTaskId;
-    if (previous && previous !== nextFocus && taskEngine) {
-      try {
-        await taskEngine.flushPendingTranscriptForTask(previous);
-      } catch {
-        // Best-effort durable flush before handoff.
-      }
-    }
-    this.focusedTaskId = nextFocus;
-    this.knownTranscriptIds.clear();
-    await this.hydrateSnapshotAndResumePolling(nextFocus);
+    await this.focusTransitions.run(
+      async () => {
+        if (!previous || previous === nextFocus || !taskEngine) return;
+        try {
+          await taskEngine.flushPendingTranscriptForTask(previous);
+        } catch {
+          // Best-effort durable flush before handoff.
+        }
+      },
+      async () => {
+        this.focusedTaskId = nextFocus;
+        this.knownTranscriptIds.clear();
+        await this.hydrateSnapshotAndResumePolling(nextFocus);
+      },
+    );
   }
 
   postSnapshot(focusedTaskId?: string, retryAttempt = 0): void {

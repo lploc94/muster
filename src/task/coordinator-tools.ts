@@ -98,13 +98,11 @@ export const BATCH_EXPAND_MAX = 16;
 export const PRESENTATION_ID_MAX_LENGTH = 128;
 export const PRESENTATION_TITLE_MAX_LENGTH = 200;
 export const PRESENTATION_MARKDOWN_MAX_LENGTH = PRESENTATION_MARKDOWN_MAX_CHARS;
+export const PRESENTATION_REF_PATTERN = '^presentation-[a-f0-9]{32}$';
+export const WORKFLOW_REF_PATTERN = '^(workflow-[a-f0-9]{32})@([1-9][0-9]*)$';
 
 const PRESENTATION_KEYS = new Set([
-  'documentKey',
-  'presentationId',
-  'ownerTaskId',
-  'opId',
-  'revision',
+  'presentationRef',
   'title',
   'markdown',
   'kind',
@@ -115,6 +113,8 @@ const PRESENTATION_KIND_VALUES = new Set(['plan', 'spec', 'document']);
 const PRESENTATION_SUMMARY_MAX_LENGTH = 600;
 const PRESENTATION_CHANGE_SUMMARY_MAX_LENGTH = 1000;
 const STABLE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+const PRESENTATION_REF_REGEX = new RegExp(PRESENTATION_REF_PATTERN);
+const WORKFLOW_REF_REGEX = new RegExp(WORKFLOW_REF_PATTERN);
 
 export type ToolCommand =
   | { kind: 'create_task'; opId: string; spec: CreateChildSpec }
@@ -218,6 +218,7 @@ export type ToolCommand =
       ownerTaskId: string;
       opId: string;
       revision?: number;
+      requireExisting?: true;
       title: string;
       markdown: string;
       presentationKind?: 'plan' | 'spec' | 'document';
@@ -311,110 +312,6 @@ function toolActionForName(name: string): ToolAction | undefined {
   return actions.find((a) => a === name);
 }
 
-/** Light MCP topology shape check; domain validateDefineWorkflow is authoritative. */
-function parseWorkflowNode(value: unknown): boolean {
-  if (!isRecord(value) || typeof value.nodeId !== 'string' || value.nodeId.length === 0) {
-    return false;
-  }
-  if (value.label !== undefined && typeof value.label !== 'string') return false;
-  if (value.role !== undefined && value.role !== 'coordinator' && value.role !== 'worker') {
-    return false;
-  }
-  for (const key of ['taskType', 'backend', 'model'] as const) {
-    if (value[key] !== undefined && (typeof value[key] !== 'string' || value[key].length === 0)) {
-      return false;
-    }
-  }
-  if (
-    value.capabilities !== undefined &&
-    (!Array.isArray(value.capabilities) || value.capabilities.some((capability) => typeof capability !== 'string'))
-  ) {
-    return false;
-  }
-  return true;
-}
-
-function parseOneNodeTopology(value: unknown): unknown | undefined {
-  if (!isRecord(value)) return undefined;
-  if (value.kind !== 'one_node_v1') return undefined;
-  if (typeof value.entryNodeId !== 'string' || value.entryNodeId.length === 0) return undefined;
-  if (!Array.isArray(value.nodes) || value.nodes.length !== 1) return undefined;
-  if (!parseWorkflowNode(value.nodes[0])) return undefined;
-  return value;
-}
-
-/** Light MCP graph_v1 shape check; domain validateDefineWorkflow is authoritative. */
-function parseGraphTopology(value: unknown): unknown | undefined {
-  if (!isRecord(value)) return undefined;
-  if (value.kind !== 'graph_v1') return undefined;
-  if (!Array.isArray(value.nodes) || value.nodes.length < 2) return undefined;
-  if (!Array.isArray(value.edges) || value.edges.length === 0) return undefined;
-  for (const node of value.nodes) {
-    if (!parseWorkflowNode(node)) return undefined;
-  }
-  for (const edge of value.edges) {
-    if (!isRecord(edge)) return undefined;
-    if (typeof edge.fromNodeId !== 'string' || edge.fromNodeId.length === 0) return undefined;
-    if (typeof edge.toNodeId !== 'string' || edge.toNodeId.length === 0) return undefined;
-    if (typeof edge.inputRef !== 'string' || edge.inputRef.length === 0) return undefined;
-  }
-  return value;
-}
-
-function parseDefineTopology(value: unknown): unknown | undefined {
-  if (!isRecord(value)) return undefined;
-  if (value.kind === 'one_node_v1') return parseOneNodeTopology(value);
-  if (value.kind === 'graph_v1') return parseGraphTopology(value);
-  return undefined;
-}
-
-function parseWorkflowEntryContracts(value: unknown): WorkflowEntryContractV1[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const contracts: WorkflowEntryContractV1[] = [];
-  for (const item of value) {
-    if (!isRecord(item)) return undefined;
-    const entryNodeId = requireString(item, 'entryNodeId');
-    const inputRef = requireString(item, 'inputRef');
-    const expectedArtifactKind = requireString(item, 'expectedArtifactKind');
-    if (!entryNodeId || !inputRef || !expectedArtifactKind) return undefined;
-    contracts.push({ entryNodeId, inputRef, expectedArtifactKind });
-  }
-  return contracts;
-}
-
-function parseWorkflowPolicy(value: unknown): WorkflowPolicyV1 | undefined {
-  if (!isRecord(value)) return undefined;
-  const numericKeys = [
-    'maxFeedbackRoundsPerRun',
-    'maxTurnsPerTask',
-    'maxWorkflowTurnsPerRun',
-    'runTimeoutMs',
-    'maxDepth',
-    'maxTaskCount',
-    'maxConcurrency',
-    'maxInputsPerGate',
-    'maxArtifactBytes',
-    'maxAggregateBytes',
-  ] as const;
-  if (numericKeys.some((key) => !Number.isSafeInteger(value[key]))) return undefined;
-  if (typeof value.failWorkflow !== 'boolean') return undefined;
-  return value as unknown as WorkflowPolicyV1;
-}
-
-function parseWorkflowEntryInputs(value: unknown): StartWorkflowEntryInput[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const inputs: StartWorkflowEntryInput[] = [];
-  for (const item of value) {
-    if (!isRecord(item)) return undefined;
-    const entryNodeId = requireString(item, 'entryNodeId');
-    const inputRef = requireString(item, 'inputRef');
-    const kind = requireString(item, 'kind');
-    if (!entryNodeId || !inputRef || !kind || typeof item.value !== 'string') return undefined;
-    inputs.push({ entryNodeId, inputRef, kind, value: item.value });
-  }
-  return inputs;
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -428,6 +325,17 @@ function stableHash(...parts: string[]): string {
   return createHash('sha256').update(parts.join('\0'), 'utf8').digest('hex').slice(0, 32);
 }
 
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (isRecord(value)) {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
 function derivedOperationId(
   ctx: CredentialContext,
   slot: string,
@@ -436,27 +344,24 @@ function derivedOperationId(
   return `auto-${stableHash(ctx.rootId, ctx.callerTaskId, ctx.turnId, slot, semanticKey)}`;
 }
 
-function parseWorkflowReference(value: unknown): { definitionId: string; version?: number } | undefined {
+function parseWorkflowReference(value: unknown): { definitionId: string; version: number } | undefined {
   if (typeof value !== 'string' || value.length === 0) return undefined;
-  const match = /^(.*)@([1-9][0-9]*)$/.exec(value);
-  const definitionId = match?.[1] ?? value;
-  if (!isStablePresentationId(definitionId)) return undefined;
-  if (!match) return { definitionId };
+  const match = WORKFLOW_REF_REGEX.exec(value);
+  if (!match) return undefined;
+  const definitionId = match[1]!;
   const version = Number(match[2]);
   return Number.isSafeInteger(version) ? { definitionId, version } : undefined;
 }
 
 function parseSemanticWorkflowDefinition(args: Record<string, unknown>): {
-  definitionId: string;
   name: string;
   topology: unknown;
   entryContracts: WorkflowEntryContractV1[];
 } | undefined {
-  const allowed = new Set(['workflowKey', 'name', 'nodes', 'edges', 'inputs']);
+  const allowed = new Set(['name', 'nodes', 'edges', 'inputs']);
   if (Object.keys(args).some((key) => !allowed.has(key))) return undefined;
-  const definitionId = requireString(args, 'workflowKey');
   const name = requireString(args, 'name');
-  if (!definitionId || !isStablePresentationId(definitionId) || !name) return undefined;
+  if (!name) return undefined;
   if (
     !Array.isArray(args.nodes) ||
     args.nodes.length === 0 ||
@@ -549,7 +454,7 @@ function parseSemanticWorkflowDefinition(args: Record<string, unknown>): {
   const topology = nodes.length === 1
     ? { kind: 'one_node_v1', entryNodeId: nodes[0]!.nodeId, nodes }
     : { kind: 'graph_v1', nodes, edges };
-  return { definitionId, name, topology, entryContracts };
+  return { name, topology, entryContracts };
 }
 
 function parseSemanticWorkflowInputs(value: unknown): StartWorkflowEntryInput[] | undefined {
@@ -608,16 +513,9 @@ function isStablePresentationId(value: string | undefined): value is string {
   return value !== undefined && value.length <= PRESENTATION_ID_MAX_LENGTH && STABLE_ID_PATTERN.test(value);
 }
 
-function isPositiveSafeInt(value: unknown): value is number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
-}
-
 function isPresentationPayloadTooLarge(args: Record<string, unknown>): boolean {
   return (
-    (typeof args.documentKey === 'string' && args.documentKey.length > PRESENTATION_ID_MAX_LENGTH) ||
-    (typeof args.presentationId === 'string' && args.presentationId.length > PRESENTATION_ID_MAX_LENGTH) ||
-    (typeof args.ownerTaskId === 'string' && args.ownerTaskId.length > PRESENTATION_ID_MAX_LENGTH) ||
-    (typeof args.opId === 'string' && args.opId.length > PRESENTATION_ID_MAX_LENGTH) ||
+    (typeof args.presentationRef === 'string' && args.presentationRef.length > PRESENTATION_ID_MAX_LENGTH) ||
     (typeof args.title === 'string' && args.title.length > PRESENTATION_TITLE_MAX_LENGTH) ||
     (typeof args.markdown === 'string' && args.markdown.length > PRESENTATION_MARKDOWN_MAX_LENGTH) ||
     (typeof args.summary === 'string' && args.summary.length > PRESENTATION_SUMMARY_MAX_LENGTH) ||
@@ -991,19 +889,12 @@ export function dispatch(
         toolError: tool === 'upsert_presentation' ? 'invalid_arguments' : 'opId must be a non-empty string',
       };
     }
-    const semanticKey = tool === 'start_workflow'
-      ? `${requireString(args, 'workflow') ?? requireString(args, 'definitionId') ?? 'default'}\0${
-        requireString(args, 'instanceKey') ?? requireString(args, 'startIdempotencyKey') ?? 'default'
-      }`
-      : tool === 'invoke_child_workflow'
-        ? `${requireString(args, 'workflow') ?? requireString(args, 'childDefinitionId') ?? 'default'}\0${
-          requireString(args, 'callKey') ?? requireString(args, 'childIdempotencyKey') ?? 'default'
-        }`
-        : requireString(args, 'documentKey') ??
-          requireString(args, 'presentationId') ??
-          requireString(args, 'workflowKey') ??
-          requireString(args, 'definitionId') ??
-          'default';
+    const semanticKey = tool === 'define_workflow' ||
+      tool === 'start_workflow' ||
+      tool === 'invoke_child_workflow' ||
+      tool === 'upsert_presentation'
+      ? stableHash(canonicalJson(args))
+      : requireString(args, 'definitionId') ?? 'default';
     const slot = tool === 'workflow_next' || tool === 'workflow_prev' || tool === 'workflow_fail'
       ? 'workflow_disposition'
       : tool;
@@ -1341,14 +1232,12 @@ export function dispatch(
       }
       case 'invoke_child_workflow': {
         const semanticReference = parseWorkflowReference(args.workflow);
-        const childDefinitionId = semanticReference?.definitionId ?? requireString(args, 'childDefinitionId');
-        const childDefinitionVersion = semanticReference?.version ?? (
-          isPositiveSafeInt(args.childDefinitionVersion) ? args.childDefinitionVersion : undefined
-        );
-        if (!childDefinitionId) return { ok: false, toolError: 'workflow is required' };
-        if (args.workflow === undefined && childDefinitionVersion === undefined) {
-          return { ok: false, toolError: 'childDefinitionVersion must be a positive integer' };
-        }
+        if (
+          !semanticReference ||
+          Object.keys(args).some((key) => !['workflow', 'bindings'].includes(key))
+        ) return { ok: false, toolError: 'invalid invoke_child_workflow arguments' };
+        const childDefinitionId = semanticReference.definitionId;
+        const childDefinitionVersion = semanticReference.version;
 
         if (Array.isArray(args.bindings)) {
           if (
@@ -1381,10 +1270,6 @@ export function dispatch(
             seenRefs.add(bindingKey);
             semanticEntryBindings.push({ childEntryNodeId, inputRef, fromInputRef });
           }
-          const callKey = args.callKey;
-          if (callKey !== undefined && (typeof callKey !== 'string' || callKey.length === 0)) {
-            return { ok: false, toolError: 'callKey must be a non-empty string when provided' };
-          }
           return {
             ok: true,
             command: {
@@ -1393,83 +1278,11 @@ export function dispatch(
               childDefinitionId,
               ...(childDefinitionVersion !== undefined ? { childDefinitionVersion } : {}),
               semanticEntryBindings,
-              childIdempotencyKey: typeof callKey === 'string'
-                ? `call-${stableHash(ctx.rootId, ctx.callerTaskId, callKey)}`
-                : `turn-${stableHash(ctx.turnId, 'default-child')}`,
+              childIdempotencyKey: `turn-${stableHash(ctx.turnId, opId)}`,
             },
           };
         }
-
-        if (
-          !Array.isArray(args.entryBindings) ||
-          args.entryBindings.length === 0 ||
-          args.entryBindings.length > WORKFLOW_CHILD_BINDINGS_MAX
-        ) {
-          return { ok: false, toolError: 'entryBindings must be a non-empty array' };
-        }
-        const entryBindings: {
-          childEntryNodeId: string;
-          inputRef: string;
-          artifactId: string;
-          artifactRevision: number;
-        }[] = [];
-        const seenRefs = new Set<string>();
-        for (const entry of args.entryBindings) {
-          if (!isRecord(entry)) {
-            return { ok: false, toolError: 'entryBindings entries must be objects' };
-          }
-          const childEntryNodeId = typeof entry.childEntryNodeId === 'string'
-            ? entry.childEntryNodeId
-            : '';
-          const inputRef = typeof entry.inputRef === 'string' ? entry.inputRef : '';
-          const artifactId = typeof entry.artifactId === 'string' ? entry.artifactId : '';
-          const artifactRevision = entry.artifactRevision;
-          if (
-            !childEntryNodeId || !inputRef || !artifactId ||
-            typeof artifactRevision !== 'number' ||
-            !Number.isInteger(artifactRevision) ||
-            artifactRevision < 1
-          ) {
-            return {
-              ok: false,
-              toolError:
-                'each entryBinding requires childEntryNodeId, inputRef, artifactId, and a positive artifactRevision',
-            };
-          }
-          const bindingKey = `${childEntryNodeId}\0${inputRef}`;
-          if (seenRefs.has(bindingKey)) {
-            return {
-              ok: false,
-              toolError: `duplicate entryBinding: ${childEntryNodeId}/${inputRef}`,
-            };
-          }
-          seenRefs.add(bindingKey);
-          entryBindings.push({ childEntryNodeId, inputRef, artifactId, artifactRevision });
-        }
-        let childIdempotencyKey: string | undefined;
-        if (Object.prototype.hasOwnProperty.call(args, 'childIdempotencyKey')) {
-          if (
-            typeof args.childIdempotencyKey !== 'string' ||
-            args.childIdempotencyKey.length === 0
-          ) {
-            return {
-              ok: false,
-              toolError: 'childIdempotencyKey must be a non-empty string when provided',
-            };
-          }
-          childIdempotencyKey = args.childIdempotencyKey;
-        }
-        return {
-          ok: true,
-          command: {
-            kind: 'invoke_child_workflow',
-            opId,
-            childDefinitionId,
-            childDefinitionVersion: childDefinitionVersion!,
-            entryBindings,
-            ...(childIdempotencyKey !== undefined ? { childIdempotencyKey } : {}),
-          },
-        };
+        return { ok: false, toolError: 'bindings must be a non-empty array' };
       }
       case 'ask_parent': {
         const questions = parseQuestions(args.questions);
@@ -1505,27 +1318,31 @@ export function dispatch(
         if (isPresentationPayloadTooLarge(args)) {
           return { ok: false, toolError: 'payload_too_large' };
         }
-        const documentKey = requireString(args, 'documentKey');
-        const legacyPresentationId = requireString(args, 'presentationId');
-        const presentationId = documentKey
-          ? `presentation-${stableHash(ctx.rootId, ctx.callerTaskId, documentKey)}`
-          : legacyPresentationId;
-        const ownerTaskId = requireString(args, 'ownerTaskId') ?? ctx.callerTaskId;
+        const presentationRef = requireString(args, 'presentationRef');
+        const ownerTaskId = ctx.callerTaskId;
         const title = requireString(args, 'title');
         const markdown = requireString(args, 'markdown');
+        const presentationId = presentationRef ?? (
+          title && markdown
+            ? `presentation-${stableHash(ctx.rootId, ctx.callerTaskId, canonicalJson({
+                title,
+                markdown,
+                kind: args.kind,
+                summary: args.summary,
+              }))}`
+            : undefined
+        );
         if (
           Object.keys(args).some((key) => !PRESENTATION_KEYS.has(key)) ||
+          (Object.prototype.hasOwnProperty.call(args, 'presentationRef') && !presentationRef) ||
+          (presentationRef !== undefined && !PRESENTATION_REF_REGEX.test(presentationRef)) ||
           !isStablePresentationId(presentationId) ||
           !isStablePresentationId(ownerTaskId) ||
           !isStablePresentationId(opId) ||
-          (legacyPresentationId !== undefined && !isPositiveSafeInt(args.revision)) ||
           !title ||
           !markdown
         ) {
           return { ok: false, toolError: 'invalid_arguments' };
-        }
-        if (ownerTaskId !== ctx.callerTaskId) {
-          return { ok: false, toolError: 'owner_mismatch' };
         }
         let presentationKind: 'plan' | 'spec' | 'document' | undefined;
         if (args.kind !== undefined) {
@@ -1555,7 +1372,7 @@ export function dispatch(
             presentationId,
             ownerTaskId,
             opId,
-            ...(isPositiveSafeInt(args.revision) ? { revision: args.revision } : {}),
+            ...(presentationRef !== undefined ? { requireExisting: true as const } : {}),
             title,
             markdown,
             ...(presentationKind !== undefined ? { presentationKind } : {}),
@@ -1567,49 +1384,20 @@ export function dispatch(
       case 'define_workflow': {
         const semantic = parseSemanticWorkflowDefinition(args);
         if (semantic) {
+          const definitionId = `workflow-${stableHash(ctx.rootId, canonicalJson(semantic))}`;
           return {
             ok: true,
             command: {
               kind: 'define_workflow',
               opId,
-              definitionId: semantic.definitionId,
+              definitionId,
               name: semantic.name,
               topology: semantic.topology,
               entryContracts: semantic.entryContracts,
             },
           };
         }
-        const definitionId = requireString(args, 'definitionId');
-        const name = requireString(args, 'name');
-        if (!definitionId || !name) {
-          return { ok: false, toolError: 'invalid define_workflow arguments' };
-        }
-        if (
-          typeof args.version !== 'number' ||
-          !Number.isInteger(args.version) ||
-          args.version < 1
-        ) {
-          return { ok: false, toolError: 'invalid define_workflow arguments' };
-        }
-        const topology = parseDefineTopology(args.topology);
-        const entryContracts = parseWorkflowEntryContracts(args.entryContracts);
-        const policy = parseWorkflowPolicy(args.policy);
-        if (!topology || !entryContracts || !policy) {
-          return { ok: false, toolError: 'invalid define_workflow arguments' };
-        }
-        return {
-          ok: true,
-          command: {
-            kind: 'define_workflow',
-            opId,
-            definitionId,
-            version: args.version,
-            name,
-            topology,
-            entryContracts,
-            policy,
-          },
-        };
+        return { ok: false, toolError: 'invalid define_workflow arguments' };
       }
       case 'start_workflow': {
         const semanticReference = parseWorkflowReference(args.workflow);
@@ -1627,14 +1415,11 @@ export function dispatch(
             return { ok: false, toolError: 'invalid start_workflow goal' };
           }
           if (
-            'instanceKey' in args &&
-            (typeof args.instanceKey !== 'string' || args.instanceKey.length === 0)
+            Object.keys(args).some((key) => !['workflow', 'goal', 'inputs'].includes(key))
           ) {
-            return { ok: false, toolError: 'instanceKey must be a non-empty string when provided' };
+            return { ok: false, toolError: 'invalid start_workflow arguments' };
           }
-          const startIdempotencyKey = typeof args.instanceKey === 'string'
-            ? `instance-${stableHash(ctx.rootId, ctx.callerTaskId, semanticReference.definitionId, args.instanceKey)}`
-            : `turn-${stableHash(ctx.turnId, semanticReference.definitionId)}`;
+          const startIdempotencyKey = `turn-${stableHash(ctx.turnId, opId)}`;
           return {
             ok: true,
             command: {
@@ -1648,51 +1433,7 @@ export function dispatch(
             },
           };
         }
-        const definitionId = requireString(args, 'definitionId');
-        const startIdempotencyKey = requireString(args, 'startIdempotencyKey');
-        if (!definitionId || !startIdempotencyKey) {
-          return { ok: false, toolError: 'invalid start_workflow arguments' };
-        }
-        if (
-          typeof args.version !== 'number' ||
-          !Number.isInteger(args.version) ||
-          args.version < 1
-        ) {
-          return { ok: false, toolError: 'invalid start_workflow arguments' };
-        }
-        const entryInputs = parseWorkflowEntryInputs(args.entryInputs);
-        if (!entryInputs) {
-          return { ok: false, toolError: 'invalid start_workflow arguments' };
-        }
-        if (
-          'goal' in args &&
-          (
-            typeof args.goal !== 'string' ||
-            args.goal.length === 0 ||
-            args.goal.length > WORKFLOW_RUN_GOAL_MAX_LENGTH
-          )
-        ) {
-          return { ok: false, toolError: 'invalid start_workflow arguments' };
-        }
-        if (
-          'backend' in args &&
-          (typeof args.backend !== 'string' || args.backend.length === 0)
-        ) {
-          return { ok: false, toolError: 'invalid start_workflow arguments' };
-        }
-        return {
-          ok: true,
-          command: {
-            kind: 'start_workflow',
-            opId,
-            definitionId,
-            version: args.version,
-            startIdempotencyKey,
-            ...(typeof args.goal === 'string' ? { goal: args.goal } : {}),
-            ...(typeof args.backend === 'string' ? { backend: args.backend } : {}),
-            entryInputs,
-          },
-        };
+        return { ok: false, toolError: 'invalid start_workflow arguments' };
       }
       default:
         return { ok: false, toolError: `unsupported mutating tool: ${tool}` };

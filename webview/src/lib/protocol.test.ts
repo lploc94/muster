@@ -1513,6 +1513,25 @@ describe('protocol v7 loadTranscriptPage / transcriptPageResult', () => {
     ).toBe(false);
   });
 
+  it('accepts ordered reasoning and rejects missing or invalid order', () => {
+    const reasoning = {
+      id: 'reasoning-1',
+      kind: 'reasoning' as const,
+      turnId: 'turn-1',
+      order: 2,
+      content: 'thinking',
+    };
+    expect(isExtMessage({ ...validSuccess, items: [reasoning] })).toBe(true);
+    const { order: _order, ...missingOrder } = reasoning;
+    expect(isExtMessage({ ...validSuccess, items: [missingOrder] })).toBe(false);
+    expect(
+      isExtMessage({ ...validSuccess, items: [{ ...reasoning, order: -1 }] }),
+    ).toBe(false);
+    expect(
+      isExtMessage({ ...validSuccess, items: [{ ...reasoning, extra: true }] }),
+    ).toBe(false);
+  });
+
   it('rejects host error transcript items and transcriptPage extra fields', () => {
     expect(
       isExtMessage({

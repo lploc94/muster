@@ -58,7 +58,7 @@ export interface WorkflowDependencyEdgeV1 {
 
 /**
  * Multi-node graph topology (S02+).
- * N >= 2 nodes; each non-terminal has exactly one outgoing edge; exactly one terminal;
+ * N >= 2 nodes; each node has at most one outgoing edge; one or more terminal sinks;
  * acyclic; per-consumer inputRefs unique. Entry nodes are those with no incoming edges.
  */
 export interface GraphTopologyV1 {

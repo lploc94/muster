@@ -393,13 +393,18 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
     const def = dispatch(
       'define_workflow',
       {
-        opId: 'def-canonical-1',
-        definitionId: 'wf-canonical',
-        version: 1,
         name: 'canonical-research',
-        topology: CANONICAL_TOPOLOGY,
-        entryContracts: [],
-        policy: DEFAULT_WORKFLOW_POLICY,
+        nodes: [
+          { nodeKey: 'r1', taskType: 'research' },
+          { nodeKey: 'r2', taskType: 'research' },
+          { nodeKey: 'planner', taskType: 'plan' },
+          { nodeKey: 'verifier', taskType: 'verify' },
+        ],
+        edges: [
+          { from: 'r1', to: 'planner', as: 'from_r1' },
+          { from: 'r2', to: 'planner', as: 'from_r2' },
+          { from: 'planner', to: 'verifier', as: 'from_planner' },
+        ],
       },
       ctx,
     );

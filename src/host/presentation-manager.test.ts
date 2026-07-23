@@ -301,9 +301,23 @@ describe('PresentationManager', () => {
     expect(await manager.upsert(context, semantic)).toEqual({ ok: true, code: 'idempotent' });
     expect(await manager.upsert(
       { ...context, turnId: 'turn-2' },
-      { ...semantic, opId: 'op-2', markdown: '# Revised' },
+      { ...semantic, opId: 'op-2', requireExisting: true, markdown: '# Revised' },
     )).toEqual({ ok: true, code: 'opened' });
     expect(docs.get('plan.main')?.revision).toBe(2);
+  });
+
+  it('rejects a refresh reference that has no existing document', async () => {
+    const factory = new FakeFactory();
+    const manager = new PresentationManager(factory);
+    const docs = wireMemoryStore(manager);
+
+    await expect(manager.upsert(context, {
+      ...request,
+      revision: undefined,
+      requireExisting: true,
+    })).resolves.toEqual({ ok: false, code: 'invalid_arguments' });
+    expect(docs.size).toBe(0);
+    expect(factory.created).toEqual([]);
   });
 
   it('rejects malformed and oversized requests before calling the panel factory', async () => {
@@ -315,6 +329,9 @@ describe('PresentationManager', () => {
       ok: false,
       code: 'invalid_arguments',
     });
+    await expect(
+      manager.upsert(context, { ...request, requireExisting: 'yes' } as typeof request),
+    ).resolves.toEqual({ ok: false, code: 'invalid_arguments' });
     await expect(manager.upsert(context, { ...request, markdown: 'x'.repeat(PRESENTATION_MARKDOWN_MAX_LENGTH + 1) })).resolves.toEqual({
       ok: false,
       code: 'payload_too_large',

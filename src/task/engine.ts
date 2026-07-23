@@ -1395,6 +1395,22 @@ export class TaskEngine {
     return this.repository;
   }
 
+  private async refreshAndScheduleReceipt(receipt: { taskId: string; turnId: string }): Promise<void> {
+    const projection = this.getProjection();
+    if (projection) {
+      try {
+        const refresh = () => projection.refreshTask(receipt.taskId);
+        if (this.repository.runConsistentRead) await this.repository.runConsistentRead(refresh);
+        else await refresh();
+      } catch {
+        return;
+      }
+    }
+    if (!this.deferredQueuedTurns.has(receipt.turnId)) {
+      void this.scheduleTurn(receipt.turnId);
+    }
+  }
+
   async startNewTask(params: {
     goal: string;
     backend: string;
@@ -1444,22 +1460,29 @@ export class TaskEngine {
       continuationOf: params.continuationOf,
       goal: params.goal,
     });
-    if (clientRequestId) {
-      const existing = await this.repository.getSendReceipt(clientRequestId);
-      if (existing) {
-        if (existing.fingerprint !== fingerprint) {
-          return { ok: false, reason: 'clientRequestId conflict: different payload' };
-        }
-        return {
-          ok: true,
-          value: {
-            taskId: existing.taskId,
-            messageId: existing.messageId,
-            turnId: existing.turnId,
-            clientRequestId,
-          },
-        };
+    const replayClaimedReceipt = async (): Promise<
+      EngineResult<{ taskId: string; messageId: string; turnId: string; clientRequestId?: string }> | undefined
+    > => {
+      if (!clientRequestId) return undefined;
+      const receipt = await this.repository.getSendReceipt(clientRequestId);
+      if (!receipt) return undefined;
+      if (receipt.fingerprint !== fingerprint) {
+        return { ok: false, reason: 'clientRequestId conflict: different payload' };
       }
+      await this.refreshAndScheduleReceipt(receipt);
+      return {
+        ok: true,
+        value: {
+          taskId: receipt.taskId,
+          messageId: receipt.messageId,
+          turnId: receipt.turnId,
+          clientRequestId,
+        },
+      };
+    };
+    if (clientRequestId) {
+      const existing = await replayClaimedReceipt();
+      if (existing) return existing;
     }
 
     const taskId = randomUUID();
@@ -1546,33 +1569,21 @@ export class TaskEngine {
                 createdAt: now,
               },
             }
-          : {}),
+           : {}),
       });
       if (!write.changed) {
+        if (write.reason === 'clientRequestId already claimed') {
+          const replay = await replayClaimedReceipt();
+          if (replay) return replay;
+        }
         return { ok: false, reason: write.reason ?? 'could not create task' };
       }
     } catch (error) {
       // A resend racing the first request may hit the unique receipt after its
       // preflight read. Re-read once: exact fingerprint is a normal idempotent
       // replay; any other error remains visible to the host.
-      if (clientRequestId) {
-        const race = await this.repository.getSendReceipt(clientRequestId);
-        if (race) {
-          if (race.fingerprint !== fingerprint) {
-            return { ok: false, reason: 'clientRequestId conflict: different payload' };
-          }
-          void this.scheduleTurn(race.turnId);
-          return {
-            ok: true,
-            value: {
-              taskId: race.taskId,
-              messageId: race.messageId,
-              turnId: race.turnId,
-              clientRequestId,
-            },
-          };
-        }
-      }
+      const race = await replayClaimedReceipt();
+      if (race) return race;
       return { ok: false, reason: error instanceof Error ? error.message : String(error) };
     }
 
@@ -2050,10 +2061,7 @@ export class TaskEngine {
       if (receipt.fingerprint !== fingerprint) {
         return { ok: false, reason: 'clientRequestId conflict: different payload' };
       }
-      const task = await this.repository.getTask(taskId);
-      if (!this.deferredQueuedTurns.has(receipt.turnId)) {
-        void this.scheduleTurn(receipt.turnId);
-      }
+      await this.refreshAndScheduleReceipt(receipt);
       return {
         ok: true,
         value: { messageId: receipt.messageId, turnId: receipt.turnId, clientRequestId },
@@ -2141,7 +2149,13 @@ export class TaskEngine {
             }
           : {}),
       });
-      if (!write.changed) return { ok: false, reason: write.reason ?? 'task changed; retry send' };
+      if (!write.changed) {
+        if (write.reason === 'clientRequestId already claimed') {
+          const raced = await replay();
+          if (raced) return raced;
+        }
+        return { ok: false, reason: write.reason ?? 'task changed; retry send' };
+      }
     } catch (error) {
       const raced = await replay();
       if (raced) return raced;

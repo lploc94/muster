@@ -15,7 +15,9 @@ import {
   dispatch,
   PRESENTATION_ID_MAX_LENGTH,
   PRESENTATION_MARKDOWN_MAX_LENGTH,
+  PRESENTATION_REF_PATTERN,
   PRESENTATION_TITLE_MAX_LENGTH,
+  WORKFLOW_REF_PATTERN,
 } from '../task/coordinator-tools';
 import {
   MCP_JSON_BODY_MAX_BYTES,
@@ -99,16 +101,27 @@ const PRESENTATION_ID = {
   maxLength: PRESENTATION_ID_MAX_LENGTH,
   pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]*$',
 };
+const PRESENTATION_REF = {
+  type: 'string',
+  minLength: 1,
+  maxLength: PRESENTATION_ID_MAX_LENGTH,
+  pattern: PRESENTATION_REF_PATTERN,
+};
+const WORKFLOW_REF = {
+  type: 'string',
+  minLength: 1,
+  pattern: WORKFLOW_REF_PATTERN,
+};
 
 const DEFINE_WORKFLOW_DESCRIPTION = [
-  'Define or revise a reusable immutable workflow after selecting exact taskType ids from list_task_types.',
-  'Use only this public shape: {"workflowKey":"...","name":"...","nodes":[{"nodeKey":"...","taskType":"...","label":"..."}],"edges":[{"from":"...","to":"...","as":"..."}],"inputs":[{"to":"...","name":"..."}]}. Omit edges for a one-node workflow. Omit inputs when the run needs no caller-supplied values. Never send internal fields such as definitionId, version, topology, entryContracts, policy, backend, model, role, capabilities, opId, or task ids.',
-  'workflowKey rules: choose a unique stable key for a new logical workflow. Reuse a key only to replay the exact same definition or intentionally publish a changed revision owned by this same root task. Retries for the same key in one turn must repeat identical name/nodes/edges/inputs. If a key reports a fingerprint conflict, do not keep changing that retry: use a new unique workflowKey for a different workflow.',
-  'Topology rules: one node is valid. Multi-node workflows must be converging DAGs. Parallel source nodes may fan in, but fan-out and cycles are invalid. Every non-terminal node has exactly one outgoing edge and all branches converge to exactly one terminal node. edges use producer-to-consumer direction. Each from node may appear only once. Each as value is the input name seen by the consumer and must be unique for that consumer.',
+  'Define a reusable immutable workflow after selecting exact taskType ids from list_task_types.',
+  'Use only this public shape: {"name":"...","nodes":[{"nodeKey":"...","taskType":"...","label":"..."}],"edges":[{"from":"...","to":"...","as":"..."}],"inputs":[{"to":"...","name":"..."}]}. Omit edges for a one-node workflow. Omit inputs when the run needs no caller-supplied values. Never send internal fields such as workflowKey, definitionId, version, topology, entryContracts, policy, backend, model, role, capabilities, opId, or task ids.',
+  'The engine generates a stable workflowRef from the immutable semantic content and returns it. Do not invent a workflow identity. Repeating the exact same definition is idempotent; changing the content creates a distinct generated workflowRef.',
+  'Topology rules: one node is valid. Multi-node workflows must be converging DAGs. Parallel source nodes may fan in, but fan-out and cycles are invalid. Every non-terminal node has exactly one outgoing edge; branches may end at one or more terminal sinks whose reports are combined in topology order. edges use producer-to-consumer direction. Each from node may appear only once. Each as value is the input name seen by the consumer and must be unique for that consumer.',
   'Input rules: inputs declare runtime values that start_workflow must later supply. Each input has exactly {"to":"source-nodeKey","name":"input-name"}. The to node must have no incoming edge. Do not put objectives or instructions in inputs; put the workflow name in name and each step objective in nodes[].label.',
-  'CORRECT one-node: {"workflowKey":"inspect-scheduling-2026","name":"Inspect scheduling","nodes":[{"nodeKey":"inspect","taskType":"explore","label":"Trace scheduling architecture, persistence, tests, and limitations."}],"inputs":[{"to":"inspect","name":"question"}]}',
-  'CORRECT parallel fan-in: {"workflowKey":"parallel-review-2026","name":"Parallel review","nodes":[{"nodeKey":"code","taskType":"explore","label":"Inspect implementation."},{"nodeKey":"tests","taskType":"verify","label":"Inspect coverage."},{"nodeKey":"synthesize","taskType":"research","label":"Combine findings."}],"edges":[{"from":"code","to":"synthesize","as":"codeFindings"},{"from":"tests","to":"synthesize","as":"testFindings"}],"inputs":[{"to":"code","name":"request"},{"to":"tests","name":"request"}]}',
-  'INCORRECT internal parameters: {"definitionId":"review","version":1,"topology":{...}}. Use workflowKey/name/nodes/edges/inputs instead.',
+  'CORRECT one-node: {"name":"Inspect scheduling","nodes":[{"nodeKey":"inspect","taskType":"explore","label":"Trace scheduling architecture, persistence, tests, and limitations."}],"inputs":[{"to":"inspect","name":"question"}]}',
+  'CORRECT parallel fan-in: {"name":"Parallel review","nodes":[{"nodeKey":"code","taskType":"explore","label":"Inspect implementation."},{"nodeKey":"tests","taskType":"verify","label":"Inspect coverage."},{"nodeKey":"synthesize","taskType":"research","label":"Combine findings."}],"edges":[{"from":"code","to":"synthesize","as":"codeFindings"},{"from":"tests","to":"synthesize","as":"testFindings"}],"inputs":[{"to":"code","name":"request"},{"to":"tests","name":"request"}]}',
+  'INCORRECT internal parameters: {"definitionId":"review","version":1,"topology":{...}}. Use name/nodes/edges/inputs instead.',
   'INCORRECT fan-out: edges [{"from":"intake","to":"code","as":"request"},{"from":"intake","to":"tests","as":"request"}]. Replace intake with independent source nodes that converge downstream.',
   'INCORRECT downstream input: if research -> review, inputs [{"to":"review","name":"request"}] is invalid because review has an incoming edge; declare the input on research.',
 ].join('\n');
@@ -182,7 +195,7 @@ const TOOL_INPUT_SCHEMAS: Record<PublicMcpToolAction, Record<string, unknown>> =
     description: 'Invoke a saved child workflow from the current live activation using semantic input bindings.',
     required: ['workflow', 'bindings'],
     properties: {
-      workflow: { ...OP_ID, description: 'Child workflow key (latest revision) or immutable workflowRef such as review-flow@3.' },
+      workflow: { ...WORKFLOW_REF, description: 'Immutable workflowRef returned by define_workflow.' },
       bindings: {
         type: 'array',
         minItems: 1,
@@ -199,16 +212,15 @@ const TOOL_INPUT_SCHEMAS: Record<PublicMcpToolAction, Record<string, unknown>> =
           additionalProperties: false,
         },
       },
-      callKey: { ...OP_ID, description: 'Optional stable semantic key for intentionally replaying this child call across turns.' },
     },
     additionalProperties: false,
   },
   upsert_presentation: {
     type: 'object',
     description: 'Create or refresh one user-facing Markdown document in the IDE.',
-    required: ['documentKey', 'title', 'markdown'],
+    required: ['title', 'markdown'],
     properties: {
-      documentKey: { ...PRESENTATION_ID, description: 'Stable semantic key reused when updating the same document.' },
+      presentationRef: { ...PRESENTATION_REF, description: 'Optional opaque ref returned by an earlier upsert when refreshing that same document.' },
       title: { type: 'string', minLength: 1, maxLength: PRESENTATION_TITLE_MAX_LENGTH, description: 'Human-readable tab title.' },
       markdown: { type: 'string', minLength: 1, maxLength: PRESENTATION_MARKDOWN_MAX_LENGTH, description: 'Full document content, not a patch. Mermaid fenced blocks are supported.' },
       kind: { type: 'string', enum: ['plan', 'spec', 'document'], description: 'Optional document classification.' },
@@ -219,10 +231,9 @@ const TOOL_INPUT_SCHEMAS: Record<PublicMcpToolAction, Record<string, unknown>> =
   },
   define_workflow: {
     type: 'object',
-    description: 'Exact semantic workflow object. Required: workflowKey, name, nodes. Optional: edges and inputs. One node needs no edges. For parallel work use A -> C and B -> C, with workflow inputs declared on A and B only. Fan-out, cycles, downstream inputs, internal ids, versions, topology objects, policy, backend, model, role, capabilities, and opId are invalid.',
-    required: ['workflowKey', 'name', 'nodes'],
+    description: 'Exact semantic workflow object. Required: name, nodes. Optional: edges and inputs. One node needs no edges. For parallel work use A -> C and B -> C, with workflow inputs declared on A and B only. Fan-out, cycles, downstream inputs, internal ids, workflow identity, versions, topology objects, policy, backend, model, role, capabilities, and opId are invalid.',
+    required: ['name', 'nodes'],
     properties: {
-      workflowKey: { ...PRESENTATION_ID, description: 'Unique stable identity for this logical workflow. Reuse only for an identical replay or an intentional revision owned by this root. A changed retry in the same turn conflicts; use a new key for a different workflow.' },
       name: { type: 'string', minLength: 1, maxLength: 200, description: 'Human-readable workflow name.' },
       nodes: {
         type: 'array',
@@ -278,7 +289,7 @@ const TOOL_INPUT_SCHEMAS: Record<PublicMcpToolAction, Record<string, unknown>> =
     description: 'Start a saved workflow and suspend this caller after durable acceptance. Supply exactly one value for every input declared by define_workflow, using the same source nodeKey and input name; omit inputs only when the definition declares none.',
     required: ['workflow'],
     properties: {
-      workflow: { ...OP_ID, description: 'Workflow key to resolve the latest authorized revision, or immutable workflowRef such as review-flow@3.' },
+      workflow: { ...WORKFLOW_REF, description: 'Immutable workflowRef returned by define_workflow.' },
       goal: { type: 'string', minLength: 1, maxLength: WORKFLOW_RUN_GOAL_MAX_LENGTH, description: 'Optional run-specific objective shared with workflow nodes.' },
       inputs: {
         type: 'array',
@@ -295,7 +306,6 @@ const TOOL_INPUT_SCHEMAS: Record<PublicMcpToolAction, Record<string, unknown>> =
           additionalProperties: false,
         },
       },
-      instanceKey: { ...OP_ID, description: 'Optional stable key for intentionally replaying the same logical run across turns. Use a different key for a distinct run.' },
     },
     additionalProperties: false,
   },
@@ -308,10 +318,10 @@ const TOOL_DESCRIPTIONS: Record<PublicMcpToolAction, string> = {
   workflow_next: 'Publish the current live workflow activation result to its downstream node or terminal caller. message must be a self-contained final response because the receiver cannot see earlier assistant messages. change defaults to updated; use unchanged only for an exact feedback replay.',
   workflow_prev: 'Request correction from direct predecessor inputs of the current live activation. targets are semantic input names, not node ids, and default to all. message is the final assistant response committed before the host ends the turn.',
   workflow_fail: 'Fail the current live workflow run only when this activation cannot produce a usable result or request a valid correction. Provide an optional concise diagnostic reason. This is a terminal disposition for the current turn.',
-  invoke_child_workflow: 'Invoke a saved child workflow from the current live activation. Bind every required child source input to an exact current-activation input name; never provide artifact ids or revisions. Use callKey only to replay the same logical child call across turns.',
-  upsert_presentation: 'Open or refresh a read-only IDE Markdown tab. REQUIRED for user-facing plans/specs. Send a stable documentKey, title, and the full markdown document (not a patch); Mermaid fenced blocks are supported. Reuse documentKey to update the same document; the engine owns identity, ownership, idempotency, and revision.',
+  invoke_child_workflow: 'Invoke a saved child workflow from the current live activation using a workflowRef returned by define_workflow. Bind every required child source input to an exact current-activation input name; never provide artifact ids, revisions, or idempotency keys.',
+  upsert_presentation: 'Open or refresh a read-only IDE Markdown tab. REQUIRED for user-facing plans/specs. Send the full markdown document (not a patch); Mermaid fenced blocks are supported. The engine generates a presentationRef on create; pass that returned ref to refresh the same document.',
   define_workflow: DEFINE_WORKFLOW_DESCRIPTION,
-  start_workflow: 'Start a saved workflow by key (latest authorized revision) or immutable workflowRef. A successful call returns durable acceptance, then the host suspends this turn and resumes the caller exactly once with the terminal result; do not poll inspect_workflow_run. Supply exactly one value for every input declared by define_workflow. Use instanceKey to replay the same logical run across turns; change it for a distinct run. Inside a workflow activation use invoke_child_workflow instead.',
+  start_workflow: 'Start a saved workflow using the workflowRef returned by define_workflow. A successful call returns durable acceptance, then the host suspends this turn and resumes the caller exactly once with the terminal result; do not poll inspect_workflow_run. Supply exactly one value for every input declared by define_workflow. Inside a workflow activation use invoke_child_workflow instead.',
 };
 
 function parseBearer(header: string | undefined): string | undefined {
@@ -329,9 +339,6 @@ function workflowErrorHint(code: unknown, message: unknown): string | undefined 
   }
   if (message.startsWith('fan-out not allowed:')) {
     return 'Use independent source nodes that converge by fan-in (for example A -> C and B -> C); one producer cannot route to multiple consumers.';
-  }
-  if (message.includes('multiple terminals')) {
-    return 'Converge every branch into one final consumer so the workflow has exactly one terminal node.';
   }
   if (message.includes('cycle not allowed')) {
     return 'Remove the cycle and keep all edges directed forward toward one terminal node.';
@@ -363,16 +370,16 @@ export function formatToolError(error: string): string {
   }
   if (error === 'definition fingerprint conflict') {
     return JSON.stringify({
-      code: 'workflow_key_conflict',
+      code: 'workflow_identity_conflict',
       message: error,
-      hint: 'This workflowKey is already claimed by different immutable content or another owner. Do not retry it with changed fields. Replay the exact original definition if intentional, otherwise choose a new unique workflowKey.',
+      hint: 'The engine-generated workflow identity collided with different durable content. Retry the exact definition once; if it persists, refresh host context and report the failure.',
     });
   }
   if (error === 'operation fingerprint conflict') {
     return JSON.stringify({
       code: 'workflow_definition_retry_conflict',
       message: error,
-      hint: 'This turn already used the same workflowKey with different arguments. Retry with identical name/nodes/edges/inputs, or choose a new workflowKey for different content.',
+      hint: 'This turn already submitted different content for the same generated operation. Retry with identical name/nodes/edges/inputs.',
     });
   }
   try {
@@ -437,10 +444,16 @@ function projectPublicToolResult(tool: PublicMcpToolAction, value: unknown): unk
     if (!ref) return value;
     return {
       workflowRef: ref,
-      workflowKey: value.definitionId,
       revision: value.version,
       changed: value.changed === true,
       replay: value.replay === true || value.changed === false,
+    };
+  }
+  if (tool === 'upsert_presentation') {
+    if (typeof value.presentationId !== 'string' || typeof value.code !== 'string') return value;
+    return {
+      presentationRef: value.presentationId,
+      status: value.code,
     };
   }
   if (tool === 'start_workflow') {

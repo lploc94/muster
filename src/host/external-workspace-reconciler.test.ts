@@ -110,6 +110,31 @@ describe('external workspace reconciler', () => {
     }
   }, 30_000);
 
+  it('keeps a pre-hydrated peer task visible in the reconciled patch', async () => {
+    const pair = await openPair();
+    try {
+      const projection = await RepositoryProjection.load(pair.b, 'ws');
+      await pair.a.execute({ kind: 'createTask', workspaceId: 'ws', task: makeTask('prehydrated-peer') });
+      await projection.refreshTask('prehydrated-peer');
+
+      const result = await reconcileExternalWorkspaceChanges({
+        repository: pair.b,
+        projection,
+        afterRevision: 1,
+        knownTranscriptIds: new Set(),
+      });
+      expect(result.kind).toBe('batches');
+      if (result.kind !== 'batches') return;
+      expect(result.batches).toHaveLength(1);
+      expect(result.batches[0]?.patches).toEqual([
+        expect.objectContaining({ type: 'turnActivityChanged', task: expect.objectContaining({ id: 'prehydrated-peer' }) }),
+      ]);
+      expect(projection.getFile().revision).toBe(2);
+    } finally {
+      await pair.close();
+    }
+  }, 30_000);
+
   it('converges two clients with interleaved writes via feed without full transcript list', async () => {
     const pair = await openPair();
     try {

@@ -477,6 +477,112 @@ describe('SqliteTaskRepository', () => {
     }
   }, 20_000);
 
+  it('claims a concurrent root send receipt before creating an aggregate', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-root-receipt-race-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      await client.run(
+        `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at) VALUES (?,?,?,?,?)`,
+        ['ws', 'root-receipt-race', 'Root receipt race', 'now', 'now'],
+      );
+      const repository = new SqliteTaskRepository(client, 'ws');
+      const command = (suffix: string) => {
+        const task = { ...makeTask(`root-race-${suffix}`), releaseState: 'released' as const };
+        const message = {
+          id: `${task.id}-message`, taskId: task.id, role: 'user' as const,
+          content: 'same root send', state: 'pending' as const, createdAt: '2026-07-16T00:00:01.000Z',
+        };
+        const turn = {
+          id: `${task.id}-turn`, taskId: task.id, sequence: 1, status: 'queued' as const,
+          trigger: 'user' as const, inputs: [{ kind: 'message' as const, messageId: message.id }],
+          createdAt: '2026-07-16T00:00:01.000Z',
+        };
+        return {
+          kind: 'createRootAndInitialTurn' as const,
+          workspaceId: 'ws', task, message, turn,
+          receipt: {
+            clientRequestId: 'same-root-request', fingerprint: 'same-root-payload',
+            taskId: task.id, messageId: message.id, turnId: turn.id,
+            createdAt: turn.createdAt,
+          },
+        };
+      };
+
+      const results = await Promise.all([
+        repository.execute(command('a')),
+        repository.execute(command('b')),
+      ]);
+      expect(results.filter((result) => result.changed === true)).toHaveLength(1);
+      expect(results.filter((result) => result.changed === false)).toHaveLength(1);
+      expect(results.find((result) => result.changed === false)?.reason).toBe('clientRequestId already claimed');
+      const tasks = await repository.listTasks('ws');
+      expect(tasks).toHaveLength(1);
+      await expect(repository.getSendReceipt('same-root-request')).resolves.toMatchObject({
+        fingerprint: 'same-root-payload', taskId: tasks[0]!.id,
+      });
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('claims a concurrent follow-up receipt across different tasks', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-follow-up-receipt-race-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      await client.run(
+        `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at) VALUES (?,?,?,?,?)`,
+        ['ws', 'follow-up-receipt-race', 'Follow-up receipt race', 'now', 'now'],
+      );
+      const repository = new SqliteTaskRepository(client, 'ws');
+      const tasks = [
+        { ...makeTask('follow-up-race-a'), releaseState: 'released' as const },
+        { ...makeTask('follow-up-race-b'), releaseState: 'released' as const },
+      ];
+      await Promise.all(tasks.map((task) => repository.execute({ kind: 'createTask', workspaceId: 'ws', task })));
+      const command = (task: MusterTask, suffix: string) => {
+        const message = {
+          id: `${task.id}-message`, taskId: task.id, role: 'user' as const,
+          content: 'same follow-up send', state: 'pending' as const, createdAt: '2026-07-16T00:00:02.000Z',
+        };
+        const turn = {
+          id: `${task.id}-turn`, taskId: task.id, sequence: 1, status: 'queued' as const,
+          trigger: 'user' as const, inputs: [{ kind: 'message' as const, messageId: message.id }],
+          createdAt: '2026-07-16T00:00:02.000Z',
+        };
+        return {
+          kind: 'enqueueMessageTurn' as const,
+          workspaceId: 'ws', expectedTaskRevision: task.revision, maxTurnsPerTask: 10,
+          task, message, turn,
+          receipt: {
+            clientRequestId: 'same-follow-up-request', fingerprint: `same-follow-up-${suffix}`,
+            taskId: task.id, messageId: message.id, turnId: turn.id,
+            createdAt: turn.createdAt,
+          },
+        };
+      };
+
+      const results = await Promise.all([
+        repository.execute(command(tasks[0]!, 'payload')),
+        repository.execute(command(tasks[1]!, 'payload')),
+      ]);
+      expect(results.filter((result) => result.changed === true)).toHaveLength(1);
+      expect(results.filter((result) => result.changed === false)).toHaveLength(1);
+      expect(results.find((result) => result.changed === false)?.reason).toBe('clientRequestId already claimed');
+      const turns = await Promise.all(tasks.map((task) => repository.listTurns(task.id)));
+      expect(turns.filter((entries) => entries.length === 1)).toHaveLength(1);
+      expect(turns.filter((entries) => entries.length === 0)).toHaveLength(1);
+      await expect(repository.getSendReceipt('same-follow-up-request')).resolves.toMatchObject({
+        fingerprint: 'same-follow-up-payload',
+      });
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it('edits, deletes, and resumes only queued message turns', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-queue-mutations-sqlite-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });

@@ -1021,7 +1021,6 @@ describe('M018 S01 one-node workflow activation', () => {
       const defineRouted = dispatch(
         'define_workflow',
         {
-          workflowKey: 'wf-public',
           name: 'public-one-node',
           nodes: [{ nodeKey: 'entry', taskType: 'worker' }],
           inputs: [{ to: 'entry', name: 'request' }],
@@ -1030,18 +1029,26 @@ describe('M018 S01 one-node workflow activation', () => {
       );
       expect(defineRouted.ok).toBe(true);
       if (!defineRouted.ok) return;
+      expect(defineRouted.command).toMatchObject({
+        kind: 'define_workflow',
+        definitionId: expect.stringMatching(/^workflow-[a-f0-9]{32}$/),
+      });
+      if (defineRouted.command.kind !== 'define_workflow') return;
+      const firstDefinitionId = defineRouted.command.definitionId;
       const defined = await engine.handleToolCall(
         context,
         'define_workflow',
         defineRouted.command,
       );
-      expect(defined).toMatchObject({ ok: true, result: { changed: true, definitionId: 'wf-public' } });
+      expect(defined).toMatchObject({
+        ok: true,
+        result: { changed: true, definitionId: firstDefinitionId, version: 1 },
+      });
 
       const editContext = { ...context, turnId: `${turnId}-definition-edit` };
       const revisedRouted = dispatch(
         'define_workflow',
         {
-          workflowKey: 'wf-public',
           name: 'public-one-node-revised',
           nodes: [{ nodeKey: 'entry', taskType: 'worker' }],
           inputs: [{ to: 'entry', name: 'request' }],
@@ -1050,22 +1057,24 @@ describe('M018 S01 one-node workflow activation', () => {
       );
       expect(revisedRouted.ok).toBe(true);
       if (!revisedRouted.ok) return;
+      if (revisedRouted.command.kind !== 'define_workflow') return;
+      const revisedDefinitionId = revisedRouted.command.definitionId;
+      expect(revisedDefinitionId).not.toBe(firstDefinitionId);
       await expect(engine.handleToolCall(
         editContext,
         'define_workflow',
         revisedRouted.command,
       )).resolves.toMatchObject({
         ok: true,
-        result: { changed: true, definitionId: 'wf-public', version: 2 },
+        result: { changed: true, definitionId: revisedDefinitionId, version: 1 },
       });
-      await expect(repository.getLatestWorkflowDefinition('wf-public', taskId))
-        .resolves.toMatchObject({ version: 2, name: 'public-one-node-revised' });
+      await expect(repository.getLatestWorkflowDefinition(revisedDefinitionId, taskId))
+        .resolves.toMatchObject({ version: 1, name: 'public-one-node-revised' });
 
       const startRouted = dispatch(
         'start_workflow',
         {
-          workflow: 'wf-public',
-          instanceKey: 'public-start-1',
+          workflow: `${revisedDefinitionId}@1`,
           goal: 'activate one-node via bridge',
           inputs: [
             { node: 'entry', input: 'request', value: 'review this change' },
@@ -1194,8 +1203,8 @@ describe('M018 S01 one-node workflow activation', () => {
           [workspaceId, taskId, taskId],
         ),
       ).toMatchObject({
-        definition_id: 'wf-public',
-        definition_version: 2,
+        definition_id: revisedDefinitionId,
+        definition_version: 1,
         fingerprint: expect.any(String),
         run_id: payload.runId,
       });
@@ -1234,68 +1243,6 @@ describe('M018 S01 one-node workflow activation', () => {
       expect(resumeMessage?.content).toContain('workflow complete');
       expect(resumeMessage?.content).not.toContain('Detailed result for the receiving coordinator.');
 
-      const replayToken = credentials.issue({
-        rootId: taskId,
-        callerTaskId: taskId,
-        turnId: firstResumeTurnId!,
-        allowedActions: new Set(['start_workflow']),
-        attemptId: 'att-s01-replay',
-        ttlMs: 60_000,
-      });
-      const replayContext = credentials.verify(replayToken)!;
-
-      // The same instanceKey from a later turn reuses the run and creates that
-      // turn's own deterministic terminal continuation.
-      const replayRouted = dispatch(
-        'start_workflow',
-        {
-          workflow: 'wf-public',
-          instanceKey: 'public-start-1',
-          goal: 'activate one-node via bridge',
-          inputs: [
-            { node: 'entry', input: 'request', value: 'review this change' },
-          ],
-        },
-        replayContext,
-      );
-      expect(replayRouted.ok).toBe(true);
-      if (!replayRouted.ok) return;
-      const replayed = await engine.handleToolCall(
-        replayContext,
-        'start_workflow',
-        replayRouted.command,
-      );
-      expect(replayed).toMatchObject({
-        ok: true,
-        result: {
-           changed: false,
-           replay: true,
-           activationTurnId: payload.activationTurnId,
-         },
-      });
-      expect(await repository.listTurns(payload.entryTaskId)).toHaveLength(1);
-      let replayContinuations: Array<{ caller_turn_id: string; status: string }> = [];
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        replayContinuations = await client.all<{ caller_turn_id: string; status: string }>(
-          `SELECT caller_turn_id, status
-             FROM workflow_continuations
-            WHERE workspace_id = ? AND run_id = ? AND kind = 'start_wait'
-            ORDER BY created_at, continuation_id`,
-          [workspaceId, payload.runId],
-        );
-        if (
-          replayContinuations.length === 2 &&
-          replayContinuations.some((row) =>
-            row.caller_turn_id === firstResumeTurnId && row.status === 'resolved')
-        ) {
-          break;
-        }
-        await new Promise<void>((resolve) => setTimeout(resolve, 0));
-      }
-      expect(replayContinuations).toEqual(expect.arrayContaining([
-        expect.objectContaining({ caller_turn_id: turnId, status: 'consumed' }),
-        expect.objectContaining({ caller_turn_id: firstResumeTurnId, status: 'resolved' }),
-      ]));
     } finally {
       release();
       releaseResume();

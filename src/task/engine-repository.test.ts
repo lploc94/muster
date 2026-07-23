@@ -107,6 +107,80 @@ describe('TaskEngine repository-only boundary', () => {
     }
   }, 20_000);
 
+  it('replays a root send when concurrent engines race after preflight', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-engine-root-receipt-race-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    let first: TaskEngine | undefined;
+    let second: TaskEngine | undefined;
+    let releasePreflight!: () => void;
+    const preflightBarrier = new Promise<void>((resolve) => { releasePreflight = resolve; });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const repository = new SqliteTaskRepository(client, 'ws');
+      await repository.execute({
+        kind: 'upsertWorkspace', workspaceId: 'ws', identityKey: 'engine-root-receipt-race',
+        displayName: 'Engine root receipt race', createdAt: 'now', lastOpenedAt: 'now',
+      });
+      const config = {
+        repository,
+        workspaceId: 'ws',
+        makeBackend: () => ({
+          name: 'fake',
+          capabilities: { supportsMCP: true, supportsReasoning: false, supportsDetailedToolEvents: false },
+          run: async function* () {},
+        }),
+        runTurn: async function* () {
+          yield { type: 'turnCompleted' as const };
+        },
+        clock: () => '2026-07-16T00:00:00.000Z',
+      };
+      first = await TaskEngine.loadAsync(config);
+      second = await TaskEngine.loadAsync(config);
+
+      const originalGetSendReceipt = repository.getSendReceipt.bind(repository);
+      let preflightReads = 0;
+      const receiptSpy = vi.spyOn(repository, 'getSendReceipt').mockImplementation(async (clientRequestId) => {
+        if (clientRequestId === 'engine-root-race' && preflightReads < 2) {
+          preflightReads += 1;
+          if (preflightReads === 2) releasePreflight();
+          await preflightBarrier;
+        }
+        return originalGetSendReceipt(clientRequestId);
+      });
+      try {
+        const results = await Promise.all([
+          first.startNewTask({ goal: 'same root goal', backend: 'fake', clientRequestId: 'engine-root-race' }),
+          second.startNewTask({ goal: 'same root goal', backend: 'fake', clientRequestId: 'engine-root-race' }),
+        ]);
+        expect(results[0]).toMatchObject({ ok: true });
+        expect(results[1]).toMatchObject({ ok: true });
+        if (!results[0].ok || !results[1].ok) return;
+        expect(results[1].value).toEqual(results[0].value);
+        await Promise.all([first.whenIdle(), second.whenIdle()]);
+        await expect(repository.listTasks('ws')).resolves.toHaveLength(1);
+        expect(first.getReadModel().getFile().tasks[results[0].value.taskId]).toBeDefined();
+        expect(second.getReadModel().getFile().tasks[results[0].value.taskId]).toBeDefined();
+        expect(first.getReadModel().getFile().turns[results[0].value.turnId]).toBeDefined();
+        expect(second.getReadModel().getFile().turns[results[0].value.turnId]).toBeDefined();
+        await expect(repository.getSendReceipt('engine-root-race')).resolves.toMatchObject({
+          taskId: results[0].value.taskId,
+          messageId: results[0].value.messageId,
+          turnId: results[0].value.turnId,
+        });
+      } finally {
+        receiptSpy.mockRestore();
+      }
+    } finally {
+      releasePreflight();
+      await Promise.all([
+        first?.shutdown().catch(() => undefined),
+        second?.shutdown().catch(() => undefined),
+      ]);
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it('rotates a replacement session binding and keeps the root coordinator open', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-engine-session-rotation-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });

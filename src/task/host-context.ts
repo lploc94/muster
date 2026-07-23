@@ -86,10 +86,10 @@ export const HOST_RULES_BASE: readonly string[] = [
  * Coordinator workflow-authoring rules when no task types are configured.
  */
 export const HOST_RULES_COORDINATOR: readonly string[] = [
-  'Build orchestration with **`define_workflow`** and **`start_workflow`**; the legacy delegate-task MCP protocol is unavailable. Workflows are converging DAGs: independent source nodes may run in parallel and fan in, but fan-out/cycles are unsupported; inputs belong only to source nodes and all branches must converge to one terminal.',
+  'Build orchestration with **`define_workflow`** and **`start_workflow`**; the legacy delegate-task MCP protocol is unavailable. Workflows are converging DAGs: independent source nodes may run in parallel and fan in, but fan-out/cycles are unsupported; inputs belong only to source nodes and branches may finish at multiple terminal sinks whose reports are combined in topology order.',
   'Use **`list_task_types`** to refresh semantic task profiles before defining workflow nodes.',
   'Use **`inspect_workflow_run`** only for bounded recovery diagnostics; do not poll it as a substitute for routing.',
-  'REQUIRED for user-facing plans/specs: call MCP **`upsert_presentation`** with a semantic `documentKey`, `title`, and the full markdown (Mermaid fenced blocks allowed). The host owns identity, ownership, idempotency, and revisions. Do not only paste the plan in chat.',
+  'REQUIRED for user-facing plans/specs: call MCP **`upsert_presentation`** with `title` and the full markdown (Mermaid fenced blocks allowed). The host returns a `presentationRef`; pass it only when refreshing that same document. Do not invent identity, ownership, idempotency, or revision fields, and do not only paste the plan in chat.',
   'A live workflow activation may explicitly stage `workflow_next`, contextual `workflow_prev`, or `workflow_fail`; if the turn ends without one, the host forwards the final assistant message as an updated NEXT result.',
 ];
 

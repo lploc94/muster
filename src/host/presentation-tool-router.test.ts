@@ -8,6 +8,7 @@ const context: CredentialContext = {
   rootId: 'root-1',
   callerTaskId: 'task-1',
   turnId: 'turn-1',
+  attemptId: 'attempt-1',
   allowedActions: new Set(['upsert_presentation']),
   expiry: Date.now() + 60_000,
 };
@@ -18,6 +19,7 @@ const command: ToolCommand = {
   ownerTaskId: 'task-1',
   opId: 'op-1',
   revision: 1,
+  requireExisting: true,
   title: 'Release notes',
   markdown: '# Ready',
 };
@@ -30,7 +32,10 @@ describe('PresentationToolRouter', () => {
 
     const result = await router.handleToolCall(context, 'upsert_presentation', command);
 
-    expect(result).toEqual({ ok: true, result: { code: 'opened' } });
+    expect(result).toEqual({
+      ok: true,
+      result: { code: 'opened', presentationId: 'release-notes' },
+    });
     expect(manager.upsert).toHaveBeenCalledWith(
       { rootId: 'root-1', callerTaskId: 'task-1', turnId: 'turn-1' },
       {
@@ -38,6 +43,7 @@ describe('PresentationToolRouter', () => {
         ownerTaskId: 'task-1',
         opId: 'op-1',
         revision: 1,
+        requireExisting: true,
         title: 'Release notes',
         markdown: '# Ready',
       },

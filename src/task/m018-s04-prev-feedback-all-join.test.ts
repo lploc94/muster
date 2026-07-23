@@ -256,13 +256,16 @@ describe('M018 S04 PREV feedback ALL-join', () => {
     const ok = dispatch(
       'define_workflow',
       {
-        opId: 'def-s04-fan-1',
-        definitionId: 'wf-s04-fan',
-        version: 1,
         name: 'fan-in',
-        topology: FAN_IN_TOPOLOGY,
-        entryContracts: [],
-        policy: DEFAULT_WORKFLOW_POLICY,
+        nodes: FAN_IN_TOPOLOGY.nodes.map((node) => ({
+          nodeKey: node.nodeId,
+          taskType: 'worker',
+        })),
+        edges: FAN_IN_TOPOLOGY.edges.map((edge) => ({
+          from: edge.fromNodeId,
+          to: edge.toNodeId,
+          as: edge.inputRef,
+        })),
       },
       ctx,
     );

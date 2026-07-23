@@ -27,6 +27,7 @@ import {
   maximumWorkflowEntryAggregateBytes,
   type WorkflowPolicyV1,
 } from './workflow';
+import type { GraphTopologyV1 } from './workflow-types';
 
 const WORKER_TS = path.join(__dirname, 'sqlite', 'worker.ts');
 const TSX_ARGV = ['--import', 'tsx'];
@@ -35,6 +36,20 @@ const ONE_NODE = {
   kind: 'one_node_v1' as const,
   nodes: [{ nodeId: 'entry', role: 'coordinator' as const, capabilities: ['create_child' as const] }],
   entryNodeId: 'entry',
+};
+
+const MULTI_TERMINAL_CHILD: GraphTopologyV1 = {
+  kind: 'graph_v1',
+  nodes: [
+    { nodeId: 'left_source' },
+    { nodeId: 'left_terminal' },
+    { nodeId: 'right_source' },
+    { nodeId: 'right_terminal' },
+  ],
+  edges: [
+    { fromNodeId: 'left_source', toNodeId: 'left_terminal', inputRef: 'left' },
+    { fromNodeId: 'right_source', toNodeId: 'right_terminal', inputRef: 'right' },
+  ],
 };
 
 type OneNodeStart = {
@@ -102,6 +117,31 @@ async function defineVersion(
           }],
         }
       : {}),
+    policy,
+    createdAt,
+  });
+  expect(def.ok).toBe(true);
+}
+
+async function defineGraphVersion(
+  repository: SqliteTaskRepository,
+  createdAt: string,
+  definitionId: string,
+  name: string,
+  topology: GraphTopologyV1,
+  policy: WorkflowPolicyV1 = DEFAULT_WORKFLOW_POLICY,
+): Promise<void> {
+  const def = await repository.execute({
+    kind: 'defineWorkflowVersion',
+    workspaceId: 'ws',
+    definitionId,
+    version: 1,
+    name,
+    topology,
+    entryContracts: [
+      { entryNodeId: 'left_source', inputRef: 'engine_start', expectedArtifactKind: 'engine_start' },
+      { entryNodeId: 'right_source', inputRef: 'engine_start', expectedArtifactKind: 'engine_start' },
+    ],
     policy,
     createdAt,
   });
@@ -621,6 +661,292 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
       await opened.close();
     }
   });
+
+  it('waits for every child terminal sink and returns one ordered aggregate', async () => {
+    const opened = await openRepo('multi-terminal');
+    try {
+      const createdAt = '2026-07-20T00:00:00.000Z';
+      await defineVersion(opened.repository, createdAt, 'wf-source', 'source');
+      await defineGraphVersion(
+        opened.repository,
+        createdAt,
+        'wf-multi-terminal-child',
+        'multi-terminal child',
+        MULTI_TERMINAL_CHILD,
+      );
+
+      const caller = await startOneNode(
+        opened.repository,
+        createdAt,
+        'wf-source',
+        'multi-terminal-caller',
+        'invoke multi-terminal child',
+      );
+      const callerTask = await opened.repository.getTask(caller.entryTaskId);
+      const callerTurn = await opened.repository.getTurn(caller.activationTurnId);
+      expect(callerTask).toBeTruthy();
+      expect(callerTurn).toBeTruthy();
+
+      const invocation: TurnDisposition = {
+        kind: 'workflow_next',
+        change: 'updated',
+        route: {
+          kind: 'child_workflow',
+          childDefinitionId: 'wf-multi-terminal-child',
+          childDefinitionVersion: 1,
+          entryBindings: [
+            {
+              childEntryNodeId: 'left_source',
+              inputRef: 'engine_start',
+              artifactId: caller.startArtifactId,
+              artifactRevision: 1,
+            },
+            {
+              childEntryNodeId: 'right_source',
+              inputRef: 'engine_start',
+              artifactId: caller.startArtifactId,
+              artifactRevision: 1,
+            },
+          ],
+          childIdempotencyKey: 'multi-terminal-child-1',
+        },
+      };
+      const invocationSettlement = await settleSucceeded(
+        opened.repository,
+        opened.client,
+        caller.entryTaskId,
+        caller.activationTurnId,
+        invocation,
+        '2026-07-20T00:00:01.000Z',
+        createdAt,
+      );
+      expect(invocationSettlement).toMatchObject({ ok: true, changed: true });
+
+      const childRun = await opened.client.get<{ run_id: string }>(
+        `SELECT run_id FROM workflow_runs
+          WHERE workspace_id = 'ws' AND origin = 'child' AND caller_task_id = ?`,
+        [caller.entryTaskId],
+      );
+      expect(childRun?.run_id).toBeTruthy();
+      const childNodes = await opened.client.all<{ node_id: string; task_id: string }>(
+        `SELECT node_id, task_id FROM workflow_nodes
+          WHERE workspace_id = 'ws' AND run_id = ? AND task_id IS NOT NULL`,
+        [childRun!.run_id],
+      );
+      const taskForNode = (nodeId: string) => childNodes.find((row) => row.node_id === nodeId)?.task_id;
+      const leftSourceTask = taskForNode('left_source');
+      const rightSourceTask = taskForNode('right_source');
+      expect(leftSourceTask).toBeTruthy();
+      expect(rightSourceTask).toBeTruthy();
+
+      const leftSourceTurn = (await queuedTurnsForTask(opened.client, leftSourceTask!))[0];
+      await expect(settleSucceeded(
+        opened.repository,
+        opened.client,
+        leftSourceTask!,
+        leftSourceTurn!.id,
+        { kind: 'workflow_next', change: 'updated', result: 'left source' },
+        '2026-07-20T00:00:02.000Z',
+      )).resolves.toMatchObject({ ok: true, changed: true });
+      const leftTerminalNode = await opened.client.get<{ task_id: string }>(
+        `SELECT task_id FROM workflow_nodes
+          WHERE workspace_id = 'ws' AND run_id = ? AND node_id = 'left_terminal'`,
+        [childRun!.run_id],
+      );
+      expect(leftTerminalNode?.task_id).toBeTruthy();
+      const leftTerminalTurn = (await queuedTurnsForTask(opened.client, leftTerminalNode!.task_id))[0];
+      await expect(settleSucceeded(
+        opened.repository,
+        opened.client,
+        leftTerminalNode!.task_id,
+        leftTerminalTurn!.id,
+        { kind: 'workflow_next', change: 'updated', result: 'left report' },
+        '2026-07-20T00:00:03.000Z',
+      )).resolves.toMatchObject({ ok: true, changed: true });
+
+      await expect(runRow(opened.client, childRun!.run_id)).resolves.toMatchObject({ status: 'running' });
+      await expect(opened.client.get<{ status: string }>(
+        `SELECT status FROM workflow_return_gates WHERE workspace_id = 'ws' AND child_run_id = ?`,
+        [childRun!.run_id],
+      )).resolves.toMatchObject({ status: 'open' });
+      await expect(queuedTurnsForTask(opened.client, caller.entryTaskId)).resolves.toHaveLength(0);
+
+      const rightSourceTurn = (await queuedTurnsForTask(opened.client, rightSourceTask!))[0];
+      await expect(settleSucceeded(
+        opened.repository,
+        opened.client,
+        rightSourceTask!,
+        rightSourceTurn!.id,
+        { kind: 'workflow_next', change: 'updated', result: 'right source' },
+        '2026-07-20T00:00:04.000Z',
+      )).resolves.toMatchObject({ ok: true, changed: true });
+      const rightTerminalNode = await opened.client.get<{ task_id: string }>(
+        `SELECT task_id FROM workflow_nodes
+          WHERE workspace_id = 'ws' AND run_id = ? AND node_id = 'right_terminal'`,
+        [childRun!.run_id],
+      );
+      expect(rightTerminalNode?.task_id).toBeTruthy();
+      const rightTerminalTurn = (await queuedTurnsForTask(opened.client, rightTerminalNode!.task_id))[0];
+      await expect(settleSucceeded(
+        opened.repository,
+        opened.client,
+        rightTerminalNode!.task_id,
+        rightTerminalTurn!.id,
+        { kind: 'workflow_next', change: 'updated', result: 'right report' },
+        '2026-07-20T00:00:05.000Z',
+      )).resolves.toMatchObject({ ok: true, changed: true });
+
+      await expect(runRow(opened.client, childRun!.run_id)).resolves.toMatchObject({ status: 'succeeded' });
+      await expect(opened.client.get<{ status: string }>(
+        `SELECT status FROM workflow_return_gates WHERE workspace_id = 'ws' AND child_run_id = ?`,
+        [childRun!.run_id],
+      )).resolves.toMatchObject({ status: 'satisfied' });
+      await expect(queuedTurnsForTask(opened.client, caller.entryTaskId)).resolves.toHaveLength(1);
+
+      const childReturn = await opened.client.get<{ payload_json: string }>(
+        `SELECT payload_json FROM workflow_artifacts
+          WHERE workspace_id = 'ws' AND run_id = ? AND kind = 'child_return'`,
+        [childRun!.run_id],
+      );
+      expect(childReturn?.payload_json).toContain('left report');
+      expect(childReturn?.payload_json).toContain('right report');
+      expect(childReturn?.payload_json.indexOf('left_terminal')).toBeLessThan(
+        childReturn?.payload_json.indexOf('right_terminal') ?? -1,
+      );
+      await expect(opened.client.get<{ count: number }>(
+        `SELECT COUNT(*) AS count FROM workflow_nodes WHERE workspace_id = 'ws' AND run_id = ?`,
+        [childRun!.run_id],
+      )).resolves.toMatchObject({ count: 4 });
+    } finally {
+      await opened.close();
+    }
+  });
+
+  it('enforces the child aggregate budget before the caller return framing budget', async () => {
+    const opened = await openRepo('multi-terminal-child-budget');
+    try {
+      const createdAt = '2026-07-20T01:00:00.000Z';
+      const maxArtifactBytes = 64;
+      const childMaxAggregateBytes = maximumWorkflowEntryAggregateBytes(
+        [{ inputRef: 'engine_start' }],
+        maxArtifactBytes,
+      );
+      const childPolicy = {
+        ...DEFAULT_WORKFLOW_POLICY,
+        maxArtifactBytes,
+        maxAggregateBytes: childMaxAggregateBytes,
+      };
+      await defineVersion(opened.repository, createdAt, 'wf-budget-caller', 'caller');
+      await defineGraphVersion(
+        opened.repository,
+        createdAt,
+        'wf-budget-child',
+        'budget child',
+        MULTI_TERMINAL_CHILD,
+        childPolicy,
+      );
+      const caller = await startOneNode(
+        opened.repository,
+        createdAt,
+        'wf-budget-caller',
+        'multi-terminal-budget-caller',
+        'enforce child budget',
+      );
+      const invocation = await settleSucceeded(
+        opened.repository,
+        opened.client,
+        caller.entryTaskId,
+        caller.activationTurnId,
+        {
+          kind: 'workflow_next',
+          change: 'updated',
+          route: {
+            kind: 'child_workflow',
+            childDefinitionId: 'wf-budget-child',
+            childDefinitionVersion: 1,
+            entryBindings: [
+              { childEntryNodeId: 'left_source', inputRef: 'engine_start', artifactId: caller.startArtifactId, artifactRevision: 1 },
+              { childEntryNodeId: 'right_source', inputRef: 'engine_start', artifactId: caller.startArtifactId, artifactRevision: 1 },
+            ],
+            childIdempotencyKey: 'multi-terminal-budget-child',
+          },
+        },
+        '2026-07-20T01:00:01.000Z',
+      );
+      expect(invocation).toMatchObject({ ok: true, changed: true });
+
+      const childRun = (await childRunsForParent(opened.client, caller.runId))[0];
+      expect(childRun?.run_id).toBeTruthy();
+      const childNodes = await opened.client.all<{ node_id: string; task_id: string }>(
+        `SELECT node_id, task_id FROM workflow_nodes
+          WHERE workspace_id = 'ws' AND run_id = ? AND task_id IS NOT NULL`,
+        [childRun!.run_id],
+      );
+      const taskForNode = (nodeId: string) => childNodes.find((row) => row.node_id === nodeId)?.task_id;
+      const settleBranch = async (
+        sourceNodeId: string,
+        terminalNodeId: string,
+        result: string,
+        sourceTime: string,
+        terminalTime: string,
+      ) => {
+        const sourceTaskId = taskForNode(sourceNodeId)!;
+        const sourceTurn = (await queuedTurnsForTask(opened.client, sourceTaskId))[0]!;
+        await settleSucceeded(
+          opened.repository,
+          opened.client,
+          sourceTaskId,
+          sourceTurn.id,
+          { kind: 'workflow_next', change: 'updated', result: `${sourceNodeId}-source` },
+          sourceTime,
+        );
+        const terminalNode = await opened.client.get<{ task_id: string }>(
+          `SELECT task_id FROM workflow_nodes
+            WHERE workspace_id = 'ws' AND run_id = ? AND node_id = ?`,
+          [childRun!.run_id, terminalNodeId],
+        );
+        const terminalTaskId = terminalNode!.task_id;
+        const terminalTurn = (await queuedTurnsForTask(opened.client, terminalTaskId))[0]!;
+        return settleSucceeded(
+          opened.repository,
+          opened.client,
+          terminalTaskId,
+          terminalTurn.id,
+          { kind: 'workflow_next', change: 'updated', result },
+          terminalTime,
+        );
+      };
+
+      await expect(settleBranch(
+        'left_source',
+        'left_terminal',
+        'L'.repeat(maxArtifactBytes),
+        '2026-07-20T01:00:02.000Z',
+        '2026-07-20T01:00:03.000Z',
+      )).resolves.toMatchObject({ ok: true, changed: true });
+      await expect(settleBranch(
+        'right_source',
+        'right_terminal',
+        'R'.repeat(maxArtifactBytes),
+        '2026-07-20T01:00:04.000Z',
+        '2026-07-20T01:00:05.000Z',
+      )).resolves.toMatchObject({ ok: true, changed: true });
+
+      await expect(opened.client.get<{ status: string; terminal_reason_code: string }>(
+        `SELECT status, terminal_reason_code FROM workflow_runs
+          WHERE workspace_id = 'ws' AND run_id = ?`,
+        [childRun!.run_id],
+      )).resolves.toEqual({ status: 'failed', terminal_reason_code: 'aggregate_too_large' });
+      await expect(opened.client.get<{ status: string; reason_code: string }>(
+        `SELECT status, reason_code FROM workflow_continuations
+          WHERE workspace_id = 'ws' AND child_run_id = ?`,
+        [childRun!.run_id],
+      )).resolves.toEqual({ status: 'failed', reason_code: 'aggregate_too_large' });
+      await expect(queuedTurnsForTask(opened.client, caller.entryTaskId)).resolves.toHaveLength(0);
+    } finally {
+      await opened.close();
+    }
+  }, 45_000);
 
   it('invoke_child_workflow atomically starts child + pending continuation; foreign binding creates zero child rows', async () => {
     const opened = await openRepo('invoke');

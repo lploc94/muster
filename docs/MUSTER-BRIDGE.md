@@ -13,7 +13,7 @@ The public MCP catalog is exactly:
 | `list_task_types` | Refresh semantic workflow-node profiles and diagnostics |
 | `inspect_workflow_run` | Inspect semantic durable state for an owned workflow run |
 | `get_host_context` | Refresh trusted host, self, profile, and role context |
-| `define_workflow` | Save an engine-versioned workflow from semantic nodes and inputs |
+| `define_workflow` | Save an engine-identified workflow from semantic nodes and inputs |
 | `start_workflow` | Idempotently start a workflow, suspend the caller, and resume it with the terminal result |
 | `workflow_next` | Publish the current node result to its forward route |
 | `workflow_prev` | Request correction from one or all direct producers |
@@ -27,17 +27,16 @@ explicit `workflow_next`, contextual `workflow_prev`, `workflow_fail`, the
 specialized child-workflow `NEXT` route, or an implicit host-generated `NEXT` from
 the final assistant message when the model ends without a disposition.
 
-The public boundary is semantic. Models provide workflow keys, definition-local node
-keys, configured `taskType` values, dependency aliases, named inputs, values,
+The public boundary is semantic. Models provide definition-local node keys, configured
+`taskType` values, dependency aliases, named inputs, values,
 disposition intent, and presentation content. The bridge derives operation slots,
-immutable versions, topology kinds, entry nodes, routing snapshots, capabilities,
-numeric policy, artifact pins, ownership, and revisions.
+workflow and presentation identities, immutable versions, topology kinds, entry nodes,
+routing snapshots, capabilities, numeric policy, artifact pins, ownership, and revisions.
 
 `define_workflow` accepts:
 
 ```json
 {
-  "workflowKey": "review-flow",
   "name": "Review flow",
   "nodes": [
     { "nodeKey": "research", "taskType": "research" },
@@ -54,38 +53,30 @@ numeric policy, artifact pins, ownership, and revisions.
 
 Workflow graphs are converging DAGs. Independent source nodes may run in parallel and
 fan in to a downstream node, but a node cannot fan out to multiple consumers. Cycles
-are rejected, every non-terminal node has exactly one outgoing edge, and all branches
-must converge to exactly one terminal node. Declare workflow `inputs` only on source
-nodes with no incoming edges. For parallel work, use `A -> C` and `B -> C` with the
-shared caller input declared separately on `A` and `B`; do not add an intake node that
-routes to both.
+are rejected, every non-terminal node has exactly one outgoing edge, and branches may
+finish at one or more terminal sink nodes. When there are multiple sinks, their terminal
+reports are combined directly at completion in frozen topology order. Declare workflow
+`inputs` only on source nodes with no incoming edges. For parallel work, use `A -> C` and
+`B -> C` with the shared caller input declared separately on `A` and `B`; do not add an
+intake node that routes to both.
 
-The engine returns an immutable `workflowRef` such as `review-flow@3`. Identical
-normalized content reuses the current revision; changed content allocates the next
-revision. `start_workflow` accepts either that reference or the semantic key. A key
-resolves to the latest authorized immutable revision and freezes that resolution in
-the start claim:
-
-Choose a unique `workflowKey` for each new logical workflow. Reuse a key only for an
-identical replay or an intentional revision owned by the same root task. Idempotent
-retries for one key in the same turn must repeat identical `name`, `nodes`, `edges`,
-and `inputs`; a different workflow should use a new key. Fingerprint conflicts return
-an actionable public hint instead of exposing an unexplained storage conflict.
+The engine returns an immutable generated `workflowRef`, for example
+`workflow-8f4c2a1b3d5e7f90123456789abcdef0@1`. Identity is derived from the owning root and normalized semantic
+content. Repeating identical `name`, `nodes`, `edges`, and `inputs` is idempotent;
+changing that content creates a distinct generated reference. Models must retain the
+returned reference and pass it to `start_workflow` or `invoke_child_workflow` rather
+than inventing a storage key. The complete generated ID and positive `@version` suffix
+are required; bare IDs and caller-named versioned keys are rejected.
 
 ```json
 {
-  "workflow": "review-flow",
+  "workflow": "workflow-8f4c2a1b3d5e7f90123456789abcdef0@1",
   "goal": "Review the subsystem",
   "inputs": [
     { "node": "research", "input": "request", "value": "Inspect routing" }
-  ],
-  "instanceKey": "primary"
+  ]
 }
 ```
-
-`instanceKey` is optional. Without it the default start slot is scoped to the
-authenticated turn. An explicit key distinguishes intentional repeated starts across
-turns without exposing the durable idempotency key.
 
 ## 2. Removed protocol
 
@@ -139,13 +130,14 @@ workflow activation must use `invoke_child_workflow` rather than `start_workflow
 The terminal transaction seals tasks owned by the run to the matching lifecycle
 (`succeeded`, `failed`, or `cancelled`); the coordinator/caller task remains open.
 
-`invoke_child_workflow` accepts a workflow key/reference and semantic bindings from
+`invoke_child_workflow` accepts a returned workflow reference and semantic bindings from
 the current activation's named inputs. The repository resolves each source to an
 authorized immutable artifact revision before staging the child route. Artifact IDs
-and revisions are never model inputs.
+and revisions, operation IDs, and idempotency keys are never model inputs.
 
-`upsert_presentation` accepts `documentKey`, `title`, `markdown`, and optional display
-metadata. The host derives the root-scoped presentation ID and owner from credentials,
+`upsert_presentation` accepts `title`, `markdown`, optional display metadata, and an
+optional `presentationRef` returned by an earlier call when refreshing that document.
+For a new document the host derives the root-scoped presentation ID, returns its ref,
 allocates revisions, and treats identical content as an idempotent replay.
 
 ## 4. Human input
@@ -202,8 +194,11 @@ planes.
 - Validate every tool input with a closed JSON schema and domain validation.
 - Derive engine-owned operation, run, activation, gate, round, artifact, continuation,
   presentation, ownership, and revision identities. Agents may pass a returned
-  `runRef` only to the read-only inspection tool and a returned `workflowRef` to
-  workflow start/child calls; mutation tools never accept routing coordinates.
+  `runRef` only to the read-only inspection tool, a returned `workflowRef` to
+  workflow start/child calls, and a returned `presentationRef` to refresh that
+  document. A refresh ref must already exist for the authenticated owner; an unknown
+  ref cannot create a caller-named document. Mutation tools never accept internal
+  routing coordinates.
 - Keep resolved workflow policy and task-type routing frozen in each immutable
   definition so extension upgrades cannot reinterpret an existing revision.
 

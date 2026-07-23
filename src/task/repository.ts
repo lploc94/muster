@@ -34,6 +34,7 @@ import {
   deriveNextContributionMessageId,
   deriveProducerArtifactId,
   deriveProducerArtifactRevision,
+  deriveTerminalAggregateArtifactId,
   deriveFeedbackRoundId,
   deriveFeedbackRequestMessageId,
   deriveFeedbackRequestActivationId,
@@ -51,7 +52,7 @@ import {
   type WorkflowFailReasonCode,
   outgoingEdge,
   consumerInputRefsInDefinitionOrder,
-  terminalNodeId,
+  terminalNodeIds,
   maximumWorkflowEntryAggregateBytes,
   deriveChildInvocationFenceId,
   deriveChildReturnFenceId,
@@ -447,7 +448,7 @@ export type RepositoryCommand =
       /**
        * Idempotent compound start for a frozen one-node definition (M018 S01).
        * Claims startIdempotencyKey, then inserts run/node/gate/artifact/task/
-       * aggregate message + exactly one queued entry turn in one transaction.
+       * aggregate message + queued entry turns in one transaction.
        */
       kind: 'startWorkflowRun';
       workspaceId: string;
@@ -478,7 +479,7 @@ export type RepositoryCommand =
       kind: 'reapWorkflowTimeouts'; workspaceId: string; now: string;
     }
   | {
-      /** Resolve one terminal top-level workflow into its deterministic caller resume. */
+      /** Resolve a completed top-level workflow into its deterministic caller resume. */
       kind: 'resolveWorkflowStartContinuation'; workspaceId: string; now: string;
     }
   | {
@@ -3999,7 +4000,6 @@ export class SqliteTaskRepository implements TaskRepository {
     command.turn.inputs.forEach((input, ordering) => {
       statements.push(turnInputStatement(this.workspaceId, command.turn.id, ordering, input));
     });
-    if (command.receipt) statements.push(sendReceiptStatement(this.workspaceId, command.receipt));
     const changes: ChangeRecord[] = [
       { kind: 'task', id: command.task.id, change: 'insert' },
       { kind: 'turn', id: command.turn.id, taskId: command.task.id, change: 'insert' },
@@ -4008,8 +4008,22 @@ export class SqliteTaskRepository implements TaskRepository {
         ? [{ kind: 'send_receipt' as const, id: command.receipt.clientRequestId, taskId: command.task.id, change: 'insert' as const }]
         : []),
     ];
-    const results = await this.write(statements, changes, command.turn.createdAt);
-    return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
+    const results = command.receipt
+      ? await this.db.transaction(
+          [
+            claimSendReceiptStatement(this.workspaceId, command.receipt),
+            ...statements,
+            ...revisionStatements(this.workspaceId, changes, command.turn.createdAt, this.changeFeedRetainRevisions),
+          ],
+          { abortIfFirstUnchanged: true },
+        )
+      : await this.write(statements, changes, command.turn.createdAt);
+    const changed = (results[0]?.changes ?? 0) > 0;
+    return {
+      ok: true,
+      changed,
+      ...(!changed && command.receipt ? { reason: 'clientRequestId already claimed' } : {}),
+    };
   }
 
   private async enqueueMessageTurn(
@@ -4018,9 +4032,10 @@ export class SqliteTaskRepository implements TaskRepository {
     const invalid = validateEnqueueMessageTurn(command);
     if (invalid) return { ok: true, changed: false, reason: invalid };
     const statements: SqlStatement[] = [];
-    // The guarded task write is deliberately first. `writeIfFirstChanged()` asks
-    // the worker to roll back before touching any dependent row on a stale task
-    // revision or a saturated current execution epoch.
+    // The receipt claim is first when present, so one client request cannot reserve
+    // different aggregates across concurrent extension hosts. The task guard remains
+    // immediately before the revision/feed statements and still rolls back the claim
+    // when the task changed or its turn cap is saturated.
     const guard = guardedTaskUpdateStatement(
       this.workspaceId,
       command.task,
@@ -4038,17 +4053,41 @@ export class SqliteTaskRepository implements TaskRepository {
     command.turn.inputs.forEach((input, ordering) => {
       statements.push(turnInputStatement(this.workspaceId, command.turn.id, ordering, input));
     });
-    if (command.receipt) statements.push(sendReceiptStatement(this.workspaceId, command.receipt));
-    const results = await this.writeIfFirstChanged(
-      guard,
-      statements,
-      { kind: 'task', id: command.task.id, change: 'enqueue' },
-      command.turn.createdAt,
-    );
+    const change: ChangeRecord = { kind: 'task', id: command.task.id, change: 'enqueue' };
+    const results = command.receipt
+      ? await this.db.transaction(
+          [
+            claimSendReceiptStatement(this.workspaceId, command.receipt),
+            guard,
+            ...conditionalRevisionStatements(
+              this.workspaceId,
+              change,
+              command.turn.createdAt,
+              this.changeFeedRetainRevisions,
+            ),
+            ...statements,
+          ],
+          { abortIfFirstUnchanged: true, abortIfUnchangedAt: [1] },
+        )
+      : await this.writeIfFirstChanged(
+          guard,
+          statements,
+          change,
+          command.turn.createdAt,
+        );
+    const receiptChanged = command.receipt ? (results[0]?.changes ?? 0) > 0 : true;
+    const guardIndex = command.receipt ? 1 : 0;
+    const changed = (results[guardIndex]?.changes ?? 0) > 0;
     return {
       ok: true,
-      changed: (results[0]?.changes ?? 0) > 0,
-      ...((results[0]?.changes ?? 0) === 0 ? { reason: 'task changed or max turns per task exceeded; retry' } : {}),
+      changed,
+      ...(changed
+        ? {}
+        : {
+            reason: receiptChanged
+              ? 'task changed or max turns per task exceeded; retry'
+              : 'clientRequestId already claimed',
+          }),
     };
   }
 
@@ -4721,7 +4760,7 @@ export class SqliteTaskRepository implements TaskRepository {
         definition.createdAt,
       ],
     };
-    const terminalId = terminalNodeId(definition.topology);
+    const terminalIds = new Set(terminalNodeIds(definition.topology));
     const normalizedTopologyStatements: SqlStatement[] = definition.topology.nodes.map(
       (node, ordinal) => ({
         sql: `INSERT INTO workflow_definition_nodes
@@ -4735,7 +4774,7 @@ export class SqliteTaskRepository implements TaskRepository {
           definition.version,
           node.nodeId,
           ordinal,
-          node.nodeId === terminalId ? 1 : 0,
+          terminalIds.has(node.nodeId) ? 1 : 0,
           node.role ?? null,
           node.taskType ?? null,
           node.backend ?? null,
@@ -6202,6 +6241,56 @@ export class SqliteTaskRepository implements TaskRepository {
     return undefined;
   }
 
+  private async workflowTerminalCompletion(
+    runId: string,
+    terminalIds: readonly string[],
+    currentNodeId: string,
+    currentResult: string | undefined,
+  ): Promise<
+    | { complete: false }
+    | { complete: true; result: string | undefined; missingArtifact: boolean }
+  > {
+    const placeholders = terminalIds.map(() => '?').join(',');
+    const nodeRows = await this.db.all<{ node_id: string; status: string }>(
+      `SELECT node_id, status FROM workflow_nodes
+        WHERE workspace_id = ? AND run_id = ? AND node_id IN (${placeholders})`,
+      [this.workspaceId, runId, ...terminalIds],
+    );
+    const statusByNode = new Map(nodeRows.map((row) => [row.node_id, row.status] as const));
+    const complete = terminalIds.every(
+      (nodeId) => nodeId === currentNodeId || statusByNode.get(nodeId) === 'succeeded',
+    );
+    if (!complete) return { complete: false };
+    if (terminalIds.length === 1) {
+      return { complete: true, result: currentResult, missingArtifact: false };
+    }
+
+    const artifactRows = await this.db.all<{
+      producer_node_id: string | null;
+      revision: number;
+      payload_json: string;
+    }>(
+      `SELECT producer_node_id, revision, payload_json FROM workflow_artifacts
+        WHERE workspace_id = ? AND run_id = ? AND kind = 'next_result'
+          AND producer_node_id IN (${placeholders})
+        ORDER BY revision DESC`,
+      [this.workspaceId, runId, ...terminalIds],
+    );
+    const resultByNode = new Map<string, string>();
+    resultByNode.set(currentNodeId, currentResult ?? '');
+    for (const row of artifactRows) {
+      if (!row.producer_node_id || resultByNode.has(row.producer_node_id)) continue;
+      const result = workflowArtifactResult(row.payload_json);
+      if (result !== undefined) resultByNode.set(row.producer_node_id, result);
+    }
+    const missingArtifact = terminalIds.some((nodeId) => !resultByNode.has(nodeId));
+    return {
+      complete: true,
+      result: missingArtifact ? undefined : combineWorkflowTerminalResults(terminalIds, resultByNode),
+      missingArtifact,
+    };
+  }
+
   /**
    * M018 S02 / §20.5–20.6: when a producer turn settles with staged workflow_next,
    * commit artifact + gate contribution in the same transaction. Partial fills
@@ -6238,8 +6327,9 @@ export class SqliteTaskRepository implements TaskRepository {
       definition_id: string;
       definition_version: number;
       status: string;
+      max_aggregate_bytes: number;
     }>(
-      `SELECT run_id, definition_id, definition_version, status FROM workflow_runs
+      `SELECT run_id, definition_id, definition_version, status, max_aggregate_bytes FROM workflow_runs
         WHERE workspace_id = ? AND run_id = ?`,
       [this.workspaceId, producerNode.run_id],
     );
@@ -6281,91 +6371,171 @@ export class SqliteTaskRepository implements TaskRepository {
       ? outgoingEdge(topology, producerNode.node_id)
       : undefined;
     if (!edge) {
+      const terminalIds = terminalNodeIds(topology);
+      const terminalCompletion = await this.workflowTerminalCompletion(
+        producerNode.run_id,
+        terminalIds,
+        producerNode.node_id,
+        resultBody,
+      );
+      if (terminalCompletion.complete && terminalCompletion.missingArtifact) {
+        return this.planWorkflowFailClosure({
+          runId: producerNode.run_id,
+          reasonCode: 'invalid_route',
+          reasonText: 'terminal result artifact missing',
+          at: command.turn.finishedAt ?? new Date().toISOString(),
+          sourceTaskId: command.task.id,
+          sourceTurnId: command.turn.id,
+        });
+      }
+      if (
+        terminalCompletion.complete &&
+        terminalCompletion.result !== undefined &&
+        Buffer.byteLength(terminalCompletion.result, 'utf8') > run.max_aggregate_bytes
+      ) {
+        return this.planWorkflowFailClosure({
+          runId: producerNode.run_id,
+          reasonCode: 'aggregate_too_large',
+          at: command.turn.finishedAt ?? new Date().toISOString(),
+          sourceTaskId: command.task.id,
+          sourceTurnId: command.turn.id,
+        });
+      }
       const artifactId = deriveProducerArtifactId(producerNode.run_id, producerNode.node_id);
       const revision = 1;
       const finishedAt = command.turn.finishedAt ?? new Date().toISOString();
       const fenceId = stableId('wfc', `${producerNode.run_id}\0terminal_next\0${command.turn.id}`);
+      const statements: SqlStatement[] = [
+        {
+          sql: `UPDATE workflow_dependency_gates
+                   SET status = 'consumed'
+                 WHERE workspace_id = ? AND run_id = ?
+                   AND consumer_node_id = ? AND status = 'satisfied'`,
+          params: [this.workspaceId, producerNode.run_id, producerNode.node_id],
+        },
+        {
+          sql: `INSERT INTO workflow_routed_messages (
+                  workspace_id, run_id, message_id, source_node_id, destination_node_id,
+                  kind, body_json, created_at
+                ) VALUES (?,?,?,?,?,?,?,?)
+                ON CONFLICT(workspace_id, run_id, message_id) DO NOTHING`,
+          params: [
+            this.workspaceId,
+            producerNode.run_id,
+            fenceId,
+            producerNode.node_id,
+            'engine',
+            'terminal_next',
+            encodePayload({ kind: 'terminal_next', sourceTurnId: command.turn.id, change: disposition.change }),
+            finishedAt,
+          ],
+        },
+        {
+          sql: `INSERT INTO workflow_artifacts (
+                  workspace_id, run_id, artifact_id, producer_node_id, logical_name,
+                  revision, kind, payload_json, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+                ON CONFLICT DO NOTHING`,
+          params: [
+            this.workspaceId,
+            producerNode.run_id,
+            artifactId,
+            producerNode.node_id,
+            'next_result',
+            revision,
+            'next_result',
+            encodePayload({ kind: 'next_result', schema: 1, change: disposition.change, producerNodeId: producerNode.node_id, sourceTurnId: command.turn.id, ...(resultBody !== undefined ? { result: resultBody } : {}) }),
+            finishedAt,
+          ],
+        },
+        workflowNodeArtifactSourceStatement({
+          workspaceId: this.workspaceId,
+          runId: producerNode.run_id,
+          artifactId,
+          artifactRevision: revision,
+          nodeId: producerNode.node_id,
+          taskId: command.task.id,
+          turnId: command.turn.id,
+        }),
+        {
+          sql: `UPDATE workflow_nodes
+                   SET status = 'succeeded'
+                 WHERE workspace_id = ? AND run_id = ? AND node_id = ? AND status = 'active'`,
+          params: [this.workspaceId, producerNode.run_id, producerNode.node_id],
+        },
+      ];
+      if (!terminalCompletion.complete) {
+        return { statements, changes: [] };
+      }
+
+      const terminalArtifactId = terminalIds.length > 1
+        ? deriveTerminalAggregateArtifactId(producerNode.run_id)
+        : artifactId;
+      if (terminalIds.length > 1) {
+        statements.push({
+          sql: `INSERT INTO workflow_artifacts (
+                  workspace_id, run_id, artifact_id, producer_node_id, logical_name,
+                  revision, kind, payload_json, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+                ON CONFLICT DO NOTHING`,
+          params: [
+            this.workspaceId,
+            producerNode.run_id,
+            terminalArtifactId,
+            producerNode.node_id,
+            'terminal_result',
+            1,
+            'next_result',
+            encodePayload({
+              kind: 'next_result',
+              schema: 1,
+              change: disposition.change,
+              producerNodeId: producerNode.node_id,
+              sourceTurnId: command.turn.id,
+              result: terminalCompletion.result,
+            }),
+            finishedAt,
+          ],
+        });
+        statements.push(workflowNodeArtifactSourceStatement({
+          workspaceId: this.workspaceId,
+          runId: producerNode.run_id,
+          artifactId: terminalArtifactId,
+          artifactRevision: 1,
+          nodeId: producerNode.node_id,
+          taskId: command.task.id,
+          turnId: command.turn.id,
+        }));
+      }
+      statements.push({
+        sql: `UPDATE workflow_nodes
+                 SET status = 'succeeded'
+               WHERE workspace_id = ? AND run_id = ? AND status = 'active'`,
+        params: [this.workspaceId, producerNode.run_id],
+      });
       const taskClosure = await this.planWorkflowTaskLifecycleClosure({
         runIds: [producerNode.run_id],
         lifecycle: 'succeeded',
         at: finishedAt,
       });
-      return {
-        statements: [
-          {
-            sql: `UPDATE workflow_dependency_gates
-                     SET status = 'consumed'
-                   WHERE workspace_id = ? AND run_id = ?
-                     AND consumer_node_id = ? AND status = 'satisfied'`,
-            params: [this.workspaceId, producerNode.run_id, producerNode.node_id],
-          },
-          {
-            sql: `INSERT INTO workflow_routed_messages (
-                    workspace_id, run_id, message_id, source_node_id, destination_node_id,
-                    kind, body_json, created_at
-                  ) VALUES (?,?,?,?,?,?,?,?)
-                  ON CONFLICT(workspace_id, run_id, message_id) DO NOTHING`,
-            params: [
-              this.workspaceId,
-              producerNode.run_id,
-              fenceId,
-              producerNode.node_id,
-              'engine',
-              'terminal_next',
-              encodePayload({ kind: 'terminal_next', sourceTurnId: command.turn.id, change: disposition.change }),
-              finishedAt,
-            ],
-          },
-          {
-            sql: `INSERT INTO workflow_artifacts (
-                    workspace_id, run_id, artifact_id, producer_node_id, logical_name,
-                    revision, kind, payload_json, created_at
-                  ) VALUES (?,?,?,?,?,?,?,?,?)
-                  ON CONFLICT DO NOTHING`,
-            params: [
-              this.workspaceId,
-              producerNode.run_id,
-              artifactId,
-              producerNode.node_id,
-              'next_result',
-              revision,
-              'next_result',
-              encodePayload({ kind: 'next_result', schema: 1, change: disposition.change, producerNodeId: producerNode.node_id, sourceTurnId: command.turn.id, ...(resultBody !== undefined ? { result: resultBody } : {}) }),
-              finishedAt,
-            ],
-          },
-          workflowNodeArtifactSourceStatement({
-            workspaceId: this.workspaceId,
-            runId: producerNode.run_id,
-            artifactId,
-            artifactRevision: revision,
-            nodeId: producerNode.node_id,
-            taskId: command.task.id,
-            turnId: command.turn.id,
-          }),
-          {
-            sql: `UPDATE workflow_nodes
-                     SET status = 'succeeded'
-                   WHERE workspace_id = ? AND run_id = ? AND status = 'active'`,
-            params: [this.workspaceId, producerNode.run_id],
-          },
-          {
-            sql: `UPDATE workflow_runs
-                     SET status = 'succeeded',
-                         terminal_result_run_id = ?, terminal_result_artifact_id = ?,
-                         terminal_result_artifact_revision = ?, updated_at = ?
-                   WHERE workspace_id = ? AND run_id = ? AND status = 'running'`,
-            params: [
-              producerNode.run_id,
-              artifactId,
-              revision,
-              finishedAt,
-              this.workspaceId,
-              producerNode.run_id,
-            ],
-          },
-          ...taskClosure.statements,
+      statements.push({
+        sql: `UPDATE workflow_runs
+                 SET status = 'succeeded',
+                     terminal_result_run_id = ?, terminal_result_artifact_id = ?,
+                     terminal_result_artifact_revision = ?, updated_at = ?
+               WHERE workspace_id = ? AND run_id = ? AND status = 'running'`,
+        params: [
+          producerNode.run_id,
+          terminalArtifactId,
+          1,
+          finishedAt,
+          this.workspaceId,
+          producerNode.run_id,
         ],
+      });
+      statements.push(...taskClosure.statements);
+      return {
+        statements,
         changes: taskClosure.changes,
       };
     }
@@ -8864,11 +9034,8 @@ export class SqliteTaskRepository implements TaskRepository {
     if (outgoingEdge(topology, childNode.nodeId)) {
       return empty;
     }
-    try {
-      if (terminalNodeId(topology) !== childNode.nodeId) return empty;
-    } catch {
-      // no forward edge already checked
-    }
+    const terminalIds = terminalNodeIds(topology);
+    if (!terminalIds.includes(childNode.nodeId)) return empty;
 
     const continuation = await this.db.get<{
       run_id: string;
@@ -8906,19 +9073,53 @@ export class SqliteTaskRepository implements TaskRepository {
     const resumeMessageId = deriveCallerReturnMessageId(callerScopeId, childNode.runId);
     const callerTaskId = continuation.caller_task_id ?? undefined;
     if (!callerTaskId) return empty;
-    const aggregatePolicyRun = callerRunId
+    const callerAggregatePolicyRun = callerRunId
       ? await this.db.get<{ max_aggregate_bytes: number }>(
           `SELECT max_aggregate_bytes FROM workflow_runs
             WHERE workspace_id = ? AND run_id = ?`,
           [this.workspaceId, callerRunId],
         )
-      : childRun;
-    if (!aggregatePolicyRun || !Number.isInteger(aggregatePolicyRun.max_aggregate_bytes)) {
+      : undefined;
+    if (callerRunId && (
+      !callerAggregatePolicyRun ||
+      !Number.isInteger(callerAggregatePolicyRun.max_aggregate_bytes)
+    )) {
       return empty;
     }
     const resultBody = workflowResultFromSettlement(command, disposition.result);
-    const returnContent = `[workflow-child-return] childRunId=${childNode.runId} change=${disposition.change}\n${resultBody ?? ''}`;
-    if (Buffer.byteLength(returnContent, 'utf8') > aggregatePolicyRun.max_aggregate_bytes) {
+    const terminalCompletion = await this.workflowTerminalCompletion(
+      childNode.runId,
+      terminalIds,
+      childNode.nodeId,
+      resultBody,
+    );
+    if (!terminalCompletion.complete) return empty;
+    if (terminalCompletion.missingArtifact) {
+      return this.planWorkflowFailClosure({
+        runId: childNode.runId,
+        reasonCode: 'invalid_route',
+        reasonText: 'terminal result artifact missing',
+        at: finishedAt,
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
+    }
+    const returnResult = terminalCompletion.result;
+    if (
+      returnResult !== undefined &&
+      Buffer.byteLength(returnResult, 'utf8') > childRun.max_aggregate_bytes
+    ) {
+      return this.planWorkflowFailClosure({
+        runId: childNode.runId,
+        reasonCode: 'aggregate_too_large',
+        at: finishedAt,
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
+    }
+    const returnContent = `[workflow-child-return] childRunId=${childNode.runId} change=${disposition.change}\n${returnResult ?? ''}`;
+    const returnLimit = callerAggregatePolicyRun?.max_aggregate_bytes ?? childRun.max_aggregate_bytes;
+    if (Buffer.byteLength(returnContent, 'utf8') > returnLimit) {
       return this.planWorkflowFailClosure({
         runId: childNode.runId,
         reasonCode: 'aggregate_too_large',
@@ -9018,7 +9219,7 @@ export class SqliteTaskRepository implements TaskRepository {
       kind: 'child_return',
       childRunId: childNode.runId,
       change: disposition.change,
-      result: resultBody ?? null,
+      result: returnResult ?? null,
       sourceTurnId: command.turn.id,
     });
     statements.push({
@@ -11793,6 +11994,28 @@ function workflowResultFromSettlement(
   return truncateUtf8Bytes(finalAssistant, TASK_RESULT_MAX_BYTES).text;
 }
 
+function workflowArtifactResult(payloadJson: string): string | undefined {
+  try {
+    const payload = JSON.parse(payloadJson) as Record<string, unknown>;
+    return typeof payload.result === 'string' ? payload.result : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function combineWorkflowTerminalResults(
+  terminalIds: readonly string[],
+  resultByNode: ReadonlyMap<string, string>,
+): string | undefined {
+  if (terminalIds.length === 0) return undefined;
+  if (terminalIds.length === 1) return resultByNode.get(terminalIds[0]!);
+  return terminalIds
+    .map((nodeId) =>
+      `[workflow-terminal-result] node=${JSON.stringify(nodeId)}\n${resultByNode.get(nodeId) ?? ''}`,
+    )
+    .join('\n\n');
+}
+
 function workspaceStatement(command: Extract<RepositoryCommand, { kind: 'upsertWorkspace' }>): SqlStatement {
   return {
     sql: `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
@@ -11912,6 +12135,16 @@ function sendReceiptStatement(workspaceId: string, receipt: SendReceipt): SqlSta
           VALUES (?,?,?,?,?,?,?) ON CONFLICT(workspace_id, client_request_id) DO UPDATE SET
           fingerprint=excluded.fingerprint, task_id=excluded.task_id, message_id=excluded.message_id,
           turn_id=excluded.turn_id, created_at=excluded.created_at`,
+    params: [workspaceId, receipt.clientRequestId, receipt.fingerprint, receipt.taskId, receipt.messageId,
+      receipt.turnId, receipt.createdAt],
+  };
+}
+
+function claimSendReceiptStatement(workspaceId: string, receipt: SendReceipt): SqlStatement {
+  return {
+    sql: `INSERT INTO send_receipts
+          (workspace_id, client_request_id, fingerprint, task_id, message_id, turn_id, created_at)
+          VALUES (?,?,?,?,?,?,?) ON CONFLICT(workspace_id, client_request_id) DO NOTHING`,
     params: [workspaceId, receipt.clientRequestId, receipt.fingerprint, receipt.taskId, receipt.messageId,
       receipt.turnId, receipt.createdAt],
   };

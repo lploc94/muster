@@ -1195,9 +1195,13 @@ function isTranscriptItem(v: unknown): v is TranscriptItem {
       return true;
     }
     case 'reasoning': {
-      // Exact keys; non-empty turnId; string content. Host never sends order/state.
-      if (!hasOnlyKeys(v, ['id', 'kind', 'turnId', 'content'])) return false;
-      return isBoundedId(v.turnId, WORKSPACE_PATCH_ID_MAX) && isString(v.content);
+      // Exact keys; durable reasoning segments carry their canonical turn order.
+      if (!hasOnlyKeys(v, ['id', 'kind', 'turnId', 'order', 'content'])) return false;
+      return (
+        isBoundedId(v.turnId, WORKSPACE_PATCH_ID_MAX) &&
+        isNonNegativeSafeInteger(v.order) &&
+        isString(v.content)
+      );
     }
     case 'tool': {
       // Exact top-level keys; structured tool content with fixed status/toolKind.

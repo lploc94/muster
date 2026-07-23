@@ -296,7 +296,8 @@ function hasCycle(nodeIds: readonly string[], edges: readonly WorkflowDependency
 /**
  * Validate and normalize multi-node graph_v1 topology.
  * Fail closed on fan-out, cycles, duplicate per-consumer inputRef, missing route-to-gate,
- * and zero/multiple terminals.
+ * and zero terminals. Multiple terminal sinks are valid and return their reports as
+ * one aggregate result to the caller.
  */
 export function decodeGraphTopology(
   raw: unknown,
@@ -386,25 +387,20 @@ export function decodeGraphTopology(
     return { ok: false, reason: 'cycle not allowed' };
   }
 
-  // Exactly one terminal (out-degree 0). Non-terminals must have exactly one outgoing route.
+  // At least one terminal sink (out-degree 0). Non-terminals have exactly one outgoing route.
   const terminals = [...nodeIds].filter((id) => (outDegree.get(id) ?? 0) === 0);
   if (terminals.length === 0) {
-    return { ok: false, reason: 'exactly one terminal required: zero terminals' };
-  }
-  if (terminals.length > 1) {
-    return { ok: false, reason: 'exactly one terminal required: multiple terminals' };
+    return { ok: false, reason: 'at least one terminal required: zero terminals' };
   }
   // Non-terminals (everything else) already have out-degree 1 by fan-out check + not terminal.
 
   // Every non-entry node must be reachable as a consumer (have ≥1 incoming).
-  // With one terminal + out-degree 0|1 + acyclic, unreachable nodes would be extra terminals
-  // or cycles; still reject nodes with neither in nor out except the sole terminal.
+  // Reject isolated nodes even though multiple independent entry/sink paths are valid.
   for (const id of nodeIds) {
     const out = outDegree.get(id) ?? 0;
     const inn = inDegree.get(id) ?? 0;
     if (out === 0 && inn === 0 && nodeIds.size > 1) {
-      // Isolated node is a second terminal already caught; keep fail-closed.
-      return { ok: false, reason: 'exactly one terminal required: multiple terminals' };
+      return { ok: false, reason: 'isolated node is not a valid workflow path' };
     }
   }
 
