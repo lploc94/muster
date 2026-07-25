@@ -1831,3 +1831,73 @@ describe('protocol v9 workspacePatchBatch', () => {
     ).toBe(false);
   });
 });
+
+describe('M019 backend readiness protocol', () => {
+  const checkedAt = '2026-07-25T00:00:00.000Z';
+  const baseRecord = (backendId: string) => ({
+    backendId,
+    state: 'missing' as const,
+    code: 'executable_missing' as const,
+    recoveryAction: 'install' as const,
+    compatibility: 'unknown' as const,
+    versionEvidence: null,
+    checkedAt,
+  });
+  const validSnapshot = () => ({
+    schemaVersion: 1 as const,
+    correlationId: 'req-1',
+    phase: 'settled' as const,
+    checkedAt,
+    backends: [
+      baseRecord('claude'),
+      baseRecord('grok'),
+      baseRecord('kiro'),
+      baseRecord('codex'),
+      baseRecord('opencode'),
+    ],
+  });
+
+  it('accepts a well-formed backendReadinessSnapshot', () => {
+    expect(
+      isExtMessage({ type: 'backendReadinessSnapshot', snapshot: validSnapshot() }),
+    ).toBe(true);
+  });
+
+  it('rejects backendReadinessSnapshot with extra keys', () => {
+    expect(
+      isExtMessage({
+        type: 'backendReadinessSnapshot',
+        snapshot: validSnapshot(),
+        extra: true,
+      }),
+    ).toBe(false);
+  });
+
+  it('rejects backendReadinessSnapshot with malformed snapshot (duplicate/unknown id)', () => {
+    const snap = validSnapshot();
+    snap.backends[0] = { ...snap.backends[0], backendId: 'not-a-backend' as 'claude' };
+    expect(isExtMessage({ type: 'backendReadinessSnapshot', snapshot: snap })).toBe(false);
+
+    const dup = validSnapshot();
+    dup.backends[1] = { ...dup.backends[0] };
+    expect(isExtMessage({ type: 'backendReadinessSnapshot', snapshot: dup })).toBe(false);
+  });
+
+  it('rejects backendReadinessSnapshot with missing backends array', () => {
+    const { backends: _b, ...rest } = validSnapshot();
+    expect(
+      isExtMessage({ type: 'backendReadinessSnapshot', snapshot: rest }),
+    ).toBe(false);
+  });
+
+  it('rejects overlong correlationId and non-ISO timestamps', () => {
+    const longCorr = validSnapshot();
+    longCorr.correlationId = 'x'.repeat(129);
+    expect(isExtMessage({ type: 'backendReadinessSnapshot', snapshot: longCorr })).toBe(false);
+
+    const badTs = validSnapshot();
+    badTs.checkedAt = 'yesterday';
+    expect(isExtMessage({ type: 'backendReadinessSnapshot', snapshot: badTs })).toBe(false);
+  });
+});
+

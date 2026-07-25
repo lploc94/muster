@@ -475,6 +475,11 @@ export type ExtMessage =
   | { type: 'filePicked'; path: string; displayName?: string }
   | { type: 'backendsAvailable'; backends: string[] }
   /**
+   * Host-owned passive BackendReadinessSnapshot (M019). Webview must parse via
+   * parseBackendReadinessSnapshot — reject malformed/unknown payloads fail-closed.
+   */
+  | { type: 'backendReadinessSnapshot'; snapshot: BackendReadinessSnapshot }
+  /**
    * A backend's advertised skills + its per-backend invocation prefix (`/` or `$`).
    * `prefix` is always present (static map) even when `skills` is empty (cold cache).
    */

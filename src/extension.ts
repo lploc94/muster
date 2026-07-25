@@ -77,6 +77,14 @@ import {
 } from './host/permission-settings';
 import { detectAvailableBackends, installAugmentedPath } from './host/backend-availability';
 import {
+  BackendReadinessService,
+  createDefaultBackendReadinessDeps,
+} from './host/backend-readiness';
+import {
+  derivePassivelySelectableBackendIds,
+  type BackendReadinessSnapshot,
+} from './shared/backend-readiness';
+import {
   parseComposerSelection,
   readComposerSelection,
   writeComposerSelection,
@@ -222,10 +230,11 @@ async function prepareHostEnvironment(): Promise<void> {
   if (!hostEnvPrepare) {
     hostEnvPrepare = (async () => {
       try {
-        const backends = await detectAvailableBackends();
-        writeHostEnvCache({ availableBackends: backends });
-        const models = await enumerateModels(backends, resolveTaskCwd());
-        writeHostEnvCache({ availableBackends: backends, models });
+        // Passive inventory only — no ACP model enumeration (M019 S01).
+        const snapshot = await ensureBackendReadiness(/* refresh */ false);
+        writeHostEnvCache({
+          availableBackends: derivePassivelySelectableBackendIds(snapshot),
+        });
       } catch {
         // leave cache partial/empty; engine synthesizes minimal
       }
@@ -975,17 +984,39 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
    * fails we stay silent — the webview then fails open and shows all backends.
    */
   private async postAvailableBackends(): Promise<void> {
+    await this.postBackendReadiness('current');
+  }
+
+  /**
+   * Deliver versioned BackendReadinessSnapshot to the webview and update
+   * hostEnvCache.availableBackends as a derived passively-selectable list.
+   * Keeps models cache intact. Explicit refresh invalidates the single-flight
+   * inventory so PATH/version changes are visible without reload.
+   */
+  private async postBackendReadiness(
+    mode: 'current' | 'refresh',
+    requestId?: string,
+  ): Promise<void> {
     try {
-      // Cache the in-flight promise so a concurrent panel-open + `listBackends`
-      // don't run detection twice.
-      this.availableBackendsPromise ??= detectAvailableBackends();
-      const backends = await this.availableBackendsPromise;
-      writeHostEnvCache({ availableBackends: backends });
-      this.post({ type: 'backendsAvailable', backends });
+      const snapshot = await ensureBackendReadiness(mode === 'refresh', requestId);
+      // Prefer requestId as correlation when provided so webview can match refresh.
+      const delivered =
+        requestId && snapshot.correlationId !== requestId
+          ? { ...snapshot, correlationId: requestId }
+          : snapshot;
+      writeHostEnvCache({
+        availableBackends: derivePassivelySelectableBackendIds(delivered),
+      });
+      // Legacy string-array channel for older consumers / progressive hydration.
+      this.post({
+        type: 'backendsAvailable',
+        backends: derivePassivelySelectableBackendIds(delivered),
+      });
+      this.post({ type: 'backendReadinessSnapshot', snapshot: delivered });
     } catch {
-      // Detection failed — drop the cached rejection so a later request retries;
-      // the webview meanwhile fails open and shows all backends.
-      this.availableBackendsPromise = undefined;
+      // ensureBackendReadiness already normalizes failures; if we still throw,
+      // drop single-flight so a later request retries.
+      backendReadinessPromise = undefined;
     }
   }
 
@@ -1067,7 +1098,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     }
 
     this.availableModelsPromise = (async () => {
-      const backends = await (this.availableBackendsPromise ??= detectAvailableBackends());
+      // Model enumeration is explicit-only (listModels). Derive backends from readiness.
+      const readiness = await ensureBackendReadiness(false);
+      const backends = derivePassivelySelectableBackendIds(readiness);
       console.info(`Muster: enumerating models for backends: ${backends.join(', ') || '(none)'}`);
       const models = await enumerateModels(backends, resolveTaskCwd(), (partial) => {
         this.post({ type: 'modelsAvailable', models: partial });
