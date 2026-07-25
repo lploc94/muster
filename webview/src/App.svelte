@@ -3,6 +3,7 @@
   import SettingsPanel from './components/SettingsPanel.svelte';
   import TaskHistoryList from './components/TaskList.svelte';
   import TaskWorkspace from './components/TaskWorkspace.svelte';
+  import FirstRunJourney from './components/FirstRunJourney.svelte';
   import PermissionCard from './components/PermissionCard.svelte';
   import ElicitationFormCard from './components/ElicitationFormCard.svelte';
   import ElicitationUrlCard from './components/ElicitationUrlCard.svelte';
@@ -63,6 +64,7 @@
   } from './lib/settings-view-state';
   import type { SettingsTopicId } from './lib/settings-topics';
   import { resolveRevealBackendDiagnosticsAction } from './lib/settings-backends-deep-link';
+  import { resolveOpenBackendSetupAction } from './lib/composer-backend-setup';
   import type { BackendReadinessId } from '../../src/shared/backend-readiness';
   import { vscode } from './lib/vscode';
 
@@ -375,6 +377,21 @@
     const action = resolveRevealBackendDiagnosticsAction();
     openSettings({ topicId: action.topicId, focusBackends: true });
   }
+
+  /** Composer / first-run deep-link into Agents → Backends (relocated probe entry). */
+  function openBackendSetup(): void {
+    const action = resolveOpenBackendSetupAction();
+    openSettings({ topicId: action.topicId, focusBackends: action.focusBackends });
+  }
+
+  function startFirstTaskFromJourney(): void {
+    tasks.openNewTaskDraft();
+    post({ type: 'newTask' });
+    historyOpen = false;
+  }
+
+  /** Root-task count for the derived first-run journey (no durable onboarding flag). */
+  const firstRunTaskCount = $derived(tasks.rootTasks.length);
 
   function onStartBackendProbeFromSettings(backendId: BackendReadinessId): void {
     tasks.startBackendProbe(backendId);
@@ -992,8 +1009,13 @@
       }
     }
 
+    function onOpenBackendSetupEvent(): void {
+      openBackendSetup();
+    }
+
     window.addEventListener('message', onMessage);
     window.addEventListener('muster:prefill-applied', onPrefillApplied);
+    window.addEventListener('muster:open-backend-setup', onOpenBackendSetupEvent);
     // Passive readiness inventory (M019): correlated request; host also posts
     // derived backendsAvailable. listBackends remains for transitional hosts.
     post({ type: 'requestBackendReadiness', requestId: `init-${Date.now()}` });
@@ -1003,6 +1025,7 @@
     return () => {
       window.removeEventListener('message', onMessage);
       window.removeEventListener('muster:prefill-applied', onPrefillApplied);
+      window.removeEventListener('muster:open-backend-setup', onOpenBackendSetupEvent);
     };
   });
 
@@ -1196,6 +1219,12 @@
       </button>
     </div>
     <div class="shrink-0" style="border-top: 1px solid var(--vscode-panel-border);"></div>
+    <FirstRunJourney
+      snapshot={tasks.backendReadinessSnapshot}
+      taskCount={firstRunTaskCount}
+      onOpenBackendSetup={openBackendSetup}
+      onStartFirstTask={startFirstTaskFromJourney}
+    />
     <TaskHistoryList
       variant="full"
       onSelect={(id) => { selectTask(id); historyOpen = false; }}
