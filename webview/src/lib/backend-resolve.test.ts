@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { parseBackendId, parseModelFromSelectValue } from './backend-resolve';
+import { BACKEND_READINESS_IDS } from '../../../src/shared/backend-readiness';
+import {
+  parseBackendId,
+  parseModelFromSelectValue,
+  WEBVIEW_BACKEND_IDS,
+} from './backend-resolve';
 
 describe('parseBackendId', () => {
   it('parses backend::model select values (model picker format)', () => {
@@ -19,6 +24,13 @@ describe('parseBackendId', () => {
     expect(parseBackendId('')).toBeNull();
     expect(parseBackendId('gemini')).toBeNull();
     expect(parseBackendId('gemini::x')).toBeNull();
+  });
+
+  it('shares the readiness allowlist order and membership', () => {
+    expect(WEBVIEW_BACKEND_IDS).toEqual(BACKEND_READINESS_IDS);
+    for (const id of BACKEND_READINESS_IDS) {
+      expect(parseBackendId(id)).toBe(id);
+    }
   });
 });
 

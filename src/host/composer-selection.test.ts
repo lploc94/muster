@@ -1,5 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
+import { BACKEND_READINESS_IDS } from '../shared/backend-readiness';
 import {
+  COMPOSER_BACKEND_IDS,
   COMPOSER_SELECTION_CONFIG_KEY,
   parseComposerSelection,
   readComposerSelection,
@@ -18,6 +20,10 @@ describe('isComposerBackendId', () => {
     expect(isComposerBackendId('gemini')).toBe(false);
     expect(isComposerBackendId(null)).toBe(false);
     expect(isComposerBackendId(1)).toBe(false);
+  });
+
+  it('re-exports the shared readiness allowlist', () => {
+    expect(COMPOSER_BACKEND_IDS).toEqual(BACKEND_READINESS_IDS);
   });
 });
 
