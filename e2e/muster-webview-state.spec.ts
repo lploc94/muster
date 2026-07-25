@@ -8862,6 +8862,9 @@ test.describe('M019 S01 Composer readiness', () => {
 });
 
 test.describe('M019 S02 Test Connection', () => {
+  // S03 relocated Test Connection from draft Composer to Agents → Backends.
+  // Assertions preserve S02 progress/ready/auth/cancel/stale-drop contracts on
+  // the stable settings-backends surface (backend-row-*).
   const checkedAt = '2026-07-25T02:00:00.000Z';
 
   function allInstalledUnverifiedSnapshot(correlationId = 'e2e-s02-unverified') {
@@ -8917,31 +8920,34 @@ test.describe('M019 S02 Test Connection', () => {
     };
   }
 
-  async function openDraftProbeSurface(page: Page) {
-    // Default harness seeds all-installed-unverified so the draft composer is
-    // eligible and Claude is the preferred display backend for Test Connection.
+  async function openAgentsBackendsProbeSurface(page: Page) {
+    // Default harness seeds all-installed-unverified so Claude is probe-eligible.
     await openWebview(page);
-    await page.getByRole('button', { name: 'New task' }).click();
-    const surface = page.getByTestId('backend-probe-surface');
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+    await page.getByRole('tab', { name: 'Agents' }).click();
+    const surface = page.getByTestId('settings-backends');
     await expect(surface).toBeVisible();
-    await expect(surface).toHaveAttribute('data-probe-kind', 'idle');
-    await expect(page.getByTestId('backend-probe-status')).toContainText(
+    const claudeRow = page.getByTestId('backend-row-claude');
+    await expect(claudeRow).toBeVisible();
+    await expect(claudeRow).toHaveAttribute('data-backend-state', 'installed_unverified');
+    await expect(page.getByTestId('backend-row-diagnostic-claude')).toContainText(
       /Claude is installed but not yet verified/i,
     );
-    await expect(page.getByTestId('start-backend-probe')).toBeVisible();
+    await expect(page.getByTestId('backend-row-test-claude')).toBeVisible();
     return surface;
   }
 
   test('idle start posts correlated probe; progress/ready and auth diagnostics render; cancel posts cancel; keyboard reachable', async ({
     page,
   }) => {
-    const surface = await openDraftProbeSurface(page);
-    const start = page.getByTestId('start-backend-probe');
+    const surface = await openAgentsBackendsProbeSurface(page);
+    const start = page.getByTestId('backend-row-test-claude');
 
     // Keyboard/status semantics: Test Connection is a real button with aria-label.
     await start.focus();
     await expect(start).toBeFocused();
-    await expect(start).toHaveAttribute('aria-label', 'Test Connection');
+    await expect(start).toHaveAttribute('aria-label', /Test Connection for Claude/i);
 
     const beforeStart = (await postedMessages(page)).length;
     await start.click();
@@ -8969,12 +8975,12 @@ test.describe('M019 S02 Test Connection', () => {
     expect(startMsg?.probeId?.length).toBeGreaterThan(0);
     const probeId = startMsg!.probeId as string;
 
-    // Local correlation flips the surface to testing + Cancel before host settles.
-    await expect(surface).toHaveAttribute('data-probe-kind', 'testing');
-    await expect(page.getByTestId('backend-probe-status')).toContainText(/Claude/i);
-    const cancel = page.getByTestId('cancel-backend-probe');
+    // Local correlation flips the row to testing + Cancel before host settles.
+    await expect(page.getByTestId('backend-row-claude')).toHaveClass(/backend-row--testing/);
+    await expect(page.getByTestId('backend-row-progress-claude')).toBeVisible();
+    const cancel = page.getByTestId('backend-row-cancel-claude');
     await expect(cancel).toBeVisible();
-    await expect(cancel).toHaveAttribute('aria-label', 'Cancel Test Connection');
+    await expect(cancel).toHaveAttribute('aria-label', /Cancel Test Connection for Claude/i);
 
     // Host progress (version stage) updates status without inventing readiness truth.
     await postRawHostMessage(page, {
@@ -8987,7 +8993,7 @@ test.describe('M019 S02 Test Connection', () => {
         startedAt: '2026-07-25T02:00:01.000Z',
       },
     });
-    await expect(page.getByTestId('backend-probe-status')).toContainText(/Checking version/i);
+    await expect(page.getByTestId('backend-row-progress-claude')).toContainText(/Checking version/i);
 
     // Host testing snapshot keeps Cancel and does not enable Start.
     await postRawHostMessage(page, {
@@ -8999,8 +9005,8 @@ test.describe('M019 S02 Test Connection', () => {
         checkedAt: '2026-07-25T02:00:01.000Z',
       }),
     });
-    await expect(surface).toHaveAttribute('data-probe-kind', 'testing');
-    await expect(page.getByTestId('start-backend-probe')).toHaveCount(0);
+    await expect(page.getByTestId('backend-row-claude')).toHaveAttribute('data-backend-state', 'testing');
+    await expect(page.getByTestId('backend-row-test-claude')).toHaveCount(0);
     await expect(cancel).toBeVisible();
 
     // Ready terminal: status shows ready/version evidence; Start may reappear (re-probe).
@@ -9015,11 +9021,11 @@ test.describe('M019 S02 Test Connection', () => {
         checkedAt: '2026-07-25T02:00:02.000Z',
       }),
     });
-    await expect(surface).toHaveAttribute('data-probe-kind', 'ready');
-    await expect(page.getByTestId('backend-probe-status')).toContainText(/Claude is ready/i);
-    await expect(page.getByTestId('backend-probe-status')).toContainText(/1\.0\.0/);
-    await expect(page.getByTestId('cancel-backend-probe')).toHaveCount(0);
-    await expect(page.getByTestId('start-backend-probe')).toBeVisible();
+    await expect(page.getByTestId('backend-row-claude')).toHaveAttribute('data-backend-state', 'ready');
+    await expect(page.getByTestId('backend-row-diagnostic-claude')).toContainText(/Claude is ready/i);
+    await expect(page.getByTestId('backend-row-version-claude')).toContainText(/1\.0\.0/);
+    await expect(page.getByTestId('backend-row-cancel-claude')).toHaveCount(0);
+    await expect(page.getByTestId('backend-row-test-claude')).toBeVisible();
 
     // Probe never posts session/prompt or task send traffic.
     const afterReady = await postedMessages(page);
@@ -9032,7 +9038,7 @@ test.describe('M019 S02 Test Connection', () => {
 
     // Auth diagnostic path: re-start, progress authenticate, settle auth_required.
     const beforeAuthStart = (await postedMessages(page)).length;
-    await page.getByTestId('start-backend-probe').click();
+    await page.getByTestId('backend-row-test-claude').click();
     let authProbeId: string | null = null;
     await expect
       .poll(async () => {
@@ -9055,7 +9061,7 @@ test.describe('M019 S02 Test Connection', () => {
         startedAt: '2026-07-25T02:00:03.000Z',
       },
     });
-    await expect(page.getByTestId('backend-probe-status')).toContainText(
+    await expect(page.getByTestId('backend-row-progress-claude')).toContainText(
       /Checking authentication/i,
     );
 
@@ -9070,15 +9076,18 @@ test.describe('M019 S02 Test Connection', () => {
         checkedAt: '2026-07-25T02:00:04.000Z',
       }),
     });
-    await expect(surface).toHaveAttribute('data-probe-kind', 'diagnostic');
-    await expect(page.getByTestId('backend-probe-status')).toContainText(/sign in/i);
-    await expect(page.getByTestId('backend-probe-status')).toContainText(/Sign in required/i);
-    await expect(page.getByTestId('start-backend-probe')).toBeVisible();
-    await expect(page.getByTestId('cancel-backend-probe')).toHaveCount(0);
+    await expect(page.getByTestId('backend-row-claude')).toHaveAttribute(
+      'data-backend-state',
+      'auth_required',
+    );
+    await expect(page.getByTestId('backend-row-status-claude')).toContainText(/Sign in required/i);
+    await expect(page.getByTestId('backend-row-diagnostic-claude')).toContainText(/sign in/i);
+    await expect(page.getByTestId('backend-row-test-claude')).toBeVisible();
+    await expect(page.getByTestId('backend-row-cancel-claude')).toHaveCount(0);
 
     // Cancel path: start → cancel posts cancelBackendProbe with same probeId.
     const beforeCancelStart = (await postedMessages(page)).length;
-    await page.getByTestId('start-backend-probe').click();
+    await page.getByTestId('backend-row-test-claude').click();
     let cancelProbeId: string | null = null;
     await expect
       .poll(async () => {
@@ -9091,9 +9100,9 @@ test.describe('M019 S02 Test Connection', () => {
       })
       .toBe(true);
 
-    await expect(page.getByTestId('cancel-backend-probe')).toBeVisible();
+    await expect(page.getByTestId('backend-row-cancel-claude')).toBeVisible();
     const beforeCancel = (await postedMessages(page)).length;
-    await page.getByTestId('cancel-backend-probe').click();
+    await page.getByTestId('backend-row-cancel-claude').click();
     await expect
       .poll(async () =>
         (await postedMessages(page))
@@ -9118,12 +9127,15 @@ test.describe('M019 S02 Test Connection', () => {
         checkedAt: '2026-07-25T02:00:05.000Z',
       }),
     });
-    await expect(surface).toHaveAttribute('data-probe-kind', 'idle');
-    await expect(page.getByTestId('backend-probe-status')).toContainText(
+    await expect(page.getByTestId('backend-row-claude')).toHaveAttribute(
+      'data-backend-state',
+      'installed_unverified',
+    );
+    await expect(page.getByTestId('backend-row-diagnostic-claude')).toContainText(
       /installed but not yet verified|cancelled/i,
     );
-    await expect(page.getByTestId('start-backend-probe')).toBeVisible();
-    await expect(page.getByTestId('cancel-backend-probe')).toHaveCount(0);
+    await expect(page.getByTestId('backend-row-test-claude')).toBeVisible();
+    await expect(page.getByTestId('backend-row-cancel-claude')).toHaveCount(0);
 
     // Stale/unsolicited progress for a different probeId must not hijack status.
     await postRawHostMessage(page, {
@@ -9136,8 +9148,279 @@ test.describe('M019 S02 Test Connection', () => {
         startedAt: '2026-07-25T02:00:06.000Z',
       },
     });
-    await expect(surface).toHaveAttribute('data-probe-kind', 'idle');
-    await expect(page.getByTestId('backend-probe-status')).not.toContainText(/probe session/i);
+    await expect(page.getByTestId('backend-row-claude')).toHaveAttribute(
+      'data-backend-state',
+      'installed_unverified',
+    );
+    // No progress row for a stale probe when idle; status must not claim session stage.
+    await expect(page.getByTestId('backend-row-progress-claude')).toHaveCount(0);
+    await expect(surface).toBeVisible();
+  });
+});
+
+test.describe('M019 S03 First Run Journey', () => {
+  const checkedAt = '2026-07-25T03:00:00.000Z';
+
+  function fiveMissingSnapshot(correlationId = 'e2e-s03-missing') {
+    const backends = ['claude', 'grok', 'kiro', 'codex', 'opencode'].map((backendId) => ({
+      backendId,
+      state: 'missing',
+      code: 'executable_missing',
+      recoveryAction: 'install',
+      compatibility: 'unknown',
+      versionEvidence: null,
+      checkedAt,
+    }));
+    return {
+      schemaVersion: 1,
+      correlationId,
+      phase: 'settled',
+      checkedAt,
+      backends,
+    };
+  }
+
+  function oneInstalledUnverifiedSnapshot(correlationId = 'e2e-s03-unverified') {
+    const backends = ['claude', 'grok', 'kiro', 'codex', 'opencode'].map((backendId) => {
+      if (backendId === 'claude') {
+        return {
+          backendId,
+          state: 'installed_unverified',
+          code: 'version_unknown',
+          recoveryAction: 'retry',
+          compatibility: 'unknown',
+          versionEvidence: '1.0.0',
+          checkedAt,
+        };
+      }
+      return {
+        backendId,
+        state: 'missing',
+        code: 'executable_missing',
+        recoveryAction: 'install',
+        compatibility: 'unknown',
+        versionEvidence: null,
+        checkedAt,
+      };
+    });
+    return {
+      schemaVersion: 1,
+      correlationId,
+      phase: 'settled',
+      checkedAt,
+      backends,
+    };
+  }
+
+  function claudeReadySnapshot(correlationId = 'e2e-s03-ready') {
+    const base = oneInstalledUnverifiedSnapshot(correlationId);
+    return {
+      ...base,
+      backends: base.backends.map((record) =>
+        record.backendId === 'claude'
+          ? {
+              ...record,
+              state: 'ready',
+              code: 'none',
+              recoveryAction: 'none',
+              compatibility: 'compatible',
+              versionEvidence: '1.0.0',
+              checkedAt: '2026-07-25T03:00:02.000Z',
+            }
+          : record,
+      ),
+    };
+  }
+
+  test('assembled journey: empty state → Agents Backends → refresh/test → ready → draft send; 320px usable', async ({
+    page,
+  }) => {
+    // Start unseeded so the derived first-run journey owns the empty-state path.
+    await openWebview(page, { backendReadiness: 'none' });
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [],
+      storeRevision: 1,
+    });
+
+    // Settled empty → install step visible; no Composer probe controls remain.
+    await postRawHostMessage(page, {
+      type: 'backendReadinessSnapshot',
+      snapshot: fiveMissingSnapshot(),
+    });
+    const journey = page.getByTestId('first-run-journey');
+    await expect(journey).toBeVisible();
+    await expect(journey).toHaveAttribute('data-active-step', 'install');
+    await expect(page.getByTestId('first-run-step-install')).toHaveAttribute(
+      'data-step-state',
+      'active',
+    );
+    await expect(page.getByTestId('start-backend-probe')).toHaveCount(0);
+    await expect(page.getByTestId('backend-probe-surface')).toHaveCount(0);
+
+    // Primary action deep-links into Agents → Backends.
+    await page.getByTestId('first-run-journey-primary').click();
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+    await expect(page.getByTestId('settings-backends')).toBeVisible();
+    await expect(page.getByTestId('backends-list')).toBeVisible();
+    await expect(page.getByTestId('backend-row-claude')).toHaveAttribute(
+      'data-backend-state',
+      'missing',
+    );
+
+    // Refresh from the Backends surface posts refreshBackendReadiness.
+    const beforeRefresh = (await postedMessages(page)).length;
+    await page.getByTestId('backends-refresh').click();
+    await expect
+      .poll(async () =>
+        (await postedMessages(page))
+          .slice(beforeRefresh)
+          .some((m) => (m as { type?: string }).type === 'refreshBackendReadiness'),
+      )
+      .toBe(true);
+
+    // Host settles one installed_unverified; Test Connection becomes available.
+    await postRawHostMessage(page, {
+      type: 'backendReadinessSnapshot',
+      snapshot: oneInstalledUnverifiedSnapshot(),
+    });
+    await expect(page.getByTestId('backend-row-claude')).toHaveAttribute(
+      'data-backend-state',
+      'installed_unverified',
+    );
+    const testBtn = page.getByTestId('backend-row-test-claude');
+    await expect(testBtn).toBeVisible();
+    await testBtn.focus();
+    await expect(testBtn).toBeFocused();
+
+    const beforeProbe = (await postedMessages(page)).length;
+    await testBtn.click();
+    let probeId: string | null = null;
+    await expect
+      .poll(async () => {
+        const msgs = (await postedMessages(page)).slice(beforeProbe);
+        const msg = msgs.find(
+          (m) => (m as { type?: string }).type === 'startBackendProbe',
+        ) as { probeId?: string; backendId?: string } | undefined;
+        probeId = msg?.probeId ?? null;
+        return msg?.backendId === 'claude' && typeof probeId === 'string';
+      })
+      .toBe(true);
+
+    await postRawHostMessage(page, {
+      type: 'backendProbeProgress',
+      progress: {
+        schemaVersion: 1,
+        probeId,
+        backendId: 'claude',
+        stage: 'version',
+        startedAt: '2026-07-25T03:00:01.000Z',
+      },
+    });
+    await expect(page.getByTestId('backend-row-progress-claude')).toContainText(/Checking version/i);
+
+    await postRawHostMessage(page, {
+      type: 'backendReadinessSnapshot',
+      snapshot: claudeReadySnapshot(),
+    });
+    await expect(page.getByTestId('backend-row-claude')).toHaveAttribute(
+      'data-backend-state',
+      'ready',
+    );
+    await expect(page.getByTestId('backend-row-diagnostic-claude')).toContainText(/Claude is ready/i);
+
+    // Leave Settings; journey advances to first-task with ready evidence.
+    await page.getByRole('button', { name: /Back/i }).first().click();
+    await expect(page.getByTestId('first-run-journey')).toBeVisible();
+    await expect(page.getByTestId('first-run-journey')).toHaveAttribute(
+      'data-active-step',
+      'first-task',
+    );
+    await expect(page.getByTestId('first-run-journey-detail')).toContainText(/Claude is ready/i);
+
+    // Start first task from journey → draft composer; send posts selected backend.
+    await page.getByTestId('first-run-journey-primary').click();
+    await expectPostedMessage(page, { type: 'newTask' });
+    const draftPicker = page.getByTestId('draft-model-picker');
+    await expect(draftPicker).toBeVisible();
+    await expect(draftPicker).not.toHaveAttribute('disabled', '');
+    // Ready backend: setup guidance strip is hidden; probe controls stay relocated away.
+    await expect(page.getByTestId('start-backend-probe')).toHaveCount(0);
+    await expect(page.getByTestId('backend-probe-surface')).toHaveCount(0);
+    // Journey secondary still exposes Open backend setup while on first-task step before draft.
+    // After draft opens with a ready backend, Composer does not re-show setup chrome.
+    await expect(page.getByTestId('open-backend-setup')).toHaveCount(0);
+
+    const composer = page.getByPlaceholder(/Start a new coordinator task/i);
+    await composer.fill('First accepted task after ready probe');
+    await page.getByRole('button', { name: 'Send' }).click();
+    await expectPostedMessage(page, {
+      type: 'send',
+      text: 'First accepted task after ready probe',
+      backend: 'claude',
+    });
+
+    // Leave draft so the task list shell is visible, then prove history remains
+    // listable even when no backend is currently ready.
+    await page.getByRole('button', { name: 'Back to tasks list' }).click();
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [
+        task({
+          id: 't-history',
+          goal: 'Prior task still openable',
+          backend: 'claude',
+          lifecycle: 'open',
+          viewStatus: 'idle',
+        }),
+      ],
+      // Omit focusedTaskId (null is rejected by isExtMessage).
+      storeRevision: 2,
+    });
+    await postRawHostMessage(page, {
+      type: 'backendReadinessSnapshot',
+      snapshot: fiveMissingSnapshot('e2e-s03-history-missing'),
+    });
+    // Journey hides once taskCount > 0 (no durable onboarding flag).
+    await expect(page.getByTestId('first-run-journey')).toHaveCount(0);
+    await expect(page.getByText('Prior task still openable')).toBeVisible();
+
+    // 320px density: reopen empty journey + Backends remains operable.
+    await page.setViewportSize({ width: 320, height: 720 });
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [],
+      storeRevision: 3,
+    });
+    await postRawHostMessage(page, {
+      type: 'backendReadinessSnapshot',
+      snapshot: oneInstalledUnverifiedSnapshot('e2e-s03-narrow'),
+    });
+    await expect(page.getByTestId('first-run-journey')).toBeVisible();
+    await page.getByTestId('first-run-journey-primary').click();
+    await expect(page.getByTestId('settings-backends')).toBeVisible();
+    await expect(page.getByTestId('backend-row-test-claude')).toBeVisible();
+    const backendsBox = await page.getByTestId('settings-backends').boundingBox();
+    expect(backendsBox).toBeTruthy();
+    expect(backendsBox!.width).toBeLessThanOrEqual(320);
+  });
+
+  test('revealBackendDiagnostics deep-link focuses settings-backends', async ({ page }) => {
+    await openWebview(page);
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [],
+      storeRevision: 1,
+    });
+    await postRawHostMessage(page, {
+      type: 'revealBackendDiagnostics',
+    });
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+    const backends = page.getByTestId('settings-backends');
+    await expect(backends).toBeVisible();
+    await expect
+      .poll(async () => controlHasFocus(backends))
+      .toBe(true);
   });
 });
 
