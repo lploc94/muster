@@ -8,6 +8,7 @@ import { SEND_OUTBOX_TEXT_MAX } from '../task/repository';
 import {
   evaluateNewTaskBackendEligibility,
   NEW_TASK_BACKEND_ELIGIBILITY_REJECT_REASON,
+  NEW_TASK_BACKEND_FIRST_RUN_REJECT_REASON,
   parseHostSendRequest,
 } from './send-request';
 
@@ -103,7 +104,7 @@ describe('evaluateNewTaskBackendEligibility', () => {
     });
   });
 
-  it('rejects missing and known-incompatible backends; permits installed_unverified', () => {
+  it('rejects missing and known-incompatible backends; permits installed_unverified for non-clean workspaces', () => {
     const missing = settledSnapshot();
     expect(evaluateNewTaskBackendEligibility(missing, 'claude').ok).toBe(false);
 
@@ -127,11 +128,86 @@ describe('evaluateNewTaskBackendEligibility', () => {
         versionEvidence: '1.0.0',
       },
     });
+    // Existing users (non-clean workspace / default): S01 passivelySelectable rule.
     expect(evaluateNewTaskBackendEligibility(installed, 'opencode')).toEqual({
+      ok: true,
+      backend: 'opencode',
+    });
+    expect(
+      evaluateNewTaskBackendEligibility(installed, 'opencode', { isCleanWorkspace: false }),
+    ).toEqual({
       ok: true,
       backend: 'opencode',
     });
     // Stale preference against a settled-empty inventory is rejected.
     expect(evaluateNewTaskBackendEligibility(installed, 'claude').ok).toBe(false);
+  });
+
+  it('D060: clean workspace requires trustworthyFirstRunEligible (ready only)', () => {
+    const installed = settledSnapshot({
+      opencode: {
+        state: 'installed_unverified',
+        code: 'version_unknown',
+        recoveryAction: 'retry',
+        compatibility: 'unknown',
+        versionEvidence: '1.0.0',
+      },
+    });
+    // Clean workspace fails closed: installed_unverified is not enough.
+    expect(
+      evaluateNewTaskBackendEligibility(installed, 'opencode', { isCleanWorkspace: true }),
+    ).toEqual({
+      ok: false,
+      reason: NEW_TASK_BACKEND_FIRST_RUN_REJECT_REASON,
+      code: 'validation',
+    });
+
+    const ready = settledSnapshot({
+      opencode: {
+        state: 'ready',
+        code: 'none',
+        recoveryAction: 'none',
+        compatibility: 'compatible',
+        versionEvidence: '1.0.0',
+      },
+    });
+    expect(
+      evaluateNewTaskBackendEligibility(ready, 'opencode', { isCleanWorkspace: true }),
+    ).toEqual({
+      ok: true,
+      backend: 'opencode',
+    });
+
+    // Known-incompatible never passes even when clean + ready-shaped fields.
+    const incompatibleReady = settledSnapshot({
+      claude: {
+        state: 'ready',
+        code: 'none',
+        recoveryAction: 'none',
+        compatibility: 'incompatible',
+        versionEvidence: '1.0.0',
+      },
+    });
+    expect(
+      evaluateNewTaskBackendEligibility(incompatibleReady, 'claude', {
+        isCleanWorkspace: true,
+      }).ok,
+    ).toBe(false);
+  });
+
+  it('D060: failed cleanliness read is fail-closed to the strict first-run rule', () => {
+    // Caller maps a failed listRootTasks into isCleanWorkspace: true.
+    const installed = settledSnapshot({
+      grok: {
+        state: 'installed_unverified',
+        code: 'version_unknown',
+        recoveryAction: 'retry',
+        compatibility: 'unknown',
+        versionEvidence: '2.0.0',
+      },
+    });
+    expect(
+      evaluateNewTaskBackendEligibility(installed, 'grok', { isCleanWorkspace: true }).ok,
+    ).toBe(false);
   });
 });

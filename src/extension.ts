@@ -1224,6 +1224,15 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  /**
+   * M019/S03 deep-link: open Settings → Agents → Backends for Doctor (S04).
+   * Posts the additive empty `revealBackendDiagnostics` host→webview message.
+   * Does not open VS Code native settings; webview owns the Settings panel.
+   */
+  revealBackendDiagnostics(): void {
+    this.post({ type: 'revealBackendDiagnostics' });
+  }
+
   private handleSetComposerSelection(data: { backend?: unknown; model?: unknown }): void {
     const selection = parseComposerSelection({
       backend: data.backend,
@@ -2191,13 +2200,26 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    // M019 S01: pure new-task inventory gate BEFORE durable outbox mutation.
+    // M019 S01/S03: pure new-task inventory gate BEFORE durable outbox mutation.
     // Existing-task follow-ups and task-bound handoffs are not blocked here.
+    // D060: clean workspace (zero root tasks) requires trustworthyFirstRunEligible;
+    // failed cleanliness read fails closed to the strict rule.
     let newTaskBackend: string | undefined;
     if (!data.taskId) {
+      let isCleanWorkspace = true;
+      try {
+        const roots = await taskRepository.listRootTasks(repositoryWorkspaceId(), {
+          limit: 1,
+        });
+        isCleanWorkspace = roots.items.length === 0;
+      } catch {
+        // Fail closed: treat as clean so first-run still requires ready.
+        isCleanWorkspace = true;
+      }
       const eligibility = evaluateNewTaskBackendEligibility(
         getBackendReadinessService().peek(),
         data.backend,
+        { isCleanWorkspace },
       );
       if (!eligibility.ok) {
         this.post({

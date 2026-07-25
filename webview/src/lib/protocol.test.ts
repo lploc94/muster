@@ -1960,3 +1960,25 @@ describe('isExtMessage backendProbeProgress (M019/S02)', () => {
   });
 });
 
+describe('isExtMessage revealBackendDiagnostics (M019/S03)', () => {
+  it('accepts the empty additive revealBackendDiagnostics message', () => {
+    expect(isExtMessage({ type: 'revealBackendDiagnostics' })).toBe(true);
+  });
+
+  it('rejects revealBackendDiagnostics with extra keys or wrong type', () => {
+    expect(
+      isExtMessage({
+        type: 'revealBackendDiagnostics',
+        focus: 'settings-backends',
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'revealBackendDiagnostics',
+        backendId: 'claude',
+      }),
+    ).toBe(false);
+    expect(isExtMessage({ type: 'revealBackendDiagnostic' })).toBe(false);
+  });
+});
+

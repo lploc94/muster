@@ -1,5 +1,6 @@
 import {
   isPassivelySelectable,
+  isTrustworthyFirstRunEligible,
   type BackendReadinessSnapshot,
 } from '../shared/backend-readiness';
 import {
@@ -155,22 +156,40 @@ export function parseHostSendRequest(value: unknown): HostSendRequestParseResult
 export const NEW_TASK_BACKEND_ELIGIBILITY_REJECT_REASON =
   'selected backend is not passively available';
 
+/**
+ * Fixed validation reason when a clean workspace first task is rejected because
+ * the chosen backend is not probe-proven ready (D058 / D060).
+ */
+export const NEW_TASK_BACKEND_FIRST_RUN_REJECT_REASON =
+  'selected backend is not ready for first run';
+
 export type NewTaskBackendEligibilityResult =
   | { ok: true; backend: string }
   | { ok: false; reason: string; code: 'validation' };
 
 /**
- * Pure host-side new-task backend guard (M019 S01 / D058).
+ * Optional gate options. `isCleanWorkspace` is true when the workspace has zero
+ * root tasks (D060) — including when the cleanliness read fails closed.
+ * Omit / false keeps the S01 isPassivelySelectable rule for existing users.
+ */
+export interface NewTaskBackendEligibilityOptions {
+  isCleanWorkspace?: boolean;
+}
+
+/**
+ * Pure host-side new-task backend guard (M019 S01/S03 / D058 / D060).
  *
  * Call before any durable outbox / task / turn / message mutation.
  * Existing-task follow-ups are not gated here (caller must skip when taskId is set).
  *
- * Permits installed_unverified via isPassivelySelectable; does not enforce
- * trustworthyFirstRunEligible (S03 after S02 can produce ready).
+ * Default / non-clean workspaces: isPassivelySelectable (installed_unverified+).
+ * Clean workspaces (zero root tasks, or failed cleanliness read): require
+ * isTrustworthyFirstRunEligible (state ready, not known-incompatible).
  */
 export function evaluateNewTaskBackendEligibility(
   snapshot: BackendReadinessSnapshot | null | undefined,
   backend: string | undefined,
+  options?: NewTaskBackendEligibilityOptions,
 ): NewTaskBackendEligibilityResult {
   if (!snapshot || snapshot.phase !== 'settled') {
     return {
@@ -193,6 +212,15 @@ export function evaluateNewTaskBackendEligibility(
       reason: NEW_TASK_BACKEND_ELIGIBILITY_REJECT_REASON,
       code: 'validation',
     };
+  }
+  if (options?.isCleanWorkspace) {
+    if (!isTrustworthyFirstRunEligible(record)) {
+      return {
+        ok: false,
+        reason: NEW_TASK_BACKEND_FIRST_RUN_REJECT_REASON,
+        code: 'validation',
+      };
+    }
   }
   return { ok: true, backend };
 }

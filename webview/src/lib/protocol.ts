@@ -499,6 +499,13 @@ export type ExtMessage =
    */
   | { type: 'backendProbeProgress'; progress: BackendProbeProgress }
   /**
+   * Host→webview deep-link (M019/S03): open Settings on the Agents domain and
+   * focus the stable Backends section target (`settings-backends`). Additive;
+   * PROTOCOL_VERSION stays at 10. S04's Doctor command sends this message.
+   * Payload is intentionally empty — no secrets, paths, or diagnostics body.
+   */
+  | { type: 'revealBackendDiagnostics' }
+  /**
    * A backend's advertised skills + its per-backend invocation prefix (`/` or `$`).
    * `prefix` is always present (static map) even when `skills` is empty (cold cache).
    */
@@ -1758,6 +1765,10 @@ export function isExtMessage(data: unknown): data is ExtMessage {
         hasOnlyKeys(data, ['type', 'progress']) &&
         parseBackendProbeProgress((data as { progress: unknown }).progress) !== null
       );
+
+    case 'revealBackendDiagnostics':
+      // Empty additive payload — type key only (M019/S03 deep-link contract).
+      return hasOnlyKeys(data, ['type']);
 
     case 'skillsAvailable':
       return (
