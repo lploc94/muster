@@ -324,6 +324,7 @@
     "mvp:bridge": "tsx scripts/test-bridge.ts",
     "test:agy-ask": "node scripts/test-agy-ask-mcp.mjs",
     "test": "vitest run",
+    "test:m019-s01": "vitest run src/host/m019-s01-truthful-backend-inventory.test.ts src/host/send-request.test.ts src/host/backend-readiness.test.ts src/shared/backend-readiness.test.ts webview/src/lib/backend-eligibility.test.ts webview/src/lib/backend-resolve.test.ts && npx playwright test e2e/muster-webview-state.spec.ts --grep \"M019 S01 Composer readiness\"",
     "test:task-audit": "node --test scripts/verify-task-model-ui-state-audit.test.mjs",
     "test:settings-docs": "node --test scripts/verify-settings-docs.test.mjs",
     "test:settings-live-evidence": "node --test scripts/verify-settings-live-host-evidence.test.mjs",

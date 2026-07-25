@@ -1,4 +1,8 @@
 import {
+  isPassivelySelectable,
+  type BackendReadinessSnapshot,
+} from '../shared/backend-readiness';
+import {
   SEND_OUTBOX_MENTION_BINDINGS_MAX,
   SEND_OUTBOX_PATH_MAX,
   SEND_OUTBOX_SKILLS_MAX,
@@ -145,4 +149,50 @@ export function parseHostSendRequest(value: unknown): HostSendRequestParseResult
       ...(mentionBindings ? { mentionBindings } : {}),
     },
   };
+}
+
+/** Fixed validation reason for pre-outbox new-task backend eligibility rejects. */
+export const NEW_TASK_BACKEND_ELIGIBILITY_REJECT_REASON =
+  'selected backend is not passively available';
+
+export type NewTaskBackendEligibilityResult =
+  | { ok: true; backend: string }
+  | { ok: false; reason: string; code: 'validation' };
+
+/**
+ * Pure host-side new-task backend guard (M019 S01 / D058).
+ *
+ * Call before any durable outbox / task / turn / message mutation.
+ * Existing-task follow-ups are not gated here (caller must skip when taskId is set).
+ *
+ * Permits installed_unverified via isPassivelySelectable; does not enforce
+ * trustworthyFirstRunEligible (S03 after S02 can produce ready).
+ */
+export function evaluateNewTaskBackendEligibility(
+  snapshot: BackendReadinessSnapshot | null | undefined,
+  backend: string | undefined,
+): NewTaskBackendEligibilityResult {
+  if (!snapshot || snapshot.phase !== 'settled') {
+    return {
+      ok: false,
+      reason: NEW_TASK_BACKEND_ELIGIBILITY_REJECT_REASON,
+      code: 'validation',
+    };
+  }
+  if (typeof backend !== 'string' || backend.length === 0 || !BACKENDS.has(backend)) {
+    return {
+      ok: false,
+      reason: NEW_TASK_BACKEND_ELIGIBILITY_REJECT_REASON,
+      code: 'validation',
+    };
+  }
+  const record = snapshot.backends.find((b) => b.backendId === backend);
+  if (!record || !isPassivelySelectable(record)) {
+    return {
+      ok: false,
+      reason: NEW_TASK_BACKEND_ELIGIBILITY_REJECT_REASON,
+      code: 'validation',
+    };
+  }
+  return { ok: true, backend };
 }

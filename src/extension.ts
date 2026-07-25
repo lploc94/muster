@@ -94,7 +94,11 @@ import {
 } from './host/composer-selection';
 import { pickWorkspaceFileMentionPath } from './host/workspace-files';
 import { resolveDroppedFileMention } from './host/file-mentions';
-import { parseHostSendRequest, type HostSendRequest } from './host/send-request';
+import {
+  evaluateNewTaskBackendEligibility,
+  parseHostSendRequest,
+  type HostSendRequest,
+} from './host/send-request';
 import {
   isFileMentionDirectorySymlink,
   listFileMentionSuggestions,
@@ -2095,6 +2099,26 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    // M019 S01: pure new-task inventory gate BEFORE durable outbox mutation.
+    // Existing-task follow-ups and task-bound handoffs are not blocked here.
+    let newTaskBackend: string | undefined;
+    if (!data.taskId) {
+      const eligibility = evaluateNewTaskBackendEligibility(
+        getBackendReadinessService().peek(),
+        data.backend,
+      );
+      if (!eligibility.ok) {
+        this.post({
+          type: 'sendRejected',
+          clientRequestId,
+          reason: eligibility.reason,
+          code: eligibility.code,
+        });
+        return;
+      }
+      newTaskBackend = eligibility.backend;
+    }
+
     const llmText =
       typeof data.llmText === 'string' && data.llmText.trim() ? data.llmText.trim() : text;
 
@@ -2111,7 +2135,11 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           : {}),
         ...(Array.isArray(data.mentionBindings) ? { mentionBindings: data.mentionBindings } : {}),
         ...(Array.isArray(data.skills) ? { skills: data.skills } : {}),
-        ...(typeof data.backend === 'string' ? { backend: data.backend } : {}),
+        ...(typeof data.backend === 'string'
+          ? { backend: data.backend }
+          : newTaskBackend
+            ? { backend: newTaskBackend }
+            : {}),
         ...(typeof data.model === 'string' ? { model: data.model } : {}),
         ...(typeof data.continuationOf === 'string'
           ? { continuationOf: data.continuationOf }
@@ -2180,7 +2208,16 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       }
 
       const shortGoal = text.length <= 30 ? text : text.slice(0, 30).trim() + '…';
-      const resolvedBackend = data.backend ?? 'claude';
+      // No implicit Claude default: eligibility already required an explicit
+      // passively selectable backend before outbox commit.
+      if (typeof data.backend !== 'string' || !data.backend) {
+        return {
+          ok: false,
+          reason: 'selected backend is not passively available',
+          code: 'validation',
+        };
+      }
+      const resolvedBackend = data.backend;
       const resolvedModel =
         typeof data.model === 'string' && data.model ? data.model : undefined;
       const result = await taskEngine.startNewTask({
