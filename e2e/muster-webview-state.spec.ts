@@ -8727,6 +8727,129 @@ test.describe('M015 S02 compact hit targets', () => {
 
 
 
+
+
+test.describe('M019 S01 Composer readiness', () => {
+  function fiveMissingSnapshot(correlationId = 'e2e-corr-missing') {
+    const checkedAt = '2026-07-25T00:00:00.000Z';
+    const backends = ['claude', 'grok', 'kiro', 'codex', 'opencode'].map((backendId) => ({
+      backendId,
+      state: 'missing',
+      code: 'executable_missing',
+      recoveryAction: 'install',
+      compatibility: 'unknown',
+      versionEvidence: null,
+      checkedAt,
+    }));
+    return {
+      schemaVersion: 1,
+      correlationId,
+      phase: 'settled',
+      checkedAt,
+      backends,
+    };
+  }
+
+  function oneInstalledUnverifiedSnapshot(correlationId = 'e2e-corr-opencode') {
+    const checkedAt = '2026-07-25T00:01:00.000Z';
+    const backends = ['claude', 'grok', 'kiro', 'codex', 'opencode'].map((backendId) => {
+      if (backendId === 'opencode') {
+        return {
+          backendId,
+          state: 'installed_unverified',
+          code: 'version_unknown',
+          recoveryAction: 'retry',
+          compatibility: 'unknown',
+          versionEvidence: '1.0.0',
+          checkedAt,
+        };
+      }
+      return {
+        backendId,
+        state: 'missing',
+        code: 'executable_missing',
+        recoveryAction: 'install',
+        compatibility: 'unknown',
+        versionEvidence: null,
+        checkedAt,
+      };
+    });
+    return {
+      schemaVersion: 1,
+      correlationId,
+      phase: 'settled',
+      checkedAt,
+      backends,
+    };
+  }
+
+  test('loading then settled-empty blocks draft; refresh installs unverified option; existing task stays usable', async ({
+    page,
+  }) => {
+    await openWebview(page);
+
+    // Loading: no readiness / backends yet → guidance + disabled draft picker.
+    await page.getByRole('button', { name: 'New task' }).click();
+    await expect(page.getByTestId('backend-readiness-guidance')).toBeVisible();
+    await expect(page.getByTestId('refresh-backends')).toBeVisible();
+    const draftPicker = page.getByTestId('draft-model-picker');
+    await expect(draftPicker).toHaveAttribute('disabled', '');
+
+    // Settled empty (all missing).
+    await postRawHostMessage(page, {
+      type: 'backendReadinessSnapshot',
+      snapshot: fiveMissingSnapshot(),
+    });
+    await expect(page.getByTestId('backend-readiness-guidance')).toContainText(/No supported agent CLIs/i);
+    await expect(draftPicker).toHaveAttribute('disabled', '');
+    await expect(page.getByPlaceholder('Install a supported agent CLI to start a task…')).toBeVisible();
+
+    // Refresh action posts correlated refreshBackendReadiness.
+    const beforeRefresh = (await postedMessages(page)).length;
+    await page.getByTestId('refresh-backends').click();
+    await expect
+      .poll(async () =>
+        (await postedMessages(page))
+          .slice(beforeRefresh)
+          .some((m) => (m as { type?: string }).type === 'refreshBackendReadiness'),
+      )
+      .toBe(true);
+
+    // Installed-unverified becomes selectable; missing providers stay off the list.
+    await postRawHostMessage(page, {
+      type: 'backendReadinessSnapshot',
+      snapshot: oneInstalledUnverifiedSnapshot(),
+    });
+    await expect(draftPicker).not.toHaveAttribute('disabled', '');
+    const optionLabels = await draftPicker.locator('vscode-option').allTextContents();
+    expect(optionLabels.join(' ')).toMatch(/installed, unverified/i);
+    expect(optionLabels.join(' ').toLowerCase()).not.toContain('claude');
+
+    // Existing task non-regression: task composer remains usable with bound backend.
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [
+        task({
+          id: 't-existing',
+          goal: 'Existing task',
+          backend: 'claude',
+          lifecycle: 'open',
+          viewStatus: 'idle',
+        }),
+      ],
+      focusedTaskId: 't-existing',
+      subtree: [],
+      transcript: [],
+      transcriptPage: { hasMoreBefore: false, workspaceRevision: 1 },
+      storeRevision: 1,
+    });
+    await expect(page.getByTestId('task-model-switch')).toBeVisible();
+    const taskComposer = page.getByPlaceholder('Message this task…');
+    await expect(taskComposer).toBeVisible();
+    await expect(taskComposer).not.toBeDisabled();
+  });
+});
+
 declare global {
   interface Window {
     acquireVsCodeApi: () => {

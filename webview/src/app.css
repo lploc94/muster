@@ -2678,3 +2678,35 @@ body {
   - Math: Cũng phải tự xử lý.
   - Ưu điểm: Nhìn "chuẩn GitHub" nhất.
 */
+
+
+/* M019 S01 — bounded backend readiness guidance in draft Composer */
+.composer-readiness {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.composer-readiness__text {
+  flex: 1 1 12rem;
+  min-width: 0;
+}
+.composer-readiness__refresh {
+  flex: 0 0 auto;
+  background: transparent;
+  border: 1px solid var(--vscode-button-border, var(--vscode-panel-border));
+  color: var(--vscode-textLink-foreground, var(--vscode-foreground));
+  border-radius: 2px;
+  padding: 0.15rem 0.45rem;
+  font: inherit;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+.composer-readiness__refresh:hover {
+  background: var(--vscode-toolbar-hoverBackground, transparent);
+}
+.composer-readiness__refresh:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}

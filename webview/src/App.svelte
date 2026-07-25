@@ -886,7 +886,13 @@
           break;
 
         case 'backendsAvailable':
+          // Derived list remains for Settings/legacy consumers; readiness truth
+          // is backendReadinessSnapshot (M019). Keep hostHydrated path intact.
           tasks.setAvailableBackends(msg.backends);
+          break;
+
+        case 'backendReadinessSnapshot':
+          tasks.applyBackendReadinessSnapshot(msg.snapshot);
           break;
 
         case 'modelsAvailable':
@@ -947,7 +953,9 @@
 
     window.addEventListener('message', onMessage);
     window.addEventListener('muster:prefill-applied', onPrefillApplied);
-    // Ask the host which backends are installed so the picker only offers them.
+    // Passive readiness inventory (M019): correlated request; host also posts
+    // derived backendsAvailable. listBackends remains for transitional hosts.
+    post({ type: 'requestBackendReadiness', requestId: `init-${Date.now()}` });
     post({ type: 'listBackends' });
     // Model catalog is explicit listModels only (M019 S01) — no ACP sessions on mount.
     // Phase C outbox replay happens after a compatible snapshot (see below).

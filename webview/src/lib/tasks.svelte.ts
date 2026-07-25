@@ -1,4 +1,8 @@
 import type { BackendModels, QueuedTurnProjection, SnapshotMessage, TaskSummary } from './protocol';
+import {
+  derivePassivelySelectableBackendIds,
+  type BackendReadinessSnapshot,
+} from '../../../src/shared/backend-readiness';
 import { isHardTerminalLifecycle, post } from './protocol';
 import { sortQueuedTurns } from './queued-turns';
 import { parseBackendId, parseModelFromSelectValue } from './backend-resolve';
@@ -71,6 +75,15 @@ class TasksState {
 
   /** Backend ids the host reports as installed/callable; null = not yet known. */
   availableBackends = $state<string[] | null>(null);
+
+  /**
+   * Host-owned passive BackendReadinessSnapshot (M019). null = not yet known /
+   * checking. Do not reuse hostHydrated as readiness truth — hostHydrated only
+   * gates rejected-send skill restoration once any authoritative host init
+   * message has arrived.
+   */
+  backendReadinessSnapshot = $state<BackendReadinessSnapshot | null>(null);
+
 
   /** Per-backend model lists reported by the host; null = not yet enumerated. */
   modelsByBackend = $state<Record<string, BackendModels> | null>(null);
@@ -161,10 +174,22 @@ class TasksState {
 
   setAvailableBackends(ids: string[]): void {
     this.availableBackends = ids;
-    // The host always posts backendsAvailable on init → the composer backend is
-    // now considered hydrated for the purpose of a backend-scoped chip restore.
+    // Derived list alone is not readiness truth; still marks host init for
+    // rejected-send skill restoration (chips may restore before full snapshot).
     this.hostHydrated = true;
     // Recompute display only — never overwrite preferredBackend/model.
+    this.syncDisplaySelection();
+  }
+
+  /**
+   * Apply host-owned BackendReadinessSnapshot. Derives availableBackends from
+   * passively selectable providers and sets hostHydrated for skill restore.
+   * Never invents readiness when the payload is absent.
+   */
+  applyBackendReadinessSnapshot(snapshot: BackendReadinessSnapshot): void {
+    this.backendReadinessSnapshot = snapshot;
+    this.availableBackends = derivePassivelySelectableBackendIds(snapshot);
+    this.hostHydrated = true;
     this.syncDisplaySelection();
   }
 
