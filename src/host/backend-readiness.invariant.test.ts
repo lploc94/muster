@@ -274,15 +274,25 @@ describe('M019 S01 zero-side-effect invariant (T06)', () => {
   });
 
   describe('protocol surface — readiness is additive and passive', () => {
-    it('protocol declares backendReadinessSnapshot + request/refresh without auth probe types', () => {
+    it('protocol declares backendReadinessSnapshot + request/refresh; S02 probe names are additive', () => {
       const content = readRepoFile('webview/src/lib/protocol.ts');
-      expect(content).toMatch(/backendReadinessSnapshot/);
-      expect(content).toMatch(/requestBackendReadiness/);
-      expect(content).toMatch(/refreshBackendReadiness/);
-      // S01 must not introduce an active Test Connection protocol type.
-      expect(content).not.toMatch(/testConnection|probeBackend|authProbe/i);
-      // session/prompt must never appear on the webview protocol surface.
-      expect(content).not.toMatch(/session\/prompt/);
+      // Strip comments so isolation docs may name forbidden methods without failing the scan.
+      const code = content
+        .replace(/\/\*[\s\S]*?\*\//g, (block) => block.replace(/[^\n]/g, ' '))
+        .replace(/(^|[\s;{}()\[\],=])\/\/.*$/gm, '$1');
+      expect(code).toMatch(/backendReadinessSnapshot/);
+      expect(code).toMatch(/requestBackendReadiness/);
+      expect(code).toMatch(/refreshBackendReadiness/);
+      // S01 forbade ad-hoc auth probe names. S02 adds the closed start/cancel/progress
+      // probe messages (isolation proven by backend-probe.invariant.test.ts).
+      // Legacy informal names remain forbidden.
+      expect(code).not.toMatch(/\btestConnection\b|\bprobeBackend\b|\bauthProbe\b/i);
+      // session/prompt must never appear as executable protocol surface code.
+      expect(code).not.toMatch(/session\/prompt/);
+      // S02 additive contract is present (does not regress when S02 ships).
+      expect(code).toMatch(/startBackendProbe/);
+      expect(code).toMatch(/cancelBackendProbe/);
+      expect(code).toMatch(/backendProbeProgress/);
     });
   });
 
