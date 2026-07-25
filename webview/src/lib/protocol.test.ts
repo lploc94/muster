@@ -1899,5 +1899,17 @@ describe('M019 backend readiness protocol', () => {
     badTs.checkedAt = 'yesterday';
     expect(isExtMessage({ type: 'backendReadinessSnapshot', snapshot: badTs })).toBe(false);
   });
+
+  it('accepts installed_unverified records in a well-formed snapshot', () => {
+    const snap = validSnapshot();
+    snap.backends[0] = {
+      ...snap.backends[0],
+      state: 'installed_unverified',
+      code: 'version_unknown',
+      recoveryAction: 'retry',
+      versionEvidence: '1.2.3',
+    };
+    expect(isExtMessage({ type: 'backendReadinessSnapshot', snapshot: snap })).toBe(true);
+  });
 });
 

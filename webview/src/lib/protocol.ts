@@ -11,7 +11,14 @@ import type { NormalizedEvent, Question } from './types';
  * breaking change to the ExtMessage/OutMessage shapes below (and mirror it in
  * src/extension.ts).
  */
+import {
+  parseBackendReadinessSnapshot,
+  type BackendReadinessSnapshot,
+} from '../../../src/shared/backend-readiness';
+
 export const PROTOCOL_VERSION = 10;
+
+export type { BackendReadinessSnapshot };
 
 /**
  * Require an exact peer protocol version. A different or malformed version
@@ -712,6 +719,13 @@ export type OutMessage =
   | { type: 'updatePermissionSettings'; mode: PermissionModeSetting }
   | { type: 'listBackends' }
   | { type: 'listModels' }
+  /**
+   * Correlated passive readiness request (M019). Host returns backendReadinessSnapshot
+   * (+ derived backendsAvailable). Optional requestId is echoed as correlationId.
+   */
+  | { type: 'requestBackendReadiness'; requestId?: string }
+  /** Force PATH/version re-inventory; requestId required for refresh correlation. */
+  | { type: 'refreshBackendReadiness'; requestId: string }
   /** Ask the host for a backend's advertised skills + invocation prefix. */
   | { type: 'listSkills'; backend: string }
   /** Webview → host debug line for Output channel "Muster Debug". */
@@ -1702,6 +1716,12 @@ export function isExtMessage(data: unknown): data is ExtMessage {
 
     case 'backendsAvailable':
       return Array.isArray(data.backends) && data.backends.every(isString);
+
+    case 'backendReadinessSnapshot':
+      return (
+        hasOnlyKeys(data, ['type', 'snapshot']) &&
+        parseBackendReadinessSnapshot((data as { snapshot: unknown }).snapshot) !== null
+      );
 
     case 'skillsAvailable':
       return (

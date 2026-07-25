@@ -350,7 +350,7 @@
     post({ type: 'requestTaskTypesSettings' });
     post({ type: 'requestPermissionSettings' });
     post({ type: 'listBackends' });
-    post({ type: 'listModels' });
+    // Model enumeration is explicit-only (M019 S01); Settings open stays passive.
   }
 
   function closeSettings() {
@@ -949,8 +949,7 @@
     window.addEventListener('muster:prefill-applied', onPrefillApplied);
     // Ask the host which backends are installed so the picker only offers them.
     post({ type: 'listBackends' });
-    // Prefetch model lists for the New-task picker (host also prefetches on resolve).
-    post({ type: 'listModels' });
+    // Model catalog is explicit listModels only (M019 S01) — no ACP sessions on mount.
     // Phase C outbox replay happens after a compatible snapshot (see below).
     return () => {
       window.removeEventListener('message', onMessage);

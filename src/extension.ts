@@ -75,12 +75,15 @@ import {
   buildPermissionSettingsSnapshot,
   handlePermissionSettingsUpdateAction,
 } from './host/permission-settings';
-import { detectAvailableBackends, installAugmentedPath } from './host/backend-availability';
+import { randomUUID } from 'node:crypto';
+import { installAugmentedPath } from './host/backend-availability';
 import {
   BackendReadinessService,
   createDefaultBackendReadinessDeps,
 } from './host/backend-readiness';
 import {
+  BACKEND_READINESS_IDS,
+  BACKEND_READINESS_SCHEMA_VERSION,
   derivePassivelySelectableBackendIds,
   type BackendReadinessSnapshot,
 } from './shared/backend-readiness';
@@ -201,6 +204,73 @@ let peerResetHandled = false;
 /** Shared host-env cache for first-turn inject + get_host_context (W1). */
 let hostEnvCache: HostEnvironmentSnapshot | undefined;
 let hostEnvPrepare: Promise<void> | undefined;
+
+/** Single-flight passive readiness inventory (M019 S01). */
+let backendReadinessService: BackendReadinessService | undefined;
+let backendReadinessPromise: Promise<BackendReadinessSnapshot> | undefined;
+
+function getBackendReadinessService(): BackendReadinessService {
+  if (!backendReadinessService) {
+    backendReadinessService = new BackendReadinessService(createDefaultBackendReadinessDeps());
+  }
+  return backendReadinessService;
+}
+
+/** Settled diagnostic snapshot when inventory throws (fail closed, never silent). */
+function settledInternalErrorSnapshot(correlationId?: string): BackendReadinessSnapshot {
+  const checkedAt = new Date().toISOString();
+  const corr =
+    typeof correlationId === 'string' && correlationId.length > 0 && correlationId.length <= 128
+      ? correlationId
+      : randomUUID();
+  return {
+    schemaVersion: BACKEND_READINESS_SCHEMA_VERSION,
+    correlationId: corr,
+    phase: 'settled',
+    checkedAt,
+    backends: BACKEND_READINESS_IDS.map((backendId) => ({
+      backendId,
+      state: 'failed' as const,
+      code: 'internal_error' as const,
+      recoveryAction: 'retry' as const,
+      compatibility: 'unknown' as const,
+      versionEvidence: null,
+      checkedAt,
+    })),
+  };
+}
+
+/**
+ * Passive inventory single-flight. refresh=true invalidates the in-flight promise
+ * so PATH/version changes are visible without reload. Always returns a settled
+ * snapshot (never throws to callers).
+ */
+async function ensureBackendReadiness(
+  refresh: boolean,
+  correlationId?: string,
+): Promise<BackendReadinessSnapshot> {
+  if (refresh) {
+    backendReadinessPromise = undefined;
+  }
+  if (!backendReadinessPromise) {
+    backendReadinessPromise = (async () => {
+      try {
+        return await getBackendReadinessService().refresh(correlationId);
+      } catch (err) {
+        console.warn(
+          'Muster: backend readiness inventory failed:',
+          err instanceof Error ? err.message : err,
+        );
+        // Drop single-flight so a later request retries.
+        backendReadinessPromise = undefined;
+        return settledInternalErrorSnapshot(correlationId);
+      }
+    })();
+  }
+  // When a correlated refresh is already in flight without this id, still await
+  // the single-flight result and rewrite correlation on delivery in postBackendReadiness.
+  return backendReadinessPromise;
+}
 
 function writeHostEnvCache(partial: {
   availableBackends?: string[];
@@ -465,9 +535,7 @@ function scheduleRetention(): void {
 class MusterChatProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'muster.chat';
   private _view?: vscode.WebviewView;
-  /** In-flight/cached detection of which backend CLIs are callable (computed once). */
-  private availableBackendsPromise?: Promise<string[]>;
-  /** In-flight/cached per-backend model enumeration (computed once). */
+  /** In-flight/cached per-backend model enumeration (explicit listModels only). */
   private availableModelsPromise?: Promise<Record<string, BackendModels>>;
   /** Discards stale async repository snapshots when focus/commits race. */
   private snapshotGeneration = 0;
@@ -979,9 +1047,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * Detect (once, cached) which backend CLIs are installed on this machine and
-   * tell the webview so its picker only offers callable backends. If detection
-   * fails we stay silent — the webview then fails open and shows all backends.
+   * Deliver passive BackendReadinessSnapshot (M019) and derived backendsAvailable.
+   * Failures post a settled diagnostic snapshot rather than staying silent.
    */
   private async postAvailableBackends(): Promise<void> {
     await this.postBackendReadiness('current');
@@ -1013,10 +1080,22 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         backends: derivePassivelySelectableBackendIds(delivered),
       });
       this.post({ type: 'backendReadinessSnapshot', snapshot: delivered });
-    } catch {
-      // ensureBackendReadiness already normalizes failures; if we still throw,
-      // drop single-flight so a later request retries.
+    } catch (err) {
+      // Last-resort: always post a settled diagnostic snapshot (never silent).
+      console.warn(
+        'Muster: postBackendReadiness failed:',
+        err instanceof Error ? err.message : err,
+      );
       backendReadinessPromise = undefined;
+      const fallback = settledInternalErrorSnapshot(requestId);
+      writeHostEnvCache({
+        availableBackends: derivePassivelySelectableBackendIds(fallback),
+      });
+      this.post({
+        type: 'backendsAvailable',
+        backends: derivePassivelySelectableBackendIds(fallback),
+      });
+      this.post({ type: 'backendReadinessSnapshot', snapshot: fallback });
     }
   }
 
@@ -2912,10 +2991,44 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         case 'listBackends':
           void this.postAvailableBackends();
           break;
+        case 'requestBackendReadiness': {
+          const rawId = (data as { requestId?: unknown })?.requestId;
+          const requestId =
+            typeof rawId === 'string' &&
+            rawId.length > 0 &&
+            rawId.length <= MAX_ID_CHARS &&
+            /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(rawId)
+              ? rawId
+              : undefined;
+          // Reject overlong/malformed requestId shapes by ignoring them (fail closed).
+          if (rawId !== undefined && requestId === undefined) {
+            console.warn('Muster: ignoring requestBackendReadiness with malformed requestId');
+            break;
+          }
+          void this.postBackendReadiness('current', requestId);
+          break;
+        }
+        case 'refreshBackendReadiness': {
+          const rawId = (data as { requestId?: unknown })?.requestId;
+          const requestId =
+            typeof rawId === 'string' &&
+            rawId.length > 0 &&
+            rawId.length <= MAX_ID_CHARS &&
+            /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(rawId)
+              ? rawId
+              : '';
+          if (!requestId) {
+            console.warn('Muster: ignoring refreshBackendReadiness without valid requestId');
+            break;
+          }
+          void this.postBackendReadiness('refresh', requestId);
+          break;
+        }
         case 'listSkills':
           this.postAvailableSkills((data as { backend: string }).backend);
           break;
         case 'listModels':
+          // Explicit user-triggered model discovery only (no activation/panel auto-enum).
           void this.postAvailableModels();
           break;
         case 'setComposerSelection':
@@ -2960,11 +3073,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       await this.postSendOutboxSnapshot();
       await this.hydrateSnapshotAndResumePolling(this.focusedTaskId);
     })();
-    // Tell the webview which backends are actually installed so its picker only
-    // offers callable ones (the webview also requests this on mount).
+    // Passive readiness inventory only on panel resolve (M019 S01).
+    // Model enumeration is explicit listModels — no ACP sessions on open.
     void this.postAvailableBackends();
-    // Prefetch model catalog so New task can show [Backend] Model options promptly.
-    void this.postAvailableModels();
     // Restore last-used backend/model from VS Code Settings (survives restarts).
     this.postComposerSelection();
   }
