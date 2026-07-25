@@ -8861,6 +8861,286 @@ test.describe('M019 S01 Composer readiness', () => {
   });
 });
 
+test.describe('M019 S02 Test Connection', () => {
+  const checkedAt = '2026-07-25T02:00:00.000Z';
+
+  function allInstalledUnverifiedSnapshot(correlationId = 'e2e-s02-unverified') {
+    const backends = ['claude', 'grok', 'kiro', 'codex', 'opencode'].map((backendId) => ({
+      backendId,
+      state: 'installed_unverified',
+      code: 'version_unknown',
+      recoveryAction: 'retry',
+      compatibility: 'unknown',
+      versionEvidence: '1.0.0',
+      checkedAt,
+    }));
+    return {
+      schemaVersion: 1,
+      correlationId,
+      phase: 'settled',
+      checkedAt,
+      backends,
+    };
+  }
+
+  function withClaudeState(
+    base: ReturnType<typeof allInstalledUnverifiedSnapshot>,
+    claude: {
+      state: string;
+      code: string;
+      recoveryAction: string;
+      compatibility?: string;
+      versionEvidence?: string | null;
+      checkedAt?: string;
+    },
+  ) {
+    return {
+      ...base,
+      correlationId: `${base.correlationId}-${claude.state}`,
+      checkedAt: claude.checkedAt ?? base.checkedAt,
+      backends: base.backends.map((record) =>
+        record.backendId === 'claude'
+          ? {
+              ...record,
+              state: claude.state,
+              code: claude.code,
+              recoveryAction: claude.recoveryAction,
+              compatibility: claude.compatibility ?? record.compatibility,
+              versionEvidence:
+                claude.versionEvidence === undefined
+                  ? record.versionEvidence
+                  : claude.versionEvidence,
+              checkedAt: claude.checkedAt ?? record.checkedAt,
+            }
+          : record,
+      ),
+    };
+  }
+
+  async function openDraftProbeSurface(page: Page) {
+    // Default harness seeds all-installed-unverified so the draft composer is
+    // eligible and Claude is the preferred display backend for Test Connection.
+    await openWebview(page);
+    await page.getByRole('button', { name: 'New task' }).click();
+    const surface = page.getByTestId('backend-probe-surface');
+    await expect(surface).toBeVisible();
+    await expect(surface).toHaveAttribute('data-probe-kind', 'idle');
+    await expect(page.getByTestId('backend-probe-status')).toContainText(
+      /Claude is installed but not yet verified/i,
+    );
+    await expect(page.getByTestId('start-backend-probe')).toBeVisible();
+    return surface;
+  }
+
+  test('idle start posts correlated probe; progress/ready and auth diagnostics render; cancel posts cancel; keyboard reachable', async ({
+    page,
+  }) => {
+    const surface = await openDraftProbeSurface(page);
+    const start = page.getByTestId('start-backend-probe');
+
+    // Keyboard/status semantics: Test Connection is a real button with aria-label.
+    await start.focus();
+    await expect(start).toBeFocused();
+    await expect(start).toHaveAttribute('aria-label', 'Test Connection');
+
+    const beforeStart = (await postedMessages(page)).length;
+    await start.click();
+
+    // Webview posts one correlated startBackendProbe (schemaVersion + probeId + backendId).
+    let startMsg: {
+      type?: string;
+      schemaVersion?: number;
+      probeId?: string;
+      backendId?: string;
+    } | null = null;
+    await expect
+      .poll(async () => {
+        const msgs = (await postedMessages(page)).slice(beforeStart);
+        startMsg =
+          (msgs.find(
+            (m) => (m as { type?: string }).type === 'startBackendProbe',
+          ) as typeof startMsg) ?? null;
+        return startMsg?.type === 'startBackendProbe';
+      })
+      .toBe(true);
+    expect(startMsg?.schemaVersion).toBe(1);
+    expect(startMsg?.backendId).toBe('claude');
+    expect(typeof startMsg?.probeId).toBe('string');
+    expect(startMsg?.probeId?.length).toBeGreaterThan(0);
+    const probeId = startMsg!.probeId as string;
+
+    // Local correlation flips the surface to testing + Cancel before host settles.
+    await expect(surface).toHaveAttribute('data-probe-kind', 'testing');
+    await expect(page.getByTestId('backend-probe-status')).toContainText(/Claude/i);
+    const cancel = page.getByTestId('cancel-backend-probe');
+    await expect(cancel).toBeVisible();
+    await expect(cancel).toHaveAttribute('aria-label', 'Cancel Test Connection');
+
+    // Host progress (version stage) updates status without inventing readiness truth.
+    await postRawHostMessage(page, {
+      type: 'backendProbeProgress',
+      progress: {
+        schemaVersion: 1,
+        probeId,
+        backendId: 'claude',
+        stage: 'version',
+        startedAt: '2026-07-25T02:00:01.000Z',
+      },
+    });
+    await expect(page.getByTestId('backend-probe-status')).toContainText(/Checking version/i);
+
+    // Host testing snapshot keeps Cancel and does not enable Start.
+    await postRawHostMessage(page, {
+      type: 'backendReadinessSnapshot',
+      snapshot: withClaudeState(allInstalledUnverifiedSnapshot(), {
+        state: 'testing',
+        code: 'none',
+        recoveryAction: 'none',
+        checkedAt: '2026-07-25T02:00:01.000Z',
+      }),
+    });
+    await expect(surface).toHaveAttribute('data-probe-kind', 'testing');
+    await expect(page.getByTestId('start-backend-probe')).toHaveCount(0);
+    await expect(cancel).toBeVisible();
+
+    // Ready terminal: status shows ready/version evidence; Start may reappear (re-probe).
+    await postRawHostMessage(page, {
+      type: 'backendReadinessSnapshot',
+      snapshot: withClaudeState(allInstalledUnverifiedSnapshot('e2e-s02-ready'), {
+        state: 'ready',
+        code: 'none',
+        recoveryAction: 'none',
+        compatibility: 'compatible',
+        versionEvidence: '1.0.0',
+        checkedAt: '2026-07-25T02:00:02.000Z',
+      }),
+    });
+    await expect(surface).toHaveAttribute('data-probe-kind', 'ready');
+    await expect(page.getByTestId('backend-probe-status')).toContainText(/Claude is ready/i);
+    await expect(page.getByTestId('backend-probe-status')).toContainText(/1\.0\.0/);
+    await expect(page.getByTestId('cancel-backend-probe')).toHaveCount(0);
+    await expect(page.getByTestId('start-backend-probe')).toBeVisible();
+
+    // Probe never posts session/prompt or task send traffic.
+    const afterReady = await postedMessages(page);
+    expect(
+      afterReady.some((m) => {
+        const type = (m as { type?: string }).type;
+        return type === 'send' || type === 'session/prompt' || type === 'prompt';
+      }),
+    ).toBe(false);
+
+    // Auth diagnostic path: re-start, progress authenticate, settle auth_required.
+    const beforeAuthStart = (await postedMessages(page)).length;
+    await page.getByTestId('start-backend-probe').click();
+    let authProbeId: string | null = null;
+    await expect
+      .poll(async () => {
+        const msgs = (await postedMessages(page)).slice(beforeAuthStart);
+        const msg = msgs.find(
+          (m) => (m as { type?: string }).type === 'startBackendProbe',
+        ) as { probeId?: string } | undefined;
+        authProbeId = msg?.probeId ?? null;
+        return typeof authProbeId === 'string' && authProbeId.length > 0;
+      })
+      .toBe(true);
+
+    await postRawHostMessage(page, {
+      type: 'backendProbeProgress',
+      progress: {
+        schemaVersion: 1,
+        probeId: authProbeId,
+        backendId: 'claude',
+        stage: 'authenticate',
+        startedAt: '2026-07-25T02:00:03.000Z',
+      },
+    });
+    await expect(page.getByTestId('backend-probe-status')).toContainText(
+      /Checking authentication/i,
+    );
+
+    await postRawHostMessage(page, {
+      type: 'backendReadinessSnapshot',
+      snapshot: withClaudeState(allInstalledUnverifiedSnapshot('e2e-s02-auth'), {
+        state: 'auth_required',
+        code: 'auth_required',
+        recoveryAction: 'login',
+        compatibility: 'unknown',
+        versionEvidence: '1.0.0',
+        checkedAt: '2026-07-25T02:00:04.000Z',
+      }),
+    });
+    await expect(surface).toHaveAttribute('data-probe-kind', 'diagnostic');
+    await expect(page.getByTestId('backend-probe-status')).toContainText(/sign in/i);
+    await expect(page.getByTestId('backend-probe-status')).toContainText(/Sign in required/i);
+    await expect(page.getByTestId('start-backend-probe')).toBeVisible();
+    await expect(page.getByTestId('cancel-backend-probe')).toHaveCount(0);
+
+    // Cancel path: start → cancel posts cancelBackendProbe with same probeId.
+    const beforeCancelStart = (await postedMessages(page)).length;
+    await page.getByTestId('start-backend-probe').click();
+    let cancelProbeId: string | null = null;
+    await expect
+      .poll(async () => {
+        const msgs = (await postedMessages(page)).slice(beforeCancelStart);
+        const msg = msgs.find(
+          (m) => (m as { type?: string }).type === 'startBackendProbe',
+        ) as { probeId?: string } | undefined;
+        cancelProbeId = msg?.probeId ?? null;
+        return typeof cancelProbeId === 'string' && cancelProbeId.length > 0;
+      })
+      .toBe(true);
+
+    await expect(page.getByTestId('cancel-backend-probe')).toBeVisible();
+    const beforeCancel = (await postedMessages(page)).length;
+    await page.getByTestId('cancel-backend-probe').click();
+    await expect
+      .poll(async () =>
+        (await postedMessages(page))
+          .slice(beforeCancel)
+          .some(
+            (m) =>
+              (m as { type?: string; probeId?: string; backendId?: string }).type ===
+                'cancelBackendProbe' &&
+              (m as { probeId?: string }).probeId === cancelProbeId &&
+              (m as { backendId?: string }).backendId === 'claude',
+          ),
+      )
+      .toBe(true);
+
+    // Host cancel settles back to installed_unverified (never claims ready/failed).
+    await postRawHostMessage(page, {
+      type: 'backendReadinessSnapshot',
+      snapshot: withClaudeState(allInstalledUnverifiedSnapshot('e2e-s02-cancelled'), {
+        state: 'installed_unverified',
+        code: 'cancelled',
+        recoveryAction: 'retry',
+        checkedAt: '2026-07-25T02:00:05.000Z',
+      }),
+    });
+    await expect(surface).toHaveAttribute('data-probe-kind', 'idle');
+    await expect(page.getByTestId('backend-probe-status')).toContainText(
+      /installed but not yet verified|cancelled/i,
+    );
+    await expect(page.getByTestId('start-backend-probe')).toBeVisible();
+    await expect(page.getByTestId('cancel-backend-probe')).toHaveCount(0);
+
+    // Stale/unsolicited progress for a different probeId must not hijack status.
+    await postRawHostMessage(page, {
+      type: 'backendProbeProgress',
+      progress: {
+        schemaVersion: 1,
+        probeId: 'stale-other-probe',
+        backendId: 'claude',
+        stage: 'session',
+        startedAt: '2026-07-25T02:00:06.000Z',
+      },
+    });
+    await expect(surface).toHaveAttribute('data-probe-kind', 'idle');
+    await expect(page.getByTestId('backend-probe-status')).not.toContainText(/probe session/i);
+  });
+});
+
 declare global {
   interface Window {
     acquireVsCodeApi: () => {
