@@ -1577,6 +1577,136 @@ body {
   outline-offset: 1px;
 }
 
+/* ===== Agents → Backends (M019/S03) ===== */
+.backends-settings:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder, #3794ff);
+  outline-offset: 2px;
+}
+
+.backends-settings__summary {
+  margin-top: 10px;
+}
+
+.backends-settings__list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+  min-width: 0;
+}
+
+.backend-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px 12px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--vscode-editor-background, transparent) 70%, transparent);
+}
+
+.backend-row__main {
+  flex: 1 1 160px;
+  min-width: 0;
+}
+
+.backend-row__identity {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 8px;
+  min-width: 0;
+}
+
+.backend-row__label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--vscode-foreground);
+}
+
+.backend-row__status {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 7px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--vscode-descriptionForeground) 30%, transparent);
+  background: color-mix(in srgb, var(--vscode-descriptionForeground) 10%, transparent);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--vscode-descriptionForeground);
+  white-space: nowrap;
+}
+
+.backend-row--ready .backend-row__status {
+  color: var(--vscode-testing-iconPassed, #73c991);
+  border-color: color-mix(in srgb, var(--vscode-testing-iconPassed, #73c991) 34%, transparent);
+  background: color-mix(in srgb, var(--vscode-testing-iconPassed, #73c991) 14%, transparent);
+}
+
+.backend-row--testing .backend-row__status {
+  color: var(--vscode-charts-blue, #3794ff);
+  border-color: color-mix(in srgb, var(--vscode-charts-blue, #3794ff) 34%, transparent);
+  background: color-mix(in srgb, var(--vscode-charts-blue, #3794ff) 14%, transparent);
+}
+
+.backend-row--diagnostic .backend-row__status {
+  color: var(--vscode-editorWarning-foreground, #cca700);
+  border-color: color-mix(in srgb, var(--vscode-editorWarning-foreground, #cca700) 34%, transparent);
+  background: color-mix(in srgb, var(--vscode-editorWarning-foreground, #cca700) 12%, transparent);
+}
+
+.backend-row__version {
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  font-variant-numeric: tabular-nums;
+}
+
+.backend-row__progress,
+.backend-row__diagnostic,
+.backend-row__checked {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--vscode-descriptionForeground);
+  overflow-wrap: anywhere;
+}
+
+.backend-row__progress {
+  color: var(--vscode-charts-blue, #3794ff);
+}
+
+.backend-row__recovery {
+  color: var(--vscode-foreground);
+  font-weight: 500;
+}
+
+.backend-row__actions {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+@media (max-width: 360px) {
+  .backend-row {
+    padding: 8px 10px;
+  }
+
+  .backend-row__actions {
+    width: 100%;
+  }
+
+  .backend-row__actions .settings-panel__btn {
+    flex: 1 1 auto;
+  }
+}
+
 /* ===== Task-type cards ===== */
 .settings-types {
   display: flex;

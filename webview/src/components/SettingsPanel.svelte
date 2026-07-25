@@ -17,6 +17,10 @@
     settingsPanelId,
     settingsTabId,
   } from '../lib/settings-topics';
+  import type { ActiveBackendProbe } from '../lib/backend-eligibility';
+  import type { BackendReadinessSnapshot } from '../lib/protocol';
+  import type { BackendReadinessId } from '../../../src/shared/backend-readiness';
+  import BackendsSettings from './BackendsSettings.svelte';
   import {
     DATA_RUNTIME_STORAGE_IDS,
     EXECUTION_RUNTIME_STORAGE_IDS,
@@ -83,6 +87,13 @@
     permissionDraftMode: PermissionModeSetting | undefined;
     onPermissionDraftModeChange: (mode: PermissionModeSetting) => void;
     onSavePermissionSettings: () => void;
+    /** Host-owned backend readiness (Agents → Backends, M019/S03). */
+    backendReadinessSnapshot?: BackendReadinessSnapshot | null;
+    activeBackendProbe?: ActiveBackendProbe | null;
+    /** Increment to focus the stable settings-backends target (Doctor deep-link). */
+    backendsFocusRequest?: number;
+    onStartBackendProbe?: (backendId: BackendReadinessId) => void;
+    onCancelBackendProbe?: () => void;
   }
 
   const TASK_TYPE_STATUS_LABEL: Record<TaskTypesSettingsSnapshot['status'], string> = {
@@ -136,6 +147,11 @@
     modelsByBackend,
     onSaveTaskTypes,
     onResetTaskTypes,
+    backendReadinessSnapshot = null,
+    activeBackendProbe = null,
+    backendsFocusRequest = 0,
+    onStartBackendProbe = () => {},
+    onCancelBackendProbe = () => {},
   }: Props = $props();
 
   let tablistEl = $state<HTMLDivElement | null>(null);
@@ -502,6 +518,14 @@
         tabindex="0"
       >
         {#if activeTopicId === 'agents'}
+          <div class="settings-domain" data-testid="settings-domain-agents">
+          <BackendsSettings
+            snapshot={backendReadinessSnapshot}
+            activeProbe={activeBackendProbe}
+            focusRequest={backendsFocusRequest}
+            onStartProbe={onStartBackendProbe}
+            onCancelProbe={onCancelBackendProbe}
+          />
           <section class="settings-section" aria-label="Task profiles">
             <div class="settings-section__head">
               <div class="settings-section__heading">
@@ -716,6 +740,7 @@
               </div>
             {/if}
           </section>
+          </div>
         {:else if activeTopicId === 'execution'}
           <!-- Run limits: the runLimit enum from the shared Runtime & Storage snapshot. -->
           <section class="settings-section" aria-label="Run limits" data-testid="execution-run-limits">

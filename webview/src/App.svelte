@@ -62,6 +62,8 @@
     type RetentionDrafts,
   } from './lib/settings-view-state';
   import type { SettingsTopicId } from './lib/settings-topics';
+  import { resolveRevealBackendDiagnosticsAction } from './lib/settings-backends-deep-link';
+  import type { BackendReadinessId } from '../../src/shared/backend-readiness';
   import { vscode } from './lib/vscode';
 
   type PendingElicitation =
@@ -156,6 +158,8 @@
   const inChat = $derived(tasks.draftMode || !!tasks.focusedTaskId);
   let historyOpen = $state(false);
   let settingsOpen = $state(false);
+  /** Incremented on revealBackendDiagnostics so BackendsSettings re-focuses. */
+  let backendsFocusRequest = $state(0);
   let settingsSnapshot = $state<RuntimeStorageSettingsSnapshot | null>(null);
   let settingsLoading = $state(false);
   let settingsSavingSettingId = $state<RuntimeStorageSettingId | null>(null);
@@ -331,9 +335,15 @@
     post({ type: 'renameTask', taskId, goal });
   }
 
-  function openSettings() {
+  function openSettings(opts?: { topicId?: SettingsTopicId; focusBackends?: boolean }) {
     historyOpen = false;
     settingsOpen = true;
+    if (opts?.topicId) {
+      setSettingsActiveTopicId(opts.topicId);
+    }
+    if (opts?.focusBackends) {
+      backendsFocusRequest += 1;
+    }
     settingsLoading = !settingsSnapshot;
     // Keep Retention feedback scoped; do not clear dirty drafts on open.
     retentionError = null;
@@ -351,6 +361,27 @@
     post({ type: 'requestPermissionSettings' });
     post({ type: 'listBackends' });
     // Model enumeration is explicit-only (M019 S01); Settings open stays passive.
+    // Passive readiness re-request when Doctor deep-links to Backends.
+    if (opts?.focusBackends) {
+      post({
+        type: 'requestBackendReadiness',
+        requestId: `reveal-backends-${Date.now()}`,
+      });
+    }
+  }
+
+  /** S04 Doctor deep-link: open Settings → Agents and focus settings-backends. */
+  function revealBackendDiagnostics(): void {
+    const action = resolveRevealBackendDiagnosticsAction();
+    openSettings({ topicId: action.topicId, focusBackends: true });
+  }
+
+  function onStartBackendProbeFromSettings(backendId: BackendReadinessId): void {
+    tasks.startBackendProbe(backendId);
+  }
+
+  function onCancelBackendProbeFromSettings(): void {
+    tasks.cancelBackendProbe();
   }
 
   function closeSettings() {
@@ -900,6 +931,11 @@
           tasks.applyBackendProbeProgress(msg.progress);
           break;
 
+        case 'revealBackendDiagnostics':
+          // S04 Doctor deep-link — open Agents → Backends (M019/S03).
+          revealBackendDiagnostics();
+          break;
+
         case 'modelsAvailable':
           tasks.setAvailableModels(msg.models);
           break;
@@ -1098,6 +1134,11 @@
     modelsByBackend={tasks.modelsByBackend ?? {}}
     onSaveTaskTypes={saveTaskTypes}
     onResetTaskTypes={resetTaskTypesToDefaults}
+    backendReadinessSnapshot={tasks.backendReadinessSnapshot}
+    activeBackendProbe={tasks.activeBackendProbe}
+    backendsFocusRequest={backendsFocusRequest}
+    onStartBackendProbe={onStartBackendProbeFromSettings}
+    onCancelBackendProbe={onCancelBackendProbeFromSettings}
   />
 {:else}
 {#if visibleCommandError}
@@ -1146,7 +1187,7 @@
         type="button"
         class="icon-btn shrink-0 mr-2"
        
-        onclick={openSettings}
+        onclick={() => openSettings()}
         aria-label="Settings"
         aria-pressed={settingsOpen}
         use:tip={'Settings'}
@@ -1225,7 +1266,7 @@
         type="button"
         class="icon-btn"
        
-        onclick={openSettings}
+        onclick={() => openSettings()}
         aria-label="Settings"
         aria-pressed={settingsOpen}
         use:tip={'Settings'}
