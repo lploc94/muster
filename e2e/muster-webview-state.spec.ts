@@ -129,12 +129,21 @@ interface CommandErrorMessage {
   message: string;
 }
 
-async function openWebview(page: Page, options?: { initialState?: unknown }) {
+async function openWebview(
+  page: Page,
+  options?: { initialState?: unknown; backendReadiness?: 'none' | 'all-installed-unverified' },
+) {
   // Shared harness: structured-clone VS Code API mock + deterministic open path.
+  // M019: the draft composer is fail-closed on backend readiness, so this suite
+  // seeds a settled all-installed-unverified snapshot by default. Without it the
+  // draft textarea stays disabled behind setup guidance and every composer flow
+  // (file mentions, Add Context, model switch) times out. Readiness-specific
+  // tests opt out with backendReadiness: 'none'.
   await openMusterWebview(page, {
     initialState: options?.initialState,
     structuredCloneMessages: true,
     stateMode: 'bag',
+    backendReadiness: options?.backendReadiness ?? 'all-installed-unverified',
   });
 }
 
@@ -8786,7 +8795,9 @@ test.describe('M019 S01 Composer readiness', () => {
   test('loading then settled-empty blocks draft; refresh installs unverified option; existing task stays usable', async ({
     page,
   }) => {
-    await openWebview(page);
+    // This suite owns the readiness state machine itself, so it must start from
+    // the unseeded loading state rather than the shared all-installed seed.
+    await openWebview(page, { backendReadiness: 'none' });
 
     // Loading: no readiness / backends yet → guidance + disabled draft picker.
     await page.getByRole('button', { name: 'New task' }).click();

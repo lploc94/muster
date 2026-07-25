@@ -15,6 +15,41 @@ export interface MusterHostInstallOptions {
    * - presentation: `__musterPersistedState` (direct value)
    */
   stateMode?: 'bag' | 'direct';
+  /**
+   * M019: seed a settled BackendReadinessSnapshot after open so the draft
+   * composer is eligible (fail-closed gating satisfied).
+   * - 'all-installed-unverified': every supported CLI detected but unverified,
+   *   which is the closest analogue of pre-M019 "all backends selectable".
+   * - 'none' (default): post nothing, leaving readiness in the loading state.
+   */
+  backendReadiness?: 'none' | 'all-installed-unverified';
+}
+
+const BACKEND_READINESS_IDS = ['claude', 'grok', 'kiro', 'codex', 'opencode'] as const;
+
+/**
+ * Host-shaped settled snapshot marking every supported CLI installed-unverified.
+ * Mirrors the validated wire contract in webview/src/lib/protocol.ts.
+ */
+export function allInstalledUnverifiedReadinessSnapshot(
+  correlationId = 'e2e-readiness-seed',
+): Record<string, unknown> {
+  const checkedAt = '2026-07-25T00:00:00.000Z';
+  return {
+    schemaVersion: 1,
+    correlationId,
+    phase: 'settled',
+    checkedAt,
+    backends: BACKEND_READINESS_IDS.map((backendId) => ({
+      backendId,
+      state: 'installed_unverified',
+      code: 'version_unknown',
+      recoveryAction: 'retry',
+      compatibility: 'unknown',
+      versionEvidence: '1.0.0',
+      checkedAt,
+    })),
+  };
 }
 
 declare global {
@@ -98,8 +133,20 @@ export async function openMusterWebview(
     window.__musterPostedMessages = [];
   });
 
-  if (options.waitForReady !== false) {
+  // The App message listener only exists once the Svelte root has mounted, so
+  // any host-shaped seed must be posted after mount or it is silently dropped.
+  if (options.waitForReady !== false || options.backendReadiness === 'all-installed-unverified') {
     await expect(page.getByText('New task')).toBeVisible();
+  }
+
+  // M019: the draft composer is fail-closed on backend readiness. Suites that
+  // exercise composer behavior (file mentions, Add Context, model switch) must
+  // seed a settled snapshot, otherwise readiness stays 'loading' and the draft
+  // textarea is disabled behind setup guidance.
+  if (options.backendReadiness === 'all-installed-unverified') {
+    await page.evaluate((snapshot) => {
+      window.postMessage({ type: 'backendReadinessSnapshot', snapshot }, '*');
+    }, allInstalledUnverifiedReadinessSnapshot());
   }
 }
 
