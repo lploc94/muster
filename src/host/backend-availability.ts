@@ -2,19 +2,65 @@ import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import {
+  BACKEND_READINESS_IDS,
+  type BackendReadinessId,
+} from '../shared/backend-readiness';
 
 /**
- * The underlying CLI each backend needs on PATH to be usable. Claude and Codex
- * run a bundled ACP adapter that shells out to the user's installed `claude` /
- * `codex` (overridable via env); the other three are plain commands.
+ * Allowlisted provider registry: one ordered entry per readiness backend.
+ * Command resolution stays host-only; absolute paths never cross into snapshots.
  */
-const BACKEND_COMMAND: Record<string, () => string> = {
-  claude: () => process.env.CLAUDE_CODE_EXECUTABLE || 'claude',
-  codex: () => process.env.CODEX_PATH || 'codex',
-  grok: () => 'grok',
-  kiro: () => 'kiro-cli',
-  opencode: () => 'opencode',
-};
+export interface BackendProviderEntry {
+  id: BackendReadinessId;
+  /** Human label (not used in readiness snapshot). */
+  label: string;
+  /** Resolve the PATH command / override env for passive inventory. */
+  resolveCommand: () => string;
+}
+
+/**
+ * Single allowlisted provider registry. Order matches BACKEND_READINESS_IDS.
+ * Claude/Codex honor existing env overrides used by their ACP adapters.
+ */
+export const BACKEND_PROVIDER_REGISTRY: readonly BackendProviderEntry[] = [
+  {
+    id: 'claude',
+    label: 'Claude',
+    resolveCommand: () => process.env.CLAUDE_CODE_EXECUTABLE || 'claude',
+  },
+  {
+    id: 'grok',
+    label: 'Grok',
+    resolveCommand: () => 'grok',
+  },
+  {
+    id: 'kiro',
+    label: 'Kiro',
+    resolveCommand: () => 'kiro-cli',
+  },
+  {
+    id: 'codex',
+    label: 'Codex',
+    resolveCommand: () => process.env.CODEX_PATH || 'codex',
+  },
+  {
+    id: 'opencode',
+    label: 'OpenCode',
+    resolveCommand: () => 'opencode',
+  },
+];
+
+const REGISTRY_BY_ID = new Map(BACKEND_PROVIDER_REGISTRY.map((e) => [e.id, e]));
+
+/** Resolve the inventory command for a backend ID. */
+export function resolveBackendCommand(id: BackendReadinessId): string {
+  const entry = REGISTRY_BY_ID.get(id);
+  if (!entry) {
+    throw new Error(`unknown backend id: ${id}`);
+  }
+  return entry.resolveCommand();
+}
 
 /**
  * Query the login shell's PATH. GUI-launched editors (Finder/Dock on macOS)
@@ -121,12 +167,16 @@ export function commandResolves(command: string, dirs: string[]): boolean {
  * this machine. Reads `process.env.PATH`, which {@link installAugmentedPath}
  * has patched at activation to the same PATH the backend spawns will use — so
  * "detected available" matches "actually callable".
+ *
+ * Returns IDs in registry / readiness order (subset of BACKEND_READINESS_IDS).
  */
 export async function detectAvailableBackends(): Promise<string[]> {
   const dirs = (process.env.PATH ?? '').split(path.delimiter).filter(Boolean);
   const available: string[] = [];
-  for (const [id, command] of Object.entries(BACKEND_COMMAND)) {
-    if (commandResolves(command(), dirs)) available.push(id);
+  for (const entry of BACKEND_PROVIDER_REGISTRY) {
+    if (commandResolves(entry.resolveCommand(), dirs)) available.push(entry.id);
   }
+  // Defensive: registry order must stay aligned with the shared allowlist.
+  void BACKEND_READINESS_IDS;
   return available;
 }
