@@ -228,6 +228,33 @@ describe('BackendReadinessService', () => {
     expect(service.peek()?.correlationId).toBe(second.correlationId);
   });
 
+  it('replaceSnapshot updates peek without re-running inventory', async () => {
+    const collectVersion = vi.fn(async () => ({
+      versionEvidence: '1.0.0' as string | null,
+      code: 'none' as const,
+    }));
+    const deps = baseDeps({ collectVersion });
+    const service = new BackendReadinessService(deps);
+    const first = await service.refresh();
+    const collectCalls = collectVersion.mock.calls.length;
+    const replaced = {
+      ...first,
+      correlationId: 'probe-applied',
+      backends: first.backends.map((b) =>
+        b.backendId === 'claude'
+          ? { ...b, state: 'ready' as const, code: 'none' as const }
+          : b,
+      ),
+    };
+    service.replaceSnapshot(replaced);
+    expect(service.peek()?.correlationId).toBe('probe-applied');
+    expect(service.peek()?.backends.find((b) => b.backendId === 'claude')?.state).toBe(
+      'ready',
+    );
+    // No additional version collection from replaceSnapshot.
+    expect(collectVersion.mock.calls.length).toBe(collectCalls);
+  });
+
   it('snapshot always passes the fail-closed shared parser', async () => {
     const deps = baseDeps();
     const present = (deps as { __present: Set<string> }).__present;

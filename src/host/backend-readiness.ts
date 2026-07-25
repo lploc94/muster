@@ -161,6 +161,15 @@ export class BackendReadinessService {
   }
 
   /**
+   * Replace the cached snapshot after a pure probe reducer apply (M019/S02).
+   * Does not run inventory, ACP, or version collection. Callers must pass a
+   * full five-backend snapshot produced by shared reducers only.
+   */
+  replaceSnapshot(snapshot: BackendReadinessSnapshot): void {
+    this.last = snapshot;
+  }
+
+  /**
    * Run passive inventory + version collection and cache the settled snapshot.
    * @param correlationId optional external correlation (refresh request id)
    */

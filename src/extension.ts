@@ -8,6 +8,7 @@ import { McpReadinessSupervisor } from './bridge/mcp-readiness';
 import { MusterBridgeServer } from './bridge/server';
 import { makeBackend } from './backends/index';
 import {
+  AcpClient,
   disposeSharedAcpClient,
   isAskLikeForm,
   peekSharedAcpClient,
@@ -16,6 +17,11 @@ import {
   setPermissionController,
   setQuestionController,
 } from './backends/acp-client';
+import { claudeAgentConfig } from './backends/claude';
+import { codexAgentConfig } from './backends/codex';
+import { GROK_AGENT_CONFIG } from './backends/grok';
+import { KIRO_AGENT_CONFIG } from './backends/kiro';
+import { OPENCODE_AGENT_CONFIG } from './backends/opencode';
 import type {
   ElicitationController,
   PermissionController,
@@ -82,9 +88,19 @@ import {
   createDefaultBackendReadinessDeps,
 } from './host/backend-readiness';
 import {
+  BackendProbeService,
+  createDefaultBackendProbeDeps,
+} from './host/backend-probe';
+import {
+  routeCancelBackendProbe,
+  routeStartBackendProbe,
+  type BackendProbeHostMessage,
+} from './host/backend-probe-route';
+import {
   BACKEND_READINESS_IDS,
   BACKEND_READINESS_SCHEMA_VERSION,
   derivePassivelySelectableBackendIds,
+  type BackendReadinessId,
   type BackendReadinessSnapshot,
 } from './shared/backend-readiness';
 import {
@@ -213,11 +229,35 @@ let hostEnvPrepare: Promise<void> | undefined;
 let backendReadinessService: BackendReadinessService | undefined;
 let backendReadinessPromise: Promise<BackendReadinessSnapshot> | undefined;
 
+/** Isolated active Test Connection probe service (M019 S02). */
+let backendProbeService: BackendProbeService | undefined;
+
+/** Owned AcpClient configs for probes — never getSharedAcpClient. */
+const PROBE_ACP_CONFIGS: Record<BackendReadinessId, () => import('./backends/acp-client').AcpAgentConfig> = {
+  claude: claudeAgentConfig,
+  codex: codexAgentConfig,
+  grok: () => GROK_AGENT_CONFIG,
+  kiro: () => KIRO_AGENT_CONFIG,
+  opencode: () => OPENCODE_AGENT_CONFIG,
+};
+
 function getBackendReadinessService(): BackendReadinessService {
   if (!backendReadinessService) {
     backendReadinessService = new BackendReadinessService(createDefaultBackendReadinessDeps());
   }
   return backendReadinessService;
+}
+
+function getBackendProbeService(): BackendProbeService {
+  if (!backendProbeService) {
+    backendProbeService = new BackendProbeService(
+      createDefaultBackendProbeDeps({
+        createClient: (backendId) => new AcpClient(PROBE_ACP_CONFIGS[backendId]()),
+        resolveCwd: () => resolveTaskCwd(),
+      }),
+    );
+  }
+  return backendProbeService;
 }
 
 /** Settled diagnostic snapshot when inventory throws (fail closed, never silent). */
@@ -1104,6 +1144,52 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   }
 
   /**
+   * Injected seams for the isolated Test Connection route (M019/S02).
+   * Posts progress + reduced readiness snapshots; never touches task/session state.
+   */
+  private backendProbeRouteDeps() {
+    const probe = getBackendProbeService();
+    return {
+      getReadinessSnapshot: () => getBackendReadinessService().peek(),
+      ensureReadiness: () => ensureBackendReadiness(false),
+      applySnapshot: (snapshot: BackendReadinessSnapshot) => {
+        getBackendReadinessService().replaceSnapshot(snapshot);
+        // Keep hostEnvCache.availableBackends in sync when probe upgrades to ready.
+        writeHostEnvCache({
+          availableBackends: derivePassivelySelectableBackendIds(snapshot),
+        });
+      },
+      isInFlight: (backendId: BackendReadinessId) => probe.isInFlight(backendId),
+      startProbe: (input: Parameters<BackendProbeService['start']>[0]) => probe.start(input),
+      cancelProbe: (backendId: BackendReadinessId) => probe.cancel(backendId),
+      post: (message: BackendProbeHostMessage) => {
+        this.post(message);
+      },
+      now: () => new Date(),
+      deriveAvailableBackends: derivePassivelySelectableBackendIds,
+    };
+  }
+
+  /** Explicit user-triggered Test Connection — isolated bounded ACP probe. */
+  private async handleStartBackendProbe(data: unknown): Promise<void> {
+    try {
+      const outcome = await routeStartBackendProbe(data, this.backendProbeRouteDeps());
+      if (outcome.kind === 'ignored') {
+        console.warn('Muster: ignoring malformed startBackendProbe');
+      } else if (outcome.kind === 'refused') {
+        console.warn(
+          `Muster: refusing startBackendProbe reason=${outcome.reason}`,
+        );
+      }
+    } catch (err) {
+      console.warn(
+        'Muster: startBackendProbe failed:',
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+
+  /**
    * Answer a `listSkills` request with the uniform composer trigger prefix and the
    * backend's discovered skills. The trigger prefix is ALWAYS `/`, identical for
    * every backend: the picker UX is normalized to `/` and the host translates to
@@ -1802,6 +1888,12 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     this.pollingReady = false;
     this.windowStateSub?.dispose();
     this.windowStateSub = undefined;
+    // Tear down any in-flight Test Connection probes when the webview is replaced.
+    try {
+      backendProbeService?.disposeAll();
+    } catch {
+      // best-effort
+    }
   }
 
   /** Keep both independent Electron processes polling while CI cannot focus both. */
@@ -2425,6 +2517,15 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       } else {
         this.pollingReady = false;
         this.revisionPoller?.stop();
+      }
+    });
+
+    // Abort in-flight Test Connection probes when this webview instance is disposed.
+    webviewView.onDidDispose(() => {
+      try {
+        backendProbeService?.disposeAll();
+      } catch {
+        // best-effort
       }
     });
 
@@ -3059,6 +3160,19 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             break;
           }
           void this.postBackendReadiness('refresh', requestId);
+          break;
+        }
+        case 'startBackendProbe': {
+          // Explicit user-triggered Test Connection (M019/S02).
+          // Isolated probe route — never shared ACP, never task/session mutation.
+          void this.handleStartBackendProbe(data);
+          break;
+        }
+        case 'cancelBackendProbe': {
+          const outcome = routeCancelBackendProbe(data, this.backendProbeRouteDeps());
+          if (outcome.kind === 'ignored') {
+            console.warn('Muster: ignoring malformed cancelBackendProbe');
+          }
           break;
         }
         case 'listSkills':
@@ -4357,6 +4471,12 @@ export async function deactivate(): Promise<void> {
   permissionBridge?.cancelAll();
   credentialRegistry?.revokeAll();
   void bridgeServer?.close();
+  try {
+    backendProbeService?.disposeAll();
+  } catch {
+    // best-effort probe teardown
+  }
+  backendProbeService = undefined;
   disposeSharedAcpClient();
   musterDebugChannel?.dispose();
   musterDebugChannel = undefined;

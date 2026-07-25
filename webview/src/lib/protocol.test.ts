@@ -1920,3 +1920,43 @@ describe('M019 backend readiness protocol', () => {
   });
 });
 
+describe('isExtMessage backendProbeProgress (M019/S02)', () => {
+  const validProgress = () => ({
+    schemaVersion: 1 as const,
+    probeId: 'probe-1',
+    backendId: 'claude' as const,
+    stage: 'initialize' as const,
+    startedAt: '2026-07-25T00:00:00.000Z',
+  });
+
+  it('accepts a well-formed backendProbeProgress', () => {
+    expect(
+      isExtMessage({ type: 'backendProbeProgress', progress: validProgress() }),
+    ).toBe(true);
+  });
+
+  it('rejects backendProbeProgress with extra keys or malformed progress', () => {
+    expect(
+      isExtMessage({
+        type: 'backendProbeProgress',
+        progress: validProgress(),
+        extra: true,
+      }),
+    ).toBe(false);
+
+    expect(
+      isExtMessage({
+        type: 'backendProbeProgress',
+        progress: { ...validProgress(), stage: 'not-a-stage' },
+      }),
+    ).toBe(false);
+
+    expect(
+      isExtMessage({
+        type: 'backendProbeProgress',
+        progress: { ...validProgress(), probeId: '' },
+      }),
+    ).toBe(false);
+  });
+});
+
