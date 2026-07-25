@@ -895,6 +895,11 @@
           tasks.applyBackendReadinessSnapshot(msg.snapshot);
           break;
 
+        case 'backendProbeProgress':
+          // Correlated Test Connection stage only; never invents readiness truth.
+          tasks.applyBackendProbeProgress(msg.progress);
+          break;
+
         case 'modelsAvailable':
           tasks.setAvailableModels(msg.models);
           break;

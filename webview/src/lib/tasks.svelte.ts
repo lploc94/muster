@@ -1,8 +1,20 @@
 import type { BackendModels, QueuedTurnProjection, SnapshotMessage, TaskSummary } from './protocol';
 import {
   derivePassivelySelectableBackendIds,
+  type BackendReadinessId,
   type BackendReadinessSnapshot,
 } from '../../../src/shared/backend-readiness';
+import {
+  BACKEND_PROBE_SCHEMA_VERSION,
+  type BackendProbeProgress,
+} from '../../../src/shared/backend-probe';
+import {
+  applyProbeProgressToActive,
+  canStartBackendProbe,
+  clearActiveProbeIfSettled,
+  createActiveBackendProbe,
+  type ActiveBackendProbe,
+} from './backend-eligibility';
 import { isHardTerminalLifecycle, post } from './protocol';
 import { sortQueuedTurns } from './queued-turns';
 import { parseBackendId, parseModelFromSelectValue } from './backend-resolve';
@@ -84,6 +96,12 @@ class TasksState {
    */
   backendReadinessSnapshot = $state<BackendReadinessSnapshot | null>(null);
 
+  /**
+   * Correlated in-flight Test Connection (M019/S02). Display/correlation only —
+   * never invents readiness truth. Cleared when the host snapshot leaves testing
+   * for that backend, or when progress is unsolicited/stale.
+   */
+  activeBackendProbe = $state<ActiveBackendProbe | null>(null);
 
   /** Per-backend model lists reported by the host; null = not yet enumerated. */
   modelsByBackend = $state<Record<string, BackendModels> | null>(null);
@@ -184,13 +202,75 @@ class TasksState {
   /**
    * Apply host-owned BackendReadinessSnapshot. Derives availableBackends from
    * passively selectable providers and sets hostHydrated for skill restore.
-   * Never invents readiness when the payload is absent.
+   * Never invents readiness when the payload is absent. Clears correlated probe
+   * state once the host leaves testing for that backend.
    */
   applyBackendReadinessSnapshot(snapshot: BackendReadinessSnapshot): void {
     this.backendReadinessSnapshot = snapshot;
     this.availableBackends = derivePassivelySelectableBackendIds(snapshot);
     this.hostHydrated = true;
+    this.activeBackendProbe = clearActiveProbeIfSettled(this.activeBackendProbe, snapshot);
     this.syncDisplaySelection();
+  }
+
+  /**
+   * Apply correlated host probe progress. Drops stale/unsolicited progress
+   * (wrong probeId/backend) fail-closed without mutating readiness.
+   */
+  applyBackendProbeProgress(progress: BackendProbeProgress): void {
+    this.activeBackendProbe = applyProbeProgressToActive(this.activeBackendProbe, progress);
+  }
+
+  /**
+   * Explicit user-triggered Test Connection. Posts startBackendProbe only when
+   * the selected record is probe-eligible; single-flight is enforced on the host.
+   * Never writes task/composer durable state.
+   */
+  startBackendProbe(backendId: BackendReadinessId | string): boolean {
+    const snap = this.backendReadinessSnapshot;
+    if (!snap) return false;
+    const record = snap.backends.find((r) => r.backendId === backendId);
+    if (!record || !canStartBackendProbe(record)) return false;
+
+    // Join local correlation when a probe is already active for this backend.
+    if (
+      this.activeBackendProbe &&
+      this.activeBackendProbe.backendId === record.backendId
+    ) {
+      post({
+        type: 'startBackendProbe',
+        schemaVersion: BACKEND_PROBE_SCHEMA_VERSION,
+        probeId: this.activeBackendProbe.probeId,
+        backendId: record.backendId,
+      });
+      return true;
+    }
+
+    const probeId =
+      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `probe-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    this.activeBackendProbe = createActiveBackendProbe(record.backendId, probeId);
+    post({
+      type: 'startBackendProbe',
+      schemaVersion: BACKEND_PROBE_SCHEMA_VERSION,
+      probeId,
+      backendId: record.backendId,
+    });
+    return true;
+  }
+
+  /** Cancel the correlated in-flight Test Connection when one is active. */
+  cancelBackendProbe(): boolean {
+    const active = this.activeBackendProbe;
+    if (!active) return false;
+    post({
+      type: 'cancelBackendProbe',
+      schemaVersion: BACKEND_PROBE_SCHEMA_VERSION,
+      probeId: active.probeId,
+      backendId: active.backendId,
+    });
+    return true;
   }
 
   setAvailableModels(models: Record<string, BackendModels>): void {

@@ -9,8 +9,10 @@
   import {
     pickerOptionLabelForRecord,
     resolveDraftComposerEligibility,
+    resolveProbeSurface,
   } from '../lib/backend-eligibility';
   import { post, postDebug } from '../lib/protocol';
+  import type { BackendReadinessId } from '../../../src/shared/backend-readiness';
   import { ADD_CONTEXT_ACTIONS, getAddContextActionHostMessage } from '../lib/context-actions';
   import {
     getTaskPresentation,
@@ -475,6 +477,32 @@
   const draftBlockedByReadiness = $derived(
     mode === 'draft' && !draftEligibility.canComposeNewTask,
   );
+
+  /** M019/S02: Test Connection surface for the draft display backend. */
+  const draftProbeRecord = $derived.by(() => {
+    if (mode !== 'draft') return null;
+    const backendId = draftEligibility.displayBackend;
+    if (!backendId) return null;
+    return draftEligibility.records.find((r) => r.backendId === backendId) ?? null;
+  });
+
+  const draftProbeSurface = $derived(
+    resolveProbeSurface({
+      record: draftProbeRecord,
+      activeProbe: tasks.activeBackendProbe,
+      backendId: draftEligibility.displayBackend,
+    }),
+  );
+
+  function onStartBackendProbe(): void {
+    const backendId = draftEligibility.displayBackend as BackendReadinessId | null;
+    if (!backendId) return;
+    tasks.startBackendProbe(backendId);
+  }
+
+  function onCancelBackendProbe(): void {
+    tasks.cancelBackendProbe();
+  }
 
   // Draft still waits for the first turn to settle. Task mode stays open while
   // a live/queued turn is active so Enter queues and Ctrl+Enter can inject.
@@ -1827,6 +1855,55 @@
       >
         Refresh backends
       </button>
+    </div>
+  {/if}
+
+  {#if mode === 'draft' && draftProbeSurface.kind !== 'hidden'}
+    <div
+      class="composer-guidance composer-probe"
+      class:composer-probe--testing={draftProbeSurface.kind === 'testing'}
+      class:composer-probe--ready={draftProbeSurface.kind === 'ready'}
+      class:composer-probe--diagnostic={draftProbeSurface.kind === 'diagnostic'}
+      role="status"
+      aria-live="polite"
+      data-composer-guidance={draftProbeSurface.kind === 'diagnostic'
+        ? 'warning'
+        : draftProbeSurface.kind === 'ready'
+          ? 'info'
+          : 'info'}
+      data-testid="backend-probe-surface"
+      data-probe-kind={draftProbeSurface.kind}
+    >
+      <span class="composer-probe__text" data-testid="backend-probe-status">
+        {draftProbeSurface.statusText}
+        {#if draftProbeSurface.recoveryLabel}
+          <span class="composer-probe__recovery"> · {draftProbeSurface.recoveryLabel}</span>
+        {/if}
+      </span>
+      <div class="composer-probe__actions">
+        {#if draftProbeSurface.canCancel}
+          <button
+            type="button"
+            class="composer-probe__cancel"
+            data-testid="cancel-backend-probe"
+            aria-label="Cancel Test Connection"
+            onclick={onCancelBackendProbe}
+          >
+            Cancel
+          </button>
+        {/if}
+        {#if draftProbeSurface.canStart}
+          <button
+            type="button"
+            class="composer-probe__start"
+            data-testid="start-backend-probe"
+            aria-label="Test Connection"
+            onclick={onStartBackendProbe}
+          >
+            Test Connection
+          </button>
+        {/if}
+      </div>
     </div>
   {/if}
 

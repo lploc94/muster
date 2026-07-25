@@ -2710,3 +2710,55 @@ body {
   outline: 1px solid var(--vscode-focusBorder);
   outline-offset: 1px;
 }
+
+/* M019 S02 — Test Connection probe surface in draft Composer */
+.composer-probe {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.composer-probe__text {
+  flex: 1 1 12rem;
+  min-width: 0;
+}
+.composer-probe__recovery {
+  opacity: 0.9;
+}
+.composer-probe__actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 0.35rem;
+  align-items: center;
+}
+.composer-probe__start,
+.composer-probe__cancel {
+  flex: 0 0 auto;
+  background: transparent;
+  border: 1px solid var(--vscode-button-border, var(--vscode-panel-border));
+  color: var(--vscode-textLink-foreground, var(--vscode-foreground));
+  border-radius: 2px;
+  padding: 0.15rem 0.45rem;
+  font: inherit;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+.composer-probe__start:hover,
+.composer-probe__cancel:hover {
+  background: var(--vscode-toolbar-hoverBackground, transparent);
+}
+.composer-probe__start:focus-visible,
+.composer-probe__cancel:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+.composer-probe--testing .composer-probe__text {
+  color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+}
+.composer-probe--ready .composer-probe__text {
+  color: var(--vscode-testing-iconPassed, var(--vscode-charts-green, var(--vscode-foreground)));
+}
+.composer-probe--diagnostic .composer-probe__text {
+  color: var(--vscode-inputValidation-warningForeground, var(--vscode-editorWarning-foreground, var(--vscode-foreground)));
+}
