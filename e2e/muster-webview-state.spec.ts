@@ -9969,6 +9969,111 @@ test.describe('M019 S05 Assembled First Run', () => {
     expect(blob).not.toMatch(/[A-Za-z]:\\/);
     expect(blob).not.toMatch(/\/(?:Users|home)\/[^/\s]+/);
   });
+
+  test('M020 S01 inline diff: ToolCard renders removed and added lines from fileChanges', async ({
+    page,
+  }) => {
+    await openWebview(page);
+
+    const oldLine = 'const greeting = "hello";';
+    const newLine = 'const greeting = "world";';
+    // Model-supplied markup must render as inert text, not HTML.
+    const inertPayload = '<img src=x onerror=window.__m020Xss=1>';
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-diff', goal: 'Apply one-file edit' })],
+      focusedTaskId: 'task-diff',
+      subtree: [task({ id: 'task-diff', goal: 'Apply one-file edit' })],
+      transcript: [
+        {
+          id: 'tool-diff-1',
+          kind: 'tool',
+          turnId: 'turn-diff',
+          order: 0,
+          content: {
+            toolCallId: 'tc-diff-1',
+            name: 'Edit',
+            toolKind: 'builtin',
+            status: 'success',
+            // Evidence-only: no input/output so expandability comes from fileChanges.
+            fileChanges: [
+              {
+                path: 'src/hello.ts',
+                oldText: `${oldLine}\n${inertPayload}\n`,
+                newText: `${newLine}\n`,
+              },
+            ],
+          },
+        },
+      ],
+      storeRevision: 1,
+    });
+
+    const card = page.locator('.tool-card').filter({ hasText: 'Edit' });
+    await expect(card).toBeVisible();
+    await expect(card.getByText('src/hello.ts')).toBeVisible();
+
+    // Inline removed/added lines visible without expanding params/result payloads.
+    const removed = card.locator('.tool-card__diff-line--removed');
+    const added = card.locator('.tool-card__diff-line--added');
+    await expect(removed.filter({ hasText: oldLine })).toBeVisible();
+    await expect(added.filter({ hasText: newLine })).toBeVisible();
+    await expect(removed.filter({ hasText: inertPayload })).toBeVisible();
+
+    // Evidence-only tool is expandable (not inert/disabled).
+    const header = card.getByRole('button').first();
+    await expect(header).toBeEnabled();
+    await expect(header).toHaveAttribute('aria-expanded', 'true');
+
+    // Inert rendering: markup from model text must not become a live element.
+    await expect(card.locator('img')).toHaveCount(0);
+    const xssFlag = await page.evaluate(() => (window as Window & { __m020Xss?: number }).__m020Xss);
+    expect(xssFlag).toBeUndefined();
+  });
+
+  test('M020 S01 inline diff: content-only tool stays free of empty diff chrome', async ({
+    page,
+  }) => {
+    await openWebview(page);
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-content', goal: 'Read a file' })],
+      focusedTaskId: 'task-content',
+      subtree: [task({ id: 'task-content', goal: 'Read a file' })],
+      transcript: [
+        {
+          id: 'tool-read-1',
+          kind: 'tool',
+          turnId: 'turn-read',
+          order: 0,
+          content: {
+            toolCallId: 'tc-read-1',
+            name: 'Read',
+            toolKind: 'builtin',
+            status: 'success',
+            input: { path: 'src/hello.ts' },
+            output: 'file contents',
+          },
+        },
+      ],
+      storeRevision: 1,
+    });
+
+    const card = page.locator('.tool-card').filter({ hasText: 'Read' });
+    await expect(card).toBeVisible();
+    await expect(card.locator('.tool-card__diff')).toHaveCount(0);
+    await expect(card.locator('.tool-card__diff-line--removed')).toHaveCount(0);
+    await expect(card.locator('.tool-card__diff-line--added')).toHaveCount(0);
+
+    // Existing expand path for input/output still works.
+    const header = card.getByRole('button').first();
+    await expect(header).toBeEnabled();
+    await header.click();
+    await expect(card.getByText('params:')).toBeVisible();
+    await expect(card.getByText('result:')).toBeVisible();
+  });
 });
 
 declare global {

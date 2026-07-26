@@ -6,7 +6,11 @@
   }
   let { tool }: Props = $props();
 
-  let expanded = $state(false);
+  /**
+   * User toggle for params/result. null = default:
+   * evidence tools start expanded; content-only tools start collapsed.
+   */
+  let expandedOverride = $state<boolean | null>(null);
 
   function toolIcon(name: string, kind?: string): string {
     const n = (name || '').toLowerCase();
@@ -19,11 +23,39 @@
     return 'codicon-tools';
   }
 
+  /** Split model text into display lines; trailing empty line from a final \n is dropped. */
+  function textLines(text: string | null | undefined): string[] {
+    if (text == null || text === '') return [];
+    const lines = text.split('\n');
+    if (lines.length > 0 && lines[lines.length - 1] === '') {
+      lines.pop();
+    }
+    return lines;
+  }
+
   const icon = $derived(toolIcon(tool.name, tool.toolKind));
   const resultPayload = $derived(
     tool.status === 'error' && tool.error ? tool.error : tool.output,
   );
-  const hasDetails = $derived(tool.input !== undefined || tool.output !== undefined || !!tool.error);
+  const fileChanges = $derived(
+    tool.fileChanges && tool.fileChanges.length > 0 ? tool.fileChanges : undefined,
+  );
+  /** Expandable when params/result/error OR structured diff evidence is present. */
+  const hasDetails = $derived(
+    tool.input !== undefined ||
+      tool.output !== undefined ||
+      !!tool.error ||
+      fileChanges !== undefined,
+  );
+  /** Diff evidence defaults expanded so the edit is visible where the user approves it. */
+  const expanded = $derived(
+    expandedOverride !== null ? expandedOverride : fileChanges !== undefined,
+  );
+
+  function toggleExpanded() {
+    if (!hasDetails) return;
+    expandedOverride = !expanded;
+  }
 </script>
 
 <div class="tool-card rounded px-2 py-1 text-xs border" style="border-color: var(--vscode-panel-border);">
@@ -33,9 +65,7 @@
     class:cursor-pointer={hasDetails}
     disabled={!hasDetails}
     aria-expanded={hasDetails ? expanded : undefined}
-    onclick={() => {
-      if (hasDetails) expanded = !expanded;
-    }}
+    onclick={toggleExpanded}
   >
     <span class="codicon {icon}"></span>
     {#if tool.toolKind === 'mcp'}<vscode-badge>MCP</vscode-badge>{/if}
@@ -47,6 +77,22 @@
       <span class="codicon {expanded ? 'codicon-chevron-down' : 'codicon-chevron-right'}" style="font-size: 12px;"></span>
     {/if}
   </button>
+
+  {#if fileChanges}
+    <div class="tool-card__diff mt-1.5" aria-label="File changes">
+      {#each fileChanges as change (change.path + (change.oldText ?? '') + change.newText)}
+        {@const removed = textLines(change.oldText)}
+        {@const added = textLines(change.newText)}
+        <div class="tool-card__diff-file">
+          <div class="tool-card__diff-path font-mono break-all">{change.path}</div>
+          <pre class="tool-card__diff-body text-[10px] bg-[var(--vscode-textCodeBlock-background)] p-1 rounded max-h-48">
+{#each removed as line}<span class="tool-card__diff-line tool-card__diff-line--removed">-{line}
+</span>{/each}{#each added as line}<span class="tool-card__diff-line tool-card__diff-line--added">+{line}
+</span>{/each}</pre>
+        </div>
+      {/each}
+    </div>
+  {/if}
 
   {#if expanded && hasDetails}
     {#if tool.input !== undefined}
@@ -70,7 +116,8 @@
 
 <style>
   .tool-card,
-  .tool-card__details {
+  .tool-card__details,
+  .tool-card__diff {
     min-width: 0;
     max-width: 100%;
   }
@@ -79,11 +126,36 @@
     overflow: hidden;
   }
 
-  .tool-card__payload {
+  .tool-card__payload,
+  .tool-card__diff-body {
     box-sizing: border-box;
     width: 100%;
     max-width: 100%;
     margin: 0;
     overflow: auto;
+    white-space: pre;
+  }
+
+  .tool-card__diff-path {
+    color: var(--vscode-descriptionForeground);
+    margin-bottom: 0.25rem;
+  }
+
+  .tool-card__diff-line {
+    display: block;
+  }
+
+  .tool-card__diff-line--removed {
+    color: var(--vscode-errorForeground);
+    background: color-mix(in srgb, var(--vscode-errorForeground) 12%, transparent);
+  }
+
+  .tool-card__diff-line--added {
+    color: var(--vscode-testing-iconPassed, var(--vscode-charts-green, #89d185));
+    background: color-mix(
+      in srgb,
+      var(--vscode-testing-iconPassed, var(--vscode-charts-green, #89d185)) 12%,
+      transparent
+    );
   }
 </style>
