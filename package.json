@@ -335,6 +335,8 @@
     "test:m019-s05-native-evidence": "node --test scripts/verify-m019-s05-native-first-run-evidence.test.mjs",
     "test:m019-s05-native-runner": "vitest run scripts/m019-s05-native-first-run.test.ts",
     "test:m019-s05-native-first-run": "node scripts/run-m019-s05-native-first-run.mjs",
+    "test:m019-s05-docs": "node --test scripts/verify-m019-s05-first-run-docs.test.mjs",
+    "test:m019-s05": "npm run test:m019-s05-docs && npm run test:m019-s05-native-evidence && npm run test:m019-s05-native-runner && vitest run src/host/m019-s05-native-first-run.test.ts src/host/uat-commands.test.ts && npx playwright test e2e/muster-webview-state.spec.ts --grep \"M019 S05 Assembled First Run\"",
     "test:task-audit": "node --test scripts/verify-task-model-ui-state-audit.test.mjs",
     "test:settings-docs": "node --test scripts/verify-settings-docs.test.mjs",
     "test:settings-live-evidence": "node --test scripts/verify-settings-live-host-evidence.test.mjs",

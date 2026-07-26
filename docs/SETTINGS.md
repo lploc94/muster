@@ -32,7 +32,7 @@ The presentation order of the rendered tabs is product contract, not a generic r
 
 | Order | Domain | Rendered | Sections and host ownership |
 |------:|--------|----------|-----------------------------|
-| 1 | **Agents** | Yes | **Task profiles** — host-owned `muster.taskTypes` (workspace write from the panel; resource-scoped contributed config). Formerly labelled Task Types; the label changed but the internal id and config key did not. |
+| 1 | **Agents** | Yes | **Backends** — host-owned readiness inventory, Refresh, and isolated Test Connection (status and recovery guidance; not durable configuration). **Task profiles** — host-owned `muster.taskTypes` (workspace write from the panel; resource-scoped contributed config). Formerly labelled Task Types; the label changed but the internal id and config key did not. |
 | 2 | **Execution** | Yes | **Run limits** — the `runLimit` enum from the runtime/storage host snapshot (`muster.execution.runLimit`). **Tool access** — host-owned `muster.permissions.mode` enum (formerly the Permissions topic; unchanged semantics). Concurrent scheduling caps (`muster.execution.maxConcurrentPerBackend`, `maxConcurrentTurns`, `maxConcurrentPerRoot`) are contributed configuration under the Execution domain; they are edited in native VS Code Settings (not yet in the custom panel) and read live by the task engine each scheduling pass. |
 | 3 | **Data** | Yes | **History** — `muster.retention.maxRetainedTurnsPerTask`. **Outputs** — `muster.retention.maxStoredOutputChars`. Both are flat sections; the old **History storage (Advanced)** disclosure is gone. |
 | — | **Connections** | Reserved (not rendered) | No host-backed context-engine or MCP control exists yet. |
@@ -150,6 +150,81 @@ Settings failures should localize to one layer:
 
 The important rule is fail closed: a rejected update must never become the displayed saved value just because the webview had a draft.
 
+## Agents → Backends readiness and recovery
+
+Reader post-read action for this section: recover a blocked first task by installing or signing into a supported agent CLI, refreshing inventory, running Test Connection, and using Doctor when the surface is unclear — without treating browser checks as native proof.
+
+**Agents → Backends** is the product home for supported AI CLIs that *perform* tasks. It is not durable VS Code configuration: readiness is a host-owned, sanitized `BackendReadinessSnapshot` that also powers Composer eligibility, the derived first-run journey, Doctor, and actionable first-turn errors. **Connections** remains reserved for auxiliary context engines and external MCP services and is still not rendered until those controls exist. A backend/model that runs the task belongs under Agents; an external service that only enriches context belongs under Connections when that domain becomes actionable.
+
+### Supported backends and install prerequisites
+
+Muster inventories five allowlisted backends in fixed order: `claude`, `grok`, `kiro`, `codex`, and `opencode`. Passive discovery looks for each CLI on the host `PATH` (and platform-augmented path rules) and may read a bounded `--version` result. It does **not** open ACP sessions, send prompts, create tasks, or write credentials.
+
+Install or update the provider's own CLI outside Muster, then use **Refresh** so inventory can detect it. Authentication is owned by each CLI (for example its login or auth command). Muster does not persist provider secrets, tokens, or API keys in settings, readiness records, or diagnostics.
+
+### Passive Refresh vs explicit Test Connection
+
+| Action | When | What it does | What it never does |
+|--------|------|--------------|--------------------|
+| **Refresh** | Startup, first-run journey, Agents → Backends Refresh, and Doctor entry | Cheap passive inventory: executable presence, bounded version evidence, compatibility classification | ACP initialize, authentication, model catalog, prompts, task/session writes |
+| **Test Connection** | Explicit user click on one backend row | Isolated, single-flight, bounded ACP probe (executable → version → initialize → authenticate → optional throwaway session → model catalog) | Shared ACP client reuse; `session/prompt`; Muster task/turn/session store writes; concurrent probes for the same backend |
+
+Test Connection contacts the selected provider through its CLI only after explicit user action and sends **no model prompt**. Progress stages are correlated and sanitized. Success promotes that backend to **ready**. Failure maps to a closed diagnostic code and recovery action; it does not invent readiness for other backends and does not leave probe processes behind after settle, cancel, webview dispose, or deactivation.
+
+### Readiness states operators see
+
+| State | Meaning | Typical recovery |
+|-------|---------|------------------|
+| `checking` | Inventory still settling | Wait; use Refresh if stuck |
+| `missing` | CLI not found | Install CLI, then Refresh |
+| `installed_unverified` | Detected but not probe-proven | Run Test Connection |
+| `testing` | Test Connection in progress | Wait or Cancel |
+| `ready` | Probe-proven usable for first task (when clean workspace) | Start a task |
+| `auth_required` | CLI needs sign-in | Login with the CLI, then retry Test Connection |
+| `incompatible` | Version/policy incompatible | Update CLI, then retry |
+| `failed` | Probe failed without a more specific settled state | Retry after checking the CLI |
+
+Composer and clean-workspace first-task acceptance treat **ready** as the trustworthy first-run bar. Workspaces that already have tasks keep the broader passive-selectable rule so existing work is not forced through re-test.
+
+### Diagnostic codes and recovery actions
+
+Diagnostics are closed-shape and sanitized. UI copy never includes absolute paths, raw stderr, env values, credentials, prompts, or store bodies.
+
+| Code | Operator meaning | Recovery action |
+|------|------------------|-----------------|
+| `executable_missing` | CLI not installed / not on PATH | `install` — Install CLI |
+| `version_unknown` | Installed but not yet verified | Run Test Connection |
+| `version_incompatible` | Version not compatible | `update` — Update CLI |
+| `auth_required` | Sign-in required | `login` — Sign in required |
+| `acp_initialize_failed` | Agent connection initialize failed | `retry` — Retry Test Connection |
+| `session_probe_failed` | Probe session could not open | `retry` |
+| `model_catalog_unavailable` | Connected but model catalog missing | `retry` |
+| `timeout` | Probe timed out | `retry` when CLI is responsive |
+| `process_exited` | CLI process exited during probe | `retry` after checking the CLI |
+| `cancelled` | User cancelled Test Connection | Re-run when ready |
+| `internal_error` | Bounded internal failure | `retry` |
+| `none` | No diagnostic | — |
+
+Allowlisted recovery actions rendered as guidance: `none`, `install`, `login`, `update`, `retry`, `open_docs`.
+
+Mid-turn spawn/auth/version/ACP setup failures on a real task map onto the **same** codes and recovery actions so Agents → Backends, Composer, and Doctor stay consistent. Unmapped runtime signals fail closed without inventing a false ready state and without replaying the user prompt.
+
+### Doctor (Muster: Run Diagnostics)
+
+Command Palette: **Muster: Run Diagnostics** (`muster.runDiagnostics`). Doctor refreshes the shared readiness snapshot, opens the Muster chat view, then deep-links into **Agents → Backends** (via `revealBackendDiagnostics`) so the refreshed inventory is focused. It does not create a second diagnostics UI, does not mutate tasks/sessions, and does not run Test Connection by itself — after Doctor, run Test Connection on the backend you care about.
+
+### Privacy and redaction
+
+Readiness publication and probe progress carry only allowlisted backend ids, states, codes, recovery actions, compatibility, bounded version evidence, and timestamps. No secrets, prompts, absolute paths, raw provider output, or task/store bodies. Native first-run evidence follows the same redaction rules in `docs/uat/m019-s05/native-first-run-evidence.md`.
+
+### Local verification for this surface
+
+```bash
+npm run test:m019-s05
+```
+
+The aggregate gate includes the first-run docs verifier, native evidence ledger shape, host/native-runner unit coverage, and the assembled Playwright first-run browser flow. Named slice gates `npm run test:m019-s01` through `test:m019-s04` remain the focused contract/integration proofs for inventory, Test Connection, first-run journey, and Doctor/runtime recovery. Browser and injected-host results are **supportive only**. Scenario-local **ENVIRONMENT BLOCKED** on the native ledger is the honest outcome when a real provider or Extension Development Host prerequisite is unavailable; it is never upgraded from Playwright.
+
 ## Verification
 
 Run the focused local checks while changing settings behavior or this guide:
@@ -177,6 +252,13 @@ npm run test:settings-acceptance
 ```
 
 These checks are local verification only. A valid `ENVIRONMENT BLOCKED` live-host ledger means the native scenarios were blocked after attempted steps; local CI still only covers docs, ledger shape, and browser webview gates.
+
+For Agents → Backends readiness, Test Connection, Doctor, and trustworthy first-run recovery docs, also run:
+
+```bash
+npm run test:m019-s05-docs
+npm run test:m019-s05
+```
 
 ## Proof boundary
 
