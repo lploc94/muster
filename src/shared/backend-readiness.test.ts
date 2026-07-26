@@ -4,9 +4,11 @@ import {
   BACKEND_READINESS_SCHEMA_VERSION,
   BACKEND_READINESS_STATES,
   BACKEND_READINESS_CODES,
+  BACKEND_READINESS_VERSION_EVIDENCE_MAX,
   BACKEND_RECOVERY_ACTIONS,
   BACKEND_COMPATIBILITY_STATUSES,
   isBackendReadinessId,
+  isBackendVersionEvidence,
   isPassivelySelectable,
   isTrustworthyFirstRunEligible,
   selectPickerBackends,
@@ -15,6 +17,15 @@ import {
   type BackendReadinessRecord,
   type BackendReadinessSnapshot,
 } from './backend-readiness';
+
+/**
+ * Build a grammar-valid version string of an exact length so length-cap tests
+ * fail for exceeding the cap rather than for having the wrong shape.
+ */
+function semverOfLength(length: number): string {
+  const prefix = '1.2.3+';
+  return prefix + 'a'.repeat(length - prefix.length);
+}
 
 function baseRecord(
   overrides: Partial<BackendReadinessRecord> & Pick<BackendReadinessRecord, 'backendId'>,
@@ -353,7 +364,8 @@ describe('parseBackendReadinessSnapshot', () => {
       state: 'installed_unverified',
       code: 'version_unknown',
       recoveryAction: 'retry',
-      versionEvidence: 'v'.repeat(200),
+      // Grammar-valid but over the cap, so only the length bound can reject it.
+      versionEvidence: semverOfLength(BACKEND_READINESS_VERSION_EVIDENCE_MAX + 1),
     };
     expect(parseBackendReadinessSnapshot(settledSnapshot(longEvidence))).toBeNull();
   });
@@ -393,15 +405,63 @@ describe('parseBackendReadinessSnapshot', () => {
   });
 
   it('accepts null versionEvidence and bounded semver-like evidence strings', () => {
-    const backends = fiveMissing();
-    backends[0] = {
-      ...backends[0],
-      state: 'installed_unverified',
-      code: 'version_unknown',
-      recoveryAction: 'retry',
-      versionEvidence: '1.2.3',
-    };
-    const snap = settledSnapshot(backends);
-    expect(parseBackendReadinessSnapshot(snap)).toEqual(snap);
+    for (const versionEvidence of [
+      '1.2.3',
+      '2.0.0-beta.1',
+      '1.2.3+build.5',
+      semverOfLength(BACKEND_READINESS_VERSION_EVIDENCE_MAX),
+    ]) {
+      const backends = fiveMissing();
+      backends[0] = {
+        ...backends[0],
+        state: 'installed_unverified',
+        code: 'version_unknown',
+        recoveryAction: 'retry',
+        versionEvidence,
+      };
+      const snap = settledSnapshot(backends);
+      expect(parseBackendReadinessSnapshot(snap), `versionEvidence=${versionEvidence}`).toEqual(
+        snap,
+      );
+    }
+  });
+});
+
+describe('isBackendVersionEvidence', () => {
+  it('accepts semver-like tokens the host extractor can emit', () => {
+    for (const value of ['0.0.1', '1.2.3', '10.20.30', '2.0.0-beta', '1.2.3-beta.1', '1.2.3+build.5']) {
+      expect(isBackendVersionEvidence(value), value).toBe(true);
+    }
+  });
+
+  it('enforces the length cap independently of the grammar', () => {
+    const atCap = semverOfLength(BACKEND_READINESS_VERSION_EVIDENCE_MAX);
+    const overCap = semverOfLength(BACKEND_READINESS_VERSION_EVIDENCE_MAX + 1);
+
+    // Both are grammar-valid; only the cap separates them.
+    expect(atCap).toHaveLength(BACKEND_READINESS_VERSION_EVIDENCE_MAX);
+    expect(overCap).toHaveLength(BACKEND_READINESS_VERSION_EVIDENCE_MAX + 1);
+    expect(/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(overCap)).toBe(true);
+
+    expect(isBackendVersionEvidence(atCap)).toBe(true);
+    expect(isBackendVersionEvidence(overCap)).toBe(false);
+  });
+
+  it('rejects empty, non-string, and non-version shapes', () => {
+    for (const value of [
+      '',
+      '1.2',
+      '1.2.3.4',
+      'v1.2.3',
+      '1.2.3 ',
+      'sk-live-READINESS_SECRET_CANARY',
+      'RAW_STDERR_CANARY',
+      'C:\\Users\\secret\\muster.db',
+      null,
+      undefined,
+      12,
+    ]) {
+      expect(isBackendVersionEvidence(value), String(value)).toBe(false);
+    }
   });
 });

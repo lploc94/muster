@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   BACKEND_READINESS_IDS,
   BACKEND_READINESS_SCHEMA_VERSION,
+  BACKEND_READINESS_VERSION_EVIDENCE_MAX,
   type BackendReadinessRecord,
   type BackendReadinessSnapshot,
 } from './backend-readiness';
@@ -82,6 +83,15 @@ function validProgress(overrides: Partial<BackendProbeProgress> = {}): BackendPr
     startedAt: '2026-07-25T00:00:01.000Z',
     ...overrides,
   };
+}
+
+/**
+ * Build a grammar-valid version string of an exact length so length-cap tests
+ * fail for exceeding the cap rather than for having the wrong shape.
+ */
+function semverOfLength(length: number): string {
+  const prefix = '1.2.3+';
+  return prefix + 'a'.repeat(length - prefix.length);
 }
 
 function validResult(overrides: Partial<BackendProbeResult> = {}): BackendProbeResult {
@@ -219,7 +229,8 @@ describe('parseBackendProbeResult', () => {
 
     for (const versionEvidence of [
       '',
-      'v'.repeat(65),
+      // Grammar-valid but over the cap, so only the length bound can reject it.
+      semverOfLength(BACKEND_READINESS_VERSION_EVIDENCE_MAX + 1),
       'sk-live-READINESS_SECRET_CANARY',
       'RAW_STDERR_CANARY',
       'PROMPT_BODY_CANARY',
@@ -230,6 +241,17 @@ describe('parseBackendProbeResult', () => {
         parseBackendProbeResult(validResult({ versionEvidence })),
         `versionEvidence=${versionEvidence}`,
       ).toBeNull();
+    }
+  });
+
+  it('accepts semver-like versionEvidence up to the cap', () => {
+    for (const versionEvidence of [
+      '1.2.3',
+      '2.0.0-beta.1',
+      semverOfLength(BACKEND_READINESS_VERSION_EVIDENCE_MAX),
+    ]) {
+      const valid = validResult({ versionEvidence });
+      expect(parseBackendProbeResult(valid), `versionEvidence=${versionEvidence}`).toEqual(valid);
     }
   });
 
