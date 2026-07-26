@@ -97,6 +97,10 @@ import {
   type BackendProbeHostMessage,
 } from './host/backend-probe-route';
 import {
+  scheduleRuntimeReadinessInvalidation,
+  type RuntimeInvalidationDeps,
+} from './host/backend-runtime-invalidation';
+import {
   BACKEND_READINESS_IDS,
   BACKEND_READINESS_SCHEMA_VERSION,
   derivePassivelySelectableBackendIds,
@@ -1228,6 +1232,42 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
    */
   postRevealBackendDiagnostics(): void {
     this.post({ type: 'revealBackendDiagnostics' });
+  }
+
+  /**
+   * M019/S04: seams for runtime setup-failure → readiness invalidation.
+   * Reuses the same replaceSnapshot + publish path as Test Connection.
+   * Never mutates tasks/sessions and never replays prompts.
+   */
+  runtimeInvalidationDeps(): RuntimeInvalidationDeps {
+    return {
+      getReadinessSnapshot: () => getBackendReadinessService().peek(),
+      ensureReadiness: () => ensureBackendReadiness(false),
+      applySnapshot: (snapshot: BackendReadinessSnapshot) => {
+        getBackendReadinessService().replaceSnapshot(snapshot);
+        writeHostEnvCache({
+          availableBackends: derivePassivelySelectableBackendIds(snapshot),
+        });
+      },
+      post: (message) => {
+        this.post(message);
+      },
+      now: () => new Date(),
+      deriveAvailableBackends: derivePassivelySelectableBackendIds,
+    };
+  }
+
+  /**
+   * Best-effort: map a real-task setup failure onto shared readiness and publish.
+   * Turn error remains authoritative; this never replays the prompt.
+   */
+  invalidateReadinessFromRuntimeFailure(signal: {
+    backendId: string;
+    message?: string;
+    errorCode?: string;
+    stage?: string;
+  }): void {
+    scheduleRuntimeReadinessInvalidation(signal, this.runtimeInvalidationDeps());
   }
 
   postComposerSelection(): void {
@@ -4060,6 +4100,14 @@ export async function activate(context: vscode.ExtensionContext) {
           provider.forwardTurnEvent(event);
         } catch {
           // best-effort streaming
+        }
+      },
+      // M019/S04: mapped setup failures invalidate readiness without prompt replay.
+      onRuntimeSetupFailure: (signal) => {
+        try {
+          provider.invalidateReadinessFromRuntimeFailure(signal);
+        } catch {
+          // best-effort readiness publication
         }
       },
     });
