@@ -1,5 +1,10 @@
 <script lang="ts">
   import type { ToolItem } from '../lib/turn-state.svelte';
+  import {
+    buildToolDiffView,
+    describeDiffFileForScreenReader,
+    type ToolDiffView,
+  } from '../lib/tool-diff-view';
 
   interface Props {
     tool: ToolItem;
@@ -11,6 +16,13 @@
    * evidence tools start expanded; content-only tools start collapsed.
    */
   let expandedOverride = $state<boolean | null>(null);
+
+  /**
+   * Per-file body open overrides, keyed by bodyId from buildToolDiffView.
+   * Only consulted when the view is size-gated collapsed-by-default; small
+   * diffs always render bodies open so S01/S02 fixtures stay interaction-free.
+   */
+  let fileBodyExpanded = $state<Record<string, boolean>>({});
 
   function toolIcon(name: string, kind?: string): string {
     const n = (name || '').toLowerCase();
@@ -46,6 +58,21 @@
       ? tool.fileChangesOmitted
       : undefined,
   );
+
+  /**
+   * Pure presentation model (M020 S03). tool.id is the stable DOM-safe seed for
+   * body ids — never the agent path. Omitted counter is present-only.
+   */
+  const diffView: ToolDiffView | undefined = $derived(
+    fileChanges
+      ? buildToolDiffView({
+          toolCallId: tool.id,
+          fileChanges,
+          ...(fileChangesOmitted !== undefined ? { fileChangesOmitted } : {}),
+        })
+      : undefined,
+  );
+
   /** Expandable when params/result/error OR structured diff evidence is present. */
   const hasDetails = $derived(
     tool.input !== undefined ||
@@ -61,6 +88,21 @@
   function toggleExpanded() {
     if (!hasDetails) return;
     expandedOverride = !expanded;
+  }
+
+  function isFileBodyExpanded(view: ToolDiffView, bodyId: string): boolean {
+    // Small diffs: always open — size-gated collapse only, never unconditional.
+    if (!view.collapsedByDefault) return true;
+    if (Object.prototype.hasOwnProperty.call(fileBodyExpanded, bodyId)) {
+      return fileBodyExpanded[bodyId] === true;
+    }
+    return false;
+  }
+
+  function toggleFileBody(view: ToolDiffView, bodyId: string) {
+    if (!view.collapsedByDefault) return;
+    const next = !isFileBodyExpanded(view, bodyId);
+    fileBodyExpanded = { ...fileBodyExpanded, [bodyId]: next };
   }
 </script>
 
@@ -84,35 +126,72 @@
     {/if}
   </button>
 
-  {#if fileChanges}
-    <div class="tool-card__diff mt-1.5" aria-label="File changes">
-      {#each fileChanges as change (change.path + (change.oldText ?? '') + change.newText)}
-        {@const removed = textLines(change.oldText)}
-        {@const added = textLines(change.newText)}
+  {#if diffView}
+    <div class="tool-card__diff mt-1.5" role="group" aria-label="File changes">
+      {#each diffView.files as file (file.bodyId)}
+        {@const removed = textLines(file.oldText)}
+        {@const added = textLines(file.newText)}
+        {@const bodyOpen = isFileBodyExpanded(diffView, file.bodyId)}
+        {@const srSummary = describeDiffFileForScreenReader(file)}
         <div class="tool-card__diff-file">
-          <div class="tool-card__diff-path font-mono break-all">{change.path}</div>
-          <pre class="tool-card__diff-body text-[10px] bg-[var(--vscode-textCodeBlock-background)] p-1 rounded max-h-48">
+          <div class="tool-card__diff-summary">
+            {#if diffView.collapsedByDefault}
+              <button
+                type="button"
+                class="tool-card__diff-toggle"
+                aria-expanded={bodyOpen}
+                aria-controls={file.bodyId}
+                aria-label={srSummary}
+                onclick={() => toggleFileBody(diffView, file.bodyId)}
+              >
+                <span
+                  class="codicon {bodyOpen ? 'codicon-chevron-down' : 'codicon-chevron-right'} tool-card__diff-chevron"
+                  aria-hidden="true"
+                ></span>
+                <span class="tool-card__diff-path font-mono break-all">{file.path}</span>
+                <span class="tool-card__diff-counts" aria-hidden="true">{file.countsLabel}</span>
+              </button>
+            {:else}
+              <div class="tool-card__diff-summary-static" aria-label={srSummary}>
+                <span class="tool-card__diff-path font-mono break-all">{file.path}</span>
+                <span class="tool-card__diff-counts" aria-hidden="true">{file.countsLabel}</span>
+              </div>
+            {/if}
+          </div>
+
+          <div
+            id={file.bodyId}
+            class="tool-card__diff-body-panel"
+            data-collapsed={bodyOpen ? 'false' : 'true'}
+            aria-hidden={bodyOpen ? undefined : 'true'}
+          >
+            <div class="tool-card__diff-body-inner">
+              <pre class="tool-card__diff-body text-[10px] bg-[var(--vscode-textCodeBlock-background)] p-1 rounded max-h-48">
 {#each removed as line}<span class="tool-card__diff-line tool-card__diff-line--removed">-{line}
 </span>{/each}{#each added as line}<span class="tool-card__diff-line tool-card__diff-line--added">+{line}
 </span>{/each}</pre>
-          {#if change.truncated}
-            <div
-              class="tool-card__diff-truncated"
-              role="status"
-              aria-label="Diff truncated"
-            >
-              Diff truncated — full text exceeded the per-side bound
+              {#if file.truncated}
+                <div
+                  class="tool-card__diff-truncated"
+                  role="status"
+                  aria-label="Diff truncated"
+                >
+                  Diff truncated — full text exceeded the per-side bound
+                </div>
+              {/if}
             </div>
-          {/if}
+          </div>
         </div>
       {/each}
-      {#if fileChangesOmitted !== undefined}
+      {#if diffView.fileChangesOmitted !== undefined}
         <div
           class="tool-card__diff-omitted"
           role="status"
           aria-label="File changes omitted"
         >
-          {fileChangesOmitted} additional file{fileChangesOmitted === 1 ? '' : 's'} omitted
+          {diffView.fileChangesOmitted} additional file{diffView.fileChangesOmitted === 1
+            ? ''
+            : 's'} omitted
         </div>
       {/if}
     </div>
@@ -160,9 +239,84 @@
     white-space: pre;
   }
 
+  .tool-card__diff-summary {
+    margin-bottom: 0.25rem;
+  }
+
+  .tool-card__diff-toggle,
+  .tool-card__diff-summary-static {
+    display: flex;
+    align-items: baseline;
+    gap: 0.35rem;
+    width: 100%;
+    min-width: 0;
+    text-align: left;
+  }
+
+  .tool-card__diff-toggle {
+    background: transparent;
+    border: 0;
+    padding: 0;
+    margin: 0;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+  }
+
+  .tool-card__diff-toggle:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder, #007fd4);
+    outline-offset: 1px;
+  }
+
+  .tool-card__diff-chevron {
+    flex: 0 0 auto;
+    font-size: 12px;
+    line-height: 1;
+    position: relative;
+    top: 1px;
+  }
+
   .tool-card__diff-path {
     color: var(--vscode-descriptionForeground);
-    margin-bottom: 0.25rem;
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .tool-card__diff-counts {
+    flex: 0 0 auto;
+    font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
+    font-size: 10px;
+    color: var(--vscode-descriptionForeground);
+    white-space: nowrap;
+  }
+
+  /*
+   * Size-gated disclosure panel: animate row height under no-preference,
+   * force 0s under prefers-reduced-motion so expansion is instant.
+   */
+  .tool-card__diff-body-panel {
+    display: grid;
+    grid-template-rows: 1fr;
+    transition: grid-template-rows 0.2s ease;
+  }
+
+  .tool-card__diff-body-panel[data-collapsed='true'] {
+    grid-template-rows: 0fr;
+  }
+
+  .tool-card__diff-body-inner {
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .tool-card__diff-body-panel[data-collapsed='false'] .tool-card__diff-body-inner {
+    overflow: visible;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .tool-card__diff-body-panel {
+      transition-duration: 0s;
+    }
   }
 
   .tool-card__diff-line {
