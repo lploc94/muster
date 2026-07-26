@@ -10204,6 +10204,256 @@ test.describe('M019 S05 Assembled First Run', () => {
     // Truncation chrome only when truncated:true is set on an entry.
     await expect(card.locator('.tool-card__diff-truncated')).toHaveCount(0);
   });
+  test('M020 S03 collapse: multi-file over threshold starts collapsed with counts and expands', async ({
+    page,
+  }) => {
+    await openWebview(page);
+
+    // 4 files > TOOL_DIFF_COLLAPSE_FILE_THRESHOLD (3) → size-gated collapse.
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-s03-collapse', goal: 'Edit four files' })],
+      focusedTaskId: 'task-s03-collapse',
+      subtree: [task({ id: 'task-s03-collapse', goal: 'Edit four files' })],
+      transcript: [
+        {
+          id: 'tool-s03-collapse-1',
+          kind: 'tool',
+          turnId: 'turn-s03-collapse',
+          order: 0,
+          content: {
+            toolCallId: 'tc-s03-collapse-1',
+            name: 'MultiEdit',
+            toolKind: 'builtin',
+            status: 'success',
+            fileChanges: [
+              { path: 'src/a.ts', oldText: null, newText: 'a-unique-body\n' },
+              { path: 'src/b.ts', oldText: null, newText: 'b-unique-body\n' },
+              { path: 'src/c.ts', oldText: null, newText: 'c-unique-body\n' },
+              { path: 'src/d.ts', oldText: null, newText: 'd-unique-body\n' },
+            ],
+          },
+        },
+      ],
+      storeRevision: 1,
+    });
+
+    const card = page.locator('.tool-card').filter({ hasText: 'MultiEdit' });
+    await expect(card).toBeVisible();
+
+    const group = card.locator('.tool-card__diff');
+    await expect(group).toHaveAttribute('role', 'group');
+    await expect(card.locator('.tool-card__diff-file')).toHaveCount(4);
+
+    // Per-file counts visible while bodies are collapsed.
+    const counts = card.locator('.tool-card__diff-counts');
+    await expect(counts).toHaveCount(4);
+    await expect(counts.first()).toContainText('+1');
+    await expect(counts.first()).toContainText('−0');
+
+    const toggles = card.locator('button.tool-card__diff-toggle');
+    await expect(toggles).toHaveCount(4);
+    await expect(toggles.first()).toHaveAttribute('aria-expanded', 'false');
+
+    // Collapsed panel is marked data-collapsed and clips via grid 0fr.
+    // Assert collapse state via attributes + bounding box (Playwright still
+    // treats overflow-hidden grid children as "visible" for toBeVisible).
+    const firstBodyId = await toggles.first().getAttribute('aria-controls');
+    expect(firstBodyId).toBeTruthy();
+    const firstBody = card.locator(`#${firstBodyId}`);
+    await expect(firstBody).toHaveAttribute('data-collapsed', 'true');
+    const collapsedBox = await firstBody.boundingBox();
+    expect(collapsedBox).toBeTruthy();
+    expect(collapsedBox!.height).toBeLessThanOrEqual(1);
+
+    await toggles.first().click();
+    await expect(toggles.first()).toHaveAttribute('aria-expanded', 'true');
+    await expect(firstBody).toHaveAttribute('data-collapsed', 'false');
+    await expect(card.getByText('a-unique-body')).toBeVisible();
+    await expect(
+      card.locator('.tool-card__diff-line--added').filter({ hasText: 'a-unique-body' }),
+    ).toBeVisible();
+    const expandedBox = await firstBody.boundingBox();
+    expect(expandedBox).toBeTruthy();
+    expect(expandedBox!.height).toBeGreaterThan(1);
+  });
+
+  test('M020 S03 a11y: aria-controls targets body id and screen-reader summary is present', async ({
+    page,
+  }) => {
+    await openWebview(page);
+
+    // Long single-file diff (>24 changed lines) triggers line-threshold collapse.
+    const oldText = Array.from({ length: 13 }, (_, i) => `old-line-${i + 1}`).join('\n') + '\n';
+    const newText = Array.from({ length: 12 }, (_, i) => `new-line-${i + 1}`).join('\n') + '\n';
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-s03-a11y', goal: 'Long edit' })],
+      focusedTaskId: 'task-s03-a11y',
+      subtree: [task({ id: 'task-s03-a11y', goal: 'Long edit' })],
+      transcript: [
+        {
+          id: 'tool-s03-a11y-1',
+          kind: 'tool',
+          turnId: 'turn-s03-a11y',
+          order: 0,
+          content: {
+            toolCallId: 'tc-s03-a11y-1',
+            name: 'Edit',
+            toolKind: 'builtin',
+            status: 'success',
+            fileChanges: [
+              {
+                path: 'src/long.ts',
+                oldText,
+                newText,
+                truncated: true,
+              },
+            ],
+          },
+        },
+      ],
+      storeRevision: 1,
+    });
+
+    const card = page.locator('.tool-card').filter({ hasText: 'Edit' });
+    await expect(card).toBeVisible();
+
+    const toggle = card.locator('button.tool-card__diff-toggle');
+    await expect(toggle).toHaveCount(1);
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+
+    const controlsId = await toggle.getAttribute('aria-controls');
+    expect(controlsId).toBeTruthy();
+    // bodyId derived from transcript item id + index, never agent path.
+    expect(controlsId!).toMatch(/^tool-diff-body-/);
+    expect(controlsId!).not.toContain('long.ts');
+    expect(controlsId!).not.toContain('/');
+
+    // bodyId is already DOM-safe (sanitized tool id + index); no CSS.escape needed.
+    const body = card.locator(`#${controlsId}`);
+    await expect(body).toHaveCount(1);
+    await expect(body).toHaveAttribute('data-collapsed', 'true');
+
+    const ariaLabel = await toggle.getAttribute('aria-label');
+    expect(ariaLabel).toBeTruthy();
+    expect(ariaLabel!).toMatch(/src\/long\.ts/);
+    expect(ariaLabel!).toMatch(/12 lines added/);
+    expect(ariaLabel!).toMatch(/13 lines removed/);
+    expect(ariaLabel!).toMatch(/partial/i);
+
+    await expect(card.locator('.tool-card__diff-counts')).toContainText(/partial/i);
+
+    await toggle.click();
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    await expect(body).toHaveAttribute('data-collapsed', 'false');
+    // exact: true — substring match would also hit old-line-10..13.
+    await expect(card.getByText('-old-line-1', { exact: true })).toBeVisible();
+    await expect(card.getByText('+new-line-12', { exact: true })).toBeVisible();
+  });
+
+  test('M020 S03 reduced motion: expansion transition duration is 0s', async ({ page }) => {
+    await openWebview(page);
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+
+    const newText =
+      Array.from({ length: 25 }, (_, i) => `motion-line-${i + 1}`).join('\n') + '\n';
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-s03-motion', goal: 'Motion edit' })],
+      focusedTaskId: 'task-s03-motion',
+      subtree: [task({ id: 'task-s03-motion', goal: 'Motion edit' })],
+      transcript: [
+        {
+          id: 'tool-s03-motion-1',
+          kind: 'tool',
+          turnId: 'turn-s03-motion',
+          order: 0,
+          content: {
+            toolCallId: 'tc-s03-motion-1',
+            name: 'Write',
+            toolKind: 'builtin',
+            status: 'success',
+            fileChanges: [{ path: 'src/motion.ts', oldText: null, newText }],
+          },
+        },
+      ],
+      storeRevision: 1,
+    });
+
+    const card = page.locator('.tool-card').filter({ hasText: 'Write' });
+    await expect(card).toBeVisible();
+
+    const panel = card.locator('.tool-card__diff-body-panel');
+    await expect(panel).toHaveCount(1);
+
+    const durationReduce = await panel.evaluate((el) =>
+      getComputedStyle(el).transitionDuration,
+    );
+    expect(durationReduce === '0s' || durationReduce === '0ms').toBe(true);
+
+    await page.emulateMedia({ reducedMotion: 'no-preference' });
+    const durationNormal = await panel.evaluate((el) =>
+      getComputedStyle(el).transitionDuration,
+    );
+    const normalMs = durationNormal
+      .split(',')
+      .map((part) => part.trim())
+      .map((part) => {
+        if (part.endsWith('ms')) return Number.parseFloat(part);
+        if (part.endsWith('s')) return Number.parseFloat(part) * 1000;
+        return Number.NaN;
+      })
+      .filter((n) => Number.isFinite(n));
+    expect(normalMs.some((n) => n > 0)).toBe(true);
+  });
+
+  test('M020 S03 size-gate: small fixture stays expanded without disclosure button', async ({
+    page,
+  }) => {
+    await openWebview(page);
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-s03-small', goal: 'Tiny edit' })],
+      focusedTaskId: 'task-s03-small',
+      subtree: [task({ id: 'task-s03-small', goal: 'Tiny edit' })],
+      transcript: [
+        {
+          id: 'tool-s03-small-1',
+          kind: 'tool',
+          turnId: 'turn-s03-small',
+          order: 0,
+          content: {
+            toolCallId: 'tc-s03-small-1',
+            name: 'Edit',
+            toolKind: 'builtin',
+            status: 'success',
+            fileChanges: [
+              {
+                path: 'src/tiny.ts',
+                oldText: 'tiny-old\n',
+                newText: 'tiny-new\n',
+              },
+            ],
+          },
+        },
+      ],
+      storeRevision: 1,
+    });
+
+    const card = page.locator('.tool-card').filter({ hasText: 'Edit' });
+    await expect(card).toBeVisible();
+
+    await expect(card.locator('.tool-card__diff-counts')).toContainText('+1');
+    await expect(card.locator('button.tool-card__diff-toggle')).toHaveCount(0);
+    await expect(card.locator('.tool-card__diff-summary-static')).toHaveCount(1);
+
+    await expect(card.getByText('tiny-old')).toBeVisible();
+    await expect(card.getByText('tiny-new')).toBeVisible();
+  });
 });
 
 declare global {

@@ -339,6 +339,7 @@
     "test:m019-s05": "npm run test:m019-s05-docs && npm run test:m019-s05-native-evidence && npm run test:m019-s05-native-runner && vitest run src/host/m019-s05-native-first-run.test.ts src/host/uat-commands.test.ts && npx playwright test e2e/muster-webview-state.spec.ts --grep \"M019 S05 Assembled First Run\"",
     "test:m020-s01": "vitest run src/backends/m020-s01-diff-evidence-flow.test.ts",
     "test:m020-s02": "vitest run src/shared/tool-file-changes.test.ts src/task/engine-tool-evidence.test.ts webview/src/lib/protocol.test.ts && npx playwright test e2e/muster-webview-state.spec.ts --grep \"M020 S02\"",
+    "test:m020-s03": "vitest run webview/src/lib/tool-diff-view.test.ts && npx playwright test e2e/muster-webview-state.spec.ts --grep \"M020 S03\"",
     "test:task-audit": "node --test scripts/verify-task-model-ui-state-audit.test.mjs",
     "test:settings-docs": "node --test scripts/verify-settings-docs.test.mjs",
     "test:settings-live-evidence": "node --test scripts/verify-settings-live-host-evidence.test.mjs",
