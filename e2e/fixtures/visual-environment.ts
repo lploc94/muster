@@ -534,7 +534,10 @@ export function assertSanitizedVisualFixture(value: unknown): void {
   }
 }
 
-/** Options for deterministic main-webview host snapshots (protocol v5). */
+/** Protocol stamped on deterministic visual fixtures; mirror webview/src/lib/protocol.ts. */
+export const VISUAL_PROTOCOL_VERSION = 10;
+
+/** Options for deterministic main-webview host snapshots (protocol v10). */
 export interface StaticWebviewFixtureOptions {
   /** When set, projects a static Ask card for accessible validation coverage. */
   pendingAsk?: {
@@ -563,7 +566,7 @@ export function createStaticWebviewFixture(
     parentId: null,
     goal,
     role: 'coordinator',
-    lifecycle: 'active',
+    lifecycle: 'open',
     runtimeActivity: (options.runtimeActivity ?? 'idle') as 'idle',
     viewStatus: (options.viewStatus ?? 'idle') as 'idle',
     currentTurnActivity: null,
@@ -574,7 +577,7 @@ export function createStaticWebviewFixture(
     type: 'snapshot' as const,
     // Must match webview/src/lib/protocol.ts PROTOCOL_VERSION so the pilot
     // does not render the host/UI version-mismatch banner.
-    protocolVersion: 5,
+    protocolVersion: VISUAL_PROTOCOL_VERSION,
     rootTasks: [task],
     focusedTaskId: taskId,
     subtree: [task],
@@ -585,6 +588,10 @@ export function createStaticWebviewFixture(
         content: options.transcriptContent ?? 'Synthetic visual pilot transcript.',
       },
     ],
+    transcriptPage: {
+      hasMoreBefore: false,
+      workspaceRevision: 1400,
+    },
     storeRevision: 1400,
     ...(options.pendingAsk ? { pendingAsk: options.pendingAsk } : {}),
   };
@@ -626,7 +633,6 @@ export function createStaticPendingPermission() {
 export function createStaticPermissionPendingMessage() {
   return {
     type: 'permissionPending' as const,
-    protocolVersion: 5,
     ...createStaticPendingPermission(),
   };
 }
