@@ -198,7 +198,7 @@ describe('permission settings host routing contract', () => {
   });
 
   it('opens Settings requesting the permission snapshot alongside Task Types and Retention', async () => {
-    const openSettings = appSource.match(/function openSettings\(\)[\s\S]*?\n  \}/)?.[0];
+    const openSettings = appSource.match(/function openSettings\([^)]*\)[\s\S]*?\n  \}/)?.[0];
     expect(openSettings).toBeDefined();
     expect(openSettings).toContain("type: 'requestSettings'");
     expect(openSettings).toContain("type: 'requestTaskTypesSettings'");
