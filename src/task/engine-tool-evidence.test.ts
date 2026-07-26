@@ -2,6 +2,11 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import {
+  TOOL_FILE_CHANGE_TEXT_MAX,
+  TOOL_FILE_CHANGE_TRUNCATION_SUFFIX,
+  TOOL_FILE_CHANGES_MAX_FILES,
+} from '../shared/tool-file-changes';
 import { TaskEngine } from './engine';
 import { SqliteTaskRepository } from './repository';
 import { DbClient } from './sqlite/client';
@@ -60,12 +65,15 @@ async function seedTurn(repository: SqliteTaskRepository, taskId: string, turnId
 async function openRepo(label: string): Promise<{
   repository: SqliteTaskRepository;
   dir: string;
+  dbPath: string;
+  client: DbClient;
 }> {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `muster-engine-tool-evidence-${label}-`));
   tempDirs.push(dir);
   const client = new DbClient({ workerPath: WORKER_TS, execArgv: TSX_ARGV });
   clients.push(client);
-  await client.open(path.join(dir, 'muster.sqlite3'));
+  const dbPath = path.join(dir, 'muster.sqlite3');
+  await client.open(dbPath);
   const repository = new SqliteTaskRepository(client, 'ws');
   await repository.execute({
     kind: 'upsertWorkspace',
@@ -75,7 +83,17 @@ async function openRepo(label: string): Promise<{
     createdAt: 'now',
     lastOpenedAt: 'now',
   });
-  return { repository, dir };
+  return { repository, dir, dbPath, client };
+}
+
+async function reopenRepo(dbPath: string): Promise<{
+  repository: SqliteTaskRepository;
+  client: DbClient;
+}> {
+  const client = new DbClient({ workerPath: WORKER_TS, execArgv: TSX_ARGV });
+  clients.push(client);
+  await client.open(dbPath);
+  return { repository: new SqliteTaskRepository(client, 'ws'), client };
 }
 
 function toolByCallId(tools: readonly PersistedToolCall[], toolCallId: string): PersistedToolCall {
@@ -224,6 +242,8 @@ describe('TaskEngine tool evidence persistence (M020 S01 T02)', () => {
     expect(tool.output).toBe('file body');
     expect(tool.fileChanges).toBeUndefined();
     expect(Object.prototype.hasOwnProperty.call(tool, 'fileChanges')).toBe(false);
+    expect(tool.fileChangesOmitted).toBeUndefined();
+    expect(Object.prototype.hasOwnProperty.call(tool, 'fileChangesOmitted')).toBe(false);
   }, 60_000);
 
   it('persists fileChanges on error outcome without inventing output', async () => {
@@ -270,4 +290,281 @@ describe('TaskEngine tool evidence persistence (M020 S01 T02)', () => {
     expect(tool.output).toBeUndefined();
     expect(tool.fileChanges).toEqual(fileChanges);
   }, 60_000);
+});
+
+describe('TaskEngine tool evidence bounding (M020 S02 T02)', () => {
+  it('persists three fileChanges entries from one toolCompleted',
+    async () => {
+      const { repository } = await openRepo('three-files');
+      const t = await seedTurn(repository, 'three-task', 'three-turn');
+
+      const fileChanges = [
+        { path: 'a.ts', oldText: 'a1', newText: 'a2' },
+        { path: 'b.ts', oldText: 'b1', newText: 'b2' },
+        { path: 'c.ts', oldText: null, newText: 'c-new' },
+      ];
+
+      const engine = await TaskEngine.loadAsync({
+        workspaceId: 'ws',
+        repository,
+        makeBackend: () => ({ name: 'fake', run: async function* () {} }) as never,
+        runTurn: async function* () {
+          yield {
+            type: 'toolStarted',
+            toolCallId: 'multi-1',
+            name: 'MultiEdit',
+            kind: 'builtin',
+          };
+          yield {
+            type: 'toolCompleted',
+            toolCallId: 'multi-1',
+            outcome: 'success',
+            output: 'edited-3',
+            fileChanges,
+          };
+          yield { type: 'turnCompleted' };
+        },
+        clock: () => '2026-07-16T00:00:02.000Z',
+      });
+
+      await engine.resumeQueuedTurnAsync(t.id, 'three-turn');
+      await engine.whenIdle().catch(() => undefined);
+
+      const tool = toolByCallId(await repository.listToolCalls(t.id), 'multi-1');
+      expect(tool.fileChanges).toEqual(fileChanges);
+      expect(tool.fileChangesOmitted).toBeUndefined();
+    },
+    60_000,
+  );
+
+  it('clips oversized newText, sets truncated: true, and stays within the bound',
+    async () => {
+      const { repository } = await openRepo('truncate');
+      const t = await seedTurn(repository, 'trunc-task', 'trunc-turn');
+      const huge = 'x'.repeat(TOOL_FILE_CHANGE_TEXT_MAX + 50);
+
+      const engine = await TaskEngine.loadAsync({
+        workspaceId: 'ws',
+        repository,
+        makeBackend: () => ({ name: 'fake', run: async function* () {} }) as never,
+        runTurn: async function* () {
+          yield {
+            type: 'toolStarted',
+            toolCallId: 'big-1',
+            name: 'Edit',
+            kind: 'builtin',
+          };
+          yield {
+            type: 'toolCompleted',
+            toolCallId: 'big-1',
+            outcome: 'success',
+            output: 'big',
+            fileChanges: [{ path: 'big.ts', oldText: 'old', newText: huge }],
+          };
+          yield { type: 'turnCompleted' };
+        },
+        clock: () => '2026-07-16T00:00:02.000Z',
+      });
+
+      await engine.resumeQueuedTurnAsync(t.id, 'trunc-turn');
+      await engine.whenIdle().catch(() => undefined);
+
+      const tool = toolByCallId(await repository.listToolCalls(t.id), 'big-1');
+      const entry = tool.fileChanges?.[0];
+      expect(entry).toBeDefined();
+      expect(entry!.truncated).toBe(true);
+      expect(entry!.newText.length).toBeLessThanOrEqual(TOOL_FILE_CHANGE_TEXT_MAX);
+      expect(entry!.newText.endsWith(TOOL_FILE_CHANGE_TRUNCATION_SUFFIX)).toBe(true);
+      expect(entry!.oldText).toBe('old');
+      expect(tool.fileChangesOmitted).toBeUndefined();
+    },
+    60_000,
+  );
+
+  it('keeps the first 32 of 40 entries and reports fileChangesOmitted: 8',
+    async () => {
+      const { repository } = await openRepo('omitted');
+      const t = await seedTurn(repository, 'omit-task', 'omit-turn');
+      const fileChanges = Array.from({ length: 40 }, (_, i) => ({
+        path: `f${i}.ts`,
+        oldText: 'o',
+        newText: 'n',
+      }));
+
+      const engine = await TaskEngine.loadAsync({
+        workspaceId: 'ws',
+        repository,
+        makeBackend: () => ({ name: 'fake', run: async function* () {} }) as never,
+        runTurn: async function* () {
+          yield {
+            type: 'toolStarted',
+            toolCallId: 'many-1',
+            name: 'Edit',
+            kind: 'builtin',
+          };
+          yield {
+            type: 'toolCompleted',
+            toolCallId: 'many-1',
+            outcome: 'success',
+            output: 'many',
+            fileChanges,
+          };
+          yield { type: 'turnCompleted' };
+        },
+        clock: () => '2026-07-16T00:00:02.000Z',
+      });
+
+      await engine.resumeQueuedTurnAsync(t.id, 'omit-turn');
+      await engine.whenIdle().catch(() => undefined);
+
+      const tool = toolByCallId(await repository.listToolCalls(t.id), 'many-1');
+      expect(tool.fileChanges).toHaveLength(TOOL_FILE_CHANGES_MAX_FILES);
+      expect(tool.fileChanges?.[0]?.path).toBe('f0.ts');
+      expect(tool.fileChanges?.[31]?.path).toBe('f31.ts');
+      expect(tool.fileChangesOmitted).toBe(8);
+    },
+    60_000,
+  );
+
+  it('relativizes absolute in-cwd paths and basenames outside-cwd / drive paths',
+    async () => {
+      const cwd = path.join(os.tmpdir(), 'muster-evidence-cwd');
+      fs.mkdirSync(cwd, { recursive: true });
+      tempDirs.push(cwd);
+      const { repository } = await openRepo('sanitize');
+      // Persist cwd on the task so the stream loop can relativize under it.
+      const t = await seedTurn(repository, 'sanitize-task', 'sanitize-turn');
+      await repository.execute({
+        kind: 'updateTask',
+        workspaceId: 'ws',
+        taskId: t.id,
+        patch: { cwd },
+      } as never).catch(async () => {
+        // Fallback: rewrite via create-style update if updateTask shape differs.
+        const existing = (await repository.listTasks()).find((row) => row.id === t.id);
+        if (!existing) throw new Error('missing task for cwd patch');
+        await repository.execute({
+          kind: 'upsertTask',
+          workspaceId: 'ws',
+          task: { ...existing, cwd },
+        } as never);
+      });
+
+      // Re-read so the engine projection has cwd if needed after reload path.
+      const absInCwd = path.join(cwd, 'src', 'main.ts');
+      const absOutside = path.join(os.tmpdir(), 'outside-secret.ts');
+
+      const engine = await TaskEngine.loadAsync({
+        workspaceId: 'ws',
+        repository,
+        workspaceFolder: cwd,
+        makeBackend: () => ({ name: 'fake', run: async function* () {} }) as never,
+        runTurn: async function* () {
+          yield {
+            type: 'toolStarted',
+            toolCallId: 'path-1',
+            name: 'Edit',
+            kind: 'builtin',
+          };
+          yield {
+            type: 'toolCompleted',
+            toolCallId: 'path-1',
+            outcome: 'success',
+            output: 'paths',
+            fileChanges: [
+              { path: absInCwd, oldText: 'a', newText: 'b' },
+              { path: absOutside, oldText: 'c', newText: 'd' },
+              {
+                path: 'C:\\Users\\alice\\AppData\\Local\\secret.ts',
+                oldText: 'e',
+                newText: 'f',
+              },
+            ],
+          };
+          yield { type: 'turnCompleted' };
+        },
+        clock: () => '2026-07-16T00:00:02.000Z',
+      });
+
+      await engine.resumeQueuedTurnAsync(t.id, 'sanitize-turn');
+      await engine.whenIdle().catch(() => undefined);
+
+      const tool = toolByCallId(await repository.listToolCalls(t.id), 'path-1');
+      expect(tool.fileChanges).toHaveLength(3);
+      expect(tool.fileChanges?.[0]?.path).toBe('src/main.ts');
+      expect(tool.fileChanges?.[1]?.path).toBe('outside-secret.ts');
+      expect(tool.fileChanges?.[2]?.path).toBe('secret.ts');
+      for (const entry of tool.fileChanges ?? []) {
+        expect(entry.path).not.toMatch(/^[A-Za-z]:/);
+        expect(entry.path).not.toContain('Users');
+        expect(entry.path).not.toContain('\\');
+      }
+    },
+    60_000,
+  );
+
+  it('survives SQLite close/reopen with the same bounded sanitized evidence',
+    async () => {
+      const cwd = path.join(os.tmpdir(), 'muster-evidence-reopen-cwd');
+      fs.mkdirSync(cwd, { recursive: true });
+      tempDirs.push(cwd);
+      const { repository, dbPath, client } = await openRepo('reopen');
+      const t = await seedTurn(repository, 'reopen-task', 'reopen-turn');
+
+      const huge = 'z'.repeat(TOOL_FILE_CHANGE_TEXT_MAX + 20);
+      const many = Array.from({ length: 35 }, (_, i) => ({
+        path: path.join(cwd, `file${i}.ts`),
+        oldText: 'o',
+        newText: i === 0 ? huge : 'n',
+      }));
+
+      const engine = await TaskEngine.loadAsync({
+        workspaceId: 'ws',
+        repository,
+        workspaceFolder: cwd,
+        makeBackend: () => ({ name: 'fake', run: async function* () {} }) as never,
+        runTurn: async function* () {
+          yield {
+            type: 'toolStarted',
+            toolCallId: 'reopen-1',
+            name: 'Edit',
+            kind: 'builtin',
+          };
+          yield {
+            type: 'toolCompleted',
+            toolCallId: 'reopen-1',
+            outcome: 'success',
+            output: 'reopen',
+            fileChanges: many,
+          };
+          yield { type: 'turnCompleted' };
+        },
+        clock: () => '2026-07-16T00:00:02.000Z',
+      });
+
+      await engine.resumeQueuedTurnAsync(t.id, 'reopen-turn');
+      await engine.whenIdle().catch(() => undefined);
+
+      const before = toolByCallId(await repository.listToolCalls(t.id), 'reopen-1');
+      expect(before.fileChanges).toHaveLength(TOOL_FILE_CHANGES_MAX_FILES);
+      expect(before.fileChangesOmitted).toBe(3);
+      expect(before.fileChanges?.[0]?.path).toBe('file0.ts');
+      expect(before.fileChanges?.[0]?.truncated).toBe(true);
+      expect(before.fileChanges?.[0]?.newText.endsWith(TOOL_FILE_CHANGE_TRUNCATION_SUFFIX)).toBe(
+        true,
+      );
+
+      // Close the original client, then reopen a fresh repository on the same db.
+      await client.close().catch(() => undefined);
+      const idx = clients.indexOf(client);
+      if (idx >= 0) clients.splice(idx, 1);
+
+      const reopened = await reopenRepo(dbPath);
+      const after = toolByCallId(await reopened.repository.listToolCalls(t.id), 'reopen-1');
+      expect(after.fileChanges).toEqual(before.fileChanges);
+      expect(after.fileChangesOmitted).toBe(before.fileChangesOmitted);
+      expect(after.output).toBe('reopen');
+    },
+    60_000,
+  );
 });

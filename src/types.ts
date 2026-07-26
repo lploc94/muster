@@ -1,13 +1,18 @@
 /**
  * Structured file-change evidence from an ACP `tool_call` / `tool_call_update`
- * `diff` content block (`zToolCallContent` union). Paths are as reported by the
- * agent (may be absolute); host/webview layers are responsible for relativizing
- * before display. `oldText` is null when the file is created.
+ * `diff` content block (`zToolCallContent` union).
+ *
+ * On the wire from the agent, `path` may be absolute. The engine bounds and
+ * sanitizes before persistence (M020 S02): paths become workspace-relative
+ * POSIX or basename-only, and oversized sides may set `truncated: true`.
+ * `oldText` is null when the file is created.
  */
 export interface ToolFileChange {
   path: string;
   oldText: string | null;
   newText: string;
+  /** Present only when a side was clipped by the engine bound; never `false`. */
+  truncated?: boolean;
 }
 
 export type NormalizedEvent =

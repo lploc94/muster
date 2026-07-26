@@ -69,6 +69,7 @@ import {
   TASK_MESSAGE_MAX_CHARS,
   TASK_RESULT_MAX_BYTES,
 } from './content-limits';
+import { boundToolFileChanges } from '../shared/tool-file-changes';
 import { selectCommittedSessionId } from './session-select';
 import { sanitizeHandoffFailureMessage } from './sanitization';
 import type { TaskReadPort } from './store-port';
@@ -4866,25 +4867,48 @@ export class TaskEngine {
             const compositeId = `${turnId}:${event.toolCallId}`;
             const at = nowIso(this.clock);
             const existing = streamedTools.get(compositeId);
-            // fileChanges: replace when present on the event; otherwise keep prior evidence.
+            // Bound + sanitize before persistence (M020 S02). When the event carries
+            // fileChanges, replace prior evidence with the bounded result (including
+            // clearing when every entry is dropped). When absent, keep prior evidence.
             // Never write an empty array for absence — omit so payload_json stays clean.
+            const boundEvidence =
+              event.fileChanges !== undefined
+                ? boundToolFileChanges(event.fileChanges, {
+                    cwd: eventTask.cwd ?? this.workspaceFolder,
+                  })
+                : undefined;
             const nextTool: PersistedToolCall = existing
               ? {
                   ...existing,
                   input: event.input !== undefined ? event.input : existing.input,
                   updatedAt: at,
-                  ...(event.fileChanges !== undefined
-                    ? { fileChanges: event.fileChanges }
+                  ...(boundEvidence !== undefined
+                    ? {
+                        fileChanges: boundEvidence.fileChanges,
+                        fileChangesOmitted: boundEvidence.fileChangesOmitted,
+                      }
                     : {}),
                 }
               : {
                   id: compositeId, taskId: eventTurn.taskId, turnId, toolCallId: event.toolCallId,
                   order: nextOrder(), name: 'tool', status: 'running', input: event.input,
                   createdAt: at, updatedAt: at,
-                  ...(event.fileChanges !== undefined
-                    ? { fileChanges: event.fileChanges }
+                  ...(boundEvidence !== undefined
+                    ? {
+                        fileChanges: boundEvidence.fileChanges,
+                        fileChangesOmitted: boundEvidence.fileChangesOmitted,
+                      }
                     : {}),
                 };
+            // Clear stale omitted/fileChanges keys when replace yields absence.
+            if (boundEvidence !== undefined) {
+              if (boundEvidence.fileChanges === undefined) {
+                delete nextTool.fileChanges;
+              }
+              if (boundEvidence.fileChangesOmitted === undefined) {
+                delete nextTool.fileChangesOmitted;
+              }
+            }
             streamedTools.set(compositeId, nextTool);
             let failMessage: string | undefined;
             try {
@@ -4925,6 +4949,15 @@ export class TaskEngine {
               createdAt: at,
               updatedAt: at,
             };
+            // Bound + sanitize before persistence (M020 S02). When the complete
+            // event carries fileChanges, replace prior evidence; otherwise keep
+            // whatever toolUpdated already stored (spread of `base` preserves it).
+            const boundEvidence =
+              event.fileChanges !== undefined
+                ? boundToolFileChanges(event.fileChanges, {
+                    cwd: eventTask.cwd ?? this.workspaceFolder,
+                  })
+                : undefined;
             const nextTool: PersistedToolCall = {
               ...base,
               status: outcome === 'error' ? 'error' : 'success',
@@ -4932,12 +4965,21 @@ export class TaskEngine {
               ...(outcome === 'error'
                 ? { error: event.error, output: undefined }
                 : { output: event.output, error: undefined }),
-              // Replace evidence when the complete event carries it; otherwise keep
-              // whatever toolUpdated already stored (spread of `base` preserves it).
-              ...(event.fileChanges !== undefined
-                ? { fileChanges: event.fileChanges }
+              ...(boundEvidence !== undefined
+                ? {
+                    fileChanges: boundEvidence.fileChanges,
+                    fileChangesOmitted: boundEvidence.fileChangesOmitted,
+                  }
                 : {}),
             };
+            if (boundEvidence !== undefined) {
+              if (boundEvidence.fileChanges === undefined) {
+                delete nextTool.fileChanges;
+              }
+              if (boundEvidence.fileChangesOmitted === undefined) {
+                delete nextTool.fileChangesOmitted;
+              }
+            }
             streamedTools.set(compositeId, nextTool);
             let failMessage: string | undefined;
             try {
