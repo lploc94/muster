@@ -62,6 +62,16 @@ import {
   readRedactedDbIdentity,
   type UatHostState,
 } from './host/uat-commands';
+import {
+  NATIVE_FIRST_RUN_UAT_PROMPT,
+  isNativeFirstRunProviderId,
+  observeNativeCleanup,
+  observeNativeDoctor,
+  observeNativeFirstTaskAcceptance,
+  observeNativeIsolatedProbe,
+  observeNativeReadinessRefresh,
+  type NativeFirstTaskAcceptResult,
+} from './host/m019-s05-native-first-run';
 import type { RepositoryCommitContext } from './task/repository-projection';
 import {
   buildRetentionSettingsSnapshot,
@@ -618,7 +628,15 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     private readonly _extensionUri: vscode.Uri,
   ) {}
 
+  /** Optional non-production interceptor used by native first-run UAT accept. */
+  private uatPostInterceptor: ((message: unknown) => void) | undefined;
+
   private post(message: unknown): void {
+    try {
+      this.uatPostInterceptor?.(message);
+    } catch {
+      // UAT interceptor must never break production post path
+    }
     try {
       this._view?.webview.postMessage(message);
     } catch {
@@ -2015,6 +2033,158 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   async focusTaskForUat(taskId: string | undefined): Promise<UatHostState> {
     await this.transitionFocus(taskId);
     return this.hostStateForUat();
+  }
+
+  /**
+   * M019/S05: non-production native first-run observations.
+   * Each method delegates to the production refresh/probe/Doctor/send path and
+   * returns only bounded sanitized fields (no prompt, task body, path, or secret).
+   */
+  async observeNativeReadinessRefreshForUat(providerId: string) {
+    if (!isNativeFirstRunProviderId(providerId)) {
+      throw new Error('UAT providerId not allowlisted');
+    }
+    return observeNativeReadinessRefresh(providerId, {
+      refreshAndPublishReadiness: () => this.refreshAndPublishBackendReadiness(),
+      getReadinessSnapshot: () => getBackendReadinessService().peek(),
+      now: () => new Date(),
+    });
+  }
+
+  async observeNativeIsolatedProbeForUat(providerId: string) {
+    if (!isNativeFirstRunProviderId(providerId)) {
+      throw new Error('UAT providerId not allowlisted');
+    }
+    return observeNativeIsolatedProbe(providerId, {
+      routeStart: (message) => routeStartBackendProbe(message, this.backendProbeRouteDeps()),
+      getReadinessSnapshot: () => getBackendReadinessService().peek(),
+      createProbeId: () => randomUUID(),
+      now: () => new Date(),
+    });
+  }
+
+  async observeNativeDoctorForUat(providerId: string) {
+    if (!isNativeFirstRunProviderId(providerId)) {
+      throw new Error('UAT providerId not allowlisted');
+    }
+    return observeNativeDoctor(providerId, {
+      runDoctor: () =>
+        handleRunDiagnosticsCommand({
+          refreshAndPublishReadiness: () => this.refreshAndPublishBackendReadiness(),
+          openChatView: () =>
+            vscode.commands.executeCommand(MUSTER_OPEN_CHAT_VIEW_COMMAND),
+          postRevealBackendDiagnostics: () => this.postRevealBackendDiagnostics(),
+        }),
+      getReadinessSnapshot: () => getBackendReadinessService().peek(),
+      now: () => new Date(),
+    });
+  }
+
+  async observeNativeFirstTaskAcceptanceForUat(providerId: string) {
+    if (!isNativeFirstRunProviderId(providerId)) {
+      throw new Error('UAT providerId not allowlisted');
+    }
+    return observeNativeFirstTaskAcceptance(providerId, {
+      acceptFirstTask: async ({ backendId, clientRequestId }) => {
+        if (!taskEngine || !taskStore || !taskRepository) {
+          return { kind: 'error', code: 'host_unavailable' };
+        }
+        const result = await this.acceptFirstTaskForUat({
+          backendId,
+          clientRequestId,
+        });
+        return result;
+      },
+      getReadinessSnapshot: () => getBackendReadinessService().peek(),
+      createClientRequestId: () => `uat-s05-${randomUUID()}`,
+      now: () => new Date(),
+    });
+  }
+
+  /**
+   * Production send path for clean-workspace first-task acceptance.
+   * Captures only accept/reject codes + id lengths — never prompt or store bodies.
+   */
+  private async acceptFirstTaskForUat(input: {
+    backendId: string;
+    clientRequestId: string;
+  }): Promise<NativeFirstTaskAcceptResult> {
+    let outcome: NativeFirstTaskAcceptResult = {
+      kind: 'error',
+      code: 'host_unavailable',
+    };
+    // Intercept sendAccepted/sendRejected from the durable coordinator without
+    // reassigning the private post method (keeps TypeScript private-method safety).
+    this.uatPostInterceptor = (message: unknown) => {
+      if (typeof message !== 'object' || message === null) return;
+      const msg = message as {
+        type?: string;
+        clientRequestId?: string;
+        taskId?: string;
+        messageId?: string;
+        code?: string;
+      };
+      if (
+        msg.type === 'sendAccepted' &&
+        msg.clientRequestId === input.clientRequestId &&
+        typeof msg.taskId === 'string' &&
+        typeof msg.messageId === 'string'
+      ) {
+        outcome = {
+          kind: 'accepted',
+          taskIdLength: msg.taskId.length,
+          messageIdLength: msg.messageId.length,
+        };
+        // Remember task id for cleanup without returning it in the observation.
+        this.uatNativeFirstRunTaskId = msg.taskId;
+      } else if (
+        msg.type === 'sendRejected' &&
+        msg.clientRequestId === input.clientRequestId
+      ) {
+        const code =
+          msg.code === 'store' ||
+          msg.code === 'validation' ||
+          msg.code === 'conflict' ||
+          msg.code === 'capacity' ||
+          msg.code === 'unknown'
+            ? msg.code
+            : 'unknown';
+        outcome = { kind: 'rejected', code };
+      }
+    };
+    try {
+      await this.handleSend({
+        type: 'send',
+        text: NATIVE_FIRST_RUN_UAT_PROMPT,
+        backend: input.backendId,
+        clientRequestId: input.clientRequestId,
+      });
+    } catch {
+      outcome = { kind: 'error', code: 'host_unavailable' };
+    } finally {
+      this.uatPostInterceptor = undefined;
+    }
+    return outcome;
+  }
+
+  /** Last UAT first-task id (in-memory only; never returned in observations). */
+  private uatNativeFirstRunTaskId: string | undefined;
+
+  async observeNativeCleanupForUat(providerId: string) {
+    if (!isNativeFirstRunProviderId(providerId)) {
+      throw new Error('UAT providerId not allowlisted');
+    }
+    const createdTaskId = this.uatNativeFirstRunTaskId;
+    this.uatNativeFirstRunTaskId = undefined;
+    return observeNativeCleanup(providerId, {
+      cancelProbe: (backendId) => getBackendProbeService().cancel(backendId),
+      disposeAllProbes: () => getBackendProbeService().disposeAll(),
+      createdTaskId,
+      deleteCreatedTask: async (taskId) => {
+        await this.handleDeleteTask(taskId);
+      },
+      now: () => new Date(),
+    });
   }
 
   /** Exercise the production loadTranscriptPage route against a real focused view. */
@@ -4549,6 +4719,27 @@ function registerLiveUatCommands(context: vscode.ExtensionContext): void {
         rootId: String(args.rootId),
         presentationId: String(args.presentationId),
       });
+    }),
+    // M019/S05 native first-run observations — production-path delegates only.
+    vscode.commands.registerCommand(UAT_COMMANDS.refreshReadiness, async (args) => {
+      if (!uatChatProvider) throw new Error('UAT chat provider unavailable');
+      return uatChatProvider.observeNativeReadinessRefreshForUat(String(args?.providerId ?? ''));
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.probeBackend, async (args) => {
+      if (!uatChatProvider) throw new Error('UAT chat provider unavailable');
+      return uatChatProvider.observeNativeIsolatedProbeForUat(String(args?.providerId ?? ''));
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.runDoctor, async (args) => {
+      if (!uatChatProvider) throw new Error('UAT chat provider unavailable');
+      return uatChatProvider.observeNativeDoctorForUat(String(args?.providerId ?? ''));
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.acceptFirstTask, async (args) => {
+      if (!uatChatProvider) throw new Error('UAT chat provider unavailable');
+      return uatChatProvider.observeNativeFirstTaskAcceptanceForUat(String(args?.providerId ?? ''));
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.nativeFirstRunCleanup, async (args) => {
+      if (!uatChatProvider) throw new Error('UAT chat provider unavailable');
+      return uatChatProvider.observeNativeCleanupForUat(String(args?.providerId ?? ''));
     }),
   );
 }
