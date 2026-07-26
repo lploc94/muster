@@ -9424,6 +9424,183 @@ test.describe('M019 S03 First Run Journey', () => {
   });
 });
 
+test.describe('M019 S04 Doctor + runtime recovery', () => {
+  const checkedAt = '2026-07-26T16:00:00.000Z';
+
+  function fiveReadySnapshot(correlationId = 'e2e-s04-ready') {
+    const backends = ['claude', 'grok', 'kiro', 'codex', 'opencode'].map((backendId) => ({
+      backendId,
+      state: 'ready',
+      code: 'none',
+      recoveryAction: 'none',
+      compatibility: 'compatible',
+      versionEvidence: '2.1.4',
+      checkedAt,
+    }));
+    return {
+      schemaVersion: 1,
+      correlationId,
+      phase: 'settled',
+      checkedAt,
+      backends,
+    };
+  }
+
+  function withClaudeInvalidated(
+    base: ReturnType<typeof fiveReadySnapshot>,
+    claude: {
+      state: string;
+      code: string;
+      recoveryAction: string;
+      compatibility?: string;
+      checkedAt?: string;
+    },
+  ) {
+    return {
+      ...base,
+      correlationId: `${base.correlationId}-${claude.state}`,
+      backends: base.backends.map((record) =>
+        record.backendId === 'claude'
+          ? {
+              ...record,
+              state: claude.state,
+              code: claude.code,
+              recoveryAction: claude.recoveryAction,
+              compatibility: claude.compatibility ?? record.compatibility,
+              checkedAt: claude.checkedAt ?? '2026-07-26T16:05:00.000Z',
+            }
+          : record,
+      ),
+    };
+  }
+
+  test('Doctor refresh-then-reveal focuses settings-backends on refreshed snapshot', async ({
+    page,
+  }) => {
+    // Host Doctor order (T02): refresh readiness publish, open chat, then post
+    // revealBackendDiagnostics. Playwright proves the S03 deep-link contract still
+    // focuses Agents → Backends after a refreshed readiness snapshot lands first.
+    await openWebview(page, { backendReadiness: 'none' });
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [],
+      storeRevision: 1,
+    });
+
+    // Doctor refresh publishes the shared readiness snapshot first.
+    await postRawHostMessage(page, {
+      type: 'backendReadinessSnapshot',
+      snapshot: fiveReadySnapshot('e2e-s04-doctor-refresh'),
+    });
+
+    // Then Doctor posts the S03 reveal deep-link.
+    await postRawHostMessage(page, {
+      type: 'revealBackendDiagnostics',
+    });
+
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+    const backends = page.getByTestId('settings-backends');
+    await expect(backends).toBeVisible();
+    await expect(page.getByTestId('backends-list')).toBeVisible();
+    await expect(page.getByTestId('backend-row-claude')).toHaveAttribute(
+      'data-backend-state',
+      'ready',
+    );
+    await expect(page.getByTestId('backend-row-diagnostic-claude')).toContainText(
+      /Claude is ready/i,
+    );
+    await expect
+      .poll(async () => controlHasFocus(backends))
+      .toBe(true);
+  });
+
+  test('runtime-invalidated provider shows same Agents Backends recovery guidance', async ({
+    page,
+  }) => {
+    // Assembled S04 browser path: ready inventory visible on Agents Backends,
+    // then a later runtime invalidation republishes the same sanitized readiness
+    // channel with auth_required + login recovery (no second diagnostic vocabulary).
+    await openWebview(page, { backendReadiness: 'none' });
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [
+        {
+          id: 't-live',
+          parentId: null,
+          goal: 'Live task that later hits auth setup failure',
+          role: 'worker',
+          lifecycle: 'open',
+          viewStatus: 'failed',
+          currentTurnActivity: null,
+          updatedAt: checkedAt,
+          backend: 'claude',
+        },
+      ],
+      storeRevision: 1,
+    });
+
+    // Doctor / inventory: all ready.
+    await postRawHostMessage(page, {
+      type: 'backendReadinessSnapshot',
+      snapshot: fiveReadySnapshot('e2e-s04-ready-base'),
+    });
+    await postRawHostMessage(page, {
+      type: 'revealBackendDiagnostics',
+    });
+
+    await expect(page.getByTestId('settings-backends')).toBeVisible();
+    await expect(page.getByTestId('backend-row-claude')).toHaveAttribute(
+      'data-backend-state',
+      'ready',
+    );
+
+    // Later real-task auth setup failure invalidates only claude via shared snapshot.
+    await postRawHostMessage(page, {
+      type: 'backendReadinessSnapshot',
+      snapshot: withClaudeInvalidated(fiveReadySnapshot('e2e-s04-runtime-auth'), {
+        state: 'auth_required',
+        code: 'auth_required',
+        recoveryAction: 'login',
+        compatibility: 'compatible',
+        checkedAt: '2026-07-26T16:10:00.000Z',
+      }),
+    });
+
+    const claudeRow = page.getByTestId('backend-row-claude');
+    await expect(claudeRow).toHaveAttribute('data-backend-state', 'auth_required');
+    await expect(page.getByTestId('backend-row-status-claude')).toContainText(
+      /Sign in required/i,
+    );
+    await expect(page.getByTestId('backend-row-diagnostic-claude')).toContainText(
+      /sign in/i,
+    );
+    // Same recovery affordance as S02 Test Connection auth path: re-test remains available.
+    await expect(page.getByTestId('backend-row-test-claude')).toBeVisible();
+    // Sibling providers stay ready (only the failing provider is invalidated).
+    await expect(page.getByTestId('backend-row-codex')).toHaveAttribute(
+      'data-backend-state',
+      'ready',
+    );
+
+    // Spawn-style invalidation also lands on the same surface with install recovery.
+    await postRawHostMessage(page, {
+      type: 'backendReadinessSnapshot',
+      snapshot: withClaudeInvalidated(fiveReadySnapshot('e2e-s04-runtime-missing'), {
+        state: 'missing',
+        code: 'executable_missing',
+        recoveryAction: 'install',
+        compatibility: 'unknown',
+        checkedAt: '2026-07-26T16:12:00.000Z',
+      }),
+    });
+    await expect(page.getByTestId('backend-row-claude')).toHaveAttribute(
+      'data-backend-state',
+      'missing',
+    );
+    await expect(page.getByTestId('backend-row-status-claude')).toContainText(/Not installed|Missing|Install/i);
+  });
+});
+
 declare global {
   interface Window {
     acquireVsCodeApi: () => {
