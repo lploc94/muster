@@ -169,6 +169,11 @@ import {
   MUSTER_BACKUP_DATABASE_COMMAND,
   MUSTER_DEVELOPER_RESET_COMMAND,
 } from './host/sqlite-maintenance-commands';
+import {
+  handleRunDiagnosticsCommand,
+  MUSTER_OPEN_CHAT_VIEW_COMMAND,
+  MUSTER_RUN_DIAGNOSTICS_COMMAND,
+} from './host/run-diagnostics-command';
 import { createTerminalStorageLifecycle } from './host/terminal-storage-lifecycle';
 import { runDurableHostSend } from './host/durable-send-coordinator';
 
@@ -1210,6 +1215,21 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   }
 
   /** Push Settings-backed last-used backend/model so the picker survives restarts. */
+  /**
+   * Doctor (M019/S04): refresh shared readiness and publish backendReadinessSnapshot.
+   * Does not mutate tasks/sessions. Used by muster.runDiagnostics.
+   */
+  async refreshAndPublishBackendReadiness(): Promise<void> {
+    await this.postBackendReadiness('refresh');
+  }
+
+  /**
+   * Doctor deep-link: post revealBackendDiagnostics (type key only — S03 contract).
+   */
+  postRevealBackendDiagnostics(): void {
+    this.post({ type: 'revealBackendDiagnostics' });
+  }
+
   postComposerSelection(): void {
     const selection = readComposerSelection({
       get: (key) => vscode.workspace.getConfiguration().get(key),
@@ -3683,6 +3703,25 @@ export async function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand('muster.openChat', () =>
       vscode.commands.executeCommand('workbench.view.extension.muster'),
+    ),
+  );
+
+  // M019/S04 Doctor: refresh readiness → open chat → reveal Agents → Backends.
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      MUSTER_RUN_DIAGNOSTICS_COMMAND,
+      async (_args?: unknown, token?: vscode.CancellationToken) => {
+        await handleRunDiagnosticsCommand({
+          refreshAndPublishReadiness: () =>
+            provider.refreshAndPublishBackendReadiness(),
+          openChatView: () =>
+            vscode.commands.executeCommand(MUSTER_OPEN_CHAT_VIEW_COMMAND),
+          postRevealBackendDiagnostics: () =>
+            provider.postRevealBackendDiagnostics(),
+          isCancellationRequested: () =>
+            Boolean(token?.isCancellationRequested),
+        });
+      },
     ),
   );
 

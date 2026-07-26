@@ -41,6 +41,10 @@
         "title": "Muster: Open Chat"
       },
       {
+        "command": "muster.runDiagnostics",
+        "title": "Muster: Run Diagnostics"
+      },
+      {
         "command": "muster.backupDatabase",
         "title": "Muster: Back Up Global Database"
       },
