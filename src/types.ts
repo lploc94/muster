@@ -1,10 +1,38 @@
+/**
+ * Structured file-change evidence from an ACP `tool_call` / `tool_call_update`
+ * `diff` content block (`zToolCallContent` union). Paths are as reported by the
+ * agent (may be absolute); host/webview layers are responsible for relativizing
+ * before display. `oldText` is null when the file is created.
+ */
+export interface ToolFileChange {
+  path: string;
+  oldText: string | null;
+  newText: string;
+}
+
 export type NormalizedEvent =
   | { type: 'sessionStarted'; sessionId?: string; meta?: Record<string, unknown> }
   | { type: 'assistantDelta'; content: string; messageId: string; meta?: Record<string, unknown> }
   | { type: 'reasoningDelta'; content: string; messageId: string; meta?: Record<string, unknown> }
   | { type: 'toolStarted'; toolCallId: string; name: string; kind?: 'mcp' | 'builtin' | 'other'; input?: unknown; meta?: Record<string, unknown> }
-  | { type: 'toolUpdated'; toolCallId: string; input?: unknown; meta?: Record<string, unknown> }
-  | { type: 'toolCompleted'; toolCallId: string; outcome: 'success' | 'error'; output?: unknown; error?: string; meta?: Record<string, unknown> }
+  | {
+      type: 'toolUpdated';
+      toolCallId: string;
+      input?: unknown;
+      /** Optional ACP diff-block evidence (M020). Omitted when absent. */
+      fileChanges?: ToolFileChange[];
+      meta?: Record<string, unknown>;
+    }
+  | {
+      type: 'toolCompleted';
+      toolCallId: string;
+      outcome: 'success' | 'error';
+      output?: unknown;
+      error?: string;
+      /** Optional ACP diff-block evidence (M020). Omitted when absent. */
+      fileChanges?: ToolFileChange[];
+      meta?: Record<string, unknown>;
+    }
   | { type: 'usage'; usage: Record<string, unknown>; meta?: Record<string, unknown> }
   | { type: 'turnCompleted'; meta?: Record<string, unknown> }
   | { type: 'error'; message: string; isCancellation?: boolean; raw?: unknown; meta?: Record<string, unknown> }
