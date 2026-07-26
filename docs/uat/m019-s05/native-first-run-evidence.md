@@ -2,67 +2,67 @@
 
 ## Environment and Preconditions
 
-Tracked structural ledger for the packaged Extension Host native first-run contract. Provider matrix covers the five allowlisted readiness IDs (`claude`, `grok`, `kiro`, `codex`, `opencode`) plus host activation, Doctor, first-task acceptance, and cleanup. T02 installs the runner and fail-closed verifier; T05 executes the matrix and reconciles live outcomes. No credentials, prompts, absolute paths, raw stderr, or store bodies are recorded.
+Tracked live ledger for the packaged Extension Host native first-run matrix. Provider coverage covers the five allowlisted readiness IDs (`claude`, `grok`, `kiro`, `codex`, `opencode`) plus host activation, Doctor, first-task acceptance, and cleanup. T05 executed `npm run test:m019-s05-native-first-run` (fresh VSIX via createVSIX, disposable Extension Development Host, `MUSTER_UAT_MODE=1`) and reconciled the closed host result. Host result: ok=true, readyProviderId=none, cleanupCompleted=true, vscode 1.129.1. No credentials, prompts, absolute paths, raw stderr, or store bodies are recorded.
 
 ## Proof Boundary
 
-Playwright and local integration gates are supportive only. PASS requires actual VS Code Extension Development Host observation through the packaged Extension Host runner (`scripts/run-m019-s05-native-first-run.mjs` launching `scripts/m019-s05-native-first-run.ts` against a freshly packaged VSIX with `MUSTER_UAT_MODE=1`). Browser fixtures and injected host suites cannot replace native proof and do not claim native PASS. Scenario-local `ENVIRONMENT BLOCKED` is the honest outcome when launch, provider install/auth, probe, Doctor, or first-send prerequisites are unavailable.
+Playwright and local integration gates are supportive only. PASS requires actual VS Code Extension Development Host observation through the packaged Extension Host runner (`scripts/run-m019-s05-native-first-run.mjs` launching `scripts/m019-s05-native-first-run.ts` against a freshly packaged VSIX with `MUSTER_UAT_MODE=1`). Browser fixtures and injected host suites cannot replace native proof and do not claim native PASS. Scenario-local `ENVIRONMENT BLOCKED` is the honest outcome when launch, provider install/auth, probe, Doctor, or first-send prerequisites are unavailable. This ledger does not claim CI ran native UAT, and a valid ENVIRONMENT BLOCKED ledger does not claim CI ran native UAT.
 
 ## Scenario Evidence
 
 ### NATIVE-HOST-ACTIVATE
-- Verdict: ENVIRONMENT BLOCKED
-- Timestamp: 2026-07-26T00:00:00Z
-- Observation: Packaged Extension Host activation was not executed in this structural-contract task; the runner and UAT adapter are present for later execution.
-- Evidence: Attempted: prepare the fail-closed native first-run runner and evidence contract. Blocker: live packaged host launch is deferred to the execute-matrix task and was not performed here.
+- Verdict: PASS
+- Timestamp: 2026-07-26T02:10:26Z
+- Observation: Packaged tlelabs.muster activated under MUSTER_UAT_MODE; UAT ping ok; chat view open requested; extensionActive=true.
+- Evidence: runner: npm run test:m019-s05-native-first-run; observation: NATIVE-HOST-ACTIVATE PASS packaged extension activated UAT ping ok.
 
 ### NATIVE-CLAUDE-FIRST-RUN
 - Verdict: ENVIRONMENT BLOCKED
-- Timestamp: 2026-07-26T00:00:00Z
-- Observation: No live native first-run behavior was inferred from browser, injected, or mocked coverage for the claude provider.
-- Evidence: Attempted: exercise claude through readiness refresh, isolated Test Connection, and readiness-gated steps in a packaged host. Blocker: host execution is deferred to the execute-matrix task and was not performed in this structural-contract task.
+- Timestamp: 2026-07-26T02:10:26Z
+- Observation: Claude refresh/probe ran through production UAT adapter; state=installed_unverified; probe did not reach ready; no native ready claim.
+- Evidence: Attempted: readiness refresh and isolated Test Connection for claude in packaged Extension Host. Blocker: probe ENVIRONMENT_BLOCKED with block=host_unavailable (state=installed_unverified code=none recovery=none).
 
 ### NATIVE-GROK-FIRST-RUN
 - Verdict: ENVIRONMENT BLOCKED
-- Timestamp: 2026-07-26T00:00:00Z
-- Observation: No live native first-run behavior was inferred from browser, injected, or mocked coverage for the grok provider.
-- Evidence: Attempted: exercise grok through readiness refresh, isolated Test Connection, and readiness-gated steps in a packaged host. Blocker: host execution is deferred to the execute-matrix task and was not performed in this structural-contract task.
+- Timestamp: 2026-07-26T02:10:26Z
+- Observation: Grok refresh/probe ran through production UAT adapter; state=installed_unverified; probe did not reach ready; no native ready claim.
+- Evidence: Attempted: readiness refresh and isolated Test Connection for grok in packaged Extension Host. Blocker: probe ENVIRONMENT_BLOCKED with block=host_unavailable (state=installed_unverified code=none recovery=none).
 
 ### NATIVE-KIRO-FIRST-RUN
 - Verdict: ENVIRONMENT BLOCKED
-- Timestamp: 2026-07-26T00:00:00Z
-- Observation: No live native first-run behavior was inferred from browser, injected, or mocked coverage for the kiro provider.
-- Evidence: Attempted: exercise kiro through readiness refresh, isolated Test Connection, and readiness-gated steps in a packaged host. Blocker: host execution is deferred to the execute-matrix task and was not performed in this structural-contract task.
+- Timestamp: 2026-07-26T02:10:26Z
+- Observation: Kiro refresh/probe ran through production UAT adapter; state=missing with code=executable_missing recovery=install; probe did not reach ready.
+- Evidence: Attempted: readiness refresh and isolated Test Connection for kiro in packaged Extension Host. Blocker: probe ENVIRONMENT_BLOCKED with block=host_unavailable (state=missing code=executable_missing recovery=install).
 
 ### NATIVE-CODEX-FIRST-RUN
 - Verdict: ENVIRONMENT BLOCKED
-- Timestamp: 2026-07-26T00:00:00Z
-- Observation: No live native first-run behavior was inferred from browser, injected, or mocked coverage for the codex provider.
-- Evidence: Attempted: exercise codex through readiness refresh, isolated Test Connection, and readiness-gated steps in a packaged host. Blocker: host execution is deferred to the execute-matrix task and was not performed in this structural-contract task.
+- Timestamp: 2026-07-26T02:10:26Z
+- Observation: Codex refresh/probe ran through production UAT adapter; state=installed_unverified with code=internal_error; probe did not reach ready.
+- Evidence: Attempted: readiness refresh and isolated Test Connection for codex in packaged Extension Host. Blocker: probe ENVIRONMENT_BLOCKED with block=host_unavailable (state=installed_unverified code=internal_error recovery=none).
 
 ### NATIVE-OPENCODE-FIRST-RUN
 - Verdict: ENVIRONMENT BLOCKED
-- Timestamp: 2026-07-26T00:00:00Z
-- Observation: No live native first-run behavior was inferred from browser, injected, or mocked coverage for the opencode provider.
-- Evidence: Attempted: exercise opencode through readiness refresh, isolated Test Connection, and readiness-gated steps in a packaged host. Blocker: host execution is deferred to the execute-matrix task and was not performed in this structural-contract task.
+- Timestamp: 2026-07-26T02:10:26Z
+- Observation: OpenCode refresh/probe ran through production UAT adapter; state=installed_unverified; probe did not reach ready; no native ready claim.
+- Evidence: Attempted: readiness refresh and isolated Test Connection for opencode in packaged Extension Host. Blocker: probe ENVIRONMENT_BLOCKED with block=host_unavailable (state=installed_unverified code=none recovery=none).
 
 ### NATIVE-DOCTOR
-- Verdict: ENVIRONMENT BLOCKED
-- Timestamp: 2026-07-26T00:00:00Z
-- Observation: Doctor was not invoked through the packaged host in this structural-contract task; no native Doctor observation is claimed.
-- Evidence: Attempted: run Muster Doctor via the non-production UAT adapter on the production diagnostics path. Blocker: host execution is deferred to the execute-matrix task and was not performed in this structural-contract task.
+- Verdict: PASS
+- Timestamp: 2026-07-26T02:10:26Z
+- Observation: Doctor ran via non-production UAT adapter on the production diagnostics path for provider tag claude; doctorResult=success.
+- Evidence: runner: npm run test:m019-s05-native-first-run; observation: NATIVE-DOCTOR PASS step=doctor doctor=success.
 
 ### NATIVE-FIRST-TASK-ACCEPTANCE
 - Verdict: ENVIRONMENT BLOCKED
-- Timestamp: 2026-07-26T00:00:00Z
-- Observation: Clean-workspace first-task acceptance was not attempted live; browser or unit send coverage is supportive only.
-- Evidence: Attempted: accept a first task through the production send path for one ready provider after refresh and probe. Blocker: host execution is deferred to the execute-matrix task and was not performed in this structural-contract task.
+- Timestamp: 2026-07-26T02:10:26Z
+- Observation: Clean-workspace first-task acceptance was not attempted because no provider reached ready after refresh/probe.
+- Evidence: Attempted: accept a first task through the production send path for one ready provider after refresh and probe. Blocker: no ready provider after refresh/probe; first-task acceptance not attempted (readyProviderId=none).
 
 ### NATIVE-FINAL-CLEANUP
-- Verdict: ENVIRONMENT BLOCKED
-- Timestamp: 2026-07-26T00:00:00Z
-- Observation: Cleanup could not be observed because no disposable host profile, workspace, probe, or first-task was started.
-- Evidence: Attempted: dispose probes, delete any UAT-created task, and tear down the disposable user-data directory. Blocker: host execution is deferred to the execute-matrix task and was not performed in this structural-contract task.
+- Verdict: PASS
+- Timestamp: 2026-07-26T02:10:26Z
+- Observation: Cleanup completed through the UAT adapter; probes disposed and no residual UAT first-task retained; cleanup=yes.
+- Evidence: runner: npm run test:m019-s05-native-first-run; observation: NATIVE-FINAL-CLEANUP PASS cleanup=yes disposed.
 
 ## Redaction Rules
 
