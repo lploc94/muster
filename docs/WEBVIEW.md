@@ -13,7 +13,7 @@ Authoritative spec for the Muster chat sidebar webview: tech stack, folder layou
 - [`MUSTER-BRIDGE.md`](MUSTER-BRIDGE.md) — elicitation / AskBridge (§3.2–3.3), extension↔webview messages (§6)
 - [`SESSION-MANAGEMENT.md`](SESSION-MANAGEMENT.md) — resume IDs, `.muster-sessions.json`
 - [`DESIGN.md`](DESIGN.md) — coordinator architecture (extension host vs webview)
-- [`SETTINGS.md`](SETTINGS.md) — host-backed Settings pattern for feature configuration
+- [`SETTINGS.md`](SETTINGS.md) — host-backed Settings pattern for feature configuration, including Agents → Backends readiness and recovery
 
 ---
 
@@ -760,7 +760,46 @@ Unit tests cover the pure Markdown projector, host export route (including silen
 
 ---
 
-## 16. References
+## 16. Trustworthy first run and backend recovery
+
+When the workspace has **no root tasks**, Muster shows a derived **first-run journey** (not a durable onboarding flag): install → refresh → Test Connection → first task. The journey and Composer eligibility both read the same host `BackendReadinessSnapshot`; the webview never invents readiness truth.
+
+### Operator path
+
+1. Install at least one supported agent CLI (`claude`, `grok`, `kiro`, `codex`, `opencode`) and complete that CLI's own sign-in if required.
+2. Open Muster with a clean workspace (no existing root tasks) or open **Settings → Agents → Backends**.
+3. Use **Refresh backends** / **Refresh** for passive inventory (PATH + bounded version only).
+4. On a detected but unverified backend, run **Test Connection** from the Agents → Backends row (single-flight, cancelable, no model prompt, no task artifacts).
+5. When a backend is **ready**, start the first task from the journey or Composer. Clean workspaces require ready; existing-task workspaces keep the broader passive-selectable rule.
+6. If inventory looks wrong or recovery is unclear, run Command Palette **Muster: Run Diagnostics** — it refreshes readiness and deep-links via `revealBackendDiagnostics` into Agents → Backends.
+
+Composer no longer hosts Test Connection controls. When setup is still required it shows readiness guidance plus **Open backend setup**, which deep-links to Agents → Backends.
+
+### States and recovery the UI surfaces
+
+| Signal | What the user should do |
+|--------|-------------------------|
+| `missing` / Install CLI | Install the provider CLI, then Refresh |
+| `installed_unverified` | Run Test Connection on that row |
+| `auth_required` / Sign in required | Sign in with the CLI, then retry Test Connection |
+| `testing` | Wait for progress stages or Cancel |
+| `ready` | Send the first task |
+| `failed` / timeout / process exited | Retry Test Connection after checking the CLI |
+| Mid-turn setup failure mapped to the same codes | Follow the same Agents → Backends recovery copy; the prompt is not auto-replayed |
+
+Diagnostics stay sanitized: no absolute paths, raw stderr, secrets, or store bodies. Full code/action tables live in [SETTINGS.md](SETTINGS.md) under **Agents → Backends readiness and recovery**.
+
+### Proof boundary
+
+Unit, host-integration, and Playwright flows (including `M019 S05 Assembled First Run`) are **supportive only**. They do not prove a real CLI, authentication, or VS Code Extension Development Host path. Native scenario outcomes are recorded as PASS, FAIL, or **ENVIRONMENT BLOCKED** in [docs/uat/m019-s05/native-first-run-evidence.md](uat/m019-s05/native-first-run-evidence.md). Local aggregate gate:
+
+```bash
+npm run test:m019-s05
+```
+
+---
+
+## 17. References
 
 - [VS Code Webview API](https://code.visualstudio.com/api/extension-guides/webview)
 - [VS Code Elements docs](https://vscode-elements.github.io)

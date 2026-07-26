@@ -10,6 +10,6 @@ export default defineConfig({
     // afterSanitizeAttributes hook (a `javascript:` href survives), so it can't
     // genuinely exercise the sanitizer.
     environment: 'node',
-    include: ['src/**/*.test.ts', 'webview/src/**/*.test.ts'],
+    include: ['src/**/*.test.ts', 'webview/src/**/*.test.ts', 'scripts/**/*.test.ts'],
   },
 });

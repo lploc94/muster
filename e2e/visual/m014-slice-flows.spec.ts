@@ -266,7 +266,9 @@ test.describe('M014 S02 representative visual matrix flow', () => {
     // --- V03: autocomplete light ---
     await page.setViewportSize(COMPACT_WEBVIEW_VIEWPORT);
     await installVisualEnvironment(page, { theme: 'light' });
-    await openMusterWebview(page);
+    // M019: draft composer is fail-closed on readiness, so seed a settled
+    // snapshot before driving the autocomplete flow.
+    await openMusterWebview(page, { backendReadiness: 'all-installed-unverified' });
     await ensureVisualEnvironmentApplied(page);
     await openComposerAutocomplete(page);
     await waitForVisualReady(page, {

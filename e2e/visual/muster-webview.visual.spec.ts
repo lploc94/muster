@@ -8,6 +8,7 @@ import {
 import {
   COMPACT_WEBVIEW_VIEWPORT,
   createStaticFileMentionSuggestions,
+  createStaticFirstRunBackendsReadinessSnapshot,
   createStaticPendingAsk,
   createStaticPermissionPendingMessage,
   createStaticPermissionSettingsSnapshot,
@@ -21,6 +22,7 @@ import {
   waitForVisualReady,
   type VisualThemeKind,
 } from '../fixtures/visual-environment';
+import { M019_S05_FIRST_RUN_BACKENDS_VISUAL_ID } from './visual-cases';
 
 /** Stable pilot case ID for the main webview entrypoint (S01/S02). */
 export const WEBVIEW_VISUAL_PILOT_ID = 'V01-webview-compact-dark';
@@ -34,12 +36,16 @@ export const WEBVIEW_VISUAL_SETTINGS_PROMPT_ID = 'V04-webview-settings-prompt-hc
 /** Accessible Ask validation errors (dark theme). */
 export const WEBVIEW_VISUAL_VALIDATION_ID = 'V05-webview-validation-errors-dark';
 
-/** All main-webview matrix case IDs owned by this spec (S02 T01). */
+/** M019/S05 first-run Agents → Backends readiness surface at 320×600 dark. */
+export const WEBVIEW_VISUAL_FIRST_RUN_BACKENDS_ID = M019_S05_FIRST_RUN_BACKENDS_VISUAL_ID;
+
+/** All main-webview matrix case IDs owned by this spec (S02 T01 + M019/S05). */
 export const WEBVIEW_VISUAL_CASE_IDS = [
   WEBVIEW_VISUAL_PILOT_ID,
   WEBVIEW_VISUAL_AUTOCOMPLETE_ID,
   WEBVIEW_VISUAL_SETTINGS_PROMPT_ID,
   WEBVIEW_VISUAL_VALIDATION_ID,
+  WEBVIEW_VISUAL_FIRST_RUN_BACKENDS_ID,
 ] as const;
 
 const PROTOCOL_VERSION = 5;
@@ -181,7 +187,9 @@ test.describe('visual matrix · main webview', () => {
     await page.setViewportSize(COMPACT_WEBVIEW_VIEWPORT);
     // Install theme + open shell without a focused-task snapshot; draft flow owns state.
     await installVisualEnvironment(page, { theme: 'light' });
-    await openMusterWebview(page);
+    // M019: draft composer is fail-closed on readiness, so seed a settled
+    // snapshot before driving the autocomplete flow.
+    await openMusterWebview(page, { backendReadiness: 'all-installed-unverified' });
     await ensureVisualEnvironmentApplied(page);
     await openComposerAutocomplete(page);
 
@@ -238,6 +246,85 @@ test.describe('visual matrix · main webview', () => {
     await expect(page).toHaveScreenshot(`${WEBVIEW_VISUAL_VALIDATION_ID}.png`, SCREENSHOT);
 
     // Negative surface: posted messages must not contain secrets/paths.
+    const posted = await readPostedMessages(page);
+    const blob = JSON.stringify(posted);
+    expect(blob).not.toMatch(/sk-[A-Za-z0-9]{16,}/);
+    expect(blob).not.toMatch(/[A-Za-z]:\\/);
+    expect(blob).not.toMatch(/\/(?:Users|home)\/[^/\s]+/);
+  });
+
+  test(`${WEBVIEW_VISUAL_FIRST_RUN_BACKENDS_ID} · first-run Agents Backends readiness recovery at 320px`, async ({
+    page,
+  }) => {
+    // Supportive visual proof for M019/S05 compact readiness/recovery surface.
+    // Not a native Extension Host claim — browser fixtures only.
+    // Current webview protocol is 10; legacy pilot fixtures still stamp 5.
+    const CURRENT_PROTOCOL_VERSION = 10;
+    await page.setViewportSize(COMPACT_WEBVIEW_VIEWPORT);
+    await installVisualEnvironment(page, { theme: 'dark' });
+    await openMusterWebview(page, { backendReadiness: 'none' });
+    await ensureVisualEnvironmentApplied(page);
+
+    // Clean no-task workspace so first-run chrome remains the context.
+    // Snapshot must carry the current protocol version so the panel accepts
+    // subsequent readiness messages without the mismatch banner.
+    await page.evaluate((message) => {
+      window.postMessage(message, '*');
+    }, {
+      type: 'snapshot',
+      protocolVersion: CURRENT_PROTOCOL_VERSION,
+      rootTasks: [],
+      storeRevision: 1,
+    });
+
+    await openSettingsWithSnapshots(page);
+
+    // backendReadinessSnapshot / revealBackendDiagnostics reject extra keys
+    // (including protocolVersion) in isExtMessage — type + payload only.
+    const readiness = createStaticFirstRunBackendsReadinessSnapshot();
+    await postHostMessage(page, {
+      type: 'backendReadinessSnapshot',
+      snapshot: readiness,
+    });
+    await postHostMessage(page, {
+      type: 'revealBackendDiagnostics',
+    });
+
+    const backends = page.getByTestId('settings-backends');
+    await expect(backends).toBeVisible();
+    await expect(page.getByTestId('backends-list')).toBeVisible();
+    await expect(page.getByTestId('backend-row-claude')).toHaveAttribute(
+      'data-backend-state',
+      'ready',
+    );
+    await expect(page.getByTestId('backend-row-diagnostic-claude')).toContainText(
+      /Claude is ready/i,
+    );
+    await expect(page.getByTestId('backend-row-grok')).toHaveAttribute(
+      'data-backend-state',
+      'missing',
+    );
+
+    // No version-mismatch banner on this assembled first-run surface.
+    await expect(
+      page.getByText(/UI\/host version mismatch/i),
+    ).toHaveCount(0);
+
+    const backendsBox = await backends.boundingBox();
+    expect(backendsBox).toBeTruthy();
+    expect(backendsBox!.width).toBeLessThanOrEqual(320);
+
+    await waitForVisualReady(page, {
+      selector: '[data-testid="settings-backends"], body',
+    });
+    await normalizeVisualChrome(page);
+
+    await expect(page).toHaveScreenshot(
+      `${WEBVIEW_VISUAL_FIRST_RUN_BACKENDS_ID}.png`,
+      SCREENSHOT,
+    );
+
+    // Negative surface: host traffic stays free of secrets/paths.
     const posted = await readPostedMessages(page);
     const blob = JSON.stringify(posted);
     expect(blob).not.toMatch(/sk-[A-Za-z0-9]{16,}/);

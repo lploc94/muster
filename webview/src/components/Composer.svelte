@@ -6,6 +6,15 @@
     type WebviewBackendId,
   } from '../lib/tasks.svelte';
   import { parseBackendId, parseModelFromSelectValue } from '../lib/backend-resolve';
+  import {
+    pickerOptionLabelForRecord,
+    resolveDraftComposerEligibility,
+  } from '../lib/backend-eligibility';
+  import {
+    OPEN_BACKEND_SETUP_EVENT,
+    OPEN_BACKEND_SETUP_LABEL,
+    resolveComposerBackendSetupSurface,
+  } from '../lib/composer-backend-setup';
   import { post, postDebug } from '../lib/protocol';
   import { ADD_CONTEXT_ACTIONS, getAddContextActionHostMessage } from '../lib/context-actions';
   import {
@@ -455,9 +464,41 @@
       : taskStatus === 'waiting_user',
   );
   const blocked = $derived(mode === 'task' && (!!pendingAsk || readOnly || statusBlocksSend));
+  /**
+   * M019 draft eligibility: loading / settled-empty / ready.
+   * Never fall open to all BACKENDS. Task mode keeps existing binding behavior.
+   */
+  const draftEligibility = $derived(
+    resolveDraftComposerEligibility({
+      snapshot: tasks.backendReadinessSnapshot,
+      preferredBackend: tasks.preferredBackend,
+      preferredModel: tasks.preferredModel,
+      availableBackends: tasks.availableBackends,
+    }),
+  );
+
+  const draftBlockedByReadiness = $derived(
+    mode === 'draft' && !draftEligibility.canComposeNewTask,
+  );
+
+  /**
+   * M019/S03 T04: Test Connection relocated to Agents → Backends.
+   * Draft Composer keeps readiness guidance + Open backend setup deep link.
+   */
+  const draftSetupSurface = $derived(
+    resolveComposerBackendSetupSurface({
+      mode,
+      eligibility: draftEligibility,
+    }),
+  );
+
+  function onOpenBackendSetup(): void {
+    window.dispatchEvent(new CustomEvent(OPEN_BACKEND_SETUP_EVENT));
+  }
+
   // Draft still waits for the first turn to settle. Task mode stays open while
   // a live/queued turn is active so Enter queues and Ctrl+Enter can inject.
-  const canSend = $derived(mode === 'draft' ? !thread.running : !blocked);
+  const canSend = $derived(mode === 'draft' ? !thread.running && !draftBlockedByReadiness : !blocked);
 
   // Queue panel Edit / sendRejected restore → load text into the message box.
   // Never overwrite a newer non-empty draft the user already typed.
@@ -1201,27 +1242,49 @@
     return '';
   });
 
-  // Only offer backends whose CLI the host reports as installed. Until that is
-  // known (null) — or if nothing was detected — fail open and show all.
+
+  /**
+   * M019 draft eligibility drives picker options (snapshot already resolved above).
+   * Never fall open to all BACKENDS. Task mode keeps existing binding behavior.
+   */
+  // Only offer passively selectable backends for draft; task mode uses binding.
   const pickerBackends = $derived.by(() => {
-    const avail = tasks.availableBackends;
-    if (!avail || avail.length === 0) return BACKENDS;
-    const filtered = BACKENDS.filter((b) => avail.includes(b.id));
-    return filtered.length > 0 ? filtered : BACKENDS;
+    if (mode === 'task') {
+      // Existing-task handoff picker: keep passively selectable list when known,
+      // otherwise allow the bound backend to remain visible via pickerOptions.
+      const ids = draftEligibility.pickerBackendIds;
+      if (ids.length === 0) {
+        const bound = tasks.focusedTask?.backend;
+        return bound ? BACKENDS.filter((b) => b.id === bound) : BACKENDS;
+      }
+      return BACKENDS.filter((b) => ids.includes(b.id as (typeof ids)[number]));
+    }
+    if (draftEligibility.kind !== 'ready') return [];
+    return BACKENDS.filter((b) => draftEligibility.pickerBackendIds.includes(b.id as (typeof draftEligibility.pickerBackendIds)[number]));
   });
 
   // Grouped model picker: one `[Backend] Model` option per enumerated model.
   // Until the host reports models, fall back to plain per-backend options.
   const modelsLoaded = $derived(!!tasks.modelsByBackend && Object.keys(tasks.modelsByBackend).length > 0);
-  const modelsLoading = $derived(mode === 'draft' && !modelsLoaded);
+  // S01 is passive: do not imply model enumeration is in flight just because
+  // modelsByBackend is empty. Only show loading when host has sent a models map
+  // object that is still empty for the draft picker backends.
+  const modelsLoading = $derived(
+    mode === 'draft' &&
+      draftEligibility.kind === 'ready' &&
+      tasks.modelsByBackend != null &&
+      !modelsLoaded,
+  );
 
-  /** Prefer the user's restored choice over the availability display fallback. */
+  /** Draft display target from eligibility (never stale preference when unavailable). */
   const draftBackend = $derived(
-    mode === 'draft' ? tasks.preferredBackend : currentBackend,
+    mode === 'draft'
+      ? (draftEligibility.displayBackend ?? tasks.selectedBackend)
+      : currentBackend,
   );
   const draftModel = $derived(
     mode === 'draft'
-      ? (tasks.preferredModel ?? tasks.selectedModel)
+      ? draftEligibility.displayModel
       : (tasks.focusedTask?.model ?? tasks.selectedModel),
   );
 
@@ -1281,9 +1344,17 @@
             label: `[${backendShortLabel(be.id)}] ${draftModel}`,
           });
         } else {
+          const record = draftEligibility.records.find((r) => r.backendId === be.id);
+          const baseLabel =
+            mode === 'draft' && record
+              ? pickerOptionLabelForRecord(record)
+              : be.label;
           opts.push({
             value: be.id,
-            label: modelsLoading ? `${be.label} (loading models…)` : be.label,
+            label:
+              modelsLoading && !record
+                ? `${be.label} (loading models…)`
+                : baseLabel,
           });
         }
       }
@@ -1418,7 +1489,11 @@
 
   const placeholder = $derived(
     mode === 'draft'
-      ? `Start a new coordinator task with ${draftBackend}…`
+      ? draftBlockedByReadiness
+        ? draftEligibility.kind === 'loading'
+          ? 'Checking installed agent CLIs…'
+          : 'Install a supported agent CLI to start a task…'
+        : `Start a new coordinator task with ${draftBackend}…`
       : isTerminalReopenable
         ? 'Send a message to reopen this task…'
         : blockReason
@@ -1751,6 +1826,47 @@
     {/if}
   </div>
 
+  {#if mode === 'draft' && draftSetupSurface.visible}
+    <div
+      class="composer-guidance composer-readiness"
+      role="status"
+      data-composer-guidance={draftBlockedByReadiness ? 'blocked' : 'info'}
+      data-testid="backend-readiness-guidance"
+      data-needs-setup={draftSetupSurface.needsSetup ? 'true' : 'false'}
+    >
+      <span class="composer-readiness__text">
+        {draftSetupSurface.setupGuidance || draftEligibility.setupGuidance}
+      </span>
+      <div class="composer-readiness__actions">
+        <button
+          type="button"
+          class="composer-readiness__refresh"
+          data-testid="refresh-backends"
+          aria-label="Refresh backends"
+          onclick={() =>
+            post({
+              type: 'refreshBackendReadiness',
+              requestId: `refresh-${Date.now()}`,
+            })
+          }
+        >
+          Refresh backends
+        </button>
+        {#if draftSetupSurface.showOpenSetup}
+          <button
+            type="button"
+            class="composer-readiness__open-setup"
+            data-testid="open-backend-setup"
+            aria-label={OPEN_BACKEND_SETUP_LABEL}
+            onclick={onOpenBackendSetup}
+          >
+            {OPEN_BACKEND_SETUP_LABEL}
+          </button>
+        {/if}
+      </div>
+    </div>
+  {/if}
+
   {#if skillColdHint}
     <div class="composer-guidance" role="note" data-composer-guidance="info" data-testid="skill-cold-hint">
       {skillColdHint}
@@ -1773,7 +1889,7 @@
                   ? 'Switch backend + model for this task'
                   : 'Loading models from installed CLIs…'
             }
-            disabled={mode === 'draft' ? thread.running : false}
+            disabled={mode === 'draft' ? thread.running || draftBlockedByReadiness : false}
             position="above"
             onchange={onBackendChange}
             style={pickerWidthStyle}

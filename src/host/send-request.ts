@@ -1,4 +1,9 @@
 import {
+  isPassivelySelectable,
+  isTrustworthyFirstRunEligible,
+  type BackendReadinessSnapshot,
+} from '../shared/backend-readiness';
+import {
   SEND_OUTBOX_MENTION_BINDINGS_MAX,
   SEND_OUTBOX_PATH_MAX,
   SEND_OUTBOX_SKILLS_MAX,
@@ -145,4 +150,77 @@ export function parseHostSendRequest(value: unknown): HostSendRequestParseResult
       ...(mentionBindings ? { mentionBindings } : {}),
     },
   };
+}
+
+/** Fixed validation reason for pre-outbox new-task backend eligibility rejects. */
+export const NEW_TASK_BACKEND_ELIGIBILITY_REJECT_REASON =
+  'selected backend is not passively available';
+
+/**
+ * Fixed validation reason when a clean workspace first task is rejected because
+ * the chosen backend is not probe-proven ready (D058 / D060).
+ */
+export const NEW_TASK_BACKEND_FIRST_RUN_REJECT_REASON =
+  'selected backend is not ready for first run';
+
+export type NewTaskBackendEligibilityResult =
+  | { ok: true; backend: string }
+  | { ok: false; reason: string; code: 'validation' };
+
+/**
+ * Optional gate options. `isCleanWorkspace` is true when the workspace has zero
+ * root tasks (D060) — including when the cleanliness read fails closed.
+ * Omit / false keeps the S01 isPassivelySelectable rule for existing users.
+ */
+export interface NewTaskBackendEligibilityOptions {
+  isCleanWorkspace?: boolean;
+}
+
+/**
+ * Pure host-side new-task backend guard (M019 S01/S03 / D058 / D060).
+ *
+ * Call before any durable outbox / task / turn / message mutation.
+ * Existing-task follow-ups are not gated here (caller must skip when taskId is set).
+ *
+ * Default / non-clean workspaces: isPassivelySelectable (installed_unverified+).
+ * Clean workspaces (zero root tasks, or failed cleanliness read): require
+ * isTrustworthyFirstRunEligible (state ready, not known-incompatible).
+ */
+export function evaluateNewTaskBackendEligibility(
+  snapshot: BackendReadinessSnapshot | null | undefined,
+  backend: string | undefined,
+  options?: NewTaskBackendEligibilityOptions,
+): NewTaskBackendEligibilityResult {
+  if (!snapshot || snapshot.phase !== 'settled') {
+    return {
+      ok: false,
+      reason: NEW_TASK_BACKEND_ELIGIBILITY_REJECT_REASON,
+      code: 'validation',
+    };
+  }
+  if (typeof backend !== 'string' || backend.length === 0 || !BACKENDS.has(backend)) {
+    return {
+      ok: false,
+      reason: NEW_TASK_BACKEND_ELIGIBILITY_REJECT_REASON,
+      code: 'validation',
+    };
+  }
+  const record = snapshot.backends.find((b) => b.backendId === backend);
+  if (!record || !isPassivelySelectable(record)) {
+    return {
+      ok: false,
+      reason: NEW_TASK_BACKEND_ELIGIBILITY_REJECT_REASON,
+      code: 'validation',
+    };
+  }
+  if (options?.isCleanWorkspace) {
+    if (!isTrustworthyFirstRunEligible(record)) {
+      return {
+        ok: false,
+        reason: NEW_TASK_BACKEND_FIRST_RUN_REJECT_REASON,
+        code: 'validation',
+      };
+    }
+  }
+  return { ok: true, backend };
 }

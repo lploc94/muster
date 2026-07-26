@@ -1831,3 +1831,154 @@ describe('protocol v9 workspacePatchBatch', () => {
     ).toBe(false);
   });
 });
+
+describe('M019 backend readiness protocol', () => {
+  const checkedAt = '2026-07-25T00:00:00.000Z';
+  const baseRecord = (backendId: string) => ({
+    backendId,
+    state: 'missing' as const,
+    code: 'executable_missing' as const,
+    recoveryAction: 'install' as const,
+    compatibility: 'unknown' as const,
+    versionEvidence: null,
+    checkedAt,
+  });
+  const validSnapshot = () => ({
+    schemaVersion: 1 as const,
+    correlationId: 'req-1',
+    phase: 'settled' as const,
+    checkedAt,
+    backends: [
+      baseRecord('claude'),
+      baseRecord('grok'),
+      baseRecord('kiro'),
+      baseRecord('codex'),
+      baseRecord('opencode'),
+    ],
+  });
+
+  it('accepts a well-formed backendReadinessSnapshot', () => {
+    expect(
+      isExtMessage({ type: 'backendReadinessSnapshot', snapshot: validSnapshot() }),
+    ).toBe(true);
+  });
+
+  it('rejects backendReadinessSnapshot with extra keys', () => {
+    expect(
+      isExtMessage({
+        type: 'backendReadinessSnapshot',
+        snapshot: validSnapshot(),
+        extra: true,
+      }),
+    ).toBe(false);
+  });
+
+  it('rejects backendReadinessSnapshot with malformed snapshot (duplicate/unknown id)', () => {
+    const snap = validSnapshot();
+    snap.backends[0] = { ...snap.backends[0], backendId: 'not-a-backend' as 'claude' };
+    expect(isExtMessage({ type: 'backendReadinessSnapshot', snapshot: snap })).toBe(false);
+
+    const dup = validSnapshot();
+    dup.backends[1] = { ...dup.backends[0] };
+    expect(isExtMessage({ type: 'backendReadinessSnapshot', snapshot: dup })).toBe(false);
+  });
+
+  it('rejects backendReadinessSnapshot with missing backends array', () => {
+    const { backends: _b, ...rest } = validSnapshot();
+    expect(
+      isExtMessage({ type: 'backendReadinessSnapshot', snapshot: rest }),
+    ).toBe(false);
+  });
+
+  it('rejects overlong correlationId and non-ISO timestamps', () => {
+    const longCorr = validSnapshot();
+    longCorr.correlationId = 'x'.repeat(129);
+    expect(isExtMessage({ type: 'backendReadinessSnapshot', snapshot: longCorr })).toBe(false);
+
+    const badTs = validSnapshot();
+    badTs.checkedAt = 'yesterday';
+    expect(isExtMessage({ type: 'backendReadinessSnapshot', snapshot: badTs })).toBe(false);
+  });
+
+  it('accepts installed_unverified records in a well-formed snapshot', () => {
+    const snap = {
+      ...validSnapshot(),
+      backends: [
+        {
+          backendId: 'claude',
+          state: 'installed_unverified' as const,
+          code: 'version_unknown' as const,
+          recoveryAction: 'retry' as const,
+          compatibility: 'unknown' as const,
+          versionEvidence: '1.2.3',
+          checkedAt: '2026-07-21T00:00:00.000Z',
+        },
+        ...validSnapshot().backends.slice(1),
+      ],
+    };
+    expect(isExtMessage({ type: 'backendReadinessSnapshot', snapshot: snap })).toBe(true);
+  });
+});
+
+describe('isExtMessage backendProbeProgress (M019/S02)', () => {
+  const validProgress = () => ({
+    schemaVersion: 1 as const,
+    probeId: 'probe-1',
+    backendId: 'claude' as const,
+    stage: 'initialize' as const,
+    startedAt: '2026-07-25T00:00:00.000Z',
+  });
+
+  it('accepts a well-formed backendProbeProgress', () => {
+    expect(
+      isExtMessage({ type: 'backendProbeProgress', progress: validProgress() }),
+    ).toBe(true);
+  });
+
+  it('rejects backendProbeProgress with extra keys or malformed progress', () => {
+    expect(
+      isExtMessage({
+        type: 'backendProbeProgress',
+        progress: validProgress(),
+        extra: true,
+      }),
+    ).toBe(false);
+
+    expect(
+      isExtMessage({
+        type: 'backendProbeProgress',
+        progress: { ...validProgress(), stage: 'not-a-stage' },
+      }),
+    ).toBe(false);
+
+    expect(
+      isExtMessage({
+        type: 'backendProbeProgress',
+        progress: { ...validProgress(), probeId: '' },
+      }),
+    ).toBe(false);
+  });
+});
+
+describe('isExtMessage revealBackendDiagnostics (M019/S03)', () => {
+  it('accepts the empty additive revealBackendDiagnostics message', () => {
+    expect(isExtMessage({ type: 'revealBackendDiagnostics' })).toBe(true);
+  });
+
+  it('rejects revealBackendDiagnostics with extra keys or wrong type', () => {
+    expect(
+      isExtMessage({
+        type: 'revealBackendDiagnostics',
+        focus: 'settings-backends',
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'revealBackendDiagnostics',
+        backendId: 'claude',
+      }),
+    ).toBe(false);
+    expect(isExtMessage({ type: 'revealBackendDiagnostic' })).toBe(false);
+  });
+});
+

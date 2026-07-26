@@ -1,22 +1,21 @@
-/** Backends selectable from the webview toolbar. */
-export type WebviewBackendId = 'claude' | 'grok' | 'kiro' | 'codex' | 'opencode';
+import {
+  BACKEND_READINESS_IDS,
+  isBackendReadinessId,
+  type BackendReadinessId,
+} from '../../../src/shared/backend-readiness';
 
-const BACKEND_IDS: readonly WebviewBackendId[] = [
-  'claude',
-  'grok',
-  'kiro',
-  'codex',
-  'opencode',
-];
+/** Backends selectable from the webview toolbar (shared allowlist). */
+export type WebviewBackendId = BackendReadinessId;
+
+/** Re-export ordered allowlist so webview consumers do not fork IDs. */
+export const WEBVIEW_BACKEND_IDS = BACKEND_READINESS_IDS;
 
 /** Parse a bare backend id or a model-picker value `backend::model`. */
 export function parseBackendId(raw: string | undefined | null): WebviewBackendId | null {
   if (!raw) return null;
   const sep = raw.indexOf('::');
   const backend = sep >= 0 ? raw.slice(0, sep) : raw;
-  return (BACKEND_IDS as readonly string[]).includes(backend)
-    ? (backend as WebviewBackendId)
-    : null;
+  return isBackendReadinessId(backend) ? backend : null;
 }
 
 /** Model segment from `backend::model`, or null for bare backend / empty. */

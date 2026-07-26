@@ -1,7 +1,13 @@
-/** Backends the webview composer may persist as the default for new tasks. */
-export const COMPOSER_BACKEND_IDS = ['claude', 'grok', 'kiro', 'codex', 'opencode'] as const;
+import {
+  BACKEND_READINESS_IDS,
+  isBackendReadinessId,
+  type BackendReadinessId,
+} from '../shared/backend-readiness';
 
-export type ComposerBackendId = (typeof COMPOSER_BACKEND_IDS)[number];
+/** Backends the webview composer may persist as the default for new tasks. */
+export const COMPOSER_BACKEND_IDS = BACKEND_READINESS_IDS;
+
+export type ComposerBackendId = BackendReadinessId;
 
 export interface ComposerSelection {
   backend: ComposerBackendId;
@@ -16,13 +22,7 @@ export interface ComposerSelection {
 export const COMPOSER_SELECTION_CONFIG_KEY = 'muster.composerSelection';
 
 export function isComposerBackendId(value: unknown): value is ComposerBackendId {
-  return (
-    value === 'claude' ||
-    value === 'grok' ||
-    value === 'kiro' ||
-    value === 'codex' ||
-    value === 'opencode'
-  );
+  return isBackendReadinessId(value);
 }
 
 /**

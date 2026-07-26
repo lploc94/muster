@@ -1577,6 +1577,275 @@ body {
   outline-offset: 1px;
 }
 
+/* ===== Agents → Backends (M019/S03) ===== */
+.backends-settings:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder, #3794ff);
+  outline-offset: 2px;
+}
+
+.backends-settings__summary {
+  margin-top: 10px;
+}
+
+.backends-settings__list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+  min-width: 0;
+}
+
+.backend-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px 12px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--vscode-editor-background, transparent) 70%, transparent);
+}
+
+.backend-row__main {
+  flex: 1 1 160px;
+  min-width: 0;
+}
+
+.backend-row__identity {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 8px;
+  min-width: 0;
+}
+
+.backend-row__label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--vscode-foreground);
+}
+
+.backend-row__status {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 7px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--vscode-descriptionForeground) 30%, transparent);
+  background: color-mix(in srgb, var(--vscode-descriptionForeground) 10%, transparent);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--vscode-descriptionForeground);
+  white-space: nowrap;
+}
+
+.backend-row--ready .backend-row__status {
+  color: var(--vscode-testing-iconPassed, #73c991);
+  border-color: color-mix(in srgb, var(--vscode-testing-iconPassed, #73c991) 34%, transparent);
+  background: color-mix(in srgb, var(--vscode-testing-iconPassed, #73c991) 14%, transparent);
+}
+
+.backend-row--testing .backend-row__status {
+  color: var(--vscode-charts-blue, #3794ff);
+  border-color: color-mix(in srgb, var(--vscode-charts-blue, #3794ff) 34%, transparent);
+  background: color-mix(in srgb, var(--vscode-charts-blue, #3794ff) 14%, transparent);
+}
+
+.backend-row--diagnostic .backend-row__status {
+  color: var(--vscode-editorWarning-foreground, #cca700);
+  border-color: color-mix(in srgb, var(--vscode-editorWarning-foreground, #cca700) 34%, transparent);
+  background: color-mix(in srgb, var(--vscode-editorWarning-foreground, #cca700) 12%, transparent);
+}
+
+.backend-row__version {
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  font-variant-numeric: tabular-nums;
+}
+
+.backend-row__progress,
+.backend-row__diagnostic,
+.backend-row__checked {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--vscode-descriptionForeground);
+  overflow-wrap: anywhere;
+}
+
+.backend-row__progress {
+  color: var(--vscode-charts-blue, #3794ff);
+}
+
+.backend-row__recovery {
+  color: var(--vscode-foreground);
+  font-weight: 500;
+}
+
+.backend-row__actions {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+@media (max-width: 360px) {
+  .backend-row {
+    padding: 8px 10px;
+  }
+
+  .backend-row__actions {
+    width: 100%;
+  }
+
+  .backend-row__actions .settings-panel__btn {
+    flex: 1 1 auto;
+  }
+}
+
+
+
+/* ===== First-run journey empty state (M019/S03 T04) ===== */
+.first-run-journey {
+  margin: 10px 12px 0;
+  padding: 12px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--vscode-editor-background, transparent) 72%, transparent);
+  min-width: 0;
+}
+
+.first-run-journey__head {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.first-run-journey__title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--vscode-foreground);
+}
+
+.first-run-journey__detail {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--vscode-descriptionForeground);
+  overflow-wrap: anywhere;
+}
+
+.first-run-journey__steps {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.first-run-journey__step {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--vscode-descriptionForeground);
+}
+
+.first-run-journey__step--active {
+  color: var(--vscode-foreground);
+  font-weight: 600;
+}
+
+.first-run-journey__step--done {
+  color: var(--vscode-testing-iconPassed, #73c991);
+}
+
+.first-run-journey__step-marker {
+  flex: 0 0 auto;
+  width: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 1px;
+}
+
+.first-run-journey__step-body {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  min-width: 0;
+}
+
+.first-run-journey__step-state {
+  font-size: 11px;
+  opacity: 0.8;
+  font-weight: 500;
+}
+
+.first-run-journey__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.first-run-journey__primary,
+.first-run-journey__secondary {
+  flex: 0 0 auto;
+  border-radius: 2px;
+  padding: 0.25rem 0.6rem;
+  font: inherit;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+
+.first-run-journey__primary {
+  background: var(--vscode-button-background, #0e639c);
+  color: var(--vscode-button-foreground, #fff);
+  border: 1px solid transparent;
+}
+
+.first-run-journey__primary:hover {
+  background: var(--vscode-button-hoverBackground, #1177bb);
+}
+
+.first-run-journey__secondary {
+  background: transparent;
+  color: var(--vscode-textLink-foreground, var(--vscode-foreground));
+  border: 1px solid var(--vscode-button-border, var(--vscode-panel-border));
+}
+
+.first-run-journey__secondary:hover {
+  background: var(--vscode-toolbar-hoverBackground, transparent);
+}
+
+.first-run-journey__primary:focus-visible,
+.first-run-journey__secondary:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+
+@media (max-width: 360px) {
+  .first-run-journey {
+    margin: 8px;
+    padding: 10px;
+  }
+
+  .first-run-journey__primary,
+  .first-run-journey__secondary {
+    flex: 1 1 auto;
+  }
+}
+
 /* ===== Task-type cards ===== */
 .settings-types {
   display: flex;
@@ -2678,3 +2947,97 @@ body {
   - Math: Cũng phải tự xử lý.
   - Ưu điểm: Nhìn "chuẩn GitHub" nhất.
 */
+
+
+/* M019 S01 — bounded backend readiness guidance in draft Composer */
+.composer-readiness {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.composer-readiness__text {
+  flex: 1 1 12rem;
+  min-width: 0;
+}
+.composer-readiness__actions {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  align-items: center;
+}
+.composer-readiness__refresh,
+.composer-readiness__open-setup {
+  flex: 0 0 auto;
+  background: transparent;
+  border: 1px solid var(--vscode-button-border, var(--vscode-panel-border));
+  color: var(--vscode-textLink-foreground, var(--vscode-foreground));
+  border-radius: 2px;
+  padding: 0.15rem 0.45rem;
+  font: inherit;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+.composer-readiness__refresh:hover,
+.composer-readiness__open-setup:hover {
+  background: var(--vscode-toolbar-hoverBackground, transparent);
+}
+.composer-readiness__refresh:focus-visible,
+.composer-readiness__open-setup:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+
+/* M019 S02 — Test Connection probe surface in draft Composer */
+.composer-probe {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+.composer-probe__text {
+  flex: 1 1 12rem;
+  min-width: 0;
+}
+.composer-probe__recovery {
+  opacity: 0.9;
+}
+.composer-probe__actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 0.35rem;
+  align-items: center;
+}
+.composer-probe__start,
+.composer-probe__cancel {
+  flex: 0 0 auto;
+  background: transparent;
+  border: 1px solid var(--vscode-button-border, var(--vscode-panel-border));
+  color: var(--vscode-textLink-foreground, var(--vscode-foreground));
+  border-radius: 2px;
+  padding: 0.15rem 0.45rem;
+  font: inherit;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+.composer-probe__start:hover,
+.composer-probe__cancel:hover {
+  background: var(--vscode-toolbar-hoverBackground, transparent);
+}
+.composer-probe__start:focus-visible,
+.composer-probe__cancel:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 1px;
+}
+.composer-probe--testing .composer-probe__text {
+  color: var(--vscode-descriptionForeground, var(--vscode-foreground));
+}
+.composer-probe--ready .composer-probe__text {
+  color: var(--vscode-testing-iconPassed, var(--vscode-charts-green, var(--vscode-foreground)));
+}
+.composer-probe--diagnostic .composer-probe__text {
+  color: var(--vscode-inputValidation-warningForeground, var(--vscode-editorWarning-foreground, var(--vscode-foreground)));
+}

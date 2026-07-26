@@ -8,6 +8,7 @@ import { McpReadinessSupervisor } from './bridge/mcp-readiness';
 import { MusterBridgeServer } from './bridge/server';
 import { makeBackend } from './backends/index';
 import {
+  AcpClient,
   disposeSharedAcpClient,
   isAskLikeForm,
   peekSharedAcpClient,
@@ -16,6 +17,11 @@ import {
   setPermissionController,
   setQuestionController,
 } from './backends/acp-client';
+import { claudeAgentConfig } from './backends/claude';
+import { codexAgentConfig } from './backends/codex';
+import { GROK_AGENT_CONFIG } from './backends/grok';
+import { KIRO_AGENT_CONFIG } from './backends/kiro';
+import { OPENCODE_AGENT_CONFIG } from './backends/opencode';
 import type {
   ElicitationController,
   PermissionController,
@@ -56,6 +62,16 @@ import {
   readRedactedDbIdentity,
   type UatHostState,
 } from './host/uat-commands';
+import {
+  NATIVE_FIRST_RUN_UAT_PROMPT,
+  isNativeFirstRunProviderId,
+  observeNativeCleanup,
+  observeNativeDoctor,
+  observeNativeFirstTaskAcceptance,
+  observeNativeIsolatedProbe,
+  observeNativeReadinessRefresh,
+  type NativeFirstTaskAcceptResult,
+} from './host/m019-s05-native-first-run';
 import type { RepositoryCommitContext } from './task/repository-projection';
 import {
   buildRetentionSettingsSnapshot,
@@ -75,7 +91,32 @@ import {
   buildPermissionSettingsSnapshot,
   handlePermissionSettingsUpdateAction,
 } from './host/permission-settings';
-import { detectAvailableBackends, installAugmentedPath } from './host/backend-availability';
+import { randomUUID } from 'node:crypto';
+import { installAugmentedPath } from './host/backend-availability';
+import {
+  BackendReadinessService,
+  createDefaultBackendReadinessDeps,
+} from './host/backend-readiness';
+import {
+  BackendProbeService,
+  createDefaultBackendProbeDeps,
+} from './host/backend-probe';
+import {
+  routeCancelBackendProbe,
+  routeStartBackendProbe,
+  type BackendProbeHostMessage,
+} from './host/backend-probe-route';
+import {
+  scheduleRuntimeReadinessInvalidation,
+  type RuntimeInvalidationDeps,
+} from './host/backend-runtime-invalidation';
+import {
+  BACKEND_READINESS_IDS,
+  BACKEND_READINESS_SCHEMA_VERSION,
+  derivePassivelySelectableBackendIds,
+  type BackendReadinessId,
+  type BackendReadinessSnapshot,
+} from './shared/backend-readiness';
 import {
   parseComposerSelection,
   readComposerSelection,
@@ -83,7 +124,11 @@ import {
 } from './host/composer-selection';
 import { pickWorkspaceFileMentionPath } from './host/workspace-files';
 import { resolveDroppedFileMention } from './host/file-mentions';
-import { parseHostSendRequest, type HostSendRequest } from './host/send-request';
+import {
+  evaluateNewTaskBackendEligibility,
+  parseHostSendRequest,
+  type HostSendRequest,
+} from './host/send-request';
 import {
   isFileMentionDirectorySymlink,
   listFileMentionSuggestions,
@@ -138,6 +183,11 @@ import {
   MUSTER_BACKUP_DATABASE_COMMAND,
   MUSTER_DEVELOPER_RESET_COMMAND,
 } from './host/sqlite-maintenance-commands';
+import {
+  handleRunDiagnosticsCommand,
+  MUSTER_OPEN_CHAT_VIEW_COMMAND,
+  MUSTER_RUN_DIAGNOSTICS_COMMAND,
+} from './host/run-diagnostics-command';
 import { createTerminalStorageLifecycle } from './host/terminal-storage-lifecycle';
 import { runDurableHostSend } from './host/durable-send-coordinator';
 
@@ -194,6 +244,97 @@ let peerResetHandled = false;
 let hostEnvCache: HostEnvironmentSnapshot | undefined;
 let hostEnvPrepare: Promise<void> | undefined;
 
+/** Single-flight passive readiness inventory (M019 S01). */
+let backendReadinessService: BackendReadinessService | undefined;
+let backendReadinessPromise: Promise<BackendReadinessSnapshot> | undefined;
+
+/** Isolated active Test Connection probe service (M019 S02). */
+let backendProbeService: BackendProbeService | undefined;
+
+/** Owned AcpClient configs for probes — never getSharedAcpClient. */
+const PROBE_ACP_CONFIGS: Record<BackendReadinessId, () => import('./backends/acp-client').AcpAgentConfig> = {
+  claude: claudeAgentConfig,
+  codex: codexAgentConfig,
+  grok: () => GROK_AGENT_CONFIG,
+  kiro: () => KIRO_AGENT_CONFIG,
+  opencode: () => OPENCODE_AGENT_CONFIG,
+};
+
+function getBackendReadinessService(): BackendReadinessService {
+  if (!backendReadinessService) {
+    backendReadinessService = new BackendReadinessService(createDefaultBackendReadinessDeps());
+  }
+  return backendReadinessService;
+}
+
+function getBackendProbeService(): BackendProbeService {
+  if (!backendProbeService) {
+    backendProbeService = new BackendProbeService(
+      createDefaultBackendProbeDeps({
+        createClient: (backendId) => new AcpClient(PROBE_ACP_CONFIGS[backendId]()),
+        resolveCwd: () => resolveTaskCwd(),
+      }),
+    );
+  }
+  return backendProbeService;
+}
+
+/** Settled diagnostic snapshot when inventory throws (fail closed, never silent). */
+function settledInternalErrorSnapshot(correlationId?: string): BackendReadinessSnapshot {
+  const checkedAt = new Date().toISOString();
+  const corr =
+    typeof correlationId === 'string' && correlationId.length > 0 && correlationId.length <= 128
+      ? correlationId
+      : randomUUID();
+  return {
+    schemaVersion: BACKEND_READINESS_SCHEMA_VERSION,
+    correlationId: corr,
+    phase: 'settled',
+    checkedAt,
+    backends: BACKEND_READINESS_IDS.map((backendId) => ({
+      backendId,
+      state: 'failed' as const,
+      code: 'internal_error' as const,
+      recoveryAction: 'retry' as const,
+      compatibility: 'unknown' as const,
+      versionEvidence: null,
+      checkedAt,
+    })),
+  };
+}
+
+/**
+ * Passive inventory single-flight. refresh=true invalidates the in-flight promise
+ * so PATH/version changes are visible without reload. Always returns a settled
+ * snapshot (never throws to callers).
+ */
+async function ensureBackendReadiness(
+  refresh: boolean,
+  correlationId?: string,
+): Promise<BackendReadinessSnapshot> {
+  if (refresh) {
+    backendReadinessPromise = undefined;
+  }
+  if (!backendReadinessPromise) {
+    backendReadinessPromise = (async () => {
+      try {
+        return await getBackendReadinessService().refresh(correlationId);
+      } catch (err) {
+        console.warn(
+          'Muster: backend readiness inventory failed:',
+          err instanceof Error ? err.message : err,
+        );
+        // Drop single-flight so a later request retries.
+        backendReadinessPromise = undefined;
+        return settledInternalErrorSnapshot(correlationId);
+      }
+    })();
+  }
+  // When a correlated refresh is already in flight without this id, still await
+  // the single-flight result and rewrite correlation on delivery in postBackendReadiness.
+  return backendReadinessPromise;
+}
+
 function writeHostEnvCache(partial: {
   availableBackends?: string[];
   models?: Record<string, BackendModels>;
@@ -222,10 +363,11 @@ async function prepareHostEnvironment(): Promise<void> {
   if (!hostEnvPrepare) {
     hostEnvPrepare = (async () => {
       try {
-        const backends = await detectAvailableBackends();
-        writeHostEnvCache({ availableBackends: backends });
-        const models = await enumerateModels(backends, resolveTaskCwd());
-        writeHostEnvCache({ availableBackends: backends, models });
+        // Passive inventory only — no ACP model enumeration (M019 S01).
+        const snapshot = await ensureBackendReadiness(/* refresh */ false);
+        writeHostEnvCache({
+          availableBackends: derivePassivelySelectableBackendIds(snapshot),
+        });
       } catch {
         // leave cache partial/empty; engine synthesizes minimal
       }
@@ -456,9 +598,7 @@ function scheduleRetention(): void {
 class MusterChatProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'muster.chat';
   private _view?: vscode.WebviewView;
-  /** In-flight/cached detection of which backend CLIs are callable (computed once). */
-  private availableBackendsPromise?: Promise<string[]>;
-  /** In-flight/cached per-backend model enumeration (computed once). */
+  /** In-flight/cached per-backend model enumeration (explicit listModels only). */
   private availableModelsPromise?: Promise<Record<string, BackendModels>>;
   /** Discards stale async repository snapshots when focus/commits race. */
   private snapshotGeneration = 0;
@@ -488,7 +628,15 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     private readonly _extensionUri: vscode.Uri,
   ) {}
 
+  /** Optional non-production interceptor used by native first-run UAT accept. */
+  private uatPostInterceptor: ((message: unknown) => void) | undefined;
+
   private post(message: unknown): void {
+    try {
+      this.uatPostInterceptor?.(message);
+    } catch {
+      // UAT interceptor must never break production post path
+    }
     try {
       this._view?.webview.postMessage(message);
     } catch {
@@ -970,22 +1118,101 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * Detect (once, cached) which backend CLIs are installed on this machine and
-   * tell the webview so its picker only offers callable backends. If detection
-   * fails we stay silent — the webview then fails open and shows all backends.
+   * Deliver passive BackendReadinessSnapshot (M019) and derived backendsAvailable.
+   * Failures post a settled diagnostic snapshot rather than staying silent.
    */
   private async postAvailableBackends(): Promise<void> {
+    await this.postBackendReadiness('current');
+  }
+
+  /**
+   * Deliver versioned BackendReadinessSnapshot to the webview and update
+   * hostEnvCache.availableBackends as a derived passively-selectable list.
+   * Keeps models cache intact. Explicit refresh invalidates the single-flight
+   * inventory so PATH/version changes are visible without reload.
+   */
+  private async postBackendReadiness(
+    mode: 'current' | 'refresh',
+    requestId?: string,
+  ): Promise<void> {
     try {
-      // Cache the in-flight promise so a concurrent panel-open + `listBackends`
-      // don't run detection twice.
-      this.availableBackendsPromise ??= detectAvailableBackends();
-      const backends = await this.availableBackendsPromise;
-      writeHostEnvCache({ availableBackends: backends });
-      this.post({ type: 'backendsAvailable', backends });
-    } catch {
-      // Detection failed — drop the cached rejection so a later request retries;
-      // the webview meanwhile fails open and shows all backends.
-      this.availableBackendsPromise = undefined;
+      const snapshot = await ensureBackendReadiness(mode === 'refresh', requestId);
+      // Prefer requestId as correlation when provided so webview can match refresh.
+      const delivered =
+        requestId && snapshot.correlationId !== requestId
+          ? { ...snapshot, correlationId: requestId }
+          : snapshot;
+      writeHostEnvCache({
+        availableBackends: derivePassivelySelectableBackendIds(delivered),
+      });
+      // Legacy string-array channel for older consumers / progressive hydration.
+      this.post({
+        type: 'backendsAvailable',
+        backends: derivePassivelySelectableBackendIds(delivered),
+      });
+      this.post({ type: 'backendReadinessSnapshot', snapshot: delivered });
+    } catch (err) {
+      // Last-resort: always post a settled diagnostic snapshot (never silent).
+      console.warn(
+        'Muster: postBackendReadiness failed:',
+        err instanceof Error ? err.message : err,
+      );
+      backendReadinessPromise = undefined;
+      const fallback = settledInternalErrorSnapshot(requestId);
+      writeHostEnvCache({
+        availableBackends: derivePassivelySelectableBackendIds(fallback),
+      });
+      this.post({
+        type: 'backendsAvailable',
+        backends: derivePassivelySelectableBackendIds(fallback),
+      });
+      this.post({ type: 'backendReadinessSnapshot', snapshot: fallback });
+    }
+  }
+
+  /**
+   * Injected seams for the isolated Test Connection route (M019/S02).
+   * Posts progress + reduced readiness snapshots; never touches task/session state.
+   */
+  private backendProbeRouteDeps() {
+    const probe = getBackendProbeService();
+    return {
+      getReadinessSnapshot: () => getBackendReadinessService().peek(),
+      ensureReadiness: () => ensureBackendReadiness(false),
+      applySnapshot: (snapshot: BackendReadinessSnapshot) => {
+        getBackendReadinessService().replaceSnapshot(snapshot);
+        // Keep hostEnvCache.availableBackends in sync when probe upgrades to ready.
+        writeHostEnvCache({
+          availableBackends: derivePassivelySelectableBackendIds(snapshot),
+        });
+      },
+      isInFlight: (backendId: BackendReadinessId) => probe.isInFlight(backendId),
+      startProbe: (input: Parameters<BackendProbeService['start']>[0]) => probe.start(input),
+      cancelProbe: (backendId: BackendReadinessId) => probe.cancel(backendId),
+      post: (message: BackendProbeHostMessage) => {
+        this.post(message);
+      },
+      now: () => new Date(),
+      deriveAvailableBackends: derivePassivelySelectableBackendIds,
+    };
+  }
+
+  /** Explicit user-triggered Test Connection — isolated bounded ACP probe. */
+  private async handleStartBackendProbe(data: unknown): Promise<void> {
+    try {
+      const outcome = await routeStartBackendProbe(data, this.backendProbeRouteDeps());
+      if (outcome.kind === 'ignored') {
+        console.warn('Muster: ignoring malformed startBackendProbe');
+      } else if (outcome.kind === 'refused') {
+        console.warn(
+          `Muster: refusing startBackendProbe reason=${outcome.reason}`,
+        );
+      }
+    } catch (err) {
+      console.warn(
+        'Muster: startBackendProbe failed:',
+        err instanceof Error ? err.message : err,
+      );
     }
   }
 
@@ -1010,6 +1237,57 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   }
 
   /** Push Settings-backed last-used backend/model so the picker survives restarts. */
+  /**
+   * Doctor (M019/S04): refresh shared readiness and publish backendReadinessSnapshot.
+   * Does not mutate tasks/sessions. Used by muster.runDiagnostics.
+   */
+  async refreshAndPublishBackendReadiness(): Promise<void> {
+    await this.postBackendReadiness('refresh');
+  }
+
+  /**
+   * Doctor deep-link: post revealBackendDiagnostics (type key only — S03 contract).
+   */
+  postRevealBackendDiagnostics(): void {
+    this.post({ type: 'revealBackendDiagnostics' });
+  }
+
+  /**
+   * M019/S04: seams for runtime setup-failure → readiness invalidation.
+   * Reuses the same replaceSnapshot + publish path as Test Connection.
+   * Never mutates tasks/sessions and never replays prompts.
+   */
+  runtimeInvalidationDeps(): RuntimeInvalidationDeps {
+    return {
+      getReadinessSnapshot: () => getBackendReadinessService().peek(),
+      ensureReadiness: () => ensureBackendReadiness(false),
+      applySnapshot: (snapshot: BackendReadinessSnapshot) => {
+        getBackendReadinessService().replaceSnapshot(snapshot);
+        writeHostEnvCache({
+          availableBackends: derivePassivelySelectableBackendIds(snapshot),
+        });
+      },
+      post: (message) => {
+        this.post(message);
+      },
+      now: () => new Date(),
+      deriveAvailableBackends: derivePassivelySelectableBackendIds,
+    };
+  }
+
+  /**
+   * Best-effort: map a real-task setup failure onto shared readiness and publish.
+   * Turn error remains authoritative; this never replays the prompt.
+   */
+  invalidateReadinessFromRuntimeFailure(signal: {
+    backendId: string;
+    message?: string;
+    errorCode?: string;
+    stage?: string;
+  }): void {
+    scheduleRuntimeReadinessInvalidation(signal, this.runtimeInvalidationDeps());
+  }
+
   postComposerSelection(): void {
     const selection = readComposerSelection({
       get: (key) => vscode.workspace.getConfiguration().get(key),
@@ -1022,6 +1300,15 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       backend: selection.backend,
       model: selection.model,
     });
+  }
+
+  /**
+   * M019/S03 deep-link: open Settings → Agents → Backends for Doctor (S04).
+   * Posts the additive empty `revealBackendDiagnostics` host→webview message.
+   * Does not open VS Code native settings; webview owns the Settings panel.
+   */
+  revealBackendDiagnostics(): void {
+    this.post({ type: 'revealBackendDiagnostics' });
   }
 
   private handleSetComposerSelection(data: { backend?: unknown; model?: unknown }): void {
@@ -1067,7 +1354,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     }
 
     this.availableModelsPromise = (async () => {
-      const backends = await (this.availableBackendsPromise ??= detectAvailableBackends());
+      // Model enumeration is explicit-only (listModels). Derive backends from readiness.
+      const readiness = await ensureBackendReadiness(false);
+      const backends = derivePassivelySelectableBackendIds(readiness);
       console.info(`Muster: enumerating models for backends: ${backends.join(', ') || '(none)'}`);
       const models = await enumerateModels(backends, resolveTaskCwd(), (partial) => {
         this.post({ type: 'modelsAvailable', models: partial });
@@ -1686,6 +1975,12 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     this.pollingReady = false;
     this.windowStateSub?.dispose();
     this.windowStateSub = undefined;
+    // Tear down any in-flight Test Connection probes when the webview is replaced.
+    try {
+      backendProbeService?.disposeAll();
+    } catch {
+      // best-effort
+    }
   }
 
   /** Keep both independent Electron processes polling while CI cannot focus both. */
@@ -1738,6 +2033,158 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   async focusTaskForUat(taskId: string | undefined): Promise<UatHostState> {
     await this.transitionFocus(taskId);
     return this.hostStateForUat();
+  }
+
+  /**
+   * M019/S05: non-production native first-run observations.
+   * Each method delegates to the production refresh/probe/Doctor/send path and
+   * returns only bounded sanitized fields (no prompt, task body, path, or secret).
+   */
+  async observeNativeReadinessRefreshForUat(providerId: string) {
+    if (!isNativeFirstRunProviderId(providerId)) {
+      throw new Error('UAT providerId not allowlisted');
+    }
+    return observeNativeReadinessRefresh(providerId, {
+      refreshAndPublishReadiness: () => this.refreshAndPublishBackendReadiness(),
+      getReadinessSnapshot: () => getBackendReadinessService().peek(),
+      now: () => new Date(),
+    });
+  }
+
+  async observeNativeIsolatedProbeForUat(providerId: string) {
+    if (!isNativeFirstRunProviderId(providerId)) {
+      throw new Error('UAT providerId not allowlisted');
+    }
+    return observeNativeIsolatedProbe(providerId, {
+      routeStart: (message) => routeStartBackendProbe(message, this.backendProbeRouteDeps()),
+      getReadinessSnapshot: () => getBackendReadinessService().peek(),
+      createProbeId: () => randomUUID(),
+      now: () => new Date(),
+    });
+  }
+
+  async observeNativeDoctorForUat(providerId: string) {
+    if (!isNativeFirstRunProviderId(providerId)) {
+      throw new Error('UAT providerId not allowlisted');
+    }
+    return observeNativeDoctor(providerId, {
+      runDoctor: () =>
+        handleRunDiagnosticsCommand({
+          refreshAndPublishReadiness: () => this.refreshAndPublishBackendReadiness(),
+          openChatView: () =>
+            vscode.commands.executeCommand(MUSTER_OPEN_CHAT_VIEW_COMMAND),
+          postRevealBackendDiagnostics: () => this.postRevealBackendDiagnostics(),
+        }),
+      getReadinessSnapshot: () => getBackendReadinessService().peek(),
+      now: () => new Date(),
+    });
+  }
+
+  async observeNativeFirstTaskAcceptanceForUat(providerId: string) {
+    if (!isNativeFirstRunProviderId(providerId)) {
+      throw new Error('UAT providerId not allowlisted');
+    }
+    return observeNativeFirstTaskAcceptance(providerId, {
+      acceptFirstTask: async ({ backendId, clientRequestId }) => {
+        if (!taskEngine || !taskStore || !taskRepository) {
+          return { kind: 'error', code: 'host_unavailable' };
+        }
+        const result = await this.acceptFirstTaskForUat({
+          backendId,
+          clientRequestId,
+        });
+        return result;
+      },
+      getReadinessSnapshot: () => getBackendReadinessService().peek(),
+      createClientRequestId: () => `uat-s05-${randomUUID()}`,
+      now: () => new Date(),
+    });
+  }
+
+  /**
+   * Production send path for clean-workspace first-task acceptance.
+   * Captures only accept/reject codes + id lengths — never prompt or store bodies.
+   */
+  private async acceptFirstTaskForUat(input: {
+    backendId: string;
+    clientRequestId: string;
+  }): Promise<NativeFirstTaskAcceptResult> {
+    let outcome: NativeFirstTaskAcceptResult = {
+      kind: 'error',
+      code: 'host_unavailable',
+    };
+    // Intercept sendAccepted/sendRejected from the durable coordinator without
+    // reassigning the private post method (keeps TypeScript private-method safety).
+    this.uatPostInterceptor = (message: unknown) => {
+      if (typeof message !== 'object' || message === null) return;
+      const msg = message as {
+        type?: string;
+        clientRequestId?: string;
+        taskId?: string;
+        messageId?: string;
+        code?: string;
+      };
+      if (
+        msg.type === 'sendAccepted' &&
+        msg.clientRequestId === input.clientRequestId &&
+        typeof msg.taskId === 'string' &&
+        typeof msg.messageId === 'string'
+      ) {
+        outcome = {
+          kind: 'accepted',
+          taskIdLength: msg.taskId.length,
+          messageIdLength: msg.messageId.length,
+        };
+        // Remember task id for cleanup without returning it in the observation.
+        this.uatNativeFirstRunTaskId = msg.taskId;
+      } else if (
+        msg.type === 'sendRejected' &&
+        msg.clientRequestId === input.clientRequestId
+      ) {
+        const code =
+          msg.code === 'store' ||
+          msg.code === 'validation' ||
+          msg.code === 'conflict' ||
+          msg.code === 'capacity' ||
+          msg.code === 'unknown'
+            ? msg.code
+            : 'unknown';
+        outcome = { kind: 'rejected', code };
+      }
+    };
+    try {
+      await this.handleSend({
+        type: 'send',
+        text: NATIVE_FIRST_RUN_UAT_PROMPT,
+        backend: input.backendId,
+        clientRequestId: input.clientRequestId,
+      });
+    } catch {
+      outcome = { kind: 'error', code: 'host_unavailable' };
+    } finally {
+      this.uatPostInterceptor = undefined;
+    }
+    return outcome;
+  }
+
+  /** Last UAT first-task id (in-memory only; never returned in observations). */
+  private uatNativeFirstRunTaskId: string | undefined;
+
+  async observeNativeCleanupForUat(providerId: string) {
+    if (!isNativeFirstRunProviderId(providerId)) {
+      throw new Error('UAT providerId not allowlisted');
+    }
+    const createdTaskId = this.uatNativeFirstRunTaskId;
+    this.uatNativeFirstRunTaskId = undefined;
+    return observeNativeCleanup(providerId, {
+      cancelProbe: (backendId) => getBackendProbeService().cancel(backendId),
+      disposeAllProbes: () => getBackendProbeService().disposeAll(),
+      createdTaskId,
+      deleteCreatedTask: async (taskId) => {
+        await this.handleDeleteTask(taskId);
+      },
+      now: () => new Date(),
+    });
   }
 
   /** Exercise the production loadTranscriptPage route against a real focused view. */
@@ -1983,6 +2430,39 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    // M019 S01/S03: pure new-task inventory gate BEFORE durable outbox mutation.
+    // Existing-task follow-ups and task-bound handoffs are not blocked here.
+    // D060: clean workspace (zero root tasks) requires trustworthyFirstRunEligible;
+    // failed cleanliness read fails closed to the strict rule.
+    let newTaskBackend: string | undefined;
+    if (!data.taskId) {
+      let isCleanWorkspace = true;
+      try {
+        const roots = await taskRepository.listRootTasks(repositoryWorkspaceId(), {
+          limit: 1,
+        });
+        isCleanWorkspace = roots.items.length === 0;
+      } catch {
+        // Fail closed: treat as clean so first-run still requires ready.
+        isCleanWorkspace = true;
+      }
+      const eligibility = evaluateNewTaskBackendEligibility(
+        getBackendReadinessService().peek(),
+        data.backend,
+        { isCleanWorkspace },
+      );
+      if (!eligibility.ok) {
+        this.post({
+          type: 'sendRejected',
+          clientRequestId,
+          reason: eligibility.reason,
+          code: eligibility.code,
+        });
+        return;
+      }
+      newTaskBackend = eligibility.backend;
+    }
+
     const llmText =
       typeof data.llmText === 'string' && data.llmText.trim() ? data.llmText.trim() : text;
 
@@ -1999,7 +2479,11 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           : {}),
         ...(Array.isArray(data.mentionBindings) ? { mentionBindings: data.mentionBindings } : {}),
         ...(Array.isArray(data.skills) ? { skills: data.skills } : {}),
-        ...(typeof data.backend === 'string' ? { backend: data.backend } : {}),
+        ...(typeof data.backend === 'string'
+          ? { backend: data.backend }
+          : newTaskBackend
+            ? { backend: newTaskBackend }
+            : {}),
         ...(typeof data.model === 'string' ? { model: data.model } : {}),
         ...(typeof data.continuationOf === 'string'
           ? { continuationOf: data.continuationOf }
@@ -2068,7 +2552,16 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       }
 
       const shortGoal = text.length <= 30 ? text : text.slice(0, 30).trim() + '…';
-      const resolvedBackend = data.backend ?? 'claude';
+      // No implicit Claude default: eligibility already required an explicit
+      // passively selectable backend before outbox commit.
+      if (typeof data.backend !== 'string' || !data.backend) {
+        return {
+          ok: false,
+          reason: 'selected backend is not passively available',
+          code: 'validation',
+        };
+      }
+      const resolvedBackend = data.backend;
       const resolvedModel =
         typeof data.model === 'string' && data.model ? data.model : undefined;
       const result = await taskEngine.startNewTask({
@@ -2276,6 +2769,15 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       } else {
         this.pollingReady = false;
         this.revisionPoller?.stop();
+      }
+    });
+
+    // Abort in-flight Test Connection probes when this webview instance is disposed.
+    webviewView.onDidDispose(() => {
+      try {
+        backendProbeService?.disposeAll();
+      } catch {
+        // best-effort
       }
     });
 
@@ -2879,10 +3381,57 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         case 'listBackends':
           void this.postAvailableBackends();
           break;
+        case 'requestBackendReadiness': {
+          const rawId = (data as { requestId?: unknown })?.requestId;
+          const requestId =
+            typeof rawId === 'string' &&
+            rawId.length > 0 &&
+            rawId.length <= MAX_ID_CHARS &&
+            /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(rawId)
+              ? rawId
+              : undefined;
+          // Reject overlong/malformed requestId shapes by ignoring them (fail closed).
+          if (rawId !== undefined && requestId === undefined) {
+            console.warn('Muster: ignoring requestBackendReadiness with malformed requestId');
+            break;
+          }
+          void this.postBackendReadiness('current', requestId);
+          break;
+        }
+        case 'refreshBackendReadiness': {
+          const rawId = (data as { requestId?: unknown })?.requestId;
+          const requestId =
+            typeof rawId === 'string' &&
+            rawId.length > 0 &&
+            rawId.length <= MAX_ID_CHARS &&
+            /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(rawId)
+              ? rawId
+              : '';
+          if (!requestId) {
+            console.warn('Muster: ignoring refreshBackendReadiness without valid requestId');
+            break;
+          }
+          void this.postBackendReadiness('refresh', requestId);
+          break;
+        }
+        case 'startBackendProbe': {
+          // Explicit user-triggered Test Connection (M019/S02).
+          // Isolated probe route — never shared ACP, never task/session mutation.
+          void this.handleStartBackendProbe(data);
+          break;
+        }
+        case 'cancelBackendProbe': {
+          const outcome = routeCancelBackendProbe(data, this.backendProbeRouteDeps());
+          if (outcome.kind === 'ignored') {
+            console.warn('Muster: ignoring malformed cancelBackendProbe');
+          }
+          break;
+        }
         case 'listSkills':
           this.postAvailableSkills((data as { backend: string }).backend);
           break;
         case 'listModels':
+          // Explicit user-triggered model discovery only (no activation/panel auto-enum).
           void this.postAvailableModels();
           break;
         case 'setComposerSelection':
@@ -2927,11 +3476,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       await this.postSendOutboxSnapshot();
       await this.hydrateSnapshotAndResumePolling(this.focusedTaskId);
     })();
-    // Tell the webview which backends are actually installed so its picker only
-    // offers callable ones (the webview also requests this on mount).
+    // Passive readiness inventory only on panel resolve (M019 S01).
+    // Model enumeration is explicit listModels — no ACP sessions on open.
     void this.postAvailableBackends();
-    // Prefetch model catalog so New task can show [Backend] Model options promptly.
-    void this.postAvailableModels();
     // Restore last-used backend/model from VS Code Settings (survives restarts).
     this.postComposerSelection();
   }
@@ -3369,6 +3916,25 @@ export async function activate(context: vscode.ExtensionContext) {
     ),
   );
 
+  // M019/S04 Doctor: refresh readiness → open chat → reveal Agents → Backends.
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      MUSTER_RUN_DIAGNOSTICS_COMMAND,
+      async (_args?: unknown, token?: vscode.CancellationToken) => {
+        await handleRunDiagnosticsCommand({
+          refreshAndPublishReadiness: () =>
+            provider.refreshAndPublishBackendReadiness(),
+          openChatView: () =>
+            vscode.commands.executeCommand(MUSTER_OPEN_CHAT_VIEW_COMMAND),
+          postRevealBackendDiagnostics: () =>
+            provider.postRevealBackendDiagnostics(),
+          isCancellationRequested: () =>
+            Boolean(token?.isCancellationRequested),
+        });
+      },
+    ),
+  );
+
   if (liveUatEnabled) {
     registerLiveUatCommands(context);
   }
@@ -3704,6 +4270,14 @@ export async function activate(context: vscode.ExtensionContext) {
           provider.forwardTurnEvent(event);
         } catch {
           // best-effort streaming
+        }
+      },
+      // M019/S04: mapped setup failures invalidate readiness without prompt replay.
+      onRuntimeSetupFailure: (signal) => {
+        try {
+          provider.invalidateReadinessFromRuntimeFailure(signal);
+        } catch {
+          // best-effort readiness publication
         }
       },
     });
@@ -4146,6 +4720,27 @@ function registerLiveUatCommands(context: vscode.ExtensionContext): void {
         presentationId: String(args.presentationId),
       });
     }),
+    // M019/S05 native first-run observations — production-path delegates only.
+    vscode.commands.registerCommand(UAT_COMMANDS.refreshReadiness, async (args) => {
+      if (!uatChatProvider) throw new Error('UAT chat provider unavailable');
+      return uatChatProvider.observeNativeReadinessRefreshForUat(String(args?.providerId ?? ''));
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.probeBackend, async (args) => {
+      if (!uatChatProvider) throw new Error('UAT chat provider unavailable');
+      return uatChatProvider.observeNativeIsolatedProbeForUat(String(args?.providerId ?? ''));
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.runDoctor, async (args) => {
+      if (!uatChatProvider) throw new Error('UAT chat provider unavailable');
+      return uatChatProvider.observeNativeDoctorForUat(String(args?.providerId ?? ''));
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.acceptFirstTask, async (args) => {
+      if (!uatChatProvider) throw new Error('UAT chat provider unavailable');
+      return uatChatProvider.observeNativeFirstTaskAcceptanceForUat(String(args?.providerId ?? ''));
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.nativeFirstRunCleanup, async (args) => {
+      if (!uatChatProvider) throw new Error('UAT chat provider unavailable');
+      return uatChatProvider.observeNativeCleanupForUat(String(args?.providerId ?? ''));
+    }),
   );
 }
 
@@ -4176,6 +4771,12 @@ export async function deactivate(): Promise<void> {
   permissionBridge?.cancelAll();
   credentialRegistry?.revokeAll();
   void bridgeServer?.close();
+  try {
+    backendProbeService?.disposeAll();
+  } catch {
+    // best-effort probe teardown
+  }
+  backendProbeService = undefined;
   disposeSharedAcpClient();
   musterDebugChannel?.dispose();
   musterDebugChannel = undefined;

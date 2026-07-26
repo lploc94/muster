@@ -3,6 +3,7 @@
   import SettingsPanel from './components/SettingsPanel.svelte';
   import TaskHistoryList from './components/TaskList.svelte';
   import TaskWorkspace from './components/TaskWorkspace.svelte';
+  import FirstRunJourney from './components/FirstRunJourney.svelte';
   import PermissionCard from './components/PermissionCard.svelte';
   import ElicitationFormCard from './components/ElicitationFormCard.svelte';
   import ElicitationUrlCard from './components/ElicitationUrlCard.svelte';
@@ -62,6 +63,9 @@
     type RetentionDrafts,
   } from './lib/settings-view-state';
   import type { SettingsTopicId } from './lib/settings-topics';
+  import { resolveRevealBackendDiagnosticsAction } from './lib/settings-backends-deep-link';
+  import { resolveOpenBackendSetupAction } from './lib/composer-backend-setup';
+  import type { BackendReadinessId } from '../../src/shared/backend-readiness';
   import { vscode } from './lib/vscode';
 
   type PendingElicitation =
@@ -156,6 +160,8 @@
   const inChat = $derived(tasks.draftMode || !!tasks.focusedTaskId);
   let historyOpen = $state(false);
   let settingsOpen = $state(false);
+  /** Incremented on revealBackendDiagnostics so BackendsSettings re-focuses. */
+  let backendsFocusRequest = $state(0);
   let settingsSnapshot = $state<RuntimeStorageSettingsSnapshot | null>(null);
   let settingsLoading = $state(false);
   let settingsSavingSettingId = $state<RuntimeStorageSettingId | null>(null);
@@ -331,9 +337,15 @@
     post({ type: 'renameTask', taskId, goal });
   }
 
-  function openSettings() {
+  function openSettings(opts?: { topicId?: SettingsTopicId; focusBackends?: boolean }) {
     historyOpen = false;
     settingsOpen = true;
+    if (opts?.topicId) {
+      setSettingsActiveTopicId(opts.topicId);
+    }
+    if (opts?.focusBackends) {
+      backendsFocusRequest += 1;
+    }
     settingsLoading = !settingsSnapshot;
     // Keep Retention feedback scoped; do not clear dirty drafts on open.
     retentionError = null;
@@ -350,7 +362,43 @@
     post({ type: 'requestTaskTypesSettings' });
     post({ type: 'requestPermissionSettings' });
     post({ type: 'listBackends' });
-    post({ type: 'listModels' });
+    // Model enumeration is explicit-only (M019 S01); Settings open stays passive.
+    // Passive readiness re-request when Doctor deep-links to Backends.
+    if (opts?.focusBackends) {
+      post({
+        type: 'requestBackendReadiness',
+        requestId: `reveal-backends-${Date.now()}`,
+      });
+    }
+  }
+
+  /** S04 Doctor deep-link: open Settings → Agents and focus settings-backends. */
+  function revealBackendDiagnostics(): void {
+    const action = resolveRevealBackendDiagnosticsAction();
+    openSettings({ topicId: action.topicId, focusBackends: true });
+  }
+
+  /** Composer / first-run deep-link into Agents → Backends (relocated probe entry). */
+  function openBackendSetup(): void {
+    const action = resolveOpenBackendSetupAction();
+    openSettings({ topicId: action.topicId, focusBackends: action.focusBackends });
+  }
+
+  function startFirstTaskFromJourney(): void {
+    tasks.openNewTaskDraft();
+    post({ type: 'newTask' });
+    historyOpen = false;
+  }
+
+  /** Root-task count for the derived first-run journey (no durable onboarding flag). */
+  const firstRunTaskCount = $derived(tasks.rootTasks.length);
+
+  function onStartBackendProbeFromSettings(backendId: BackendReadinessId): void {
+    tasks.startBackendProbe(backendId);
+  }
+
+  function onCancelBackendProbeFromSettings(): void {
+    tasks.cancelBackendProbe();
   }
 
   function closeSettings() {
@@ -886,7 +934,23 @@
           break;
 
         case 'backendsAvailable':
+          // Derived list remains for Settings/legacy consumers; readiness truth
+          // is backendReadinessSnapshot (M019). Keep hostHydrated path intact.
           tasks.setAvailableBackends(msg.backends);
+          break;
+
+        case 'backendReadinessSnapshot':
+          tasks.applyBackendReadinessSnapshot(msg.snapshot);
+          break;
+
+        case 'backendProbeProgress':
+          // Correlated Test Connection stage only; never invents readiness truth.
+          tasks.applyBackendProbeProgress(msg.progress);
+          break;
+
+        case 'revealBackendDiagnostics':
+          // S04 Doctor deep-link — open Agents → Backends (M019/S03).
+          revealBackendDiagnostics();
           break;
 
         case 'modelsAvailable':
@@ -945,16 +1009,23 @@
       }
     }
 
+    function onOpenBackendSetupEvent(): void {
+      openBackendSetup();
+    }
+
     window.addEventListener('message', onMessage);
     window.addEventListener('muster:prefill-applied', onPrefillApplied);
-    // Ask the host which backends are installed so the picker only offers them.
+    window.addEventListener('muster:open-backend-setup', onOpenBackendSetupEvent);
+    // Passive readiness inventory (M019): correlated request; host also posts
+    // derived backendsAvailable. listBackends remains for transitional hosts.
+    post({ type: 'requestBackendReadiness', requestId: `init-${Date.now()}` });
     post({ type: 'listBackends' });
-    // Prefetch model lists for the New-task picker (host also prefetches on resolve).
-    post({ type: 'listModels' });
+    // Model catalog is explicit listModels only (M019 S01) — no ACP sessions on mount.
     // Phase C outbox replay happens after a compatible snapshot (see below).
     return () => {
       window.removeEventListener('message', onMessage);
       window.removeEventListener('muster:prefill-applied', onPrefillApplied);
+      window.removeEventListener('muster:open-backend-setup', onOpenBackendSetupEvent);
     };
   });
 
@@ -1086,6 +1157,11 @@
     modelsByBackend={tasks.modelsByBackend ?? {}}
     onSaveTaskTypes={saveTaskTypes}
     onResetTaskTypes={resetTaskTypesToDefaults}
+    backendReadinessSnapshot={tasks.backendReadinessSnapshot}
+    activeBackendProbe={tasks.activeBackendProbe}
+    backendsFocusRequest={backendsFocusRequest}
+    onStartBackendProbe={onStartBackendProbeFromSettings}
+    onCancelBackendProbe={onCancelBackendProbeFromSettings}
   />
 {:else}
 {#if visibleCommandError}
@@ -1134,7 +1210,7 @@
         type="button"
         class="icon-btn shrink-0 mr-2"
        
-        onclick={openSettings}
+        onclick={() => openSettings()}
         aria-label="Settings"
         aria-pressed={settingsOpen}
         use:tip={'Settings'}
@@ -1143,6 +1219,12 @@
       </button>
     </div>
     <div class="shrink-0" style="border-top: 1px solid var(--vscode-panel-border);"></div>
+    <FirstRunJourney
+      snapshot={tasks.backendReadinessSnapshot}
+      taskCount={firstRunTaskCount}
+      onOpenBackendSetup={openBackendSetup}
+      onStartFirstTask={startFirstTaskFromJourney}
+    />
     <TaskHistoryList
       variant="full"
       onSelect={(id) => { selectTask(id); historyOpen = false; }}
@@ -1213,7 +1295,7 @@
         type="button"
         class="icon-btn"
        
-        onclick={openSettings}
+        onclick={() => openSettings()}
         aria-label="Settings"
         aria-pressed={settingsOpen}
         use:tip={'Settings'}

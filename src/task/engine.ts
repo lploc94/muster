@@ -248,6 +248,18 @@ export interface TaskEngineConfig {
    * projection refresh. Used to publish one workspacePatchBatch per revision.
    */
   onAfterCommit?: (ctx: RepositoryCommitContext) => void | Promise<void>;
+  /**
+   * M019/S04: best-effort callback after a failed turn is settled with turnError.
+   * Host maps spawn/auth/version/ACP setup failures onto BackendReadinessSnapshot
+   * without replaying the prompt or mutating task/session state. Optional — tests
+   * and hosts that do not publish readiness may omit it.
+   */
+  onRuntimeSetupFailure?: (signal: {
+    backendId: string;
+    message?: string;
+    errorCode?: string;
+    stage?: string;
+  }) => void;
 }
 
 export type EngineResult<T> =
@@ -505,6 +517,16 @@ export class TaskEngine {
   ) => ReadonlySet<string> | undefined;
   private readonly getSkillPrefix?: (backend: string) => string;
   /**
+   * M019/S04: host callback after turnError settlement for readiness invalidation.
+   * Best-effort; must never throw into the turn path.
+   */
+  private readonly onRuntimeSetupFailure?: (signal: {
+    backendId: string;
+    message?: string;
+    errorCode?: string;
+    stage?: string;
+  }) => void;
+  /**
    * Phase C host-authorization master switch (default false — never execute). Held as
    * the raw config value (static boolean OR live resolver) and evaluated per settle via
    * {@link resolveAllowHostVerification}.
@@ -610,6 +632,7 @@ export class TaskEngine {
     this.getRuntimeFallbacks = config.getRuntimeFallbacks;
     this.getAdvertisedCommands = config.getAdvertisedCommands;
     this.getSkillPrefix = config.getSkillPrefix;
+    this.onRuntimeSetupFailure = config.onRuntimeSetupFailure;
     // Preserve the raw value (boolean or resolver); resolveAllowHostVerification()
     // evaluates it live at settle time so a mid-session setting toggle takes effect.
     this.allowHostVerification = config.allowHostVerification ?? false;
@@ -934,6 +957,59 @@ export class TaskEngine {
       return;
     }
     this.safeEmit({ type: 'turnError', taskId, turnId, message });
+    // M019/S04: notify host so mapped setup failures can invalidate readiness.
+    // Turn error remains authoritative; host must not replay the prompt.
+    this.notifyRuntimeSetupFailure(taskId, turnId, message);
+  }
+
+  /**
+   * Best-effort host notification for runtime setup-failure → readiness
+   * invalidation (M019/S04). Never throws; never mutates task/session state.
+   * Resolves backendId from the durable task record when present.
+   */
+  private notifyRuntimeSetupFailure(taskId: string, _turnId: string, message: string): void {
+    if (!this.onRuntimeSetupFailure) return;
+    try {
+      const file = this.store.getFile();
+      const task = file.tasks[taskId];
+      const backendId = typeof task?.backend === 'string' ? task.backend : undefined;
+      if (!backendId) return;
+
+      // Prefer structured attention code when present; otherwise classify from message.
+      let errorCode: string | undefined;
+      let stage: string | undefined;
+      const attentionCode =
+        task?.attention && typeof task.attention === 'object'
+          ? (task.attention as { code?: unknown }).code
+          : undefined;
+      if (typeof attentionCode === 'string' && attentionCode.trim()) {
+        errorCode = attentionCode.trim();
+      }
+      // Heuristic stage hints from well-known message prefixes (classification only).
+      if (/backend factory failed/i.test(message) || /ENOENT/i.test(message)) {
+        stage = 'spawn';
+      } else if (/setup timed out|setup_timeout/i.test(message)) {
+        stage = 'session';
+        errorCode = errorCode ?? 'setup_timeout';
+      } else if (/agent exited|exited \(code/i.test(message)) {
+        stage = 'unknown';
+      } else if (/ACP error|initialize/i.test(message)) {
+        stage = 'initialize';
+      } else if (/mcp setup exhausted|session_registry|session resume/i.test(message)) {
+        stage = 'session';
+      } else if (/not authenticated|auth(?:enticate|entication)?|login required|unauthorized/i.test(message)) {
+        stage = 'authenticate';
+      }
+
+      this.onRuntimeSetupFailure({
+        backendId,
+        message,
+        errorCode,
+        stage,
+      });
+    } catch {
+      // Host notification is best-effort and must not break turn settlement.
+    }
   }
 
   private graphDeps(): GraphEngineDeps {

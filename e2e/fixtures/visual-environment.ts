@@ -719,6 +719,50 @@ export function createStaticTaskTypesSettingsSnapshot() {
   };
 }
 
+/**
+ * M019/S05 first-run Agents → Backends readiness surface for the compact visual
+ * golden. Claude is ready; siblings stay missing so the 320px recovery list is
+ * visible. Synthetic only — never a native Extension Host claim.
+ */
+export function createStaticFirstRunBackendsReadinessSnapshot(
+  correlationId = 'visual-s05-first-run',
+) {
+  const checkedAt = VISUAL_CLOCK_ISO;
+  const backends = (
+    ['claude', 'grok', 'kiro', 'codex', 'opencode'] as const
+  ).map((backendId) => {
+    if (backendId === 'claude') {
+      return {
+        backendId,
+        state: 'ready',
+        code: 'none',
+        recoveryAction: 'none',
+        compatibility: 'compatible',
+        versionEvidence: '1.0.0',
+        checkedAt,
+      };
+    }
+    return {
+      backendId,
+      state: 'missing',
+      code: 'executable_missing',
+      recoveryAction: 'install',
+      compatibility: 'unknown',
+      versionEvidence: null,
+      checkedAt,
+    };
+  });
+  const snapshot = {
+    schemaVersion: 1,
+    correlationId,
+    phase: 'settled',
+    checkedAt,
+    backends,
+  };
+  assertSanitizedVisualFixture(snapshot);
+  return snapshot;
+}
+
 /** Relative-only file mention suggestions (no absolute paths or cwd). */
 export function createStaticFileMentionSuggestions(
   requestId: string,

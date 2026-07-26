@@ -31,6 +31,13 @@ export const VISUAL_MATRIX_MAX_CASES: number = manifest.maxCases;
  */
 export const M014_S02_FLOW_TITLE: string = manifest.flowTitle;
 
+/**
+ * M019/S05 first-run Agents → Backends compact visual golden id.
+ * Screenshot basename (not the V07 matrix case id) — grepped by the S05 gate.
+ */
+export const M019_S05_FIRST_RUN_BACKENDS_VISUAL_ID =
+  'M019-S05-first-run-backends-compact-dark' as const;
+
 /** Bounded representative visual matrix (≤ VISUAL_MATRIX_MAX_CASES). */
 export const VISUAL_MATRIX_CASES: readonly VisualMatrixCase[] =
   manifest.cases as VisualMatrixCase[];

@@ -31,6 +31,12 @@ export const UAT_COMMANDS = {
   loadOlderTranscript: 'muster.uat.loadOlderTranscript',
   readDurableSurfaces: 'muster.uat.readDurableSurfaces',
   focusTask: 'muster.uat.focusTask',
+  /** M019/S05 native first-run observations (production-path delegates). */
+  refreshReadiness: 'muster.uat.refreshReadiness',
+  probeBackend: 'muster.uat.probeBackend',
+  runDoctor: 'muster.uat.runDoctor',
+  acceptFirstTask: 'muster.uat.acceptFirstTask',
+  nativeFirstRunCleanup: 'muster.uat.nativeFirstRunCleanup',
 } as const;
 
 export type UatCommandId = (typeof UAT_COMMANDS)[keyof typeof UAT_COMMANDS];

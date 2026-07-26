@@ -11,7 +11,19 @@ import type { NormalizedEvent, Question } from './types';
  * breaking change to the ExtMessage/OutMessage shapes below (and mirror it in
  * src/extension.ts).
  */
+import {
+  parseBackendReadinessSnapshot,
+  type BackendReadinessSnapshot,
+} from '../../../src/shared/backend-readiness';
+import {
+  parseBackendProbeProgress,
+  type BackendProbeProgress,
+  type BackendProbeRequest,
+} from '../../../src/shared/backend-probe';
+
 export const PROTOCOL_VERSION = 10;
+
+export type { BackendReadinessSnapshot, BackendProbeProgress, BackendProbeRequest };
 
 /**
  * Require an exact peer protocol version. A different or malformed version
@@ -475,6 +487,25 @@ export type ExtMessage =
   | { type: 'filePicked'; path: string; displayName?: string }
   | { type: 'backendsAvailable'; backends: string[] }
   /**
+   * Host-owned passive BackendReadinessSnapshot (M019). Webview must parse via
+   * parseBackendReadinessSnapshot — reject malformed/unknown payloads fail-closed.
+   * S02 also delivers testing/ready/auth/failed states via the same channel after
+   * an explicit Test Connection probe settles.
+   */
+  | { type: 'backendReadinessSnapshot'; snapshot: BackendReadinessSnapshot }
+  /**
+   * Correlated probe stage progress for an in-flight Test Connection (M019/S02).
+   * Webview must parse via parseBackendProbeProgress — drop malformed payloads.
+   */
+  | { type: 'backendProbeProgress'; progress: BackendProbeProgress }
+  /**
+   * Host→webview deep-link (M019/S03): open Settings on the Agents domain and
+   * focus the stable Backends section target (`settings-backends`). Additive;
+   * PROTOCOL_VERSION stays at 10. S04's Doctor command sends this message.
+   * Payload is intentionally empty — no secrets, paths, or diagnostics body.
+   */
+  | { type: 'revealBackendDiagnostics' }
+  /**
    * A backend's advertised skills + its per-backend invocation prefix (`/` or `$`).
    * `prefix` is always present (static map) even when `skills` is empty (cold cache).
    */
@@ -707,6 +738,31 @@ export type OutMessage =
   | { type: 'updatePermissionSettings'; mode: PermissionModeSetting }
   | { type: 'listBackends' }
   | { type: 'listModels' }
+  /**
+   * Correlated passive readiness request (M019). Host returns backendReadinessSnapshot
+   * (+ derived backendsAvailable). Optional requestId is echoed as correlationId.
+   */
+  | { type: 'requestBackendReadiness'; requestId?: string }
+  /** Force PATH/version re-inventory; requestId required for refresh correlation. */
+  | { type: 'refreshBackendReadiness'; requestId: string }
+  /**
+   * Explicit user-triggered Test Connection (M019/S02). Host runs one isolated
+   * bounded ACP probe, posts backendProbeProgress, then a reduced
+   * backendReadinessSnapshot. Never sends session/prompt; never mutates tasks.
+   */
+  | {
+      type: 'startBackendProbe';
+      schemaVersion: 1;
+      probeId: string;
+      backendId: BackendReadinessSnapshot['backends'][number]['backendId'];
+    }
+  /** Cancel the in-flight Test Connection for a backend (correlated by probeId). */
+  | {
+      type: 'cancelBackendProbe';
+      schemaVersion: 1;
+      probeId: string;
+      backendId: BackendReadinessSnapshot['backends'][number]['backendId'];
+    }
   /** Ask the host for a backend's advertised skills + invocation prefix. */
   | { type: 'listSkills'; backend: string }
   /** Webview → host debug line for Output channel "Muster Debug". */
@@ -1697,6 +1753,22 @@ export function isExtMessage(data: unknown): data is ExtMessage {
 
     case 'backendsAvailable':
       return Array.isArray(data.backends) && data.backends.every(isString);
+
+    case 'backendReadinessSnapshot':
+      return (
+        hasOnlyKeys(data, ['type', 'snapshot']) &&
+        parseBackendReadinessSnapshot((data as { snapshot: unknown }).snapshot) !== null
+      );
+
+    case 'backendProbeProgress':
+      return (
+        hasOnlyKeys(data, ['type', 'progress']) &&
+        parseBackendProbeProgress((data as { progress: unknown }).progress) !== null
+      );
+
+    case 'revealBackendDiagnostics':
+      // Empty additive payload — type key only (M019/S03 deep-link contract).
+      return hasOnlyKeys(data, ['type']);
 
     case 'skillsAvailable':
       return (
