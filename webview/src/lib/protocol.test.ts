@@ -1691,6 +1691,72 @@ describe('protocol v7 loadTranscriptPage / transcriptPageResult', () => {
         ],
       }),
     ).toBe(false);
+
+    // M020 S02: truncated flag and fileChangesOmitted must survive the guard.
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [
+          {
+            ...baseTool,
+            content: {
+              ...baseTool.content,
+              fileChanges: [{ ...validChange, truncated: true }],
+              fileChangesOmitted: 8,
+            },
+          },
+        ],
+      }),
+    ).toBe(true);
+
+    // truncated:false is never emitted by the engine; reject it fail-closed.
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [
+          {
+            ...baseTool,
+            content: {
+              ...baseTool.content,
+              fileChanges: [{ ...validChange, truncated: false }],
+            },
+          },
+        ],
+      }),
+    ).toBe(false);
+
+    // fileChangesOmitted must be a non-negative safe integer when present.
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [
+          {
+            ...baseTool,
+            content: {
+              ...baseTool.content,
+              fileChanges: [validChange],
+              fileChangesOmitted: -1,
+            },
+          },
+        ],
+      }),
+    ).toBe(false);
+
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [
+          {
+            ...baseTool,
+            content: {
+              ...baseTool.content,
+              fileChanges: [validChange],
+              fileChangesOmitted: 1.5,
+            },
+          },
+        ],
+      }),
+    ).toBe(false);
   });
 });
 

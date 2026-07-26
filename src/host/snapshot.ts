@@ -91,6 +91,8 @@ export interface ToolFileChange {
   path: string;
   oldText: string | null;
   newText: string;
+  /** Present only when a side was clipped by the engine bound; never `false`. */
+  truncated?: boolean;
 }
 
 export interface ToolTranscriptContent {
@@ -103,6 +105,11 @@ export interface ToolTranscriptContent {
   error?: string;
   /** Optional ACP diff evidence. Omitted when absent (never empty array). */
   fileChanges?: ToolFileChange[];
+  /**
+   * Count of valid fileChanges dropped by the file-count bound (M020 S02).
+   * Omitted when zero / absent so content-only tools stay free of empty evidence.
+   */
+  fileChangesOmitted?: number;
 }
 
 export type TranscriptItem =
@@ -521,6 +528,9 @@ export function buildTranscript(file: EngineProjection, taskId: string): Transcr
           error: tc.error,
           ...(tc.fileChanges !== undefined && tc.fileChanges.length > 0
             ? { fileChanges: tc.fileChanges }
+            : {}),
+          ...(tc.fileChangesOmitted !== undefined && tc.fileChangesOmitted > 0
+            ? { fileChangesOmitted: tc.fileChangesOmitted }
             : {}),
         },
       },

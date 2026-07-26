@@ -1235,13 +1235,15 @@ function isTaskSummary(v: unknown): v is TaskSummary {
 
 function isToolFileChange(v: unknown): boolean {
   if (!isRecord(v)) return false;
-  if (!hasOnlyKeys(v, ['path', 'oldText', 'newText'])) return false;
+  if (!hasOnlyKeys(v, ['path', 'oldText', 'newText', 'truncated'])) return false;
   if (!isString(v.path) || v.path.length === 0 || v.path.length > TOOL_FILE_CHANGE_TEXT_MAX) return false;
   if (v.path.includes('\0')) return false;
   if (!(v.oldText === null || (isString(v.oldText) && v.oldText.length <= TOOL_FILE_CHANGE_TEXT_MAX))) {
     return false;
   }
   if (!isString(v.newText) || v.newText.length > TOOL_FILE_CHANGE_TEXT_MAX) return false;
+  // truncated is present only when true (engine never emits false).
+  if (v.truncated !== undefined && v.truncated !== true) return false;
   return true;
 }
 
@@ -1294,6 +1296,7 @@ function isTranscriptItem(v: unknown): v is TranscriptItem {
           'output',
           'error',
           'fileChanges',
+          'fileChangesOmitted',
         ])
       ) {
         return false;
@@ -1316,6 +1319,17 @@ function isTranscriptItem(v: unknown): v is TranscriptItem {
         if (c.fileChanges.length === 0 || c.fileChanges.length > TOOL_FILE_CHANGES_MAX) return false;
         for (const entry of c.fileChanges) {
           if (!isToolFileChange(entry)) return false;
+        }
+      }
+      // Optional file-count overflow signal (M020 S02): omit or non-negative safe integer.
+      if (c.fileChangesOmitted !== undefined) {
+        if (
+          typeof c.fileChangesOmitted !== 'number' ||
+          !Number.isFinite(c.fileChangesOmitted) ||
+          !Number.isSafeInteger(c.fileChangesOmitted) ||
+          c.fileChangesOmitted < 0
+        ) {
+          return false;
         }
       }
       return true;
