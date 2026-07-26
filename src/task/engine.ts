@@ -4866,16 +4866,24 @@ export class TaskEngine {
             const compositeId = `${turnId}:${event.toolCallId}`;
             const at = nowIso(this.clock);
             const existing = streamedTools.get(compositeId);
+            // fileChanges: replace when present on the event; otherwise keep prior evidence.
+            // Never write an empty array for absence — omit so payload_json stays clean.
             const nextTool: PersistedToolCall = existing
               ? {
                   ...existing,
                   input: event.input !== undefined ? event.input : existing.input,
                   updatedAt: at,
+                  ...(event.fileChanges !== undefined
+                    ? { fileChanges: event.fileChanges }
+                    : {}),
                 }
               : {
                   id: compositeId, taskId: eventTurn.taskId, turnId, toolCallId: event.toolCallId,
                   order: nextOrder(), name: 'tool', status: 'running', input: event.input,
                   createdAt: at, updatedAt: at,
+                  ...(event.fileChanges !== undefined
+                    ? { fileChanges: event.fileChanges }
+                    : {}),
                 };
             streamedTools.set(compositeId, nextTool);
             let failMessage: string | undefined;
@@ -4924,6 +4932,11 @@ export class TaskEngine {
               ...(outcome === 'error'
                 ? { error: event.error, output: undefined }
                 : { output: event.output, error: undefined }),
+              // Replace evidence when the complete event carries it; otherwise keep
+              // whatever toolUpdated already stored (spread of `base` preserves it).
+              ...(event.fileChanges !== undefined
+                ? { fileChanges: event.fileChanges }
+                : {}),
             };
             streamedTools.set(compositeId, nextTool);
             let failMessage: string | undefined;

@@ -1,3 +1,5 @@
+import type { ToolFileChange } from '../types';
+
 // Tasks (§4.1)
 export type TaskRole = 'coordinator' | 'worker';
 export type TaskLifecycleState = 'open' | 'succeeded' | 'failed' | 'cancelled' | 'skipped';
@@ -618,6 +620,12 @@ export interface PersistedToolCall {
   input?: unknown;
   output?: unknown;
   error?: string;
+  /**
+   * Optional ACP diff-block evidence (M020). Omitted when absent so content-only
+   * tools stay free of empty evidence. Rides `tool_calls.payload_json` remainder
+   * via `toolCallPayload` — no schema change.
+   */
+  fileChanges?: ToolFileChange[];
   createdAt: string;
   updatedAt: string;
 }
