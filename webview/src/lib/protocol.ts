@@ -176,6 +176,10 @@ export const TRANSCRIPT_PAGE_MAX_ITEMS = 100;
 export const WORKSPACE_PATCH_MAX_PATCHES = 10_000;
 export const WORKSPACE_PATCH_MAX_ITEMS = 500;
 export const WORKSPACE_PATCH_MAX_QUEUED = 500;
+/** Max ACP fileChanges entries projected per tool call (M020). */
+export const TOOL_FILE_CHANGES_MAX = 32;
+/** Max path / text length for a single fileChange entry (M020). */
+export const TOOL_FILE_CHANGE_TEXT_MAX = 262_144;
 export const WORKSPACE_PATCH_ID_MAX = 512;
 
 /** Fixed failure codes for transcriptPageResult (no free-form message). */
@@ -1229,6 +1233,18 @@ function isTaskSummary(v: unknown): v is TaskSummary {
   );
 }
 
+function isToolFileChange(v: unknown): boolean {
+  if (!isRecord(v)) return false;
+  if (!hasOnlyKeys(v, ['path', 'oldText', 'newText'])) return false;
+  if (!isString(v.path) || v.path.length === 0 || v.path.length > TOOL_FILE_CHANGE_TEXT_MAX) return false;
+  if (v.path.includes('\0')) return false;
+  if (!(v.oldText === null || (isString(v.oldText) && v.oldText.length <= TOOL_FILE_CHANGE_TEXT_MAX))) {
+    return false;
+  }
+  if (!isString(v.newText) || v.newText.length > TOOL_FILE_CHANGE_TEXT_MAX) return false;
+  return true;
+}
+
 function isTranscriptItem(v: unknown): v is TranscriptItem {
   if (!isRecord(v) || !isBoundedId(v.id, WORKSPACE_PATCH_ID_MAX)) return false;
   switch (v.kind) {
@@ -1277,6 +1293,7 @@ function isTranscriptItem(v: unknown): v is TranscriptItem {
           'input',
           'output',
           'error',
+          'fileChanges',
         ])
       ) {
         return false;
@@ -1293,6 +1310,14 @@ function isTranscriptItem(v: unknown): v is TranscriptItem {
       }
       if (c.error !== undefined && !isString(c.error)) return false;
       // input/output remain unknown payloads when present.
+      // Optional ACP diff evidence (M020): omit or non-empty validated array.
+      if (c.fileChanges !== undefined) {
+        if (!Array.isArray(c.fileChanges)) return false;
+        if (c.fileChanges.length === 0 || c.fileChanges.length > TOOL_FILE_CHANGES_MAX) return false;
+        for (const entry of c.fileChanges) {
+          if (!isToolFileChange(entry)) return false;
+        }
+      }
       return true;
     }
     case 'error':

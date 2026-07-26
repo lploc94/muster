@@ -16,6 +16,13 @@ export interface AssistantItem {
   turnId?: string;
   order?: number;
 }
+/** Optional ACP diff-block evidence projected across the host/webview boundary (M020). */
+export interface ToolFileChange {
+  path: string;
+  oldText: string | null;
+  newText: string;
+}
+
 export interface ToolItem {
   kind: 'tool';
   id: string;
@@ -25,6 +32,8 @@ export interface ToolItem {
   input?: unknown;
   output?: unknown;
   error?: string;
+  /** Optional ACP diff evidence. Omitted when absent (never empty array). */
+  fileChanges?: ToolFileChange[];
   turnId?: string;
   order?: number;
 }

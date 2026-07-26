@@ -76,6 +76,9 @@ function toolToTranscriptItem(tool: PersistedToolCall): TranscriptItem {
       ...(tool.input !== undefined ? { input: tool.input } : {}),
       ...(tool.output !== undefined ? { output: tool.output } : {}),
       ...(tool.error !== undefined ? { error: tool.error } : {}),
+      ...(tool.fileChanges !== undefined && tool.fileChanges.length > 0
+        ? { fileChanges: tool.fileChanges }
+        : {}),
     },
   };
 }

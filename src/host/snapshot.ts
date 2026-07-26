@@ -86,6 +86,13 @@ export interface TaskSummary {
   };
 }
 
+/** Optional ACP diff-block evidence projected to the webview (M020). */
+export interface ToolFileChange {
+  path: string;
+  oldText: string | null;
+  newText: string;
+}
+
 export interface ToolTranscriptContent {
   toolCallId: string;
   name: string;
@@ -94,6 +101,8 @@ export interface ToolTranscriptContent {
   input?: unknown;
   output?: unknown;
   error?: string;
+  /** Optional ACP diff evidence. Omitted when absent (never empty array). */
+  fileChanges?: ToolFileChange[];
 }
 
 export type TranscriptItem =
@@ -510,6 +519,9 @@ export function buildTranscript(file: EngineProjection, taskId: string): Transcr
           input: tc.input,
           output: tc.output,
           error: tc.error,
+          ...(tc.fileChanges !== undefined && tc.fileChanges.length > 0
+            ? { fileChanges: tc.fileChanges }
+            : {}),
         },
       },
       key: { turnSequence: seq, kindRank: KIND_RANK.tool, ordering: tc.order, createdAt: tc.createdAt, entityId: tc.id },

@@ -1583,6 +1583,115 @@ describe('protocol v7 loadTranscriptPage / transcriptPageResult', () => {
       }),
     ).toBe(false);
   });
+
+  it('accepts optional fileChanges evidence and rejects malformed entries', () => {
+    const baseTool = {
+      id: 'tool-1',
+      kind: 'tool' as const,
+      turnId: 't1',
+      order: 1,
+      content: {
+        toolCallId: 'c1',
+        name: 'Edit',
+        status: 'success' as const,
+      },
+    };
+    const validChange = {
+      path: 'src/a.ts',
+      oldText: 'const a = 1;\n',
+      newText: 'const a = 2;\n',
+    };
+    // Content-only (no fileChanges) remains valid.
+    expect(isExtMessage({ ...validSuccess, items: [baseTool] })).toBe(true);
+    // Valid single-file evidence accepted.
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [
+          {
+            ...baseTool,
+            content: { ...baseTool.content, fileChanges: [validChange] },
+          },
+        ],
+      }),
+    ).toBe(true);
+    // Create (oldText null) accepted.
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [
+          {
+            ...baseTool,
+            content: {
+              ...baseTool.content,
+              fileChanges: [{ path: 'new.ts', oldText: null, newText: 'x' }],
+            },
+          },
+        ],
+      }),
+    ).toBe(true);
+    // Empty array rejected (omit instead).
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [{ ...baseTool, content: { ...baseTool.content, fileChanges: [] } }],
+      }),
+    ).toBe(false);
+    // Non-array rejected.
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [
+          { ...baseTool, content: { ...baseTool.content, fileChanges: validChange as unknown as [] } },
+        ],
+      }),
+    ).toBe(false);
+    // Missing path rejected.
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [
+          {
+            ...baseTool,
+            content: {
+              ...baseTool.content,
+              fileChanges: [{ oldText: 'a', newText: 'b' } as { path: string; oldText: string | null; newText: string }],
+            },
+          },
+        ],
+      }),
+    ).toBe(false);
+    // Nested extra key rejected.
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [
+          {
+            ...baseTool,
+            content: {
+              ...baseTool.content,
+              fileChanges: [{ ...validChange, extra: true } as typeof validChange],
+            },
+          },
+        ],
+      }),
+    ).toBe(false);
+    // Invalid oldText type rejected.
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [
+          {
+            ...baseTool,
+            content: {
+              ...baseTool.content,
+              fileChanges: [{ path: 'a.ts', oldText: 1 as unknown as string, newText: 'b' }],
+            },
+          },
+        ],
+      }),
+    ).toBe(false);
+  });
 });
 
 describe('protocol v9 workspacePatchBatch', () => {
