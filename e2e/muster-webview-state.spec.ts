@@ -9601,6 +9601,295 @@ test.describe('M019 S04 Doctor + runtime recovery', () => {
   });
 });
 
+test.describe('M019 S05 Assembled First Run', () => {
+  const checkedAt = '2026-07-26T18:00:00.000Z';
+
+  /** Harness noise: optional assets may 403/abort under vite without app impact. */
+  function isHarnessNoise(text: string): boolean {
+    return (
+      /403\s*\(Forbidden\)/i.test(text) ||
+      /Failed to load resource:.*403/i.test(text) ||
+      /favicon\.ico/i.test(text) ||
+      /codicon\.(ttf|woff2?|css)/i.test(text) ||
+      /@vscode\/codicons/i.test(text) ||
+      /net::ERR_ABORTED/i.test(text)
+    );
+  }
+
+  function fiveMissingSnapshot(correlationId = 'e2e-s05-missing') {
+    const backends = ['claude', 'grok', 'kiro', 'codex', 'opencode'].map((backendId) => ({
+      backendId,
+      state: 'missing',
+      code: 'executable_missing',
+      recoveryAction: 'install',
+      compatibility: 'unknown',
+      versionEvidence: null,
+      checkedAt,
+    }));
+    return {
+      schemaVersion: 1,
+      correlationId,
+      phase: 'settled',
+      checkedAt,
+      backends,
+    };
+  }
+
+  function oneInstalledUnverifiedSnapshot(correlationId = 'e2e-s05-unverified') {
+    const backends = ['claude', 'grok', 'kiro', 'codex', 'opencode'].map((backendId) => {
+      if (backendId === 'claude') {
+        return {
+          backendId,
+          state: 'installed_unverified',
+          code: 'version_unknown',
+          recoveryAction: 'retry',
+          compatibility: 'unknown',
+          versionEvidence: '1.0.0',
+          checkedAt,
+        };
+      }
+      return {
+        backendId,
+        state: 'missing',
+        code: 'executable_missing',
+        recoveryAction: 'install',
+        compatibility: 'unknown',
+        versionEvidence: null,
+        checkedAt,
+      };
+    });
+    return {
+      schemaVersion: 1,
+      correlationId,
+      phase: 'settled',
+      checkedAt,
+      backends,
+    };
+  }
+
+  function claudeReadySnapshot(correlationId = 'e2e-s05-ready') {
+    const base = oneInstalledUnverifiedSnapshot(correlationId);
+    return {
+      ...base,
+      backends: base.backends.map((record) =>
+        record.backendId === 'claude'
+          ? {
+              ...record,
+              state: 'ready',
+              code: 'none',
+              recoveryAction: 'none',
+              compatibility: 'compatible',
+              versionEvidence: '1.0.0',
+              checkedAt: '2026-07-26T18:00:02.000Z',
+            }
+          : record,
+      ),
+    };
+  }
+
+  test('assembled clean-profile: setup → ready backend → Doctor → first send; keyboard + 320px; no console/network errors', async ({
+    page,
+  }) => {
+    const consoleErrors: string[] = [];
+    const pageErrors: string[] = [];
+    const failedRequests: string[] = [];
+    page.on('console', (msg) => {
+      if (msg.type() !== 'error') return;
+      const text = msg.text();
+      if (isHarnessNoise(text)) return;
+      consoleErrors.push(text);
+    });
+    page.on('pageerror', (err) => {
+      pageErrors.push(String(err?.message ?? err));
+    });
+    page.on('requestfailed', (req) => {
+      const entry = `${req.method()} ${req.url()} ${req.failure()?.errorText ?? ''}`;
+      if (isHarnessNoise(entry) || /favicon\.ico/i.test(req.url())) return;
+      failedRequests.push(entry);
+    });
+
+    // Supportive browser proof only — not native Extension Host acceptance.
+    await openWebview(page, { backendReadiness: 'none' });
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [],
+      storeRevision: 1,
+    });
+
+    // 1) No-task setup: settled empty journey owns install step.
+    await postRawHostMessage(page, {
+      type: 'backendReadinessSnapshot',
+      snapshot: fiveMissingSnapshot(),
+    });
+    const journey = page.getByTestId('first-run-journey');
+    await expect(journey).toBeVisible();
+    await expect(journey).toHaveAttribute('data-active-step', 'install');
+    await expect(page.getByTestId('start-backend-probe')).toHaveCount(0);
+
+    // Keyboard: primary action is focusable and activates via Enter.
+    const primary = page.getByTestId('first-run-journey-primary');
+    await primary.focus();
+    await expect(primary).toBeFocused();
+    await primary.press('Enter');
+    await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+    await expect(page.getByTestId('settings-backends')).toBeVisible();
+    await expect(page.getByTestId('backend-row-claude')).toHaveAttribute(
+      'data-backend-state',
+      'missing',
+    );
+
+    // Refresh from Agents → Backends (keyboard-reachable control).
+    const refreshBtn = page.getByTestId('backends-refresh');
+    await refreshBtn.focus();
+    await expect(refreshBtn).toBeFocused();
+    const beforeRefresh = (await postedMessages(page)).length;
+    await refreshBtn.press('Enter');
+    await expect
+      .poll(async () =>
+        (await postedMessages(page))
+          .slice(beforeRefresh)
+          .some((m) => (m as { type?: string }).type === 'refreshBackendReadiness'),
+      )
+      .toBe(true);
+
+    // Host settles one installed_unverified; Test Connection available.
+    await postRawHostMessage(page, {
+      type: 'backendReadinessSnapshot',
+      snapshot: oneInstalledUnverifiedSnapshot(),
+    });
+    await expect(page.getByTestId('backend-row-claude')).toHaveAttribute(
+      'data-backend-state',
+      'installed_unverified',
+    );
+    const testBtn = page.getByTestId('backend-row-test-claude');
+    await expect(testBtn).toBeVisible();
+    await testBtn.focus();
+    await expect(testBtn).toBeFocused();
+
+    const beforeProbe = (await postedMessages(page)).length;
+    await testBtn.press('Enter');
+    let probeId: string | null = null;
+    await expect
+      .poll(async () => {
+        const msgs = (await postedMessages(page)).slice(beforeProbe);
+        const msg = msgs.find(
+          (m) => (m as { type?: string }).type === 'startBackendProbe',
+        ) as { probeId?: string; backendId?: string } | undefined;
+        probeId = msg?.probeId ?? null;
+        return msg?.backendId === 'claude' && typeof probeId === 'string';
+      })
+      .toBe(true);
+
+    await postRawHostMessage(page, {
+      type: 'backendProbeProgress',
+      progress: {
+        schemaVersion: 1,
+        probeId,
+        backendId: 'claude',
+        stage: 'version',
+        startedAt: '2026-07-26T18:00:01.000Z',
+      },
+    });
+    await expect(page.getByTestId('backend-row-progress-claude')).toContainText(/Checking version/i);
+
+    // Ready backend evidence on Agents → Backends.
+    await postRawHostMessage(page, {
+      type: 'backendReadinessSnapshot',
+      snapshot: claudeReadySnapshot(),
+    });
+    await expect(page.getByTestId('backend-row-claude')).toHaveAttribute(
+      'data-backend-state',
+      'ready',
+    );
+    await expect(page.getByTestId('backend-row-diagnostic-claude')).toContainText(/Claude is ready/i);
+
+    // 2) Doctor refresh-then-reveal focuses settings-backends on the ready snapshot.
+    await postRawHostMessage(page, {
+      type: 'backendReadinessSnapshot',
+      snapshot: claudeReadySnapshot('e2e-s05-doctor-refresh'),
+    });
+    await postRawHostMessage(page, {
+      type: 'revealBackendDiagnostics',
+    });
+    const backends = page.getByTestId('settings-backends');
+    await expect(backends).toBeVisible();
+    await expect.poll(async () => controlHasFocus(backends)).toBe(true);
+    await expect(page.getByTestId('backend-row-claude')).toHaveAttribute(
+      'data-backend-state',
+      'ready',
+    );
+
+    // Leave Settings; journey advances to first-task with ready evidence.
+    await page.getByRole('button', { name: /Back/i }).first().click();
+    await expect(page.getByTestId('first-run-journey')).toBeVisible();
+    await expect(page.getByTestId('first-run-journey')).toHaveAttribute(
+      'data-active-step',
+      'first-task',
+    );
+    await expect(page.getByTestId('first-run-journey-detail')).toContainText(/Claude is ready/i);
+
+    // 3) First accepted send posts selected ready backend (supportive browser path).
+    await page.getByTestId('first-run-journey-primary').click();
+    await expectPostedMessage(page, { type: 'newTask' });
+    const draftPicker = page.getByTestId('draft-model-picker');
+    await expect(draftPicker).toBeVisible();
+    await expect(draftPicker).not.toHaveAttribute('disabled', '');
+    await expect(page.getByTestId('start-backend-probe')).toHaveCount(0);
+    await expect(page.getByTestId('open-backend-setup')).toHaveCount(0);
+
+    const composer = page.getByPlaceholder(/Start a new coordinator task/i);
+    await composer.fill('Assembled first-run accepted send');
+    // Keyboard send: focus Send and activate with Enter.
+    const sendBtn = page.getByRole('button', { name: 'Send' });
+    await sendBtn.focus();
+    await expect(sendBtn).toBeFocused();
+    await sendBtn.press('Enter');
+    await expectPostedMessage(page, {
+      type: 'send',
+      text: 'Assembled first-run accepted send',
+      backend: 'claude',
+    });
+
+    // 4) 320px containment: reopen empty journey + Backends remains operable.
+    await page.getByRole('button', { name: 'Back to tasks list' }).click();
+    await page.setViewportSize({ width: 320, height: 720 });
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [],
+      storeRevision: 2,
+    });
+    await postRawHostMessage(page, {
+      type: 'backendReadinessSnapshot',
+      snapshot: oneInstalledUnverifiedSnapshot('e2e-s05-narrow'),
+    });
+    await expect(page.getByTestId('first-run-journey')).toBeVisible();
+    await page.getByTestId('first-run-journey-primary').click();
+    await expect(page.getByTestId('settings-backends')).toBeVisible();
+    await expect(page.getByTestId('backend-row-test-claude')).toBeVisible();
+    const backendsBox = await page.getByTestId('settings-backends').boundingBox();
+    expect(backendsBox).toBeTruthy();
+    expect(backendsBox!.width).toBeLessThanOrEqual(320);
+
+    // Doctor reveal still focuses at compact width.
+    await postRawHostMessage(page, {
+      type: 'revealBackendDiagnostics',
+    });
+    await expect.poll(async () => controlHasFocus(page.getByTestId('settings-backends'))).toBe(true);
+
+    // Negative surface: no app console/page errors and no failed non-harness requests.
+    expect(consoleErrors, `console errors: ${consoleErrors.join(' | ')}`).toEqual([]);
+    expect(pageErrors, `page errors: ${pageErrors.join(' | ')}`).toEqual([]);
+    expect(failedRequests, `failed requests: ${failedRequests.join(' | ')}`).toEqual([]);
+
+    // Posted host traffic must stay free of secrets and absolute paths.
+    const posted = await postedMessages(page);
+    const blob = JSON.stringify(posted);
+    expect(blob).not.toMatch(/sk-[A-Za-z0-9]{16,}/);
+    expect(blob).not.toMatch(/[A-Za-z]:\\/);
+    expect(blob).not.toMatch(/\/(?:Users|home)\/[^/\s]+/);
+  });
+});
+
 declare global {
   interface Window {
     acquireVsCodeApi: () => {

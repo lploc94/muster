@@ -110,6 +110,24 @@
       ],
       "snapshotPath": "e2e/visual/muster-presentation.visual.spec.ts-snapshots/V06-presentation-narrow-light.png",
       "fixtureFactory": "createStaticNarrowPresentationFixture"
+    },
+    {
+      "id": "V07-webview-first-run-backends-dark",
+      "owner": "m019-s05-webview",
+      "entrypoint": "webview",
+      "state": "first-run-agents-backends-ready",
+      "layout": "compact",
+      "viewport": {
+        "width": 320,
+        "height": 600
+      },
+      "theme": "dark",
+      "requirements": [
+        "M019-S05-first-run-backends",
+        "M019-S05-compact-320"
+      ],
+      "snapshotPath": "e2e/visual/muster-webview.visual.spec.ts-snapshots/M019-S05-first-run-backends-compact-dark.png",
+      "fixtureFactory": "createStaticFirstRunBackendsReadinessSnapshot"
     }
   ]
 }
