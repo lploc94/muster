@@ -9687,7 +9687,7 @@ test.describe('M019 S05 Assembled First Run', () => {
     };
   }
 
-  test('assembled clean-profile: setup → ready backend → Doctor → first send; keyboard + 320px; no console/network errors', async ({
+  test('assembled clean-profile: setup → ready backend → Doctor → first send; keyboard + 320px; Settings draft + sanitized diagnostics; no console/network errors', async ({
     page,
   }) => {
     const consoleErrors: string[] = [];
@@ -9738,6 +9738,30 @@ test.describe('M019 S05 Assembled First Run', () => {
       'missing',
     );
 
+    // Keep an unrelated Settings draft dirty through readiness operations.
+    await postRawHostMessage(page, {
+      type: 'taskTypesSettingsSnapshot',
+      snapshot: taskTypesOkSnapshot(),
+    });
+    const settingsDraft = page.locator('#tt-desc-0');
+    const settingsDirty = page.getByTestId('task-types-dirty');
+    await expect(settingsDraft).toBeVisible();
+    await settingsDraft.fill('Preserve through backend diagnostics');
+    await expect(settingsDirty).toBeVisible();
+    const expectSettingsDraftPreserved = async () => {
+      await expect(settingsDraft).toHaveValue('Preserve through backend diagnostics');
+      await expect(settingsDirty).toBeVisible();
+    };
+
+    // The Backends surface exposes named region/list/status/action semantics.
+    const backendsRegion = page.getByRole('region', { name: 'Backends' });
+    await expect(backendsRegion).toBeVisible();
+    await expect(backendsRegion.getByRole('list')).toBeVisible();
+    await expect(backendsRegion.getByRole('listitem', { name: /Claude/i })).toBeVisible();
+    await expect(
+      backendsRegion.getByRole('button', { name: 'Refresh backends' }),
+    ).toBeVisible();
+
     // Refresh from Agents → Backends (keyboard-reachable control).
     const refreshBtn = page.getByTestId('backends-refresh');
     await refreshBtn.focus();
@@ -9751,6 +9775,7 @@ test.describe('M019 S05 Assembled First Run', () => {
           .some((m) => (m as { type?: string }).type === 'refreshBackendReadiness'),
       )
       .toBe(true);
+    await expectSettingsDraftPreserved();
 
     // Host settles one installed_unverified; Test Connection available.
     await postRawHostMessage(page, {
@@ -9761,7 +9786,8 @@ test.describe('M019 S05 Assembled First Run', () => {
       'data-backend-state',
       'installed_unverified',
     );
-    const testBtn = page.getByTestId('backend-row-test-claude');
+    await expectSettingsDraftPreserved();
+    const testBtn = page.getByRole('button', { name: 'Test Connection for Claude' });
     await expect(testBtn).toBeVisible();
     await testBtn.focus();
     await expect(testBtn).toBeFocused();
@@ -9791,6 +9817,7 @@ test.describe('M019 S05 Assembled First Run', () => {
       },
     });
     await expect(page.getByTestId('backend-row-progress-claude')).toContainText(/Checking version/i);
+    await expectSettingsDraftPreserved();
 
     // Ready backend evidence on Agents → Backends.
     await postRawHostMessage(page, {
@@ -9802,6 +9829,58 @@ test.describe('M019 S05 Assembled First Run', () => {
       'ready',
     );
     await expect(page.getByTestId('backend-row-diagnostic-claude')).toContainText(/Claude is ready/i);
+    await expect(
+      backendsRegion.getByRole('status').filter({ hasText: /Claude is ready/i }),
+    ).toBeVisible();
+    await expectSettingsDraftPreserved();
+
+    // Unsafe version evidence must reject the whole candidate snapshot.
+    const unsafeVersionSnapshot = claudeReadySnapshot('e2e-s05-unsafe-version');
+    unsafeVersionSnapshot.backends = unsafeVersionSnapshot.backends.map((record) =>
+      record.backendId === 'claude'
+        ? {
+            ...record,
+            state: 'auth_required',
+            code: 'auth_required',
+            recoveryAction: 'login',
+            versionEvidence: 'sk-live-READINESS_SECRET_CANARY',
+          }
+        : record,
+    );
+    await postRawHostMessage(page, {
+      type: 'backendReadinessSnapshot',
+      snapshot: unsafeVersionSnapshot,
+    });
+    await expect(page.getByTestId('backend-row-claude')).toHaveAttribute(
+      'data-backend-state',
+      'ready',
+    );
+
+    // Extra stderr/prompt/path/store fields reject the whole snapshot too.
+    const extraFieldSnapshot = claudeReadySnapshot('e2e-s05-extra-fields');
+    extraFieldSnapshot.backends[0] = {
+      ...extraFieldSnapshot.backends[0],
+      state: 'auth_required',
+      code: 'auth_required',
+      recoveryAction: 'login',
+      stderr: 'RAW_STDERR_CANARY',
+      prompt: 'PROMPT_BODY_CANARY',
+      absolutePath: 'C:\\Users\\secret\\muster.db',
+      storeBody: 'STORE_BODY_CANARY',
+    } as never;
+    await postRawHostMessage(page, {
+      type: 'backendReadinessSnapshot',
+      snapshot: extraFieldSnapshot,
+    });
+    await expect(page.getByTestId('backend-row-claude')).toHaveAttribute(
+      'data-backend-state',
+      'ready',
+    );
+    const renderedBackends = await backendsRegion.evaluate((element) => element.outerHTML);
+    expect(renderedBackends).not.toMatch(
+      /READINESS_SECRET_CANARY|RAW_STDERR_CANARY|PROMPT_BODY_CANARY|STORE_BODY_CANARY|C:\\Users\\secret/,
+    );
+    await expectSettingsDraftPreserved();
 
     // 2) Doctor refresh-then-reveal focuses settings-backends on the ready snapshot.
     await postRawHostMessage(page, {
@@ -9818,6 +9897,7 @@ test.describe('M019 S05 Assembled First Run', () => {
       'data-backend-state',
       'ready',
     );
+    await expectSettingsDraftPreserved();
 
     // Leave Settings; journey advances to first-task with ready evidence.
     await page.getByRole('button', { name: /Back/i }).first().click();
@@ -9866,6 +9946,7 @@ test.describe('M019 S05 Assembled First Run', () => {
     await page.getByTestId('first-run-journey-primary').click();
     await expect(page.getByTestId('settings-backends')).toBeVisible();
     await expect(page.getByTestId('backend-row-test-claude')).toBeVisible();
+    await expectSettingsDraftPreserved();
     const backendsBox = await page.getByTestId('settings-backends').boundingBox();
     expect(backendsBox).toBeTruthy();
     expect(backendsBox!.width).toBeLessThanOrEqual(320);

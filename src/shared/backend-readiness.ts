@@ -156,8 +156,24 @@ const PASSIVELY_SELECTABLE_STATES = new Set<BackendReadinessState>([
 const ISO_TIMESTAMP =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
 
+/**
+ * Closed display grammar for provider version evidence.
+ * Matches the host extractor and rejects arbitrary short strings that could
+ * carry stderr, prompts, paths, store content, or secret material.
+ */
+const VERSION_EVIDENCE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
+
 export function isBackendReadinessId(value: unknown): value is BackendReadinessId {
   return typeof value === 'string' && BACKEND_ID_SET.has(value);
+}
+
+export function isBackendVersionEvidence(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= BACKEND_READINESS_VERSION_EVIDENCE_MAX &&
+    VERSION_EVIDENCE.test(value)
+  );
 }
 
 /**
@@ -240,11 +256,7 @@ function parseRecord(raw: unknown, expectedId: BackendReadinessId): BackendReadi
   let versionEvidence: string | null;
   if (record.versionEvidence === null) {
     versionEvidence = null;
-  } else if (
-    typeof record.versionEvidence === 'string' &&
-    record.versionEvidence.length > 0 &&
-    record.versionEvidence.length <= BACKEND_READINESS_VERSION_EVIDENCE_MAX
-  ) {
+  } else if (isBackendVersionEvidence(record.versionEvidence)) {
     versionEvidence = record.versionEvidence;
   } else {
     return null;

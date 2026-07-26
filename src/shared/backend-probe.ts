@@ -10,8 +10,8 @@
  */
 
 import {
-  BACKEND_READINESS_VERSION_EVIDENCE_MAX,
   isBackendReadinessId,
+  isBackendVersionEvidence,
   isPassivelySelectable,
   type BackendCompatibilityStatus,
   type BackendReadinessCode,
@@ -241,11 +241,7 @@ export function parseBackendProbeResult(raw: unknown): BackendProbeResult | null
   let versionEvidence: string | null;
   if (res.versionEvidence === null) {
     versionEvidence = null;
-  } else if (
-    typeof res.versionEvidence === 'string' &&
-    res.versionEvidence.length > 0 &&
-    res.versionEvidence.length <= BACKEND_READINESS_VERSION_EVIDENCE_MAX
-  ) {
+  } else if (isBackendVersionEvidence(res.versionEvidence)) {
     versionEvidence = res.versionEvidence;
   } else {
     return null;

@@ -211,13 +211,26 @@ describe('parseBackendProbeResult', () => {
     expect(parseBackendProbeResult(validResult({ backendId: 'gemini' as 'claude' }))).toBeNull();
   });
 
-  it('rejects empty/overlong probeId and overlong versionEvidence', () => {
+  it('rejects empty/overlong probeId and unsafe versionEvidence', () => {
     expect(parseBackendProbeResult(validResult({ probeId: '' }))).toBeNull();
     expect(
       parseBackendProbeResult(validResult({ probeId: 'p'.repeat(BACKEND_PROBE_ID_MAX + 1) })),
     ).toBeNull();
-    expect(parseBackendProbeResult(validResult({ versionEvidence: 'v'.repeat(65) }))).toBeNull();
-    expect(parseBackendProbeResult(validResult({ versionEvidence: '' }))).toBeNull();
+
+    for (const versionEvidence of [
+      '',
+      'v'.repeat(65),
+      'sk-live-READINESS_SECRET_CANARY',
+      'RAW_STDERR_CANARY',
+      'PROMPT_BODY_CANARY',
+      'C:\\Users\\secret\\muster.db',
+      'STORE_BODY_CANARY',
+    ]) {
+      expect(
+        parseBackendProbeResult(validResult({ versionEvidence })),
+        `versionEvidence=${versionEvidence}`,
+      ).toBeNull();
+    }
   });
 
   it('rejects malformed timestamp, wrong schema, non-boolean modelCatalogAvailable, extra keys', () => {

@@ -366,19 +366,33 @@ describe('parseBackendReadinessSnapshot', () => {
     expect(parseBackendReadinessSnapshot(settledSnapshot(badEvidence))).toBeNull();
   });
 
-  it('rejects empty string versionEvidence (use null)', () => {
-    const emptyEvidence = fiveMissing();
-    emptyEvidence[0] = {
-      ...emptyEvidence[0],
-      state: 'installed_unverified',
-      code: 'version_unknown',
-      recoveryAction: 'retry',
-      versionEvidence: '',
-    };
-    expect(parseBackendReadinessSnapshot(settledSnapshot(emptyEvidence))).toBeNull();
+  it('rejects empty or non-version versionEvidence (use null)', () => {
+    const unsafeEvidence = [
+      '',
+      'sk-live-READINESS_SECRET_CANARY',
+      'RAW_STDERR_CANARY',
+      'PROMPT_BODY_CANARY',
+      'C:\\Users\\secret\\muster.db',
+      'STORE_BODY_CANARY',
+    ];
+
+    for (const versionEvidence of unsafeEvidence) {
+      const backends = fiveMissing();
+      backends[0] = {
+        ...backends[0],
+        state: 'installed_unverified',
+        code: 'version_unknown',
+        recoveryAction: 'retry',
+        versionEvidence,
+      };
+      expect(
+        parseBackendReadinessSnapshot(settledSnapshot(backends)),
+        `versionEvidence=${versionEvidence}`,
+      ).toBeNull();
+    }
   });
 
-  it('accepts null versionEvidence and bounded evidence strings', () => {
+  it('accepts null versionEvidence and bounded semver-like evidence strings', () => {
     const backends = fiveMissing();
     backends[0] = {
       ...backends[0],
