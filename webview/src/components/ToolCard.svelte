@@ -40,6 +40,12 @@
   const fileChanges = $derived(
     tool.fileChanges && tool.fileChanges.length > 0 ? tool.fileChanges : undefined,
   );
+  /** Present only when the engine hit the file-count bound (never 0 / never empty chrome). */
+  const fileChangesOmitted = $derived(
+    typeof tool.fileChangesOmitted === 'number' && tool.fileChangesOmitted > 0
+      ? tool.fileChangesOmitted
+      : undefined,
+  );
   /** Expandable when params/result/error OR structured diff evidence is present. */
   const hasDetails = $derived(
     tool.input !== undefined ||
@@ -89,8 +95,26 @@
 {#each removed as line}<span class="tool-card__diff-line tool-card__diff-line--removed">-{line}
 </span>{/each}{#each added as line}<span class="tool-card__diff-line tool-card__diff-line--added">+{line}
 </span>{/each}</pre>
+          {#if change.truncated}
+            <div
+              class="tool-card__diff-truncated"
+              role="status"
+              aria-label="Diff truncated"
+            >
+              Diff truncated — full text exceeded the per-side bound
+            </div>
+          {/if}
         </div>
       {/each}
+      {#if fileChangesOmitted !== undefined}
+        <div
+          class="tool-card__diff-omitted"
+          role="status"
+          aria-label="File changes omitted"
+        >
+          {fileChangesOmitted} additional file{fileChangesOmitted === 1 ? '' : 's'} omitted
+        </div>
+      {/if}
     </div>
   {/if}
 
@@ -157,5 +181,17 @@
       var(--vscode-testing-iconPassed, var(--vscode-charts-green, #89d185)) 12%,
       transparent
     );
+  }
+
+  /* Honest bound markers (M020 S02) — description tone, not error chrome. */
+  .tool-card__diff-truncated,
+  .tool-card__diff-omitted {
+    color: var(--vscode-descriptionForeground);
+    font-size: 10px;
+    margin-top: 0.25rem;
+  }
+
+  .tool-card__diff-omitted {
+    margin-top: 0.5rem;
   }
 </style>

@@ -10074,6 +10074,136 @@ test.describe('M019 S05 Assembled First Run', () => {
     await expect(card.getByText('params:')).toBeVisible();
     await expect(card.getByText('result:')).toBeVisible();
   });
+
+  test('M020 S02 bounds: multi-file diffs render every path', async ({ page }) => {
+    await openWebview(page);
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-multi', goal: 'Edit three files' })],
+      focusedTaskId: 'task-multi',
+      subtree: [task({ id: 'task-multi', goal: 'Edit three files' })],
+      transcript: [
+        {
+          id: 'tool-multi-1',
+          kind: 'tool',
+          turnId: 'turn-multi',
+          order: 0,
+          content: {
+            toolCallId: 'tc-multi-1',
+            name: 'Edit',
+            toolKind: 'builtin',
+            status: 'success',
+            fileChanges: [
+              { path: 'src/a.ts', oldText: 'a-old\n', newText: 'a-new\n' },
+              { path: 'src/b.ts', oldText: 'b-old\n', newText: 'b-new\n' },
+              { path: 'src/c.ts', oldText: null, newText: 'c-new\n' },
+            ],
+          },
+        },
+      ],
+      storeRevision: 1,
+    });
+
+    const card = page.locator('.tool-card').filter({ hasText: 'Edit' });
+    await expect(card).toBeVisible();
+    await expect(card.getByText('src/a.ts')).toBeVisible();
+    await expect(card.getByText('src/b.ts')).toBeVisible();
+    await expect(card.getByText('src/c.ts')).toBeVisible();
+    await expect(card.locator('.tool-card__diff-file')).toHaveCount(3);
+    // No truncation/omission chrome when bounds were not hit.
+    await expect(card.locator('.tool-card__diff-truncated')).toHaveCount(0);
+    await expect(card.locator('.tool-card__diff-omitted')).toHaveCount(0);
+  });
+
+  test('M020 S02 bounds: truncated fileChange shows honest marker', async ({ page }) => {
+    await openWebview(page);
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-trunc', goal: 'Huge edit' })],
+      focusedTaskId: 'task-trunc',
+      subtree: [task({ id: 'task-trunc', goal: 'Huge edit' })],
+      transcript: [
+        {
+          id: 'tool-trunc-1',
+          kind: 'tool',
+          turnId: 'turn-trunc',
+          order: 0,
+          content: {
+            toolCallId: 'tc-trunc-1',
+            name: 'Edit',
+            toolKind: 'builtin',
+            status: 'success',
+            fileChanges: [
+              {
+                path: 'src/big.ts',
+                oldText: 'line-old\n… truncated',
+                newText: 'line-new\n… truncated',
+                truncated: true,
+              },
+            ],
+          },
+        },
+      ],
+      storeRevision: 1,
+    });
+
+    const card = page.locator('.tool-card').filter({ hasText: 'Edit' });
+    await expect(card).toBeVisible();
+    await expect(card.getByText('src/big.ts')).toBeVisible();
+    // Dedicated marker (not only the text suffix buried in the pre).
+    const marker = card.locator('.tool-card__diff-truncated');
+    await expect(marker).toHaveCount(1);
+    await expect(marker).toBeVisible();
+    await expect(marker).toContainText(/truncated/i);
+    // Content-only chrome still absent on a pure evidence tool.
+    await expect(card.locator('.tool-card__diff-omitted')).toHaveCount(0);
+  });
+
+  test('M020 S02 bounds: omitted-file count is honest and visible', async ({ page }) => {
+    await openWebview(page);
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-omit', goal: 'Many files' })],
+      focusedTaskId: 'task-omit',
+      subtree: [task({ id: 'task-omit', goal: 'Many files' })],
+      transcript: [
+        {
+          id: 'tool-omit-1',
+          kind: 'tool',
+          turnId: 'turn-omit',
+          order: 0,
+          content: {
+            toolCallId: 'tc-omit-1',
+            name: 'MultiEdit',
+            toolKind: 'builtin',
+            status: 'success',
+            fileChanges: [
+              { path: 'src/kept-1.ts', oldText: null, newText: 'one\n' },
+              { path: 'src/kept-2.ts', oldText: null, newText: 'two\n' },
+            ],
+            fileChangesOmitted: 5,
+          },
+        },
+      ],
+      storeRevision: 1,
+    });
+
+    const card = page.locator('.tool-card').filter({ hasText: 'MultiEdit' });
+    await expect(card).toBeVisible();
+    await expect(card.getByText('src/kept-1.ts')).toBeVisible();
+    await expect(card.getByText('src/kept-2.ts')).toBeVisible();
+
+    const omitted = card.locator('.tool-card__diff-omitted');
+    await expect(omitted).toHaveCount(1);
+    await expect(omitted).toBeVisible();
+    await expect(omitted).toContainText(/5/);
+    await expect(omitted).toContainText(/omitted/i);
+    // Truncation chrome only when truncated:true is set on an entry.
+    await expect(card.locator('.tool-card__diff-truncated')).toHaveCount(0);
+  });
 });
 
 declare global {
