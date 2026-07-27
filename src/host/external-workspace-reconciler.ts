@@ -7,11 +7,11 @@ import type { RepositoryProjection } from '../task/repository-projection';
 import { snapshotProjectionBefore } from '../task/repository-projection';
 import type {
   PersistedReasoning,
-  PersistedToolCall,
   TaskMessage,
   EngineProjection,
 } from '../task/types';
 import {
+  projectPersistedToolCall,
   projectQueuedTurns,
   projectTaskSummary,
   type TranscriptItem,
@@ -383,7 +383,7 @@ export function projectExternalWorkspacePatches(args: {
     for (const id of focusedToolIds) {
       const tool = after.toolCalls?.[id];
       if (!tool || tool.taskId !== focusedTaskId) continue;
-      pushItem(toolToItem(tool));
+      pushItem(projectPersistedToolCall(tool));
     }
     for (const id of focusedReasoningIds) {
       const segment = after.reasoning?.[id];
@@ -458,24 +458,6 @@ function messageToItem(
     ...(resolvedTurnId !== undefined ? { turnId: resolvedTurnId } : {}),
     ...(message.order !== undefined ? { order: message.order } : {}),
     ...(message.state !== undefined ? { state: message.state } : {}),
-  };
-}
-
-function toolToItem(tool: PersistedToolCall): TranscriptItem {
-  return {
-    id: tool.id,
-    kind: 'tool',
-    turnId: tool.turnId,
-    order: tool.order,
-    content: {
-      toolCallId: tool.toolCallId,
-      name: tool.name,
-      ...(tool.kind ? { toolKind: tool.kind } : {}),
-      status: tool.status,
-      ...(tool.input !== undefined ? { input: tool.input } : {}),
-      ...(tool.output !== undefined ? { output: tool.output } : {}),
-      ...(tool.error !== undefined ? { error: tool.error } : {}),
-    },
   };
 }
 

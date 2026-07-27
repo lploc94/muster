@@ -407,6 +407,113 @@ describe('external workspace reconciler', () => {
     }
   }, 30_000);
 
+  it('preserves tool file evidence when reconciling a peer transcript commit', async () => {
+    const pair = await openPair();
+    try {
+      const task = makeTask('tool-focus');
+      await pair.a.execute({ kind: 'createTask', workspaceId: 'ws', task });
+      await pair.a.execute({
+        kind: 'createTurn',
+        workspaceId: 'ws',
+        turn: {
+          id: 'tool-turn',
+          taskId: task.id,
+          sequence: 1,
+          status: 'running',
+          trigger: 'user',
+          inputs: [],
+          createdAt: '2026-07-16T00:00:01.000Z',
+        },
+      });
+      const projectionB = await RepositoryProjection.load(pair.b, 'ws');
+      const afterTurn = await pair.a.getWorkspaceRevision();
+      await pair.a.execute({
+        kind: 'appendTranscriptBatch',
+        workspaceId: 'ws',
+        taskId: task.id,
+        toolCalls: [
+          {
+            id: 'tool-evidence',
+            taskId: task.id,
+            turnId: 'tool-turn',
+            toolCallId: 'call-evidence',
+            order: 1,
+            name: 'Edit',
+            kind: 'mcp',
+            status: 'success',
+            fileChanges: [
+              { path: 'src/peer.ts', oldText: 'before', newText: 'after', truncated: true },
+            ],
+            fileChangesOmitted: 5,
+            createdAt: '2026-07-16T00:00:02.000Z',
+            updatedAt: '2026-07-16T00:00:02.000Z',
+          },
+          {
+            id: 'tool-plain',
+            taskId: task.id,
+            turnId: 'tool-turn',
+            toolCallId: 'call-plain',
+            order: 2,
+            name: 'Read',
+            status: 'success',
+            createdAt: '2026-07-16T00:00:03.000Z',
+            updatedAt: '2026-07-16T00:00:03.000Z',
+          },
+        ],
+      });
+
+      const result = await reconcileExternalWorkspaceChanges({
+        repository: pair.b,
+        projection: projectionB,
+        afterRevision: afterTurn,
+        focusedTaskId: task.id,
+        knownTranscriptIds: new Set(['tool-plain']),
+      });
+      expect(result.kind).toBe('batches');
+      if (result.kind !== 'batches') return;
+      const final = result.batches.at(-1)!;
+      expect(final.patches).toContainEqual({
+        type: 'transcriptItemsAppended',
+        taskId: task.id,
+        items: [
+          {
+            id: 'tool-evidence',
+            kind: 'tool',
+            turnId: 'tool-turn',
+            order: 1,
+            content: {
+              toolCallId: 'call-evidence',
+              name: 'Edit',
+              toolKind: 'mcp',
+              status: 'success',
+              fileChanges: [
+                { path: 'src/peer.ts', oldText: 'before', newText: 'after', truncated: true },
+              ],
+              fileChangesOmitted: 5,
+            },
+          },
+        ],
+      });
+      expect(final.patches).toContainEqual({
+        type: 'transcriptItemPatched',
+        taskId: task.id,
+        item: {
+          id: 'tool-plain',
+          kind: 'tool',
+          turnId: 'tool-turn',
+          order: 2,
+          content: {
+            toolCallId: 'call-plain',
+            name: 'Read',
+            status: 'success',
+          },
+        },
+      });
+    } finally {
+      await pair.close();
+    }
+  }, 30_000);
+
   it('returns gap after prune and does not invent patches', async () => {
     const pair = await openPair(2);
     try {

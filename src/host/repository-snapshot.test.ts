@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import {
   BOOTSTRAP_TRANSCRIPT_LIMIT,
   buildRepositorySnapshot,
+  toHostTranscriptItem,
 } from './repository-snapshot';
 import { SqliteTaskRepository } from '../task/repository';
 import { DbClient } from '../task/sqlite/client';
@@ -168,6 +169,113 @@ describe('buildRepositorySnapshot', () => {
       });
     });
   }, 20_000);
+
+  it('preserves persisted tool file evidence through the bounded repository transcript page', async () => {
+    await withRepo('repository-snapshot-tool-evidence', async (repo) => {
+      const focused = task('tool-focus');
+      await repo.execute({ kind: 'createTask', workspaceId: 'ws', task: focused });
+      await repo.execute({
+        kind: 'createTurn',
+        workspaceId: 'ws',
+        turn: makeTurn('tool-turn', focused.id, 1, 'succeeded'),
+      });
+      await repo.execute({
+        kind: 'appendTranscriptBatch',
+        workspaceId: 'ws',
+        taskId: focused.id,
+        toolCalls: [
+          {
+            id: 'tool-evidence',
+            taskId: focused.id,
+            turnId: 'tool-turn',
+            toolCallId: 'call-evidence',
+            order: 1,
+            name: 'Edit',
+            kind: 'mcp',
+            status: 'success',
+            fileChanges: [
+              { path: 'src/a.ts', oldText: 'before', newText: 'after', truncated: true },
+              { path: 'src/b.ts', oldText: null, newText: 'created' },
+            ],
+            fileChangesOmitted: 3,
+            createdAt: '2026-07-17T00:00:02.000Z',
+            updatedAt: '2026-07-17T00:00:02.000Z',
+          },
+          {
+            id: 'tool-plain',
+            taskId: focused.id,
+            turnId: 'tool-turn',
+            toolCallId: 'call-plain',
+            order: 2,
+            name: 'Read',
+            status: 'success',
+            createdAt: '2026-07-17T00:00:03.000Z',
+            updatedAt: '2026-07-17T00:00:03.000Z',
+          },
+        ],
+      });
+
+      const projection = await buildRepositorySnapshot(repo, 'ws', focused.id, new Map());
+      expect(projection.snapshot.transcript).toStrictEqual([
+        {
+          id: 'tool-evidence',
+          kind: 'tool',
+          turnId: 'tool-turn',
+          order: 1,
+          content: {
+            toolCallId: 'call-evidence',
+            name: 'Edit',
+            toolKind: 'mcp',
+            status: 'success',
+            fileChanges: [
+              { path: 'src/a.ts', oldText: 'before', newText: 'after', truncated: true },
+              { path: 'src/b.ts', oldText: null, newText: 'created' },
+            ],
+            fileChangesOmitted: 3,
+          },
+        },
+        {
+          id: 'tool-plain',
+          kind: 'tool',
+          turnId: 'tool-turn',
+          order: 2,
+          content: {
+            toolCallId: 'call-plain',
+            name: 'Read',
+            status: 'success',
+          },
+        },
+      ]);
+    });
+  }, 20_000);
+
+  it('accepts legacy repository toolKind content while preferring persisted kind', () => {
+    const base = {
+      id: 'legacy-tool',
+      kind: 'tool' as const,
+      turnId: 'turn-1',
+      order: 1,
+    };
+    expect(toHostTranscriptItem({
+      ...base,
+      content: {
+        toolCallId: 'call-1',
+        name: 'Read',
+        status: 'success',
+        toolKind: 'builtin',
+      },
+    })).toMatchObject({ content: { toolKind: 'builtin' } });
+    expect(toHostTranscriptItem({
+      ...base,
+      content: {
+        toolCallId: 'call-1',
+        name: 'Read',
+        status: 'success',
+        kind: 'mcp',
+        toolKind: 'builtin',
+      },
+    })).toMatchObject({ content: { toolKind: 'mcp' } });
+  });
 
   it('retries the bounded read when a workspace revision changes mid-snapshot', async () => {
     await withRepo('repository-snapshot-stable-retry', async (repo) => {

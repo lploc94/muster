@@ -1,4 +1,5 @@
 import type { Question } from '../bridge/ask-bridge';
+import { boundToolFileChanges } from '../shared/tool-file-changes';
 import { deriveRuntimeActivity, deriveViewStatus } from '../task/derived-status';
 import { prerequisitesBlockTask } from '../task/scheduler';
 import {
@@ -16,6 +17,7 @@ import type {
   TaskRole,
   TaskRuntimeActivity,
   EngineProjection,
+  PersistedToolCall,
   TaskTurn,
   TaskViewStatus,
 } from '../task/types';
@@ -123,6 +125,47 @@ export type TranscriptItem =
     }
   | { id: string; kind: 'tool'; turnId: string; order: number; content: ToolTranscriptContent }
   | { id: string; kind: 'reasoning'; turnId: string; order: number; content: string };
+
+/**
+ * Canonical persisted-tool projector for every host transcript surface.
+ * Optional fields remain absent rather than crossing the wire as undefined,
+ * and empty/zero bounded-evidence metadata is omitted by contract.
+ */
+export function projectPersistedToolCall(
+  tool: PersistedToolCall,
+): Extract<TranscriptItem, { kind: 'tool' }> {
+  // Rows written by older protocol versions may satisfy their historical bounds
+  // but violate the current webview contract. Canonicalize again at the shared
+  // host projector so one legacy row cannot poison an entire snapshot/page.
+  const rebound =
+    tool.fileChanges !== undefined ? boundToolFileChanges(tool.fileChanges) : {};
+  const priorOmitted =
+    typeof tool.fileChangesOmitted === 'number' &&
+    Number.isSafeInteger(tool.fileChangesOmitted) &&
+    tool.fileChangesOmitted > 0
+      ? tool.fileChangesOmitted
+      : 0;
+  const newlyOmitted = rebound.fileChangesOmitted ?? 0;
+  const omitted = Math.min(Number.MAX_SAFE_INTEGER, priorOmitted + newlyOmitted);
+
+  return {
+    id: tool.id,
+    kind: 'tool',
+    turnId: tool.turnId,
+    order: tool.order,
+    content: {
+      toolCallId: tool.toolCallId,
+      name: tool.name,
+      ...(tool.kind !== undefined ? { toolKind: tool.kind } : {}),
+      status: tool.status,
+      ...(tool.input !== undefined ? { input: tool.input } : {}),
+      ...(tool.output !== undefined ? { output: tool.output } : {}),
+      ...(tool.error !== undefined ? { error: tool.error } : {}),
+      ...(rebound.fileChanges !== undefined ? { fileChanges: rebound.fileChanges } : {}),
+      ...(omitted > 0 ? { fileChangesOmitted: omitted } : {}),
+    },
+  };
+}
 
 /**
  * Authoritative queued follow-up turn projection for S03 edit/delete and S04
@@ -513,27 +556,7 @@ export function buildTranscript(file: EngineProjection, taskId: string): Transcr
     }
     const seq = seqOf.has(tc.turnId) ? seqOf.get(tc.turnId)! : UNBOUND_TURN_SEQUENCE;
     entries.push({
-      item: {
-        id: tc.id,
-        kind: 'tool',
-        turnId: tc.turnId,
-        order: tc.order,
-        content: {
-          toolCallId: tc.toolCallId,
-          name: tc.name,
-          toolKind: tc.kind,
-          status: tc.status,
-          input: tc.input,
-          output: tc.output,
-          error: tc.error,
-          ...(tc.fileChanges !== undefined && tc.fileChanges.length > 0
-            ? { fileChanges: tc.fileChanges }
-            : {}),
-          ...(tc.fileChangesOmitted !== undefined && tc.fileChangesOmitted > 0
-            ? { fileChangesOmitted: tc.fileChangesOmitted }
-            : {}),
-        },
-      },
+      item: projectPersistedToolCall(tc),
       key: { turnSequence: seq, kindRank: KIND_RANK.tool, ordering: tc.order, createdAt: tc.createdAt, entityId: tc.id },
     });
   }

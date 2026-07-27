@@ -8,6 +8,7 @@ import {
   findOwningRoot,
   owningRootMembershipChanged,
   projectCurrentTurnActivity,
+  projectPersistedToolCall,
   projectQueuedTurns,
   projectTaskSummary,
   type PendingAskOverlay,
@@ -81,6 +82,106 @@ function storeFrom(file: EngineProjection): TaskReadPort {
 }
 
 describe('host task snapshot projection', () => {
+  it('re-bounds legacy persisted evidence before it crosses protocol v11', () => {
+    const projected = projectPersistedToolCall({
+      id: 'legacy',
+      taskId: 't1',
+      turnId: 'turn1',
+      toolCallId: 'legacy-call',
+      order: 1,
+      name: 'Edit',
+      status: 'success',
+      fileChanges: [
+        { path: '../outside.ts', oldText: 'old', newText: 'unsafe' },
+        { path: 'src/safe.ts', oldText: 'a', newText: 'é'.repeat(100_000) },
+      ],
+      fileChangesOmitted: 2,
+      createdAt: '2026-07-06T00:00:01.000Z',
+      updatedAt: '2026-07-06T00:00:01.000Z',
+    });
+
+    expect(projected.content.fileChanges).toHaveLength(1);
+    expect(projected.content.fileChanges?.[0]).toMatchObject({
+      path: 'src/safe.ts',
+      truncated: true,
+    });
+    expect(projected.content.fileChanges?.[0]?.newText).not.toContain('�');
+    expect(projected.content.fileChangesOmitted).toBe(3);
+  });
+
+  it('rebuilds tool transcript items with bounded file evidence and no absent optional fields', () => {
+    const file: EngineProjection = {
+      schemaVersion: 6,
+      revision: 1,
+      tasks: { t1: task('t1') },
+      turns: {
+        turn1: turn({ id: 'turn1', taskId: 't1', status: 'succeeded', sequence: 1 }),
+      },
+      messages: {},
+      toolCalls: {
+        evidence: {
+          id: 'evidence',
+          taskId: 't1',
+          turnId: 'turn1',
+          toolCallId: 'call-evidence',
+          order: 1,
+          name: 'Edit',
+          kind: 'builtin',
+          status: 'success',
+          fileChanges: [
+            { path: 'src/a.ts', oldText: 'before', newText: 'after', truncated: true },
+            { path: 'src/b.ts', oldText: null, newText: 'created' },
+          ],
+          fileChangesOmitted: 4,
+          createdAt: '2026-07-06T00:00:01.000Z',
+          updatedAt: '2026-07-06T00:00:01.000Z',
+        },
+        plain: {
+          id: 'plain',
+          taskId: 't1',
+          turnId: 'turn1',
+          toolCallId: 'call-plain',
+          order: 2,
+          name: 'Read',
+          status: 'success',
+          createdAt: '2026-07-06T00:00:02.000Z',
+          updatedAt: '2026-07-06T00:00:02.000Z',
+        },
+      },
+      reasoning: {},
+    };
+
+    const transcript = buildTranscript(file, 't1');
+    expect(transcript[0]).toStrictEqual({
+      id: 'evidence',
+      kind: 'tool',
+      turnId: 'turn1',
+      order: 1,
+      content: {
+        toolCallId: 'call-evidence',
+        name: 'Edit',
+        toolKind: 'builtin',
+        status: 'success',
+        fileChanges: [
+          { path: 'src/a.ts', oldText: 'before', newText: 'after', truncated: true },
+          { path: 'src/b.ts', oldText: null, newText: 'created' },
+        ],
+        fileChangesOmitted: 4,
+      },
+    });
+    expect(transcript[1]).toStrictEqual({
+      id: 'plain',
+      kind: 'tool',
+      turnId: 'turn1',
+      order: 2,
+      content: {
+        toolCallId: 'call-plain',
+        name: 'Read',
+        status: 'success',
+      },
+    });
+  });
+
   it('renders a human-readable configured run timeout reason', () => {
     const file: EngineProjection = {
       schemaVersion: 6,

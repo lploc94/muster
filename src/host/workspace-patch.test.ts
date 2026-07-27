@@ -160,6 +160,93 @@ describe('projectWorkspacePatches', () => {
     expect(patched[0]).toMatchObject({ type: 'transcriptItemPatched', item: { id: 'a1' } });
   });
 
+  it('preserves tool file evidence in local transcript append and patch projections', () => {
+    const before = emptyFile(1);
+    before.tasks['t1'] = task('t1');
+    const after = emptyFile(2);
+    after.tasks['t1'] = task('t1');
+    const command: RepositoryCommand = {
+      kind: 'appendTranscriptBatch',
+      workspaceId: 'ws',
+      taskId: 't1',
+      toolCalls: [
+        {
+          id: 'tool-new',
+          taskId: 't1',
+          turnId: 'turn-1',
+          toolCallId: 'call-new',
+          order: 1,
+          name: 'Edit',
+          kind: 'builtin',
+          status: 'success',
+          fileChanges: [
+            { path: 'src/new.ts', oldText: null, newText: 'created', truncated: true },
+          ],
+          fileChangesOmitted: 2,
+          createdAt: '2026-07-06T00:00:01.000Z',
+          updatedAt: '2026-07-06T00:00:01.000Z',
+        },
+        {
+          id: 'tool-known',
+          taskId: 't1',
+          turnId: 'turn-1',
+          toolCallId: 'call-known',
+          order: 2,
+          name: 'Read',
+          status: 'success',
+          createdAt: '2026-07-06T00:00:02.000Z',
+          updatedAt: '2026-07-06T00:00:02.000Z',
+        },
+      ],
+    };
+
+    const patches = projectWorkspacePatches({
+      command,
+      result: { ok: true, changed: true },
+      before,
+      after,
+      focusedTaskId: 't1',
+      knownTranscriptIds: new Set(['tool-known']),
+    });
+    expect(patches).toContainEqual({
+      type: 'transcriptItemsAppended',
+      taskId: 't1',
+      items: [
+        {
+          id: 'tool-new',
+          kind: 'tool',
+          turnId: 'turn-1',
+          order: 1,
+          content: {
+            toolCallId: 'call-new',
+            name: 'Edit',
+            toolKind: 'builtin',
+            status: 'success',
+            fileChanges: [
+              { path: 'src/new.ts', oldText: null, newText: 'created', truncated: true },
+            ],
+            fileChangesOmitted: 2,
+          },
+        },
+      ],
+    });
+    expect(patches).toContainEqual({
+      type: 'transcriptItemPatched',
+      taskId: 't1',
+      item: {
+        id: 'tool-known',
+        kind: 'tool',
+        turnId: 'turn-1',
+        order: 2,
+        content: {
+          toolCallId: 'call-known',
+          name: 'Read',
+          status: 'success',
+        },
+      },
+    });
+  });
+
   it('queued follow-up enqueue does not append transcript', () => {
     const before = emptyFile(1);
     before.tasks['t1'] = task('t1');
