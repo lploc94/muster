@@ -61,22 +61,64 @@ describe('countDiffLines', () => {
 });
 
 describe('sanitizeDomIdPart', () => {
-  it('replaces characters outside [A-Za-z0-9_-] with -', () => {
-    expect(sanitizeDomIdPart('turn:producer/abc')).toBe('turn-producer-abc');
+  it('encodes punctuation injectively instead of collapsing distinct ids', () => {
+    expect(sanitizeDomIdPart('turn:producer/abc')).not.toBe(
+      sanitizeDomIdPart('turn/producer:abc'),
+    );
   });
 
-  it('falls back to tool when result is empty', () => {
-    // All-punctuation input becomes dashes (not empty); only truly empty falls back.
-    expect(sanitizeDomIdPart(':::')).toBe('---');
-    expect(sanitizeDomIdPart('')).toBe('tool');
+  it('returns a non-empty selector-safe encoding for every string', () => {
+    expect(sanitizeDomIdPart('')).toMatch(/^u[0-9a-f]*$/);
+    expect(sanitizeDomIdPart('tool_call-1')).toMatch(/^u[0-9a-f]+$/);
+    expect(sanitizeDomIdPart('🛠️')).toMatch(/^u[0-9a-f]+$/);
   });
 
-  it('preserves alphanumerics underscores and hyphens', () => {
-    expect(sanitizeDomIdPart('tool_call-1')).toBe('tool_call-1');
+  it('is stable for the same exact input', () => {
+    expect(sanitizeDomIdPart('tool_call-1')).toBe(sanitizeDomIdPart('tool_call-1'));
   });
 });
 
 describe('buildToolDiffView', () => {
+  it('models unchanged context once and counts only changed line operations', () => {
+    const view = buildToolDiffView({
+      toolCallId: 'tc-exact',
+      fileChanges: [
+        change(
+          'src/exact.ts',
+          'const shared = true;\nconst value = "old";\nreturn shared;\n',
+          'const shared = true;\nconst value = "new";\nreturn shared;\n',
+        ),
+      ],
+    });
+
+    expect(view.files[0]).toMatchObject({
+      added: 1,
+      removed: 1,
+      lines: [
+        { kind: 'context', text: 'const shared = true;' },
+        { kind: 'removed', text: 'const value = "old";' },
+        { kind: 'added', text: 'const value = "new";' },
+        { kind: 'context', text: 'return shared;' },
+      ],
+    });
+    expect(view.totalAdded).toBe(1);
+    expect(view.totalRemoved).toBe(1);
+  });
+
+  it('normalizes CRLF terminators without changing line operation counts', () => {
+    const view = buildToolDiffView({
+      toolCallId: 'tc-crlf',
+      fileChanges: [change('src/crlf.ts', 'shared\r\nold\r\n', 'shared\r\nnew\r\n')],
+    });
+
+    expect(view.files[0].lines).toEqual([
+      { kind: 'context', text: 'shared' },
+      { kind: 'removed', text: 'old' },
+      { kind: 'added', text: 'new' },
+    ]);
+    expect(view.files[0]).toMatchObject({ added: 1, removed: 1 });
+  });
+
   it('builds per-file counts and leaves small single-file diffs expanded', () => {
     const view = buildToolDiffView({
       toolCallId: 'tc-1',
@@ -91,8 +133,13 @@ describe('buildToolDiffView', () => {
       truncated: false,
       countsPartial: false,
       countsLabel: `+2 ${MINUS}1`,
-      bodyId: 'tool-diff-body-tc-1-0',
     });
+    expect(view.files[0].bodyId).toMatch(
+      /^tool-diff-body-u[0-9a-f]+-u[0-9a-f]+-[0-9a-f]{8}-0$/,
+    );
+    expect(view.files[0].toggleId).toMatch(
+      /^tool-diff-toggle-u[0-9a-f]+-u[0-9a-f]+-[0-9a-f]{8}-0$/,
+    );
     expect(view.totalAdded).toBe(2);
     expect(view.totalRemoved).toBe(1);
     expect(view.fileChangesOmitted).toBeUndefined();
@@ -117,6 +164,19 @@ describe('buildToolDiffView', () => {
     expect(view.files).toHaveLength(4);
   });
 
+  it('does not collapse large unchanged context around a small edit', () => {
+    const context = nLines(30, 'shared');
+    const view = buildToolDiffView({
+      toolCallId: 'tc-context',
+      fileChanges: [
+        change('context.ts', `${context}\nold\n`, `${context}\nnew\n`),
+      ],
+    });
+
+    expect(view.totalAdded + view.totalRemoved).toBe(2);
+    expect(view.collapsedByDefault).toBe(false);
+  });
+
   it('stays expanded at exactly the line threshold', () => {
     // 12 removed + 12 added = 24 total changed lines, one file
     const view = buildToolDiffView({
@@ -135,6 +195,23 @@ describe('buildToolDiffView', () => {
     });
     expect(view.totalAdded + view.totalRemoved).toBe(TOOL_DIFF_COLLAPSE_LINE_THRESHOLD + 1);
     expect(view.collapsedByDefault).toBe(true);
+  });
+
+  it('reports comparison unavailable without inventing changed lines when work exceeds the cap', () => {
+    const oldText = nLines(1_100, 'old');
+    const newText = nLines(1_100, 'new');
+    const view = buildToolDiffView({
+      toolCallId: 'too-complex',
+      fileChanges: [change('complex.ts', oldText, newText)],
+    });
+    expect(view.files[0]).toMatchObject({
+      comparisonUnavailable: true,
+      added: 0,
+      removed: 0,
+      lines: [],
+      countsLabel: 'Comparison unavailable',
+    });
+    expect(describeDiffFileForScreenReader(view.files[0])).toContain('comparison unavailable');
   });
 
   it('marks truncated entries as partial and suffixes the counts label', () => {
@@ -171,15 +248,65 @@ describe('buildToolDiffView', () => {
     ).toBe(5);
   });
 
-  it('sanitizes toolCallId for bodyId and never embeds the path', () => {
-    const view = buildToolDiffView({
+  it('creates stable injective body and toggle ids without embedding the path', () => {
+    const colon = buildToolDiffView({
       toolCallId: 'turn:producer/abc',
       fileChanges: [change('src/evil:path.ts', null, 'x')],
     });
-    expect(view.files[0].bodyId).toBe('tool-diff-body-turn-producer-abc-0');
-    expect(view.files[0].bodyId).not.toContain('evil');
-    expect(view.files[0].bodyId).not.toContain(':');
-    expect(view.files[0].bodyId).not.toContain('/');
+    const slash = buildToolDiffView({
+      toolCallId: 'turn/producer:abc',
+      fileChanges: [change('src/evil:path.ts', null, 'x')],
+    });
+
+    expect(colon.files[0].bodyId).toBe(
+      buildToolDiffView({
+        toolCallId: 'turn:producer/abc',
+        fileChanges: [change('src/evil:path.ts', null, 'x')],
+      }).files[0].bodyId,
+    );
+    expect(colon.files[0].bodyId).not.toBe(
+      buildToolDiffView({
+        toolCallId: 'turn:producer/abc',
+        fileChanges: [change('src/evil:path.ts', 'different', 'content')],
+      }).files[0].bodyId,
+    );
+    expect(colon.files[0].bodyId).not.toBe(
+      buildToolDiffView({
+        toolCallId: 'turn:producer/abc',
+        fileChanges: [change('different-path.ts', null, 'y')],
+      }).files[0].bodyId,
+    );
+    expect(colon.files[0].bodyId).not.toBe(slash.files[0].bodyId);
+    expect(colon.files[0].toggleId).not.toBe(colon.files[0].bodyId);
+    expect(colon.files[0].toggleId).not.toBe(slash.files[0].toggleId);
+    expect(colon.files[0].bodyId).not.toContain('evil');
+    expect(colon.files[0].bodyId).not.toContain(':');
+    expect(colon.files[0].bodyId).not.toContain('/');
+  });
+
+  it('keeps file ids stable across reorder and unique for duplicate paths', () => {
+    const first = buildToolDiffView({
+      toolCallId: 'tool',
+      fileChanges: [change('a.ts', 'a', 'A'), change('b.ts', 'b', 'B')],
+    });
+    const reordered = buildToolDiffView({
+      toolCallId: 'tool',
+      fileChanges: [change('b.ts', 'b', 'B'), change('a.ts', 'a', 'A')],
+    });
+    expect(first.files.find((file) => file.path === 'a.ts')?.bodyId).toBe(
+      reordered.files.find((file) => file.path === 'a.ts')?.bodyId,
+    );
+    const duplicates = buildToolDiffView({
+      toolCallId: 'tool',
+      fileChanges: [change('a.ts', 'a', 'A'), change('a.ts', 'x', 'X')],
+    });
+    const duplicateReorder = buildToolDiffView({
+      toolCallId: 'tool',
+      fileChanges: [change('a.ts', 'x', 'X'), change('a.ts', 'a', 'A')],
+    });
+    expect(duplicates.files[0].bodyId).not.toBe(duplicates.files[1].bodyId);
+    expect(duplicates.files[0].bodyId).toBe(duplicateReorder.files[1].bodyId);
+    expect(duplicates.files[1].bodyId).toBe(duplicateReorder.files[0].bodyId);
   });
 
   it('does not mutate the input array or objects', () => {
@@ -212,7 +339,10 @@ describe('describeDiffFileForScreenReader', () => {
       newText: '',
       truncated: false,
       countsPartial: false,
+      comparisonUnavailable: false,
       bodyId: 'tool-diff-body-x-0',
+      toggleId: 'tool-diff-toggle-x-0',
+      lines: [],
       countsLabel: '',
       ...partial,
     };

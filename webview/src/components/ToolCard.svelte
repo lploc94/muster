@@ -13,7 +13,7 @@
 
   /**
    * User toggle for params/result. null = default:
-   * evidence tools start expanded; content-only tools start collapsed.
+   * mixed diff + payload tools start expanded; payload-only tools start collapsed.
    */
   let expandedOverride = $state<boolean | null>(null);
 
@@ -35,15 +35,9 @@
     return 'codicon-tools';
   }
 
-  /** Split model text into display lines; trailing empty line from a final \n is dropped. */
-  function textLines(text: string | null | undefined): string[] {
-    if (text == null || text === '') return [];
-    const lines = text.split('\n');
-    if (lines.length > 0 && lines[lines.length - 1] === '') {
-      lines.pop();
-    }
-    return lines;
-  }
+  const componentId = $props.id();
+  const headerId = `${componentId}-tool-header`;
+  const detailsId = `${componentId}-tool-details`;
 
   const icon = $derived(toolIcon(tool.name, tool.toolKind));
   const resultPayload = $derived(
@@ -60,29 +54,26 @@
   );
 
   /**
-   * Pure presentation model (M020 S03). tool.id is the stable DOM-safe seed for
-   * body ids — never the agent path. Omitted counter is present-only.
+   * Pure presentation model (M020 S03). tool.id is encoded into stable,
+   * collision-free body/toggle ids; agent paths never participate.
    */
   const diffView: ToolDiffView | undefined = $derived(
-    fileChanges
+    fileChanges || fileChangesOmitted !== undefined
       ? buildToolDiffView({
           toolCallId: tool.id,
-          fileChanges,
+          fileChanges: fileChanges ?? [],
           ...(fileChangesOmitted !== undefined ? { fileChangesOmitted } : {}),
         })
       : undefined,
   );
 
-  /** Expandable when params/result/error OR structured diff evidence is present. */
+  /** The header discloses only the params/result region; file diffs have per-file controls. */
   const hasDetails = $derived(
-    tool.input !== undefined ||
-      tool.output !== undefined ||
-      !!tool.error ||
-      fileChanges !== undefined,
+    tool.input !== undefined || tool.output !== undefined || !!tool.error,
   );
-  /** Diff evidence defaults expanded so the edit is visible where the user approves it. */
+  /** Mixed evidence tools keep the existing default of showing their params/result. */
   const expanded = $derived(
-    expandedOverride !== null ? expandedOverride : fileChanges !== undefined,
+    expandedOverride !== null ? expandedOverride : fileChanges !== undefined && hasDetails,
   );
 
   function toggleExpanded() {
@@ -108,11 +99,13 @@
 
 <div class="tool-card rounded px-2 py-1 text-xs border" style="border-color: var(--vscode-panel-border);">
   <button
+    id={headerId}
     type="button"
     class="flex items-center gap-2 w-full text-left"
     class:cursor-pointer={hasDetails}
     disabled={!hasDetails}
     aria-expanded={hasDetails ? expanded : undefined}
+    aria-controls={hasDetails ? detailsId : undefined}
     onclick={toggleExpanded}
   >
     <span class="codicon {icon}"></span>
@@ -129,14 +122,13 @@
   {#if diffView}
     <div class="tool-card__diff mt-1.5" role="group" aria-label="File changes">
       {#each diffView.files as file (file.bodyId)}
-        {@const removed = textLines(file.oldText)}
-        {@const added = textLines(file.newText)}
         {@const bodyOpen = isFileBodyExpanded(diffView, file.bodyId)}
         {@const srSummary = describeDiffFileForScreenReader(file)}
         <div class="tool-card__diff-file">
           <div class="tool-card__diff-summary">
             {#if diffView.collapsedByDefault}
               <button
+                id={file.toggleId}
                 type="button"
                 class="tool-card__diff-toggle"
                 aria-expanded={bodyOpen}
@@ -162,22 +154,31 @@
           <div
             id={file.bodyId}
             class="tool-card__diff-body-panel"
+            role={diffView.collapsedByDefault ? 'region' : undefined}
+            aria-labelledby={diffView.collapsedByDefault ? file.toggleId : undefined}
             data-collapsed={bodyOpen ? 'false' : 'true'}
             aria-hidden={bodyOpen ? undefined : 'true'}
           >
             <div class="tool-card__diff-body-inner">
-              <pre class="tool-card__diff-body text-[10px] bg-[var(--vscode-textCodeBlock-background)] p-1 rounded max-h-48">
-{#each removed as line}<span class="tool-card__diff-line tool-card__diff-line--removed">-{line}
-</span>{/each}{#each added as line}<span class="tool-card__diff-line tool-card__diff-line--added">+{line}
+              {#if bodyOpen}
+                {#if file.comparisonUnavailable}
+                  <div class="tool-card__diff-unavailable" role="status">
+                    Comparison unavailable — this diff is too complex to compare safely
+                  </div>
+                {:else}
+                  <pre class="tool-card__diff-body text-[10px] bg-[var(--vscode-textCodeBlock-background)] p-1 rounded max-h-48">
+{#each file.lines as line}<span class="tool-card__diff-line tool-card__diff-line--{line.kind}">{line.kind === 'added' ? '+' : line.kind === 'removed' ? '-' : ' '}{line.text}
 </span>{/each}</pre>
-              {#if file.truncated}
-                <div
-                  class="tool-card__diff-truncated"
-                  role="status"
-                  aria-label="Diff truncated"
-                >
-                  Diff truncated — full text exceeded the per-side bound
-                </div>
+                {/if}
+                {#if file.truncated}
+                  <div
+                    class="tool-card__diff-truncated"
+                    role="status"
+                    aria-label="Diff truncated"
+                  >
+                    Diff truncated — full text exceeded the per-side bound
+                  </div>
+                {/if}
               {/if}
             </div>
           </div>
@@ -197,23 +198,33 @@
     </div>
   {/if}
 
-  {#if expanded && hasDetails}
-    {#if tool.input !== undefined}
-      <div class="tool-card__details mt-1.5">
-        <div class="text-[10px] opacity-70 mb-0.5">params:</div>
-        <pre class="tool-card__payload text-[10px] bg-[var(--vscode-textCodeBlock-background)] p-1 rounded max-h-40 whitespace-pre">{typeof tool.input === 'string' ? tool.input : JSON.stringify(tool.input, null, 2)}</pre>
-      </div>
-    {/if}
+  {#if hasDetails}
+    <div
+      id={detailsId}
+      class="tool-card__details-region"
+      role="region"
+      aria-labelledby={headerId}
+      aria-hidden={expanded ? undefined : 'true'}
+    >
+      {#if expanded}
+        {#if tool.input !== undefined}
+          <div class="tool-card__details mt-1.5">
+            <div class="text-[10px] opacity-70 mb-0.5">params:</div>
+            <pre class="tool-card__payload text-[10px] bg-[var(--vscode-textCodeBlock-background)] p-1 rounded max-h-40 whitespace-pre">{typeof tool.input === 'string' ? tool.input : JSON.stringify(tool.input, null, 2)}</pre>
+          </div>
+        {/if}
 
-    {#if resultPayload !== undefined}
-      <div class="tool-card__details mt-1.5">
-        <div class="text-[10px] opacity-70 mb-0.5">result:</div>
-        <pre
-          class="tool-card__payload text-[10px] bg-[var(--vscode-textCodeBlock-background)] p-1 rounded max-h-40 whitespace-pre"
-          style:color={tool.status === 'error' ? 'var(--vscode-errorForeground)' : undefined}
-        >{typeof resultPayload === 'string' ? resultPayload : JSON.stringify(resultPayload, null, 2)}</pre>
-      </div>
-    {/if}
+        {#if resultPayload !== undefined}
+          <div class="tool-card__details mt-1.5">
+            <div class="text-[10px] opacity-70 mb-0.5">result:</div>
+            <pre
+              class="tool-card__payload text-[10px] bg-[var(--vscode-textCodeBlock-background)] p-1 rounded max-h-40 whitespace-pre"
+              style:color={tool.status === 'error' ? 'var(--vscode-errorForeground)' : undefined}
+            >{typeof resultPayload === 'string' ? resultPayload : JSON.stringify(resultPayload, null, 2)}</pre>
+          </div>
+        {/if}
+      {/if}
+    </div>
   {/if}
 </div>
 

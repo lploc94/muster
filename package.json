@@ -410,6 +410,7 @@
     "@tanstack/svelte-virtual": "3.13.32",
     "@tanstack/virtual-core": "3.17.4",
     "@vscode-elements/elements": "^2.5.1",
+    "diff": "^9.0.0",
     "dompurify": "^3.4.11",
     "github-markdown-css": "^5.9.0",
     "highlight.js": "^11.11.1",
