@@ -2,11 +2,13 @@ import { EventEmitter } from 'events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   AcpClient,
+  MAX_ACP_FRAME_BYTES,
   boundedPromptCancel,
   disposeSharedAcpClient,
   encodeElicitationContent,
   encodeGrokAnswers,
   extractCommandNames,
+  feedBoundedNdjson,
   getSharedAcpClient,
   killProcessTree,
   normalizeAgentQuestions,
@@ -36,6 +38,33 @@ class FakeProc extends EventEmitter {
 
 afterEach(() => {
   vi.useRealTimers();
+});
+
+describe('feedBoundedNdjson', () => {
+  it('reassembles split UTF-8 frames and emits only complete lines', () => {
+    const payload = Buffer.from('{"text":"🙂"}\n{"ok":true}\n', 'utf8');
+    const split = payload.indexOf(Buffer.from('🙂')) + 2;
+    const first = feedBoundedNdjson(Buffer.alloc(0), payload.subarray(0, split));
+    expect(first.lines).toEqual([]);
+    expect(first.exceeded).toBe(false);
+
+    const second = feedBoundedNdjson(first.remainder, payload.subarray(split));
+    expect(second.lines).toEqual(['{"text":"🙂"}', '{"ok":true}']);
+    expect(second.remainder).toHaveLength(0);
+  });
+
+  it('rejects an unterminated frame as soon as its byte cap is exceeded', () => {
+    const first = feedBoundedNdjson(Buffer.alloc(0), Buffer.alloc(8, 97), 10);
+    expect(first.exceeded).toBe(false);
+    const second = feedBoundedNdjson(first.remainder, Buffer.alloc(3, 98), 10);
+    expect(second.exceeded).toBe(true);
+    expect(second.remainder).toHaveLength(0);
+    expect(second.observedBytes).toBe(11);
+  });
+
+  it('keeps the production cap bounded at two MiB', () => {
+    expect(MAX_ACP_FRAME_BYTES).toBe(2 * 1024 * 1024);
+  });
 });
 
 describe('boundedPromptCancel', () => {

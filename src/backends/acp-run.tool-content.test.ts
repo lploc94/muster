@@ -35,6 +35,13 @@ function toolUpdated(events: NormalizedEvent[]) {
   >;
 }
 
+function toolStarted(events: NormalizedEvent[]) {
+  return events.find((e) => e.type === 'toolStarted') as Extract<
+    NormalizedEvent,
+    { type: 'toolStarted' }
+  >;
+}
+
 let fake: FakeAcpHarness;
 
 beforeEach(() => {
@@ -117,6 +124,37 @@ describe('ACP tool content union — content-only regression', () => {
 });
 
 describe('ACP tool content union — diff evidence', () => {
+  it('captures diff evidence carried only by the initial tool_call', async () => {
+    const events = await runTurn(new ClaudeBackend(), options(), fake, {
+      updates: [
+        {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'edit-initial',
+          title: 'Editing files',
+          kind: 'edit',
+          content: [
+            {
+              type: 'diff',
+              path: 'src/initial.ts',
+              oldText: 'before\n',
+              newText: 'after\n',
+            },
+          ],
+        },
+        {
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'edit-initial',
+          status: 'completed',
+        },
+      ],
+    });
+
+    expect(toolStarted(events).fileChanges).toEqual([
+      { path: 'src/initial.ts', oldText: 'before\n', newText: 'after\n' },
+    ]);
+    expect(toolCompleted(events)).not.toHaveProperty('fileChanges');
+  });
+
   it('captures a single diff block on completed tool_call_update as fileChanges', async () => {
     const events = await runTurn(new ClaudeBackend(), options(), fake, {
       updates: [
@@ -144,6 +182,29 @@ describe('ACP tool content union — diff evidence', () => {
         newText: 'const x = 2;\n',
       } satisfies ToolFileChange,
     ]);
+  });
+
+  it('caps diff blocks at the adapter edge and reports the omitted remainder', async () => {
+    const blocks = Array.from({ length: 40 }, (_, index) => ({
+      type: 'diff',
+      path: `f${index}.ts`,
+      oldText: 'old',
+      newText: 'new',
+    }));
+    const events = await runTurn(new ClaudeBackend(), options(), fake, {
+      updates: [
+        {
+          sessionUpdate: 'tool_call',
+          toolCallId: 'edit-many',
+          title: 'Editing files',
+          content: blocks,
+        },
+      ],
+    });
+    const started = toolStarted(events);
+    expect(started.fileChanges).toHaveLength(32);
+    expect(started.fileChanges?.[31]?.path).toBe('f31.ts');
+    expect(started.fileChangesOmitted).toBe(8);
   });
 
   it('captures multiple diff blocks and preserves content text output', async () => {

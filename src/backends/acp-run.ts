@@ -8,6 +8,7 @@ import {
   RunOptions,
   ToolFileChange,
 } from '../types';
+import { TOOL_FILE_CHANGES_MAX_FILES } from '../shared/tool-file-change-contract';
 import {
   AcpAgentConfig,
   type AcpModelConfig,
@@ -121,19 +122,28 @@ function parseDiffBlock(block: unknown): ToolFileChange | undefined {
 }
 
 /**
- * Extract structured file-change evidence from ACP tool content blocks.
- * Returns undefined (not []) when no valid diff blocks are present so callers
- * can omit the field and keep content-only events byte-identical.
+ * Extract at most the retained file-count bound directly at the adapter edge.
+ * This prevents a bounded ACP frame from becoming an unbounded intermediate
+ * array before the engine applies path/text/aggregate canonicalization.
  */
-function extractFileChanges(update: SessionUpdate): ToolFileChange[] | undefined {
+function extractFileChangeEvidence(update: SessionUpdate): {
+  fileChanges?: ToolFileChange[];
+  fileChangesOmitted?: number;
+} {
   const content = update.content;
-  if (!Array.isArray(content)) return undefined;
+  if (!Array.isArray(content)) return {};
   const changes: ToolFileChange[] = [];
+  let omitted = 0;
   for (const block of content) {
     const change = parseDiffBlock(block);
-    if (change) changes.push(change);
+    if (!change) continue;
+    if (changes.length < TOOL_FILE_CHANGES_MAX_FILES) changes.push(change);
+    else omitted += 1;
   }
-  return changes.length > 0 ? changes : undefined;
+  return {
+    ...(changes.length > 0 ? { fileChanges: changes } : {}),
+    ...(omitted > 0 ? { fileChangesOmitted: omitted } : {}),
+  };
 }
 
 /** Pull displayable output from an ACP `tool_call_update`. */
@@ -208,12 +218,14 @@ function mapSessionUpdate(
       const name = typeof update.title === 'string' ? update.title : 'tool';
       if (!toolCallId) return { type: 'raw', line: JSON.stringify(update) };
       const meta = update._meta as Record<string, unknown> | undefined;
+      const fileEvidence = extractFileChangeEvidence(update);
       return {
         type: 'toolStarted',
         toolCallId,
         name,
         kind: spec.toolKind(update),
         input: update.rawInput,
+        ...fileEvidence,
         meta,
       };
     }
@@ -222,7 +234,7 @@ function mapSessionUpdate(
         typeof update.toolCallId === 'string' ? `${spec.idPrefix}${update.toolCallId}` : undefined;
       if (!toolCallId) return { type: 'raw', line: JSON.stringify(update) };
       const meta = update._meta as Record<string, unknown> | undefined;
-      const fileChanges = extractFileChanges(update);
+      const fileEvidence = extractFileChangeEvidence(update);
       const statusRaw =
         typeof update.status === 'string'
           ? update.status
@@ -241,7 +253,7 @@ function mapSessionUpdate(
             toolCallId,
             outcome: 'error',
             error,
-            ...(fileChanges ? { fileChanges } : {}),
+            ...fileEvidence,
             meta,
           };
         }
@@ -250,7 +262,7 @@ function mapSessionUpdate(
           toolCallId,
           outcome: 'success',
           output,
-          ...(fileChanges ? { fileChanges } : {}),
+          ...fileEvidence,
           meta,
         };
       }
@@ -258,7 +270,7 @@ function mapSessionUpdate(
         type: 'toolUpdated',
         toolCallId,
         input: update.rawInput,
-        ...(fileChanges ? { fileChanges } : {}),
+        ...fileEvidence,
         meta,
       };
     }

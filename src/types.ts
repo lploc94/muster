@@ -19,13 +19,26 @@ export type NormalizedEvent =
   | { type: 'sessionStarted'; sessionId?: string; meta?: Record<string, unknown> }
   | { type: 'assistantDelta'; content: string; messageId: string; meta?: Record<string, unknown> }
   | { type: 'reasoningDelta'; content: string; messageId: string; meta?: Record<string, unknown> }
-  | { type: 'toolStarted'; toolCallId: string; name: string; kind?: 'mcp' | 'builtin' | 'other'; input?: unknown; meta?: Record<string, unknown> }
+  | {
+      type: 'toolStarted';
+      toolCallId: string;
+      name: string;
+      kind?: 'mcp' | 'builtin' | 'other';
+      input?: unknown;
+      /** Optional ACP diff-block evidence, including initial tool_call content. */
+      fileChanges?: ToolFileChange[];
+      /** Number of entries omitted by engine bounds; absent on raw adapter events. */
+      fileChangesOmitted?: number;
+      meta?: Record<string, unknown>;
+    }
   | {
       type: 'toolUpdated';
       toolCallId: string;
       input?: unknown;
       /** Optional ACP diff-block evidence (M020). Omitted when absent. */
       fileChanges?: ToolFileChange[];
+      /** Number of entries omitted by engine bounds; absent on raw adapter events. */
+      fileChangesOmitted?: number;
       meta?: Record<string, unknown>;
     }
   | {
@@ -36,6 +49,8 @@ export type NormalizedEvent =
       error?: string;
       /** Optional ACP diff-block evidence (M020). Omitted when absent. */
       fileChanges?: ToolFileChange[];
+      /** Number of entries omitted by engine bounds; absent on raw adapter events. */
+      fileChangesOmitted?: number;
       meta?: Record<string, unknown>;
     }
   | { type: 'usage'; usage: Record<string, unknown>; meta?: Record<string, unknown> }

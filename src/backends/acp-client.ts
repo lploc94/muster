@@ -1,5 +1,4 @@
 import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
-import { createInterface, Interface } from 'readline';
 import { McpServerConfig } from '../types';
 import type {
   AgentQuestion,
@@ -32,6 +31,57 @@ import {
 } from './permission-policy';
 
 export type { AgentQuestion, QuestionAnswers } from './elicitation';
+
+/** Hard cap for one ACP stdout NDJSON frame before JSON.parse. */
+export const MAX_ACP_FRAME_BYTES = 2 * 1024 * 1024;
+
+export interface BoundedNdjsonFeed {
+  lines: string[];
+  remainder: Buffer;
+  exceeded: boolean;
+  observedBytes: number;
+}
+
+/**
+ * Incrementally split stdout into bounded NDJSON frames without ever retaining
+ * more than one capped frame. Decoding happens only after a full newline, so a
+ * UTF-8 code point split across chunks remains intact.
+ */
+export function feedBoundedNdjson(
+  remainder: Buffer,
+  chunk: Buffer,
+  maxBytes = MAX_ACP_FRAME_BYTES,
+): BoundedNdjsonFeed {
+  const lines: string[] = [];
+  let pending = remainder;
+  let cursor = 0;
+
+  while (cursor < chunk.length) {
+    const newline = chunk.indexOf(10, cursor);
+    const end = newline === -1 ? chunk.length : newline;
+    const segment = chunk.subarray(cursor, end);
+    const observedBytes = pending.length + segment.length;
+    if (observedBytes > maxBytes) {
+      return {
+        lines,
+        remainder: Buffer.alloc(0),
+        exceeded: true,
+        observedBytes,
+      };
+    }
+    if (segment.length > 0) {
+      pending = pending.length === 0
+        ? Buffer.from(segment)
+        : Buffer.concat([pending, segment], observedBytes);
+    }
+    if (newline === -1) break;
+    lines.push(pending.toString('utf8'));
+    pending = Buffer.alloc(0);
+    cursor = newline + 1;
+  }
+
+  return { lines, remainder: pending, exceeded: false, observedBytes: pending.length };
+}
 export {
   encodeElicitationContentFromQuestions as encodeElicitationContent,
   encodeGrokAnswers,
@@ -567,7 +617,7 @@ export function extractModelConfig(configOptions: unknown, sessionModels?: unkno
 
 export class AcpClient {
   private proc?: ChildProcessWithoutNullStreams;
-  private rl?: Interface;
+  private stdoutFrame: Buffer<ArrayBufferLike> = Buffer.alloc(0);
   private nextId = 1;
   private pending = new Map<number, Pending>();
   private sessionSinks = new Map<string, Set<SessionSink>>();
@@ -751,8 +801,7 @@ export class AcpClient {
     // Drop advertised commands with the process: a fresh connection re-advertises,
     // so the cache must not survive teardown (stale → wrong fail-closed decisions).
     this.advertisedCommands = undefined;
-    this.rl?.close();
-    this.rl = undefined;
+    this.stdoutFrame = Buffer.alloc(0);
     // Group SIGTERM now, escalate to group SIGKILL if the tree is still alive
     // after the grace — reaps the adapter's grandchild CLI, not just the child.
     if (proc) terminateProcessTree(proc);
@@ -777,8 +826,23 @@ export class AcpClient {
     });
     this.proc = proc;
 
-    this.rl = createInterface({ input: proc.stdout });
-    this.rl.on('line', (line) => this.onLine(line));
+    proc.stdout.on('data', (chunk: Buffer) => {
+      const feed = feedBoundedNdjson(this.stdoutFrame, chunk);
+      this.stdoutFrame = feed.remainder;
+      for (const line of feed.lines) this.onLine(line);
+      if (feed.exceeded) {
+        const error = new Error(
+          `${this.config.label} ACP frame exceeded ${MAX_ACP_FRAME_BYTES} bytes`,
+        );
+        debugAcp('frame.rejected', {
+          backend: this.config.key,
+          maxBytes: MAX_ACP_FRAME_BYTES,
+          observedBytes: feed.observedBytes,
+        });
+        this.rejectAllPending(error);
+        this.teardownProcess();
+      }
+    });
 
     proc.stdin.on('error', () => {
       // Swallow EPIPE after exit — writeLine handles the synchronous path.
