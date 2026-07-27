@@ -336,7 +336,7 @@ function taskTypesSettingsSnapshot(overrides?: {
 // PROTOCOL_VERSION in webview/src/lib/protocol.ts. Test fixtures below always
 // send it so the version-mismatch banner doesn't mask the harness's own
 // snapshot messages.
-const PROTOCOL_VERSION = 10;
+const PROTOCOL_VERSION = 11;
 
 /**
  * Normalize a focused snapshot to the protocol v9 current-only contract:
@@ -9970,13 +9970,102 @@ test.describe('M019 S05 Assembled First Run', () => {
     expect(blob).not.toMatch(/\/(?:Users|home)\/[^/\s]+/);
   });
 
+  test('M020 live permission flow: initial diff is visible before approval and unsafe updates are rejected', async ({
+    page,
+  }) => {
+    await openWebview(page);
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-live-diff', goal: 'Approve one edit', viewStatus: 'running' })],
+      focusedTaskId: 'task-live-diff',
+      subtree: [task({ id: 'task-live-diff', goal: 'Approve one edit', viewStatus: 'running' })],
+      transcript: [],
+      transcriptPage: { hasMoreBefore: false, workspaceRevision: 1 },
+      storeRevision: 1,
+    });
+
+    await postRawHostMessage(page, {
+      type: 'turnStart',
+      taskId: 'task-live-diff',
+      turnId: 'turn-live-diff',
+      trigger: 'engine',
+    });
+    await postRawHostMessage(page, {
+      type: 'event',
+      taskId: 'task-live-diff',
+      turnId: 'turn-live-diff',
+      event: {
+        type: 'toolStarted',
+        toolCallId: 'edit-live',
+        name: 'Edit',
+        kind: 'builtin',
+        fileChanges: [
+          {
+            path: 'src/live.ts',
+            oldText: 'const value = 1;\n',
+            newText: 'const value = 2;\n',
+          },
+        ],
+      },
+    });
+    await postRawHostMessage(page, {
+      type: 'permissionPending',
+      sessionId: 'session-live-diff',
+      permissionId: 'permission-live-diff',
+      title: 'Edit src/live.ts',
+      kind: 'edit',
+      classification: 'write',
+      options: [
+        { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
+        { optionId: 'reject', name: 'Deny', kind: 'reject' },
+      ],
+    });
+
+    const card = page.locator('.tool-card').filter({ hasText: 'Edit' });
+    await expect(card).toBeVisible();
+    await expect(card.locator('.tool-card__diff-line--removed')).toContainText(
+      '-const value = 1;',
+    );
+    await expect(card.locator('.tool-card__diff-line--added')).toContainText(
+      '+const value = 2;',
+    );
+    await expect(page.getByTestId('runtime-permission-card')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Allow once' })).toBeVisible();
+
+    // The host/webview guard must reject raw unsafe evidence rather than overwrite
+    // the canonical initial diff that the user is reviewing.
+    await postRawHostMessage(page, {
+      type: 'event',
+      taskId: 'task-live-diff',
+      turnId: 'turn-live-diff',
+      event: {
+        type: 'toolUpdated',
+        toolCallId: 'edit-live',
+        fileChanges: [
+          {
+            path: 'C:\\Users\\alice\\secret.ts',
+            oldText: 'safe',
+            newText: 'UNSAFE_LIVE_DIFF_CANARY',
+          },
+        ],
+      },
+    });
+    await expect(card).not.toContainText('UNSAFE_LIVE_DIFF_CANARY');
+    await expect(card).not.toContainText('Users');
+    await expect(card.locator('.tool-card__diff-line--added')).toContainText(
+      '+const value = 2;',
+    );
+  });
+
   test('M020 S01 inline diff: ToolCard renders removed and added lines from fileChanges', async ({
     page,
   }) => {
     await openWebview(page);
 
+    const sharedBefore = 'export function greeting() {';
     const oldLine = 'const greeting = "hello";';
     const newLine = 'const greeting = "world";';
+    const sharedAfter = 'return greeting;';
     // Model-supplied markup must render as inert text, not HTML.
     const inertPayload = '<img src=x onerror=window.__m020Xss=1>';
 
@@ -10000,8 +10089,8 @@ test.describe('M019 S05 Assembled First Run', () => {
             fileChanges: [
               {
                 path: 'src/hello.ts',
-                oldText: `${oldLine}\n${inertPayload}\n`,
-                newText: `${newLine}\n`,
+                oldText: `${sharedBefore}\n${oldLine}\n${inertPayload}\n${sharedAfter}\n`,
+                newText: `${sharedBefore}\n${newLine}\n${sharedAfter}\n`,
               },
             ],
           },
@@ -10021,10 +10110,19 @@ test.describe('M019 S05 Assembled First Run', () => {
     await expect(added.filter({ hasText: newLine })).toBeVisible();
     await expect(removed.filter({ hasText: inertPayload })).toBeVisible();
 
-    // Evidence-only tool is expandable (not inert/disabled).
+    // Exact line diff: unchanged context is rendered once, not once per side.
+    const context = card.locator('.tool-card__diff-line--context');
+    await expect(context.filter({ hasText: sharedBefore })).toHaveCount(1);
+    await expect(context.filter({ hasText: sharedAfter })).toHaveCount(1);
+    await expect(card.locator('.tool-card__diff-counts')).toContainText('+1');
+    await expect(card.locator('.tool-card__diff-counts')).toContainText('−2');
+
+    // Evidence has its own per-file disclosure; the top-level header must not
+    // claim to control a details region that does not exist.
     const header = card.getByRole('button').first();
-    await expect(header).toBeEnabled();
-    await expect(header).toHaveAttribute('aria-expanded', 'true');
+    await expect(header).toBeDisabled();
+    expect(await header.getAttribute('aria-expanded')).toBeNull();
+    expect(await header.getAttribute('aria-controls')).toBeNull();
 
     // Inert rendering: markup from model text must not become a live element.
     await expect(card.locator('img')).toHaveCount(0);
@@ -10070,7 +10168,16 @@ test.describe('M019 S05 Assembled First Run', () => {
     // Existing expand path for input/output still works.
     const header = card.getByRole('button').first();
     await expect(header).toBeEnabled();
+    await expect(header).toHaveAttribute('aria-expanded', 'false');
+    const detailsId = await header.getAttribute('aria-controls');
+    const headerId = await header.getAttribute('id');
+    expect(detailsId).toBeTruthy();
+    expect(headerId).toBeTruthy();
+    const details = card.locator(`#${detailsId}`);
+    await expect(details).toHaveAttribute('role', 'region');
+    await expect(details).toHaveAttribute('aria-labelledby', headerId!);
     await header.click();
+    await expect(header).toHaveAttribute('aria-expanded', 'true');
     await expect(card.getByText('params:')).toBeVisible();
     await expect(card.getByText('result:')).toBeVisible();
   });
@@ -10254,14 +10361,23 @@ test.describe('M019 S05 Assembled First Run', () => {
     const toggles = card.locator('button.tool-card__diff-toggle');
     await expect(toggles).toHaveCount(4);
     await expect(toggles.first()).toHaveAttribute('aria-expanded', 'false');
+    // Lightweight controlled regions stay mounted, but all expensive line DOM
+    // is absent until an individual file is expanded.
+    await expect(card.locator('.tool-card__diff-body-panel')).toHaveCount(4);
+    await expect(card.locator('.tool-card__diff-line')).toHaveCount(0);
 
     // Collapsed panel is marked data-collapsed and clips via grid 0fr.
     // Assert collapse state via attributes + bounding box (Playwright still
     // treats overflow-hidden grid children as "visible" for toBeVisible).
     const firstBodyId = await toggles.first().getAttribute('aria-controls');
+    const firstToggleId = await toggles.first().getAttribute('id');
     expect(firstBodyId).toBeTruthy();
+    expect(firstToggleId).toBeTruthy();
     const firstBody = card.locator(`#${firstBodyId}`);
+    await expect(firstBody).toHaveAttribute('role', 'region');
+    await expect(firstBody).toHaveAttribute('aria-labelledby', firstToggleId!);
     await expect(firstBody).toHaveAttribute('data-collapsed', 'true');
+    await expect(firstBody.locator('.tool-card__diff-line')).toHaveCount(0);
     const collapsedBox = await firstBody.boundingBox();
     expect(collapsedBox).toBeTruthy();
     expect(collapsedBox!.height).toBeLessThanOrEqual(1);
@@ -10276,6 +10392,11 @@ test.describe('M019 S05 Assembled First Run', () => {
     const expandedBox = await firstBody.boundingBox();
     expect(expandedBox).toBeTruthy();
     expect(expandedBox!.height).toBeGreaterThan(1);
+
+    await toggles.first().click();
+    await expect(toggles.first()).toHaveAttribute('aria-expanded', 'false');
+    await expect(firstBody).toHaveAttribute('data-collapsed', 'true');
+    await expect(firstBody.locator('.tool-card__diff-line')).toHaveCount(0);
   });
 
   test('M020 S03 a11y: aria-controls targets body id and screen-reader summary is present', async ({
@@ -10325,7 +10446,9 @@ test.describe('M019 S05 Assembled First Run', () => {
     await expect(toggle).toHaveAttribute('aria-expanded', 'false');
 
     const controlsId = await toggle.getAttribute('aria-controls');
+    const toggleId = await toggle.getAttribute('id');
     expect(controlsId).toBeTruthy();
+    expect(toggleId).toBeTruthy();
     // bodyId derived from transcript item id + index, never agent path.
     expect(controlsId!).toMatch(/^tool-diff-body-/);
     expect(controlsId!).not.toContain('long.ts');
@@ -10334,7 +10457,10 @@ test.describe('M019 S05 Assembled First Run', () => {
     // bodyId is already DOM-safe (sanitized tool id + index); no CSS.escape needed.
     const body = card.locator(`#${controlsId}`);
     await expect(body).toHaveCount(1);
+    await expect(body).toHaveAttribute('role', 'region');
+    await expect(body).toHaveAttribute('aria-labelledby', toggleId!);
     await expect(body).toHaveAttribute('data-collapsed', 'true');
+    await expect(body.locator('.tool-card__diff-line')).toHaveCount(0);
 
     const ariaLabel = await toggle.getAttribute('aria-label');
     expect(ariaLabel).toBeTruthy();

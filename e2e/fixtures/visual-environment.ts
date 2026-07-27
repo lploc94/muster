@@ -535,9 +535,9 @@ export function assertSanitizedVisualFixture(value: unknown): void {
 }
 
 /** Protocol stamped on deterministic visual fixtures; mirror webview/src/lib/protocol.ts. */
-export const VISUAL_PROTOCOL_VERSION = 10;
+export const VISUAL_PROTOCOL_VERSION = 11;
 
-/** Options for deterministic main-webview host snapshots (protocol v10). */
+/** Options for deterministic main-webview host snapshots (protocol v11). */
 export interface StaticWebviewFixtureOptions {
   /** When set, projects a static Ask card for accessible validation coverage. */
   pendingAsk?: {

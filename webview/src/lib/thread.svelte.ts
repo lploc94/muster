@@ -421,6 +421,15 @@ export class TaskThread {
           existing.toolKind = ev.kind;
           existing.status = 'running';
           if (ev.input !== undefined) existing.input = ev.input;
+          if (ev.fileChanges !== undefined) {
+            if (ev.fileChanges.length > 0) existing.fileChanges = ev.fileChanges;
+            else delete existing.fileChanges;
+          }
+          if (ev.fileChangesOmitted !== undefined) {
+            existing.fileChangesOmitted = ev.fileChangesOmitted;
+          } else if (ev.fileChanges !== undefined) {
+            delete existing.fileChangesOmitted;
+          }
         } else {
           this.items.push({
             kind: 'tool',
@@ -430,6 +439,12 @@ export class TaskThread {
             toolKind: ev.kind,
             status: 'running',
             input: ev.input,
+            ...(ev.fileChanges !== undefined && ev.fileChanges.length > 0
+              ? { fileChanges: ev.fileChanges }
+              : {}),
+            ...(ev.fileChangesOmitted !== undefined
+              ? { fileChangesOmitted: ev.fileChangesOmitted }
+              : {}),
           });
         }
         break;
@@ -451,6 +466,11 @@ export class TaskThread {
             if (ev.fileChanges.length > 0) tool.fileChanges = ev.fileChanges;
             else delete tool.fileChanges;
           }
+          if (ev.fileChangesOmitted !== undefined) {
+            tool.fileChangesOmitted = ev.fileChangesOmitted;
+          } else if (ev.fileChanges !== undefined) {
+            delete tool.fileChangesOmitted;
+          }
         } else {
           this.items.push({
             kind: 'tool',
@@ -460,6 +480,9 @@ export class TaskThread {
             status: 'running',
             input: ev.input,
             ...liveFileChanges,
+            ...(ev.fileChangesOmitted !== undefined
+              ? { fileChangesOmitted: ev.fileChangesOmitted }
+              : {}),
           });
         }
         break;
@@ -484,6 +507,11 @@ export class TaskThread {
             if (ev.fileChanges.length > 0) tool.fileChanges = ev.fileChanges;
             else delete tool.fileChanges;
           }
+          if (ev.fileChangesOmitted !== undefined) {
+            tool.fileChangesOmitted = ev.fileChangesOmitted;
+          } else if (ev.fileChanges !== undefined) {
+            delete tool.fileChangesOmitted;
+          }
         } else {
           this.items.push({
             kind: 'tool',
@@ -494,6 +522,9 @@ export class TaskThread {
             output: ev.outcome === 'error' ? undefined : ev.output,
             error: ev.outcome === 'error' ? ev.error : undefined,
             ...liveFileChanges,
+            ...(ev.fileChangesOmitted !== undefined
+              ? { fileChangesOmitted: ev.fileChangesOmitted }
+              : {}),
           });
         }
         break;

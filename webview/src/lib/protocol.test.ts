@@ -172,7 +172,7 @@ describe('protocol v7 focused transcriptPage contract', () => {
   };
 
   it('uses the current protocol version', () => {
-    expect(PROTOCOL_VERSION).toBe(10);
+    expect(PROTOCOL_VERSION).toBe(11);
   });
 
   it('accepts focused snapshot with transcript + transcriptPage', () => {
@@ -1758,6 +1758,123 @@ describe('protocol v7 loadTranscriptPage / transcriptPageResult', () => {
       }),
     ).toBe(false);
   });
+
+  it('rejects absolute, traversal, control, and oversized paths fail-closed', () => {
+    const baseTool = {
+      id: 'tool-unsafe',
+      kind: 'tool' as const,
+      turnId: 't1',
+      order: 1,
+      content: { toolCallId: 'c1', name: 'Edit', status: 'success' as const },
+    };
+    for (const unsafePath of [
+      '/etc/passwd',
+      'C:\\Users\\alice\\secret.ts',
+      '../secret.ts',
+      'src/../secret.ts',
+      'src/\nsecret.ts',
+      'src/\u202esecret.ts',
+      `${'é'.repeat(600)}.ts`,
+    ]) {
+      expect(
+        isExtMessage({
+          ...validSuccess,
+          items: [
+            {
+              ...baseTool,
+              content: {
+                ...baseTool.content,
+                fileChanges: [{ path: unsafePath, oldText: 'a', newText: 'b' }],
+              },
+            },
+          ],
+        }),
+        unsafePath,
+      ).toBe(false);
+    }
+  });
+});
+
+describe('M020 bounded live tool events', () => {
+  const validChange = { path: 'src/a.ts', oldText: 'a', newText: 'b' };
+  const envelope = (event: Record<string, unknown>) => ({
+    type: 'event',
+    taskId: 'task-1',
+    turnId: 'turn-1',
+    event,
+  });
+
+  it('accepts bounded evidence and omission metadata on start, update, and complete', () => {
+    expect(
+      isExtMessage(
+        envelope({
+          type: 'toolStarted',
+          toolCallId: 'c1',
+          name: 'Edit',
+          fileChanges: [validChange],
+          fileChangesOmitted: 2,
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      isExtMessage(
+        envelope({
+          type: 'toolUpdated',
+          toolCallId: 'c1',
+          fileChanges: [validChange],
+          fileChangesOmitted: 2,
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      isExtMessage(
+        envelope({
+          type: 'toolCompleted',
+          toolCallId: 'c1',
+          outcome: 'success',
+          fileChanges: [validChange],
+          fileChangesOmitted: 2,
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it('rejects unbounded or unsafe evidence on every live tool event', () => {
+    const tooMany = Array.from({ length: 33 }, (_, index) => ({
+      ...validChange,
+      path: `f${index}.ts`,
+    }));
+    const invalidEvidence = [
+      tooMany,
+      [{ ...validChange, path: '/etc/passwd' }],
+      [{ ...validChange, path: '../secret.ts' }],
+      [{ ...validChange, newText: 'x\n'.repeat(2_001) }],
+    ];
+    for (const fileChanges of invalidEvidence) {
+      for (const event of [
+        { type: 'toolStarted', toolCallId: 'c1', name: 'Edit', fileChanges },
+        { type: 'toolUpdated', toolCallId: 'c1', fileChanges },
+        { type: 'toolCompleted', toolCallId: 'c1', outcome: 'success', fileChanges },
+      ]) {
+        expect(isExtMessage(envelope(event))).toBe(false);
+      }
+    }
+  });
+
+  it('rejects invalid omitted counters but accepts omission-only evidence', () => {
+    expect(
+      isExtMessage(
+        envelope({ type: 'toolUpdated', toolCallId: 'c1', fileChangesOmitted: 2 }),
+      ),
+    ).toBe(true);
+    for (const invalid of [0, -1, 1.5, Number.POSITIVE_INFINITY]) {
+      expect(
+        isExtMessage(
+          envelope({ type: 'toolUpdated', toolCallId: 'c1', fileChangesOmitted: invalid }),
+        ),
+      ).toBe(false);
+    }
+  });
 });
 
 describe('protocol v9 workspacePatchBatch', () => {
@@ -1814,7 +1931,7 @@ describe('protocol v9 workspacePatchBatch', () => {
   };
 
   it('uses the current protocol version', () => {
-    expect(PROTOCOL_VERSION).toBe(10);
+    expect(PROTOCOL_VERSION).toBe(11);
   });
 
   it('accepts a multi-kind batch and empty patches', () => {

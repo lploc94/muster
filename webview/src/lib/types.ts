@@ -12,6 +12,14 @@ export type NormalizedEvent =
       name: string;
       kind?: 'mcp' | 'builtin' | 'other';
       input?: unknown;
+      /** Optional bounded ACP diff-block evidence. */
+      fileChanges?: Array<{
+        path: string;
+        oldText: string | null;
+        newText: string;
+        truncated?: boolean;
+      }>;
+      fileChangesOmitted?: number;
       meta?: Record<string, unknown>;
     }
   | {
@@ -25,6 +33,7 @@ export type NormalizedEvent =
         newText: string;
         truncated?: boolean;
       }>;
+      fileChangesOmitted?: number;
       meta?: Record<string, unknown>;
     }
   | {
@@ -40,6 +49,7 @@ export type NormalizedEvent =
         newText: string;
         truncated?: boolean;
       }>;
+      fileChangesOmitted?: number;
       meta?: Record<string, unknown>;
     }
   | { type: 'usage'; usage: Record<string, unknown>; meta?: Record<string, unknown> }

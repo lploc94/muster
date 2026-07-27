@@ -20,8 +20,13 @@ import {
   type BackendProbeProgress,
   type BackendProbeRequest,
 } from '../../../src/shared/backend-probe';
+import {
+  TOOL_FILE_CHANGE_SIDE_MAX_BYTES,
+  TOOL_FILE_CHANGES_MAX_FILES,
+  isBoundedToolFileChanges,
+} from '../../../src/shared/tool-file-change-contract';
 
-export const PROTOCOL_VERSION = 10;
+export const PROTOCOL_VERSION = 11;
 
 export type { BackendReadinessSnapshot, BackendProbeProgress, BackendProbeRequest };
 
@@ -177,9 +182,9 @@ export const WORKSPACE_PATCH_MAX_PATCHES = 10_000;
 export const WORKSPACE_PATCH_MAX_ITEMS = 500;
 export const WORKSPACE_PATCH_MAX_QUEUED = 500;
 /** Max ACP fileChanges entries projected per tool call (M020). */
-export const TOOL_FILE_CHANGES_MAX = 32;
-/** Max path / text length for a single fileChange entry (M020). */
-export const TOOL_FILE_CHANGE_TEXT_MAX = 262_144;
+export const TOOL_FILE_CHANGES_MAX = TOOL_FILE_CHANGES_MAX_FILES;
+/** Backward-compatible alias; bounds are now measured as UTF-8 bytes. */
+export const TOOL_FILE_CHANGE_TEXT_MAX = TOOL_FILE_CHANGE_SIDE_MAX_BYTES;
 export const WORKSPACE_PATCH_ID_MAX = 512;
 
 /** Fixed failure codes for transcriptPageResult (no free-form message). */
@@ -505,7 +510,7 @@ export type ExtMessage =
   /**
    * Host→webview deep-link (M019/S03): open Settings on the Agents domain and
    * focus the stable Backends section target (`settings-backends`). Additive;
-   * PROTOCOL_VERSION stays at 10. S04's Doctor command sends this message.
+   * PROTOCOL_VERSION stays at 11. S04's Doctor command sends this message.
    * Payload is intentionally empty — no secrets, paths, or diagnostics body.
    */
   | { type: 'revealBackendDiagnostics' }
@@ -1233,17 +1238,18 @@ function isTaskSummary(v: unknown): v is TaskSummary {
   );
 }
 
-function isToolFileChange(v: unknown): boolean {
-  if (!isRecord(v)) return false;
-  if (!hasOnlyKeys(v, ['path', 'oldText', 'newText', 'truncated'])) return false;
-  if (!isString(v.path) || v.path.length === 0 || v.path.length > TOOL_FILE_CHANGE_TEXT_MAX) return false;
-  if (v.path.includes('\0')) return false;
-  if (!(v.oldText === null || (isString(v.oldText) && v.oldText.length <= TOOL_FILE_CHANGE_TEXT_MAX))) {
+function hasValidToolEvidence(v: Record<string, unknown>): boolean {
+  if (v.fileChanges !== undefined && !isBoundedToolFileChanges(v.fileChanges)) return false;
+  if (
+    v.fileChangesOmitted !== undefined &&
+    !(
+      typeof v.fileChangesOmitted === 'number' &&
+      Number.isSafeInteger(v.fileChangesOmitted) &&
+      v.fileChangesOmitted > 0
+    )
+  ) {
     return false;
   }
-  if (!isString(v.newText) || v.newText.length > TOOL_FILE_CHANGE_TEXT_MAX) return false;
-  // truncated is present only when true (engine never emits false).
-  if (v.truncated !== undefined && v.truncated !== true) return false;
   return true;
 }
 
@@ -1314,25 +1320,7 @@ function isTranscriptItem(v: unknown): v is TranscriptItem {
       if (c.error !== undefined && !isString(c.error)) return false;
       // input/output remain unknown payloads when present.
       // Optional ACP diff evidence (M020): omit or non-empty validated array.
-      if (c.fileChanges !== undefined) {
-        if (!Array.isArray(c.fileChanges)) return false;
-        if (c.fileChanges.length === 0 || c.fileChanges.length > TOOL_FILE_CHANGES_MAX) return false;
-        for (const entry of c.fileChanges) {
-          if (!isToolFileChange(entry)) return false;
-        }
-      }
-      // Optional file-count overflow signal (M020 S02): omit or non-negative safe integer.
-      if (c.fileChangesOmitted !== undefined) {
-        if (
-          typeof c.fileChangesOmitted !== 'number' ||
-          !Number.isFinite(c.fileChangesOmitted) ||
-          !Number.isSafeInteger(c.fileChangesOmitted) ||
-          c.fileChangesOmitted < 0
-        ) {
-          return false;
-        }
-      }
-      return true;
+      return hasValidToolEvidence(c);
     }
     case 'error':
       // Locally-synthesized only; host isExtMessage must reject error items.
@@ -1572,11 +1560,15 @@ export function isNormalizedEvent(v: unknown): v is NormalizedEvent {
     case 'reasoningDelta':
       return isString(v.content) && isString(v.messageId);
     case 'toolStarted':
-      return isString(v.toolCallId) && isString(v.name);
+      return isString(v.toolCallId) && isString(v.name) && hasValidToolEvidence(v);
     case 'toolUpdated':
-      return isString(v.toolCallId);
+      return isString(v.toolCallId) && hasValidToolEvidence(v);
     case 'toolCompleted':
-      return isString(v.toolCallId) && (v.outcome === 'success' || v.outcome === 'error');
+      return (
+        isString(v.toolCallId) &&
+        (v.outcome === 'success' || v.outcome === 'error') &&
+        hasValidToolEvidence(v)
+      );
     case 'usage':
       return isRecord(v.usage);
     case 'turnCompleted':
