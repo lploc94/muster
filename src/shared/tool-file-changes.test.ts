@@ -1,9 +1,15 @@
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
-  TOOL_FILE_CHANGE_TEXT_MAX,
-  TOOL_FILE_CHANGE_TRUNCATION_SUFFIX,
+  TOOL_FILE_CHANGE_PATH_MAX_BYTES,
+  TOOL_FILE_CHANGE_SIDE_MAX_BYTES,
+  TOOL_FILE_CHANGE_SIDE_MAX_LINES,
   TOOL_FILE_CHANGES_MAX_FILES,
+  TOOL_FILE_CHANGES_TOTAL_MAX_BYTES,
+  utf8ByteLength,
+} from './tool-file-change-contract';
+import {
+  TOOL_FILE_CHANGE_TEXT_MAX,
   boundToolFileChanges,
   sanitizeToolFileChangePath,
   type BoundedToolFileChange,
@@ -20,8 +26,9 @@ function change(
 describe('constants', () => {
   it('mirrors the webview protocol outer bounds', () => {
     expect(TOOL_FILE_CHANGES_MAX_FILES).toBe(32);
-    expect(TOOL_FILE_CHANGE_TEXT_MAX).toBe(262_144);
-    expect(TOOL_FILE_CHANGE_TRUNCATION_SUFFIX).toBe('\n… truncated');
+    expect(TOOL_FILE_CHANGE_TEXT_MAX).toBe(TOOL_FILE_CHANGE_SIDE_MAX_BYTES);
+    expect(TOOL_FILE_CHANGE_PATH_MAX_BYTES).toBeLessThan(TOOL_FILE_CHANGE_SIDE_MAX_BYTES);
+    expect(TOOL_FILE_CHANGES_TOTAL_MAX_BYTES).toBeGreaterThan(TOOL_FILE_CHANGE_SIDE_MAX_BYTES);
   });
 });
 
@@ -32,9 +39,9 @@ describe('sanitizeToolFileChangePath', () => {
     expect(sanitizeToolFileChangePath(abs, cwd)).toBe('src/app.ts');
   });
 
-  it('returns "." when the path is the cwd itself', () => {
+  it('rejects the workspace root because it is not a file identity', () => {
     const cwd = path.resolve('/workspace/project');
-    expect(sanitizeToolFileChangePath(cwd, cwd)).toBe('.');
+    expect(sanitizeToolFileChangePath(cwd, cwd)).toBe('');
   });
 
   it('degrades absolute paths outside cwd to basename', () => {
@@ -50,8 +57,33 @@ describe('sanitizeToolFileChangePath', () => {
     expect(sanitized).not.toContain('Users');
   });
 
-  it('strips NUL bytes before other handling', () => {
-    expect(sanitizeToolFileChangePath('src/\0app.ts')).toBe('src/app.ts');
+  it('rejects control and bidi characters instead of silently rewriting them', () => {
+    for (const unsafe of [
+      'src/\0app.ts',
+      'src/\napp.ts',
+      'src/\u001bapp.ts',
+      'src/\u202eapp.ts',
+      'src/\u2066app.ts',
+    ]) {
+      expect(sanitizeToolFileChangePath(unsafe)).toBe('');
+    }
+  });
+
+  it('degrades traversal outside cwd to a basename-only path', () => {
+    const cwd = path.resolve('/workspace/project');
+    expect(sanitizeToolFileChangePath('../Users/alice/secret.ts', cwd)).toBe('secret.ts');
+    expect(sanitizeToolFileChangePath('../../etc/passwd', cwd)).toBe('passwd');
+  });
+
+  it('preserves valid child segments whose names merely start with two dots', () => {
+    const cwd = path.resolve('/workspace/project');
+    expect(sanitizeToolFileChangePath(path.join(cwd, '..config', 'a.ts'), cwd)).toBe(
+      '..config/a.ts',
+    );
+  });
+
+  it('rejects paths over the UTF-8 path byte bound', () => {
+    expect(sanitizeToolFileChangePath(`${'é'.repeat(TOOL_FILE_CHANGE_PATH_MAX_BYTES)}.ts`)).toBe('');
   });
 
   it('normalizes already-relative paths to POSIX separators', () => {
@@ -101,8 +133,8 @@ describe('boundToolFileChanges', () => {
     const entry = result.fileChanges?.[0];
     expect(entry).toBeDefined();
     expect(entry!.truncated).toBe(true);
-    expect(entry!.newText.length).toBeLessThanOrEqual(TOOL_FILE_CHANGE_TEXT_MAX);
-    expect(entry!.newText.endsWith(TOOL_FILE_CHANGE_TRUNCATION_SUFFIX)).toBe(true);
+    expect(utf8ByteLength(entry!.newText)).toBeLessThanOrEqual(TOOL_FILE_CHANGE_SIDE_MAX_BYTES);
+    expect(entry!.newText).not.toContain('… truncated');
     expect(entry!.oldText).toBe('old');
   });
 
@@ -112,8 +144,8 @@ describe('boundToolFileChanges', () => {
     const entry = result.fileChanges?.[0];
     expect(entry).toBeDefined();
     expect(entry!.truncated).toBe(true);
-    expect(entry!.oldText!.length).toBeLessThanOrEqual(TOOL_FILE_CHANGE_TEXT_MAX);
-    expect(entry!.oldText!.endsWith(TOOL_FILE_CHANGE_TRUNCATION_SUFFIX)).toBe(true);
+    expect(utf8ByteLength(entry!.oldText!)).toBeLessThanOrEqual(TOOL_FILE_CHANGE_SIDE_MAX_BYTES);
+    expect(entry!.oldText).not.toContain('… truncated');
     expect(entry!.newText).toBe('new');
   });
 
@@ -150,19 +182,64 @@ describe('boundToolFileChanges', () => {
     expect(p).not.toContain('\\');
   });
 
-  it('strips NUL from paths during bounding', () => {
-    const result = boundToolFileChanges([change('src/\0evil.ts')]);
-    expect(result.fileChanges?.[0]?.path).toBe('src/evil.ts');
+  it('omits unsafe paths and reports every omission honestly', () => {
+    const result = boundToolFileChanges([
+      change('src/\0evil.ts'),
+      change('src/\u202esecret.ts'),
+      change('kept.ts'),
+    ]);
+    expect(result.fileChanges).toEqual([{ path: 'kept.ts', oldText: 'old', newText: 'new' }]);
+    expect(result.fileChangesOmitted).toBe(2);
   });
 
-  it('drops entries whose sanitized path is empty', () => {
+  it('drops entries whose sanitized path is empty and reports the omission', () => {
     const result = boundToolFileChanges([change('   '), change('kept.ts')]);
     expect(result.fileChanges).toEqual([{ path: 'kept.ts', oldText: 'old', newText: 'new' }]);
-    expect(result).not.toHaveProperty('fileChangesOmitted');
+    expect(result.fileChangesOmitted).toBe(1);
   });
 
-  it('returns {} when every entry is dropped', () => {
-    expect(boundToolFileChanges([change(''), change('  ')])).toEqual({});
+  it('retains an omission marker when every unsafe entry is dropped', () => {
+    expect(boundToolFileChanges([change(''), change('  ')])).toEqual({ fileChangesOmitted: 2 });
+  });
+
+  it('clips multibyte sides by UTF-8 bytes without splitting a code point', () => {
+    const result = boundToolFileChanges([
+      change('emoji.ts', null, '🙂'.repeat(TOOL_FILE_CHANGE_SIDE_MAX_BYTES)),
+    ]);
+    const entry = result.fileChanges?.[0];
+    expect(entry?.truncated).toBe(true);
+    expect(utf8ByteLength(entry?.newText ?? '')).toBeLessThanOrEqual(TOOL_FILE_CHANGE_SIDE_MAX_BYTES);
+    expect(entry?.newText.endsWith('🙂')).toBe(true);
+    expect(entry?.newText).not.toContain('�');
+  });
+
+  it('clips newline-dense evidence by logical line count', () => {
+    const result = boundToolFileChanges([
+      change('dense.ts', '', 'x\n'.repeat(TOOL_FILE_CHANGE_SIDE_MAX_LINES + 100)),
+    ]);
+    const entry = result.fileChanges?.[0];
+    expect(entry?.truncated).toBe(true);
+    expect((entry?.newText.match(/\n/g) ?? []).length).toBeLessThanOrEqual(
+      TOOL_FILE_CHANGE_SIDE_MAX_LINES,
+    );
+  });
+
+  it('omits whole entries that exceed the aggregate retained-byte bound', () => {
+    const side = 'x'.repeat(TOOL_FILE_CHANGE_SIDE_MAX_BYTES);
+    const input = Array.from({ length: 8 }, (_, index) =>
+      change(`large-${index}.ts`, side, side),
+    );
+    const result = boundToolFileChanges(input);
+    const retainedBytes = (result.fileChanges ?? []).reduce(
+      (total, entry) =>
+        total +
+        utf8ByteLength(entry.path) +
+        (entry.oldText === null ? 0 : utf8ByteLength(entry.oldText)) +
+        utf8ByteLength(entry.newText),
+      0,
+    );
+    expect(retainedBytes).toBeLessThanOrEqual(TOOL_FILE_CHANGES_TOTAL_MAX_BYTES);
+    expect(result.fileChangesOmitted).toBeGreaterThan(0);
   });
 
   it('does not mutate the input array or entries', () => {
@@ -180,11 +257,11 @@ describe('boundToolFileChanges', () => {
     expect(Object.prototype.hasOwnProperty.call(result.fileChanges?.[0], 'truncated')).toBe(false);
   });
 
-  it('counts only file-count overflow as omitted, not empty-path drops', () => {
-    // 1 empty + 33 valid → keep 32 valid, omit 1 valid (empty does not count toward omitted).
+  it('counts unsafe entries and file-count overflow in the aggregate omitted marker', () => {
+    // 1 unsafe + 33 valid → keep 32 valid, omit 2 total.
     const input = [change(''), ...Array.from({ length: 33 }, (_, i) => change(`f${i}.ts`))];
     const result = boundToolFileChanges(input);
     expect(result.fileChanges).toHaveLength(32);
-    expect(result.fileChangesOmitted).toBe(1);
+    expect(result.fileChangesOmitted).toBe(2);
   });
 });

@@ -1,153 +1,216 @@
 /**
- * Shared bounding + path sanitization for ACP tool-call fileChanges evidence (M020).
- *
- * Pure Node-safe module: host engine and webview protocol both import the same
- * bounds so the producer and the fail-closed guard stay aligned. Does not import
- * from `src/types.ts` so the webview can consume it without pulling host types.
- *
- * Bounding signals are in-data (not logs):
- * - `truncated: true` on an entry means a per-side text bound was hit
- * - `fileChangesOmitted > 0` on the result means the file-count bound was hit
+ * Shared producer-side canonicalization and bounding for untrusted ACP
+ * file-change evidence. Every sink (SQLite, host projection, live webview event)
+ * receives only the representation returned here.
  */
 
 import path from 'node:path';
+import {
+  TOOL_FILE_CHANGE_PATH_MAX_BYTES,
+  TOOL_FILE_CHANGE_SIDE_MAX_BYTES,
+  TOOL_FILE_CHANGE_SIDE_MAX_LINES,
+  TOOL_FILE_CHANGES_MAX_FILES,
+  TOOL_FILE_CHANGES_TOTAL_MAX_BYTES,
+  isSafeRelativeToolPath,
+  logicalLineCount,
+  toolFileChangeRetainedBytes,
+  utf8ByteLength,
+} from './tool-file-change-contract';
 
-/** Max ACP fileChanges entries retained per tool call (mirrors webview protocol). */
-export const TOOL_FILE_CHANGES_MAX_FILES = 32;
+export { TOOL_FILE_CHANGES_MAX_FILES } from './tool-file-change-contract';
 
-/** Max path / text length for a single side of a fileChange entry (mirrors webview protocol). */
-export const TOOL_FILE_CHANGE_TEXT_MAX = 262_144;
+/** Backward-compatible name used by existing tests/docs; the bound is now UTF-8 bytes. */
+export const TOOL_FILE_CHANGE_TEXT_MAX = TOOL_FILE_CHANGE_SIDE_MAX_BYTES;
+/** Deprecated: truncation is metadata-only and never injected into file text. */
+export const TOOL_FILE_CHANGE_TRUNCATION_SUFFIX = '';
 
-/** Honest suffix appended when a side is clipped. Length must fit inside the text max. */
-export const TOOL_FILE_CHANGE_TRUNCATION_SUFFIX = '\n… truncated';
-
-/**
- * Structural shape of a bounded file-change entry.
- * Compatible with `ToolFileChange` in `src/types.ts` once that type gains
- * optional `truncated`; kept local so this module stays dependency-free.
- */
 export interface BoundedToolFileChange {
   path: string;
   oldText: string | null;
   newText: string;
-  /** Present only when a side was clipped; never emitted as `false`. */
+  /** Present only when either side was clipped by a byte or line bound. */
   truncated?: boolean;
 }
 
 export interface BoundToolFileChangesResult {
   fileChanges?: BoundedToolFileChange[];
-  /** Count of valid entries dropped by the file-count bound; omitted when zero. */
+  /** All entries omitted by unsafe path, file-count, or aggregate-byte bounds. */
   fileChangesOmitted?: number;
 }
 
 export interface BoundToolFileChangesOptions {
-  /** Task/workspace cwd used to relativize absolute in-workspace paths. */
+  /** Trusted task/workspace cwd used only to relativize contained absolute paths. */
   cwd?: string;
 }
 
+const CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
+const WINDOWS_DRIVE = /^[A-Za-z]:/u;
+const WINDOWS_ABSOLUTE = /^(?:[A-Za-z]:[\\/]|\\\\|\/\/|\\\\[?.]\\)/u;
+
+function isContained(
+  relative: string,
+  flavor: typeof path.posix | typeof path.win32,
+): boolean {
+  return (
+    relative === '' ||
+    (relative !== '..' &&
+      !relative.startsWith(`..${flavor.sep}`) &&
+      !flavor.isAbsolute(relative))
+  );
+}
+
+function basenameForAnyFlavor(value: string): string {
+  const normalized = value.replace(/\\/g, '/');
+  return path.posix.basename(normalized);
+}
+
+function relativeWithinTrustedCwd(raw: string, cwd: string): string | undefined {
+  const rawLooksWindows = WINDOWS_DRIVE.test(raw) || raw.startsWith('\\\\');
+  const cwdLooksWindows = WINDOWS_DRIVE.test(cwd) || cwd.startsWith('\\\\');
+
+  if (rawLooksWindows || cwdLooksWindows) {
+    if (!(rawLooksWindows && cwdLooksWindows)) return undefined;
+    const relative = path.win32.relative(path.win32.resolve(cwd), path.win32.resolve(raw));
+    return isContained(relative, path.win32) ? relative.replace(/\\/g, '/') || '.' : undefined;
+  }
+
+  const relative = path.posix.relative(path.posix.resolve(cwd), path.posix.resolve(raw));
+  return isContained(relative, path.posix) ? relative || '.' : undefined;
+}
+
 /**
- * Relativize or degrade a model-supplied path so no absolute host path
- * (drive prefix, home directory layout) crosses the host/webview boundary.
+ * Canonicalize an agent path without leaking host layout.
  *
- * Semantics match `workspaceRelativePath` in `src/task/engine-handoff.ts`
- * (reimplemented here rather than imported so shared stays free of task code).
+ * - absolute paths are relativized only when proven inside the trusted cwd;
+ *   otherwise they degrade to basename;
+ * - relative traversal that resolves outside cwd also degrades to basename;
+ * - Windows and POSIX flavors are handled independently of the host OS;
+ * - controls, bidi overrides/isolates, blank values, and oversized paths reject.
  */
 export function sanitizeToolFileChangePath(raw: string, cwd?: string): string {
-  // Strip NULs first so they cannot hide path separators or drive prefixes.
-  const cleaned = raw.replace(/\0/g, '').trim();
-  if (!cleaned) return cleaned;
+  if (raw.length === 0 || CONTROL_OR_BIDI.test(raw)) return '';
+  const cleaned = raw.trim();
+  if (!cleaned) return '';
 
-  if (cwd) {
-    const absCwd = path.resolve(cwd);
-    const absPath = path.isAbsolute(cleaned)
-      ? path.resolve(cleaned)
-      : path.resolve(absCwd, cleaned);
-    if (absPath === absCwd) return '.';
-    if (absPath.startsWith(`${absCwd}${path.sep}`)) {
-      return path.relative(absCwd, absPath).split(path.sep).join('/');
+  const absolute = path.posix.isAbsolute(cleaned) || WINDOWS_ABSOLUTE.test(cleaned);
+  let candidate: string;
+
+  if (absolute) {
+    const contained = cwd ? relativeWithinTrustedCwd(cleaned, cwd) : undefined;
+    candidate = contained ?? basenameForAnyFlavor(cleaned);
+  } else {
+    const normalized = cleaned.replace(/\\/g, '/');
+    if (cwd && normalized.split('/').includes('..')) {
+      const resolved = path.posix.resolve(cwd.replace(/\\/g, '/'), normalized);
+      const relative = path.posix.relative(cwd.replace(/\\/g, '/'), resolved);
+      candidate = isContained(relative, path.posix) ? relative || '.' : path.posix.basename(resolved);
+    } else {
+      candidate = path.posix.normalize(normalized);
     }
   }
 
-  // Absolute outside cwd (or absolute with no cwd): degrade to basename so
-  // host home directories / drive prefixes never leak.
-  if (path.isAbsolute(cleaned) || /^[A-Za-z]:[\\/]/.test(cleaned)) {
-    return path.basename(cleaned);
-  }
-
-  return cleaned.replace(/\\/g, '/');
+  // A file-change path equal to the workspace root is not a file identity.
+  if (candidate === '.') return '';
+  if (!isSafeRelativeToolPath(candidate)) return '';
+  if (utf8ByteLength(candidate) > TOOL_FILE_CHANGE_PATH_MAX_BYTES) return '';
+  return candidate;
 }
 
-function clipSide(text: string): { text: string; truncated: boolean } {
-  if (text.length <= TOOL_FILE_CHANGE_TEXT_MAX) {
-    return { text, truncated: false };
+function clipToLogicalLines(value: string): { text: string; truncated: boolean } {
+  if (logicalLineCount(value) <= TOOL_FILE_CHANGE_SIDE_MAX_LINES) {
+    return { text: value, truncated: false };
   }
-  const suffix = TOOL_FILE_CHANGE_TRUNCATION_SUFFIX;
-  // Ensure the clipped result (content + suffix) stays within the bound.
-  const usable = Math.max(0, TOOL_FILE_CHANGE_TEXT_MAX - suffix.length);
-  return { text: text.slice(0, usable) + suffix, truncated: true };
+  let newlineCount = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    if (value.charCodeAt(index) !== 10) continue;
+    newlineCount += 1;
+    if (newlineCount === TOOL_FILE_CHANGE_SIDE_MAX_LINES) {
+      return { text: value.slice(0, index + 1), truncated: true };
+    }
+  }
+  return { text: value, truncated: false };
 }
 
-/**
- * Bound and sanitize a list of tool file changes before persistence / projection.
- *
- * - `undefined` / `[]` → `{}` (absence stays byte-identical; never emits empty array)
- * - paths are sanitized; empty sanitized paths are dropped
- * - at most `TOOL_FILE_CHANGES_MAX_FILES` entries kept; remainder → `fileChangesOmitted`
- * - each `oldText`/`newText` side clipped independently; clipped entry gets `truncated: true`
- * - never mutates the input array or its entries
- */
+function clipToUtf8Bytes(value: string): { text: string; truncated: boolean } {
+  if (utf8ByteLength(value) <= TOOL_FILE_CHANGE_SIDE_MAX_BYTES) {
+    return { text: value, truncated: false };
+  }
+  let bytes = 0;
+  let text = '';
+  for (const character of value) {
+    const charBytes = utf8ByteLength(character);
+    if (bytes + charBytes > TOOL_FILE_CHANGE_SIDE_MAX_BYTES) break;
+    text += character;
+    bytes += charBytes;
+  }
+  return { text, truncated: true };
+}
+
+function clipSide(value: string): { text: string; truncated: boolean } {
+  const byLines = clipToLogicalLines(value);
+  const byBytes = clipToUtf8Bytes(byLines.text);
+  return { text: byBytes.text, truncated: byLines.truncated || byBytes.truncated };
+}
+
 export function boundToolFileChanges(
   changes: readonly BoundedToolFileChange[] | undefined,
   options?: BoundToolFileChangesOptions,
 ): BoundToolFileChangesResult {
-  if (changes === undefined || changes.length === 0) {
-    return {};
-  }
+  if (changes === undefined || changes.length === 0) return {};
 
-  const cwd = options?.cwd;
   const kept: BoundedToolFileChange[] = [];
   let omitted = 0;
+  let retainedBytes = 0;
 
   for (const entry of changes) {
-    const sanitizedPath = sanitizeToolFileChangePath(entry.path, cwd);
-    if (!sanitizedPath) {
-      // Empty after sanitize: drop without counting toward omitted.
+    if (
+      !entry ||
+      typeof entry !== 'object' ||
+      typeof entry.path !== 'string' ||
+      !(entry.oldText === null || typeof entry.oldText === 'string') ||
+      typeof entry.newText !== 'string'
+    ) {
+      omitted += 1;
       continue;
     }
-
+    const sanitizedPath = sanitizeToolFileChangePath(entry.path, options?.cwd);
+    if (!sanitizedPath) {
+      omitted += 1;
+      continue;
+    }
     if (kept.length >= TOOL_FILE_CHANGES_MAX_FILES) {
       omitted += 1;
       continue;
     }
 
-    let truncated = false;
+    let truncated = entry.truncated === true;
     let oldText: string | null = entry.oldText;
     if (oldText !== null) {
       const clipped = clipSide(oldText);
       oldText = clipped.text;
-      truncated = truncated || clipped.truncated;
+      truncated ||= clipped.truncated;
     }
-    const newClipped = clipSide(entry.newText);
-    const newText = newClipped.text;
-    truncated = truncated || newClipped.truncated;
+    const clippedNew = clipSide(entry.newText);
+    truncated ||= clippedNew.truncated;
 
-    const next: BoundedToolFileChange = {
+    const candidate: BoundedToolFileChange = {
       path: sanitizedPath,
       oldText,
-      newText,
+      newText: clippedNew.text,
+      ...(truncated ? { truncated: true } : {}),
     };
-    if (truncated) {
-      next.truncated = true;
+    const candidateBytes = toolFileChangeRetainedBytes(candidate);
+    if (retainedBytes + candidateBytes > TOOL_FILE_CHANGES_TOTAL_MAX_BYTES) {
+      omitted += 1;
+      continue;
     }
-    kept.push(next);
-  }
 
-  if (kept.length === 0) {
-    return {};
+    retainedBytes += candidateBytes;
+    kept.push(candidate);
   }
 
   return {
-    fileChanges: kept,
+    ...(kept.length > 0 ? { fileChanges: kept } : {}),
     ...(omitted > 0 ? { fileChangesOmitted: omitted } : {}),
   };
 }
