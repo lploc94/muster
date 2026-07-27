@@ -4,10 +4,9 @@ import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   TOOL_FILE_CHANGE_TEXT_MAX,
-  TOOL_FILE_CHANGE_TRUNCATION_SUFFIX,
   TOOL_FILE_CHANGES_MAX_FILES,
 } from '../shared/tool-file-changes';
-import { TaskEngine } from './engine';
+import { TaskEngine, type EngineEvent } from './engine';
 import { SqliteTaskRepository } from './repository';
 import { DbClient } from './sqlite/client';
 import type { MusterTask, PersistedToolCall } from './types';
@@ -154,6 +153,44 @@ describe('TaskEngine tool evidence persistence (M020 S01 T02)', () => {
     const toolItem = page.items.find((item) => item.kind === 'tool' && item.id === tool.id);
     expect(toolItem).toBeDefined();
     expect(toolItem?.kind).toBe('tool');
+  }, 60_000);
+
+  it('persists initial toolStarted evidence when completion does not repeat it', async () => {
+    const { repository } = await openRepo('start-then-complete');
+    const t = await seedTurn(repository, 'start-task', 'start-turn');
+    const fileChanges = [
+      { path: 'src/initial.ts', oldText: 'before\n', newText: 'after\n' },
+    ];
+
+    const engine = await TaskEngine.loadAsync({
+      workspaceId: 'ws',
+      repository,
+      makeBackend: () => ({ name: 'fake', run: async function* () {} }) as never,
+      runTurn: async function* () {
+        yield {
+          type: 'toolStarted',
+          toolCallId: 'initial-1',
+          name: 'Edit',
+          kind: 'builtin',
+          fileChanges,
+        };
+        yield {
+          type: 'toolCompleted',
+          toolCallId: 'initial-1',
+          outcome: 'success',
+          output: 'edited',
+        };
+        yield { type: 'turnCompleted' };
+      },
+      clock: () => '2026-07-16T00:00:02.000Z',
+    });
+
+    await engine.resumeQueuedTurnAsync(t.id, 'start-turn');
+    await engine.whenIdle().catch(() => undefined);
+
+    const tool = toolByCallId(await repository.listToolCalls(t.id), 'initial-1');
+    expect(tool.status).toBe('success');
+    expect(tool.fileChanges).toEqual(fileChanges);
   }, 60_000);
 
   it('merges fileChanges from toolUpdated and keeps them when a later complete omits them', async () => {
@@ -373,8 +410,10 @@ describe('TaskEngine tool evidence bounding (M020 S02 T02)', () => {
       const entry = tool.fileChanges?.[0];
       expect(entry).toBeDefined();
       expect(entry!.truncated).toBe(true);
-      expect(entry!.newText.length).toBeLessThanOrEqual(TOOL_FILE_CHANGE_TEXT_MAX);
-      expect(entry!.newText.endsWith(TOOL_FILE_CHANGE_TRUNCATION_SUFFIX)).toBe(true);
+      expect(Buffer.byteLength(entry!.newText, 'utf8')).toBeLessThanOrEqual(
+        TOOL_FILE_CHANGE_TEXT_MAX,
+      );
+      expect(entry!.newText).not.toContain('… truncated');
       expect(entry!.oldText).toBe('old');
       expect(tool.fileChangesOmitted).toBeUndefined();
     },
@@ -391,6 +430,7 @@ describe('TaskEngine tool evidence bounding (M020 S02 T02)', () => {
         newText: 'n',
       }));
 
+      const emitted: EngineEvent[] = [];
       const engine = await TaskEngine.loadAsync({
         workspaceId: 'ws',
         repository,
@@ -411,6 +451,7 @@ describe('TaskEngine tool evidence bounding (M020 S02 T02)', () => {
           };
           yield { type: 'turnCompleted' };
         },
+        emit: (event) => emitted.push(event),
         clock: () => '2026-07-16T00:00:02.000Z',
       });
 
@@ -422,6 +463,15 @@ describe('TaskEngine tool evidence bounding (M020 S02 T02)', () => {
       expect(tool.fileChanges?.[0]?.path).toBe('f0.ts');
       expect(tool.fileChanges?.[31]?.path).toBe('f31.ts');
       expect(tool.fileChangesOmitted).toBe(8);
+
+      const live = emitted.find(
+        (candidate): candidate is Extract<EngineEvent, { type: 'event' }> =>
+          candidate.type === 'event' &&
+          candidate.event.type === 'toolCompleted' &&
+          candidate.event.toolCallId === 'many-1',
+      );
+      expect(live?.event.fileChanges).toEqual(tool.fileChanges);
+      expect(live?.event.fileChangesOmitted).toBe(8);
     },
     60_000,
   );
@@ -550,9 +600,7 @@ describe('TaskEngine tool evidence bounding (M020 S02 T02)', () => {
       expect(before.fileChangesOmitted).toBe(3);
       expect(before.fileChanges?.[0]?.path).toBe('file0.ts');
       expect(before.fileChanges?.[0]?.truncated).toBe(true);
-      expect(before.fileChanges?.[0]?.newText.endsWith(TOOL_FILE_CHANGE_TRUNCATION_SUFFIX)).toBe(
-        true,
-      );
+      expect(before.fileChanges?.[0]?.newText).not.toContain('… truncated');
 
       // Close the original client, then reopen a fresh repository on the same db.
       await client.close().catch(() => undefined);
