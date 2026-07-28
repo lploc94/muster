@@ -2,12 +2,15 @@ import { describe, expect, it } from 'vitest';
 import {
   TOOL_DIFF_COLLAPSE_FILE_THRESHOLD,
   TOOL_DIFF_COLLAPSE_LINE_THRESHOLD,
+  TOOL_DIFF_CONTEXT_LINES,
   buildToolDiffView,
   countDiffLines,
   describeDiffFileForScreenReader,
   sanitizeDomIdPart,
   type ToolDiffFileView,
+  type ToolDiffLine,
 } from './tool-diff-view';
+import { TOOL_FILE_CHANGES_MAX_FILES, TOOL_FILE_CHANGE_SIDE_MAX_LINES } from '../../../src/shared/tool-file-change-contract';
 
 const MINUS = '\u2212';
 
@@ -329,6 +332,248 @@ describe('buildToolDiffView', () => {
     });
     expect(view.files[0].oldText).toBe('old-line');
     expect(view.files[0].newText).toBe('new-line');
+  });
+});
+
+/** Build a max-side single-change fixture: full retained line budget, one central edit. */
+function fullBudgetSingleChange(path: string): ReturnType<typeof change> {
+  const half = Math.floor(TOOL_FILE_CHANGE_SIDE_MAX_LINES / 2);
+  const leading = nLines(half, 'lead');
+  const trailing = nLines(TOOL_FILE_CHANGE_SIDE_MAX_LINES - half - 1, 'trail');
+  return change(
+    path,
+    `${leading}\nOLD\n${trailing}\n`,
+    `${leading}\nNEW\n${trailing}\n`,
+  );
+}
+
+function foldCount(lines: ToolDiffLine[]): number {
+  return lines.filter((line) => line.kind === 'fold').length;
+}
+
+function totalOmitted(lines: ToolDiffLine[]): number {
+  return lines.reduce(
+    (sum, line) => (line.kind === 'fold' ? sum + (line.omittedCount ?? 0) : sum),
+    0,
+  );
+}
+
+describe('M021 S03 compact unchanged context windows', () => {
+  it(`retains ${3} context lines around a hunk and folds the rest with exact counts`, () => {
+    expect(TOOL_DIFF_CONTEXT_LINES).toBe(3);
+    const leading = nLines(10, 'L');
+    const trailing = nLines(10, 'T');
+    const view = buildToolDiffView({
+      toolCallId: 'tc-window',
+      fileChanges: [
+        change(
+          'window.ts',
+          `${leading}\nold\n${trailing}\n`,
+          `${leading}\nnew\n${trailing}\n`,
+        ),
+      ],
+    });
+
+    const file = view.files[0]!;
+    expect(file.added).toBe(1);
+    expect(file.removed).toBe(1);
+    expect(view.totalAdded).toBe(1);
+    expect(view.totalRemoved).toBe(1);
+
+    expect(file.lines).toEqual([
+      { kind: 'fold', text: '', omittedCount: 7 },
+      { kind: 'context', text: 'L-8' },
+      { kind: 'context', text: 'L-9' },
+      { kind: 'context', text: 'L-10' },
+      { kind: 'removed', text: 'old' },
+      { kind: 'added', text: 'new' },
+      { kind: 'context', text: 'T-1' },
+      { kind: 'context', text: 'T-2' },
+      { kind: 'context', text: 'T-3' },
+      { kind: 'fold', text: '', omittedCount: 7 },
+    ]);
+    expect(file.lines).toHaveLength(10);
+    expect(totalOmitted(file.lines)).toBe(14);
+  });
+
+  it('does not emit fold rows when no context is omitted', () => {
+    const view = buildToolDiffView({
+      toolCallId: 'tc-small',
+      fileChanges: [
+        change(
+          'small.ts',
+          'a\nb\nc\nold\nd\ne\nf\n',
+          'a\nb\nc\nnew\nd\ne\nf\n',
+        ),
+      ],
+    });
+
+    expect(foldCount(view.files[0]!.lines)).toBe(0);
+    expect(view.files[0]!.lines.every((line) => line.kind !== 'fold')).toBe(true);
+    expect(view.files[0]!.lines).toHaveLength(8);
+  });
+
+  it('merges overlapping context windows for nearby hunks without a middle fold', () => {
+    // 3 context between hunks → fully covered by both windows, no middle omission.
+    const view = buildToolDiffView({
+      toolCallId: 'tc-near',
+      fileChanges: [
+        change(
+          'near.ts',
+          'A0\nA1\nA2\nA3\nold1\nM1\nM2\nM3\nold2\nB1\nB2\nB3\nB4\n',
+          'A0\nA1\nA2\nA3\nnew1\nM1\nM2\nM3\nnew2\nB1\nB2\nB3\nB4\n',
+        ),
+      ],
+    });
+
+    const kinds = view.files[0]!.lines.map((line) =>
+      line.kind === 'fold' ? `fold:${line.omittedCount}` : line.kind,
+    );
+    expect(kinds).toEqual([
+      'fold:1',
+      'context',
+      'context',
+      'context',
+      'removed',
+      'added',
+      'context',
+      'context',
+      'context',
+      'removed',
+      'added',
+      'context',
+      'context',
+      'context',
+      'fold:1',
+    ]);
+    expect(kinds.filter((k) => k.startsWith('fold'))).toHaveLength(2);
+  });
+
+  it('inserts an exact middle fold between distant hunks', () => {
+    const middle = nLines(7, 'M');
+    const view = buildToolDiffView({
+      toolCallId: 'tc-far',
+      fileChanges: [
+        change(
+          'far.ts',
+          `old1\n${middle}\nold2\n`,
+          `new1\n${middle}\nnew2\n`,
+        ),
+      ],
+    });
+
+    const file = view.files[0]!;
+    // 3 after first + 1 omitted + 3 before second = 7 middle context
+    expect(file.lines).toEqual([
+      { kind: 'removed', text: 'old1' },
+      { kind: 'added', text: 'new1' },
+      { kind: 'context', text: 'M-1' },
+      { kind: 'context', text: 'M-2' },
+      { kind: 'context', text: 'M-3' },
+      { kind: 'fold', text: '', omittedCount: 1 },
+      { kind: 'context', text: 'M-5' },
+      { kind: 'context', text: 'M-6' },
+      { kind: 'context', text: 'M-7' },
+      { kind: 'removed', text: 'old2' },
+      { kind: 'added', text: 'new2' },
+    ]);
+  });
+
+  it('folds pure context (identical sides) into one counted row and keeps counts at zero', () => {
+    const view = buildToolDiffView({
+      toolCallId: 'tc-identical',
+      fileChanges: [change('same.ts', nLines(12, 'same') + '\n', nLines(12, 'same') + '\n')],
+    });
+
+    expect(view.files[0]).toMatchObject({ added: 0, removed: 0 });
+    expect(view.files[0]!.lines).toEqual([{ kind: 'fold', text: '', omittedCount: 12 }]);
+  });
+
+  it('does not count fold rows as added or removed', () => {
+    const view = buildToolDiffView({
+      toolCallId: 'tc-counts',
+      fileChanges: [
+        change('c.ts', `${nLines(20, 'L')}\nold\n${nLines(20, 'T')}\n`, `${nLines(20, 'L')}\nnew\n${nLines(20, 'T')}\n`),
+      ],
+    });
+    expect(view.files[0]!.added).toBe(1);
+    expect(view.files[0]!.removed).toBe(1);
+    expect(view.totalAdded).toBe(1);
+    expect(view.totalRemoved).toBe(1);
+    expect(foldCount(view.files[0]!.lines)).toBe(2);
+  });
+
+  it('compacts CRLF context the same way as LF context', () => {
+    const leading = Array.from({ length: 8 }, (_, i) => `L-${i + 1}`).join('\r\n');
+    const trailing = Array.from({ length: 8 }, (_, i) => `T-${i + 1}`).join('\r\n');
+    const view = buildToolDiffView({
+      toolCallId: 'tc-crlf-fold',
+      fileChanges: [
+        change(
+          'crlf-fold.ts',
+          `${leading}\r\nold\r\n${trailing}\r\n`,
+          `${leading}\r\nnew\r\n${trailing}\r\n`,
+        ),
+      ],
+    });
+
+    expect(view.files[0]!.lines[0]).toEqual({ kind: 'fold', text: '', omittedCount: 5 });
+    expect(view.files[0]!.lines.at(-1)).toEqual({ kind: 'fold', text: '', omittedCount: 5 });
+    expect(view.files[0]).toMatchObject({ added: 1, removed: 1 });
+  });
+
+  it('does not mutate the source line model input while compacting', () => {
+    const entry = change('imm.ts', `${nLines(10, 'L')}\nold\n`, `${nLines(10, 'L')}\nnew\n`);
+    const input = { toolCallId: 'tc-imm', fileChanges: [entry] };
+    const snapshot = structuredClone(input);
+    const view = buildToolDiffView(input);
+    expect(input).toEqual(snapshot);
+    expect(foldCount(view.files[0]!.lines)).toBe(1);
+  });
+
+  it('computes collapsedByDefault from rendered row total including fold rows', () => {
+    // Three full-budget single-change files: ~10 rendered rows each → 30 > line threshold.
+    const view = buildToolDiffView({
+      toolCallId: 'tc-collapse-rendered',
+      fileChanges: [
+        fullBudgetSingleChange('a.ts'),
+        fullBudgetSingleChange('b.ts'),
+        fullBudgetSingleChange('c.ts'),
+      ],
+    });
+
+    expect(view.files).toHaveLength(3);
+    for (const file of view.files) {
+      expect(file.lines.length).toBeLessThanOrEqual(10);
+      expect(file.added).toBe(1);
+      expect(file.removed).toBe(1);
+      expect(foldCount(file.lines)).toBe(2);
+    }
+    const rendered = view.files.reduce((sum, file) => sum + file.lines.length, 0);
+    expect(rendered).toBeGreaterThan(TOOL_DIFF_COLLAPSE_LINE_THRESHOLD);
+    expect(view.totalAdded + view.totalRemoved).toBe(6); // would NOT collapse on changed-only metric
+    expect(view.collapsedByDefault).toBe(true);
+  });
+
+  it('bounds the max 32-file retained-budget model to a counted row ceiling', () => {
+    const files = Array.from({ length: TOOL_FILE_CHANGES_MAX_FILES }, (_, i) =>
+      fullBudgetSingleChange(`f${i}.ts`),
+    );
+    const view = buildToolDiffView({ toolCallId: 'tc-max', fileChanges: files });
+
+    expect(view.files).toHaveLength(TOOL_FILE_CHANGES_MAX_FILES);
+    let rendered = 0;
+    for (const file of view.files) {
+      expect(file.lines.length).toBeLessThanOrEqual(10);
+      expect(file.added + file.removed).toBe(2);
+      // Every changed row remains visible.
+      expect(file.lines.some((line) => line.kind === 'removed')).toBe(true);
+      expect(file.lines.some((line) => line.kind === 'added')).toBe(true);
+      rendered += file.lines.length;
+    }
+    // 32 files × ≤10 rows = ≤320 rendered nodes when expanded.
+    expect(rendered).toBeLessThanOrEqual(TOOL_FILE_CHANGES_MAX_FILES * 10);
+    expect(view.collapsedByDefault).toBe(true);
   });
 });
 

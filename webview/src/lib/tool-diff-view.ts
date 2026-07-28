@@ -15,10 +15,15 @@ import { diffLines } from 'diff';
 export const TOOL_DIFF_COLLAPSE_FILE_THRESHOLD = 3;
 
 /**
- * Collapse when total changed lines (added + removed) across all entries is
+ * Collapse when total rendered rows (including fold rows) across all entries is
  * greater than this. Deliberately above the S01/S02 Playwright fixture sizes.
  */
 export const TOOL_DIFF_COLLAPSE_LINE_THRESHOLD = 24;
+/**
+ * Unchanged context lines retained immediately before and after each change hunk.
+ * Contiguous omitted context is replaced by one counted fold row.
+ */
+export const TOOL_DIFF_CONTEXT_LINES = 3;
 /** Synchronous jsdiff work budget; abort falls back to an explicitly partial view. */
 export const TOOL_DIFF_MAX_EDIT_LENGTH = 1_000;
 /** One synchronous comparison budget shared by every file in a ToolCard. */
@@ -39,11 +44,14 @@ export interface BuildToolDiffViewInput {
   fileChangesOmitted?: number;
 }
 
-export type ToolDiffLineKind = 'context' | 'added' | 'removed';
+export type ToolDiffLineKind = 'context' | 'added' | 'removed' | 'fold';
 
 export interface ToolDiffLine {
   kind: ToolDiffLineKind;
+  /** Source text for context/added/removed; empty string for fold rows. */
   text: string;
+  /** Exact omitted unchanged-line count; present only on fold rows. */
+  omittedCount?: number;
 }
 
 export interface ToolDiffFileView {
@@ -120,7 +128,64 @@ function buildDiffLines(
     for (const text of operationLineValues) lines.push({ kind, text });
   }
 
-  return { lines, removed, added, comparisonUnavailable: false };
+  return {
+    lines: compactDiffContext(lines),
+    removed,
+    added,
+    comparisonUnavailable: false,
+  };
+}
+
+/**
+ * Keep only TOOL_DIFF_CONTEXT_LINES unchanged lines on each side of every
+ * added/removed hunk, merge overlapping windows, and replace each omitted
+ * contiguous context run with one fold row carrying the exact omitted count.
+ * Never mutates the input array or its line objects.
+ */
+export function compactDiffContext(lines: ReadonlyArray<ToolDiffLine>): ToolDiffLine[] {
+  if (lines.length === 0) return [];
+
+  const keepContext = new Array<boolean>(lines.length).fill(false);
+  for (let index = 0; index < lines.length; index++) {
+    const kind = lines[index]!.kind;
+    if (kind !== 'added' && kind !== 'removed') continue;
+    for (let distance = 1; distance <= TOOL_DIFF_CONTEXT_LINES; distance++) {
+      const before = index - distance;
+      const after = index + distance;
+      if (before >= 0 && lines[before]!.kind === 'context') keepContext[before] = true;
+      if (after < lines.length && lines[after]!.kind === 'context') keepContext[after] = true;
+    }
+  }
+
+  const compacted: ToolDiffLine[] = [];
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index]!;
+    if (line.kind === 'added' || line.kind === 'removed') {
+      compacted.push(line);
+      index += 1;
+      continue;
+    }
+    if (line.kind === 'context' && keepContext[index]) {
+      compacted.push(line);
+      index += 1;
+      continue;
+    }
+    // Contiguous omitted context (or pure-context input with no change anchors).
+    let omitted = 0;
+    while (
+      index < lines.length &&
+      lines[index]!.kind === 'context' &&
+      !keepContext[index]
+    ) {
+      omitted += 1;
+      index += 1;
+    }
+    if (omitted > 0) {
+      compacted.push({ kind: 'fold', text: '', omittedCount: omitted });
+    }
+  }
+  return compacted;
 }
 
 /** Count only real added/removed operations, excluding unchanged context. */
@@ -210,10 +275,14 @@ export function buildToolDiffView(input: BuildToolDiffViewInput): ToolDiffView {
     });
   }
 
-  const totalChanged = totalAdded + totalRemoved;
+  // Collapse on rendered presentation cost (context + changes + fold rows),
+  // not only added/removed counts — large unchanged context is already compacted
+  // but three full-budget files still exceed the line threshold via fold rows.
+  let totalRenderedRows = 0;
+  for (const file of files) totalRenderedRows += file.lines.length;
   const collapsedByDefault =
     files.length > TOOL_DIFF_COLLAPSE_FILE_THRESHOLD ||
-    totalChanged > TOOL_DIFF_COLLAPSE_LINE_THRESHOLD;
+    totalRenderedRows > TOOL_DIFF_COLLAPSE_LINE_THRESHOLD;
 
   const view: ToolDiffView = {
     collapsedByDefault,
