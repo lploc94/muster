@@ -15,8 +15,10 @@ import {
   findMissingEntrypoints,
 } from './packaging-archive-census.mjs';
 import {
+  applyHostStageToEvidence,
   buildEntrypointResults,
   buildPackagingGateEvidence,
+  parseHostSmokeResult,
 } from './run-packaging-gate.mjs';
 
 const FIXTURE_ENTRIES = [
@@ -122,4 +124,141 @@ test('buildPackagingGateEvidence fails closed when entrypoints are missing', () 
   });
   assert.equal(evidence.missingEntrypoints.length, 3);
   assert.equal(evidence.ok, false);
+});
+
+function packagingBaseEvidence() {
+  const census = buildArchiveCensus(FIXTURE_ENTRIES);
+  const allowlist = evaluateAllowlist(census, PACKAGING_ALLOWLIST);
+  const missing = findMissingEntrypoints(FIXTURE_ENTRIES, REQUIRED_ARCHIVE_ENTRYPOINTS);
+  const entrypoints = buildEntrypointResults({
+    entryNames: FIXTURE_ENTRIES,
+    requiredEntrypoints: REQUIRED_ARCHIVE_ENTRYPOINTS,
+    fileExists: () => true,
+  });
+  return buildPackagingGateEvidence({
+    census,
+    allowlistResult: allowlist,
+    missingEntrypoints: missing,
+    entrypoints,
+    mode: 'full',
+  });
+}
+
+test('parseHostSmokeResult accepts a successful host smoke payload', () => {
+  const parsed = parseHostSmokeResult({
+    kind: 'm022-s01-packaging-host-smoke',
+    ok: true,
+    activation: 'ok',
+    bridge: { port: 41234, status: 'ok', generation: 1 },
+    bridgePhase: 'ok',
+    entrypoints: [
+      {
+        path: 'extension/dist/src/extension.js',
+        present: true,
+        resolved: true,
+        phase: 'ok',
+      },
+      {
+        path: 'extension/dist/src/task/sqlite/worker.js',
+        present: true,
+        resolved: true,
+        phase: 'ok',
+      },
+      {
+        path: 'extension/dist/src/bridge/mcp-stdio-proxy.js',
+        present: true,
+        resolved: true,
+        phase: 'ok',
+      },
+    ],
+  });
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.activation, 'ok');
+  assert.equal(parsed.bridge.port, 41234);
+  assert.equal(parsed.bridgePhase, 'ok');
+  assert.equal(parsed.entrypoints.length, 3);
+});
+
+test('parseHostSmokeResult classifies missing/invalid host output as activation failure', () => {
+  const missing = parseHostSmokeResult(null);
+  assert.equal(missing.ok, false);
+  assert.equal(missing.activation, 'failed');
+  assert.equal(missing.bridgePhase, 'activation');
+  assert.equal(missing.bridge, null);
+
+  const badKind = parseHostSmokeResult({ kind: 'wrong', activation: 'ok' });
+  assert.equal(badKind.ok, false);
+  assert.equal(badKind.bridgePhase, 'activation');
+});
+
+test('applyHostStageToEvidence promotes activation/bridge and recomputes ok for full mode', () => {
+  const base = packagingBaseEvidence();
+  assert.equal(base.activation, 'deferred');
+  assert.equal(base.bridge, null);
+
+  const merged = applyHostStageToEvidence(
+    base,
+    parseHostSmokeResult({
+      kind: 'm022-s01-packaging-host-smoke',
+      ok: true,
+      activation: 'ok',
+      bridge: { port: 55555, status: 'ok', generation: 2 },
+      bridgePhase: 'ok',
+      entrypoints: base.entrypoints.map((r) => ({ ...r, phase: 'ok', resolved: true, present: true })),
+    }),
+  );
+
+  assert.equal(merged.mode, 'full');
+  assert.equal(merged.activation, 'ok');
+  assert.deepEqual(merged.bridge, { port: 55555, status: 'ok', generation: 2 });
+  assert.equal(merged.ok, true);
+  assert.equal(merged.bridgePhase, 'ok');
+});
+
+test('applyHostStageToEvidence fails closed when bridge is not listening', () => {
+  const base = packagingBaseEvidence();
+  const merged = applyHostStageToEvidence(
+    base,
+    parseHostSmokeResult({
+      kind: 'm022-s01-packaging-host-smoke',
+      ok: false,
+      activation: 'ok',
+      bridge: { port: 0, status: 'unavailable', generation: 0 },
+      bridgePhase: 'health-unreachable',
+      entrypoints: base.entrypoints,
+    }),
+  );
+  assert.equal(merged.activation, 'ok');
+  assert.equal(merged.ok, false);
+  assert.equal(merged.bridgePhase, 'health-unreachable');
+  assert.equal(merged.bridge.status, 'unavailable');
+});
+
+test('applyHostStageToEvidence fails closed when stdio proxy require graph fails', () => {
+  const base = packagingBaseEvidence();
+  const entrypoints = base.entrypoints.map((r) =>
+    r.path.endsWith('mcp-stdio-proxy.js')
+      ? {
+          ...r,
+          resolved: false,
+          phase: 'require-failed',
+          detail: 'MODULE_NOT_FOUND: express',
+        }
+      : r,
+  );
+  const merged = applyHostStageToEvidence(
+    base,
+    parseHostSmokeResult({
+      kind: 'm022-s01-packaging-host-smoke',
+      ok: false,
+      activation: 'ok',
+      bridge: { port: 4000, status: 'ok', generation: 1 },
+      bridgePhase: 'ok',
+      entrypoints,
+    }),
+  );
+  assert.equal(merged.ok, false);
+  const proxy = merged.entrypoints.find((r) => r.path.endsWith('mcp-stdio-proxy.js'));
+  assert.equal(proxy.phase, 'require-failed');
+  assert.equal(proxy.resolved, false);
 });

@@ -1,7 +1,7 @@
 {
   "kind": "m022-s01-packaging-gate",
   "ok": true,
-  "mode": "census-only",
+  "mode": "full",
   "totalEntries": 16050,
   "nodeModulesEntryCount": 15801,
   "nonNodeModulesEntries": 249,
@@ -497,8 +497,13 @@
       "phase": "ok"
     }
   ],
-  "activation": "deferred",
-  "bridge": null,
-  "generatedAt": "2026-07-28T23:03:05.218Z",
-  "durationMs": 41876
+  "activation": "ok",
+  "bridge": {
+    "port": 63853,
+    "status": "ok",
+    "generation": 1
+  },
+  "bridgePhase": "ok",
+  "generatedAt": "2026-07-28T23:09:36.150Z",
+  "durationMs": 49536
 }
