@@ -50,6 +50,11 @@ export interface ToolFileChangeEvidenceShape {
   oldText: string | null;
   newText: string;
   truncated?: boolean;
+  /**
+   * Present only when the original agent path resolved outside the trusted
+   * workspace. Always `true` when set — never `false`.
+   */
+  outsideWorkspace?: true;
 }
 
 export function toolFileChangeRetainedBytes(change: ToolFileChangeEvidenceShape): number {
@@ -64,11 +69,18 @@ export function isBoundedToolFileChange(change: unknown): change is ToolFileChan
   if (typeof change !== 'object' || change === null || Array.isArray(change)) return false;
   const value = change as Record<string, unknown>;
   const keys = Object.keys(value);
-  if (keys.some((key) => !['path', 'oldText', 'newText', 'truncated'].includes(key))) return false;
+  if (
+    keys.some(
+      (key) => !['path', 'oldText', 'newText', 'truncated', 'outsideWorkspace'].includes(key),
+    )
+  ) {
+    return false;
+  }
   if (typeof value.path !== 'string' || !isSafeRelativeToolPath(value.path)) return false;
   if (!(value.oldText === null || typeof value.oldText === 'string')) return false;
   if (typeof value.newText !== 'string') return false;
   if (value.truncated !== undefined && value.truncated !== true) return false;
+  if (value.outsideWorkspace !== undefined && value.outsideWorkspace !== true) return false;
   for (const side of [value.oldText, value.newText]) {
     if (typeof side !== 'string') continue;
     if (utf8ByteLength(side) > TOOL_FILE_CHANGE_SIDE_MAX_BYTES) return false;

@@ -30,6 +30,17 @@ export interface BoundedToolFileChange {
   newText: string;
   /** Present only when either side was clipped by a byte or line bound. */
   truncated?: boolean;
+  /**
+   * Present only when the original agent path resolved outside the trusted
+   * workspace. Always `true` when set — never `false`.
+   */
+  outsideWorkspace?: true;
+}
+
+/** Path classification after sanitization; empty path means rejected. */
+export interface ClassifiedToolFileChangePath {
+  path: string;
+  outsideWorkspace?: true;
 }
 
 export interface BoundToolFileChangesResult {
@@ -79,41 +90,64 @@ function relativeWithinTrustedCwd(raw: string, cwd: string): string | undefined 
 }
 
 /**
- * Canonicalize an agent path without leaking host layout.
+ * Canonicalize and classify an agent path without leaking host layout.
  *
  * - absolute paths are relativized only when proven inside the trusted cwd;
- *   otherwise they degrade to basename;
- * - relative traversal that resolves outside cwd also degrades to basename;
+ *   otherwise they degrade to basename and set outsideWorkspace: true;
+ * - relative traversal that resolves outside cwd also degrades to basename
+ *   and sets outsideWorkspace: true;
  * - Windows and POSIX flavors are handled independently of the host OS;
- * - controls, bidi overrides/isolates, blank values, and oversized paths reject.
+ * - controls, bidi overrides/isolates, blank values, and oversized paths reject
+ *   with an empty path (no marker).
  */
-export function sanitizeToolFileChangePath(raw: string, cwd?: string): string {
-  if (raw.length === 0 || CONTROL_OR_BIDI.test(raw)) return '';
+export function classifyToolFileChangePath(
+  raw: string,
+  cwd?: string,
+): ClassifiedToolFileChangePath {
+  if (raw.length === 0 || CONTROL_OR_BIDI.test(raw)) return { path: '' };
   const cleaned = raw.trim();
-  if (!cleaned) return '';
+  if (!cleaned) return { path: '' };
 
   const absolute = path.posix.isAbsolute(cleaned) || WINDOWS_ABSOLUTE.test(cleaned);
   let candidate: string;
+  let outsideWorkspace = false;
 
   if (absolute) {
     const contained = cwd ? relativeWithinTrustedCwd(cleaned, cwd) : undefined;
-    candidate = contained ?? basenameForAnyFlavor(cleaned);
+    if (contained !== undefined) {
+      candidate = contained;
+    } else {
+      candidate = basenameForAnyFlavor(cleaned);
+      outsideWorkspace = true;
+    }
   } else {
     const normalized = cleaned.replace(/\\/g, '/');
     if (cwd && normalized.split('/').includes('..')) {
       const resolved = path.posix.resolve(cwd.replace(/\\/g, '/'), normalized);
       const relative = path.posix.relative(cwd.replace(/\\/g, '/'), resolved);
-      candidate = isContained(relative, path.posix) ? relative || '.' : path.posix.basename(resolved);
+      if (isContained(relative, path.posix)) {
+        candidate = relative || '.';
+      } else {
+        candidate = path.posix.basename(resolved);
+        outsideWorkspace = true;
+      }
     } else {
       candidate = path.posix.normalize(normalized);
     }
   }
 
   // A file-change path equal to the workspace root is not a file identity.
-  if (candidate === '.') return '';
-  if (!isSafeRelativeToolPath(candidate)) return '';
-  if (utf8ByteLength(candidate) > TOOL_FILE_CHANGE_PATH_MAX_BYTES) return '';
-  return candidate;
+  if (candidate === '.') return { path: '' };
+  if (!isSafeRelativeToolPath(candidate)) return { path: '' };
+  if (utf8ByteLength(candidate) > TOOL_FILE_CHANGE_PATH_MAX_BYTES) return { path: '' };
+  return outsideWorkspace
+    ? { path: candidate, outsideWorkspace: true }
+    : { path: candidate };
+}
+
+/** Canonicalize-only wrapper; use classifyToolFileChangePath when the marker is needed. */
+export function sanitizeToolFileChangePath(raw: string, cwd?: string): string {
+  return classifyToolFileChangePath(raw, cwd).path;
 }
 
 function clipToLogicalLines(value: string): { text: string; truncated: boolean } {
@@ -173,8 +207,8 @@ export function boundToolFileChanges(
       omitted += 1;
       continue;
     }
-    const sanitizedPath = sanitizeToolFileChangePath(entry.path, options?.cwd);
-    if (!sanitizedPath) {
+    const classified = classifyToolFileChangePath(entry.path, options?.cwd);
+    if (!classified.path) {
       omitted += 1;
       continue;
     }
@@ -193,11 +227,16 @@ export function boundToolFileChanges(
     const clippedNew = clipSide(entry.newText);
     truncated ||= clippedNew.truncated;
 
+    // Present-only marker: set by classification or preserved from prior rebound.
+    const outsideWorkspace =
+      classified.outsideWorkspace === true || entry.outsideWorkspace === true;
+
     const candidate: BoundedToolFileChange = {
-      path: sanitizedPath,
+      path: classified.path,
       oldText,
       newText: clippedNew.text,
       ...(truncated ? { truncated: true } : {}),
+      ...(outsideWorkspace ? { outsideWorkspace: true } : {}),
     };
     const candidateBytes = toolFileChangeRetainedBytes(candidate);
     if (retainedBytes + candidateBytes > TOOL_FILE_CHANGES_TOTAL_MAX_BYTES) {
