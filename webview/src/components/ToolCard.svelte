@@ -167,8 +167,14 @@
                   </div>
                 {:else}
                   <pre class="tool-card__diff-body text-[10px] bg-[var(--vscode-textCodeBlock-background)] p-1 rounded max-h-48">
-{#each file.lines as line}<span class="tool-card__diff-line tool-card__diff-line--{line.kind}">{line.kind === 'added' ? '+' : line.kind === 'removed' ? '-' : ' '}{line.text}
-</span>{/each}</pre>
+{#each file.lines as line}{#if line.kind === 'fold'}<span
+                      class="tool-card__diff-line tool-card__diff-line--fold"
+                      data-omitted-count={line.omittedCount ?? 0}
+                    >{line.omittedCount ?? 0} unchanged line{(line.omittedCount ?? 0) === 1
+                        ? ''
+                        : 's'} omitted</span
+                    >{:else}<span class="tool-card__diff-line tool-card__diff-line--{line.kind}">{line.kind === 'added' ? '+' : line.kind === 'removed' ? '-' : ' '}{line.text}
+</span>{/if}{/each}</pre>
                 {/if}
                 {#if file.truncated}
                   <div
@@ -346,6 +352,12 @@
       var(--vscode-testing-iconPassed, var(--vscode-charts-green, #89d185)) 12%,
       transparent
     );
+  }
+
+  /* Folded context (M021 S03) — counted omission marker, never a source line. */
+  .tool-card__diff-line--fold {
+    color: var(--vscode-descriptionForeground);
+    font-style: italic;
   }
 
   /* Honest bound markers (M020 S02) — description tone, not error chrome. */

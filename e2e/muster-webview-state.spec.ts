@@ -10580,6 +10580,190 @@ test.describe('M019 S05 Assembled First Run', () => {
     await expect(card.getByText('tiny-old')).toBeVisible();
     await expect(card.getByText('tiny-new')).toBeVisible();
   });
+  test('M021 S03 fold: three full-budget files collapse and expand within row bounds', async ({
+    page,
+  }) => {
+    await openWebview(page);
+
+    // Roadmap demo: 3 files × full 2,000-line retained budget with one central
+    // change. Context windows compact to ≤10 rows/file (2 folds + 6 context +
+    // rem + add); rendered total 30 > line threshold → collapsed by default.
+    const SIDE = 2_000;
+    const half = Math.floor(SIDE / 2); // 1000 leading
+    const nLines = (n: number, prefix: string): string =>
+      Array.from({ length: n }, (_, i) => `${prefix}-${i + 1}`).join('\n');
+    const leading = nLines(half, 'lead');
+    const trailing = nLines(SIDE - half - 1, 'trail'); // 999
+    // Keep 3 context on each side → omit 997 leading + 996 trailing.
+    const LEAD_OMITTED = half - 3; // 997
+    const TRAIL_OMITTED = SIDE - half - 1 - 3; // 996
+    const fullBudget = (filePath: string) => ({
+      path: filePath,
+      oldText: `${leading}\nOLD\n${trailing}\n`,
+      newText: `${leading}\nNEW\n${trailing}\n`,
+    });
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-m021-s03-fold', goal: 'Bounded context windows' })],
+      focusedTaskId: 'task-m021-s03-fold',
+      subtree: [task({ id: 'task-m021-s03-fold', goal: 'Bounded context windows' })],
+      transcript: [
+        {
+          id: 'tool-m021-s03-fold-1',
+          kind: 'tool',
+          turnId: 'turn-m021-s03-fold',
+          order: 0,
+          content: {
+            toolCallId: 'tc-m021-s03-fold-1',
+            name: 'MultiEdit',
+            toolKind: 'builtin',
+            status: 'success',
+            fileChanges: [
+              fullBudget('src/a.ts'),
+              fullBudget('src/b.ts'),
+              fullBudget('src/c.ts'),
+            ],
+          },
+        },
+      ],
+      storeRevision: 1,
+    });
+
+    const card = page.locator('.tool-card').filter({ hasText: 'MultiEdit' });
+    await expect(card).toBeVisible();
+    await expect(card.locator('.tool-card__diff-file')).toHaveCount(3);
+
+    // Collapsed bodies mount zero line/fold DOM.
+    const toggles = card.locator('button.tool-card__diff-toggle');
+    await expect(toggles).toHaveCount(3);
+    for (let i = 0; i < 3; i++) {
+      await expect(toggles.nth(i)).toHaveAttribute('aria-expanded', 'false');
+    }
+    await expect(card.locator('.tool-card__diff-line')).toHaveCount(0);
+    await expect(card.locator('.tool-card__diff-line--fold')).toHaveCount(0);
+
+    // Expand every file body and assert the rendered bound.
+    for (let i = 0; i < 3; i++) {
+      await toggles.nth(i).click();
+      await expect(toggles.nth(i)).toHaveAttribute('aria-expanded', 'true');
+    }
+
+    const files = card.locator('.tool-card__diff-file');
+    await expect(files).toHaveCount(3);
+    for (let i = 0; i < 3; i++) {
+      const file = files.nth(i);
+      const bodyId = await toggles.nth(i).getAttribute('aria-controls');
+      expect(bodyId).toBeTruthy();
+      const body = card.locator(`#${bodyId}`);
+      await expect(body).toHaveAttribute('data-collapsed', 'false');
+
+      // ≤10 rendered rows per full-budget single-change file.
+      const lines = body.locator('.tool-card__diff-line');
+      const lineCount = await lines.count();
+      expect(lineCount).toBeGreaterThan(0);
+      expect(lineCount).toBeLessThanOrEqual(10);
+
+      // Fold rows are explicit counted markers, not ordinary empty source lines.
+      const folds = body.locator('.tool-card__diff-line--fold');
+      await expect(folds).toHaveCount(2);
+      await expect(folds.nth(0)).toHaveAttribute('data-omitted-count', String(LEAD_OMITTED));
+      await expect(folds.nth(1)).toHaveAttribute('data-omitted-count', String(TRAIL_OMITTED));
+      await expect(folds.nth(0)).toContainText(`${LEAD_OMITTED} unchanged lines omitted`);
+      await expect(folds.nth(1)).toContainText(`${TRAIL_OMITTED} unchanged lines omitted`);
+      // No +/- prefix on fold markers (not source lines).
+      const foldText = (await folds.nth(0).textContent()) ?? '';
+      expect(foldText.startsWith('-') || foldText.startsWith('+')).toBe(false);
+
+      // Every changed row remains visible after compaction.
+      await expect(
+        body.locator('.tool-card__diff-line--removed').filter({ hasText: 'OLD' }),
+      ).toHaveCount(1);
+      await expect(
+        body.locator('.tool-card__diff-line--added').filter({ hasText: 'NEW' }),
+      ).toHaveCount(1);
+
+      // Per-file counts stay exact (fold rows never counted as added/removed).
+      await expect(file.locator('.tool-card__diff-counts')).toContainText('+1');
+      await expect(file.locator('.tool-card__diff-counts')).toContainText('−1');
+    }
+
+    // Expanded total across three files stays bounded (≤30 nodes).
+    const allLines = card.locator('.tool-card__diff-line');
+    expect(await allLines.count()).toBeLessThanOrEqual(30);
+
+    // Inert rendering: model text never becomes live markup.
+    await expect(card.locator('img')).toHaveCount(0);
+  });
+
+  test('M021 S03 fold: always-expanded small window renders counted fold markers', async ({
+    page,
+  }) => {
+    await openWebview(page);
+
+    // 10 leading + change + 10 trailing → 2 folds + 6 context + rem + add = 10
+    // rows, under the collapse threshold so bodies stay open with no toggle.
+    const nLines = (n: number, prefix: string): string =>
+      Array.from({ length: n }, (_, i) => `${prefix}-${i + 1}`).join('\n');
+    const leading = nLines(10, 'L');
+    const trailing = nLines(10, 'T');
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-m021-s03-small-fold', goal: 'Small folded window' })],
+      focusedTaskId: 'task-m021-s03-small-fold',
+      subtree: [task({ id: 'task-m021-s03-small-fold', goal: 'Small folded window' })],
+      transcript: [
+        {
+          id: 'tool-m021-s03-small-fold-1',
+          kind: 'tool',
+          turnId: 'turn-m021-s03-small-fold',
+          order: 0,
+          content: {
+            toolCallId: 'tc-m021-s03-small-fold-1',
+            name: 'Edit',
+            toolKind: 'builtin',
+            status: 'success',
+            fileChanges: [
+              {
+                path: 'src/window.ts',
+                oldText: `${leading}\nold\n${trailing}\n`,
+                newText: `${leading}\nnew\n${trailing}\n`,
+              },
+            ],
+          },
+        },
+      ],
+      storeRevision: 1,
+    });
+
+    const card = page.locator('.tool-card').filter({ hasText: 'Edit' });
+    await expect(card).toBeVisible();
+
+    // Small fixture: no disclosure button, body already open.
+    await expect(card.locator('button.tool-card__diff-toggle')).toHaveCount(0);
+    await expect(card.locator('.tool-card__diff-summary-static')).toHaveCount(1);
+
+    const lines = card.locator('.tool-card__diff-line');
+    expect(await lines.count()).toBeLessThanOrEqual(10);
+
+    const folds = card.locator('.tool-card__diff-line--fold');
+    await expect(folds).toHaveCount(2);
+    await expect(folds.nth(0)).toHaveAttribute('data-omitted-count', '7');
+    await expect(folds.nth(1)).toHaveAttribute('data-omitted-count', '7');
+    await expect(folds.nth(0)).toContainText('7 unchanged lines omitted');
+    await expect(folds.nth(1)).toContainText('7 unchanged lines omitted');
+
+    // Kept context + changes are ordinary source lines; folds are not.
+    // Context rows carry a single leading space prefix (diff gutter).
+    await expect(card.getByText(' L-8', { exact: true })).toHaveCount(1);
+    await expect(card.locator('.tool-card__diff-line--removed').filter({ hasText: 'old' })).toHaveCount(1);
+    await expect(card.locator('.tool-card__diff-line--added').filter({ hasText: 'new' })).toHaveCount(1);
+    // Omitted source text must not appear (exact: true so L-10 does not match L-1).
+    await expect(card.getByText(' L-1', { exact: true })).toHaveCount(0);
+    await expect(card.getByText(' T-10', { exact: true })).toHaveCount(0);
+  });
+
 });
 
 declare global {
