@@ -10023,6 +10023,7 @@ test.describe('M019 S05 Assembled First Run', () => {
 
     const card = page.locator('.tool-card').filter({ hasText: 'Edit' });
     await expect(card).toBeVisible();
+    await card.locator('button.tool-card__diff-toggle').click();
     await expect(card.locator('.tool-card__diff-line--removed')).toContainText(
       '-const value = 1;',
     );
@@ -10103,7 +10104,9 @@ test.describe('M019 S05 Assembled First Run', () => {
     await expect(card).toBeVisible();
     await expect(card.getByText('src/hello.ts')).toBeVisible();
 
-    // Inline removed/added lines visible without expanding params/result payloads.
+    // Diff bodies are lazy and only mount after the per-file disclosure is opened.
+    await expect(card.locator('.tool-card__diff-line')).toHaveCount(0);
+    await card.locator('button.tool-card__diff-toggle').click();
     const removed = card.locator('.tool-card__diff-line--removed');
     const added = card.locator('.tool-card__diff-line--added');
     await expect(removed.filter({ hasText: oldLine })).toBeVisible();
@@ -10311,12 +10314,12 @@ test.describe('M019 S05 Assembled First Run', () => {
     // Truncation chrome only when truncated:true is set on an entry.
     await expect(card.locator('.tool-card__diff-truncated')).toHaveCount(0);
   });
-  test('M020 S03 collapse: multi-file over threshold starts collapsed with counts and expands', async ({
+  test('M020 S03 collapse: multi-file diff starts collapsed with counts and expands', async ({
     page,
   }) => {
     await openWebview(page);
 
-    // 4 files > TOOL_DIFF_COLLAPSE_FILE_THRESHOLD (3) → size-gated collapse.
+    // Every file body starts collapsed regardless of retained diff size.
     await postSnapshot(page, {
       type: 'snapshot',
       rootTasks: [task({ id: 'task-s03-collapse', goal: 'Edit four files' })],
@@ -10536,7 +10539,7 @@ test.describe('M019 S05 Assembled First Run', () => {
     expect(normalMs.some((n) => n > 0)).toBe(true);
   });
 
-  test('M020 S03 size-gate: small fixture stays expanded without disclosure button', async ({
+  test('M020 S03 lazy diff: small fixture starts collapsed with counts and expands', async ({
     page,
   }) => {
     await openWebview(page);
@@ -10574,9 +10577,12 @@ test.describe('M019 S05 Assembled First Run', () => {
     await expect(card).toBeVisible();
 
     await expect(card.locator('.tool-card__diff-counts')).toContainText('+1');
-    await expect(card.locator('button.tool-card__diff-toggle')).toHaveCount(0);
-    await expect(card.locator('.tool-card__diff-summary-static')).toHaveCount(1);
+    const toggle = card.locator('button.tool-card__diff-toggle');
+    await expect(toggle).toHaveCount(1);
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    await expect(card.locator('.tool-card__diff-line')).toHaveCount(0);
 
+    await toggle.click();
     await expect(card.getByText('tiny-old')).toBeVisible();
     await expect(card.getByText('tiny-new')).toBeVisible();
   });
@@ -10696,13 +10702,13 @@ test.describe('M019 S05 Assembled First Run', () => {
     await expect(card.locator('img')).toHaveCount(0);
   });
 
-  test('M021 S03 fold: always-expanded small window renders counted fold markers', async ({
+  test('M021 S03 fold: expanded small window renders counted fold markers', async ({
     page,
   }) => {
     await openWebview(page);
 
     // 10 leading + change + 10 trailing → 2 folds + 6 context + rem + add = 10
-    // rows, under the collapse threshold so bodies stay open with no toggle.
+    // rows after the user expands the body.
     const nLines = (n: number, prefix: string): string =>
       Array.from({ length: n }, (_, i) => `${prefix}-${i + 1}`).join('\n');
     const leading = nLines(10, 'L');
@@ -10740,10 +10746,13 @@ test.describe('M019 S05 Assembled First Run', () => {
     const card = page.locator('.tool-card').filter({ hasText: 'Edit' });
     await expect(card).toBeVisible();
 
-    // Small fixture: no disclosure button, body already open.
-    await expect(card.locator('button.tool-card__diff-toggle')).toHaveCount(0);
-    await expect(card.locator('.tool-card__diff-summary-static')).toHaveCount(1);
+    // Every fixture starts collapsed; full diff rows mount only after expansion.
+    const toggle = card.locator('button.tool-card__diff-toggle');
+    await expect(toggle).toHaveCount(1);
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    await expect(card.locator('.tool-card__diff-line')).toHaveCount(0);
 
+    await toggle.click();
     const lines = card.locator('.tool-card__diff-line');
     expect(await lines.count()).toBeLessThanOrEqual(10);
 

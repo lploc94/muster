@@ -771,8 +771,8 @@ export function createStaticFirstRunBackendsReadinessSnapshot(
 
 /**
  * M021/S03 bounded folded-diff surface for the compact visual golden.
- * Small always-expanded window (10 lead + change + 10 trail) so counted fold
- * markers are visible without disclosure interaction. Synthetic only.
+ * Small window (10 lead + change + 10 trail) whose counted fold markers appear
+ * after disclosure interaction. Synthetic only.
  */
 export function createStaticBoundedDiffFixture() {
   const nLines = (n: number, prefix: string): string =>

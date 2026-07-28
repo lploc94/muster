@@ -19,8 +19,7 @@
 
   /**
    * Per-file body open overrides, keyed by bodyId from buildToolDiffView.
-   * Only consulted when the view is size-gated collapsed-by-default; small
-   * diffs always render bodies open so S01/S02 fixtures stay interaction-free.
+   * Full diff lines are computed by the file view only after this becomes true.
    */
   let fileBodyExpanded = $state<Record<string, boolean>>({});
 
@@ -81,18 +80,15 @@
     expandedOverride = !expanded;
   }
 
-  function isFileBodyExpanded(view: ToolDiffView, bodyId: string): boolean {
-    // Small diffs: always open — size-gated collapse only, never unconditional.
-    if (!view.collapsedByDefault) return true;
+  function isFileBodyExpanded(bodyId: string): boolean {
     if (Object.prototype.hasOwnProperty.call(fileBodyExpanded, bodyId)) {
       return fileBodyExpanded[bodyId] === true;
     }
     return false;
   }
 
-  function toggleFileBody(view: ToolDiffView, bodyId: string) {
-    if (!view.collapsedByDefault) return;
-    const next = !isFileBodyExpanded(view, bodyId);
+  function toggleFileBody(bodyId: string) {
+    const next = !isFileBodyExpanded(bodyId);
     fileBodyExpanded = { ...fileBodyExpanded, [bodyId]: next };
   }
 </script>
@@ -122,7 +118,7 @@
   {#if diffView}
     <div class="tool-card__diff mt-1.5" role="group" aria-label="File changes">
       {#each diffView.files as file (file.bodyId)}
-        {@const bodyOpen = isFileBodyExpanded(diffView, file.bodyId)}
+        {@const bodyOpen = isFileBodyExpanded(file.bodyId)}
         {@const srSummary = describeDiffFileForScreenReader(file)}
         <div class="tool-card__diff-file">
           <div class="tool-card__diff-summary">
@@ -134,7 +130,7 @@
                 aria-expanded={bodyOpen}
                 aria-controls={file.bodyId}
                 aria-label={srSummary}
-                onclick={() => toggleFileBody(diffView, file.bodyId)}
+                onclick={() => toggleFileBody(file.bodyId)}
               >
                 <span
                   class="codicon {bodyOpen ? 'codicon-chevron-down' : 'codicon-chevron-right'} tool-card__diff-chevron"

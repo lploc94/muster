@@ -343,7 +343,7 @@ test.describe('visual matrix · main webview', () => {
   test(`M021 S03 bounded diff context · ${WEBVIEW_VISUAL_BOUNDED_DIFF_ID}`, async ({
     page,
   }) => {
-    // Pinned Linux golden for counted fold markers on a small always-expanded
+    // Pinned Linux golden for counted fold markers after expanding a small
     // window. Browser fixtures only — not a native Extension Host claim.
     await page.setViewportSize(COMPACT_WEBVIEW_VIEWPORT);
     await installVisualEnvironment(page, { theme: 'dark' });
@@ -361,8 +361,12 @@ test.describe('visual matrix · main webview', () => {
     await expect(card).toBeVisible();
     await expect(card.getByText('src/window.ts')).toBeVisible();
 
-    // Always-expanded small window: no disclosure toggle; fold markers present.
-    await expect(card.locator('button.tool-card__diff-toggle')).toHaveCount(0);
+    // Diff bodies are collapsed until the user opens the per-file disclosure.
+    const toggle = card.locator('button.tool-card__diff-toggle');
+    await expect(toggle).toHaveCount(1);
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    await expect(card.locator('.tool-card__diff-line')).toHaveCount(0);
+    await toggle.click();
     const folds = card.locator('.tool-card__diff-line--fold');
     await expect(folds).toHaveCount(2);
     await expect(folds.nth(0)).toHaveAttribute('data-omitted-count', '7');

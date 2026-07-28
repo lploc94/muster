@@ -122,12 +122,12 @@ describe('buildToolDiffView', () => {
     expect(view.files[0]).toMatchObject({ added: 1, removed: 1 });
   });
 
-  it('builds per-file counts and leaves small single-file diffs expanded', () => {
+  it('builds per-file counts and keeps the diff body collapsed', () => {
     const view = buildToolDiffView({
       toolCallId: 'tc-1',
       fileChanges: [change('src/a.ts', 'old\n', 'new\nextra\n')],
     });
-    expect(view.collapsedByDefault).toBe(false);
+    expect(view.collapsedByDefault).toBe(true);
     expect(view.files).toHaveLength(1);
     expect(view.files[0]).toMatchObject({
       path: 'src/a.ts',
@@ -148,17 +148,17 @@ describe('buildToolDiffView', () => {
     expect(view.fileChangesOmitted).toBeUndefined();
   });
 
-  it('stays expanded at exactly the file threshold', () => {
+  it('keeps the diff body collapsed at the file threshold', () => {
     const files = Array.from({ length: TOOL_DIFF_COLLAPSE_FILE_THRESHOLD }, (_, i) =>
       change(`f${i}.ts`, 'a', 'b'),
     );
     // 3 files * 2 lines = 6 total changed — well under line threshold
     const view = buildToolDiffView({ toolCallId: 'tc', fileChanges: files });
     expect(files).toHaveLength(3);
-    expect(view.collapsedByDefault).toBe(false);
+    expect(view.collapsedByDefault).toBe(true);
   });
 
-  it('collapses when file count exceeds the file threshold', () => {
+  it('keeps the diff body collapsed beyond the former file threshold', () => {
     const files = Array.from({ length: TOOL_DIFF_COLLAPSE_FILE_THRESHOLD + 1 }, (_, i) =>
       change(`f${i}.ts`, 'a', 'b'),
     );
@@ -167,7 +167,7 @@ describe('buildToolDiffView', () => {
     expect(view.files).toHaveLength(4);
   });
 
-  it('does not collapse large unchanged context around a small edit', () => {
+  it('keeps counts available while large unchanged context stays collapsed', () => {
     const context = nLines(30, 'shared');
     const view = buildToolDiffView({
       toolCallId: 'tc-context',
@@ -177,20 +177,20 @@ describe('buildToolDiffView', () => {
     });
 
     expect(view.totalAdded + view.totalRemoved).toBe(2);
-    expect(view.collapsedByDefault).toBe(false);
+    expect(view.collapsedByDefault).toBe(true);
   });
 
-  it('stays expanded at exactly the line threshold', () => {
+  it('keeps the diff body collapsed at exactly the line threshold', () => {
     // 12 removed + 12 added = 24 total changed lines, one file
     const view = buildToolDiffView({
       toolCallId: 'tc',
       fileChanges: [change('big.ts', nLines(12, 'old'), nLines(12, 'new'))],
     });
     expect(view.totalAdded + view.totalRemoved).toBe(TOOL_DIFF_COLLAPSE_LINE_THRESHOLD);
-    expect(view.collapsedByDefault).toBe(false);
+    expect(view.collapsedByDefault).toBe(true);
   });
 
-  it('collapses when total changed lines exceed the line threshold', () => {
+  it('keeps the diff body collapsed beyond the former line threshold', () => {
     // 13 removed + 12 added = 25
     const view = buildToolDiffView({
       toolCallId: 'tc',
@@ -531,8 +531,7 @@ describe('M021 S03 compact unchanged context windows', () => {
     expect(foldCount(view.files[0]!.lines)).toBe(1);
   });
 
-  it('computes collapsedByDefault from rendered row total including fold rows', () => {
-    // Three full-budget single-change files: ~10 rendered rows each → 30 > line threshold.
+  it('keeps full diff lines lazy until the body is read', () => {
     const view = buildToolDiffView({
       toolCallId: 'tc-collapse-rendered',
       fileChanges: [
@@ -543,15 +542,8 @@ describe('M021 S03 compact unchanged context windows', () => {
     });
 
     expect(view.files).toHaveLength(3);
-    for (const file of view.files) {
-      expect(file.lines.length).toBeLessThanOrEqual(10);
-      expect(file.added).toBe(1);
-      expect(file.removed).toBe(1);
-      expect(foldCount(file.lines)).toBe(2);
-    }
-    const rendered = view.files.reduce((sum, file) => sum + file.lines.length, 0);
-    expect(rendered).toBeGreaterThan(TOOL_DIFF_COLLAPSE_LINE_THRESHOLD);
-    expect(view.totalAdded + view.totalRemoved).toBe(6); // would NOT collapse on changed-only metric
+    expect(Object.getOwnPropertyDescriptor(view.files[0]!, 'lines')?.get).toBeTypeOf('function');
+    expect(view.totalAdded + view.totalRemoved).toBe(6);
     expect(view.collapsedByDefault).toBe(true);
   });
 

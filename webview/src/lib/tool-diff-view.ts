@@ -4,19 +4,18 @@ import { diffLines } from 'diff';
  * Pure tool-diff presentation helpers (M020 S03).
  *
  * I/O-free: no Svelte, DOM, or host imports. Builds an exact line-operation
- * model and applies the size-gated collapse policy so ToolCard does not need to
- * compare or duplicate old/new text itself.
+ * model and keeps full line rendering lazy so ToolCard does not need to compare
+ * or duplicate old/new text itself.
  *
  * Input is already bounded by S02 (`TOOL_FILE_CHANGES_MAX_FILES`,
  * `TOOL_FILE_CHANGE_TEXT_MAX`).
  */
 
-/** Collapse when the number of rendered file entries is greater than this. */
+/** Legacy fixture threshold retained for callers that size-test diff evidence. */
 export const TOOL_DIFF_COLLAPSE_FILE_THRESHOLD = 3;
 
 /**
- * Collapse when total rendered rows (including fold rows) across all entries is
- * greater than this. Deliberately above the S01/S02 Playwright fixture sizes.
+ * Legacy fixture threshold retained for callers that size-test diff evidence.
  */
 export const TOOL_DIFF_COLLAPSE_LINE_THRESHOLD = 24;
 /**
@@ -106,10 +105,11 @@ function operationLines(value: string): string[] {
   return lines;
 }
 
-function buildDiffLines(
+function compareDiffLines(
   oldText: string | null,
   newText: string,
   timeoutMs: number,
+  includeLines: boolean,
 ): { lines: ToolDiffLine[]; removed: number; added: number; comparisonUnavailable: boolean } {
   if (timeoutMs <= 0) {
     return { lines: [], removed: 0, added: 0, comparisonUnavailable: true };
@@ -138,15 +138,25 @@ function buildDiffLines(
     const operationLineValues = operationLines(operation.value);
     if (kind === 'added') added += operationLineValues.length;
     if (kind === 'removed') removed += operationLineValues.length;
-    for (const text of operationLineValues) lines.push({ kind, text });
+    if (includeLines) {
+      for (const text of operationLineValues) lines.push({ kind, text });
+    }
   }
 
   return {
-    lines: compactDiffContext(lines),
+    lines: includeLines ? compactDiffContext(lines) : [],
     removed,
     added,
     comparisonUnavailable: false,
   };
+}
+
+function buildDiffLines(
+  oldText: string | null,
+  newText: string,
+  timeoutMs: number,
+): { lines: ToolDiffLine[]; removed: number; added: number; comparisonUnavailable: boolean } {
+  return compareDiffLines(oldText, newText, timeoutMs, true);
 }
 
 /**
@@ -206,7 +216,7 @@ export function countDiffLines(
   oldText: string | null,
   newText: string,
 ): { removed: number; added: number } {
-  const { removed, added } = buildDiffLines(oldText, newText, TOOL_DIFF_TOTAL_TIMEOUT_MS);
+  const { removed, added } = compareDiffLines(oldText, newText, TOOL_DIFF_TOTAL_TIMEOUT_MS, false);
   return { removed, added };
 }
 
@@ -275,21 +285,28 @@ export function buildToolDiffView(input: BuildToolDiffViewInput): ToolDiffView {
     const occurrence = evidenceOccurrences.get(fingerprint) ?? 0;
     evidenceOccurrences.set(fingerprint, occurrence + 1);
     const fileIdSeed = `${toolIdSeed}-${sanitizeDomIdPart(entry.path)}-${fingerprint}-${occurrence}`;
-    const { lines, added, removed, comparisonUnavailable } = buildDiffLines(
+    const { added, removed, comparisonUnavailable } = compareDiffLines(
       entry.oldText,
       entry.newText,
       Math.max(0, deadline - Date.now()),
+      false,
     );
     const truncated = entry.truncated === true;
     const countsPartial = truncated;
     const outsideWorkspace = entry.outsideWorkspace === true;
     totalAdded += added;
     totalRemoved += removed;
-    files.push({
+    let lines: ToolDiffLine[] | undefined;
+    const file: ToolDiffFileView = {
       path: entry.path,
       oldText: entry.oldText,
       newText: entry.newText,
-      lines,
+      get lines() {
+        if (lines === undefined) {
+          lines = buildDiffLines(entry.oldText, entry.newText, TOOL_DIFF_TOTAL_TIMEOUT_MS).lines;
+        }
+        return lines;
+      },
       added,
       removed,
       truncated,
@@ -299,20 +316,12 @@ export function buildToolDiffView(input: BuildToolDiffViewInput): ToolDiffView {
       bodyId: `tool-diff-body-${fileIdSeed}`,
       toggleId: `tool-diff-toggle-${fileIdSeed}`,
       countsLabel: formatCountsLabel(added, removed, countsPartial, comparisonUnavailable),
-    });
+    };
+    files.push(file);
   }
 
-  // Collapse on rendered presentation cost (context + changes + fold rows),
-  // not only added/removed counts — large unchanged context is already compacted
-  // but three full-budget files still exceed the line threshold via fold rows.
-  let totalRenderedRows = 0;
-  for (const file of files) totalRenderedRows += file.lines.length;
-  const collapsedByDefault =
-    files.length > TOOL_DIFF_COLLAPSE_FILE_THRESHOLD ||
-    totalRenderedRows > TOOL_DIFF_COLLAPSE_LINE_THRESHOLD;
-
   const view: ToolDiffView = {
-    collapsedByDefault,
+    collapsedByDefault: true,
     totalAdded,
     totalRemoved,
     files,
