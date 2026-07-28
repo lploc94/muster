@@ -53,6 +53,14 @@ function transcriptToThreadItem(item: TranscriptItem): ThreadItem | null {
         input?: unknown;
         output?: unknown;
         error?: string;
+        fileChanges?: Array<{
+          path: string;
+          oldText: string | null;
+          newText: string;
+          truncated?: boolean;
+          outsideWorkspace?: true;
+        }>;
+        fileChangesOmitted?: number;
       };
       return {
         kind: 'tool',
@@ -63,6 +71,12 @@ function transcriptToThreadItem(item: TranscriptItem): ThreadItem | null {
         input: t?.input,
         output: t?.output,
         error: t?.error,
+        ...(t?.fileChanges !== undefined && t.fileChanges.length > 0
+          ? { fileChanges: t.fileChanges }
+          : {}),
+        ...(t?.fileChangesOmitted !== undefined && t.fileChangesOmitted > 0
+          ? { fileChangesOmitted: t.fileChangesOmitted }
+          : {}),
         turnId: item.turnId,
         order: item.order,
       };

@@ -1,10 +1,64 @@
+/**
+ * Structured file-change evidence from an ACP `tool_call` / `tool_call_update`
+ * `diff` content block (`zToolCallContent` union).
+ *
+ * On the wire from the agent, `path` may be absolute. The engine bounds and
+ * sanitizes before persistence (M020 S02): paths become workspace-relative
+ * POSIX or basename-only, and oversized sides may set `truncated: true`.
+ * `oldText` is null when the file is created.
+ */
+export interface ToolFileChange {
+  path: string;
+  oldText: string | null;
+  newText: string;
+  /** Present only when a side was clipped by the engine bound; never `false`. */
+  truncated?: boolean;
+  /**
+   * Present only when the agent-reported path resolved outside the trusted
+   * workspace (M021 S04). Path is already basename-only when this is set;
+   * never `false` — absent means in-workspace or unclassified-safe.
+   */
+  outsideWorkspace?: true;
+}
+
 export type NormalizedEvent =
   | { type: 'sessionStarted'; sessionId?: string; meta?: Record<string, unknown> }
   | { type: 'assistantDelta'; content: string; messageId: string; meta?: Record<string, unknown> }
   | { type: 'reasoningDelta'; content: string; messageId: string; meta?: Record<string, unknown> }
-  | { type: 'toolStarted'; toolCallId: string; name: string; kind?: 'mcp' | 'builtin' | 'other'; input?: unknown; meta?: Record<string, unknown> }
-  | { type: 'toolUpdated'; toolCallId: string; input?: unknown; meta?: Record<string, unknown> }
-  | { type: 'toolCompleted'; toolCallId: string; outcome: 'success' | 'error'; output?: unknown; error?: string; meta?: Record<string, unknown> }
+  | {
+      type: 'toolStarted';
+      toolCallId: string;
+      name: string;
+      kind?: 'mcp' | 'builtin' | 'other';
+      input?: unknown;
+      /** Optional ACP diff-block evidence, including initial tool_call content. */
+      fileChanges?: ToolFileChange[];
+      /** Number of entries omitted by engine bounds; absent on raw adapter events. */
+      fileChangesOmitted?: number;
+      meta?: Record<string, unknown>;
+    }
+  | {
+      type: 'toolUpdated';
+      toolCallId: string;
+      input?: unknown;
+      /** Optional ACP diff-block evidence (M020). Omitted when absent. */
+      fileChanges?: ToolFileChange[];
+      /** Number of entries omitted by engine bounds; absent on raw adapter events. */
+      fileChangesOmitted?: number;
+      meta?: Record<string, unknown>;
+    }
+  | {
+      type: 'toolCompleted';
+      toolCallId: string;
+      outcome: 'success' | 'error';
+      output?: unknown;
+      error?: string;
+      /** Optional ACP diff-block evidence (M020). Omitted when absent. */
+      fileChanges?: ToolFileChange[];
+      /** Number of entries omitted by engine bounds; absent on raw adapter events. */
+      fileChangesOmitted?: number;
+      meta?: Record<string, unknown>;
+    }
   | { type: 'usage'; usage: Record<string, unknown>; meta?: Record<string, unknown> }
   | { type: 'turnCompleted'; meta?: Record<string, unknown> }
   | { type: 'error'; message: string; isCancellation?: boolean; raw?: unknown; meta?: Record<string, unknown> }

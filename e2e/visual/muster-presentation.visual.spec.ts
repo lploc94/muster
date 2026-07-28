@@ -44,11 +44,20 @@ async function openPresentationVisual(
 ): Promise<void> {
   await installVisualEnvironment(page, { theme });
   await openMusterPresentation(page, {
-    initialState: fixture,
+    initialState: {
+      rootId: fixture.ownerTaskId,
+      presentationId: fixture.presentationId,
+    },
     structuredCloneMessages: false,
     stateMode: 'direct',
     waitForReady: true,
   });
+  await page.evaluate(
+    ({ document, rootId }) => {
+      window.postMessage({ type: 'presentationUpdate', document, rootId }, '*');
+    },
+    { document: fixture, rootId: fixture.ownerTaskId },
+  );
   await ensureVisualEnvironmentApplied(page);
 }
 

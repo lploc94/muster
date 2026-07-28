@@ -569,3 +569,47 @@ describe('workspace-patch-reducer', () => {
     expect(result.state.tasks.get('task-1')).toEqual(next);
   });
 });
+
+
+describe('M021 S04 outsideWorkspace through workspace patch projection', () => {
+  it('preserves present-only outsideWorkspace on appended tool fileChanges', () => {
+    let state = applySnapshotToPatchView(emptyWorkspacePatchViewState(), focusedSnapshot(1));
+    const result = applyWorkspacePatchBatch(
+      state,
+      batch(2, [
+        {
+          type: 'transcriptItemsAppended',
+          taskId: 'task-1',
+          items: [
+            {
+              id: 'tool-out',
+              kind: 'tool',
+              turnId: 'turn-out',
+              order: 2,
+              content: {
+                toolCallId: 'tc-out',
+                name: 'Edit',
+                status: 'success',
+                fileChanges: [
+                  {
+                    path: 'outside.ts',
+                    oldText: 'a',
+                    newText: 'b',
+                    outsideWorkspace: true,
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ]),
+    );
+    expect(result.kind).toBe('applied');
+    const tool = result.state.transcriptItems.find((i) => i.id === 'tool-out');
+    expect(tool && tool.kind === 'tool' ? tool.fileChanges : null).toEqual([
+      { path: 'outside.ts', oldText: 'a', newText: 'b', outsideWorkspace: true },
+    ]);
+    const serialized = JSON.stringify(result.state.transcriptItems);
+    expect(serialized).not.toMatch(/\/tmp\/|Users\\|C:\\/);
+  });
+});

@@ -38,6 +38,13 @@ export const M014_S02_FLOW_TITLE: string = manifest.flowTitle;
 export const M019_S05_FIRST_RUN_BACKENDS_VISUAL_ID =
   'M019-S05-first-run-backends-compact-dark' as const;
 
+/**
+ * M021/S03 bounded folded-diff visual golden id (matrix case V08).
+ * Grepped by the S03 gate as "M021 S03 bounded diff context".
+ */
+export const M021_S03_BOUNDED_DIFF_VISUAL_ID =
+  'V08-webview-bounded-diff-dark' as const;
+
 /** Bounded representative visual matrix (≤ VISUAL_MATRIX_MAX_CASES). */
 export const VISUAL_MATRIX_CASES: readonly VisualMatrixCase[] =
   manifest.cases as VisualMatrixCase[];

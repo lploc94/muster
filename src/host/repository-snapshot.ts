@@ -1,7 +1,7 @@
 import type { PendingAskOverlay, TaskSnapshot, TranscriptItem, TranscriptPageState } from './snapshot';
-import { buildSnapshot } from './snapshot';
+import { buildSnapshot, projectPersistedToolCall } from './snapshot';
 import type { RepositoryTranscriptItem, TaskRepository } from '../task/repository';
-import type { EngineProjection } from '../task/types';
+import type { EngineProjection, PersistedToolCall } from '../task/types';
 
 /** Bounded page size for the focused-task bootstrap transcript (W4). */
 export const BOOTSTRAP_TRANSCRIPT_LIMIT = 100;
@@ -22,23 +22,37 @@ export interface RepositorySnapshotProjection {
 export function toHostTranscriptItem(item: RepositoryTranscriptItem): TranscriptItem {
   if (item.kind === 'tool') {
     const content = item.content as Record<string, unknown>;
-    return {
+    const persistedKind = content.kind ?? content.toolKind;
+    const kind =
+      persistedKind === 'mcp' || persistedKind === 'builtin' || persistedKind === 'other'
+        ? persistedKind
+        : undefined;
+    const status =
+      content.status === 'success' || content.status === 'error' || content.status === 'running'
+        ? content.status
+        : 'running';
+    const tool: PersistedToolCall = {
       id: item.id,
-      kind: 'tool',
+      taskId: '',
       turnId: item.turnId,
+      toolCallId: String(content.toolCallId ?? ''),
       order: item.order,
-      content: {
-        toolCallId: String(content.toolCallId ?? ''),
-        name: String(content.name ?? ''),
-        ...(typeof content.toolKind === 'string'
-          ? { toolKind: content.toolKind as 'mcp' | 'builtin' | 'other' }
-          : {}),
-        status: (content.status as 'running' | 'success' | 'error') ?? 'running',
-        ...(content.input !== undefined ? { input: content.input } : {}),
-        ...(content.output !== undefined ? { output: content.output } : {}),
-        ...(typeof content.error === 'string' ? { error: content.error } : {}),
-      },
+      name: String(content.name ?? ''),
+      ...(kind !== undefined ? { kind } : {}),
+      status,
+      ...(content.input !== undefined ? { input: content.input } : {}),
+      ...(content.output !== undefined ? { output: content.output } : {}),
+      ...(typeof content.error === 'string' ? { error: content.error } : {}),
+      ...(Array.isArray(content.fileChanges)
+        ? { fileChanges: content.fileChanges as PersistedToolCall['fileChanges'] }
+        : {}),
+      ...(typeof content.fileChangesOmitted === 'number'
+        ? { fileChangesOmitted: content.fileChangesOmitted }
+        : {}),
+      createdAt: item.createdAt ?? '',
+      updatedAt: item.createdAt ?? '',
     };
+    return projectPersistedToolCall(tool);
   }
   if (item.kind === 'reasoning') {
     return { id: item.id, kind: 'reasoning', turnId: item.turnId, order: item.order, content: item.content };

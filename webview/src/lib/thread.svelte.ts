@@ -63,6 +63,14 @@ function transcriptToThreadItem(item: TranscriptItem): ThreadItem | null {
         input?: unknown;
         output?: unknown;
         error?: string;
+        fileChanges?: Array<{
+          path: string;
+          oldText: string | null;
+          newText: string;
+          truncated?: boolean;
+          outsideWorkspace?: true;
+        }>;
+        fileChangesOmitted?: number;
       };
       return {
         kind: 'tool',
@@ -73,6 +81,13 @@ function transcriptToThreadItem(item: TranscriptItem): ThreadItem | null {
         input: t?.input,
         output: t?.output,
         error: t?.error,
+        // M020: optional ACP diff evidence — omit when absent (never empty array).
+        ...(t?.fileChanges !== undefined && t.fileChanges.length > 0
+          ? { fileChanges: t.fileChanges }
+          : {}),
+        ...(t?.fileChangesOmitted !== undefined && t.fileChangesOmitted > 0
+          ? { fileChangesOmitted: t.fileChangesOmitted }
+          : {}),
         turnId: item.turnId,
         order: item.order,
       };
@@ -407,6 +422,15 @@ export class TaskThread {
           existing.toolKind = ev.kind;
           existing.status = 'running';
           if (ev.input !== undefined) existing.input = ev.input;
+          if (ev.fileChanges !== undefined) {
+            if (ev.fileChanges.length > 0) existing.fileChanges = ev.fileChanges;
+            else delete existing.fileChanges;
+          }
+          if (ev.fileChangesOmitted !== undefined) {
+            existing.fileChangesOmitted = ev.fileChangesOmitted;
+          } else if (ev.fileChanges !== undefined) {
+            delete existing.fileChangesOmitted;
+          }
         } else {
           this.items.push({
             kind: 'tool',
@@ -416,6 +440,12 @@ export class TaskThread {
             toolKind: ev.kind,
             status: 'running',
             input: ev.input,
+            ...(ev.fileChanges !== undefined && ev.fileChanges.length > 0
+              ? { fileChanges: ev.fileChanges }
+              : {}),
+            ...(ev.fileChangesOmitted !== undefined
+              ? { fileChangesOmitted: ev.fileChangesOmitted }
+              : {}),
           });
         }
         break;
@@ -426,8 +456,22 @@ export class TaskThread {
         const id = `${this.activeTurnId}:${ev.toolCallId}`;
         this.loadedTranscriptIds.add(id);
         const tool = this.findTool(id);
+        // M020 S02: attach live fileChanges mid-turn (not only hydrate/patch path).
+        const liveFileChanges =
+          ev.fileChanges !== undefined && ev.fileChanges.length > 0
+            ? { fileChanges: ev.fileChanges }
+            : {};
         if (tool) {
           if (ev.input !== undefined) tool.input = ev.input;
+          if (ev.fileChanges !== undefined) {
+            if (ev.fileChanges.length > 0) tool.fileChanges = ev.fileChanges;
+            else delete tool.fileChanges;
+          }
+          if (ev.fileChangesOmitted !== undefined) {
+            tool.fileChangesOmitted = ev.fileChangesOmitted;
+          } else if (ev.fileChanges !== undefined) {
+            delete tool.fileChangesOmitted;
+          }
         } else {
           this.items.push({
             kind: 'tool',
@@ -436,6 +480,10 @@ export class TaskThread {
             name: 'tool',
             status: 'running',
             input: ev.input,
+            ...liveFileChanges,
+            ...(ev.fileChangesOmitted !== undefined
+              ? { fileChangesOmitted: ev.fileChangesOmitted }
+              : {}),
           });
         }
         break;
@@ -447,10 +495,24 @@ export class TaskThread {
         this.loadedTranscriptIds.add(id);
         const tool = this.findTool(id);
         const status = ev.outcome === 'error' ? 'error' : 'success';
+        // M020 S02: attach live fileChanges mid-turn (not only hydrate/patch path).
+        const liveFileChanges =
+          ev.fileChanges !== undefined && ev.fileChanges.length > 0
+            ? { fileChanges: ev.fileChanges }
+            : {};
         if (tool) {
           tool.status = status;
           if (ev.outcome === 'error') tool.error = ev.error;
           else tool.output = ev.output;
+          if (ev.fileChanges !== undefined) {
+            if (ev.fileChanges.length > 0) tool.fileChanges = ev.fileChanges;
+            else delete tool.fileChanges;
+          }
+          if (ev.fileChangesOmitted !== undefined) {
+            tool.fileChangesOmitted = ev.fileChangesOmitted;
+          } else if (ev.fileChanges !== undefined) {
+            delete tool.fileChangesOmitted;
+          }
         } else {
           this.items.push({
             kind: 'tool',
@@ -460,6 +522,10 @@ export class TaskThread {
             status,
             output: ev.outcome === 'error' ? undefined : ev.output,
             error: ev.outcome === 'error' ? ev.error : undefined,
+            ...liveFileChanges,
+            ...(ev.fileChangesOmitted !== undefined
+              ? { fileChangesOmitted: ev.fileChangesOmitted }
+              : {}),
           });
         }
         break;

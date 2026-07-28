@@ -23,10 +23,12 @@ import {
   normalizeVisualChrome,
   normalizeVisualScroll,
   waitForVisualReady,
+  VISUAL_PROTOCOL_VERSION,
   type VisualThemeKind,
 } from '../fixtures/visual-environment';
 import {
   M014_S02_FLOW_TITLE,
+  M021_S03_BOUNDED_DIFF_VISUAL_ID,
   VISUAL_MATRIX_CASES,
   VISUAL_MATRIX_MAX_CASES,
 } from './visual-cases';
@@ -48,7 +50,6 @@ const WEBVIEW_VISUAL_PILOT_ID = 'V01-webview-compact-dark';
 /** Keep in sync with e2e/visual/muster-presentation.visual.spec.ts */
 const PRESENTATION_VISUAL_PILOT_ID = 'V02-presentation-rich-dark';
 
-const PROTOCOL_VERSION = 5;
 const SCREENSHOT = {
   animations: 'disabled' as const,
   caret: 'hide' as const,
@@ -64,7 +65,7 @@ const FORBIDDEN_BODY_RE =
 async function postSnapshot(page: Page, snapshot: Record<string, unknown>): Promise<void> {
   await page.evaluate((message) => {
     window.postMessage(message, '*');
-  }, { ...snapshot, protocolVersion: PROTOCOL_VERSION });
+  }, { ...snapshot, protocolVersion: VISUAL_PROTOCOL_VERSION });
 }
 
 async function assertNoForbiddenPageText(page: Page): Promise<void> {
@@ -91,7 +92,12 @@ async function seedWebview(
 async function openComposerAutocomplete(page: Page): Promise<void> {
   await page.evaluate((message) => {
     window.postMessage(message, '*');
-  }, { type: 'snapshot', protocolVersion: PROTOCOL_VERSION, rootTasks: [], storeRevision: 2 });
+  }, {
+    type: 'snapshot',
+    protocolVersion: VISUAL_PROTOCOL_VERSION,
+    rootTasks: [],
+    storeRevision: 2,
+  });
 
   await page.getByRole('button', { name: 'New task' }).first().click();
   await expect
@@ -137,17 +143,14 @@ async function openSettingsWithSnapshots(page: Page): Promise<void> {
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
   await postHostMessage(page, {
     type: 'settingsSnapshot',
-    protocolVersion: PROTOCOL_VERSION,
     snapshot: createStaticRuntimeStorageSettingsSnapshot(),
   });
   await postHostMessage(page, {
     type: 'taskTypesSettingsSnapshot',
-    protocolVersion: PROTOCOL_VERSION,
     snapshot: createStaticTaskTypesSettingsSnapshot(),
   });
   await postHostMessage(page, {
     type: 'permissionSettingsSnapshot',
-    protocolVersion: PROTOCOL_VERSION,
     snapshot: createStaticPermissionSettingsSnapshot(),
   });
   await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible({
@@ -196,11 +199,20 @@ test.describe('M014 S01 dual-entrypoint pilot flow', () => {
     const presentationFixture = createStaticPresentationFixture();
     await installVisualEnvironment(page, { theme: 'dark' });
     await openMusterPresentation(page, {
-      initialState: presentationFixture,
+      initialState: {
+        rootId: presentationFixture.ownerTaskId,
+        presentationId: presentationFixture.presentationId,
+      },
       structuredCloneMessages: false,
       stateMode: 'direct',
       waitForReady: true,
     });
+    await page.evaluate(
+      ({ document, rootId }) => {
+        window.postMessage({ type: 'presentationUpdate', document, rootId }, '*');
+      },
+      { document: presentationFixture, rootId: presentationFixture.ownerTaskId },
+    );
     await ensureVisualEnvironmentApplied(page);
 
     const root = page.locator('[data-presentation-id="visual-pilot-presentation"]');
@@ -241,6 +253,10 @@ test.describe('M014 S02 representative visual matrix flow', () => {
     expect(VISUAL_MATRIX_CASES.length).toBeLessThanOrEqual(VISUAL_MATRIX_MAX_CASES);
     expect(VISUAL_MATRIX_CASES.length).toBeGreaterThanOrEqual(2);
     expect(VISUAL_MATRIX_MAX_CASES).toBe(8);
+    // M021/S03 fills the eighth matrix slot with the bounded folded-diff case.
+    expect(
+      VISUAL_MATRIX_CASES.some((c) => c.id === M021_S03_BOUNDED_DIFF_VISUAL_ID),
+    ).toBe(true);
     const entrypoints = new Set(VISUAL_MATRIX_CASES.map((c) => c.entrypoint));
     expect(entrypoints.has('webview')).toBe(true);
     expect(entrypoints.has('presentation')).toBe(true);
@@ -318,11 +334,20 @@ test.describe('M014 S02 representative visual matrix flow', () => {
     const rich = createStaticPresentationFixture();
     await installVisualEnvironment(page, { theme: 'dark' });
     await openMusterPresentation(page, {
-      initialState: rich,
+      initialState: {
+        rootId: rich.ownerTaskId,
+        presentationId: rich.presentationId,
+      },
       structuredCloneMessages: false,
       stateMode: 'direct',
       waitForReady: true,
     });
+    await page.evaluate(
+      ({ document, rootId }) => {
+        window.postMessage({ type: 'presentationUpdate', document, rootId }, '*');
+      },
+      { document: rich, rootId: rich.ownerTaskId },
+    );
     await ensureVisualEnvironmentApplied(page);
     await waitForPresentationSettled(page, rich.presentationId, rich.revision);
     await expect(page.getByRole('table')).toContainText('Baseline');
@@ -336,11 +361,20 @@ test.describe('M014 S02 representative visual matrix flow', () => {
     const narrow = createStaticNarrowPresentationFixture();
     await installVisualEnvironment(page, { theme: 'light' });
     await openMusterPresentation(page, {
-      initialState: narrow,
+      initialState: {
+        rootId: narrow.ownerTaskId,
+        presentationId: narrow.presentationId,
+      },
       structuredCloneMessages: false,
       stateMode: 'direct',
       waitForReady: true,
     });
+    await page.evaluate(
+      ({ document, rootId }) => {
+        window.postMessage({ type: 'presentationUpdate', document, rootId }, '*');
+      },
+      { document: narrow, rootId: narrow.ownerTaskId },
+    );
     await ensureVisualEnvironmentApplied(page);
     await waitForPresentationSettled(page, narrow.presentationId, narrow.revision, {
       articleHeadingId: 'narrow-containment-presentation',

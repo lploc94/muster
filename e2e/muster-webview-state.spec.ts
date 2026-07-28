@@ -336,7 +336,7 @@ function taskTypesSettingsSnapshot(overrides?: {
 // PROTOCOL_VERSION in webview/src/lib/protocol.ts. Test fixtures below always
 // send it so the version-mismatch banner doesn't mask the harness's own
 // snapshot messages.
-const PROTOCOL_VERSION = 10;
+const PROTOCOL_VERSION = 12;
 
 /**
  * Normalize a focused snapshot to the protocol v9 current-only contract:
@@ -9969,6 +9969,1004 @@ test.describe('M019 S05 Assembled First Run', () => {
     expect(blob).not.toMatch(/[A-Za-z]:\\/);
     expect(blob).not.toMatch(/\/(?:Users|home)\/[^/\s]+/);
   });
+
+  test('M020 live permission flow: initial diff is visible before approval and unsafe updates are rejected', async ({
+    page,
+  }) => {
+    await openWebview(page);
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-live-diff', goal: 'Approve one edit', viewStatus: 'running' })],
+      focusedTaskId: 'task-live-diff',
+      subtree: [task({ id: 'task-live-diff', goal: 'Approve one edit', viewStatus: 'running' })],
+      transcript: [],
+      transcriptPage: { hasMoreBefore: false, workspaceRevision: 1 },
+      storeRevision: 1,
+    });
+
+    await postRawHostMessage(page, {
+      type: 'turnStart',
+      taskId: 'task-live-diff',
+      turnId: 'turn-live-diff',
+      trigger: 'engine',
+    });
+    await postRawHostMessage(page, {
+      type: 'event',
+      taskId: 'task-live-diff',
+      turnId: 'turn-live-diff',
+      event: {
+        type: 'toolStarted',
+        toolCallId: 'edit-live',
+        name: 'Edit',
+        kind: 'builtin',
+        fileChanges: [
+          {
+            path: 'src/live.ts',
+            oldText: 'const value = 1;\n',
+            newText: 'const value = 2;\n',
+          },
+        ],
+      },
+    });
+    await postRawHostMessage(page, {
+      type: 'permissionPending',
+      sessionId: 'session-live-diff',
+      permissionId: 'permission-live-diff',
+      title: 'Edit src/live.ts',
+      kind: 'edit',
+      classification: 'write',
+      options: [
+        { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
+        { optionId: 'reject', name: 'Deny', kind: 'reject' },
+      ],
+    });
+
+    const card = page.locator('.tool-card').filter({ hasText: 'Edit' });
+    await expect(card).toBeVisible();
+    await card.locator('button.tool-card__diff-toggle').click();
+    await expect(card.locator('.tool-card__diff-line--removed')).toContainText(
+      '-const value = 1;',
+    );
+    await expect(card.locator('.tool-card__diff-line--added')).toContainText(
+      '+const value = 2;',
+    );
+    await expect(page.getByTestId('runtime-permission-card')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Allow once' })).toBeVisible();
+
+    // The host/webview guard must reject raw unsafe evidence rather than overwrite
+    // the canonical initial diff that the user is reviewing.
+    await postRawHostMessage(page, {
+      type: 'event',
+      taskId: 'task-live-diff',
+      turnId: 'turn-live-diff',
+      event: {
+        type: 'toolUpdated',
+        toolCallId: 'edit-live',
+        fileChanges: [
+          {
+            path: 'C:\\Users\\alice\\secret.ts',
+            oldText: 'safe',
+            newText: 'UNSAFE_LIVE_DIFF_CANARY',
+          },
+        ],
+      },
+    });
+    await expect(card).not.toContainText('UNSAFE_LIVE_DIFF_CANARY');
+    await expect(card).not.toContainText('Users');
+    await expect(card.locator('.tool-card__diff-line--added')).toContainText(
+      '+const value = 2;',
+    );
+  });
+
+  test('M020 S01 inline diff: ToolCard renders removed and added lines from fileChanges', async ({
+    page,
+  }) => {
+    await openWebview(page);
+
+    const sharedBefore = 'export function greeting() {';
+    const oldLine = 'const greeting = "hello";';
+    const newLine = 'const greeting = "world";';
+    const sharedAfter = 'return greeting;';
+    // Model-supplied markup must render as inert text, not HTML.
+    const inertPayload = '<img src=x onerror=window.__m020Xss=1>';
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-diff', goal: 'Apply one-file edit' })],
+      focusedTaskId: 'task-diff',
+      subtree: [task({ id: 'task-diff', goal: 'Apply one-file edit' })],
+      transcript: [
+        {
+          id: 'tool-diff-1',
+          kind: 'tool',
+          turnId: 'turn-diff',
+          order: 0,
+          content: {
+            toolCallId: 'tc-diff-1',
+            name: 'Edit',
+            toolKind: 'builtin',
+            status: 'success',
+            // Evidence-only: no input/output so expandability comes from fileChanges.
+            fileChanges: [
+              {
+                path: 'src/hello.ts',
+                oldText: `${sharedBefore}\n${oldLine}\n${inertPayload}\n${sharedAfter}\n`,
+                newText: `${sharedBefore}\n${newLine}\n${sharedAfter}\n`,
+              },
+            ],
+          },
+        },
+      ],
+      storeRevision: 1,
+    });
+
+    const card = page.locator('.tool-card').filter({ hasText: 'Edit' });
+    await expect(card).toBeVisible();
+    await expect(card.getByText('src/hello.ts')).toBeVisible();
+
+    // Diff bodies are lazy and only mount after the per-file disclosure is opened.
+    await expect(card.locator('.tool-card__diff-line')).toHaveCount(0);
+    await card.locator('button.tool-card__diff-toggle').click();
+    const removed = card.locator('.tool-card__diff-line--removed');
+    const added = card.locator('.tool-card__diff-line--added');
+    await expect(removed.filter({ hasText: oldLine })).toBeVisible();
+    await expect(added.filter({ hasText: newLine })).toBeVisible();
+    await expect(removed.filter({ hasText: inertPayload })).toBeVisible();
+
+    // Exact line diff: unchanged context is rendered once, not once per side.
+    const context = card.locator('.tool-card__diff-line--context');
+    await expect(context.filter({ hasText: sharedBefore })).toHaveCount(1);
+    await expect(context.filter({ hasText: sharedAfter })).toHaveCount(1);
+    await expect(card.locator('.tool-card__diff-counts')).toContainText('+1');
+    await expect(card.locator('.tool-card__diff-counts')).toContainText('−2');
+
+    // Evidence has its own per-file disclosure; the top-level header must not
+    // claim to control a details region that does not exist.
+    const header = card.getByRole('button').first();
+    await expect(header).toBeDisabled();
+    expect(await header.getAttribute('aria-expanded')).toBeNull();
+    expect(await header.getAttribute('aria-controls')).toBeNull();
+
+    // Inert rendering: markup from model text must not become a live element.
+    await expect(card.locator('img')).toHaveCount(0);
+    const xssFlag = await page.evaluate(() => (window as Window & { __m020Xss?: number }).__m020Xss);
+    expect(xssFlag).toBeUndefined();
+  });
+
+  test('M020 S01 inline diff: content-only tool stays free of empty diff chrome', async ({
+    page,
+  }) => {
+    await openWebview(page);
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-content', goal: 'Read a file' })],
+      focusedTaskId: 'task-content',
+      subtree: [task({ id: 'task-content', goal: 'Read a file' })],
+      transcript: [
+        {
+          id: 'tool-read-1',
+          kind: 'tool',
+          turnId: 'turn-read',
+          order: 0,
+          content: {
+            toolCallId: 'tc-read-1',
+            name: 'Read',
+            toolKind: 'builtin',
+            status: 'success',
+            input: { path: 'src/hello.ts' },
+            output: 'file contents',
+          },
+        },
+      ],
+      storeRevision: 1,
+    });
+
+    const card = page.locator('.tool-card').filter({ hasText: 'Read' });
+    await expect(card).toBeVisible();
+    await expect(card.locator('.tool-card__diff')).toHaveCount(0);
+    await expect(card.locator('.tool-card__diff-line--removed')).toHaveCount(0);
+    await expect(card.locator('.tool-card__diff-line--added')).toHaveCount(0);
+
+    // Existing expand path for input/output still works.
+    const header = card.getByRole('button').first();
+    await expect(header).toBeEnabled();
+    await expect(header).toHaveAttribute('aria-expanded', 'false');
+    const detailsId = await header.getAttribute('aria-controls');
+    const headerId = await header.getAttribute('id');
+    expect(detailsId).toBeTruthy();
+    expect(headerId).toBeTruthy();
+    const details = card.locator(`#${detailsId}`);
+    await expect(details).toHaveAttribute('role', 'region');
+    await expect(details).toHaveAttribute('aria-labelledby', headerId!);
+    await header.click();
+    await expect(header).toHaveAttribute('aria-expanded', 'true');
+    await expect(card.getByText('params:')).toBeVisible();
+    await expect(card.getByText('result:')).toBeVisible();
+  });
+
+  test('M020 S02 bounds: multi-file diffs render every path', async ({ page }) => {
+    await openWebview(page);
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-multi', goal: 'Edit three files' })],
+      focusedTaskId: 'task-multi',
+      subtree: [task({ id: 'task-multi', goal: 'Edit three files' })],
+      transcript: [
+        {
+          id: 'tool-multi-1',
+          kind: 'tool',
+          turnId: 'turn-multi',
+          order: 0,
+          content: {
+            toolCallId: 'tc-multi-1',
+            name: 'Edit',
+            toolKind: 'builtin',
+            status: 'success',
+            fileChanges: [
+              { path: 'src/a.ts', oldText: 'a-old\n', newText: 'a-new\n' },
+              { path: 'src/b.ts', oldText: 'b-old\n', newText: 'b-new\n' },
+              { path: 'src/c.ts', oldText: null, newText: 'c-new\n' },
+            ],
+          },
+        },
+      ],
+      storeRevision: 1,
+    });
+
+    const card = page.locator('.tool-card').filter({ hasText: 'Edit' });
+    await expect(card).toBeVisible();
+    await expect(card.getByText('src/a.ts')).toBeVisible();
+    await expect(card.getByText('src/b.ts')).toBeVisible();
+    await expect(card.getByText('src/c.ts')).toBeVisible();
+    await expect(card.locator('.tool-card__diff-file')).toHaveCount(3);
+    // No truncation/omission chrome when bounds were not hit.
+    await expect(card.locator('.tool-card__diff-truncated')).toHaveCount(0);
+    await expect(card.locator('.tool-card__diff-omitted')).toHaveCount(0);
+  });
+
+  test('M020 S02 bounds: truncated fileChange shows honest marker', async ({ page }) => {
+    await openWebview(page);
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-trunc', goal: 'Huge edit' })],
+      focusedTaskId: 'task-trunc',
+      subtree: [task({ id: 'task-trunc', goal: 'Huge edit' })],
+      transcript: [
+        {
+          id: 'tool-trunc-1',
+          kind: 'tool',
+          turnId: 'turn-trunc',
+          order: 0,
+          content: {
+            toolCallId: 'tc-trunc-1',
+            name: 'Edit',
+            toolKind: 'builtin',
+            status: 'success',
+            fileChanges: [
+              {
+                path: 'src/big.ts',
+                oldText: 'line-old\n… truncated',
+                newText: 'line-new\n… truncated',
+                truncated: true,
+              },
+            ],
+          },
+        },
+      ],
+      storeRevision: 1,
+    });
+
+    const card = page.locator('.tool-card').filter({ hasText: 'Edit' });
+    await expect(card).toBeVisible();
+    await expect(card.getByText('src/big.ts')).toBeVisible();
+    await card.locator('button.tool-card__diff-toggle').click();
+    // Dedicated marker (not only the text suffix buried in the pre).
+    const marker = card.locator('.tool-card__diff-truncated');
+    await expect(marker).toHaveCount(1);
+    await expect(marker).toBeVisible();
+    await expect(marker).toContainText(/truncated/i);
+    // Content-only chrome still absent on a pure evidence tool.
+    await expect(card.locator('.tool-card__diff-omitted')).toHaveCount(0);
+  });
+
+  test('M020 S02 bounds: omitted-file count is honest and visible', async ({ page }) => {
+    await openWebview(page);
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-omit', goal: 'Many files' })],
+      focusedTaskId: 'task-omit',
+      subtree: [task({ id: 'task-omit', goal: 'Many files' })],
+      transcript: [
+        {
+          id: 'tool-omit-1',
+          kind: 'tool',
+          turnId: 'turn-omit',
+          order: 0,
+          content: {
+            toolCallId: 'tc-omit-1',
+            name: 'MultiEdit',
+            toolKind: 'builtin',
+            status: 'success',
+            fileChanges: [
+              { path: 'src/kept-1.ts', oldText: null, newText: 'one\n' },
+              { path: 'src/kept-2.ts', oldText: null, newText: 'two\n' },
+            ],
+            fileChangesOmitted: 5,
+          },
+        },
+      ],
+      storeRevision: 1,
+    });
+
+    const card = page.locator('.tool-card').filter({ hasText: 'MultiEdit' });
+    await expect(card).toBeVisible();
+    await expect(card.getByText('src/kept-1.ts')).toBeVisible();
+    await expect(card.getByText('src/kept-2.ts')).toBeVisible();
+
+    const omitted = card.locator('.tool-card__diff-omitted');
+    await expect(omitted).toHaveCount(1);
+    await expect(omitted).toBeVisible();
+    await expect(omitted).toContainText(/5/);
+    await expect(omitted).toContainText(/omitted/i);
+    // Truncation chrome only when truncated:true is set on an entry.
+    await expect(card.locator('.tool-card__diff-truncated')).toHaveCount(0);
+  });
+  test('M020 S03 collapse: multi-file diff starts collapsed with counts and expands', async ({
+    page,
+  }) => {
+    await openWebview(page);
+
+    // Every file body starts collapsed regardless of retained diff size.
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-s03-collapse', goal: 'Edit four files' })],
+      focusedTaskId: 'task-s03-collapse',
+      subtree: [task({ id: 'task-s03-collapse', goal: 'Edit four files' })],
+      transcript: [
+        {
+          id: 'tool-s03-collapse-1',
+          kind: 'tool',
+          turnId: 'turn-s03-collapse',
+          order: 0,
+          content: {
+            toolCallId: 'tc-s03-collapse-1',
+            name: 'MultiEdit',
+            toolKind: 'builtin',
+            status: 'success',
+            fileChanges: [
+              { path: 'src/a.ts', oldText: null, newText: 'a-unique-body\n' },
+              { path: 'src/b.ts', oldText: null, newText: 'b-unique-body\n' },
+              { path: 'src/c.ts', oldText: null, newText: 'c-unique-body\n' },
+              { path: 'src/d.ts', oldText: null, newText: 'd-unique-body\n' },
+            ],
+          },
+        },
+      ],
+      storeRevision: 1,
+    });
+
+    const card = page.locator('.tool-card').filter({ hasText: 'MultiEdit' });
+    await expect(card).toBeVisible();
+
+    const group = card.locator('.tool-card__diff');
+    await expect(group).toHaveAttribute('role', 'group');
+    await expect(card.locator('.tool-card__diff-file')).toHaveCount(4);
+
+    // Per-file counts visible while bodies are collapsed.
+    const counts = card.locator('.tool-card__diff-counts');
+    await expect(counts).toHaveCount(4);
+    await expect(counts.first()).toContainText('+1');
+    await expect(counts.first()).toContainText('−0');
+
+    const toggles = card.locator('button.tool-card__diff-toggle');
+    await expect(toggles).toHaveCount(4);
+    await expect(toggles.first()).toHaveAttribute('aria-expanded', 'false');
+    // Lightweight controlled regions stay mounted, but all expensive line DOM
+    // is absent until an individual file is expanded.
+    await expect(card.locator('.tool-card__diff-body-panel')).toHaveCount(4);
+    await expect(card.locator('.tool-card__diff-line')).toHaveCount(0);
+
+    // Collapsed panel is marked data-collapsed and clips via grid 0fr.
+    // Assert collapse state via attributes + bounding box (Playwright still
+    // treats overflow-hidden grid children as "visible" for toBeVisible).
+    const firstBodyId = await toggles.first().getAttribute('aria-controls');
+    const firstToggleId = await toggles.first().getAttribute('id');
+    expect(firstBodyId).toBeTruthy();
+    expect(firstToggleId).toBeTruthy();
+    const firstBody = card.locator(`#${firstBodyId}`);
+    await expect(firstBody).toHaveAttribute('role', 'region');
+    await expect(firstBody).toHaveAttribute('aria-labelledby', firstToggleId!);
+    await expect(firstBody).toHaveAttribute('data-collapsed', 'true');
+    await expect(firstBody.locator('.tool-card__diff-line')).toHaveCount(0);
+    const collapsedBox = await firstBody.boundingBox();
+    expect(collapsedBox).toBeTruthy();
+    expect(collapsedBox!.height).toBeLessThanOrEqual(1);
+
+    await toggles.first().click();
+    await expect(toggles.first()).toHaveAttribute('aria-expanded', 'true');
+    await expect(firstBody).toHaveAttribute('data-collapsed', 'false');
+    await expect(card.getByText('a-unique-body')).toBeVisible();
+    await expect(
+      card.locator('.tool-card__diff-line--added').filter({ hasText: 'a-unique-body' }),
+    ).toBeVisible();
+    const expandedBox = await firstBody.boundingBox();
+    expect(expandedBox).toBeTruthy();
+    expect(expandedBox!.height).toBeGreaterThan(1);
+
+    await toggles.first().click();
+    await expect(toggles.first()).toHaveAttribute('aria-expanded', 'false');
+    await expect(firstBody).toHaveAttribute('data-collapsed', 'true');
+    await expect(firstBody.locator('.tool-card__diff-line')).toHaveCount(0);
+  });
+
+  test('M020 S03 a11y: aria-controls targets body id and screen-reader summary is present', async ({
+    page,
+  }) => {
+    await openWebview(page);
+
+    // Long single-file diff (>24 changed lines) triggers line-threshold collapse.
+    const oldText = Array.from({ length: 13 }, (_, i) => `old-line-${i + 1}`).join('\n') + '\n';
+    const newText = Array.from({ length: 12 }, (_, i) => `new-line-${i + 1}`).join('\n') + '\n';
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-s03-a11y', goal: 'Long edit' })],
+      focusedTaskId: 'task-s03-a11y',
+      subtree: [task({ id: 'task-s03-a11y', goal: 'Long edit' })],
+      transcript: [
+        {
+          id: 'tool-s03-a11y-1',
+          kind: 'tool',
+          turnId: 'turn-s03-a11y',
+          order: 0,
+          content: {
+            toolCallId: 'tc-s03-a11y-1',
+            name: 'Edit',
+            toolKind: 'builtin',
+            status: 'success',
+            fileChanges: [
+              {
+                path: 'src/long.ts',
+                oldText,
+                newText,
+                truncated: true,
+              },
+            ],
+          },
+        },
+      ],
+      storeRevision: 1,
+    });
+
+    const card = page.locator('.tool-card').filter({ hasText: 'Edit' });
+    await expect(card).toBeVisible();
+
+    const toggle = card.locator('button.tool-card__diff-toggle');
+    await expect(toggle).toHaveCount(1);
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+
+    const controlsId = await toggle.getAttribute('aria-controls');
+    const toggleId = await toggle.getAttribute('id');
+    expect(controlsId).toBeTruthy();
+    expect(toggleId).toBeTruthy();
+    // bodyId derived from transcript item id + index, never agent path.
+    expect(controlsId!).toMatch(/^tool-diff-body-/);
+    expect(controlsId!).not.toContain('long.ts');
+    expect(controlsId!).not.toContain('/');
+
+    // bodyId is already DOM-safe (sanitized tool id + index); no CSS.escape needed.
+    const body = card.locator(`#${controlsId}`);
+    await expect(body).toHaveCount(1);
+    await expect(body).toHaveAttribute('role', 'region');
+    await expect(body).toHaveAttribute('aria-labelledby', toggleId!);
+    await expect(body).toHaveAttribute('data-collapsed', 'true');
+    await expect(body.locator('.tool-card__diff-line')).toHaveCount(0);
+
+    const ariaLabel = await toggle.getAttribute('aria-label');
+    expect(ariaLabel).toBeTruthy();
+    expect(ariaLabel!).toMatch(/src\/long\.ts/);
+    expect(ariaLabel!).toMatch(/12 lines added/);
+    expect(ariaLabel!).toMatch(/13 lines removed/);
+    expect(ariaLabel!).toMatch(/partial/i);
+
+    await expect(card.locator('.tool-card__diff-counts')).toContainText(/partial/i);
+
+    await toggle.click();
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    await expect(body).toHaveAttribute('data-collapsed', 'false');
+    // exact: true — substring match would also hit old-line-10..13.
+    await expect(card.getByText('-old-line-1', { exact: true })).toBeVisible();
+    await expect(card.getByText('+new-line-12', { exact: true })).toBeVisible();
+  });
+
+  test('M020 S03 reduced motion: expansion transition duration is 0s', async ({ page }) => {
+    await openWebview(page);
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+
+    const newText =
+      Array.from({ length: 25 }, (_, i) => `motion-line-${i + 1}`).join('\n') + '\n';
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-s03-motion', goal: 'Motion edit' })],
+      focusedTaskId: 'task-s03-motion',
+      subtree: [task({ id: 'task-s03-motion', goal: 'Motion edit' })],
+      transcript: [
+        {
+          id: 'tool-s03-motion-1',
+          kind: 'tool',
+          turnId: 'turn-s03-motion',
+          order: 0,
+          content: {
+            toolCallId: 'tc-s03-motion-1',
+            name: 'Write',
+            toolKind: 'builtin',
+            status: 'success',
+            fileChanges: [{ path: 'src/motion.ts', oldText: null, newText }],
+          },
+        },
+      ],
+      storeRevision: 1,
+    });
+
+    const card = page.locator('.tool-card').filter({ hasText: 'Write' });
+    await expect(card).toBeVisible();
+
+    const panel = card.locator('.tool-card__diff-body-panel');
+    await expect(panel).toHaveCount(1);
+
+    const durationReduce = await panel.evaluate((el) =>
+      getComputedStyle(el).transitionDuration,
+    );
+    expect(durationReduce === '0s' || durationReduce === '0ms').toBe(true);
+
+    await page.emulateMedia({ reducedMotion: 'no-preference' });
+    const durationNormal = await panel.evaluate((el) =>
+      getComputedStyle(el).transitionDuration,
+    );
+    const normalMs = durationNormal
+      .split(',')
+      .map((part) => part.trim())
+      .map((part) => {
+        if (part.endsWith('ms')) return Number.parseFloat(part);
+        if (part.endsWith('s')) return Number.parseFloat(part) * 1000;
+        return Number.NaN;
+      })
+      .filter((n) => Number.isFinite(n));
+    expect(normalMs.some((n) => n > 0)).toBe(true);
+  });
+
+  test('M020 S03 lazy diff: small fixture starts collapsed with counts and expands', async ({
+    page,
+  }) => {
+    await openWebview(page);
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-s03-small', goal: 'Tiny edit' })],
+      focusedTaskId: 'task-s03-small',
+      subtree: [task({ id: 'task-s03-small', goal: 'Tiny edit' })],
+      transcript: [
+        {
+          id: 'tool-s03-small-1',
+          kind: 'tool',
+          turnId: 'turn-s03-small',
+          order: 0,
+          content: {
+            toolCallId: 'tc-s03-small-1',
+            name: 'Edit',
+            toolKind: 'builtin',
+            status: 'success',
+            fileChanges: [
+              {
+                path: 'src/tiny.ts',
+                oldText: 'tiny-old\n',
+                newText: 'tiny-new\n',
+              },
+            ],
+          },
+        },
+      ],
+      storeRevision: 1,
+    });
+
+    const card = page.locator('.tool-card').filter({ hasText: 'Edit' });
+    await expect(card).toBeVisible();
+
+    await expect(card.locator('.tool-card__diff-counts')).toContainText('+1');
+    const toggle = card.locator('button.tool-card__diff-toggle');
+    await expect(toggle).toHaveCount(1);
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    await expect(card.locator('.tool-card__diff-line')).toHaveCount(0);
+
+    await toggle.click();
+    await expect(card.getByText('tiny-old')).toBeVisible();
+    await expect(card.getByText('tiny-new')).toBeVisible();
+  });
+  test('M021 S03 fold: three full-budget files collapse and expand within row bounds', async ({
+    page,
+  }) => {
+    await openWebview(page);
+
+    // Roadmap demo: 3 files × full 2,000-line retained budget with one central
+    // change. Context windows compact to ≤10 rows/file (2 folds + 6 context +
+    // rem + add); rendered total 30 > line threshold → collapsed by default.
+    const SIDE = 2_000;
+    const half = Math.floor(SIDE / 2); // 1000 leading
+    const nLines = (n: number, prefix: string): string =>
+      Array.from({ length: n }, (_, i) => `${prefix}-${i + 1}`).join('\n');
+    const leading = nLines(half, 'lead');
+    const trailing = nLines(SIDE - half - 1, 'trail'); // 999
+    // Keep 3 context on each side → omit 997 leading + 996 trailing.
+    const LEAD_OMITTED = half - 3; // 997
+    const TRAIL_OMITTED = SIDE - half - 1 - 3; // 996
+    const fullBudget = (filePath: string) => ({
+      path: filePath,
+      oldText: `${leading}\nOLD\n${trailing}\n`,
+      newText: `${leading}\nNEW\n${trailing}\n`,
+    });
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-m021-s03-fold', goal: 'Bounded context windows' })],
+      focusedTaskId: 'task-m021-s03-fold',
+      subtree: [task({ id: 'task-m021-s03-fold', goal: 'Bounded context windows' })],
+      transcript: [
+        {
+          id: 'tool-m021-s03-fold-1',
+          kind: 'tool',
+          turnId: 'turn-m021-s03-fold',
+          order: 0,
+          content: {
+            toolCallId: 'tc-m021-s03-fold-1',
+            name: 'MultiEdit',
+            toolKind: 'builtin',
+            status: 'success',
+            fileChanges: [
+              fullBudget('src/a.ts'),
+              fullBudget('src/b.ts'),
+              fullBudget('src/c.ts'),
+            ],
+          },
+        },
+      ],
+      storeRevision: 1,
+    });
+
+    const card = page.locator('.tool-card').filter({ hasText: 'MultiEdit' });
+    await expect(card).toBeVisible();
+    await expect(card.locator('.tool-card__diff-file')).toHaveCount(3);
+
+    // Collapsed bodies mount zero line/fold DOM.
+    const toggles = card.locator('button.tool-card__diff-toggle');
+    await expect(toggles).toHaveCount(3);
+    for (let i = 0; i < 3; i++) {
+      await expect(toggles.nth(i)).toHaveAttribute('aria-expanded', 'false');
+    }
+    await expect(card.locator('.tool-card__diff-line')).toHaveCount(0);
+    await expect(card.locator('.tool-card__diff-line--fold')).toHaveCount(0);
+
+    // Expand every file body and assert the rendered bound.
+    for (let i = 0; i < 3; i++) {
+      await toggles.nth(i).click();
+      await expect(toggles.nth(i)).toHaveAttribute('aria-expanded', 'true');
+    }
+
+    const files = card.locator('.tool-card__diff-file');
+    await expect(files).toHaveCount(3);
+    for (let i = 0; i < 3; i++) {
+      const file = files.nth(i);
+      const bodyId = await toggles.nth(i).getAttribute('aria-controls');
+      expect(bodyId).toBeTruthy();
+      const body = card.locator(`#${bodyId}`);
+      await expect(body).toHaveAttribute('data-collapsed', 'false');
+
+      // ≤10 rendered rows per full-budget single-change file.
+      const lines = body.locator('.tool-card__diff-line');
+      const lineCount = await lines.count();
+      expect(lineCount).toBeGreaterThan(0);
+      expect(lineCount).toBeLessThanOrEqual(10);
+
+      // Fold rows are explicit counted markers, not ordinary empty source lines.
+      const folds = body.locator('.tool-card__diff-line--fold');
+      await expect(folds).toHaveCount(2);
+      await expect(folds.nth(0)).toHaveAttribute('data-omitted-count', String(LEAD_OMITTED));
+      await expect(folds.nth(1)).toHaveAttribute('data-omitted-count', String(TRAIL_OMITTED));
+      await expect(folds.nth(0)).toContainText(`${LEAD_OMITTED} unchanged lines omitted`);
+      await expect(folds.nth(1)).toContainText(`${TRAIL_OMITTED} unchanged lines omitted`);
+      // No +/- prefix on fold markers (not source lines).
+      const foldText = (await folds.nth(0).textContent()) ?? '';
+      expect(foldText.startsWith('-') || foldText.startsWith('+')).toBe(false);
+
+      // Every changed row remains visible after compaction.
+      await expect(
+        body.locator('.tool-card__diff-line--removed').filter({ hasText: 'OLD' }),
+      ).toHaveCount(1);
+      await expect(
+        body.locator('.tool-card__diff-line--added').filter({ hasText: 'NEW' }),
+      ).toHaveCount(1);
+
+      // Per-file counts stay exact (fold rows never counted as added/removed).
+      await expect(file.locator('.tool-card__diff-counts')).toContainText('+1');
+      await expect(file.locator('.tool-card__diff-counts')).toContainText('−1');
+    }
+
+    // Expanded total across three files stays bounded (≤30 nodes).
+    const allLines = card.locator('.tool-card__diff-line');
+    expect(await allLines.count()).toBeLessThanOrEqual(30);
+
+    // Inert rendering: model text never becomes live markup.
+    await expect(card.locator('img')).toHaveCount(0);
+  });
+
+  test('M021 S03 fold: expanded small window renders counted fold markers', async ({
+    page,
+  }) => {
+    await openWebview(page);
+
+    // 10 leading + change + 10 trailing → 2 folds + 6 context + rem + add = 10
+    // rows after the user expands the body.
+    const nLines = (n: number, prefix: string): string =>
+      Array.from({ length: n }, (_, i) => `${prefix}-${i + 1}`).join('\n');
+    const leading = nLines(10, 'L');
+    const trailing = nLines(10, 'T');
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: 'task-m021-s03-small-fold', goal: 'Small folded window' })],
+      focusedTaskId: 'task-m021-s03-small-fold',
+      subtree: [task({ id: 'task-m021-s03-small-fold', goal: 'Small folded window' })],
+      transcript: [
+        {
+          id: 'tool-m021-s03-small-fold-1',
+          kind: 'tool',
+          turnId: 'turn-m021-s03-small-fold',
+          order: 0,
+          content: {
+            toolCallId: 'tc-m021-s03-small-fold-1',
+            name: 'Edit',
+            toolKind: 'builtin',
+            status: 'success',
+            fileChanges: [
+              {
+                path: 'src/window.ts',
+                oldText: `${leading}\nold\n${trailing}\n`,
+                newText: `${leading}\nnew\n${trailing}\n`,
+              },
+            ],
+          },
+        },
+      ],
+      storeRevision: 1,
+    });
+
+    const card = page.locator('.tool-card').filter({ hasText: 'Edit' });
+    await expect(card).toBeVisible();
+
+    // Every fixture starts collapsed; full diff rows mount only after expansion.
+    const toggle = card.locator('button.tool-card__diff-toggle');
+    await expect(toggle).toHaveCount(1);
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    await expect(card.locator('.tool-card__diff-line')).toHaveCount(0);
+
+    await toggle.click();
+    const lines = card.locator('.tool-card__diff-line');
+    expect(await lines.count()).toBeLessThanOrEqual(10);
+
+    const folds = card.locator('.tool-card__diff-line--fold');
+    await expect(folds).toHaveCount(2);
+    await expect(folds.nth(0)).toHaveAttribute('data-omitted-count', '7');
+    await expect(folds.nth(1)).toHaveAttribute('data-omitted-count', '7');
+    await expect(folds.nth(0)).toContainText('7 unchanged lines omitted');
+    await expect(folds.nth(1)).toContainText('7 unchanged lines omitted');
+
+    // Kept context + changes are ordinary source lines; folds are not.
+    // Context rows carry a single leading space prefix (diff gutter).
+    await expect(card.getByText(' L-8', { exact: true })).toHaveCount(1);
+    await expect(card.locator('.tool-card__diff-line--removed').filter({ hasText: 'old' })).toHaveCount(1);
+    await expect(card.locator('.tool-card__diff-line--added').filter({ hasText: 'new' })).toHaveCount(1);
+    // Omitted source text must not appear (exact: true so L-10 does not match L-1).
+    await expect(card.getByText(' L-1', { exact: true })).toHaveCount(0);
+    await expect(card.getByText(' T-10', { exact: true })).toHaveCount(0);
+  });
+
+  /**
+   * M021 S04 final proof: outside-workspace warning is visible before the
+   * permission decision and after durable projection, without exposing host
+   * path or traversal canaries. Host evidence is already basename-canonical
+   * with present-only outsideWorkspace: true (as the engine emits).
+   */
+  test('M021 S04 outside workspace: warning before approval and after durable projection', async ({
+    page,
+  }) => {
+    // Synthetic canaries — must never appear in browser-visible content.
+    const absCanary = 'C:\\Users\\m021-s04-canary\\secrets\\outside-secret.ts';
+    const posixCanary = '/tmp/m021-s04-canary/outside-secret.ts';
+    const traversalCanary = '../../etc/m021-s04-canary';
+    const safeBasename = 'outside-secret.ts';
+
+    await openWebview(page);
+
+    // --- Phase 1: live pre-approval surface ---
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [
+        task({
+          id: 'task-m021-s04-outside',
+          goal: 'Review outside edit',
+          viewStatus: 'running',
+        }),
+      ],
+      focusedTaskId: 'task-m021-s04-outside',
+      subtree: [
+        task({
+          id: 'task-m021-s04-outside',
+          goal: 'Review outside edit',
+          viewStatus: 'running',
+        }),
+      ],
+      transcript: [],
+      transcriptPage: { hasMoreBefore: false, workspaceRevision: 1 },
+      storeRevision: 1,
+    });
+
+    await postRawHostMessage(page, {
+      type: 'turnStart',
+      taskId: 'task-m021-s04-outside',
+      turnId: 'turn-m021-s04-outside',
+      trigger: 'engine',
+    });
+    await postRawHostMessage(page, {
+      type: 'event',
+      taskId: 'task-m021-s04-outside',
+      turnId: 'turn-m021-s04-outside',
+      event: {
+        type: 'toolStarted',
+        toolCallId: 'edit-m021-s04-outside',
+        name: 'Edit',
+        kind: 'builtin',
+        fileChanges: [
+          {
+            path: safeBasename,
+            oldText: 'const secret = 1;\n',
+            newText: 'const secret = 2;\n',
+            outsideWorkspace: true,
+          },
+        ],
+      },
+    });
+    await postRawHostMessage(page, {
+      type: 'permissionPending',
+      sessionId: 'session-m021-s04-outside',
+      permissionId: 'permission-m021-s04-outside',
+      title: `Edit ${safeBasename}`,
+      kind: 'edit',
+      classification: 'write',
+      options: [
+        { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
+        { optionId: 'reject', name: 'Deny', kind: 'reject' },
+      ],
+    });
+
+    const liveCard = page.locator('.tool-card').filter({ hasText: 'Edit' });
+    await expect(liveCard).toBeVisible();
+    await expect(page.getByTestId('runtime-permission-card')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Allow once' })).toBeVisible();
+
+    // Visible Outside workspace badge before the permission decision.
+    const liveBadge = liveCard.locator('.tool-card__diff-outside');
+    await expect(liveBadge).toHaveCount(1);
+    await expect(liveBadge).toHaveText('Outside workspace');
+
+    // Accessible summary carries the same warning (badge is aria-hidden).
+    const liveSummary = liveCard.locator(
+      '.tool-card__diff-summary-static, button.tool-card__diff-toggle',
+    );
+    await expect(liveSummary).toHaveAttribute('aria-label', /outside workspace/i);
+
+    // Basename only — no absolute / traversal / host canaries.
+    await expect(liveCard.locator('.tool-card__diff-path')).toHaveText(safeBasename);
+    await expect(liveCard).not.toContainText(absCanary);
+    await expect(liveCard).not.toContainText(posixCanary);
+    await expect(liveCard).not.toContainText(traversalCanary);
+    await expect(liveCard).not.toContainText('Users\\m021-s04-canary');
+    await expect(liveCard).not.toContainText('/tmp/m021-s04-canary');
+    await expect(liveCard).not.toContainText('../../etc');
+
+    // Ordinary in-workspace path must not show the warning when co-projected.
+    // (Negative control is covered in durable phase with a second file.)
+
+    // --- Phase 2: durable snapshot projection after settle ---
+    // Clear the pre-approval card so durable projection is the only surface.
+    await postRawHostMessage(page, {
+      type: 'permissionCleared',
+      permissionId: 'permission-m021-s04-outside',
+    });
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [
+        task({
+          id: 'task-m021-s04-outside',
+          goal: 'Review outside edit',
+          viewStatus: 'idle',
+        }),
+      ],
+      focusedTaskId: 'task-m021-s04-outside',
+      subtree: [
+        task({
+          id: 'task-m021-s04-outside',
+          goal: 'Review outside edit',
+          viewStatus: 'idle',
+        }),
+      ],
+      transcript: [
+        {
+          id: 'tool-m021-s04-outside-durable',
+          kind: 'tool',
+          turnId: 'turn-m021-s04-outside',
+          order: 0,
+          content: {
+            toolCallId: 'edit-m021-s04-outside',
+            name: 'Edit',
+            toolKind: 'builtin',
+            status: 'success',
+            fileChanges: [
+              {
+                path: safeBasename,
+                oldText: 'const secret = 1;\n',
+                newText: 'const secret = 2;\n',
+                outsideWorkspace: true,
+              },
+              {
+                path: 'src/inside.ts',
+                oldText: 'export const inside = 1;\n',
+                newText: 'export const inside = 2;\n',
+              },
+            ],
+          },
+        },
+      ],
+      storeRevision: 2,
+    });
+
+    const durableCard = page.locator('.tool-card').filter({ hasText: 'Edit' });
+    await expect(durableCard).toBeVisible();
+    await expect(page.getByTestId('runtime-permission-card')).toHaveCount(0);
+
+    const durableFiles = durableCard.locator('.tool-card__diff-file');
+    await expect(durableFiles).toHaveCount(2);
+
+    const outsideFile = durableFiles.filter({ hasText: safeBasename });
+    const insideFile = durableFiles.filter({ hasText: 'src/inside.ts' });
+
+    await expect(outsideFile.locator('.tool-card__diff-outside')).toHaveCount(1);
+    await expect(outsideFile.locator('.tool-card__diff-outside')).toHaveText(
+      'Outside workspace',
+    );
+    await expect(
+      outsideFile.locator('.tool-card__diff-summary-static, button.tool-card__diff-toggle'),
+    ).toHaveAttribute('aria-label', /outside workspace/i);
+
+    // In-workspace file: no warning badge, no outside-workspace aria prose.
+    await expect(insideFile.locator('.tool-card__diff-outside')).toHaveCount(0);
+    await expect(
+      insideFile.locator('.tool-card__diff-summary-static, button.tool-card__diff-toggle'),
+    ).not.toHaveAttribute('aria-label', /outside workspace/i);
+
+    // Still no host-layout canaries after durable projection.
+    const durableBlob = await durableCard.innerText();
+    expect(durableBlob).not.toContain(absCanary);
+    expect(durableBlob).not.toContain(posixCanary);
+    expect(durableBlob).not.toContain(traversalCanary);
+    expect(durableBlob).not.toMatch(/[A-Za-z]:\\Users\\/);
+    expect(durableBlob).not.toMatch(/\/tmp\/m021-s04-canary/);
+    expect(durableBlob).not.toContain('../../etc');
+  });
+
 });
 
 declare global {

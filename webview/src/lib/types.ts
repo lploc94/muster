@@ -12,15 +12,50 @@ export type NormalizedEvent =
       name: string;
       kind?: 'mcp' | 'builtin' | 'other';
       input?: unknown;
+      /** Optional bounded ACP diff-block evidence. */
+      fileChanges?: Array<{
+        path: string;
+        oldText: string | null;
+        newText: string;
+        truncated?: boolean;
+        /** Present only when path resolved outside trusted workspace; never false. */
+        outsideWorkspace?: true;
+      }>;
+      fileChangesOmitted?: number;
       meta?: Record<string, unknown>;
     }
-  | { type: 'toolUpdated'; toolCallId: string; input?: unknown; meta?: Record<string, unknown> }
+  | {
+      type: 'toolUpdated';
+      toolCallId: string;
+      input?: unknown;
+      /** Optional ACP diff-block evidence (M020). Omitted when absent. */
+      fileChanges?: Array<{
+        path: string;
+        oldText: string | null;
+        newText: string;
+        truncated?: boolean;
+        /** Present only when path resolved outside trusted workspace; never false. */
+        outsideWorkspace?: true;
+      }>;
+      fileChangesOmitted?: number;
+      meta?: Record<string, unknown>;
+    }
   | {
       type: 'toolCompleted';
       toolCallId: string;
       outcome: 'success' | 'error';
       output?: unknown;
       error?: string;
+      /** Optional ACP diff-block evidence (M020). Omitted when absent. */
+      fileChanges?: Array<{
+        path: string;
+        oldText: string | null;
+        newText: string;
+        truncated?: boolean;
+        /** Present only when path resolved outside trusted workspace; never false. */
+        outsideWorkspace?: true;
+      }>;
+      fileChangesOmitted?: number;
       meta?: Record<string, unknown>;
     }
   | { type: 'usage'; usage: Record<string, unknown>; meta?: Record<string, unknown> }

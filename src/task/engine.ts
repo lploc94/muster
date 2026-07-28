@@ -4,7 +4,7 @@ import { AskBridge } from '../bridge/ask-bridge';
 import { CredentialRegistry } from '../bridge/credentials';
 import type { McpReadinessSupervisor } from '../bridge/mcp-readiness';
 import { runTurn as defaultRunTurn } from '../runner';
-import type { Backend, NormalizedEvent, RunOptions } from '../types';
+import type { Backend, NormalizedEvent, RunOptions, ToolFileChange } from '../types';
 import type { TurnTrigger } from './types';
 import { canBindTaskToBackend } from './backend-eligibility';
 import {
@@ -69,6 +69,10 @@ import {
   TASK_MESSAGE_MAX_CHARS,
   TASK_RESULT_MAX_BYTES,
 } from './content-limits';
+import {
+  boundToolFileChanges,
+  type BoundToolFileChangesResult,
+} from '../shared/tool-file-changes';
 import { selectCommittedSessionId } from './session-select';
 import { sanitizeHandoffFailureMessage } from './sanitization';
 import type { TaskReadPort } from './store-port';
@@ -291,6 +295,29 @@ const DEFAULT_LIMITS: DispositionLimits = {
 
 function nowIso(clock?: () => string): string {
   return clock?.() ?? new Date().toISOString();
+}
+
+function canonicalizeToolEvidence(
+  fileChanges: readonly ToolFileChange[] | undefined,
+  upstreamOmitted: number | undefined,
+  cwd: string | undefined,
+): BoundToolFileChangesResult | undefined {
+  if (fileChanges === undefined && upstreamOmitted === undefined) return undefined;
+  const bounded = boundToolFileChanges(fileChanges, { cwd });
+  const upstream =
+    typeof upstreamOmitted === 'number' &&
+    Number.isSafeInteger(upstreamOmitted) &&
+    upstreamOmitted > 0
+      ? upstreamOmitted
+      : 0;
+  const omitted = Math.min(
+    Number.MAX_SAFE_INTEGER,
+    upstream + (bounded.fileChangesOmitted ?? 0),
+  );
+  return {
+    ...(bounded.fileChanges !== undefined ? { fileChanges: bounded.fileChanges } : {}),
+    ...(omitted > 0 ? { fileChangesOmitted: omitted } : {}),
+  };
 }
 
 function isStartWorkflowToolCall(tool: PersistedToolCall): boolean {
@@ -4822,61 +4849,50 @@ export class TaskEngine {
             currentAssistantSegment = undefined;
             currentReasoning = undefined;
             const compositeId = `${turnId}:${event.toolCallId}`;
-            if (!streamedTools.has(compositeId)) {
-              const at = nowIso(this.clock);
-              streamedTools.set(compositeId, {
-                id: compositeId,
-                taskId: eventTurn.taskId,
-                turnId,
-                toolCallId: event.toolCallId,
-                order: nextOrder(),
-                name: event.name,
-                kind: event.kind,
-                status: 'running',
-                input: event.input,
-                createdAt: at,
-                updatedAt: at,
-              });
-            }
-            let failMessage: string | undefined;
-            try {
-              const persisted = await this.repository.execute({
-                kind: 'appendTranscriptBatch', workspaceId: this.workspaceId, taskId: eventTurn.taskId,
-                toolCalls: [streamedTools.get(compositeId)!],
-              });
-              if (!persisted.changed) failMessage = persisted.reason ?? 'tool persistence failed';
-            } catch (error) {
-              failMessage = error instanceof Error ? error.message : String(error);
-            }
-            if (failMessage) {
-              await markStreamPersistenceFailure(failMessage);
-              break;
-            }
-            this.safeEmit({ type: 'event', taskId: turn.taskId, turnId, event });
-            break;
-          }
-          case 'toolUpdated': {
-            const preTool = await this.streamBatcher.flushTurn(turnId);
-            if (!preTool.ok) {
-              await markStreamPersistenceFailure(preTool.message);
-              break;
-            }
-            currentAssistantSegment = undefined;
-            currentReasoning = undefined;
-            const compositeId = `${turnId}:${event.toolCallId}`;
             const at = nowIso(this.clock);
             const existing = streamedTools.get(compositeId);
+            const boundEvidence = canonicalizeToolEvidence(
+              event.fileChanges,
+              event.fileChangesOmitted,
+              eventTask.cwd ?? this.workspaceFolder,
+            );
             const nextTool: PersistedToolCall = existing
               ? {
                   ...existing,
+                  name: event.name,
+                  kind: event.kind,
                   input: event.input !== undefined ? event.input : existing.input,
                   updatedAt: at,
+                  ...(boundEvidence !== undefined
+                    ? {
+                        fileChanges: boundEvidence.fileChanges,
+                        fileChangesOmitted: boundEvidence.fileChangesOmitted,
+                      }
+                    : {}),
                 }
               : {
-                  id: compositeId, taskId: eventTurn.taskId, turnId, toolCallId: event.toolCallId,
-                  order: nextOrder(), name: 'tool', status: 'running', input: event.input,
-                  createdAt: at, updatedAt: at,
+                  id: compositeId,
+                  taskId: eventTurn.taskId,
+                  turnId,
+                  toolCallId: event.toolCallId,
+                  order: nextOrder(),
+                  name: event.name,
+                  kind: event.kind,
+                  status: 'running',
+                  input: event.input,
+                  createdAt: at,
+                  updatedAt: at,
+                  ...(boundEvidence !== undefined
+                    ? {
+                        fileChanges: boundEvidence.fileChanges,
+                        fileChangesOmitted: boundEvidence.fileChangesOmitted,
+                      }
+                    : {}),
                 };
+            if (boundEvidence !== undefined) {
+              if (boundEvidence.fileChanges === undefined) delete nextTool.fileChanges;
+              if (boundEvidence.fileChangesOmitted === undefined) delete nextTool.fileChangesOmitted;
+            }
             streamedTools.set(compositeId, nextTool);
             let failMessage: string | undefined;
             try {
@@ -4892,7 +4908,107 @@ export class TaskEngine {
               await markStreamPersistenceFailure(failMessage);
               break;
             }
-            this.safeEmit({ type: 'event', taskId: turn.taskId, turnId, event });
+            const emittedEvent: Extract<NormalizedEvent, { type: 'toolStarted' }> = {
+              ...event,
+              ...(boundEvidence?.fileChanges !== undefined
+                ? { fileChanges: boundEvidence.fileChanges }
+                : {}),
+              ...(boundEvidence?.fileChangesOmitted !== undefined
+                ? { fileChangesOmitted: boundEvidence.fileChangesOmitted }
+                : {}),
+            };
+            if (boundEvidence !== undefined) {
+              if (boundEvidence.fileChanges === undefined) delete emittedEvent.fileChanges;
+              if (boundEvidence.fileChangesOmitted === undefined) delete emittedEvent.fileChangesOmitted;
+            } else {
+              delete emittedEvent.fileChangesOmitted;
+            }
+            this.safeEmit({ type: 'event', taskId: turn.taskId, turnId, event: emittedEvent });
+            break;
+          }
+          case 'toolUpdated': {
+            const preTool = await this.streamBatcher.flushTurn(turnId);
+            if (!preTool.ok) {
+              await markStreamPersistenceFailure(preTool.message);
+              break;
+            }
+            currentAssistantSegment = undefined;
+            currentReasoning = undefined;
+            const compositeId = `${turnId}:${event.toolCallId}`;
+            const at = nowIso(this.clock);
+            const existing = streamedTools.get(compositeId);
+            // Bound + sanitize before persistence (M020 S02). When the event carries
+            // fileChanges, replace prior evidence with the bounded result (including
+            // clearing when every entry is dropped). When absent, keep prior evidence.
+            // Never write an empty array for absence — omit so payload_json stays clean.
+            const boundEvidence = canonicalizeToolEvidence(
+              event.fileChanges,
+              event.fileChangesOmitted,
+              eventTask.cwd ?? this.workspaceFolder,
+            );
+            const nextTool: PersistedToolCall = existing
+              ? {
+                  ...existing,
+                  input: event.input !== undefined ? event.input : existing.input,
+                  updatedAt: at,
+                  ...(boundEvidence !== undefined
+                    ? {
+                        fileChanges: boundEvidence.fileChanges,
+                        fileChangesOmitted: boundEvidence.fileChangesOmitted,
+                      }
+                    : {}),
+                }
+              : {
+                  id: compositeId, taskId: eventTurn.taskId, turnId, toolCallId: event.toolCallId,
+                  order: nextOrder(), name: 'tool', status: 'running', input: event.input,
+                  createdAt: at, updatedAt: at,
+                  ...(boundEvidence !== undefined
+                    ? {
+                        fileChanges: boundEvidence.fileChanges,
+                        fileChangesOmitted: boundEvidence.fileChangesOmitted,
+                      }
+                    : {}),
+                };
+            // Clear stale omitted/fileChanges keys when replace yields absence.
+            if (boundEvidence !== undefined) {
+              if (boundEvidence.fileChanges === undefined) {
+                delete nextTool.fileChanges;
+              }
+              if (boundEvidence.fileChangesOmitted === undefined) {
+                delete nextTool.fileChangesOmitted;
+              }
+            }
+            streamedTools.set(compositeId, nextTool);
+            let failMessage: string | undefined;
+            try {
+              const persisted = await this.repository.execute({
+                kind: 'appendTranscriptBatch', workspaceId: this.workspaceId, taskId: eventTurn.taskId,
+                toolCalls: [nextTool],
+              });
+              if (!persisted.changed) failMessage = persisted.reason ?? 'tool persistence failed';
+            } catch (error) {
+              failMessage = error instanceof Error ? error.message : String(error);
+            }
+            if (failMessage) {
+              await markStreamPersistenceFailure(failMessage);
+              break;
+            }
+            const emittedEvent: Extract<NormalizedEvent, { type: 'toolUpdated' }> = {
+              ...event,
+              ...(boundEvidence?.fileChanges !== undefined
+                ? { fileChanges: boundEvidence.fileChanges }
+                : {}),
+              ...(boundEvidence?.fileChangesOmitted !== undefined
+                ? { fileChangesOmitted: boundEvidence.fileChangesOmitted }
+                : {}),
+            };
+            if (boundEvidence !== undefined) {
+              if (boundEvidence.fileChanges === undefined) delete emittedEvent.fileChanges;
+              if (boundEvidence.fileChangesOmitted === undefined) delete emittedEvent.fileChangesOmitted;
+            } else {
+              delete emittedEvent.fileChangesOmitted;
+            }
+            this.safeEmit({ type: 'event', taskId: turn.taskId, turnId, event: emittedEvent });
             break;
           }
           case 'toolCompleted': {
@@ -4917,6 +5033,14 @@ export class TaskEngine {
               createdAt: at,
               updatedAt: at,
             };
+            // Bound + sanitize before persistence (M020 S02). When the complete
+            // event carries fileChanges, replace prior evidence; otherwise keep
+            // whatever toolUpdated already stored (spread of `base` preserves it).
+            const boundEvidence = canonicalizeToolEvidence(
+              event.fileChanges,
+              event.fileChangesOmitted,
+              eventTask.cwd ?? this.workspaceFolder,
+            );
             const nextTool: PersistedToolCall = {
               ...base,
               status: outcome === 'error' ? 'error' : 'success',
@@ -4924,7 +5048,21 @@ export class TaskEngine {
               ...(outcome === 'error'
                 ? { error: event.error, output: undefined }
                 : { output: event.output, error: undefined }),
+              ...(boundEvidence !== undefined
+                ? {
+                    fileChanges: boundEvidence.fileChanges,
+                    fileChangesOmitted: boundEvidence.fileChangesOmitted,
+                  }
+                : {}),
             };
+            if (boundEvidence !== undefined) {
+              if (boundEvidence.fileChanges === undefined) {
+                delete nextTool.fileChanges;
+              }
+              if (boundEvidence.fileChangesOmitted === undefined) {
+                delete nextTool.fileChangesOmitted;
+              }
+            }
             streamedTools.set(compositeId, nextTool);
             let failMessage: string | undefined;
             try {
@@ -4940,7 +5078,22 @@ export class TaskEngine {
               await markStreamPersistenceFailure(failMessage);
               break;
             }
-            this.safeEmit({ type: 'event', taskId: turn.taskId, turnId, event });
+            const emittedEvent: Extract<NormalizedEvent, { type: 'toolCompleted' }> = {
+              ...event,
+              ...(boundEvidence?.fileChanges !== undefined
+                ? { fileChanges: boundEvidence.fileChanges }
+                : {}),
+              ...(boundEvidence?.fileChangesOmitted !== undefined
+                ? { fileChangesOmitted: boundEvidence.fileChangesOmitted }
+                : {}),
+            };
+            if (boundEvidence !== undefined) {
+              if (boundEvidence.fileChanges === undefined) delete emittedEvent.fileChanges;
+              if (boundEvidence.fileChangesOmitted === undefined) delete emittedEvent.fileChangesOmitted;
+            } else {
+              delete emittedEvent.fileChangesOmitted;
+            }
+            this.safeEmit({ type: 'event', taskId: turn.taskId, turnId, event: emittedEvent });
             const liveHandle = this.liveRuns.get(turnId);
             if (
               outcome === 'success' &&

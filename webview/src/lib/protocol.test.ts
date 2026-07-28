@@ -172,7 +172,7 @@ describe('protocol v7 focused transcriptPage contract', () => {
   };
 
   it('uses the current protocol version', () => {
-    expect(PROTOCOL_VERSION).toBe(10);
+    expect(PROTOCOL_VERSION).toBe(12);
   });
 
   it('accepts focused snapshot with transcript + transcriptPage', () => {
@@ -1583,6 +1583,331 @@ describe('protocol v7 loadTranscriptPage / transcriptPageResult', () => {
       }),
     ).toBe(false);
   });
+
+  it('accepts optional fileChanges evidence and rejects malformed entries', () => {
+    const baseTool = {
+      id: 'tool-1',
+      kind: 'tool' as const,
+      turnId: 't1',
+      order: 1,
+      content: {
+        toolCallId: 'c1',
+        name: 'Edit',
+        status: 'success' as const,
+      },
+    };
+    const validChange = {
+      path: 'src/a.ts',
+      oldText: 'const a = 1;\n',
+      newText: 'const a = 2;\n',
+    };
+    // Content-only (no fileChanges) remains valid.
+    expect(isExtMessage({ ...validSuccess, items: [baseTool] })).toBe(true);
+    // Valid single-file evidence accepted.
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [
+          {
+            ...baseTool,
+            content: { ...baseTool.content, fileChanges: [validChange] },
+          },
+        ],
+      }),
+    ).toBe(true);
+    // Create (oldText null) accepted.
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [
+          {
+            ...baseTool,
+            content: {
+              ...baseTool.content,
+              fileChanges: [{ path: 'new.ts', oldText: null, newText: 'x' }],
+            },
+          },
+        ],
+      }),
+    ).toBe(true);
+    // Empty array rejected (omit instead).
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [{ ...baseTool, content: { ...baseTool.content, fileChanges: [] } }],
+      }),
+    ).toBe(false);
+    // Non-array rejected.
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [
+          { ...baseTool, content: { ...baseTool.content, fileChanges: validChange as unknown as [] } },
+        ],
+      }),
+    ).toBe(false);
+    // Missing path rejected.
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [
+          {
+            ...baseTool,
+            content: {
+              ...baseTool.content,
+              fileChanges: [{ oldText: 'a', newText: 'b' } as { path: string; oldText: string | null; newText: string }],
+            },
+          },
+        ],
+      }),
+    ).toBe(false);
+    // Nested extra key rejected.
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [
+          {
+            ...baseTool,
+            content: {
+              ...baseTool.content,
+              fileChanges: [{ ...validChange, extra: true } as typeof validChange],
+            },
+          },
+        ],
+      }),
+    ).toBe(false);
+    // Invalid oldText type rejected.
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [
+          {
+            ...baseTool,
+            content: {
+              ...baseTool.content,
+              fileChanges: [{ path: 'a.ts', oldText: 1 as unknown as string, newText: 'b' }],
+            },
+          },
+        ],
+      }),
+    ).toBe(false);
+
+    // M020 S02: truncated flag and fileChangesOmitted must survive the guard.
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [
+          {
+            ...baseTool,
+            content: {
+              ...baseTool.content,
+              fileChanges: [{ ...validChange, truncated: true }],
+              fileChangesOmitted: 8,
+            },
+          },
+        ],
+      }),
+    ).toBe(true);
+
+    // truncated:false is never emitted by the engine; reject it fail-closed.
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [
+          {
+            ...baseTool,
+            content: {
+              ...baseTool.content,
+              fileChanges: [{ ...validChange, truncated: false }],
+            },
+          },
+        ],
+      }),
+    ).toBe(false);
+
+    // fileChangesOmitted must be a non-negative safe integer when present.
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [
+          {
+            ...baseTool,
+            content: {
+              ...baseTool.content,
+              fileChanges: [validChange],
+              fileChangesOmitted: -1,
+            },
+          },
+        ],
+      }),
+    ).toBe(false);
+
+    expect(
+      isExtMessage({
+        ...validSuccess,
+        items: [
+          {
+            ...baseTool,
+            content: {
+              ...baseTool.content,
+              fileChanges: [validChange],
+              fileChangesOmitted: 1.5,
+            },
+          },
+        ],
+      }),
+    ).toBe(false);
+  });
+
+  it('rejects absolute, traversal, control, and oversized paths fail-closed', () => {
+    const baseTool = {
+      id: 'tool-unsafe',
+      kind: 'tool' as const,
+      turnId: 't1',
+      order: 1,
+      content: { toolCallId: 'c1', name: 'Edit', status: 'success' as const },
+    };
+    for (const unsafePath of [
+      '/etc/passwd',
+      'C:\\Users\\alice\\secret.ts',
+      '../secret.ts',
+      'src/../secret.ts',
+      'src/\nsecret.ts',
+      'src/\u202esecret.ts',
+      `${'é'.repeat(600)}.ts`,
+    ]) {
+      expect(
+        isExtMessage({
+          ...validSuccess,
+          items: [
+            {
+              ...baseTool,
+              content: {
+                ...baseTool.content,
+                fileChanges: [{ path: unsafePath, oldText: 'a', newText: 'b' }],
+              },
+            },
+          ],
+        }),
+        unsafePath,
+      ).toBe(false);
+    }
+  });
+});
+
+describe('M020 bounded live tool events', () => {
+  const validChange = { path: 'src/a.ts', oldText: 'a', newText: 'b' };
+  const envelope = (event: Record<string, unknown>) => ({
+    type: 'event',
+    taskId: 'task-1',
+    turnId: 'turn-1',
+    event,
+  });
+
+  it('accepts bounded evidence and omission metadata on start, update, and complete', () => {
+    expect(
+      isExtMessage(
+        envelope({
+          type: 'toolStarted',
+          toolCallId: 'c1',
+          name: 'Edit',
+          fileChanges: [validChange],
+          fileChangesOmitted: 2,
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      isExtMessage(
+        envelope({
+          type: 'toolUpdated',
+          toolCallId: 'c1',
+          fileChanges: [validChange],
+          fileChangesOmitted: 2,
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      isExtMessage(
+        envelope({
+          type: 'toolCompleted',
+          toolCallId: 'c1',
+          outcome: 'success',
+          fileChanges: [validChange],
+          fileChangesOmitted: 2,
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it('rejects unbounded or unsafe evidence on every live tool event', () => {
+    const tooMany = Array.from({ length: 33 }, (_, index) => ({
+      ...validChange,
+      path: `f${index}.ts`,
+    }));
+    const invalidEvidence = [
+      tooMany,
+      [{ ...validChange, path: '/etc/passwd' }],
+      [{ ...validChange, path: '../secret.ts' }],
+      [{ ...validChange, newText: 'x\n'.repeat(2_001) }],
+    ];
+    for (const fileChanges of invalidEvidence) {
+      for (const event of [
+        { type: 'toolStarted', toolCallId: 'c1', name: 'Edit', fileChanges },
+        { type: 'toolUpdated', toolCallId: 'c1', fileChanges },
+        { type: 'toolCompleted', toolCallId: 'c1', outcome: 'success', fileChanges },
+      ]) {
+        expect(isExtMessage(envelope(event))).toBe(false);
+      }
+    }
+  });
+
+  it('rejects invalid omitted counters but accepts omission-only evidence', () => {
+    expect(
+      isExtMessage(
+        envelope({ type: 'toolUpdated', toolCallId: 'c1', fileChangesOmitted: 2 }),
+      ),
+    ).toBe(true);
+    for (const invalid of [0, -1, 1.5, Number.POSITIVE_INFINITY]) {
+      expect(
+        isExtMessage(
+          envelope({ type: 'toolUpdated', toolCallId: 'c1', fileChangesOmitted: invalid }),
+        ),
+      ).toBe(false);
+    }
+  });
+});
+
+describe('M021 S03 bounded live toolCallId identifiers', () => {
+  const envelope = (event: Record<string, unknown>) => ({
+    type: 'event',
+    taskId: 'task-1',
+    turnId: 'turn-1',
+    event,
+  });
+
+  const variantsFor = (toolCallId: string): Record<string, unknown>[] => [
+    { type: 'toolStarted', toolCallId, name: 'Edit' },
+    { type: 'toolUpdated', toolCallId },
+    { type: 'toolCompleted', toolCallId, outcome: 'success' },
+  ];
+
+  it.each([
+    ['toolStarted', { type: 'toolStarted', toolCallId: 'a'.repeat(512), name: 'Edit' }],
+    ['toolUpdated', { type: 'toolUpdated', toolCallId: 'a'.repeat(512) }],
+    ['toolCompleted', { type: 'toolCompleted', toolCallId: 'a'.repeat(512), outcome: 'success' }],
+  ] as const)('accepts a 512-character toolCallId on %s', (_label, event) => {
+    expect(isExtMessage(envelope(event))).toBe(true);
+  });
+
+  it.each([
+    ['513 characters', 'a'.repeat(513)],
+    ['empty string', ''],
+    ['NUL-bearing', 'id\0x'],
+  ] as const)('rejects %s toolCallId on start, update, and complete', (_label, toolCallId) => {
+    for (const event of variantsFor(toolCallId)) {
+      expect(isExtMessage(envelope(event))).toBe(false);
+    }
+  });
 });
 
 describe('protocol v9 workspacePatchBatch', () => {
@@ -1639,7 +1964,7 @@ describe('protocol v9 workspacePatchBatch', () => {
   };
 
   it('uses the current protocol version', () => {
-    expect(PROTOCOL_VERSION).toBe(10);
+    expect(PROTOCOL_VERSION).toBe(12);
   });
 
   it('accepts a multi-kind batch and empty patches', () => {
@@ -1982,3 +2307,65 @@ describe('isExtMessage revealBackendDiagnostics (M019/S03)', () => {
   });
 });
 
+
+
+describe('M021 S04 protocol outsideWorkspace marker', () => {
+  it('accepts present-only outsideWorkspace: true on tool fileChanges', () => {
+    expect(
+      isExtMessage({
+        type: 'event',
+        taskId: 'task-1',
+        turnId: 'turn-1',
+        event: {
+          type: 'toolCompleted',
+          toolCallId: 'c1',
+          outcome: 'success',
+          fileChanges: [
+            { path: 'outside.ts', oldText: 'a', newText: 'b', outsideWorkspace: true },
+          ],
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it('rejects outsideWorkspace false/string/number and unknown nested keys', () => {
+    for (const bad of [false, 'true', 1]) {
+      expect(
+        isExtMessage({
+          type: 'event',
+          taskId: 'task-1',
+          turnId: 'turn-1',
+          event: {
+            type: 'toolCompleted',
+            toolCallId: 'c1',
+            outcome: 'success',
+            fileChanges: [
+              { path: 'outside.ts', oldText: 'a', newText: 'b', outsideWorkspace: bad as never },
+            ],
+          },
+        }),
+      ).toBe(false);
+    }
+    expect(
+      isExtMessage({
+        type: 'event',
+        taskId: 'task-1',
+        turnId: 'turn-1',
+        event: {
+          type: 'toolCompleted',
+          toolCallId: 'c1',
+          outcome: 'success',
+          fileChanges: [
+            {
+              path: 'outside.ts',
+              oldText: 'a',
+              newText: 'b',
+              outsideWorkspace: true,
+              hostPath: '/tmp/outside.ts',
+            },
+          ],
+        },
+      }),
+    ).toBe(false);
+  });
+});

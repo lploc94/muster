@@ -6,7 +6,9 @@ import {
   McpSetupRecoveryMode,
   NormalizedEvent,
   RunOptions,
+  ToolFileChange,
 } from '../types';
+import { TOOL_FILE_CHANGES_MAX_FILES } from '../shared/tool-file-change-contract';
 import {
   AcpAgentConfig,
   type AcpModelConfig,
@@ -91,13 +93,70 @@ function cancellationTerminal(): NormalizedEvent {
   return { type: 'error', message: 'Turn cancelled', isCancellation: true };
 }
 
+/**
+ * Parse one ACP `zToolCallContent` `diff` block into a ToolFileChange.
+ * Returns undefined for malformed / incomplete blocks so callers can skip them
+ * without discarding the rest of the content array (or falling through to raw).
+ */
+function parseDiffBlock(block: unknown): ToolFileChange | undefined {
+  if (!block || typeof block !== 'object') return undefined;
+  const b = block as {
+    type?: unknown;
+    path?: unknown;
+    oldText?: unknown;
+    newText?: unknown;
+  };
+  if (b.type !== 'diff') return undefined;
+  if (typeof b.path !== 'string' || b.path.length === 0) return undefined;
+  if (typeof b.newText !== 'string') return undefined;
+  // ACP allows nullish oldText (create). Non-string non-null is malformed.
+  let oldText: string | null;
+  if (b.oldText === null || b.oldText === undefined) {
+    oldText = null;
+  } else if (typeof b.oldText === 'string') {
+    oldText = b.oldText;
+  } else {
+    return undefined;
+  }
+  return { path: b.path, oldText, newText: b.newText };
+}
+
+/**
+ * Extract at most the retained file-count bound directly at the adapter edge.
+ * This prevents a bounded ACP frame from becoming an unbounded intermediate
+ * array before the engine applies path/text/aggregate canonicalization.
+ */
+function extractFileChangeEvidence(update: SessionUpdate): {
+  fileChanges?: ToolFileChange[];
+  fileChangesOmitted?: number;
+} {
+  const content = update.content;
+  if (!Array.isArray(content)) return {};
+  const changes: ToolFileChange[] = [];
+  let omitted = 0;
+  for (const block of content) {
+    const change = parseDiffBlock(block);
+    if (!change) continue;
+    if (changes.length < TOOL_FILE_CHANGES_MAX_FILES) changes.push(change);
+    else omitted += 1;
+  }
+  return {
+    ...(changes.length > 0 ? { fileChanges: changes } : {}),
+    ...(omitted > 0 ? { fileChangesOmitted: omitted } : {}),
+  };
+}
+
 /** Pull displayable output from an ACP `tool_call_update`. */
 function extractToolOutput(update: SessionUpdate): unknown {
   const content = update.content;
   if (!Array.isArray(content)) return update.rawOutput;
-  const textBlock = content.find((c) => (c as { type?: string }).type === 'content') as
-    | { content?: { type?: string; text?: string } }
-    | undefined;
+  // Guard null/non-object entries so malformed wire content cannot throw.
+  const textBlock = content.find(
+    (c) =>
+      !!c &&
+      typeof c === 'object' &&
+      (c as { type?: string }).type === 'content',
+  ) as { content?: { type?: string; text?: string } } | undefined;
   return textBlock?.content?.text ?? update.rawOutput;
 }
 
@@ -159,12 +218,14 @@ function mapSessionUpdate(
       const name = typeof update.title === 'string' ? update.title : 'tool';
       if (!toolCallId) return { type: 'raw', line: JSON.stringify(update) };
       const meta = update._meta as Record<string, unknown> | undefined;
+      const fileEvidence = extractFileChangeEvidence(update);
       return {
         type: 'toolStarted',
         toolCallId,
         name,
         kind: spec.toolKind(update),
         input: update.rawInput,
+        ...fileEvidence,
         meta,
       };
     }
@@ -173,6 +234,7 @@ function mapSessionUpdate(
         typeof update.toolCallId === 'string' ? `${spec.idPrefix}${update.toolCallId}` : undefined;
       if (!toolCallId) return { type: 'raw', line: JSON.stringify(update) };
       const meta = update._meta as Record<string, unknown> | undefined;
+      const fileEvidence = extractFileChangeEvidence(update);
       const statusRaw =
         typeof update.status === 'string'
           ? update.status
@@ -186,11 +248,31 @@ function mapSessionUpdate(
             : output === undefined
               ? 'Tool failed'
               : JSON.stringify(output);
-          return { type: 'toolCompleted', toolCallId, outcome: 'error', error, meta };
+          return {
+            type: 'toolCompleted',
+            toolCallId,
+            outcome: 'error',
+            error,
+            ...fileEvidence,
+            meta,
+          };
         }
-        return { type: 'toolCompleted', toolCallId, outcome: 'success', output, meta };
+        return {
+          type: 'toolCompleted',
+          toolCallId,
+          outcome: 'success',
+          output,
+          ...fileEvidence,
+          meta,
+        };
       }
-      return { type: 'toolUpdated', toolCallId, input: update.rawInput, meta };
+      return {
+        type: 'toolUpdated',
+        toolCallId,
+        input: update.rawInput,
+        ...fileEvidence,
+        meta,
+      };
     }
     default:
       return { type: 'raw', line: JSON.stringify(update) };

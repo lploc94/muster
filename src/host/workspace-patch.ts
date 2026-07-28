@@ -1,7 +1,8 @@
 import type { RepositoryCommand, RepositoryCommandResult } from '../task/repository';
-import type { TaskMessage, EngineProjection, PersistedToolCall, PersistedReasoning } from '../task/types';
+import type { TaskMessage, EngineProjection, PersistedReasoning } from '../task/types';
 import {
   collectAncestorIds,
+  projectPersistedToolCall,
   projectQueuedTurns,
   projectTaskSummary,
   type QueuedTurnProjection,
@@ -59,24 +60,6 @@ function messageToTranscriptItem(message: TaskMessage): TranscriptItem | null {
     ...(message.turnId !== undefined ? { turnId: message.turnId } : {}),
     ...(message.order !== undefined ? { order: message.order } : {}),
     ...(message.state !== undefined ? { state: message.state } : {}),
-  };
-}
-
-function toolToTranscriptItem(tool: PersistedToolCall): TranscriptItem {
-  return {
-    id: tool.id,
-    kind: 'tool',
-    turnId: tool.turnId,
-    order: tool.order,
-    content: {
-      toolCallId: tool.toolCallId,
-      name: tool.name,
-      ...(tool.kind ? { toolKind: tool.kind } : {}),
-      status: tool.status,
-      ...(tool.input !== undefined ? { input: tool.input } : {}),
-      ...(tool.output !== undefined ? { output: tool.output } : {}),
-      ...(tool.error !== undefined ? { error: tool.error } : {}),
-    },
   };
 }
 
@@ -232,7 +215,7 @@ function extractCommandTranscriptItems(command: RepositoryCommand): {
         const item = messageToTranscriptItem(message);
         if (item) items.push(item);
       }
-      for (const tool of command.toolCalls ?? []) items.push(toolToTranscriptItem(tool));
+      for (const tool of command.toolCalls ?? []) items.push(projectPersistedToolCall(tool));
       for (const segment of command.reasoning ?? []) items.push(reasoningToTranscriptItem(segment));
       return items.length > 0 ? { taskId: command.taskId, items } : null;
     }

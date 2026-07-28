@@ -366,6 +366,15 @@ describe('openStoreDatabase', () => {
       seed.exec('PRAGMA journal_mode = DELETE');
       seed.exec(`PRAGMA application_id = ${MUSTER_APPLICATION_ID}`);
       seed.exec(`PRAGMA user_version = ${SQLITE_SCHEMA_VERSION}`);
+      // Seed the whole hostile schema in ONE transaction. Unbatched, these 60
+      // DDL statements each commit with their own fsync (~2-7ms locally, far
+      // worse on contended CI storage), which is what pushed this test past the
+      // 5s default budget in CI. Batching only changes durability boundaries,
+      // not the resulting schema: the IncompatibleSchemaError rejection and the
+      // DELETE journal / marker / byte-equality assertions below are unchanged.
+      // Pragmas stay outside BEGIN — SQLite ignores journal_mode changes inside
+      // a transaction.
+      seed.exec('BEGIN');
       for (const table of expected.tables) {
         const colDefs = table.columns
           .map((col, i) => `${col.name} BLOB${i === 0 ? ' PRIMARY KEY' : ''}`)
@@ -397,6 +406,7 @@ describe('openStoreDatabase', () => {
       seed.exec(
         `CREATE TRIGGER ${REQUIRED_SCHEMA_TRIGGERS[0]} BEFORE INSERT ON send_outbox BEGIN SELECT 1; END`,
       );
+      seed.exec('COMMIT');
       seed.close();
     }
     const before = fs.readFileSync(dbPath);

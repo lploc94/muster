@@ -20,8 +20,13 @@ import {
   type BackendProbeProgress,
   type BackendProbeRequest,
 } from '../../../src/shared/backend-probe';
+import {
+  TOOL_FILE_CHANGE_SIDE_MAX_BYTES,
+  TOOL_FILE_CHANGES_MAX_FILES,
+  isBoundedToolFileChanges,
+} from '../../../src/shared/tool-file-change-contract';
 
-export const PROTOCOL_VERSION = 10;
+export const PROTOCOL_VERSION = 12;
 
 export type { BackendReadinessSnapshot, BackendProbeProgress, BackendProbeRequest };
 
@@ -176,6 +181,10 @@ export const TRANSCRIPT_PAGE_MAX_ITEMS = 100;
 export const WORKSPACE_PATCH_MAX_PATCHES = 10_000;
 export const WORKSPACE_PATCH_MAX_ITEMS = 500;
 export const WORKSPACE_PATCH_MAX_QUEUED = 500;
+/** Max ACP fileChanges entries projected per tool call (M020). */
+export const TOOL_FILE_CHANGES_MAX = TOOL_FILE_CHANGES_MAX_FILES;
+/** Backward-compatible alias; bounds are now measured as UTF-8 bytes. */
+export const TOOL_FILE_CHANGE_TEXT_MAX = TOOL_FILE_CHANGE_SIDE_MAX_BYTES;
 export const WORKSPACE_PATCH_ID_MAX = 512;
 
 /** Fixed failure codes for transcriptPageResult (no free-form message). */
@@ -501,7 +510,7 @@ export type ExtMessage =
   /**
    * Host→webview deep-link (M019/S03): open Settings on the Agents domain and
    * focus the stable Backends section target (`settings-backends`). Additive;
-   * PROTOCOL_VERSION stays at 10. S04's Doctor command sends this message.
+   * PROTOCOL_VERSION stays at 11. S04's Doctor command sends this message.
    * Payload is intentionally empty — no secrets, paths, or diagnostics body.
    */
   | { type: 'revealBackendDiagnostics' }
@@ -1229,6 +1238,21 @@ function isTaskSummary(v: unknown): v is TaskSummary {
   );
 }
 
+function hasValidToolEvidence(v: Record<string, unknown>): boolean {
+  if (v.fileChanges !== undefined && !isBoundedToolFileChanges(v.fileChanges)) return false;
+  if (
+    v.fileChangesOmitted !== undefined &&
+    !(
+      typeof v.fileChangesOmitted === 'number' &&
+      Number.isSafeInteger(v.fileChangesOmitted) &&
+      v.fileChangesOmitted > 0
+    )
+  ) {
+    return false;
+  }
+  return true;
+}
+
 function isTranscriptItem(v: unknown): v is TranscriptItem {
   if (!isRecord(v) || !isBoundedId(v.id, WORKSPACE_PATCH_ID_MAX)) return false;
   switch (v.kind) {
@@ -1277,6 +1301,8 @@ function isTranscriptItem(v: unknown): v is TranscriptItem {
           'input',
           'output',
           'error',
+          'fileChanges',
+          'fileChangesOmitted',
         ])
       ) {
         return false;
@@ -1293,7 +1319,8 @@ function isTranscriptItem(v: unknown): v is TranscriptItem {
       }
       if (c.error !== undefined && !isString(c.error)) return false;
       // input/output remain unknown payloads when present.
-      return true;
+      // Optional ACP diff evidence (M020): omit or non-empty validated array.
+      return hasValidToolEvidence(c);
     }
     case 'error':
       // Locally-synthesized only; host isExtMessage must reject error items.
@@ -1533,11 +1560,19 @@ export function isNormalizedEvent(v: unknown): v is NormalizedEvent {
     case 'reasoningDelta':
       return isString(v.content) && isString(v.messageId);
     case 'toolStarted':
-      return isString(v.toolCallId) && isString(v.name);
+      return (
+        isBoundedId(v.toolCallId, WORKSPACE_PATCH_ID_MAX) &&
+        isString(v.name) &&
+        hasValidToolEvidence(v)
+      );
     case 'toolUpdated':
-      return isString(v.toolCallId);
+      return isBoundedId(v.toolCallId, WORKSPACE_PATCH_ID_MAX) && hasValidToolEvidence(v);
     case 'toolCompleted':
-      return isString(v.toolCallId) && (v.outcome === 'success' || v.outcome === 'error');
+      return (
+        isBoundedId(v.toolCallId, WORKSPACE_PATCH_ID_MAX) &&
+        (v.outcome === 'success' || v.outcome === 'error') &&
+        hasValidToolEvidence(v)
+      );
     case 'usage':
       return isRecord(v.usage);
     case 'turnCompleted':

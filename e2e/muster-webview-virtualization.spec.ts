@@ -5,7 +5,7 @@ import { expect, test, type Page } from '@playwright/test';
  * Protocol-conformant large history: bootstrap <=100, then owned older pages.
  */
 
-const PROTOCOL_VERSION = 10;
+const PROTOCOL_VERSION = 12;
 const BOOTSTRAP = 100;
 const PAGE = 100;
 const TOTAL = 2000;

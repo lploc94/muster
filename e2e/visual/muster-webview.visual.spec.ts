@@ -7,6 +7,7 @@ import {
 } from '../fixtures/muster-webview';
 import {
   COMPACT_WEBVIEW_VIEWPORT,
+  createStaticBoundedDiffFixture,
   createStaticFileMentionSuggestions,
   createStaticFirstRunBackendsReadinessSnapshot,
   createStaticPendingAsk,
@@ -20,9 +21,13 @@ import {
   normalizeVisualChrome,
   normalizeVisualScroll,
   waitForVisualReady,
+  VISUAL_PROTOCOL_VERSION,
   type VisualThemeKind,
 } from '../fixtures/visual-environment';
-import { M019_S05_FIRST_RUN_BACKENDS_VISUAL_ID } from './visual-cases';
+import {
+  M019_S05_FIRST_RUN_BACKENDS_VISUAL_ID,
+  M021_S03_BOUNDED_DIFF_VISUAL_ID,
+} from './visual-cases';
 
 /** Stable pilot case ID for the main webview entrypoint (S01/S02). */
 export const WEBVIEW_VISUAL_PILOT_ID = 'V01-webview-compact-dark';
@@ -39,16 +44,19 @@ export const WEBVIEW_VISUAL_VALIDATION_ID = 'V05-webview-validation-errors-dark'
 /** M019/S05 first-run Agents → Backends readiness surface at 320×600 dark. */
 export const WEBVIEW_VISUAL_FIRST_RUN_BACKENDS_ID = M019_S05_FIRST_RUN_BACKENDS_VISUAL_ID;
 
-/** All main-webview matrix case IDs owned by this spec (S02 T01 + M019/S05). */
+/** M021/S03 bounded folded-diff context at 320×600 dark. */
+export const WEBVIEW_VISUAL_BOUNDED_DIFF_ID = M021_S03_BOUNDED_DIFF_VISUAL_ID;
+
+/** All main-webview matrix case IDs owned by this spec (S02 + M019/S05 + M021/S03). */
 export const WEBVIEW_VISUAL_CASE_IDS = [
   WEBVIEW_VISUAL_PILOT_ID,
   WEBVIEW_VISUAL_AUTOCOMPLETE_ID,
   WEBVIEW_VISUAL_SETTINGS_PROMPT_ID,
   WEBVIEW_VISUAL_VALIDATION_ID,
   WEBVIEW_VISUAL_FIRST_RUN_BACKENDS_ID,
+  WEBVIEW_VISUAL_BOUNDED_DIFF_ID,
 ] as const;
 
-const PROTOCOL_VERSION = 5;
 const SCREENSHOT = {
   animations: 'disabled' as const,
   caret: 'hide' as const,
@@ -60,7 +68,7 @@ async function postSnapshot(page: Page, snapshot: Record<string, unknown>): Prom
     (message) => {
       window.postMessage(message, '*');
     },
-    { ...snapshot, protocolVersion: PROTOCOL_VERSION },
+    { ...snapshot, protocolVersion: VISUAL_PROTOCOL_VERSION },
   );
 }
 
@@ -83,7 +91,12 @@ async function openComposerAutocomplete(page: Page): Promise<void> {
   // Exact e2e/muster-webview-state.spec.ts flow (draft composer + protocol reply).
   await page.evaluate((message) => {
     window.postMessage(message, '*');
-  }, { type: 'snapshot', protocolVersion: PROTOCOL_VERSION, rootTasks: [], storeRevision: 2 });
+  }, {
+    type: 'snapshot',
+    protocolVersion: VISUAL_PROTOCOL_VERSION,
+    rootTasks: [],
+    storeRevision: 2,
+  });
 
   await page.getByRole('button', { name: 'New task' }).first().click();
   await expect
@@ -149,17 +162,14 @@ async function openSettingsWithSnapshots(page: Page): Promise<void> {
   // Host replies for the three Settings catalog requests.
   await postHostMessage(page, {
     type: 'settingsSnapshot',
-    protocolVersion: PROTOCOL_VERSION,
     snapshot: createStaticRuntimeStorageSettingsSnapshot(),
   });
   await postHostMessage(page, {
     type: 'taskTypesSettingsSnapshot',
-    protocolVersion: PROTOCOL_VERSION,
     snapshot: createStaticTaskTypesSettingsSnapshot(),
   });
   await postHostMessage(page, {
     type: 'permissionSettingsSnapshot',
-    protocolVersion: PROTOCOL_VERSION,
     snapshot: createStaticPermissionSettingsSnapshot(),
   });
   await expect(page.getByRole('heading', { name: 'Settings', exact: true })).toBeVisible({
@@ -258,8 +268,6 @@ test.describe('visual matrix · main webview', () => {
   }) => {
     // Supportive visual proof for M019/S05 compact readiness/recovery surface.
     // Not a native Extension Host claim — browser fixtures only.
-    // Current webview protocol is 10; legacy pilot fixtures still stamp 5.
-    const CURRENT_PROTOCOL_VERSION = 10;
     await page.setViewportSize(COMPACT_WEBVIEW_VIEWPORT);
     await installVisualEnvironment(page, { theme: 'dark' });
     await openMusterWebview(page, { backendReadiness: 'none' });
@@ -272,7 +280,7 @@ test.describe('visual matrix · main webview', () => {
       window.postMessage(message, '*');
     }, {
       type: 'snapshot',
-      protocolVersion: CURRENT_PROTOCOL_VERSION,
+      protocolVersion: VISUAL_PROTOCOL_VERSION,
       rootTasks: [],
       storeRevision: 1,
     });
@@ -330,5 +338,68 @@ test.describe('visual matrix · main webview', () => {
     expect(blob).not.toMatch(/sk-[A-Za-z0-9]{16,}/);
     expect(blob).not.toMatch(/[A-Za-z]:\\/);
     expect(blob).not.toMatch(/\/(?:Users|home)\/[^/\s]+/);
+  });
+
+  test(`M021 S03 bounded diff context · ${WEBVIEW_VISUAL_BOUNDED_DIFF_ID}`, async ({
+    page,
+  }) => {
+    // Pinned Linux golden for counted fold markers after expanding a small
+    // window. Browser fixtures only — not a native Extension Host claim.
+    await page.setViewportSize(COMPACT_WEBVIEW_VIEWPORT);
+    await installVisualEnvironment(page, { theme: 'dark' });
+    await openMusterWebview(page);
+    await ensureVisualEnvironmentApplied(page);
+
+    const fixture = createStaticBoundedDiffFixture() as unknown as Record<
+      string,
+      unknown
+    >;
+    await postSnapshot(page, fixture);
+
+    await expect(page.getByText('Bounded folded diff window')).toBeVisible();
+    const card = page.locator('.tool-card').filter({ hasText: 'Edit' });
+    await expect(card).toBeVisible();
+    await expect(card.getByText('src/window.ts')).toBeVisible();
+
+    // Diff bodies are collapsed until the user opens the per-file disclosure.
+    const toggle = card.locator('button.tool-card__diff-toggle');
+    await expect(toggle).toHaveCount(1);
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    await expect(card.locator('.tool-card__diff-line')).toHaveCount(0);
+    await toggle.click();
+    const folds = card.locator('.tool-card__diff-line--fold');
+    await expect(folds).toHaveCount(2);
+    await expect(folds.nth(0)).toHaveAttribute('data-omitted-count', '7');
+    await expect(folds.nth(1)).toHaveAttribute('data-omitted-count', '7');
+    await expect(folds.nth(0)).toContainText('7 unchanged lines omitted');
+    await expect(folds.nth(1)).toContainText('7 unchanged lines omitted');
+
+    await expect(
+      card.locator('.tool-card__diff-line--removed').filter({ hasText: 'old' }),
+    ).toHaveCount(1);
+    await expect(
+      card.locator('.tool-card__diff-line--added').filter({ hasText: 'new' }),
+    ).toHaveCount(1);
+
+    await waitForVisualReady(page, {
+      selector: '.tool-card__diff-line--fold, body',
+    });
+    await normalizeVisualChrome(page);
+
+    await expect(page).toHaveScreenshot(
+      `${WEBVIEW_VISUAL_BOUNDED_DIFF_ID}.png`,
+      SCREENSHOT,
+    );
+
+    // Negative surface: no secrets/paths in fixture traffic or visible body.
+    const posted = await readPostedMessages(page);
+    const blob = JSON.stringify(posted);
+    expect(blob).not.toMatch(/sk-[A-Za-z0-9]{16,}/);
+    expect(blob).not.toMatch(/[A-Za-z]:\\/);
+    expect(blob).not.toMatch(/\/(?:Users|home)\/[^/\s]+/);
+    const bodyText = await page.locator('body').innerText();
+    expect(bodyText).not.toMatch(/sk-[A-Za-z0-9]{16,}/);
+    expect(bodyText).not.toMatch(/[A-Za-z]:\\/);
+    expect(bodyText).not.toMatch(/\/(?:Users|home)\/[^/\s]+/);
   });
 });

@@ -1,3 +1,5 @@
+import type { ToolFileChange } from '../types';
+
 // Tasks (§4.1)
 export type TaskRole = 'coordinator' | 'worker';
 export type TaskLifecycleState = 'open' | 'succeeded' | 'failed' | 'cancelled' | 'skipped';
@@ -618,6 +620,23 @@ export interface PersistedToolCall {
   input?: unknown;
   output?: unknown;
   error?: string;
+  /**
+   * Optional ACP diff-block evidence (M020). Omitted when absent so content-only
+   * tools stay free of empty evidence. Rides `tool_calls.payload_json` remainder
+   * via `toolCallPayload` — no schema change.
+   *
+   * Engine-bounded before persistence (M020 S02 / M021 S04): at most 32 entries,
+   * paths sanitized (basename + present-only `outsideWorkspace: true` when the
+   * agent path resolved outside trusted cwd), oversized sides marked
+   * `truncated: true`.
+   */
+  fileChanges?: ToolFileChange[];
+  /**
+   * Count of valid fileChanges dropped by the file-count bound (M020 S02).
+   * Omitted when zero / absent so content-only payloads stay free of empty evidence.
+   * Rides the same `payload_json` remainder — no schema change.
+   */
+  fileChangesOmitted?: number;
   createdAt: string;
   updatedAt: string;
 }

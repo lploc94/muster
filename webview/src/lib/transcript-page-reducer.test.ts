@@ -438,3 +438,47 @@ describe('ownershipFromTranscript', () => {
     expect([...ids].sort()).toEqual(['r1', 'u1']);
   });
 });
+
+
+describe('M021 S04 outsideWorkspace through older-page prepend', () => {
+  it('preserves present-only outsideWorkspace on prepended tool fileChanges', () => {
+    const pending = beginLoadOlder(seeded(['u2']), {
+      taskId: 'task-1',
+      requestId: 'req-out',
+    });
+    if (!pending.ok) throw new Error('expected pending');
+    const applied = applyTranscriptPageResult(
+      pending.state,
+      success(
+        'req-out',
+        [
+          {
+            id: 'tool-out',
+            kind: 'tool',
+            turnId: 'turn-out',
+            order: 2,
+            content: {
+              toolCallId: 'tc-out',
+              name: 'Edit',
+              status: 'success',
+              fileChanges: [
+                {
+                  path: 'outside.ts',
+                  oldText: 'a',
+                  newText: 'b',
+                  outsideWorkspace: true,
+                },
+              ],
+            },
+          },
+        ],
+        { hasMoreBefore: false, workspaceRevision: 6 },
+      ),
+      'task-1',
+    );
+    const tool = applied.state.items.find((i) => i.id === 'tool-out');
+    expect(tool && tool.kind === 'tool' ? tool.fileChanges : null).toEqual([
+      { path: 'outside.ts', oldText: 'a', newText: 'b', outsideWorkspace: true },
+    ]);
+  });
+});
