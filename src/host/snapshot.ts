@@ -88,13 +88,18 @@ export interface TaskSummary {
   };
 }
 
-/** Optional ACP diff-block evidence projected to the webview (M020). */
+/** Optional ACP diff-block evidence projected to the webview (M020 / M021 S04). */
 export interface ToolFileChange {
   path: string;
   oldText: string | null;
   newText: string;
   /** Present only when a side was clipped by the engine bound; never `false`. */
   truncated?: boolean;
+  /**
+   * Present only when the path resolved outside the trusted workspace.
+   * Path is already basename-only when set; never `false`.
+   */
+  outsideWorkspace?: true;
 }
 
 export interface ToolTranscriptContent {

@@ -196,6 +196,12 @@ describe('buildRepositorySnapshot', () => {
             fileChanges: [
               { path: 'src/a.ts', oldText: 'before', newText: 'after', truncated: true },
               { path: 'src/b.ts', oldText: null, newText: 'created' },
+              {
+                path: 'outside-canary.ts',
+                oldText: 'old',
+                newText: 'new',
+                outsideWorkspace: true,
+              },
             ],
             fileChangesOmitted: 3,
             createdAt: '2026-07-17T00:00:02.000Z',
@@ -230,6 +236,12 @@ describe('buildRepositorySnapshot', () => {
             fileChanges: [
               { path: 'src/a.ts', oldText: 'before', newText: 'after', truncated: true },
               { path: 'src/b.ts', oldText: null, newText: 'created' },
+              {
+                path: 'outside-canary.ts',
+                oldText: 'old',
+                newText: 'new',
+                outsideWorkspace: true,
+              },
             ],
             fileChangesOmitted: 3,
           },
@@ -246,6 +258,9 @@ describe('buildRepositorySnapshot', () => {
           },
         },
       ]);
+      const serialized = JSON.stringify(projection.snapshot.transcript);
+      expect(serialized).not.toContain('/tmp/');
+      expect(serialized).not.toContain('Users');
     });
   }, 20_000);
 

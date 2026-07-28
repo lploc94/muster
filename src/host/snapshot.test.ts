@@ -107,6 +107,48 @@ describe('host task snapshot projection', () => {
     });
     expect(projected.content.fileChanges?.[0]?.newText).not.toContain('�');
     expect(projected.content.fileChangesOmitted).toBe(3);
+    expect(
+      Object.prototype.hasOwnProperty.call(
+        projected.content.fileChanges?.[0] ?? {},
+        'outsideWorkspace',
+      ),
+    ).toBe(false);
+  });
+
+  it('classifies absolute outside paths as basename + outsideWorkspace and preserves marked evidence', () => {
+    const projected = projectPersistedToolCall({
+      id: 'outside-marker',
+      taskId: 't1',
+      turnId: 'turn1',
+      toolCallId: 'outside-call',
+      order: 1,
+      name: 'Edit',
+      status: 'success',
+      fileChanges: [
+        // Legacy absolute path without cwd → basename + marker.
+        { path: '/tmp/outside-canary.ts', oldText: 'old', newText: 'new' },
+        // Already-canonical durable evidence must keep the present-only marker.
+        {
+          path: 'drive-canary.ts',
+          oldText: 'e',
+          newText: 'f',
+          outsideWorkspace: true,
+        },
+        // Ordinary in-workspace relative path stays unmarked.
+        { path: 'src/safe.ts', oldText: 'a', newText: 'b' },
+      ],
+      createdAt: '2026-07-06T00:00:01.000Z',
+      updatedAt: '2026-07-06T00:00:01.000Z',
+    });
+
+    expect(projected.content.fileChanges).toEqual([
+      { path: 'outside-canary.ts', oldText: 'old', newText: 'new', outsideWorkspace: true },
+      { path: 'drive-canary.ts', oldText: 'e', newText: 'f', outsideWorkspace: true },
+      { path: 'src/safe.ts', oldText: 'a', newText: 'b' },
+    ]);
+    const serialized = JSON.stringify(projected.content.fileChanges);
+    expect(serialized).not.toContain('/tmp/');
+    expect(serialized).not.toContain('Users');
   });
 
   it('rebuilds tool transcript items with bounded file evidence and no absent optional fields', () => {

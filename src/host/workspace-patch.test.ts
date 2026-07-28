@@ -181,6 +181,12 @@ describe('projectWorkspacePatches', () => {
           status: 'success',
           fileChanges: [
             { path: 'src/new.ts', oldText: null, newText: 'created', truncated: true },
+            {
+              path: 'outside-canary.ts',
+              oldText: 'old',
+              newText: 'new',
+              outsideWorkspace: true,
+            },
           ],
           fileChangesOmitted: 2,
           createdAt: '2026-07-06T00:00:01.000Z',
@@ -224,6 +230,12 @@ describe('projectWorkspacePatches', () => {
             status: 'success',
             fileChanges: [
               { path: 'src/new.ts', oldText: null, newText: 'created', truncated: true },
+              {
+                path: 'outside-canary.ts',
+                oldText: 'old',
+                newText: 'new',
+                outsideWorkspace: true,
+              },
             ],
             fileChangesOmitted: 2,
           },
@@ -245,6 +257,9 @@ describe('projectWorkspacePatches', () => {
         },
       },
     });
+    const serialized = JSON.stringify(patches);
+    expect(serialized).not.toContain('/tmp/');
+    expect(serialized).not.toContain('Users');
   });
 
   it('queued follow-up enqueue does not append transcript', () => {

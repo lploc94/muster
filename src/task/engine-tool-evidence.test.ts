@@ -542,12 +542,20 @@ describe('TaskEngine tool evidence bounding (M020 S02 T02)', () => {
       const tool = toolByCallId(await repository.listToolCalls(t.id), 'path-1');
       expect(tool.fileChanges).toHaveLength(3);
       expect(tool.fileChanges?.[0]?.path).toBe('src/main.ts');
+      expect(tool.fileChanges?.[0]?.outsideWorkspace).toBeUndefined();
+      expect(
+        Object.prototype.hasOwnProperty.call(tool.fileChanges?.[0] ?? {}, 'outsideWorkspace'),
+      ).toBe(false);
       expect(tool.fileChanges?.[1]?.path).toBe('outside-secret.ts');
+      expect(tool.fileChanges?.[1]?.outsideWorkspace).toBe(true);
       expect(tool.fileChanges?.[2]?.path).toBe('secret.ts');
+      expect(tool.fileChanges?.[2]?.outsideWorkspace).toBe(true);
       for (const entry of tool.fileChanges ?? []) {
         expect(entry.path).not.toMatch(/^[A-Za-z]:/);
         expect(entry.path).not.toContain('Users');
         expect(entry.path).not.toContain('\\');
+        // Present-only marker: never emit false.
+        expect(entry.outsideWorkspace).not.toBe(false);
       }
     },
     60_000,
@@ -612,6 +620,78 @@ describe('TaskEngine tool evidence bounding (M020 S02 T02)', () => {
       expect(after.fileChanges).toEqual(before.fileChanges);
       expect(after.fileChangesOmitted).toBe(before.fileChangesOmitted);
       expect(after.output).toBe('reopen');
+    },
+    60_000,
+  );
+
+  it('persists outsideWorkspace marker through SQLite close/reopen without host layout',
+    async () => {
+      const cwd = path.join(os.tmpdir(), 'muster-evidence-marker-cwd');
+      fs.mkdirSync(cwd, { recursive: true });
+      tempDirs.push(cwd);
+      const { repository, dbPath, client } = await openRepo('marker-reopen');
+      const t = await seedTurn(repository, 'marker-task', 'marker-turn');
+
+      const absOutside = path.join(os.tmpdir(), 'outside-marker-canary.ts');
+      const absInCwd = path.join(cwd, 'src', 'inside.ts');
+
+      const engine = await TaskEngine.loadAsync({
+        workspaceId: 'ws',
+        repository,
+        workspaceFolder: cwd,
+        makeBackend: () => ({ name: 'fake', run: async function* () {} }) as never,
+        runTurn: async function* () {
+          yield {
+            type: 'toolStarted',
+            toolCallId: 'marker-1',
+            name: 'Edit',
+            kind: 'builtin',
+          };
+          yield {
+            type: 'toolCompleted',
+            toolCallId: 'marker-1',
+            outcome: 'success',
+            output: 'marker',
+            fileChanges: [
+              { path: absInCwd, oldText: 'a', newText: 'b' },
+              { path: absOutside, oldText: 'c', newText: 'd' },
+              {
+                path: 'C:\\Users\\alice\\AppData\\Local\\drive-canary.ts',
+                oldText: 'e',
+                newText: 'f',
+              },
+            ],
+          };
+          yield { type: 'turnCompleted' };
+        },
+        clock: () => '2026-07-16T00:00:02.000Z',
+      });
+
+      await engine.resumeQueuedTurnAsync(t.id, 'marker-turn');
+      await engine.whenIdle().catch(() => undefined);
+
+      const before = toolByCallId(await repository.listToolCalls(t.id), 'marker-1');
+      expect(before.fileChanges).toEqual([
+        { path: 'src/inside.ts', oldText: 'a', newText: 'b' },
+        { path: 'outside-marker-canary.ts', oldText: 'c', newText: 'd', outsideWorkspace: true },
+        { path: 'drive-canary.ts', oldText: 'e', newText: 'f', outsideWorkspace: true },
+      ]);
+      const serialized = JSON.stringify(before.fileChanges);
+      expect(serialized).not.toContain('Users');
+      expect(serialized).not.toContain(os.tmpdir());
+
+      await client.close().catch(() => undefined);
+      const idx = clients.indexOf(client);
+      if (idx >= 0) clients.splice(idx, 1);
+
+      const reopened = await reopenRepo(dbPath);
+      const after = toolByCallId(await reopened.repository.listToolCalls(t.id), 'marker-1');
+      expect(after.fileChanges).toEqual(before.fileChanges);
+      expect(after.fileChanges?.[1]?.outsideWorkspace).toBe(true);
+      expect(after.fileChanges?.[2]?.outsideWorkspace).toBe(true);
+      expect(
+        Object.prototype.hasOwnProperty.call(after.fileChanges?.[0] ?? {}, 'outsideWorkspace'),
+      ).toBe(false);
     },
     60_000,
   );

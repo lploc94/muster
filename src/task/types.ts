@@ -625,8 +625,10 @@ export interface PersistedToolCall {
    * tools stay free of empty evidence. Rides `tool_calls.payload_json` remainder
    * via `toolCallPayload` — no schema change.
    *
-   * Engine-bounded before persistence (M020 S02): at most 32 entries, paths
-   * sanitized, oversized sides marked `truncated: true`.
+   * Engine-bounded before persistence (M020 S02 / M021 S04): at most 32 entries,
+   * paths sanitized (basename + present-only `outsideWorkspace: true` when the
+   * agent path resolved outside trusted cwd), oversized sides marked
+   * `truncated: true`.
    */
   fileChanges?: ToolFileChange[];
   /**

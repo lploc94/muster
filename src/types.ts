@@ -13,6 +13,12 @@ export interface ToolFileChange {
   newText: string;
   /** Present only when a side was clipped by the engine bound; never `false`. */
   truncated?: boolean;
+  /**
+   * Present only when the agent-reported path resolved outside the trusted
+   * workspace (M021 S04). Path is already basename-only when this is set;
+   * never `false` — absent means in-workspace or unclassified-safe.
+   */
+  outsideWorkspace?: true;
 }
 
 export type NormalizedEvent =
