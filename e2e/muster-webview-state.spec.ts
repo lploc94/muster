@@ -10764,6 +10764,199 @@ test.describe('M019 S05 Assembled First Run', () => {
     await expect(card.getByText(' T-10', { exact: true })).toHaveCount(0);
   });
 
+  /**
+   * M021 S04 final proof: outside-workspace warning is visible before the
+   * permission decision and after durable projection, without exposing host
+   * path or traversal canaries. Host evidence is already basename-canonical
+   * with present-only outsideWorkspace: true (as the engine emits).
+   */
+  test('M021 S04 outside workspace: warning before approval and after durable projection', async ({
+    page,
+  }) => {
+    // Synthetic canaries — must never appear in browser-visible content.
+    const absCanary = 'C:\\Users\\m021-s04-canary\\secrets\\outside-secret.ts';
+    const posixCanary = '/tmp/m021-s04-canary/outside-secret.ts';
+    const traversalCanary = '../../etc/m021-s04-canary';
+    const safeBasename = 'outside-secret.ts';
+
+    await openWebview(page);
+
+    // --- Phase 1: live pre-approval surface ---
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [
+        task({
+          id: 'task-m021-s04-outside',
+          goal: 'Review outside edit',
+          viewStatus: 'running',
+        }),
+      ],
+      focusedTaskId: 'task-m021-s04-outside',
+      subtree: [
+        task({
+          id: 'task-m021-s04-outside',
+          goal: 'Review outside edit',
+          viewStatus: 'running',
+        }),
+      ],
+      transcript: [],
+      transcriptPage: { hasMoreBefore: false, workspaceRevision: 1 },
+      storeRevision: 1,
+    });
+
+    await postRawHostMessage(page, {
+      type: 'turnStart',
+      taskId: 'task-m021-s04-outside',
+      turnId: 'turn-m021-s04-outside',
+      trigger: 'engine',
+    });
+    await postRawHostMessage(page, {
+      type: 'event',
+      taskId: 'task-m021-s04-outside',
+      turnId: 'turn-m021-s04-outside',
+      event: {
+        type: 'toolStarted',
+        toolCallId: 'edit-m021-s04-outside',
+        name: 'Edit',
+        kind: 'builtin',
+        fileChanges: [
+          {
+            path: safeBasename,
+            oldText: 'const secret = 1;\n',
+            newText: 'const secret = 2;\n',
+            outsideWorkspace: true,
+          },
+        ],
+      },
+    });
+    await postRawHostMessage(page, {
+      type: 'permissionPending',
+      sessionId: 'session-m021-s04-outside',
+      permissionId: 'permission-m021-s04-outside',
+      title: `Edit ${safeBasename}`,
+      kind: 'edit',
+      classification: 'write',
+      options: [
+        { optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' },
+        { optionId: 'reject', name: 'Deny', kind: 'reject' },
+      ],
+    });
+
+    const liveCard = page.locator('.tool-card').filter({ hasText: 'Edit' });
+    await expect(liveCard).toBeVisible();
+    await expect(page.getByTestId('runtime-permission-card')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Allow once' })).toBeVisible();
+
+    // Visible Outside workspace badge before the permission decision.
+    const liveBadge = liveCard.locator('.tool-card__diff-outside');
+    await expect(liveBadge).toHaveCount(1);
+    await expect(liveBadge).toHaveText('Outside workspace');
+
+    // Accessible summary carries the same warning (badge is aria-hidden).
+    const liveSummary = liveCard.locator(
+      '.tool-card__diff-summary-static, button.tool-card__diff-toggle',
+    );
+    await expect(liveSummary).toHaveAttribute('aria-label', /outside workspace/i);
+
+    // Basename only — no absolute / traversal / host canaries.
+    await expect(liveCard.locator('.tool-card__diff-path')).toHaveText(safeBasename);
+    await expect(liveCard).not.toContainText(absCanary);
+    await expect(liveCard).not.toContainText(posixCanary);
+    await expect(liveCard).not.toContainText(traversalCanary);
+    await expect(liveCard).not.toContainText('Users\\m021-s04-canary');
+    await expect(liveCard).not.toContainText('/tmp/m021-s04-canary');
+    await expect(liveCard).not.toContainText('../../etc');
+
+    // Ordinary in-workspace path must not show the warning when co-projected.
+    // (Negative control is covered in durable phase with a second file.)
+
+    // --- Phase 2: durable snapshot projection after settle ---
+    // Clear the pre-approval card so durable projection is the only surface.
+    await postRawHostMessage(page, {
+      type: 'permissionCleared',
+      permissionId: 'permission-m021-s04-outside',
+    });
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [
+        task({
+          id: 'task-m021-s04-outside',
+          goal: 'Review outside edit',
+          viewStatus: 'idle',
+        }),
+      ],
+      focusedTaskId: 'task-m021-s04-outside',
+      subtree: [
+        task({
+          id: 'task-m021-s04-outside',
+          goal: 'Review outside edit',
+          viewStatus: 'idle',
+        }),
+      ],
+      transcript: [
+        {
+          id: 'tool-m021-s04-outside-durable',
+          kind: 'tool',
+          turnId: 'turn-m021-s04-outside',
+          order: 0,
+          content: {
+            toolCallId: 'edit-m021-s04-outside',
+            name: 'Edit',
+            toolKind: 'builtin',
+            status: 'success',
+            fileChanges: [
+              {
+                path: safeBasename,
+                oldText: 'const secret = 1;\n',
+                newText: 'const secret = 2;\n',
+                outsideWorkspace: true,
+              },
+              {
+                path: 'src/inside.ts',
+                oldText: 'export const inside = 1;\n',
+                newText: 'export const inside = 2;\n',
+              },
+            ],
+          },
+        },
+      ],
+      storeRevision: 2,
+    });
+
+    const durableCard = page.locator('.tool-card').filter({ hasText: 'Edit' });
+    await expect(durableCard).toBeVisible();
+    await expect(page.getByTestId('runtime-permission-card')).toHaveCount(0);
+
+    const durableFiles = durableCard.locator('.tool-card__diff-file');
+    await expect(durableFiles).toHaveCount(2);
+
+    const outsideFile = durableFiles.filter({ hasText: safeBasename });
+    const insideFile = durableFiles.filter({ hasText: 'src/inside.ts' });
+
+    await expect(outsideFile.locator('.tool-card__diff-outside')).toHaveCount(1);
+    await expect(outsideFile.locator('.tool-card__diff-outside')).toHaveText(
+      'Outside workspace',
+    );
+    await expect(
+      outsideFile.locator('.tool-card__diff-summary-static, button.tool-card__diff-toggle'),
+    ).toHaveAttribute('aria-label', /outside workspace/i);
+
+    // In-workspace file: no warning badge, no outside-workspace aria prose.
+    await expect(insideFile.locator('.tool-card__diff-outside')).toHaveCount(0);
+    await expect(
+      insideFile.locator('.tool-card__diff-summary-static, button.tool-card__diff-toggle'),
+    ).not.toHaveAttribute('aria-label', /outside workspace/i);
+
+    // Still no host-layout canaries after durable projection.
+    const durableBlob = await durableCard.innerText();
+    expect(durableBlob).not.toContain(absCanary);
+    expect(durableBlob).not.toContain(posixCanary);
+    expect(durableBlob).not.toContain(traversalCanary);
+    expect(durableBlob).not.toMatch(/[A-Za-z]:\\Users\\/);
+    expect(durableBlob).not.toMatch(/\/tmp\/m021-s04-canary/);
+    expect(durableBlob).not.toContain('../../etc');
+  });
+
 });
 
 declare global {

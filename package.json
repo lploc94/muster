@@ -340,6 +340,7 @@
     "test:m020-s01": "vitest run src/backends/m020-s01-diff-evidence-flow.test.ts",
     "test:m020-s02": "vitest run src/shared/tool-file-changes.test.ts src/task/engine-tool-evidence.test.ts webview/src/lib/protocol.test.ts && npx playwright test e2e/muster-webview-state.spec.ts --grep \"M020 S02\"",
     "test:m020-s03": "vitest run webview/src/lib/tool-diff-view.test.ts && npx playwright test e2e/muster-webview-state.spec.ts --grep \"M020 S03\"",
+    "test:m021-s04": "node --test scripts/verify-adapter-spec.test.mjs && vitest run src/shared/tool-file-changes.test.ts src/task/engine-tool-evidence.test.ts webview/src/lib/protocol.test.ts webview/src/lib/tool-diff-view.test.ts && npx playwright test e2e/muster-webview-state.spec.ts --grep \"M021 S04\"",
     "test:task-audit": "node --test scripts/verify-task-model-ui-state-audit.test.mjs",
     "test:settings-docs": "node --test scripts/verify-settings-docs.test.mjs",
     "test:settings-live-evidence": "node --test scripts/verify-settings-live-host-evidence.test.mjs",

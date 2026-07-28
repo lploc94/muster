@@ -26,6 +26,12 @@ export interface ToolFileChange {
   newText: string;
   /** Engine-owned bounded representation only; never emitted as false. */
   truncated?: boolean;
+  /**
+   * Present-only engine classification: the original agent path resolved
+   * outside the trusted workspace. Always true when set — never false.
+   * Path is the safe basename only; raw host layout is never retained.
+   */
+  outsideWorkspace?: true;
 }
 
 export type NormalizedEvent =
@@ -52,7 +58,7 @@ export type NormalizedEvent =
 - `toolCallId` is required and should be namespaced by the adapter (e.g. `claude:tool-abc123`).
 - **Tool event ordering:** `toolStarted` for a given `toolCallId` must precede any `toolUpdated`/`toolCompleted` with the same ID, and each `toolCallId` gets exactly one `toolCompleted` — unless the turn ends in `error` mid-tool, in which case in-flight tools are simply abandoned (no synthetic completion required).
 - `toolUpdated.input` is a **full replacement** of the previous input snapshot (not a merge patch). Adapters should buffer fragmented input until a valid snapshot can be emitted.
-- ACP `diff` content blocks may arrive on the initial `tool_call` or a later `tool_call_update`. Adapters must preserve them on the corresponding tool event; the engine canonicalizes paths, bounds retained bytes/lines/file count, and is the only layer allowed to add `truncated` or `fileChangesOmitted` metadata before persistence or host emission.
+- ACP `diff` content blocks may arrive on the initial `tool_call` or a later `tool_call_update`. Adapters must preserve them on the corresponding tool event. Adapters may cap retained file count and set `fileChangesOmitted` at the adapter edge so a bounded ACP frame never expands into an unbounded intermediate array. The engine re-bounds with the trusted cwd, adds engine omissions to upstream omissions, and owns path classification plus remaining text/line/aggregate bounds (including present-only `outsideWorkspace: true` on basenames for out-of-workspace paths, and engine-owned `truncated`) before persistence or host emission.
 - `fileChanges` and `fileChangesOmitted` are optional and present-only. No-diff tools remain byte-compatible with older persisted rows; an omission-only event is valid when every unsafe or over-budget entry was dropped.
 - `toolCompleted.outcome: 'success'` permits `output` but not `error`; `outcome: 'error'` requires `error` and must not include `output`.
 - **`raw` policy:** adapters emit `raw` for stdout lines they cannot parse and for unknown provider events. The coordinator uses `raw` only for diagnostic logging — never rendered in the UI. This preserves unexpected output for debugging when CLI formats change.
