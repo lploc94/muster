@@ -44,6 +44,12 @@ export interface BuildToolDiffViewInput {
   toolCallId: string;
   fileChanges: ReadonlyArray<ToolDiffFileChangeInput>;
   fileChangesOmitted?: number;
+  /**
+   * Override the shared per-card comparison budget (ms). Production UI keeps the
+   * default wall-clock cap; tests that prove the max retained-budget model may
+   * raise this so CPU contention in the full suite does not fake unavailable diffs.
+   */
+  comparisonBudgetMs?: number;
 }
 
 export type ToolDiffLineKind = 'context' | 'added' | 'removed' | 'fold';
@@ -255,7 +261,13 @@ export function buildToolDiffView(input: BuildToolDiffViewInput): ToolDiffView {
   const files: ToolDiffFileView[] = [];
   let totalAdded = 0;
   let totalRemoved = 0;
-  const deadline = Date.now() + TOOL_DIFF_TOTAL_TIMEOUT_MS;
+  const budgetMs =
+    typeof input.comparisonBudgetMs === 'number' &&
+    Number.isFinite(input.comparisonBudgetMs) &&
+    input.comparisonBudgetMs > 0
+      ? input.comparisonBudgetMs
+      : TOOL_DIFF_TOTAL_TIMEOUT_MS;
+  const deadline = Date.now() + budgetMs;
 
   for (let index = 0; index < input.fileChanges.length; index++) {
     const entry = input.fileChanges[index]!;

@@ -559,7 +559,14 @@ describe('M021 S03 compact unchanged context windows', () => {
     const files = Array.from({ length: TOOL_FILE_CHANGES_MAX_FILES }, (_, i) =>
       fullBudgetSingleChange(`f${i}.ts`),
     );
-    const view = buildToolDiffView({ toolCallId: 'tc-max', fileChanges: files });
+    // Deterministic budget: 32×full-side files under full-suite CPU contention can
+    // exhaust the 40ms UI default mid-loop (comparisonUnavailable, added+removed=0).
+    // This test proves the retained-budget row ceiling, not wall-clock abort policy.
+    const view = buildToolDiffView({
+      toolCallId: 'tc-max',
+      fileChanges: files,
+      comparisonBudgetMs: 5_000,
+    });
 
     expect(view.files).toHaveLength(TOOL_FILE_CHANGES_MAX_FILES);
     let rendered = 0;

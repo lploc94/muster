@@ -281,6 +281,12 @@ describe('P5-W3 durable write failures', () => {
   it('holds real lock longer than busyTimeout and SAME contender recovers after release', async () => {
     const dbPath = tempDbPath();
     await seedWorkspace(dbPath);
+    // Open contender BEFORE the lock hold window. Spawning/opening a DbClient under
+    // full-suite parallelism can exceed the short holdMs budget; if open happens after
+    // the lock is already released, the busy write succeeds and the race resolves instead
+    // of rejecting — a load flake, not a product regression.
+    const contender = makeClient();
+    await contender.open(dbPath, 80);
     const { Worker } = await import('node:worker_threads');
     const lockWorker = new Worker(
       `
@@ -296,7 +302,7 @@ describe('P5-W3 durable write failures', () => {
       db.close();
       parentPort.postMessage({ released: true });
       `,
-      { eval: true, workerData: { path: dbPath, holdMs: 800 } },
+      { eval: true, workerData: { path: dbPath, holdMs: 1_200 } },
     );
     try {
       await new Promise<void>((resolve, reject) => {
@@ -312,8 +318,6 @@ describe('P5-W3 durable write failures', () => {
         });
       });
 
-      const contender = makeClient();
-      await contender.open(dbPath, 80);
       const started = Date.now();
       let ticks = 0;
       const heartbeat = setInterval(() => {
