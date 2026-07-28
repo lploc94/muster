@@ -10262,6 +10262,7 @@ test.describe('M019 S05 Assembled First Run', () => {
     const card = page.locator('.tool-card').filter({ hasText: 'Edit' });
     await expect(card).toBeVisible();
     await expect(card.getByText('src/big.ts')).toBeVisible();
+    await card.locator('button.tool-card__diff-toggle').click();
     // Dedicated marker (not only the text suffix buried in the pre).
     const marker = card.locator('.tool-card__diff-truncated');
     await expect(marker).toHaveCount(1);
