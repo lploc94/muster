@@ -93,7 +93,8 @@ test('buildPackagingGateEvidence exposes totalEntries, nodeModulesEntryCount, mi
   assert.equal(evidence.nodeModulesEntryCount, census.nodeModulesEntries);
   assert.deepEqual(evidence.missingEntrypoints, []);
   assert.equal(evidence.allowlist.ok, true);
-  assert.equal(evidence.allowlist.mode, 'current-tree');
+  assert.equal(evidence.allowlist.mode, 'sdk-closure-only');
+  assert.deepEqual(evidence.allowlist.violations, []);
   assert.ok(Array.isArray(evidence.nodeModulesPackages));
   assert.ok(evidence.topLevelCounts.dist > 0);
   assert.equal(evidence.entrypoints.length, 3);

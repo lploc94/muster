@@ -365,6 +365,7 @@
     "test:task-export-live-evidence": "node --test scripts/verify-task-export-live-host-evidence.test.mjs",
     "test:live-inject-smoke": "node --test scripts/verify-live-inject-smoke.test.mjs",
     "package": "vsce package",
+    "test:m022-s02": "node --test scripts/packaging-dependency-shape.test.mjs scripts/packaging-allowlist-closure.test.mjs scripts/run-packaging-gate.test.mjs",
     "test:packaging": "node scripts/run-packaging-gate.mjs",
     "test:sqlite-extension-host": "node scripts/run-sqlite-extension-host-smoke.mjs",
     "test:sqlite-two-window-live-uat": "node scripts/run-sqlite-two-window-live-uat.mjs",
