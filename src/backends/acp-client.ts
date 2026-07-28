@@ -618,6 +618,15 @@ export function extractModelConfig(configOptions: unknown, sessionModels?: unkno
 export class AcpClient {
   private proc?: ChildProcessWithoutNullStreams;
   private stdoutFrame: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+  /**
+   * Exact stdout `data` listener owned by the current process. Cleared and
+   * detached on teardown so late bytes from a retired child cannot mutate the
+   * replacement connection's NDJSON remainder or live sinks (R038).
+   */
+  private stdoutIntake?: {
+    proc: ChildProcessWithoutNullStreams;
+    onData: (chunk: Buffer) => void;
+  };
   private nextId = 1;
   private pending = new Map<number, Pending>();
   private sessionSinks = new Map<string, Set<SessionSink>>();
@@ -796,12 +805,19 @@ export class AcpClient {
 
   private teardownProcess(): void {
     const proc = this.proc;
+    const intake = this.stdoutIntake;
+    // Drop ownership first so any already-queued stdout callback is inert, then
+    // detach the exact retired listener so the stream cannot re-enter later.
+    this.stdoutIntake = undefined;
     this.proc = undefined;
     this.authenticated = false;
     // Drop advertised commands with the process: a fresh connection re-advertises,
     // so the cache must not survive teardown (stale → wrong fail-closed decisions).
     this.advertisedCommands = undefined;
     this.stdoutFrame = Buffer.alloc(0);
+    if (intake) {
+      intake.proc.stdout.off('data', intake.onData);
+    }
     // Group SIGTERM now, escalate to group SIGKILL if the tree is still alive
     // after the grace — reaps the adapter's grandchild CLI, not just the child.
     if (proc) terminateProcessTree(proc);
@@ -826,7 +842,11 @@ export class AcpClient {
     });
     this.proc = proc;
 
-    proc.stdout.on('data', (chunk: Buffer) => {
+    // Fence stdout intake to this process only. Without the ownership check,
+    // a late chunk from a retired child mutates the replacement connection's
+    // shared stdoutFrame remainder and can route stale JSON into live sinks.
+    const onStdoutData = (chunk: Buffer): void => {
+      if (this.proc !== proc) return;
       const feed = feedBoundedNdjson(this.stdoutFrame, chunk);
       this.stdoutFrame = feed.remainder;
       for (const line of feed.lines) this.onLine(line);
@@ -842,7 +862,9 @@ export class AcpClient {
         this.rejectAllPending(error);
         this.teardownProcess();
       }
-    });
+    };
+    this.stdoutIntake = { proc, onData: onStdoutData };
+    proc.stdout.on('data', onStdoutData);
 
     proc.stdin.on('error', () => {
       // Swallow EPIPE after exit — writeLine handles the synchronous path.

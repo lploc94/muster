@@ -1,5 +1,18 @@
 import { EventEmitter } from 'events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+
+const { mockSpawn } = vi.hoisted(() => ({
+  mockSpawn: vi.fn(),
+}));
+
+vi.mock('child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('child_process')>();
+  return {
+    ...actual,
+    spawn: (...args: unknown[]) => mockSpawn(...args),
+  };
+});
+
 import {
   AcpClient,
   MAX_ACP_FRAME_BYTES,
@@ -714,3 +727,241 @@ describe('M012 S03 flow: permission mode is sampled per request from mutable con
     client.dispose();
   });
 });
+
+/**
+ * Controllable ACP child process for reconnect/fencing regressions.
+ * Auto-answers initialize/authenticate so ensureConnected can complete,
+ * while leaving later requests pending for the test to settle.
+ */
+class FakeStdioChild extends EventEmitter {
+  exitCode: number | null = null;
+  signalCode: NodeJS.Signals | null = null;
+  killed = false;
+  stdout = new EventEmitter();
+  stderr = new EventEmitter();
+  stdin: EventEmitter & {
+    writable: boolean;
+    write: (data: string) => boolean;
+  };
+
+  constructor(public pid: number) {
+    super();
+    this.stdin = Object.assign(new EventEmitter(), {
+      writable: true,
+      write: (data: string): boolean => {
+        for (const line of data.split('\n')) {
+          if (!line.trim()) continue;
+          let msg: { id?: number; method?: string };
+          try {
+            msg = JSON.parse(line) as { id?: number; method?: string };
+          } catch {
+            continue;
+          }
+          if (msg.id == null) continue;
+          if (msg.method === 'initialize') {
+            queueMicrotask(() => {
+              this.stdout.emit(
+                'data',
+                Buffer.from(
+                  JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: msg.id,
+                    result: { protocolVersion: 1, agentCapabilities: {} },
+                  }) + '\n',
+                ),
+              );
+            });
+          } else if (msg.method === 'authenticate') {
+            queueMicrotask(() => {
+              this.stdout.emit(
+                'data',
+                Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\n'),
+              );
+            });
+          }
+        }
+        return true;
+      },
+    });
+  }
+
+  kill = vi.fn((_signal?: NodeJS.Signals | number) => {
+    this.killed = true;
+    return true;
+  });
+}
+
+describe('AcpClient retired stdout fencing (R038 / M021-S02)', () => {
+  const config: AcpAgentConfig = {
+    key: 'stdout-fence-backend',
+    label: 'Fence',
+    command: 'fake-acp',
+    args: ['stdio'],
+  };
+
+  afterEach(() => {
+    mockSpawn.mockReset();
+  });
+
+  it('detaches retired stdout and keeps late bytes out of the fresh connection', async () => {
+    const child1 = new FakeStdioChild(1001);
+    const child2 = new FakeStdioChild(1002);
+    mockSpawn.mockReturnValueOnce(child1).mockReturnValueOnce(child2);
+
+    const client = new AcpClient(config);
+    await client.ensureConnected();
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+
+    const sessionUpdates: SessionUpdateLike[] = [];
+    const connectionLines: Array<{ line: string; source: string }> = [];
+    client.registerSessionSink('sess-live', (update) => {
+      sessionUpdates.push(update as SessionUpdateLike);
+    });
+    client.registerConnectionSink((line, source) => {
+      connectionLines.push({ line, source });
+    });
+
+    // Capture the retired listener before teardown so we can also exercise the
+    // ownership guard for an already-queued callback after replacement.
+    const retiredStdoutListeners = [
+      ...child1.stdout.listeners('data'),
+    ] as Array<(chunk: Buffer) => void>;
+    expect(retiredStdoutListeners.length).toBeGreaterThan(0);
+
+    // Reconnect without dispose() so session/connection sinks stay registered.
+    (client as unknown as { teardownProcess(): void }).teardownProcess();
+    (client as unknown as { connectPromise?: Promise<void> }).connectPromise = undefined;
+
+    // Teardown must detach the exact retired stdout data listener.
+    expect(child1.stdout.listenerCount('data')).toBe(0);
+
+    await client.ensureConnected();
+    expect(mockSpawn).toHaveBeenCalledTimes(2);
+
+    // Track request ids written to the fresh child so we can attempt a stale settle.
+    let lastFreshRequestId: number | undefined;
+    const originalWrite = child2.stdin.write.bind(child2.stdin);
+    child2.stdin.write = (data: string): boolean => {
+      for (const line of data.split('\n')) {
+        if (!line.trim()) continue;
+        try {
+          const msg = JSON.parse(line) as { id?: number };
+          if (typeof msg.id === 'number') lastFreshRequestId = msg.id;
+        } catch {
+          // ignore non-json writes
+        }
+      }
+      return originalWrite(data);
+    };
+
+    const pending = (
+      client as unknown as {
+        request(method: string, params: unknown, timeoutMs?: number): Promise<unknown>;
+      }
+    ).request(
+      'session/prompt',
+      { sessionId: 'sess-live', prompt: [{ type: 'text', text: 'hi' }] },
+      2_000,
+    );
+    expect(lastFreshRequestId).toBeTypeOf('number');
+
+    // Late complete JSON session update from the retired child.
+    const staleSessionFrame =
+      JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId: 'sess-live',
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'STALE' },
+          },
+        },
+      }) + '\n';
+    child1.stdout.emit('data', Buffer.from(staleSessionFrame));
+
+    // Late non-JSON complete line from the retired child.
+    child1.stdout.emit('data', Buffer.from('NOT-JSON-FROM-RETIRED\n'));
+
+    // Late partial NDJSON fragment that would poison the shared remainder.
+    child1.stdout.emit('data', Buffer.from('{"stale":'));
+
+    // Late response that would settle the fresh connection's pending request.
+    child1.stdout.emit(
+      'data',
+      Buffer.from(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: lastFreshRequestId,
+          result: { stopReason: 'STALE' },
+        }) + '\n',
+      ),
+    );
+
+    // Already-queued ownership path: invoke the captured retired callback directly.
+    for (const listener of retiredStdoutListeners) {
+      listener(Buffer.from(staleSessionFrame));
+      listener(Buffer.from('QUEUED-NON-JSON\n'));
+      listener(Buffer.from('{"partial'));
+      listener(
+        Buffer.from(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: lastFreshRequestId,
+            result: { stopReason: 'STALE_QUEUED' },
+          }) + '\n',
+        ),
+      );
+    }
+
+    // Fresh child delivers a clean valid frame — must not be prefixed by retired partials.
+    child2.stdout.emit(
+      'data',
+      Buffer.from(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'session/update',
+          params: {
+            sessionId: 'sess-live',
+            update: {
+              sessionUpdate: 'agent_message_chunk',
+              content: { type: 'text', text: 'FRESH' },
+            },
+          },
+        }) + '\n',
+      ),
+    );
+
+    expect(sessionUpdates).toEqual([
+      {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'FRESH' },
+      },
+    ]);
+    expect(connectionLines).toEqual([]);
+
+    const pendingMap = (
+      client as unknown as { pending: Map<number, unknown> }
+    ).pending;
+    expect(pendingMap.has(lastFreshRequestId!)).toBe(true);
+
+    child2.stdout.emit(
+      'data',
+      Buffer.from(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: lastFreshRequestId,
+          result: { stopReason: 'end_turn' },
+        }) + '\n',
+      ),
+    );
+    await expect(pending).resolves.toEqual({ stopReason: 'end_turn' });
+
+    client.dispose();
+  });
+});
+
+type SessionUpdateLike = {
+  sessionUpdate?: string;
+  content?: { type?: string; text?: string };
+};
