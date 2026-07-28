@@ -59,6 +59,7 @@ import {
   putPresentation,
   putSendOutbox,
   readDurableSurfaces,
+  readRedactedBridgeHealth,
   readRedactedDbIdentity,
   type UatHostState,
 } from './host/uat-commands';
@@ -4687,6 +4688,21 @@ function registerLiveUatCommands(context: vscode.ExtensionContext): void {
         throw new Error('UAT chat provider unavailable');
       }
       return uatChatProvider.hostStateForUat();
+    }),
+    // Packaging-gate observation: redacted MCP bridge listen state only.
+    // Does not start/stop the bridge; production activation already owns listen().
+    vscode.commands.registerCommand(UAT_COMMANDS.bridgeHealth, () => {
+      if (!bridgeServer) {
+        return readRedactedBridgeHealth(null);
+      }
+      const port = bridgeServer.getPort();
+      return readRedactedBridgeHealth({
+        port,
+        generation: bridgeServer.getGeneration(),
+        // port > 0 means the production listen() path bound successfully.
+        // Packaging gate only needs ok + port > 0 after activation.
+        status: port > 0 ? 'ok' : 'unavailable',
+      });
     }),
     vscode.commands.registerCommand(UAT_COMMANDS.forcePollingActive, async () => {
       if (!uatChatProvider) {

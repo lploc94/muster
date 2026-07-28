@@ -31,6 +31,11 @@ export const UAT_COMMANDS = {
   loadOlderTranscript: 'muster.uat.loadOlderTranscript',
   readDurableSurfaces: 'muster.uat.readDurableSurfaces',
   focusTask: 'muster.uat.focusTask',
+  /**
+   * Packaging-gate observation: redacted MCP bridge listen state.
+   * Returns only `{ port, status, generation }` — never tokens/paths.
+   */
+  bridgeHealth: 'muster.uat.bridgeHealth',
   /** M019/S05 native first-run observations (production-path delegates). */
   refreshReadiness: 'muster.uat.refreshReadiness',
   probeBackend: 'muster.uat.probeBackend',
@@ -71,6 +76,55 @@ export type UatHostState = {
   /** True only because the live UAT keeps two independent Electron processes active. */
   focusGateOverridden: boolean;
 };
+
+/** Redacted MCP bridge listen observation for packaging-gate /health proof. */
+export type UatBridgeHealthStatus = 'ok' | 'stopping' | 'unavailable';
+
+export type UatBridgeHealth = {
+  port: number;
+  status: UatBridgeHealthStatus;
+  generation: number;
+};
+
+/**
+ * Project a bridge health snapshot to the packaging-gate allowlist of fields.
+ * Strips bearer tokens, credential ids, workspace/db paths, and any other extras.
+ * Does not start or stop the bridge — pure observation.
+ */
+export function readRedactedBridgeHealth(
+  source:
+    | {
+        port?: number | null;
+        status?: string | null;
+        generation?: number | null;
+        [key: string]: unknown;
+      }
+    | null
+    | undefined,
+): UatBridgeHealth {
+  if (!source) {
+    return { port: 0, status: 'unavailable', generation: 0 };
+  }
+
+  const port =
+    typeof source.port === 'number' && Number.isFinite(source.port) ? source.port : 0;
+  const generation =
+    typeof source.generation === 'number' && Number.isFinite(source.generation)
+      ? source.generation
+      : 0;
+
+  let status: UatBridgeHealthStatus;
+  if (source.status === 'ok' || source.status === 'stopping') {
+    // Explicit bridge status wins, but a non-listening port cannot claim ok.
+    status = source.status === 'ok' && port <= 0 ? 'unavailable' : source.status;
+  } else if (port > 0) {
+    status = 'ok';
+  } else {
+    status = 'unavailable';
+  }
+
+  return { port, status, generation };
+}
 
 export type UatDurableSurfaces = {
   sendOutbox: Array<{
