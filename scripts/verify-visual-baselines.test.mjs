@@ -233,10 +233,16 @@ describe('visual matrix baseline contract (M014 S02)', () => {
     assert.match(casesTs, /visual-cases\.manifest\.json/);
     assert.match(casesTs, /M014_S02_FLOW_TITLE/);
     assert.match(casesTs, /VISUAL_MATRIX_MAX_CASES/);
+    assert.match(casesTs, /M021_S03_BOUNDED_DIFF_VISUAL_ID/);
+    assert.match(casesTs, /V08-webview-bounded-diff-dark/);
     for (const c of manifest.cases) {
       assert.ok(c.id.length > 0);
     }
     assert.equal(manifest.flowTitle, 'M014 S02 flow: representative visual matrix');
+    const v08 = manifest.cases.find((c) => c.id === 'V08-webview-bounded-diff-dark');
+    assert.ok(v08, 'manifest must include V08-webview-bounded-diff-dark');
+    assert.equal(v08.fixtureFactory, 'createStaticBoundedDiffFixture');
+    assert.match(v08.snapshotPath, /V08-webview-bounded-diff-dark\.png$/);
   });
 
   it('requires the named S02 flow to exist with the exact Playwright title', () => {
@@ -260,6 +266,8 @@ describe('visual matrix baseline contract (M014 S02)', () => {
     assert.match(docs, /eight|≤\s*8|at most eight|maxCases/i);
     assert.match(docs, /V01-webview-compact-dark/);
     assert.match(docs, /V06-presentation-narrow-light/);
+    assert.match(docs, /V08-webview-bounded-diff-dark/);
+    assert.match(docs, /M021 S03 bounded diff context/);
     assert.match(docs, /high-contrast|high contrast/i);
     assert.match(docs, /assertPresentationReadableContrast/);
     assert.match(docs, /black-on-black|unreadable contrast/i);

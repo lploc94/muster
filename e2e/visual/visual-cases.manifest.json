@@ -128,6 +128,24 @@
       ],
       "snapshotPath": "e2e/visual/muster-webview.visual.spec.ts-snapshots/M019-S05-first-run-backends-compact-dark.png",
       "fixtureFactory": "createStaticFirstRunBackendsReadinessSnapshot"
+    },
+    {
+      "id": "V08-webview-bounded-diff-dark",
+      "owner": "m021-s03-webview",
+      "entrypoint": "webview",
+      "state": "bounded-folded-diff-context",
+      "layout": "compact",
+      "viewport": {
+        "width": 320,
+        "height": 600
+      },
+      "theme": "dark",
+      "requirements": [
+        "M021-S03-bounded-diff-context",
+        "M021-S03-fold-markers"
+      ],
+      "snapshotPath": "e2e/visual/muster-webview.visual.spec.ts-snapshots/V08-webview-bounded-diff-dark.png",
+      "fixtureFactory": "createStaticBoundedDiffFixture"
     }
   ]
 }

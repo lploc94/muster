@@ -769,6 +769,66 @@ export function createStaticFirstRunBackendsReadinessSnapshot(
   return snapshot;
 }
 
+/**
+ * M021/S03 bounded folded-diff surface for the compact visual golden.
+ * Small always-expanded window (10 lead + change + 10 trail) so counted fold
+ * markers are visible without disclosure interaction. Synthetic only.
+ */
+export function createStaticBoundedDiffFixture() {
+  const nLines = (n: number, prefix: string): string =>
+    Array.from({ length: n }, (_, i) => `${prefix}-${i + 1}`).join('\n');
+  const leading = nLines(10, 'L');
+  const trailing = nLines(10, 'T');
+  const taskId = 'task-visual-bounded-diff';
+  const task = {
+    id: taskId,
+    parentId: null,
+    goal: 'Bounded folded diff window',
+    role: 'coordinator' as const,
+    lifecycle: 'open' as const,
+    runtimeActivity: 'idle' as const,
+    viewStatus: 'idle' as const,
+    currentTurnActivity: null,
+    updatedAt: VISUAL_CLOCK_ISO,
+    backend: 'claude',
+  };
+  const fixture = {
+    type: 'snapshot' as const,
+    protocolVersion: VISUAL_PROTOCOL_VERSION,
+    rootTasks: [task],
+    focusedTaskId: taskId,
+    subtree: [task],
+    transcript: [
+      {
+        id: 'tool-visual-bounded-diff-1',
+        kind: 'tool' as const,
+        turnId: 'turn-visual-bounded-diff',
+        order: 0,
+        content: {
+          toolCallId: 'tc-visual-bounded-diff-1',
+          name: 'Edit',
+          toolKind: 'builtin' as const,
+          status: 'success' as const,
+          fileChanges: [
+            {
+              path: 'src/window.ts',
+              oldText: `${leading}\nold\n${trailing}\n`,
+              newText: `${leading}\nnew\n${trailing}\n`,
+            },
+          ],
+        },
+      },
+    ],
+    transcriptPage: {
+      hasMoreBefore: false,
+      workspaceRevision: 2103,
+    },
+    storeRevision: 2103,
+  };
+  assertSanitizedVisualFixture(fixture);
+  return fixture;
+}
+
 /** Relative-only file mention suggestions (no absolute paths or cwd). */
 export function createStaticFileMentionSuggestions(
   requestId: string,

@@ -287,7 +287,7 @@ npm run test:visual:linux -- --grep "M014 S01 flow: deterministic dual-entrypoin
 
 ## M014 S02 representative visual matrix
 
-Bounded committed matrix (hard cap **eight** cases, currently six) covering both
+Bounded committed matrix (hard cap **eight** cases, currently eight) covering both
 entrypoints, compact 320px main-webview and narrow Presentation containment, and
 light / dark / high-contrast browser theme tokens.
 
@@ -329,6 +329,15 @@ git diff --exit-code -- e2e/visual
 | `V04-webview-settings-prompt-hc` | webview | compact 320×600 | high-contrast | `muster-webview.visual.spec.ts-snapshots/` |
 | `V05-webview-validation-errors-dark` | webview | compact 320×600 | dark | `muster-webview.visual.spec.ts-snapshots/` |
 | `V06-presentation-narrow-light` | presentation | narrow 360×600 | light | `muster-presentation.visual.spec.ts-snapshots/` |
+| `V07-webview-first-run-backends-dark` | webview | compact 320×600 | dark | `muster-webview.visual.spec.ts-snapshots/` (file: `M019-S05-first-run-backends-compact-dark.png`) |
+| `V08-webview-bounded-diff-dark` | webview | compact 320×600 | dark | `muster-webview.visual.spec.ts-snapshots/` |
+
+Independent greppable proofs for later matrix slots:
+
+```bash
+npm run test:webview:visual:linux -- --grep "M019-S05-first-run-backends-compact-dark"
+npm run test:webview:visual:linux -- --grep "M021 S03 bounded diff context"
+```
 
 Flow-owned goldens under `m014-slice-flows.spec.ts-snapshots/` use the `S02-`
 prefix so they do not collide with the S01 dual-entrypoint pilot snapshots that
@@ -353,5 +362,7 @@ Before commit, inspect every image for:
 | Autocomplete (light) | `V03-webview-autocomplete-light` | `e2e/visual/muster-webview.visual.spec.ts` |
 | Settings + prompt (HC) | `V04-webview-settings-prompt-hc` | `e2e/visual/muster-webview.visual.spec.ts` |
 | Validation errors (dark) | `V05-webview-validation-errors-dark` | `e2e/visual/muster-webview.visual.spec.ts` |
+| First-run backends (dark) | `M019-S05-first-run-backends-compact-dark` | `e2e/visual/muster-webview.visual.spec.ts` |
+| Bounded folded diff (dark) | `V08-webview-bounded-diff-dark` (`M021 S03 bounded diff context`) | `e2e/visual/muster-webview.visual.spec.ts` |
 | Matrix flow | `M014 S02 flow: representative visual matrix` | `e2e/visual/m014-slice-flows.spec.ts` |
 

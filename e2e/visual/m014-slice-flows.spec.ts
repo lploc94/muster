@@ -28,6 +28,7 @@ import {
 } from '../fixtures/visual-environment';
 import {
   M014_S02_FLOW_TITLE,
+  M021_S03_BOUNDED_DIFF_VISUAL_ID,
   VISUAL_MATRIX_CASES,
   VISUAL_MATRIX_MAX_CASES,
 } from './visual-cases';
@@ -252,6 +253,10 @@ test.describe('M014 S02 representative visual matrix flow', () => {
     expect(VISUAL_MATRIX_CASES.length).toBeLessThanOrEqual(VISUAL_MATRIX_MAX_CASES);
     expect(VISUAL_MATRIX_CASES.length).toBeGreaterThanOrEqual(2);
     expect(VISUAL_MATRIX_MAX_CASES).toBe(8);
+    // M021/S03 fills the eighth matrix slot with the bounded folded-diff case.
+    expect(
+      VISUAL_MATRIX_CASES.some((c) => c.id === M021_S03_BOUNDED_DIFF_VISUAL_ID),
+    ).toBe(true);
     const entrypoints = new Set(VISUAL_MATRIX_CASES.map((c) => c.entrypoint));
     expect(entrypoints.has('webview')).toBe(true);
     expect(entrypoints.has('presentation')).toBe(true);
