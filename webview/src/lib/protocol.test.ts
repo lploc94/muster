@@ -1877,6 +1877,39 @@ describe('M020 bounded live tool events', () => {
   });
 });
 
+describe('M021 S03 bounded live toolCallId identifiers', () => {
+  const envelope = (event: Record<string, unknown>) => ({
+    type: 'event',
+    taskId: 'task-1',
+    turnId: 'turn-1',
+    event,
+  });
+
+  const variantsFor = (toolCallId: string): Record<string, unknown>[] => [
+    { type: 'toolStarted', toolCallId, name: 'Edit' },
+    { type: 'toolUpdated', toolCallId },
+    { type: 'toolCompleted', toolCallId, outcome: 'success' },
+  ];
+
+  it.each([
+    ['toolStarted', { type: 'toolStarted', toolCallId: 'a'.repeat(512), name: 'Edit' }],
+    ['toolUpdated', { type: 'toolUpdated', toolCallId: 'a'.repeat(512) }],
+    ['toolCompleted', { type: 'toolCompleted', toolCallId: 'a'.repeat(512), outcome: 'success' }],
+  ] as const)('accepts a 512-character toolCallId on %s', (_label, event) => {
+    expect(isExtMessage(envelope(event))).toBe(true);
+  });
+
+  it.each([
+    ['513 characters', 'a'.repeat(513)],
+    ['empty string', ''],
+    ['NUL-bearing', 'id\0x'],
+  ] as const)('rejects %s toolCallId on start, update, and complete', (_label, toolCallId) => {
+    for (const event of variantsFor(toolCallId)) {
+      expect(isExtMessage(envelope(event))).toBe(false);
+    }
+  });
+});
+
 describe('protocol v9 workspacePatchBatch', () => {
   const summary = {
     id: 'task-1',

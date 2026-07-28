@@ -1560,12 +1560,16 @@ export function isNormalizedEvent(v: unknown): v is NormalizedEvent {
     case 'reasoningDelta':
       return isString(v.content) && isString(v.messageId);
     case 'toolStarted':
-      return isString(v.toolCallId) && isString(v.name) && hasValidToolEvidence(v);
+      return (
+        isBoundedId(v.toolCallId, WORKSPACE_PATCH_ID_MAX) &&
+        isString(v.name) &&
+        hasValidToolEvidence(v)
+      );
     case 'toolUpdated':
-      return isString(v.toolCallId) && hasValidToolEvidence(v);
+      return isBoundedId(v.toolCallId, WORKSPACE_PATCH_ID_MAX) && hasValidToolEvidence(v);
     case 'toolCompleted':
       return (
-        isString(v.toolCallId) &&
+        isBoundedId(v.toolCallId, WORKSPACE_PATCH_ID_MAX) &&
         (v.outcome === 'success' || v.outcome === 'error') &&
         hasValidToolEvidence(v)
       );
