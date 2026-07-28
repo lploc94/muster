@@ -18,6 +18,8 @@ export type NormalizedEvent =
         oldText: string | null;
         newText: string;
         truncated?: boolean;
+        /** Present only when path resolved outside trusted workspace; never false. */
+        outsideWorkspace?: true;
       }>;
       fileChangesOmitted?: number;
       meta?: Record<string, unknown>;
@@ -32,6 +34,8 @@ export type NormalizedEvent =
         oldText: string | null;
         newText: string;
         truncated?: boolean;
+        /** Present only when path resolved outside trusted workspace; never false. */
+        outsideWorkspace?: true;
       }>;
       fileChangesOmitted?: number;
       meta?: Record<string, unknown>;
@@ -48,6 +52,8 @@ export type NormalizedEvent =
         oldText: string | null;
         newText: string;
         truncated?: boolean;
+        /** Present only when path resolved outside trusted workspace; never false. */
+        outsideWorkspace?: true;
       }>;
       fileChangesOmitted?: number;
       meta?: Record<string, unknown>;

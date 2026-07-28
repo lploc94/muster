@@ -23,6 +23,8 @@ export interface ToolFileChange {
   newText: string;
   /** Present only when a side was clipped by the engine bound; never `false`. */
   truncated?: boolean;
+  /** Present only when path resolved outside trusted workspace; never `false`. */
+  outsideWorkspace?: true;
 }
 
 export interface ToolItem {

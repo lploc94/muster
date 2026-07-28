@@ -585,6 +585,7 @@ describe('describeDiffFileForScreenReader', () => {
       truncated: false,
       countsPartial: false,
       comparisonUnavailable: false,
+      outsideWorkspace: false,
       bodyId: 'tool-diff-body-x-0',
       toggleId: 'tool-diff-toggle-x-0',
       lines: [],
@@ -612,6 +613,73 @@ describe('describeDiffFileForScreenReader', () => {
       ),
     ).toBe(
       'src/c.ts: 2 lines added, 0 lines removed, counts are partial because this diff was truncated',
+    );
+  });
+
+  it('appends outside workspace for marked files only', () => {
+    expect(
+      describeDiffFileForScreenReader(
+        file({ path: 'outside.ts', added: 1, removed: 0, outsideWorkspace: true }),
+      ),
+    ).toBe('outside.ts: 1 line added, 0 lines removed, outside workspace');
+    expect(
+      describeDiffFileForScreenReader(file({ path: 'src/a.ts', added: 1, removed: 0 })),
+    ).not.toContain('outside workspace');
+  });
+});
+
+describe('M021 S04 outsideWorkspace marker', () => {
+  it('normalizes present-only outsideWorkspace onto the file view', () => {
+    const marked = buildToolDiffView({
+      toolCallId: 'tc-out',
+      fileChanges: [{ path: 'outside.ts', oldText: 'a', newText: 'b', outsideWorkspace: true }],
+    });
+    const plain = buildToolDiffView({
+      toolCallId: 'tc-in',
+      fileChanges: [change('src/a.ts', 'a', 'b')],
+    });
+    expect(marked.files[0].outsideWorkspace).toBe(true);
+    expect(plain.files[0].outsideWorkspace).toBe(false);
+  });
+
+  it('includes outside workspace in the accessible summary without host layout', () => {
+    const marked = buildToolDiffView({
+      toolCallId: 'tc-out',
+      fileChanges: [
+        { path: 'outside.ts', oldText: 'old\n', newText: 'new\n', outsideWorkspace: true },
+      ],
+    });
+    expect(describeDiffFileForScreenReader(marked.files[0])).toContain('outside workspace');
+    expect(describeDiffFileForScreenReader(marked.files[0])).not.toMatch(/\/tmp\/|C:\\|Users\//);
+    expect(marked.files[0].path).toBe('outside.ts');
+  });
+
+  it('keeps the marker when truncated and when comparison is unavailable', () => {
+    const truncated = buildToolDiffView({
+      toolCallId: 'tc-trunc',
+      fileChanges: [
+        { path: 'out.ts', oldText: 'a\n', newText: 'b\n', truncated: true, outsideWorkspace: true },
+      ],
+    });
+    expect(truncated.files[0].outsideWorkspace).toBe(true);
+    expect(describeDiffFileForScreenReader(truncated.files[0])).toContain('outside workspace');
+    expect(describeDiffFileForScreenReader(truncated.files[0])).toContain('counts are partial');
+
+    const complex = buildToolDiffView({
+      toolCallId: 'tc-complex',
+      fileChanges: [
+        {
+          path: 'out.ts',
+          oldText: nLines(1100, 'old'),
+          newText: nLines(1100, 'new'),
+          outsideWorkspace: true,
+        },
+      ],
+    });
+    expect(complex.files[0].comparisonUnavailable).toBe(true);
+    expect(complex.files[0].outsideWorkspace).toBe(true);
+    expect(describeDiffFileForScreenReader(complex.files[0])).toMatch(
+      /comparison unavailable.*outside workspace/,
     );
   });
 });

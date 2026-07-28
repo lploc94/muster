@@ -26,7 +26,7 @@ import {
   isBoundedToolFileChanges,
 } from '../../../src/shared/tool-file-change-contract';
 
-export const PROTOCOL_VERSION = 11;
+export const PROTOCOL_VERSION = 12;
 
 export type { BackendReadinessSnapshot, BackendProbeProgress, BackendProbeRequest };
 

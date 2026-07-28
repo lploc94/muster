@@ -36,6 +36,8 @@ export interface ToolDiffFileChangeInput {
   newText: string;
   /** Present only when a side was clipped; never emitted as `false`. */
   truncated?: boolean;
+  /** Present only when path resolved outside trusted workspace; never `false`. */
+  outsideWorkspace?: true;
 }
 
 export interface BuildToolDiffViewInput {
@@ -68,6 +70,11 @@ export interface ToolDiffFileView {
   countsPartial: boolean;
   /** Comparison exceeded the shared ToolCard work budget; no counts/lines are claimed. */
   comparisonUnavailable: boolean;
+  /**
+   * Outside-workspace origin marker (M021 S04).
+   * `true` when the agent path resolved outside trusted cwd; otherwise false.
+   */
+  outsideWorkspace: boolean;
   bodyId: string;
   toggleId: string;
   /** Visual short form, e.g. `+2 −1` or `+2 −1 (partial)`. */
@@ -221,7 +228,13 @@ function evidenceFingerprint(entry: ToolDiffFileChangeInput): string {
   // Deterministic FNV-1a over retained evidence. The hash is an identity hint,
   // not a security primitive; it keeps DOM ids stable without exposing content.
   let hash = 0x811c9dc5;
-  for (const value of [entry.path, entry.oldText ?? '', entry.newText, entry.truncated ? '1' : '0']) {
+  for (const value of [
+    entry.path,
+    entry.oldText ?? '',
+    entry.newText,
+    entry.truncated ? '1' : '0',
+    entry.outsideWorkspace === true ? '1' : '0',
+  ]) {
     for (let index = 0; index < value.length; index += 1) {
       hash ^= value.charCodeAt(index);
       hash = Math.imul(hash, 0x01000193);
@@ -257,6 +270,7 @@ export function buildToolDiffView(input: BuildToolDiffViewInput): ToolDiffView {
     );
     const truncated = entry.truncated === true;
     const countsPartial = truncated;
+    const outsideWorkspace = entry.outsideWorkspace === true;
     totalAdded += added;
     totalRemoved += removed;
     files.push({
@@ -269,6 +283,7 @@ export function buildToolDiffView(input: BuildToolDiffViewInput): ToolDiffView {
       truncated,
       countsPartial,
       comparisonUnavailable,
+      outsideWorkspace,
       bodyId: `tool-diff-body-${fileIdSeed}`,
       toggleId: `tool-diff-toggle-${fileIdSeed}`,
       countsLabel: formatCountsLabel(added, removed, countsPartial, comparisonUnavailable),
@@ -307,10 +322,15 @@ export function describeDiffFileForScreenReader(file: ToolDiffFileView): string 
   const removedWord = file.removed === 1 ? 'line' : 'lines';
   let prose = `${file.path}: ${file.added} ${addedWord} added, ${file.removed} ${removedWord} removed`;
   if (file.comparisonUnavailable) {
-    return `${file.path}: comparison unavailable because this diff is too complex`;
+    prose = `${file.path}: comparison unavailable because this diff is too complex`;
+    if (file.outsideWorkspace) prose += ', outside workspace';
+    return prose;
   }
   if (file.countsPartial) {
     prose += ', counts are partial because this diff was truncated';
+  }
+  if (file.outsideWorkspace) {
+    prose += ', outside workspace';
   }
   return prose;
 }

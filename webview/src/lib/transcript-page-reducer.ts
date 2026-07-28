@@ -58,6 +58,7 @@ function transcriptToThreadItem(item: TranscriptItem): ThreadItem | null {
           oldText: string | null;
           newText: string;
           truncated?: boolean;
+          outsideWorkspace?: true;
         }>;
         fileChangesOmitted?: number;
       };

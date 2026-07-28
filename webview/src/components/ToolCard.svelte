@@ -141,11 +141,17 @@
                   aria-hidden="true"
                 ></span>
                 <span class="tool-card__diff-path font-mono break-all">{file.path}</span>
+                {#if file.outsideWorkspace}
+                  <span class="tool-card__diff-outside" aria-hidden="true">Outside workspace</span>
+                {/if}
                 <span class="tool-card__diff-counts" aria-hidden="true">{file.countsLabel}</span>
               </button>
             {:else}
               <div class="tool-card__diff-summary-static" aria-label={srSummary}>
                 <span class="tool-card__diff-path font-mono break-all">{file.path}</span>
+                {#if file.outsideWorkspace}
+                  <span class="tool-card__diff-outside" aria-hidden="true">Outside workspace</span>
+                {/if}
                 <span class="tool-card__diff-counts" aria-hidden="true">{file.countsLabel}</span>
               </div>
             {/if}
@@ -304,6 +310,14 @@
     font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
     font-size: 10px;
     color: var(--vscode-descriptionForeground);
+    white-space: nowrap;
+  }
+
+  /* Outside-workspace origin warning (M021 S04) — visible badge; aria via summary label. */
+  .tool-card__diff-outside {
+    flex: 0 0 auto;
+    font-size: 10px;
+    color: var(--vscode-editorWarning-foreground, var(--vscode-descriptionForeground));
     white-space: nowrap;
   }
 

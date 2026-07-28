@@ -172,7 +172,7 @@ describe('protocol v7 focused transcriptPage contract', () => {
   };
 
   it('uses the current protocol version', () => {
-    expect(PROTOCOL_VERSION).toBe(11);
+    expect(PROTOCOL_VERSION).toBe(12);
   });
 
   it('accepts focused snapshot with transcript + transcriptPage', () => {
@@ -1964,7 +1964,7 @@ describe('protocol v9 workspacePatchBatch', () => {
   };
 
   it('uses the current protocol version', () => {
-    expect(PROTOCOL_VERSION).toBe(11);
+    expect(PROTOCOL_VERSION).toBe(12);
   });
 
   it('accepts a multi-kind batch and empty patches', () => {
@@ -2307,3 +2307,65 @@ describe('isExtMessage revealBackendDiagnostics (M019/S03)', () => {
   });
 });
 
+
+
+describe('M021 S04 protocol outsideWorkspace marker', () => {
+  it('accepts present-only outsideWorkspace: true on tool fileChanges', () => {
+    expect(
+      isExtMessage({
+        type: 'event',
+        taskId: 'task-1',
+        turnId: 'turn-1',
+        event: {
+          type: 'toolCompleted',
+          toolCallId: 'c1',
+          outcome: 'success',
+          fileChanges: [
+            { path: 'outside.ts', oldText: 'a', newText: 'b', outsideWorkspace: true },
+          ],
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it('rejects outsideWorkspace false/string/number and unknown nested keys', () => {
+    for (const bad of [false, 'true', 1]) {
+      expect(
+        isExtMessage({
+          type: 'event',
+          taskId: 'task-1',
+          turnId: 'turn-1',
+          event: {
+            type: 'toolCompleted',
+            toolCallId: 'c1',
+            outcome: 'success',
+            fileChanges: [
+              { path: 'outside.ts', oldText: 'a', newText: 'b', outsideWorkspace: bad as never },
+            ],
+          },
+        }),
+      ).toBe(false);
+    }
+    expect(
+      isExtMessage({
+        type: 'event',
+        taskId: 'task-1',
+        turnId: 'turn-1',
+        event: {
+          type: 'toolCompleted',
+          toolCallId: 'c1',
+          outcome: 'success',
+          fileChanges: [
+            {
+              path: 'outside.ts',
+              oldText: 'a',
+              newText: 'b',
+              outsideWorkspace: true,
+              hostPath: '/tmp/outside.ts',
+            },
+          ],
+        },
+      }),
+    ).toBe(false);
+  });
+});
