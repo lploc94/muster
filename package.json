@@ -369,6 +369,8 @@
     "test:m022-s02": "node --test scripts/packaging-dependency-shape.test.mjs scripts/packaging-allowlist-closure.test.mjs scripts/run-packaging-gate.test.mjs",
     "test:m022-s02-archive": "node --test scripts/verify-m022-s02-prune-evidence.test.mjs",
     "test:m022-s03": "node --test scripts/packaging-marketplace-metadata.test.mjs",
+    "test:m022-s03-regression": "node scripts/run-m022-s03-injected-regression.mjs",
+    "test:m022-s03-regression-evidence": "node --test scripts/verify-m022-s03-injected-regression-evidence.test.mjs",
     "test:packaging": "node scripts/run-packaging-gate.mjs",
     "test:sqlite-extension-host": "node scripts/run-sqlite-extension-host-smoke.mjs",
     "test:sqlite-two-window-live-uat": "node scripts/run-sqlite-two-window-live-uat.mjs",
