@@ -218,6 +218,24 @@ test('runner clones cleanly, runs npm ci + npm run package, and never uses creat
   );
 });
 
+test('runner enables shell for Windows npm spawn (npm.cmd requires shell)', async () => {
+  const source = await readTracked(RUNNER_REL);
+  // Regression: rewriting npm → npm.cmd then setting shell only when
+  // resolved === command leaves npm.cmd with shell:false. Node then returns
+  // spawn EINVAL and the drill records npmCiExitCode=1 with no npm output.
+  assert.doesNotMatch(
+    source,
+    /shell:\s*process\.platform\s*===\s*['"]win32['"]\s*&&\s*resolved\s*===\s*command/,
+    'must not disable shell for resolved npm.cmd (Node EINVAL on .cmd without shell)',
+  );
+  // Positive contract: win32 spawn path enables shell so npm/.cmd resolves.
+  assert.match(
+    source,
+    /shell:\s*(?:true|process\.platform\s*===\s*['"]win32['"])\s*,/,
+    'Windows spawn path must enable shell so npm.cmd executes',
+  );
+});
+
 test('accepts a complete clean-clone fixture', () => {
   assert.equal(validateCleanCloneEvidence(fixtureEvidence()), true);
 });

@@ -62,25 +62,23 @@ function log(label, value) {
 }
 
 /**
- * Spawn a command in cwd. On Windows, resolve npm → npm.cmd so we can keep
- * argv form without shell:true (avoids DEP0190 and injection footguns).
+ * Spawn a command in cwd.
+ * On Windows, shell:true is required so npm resolves to npm.cmd. Spawning
+ * npm.cmd with shell:false fails with EINVAL on current Node (no .cmd exec
+ * without a shell). Matches the S03 drill pattern (shell:true for npm).
  * @param {string} command
  * @param {string[]} args
  * @param {string} cwd
  * @returns {{ exitCode: number, combined: string }}
  */
 function run(command, args, cwd) {
-  let resolved = command;
-  if (process.platform === 'win32' && command === 'npm') {
-    resolved = 'npm.cmd';
-  }
-  const result = spawnSync(resolved, args, {
+  const result = spawnSync(command, args, {
     cwd,
     encoding: 'utf8',
     env: process.env,
-    // Windows needs shell for .cmd resolution when PATH lookup alone fails;
-    // keep shell off when we already resolved npm.cmd to avoid DEP0190.
-    shell: process.platform === 'win32' && resolved === command,
+    // Windows: npm is a .cmd shim. Node cannot spawn .cmd with shell:false
+    // (EINVAL). shell:true lets cmd.exe resolve npm → npm.cmd and run git.
+    shell: process.platform === 'win32',
     maxBuffer: 32 * 1024 * 1024,
   });
   const exitCode =
