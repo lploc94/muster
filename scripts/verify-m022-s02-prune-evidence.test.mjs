@@ -510,11 +510,10 @@ test('rejects incomplete PACKAGING.md and census-only-as-host overclaim', () => 
 });
 
 test('rejects evidence missing bridgeClosure (pid-exit inference is not enough)', () => {
-  const evidence = JSON.parse(
-    fs.readFileSync(path.join(REPO_ROOT, 'docs/plans/m022-s01-packaging-gate-evidence.json'), 'utf8'),
-  );
-  // If the tracked file already has bridgeClosure, strip it for the negative.
-  const { bridgeClosure, ...rest } = evidence;
+  // Use the in-memory fixture so this negative does not depend on live file I/O
+  // or undeclared fs/path/REPO_ROOT symbols (same surface as other contract negatives).
+  const evidence = fixtureEvidence();
+  const { bridgeClosure: _stripped, ...rest } = evidence;
   assert.throws(
     () => validatePrunedPackagingEvidence(rest),
     /bridgeClosure required/,
