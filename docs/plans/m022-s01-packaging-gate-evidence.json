@@ -2,14 +2,16 @@
   "kind": "m022-s01-packaging-gate",
   "ok": true,
   "mode": "full",
-  "totalEntries": 3355,
+  "totalEntries": 3357,
   "nodeModulesEntryCount": 3104,
-  "nonNodeModulesEntries": 251,
+  "nonNodeModulesEntries": 253,
   "topLevelCounts": {
     "readme.md": 1,
     "package.json": 1,
     "LICENSE.txt": 1,
+    "d1.txt": 1,
     "changelog.md": 1,
+    "c1.txt": 1,
     "resources": 6,
     "dist": 239,
     "node_modules": 3104
@@ -234,15 +236,15 @@
   ],
   "activation": "ok",
   "bridge": {
-    "port": 55182,
+    "port": 57503,
     "status": "ok",
     "generation": 1
   },
   "bridgePhase": "ok",
-  "generatedAt": "2026-07-29T02:33:31.241Z",
-  "durationMs": 29179,
+  "generatedAt": "2026-07-29T03:13:24.267Z",
+  "durationMs": 30919,
   "bridgeClosure": {
-    "port": 55182,
+    "port": 57503,
     "trace": "present",
     "bridgeClosed": true,
     "postExitProbe": "refused",

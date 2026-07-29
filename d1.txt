@@ -1,0 +1,15 @@
+== QUEUE.md ==
+# Queue
+
+- 🔄 **M022: Release Packaging and Marketplace Metadata**
+
+== unique_milestone_ids pref ==
+  not set
+
+== lock still held? ==
+{
+  "pid": 2672,
+  "startedAt": "2026-07-29T03:02:45.201Z",
+  "unitType": "complete-slice",
+  "unitId": "M022/S04",
+  "unitStartedAt": "2026-07-29T03:02:45.201Z"
