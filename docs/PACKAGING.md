@@ -48,6 +48,8 @@ Drift between the literal allowlist and the real lockfile production walk is rej
 | `npm run test:packaging` | Full packaging gate: createVSIX → extract → census → Extension Host activation + MCP bridge listen | multi-minute |
 | `npm run test:m022-s02-archive` | Tracked post-prune evidence contract + `docs/PACKAGING.md` markers | seconds |
 | `npm run test:m022-s03-regression` | Injected mermaid dependency drill proving the CI-wired fast tier blocks | ~1 min |
+| `npm run test:m022-s04-entrypoint-regression` | Injected `.vscodeignore` exclusion drill proving the census gate blocks a missing archive entrypoint with a typed phase | ~2–4 min |
+| `npm run test:m022-s04-entrypoint-regression-evidence` | Bounds the tracked entrypoint-regression evidence artifact | seconds |
 
 `--census-only` separates a staging regression from a host regression. It does **not** prove activation, bridge listen, or Extension Host behavior — use `npm run test:packaging` for that.
 
@@ -68,6 +70,10 @@ CI wiring is guarded by `scripts/source-boundary-smoke.mjs` (plus fixture negati
 ### Injected-regression drill
 
 `npm run test:m022-s03-regression` injects `mermaid` into `dependencies`, runs the same CI-wired command `npm run test:m022-s02`, requires a non-zero exit that names `mermaid`, restores `package.json` byte-for-byte, and re-passes the command. Evidence lands in `docs/plans/m022-s03-injected-regression-evidence.json`. The drill never overwrites the packaging-gate evidence path.
+
+### Entrypoint-resolution regression drill
+
+`npm run test:m022-s04-entrypoint-regression` injects a temporary `.vscodeignore` exclusion for a required archive entrypoint (default `dist/src/task/sqlite/worker.js`), runs `node scripts/run-packaging-gate.mjs --census-only --evidence <temp-evidence>`, requires a non-zero exit that names the broken entry path (`extension/dist/src/task/sqlite/worker.js`) with typed phase `missing-archive-entry`, restores `.vscodeignore` byte-for-byte with matching sha256 before and after, and re-passes the same gate command. Evidence lands in `docs/plans/m022-s04-entrypoint-regression-evidence.json`. The drill always routes gate evidence through a temp `--evidence` path so the tracked packaging-gate artifact is never clobbered. This is a recorded local drill (D069); CI validates the evidence artifact via `npm run test:m022-s04-entrypoint-regression-evidence` rather than re-running vsce package on every push.
 
 ## Evidence snapshot
 
