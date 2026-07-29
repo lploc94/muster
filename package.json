@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "publisher": "tlelabs",
   "license": "MIT",
-  "description": "Muster \u2014 an open-source coordinator for multiple AI CLIs (Claude, Grok, Codex, Antigravity) with streaming and session resume",
+  "description": "Muster — an open-source coordinator for multiple AI CLIs (Claude, Grok, Codex, Antigravity) with streaming and session resume",
   "repository": {
     "type": "git",
     "url": "https://github.com/lploc94/muster.git"
@@ -24,7 +24,8 @@
     "coordinator"
   ],
   "categories": [
-    "Other"
+    "AI",
+    "Chat"
   ],
   "engines": {
     "vscode": "^1.101.0"
@@ -224,7 +225,7 @@
             }
           },
           "scope": "resource",
-          "description": "Named task type presets (id \u2192 { backend, model?, role?, briefKind?, description? }). Muster ships defaults (no model pins); edit in Settings or VS Code settings.json. Explicit empty map fails closed for create/delegate.",
+          "description": "Named task type presets (id → { backend, model?, role?, briefKind?, description? }). Muster ships defaults (no model pins); edit in Settings or VS Code settings.json. Explicit empty map fails closed for create/delegate.",
           "additionalProperties": {
             "type": "object",
             "required": [
@@ -367,6 +368,7 @@
     "package": "vsce package",
     "test:m022-s02": "node --test scripts/packaging-dependency-shape.test.mjs scripts/packaging-allowlist-closure.test.mjs scripts/run-packaging-gate.test.mjs",
     "test:m022-s02-archive": "node --test scripts/verify-m022-s02-prune-evidence.test.mjs",
+    "test:m022-s03": "node --test scripts/packaging-marketplace-metadata.test.mjs",
     "test:packaging": "node scripts/run-packaging-gate.mjs",
     "test:sqlite-extension-host": "node scripts/run-sqlite-extension-host-smoke.mjs",
     "test:sqlite-two-window-live-uat": "node scripts/run-sqlite-two-window-live-uat.mjs",
@@ -421,5 +423,6 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0"
-  }
+  },
+  "icon": "resources/icon.png"
 }
