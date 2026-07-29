@@ -366,7 +366,7 @@
     "test:task-export-live-evidence": "node --test scripts/verify-task-export-live-host-evidence.test.mjs",
     "test:live-inject-smoke": "node --test scripts/verify-live-inject-smoke.test.mjs",
     "package": "vsce package",
-    "test:m022-s02": "node --test scripts/packaging-dependency-shape.test.mjs scripts/packaging-allowlist-closure.test.mjs scripts/run-packaging-gate.test.mjs",
+    "test:m022-s02": "node --test scripts/packaging-dependency-shape.test.mjs scripts/packaging-allowlist-closure.test.mjs scripts/run-packaging-gate.test.mjs scripts/packaging-webview-bundle.test.mjs",
     "test:m022-s02-archive": "node --test scripts/verify-m022-s02-prune-evidence.test.mjs",
     "test:m022-s03": "node --test scripts/packaging-marketplace-metadata.test.mjs",
     "test:m022-s03-regression": "node scripts/run-m022-s03-injected-regression.mjs",

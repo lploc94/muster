@@ -2,9 +2,10 @@
 # and can also be triggered manually from GitHub Actions → CI → Run workflow.
 #
 # Behavioral job (`compile`): shared local verifier (`npm test`), M002 quality-gate
-# checks, Svelte check, Settings docs + live-evidence ledger verifiers, packaging
-# fast-tier contracts (`test:m022-s02`, `test:m022-s03`), and the full Playwright
-# webview suite on Node 24 LTS.
+# checks, Settings docs + live-evidence ledger verifiers, then `npm run compile`
+# before packaging fast-tier contracts (`test:m022-s02`, `test:m022-s03`) so the
+# webview bundle assertion sees a real `dist/webview`. Svelte check and the full
+# Playwright webview suite follow on Node 24 LTS.
 #
 # SQLite job (`sqlite-extension-host`): packaged Extension Host matrix across
 # minimum/incompatible/stable VS Code versions.
@@ -45,9 +46,9 @@ jobs:
       - run: npm run test:source-boundary:fixtures
       - run: npm run test:settings-docs
       - run: npm run test:settings-live-evidence
+      - run: npm run compile
       - run: npm run test:m022-s02
       - run: npm run test:m022-s03
-      - run: npm run compile
       - run: npm run check:svelte
       - run: npx playwright install --with-deps chromium
       - run: npm run test:webview

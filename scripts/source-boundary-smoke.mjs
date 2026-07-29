@@ -82,6 +82,22 @@ function hasYamlLine(text, pattern) {
   return normalizeLines(text).some((line) => !/^\s*#/.test(line) && pattern.test(line));
 }
 
+/**
+ * Index of the first non-comment YAML step line whose `run:` value matches pattern.
+ * Returns -1 when absent. Used to assert step ordering (e.g. compile before fast tier).
+ */
+function findYamlRunStepIndex(text, runPattern) {
+  const lines = normalizeLines(text);
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (/^\s*#/.test(line)) continue;
+    if (!/^\s*-?\s*run:\s*/.test(line)) continue;
+    const runValue = line.replace(/^\s*-?\s*run:\s*/, '').replace(/\s*(?:#.*)?$/, '');
+    if (runPattern.test(runValue)) return i;
+  }
+  return -1;
+}
+
 function getTopLevelYamlBlock(text, key) {
   const lines = normalizeLines(text);
   const startIndex = lines.findIndex((line) => new RegExp(`^${key}:\\s*(?:#.*)?$`).test(line));
@@ -201,6 +217,17 @@ function expectCiWorkflowContract(workflowText, failures) {
     hasYamlLine(workflowText, /^\s*-?\s*run:\s*npm run test:m022-s03\s*(?:#.*)?$/),
     failures,
     `Expected ${workflowPath} to run \`npm run test:m022-s03\` as the packaging marketplace-metadata contract.`,
+  );
+
+  // M022/S04: fast tier includes a fail-closed webview bundle check that needs
+  // dist/webview from `npm run compile`. Running test:m022-s02 before compile
+  // would always see a missing bundle in a clean CI checkout.
+  const compileStepIndex = findYamlRunStepIndex(workflowText, /npm run compile/);
+  const m022S02StepIndex = findYamlRunStepIndex(workflowText, /npm run test:m022-s02/);
+  expectCondition(
+    compileStepIndex !== -1 && m022S02StepIndex !== -1 && compileStepIndex < m022S02StepIndex,
+    failures,
+    `Expected ${workflowPath} to run \`npm run compile\` before \`npm run test:m022-s02\` so the packaging fast tier sees a built dist/webview (fail-closed webview bundle check).`,
   );
 
   const packagingGateBlock = getIndentedYamlBlock(workflowText, 'packaging-gate', 2);

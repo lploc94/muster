@@ -74,6 +74,7 @@ const validVisualCiWorkflow = [
   '          cache: npm',
   '      - run: npm ci',
   '      - run: npm test',
+  '      - run: npm run compile',
   '      - run: npm run test:m022-s02',
   '      - run: npm run test:m022-s03',
   '      - run: npm run test:webview',
@@ -164,6 +165,10 @@ test('repository GitHub Actions workflow runs npm test automatically on main pus
   // M022/S03 packaging gate: fast compile-job tier + dedicated host job.
   assert.match(workflow, /run: npm run test:m022-s02/);
   assert.match(workflow, /run: npm run test:m022-s03/);
+  // M022/S04: compile must precede fast tier so webview bundle check sees dist/webview.
+  const compileIdx = workflow.search(/^\s*-\s*run:\s*npm run compile\s*$/m);
+  const s02Idx = workflow.search(/^\s*-\s*run:\s*npm run test:m022-s02\s*$/m);
+  assert.ok(compileIdx !== -1 && s02Idx !== -1 && compileIdx < s02Idx);
   assert.match(workflow, /^ {2}packaging-gate:\s*$/m);
   assert.match(workflow, /xvfb-run -a npm run test:packaging/);
   assert.match(workflow, /uses: actions\/upload-artifact@v4/);
@@ -253,6 +258,28 @@ test('rejects CI workflow missing packaging fast-tier test:m022-s02', async () =
 
     assert.equal(result.ok, false);
     assert.match(result.failures.join('\n'), /test:m022-s02/);
+  });
+});
+
+test('rejects CI workflow that runs packaging fast tier before npm run compile', async () => {
+  const fixture = {
+    ...validFixture,
+    '.github/workflows/ci.yml': validVisualCiWorkflow.replace(
+      /^\s*- run: npm run compile\s*(?:#.*)?\n/m,
+      '',
+    ).replace(
+      /^(\s*- run: npm run test:m022-s03\s*(?:#.*)?)$/m,
+      '$1\n      - run: npm run compile',
+    ),
+  };
+
+  await withFixture(fixture, async (rootDir) => {
+    const result = await runSourceBoundarySmoke({ rootDir });
+
+    assert.equal(result.ok, false);
+    assert.match(result.failures.join('\n'), /npm run compile/);
+    assert.match(result.failures.join('\n'), /test:m022-s02/);
+    assert.match(result.failures.join('\n'), /before/);
   });
 });
 
