@@ -1,12 +1,13 @@
 /**
- * Fail-closed contract for the M022/S02 pruned packaging-gate evidence snapshot.
+ * Fail-closed contract for the M022/S02+S03 packaging-gate evidence snapshot.
  *
  * Asserts the tracked post-prune VSIX evidence:
  * - allowlist.mode is enforcing sdk-closure-only with empty violations
  * - node_modules entry count is far below the S01 15801 baseline (< 5000)
  * - activation=ok, bridgePhase=ok, bridge.port > 0 with redacted keys only
  * - all three required archive entrypoints present/resolved/phase ok
- * - docs/PACKAGING.md documents the release package path and gates
+ * - marketplace metadata ships: resources/icon.png + CHANGELOG.md present in archive
+ * - docs/PACKAGING.md documents the release path, gates, CI surface, and injected regression
  *
  * Fixture-backed node:test — never inspects live hosts, secrets, or gitignored paths.
  */
@@ -40,12 +41,22 @@ const REQUIRED_ENTRYPOINTS = [
   'extension/dist/src/bridge/mcp-stdio-proxy.js',
 ];
 
+/** Marketplace metadata paths that must appear in the packaged archive (M022/S03). */
+const REQUIRED_MARKETPLACE_ARCHIVE_ENTRIES = [
+  'extension/resources/icon.png',
+  'extension/changelog.md',
+];
+
+/** Pre-icon resources count from S02 evidence (claude-acp 3 + codex-acp 2). */
+const PRE_ICON_RESOURCES_COUNT = 5;
+
 const PACKAGING_DOC_MARKERS = [
   'npm run package',
   'vsce package',
   'npm run test:packaging',
   'npm run test:m022-s02',
   'npm run test:m022-s02-archive',
+  'npm run test:m022-s03',
   'sdk-closure-only',
   '@modelcontextprotocol/sdk',
   'docs/plans/m022-s01-packaging-gate-evidence.json',
@@ -53,6 +64,11 @@ const PACKAGING_DOC_MARKERS = [
   'activation',
   'bridgePhase',
   '--census-only',
+  'packaging-gate',
+  'xvfb-run',
+  'test:m022-s03-regression',
+  'resources/icon.png',
+  'CHANGELOG.md',
 ];
 
 async function readTracked(rel) {
@@ -152,6 +168,43 @@ export function validatePrunedPackagingEvidence(evidence) {
     );
   }
 
+  // M022/S03: marketplace metadata must ship in the archive and be recorded.
+  assert.ok(
+    Array.isArray(e.marketplaceEntries),
+    'marketplaceEntries must be an array (icon + CHANGELOG archive presence)',
+  );
+  const marketplaceEntries = /** @type {Array<Record<string, unknown>>} */ (
+    e.marketplaceEntries
+  );
+  assert.equal(
+    marketplaceEntries.length,
+    REQUIRED_MARKETPLACE_ARCHIVE_ENTRIES.length,
+    `expected ${REQUIRED_MARKETPLACE_ARCHIVE_ENTRIES.length} marketplaceEntries`,
+  );
+  for (const required of REQUIRED_MARKETPLACE_ARCHIVE_ENTRIES) {
+    const match = marketplaceEntries.find(
+      (r) =>
+        typeof r.path === 'string' &&
+        String(r.path).replaceAll('\\', '/').toLowerCase() === required.toLowerCase(),
+    );
+    assert.ok(match, `missing marketplaceEntries record for ${required}`);
+    assert.equal(match.present, true, `${required}: present must be true`);
+  }
+
+  const top = /** @type {Record<string, number>} */ (e.topLevelCounts ?? {});
+  const changelogCount =
+    (typeof top['changelog.md'] === 'number' ? top['changelog.md'] : 0) +
+    (typeof top['CHANGELOG.md'] === 'number' ? top['CHANGELOG.md'] : 0);
+  assert.ok(
+    changelogCount >= 1,
+    'topLevelCounts must include changelog.md after marketplace metadata ships',
+  );
+  const resourcesCount = typeof top.resources === 'number' ? top.resources : 0;
+  assert.ok(
+    resourcesCount > PRE_ICON_RESOURCES_COUNT,
+    `topLevelCounts.resources must exceed pre-icon baseline ${PRE_ICON_RESOURCES_COUNT} (got ${resourcesCount})`,
+  );
+
   return true;
 }
 
@@ -182,10 +235,16 @@ function fixtureEvidence(overrides = {}) {
     kind: 'm022-s01-packaging-gate',
     ok: true,
     mode: 'full',
-    totalEntries: 3400,
+    totalEntries: 3402,
     nodeModulesEntryCount: 3137,
-    nonNodeModulesEntries: 263,
-    topLevelCounts: { dist: 239, node_modules: 3137, resources: 5 },
+    nonNodeModulesEntries: 265,
+    topLevelCounts: {
+      dist: 239,
+      node_modules: 3137,
+      resources: 6,
+      'changelog.md': 1,
+      'package.json': 1,
+    },
     nodeModulesPackages: [
       '@modelcontextprotocol/sdk',
       'express',
@@ -207,6 +266,10 @@ function fixtureEvidence(overrides = {}) {
       present: true,
       resolved: true,
       phase: 'ok',
+    })),
+    marketplaceEntries: REQUIRED_MARKETPLACE_ARCHIVE_ENTRIES.map((path) => ({
+      path,
+      present: true,
     })),
     activation: 'ok',
     bridge: {
@@ -362,6 +425,43 @@ test('rejects missing entrypoints and staged webview packages', () => {
         }),
       ),
     /webview-only package mermaid/,
+  );
+});
+
+test('rejects missing marketplace archive entries and pre-icon resources count', () => {
+  assert.throws(
+    () =>
+      validatePrunedPackagingEvidence(
+        fixtureEvidence({
+          marketplaceEntries: undefined,
+        }),
+      ),
+    /marketplaceEntries/,
+  );
+  assert.throws(
+    () =>
+      validatePrunedPackagingEvidence(
+        fixtureEvidence({
+          marketplaceEntries: [
+            { path: 'extension/resources/icon.png', present: false },
+            { path: 'extension/changelog.md', present: true },
+          ],
+        }),
+      ),
+    /present must be true|icon\.png/,
+  );
+  assert.throws(
+    () =>
+      validatePrunedPackagingEvidence(
+        fixtureEvidence({
+          topLevelCounts: {
+            dist: 239,
+            node_modules: 3137,
+            resources: PRE_ICON_RESOURCES_COUNT,
+          },
+        }),
+      ),
+    /changelog\.md|resources must exceed pre-icon/,
   );
 });
 

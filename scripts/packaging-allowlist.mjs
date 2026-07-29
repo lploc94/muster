@@ -138,3 +138,13 @@ export const REQUIRED_ARCHIVE_ENTRYPOINTS = [
   'extension/dist/src/task/sqlite/worker.js',
   'extension/dist/src/bridge/mcp-stdio-proxy.js',
 ];
+
+/**
+ * Marketplace metadata that must ship in the VSIX (M022/S03).
+ * Paths are matched case-insensitively against archive entry names so
+ * vsce's changelog casing does not break the gate.
+ */
+export const REQUIRED_MARKETPLACE_ARCHIVE_ENTRIES = [
+  'extension/resources/icon.png',
+  'extension/changelog.md',
+];

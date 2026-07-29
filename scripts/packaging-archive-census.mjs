@@ -154,6 +154,46 @@ export function findMissingEntrypoints(entryNames, requiredEntrypoints) {
 }
 
 /**
+ * @typedef {object} MarketplaceEntryResult
+ * @property {string} path Canonical required path (lower-case changelog form).
+ * @property {boolean} present
+ * @property {string | null} [actualPath] Case-preserving path found in the archive.
+ */
+
+/**
+ * Case-insensitive presence check for marketplace metadata archive entries
+ * (icon + CHANGELOG). vsce may preserve or normalize changelog casing.
+ *
+ * @param {string[]} entryNames
+ * @param {string[]} required
+ * @returns {MarketplaceEntryResult[]}
+ */
+export function buildMarketplaceEntryResults(entryNames, required) {
+  const names = (Array.isArray(entryNames) ? entryNames : []).map((name) =>
+    normalizeEntryName(name),
+  );
+  /** @type {Map<string, string>} */
+  const byLower = new Map();
+  for (const name of names) {
+    const key = name.toLowerCase();
+    if (!byLower.has(key)) {
+      byLower.set(key, name);
+    }
+  }
+
+  const requiredPaths = Array.isArray(required) ? required : [];
+  return requiredPaths.map((raw) => {
+    const path = normalizeEntryName(raw);
+    const actual = byLower.get(path.toLowerCase()) ?? null;
+    return {
+      path,
+      present: actual !== null,
+      actualPath: actual,
+    };
+  });
+}
+
+/**
  * @param {ArchiveCensus} census
  * @param {AllowlistResult} allowlistResult
  * @param {string[]} missingEntrypoints

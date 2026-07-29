@@ -23,9 +23,11 @@ import { createVSIX } from '@vscode/vsce';
 import {
   PACKAGING_ALLOWLIST,
   REQUIRED_ARCHIVE_ENTRYPOINTS,
+  REQUIRED_MARKETPLACE_ARCHIVE_ENTRIES,
 } from './packaging-allowlist.mjs';
 import {
   buildArchiveCensus,
+  buildMarketplaceEntryResults,
   evaluateAllowlist,
   findMissingEntrypoints,
   formatCensusReport,
@@ -105,6 +107,7 @@ export function buildEntrypointResults({ entryNames, requiredEntrypoints, fileEx
  *   allowlistResult: { mode: string, ok: boolean, violations: string[] },
  *   missingEntrypoints: string[],
  *   entrypoints: EntrypointResult[],
+ *   marketplaceEntries?: Array<{ path: string, present: boolean, actualPath?: string | null }>,
  *   mode?: string,
  *   activation?: string,
  *   bridge?: { port: number, status: string, generation?: number } | null,
@@ -118,6 +121,7 @@ export function buildPackagingGateEvidence({
   allowlistResult,
   missingEntrypoints,
   entrypoints,
+  marketplaceEntries,
   mode = 'census-only',
   activation = 'deferred',
   bridge = null,
@@ -127,9 +131,18 @@ export function buildPackagingGateEvidence({
 }) {
   const missing = Array.isArray(missingEntrypoints) ? missingEntrypoints : [];
   const eps = Array.isArray(entrypoints) ? entrypoints : [];
+  const market =
+    Array.isArray(marketplaceEntries) && marketplaceEntries.length > 0
+      ? marketplaceEntries
+      : REQUIRED_MARKETPLACE_ARCHIVE_ENTRIES.map((path) => ({
+          path,
+          present: false,
+          actualPath: null,
+        }));
   const allowOk = allowlistResult?.ok === true;
   const entrypointsOk = eps.every((r) => r.present && r.resolved && r.phase === 'ok');
-  const packagingOk = allowOk && missing.length === 0 && entrypointsOk;
+  const marketplaceOk = market.every((r) => r.present === true);
+  const packagingOk = allowOk && missing.length === 0 && entrypointsOk && marketplaceOk;
   // 'full' requires live host observations; 'census-only' / 'packaging' only gate archive contents.
   const hostRequired = mode === 'full';
   const bridgeOk =
@@ -157,6 +170,7 @@ export function buildPackagingGateEvidence({
     },
     missingEntrypoints: missing,
     entrypoints: eps,
+    marketplaceEntries: market,
     activation,
     bridge,
     bridgePhase,
@@ -274,10 +288,14 @@ export function applyHostStageToEvidence(evidence, hostResult) {
       ? host.entrypoints
       : evidence.entrypoints;
 
+  const marketplaceOk = Array.isArray(evidence.marketplaceEntries)
+    ? evidence.marketplaceEntries.every((r) => r.present === true)
+    : false;
   const packagingOk =
     evidence.allowlist?.ok === true &&
     (evidence.missingEntrypoints?.length ?? 0) === 0 &&
-    entrypoints.every((r) => r.present && r.resolved && r.phase === 'ok');
+    entrypoints.every((r) => r.present && r.resolved && r.phase === 'ok') &&
+    marketplaceOk;
 
   const bridge = host.bridge;
   const bridgeOk =
@@ -377,6 +395,10 @@ async function runPackagingStage({ censusOnly, evidencePath }) {
         }
       },
     });
+    const marketplaceEntries = buildMarketplaceEntryResults(
+      entryNames,
+      REQUIRED_MARKETPLACE_ARCHIVE_ENTRIES,
+    );
 
     const report = formatCensusReport(census, allowlistResult, missingEntrypoints);
     console.log(report);
@@ -386,6 +408,13 @@ async function runPackagingStage({ censusOnly, evidencePath }) {
         `  ${r.path}: present=${r.present} resolved=${r.resolved} phase=${r.phase}`,
       );
     }
+    console.log('[packaging-gate] marketplace archive entries:');
+    for (const r of marketplaceEntries) {
+      console.log(
+        `  ${r.path}: present=${r.present}` +
+          (r.actualPath && r.actualPath !== r.path ? ` actual=${r.actualPath}` : ''),
+      );
+    }
 
     // Intermediate packaging evidence does not require host yet; host stage promotes to 'full'.
     const evidence = buildPackagingGateEvidence({
@@ -393,6 +422,7 @@ async function runPackagingStage({ censusOnly, evidencePath }) {
       allowlistResult,
       missingEntrypoints,
       entrypoints,
+      marketplaceEntries,
       mode: censusOnly ? 'census-only' : 'packaging',
       activation: 'deferred',
       bridge: null,
@@ -420,6 +450,12 @@ async function runPackagingStage({ censusOnly, evidencePath }) {
       if (failedEps.length > 0) {
         reasons.push(
           `entrypoint failures: ${failedEps.map((r) => `${r.path}(${r.phase})`).join(', ')}`,
+        );
+      }
+      const missingMarket = marketplaceEntries.filter((r) => !r.present);
+      if (missingMarket.length > 0) {
+        reasons.push(
+          `missing marketplace entries: ${missingMarket.map((r) => r.path).join(', ')}`,
         );
       }
       throw new Error(`packaging gate failed: ${reasons.join('; ')}`);

@@ -8,9 +8,11 @@ import test from 'node:test';
 import {
   PACKAGING_ALLOWLIST,
   REQUIRED_ARCHIVE_ENTRYPOINTS,
+  REQUIRED_MARKETPLACE_ARCHIVE_ENTRIES,
 } from './packaging-allowlist.mjs';
 import {
   buildArchiveCensus,
+  buildMarketplaceEntryResults,
   evaluateAllowlist,
   findMissingEntrypoints,
 } from './packaging-archive-census.mjs';
@@ -23,6 +25,8 @@ import {
 
 const FIXTURE_ENTRIES = [
   'extension/package.json',
+  'extension/changelog.md',
+  'extension/resources/icon.png',
   'extension/dist/src/extension.js',
   'extension/dist/src/task/sqlite/worker.js',
   'extension/dist/src/bridge/mcp-stdio-proxy.js',
@@ -79,11 +83,16 @@ test('buildPackagingGateEvidence exposes totalEntries, nodeModulesEntryCount, mi
     requiredEntrypoints: REQUIRED_ARCHIVE_ENTRYPOINTS,
     fileExists: () => true,
   });
+  const marketplaceEntries = buildMarketplaceEntryResults(
+    FIXTURE_ENTRIES,
+    REQUIRED_MARKETPLACE_ARCHIVE_ENTRIES,
+  );
   const evidence = buildPackagingGateEvidence({
     census,
     allowlistResult: allowlist,
     missingEntrypoints: missing,
     entrypoints,
+    marketplaceEntries,
     mode: 'census-only',
   });
 
@@ -98,10 +107,40 @@ test('buildPackagingGateEvidence exposes totalEntries, nodeModulesEntryCount, mi
   assert.ok(Array.isArray(evidence.nodeModulesPackages));
   assert.ok(evidence.topLevelCounts.dist > 0);
   assert.equal(evidence.entrypoints.length, 3);
+  assert.equal(evidence.marketplaceEntries.length, 2);
+  assert.ok(evidence.marketplaceEntries.every((r) => r.present === true));
+  assert.equal(evidence.ok, true);
   assert.equal(evidence.mode, 'census-only');
   // Host stage is T04; packaging stage leaves these deferred/null.
   assert.equal(evidence.activation, 'deferred');
   assert.equal(evidence.bridge, null);
+});
+
+test('buildPackagingGateEvidence fails closed when marketplace metadata is missing', () => {
+  const census = buildArchiveCensus(FIXTURE_ENTRIES);
+  const allowlist = evaluateAllowlist(census, PACKAGING_ALLOWLIST);
+  const missing = findMissingEntrypoints(FIXTURE_ENTRIES, REQUIRED_ARCHIVE_ENTRYPOINTS);
+  const entrypoints = buildEntrypointResults({
+    entryNames: FIXTURE_ENTRIES,
+    requiredEntrypoints: REQUIRED_ARCHIVE_ENTRYPOINTS,
+    fileExists: () => true,
+  });
+  const evidence = buildPackagingGateEvidence({
+    census,
+    allowlistResult: allowlist,
+    missingEntrypoints: missing,
+    entrypoints,
+    marketplaceEntries: [
+      { path: 'extension/resources/icon.png', present: false, actualPath: null },
+      { path: 'extension/changelog.md', present: true, actualPath: 'extension/CHANGELOG.md' },
+    ],
+    mode: 'census-only',
+  });
+  assert.equal(evidence.ok, false);
+  assert.equal(
+    evidence.marketplaceEntries.find((r) => r.path.endsWith('icon.png'))?.present,
+    false,
+  );
 });
 
 test('buildPackagingGateEvidence fails closed when entrypoints are missing', () => {
@@ -136,11 +175,16 @@ function packagingBaseEvidence() {
     requiredEntrypoints: REQUIRED_ARCHIVE_ENTRYPOINTS,
     fileExists: () => true,
   });
+  const marketplaceEntries = buildMarketplaceEntryResults(
+    FIXTURE_ENTRIES,
+    REQUIRED_MARKETPLACE_ARCHIVE_ENTRIES,
+  );
   return buildPackagingGateEvidence({
     census,
     allowlistResult: allowlist,
     missingEntrypoints: missing,
     entrypoints,
+    marketplaceEntries,
     mode: 'full',
   });
 }
