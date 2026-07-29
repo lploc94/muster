@@ -36,6 +36,16 @@ export const UAT_COMMANDS = {
    * Returns only `{ port, status, generation }` — never tokens/paths.
    */
   bridgeHealth: 'muster.uat.bridgeHealth',
+  /**
+   * Packaging-gate: run production `deactivate()` and return the redacted
+   * deactivate trace (`{ port, bridgeClosed }` only).
+   */
+  runDeactivate: 'muster.uat.runDeactivate',
+  /**
+   * Packaging-gate observation: last redacted deactivate trace, or null when
+   * deactivate has not run yet. Booleans + port only — never tokens/paths/env.
+   */
+  deactivateTrace: 'muster.uat.deactivateTrace',
   /** M019/S05 native first-run observations (production-path delegates). */
   refreshReadiness: 'muster.uat.refreshReadiness',
   probeBackend: 'muster.uat.probeBackend',
@@ -124,6 +134,99 @@ export function readRedactedBridgeHealth(
   }
 
   return { port, status, generation };
+}
+
+/** Redacted deactivate observation for packaging-gate bridge-closure proof. */
+export type UatDeactivateTrace = {
+  port: number;
+  bridgeClosed: boolean;
+};
+
+/**
+ * Project a deactivate observation to the packaging-gate allowlist of fields.
+ * Strips bearer tokens, credential ids, workspace/db paths, env values, and any extras.
+ * Pure projection — does not start or stop the bridge.
+ */
+export function readRedactedDeactivateTrace(
+  source:
+    | {
+        port?: number | null;
+        bridgeClosed?: boolean | null;
+        [key: string]: unknown;
+      }
+    | null
+    | undefined,
+): UatDeactivateTrace {
+  if (!source) {
+    return { port: 0, bridgeClosed: false };
+  }
+
+  const port =
+    typeof source.port === 'number' && Number.isFinite(source.port) ? source.port : 0;
+  const bridgeClosed = source.bridgeClosed === true;
+
+  return { port, bridgeClosed };
+}
+
+/** Typed packaging-gate observation that deactivate closed the MCP bridge. */
+export type BridgeClosureTracePresence = 'present' | 'missing';
+export type BridgeClosurePostExitProbe = 'refused' | 'still-serving' | 'unknown';
+export type BridgeClosurePhase =
+  | 'ok'
+  | 'deactivate-failed'
+  | 'trace-missing'
+  | 'not-closed'
+  | 'still-serving'
+  | 'probe-unknown';
+
+export type BridgeClosureObservation = {
+  port: number;
+  trace: BridgeClosureTracePresence;
+  bridgeClosed: boolean;
+  postExitProbe: BridgeClosurePostExitProbe;
+  phase: BridgeClosurePhase;
+};
+
+/**
+ * Build the packaging-gate `bridgeClosure` observation from redacted inputs.
+ * Pure — never carries tokens, workspace paths, or env values.
+ */
+export function buildBridgeClosureObservation(input: {
+  port: number;
+  trace: BridgeClosureTracePresence;
+  bridgeClosed: boolean;
+  postExitProbe: BridgeClosurePostExitProbe;
+  deactivateFailed?: boolean;
+}): BridgeClosureObservation {
+  const port =
+    typeof input.port === 'number' && Number.isFinite(input.port) && input.port > 0
+      ? input.port
+      : 0;
+  const bridgeClosed = input.bridgeClosed === true;
+  const trace: BridgeClosureTracePresence = input.trace === 'present' ? 'present' : 'missing';
+  const postExitProbe: BridgeClosurePostExitProbe =
+    input.postExitProbe === 'refused' ||
+    input.postExitProbe === 'still-serving' ||
+    input.postExitProbe === 'unknown'
+      ? input.postExitProbe
+      : 'unknown';
+
+  let phase: BridgeClosurePhase;
+  if (input.deactivateFailed) {
+    phase = 'deactivate-failed';
+  } else if (trace === 'missing') {
+    phase = 'trace-missing';
+  } else if (!bridgeClosed) {
+    phase = 'not-closed';
+  } else if (postExitProbe === 'still-serving') {
+    phase = 'still-serving';
+  } else if (postExitProbe === 'unknown') {
+    phase = 'probe-unknown';
+  } else {
+    phase = 'ok';
+  }
+
+  return { port, trace, bridgeClosed, postExitProbe, phase };
 }
 
 export type UatDurableSurfaces = {

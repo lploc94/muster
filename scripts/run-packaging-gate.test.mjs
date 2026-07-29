@@ -3,6 +3,9 @@
  * Pure helpers only — no createVSIX / zip I/O.
  */
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 
 import {
@@ -33,6 +36,16 @@ const FIXTURE_ENTRIES = [
   'extension/node_modules/@modelcontextprotocol/sdk/package.json',
   'extension/node_modules/express/index.js',
 ];
+
+/** Valid redacted bridgeClosure observation used by ok host fixtures. */
+const OK_BRIDGE_CLOSURE = {
+  port: 64149,
+  trace: 'present',
+  bridgeClosed: true,
+  postExitProbe: 'refused',
+  phase: 'ok',
+};
+
 
 test('buildEntrypointResults marks present+resolved when entry exists and file is on disk', () => {
   const results = buildEntrypointResults({
@@ -196,6 +209,7 @@ test('parseHostSmokeResult accepts a successful host smoke payload', () => {
     activation: 'ok',
     bridge: { port: 41234, status: 'ok', generation: 1 },
     bridgePhase: 'ok',
+    bridgeClosure: OK_BRIDGE_CLOSURE,
     entrypoints: [
       {
         path: 'extension/dist/src/extension.js',
@@ -249,6 +263,7 @@ test('applyHostStageToEvidence promotes activation/bridge and recomputes ok for 
       activation: 'ok',
       bridge: { port: 55555, status: 'ok', generation: 2 },
       bridgePhase: 'ok',
+      bridgeClosure: OK_BRIDGE_CLOSURE,
       entrypoints: base.entrypoints.map((r) => ({ ...r, phase: 'ok', resolved: true, present: true })),
     }),
   );
@@ -299,6 +314,7 @@ test('applyHostStageToEvidence fails closed when stdio proxy require graph fails
       activation: 'ok',
       bridge: { port: 4000, status: 'ok', generation: 1 },
       bridgePhase: 'ok',
+      bridgeClosure: OK_BRIDGE_CLOSURE,
       entrypoints,
     }),
   );
@@ -307,3 +323,104 @@ test('applyHostStageToEvidence fails closed when stdio proxy require graph fails
   assert.equal(proxy.phase, 'require-failed');
   assert.equal(proxy.resolved, false);
 });
+
+
+test('host smoke ok requires bridgeClosure proof (not pid-exit inference)', () => {
+  const entrypoints = [
+    {
+      path: 'extension/dist/src/extension.js',
+      present: true,
+      resolved: true,
+      phase: 'ok',
+    },
+    {
+      path: 'extension/dist/src/task/sqlite/worker.js',
+      present: true,
+      resolved: true,
+      phase: 'ok',
+    },
+    {
+      path: 'extension/dist/src/bridge/mcp-stdio-proxy.js',
+      present: true,
+      resolved: true,
+      phase: 'ok',
+    },
+  ];
+
+  // Listening bridge alone is no longer enough — missing bridgeClosure must fail closed.
+  const withoutClosure = parseHostSmokeResult({
+    kind: 'm022-s01-packaging-host-smoke',
+    ok: true,
+    activation: 'ok',
+    bridge: { port: 64149, status: 'ok', generation: 1 },
+    bridgePhase: 'ok',
+    entrypoints,
+  });
+  assert.equal(withoutClosure.ok, false);
+  assert.equal(withoutClosure.bridgeClosure, null);
+
+  // still-serving postExitProbe must fail (bridge did not actually close).
+  const stillServing = parseHostSmokeResult({
+    kind: 'm022-s01-packaging-host-smoke',
+    ok: true,
+    activation: 'ok',
+    bridge: { port: 64149, status: 'ok', generation: 1 },
+    bridgePhase: 'ok',
+    bridgeClosure: {
+      port: 64149,
+      trace: 'present',
+      bridgeClosed: true,
+      postExitProbe: 'still-serving',
+      phase: 'still-serving',
+    },
+    entrypoints,
+  });
+  assert.equal(stillServing.ok, false);
+  assert.equal(stillServing.bridgeClosure?.phase, 'still-serving');
+
+  // Full redacted bridgeClosure with refused probe passes.
+  const withClosure = parseHostSmokeResult({
+    kind: 'm022-s01-packaging-host-smoke',
+    ok: true,
+    activation: 'ok',
+    bridge: { port: 64149, status: 'ok', generation: 1 },
+    bridgePhase: 'ok',
+    bridgeClosure: OK_BRIDGE_CLOSURE,
+    entrypoints,
+  });
+  assert.equal(withClosure.ok, true);
+  assert.deepEqual(withClosure.bridgeClosure, OK_BRIDGE_CLOSURE);
+
+  const evidence = applyHostStageToEvidence(
+    {
+      kind: 'm022-s01-packaging-gate',
+      mode: 'full',
+      ok: false,
+      allowlist: { mode: 'sdk-closure-only', ok: true, violations: [] },
+      entrypoints: [],
+      activation: 'failed',
+      bridge: null,
+      bridgePhase: 'activation',
+      archiveEntries: [],
+      generatedAt: '2026-07-28T00:00:00.000Z',
+      durationMs: 1,
+    },
+    withClosure,
+  );
+  assert.equal(evidence.ok, true);
+  assert.deepEqual(evidence.bridgeClosure, OK_BRIDGE_CLOSURE);
+
+  // applyHostStage must not accept forged host.ok without bridgeClosure.
+  const forged = applyHostStageToEvidence(evidence, {
+    kind: 'm022-s01-packaging-host-smoke',
+    ok: true,
+    activation: 'ok',
+    bridge: { port: 64149, status: 'ok', generation: 1 },
+    bridgePhase: 'ok',
+    bridgeClosure: null,
+    entrypoints,
+  });
+  assert.equal(forged.ok, false);
+  assert.equal(forged.bridgeClosure, null);
+});
+

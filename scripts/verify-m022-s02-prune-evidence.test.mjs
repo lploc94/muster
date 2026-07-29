@@ -119,6 +119,27 @@ export function validatePrunedPackagingEvidence(evidence) {
     ['generation', 'port', 'status'],
     'bridge payload keys must be exactly generation,port,status',
   );
+
+  // bridgeClosure: deactivate() closed the bridge (not pid-exit inference).
+  assert.ok(e.bridgeClosure && typeof e.bridgeClosure === 'object', 'bridgeClosure required');
+  const closure = /** @type {Record<string, unknown>} */ (e.bridgeClosure);
+  const closureKeys = Object.keys(closure).sort();
+  assert.deepEqual(
+    closureKeys,
+    ['bridgeClosed', 'phase', 'port', 'postExitProbe', 'trace'],
+    'bridgeClosure keys must be exactly bridgeClosed,phase,port,postExitProbe,trace',
+  );
+  assert.equal(typeof closure.port, 'number');
+  assert.ok(/** @type {number} */ (closure.port) > 0, 'bridgeClosure.port must be > 0');
+  assert.equal(closure.trace, 'present', 'bridgeClosure.trace must be present');
+  assert.equal(closure.bridgeClosed, true, 'bridgeClosure.bridgeClosed must be true');
+  assert.equal(closure.postExitProbe, 'refused', 'bridgeClosure.postExitProbe must be refused');
+  assert.equal(closure.phase, 'ok', 'bridgeClosure.phase must be ok');
+  const closureJson = JSON.stringify(closure);
+  assert.ok(
+    !/token|secret|bearer|Users|workspace|MUSTER_/i.test(closureJson),
+    'bridgeClosure must not carry tokens paths or env',
+  );
   const b = /** @type {{ port: unknown, status: unknown, generation: unknown }} */ (bridge);
   assert.equal(typeof b.port, 'number', 'bridge.port must be a number');
   assert.ok(
@@ -278,6 +299,13 @@ function fixtureEvidence(overrides = {}) {
       generation: 1,
     },
     bridgePhase: 'ok',
+    bridgeClosure: {
+      port: 64149,
+      trace: 'present',
+      bridgeClosed: true,
+      postExitProbe: 'refused',
+      phase: 'ok',
+    },
     generatedAt: '2026-07-28T00:00:00.000Z',
     durationMs: 50000,
     ...overrides,
@@ -478,5 +506,17 @@ test('rejects incomplete PACKAGING.md and census-only-as-host overclaim', () => 
         `${complete}\n--census-only proves activation of the host bridge.`,
       ),
     /census-only proves host activation/,
+  );
+});
+
+test('rejects evidence missing bridgeClosure (pid-exit inference is not enough)', () => {
+  const evidence = JSON.parse(
+    fs.readFileSync(path.join(REPO_ROOT, 'docs/plans/m022-s01-packaging-gate-evidence.json'), 'utf8'),
+  );
+  // If the tracked file already has bridgeClosure, strip it for the negative.
+  const { bridgeClosure, ...rest } = evidence;
+  assert.throws(
+    () => validatePrunedPackagingEvidence(rest),
+    /bridgeClosure required/,
   );
 });

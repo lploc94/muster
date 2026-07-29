@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { NATIVE_FIRST_RUN_UAT_COMMANDS } from './m019-s05-native-first-run';
 import {
+  buildBridgeClosureObservation,
   isUatModeEnabled,
   readRedactedBridgeHealth,
+  readRedactedDeactivateTrace,
   UAT_COMMANDS,
 } from './uat-commands';
 
@@ -32,6 +34,14 @@ describe('live UAT exposure gate', () => {
     expect(UAT_COMMANDS.bridgeHealth).toBe('muster.uat.bridgeHealth');
     expect(UAT_COMMANDS.bridgeHealth.startsWith('muster.uat.')).toBe(true);
     // Production host never registers UAT commands even if env is set.
+    expect(isUatModeEnabled(true, { MUSTER_UAT_MODE: '1' })).toBe(false);
+  });
+
+  it('exposes packaging-gate runDeactivate + deactivateTrace under muster.uat.* only when UAT is enabled', () => {
+    expect(UAT_COMMANDS.runDeactivate).toBe('muster.uat.runDeactivate');
+    expect(UAT_COMMANDS.deactivateTrace).toBe('muster.uat.deactivateTrace');
+    expect(UAT_COMMANDS.runDeactivate.startsWith('muster.uat.')).toBe(true);
+    expect(UAT_COMMANDS.deactivateTrace.startsWith('muster.uat.')).toBe(true);
     expect(isUatModeEnabled(true, { MUSTER_UAT_MODE: '1' })).toBe(false);
   });
 });
@@ -93,5 +103,97 @@ describe('readRedactedBridgeHealth', () => {
         status: 'ok',
       }),
     ).toEqual({ port: 0, status: 'unavailable', generation: 0 });
+  });
+});
+
+describe('readRedactedDeactivateTrace', () => {
+  it('returns only port and bridgeClosed and strips tokens/paths/env', () => {
+    const redacted = readRedactedDeactivateTrace({
+      port: 63197,
+      bridgeClosed: true,
+      bearerToken: 'sk-secret-token',
+      workspacePath: 'C:\\Users\\dev\\project',
+      env: { MUSTER_BRIDGE_TOKEN: 'tok' },
+      dbPath: '/tmp/muster.db',
+    });
+
+    expect(redacted).toEqual({ port: 63197, bridgeClosed: true });
+    expect(Object.keys(redacted).sort()).toEqual(['bridgeClosed', 'port']);
+    expect(JSON.stringify(redacted)).not.toMatch(/sk-secret|Users|muster\.db|MUSTER_BRIDGE_TOKEN|tok/i);
+  });
+
+  it('defaults missing source to port 0 and bridgeClosed false', () => {
+    expect(readRedactedDeactivateTrace(null)).toEqual({ port: 0, bridgeClosed: false });
+    expect(readRedactedDeactivateTrace(undefined)).toEqual({ port: 0, bridgeClosed: false });
+  });
+
+  it('coerces non-boolean bridgeClosed and non-finite port', () => {
+    expect(
+      readRedactedDeactivateTrace({
+        port: Number.NaN,
+        bridgeClosed: 'yes' as unknown as boolean,
+      }),
+    ).toEqual({ port: 0, bridgeClosed: false });
+    expect(
+      readRedactedDeactivateTrace({
+        port: 4000,
+        bridgeClosed: false,
+      }),
+    ).toEqual({ port: 4000, bridgeClosed: false });
+  });
+});
+
+describe('buildBridgeClosureObservation', () => {
+  it('reports phase ok only when trace present, bridgeClosed, and postExitProbe refused', () => {
+    expect(
+      buildBridgeClosureObservation({
+        port: 63197,
+        trace: 'present',
+        bridgeClosed: true,
+        postExitProbe: 'refused',
+      }),
+    ).toEqual({
+      port: 63197,
+      trace: 'present',
+      bridgeClosed: true,
+      postExitProbe: 'refused',
+      phase: 'ok',
+    });
+  });
+
+  it('types not-closed / still-serving / trace-missing / deactivate-failed phases', () => {
+    expect(
+      buildBridgeClosureObservation({
+        port: 1,
+        trace: 'missing',
+        bridgeClosed: false,
+        postExitProbe: 'unknown',
+      }).phase,
+    ).toBe('trace-missing');
+    expect(
+      buildBridgeClosureObservation({
+        port: 1,
+        trace: 'present',
+        bridgeClosed: false,
+        postExitProbe: 'refused',
+      }).phase,
+    ).toBe('not-closed');
+    expect(
+      buildBridgeClosureObservation({
+        port: 1,
+        trace: 'present',
+        bridgeClosed: true,
+        postExitProbe: 'still-serving',
+      }).phase,
+    ).toBe('still-serving');
+    expect(
+      buildBridgeClosureObservation({
+        port: 1,
+        trace: 'present',
+        bridgeClosed: true,
+        postExitProbe: 'refused',
+        deactivateFailed: true,
+      }).phase,
+    ).toBe('deactivate-failed');
   });
 });

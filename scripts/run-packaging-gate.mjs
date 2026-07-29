@@ -187,82 +187,109 @@ export function buildPackagingGateEvidence({
  * @param {unknown} raw
  */
 export function parseHostSmokeResult(raw) {
-  /** @type {{ ok: false, activation: 'failed', bridge: null, bridgePhase: 'activation', entrypoints: [], detail: string }} */
-  const activationFailure = (detail) => ({
-    kind: 'm022-s01-packaging-host-smoke',
-    ok: false,
-    activation: 'failed',
-    bridge: null,
-    bridgePhase: 'activation',
-    entrypoints: [],
-    detail,
-  });
-
-  if (!raw || typeof raw !== 'object') {
-    return activationFailure('host smoke did not write a result payload');
-  }
-
-  const obj = /** @type {Record<string, unknown>} */ (raw);
-  if (obj.kind !== 'm022-s01-packaging-host-smoke') {
-    return activationFailure(`unexpected host smoke kind: ${String(obj.kind)}`);
-  }
-
+  const obj = raw && typeof raw === 'object' ? /** @type {Record<string, unknown>} */ (raw) : {};
+  /** @type {'ok' | 'failed'} */
   const activation = obj.activation === 'ok' ? 'ok' : 'failed';
-  const entrypoints = Array.isArray(obj.entrypoints)
-    ? obj.entrypoints.map((item) => {
-        const r = /** @type {Record<string, unknown>} */ (item ?? {});
-        return {
-          path: String(r.path ?? ''),
-          present: r.present === true,
-          resolved: r.resolved === true,
-          phase:
-            r.phase === 'ok' ||
-            r.phase === 'missing-archive-entry' ||
-            r.phase === 'require-failed' ||
-            r.phase === 'spawn-failed'
-              ? r.phase
-              : 'require-failed',
-          ...(typeof r.detail === 'string' ? { detail: r.detail } : {}),
-        };
-      })
-    : [];
+  /** @type {'ok' | 'activation' | 'uat-command-unavailable' | 'health-unreachable'} */
+  let bridgePhase = 'activation';
+  if (
+    obj.bridgePhase === 'ok' ||
+    obj.bridgePhase === 'activation' ||
+    obj.bridgePhase === 'uat-command-unavailable' ||
+    obj.bridgePhase === 'health-unreachable'
+  ) {
+    bridgePhase = obj.bridgePhase;
+  }
 
+  /** @type {{ port: number, status: 'ok' | 'stopping' | 'unavailable', generation: number } | null} */
   let bridge = null;
   if (obj.bridge && typeof obj.bridge === 'object') {
     const b = /** @type {Record<string, unknown>} */ (obj.bridge);
     const port = typeof b.port === 'number' && Number.isFinite(b.port) ? b.port : 0;
     const generation =
       typeof b.generation === 'number' && Number.isFinite(b.generation) ? b.generation : 0;
-    const status =
-      b.status === 'ok' || b.status === 'stopping' || b.status === 'unavailable'
-        ? b.status
-        : port > 0
-          ? 'ok'
-          : 'unavailable';
+    /** @type {'ok' | 'stopping' | 'unavailable'} */
+    let status = 'unavailable';
+    if (b.status === 'ok' || b.status === 'stopping' || b.status === 'unavailable') {
+      status = b.status;
+    } else if (port > 0) {
+      status = 'ok';
+    }
     bridge = { port, status, generation };
   }
 
-  const allowedBridgePhases = new Set([
-    'ok',
-    'activation',
-    'uat-command-unavailable',
-    'health-unreachable',
-  ]);
-  let bridgePhase =
-    typeof obj.bridgePhase === 'string' && allowedBridgePhases.has(obj.bridgePhase)
-      ? obj.bridgePhase
-      : activation === 'ok'
-        ? 'health-unreachable'
-        : 'activation';
+  const entrypointsRaw = Array.isArray(obj.entrypoints) ? obj.entrypoints : [];
+  const entrypoints = entrypointsRaw.map((item) => {
+    const e = item && typeof item === 'object' ? /** @type {Record<string, unknown>} */ (item) : {};
+    /** @type {'ok' | 'missing-archive-entry' | 'require-failed' | 'spawn-failed'} */
+    let phase = 'missing-archive-entry';
+    if (
+      e.phase === 'ok' ||
+      e.phase === 'missing-archive-entry' ||
+      e.phase === 'require-failed' ||
+      e.phase === 'spawn-failed'
+    ) {
+      phase = e.phase;
+    }
+    return {
+      path: typeof e.path === 'string' ? e.path : '',
+      present: e.present === true,
+      resolved: e.resolved === true,
+      phase,
+      ...(typeof e.detail === 'string' ? { detail: e.detail } : {}),
+    };
+  });
 
-  const bridgeListening =
-    bridge && bridge.status === 'ok' && typeof bridge.port === 'number' && bridge.port > 0;
-  if (activation === 'ok' && bridgeListening) {
-    bridgePhase = bridgePhase === 'ok' ? 'ok' : bridgePhase;
+  /** @type {{ port: number, trace: 'present' | 'missing', bridgeClosed: boolean, postExitProbe: 'refused' | 'still-serving' | 'unknown', phase: string } | null} */
+  let bridgeClosure = null;
+  if (obj.bridgeClosure && typeof obj.bridgeClosure === 'object') {
+    const c = /** @type {Record<string, unknown>} */ (obj.bridgeClosure);
+    const cPort = typeof c.port === 'number' && Number.isFinite(c.port) ? c.port : 0;
+    const cTrace = c.trace === 'present' || c.trace === 'missing' ? c.trace : 'missing';
+    const cClosed = c.bridgeClosed === true;
+    const cProbe =
+      c.postExitProbe === 'refused' ||
+      c.postExitProbe === 'still-serving' ||
+      c.postExitProbe === 'unknown'
+        ? c.postExitProbe
+        : 'unknown';
+    const cPhase =
+      c.phase === 'ok' ||
+      c.phase === 'deactivate-failed' ||
+      c.phase === 'trace-missing' ||
+      c.phase === 'not-closed' ||
+      c.phase === 'still-serving' ||
+      c.phase === 'probe-unknown'
+        ? c.phase
+        : 'trace-missing';
+    bridgeClosure = {
+      port: cPort,
+      trace: cTrace,
+      bridgeClosed: cClosed,
+      postExitProbe: cProbe,
+      phase: cPhase,
+    };
   }
 
-  const entrypointsOk = entrypoints.length > 0 && entrypoints.every((r) => r.present && r.resolved && r.phase === 'ok');
-  const ok = activation === 'ok' && bridgeListening === true && entrypointsOk && bridgePhase === 'ok';
+  const activationOk = activation === 'ok';
+  const bridgeListening = bridge !== null && bridge.status === 'ok' && bridge.port > 0;
+  const entrypointsOk = entrypoints.every(
+    (r) => r.present === true && r.resolved === true && r.phase === 'ok',
+  );
+  const bridgeClosureOk =
+    bridgeClosure !== null &&
+    bridgeClosure.phase === 'ok' &&
+    bridgeClosure.trace === 'present' &&
+    bridgeClosure.bridgeClosed === true &&
+    bridgeClosure.postExitProbe === 'refused' &&
+    bridgeClosure.port > 0;
+  // Host smoke ok requires bridge closure proof — never pid-exit inference alone.
+  const ok =
+    activationOk &&
+    bridgeListening === true &&
+    entrypointsOk &&
+    bridgePhase === 'ok' &&
+    bridgeClosureOk;
 
   return {
     kind: 'm022-s01-packaging-host-smoke',
@@ -270,6 +297,7 @@ export function parseHostSmokeResult(raw) {
     activation,
     bridge,
     bridgePhase,
+    bridgeClosure,
     entrypoints,
     ...(typeof obj.detail === 'string' ? { detail: obj.detail } : {}),
   };
@@ -281,31 +309,70 @@ export function parseHostSmokeResult(raw) {
  * @param {ReturnType<typeof buildPackagingGateEvidence>} evidence
  * @param {ReturnType<typeof parseHostSmokeResult>} hostResult
  */
-export function applyHostStageToEvidence(evidence, hostResult) {
-  const host = hostResult ?? parseHostSmokeResult(null);
-  const entrypoints =
-    Array.isArray(host.entrypoints) && host.entrypoints.length > 0
-      ? host.entrypoints
-      : evidence.entrypoints;
+export function applyHostStageToEvidence(evidence, host) {
+  const entrypoints = Array.isArray(host.entrypoints)
+    ? host.entrypoints.map((r) => ({
+        path: r.path,
+        present: r.present === true,
+        resolved: r.resolved === true,
+        phase: r.phase,
+        ...(typeof r.detail === 'string' ? { detail: r.detail } : {}),
+      }))
+    : [];
 
-  const marketplaceOk = Array.isArray(evidence.marketplaceEntries)
-    ? evidence.marketplaceEntries.every((r) => r.present === true)
-    : false;
-  const packagingOk =
-    evidence.allowlist?.ok === true &&
-    (evidence.missingEntrypoints?.length ?? 0) === 0 &&
-    entrypoints.every((r) => r.present && r.resolved && r.phase === 'ok') &&
-    marketplaceOk;
+  const bridge =
+    host.bridge &&
+    typeof host.bridge.port === 'number' &&
+    (host.bridge.status === 'ok' ||
+      host.bridge.status === 'stopping' ||
+      host.bridge.status === 'unavailable')
+      ? {
+          port: host.bridge.port,
+          status: host.bridge.status,
+          generation:
+            typeof host.bridge.generation === 'number' ? host.bridge.generation : 0,
+        }
+      : null;
 
-  const bridge = host.bridge;
-  const bridgeOk =
-    bridge &&
-    typeof bridge.port === 'number' &&
-    bridge.port > 0 &&
-    bridge.status === 'ok';
   const activationOk = host.activation === 'ok';
+  const bridgeOk = bridge !== null && bridge.status === 'ok' && bridge.port > 0;
   const bridgePhaseOk = host.bridgePhase === 'ok';
-  const ok = packagingOk && activationOk && bridgeOk === true && bridgePhaseOk;
+
+  const bridgeClosure =
+    host.bridgeClosure &&
+    typeof host.bridgeClosure === 'object' &&
+    typeof host.bridgeClosure.port === 'number' &&
+    (host.bridgeClosure.trace === 'present' || host.bridgeClosure.trace === 'missing') &&
+    typeof host.bridgeClosure.bridgeClosed === 'boolean' &&
+    (host.bridgeClosure.postExitProbe === 'refused' ||
+      host.bridgeClosure.postExitProbe === 'still-serving' ||
+      host.bridgeClosure.postExitProbe === 'unknown') &&
+    typeof host.bridgeClosure.phase === 'string'
+      ? {
+          port: host.bridgeClosure.port,
+          trace: host.bridgeClosure.trace,
+          bridgeClosed: host.bridgeClosure.bridgeClosed,
+          postExitProbe: host.bridgeClosure.postExitProbe,
+          phase: host.bridgeClosure.phase,
+        }
+      : null;
+
+  const bridgeClosureOk =
+    bridgeClosure !== null &&
+    bridgeClosure.phase === 'ok' &&
+    bridgeClosure.trace === 'present' &&
+    bridgeClosure.bridgeClosed === true &&
+    bridgeClosure.postExitProbe === 'refused' &&
+    bridgeClosure.port > 0;
+
+  // Prefer host.ok when present, but recompute from fields so a forged ok:true
+  // cannot pass without a listening bridge, bridge closure proof, and resolved entrypoints.
+  const ok =
+    host.ok === true &&
+    activationOk &&
+    bridgeOk === true &&
+    bridgePhaseOk &&
+    bridgeClosureOk;
 
   return {
     ...evidence,
@@ -314,6 +381,7 @@ export function applyHostStageToEvidence(evidence, hostResult) {
     activation: host.activation,
     bridge,
     bridgePhase: host.bridgePhase,
+    bridgeClosure,
     ok,
     ...(typeof host.detail === 'string' ? { hostDetail: host.detail } : {}),
   };

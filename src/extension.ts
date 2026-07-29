@@ -61,6 +61,8 @@ import {
   readDurableSurfaces,
   readRedactedBridgeHealth,
   readRedactedDbIdentity,
+  readRedactedDeactivateTrace,
+  type UatDeactivateTrace,
   type UatHostState,
 } from './host/uat-commands';
 import {
@@ -225,6 +227,8 @@ let musterDebugChannel: vscode.OutputChannel | undefined;
 let credentialRegistry: CredentialRegistry | undefined;
 let mcpReadiness: McpReadinessSupervisor | undefined;
 let bridgeServer: MusterBridgeServer | undefined;
+/** Last redacted deactivate observation for packaging-gate bridge-closure proof. */
+let lastUatDeactivateTrace: UatDeactivateTrace | null = null;
 let taskEngine: TaskEngine | undefined;
 let taskStore: TaskReadPort | undefined;
 let taskRepository: TaskRepository | undefined;
@@ -4365,8 +4369,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
     context.subscriptions.push({
       dispose: () => {
-        void bridgeServer?.close();
-        askBridge?.cancelAll('deactivate');
+askBridge?.cancelAll('deactivate');
         elicitationBridge?.cancelAll();
         setPermissionController(null);
         setQuestionController(null);
@@ -4704,6 +4707,15 @@ function registerLiveUatCommands(context: vscode.ExtensionContext): void {
         status: port > 0 ? 'ok' : 'unavailable',
       });
     }),
+    // Packaging-gate: invoke production deactivate() on this module instance and
+    // return the redacted bridge-close observation (port + bridgeClosed only).
+    vscode.commands.registerCommand(UAT_COMMANDS.runDeactivate, async () => {
+      await deactivate();
+      return lastUatDeactivateTrace ?? readRedactedDeactivateTrace(null);
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.deactivateTrace, () => {
+      return lastUatDeactivateTrace;
+    }),
     vscode.commands.registerCommand(UAT_COMMANDS.forcePollingActive, async () => {
       if (!uatChatProvider) {
         throw new Error('UAT chat provider unavailable');
@@ -4786,8 +4798,30 @@ export async function deactivate(): Promise<void> {
   setAcpDebugLogger(null);
   permissionBridge?.cancelAll();
   credentialRegistry?.revokeAll();
-  void bridgeServer?.close();
-  try {
+  
+  
+  // Await bridge close and record a redacted deactivate trace (port + boolean only).
+  // Packaging-gate host smoke asserts this instead of inferring closure from pid exit.
+  const bridgePortBeforeClose = bridgeServer?.getPort() ?? 0;
+  let bridgeClosed = false;
+  if (bridgeServer) {
+    try {
+      await bridgeServer.close();
+      bridgeClosed = true;
+    } catch {
+      bridgeClosed = false;
+    }
+    bridgeServer = undefined;
+  } else {
+    // No live server — treat as already closed (nothing left serving).
+    bridgeClosed = true;
+  }
+  lastUatDeactivateTrace = readRedactedDeactivateTrace({
+    port: bridgePortBeforeClose,
+    bridgeClosed,
+  });
+
+try {
     backendProbeService?.disposeAll();
   } catch {
     // best-effort probe teardown

@@ -96,6 +96,8 @@ Post-prune + marketplace contract (enforced by `scripts/verify-m022-s02-prune-ev
 | Bridge never listens | Missing SDK CJS build or `express` in archive | `bridgePhase: "health-unreachable"` |
 | Stdio proxy / SQLite worker fail | Missing compiled entry or require graph break | `require-failed` / `spawn-failed` with child stderr tail |
 | Activation fails | Broken packaged `extension.js` or activation path | `activation: "failed"`, `bridgePhase: "activation"` |
+| Bridge still serving after deactivate | `deactivate()` did not close the MCP listen socket | `bridgeClosure.phase: "still-serving"` or `"not-closed"`; host smoke fails closed |
+| Deactivate trace missing | UAT deactivate path not registered or not invoked | `bridgeClosure.phase: "trace-missing"` |
 
 ## Refreshing evidence
 

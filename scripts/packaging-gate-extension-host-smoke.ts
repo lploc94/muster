@@ -8,6 +8,8 @@
  * - packaged mcp-stdio-proxy require graph loads without MODULE_NOT_FOUND
  * - production MusterBridgeServer listen is observable via muster.uat.bridgeHealth
  *   and loopback /health returns status ok with port > 0
+ * - deactivate() closes the MCP bridge: redacted deactivate trace + post-close
+ *   probe (connection refused) — never inferred from Extension Host pid exit zero
  *
  * Writes a closed host result to MUSTER_PACKAGING_HOST_RESULT_OUT for the runner.
  */
@@ -37,12 +39,32 @@ type BridgeHealth = {
   generation: number;
 };
 
+type BridgeClosureTracePresence = 'present' | 'missing';
+type BridgeClosurePostExitProbe = 'refused' | 'still-serving' | 'unknown';
+type BridgeClosurePhase =
+  | 'ok'
+  | 'deactivate-failed'
+  | 'trace-missing'
+  | 'not-closed'
+  | 'still-serving'
+  | 'probe-unknown';
+
+/** Typed observation that deactivate closed the MCP bridge (no tokens/paths/env). */
+type BridgeClosure = {
+  port: number;
+  trace: BridgeClosureTracePresence;
+  bridgeClosed: boolean;
+  postExitProbe: BridgeClosurePostExitProbe;
+  phase: BridgeClosurePhase;
+};
+
 type HostSmokeResult = {
   kind: typeof HOST_SMOKE_KIND;
   ok: boolean;
   activation: 'ok' | 'failed';
   bridge: BridgeHealth | null;
   bridgePhase: 'ok' | 'activation' | 'uat-command-unavailable' | 'health-unreachable';
+  bridgeClosure: BridgeClosure | null;
   entrypoints: EntrypointResult[];
   detail?: string;
 };
@@ -198,6 +220,7 @@ export async function run(): Promise<void> {
       activation: partial.activation,
       bridge: partial.bridge ?? null,
       bridgePhase: partial.bridgePhase,
+      bridgeClosure: partial.bridgeClosure ?? null,
       entrypoints: partial.entrypoints ?? entrypoints,
       ...(partial.detail ? { detail: partial.detail } : {}),
     };
@@ -450,12 +473,102 @@ export async function run(): Promise<void> {
     });
   }
 
+  // 5) Assert deactivate() actually closed the bridge (not pid-exit inference).
+  // Call the production deactivate path via UAT, read the redacted trace, then
+  // probe the former listen port — connection refused proves the socket is gone.
+  let deactivateFailed = false;
+  let deactivateDetail: string | undefined;
+  let deactivateTraceRaw: unknown;
+  try {
+    deactivateTraceRaw = await vscode.commands.executeCommand('muster.uat.runDeactivate');
+  } catch (err) {
+    deactivateFailed = true;
+    deactivateDetail = err instanceof Error ? err.message : String(err);
+  }
+
+  let tracePresence: BridgeClosureTracePresence = 'missing';
+  let bridgeClosed = false;
+  let tracePort = bridge.port;
+  if (
+    !deactivateFailed &&
+    deactivateTraceRaw &&
+    typeof deactivateTraceRaw === 'object' &&
+    'bridgeClosed' in (deactivateTraceRaw as object)
+  ) {
+    const t = deactivateTraceRaw as { port?: unknown; bridgeClosed?: unknown };
+    tracePresence = 'present';
+    bridgeClosed = t.bridgeClosed === true;
+    if (typeof t.port === 'number' && Number.isFinite(t.port) && t.port > 0) {
+      tracePort = t.port;
+    }
+  }
+
+  let postExitProbe: BridgeClosurePostExitProbe = 'unknown';
+  if (!deactivateFailed && bridge.port > 0) {
+    try {
+      await fetchBridgeHealth(bridge.port);
+      postExitProbe = 'still-serving';
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const code =
+        err && typeof err === 'object' && 'code' in err
+          ? String((err as { code?: unknown }).code ?? '')
+          : '';
+      if (
+        code === 'ECONNREFUSED' ||
+        code === 'ECONNRESET' ||
+        /ECONNREFUSED|ECONNRESET|connect ECONN|socket hang up|EHOSTUNREACH/i.test(message)
+      ) {
+        postExitProbe = 'refused';
+      } else {
+        postExitProbe = 'unknown';
+      }
+    }
+  }
+
+  let phase: BridgeClosurePhase;
+  if (deactivateFailed) {
+    phase = 'deactivate-failed';
+  } else if (tracePresence === 'missing') {
+    phase = 'trace-missing';
+  } else if (!bridgeClosed) {
+    phase = 'not-closed';
+  } else if (postExitProbe === 'still-serving') {
+    phase = 'still-serving';
+  } else if (postExitProbe === 'unknown') {
+    phase = 'probe-unknown';
+  } else {
+    phase = 'ok';
+  }
+
+  const bridgeClosure: BridgeClosure = {
+    port: tracePort > 0 ? tracePort : bridge.port,
+    trace: tracePresence,
+    bridgeClosed,
+    postExitProbe,
+    phase,
+  };
+
+  if (phase !== 'ok') {
+    fail({
+      activation: 'ok',
+      bridge,
+      bridgePhase: 'ok',
+      bridgeClosure,
+      entrypoints,
+      detail: deactivateDetail
+        ? `bridge closure failed (${phase}): ${deactivateDetail.slice(0, 400)}`
+        : `bridge closure failed (${phase}): trace=${tracePresence} bridgeClosed=${bridgeClosed} postExitProbe=${postExitProbe}`,
+    });
+  }
+
   const result: HostSmokeResult = {
     kind: HOST_SMOKE_KIND,
     ok: true,
     activation: 'ok',
     bridge,
     bridgePhase: 'ok',
+    bridgeClosure,
     entrypoints,
   };
   writeResult(result);
