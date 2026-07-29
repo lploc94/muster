@@ -4369,7 +4369,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
     context.subscriptions.push({
       dispose: () => {
-askBridge?.cancelAll('deactivate');
+        askBridge?.cancelAll('deactivate');
         elicitationBridge?.cancelAll();
         setPermissionController(null);
         setQuestionController(null);
